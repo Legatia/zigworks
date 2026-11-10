@@ -141,7 +141,7 @@ if (demo) {
     });
     const row = selected + 2;
     screen.append("\n");
-    screen.append(span("dim", `row ${row}: [0-${width} inverse "  ${items[selected]}"]\n[headterm] menu 34x8 cursor=${row},0 running`));
+    screen.append(span("dim", `[headterm] highlighted: row ${row} "${items[selected]}"\n[headterm] menu 34x8 cursor=${row},0 running`));
   }
 
   demo.addEventListener("click", (e) => {
@@ -150,13 +150,13 @@ if (demo) {
     if (key === "reset") {
       selected = 1;
       installed = null;
-      cmd.textContent = "headterm screen menu --styles";
+      cmd.textContent = "headterm screen menu";
     } else if (installed === null) {
       if (key === "up") selected = Math.max(0, selected - 1);
       if (key === "down") selected = Math.min(items.length - 1, selected + 1);
       if (key === "enter") installed = selected;
-      const name = key === "enter" ? "<Enter>" : key === "up" ? "<Up>" : "<Down>";
-      cmd.textContent = `headterm send menu '${name}'; headterm screen menu --styles`;
+      const name = key === "enter" ? "Enter" : key === "up" ? "Up" : "Down";
+      cmd.textContent = `headterm send menu ${name}; headterm screen menu`;
     }
     render();
   });

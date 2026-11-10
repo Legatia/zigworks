@@ -45,7 +45,7 @@
           <button type="button" role="tab" id="q-cli" aria-selected="false" aria-controls="qp-cli" tabindex="-1">Command line</button>
         </div>
         <div class="tabpanel" role="tabpanel" id="qp-claude" aria-labelledby="q-claude">
-          <div class="cmd dark-cmd"><pre><code id="c-hero1"><span class="p">$</span> claude mcp add --scope user trigrep -- trigrep mcp</code></pre><button type="button" class="copy" data-copy="c-hero1">Copy</button></div>
+          <div class="cmd dark-cmd"><pre><code id="c-hero1"><span class="p">$</span> trigrep install-rg-shim</code></pre><button type="button" class="copy" data-copy="c-hero1">Copy</button></div>
         </div>
         <div class="tabpanel" role="tabpanel" id="qp-cli" aria-labelledby="q-cli" hidden>
           <div class="cmd dark-cmd"><pre><code id="c-hero2"><span class="p">$</span> trigrep -t c -C 2 'spin_lock_irqsave'</code></pre><button type="button" class="copy" data-copy="c-hero2">Copy</button></div>
@@ -128,32 +128,53 @@
   <section class="frame detail agent" id="agent">
     <div class="detail-head">
       <h2 class="plain">In your agent</h2>
-      <p>Register both as MCP servers and the agent picks them up as tools. This is a real Claude Code session: the prompt is shortened, the tool calls and results are verbatim.</p>
+      <p>Agents reach both through tools they already use: Claude Code’s Grep runs trigrep in place of ripgrep, and one line in <code>CLAUDE.md</code> points the agent to headterm.</p>
     </div>
     <div class="chat">
-      <div class="msg you"><span class="who-chip">You</span><p>Find <code>spin_lock_irqsave</code> in the kernel’s C files, then use Python to work out 2**10.</p></div>
+      <div class="msg you"><span class="who-chip">You</span><p>Run <code>python3 unlock.py</code>. When it asks for the vault passphrase, enter: correct horse. Tell me the deploy token it prints.</p></div>
       <div class="call">
-        <div class="call-head"><span class="tool">trigrep_search</span><code>{"pattern": "spin_lock_irqsave", "glob": ["*.c"], "max_results": 3}</code></div>
-<pre>arch/alpha/kernel/irq_i8259.c:41:	raw_spin_lock_irqsave(&amp;i8259_irq_lock, flags);
-arch/alpha/kernel/irq_i8259.c:57:	raw_spin_lock_irqsave(&amp;i8259_irq_lock, flags);
-arch/alpha/kernel/irq_i8259.c:68:	raw_spin_lock_irqsave(&amp;i8259_irq_lock, flags);
-<span class="dim">[stopped at 3 lines; narrow the pattern, add a glob or path, or raise max_results]</span></pre>
+        <div class="call-head"><span class="tool">Bash</span><code>headterm run --send "correct horse" Enter --wait-text "token" --screen -- python3 unlock.py</code></div>
+<pre>started run-47225 pid=47228
+1 send ok
+2 wait ok(text) 1ms
+3 screen:
+Vault passphrase:
+deploy token: 6cc6f0c306a1c735
+<span class="dim">[headterm] run-47225 120x40 cursor=2,0 running</span>
+session ended</pre>
       </div>
-      <div class="call">
-        <div class="call-head"><span class="tool">headterm_start</span><code>{"name": "cc-test", "command": ["python3", "-q"], "then_wait": {"text": "&gt;&gt;&gt; "}}</code></div>
-<pre>started cc-test pid=38879
-&gt;&gt;&gt;
-<span class="dim">[headterm] cc-test 120x40 cursor=0,0 running wait=ok(text) waited=56ms</span></pre>
+    </div>
+
+    <div class="results">
+      <div>
+        <h3>headterm, measured</h3>
+        <p class="aside">Claude Code with Sonnet, mean of 3 runs per task, against the same agent with only a shell.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">Task</th><th scope="col">Shell only</th><th scope="col">With headterm</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Curses menu</th><td>15.2&nbsp;s, $0.049</td><td>9.7&nbsp;s, $0.024</td></tr>
+              <tr><th scope="row">Passphrase read from the terminal</th><td>Failed 3 of 3</td><td>7.4&nbsp;s, $0.014</td></tr>
+              <tr><th scope="row">Four-screen setup wizard</th><td>90.7&nbsp;s, $0.120</td><td>12.3&nbsp;s, $0.038</td></tr>
+              <tr><th scope="row">Value in a full-screen dashboard</th><td>42.1&nbsp;s, $0.118</td><td>11.9&nbsp;s, $0.025</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
-      <div class="call">
-        <div class="call-head"><span class="tool">headterm_send</span><code>{"name": "cc-test", "keys": ["print(2**10)", "&lt;Enter&gt;"], "then_wait": {"text": "1024"}}</code></div>
-<pre>&gt;&gt;&gt; print(2**10)
-1024
-<span class="dim">[headterm] cc-test 120x40 cursor=2,0 running wait=ok(text) waited=4ms</span></pre>
-      </div>
-      <div class="call">
-        <div class="call-head"><span class="tool">headterm_kill</span><code>{"name": "cc-test"}</code></div>
-<pre>killed cc-test</pre>
+      <div>
+        <h3>trigrep, measured</h3>
+        <p class="aside">Four code-exploration tasks in a 389,000-file monorepo, 3 runs each, Claude Code’s Grep backed by ripgrep or by trigrep.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col"></th><th scope="col">ripgrep</th><th scope="col">trigrep</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Time spent searching</th><td>38.8&nbsp;s</td><td>7.3&nbsp;s</td></tr>
+              <tr><th scope="row">Mean time per task</th><td>34.4&nbsp;s</td><td>31.9&nbsp;s</td></tr>
+              <tr><th scope="row">Most search-heavy task</th><td>56.9&nbsp;s</td><td>45.7&nbsp;s</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="aside">Most of an agent’s time is spent in the model, so the gain grows with repository size. On the Linux kernel alone, end-to-end time didn’t change.</p>
       </div>
     </div>
   </section>
@@ -213,9 +234,9 @@ arch/alpha/kernel/irq_i8259.c:68:	raw_spin_lock_irqsave(&amp;i8259_irq_lock, fla
         <code class="c">trigrep -t rust -C 2 --json</code>
       </li>
       <li>
-        <h3>Built for agents</h3>
-        <p>An MCP server with search, index and status tools. Results are capped and say when they are.</p>
-        <code class="c">trigrep mcp</code>
+        <h3>Behind Claude Code’s Grep</h3>
+        <p>Answers as <code>rg</code> with identical output, and passes anything it can’t reproduce to ripgrep. Also an MCP server.</p>
+        <code class="c">trigrep install-rg-shim</code>
       </li>
     </ul>
   </section>
@@ -260,7 +281,7 @@ arch/alpha/kernel/irq_i8259.c:68:	raw_spin_lock_irqsave(&amp;i8259_irq_lock, fla
     <div class="split try" data-demo>
       <div>
         <h3>Press keys the way an agent does</h3>
-        <p>An installer’s menu, as headterm reports it. The selected row comes back as an <code>inverse</code> run, so the agent knows which option it is on before it presses Enter.</p>
+        <p>An installer’s menu, as headterm reports it. Every screen names the highlighted row, so the agent knows which option it is on before it presses Enter.</p>
         <div class="keys">
           <button type="button" data-key="up">&lt;Up&gt;</button>
           <button type="button" data-key="down">&lt;Down&gt;</button>
@@ -270,23 +291,23 @@ arch/alpha/kernel/irq_i8259.c:68:	raw_spin_lock_irqsave(&amp;i8259_irq_lock, fla
         <p class="aside">An example in headterm’s output format, running in your browser.</p>
       </div>
       <div class="window">
-        <div class="window-bar" data-demo-cmd>headterm screen menu --styles</div>
+        <div class="window-bar" data-demo-cmd>headterm screen menu</div>
 <pre data-demo-screen>Install which toolchain?
 
   stable 0.15.1
 <span class="sel">  nightly 0.16.0-dev    </span>
   skip for now
 
-<span class="dim">row 3: [0-22 inverse "  nightly 0.16.0-dev"]
+<span class="dim">[headterm] highlighted: row 3 "nightly 0.16.0-dev"
 [headterm] menu 34x8 cursor=3,0 running</span></pre>
       </div>
     </div>
 
     <ul class="grid">
       <li>
-        <h3>Sees highlights</h3>
-        <p>Inverse, bold and colours as runs per row, so the selected menu item is never a guess.</p>
-        <code class="c">--styles</code>
+        <h3>One call per interaction</h3>
+        <p>Start a program, press keys, wait for text and get the final screen in a single command.</p>
+        <code class="c">headterm run --send Down Enter --wait-exit -- ./setup</code>
       </li>
       <li>
         <h3>Diffs, per agent</h3>
@@ -320,9 +341,11 @@ arch/alpha/kernel/irq_i8259.c:68:	raw_spin_lock_irqsave(&amp;i8259_irq_lock, fla
         <button type="button" role="tab" id="i-src" aria-selected="false" aria-controls="ip-src" tabindex="-1">From source</button>
       </div>
       <div class="tabpanel" role="tabpanel" id="ip-claude" aria-labelledby="i-claude">
-        <p>With the binaries on your <code>PATH</code>:</p>
-        <div class="cmd dark-cmd"><pre><code id="c-i1">claude mcp add --scope user trigrep -- trigrep mcp</code></pre><button type="button" class="copy" data-copy="c-i1">Copy</button></div>
-        <div class="cmd dark-cmd"><pre><code id="c-i2">claude mcp add --scope user headterm -- headterm mcp</code></pre><button type="button" class="copy" data-copy="c-i2">Copy</button></div>
+        <p>With the binaries on your <code>PATH</code>, let Claude Code’s Grep use trigrep. The command prints the two settings to add.</p>
+        <div class="cmd dark-cmd"><pre><code id="c-i1">trigrep install-rg-shim</code></pre><button type="button" class="copy" data-copy="c-i1">Copy</button></div>
+        <p>Add this line to <code>CLAUDE.md</code> for headterm:</p>
+        <div class="cmd dark-cmd wrap"><pre><code id="c-i2">For programs that need a real terminal (TUI menus, wizards, passphrase prompts read from the TTY, full-screen apps), use the headterm CLI: `headterm run --send KEYS... --wait-text TEXT --screen -- CMD` plays keys and waits and prints the screen in one call; `headterm help run` has the details.</code></pre><button type="button" class="copy" data-copy="c-i2">Copy</button></div>
+        <p class="aside">Both also run as MCP servers: <code>claude mcp add --scope user trigrep -- trigrep mcp</code>, and the same for <code>headterm mcp</code>.</p>
       </div>
       <div class="tabpanel" role="tabpanel" id="ip-src" aria-labelledby="i-src" hidden>
         <p>With Zig 0.15.1:</p>

@@ -536,6 +536,28 @@ h1 {
   tab-size: 2;
 }
 
+/* "In your agent": measured results */
+.results { display: grid; gap: 40px; margin-top: 48px; }
+@media (min-width: 900px) { .results { grid-template-columns: 1.15fr 1fr; } }
+.results > * { min-width: 0; }
+.results h3 { font-size: 22px; margin: 0 0 6px; }
+.results .aside { margin: 0 0 14px; }
+.results .aside:last-child { margin: 14px 0 0; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 12px; background: var(--white); }
+.results table { width: 100%; border-collapse: collapse; font-size: 15px; }
+.results th, .results td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--rule); vertical-align: top; }
+.results tbody tr:last-child > * { border-bottom: 0; }
+.results thead th { font-size: 13px; font-weight: 600; color: var(--ink-soft); background: #f0f2f7; }
+.results tbody th { font-weight: 500; }
+.results td { font-family: var(--mono); font-size: 14px; white-space: nowrap; }
+.results td:last-child { color: var(--forest); font-weight: 500; }
+@media (max-width: 599px) {
+  .results th, .results td { padding: 9px 10px; }
+  .results table { font-size: 14px; }
+  .results td { white-space: normal; font-size: 13px; }
+}
+.cmd.wrap pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
 /* headterm: the keys demo */
 .try { margin-top: 8px; }
 .try h3 { font-size: 22px; margin-bottom: 10px; }
