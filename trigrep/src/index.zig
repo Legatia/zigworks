@@ -1,7 +1,7 @@
 //! The on-disk trigram index: one file per indexed root, read through mmap.
 //!
 //! Layout (little-endian):
-//!   header      magic, version, counts, section offsets, build id (header_len bytes)
+//!   header      magic, version, counts, section offsets, build id, base id (header_len bytes)
 //!   files       file_count x { path_off u32, path_len u32, size u64, mtime i64 }
 //!   paths       relative paths, concatenated
 //!   root        the absolute root path
@@ -9,6 +9,11 @@
 //!   postings    per trigram: file ids as varint deltas
 //!
 //! Trigrams are ASCII-lowercased and never span a newline.
+//!
+//! A *delta* index (same format, `<index>.delta`, base id set) holds files that differ
+//! from the base index: changed or new files with their trigrams, and deleted ones as
+//! tombstones (size `tombstone`). A delta whose base id doesn't match the base's build
+//! id is stale and ignored.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,13 +21,20 @@ const walk = @import("walk.zig");
 const Query = @import("query.zig").Query;
 
 pub const magic = "TRIGREP\x01";
-pub const format_version: u32 = 2;
-const header_len = 80;
+pub const format_version: u32 = 3;
+const header_len = 88;
 const file_rec = 24;
 const tri_rec = 16;
 const tri_space = 1 << 24;
 
 pub const binary_probe = 8192;
+
+/// Size recorded for a file deleted since the base index was built (deltas only).
+pub const tombstone: u64 = std.math.maxInt(u64);
+
+pub fn deltaPath(arena: Allocator, index_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}.delta", .{index_path});
+}
 
 pub fn isBinary(data: []const u8) bool {
     return std.mem.indexOfScalar(u8, data[0..@min(data.len, binary_probe)], 0) != null;
@@ -117,12 +129,13 @@ const Extractor = struct {
         while (true) {
             const i = x.next.fetchAdd(1, .monotonic);
             if (i >= x.end) break;
-            x.results[i - x.base] = x.process(x.entries[i].path) catch null;
+            x.results[i - x.base] = x.process(x.entries[i]) catch null;
         }
     }
 
-    fn process(x: *Extractor, path: []const u8) ![]u32 {
-        var f = try x.root.openFile(path, .{});
+    fn process(x: *Extractor, entry: walk.Entry) ![]u32 {
+        if (entry.size == tombstone) return try x.gpa.alloc(u32, 0);
+        var f = try x.root.openFile(entry.path, .{});
         defer f.close();
         const size = (try f.stat()).size;
         try x.buf.resize(x.gpa, @intCast(size));
@@ -146,9 +159,14 @@ fn writeU64(buf: []u8, off: usize, v: u64) void {
     std.mem.writeInt(u64, buf[off..][0..8], v, .little);
 }
 
+pub const BuildOptions = struct {
+    /// Nonzero for a delta: the build id of the base index it applies to.
+    base_id: u64 = 0,
+};
+
 /// Indexes `entries` (files under `root`) and writes the index to `out_path`
 /// atomically.
-pub fn build(gpa: Allocator, root: []const u8, entries: []const walk.Entry, out_path: []const u8, threads: usize) !BuildStats {
+pub fn build(gpa: Allocator, root: []const u8, entries: []const walk.Entry, out_path: []const u8, threads: usize, opts: BuildOptions) !BuildStats {
     var stats = BuildStats{ .files = entries.len, .build_id = std.crypto.random.int(u64) | 1 };
     if (entries.len > std.math.maxInt(u32)) return error.TooManyFiles;
 
@@ -273,6 +291,7 @@ pub fn build(gpa: Allocator, root: []const u8, entries: []const walk.Entry, out_
         writeU64(&head, 56, root_off);
         writeU64(&head, 64, total);
         writeU64(&head, 72, stats.build_id);
+        writeU64(&head, 80, opts.base_id);
         try w.writeAll(&head);
 
         var po: u32 = 0;
@@ -330,6 +349,8 @@ pub const Index = struct {
     post_off: usize,
     root: []const u8,
     build_id: u64,
+    /// Nonzero for a delta index.
+    base_id: u64,
 
     pub fn open(path: []const u8) !Index {
         var f = try std.fs.cwd().openFile(path, .{});
@@ -355,6 +376,7 @@ pub const Index = struct {
             .post_off = rd64(data, 48),
             .root = data[root_off..][0..root_len],
             .build_id = std.mem.readInt(u64, data[72..80], .little),
+            .base_id = std.mem.readInt(u64, data[80..88], .little),
         };
         if (ix.files_off + @as(usize, ix.file_count) * file_rec > size or
             ix.tris_off + @as(usize, ix.tri_count) * tri_rec > size or ix.post_off > size)
@@ -540,7 +562,7 @@ test "build, open and query an index" {
     const root = try tmp.dir.realpathAlloc(arena, ".");
     const entries = try walk.walk(arena, root, .{});
     const out = try std.fmt.allocPrint(arena, "{s}/index.idx", .{root});
-    const stats = try build(gpa, root, entries, out, 2);
+    const stats = try build(gpa, root, entries, out, 2, .{});
     try std.testing.expectEqual(@as(usize, 3), stats.files);
     try std.testing.expectEqual(@as(usize, 1), stats.binary);
 

@@ -25,7 +25,8 @@ const search_schema =
     \\"glob":{"type":"array","items":{"type":"string"},"description":"Only paths matching these globs, e.g. [\"*.ts\", \"!*.test.ts\"]."},
     \\"output":{"type":"string","enum":["lines","files","count"],"description":"lines: path:line:text (default); files: matching paths; count: path:count."},
     \\"max_results":{"type":"integer","description":"Stop after this many output lines (default 200)."},
-    \\"max_per_file":{"type":"integer","description":"At most this many matching lines per file."}
+    \\"max_per_file":{"type":"integer","description":"At most this many matching lines per file."},
+    \\"context":{"type":"integer","description":"Lines of context before and after each match (like rg -C). Context lines are path-N-text; groups are separated by --."}
     \\},"required":["pattern"]}
 ;
 
@@ -70,7 +71,7 @@ pub const Registry = struct {
     }
 
     pub fn hook(r: *Registry) engine.WatchHook {
-        return .{ .ptr = r, .changes = changes, .seeded = seeded };
+        return .{ .ptr = r, .changes = changes, .seeded = seeded, .rebased = rebased, .auto_update = true };
     }
 
     fn get(r: *Registry, root: []const u8) ?*watch.Watcher {
@@ -93,10 +94,16 @@ pub const Registry = struct {
         return ch;
     }
 
-    fn seeded(ptr: *anyopaque, root: []const u8, build_id: u64, hidden: bool, changed: []const []const u8) void {
-        if (hidden) return;
+    fn seeded(ptr: *anyopaque, root: []const u8, build_id: u64, hidden: bool, changed: []const []const u8) u64 {
+        if (hidden) return 0;
         const r: *Registry = @ptrCast(@alignCast(ptr));
-        if (r.watchers.get(root)) |w| w.seed(build_id, changed);
+        if (r.watchers.get(root)) |w| return w.seed(build_id, changed);
+        return 0;
+    }
+
+    fn rebased(ptr: *anyopaque, root: []const u8, seq: u64, new_state: u64) void {
+        const r: *Registry = @ptrCast(@alignCast(ptr));
+        if (r.watchers.get(root)) |w| w.rebased(seq, new_state);
     }
 };
 
@@ -140,6 +147,7 @@ fn toolSearch(gpa: Allocator, arena: Allocator, reg: ?*Registry, args: std.json.
         .opts = .{ .ignore_case = boolean(args, "ignore_case"), .fixed_string = boolean(args, "fixed_strings"), .word = boolean(args, "word") },
         .mode = mode,
         .max_count = int(args, "max_per_file"),
+        .context = if (int(args, "context")) |c| .{ .before = c, .after = c } else .{},
         .globs = globs.items,
         .limit = limit,
         .watch = if (reg) |r| r.hook() else null,
@@ -154,6 +162,7 @@ fn toolSearch(gpa: Allocator, arena: Allocator, reg: ?*Registry, args: std.json.
     if (outcome.totals.truncated)
         try w.print("[stopped at {d} lines; narrow the pattern, add a glob or path, or raise max_results]\n", .{limit});
     if (outcome.built_index) |b| try w.print("[{s}]\n", .{b});
+    if (outcome.updated_index) |u| try w.print("[{s}]\n", .{u});
     if (outcome.note) |n| try w.print("[{s}]\n", .{n});
     return .{ .text = aw.written() };
 }

@@ -8,11 +8,22 @@ const index = @import("index.zig");
 
 pub const Mode = enum { lines, files_with_matches, count };
 
+/// Lines of context to print around each match (like rg -B/-A).
+pub const Context = struct {
+    before: usize = 0,
+    after: usize = 0,
+
+    pub fn active(c: Context) bool {
+        return c.before > 0 or c.after > 0;
+    }
+};
+
 pub const Config = struct {
     prog: *const regex.Program,
     plan: query.Plan,
     mode: Mode = .lines,
     max_count: ?usize = null,
+    context: Context = .{},
 };
 
 pub const Job = struct {
@@ -93,6 +104,8 @@ pub fn searchBuffer(
     if (cfg.plan.required == null) if (cfg.plan.alternatives) |alts| {
         if (alts.len <= MultiFinder.max) multi = .{ .lits = alts };
     };
+    const with_context = cfg.mode == .lines and cfg.context.active();
+    var ctx = ContextState{ .n = cfg.context.before };
 
     while (pos <= data.len and matches < limit) {
         var line_start = pos;
@@ -113,7 +126,33 @@ pub fn searchBuffer(
             if (cfg.mode == .lines) {
                 line_no += countNewlines(data[counted_to..line_start]);
                 counted_to = line_start;
+                if (with_context) try ctx.before(gpa, out, data, display, line_start, line_no);
                 try out.print(gpa, "{s}:{d}:{s}\n", .{ display, line_no, line });
+                ctx.printed(line_end, line_no);
+                if (with_context and cfg.context.after > 0) {
+                    // Print the following lines; any that match restart the count.
+                    var left = cfg.context.after;
+                    var p = line_end + 1;
+                    var no = line_no + 1;
+                    while (left > 0 and p < data.len and matches < limit) : (no += 1) {
+                        const e = std.mem.indexOfScalarPos(u8, data, p, '\n') orelse data.len;
+                        const l = data[p..e];
+                        if (m.isMatch(l)) {
+                            matches += 1;
+                            try out.print(gpa, "{s}:{d}:{s}\n", .{ display, no, l });
+                            left = cfg.context.after;
+                        } else {
+                            try out.print(gpa, "{s}-{d}-{s}\n", .{ display, no, l });
+                            left -= 1;
+                        }
+                        ctx.printed(e, no);
+                        p = e + 1;
+                    }
+                    counted_to = @min(p, data.len);
+                    line_no = no;
+                    pos = p;
+                    continue;
+                }
             }
         }
         pos = line_end + 1;
@@ -125,6 +164,43 @@ pub fn searchBuffer(
     };
     return matches;
 }
+
+/// Tracks what has been printed in a file, for context lines and `--` separators.
+const ContextState = struct {
+    n: usize,
+    /// Byte offset just past the last printed line.
+    end: usize = 0,
+    last_no: usize = 0,
+    any: bool = false,
+
+    fn printed(c: *ContextState, line_end: usize, no: usize) void {
+        c.end = line_end + 1;
+        c.last_no = no;
+        c.any = true;
+    }
+
+    /// Prints up to `n` lines before the line at `start` (number `no`) that haven't
+    /// been printed yet, preceded by `--` if there's a gap since the last group.
+    fn before(c: *ContextState, gpa: Allocator, out: *std.ArrayList(u8), data: []const u8, display: []const u8, start: usize, no: usize) !void {
+        var first = start;
+        var count: usize = 0;
+        while (count < c.n and first > 0 and first > c.end) {
+            const prev = if (std.mem.lastIndexOfScalar(u8, data[0 .. first - 1], '\n')) |nl| nl + 1 else 0;
+            if (prev < c.end) break;
+            first = prev;
+            count += 1;
+        }
+        const first_no = no - count;
+        if (c.any and first_no > c.last_no + 1) try out.appendSlice(gpa, "--\n");
+        var p = first;
+        var k = first_no;
+        while (p < start) : (k += 1) {
+            const e = std.mem.indexOfScalarPos(u8, data, p, '\n').?;
+            try out.print(gpa, "{s}-{d}-{s}\n", .{ display, k, data[p..e] });
+            p = e + 1;
+        }
+    }
+};
 
 const Result = struct { out: std.ArrayList(u8) = .empty, matches: usize = 0, bytes: u64 = 0, scanned: bool = false };
 
@@ -237,6 +313,7 @@ pub fn run(gpa: Allocator, root: std.fs.Dir, jobs: []const Job, cfg: Config, thr
                 totals.truncated = true;
             }
             totals.lines_written += @min(lines, room);
+            if (cfg.mode == .lines and cfg.context.active() and totals.files_matched > 1) try out.writeAll("--\n");
             try out.writeAll(text);
         }
         if (totals.truncated) break;
@@ -283,6 +360,38 @@ test "alternation prefilter" {
     const b = try runSearch("ab|x", .{ .ignore_case = true }, .lines, "AB\nzz\nX\n");
     defer gpa.free(b);
     try std.testing.expectEqualStrings("f:1:AB\nf:3:X\n", b);
+}
+
+fn runContext(pattern: []const u8, before: usize, after: usize, data: []const u8) ![]u8 {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const root = try regex.parse(arena.allocator(), pattern, .{});
+    const prog = try regex.compile(arena.allocator(), root);
+    const p = try query.plan(arena.allocator(), root);
+    var m = try regex.Matcher.init(gpa, &prog);
+    defer m.deinit(gpa);
+    var out: std.ArrayList(u8) = .empty;
+    _ = try searchBuffer(gpa, &m, .{ .prog = &prog, .plan = p, .context = .{ .before = before, .after = after } }, data, "f", &out);
+    return out.toOwnedSlice(gpa);
+}
+
+test "context lines, merged groups and separators" {
+    const gpa = std.testing.allocator;
+    const text = "l1\nl2 hit\nl3\nl4\nl5\nl6\nl7 hit\nl8 hit\nl9\nl10";
+    const a = try runContext("hit", 1, 1, text);
+    defer gpa.free(a);
+    try std.testing.expectEqualStrings("f-1-l1\nf:2:l2 hit\nf-3-l3\n--\nf-6-l6\nf:7:l7 hit\nf:8:l8 hit\nf-9-l9\n", a);
+    const b = try runContext("hit", 3, 0, text);
+    defer gpa.free(b);
+    // Matches ripgrep: line 3 is outside 7's three lines of context, so a gap.
+    try std.testing.expectEqualStrings("f-1-l1\nf:2:l2 hit\n--\nf-4-l4\nf-5-l5\nf-6-l6\nf:7:l7 hit\nf:8:l8 hit\n", b);
+    const c = try runContext("l10", 0, 2, text);
+    defer gpa.free(c);
+    try std.testing.expectEqualStrings("f:10:l10\n", c);
+    const d = try runContext("l1$", 2, 0, text);
+    defer gpa.free(d);
+    try std.testing.expectEqualStrings("f:1:l1\n", d);
 }
 
 test "count and files-with-matches" {

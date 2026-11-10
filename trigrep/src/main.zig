@@ -8,6 +8,8 @@ const search = @import("search.zig");
 const engine = @import("engine.zig");
 const mcp = @import("mcp.zig");
 const watch = @import("watch.zig");
+const view = @import("view.zig");
+const View = view.View;
 
 pub const version = "0.1.0";
 
@@ -16,7 +18,8 @@ const usage =
     \\
     \\Usage:
     \\  trigrep [OPTIONS] PATTERN [PATH]   search; builds the index on first use
-    \\  trigrep index [PATH]               build or rebuild the index for PATH
+    \\  trigrep index [--update] [PATH]    build or rebuild the index; --update only
+    \\                                     re-indexes files that changed
     \\  trigrep status [PATH]              show the index and how many files changed
     \\  trigrep watch [PATH]               keep the index fresh; searches skip the full walk
     \\  trigrep mcp                        run as an MCP server on stdin/stdout
@@ -28,6 +31,7 @@ const usage =
     \\  -l, --files-with-matches   print only the paths of matching files
     \\  -c, --count                print path:count for matching files
     \\  -m, --max-count N          stop after N matching lines per file
+    \\  -A, -B, -C N               N lines of context after, before, or around matches
     \\  -g, --glob GLOB            only files matching GLOB; !GLOB excludes (repeatable)
     \\  -e, --regexp PATTERN       the pattern (for patterns starting with -)
     \\      --hidden               include hidden files and directories
@@ -52,6 +56,8 @@ const Args = struct {
     opts: regex.Options = .{},
     mode: search.Mode = .lines,
     max_count: ?usize = null,
+    context: search.Context = .{},
+    update: bool = false,
     globs: std.ArrayList([]const u8) = .empty,
     hidden: bool = false,
     no_index: bool = false,
@@ -102,6 +108,12 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
             else if (std.mem.eql(u8, name, "count")) a.mode = .count
             else if (std.mem.eql(u8, name, "max-count")) a.max_count = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --max-count", .{})
             else if (std.mem.eql(u8, name, "glob")) try a.globs.append(arena, value(argv, &i, inline_value, name))
+            else if (std.mem.eql(u8, name, "context")) {
+                const n = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --context", .{});
+                a.context = .{ .before = n, .after = n };
+            } else if (std.mem.eql(u8, name, "after-context")) a.context.after = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --after-context", .{})
+            else if (std.mem.eql(u8, name, "before-context")) a.context.before = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --before-context", .{})
+            else if (std.mem.eql(u8, name, "update")) a.update = true
             else if (std.mem.eql(u8, name, "regexp")) a.pattern = value(argv, &i, inline_value, name)
             else if (std.mem.eql(u8, name, "hidden")) a.hidden = true
             else if (std.mem.eql(u8, name, "no-index")) a.no_index = true
@@ -126,7 +138,7 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
         var k: usize = 1;
         while (k < arg.len) : (k += 1) {
             const c = arg[k];
-            const takes_value = c == 'm' or c == 'g' or c == 'e' or c == 'j';
+            const takes_value = c == 'm' or c == 'g' or c == 'e' or c == 'j' or c == 'A' or c == 'B' or c == 'C';
             var v: []const u8 = "";
             if (takes_value) {
                 if (k + 1 < arg.len) {
@@ -147,6 +159,12 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
                 'g' => try a.globs.append(arena, v),
                 'e' => a.pattern = v,
                 'j' => a.threads = std.fmt.parseInt(usize, v, 10) catch fail("bad -j value", .{}),
+                'A' => a.context.after = std.fmt.parseInt(usize, v, 10) catch fail("bad -A value", .{}),
+                'B' => a.context.before = std.fmt.parseInt(usize, v, 10) catch fail("bad -B value", .{}),
+                'C' => {
+                    const n = std.fmt.parseInt(usize, v, 10) catch fail("bad -C value", .{});
+                    a.context = .{ .before = n, .after = n };
+                },
                 'h' => {
                     std.fs.File.stdout().writeAll(usage) catch {};
                     std.process.exit(0);
@@ -206,6 +224,16 @@ pub fn main() !void {
         .watch => return watchMain(gpa, arena, a),
         .index => {
             const target = engine.resolve(arena, a.path, &diag) catch fail("{s}", .{diag.message});
+            if (a.update) {
+                const found = (try engine.findIndex(arena, target)) orelse fail("no index covers {s}; run `trigrep index` first", .{target});
+                var v = View.open(arena, found.path) catch |err| fail("can't read index: {s}; run `trigrep index`", .{@errorName(err)});
+                defer v.close();
+                const entries = try walk.walk(arena, found.root, .{});
+                const changed = try engine.diffIndex(arena, &v, entries);
+                const u = engine.updateDelta(gpa, arena, found.root, found.path, &v, changed, a.threads) catch |err| fail("update failed: {s}", .{@errorName(err)});
+                std.debug.print("trigrep: {s}\n", .{try engine.describeUpdate(arena, u)});
+                return;
+            }
             const b = engine.buildIndex(gpa, arena, target, a.threads) catch |err| fail("indexing failed: {s}", .{@errorName(err)});
             std.debug.print("trigrep: {s}\n", .{try engine.describeBuild(arena, target, b)});
             return;
@@ -231,12 +259,13 @@ pub fn main() !void {
         .opts = a.opts,
         .mode = a.mode,
         .max_count = a.max_count,
+        .context = a.context,
         .globs = a.globs.items,
         .hidden = a.hidden,
         .no_index = a.no_index,
         .trust_index = a.trust_index,
         .threads = a.threads,
-        .watch = if (watch.supported) .{ .ptr = undefined, .changes = daemonChanges, .seeded = daemonSeeded } else null,
+        .watch = if (watch.supported) .{ .ptr = undefined, .changes = daemonChanges, .seeded = daemonSeeded, .rebased = daemonRebased, .auto_update = false } else null,
     };
     const outcome = engine.run(gpa, arena, req, out, &diag) catch |err| {
         out.flush() catch {};
@@ -245,6 +274,7 @@ pub fn main() !void {
     };
     out.flush() catch {};
     if (outcome.built_index) |b| std.debug.print("trigrep: {s}\n", .{b});
+    if (outcome.updated_index) |u| std.debug.print("trigrep: {s}\n", .{u});
     if (outcome.note) |n| std.debug.print("trigrep: {s}\n", .{n});
     if (a.stats) std.debug.print("trigrep: {s}\n", .{outcome.stats});
     std.process.exit(if (outcome.totals.lines_matched > 0) 0 else 1);
@@ -256,18 +286,16 @@ fn daemonChanges(_: *anyopaque, arena: Allocator, _: []const u8, index_path: []c
     return watch.query(arena, sock, build_id);
 }
 
-fn daemonSeeded(_: *anyopaque, _: []const u8, _: u64, _: bool, _: []const []const u8) void {
-    // The daemon re-seeds itself.
+fn daemonSeeded(_: *anyopaque, _: []const u8, _: u64, _: bool, _: []const []const u8) u64 {
+    return 0; // The daemon re-seeds itself.
 }
 
+fn daemonRebased(_: *anyopaque, _: []const u8, _: u64, _: u64) void {}
+
 fn readBuildId(path: []const u8) ?u64 {
-    var f = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer f.close();
-    var head: [80]u8 = undefined;
-    const n = f.readAll(&head) catch return null;
-    if (n < head.len or !std.mem.eql(u8, head[0..8], index.magic)) return null;
-    if (std.mem.readInt(u32, head[8..12], .little) != index.format_version) return null;
-    return std.mem.readInt(u64, head[72..80], .little);
+    var buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    return view.stateId(fba.allocator(), path);
 }
 
 fn reseed(gpa: Allocator, w: *watch.Watcher, root: []const u8, index_path: []const u8) !void {
@@ -275,12 +303,36 @@ fn reseed(gpa: Allocator, w: *watch.Watcher, root: []const u8, index_path: []con
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     w.beginSeed();
-    var ix = try index.Index.open(index_path);
-    defer ix.close();
+    var v = try View.open(arena, index_path);
+    defer v.close();
     const entries = try walk.walk(arena, root, .{});
-    const changed = try engine.diffIndex(arena, &ix, entries);
-    w.seed(ix.build_id, changed);
+    const changed = try engine.diffIndex(arena, &v, entries);
+    _ = w.seed(v.state_id, changed);
     std.debug.print("trigrep: tracking {d} files, {d} changed since indexing\n", .{ entries.len, changed.len });
+}
+
+fn updateFromWatcher(gpa: Allocator, w: *watch.Watcher, root: []const u8, index_path: []const u8, threads: ?usize) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var v = try View.open(arena, index_path);
+    defer v.close();
+    const ch = try w.changes(arena, v.state_id);
+    if (ch.full) return; // the main loop re-seeds first
+    var changed: std.ArrayList([]const u8) = .empty;
+    try changed.appendSlice(arena, ch.files);
+    for (ch.dirs) |d| {
+        for (try walk.walk(arena, root, .{ .prefix = d })) |e| try changed.append(arena, e.path);
+        var id: u32 = 0;
+        while (id < v.file_count) : (id += 1) {
+            const pth = v.file(id).path;
+            if (v.live(id) and pth.len > d.len and std.mem.startsWith(u8, pth, d) and pth[d.len] == '/')
+                try changed.append(arena, try arena.dupe(u8, pth));
+        }
+    }
+    const u = try engine.updateDelta(gpa, arena, root, index_path, &v, changed.items, threads);
+    w.rebased(ch.seq, u.state_id);
+    std.debug.print("trigrep: {d} changes; {s}\n", .{ changed.items.len, try engine.describeUpdate(arena, u) });
 }
 
 fn watchMain(gpa: Allocator, arena: Allocator, a: Args) !void {
@@ -317,15 +369,11 @@ fn watchMain(gpa: Allocator, arena: Allocator, a: Args) !void {
         } else {
             if (p.count != last_count) quiet_since = std.time.milliTimestamp();
             last_count = p.count;
-            // Many changes and a quiet second (e.g. after a branch switch): reindex.
-            if (p.count > 1000 and std.time.milliTimestamp() - quiet_since > 1000) {
-                const at = w.mark();
-                var build_arena = std.heap.ArenaAllocator.init(gpa);
-                defer build_arena.deinit();
-                if (engine.buildIndex(gpa, build_arena.allocator(), root, a.threads)) |b| {
-                    w.rebased(at, b.stats.build_id);
-                    std.debug.print("trigrep: {d} changes, re{s}\n", .{ p.count, try engine.describeBuild(build_arena.allocator(), root, b) });
-                } else |err| std.debug.print("trigrep: reindex failed: {s}\n", .{@errorName(err)});
+            // Enough changes and a quiet second (e.g. after a branch switch): fold them
+            // into the index delta (or rebuild, if the delta would get too big).
+            if (p.count >= engine.auto_update_threshold and std.time.milliTimestamp() - quiet_since > 1000) {
+                updateFromWatcher(gpa, w, root, index_path, a.threads) catch |err|
+                    std.debug.print("trigrep: index update failed: {s}\n", .{@errorName(err)});
             }
         }
         std.Thread.sleep(500 * std.time.ns_per_ms);
@@ -341,5 +389,6 @@ test {
     _ = engine;
     _ = mcp;
     _ = @import("watch.zig");
+    _ = view;
     _ = @import("glob.zig");
 }

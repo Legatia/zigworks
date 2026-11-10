@@ -5,8 +5,9 @@ Indexed code search for large repositories and coding agents. ripgrep-compatible
 ```sh
 trigrep spin_lock_irqsave            # first run in a repo builds the index
 trigrep -i 'todo|fixme' src/
-trigrep -w mutex_lock -g '*.c'
-trigrep index                        # rebuild after big changes (branch switch, pull)
+trigrep -w mutex_lock -g '*.c' -C 2  # with 2 lines of context
+trigrep index                        # rebuild from scratch
+trigrep index --update               # re-index only files that changed
 trigrep status                       # how many files changed since indexing
 trigrep watch &                      # optional: searches skip the freshness walk
 ```
@@ -23,7 +24,7 @@ claude mcp add trigrep -- /absolute/path/to/trigrep mcp
 
 Tools:
 
-- `trigrep_search` takes `pattern`, plus optional `path`, `ignore_case`, `fixed_strings`, `word`, `glob` (array), `output` (`lines`, `files` or `count`), `max_results` (default 200) and `max_per_file`. It returns `path:line:text` lines, and says so when it stopped at `max_results`.
+- `trigrep_search` takes `pattern`, plus optional `path`, `ignore_case`, `fixed_strings`, `word`, `glob` (array), `output` (`lines`, `files` or `count`), `max_results` (default 200), `max_per_file` and `context` (lines around each match). It returns `path:line:text` lines, and says so when it stopped at `max_results`.
 - `trigrep_index` rebuilds the index for `path`.
 - `trigrep_status` shows the index and how many files changed since it was built.
 
@@ -31,9 +32,13 @@ Paths are relative to the server's working directory, which is the project when 
 
 The MCP server watches every repository it has searched (see below), so after the first search in a repo, later searches cost tens of milliseconds and still see every edit, including files written a moment before the search.
 
+## Keeping the index current
+
+The index has a base and a small *delta*: files that changed, appeared or were deleted since the base was built. A search that finds 300 or more changed files folds them into the delta afterwards (on the Linux kernel, 500 changed files took 84 ms), so the next search uses the index for them again instead of reading them all. `trigrep index --update` does the same on demand. When the delta would hold more than a quarter of the files, the base is rebuilt instead.
+
 ## Watching
 
-`trigrep watch [PATH]` keeps a list of files changed since indexing, from FSEvents (macOS) or inotify (Linux), and serves it over a Unix socket in `/tmp/trigrep-$UID/`. While it runs, searches under that root re-check only those files instead of walking the whole tree. It reindexes on its own after a burst of more than 1,000 changes (a branch switch, say) once things are quiet for a second. `trigrep mcp` does the same in-process.
+`trigrep watch [PATH]` keeps a list of files changed since indexing, from FSEvents (macOS) or inotify (Linux), and serves it over a Unix socket in `/tmp/trigrep-$UID/`. While it runs, searches under that root re-check only those files instead of walking the whole tree. It updates the index delta on its own after a burst of 300 or more changes (a branch switch, say) once things are quiet for a second. `trigrep mcp` does the same in-process.
 
 Results stay correct when the watcher can't vouch for its list: dropped events, a changed `.gitignore`, an index rebuilt by someone else, or a filesystem without events all make the next search walk the tree and re-seed the watcher. On macOS, each search first writes a cookie file (in `.git` when there is one) and waits for its event, as Watchman does, so an edit made just before the search is never missed. On Linux, inotify queues events synchronously, so draining the queue is enough.
 
@@ -75,20 +80,19 @@ Reproduce: `zig build -Doptimize=ReleaseFast`, then `python3 scripts/bench.py DI
 
 ## Options
 
-`-i` `-F` `-w` `-l` `-c` `-m N` `-g GLOB` (repeatable, `!GLOB` excludes) `-e PATTERN` `--hidden` `--no-index` `--trust-index` `-j N` `--stats`. `-n`, `-H`, `--no-heading` and `--color` are accepted and ignored. `trigrep --help` has the full list.
+`-i` `-F` `-w` `-l` `-c` `-m N` `-A N` `-B N` `-C N` `-g GLOB` (repeatable, `!GLOB` excludes) `-e PATTERN` `--hidden` `--no-index` `--trust-index` `-j N` `--stats`. `-n`, `-H`, `--no-heading` and `--color` are accepted and ignored. `trigrep --help` has the full list.
 
 ## Known differences from ripgrep
 
 - `-i` and `(?i)` fold ASCII only, and `\w` counts every non-ASCII character as a word character (ripgrep uses Unicode tables), so a pattern like `\w+` can match a few more lines in text with non-ASCII symbols.
 - No lookaround, backreferences, `\p{..}`, or non-ASCII ranges in classes (`[α-ω]`); these are rejected with an error rather than mis-matched.
-- One PATH per search; no `--type`, context lines (`-A/-B/-C`), `-o`, `--json` or colour yet.
+- One PATH per search; no `--type`, `-o`, `--json` or colour yet.
 - Multi-line patterns aren't supported (matching is per line, like ripgrep's default).
 
 ## Next
 
-- Incremental index updates instead of full rebuilds.
 - `--json` output.
-- Unicode classes, context lines, `-o`, `--type`.
+- Unicode classes, `-o`, `--type`.
 
 ## Building
 

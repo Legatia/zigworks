@@ -21,6 +21,8 @@ pub const Changes = struct {
     /// Directories whose whole subtree must be re-walked (created, removed, renamed,
     /// or the OS asked for a rescan).
     dirs: []const []const u8,
+    /// The watcher's sequence number when this list was taken (for `rebased`).
+    seq: u64 = 0,
 };
 
 pub const Watcher = struct {
@@ -178,7 +180,7 @@ pub const Watcher = struct {
         i = 0;
         var dt = w.dirs.keyIterator();
         while (dt.next()) |k| : (i += 1) dirs[i] = try arena.dupe(u8, k.*);
-        return .{ .full = false, .files = files, .dirs = dirs };
+        return .{ .full = false, .files = files, .dirs = dirs, .seq = w.seq };
     }
 
     /// Call right before walking the tree for a re-seed: forgets what was recorded so
@@ -194,11 +196,12 @@ pub const Watcher = struct {
 
     /// After that walk: `changed` are the paths the walk found to differ from index
     /// `build_id`. Unless something forced `full` meanwhile, the watcher is now current.
-    pub fn seed(w: *Watcher, build_id: u64, changed: []const []const u8) void {
+    pub fn seed(w: *Watcher, build_id: u64, changed: []const []const u8) u64 {
         w.mutex.lock();
         defer w.mutex.unlock();
         for (changed) |p| w.insertLocked(p, false);
         w.base_id = build_id;
+        return w.seq;
     }
 
     /// Before rebuilding the index: a mark to pass to `rebased` afterwards.
@@ -630,11 +633,11 @@ test "watcher records edits, creations and ignores ignored files" {
     defer arena.deinit();
     try std.testing.expect((try w.changes(arena.allocator(), 7)).full);
     w.beginSeed();
-    w.seed(7, &.{});
+    _ = w.seed(7, &.{});
     // FSEvents may deliver events from before the stream started; let them settle.
     std.Thread.sleep(200 * std.time.ns_per_ms);
     w.beginSeed();
-    w.seed(7, &.{});
+    _ = w.seed(7, &.{});
 
     try tmp.dir.writeFile(.{ .sub_path = "src/a.txt", .data = "two\n" });
     try tmp.dir.writeFile(.{ .sub_path = "b.txt", .data = "new\n" });
@@ -665,7 +668,7 @@ test "rebased drops changes the rebuild saw" {
     const w = try Watcher.create(gpa, root, false);
     defer w.destroy();
     w.beginSeed();
-    w.seed(1, &.{ "a", "b" });
+    _ = w.seed(1, &.{ "a", "b" });
     const at = w.mark();
     w.mutex.lock();
     w.insertLocked("c", false);

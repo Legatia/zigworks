@@ -1,12 +1,13 @@
 //! The search pipeline shared by the CLI and the MCP server: find or build the index,
-//! check freshness, pick candidate files, scan them. Errors come back as an error plus
-//! a message in `Diag`, never by exiting the process.
+//! check freshness, pick candidate files, scan them, and keep the index's delta up to
+//! date. Errors come back as an error plus a message in `Diag`, never by exiting.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const regex = @import("regex.zig");
 const query = @import("query.zig");
 const index = @import("index.zig");
+const View = @import("view.zig").View;
 const walk = @import("walk.zig");
 const search = @import("search.zig");
 const watch = @import("watch.zig");
@@ -19,10 +20,16 @@ pub const Diag = struct {
 /// an in-process watcher (MCP server) or a `trigrep watch` daemon (CLI).
 pub const WatchHook = struct {
     ptr: *anyopaque,
-    /// Changes under `root` since index `build_id`; null if nothing watches it.
-    changes: *const fn (ptr: *anyopaque, arena: Allocator, root: []const u8, index_path: []const u8, build_id: u64, hidden: bool) ?watch.Changes,
-    /// A full walk of `root` just found `changed` to differ from index `build_id`.
-    seeded: *const fn (ptr: *anyopaque, root: []const u8, build_id: u64, hidden: bool, changed: []const []const u8) void,
+    /// Changes under `root` since index state `state_id`; null if nothing watches it.
+    changes: *const fn (ptr: *anyopaque, arena: Allocator, root: []const u8, index_path: []const u8, state_id: u64, hidden: bool) ?watch.Changes,
+    /// A full walk of `root` just found `changed` to differ from index state
+    /// `state_id`. Returns the watcher's sequence number after recording them.
+    seeded: *const fn (ptr: *anyopaque, root: []const u8, state_id: u64, hidden: bool, changed: []const []const u8) u64,
+    /// The index is now `new_state`, which includes every change up to `seq`.
+    rebased: *const fn (ptr: *anyopaque, root: []const u8, seq: u64, new_state: u64) void,
+    /// Whether searches may update the index delta themselves (false when a daemon
+    /// owns the index).
+    auto_update: bool,
 };
 
 pub const Request = struct {
@@ -32,6 +39,7 @@ pub const Request = struct {
     opts: regex.Options = .{},
     mode: search.Mode = .lines,
     max_count: ?usize = null,
+    context: search.Context = .{},
     globs: []const []const u8 = &.{},
     hidden: bool = false,
     no_index: bool = false,
@@ -48,9 +56,15 @@ pub const Outcome = struct {
     stats: []const u8,
     /// Set when this search had to build the index first.
     built_index: ?[]const u8 = null,
-    /// Advice worth showing, e.g. "many files changed, reindex".
+    /// Set when this search folded changed files into the index delta.
+    updated_index: ?[]const u8 = null,
+    /// Advice worth showing.
     note: ?[]const u8 = null,
 };
+
+/// A search that sees at least this many changed files updates the index delta
+/// afterwards, so later searches can use the index for them again.
+pub const auto_update_threshold = 300;
 
 pub fn threadCount(t: ?usize) usize {
     return t orelse (std.Thread.getCpuCount() catch 4);
@@ -97,11 +111,13 @@ pub fn resolve(arena: Allocator, path: ?[]const u8, diag: *Diag) ![]const u8 {
 
 pub const Built = struct { path: []const u8, stats: index.BuildStats, ms: f64 };
 
+/// Builds the base index for `root` from scratch and drops any delta.
 pub fn buildIndex(gpa: Allocator, arena: Allocator, root: []const u8, threads: ?usize) !Built {
     const t0 = std.time.nanoTimestamp();
     const entries = try walk.walk(arena, root, .{});
     const out = try index.pathFor(arena, root);
-    const st = try index.build(gpa, root, entries, out, threadCount(threads));
+    const st = try index.build(gpa, root, entries, out, threadCount(threads), .{});
+    std.fs.cwd().deleteFile(try index.deltaPath(arena, out)) catch {};
     return .{ .path = out, .stats = st, .ms = ms(t0) };
 }
 
@@ -111,6 +127,76 @@ pub fn describeBuild(arena: Allocator, root: []const u8, b: Built) ![]const u8 {
         @as(f64, @floatFromInt(b.stats.bytes)) / 1e6, b.stats.trigrams, @as(f64, @floatFromInt(b.stats.index_bytes)) / 1e6,
         b.ms,
     });
+}
+
+pub const Updated = struct {
+    /// The new index state id.
+    state_id: u64,
+    /// Files now in the delta (changed, new or deleted relative to the base).
+    delta_files: usize,
+    /// The delta grew too large, so the base was rebuilt instead.
+    rebuilt: ?Built = null,
+    ms: f64,
+};
+
+pub fn describeUpdate(arena: Allocator, u: Updated) ![]const u8 {
+    if (u.rebuilt) |b| return std.fmt.allocPrint(arena, "many changes, re{s}", .{try describeBuild(arena, "the root", b)});
+    return std.fmt.allocPrint(arena, "updated the index: {d} files differ from the base index, {d:.0} ms", .{ u.delta_files, u.ms });
+}
+
+/// Rewrites the delta for the index at `index_path` so it covers `changed` (plus
+/// whatever the old delta held). Rebuilds the base instead when the delta would hold
+/// more than a quarter of the files.
+pub fn updateDelta(gpa: Allocator, arena: Allocator, root: []const u8, index_path: []const u8, v: *const View, changed: []const []const u8, threads: ?usize) !Updated {
+    const t0 = std.time.nanoTimestamp();
+    var paths = std.StringHashMapUnmanaged(void){};
+    if (v.delta) |d| {
+        var i: u32 = 0;
+        while (i < d.file_count) : (i += 1) try paths.put(arena, try arena.dupe(u8, d.file(i).path), {});
+    }
+    for (changed) |p| try paths.put(arena, p, {});
+    if (paths.count() * 4 > v.base_files and paths.count() > 1000) {
+        const b = try buildIndex(gpa, arena, root, threads);
+        return .{ .state_id = b.stats.build_id, .delta_files = 0, .rebuilt = b, .ms = ms(t0) };
+    }
+
+    var base_ids = std.StringHashMapUnmanaged(u32){};
+    try base_ids.ensureTotalCapacity(arena, v.base_files);
+    var i: u32 = 0;
+    while (i < v.base_files) : (i += 1) base_ids.putAssumeCapacity(v.base.file(i).path, i);
+
+    var root_dir = try std.fs.cwd().openDir(root, .{});
+    defer root_dir.close();
+    var checker = try walk.Checker.init(gpa, root, false);
+    defer checker.deinit();
+    var entries: std.ArrayList(walk.Entry) = .empty;
+    var it = paths.keyIterator();
+    while (it.next()) |k| {
+        const p = k.*;
+        const base_rec = if (base_ids.get(p)) |id| v.base.file(id) else null;
+        const st = walk.lstat(root_dir, p);
+        const present = st != null and st.?.kind == .file and !(try checker.skipped(p, false));
+        if (present) {
+            const size = st.?.size;
+            const mtime: i64 = @intCast(st.?.mtime);
+            if (base_rec) |r| if (r.size == size and r.mtime == mtime) continue; // back to the base version
+            try entries.append(arena, .{ .path = p, .size = size, .mtime = mtime });
+        } else if (base_rec != null) {
+            try entries.append(arena, .{ .path = p, .size = index.tombstone, .mtime = 0 });
+        }
+    }
+    const dp = try index.deltaPath(arena, index_path);
+    if (entries.items.len == 0) {
+        std.fs.cwd().deleteFile(dp) catch {};
+        return .{ .state_id = v.base.build_id, .delta_files = 0, .ms = ms(t0) };
+    }
+    std.mem.sort(walk.Entry, entries.items, {}, struct {
+        fn lt(_: void, a: walk.Entry, b: walk.Entry) bool {
+            return walk.pathOrder(a.path, b.path);
+        }
+    }.lt);
+    const st = try index.build(gpa, root, entries.items, dp, threadCount(threads), .{ .base_id = v.base.build_id });
+    return .{ .state_id = st.build_id, .delta_files = entries.items.len, .ms = ms(t0) };
 }
 
 fn relUnder(root: []const u8, target: []const u8) []const u8 {
@@ -134,6 +220,33 @@ pub fn patternError(err: anyerror) []const u8 {
     };
 }
 
+fn under(path: []const u8, dir: []const u8) bool {
+    if (dir.len == 0) return true;
+    return path.len > dir.len and std.mem.startsWith(u8, path, dir) and path[dir.len] == '/';
+}
+
+fn underAny(path: []const u8, dirs: []const []const u8) bool {
+    for (dirs) |d| {
+        if (std.mem.eql(u8, path, d) or under(path, d)) return true;
+    }
+    return false;
+}
+
+fn jobLess(_: void, a: search.Job, b: search.Job) bool {
+    return walk.pathOrder(a.path, b.path);
+}
+
+/// Live index files by path.
+fn pathMap(arena: Allocator, v: *const View) !std.StringHashMapUnmanaged(u32) {
+    var by_path = std.StringHashMapUnmanaged(u32){};
+    try by_path.ensureTotalCapacity(arena, v.file_count);
+    var id: u32 = 0;
+    while (id < v.file_count) : (id += 1) {
+        if (v.live(id)) by_path.putAssumeCapacity(v.file(id).path, id);
+    }
+    return by_path;
+}
+
 /// Runs a search and writes `path:line:text` output to `out`.
 pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, diag: *Diag) !Outcome {
     const t_start = std.time.nanoTimestamp();
@@ -144,7 +257,7 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
     if (plan.required) |r| if (std.mem.indexOfScalar(u8, r.bytes, '\n') != null)
         return failWith(diag, arena, "the pattern contains a newline; trigrep matches single lines", .{});
     const filter = try walk.Filter.fromGlobs(arena, req.globs);
-    const cfg = search.Config{ .prog = &prog, .plan = plan, .mode = req.mode, .max_count = req.max_count };
+    const cfg = search.Config{ .prog = &prog, .plan = plan, .mode = req.mode, .max_count = req.max_count, .context = req.context };
     const threads = threadCount(req.threads);
 
     // A single file: just scan it.
@@ -160,6 +273,11 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
     var jobs: std.ArrayList(search.Job) = .empty;
     var root: []const u8 = target;
     const t_walk = std.time.nanoTimestamp();
+
+    // After the search: fold these changed paths into the index delta.
+    var pending_update: ?[]const []const u8 = null;
+    var pending_seq: u64 = 0;
+    var found_path: []const u8 = "";
 
     if (req.no_index) {
         const entries = try walk.walk(arena, target, .{ .hidden = req.hidden });
@@ -178,66 +296,73 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
             found = .{ .root = r, .path = b.path };
         }
         root = found.?.root;
+        found_path = found.?.path;
         const prefix = relUnder(root, target);
 
         const t_load = std.time.nanoTimestamp();
-        var ix = index.Index.open(found.?.path) catch |err| blk: {
+        var v = View.open(arena, found_path) catch |err| blk: {
             if (err != error.BadIndex)
-                return failWith(diag, arena, "can't read index {s}: {s}", .{ found.?.path, @errorName(err) });
+                return failWith(diag, arena, "can't read index {s}: {s}", .{ found_path, @errorName(err) });
             // Older format or damaged: rebuild it.
             const b = buildIndex(gpa, arena, root, req.threads) catch |e|
                 return failWith(diag, arena, "rebuilding index for {s} failed: {s}", .{ root, @errorName(e) });
             outcome.built_index = try describeBuild(arena, root, b);
-            break :blk index.Index.open(b.path) catch |e|
+            break :blk View.open(arena, b.path) catch |e|
                 return failWith(diag, arena, "can't read index {s}: {s}", .{ b.path, @errorName(e) });
         };
-        defer ix.close();
-        if (!std.mem.eql(u8, ix.root, root))
-            return failWith(diag, arena, "index {s} belongs to {s}; run `trigrep index`", .{ found.?.path, ix.root });
-        const cand = try ix.candidates(arena, plan.query);
+        defer v.close();
+        if (!std.mem.eql(u8, v.root, root))
+            return failWith(diag, arena, "index {s} belongs to {s}; run `trigrep index`", .{ found_path, v.root });
+        const cand = try v.candidates(arena, plan.query);
         const load_ms = ms(t_load);
-        const n_cand = if (cand) |c| c.len else ix.file_count;
+        const n_cand = if (cand) |c| c.len else v.liveCount();
 
-        var cand_set = try std.DynamicBitSetUnmanaged.initEmpty(arena, ix.file_count);
+        var cand_set = try std.DynamicBitSetUnmanaged.initEmpty(arena, v.file_count);
         if (cand) |ids| {
             for (ids) |id| cand_set.set(id);
-        } else cand_set.setRangeValue(.{ .start = 0, .end = ix.file_count }, true);
+        } else {
+            var id: u32 = 0;
+            while (id < v.file_count) : (id += 1) {
+                if (v.live(id)) cand_set.set(id);
+            }
+        }
 
         const strip = if (prefix.len == 0) 0 else prefix.len + 1;
         if (req.trust_index) {
             var id: u32 = 0;
-            while (id < ix.file_count) : (id += 1) {
+            while (id < v.file_count) : (id += 1) {
                 if (!cand_set.isSet(id)) continue;
-                const rec = ix.file(id);
-                if (prefix.len > 0 and !(std.mem.startsWith(u8, rec.path, prefix) and rec.path.len > prefix.len and rec.path[prefix.len] == '/')) continue;
+                const rec = v.file(id);
+                if (!under(rec.path, prefix)) continue;
                 if (!filter.allows(rec.path[strip..])) continue;
                 // Copy: rec.path points into the index mapping, which is closed before the scan.
                 const path = try arena.dupe(u8, rec.path);
                 try jobs.append(arena, .{ .path = path, .display = try displayPath(arena, req.path, path[strip..]) });
             }
+            if (v.delta != null) std.mem.sort(search.Job, jobs.items, {}, jobLess);
             outcome.stats = try std.fmt.allocPrint(arena, "index {d:.1} ms, {d} candidates, no freshness check", .{ load_ms, n_cand });
         } else {
             const t_fresh = std.time.nanoTimestamp();
-            const ch: ?watch.Changes = if (req.watch) |h| h.changes(h.ptr, arena, root, found.?.path, ix.build_id, req.hidden) else null;
+            const ch: ?watch.Changes = if (req.watch) |h| h.changes(h.ptr, arena, root, found_path, v.state_id, req.hidden) else null;
+            const may_update = ch == null or (req.watch != null and req.watch.?.auto_update);
             if (ch != null and !ch.?.full) {
-                const n = try watchedJobs(gpa, arena, req, root, prefix, &ix, &cand_set, filter, ch.?, &jobs);
-                if (n > 2000 and n * 10 > ix.file_count)
-                    outcome.note = try std.fmt.allocPrint(arena, "{d} files changed since indexing; reindexing makes searches fast again", .{n});
+                const changed = try watchedJobs(gpa, arena, req, root, prefix, &v, &cand_set, filter, ch.?, &jobs);
+                if (may_update and changed.len >= auto_update_threshold) {
+                    pending_update = changed;
+                    pending_seq = ch.?.seq;
+                }
                 outcome.stats = try std.fmt.allocPrint(arena, "index {d:.1} ms, {d} candidates, watcher {d:.1} ms: {d} changed files, {d} changed dirs", .{ load_ms, n_cand, ms(t_fresh), ch.?.files.len, ch.?.dirs.len });
             } else {
                 const entries = try walk.walk(arena, root, .{ .hidden = req.hidden, .prefix = prefix });
-                var by_path = std.StringHashMapUnmanaged(u32){};
-                try by_path.ensureTotalCapacity(arena, ix.file_count);
-                var id: u32 = 0;
-                while (id < ix.file_count) : (id += 1) by_path.putAssumeCapacity(ix.file(id).path, id);
-                var seen = try std.DynamicBitSetUnmanaged.initEmpty(arena, ix.file_count);
+                const by_path = try pathMap(arena, &v);
+                var seen = try std.DynamicBitSetUnmanaged.initEmpty(arena, v.file_count);
                 var changed_paths: std.ArrayList([]const u8) = .empty;
                 for (entries) |e| {
                     var changed = true;
                     var candidate = true;
                     if (by_path.get(e.path)) |fid| {
                         seen.set(fid);
-                        const rec = ix.file(fid);
+                        const rec = v.file(fid);
                         changed = rec.size != e.size or rec.mtime != e.mtime;
                         candidate = cand_set.isSet(fid);
                     }
@@ -248,17 +373,30 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
                     try jobs.append(arena, .{ .path = e.path, .display = try displayPath(arena, req.path, rel) });
                 }
                 const dirty = changed_paths.items.len;
-                if (req.watch) |h| if (prefix.len == 0) {
-                    // Deleted files count as changed too, so later watched searches drop them.
-                    id = 0;
-                    while (id < ix.file_count) : (id += 1) {
-                        if (!seen.isSet(id)) try changed_paths.append(arena, try arena.dupe(u8, ix.file(id).path));
+                // Deleted files count as changed too, so watched searches and the
+                // delta drop them. Only knowable when the walk covered everything.
+                if (prefix.len == 0 and !req.hidden) {
+                    var id: u32 = 0;
+                    while (id < v.file_count) : (id += 1) {
+                        if (v.live(id) and !seen.isSet(id)) try changed_paths.append(arena, try arena.dupe(u8, v.file(id).path));
                     }
-                    h.seeded(h.ptr, root, ix.build_id, req.hidden, changed_paths.items);
-                };
-                if (dirty > 200 and dirty * 10 > entries.len)
-                    outcome.note = try std.fmt.allocPrint(arena, "{d} files changed since indexing; reindexing makes searches fast again", .{dirty});
+                    var seq: u64 = 0;
+                    if (req.watch) |h| seq = h.seeded(h.ptr, root, v.state_id, req.hidden, changed_paths.items);
+                    if (may_update and changed_paths.items.len >= auto_update_threshold) {
+                        pending_update = changed_paths.items;
+                        pending_seq = seq;
+                    }
+                }
                 outcome.stats = try std.fmt.allocPrint(arena, "index {d:.1} ms, {d} candidates, freshness check {d:.1} ms over {d} files, {d} changed", .{ load_ms, n_cand, ms(t_fresh), entries.len, dirty });
+            }
+        }
+
+        if (pending_update) |changed| {
+            if (updateDelta(gpa, arena, root, found_path, &v, changed, req.threads)) |u| {
+                outcome.updated_index = try describeUpdate(arena, u);
+                if (req.watch) |h| h.rebased(h.ptr, root, pending_seq, u.state_id);
+            } else |err| {
+                outcome.note = try std.fmt.allocPrint(arena, "updating the index failed ({s}); searches stay correct, run `trigrep index`", .{@errorName(err)});
             }
         }
     }
@@ -275,47 +413,35 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
     return outcome;
 }
 
-fn under(path: []const u8, dir: []const u8) bool {
-    if (dir.len == 0) return true;
-    return path.len > dir.len and std.mem.startsWith(u8, path, dir) and path[dir.len] == '/';
-}
-
-fn underAny(path: []const u8, dirs: []const []const u8) bool {
-    for (dirs) |d| {
-        if (std.mem.eql(u8, path, d) or under(path, d)) return true;
-    }
-    return false;
-}
-
-fn jobLess(_: void, a: search.Job, b: search.Job) bool {
-    return walk.pathOrder(a.path, b.path);
-}
-
 /// Jobs for a search when a watcher vouches for the list of changes: index
 /// candidates that didn't change, plus changed files and changed directories
-/// re-checked directly. Returns how many paths changed.
+/// re-checked directly. Returns every changed path (for updating the delta).
 fn watchedJobs(
     gpa: Allocator,
     arena: Allocator,
     req: Request,
     root: []const u8,
     prefix: []const u8,
-    ix: *const index.Index,
+    v: *const View,
     cand_set: *const std.DynamicBitSetUnmanaged,
     filter: walk.Filter,
     ch: watch.Changes,
     jobs: *std.ArrayList(search.Job),
-) !usize {
+) ![]const []const u8 {
     const strip = if (prefix.len == 0) 0 else prefix.len + 1;
     var dirty = std.StringHashMapUnmanaged(void){};
     for (ch.files) |f| try dirty.put(arena, f, {});
+    var changed: std.ArrayList([]const u8) = .empty;
+    try changed.appendSlice(arena, ch.files);
 
     var id: u32 = 0;
-    while (id < ix.file_count) : (id += 1) {
-        if (!cand_set.isSet(id)) continue;
-        const rec = ix.file(id);
-        if (!under(rec.path, prefix)) continue;
-        if (dirty.contains(rec.path) or underAny(rec.path, ch.dirs)) continue;
+    while (id < v.file_count) : (id += 1) {
+        if (!v.live(id)) continue;
+        const rec = v.file(id);
+        const in_dir = ch.dirs.len > 0 and underAny(rec.path, ch.dirs);
+        if (in_dir) try changed.append(arena, try arena.dupe(u8, rec.path));
+        if (!cand_set.isSet(id) or !under(rec.path, prefix)) continue;
+        if (in_dir or dirty.contains(rec.path)) continue;
         if (!filter.allows(rec.path[strip..])) continue;
         const path = try arena.dupe(u8, rec.path);
         try jobs.append(arena, .{ .path = path, .display = try displayPath(arena, req.path, path[strip..]) });
@@ -340,36 +466,35 @@ fn watchedJobs(
             if (i != j and (under(d, other) or (std.mem.eql(u8, d, other) and j < i))) nested = true;
         }
         if (nested) continue;
-        const wp = if (under(d, prefix) or std.mem.eql(u8, d, prefix)) d else if (under(prefix, d)) prefix else continue;
-        const entries = try walk.walk(arena, root, .{ .hidden = req.hidden, .prefix = wp });
+        // Walk the whole changed directory (for the delta), search the part in the prefix.
+        const entries = try walk.walk(arena, root, .{ .hidden = req.hidden, .prefix = d });
         for (entries) |e| {
+            try changed.append(arena, e.path);
+            if (!under(e.path, prefix)) continue;
             if (!filter.allows(e.path[strip..])) continue;
             try jobs.append(arena, .{ .path = e.path, .display = try displayPath(arena, req.path, e.path[strip..]) });
         }
     }
     std.mem.sort(search.Job, jobs.items, {}, jobLess);
-    return ch.files.len + ch.dirs.len;
+    return changed.items;
 }
 
-/// Paths that differ between index `ix` and a full walk: modified, new and deleted.
-pub fn diffIndex(arena: Allocator, ix: *const index.Index, entries: []const walk.Entry) ![]const []const u8 {
-    var by_path = std.StringHashMapUnmanaged(u32){};
-    try by_path.ensureTotalCapacity(arena, ix.file_count);
-    var id: u32 = 0;
-    while (id < ix.file_count) : (id += 1) by_path.putAssumeCapacity(ix.file(id).path, id);
-    var seen = try std.DynamicBitSetUnmanaged.initEmpty(arena, ix.file_count);
+/// Paths that differ between the index and a full walk: modified, new and deleted.
+pub fn diffIndex(arena: Allocator, v: *const View, entries: []const walk.Entry) ![]const []const u8 {
+    const by_path = try pathMap(arena, v);
+    var seen = try std.DynamicBitSetUnmanaged.initEmpty(arena, v.file_count);
     var out: std.ArrayList([]const u8) = .empty;
     for (entries) |e| {
         if (by_path.get(e.path)) |fid| {
             seen.set(fid);
-            const rec = ix.file(fid);
+            const rec = v.file(fid);
             if (rec.size == e.size and rec.mtime == e.mtime) continue;
         }
         try out.append(arena, e.path);
     }
-    id = 0;
-    while (id < ix.file_count) : (id += 1) {
-        if (!seen.isSet(id)) try out.append(arena, try arena.dupe(u8, ix.file(id).path));
+    var id: u32 = 0;
+    while (id < v.file_count) : (id += 1) {
+        if (v.live(id) and !seen.isSet(id)) try out.append(arena, try arena.dupe(u8, v.file(id).path));
     }
     return out.items;
 }
@@ -381,6 +506,7 @@ pub const Status = struct {
     age_s: i64,
     files: u32,
     trigrams: u32,
+    delta_files: u32,
     modified: usize,
     added: usize,
     deleted: usize,
@@ -389,17 +515,15 @@ pub const Status = struct {
 /// Index status for `target`, or null if no index covers it.
 pub fn status(arena: Allocator, target: []const u8) !?Status {
     const found = (try findIndex(arena, target)) orelse return null;
-    var ix = try index.Index.open(found.path);
-    defer ix.close();
+    var v = try View.open(arena, found.path);
+    defer v.close();
     const entries = try walk.walk(arena, found.root, .{});
-    var by_path = std.StringHashMapUnmanaged(u32){};
-    var id: u32 = 0;
-    while (id < ix.file_count) : (id += 1) try by_path.put(arena, ix.file(id).path, id);
+    var by_path = try pathMap(arena, &v);
     var modified: usize = 0;
     var added: usize = 0;
     for (entries) |e| {
         if (by_path.fetchRemove(e.path)) |kv| {
-            const rec = ix.file(kv.value);
+            const rec = v.file(kv.value);
             if (rec.size != e.size or rec.mtime != e.mtime) modified += 1;
         } else added += 1;
     }
@@ -409,8 +533,9 @@ pub fn status(arena: Allocator, target: []const u8) !?Status {
         .index_path = found.path,
         .index_bytes = st.size,
         .age_s = @intCast(@divTrunc(std.time.nanoTimestamp() - st.mtime, std.time.ns_per_s)),
-        .files = ix.file_count,
-        .trigrams = ix.tri_count,
+        .files = v.liveCount(),
+        .trigrams = v.base.tri_count,
+        .delta_files = if (v.delta) |d| d.file_count else 0,
         .modified = modified,
         .added = added,
         .deleted = by_path.count(),
@@ -420,9 +545,62 @@ pub fn status(arena: Allocator, target: []const u8) !?Status {
 pub fn describeStatus(arena: Allocator, s: Status) ![]const u8 {
     return std.fmt.allocPrint(arena,
         \\root:     {s}
-        \\index:    {s} ({d:.1} MB, built {d} s ago)
+        \\index:    {s} ({d:.1} MB, built {d} s ago; {d} files in the delta)
         \\files:    {d} indexed, {d} trigrams
         \\changed:  {d} modified, {d} new, {d} deleted
         \\
-    , .{ s.root, s.index_path, @as(f64, @floatFromInt(s.index_bytes)) / 1e6, s.age_s, s.files, s.trigrams, s.modified, s.added, s.deleted });
+    , .{ s.root, s.index_path, @as(f64, @floatFromInt(s.index_bytes)) / 1e6, s.age_s, s.delta_files, s.files, s.trigrams, s.modified, s.added, s.deleted });
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+
+test "delta updates replace, add and delete files, and searches see them" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.makePath("idx");
+    try tmp.dir.makePath("repo");
+    try tmp.dir.writeFile(.{ .sub_path = "repo/a.txt", .data = "alpha one\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "repo/b.txt", .data = "beta one\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "repo/c.txt", .data = "gamma one\n" });
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const repo = try tmp.dir.realpathAlloc(arena, "repo");
+    const idx_dir = try tmp.dir.realpathAlloc(arena, "idx");
+    const index_path = try std.fmt.allocPrint(arena, "{s}/x.idx", .{idx_dir});
+
+    const entries = try walk.walk(arena, repo, .{});
+    const base = try index.build(gpa, repo, entries, index_path, 2, .{});
+
+    // Change b, delete c, add d.
+    try tmp.dir.writeFile(.{ .sub_path = "repo/b.txt", .data = "beta two zebra\n" });
+    try tmp.dir.deleteFile("repo/c.txt");
+    try tmp.dir.writeFile(.{ .sub_path = "repo/d.txt", .data = "delta zebra\n" });
+
+    var v = try View.open(arena, index_path);
+    const now = try walk.walk(arena, repo, .{});
+    const changed = try diffIndex(arena, &v, now);
+    try std.testing.expectEqual(@as(usize, 3), changed.len);
+    const u = try updateDelta(gpa, arena, repo, index_path, &v, changed, 2);
+    v.close();
+    try std.testing.expectEqual(@as(usize, 3), u.delta_files);
+    try std.testing.expect(u.state_id != base.build_id);
+
+    var v2 = try View.open(arena, index_path);
+    defer v2.close();
+    try std.testing.expectEqual(u.state_id, v2.state_id);
+    try std.testing.expectEqual(@as(u32, 3), v2.liveCount()); // a, b(new), d
+    // The index now agrees with the tree.
+    try std.testing.expectEqual(@as(usize, 0), (try diffIndex(arena, &v2, try walk.walk(arena, repo, .{}))).len);
+
+    const zebra = try query.plan(arena, try regex.parse(arena, "zebra", .{}));
+    const ids = (try v2.candidates(arena, zebra.query)).?;
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    for (ids) |id| try std.testing.expect(std.mem.indexOf(u8, v2.file(id).path, "c.txt") == null);
+    const gamma = try query.plan(arena, try regex.parse(arena, "gamma", .{}));
+    try std.testing.expectEqual(@as(usize, 0), (try v2.candidates(arena, gamma.query)).?.len);
+    const beta = try query.plan(arena, try regex.parse(arena, "beta one", .{}));
+    try std.testing.expectEqual(@as(usize, 0), (try v2.candidates(arena, beta.query)).?.len);
 }
