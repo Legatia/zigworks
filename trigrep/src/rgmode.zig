@@ -133,7 +133,7 @@ fn parse(arena: Allocator, args: []const []const u8) !?Parsed {
 }
 
 /// The real ripgrep: $TRIGREP_REAL_RG, or the first `rg` on PATH that isn't us.
-fn realRg(arena: Allocator) ?[]const u8 {
+pub fn realRg(arena: Allocator) ?[]const u8 {
     if (std.posix.getenv("TRIGREP_REAL_RG")) |p| return p;
     const self = std.fs.selfExePathAlloc(arena) catch return null;
     const self_real = std.fs.cwd().realpathAlloc(arena, self) catch self;
@@ -228,10 +228,40 @@ fn ensureDaemon(gpa: Allocator, arena: Allocator, root: []const u8, index_path: 
     child.spawn() catch {};
 }
 
-/// `trigrep __bg-index ROOT LOCK`: build the index, then remove the lock.
+extern "c" fn nice(inc: c_int) c_int;
+
+/// `trigrep __bg-index ROOT LOCK`: build the index at low priority, remove the
+/// lock, then drop indexes of repositories that have been deleted.
 pub fn backgroundIndex(gpa: Allocator, arena: Allocator, root: []const u8, lock: []const u8) void {
-    defer std.fs.cwd().deleteFile(lock) catch {};
-    _ = engine.buildIndex(gpa, arena, root, null) catch return;
+    _ = nice(10);
+    {
+        defer std.fs.cwd().deleteFile(lock) catch {};
+        _ = engine.buildIndex(gpa, arena, root, null) catch return;
+    }
+    const dir = index.cacheDir(arena) catch return;
+    _ = index.prune(arena, dir, null) catch {};
+}
+
+/// The directory to index after a slow search under `target`: the enclosing
+/// git repository. Null outside a repository, and when the repository is the
+/// home directory or above it (dotfiles kept in git), where an index would
+/// take in everything the user owns. `trigrep index` still works anywhere.
+fn autoIndexRoot(arena: Allocator, target: []const u8) !?[]const u8 {
+    if (std.posix.getenv("TRIGREP_RG_AUTO_INDEX")) |v| {
+        if (std.mem.eql(u8, v, "0")) return null;
+    }
+    const root = (try engine.gitRoot(arena, target)) orelse return null;
+    if (std.posix.getenv("HOME")) |home| {
+        const real = std.fs.cwd().realpathAlloc(arena, home) catch home;
+        if (contains(root, real)) return null;
+    }
+    return root;
+}
+
+/// True if `path` is `dir` or lies under it.
+fn contains(dir: []const u8, path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, dir)) return false;
+    return path.len == dir.len or dir[dir.len - 1] == '/' or path[dir.len] == '/';
 }
 
 pub fn main(gpa: Allocator, arena: Allocator, argv: []const []const u8) !noreturn {
@@ -249,8 +279,8 @@ pub fn main(gpa: Allocator, arena: Allocator, argv: []const []const u8) !noretur
         const r = timedRg(gpa, arena, argv) catch passthrough(arena, argv);
         const min_ms: i64 = if (std.posix.getenv("TRIGREP_RG_MIN_MS")) |s| (std.fmt.parseInt(i64, s, 10) catch 300) else 300;
         if (r.ms >= min_ms) {
-            const root = if (found) |f| f.root else ((try engine.gitRoot(arena, target)) orelse target);
-            startBackgroundIndex(gpa, arena, root);
+            const root = if (found) |f| f.root else try autoIndexRoot(arena, target);
+            if (root) |dir| startBackgroundIndex(gpa, arena, dir);
         }
         std.process.exit(r.code);
     }
@@ -292,6 +322,14 @@ pub fn main(gpa: Allocator, arena: Allocator, argv: []const []const u8) !noretur
 // The `trigrep watch` daemon, reached through its socket (see main.zig).
 fn daemonHook() engine.WatchHook {
     return @import("main.zig").daemonWatchHook();
+}
+
+test "automatic indexing stays inside repositories below the home directory" {
+    try std.testing.expect(contains("/Users/me", "/Users/me"));
+    try std.testing.expect(contains("/Users", "/Users/me"));
+    try std.testing.expect(contains("/", "/Users/me"));
+    try std.testing.expect(!contains("/Users/me/code/app", "/Users/me"));
+    try std.testing.expect(!contains("/Users/m", "/Users/me"));
 }
 
 test "parse Claude Code's Grep invocations" {

@@ -72,16 +72,100 @@ pub fn extractTrigrams(gpa: Allocator, data: []const u8, seen: []u64, out: *std.
 /// Where the index for `root` (an absolute path) lives: $TRIGREP_INDEX_DIR,
 /// $XDG_CACHE_HOME/trigrep or ~/.cache/trigrep, named by a hash of the root.
 pub fn pathFor(arena: Allocator, root: []const u8) ![]u8 {
-    const dir = if (std.posix.getenv("TRIGREP_INDEX_DIR")) |d|
+    const dir = try cacheDir(arena);
+    const h = std.hash.Wyhash.hash(0, root);
+    return std.fmt.allocPrint(arena, "{s}/{x:0>16}.idx", .{ dir, h });
+}
+
+/// The directory all indexes live in.
+pub fn cacheDir(arena: Allocator) ![]u8 {
+    return if (std.posix.getenv("TRIGREP_INDEX_DIR")) |d|
         try arena.dupe(u8, d)
     else if (std.posix.getenv("XDG_CACHE_HOME")) |d|
         try std.fs.path.join(arena, &.{ d, "trigrep" })
     else if (std.posix.getenv("HOME")) |h|
         try std.fs.path.join(arena, &.{ h, ".cache", "trigrep" })
     else
-        return error.NoCacheDir;
-    const h = std.hash.Wyhash.hash(0, root);
-    return std.fmt.allocPrint(arena, "{s}/{x:0>16}.idx", .{ dir, h });
+        error.NoCacheDir;
+}
+
+pub const Pruned = struct {
+    removed: usize = 0,
+    removed_bytes: u64 = 0,
+    kept: usize = 0,
+    kept_bytes: u64 = 0,
+};
+
+/// Deletes the indexes in `dir_path` whose root directory no longer exists (a
+/// removed checkout or worktree). With `report`, lists every index and what
+/// happened to it. Indexes this version can't read are left alone.
+pub fn prune(arena: Allocator, dir_path: []const u8, report: ?*std.Io.Writer) !Pruned {
+    var res: Pruned = .{};
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return res,
+        else => return err,
+    };
+    defer dir.close();
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (try it.next()) |e| {
+        if (e.kind == .file and std.mem.endsWith(u8, e.name, ".idx")) try names.append(arena, try arena.dupe(u8, e.name));
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    for (names.items) |name| {
+        const path = try std.fs.path.join(arena, &.{ dir_path, name });
+        const delta = try deltaPath(arena, path);
+        const bytes = fileSize(path) + fileSize(delta);
+        var ix = Index.open(path) catch {
+            if (report) |w| try w.print("skipped  {d:>7.1} MB  {s} (not readable by this version)\n", .{ mb(bytes), path });
+            continue;
+        };
+        const root = try arena.dupe(u8, ix.root);
+        ix.close();
+        if (rootGone(root)) {
+            std.fs.cwd().deleteFile(path) catch {};
+            std.fs.cwd().deleteFile(delta) catch {};
+            std.fs.cwd().deleteFile(try std.fmt.allocPrint(arena, "{s}.building", .{path})) catch {};
+            res.removed += 1;
+            res.removed_bytes += bytes;
+            if (report) |w| try w.print("removed  {d:>7.1} MB  {s}\n", .{ mb(bytes), root });
+        } else {
+            res.kept += 1;
+            res.kept_bytes += bytes;
+            if (report) |w| try w.print("kept     {d:>7.1} MB  {s}\n", .{ mb(bytes), root });
+        }
+    }
+    return res;
+}
+
+fn mb(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / 1e6;
+}
+
+fn fileSize(path: []const u8) u64 {
+    const st = std.fs.cwd().statFile(path) catch return 0;
+    return st.size;
+}
+
+fn missing(path: []const u8) bool {
+    std.fs.cwd().access(path, .{}) catch |err| return err == error.FileNotFound;
+    return false;
+}
+
+/// True if `root` has been deleted. A root on a volume that isn't mounted
+/// right now is not gone.
+fn rootGone(root: []const u8) bool {
+    if (!missing(root)) return false;
+    for ([_][]const u8{ "/Volumes/", "/mnt/", "/media/", "/run/media/" }) |mounts| {
+        if (!std.mem.startsWith(u8, root, mounts)) continue;
+        const end = std.mem.indexOfScalarPos(u8, root, mounts.len, '/') orelse root.len;
+        if (missing(root[0..end])) return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +660,43 @@ test "trigram extraction folds case and skips newlines" {
         @import("query.zig").trigramKey('b', 'c', 'd'),
     }, out.items);
     for (seen) |w| try std.testing.expectEqual(@as(u64, 0), w);
+}
+
+test "prune removes indexes whose root is gone" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.makePath("cache");
+    try tmp.dir.makePath("here");
+    try tmp.dir.makePath("gone");
+    try tmp.dir.writeFile(.{ .sub_path = "here/a.txt", .data = "hello\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "gone/b.txt", .data = "world\n" });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const base = try tmp.dir.realpathAlloc(arena, ".");
+    const cache = try std.fs.path.join(arena, &.{ base, "cache" });
+    for ([_][]const u8{ "here", "gone" }) |name| {
+        const root = try std.fs.path.join(arena, &.{ base, name });
+        const entries = try walk.walk(arena, root, .{});
+        _ = try build(gpa, root, entries, try std.fmt.allocPrint(arena, "{s}/{s}.idx", .{ cache, name }), 1, .{});
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "cache/gone.idx.delta", .data = "x" });
+    try tmp.dir.writeFile(.{ .sub_path = "cache/old.idx", .data = "not an index" });
+    try tmp.dir.deleteTree("gone");
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const res = try prune(arena, cache, &out.writer);
+    try std.testing.expectEqual(@as(usize, 1), res.removed);
+    try std.testing.expectEqual(@as(usize, 1), res.kept);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "removed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "skipped") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("cache/gone.idx", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("cache/gone.idx.delta", .{}));
+    try tmp.dir.access("cache/here.idx", .{});
+    try tmp.dir.access("cache/old.idx", .{});
+    try std.testing.expect(!rootGone("/Volumes/trigrep-no-such-volume/repo"));
 }
 
 test "build, open and query an index" {

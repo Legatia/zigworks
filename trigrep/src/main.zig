@@ -12,7 +12,7 @@ const view = @import("view.zig");
 const rgmode = @import("rgmode.zig");
 const View = view.View;
 
-pub const version = "0.2.1";
+pub const version = "0.3.0";
 
 const usage =
     \\trigrep: indexed code search
@@ -21,6 +21,8 @@ const usage =
     \\  trigrep [OPTIONS] PATTERN [PATH]   search; builds the index on first use
     \\  trigrep index [--update] [PATH]    build or rebuild the index; --update only
     \\                                     re-indexes files that changed
+    \\  trigrep index --prune              list all indexes; delete those whose
+    \\                                     directory no longer exists
     \\  trigrep status [PATH]              show the index and how many files changed
     \\  trigrep watch [PATH]               keep the index fresh; searches skip the full walk
     \\        [--idle-exit MINUTES]        stop after MINUTES without searches
@@ -66,6 +68,7 @@ const Args = struct {
     max_count: ?usize = null,
     context: search.Context = .{},
     update: bool = false,
+    prune: bool = false,
     /// `watch --idle-exit MINUTES`: stop after this long without searches.
     idle_exit_min: ?i64 = null,
     globs: std.ArrayList([]const u8) = .empty,
@@ -128,6 +131,7 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
             } else if (std.mem.eql(u8, name, "after-context")) a.context.after = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --after-context", .{})
             else if (std.mem.eql(u8, name, "before-context")) a.context.before = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --before-context", .{})
             else if (std.mem.eql(u8, name, "update")) a.update = true
+            else if (std.mem.eql(u8, name, "prune")) a.prune = true
             else if (std.mem.eql(u8, name, "idle-exit")) a.idle_exit_min = std.fmt.parseInt(i64, value(argv, &i, inline_value, name), 10) catch fail("bad --idle-exit", .{})
             else if (std.mem.eql(u8, name, "type")) try a.types.append(arena, value(argv, &i, inline_value, name))
             else if (std.mem.eql(u8, name, "type-not")) try a.types_not.append(arena, value(argv, &i, inline_value, name))
@@ -269,6 +273,19 @@ pub fn main() !void {
         .mcp => return mcp.serve(gpa),
         .watch => return watchMain(gpa, arena, a),
         .index => {
+            if (a.prune) {
+                const dir = index.cacheDir(arena) catch fail("no index directory: set HOME or TRIGREP_INDEX_DIR", .{});
+                var buf: [4096]u8 = undefined;
+                var w = std.fs.File.stdout().writerStreaming(&buf);
+                const p = index.prune(arena, dir, &w.interface) catch |err| fail("can't read {s}: {s}", .{ dir, @errorName(err) });
+                try w.interface.flush();
+                std.debug.print("trigrep: removed {d} ({d:.1} MB), kept {d} ({d:.1} MB) in {s}\n", .{
+                    p.removed, @as(f64, @floatFromInt(p.removed_bytes)) / 1e6,
+                    p.kept,    @as(f64, @floatFromInt(p.kept_bytes)) / 1e6,
+                    dir,
+                });
+                return;
+            }
             const target = engine.resolve(arena, a.path, &diag) catch fail("{s}", .{diag.message});
             if (a.update) {
                 const found = (try engine.findIndex(arena, target)) orelse fail("no index covers {s}; run `trigrep index` first", .{target});
@@ -340,25 +357,49 @@ fn installShim(arena: Allocator, dir_arg: ?[]const u8) !void {
     const link = try std.fs.path.join(arena, &.{ dir, "rg" });
     std.fs.cwd().deleteFile(link) catch {};
     std.fs.cwd().symLink(self, link, .{}) catch |err| fail("can't create {s}: {s}", .{ link, @errorName(err) });
+    // The PATH to paste: this directory first, then the current PATH without it.
+    var path: std.ArrayList(u8) = .empty;
+    try path.appendSlice(arena, dir);
+    var it = std.mem.tokenizeScalar(u8, std.posix.getenv("PATH") orelse "", ':');
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    try seen.put(arena, dir, {});
+    while (it.next()) |d| {
+        if ((try seen.getOrPut(arena, d)).found_existing) continue;
+        try path.append(arena, ':');
+        try path.appendSlice(arena, d);
+    }
+    const real = rgmode.realRg(arena);
+
     var buf: [2048]u8 = undefined;
     var w = std.fs.File.stdout().writerStreaming(&buf);
-    try w.interface.print(
-        \\Created {s} -> {s}
+    const out = &w.interface;
+    try out.print("Created {s} -> {s}\n\n", .{ link, self });
+    if (real == null) try out.writeAll(
+        \\ripgrep was not found on PATH. Install it first: searches trigrep can't
+        \\reproduce exactly, and searches in small repositories, are handed to it.
         \\
-        \\To have Claude Code's Grep tool use it, add to ~/.claude/settings.json:
         \\
-        \\  "env": {{
-        \\    "USE_BUILTIN_RIPGREP": "0",
-        \\    "PATH": "{s}:<your existing PATH>"
-        \\  }}
+    );
+    try out.writeAll("To have Claude Code's Grep tool use it, add these to \"env\" in ~/.claude/settings.json:\n\n");
+    try out.writeAll("  \"USE_BUILTIN_RIPGREP\": \"0\",\n");
+    if (real) |r| {
+        try out.writeAll("  \"TRIGREP_REAL_RG\": ");
+        try std.json.Stringify.encodeJsonString(r, .{}, out);
+        try out.writeAll(",\n");
+    }
+    try out.writeAll("  \"PATH\": ");
+    try std.json.Stringify.encodeJsonString(path.items, .{}, out);
+    try out.print(
+        \\
         \\
         \\or start Claude Code with: USE_BUILTIN_RIPGREP=0 PATH="{s}:$PATH" claude
         \\
-        \\Searches trigrep can't reproduce exactly go to the real ripgrep on your PATH
-        \\(it must be installed). Repositories where ripgrep is already fast are left
-        \\alone; slow ones get an index built in the background on first use.
+        \\Repositories where ripgrep is already fast are left alone. A git repository
+        \\where a search takes 300 ms or more gets an index built in the background.
+        \\`trigrep index --prune` lists the indexes and removes those of deleted
+        \\repositories.
         \\
-    , .{ link, self, dir, dir });
+    , .{dir});
     try w.interface.flush();
 }
 

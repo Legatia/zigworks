@@ -10,6 +10,7 @@ trigrep -o 'EXPORT_SYMBOL\w*'       # print only the matched text
 trigrep --json 'fo+' src/            # ripgrep's JSON Lines format
 trigrep index                        # rebuild from scratch
 trigrep index --update               # re-index only files that changed
+trigrep index --prune                # list indexes, delete those of removed directories
 trigrep status                       # how many files changed since indexing
 trigrep watch &                      # optional: searches skip the freshness walk
 ```
@@ -43,9 +44,12 @@ trigrep install-rg-shim              # creates ~/.local/share/trigrep/bin/rg -> 
 USE_BUILTIN_RIPGREP=0 PATH="$HOME/.local/share/trigrep/bin:$PATH" claude
 ```
 
+`install-rg-shim` also prints the three `env` entries (`USE_BUILTIN_RIPGREP`, `TRIGREP_REAL_RG`, `PATH`) to paste into `~/.claude/settings.json` to make this permanent.
+
 Invoked as `rg`, trigrep handles the searches it can reproduce exactly (Claude Code's `-l --null`, `--json -n`, `-c -H --null`, context, `--glob`, `--max-columns`, `-i/-w/-F/-o/-m/-t`) and hands everything else to the real ripgrep, which must be on PATH (or set `TRIGREP_REAL_RG`). It stays out of the way where ripgrep is already fast:
 
-- No index yet: the real ripgrep answers. If that took 300 ms or more (`TRIGREP_RG_MIN_MS`), an index is built in the background for next time.
+- No index yet: the real ripgrep answers. If that took 300 ms or more (`TRIGREP_RG_MIN_MS`) and the search was inside a git repository, an index of the repository is built in the background, at low priority, for next time. Directories outside a repository, and a repository at or above your home directory, are never indexed on their own; `trigrep index` there opts in. `TRIGREP_RG_AUTO_INDEX=0` turns background indexing off.
+- After each background build, indexes of repositories that no longer exist (deleted checkouts and worktrees) are removed. `trigrep index --prune` does the same on demand and lists every index with its size.
 - A search in a subtree with fewer than 3,000 indexed files (`TRIGREP_RG_MIN_FILES`), or of a single file, goes to ripgrep.
 - Otherwise trigrep searches, and starts `trigrep watch --idle-exit 30` for the repository if none is running, so later searches skip the freshness walk. The watcher exits after 30 minutes without queries.
 - Any error before output is written falls back to ripgrep.
