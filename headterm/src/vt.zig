@@ -22,6 +22,7 @@ pub const Cell = struct {
     /// 1 for normal cells, 2 for the left half of a wide character,
     /// 0 for the right half (a spacer that renders as nothing).
     width: u2 = 1,
+    style: Style = .{},
 };
 
 const blank: Cell = .{};
@@ -32,7 +33,7 @@ pub const Color = union(enum) {
     rgb: [3]u8,
 };
 
-/// SGR state. Parsed and tracked but not stored per cell in v0.
+/// SGR attributes, stored per cell.
 pub const Style = struct {
     fg: Color = .default,
     bg: Color = .default,
@@ -242,6 +243,12 @@ pub const Terminal = struct {
         return self.grid().rows[r];
     }
 
+    /// A cell cleared by an erase, insert, delete or scroll. It takes the
+    /// current background color (xterm's "bce", which ncurses relies on).
+    fn erased(self: *const Terminal) Cell {
+        return .{ .style = .{ .bg = self.cursor.style.bg } };
+    }
+
     // ------------------------------------------------------------------
     // Output
 
@@ -260,6 +267,25 @@ pub const Terminal = struct {
     /// its full width), so a search for "$ " matches a prompt.
     pub fn appendRowTextPadded(self: *const Terminal, r: usize, out: *std.ArrayList(u8), gpa: Allocator) !void {
         try appendCellsText(self.rowCells(r), out, gpa, false);
+    }
+
+    /// Appends the runs of row `r` that have a non-default style: maximal
+    /// ranges of cells with equal attributes, `end` exclusive.
+    pub fn appendStyleRuns(self: *const Terminal, r: usize, out: *std.ArrayList(StyleRun), gpa: Allocator) !void {
+        const cells = self.rowCells(r);
+        var i: usize = 0;
+        while (i < cells.len) {
+            const st = shownStyle(cells[i].style);
+            var j = i + 1;
+            while (j < cells.len and std.meta.eql(shownStyle(cells[j].style), st)) j += 1;
+            if (!std.meta.eql(st, Style{})) try out.append(gpa, .{ .start = i, .end = j, .style = st });
+            i = j;
+        }
+    }
+
+    /// Text of cells [start, end) of row `r`, trailing spaces removed.
+    pub fn appendRangeText(self: *const Terminal, r: usize, start: usize, end: usize, out: *std.ArrayList(u8), gpa: Allocator) !void {
+        try appendCellsText(self.rowCells(r)[start..end], out, gpa, true);
     }
 
     /// Whole visible screen, one line per row joined by '\n'. Caller owns.
@@ -809,8 +835,8 @@ pub const Terminal = struct {
         if (self.modes.insert) self.shiftRight(c.row, c.col, w);
         self.splitWide(c.row, c.col);
         if (w == 2) self.splitWide(c.row, c.col + 1);
-        row[c.col] = .{ .cp = cp, .width = w };
-        if (w == 2) row[c.col + 1] = .{ .cp = 0, .width = 0 };
+        row[c.col] = .{ .cp = cp, .width = w, .style = c.style };
+        if (w == 2) row[c.col + 1] = .{ .cp = 0, .width = 0, .style = c.style };
         self.last_printed = cp_in;
 
         if (c.col + w >= self.cols) {
@@ -840,7 +866,7 @@ pub const Terminal = struct {
         if (from >= to) return;
         self.splitWide(r, from);
         self.splitWide(r, to - 1);
-        @memset(self.line(r)[from..to], blank);
+        @memset(self.line(r)[from..to], self.erased());
     }
 
     fn shiftRight(self: *Terminal, r: usize, col: usize, n_in: usize) void {
@@ -848,7 +874,7 @@ pub const Terminal = struct {
         const n = @min(n_in, self.cols - col);
         self.splitWide(r, col);
         std.mem.copyBackwards(Cell, row[col + n ..], row[col .. self.cols - n]);
-        @memset(row[col .. col + n], blank);
+        @memset(row[col .. col + n], self.erased());
         if (row[self.cols - 1].width == 2) row[self.cols - 1] = blank;
     }
 
@@ -965,14 +991,14 @@ pub const Terminal = struct {
             for (rows[0..n]) |r| try self.pushScrollback(r);
         }
         std.mem.rotate([]Cell, rows[self.top .. self.bottom + 1], n);
-        for (rows[self.bottom + 1 - n .. self.bottom + 1]) |r| @memset(r, blank);
+        for (rows[self.bottom + 1 - n .. self.bottom + 1]) |r| @memset(r, self.erased());
     }
 
     fn scrollDown(self: *Terminal, n_in: usize) !void {
         const n = @min(n_in, self.bottom - self.top + 1);
         const region = self.grid().rows[self.top .. self.bottom + 1];
         std.mem.rotate([]Cell, region, region.len - n);
-        for (region[0..n]) |r| @memset(r, blank);
+        for (region[0..n]) |r| @memset(r, self.erased());
     }
 
     fn pushScrollback(self: *Terminal, cells: []const Cell) !void {
@@ -1000,13 +1026,13 @@ pub const Terminal = struct {
         switch (mode) {
             0 => {
                 self.clearCells(c.row, c.col, self.cols);
-                for (c.row + 1..self.rows) |r| @memset(self.line(r), blank);
+                for (c.row + 1..self.rows) |r| @memset(self.line(r), self.erased());
             },
             1 => {
-                for (0..c.row) |r| @memset(self.line(r), blank);
+                for (0..c.row) |r| @memset(self.line(r), self.erased());
                 self.clearCells(c.row, 0, c.col + 1);
             },
-            2 => self.grid().clear(),
+            2 => for (self.grid().rows) |r| @memset(r, self.erased()),
             3 => self.scrollback.clear(self.gpa),
             else => {},
         }
@@ -1042,7 +1068,7 @@ pub const Terminal = struct {
         self.splitWide(c.row, c.col);
         self.splitWide(c.row, c.col + n - 1);
         std.mem.copyForwards(Cell, row[c.col .. self.cols - n], row[c.col + n ..]);
-        @memset(row[self.cols - n ..], blank);
+        @memset(row[self.cols - n ..], self.erased());
     }
 
     fn insertLines(self: *Terminal, n_in: usize) void {
@@ -1051,7 +1077,7 @@ pub const Terminal = struct {
         const region = self.grid().rows[c.row .. self.bottom + 1];
         const n = @min(n_in, region.len);
         std.mem.rotate([]Cell, region, region.len - n);
-        for (region[0..n]) |r| @memset(r, blank);
+        for (region[0..n]) |r| @memset(r, self.erased());
         c.col = 0;
         c.pending_wrap = false;
     }
@@ -1062,7 +1088,7 @@ pub const Terminal = struct {
         const region = self.grid().rows[c.row .. self.bottom + 1];
         const n = @min(n_in, region.len);
         std.mem.rotate([]Cell, region, n);
-        for (region[region.len - n ..]) |r| @memset(r, blank);
+        for (region[region.len - n ..]) |r| @memset(r, self.erased());
         c.col = 0;
         c.pending_wrap = false;
     }
@@ -1167,6 +1193,19 @@ pub const Terminal = struct {
 };
 
 const da1_reply = "\x1b[?62;22c";
+
+pub const StyleRun = struct {
+    start: usize,
+    end: usize,
+    style: Style,
+};
+
+/// The attributes reported to clients; underline color is not.
+fn shownStyle(s: Style) Style {
+    var x = s;
+    x.underline_color = .default;
+    return x;
+}
 
 fn copyGrid(dst: *Grid, src: *const Grid, skip: usize, cols: usize) void {
     var r: usize = 0;
@@ -1690,4 +1729,75 @@ test "backspace and carriage return with pending wrap" {
     defer t.deinit();
     try t.feed("abc\x08x");
     try expectScreen(&t, "axc\n");
+}
+
+fn expectRuns(t: *const Terminal, row: usize, expected: []const StyleRun) !void {
+    var runs: std.ArrayList(StyleRun) = .empty;
+    defer runs.deinit(testing.allocator);
+    try t.appendStyleRuns(row, &runs, testing.allocator);
+    try testing.expectEqual(expected.len, runs.items.len);
+    for (expected, runs.items) |e, got| {
+        try testing.expectEqual(e.start, got.start);
+        try testing.expectEqual(e.end, got.end);
+        try testing.expect(std.meta.eql(e.style, got.style));
+    }
+}
+
+test "styles are stored per cell" {
+    var t = try testTerm(20, 2);
+    defer t.deinit();
+    try t.feed("ab\x1b[1;31mcd\x1b[0m e\x1b[38;5;208;48;2;1;2;3mf\x1b[m");
+    try testing.expect(t.rowCells(0)[2].style.bold);
+    try testing.expectEqual(Color{ .palette = 1 }, t.rowCells(0)[3].style.fg);
+    try testing.expect(!t.rowCells(0)[4].style.bold);
+    try expectRuns(&t, 0, &.{
+        .{ .start = 2, .end = 4, .style = .{ .bold = true, .fg = .{ .palette = 1 } } },
+        .{ .start = 6, .end = 7, .style = .{ .fg = .{ .palette = 208 }, .bg = .{ .rgb = .{ 1, 2, 3 } } } },
+    });
+    try expectRuns(&t, 1, &.{});
+}
+
+test "wide characters carry their style on both halves" {
+    var t = try testTerm(10, 1);
+    defer t.deinit();
+    try t.feed("\x1b[4m\xe4\xb8\xad\x1b[24mx");
+    try expectRuns(&t, 0, &.{.{ .start = 0, .end = 2, .style = .{ .underline = 1 } }});
+}
+
+test "erase uses the current background color (bce)" {
+    var t = try testTerm(6, 3);
+    defer t.deinit();
+    try t.feed("\x1b[44mab\x1b[K\x1b[m");
+    const blue: Style = .{ .bg = .{ .palette = 4 } };
+    try expectRuns(&t, 0, &.{.{ .start = 0, .end = 6, .style = blue }});
+    try expectScreen(&t, "ab\n\n");
+    // Only the background is used: bold does not leak into erased cells.
+    try t.feed("\x1b[2;1H\x1b[1;42m\x1b[2X\x1b[m");
+    try expectRuns(&t, 1, &.{.{ .start = 0, .end = 2, .style = .{ .bg = .{ .palette = 2 } } }});
+    // Erasing with default colors clears the style again.
+    try t.feed("\x1b[1;1H\x1b[2K");
+    try expectRuns(&t, 0, &.{});
+    // Scrolling in a new line uses the current background too.
+    try t.feed("\x1b[3;1H\x1b[45m\n\x1b[m");
+    try expectRuns(&t, 2, &.{.{ .start = 0, .end = 6, .style = .{ .bg = .{ .palette = 5 } } }});
+}
+
+test "curses-style menu: the selected item is inverse" {
+    var t = try testTerm(20, 5);
+    defer t.deinit();
+    // What ncurses sends for a box-less menu with item 2 highlighted.
+    try t.feed("\x1b[?1049h\x1b[H\x1b[2J\x1b[1;1H\x1b[1mMenu\x1b[m");
+    try t.feed("\x1b[2;3HOpen\x1b[3;3H\x1b[7mSave    \x1b[m\x1b[4;3HQuit");
+    try expectScreen(&t, "Menu\n  Open\n  Save\n  Quit\n");
+    try expectRuns(&t, 1, &.{});
+    try expectRuns(&t, 2, &.{.{ .start = 2, .end = 10, .style = .{ .inverse = true } }});
+    // Moving the selection down repaints both rows.
+    try t.feed("\x1b[3;3HSave    \x1b[4;3H\x1b[7mQuit    \x1b[m");
+    try expectRuns(&t, 2, &.{});
+    try expectRuns(&t, 3, &.{.{ .start = 2, .end = 10, .style = .{ .inverse = true } }});
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try t.appendRangeText(3, 2, 10, &text, testing.allocator);
+    try testing.expectEqualStrings("Quit", text.items);
 }

@@ -15,6 +15,7 @@ S=smoke$$
 cleanup() {
     "$HT" kill "$S" >/dev/null 2>&1 || true
     "$HT" kill "$S-x" >/dev/null 2>&1 || true
+    "$HT" kill "$S-m" >/dev/null 2>&1 || true
     rm -rf "$STATE"
 }
 trap cleanup EXIT
@@ -70,6 +71,16 @@ check "arrow sent in application mode" sh -c 'printf "%s\n" "$1" | grep -q "033 
 "$HT" resize "$S-x" 50 7
 check "resize" sh -c '"$1" screen "$2" | grep -q " 50x7 "' _ "$HT" "$S-x"
 "$HT" kill "$S-x"
+
+# Styles: a menu whose selection (inverse) moves when a key is pressed.
+"$HT" start "$S-m" --cols 20 --rows 4 -- /bin/sh -c 'printf "  Open\r\n\033[7m  Save  \033[m\r\n"; read x; printf "\033[1;1H\033[7m  Open  \033[m\033[2;1H  Save  "; sleep 30' >/dev/null
+out=$("$HT" wait "$S-m" --text Save --styles --timeout 5000)
+check "styled run reported" sh -c 'printf "%s\n" "$1" | grep -qF "row 1: [0-8 inverse \"  Save\"]"' _ "$out"
+check "styles in json" sh -c '"$1" screen "$2" --json --styles | grep -qF "\"attrs\":[\"inverse\"]"' _ "$HT" "$S-m"
+"$HT" send "$S-m" '<Enter>'
+out=$("$HT" wait "$S-m" --idle 300 --diff --styles --timeout 5000)
+check "style-only change shows in diff" sh -c 'printf "%s\n" "$1" | grep -qx "0|  Open" && printf "%s\n" "$1" | grep -qF "row 0: [0-8 inverse \"  Open\"]"' _ "$out"
+"$HT" kill "$S-m"
 
 set +e
 err=$("$HT" start "$S" -- /nonexistent/program 2>&1)

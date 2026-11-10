@@ -119,12 +119,16 @@ const Waiter = struct {
     text: ?[]u8,
     idle_ms: ?i64,
     exit: bool,
-    json: bool,
-    diff: bool,
-    scrollback: usize,
+    render: Session.RenderOptions,
     started: i64,
     deadline: i64,
 };
+
+fn withWait(opts: Session.RenderOptions, outcome: WaitOutcome) Session.RenderOptions {
+    var o = opts;
+    o.wait = outcome;
+    return o;
+}
 
 fn waitCondition(w: Waiter) []const u8 {
     return if (w.text != null) "text" else if (w.idle_ms != null) "idle" else "exit";
@@ -268,7 +272,7 @@ const Session = struct {
         while (self.waiters.items.len > 0) {
             const w = self.waiters.items[0];
             const outcome: WaitOutcome = .{ .condition = waitCondition(w), .satisfied = false, .reason = "killed", .elapsed_ms = now - w.started };
-            self.respondScreen(w.fd, .timeout, .{ .json = w.json, .diff = w.diff, .scrollback = w.scrollback, .wait = outcome }) catch {};
+            self.respondScreen(w.fd, .timeout, withWait(w.render, outcome)) catch {};
             self.dropWaiter(0);
         }
     }
@@ -353,7 +357,9 @@ const Session = struct {
     fn acceptClient(self: *Session) void {
         const fd = posix.accept(self.listen_fd, null, null, posix.SOCK.CLOEXEC) catch return;
         const tv: posix.timeval = .{ .sec = 2, .usec = 0 };
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+        // libc directly: macOS fails with EINVAL if the client has already
+        // hung up, which std.posix.setsockopt treats as unreachable.
+        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(posix.timeval));
 
         var req: std.ArrayList(u8) = .empty;
         defer req.deinit(self.gpa);
@@ -421,6 +427,10 @@ const Session = struct {
                     opts.json = true;
                 } else if (std.mem.eql(u8, a, "--diff")) {
                     opts.diff = true;
+                } else if (std.mem.eql(u8, a, "--styles")) {
+                    opts.styles = true;
+                } else if (std.mem.eql(u8, a, "--trim")) {
+                    opts.trim = true;
                 } else if (std.mem.eql(u8, a, "--scrollback") and i + 1 < rest.len) {
                     i += 1;
                     opts.scrollback = std.fmt.parseInt(usize, rest[i], 10) catch return self.usage(fd, "screen: --scrollback needs a number");
@@ -485,10 +495,19 @@ const Session = struct {
         var esc_delay: u32 = default_esc_delay_ms;
         var literal = false;
         var paste = false;
+        var options_done = false;
+        var pasted: std.ArrayList(u8) = .empty;
+        defer pasted.deinit(self.gpa);
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
             const a = args[i];
-            if (!literal) {
+            // Options are recognized until "--" or "--literal"; after that
+            // every argument is a key or text.
+            if (!options_done and !literal) {
+                if (std.mem.eql(u8, a, "--")) {
+                    options_done = true;
+                    continue;
+                }
                 if (std.mem.eql(u8, a, "--literal")) {
                     literal = true;
                     continue;
@@ -506,14 +525,12 @@ const Session = struct {
                     continue;
                 }
             }
-            if (literal or paste) {
-                if (paste and self.term.modes.bracketed_paste) {
-                    try bytes.appendSlice(self.gpa, "\x1b[200~");
-                    try bytes.appendSlice(self.gpa, a);
-                    try bytes.appendSlice(self.gpa, "\x1b[201~");
-                } else {
-                    try bytes.appendSlice(self.gpa, a);
-                }
+            if (paste) {
+                try pasted.appendSlice(self.gpa, a);
+                continue;
+            }
+            if (literal) {
+                try bytes.appendSlice(self.gpa, a);
                 continue;
             }
             const before = bytes.items.len;
@@ -528,6 +545,13 @@ const Session = struct {
             if (keys.isKeySyntax(a) and bytes.items.len == before + 1 and bytes.items[before] == 0x1b) {
                 try pauses.append(self.gpa, bytes.items.len);
             }
+        }
+        // Pasted text goes out as one block, wrapped in bracketed-paste
+        // markers if the program asked for them.
+        if (paste) {
+            if (self.term.modes.bracketed_paste) try bytes.appendSlice(self.gpa, "\x1b[200~");
+            try bytes.appendSlice(self.gpa, pasted.items);
+            if (self.term.modes.bracketed_paste) try bytes.appendSlice(self.gpa, "\x1b[201~");
         }
         if (self.child_exited) {
             respond(fd, .@"error", "process has exited\n");
@@ -566,9 +590,7 @@ const Session = struct {
             .text = null,
             .idle_ms = null,
             .exit = false,
-            .json = false,
-            .diff = false,
-            .scrollback = 0,
+            .render = .{},
             .started = nowMs(),
             .deadline = 0,
         };
@@ -590,14 +612,18 @@ const Session = struct {
             } else if (std.mem.eql(u8, a, "--exit")) {
                 w.exit = true;
             } else if (std.mem.eql(u8, a, "--json")) {
-                w.json = true;
+                w.render.json = true;
             } else if (std.mem.eql(u8, a, "--diff")) {
-                w.diff = true;
+                w.render.diff = true;
+            } else if (std.mem.eql(u8, a, "--styles")) {
+                w.render.styles = true;
+            } else if (std.mem.eql(u8, a, "--trim")) {
+                w.render.trim = true;
             } else if (std.mem.eql(u8, a, "--scrollback") and has_val) {
                 i += 1;
-                w.scrollback = std.fmt.parseInt(usize, args[i], 10) catch return self.usage(fd, "wait: --scrollback needs a number");
+                w.render.scrollback = std.fmt.parseInt(usize, args[i], 10) catch return self.usage(fd, "wait: --scrollback needs a number");
             } else {
-                return self.usage(fd, "usage: wait (--text STR | --idle MS | --exit) [--timeout MS] [--json] [--diff] [--scrollback N]");
+                return self.usage(fd, "usage: wait (--text STR | --idle MS | --exit) [--timeout MS] [--json] [--diff] [--styles] [--trim] [--scrollback N]");
             }
         }
         if (text == null and w.idle_ms == null and !w.exit) {
@@ -626,7 +652,7 @@ const Session = struct {
                 i += 1;
                 continue;
             };
-            try self.respondScreen(w.fd, if (outcome.satisfied) .ok else .timeout, .{ .json = w.json, .diff = w.diff, .scrollback = w.scrollback, .wait = outcome });
+            try self.respondScreen(w.fd, if (outcome.satisfied) .ok else .timeout, withWait(w.render, outcome));
             self.dropWaiter(i);
         }
     }
@@ -681,7 +707,18 @@ const Session = struct {
         json: bool = false,
         diff: bool = false,
         scrollback: usize = 0,
+        /// Report styled runs per row.
+        styles: bool = false,
+        /// Text output only: leave out empty rows at the bottom.
+        trim: bool = false,
         wait: ?WaitOutcome = null,
+    };
+
+    const Run = struct {
+        start: usize,
+        end: usize,
+        text: []const u8,
+        style: vt.Style,
     };
 
     fn respondScreen(self: *Session, fd: posix.fd_t, status: Status, opts: RenderOptions) !void {
@@ -698,18 +735,37 @@ const Session = struct {
 
         const t = &self.term;
         const lines = try arena.alloc([]u8, t.rows);
-        for (lines, 0..) |*l, r| {
+        const runs = try arena.alloc([]Run, t.rows);
+        // Text plus styles: a row whose styles change (a menu selection
+        // moving) counts as changed for --diff.
+        const signatures = try arena.alloc([]u8, t.rows);
+        for (0..t.rows) |r| {
             var buf: std.ArrayList(u8) = .empty;
             try t.appendRowText(r, &buf, arena);
-            l.* = buf.items;
+            lines[r] = buf.items;
+
+            var raw: std.ArrayList(vt.StyleRun) = .empty;
+            try t.appendStyleRuns(r, &raw, arena);
+            runs[r] = try arena.alloc(Run, raw.items.len);
+            for (raw.items, runs[r]) |sr, *dst| {
+                var text: std.ArrayList(u8) = .empty;
+                try t.appendRangeText(r, sr.start, sr.end, &text, arena);
+                dst.* = .{ .start = sr.start, .end = sr.end, .text = text.items, .style = sr.style };
+            }
+
+            var sig: std.Io.Writer.Allocating = .init(arena);
+            try sig.writer.writeAll(lines[r]);
+            try sig.writer.writeByte(0);
+            try writeRunsText(&sig.writer, runs[r]);
+            signatures[r] = sig.written();
         }
 
         var changed: std.ArrayList(usize) = .empty;
         const same_shape = self.snapshot.items.len == lines.len;
-        for (lines, 0..) |l, r| {
-            if (!same_shape or !std.mem.eql(u8, self.snapshot.items[r], l)) try changed.append(arena, r);
+        for (signatures, 0..) |sig, r| {
+            if (!same_shape or !std.mem.eql(u8, self.snapshot.items[r], sig)) try changed.append(arena, r);
         }
-        try self.updateSnapshot(lines);
+        try self.updateSnapshot(signatures);
 
         const sb = &t.scrollback;
         const sb_count = @min(opts.scrollback, sb.len);
@@ -751,12 +807,22 @@ const Session = struct {
                     try jw.write(r);
                     try jw.objectField("text");
                     try jw.write(lines[r]);
+                    if (opts.styles) {
+                        try jw.objectField("styles");
+                        try writeRunsJson(&jw, runs[r]);
+                    }
                     try jw.endObject();
                 }
                 try jw.endArray();
             } else {
                 try jw.objectField("lines");
                 try jw.write(lines);
+                if (opts.styles) {
+                    try jw.objectField("styles");
+                    try jw.beginArray();
+                    for (runs) |row_runs| try writeRunsJson(&jw, row_runs);
+                    try jw.endArray();
+                }
             }
             if (opts.scrollback > 0) {
                 try jw.objectField("scrollback");
@@ -777,10 +843,29 @@ const Session = struct {
             for (sb_first..sb.len) |i| try w.print("{s}\n", .{sb.get(i)});
             try w.print("[headterm] end of scrollback ({d} lines)\n", .{sb_count});
         }
+        var shown_rows = lines.len;
+        if (opts.trim) {
+            while (shown_rows > 0 and lines[shown_rows - 1].len == 0 and
+                (!opts.styles or runs[shown_rows - 1].len == 0)) shown_rows -= 1;
+        }
         if (opts.diff) {
             for (changed.items) |r| try w.print("{d}|{s}\n", .{ r, lines[r] });
         } else {
-            for (lines) |l| try w.print("{s}\n", .{l});
+            for (lines[0..shown_rows]) |l| try w.print("{s}\n", .{l});
+        }
+        if (opts.styles) {
+            try w.writeAll("[headterm] styles (row: [start-end attributes \"text\"], 0-based columns, end exclusive)\n");
+            const style_rows: []const usize = if (opts.diff) changed.items else blk: {
+                const all = try arena.alloc(usize, shown_rows);
+                for (all, 0..) |*x, i| x.* = i;
+                break :blk all;
+            };
+            for (style_rows) |r| {
+                if (runs[r].len == 0) continue;
+                try w.print("row {d}: ", .{r});
+                try writeRunsText(w, runs[r]);
+                try w.writeByte('\n');
+            }
         }
         try w.print("[headterm] {s} {d}x{d} cursor={d},{d}", .{ self.cfg.name, t.cols, t.rows, t.cursor.row, t.cursor.col });
         if (t.alt_active) try w.writeAll(" alt");
@@ -788,8 +873,8 @@ const Session = struct {
         if (opts.diff) try w.print(" changed={d}", .{changed.items.len});
         if (self.exit_code) |c| {
             try w.print(" exited={d}", .{c});
-        } else if (self.exit_signal) |s| {
-            try w.print(" killed-by-signal={d}", .{s});
+        } else if (self.exit_signal) |sig| {
+            try w.print(" killed-by-signal={d}", .{sig});
         } else if (self.child_exited) {
             try w.writeAll(" exited");
         } else {
@@ -847,6 +932,86 @@ const Session = struct {
         try jw.endObject();
     }
 };
+
+const color_names = [_][]const u8{ "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white" };
+
+/// "red", "bright-red", "208" or "#rrggbb"; null for the default color.
+fn colorName(buf: []u8, c: vt.Color) ?[]const u8 {
+    return switch (c) {
+        .default => null,
+        .palette => |p| if (p < 8)
+            color_names[p]
+        else if (p < 16)
+            std.fmt.bufPrint(buf, "bright-{s}", .{color_names[p - 8]}) catch unreachable
+        else
+            std.fmt.bufPrint(buf, "{d}", .{p}) catch unreachable,
+        .rgb => |rgb| std.fmt.bufPrint(buf, "#{x:0>2}{x:0>2}{x:0>2}", .{ rgb[0], rgb[1], rgb[2] }) catch unreachable,
+    };
+}
+
+/// Attribute names in a fixed order; colors are separate.
+fn styleAttrs(st: vt.Style, out: *[9][]const u8) [][]const u8 {
+    var n: usize = 0;
+    const flags = [_]struct { bool, []const u8 }{
+        .{ st.bold, "bold" },
+        .{ st.faint, "dim" },
+        .{ st.italic, "italic" },
+        .{ st.underline != 0, "underline" },
+        .{ st.blink, "blink" },
+        .{ st.inverse, "inverse" },
+        .{ st.invisible, "hidden" },
+        .{ st.strikethrough, "strike" },
+        .{ st.overline, "overline" },
+    };
+    for (flags) |f| {
+        if (f[0]) {
+            out[n] = f[1];
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+/// `[2-10 inverse "Save"] [12-17 bold fg=red "Error"]`
+fn writeRunsText(w: *std.Io.Writer, runs: []const Session.Run) !void {
+    for (runs, 0..) |r, i| {
+        if (i > 0) try w.writeByte(' ');
+        try w.print("[{d}-{d}", .{ r.start, r.end });
+        var attr_buf: [9][]const u8 = undefined;
+        for (styleAttrs(r.style, &attr_buf)) |a| try w.print(" {s}", .{a});
+        var buf: [16]u8 = undefined;
+        if (colorName(&buf, r.style.fg)) |c| try w.print(" fg={s}", .{c});
+        if (colorName(&buf, r.style.bg)) |c| try w.print(" bg={s}", .{c});
+        if (r.text.len > 0) {
+            try w.writeByte(' ');
+            try std.json.Stringify.encodeJsonString(r.text, .{}, w);
+        }
+        try w.writeByte(']');
+    }
+}
+
+fn writeRunsJson(jw: *std.json.Stringify, runs: []const Session.Run) !void {
+    try jw.beginArray();
+    for (runs) |r| {
+        try jw.beginObject();
+        try jw.objectField("start");
+        try jw.write(r.start);
+        try jw.objectField("end");
+        try jw.write(r.end);
+        try jw.objectField("text");
+        try jw.write(r.text);
+        try jw.objectField("attrs");
+        var attr_buf: [9][]const u8 = undefined;
+        try jw.write(styleAttrs(r.style, &attr_buf));
+        var buf: [16]u8 = undefined;
+        try jw.objectField("fg");
+        try jw.write(colorName(&buf, r.style.fg));
+        try jw.objectField("bg");
+        try jw.write(colorName(&buf, r.style.bg));
+        try jw.endObject();
+    }
+    try jw.endArray();
+}
 
 fn respond(fd: posix.fd_t, status: Status, body: []const u8) void {
     writeAll(fd, @tagName(status)) catch return;

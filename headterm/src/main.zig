@@ -8,9 +8,10 @@ const mcp = @import("mcp.zig");
 const usage_text =
     \\usage:
     \\  headterm start <name> [--cols N] [--rows N] [--cwd DIR] [--log FILE] -- <cmd> [args...]
-    \\  headterm screen <name> [--json] [--diff] [--scrollback N]
-    \\  headterm send <name> [--literal] [--paste] [--esc-delay MS] <text | <Key>>...
-    \\  headterm wait <name> (--text STR | --idle MS | --exit) [--timeout MS] [--json] [--diff] [--scrollback N]
+    \\  headterm screen <name> [--json] [--diff] [--styles] [--trim] [--scrollback N]
+    \\  headterm send <name> [--literal] [--paste] [--esc-delay MS] [--] <text | <Key>>...
+    \\  headterm wait <name> (--text STR | --idle MS | --exit) [--timeout MS] [--json] [--diff]
+    \\                [--styles] [--trim] [--scrollback N]
     \\  headterm resize <name> <cols> <rows>
     \\  headterm kill <name>
     \\  headterm list [--json]

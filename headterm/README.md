@@ -53,9 +53,9 @@ $ headterm kill ed
 | Command | Description |
 | --- | --- |
 | `headterm start <name> [--cols 120] [--rows 40] [--cwd DIR] [--log FILE] -- <cmd> [args...]` | Starts a session server that owns the PTY. Returns once the program has been exec'd; exec and chdir failures are reported here. `--log` appends the raw PTY output to FILE. |
-| `headterm screen <name> [--json] [--diff] [--scrollback N]` | Prints the visible screen. |
-| `headterm send <name> [--literal] [--paste] [--esc-delay MS] <arg>...` | Sends keys and text. |
-| `headterm wait <name> (--text STR \| --idle MS \| --exit) [--timeout MS] [--json] [--diff] [--scrollback N]` | Blocks until a condition holds, then prints the screen. |
+| `headterm screen <name> [--json] [--diff] [--styles] [--trim] [--scrollback N]` | Prints the visible screen. |
+| `headterm send <name> [--literal] [--paste] [--esc-delay MS] [--] <arg>...` | Sends keys and text. |
+| `headterm wait <name> (--text STR \| --idle MS \| --exit) [--timeout MS] [--json] [--diff] [--styles] [--trim] [--scrollback N]` | Blocks until a condition holds, then prints the screen. |
 | `headterm resize <name> <cols> <rows>` | Resizes the PTY and the screen and sends SIGWINCH. |
 | `headterm kill <name>` | Sends SIGHUP, then SIGTERM, then SIGKILL (500 ms apart) to the program's process group and stops the session server. |
 | `headterm list [--json]` | Lists sessions. Removes sockets left behind by crashed servers. |
@@ -97,8 +97,11 @@ sends `ESC[1;5D`, `<S-Tab>` sends `ESC[Z`).
   `ESC[A` normally, `ESC O A` in application mode.
 - An unknown `<Name>` is an error and nothing is sent. Use `--literal` to send
   the following arguments as text, unparsed.
-- `--paste` sends the following arguments as text, wrapped in bracketed-paste
-  markers when the program has enabled bracketed paste (mode 2004).
+- `--paste` sends the following arguments as one block of text, wrapped in
+  bracketed-paste markers when the program has enabled bracketed paste
+  (mode 2004).
+- Options are recognized up to `--` or `--literal`. After `--`, every argument
+  is a key or text, so `send s -- --literal` types `--literal`.
 - A standalone `<Esc>` followed by more input is sent, then headterm pauses
   100 ms (`--esc-delay MS`, 0 to disable) before sending the rest. Without the
   pause, many programs (busybox vi, readline) read `ESC :` as an Alt chord.
@@ -128,8 +131,44 @@ screen with reason `killed` and exits with code 1.
 ### Diffs
 
 `--diff` prints only rows that differ from the screen headterm last returned
-for this session, from either `screen` or `wait`. There is one marker per
-session, shared by all clients. After a resize, every row counts as changed.
+for this session, from either `screen` or `wait`. A row counts as changed
+when its text or its styles changed, so a menu selection that moves shows up
+even though no text changed. There is one marker per session, shared by all
+clients. After a resize, every row counts as changed.
+
+### Styles
+
+`--styles` adds, for each row with styled cells, the runs of cells that share
+non-default attributes. It is meant for finding what is highlighted: the
+selected menu item (inverse or a background color), errors in red, the
+focused field.
+
+```
+$ headterm wait menu --text unsaved --styles
+┌─ File ─────────────────────┐
+│  Open                      │
+│  Save                      │
+...
+[headterm] styles (row: [start-end attributes "text"], 0-based columns, end exclusive)
+row 0: [2-8 bold " File"]
+row 1: [2-13 inverse " Open"]
+row 6: [2-17 fg=red "unsaved changes"]
+[headterm] menu 30x8 cursor=6,17 alt running wait=ok(text) waited=55ms
+```
+
+- Columns are 0-based cell positions with `end` exclusive. A wide character
+  takes two cells.
+- The text is the run's text with trailing spaces removed, JSON-escaped. It is
+  left out when the run is all blanks, such as a colored bar.
+- Attributes, in this order: `bold` `dim` `italic` `underline` `blink`
+  `inverse` `hidden` `strike` `overline`, then `fg=<color>` and `bg=<color>`.
+- Colors: `black` `red` `green` `yellow` `blue` `magenta` `cyan` `white`,
+  `bright-<name>` for 8-15, the number for 16-255, and `#rrggbb` for RGB.
+- Erased cells take the current background color, as in xterm (`bce`), so a
+  highlighted bar drawn with an erase is reported as a `bg=` run.
+
+`--trim` leaves out empty rows at the bottom of the text output; the status
+line still gives the full size. JSON output is never trimmed.
 
 ## Output
 
@@ -144,7 +183,10 @@ One line per screen row with trailing spaces removed, then a status line:
 `<state>` is `running`, `exited=<code>` or `killed-by-signal=<n>`. Rows and
 columns are 0-based. With `--diff`, each changed row is printed as
 `<row>|<text>`. With `--scrollback N`, up to N scrollback lines (oldest first)
-come first, followed by `[headterm] end of scrollback (<n> lines)`.
+come first, followed by `[headterm] end of scrollback (<n> lines)`. With
+`--styles`, a `[headterm] styles ...` line and one `row <n>: [...]` line per
+styled row come between the screen and the status line (for changed rows only
+with `--diff`).
 
 ### JSON (`screen --json`, `wait --json`)
 
@@ -166,7 +208,8 @@ One object followed by a newline. Fields appear in this order; fields marked
   "exit_code": null,
   "exit_signal": null,
   "lines": ["line one", "line two (edited)", "..."],
-  "changed": [{"row": 1, "text": "line two (edited)"}],
+  "styles": [[], [{"start": 0, "end": 17, "text": "line two (edited)", "attrs": ["bold"], "fg": "red", "bg": null}], "..."],
+  "changed": [{"row": 1, "text": "line two (edited)", "styles": ["..."]}],
   "scrollback": ["older line", "..."],
   "wait": {"condition": "idle", "satisfied": true, "reason": "idle", "elapsed_ms": 402}
 }
@@ -182,7 +225,8 @@ One object followed by a newline. Fields appear in this order; fields marked
 | `pid` | The program's pid. |
 | `exited`, `exit_code`, `exit_signal` | `exit_code` is set after a normal exit, `exit_signal` if a signal killed the program. Both are `null` while it runs. |
 | `lines` | Every row, trailing spaces trimmed. Absent with `--diff`. |
-| `changed` | Only with `--diff`: rows that changed, with their 0-based row number. |
+| `styles` | Only with `--styles`, and not with `--diff`: one array of runs per row, parallel to `lines`. A run is `{start, end, text, attrs, fg, bg}` as described in [Styles](#styles); `fg` and `bg` are `null` for the default color. |
+| `changed` | Only with `--diff`: rows that changed, with their 0-based row number. With `--styles`, each entry also has `styles`, that row's runs. |
 | `scrollback` | Only with `--scrollback N` (N > 0): up to N lines, oldest first. |
 | `wait` | Only from `wait`. `condition` is the first condition given (`text`, `idle` or `exit`). `reason` is `text`, `idle` or `exit` when `satisfied` is true, and `timeout`, `exited` or `killed` when it is false. |
 
@@ -218,10 +262,10 @@ running after the MCP server exits until they are killed.
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
-| `headterm_start` | `name`, `command` (string array), `cols?`, `rows?`, `cwd?`, `then_wait?` | `started <name> pid=N` and the first screen, once output has been idle for 300 ms (at most 5 s) or `then_wait` is met |
-| `headterm_send` | `name`, `keys` (string array, same syntax as `headterm send`), `then_wait?` | the screen after the wait, or `sent` without `then_wait` |
-| `headterm_screen` | `name`, `diff?`, `scrollback?` | the screen |
-| `headterm_wait` | `name`, `text?`, `idle_ms?`, `exit?`, `timeout_ms?` | the screen |
+| `headterm_start` | `name`, `command` (string array), `cols?`, `rows?`, `cwd?`, `then_wait?`, `styles?` | `started <name> pid=N` and the first screen, once output has been idle for 300 ms (at most 5 s) or `then_wait` is met |
+| `headterm_send` | `name`, `keys` (string array, same key syntax as `headterm send`), `literal?`, `paste?`, `esc_delay_ms?`, `then_wait?`, `styles?` | the screen after the wait, or `sent` without `then_wait` |
+| `headterm_screen` | `name`, `diff?`, `scrollback?`, `styles?` | the screen |
+| `headterm_wait` | `name`, `text?`, `idle_ms?`, `exit?`, `timeout_ms?`, `styles?` | the screen |
 | `headterm_resize` | `name`, `cols`, `rows` | confirmation |
 | `headterm_kill` | `name` | confirmation |
 | `headterm_list` | none | one line per session |
@@ -231,9 +275,22 @@ running after the MCP server exits until they are killed.
 `headterm_send` with `then_wait` to act and see the result in one call.
 `idle_ms` and `timeout_ms` are capped at 60000.
 
-Screens use the CLI text format: rows, then the `[headterm] ...` status line.
-Empty rows between the last non-empty row and the status line are left out;
-the status line still gives the full size.
+Elements of `keys` are always keys or text, never options: the options are
+the separate arguments `literal` (send every element as plain text), `paste`
+(send the elements as one bracketed paste) and `esc_delay_ms` (the pause after
+a lone `<Esc>`, default 100, 0 to disable). `styles: true` adds the styled
+runs described in [Styles](#styles).
+
+The server handles one request at a time. While a tool call waits, it keeps
+reading stdin. A `notifications/cancelled` for that request stops the wait at
+once and the request gets no reply. Other messages that arrive meanwhile are
+handled afterwards, in order, and a cancellation for one of those queued
+requests drops it unanswered. When stdin closes, the server finishes the
+current and queued requests, then exits.
+
+Screens use the CLI text format of `--trim`: rows without the empty ones at
+the bottom, then the `[headterm] ...` status line, which still gives the full
+size.
 
 Errors:
 
@@ -268,7 +325,8 @@ Supported:
   Focus (1004) and mouse modes (9, 1000, 1002, 1003, 1006) are tracked, but
   headterm sends no mouse or focus events.
 - SGR is parsed completely, including `38;5;n`, `38;2;r;g;b` and the colon
-  forms. Styles are not stored per cell yet.
+  forms. Attributes and colors are stored per cell and reported with
+  `--styles`. Erases use the current background color (`bce`).
 - Replies to the program: CPR (`CSI 6 n`, `CSI ? 6 n`), DSR (`CSI 5 n`), DA1
   (`ESC[?62;22c`), DA2, XTVERSION, DECRQM, the text-area size query
   (`CSI 18 t`) and OSC 10/11 color queries.
@@ -297,7 +355,8 @@ arguments, and keeps the connection open. The server answers with
 
 ## Limitations
 
-- No styling in the output (colors, bold and so on) and no mouse input.
+- No mouse input. Underline color and the underline kind (double, curly) are
+  parsed but not reported.
 - No reflow on resize.
 - Combining characters are dropped, and character widths come from a built-in
   table that can disagree with the program's `wcwidth`.

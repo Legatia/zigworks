@@ -57,12 +57,20 @@ pub const RequestError = error{ NoSuchSession, StaleSession, BadResponse } || Al
 
 /// Sends one request and reads the whole response. The caller owns `body`.
 pub fn request(gpa: Allocator, socket_path: []const u8, args: []const []const u8) RequestError!Response {
-    const stream = std.net.connectUnixSocket(socket_path) catch |err| switch (err) {
-        error.ConnectionRefused => return error.StaleSession,
-        else => return error.NoSuchSession,
-    };
+    const stream = try connect(socket_path);
     defer stream.close();
+    try sendRequest(gpa, stream.handle, args);
+    return readResponse(gpa, stream.handle);
+}
 
+pub fn connect(socket_path: []const u8) RequestError!std.net.Stream {
+    return std.net.connectUnixSocket(socket_path) catch |err| switch (err) {
+        error.ConnectionRefused => error.StaleSession,
+        else => error.NoSuchSession,
+    };
+}
+
+pub fn sendRequest(gpa: Allocator, fd: posix.fd_t, args: []const []const u8) RequestError!void {
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(gpa);
     for (args) |a| {
@@ -70,14 +78,17 @@ pub fn request(gpa: Allocator, socket_path: []const u8, args: []const []const u8
         try payload.append(gpa, 0);
     }
     var header: [32]u8 = undefined;
-    try writeAll(stream.handle, std.fmt.bufPrint(&header, "{d}\n", .{payload.items.len}) catch unreachable);
-    try writeAll(stream.handle, payload.items);
+    try writeAll(fd, std.fmt.bufPrint(&header, "{d}\n", .{payload.items.len}) catch unreachable);
+    try writeAll(fd, payload.items);
+}
 
+/// Reads until the server closes the connection.
+pub fn readResponse(gpa: Allocator, fd: posix.fd_t) RequestError!Response {
     var resp: std.ArrayList(u8) = .empty;
     errdefer resp.deinit(gpa);
     var buf: [16384]u8 = undefined;
     while (true) {
-        const n = posix.read(stream.handle, &buf) catch |err| switch (err) {
+        const n = posix.read(fd, &buf) catch |err| switch (err) {
             error.ConnectionResetByPeer => break,
             else => |e| return e,
         };
@@ -150,12 +161,16 @@ pub const CallError = error{InvalidName} || RequestError;
 
 /// Sends `args` to the server of session `name`.
 pub fn call(gpa: Allocator, name: []const u8, args: []const []const u8) CallError!Response {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    return request(gpa, try sessionSocket(&path_buf, name), args);
+}
+
+/// Socket path of session `name`.
+pub fn sessionSocket(buf: *[std.fs.max_path_bytes]u8, name: []const u8) CallError![]const u8 {
     if (!validName(name)) return error.InvalidName;
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = sessionDir(&dir_buf) catch return error.NoSuchSession;
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sock = socketPath(&path_buf, dir, name) catch return error.NoSuchSession;
-    return request(gpa, sock, args);
+    return socketPath(buf, dir, name) catch error.NoSuchSession;
 }
 
 /// One-line explanation of a `call` failure.

@@ -5,6 +5,7 @@
 //! to session servers in-process, not through the CLI.
 
 const std = @import("std");
+const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const json = std.json;
 const client = @import("client.zig");
@@ -22,34 +23,161 @@ pub fn serve(gpa: Allocator) !void {
     const in_buf = try gpa.alloc(u8, max_line);
     defer gpa.free(in_buf);
     var reader = std.fs.File.stdin().readerStreaming(in_buf);
-    const in = &reader.interface;
     var out_buf: [8192]u8 = undefined;
     var writer = std.fs.File.stdout().writerStreaming(&out_buf);
     const out = &writer.interface;
 
+    var io: Io = .{ .gpa = gpa, .in = &reader.interface, .in_fd = posix.STDIN_FILENO };
+    defer io.deinit();
+
     while (true) {
-        const reply = if (in.takeDelimiterExclusive('\n')) |line|
-            try handleLine(gpa, line)
-        else |err| switch (err) {
-            error.EndOfStream => return,
-            error.StreamTooLong => blk: {
-                _ = in.discardDelimiterInclusive('\n') catch return;
-                break :blk try errorReply(gpa, .null, -32700, "request line too long");
+        const line = io.next() catch |err| switch (err) {
+            error.LineTooLong => {
+                const r = try errorReply(gpa, .null, -32700, "request line too long");
+                defer gpa.free(r);
+                try writeLine(out, r);
+                continue;
             },
-            error.ReadFailed => return err,
-        };
-        if (reply) |r| {
+            else => |e| return e,
+        } orelse return;
+        defer gpa.free(line);
+        if (try handleMessage(gpa, line, &io)) |r| {
             defer gpa.free(r);
-            try out.writeAll(r);
-            try out.writeByte('\n');
-            try out.flush();
+            try writeLine(out, r);
         }
     }
 }
 
+fn writeLine(out: *std.Io.Writer, msg: []const u8) !void {
+    try out.writeAll(msg);
+    try out.writeByte('\n');
+    try out.flush();
+}
+
+/// Stdin while serving. A tool call that waits on a session keeps reading
+/// stdin so it can notice `notifications/cancelled`; anything else that
+/// arrives meanwhile is queued and handled afterwards, in order.
+const Io = struct {
+    gpa: Allocator,
+    in: *std.Io.Reader,
+    in_fd: posix.fd_t,
+    pending: std.ArrayList([]u8) = .empty,
+    /// JSON-encoded ids of queued requests that were cancelled.
+    cancelled: std.ArrayList([]u8) = .empty,
+    eof: bool = false,
+
+    fn deinit(io: *Io) void {
+        for (io.pending.items) |l| io.gpa.free(l);
+        io.pending.deinit(io.gpa);
+        for (io.cancelled.items) |c| io.gpa.free(c);
+        io.cancelled.deinit(io.gpa);
+    }
+
+    /// The next message (caller frees it), or null at end of input.
+    fn next(io: *Io) !?[]u8 {
+        if (io.pending.items.len > 0) return io.pending.orderedRemove(0);
+        if (io.eof) return null;
+        const line = io.in.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => return null,
+            error.StreamTooLong => {
+                _ = io.in.discardDelimiterInclusive('\n') catch {
+                    io.eof = true;
+                };
+                return error.LineTooLong;
+            },
+            error.ReadFailed => return err,
+        };
+        return try io.gpa.dupe(u8, line);
+    }
+
+    /// Blocks until `fd` is readable. Returns false if request `id` (JSON
+    /// encoded) was cancelled in the meantime. After end of input the
+    /// current request still runs to completion.
+    fn waitReadable(io: *Io, fd: posix.fd_t, id: []const u8) !bool {
+        while (true) {
+            // Complete lines already buffered never show up in poll().
+            while (std.mem.indexOfScalar(u8, io.in.buffered(), '\n') != null) {
+                const line = io.in.takeDelimiterExclusive('\n') catch break;
+                if (try io.absorb(try io.gpa.dupe(u8, line), id)) return false;
+            }
+            var fds = [_]posix.pollfd{
+                .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = if (io.eof) -1 else io.in_fd, .events = posix.POLL.IN, .revents = 0 },
+            };
+            _ = try posix.poll(&fds, -1);
+            if (fds[0].revents != 0) return true;
+            if (fds[1].revents != 0) {
+                if (io.in.buffered().len == io.in.buffer.len) {
+                    // A line longer than the buffer: drop it.
+                    io.in.toss(io.in.buffered().len);
+                }
+                io.in.fillMore() catch {
+                    io.eof = true;
+                    // A final line without a newline is still a message.
+                    const rest = io.in.buffered();
+                    if (rest.len > 0) {
+                        const line = try io.gpa.dupe(u8, rest);
+                        io.in.toss(rest.len);
+                        if (try io.absorb(line, id)) return false;
+                    }
+                };
+            }
+        }
+    }
+
+    /// Takes ownership of `line`. Returns true if it cancels request `id`.
+    fn absorb(io: *Io, line: []u8, id: []const u8) !bool {
+        if (try cancelledId(io.gpa, line)) |target| {
+            io.gpa.free(line);
+            if (std.mem.eql(u8, target, id)) {
+                io.gpa.free(target);
+                return true;
+            }
+            if (io.cancelled.items.len >= 64) io.gpa.free(io.cancelled.orderedRemove(0));
+            try io.cancelled.append(io.gpa, target);
+            return false;
+        }
+        try io.pending.append(io.gpa, line);
+        return false;
+    }
+
+    /// True (and forgets it) if request `id` was cancelled while queued.
+    fn takeCancelled(io: *Io, id: []const u8) bool {
+        for (io.cancelled.items, 0..) |c, i| {
+            if (std.mem.eql(u8, c, id)) {
+                io.gpa.free(io.cancelled.orderedRemove(i));
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+/// If `line` is a notifications/cancelled message, its JSON-encoded
+/// requestId (caller frees).
+fn cancelledId(gpa: Allocator, line: []const u8) Allocator.Error!?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const msg = json.parseFromSliceLeaky(json.Value, arena_state.allocator(), line, .{}) catch return null;
+    if (msg != .object) return null;
+    const method = msg.object.get("method") orelse return null;
+    if (method != .string or !eql(method.string, "notifications/cancelled")) return null;
+    const params = msg.object.get("params") orelse return null;
+    if (params != .object) return null;
+    const id = params.object.get("requestId") orelse return null;
+    return try json.Stringify.valueAlloc(gpa, id, .{});
+}
+
 /// Handles one JSON-RPC message. Returns the reply (without newline,
 /// caller owns it), or null for notifications.
-pub fn handleLine(gpa: Allocator, line_in: []const u8) Allocator.Error!?[]u8 {
+pub fn handleLine(gpa: Allocator, line: []const u8) Allocator.Error!?[]u8 {
+    return handleMessage(gpa, line, null) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => unreachable, // only reachable with stdin attached
+    };
+}
+
+fn handleMessage(gpa: Allocator, line_in: []const u8, io: ?*Io) !?[]u8 {
     const line = std.mem.trim(u8, line_in, " \t\r");
     if (line.len == 0) return null;
 
@@ -73,12 +201,17 @@ pub fn handleLine(gpa: Allocator, line_in: []const u8) Allocator.Error!?[]u8 {
     };
     // Notifications (no id) never get a reply.
     const req_id = id orelse return null;
+    const id_json = try json.Stringify.valueAlloc(arena, req_id, .{});
+    if (io) |i| if (i.takeCancelled(id_json)) return null;
 
-    var d: Dispatch = .{ .gpa = gpa, .arena = arena };
+    var d: Dispatch = .{ .gpa = gpa, .arena = arena, .io = io, .id_json = id_json };
     const result = d.dispatch(method, obj.get("params")) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MethodNotFound => return try errorReply(gpa, req_id, -32601, d.err_msg),
         error.InvalidParams => return try errorReply(gpa, req_id, -32602, d.err_msg),
+        // The client gave up on this request: send nothing.
+        error.Cancelled => return null,
+        else => |e| return e,
     };
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -139,11 +272,16 @@ const Result = union(enum) {
     tool: ToolResult,
 };
 
-const DispatchError = error{ MethodNotFound, InvalidParams } || Allocator.Error;
+const DispatchError = error{ MethodNotFound, InvalidParams, Cancelled } || Allocator.Error || posix.PollError;
 
 const Dispatch = struct {
     gpa: Allocator,
     arena: Allocator,
+    /// Null in unit tests: session calls then block without watching stdin.
+    io: ?*Io = null,
+    id_json: []const u8 = "",
+    /// The `styles` argument of the current tool call.
+    styles: bool = false,
     err_msg: []const u8 = "",
 
     fn fail(self: *Dispatch, err: DispatchError, comptime fmt: []const u8, args: anytype) DispatchError {
@@ -183,6 +321,7 @@ const Dispatch = struct {
     fn callTool(self: *Dispatch, tool: []const u8, a: Args) DispatchError!ToolResult {
         if (eql(tool, "headterm_list")) return self.list();
         const name = try a.requiredString("name");
+        self.styles = try a.boolean("styles") orelse false;
         if (eql(tool, "headterm_start")) {
             const command = (try a.stringArray("command")) orelse return self.fail(error.InvalidParams, "missing required argument 'command'", .{});
             if (command.len == 0) return self.fail(error.InvalidParams, "'command' must not be empty", .{});
@@ -202,7 +341,12 @@ const Dispatch = struct {
         if (eql(tool, "headterm_screen")) {
             var args: std.ArrayList([]const u8) = .empty;
             try args.append(self.arena, "screen");
-            if (try a.boolean("diff") orelse false) try args.append(self.arena, "--diff");
+            if (try a.boolean("diff") orelse false) {
+                try args.append(self.arena, "--diff");
+            } else {
+                try args.append(self.arena, "--trim");
+            }
+            if (self.styles) try args.append(self.arena, "--styles");
             if (try a.int("scrollback", 0, 100_000)) |n| {
                 try args.append(self.arena, "--scrollback");
                 try args.append(self.arena, try std.fmt.allocPrint(self.arena, "{d}", .{n}));
@@ -213,8 +357,21 @@ const Dispatch = struct {
             const keys = (try a.stringArray("keys")) orelse return self.fail(error.InvalidParams, "missing required argument 'keys'", .{});
             const then_wait = try a.object("then_wait");
             const wait = if (then_wait != null) try self.waitSpec(then_wait, .{ .idle_ms = start_idle_ms }) else null;
+            const literal = try a.boolean("literal") orelse false;
+            const paste = try a.boolean("paste") orelse false;
+            const esc_delay = try a.int("esc_delay_ms", 0, 10_000);
             var args: std.ArrayList([]const u8) = .empty;
             try args.append(self.arena, "send");
+            if (esc_delay) |ms| try args.appendSlice(self.arena, &.{ "--esc-delay", try std.fmt.allocPrint(self.arena, "{d}", .{ms}) });
+            // `--literal` ends option parsing itself; otherwise `--` does,
+            // so no element of `keys` is ever read as an option.
+            if (paste) {
+                try args.appendSlice(self.arena, &.{ "--paste", "--" });
+            } else if (literal) {
+                try args.append(self.arena, "--literal");
+            } else {
+                try args.append(self.arena, "--");
+            }
             try args.appendSlice(self.arena, keys);
             const sent = try self.session(name, args.items);
             if (sent.is_error) return sent.result();
@@ -279,6 +436,8 @@ const Dispatch = struct {
         if (w.idle_ms) |ms| try args.appendSlice(self.arena, &.{ "--idle", try std.fmt.allocPrint(self.arena, "{d}", .{ms}) });
         if (w.exit) try args.append(self.arena, "--exit");
         if (w.timeout_ms) |ms| try args.appendSlice(self.arena, &.{ "--timeout", try std.fmt.allocPrint(self.arena, "{d}", .{ms}) });
+        try args.append(self.arena, "--trim");
+        if (self.styles) try args.append(self.arena, "--styles");
         var r = try self.session(name, args.items);
         // An unmet default wait (e.g. a program that keeps printing) is not
         // a failure; the screen is still useful.
@@ -299,16 +458,32 @@ const Dispatch = struct {
     };
 
     fn session(self: *Dispatch, name: []const u8, args: []const []const u8) DispatchError!SessionResult {
-        const resp = client.call(self.arena, name, args) catch |err| {
-            var buf: [256]u8 = undefined;
-            const text = try self.arena.dupe(u8, client.describeError(&buf, err, name));
-            return .{ .text = text, .is_error = true, .request_failed = true };
+        const resp = self.callSession(name, args) catch |err| switch (err) {
+            error.Cancelled => return error.Cancelled,
+            error.Unexpected, error.SystemResources, error.NetworkSubsystemFailed => |e| return e,
+            else => |e| {
+                var buf: [256]u8 = undefined;
+                const text = try self.arena.dupe(u8, client.describeError(&buf, e, name));
+                return .{ .text = text, .is_error = true, .request_failed = true };
+            },
         };
+        const body = std.mem.trimRight(u8, resp.body, "\n");
         return switch (resp.status) {
-            .ok => .{ .text = try trimBlankRows(self.arena, resp.body), .is_error = false, .request_failed = false },
-            .timeout => .{ .text = try trimBlankRows(self.arena, resp.body), .is_error = true, .request_failed = false },
+            .ok => .{ .text = body, .is_error = false, .request_failed = false },
+            .timeout => .{ .text = body, .is_error = true, .request_failed = false },
             .@"error" => .{ .text = std.mem.trimRight(u8, resp.body, "\n"), .is_error = true, .request_failed = true },
         };
+    }
+
+    fn callSession(self: *Dispatch, name: []const u8, args: []const []const u8) (client.CallError || error{Cancelled} || posix.PollError)!client.Response {
+        const io = self.io orelse return client.call(self.arena, name, args);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const stream = try client.connect(try client.sessionSocket(&path_buf, name));
+        // Closing the connection early cancels a wait on the session server.
+        defer stream.close();
+        try client.sendRequest(self.arena, stream.handle, args);
+        if (!try io.waitReadable(stream.handle, self.id_json)) return error.Cancelled;
+        return client.readResponse(self.arena, stream.handle);
     }
 
     fn list(self: *Dispatch) DispatchError!ToolResult {
@@ -380,16 +555,6 @@ const Args = struct {
     }
 };
 
-/// Drops the empty rows between the last screen row with text and the
-/// status line; the status line still gives the full size.
-fn trimBlankRows(arena: Allocator, body: []const u8) Allocator.Error![]const u8 {
-    const text = std.mem.trimRight(u8, body, "\n");
-    const status_at = if (std.mem.lastIndexOf(u8, text, "\n[headterm] ")) |i| i + 1 else return text;
-    const screen = std.mem.trimRight(u8, text[0..status_at], "\n");
-    if (screen.len == 0) return text[status_at..];
-    return std.mem.concat(arena, u8, &.{ screen, "\n", text[status_at..] });
-}
-
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
@@ -406,6 +571,10 @@ const wait_props =
 
 const name_prop =
     \\"name":{"type":"string","description":"Session name: letters, digits, '.', '_', '-'."}
+;
+
+const styles_prop =
+    \\"styles":{"type":"boolean","description":"Also list styled runs per row (bold, inverse, colors...) as 'row N: [start-end attrs \"text\"]', 0-based columns, end exclusive. Use it to find the selected menu item (inverse or a background color), errors in red, or the focused field."}
 ;
 
 // Written over several lines for readability; the line breaks fall between
@@ -435,6 +604,7 @@ const tools_json_src =
     \\"cols":{"type":"integer","minimum":2,"maximum":1000,"description":"Width (default 120)."},
     \\"rows":{"type":"integer","minimum":1,"maximum":1000,"description":"Height (default 40)."},
     \\"cwd":{"type":"string","description":"Working directory (default: the MCP server's)."},
+++ styles_prop ++ "," ++
     \\"then_wait":{"type":"object","description":"Wait condition before returning the first screen, instead of the 300 ms idle default.","properties":{
 ++ wait_props ++
     \\}}},"required":["name","command"]}},
@@ -443,18 +613,24 @@ const tools_json_src =
 ++ " " ++ key_syntax ++
     \\","inputSchema":{"type":"object","properties":{
 ++ name_prop ++
-    \\,"keys":{"type":"array","items":{"type":"string"},"description":"Keys and text to send, in order."},
+    \\,"keys":{"type":"array","items":{"type":"string"},"description":"Keys and text to send, in order. Elements are never options."},
+    \\"literal":{"type":"boolean","description":"Send every element as plain text, without key parsing (so \"<Enter>\" is 7 characters)."},
+    \\"paste":{"type":"boolean","description":"Send the elements as one pasted block of text, wrapped in bracketed-paste markers if the program enabled them."},
+    \\"esc_delay_ms":{"type":"integer","minimum":0,"maximum":10000,"description":"Pause after a lone <Esc> followed by more keys, so it is not read as Alt (default 100, 0 disables)."},
+++ styles_prop ++ "," ++
     \\"then_wait":{"type":"object","description":"Wait after sending, then return the screen. An empty object means {\"idle_ms\":300}.","properties":{
 ++ wait_props ++
     \\}}},"required":["name","keys"]}},
 ++
-    \\{"name":"headterm_screen","description":"Return the current screen: one line per row, then a status line with size, cursor (0-based row,col), alt-screen flag and exit status.","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_screen","description":"Return the current screen: one line per row (empty rows at the bottom left out), then a status line with size, cursor (0-based row,col), alt-screen flag and exit status. A row whose text or styles changed counts as changed for diff.","inputSchema":{"type":"object","properties":{
 ++ name_prop ++
     \\,"diff":{"type":"boolean","description":"Only rows changed since the last screen returned for this session, as 'row|text'."},
-    \\"scrollback":{"type":"integer","minimum":0,"maximum":100000,"description":"Also return up to this many lines that scrolled off the top."}},"required":["name"]}},
+    \\"scrollback":{"type":"integer","minimum":0,"maximum":100000,"description":"Also return up to this many lines that scrolled off the top."},
+++ styles_prop ++
+    \\},"required":["name"]}},
 ++
-    \\{"name":"headterm_wait","description":"Wait until text appears, output goes idle, or the program exits (the first condition met wins), then return the screen. Returns an error result with the screen on timeout.","inputSchema":{"type":"object","properties":{
-++ name_prop ++ "," ++ wait_props ++
+    \\{"name":"headterm_wait","description":"Wait until text appears, output goes idle, or the program exits (the first condition met wins), then return the screen. Returns an error result with the screen on timeout. Cancellable with notifications/cancelled.","inputSchema":{"type":"object","properties":{
+++ name_prop ++ "," ++ wait_props ++ "," ++ styles_prop ++
     \\},"required":["name"]}},
 ++
     \\{"name":"headterm_resize","description":"Resize a session's terminal; the program gets SIGWINCH.","inputSchema":{"type":"object","properties":{
@@ -580,14 +756,4 @@ test "tool failures are results with isError" {
         try testing.expect(r.get("isError").?.bool);
         try testing.expect(std.mem.indexOf(u8, r.get("content").?.array.items[0].object.get("text").?.string, "no session named") != null);
     }
-}
-
-test "trimBlankRows keeps content and status line" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try testing.expectEqualStrings("line\n[headterm] x 10x4 running", try trimBlankRows(arena, "line\n\n\n[headterm] x 10x4 running\n"));
-    try testing.expectEqualStrings("[headterm] x 10x2 running", try trimBlankRows(arena, "\n\n[headterm] x 10x2 running\n"));
-    try testing.expectEqualStrings("a\nb\n[headterm] x", try trimBlankRows(arena, "a\nb\n[headterm] x"));
-    try testing.expectEqualStrings("\n  top\n\nmid\n[headterm] s", try trimBlankRows(arena, "\n  top\n\nmid\n\n[headterm] s"));
 }
