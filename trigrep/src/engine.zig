@@ -21,10 +21,10 @@ pub const Diag = struct {
 pub const WatchHook = struct {
     ptr: *anyopaque,
     /// Changes under `root` since index state `state_id`; null if nothing watches it.
-    changes: *const fn (ptr: *anyopaque, arena: Allocator, root: []const u8, index_path: []const u8, state_id: u64, hidden: bool) ?watch.Changes,
+    changes: *const fn (ptr: *anyopaque, arena: Allocator, root: []const u8, index_path: []const u8, state_id: u64) ?watch.Changes,
     /// A full walk of `root` just found `changed` to differ from index state
     /// `state_id`. Returns the watcher's sequence number after recording them.
-    seeded: *const fn (ptr: *anyopaque, root: []const u8, state_id: u64, hidden: bool, changed: []const []const u8) u64,
+    seeded: *const fn (ptr: *anyopaque, root: []const u8, state_id: u64, changed: []const []const u8) u64,
     /// The index is now `new_state`, which includes every change up to `seq`.
     rebased: *const fn (ptr: *anyopaque, root: []const u8, seq: u64, new_state: u64) void,
     /// Whether searches may update the index delta themselves (false when a daemon
@@ -45,6 +45,7 @@ pub const Request = struct {
     types_not: []const []const u8 = &.{},
     format: search.Format = .text,
     only_matching: bool = false,
+    style: search.TextStyle = .{},
     hidden: bool = false,
     no_index: bool = false,
     trust_index: bool = false,
@@ -118,7 +119,8 @@ pub const Built = struct { path: []const u8, stats: index.BuildStats, ms: f64 };
 /// Builds the base index for `root` from scratch and drops any delta.
 pub fn buildIndex(gpa: Allocator, arena: Allocator, root: []const u8, threads: ?usize) !Built {
     const t0 = std.time.nanoTimestamp();
-    const entries = try walk.walk(arena, root, .{});
+    // Hidden files are indexed too; searches without --hidden filter them out.
+    const entries = try walk.walk(arena, root, .{ .hidden = true });
     const out = try index.pathFor(arena, root);
     const st = try index.build(gpa, root, entries, out, threadCount(threads), .{});
     std.fs.cwd().deleteFile(try index.deltaPath(arena, out)) catch {};
@@ -171,7 +173,7 @@ pub fn updateDelta(gpa: Allocator, arena: Allocator, root: []const u8, index_pat
 
     var root_dir = try std.fs.cwd().openDir(root, .{});
     defer root_dir.close();
-    var checker = try walk.Checker.init(gpa, root, false);
+    var checker = try walk.Checker.init(gpa, root, true);
     defer checker.deinit();
     var entries: std.ArrayList(walk.Entry) = .empty;
     var it = paths.keyIterator();
@@ -251,6 +253,26 @@ fn pathMap(arena: Allocator, v: *const View) !std.StringHashMapUnmanaged(u32) {
     return by_path;
 }
 
+/// Filters out hidden files for searches without --hidden. The index and the
+/// freshness walk include hidden files; a hidden path stays visible only if an
+/// ignore file re-includes it (like `!.mailmap`), as in the walker.
+const Visibility = struct {
+    gpa: Allocator,
+    root: []const u8,
+    hidden: bool,
+    checker: ?walk.Checker = null,
+
+    fn ok(v: *Visibility, path: []const u8) !bool {
+        if (v.hidden or !walk.hasHiddenComponent(path)) return true;
+        if (v.checker == null) v.checker = try walk.Checker.init(v.gpa, v.root, false);
+        return !(try v.checker.?.skipped(path, false));
+    }
+
+    fn deinit(v: *Visibility) void {
+        if (v.checker) |*c| c.deinit();
+    }
+};
+
 /// Runs a search and writes `path:line:text` output to `out`.
 pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, diag: *Diag) !Outcome {
     const t_start = std.time.nanoTimestamp();
@@ -271,6 +293,7 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
         .context = req.context,
         .format = req.format,
         .only_matching = req.only_matching,
+        .style = req.style,
     };
     const threads = threadCount(req.threads);
 
@@ -342,6 +365,8 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
         }
 
         const strip = if (prefix.len == 0) 0 else prefix.len + 1;
+        var vis = Visibility{ .gpa = gpa, .root = root, .hidden = req.hidden };
+        defer vis.deinit();
         if (req.trust_index) {
             var id: u32 = 0;
             while (id < v.file_count) : (id += 1) {
@@ -349,6 +374,7 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
                 const rec = v.file(id);
                 if (!under(rec.path, prefix)) continue;
                 if (!filter.allows(rec.path[strip..])) continue;
+                if (!try vis.ok(rec.path)) continue;
                 // Copy: rec.path points into the index mapping, which is closed before the scan.
                 const path = try arena.dupe(u8, rec.path);
                 try jobs.append(arena, .{ .path = path, .display = try displayPath(arena, req.path, path[strip..]) });
@@ -357,17 +383,18 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
             outcome.stats = try std.fmt.allocPrint(arena, "index {d:.1} ms, {d} candidates, no freshness check", .{ load_ms, n_cand });
         } else {
             const t_fresh = std.time.nanoTimestamp();
-            const ch: ?watch.Changes = if (req.watch) |h| h.changes(h.ptr, arena, root, found_path, v.state_id, req.hidden) else null;
+            const ch: ?watch.Changes = if (req.watch) |h| h.changes(h.ptr, arena, root, found_path, v.state_id) else null;
             const may_update = ch == null or (req.watch != null and req.watch.?.auto_update);
             if (ch != null and !ch.?.full) {
-                const changed = try watchedJobs(gpa, arena, req, root, prefix, &v, &cand_set, filter, ch.?, &jobs);
+                const changed = try watchedJobs(gpa, arena, req, root, prefix, &v, &cand_set, filter, ch.?, &vis, &jobs);
                 if (may_update and changed.len >= auto_update_threshold) {
                     pending_update = changed;
                     pending_seq = ch.?.seq;
                 }
                 outcome.stats = try std.fmt.allocPrint(arena, "index {d:.1} ms, {d} candidates, watcher {d:.1} ms: {d} changed files, {d} changed dirs", .{ load_ms, n_cand, ms(t_fresh), ch.?.files.len, ch.?.dirs.len });
             } else {
-                const entries = try walk.walk(arena, root, .{ .hidden = req.hidden, .prefix = prefix });
+                // Walk with hidden files, like the index, so the two compare cleanly.
+                const entries = try walk.walk(arena, root, .{ .hidden = true, .prefix = prefix });
                 const by_path = try pathMap(arena, &v);
                 var seen = try std.DynamicBitSetUnmanaged.initEmpty(arena, v.file_count);
                 var changed_paths: std.ArrayList([]const u8) = .empty;
@@ -384,18 +411,19 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
                     if (!changed and !candidate) continue;
                     const rel = e.path[strip..];
                     if (!filter.allows(rel)) continue;
+                    if (!try vis.ok(e.path)) continue;
                     try jobs.append(arena, .{ .path = e.path, .display = try displayPath(arena, req.path, rel) });
                 }
                 const dirty = changed_paths.items.len;
                 // Deleted files count as changed too, so watched searches and the
                 // delta drop them. Only knowable when the walk covered everything.
-                if (prefix.len == 0 and !req.hidden) {
+                if (prefix.len == 0) {
                     var id: u32 = 0;
                     while (id < v.file_count) : (id += 1) {
                         if (v.live(id) and !seen.isSet(id)) try changed_paths.append(arena, try arena.dupe(u8, v.file(id).path));
                     }
                     var seq: u64 = 0;
-                    if (req.watch) |h| seq = h.seeded(h.ptr, root, v.state_id, req.hidden, changed_paths.items);
+                    if (req.watch) |h| seq = h.seeded(h.ptr, root, v.state_id, changed_paths.items);
                     if (may_update and changed_paths.items.len >= auto_update_threshold) {
                         pending_update = changed_paths.items;
                         pending_seq = seq;
@@ -440,6 +468,7 @@ fn watchedJobs(
     cand_set: *const std.DynamicBitSetUnmanaged,
     filter: walk.Filter,
     ch: watch.Changes,
+    vis: *Visibility,
     jobs: *std.ArrayList(search.Job),
 ) ![]const []const u8 {
     const strip = if (prefix.len == 0) 0 else prefix.len + 1;
@@ -457,13 +486,14 @@ fn watchedJobs(
         if (!cand_set.isSet(id) or !under(rec.path, prefix)) continue;
         if (in_dir or dirty.contains(rec.path)) continue;
         if (!filter.allows(rec.path[strip..])) continue;
+        if (!try vis.ok(rec.path)) continue;
         const path = try arena.dupe(u8, rec.path);
         try jobs.append(arena, .{ .path = path, .display = try displayPath(arena, req.path, path[strip..]) });
     }
 
     var root_dir = try std.fs.cwd().openDir(root, .{});
     defer root_dir.close();
-    var checker = try walk.Checker.init(gpa, root, req.hidden);
+    var checker = try walk.Checker.init(gpa, root, true);
     defer checker.deinit();
     for (ch.files) |f| {
         if (!under(f, prefix) or underAny(f, ch.dirs)) continue;
@@ -471,6 +501,7 @@ fn watchedJobs(
         if (st.kind != .file) continue;
         if (try checker.skipped(f, false)) continue;
         if (!filter.allows(f[strip..])) continue;
+        if (!try vis.ok(f)) continue;
         try jobs.append(arena, .{ .path = f, .display = try displayPath(arena, req.path, f[strip..]) });
     }
 
@@ -481,11 +512,12 @@ fn watchedJobs(
         }
         if (nested) continue;
         // Walk the whole changed directory (for the delta), search the part in the prefix.
-        const entries = try walk.walk(arena, root, .{ .hidden = req.hidden, .prefix = d });
+        const entries = try walk.walk(arena, root, .{ .hidden = true, .prefix = d });
         for (entries) |e| {
             try changed.append(arena, e.path);
             if (!under(e.path, prefix)) continue;
             if (!filter.allows(e.path[strip..])) continue;
+            if (!try vis.ok(e.path)) continue;
             try jobs.append(arena, .{ .path = e.path, .display = try displayPath(arena, req.path, e.path[strip..]) });
         }
     }
@@ -531,7 +563,7 @@ pub fn status(arena: Allocator, target: []const u8) !?Status {
     const found = (try findIndex(arena, target)) orelse return null;
     var v = try View.open(arena, found.path);
     defer v.close();
-    const entries = try walk.walk(arena, found.root, .{});
+    const entries = try walk.walk(arena, found.root, .{ .hidden = true });
     var by_path = try pathMap(arena, &v);
     var modified: usize = 0;
     var added: usize = 0;

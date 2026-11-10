@@ -34,6 +34,24 @@ Paths are relative to the server's working directory, which is the project when 
 
 The MCP server watches every repository it has searched (see below), so after the first search in a repo, later searches cost tens of milliseconds and still see every edit, including files written a moment before the search.
 
+## Standing in for ripgrep
+
+Coding agents already search with ripgrep (Claude Code's Grep tool runs `rg`), and in tests they rarely pick an extra search tool on their own. So trigrep can also answer as `rg`:
+
+```sh
+trigrep install-rg-shim              # creates ~/.local/share/trigrep/bin/rg -> trigrep
+USE_BUILTIN_RIPGREP=0 PATH="$HOME/.local/share/trigrep/bin:$PATH" claude
+```
+
+Invoked as `rg`, trigrep handles the searches it can reproduce exactly (Claude Code's `-l --null`, `--json -n`, `-c -H --null`, context, `--glob`, `--max-columns`, `-i/-w/-F/-o/-m/-t`) and hands everything else to the real ripgrep, which must be on PATH (or set `TRIGREP_REAL_RG`). It stays out of the way where ripgrep is already fast:
+
+- No index yet: the real ripgrep answers. If that took 300 ms or more (`TRIGREP_RG_MIN_MS`), an index is built in the background for next time.
+- A search in a subtree with fewer than 3,000 indexed files (`TRIGREP_RG_MIN_FILES`), or of a single file, goes to ripgrep.
+- Otherwise trigrep searches, and starts `trigrep watch --idle-exit 30` for the repository if none is running, so later searches skip the freshness walk. The watcher exits after 30 minutes without queries.
+- Any error before output is written falls back to ripgrep.
+
+On a 389k-file monorepo (four Linux trees), Claude Code-style searches gave output identical to ripgrep 15.2 (sorted lines, JSON records, exit codes) and took 0.05–0.84 s instead of 2.9–10.6 s. Running Claude Code (Sonnet) on four code-exploration tasks there, 3 runs each, total search time went from 38.8 s to 7.3 s. End-to-end time fell 7% on average and 20% on the most search-heavy task, because most of an agent's time is spent in the model. On the Linux kernel alone (97k files), end-to-end time didn't change.
+
 ## Keeping the index current
 
 The index has a base and a small *delta*: files that changed, appeared or were deleted since the base was built. A search that finds 300 or more changed files folds them into the delta afterwards (on the Linux kernel, 500 changed files took 84 ms), so the next search uses the index for them again instead of reading them all. `trigrep index --update` does the same on demand. When the delta would hold more than a quarter of the files, the base is rebuilt instead.

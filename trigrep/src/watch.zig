@@ -27,6 +27,8 @@ pub const Changes = struct {
 
 pub const Watcher = struct {
     gpa: Allocator,
+    /// When a search last asked (ms since epoch), for `trigrep watch --idle-exit`.
+    last_query_ms: std.atomic.Value(i64) = .init(0),
     root: []const u8,
     hidden: bool,
     mutex: std.Thread.Mutex = .{},
@@ -583,6 +585,7 @@ fn answer(w: *Watcher, stream: std.net.Stream) !void {
     const id = try std.fmt.parseInt(u64, line["changes ".len..], 16);
     var arena = std.heap.ArenaAllocator.init(w.gpa);
     defer arena.deinit();
+    w.last_query_ms.store(std.time.milliTimestamp(), .monotonic);
     const ch = try w.changes(arena.allocator(), id);
     var wbuf: [64 * 1024]u8 = undefined;
     var writer = stream.writer(&wbuf);

@@ -9,6 +9,7 @@ const engine = @import("engine.zig");
 const mcp = @import("mcp.zig");
 const watch = @import("watch.zig");
 const view = @import("view.zig");
+const rgmode = @import("rgmode.zig");
 const View = view.View;
 
 pub const version = "0.2.1";
@@ -22,7 +23,9 @@ const usage =
     \\                                     re-indexes files that changed
     \\  trigrep status [PATH]              show the index and how many files changed
     \\  trigrep watch [PATH]               keep the index fresh; searches skip the full walk
+    \\        [--idle-exit MINUTES]        stop after MINUTES without searches
     \\  trigrep mcp                        run as an MCP server on stdin/stdout
+    \\  trigrep install-rg-shim [DIR]      let tools that run `rg` use trigrep
     \\
     \\Search options:
     \\  -i, --ignore-case          case-insensitive (ASCII)
@@ -63,6 +66,8 @@ const Args = struct {
     max_count: ?usize = null,
     context: search.Context = .{},
     update: bool = false,
+    /// `watch --idle-exit MINUTES`: stop after this long without searches.
+    idle_exit_min: ?i64 = null,
     globs: std.ArrayList([]const u8) = .empty,
     types: std.ArrayList([]const u8) = .empty,
     types_not: std.ArrayList([]const u8) = .empty,
@@ -123,6 +128,7 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
             } else if (std.mem.eql(u8, name, "after-context")) a.context.after = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --after-context", .{})
             else if (std.mem.eql(u8, name, "before-context")) a.context.before = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --before-context", .{})
             else if (std.mem.eql(u8, name, "update")) a.update = true
+            else if (std.mem.eql(u8, name, "idle-exit")) a.idle_exit_min = std.fmt.parseInt(i64, value(argv, &i, inline_value, name), 10) catch fail("bad --idle-exit", .{})
             else if (std.mem.eql(u8, name, "type")) try a.types.append(arena, value(argv, &i, inline_value, name))
             else if (std.mem.eql(u8, name, "type-not")) try a.types_not.append(arena, value(argv, &i, inline_value, name))
             else if (std.mem.eql(u8, name, "json")) a.json = true
@@ -244,6 +250,18 @@ pub fn main() !void {
     const arena = arena_state.allocator();
 
     const argv = try std.process.argsAlloc(arena);
+    if (argv.len > 0 and rgmode.invokedAsRg(argv[0])) {
+        const args = try arena.alloc([]const u8, argv.len);
+        for (argv, 0..) |x, i| args[i] = x;
+        try rgmode.main(gpa, arena, args);
+    }
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "install-rg-shim")) {
+        return installShim(arena, if (argv.len >= 3) argv[2] else null);
+    }
+    if (argv.len == 4 and std.mem.eql(u8, argv[1], "__bg-index")) {
+        rgmode.backgroundIndex(gpa, arena, argv[2], argv[3]);
+        return;
+    }
     const a = try parseArgs(arena, argv);
     var diag = engine.Diag{};
 
@@ -256,7 +274,7 @@ pub fn main() !void {
                 const found = (try engine.findIndex(arena, target)) orelse fail("no index covers {s}; run `trigrep index` first", .{target});
                 var v = View.open(arena, found.path) catch |err| fail("can't read index: {s}; run `trigrep index`", .{@errorName(err)});
                 defer v.close();
-                const entries = try walk.walk(arena, found.root, .{});
+                const entries = try walk.walk(arena, found.root, .{ .hidden = true });
                 const changed = try engine.diffIndex(arena, &v, entries);
                 const u = engine.updateDelta(gpa, arena, found.root, found.path, &v, changed, a.threads) catch |err| fail("update failed: {s}", .{@errorName(err)});
                 std.debug.print("trigrep: {s}\n", .{try engine.describeUpdate(arena, u)});
@@ -297,7 +315,7 @@ pub fn main() !void {
         .no_index = a.no_index,
         .trust_index = a.trust_index,
         .threads = a.threads,
-        .watch = if (watch.supported) .{ .ptr = undefined, .changes = daemonChanges, .seeded = daemonSeeded, .rebased = daemonRebased, .auto_update = false } else null,
+        .watch = if (watch.supported) daemonWatchHook() else null,
     };
     const outcome = engine.run(gpa, arena, req, out, &diag) catch |err| {
         out.flush() catch {};
@@ -312,13 +330,49 @@ pub fn main() !void {
     std.process.exit(if (outcome.totals.lines_matched > 0) 0 else 1);
 }
 
-fn daemonChanges(_: *anyopaque, arena: Allocator, _: []const u8, index_path: []const u8, build_id: u64, hidden: bool) ?watch.Changes {
-    if (hidden) return null;
+/// `trigrep install-rg-shim [DIR]`: make `DIR/rg` a symlink to trigrep, so programs
+/// that run `rg` (Claude Code's Grep with USE_BUILTIN_RIPGREP=0) use the index.
+fn installShim(arena: Allocator, dir_arg: ?[]const u8) !void {
+    const home = std.posix.getenv("HOME") orelse fail("HOME is not set", .{});
+    const dir = dir_arg orelse try std.fs.path.join(arena, &.{ home, ".local", "share", "trigrep", "bin" });
+    std.fs.cwd().makePath(dir) catch |err| fail("can't create {s}: {s}", .{ dir, @errorName(err) });
+    const self = try std.fs.selfExePathAlloc(arena);
+    const link = try std.fs.path.join(arena, &.{ dir, "rg" });
+    std.fs.cwd().deleteFile(link) catch {};
+    std.fs.cwd().symLink(self, link, .{}) catch |err| fail("can't create {s}: {s}", .{ link, @errorName(err) });
+    var buf: [2048]u8 = undefined;
+    var w = std.fs.File.stdout().writerStreaming(&buf);
+    try w.interface.print(
+        \\Created {s} -> {s}
+        \\
+        \\To have Claude Code's Grep tool use it, add to ~/.claude/settings.json:
+        \\
+        \\  "env": {{
+        \\    "USE_BUILTIN_RIPGREP": "0",
+        \\    "PATH": "{s}:<your existing PATH>"
+        \\  }}
+        \\
+        \\or start Claude Code with: USE_BUILTIN_RIPGREP=0 PATH="{s}:$PATH" claude
+        \\
+        \\Searches trigrep can't reproduce exactly go to the real ripgrep on your PATH
+        \\(it must be installed). Repositories where ripgrep is already fast are left
+        \\alone; slow ones get an index built in the background on first use.
+        \\
+    , .{ link, self, dir, dir });
+    try w.interface.flush();
+}
+
+/// Freshness from a running `trigrep watch`, for CLI and ripgrep-mode searches.
+pub fn daemonWatchHook() engine.WatchHook {
+    return .{ .ptr = undefined, .changes = daemonChanges, .seeded = daemonSeeded, .rebased = daemonRebased, .auto_update = false };
+}
+
+fn daemonChanges(_: *anyopaque, arena: Allocator, _: []const u8, index_path: []const u8, build_id: u64) ?watch.Changes {
     const sock = watch.socketPath(arena, index_path) catch return null;
     return watch.query(arena, sock, build_id);
 }
 
-fn daemonSeeded(_: *anyopaque, _: []const u8, _: u64, _: bool, _: []const []const u8) u64 {
+fn daemonSeeded(_: *anyopaque, _: []const u8, _: u64, _: []const []const u8) u64 {
     return 0; // The daemon re-seeds itself.
 }
 
@@ -337,7 +391,7 @@ fn reseed(gpa: Allocator, w: *watch.Watcher, root: []const u8, index_path: []con
     w.beginSeed();
     var v = try View.open(arena, index_path);
     defer v.close();
-    const entries = try walk.walk(arena, root, .{});
+    const entries = try walk.walk(arena, root, .{ .hidden = true });
     const changed = try engine.diffIndex(arena, &v, entries);
     _ = w.seed(v.state_id, changed);
     std.debug.print("trigrep: tracking {d} files, {d} changed since indexing\n", .{ entries.len, changed.len });
@@ -354,7 +408,7 @@ fn updateFromWatcher(gpa: Allocator, w: *watch.Watcher, root: []const u8, index_
     var changed: std.ArrayList([]const u8) = .empty;
     try changed.appendSlice(arena, ch.files);
     for (ch.dirs) |d| {
-        for (try walk.walk(arena, root, .{ .prefix = d })) |e| try changed.append(arena, e.path);
+        for (try walk.walk(arena, root, .{ .hidden = true, .prefix = d })) |e| try changed.append(arena, e.path);
         var id: u32 = 0;
         while (id < v.file_count) : (id += 1) {
             const pth = v.file(id).path;
@@ -380,7 +434,7 @@ fn watchMain(gpa: Allocator, arena: Allocator, a: Args) !void {
     }
     const root = found.?.root;
     const index_path = found.?.path;
-    const w = try watch.Watcher.create(gpa, root, false);
+    const w = try watch.Watcher.create(gpa, root, true);
     if (w.failed) fail("can't watch {s}", .{root});
     const sock = try watch.socketPath(arena, index_path);
     watch.ensureSocketDir(sock) catch |err| fail("socket directory for {s}: {s}", .{ sock, @errorName(err) });
@@ -388,6 +442,7 @@ fn watchMain(gpa: Allocator, arena: Allocator, a: Args) !void {
     std.debug.print("trigrep: watching {s} (socket {s}); Ctrl-C stops\n", .{ root, sock });
 
     var quiet_since = std.time.milliTimestamp();
+    w.last_query_ms.store(std.time.milliTimestamp(), .monotonic);
     var last_count: usize = 0;
     while (true) {
         const p = w.pending();
@@ -408,6 +463,13 @@ fn watchMain(gpa: Allocator, arena: Allocator, a: Args) !void {
                     std.debug.print("trigrep: index update failed: {s}\n", .{@errorName(err)});
             }
         }
+        if (a.idle_exit_min) |mins| {
+            if (std.time.milliTimestamp() - w.last_query_ms.load(.monotonic) > mins * 60 * 1000) {
+                std.fs.cwd().deleteFile(sock) catch {};
+                std.debug.print("trigrep: no searches for {d} minutes, exiting\n", .{mins});
+                std.process.exit(0);
+            }
+        }
         std.Thread.sleep(500 * std.time.ns_per_ms);
     }
 }
@@ -422,5 +484,6 @@ test {
     _ = mcp;
     _ = @import("watch.zig");
     _ = view;
+    _ = rgmode;
     _ = @import("glob.zig");
 }

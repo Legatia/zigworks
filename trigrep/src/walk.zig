@@ -256,6 +256,12 @@ pub const Checker = struct {
     }
 };
 
+/// True if any component of `rel` starts with a dot.
+pub fn hasHiddenComponent(rel: []const u8) bool {
+    if (rel.len > 0 and rel[0] == '.') return true;
+    return std.mem.indexOf(u8, rel, "/.") != null;
+}
+
 /// Stats `rel` under `root` without following a final symlink.
 pub fn lstat(root: std.fs.Dir, rel: []const u8) ?std.fs.File.Stat {
     const st = std.posix.fstatat(root.fd, rel, std.posix.AT.SYMLINK_NOFOLLOW) catch return null;

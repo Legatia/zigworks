@@ -21,7 +21,7 @@ const walk = @import("walk.zig");
 const Query = @import("query.zig").Query;
 
 pub const magic = "TRIGREP\x01";
-pub const format_version: u32 = 3;
+pub const format_version: u32 = 4;
 const header_len = 88;
 const file_rec = 24;
 const tri_rec = 16;
@@ -407,6 +407,36 @@ pub const Index = struct {
         };
     }
 
+    /// How many indexed files lie under directory `prefix` (relative, no trailing
+    /// slash). Files are stored in walk order, so they form one contiguous range.
+    pub fn countUnder(ix: *const Index, prefix: []const u8) u32 {
+        if (prefix.len == 0) return ix.file_count;
+        var lo_key: [std.fs.max_path_bytes + 1]u8 = undefined;
+        if (prefix.len + 1 > lo_key.len) return ix.file_count;
+        @memcpy(lo_key[0..prefix.len], prefix);
+        lo_key[prefix.len] = '/';
+        const key = lo_key[0 .. prefix.len + 1];
+        const first = ix.lowerBound(key);
+        var lo = first;
+        var hi: u32 = ix.file_count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.startsWith(u8, ix.file(mid).path, key)) lo = mid + 1 else hi = mid;
+        }
+        return lo - first;
+    }
+
+    /// First file id whose path is not before `key` in walk order.
+    fn lowerBound(ix: *const Index, key: []const u8) u32 {
+        var lo: u32 = 0;
+        var hi: u32 = ix.file_count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (walk.pathOrder(ix.file(mid).path, key)) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
     pub fn lookup(ix: *const Index, tri: u32) ?Postings {
         var lo: usize = 0;
         var hi: usize = ix.tri_count;
@@ -571,6 +601,8 @@ test "build, open and query an index" {
     try std.testing.expectEqualStrings(root, ix.root);
     try std.testing.expectEqual(@as(u32, 3), ix.file_count);
     try std.testing.expectEqualStrings("b.txt", ix.file(1).path);
+    try std.testing.expectEqual(@as(u32, 3), ix.countUnder(""));
+    try std.testing.expectEqual(@as(u32, 0), ix.countUnder("nope"));
 
     const q = @import("query.zig");
     const hello = try q.plan(arena, try @import("regex.zig").parse(arena, "hello", .{}));

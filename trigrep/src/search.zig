@@ -18,6 +18,17 @@ pub const Context = struct {
     }
 };
 
+/// How text output looks. trigrep's own default is `path:line:text`; in ripgrep mode
+/// these follow ripgrep's flags exactly.
+pub const TextStyle = struct {
+    filename: bool = true,
+    line_numbers: bool = true,
+    /// Follow every printed path with NUL instead of the usual separator (--null).
+    null_after_path: bool = false,
+    /// Replace longer lines with ripgrep's "[Omitted long ... line]" (--max-columns).
+    max_columns: ?usize = null,
+};
+
 pub const Config = struct {
     prog: *const regex.Program,
     plan: query.Plan,
@@ -25,6 +36,7 @@ pub const Config = struct {
     max_count: ?usize = null,
     context: Context = .{},
     format: Format = .text,
+    style: TextStyle = .{},
     /// Print each match instead of the whole line (-o).
     only_matching: bool = false,
 };
@@ -178,8 +190,11 @@ pub fn searchBuffer(
         pos = line_end + 1;
     }
     if (matches > 0) switch (cfg.mode) {
-        .files_with_matches => try out.print(gpa, "{s}\n", .{display}),
-        .count => try out.print(gpa, "{s}:{d}\n", .{ display, matches }),
+        .files_with_matches => try out.print(gpa, "{s}{c}", .{ display, @as(u8, if (cfg.style.null_after_path) 0 else '\n') }),
+        .count => if (cfg.style.filename)
+            try out.print(gpa, "{s}{c}{d}\n", .{ display, @as(u8, if (cfg.style.null_after_path) 0 else ':'), matches })
+        else
+            try out.print(gpa, "{d}\n", .{matches}),
         .lines => try pr.finish(matches),
     };
     return .{ .lines = matches, .matches = pr.submatches };
@@ -274,19 +289,32 @@ const Printer = struct {
     fn matchLine(p: *Printer, no: usize, start: usize, end: usize) !void {
         const line = p.data[start..end];
         if (p.cfg.format == .text and !p.cfg.only_matching) {
-            return p.out.print(p.gpa, "{s}:{d}:{s}\n", .{ p.display, no, line });
+            return p.textLine(':', no, line, "[Omitted long matching line]");
         }
         var found: std.ArrayList(regex.Matcher.Span) = .empty;
         defer found.deinit(p.gpa);
         try p.spans(line, &found);
         p.submatches += found.items.len;
         if (p.cfg.format == .json) return p.record("match", no, start, end, found.items);
-        for (found.items) |sp| try p.out.print(p.gpa, "{s}:{d}:{s}\n", .{ p.display, no, line[sp.start..sp.end] });
+        for (found.items) |sp| try p.textLine(':', no, line[sp.start..sp.end], "[Omitted long matching line]");
     }
 
     fn contextLine(p: *Printer, no: usize, start: usize, end: usize) !void {
         if (p.cfg.format == .json) return p.record("context", no, start, end, &.{});
-        try p.out.print(p.gpa, "{s}-{d}-{s}\n", .{ p.display, no, p.data[start..end] });
+        try p.textLine('-', no, p.data[start..end], "[Omitted long context line]");
+    }
+
+    /// One line of text output: [path sep][line sep]text, per the style.
+    fn textLine(p: *Printer, sep: u8, no: usize, text: []const u8, omitted: []const u8) !void {
+        const st = p.cfg.style;
+        if (st.filename) {
+            try p.out.appendSlice(p.gpa, p.display);
+            try p.out.append(p.gpa, if (st.null_after_path) 0 else sep);
+        }
+        if (st.line_numbers) try p.out.print(p.gpa, "{d}{c}", .{ no, sep });
+        const long = if (st.max_columns) |m| text.len > m else false;
+        try p.out.appendSlice(p.gpa, if (long) omitted else text);
+        try p.out.append(p.gpa, '\n');
     }
 
     fn separator(p: *Printer) !void {

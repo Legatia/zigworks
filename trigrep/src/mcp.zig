@@ -80,11 +80,11 @@ pub const Registry = struct {
         return r.watchers.get(root);
     }
 
-    fn changes(ptr: *anyopaque, arena: Allocator, root: []const u8, _: []const u8, build_id: u64, hidden: bool) ?watch.Changes {
-        if (!watch.supported or hidden) return null;
+    fn changes(ptr: *anyopaque, arena: Allocator, root: []const u8, _: []const u8, build_id: u64) ?watch.Changes {
+        if (!watch.supported) return null;
         const r: *Registry = @ptrCast(@alignCast(ptr));
         const w = r.watchers.get(root) orelse blk: {
-            const nw = watch.Watcher.create(r.gpa, root, false) catch return null;
+            const nw = watch.Watcher.create(r.gpa, root, true) catch return null;
             r.watchers.put(r.gpa, nw.root, nw) catch {
                 nw.destroy();
                 return null;
@@ -96,8 +96,7 @@ pub const Registry = struct {
         return ch;
     }
 
-    fn seeded(ptr: *anyopaque, root: []const u8, build_id: u64, hidden: bool, changed: []const []const u8) u64 {
-        if (hidden) return 0;
+    fn seeded(ptr: *anyopaque, root: []const u8, build_id: u64, changed: []const []const u8) u64 {
         const r: *Registry = @ptrCast(@alignCast(ptr));
         if (r.watchers.get(root)) |w| return w.seed(build_id, changed);
         return 0;
