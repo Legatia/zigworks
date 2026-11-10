@@ -8,7 +8,7 @@ const server = @import("server.zig");
 pub const max_name_len = 64;
 
 pub fn validName(name: []const u8) bool {
-    if (name.len == 0 or name.len > max_name_len or name[0] == '.') return false;
+    if (name.len == 0 or name.len > max_name_len or name[0] == '.' or name[0] == '-') return false;
     for (name) |c| {
         if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.')) return false;
     }
@@ -110,15 +110,16 @@ pub const StartOptions = struct {
     cwd: ?[]const u8 = null,
     log_path: ?[]const u8 = null,
     ttl_s: ?u32 = null,
+    record_path: ?[]const u8 = null,
 };
 
 /// Starts session `name` running `argv`. Returns the program's pid; on
 /// failure `msg` holds a human-readable reason.
 pub fn startSession(gpa: Allocator, name: []const u8, argv: []const []const u8, opts: StartOptions, msg: *[256]u8) error{StartFailed}!posix.pid_t {
     @memset(msg, 0);
-    if (!validName(name)) return failMsg(msg, "invalid session name '{s}' (use letters, digits, '.', '_', '-')", .{name});
+    if (!validName(name)) return failMsg(msg, "invalid session name '{s}': use 1-64 letters, digits, '.', '_' or '-', not starting with '.' or '-'", .{name});
     if (argv.len == 0) return failMsg(msg, "missing command", .{});
-    if (opts.cols < 2 or opts.rows < 1 or opts.cols > 1000 or opts.rows > 1000) return failMsg(msg, "cols must be 2..1000 and rows 1..1000", .{});
+    if (opts.cols < 2 or opts.rows < 1 or opts.cols > 1000 or opts.rows > 1000) return failMsg(msg, "size {d}x{d} is out of range: cols must be 2..1000 and rows 1..1000", .{ opts.cols, opts.rows });
 
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = sessionDir(&dir_buf) catch return failMsg(msg, "session directory path too long", .{});
@@ -129,7 +130,7 @@ pub fn startSession(gpa: Allocator, name: []const u8, argv: []const []const u8, 
     // A socket nobody listens on is left over from a crashed server.
     if (request(gpa, sock, &.{"info"})) |resp| {
         gpa.free(resp.body);
-        return failMsg(msg, "session '{s}' already exists", .{name});
+        return failMsg(msg, "session '{s}' already exists; kill it or pick another name", .{name});
     } else |err| switch (err) {
         error.StaleSession => posix.unlink(sock) catch {},
         else => {},
@@ -146,6 +147,7 @@ pub fn startSession(gpa: Allocator, name: []const u8, argv: []const []const u8, 
         .rows = opts.rows,
         .log_path = opts.log_path,
         .ttl_s = opts.ttl_s,
+        .record_path = opts.record_path,
     }, &server_msg) catch |err| switch (err) {
         error.StartFailed => failMsg(msg, "{s}", .{std.mem.sliceTo(&server_msg, 0)}),
         else => failMsg(msg, "{s}", .{@errorName(err)}),
@@ -178,9 +180,9 @@ pub fn sessionSocket(buf: *[std.fs.max_path_bytes]u8, name: []const u8) CallErro
 /// One-line explanation of a `call` failure.
 pub fn describeError(buf: []u8, err: CallError, name: []const u8) []const u8 {
     return switch (err) {
-        error.InvalidName => std.fmt.bufPrint(buf, "invalid session name '{s}' (use letters, digits, '.', '_', '-')", .{name}),
+        error.InvalidName => std.fmt.bufPrint(buf, "invalid session name '{s}': use 1-64 letters, digits, '.', '_' or '-', not starting with '.' or '-'", .{name}),
         error.NoSuchSession, error.StaleSession => std.fmt.bufPrint(buf, "no session named '{s}'", .{name}),
-        error.BadResponse => std.fmt.bufPrint(buf, "bad response from session '{s}'", .{name}),
+        error.BadResponse => std.fmt.bufPrint(buf, "session '{s}' closed the connection without an answer; its server may have stopped", .{name}),
         else => std.fmt.bufPrint(buf, "session '{s}': {s}", .{ name, @errorName(err) }),
     } catch "error";
 }
@@ -272,6 +274,7 @@ test validName {
     try std.testing.expect(validName("a.b_c"));
     try std.testing.expect(!validName(""));
     try std.testing.expect(!validName(".hidden"));
+    try std.testing.expect(!validName("-h"));
     try std.testing.expect(!validName("a/b"));
     try std.testing.expect(!validName("a b"));
 }

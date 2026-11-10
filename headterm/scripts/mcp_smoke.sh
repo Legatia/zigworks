@@ -103,13 +103,15 @@ echo "ok - cancelled wait returned in ${elapsed}s with no reply"
 # MCP sessions get a one-hour TTL by default, and the MCP server's diff
 # marker is its own: a CLI client still sees every row as new.
 printf '%s\n' \
-    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"headterm_start","arguments":{"name":"mcpsmoke","command":["sleep","60"],"rows":6}}}' \
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"headterm_start","arguments":{"name":"mcpsmoke","command":["sleep","60"],"rows":6,"record":"'"$STATE"'/mcp.cast"}}}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"headterm_screen","arguments":{"name":"mcpsmoke"}}}' |
     "$HT" mcp >"$STATE/out" 2>"$STATE/err" || fail "mcp exited with $?"
 "$HT" list --json | grep -q '"name":"mcpsmoke".*"ttl_s":3600' || fail "default ttl_s 3600 not reported"
 echo "ok - MCP sessions default to ttl_s 3600"
 "$HT" screen mcpsmoke --diff | grep -q 'changed=6' || fail "CLI diff marker was consumed by the MCP server"
 echo "ok - MCP and CLI diff markers are separate"
+head -1 "$STATE/mcp.cast" | grep -q '^{"version":2,"width":120,"height":6,' || fail "record option did not write an asciicast header"
+echo "ok - record option writes an asciicast file"
 "$HT" kill mcpsmoke
 
 echo "mcp smoke: all passed"

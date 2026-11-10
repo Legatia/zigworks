@@ -342,6 +342,7 @@ const Dispatch = struct {
             if (try a.int("cols", 2, 1000)) |c| opts.cols = @intCast(c);
             if (try a.int("rows", 1, 1000)) |r| opts.rows = @intCast(r);
             opts.cwd = try a.string("cwd");
+            opts.record_path = try a.string("record");
             const ttl = (try a.int("ttl_s", 0, max_ttl_s)) orelse default_ttl_s;
             opts.ttl_s = if (ttl == 0) null else @intCast(ttl);
             const wait = try self.waitSpec(try a.object("then_wait"), .{ .idle_ms = start_idle_ms, .timeout_ms = start_timeout_ms });
@@ -492,7 +493,8 @@ const Dispatch = struct {
             error.Unexpected, error.SystemResources, error.NetworkSubsystemFailed => |e| return e,
             else => |e| {
                 var buf: [256]u8 = undefined;
-                const text = try self.arena.dupe(u8, client.describeError(&buf, e, name));
+                const hint = if (e == error.NoSuchSession or e == error.StaleSession) " (see headterm_list)" else "";
+                const text = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ client.describeError(&buf, e, name), hint });
                 return .{ .text = text, .is_error = true, .request_failed = true };
             },
         };
@@ -588,16 +590,17 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-// Embedded in a JSON string, so quotes are escaped for JSON.
-const key_syntax = "Each element is literal text or a key: <Enter> <Tab> <Esc> <Backspace> <Space> <Up> <Down> <Left> <Right> <Home> <End> <PageUp> <PageDown> <Delete> <F1>..<F12>, <C-x> for Ctrl (e.g. <C-c>), <M-x> for Alt, <lt> for a literal '<'. Mouse, only if the program enabled mouse reporting: <Click row,col>, <RightClick row,col>, <MiddleClick row,col>, <ScrollUp row,col>, <ScrollDown row,col> (0-based, like the cursor position). Example: [\\\"ihello\\\", \\\"<Esc>\\\", \\\":wq\\\", \\\"<Enter>\\\"].";
+// Tool definitions. The descriptions are what a model reads to decide how
+// to call a tool: keep them short, and keep the key syntax in one place
+// (headterm_send).
 
 const wait_props =
-    \\"text":{"type":"string","description":"Wait until this text is on screen (already-visible text counts). Rows joined by line wrapping are searched as one line."},
-    \\"regex":{"type":"string","description":"Wait until a line on screen matches this regex (. [] \\d \\w \\s ^ $ | () * + ? {n,m}; (?i) prefix for any case). Lines are joined across wrapping, trailing spaces removed."},
-    \\"gone":{"type":"string","description":"Wait until this text is no longer on screen, e.g. a spinner or 'Loading'. Met at once if it is not there."},
-    \\"idle_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"Wait until the program has printed nothing for this many ms."},
-    \\"exit":{"type":"boolean","description":"Wait until the program exits."},
-    \\"timeout_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"Give up after this many ms (default 10000)."}
+    \\"text":{"type":"string","description":"Text is on screen (wrapped rows count as one line)."},
+    \\"regex":{"type":"string","description":"A screen line matches: . [] \\d \\w \\s \\b ^ $ | () * + ? {n,m}, (?i) prefix for any case."},
+    \\"gone":{"type":"string","description":"Text is no longer on screen, e.g. a spinner or 'Loading'."},
+    \\"idle_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"No output for this many ms."},
+    \\"exit":{"type":"boolean","description":"The program exited."},
+    \\"timeout_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"Default 10000."}
 ;
 
 const name_prop =
@@ -605,7 +608,7 @@ const name_prop =
 ;
 
 const styles_prop =
-    \\"styles":{"type":"boolean","description":"Also list styled runs per row (bold, inverse, colors...) as 'row N: [start-end attrs \"text\"]', 0-based columns, end exclusive. Use it to find the selected menu item (inverse or a background color), errors in red, or the focused field."}
+    \\"styles":{"type":"boolean","description":"Also list styled runs per row: 'row N: [start-end attrs \"text\"]'. Shows the selected menu item (inverse or a background color), red errors, the focused field."}
 ;
 
 // Written over several lines for readability; the line breaks fall between
@@ -629,51 +632,50 @@ fn oneLine(comptime src: []const u8) []const u8 {
 const tools_json_src =
     \\{"tools":[
 ++
-    \\{"name":"headterm_start","description":"Start a program (shell, REPL, vim, less, top, installer...) in a new terminal session and return its first screen once output has been idle for 300 ms (at most 5 s). Sessions end after ttl_s (default 1 hour) without tool calls or output. Use for interactive or full-screen programs; use plain shell execution for one-shot commands.","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_start","description":"Start a program in a new terminal session and return its first screen, after 300 ms without output (at most 5 s). For interactive and full-screen programs: shells, REPLs, vim, less, installers.","inputSchema":{"type":"object","properties":{
 ++ name_prop ++
-    \\,"command":{"type":"array","items":{"type":"string"},"minItems":1,"description":"Program and arguments, e.g. [\"python3\", \"-q\"] or [\"vim\", \"notes.txt\"]."},
-    \\"cols":{"type":"integer","minimum":2,"maximum":1000,"description":"Width (default 120)."},
-    \\"rows":{"type":"integer","minimum":1,"maximum":1000,"description":"Height (default 40)."},
-    \\"cwd":{"type":"string","description":"Working directory (default: the MCP server's)."},
-    \\"ttl_s":{"type":"integer","minimum":0,"maximum":2592000,"description":"End the session after this many seconds without tool calls or output (default 3600, 0 = never)."},
+    \\,"command":{"type":"array","items":{"type":"string"},"minItems":1,"description":"Program and arguments, e.g. [\"python3\", \"-q\"]."},
+    \\"cols":{"type":"integer","minimum":2,"maximum":1000,"description":"Width, default 120."},
+    \\"rows":{"type":"integer","minimum":1,"maximum":1000,"description":"Height, default 40."},
+    \\"cwd":{"type":"string","description":"Working directory."},
+    \\"ttl_s":{"type":"integer","minimum":0,"maximum":2592000,"description":"End the session after this many seconds without calls or output. Default 3600, 0 = never."},
+    \\"record":{"type":"string","description":"Write an asciicast v2 recording to this file (play with asciinema play)."},
 ++ styles_prop ++ "," ++
-    \\"then_wait":{"type":"object","description":"Wait condition before returning the first screen, instead of the 300 ms idle default.","properties":{
+    \\"then_wait":{"type":"object","description":"Wait for this instead of the 300 ms idle default.","properties":{
 ++ wait_props ++
     \\}}},"required":["name","command"]}},
 ++
-    \\{"name":"headterm_send","description":"Send keys to a session, optionally wait, and return the screen. Use then_wait (e.g. {\"idle_ms\":300} or {\"text\":\"$ \"}) to get the result in the same call.
-++ " " ++ key_syntax ++
-    \\","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_send","description":"Send keys, optionally wait, and return the screen. Each keys element is text or a key: <Enter> <Tab> <Esc> <Backspace> <Space> <Up> <Down> <Left> <Right> <Home> <End> <PageUp> <PageDown> <Delete> <F1>..<F12> <lt>; modifiers <C-c> <M-x> <S-Tab>. Mouse, only if the program enabled it (0-based row,col): <Click r,c> <RightClick r,c> <Drag r1,c1 r2,c2> <ScrollUp r,c> <ScrollDown r,c>, also <S-Click r,c> <C-Click r,c>. Example: [\"ihello\", \"<Esc>\", \":wq\", \"<Enter>\"].","inputSchema":{"type":"object","properties":{
 ++ name_prop ++
-    \\,"keys":{"type":"array","items":{"type":"string"},"description":"Keys and text to send, in order. Elements are never options."},
-    \\"literal":{"type":"boolean","description":"Send every element as plain text, without key parsing (so \"<Enter>\" is 7 characters)."},
-    \\"paste":{"type":"boolean","description":"Send the elements as one pasted block of text, wrapped in bracketed-paste markers if the program enabled them."},
-    \\"esc_delay_ms":{"type":"integer","minimum":0,"maximum":10000,"description":"Pause after a lone <Esc> followed by more keys, so it is not read as Alt (default 100, 0 disables)."},
+    \\,"keys":{"type":"array","items":{"type":"string"},"description":"Sent in order; never treated as options."},
+    \\"literal":{"type":"boolean","description":"Send keys as plain text, without <Key> parsing."},
+    \\"paste":{"type":"boolean","description":"Send keys as one bracketed paste."},
+    \\"esc_delay_ms":{"type":"integer","minimum":0,"maximum":10000,"description":"Pause after a lone <Esc> so it is not read as Alt. Default 100."},
 ++ styles_prop ++ "," ++
-    \\"then_wait":{"type":"object","description":"Wait after sending, then return the screen. An empty object means {\"idle_ms\":300}.","properties":{
+    \\"then_wait":{"type":"object","description":"Wait, then return the screen. {} means {\"idle_ms\":300}.","properties":{
 ++ wait_props ++
     \\}}},"required":["name","keys"]}},
 ++
-    \\{"name":"headterm_screen","description":"Return the current screen: one line per row (empty rows at the bottom left out), then a status line with size, cursor (0-based row,col), alt-screen flag and exit status. A row whose text or styles changed counts as changed for diff.","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_screen","description":"Return the screen: rows, then a status line with size, cursor (0-based row,col), alt screen and exit status.","inputSchema":{"type":"object","properties":{
 ++ name_prop ++
-    \\,"diff":{"type":"boolean","description":"Only rows changed since the last screen returned for this session, as 'row|text'."},
+    \\,"diff":{"type":"boolean","description":"Only rows whose text or styles changed since this MCP server's last screen, as 'row|text'."},
     \\"scrollback":{"type":"integer","minimum":0,"maximum":100000,"description":"Also return up to this many lines that scrolled off the top."},
 ++ styles_prop ++
     \\},"required":["name"]}},
 ++
-    \\{"name":"headterm_wait","description":"Wait until text appears (text, regex), text disappears (gone), output goes idle, or the program exits; the first condition met wins. Then return the screen. Returns an error result with the screen on timeout. Cancellable with notifications/cancelled.","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_wait","description":"Wait until the first of the given conditions holds, then return the screen. On timeout: an error result, with the screen.","inputSchema":{"type":"object","properties":{
 ++ name_prop ++ "," ++ wait_props ++ "," ++ styles_prop ++
     \\},"required":["name"]}},
 ++
-    \\{"name":"headterm_resize","description":"Resize a session's terminal; the program gets SIGWINCH.","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_resize","description":"Resize the terminal; the program gets SIGWINCH.","inputSchema":{"type":"object","properties":{
 ++ name_prop ++
     \\,"cols":{"type":"integer","minimum":2,"maximum":1000},"rows":{"type":"integer","minimum":1,"maximum":1000}},"required":["name","cols","rows"]}},
 ++
-    \\{"name":"headterm_kill","description":"End a session: hang up the program (SIGHUP, then SIGTERM, then SIGKILL) and remove the session.","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_kill","description":"End a session: SIGHUP, then SIGTERM, then SIGKILL to the program.","inputSchema":{"type":"object","properties":{
 ++ name_prop ++
     \\},"required":["name"]}},
 ++
-    \\{"name":"headterm_list","description":"List sessions with pid, size, status and command.","inputSchema":{"type":"object","properties":{}}}
+    \\{"name":"headterm_list","description":"List sessions: name, pid, size, status, command.","inputSchema":{"type":"object","properties":{}}}
     \\]}
 ;
 

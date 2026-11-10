@@ -14,8 +14,9 @@ const vt = @import("vt.zig");
 const keys = @import("keys.zig");
 const pty = @import("pty.zig");
 const regex = @import("regex.zig");
+const record = @import("record.zig");
 
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 pub const default_wait_timeout_ms = 10_000;
 pub const default_esc_delay_ms = 100;
 const max_request = 1 << 20;
@@ -32,6 +33,8 @@ pub const Config = struct {
     /// End the session after this many seconds with no client request and
     /// no output.
     ttl_s: ?u32 = null,
+    /// Write an asciicast v2 recording here.
+    record_path: ?[]const u8 = null,
 };
 
 /// Diff markers kept per session; the least recently used one is dropped.
@@ -91,7 +94,7 @@ fn daemonMain(gpa: Allocator, cfg: Config, ready_fd: posix.fd_t) noreturn {
         var buf: [300]u8 = undefined;
         const reason: []const u8 = switch (err) {
             error.AddressInUse => "session already exists",
-            error.SpawnFailed, error.ExecFailed, error.ChdirFailed => std.mem.sliceTo(&spawn_err, 0),
+            error.SpawnFailed, error.ExecFailed, error.ChdirFailed, error.RecordFailed => std.mem.sliceTo(&spawn_err, 0),
             else => @errorName(err),
         };
         const line = std.fmt.bufPrint(&buf, "err {s}\n", .{reason}) catch "err startup failed\n";
@@ -197,6 +200,7 @@ const Session = struct {
     waiters: std.ArrayList(Waiter) = .empty,
     quit: bool = false,
     log_fd: ?posix.fd_t = null,
+    recorder: ?record.Recorder = null,
 
     fn init(gpa: Allocator, cfg: Config) !Session {
         const ignore: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
@@ -222,6 +226,17 @@ const Session = struct {
         _ = setenv("TERM", "xterm-256color", 1);
         _ = unsetenv("COLUMNS");
         _ = unsetenv("LINES");
+        // Opened before the program starts so no output is missed.
+        var recorder: ?record.Recorder = null;
+        if (cfg.record_path) |rp| {
+            recorder = record.Recorder.create(gpa, rp, cfg.cols, cfg.rows, cfg.argv) catch |err| {
+                _ = std.fmt.bufPrintZ(&spawn_err, "cannot write recording {s}: {s}", .{ rp, @errorName(err) }) catch {};
+                posix.unlink(cfg.socket_path) catch {};
+                return error.RecordFailed;
+            };
+        }
+        errdefer if (recorder) |*r| r.deinit();
+
         const p = pty.spawn(gpa, cfg.argv, cfg.cwd, cfg.cols, cfg.rows, &spawn_err) catch |err| {
             posix.unlink(cfg.socket_path) catch {};
             return err;
@@ -236,6 +251,7 @@ const Session = struct {
         const now = nowMs();
         return .{
             .log_fd = log_fd,
+            .recorder = recorder,
             .gpa = gpa,
             .cfg = cfg,
             .term = term,
@@ -270,6 +286,7 @@ const Session = struct {
         self.markers.deinit(self.gpa);
         self.input.deinit(self.gpa);
         self.term.deinit();
+        if (self.recorder) |*r| r.deinit();
     }
 
     fn run(self: *Session) !void {
@@ -363,6 +380,7 @@ const Session = struct {
             }
             total += n;
             if (self.log_fd) |lf| writeAll(lf, buf[0..n]) catch {};
+            if (self.recorder) |*r| r.output(buf[0..n]);
             try self.term.feed(buf[0..n]);
             if (self.term.reply.items.len > 0) {
                 try self.input.appendSlice(self.gpa, self.term.reply.items);
@@ -495,13 +513,13 @@ const Session = struct {
                     opts.trim = true;
                 } else if (std.mem.eql(u8, a, "--client") and i + 1 < rest.len) {
                     i += 1;
-                    if (!validClientId(rest[i])) return self.usage(fd, "screen: --client needs an id of 1 to 64 bytes");
+                    if (!validClientId(rest[i])) return self.usagef(fd, "screen: --client id must be 1 to 64 bytes, got {d}", .{rest[i].len});
                     opts.client = rest[i];
                 } else if (std.mem.eql(u8, a, "--scrollback") and i + 1 < rest.len) {
                     i += 1;
-                    opts.scrollback = std.fmt.parseInt(usize, rest[i], 10) catch return self.usage(fd, "screen: --scrollback needs a number");
+                    opts.scrollback = std.fmt.parseInt(usize, rest[i], 10) catch return self.usagef(fd, "screen: --scrollback needs a number of lines, got '{s}'", .{rest[i]});
                 } else {
-                    return self.usage(fd, "screen: unknown option");
+                    return self.usagef(fd, "screen: unknown option '{s}' (see 'headterm help screen')", .{a});
                 }
             }
             try self.respondScreen(fd, .ok, opts);
@@ -513,12 +531,13 @@ const Session = struct {
             return false;
         }
         if (std.mem.eql(u8, cmd, "resize")) {
-            if (rest.len != 2) return self.usage(fd, "usage: resize <cols> <rows>");
+            if (rest.len != 2) return self.usage(fd, "resize: expected <cols> <rows>, e.g. 'headterm resize NAME 120 40'");
             const cols = std.fmt.parseInt(u16, rest[0], 10) catch 0;
             const rows = std.fmt.parseInt(u16, rest[1], 10) catch 0;
-            if (cols < 1 or rows < 1 or cols > 1000 or rows > 1000) return self.usage(fd, "resize: cols and rows must be 1..1000");
+            if (cols < 2 or rows < 1 or cols > 1000 or rows > 1000) return self.usagef(fd, "resize: '{s}' '{s}' is out of range: cols must be 2..1000 and rows 1..1000", .{ rest[0], rest[1] });
             pty.setSize(self.pty.master, cols, rows);
             try self.term.resize(cols, rows);
+            if (self.recorder) |*r| r.resize(cols, rows);
             if (!self.child_exited) posix.kill(-self.pty.pid, posix.SIG.WINCH) catch {};
             respond(fd, .ok, "");
             return false;
@@ -540,7 +559,12 @@ const Session = struct {
             respond(fd, .ok, out.written());
             return false;
         }
-        return self.usage(fd, "unknown command");
+        return self.usagef(fd, "unknown request '{s}' (client and session server versions differ?)", .{cmd});
+    }
+
+    fn usagef(self: *Session, fd: posix.fd_t, comptime fmt: []const u8, args: anytype) bool {
+        var buf: [512]u8 = undefined;
+        return self.usage(fd, std.fmt.bufPrint(&buf, fmt, args) catch fmt);
     }
 
     fn usage(self: *Session, fd: posix.fd_t, msg: []const u8) bool {
@@ -585,7 +609,7 @@ const Session = struct {
                 if (std.mem.eql(u8, a, "--esc-delay") and i + 1 < args.len) {
                     i += 1;
                     esc_delay = std.fmt.parseInt(u32, args[i], 10) catch {
-                        _ = self.usage(fd, "send: --esc-delay needs milliseconds");
+                        _ = self.usagef(fd, "send: --esc-delay needs milliseconds, got '{s}'", .{args[i]});
                         return;
                     };
                     continue;
@@ -630,19 +654,26 @@ const Session = struct {
             if (self.term.modes.bracketed_paste) try bytes.appendSlice(self.gpa, "\x1b[201~");
         }
         if (self.child_exited) {
-            respond(fd, .@"error", "process has exited\n");
+            respond(fd, .@"error", "the program has exited, so nothing was sent; 'screen' still shows its last screen and 'kill' ends the session\n");
             return;
         }
         var from: usize = 0;
         for (pauses.items) |at| {
             if (at == bytes.items.len or esc_delay == 0) continue;
-            try self.input.appendSlice(self.gpa, bytes.items[from..at]);
+            try self.queueInput(bytes.items[from..at]);
             from = at;
             try self.pumpFor(esc_delay);
         }
-        try self.input.appendSlice(self.gpa, bytes.items[from..]);
+        try self.queueInput(bytes.items[from..]);
         self.flushInput();
         respond(fd, .ok, "");
+    }
+
+    /// Queues keys from `send` for the program (and the recording).
+    fn queueInput(self: *Session, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try self.input.appendSlice(self.gpa, bytes);
+        if (self.recorder) |*r| r.input(bytes);
     }
 
     /// Keeps reading output and writing queued input for `ms` milliseconds.
@@ -659,8 +690,6 @@ const Session = struct {
             if (pfd[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) try self.readPty();
         }
     }
-
-    const wait_usage = "usage: wait (--text STR | --regex RE | --text-gone STR | --idle MS | --exit)... [--timeout MS] [--json] [--diff] [--styles] [--trim] [--scrollback N] [--client ID]";
 
     fn handleWait(self: *Session, fd: posix.fd_t, args: []const []const u8) !bool {
         var w: Waiter = .{ .fd = fd, .started = nowMs() };
@@ -704,24 +733,28 @@ const Session = struct {
                     ptr.* = re;
                     w.regex = ptr;
                 } else if (std.mem.eql(u8, a, "--idle")) {
-                    w.idle_ms = std.fmt.parseInt(i64, v, 10) catch return self.waitError(w, "wait: --idle needs milliseconds");
+                    w.idle_ms = std.fmt.parseInt(i64, v, 10) catch return self.waitErrorf(w, "wait: --idle needs milliseconds, got '{s}'", .{v});
                 } else if (std.mem.eql(u8, a, "--timeout")) {
-                    timeout = std.fmt.parseInt(i64, v, 10) catch return self.waitError(w, "wait: --timeout needs milliseconds");
+                    timeout = std.fmt.parseInt(i64, v, 10) catch return self.waitErrorf(w, "wait: --timeout needs milliseconds, got '{s}'", .{v});
                 } else if (std.mem.eql(u8, a, "--scrollback")) {
-                    w.render.scrollback = std.fmt.parseInt(usize, v, 10) catch return self.waitError(w, "wait: --scrollback needs a number");
+                    w.render.scrollback = std.fmt.parseInt(usize, v, 10) catch return self.waitErrorf(w, "wait: --scrollback needs a number of lines, got '{s}'", .{v});
                 } else if (std.mem.eql(u8, a, "--client")) {
-                    if (!validClientId(v)) return self.waitError(w, "wait: --client needs an id of 1 to 64 bytes");
+                    if (!validClientId(v)) return self.waitErrorf(w, "wait: --client id must be 1 to 64 bytes, got {d}", .{v.len});
                     if (w.client) |c| self.gpa.free(c);
                     w.client = try self.gpa.dupe(u8, v);
                 } else {
-                    return self.waitError(w, wait_usage);
+                    return self.waitErrorf(w, "wait: unknown option '{s}' (see 'headterm help wait')", .{a});
                 }
             } else {
-                return self.waitError(w, wait_usage);
+                const known = for ([_][]const u8{ "--text", "--text-gone", "--regex", "--idle", "--timeout", "--scrollback", "--client" }) |k| {
+                    if (std.mem.eql(u8, a, k)) break true;
+                } else false;
+                if (known) return self.waitErrorf(w, "wait: {s} needs a value", .{a});
+                return self.waitErrorf(w, "wait: unknown option '{s}' (see 'headterm help wait')", .{a});
             }
         }
         if (w.text == null and w.regex == null and w.gone == null and w.idle_ms == null and !w.exit) {
-            return self.waitError(w, "wait: need --text, --regex, --text-gone, --idle or --exit");
+            return self.waitError(w, "wait: give a condition: --text STR, --regex RE, --text-gone STR, --idle MS or --exit");
         }
         if (w.client) |c| w.render.client = c;
         w.deadline = w.started + timeout;
@@ -729,6 +762,11 @@ const Session = struct {
         // Checked on the next loop iteration, so an already-true condition
         // returns immediately.
         return true;
+    }
+
+    fn waitErrorf(self: *Session, w: Waiter, comptime fmt: []const u8, args: anytype) bool {
+        var buf: [512]u8 = undefined;
+        return self.waitError(w, std.fmt.bufPrint(&buf, fmt, args) catch fmt);
     }
 
     fn waitError(self: *Session, w: Waiter, msg: []const u8) bool {

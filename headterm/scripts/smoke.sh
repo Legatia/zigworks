@@ -18,6 +18,7 @@ cleanup() {
     "$HT" kill "$S-m" >/dev/null 2>&1 || true
     "$HT" kill "$S-w" >/dev/null 2>&1 || true
     "$HT" kill "$S-t" >/dev/null 2>&1 || true
+    "$HT" kill "$S-r" >/dev/null 2>&1 || true
     rm -rf "$STATE"
 }
 trap cleanup EXIT
@@ -115,6 +116,26 @@ rc=$?
 set -e
 check "mouse refused without mouse reporting" sh -c '[ "$1" -eq 2 ] && printf "%s" "$2" | grep -q "has not enabled mouse reporting"' _ "$rc" "$err"
 "$HT" kill "$S-x"
+
+# Mouse: a drag in SGR mode with button-event tracking (1002) sends press,
+# motion and release.
+"$HT" start "$S-x" --cols 40 --rows 4 -- /bin/sh -c 'printf "\033[?1002h\033[?1006h"; stty raw -echo; dd bs=1 count=38 2>/dev/null | tr "\033" E; sleep 30' >/dev/null
+"$HT" wait "$S-x" --idle 300 --timeout 5000 >/dev/null
+"$HT" send "$S-x" '<Drag 0,0 0,2>'
+check "drag sends press, motion and release" quiet "$HT" wait "$S-x" --text 'E[<0;1;1ME[<32;2;1ME[<32;3;1ME[<0;3;1m' --timeout 5000
+"$HT" kill "$S-x"
+
+# Recording.
+"$HT" start "$S-r" --record "$STATE/s.cast" --cols 30 --rows 4 -- /bin/sh -c 'read x; echo got:$x' >/dev/null
+"$HT" send "$S-r" hi '<Enter>'
+"$HT" wait "$S-r" --exit --timeout 5000 >/dev/null
+"$HT" kill "$S-r"
+check "recording header" sh -c 'head -1 "$1" | grep -q "^{\"version\":2,\"width\":30,\"height\":4,"' _ "$STATE/s.cast"
+check "recording has input and output events" sh -c 'grep -q "\"i\", \"hi\\\\r\"" "$1" && grep -q "\"o\", .*got:hi" "$1"' _ "$STATE/s.cast"
+
+# Help and version.
+check "version" sh -c '"$1" --version | grep -q "^headterm [0-9]"' _ "$HT"
+check "help for a command" sh -c '"$1" help wait | grep -q -- "--text-gone" && "$1" send --help | grep -q "<Drag r1,c1 r2,c2>"' _ "$HT"
 
 # A session with --ttl ends by itself once idle.
 "$HT" start "$S-t" --ttl 1 -- sleep 30 >/dev/null

@@ -23,6 +23,9 @@ pub const Cell = struct {
     /// 0 for the right half (a spacer that renders as nothing).
     width: u2 = 1,
     style: Style = .{},
+    /// One combining mark or other zero-width character (accent, variation
+    /// selector, ZWJ) that follows `cp`. Further ones are dropped.
+    combining: u21 = 0,
 };
 
 const blank: Cell = .{};
@@ -833,8 +836,7 @@ pub const Terminal = struct {
             cp = dec_special[cp - 0x5F];
         }
         const w = charWidth(cp);
-        // Combining marks and other zero-width characters are dropped in v0.
-        if (w == 0) return;
+        if (w == 0) return self.attachCombining(cp);
 
         const c = &self.cursor;
         if (c.pending_wrap and self.modes.autowrap) {
@@ -865,6 +867,20 @@ pub const Terminal = struct {
             c.col += w;
             c.pending_wrap = false;
         }
+    }
+
+    /// Puts a zero-width character on the cell just written: the cursor's
+    /// cell when a wrap is pending, otherwise the one to its left.
+    fn attachCombining(self: *Terminal, cp: u21) void {
+        const c = &self.cursor;
+        var col = c.col;
+        if (!c.pending_wrap) {
+            if (col == 0) return;
+            col -= 1;
+        }
+        const row = self.line(c.row);
+        if (row[col].width == 0 and col > 0) col -= 1; // right half of a wide char
+        if (row[col].combining == 0) row[col].combining = cp;
     }
 
     fn wrapLine(self: *Terminal) !void {
@@ -1274,17 +1290,22 @@ fn appendCellsText(cells: []const Cell, out: *std.ArrayList(u8), gpa: Allocator,
             continue;
         }
         prev_wide = cell.width == 2;
-        var buf: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(cell.cp, &buf) catch blk: {
-            buf[0] = '?';
-            break :blk 1;
-        };
-        try out.appendSlice(gpa, buf[0..n]);
+        try appendCodepoint(out, gpa, cell.cp);
+        if (cell.combining != 0) try appendCodepoint(out, gpa, cell.combining);
     }
     if (!trim) return;
     var end = out.items.len;
     while (end > start and out.items[end - 1] == ' ') end -= 1;
     out.shrinkRetainingCapacity(end);
+}
+
+fn appendCodepoint(out: *std.ArrayList(u8), gpa: Allocator, cp: u21) !void {
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(cp, &buf) catch blk: {
+        buf[0] = '?';
+        break :blk 1;
+    };
+    try out.appendSlice(gpa, buf[0..n]);
 }
 
 /// DEC Special Graphics (ESC ( 0) for 0x5F..0x7E: line drawing and symbols.
@@ -1852,4 +1873,22 @@ test "rows remember autowrap, and the flag moves with scrolling" {
     try testing.expect(t.rowWrapped(0));
     try t.feed("\x1b[1;3H\x1b[K");
     try testing.expect(!t.rowWrapped(0));
+}
+
+test "combining marks stay with their base character" {
+    var t = try testTerm(10, 2);
+    defer t.deinit();
+    // "é" as e + U+0301, then a wide char with a variation selector.
+    try t.feed("e\xcc\x81x\xe4\xb8\xad\xef\xb8\x8fy");
+    try expectScreen(&t, "e\u{301}x中\u{FE0F}y\n");
+    try expectCursor(&t, 0, 5);
+    // A second mark on the same cell is dropped; a mark at column 0 too.
+    try t.feed("\r\n\xcc\x81a\xcc\x81\xcc\x88");
+    try expectScreen(&t, "e\u{301}x中\u{FE0F}y\na\u{301}");
+    // Overwriting the cell clears the mark.
+    try t.feed("\x1b[1;1Hf");
+    try expectScreen(&t, "fx中\u{FE0F}y\na\u{301}");
+    // At the right edge (pending wrap) the mark goes on the last cell.
+    try t.feed("\x1b[1;10Hz\xcc\x81");
+    try expectScreen(&t, "fx中\u{FE0F}y    z\u{301}\na\u{301}");
 }

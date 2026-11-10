@@ -1,7 +1,7 @@
 //! Small regular expressions for `wait --regex`.
 //!
 //! Syntax: literals, `.`, `[...]` and `[^...]` classes with ranges, `\d \w
-//! \s` (and `\D \W \S`), `^` `$`, `(...)` and `(?:...)` groups, `|`, and the
+//! \s` (and `\D \W \S`), `^` `$`, `\b` `\B` (word boundary), `(...)` and `(?:...)` groups, `|`, and the
 //! quantifiers `* + ? {n} {n,} {n,m}` (a trailing `?` for laziness is
 //! accepted and ignored). A leading `(?i)` makes ASCII letters match either
 //! case. Matching is on codepoints of UTF-8 text.
@@ -37,6 +37,8 @@ const Inst = union(enum) {
     jmp: u32,
     bol,
     eol,
+    word_boundary,
+    not_word_boundary,
     match,
 };
 
@@ -47,6 +49,7 @@ const Node = union(enum) {
     class: Class,
     bol,
     eol,
+    word_boundary: bool,
     cat: []const Node,
     alt: []const Node,
     repeat: struct { node: *const Node, min: u32, max: ?u32 },
@@ -79,6 +82,8 @@ pub const Regex = struct {
     stack: []u32,
     marks: []u32,
     gen: u32 = 0,
+    /// The text being searched, for \b.
+    text: []const u21 = &.{},
 
     /// On error.BadRegex, `diag` says what is wrong.
     pub fn compile(gpa: Allocator, pattern_in: []const u8, diag: *Diagnostic) Error!Regex {
@@ -152,6 +157,7 @@ pub const Regex = struct {
     }
 
     fn run(self: *Regex, text: []const u21) bool {
+        self.text = text;
         var clist = self.clist;
         var nlist = self.nlist;
         var clen: usize = 0;
@@ -204,6 +210,14 @@ pub const Regex = struct {
                     self.stack[sp] = pc + 1;
                     sp += 1;
                 },
+                .word_boundary, .not_word_boundary => {
+                    const before = pos > 0 and isWord(self.text[pos - 1]);
+                    const after = pos < n and isWord(self.text[pos]);
+                    if ((before != after) == (self.prog[pc] == .word_boundary)) {
+                        self.stack[sp] = pc + 1;
+                        sp += 1;
+                    }
+                },
                 .match => return true,
                 else => {
                     list[len.*] = pc;
@@ -223,6 +237,10 @@ pub const Regex = struct {
         };
     }
 };
+
+fn isWord(c: u21) bool {
+    return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+}
 
 fn fold(c: u21) u21 {
     return if (c >= 'A' and c <= 'Z') c + 32 else c;
@@ -303,7 +321,7 @@ const Parser = struct {
                 else => return node,
             }
             switch (node) {
-                .empty, .bol, .eol => return p.fail("nothing to repeat"),
+                .empty, .bol, .eol, .word_boundary => return p.fail("nothing to repeat"),
                 else => {},
             }
             if (p.peek() == '?') p.pos += 1; // lazy: same result for a yes/no search
@@ -373,6 +391,11 @@ const Parser = struct {
             '\\' => {
                 p.pos += 1;
                 if (p.peek() == null) return p.fail("trailing backslash");
+                if (p.peek() == 'b' or p.peek() == 'B') {
+                    const b = p.peek() == 'b';
+                    p.pos += 1;
+                    return .{ .word_boundary = b };
+                }
                 if (try p.classEscape(false)) |cl| return .{ .class = cl };
                 return .{ .char = try p.escapedChar() };
             },
@@ -485,6 +508,7 @@ const Compiler = struct {
             .class => |cl| _ = try c.emit(.{ .class = cl }),
             .bol => _ = try c.emit(.bol),
             .eol => _ = try c.emit(.eol),
+            .word_boundary => |b| _ = try c.emit(if (b) .word_boundary else .not_word_boundary),
             .cat => |items| for (items) |n| try c.emitNode(n),
             .alt => |branches| {
                 var jumps: std.ArrayList(u32) = .empty;
@@ -591,6 +615,15 @@ test "groups, alternation and quantifiers" {
     try expectMatch("(a|)+b", "aab", true);
 }
 
+test "word boundaries" {
+    try expectMatch("\\berror\\b", "an error: x", true);
+    try expectMatch("\\berror\\b", "errors", false);
+    try expectMatch("\\berror\\b", "error", true);
+    try expectMatch("\\Bror", "error", true);
+    try expectMatch("\\Berr", "error", false);
+    try expectMatch("\\b\\d+\\b", "x 42 y", true);
+}
+
 test "case-insensitive and UTF-8" {
     try expectMatch("(?i)error", "ERROR: x", true);
     try expectMatch("error", "ERROR: x", false);
@@ -620,6 +653,7 @@ test "bad patterns are rejected with a message" {
     try expectBad("a{2000}");
     try expectBad("[z-a]");
     try expectBad("\\q");
+    try expectBad("\\b*");
     try expectBad("[\\W]");
     try expectBad("(a{1000}){1000}");
 }

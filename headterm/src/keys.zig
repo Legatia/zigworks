@@ -6,9 +6,10 @@
 //! `<C-Left>`. `<lt>` sends a literal `<`.
 //!
 //! Mouse events are `<Click row,col>`, `<RightClick row,col>`,
-//! `<MiddleClick row,col>`, `<ScrollUp row,col>` and `<ScrollDown row,col>`
-//! with 0-based screen coordinates. They are only accepted when the program
-//! has turned on mouse reporting.
+//! `<MiddleClick row,col>`, `<Drag r1,c1 r2,c2>`, `<ScrollUp row,col>` and
+//! `<ScrollDown row,col>` with 0-based screen coordinates, optionally with
+//! modifiers (`<S-Click 1,2>`, `<C-M-ScrollUp 0,0>`). They are only accepted
+//! when the program has turned on mouse reporting.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -49,9 +50,9 @@ pub fn isKeySyntax(arg: []const u8) bool {
     if (arg.len < 3 or arg[0] != '<' or arg[arg.len - 1] != '>') return false;
     const inner = arg[1 .. arg.len - 1];
     if (std.mem.indexOfAny(u8, inner, "<>") != null) return false;
-    if (std.mem.indexOfScalar(u8, inner, ' ') == null) return true;
+    const sp = std.mem.indexOfScalar(u8, inner, ' ') orelse return true;
     // Only mouse events have a space: "<Click 3,4>".
-    return mouseButton(inner[0..std.mem.indexOfScalar(u8, inner, ' ').?]) != null;
+    return mouseEvent(splitMods(inner[0..sp]).name) != null;
 }
 
 /// Appends the encoding of one `send` argument to `out`.
@@ -62,15 +63,17 @@ pub fn encodeArg(gpa: Allocator, out: *std.ArrayList(u8), arg: []const u8, ctx: 
     return encodeKey(gpa, out, inner, ctx.app_cursor);
 }
 
-const Mouse = struct { button: u8, release: bool };
+const MouseKind = enum { click, drag, scroll };
+const MouseEvent = struct { button: u8, kind: MouseKind };
 
-fn mouseButton(name: []const u8) ?Mouse {
-    const names = [_]struct { []const u8, Mouse }{
-        .{ "click", .{ .button = 0, .release = true } },
-        .{ "middleclick", .{ .button = 1, .release = true } },
-        .{ "rightclick", .{ .button = 2, .release = true } },
-        .{ "scrollup", .{ .button = 64, .release = false } },
-        .{ "scrolldown", .{ .button = 65, .release = false } },
+fn mouseEvent(name: []const u8) ?MouseEvent {
+    const names = [_]struct { []const u8, MouseEvent }{
+        .{ "click", .{ .button = 0, .kind = .click } },
+        .{ "middleclick", .{ .button = 1, .kind = .click } },
+        .{ "rightclick", .{ .button = 2, .kind = .click } },
+        .{ "drag", .{ .button = 0, .kind = .drag } },
+        .{ "scrollup", .{ .button = 64, .kind = .scroll } },
+        .{ "scrolldown", .{ .button = 65, .kind = .scroll } },
     };
     var buf: [16]u8 = undefined;
     if (name.len > buf.len) return null;
@@ -81,28 +84,97 @@ fn mouseButton(name: []const u8) ?Mouse {
     return null;
 }
 
-fn encodeMouse(gpa: Allocator, out: *std.ArrayList(u8), name: []const u8, pos: []const u8, ctx: Context) Error!void {
-    const m = mouseButton(name) orelse return error.UnknownKey;
-    const comma = std.mem.indexOfScalar(u8, pos, ',') orelse return error.BadMousePosition;
-    const row = std.fmt.parseInt(usize, std.mem.trim(u8, pos[0..comma], " "), 10) catch return error.BadMousePosition;
-    const col = std.fmt.parseInt(usize, std.mem.trim(u8, pos[comma + 1 ..], " "), 10) catch return error.BadMousePosition;
+/// Splits "C-S-Click" into xterm's modifier bits (Shift 4, Meta 8, Ctrl 16)
+/// and "Click".
+fn splitMods(spec: []const u8) struct { bits: u8, name: []const u8 } {
+    var bits: u8 = 0;
+    var name = spec;
+    while (name.len > 2 and name[1] == '-') {
+        switch (std.ascii.toLower(name[0])) {
+            's' => bits |= 4,
+            'm', 'a' => bits |= 8,
+            'c' => bits |= 16,
+            else => break,
+        }
+        name = name[2..];
+    }
+    return .{ .bits = bits, .name = name };
+}
+
+const Pos = struct { row: usize, col: usize };
+
+fn parsePos(text: []const u8) Error!Pos {
+    const t = std.mem.trim(u8, text, " ");
+    const comma = std.mem.indexOfScalar(u8, t, ',') orelse return error.BadMousePosition;
+    return .{
+        .row = std.fmt.parseInt(usize, std.mem.trim(u8, t[0..comma], " "), 10) catch return error.BadMousePosition,
+        .col = std.fmt.parseInt(usize, std.mem.trim(u8, t[comma + 1 ..], " "), 10) catch return error.BadMousePosition,
+    };
+}
+
+fn encodeMouse(gpa: Allocator, out: *std.ArrayList(u8), head: []const u8, rest: []const u8, ctx: Context) Error!void {
+    const mods = splitMods(head);
+    const ev = mouseEvent(mods.name) orelse return error.UnknownKey;
+    var from: Pos = undefined;
+    var to: Pos = undefined;
+    if (ev.kind == .drag) {
+        // "<Drag r1,c1 r2,c2>"
+        const t = std.mem.trim(u8, rest, " ");
+        const sp = std.mem.lastIndexOfScalar(u8, t, ' ') orelse return error.BadMousePosition;
+        from = try parsePos(t[0..sp]);
+        to = try parsePos(t[sp + 1 ..]);
+    } else {
+        from = try parsePos(rest);
+        to = from;
+    }
     if (ctx.mouse_tracking == 0) return error.MouseNotEnabled;
-    if (row >= ctx.rows or col >= ctx.cols) return error.BadMousePosition;
-    // Terminal mouse coordinates are 1-based, column first.
-    const x = col + 1;
-    const y = row + 1;
+    for ([_]Pos{ from, to }) |p| {
+        if (p.row >= ctx.rows or p.col >= ctx.cols) return error.BadMousePosition;
+    }
+
+    const code = ev.button | mods.bits;
+    try mouseReport(gpa, out, ctx, code, from, false);
+    switch (ev.kind) {
+        .scroll => {},
+        .click => try mouseReport(gpa, out, ctx, code, from, true),
+        .drag => {
+            // Motion is only reported in button-event (1002) and any-event
+            // (1003) modes; it has bit 32 set.
+            if (ctx.mouse_tracking == 1002 or ctx.mouse_tracking == 1003) {
+                const dr = @as(isize, @intCast(to.row)) - @as(isize, @intCast(from.row));
+                const dc = @as(isize, @intCast(to.col)) - @as(isize, @intCast(from.col));
+                const steps: isize = @min(@max(@abs(dr), @abs(dc)), 40);
+                var last = from;
+                var i: isize = 1;
+                while (i <= steps) : (i += 1) {
+                    const p: Pos = .{
+                        .row = @intCast(@as(isize, @intCast(from.row)) + @divTrunc(dr * i, steps)),
+                        .col = @intCast(@as(isize, @intCast(from.col)) + @divTrunc(dc * i, steps)),
+                    };
+                    if (p.row == last.row and p.col == last.col) continue;
+                    try mouseReport(gpa, out, ctx, code | 32, p, false);
+                    last = p;
+                }
+            }
+            try mouseReport(gpa, out, ctx, code, to, true);
+        },
+    }
+}
+
+/// One mouse report. Coordinates on the wire are 1-based, column first.
+fn mouseReport(gpa: Allocator, out: *std.ArrayList(u8), ctx: Context, code: u8, p: Pos, release: bool) Error!void {
+    const x = p.col + 1;
+    const y = p.row + 1;
     if (ctx.mouse_sgr) {
-        try out.print(gpa, "\x1b[<{d};{d};{d}M", .{ m.button, x, y });
-        if (m.release) try out.print(gpa, "\x1b[<{d};{d};{d}m", .{ m.button, x, y });
-        return;
+        return out.print(gpa, "\x1b[<{d};{d};{d}{c}", .{ code, x, y, @as(u8, if (release) 'm' else 'M') });
     }
-    // Legacy encoding: each value + 32 in one byte, so at most 223.
+    // X10 mode (9) reports presses only.
+    if (release and ctx.mouse_tracking == 9) return;
+    // Legacy encoding: each value + 32 in one byte, so at most 223. A
+    // release is button 3, keeping the modifier bits.
     if (x > 223 or y > 223) return error.BadMousePosition;
-    try out.appendSlice(gpa, &.{ 0x1b, '[', 'M', 32 + m.button, @intCast(32 + x), @intCast(32 + y) });
-    // X10 mode (9) reports presses only; release is button code 3.
-    if (m.release and ctx.mouse_tracking != 9) {
-        try out.appendSlice(gpa, &.{ 0x1b, '[', 'M', 32 + 3, @intCast(32 + x), @intCast(32 + y) });
-    }
+    const b = if (release) (code & ~@as(u8, 3)) | 3 else code;
+    try out.appendSlice(gpa, &.{ 0x1b, '[', 'M', 32 + b, @intCast(32 + x), @intCast(32 + y) });
 }
 
 const Cursor = struct { name: []const u8, final: u8 };
@@ -313,4 +385,28 @@ test "mouse events need mouse reporting and use the program's encoding" {
 
     // Text that only looks like a key stays text.
     try expectEncodedCtx("<hello world>", .{}, "<hello world>");
+}
+
+test "mouse drag and modifiers" {
+    const sgr1002: Context = .{ .mouse_tracking = 1002, .mouse_sgr = true, .rows = 24, .cols = 80 };
+    try expectEncodedCtx("<Drag 1,1 1,4>", sgr1002, "\x1b[<0;2;2M\x1b[<32;3;2M\x1b[<32;4;2M\x1b[<32;5;2M\x1b[<0;5;2m");
+    try expectEncodedCtx("<Drag 0,0 2,1>", sgr1002, "\x1b[<0;1;1M\x1b[<32;1;2M\x1b[<32;2;3M\x1b[<0;2;3m");
+    // Mode 1000 reports no motion: press and release only.
+    const sgr1000: Context = .{ .mouse_tracking = 1000, .mouse_sgr = true, .rows = 24, .cols = 80 };
+    try expectEncodedCtx("<Drag 1,1 1,4>", sgr1000, "\x1b[<0;2;2M\x1b[<0;5;2m");
+    try expectEncodedCtx("<S-Click 0,0>", sgr1000, "\x1b[<4;1;1M\x1b[<4;1;1m");
+    try expectEncodedCtx("<C-Click 0,0>", sgr1000, "\x1b[<16;1;1M\x1b[<16;1;1m");
+    try expectEncodedCtx("<M-RightClick 0,0>", sgr1000, "\x1b[<10;1;1M\x1b[<10;1;1m");
+    try expectEncodedCtx("<C-ScrollUp 3,3>", sgr1000, "\x1b[<80;4;4M");
+    // Legacy encoding keeps the modifier bits on release (button 3).
+    const x11: Context = .{ .mouse_tracking = 1002, .rows = 24, .cols = 80 };
+    try expectEncodedCtx("<M-Click 0,0>", x11, "\x1b[M\x28\x21\x21\x1b[M\x2b\x21\x21");
+    try expectEncodedCtx("<Drag 0,0 0,1>", x11, "\x1b[M\x20\x21\x21\x1b[M\x40\x22\x21\x1b[M\x23\x22\x21");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectError(error.BadMousePosition, encodeArg(testing.allocator, &out, "<Drag 1,1>", sgr1002));
+    try testing.expectError(error.BadMousePosition, encodeArg(testing.allocator, &out, "<Drag 1,1 99,1>", sgr1002));
+    try testing.expect(isKeySyntax("<C-S-Click 1,2>"));
+    try testing.expect(!isKeySyntax("<C-Hello 1,2>"));
 }

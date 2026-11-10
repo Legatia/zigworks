@@ -6,27 +6,134 @@ const server = @import("server.zig");
 const mcp = @import("mcp.zig");
 
 const usage_text =
-    \\usage:
-    \\  headterm start <name> [--cols N] [--rows N] [--cwd DIR] [--log FILE] [--ttl S] -- <cmd> [args...]
-    \\  headterm screen <name> [--json] [--diff] [--styles] [--trim] [--scrollback N] [--client ID]
-    \\  headterm send <name> [--literal] [--paste] [--esc-delay MS] [--] <text | <Key>>...
-    \\  headterm wait <name> (--text STR | --regex RE | --text-gone STR | --idle MS | --exit)...
-    \\                [--timeout MS] [--json] [--diff] [--styles] [--trim] [--scrollback N] [--client ID]
-    \\  headterm resize <name> <cols> <rows>
-    \\  headterm kill <name>
-    \\  headterm list [--json]
-    \\  headterm mcp                 (MCP server on stdin/stdout)
-    \\  headterm version
+    \\usage: headterm <command> [arguments]
     \\
-    \\keys: <Enter> <Tab> <Esc> <Backspace> <Space> <Up> <Down> <Left> <Right>
-    \\      <Home> <End> <PageUp> <PageDown> <Insert> <Delete> <F1>..<F12> <lt>
-    \\      modifiers: <C-x> (Ctrl) <M-x> (Meta/Alt) <S-x> (Shift), combinable
-    \\mouse (only if the program enabled it): <Click row,col> <RightClick row,col>
-    \\      <MiddleClick row,col> <ScrollUp row,col> <ScrollDown row,col>, 0-based
+    \\  start <name> [options] -- <cmd> [args...]   start a program in a new session
+    \\  screen <name> [options]                     print the screen
+    \\  send <name> [options] <keys>...             send keys and text
+    \\  wait <name> <conditions> [options]          wait for text, a regex, idle or exit
+    \\  resize <name> <cols> <rows>                 resize the terminal
+    \\  kill <name>                                 end a session
+    \\  list [--json]                               list sessions
+    \\  mcp                                         run the MCP server on stdin/stdout
+    \\  help [command], version
     \\
-    \\exit codes: 0 ok, 1 wait not satisfied (timeout), 2 error
+    \\Run 'headterm help <command>' for its options.
+    \\Exit codes: 0 ok, 1 wait not satisfied, 2 error.
     \\
 ;
+
+const Help = struct { []const u8, []const u8 };
+const command_help = [_]Help{
+    .{
+        "start",
+        \\usage: headterm start <name> [options] -- <cmd> [args...]
+        \\
+        \\Starts <cmd> in a pseudo-terminal held by a background session server and
+        \\returns once it is running. <name>: letters, digits, '.', '_', '-'.
+        \\
+        \\  --cols N        width (default 120)
+        \\  --rows N        height (default 40)
+        \\  --cwd DIR       working directory
+        \\  --ttl S         end the session after S seconds without requests or output
+        \\  --record FILE   write an asciicast v2 recording (asciinema play FILE)
+        \\  --log FILE      append the raw program output to FILE
+        \\
+    },
+    .{
+        "screen",
+        \\usage: headterm screen <name> [options]
+        \\
+        \\Prints the screen, one line per row, then a status line with size,
+        \\cursor (0-based row,col), alt screen and exit status.
+        \\
+        \\  --json           JSON output
+        \\  --diff           only rows changed since this client's last screen/wait
+        \\  --styles         also list styled runs (inverse, bold, colors) per row
+        \\  --trim           leave out empty rows at the bottom
+        \\  --scrollback N   also print up to N lines that scrolled off the top
+        \\  --client ID      use the diff marker ID instead of the shared one
+        \\
+    },
+    .{
+        "send",
+        \\usage: headterm send <name> [options] [--] <keys>...
+        \\
+        \\Each argument is text or a key:
+        \\  <Enter> <Tab> <Esc> <Backspace> <Space> <Up> <Down> <Left> <Right>
+        \\  <Home> <End> <PageUp> <PageDown> <Insert> <Delete> <F1>..<F12> <lt>
+        \\  modifiers: <C-c> (Ctrl), <M-x> (Alt), <S-Tab> (Shift), combinable
+        \\Mouse, if the program enabled mouse reporting (0-based positions):
+        \\  <Click r,c> <RightClick r,c> <MiddleClick r,c> <Drag r1,c1 r2,c2>
+        \\  <ScrollUp r,c> <ScrollDown r,c>, with modifiers: <S-Click r,c>
+        \\
+        \\  --literal        send the following arguments as plain text
+        \\  --paste          send them as one bracketed paste
+        \\  --esc-delay MS   pause after a lone <Esc> (default 100, 0 = none)
+        \\  --               end of options
+        \\
+    },
+    .{
+        "wait",
+        \\usage: headterm wait <name> <conditions> [options]
+        \\
+        \\Waits until one of the conditions holds, then prints the screen.
+        \\Exit code 1 if none did before the timeout.
+        \\
+        \\  --text STR        STR is on screen (rows joined where text wrapped)
+        \\  --regex RE        a screen line matches RE (see the README for syntax)
+        \\  --text-gone STR   STR is not on screen
+        \\  --idle MS         no output for MS milliseconds
+        \\  --exit            the program exited
+        \\  --timeout MS      give up after MS (default 10000)
+        \\
+        \\Output options as for screen: --json --diff --styles --trim
+        \\--scrollback N --client ID
+        \\
+    },
+    .{
+        "resize",
+        \\usage: headterm resize <name> <cols> <rows>
+        \\
+        \\Resizes the terminal (2..1000 columns, 1..1000 rows); the program gets
+        \\SIGWINCH.
+        \\
+    },
+    .{
+        "kill",
+        \\usage: headterm kill <name>
+        \\
+        \\Hangs up the program (SIGHUP, then SIGTERM, then SIGKILL) and removes the
+        \\session.
+        \\
+    },
+    .{
+        "list",
+        \\usage: headterm list [--json]
+        \\
+        \\Lists sessions: name, pid, size, status, command.
+        \\
+    },
+    .{
+        "mcp",
+        \\usage: headterm mcp
+        \\
+        \\Runs an MCP server on stdin/stdout (JSON-RPC, one message per line).
+        \\Register it with: claude mcp add headterm -- /path/to/headterm mcp
+        \\
+    },
+};
+
+fn helpFor(cmd: []const u8) ?[]const u8 {
+    for (command_help) |h| {
+        if (eql(h[0], cmd)) return h[1];
+    }
+    return null;
+}
+
+fn isHelpFlag(a: []const u8) bool {
+    return eql(a, "--help") or eql(a, "-h");
+}
 
 pub fn main() u8 {
     const gpa = std.heap.c_allocator;
@@ -41,9 +148,20 @@ fn run(gpa: Allocator, args: []const []const u8) !u8 {
         return 2;
     }
     const cmd = args[0];
-    if (eql(cmd, "help") or eql(cmd, "--help") or eql(cmd, "-h")) {
-        try writeStdout(usage_text);
+    if (eql(cmd, "help") or isHelpFlag(cmd)) {
+        if (args.len > 1) {
+            const text = helpFor(args[1]) orelse return fail("help: no command '{s}' (commands: start screen send wait resize kill list mcp)", .{args[1]});
+            try writeStdout(text);
+        } else {
+            try writeStdout(usage_text);
+        }
         return 0;
+    }
+    if (args.len > 1 and isHelpFlag(args[1])) {
+        if (helpFor(cmd)) |text| {
+            try writeStdout(text);
+            return 0;
+        }
     }
     if (eql(cmd, "version") or eql(cmd, "--version")) {
         try writeStdout("headterm " ++ server.version ++ "\n");
@@ -52,7 +170,7 @@ fn run(gpa: Allocator, args: []const []const u8) !u8 {
 
     if (eql(cmd, "list")) return list(gpa, args[1..]);
     if (eql(cmd, "mcp")) {
-        if (args.len > 1) return fail("mcp takes no arguments", .{});
+        if (args.len > 1) return fail("mcp: takes no arguments (got '{s}')", .{args[1]});
         try mcp.serve(gpa);
         return 0;
     }
@@ -60,11 +178,11 @@ fn run(gpa: Allocator, args: []const []const u8) !u8 {
     const known = [_][]const u8{ "start", "screen", "send", "wait", "resize", "kill" };
     for (known) |k| {
         if (eql(cmd, k)) break;
-    } else return fail("unknown command '{s}' (try 'headterm help')", .{cmd});
+    } else return fail("unknown command '{s}' (see 'headterm help')", .{cmd});
 
-    if (args.len < 2) return fail("{s}: missing session name", .{cmd});
+    if (args.len < 2) return fail("{s}: missing session name (see 'headterm help {s}')", .{ cmd, cmd });
     const name = args[1];
-    if (!client.validName(name)) return fail("invalid session name '{s}' (use letters, digits, '.', '_', '-')", .{name});
+    if (!client.validName(name)) return fail("invalid session name '{s}': use 1-64 letters, digits, '.', '_' or '-', not starting with '.' or '-'", .{name});
     if (eql(cmd, "start")) return start(gpa, name, args[2..]);
 
     // Everything else is forwarded to the session server as-is.
@@ -74,7 +192,7 @@ fn run(gpa: Allocator, args: []const []const u8) !u8 {
     try fwd.appendSlice(gpa, args[2..]);
     const resp = client.call(gpa, name, fwd.items) catch |err| {
         var buf: [256]u8 = undefined;
-        return fail("{s}", .{client.describeError(&buf, err, name)});
+        return fail("{s} (see 'headterm list')", .{client.describeError(&buf, err, name)});
     };
     defer gpa.free(resp.body);
     switch (resp.status) {
@@ -104,7 +222,7 @@ fn start(gpa: Allocator, name: []const u8, args: []const []const u8) !u8 {
             break;
         }
         if (!std.mem.startsWith(u8, a, "--")) break;
-        if (i + 1 >= args.len) return fail("start: {s} needs a value", .{a});
+        if (i + 1 >= args.len) return fail("start: {s} needs a value (see 'headterm help start')", .{a});
         const v = args[i + 1];
         i += 1;
         if (eql(a, "--cols")) {
@@ -115,15 +233,17 @@ fn start(gpa: Allocator, name: []const u8, args: []const []const u8) !u8 {
             opts.cwd = v;
         } else if (eql(a, "--log")) {
             opts.log_path = v;
+        } else if (eql(a, "--record")) {
+            opts.record_path = v;
         } else if (eql(a, "--ttl")) {
             const ttl = std.fmt.parseInt(u32, v, 10) catch return fail("start: bad --ttl '{s}' (seconds)", .{v});
             opts.ttl_s = if (ttl == 0) null else ttl;
         } else {
-            return fail("start: unknown option {s}", .{a});
+            return fail("start: unknown option '{s}' (see 'headterm help start')", .{a});
         }
     }
     const argv = args[i..];
-    if (argv.len == 0) return fail("start: missing command (headterm start <name> -- <cmd> [args...])", .{});
+    if (argv.len == 0) return fail("start: missing command, e.g. 'headterm start {s} -- python3'", .{name});
 
     var msg: [256]u8 = undefined;
     const pid = client.startSession(gpa, name, argv, opts, &msg) catch
@@ -136,7 +256,7 @@ fn start(gpa: Allocator, name: []const u8, args: []const []const u8) !u8 {
 fn list(gpa: Allocator, args: []const []const u8) !u8 {
     var json = false;
     for (args) |a| {
-        if (eql(a, "--json")) json = true else return fail("list: unknown option {s}", .{a});
+        if (eql(a, "--json")) json = true else return fail("list: unknown option '{s}' (only --json)", .{a});
     }
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -189,4 +309,5 @@ test {
     _ = @import("mcp.zig");
     _ = @import("regex.zig");
     _ = @import("session_test.zig");
+    _ = @import("record.zig");
 }

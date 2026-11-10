@@ -123,3 +123,46 @@ test "each client has its own diff marker" {
     defer gpa.free(a_diff.body);
     try testing.expect(std.mem.indexOf(u8, a_diff.body, "changed=0") != null);
 }
+
+test "start --record writes a valid asciicast v2 file" {
+    var dir: SessionDir = .{};
+    try dir.init("record");
+    defer dir.deinit();
+    var path_buf: [128]u8 = undefined;
+    const cast = try std.fmt.bufPrint(&path_buf, "{s}/session.cast", .{dir.path});
+
+    try start("rec", &.{ "/bin/sh", "-c", "read x; echo got:$x" }, .{ .cols = 30, .rows = 5, .record_path = cast });
+    defer kill("rec");
+    const sent = try call("rec", &.{ "send", "hi", "<Enter>" });
+    gpa.free(sent.body);
+    const waited = try call("rec", &.{ "wait", "--exit" });
+    gpa.free(waited.body);
+    kill("rec"); // closes the recording
+
+    const data = try std.fs.cwd().readFileAlloc(gpa, cast, 1 << 20);
+    defer gpa.free(data);
+    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, data, "\n"), '\n');
+    const header = try std.json.parseFromSlice(std.json.Value, gpa, lines.next().?, .{});
+    defer header.deinit();
+    try testing.expectEqual(@as(i64, 2), header.value.object.get("version").?.integer);
+    try testing.expectEqual(@as(i64, 30), header.value.object.get("width").?.integer);
+    try testing.expectEqual(@as(i64, 5), header.value.object.get("height").?.integer);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(gpa);
+    var input_seen = false;
+    while (lines.next()) |line| {
+        const ev = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
+        defer ev.deinit();
+        const arr = ev.value.array.items;
+        try testing.expectEqual(@as(usize, 3), arr.len);
+        try testing.expect(arr[0] == .float or arr[0] == .integer);
+        if (std.mem.eql(u8, arr[1].string, "o")) try output.appendSlice(gpa, arr[2].string);
+        if (std.mem.eql(u8, arr[1].string, "i")) {
+            try testing.expectEqualStrings("hi\r", arr[2].string);
+            input_seen = true;
+        }
+    }
+    try testing.expect(input_seen);
+    try testing.expect(std.mem.indexOf(u8, output.items, "got:hi") != null);
+}
