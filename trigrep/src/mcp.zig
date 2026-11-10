@@ -26,6 +26,8 @@ const search_schema =
     \\"output":{"type":"string","enum":["lines","files","count"],"description":"lines: path:line:text (default); files: matching paths; count: path:count."},
     \\"max_results":{"type":"integer","description":"Stop after this many output lines (default 200)."},
     \\"max_per_file":{"type":"integer","description":"At most this many matching lines per file."},
+    \\"type":{"type":"array","items":{"type":"string"},"description":"Only these file types, e.g. [\"rust\"] or [\"ts\", \"js\"] (ripgrep's names)."},
+    \\"only_matching":{"type":"boolean","description":"Print only the matched text (like rg -o), one match per line."},
     \\"context":{"type":"integer","description":"Lines of context before and after each match (like rg -C). Context lines are path-N-text; groups are separated by --."}
     \\},"required":["pattern"]}
 ;
@@ -136,6 +138,14 @@ fn toolSearch(gpa: Allocator, arena: Allocator, reg: ?*Registry, args: std.json.
         .string => |s| try globs.append(arena, s),
         else => {},
     };
+    var types: std.ArrayList([]const u8) = .empty;
+    if (args.get("type")) |t| switch (t) {
+        .array => |arr| for (arr.items) |it| {
+            if (it == .string) try types.append(arena, it.string);
+        },
+        .string => |s| try types.append(arena, s),
+        else => {},
+    };
     const mode: search.Mode = if (str(args, "output")) |o|
         (if (std.mem.eql(u8, o, "files")) .files_with_matches else if (std.mem.eql(u8, o, "count")) .count else .lines)
     else
@@ -149,6 +159,8 @@ fn toolSearch(gpa: Allocator, arena: Allocator, reg: ?*Registry, args: std.json.
         .max_count = int(args, "max_per_file"),
         .context = if (int(args, "context")) |c| .{ .before = c, .after = c } else .{},
         .globs = globs.items,
+        .types = types.items,
+        .only_matching = boolean(args, "only_matching"),
         .limit = limit,
         .watch = if (reg) |r| r.hook() else null,
     };

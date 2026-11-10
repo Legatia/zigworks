@@ -3,8 +3,10 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Strip debug info (for release binaries)") orelse false;
 
     const mod = module(b, target, optimize);
+    mod.strip = strip;
     const exe = b.addExecutable(.{ .name = "trigrep", .root_module = mod });
     b.installArtifact(exe);
 

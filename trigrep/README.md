@@ -5,7 +5,9 @@ Indexed code search for large repositories and coding agents. ripgrep-compatible
 ```sh
 trigrep spin_lock_irqsave            # first run in a repo builds the index
 trigrep -i 'todo|fixme' src/
-trigrep -w mutex_lock -g '*.c' -C 2  # with 2 lines of context
+trigrep -w mutex_lock -t c -C 2     # C files only, 2 lines of context
+trigrep -o 'EXPORT_SYMBOL\w*'       # print only the matched text
+trigrep --json 'fo+' src/            # ripgrep's JSON Lines format
 trigrep index                        # rebuild from scratch
 trigrep index --update               # re-index only files that changed
 trigrep status                       # how many files changed since indexing
@@ -24,7 +26,7 @@ claude mcp add trigrep -- /absolute/path/to/trigrep mcp
 
 Tools:
 
-- `trigrep_search` takes `pattern`, plus optional `path`, `ignore_case`, `fixed_strings`, `word`, `glob` (array), `output` (`lines`, `files` or `count`), `max_results` (default 200), `max_per_file` and `context` (lines around each match). It returns `path:line:text` lines, and says so when it stopped at `max_results`.
+- `trigrep_search` takes `pattern`, plus optional `path`, `ignore_case`, `fixed_strings`, `word`, `glob` (array), `output` (`lines`, `files` or `count`), `max_results` (default 200), `max_per_file`, `context` (lines around each match), `type` (array of file types, e.g. `["rust"]`) and `only_matching`. It returns `path:line:text` lines, and says so when it stopped at `max_results`.
 - `trigrep_index` rebuilds the index for `path`.
 - `trigrep_status` shows the index and how many files changed since it was built.
 
@@ -80,19 +82,20 @@ Reproduce: `zig build -Doptimize=ReleaseFast`, then `python3 scripts/bench.py DI
 
 ## Options
 
-`-i` `-F` `-w` `-l` `-c` `-m N` `-A N` `-B N` `-C N` `-g GLOB` (repeatable, `!GLOB` excludes) `-e PATTERN` `--hidden` `--no-index` `--trust-index` `-j N` `--stats`. `-n`, `-H`, `--no-heading` and `--color` are accepted and ignored. `trigrep --help` has the full list.
+`-i` `-F` `-w` `-l` `-c` `-o` `-m N` `-A N` `-B N` `-C N` `-t TYPE` `-T TYPE` `--type-list` `--json` `-g GLOB` (repeatable, `!GLOB` excludes) `-e PATTERN` `--hidden` `--no-index` `--trust-index` `-j N` `--stats`. `-n`, `-H`, `--no-heading` and `--color` are accepted and ignored. `trigrep --help` has the full list.
 
 ## Known differences from ripgrep
 
-- `-i` and `(?i)` fold ASCII only, and `\w` counts every non-ASCII character as a word character (ripgrep uses Unicode tables), so a pattern like `\w+` can match a few more lines in text with non-ASCII symbols.
-- No lookaround, backreferences, `\p{..}`, or non-ASCII ranges in classes (`[α-ω]`); these are rejected with an error rather than mis-matched.
-- One PATH per search; no `--type`, `-o`, `--json` or colour yet.
+- `\w`, `\d`, `\s`, `\b`, `.` and classes like `[α-ω]` are Unicode-aware (tables generated from Unicode 16 by `scripts/gen_unicode.py`), and `-i` folds non-ASCII letters (`É` matches `é`, `Σ` matches `σ`). ASCII letters fold only to ASCII, so `-i k` doesn't match the Kelvin sign `K`; ripgrep's does. This keeps `-i` searches on the fast literal path.
+- No lookaround, backreferences or `\p{..}`; these are rejected with an error rather than mis-matched.
+- One PATH per search; no colour or `--sort` options.
+- Patterns with no literal of three or more bytes (e.g. `\d{4}-\d{2}-\d{2}`) can't use the index and scan every file; there trigrep is about as fast as ripgrep (0.8–1.2× on the Zig standard library), not faster.
 - Multi-line patterns aren't supported (matching is per line, like ripgrep's default).
 
 ## Next
 
-- `--json` output.
-- Unicode classes, `-o`, `--type`.
+- Faster scans for patterns the index can't narrow (a reverse-DFA "inner literal" search, as ripgrep's regex engine does).
+- Multiple PATH arguments.
 
 ## Building
 

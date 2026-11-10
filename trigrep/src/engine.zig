@@ -41,6 +41,10 @@ pub const Request = struct {
     max_count: ?usize = null,
     context: search.Context = .{},
     globs: []const []const u8 = &.{},
+    types: []const []const u8 = &.{},
+    types_not: []const []const u8 = &.{},
+    format: search.Format = .text,
+    only_matching: bool = false,
     hidden: bool = false,
     no_index: bool = false,
     trust_index: bool = false,
@@ -256,8 +260,18 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
     const plan = try query.plan(arena, root_node);
     if (plan.required) |r| if (std.mem.indexOfScalar(u8, r.bytes, '\n') != null)
         return failWith(diag, arena, "the pattern contains a newline; trigrep matches single lines", .{});
-    const filter = try walk.Filter.fromGlobs(arena, req.globs);
-    const cfg = search.Config{ .prog = &prog, .plan = plan, .mode = req.mode, .max_count = req.max_count, .context = req.context };
+    var filter = try walk.Filter.fromGlobs(arena, req.globs);
+    if (try filter.addTypes(arena, req.types, req.types_not)) |bad|
+        return failWith(diag, arena, "unknown file type '{s}' (see `trigrep --type-list`)", .{bad});
+    const cfg = search.Config{
+        .prog = &prog,
+        .plan = plan,
+        .mode = req.mode,
+        .max_count = req.max_count,
+        .context = req.context,
+        .format = req.format,
+        .only_matching = req.only_matching,
+    };
     const threads = threadCount(req.threads);
 
     // A single file: just scan it.

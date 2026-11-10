@@ -103,7 +103,7 @@ const Analyzer = struct {
 
     /// A set that is really one character: a single byte, or a letter in both cases.
     fn setLiteral(s: regex.Set) ?SetChar {
-        if (s.multibyte or s.seqs.len > 0) return null;
+        if (s.ranges.len > 0) return null;
         const n = s.bytes.count();
         const first: u8 = @intCast(s.bytes.findFirstSet() orelse return null);
         if (n == 1) return .{ .byte = first, .ignore_case = false };

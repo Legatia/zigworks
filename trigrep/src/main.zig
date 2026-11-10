@@ -11,7 +11,7 @@ const watch = @import("watch.zig");
 const view = @import("view.zig");
 const View = view.View;
 
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 const usage =
     \\trigrep: indexed code search
@@ -33,6 +33,11 @@ const usage =
     \\  -m, --max-count N          stop after N matching lines per file
     \\  -A, -B, -C N               N lines of context after, before, or around matches
     \\  -g, --glob GLOB            only files matching GLOB; !GLOB excludes (repeatable)
+    \\  -t, --type TYPE            only files of TYPE, e.g. rust, py, ts (repeatable)
+    \\  -T, --type-not TYPE        skip files of TYPE
+    \\      --type-list            list the file types
+    \\  -o, --only-matching        print only the matched text
+    \\      --json                 ripgrep's JSON Lines output
     \\  -e, --regexp PATTERN       the pattern (for patterns starting with -)
     \\      --hidden               include hidden files and directories
     \\      --no-index             scan every file, don't use or build an index
@@ -59,6 +64,10 @@ const Args = struct {
     context: search.Context = .{},
     update: bool = false,
     globs: std.ArrayList([]const u8) = .empty,
+    types: std.ArrayList([]const u8) = .empty,
+    types_not: std.ArrayList([]const u8) = .empty,
+    json: bool = false,
+    only_matching: bool = false,
     hidden: bool = false,
     no_index: bool = false,
     trust_index: bool = false,
@@ -114,6 +123,22 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
             } else if (std.mem.eql(u8, name, "after-context")) a.context.after = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --after-context", .{})
             else if (std.mem.eql(u8, name, "before-context")) a.context.before = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --before-context", .{})
             else if (std.mem.eql(u8, name, "update")) a.update = true
+            else if (std.mem.eql(u8, name, "type")) try a.types.append(arena, value(argv, &i, inline_value, name))
+            else if (std.mem.eql(u8, name, "type-not")) try a.types_not.append(arena, value(argv, &i, inline_value, name))
+            else if (std.mem.eql(u8, name, "json")) a.json = true
+            else if (std.mem.eql(u8, name, "only-matching")) a.only_matching = true
+            else if (std.mem.eql(u8, name, "type-list")) {
+                const types = @import("types.zig");
+                var buf: [8192]u8 = undefined;
+                var w = std.fs.File.stdout().writerStreaming(&buf);
+                for (types.all) |t| {
+                    w.interface.print("{s}: ", .{t.name}) catch {};
+                    for (t.globs, 0..) |g, k| w.interface.print("{s}{s}", .{ if (k > 0) ", " else "", g }) catch {};
+                    w.interface.writeAll("\n") catch {};
+                }
+                w.interface.flush() catch {};
+                std.process.exit(0);
+            }
             else if (std.mem.eql(u8, name, "regexp")) a.pattern = value(argv, &i, inline_value, name)
             else if (std.mem.eql(u8, name, "hidden")) a.hidden = true
             else if (std.mem.eql(u8, name, "no-index")) a.no_index = true
@@ -138,7 +163,7 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
         var k: usize = 1;
         while (k < arg.len) : (k += 1) {
             const c = arg[k];
-            const takes_value = c == 'm' or c == 'g' or c == 'e' or c == 'j' or c == 'A' or c == 'B' or c == 'C';
+            const takes_value = c == 'm' or c == 'g' or c == 'e' or c == 'j' or c == 'A' or c == 'B' or c == 'C' or c == 't' or c == 'T';
             var v: []const u8 = "";
             if (takes_value) {
                 if (k + 1 < arg.len) {
@@ -159,6 +184,9 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
                 'g' => try a.globs.append(arena, v),
                 'e' => a.pattern = v,
                 'j' => a.threads = std.fmt.parseInt(usize, v, 10) catch fail("bad -j value", .{}),
+                't' => try a.types.append(arena, v),
+                'T' => try a.types_not.append(arena, v),
+                'o' => a.only_matching = true,
                 'A' => a.context.after = std.fmt.parseInt(usize, v, 10) catch fail("bad -A value", .{}),
                 'B' => a.context.before = std.fmt.parseInt(usize, v, 10) catch fail("bad -B value", .{}),
                 'C' => {
@@ -261,6 +289,10 @@ pub fn main() !void {
         .max_count = a.max_count,
         .context = a.context,
         .globs = a.globs.items,
+        .types = a.types.items,
+        .types_not = a.types_not.items,
+        .format = if (a.json) .json else .text,
+        .only_matching = a.only_matching,
         .hidden = a.hidden,
         .no_index = a.no_index,
         .trust_index = a.trust_index,

@@ -33,6 +33,10 @@ const Rule = struct {
 pub const Filter = struct {
     includes: []const []const u8 = &.{},
     excludes: []const []const u8 = &.{},
+    /// From -t / -T: a file must match one of `type_includes` (if any) and none of
+    /// `type_excludes`.
+    type_includes: []const []const u8 = &.{},
+    type_excludes: []const []const u8 = &.{},
 
     /// From ripgrep-style `-g` globs; a leading `!` makes it an exclude.
     pub fn fromGlobs(arena: Allocator, globs: []const []const u8) !Filter {
@@ -51,9 +55,29 @@ pub const Filter = struct {
         return glob.match(p, base);
     }
 
+    /// Adds file types by name (see types.zig); returns the first unknown name.
+    pub fn addTypes(f: *Filter, arena: Allocator, include: []const []const u8, exclude: []const []const u8) !?[]const u8 {
+        const types = @import("types.zig");
+        var inc: std.ArrayList([]const u8) = .empty;
+        var exc: std.ArrayList([]const u8) = .empty;
+        for (include) |n| try inc.appendSlice(arena, (types.find(n) orelse return n).globs);
+        for (exclude) |n| try exc.appendSlice(arena, (types.find(n) orelse return n).globs);
+        f.type_includes = inc.items;
+        f.type_excludes = exc.items;
+        return null;
+    }
+
     pub fn allows(f: Filter, path: []const u8) bool {
         for (f.excludes) |e| {
             if (hit(e, path)) return false;
+        }
+        for (f.type_excludes) |e| {
+            if (hit(e, path)) return false;
+        }
+        if (f.type_includes.len > 0) {
+            for (f.type_includes) |t| {
+                if (hit(t, path)) break;
+            } else return false;
         }
         if (f.includes.len == 0) return true;
         for (f.includes) |i| {
@@ -94,9 +118,11 @@ fn parseIgnoreFile(arena: Allocator, text: []const u8, base: []const u8, into: *
     }
 }
 
+const Decision = enum { none, ignore, include };
+
 /// Later rules win, and deeper ignore files win over shallower ones, so walk the chain
 /// from the leaf up and each node's rules backwards; the first hit decides.
-fn ignored(node: ?*const RuleNode, rel: []const u8, name: []const u8, is_dir: bool) bool {
+fn decide(node: ?*const RuleNode, rel: []const u8, name: []const u8, is_dir: bool) Decision {
     var n = node;
     while (n) |cur| : (n = cur.parent) {
         var i = cur.rules.len;
@@ -111,10 +137,21 @@ fn ignored(node: ?*const RuleNode, rel: []const u8, name: []const u8, is_dir: bo
             else
                 continue;
             const hit = if (r.anchored) glob.match(r.pattern, sub) else glob.match(r.pattern, name);
-            if (hit) return !r.negate;
+            if (hit) return if (r.negate) .include else .ignore;
         }
     }
-    return false;
+    return .none;
+}
+
+fn ignored(node: ?*const RuleNode, rel: []const u8, name: []const u8, is_dir: bool) bool {
+    return decide(node, rel, name, is_dir) == .ignore;
+}
+
+/// Like ripgrep: a hidden entry is skipped unless `--hidden`, or an ignore file
+/// explicitly re-includes it (e.g. `.*` then `!.mailmap`).
+fn skipHidden(hidden: bool, node: ?*const RuleNode, rel: []const u8, name: []const u8, is_dir: bool) bool {
+    if (hidden or name.len == 0 or name[0] != '.') return false;
+    return decide(node, rel, name, is_dir) != .include;
 }
 
 fn under(path: []const u8, prefix: []const u8) bool {
@@ -208,9 +245,11 @@ pub const Checker = struct {
             const end = slash orelse rel.len;
             const name = rel[start..end];
             if (std.mem.eql(u8, name, ".git")) return true;
-            if (!c.hidden and name.len > 0 and name[0] == '.') return true;
             const parent_rel = if (start == 0) "" else rel[0 .. start - 1];
-            if (ignored(try c.nodeFor(parent_rel), rel[0..end], name, slash != null or is_dir)) return true;
+            const node = try c.nodeFor(parent_rel);
+            const as_dir = slash != null or is_dir;
+            if (skipHidden(c.hidden, node, rel[0..end], name, as_dir)) return true;
+            if (ignored(node, rel[0..end], name, as_dir)) return true;
             start = end + 1;
         }
         return false;
@@ -299,7 +338,6 @@ const Worker = struct {
         var it = dir.iterate();
         while (it.next() catch null) |e| {
             if (std.mem.eql(u8, e.name, ".git")) continue;
-            if (!sh.opts.hidden and e.name[0] == '.') continue;
             const child = if (task.rel.len == 0)
                 try arena.dupe(u8, e.name)
             else
@@ -315,11 +353,11 @@ const Worker = struct {
             }
             switch (kind) {
                 .directory => {
-                    if (ignored(node, child, name, true)) continue;
+                    if (skipHidden(sh.opts.hidden, node, child, name, true) or ignored(node, child, name, true)) continue;
                     try w.subdirs.append(arena, .{ .rel = child, .rules = node });
                 },
                 .file => {
-                    if (!inside or ignored(node, child, name, false)) continue;
+                    if (!inside or skipHidden(sh.opts.hidden, node, child, name, false) or ignored(node, child, name, false)) continue;
                     const s = st orelse (dir.statFile(name) catch continue);
                     try w.out.append(arena, .{ .path = child, .size = s.size, .mtime = @intCast(s.mtime) });
                 },
@@ -428,6 +466,26 @@ test "checker agrees with the walker" {
     try std.testing.expect(!try c.skipped("src", true));
 }
 
+test "hidden files re-included by an ignore file are searched" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = ".gitignore", .data = ".*\n!.gitignore\n!.mailmap\n" });
+    try tmp.dir.writeFile(.{ .sub_path = ".mailmap", .data = "x" });
+    try tmp.dir.writeFile(.{ .sub_path = ".other", .data = "x" });
+    try tmp.dir.writeFile(.{ .sub_path = "a.c", .data = "x" });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try tmp.dir.realpathAlloc(arena.allocator(), ".");
+    const entries = try walk(arena.allocator(), root, .{});
+    var got: std.ArrayList(u8) = .empty;
+    for (entries) |e| try got.print(arena.allocator(), "{s}\n", .{e.path});
+    try std.testing.expectEqualStrings(".gitignore\n.mailmap\na.c\n", got.items);
+    var c = try Checker.init(std.testing.allocator, root, false);
+    defer c.deinit();
+    try std.testing.expect(!try c.skipped(".mailmap", false));
+    try std.testing.expect(try c.skipped(".other", false));
+}
+
 test "filter globs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -435,4 +493,15 @@ test "filter globs" {
     try std.testing.expect(f.allows("src/main.zig"));
     try std.testing.expect(!f.allows("src/main_test.zig"));
     try std.testing.expect(!f.allows("README"));
+
+    var t = Filter{};
+    try std.testing.expect((try t.addTypes(arena.allocator(), &.{ "rust", "c" }, &.{})) == null);
+    try std.testing.expect(t.allows("src/lib.rs"));
+    try std.testing.expect(t.allows("kernel/fork.c"));
+    try std.testing.expect(!t.allows("README.md"));
+    var u = Filter{};
+    try std.testing.expect((try u.addTypes(arena.allocator(), &.{}, &.{"md"})) == null);
+    try std.testing.expect(!u.allows("docs/README.md"));
+    try std.testing.expect(u.allows("main.zig"));
+    try std.testing.expectEqualStrings("nope", (try u.addTypes(arena.allocator(), &.{"nope"}, &.{})).?);
 }
