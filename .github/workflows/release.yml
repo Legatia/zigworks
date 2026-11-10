@@ -19,7 +19,10 @@ jobs:
           - { os: ubuntu-latest, target: x86_64-linux-musl, name: x86_64-linux }
           - { os: ubuntu-latest, target: aarch64-linux-musl, name: aarch64-linux }
           # Zig 0.15.1 can't link against the macOS 26 SDK on macos-latest; macos-15 works.
-          - { os: macos-15, target: aarch64-macos, name: aarch64-macos }
+          # Native build: an explicit -Dtarget would make Zig treat it as a cross
+          # build and not find the SDK frameworks trigrep links (CoreServices).
+          # -Dcpu=apple_m1 keeps the binary runnable on every Apple Silicon Mac.
+          - { os: macos-15, target: native, name: aarch64-macos }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -36,7 +39,8 @@ jobs:
           grep -q "\"$version\"" "$project/build.zig.zon" || { echo "tag version $version not in $project/build.zig.zon"; exit 1; }
           cd "$project"
           zig build test
-          zig build -Doptimize=ReleaseFast -Dstrip=true -Dtarget=${{ matrix.target }} --prefix out
+          if [ "${{ matrix.target }}" = native ]; then target_flag=-Dcpu=apple_m1; else target_flag=-Dtarget=${{ matrix.target }}; fi
+          zig build -Doptimize=ReleaseFast -Dstrip=true $target_flag --prefix out
           pkg="$project-$version-${{ matrix.name }}"
           mkdir "$pkg"
           cp out/bin/"$project" README.md LICENSE "$pkg"/

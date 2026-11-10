@@ -11,7 +11,7 @@ const watch = @import("watch.zig");
 const view = @import("view.zig");
 const View = view.View;
 
-pub const version = "0.2.0";
+pub const version = "0.2.1";
 
 const usage =
     \\trigrep: indexed code search
