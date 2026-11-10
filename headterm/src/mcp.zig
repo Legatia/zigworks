@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 const json = std.json;
 const client = @import("client.zig");
 const server = @import("server.zig");
+const regex = @import("regex.zig");
 
 const supported_versions = [_][]const u8{ "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25" };
 const default_version = "2025-06-18";
@@ -17,6 +18,10 @@ const max_ms = 60_000;
 const max_line = 4 << 20;
 const start_idle_ms = 300;
 const start_timeout_ms = 5_000;
+/// Sessions started over MCP end after an hour without requests or output,
+/// unless the caller passes another ttl_s (0 disables it).
+const default_ttl_s = 3600;
+const max_ttl_s = 30 * 24 * 3600;
 
 /// Reads requests from stdin until EOF and writes replies to stdout.
 pub fn serve(gpa: Allocator) !void {
@@ -28,6 +33,9 @@ pub fn serve(gpa: Allocator) !void {
     const out = &writer.interface;
 
     var io: Io = .{ .gpa = gpa, .in = &reader.interface, .in_fd = posix.STDIN_FILENO };
+    // One diff marker per MCP server process, separate from CLI users and
+    // other agents watching the same session.
+    io.client_id = std.fmt.bufPrint(&io.client_id_buf, "mcp-{d}", .{std.c.getpid()}) catch "mcp";
     defer io.deinit();
 
     while (true) {
@@ -61,6 +69,8 @@ const Io = struct {
     gpa: Allocator,
     in: *std.Io.Reader,
     in_fd: posix.fd_t,
+    client_id_buf: [32]u8 = undefined,
+    client_id: []const u8 = "mcp",
     pending: std.ArrayList([]u8) = .empty,
     /// JSON-encoded ids of queued requests that were cancelled.
     cancelled: std.ArrayList([]u8) = .empty,
@@ -205,6 +215,7 @@ fn handleMessage(gpa: Allocator, line_in: []const u8, io: ?*Io) !?[]u8 {
     if (io) |i| if (i.takeCancelled(id_json)) return null;
 
     var d: Dispatch = .{ .gpa = gpa, .arena = arena, .io = io, .id_json = id_json };
+    if (io) |i| d.client_id = i.client_id;
     const result = d.dispatch(method, obj.get("params")) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MethodNotFound => return try errorReply(gpa, req_id, -32601, d.err_msg),
@@ -282,6 +293,8 @@ const Dispatch = struct {
     id_json: []const u8 = "",
     /// The `styles` argument of the current tool call.
     styles: bool = false,
+    /// Diff marker id passed to the session server.
+    client_id: []const u8 = "mcp",
     err_msg: []const u8 = "",
 
     fn fail(self: *Dispatch, err: DispatchError, comptime fmt: []const u8, args: anytype) DispatchError {
@@ -329,6 +342,8 @@ const Dispatch = struct {
             if (try a.int("cols", 2, 1000)) |c| opts.cols = @intCast(c);
             if (try a.int("rows", 1, 1000)) |r| opts.rows = @intCast(r);
             opts.cwd = try a.string("cwd");
+            const ttl = (try a.int("ttl_s", 0, max_ttl_s)) orelse default_ttl_s;
+            opts.ttl_s = if (ttl == 0) null else @intCast(ttl);
             const wait = try self.waitSpec(try a.object("then_wait"), .{ .idle_ms = start_idle_ms, .timeout_ms = start_timeout_ms });
 
             var msg: [256]u8 = undefined;
@@ -340,7 +355,7 @@ const Dispatch = struct {
         }
         if (eql(tool, "headterm_screen")) {
             var args: std.ArrayList([]const u8) = .empty;
-            try args.append(self.arena, "screen");
+            try args.appendSlice(self.arena, &.{ "screen", "--client", self.client_id });
             if (try a.boolean("diff") orelse false) {
                 try args.append(self.arena, "--diff");
             } else {
@@ -403,6 +418,8 @@ const Dispatch = struct {
 
     const WaitSpec = struct {
         text: ?[]const u8 = null,
+        regex: ?[]const u8 = null,
+        gone: ?[]const u8 = null,
         idle_ms: ?i64 = null,
         exit: bool = false,
         timeout_ms: ?i64 = null,
@@ -416,23 +433,35 @@ const Dispatch = struct {
         var w: WaitSpec = .{};
         if (args) |a| {
             w.text = try a.string("text");
+            w.gone = try a.string("gone");
+            w.regex = try a.string("regex");
+            if (w.regex) |pattern| {
+                var diag: regex.Diagnostic = .{};
+                var re = regex.Regex.compile(self.gpa, pattern, &diag) catch |err| switch (err) {
+                    error.BadRegex => return self.fail(error.InvalidParams, "bad regex: {s}", .{diag.message()}),
+                    else => |e| return e,
+                };
+                re.deinit();
+            }
             w.idle_ms = try a.int("idle_ms", 0, max_ms);
             w.exit = try a.boolean("exit") orelse false;
             w.timeout_ms = try a.int("timeout_ms", 0, max_ms);
         }
-        if (w.text != null or w.idle_ms != null or w.exit) {
+        if (w.text != null or w.regex != null or w.gone != null or w.idle_ms != null or w.exit) {
             w.explicit = true;
             return w;
         }
-        var d = default orelse return self.fail(error.InvalidParams, "wait needs at least one of 'text', 'idle_ms' or 'exit'", .{});
+        var d = default orelse return self.fail(error.InvalidParams, "wait needs at least one of 'text', 'regex', 'gone', 'idle_ms' or 'exit'", .{});
         if (w.timeout_ms) |t| d.timeout_ms = t;
         return d;
     }
 
     fn waitFor(self: *Dispatch, name: []const u8, w: WaitSpec) DispatchError!ToolResult {
         var args: std.ArrayList([]const u8) = .empty;
-        try args.append(self.arena, "wait");
+        try args.appendSlice(self.arena, &.{ "wait", "--client", self.client_id });
         if (w.text) |t| try args.appendSlice(self.arena, &.{ "--text", t });
+        if (w.regex) |r| try args.appendSlice(self.arena, &.{ "--regex", r });
+        if (w.gone) |t| try args.appendSlice(self.arena, &.{ "--text-gone", t });
         if (w.idle_ms) |ms| try args.appendSlice(self.arena, &.{ "--idle", try std.fmt.allocPrint(self.arena, "{d}", .{ms}) });
         if (w.exit) try args.append(self.arena, "--exit");
         if (w.timeout_ms) |ms| try args.appendSlice(self.arena, &.{ "--timeout", try std.fmt.allocPrint(self.arena, "{d}", .{ms}) });
@@ -560,10 +589,12 @@ fn eql(a: []const u8, b: []const u8) bool {
 }
 
 // Embedded in a JSON string, so quotes are escaped for JSON.
-const key_syntax = "Each element is literal text or a key: <Enter> <Tab> <Esc> <Backspace> <Space> <Up> <Down> <Left> <Right> <Home> <End> <PageUp> <PageDown> <Delete> <F1>..<F12>, <C-x> for Ctrl (e.g. <C-c>), <M-x> for Alt, <lt> for a literal '<'. Example: [\\\"ihello\\\", \\\"<Esc>\\\", \\\":wq\\\", \\\"<Enter>\\\"].";
+const key_syntax = "Each element is literal text or a key: <Enter> <Tab> <Esc> <Backspace> <Space> <Up> <Down> <Left> <Right> <Home> <End> <PageUp> <PageDown> <Delete> <F1>..<F12>, <C-x> for Ctrl (e.g. <C-c>), <M-x> for Alt, <lt> for a literal '<'. Mouse, only if the program enabled mouse reporting: <Click row,col>, <RightClick row,col>, <MiddleClick row,col>, <ScrollUp row,col>, <ScrollDown row,col> (0-based, like the cursor position). Example: [\\\"ihello\\\", \\\"<Esc>\\\", \\\":wq\\\", \\\"<Enter>\\\"].";
 
 const wait_props =
-    \\"text":{"type":"string","description":"Wait until this text appears on the visible screen (already-visible text counts)."},
+    \\"text":{"type":"string","description":"Wait until this text is on screen (already-visible text counts). Rows joined by line wrapping are searched as one line."},
+    \\"regex":{"type":"string","description":"Wait until a line on screen matches this regex (. [] \\d \\w \\s ^ $ | () * + ? {n,m}; (?i) prefix for any case). Lines are joined across wrapping, trailing spaces removed."},
+    \\"gone":{"type":"string","description":"Wait until this text is no longer on screen, e.g. a spinner or 'Loading'. Met at once if it is not there."},
     \\"idle_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"Wait until the program has printed nothing for this many ms."},
     \\"exit":{"type":"boolean","description":"Wait until the program exits."},
     \\"timeout_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"Give up after this many ms (default 10000)."}
@@ -598,12 +629,13 @@ fn oneLine(comptime src: []const u8) []const u8 {
 const tools_json_src =
     \\{"tools":[
 ++
-    \\{"name":"headterm_start","description":"Start a program (shell, REPL, vim, less, top, installer...) in a new terminal session and return its first screen once output has been idle for 300 ms (at most 5 s). Use for interactive or full-screen programs; use plain shell execution for one-shot commands.","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_start","description":"Start a program (shell, REPL, vim, less, top, installer...) in a new terminal session and return its first screen once output has been idle for 300 ms (at most 5 s). Sessions end after ttl_s (default 1 hour) without tool calls or output. Use for interactive or full-screen programs; use plain shell execution for one-shot commands.","inputSchema":{"type":"object","properties":{
 ++ name_prop ++
     \\,"command":{"type":"array","items":{"type":"string"},"minItems":1,"description":"Program and arguments, e.g. [\"python3\", \"-q\"] or [\"vim\", \"notes.txt\"]."},
     \\"cols":{"type":"integer","minimum":2,"maximum":1000,"description":"Width (default 120)."},
     \\"rows":{"type":"integer","minimum":1,"maximum":1000,"description":"Height (default 40)."},
     \\"cwd":{"type":"string","description":"Working directory (default: the MCP server's)."},
+    \\"ttl_s":{"type":"integer","minimum":0,"maximum":2592000,"description":"End the session after this many seconds without tool calls or output (default 3600, 0 = never)."},
 ++ styles_prop ++ "," ++
     \\"then_wait":{"type":"object","description":"Wait condition before returning the first screen, instead of the 300 ms idle default.","properties":{
 ++ wait_props ++
@@ -629,7 +661,7 @@ const tools_json_src =
 ++ styles_prop ++
     \\},"required":["name"]}},
 ++
-    \\{"name":"headterm_wait","description":"Wait until text appears, output goes idle, or the program exits (the first condition met wins), then return the screen. Returns an error result with the screen on timeout. Cancellable with notifications/cancelled.","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_wait","description":"Wait until text appears (text, regex), text disappears (gone), output goes idle, or the program exits; the first condition met wins. Then return the screen. Returns an error result with the screen on timeout. Cancellable with notifications/cancelled.","inputSchema":{"type":"object","properties":{
 ++ name_prop ++ "," ++ wait_props ++ "," ++ styles_prop ++
     \\},"required":["name"]}},
 ++
@@ -732,6 +764,10 @@ test "protocol errors" {
     try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_wait\",\"arguments\":{\"name\":\"x\",\"idle_ms\":100,\"timeout_ms\":600000}}}", -32602);
     try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_send\",\"arguments\":{\"name\":\"x\",\"keys\":\"abc\"}}}", -32602);
     try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_start\",\"arguments\":{\"name\":\"x\",\"command\":[]}}}", -32602);
+
+    try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_wait\",\"arguments\":{\"name\":\"x\",\"regex\":\"a{9,1}\"}}}", -32602);
+    try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_send\",\"arguments\":{\"name\":\"x\",\"keys\":[],\"then_wait\":{\"regex\":\"(\"}}}}", -32602);
+    try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_start\",\"arguments\":{\"name\":\"x\",\"command\":[\"sh\"],\"ttl_s\":-1}}}", -32602);
 
     // A parse error carries a null id.
     const p = (try roundTrip("{\"id\":")).?;

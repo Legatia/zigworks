@@ -109,6 +109,7 @@ pub const StartOptions = struct {
     rows: u16 = 40,
     cwd: ?[]const u8 = null,
     log_path: ?[]const u8 = null,
+    ttl_s: ?u32 = null,
 };
 
 /// Starts session `name` running `argv`. Returns the program's pid; on
@@ -144,6 +145,7 @@ pub fn startSession(gpa: Allocator, name: []const u8, argv: []const []const u8, 
         .cols = opts.cols,
         .rows = opts.rows,
         .log_path = opts.log_path,
+        .ttl_s = opts.ttl_s,
     }, &server_msg) catch |err| switch (err) {
         error.StartFailed => failMsg(msg, "{s}", .{std.mem.sliceTo(&server_msg, 0)}),
         else => failMsg(msg, "{s}", .{@errorName(err)}),

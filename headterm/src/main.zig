@@ -7,11 +7,11 @@ const mcp = @import("mcp.zig");
 
 const usage_text =
     \\usage:
-    \\  headterm start <name> [--cols N] [--rows N] [--cwd DIR] [--log FILE] -- <cmd> [args...]
-    \\  headterm screen <name> [--json] [--diff] [--styles] [--trim] [--scrollback N]
+    \\  headterm start <name> [--cols N] [--rows N] [--cwd DIR] [--log FILE] [--ttl S] -- <cmd> [args...]
+    \\  headterm screen <name> [--json] [--diff] [--styles] [--trim] [--scrollback N] [--client ID]
     \\  headterm send <name> [--literal] [--paste] [--esc-delay MS] [--] <text | <Key>>...
-    \\  headterm wait <name> (--text STR | --idle MS | --exit) [--timeout MS] [--json] [--diff]
-    \\                [--styles] [--trim] [--scrollback N]
+    \\  headterm wait <name> (--text STR | --regex RE | --text-gone STR | --idle MS | --exit)...
+    \\                [--timeout MS] [--json] [--diff] [--styles] [--trim] [--scrollback N] [--client ID]
     \\  headterm resize <name> <cols> <rows>
     \\  headterm kill <name>
     \\  headterm list [--json]
@@ -21,6 +21,8 @@ const usage_text =
     \\keys: <Enter> <Tab> <Esc> <Backspace> <Space> <Up> <Down> <Left> <Right>
     \\      <Home> <End> <PageUp> <PageDown> <Insert> <Delete> <F1>..<F12> <lt>
     \\      modifiers: <C-x> (Ctrl) <M-x> (Meta/Alt) <S-x> (Shift), combinable
+    \\mouse (only if the program enabled it): <Click row,col> <RightClick row,col>
+    \\      <MiddleClick row,col> <ScrollUp row,col> <ScrollDown row,col>, 0-based
     \\
     \\exit codes: 0 ok, 1 wait not satisfied (timeout), 2 error
     \\
@@ -113,6 +115,9 @@ fn start(gpa: Allocator, name: []const u8, args: []const []const u8) !u8 {
             opts.cwd = v;
         } else if (eql(a, "--log")) {
             opts.log_path = v;
+        } else if (eql(a, "--ttl")) {
+            const ttl = std.fmt.parseInt(u32, v, 10) catch return fail("start: bad --ttl '{s}' (seconds)", .{v});
+            opts.ttl_s = if (ttl == 0) null else ttl;
         } else {
             return fail("start: unknown option {s}", .{a});
         }
@@ -182,4 +187,6 @@ test {
     _ = @import("server.zig");
     _ = @import("pty.zig");
     _ = @import("mcp.zig");
+    _ = @import("regex.zig");
+    _ = @import("session_test.zig");
 }

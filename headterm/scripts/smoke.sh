@@ -16,6 +16,8 @@ cleanup() {
     "$HT" kill "$S" >/dev/null 2>&1 || true
     "$HT" kill "$S-x" >/dev/null 2>&1 || true
     "$HT" kill "$S-m" >/dev/null 2>&1 || true
+    "$HT" kill "$S-w" >/dev/null 2>&1 || true
+    "$HT" kill "$S-t" >/dev/null 2>&1 || true
     rm -rf "$STATE"
 }
 trap cleanup EXIT
@@ -25,6 +27,8 @@ fail() {
     exit 1
 }
 
+quiet() { "$@" >/dev/null; }
+
 check() { # check <description> <command...>
     desc=$1
     shift
@@ -32,7 +36,7 @@ check() { # check <description> <command...>
 }
 
 "$HT" start "$S" --cols 40 --rows 6 -- /bin/sh -c 'printf "ready\n"; read x; echo got:$x; read y; echo second:$y; exit 3' >/dev/null
-check "wait for initial text" "$HT" wait "$S" --text ready --timeout 5000 >/dev/null
+check "wait for initial text" quiet "$HT" wait "$S" --text ready --timeout 5000
 
 "$HT" send "$S" hello '<Enter>'
 out=$("$HT" wait "$S" --text got:hello --timeout 5000)
@@ -81,6 +85,42 @@ check "styles in json" sh -c '"$1" screen "$2" --json --styles | grep -qF "\"att
 out=$("$HT" wait "$S-m" --idle 300 --diff --styles --timeout 5000)
 check "style-only change shows in diff" sh -c 'printf "%s\n" "$1" | grep -qx "0|  Open" && printf "%s\n" "$1" | grep -qF "row 0: [0-8 inverse \"  Open\"]"' _ "$out"
 "$HT" kill "$S-m"
+
+# Waits on wrapped text, regex and disappearing text.
+"$HT" start "$S-w" --cols 20 --rows 5 -- /bin/sh -c 'printf "Downloading package-name-that-is-long 42%%\n"; read x; printf "Loading..."; sleep 1; printf "\r\033[KDone\n"; sleep 30' >/dev/null
+check "text across a wrapped row" quiet "$HT" wait "$S-w" --text package-name-that-is-long --timeout 5000
+check "regex across a wrapped row" quiet "$HT" wait "$S-w" --regex '^Down.*long \d+%$' --timeout 5000
+set +e
+err=$("$HT" wait "$S-w" --regex '(abc' 2>&1)
+rc=$?
+set -e
+check "bad regex is rejected" sh -c '[ "$1" -eq 2 ] && printf "%s" "$2" | grep -q "missing .). at offset 4"' _ "$rc" "$err"
+"$HT" send "$S-w" '<Enter>'
+"$HT" wait "$S-w" --text Loading --timeout 5000 >/dev/null
+out=$("$HT" wait "$S-w" --text-gone Loading --timeout 5000)
+check "text-gone waits for the text to go" sh -c 'printf "%s\n" "$1" | grep -q "wait=ok(gone)" && printf "%s\n" "$1" | grep -qx Done' _ "$out"
+
+# Diff markers per --client.
+"$HT" screen "$S-w" --diff --client one >/dev/null
+check "client one has seen everything" sh -c '"$1" screen "$2" --diff --client one | grep -q "changed=0"' _ "$HT" "$S-w"
+# A client that has seen nothing yet gets every row.
+check "client two has its own marker" sh -c '"$1" screen "$2" --diff --client two | grep -q "changed=5"' _ "$HT" "$S-w"
+"$HT" kill "$S-w"
+
+# Mouse input is refused unless the program asked for it.
+"$HT" start "$S-x" -- sleep 30 >/dev/null
+set +e
+err=$("$HT" send "$S-x" '<Click 1,2>' 2>&1)
+rc=$?
+set -e
+check "mouse refused without mouse reporting" sh -c '[ "$1" -eq 2 ] && printf "%s" "$2" | grep -q "has not enabled mouse reporting"' _ "$rc" "$err"
+"$HT" kill "$S-x"
+
+# A session with --ttl ends by itself once idle.
+"$HT" start "$S-t" --ttl 1 -- sleep 30 >/dev/null
+check "ttl is reported" sh -c '"$1" list --json | grep -q "\"ttl_s\":1"' _ "$HT"
+sleep 2.5
+check "session expired after its ttl" sh -c '! "$1" list | grep -q "^$2 "' _ "$HT" "$S-t"
 
 set +e
 err=$("$HT" start "$S" -- /nonexistent/program 2>&1)

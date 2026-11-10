@@ -77,33 +77,46 @@ pub const Modes = struct {
     mouse_sgr: bool = false, // ?1006
 };
 
+const Row = struct {
+    cells: []Cell,
+    /// Text ran past the right edge and continues on the next row
+    /// (autowrap), so the two rows form one logical line.
+    wrapped: bool = false,
+
+    fn fill(row: *Row, cell: Cell) void {
+        @memset(row.cells, cell);
+        row.wrapped = false;
+    }
+};
+
 const Grid = struct {
-    rows: [][]Cell,
+    /// Rotated, not copied, when the screen scrolls.
+    rows: []Row,
     /// DECSC slot. Each buffer has its own, as in xterm.
     saved: Cursor = .{},
 
     fn init(gpa: Allocator, cols: usize, nrows: usize) !Grid {
-        const rows = try gpa.alloc([]Cell, nrows);
+        const rows = try gpa.alloc(Row, nrows);
         var done: usize = 0;
         errdefer {
-            for (rows[0..done]) |r| gpa.free(r);
+            for (rows[0..done]) |r| gpa.free(r.cells);
             gpa.free(rows);
         }
         for (rows) |*r| {
-            r.* = try gpa.alloc(Cell, cols);
-            @memset(r.*, blank);
+            r.* = .{ .cells = try gpa.alloc(Cell, cols) };
+            @memset(r.cells, blank);
             done += 1;
         }
         return .{ .rows = rows };
     }
 
     fn deinit(self: *Grid, gpa: Allocator) void {
-        for (self.rows) |r| gpa.free(r);
+        for (self.rows) |r| gpa.free(r.cells);
         gpa.free(self.rows);
     }
 
     fn clear(self: *Grid) void {
-        for (self.rows) |r| @memset(r, blank);
+        for (self.rows) |*r| r.fill(blank);
     }
 };
 
@@ -240,7 +253,7 @@ pub const Terminal = struct {
     }
 
     fn line(self: *Terminal, r: usize) []Cell {
-        return self.grid().rows[r];
+        return self.grid().rows[r].cells;
     }
 
     /// A cell cleared by an erase, insert, delete or scroll. It takes the
@@ -255,7 +268,13 @@ pub const Terminal = struct {
     /// Visible cells of row `r` of the active screen.
     pub fn rowCells(self: *const Terminal, r: usize) []const Cell {
         const g = if (self.alt_active) &self.alt else &self.main;
-        return g.rows[r];
+        return g.rows[r].cells;
+    }
+
+    /// True if row `r` of the active screen continues on row `r + 1`.
+    pub fn rowWrapped(self: *const Terminal, r: usize) bool {
+        const g = if (self.alt_active) &self.alt else &self.main;
+        return g.rows[r].wrapped;
     }
 
     /// Appends row `r` as UTF-8 with trailing spaces removed.
@@ -849,6 +868,7 @@ pub const Terminal = struct {
     }
 
     fn wrapLine(self: *Terminal) !void {
+        self.grid().rows[self.cursor.row].wrapped = true;
         self.cursor.pending_wrap = false;
         self.cursor.col = 0;
         try self.index();
@@ -988,17 +1008,17 @@ pub const Terminal = struct {
         const n = @min(n_in, self.bottom - self.top + 1);
         const rows = self.grid().rows;
         if (!self.alt_active and self.top == 0) {
-            for (rows[0..n]) |r| try self.pushScrollback(r);
+            for (rows[0..n]) |r| try self.pushScrollback(r.cells);
         }
-        std.mem.rotate([]Cell, rows[self.top .. self.bottom + 1], n);
-        for (rows[self.bottom + 1 - n .. self.bottom + 1]) |r| @memset(r, self.erased());
+        std.mem.rotate(Row, rows[self.top .. self.bottom + 1], n);
+        for (rows[self.bottom + 1 - n .. self.bottom + 1]) |*r| r.fill(self.erased());
     }
 
     fn scrollDown(self: *Terminal, n_in: usize) !void {
         const n = @min(n_in, self.bottom - self.top + 1);
         const region = self.grid().rows[self.top .. self.bottom + 1];
-        std.mem.rotate([]Cell, region, region.len - n);
-        for (region[0..n]) |r| @memset(r, self.erased());
+        std.mem.rotate(Row, region, region.len - n);
+        for (region[0..n]) |*r| r.fill(self.erased());
     }
 
     fn pushScrollback(self: *Terminal, cells: []const Cell) !void {
@@ -1026,13 +1046,14 @@ pub const Terminal = struct {
         switch (mode) {
             0 => {
                 self.clearCells(c.row, c.col, self.cols);
-                for (c.row + 1..self.rows) |r| @memset(self.line(r), self.erased());
+                self.grid().rows[c.row].wrapped = false;
+                for (self.grid().rows[c.row + 1 ..]) |*r| r.fill(self.erased());
             },
             1 => {
-                for (0..c.row) |r| @memset(self.line(r), self.erased());
+                for (self.grid().rows[0..c.row]) |*r| r.fill(self.erased());
                 self.clearCells(c.row, 0, c.col + 1);
             },
-            2 => for (self.grid().rows) |r| @memset(r, self.erased()),
+            2 => for (self.grid().rows) |*r| r.fill(self.erased()),
             3 => self.scrollback.clear(self.gpa),
             else => {},
         }
@@ -1042,9 +1063,15 @@ pub const Terminal = struct {
         const c = &self.cursor;
         c.pending_wrap = false;
         switch (mode) {
-            0 => self.clearCells(c.row, c.col, self.cols),
+            0 => {
+                self.clearCells(c.row, c.col, self.cols);
+                self.grid().rows[c.row].wrapped = false;
+            },
             1 => self.clearCells(c.row, 0, c.col + 1),
-            2 => self.clearCells(c.row, 0, self.cols),
+            2 => {
+                self.clearCells(c.row, 0, self.cols);
+                self.grid().rows[c.row].wrapped = false;
+            },
             else => {},
         }
     }
@@ -1076,8 +1103,8 @@ pub const Terminal = struct {
         if (c.row < self.top or c.row > self.bottom) return;
         const region = self.grid().rows[c.row .. self.bottom + 1];
         const n = @min(n_in, region.len);
-        std.mem.rotate([]Cell, region, region.len - n);
-        for (region[0..n]) |r| @memset(r, self.erased());
+        std.mem.rotate(Row, region, region.len - n);
+        for (region[0..n]) |*r| r.fill(self.erased());
         c.col = 0;
         c.pending_wrap = false;
     }
@@ -1087,14 +1114,14 @@ pub const Terminal = struct {
         if (c.row < self.top or c.row > self.bottom) return;
         const region = self.grid().rows[c.row .. self.bottom + 1];
         const n = @min(n_in, region.len);
-        std.mem.rotate([]Cell, region, n);
-        for (region[region.len - n ..]) |r| @memset(r, self.erased());
+        std.mem.rotate(Row, region, n);
+        for (region[region.len - n ..]) |*r| r.fill(self.erased());
         c.col = 0;
         c.pending_wrap = false;
     }
 
     fn screenAlignment(self: *Terminal) void {
-        for (self.grid().rows) |r| @memset(r, .{ .cp = 'E' });
+        for (self.grid().rows) |*r| r.fill(.{ .cp = 'E' });
         self.top = 0;
         self.bottom = self.rows - 1;
         self.cursor.origin = false;
@@ -1165,7 +1192,7 @@ pub const Terminal = struct {
 
         const shift = if (self.cursor.row >= rows) self.cursor.row - rows + 1 else 0;
         if (!self.alt_active) {
-            for (self.main.rows[0..shift]) |r| try self.pushScrollback(r);
+            for (self.main.rows[0..shift]) |r| try self.pushScrollback(r.cells);
         }
         copyGrid(&main, &self.main, if (self.alt_active) 0 else shift, cols);
         copyGrid(&alt, &self.alt, if (self.alt_active) shift else 0, cols);
@@ -1210,11 +1237,13 @@ fn shownStyle(s: Style) Style {
 fn copyGrid(dst: *Grid, src: *const Grid, skip: usize, cols: usize) void {
     var r: usize = 0;
     while (r < dst.rows.len and r + skip < src.rows.len) : (r += 1) {
-        const from = src.rows[r + skip];
+        const from = src.rows[r + skip].cells;
+        const to = dst.rows[r].cells;
         const n = @min(cols, from.len);
-        @memcpy(dst.rows[r][0..n], from[0..n]);
+        @memcpy(to[0..n], from[0..n]);
         // A wide char cut in half at the new right edge becomes a blank.
-        if (n > 0 and dst.rows[r][n - 1].width == 2) dst.rows[r][n - 1] = blank;
+        if (n > 0 and to[n - 1].width == 2) to[n - 1] = blank;
+        dst.rows[r].wrapped = src.rows[r + skip].wrapped;
     }
 }
 
@@ -1800,4 +1829,27 @@ test "curses-style menu: the selected item is inverse" {
     defer text.deinit(testing.allocator);
     try t.appendRangeText(3, 2, 10, &text, testing.allocator);
     try testing.expectEqualStrings("Quit", text.items);
+}
+
+test "rows remember autowrap, and the flag moves with scrolling" {
+    var t = try testTerm(5, 3);
+    defer t.deinit();
+    try t.feed("1\r\nabcdefg");
+    try testing.expect(!t.rowWrapped(0));
+    try testing.expect(t.rowWrapped(1));
+    try testing.expect(!t.rowWrapped(2));
+    try t.feed("\r\n"); // scrolls: the wrapped row moves to the top
+    try expectScreen(&t, "abcde\nfg\n");
+    try testing.expect(t.rowWrapped(0));
+    try testing.expect(!t.rowWrapped(1));
+    // Reaching the edge and then CR LF is not a wrap.
+    try t.feed("xyzuv\r\n");
+    try expectScreen(&t, "fg\nxyzuv\n");
+    try testing.expect(!t.rowWrapped(0));
+    try testing.expect(!t.rowWrapped(1));
+    // Erasing to the end of the line ends the logical line there.
+    try t.feed("\x1b[1;1Habcdefg");
+    try testing.expect(t.rowWrapped(0));
+    try t.feed("\x1b[1;3H\x1b[K");
+    try testing.expect(!t.rowWrapped(0));
 }

@@ -4,11 +4,29 @@
 //! Key names are case-insensitive and may carry modifiers: `C-` (Ctrl),
 //! `M-` or `A-` (Meta/Alt), `S-` (Shift), e.g. `<C-c>`, `<M-x>`, `<S-Tab>`,
 //! `<C-Left>`. `<lt>` sends a literal `<`.
+//!
+//! Mouse events are `<Click row,col>`, `<RightClick row,col>`,
+//! `<MiddleClick row,col>`, `<ScrollUp row,col>` and `<ScrollDown row,col>`
+//! with 0-based screen coordinates. They are only accepted when the program
+//! has turned on mouse reporting.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const Error = error{UnknownKey} || Allocator.Error;
+pub const Error = error{ UnknownKey, MouseNotEnabled, BadMousePosition } || Allocator.Error;
+
+/// Terminal state that changes what keys send.
+pub const Context = struct {
+    /// DECCKM: arrows send ESC O x instead of ESC [ x.
+    app_cursor: bool = false,
+    /// Mouse tracking mode the program enabled: 0 (off), 9, 1000, 1002, 1003.
+    mouse_tracking: u16 = 0,
+    /// Mode 1006: SGR mouse encoding.
+    mouse_sgr: bool = false,
+    /// Screen size, to reject mouse positions outside it.
+    rows: usize = std.math.maxInt(usize),
+    cols: usize = std.math.maxInt(usize),
+};
 
 pub const Mods = struct {
     ctrl: bool = false,
@@ -28,14 +46,63 @@ pub const Mods = struct {
 /// Returns true if `arg` looks like a key (`<...>`), whether or not the name
 /// is known.
 pub fn isKeySyntax(arg: []const u8) bool {
-    return arg.len >= 3 and arg[0] == '<' and arg[arg.len - 1] == '>' and
-        std.mem.indexOfAny(u8, arg[1 .. arg.len - 1], " <>") == null;
+    if (arg.len < 3 or arg[0] != '<' or arg[arg.len - 1] != '>') return false;
+    const inner = arg[1 .. arg.len - 1];
+    if (std.mem.indexOfAny(u8, inner, "<>") != null) return false;
+    if (std.mem.indexOfScalar(u8, inner, ' ') == null) return true;
+    // Only mouse events have a space: "<Click 3,4>".
+    return mouseButton(inner[0..std.mem.indexOfScalar(u8, inner, ' ').?]) != null;
 }
 
 /// Appends the encoding of one `send` argument to `out`.
-pub fn encodeArg(gpa: Allocator, out: *std.ArrayList(u8), arg: []const u8, app_cursor: bool) Error!void {
+pub fn encodeArg(gpa: Allocator, out: *std.ArrayList(u8), arg: []const u8, ctx: Context) Error!void {
     if (!isKeySyntax(arg)) return out.appendSlice(gpa, arg);
-    return encodeKey(gpa, out, arg[1 .. arg.len - 1], app_cursor);
+    const inner = arg[1 .. arg.len - 1];
+    if (std.mem.indexOfScalar(u8, inner, ' ')) |sp| return encodeMouse(gpa, out, inner[0..sp], inner[sp + 1 ..], ctx);
+    return encodeKey(gpa, out, inner, ctx.app_cursor);
+}
+
+const Mouse = struct { button: u8, release: bool };
+
+fn mouseButton(name: []const u8) ?Mouse {
+    const names = [_]struct { []const u8, Mouse }{
+        .{ "click", .{ .button = 0, .release = true } },
+        .{ "middleclick", .{ .button = 1, .release = true } },
+        .{ "rightclick", .{ .button = 2, .release = true } },
+        .{ "scrollup", .{ .button = 64, .release = false } },
+        .{ "scrolldown", .{ .button = 65, .release = false } },
+    };
+    var buf: [16]u8 = undefined;
+    if (name.len > buf.len) return null;
+    const lower = std.ascii.lowerString(&buf, name);
+    for (names) |n| {
+        if (std.mem.eql(u8, lower, n[0])) return n[1];
+    }
+    return null;
+}
+
+fn encodeMouse(gpa: Allocator, out: *std.ArrayList(u8), name: []const u8, pos: []const u8, ctx: Context) Error!void {
+    const m = mouseButton(name) orelse return error.UnknownKey;
+    const comma = std.mem.indexOfScalar(u8, pos, ',') orelse return error.BadMousePosition;
+    const row = std.fmt.parseInt(usize, std.mem.trim(u8, pos[0..comma], " "), 10) catch return error.BadMousePosition;
+    const col = std.fmt.parseInt(usize, std.mem.trim(u8, pos[comma + 1 ..], " "), 10) catch return error.BadMousePosition;
+    if (ctx.mouse_tracking == 0) return error.MouseNotEnabled;
+    if (row >= ctx.rows or col >= ctx.cols) return error.BadMousePosition;
+    // Terminal mouse coordinates are 1-based, column first.
+    const x = col + 1;
+    const y = row + 1;
+    if (ctx.mouse_sgr) {
+        try out.print(gpa, "\x1b[<{d};{d};{d}M", .{ m.button, x, y });
+        if (m.release) try out.print(gpa, "\x1b[<{d};{d};{d}m", .{ m.button, x, y });
+        return;
+    }
+    // Legacy encoding: each value + 32 in one byte, so at most 223.
+    if (x > 223 or y > 223) return error.BadMousePosition;
+    try out.appendSlice(gpa, &.{ 0x1b, '[', 'M', 32 + m.button, @intCast(32 + x), @intCast(32 + y) });
+    // X10 mode (9) reports presses only; release is button code 3.
+    if (m.release and ctx.mouse_tracking != 9) {
+        try out.appendSlice(gpa, &.{ 0x1b, '[', 'M', 32 + 3, @intCast(32 + x), @intCast(32 + y) });
+    }
 }
 
 const Cursor = struct { name: []const u8, final: u8 };
@@ -157,9 +224,13 @@ fn ctrlByte(c: u8) ?u8 {
 const testing = std.testing;
 
 fn expectEncoded(arg: []const u8, app_cursor: bool, expected: []const u8) !void {
+    return expectEncodedCtx(arg, .{ .app_cursor = app_cursor }, expected);
+}
+
+fn expectEncodedCtx(arg: []const u8, ctx: Context, expected: []const u8) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
-    try encodeArg(testing.allocator, &out, arg, app_cursor);
+    try encodeArg(testing.allocator, &out, arg, ctx);
     try testing.expectEqualStrings(expected, out.items);
 }
 
@@ -215,6 +286,31 @@ test "control and meta" {
 test "unknown keys are rejected" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
-    try testing.expectError(error.UnknownKey, encodeArg(testing.allocator, &out, "<Foo>", false));
-    try testing.expectError(error.UnknownKey, encodeArg(testing.allocator, &out, "<C-é>", false));
+    try testing.expectError(error.UnknownKey, encodeArg(testing.allocator, &out, "<Foo>", .{}));
+    try testing.expectError(error.UnknownKey, encodeArg(testing.allocator, &out, "<C-é>", .{}));
+}
+
+test "mouse events need mouse reporting and use the program's encoding" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectError(error.MouseNotEnabled, encodeArg(testing.allocator, &out, "<Click 2,5>", .{}));
+
+    const sgr: Context = .{ .mouse_tracking = 1000, .mouse_sgr = true, .rows = 24, .cols = 80 };
+    try expectEncodedCtx("<Click 2,5>", sgr, "\x1b[<0;6;3M\x1b[<0;6;3m");
+    try expectEncodedCtx("<click 0, 0>", sgr, "\x1b[<0;1;1M\x1b[<0;1;1m");
+    try expectEncodedCtx("<RightClick 1,1>", sgr, "\x1b[<2;2;2M\x1b[<2;2;2m");
+    try expectEncodedCtx("<ScrollUp 10,20>", sgr, "\x1b[<64;21;11M");
+    try expectEncodedCtx("<ScrollDown 10,20>", sgr, "\x1b[<65;21;11M");
+    try testing.expectError(error.BadMousePosition, encodeArg(testing.allocator, &out, "<Click 24,0>", sgr));
+    try testing.expectError(error.BadMousePosition, encodeArg(testing.allocator, &out, "<Click 3>", sgr));
+
+    const x11: Context = .{ .mouse_tracking = 1000, .rows = 300, .cols = 300 };
+    try expectEncodedCtx("<Click 2,5>", x11, "\x1b[M\x20\x26\x23\x1b[M\x23\x26\x23");
+    try expectEncodedCtx("<ScrollUp 0,0>", x11, "\x1b[M\x60\x21\x21");
+    try testing.expectError(error.BadMousePosition, encodeArg(testing.allocator, &out, "<Click 0,250>", x11));
+    // X10 mode reports presses only.
+    try expectEncodedCtx("<Click 0,0>", .{ .mouse_tracking = 9 }, "\x1b[M\x20\x21\x21");
+
+    // Text that only looks like a key stays text.
+    try expectEncodedCtx("<hello world>", .{}, "<hello world>");
 }

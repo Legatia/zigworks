@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 const vt = @import("vt.zig");
 const keys = @import("keys.zig");
 const pty = @import("pty.zig");
+const regex = @import("regex.zig");
 
 pub const version = "0.1.0";
 pub const default_wait_timeout_ms = 10_000;
@@ -28,7 +29,14 @@ pub const Config = struct {
     rows: u16,
     /// Raw PTY output is appended here when set (for debugging emulation).
     log_path: ?[]const u8 = null,
+    /// End the session after this many seconds with no client request and
+    /// no output.
+    ttl_s: ?u32 = null,
 };
+
+/// Diff markers kept per session; the least recently used one is dropped.
+const max_markers = 64;
+pub const max_client_id = 64;
 
 pub const StartError = error{StartFailed} || posix.ForkError || posix.PipeError;
 
@@ -116,12 +124,21 @@ fn nowMs() i64 {
 
 const Waiter = struct {
     fd: posix.fd_t,
-    text: ?[]u8,
-    idle_ms: ?i64,
-    exit: bool,
-    render: Session.RenderOptions,
+    text: ?[]u8 = null,
+    regex: ?*regex.Regex = null,
+    gone: ?[]u8 = null,
+    idle_ms: ?i64 = null,
+    exit: bool = false,
+    /// Owned copy of the --client id that render.client points to.
+    client: ?[]u8 = null,
+    render: Session.RenderOptions = .{},
     started: i64,
-    deadline: i64,
+    deadline: i64 = 0,
+
+    /// Conditions that only depend on what is on screen.
+    fn screenOnly(w: Waiter) bool {
+        return (w.text != null or w.regex != null or w.gone != null) and w.idle_ms == null and !w.exit;
+    }
 };
 
 fn withWait(opts: Session.RenderOptions, outcome: WaitOutcome) Session.RenderOptions {
@@ -131,8 +148,23 @@ fn withWait(opts: Session.RenderOptions, outcome: WaitOutcome) Session.RenderOpt
 }
 
 fn waitCondition(w: Waiter) []const u8 {
-    return if (w.text != null) "text" else if (w.idle_ms != null) "idle" else "exit";
+    if (w.text != null) return "text";
+    if (w.regex != null) return "regex";
+    if (w.gone != null) return "gone";
+    if (w.idle_ms != null) return "idle";
+    return "exit";
 }
+
+const Marker = struct {
+    /// Row signatures (text and styles) as last returned to this client.
+    rows: std.ArrayList([]u8) = .empty,
+    used_ms: i64 = 0,
+
+    fn deinit(m: *Marker, gpa: Allocator) void {
+        for (m.rows.items) |l| gpa.free(l);
+        m.rows.deinit(gpa);
+    }
+};
 
 const WaitOutcome = struct {
     condition: []const u8,
@@ -156,9 +188,12 @@ const Session = struct {
     exit_signal: ?u8 = null,
     started_ms: i64,
     last_output_ms: i64,
+    /// Last client request or program output, for --ttl.
+    last_activity_ms: i64,
     input: std.ArrayList(u8) = .empty,
     /// Rows as returned by the last screen/wait response, for --diff.
-    snapshot: std.ArrayList([]u8) = .empty,
+    /// Diff markers by client id ("" for clients that pass no --client).
+    markers: std.StringHashMapUnmanaged(Marker) = .empty,
     waiters: std.ArrayList(Waiter) = .empty,
     quit: bool = false,
     log_fd: ?posix.fd_t = null,
@@ -209,6 +244,7 @@ const Session = struct {
             .sig_pipe = sig_pipe,
             .started_ms = now,
             .last_output_ms = now,
+            .last_activity_ms = now,
         };
     }
 
@@ -226,8 +262,12 @@ const Session = struct {
             if (w.text) |t| self.gpa.free(t);
         }
         self.waiters.deinit(self.gpa);
-        for (self.snapshot.items) |l| self.gpa.free(l);
-        self.snapshot.deinit(self.gpa);
+        var it = self.markers.iterator();
+        while (it.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            e.value_ptr.deinit(self.gpa);
+        }
+        self.markers.deinit(self.gpa);
         self.input.deinit(self.gpa);
         self.term.deinit();
     }
@@ -265,6 +305,7 @@ const Session = struct {
             }
             if (fds.items[1].revents & posix.POLL.IN != 0) self.acceptClient();
             try self.checkWaiters();
+            self.checkExpiry();
         }
 
         // Session killed: answer whoever is still waiting.
@@ -284,8 +325,25 @@ const Session = struct {
             if (w.idle_ms) |idle| t = @min(t, @max(self.last_output_ms, w.started) + idle);
             next = if (next) |n| @min(n, t) else t;
         }
+        if (self.expiresAt()) |t| next = if (next) |n| @min(n, t) else t;
         const n = next orelse return -1;
         return @intCast(std.math.clamp(n - now, 0, 60_000));
+    }
+
+    /// When the session expires, or null if it has no TTL or a client is
+    /// waiting on it.
+    fn expiresAt(self: *Session) ?i64 {
+        const ttl = self.cfg.ttl_s orelse return null;
+        if (self.waiters.items.len > 0 or self.quit) return null;
+        return self.last_activity_ms + @as(i64, ttl) * 1000;
+    }
+
+    fn checkExpiry(self: *Session) void {
+        const at = self.expiresAt() orelse return;
+        if (nowMs() < at) return;
+        self.terminateChild() catch {};
+        self.closeListener();
+        self.quit = true;
     }
 
     fn readPty(self: *Session) !void {
@@ -311,7 +369,10 @@ const Session = struct {
                 self.term.reply.clearRetainingCapacity();
             }
         }
-        if (total > 0) self.last_output_ms = nowMs();
+        if (total > 0) {
+            self.last_output_ms = nowMs();
+            self.last_activity_ms = self.last_output_ms;
+        }
         if (self.input.items.len > 0) self.flushInput();
     }
 
@@ -356,6 +417,7 @@ const Session = struct {
 
     fn acceptClient(self: *Session) void {
         const fd = posix.accept(self.listen_fd, null, null, posix.SOCK.CLOEXEC) catch return;
+        self.last_activity_ms = nowMs();
         const tv: posix.timeval = .{ .sec = 2, .usec = 0 };
         // libc directly: macOS fails with EINVAL if the client has already
         // hung up, which std.posix.setsockopt treats as unreachable.
@@ -431,6 +493,10 @@ const Session = struct {
                     opts.styles = true;
                 } else if (std.mem.eql(u8, a, "--trim")) {
                     opts.trim = true;
+                } else if (std.mem.eql(u8, a, "--client") and i + 1 < rest.len) {
+                    i += 1;
+                    if (!validClientId(rest[i])) return self.usage(fd, "screen: --client needs an id of 1 to 64 bytes");
+                    opts.client = rest[i];
                 } else if (std.mem.eql(u8, a, "--scrollback") and i + 1 < rest.len) {
                     i += 1;
                     opts.scrollback = std.fmt.parseInt(usize, rest[i], 10) catch return self.usage(fd, "screen: --scrollback needs a number");
@@ -534,13 +600,23 @@ const Session = struct {
                 continue;
             }
             const before = bytes.items.len;
-            keys.encodeArg(self.gpa, &bytes, a, self.term.modes.app_cursor) catch |err| switch (err) {
-                error.UnknownKey => {
-                    var buf: [256]u8 = undefined;
-                    respond(fd, .@"error", std.fmt.bufPrint(&buf, "unknown key {s} (use --literal to send it as text)\n", .{a}) catch "unknown key\n");
-                    return;
-                },
-                else => |e| return e,
+            const ctx: keys.Context = .{
+                .app_cursor = self.term.modes.app_cursor,
+                .mouse_tracking = self.term.modes.mouse_tracking,
+                .mouse_sgr = self.term.modes.mouse_sgr,
+                .rows = self.term.rows,
+                .cols = self.term.cols,
+            };
+            keys.encodeArg(self.gpa, &bytes, a, ctx) catch |err| {
+                var buf: [256]u8 = undefined;
+                const msg = switch (err) {
+                    error.UnknownKey => std.fmt.bufPrint(&buf, "unknown key {s} (use --literal to send it as text)\n", .{a}),
+                    error.MouseNotEnabled => std.fmt.bufPrint(&buf, "{s}: the program has not enabled mouse reporting, so it does not accept mouse input\n", .{a}),
+                    error.BadMousePosition => std.fmt.bufPrint(&buf, "{s}: expected <Click row,col> with 0-based row < {d} and col < {d}\n", .{ a, self.term.rows, self.term.cols }),
+                    error.OutOfMemory => return error.OutOfMemory,
+                } catch "bad key\n";
+                respond(fd, .@"error", msg);
+                return;
             };
             if (keys.isKeySyntax(a) and bytes.items.len == before + 1 and bytes.items[before] == 0x1b) {
                 try pauses.append(self.gpa, bytes.items.len);
@@ -584,32 +660,17 @@ const Session = struct {
         }
     }
 
+    const wait_usage = "usage: wait (--text STR | --regex RE | --text-gone STR | --idle MS | --exit)... [--timeout MS] [--json] [--diff] [--styles] [--trim] [--scrollback N] [--client ID]";
+
     fn handleWait(self: *Session, fd: posix.fd_t, args: []const []const u8) !bool {
-        var w: Waiter = .{
-            .fd = fd,
-            .text = null,
-            .idle_ms = null,
-            .exit = false,
-            .render = .{},
-            .started = nowMs(),
-            .deadline = 0,
-        };
+        var w: Waiter = .{ .fd = fd, .started = nowMs() };
+        errdefer self.freeWaiter(w);
         var timeout: i64 = default_wait_timeout_ms;
-        var text: ?[]const u8 = null;
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
             const a = args[i];
-            const has_val = i + 1 < args.len;
-            if (std.mem.eql(u8, a, "--text") and has_val) {
-                i += 1;
-                text = args[i];
-            } else if (std.mem.eql(u8, a, "--idle") and has_val) {
-                i += 1;
-                w.idle_ms = std.fmt.parseInt(i64, args[i], 10) catch return self.usage(fd, "wait: --idle needs milliseconds");
-            } else if (std.mem.eql(u8, a, "--timeout") and has_val) {
-                i += 1;
-                timeout = std.fmt.parseInt(i64, args[i], 10) catch return self.usage(fd, "wait: --timeout needs milliseconds");
-            } else if (std.mem.eql(u8, a, "--exit")) {
+            const val: ?[]const u8 = if (i + 1 < args.len) args[i + 1] else null;
+            if (std.mem.eql(u8, a, "--exit")) {
                 w.exit = true;
             } else if (std.mem.eql(u8, a, "--json")) {
                 w.render.json = true;
@@ -619,17 +680,50 @@ const Session = struct {
                 w.render.styles = true;
             } else if (std.mem.eql(u8, a, "--trim")) {
                 w.render.trim = true;
-            } else if (std.mem.eql(u8, a, "--scrollback") and has_val) {
+            } else if (val) |v| {
                 i += 1;
-                w.render.scrollback = std.fmt.parseInt(usize, args[i], 10) catch return self.usage(fd, "wait: --scrollback needs a number");
+                if (std.mem.eql(u8, a, "--text")) {
+                    if (w.text != null) return self.waitError(w, "wait: --text given twice");
+                    w.text = try self.gpa.dupe(u8, v);
+                } else if (std.mem.eql(u8, a, "--text-gone")) {
+                    if (w.gone != null) return self.waitError(w, "wait: --text-gone given twice");
+                    w.gone = try self.gpa.dupe(u8, v);
+                } else if (std.mem.eql(u8, a, "--regex")) {
+                    if (w.regex != null) return self.waitError(w, "wait: --regex given twice");
+                    var diag: regex.Diagnostic = .{};
+                    var re = regex.Regex.compile(self.gpa, v, &diag) catch |err| switch (err) {
+                        error.BadRegex => {
+                            var buf: [300]u8 = undefined;
+                            const text = std.fmt.bufPrint(&buf, "wait: bad --regex: {s}", .{diag.message()}) catch "wait: bad --regex";
+                            return self.waitError(w, text);
+                        },
+                        else => |e| return e,
+                    };
+                    errdefer re.deinit();
+                    const ptr = try self.gpa.create(regex.Regex);
+                    ptr.* = re;
+                    w.regex = ptr;
+                } else if (std.mem.eql(u8, a, "--idle")) {
+                    w.idle_ms = std.fmt.parseInt(i64, v, 10) catch return self.waitError(w, "wait: --idle needs milliseconds");
+                } else if (std.mem.eql(u8, a, "--timeout")) {
+                    timeout = std.fmt.parseInt(i64, v, 10) catch return self.waitError(w, "wait: --timeout needs milliseconds");
+                } else if (std.mem.eql(u8, a, "--scrollback")) {
+                    w.render.scrollback = std.fmt.parseInt(usize, v, 10) catch return self.waitError(w, "wait: --scrollback needs a number");
+                } else if (std.mem.eql(u8, a, "--client")) {
+                    if (!validClientId(v)) return self.waitError(w, "wait: --client needs an id of 1 to 64 bytes");
+                    if (w.client) |c| self.gpa.free(c);
+                    w.client = try self.gpa.dupe(u8, v);
+                } else {
+                    return self.waitError(w, wait_usage);
+                }
             } else {
-                return self.usage(fd, "usage: wait (--text STR | --idle MS | --exit) [--timeout MS] [--json] [--diff] [--styles] [--trim] [--scrollback N]");
+                return self.waitError(w, wait_usage);
             }
         }
-        if (text == null and w.idle_ms == null and !w.exit) {
-            return self.usage(fd, "wait: need --text, --idle or --exit");
+        if (w.text == null and w.regex == null and w.gone == null and w.idle_ms == null and !w.exit) {
+            return self.waitError(w, "wait: need --text, --regex, --text-gone, --idle or --exit");
         }
-        if (text) |t| w.text = try self.gpa.dupe(u8, t);
+        if (w.client) |c| w.render.client = c;
         w.deadline = w.started + timeout;
         try self.waiters.append(self.gpa, w);
         // Checked on the next loop iteration, so an already-true condition
@@ -637,31 +731,66 @@ const Session = struct {
         return true;
     }
 
+    fn waitError(self: *Session, w: Waiter, msg: []const u8) bool {
+        self.freeWaiter(w);
+        return self.usage(w.fd, msg);
+    }
+
+    fn freeWaiter(self: *Session, w: Waiter) void {
+        if (w.text) |t| self.gpa.free(t);
+        if (w.gone) |t| self.gpa.free(t);
+        if (w.client) |c| self.gpa.free(c);
+        if (w.regex) |re| {
+            re.deinit();
+            self.gpa.destroy(re);
+        }
+    }
+
     fn dropWaiter(self: *Session, i: usize) void {
         const w = self.waiters.orderedRemove(i);
         posix.close(w.fd);
-        if (w.text) |t| self.gpa.free(t);
+        self.freeWaiter(w);
     }
 
     fn checkWaiters(self: *Session) !void {
+        if (self.waiters.items.len == 0) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const lines = try self.logicalLines(arena_state.allocator());
+
         const now = nowMs();
         var i: usize = 0;
         while (i < self.waiters.items.len) {
             const w = self.waiters.items[i];
-            const outcome = try self.evaluate(w, now) orelse {
+            const outcome = try self.evaluate(w, lines, now) orelse {
                 i += 1;
                 continue;
             };
             try self.respondScreen(w.fd, if (outcome.satisfied) .ok else .timeout, withWait(w.render, outcome));
             self.dropWaiter(i);
+            self.last_activity_ms = now;
         }
     }
 
-    fn evaluate(self: *Session, w: Waiter, now: i64) !?WaitOutcome {
+    fn evaluate(self: *Session, w: Waiter, lines: []const []const u8, now: i64) !?WaitOutcome {
         var out: WaitOutcome = .{ .condition = waitCondition(w), .satisfied = true, .reason = "", .elapsed_ms = now - w.started };
         if (w.text) |t| {
-            if (try self.screenContains(t)) {
+            if (containsText(lines, t)) {
                 out.reason = "text";
+                return out;
+            }
+        }
+        if (w.regex) |re| {
+            for (lines) |l| {
+                if (try re.search(self.gpa, std.mem.trimRight(u8, l, " "))) {
+                    out.reason = "regex";
+                    return out;
+                }
+            }
+        }
+        if (w.gone) |t| {
+            if (!containsText(lines, t)) {
+                out.reason = "gone";
                 return out;
             }
         }
@@ -676,9 +805,9 @@ const Session = struct {
             }
         }
         out.satisfied = false;
-        // Text can no longer appear once the program is gone and its output
-        // has been drained.
-        if (w.text != null and w.idle_ms == null and !w.exit and self.child_exited) {
+        // The screen can no longer change once the program is gone and its
+        // output has been drained.
+        if (w.screenOnly() and self.child_exited) {
             out.reason = "exited";
             return out;
         }
@@ -689,15 +818,19 @@ const Session = struct {
         return null;
     }
 
-    fn screenContains(self: *Session, needle: []const u8) !bool {
-        var line: std.ArrayList(u8) = .empty;
-        defer line.deinit(self.gpa);
+    /// The screen as logical lines: rows joined where the text wrapped at
+    /// the right edge, with trailing blanks kept.
+    fn logicalLines(self: *Session, arena: Allocator) ![]const []const u8 {
+        var lines: std.ArrayList([]const u8) = .empty;
+        var cur: std.ArrayList(u8) = .empty;
         for (0..self.term.rows) |r| {
-            line.clearRetainingCapacity();
-            try self.term.appendRowTextPadded(r, &line, self.gpa);
-            if (std.mem.indexOf(u8, line.items, needle) != null) return true;
+            try self.term.appendRowTextPadded(r, &cur, arena);
+            if (!self.term.rowWrapped(r) or r + 1 == self.term.rows) {
+                try lines.append(arena, cur.items);
+                cur = .empty;
+            }
         }
-        return false;
+        return lines.items;
     }
 
     // ------------------------------------------------------------------
@@ -711,6 +844,8 @@ const Session = struct {
         styles: bool = false,
         /// Text output only: leave out empty rows at the bottom.
         trim: bool = false,
+        /// Whose diff marker to compare against and update.
+        client: []const u8 = "",
         wait: ?WaitOutcome = null,
     };
 
@@ -761,11 +896,14 @@ const Session = struct {
         }
 
         var changed: std.ArrayList(usize) = .empty;
-        const same_shape = self.snapshot.items.len == lines.len;
+        const marker = try self.markerFor(opts.client);
+        const same_shape = marker.rows.items.len == lines.len;
         for (signatures, 0..) |sig, r| {
-            if (!same_shape or !std.mem.eql(u8, self.snapshot.items[r], sig)) try changed.append(arena, r);
+            if (!same_shape or !std.mem.eql(u8, marker.rows.items[r], sig)) try changed.append(arena, r);
         }
-        try self.updateSnapshot(signatures);
+        for (marker.rows.items) |l| self.gpa.free(l);
+        marker.rows.clearRetainingCapacity();
+        for (signatures) |sig| try marker.rows.append(self.gpa, try self.gpa.dupe(u8, sig));
 
         const sb = &t.scrollback;
         const sb_count = @min(opts.scrollback, sb.len);
@@ -902,10 +1040,33 @@ const Session = struct {
         try jw.write(self.exit_signal);
     }
 
-    fn updateSnapshot(self: *Session, lines: []const []const u8) !void {
-        for (self.snapshot.items) |l| self.gpa.free(l);
-        self.snapshot.clearRetainingCapacity();
-        for (lines) |l| try self.snapshot.append(self.gpa, try self.gpa.dupe(u8, l));
+    /// The diff marker of client `id`, created on first use.
+    fn markerFor(self: *Session, id: []const u8) !*Marker {
+        const now = nowMs();
+        if (self.markers.getPtr(id)) |m| {
+            m.used_ms = now;
+            return m;
+        }
+        if (self.markers.count() >= max_markers) {
+            var oldest: ?[]const u8 = null;
+            var oldest_ms: i64 = std.math.maxInt(i64);
+            var it = self.markers.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.used_ms < oldest_ms) {
+                    oldest_ms = e.value_ptr.used_ms;
+                    oldest = e.key_ptr.*;
+                }
+            }
+            if (self.markers.fetchRemove(oldest.?)) |kv| {
+                var m = kv.value;
+                m.deinit(self.gpa);
+                self.gpa.free(kv.key);
+            }
+        }
+        const key = try self.gpa.dupe(u8, id);
+        errdefer self.gpa.free(key);
+        try self.markers.put(self.gpa, key, .{ .used_ms = now });
+        return self.markers.getPtr(key).?;
     }
 
     fn writeInfo(self: *Session, w: *std.Io.Writer) !void {
@@ -929,6 +1090,8 @@ const Session = struct {
         try jw.write(std.c.getpid());
         try jw.objectField("started_at_ms");
         try jw.write(self.started_ms);
+        try jw.objectField("ttl_s");
+        try jw.write(self.cfg.ttl_s);
         try jw.endObject();
     }
 };
@@ -1011,6 +1174,17 @@ fn writeRunsJson(jw: *std.json.Stringify, runs: []const Session.Run) !void {
         try jw.endObject();
     }
     try jw.endArray();
+}
+
+fn containsText(lines: []const []const u8, needle: []const u8) bool {
+    for (lines) |l| {
+        if (std.mem.indexOf(u8, l, needle) != null) return true;
+    }
+    return false;
+}
+
+fn validClientId(id: []const u8) bool {
+    return id.len > 0 and id.len <= max_client_id;
 }
 
 fn respond(fd: posix.fd_t, status: Status, body: []const u8) void {

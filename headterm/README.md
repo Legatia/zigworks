@@ -52,10 +52,10 @@ $ headterm kill ed
 
 | Command | Description |
 | --- | --- |
-| `headterm start <name> [--cols 120] [--rows 40] [--cwd DIR] [--log FILE] -- <cmd> [args...]` | Starts a session server that owns the PTY. Returns once the program has been exec'd; exec and chdir failures are reported here. `--log` appends the raw PTY output to FILE. |
-| `headterm screen <name> [--json] [--diff] [--styles] [--trim] [--scrollback N]` | Prints the visible screen. |
+| `headterm start <name> [--cols 120] [--rows 40] [--cwd DIR] [--log FILE] [--ttl S] -- <cmd> [args...]` | Starts a session server that owns the PTY. Returns once the program has been exec'd; exec and chdir failures are reported here. `--log` appends the raw PTY output to FILE. `--ttl` ends the session after S idle seconds (see [Sessions](#sessions)). |
+| `headterm screen <name> [--json] [--diff] [--styles] [--trim] [--scrollback N] [--client ID]` | Prints the visible screen. |
 | `headterm send <name> [--literal] [--paste] [--esc-delay MS] [--] <arg>...` | Sends keys and text. |
-| `headterm wait <name> (--text STR \| --idle MS \| --exit) [--timeout MS] [--json] [--diff] [--styles] [--trim] [--scrollback N]` | Blocks until a condition holds, then prints the screen. |
+| `headterm wait <name> (--text STR \| --regex RE \| --text-gone STR \| --idle MS \| --exit)... [--timeout MS] [--json] [--diff] [--styles] [--trim] [--scrollback N] [--client ID]` | Blocks until a condition holds, then prints the screen. |
 | `headterm resize <name> <cols> <rows>` | Resizes the PTY and the screen and sends SIGWINCH. |
 | `headterm kill <name>` | Sends SIGHUP, then SIGTERM, then SIGKILL (500 ms apart) to the program's process group and stops the session server. |
 | `headterm list [--json]` | Lists sessions. Removes sockets left behind by crashed servers. |
@@ -75,7 +75,15 @@ is created with mode 0700, and headterm refuses to use one owned by another
 user.
 
 The session server keeps running after the program exits, so the final screen
-and exit status stay readable. `kill` ends it.
+and exit status stay readable. `kill` ends it, and so does the TTL:
+
+- `start --ttl S` ends the session (as `kill` does) after S seconds with no
+  client request and no program output. A pending `wait` keeps it alive.
+  `--ttl 0`, the CLI default, means no TTL.
+- Sessions started through MCP get a TTL of one hour by default (`ttl_s`), so
+  abandoned sessions don't pile up.
+- A program that keeps printing (`top`) never goes idle and so never expires.
+- `list --json` shows each session's `ttl_s`.
 
 The program gets `TERM=xterm-256color` and the caller's environment, minus
 `COLUMNS` and `LINES`.
@@ -88,6 +96,16 @@ case-insensitive:
 `<Enter>` `<Tab>` `<Esc>` `<Backspace>` `<Space>` `<Up>` `<Down>` `<Left>`
 `<Right>` `<Home>` `<End>` `<PageUp>` `<PageDown>` `<Insert>` `<Delete>`
 `<F1>`..`<F12>` `<lt>` (a literal `<`)
+
+Mouse events, with 0-based screen coordinates like the cursor position:
+`<Click row,col>` `<RightClick row,col>` `<MiddleClick row,col>`
+`<ScrollUp row,col>` `<ScrollDown row,col>`. A click is a press and a
+release. They are only accepted once the program has turned on mouse
+reporting (modes 9, 1000, 1002 or 1003). Otherwise `send` fails with "the
+program has not enabled mouse reporting" and sends nothing. Events use the
+SGR encoding (`ESC[<b;x;yM`) when the program enabled mode 1006, and the
+legacy X10/X11 encoding otherwise, which cannot express columns or rows past
+223.
 
 Modifiers: `<C-x>` Ctrl, `<M-x>` or `<A-x>` Meta/Alt (ESC prefix), `<S-x>`
 Shift. They combine (`<M-C-x>`) and apply to named keys as well (`<C-Left>`
@@ -113,17 +131,48 @@ the effect.
 
 ### wait
 
-- `--text STR`: STR appears on any visible row. Rows are matched with trailing
-  blanks kept, so `--text '>>> '` matches a Python prompt. The current screen
-  counts, so text that is already shown satisfies the wait at once.
+- `--text STR`: STR is on screen. Text is matched with trailing blanks kept,
+  so `--text '>>> '` matches a Python prompt. The current screen counts, so
+  text that is already shown satisfies the wait at once.
+- `--regex RE`: a line on screen matches RE, with the line's trailing spaces
+  removed. See [Regex syntax](#regex-syntax).
+- `--text-gone STR`: STR is no longer on screen, e.g. a spinner or
+  "Loading…". It is met at once if STR is not there, so wait for the text
+  first if it may not have appeared yet.
 - `--idle MS`: no output for MS milliseconds, counted from when the wait began
   or from the last output, whichever is later.
 - `--exit`: the program has exited.
 - `--timeout MS`: default 10000.
 
-When several conditions are given, the first one met ends the wait. A `--text`
-wait on a program that has already exited fails at once (reason `exited`)
-rather than running out the timeout.
+Text and regex conditions see the screen as logical lines. Rows that the
+terminal wrapped because the text ran past the right edge are joined into one
+line, so a long path or URL split across rows still matches. Rows that end
+with a real line break are separate lines.
+
+When several conditions are given, the first one met ends the wait. If the
+program has already exited and only `--text`, `--regex` or `--text-gone`
+conditions were given, the wait fails at once (reason `exited`) instead of
+running out the timeout, since the screen can no longer change.
+
+#### Regex syntax
+
+A small engine of its own (`src/regex.zig`). It runs as an NFA, so matching
+takes time linear in the screen size and no pattern can make it hang.
+
+| Syntax | Meaning |
+| --- | --- |
+| `.` | any character except newline |
+| `[abc]` `[a-z]` `[^...]` | character class, range, negated class |
+| `\d` `\w` `\s`, `\D` `\W` `\S` | digit, word character, whitespace, and their complements (the complements not inside `[...]`) |
+| `^` `$` | start and end of the line |
+| `a\|b`, `(...)`, `(?:...)` | alternation and grouping |
+| `*` `+` `?` `{n}` `{n,}` `{n,m}` | repetition (counts up to 1000; a trailing `?` is accepted) |
+| `\.` `\(` `\t` ... | escaped literal |
+| `(?i)` at the start | ASCII letters match either case |
+
+There are no backreferences, lookaround or `\b`. A bad pattern is an error
+(exit code 2) that says what is wrong and where, e.g. `missing ')' at offset
+4`.
 
 If the session is killed during a wait, the waiting client gets the final
 screen with reason `killed` and exits with code 1.
@@ -133,8 +182,13 @@ screen with reason `killed` and exits with code 1.
 `--diff` prints only rows that differ from the screen headterm last returned
 for this session, from either `screen` or `wait`. A row counts as changed
 when its text or its styles changed, so a menu selection that moves shows up
-even though no text changed. There is one marker per session, shared by all
-clients. After a resize, every row counts as changed.
+even though no text changed. After a resize, every row counts as changed.
+
+Each client has its own marker. Pass `--client ID` (1 to 64 bytes) to
+`screen` and `wait` to use the marker named ID; without it, the shared
+default marker is used. Each MCP server process uses its own id (`mcp-<pid>`),
+so two agents watching one session don't take each other's changes. A
+session keeps up to 64 markers and drops the least recently used one.
 
 ### Styles
 
@@ -228,7 +282,7 @@ One object followed by a newline. Fields appear in this order; fields marked
 | `styles` | Only with `--styles`, and not with `--diff`: one array of runs per row, parallel to `lines`. A run is `{start, end, text, attrs, fg, bg}` as described in [Styles](#styles); `fg` and `bg` are `null` for the default color. |
 | `changed` | Only with `--diff`: rows that changed, with their 0-based row number. With `--styles`, each entry also has `styles`, that row's runs. |
 | `scrollback` | Only with `--scrollback N` (N > 0): up to N lines, oldest first. |
-| `wait` | Only from `wait`. `condition` is the first condition given (`text`, `idle` or `exit`). `reason` is `text`, `idle` or `exit` when `satisfied` is true, and `timeout`, `exited` or `killed` when it is false. |
+| `wait` | Only from `wait`. `condition` is the first condition given, in the order `text`, `regex`, `gone`, `idle`, `exit`. `reason` is the condition that was met (`text`, `regex`, `gone`, `idle` or `exit`) when `satisfied` is true, and `timeout`, `exited` or `killed` when it is false. |
 
 ### JSON (`list --json`)
 
@@ -237,7 +291,7 @@ An array with one object per session:
 ```json
 [{"name":"ed","command":["vi","notes.txt"],"cols":60,"rows":10,"title":"","alt_screen":true,
   "pid":18964,"exited":false,"exit_code":null,"exit_signal":null,
-  "server_pid":18963,"started_at_ms":1794304777917}]
+  "server_pid":18963,"started_at_ms":1794304777917,"ttl_s":null}]
 ```
 
 ## MCP server
@@ -262,16 +316,17 @@ running after the MCP server exits until they are killed.
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
-| `headterm_start` | `name`, `command` (string array), `cols?`, `rows?`, `cwd?`, `then_wait?`, `styles?` | `started <name> pid=N` and the first screen, once output has been idle for 300 ms (at most 5 s) or `then_wait` is met |
+| `headterm_start` | `name`, `command` (string array), `cols?`, `rows?`, `cwd?`, `ttl_s?` (default 3600, 0 = none), `then_wait?`, `styles?` | `started <name> pid=N` and the first screen, once output has been idle for 300 ms (at most 5 s) or `then_wait` is met |
 | `headterm_send` | `name`, `keys` (string array, same key syntax as `headterm send`), `literal?`, `paste?`, `esc_delay_ms?`, `then_wait?`, `styles?` | the screen after the wait, or `sent` without `then_wait` |
 | `headterm_screen` | `name`, `diff?`, `scrollback?`, `styles?` | the screen |
-| `headterm_wait` | `name`, `text?`, `idle_ms?`, `exit?`, `timeout_ms?`, `styles?` | the screen |
+| `headterm_wait` | `name`, `text?`, `regex?`, `gone?`, `idle_ms?`, `exit?`, `timeout_ms?`, `styles?` | the screen |
 | `headterm_resize` | `name`, `cols`, `rows` | confirmation |
 | `headterm_kill` | `name` | confirmation |
 | `headterm_list` | none | one line per session |
 
-`then_wait` takes the same fields as `headterm_wait` (`text`, `idle_ms`,
-`exit`, `timeout_ms`); an empty object means `{"idle_ms": 300}`. Use
+`then_wait` takes the same fields as `headterm_wait` (`text`, `regex`, `gone`,
+`idle_ms`, `exit`, `timeout_ms`); an empty object means `{"idle_ms": 300}`.
+A bad `regex` is rejected with `-32602` before anything is sent. Use
 `headterm_send` with `then_wait` to act and see the result in one call.
 `idle_ms` and `timeout_ms` are capped at 60000.
 
@@ -341,7 +396,9 @@ Supported:
 | --- | --- |
 | `src/main.zig` | CLI |
 | `src/vt.zig` | Parser and screen model: no I/O, unit-tested |
-| `src/keys.zig` | Key names to bytes |
+| `src/keys.zig` | Key names and mouse events to bytes |
+| `src/regex.zig` | Regex engine for `wait --regex` |
+| `src/session_test.zig` | Tests against real session servers (hang-ups, TTL, diff markers) |
 | `src/pty.zig` | PTY allocation and child spawn |
 | `src/server.zig` | Session server: event loop, requests, rendering |
 | `src/client.zig` | Session paths, start, list and socket client |
@@ -355,12 +412,13 @@ arguments, and keeps the connection open. The server answers with
 
 ## Limitations
 
-- No mouse input. Underline color and the underline kind (double, curly) are
-  parsed but not reported.
+- Mouse input is clicks and the scroll wheel only: no drags, motion or
+  modifier keys, and no UTF-8 (1005) or urxvt (1015) mouse encodings.
+- Underline color and the underline kind (double, curly) are parsed but not
+  reported.
 - No reflow on resize.
 - Combining characters are dropped, and character widths come from a built-in
   table that can disagree with the program's `wcwidth`.
-- One diff marker per session, shared by all clients.
 
 ## License
 
