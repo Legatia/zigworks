@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>zigworks</title>
+<meta name="description" content="Open-source tools for coding agents, written in Zig. trigrep searches large codebases through an index and stays current as files change; headterm lets an agent use programs that need a real terminal. CLI and MCP servers, MIT licensed.">
+<link rel="canonical" href="https://zig.legatia.solutions/">
+<meta name="theme-color" content="#f5f6f8">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://zig.legatia.solutions/">
+<meta property="og:title" content="zigworks">
+<meta property="og:description" content="trigrep and headterm: open-source tools for coding agents, written in Zig.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/schibsted-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="styles.css">
+<script defer src="copy.js"></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <a class="mark" href="./" aria-label="zigworks home">zigworks</a>
+  <nav aria-label="Main">
+    <a href="#trigrep">trigrep</a>
+    <a href="#headterm">headterm</a>
+    <a href="#install">Install</a>
+    <a href="https://github.com/Legatia/zigworks">GitHub</a>
+  </nav>
+</header>
+
+<main id="main">
+  <section class="hero">
+    <h1>Small, fast tools that coding agents run on, written in&nbsp;Zig.</h1>
+    <p class="lede">Two open-source command-line tools, each also an MCP server. <a href="#trigrep">trigrep</a> searches large codebases in milliseconds and never misses a file you just saved. <a href="#headterm">headterm</a> lets an agent use programs that need a real terminal: editors, installers, REPLs, menus.</p>
+    <p class="actions">
+      <a class="button primary" href="https://github.com/Legatia/zigworks/releases">Download a release</a>
+      <a class="button" href="https://github.com/Legatia/zigworks">View the source</a>
+    </p>
+
+    <figure class="term hero-term">
+      <figcaption>What an agent sees: a search in the Linux kernel, then an installer's menu</figcaption>
+<pre><span class="prompt">$</span> trigrep -w spin_lock_irqsave kernel/sched
+kernel/sched/core.c:9404:	spin_lock_irqsave(&amp;task_group_lock, flags);
+kernel/sched/core.c:9448:	spin_lock_irqsave(&amp;task_group_lock, flags);
+kernel/sched/fair.c:4110:		spin_lock_irqsave(&amp;grp-&gt;lock, flags);
+kernel/sched/wait.c:24:	spin_lock_irqsave(&amp;wq_head-&gt;lock, flags);
+<span class="dim">… 12 lines in 3 files; total 3.6 ms</span>
+
+<span class="prompt">$</span> headterm wait menu --text warning --styles
+Install which toolchain?
+
+  stable 0.15.1
+<span class="sel">  nightly 0.16.0-dev  </span>
+  skip for now
+
+<span class="err">1 warning</span>: PATH not set
+<span class="dim">row 3: [0-22 inverse "  nightly 0.16.0-dev"]
+row 6: [0-9 bold fg=red "1 warning"]</span></pre>
+    </figure>
+  </section>
+
+  <section id="trigrep" class="tool">
+    <h2>trigrep</h2>
+    <p>Code search with an index, for repositories too big to grep on every question. Its output is the same as ripgrep's, but a search only reads the files that can match. A file watcher keeps the index current, so edits made a moment ago are always included.</p>
+
+    <figure class="data">
+      <figcaption>Searching the Linux kernel: 97,000 files, 1.7&nbsp;GB. Apple Silicon, 10 cores, median of 5 runs, with <code>trigrep watch</code> running. Results are identical to ripgrep&nbsp;15.2.</figcaption>
+      <div class="scroll">
+      <table>
+        <thead><tr><th scope="col">Search</th><th scope="col" class="num">ripgrep</th><th scope="col" class="num">trigrep</th></tr></thead>
+        <tbody>
+          <tr><td><code>spin_lock_irqsave</code></td><td class="num">1,432&nbsp;ms</td><td class="num win">45&nbsp;ms</td></tr>
+          <tr><td><code>EXPORT_SYMBOL_GPL\(kmalloc</code></td><td class="num">1,434&nbsp;ms</td><td class="num win">12&nbsp;ms</td></tr>
+          <tr><td><code>zzzqqqxxx</code> (no match)</td><td class="num">1,406&nbsp;ms</td><td class="num win">12&nbsp;ms</td></tr>
+          <tr><td><code>^static int __init \w+_init\(void\)</code></td><td class="num">1,464&nbsp;ms</td><td class="num win">55&nbsp;ms</td></tr>
+          <tr><td><code>TODO|FIXME|XXX</code></td><td class="num">1,388&nbsp;ms</td><td class="num win">160&nbsp;ms</td></tr>
+          <tr><td><code>struct \w+_ops \w+ = \{</code></td><td class="num">1,625&nbsp;ms</td><td class="num win">135&nbsp;ms</td></tr>
+        </tbody>
+      </table>
+      </div>
+    </figure>
+    <p class="note">Patterns with no literal text of three or more characters, such as <code>\d{4}-\d{2}-\d{2}</code>, can’t use the index and scan every file. There trigrep runs at about ripgrep’s speed.</p>
+
+    <ul class="facts">
+      <li>ripgrep’s flags and output: <code>-i -w -F -o -l -c</code>, <code>-A/-B/-C</code>, <code>-t rust</code>, <code>-g '*.ts'</code>, <code>--json</code>.</li>
+      <li>Unicode-aware regex: <code>\w</code>, <code>\b</code>, <code>[α-ω]</code> and case-insensitive non-English text.</li>
+      <li>After a branch switch, changed files are folded into the index in milliseconds, without a full rebuild.</li>
+      <li>MCP tools: <code>trigrep_search</code>, <code>trigrep_index</code>, <code>trigrep_status</code>.</li>
+    </ul>
+  </section>
+
+  <section id="headterm" class="tool">
+    <h2>headterm</h2>
+    <p>A terminal for agents. It runs a program in a pseudo-terminal and returns the screen as text, the rows that changed since the agent last looked, and which text is highlighted. The agent sends keys and waits for text, a regular expression, quiet output, or the program to exit.</p>
+
+    <figure class="term">
+      <figcaption>Driving the Python REPL from the command line</figcaption>
+<pre><span class="prompt">$</span> headterm start py --cols 60 --rows 6 -- python3 -q
+started py pid=91054
+<span class="prompt">$</span> headterm send py 'print(2**10)' '&lt;Enter&gt;'
+<span class="prompt">$</span> headterm wait py --text 1024 --trim
+&gt;&gt;&gt; print(2**10)
+1024
+&gt;&gt;&gt;
+<span class="dim">[headterm] py 60x6 cursor=2,4 running wait=ok(text) waited=0ms</span>
+<span class="prompt">$</span> headterm kill py</pre>
+    </figure>
+
+    <ul class="facts">
+      <li>Tested with vim, less, top, Python, curses menus and <code>git add -p</code>.</li>
+      <li>Keys, mouse clicks and drags, bracketed paste.</li>
+      <li>Sessions can be recorded as asciicast files and replayed with <code>asciinema play</code>.</li>
+      <li>MCP tools for start, send (and wait in the same call), screen, wait, resize, list and kill. Idle sessions close after an hour.</li>
+    </ul>
+  </section>
+
+  <section id="install" class="install">
+    <h2>Install</h2>
+    <p>Download a binary for Linux (x86_64 or arm64, static) or macOS (Apple Silicon) from <a href="https://github.com/Legatia/zigworks/releases">the releases page</a>, put it on your <code>PATH</code>, and add it to Claude Code:</p>
+    <div class="cmd">
+      <pre><code id="cmd-trigrep">claude mcp add --scope user trigrep -- trigrep mcp</code></pre>
+      <button type="button" class="copy" data-copy="cmd-trigrep">Copy</button>
+    </div>
+    <div class="cmd">
+      <pre><code id="cmd-headterm">claude mcp add --scope user headterm -- headterm mcp</code></pre>
+      <button type="button" class="copy" data-copy="cmd-headterm">Copy</button>
+    </div>
+    <p>Or build from source with Zig 0.15.1:</p>
+    <div class="cmd">
+      <pre><code id="cmd-build">git clone https://github.com/Legatia/zigworks
+cd zigworks/trigrep &amp;&amp; zig build -Doptimize=ReleaseFast</code></pre>
+      <button type="button" class="copy" data-copy="cmd-build">Copy</button>
+    </div>
+  </section>
+
+  <section class="built">
+    <h2>How they’re built</h2>
+    <dl>
+      <div><dt>Dependencies</dt><dd>The Zig standard library and libc. Nothing else to install or audit.</dd></div>
+      <div><dt>Size</dt><dd>Single static binaries, about 500 to 700&nbsp;KB.</dd></div>
+      <div><dt>Testing</dt><dd>Every commit is tested on Linux and macOS. trigrep’s output is checked line by line against ripgrep on the Linux kernel.</dd></div>
+      <div><dt>License</dt><dd>MIT. Source, issues and releases are on <a href="https://github.com/Legatia/zigworks">GitHub</a>.</dd></div>
+    </dl>
+  </section>
+</main>
+
+<footer class="foot">
+  <p>Made by <a href="https://legatia.solutions">Legatia</a>, a one-person software studio in Poland.</p>
+</footer>
+</body>
+</html>

@@ -11,6 +11,8 @@ Open-source tools written in Zig, mostly infrastructure for coding agents. Each 
 
 Download a binary for Linux (x86_64, arm64) or macOS (Apple Silicon) from [Releases](https://github.com/Legatia/zigworks/releases), or build from source below. Linux binaries are static and run on any distribution.
 
+`site/` is the project page at https://zig.legatia.solutions (static HTML, no build step).
+
 ## Building
 
 Zig 0.15.1:
