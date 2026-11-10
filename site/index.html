@@ -11,6 +11,10 @@
 <meta property="og:url" content="https://zig.legatia.solutions/">
 <meta property="og:title" content="zigworks">
 <meta property="og:description" content="trigrep and headterm: open-source tools for coding agents, written in Zig.">
+<meta property="og:image" content="https://zig.legatia.solutions/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preload" href="fonts/schibsted-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="styles.css">
@@ -32,6 +36,7 @@
 
   <section class="hero frame" id="main">
     <div class="hero-copy">
+      <a class="chip" href="https://github.com/Legatia/zigworks/releases"><span class="chip-dot" aria-hidden="true"></span>trigrep 0.2.1 and headterm 0.2.0 released</a>
       <h1>Small, fast tools that coding agents run on, written in&nbsp;Zig.</h1>
       <p class="lede">trigrep searches huge codebases in milliseconds and never misses a file you just saved. headterm lets an agent drive programs that need a real terminal. Both are command-line tools and MCP servers.</p>
       <div class="quick" data-tabs>
@@ -118,6 +123,39 @@
       </div>
       <a class="more" href="#headterm">How headterm works</a>
     </article>
+  </section>
+
+  <section class="frame detail agent" id="agent">
+    <div class="detail-head">
+      <h2 class="plain">In your agent</h2>
+      <p>Register both as MCP servers and the agent picks them up as tools. This is a real Claude Code session: the prompt is shortened, the tool calls and results are verbatim.</p>
+    </div>
+    <div class="chat">
+      <div class="msg you"><span class="who-chip">You</span><p>Find <code>spin_lock_irqsave</code> in the kernel’s C files, then use Python to work out 2**10.</p></div>
+      <div class="call">
+        <div class="call-head"><span class="tool">trigrep_search</span><code>{"pattern": "spin_lock_irqsave", "glob": ["*.c"], "max_results": 3}</code></div>
+<pre>arch/alpha/kernel/irq_i8259.c:41:	raw_spin_lock_irqsave(&amp;i8259_irq_lock, flags);
+arch/alpha/kernel/irq_i8259.c:57:	raw_spin_lock_irqsave(&amp;i8259_irq_lock, flags);
+arch/alpha/kernel/irq_i8259.c:68:	raw_spin_lock_irqsave(&amp;i8259_irq_lock, flags);
+<span class="dim">[stopped at 3 lines; narrow the pattern, add a glob or path, or raise max_results]</span></pre>
+      </div>
+      <div class="call">
+        <div class="call-head"><span class="tool">headterm_start</span><code>{"name": "cc-test", "command": ["python3", "-q"], "then_wait": {"text": "&gt;&gt;&gt; "}}</code></div>
+<pre>started cc-test pid=38879
+&gt;&gt;&gt;
+<span class="dim">[headterm] cc-test 120x40 cursor=0,0 running wait=ok(text) waited=56ms</span></pre>
+      </div>
+      <div class="call">
+        <div class="call-head"><span class="tool">headterm_send</span><code>{"name": "cc-test", "keys": ["print(2**10)", "&lt;Enter&gt;"], "then_wait": {"text": "1024"}}</code></div>
+<pre>&gt;&gt;&gt; print(2**10)
+1024
+<span class="dim">[headterm] cc-test 120x40 cursor=2,0 running wait=ok(text) waited=4ms</span></pre>
+      </div>
+      <div class="call">
+        <div class="call-head"><span class="tool">headterm_kill</span><code>{"name": "cc-test"}</code></div>
+<pre>killed cc-test</pre>
+      </div>
+    </div>
   </section>
 
   <section id="trigrep" class="frame detail">
@@ -219,6 +257,31 @@
       </div>
     </div>
 
+    <div class="split try" data-demo>
+      <div>
+        <h3>Press keys the way an agent does</h3>
+        <p>An installer’s menu, as headterm reports it. The selected row comes back as an <code>inverse</code> run, so the agent knows which option it is on before it presses Enter.</p>
+        <div class="keys">
+          <button type="button" data-key="up">&lt;Up&gt;</button>
+          <button type="button" data-key="down">&lt;Down&gt;</button>
+          <button type="button" data-key="enter">&lt;Enter&gt;</button>
+          <button type="button" data-key="reset" class="reset">Start over</button>
+        </div>
+        <p class="aside">An example in headterm’s output format, running in your browser.</p>
+      </div>
+      <div class="window">
+        <div class="window-bar" data-demo-cmd>headterm screen menu --styles</div>
+<pre data-demo-screen>Install which toolchain?
+
+  stable 0.15.1
+<span class="sel">  nightly 0.16.0-dev    </span>
+  skip for now
+
+<span class="dim">row 3: [0-22 inverse "  nightly 0.16.0-dev"]
+[headterm] menu 34x8 cursor=3,0 running</span></pre>
+      </div>
+    </div>
+
     <ul class="grid">
       <li>
         <h3>Sees highlights</h3>
@@ -279,7 +342,27 @@ cd zigworks/trigrep &amp;&amp; zig build -Doptimize=ReleaseFast</code></pre><but
   </section>
 
   <footer class="frame foot">
-    <p>Made by <a href="https://legatia.solutions">Legatia</a>, a one-person software studio in Poland.</p>
+    <div class="foot-brand">
+      <a class="mark" href="./"><img src="favicon.svg" alt="" width="24" height="24">zigworks</a>
+      <p>Made by <a href="https://legatia.solutions">Legatia</a>, a one-person software studio in Poland.</p>
+    </div>
+    <nav class="foot-cols" aria-label="Footer">
+      <div>
+        <h2>Tools</h2>
+        <a href="https://github.com/Legatia/zigworks/tree/main/trigrep">trigrep</a>
+        <a href="https://github.com/Legatia/zigworks/tree/main/headterm">headterm</a>
+      </div>
+      <div>
+        <h2>Project</h2>
+        <a href="https://github.com/Legatia/zigworks/releases">Releases</a>
+        <a href="https://github.com/Legatia/zigworks">Source</a>
+        <a href="https://github.com/Legatia/zigworks/issues">Issues</a>
+      </div>
+      <div>
+        <h2>Legal</h2>
+        <a href="https://github.com/Legatia/zigworks/blob/main/trigrep/LICENSE">MIT license</a>
+      </div>
+    </nav>
   </footer>
 </div>
 </body>

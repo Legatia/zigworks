@@ -446,3 +446,132 @@ h1 {
   html { scroll-behavior: auto; }
   * { transition: none !important; }
 }
+
+/* ---- Round 2 additions ---- */
+
+/* Hero depth: a faint dot grid, and a glow behind the race. */
+.hero-band {
+  position: relative;
+  background-color: var(--ink);
+  background-image: radial-gradient(rgba(156, 195, 174, 0.13) 1px, transparent 1.2px);
+  background-size: 22px 22px;
+  background-position: 0 0;
+}
+.hero > * { min-width: 0; }
+.race { position: relative; }
+.race::before {
+  content: "";
+  position: absolute;
+  inset: -12% -8%;
+  z-index: -1;
+  background: radial-gradient(closest-side, rgba(255, 200, 61, 0.16), rgba(156, 195, 174, 0.08) 55%, transparent 75%);
+  pointer-events: none;
+}
+.hero { position: relative; z-index: 0; }
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 22px;
+  padding: 5px 12px 5px 10px;
+  border: 1px solid var(--rule-dark);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: #c3c8dc;
+  font-size: 14px;
+  text-decoration: none;
+}
+.dark a.chip { color: #c3c8dc; }
+.chip:hover { border-color: var(--sage); color: var(--paper); }
+.chip-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--yellow); box-shadow: 0 0 0 3px rgba(255, 200, 61, 0.18); }
+
+/* "In your agent": a tool-call transcript. */
+.detail-head h2.plain { font: 700 44px/1.05 var(--sans); letter-spacing: -0.03em; }
+
+.chat {
+  display: grid;
+  gap: 14px;
+  max-width: none;
+  padding: 22px;
+  border: 1px solid var(--rule);
+  border-radius: 16px;
+  background: var(--white);
+  box-shadow: 0 30px 60px -44px rgba(24, 34, 75, 0.45);
+}
+.msg.you { display: flex; gap: 12px; align-items: baseline; padding: 4px 2px 8px; }
+.msg.you p { margin: 0; font-size: 17px; }
+.who-chip {
+  flex: none;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 13px;
+  font-weight: 600;
+}
+.call { min-width: 0; border: 1px solid var(--rule); border-radius: 12px; overflow: hidden; }
+.call-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 10px 14px;
+  background: #f0f2f7;
+  border-bottom: 1px solid var(--rule);
+}
+.call-head code { font-size: 12.5px; color: var(--ink-soft); overflow-wrap: anywhere; }
+.tool {
+  font: 500 13.5px var(--mono);
+  color: var(--forest);
+}
+.tool::before { content: "⏺ "; color: var(--sage); }
+.call pre {
+  margin: 0;
+  padding: 12px 14px 14px;
+  overflow-x: auto;
+  background: var(--ink);
+  color: var(--term-text);
+  font: 13px/1.6 var(--mono);
+  tab-size: 2;
+}
+
+/* headterm: the keys demo */
+.try { margin-top: 8px; }
+.try h3 { font-size: 22px; margin-bottom: 10px; }
+.keys { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 14px; }
+.keys button {
+  padding: 8px 12px;
+  border: 1.5px solid var(--ink);
+  border-radius: 8px;
+  background: var(--white);
+  color: var(--ink);
+  font: 500 14px var(--mono);
+  cursor: pointer;
+  transition: transform 120ms var(--ease), background-color 120ms;
+}
+.keys button:hover { background: #eef0f5; }
+.keys button:active { transform: translateY(1px); }
+.keys .reset { border-color: var(--rule); font-family: var(--sans); font-weight: 600; }
+.no-js .keys, .no-js .try .aside { display: none; }
+[data-demo-screen] { min-height: 13.5em; }
+
+/* Footer */
+.foot {
+  display: grid;
+  gap: 28px;
+  padding-top: 40px;
+}
+@media (min-width: 820px) { .foot { grid-template-columns: 1fr auto; align-items: start; } }
+.foot-brand .mark { margin: 0 0 10px; }
+.foot-brand p { color: #a9b0cb; }
+.foot-cols { display: flex; flex-wrap: wrap; gap: 24px 56px; }
+.foot-cols div { display: grid; gap: 6px; align-content: start; }
+.foot-cols h2 { margin: 0 0 4px; font-size: 14px; font-weight: 600; color: var(--paper); }
+.foot-cols a { color: #a9b0cb; text-decoration: none; font-size: 15px; }
+.foot-cols a:hover { color: var(--paper); text-decoration: underline; }
+
+/* Grid and flex children shrink below their content (long commands scroll or
+   truncate inside them instead of widening the page). */
+.split > *, .tools > *, .install > *, .steps li { min-width: 0; }
+.dark .mark { color: var(--paper); }

@@ -104,3 +104,60 @@ if (race) {
   }, { threshold: 0.5 });
   seen.observe(race);
 }
+
+// headterm keys demo: an installer menu, reported the way headterm reports it.
+const demo = document.querySelector("[data-demo]");
+if (demo) {
+  const screen = demo.querySelector("[data-demo-screen]");
+  const cmd = demo.querySelector("[data-demo-cmd]");
+  const items = ["stable 0.15.1", "nightly 0.16.0-dev", "skip for now"];
+  const width = 22; // the menu draws each row padded to this width
+  let selected = 1;
+  let installed = null;
+
+  const span = (cls, text) => {
+    const s = document.createElement("span");
+    s.className = cls;
+    s.textContent = text;
+    return s;
+  };
+
+  function render() {
+    screen.textContent = "";
+    if (installed !== null) {
+      screen.append(`Install which toolchain?\n\nInstalling ${items[installed]}... done\n\n`);
+      screen.append(span("dim", `[headterm] menu 34x8 cursor=4,0 exited=0`));
+      return;
+    }
+    screen.append("Install which toolchain?\n\n");
+    items.forEach((item, i) => {
+      const row = `  ${item}`;
+      if (i === selected) {
+        screen.append(span("sel", row.padEnd(width)));
+        screen.append("\n");
+      } else {
+        screen.append(`${row}\n`);
+      }
+    });
+    const row = selected + 2;
+    screen.append("\n");
+    screen.append(span("dim", `row ${row}: [0-${width} inverse "  ${items[selected]}"]\n[headterm] menu 34x8 cursor=${row},0 running`));
+  }
+
+  demo.addEventListener("click", (e) => {
+    const key = e.target.closest("button[data-key]")?.dataset.key;
+    if (!key) return;
+    if (key === "reset") {
+      selected = 1;
+      installed = null;
+      cmd.textContent = "headterm screen menu --styles";
+    } else if (installed === null) {
+      if (key === "up") selected = Math.max(0, selected - 1);
+      if (key === "down") selected = Math.min(items.length - 1, selected + 1);
+      if (key === "enter") installed = selected;
+      const name = key === "enter" ? "<Enter>" : key === "up" ? "<Up>" : "<Down>";
+      cmd.textContent = `headterm send menu '${name}'; headterm screen menu --styles`;
+    }
+    render();
+  });
+}
