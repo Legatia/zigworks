@@ -1,0 +1,254 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const regex = @import("regex.zig");
+const query = @import("query.zig");
+const index = @import("index.zig");
+const walk = @import("walk.zig");
+const search = @import("search.zig");
+const engine = @import("engine.zig");
+const mcp = @import("mcp.zig");
+
+pub const version = "0.1.0";
+
+const usage =
+    \\trigrep: indexed code search
+    \\
+    \\Usage:
+    \\  trigrep [OPTIONS] PATTERN [PATH]   search; builds the index on first use
+    \\  trigrep index [PATH]               build or rebuild the index for PATH
+    \\  trigrep status [PATH]              show the index and how many files changed
+    \\
+    \\Search options:
+    \\  -i, --ignore-case          case-insensitive (ASCII)
+    \\  -F, --fixed-strings        treat PATTERN as a literal string
+    \\  -w, --word-regexp          match whole words only
+    \\  -l, --files-with-matches   print only the paths of matching files
+    \\  -c, --count                print path:count for matching files
+    \\  -m, --max-count N          stop after N matching lines per file
+    \\  -g, --glob GLOB            only files matching GLOB; !GLOB excludes (repeatable)
+    \\  -e, --regexp PATTERN       the pattern (for patterns starting with -)
+    \\      --hidden               include hidden files and directories
+    \\      --no-index             scan every file, don't use or build an index
+    \\      --trust-index          skip the freshness check (faster; misses edits)
+    \\  -j, --threads N            worker threads (default: CPU count)
+    \\      --stats                print timings and counts to stderr
+    \\  -h, --help                 show this help
+    \\  -V, --version              show the version
+    \\
+    \\Output is path:line:text. Exit status: 0 if something matched, 1 if not, 2 on error.
+    \\Indexes live in $TRIGREP_INDEX_DIR, $XDG_CACHE_HOME/trigrep or ~/.cache/trigrep.
+    \\
+;
+
+const Command = enum { search, index, status, mcp };
+
+const Args = struct {
+    command: Command = .search,
+    pattern: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    opts: regex.Options = .{},
+    mode: search.Mode = .lines,
+    max_count: ?usize = null,
+    globs: std.ArrayList([]const u8) = .empty,
+    hidden: bool = false,
+    no_index: bool = false,
+    trust_index: bool = false,
+    threads: ?usize = null,
+    stats: bool = false,
+};
+
+fn fail(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print("trigrep: " ++ fmt ++ "\n", args);
+    std.process.exit(2);
+}
+
+fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
+    var a = Args{};
+    var positionals: std.ArrayList([]const u8) = .empty;
+    var i: usize = 1;
+    var only_positional = false;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (only_positional or arg.len < 2 or arg[0] != '-') {
+            try positionals.append(arena, arg);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--")) {
+            only_positional = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--")) {
+            var name = arg[2..];
+            var inline_value: ?[]const u8 = null;
+            if (std.mem.indexOfScalar(u8, name, '=')) |eq| {
+                inline_value = name[eq + 1 ..];
+                name = name[0..eq];
+            }
+            const value = struct {
+                fn get(argv_: []const []const u8, i_: *usize, inline_: ?[]const u8, n: []const u8) []const u8 {
+                    if (inline_) |v| return v;
+                    i_.* += 1;
+                    if (i_.* >= argv_.len) fail("--{s} needs a value", .{n});
+                    return argv_[i_.*];
+                }
+            }.get;
+            if (std.mem.eql(u8, name, "ignore-case")) a.opts.ignore_case = true
+            else if (std.mem.eql(u8, name, "fixed-strings")) a.opts.fixed_string = true
+            else if (std.mem.eql(u8, name, "word-regexp")) a.opts.word = true
+            else if (std.mem.eql(u8, name, "files-with-matches")) a.mode = .files_with_matches
+            else if (std.mem.eql(u8, name, "count")) a.mode = .count
+            else if (std.mem.eql(u8, name, "max-count")) a.max_count = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --max-count", .{})
+            else if (std.mem.eql(u8, name, "glob")) try a.globs.append(arena, value(argv, &i, inline_value, name))
+            else if (std.mem.eql(u8, name, "regexp")) a.pattern = value(argv, &i, inline_value, name)
+            else if (std.mem.eql(u8, name, "hidden")) a.hidden = true
+            else if (std.mem.eql(u8, name, "no-index")) a.no_index = true
+            else if (std.mem.eql(u8, name, "trust-index")) a.trust_index = true
+            else if (std.mem.eql(u8, name, "threads")) a.threads = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --threads", .{})
+            else if (std.mem.eql(u8, name, "stats")) a.stats = true
+            else if (std.mem.eql(u8, name, "help")) {
+                std.fs.File.stdout().writeAll(usage) catch {};
+                std.process.exit(0);
+            } else if (std.mem.eql(u8, name, "version")) {
+                std.fs.File.stdout().writeAll("trigrep " ++ version ++ "\n") catch {};
+                std.process.exit(0);
+            }
+            // Accepted for ripgrep compatibility; output already looks like this.
+            else if (std.mem.eql(u8, name, "line-number") or std.mem.eql(u8, name, "no-heading") or
+                std.mem.eql(u8, name, "with-filename") or std.mem.eql(u8, name, "color") or
+                std.mem.eql(u8, name, "no-ignore-messages")) {}
+            else fail("unknown option --{s}", .{name});
+            continue;
+        }
+        // Short options, possibly bundled (-il). Value options take the rest or the next arg.
+        var k: usize = 1;
+        while (k < arg.len) : (k += 1) {
+            const c = arg[k];
+            const takes_value = c == 'm' or c == 'g' or c == 'e' or c == 'j';
+            var v: []const u8 = "";
+            if (takes_value) {
+                if (k + 1 < arg.len) {
+                    v = arg[k + 1 ..];
+                } else {
+                    i += 1;
+                    if (i >= argv.len) fail("-{c} needs a value", .{c});
+                    v = argv[i];
+                }
+            }
+            switch (c) {
+                'i' => a.opts.ignore_case = true,
+                'F' => a.opts.fixed_string = true,
+                'w' => a.opts.word = true,
+                'l' => a.mode = .files_with_matches,
+                'c' => a.mode = .count,
+                'm' => a.max_count = std.fmt.parseInt(usize, v, 10) catch fail("bad -m value", .{}),
+                'g' => try a.globs.append(arena, v),
+                'e' => a.pattern = v,
+                'j' => a.threads = std.fmt.parseInt(usize, v, 10) catch fail("bad -j value", .{}),
+                'h' => {
+                    std.fs.File.stdout().writeAll(usage) catch {};
+                    std.process.exit(0);
+                },
+                'V' => {
+                    std.fs.File.stdout().writeAll("trigrep " ++ version ++ "\n") catch {};
+                    std.process.exit(0);
+                },
+                'n', 'H' => {},
+                else => fail("unknown option -{c}", .{c}),
+            }
+            if (takes_value) break;
+        }
+    }
+
+    var pos = positionals.items;
+    if (pos.len > 0 and a.pattern == null) {
+        if (std.mem.eql(u8, pos[0], "index")) {
+            a.command = .index;
+            pos = pos[1..];
+        } else if (std.mem.eql(u8, pos[0], "status")) {
+            a.command = .status;
+            pos = pos[1..];
+        } else if (std.mem.eql(u8, pos[0], "mcp")) {
+            a.command = .mcp;
+            pos = pos[1..];
+        }
+    }
+    if (a.command == .search and a.pattern == null) {
+        if (pos.len == 0) {
+            std.fs.File.stderr().writeAll(usage) catch {};
+            std.process.exit(2);
+        }
+        a.pattern = pos[0];
+        pos = pos[1..];
+    }
+    if (pos.len > 1) fail("only one PATH is supported", .{});
+    if (pos.len == 1) a.path = pos[0];
+    return a;
+}
+
+pub fn main() !void {
+    const gpa = std.heap.smp_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const argv = try std.process.argsAlloc(arena);
+    const a = try parseArgs(arena, argv);
+    var diag = engine.Diag{};
+
+    switch (a.command) {
+        .mcp => return mcp.serve(gpa),
+        .index => {
+            const target = engine.resolve(arena, a.path, &diag) catch fail("{s}", .{diag.message});
+            const b = engine.buildIndex(gpa, arena, target, a.threads) catch |err| fail("indexing failed: {s}", .{@errorName(err)});
+            std.debug.print("trigrep: {s}\n", .{try engine.describeBuild(arena, target, b)});
+            return;
+        },
+        .status => {
+            const target = engine.resolve(arena, a.path, &diag) catch fail("{s}", .{diag.message});
+            const st = (try engine.status(arena, target)) orelse {
+                std.debug.print("trigrep: no index covers {s}; run `trigrep index`\n", .{target});
+                std.process.exit(1);
+            };
+            try std.fs.File.stdout().writeAll(try engine.describeStatus(arena, st));
+            return;
+        },
+        .search => {},
+    }
+
+    var out_buf: [1 << 16]u8 = undefined;
+    var stdout = std.fs.File.stdout().writerStreaming(&out_buf);
+    const out = &stdout.interface;
+    const req = engine.Request{
+        .pattern = a.pattern.?,
+        .path = a.path,
+        .opts = a.opts,
+        .mode = a.mode,
+        .max_count = a.max_count,
+        .globs = a.globs.items,
+        .hidden = a.hidden,
+        .no_index = a.no_index,
+        .trust_index = a.trust_index,
+        .threads = a.threads,
+    };
+    const outcome = engine.run(gpa, arena, req, out, &diag) catch |err| {
+        out.flush() catch {};
+        if (err == error.Failed) fail("{s}", .{diag.message});
+        fail("{s}", .{@errorName(err)});
+    };
+    out.flush() catch {};
+    if (outcome.built_index) |b| std.debug.print("trigrep: {s}\n", .{b});
+    if (outcome.note) |n| std.debug.print("trigrep: {s}\n", .{n});
+    if (a.stats) std.debug.print("trigrep: {s}\n", .{outcome.stats});
+    std.process.exit(if (outcome.totals.lines_matched > 0) 0 else 1);
+}
+
+test {
+    _ = regex;
+    _ = query;
+    _ = index;
+    _ = walk;
+    _ = search;
+    _ = engine;
+    _ = mcp;
+    _ = @import("glob.zig");
+}
