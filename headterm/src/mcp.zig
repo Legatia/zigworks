@@ -396,7 +396,7 @@ const Dispatch = struct {
             const sent = try self.session(name, args.items);
             if (sent.is_error) return sent.result();
             if (wait) |w| return self.waitFor(name, w);
-            return .{ .text = "sent" };
+            return .{ .text = if (sent.text.len > 0) sent.text else "sent" };
         }
         if (eql(tool, "headterm_wait")) {
             const wait = try self.waitSpec(a, null);
@@ -546,7 +546,7 @@ const Dispatch = struct {
         if (try a.int("rows", 1, 1000)) |r| opts.start.rows = @intCast(r);
         opts.start.cwd = try a.string("cwd");
         opts.start.record_path = try a.string("record");
-        const ttl = (try a.int("ttl_s", 0, max_ttl_s)) orelse @as(i64, if (opts.keep) default_ttl_s else run_mod.failure_ttl_s);
+        const ttl = (try a.int("ttl_s", 0, max_ttl_s)) orelse @as(i64, if (opts.keep) run_mod.keep_ttl_s else run_mod.failure_ttl_s);
         opts.start.ttl_s = if (ttl == 0) null else @intCast(ttl);
 
         const caller: run_mod.Caller = .{ .ctx = self, .callFn = runCall };
@@ -688,7 +688,7 @@ const tools_json_src =
     \\{"name":"headterm_run","description":"Use only when a program needs a real terminal: TUI menus, passphrase prompts on the TTY, editors, interactive REPLs or debuggers. For anything that takes stdin or flags, use the shell. Starts command, plays steps in order, returns each step's result and the final screen, then ends the session. A failed step stops the run and keeps the session: continue with session=name.","inputSchema":{"type":"object","properties":{
     \\"command":{"type":"array","items":{"type":"string"},"description":"e.g. [\"python3\",\"setup.py\"]"},
     \\"steps":{"type":"array","items":{"type":"object"},"description":"[{\"send\":[\"<Down>\",\"<Enter>\"]},{\"wait\":{\"text\":\"Saved\"}},{\"screen\":true}]. send: keys as in headterm_send, add \"literal\":true for plain text. wait: text, regex, gone, idle_ms or exit, with timeout_ms."},
-    \\"session":{"type":"string","description":"Continue this session instead of starting command"},
+    \\"session":{"type":"string","description":"Continue this session instead of starting command; it stays until its program exits"},
     \\"keep":{"type":"boolean","description":"Keep the session afterwards"},
     \\"cwd":{"type":"string"},"cols":{"type":"integer"},"rows":{"type":"integer"},
 ++ name_prop ++ "," ++ styles_prop ++

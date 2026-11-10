@@ -150,6 +150,14 @@ set -e
 check "run stops at the failed step" sh -c '[ "$1" -eq 1 ] && printf "%s\n" "$2" | grep -q "^2 wait FAILED: failed(timeout)" && printf "%s\n" "$2" | grep -q "stopped at step 2 of 3; session $3 kept"' _ "$rc" "$out" "$S-run"
 out=$("$HT" run --session "$S-run" --send two --send '<Enter>' --wait-exit)
 check "run continues a kept session" sh -c 'printf "%s\n" "$1" | grep -qx "second:two" && ! "$2" list | grep -q "^$3 "' _ "$out" "$HT" "$S-run"
+# Step by step: --keep, then --session leaves the session running until its
+# program exits. Key names in lower case are keys when no argument is
+# spelled as one.
+"$HT" run --name "$S-step" --keep --cols 40 --rows 5 --wait-text name: -- /bin/sh -c 'printf "name: "; read x; echo got:$x; read y; echo second:$y' >/dev/null
+out=$("$HT" run --session "$S-step" --send one enter --wait-text got:one)
+check "run --session keeps a running session" sh -c 'printf "%s\n" "$1" | grep -qx "1 send ok, sent as keys: Enter (--literal sends such words as text)" && printf "%s\n" "$1" | grep -q "^session $3 kept" && "$2" list | grep -q "^$3 "' _ "$out" "$HT" "$S-step"
+out=$("$HT" run --session "$S-step" --send up Enter --wait-exit)
+check "run --session ends the session when the program exits" sh -c 'printf "%s\n" "$1" | grep -qx "second:up" && printf "%s\n" "$1" | grep -qx "the program exited, session ended" && ! "$2" list | grep -q "^$3 "' _ "$out" "$HT" "$S-step"
 set +e
 err=$("$HT" run -- true 2>&1)
 rc=$?

@@ -31,6 +31,16 @@ In tests with Claude Code (Sonnet, 3 runs per task), that beat an agent with onl
 
 The shell-only agent writes its own pty scripts for menus and wizards, and declines to bypass a TTY check. The MCP server (below) also solved every task, but costs more: clients load MCP tools on demand, and agents drive it one key at a time.
 
+Wizards built with the common Node prompt libraries are harder: the agent can't know the screens in advance, and checkbox lists show what is selected only by color. Same setup, 4 runs per task, median time, every run correct:
+
+| setup wizard built with | headterm 0.2.0 | headterm 0.3.0 |
+|---|---|---|
+| enquirer | 60.0 s, wizard started 3–9 times | 25.0 s, started 1–2 times |
+| @clack/prompts | 39.6 s, started 4–5 times | 18.6 s, started 1–2 times |
+| prompts | 45.1 s, started 2–5 times | 17.6 s, started 1–2 times |
+
+The difference comes from keeping the session between calls (`run --name N --keep`, then `run --session N`), a note under the screen that says which marks differ in color, and a wait for exit that stops after 2 s when the program is reading keys.
+
 ## Quick start
 
 One command for a whole interaction:
@@ -157,7 +167,7 @@ The other tools are for step-by-step use: `headterm_start`, then
 
 | Command | Description |
 | --- | --- |
-| `run <steps> -- <cmd> [args...]`, `run --session NAME <steps>` | Starts `cmd` (or uses a session), plays the steps, prints each result and the final screen, ends the session. See [run](#run). |
+| `run <steps> -- <cmd> [args...]`, `run --session NAME <steps>` | Starts `cmd` (or uses a session), plays the steps, prints each result and the final screen, ends the session (a `--session` one only when its program has exited). See [run](#run). |
 | `start <name> [options] -- <cmd> [args...]` | Starts `cmd` in a new session and returns once it runs. Options: `--cols N` (120), `--rows N` (40), `--cwd DIR`, `--ttl S`, `--record FILE`, `--log FILE`. |
 | `screen <name> [options]` | Prints the screen. Options: `--json`, `--diff`, `--styles`, `--trim`, `--scrollback N`, `--client ID`. |
 | `send <name> [options] [--] <keys>...` | Sends keys, text and mouse events. Options: `--literal`, `--paste`, `--esc-delay MS`. |
@@ -187,9 +197,15 @@ order:
   for, then the final screen with the exit status. `--styles` adds styled
   runs.
 - **Timing:** keys are held until the program's first output has settled,
-  unless a wait comes first. A screen taken right after a send waits until
-  the output has been quiet for 200 ms.
+  unless a wait comes first. A screen taken right after a send waits for the
+  program to react to the keys, then until its output has been quiet for
+  200 ms, so `--send Down Enter --screen` needs no wait step in between.
 - **Success:** the session ends (`--keep` keeps it). Exit code 0.
+- **Step by step:** start with `--name NAME --keep`, then play more steps
+  with `run --session NAME`. Steps played with `--session` leave the session
+  running, and end it once its program has exited. `headterm kill NAME` ends
+  it sooner; a kept session also ends after an hour without use (`--ttl S`,
+  0 = never).
 - **A failed step** (a wait that times out) stops the run. The result then
   holds the screen at that point and `stopped at step N of M`, and the session
   is kept for 10 minutes. Continue it with `run --session NAME` (MCP:
@@ -209,7 +225,8 @@ order:
   exit status stay readable until `kill`.
 - **TTL:** `--ttl S` ends the session after S seconds with no request and no
   output; a pending `wait` keeps it alive, and a program that keeps printing
-  never expires. The CLI default is no TTL; MCP sessions default to 3600.
+  never expires. `start` has no TTL by default; `run --keep` and MCP
+  sessions default to 3600.
   `list --json` shows `ttl_s`.
 - **Recording:** `--record FILE` writes an asciicast v2 file (`asciinema play
   FILE`). It holds a header with size and command, `"o"` events for output,
@@ -227,6 +244,13 @@ Each argument is text or a key; key names are case-insensitive:
 Modifiers: `<C-x>` Ctrl, `<M-x>` or `<A-x>` Alt, `<S-x>` Shift. They combine
 (`<M-C-x>`) and work on named keys (`<C-Left>`, `<S-Tab>`). Arrows, Home and
 End follow the program's cursor-key mode (DECCKM).
+
+The brackets can be left out when the argument is exactly a key name:
+`send s Down Down Enter`, `send s C-c`. Names in another case (`down`,
+`enter`) are keys too, unless the same `send` has a key spelled as above:
+`send s billing enter` presses Enter, while `send s up Enter` types `up` (a
+debugger command) and presses Enter. When that happens the reply says
+`sent as keys: Enter`. `--literal` always types the words.
 
 Mouse events take 0-based positions, like the cursor:
 
@@ -267,8 +291,8 @@ selected.
 | `--text STR` | STR is on screen (trailing blanks count, so `'>>> '` matches a prompt) |
 | `--regex RE` | a screen line, trailing spaces removed, matches RE |
 | `--text-gone STR` | STR is not on screen (spinners, "Loading…") |
-| `--idle MS` | no output for MS, counted from the later of the wait's start and the last output |
-| `--settle MS` | the program has printed something, then nothing for MS |
+| `--idle MS` | the screen has not changed for MS, counted from the later of the wait's start and the last change. Output that leaves the screen as it was doesn't count, nor does a cursor that the program draws and blinks itself (Bubble Tea forms): a change of colors alone that puts back the screen before the last one |
+| `--settle MS` | the program has printed something, then nothing for MS. After a send, only output since the send counts; a program that prints nothing within 500 ms is taken as settled |
 | `--exit` | the program exited |
 
 The first condition met ends the wait.
@@ -281,6 +305,13 @@ The first condition met ends the wait.
   fails at once (reason `exited`).
 - If the session is killed during a wait, the client gets the last screen
   with reason `killed` (exit code 1).
+- A wait for `--exit` alone fails after 2 s, not at the timeout, when the
+  program is probably waiting for input (reason `awaiting-input`): it printed
+  something, then the screen stayed as it was for 2 s, and the terminal is in raw mode or has echo
+  off, as menus, wizards and password prompts set it. The screen says so.
+  This happens once per send, so a program that was working after all can be
+  waited for again. A plain line prompt (`read`, `input()`) can't be told
+  apart from a quiet program and runs into the timeout.
 
 Regex syntax (own engine, `src/regex.zig`; an NFA, so matching is linear in
 the screen size and cannot hang):
@@ -358,6 +389,17 @@ bottom), then a status line:
   that differs from the screen's most common one: inverse, or a colored bar.
   A program that paints the whole screen in one color doesn't count. This
   usually finds the selected menu item at no extra cost.
+- **Style-only lists:** some checkbox lists show state by style alone
+  (enquirer prints `✔` on every row, green when selected; clack and prompts
+  mark the focused row by underline or by not dimming it). Without `--styles`
+  two more lines say so:
+  `[headterm] "✔" differs in style: rows 3,4 dim fg=bright-black ("ESLint", "Vitest"); row 5 fg=green ("Prettier")`
+  for consecutive rows with the same mark in two or three styles (the labels
+  are named for lists of up to 10 rows), and
+  `[headterm] styled unlike the rows around it: row 4 "ESLint" (underline fg=cyan; others plain)`
+  for one or two rows of a list of three or more whose label has a style of
+  its own. The second is written only while the program hides the cursor,
+  which is when it draws its own focus.
 
 ### JSON (`screen --json`, `wait --json`)
 
@@ -388,7 +430,7 @@ otherwise absent.
 | `styles` | Only with `--styles` and without `--diff`: runs per row, parallel to `lines`; `fg`/`bg` are `null` for the default color. |
 | `changed` | Only with `--diff`: changed rows; with `--styles` each has its `styles`. |
 | `scrollback` | Only with `--scrollback N`: oldest first. |
-| `wait` | Only from `wait`. `condition`: the first given, in the order text, regex, gone, idle, exit. `reason`: the condition met, or `timeout`, `exited`, `killed`. |
+| `wait` | Only from `wait`. `condition`: the first given, in the order text, regex, gone, idle, exit. `reason`: the condition met, or `timeout`, `awaiting-input`, `exited`, `killed`. |
 
 ### JSON (`list --json`)
 

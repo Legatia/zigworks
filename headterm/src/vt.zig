@@ -205,6 +205,9 @@ pub const Terminal = struct {
     scrollback: Scrollback,
     /// Last printed codepoint, for REP (CSI b).
     last_printed: ?u21 = null,
+    /// Lines scrolled so far, so that a screen scrolling through identical
+    /// lines still counts as changing (see `signatures`).
+    scrolled: u64 = 0,
 
     state: State = .ground,
     params: [max_params]u16 = undefined,
@@ -311,6 +314,33 @@ pub const Terminal = struct {
     }
 
     /// Whole visible screen, one line per row joined by '\n'. Caller owns.
+    pub const Signatures = struct {
+        /// What the screen says: its characters, the cursor position, which
+        /// screen is active and how far it has scrolled.
+        text: u64,
+        /// The same plus every cell's colors and attributes.
+        full: u64,
+    };
+
+    /// Hashes of the screen, to tell whether output changed it.
+    pub fn signatures(self: *const Terminal) Signatures {
+        var text = std.hash.Wyhash.init(0);
+        var full = std.hash.Wyhash.init(0);
+        const g = if (self.alt_active) &self.alt else &self.main;
+        for (g.rows) |r| {
+            for (r.cells) |c| {
+                const v = [2]u32{ c.cp, c.combining };
+                text.update(std.mem.asBytes(&v));
+                std.hash.autoHash(&full, c.style);
+            }
+        }
+        const tail = [4]u64{ self.cursor.row, self.cursor.col, @intFromBool(self.alt_active), self.scrolled };
+        text.update(std.mem.asBytes(&tail));
+        const t = text.final();
+        full.update(std.mem.asBytes(&t));
+        return .{ .text = t, .full = full.final() };
+    }
+
     pub fn screenText(self: *const Terminal, gpa: Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
@@ -612,7 +642,7 @@ pub const Terminal = struct {
             '>' => {
                 switch (final) {
                     'c' => try self.reply.appendSlice(self.gpa, "\x1b[>1;10;0c"), // DA2
-                    'q' => try self.reply.appendSlice(self.gpa, "\x1bP>|headterm 0.1.0\x1b\\"), // XTVERSION
+                    'q' => try self.reply.appendSlice(self.gpa, "\x1bP>|headterm " ++ @import("server.zig").version ++ "\x1b\\"), // XTVERSION
                     else => {},
                 }
                 return;
@@ -1028,6 +1058,7 @@ pub const Terminal = struct {
         }
         std.mem.rotate(Row, rows[self.top .. self.bottom + 1], n);
         for (rows[self.bottom + 1 - n .. self.bottom + 1]) |*r| r.fill(self.erased());
+        self.scrolled +%= n;
     }
 
     fn scrollDown(self: *Terminal, n_in: usize) !void {
@@ -1035,6 +1066,7 @@ pub const Terminal = struct {
         const region = self.grid().rows[self.top .. self.bottom + 1];
         std.mem.rotate(Row, region, region.len - n);
         for (region[0..n]) |*r| r.fill(self.erased());
+        self.scrolled +%= n;
     }
 
     fn pushScrollback(self: *Terminal, cells: []const Cell) !void {

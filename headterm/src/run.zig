@@ -54,6 +54,8 @@ pub const Options = struct {
 /// How long a session survives when a step failed and it is kept for the
 /// caller to recover, unless a TTL was given.
 pub const failure_ttl_s = 600;
+/// And when it is kept with --keep.
+pub const keep_ttl_s = 3600;
 const max_ms = 60_000;
 
 pub const Error = client.CallError || error{Cancelled} || posix.PollError;
@@ -81,7 +83,9 @@ pub fn run(arena: Allocator, gpa: Allocator, opts: Options, steps: []const Step,
     const w = &out.writer;
 
     // An existing session has already drawn its screen.
-    var waited_before_send = opts.argv.len == 0;
+    const existing = opts.argv.len == 0;
+    var waited_before_send = existing;
+    var last_screen: []const u8 = "";
     if (opts.argv.len > 0) {
         var msg: [256]u8 = undefined;
         const pid = client.startSession(gpa, opts.name, opts.argv, opts.start, &msg) catch {
@@ -113,7 +117,8 @@ pub fn run(arena: Allocator, gpa: Allocator, opts: Options, steps: []const Step,
                     failed_at = n;
                     break;
                 }
-                try w.print("{d} send ok\n", .{n});
+                // The session says so when it read `down enter` as keys.
+                if (r.text.len > 0) try w.print("{d} send ok, {s}\n", .{ n, r.text }) else try w.print("{d} send ok\n", .{n});
                 last_was_send = true;
             },
             .wait => |wt| {
@@ -137,9 +142,10 @@ pub fn run(arena: Allocator, gpa: Allocator, opts: Options, steps: []const Step,
                 last_was_send = false;
             },
             .screen => {
-                const r = try capture(arena, caller, opts, last_was_send);
-                try w.print("{d} screen:\n{s}\n", .{ n, r });
+                last_screen = try capture(arena, caller, opts, last_was_send or !waited_before_send);
+                try w.print("{d} screen:\n{s}\n", .{ n, last_screen });
                 last_was_send = false;
+                waited_before_send = true;
             },
         }
     }
@@ -149,6 +155,8 @@ pub fn run(arena: Allocator, gpa: Allocator, opts: Options, steps: []const Step,
         if (exited_at_failure and !opts.keep) {
             _ = try session(arena, caller, opts, &.{"kill"});
             try w.writeAll("the program exited, session ended");
+        } else if (existing) {
+            try w.print("session {s} kept (its program is still running)", .{opts.name});
         } else {
             try w.print("session {s} kept for recovery (send/screen/kill it; it ends after {d} s idle)", .{ opts.name, opts.start.ttl_s orelse failure_ttl_s });
         }
@@ -156,23 +164,35 @@ pub fn run(arena: Allocator, gpa: Allocator, opts: Options, steps: []const Step,
     }
 
     // A screen step at the very end already showed the final screen.
-    if (steps.len == 0 or steps[steps.len - 1] != .screen)
-        try w.print("final screen:\n{s}\n", .{try capture(arena, caller, opts, last_was_send)});
+    if (steps.len == 0 or steps[steps.len - 1] != .screen) {
+        last_screen = try capture(arena, caller, opts, last_was_send or !waited_before_send);
+        try w.print("final screen:\n{s}\n", .{last_screen});
+    }
 
-    if (opts.keep) {
+    // A session the caller started earlier is theirs: steps played on it
+    // with --session leave it running, so the next call can continue. It
+    // ends here only once its program has exited.
+    const exited = programExited(last_screen);
+    if (opts.keep or (existing and !exited)) {
         try w.print("session {s} kept", .{opts.name});
+        if (existing and !opts.keep) try w.writeAll(" (its program is still running)");
     } else {
         const k = try session(arena, caller, opts, &.{"kill"});
-        try w.writeAll(if (k.ok) "session ended" else "session already ended");
+        if (existing) {
+            try w.writeAll("the program exited, session ended");
+        } else {
+            try w.writeAll(if (k.ok) "session ended" else "session already ended");
+        }
     }
     return .{ .text = out.written(), .ok = true };
 }
 
-/// The screen. Right after a send, the program gets a moment to react first:
-/// until its output has been quiet for 200 ms (at most 3 s).
-fn capture(arena: Allocator, caller: Caller, opts: Options, after_send: bool) Error![]const u8 {
+/// The screen. Right after a send, or before the program has been given time
+/// to draw at all, it gets a moment first: until its output has been quiet
+/// for 200 ms (at most 3 s).
+fn capture(arena: Allocator, caller: Caller, opts: Options, settle: bool) Error![]const u8 {
     var args: std.ArrayList([]const u8) = .empty;
-    if (after_send) {
+    if (settle) {
         try args.appendSlice(arena, &.{ "wait", "--settle", "200", "--timeout", "3000" });
     } else {
         try args.append(arena, "screen");

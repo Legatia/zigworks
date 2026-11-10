@@ -37,21 +37,34 @@ const command_help = [_]Help{
         \\screen at that point and keeps the session (10 min TTL) to recover.
         \\Exit code 1 if a step failed.
         \\
+        \\To go step by step, keep the session and continue it:
+        \\  headterm run --name NAME --keep --screen -- <cmd>
+        \\  headterm run --session NAME --send Down Enter --screen
+        \\It stays until its program exits, 'headterm kill NAME', or an hour
+        \\without use (--ttl S, 0 = never).
+        \\
         \\steps, in order:
         \\  --send KEY...     keys or text (consecutive --send form one step)
         \\  --send-text TEXT  plain text, no <Key> parsing
+        \\  --screen          print the screen. It first waits for the program's
+        \\                    first output, or for its reaction to the keys just
+        \\                    sent, so no wait step is needed before it
         \\  --wait-text STR   --wait-regex RE   --wait-gone STR   --wait-idle MS
         \\  --wait-exit       --timeout MS (for the wait just before it)
-        \\  --screen          print the screen at this point
         \\  --steps JSON      [{"send":[...]},{"wait":{"text":"..."}},{"screen":true}]
         \\
-        \\--session NAME plays the steps on an existing session, e.g. one kept
-        \\after a failed step.
+        \\keys: Enter Tab Esc Space Backspace Up Down Left Right Home End PageUp
+        \\      PageDown Delete F1..F12, C-c (Ctrl), M-x (Alt), S-Tab (Shift);
+        \\      any other argument is typed as text
         \\
         \\options: --name NAME --keep --cols N --rows N --cwd DIR --ttl S
         \\         --record FILE --styles
         \\
-        \\Keys before the first wait are sent once the program's first output settles.
+        \\example: headterm run --send billing Enter --wait-text Framework \
+        \\             --send Down Enter --wait-exit -- npm create my-app
+        \\
+        \\Keys before the first wait are sent once the program's first output
+        \\settles.
         \\
     },
     .{
@@ -92,7 +105,9 @@ const command_help = [_]Help{
         \\  <Enter> <Tab> <Esc> <Backspace> <Space> <Up> <Down> <Left> <Right>
         \\  <Home> <End> <PageUp> <PageDown> <Insert> <Delete> <F1>..<F12> <lt>
         \\  modifiers: <C-c> (Ctrl), <M-x> (Alt), <S-Tab> (Shift), combinable
-        \\  an argument spelled exactly like a key also works: Enter, Down, C-c
+        \\  an argument spelled like a key also works: Enter, Down, C-c
+        \\  down, enter: also keys, unless the same send has a key spelled as above
+        \\  (then they are text, as in 'send up Enter' to a debugger)
         \\Mouse, if the program enabled mouse reporting (0-based positions):
         \\  <Click r,c> <RightClick r,c> <MiddleClick r,c> <Drag r1,c1 r2,c2>
         \\  <ScrollUp r,c> <ScrollDown r,c>, with modifiers: <S-Click r,c>
@@ -113,9 +128,13 @@ const command_help = [_]Help{
         \\  --text STR        STR is on screen (rows joined where text wrapped)
         \\  --regex RE        a screen line matches RE (see the README for syntax)
         \\  --text-gone STR   STR is not on screen
-        \\  --idle MS         no output for MS milliseconds
-        \\  --settle MS       the program printed something, then nothing for MS
-        \\  --exit            the program exited
+        \\  --idle MS         the screen has not changed for MS milliseconds (a
+        \\                    cursor that the program blinks itself is ignored)
+        \\  --settle MS       the program printed something (after the last send, if
+        \\                    any; it gets 500 ms to react), then nothing for MS
+        \\  --exit            the program exited (alone, it fails after 2 s when the
+        \\                    program went quiet in raw mode or with echo off:
+        \\                    it is waiting for input)
         \\  --timeout MS      give up after MS (default 10000)
         \\
         \\Output options as for screen: --json --diff --styles --trim
@@ -213,6 +232,11 @@ fn run(gpa: Allocator, args: []const []const u8) !u8 {
     } else return fail("unknown command '{s}' (see 'headterm help')", .{cmd});
 
     if (args.len < 2) return fail("{s}: missing session name (see 'headterm help {s}')", .{ cmd, cmd });
+    // `start --name NAME` is accepted too, as `run` spells it that way.
+    if (eql(cmd, "start") and eql(args[1], "--name") and args.len > 2) {
+        if (!client.validName(args[2])) return fail("invalid session name '{s}': use 1-64 letters, digits, '.', '_' or '-', not starting with '.' or '-'", .{args[2]});
+        return start(gpa, args[2], args[3..]);
+    }
     const name = args[1];
     if (!client.validName(name)) return fail("invalid session name '{s}': use 1-64 letters, digits, '.', '_' or '-', not starting with '.' or '-'", .{name});
     if (eql(cmd, "start")) return start(gpa, name, args[2..]);
@@ -252,6 +276,7 @@ fn runCmd(gpa: Allocator, args: []const []const u8) !u8 {
     var opts: run_mod.Options = .{ .name = "", .argv = &.{} };
     var name: ?[]const u8 = null;
     var existing: ?[]const u8 = null;
+    var ttl_given = false;
     var steps: std.ArrayList(run_mod.Step) = .empty;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -338,6 +363,7 @@ fn runCmd(gpa: Allocator, args: []const []const u8) !u8 {
         } else if (eql(a, "--ttl")) {
             const ttl = std.fmt.parseInt(u32, v, 10) catch return fail("run: bad --ttl '{s}' (seconds)", .{v});
             opts.start.ttl_s = if (ttl == 0) null else ttl;
+            ttl_given = true;
         } else {
             return fail("run: unknown option '{s}' (see 'headterm help run')", .{a});
         }
@@ -347,8 +373,9 @@ fn runCmd(gpa: Allocator, args: []const []const u8) !u8 {
     if (existing == null and opts.argv.len == 0) return fail("run: missing command, e.g. 'headterm run --send q -- less FILE' (or --session NAME)", .{});
     if (steps.items.len == 0) return fail("run: give at least one step (--send, --wait-*, --screen or --steps)", .{});
     // Without --keep the session ends after the run; if a step fails it is
-    // kept for recovery and expires.
-    if (opts.start.ttl_s == null and !opts.keep) opts.start.ttl_s = run_mod.failure_ttl_s;
+    // kept for recovery and expires. A kept session expires too, later, so
+    // one that is forgotten doesn't run forever.
+    if (!ttl_given) opts.start.ttl_s = if (opts.keep) run_mod.keep_ttl_s else run_mod.failure_ttl_s;
     opts.name = existing orelse name orelse try std.fmt.allocPrint(arena, "run-{d}", .{std.c.getpid()});
     if (!client.validName(opts.name)) return fail("run: invalid session name '{s}'", .{opts.name});
 
@@ -464,4 +491,5 @@ test {
     _ = @import("session_test.zig");
     _ = @import("record.zig");
     _ = @import("run.zig");
+    _ = @import("stylenote.zig");
 }

@@ -57,8 +57,8 @@ pub fn isKeySyntax(arg: []const u8) bool {
 }
 
 /// Key names accepted without brackets when they are a whole argument, as
-/// agents often write them (`send Down Enter`). Exact spelling only, so text
-/// like "enter the name" or "up" is still typed as text.
+/// agents often write them (`send Down Enter`). Text like "enter the name"
+/// is still typed as text; see `otherCaseKey` for `down` and `enter`.
 const bare_names = [_][]const u8{
     "Enter",    "Return", "Tab",    "Esc",   "Escape", "Backspace", "Space",
     "Up",       "Down",   "Left",   "Right", "Home",   "End",       "PageUp",
@@ -81,6 +81,26 @@ pub fn isBareKey(arg: []const u8) bool {
         if (std.mem.eql(u8, name, n)) return true;
     }
     return false;
+}
+
+/// The usual spelling of an unmodified key name written in another case
+/// (`down`, `ENTER`), or null.
+pub fn otherCaseKey(arg: []const u8) ?[]const u8 {
+    for (bare_names) |n| {
+        if (std.ascii.eqlIgnoreCase(arg, n)) return if (std.mem.eql(u8, arg, n)) null else n;
+    }
+    return null;
+}
+
+/// Whether key names in another case are keys in this `send`: only when no
+/// argument is spelled as a key. `send down down enter` and
+/// `send billing enter` press keys, while `send up Enter` types "up" (a
+/// debugger command) and presses Enter.
+pub fn otherCaseAllowed(args: []const []const u8) bool {
+    for (args) |a| {
+        if (isBareKey(a) or isKeySyntax(a)) return false;
+    }
+    return true;
 }
 
 /// Appends the encoding of one `send` argument to `out`.
@@ -356,6 +376,20 @@ test "bare key names" {
     try expectEncoded("A-1", false, "A-1");
     try expectEncoded("C-", false, "C-");
     try expectEncoded("Y", false, "Y");
+}
+
+test "key names in another case" {
+    try testing.expectEqualStrings("Down", otherCaseKey("down").?);
+    try testing.expectEqualStrings("PageUp", otherCaseKey("pageup").?);
+    try testing.expectEqualStrings("Enter", otherCaseKey("ENTER").?);
+    try testing.expect(otherCaseKey("Down") == null);
+    try testing.expect(otherCaseKey("downs") == null);
+    try testing.expect(otherCaseKey("c-c") == null);
+    try testing.expect(otherCaseAllowed(&.{ "down", "down", "enter" }));
+    try testing.expect(otherCaseAllowed(&.{ "billing", "enter" }));
+    try testing.expect(!otherCaseAllowed(&.{ "up", "Enter" }));
+    try testing.expect(!otherCaseAllowed(&.{ "up", "<Enter>" }));
+    try testing.expect(!otherCaseAllowed(&.{ "end", "C-c" }));
 }
 
 test "named keys" {

@@ -10,13 +10,14 @@
 const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
+const stylenote = @import("stylenote.zig");
 const vt = @import("vt.zig");
 const keys = @import("keys.zig");
 const pty = @import("pty.zig");
 const regex = @import("regex.zig");
 const record = @import("record.zig");
 
-pub const version = "0.2.0";
+pub const version = "0.3.0";
 pub const default_wait_timeout_ms = 10_000;
 pub const default_esc_delay_ms = 100;
 const max_request = 1 << 20;
@@ -125,6 +126,15 @@ fn nowMs() i64 {
     return std.time.milliTimestamp();
 }
 
+/// How long `--settle` waits for a program to print anything after keys were
+/// sent, before taking the keys to have no visible effect.
+const settle_grace_ms = 500;
+
+/// A wait for the program's exit gives up early when the program has gone
+/// quiet for this long with the terminal in raw mode or echo off: it is
+/// then reading keys, not finishing.
+const awaiting_input_ms = 2000;
+
 const Waiter = struct {
     fd: posix.fd_t,
     text: ?[]u8 = null,
@@ -139,6 +149,10 @@ const Waiter = struct {
     render: Session.RenderOptions = .{},
     started: i64,
     deadline: i64 = 0,
+
+    fn exitOnly(w: Waiter) bool {
+        return w.exit and w.text == null and w.regex == null and w.gone == null and w.idle_ms == null and w.settle_ms == null;
+    }
 
     /// Conditions that only depend on what is on screen.
     fn screenOnly(w: Waiter) bool {
@@ -194,6 +208,16 @@ const Session = struct {
     exit_signal: ?u8 = null,
     started_ms: i64,
     last_output_ms: i64,
+    /// When the screen last changed. `--idle` and the "awaiting-input" check
+    /// count from here. Output that leaves the screen as it was doesn't
+    /// count, and neither does a change of colors or attributes alone that
+    /// puts back the screen before the last one: that is a cursor the program
+    /// draws itself and blinks (Bubble Tea), which would keep a waiting form
+    /// busy forever.
+    last_change_ms: i64,
+    screen_sig: vt.Terminal.Signatures = .{ .text = 0, .full = 0 },
+    /// `screen_sig.full` before the last change.
+    prev_full_sig: u64 = 0,
     /// Last client request or program output, for --ttl.
     last_activity_ms: i64,
     input: std.ArrayList(u8) = .empty,
@@ -205,6 +229,17 @@ const Session = struct {
     log_fd: ?posix.fd_t = null,
     /// The program has printed anything at all.
     output_seen: bool = false,
+    /// When keys were last sent (0: never), and whether the program has
+    /// printed since. `--settle` waits for the reaction to those keys.
+    last_send_ms: i64 = 0,
+    output_since_send: bool = false,
+    /// `last_send_ms` when a wait for exit last gave up as "awaiting-input";
+    /// it does so once per send, so a program that is working after all can
+    /// be waited for with a second wait.
+    awaiting_reported_send_ms: ?i64 = null,
+    /// The terminal was in line mode with echo when last checked for the
+    /// above; look again after this time.
+    awaiting_recheck_ms: i64 = 0,
     recorder: ?record.Recorder = null,
 
     fn init(gpa: Allocator, cfg: Config) !Session {
@@ -265,6 +300,7 @@ const Session = struct {
             .sig_pipe = sig_pipe,
             .started_ms = now,
             .last_output_ms = now,
+            .last_change_ms = now,
             .last_activity_ms = now,
         };
     }
@@ -344,10 +380,11 @@ const Session = struct {
         var next: ?i64 = null;
         for (self.waiters.items) |w| {
             var t = w.deadline;
-            if (w.idle_ms) |idle| t = @min(t, @max(self.last_output_ms, w.started) + idle);
+            if (w.idle_ms) |idle| t = @min(t, @max(self.last_change_ms, w.started) + idle);
             if (w.settle_ms) |ms| {
-                if (self.output_seen) t = @min(t, self.last_output_ms + ms);
+                if (self.settledAt(ms)) |at| t = @min(t, at);
             }
+            if (self.awaitingInputAt(w)) |at| t = @min(t, at);
             next = if (next) |n| @min(n, t) else t;
         }
         if (self.expiresAt()) |t| next = if (next) |n| @min(n, t) else t;
@@ -399,6 +436,14 @@ const Session = struct {
             self.last_output_ms = nowMs();
             self.last_activity_ms = self.last_output_ms;
             self.output_seen = true;
+            self.output_since_send = true;
+            const sig = self.term.signatures();
+            if (sig.full != self.screen_sig.full) {
+                const blink = sig.text == self.screen_sig.text and sig.full == self.prev_full_sig;
+                self.prev_full_sig = self.screen_sig.full;
+                self.screen_sig = sig;
+                if (!blink) self.last_change_ms = self.last_output_ms;
+            }
         }
         if (self.input.items.len > 0) self.flushInput();
     }
@@ -597,9 +642,14 @@ const Session = struct {
         var options_done = false;
         var pasted: std.ArrayList(u8) = .empty;
         defer pasted.deinit(self.gpa);
+        // `down down enter`: key names in another case, in a send without a
+        // properly spelled key, are keys. The reply says so.
+        const other_case = keys.otherCaseAllowed(args);
+        var renamed: std.ArrayList(u8) = .empty;
+        defer renamed.deinit(self.gpa);
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
-            const a = args[i];
+            var a = args[i];
             // Options are recognized until "--" or "--literal"; after that
             // every argument is a key or text.
             if (!options_done and !literal) {
@@ -631,6 +681,13 @@ const Session = struct {
             if (literal) {
                 try bytes.appendSlice(self.gpa, a);
                 continue;
+            }
+            if (other_case) {
+                if (keys.otherCaseKey(a)) |name| {
+                    a = name;
+                    if (renamed.items.len > 0) try renamed.append(self.gpa, ' ');
+                    try renamed.appendSlice(self.gpa, name);
+                }
             }
             const before = bytes.items.len;
             const ctx: keys.Context = .{
@@ -671,6 +728,8 @@ const Session = struct {
         // its first output has settled.
         if (!self.output_seen and nowMs() - self.started_ms < 5_000) try self.settleFirstOutput(2_000);
 
+        self.last_send_ms = nowMs();
+        self.output_since_send = false;
         var from: usize = 0;
         for (pauses.items) |at| {
             if (at == bytes.items.len or esc_delay == 0) continue;
@@ -680,7 +739,11 @@ const Session = struct {
         }
         try self.queueInput(bytes.items[from..]);
         self.flushInput();
-        respond(fd, .ok, "");
+        if (renamed.items.len == 0) return respond(fd, .ok, "");
+        var note: std.Io.Writer.Allocating = .init(self.gpa);
+        defer note.deinit();
+        try note.writer.print("sent as keys: {s} (--literal sends such words as text)\n", .{renamed.items});
+        respond(fd, .ok, note.written());
     }
 
     /// Queues keys from `send` for the program (and the recording).
@@ -842,6 +905,37 @@ const Session = struct {
         }
     }
 
+    /// When `--settle ms` holds: `ms` after the last output, where that output
+    /// must come after the last send. A program that prints nothing in reply
+    /// to the keys gets `settle_grace_ms` to do so. Null while nothing has
+    /// been printed or sent at all.
+    fn settledAt(self: *const Session, ms: i64) ?i64 {
+        if (self.last_send_ms == 0 or self.output_since_send)
+            return if (self.output_seen) self.last_output_ms + ms else null;
+        return self.last_send_ms + @max(ms, settle_grace_ms);
+    }
+
+    /// When a wait for exit may give up because the program looks like it is
+    /// waiting for input: it has printed something (after the last send, if
+    /// there was one) and then nothing for `awaiting_input_ms`.
+    fn awaitingInputAt(self: *const Session, w: Waiter) ?i64 {
+        if (!w.exitOnly() or self.child_exited or !self.output_seen) return null;
+        if (self.last_send_ms != 0 and !self.output_since_send) return null;
+        if (self.awaiting_reported_send_ms) |at| {
+            if (at == self.last_send_ms) return null;
+        }
+        return @max(@max(self.last_change_ms, w.started) + awaiting_input_ms, self.awaiting_recheck_ms);
+    }
+
+    /// How the program has set the terminal up to read keys itself; null in
+    /// ordinary line mode with echo.
+    fn inputMode(self: *const Session) ?[]const u8 {
+        const tio = posix.tcgetattr(self.pty.slave) catch return null;
+        if (!tio.lflag.ICANON) return "the terminal is in raw mode";
+        if (!tio.lflag.ECHO) return "echo is off";
+        return null;
+    }
+
     fn evaluate(self: *Session, w: Waiter, lines: []const []const u8, now: i64) !?WaitOutcome {
         var out: WaitOutcome = .{ .condition = waitCondition(w), .satisfied = true, .reason = "", .elapsed_ms = now - w.started };
         if (w.text) |t| {
@@ -869,18 +963,30 @@ const Session = struct {
             return out;
         }
         if (w.idle_ms) |idle| {
-            if (now - @max(self.last_output_ms, w.started) >= idle) {
+            if (now - @max(self.last_change_ms, w.started) >= idle) {
                 out.reason = "idle";
                 return out;
             }
         }
         if (w.settle_ms) |ms| {
-            if (self.output_seen and now - self.last_output_ms >= ms) {
-                out.reason = "settle";
-                return out;
+            if (self.settledAt(ms)) |at| {
+                if (now >= at) {
+                    out.reason = "settle";
+                    return out;
+                }
             }
         }
         out.satisfied = false;
+        if (self.awaitingInputAt(w)) |at| {
+            if (now >= at) {
+                if (self.inputMode() != null) {
+                    self.awaiting_reported_send_ms = self.last_send_ms;
+                    out.reason = "awaiting-input";
+                    return out;
+                }
+                self.awaiting_recheck_ms = now + 250;
+            }
+        }
         // The screen can no longer change once the program is gone and its
         // output has been drained.
         if (w.screenOnly() and self.child_exited) {
@@ -1081,7 +1187,17 @@ const Session = struct {
                 try w.writeByte('\n');
             }
         }
-        if (!opts.styles) try writeHighlights(w, runs[0..shown_rows], dominantBackground(t));
+        if (!opts.styles) {
+            try writeHighlights(w, runs[0..shown_rows], dominantBackground(t));
+            const cell_rows = try arena.alloc([]const vt.Cell, shown_rows);
+            for (cell_rows, 0..) |*cells, r| cells.* = t.rowCells(r);
+            try stylenote.write(w, arena, cell_rows, !t.modes.cursor_visible);
+        }
+        if (opts.wait) |o| {
+            if (std.mem.eql(u8, o.reason, "awaiting-input")) {
+                try w.print("[headterm] still running: the screen has not changed for {d} s and {s}, so it is probably waiting for input (wait again if it is working)\n", .{ awaiting_input_ms / 1000, self.inputMode() orelse "the terminal is in raw mode" });
+            }
+        }
         try w.print("[headterm] {s} {d}x{d} cursor={d},{d}", .{ self.cfg.name, t.cols, t.rows, t.cursor.row, t.cursor.col });
         if (t.alt_active) try w.writeAll(" alt");
         if (t.title.items.len > 0) try w.print(" title=\"{s}\"", .{t.title.items});
@@ -1176,7 +1292,7 @@ const Session = struct {
 const color_names = [_][]const u8{ "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white" };
 
 /// "red", "bright-red", "208" or "#rrggbb"; null for the default color.
-fn colorName(buf: []u8, c: vt.Color) ?[]const u8 {
+pub fn colorName(buf: []u8, c: vt.Color) ?[]const u8 {
     return switch (c) {
         .default => null,
         .palette => |p| if (p < 8)
@@ -1190,7 +1306,7 @@ fn colorName(buf: []u8, c: vt.Color) ?[]const u8 {
 }
 
 /// Attribute names in a fixed order; colors are separate.
-fn styleAttrs(st: vt.Style, out: *[9][]const u8) [][]const u8 {
+pub fn styleAttrs(st: vt.Style, out: *[9][]const u8) [][]const u8 {
     var n: usize = 0;
     const flags = [_]struct { bool, []const u8 }{
         .{ st.bold, "bold" },
