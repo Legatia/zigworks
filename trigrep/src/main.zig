@@ -7,6 +7,7 @@ const walk = @import("walk.zig");
 const search = @import("search.zig");
 const engine = @import("engine.zig");
 const mcp = @import("mcp.zig");
+const watch = @import("watch.zig");
 
 pub const version = "0.1.0";
 
@@ -17,6 +18,8 @@ const usage =
     \\  trigrep [OPTIONS] PATTERN [PATH]   search; builds the index on first use
     \\  trigrep index [PATH]               build or rebuild the index for PATH
     \\  trigrep status [PATH]              show the index and how many files changed
+    \\  trigrep watch [PATH]               keep the index fresh; searches skip the full walk
+    \\  trigrep mcp                        run as an MCP server on stdin/stdout
     \\
     \\Search options:
     \\  -i, --ignore-case          case-insensitive (ASCII)
@@ -40,7 +43,7 @@ const usage =
     \\
 ;
 
-const Command = enum { search, index, status, mcp };
+const Command = enum { search, index, status, mcp, watch };
 
 const Args = struct {
     command: Command = .search,
@@ -170,6 +173,9 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
         } else if (std.mem.eql(u8, pos[0], "mcp")) {
             a.command = .mcp;
             pos = pos[1..];
+        } else if (std.mem.eql(u8, pos[0], "watch")) {
+            a.command = .watch;
+            pos = pos[1..];
         }
     }
     if (a.command == .search and a.pattern == null) {
@@ -197,6 +203,7 @@ pub fn main() !void {
 
     switch (a.command) {
         .mcp => return mcp.serve(gpa),
+        .watch => return watchMain(gpa, arena, a),
         .index => {
             const target = engine.resolve(arena, a.path, &diag) catch fail("{s}", .{diag.message});
             const b = engine.buildIndex(gpa, arena, target, a.threads) catch |err| fail("indexing failed: {s}", .{@errorName(err)});
@@ -229,6 +236,7 @@ pub fn main() !void {
         .no_index = a.no_index,
         .trust_index = a.trust_index,
         .threads = a.threads,
+        .watch = if (watch.supported) .{ .ptr = undefined, .changes = daemonChanges, .seeded = daemonSeeded } else null,
     };
     const outcome = engine.run(gpa, arena, req, out, &diag) catch |err| {
         out.flush() catch {};
@@ -242,6 +250,88 @@ pub fn main() !void {
     std.process.exit(if (outcome.totals.lines_matched > 0) 0 else 1);
 }
 
+fn daemonChanges(_: *anyopaque, arena: Allocator, _: []const u8, index_path: []const u8, build_id: u64, hidden: bool) ?watch.Changes {
+    if (hidden) return null;
+    const sock = watch.socketPath(arena, index_path) catch return null;
+    return watch.query(arena, sock, build_id);
+}
+
+fn daemonSeeded(_: *anyopaque, _: []const u8, _: u64, _: bool, _: []const []const u8) void {
+    // The daemon re-seeds itself.
+}
+
+fn readBuildId(path: []const u8) ?u64 {
+    var f = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer f.close();
+    var head: [80]u8 = undefined;
+    const n = f.readAll(&head) catch return null;
+    if (n < head.len or !std.mem.eql(u8, head[0..8], index.magic)) return null;
+    if (std.mem.readInt(u32, head[8..12], .little) != index.format_version) return null;
+    return std.mem.readInt(u64, head[72..80], .little);
+}
+
+fn reseed(gpa: Allocator, w: *watch.Watcher, root: []const u8, index_path: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    w.beginSeed();
+    var ix = try index.Index.open(index_path);
+    defer ix.close();
+    const entries = try walk.walk(arena, root, .{});
+    const changed = try engine.diffIndex(arena, &ix, entries);
+    w.seed(ix.build_id, changed);
+    std.debug.print("trigrep: tracking {d} files, {d} changed since indexing\n", .{ entries.len, changed.len });
+}
+
+fn watchMain(gpa: Allocator, arena: Allocator, a: Args) !void {
+    if (!watch.supported) fail("watch is only supported on macOS and Linux", .{});
+    var diag = engine.Diag{};
+    const target = engine.resolve(arena, a.path, &diag) catch fail("{s}", .{diag.message});
+    var found = try engine.findIndex(arena, target);
+    if (found == null or readBuildId(found.?.path) == null) {
+        const r = if (found) |f| f.root else ((try engine.gitRoot(arena, target)) orelse target);
+        const b = engine.buildIndex(gpa, arena, r, a.threads) catch |err| fail("indexing failed: {s}", .{@errorName(err)});
+        std.debug.print("trigrep: {s}\n", .{try engine.describeBuild(arena, r, b)});
+        found = .{ .root = r, .path = b.path };
+    }
+    const root = found.?.root;
+    const index_path = found.?.path;
+    const w = try watch.Watcher.create(gpa, root, false);
+    if (w.failed) fail("can't watch {s}", .{root});
+    const sock = try watch.socketPath(arena, index_path);
+    watch.ensureSocketDir(sock) catch |err| fail("socket directory for {s}: {s}", .{ sock, @errorName(err) });
+    _ = try std.Thread.spawn(.{}, watch.serve, .{ w, sock });
+    std.debug.print("trigrep: watching {s} (socket {s}); Ctrl-C stops\n", .{ root, sock });
+
+    var quiet_since = std.time.milliTimestamp();
+    var last_count: usize = 0;
+    while (true) {
+        const p = w.pending();
+        const current = readBuildId(index_path);
+        if (p.needs_seed or current == null or current.? != w.base_id) {
+            if (current == null) {
+                const b = engine.buildIndex(gpa, arena, root, a.threads) catch |err| fail("indexing failed: {s}", .{@errorName(err)});
+                std.debug.print("trigrep: {s}\n", .{try engine.describeBuild(arena, root, b)});
+            }
+            reseed(gpa, w, root, index_path) catch |err| std.debug.print("trigrep: re-seed failed: {s}\n", .{@errorName(err)});
+        } else {
+            if (p.count != last_count) quiet_since = std.time.milliTimestamp();
+            last_count = p.count;
+            // Many changes and a quiet second (e.g. after a branch switch): reindex.
+            if (p.count > 1000 and std.time.milliTimestamp() - quiet_since > 1000) {
+                const at = w.mark();
+                var build_arena = std.heap.ArenaAllocator.init(gpa);
+                defer build_arena.deinit();
+                if (engine.buildIndex(gpa, build_arena.allocator(), root, a.threads)) |b| {
+                    w.rebased(at, b.stats.build_id);
+                    std.debug.print("trigrep: {d} changes, re{s}\n", .{ p.count, try engine.describeBuild(build_arena.allocator(), root, b) });
+                } else |err| std.debug.print("trigrep: reindex failed: {s}\n", .{@errorName(err)});
+            }
+        }
+        std.Thread.sleep(500 * std.time.ns_per_ms);
+    }
+}
+
 test {
     _ = regex;
     _ = query;
@@ -250,5 +340,6 @@ test {
     _ = search;
     _ = engine;
     _ = mcp;
+    _ = @import("watch.zig");
     _ = @import("glob.zig");
 }

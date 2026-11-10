@@ -1,7 +1,7 @@
 //! The on-disk trigram index: one file per indexed root, read through mmap.
 //!
 //! Layout (little-endian):
-//!   header      magic, version, counts and section offsets (header_len bytes)
+//!   header      magic, version, counts, section offsets, build id (header_len bytes)
 //!   files       file_count x { path_off u32, path_len u32, size u64, mtime i64 }
 //!   paths       relative paths, concatenated
 //!   root        the absolute root path
@@ -16,8 +16,8 @@ const walk = @import("walk.zig");
 const Query = @import("query.zig").Query;
 
 pub const magic = "TRIGREP\x01";
-pub const format_version: u32 = 1;
-const header_len = 72;
+pub const format_version: u32 = 2;
+const header_len = 80;
 const file_rec = 24;
 const tri_rec = 16;
 const tri_space = 1 << 24;
@@ -83,6 +83,8 @@ pub const BuildStats = struct {
     trigrams: usize = 0,
     postings: u64 = 0,
     index_bytes: u64 = 0,
+    /// Random, nonzero; identifies this build of the index.
+    build_id: u64 = 0,
 };
 
 const PostList = struct {
@@ -147,7 +149,7 @@ fn writeU64(buf: []u8, off: usize, v: u64) void {
 /// Indexes `entries` (files under `root`) and writes the index to `out_path`
 /// atomically.
 pub fn build(gpa: Allocator, root: []const u8, entries: []const walk.Entry, out_path: []const u8, threads: usize) !BuildStats {
-    var stats = BuildStats{ .files = entries.len };
+    var stats = BuildStats{ .files = entries.len, .build_id = std.crypto.random.int(u64) | 1 };
     if (entries.len > std.math.maxInt(u32)) return error.TooManyFiles;
 
     var root_dir = try std.fs.cwd().openDir(root, .{});
@@ -270,6 +272,7 @@ pub fn build(gpa: Allocator, root: []const u8, entries: []const walk.Entry, out_
         writeU64(&head, 48, post_off);
         writeU64(&head, 56, root_off);
         writeU64(&head, 64, total);
+        writeU64(&head, 72, stats.build_id);
         try w.writeAll(&head);
 
         var po: u32 = 0;
@@ -326,6 +329,7 @@ pub const Index = struct {
     tris_off: usize,
     post_off: usize,
     root: []const u8,
+    build_id: u64,
 
     pub fn open(path: []const u8) !Index {
         var f = try std.fs.cwd().openFile(path, .{});
@@ -350,6 +354,7 @@ pub const Index = struct {
             .tris_off = rd64(data, 40),
             .post_off = rd64(data, 48),
             .root = data[root_off..][0..root_len],
+            .build_id = std.mem.readInt(u64, data[72..80], .little),
         };
         if (ix.files_off + @as(usize, ix.file_count) * file_rec > size or
             ix.tris_off + @as(usize, ix.tri_count) * tri_rec > size or ix.post_off > size)

@@ -8,6 +8,7 @@ trigrep -i 'todo|fixme' src/
 trigrep -w mutex_lock -g '*.c'
 trigrep index                        # rebuild after big changes (branch switch, pull)
 trigrep status                       # how many files changed since indexing
+trigrep watch &                      # optional: searches skip the freshness walk
 ```
 
 Output is `path:line:text`, like `rg -n --no-heading`. Exit status is 0 if something matched, 1 if not, 2 on error.
@@ -28,20 +29,28 @@ Tools:
 
 Paths are relative to the server's working directory, which is the project when Claude Code starts it. A bad pattern comes back as a tool error with the reason.
 
+The MCP server watches every repository it has searched (see below), so after the first search in a repo, later searches cost tens of milliseconds and still see every edit, including files written a moment before the search.
+
+## Watching
+
+`trigrep watch [PATH]` keeps a list of files changed since indexing, from FSEvents (macOS) or inotify (Linux), and serves it over a Unix socket in `/tmp/trigrep-$UID/`. While it runs, searches under that root re-check only those files instead of walking the whole tree. It reindexes on its own after a burst of more than 1,000 changes (a branch switch, say) once things are quiet for a second. `trigrep mcp` does the same in-process.
+
+Results stay correct when the watcher can't vouch for its list: dropped events, a changed `.gitignore`, an index rebuilt by someone else, or a filesystem without events all make the next search walk the tree and re-seed the watcher. On macOS, each search first writes a cookie file (in `.git` when there is one) and waits for its event, as Watchman does, so an edit made just before the search is never missed. On Linux, inotify queues events synchronously, so draining the queue is enough.
+
 ## Benchmarks
 
 Apple M-series, 10 cores, warm page cache, median of 5 runs, wall time including process start. Results are byte-identical to ripgrep 15.2 for every pattern below (`scripts/compare.sh`).
 
-Linux kernel (96,771 files, 1.7 GB; index 146 MB, built in 4.5 s):
+Linux kernel (96,771 files, 1.7 GB; index 146 MB, built in 4.5 s). ripgrep varied between 1.4 and 1.8 s across runs; the column is from the same run as the `watch` column:
 
-| pattern | rg | trigrep | trigrep --trust-index |
-|---|---:|---:|---:|
-| `spin_lock_irqsave` | 1467 ms | 159 ms | 26 ms |
-| `EXPORT_SYMBOL_GPL\(kmalloc` | 1398 ms | 179 ms | 10 ms |
-| `zzzqqqxxx` (no match) | 1340 ms | 154 ms | 2 ms |
-| `^static int __init \w+_init\(void\)` | 1388 ms | 246 ms | 56 ms |
-| `TODO\|FIXME\|XXX` | 1425 ms | 366 ms | 140 ms |
-| `struct \w+_ops \w+ = \{` | 1351 ms | 488 ms | 370 ms |
+| pattern | rg | trigrep | trigrep with `watch` | `--trust-index` |
+|---|---:|---:|---:|---:|
+| `spin_lock_irqsave` | 1432 ms | 200 ms | 45 ms | 26 ms |
+| `EXPORT_SYMBOL_GPL\(kmalloc` | 1434 ms | 131 ms | 12 ms | 4 ms |
+| `zzzqqqxxx` (no match) | 1406 ms | 133 ms | 12 ms | 3 ms |
+| `^static int __init \w+_init\(void\)` | 1464 ms | 183 ms | 55 ms | 38 ms |
+| `TODO\|FIXME\|XXX` | 1388 ms | 370 ms | 160 ms | 141 ms |
+| `struct \w+_ops \w+ = \{` | 1625 ms | 280 ms | 135 ms | 118 ms |
 
 Zig standard library (18,100 files, 171 MB; index 20 MB, built in 0.7 s):
 
@@ -52,7 +61,7 @@ Zig standard library (18,100 files, 171 MB; index 20 MB, built in 0.7 s):
 | `TODO\|FIXME` | 187 ms | 41 ms | 17 ms |
 | `\w+_\w+_\w+` (no literal to index) | 274 ms | 232 ms | 215 ms |
 
-Most of the default-mode time is the freshness check (walking and stat-ing every file, about 150 ms on Linux). `--trust-index` skips it and is only safe right after `trigrep index`. A watcher that keeps the index fresh is the next step, see below.
+Without a watcher, about 130 ms of each search is the freshness check (walking and stat-ing every file). `trigrep watch` replaces it with a ~10 ms query and stays correct; `--trust-index` skips it entirely and is only safe right after `trigrep index`.
 
 Reproduce: `zig build -Doptimize=ReleaseFast`, then `python3 scripts/bench.py DIR PATTERN...` and `scripts/compare.sh DIR PATTERN [flags]`.
 
@@ -60,7 +69,7 @@ Reproduce: `zig build -Doptimize=ReleaseFast`, then `python3 scripts/bench.py DI
 
 - **Index.** Every distinct trigram (3 bytes, ASCII-lowercased, never spanning a newline) of every text file, with a posting list of file ids (varint deltas). One file per indexed root under `$TRIGREP_INDEX_DIR`, `$XDG_CACHE_HOME/trigrep` or `~/.cache/trigrep`, read through mmap.
 - **Query.** The regex is parsed and turned into a trigram query (AND within literals, OR across alternation, nothing for optional parts), as in Russ Cox's [codesearch](https://swtch.com/~rsc/regexp/regexp4.html). Lowercased trigrams mean one index serves case-sensitive and `-i` searches.
-- **Freshness.** Before searching, trigrep walks the tree (in parallel, honouring ignore files) and compares sizes and mtimes with the index. Changed and new files are searched directly; deleted ones are dropped. Results are always correct, the index only decides how much has to be read.
+- **Freshness.** Before searching, trigrep asks the watcher for changed paths, or, without one, walks the tree (in parallel, honouring ignore files) and compares sizes and mtimes with the index. Changed and new files are searched directly; deleted ones are dropped. Results are always correct, the index only decides how much has to be read.
 - **Matching.** Its own regex engine (Zig's standard library has none): a parser, a Thompson NFA, a lazy DFA, and a Pike VM fallback for word boundaries. A required literal from the query (or a set of literals for alternations) skips straight to candidate lines.
 - **Walking.** ripgrep's defaults: `.gitignore`, `.ignore` and `.git/info/exclude` are honoured, hidden files and `.git` skipped, symlinks not followed, binary files (a NUL byte in the first 8 KB) skipped.
 
@@ -77,14 +86,13 @@ Reproduce: `zig build -Doptimize=ReleaseFast`, then `python3 scripts/bench.py DI
 
 ## Next
 
-- `trigrep watch`: FSEvents/inotify keeps a list of changed files, so searches skip the walk (target: Linux searches in tens of milliseconds without `--trust-index`).
 - Incremental index updates instead of full rebuilds.
 - `--json` output.
 - Unicode classes, context lines, `-o`, `--type`.
 
 ## Building
 
-Zig 0.15.1. `zig build -Doptimize=ReleaseFast` puts the binary in `zig-out/bin/trigrep`; `zig build test` runs the tests. No dependencies beyond the Zig standard library.
+Zig 0.15.1. `zig build -Doptimize=ReleaseFast` puts the binary in `zig-out/bin/trigrep`; `zig build test` runs the tests. No dependencies beyond the Zig standard library and libc (and CoreServices on macOS, for FSEvents).
 
 ## License
 

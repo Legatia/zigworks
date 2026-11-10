@@ -125,15 +125,102 @@ fn under(path: []const u8, prefix: []const u8) bool {
 
 /// Order of a depth-first walk with each directory sorted by name: compare paths
 /// bytewise, with `/` below every other byte.
-fn pathLess(_: void, a: Entry, b: Entry) bool {
-    const n = @min(a.path.len, b.path.len);
-    for (a.path[0..n], b.path[0..n]) |x, y| {
+pub fn pathOrder(a: []const u8, b: []const u8) bool {
+    const n = @min(a.len, b.len);
+    for (a[0..n], b[0..n]) |x, y| {
         if (x == y) continue;
         const xx: u16 = if (x == '/') 0 else @as(u16, x) + 1;
         const yy: u16 = if (y == '/') 0 else @as(u16, y) + 1;
         return xx < yy;
     }
-    return a.path.len < b.path.len;
+    return a.len < b.len;
+}
+
+fn pathLess(_: void, a: Entry, b: Entry) bool {
+    return pathOrder(a.path, b.path);
+}
+
+/// Answers "would the walker skip this path?" for single paths, loading ignore files
+/// along the way and caching them per directory. Not thread-safe.
+pub const Checker = struct {
+    arena_state: std.heap.ArenaAllocator,
+    root: std.fs.Dir,
+    hidden: bool,
+    nodes: std.StringHashMapUnmanaged(?*const RuleNode) = .empty,
+
+    pub fn init(gpa: Allocator, root: []const u8, hidden: bool) !Checker {
+        return .{
+            .arena_state = std.heap.ArenaAllocator.init(gpa),
+            .root = try std.fs.cwd().openDir(root, .{}),
+            .hidden = hidden,
+        };
+    }
+
+    pub fn deinit(c: *Checker) void {
+        c.root.close();
+        c.arena_state.deinit();
+    }
+
+    /// Forget cached ignore files (after one of them changed).
+    pub fn reset(c: *Checker) void {
+        _ = c.arena_state.reset(.free_all);
+        c.nodes = .empty;
+    }
+
+    fn nodeFor(c: *Checker, dir_rel: []const u8) !?*const RuleNode {
+        if (c.nodes.get(dir_rel)) |n| return n;
+        const parent: ?*const RuleNode = if (dir_rel.len == 0)
+            null
+        else
+            try c.nodeFor(if (std.mem.lastIndexOfScalar(u8, dir_rel, '/')) |i| dir_rel[0..i] else "");
+        const arena = c.arena_state.allocator();
+        var rules: std.ArrayList(Rule) = .empty;
+        const base = try arena.dupe(u8, dir_rel);
+        var opened: ?std.fs.Dir = if (dir_rel.len == 0) null else (c.root.openDir(dir_rel, .{}) catch null);
+        defer if (opened) |*d| d.close();
+        const dir = if (dir_rel.len == 0) c.root else opened;
+        if (dir) |d| {
+            const names = if (dir_rel.len == 0)
+                &[_][]const u8{ ".git/info/exclude", ".gitignore", ".ignore" }
+            else
+                &[_][]const u8{ ".gitignore", ".ignore" };
+            for (names) |name| {
+                const text = d.readFileAlloc(arena, name, 4 << 20) catch continue;
+                try parseIgnoreFile(arena, text, base, &rules);
+            }
+        }
+        var node = parent;
+        if (rules.items.len > 0) {
+            const n = try arena.create(RuleNode);
+            n.* = .{ .parent = parent, .rules = rules.items };
+            node = n;
+        }
+        try c.nodes.put(arena, base, node);
+        return node;
+    }
+
+    /// True if the walker would never report `rel` (a file, or a directory when
+    /// `is_dir`): hidden, under `.git`, or ignored, itself or through an ancestor.
+    pub fn skipped(c: *Checker, rel: []const u8, is_dir: bool) !bool {
+        var start: usize = 0;
+        while (start < rel.len) {
+            const slash = std.mem.indexOfScalarPos(u8, rel, start, '/');
+            const end = slash orelse rel.len;
+            const name = rel[start..end];
+            if (std.mem.eql(u8, name, ".git")) return true;
+            if (!c.hidden and name.len > 0 and name[0] == '.') return true;
+            const parent_rel = if (start == 0) "" else rel[0 .. start - 1];
+            if (ignored(try c.nodeFor(parent_rel), rel[0..end], name, slash != null or is_dir)) return true;
+            start = end + 1;
+        }
+        return false;
+    }
+};
+
+/// Stats `rel` under `root` without following a final symlink.
+pub fn lstat(root: std.fs.Dir, rel: []const u8) ?std.fs.File.Stat {
+    const st = std.posix.fstatat(root.fd, rel, std.posix.AT.SYMLINK_NOFOLLOW) catch return null;
+    return std.fs.File.Stat.fromPosix(st);
 }
 
 const Task = struct { rel: []const u8, rules: ?*const RuleNode };
@@ -315,6 +402,30 @@ test "walk honours gitignore, hidden files and prefix" {
     const sub = try walk(arena.allocator(), root, .{ .prefix = "src" });
     try std.testing.expectEqual(@as(usize, 1), sub.len);
     try std.testing.expectEqualStrings("src/main.zig", sub[0].path);
+}
+
+test "checker agrees with the walker" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.makePath("src/gen");
+    try d.makePath("node_modules/x");
+    try d.writeFile(.{ .sub_path = ".gitignore", .data = "node_modules/\n*.log\n!keep.log\n" });
+    try d.writeFile(.{ .sub_path = "src/.gitignore", .data = "gen/\n" });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try tmp.dir.realpathAlloc(arena.allocator(), ".");
+    var c = try Checker.init(std.testing.allocator, root, false);
+    defer c.deinit();
+    try std.testing.expect(!try c.skipped("src/main.zig", false));
+    try std.testing.expect(try c.skipped("src/gen/out.zig", false));
+    try std.testing.expect(try c.skipped("node_modules/x/i.js", false));
+    try std.testing.expect(try c.skipped("a.log", false));
+    try std.testing.expect(!try c.skipped("keep.log", false));
+    try std.testing.expect(try c.skipped(".hidden/h", false));
+    try std.testing.expect(try c.skipped(".git/HEAD", false));
+    try std.testing.expect(try c.skipped("src/gen", true));
+    try std.testing.expect(!try c.skipped("src", true));
 }
 
 test "filter globs" {

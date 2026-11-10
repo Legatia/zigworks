@@ -9,9 +9,20 @@ const query = @import("query.zig");
 const index = @import("index.zig");
 const walk = @import("walk.zig");
 const search = @import("search.zig");
+const watch = @import("watch.zig");
 
 pub const Diag = struct {
     message: []const u8 = "",
+};
+
+/// Where searches get the list of changed files from, instead of walking the tree:
+/// an in-process watcher (MCP server) or a `trigrep watch` daemon (CLI).
+pub const WatchHook = struct {
+    ptr: *anyopaque,
+    /// Changes under `root` since index `build_id`; null if nothing watches it.
+    changes: *const fn (ptr: *anyopaque, arena: Allocator, root: []const u8, index_path: []const u8, build_id: u64, hidden: bool) ?watch.Changes,
+    /// A full walk of `root` just found `changed` to differ from index `build_id`.
+    seeded: *const fn (ptr: *anyopaque, root: []const u8, build_id: u64, hidden: bool, changed: []const []const u8) void,
 };
 
 pub const Request = struct {
@@ -28,6 +39,7 @@ pub const Request = struct {
     threads: ?usize = null,
     /// Stop after this many output lines.
     limit: ?usize = null,
+    watch: ?WatchHook = null,
 };
 
 pub const Outcome = struct {
@@ -169,8 +181,16 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
         const prefix = relUnder(root, target);
 
         const t_load = std.time.nanoTimestamp();
-        var ix = index.Index.open(found.?.path) catch |err|
-            return failWith(diag, arena, "can't read index {s}: {s} (run `trigrep index`)", .{ found.?.path, @errorName(err) });
+        var ix = index.Index.open(found.?.path) catch |err| blk: {
+            if (err != error.BadIndex)
+                return failWith(diag, arena, "can't read index {s}: {s}", .{ found.?.path, @errorName(err) });
+            // Older format or damaged: rebuild it.
+            const b = buildIndex(gpa, arena, root, req.threads) catch |e|
+                return failWith(diag, arena, "rebuilding index for {s} failed: {s}", .{ root, @errorName(e) });
+            outcome.built_index = try describeBuild(arena, root, b);
+            break :blk index.Index.open(b.path) catch |e|
+                return failWith(diag, arena, "can't read index {s}: {s}", .{ b.path, @errorName(e) });
+        };
         defer ix.close();
         if (!std.mem.eql(u8, ix.root, root))
             return failWith(diag, arena, "index {s} belongs to {s}; run `trigrep index`", .{ found.?.path, ix.root });
@@ -198,29 +218,48 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
             outcome.stats = try std.fmt.allocPrint(arena, "index {d:.1} ms, {d} candidates, no freshness check", .{ load_ms, n_cand });
         } else {
             const t_fresh = std.time.nanoTimestamp();
-            const entries = try walk.walk(arena, root, .{ .hidden = req.hidden, .prefix = prefix });
-            var by_path = std.StringHashMapUnmanaged(u32){};
-            try by_path.ensureTotalCapacity(arena, ix.file_count);
-            var id: u32 = 0;
-            while (id < ix.file_count) : (id += 1) by_path.putAssumeCapacity(ix.file(id).path, id);
-            var dirty: usize = 0;
-            for (entries) |e| {
-                var changed = true;
-                var candidate = true;
-                if (by_path.get(e.path)) |fid| {
-                    const rec = ix.file(fid);
-                    changed = rec.size != e.size or rec.mtime != e.mtime;
-                    candidate = cand_set.isSet(fid);
+            const ch: ?watch.Changes = if (req.watch) |h| h.changes(h.ptr, arena, root, found.?.path, ix.build_id, req.hidden) else null;
+            if (ch != null and !ch.?.full) {
+                const n = try watchedJobs(gpa, arena, req, root, prefix, &ix, &cand_set, filter, ch.?, &jobs);
+                if (n > 2000 and n * 10 > ix.file_count)
+                    outcome.note = try std.fmt.allocPrint(arena, "{d} files changed since indexing; reindexing makes searches fast again", .{n});
+                outcome.stats = try std.fmt.allocPrint(arena, "index {d:.1} ms, {d} candidates, watcher {d:.1} ms: {d} changed files, {d} changed dirs", .{ load_ms, n_cand, ms(t_fresh), ch.?.files.len, ch.?.dirs.len });
+            } else {
+                const entries = try walk.walk(arena, root, .{ .hidden = req.hidden, .prefix = prefix });
+                var by_path = std.StringHashMapUnmanaged(u32){};
+                try by_path.ensureTotalCapacity(arena, ix.file_count);
+                var id: u32 = 0;
+                while (id < ix.file_count) : (id += 1) by_path.putAssumeCapacity(ix.file(id).path, id);
+                var seen = try std.DynamicBitSetUnmanaged.initEmpty(arena, ix.file_count);
+                var changed_paths: std.ArrayList([]const u8) = .empty;
+                for (entries) |e| {
+                    var changed = true;
+                    var candidate = true;
+                    if (by_path.get(e.path)) |fid| {
+                        seen.set(fid);
+                        const rec = ix.file(fid);
+                        changed = rec.size != e.size or rec.mtime != e.mtime;
+                        candidate = cand_set.isSet(fid);
+                    }
+                    if (changed) try changed_paths.append(arena, e.path);
+                    if (!changed and !candidate) continue;
+                    const rel = e.path[strip..];
+                    if (!filter.allows(rel)) continue;
+                    try jobs.append(arena, .{ .path = e.path, .display = try displayPath(arena, req.path, rel) });
                 }
-                if (changed) dirty += 1;
-                if (!changed and !candidate) continue;
-                const rel = e.path[strip..];
-                if (!filter.allows(rel)) continue;
-                try jobs.append(arena, .{ .path = e.path, .display = try displayPath(arena, req.path, rel) });
+                const dirty = changed_paths.items.len;
+                if (req.watch) |h| if (prefix.len == 0) {
+                    // Deleted files count as changed too, so later watched searches drop them.
+                    id = 0;
+                    while (id < ix.file_count) : (id += 1) {
+                        if (!seen.isSet(id)) try changed_paths.append(arena, try arena.dupe(u8, ix.file(id).path));
+                    }
+                    h.seeded(h.ptr, root, ix.build_id, req.hidden, changed_paths.items);
+                };
+                if (dirty > 200 and dirty * 10 > entries.len)
+                    outcome.note = try std.fmt.allocPrint(arena, "{d} files changed since indexing; reindexing makes searches fast again", .{dirty});
+                outcome.stats = try std.fmt.allocPrint(arena, "index {d:.1} ms, {d} candidates, freshness check {d:.1} ms over {d} files, {d} changed", .{ load_ms, n_cand, ms(t_fresh), entries.len, dirty });
             }
-            if (dirty > 200 and dirty * 10 > entries.len)
-                outcome.note = try std.fmt.allocPrint(arena, "{d} files changed since indexing; reindexing makes searches fast again", .{dirty});
-            outcome.stats = try std.fmt.allocPrint(arena, "index {d:.1} ms, {d} candidates, freshness check {d:.1} ms over {d} files, {d} changed", .{ load_ms, n_cand, ms(t_fresh), entries.len, dirty });
         }
     }
 
@@ -234,6 +273,105 @@ pub fn run(gpa: Allocator, arena: Allocator, req: Request, out: *std.Io.Writer, 
         ms(t_start),
     });
     return outcome;
+}
+
+fn under(path: []const u8, dir: []const u8) bool {
+    if (dir.len == 0) return true;
+    return path.len > dir.len and std.mem.startsWith(u8, path, dir) and path[dir.len] == '/';
+}
+
+fn underAny(path: []const u8, dirs: []const []const u8) bool {
+    for (dirs) |d| {
+        if (std.mem.eql(u8, path, d) or under(path, d)) return true;
+    }
+    return false;
+}
+
+fn jobLess(_: void, a: search.Job, b: search.Job) bool {
+    return walk.pathOrder(a.path, b.path);
+}
+
+/// Jobs for a search when a watcher vouches for the list of changes: index
+/// candidates that didn't change, plus changed files and changed directories
+/// re-checked directly. Returns how many paths changed.
+fn watchedJobs(
+    gpa: Allocator,
+    arena: Allocator,
+    req: Request,
+    root: []const u8,
+    prefix: []const u8,
+    ix: *const index.Index,
+    cand_set: *const std.DynamicBitSetUnmanaged,
+    filter: walk.Filter,
+    ch: watch.Changes,
+    jobs: *std.ArrayList(search.Job),
+) !usize {
+    const strip = if (prefix.len == 0) 0 else prefix.len + 1;
+    var dirty = std.StringHashMapUnmanaged(void){};
+    for (ch.files) |f| try dirty.put(arena, f, {});
+
+    var id: u32 = 0;
+    while (id < ix.file_count) : (id += 1) {
+        if (!cand_set.isSet(id)) continue;
+        const rec = ix.file(id);
+        if (!under(rec.path, prefix)) continue;
+        if (dirty.contains(rec.path) or underAny(rec.path, ch.dirs)) continue;
+        if (!filter.allows(rec.path[strip..])) continue;
+        const path = try arena.dupe(u8, rec.path);
+        try jobs.append(arena, .{ .path = path, .display = try displayPath(arena, req.path, path[strip..]) });
+    }
+
+    var root_dir = try std.fs.cwd().openDir(root, .{});
+    defer root_dir.close();
+    var checker = try walk.Checker.init(gpa, root, req.hidden);
+    defer checker.deinit();
+    for (ch.files) |f| {
+        if (!under(f, prefix) or underAny(f, ch.dirs)) continue;
+        const st = walk.lstat(root_dir, f) orelse continue;
+        if (st.kind != .file) continue;
+        if (try checker.skipped(f, false)) continue;
+        if (!filter.allows(f[strip..])) continue;
+        try jobs.append(arena, .{ .path = f, .display = try displayPath(arena, req.path, f[strip..]) });
+    }
+
+    for (ch.dirs, 0..) |d, i| {
+        var nested = false;
+        for (ch.dirs, 0..) |other, j| {
+            if (i != j and (under(d, other) or (std.mem.eql(u8, d, other) and j < i))) nested = true;
+        }
+        if (nested) continue;
+        const wp = if (under(d, prefix) or std.mem.eql(u8, d, prefix)) d else if (under(prefix, d)) prefix else continue;
+        const entries = try walk.walk(arena, root, .{ .hidden = req.hidden, .prefix = wp });
+        for (entries) |e| {
+            if (!filter.allows(e.path[strip..])) continue;
+            try jobs.append(arena, .{ .path = e.path, .display = try displayPath(arena, req.path, e.path[strip..]) });
+        }
+    }
+    std.mem.sort(search.Job, jobs.items, {}, jobLess);
+    return ch.files.len + ch.dirs.len;
+}
+
+/// Paths that differ between index `ix` and a full walk: modified, new and deleted.
+pub fn diffIndex(arena: Allocator, ix: *const index.Index, entries: []const walk.Entry) ![]const []const u8 {
+    var by_path = std.StringHashMapUnmanaged(u32){};
+    try by_path.ensureTotalCapacity(arena, ix.file_count);
+    var id: u32 = 0;
+    while (id < ix.file_count) : (id += 1) by_path.putAssumeCapacity(ix.file(id).path, id);
+    var seen = try std.DynamicBitSetUnmanaged.initEmpty(arena, ix.file_count);
+    var out: std.ArrayList([]const u8) = .empty;
+    for (entries) |e| {
+        if (by_path.get(e.path)) |fid| {
+            seen.set(fid);
+            const rec = ix.file(fid);
+            if (rec.size == e.size and rec.mtime == e.mtime) continue;
+        }
+        try out.append(arena, e.path);
+    }
+    id = 0;
+    while (id < ix.file_count) : (id += 1) {
+        if (!seen.isSet(id)) try out.append(arena, try arena.dupe(u8, ix.file(id).path));
+    }
+    return out.items;
 }
 
 pub const Status = struct {

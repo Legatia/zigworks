@@ -6,6 +6,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const engine = @import("engine.zig");
 const search = @import("search.zig");
+const watch = @import("watch.zig");
 const version = @import("main.zig").version;
 
 const Value = std.json.Value;
@@ -56,6 +57,49 @@ fn oneLine(comptime text: []const u8) []const u8 {
     }
 }
 
+/// Watchers started by this server, one per searched root. The first search of a root
+/// walks the tree and seeds its watcher; later searches only re-check what changed.
+pub const Registry = struct {
+    gpa: Allocator,
+    watchers: std.StringHashMapUnmanaged(*watch.Watcher) = .empty,
+
+    pub fn deinit(r: *Registry) void {
+        var it = r.watchers.valueIterator();
+        while (it.next()) |w| w.*.destroy();
+        r.watchers.deinit(r.gpa);
+    }
+
+    pub fn hook(r: *Registry) engine.WatchHook {
+        return .{ .ptr = r, .changes = changes, .seeded = seeded };
+    }
+
+    fn get(r: *Registry, root: []const u8) ?*watch.Watcher {
+        return r.watchers.get(root);
+    }
+
+    fn changes(ptr: *anyopaque, arena: Allocator, root: []const u8, _: []const u8, build_id: u64, hidden: bool) ?watch.Changes {
+        if (!watch.supported or hidden) return null;
+        const r: *Registry = @ptrCast(@alignCast(ptr));
+        const w = r.watchers.get(root) orelse blk: {
+            const nw = watch.Watcher.create(r.gpa, root, false) catch return null;
+            r.watchers.put(r.gpa, nw.root, nw) catch {
+                nw.destroy();
+                return null;
+            };
+            break :blk nw;
+        };
+        const ch = w.changes(arena, build_id) catch return null;
+        if (ch.full) w.beginSeed();
+        return ch;
+    }
+
+    fn seeded(ptr: *anyopaque, root: []const u8, build_id: u64, hidden: bool, changed: []const []const u8) void {
+        if (hidden) return;
+        const r: *Registry = @ptrCast(@alignCast(ptr));
+        if (r.watchers.get(root)) |w| w.seed(build_id, changed);
+    }
+};
+
 const RpcError = struct { code: i32, message: []const u8 };
 
 const ToolResult = struct { text: []const u8, is_error: bool = false };
@@ -75,7 +119,7 @@ fn int(obj: std.json.ObjectMap, key: []const u8) ?usize {
     return if (v == .integer and v.integer > 0) @intCast(v.integer) else null;
 }
 
-fn toolSearch(gpa: Allocator, arena: Allocator, args: std.json.ObjectMap) !ToolResult {
+fn toolSearch(gpa: Allocator, arena: Allocator, reg: ?*Registry, args: std.json.ObjectMap) !ToolResult {
     const pattern = str(args, "pattern") orelse return .{ .text = "missing argument: pattern", .is_error = true };
     var globs: std.ArrayList([]const u8) = .empty;
     if (args.get("glob")) |g| switch (g) {
@@ -98,6 +142,7 @@ fn toolSearch(gpa: Allocator, arena: Allocator, args: std.json.ObjectMap) !ToolR
         .max_count = int(args, "max_per_file"),
         .globs = globs.items,
         .limit = limit,
+        .watch = if (reg) |r| r.hook() else null,
     };
     var aw = std.Io.Writer.Allocating.init(arena);
     var diag = engine.Diag{};
@@ -113,11 +158,15 @@ fn toolSearch(gpa: Allocator, arena: Allocator, args: std.json.ObjectMap) !ToolR
     return .{ .text = aw.written() };
 }
 
-fn toolIndex(gpa: Allocator, arena: Allocator, args: std.json.ObjectMap) !ToolResult {
+fn toolIndex(gpa: Allocator, arena: Allocator, reg: ?*Registry, args: std.json.ObjectMap) !ToolResult {
     var diag = engine.Diag{};
     const target = engine.resolve(arena, str(args, "path"), &diag) catch return .{ .text = diag.message, .is_error = true };
+    const w = if (reg) |r| r.get(target) else null;
+    const at = if (w) |x| x.mark() else 0;
     const b = engine.buildIndex(gpa, arena, target, null) catch |err|
         return .{ .text = try std.fmt.allocPrint(arena, "indexing failed: {s}", .{@errorName(err)}), .is_error = true };
+    // Changes the rebuild saw are in the new index; keep only what happened after it began.
+    if (w) |x| x.rebased(at, b.stats.build_id);
     return .{ .text = try engine.describeBuild(arena, target, b) };
 }
 
@@ -147,7 +196,7 @@ fn writeError(w: *std.Io.Writer, id: Value, e: RpcError) !void {
 
 /// Handles one JSON-RPC message and writes the reply (if any) to `w`. Returns false
 /// when the message was a notification (nothing written).
-pub fn handle(gpa: Allocator, arena: Allocator, line: []const u8, w: *std.Io.Writer) !bool {
+pub fn handle(gpa: Allocator, arena: Allocator, reg: ?*Registry, line: []const u8, w: *std.Io.Writer) !bool {
     const parsed = std.json.parseFromSliceLeaky(Value, arena, line, .{}) catch {
         try writeError(w, .null, .{ .code = -32700, .message = "parse error" });
         return true;
@@ -184,9 +233,9 @@ pub fn handle(gpa: Allocator, arena: Allocator, line: []const u8, w: *std.Io.Wri
         };
         const args: std.json.ObjectMap = if (params.get("arguments")) |a| (if (a == .object) a.object else .init(arena)) else .init(arena);
         const result: ToolResult = if (std.mem.eql(u8, name, "trigrep_search"))
-            try toolSearch(gpa, arena, args)
+            try toolSearch(gpa, arena, reg, args)
         else if (std.mem.eql(u8, name, "trigrep_index"))
-            try toolIndex(gpa, arena, args)
+            try toolIndex(gpa, arena, reg, args)
         else if (std.mem.eql(u8, name, "trigrep_status"))
             try toolStatus(arena, args)
         else {
@@ -213,6 +262,8 @@ pub fn serve(gpa: Allocator) !void {
     var out_buf: [1 << 16]u8 = undefined;
     var writer = std.fs.File.stdout().writerStreaming(&out_buf);
     const w = &writer.interface;
+    var reg = Registry{ .gpa = gpa };
+    defer reg.deinit();
 
     while (true) {
         const raw = r.takeDelimiterExclusive('\n') catch |err| switch (err) {
@@ -231,7 +282,7 @@ pub fn serve(gpa: Allocator) !void {
         if (line.len == 0) continue;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
-        const replied = handle(gpa, arena_state.allocator(), line, w) catch |err| blk: {
+        const replied = handle(gpa, arena_state.allocator(), &reg, line, w) catch |err| blk: {
             std.debug.print("trigrep mcp: {s}\n", .{@errorName(err)});
             break :blk false;
         };
@@ -251,7 +302,7 @@ fn call(line: []const u8) ![]u8 {
     defer arena.deinit();
     var aw = std.Io.Writer.Allocating.init(gpa);
     defer aw.deinit();
-    _ = try handle(gpa, arena.allocator(), line, &aw.writer);
+    _ = try handle(gpa, arena.allocator(), null, line, &aw.writer);
     return gpa.dupe(u8, aw.written());
 }
 
