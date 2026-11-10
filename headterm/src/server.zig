@@ -131,6 +131,8 @@ const Waiter = struct {
     regex: ?*regex.Regex = null,
     gone: ?[]u8 = null,
     idle_ms: ?i64 = null,
+    /// The program has printed something, then nothing for this long.
+    settle_ms: ?i64 = null,
     exit: bool = false,
     /// Owned copy of the --client id that render.client points to.
     client: ?[]u8 = null,
@@ -140,7 +142,7 @@ const Waiter = struct {
 
     /// Conditions that only depend on what is on screen.
     fn screenOnly(w: Waiter) bool {
-        return (w.text != null or w.regex != null or w.gone != null) and w.idle_ms == null and !w.exit;
+        return (w.text != null or w.regex != null or w.gone != null) and w.idle_ms == null and w.settle_ms == null and !w.exit;
     }
 };
 
@@ -155,6 +157,7 @@ fn waitCondition(w: Waiter) []const u8 {
     if (w.regex != null) return "regex";
     if (w.gone != null) return "gone";
     if (w.idle_ms != null) return "idle";
+    if (w.settle_ms != null) return "settle";
     return "exit";
 }
 
@@ -200,6 +203,8 @@ const Session = struct {
     waiters: std.ArrayList(Waiter) = .empty,
     quit: bool = false,
     log_fd: ?posix.fd_t = null,
+    /// The program has printed anything at all.
+    output_seen: bool = false,
     recorder: ?record.Recorder = null,
 
     fn init(gpa: Allocator, cfg: Config) !Session {
@@ -340,6 +345,9 @@ const Session = struct {
         for (self.waiters.items) |w| {
             var t = w.deadline;
             if (w.idle_ms) |idle| t = @min(t, @max(self.last_output_ms, w.started) + idle);
+            if (w.settle_ms) |ms| {
+                if (self.output_seen) t = @min(t, self.last_output_ms + ms);
+            }
             next = if (next) |n| @min(n, t) else t;
         }
         if (self.expiresAt()) |t| next = if (next) |n| @min(n, t) else t;
@@ -390,6 +398,7 @@ const Session = struct {
         if (total > 0) {
             self.last_output_ms = nowMs();
             self.last_activity_ms = self.last_output_ms;
+            self.output_seen = true;
         }
         if (self.input.items.len > 0) self.flushInput();
     }
@@ -642,7 +651,7 @@ const Session = struct {
                 respond(fd, .@"error", msg);
                 return;
             };
-            if (keys.isKeySyntax(a) and bytes.items.len == before + 1 and bytes.items[before] == 0x1b) {
+            if ((keys.isKeySyntax(a) or keys.isBareKey(a)) and bytes.items.len == before + 1 and bytes.items[before] == 0x1b) {
                 try pauses.append(self.gpa, bytes.items.len);
             }
         }
@@ -657,6 +666,11 @@ const Session = struct {
             respond(fd, .@"error", "the program has exited, so nothing was sent; 'screen' still shows its last screen and 'kill' ends the session\n");
             return;
         }
+        // Keys sent before a just-started program has drawn anything can be
+        // lost (some programs flush typeahead) or misread, so hold them until
+        // its first output has settled.
+        if (!self.output_seen and nowMs() - self.started_ms < 5_000) try self.settleFirstOutput(2_000);
+
         var from: usize = 0;
         for (pauses.items) |at| {
             if (at == bytes.items.len or esc_delay == 0) continue;
@@ -674,6 +688,22 @@ const Session = struct {
         if (bytes.len == 0) return;
         try self.input.appendSlice(self.gpa, bytes);
         if (self.recorder) |*r| r.input(bytes);
+    }
+
+    /// Reads output until the program has printed something and then been
+    /// quiet for 150 ms, or for at most `max_ms`.
+    fn settleFirstOutput(self: *Session, max_ms: i64) !void {
+        const until = nowMs() + max_ms;
+        while (self.pty_open) {
+            const now = nowMs();
+            if (now >= until) break;
+            if (self.output_seen and now - self.last_output_ms >= 150) break;
+            var pfd = [_]posix.pollfd{.{ .fd = self.pty.master, .events = posix.POLL.IN, .revents = 0 }};
+            _ = try posix.poll(&pfd, @intCast(@min(until - now, 50)));
+            if (pfd[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) try self.readPty();
+            if (!self.child_exited) try self.reapChild();
+            if (self.child_exited and self.output_seen) break;
+        }
     }
 
     /// Keeps reading output and writing queued input for `ms` milliseconds.
@@ -732,6 +762,8 @@ const Session = struct {
                     const ptr = try self.gpa.create(regex.Regex);
                     ptr.* = re;
                     w.regex = ptr;
+                } else if (std.mem.eql(u8, a, "--settle")) {
+                    w.settle_ms = std.fmt.parseInt(i64, v, 10) catch return self.waitErrorf(w, "wait: --settle needs milliseconds, got '{s}'", .{v});
                 } else if (std.mem.eql(u8, a, "--idle")) {
                     w.idle_ms = std.fmt.parseInt(i64, v, 10) catch return self.waitErrorf(w, "wait: --idle needs milliseconds, got '{s}'", .{v});
                 } else if (std.mem.eql(u8, a, "--timeout")) {
@@ -746,15 +778,15 @@ const Session = struct {
                     return self.waitErrorf(w, "wait: unknown option '{s}' (see 'headterm help wait')", .{a});
                 }
             } else {
-                const known = for ([_][]const u8{ "--text", "--text-gone", "--regex", "--idle", "--timeout", "--scrollback", "--client" }) |k| {
+                const known = for ([_][]const u8{ "--text", "--text-gone", "--regex", "--idle", "--settle", "--timeout", "--scrollback", "--client" }) |k| {
                     if (std.mem.eql(u8, a, k)) break true;
                 } else false;
                 if (known) return self.waitErrorf(w, "wait: {s} needs a value", .{a});
                 return self.waitErrorf(w, "wait: unknown option '{s}' (see 'headterm help wait')", .{a});
             }
         }
-        if (w.text == null and w.regex == null and w.gone == null and w.idle_ms == null and !w.exit) {
-            return self.waitError(w, "wait: give a condition: --text STR, --regex RE, --text-gone STR, --idle MS or --exit");
+        if (w.text == null and w.regex == null and w.gone == null and w.idle_ms == null and w.settle_ms == null and !w.exit) {
+            return self.waitError(w, "wait: give a condition: --text STR, --regex RE, --text-gone STR, --idle MS, --settle MS or --exit");
         }
         if (w.client) |c| w.render.client = c;
         w.deadline = w.started + timeout;
@@ -839,6 +871,12 @@ const Session = struct {
         if (w.idle_ms) |idle| {
             if (now - @max(self.last_output_ms, w.started) >= idle) {
                 out.reason = "idle";
+                return out;
+            }
+        }
+        if (w.settle_ms) |ms| {
+            if (self.output_seen and now - self.last_output_ms >= ms) {
+                out.reason = "settle";
                 return out;
             }
         }
@@ -1043,6 +1081,7 @@ const Session = struct {
                 try w.writeByte('\n');
             }
         }
+        if (!opts.styles) try writeHighlights(w, runs[0..shown_rows], dominantBackground(t));
         try w.print("[headterm] {s} {d}x{d} cursor={d},{d}", .{ self.cfg.name, t.cols, t.rows, t.cursor.row, t.cursor.col });
         if (t.alt_active) try w.writeAll(" alt");
         if (t.title.items.len > 0) try w.print(" title=\"{s}\"", .{t.title.items});
@@ -1189,6 +1228,78 @@ fn writeRunsText(w: *std.Io.Writer, runs: []const Session.Run) !void {
         }
         try w.writeByte(']');
     }
+}
+
+/// The background a cell visibly has: its background color, or with
+/// inverse its foreground color.
+const Background = struct {
+    inverse: bool,
+    color: vt.Color,
+
+    fn of(st: vt.Style) Background {
+        return if (st.inverse) .{ .inverse = true, .color = st.fg } else .{ .inverse = false, .color = st.bg };
+    }
+
+    fn eql(a: Background, b: Background) bool {
+        return a.inverse == b.inverse and std.meta.eql(a.color, b.color);
+    }
+};
+
+/// The most common visible background on screen. Programs that paint the
+/// whole screen in a color (curses with start_color) make that the normal
+/// background, not a highlight.
+fn dominantBackground(t: *const vt.Terminal) Background {
+    var seen: [16]Background = undefined;
+    var counts: [16]usize = undefined;
+    var n: usize = 0;
+    for (0..t.rows) |r| {
+        for (t.rowCells(r)) |cell| {
+            const k = Background.of(cell.style);
+            for (seen[0..n], 0..) |existing, i| {
+                if (existing.eql(k)) {
+                    counts[i] += 1;
+                    break;
+                }
+            } else if (n < seen.len) {
+                seen[n] = k;
+                counts[n] = 1;
+                n += 1;
+            }
+        }
+    }
+    var best: usize = 0;
+    for (counts[0..n], 0..) |c, i| {
+        if (c > counts[best]) best = i;
+    }
+    return if (n == 0) .{ .inverse = false, .color = .default } else seen[best];
+}
+
+/// One line naming the rows with highlighted text (a background that differs
+/// from the screen's usual one, e.g. inverse), such as the selected menu
+/// item, for callers that did not ask for --styles.
+fn writeHighlights(w: *std.Io.Writer, rows: []const []const Session.Run, normal: Background) !void {
+    const max_shown = 3;
+    var shown: usize = 0;
+    var more: usize = 0;
+    for (rows, 0..) |runs, r| {
+        for (runs) |run| {
+            const text = std.mem.trim(u8, run.text, " ");
+            if (text.len == 0) continue;
+            if (Background.of(run.style).eql(normal)) continue;
+            if (shown == max_shown) {
+                more += 1;
+                break;
+            }
+            try w.writeAll(if (shown == 0) "[headterm] highlighted: " else "; ");
+            try w.print("row {d} ", .{r});
+            try std.json.Stringify.encodeJsonString(text[0..@min(text.len, 60)], .{}, w);
+            shown += 1;
+            break; // one run per row
+        }
+    }
+    if (shown == 0) return;
+    if (more > 0) try w.print(" (+{d} more rows)", .{more});
+    try w.writeByte('\n');
 }
 
 fn writeRunsJson(jw: *std.json.Stringify, runs: []const Session.Run) !void {

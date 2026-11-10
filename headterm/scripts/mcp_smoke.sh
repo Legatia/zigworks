@@ -10,7 +10,7 @@ case $HT in /*) ;; *) HT=$(pwd)/$HT ;; esac
 STATE=$(mktemp -d /tmp/headterm-mcp.XXXXXX)
 unset XDG_RUNTIME_DIR
 export TMPDIR=$STATE
-trap '"$HT" kill mcpsmoke >/dev/null 2>&1 || true; "$HT" kill mcpsty >/dev/null 2>&1 || true; rm -rf "$STATE"' EXIT
+trap '"$HT" kill mcpsmoke >/dev/null 2>&1 || true; "$HT" kill mcpsty >/dev/null 2>&1 || true; "$HT" kill mcprun >/dev/null 2>&1 || true; rm -rf "$STATE"' EXIT
 
 fail() {
     echo "FAIL: $*" >&2
@@ -62,7 +62,7 @@ grep -qv '^{"jsonrpc":"2.0",' "$STATE/out" && fail "stdout has a line that is no
 echo "ok - 18 replies, one JSON-RPC message per line, nothing else on stdout"
 
 check "initialize" 1 '"protocolVersion":"2025-06-18"' '"serverInfo":{"name":"headterm"'
-check "tools/list" 2 '"headterm_start"' '"headterm_send"' '"headterm_screen"' '"headterm_wait"' '"headterm_kill"' '"headterm_list"' '"headterm_resize"' '"esc_delay_ms"'
+check "tools/list" 2 '"headterm_run"' '"headterm_start"' '"headterm_send"' '"headterm_screen"' '"headterm_wait"' '"headterm_kill"' '"headterm_list"' '"headterm_resize"'
 check "start returns first screen" 3 'started mcpsmoke pid=' 'ready' '"isError":false'
 check "keys are never options; regex then_wait" 4 'got:--literal' 'wait=ok(regex)' '"isError":false'
 check "screen diff after wait is empty" 5 'changed=0' '"isError":false'
@@ -113,5 +113,15 @@ echo "ok - MCP and CLI diff markers are separate"
 head -1 "$STATE/mcp.cast" | grep -q '^{"version":2,"width":120,"height":6,' || fail "record option did not write an asciicast header"
 echo "ok - record option writes an asciicast file"
 "$HT" kill mcpsmoke
+
+# headterm_run: a whole interaction in one call, and a failure mid-script.
+printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"headterm_run","arguments":{"command":["/bin/sh","-c","read x; echo got:$x"],"cols":30,"rows":4,"steps":[{"send":["hi","<Enter>"]},{"wait":{"exit":true}}]}}}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"headterm_run","arguments":{"name":"mcprun","command":["/bin/sh","-c","read x; sleep 30"],"cols":30,"rows":4,"steps":[{"send":["a<b>","<Enter>"],"literal":true},{"wait":{"text":"never","timeout_ms":300}},{"send":["x"]}]}}}' \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"headterm_run","arguments":{"session":"mcprun","steps":[{"screen":true}]}}}' |
+    "$HT" mcp >"$STATE/out" 2>"$STATE/err" || fail "mcp exited with $?"
+check "run in one call" 1 'got:hi' '1 send ok' '2 wait ok(exit)' 'session ended' '"isError":false'
+check "run failure keeps the session" 2 '2 wait FAILED: failed(timeout)' 'stopped at step 2 of 3; session mcprun kept' 'a<b><Enter>' '"isError":true'
+check "run on an existing session" 3 '1 screen:' 'session ended' '"isError":false'
 
 echo "mcp smoke: all passed"

@@ -19,6 +19,8 @@ cleanup() {
     "$HT" kill "$S-w" >/dev/null 2>&1 || true
     "$HT" kill "$S-t" >/dev/null 2>&1 || true
     "$HT" kill "$S-r" >/dev/null 2>&1 || true
+    "$HT" kill "$S-run" >/dev/null 2>&1 || true
+    "$HT" kill "$S-h" >/dev/null 2>&1 || true
     rm -rf "$STATE"
 }
 trap cleanup EXIT
@@ -136,6 +138,35 @@ check "recording has input and output events" sh -c 'grep -q "\"i\", \"hi\\\\r\"
 # Help and version.
 check "version" sh -c '"$1" --version | grep -q "^headterm [0-9]"' _ "$HT"
 check "help for a command" sh -c '"$1" help wait | grep -q -- "--text-gone" && "$1" send --help | grep -q "<Drag r1,c1 r2,c2>"' _ "$HT"
+
+# run: start, script, report and end in one command.
+out=$("$HT" run --cols 40 --rows 5 --send hello --send '<Enter>' --wait-text got:hello --screen --send bye --send '<Enter>' --wait-exit -- /bin/sh -c 'read x; echo got:$x; read y; echo bye:$y')
+check "run succeeds" sh -c 'printf "%s\n" "$1" | grep -q "^2 wait ok(text)" && printf "%s\n" "$1" | grep -qx "bye:bye" && printf "%s\n" "$1" | grep -qx "session ended"' _ "$out"
+check "run screen step" sh -c 'printf "%s\n" "$1" | grep -q "^3 screen:"' _ "$out"
+set +e
+out=$("$HT" run --name "$S-run" --cols 40 --rows 5 --send one --send '<Enter>' --wait-text never --timeout 300 --send two -- /bin/sh -c 'read x; echo got:$x; read y; echo second:$y')
+rc=$?
+set -e
+check "run stops at the failed step" sh -c '[ "$1" -eq 1 ] && printf "%s\n" "$2" | grep -q "^2 wait FAILED: failed(timeout)" && printf "%s\n" "$2" | grep -q "stopped at step 2 of 3; session $3 kept"' _ "$rc" "$out" "$S-run"
+out=$("$HT" run --session "$S-run" --send two --send '<Enter>' --wait-exit)
+check "run continues a kept session" sh -c 'printf "%s\n" "$1" | grep -qx "second:two" && ! "$2" list | grep -q "^$3 "' _ "$out" "$HT" "$S-run"
+set +e
+err=$("$HT" run -- true 2>&1)
+rc=$?
+set -e
+check "run without steps is an error" sh -c '[ "$1" -eq 2 ] && printf "%s" "$2" | grep -q "give at least one step"' _ "$rc" "$err"
+
+# Keys sent right after start are held until the program's first output has
+# settled. This program drops typeahead (tcflush) before its prompt.
+if command -v python3 >/dev/null 2>&1; then
+    out=$("$HT" run --send early --send '<Enter>' --wait-exit -- python3 -c 'import sys,termios,time; time.sleep(0.4); termios.tcflush(0, termios.TCIFLUSH); print("ready"); print("got", input())')
+    check "run waits for first output before sending" sh -c 'printf "%s\n" "$1" | grep -qx "got early"' _ "$out"
+fi
+
+# Highlighted rows are named in the default screen output.
+"$HT" start "$S-h" --cols 20 --rows 4 -- /bin/sh -c 'printf "  Open\r\n\033[7m  Save  \033[m\r\n"; sleep 30' >/dev/null
+check "highlighted row in default output" sh -c '"$1" wait "$2" --text Save | grep -qx "\[headterm\] highlighted: row 1 \"Save\""' _ "$HT" "$S-h"
+"$HT" kill "$S-h"
 
 # A session with --ttl ends by itself once idle.
 "$HT" start "$S-t" --ttl 1 -- sleep 30 >/dev/null

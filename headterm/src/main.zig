@@ -4,10 +4,12 @@ const Allocator = std.mem.Allocator;
 const client = @import("client.zig");
 const server = @import("server.zig");
 const mcp = @import("mcp.zig");
+const run_mod = @import("run.zig");
 
 const usage_text =
     \\usage: headterm <command> [arguments]
     \\
+    \\  run <steps> -- <cmd> [args...]              start, send, wait, print, end: one command
     \\  start <name> [options] -- <cmd> [args...]   start a program in a new session
     \\  screen <name> [options]                     print the screen
     \\  send <name> [options] <keys>...             send keys and text
@@ -25,6 +27,33 @@ const usage_text =
 
 const Help = struct { []const u8, []const u8 };
 const command_help = [_]Help{
+    .{
+        "run",
+        \\usage: headterm run [options] <steps> -- <cmd> [args...]
+        \\       headterm run --session NAME [options] <steps>
+        \\
+        \\Starts <cmd>, plays the steps in order, prints each step's result and the
+        \\final screen, then ends the session. If a step fails it stops, prints the
+        \\screen at that point and keeps the session (10 min TTL) to recover.
+        \\Exit code 1 if a step failed.
+        \\
+        \\steps, in order:
+        \\  --send KEY...     keys or text (consecutive --send form one step)
+        \\  --send-text TEXT  plain text, no <Key> parsing
+        \\  --wait-text STR   --wait-regex RE   --wait-gone STR   --wait-idle MS
+        \\  --wait-exit       --timeout MS (for the wait just before it)
+        \\  --screen          print the screen at this point
+        \\  --steps JSON      [{"send":[...]},{"wait":{"text":"..."}},{"screen":true}]
+        \\
+        \\--session NAME plays the steps on an existing session, e.g. one kept
+        \\after a failed step.
+        \\
+        \\options: --name NAME --keep --cols N --rows N --cwd DIR --ttl S
+        \\         --record FILE --styles
+        \\
+        \\Keys before the first wait are sent once the program's first output settles.
+        \\
+    },
     .{
         "start",
         \\usage: headterm start <name> [options] -- <cmd> [args...]
@@ -63,6 +92,7 @@ const command_help = [_]Help{
         \\  <Enter> <Tab> <Esc> <Backspace> <Space> <Up> <Down> <Left> <Right>
         \\  <Home> <End> <PageUp> <PageDown> <Insert> <Delete> <F1>..<F12> <lt>
         \\  modifiers: <C-c> (Ctrl), <M-x> (Alt), <S-Tab> (Shift), combinable
+        \\  an argument spelled exactly like a key also works: Enter, Down, C-c
         \\Mouse, if the program enabled mouse reporting (0-based positions):
         \\  <Click r,c> <RightClick r,c> <MiddleClick r,c> <Drag r1,c1 r2,c2>
         \\  <ScrollUp r,c> <ScrollDown r,c>, with modifiers: <S-Click r,c>
@@ -84,6 +114,7 @@ const command_help = [_]Help{
         \\  --regex RE        a screen line matches RE (see the README for syntax)
         \\  --text-gone STR   STR is not on screen
         \\  --idle MS         no output for MS milliseconds
+        \\  --settle MS       the program printed something, then nothing for MS
         \\  --exit            the program exited
         \\  --timeout MS      give up after MS (default 10000)
         \\
@@ -150,7 +181,7 @@ fn run(gpa: Allocator, args: []const []const u8) !u8 {
     const cmd = args[0];
     if (eql(cmd, "help") or isHelpFlag(cmd)) {
         if (args.len > 1) {
-            const text = helpFor(args[1]) orelse return fail("help: no command '{s}' (commands: start screen send wait resize kill list mcp)", .{args[1]});
+            const text = helpFor(args[1]) orelse return fail("help: no command '{s}' (commands: run start screen send wait resize kill list mcp)", .{args[1]});
             try writeStdout(text);
         } else {
             try writeStdout(usage_text);
@@ -169,6 +200,7 @@ fn run(gpa: Allocator, args: []const []const u8) !u8 {
     }
 
     if (eql(cmd, "list")) return list(gpa, args[1..]);
+    if (eql(cmd, "run")) return runCmd(gpa, args[1..]);
     if (eql(cmd, "mcp")) {
         if (args.len > 1) return fail("mcp: takes no arguments (got '{s}')", .{args[1]});
         try mcp.serve(gpa);
@@ -210,6 +242,127 @@ fn run(gpa: Allocator, args: []const []const u8) !u8 {
             return 2;
         },
     }
+}
+
+fn runCmd(gpa: Allocator, args: []const []const u8) !u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var opts: run_mod.Options = .{ .name = "", .argv = &.{} };
+    var name: ?[]const u8 = null;
+    var existing: ?[]const u8 = null;
+    var steps: std.ArrayList(run_mod.Step) = .empty;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (eql(a, "--")) {
+            i += 1;
+            break;
+        }
+        if (isHelpFlag(a)) {
+            try writeStdout(helpFor("run").?);
+            return 0;
+        }
+        if (eql(a, "--keep")) {
+            opts.keep = true;
+            continue;
+        }
+        if (eql(a, "--styles")) {
+            opts.styles = true;
+            continue;
+        }
+        if (eql(a, "--wait-exit")) {
+            try steps.append(arena, .{ .wait = .{ .exit = true } });
+            continue;
+        }
+        if (eql(a, "--screen")) {
+            try steps.append(arena, .screen);
+            continue;
+        }
+        if (i + 1 >= args.len) return fail("run: {s} needs a value (see 'headterm help run')", .{a});
+        const v = args[i + 1];
+        i += 1;
+        if (eql(a, "--send")) {
+            // Consecutive --send arguments form one step.
+            // `--send KEY KEY ...` takes keys up to the next option or `--`.
+            var more = i + 1;
+            while (more < args.len and !std.mem.startsWith(u8, args[more], "--")) more += 1;
+            const new = args[i..more];
+            i = more - 1;
+            const last = if (steps.items.len > 0) &steps.items[steps.items.len - 1] else null;
+            if (last != null and last.?.* == .send and !last.?.send.literal) {
+                const old = last.?.send.keys;
+                const keys = try arena.alloc([]const u8, old.len + new.len);
+                @memcpy(keys[0..old.len], old);
+                @memcpy(keys[old.len..], new);
+                last.?.send.keys = keys;
+            } else {
+                try steps.append(arena, .{ .send = .{ .keys = try arena.dupe([]const u8, new) } });
+            }
+        } else if (eql(a, "--send-text")) {
+            try steps.append(arena, .{ .send = .{ .keys = try arena.dupe([]const u8, &.{v}), .literal = true } });
+        } else if (eql(a, "--wait-text")) {
+            try steps.append(arena, .{ .wait = .{ .text = v } });
+        } else if (eql(a, "--wait-regex")) {
+            try steps.append(arena, .{ .wait = .{ .regex = v } });
+        } else if (eql(a, "--wait-gone")) {
+            try steps.append(arena, .{ .wait = .{ .gone = v } });
+        } else if (eql(a, "--wait-idle")) {
+            const ms = std.fmt.parseInt(i64, v, 10) catch return fail("run: --wait-idle needs milliseconds, got '{s}'", .{v});
+            try steps.append(arena, .{ .wait = .{ .idle_ms = ms } });
+        } else if (eql(a, "--timeout")) {
+            const ms = std.fmt.parseInt(i64, v, 10) catch return fail("run: --timeout needs milliseconds, got '{s}'", .{v});
+            if (steps.items.len == 0 or steps.items[steps.items.len - 1] != .wait) return fail("run: --timeout must follow a --wait-* step", .{});
+            steps.items[steps.items.len - 1].wait.timeout_ms = ms;
+        } else if (eql(a, "--steps")) {
+            const value = std.json.parseFromSliceLeaky(std.json.Value, arena, v, .{}) catch return fail("run: --steps is not valid JSON", .{});
+            var msg: []const u8 = "";
+            const parsed = run_mod.parseSteps(arena, value, &msg) catch |err| switch (err) {
+                error.InvalidSteps => return fail("run: {s}", .{msg}),
+                else => |e| return e,
+            };
+            try steps.appendSlice(arena, parsed);
+        } else if (eql(a, "--name")) {
+            name = v;
+        } else if (eql(a, "--session")) {
+            existing = v;
+        } else if (eql(a, "--cols")) {
+            opts.start.cols = std.fmt.parseInt(u16, v, 10) catch return fail("run: bad --cols '{s}'", .{v});
+        } else if (eql(a, "--rows")) {
+            opts.start.rows = std.fmt.parseInt(u16, v, 10) catch return fail("run: bad --rows '{s}'", .{v});
+        } else if (eql(a, "--cwd")) {
+            opts.start.cwd = v;
+        } else if (eql(a, "--record")) {
+            opts.start.record_path = v;
+        } else if (eql(a, "--ttl")) {
+            const ttl = std.fmt.parseInt(u32, v, 10) catch return fail("run: bad --ttl '{s}' (seconds)", .{v});
+            opts.start.ttl_s = if (ttl == 0) null else ttl;
+        } else {
+            return fail("run: unknown option '{s}' (see 'headterm help run')", .{a});
+        }
+    }
+    opts.argv = args[i..];
+    if (existing != null and opts.argv.len > 0) return fail("run: give either --session NAME or -- <cmd>, not both", .{});
+    if (existing == null and opts.argv.len == 0) return fail("run: missing command, e.g. 'headterm run --send q -- less FILE' (or --session NAME)", .{});
+    if (steps.items.len == 0) return fail("run: give at least one step (--send, --wait-*, --screen or --steps)", .{});
+    // Without --keep the session ends after the run; if a step fails it is
+    // kept for recovery and expires.
+    if (opts.start.ttl_s == null and !opts.keep) opts.start.ttl_s = run_mod.failure_ttl_s;
+    opts.name = existing orelse name orelse try std.fmt.allocPrint(arena, "run-{d}", .{std.c.getpid()});
+    if (!client.validName(opts.name)) return fail("run: invalid session name '{s}'", .{opts.name});
+
+    var call_arena = arena;
+    const caller: run_mod.Caller = .{ .ctx = @ptrCast(&call_arena), .callFn = cliCall };
+    const result = run_mod.run(arena, gpa, opts, steps.items, caller) catch |err| return fail("run: {s}", .{@errorName(err)});
+    try writeStdout(result.text);
+    try writeStdout("\n");
+    return if (result.ok) 0 else 1;
+}
+
+fn cliCall(ctx: *anyopaque, name: []const u8, args: []const []const u8) run_mod.Error!client.Response {
+    const arena: *Allocator = @ptrCast(@alignCast(ctx));
+    return client.call(arena.*, name, args);
 }
 
 fn start(gpa: Allocator, name: []const u8, args: []const []const u8) !u8 {
@@ -310,4 +463,5 @@ test {
     _ = @import("regex.zig");
     _ = @import("session_test.zig");
     _ = @import("record.zig");
+    _ = @import("run.zig");
 }

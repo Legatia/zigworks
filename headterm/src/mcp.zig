@@ -11,13 +11,16 @@ const json = std.json;
 const client = @import("client.zig");
 const server = @import("server.zig");
 const regex = @import("regex.zig");
+const run_mod = @import("run.zig");
 
 const supported_versions = [_][]const u8{ "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25" };
 const default_version = "2025-06-18";
 const max_ms = 60_000;
 const max_line = 4 << 20;
 const start_idle_ms = 300;
-const start_timeout_ms = 5_000;
+/// headterm_start returns once the program's first output has been quiet
+/// for start_idle_ms, or after this long if it prints nothing.
+const start_timeout_ms = 2_000;
 /// Sessions started over MCP end after an hour without requests or output,
 /// unless the caller passes another ttl_s (0 disables it).
 const default_ttl_s = 3600;
@@ -333,6 +336,7 @@ const Dispatch = struct {
 
     fn callTool(self: *Dispatch, tool: []const u8, a: Args) DispatchError!ToolResult {
         if (eql(tool, "headterm_list")) return self.list();
+        if (eql(tool, "headterm_run")) return self.runTool(a);
         const name = try a.requiredString("name");
         self.styles = try a.boolean("styles") orelse false;
         if (eql(tool, "headterm_start")) {
@@ -345,7 +349,7 @@ const Dispatch = struct {
             opts.record_path = try a.string("record");
             const ttl = (try a.int("ttl_s", 0, max_ttl_s)) orelse default_ttl_s;
             opts.ttl_s = if (ttl == 0) null else @intCast(ttl);
-            const wait = try self.waitSpec(try a.object("then_wait"), .{ .idle_ms = start_idle_ms, .timeout_ms = start_timeout_ms });
+            const wait = try self.waitSpec(try a.object("then_wait"), .{ .settle_ms = start_idle_ms, .timeout_ms = start_timeout_ms });
 
             var msg: [256]u8 = undefined;
             const pid = client.startSession(self.gpa, name, command, opts, &msg) catch
@@ -418,6 +422,7 @@ const Dispatch = struct {
     }
 
     const WaitSpec = struct {
+        settle_ms: ?i64 = null,
         text: ?[]const u8 = null,
         regex: ?[]const u8 = null,
         gone: ?[]const u8 = null,
@@ -464,6 +469,7 @@ const Dispatch = struct {
         if (w.regex) |r| try args.appendSlice(self.arena, &.{ "--regex", r });
         if (w.gone) |t| try args.appendSlice(self.arena, &.{ "--text-gone", t });
         if (w.idle_ms) |ms| try args.appendSlice(self.arena, &.{ "--idle", try std.fmt.allocPrint(self.arena, "{d}", .{ms}) });
+        if (w.settle_ms) |ms| try args.appendSlice(self.arena, &.{ "--settle", try std.fmt.allocPrint(self.arena, "{d}", .{ms}) });
         if (w.exit) try args.append(self.arena, "--exit");
         if (w.timeout_ms) |ms| try args.appendSlice(self.arena, &.{ "--timeout", try std.fmt.allocPrint(self.arena, "{d}", .{ms}) });
         try args.append(self.arena, "--trim");
@@ -517,6 +523,46 @@ const Dispatch = struct {
         return client.readResponse(self.arena, stream.handle);
     }
 
+    fn runTool(self: *Dispatch, a: Args) DispatchError!ToolResult {
+        const existing = try a.string("session");
+        const command = (try a.stringArray("command")) orelse &.{};
+        if (existing == null and command.len == 0) return self.fail(error.InvalidParams, "give 'command' to start a program, or 'session' to continue an existing one", .{});
+        if (existing != null and command.len > 0) return self.fail(error.InvalidParams, "give either 'command' or 'session', not both", .{});
+        const steps_value = a.get("steps") orelse return self.fail(error.InvalidParams, "missing required argument 'steps'", .{});
+        var msg: []const u8 = "";
+        const steps = run_mod.parseSteps(self.arena, steps_value, &msg) catch |err| switch (err) {
+            error.InvalidSteps => return self.fail(error.InvalidParams, "{s}", .{msg}),
+            else => |e| return e,
+        };
+
+        var opts: run_mod.Options = .{
+            .name = existing orelse (try a.string("name")) orelse try std.fmt.allocPrint(self.arena, "run-{d}-{d}", .{ std.c.getpid(), @mod(std.time.milliTimestamp(), 1_000_000) }),
+            .argv = command,
+            .keep = try a.boolean("keep") orelse false,
+            .styles = try a.boolean("styles") orelse false,
+            .client_id = self.client_id,
+        };
+        if (try a.int("cols", 2, 1000)) |c| opts.start.cols = @intCast(c);
+        if (try a.int("rows", 1, 1000)) |r| opts.start.rows = @intCast(r);
+        opts.start.cwd = try a.string("cwd");
+        opts.start.record_path = try a.string("record");
+        const ttl = (try a.int("ttl_s", 0, max_ttl_s)) orelse @as(i64, if (opts.keep) default_ttl_s else run_mod.failure_ttl_s);
+        opts.start.ttl_s = if (ttl == 0) null else @intCast(ttl);
+
+        const caller: run_mod.Caller = .{ .ctx = self, .callFn = runCall };
+        const result = run_mod.run(self.arena, self.gpa, opts, steps, caller) catch |err| switch (err) {
+            error.Cancelled => return error.Cancelled,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => |e| return .{ .text = try std.fmt.allocPrint(self.arena, "run failed: {s}", .{@errorName(e)}), .is_error = true },
+        };
+        return .{ .text = result.text, .is_error = !result.ok };
+    }
+
+    fn runCall(ctx: *anyopaque, name: []const u8, args: []const []const u8) run_mod.Error!client.Response {
+        const self: *Dispatch = @ptrCast(@alignCast(ctx));
+        return self.callSession(name, args);
+    }
+
     fn list(self: *Dispatch) DispatchError!ToolResult {
         const sessions = client.listSessions(self.arena) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -535,7 +581,7 @@ const Args = struct {
     d: *Dispatch,
     obj: ?json.ObjectMap,
 
-    fn get(a: Args, key: []const u8) ?json.Value {
+    pub fn get(a: Args, key: []const u8) ?json.Value {
         const o = a.obj orelse return null;
         const v = o.get(key) orelse return null;
         return if (v == .null) null else v;
@@ -590,25 +636,32 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-// Tool definitions. The descriptions are what a model reads to decide how
-// to call a tool: keep them short, and keep the key syntax in one place
-// (headterm_send).
+// Tool definitions. Models read these (through ToolSearch) to decide
+// whether and how to call a tool, and every byte costs context: keep them
+// short. Key syntax lives only in headterm_send; when-to-use only in
+// headterm_run.
 
 const wait_props =
-    \\"text":{"type":"string","description":"Text is on screen (wrapped rows count as one line)."},
-    \\"regex":{"type":"string","description":"A screen line matches: . [] \\d \\w \\s \\b ^ $ | () * + ? {n,m}, (?i) prefix for any case."},
-    \\"gone":{"type":"string","description":"Text is no longer on screen, e.g. a spinner or 'Loading'."},
-    \\"idle_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"No output for this many ms."},
-    \\"exit":{"type":"boolean","description":"The program exited."},
-    \\"timeout_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"Default 10000."}
+    \\"text":{"type":"string","description":"On screen"},
+    \\"regex":{"type":"string","description":"A line matches: . [] \\d \\w \\s \\b ^ $ | () * + ? {n,m}, (?i)"},
+    \\"gone":{"type":"string","description":"No longer on screen"},
+    \\"idle_ms":{"type":"integer","description":"No output for this long"},
+    \\"exit":{"type":"boolean"},
+    \\"timeout_ms":{"type":"integer","description":"Default 10000, max 60000"}
 ;
 
 const name_prop =
-    \\"name":{"type":"string","description":"Session name: letters, digits, '.', '_', '-'."}
+    \\"name":{"type":"string"}
 ;
 
 const styles_prop =
-    \\"styles":{"type":"boolean","description":"Also list styled runs per row: 'row N: [start-end attrs \"text\"]'. Shows the selected menu item (inverse or a background color), red errors, the focused field."}
+    \\"styles":{"type":"boolean","description":"Add styled runs per row (bold, colors); highlighted rows are listed anyway"}
+;
+
+const then_wait_prop =
+    \\"then_wait":{"type":"object","description":"Wait, then return the screen; {} = idle 300 ms","properties":{
+++ wait_props ++
+    \\}}
 ;
 
 // Written over several lines for readability; the line breaks fall between
@@ -632,50 +685,50 @@ fn oneLine(comptime src: []const u8) []const u8 {
 const tools_json_src =
     \\{"tools":[
 ++
-    \\{"name":"headterm_start","description":"Start a program in a new terminal session and return its first screen, after 300 ms without output (at most 5 s). For interactive and full-screen programs: shells, REPLs, vim, less, installers.","inputSchema":{"type":"object","properties":{
-++ name_prop ++
-    \\,"command":{"type":"array","items":{"type":"string"},"minItems":1,"description":"Program and arguments, e.g. [\"python3\", \"-q\"]."},
-    \\"cols":{"type":"integer","minimum":2,"maximum":1000,"description":"Width, default 120."},
-    \\"rows":{"type":"integer","minimum":1,"maximum":1000,"description":"Height, default 40."},
-    \\"cwd":{"type":"string","description":"Working directory."},
-    \\"ttl_s":{"type":"integer","minimum":0,"maximum":2592000,"description":"End the session after this many seconds without calls or output. Default 3600, 0 = never."},
-    \\"record":{"type":"string","description":"Write an asciicast v2 recording to this file (play with asciinema play)."},
-++ styles_prop ++ "," ++
-    \\"then_wait":{"type":"object","description":"Wait for this instead of the 300 ms idle default.","properties":{
-++ wait_props ++
-    \\}}},"required":["name","command"]}},
+    \\{"name":"headterm_run","description":"Use only when a program needs a real terminal: TUI menus, passphrase prompts on the TTY, editors, interactive REPLs or debuggers. For anything that takes stdin or flags, use the shell. Starts command, plays steps in order, returns each step's result and the final screen, then ends the session. A failed step stops the run and keeps the session: continue with session=name.","inputSchema":{"type":"object","properties":{
+    \\"command":{"type":"array","items":{"type":"string"},"description":"e.g. [\"python3\",\"setup.py\"]"},
+    \\"steps":{"type":"array","items":{"type":"object"},"description":"[{\"send\":[\"<Down>\",\"<Enter>\"]},{\"wait\":{\"text\":\"Saved\"}},{\"screen\":true}]. send: keys as in headterm_send, add \"literal\":true for plain text. wait: text, regex, gone, idle_ms or exit, with timeout_ms."},
+    \\"session":{"type":"string","description":"Continue this session instead of starting command"},
+    \\"keep":{"type":"boolean","description":"Keep the session afterwards"},
+    \\"cwd":{"type":"string"},"cols":{"type":"integer"},"rows":{"type":"integer"},
+++ name_prop ++ "," ++ styles_prop ++
+    \\},"required":["steps"]}},
 ++
-    \\{"name":"headterm_send","description":"Send keys, optionally wait, and return the screen. Each keys element is text or a key: <Enter> <Tab> <Esc> <Backspace> <Space> <Up> <Down> <Left> <Right> <Home> <End> <PageUp> <PageDown> <Delete> <F1>..<F12> <lt>; modifiers <C-c> <M-x> <S-Tab>. Mouse, only if the program enabled it (0-based row,col): <Click r,c> <RightClick r,c> <Drag r1,c1 r2,c2> <ScrollUp r,c> <ScrollDown r,c>, also <S-Click r,c> <C-Click r,c>. Example: [\"ihello\", \"<Esc>\", \":wq\", \"<Enter>\"].","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_start","description":"Start a program in a terminal session for step-by-step use (headterm_run does start, keys and waits in one call). Returns the first screen; the session ends after ttl_s idle (default 3600).","inputSchema":{"type":"object","properties":{
 ++ name_prop ++
-    \\,"keys":{"type":"array","items":{"type":"string"},"description":"Sent in order; never treated as options."},
-    \\"literal":{"type":"boolean","description":"Send keys as plain text, without <Key> parsing."},
-    \\"paste":{"type":"boolean","description":"Send keys as one bracketed paste."},
-    \\"esc_delay_ms":{"type":"integer","minimum":0,"maximum":10000,"description":"Pause after a lone <Esc> so it is not read as Alt. Default 100."},
-++ styles_prop ++ "," ++
-    \\"then_wait":{"type":"object","description":"Wait, then return the screen. {} means {\"idle_ms\":300}.","properties":{
-++ wait_props ++
-    \\}}},"required":["name","keys"]}},
+    \\,"command":{"type":"array","items":{"type":"string"}},
+    \\"cwd":{"type":"string"},"cols":{"type":"integer"},"rows":{"type":"integer"},"ttl_s":{"type":"integer"},
+    \\"record":{"type":"string","description":"asciicast file"}
+    \\},"required":["name","command"]}},
 ++
-    \\{"name":"headterm_screen","description":"Return the screen: rows, then a status line with size, cursor (0-based row,col), alt screen and exit status.","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_send","description":"Send keys; with then_wait, return the screen. Keys: text, or <Enter> <Tab> <Esc> <Backspace> <Space> <Up> <Down> <Left> <Right> <Home> <End> <PageUp> <PageDown> <Delete> <F1>..<F12> <lt>, modifiers <C-c> <M-x> <S-Tab>; brackets optional for a whole key (\"Enter\"). Mouse, if the program enabled it (0-based): <Click r,c> <RightClick r,c> <Drag r1,c1 r2,c2> <ScrollUp r,c> <ScrollDown r,c>, <S-Click r,c>.","inputSchema":{"type":"object","properties":{
 ++ name_prop ++
-    \\,"diff":{"type":"boolean","description":"Only rows whose text or styles changed since this MCP server's last screen, as 'row|text'."},
-    \\"scrollback":{"type":"integer","minimum":0,"maximum":100000,"description":"Also return up to this many lines that scrolled off the top."},
+    \\,"keys":{"type":"array","items":{"type":"string"}},
+    \\"literal":{"type":"boolean","description":"Keys are plain text"},
+    \\"paste":{"type":"boolean","description":"Send as one bracketed paste"},
+++ styles_prop ++ "," ++ then_wait_prop ++
+    \\},"required":["name","keys"]}},
+++
+    \\{"name":"headterm_screen","description":"Return the screen and a status line (size, cursor row,col, exit status).","inputSchema":{"type":"object","properties":{
+++ name_prop ++
+    \\,"diff":{"type":"boolean","description":"Only rows changed since your last screen"},
+    \\"scrollback":{"type":"integer"},
 ++ styles_prop ++
     \\},"required":["name"]}},
 ++
-    \\{"name":"headterm_wait","description":"Wait until the first of the given conditions holds, then return the screen. On timeout: an error result, with the screen.","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_wait","description":"Wait for the first condition met, then return the screen; error result on timeout.","inputSchema":{"type":"object","properties":{
 ++ name_prop ++ "," ++ wait_props ++ "," ++ styles_prop ++
     \\},"required":["name"]}},
 ++
-    \\{"name":"headterm_resize","description":"Resize the terminal; the program gets SIGWINCH.","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_resize","inputSchema":{"type":"object","properties":{
 ++ name_prop ++
-    \\,"cols":{"type":"integer","minimum":2,"maximum":1000},"rows":{"type":"integer","minimum":1,"maximum":1000}},"required":["name","cols","rows"]}},
+    \\,"cols":{"type":"integer"},"rows":{"type":"integer"}},"required":["name","cols","rows"]}},
 ++
-    \\{"name":"headterm_kill","description":"End a session: SIGHUP, then SIGTERM, then SIGKILL to the program.","inputSchema":{"type":"object","properties":{
+    \\{"name":"headterm_kill","description":"End a session.","inputSchema":{"type":"object","properties":{
 ++ name_prop ++
     \\},"required":["name"]}},
 ++
-    \\{"name":"headterm_list","description":"List sessions: name, pid, size, status, command.","inputSchema":{"type":"object","properties":{}}}
+    \\{"name":"headterm_list","description":"List sessions.","inputSchema":{"type":"object","properties":{}}}
     \\]}
 ;
 
@@ -707,7 +760,7 @@ test "tools/list is valid JSON with all tools and schemas" {
     const parsed = try json.parseFromSlice(json.Value, testing.allocator, tools_json, .{});
     defer parsed.deinit();
     const tools = parsed.value.object.get("tools").?.array.items;
-    const names = [_][]const u8{ "headterm_start", "headterm_send", "headterm_screen", "headterm_wait", "headterm_resize", "headterm_kill", "headterm_list" };
+    const names = [_][]const u8{ "headterm_run", "headterm_start", "headterm_send", "headterm_screen", "headterm_wait", "headterm_resize", "headterm_kill", "headterm_list" };
     try testing.expectEqual(names.len, tools.len);
     for (tools, names) |t, n| {
         try testing.expectEqualStrings(n, t.object.get("name").?.string);
@@ -770,6 +823,11 @@ test "protocol errors" {
     try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_wait\",\"arguments\":{\"name\":\"x\",\"regex\":\"a{9,1}\"}}}", -32602);
     try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_send\",\"arguments\":{\"name\":\"x\",\"keys\":[],\"then_wait\":{\"regex\":\"(\"}}}}", -32602);
     try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_start\",\"arguments\":{\"name\":\"x\",\"command\":[\"sh\"],\"ttl_s\":-1}}}", -32602);
+
+    try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_run\",\"arguments\":{\"steps\":[{\"screen\":true}]}}}", -32602);
+    try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_run\",\"arguments\":{\"command\":[\"sh\"],\"session\":\"x\",\"steps\":[{\"screen\":true}]}}}", -32602);
+    try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_run\",\"arguments\":{\"command\":[\"sh\"],\"steps\":[{\"wait\":{\"regex\":\"(\"}}]}}}", -32602);
+    try expectErrorCode("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"headterm_run\",\"arguments\":{\"command\":[\"sh\"]}}}", -32602);
 
     // A parse error carries a null id.
     const p = (try roundTrip("{\"id\":")).?;

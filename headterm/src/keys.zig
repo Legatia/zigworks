@@ -3,7 +3,8 @@
 //! An argument of the form `<Name>` is a key; anything else is literal text.
 //! Key names are case-insensitive and may carry modifiers: `C-` (Ctrl),
 //! `M-` or `A-` (Meta/Alt), `S-` (Shift), e.g. `<C-c>`, `<M-x>`, `<S-Tab>`,
-//! `<C-Left>`. `<lt>` sends a literal `<`.
+//! `<C-Left>`. `<lt>` sends a literal `<`. A whole argument spelled exactly
+//! like a key name (`Enter`, `Down`, `C-c`) is that key too.
 //!
 //! Mouse events are `<Click row,col>`, `<RightClick row,col>`,
 //! `<MiddleClick row,col>`, `<Drag r1,c1 r2,c2>`, `<ScrollUp row,col>` and
@@ -55,8 +56,36 @@ pub fn isKeySyntax(arg: []const u8) bool {
     return mouseEvent(splitMods(inner[0..sp]).name) != null;
 }
 
+/// Key names accepted without brackets when they are a whole argument, as
+/// agents often write them (`send Down Enter`). Exact spelling only, so text
+/// like "enter the name" or "up" is still typed as text.
+const bare_names = [_][]const u8{
+    "Enter",    "Return", "Tab",    "Esc",   "Escape", "Backspace", "Space",
+    "Up",       "Down",   "Left",   "Right", "Home",   "End",       "PageUp",
+    "PageDown", "Delete", "Insert", "F1",    "F2",     "F3",        "F4",
+    "F5",       "F6",     "F7",     "F8",    "F9",     "F10",       "F11",
+    "F12",
+};
+
+/// Returns true if `arg` is a key name without brackets: `Enter`, `Down`,
+/// `S-Tab`, `C-Left`, or Ctrl/Meta with one character (`C-c`, `M-x`).
+pub fn isBareKey(arg: []const u8) bool {
+    var name = arg;
+    var mods = false;
+    while (name.len > 2 and name[1] == '-' and std.mem.indexOfScalar(u8, "CMSA", name[0]) != null) {
+        mods = true;
+        name = name[2..];
+    }
+    if (mods and name.len == 1) return (arg[0] == 'C' or arg[0] == 'M') and name[0] > 0x20 and name[0] < 0x7f;
+    for (bare_names) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
+}
+
 /// Appends the encoding of one `send` argument to `out`.
 pub fn encodeArg(gpa: Allocator, out: *std.ArrayList(u8), arg: []const u8, ctx: Context) Error!void {
+    if (isBareKey(arg)) return encodeKey(gpa, out, arg, ctx.app_cursor);
     if (!isKeySyntax(arg)) return out.appendSlice(gpa, arg);
     const inner = arg[1 .. arg.len - 1];
     if (std.mem.indexOfScalar(u8, inner, ' ')) |sp| return encodeMouse(gpa, out, inner[0..sp], inner[sp + 1 ..], ctx);
@@ -311,6 +340,22 @@ test "literal text passes through" {
     try expectEncoded("<", false, "<");
     try expectEncoded("a <b> c", false, "a <b> c");
     try expectEncoded("<>", false, "<>");
+}
+
+test "bare key names" {
+    try expectEncoded("Enter", false, "\r");
+    try expectEncoded("Down", false, "\x1b[B");
+    try expectEncoded("Down", true, "\x1bOB");
+    try expectEncoded("C-c", false, "\x03");
+    try expectEncoded("S-Tab", false, "\x1b[Z");
+    try expectEncoded("F5", false, "\x1b[15~");
+    // Anything else is text.
+    try expectEncoded("enter", false, "enter");
+    try expectEncoded("up", false, "up");
+    try expectEncoded("correct horse", false, "correct horse");
+    try expectEncoded("A-1", false, "A-1");
+    try expectEncoded("C-", false, "C-");
+    try expectEncoded("Y", false, "Y");
 }
 
 test "named keys" {

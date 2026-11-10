@@ -6,9 +6,47 @@ the screen as text, see which rows changed, send keys and mouse events, and
 wait for text or for output to go quiet. It drives full-screen programs (vim,
 less, top, curses UIs, REPLs, `git add -p`) without tmux scripting.
 
+Use it only for programs that need a real terminal: TUI menus, passphrase
+prompts read from the TTY, editors, interactive REPLs and debuggers. Anything
+that takes stdin or flags is simpler in a plain shell.
+
 Zig standard library and libc only. macOS and Linux.
 
+## Using it from an agent
+
+Put headterm on PATH and add one line to the agent's instructions (for Claude Code, `CLAUDE.md`):
+
+```
+For programs that need a real terminal (TUI menus, wizards, passphrase prompts read from the TTY, full-screen apps), use the headterm CLI: `headterm run --send KEYS... --wait-text TEXT --screen -- CMD` plays keys and waits and prints the screen in one call; `headterm help run` has the details.
+```
+
+In tests with Claude Code (Sonnet, 3 runs per task), that beat an agent with only a shell on every task:
+
+| task | shell only | headterm CLI |
+|---|---|---|
+| curses menu | 15.2 s, $0.049 | 9.7 s, $0.024 |
+| passphrase read from the TTY | failed 3/3 | 7.4 s, $0.014 |
+| four-screen setup wizard | 90.7 s, $0.120 | 12.3 s, $0.038 |
+| find a value in a full-screen dashboard | 42.1 s, $0.118 | 11.9 s, $0.025 |
+
+The shell-only agent writes its own pty scripts for menus and wizards, and declines to bypass a TTY check. The MCP server (below) also solved every task, but costs more: clients load MCP tools on demand, and agents drive it one key at a time.
+
 ## Quick start
+
+One command for a whole interaction:
+
+```
+$ headterm run --cols 60 --rows 10 --send '<Down>' --send '<Enter>' --wait-exit -- python3 configure.py
+started run-11537 pid=11541
+1 send ok
+2 wait ok(exit) 6ms
+final screen:
+saved cache = S3 bucket
+[headterm] run-11537 60x10 cursor=1,0 exited=0
+session ended
+```
+
+Or step by step:
 
 ```sh
 headterm start py -- python3 -q                 # start a session named "py"
@@ -48,20 +86,40 @@ claude mcp add headterm -- /absolute/path/to/headterm mcp
 
 Add `--scope user` after `add` to make it available in every project.
 
-Example round trip (real output; `jsonrpc` fields trimmed):
+Most interactions take one `headterm_run` call. Choosing an entry in a curses
+menu (real output):
 
 ```
-→ {"id":1,"method":"tools/call","params":{"name":"headterm_start","arguments":{"name":"py","command":["python3","-q"],"cols":60,"rows":10,"then_wait":{"text":">>> "}}}}
-← {"id":1,"result":{"content":[{"type":"text","text":"started py pid=67260\n>>>\n[headterm] py 60x10 cursor=0,4 running wait=ok(text) waited=78ms"}],"isError":false}}
-→ {"id":2,"method":"tools/call","params":{"name":"headterm_send","arguments":{"name":"py","keys":["sum(range(10))","<Enter>"],"then_wait":{"regex":"^\\d+$"}}}}
-← {"id":2,"result":{"content":[{"type":"text","text":">>> sum(range(10))\n45\n[headterm] py 60x10 cursor=2,0 running wait=ok(regex) waited=2ms"}],"isError":false}}
-→ {"id":3,"method":"tools/call","params":{"name":"headterm_kill","arguments":{"name":"py"}}}
-← {"id":3,"result":{"content":[{"type":"text","text":"killed py"}],"isError":false}}
+→ {"name":"headterm_run","arguments":{"command":["python3","configure.py"],"cols":60,"rows":8,
+   "steps":[{"wait":{"text":"Where should"}},{"send":["<Down>"]},{"screen":true},{"send":["<Enter>"]},{"wait":{"exit":true}}]}}
+← started run-15942-48800 pid=15947
+  1 wait ok(text) 32ms
+  2 send ok
+  3 screen:
+  Where should the build cache live?
+
+     local disk
+     S3 bucket
+     disabled
+
+  Up/Down to move, Enter to choose
+  [headterm] highlighted: row 3 "S3 bucket"
+  [headterm] run-15942-48800 60x8 cursor=6,32 alt running
+  4 send ok
+  5 wait ok(exit) 4ms
+  final screen:
+  saved cache = S3 bucket
+  [headterm] run-15942-48800 60x8 cursor=1,0 exited=0
+  session ended
 ```
+
+The other tools are for step-by-step use: `headterm_start`, then
+`headterm_send` with `then_wait`, `headterm_screen`, `headterm_kill`.
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
-| `headterm_start` | `name`, `command`, `cols?`, `rows?`, `cwd?`, `ttl_s?`, `record?`, `then_wait?`, `styles?` | `started <name> pid=N` and the first screen |
+| `headterm_run` | `command` or `session`, `steps`, `keep?`, `name?`, `cwd?`, `cols?`, `rows?`, `ttl_s?`, `record?`, `styles?` | each step's result and the final screen (see [run](#run)) |
+| `headterm_start` | `name`, `command`, `cols?`, `rows?`, `cwd?`, `ttl_s?`, `record?` | `started <name> pid=N` and the first screen |
 | `headterm_send` | `name`, `keys`, `literal?`, `paste?`, `esc_delay_ms?`, `then_wait?`, `styles?` | the screen after `then_wait`, or `sent` |
 | `headterm_screen` | `name`, `diff?`, `scrollback?`, `styles?` | the screen |
 | `headterm_wait` | `name`, `text?`, `regex?`, `gone?`, `idle_ms?`, `exit?`, `timeout_ms?`, `styles?` | the screen |
@@ -69,14 +127,16 @@ Example round trip (real output; `jsonrpc` fields trimmed):
 | `headterm_kill` | `name` | confirmation |
 | `headterm_list` | none | one line per session |
 
-- `headterm_start` returns after 300 ms without output (at most 5 s), or
-  when `then_wait` is met.
+- `headterm_start` returns once the program's first output has been quiet for
+  300 ms (at most 2 s), or when `then_wait` is met (still accepted, no longer
+  listed).
 - `then_wait` has the fields of `headterm_wait`; `{}` means `{"idle_ms":300}`.
   `idle_ms` and `timeout_ms` are capped at 60000.
 - `keys` elements are always keys or text, never options; `literal`, `paste`
   and `esc_delay_ms` are separate arguments.
 - MCP sessions end after an hour without calls or output (`ttl_s`, 0 =
-  never). They are ordinary sessions, so the CLI works on them too.
+  never); `headterm_run` sessions after 10 minutes unless `keep` is set. They
+  are ordinary sessions, so the CLI works on them too.
 - Each MCP server process has its own diff marker.
 - Screens leave out empty rows at the bottom (as with `--trim`).
 - Tool failures (unknown session, rejected key, failed start, wait timeout)
@@ -90,11 +150,14 @@ Example round trip (real output; `jsonrpc` fields trimmed):
   requests finish, then the server exits.
 - Protocol versions 2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25; tools
   only. Nothing but JSON-RPC messages is written to stdout.
+- tools/list is 4.7 KB. The tool descriptions are kept short because agents
+  load them into context.
 
 ## Commands
 
 | Command | Description |
 | --- | --- |
+| `run <steps> -- <cmd> [args...]`, `run --session NAME <steps>` | Starts `cmd` (or uses a session), plays the steps, prints each result and the final screen, ends the session. See [run](#run). |
 | `start <name> [options] -- <cmd> [args...]` | Starts `cmd` in a new session and returns once it runs. Options: `--cols N` (120), `--rows N` (40), `--cwd DIR`, `--ttl S`, `--record FILE`, `--log FILE`. |
 | `screen <name> [options]` | Prints the screen. Options: `--json`, `--diff`, `--styles`, `--trim`, `--scrollback N`, `--client ID`. |
 | `send <name> [options] [--] <keys>...` | Sends keys, text and mouse events. Options: `--literal`, `--paste`, `--esc-delay MS`. |
@@ -107,6 +170,32 @@ Example round trip (real output; `jsonrpc` fields trimmed):
 
 Session names: 1-64 letters, digits, `.`, `_`, `-`, not starting with `.` or
 `-`. Exit codes: `0` ok, `1` wait not met, `2` error (message on stderr).
+
+### run
+
+`run` does a whole interaction in one command or tool call. Steps, in
+order:
+
+| CLI | JSON (`--steps`, `headterm_run`) | Does |
+| --- | --- | --- |
+| `--send KEY` (repeatable) | `{"send":["<Down>","<Enter>"]}` | send keys, as in [send](#send) |
+| `--send-text TEXT` | `{"send":["a<b>"],"literal":true}` | send plain text |
+| `--wait-text S`, `--wait-regex R`, `--wait-gone S`, `--wait-idle MS`, `--wait-exit`, then `--timeout MS` | `{"wait":{"text":"S","timeout_ms":5000}}` | wait as in [wait](#wait) |
+| `--screen` | `{"screen":true}` | include the screen at this point |
+
+- **Output:** one line per step (`2 wait ok(text) 32ms`), the screens asked
+  for, then the final screen with the exit status. `--styles` adds styled
+  runs.
+- **Timing:** keys are held until the program's first output has settled,
+  unless a wait comes first. A screen taken right after a send waits until
+  the output has been quiet for 200 ms.
+- **Success:** the session ends (`--keep` keeps it). Exit code 0.
+- **A failed step** (a wait that times out) stops the run. The result then
+  holds the screen at that point and `stopped at step N of M`, and the session
+  is kept for 10 minutes. Continue it with `run --session NAME` (MCP:
+  `session`) or with `send` and `screen`. If the program has already exited,
+  the session ends instead. Exit code 1; MCP: `isError`.
+- **Options:** `--name`, `--cwd`, `--cols`, `--rows`, `--ttl`, `--record`.
 
 ### Sessions
 
@@ -166,6 +255,9 @@ selected.
   (`--esc-delay MS`, 0 = none), because busybox vi and readline read `ESC :` as
   Alt-`:`. vim's own Esc timeout can be longer; wait for `--idle` before
   relying on the mode change.
+- Keys sent within 5 s of start, before the program has printed anything, are
+  held until its first output has been quiet for 150 ms (at most 2 s). Some
+  programs drop typeahead that arrives before they are ready.
 - `send` returns once the input is queued; `wait` shows the effect.
 
 ### wait
@@ -176,6 +268,7 @@ selected.
 | `--regex RE` | a screen line, trailing spaces removed, matches RE |
 | `--text-gone STR` | STR is not on screen (spinners, "Loading…") |
 | `--idle MS` | no output for MS, counted from the later of the wait's start and the last output |
+| `--settle MS` | the program has printed something, then nothing for MS |
 | `--exit` | the program exited |
 
 The first condition met ends the wait.
@@ -259,6 +352,12 @@ bottom), then a status line:
   `[headterm] end of scrollback (<n> lines)`.
 - **`--styles`:** adds a `[headterm] styles ...` line and `row <n>: [...]`
   lines before the status line.
+- **Highlighted rows:** without `--styles`, rows with highlighted text are
+  named in one line before the status line, at most three:
+  `[headterm] highlighted: row 3 "S3 bucket"`. Highlighted means a background
+  that differs from the screen's most common one: inverse, or a colored bar.
+  A program that paints the whole screen in one color doesn't count. This
+  usually finds the selected menu item at no extra cost.
 
 ### JSON (`screen --json`, `wait --json`)
 
