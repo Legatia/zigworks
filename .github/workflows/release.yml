@@ -2,10 +2,10 @@ name: Release
 
 # Push a tag named <project>-v<version>, e.g. `trigrep-v0.2.0` or `headterm-v0.2.0`.
 # Builds static Linux binaries (x86_64, arm64) and an Apple Silicon macOS binary, and
-# attaches them to a GitHub release for that tag.
+# attaches them to a GitHub release for that tag. headsight is macOS only.
 on:
   push:
-    tags: ["trigrep-v*", "headterm-v*"]
+    tags: ["trigrep-v*", "headterm-v*", "headsight-v*"]
 
 permissions:
   contents: read
@@ -34,7 +34,12 @@ jobs:
         run: |
           project="${GITHUB_REF_NAME%%-v*}"
           version="${GITHUB_REF_NAME#*-v}"
-          case "$project" in trigrep|headterm) ;; *) echo "unknown project in tag: $project"; exit 1 ;; esac
+          case "$project" in trigrep|headterm|headsight) ;; *) echo "unknown project in tag: $project"; exit 1 ;; esac
+          echo "PKG_DIR=$project" >> "$GITHUB_ENV"
+          if [ "$project" = headsight ] && [ "${{ matrix.target }}" != native ]; then
+            echo "headsight is macOS only; no ${{ matrix.name }} build"
+            exit 0
+          fi
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version in tag: $version"; exit 1; }
           grep -q "\"$version\"" "$project/build.zig.zon" || { echo "tag version $version not in $project/build.zig.zon"; exit 1; }
           cd "$project"
@@ -46,8 +51,8 @@ jobs:
           cp out/bin/"$project" README.md LICENSE "$pkg"/
           tar czf "$pkg.tar.gz" "$pkg"
           shasum -a 256 "$pkg.tar.gz" > "$pkg.tar.gz.sha256"
-          echo "PKG_DIR=$project" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ env.PKG_DIR != 'headsight' || matrix.target == 'native' }}
         with:
           name: ${{ matrix.name }}
           path: |

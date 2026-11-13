@@ -1,0 +1,14 @@
+.{
+    .name = .headsight,
+    .version = "0.1.0",
+    .fingerprint = 0x68953869049b18c1,
+    .minimum_zig_version = "0.15.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "README.md",
+        "LICENSE",
+    },
+}
