@@ -23,7 +23,7 @@ Put headsight on PATH and add one line to the agent's instructions (for Claude C
 To wait for something on screen or camera to change, settle, or show text, use the headsight CLI instead of repeated screenshots: `headsight wait --change|--still|--text TEXT [--window APP] [--region X,Y,W,H]` blocks and prints a crop path; `headsight help` has the details.
 ```
 
-Measured results with Claude Code are pending (see Evaluation below).
+With that line, Sonnet answered 12/12 watching tasks against 10/12 with screenshots, for 37% less cost and with 76% fewer images read (see Evaluation below).
 
 ## Quick start
 
@@ -127,9 +127,11 @@ launchd have no app to hold the permission and get a message saying so.
 
 ## Limits
 
-- macOS doesn't redraw windows that are fully covered, or anything while the
-  screen is locked, so nothing changes there. headsight prints a note when the
-  screen is locked.
+- macOS doesn't redraw windows that are fully covered, so nothing changes
+  there.
+- While the screen is locked, the screen source shows the lock screen and
+  headsight prints a note saying so. Windows keep drawing: `--window` works
+  with the screen locked.
 - Text recognition mixes up similar characters (`0`/`O`) like any OCR;
   `--accurate` is slower and better on small text.
 - It sees and reads; it doesn't click or type.
@@ -150,10 +152,36 @@ On a MacBook Pro (Apple Silicon, built-in Retina display 3024x1964):
 
 ## Evaluation
 
-Planned before 0.1.0: headless Claude Code (Sonnet), 3 runs per task, with
-only a shell (`screencapture`) against headsight plus the line above, on four
-watching tasks (wait for an export to finish, read a counter once it settles,
-report every visual change after an edit, catch a toast shown for 3 s).
+Headless Claude Code (Sonnet), 3 runs per task, one at a time, on a MacBook
+Pro. Each task opens a floating test window with values that are random per
+run (the same values and timings in both conditions):
+
+- V1: wait for an export to finish (20 to 90 s) and report the file count
+- V2: read a counter once it stops changing
+- V3: edit a settings file, then report every change in the window, including
+  one the agent didn't make (seats 12 to 1)
+- V4: catch the file name in a notification shown for 3 s
+
+Both conditions have the usual tools and one instruction line: for the shell,
+how to use `screencapture` and read the PNG; for headsight, the line in
+"Using it from an agent" above.
+
+| | shell + `screencapture` | headsight |
+|---|---|---|
+| correct | 10/12 | 12/12 |
+| cost, all 12 runs | $2.04 | $1.28 |
+| model turns | 143 | 66 |
+| images the model read | 38 | 9 |
+| time from the event to the answer, all 12 runs | 542 s | 223 s |
+
+Median seconds from the event to the answer, per task: V1 26 vs 6, V2 38 vs
+24, V3 26 vs 17, V4 44 vs 4. The shell runs missed the notification once and
+didn't report the window change once. One headsight run waited for the word
+"finished" while the window said "Export Done", ran into its own 120 s
+timeout, and then read the answer with `headsight text`.
+
+Without any instruction line, the agent in this setup didn't try
+`screencapture` at all and gave up on all 12 tasks.
 
 ## Build
 

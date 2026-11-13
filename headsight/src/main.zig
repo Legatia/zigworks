@@ -218,8 +218,7 @@ const App = struct {
             return .permission;
         }
         if (platform.screenAccess(true)) {
-            if (platform.screenLocked())
-                try a.err.writeAll("headsight: note: the screen is locked; macOS doesn't redraw windows until it is unlocked, so nothing on screen will change\n");
+            if (lockNote(source, platform.screenLocked())) |note| try a.err.print("headsight: note: {s}\n", .{note});
             return null;
         }
         if (platform.hostApp(&buf)) |name| try output.permission(a.err, .screen, name) else try output.noGuiHost(a.err);
@@ -654,10 +653,24 @@ const WaitState = struct {
 /// A window's title bar changes with focus and shows macOS's recording
 /// indicator while it is captured, so window sources leave out the top
 /// strip. Returns that strip relative to `region`, or null if they don't meet.
+/// While the screen is locked the display shows the lock screen; windows
+/// keep drawing and can still be watched.
+pub fn lockNote(source: args.Source, locked: bool) ?[]const u8 {
+    if (!locked or source != .screen) return null;
+    return "the screen is locked, so the screen source shows the lock screen; watch a window with --window instead";
+}
+
 pub fn titleBar(region: Rect, pixel_scale: f64) ?Rect {
     const bar_h: u32 = @intFromFloat(@round(28 * @max(pixel_scale, 1)));
     if (region.y >= bar_h) return null;
     return .{ .x = 0, .y = 0, .w = region.w, .h = @min(bar_h - region.y, region.h) };
+}
+
+test "lock_note_only_for_the_screen" {
+    try std.testing.expect(lockNote(.screen, false) == null);
+    try std.testing.expect(std.mem.indexOf(u8, lockNote(.screen, true).?, "--window") != null);
+    try std.testing.expect(lockNote(.{ .window = "Export" }, true) == null);
+    try std.testing.expect(lockNote(.{ .camera = null }, true) == null);
 }
 
 test "title_bar_relative_to_region" {
