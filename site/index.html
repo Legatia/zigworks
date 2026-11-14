@@ -37,7 +37,7 @@
 
   <section class="hero frame" id="main">
     <div class="hero-copy">
-      <a class="chip" href="https://github.com/Legatia/zigworks/releases/tag/headsight-v0.1.0"><span class="chip-dot" aria-hidden="true"></span>headsight 0.1.0 released</a>
+      <a class="chip" href="https://github.com/Legatia/zigworks/releases/tag/headsight-v0.2.0"><span class="chip-dot" aria-hidden="true"></span>headsight 0.2.0: cameras on Linux</a>
       <h1>Small, fast tools that coding agents run on, written in&nbsp;Zig.</h1>
       <p class="lede">trigrep searches huge codebases in milliseconds and never misses a file you just saved. headterm lets an agent drive programs that need a real terminal. headsight lets an agent wait for something on screen or camera instead of taking screenshot after screenshot. All three are command-line tools.</p>
       <div class="quick" data-tabs>
@@ -364,7 +364,7 @@ session ended</pre>
   <section id="headsight" class="frame detail">
     <div class="detail-head">
       <h2>headsight</h2>
-      <p>An agent waiting for something visual takes a screenshot, sends it to the model, and repeats. headsight watches instead, on the Mac, and wakes the agent only when there is something to look at.</p>
+      <p>An agent waiting for something visual takes a screenshot, sends it to the model, and repeats. headsight watches instead, on the machine, and wakes the agent only when there is something to look at.</p>
     </div>
 
     <div class="split steps-split">
@@ -409,14 +409,14 @@ session ended</pre>
         <code class="c">--ignore X,Y,W,H</code>
       </li>
       <li>
-        <h3>Stays on the Mac</h3>
+        <h3>Stays on the machine</h3>
         <p>Nothing is uploaded. Crops are capped at 1024&nbsp;px and deleted after a day.</p>
         <code class="c">headsight drop before</code>
       </li>
       <li>
-        <h3>macOS only</h3>
-        <p>macOS 14 or later on Apple Silicon, with Screen Recording or Camera access for the app running the agent.</p>
-        <code class="c">headsight windows</code>
+        <h3>Mac, and cameras on Linux</h3>
+        <p>Everything on macOS 14 or later on Apple Silicon. On Linux (x86_64, arm64), cameras only for now: no screen, windows or text.</p>
+        <code class="c">--camera /dev/video0</code>
       </li>
     </ul>
   </section>
@@ -426,7 +426,7 @@ session ended</pre>
   <section id="install" class="frame install">
     <div class="install-copy">
       <h2>Install</h2>
-      <p>Single binaries for Linux (x86_64, arm64) and macOS (Apple Silicon). No runtime, nothing else to install. headsight is macOS only.</p>
+      <p>Single binaries for Linux (x86_64, arm64) and macOS (Apple Silicon). No runtime, nothing else to install. On Linux, headsight watches cameras only.</p>
       <p class="actions"><a class="button primary" href="https://github.com/Legatia/zigworks/releases">Download a release</a></p>
     </div>
     <div class="install-box" data-tabs>
