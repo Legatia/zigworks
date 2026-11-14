@@ -12,8 +12,10 @@ input tokens, so polling every 10 s for 10 minutes is about 115k tokens and 60
 model turns. With headsight it is one command that blocks, and the model does
 nothing until there is something to look at.
 
-macOS 14 or later on Apple Silicon. Zig standard library, libc and Apple's
-frameworks (ScreenCaptureKit, AVFoundation, Vision, ImageIO); one binary.
+macOS 14 or later on Apple Silicon: the screen, windows and the camera, with
+text recognition. Linux (x86_64, arm64): the camera only, so far. Zig standard
+library, libc and, on the Mac, Apple's frameworks (ScreenCaptureKit,
+AVFoundation, Vision, ImageIO); one binary.
 
 ## Using it from an agent
 
@@ -80,8 +82,10 @@ convert crop pixels back to source pixels: source = origin + crop / scale.
 What changed since the agent last looked: `snap --name before`, make the
 change, then `wait --change --since before` (reports a change made before the
 call at once) or `wait --still` followed by `diff --since before`. References
-live in `$TMPDIR/headsight/ref/` with mode 0600, are never shown to the model,
-and are deleted after an hour or by `drop`.
+live in `$TMPDIR/headsight/ref/` (`/tmp/headsight-UID/ref/` when TMPDIR is
+unset) with mode 0600, are never shown to the model, and are deleted after an
+hour or by `drop`. Names are shared by every agent of the same user, so agents
+running at the same time should use different names.
 
 ## How it decides
 
@@ -116,9 +120,26 @@ Tested: Terminal (screen, windows and camera). Not yet tested: iTerm2,
 Ghostty, VS Code's terminal, the Claude desktop app. Agents over ssh or under
 launchd have no app to hold the permission and get a message saying so.
 
+## Linux
+
+On Linux headsight watches cameras (V4L2): `snap`, `wait --change`,
+`wait --still`, `diff` and references work as on the Mac. The screen, windows
+and text recognition need macOS for now, and say so.
+
+- `--source camera` takes the first camera; `--camera NAME` matches the
+  device's name (`v4l2-ctl --list-devices`) or takes a path like `/dev/video2`.
+- The user needs access to the device: `sudo usermod -aG video $USER`, then log
+  in again. headsight names the device when access is missing.
+- Cameras must offer YUYV, which nearly all USB cameras do. Frames are
+  1280x720 when the camera offers it.
+- Crops are uncompressed PNG files, about 1.8 MB at 1024x576. The image the
+  model sees is the same.
+- Tested on Ubuntu 24.04 (arm64) with the kernel's test camera (vivid) and
+  v4l2loopback; not yet on a physical camera on a Raspberry Pi or Jetson.
+
 ## Privacy
 
-- Frames stay on the Mac. Nothing is sent anywhere; headsight prints paths,
+- Frames stay on the machine. Nothing is sent anywhere; headsight prints paths,
   boxes and text.
 - Crops are capped at 1024 px on the long side and removed after a day.
   Full-resolution frames exist only as named references, removed after an hour.
@@ -135,7 +156,7 @@ launchd have no app to hold the permission and get a message saying so.
 - Text recognition mixes up similar characters (`0`/`O`) like any OCR;
   `--accurate` is slower and better on small text.
 - It sees and reads; it doesn't click or type.
-- macOS only. On Linux it builds and says capture is not supported.
+- On Linux, the camera only (see Linux above). Other systems are not supported.
 
 ## Speed
 
@@ -185,12 +206,13 @@ Without any instruction line, the agent in this setup didn't try
 
 ## Build
 
-Requires Zig 0.15.1 and Xcode's command line tools.
+Requires Zig 0.15.1, plus Xcode's command line tools on the Mac. Linux builds need nothing else; `zig build -Dtarget=aarch64-linux-musl` cross-compiles from either.
 
 ```sh
 zig build                          # zig-out/bin/headsight
 zig build test                     # unit tests and CLI checks (no capture needed)
 scripts/live.sh                    # live check against a test window (needs Screen Recording)
+scripts/live-linux.sh              # Linux: live check against virtual cameras (v4l2loopback, ffmpeg)
 ```
 
 ## License

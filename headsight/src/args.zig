@@ -63,6 +63,15 @@ fn allowed(cmd: Command, f: Flag) bool {
     };
 }
 
+/// The flag that set `s`, for messages.
+fn sourceFlag(s: Source) []const u8 {
+    return switch (s) {
+        .screen => "--source screen",
+        .window => "--window",
+        .camera => "the camera",
+    };
+}
+
 pub fn parse(alloc: std.mem.Allocator, argv: []const []const u8, diag: *Diag) Error!Request {
     if (argv.len == 0) {
         diag.set("missing command; run 'headsight help'", .{});
@@ -126,10 +135,11 @@ pub fn parse(alloc: std.mem.Allocator, argv: []const []const u8, diag: *Diag) Er
                 continue;
             },
             .still => {
-                const ms = if (inline_val) |v| std.fmt.parseInt(u32, v, 10) catch {
-                    diag.set("--still=MS needs milliseconds, e.g. --still=1500", .{});
+                const ms = if (inline_val) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 800;
+                if (ms == 0) {
+                    diag.set("--still=MS needs milliseconds above 0, e.g. --still=1500", .{});
                     return error.Usage;
-                } else 800;
+                }
                 req.mode = .{ .still = ms };
                 modes += 1;
                 continue;
@@ -146,23 +156,24 @@ pub fn parse(alloc: std.mem.Allocator, argv: []const []const u8, diag: *Diag) Er
         };
         switch (flag) {
             .source => {
-                if (std.mem.eql(u8, val, "screen")) {
-                    req.source = .screen;
-                } else if (std.mem.eql(u8, val, "camera")) {
-                    if (req.source != .camera) req.source = .{ .camera = null };
-                } else {
+                const kind: std.meta.Tag(Source) = if (std.mem.eql(u8, val, "screen"))
+                    .screen
+                else if (std.mem.eql(u8, val, "camera"))
+                    .camera
+                else {
                     diag.set("--source is screen or camera, not '{s}'", .{val});
                     return error.Usage;
-                }
-                if (source_set and req.source == .window) {
-                    diag.set("--source and --window can't be combined", .{});
+                };
+                if (source_set and std.meta.activeTag(req.source) != kind) {
+                    diag.set("--source {s} can't be combined with {s}", .{ val, sourceFlag(req.source) });
                     return error.Usage;
                 }
+                if (kind == .screen) req.source = .screen else if (req.source != .camera) req.source = .{ .camera = null };
                 source_set = true;
             },
             .window => {
-                if (req.source == .camera) {
-                    diag.set("--window can't be combined with the camera", .{});
+                if (source_set and req.source != .window) {
+                    diag.set("--window can't be combined with {s}", .{sourceFlag(req.source)});
                     return error.Usage;
                 }
                 req.source = .{ .window = val };
@@ -361,6 +372,27 @@ test "camera_name_implies_camera" {
     var s = try ok(&.{ "snap", "--source", "camera" });
     defer s.deinit(testing.allocator);
     try testing.expect(s.source == .camera and s.source.camera == null);
+}
+
+test "conflicting_sources_refused" {
+    for ([_][]const []const u8{
+        &.{ "snap", "--window", "Safari", "--source", "screen" },
+        &.{ "snap", "--source", "screen", "--window", "Safari" },
+        &.{ "snap", "--camera", "FaceTime", "--source", "screen" },
+        &.{ "snap", "--source", "camera", "--window", "Safari" },
+    }) |argv| {
+        const m = try bad(argv);
+        try testing.expect(std.mem.indexOf(u8, m, "can't be combined") != null);
+    }
+    // the same kind twice is fine
+    var r = try ok(&.{ "snap", "--camera", "FaceTime", "--source", "camera" });
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("FaceTime", r.source.camera.?);
+}
+
+test "still_zero_refused" {
+    const m = try bad(&.{ "wait", "--still=0" });
+    try testing.expect(std.mem.indexOf(u8, m, "--still") != null);
 }
 
 test "diff_requires_since" {

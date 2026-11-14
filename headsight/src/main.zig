@@ -25,7 +25,7 @@ const usage_text =
     \\
     \\Sources: the main display (default), --window TEXT, --source camera, --camera NAME.
     \\Coordinates are pixels of the source, origin top left: --region X,Y,W,H.
-    \\Crops are PNG files under $TMPDIR/headsight; open them with your image tool.
+    \\Crops are PNG files under $TMPDIR/headsight (/tmp/headsight-UID without TMPDIR); open them with your image tool.
     \\Exit codes: 0 ok, 1 timeout, 2 usage error, 3 permission missing, 4 capture failed.
     \\
     \\Run 'headsight help <command>' for its options.
@@ -135,7 +135,7 @@ pub fn main() u8 {
 
     var app = App{ .alloc = alloc, .req = req, .out = .{ .w = out, .json = req.json }, .err = err };
     const code = app.run() catch |e| blk: {
-        err.print("headsight: {s}\n", .{@errorName(e)}) catch {};
+        err.print("headsight: {s}\n", .{errorText(e)}) catch {};
         break :blk Exit.failed;
     };
     return @intFromEnum(code);
@@ -159,6 +159,12 @@ const App = struct {
         }
         if (!platform.supported) {
             try output.unsupported(a.err);
+            return .failed;
+        }
+        // With --since the source comes from the reference, made on this system.
+        const gap_source: args.Source = if (a.req.since != null) .{ .camera = null } else a.req.source;
+        if (platformGap(.{ .screen = platform.screen_supported, .text = platform.text_supported }, a.req.cmd, gap_source, a.req.mode)) |gap| {
+            try a.err.print("headsight: {s}\n", .{gap});
             return .failed;
         }
         return switch (a.req.cmd) {
@@ -190,8 +196,7 @@ const App = struct {
     }
 
     fn openStore(a: *App) !store.Store {
-        const tmp = std.posix.getenv("TMPDIR") orelse "/tmp";
-        const base = try std.fs.path.join(a.alloc, &.{ tmp, "headsight" });
+        const base = try store.baseDir(a.alloc, std.posix.getenv("TMPDIR"), std.posix.getuid());
         defer a.alloc.free(base);
         return store.Store.open(a.alloc, base, std.time.timestamp());
     }
@@ -347,9 +352,15 @@ const App = struct {
         return .{ .frame = .{ .px = buf, .w = ctx.w, .h = ctx.h, .stride = ctx.w * 4 }, .pixel_scale = 1, .owned = buf };
     }
 
+    fn cameraDenied(a: *App) !Exit {
+        if (platform.screen_supported) return (try a.access(.{ .camera = null })) orelse .permission;
+        try output.deviceDenied(a.err, platform.lastDevice());
+        return .permission;
+    }
+
     fn captureError(a: *App, e: platform.Error, r: Resolved) !Exit {
         switch (e) {
-            error.Permission => return (try a.access(.screen)) orelse .permission,
+            error.Permission => return if (r.src.kind == 2) a.cameraDenied() else (try a.access(.screen)) orelse .permission,
             error.Gone => try a.err.print("headsight: the {s} is gone\n", .{r.label}),
             else => try a.err.print("headsight: capturing the {s} failed\n", .{r.label}),
         }
@@ -358,8 +369,8 @@ const App = struct {
 
     fn streamError(a: *App, rc: c_int, r: Resolved) !Exit {
         switch (rc) {
-            platform.PERMISSION => return (try a.access(.screen)) orelse .permission,
-            platform.NOT_FOUND => try a.err.print("headsight: no camera matches \"{s}\"\n", .{if (r.cam_name) |n| n else "default"}),
+            platform.PERMISSION => return if (r.src.kind == 2) a.cameraDenied() else (try a.access(.screen)) orelse .permission,
+            platform.NOT_FOUND => if (r.cam_name) |n| try a.err.print("headsight: no camera matches \"{s}\"\n", .{n}) else try a.err.writeAll("headsight: no camera found\n"),
             platform.GONE => try a.err.print("headsight: {s}\n", .{r.gone}),
             platform.TIMEOUT => try a.err.print("headsight: the {s} sent no picture\n", .{r.label}),
             else => try a.err.print("headsight: capturing the {s} failed\n", .{r.label}),
@@ -563,7 +574,7 @@ const WaitState = struct {
         const st: *WaitState = @ptrCast(@alignCast(ctx.?));
         if (hf) |p| st.scale = p.scale;
         return st.step(if (hf) |p| platform.toFrame(p) else null) catch |e| {
-            st.app.err.print("headsight: {s}\n", .{@errorName(e)}) catch {};
+            st.app.err.print("headsight: {s}\n", .{errorText(e)}) catch {};
             st.failure = .failed;
             return 1;
         };
@@ -650,9 +661,32 @@ const WaitState = struct {
     }
 };
 
-/// A window's title bar changes with focus and shows macOS's recording
-/// indicator while it is captured, so window sources leave out the top
-/// strip. Returns that strip relative to `region`, or null if they don't meet.
+/// What to print for an error that reaches the top level.
+pub fn errorText(e: anyerror) []const u8 {
+    return switch (e) {
+        error.NotDir => "the place for crops is not a folder; remove it or set TMPDIR to a writable folder",
+        error.UnsafeStore => "the folder for crops belongs to another user or other users can write to it; remove it or set TMPDIR",
+        error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => "no permission to write the folder for crops; set TMPDIR to a writable folder",
+        error.NoSpaceLeft => "the disk is full",
+        error.OutOfMemory => "out of memory",
+        error.Failed => "capture failed",
+        else => @errorName(e),
+    };
+}
+
+pub const Caps = struct { screen: bool, text: bool };
+
+/// Why this request can't run on a platform with `caps`, or null when it can.
+pub fn platformGap(caps: Caps, cmd: args.Command, source: args.Source, mode: ?watch.Mode) ?[]const u8 {
+    const needs_screen = cmd == .windows or source != .camera;
+    if (needs_screen and !caps.screen)
+        return "the screen and windows can only be captured on macOS so far; on this system use the camera (--source camera or --camera NAME)";
+    const needs_text = cmd == .text or (mode != null and mode.? == .text);
+    if (needs_text and !caps.text)
+        return "text recognition only works on macOS so far; on this system use --change, --still or diff";
+    return null;
+}
+
 /// While the screen is locked the display shows the lock screen; windows
 /// keep drawing and can still be watched.
 pub fn lockNote(source: args.Source, locked: bool) ?[]const u8 {
@@ -660,10 +694,36 @@ pub fn lockNote(source: args.Source, locked: bool) ?[]const u8 {
     return "the screen is locked, so the screen source shows the lock screen; watch a window with --window instead";
 }
 
+/// A window's title bar changes with focus and shows macOS's recording
+/// indicator while it is captured, so window sources leave out the top
+/// strip. Returns that strip relative to `region`, or null if they don't meet.
 pub fn titleBar(region: Rect, pixel_scale: f64) ?Rect {
     const bar_h: u32 = @intFromFloat(@round(28 * @max(pixel_scale, 1)));
     if (region.y >= bar_h) return null;
     return .{ .x = 0, .y = 0, .w = region.w, .h = @min(bar_h - region.y, region.h) };
+}
+
+test "platform_gap_explains_what_needs_macos" {
+    const camera: args.Source = .{ .camera = null };
+    // everything available: no gap
+    try std.testing.expect(platformGap(.{ .screen = true, .text = true }, .snap, .screen, null) == null);
+    // Linux: the camera works, the screen and windows don't
+    const linux: Caps = .{ .screen = false, .text = false };
+    try std.testing.expect(platformGap(linux, .snap, camera, null) == null);
+    try std.testing.expect(platformGap(linux, .wait, camera, .change) == null);
+    try std.testing.expect(std.mem.indexOf(u8, platformGap(linux, .snap, .screen, null).?, "--source camera") != null);
+    try std.testing.expect(platformGap(linux, .wait, .{ .window = "x" }, .change) != null);
+    try std.testing.expect(platformGap(linux, .windows, .screen, null) != null);
+    // text recognition
+    try std.testing.expect(std.mem.indexOf(u8, platformGap(linux, .text, camera, null).?, "text") != null);
+    try std.testing.expect(platformGap(linux, .wait, camera, .{ .text = "Done" }) != null);
+}
+
+test "error_text_is_a_sentence" {
+    try std.testing.expect(std.mem.indexOf(u8, errorText(error.NotDir), "not a folder") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errorText(error.UnsafeStore), "other users") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errorText(error.OutOfMemory), "memory") != null);
+    try std.testing.expectEqualStrings("capture failed", errorText(error.Failed));
 }
 
 test "lock_note_only_for_the_screen" {
@@ -691,4 +751,6 @@ test {
     _ = @import("store.zig");
     _ = @import("output.zig");
     _ = @import("platform.zig");
+    _ = @import("png.zig");
+    _ = @import("yuv.zig");
 }

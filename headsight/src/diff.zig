@@ -53,7 +53,10 @@ pub fn score(g: *Grid, prev: Frame, cur: Frame) void {
                 if (r.w == B) {
                     const a: V = pa[0 .. B * 4].*;
                     const b: V = pb[0 .. B * 4].*;
-                    sum += @reduce(.Add, @as(W, @max(a, b) - @min(a, b)));
+                    // max - min never goes below zero; the wrapping operator only
+                    // skips a safety check that fires wrongly on vectors in
+                    // optimized builds (Zig 0.15.1, ReleaseSafe).
+                    sum += @reduce(.Add, @as(W, @max(a, b) -% @min(a, b)));
                 } else {
                     for (pa[0 .. @as(usize, r.w) * 4], pb[0 .. @as(usize, r.w) * 4]) |x, z|
                         sum += if (x > z) x - z else z - x;
@@ -145,6 +148,22 @@ fn countChanged(g: Grid, thresh: u16) !u32 {
     const out = try testing.allocator.alloc(bool, g.scores.len);
     defer testing.allocator.free(out);
     return changedUniform(g, thresh, out);
+}
+
+test "score_handles_maximum_difference" {
+    // Every byte differs by 255: the largest sum a block can have.
+    const w: u32 = 40;
+    const h: u32 = 20;
+    const a = try std.testing.allocator.alloc(u8, w * h * 4);
+    defer std.testing.allocator.free(a);
+    const b = try std.testing.allocator.alloc(u8, w * h * 4);
+    defer std.testing.allocator.free(b);
+    @memset(a, 0);
+    @memset(b, 255);
+    var g = try Grid.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = w, .h = h });
+    defer g.deinit(std.testing.allocator);
+    score(&g, .{ .px = a, .w = w, .h = h, .stride = w * 4 }, .{ .px = b, .w = w, .h = h, .stride = w * 4 });
+    for (g.scores) |sc| try std.testing.expectEqual(@as(u16, 25500), sc);
 }
 
 test "identical_frames_no_change" {

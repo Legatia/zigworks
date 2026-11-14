@@ -32,7 +32,7 @@ for c in wait diff drop text windows; do
     expect 0 "$c" -- help
 done
 expect 0 "usage: headsight wait" -- help wait
-expect 0 "headsight 0.1.0" -- version
+expect 0 "headsight 0.2.0" -- version
 expect 2 "--change" -- wait
 expect 2 "--change, --still" -- wait --change --still
 expect 2 "X,Y,W,H" -- snap --region 1,2,3
@@ -44,7 +44,7 @@ expect 2 "bad name" -- snap --name ../x
 # Output appends when stdout is a file shared by several runs.
 OUT=$STATE/out.txt
 { "$HS" version; "$HS" version; "$HS" drop missing; } > "$OUT" 2>&1
-[ "$(grep -c 'headsight 0.1.0' "$OUT")" = 2 ] || fail "two runs into one file: $(cat "$OUT")"
+[ "$(grep -c 'headsight 0.2.0' "$OUT")" = 2 ] || fail "two runs into one file: $(cat "$OUT")"
 grep -q 'no reference named "missing"' "$OUT" || fail "stderr into the same file: $(cat "$OUT")"
 echo "ok - output appends to a shared file"
 
@@ -54,7 +54,18 @@ if [ "$(uname)" = Darwin ]; then
     echo "ok - binary runs on macOS 14"
 fi
 
-if [ "$(uname)" != Darwin ]; then
-    expect 4 "not supported" -- snap
+if [ "$(uname)" = Linux ]; then
+    # Linux: the camera only; what needs macOS says so before touching a device.
+    expect 4 "only be captured on macOS" -- snap
+    expect 4 "only be captured on macOS" -- wait --change --window Terminal
+    expect 4 "only be captured on macOS" -- windows
+    expect 4 "text recognition only works on macOS" -- text --source camera
+    expect 4 "no camera matches" -- snap --camera /dev/headsight-no-such-device
+    # without TMPDIR the folder is per user and private
+    unset TMPDIR
+    "$HS" drop missing >/dev/null 2>&1
+    d=/tmp/headsight-$(id -u)
+    [ "$(stat -c %a "$d")" = 700 ] || fail "$d is not private: $(stat -c %a "$d")"
+    echo "ok - private folder without TMPDIR"
 fi
 echo "smoke: all ok"

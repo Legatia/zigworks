@@ -30,6 +30,9 @@ pub fn build(b: *std.Build) void {
         for ([_][]const u8{ "Foundation", "ScreenCaptureKit", "AVFoundation", "CoreMedia", "CoreVideo", "CoreGraphics", "CoreText", "ImageIO", "Vision" }) |f|
             mod.linkFramework(f, .{});
         mod.linkSystemLibrary("objc", .{});
+    } else if (target.result.os.tag == .linux) {
+        // The camera through V4L2; uses the kernel headers that ship with Zig.
+        mod.addCSourceFile(.{ .file = b.path("src/linux/capture.c"), .flags = &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-Wall", "-Wextra", "-Werror" } });
     }
     const options = b.addOptions();
     options.addOption([]const u8, "version", @import("build.zig.zon").version);

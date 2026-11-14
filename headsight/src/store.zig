@@ -32,16 +32,38 @@ pub const Ref = struct {
 
 pub const Error = error{ BadName, NoSuchRef, RefExpired, BadRef };
 
+/// Where crops and references live: $TMPDIR/headsight (per user on macOS), or
+/// /tmp/headsight-UID when TMPDIR is unset, so users never share a folder.
+pub fn baseDir(alloc: std.mem.Allocator, tmpdir: ?[]const u8, uid: u32) ![]u8 {
+    if (tmpdir) |t| return std.fs.path.join(alloc, &.{ t, "headsight" });
+    return std.fmt.allocPrint(alloc, "/tmp/headsight-{d}", .{uid});
+}
+
 pub const Store = struct {
     alloc: std.mem.Allocator,
     base: []const u8,
     dir: std.fs.Dir,
     counter: u32 = 0,
 
+    /// Opens (creating it private, mode 0700) the folder for crops and references.
+    /// Refuses a folder that isn't this user's or that others can write to.
     pub fn open(alloc: std.mem.Allocator, base: []const u8, now_s: i64) !Store {
-        try std.fs.cwd().makePath(base);
-        var dir = try std.fs.cwd().openDir(base, .{ .iterate = true });
+        if (std.fs.path.dirname(base)) |parent| try std.fs.cwd().makePath(parent);
+        std.posix.mkdir(base, 0o700) catch |e| switch (e) {
+            error.PathAlreadyExists => {},
+            else => return e,
+        };
+        // A symlink planted where the folder belongs (shared /tmp) is refused,
+        // not followed.
+        const lst = std.posix.fstatat(std.fs.cwd().fd, base, std.posix.AT.SYMLINK_NOFOLLOW) catch |e| return e;
+        if (lst.mode & std.posix.S.IFMT == std.posix.S.IFLNK) return error.UnsafeStore;
+        var dir = std.fs.cwd().openDir(base, .{ .iterate = true, .no_follow = true }) catch |e| switch (e) {
+            error.SymLinkLoop => return error.UnsafeStore,
+            else => return e,
+        };
         errdefer dir.close();
+        const st = try std.posix.fstat(dir.fd);
+        if (st.uid != std.posix.getuid() or st.mode & 0o022 != 0) return error.UnsafeStore;
         var s = Store{ .alloc = alloc, .base = try alloc.dupe(u8, base), .dir = dir };
         s.cleanup(now_s);
         return s;
@@ -207,6 +229,48 @@ fn nowS() i64 {
 
 fn testMeta(created: i64) RefMeta {
     return .{ .source = .{ .window = "Safari" }, .window_id = 42, .region = .{ .x = 5, .y = 5, .w = 20, .h = 10 }, .created_s = created, .src_w = 40, .src_h = 30 };
+}
+
+test "base_dir_is_per_user_without_tmpdir" {
+    const a = try baseDir(testing.allocator, null, 501);
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("/tmp/headsight-501", a);
+    const b = try baseDir(testing.allocator, "/var/folders/x/T/", 501);
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("/var/folders/x/T/headsight", b);
+}
+
+test "open_makes_a_private_dir_and_refuses_a_shared_one" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(root);
+    const mine = try std.fs.path.join(testing.allocator, &.{ root, "mine" });
+    defer testing.allocator.free(mine);
+    var s = try Store.open(testing.allocator, mine, 0);
+    s.close();
+    const st = try std.fs.cwd().statFile(mine);
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(st.mode & 0o777)));
+
+    const shared = try std.fs.path.join(testing.allocator, &.{ root, "shared" });
+    defer testing.allocator.free(shared);
+    try std.fs.cwd().makeDir(shared);
+    // .iterate opens a real handle; on Linux the default is path-only, which chmod refuses
+    var d = try std.fs.cwd().openDir(shared, .{ .iterate = true });
+    try d.chmod(0o777);
+    d.close();
+    try testing.expectError(error.UnsafeStore, Store.open(testing.allocator, shared, 0));
+
+    // a symlink planted where the folder should be is refused
+    const link = try std.fs.path.join(testing.allocator, &.{ root, "link" });
+    defer testing.allocator.free(link);
+    try std.fs.cwd().symLink(mine, link, .{ .is_directory = true });
+    try testing.expectError(error.UnsafeStore, Store.open(testing.allocator, link, 0));
+
+    const file = try std.fs.path.join(testing.allocator, &.{ root, "file" });
+    defer testing.allocator.free(file);
+    (try std.fs.cwd().createFile(file, .{})).close();
+    try testing.expectError(error.NotDir, Store.open(testing.allocator, file, 0));
 }
 
 test "ref_roundtrip" {

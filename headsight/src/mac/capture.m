@@ -168,6 +168,7 @@ static uint8_t *bgra_from_image(CGImageRef img, int *w, int *h, int *stride) {
     if (!buf) return NULL;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(buf, W, H, 8, S, cs, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    if (!ctx) { CGColorSpaceRelease(cs); free(buf); return NULL; }
     CGContextDrawImage(ctx, CGRectMake(0, 0, W, H), img);
     CGContextRelease(ctx);
     CGColorSpaceRelease(cs);
@@ -451,6 +452,7 @@ int hs_write_png(const char *path, const hs_frame *f, int x, int y, int w, int h
             CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
             CGContextRef c = CGBitmapContextCreate(NULL, tw, th, 8, 0, cs, kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
             CGColorSpaceRelease(cs);
+            if (!c) { CGImageRelease(img); return HS_FAIL; }
             CGContextSetInterpolationQuality(c, kCGInterpolationHigh);
             CGContextDrawImage(c, CGRectMake(0, 0, tw, th), img);
             out = CGBitmapContextCreateImage(c);

@@ -25,4 +25,7 @@ jobs:
         with:
           version: 0.15.1
       - run: zig build test --summary all
+      # Optimized code with safety checks on: catches overflow that only shows
+      # up after optimization (headsight's diff did, on Zig 0.15.1).
+      - run: zig build test -Doptimize=ReleaseSafe
       - run: zig build -Doptimize=ReleaseFast

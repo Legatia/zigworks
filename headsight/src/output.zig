@@ -231,8 +231,13 @@ pub fn noGuiHost(w: *Writer) !void {
     try w.writeAll("permission: no app on this Mac started this process (ssh or launchd?), so macOS has nowhere to grant Screen Recording. Run the agent from a terminal app on this Mac.\n");
 }
 
+/// Linux: the camera device exists but this user may not open it.
+pub fn deviceDenied(w: *Writer, device: []const u8) !void {
+    try w.print("permission: can't open {s}. Add this user to the video group (sudo usermod -aG video $USER) and log in again.\n", .{if (device.len > 0) device else "the camera"});
+}
+
 pub fn unsupported(w: *Writer) !void {
-    try w.writeAll("headsight: screen and camera capture need macOS 14 or later; this platform is not supported yet.\n");
+    try w.writeAll("headsight: capture needs macOS 14 or later, or Linux for the camera; this platform is not supported yet.\n");
 }
 
 // ---- tests ----
@@ -330,5 +335,5 @@ test "messages" {
     try testing.expect(std.mem.startsWith(u8, w.buffered(), "permission: no app on this Mac started this process (ssh or launchd?)"));
     w = .fixed(&buf);
     try unsupported(&w);
-    try testing.expectEqualStrings("headsight: screen and camera capture need macOS 14 or later; this platform is not supported yet.\n", w.buffered());
+    try testing.expectEqualStrings("headsight: capture needs macOS 14 or later, or Linux for the camera; this platform is not supported yet.\n", w.buffered());
 }

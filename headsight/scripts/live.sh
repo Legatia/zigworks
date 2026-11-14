@@ -12,7 +12,13 @@ FIX=${TMPDIR:-/tmp}/headsight-fixture
 swiftc -O scripts/fixture.swift -o "$FIX" || { echo "FAIL: building the fixture" >&2; exit 1; }
 PID=
 
-start() { "$FIX" "$@" & PID=$!; sleep 1.5; }
+# start the test window and wait (up to 6 s) until headsight lists it
+start() {
+    "$FIX" "$@" & PID=$!
+    i=0
+    until "$HS" windows 2>/dev/null | grep -q "$W" || [ $i -ge 24 ]; do sleep 0.25; i=$((i + 1)); done
+    sleep 0.3
+}
 stop() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; PID=; }
 fail() { echo "FAIL: $*" >&2; stop; exit 1; }
 ms() { python3 -c 'import time; print(int(time.time()*1000))'; }

@@ -1,4 +1,5 @@
-//! Zig side of the Apple layer (src/mac/capture.h). On other platforms every
+//! Zig side of the capture layer: src/mac/capture.m on macOS, src/linux/capture.c
+//! (camera only) on Linux, both behind src/mac/capture.h. Elsewhere every
 //! function reports error.Unsupported.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -7,7 +8,21 @@ const watch = @import("watch.zig");
 const Rect = frame.Rect;
 const Frame = frame.Frame;
 
-pub const supported = builtin.os.tag == .macos;
+const png = @import("png.zig");
+
+comptime {
+    // src/linux/capture.c calls hs_yuyv_to_bgra, exported from yuv.zig.
+    if (builtin.os.tag == .linux) _ = @import("yuv.zig");
+}
+
+const is_mac = builtin.os.tag == .macos;
+const is_linux = builtin.os.tag == .linux;
+/// Some capture works here.
+pub const supported = is_mac or is_linux;
+/// The screen and windows (macOS only for now).
+pub const screen_supported = is_mac;
+/// Text recognition (Apple Vision; macOS only for now).
+pub const text_supported = is_mac;
 
 pub const OK = 0;
 pub const TIMEOUT = 1;
@@ -35,7 +50,14 @@ const c = struct {
     extern fn hs_write_png(path: [*:0]const u8, f: *const HsFrame, x: c_int, y: c_int, w: c_int, h: c_int, max_side: c_int, scale_out: *f64) c_int;
     extern fn hs_free(p: ?*anyopaque) void;
     extern fn hs_test_render_text(w: c_int, h: c_int, text: [*:0]const u8) ?[*]u8;
+    extern fn hs_linux_last_device() [*:0]const u8;
 };
+
+/// Linux: the camera device the last capture opened or was refused ("" if none).
+pub fn lastDevice() []const u8 {
+    if (!is_linux) return "";
+    return std.mem.span(c.hs_linux_last_device());
+}
 
 pub const Error = error{ Unsupported, Failed, Permission, Gone, NotFound };
 
@@ -149,8 +171,10 @@ pub fn ocr(alloc: std.mem.Allocator, f: Frame, r: Rect, accurate: bool, out: *st
 }
 
 /// Writes `r` of `f` as a PNG, downscaled so the long side is at most `max_side`. Returns the scale.
-pub fn writePng(path: [:0]const u8, f: Frame, r: Rect, max_side: u32) Error!f64 {
+pub fn writePng(path: [:0]const u8, f: Frame, r: Rect, max_side: u32) !f64 {
     if (!supported) return error.Unsupported;
+    // Errors such as a full disk keep their name, so the message says what happened.
+    if (!is_mac) return png.write(std.heap.page_allocator, path, f, r, max_side);
     var scale: f64 = 1;
     const hf = hsFrame(f);
     if (c.hs_write_png(path.ptr, &hf, ci(r.x), ci(r.y), ci(r.w), ci(r.h), ci(max_side), &scale) != OK) return error.Failed;
@@ -188,7 +212,7 @@ test "png_roundtrip_size" {
 }
 
 test "ocr_synthetic" {
-    if (!supported) return error.SkipZigTest;
+    if (!text_supported) return error.SkipZigTest;
     const w: u32 = 1200;
     const h: u32 = 300;
     const raw = c.hs_test_render_text(ci(w), ci(h), "Export Done 42") orelse return error.TestUnexpectedResult;
@@ -216,7 +240,7 @@ test "ocr_synthetic" {
 }
 
 test "host_app_found_from_a_terminal" {
-    if (!supported) return error.SkipZigTest;
+    if (!is_mac) return error.SkipZigTest;
     var buf: [256]u8 = undefined;
     const name = hostApp(&buf);
     if (name) |n| try testing.expect(n.len > 0);

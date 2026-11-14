@@ -2,7 +2,8 @@ name: Release
 
 # Push a tag named <project>-v<version>, e.g. `trigrep-v0.2.0` or `headterm-v0.2.0`.
 # Builds static Linux binaries (x86_64, arm64) and an Apple Silicon macOS binary, and
-# attaches them to a GitHub release for that tag. headsight is macOS only.
+# attaches them to a GitHub release for that tag. headsight's Linux binaries
+# capture the camera only (V4L2); the screen, windows and text need macOS.
 on:
   push:
     tags: ["trigrep-v*", "headterm-v*", "headsight-v*"]
@@ -36,23 +37,21 @@ jobs:
           version="${GITHUB_REF_NAME#*-v}"
           case "$project" in trigrep|headterm|headsight) ;; *) echo "unknown project in tag: $project"; exit 1 ;; esac
           echo "PKG_DIR=$project" >> "$GITHUB_ENV"
-          if [ "$project" = headsight ] && [ "${{ matrix.target }}" != native ]; then
-            echo "headsight is macOS only; no ${{ matrix.name }} build"
-            exit 0
-          fi
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version in tag: $version"; exit 1; }
           grep -q "\"$version\"" "$project/build.zig.zon" || { echo "tag version $version not in $project/build.zig.zon"; exit 1; }
           cd "$project"
           zig build test
           if [ "${{ matrix.target }}" = native ]; then target_flag=-Dcpu=apple_m1; else target_flag=-Dtarget=${{ matrix.target }}; fi
           zig build -Doptimize=ReleaseFast -Dstrip=true $target_flag --prefix out
+          if [ "${{ matrix.target }}" != native ]; then
+            file out/bin/"$project" | grep -q "statically linked" || { echo "not static: $(file out/bin/$project)"; exit 1; }
+          fi
           pkg="$project-$version-${{ matrix.name }}"
           mkdir "$pkg"
           cp out/bin/"$project" README.md LICENSE "$pkg"/
           tar czf "$pkg.tar.gz" "$pkg"
           shasum -a 256 "$pkg.tar.gz" > "$pkg.tar.gz.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: ${{ env.PKG_DIR != 'headsight' || matrix.target == 'native' }}
         with:
           name: ${{ matrix.name }}
           path: |
