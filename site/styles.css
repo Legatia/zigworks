@@ -252,17 +252,18 @@ h1 {
   padding-top: 0;
   padding-bottom: 0;
 }
-@media (min-width: 900px) {
-  .tools { grid-template-columns: 1fr 1fr; }
+@media (min-width: 1100px) {
+  .tools { grid-template-columns: repeat(3, 1fr); }
   .tool-card + .tool-card { border-left: 1px solid var(--rule); }
 }
 .tool-card { padding: 48px 0; min-width: 0; }
-@media (min-width: 900px) {
-  .tool-card { padding: 56px 36px 56px 0; }
-  .tool-card + .tool-card { padding-left: 36px; padding-right: 0; }
+@media (min-width: 1100px) {
+  .tool-card { padding: 56px 28px; }
+  .tool-card:first-child { padding-left: 0; }
+  .tool-card:last-child { padding-right: 0; }
 }
 .tool-card + .tool-card { border-top: 1px solid var(--rule); }
-@media (min-width: 900px) { .tool-card + .tool-card { border-top: 0; } }
+@media (min-width: 1100px) { .tool-card + .tool-card { border-top: 0; } }
 .tool-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; margin: 0 0 10px; }
 .tool-name { margin: 0; font-size: 34px; letter-spacing: -0.025em; font-family: var(--mono); font-weight: 500; }
 .for { margin: 0; color: var(--ink-soft); font-size: 15px; }
@@ -414,6 +415,10 @@ h1 {
 .steps p { margin: 0 0 8px; color: var(--ink-soft); font-size: 15px; }
 .steps .c { display: inline-block; margin-top: 2px; }
 .steps-split { align-items: center; }
+/* headsight: separate uses, not a sequence, so no numbers. */
+.steps.uses li { padding-left: 0; padding-bottom: 26px; }
+.steps.uses li::before, .steps.uses li::after { content: none; }
+.tools .window pre { font-size: 12.5px; }
 .window.tall pre { padding-top: 22px; padding-bottom: 26px; }
 
 /* Install band */
@@ -540,6 +545,7 @@ h1 {
 .results { display: grid; gap: 40px; margin-top: 48px; }
 @media (min-width: 900px) { .results { grid-template-columns: 1.15fr 1fr; } }
 .results > * { min-width: 0; }
+.results > .wide { grid-column: 1 / -1; }
 .results h3 { font-size: 22px; margin: 0 0 6px; }
 .results .aside { margin: 0 0 14px; }
 .results .aside:last-child { margin: 14px 0 0; }

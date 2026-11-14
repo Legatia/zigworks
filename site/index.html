@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>zigworks</title>
-<meta name="description" content="Open-source tools for coding agents, written in Zig. trigrep searches large codebases through an index and stays current as files change; headterm lets an agent use programs that need a real terminal. CLI and MCP servers, MIT licensed.">
+<meta name="description" content="Open-source tools for coding agents, written in Zig. trigrep searches large codebases through an index and stays current as files change; headterm lets an agent use programs that need a real terminal; headsight lets an agent wait for the screen, a window or the camera to change instead of taking screenshots. MIT licensed.">
 <link rel="canonical" href="https://zig.legatia.solutions/">
 <meta name="theme-color" content="#18224b">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://zig.legatia.solutions/">
 <meta property="og:title" content="zigworks">
-<meta property="og:description" content="trigrep and headterm: open-source tools for coding agents, written in Zig.">
+<meta property="og:description" content="trigrep, headterm and headsight: open-source tools for coding agents, written in Zig.">
 <meta property="og:image" content="https://zig.legatia.solutions/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
@@ -29,6 +29,7 @@
     <nav aria-label="Main">
       <a href="#trigrep">trigrep</a>
       <a href="#headterm">headterm</a>
+      <a href="#headsight">headsight</a>
       <a href="#install">Install</a>
       <a class="gh" href="https://github.com/Legatia/zigworks">GitHub</a>
     </nav>
@@ -36,9 +37,9 @@
 
   <section class="hero frame" id="main">
     <div class="hero-copy">
-      <a class="chip" href="https://github.com/Legatia/zigworks/releases"><span class="chip-dot" aria-hidden="true"></span>trigrep 0.3.0 and headterm 0.3.0 released</a>
+      <a class="chip" href="https://github.com/Legatia/zigworks/releases/tag/headsight-v0.1.0"><span class="chip-dot" aria-hidden="true"></span>headsight 0.1.0 released</a>
       <h1>Small, fast tools that coding agents run on, written in&nbsp;Zig.</h1>
-      <p class="lede">trigrep searches huge codebases in milliseconds and never misses a file you just saved. headterm lets an agent drive programs that need a real terminal. Both are command-line tools and MCP servers.</p>
+      <p class="lede">trigrep searches huge codebases in milliseconds and never misses a file you just saved. headterm lets an agent drive programs that need a real terminal. headsight lets an agent wait for something on screen or camera instead of taking screenshot after screenshot. All three are command-line tools.</p>
       <div class="quick" data-tabs>
         <div class="tablist" role="tablist" aria-label="Quick start">
           <button type="button" role="tab" id="q-claude" aria-selected="true" aria-controls="qp-claude">Claude Code</button>
@@ -123,12 +124,29 @@
       </div>
       <a class="more" href="#headterm">How headterm works</a>
     </article>
+
+    <article class="tool-card">
+      <div class="tool-top">
+        <h2 class="tool-name">headsight</h2>
+        <p class="for">Instead of screenshot after screenshot</p>
+      </div>
+      <p>One command that blocks until a window, the screen or the camera changes, goes still or shows some text, then prints one line and the path of a small crop.</p>
+      <div class="window">
+        <div class="window-bar">headsight wait --text "Export Done"</div>
+<pre>text after=2.4s
+found="Export Done: 42 files"
+box=130,197,770,82
+crop=<span class="path">…/headsight/9e3a-1.png</span>
+<span class="dim">origin=114,181 scale=1</span></pre>
+      </div>
+      <a class="more" href="#headsight">How headsight works</a>
+    </article>
   </section>
 
   <section class="frame detail agent" id="agent">
     <div class="detail-head">
       <h2 class="plain">In your agent</h2>
-      <p>Agents reach both through tools they already use: Claude Code’s Grep runs trigrep in place of ripgrep, and one line in <code>CLAUDE.md</code> points the agent to headterm.</p>
+      <p>Agents reach all three through tools they already use: Claude Code’s Grep runs trigrep in place of ripgrep, and one line each in <code>CLAUDE.md</code> points the agent to headterm and headsight.</p>
     </div>
     <div class="chat">
       <div class="msg you"><span class="who-chip">You</span><p>Run <code>python3 unlock.py</code>. When it asks for the vault passphrase, enter: correct horse. Tell me the deploy token it prints.</p></div>
@@ -146,6 +164,22 @@ session ended</pre>
     </div>
 
     <div class="results">
+      <div class="wide">
+        <h3>headsight, measured</h3>
+        <p class="aside">Claude Code with Sonnet, median of 3 runs per task, seconds from the event to the answer. The other agent had one line in its instructions on taking screenshots with <code>screencapture</code>.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">Task</th><th scope="col">Screenshots</th><th scope="col">With headsight</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Wait for an export to finish</th><td>26&nbsp;s, $0.142</td><td>6&nbsp;s, $0.114</td></tr>
+              <tr><th scope="row">Read a counter once it settles</th><td>38&nbsp;s, $0.194</td><td>24&nbsp;s, $0.100</td></tr>
+              <tr><th scope="row">Report every change after an edit</th><td>26&nbsp;s, $0.149, 2 of 3 right</td><td>17&nbsp;s, $0.108</td></tr>
+              <tr><th scope="row">Catch a notification shown for 3&nbsp;s</th><td>44&nbsp;s, $0.198, 2 of 3 right</td><td>4&nbsp;s, $0.107</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="aside">Across all 12 runs, headsight answered 12 correctly against 10, and the model read 9 images instead of 38.</p>
+      </div>
       <div>
         <h3>headterm, measured</h3>
         <p class="aside">Claude Code with Sonnet, mean of 3 runs per task, against the same agent with only a shell.</p>
@@ -326,13 +360,73 @@ session ended</pre>
       </li>
     </ul>
   </section>
+
+  <section id="headsight" class="frame detail">
+    <div class="detail-head">
+      <h2>headsight</h2>
+      <p>An agent waiting for something visual takes a screenshot, sends it to the model, and repeats. headsight watches instead, on the Mac, and wakes the agent only when there is something to look at.</p>
+    </div>
+
+    <div class="split steps-split">
+      <ul class="steps uses">
+        <li>
+          <h3>Wait for text</h3>
+          <p>Apple’s on-device text recognition runs on frames that changed.</p>
+          <code class="c">headsight wait --text "Done" --window Export</code>
+        </li>
+        <li>
+          <h3>Wait until it settles</h3>
+          <p>Returns once nothing has changed for 800&nbsp;ms, or the time you give.</p>
+          <code class="c">headsight wait --still --window Counter</code>
+        </li>
+        <li>
+          <h3>See what changed</h3>
+          <p>Name a reference, make the change, then get a crop of every area that differs.</p>
+          <code class="c">headsight diff --since before</code>
+        </li>
+      </ul>
+      <div class="window tall">
+        <div class="window-bar">what the agent receives</div>
+<pre>diff since=before age=7s boxes=3
+  box 368,192,544,96
+  crop=<span class="path">…/headsight/9e59-1.png</span>
+  box 128,592,320,80
+  crop=<span class="path">…/headsight/9e59-2.png</span>
+  box 464,384,208,80
+  crop=<span class="path">…/headsight/9e59-3.png</span></pre>
+      </div>
+    </div>
+
+    <ul class="grid">
+      <li>
+        <h3>Screen, window or camera</h3>
+        <p>A window is followed when it moves or is covered, and keeps working while the Mac is locked.</p>
+        <code class="c">--window TEXT  --source camera</code>
+      </li>
+      <li>
+        <h3>Ignores noise</h3>
+        <p>Title bars, recording indicators and camera sensor noise don’t count as changes.</p>
+        <code class="c">--ignore X,Y,W,H</code>
+      </li>
+      <li>
+        <h3>Stays on the Mac</h3>
+        <p>Nothing is uploaded. Crops are capped at 1024&nbsp;px and deleted after a day.</p>
+        <code class="c">headsight drop before</code>
+      </li>
+      <li>
+        <h3>macOS only</h3>
+        <p>macOS 14 or later on Apple Silicon, with Screen Recording or Camera access for the app running the agent.</p>
+        <code class="c">headsight windows</code>
+      </li>
+    </ul>
+  </section>
 </main>
 
 <div class="band dark">
   <section id="install" class="frame install">
     <div class="install-copy">
       <h2>Install</h2>
-      <p>Single static binaries for Linux (x86_64, arm64) and macOS (Apple Silicon). No runtime, nothing else to install.</p>
+      <p>Single binaries for Linux (x86_64, arm64) and macOS (Apple Silicon). No runtime, nothing else to install. headsight is macOS only.</p>
       <p class="actions"><a class="button primary" href="https://github.com/Legatia/zigworks/releases">Download a release</a></p>
     </div>
     <div class="install-box" data-tabs>
@@ -345,7 +439,9 @@ session ended</pre>
         <div class="cmd dark-cmd"><pre><code id="c-i1">trigrep install-rg-shim</code></pre><button type="button" class="copy" data-copy="c-i1">Copy</button></div>
         <p>Add this line to <code>CLAUDE.md</code> for headterm:</p>
         <div class="cmd dark-cmd wrap"><pre><code id="c-i2">For programs that need a real terminal (TUI menus, wizards, passphrase prompts read from the TTY, full-screen apps), use the headterm CLI: `headterm run --send KEYS... --wait-text TEXT --screen -- CMD` plays keys and waits and prints the screen in one call; `headterm help run` has the details.</code></pre><button type="button" class="copy" data-copy="c-i2">Copy</button></div>
-        <p class="aside">Both also run as MCP servers: <code>claude mcp add --scope user trigrep -- trigrep mcp</code>, and the same for <code>headterm mcp</code>.</p>
+        <p>And this one for headsight:</p>
+        <div class="cmd dark-cmd wrap"><pre><code id="c-i4">To wait for something on screen or camera to change, settle, or show text, use the headsight CLI instead of repeated screenshots: `headsight wait --change|--still|--text TEXT [--window APP] [--region X,Y,W,H]` blocks and prints a crop path; `headsight help` has the details.</code></pre><button type="button" class="copy" data-copy="c-i4">Copy</button></div>
+        <p class="aside">trigrep and headterm also run as MCP servers: <code>claude mcp add --scope user trigrep -- trigrep mcp</code>, and the same for <code>headterm mcp</code>.</p>
       </div>
       <div class="tabpanel" role="tabpanel" id="ip-src" aria-labelledby="i-src" hidden>
         <p>With Zig 0.15.1:</p>
@@ -357,8 +453,8 @@ cd zigworks/trigrep &amp;&amp; zig build -Doptimize=ReleaseFast</code></pre><but
 
   <section class="frame built">
     <dl>
-      <div><dt>Dependencies</dt><dd>The Zig standard library and libc.</dd></div>
-      <div><dt>Size</dt><dd>500 to 700&nbsp;KB per binary.</dd></div>
+      <div><dt>Dependencies</dt><dd>The Zig standard library and libc; headsight also uses Apple’s frameworks.</dd></div>
+      <div><dt>Size</dt><dd>300 to 700&nbsp;KB per binary.</dd></div>
       <div><dt>Testing</dt><dd>Linux and macOS, on every commit.</dd></div>
       <div><dt>License</dt><dd>MIT, on <a href="https://github.com/Legatia/zigworks">GitHub</a>.</dd></div>
     </dl>
@@ -374,6 +470,7 @@ cd zigworks/trigrep &amp;&amp; zig build -Doptimize=ReleaseFast</code></pre><but
         <h2>Tools</h2>
         <a href="https://github.com/Legatia/zigworks/tree/main/trigrep">trigrep</a>
         <a href="https://github.com/Legatia/zigworks/tree/main/headterm">headterm</a>
+        <a href="https://github.com/Legatia/zigworks/tree/main/headsight">headsight</a>
       </div>
       <div>
         <h2>Project</h2>
