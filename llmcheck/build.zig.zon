@@ -1,0 +1,14 @@
+.{
+    .name = .llmcheck,
+    .version = "0.1.0",
+    .fingerprint = 0xe0b60b86a6fcf25d,
+    .minimum_zig_version = "0.15.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "README.md",
+        "LICENSE",
+    },
+}
