@@ -7,6 +7,7 @@ Open-source tools written in Zig, mostly infrastructure for coding agents. Each 
 | [trigrep](trigrep/) | Indexed code search. ripgrep-compatible output; on the Linux kernel, with its file watcher running (`trigrep watch`, or built into the MCP server), searches take 12–160 ms against ripgrep's 1.4 s, and still see every edit. CLI and MCP server. |
 | [headterm](headterm/) | Headless terminal for agents. Runs a program in a pseudo-terminal and gives the screen as text, row diffs, key input and waits, and which text is highlighted (inverse, bold, colours), so agents can drive vim, less, REPLs, menus and installers. CLI and MCP server; macOS and Linux. |
 | [headsight](headsight/) | Sight for agents without a stream of screenshots. Waits until a region of the screen, a window or the camera changes, goes still or shows some text, and prints one line with a small crop; reads text on the device; compares with a reference. CLI; macOS 14+ (Apple's capture and text recognition frameworks); on Linux, the camera only (V4L2). |
+| [headsound](headsound/) | Audio checks and repairs in one line per answer: loudness, loudness range and true peak; clicks, clipping, dropouts, hum, "p" pops, harsh s, DC offset and phase, marked for GoldWave, Audition, Reaper, Audacity or DaVinci Resolve, or as subtitles; what is heard when (on the Mac); declick, dehum, cut pauses, trim, normalize, convert; and on the Mac, record from the microphone until you stop talking. CLI; macOS 14+, Linux and Windows (WAV only, no microphone or sound classifier off the Mac, so far). |
 
 ## Install
 

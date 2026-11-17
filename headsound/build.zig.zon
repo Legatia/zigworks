@@ -1,0 +1,14 @@
+.{
+    .name = .headsound,
+    .version = "0.1.0",
+    .fingerprint = 0x19b1a749b28a1f27,
+    .minimum_zig_version = "0.15.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "README.md",
+        "LICENSE",
+    },
+}

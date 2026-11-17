@@ -14,11 +14,15 @@ jobs:
       matrix:
         # Zig 0.15.1 can't link against the macOS 26 SDK on macos-latest; macos-15 works.
         os: [ubuntu-latest, macos-15]
-        project: [trigrep, headterm, headsight]
+        project: [trigrep, headterm, headsight, headsound]
+        include:
+          # headsound's file commands also run on Windows (for GoldWave users)
+          - { os: windows-latest, project: headsound }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: ${{ matrix.project }}
+        shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2

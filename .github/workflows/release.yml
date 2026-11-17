@@ -4,9 +4,10 @@ name: Release
 # Builds static Linux binaries (x86_64, arm64) and an Apple Silicon macOS binary, and
 # attaches them to a GitHub release for that tag. headsight's Linux binaries
 # capture the camera only (V4L2); the screen, windows and text need macOS.
+# headsound also gets a Windows x86_64 binary (a zip).
 on:
   push:
-    tags: ["trigrep-v*", "headterm-v*", "headsight-v*"]
+    tags: ["trigrep-v*", "headterm-v*", "headsight-v*", "headsound-v*"]
 
 permissions:
   contents: read
@@ -24,6 +25,8 @@ jobs:
           # build and not find the SDK frameworks trigrep links (CoreServices).
           # -Dcpu=apple_m1 keeps the binary runnable on every Apple Silicon Mac.
           - { os: macos-15, target: native, name: aarch64-macos }
+          # headsound only (other projects skip it below)
+          - { os: windows-latest, target: x86_64-windows-gnu, name: x86_64-windows }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -35,7 +38,10 @@ jobs:
         run: |
           project="${GITHUB_REF_NAME%%-v*}"
           version="${GITHUB_REF_NAME#*-v}"
-          case "$project" in trigrep|headterm|headsight) ;; *) echo "unknown project in tag: $project"; exit 1 ;; esac
+          case "$project" in trigrep|headterm|headsight|headsound) ;; *) echo "unknown project in tag: $project"; exit 1 ;; esac
+          if [ "${{ matrix.name }}" = x86_64-windows ] && [ "$project" != headsound ]; then
+            echo "SKIP=1" >> "$GITHUB_ENV"; exit 0
+          fi
           echo "PKG_DIR=$project" >> "$GITHUB_ENV"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version in tag: $version"; exit 1; }
           grep -q "\"$version\"" "$project/build.zig.zon" || { echo "tag version $version not in $project/build.zig.zon"; exit 1; }
@@ -43,20 +49,29 @@ jobs:
           zig build test
           if [ "${{ matrix.target }}" = native ]; then target_flag=-Dcpu=apple_m1; else target_flag=-Dtarget=${{ matrix.target }}; fi
           zig build -Doptimize=ReleaseFast -Dstrip=true $target_flag --prefix out
+          pkg="$project-$version-${{ matrix.name }}"
+          mkdir "$pkg"
+          if [ "${{ matrix.name }}" = x86_64-windows ]; then
+            cp out/bin/"$project".exe README.md LICENSE "$pkg"/
+            7z a "$pkg.zip" "$pkg" > /dev/null
+            sha256sum "$pkg.zip" > "$pkg.zip.sha256"
+            exit 0
+          fi
           if [ "${{ matrix.target }}" != native ]; then
             file out/bin/"$project" | grep -q "statically linked" || { echo "not static: $(file out/bin/$project)"; exit 1; }
           fi
-          pkg="$project-$version-${{ matrix.name }}"
-          mkdir "$pkg"
           cp out/bin/"$project" README.md LICENSE "$pkg"/
           tar czf "$pkg.tar.gz" "$pkg"
           shasum -a 256 "$pkg.tar.gz" > "$pkg.tar.gz.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: env.SKIP != '1'
         with:
           name: ${{ matrix.name }}
           path: |
             ${{ env.PKG_DIR }}/*.tar.gz
             ${{ env.PKG_DIR }}/*.tar.gz.sha256
+            ${{ env.PKG_DIR }}/*.zip
+            ${{ env.PKG_DIR }}/*.zip.sha256
 
   release:
     needs: build
