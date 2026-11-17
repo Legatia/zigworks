@@ -70,7 +70,7 @@ const testing = std.testing;
 test "base_dir_is_per_user_without_tmpdir" {
     const a = try baseDir(testing.allocator, "/var/x", 501);
     defer testing.allocator.free(a);
-    try testing.expectEqualStrings("/var/x/headsound", a);
+    try testing.expectEqualStrings("/var/x" ++ std.fs.path.sep_str ++ "headsound", a);
     const b = try baseDir(testing.allocator, null, 501);
     defer testing.allocator.free(b);
     try testing.expectEqualStrings("/tmp/headsound-501", b);
