@@ -9,6 +9,10 @@ const Biquad = @import("biquad.zig").Biquad;
 const Audio = audio.Audio;
 
 const rate_lo: u32 = 4000;
+/// Summed harmonic power under which a series is not hum (-90 dBFS as a
+/// sine's peak, below the noise of 16-bit audio): the rounding of a clean
+/// 16-bit tone leaves lines near -120 dBFS on many multiples of 10 Hz.
+const min_power: f64 = 5e-10;
 pub const max_harmonics = 16;
 
 pub const Hum = struct {
@@ -95,7 +99,7 @@ fn analyzeBlock(p: []const f64, binw: f64, scratch: []f64, strong_db: f64) Block
         // Mains hum always has its fundamental, 2nd or 3rd harmonic; a
         // steady tone's harmonics can land on 7 x 60 and 14 x 60 alone.
         const low = mask & 0b111 != 0;
-        if (low and (count >= 2 or strong) and count > best_count) {
+        if (low and power >= min_power and (count >= 2 or strong) and count > best_count) {
             best_count = count;
             best = .{ .found = true, .base = base, .freq = f, .power = power, .mask = mask };
         }
@@ -298,6 +302,25 @@ test "fifty_hertz_and_no_hum" {
     const none = try detect(testing.allocator, clean, 48000);
     defer testing.allocator.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "rounding_lines_of_a_clean_tone_are_not_hum" {
+    // 440 Hz with 50 Hz hum at -26 dBFS, rounded to 16 bits: every block
+    // must say 50 Hz, not a 60 Hz series made of the rounding's lines
+    const rate = 48000;
+    const x = try testing.allocator.alloc(f32, rate * 2);
+    defer testing.allocator.free(x);
+    for (x, 0..) |*v, i| {
+        const t = @as(f64, @floatFromInt(i)) / rate;
+        const s = 0.3 * @sin(2 * std.math.pi * 440 * t) + 0.05 * @sin(2 * std.math.pi * 50 * t);
+        v.* = @floatCast(@round(s * 32767) / 32768);
+    }
+    const hs = try detect(testing.allocator, x, rate);
+    defer testing.allocator.free(hs);
+    try testing.expectEqual(@as(usize, 1), hs.len);
+    try testing.expectApproxEqAbs(@as(f64, 50), hs[0].freq, 0.2);
+    try testing.expectApproxEqAbs(@as(f64, 2), hs[0].end, 0.01);
+    try testing.expect(hs[0].level > -30 and hs[0].level < -22);
 }
 
 test "remove_takes_the_hum_out_and_leaves_the_voice" {
