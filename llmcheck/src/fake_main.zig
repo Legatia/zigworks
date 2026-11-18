@@ -24,10 +24,10 @@ const usage_text =
     \\
 ;
 
-pub fn main() u8 {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const argv = std.process.argsAlloc(arena_state.allocator()) catch return 4;
+pub fn main(init: std.process.Init) u8 {
+    const io = init.io;
+    const stdout = std.Io.File.stdout();
+    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return 4;
 
     var faults: fake.Faults = .{};
     var port: u16 = 0;
@@ -35,7 +35,7 @@ pub fn main() u8 {
     while (i < argv.len) : (i += 1) {
         const name: []const u8 = argv[i];
         if (std.mem.eql(u8, name, "-h") or std.mem.eql(u8, name, "--help") or std.mem.eql(u8, name, "help")) {
-            std.fs.File.stdout().writeAll(usage_text) catch {};
+            stdout.writeStreamingAll(io, usage_text) catch {};
             return 0;
         }
         const known = [_][]const u8{ "--port", "--fault", "--key", "--delay", "--context" };
@@ -63,14 +63,14 @@ pub fn main() u8 {
         }
     }
 
-    const server = fake.Server.start(faults, port) catch |e| {
+    const server = fake.Server.start(io, faults, port) catch |e| {
         std.debug.print("llmcheck-fake: cannot listen on port {d}: {s}\n", .{ port, @errorName(e) });
         return 4;
     };
     var buf: [64]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "listening port={d}\n", .{server.port}) catch return 4;
-    std.fs.File.stdout().writeAll(line) catch {};
-    while (true) std.Thread.sleep(std.time.ns_per_s);
+    stdout.writeStreamingAll(io, line) catch {};
+    while (true) io.sleep(.fromSeconds(1), .awake) catch {};
 }
 
 fn wrong(comptime fmt: []const u8, a: anytype) u8 {

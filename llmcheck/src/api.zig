@@ -3,6 +3,7 @@
 //! leniently, since the checks are about what servers get wrong.
 const std = @import("std");
 const http = @import("http.zig");
+const sock = @import("sock.zig");
 const jv = @import("jv.zig");
 const sse = @import("sse.zig");
 const fidelity = @import("fidelity.zig");
@@ -355,8 +356,8 @@ pub const Server = struct {
     model: ?[]const u8 = null,
     limits: http.Limits = .{},
 
-    pub fn init(gpa: std.mem.Allocator, target: http.Target) Server {
-        return .{ .client = http.Client.init(gpa, target) };
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, target: http.Target) Server {
+        return .{ .client = http.Client.init(gpa, io, target) };
     }
 
     pub fn deinit(s: *Server) void {
@@ -382,7 +383,7 @@ pub const Server = struct {
         if (a.model == null) a.model = s.model;
         const body = try requestBody(arena, a);
         var c: Completion = .{};
-        var timer = std.time.Timer.start() catch unreachable;
+        const timer = sock.Timer.start(s.client.io);
         var resp = try s.client.send(.{
             .path = if (a.prompt != null) "/v1/completions" else "/v1/chat/completions",
             .body = body,
@@ -423,8 +424,8 @@ const Rig = struct {
     arena_state: std.heap.ArenaAllocator,
 
     fn init(r: *Rig, faults: fake.Faults) !void {
-        r.fake_server = try fake.Server.start(faults, 0);
-        r.server = Server.init(testing.allocator, .{ .https = false, .host = "127.0.0.1", .port = r.fake_server.port, .prefix = "" });
+        r.fake_server = try fake.Server.start(testing.io, faults, 0);
+        r.server = Server.init(testing.allocator, testing.io, .{ .https = false, .host = "127.0.0.1", .port = r.fake_server.port, .prefix = "" });
         r.server.key = faults.key;
         r.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     }

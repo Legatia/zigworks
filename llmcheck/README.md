@@ -247,10 +247,10 @@ Faults: `drops_grammar`, `tool_in_content`, `truncate_context`,
   generate freely, so after the first different token they are no longer
   answering the same question. A server that differs early gives few
   positions (see `positions=` and `diverged=`).
-- https uses the TLS in Zig 0.15.1's standard library. TLS 1.3 works
-  (tested through a local proxy, and with a real certificate against a
-  public site). TLS 1.2 fails against servers that pick a curve other than
-  P-256 for the key exchange: seen with OpenSSL 3.6 limited to TLS 1.2.
+- https uses the TLS in Zig 0.17.1's standard library. TLS 1.3 and TLS 1.2
+  work (tested through a local proxy, and with a real certificate against a
+  public site). A TLS 1.2 server that insists on the P-521 curve for the
+  key exchange is refused; X25519, P-256 and P-384 work.
 - A certificate from a private authority is accepted only if that authority
   is in the system's store; there is no option for a CA file. `--insecure`
   accepts any certificate. Certificates issued to an IP address may be
@@ -261,7 +261,7 @@ Faults: `drops_grammar`, `tool_in_content`, `truncate_context`,
 
 ## Building
 
-Zig 0.15.1:
+Zig 0.17.1:
 
 ```sh
 zig build -Doptimize=ReleaseSafe      # zig-out/bin/llmcheck and llmcheck-fake

@@ -464,14 +464,14 @@ const Rig = struct {
     fn init(r: *Rig, faults: fake.Faults, ref_faults: ?fake.Faults) !void {
         r.* = .{
             .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
-            .fake_server = try fake.Server.start(faults, 0),
+            .fake_server = try fake.Server.start(testing.io, faults, 0),
             .server = undefined,
         };
-        r.server = api.Server.init(testing.allocator, .{ .https = false, .host = "127.0.0.1", .port = r.fake_server.port, .prefix = "" });
+        r.server = api.Server.init(testing.allocator, testing.io, .{ .https = false, .host = "127.0.0.1", .port = r.fake_server.port, .prefix = "" });
         r.server.key = faults.key;
         if (ref_faults) |rf| {
-            r.fake_ref = try fake.Server.start(rf, 0);
-            r.ref = api.Server.init(testing.allocator, .{ .https = false, .host = "127.0.0.1", .port = r.fake_ref.?.port, .prefix = "" });
+            r.fake_ref = try fake.Server.start(testing.io, rf, 0);
+            r.ref = api.Server.init(testing.allocator, testing.io, .{ .https = false, .host = "127.0.0.1", .port = r.fake_ref.?.port, .prefix = "" });
         }
     }
 

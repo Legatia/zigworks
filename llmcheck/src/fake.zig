@@ -42,9 +42,9 @@ pub const Faults = struct {
     context: u32 = 512,
 
     pub const names = [_][]const u8{
-        "drops_grammar",   "tool_in_content", "truncate_context", "ignore_max_tokens",
-        "ignore_stop",     "ignore_seed",     "nondeterministic", "hang",
-        "no_done",         "no_usage",        "no_logprobs",      "weights_differ",
+        "drops_grammar",    "tool_in_content", "truncate_context", "ignore_max_tokens",
+        "ignore_stop",      "ignore_seed",     "nondeterministic", "hang",
+        "no_done",          "no_usage",        "no_logprobs",      "weights_differ",
         "template_differs",
     };
 
@@ -63,14 +63,14 @@ pub const Faults = struct {
 pub const model_name = "fake-1";
 
 const vocab = [64][]const u8{
-    "the",    "a",      "model",  "server", "answer", "token",  "river",  "stone",
-    "light",  "under",  "over",   "small",  "large",  "quiet",  "bright", "moves",
-    "holds",  "gives",  "takes",  "finds",  "water",  "paper",  "garden", "window",
-    "letter", "number", "simple", "common", "early",  "late",   "green",  "silver",
-    "walks",  "reads",  "writes", "counts", "and",    "but",    "with",   "from",
+    "the",    "a",      "model",  "server", "answer", "token",  "river",   "stone",
+    "light",  "under",  "over",   "small",  "large",  "quiet",  "bright",  "moves",
+    "holds",  "gives",  "takes",  "finds",  "water",  "paper",  "garden",  "window",
+    "letter", "number", "simple", "common", "early",  "late",   "green",   "silver",
+    "walks",  "reads",  "writes", "counts", "and",    "but",    "with",    "from",
     "into",   "near",   "every",  "some",   "first",  "second", "morning", "evening",
-    "house",  "road",   "bridge", "field",  "open",   "closed", "warm",   "cold",
-    "slowly", "often",  "again",  "there",  "here",   "then",   "still",  "always",
+    "house",  "road",   "bridge", "field",  "open",   "closed", "warm",    "cold",
+    "slowly", "often",  "again",  "there",  "here",   "then",   "still",   "always",
 };
 
 const eos: u16 = 0xffff;
@@ -147,12 +147,14 @@ const Gen = struct {
 
 const Generated = struct { toks: []Tok, finish: []const u8 };
 
-fn generate(arena: std.mem.Allocator, h0: u64, g: Gen, f: *const Faults) !Generated {
+fn generate(io: std.Io, arena: std.mem.Allocator, h0: u64, g: Gen, f: *const Faults) !Generated {
     var toks: std.ArrayList(Tok) = .empty;
     var text: std.ArrayList(u8) = .empty;
     var h = h0;
     const random_seed = f.ignore_seed or f.nondeterministic or g.seed == null;
-    var prng = std.Random.DefaultPrng.init(if (random_seed) std.crypto.random.int(u64) else g.seed.?);
+    var chance: u64 = undefined;
+    io.random(std.mem.asBytes(&chance));
+    var prng = std.Random.DefaultPrng.init(if (random_seed) chance else g.seed.?);
     const temperature: f64 = if (f.nondeterministic) 1 else g.temperature;
     const max = if (f.ignore_max_tokens) hard_cap else @min(g.max_tokens, hard_cap);
     var finish: []const u8 = "stop";
@@ -228,8 +230,9 @@ fn fromSchema(w: *std.Io.Writer, schema: ?Value, depth: usize) !void {
 }
 
 pub const Server = struct {
+    io: std.Io,
     faults: Faults,
-    listener: std.net.Server,
+    listener: sock.Listener,
     port: u16,
     thread: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
@@ -239,21 +242,20 @@ pub const Server = struct {
     /// Generations running at the same moment, and the most there were.
     generating: std.atomic.Value(u32) = .init(0),
     peak_generating: std.atomic.Value(u32) = .init(0),
-    mutex: std.Thread.Mutex = .{},
-    open: std.ArrayList(std.net.Stream) = .empty,
+    mutex: std.Io.Mutex = .init,
+    open: std.ArrayList(sock.Handle) = .empty,
 
     const gpa = std.heap.page_allocator;
     /// How long a connection may sit without a request before it is closed.
     const idle_ms = 60 * 60 * 1000;
 
     /// Listens on 127.0.0.1; `port` 0 takes a free one (see `Server.port`).
-    pub fn start(faults: Faults, port: u16) !*Server {
-        const addr = try std.net.Address.parseIp("127.0.0.1", port);
-        var listener = try addr.listen(.{ .reuse_address = true });
-        errdefer listener.deinit();
+    pub fn start(io: std.Io, faults: Faults, port: u16) !*Server {
+        const listener = try sock.Listener.open(port);
+        errdefer listener.close();
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
-        s.* = .{ .faults = faults, .listener = listener, .port = listener.listen_address.getPort() };
+        s.* = .{ .io = io, .faults = faults, .listener = listener, .port = listener.port };
         s.thread = try std.Thread.spawn(.{}, acceptLoop, .{s});
         return s;
     }
@@ -261,17 +263,21 @@ pub const Server = struct {
     pub fn stop(s: *Server) void {
         s.stopping.store(true, .release);
         // wake the accept
-        if (std.net.tcpConnectToAddress(s.listener.listen_address)) |c| c.close() else |_| {}
+        if (sock.connect(s.io, "127.0.0.1", s.port, 1000)) |c| sock.closeHandle(c) else |_| {}
         if (s.thread) |t| t.join();
         {
-            s.mutex.lock();
-            defer s.mutex.unlock();
-            for (s.open.items) |c| std.posix.shutdown(c.handle, .both) catch {};
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            for (s.open.items) |c| sock.shutdown(c);
         }
-        while (s.active.load(.acquire) > 0) std.Thread.sleep(std.time.ns_per_ms);
-        s.listener.deinit();
+        while (s.active.load(.acquire) > 0) s.pause(1);
+        s.listener.close();
         s.open.deinit(gpa);
         gpa.destroy(s);
+    }
+
+    fn pause(s: *Server, ms: u64) void {
+        s.io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
     }
 
     fn acceptLoop(s: *Server) void {
@@ -281,47 +287,44 @@ pub const Server = struct {
                 continue;
             };
             if (s.stopping.load(.acquire)) {
-                conn.stream.close();
+                sock.closeHandle(conn);
                 return;
             }
             {
-                s.mutex.lock();
-                defer s.mutex.unlock();
-                s.open.append(gpa, conn.stream) catch {};
+                s.mutex.lockUncancelable(s.io);
+                defer s.mutex.unlock(s.io);
+                s.open.append(gpa, conn) catch {};
             }
             _ = s.active.fetchAdd(1, .acq_rel);
-            const t = std.Thread.spawn(.{}, serve, .{ s, conn.stream }) catch {
-                s.done(conn.stream);
+            const t = std.Thread.spawn(.{}, serve, .{ s, conn }) catch {
+                s.done(conn);
                 continue;
             };
             t.detach();
         }
     }
 
-    fn done(s: *Server, stream: std.net.Stream) void {
+    fn done(s: *Server, conn: sock.Handle) void {
         {
-            s.mutex.lock();
-            defer s.mutex.unlock();
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
             for (s.open.items, 0..) |c, i| {
-                if (c.handle == stream.handle) {
+                if (c == conn) {
                     _ = s.open.swapRemove(i);
                     break;
                 }
             }
         }
-        stream.close();
+        sock.closeHandle(conn);
         _ = s.active.fetchSub(1, .acq_rel);
     }
 
-    fn serve(s: *Server, stream: std.net.Stream) void {
-        defer s.done(stream);
+    fn serve(s: *Server, conn: sock.Handle) void {
+        defer s.done(conn);
         var rbuf: [32 * 1024]u8 = undefined;
         var wbuf: [16 * 1024]u8 = undefined;
-        // The socket layer the client uses, not std's stream: on Windows that
-        // one takes some Winsock errors for impossible and panics, a write
-        // after stop() shut the socket down among them.
         var sk: sock.Socket = undefined;
-        sk.init(stream.handle, &rbuf, &wbuf, idle_ms);
+        sk.init(s.io, conn, &rbuf, &wbuf, idle_ms);
         var http_server = std.http.Server.init(&sk.reader, &sk.writer);
         while (!s.stopping.load(.acquire)) {
             var req = http_server.receiveHead() catch return;
@@ -355,7 +358,7 @@ pub const Server = struct {
         if (method == .POST and (is_chat or std.mem.eql(u8, target, "/v1/completions"))) {
             if (s.faults.hang) {
                 var waited: usize = 0;
-                while (!s.stopping.load(.acquire) and waited < 120_000) : (waited += 20) std.Thread.sleep(20 * std.time.ns_per_ms);
+                while (!s.stopping.load(.acquire) and waited < 120_000) : (waited += 20) s.pause(20);
                 return error.Hung;
             }
             const now = s.generating.fetchAdd(1, .acq_rel) + 1;
@@ -469,7 +472,7 @@ pub const Server = struct {
             while (i < text.len) : (i += 8) try pieces.append(arena, .{ .text = text[i..@min(i + 8, text.len)] });
             completion_tokens = pieces.items.len;
         } else if (tool_name == null) {
-            const made = try generate(arena, h, g, f);
+            const made = try generate(s.io, arena, h, g, f);
             finish = made.finish;
             completion_tokens = made.toks.len;
             const as_object = is_chat and !f.drops_grammar and std.mem.eql(u8, format, "json_object");
@@ -478,10 +481,10 @@ pub const Server = struct {
             if (as_object) try pieces.append(arena, .{ .text = "\"}" });
         }
         const usage = try std.fmt.allocPrint(arena, "{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}", .{ prompt.len, completion_tokens, prompt.len + completion_tokens });
-        const delay = @as(u64, f.token_delay_ms) * std.time.ns_per_ms;
+        const delay: u64 = f.token_delay_ms;
 
         if (!stream) {
-            if (delay > 0) std.Thread.sleep(delay * @max(completion_tokens, 1));
+            if (delay > 0) s.pause(delay * @max(completion_tokens, 1));
             var out: std.Io.Writer.Allocating = .init(arena);
             const w = &out.writer;
             var text: std.ArrayList(u8) = .empty;
@@ -521,7 +524,7 @@ pub const Server = struct {
             try bw.flush();
         }
         if (tool_name) |name| {
-            if (delay > 0) std.Thread.sleep(delay);
+            if (delay > 0) s.pause(delay);
             try w.print(head_f ++ "\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":{f},\"arguments\":\"\"}}}}]}},\"finish_reason\":null}}]}}\n\n", .{std.json.fmt(name, .{})});
             var i: usize = 0;
             while (i < tool_args.len) : (i += 6) {
@@ -531,7 +534,7 @@ pub const Server = struct {
             try bw.flush();
         }
         for (pieces.items) |p| {
-            if (delay > 0) std.Thread.sleep(delay);
+            if (delay > 0) s.pause(delay);
             if (is_chat) {
                 try w.print(head_f ++ "\"delta\":{{\"content\":{f}}},", .{std.json.fmt(p.text, .{})});
             } else {

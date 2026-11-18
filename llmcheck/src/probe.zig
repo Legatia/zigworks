@@ -5,6 +5,7 @@
 const std = @import("std");
 const api = @import("api.zig");
 const http = @import("http.zig");
+const sock = @import("sock.zig");
 const check = @import("check.zig");
 const fidelity = @import("fidelity.zig");
 
@@ -36,7 +37,7 @@ pub fn once(arena: std.mem.Allocator, s: *api.Server, opts: Options) error{OutOf
     defer s.model = given;
     const ms = std.time.ns_per_ms;
 
-    var timer = std.time.Timer.start() catch unreachable;
+    const timer = sock.Timer.start(s.client.io);
     const models = s.models(arena) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return problem(arena, &o, .down, "", e, s),
@@ -127,7 +128,7 @@ pub fn isoTime(buf: *[20]u8, secs: u64) []const u8 {
     const month = day.calculateMonthDay();
     const clock = es.getDaySeconds();
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-        day.year,                  month.month.numeric(),       @as(u32, month.day_index) + 1,
+        day.year,                month.month.numeric(),      @as(u32, month.day_index) + 1,
         clock.getHoursIntoDay(), clock.getMinutesIntoHour(), clock.getSecondsIntoMinute(),
     }) catch buf[0..0];
 }
@@ -144,8 +145,8 @@ const Rig = struct {
 
     fn init(r: *Rig, faults: fake.Faults) !void {
         r.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-        r.fake_server = try fake.Server.start(faults, 0);
-        r.server = api.Server.init(testing.allocator, .{ .https = false, .host = "127.0.0.1", .port = r.fake_server.port, .prefix = "" });
+        r.fake_server = try fake.Server.start(testing.io, faults, 0);
+        r.server = api.Server.init(testing.allocator, testing.io, .{ .https = false, .host = "127.0.0.1", .port = r.fake_server.port, .prefix = "" });
         r.server.limits = .{ .idle_ms = 300 };
     }
     fn deinit(r: *Rig) void {
@@ -196,7 +197,7 @@ test "a_server_that_is_not_there_is_down" {
     var r: Rig = undefined;
     try r.init(.{});
     r.fake_server.stop();
-    r.fake_server = try fake.Server.start(.{}, 0);
+    r.fake_server = try fake.Server.start(testing.io, .{}, 0);
     defer r.deinit();
     // Windows takes its time to report a refused connection (more than the
     // 300 ms of the other tests), and until then it is a server not answering

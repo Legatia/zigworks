@@ -121,17 +121,19 @@ fn tlsFailure(e: anyerror) Error {
 
 pub const Client = struct {
     gpa: std.mem.Allocator,
+    io: Io,
     target: Target,
     /// Accept any https certificate (self-signed internal servers).
     insecure: bool = false,
     user_agent: []const u8 = "llmcheck",
     conn: ?*Conn = null,
     ca: ?std.crypto.Certificate.Bundle = null,
+    ca_lock: Io.RwLock = .init,
     /// More about the last error than its name says.
     detail: ?anyerror = null,
 
-    pub fn init(gpa: std.mem.Allocator, target: Target) Client {
-        return .{ .gpa = gpa, .target = target };
+    pub fn init(gpa: std.mem.Allocator, io: Io, target: Target) Client {
+        return .{ .gpa = gpa, .io = io, .target = target };
     }
 
     pub fn deinit(c: *Client) void {
@@ -150,7 +152,7 @@ pub const Client = struct {
 
     fn open(c: *Client, limits: Limits) Error!*Conn {
         const t = c.target;
-        const handle = sock.connect(c.gpa, t.host, t.port, limits.idle_ms) catch |e| {
+        const handle = sock.connect(c.io, t.host, t.port, limits.idle_ms) catch |e| {
             c.detail = e;
             return if (e == error.OutOfMemory) error.OutOfMemory else if (e == error.ConnectionTimedOut) error.Timeout else error.ConnectFailed;
         };
@@ -165,21 +167,34 @@ pub const Client = struct {
         conn.mem = mem;
         conn.keep = false;
         conn.tls_client = null;
-        conn.s.init(handle, mem[0..read_buf_len], mem[read_buf_len..][0..write_buf_len], limits.idle_ms);
+        conn.s.init(c.io, handle, mem[0..read_buf_len], mem[read_buf_len..][0..write_buf_len], limits.idle_ms);
         conn.s.setLimits(limits.idle_ms, limits.total_ms);
         if (t.https) {
             const plain = mem[read_buf_len + write_buf_len ..];
             if (!c.insecure and c.ca == null) {
-                var bundle: std.crypto.Certificate.Bundle = .{};
-                bundle.rescan(c.gpa) catch |e| {
+                var bundle: std.crypto.Certificate.Bundle = .empty;
+                bundle.rescan(c.gpa, c.io, Io.Clock.real.now(c.io)) catch |e| {
                     c.detail = e;
                     return error.TlsFailed;
                 };
                 c.ca = bundle;
             }
+            // what the handshake's keys are made from
+            var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+            c.io.randomSecure(&entropy) catch |e| {
+                c.detail = e;
+                return error.TlsFailed;
+            };
             conn.tls_client = tls.Client.init(&conn.s.reader, &conn.s.writer, .{
                 .host = if (c.insecure) .no_verification else .{ .explicit = t.host },
-                .ca = if (c.insecure) .no_verification else .{ .bundle = c.ca.? },
+                .ca = if (c.insecure) .no_verification else .{ .bundle = .{
+                    .gpa = c.gpa,
+                    .io = c.io,
+                    .lock = &c.ca_lock,
+                    .bundle = &c.ca.?,
+                } },
+                .entropy = &entropy,
+                .realtime_now = Io.Clock.real.now(c.io),
                 .read_buffer = plain[0..read_buf_len],
                 .write_buffer = plain[read_buf_len..],
                 // HTTP says how long each answer is, so a cut-off one is noticed.
@@ -189,7 +204,7 @@ pub const Client = struct {
                 return if (conn.s.timed_out) error.Timeout else tlsFailure(e);
             };
         }
-        conn.reader = .{ .in = conn.in(), .state = .ready, .interface = undefined, .max_head_len = read_buf_len };
+        conn.reader = .{ .in = conn.in(), .state = .ready, .interface = undefined, .max_head_len = read_buf_len, .side = .response };
         return conn;
     }
 
@@ -249,7 +264,7 @@ pub const Client = struct {
         }
         var resp: Response = .{
             .client = c,
-            .status = @intFromEnum(head.status),
+            .status = @backingInt(head.status),
             .body = undefined,
             .body_buf = undefined,
         };
@@ -379,11 +394,11 @@ test "addresses_that_are_not_servers_are_refused" {
 const fake = @import("fake.zig");
 
 fn testClient(port: u16) Client {
-    return Client.init(testing.allocator, .{ .https = false, .host = "127.0.0.1", .port = port, .prefix = "" });
+    return Client.init(testing.allocator, testing.io, .{ .https = false, .host = "127.0.0.1", .port = port, .prefix = "" });
 }
 
 test "a_request_gets_its_answer_and_the_connection_is_kept_for_the_next" {
-    const server = try fake.Server.start(.{}, 0);
+    const server = try fake.Server.start(testing.io, .{}, 0);
     defer server.stop();
     var c = testClient(server.port);
     defer c.deinit();
@@ -403,11 +418,11 @@ test "a_request_gets_its_answer_and_the_connection_is_kept_for_the_next" {
 }
 
 test "a_streamed_answer_arrives_piece_by_piece_not_all_at_the_end" {
-    const server = try fake.Server.start(.{ .token_delay_ms = 40 }, 0);
+    const server = try fake.Server.start(testing.io, .{ .token_delay_ms = 40 }, 0);
     defer server.stop();
     var c = testClient(server.port);
     defer c.deinit();
-    var timer = try std.time.Timer.start();
+    const timer = sock.Timer.start(testing.io);
     var resp = try c.send(.{ .path = "/v1/chat/completions", .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"temperature\":0,\"max_tokens\":6,\"stream\":true}" });
     defer resp.deinit();
     try testing.expectEqualStrings("text/event-stream", resp.contentType());
@@ -429,7 +444,7 @@ test "a_streamed_answer_arrives_piece_by_piece_not_all_at_the_end" {
 }
 
 test "the_stand_in_server_can_be_stopped_while_an_answer_is_on_its_way" {
-    const server = try fake.Server.start(.{ .token_delay_ms = 20 }, 0);
+    const server = try fake.Server.start(testing.io, .{ .token_delay_ms = 20 }, 0);
     var stopped = false;
     defer if (!stopped) server.stop();
     var c = testClient(server.port);
@@ -450,11 +465,11 @@ test "the_stand_in_server_can_be_stopped_while_an_answer_is_on_its_way" {
 }
 
 test "a_server_that_stops_answering_is_given_up_on" {
-    const server = try fake.Server.start(.{ .hang = true }, 0);
+    const server = try fake.Server.start(testing.io, .{ .hang = true }, 0);
     defer server.stop();
     var c = testClient(server.port);
     defer c.deinit();
-    var timer = try std.time.Timer.start();
+    const timer = sock.Timer.start(testing.io);
     const r = c.send(.{ .path = "/v1/chat/completions", .body = "{\"messages\":[]}", .limits = .{ .idle_ms = 150 } });
     try testing.expectError(error.Timeout, r);
     const ms = timer.read() / std.time.ns_per_ms;
@@ -462,11 +477,11 @@ test "a_server_that_stops_answering_is_given_up_on" {
 }
 
 test "a_slow_answer_is_cut_off_at_the_total_time_allowed" {
-    const server = try fake.Server.start(.{ .token_delay_ms = 50 }, 0);
+    const server = try fake.Server.start(testing.io, .{ .token_delay_ms = 50 }, 0);
     defer server.stop();
     var c = testClient(server.port);
     defer c.deinit();
-    var timer = try std.time.Timer.start();
+    const timer = sock.Timer.start(testing.io);
     var resp = try c.send(.{
         .path = "/v1/chat/completions",
         .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"temperature\":0,\"max_tokens\":40,\"stream\":true}",
@@ -481,7 +496,7 @@ test "a_slow_answer_is_cut_off_at_the_total_time_allowed" {
 
 test "nothing_listening_is_reported_as_no_connection" {
     // a port that was free a moment ago
-    const server = try fake.Server.start(.{}, 0);
+    const server = try fake.Server.start(testing.io, .{}, 0);
     const port = server.port;
     server.stop();
     var c = testClient(port);

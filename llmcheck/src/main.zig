@@ -47,7 +47,8 @@ const usage_text =
 ;
 
 const command_help = .{
-    .{ "check",
+    .{
+        "check",
         \\llmcheck check URL [--ref URL] [--only a,b] [--skip a,b]
         \\
         \\Sends a few dozen small requests and says for each part of the interface
@@ -84,7 +85,8 @@ const command_help = .{
         \\Exit 1 when a check fails; warnings do not change the exit code.
         \\
     },
-    .{ "fidelity",
+    .{
+        "fidelity",
         \\llmcheck fidelity URL --ref URL
         \\llmcheck fidelity URL --record FILE
         \\llmcheck fidelity URL --against FILE
@@ -123,7 +125,8 @@ const command_help = .{
         \\servers differ, 4 when there are no token probabilities to compare.
         \\
     },
-    .{ "bench",
+    .{
+        "bench",
         \\llmcheck bench URL [--concurrency N] [--requests N | --duration S] [--rate R]
         \\
         \\Sends streamed chat requests and measures time to the first token, time
@@ -147,7 +150,8 @@ const command_help = .{
         \\Exit 1 when some requests fail, 4 when all do.
         \\
     },
-    .{ "probe",
+    .{
+        "probe",
         \\llmcheck probe URL [--every S [--count N]] [--baseline FILE]
         \\
         \\Three requests: the model list, a short chat, a short stream. One line:
@@ -171,25 +175,26 @@ const command_help = .{
 
 pub const Exit = enum(u8) { ok = 0, failed = 1, usage = 2, unreached = 4 };
 
-pub fn main() u8 {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+pub fn main(init: std.process.Init) u8 {
+    const io = init.io;
+    const arena = init.arena.allocator();
 
     var out_buf: [4096]u8 = undefined;
-    var out_w = std.fs.File.stdout().writerStreaming(&out_buf);
+    var out_w = std.Io.File.stdout().writerStreaming(io, &out_buf);
     const out = &out_w.interface;
 
-    const argv = std.process.argsAlloc(arena) catch return @intFromEnum(Exit.unreached);
-    const parsed = args.parse(arena, argv[1..]) catch return @intFromEnum(Exit.unreached);
+    const raw = init.minimal.args.toSlice(arena) catch return @backingInt(Exit.unreached);
+    const argv = arena.alloc([]const u8, raw.len) catch return @backingInt(Exit.unreached);
+    for (argv, raw) |*to, from| to.* = from;
+    const parsed = args.parse(arena, argv[@min(1, argv.len)..]) catch return @backingInt(Exit.unreached);
     const o = switch (parsed) {
         .ok => |o| o,
         .err => |text| {
             complain("{s}\nSee `llmcheck help`.", .{text});
-            return @intFromEnum(Exit.usage);
+            return @backingInt(Exit.usage);
         },
     };
-    var app: App = .{ .gpa = std.heap.smp_allocator, .arena = arena, .out = out, .o = o };
+    var app: App = .{ .gpa = std.heap.smp_allocator, .io = io, .environ = init.environ_map, .arena = arena, .out = out, .o = o };
     const exit = app.run() catch |e| switch (e) {
         error.WriteFailed => Exit.failed, // nobody reads the output any more
         error.OutOfMemory => blk: {
@@ -198,7 +203,7 @@ pub fn main() u8 {
         },
     };
     out.flush() catch {};
-    return @intFromEnum(exit);
+    return @backingInt(exit);
 }
 
 fn complain(comptime fmt: []const u8, a: anytype) void {
@@ -252,6 +257,8 @@ const not_an_address = "'{s}' is not an address llmcheck can use: give http://ho
 
 const App = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: *std.process.Environ.Map,
     arena: std.mem.Allocator,
     out: *Writer,
     o: args.Options,
@@ -286,7 +293,7 @@ const App = struct {
     }
 
     fn env(a: *App, name: []const u8) ?[]const u8 {
-        const v = std.process.getEnvVarOwned(a.arena, name) catch return null;
+        const v = a.environ.get(name) orelse return null;
         return if (v.len > 0) v else null;
     }
 
@@ -296,7 +303,7 @@ const App = struct {
             complain(not_an_address, .{url});
             return null;
         };
-        var s = api.Server.init(a.gpa, target);
+        var s = api.Server.init(a.gpa, a.io, target);
         s.model = model;
         s.key = key;
         s.client.insecure = a.o.insecure;
@@ -412,7 +419,7 @@ const App = struct {
     // ---- fidelity ----
 
     fn readFile(a: *App, path: []const u8) ?[]u8 {
-        return std.fs.cwd().readFileAlloc(a.arena, path, 256 << 20) catch |e| {
+        return std.Io.Dir.cwd().readFileAlloc(a.io, path, a.arena, .limited(256 << 20)) catch |e| {
             complain("cannot read {s}: {s}", .{ path, @errorName(e) });
             return null;
         };
@@ -467,7 +474,7 @@ const App = struct {
                 complain("{s} gave no token probabilities: {s}", .{ o.url, rec.items[0].problem orelse "no answer" });
                 return .unreached;
             }
-            std.fs.cwd().writeFile(.{ .sub_path = path, .data = try fidelity.writeRecord(a.arena, rec) }) catch |e| {
+            std.Io.Dir.cwd().writeFile(a.io, .{ .sub_path = path, .data = try fidelity.writeRecord(a.arena, rec) }) catch |e| {
                 complain("cannot write {s}: {s}", .{ path, @errorName(e) });
                 return .unreached;
             };
@@ -606,7 +613,7 @@ const App = struct {
             return .usage;
         };
         const limits: http.Limits = .{ .idle_ms = (o.timeout_s orelse 120) *| 1000 };
-        const res = bench.run(a.gpa, a.arena, .{
+        const res = bench.run(a.gpa, a.io, a.arena, .{
             .target = target,
             .key = o.key orelse a.env("LLMCHECK_API_KEY"),
             .model = o.model,
@@ -698,10 +705,10 @@ const App = struct {
             // what one probe needs is given back before the next
             var scratch = std.heap.ArenaAllocator.init(a.gpa);
             defer scratch.deinit();
-            const started = std.time.Instant.now() catch null;
+            const started = sock.nowNs(a.io);
             const got = try probe.once(scratch.allocator(), &s, opts);
             var time_buf: [20]u8 = undefined;
-            const time = probe.isoTime(&time_buf, @intCast(@max(0, std.time.timestamp())));
+            const time = probe.isoTime(&time_buf, @intCast(@max(0, std.Io.Clock.real.now(a.io).toSeconds())));
             if (o.json) {
                 var j: std.json.Stringify = .{ .writer = a.out, .options = .{} };
                 try j.beginObject();
@@ -739,12 +746,9 @@ const App = struct {
             const every = o.every_s orelse break;
             if (o.count) |n| if (done >= n) break;
             // from start to start, so that the probes keep their beat
-            const period: u64 = @intFromFloat(every * std.time.ns_per_s);
-            var spent: u64 = 0;
-            if (started) |t0| {
-                if (std.time.Instant.now()) |t1| spent = t1.since(t0) else |_| {}
-            }
-            if (spent < period) std.Thread.sleep(period - spent);
+            const period: i128 = @intFromFloat(every * std.time.ns_per_s);
+            const spent = sock.nowNs(a.io) - started;
+            if (spent < period) a.io.sleep(.fromNanoseconds(@intCast(period - spent)), .awake) catch {};
         }
         return worst;
     }

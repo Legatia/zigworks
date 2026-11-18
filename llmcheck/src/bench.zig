@@ -7,6 +7,7 @@
 const std = @import("std");
 const api = @import("api.zig");
 const http = @import("http.zig");
+const sock = @import("sock.zig");
 const stats = @import("stats.zig");
 const check = @import("check.zig");
 
@@ -58,8 +59,8 @@ pub const Result = struct {
 
 /// An error means the server could not be reached at all. `gpa` is used
 /// from several threads; what the result points to is in `arena`.
-pub fn run(gpa: std.mem.Allocator, arena: std.mem.Allocator, setup: Setup, opts: Options) http.Error!Result {
-    var shared: Shared = .{ .gpa = gpa, .setup = setup, .opts = opts, .model = setup.model, .start = undefined };
+pub fn run(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, setup: Setup, opts: Options) http.Error!Result {
+    var shared: Shared = .{ .gpa = gpa, .io = io, .setup = setup, .opts = opts, .model = setup.model, .start = undefined };
     if (opts.duration_s) |d| shared.duration_ns = @intFromFloat(d * std.time.ns_per_s);
     if (opts.requests) |n| shared.requests = n;
     if (opts.requests == null and opts.duration_s == null) shared.requests = @max(32, 2 * opts.concurrency);
@@ -82,7 +83,7 @@ pub fn run(gpa: std.mem.Allocator, arena: std.mem.Allocator, setup: Setup, opts:
         _ = try first.server.ask(scratch.allocator(), try request(scratch.allocator(), opts, std.math.maxInt(u32) - i));
     }
 
-    shared.start = std.time.Instant.now() catch return error.ConnectFailed;
+    shared.start = sock.nowNs(io);
     var spawned: usize = 0;
     for (workers[1..]) |*w| {
         w.thread = std.Thread.spawn(.{}, Worker.loop, .{w}) catch break;
@@ -123,22 +124,23 @@ pub fn run(gpa: std.mem.Allocator, arena: std.mem.Allocator, setup: Setup, opts:
 
 const Shared = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
     setup: Setup,
     opts: Options,
     model: ?[]const u8,
-    start: std.time.Instant,
+    /// `sock.nowNs` when the measured requests began.
+    start: i128,
     requests: ?u64 = null,
     duration_ns: ?u64 = null,
     next: std.atomic.Value(u64) = .init(0),
 
     fn now(s: *const Shared) u64 {
-        const t = std.time.Instant.now() catch return 0;
-        return t.since(s.start);
+        return @intCast(@max(0, sock.nowNs(s.io) - s.start));
     }
 };
 
 const filler = [_][]const u8{
-    "river", "stone", "light", "winter", "garden", "silver", "window", "paper",
+    "river",   "stone",   "light",  "winter", "garden", "silver", "window", "paper",
     "harbour", "morning", "thread", "forest", "candle", "bridge", "summer", "copper",
 };
 
@@ -174,7 +176,7 @@ const Worker = struct {
     rates: std.ArrayList(f64) = .empty,
 
     fn init(shared: *Shared) Worker {
-        var w: Worker = .{ .shared = shared, .server = api.Server.init(shared.gpa, shared.setup.target) };
+        var w: Worker = .{ .shared = shared, .server = api.Server.init(shared.gpa, shared.io, shared.setup.target) };
         w.server.key = shared.setup.key;
         w.server.model = shared.model;
         w.server.limits = shared.setup.limits;
@@ -203,7 +205,7 @@ const Worker = struct {
                 due = @intFromFloat(@as(f64, @floatFromInt(i)) / rate * std.time.ns_per_s);
                 if (s.duration_ns) |d| if (due.? >= d) return;
                 const t = s.now();
-                if (t < due.?) std.Thread.sleep(due.? - t);
+                if (t < due.?) s.io.sleep(.fromNanoseconds(due.? - t), .awake) catch {};
             } else if (s.duration_ns) |d| {
                 if (s.now() >= d) return;
             }
@@ -276,7 +278,7 @@ const Rig = struct {
 
     fn init(r: *Rig, faults: fake.Faults) !void {
         r.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-        r.fake_server = try fake.Server.start(faults, 0);
+        r.fake_server = try fake.Server.start(testing.io, faults, 0);
         r.setup = .{
             .target = .{ .https = false, .host = "127.0.0.1", .port = r.fake_server.port, .prefix = "" },
             .model = fake.model_name,
@@ -288,7 +290,7 @@ const Rig = struct {
         r.arena_state.deinit();
     }
     fn run(r: *Rig, opts: Options) !Result {
-        return bench.run(testing.allocator, r.arena_state.allocator(), r.setup, opts);
+        return bench.run(testing.allocator, testing.io, r.arena_state.allocator(), r.setup, opts);
     }
 };
 const bench = @This();
@@ -395,7 +397,7 @@ test "a_server_that_is_not_there_is_an_error" {
     var r: Rig = undefined;
     try r.init(.{});
     r.fake_server.stop();
-    r.fake_server = try fake.Server.start(.{}, 0);
+    r.fake_server = try fake.Server.start(testing.io, .{}, 0);
     defer r.deinit();
     try testing.expectError(error.ConnectFailed, r.run(.{ .concurrency = 2, .requests = 2 }));
 }

@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run llmcheck").dependOn(&run.step);
 
     const unit = b.addTest(.{ .root_module = mod });

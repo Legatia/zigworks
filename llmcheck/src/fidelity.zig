@@ -226,7 +226,7 @@ pub fn parsePrompts(arena: std.mem.Allocator, text: []const u8) ![]Prompt {
         } else if (std.mem.startsWith(u8, line, "chat:")) {
             line = line[5..];
         }
-        line = std.mem.trimLeft(u8, line, " \t");
+        line = std.mem.trimStart(u8, line, " \t");
         if (line.len == 0) continue;
         var body: std.ArrayList(u8) = .empty;
         var i: usize = 0;
@@ -246,9 +246,9 @@ pub fn parsePrompts(arena: std.mem.Allocator, text: []const u8) ![]Prompt {
             }
             try body.append(arena, line[i]);
         }
-        counts[@intFromEnum(kind)] += 1;
+        counts[@backingInt(kind)] += 1;
         try out.append(arena, .{
-            .id = try std.fmt.allocPrint(arena, "{s}-{d}", .{ @tagName(kind), counts[@intFromEnum(kind)] }),
+            .id = try std.fmt.allocPrint(arena, "{s}-{d}", .{ @tagName(kind), counts[@backingInt(kind)] }),
             .kind = kind,
             .text = body.items,
         });
@@ -729,8 +729,8 @@ const Rig = struct {
 
     fn init(r: *Rig, faults: fake.Faults) !void {
         r.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-        r.fake_server = try fake.Server.start(faults, 0);
-        r.server = api.Server.init(testing.allocator, .{ .https = false, .host = "127.0.0.1", .port = r.fake_server.port, .prefix = "" });
+        r.fake_server = try fake.Server.start(testing.io, faults, 0);
+        r.server = api.Server.init(testing.allocator, testing.io, .{ .https = false, .host = "127.0.0.1", .port = r.fake_server.port, .prefix = "" });
         r.server.model = fake.model_name;
     }
     fn deinit(r: *Rig) void {
@@ -831,6 +831,6 @@ test "a_prompt_the_server_refuses_is_kept_with_the_reason" {
     try testing.expect(got.items[0].steps.len == 0); // "The capital of France is": 5 words
     try testing.expect(std.mem.startsWith(u8, got.items[0].problem.?, "HTTP 400: This model's maximum context length is 4 tokens."));
     r.fake_server.stop();
-    r.fake_server = try fake.Server.start(.{}, 0); // elsewhere now: the old address is dead
+    r.fake_server = try fake.Server.start(testing.io, .{}, 0); // elsewhere now: the old address is dead
     try testing.expectError(error.ConnectFailed, r.take());
 }

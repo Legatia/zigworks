@@ -127,7 +127,7 @@ pub fn parse(arena: std.mem.Allocator, argv: []const []const u8) !Parsed {
     for (argv[1..]) |a| if (isHelp(a)) return .{ .ok = .{ .mode = .help, .topic = mode } };
 
     var o: Options = .{ .mode = mode };
-    var given = [_]bool{false} ** opts.len;
+    var given: [opts.len]bool = @splat(false);
     var have_url = false;
     var i: usize = 1;
     args: while (i < argv.len) : (i += 1) {
