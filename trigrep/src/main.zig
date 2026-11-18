@@ -15,7 +15,7 @@ const rgmode = @import("rgmode.zig");
 const plat = @import("plat.zig");
 const View = view.View;
 
-pub const version = "0.3.0";
+pub const version = "0.4.0";
 
 const usage =
     \\trigrep: indexed code search

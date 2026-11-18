@@ -20,7 +20,7 @@ const pty = @import("pty.zig");
 const regex = @import("regex.zig");
 const record = @import("record.zig");
 
-pub const version = "0.3.0";
+pub const version = "0.4.0";
 pub const default_wait_timeout_ms = 10_000;
 pub const default_esc_delay_ms = 100;
 const max_request = 1 << 20;
