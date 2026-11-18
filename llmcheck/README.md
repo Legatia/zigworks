@@ -237,6 +237,10 @@ Faults: `drops_grammar`, `tool_in_content`, `truncate_context`,
   (stock `llama-server`, for one, is reported not to return them for
   prompt tokens).
 - **The Windows and Linux binaries have been compiled, not run.**
+- On Windows the system takes a while (a second or two) to report that
+  nothing listens at an address. With a `--timeout` shorter than that, a
+  server that is not there is reported as "no answer within …" instead of
+  "could not connect"; the exit code is the same.
 - Each answer is compared only up to where the two texts part: the servers
   generate freely, so after the first different token they are no longer
   answering the same question. A server that differs early gives few

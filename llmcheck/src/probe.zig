@@ -198,6 +198,9 @@ test "a_server_that_is_not_there_is_down" {
     r.fake_server.stop();
     r.fake_server = try fake.Server.start(.{}, 0);
     defer r.deinit();
+    // Windows takes its time to report a refused connection (more than the
+    // 300 ms of the other tests), and until then it is a server not answering
+    r.server.limits = .{ .idle_ms = 10_000 };
     const o = try r.once(.{});
     try testing.expectEqual(Status.down, o.status);
     try testing.expectEqualStrings("could not connect", o.problem.?);

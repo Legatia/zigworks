@@ -486,7 +486,8 @@ test "nothing_listening_is_reported_as_no_connection" {
     server.stop();
     var c = testClient(port);
     defer c.deinit();
-    try testing.expectError(error.ConnectFailed, c.send(.{ .method = .GET, .path = "/v1/models", .limits = .{ .idle_ms = 2000 } }));
+    // the time allowed is long: Windows reports a refusal only after a while
+    try testing.expectError(error.ConnectFailed, c.send(.{ .method = .GET, .path = "/v1/models", .limits = .{ .idle_ms = 10_000 } }));
 }
 
 test "a_refused_certificate_is_told_apart_from_other_handshake_failures" {
