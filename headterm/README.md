@@ -10,7 +10,8 @@ Use it only for programs that need a real terminal: TUI menus, passphrase
 prompts read from the TTY, editors, interactive REPLs and debuggers. Anything
 that takes stdin or flags is simpler in a plain shell.
 
-Zig standard library and libc only. macOS and Linux.
+Zig standard library and libc only (on Windows also the Win32 API). macOS,
+Linux and Windows 10 or later; see [Windows](#windows) for what differs there.
 
 ## Using it from an agent
 
@@ -85,6 +86,9 @@ zig build                          # zig-out/bin/headterm
 zig build test                     # unit tests and end-to-end tests (CLI and MCP)
 zig build -Doptimize=ReleaseSafe   # optimized build
 ```
+
+On Windows `zig build test` needs `sh` on PATH for the end-to-end tests (Git
+for Windows has one).
 
 ## MCP server
 
@@ -173,7 +177,7 @@ The other tools are for step-by-step use: `headterm_start`, then
 | `send <name> [options] [--] <keys>...` | Sends keys, text and mouse events. Options: `--literal`, `--paste`, `--esc-delay MS`. |
 | `wait <name> <conditions> [options]` | Waits for `--text`, `--regex`, `--text-gone`, `--idle MS` or `--exit` (default `--timeout` 10000), then prints the screen. Takes the `screen` options. |
 | `resize <name> <cols> <rows>` | Resizes the terminal; the program gets SIGWINCH. |
-| `kill <name>` | SIGHUP, then SIGTERM, then SIGKILL (500 ms apart) to the program's process group; removes the session. |
+| `kill <name>` | SIGHUP, then SIGTERM, then SIGKILL (500 ms apart) to the program's process group; removes the session. On Windows the program and everything it started are ended at once. |
 | `list [--json]` | Lists sessions; removes sockets left by crashed servers. |
 | `mcp` | Runs the MCP server. |
 | `help [command]`, `version` | |
@@ -219,6 +223,8 @@ order:
   `$XDG_RUNTIME_DIR/headterm/<name>.sock`, or
   `$TMPDIR/headterm-$UID/<name>.sock` (`TMPDIR` defaults to `/tmp`). The
   directory has mode 0700, and headterm refuses one owned by another user.
+  On Windows it is `%XDG_RUNTIME_DIR%\headterm\<name>.sock`, or
+  `%TEMP%\headterm\<name>.sock`.
 - **Environment:** the program gets `TERM=xterm-256color` and the caller's
   environment, minus `COLUMNS` and `LINES`.
 - **After exit:** the session outlives the program, so its last screen and
@@ -476,7 +482,10 @@ printed.
 | `src/keys.zig` | Keys and mouse events to bytes |
 | `src/regex.zig` | Regex engine |
 | `src/record.zig` | asciicast v2 writer |
-| `src/pty.zig` | PTY and child process |
+| `src/pty.zig` | PTY and child process: `pty_posix.zig`, `pty_windows.zig` (pseudoconsole) |
+| `src/daemon.zig` | Starting the session server: `daemon_posix.zig` (fork), `daemon_windows.zig` (a second process) |
+| `src/sys.zig` | Files, sockets, waiting, time: `sys_posix.zig`, `sys_windows.zig` |
+| `src/win32.zig` | Win32 declarations and command-line quoting |
 | `src/mcp.zig` | MCP server |
 | `src/session_test.zig` | Tests against real session servers |
 | `scripts/smoke.sh`, `scripts/mcp_smoke.sh` | End-to-end tests, run by `zig build test` |
@@ -484,6 +493,34 @@ printed.
 Socket protocol: the client sends `<len>\n` and `<len>` bytes of NUL-terminated
 arguments; the server answers `ok|timeout|error`, `\n` and the body, then
 closes.
+
+## Windows
+
+The commands, the MCP tools and the output are the same. The program runs on
+a pseudoconsole (ConPTY) instead of a POSIX pty, which shows in a few places:
+
+- **Programs:** found like cmd.exe finds them: in `--cwd`, then on `PATH`,
+  trying the endings of `PATHEXT` (`npm` finds `npm.cmd`). Batch files run
+  through `cmd.exe /c`; quotes and `%` in their arguments follow cmd's rules.
+- **Screen:** the console host redraws the program's output in its own way.
+  The text and colors on screen are the same, but they can arrive in other
+  steps (a line that is erased and rewritten may be empty for a moment), and
+  the raw output in `--log` and `--record` files is the console host's.
+- **`kill`** ends the program and everything it started at once; there is no
+  signal that asks first. `exit_signal` is always `null`, and `exit_code` is
+  the Windows exit code.
+- **`wait --exit`** recognizes a program that waits for a key only if it
+  switched the console's line input or echo off (`pause`, password prompts,
+  the PowerShell prompt, MSYS programs). A program that reads console events
+  with line input left on, such as the Python 3.13 REPL, looks like any
+  quiet program: the wait runs to its timeout.
+- **Keys:** sent as terminal sequences, which the console host turns into key
+  events. Characters outside ASCII reach programs that read lines or
+  characters; the Python 3.13 REPL drops them (`PYTHON_BASIC_REPL=1` takes
+  them).
+- **Sessions** are found through Unix sockets under `%TEMP%\headterm`, so a
+  caller sees the sessions of other callers with the same `%TEMP%`. While a
+  session runs, `headterm.exe` cannot be replaced.
 
 ## Limitations
 

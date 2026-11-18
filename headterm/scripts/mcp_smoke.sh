@@ -10,6 +10,23 @@ case $HT in /*) ;; *) HT=$(pwd)/$HT ;; esac
 STATE=$(mktemp -d /tmp/headterm-mcp.XXXXXX)
 unset XDG_RUNTIME_DIR
 export TMPDIR=$STATE
+
+# The shell that the test programs are written for.
+SH=/bin/sh
+case $(uname -s) in
+MINGW* | MSYS*)
+    # Windows, run by the sh of Git for Windows. headterm is a Windows
+    # program: it gets Windows paths, finds sh on PATH, and keeps its
+    # sessions under XDG_RUNTIME_DIR. sh must not rewrite arguments that
+    # look like paths (/c, /bin/sh) on the way to it.
+    SH=sh
+    HT=$(cygpath -a -m "${1:-zig-out/bin/headterm}")
+    STATE=$(cygpath -m "$STATE")
+    export XDG_RUNTIME_DIR=$STATE
+    export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+    ;;
+esac
+
 trap '"$HT" kill mcpsmoke >/dev/null 2>&1 || true; "$HT" kill mcpsty >/dev/null 2>&1 || true; "$HT" kill mcprun >/dev/null 2>&1 || true; rm -rf "$STATE"' EXIT
 
 fail() {
@@ -41,6 +58,7 @@ cat >"$STATE/in" <<'REQUESTS'
 {"jsonrpc":"2.0","id":15,"method":"ping"}
 this is not json
 REQUESTS
+[ "$SH" = /bin/sh ] || sed -i "s|/bin/sh|$SH|g" "$STATE/in"
 
 "$HT" mcp <"$STATE/in" >"$STATE/out" 2>"$STATE/err" || fail "mcp exited with $?"
 
@@ -69,7 +87,7 @@ check "screen diff after wait is empty" 5 'changed=0' '"isError":false'
 check "send literal" 6 '"text":"sent"' '"isError":false'
 check "send then wait for exit" 7 'bye:w<o>rld' 'exited=0' '"isError":false'
 check "wait timeout is a tool error" 8 'wait=failed(exited)' '"isError":true'
-check "list" 9 'mcpsmoke' '/bin/sh -c' '"isError":false'
+check "list" 9 'mcpsmoke' "$SH -c" '"isError":false'
 check "kill" 10 'killed mcpsmoke' '"isError":false'
 check "screen after kill" 11 "no session named 'mcpsmoke'" '"isError":true'
 check "start with styles" 12 '[0-8 inverse \"  Save\"]' '[0-5 bold fg=red \"Error\"]' '"isError":false'
@@ -116,8 +134,8 @@ echo "ok - record option writes an asciicast file"
 
 # headterm_run: a whole interaction in one call, and a failure mid-script.
 printf '%s\n' \
-    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"headterm_run","arguments":{"command":["/bin/sh","-c","read x; echo got:$x"],"cols":30,"rows":4,"steps":[{"send":["hi","<Enter>"]},{"wait":{"exit":true}}]}}}' \
-    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"headterm_run","arguments":{"name":"mcprun","command":["/bin/sh","-c","read x; read y"],"cols":30,"rows":4,"steps":[{"send":["a<b>","<Enter>"],"literal":true},{"wait":{"text":"never","timeout_ms":300}},{"send":["x"]}]}}}' \
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"headterm_run","arguments":{"command":["'"$SH"'","-c","read x; echo got:$x"],"cols":30,"rows":4,"steps":[{"send":["hi","<Enter>"]},{"wait":{"exit":true}}]}}}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"headterm_run","arguments":{"name":"mcprun","command":["'"$SH"'","-c","read x; read y"],"cols":30,"rows":4,"steps":[{"send":["a<b>","<Enter>"],"literal":true},{"wait":{"text":"never","timeout_ms":300}},{"send":["x"]}]}}}' \
     '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"headterm_run","arguments":{"session":"mcprun","steps":[{"screen":true}]}}}' \
     '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"headterm_run","arguments":{"session":"mcprun","steps":[{"send":["enter"]},{"send":["<Enter>"]},{"wait":{"exit":true}}]}}}' |
     "$HT" mcp >"$STATE/out" 2>"$STATE/err" || fail "mcp exited with $?"

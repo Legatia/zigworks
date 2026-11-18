@@ -10,6 +10,24 @@ case $HT in /*) ;; *) HT=$(pwd)/$HT ;; esac
 STATE=$(mktemp -d /tmp/headterm-smoke.XXXXXX)
 unset XDG_RUNTIME_DIR
 export TMPDIR=$STATE
+
+# The shell that the test programs are written for.
+SH=/bin/sh
+WINDOWS=
+case $(uname -s) in
+MINGW* | MSYS*)
+    # Windows, run by the sh of Git for Windows. headterm is a Windows
+    # program: it gets Windows paths, finds sh on PATH, and keeps its
+    # sessions under XDG_RUNTIME_DIR. sh must not rewrite arguments that
+    # look like paths (/c, /bin/sh) on the way to it.
+    WINDOWS=1
+    SH=sh
+    HT=$(cygpath -a -m "${1:-zig-out/bin/headterm}")
+    STATE=$(cygpath -m "$STATE")
+    export XDG_RUNTIME_DIR=$STATE
+    export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+    ;;
+esac
 S=smoke$$
 
 cleanup() {
@@ -38,7 +56,7 @@ check() { # check <description> <command...>
     if "$@"; then echo "ok - $desc"; else fail "$desc"; fi
 }
 
-"$HT" start "$S" --cols 40 --rows 6 -- /bin/sh -c 'printf "ready\n"; read x; echo got:$x; read y; echo second:$y; exit 3' >/dev/null
+"$HT" start "$S" --cols 40 --rows 6 -- "$SH" -c 'printf "ready\n"; read x; echo got:$x; read y; echo second:$y; exit 3' >/dev/null
 check "wait for initial text" quiet "$HT" wait "$S" --text ready --timeout 5000
 
 "$HT" send "$S" hello '<Enter>'
@@ -69,7 +87,7 @@ check "list shows session" sh -c '"$1" list | grep -q "^$2 "' _ "$HT" "$S"
 check "kill removes session" sh -c '! "$1" list | grep -q "^$2 "' _ "$HT" "$S"
 
 # Idle wait, resize and cursor-key mode on a second session.
-"$HT" start "$S-x" --cols 30 --rows 5 -- /bin/sh -c 'printf "\033[?1h"; stty -echo raw; dd bs=1 count=3 2>/dev/null | od -An -c; sleep 30' >/dev/null
+"$HT" start "$S-x" --cols 30 --rows 5 -- "$SH" -c 'printf "\033[?1h"; stty -echo raw; dd bs=1 count=3 2>/dev/null | od -An -c; sleep 30' >/dev/null
 "$HT" wait "$S-x" --idle 300 --timeout 5000 >/dev/null || fail "wait --idle"
 check "DECCKM tracked" sh -c '"$1" screen "$2" --json | grep -q "\"app_cursor_keys\":true"' _ "$HT" "$S-x"
 "$HT" send "$S-x" '<Up>'
@@ -80,7 +98,7 @@ check "resize" sh -c '"$1" screen "$2" | grep -q " 50x7 "' _ "$HT" "$S-x"
 "$HT" kill "$S-x"
 
 # Styles: a menu whose selection (inverse) moves when a key is pressed.
-"$HT" start "$S-m" --cols 20 --rows 4 -- /bin/sh -c 'printf "  Open\r\n\033[7m  Save  \033[m\r\n"; read x; printf "\033[1;1H\033[7m  Open  \033[m\033[2;1H  Save  "; sleep 30' >/dev/null
+"$HT" start "$S-m" --cols 20 --rows 4 -- "$SH" -c 'printf "  Open\r\n\033[7m  Save  \033[m\r\n"; read x; printf "\033[1;1H\033[7m  Open  \033[m\033[2;1H  Save  "; sleep 30' >/dev/null
 out=$("$HT" wait "$S-m" --text Save --styles --timeout 5000)
 check "styled run reported" sh -c 'printf "%s\n" "$1" | grep -qF "row 1: [0-8 inverse \"  Save\"]"' _ "$out"
 check "styles in json" sh -c '"$1" screen "$2" --json --styles | grep -qF "\"attrs\":[\"inverse\"]"' _ "$HT" "$S-m"
@@ -90,7 +108,7 @@ check "style-only change shows in diff" sh -c 'printf "%s\n" "$1" | grep -qx "0|
 "$HT" kill "$S-m"
 
 # Waits on wrapped text, regex and disappearing text.
-"$HT" start "$S-w" --cols 20 --rows 5 -- /bin/sh -c 'printf "Downloading package-name-that-is-long 42%%\n"; read x; printf "Loading..."; sleep 1; printf "\r\033[KDone\n"; sleep 30' >/dev/null
+"$HT" start "$S-w" --cols 20 --rows 5 -- "$SH" -c 'printf "Downloading package-name-that-is-long 42%%\n"; read x; printf "Loading..."; sleep 1; printf "\r\033[KDone\n"; sleep 30' >/dev/null
 check "text across a wrapped row" quiet "$HT" wait "$S-w" --text package-name-that-is-long --timeout 5000
 check "regex across a wrapped row" quiet "$HT" wait "$S-w" --regex '^Down.*long \d+%$' --timeout 5000
 set +e
@@ -101,6 +119,10 @@ check "bad regex is rejected" sh -c '[ "$1" -eq 2 ] && printf "%s" "$2" | grep -
 "$HT" send "$S-w" '<Enter>'
 "$HT" wait "$S-w" --text Loading --timeout 5000 >/dev/null
 out=$("$HT" wait "$S-w" --text-gone Loading --timeout 5000)
+# The Windows console host may pass on the erase and the new text one after
+# the other, so "Done" can come a moment after "Loading" has gone.
+[ -z "$WINDOWS" ] || out="$out
+$("$HT" wait "$S-w" --text Done --timeout 5000)"
 check "text-gone waits for the text to go" sh -c 'printf "%s\n" "$1" | grep -q "wait=ok(gone)" && printf "%s\n" "$1" | grep -qx Done' _ "$out"
 
 # Diff markers per --client.
@@ -121,14 +143,14 @@ check "mouse refused without mouse reporting" sh -c '[ "$1" -eq 2 ] && printf "%
 
 # Mouse: a drag in SGR mode with button-event tracking (1002) sends press,
 # motion and release.
-"$HT" start "$S-x" --cols 40 --rows 4 -- /bin/sh -c 'printf "\033[?1002h\033[?1006h"; stty raw -echo; dd bs=1 count=38 2>/dev/null | tr "\033" E; sleep 30' >/dev/null
+"$HT" start "$S-x" --cols 40 --rows 4 -- "$SH" -c 'printf "\033[?1002h\033[?1006h"; stty raw -echo; dd bs=1 count=38 2>/dev/null | tr "\033" E; sleep 30' >/dev/null
 "$HT" wait "$S-x" --idle 300 --timeout 5000 >/dev/null
 "$HT" send "$S-x" '<Drag 0,0 0,2>'
 check "drag sends press, motion and release" quiet "$HT" wait "$S-x" --text 'E[<0;1;1ME[<32;2;1ME[<32;3;1ME[<0;3;1m' --timeout 5000
 "$HT" kill "$S-x"
 
 # Recording.
-"$HT" start "$S-r" --record "$STATE/s.cast" --cols 30 --rows 4 -- /bin/sh -c 'read x; echo got:$x' >/dev/null
+"$HT" start "$S-r" --record "$STATE/s.cast" --cols 30 --rows 4 -- "$SH" -c 'read x; echo got:$x' >/dev/null
 "$HT" send "$S-r" hi '<Enter>'
 "$HT" wait "$S-r" --exit --timeout 5000 >/dev/null
 "$HT" kill "$S-r"
@@ -140,11 +162,11 @@ check "version" sh -c '"$1" --version | grep -q "^headterm [0-9]"' _ "$HT"
 check "help for a command" sh -c '"$1" help wait | grep -q -- "--text-gone" && "$1" send --help | grep -q "<Drag r1,c1 r2,c2>"' _ "$HT"
 
 # run: start, script, report and end in one command.
-out=$("$HT" run --cols 40 --rows 5 --send hello --send '<Enter>' --wait-text got:hello --screen --send bye --send '<Enter>' --wait-exit -- /bin/sh -c 'read x; echo got:$x; read y; echo bye:$y')
+out=$("$HT" run --cols 40 --rows 5 --send hello --send '<Enter>' --wait-text got:hello --screen --send bye --send '<Enter>' --wait-exit -- "$SH" -c 'read x; echo got:$x; read y; echo bye:$y')
 check "run succeeds" sh -c 'printf "%s\n" "$1" | grep -q "^2 wait ok(text)" && printf "%s\n" "$1" | grep -qx "bye:bye" && printf "%s\n" "$1" | grep -qx "session ended"' _ "$out"
 check "run screen step" sh -c 'printf "%s\n" "$1" | grep -q "^3 screen:"' _ "$out"
 set +e
-out=$("$HT" run --name "$S-run" --cols 40 --rows 5 --send one --send '<Enter>' --wait-text never --timeout 300 --send two -- /bin/sh -c 'read x; echo got:$x; read y; echo second:$y')
+out=$("$HT" run --name "$S-run" --cols 40 --rows 5 --send one --send '<Enter>' --wait-text never --timeout 300 --send two -- "$SH" -c 'read x; echo got:$x; read y; echo second:$y')
 rc=$?
 set -e
 check "run stops at the failed step" sh -c '[ "$1" -eq 1 ] && printf "%s\n" "$2" | grep -q "^2 wait FAILED: failed(timeout)" && printf "%s\n" "$2" | grep -q "stopped at step 2 of 3; session $3 kept"' _ "$rc" "$out" "$S-run"
@@ -153,7 +175,7 @@ check "run continues a kept session" sh -c 'printf "%s\n" "$1" | grep -qx "secon
 # Step by step: --keep, then --session leaves the session running until its
 # program exits. Key names in lower case are keys when no argument is
 # spelled as one.
-"$HT" run --name "$S-step" --keep --cols 40 --rows 5 --wait-text name: -- /bin/sh -c 'printf "name: "; read x; echo got:$x; read y; echo second:$y' >/dev/null
+"$HT" run --name "$S-step" --keep --cols 40 --rows 5 --wait-text name: -- "$SH" -c 'printf "name: "; read x; echo got:$x; read y; echo second:$y' >/dev/null
 out=$("$HT" run --session "$S-step" --send one enter --wait-text got:one)
 check "run --session keeps a running session" sh -c 'printf "%s\n" "$1" | grep -qx "1 send ok, sent as keys: Enter (--literal sends such words as text)" && printf "%s\n" "$1" | grep -q "^session $3 kept" && "$2" list | grep -q "^$3 "' _ "$out" "$HT" "$S-step"
 out=$("$HT" run --session "$S-step" --send up Enter --wait-exit)
@@ -166,13 +188,21 @@ check "run without steps is an error" sh -c '[ "$1" -eq 2 ] && printf "%s" "$2" 
 
 # Keys sent right after start are held until the program's first output has
 # settled. This program drops typeahead (tcflush) before its prompt.
-if command -v python3 >/dev/null 2>&1; then
+if [ -n "$WINDOWS" ]; then
+    # No termios on Windows: the keys typed ahead are read and dropped.
+    if command -v python >/dev/null 2>&1; then
+        out=$("$HT" run --send early --send '<Enter>' --wait-exit -- python -c 'import msvcrt,time; time.sleep(0.4); [msvcrt.getwch() for _ in iter(msvcrt.kbhit, False)]; print("ready"); print("got", input())')
+        check "run waits for first output before sending" sh -c 'printf "%s\n" "$1" | grep -qx "got early"' _ "$out"
+    else
+        echo "skip - run waits for first output before sending (no python)"
+    fi
+elif command -v python3 >/dev/null 2>&1; then
     out=$("$HT" run --send early --send '<Enter>' --wait-exit -- python3 -c 'import sys,termios,time; time.sleep(0.4); termios.tcflush(0, termios.TCIFLUSH); print("ready"); print("got", input())')
     check "run waits for first output before sending" sh -c 'printf "%s\n" "$1" | grep -qx "got early"' _ "$out"
 fi
 
 # Highlighted rows are named in the default screen output.
-"$HT" start "$S-h" --cols 20 --rows 4 -- /bin/sh -c 'printf "  Open\r\n\033[7m  Save  \033[m\r\n"; sleep 30' >/dev/null
+"$HT" start "$S-h" --cols 20 --rows 4 -- "$SH" -c 'printf "  Open\r\n\033[7m  Save  \033[m\r\n"; sleep 30' >/dev/null
 check "highlighted row in default output" sh -c '"$1" wait "$2" --text Save | grep -qx "\[headterm\] highlighted: row 1 \"Save\""' _ "$HT" "$S-h"
 "$HT" kill "$S-h"
 

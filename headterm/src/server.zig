@@ -1,5 +1,7 @@
-//! Session server: one background process per session. It owns the PTY and
-//! the emulated screen, and answers requests on a Unix socket.
+//! Session server: one background process per session. It owns the
+//! pseudo-terminal and the emulated screen, and answers requests on a Unix
+//! socket. daemon.zig starts it; sys.zig and pty.zig hold what differs
+//! between operating systems.
 //!
 //! Wire protocol: the client sends "<len>\n" followed by <len> bytes of
 //! arguments, each terminated by a NUL byte, and keeps the connection open.
@@ -8,9 +10,9 @@
 //! waiting cancels its wait.
 
 const std = @import("std");
-const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const sys = @import("sys.zig");
+const daemon = @import("daemon.zig");
 const stylenote = @import("stylenote.zig");
 const vt = @import("vt.zig");
 const keys = @import("keys.zig");
@@ -43,55 +45,35 @@ pub const Config = struct {
 const max_markers = 64;
 pub const max_client_id = 64;
 
-pub const StartError = error{StartFailed} || sys.ForkError || sys.PipeError;
+pub const StartError = error{StartFailed} || daemon.LaunchError;
 
-/// Forks the session server and waits until it has bound its socket and
-/// started the child. Returns the child's pid. On failure `msg` holds the
-/// reason.
-pub fn start(gpa: Allocator, cfg: Config, msg: *[256]u8) StartError!posix.pid_t {
-    const ready = try sys.pipe2(.{ .cloexec = true });
-    const pid = try sys.fork();
-    if (pid == 0) {
-        sys.close(ready[0]);
-        // Double fork: the server must not be a session leader or a child
-        // of the CLI process.
-        sys.setsid();
-        const pid2 = sys.fork() catch sys.exit(1);
-        if (pid2 != 0) sys.exit(0);
-        daemonMain(gpa, cfg, ready[1]);
-    }
-    sys.close(ready[1]);
-    defer sys.close(ready[0]);
-    _ = sys.waitpid(pid, 0);
+/// Starts the session server in the background and waits until it has
+/// bound its socket and started the child. Returns the child's pid. On
+/// failure `msg` holds the reason.
+pub fn start(gpa: Allocator, cfg: Config, msg: *[256]u8) StartError!sys.pid_t {
+    const ready = try daemon.launch(gpa, cfg);
+    defer sys.close(ready);
 
     var buf: [512]u8 = undefined;
     var n: usize = 0;
     while (n < buf.len) {
-        const r = sys.read(ready[0], buf[n..]) catch break;
+        const r = sys.read(ready, buf[n..]) catch break;
         if (r == 0) break;
         n += r;
     }
     const reply = std.mem.trimEnd(u8, buf[0..n], "\n");
     if (std.mem.startsWith(u8, reply, "ok ")) {
-        return std.fmt.parseInt(posix.pid_t, reply[3..], 10) catch error.StartFailed;
+        return std.fmt.parseInt(sys.pid_t, reply[3..], 10) catch error.StartFailed;
     }
     const reason = if (std.mem.startsWith(u8, reply, "err ")) reply[4..] else "session server exited during startup";
     _ = std.mem.printSentinel(msg, "{s}", .{reason[0..@min(reason.len, msg.len - 1)]}, 0) catch {};
     return error.StartFailed;
 }
 
-fn daemonMain(gpa: Allocator, cfg: Config, ready_fd: posix.fd_t) noreturn {
-    // Detach from the caller's stdio so `$(headterm start ...)` returns, and
-    // drop any other inherited descriptors.
-    if (sys.open("/dev/null", .{ .ACCMODE = .RDWR }, 0)) |null_fd| {
-        for (0..3) |fd| sys.dup2(null_fd, @intCast(fd)) catch {};
-        if (null_fd > 2) sys.close(null_fd);
-    } else |_| {}
-    var fd: posix.fd_t = 3;
-    while (fd < 1024) : (fd += 1) {
-        if (fd != ready_fd) sys.close(fd);
-    }
-
+/// The session server itself, in the process daemon.zig made for it.
+/// Reports "ok <pid>" or "err <reason>" on `ready_fd` once the program is
+/// running or could not be started, then serves until the session ends.
+pub fn serve(gpa: Allocator, cfg: Config, ready_fd: sys.fd_t) noreturn {
     var session = Session.init(gpa, cfg) catch |err| {
         var buf: [300]u8 = undefined;
         const reason: []const u8 = switch (err) {
@@ -115,13 +97,6 @@ fn daemonMain(gpa: Allocator, cfg: Config, ready_fd: posix.fd_t) noreturn {
 }
 
 var spawn_err: [256]u8 = @splat(0);
-var sigchld_write_fd: posix.fd_t = -1;
-
-fn onSigchld(_: posix.SIG) callconv(.c) void {
-    const saved = std.c._errno().*;
-    _ = std.c.write(sigchld_write_fd, "c", 1);
-    std.c._errno().* = saved;
-}
 
 fn nowMs() i64 {
     return sys.milliTimestamp();
@@ -131,13 +106,17 @@ fn nowMs() i64 {
 /// sent, before taking the keys to have no visible effect.
 const settle_grace_ms = 500;
 
+/// How long the server waits, after the program has exited, for the end of
+/// its output where the terminal reports one.
+const end_of_output_ms = 1000;
+
 /// A wait for the program's exit gives up early when the program has gone
 /// quiet for this long with the terminal in raw mode or echo off: it is
 /// then reading keys, not finishing.
 const awaiting_input_ms = 2000;
 
 const Waiter = struct {
-    fd: posix.fd_t,
+    fd: sys.fd_t,
     text: ?[]u8 = null,
     regex: ?*regex.Regex = null,
     gone: ?[]u8 = null,
@@ -201,11 +180,11 @@ const Session = struct {
     cfg: Config,
     term: vt.Terminal,
     pty: pty.Pty,
-    listen_fd: posix.fd_t,
-    sig_pipe: [2]posix.fd_t,
+    /// Null once the session no longer takes requests.
+    listen_fd: ?sys.fd_t,
     pty_open: bool = true,
     child_exited: bool = false,
-    exit_code: ?u8 = null,
+    exit_code: ?u32 = null,
     exit_signal: ?u8 = null,
     started_ms: i64,
     last_output_ms: i64,
@@ -227,9 +206,11 @@ const Session = struct {
     markers: std.StringHashMapUnmanaged(Marker) = .empty,
     waiters: std.ArrayList(Waiter) = .empty,
     quit: bool = false,
-    log_fd: ?posix.fd_t = null,
+    log_fd: ?sys.fd_t = null,
     /// The program has printed anything at all.
     output_seen: bool = false,
+    /// `screen_sig.text` of the empty screen the session starts with.
+    blank_text_sig: u64,
     /// When keys were last sent (0: never), and whether the program has
     /// printed since. `--settle` waits for the reaction to those keys.
     last_send_ms: i64 = 0,
@@ -244,28 +225,15 @@ const Session = struct {
     recorder: ?record.Recorder = null,
 
     fn init(gpa: Allocator, cfg: Config) !Session {
-        const ignore: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
-        posix.sigaction(.PIPE, &ignore, null);
-        posix.sigaction(.HUP, &ignore, null);
-
-        const sig_pipe = try sys.pipe2(.{ .cloexec = true, .nonblock = true });
-        sigchld_write_fd = sig_pipe[1];
-        const on_chld: posix.Sigaction = .{ .handler = .{ .handler = onSigchld }, .mask = posix.sigemptyset(), .flags = posix.SA.RESTART | posix.SA.NOCLDSTOP };
-        posix.sigaction(.CHLD, &on_chld, null);
-
         const listen_fd = try sys.listenUnix(cfg.socket_path);
         errdefer sys.close(listen_fd);
-        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        if (std.mem.printSentinel(&path_buf, "{s}", .{cfg.socket_path}, 0)) |path_z| {
-            _ = std.c.chmod(path_z, 0o600);
-        } else |_| {}
 
         var term = try vt.Terminal.init(gpa, .{ .cols = cfg.cols, .rows = cfg.rows });
         errdefer term.deinit();
 
-        _ = setenv("TERM", "xterm-256color", 1);
-        _ = unsetenv("COLUMNS");
-        _ = unsetenv("LINES");
+        sys.setEnv("TERM", "xterm-256color");
+        sys.setEnv("COLUMNS", null);
+        sys.setEnv("LINES", null);
         // Opened before the program starts so no output is missed.
         var recorder: ?record.Recorder = null;
         if (cfg.record_path) |rp| {
@@ -281,10 +249,9 @@ const Session = struct {
             sys.unlink(cfg.socket_path) catch {};
             return err;
         };
-        try sys.setNonblock(p.master);
 
-        const log_fd: ?posix.fd_t = if (cfg.log_path) |lp|
-            sys.open(lp, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o600) catch null
+        const log_fd: ?sys.fd_t = if (cfg.log_path) |lp|
+            sys.openForWrite(lp, .append, 0o600) catch null
         else
             null;
 
@@ -297,7 +264,7 @@ const Session = struct {
             .term = term,
             .pty = p,
             .listen_fd = listen_fd,
-            .sig_pipe = sig_pipe,
+            .blank_text_sig = term.signatures().text,
             .started_ms = now,
             .last_output_ms = now,
             .last_change_ms = now,
@@ -306,10 +273,10 @@ const Session = struct {
     }
 
     fn closeListener(self: *Session) void {
-        if (self.listen_fd < 0) return;
+        const fd = self.listen_fd orelse return;
         sys.unlink(self.cfg.socket_path) catch {};
-        sys.close(self.listen_fd);
-        self.listen_fd = -1;
+        sys.close(fd);
+        self.listen_fd = null;
     }
 
     fn deinit(self: *Session) void {
@@ -328,40 +295,39 @@ const Session = struct {
         self.input.deinit(self.gpa);
         self.term.deinit();
         if (self.recorder) |*r| r.deinit();
+        self.pty.deinit();
     }
 
     fn run(self: *Session) !void {
-        var fds: std.ArrayList(posix.pollfd) = .empty;
+        var fds: std.ArrayList(sys.PollItem) = .empty;
         defer fds.deinit(self.gpa);
 
         while (!self.quit) {
             fds.clearRetainingCapacity();
-            var master_events: i16 = 0;
-            if (self.pty_open) master_events |= posix.POLL.IN;
-            if (self.pty_open and self.input.items.len > 0) master_events |= posix.POLL.OUT;
-            try fds.append(self.gpa, .{ .fd = self.pty.master, .events = master_events, .revents = 0 });
-            try fds.append(self.gpa, .{ .fd = self.listen_fd, .events = posix.POLL.IN, .revents = 0 });
-            try fds.append(self.gpa, .{ .fd = self.sig_pipe[0], .events = posix.POLL.IN, .revents = 0 });
+            try fds.append(self.gpa, sys.pollItem(self.listen_fd.?, false));
+            try fds.append(self.gpa, sys.pollItem(self.pty.exitFd(), false));
             for (self.waiters.items) |w| {
-                try fds.append(self.gpa, .{ .fd = w.fd, .events = posix.POLL.IN, .revents = 0 });
+                try fds.append(self.gpa, sys.pollItem(w.fd, false));
             }
+            // Last, and only until the output has ended.
+            const with_pty = self.pty_open;
+            if (with_pty) try fds.append(self.gpa, sys.pollItem(self.pty.outputFd(), self.input.items.len > 0));
 
-            _ = try posix.poll(fds.items, self.pollTimeout(nowMs()));
+            try sys.poll(fds.items, self.pollTimeout(nowMs()));
 
-            if (fds.items[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) try self.readPty();
-            if (fds.items[0].revents & posix.POLL.OUT != 0) self.flushInput();
-            if (fds.items[2].revents != 0) {
-                var drain: [64]u8 = undefined;
-                while (true) _ = posix.read(self.sig_pipe[0], &drain) catch break;
-                try self.reapChild();
+            if (with_pty) {
+                const item = fds.items[fds.items.len - 1];
+                if (sys.readable(item)) try self.readPty();
+                if (sys.writable(item)) self.flushInput();
             }
+            if (sys.readable(fds.items[1])) try self.reapChild();
             // A waiting client that sends data or hangs up has gone away.
             var i = self.waiters.items.len;
             while (i > 0) {
                 i -= 1;
-                if (fds.items[3 + i].revents != 0) self.dropWaiter(i);
+                if (sys.readable(fds.items[2 + i])) self.dropWaiter(i);
             }
-            if (fds.items[1].revents & posix.POLL.IN != 0) self.acceptClient();
+            if (sys.readable(fds.items[0])) self.acceptClient();
             try self.checkWaiters();
             self.checkExpiry();
         }
@@ -412,7 +378,7 @@ const Session = struct {
         var buf: [65536]u8 = undefined;
         var total: usize = 0;
         while (total < 4 << 20) {
-            const n = sys.read(self.pty.master, &buf) catch |err| switch (err) {
+            const n = self.pty.read(&buf) catch |err| switch (err) {
                 error.WouldBlock => break,
                 else => {
                     self.pty_open = false;
@@ -435,9 +401,11 @@ const Session = struct {
         if (total > 0) {
             self.last_output_ms = nowMs();
             self.last_activity_ms = self.last_output_ms;
-            self.output_seen = true;
             self.output_since_send = true;
             const sig = self.term.signatures();
+            // Where the terminal prints set-up sequences of its own, the
+            // program has printed once the screen shows something.
+            if (!pty.prints_setup or sig.text != self.blank_text_sig) self.output_seen = true;
             if (sig.full != self.screen_sig.full) {
                 const blink = sig.text == self.screen_sig.text and sig.full == self.prev_full_sig;
                 self.prev_full_sig = self.screen_sig.full;
@@ -450,7 +418,7 @@ const Session = struct {
 
     fn flushInput(self: *Session) void {
         while (self.input.items.len > 0) {
-            const n = sys.write(self.pty.master, self.input.items) catch break;
+            const n = self.pty.write(self.input.items) catch break;
             std.mem.copyForwards(u8, self.input.items, self.input.items[n..]);
             self.input.shrinkRetainingCapacity(self.input.items.len - n);
         }
@@ -458,42 +426,42 @@ const Session = struct {
 
     fn reapChild(self: *Session) !void {
         if (self.child_exited) return;
-        const r = sys.waitpid(self.pty.pid, posix.W.NOHANG);
-        if (r.pid != self.pty.pid) return;
+        const status = self.pty.reap() orelse return;
         self.child_exited = true;
-        if (posix.W.IFEXITED(r.status)) {
-            self.exit_code = posix.W.EXITSTATUS(r.status);
-        } else if (posix.W.IFSIGNALED(r.status)) {
-            self.exit_signal = @intCast(@backingInt(posix.W.TERMSIG(r.status)));
-        }
+        self.exit_code = status.code;
+        self.exit_signal = status.signal;
         // Output written just before exit is still buffered in the PTY.
+        const until_end = self.pty.afterExit();
         try self.readPty();
+        if (!until_end) return;
+        const until = nowMs() + end_of_output_ms;
+        while (self.pty_open and nowMs() < until) try self.pumpOutput(10);
+    }
+
+    /// Waits up to `ms` milliseconds for output and reads it. Once the
+    /// output has ended, it waits for the program's exit instead.
+    fn pumpOutput(self: *Session, ms: i32) !void {
+        const fd = if (self.pty_open) self.pty.outputFd() else self.pty.exitFd();
+        var item = [_]sys.PollItem{sys.pollItem(fd, false)};
+        sys.poll(&item, ms) catch {};
+        if (self.pty_open and sys.readable(item[0])) try self.readPty();
     }
 
     fn terminateChild(self: *Session) !void {
-        const pid = self.pty.pid;
-        const signals = [_]posix.SIG{ .HUP, .TERM, .KILL };
-        for (signals) |sig| {
-            if (self.child_exited) return;
-            posix.kill(-pid, sig) catch {};
-            posix.kill(pid, sig) catch {};
+        var step: usize = 0;
+        while (!self.child_exited and self.pty.kill(step)) : (step += 1) {
             const until = nowMs() + 500;
             while (!self.child_exited and nowMs() < until) {
-                var pfd = [_]posix.pollfd{.{ .fd = self.pty.master, .events = posix.POLL.IN, .revents = 0 }};
-                _ = posix.poll(&pfd, 10) catch {};
-                if (pfd[0].revents != 0) try self.readPty();
+                try self.pumpOutput(10);
                 try self.reapChild();
             }
         }
     }
 
     fn acceptClient(self: *Session) void {
-        const fd = sys.accept(self.listen_fd) catch return;
+        const fd = sys.accept(self.listen_fd.?) catch return;
         self.last_activity_ms = nowMs();
-        const tv: posix.timeval = .{ .sec = 2, .usec = 0 };
-        // libc directly: macOS fails with EINVAL if the client has already
-        // hung up, which std.posix.setsockopt treats as unreachable.
-        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(posix.timeval));
+        sys.setReceiveTimeout(fd, 2);
 
         var req: std.ArrayList(u8) = .empty;
         defer req.deinit(self.gpa);
@@ -521,7 +489,7 @@ const Session = struct {
         if (!keep_open) sys.close(fd);
     }
 
-    fn readRequest(self: *Session, fd: posix.fd_t, req: *std.ArrayList(u8)) ?[]const u8 {
+    fn readRequest(self: *Session, fd: sys.fd_t, req: *std.ArrayList(u8)) ?[]const u8 {
         var buf: [4096]u8 = undefined;
         var want: ?usize = null;
         var header_len: usize = 0;
@@ -545,7 +513,7 @@ const Session = struct {
     }
 
     /// Handles one request. Returns true if `fd` was handed to a waiter.
-    fn handle(self: *Session, fd: posix.fd_t, args: []const []const u8) !bool {
+    fn handle(self: *Session, fd: sys.fd_t, args: []const []const u8) !bool {
         if (args.len == 0) {
             respond(fd, .@"error", "empty request\n");
             return false;
@@ -589,10 +557,9 @@ const Session = struct {
             const cols = std.fmt.parseInt(u16, rest[0], 10) catch 0;
             const rows = std.fmt.parseInt(u16, rest[1], 10) catch 0;
             if (cols < 2 or rows < 1 or cols > 1000 or rows > 1000) return self.usagef(fd, "resize: '{s}' '{s}' is out of range: cols must be 2..1000 and rows 1..1000", .{ rest[0], rest[1] });
-            pty.setSize(self.pty.master, cols, rows);
+            self.pty.resize(cols, rows);
             try self.term.resize(cols, rows);
             if (self.recorder) |*r| r.resize(cols, rows);
-            if (!self.child_exited) posix.kill(-self.pty.pid, .WINCH) catch {};
             respond(fd, .ok, "");
             return false;
         }
@@ -616,19 +583,19 @@ const Session = struct {
         return self.usagef(fd, "unknown request '{s}' (client and session server versions differ?)", .{cmd});
     }
 
-    fn usagef(self: *Session, fd: posix.fd_t, comptime fmt: []const u8, args: anytype) bool {
+    fn usagef(self: *Session, fd: sys.fd_t, comptime fmt: []const u8, args: anytype) bool {
         var buf: [512]u8 = undefined;
         return self.usage(fd, std.fmt.bufPrint(&buf, fmt, args) catch fmt);
     }
 
-    fn usage(self: *Session, fd: posix.fd_t, msg: []const u8) bool {
+    fn usage(self: *Session, fd: sys.fd_t, msg: []const u8) bool {
         _ = self;
         var buf: [256]u8 = undefined;
         respond(fd, .@"error", std.fmt.bufPrint(&buf, "{s}\n", .{msg}) catch msg);
         return false;
     }
 
-    fn handleSend(self: *Session, fd: posix.fd_t, args: []const []const u8) !void {
+    fn handleSend(self: *Session, fd: sys.fd_t, args: []const []const u8) !void {
         var bytes: std.ArrayList(u8) = .empty;
         defer bytes.deinit(self.gpa);
         // Offsets into `bytes` after which to pause: a bare Esc immediately
@@ -761,9 +728,9 @@ const Session = struct {
             const now = nowMs();
             if (now >= until) break;
             if (self.output_seen and now - self.last_output_ms >= 150) break;
-            var pfd = [_]posix.pollfd{.{ .fd = self.pty.master, .events = posix.POLL.IN, .revents = 0 }};
-            _ = try posix.poll(&pfd, @intCast(@min(until - now, 50)));
-            if (pfd[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) try self.readPty();
+            var item = [_]sys.PollItem{sys.pollItem(self.pty.outputFd(), false)};
+            try sys.poll(&item, @intCast(@min(until - now, 50)));
+            if (sys.readable(item[0])) try self.readPty();
             if (!self.child_exited) try self.reapChild();
             if (self.child_exited and self.output_seen) break;
         }
@@ -775,18 +742,21 @@ const Session = struct {
         while (true) {
             const now = nowMs();
             if (now >= until or !self.pty_open) break;
-            var events: i16 = posix.POLL.IN;
-            if (self.input.items.len > 0) events |= posix.POLL.OUT;
-            var pfd = [_]posix.pollfd{.{ .fd = self.pty.master, .events = events, .revents = 0 }};
-            _ = try posix.poll(&pfd, @intCast(until - now));
-            if (pfd[0].revents & posix.POLL.OUT != 0) self.flushInput();
-            if (pfd[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) try self.readPty();
+            var item = [_]sys.PollItem{sys.pollItem(self.pty.outputFd(), self.input.items.len > 0)};
+            try sys.poll(&item, @intCast(until - now));
+            if (sys.writable(item[0])) self.flushInput();
+            if (sys.readable(item[0])) try self.readPty();
         }
     }
 
-    fn handleWait(self: *Session, fd: posix.fd_t, args: []const []const u8) !bool {
+    fn handleWait(self: *Session, fd: sys.fd_t, args: []const []const u8) !bool {
         var w: Waiter = .{ .fd = fd, .started = nowMs() };
         errdefer self.freeWaiter(w);
+        // `poll` takes the session's own three descriptors and one per
+        // waiting client.
+        if (sys.max_poll_items) |max| {
+            if (self.waiters.items.len + 4 > max) return self.waitError(w, "wait: too many clients are waiting on this session");
+        }
         var timeout: i64 = default_wait_timeout_ms;
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
@@ -927,15 +897,6 @@ const Session = struct {
         return @max(@max(self.last_change_ms, w.started) + awaiting_input_ms, self.awaiting_recheck_ms);
     }
 
-    /// How the program has set the terminal up to read keys itself; null in
-    /// ordinary line mode with echo.
-    fn inputMode(self: *const Session) ?[]const u8 {
-        const tio = posix.tcgetattr(self.pty.slave) catch return null;
-        if (!tio.lflag.ICANON) return "the terminal is in raw mode";
-        if (!tio.lflag.ECHO) return "echo is off";
-        return null;
-    }
-
     fn evaluate(self: *Session, w: Waiter, lines: []const []const u8, now: i64) !?WaitOutcome {
         var out: WaitOutcome = .{ .condition = waitCondition(w), .satisfied = true, .reason = "", .elapsed_ms = now - w.started };
         if (w.text) |t| {
@@ -979,7 +940,7 @@ const Session = struct {
         out.satisfied = false;
         if (self.awaitingInputAt(w)) |at| {
             if (now >= at) {
-                if (self.inputMode() != null) {
+                if (self.pty.inputMode() != null) {
                     self.awaiting_reported_send_ms = self.last_send_ms;
                     out.reason = "awaiting-input";
                     return out;
@@ -1038,7 +999,7 @@ const Session = struct {
         style: vt.Style,
     };
 
-    fn respondScreen(self: *Session, fd: posix.fd_t, status: Status, opts: RenderOptions) !void {
+    fn respondScreen(self: *Session, fd: sys.fd_t, status: Status, opts: RenderOptions) !void {
         var out: std.Io.Writer.Allocating = .init(self.gpa);
         defer out.deinit();
         try self.renderScreen(&out.writer, opts);
@@ -1195,7 +1156,7 @@ const Session = struct {
         }
         if (opts.wait) |o| {
             if (std.mem.eql(u8, o.reason, "awaiting-input")) {
-                try w.print("[headterm] still running: the screen has not changed for {d} s and {s}, so it is probably waiting for input (wait again if it is working)\n", .{ awaiting_input_ms / 1000, self.inputMode() orelse "the terminal is in raw mode" });
+                try w.print("[headterm] still running: the screen has not changed for {d} s and {s}, so it is probably waiting for input (wait again if it is working)\n", .{ awaiting_input_ms / 1000, self.pty.inputMode() orelse "the terminal is in raw mode" });
             }
         }
         try w.print("[headterm] {s} {d}x{d} cursor={d},{d}", .{ self.cfg.name, t.cols, t.rows, t.cursor.row, t.cursor.col });
@@ -1452,13 +1413,10 @@ fn validClientId(id: []const u8) bool {
     return id.len > 0 and id.len <= max_client_id;
 }
 
-fn respond(fd: posix.fd_t, status: Status, body: []const u8) void {
+fn respond(fd: sys.fd_t, status: Status, body: []const u8) void {
     writeAll(fd, @tagName(status)) catch return;
     writeAll(fd, "\n") catch return;
     writeAll(fd, body) catch return;
 }
 
 const writeAll = sys.writeAll;
-
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;

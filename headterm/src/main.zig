@@ -1,8 +1,9 @@
 const std = @import("std");
-const posix = std.posix;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const client = @import("client.zig");
+const daemon = @import("daemon.zig");
+const pty = @import("pty.zig");
 const server = @import("server.zig");
 const mcp = @import("mcp.zig");
 const run_mod = @import("run.zig");
@@ -147,17 +148,15 @@ const command_help = [_]Help{
         "resize",
         \\usage: headterm resize <name> <cols> <rows>
         \\
-        \\Resizes the terminal (2..1000 columns, 1..1000 rows); the program gets
-        \\SIGWINCH.
         \\
+        ++ pty.help.resize ++ "\n",
     },
     .{
         "kill",
         \\usage: headterm kill <name>
         \\
-        \\Hangs up the program (SIGHUP, then SIGTERM, then SIGKILL) and removes the
-        \\session.
         \\
+        ++ pty.help.kill ++ "\n",
     },
     .{
         "list",
@@ -187,27 +186,24 @@ fn isHelpFlag(a: []const u8) bool {
     return eql(a, "--help") or eql(a, "-h");
 }
 
-fn onSigpipe(_: posix.SIG) callconv(.c) void {}
-
 pub fn main(init: std.process.Init.Minimal) u8 {
-    // A write to a closed pipe fails with BrokenPipe instead of killing the
-    // process. A handler rather than SIG_IGN, so that the session server and
-    // the programs it starts do not inherit an ignored SIGPIPE.
-    posix.sigaction(.PIPE, &.{
-        .handler = .{ .handler = onSigpipe },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    }, null);
+    sys.initProcess();
 
-    // `start` forks the session server out of this process, so nothing here
-    // may start threads or change other signal dispositions: the I/O
-    // implementation is the single-threaded one (`Io.Threaded.init` would
-    // install SIGIO and SIGPIPE handlers), and memory comes from libc.
+    // On macOS and Linux `start` forks the session server out of this
+    // process, so nothing here may start threads or change other signal
+    // dispositions: the I/O implementation is the single-threaded one
+    // (`Io.Threaded.init` would install SIGIO and SIGPIPE handlers), and
+    // memory comes from libc.
     const gpa = std.heap.c_allocator;
     var threaded: Io.Threaded = .init_single_threaded;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const args = init.args.toSlice(arena.allocator()) catch return fail("out of memory", .{});
+    // Not a command for users: `start` runs it where the server cannot be
+    // forked.
+    if (daemon.server_command) |command| {
+        if (args.len == 2 and eql(args[1], command)) daemon.serverMain(gpa);
+    }
     return run(threaded.io(), gpa, args[1..]) catch |err| fail("{s}", .{@errorName(err)});
 }
 
@@ -485,17 +481,17 @@ fn eql(a: []const u8, b: []const u8) bool {
 }
 
 fn writeStdout(bytes: []const u8) !void {
-    try sys.writeAll(posix.STDOUT_FILENO, bytes);
+    try sys.writeAll(sys.stdout(), bytes);
 }
 
 fn writeStderr(bytes: []const u8) !void {
-    try sys.writeAll(posix.STDERR_FILENO, bytes);
+    try sys.writeAll(sys.stderr(), bytes);
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) u8 {
     var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "headterm: " ++ fmt ++ "\n", args) catch "headterm: error\n";
-    sys.writeAll(posix.STDERR_FILENO, msg) catch {};
+    sys.writeAll(sys.stderr(), msg) catch {};
     return 2;
 }
 
@@ -505,6 +501,7 @@ test {
     _ = @import("client.zig");
     _ = @import("server.zig");
     _ = @import("pty.zig");
+    _ = @import("daemon.zig");
     _ = @import("mcp.zig");
     _ = @import("regex.zig");
     _ = @import("session_test.zig");

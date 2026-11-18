@@ -17,9 +17,11 @@ jobs:
         os: [ubuntu-latest, macos-15]
         project: [trigrep, headterm, headsight, headsound, llmcheck]
         include:
-          # headsound's file commands also run on Windows (for GoldWave users)
+          # Windows: everything but headsight (headsound's file commands, for
+          # GoldWave users; headterm on ConPTY)
           - { os: windows-latest, project: headsound }
           - { os: windows-latest, project: trigrep }
+          - { os: windows-latest, project: headterm }
           - { os: windows-latest, project: llmcheck }
     runs-on: ${{ matrix.os }}
     defaults:

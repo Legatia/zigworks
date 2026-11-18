@@ -5,14 +5,14 @@ Open-source tools written in Zig, mostly infrastructure for coding agents. Each 
 | Project | What it does |
 |---|---|
 | [trigrep](trigrep/) | Indexed code search. ripgrep-compatible output; on the Linux kernel, with its file watcher running (`trigrep watch`, or built into the MCP server), searches take 12–160 ms against ripgrep's 1.4 s, and still see every edit. CLI and MCP server; macOS, Linux and Windows. |
-| [headterm](headterm/) | Headless terminal for agents. Runs a program in a pseudo-terminal and gives the screen as text, row diffs, key input and waits, and which text is highlighted (inverse, bold, colours), so agents can drive vim, less, REPLs, menus and installers. CLI and MCP server; macOS and Linux. |
+| [headterm](headterm/) | Headless terminal for agents. Runs a program in a pseudo-terminal and gives the screen as text, row diffs, key input and waits, and which text is highlighted (inverse, bold, colours), so agents can drive vim, less, REPLs, menus and installers. CLI and MCP server; macOS, Linux and Windows 10 or later (ConPTY). |
 | [headsight](headsight/) | Sight for agents without a stream of screenshots. Waits until a region of the screen, a window or the camera changes, goes still or shows some text, and prints one line with a small crop; reads text on the device; compares with a reference. CLI; macOS 14+ (Apple's capture and text recognition frameworks); on Linux, the camera only (V4L2). |
 | [headsound](headsound/) | Audio checks and repairs in one line per answer: loudness, loudness range and true peak; clicks, clipping, dropouts, hum, "p" pops, harsh s, DC offset and phase, marked for GoldWave, Audition, Reaper, Audacity or DaVinci Resolve, or as subtitles; what is heard when (on the Mac); declick, dehum, cut pauses, trim, normalize, convert; and on the Mac, record from the microphone until you stop talking. CLI; macOS 14+, Linux and Windows (WAV only, no microphone or sound classifier off the Mac, so far). |
 | [llmcheck](llmcheck/) | Checks a served language model through its OpenAI-style API (vLLM, llama.cpp, Ollama, gateways): whether the interface does what it accepts (output formats, tool calls, context length, limits, seeds, the key), whether token probabilities match a reference server or a recording of one, speed, and a one-line probe for cron. CLI; macOS, Linux and Windows. 0.1.0 is tested only against its own stand-in server, not yet against a real model server. |
 
 ## Install
 
-Download a binary for Linux (x86_64, arm64) or macOS (Apple Silicon; headsight on Linux watches cameras only) from [Releases](https://github.com/Legatia/zigworks/releases), or build from source below. trigrep, headsound and llmcheck also come as a zip for Windows (x86_64). Linux binaries are static and run on any distribution.
+Download a binary for Linux (x86_64, arm64) or macOS (Apple Silicon; headsight on Linux watches cameras only) from [Releases](https://github.com/Legatia/zigworks/releases), or build from source below. All but headsight also come as a zip for Windows (x86_64), from their next release on for trigrep and headterm. Linux binaries are static and run on any distribution.
 
 `site/` is the project page at https://zig.legatia.solutions (static HTML, no build step).
 
@@ -24,7 +24,7 @@ Zig 0.17.1:
 cd trigrep && zig build -Doptimize=ReleaseFast && zig build test
 ```
 
-Binaries go to `zig-out/bin/` in each project. CI runs `zig build test` for every project on Linux and macOS, and for trigrep, headsound and llmcheck on Windows too (on Linux, headsight's camera path is tested against virtual cameras with `headsight/scripts/live-linux.sh`, not in CI).
+Binaries go to `zig-out/bin/` in each project. CI runs `zig build test` for every project on Linux and macOS, and for all but headsight on Windows too (on Linux, headsight's camera path is tested against virtual cameras with `headsight/scripts/live-linux.sh`, not in CI).
 
 ## License
 
