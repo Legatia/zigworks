@@ -244,9 +244,12 @@ pub const Listener = struct {
         return .{ .handle = h, .port = std.mem.bigToNative(u16, addr.in.port) };
     }
 
-    /// Waits for the next connection. Its socket is a blocking one.
+    /// Waits for the next connection. Its socket is a blocking one, and
+    /// sends each write at once, as model servers do for a stream of tokens.
     pub fn accept(l: Listener) !Handle {
-        return sys.accept(l.handle);
+        const h = try sys.accept(l.handle);
+        sys.setOption(h, sys.IPPROTO_TCP, sys.TCP_NODELAY, 1) catch {};
+        return h;
     }
 
     pub fn close(l: Listener) void {
@@ -437,6 +440,17 @@ const unix = struct {
         _ = try result(rc);
     }
 
+    fn getOption(fd: Handle, level: i32, name: u32) Err!c_int {
+        var value: c_int = 0;
+        var size: posix.socklen_t = @sizeOf(c_int);
+        const rc = if (is_linux)
+            linux.getsockopt(fd, level, name, @ptrCast(&value), &size)
+        else
+            c.getsockopt(fd, level, name, &value, &size);
+        _ = try result(rc);
+        return value;
+    }
+
     fn bind(fd: Handle, addr: *const Addr) Err!void {
         const rc = if (is_linux) linux.bind(fd, @ptrCast(addr), addr.len()) else c.bind(fd, @ptrCast(addr), addr.len());
         _ = try result(rc);
@@ -598,6 +612,13 @@ const winsock = struct {
         try check(ws.setsockopt(s, level, @intCast(name), @ptrCast(&value), @sizeOf(c_int)));
     }
 
+    fn getOption(s: Handle, level: i32, name: u32) Error!c_int {
+        var value: c_int = 0;
+        var size: c_int = @sizeOf(c_int);
+        try check(ws.getsockopt(s, level, @intCast(name), @ptrCast(&value), &size));
+        return value;
+    }
+
     fn bind(s: Handle, addr: *const Addr) Error!void {
         try check(ws.bind(s, addr, @intCast(addr.len())));
     }
@@ -617,3 +638,16 @@ const winsock = struct {
         return got;
     }
 };
+
+test "an_accepted_connection_sends_small_writes_at_once" {
+    // A stream of tokens is many small writes. Held back until the other
+    // side confirms the one before, each can arrive tens of ms late.
+    const l = try Listener.open(0);
+    defer l.close();
+    const there = try connect(std.testing.io, "127.0.0.1", l.port, 1000);
+    defer closeHandle(there);
+    const here = try l.accept();
+    defer closeHandle(here);
+    try std.testing.expect(try sys.getOption(here, sys.IPPROTO_TCP, sys.TCP_NODELAY) != 0);
+    try std.testing.expect(try sys.getOption(there, sys.IPPROTO_TCP, sys.TCP_NODELAY) != 0);
+}
