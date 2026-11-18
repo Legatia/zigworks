@@ -78,7 +78,7 @@ $ headterm wait py --idle 300 --diff
 
 ## Build
 
-Requires Zig 0.15.1.
+Requires Zig 0.17.1.
 
 ```sh
 zig build                          # zig-out/bin/headterm

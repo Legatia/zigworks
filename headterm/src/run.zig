@@ -223,17 +223,17 @@ fn session(arena: Allocator, caller: Caller, opts: Options, args: []const []cons
         },
         else => |e| return e,
     };
-    return .{ .text = std.mem.trimRight(u8, resp.body, "\n"), .ok = resp.status == .ok };
+    return .{ .text = std.mem.trimEnd(u8, resp.body, "\n"), .ok = resp.status == .ok };
 }
 
 fn statusLine(body: []const u8) []const u8 {
-    return if (std.mem.lastIndexOfScalar(u8, body, '\n')) |i| body[i + 1 ..] else body;
+    return if (std.mem.findScalarLast(u8, body, '\n')) |i| body[i + 1 ..] else body;
 }
 
 /// "ok(text) 12ms" from a wait response's "wait=ok(text) waited=12ms".
 fn writeWaitStatus(w: *std.Io.Writer, body: []const u8) !void {
     const last = statusLine(body);
-    const at = std.mem.indexOf(u8, last, " wait=") orelse return w.writeAll(std.mem.trim(u8, last, " "));
+    const at = std.mem.find(u8, last, " wait=") orelse return w.writeAll(std.mem.trim(u8, last, " "));
     var it = std.mem.tokenizeScalar(u8, last[at + 6 ..], ' ');
     try w.writeAll(it.next() orelse "");
     if (it.next()) |waited| {
@@ -243,13 +243,13 @@ fn writeWaitStatus(w: *std.Io.Writer, body: []const u8) !void {
 
 fn programExited(body: []const u8) bool {
     const last = statusLine(body);
-    return std.mem.indexOf(u8, last, " exited") != null or std.mem.indexOf(u8, last, " killed-by-signal=") != null;
+    return std.mem.find(u8, last, " exited") != null or std.mem.find(u8, last, " killed-by-signal=") != null;
 }
 
 /// The final screen's status line without the internal settle wait.
 fn stripWait(body: []const u8) []const u8 {
-    const at = std.mem.lastIndexOf(u8, body, " wait=") orelse return body;
-    if (std.mem.indexOfScalarPos(u8, body, at, '\n') != null) return body;
+    const at = std.mem.findLast(u8, body, " wait=") orelse return body;
+    if (std.mem.findScalarPos(u8, body, at, '\n') != null) return body;
     return body[0..at];
 }
 

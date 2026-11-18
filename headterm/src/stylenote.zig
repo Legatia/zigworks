@@ -142,7 +142,7 @@ fn labelText(arena: Allocator, cells: []const vt.Cell, it: Item) ![]const u8 {
         if (out.items.len + n > max_label_bytes) break;
         try out.appendSlice(arena, buf[0..n]);
     }
-    return std.mem.trimRight(u8, out.items, " ");
+    return std.mem.trimEnd(u8, out.items, " ");
 }
 
 /// Writes the notes for `rows` (the screen's rows, top to bottom).

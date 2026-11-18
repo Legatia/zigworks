@@ -68,7 +68,7 @@ pub const Diagnostic = struct {
     }
 
     fn set(d: *Diagnostic, comptime fmt: []const u8, args: anytype) void {
-        d.len = (std.fmt.bufPrint(&d.buf, fmt, args) catch d.buf[0..]).len;
+        d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |text| text.len else |_| d.buf.len;
     }
 };
 

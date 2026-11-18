@@ -1,10 +1,12 @@
 const std = @import("std");
 const posix = std.posix;
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const client = @import("client.zig");
 const server = @import("server.zig");
 const mcp = @import("mcp.zig");
 const run_mod = @import("run.zig");
+const sys = @import("sys.zig");
 
 const usage_text =
     \\usage: headterm <command> [arguments]
@@ -185,14 +187,31 @@ fn isHelpFlag(a: []const u8) bool {
     return eql(a, "--help") or eql(a, "-h");
 }
 
-pub fn main() u8 {
+fn onSigpipe(_: posix.SIG) callconv(.c) void {}
+
+pub fn main(init: std.process.Init.Minimal) u8 {
+    // A write to a closed pipe fails with BrokenPipe instead of killing the
+    // process. A handler rather than SIG_IGN, so that the session server and
+    // the programs it starts do not inherit an ignored SIGPIPE.
+    posix.sigaction(.PIPE, &.{
+        .handler = .{ .handler = onSigpipe },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    }, null);
+
+    // `start` forks the session server out of this process, so nothing here
+    // may start threads or change other signal dispositions: the I/O
+    // implementation is the single-threaded one (`Io.Threaded.init` would
+    // install SIGIO and SIGPIPE handlers), and memory comes from libc.
     const gpa = std.heap.c_allocator;
-    const args = std.process.argsAlloc(gpa) catch return fail("out of memory", .{});
-    defer std.process.argsFree(gpa, args);
-    return run(gpa, args[1..]) catch |err| fail("{s}", .{@errorName(err)});
+    var threaded: Io.Threaded = .init_single_threaded;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const args = init.args.toSlice(arena.allocator()) catch return fail("out of memory", .{});
+    return run(threaded.io(), gpa, args[1..]) catch |err| fail("{s}", .{@errorName(err)});
 }
 
-fn run(gpa: Allocator, args: []const []const u8) !u8 {
+fn run(io: Io, gpa: Allocator, args: []const []const u8) !u8 {
     if (args.len == 0) {
         try writeStderr(usage_text);
         return 2;
@@ -218,11 +237,11 @@ fn run(gpa: Allocator, args: []const []const u8) !u8 {
         return 0;
     }
 
-    if (eql(cmd, "list")) return list(gpa, args[1..]);
+    if (eql(cmd, "list")) return list(io, gpa, args[1..]);
     if (eql(cmd, "run")) return runCmd(gpa, args[1..]);
     if (eql(cmd, "mcp")) {
         if (args.len > 1) return fail("mcp: takes no arguments (got '{s}')", .{args[1]});
-        try mcp.serve(gpa);
+        try mcp.serve(io, gpa);
         return 0;
     }
 
@@ -376,7 +395,7 @@ fn runCmd(gpa: Allocator, args: []const []const u8) !u8 {
     // kept for recovery and expires. A kept session expires too, later, so
     // one that is forgotten doesn't run forever.
     if (!ttl_given) opts.start.ttl_s = if (opts.keep) run_mod.keep_ttl_s else run_mod.failure_ttl_s;
-    opts.name = existing orelse name orelse try std.fmt.allocPrint(arena, "run-{d}", .{std.c.getpid()});
+    opts.name = existing orelse name orelse try std.fmt.allocPrint(arena, "run-{d}", .{sys.getpid()});
     if (!client.validName(opts.name)) return fail("run: invalid session name '{s}'", .{opts.name});
 
     var call_arena = arena;
@@ -433,19 +452,19 @@ fn start(gpa: Allocator, name: []const u8, args: []const []const u8) !u8 {
     return 0;
 }
 
-fn list(gpa: Allocator, args: []const []const u8) !u8 {
+fn list(io: Io, gpa: Allocator, args: []const []const u8) !u8 {
     var json = false;
     for (args) |a| {
         if (eql(a, "--json")) json = true else return fail("list: unknown option '{s}' (only --json)", .{a});
     }
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const sessions = try client.listSessions(arena_state.allocator());
+    const sessions = try client.listSessions(io, arena_state.allocator());
 
     var out_buf: [4096]u8 = undefined;
     // Streaming, not the default positional mode: with stdout redirected to
     // a file, positional writes would start at offset 0 and clobber it.
-    var fw = std.fs.File.stdout().writerStreaming(&out_buf);
+    var fw = Io.File.stdout().writerStreaming(io, &out_buf);
     const out = &fw.interface;
     if (json) {
         try out.writeByte('[');
@@ -466,17 +485,17 @@ fn eql(a: []const u8, b: []const u8) bool {
 }
 
 fn writeStdout(bytes: []const u8) !void {
-    try std.fs.File.stdout().writeAll(bytes);
+    try sys.writeAll(posix.STDOUT_FILENO, bytes);
 }
 
 fn writeStderr(bytes: []const u8) !void {
-    try std.fs.File.stderr().writeAll(bytes);
+    try sys.writeAll(posix.STDERR_FILENO, bytes);
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) u8 {
     var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "headterm: " ++ fmt ++ "\n", args) catch "headterm: error\n";
-    std.fs.File.stderr().writeAll(msg) catch {};
+    sys.writeAll(posix.STDERR_FILENO, msg) catch {};
     return 2;
 }
 
@@ -492,4 +511,5 @@ test {
     _ = @import("record.zig");
     _ = @import("run.zig");
     _ = @import("stylenote.zig");
+    _ = @import("sys.zig");
 }

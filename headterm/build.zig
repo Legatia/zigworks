@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run headterm").dependOn(&run.step);
 
     const unit = b.addTest(.{ .root_module = mod });
@@ -25,12 +25,12 @@ pub fn build(b: *std.Build) void {
 
     // End-to-end tests: real sessions through the CLI and through `mcp`.
     const smoke = b.addSystemCommand(&.{ "/bin/sh", "scripts/smoke.sh" });
-    smoke.addArtifactArg(exe);
+    smoke.addArtifactArg2(exe, .{});
     smoke.has_side_effects = true;
     smoke.step.dependOn(&run_unit.step);
 
     const mcp_smoke = b.addSystemCommand(&.{ "/bin/sh", "scripts/mcp_smoke.sh" });
-    mcp_smoke.addArtifactArg(exe);
+    mcp_smoke.addArtifactArg2(exe, .{});
     mcp_smoke.has_side_effects = true;
     mcp_smoke.step.dependOn(&run_unit.step);
 

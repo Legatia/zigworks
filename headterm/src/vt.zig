@@ -613,7 +613,7 @@ pub const Terminal = struct {
 
     fn oscDispatch(self: *Terminal, bel: bool) !void {
         const data = self.osc.items;
-        const semi = std.mem.indexOfScalar(u8, data, ';') orelse data.len;
+        const semi = std.mem.findScalar(u8, data, ';') orelse data.len;
         const num = std.fmt.parseInt(u16, data[0..semi], 10) catch return;
         const rest = if (semi < data.len) data[semi + 1 ..] else "";
         switch (num) {

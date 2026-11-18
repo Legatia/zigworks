@@ -3,6 +3,7 @@
 const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
+const sys = @import("sys.zig");
 const server = @import("server.zig");
 
 pub const max_name_len = 64;
@@ -18,28 +19,28 @@ pub fn validName(name: []const u8) bool {
 /// `$XDG_RUNTIME_DIR/headterm`, else `$TMPDIR/headterm-$UID` (TMPDIR
 /// defaulting to /tmp).
 pub fn sessionDir(buf: []u8) ![]const u8 {
-    if (posix.getenv("XDG_RUNTIME_DIR")) |xdg| {
-        if (xdg.len > 0) return std.fmt.bufPrint(buf, "{s}/headterm", .{std.mem.trimRight(u8, xdg, "/")});
+    if (sys.getenv("XDG_RUNTIME_DIR")) |xdg| {
+        if (xdg.len > 0) return std.fmt.bufPrint(buf, "{s}/headterm", .{std.mem.trimEnd(u8, xdg, "/")});
     }
-    const tmp = posix.getenv("TMPDIR") orelse "/tmp";
-    const base = if (tmp.len == 0) "/tmp" else std.mem.trimRight(u8, tmp, "/");
-    return std.fmt.bufPrint(buf, "{s}/headterm-{d}", .{ base, posix.getuid() });
+    const tmp = sys.getenv("TMPDIR") orelse "/tmp";
+    const base = if (tmp.len == 0) "/tmp" else std.mem.trimEnd(u8, tmp, "/");
+    return std.fmt.bufPrint(buf, "{s}/headterm-{d}", .{ base, sys.getuid() });
 }
 
-pub const DirError = error{ NotOwned, NotADirectory } || posix.MakeDirError || posix.OpenError || posix.FStatError || posix.FChmodError;
+pub const DirError = error{ NotOwned, NotADirectory } || sys.MakeDirError || sys.OpenError || sys.FStatError || sys.FChmodError;
 
 /// Creates the session directory with mode 0700, refusing one owned by
 /// another user.
 pub fn ensureSessionDir(dir: []const u8) DirError!void {
-    posix.mkdir(dir, 0o700) catch |err| switch (err) {
+    sys.mkdir(dir, 0o700) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => |e| return e,
     };
-    const fd = try posix.open(dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-    defer posix.close(fd);
-    const st = try posix.fstat(fd);
-    if (st.uid != posix.getuid()) return error.NotOwned;
-    if (st.mode & 0o777 != 0o700) try posix.fchmod(fd, 0o700);
+    const fd = try sys.open(dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    defer sys.close(fd);
+    const st = try sys.fstatOwner(fd);
+    if (st.uid != sys.getuid()) return error.NotOwned;
+    if (st.mode & 0o777 != 0o700) try sys.fchmod(fd, 0o700);
 }
 
 pub fn socketPath(buf: []u8, dir: []const u8, name: []const u8) ![]const u8 {
@@ -53,18 +54,19 @@ pub const Response = struct {
     body: []u8,
 };
 
-pub const RequestError = error{ NoSuchSession, StaleSession, BadResponse } || Allocator.Error || posix.WriteError || posix.ReadError;
+pub const RequestError = error{ NoSuchSession, StaleSession, BadResponse } || Allocator.Error || sys.WriteError || sys.ReadError;
 
 /// Sends one request and reads the whole response. The caller owns `body`.
 pub fn request(gpa: Allocator, socket_path: []const u8, args: []const []const u8) RequestError!Response {
-    const stream = try connect(socket_path);
-    defer stream.close();
-    try sendRequest(gpa, stream.handle, args);
-    return readResponse(gpa, stream.handle);
+    const fd = try connect(socket_path);
+    defer sys.close(fd);
+    try sendRequest(gpa, fd, args);
+    return readResponse(gpa, fd);
 }
 
-pub fn connect(socket_path: []const u8) RequestError!std.net.Stream {
-    return std.net.connectUnixSocket(socket_path) catch |err| switch (err) {
+/// Connects to a session server. The caller closes the descriptor.
+pub fn connect(socket_path: []const u8) RequestError!posix.fd_t {
+    return sys.connectUnix(socket_path) catch |err| switch (err) {
         error.ConnectionRefused => error.StaleSession,
         else => error.NoSuchSession,
     };
@@ -78,8 +80,8 @@ pub fn sendRequest(gpa: Allocator, fd: posix.fd_t, args: []const []const u8) Req
         try payload.append(gpa, 0);
     }
     var header: [32]u8 = undefined;
-    try writeAll(fd, std.fmt.bufPrint(&header, "{d}\n", .{payload.items.len}) catch unreachable);
-    try writeAll(fd, payload.items);
+    try sys.writeAll(fd, std.fmt.bufPrint(&header, "{d}\n", .{payload.items.len}) catch unreachable);
+    try sys.writeAll(fd, payload.items);
 }
 
 /// Reads until the server closes the connection.
@@ -88,7 +90,7 @@ pub fn readResponse(gpa: Allocator, fd: posix.fd_t) RequestError!Response {
     errdefer resp.deinit(gpa);
     var buf: [16384]u8 = undefined;
     while (true) {
-        const n = posix.read(fd, &buf) catch |err| switch (err) {
+        const n = sys.read(fd, &buf) catch |err| switch (err) {
             error.ConnectionResetByPeer => break,
             else => |e| return e,
         };
@@ -96,7 +98,7 @@ pub fn readResponse(gpa: Allocator, fd: posix.fd_t) RequestError!Response {
         try resp.appendSlice(gpa, buf[0..n]);
     }
 
-    const nl = std.mem.indexOfScalar(u8, resp.items, '\n') orelse return error.BadResponse;
+    const nl = std.mem.findScalar(u8, resp.items, '\n') orelse return error.BadResponse;
     const status = std.meta.stringToEnum(Status, resp.items[0..nl]) orelse return error.BadResponse;
     const body_len = resp.items.len - nl - 1;
     std.mem.copyForwards(u8, resp.items[0..body_len], resp.items[nl + 1 ..]);
@@ -121,10 +123,10 @@ pub fn startSession(gpa: Allocator, name: []const u8, argv: []const []const u8, 
     if (argv.len == 0) return failMsg(msg, "missing command", .{});
     if (opts.cols < 2 or opts.rows < 1 or opts.cols > 1000 or opts.rows > 1000) return failMsg(msg, "size {d}x{d} is out of range: cols must be 2..1000 and rows 1..1000", .{ opts.cols, opts.rows });
 
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = sessionDir(&dir_buf) catch return failMsg(msg, "session directory path too long", .{});
     ensureSessionDir(dir) catch |err| return failMsg(msg, "cannot use session directory {s}: {s}", .{ dir, @errorName(err) });
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const sock = socketPath(&path_buf, dir, name) catch return failMsg(msg, "socket path too long", .{});
 
     // A socket nobody listens on is left over from a crashed server.
@@ -132,12 +134,12 @@ pub fn startSession(gpa: Allocator, name: []const u8, argv: []const []const u8, 
         gpa.free(resp.body);
         return failMsg(msg, "session '{s}' already exists; kill it or pick another name", .{name});
     } else |err| switch (err) {
-        error.StaleSession => posix.unlink(sock) catch {},
+        error.StaleSession => sys.unlink(sock) catch {},
         else => {},
     }
-    _ = std.net.Address.initUnix(sock) catch return failMsg(msg, "socket path too long: {s} (set XDG_RUNTIME_DIR or TMPDIR to a shorter directory)", .{sock});
+    _ = sys.unixAddress(sock) catch return failMsg(msg, "socket path too long: {s} (set XDG_RUNTIME_DIR or TMPDIR to a shorter directory)", .{sock});
 
-    var server_msg: [256]u8 = .{0} ** 256;
+    var server_msg: [256]u8 = @splat(0);
     return server.start(gpa, .{
         .name = name,
         .socket_path = sock,
@@ -155,7 +157,7 @@ pub fn startSession(gpa: Allocator, name: []const u8, argv: []const []const u8, 
 }
 
 fn failMsg(msg: *[256]u8, comptime fmt: []const u8, args: anytype) error{StartFailed} {
-    _ = std.fmt.bufPrintZ(msg, fmt, args) catch {
+    _ = std.mem.printSentinel(msg, fmt, args, 0) catch {
         @memcpy(msg[msg.len - 4 ..], "...\x00");
     };
     return error.StartFailed;
@@ -165,14 +167,14 @@ pub const CallError = error{InvalidName} || RequestError;
 
 /// Sends `args` to the server of session `name`.
 pub fn call(gpa: Allocator, name: []const u8, args: []const []const u8) CallError!Response {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     return request(gpa, try sessionSocket(&path_buf, name), args);
 }
 
 /// Socket path of session `name`.
-pub fn sessionSocket(buf: *[std.fs.max_path_bytes]u8, name: []const u8) CallError![]const u8 {
+pub fn sessionSocket(buf: *[std.Io.Dir.max_path_bytes]u8, name: []const u8) CallError![]const u8 {
     if (!validName(name)) return error.InvalidName;
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = sessionDir(&dir_buf) catch return error.NoSuchSession;
     return socketPath(buf, dir, name) catch error.NoSuchSession;
 }
@@ -206,16 +208,15 @@ pub const SessionList = struct {
 
 /// Queries every live session, sorted by name, and removes sockets left by
 /// crashed servers. Everything is allocated in `arena`.
-pub fn listSessions(arena: Allocator) !SessionList {
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+pub fn listSessions(io: std.Io, arena: Allocator) !SessionList {
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try sessionDir(&dir_buf);
 
     var names: std.ArrayList([]const u8) = .empty;
-    if (std.fs.openDirAbsolute(dir, .{ .iterate = true })) |d_const| {
-        var d = d_const;
-        defer d.close();
+    if (std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true })) |d| {
+        defer d.close(io);
         var it = d.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(io)) |entry| {
             if (!std.mem.endsWith(u8, entry.name, ".sock")) continue;
             try names.append(arena, try arena.dupe(u8, entry.name[0 .. entry.name.len - 5]));
         }
@@ -229,14 +230,14 @@ pub fn listSessions(arena: Allocator) !SessionList {
     var raw: std.ArrayList([]const u8) = .empty;
     var infos: std.ArrayList(SessionInfo) = .empty;
     for (names.items) |name| {
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const sock = try socketPath(&path_buf, dir, name);
         const resp = request(arena, sock, &.{"info"}) catch |err| {
-            if (err == error.StaleSession) posix.unlink(sock) catch {};
+            if (err == error.StaleSession) sys.unlink(sock) catch {};
             continue;
         };
         if (resp.status != .ok) continue;
-        const body = std.mem.trimRight(u8, resp.body, "\n");
+        const body = std.mem.trimEnd(u8, resp.body, "\n");
         const parsed = std.json.parseFromSliceLeaky(SessionInfo, arena, body, .{ .ignore_unknown_fields = true }) catch continue;
         try raw.append(arena, body);
         try infos.append(arena, parsed);
@@ -262,11 +263,6 @@ pub fn writeSessionTable(w: *std.Io.Writer, infos: []const SessionInfo) !void {
         for (info.command) |c| try w.print(" {s}", .{c});
         try w.writeByte('\n');
     }
-}
-
-fn writeAll(fd: posix.fd_t, bytes: []const u8) posix.WriteError!void {
-    var off: usize = 0;
-    while (off < bytes.len) off += try posix.write(fd, bytes[off..]);
 }
 
 test validName {

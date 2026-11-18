@@ -12,6 +12,7 @@ const client = @import("client.zig");
 const server = @import("server.zig");
 const regex = @import("regex.zig");
 const run_mod = @import("run.zig");
+const sys = @import("sys.zig");
 
 const supported_versions = [_][]const u8{ "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25" };
 const default_version = "2025-06-18";
@@ -27,22 +28,22 @@ const default_ttl_s = 3600;
 const max_ttl_s = 30 * 24 * 3600;
 
 /// Reads requests from stdin until EOF and writes replies to stdout.
-pub fn serve(gpa: Allocator) !void {
+pub fn serve(io: std.Io, gpa: Allocator) !void {
     const in_buf = try gpa.alloc(u8, max_line);
     defer gpa.free(in_buf);
-    var reader = std.fs.File.stdin().readerStreaming(in_buf);
+    var reader = std.Io.File.stdin().readerStreaming(io, in_buf);
     var out_buf: [8192]u8 = undefined;
-    var writer = std.fs.File.stdout().writerStreaming(&out_buf);
+    var writer = std.Io.File.stdout().writerStreaming(io, &out_buf);
     const out = &writer.interface;
 
-    var io: Io = .{ .gpa = gpa, .in = &reader.interface, .in_fd = posix.STDIN_FILENO };
+    var stdin: Stdin = .{ .gpa = gpa, .in = &reader.interface, .in_fd = posix.STDIN_FILENO };
     // One diff marker per MCP server process, separate from CLI users and
     // other agents watching the same session.
-    io.client_id = std.fmt.bufPrint(&io.client_id_buf, "mcp-{d}", .{std.c.getpid()}) catch "mcp";
-    defer io.deinit();
+    stdin.client_id = std.fmt.bufPrint(&stdin.client_id_buf, "mcp-{d}", .{sys.getpid()}) catch "mcp";
+    defer stdin.deinit();
 
     while (true) {
-        const line = io.next() catch |err| switch (err) {
+        const line = stdin.next() catch |err| switch (err) {
             error.LineTooLong => {
                 const r = try errorReply(gpa, .null, -32700, "request line too long");
                 defer gpa.free(r);
@@ -52,7 +53,7 @@ pub fn serve(gpa: Allocator) !void {
             else => |e| return e,
         } orelse return;
         defer gpa.free(line);
-        if (try handleMessage(gpa, line, &io)) |r| {
+        if (try handleMessage(io, gpa, line, &stdin)) |r| {
             defer gpa.free(r);
             try writeLine(out, r);
         }
@@ -68,7 +69,7 @@ fn writeLine(out: *std.Io.Writer, msg: []const u8) !void {
 /// Stdin while serving. A tool call that waits on a session keeps reading
 /// stdin so it can notice `notifications/cancelled`; anything else that
 /// arrives meanwhile is queued and handled afterwards, in order.
-const Io = struct {
+const Stdin = struct {
     gpa: Allocator,
     in: *std.Io.Reader,
     in_fd: posix.fd_t,
@@ -79,59 +80,60 @@ const Io = struct {
     cancelled: std.ArrayList([]u8) = .empty,
     eof: bool = false,
 
-    fn deinit(io: *Io) void {
-        for (io.pending.items) |l| io.gpa.free(l);
-        io.pending.deinit(io.gpa);
-        for (io.cancelled.items) |c| io.gpa.free(c);
-        io.cancelled.deinit(io.gpa);
+    fn deinit(self: *Stdin) void {
+        for (self.pending.items) |l| self.gpa.free(l);
+        self.pending.deinit(self.gpa);
+        for (self.cancelled.items) |c| self.gpa.free(c);
+        self.cancelled.deinit(self.gpa);
     }
 
     /// The next message (caller frees it), or null at end of input.
-    fn next(io: *Io) !?[]u8 {
-        if (io.pending.items.len > 0) return io.pending.orderedRemove(0);
-        if (io.eof) return null;
-        const line = io.in.takeDelimiterExclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => return null,
+    fn next(self: *Stdin) !?[]u8 {
+        if (self.pending.items.len > 0) return self.pending.orderedRemove(0);
+        if (self.eof) return null;
+        // `takeDelimiter` also consumes the newline; a final line without one
+        // is still returned, and null means end of input.
+        const line = (self.in.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => {
-                _ = io.in.discardDelimiterInclusive('\n') catch {
-                    io.eof = true;
+                _ = self.in.discardDelimiterInclusive('\n') catch {
+                    self.eof = true;
                 };
                 return error.LineTooLong;
             },
             error.ReadFailed => return err,
-        };
-        return try io.gpa.dupe(u8, line);
+        }) orelse return null;
+        return try self.gpa.dupe(u8, line);
     }
 
     /// Blocks until `fd` is readable. Returns false if request `id` (JSON
     /// encoded) was cancelled in the meantime. After end of input the
     /// current request still runs to completion.
-    fn waitReadable(io: *Io, fd: posix.fd_t, id: []const u8) !bool {
+    fn waitReadable(self: *Stdin, fd: posix.fd_t, id: []const u8) !bool {
         while (true) {
             // Complete lines already buffered never show up in poll().
-            while (std.mem.indexOfScalar(u8, io.in.buffered(), '\n') != null) {
-                const line = io.in.takeDelimiterExclusive('\n') catch break;
-                if (try io.absorb(try io.gpa.dupe(u8, line), id)) return false;
+            while (std.mem.findScalar(u8, self.in.buffered(), '\n') != null) {
+                const line = (self.in.takeDelimiter('\n') catch break) orelse break;
+                if (try self.absorb(try self.gpa.dupe(u8, line), id)) return false;
             }
             var fds = [_]posix.pollfd{
                 .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
-                .{ .fd = if (io.eof) -1 else io.in_fd, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = if (self.eof) -1 else self.in_fd, .events = posix.POLL.IN, .revents = 0 },
             };
             _ = try posix.poll(&fds, -1);
             if (fds[0].revents != 0) return true;
             if (fds[1].revents != 0) {
-                if (io.in.buffered().len == io.in.buffer.len) {
+                if (self.in.buffered().len == self.in.buffer.len) {
                     // A line longer than the buffer: drop it.
-                    io.in.toss(io.in.buffered().len);
+                    self.in.toss(self.in.buffered().len);
                 }
-                io.in.fillMore() catch {
-                    io.eof = true;
+                self.in.fillMore() catch {
+                    self.eof = true;
                     // A final line without a newline is still a message.
-                    const rest = io.in.buffered();
+                    const rest = self.in.buffered();
                     if (rest.len > 0) {
-                        const line = try io.gpa.dupe(u8, rest);
-                        io.in.toss(rest.len);
-                        if (try io.absorb(line, id)) return false;
+                        const line = try self.gpa.dupe(u8, rest);
+                        self.in.toss(rest.len);
+                        if (try self.absorb(line, id)) return false;
                     }
                 };
             }
@@ -139,26 +141,26 @@ const Io = struct {
     }
 
     /// Takes ownership of `line`. Returns true if it cancels request `id`.
-    fn absorb(io: *Io, line: []u8, id: []const u8) !bool {
-        if (try cancelledId(io.gpa, line)) |target| {
-            io.gpa.free(line);
+    fn absorb(self: *Stdin, line: []u8, id: []const u8) !bool {
+        if (try cancelledId(self.gpa, line)) |target| {
+            self.gpa.free(line);
             if (std.mem.eql(u8, target, id)) {
-                io.gpa.free(target);
+                self.gpa.free(target);
                 return true;
             }
-            if (io.cancelled.items.len >= 64) io.gpa.free(io.cancelled.orderedRemove(0));
-            try io.cancelled.append(io.gpa, target);
+            if (self.cancelled.items.len >= 64) self.gpa.free(self.cancelled.orderedRemove(0));
+            try self.cancelled.append(self.gpa, target);
             return false;
         }
-        try io.pending.append(io.gpa, line);
+        try self.pending.append(self.gpa, line);
         return false;
     }
 
     /// True (and forgets it) if request `id` was cancelled while queued.
-    fn takeCancelled(io: *Io, id: []const u8) bool {
-        for (io.cancelled.items, 0..) |c, i| {
+    fn takeCancelled(self: *Stdin, id: []const u8) bool {
+        for (self.cancelled.items, 0..) |c, i| {
             if (std.mem.eql(u8, c, id)) {
-                io.gpa.free(io.cancelled.orderedRemove(i));
+                self.gpa.free(self.cancelled.orderedRemove(i));
                 return true;
             }
         }
@@ -183,14 +185,14 @@ fn cancelledId(gpa: Allocator, line: []const u8) Allocator.Error!?[]u8 {
 
 /// Handles one JSON-RPC message. Returns the reply (without newline,
 /// caller owns it), or null for notifications.
-pub fn handleLine(gpa: Allocator, line: []const u8) Allocator.Error!?[]u8 {
-    return handleMessage(gpa, line, null) catch |err| switch (err) {
+pub fn handleLine(io: std.Io, gpa: Allocator, line: []const u8) Allocator.Error!?[]u8 {
+    return handleMessage(io, gpa, line, null) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => unreachable, // only reachable with stdin attached
     };
 }
 
-fn handleMessage(gpa: Allocator, line_in: []const u8, io: ?*Io) !?[]u8 {
+fn handleMessage(io: std.Io, gpa: Allocator, line_in: []const u8, stdin: ?*Stdin) !?[]u8 {
     const line = std.mem.trim(u8, line_in, " \t\r");
     if (line.len == 0) return null;
 
@@ -215,10 +217,10 @@ fn handleMessage(gpa: Allocator, line_in: []const u8, io: ?*Io) !?[]u8 {
     // Notifications (no id) never get a reply.
     const req_id = id orelse return null;
     const id_json = try json.Stringify.valueAlloc(arena, req_id, .{});
-    if (io) |i| if (i.takeCancelled(id_json)) return null;
+    if (stdin) |in| if (in.takeCancelled(id_json)) return null;
 
-    var d: Dispatch = .{ .gpa = gpa, .arena = arena, .io = io, .id_json = id_json };
-    if (io) |i| d.client_id = i.client_id;
+    var d: Dispatch = .{ .io = io, .gpa = gpa, .arena = arena, .stdin = stdin, .id_json = id_json };
+    if (stdin) |in| d.client_id = in.client_id;
     const result = d.dispatch(method, obj.get("params")) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MethodNotFound => return try errorReply(gpa, req_id, -32601, d.err_msg),
@@ -289,10 +291,11 @@ const Result = union(enum) {
 const DispatchError = error{ MethodNotFound, InvalidParams, Cancelled } || Allocator.Error || posix.PollError;
 
 const Dispatch = struct {
+    io: std.Io,
     gpa: Allocator,
     arena: Allocator,
     /// Null in unit tests: session calls then block without watching stdin.
-    io: ?*Io = null,
+    stdin: ?*Stdin = null,
     id_json: []const u8 = "",
     /// The `styles` argument of the current tool call.
     styles: bool = false,
@@ -496,7 +499,7 @@ const Dispatch = struct {
     fn session(self: *Dispatch, name: []const u8, args: []const []const u8) DispatchError!SessionResult {
         const resp = self.callSession(name, args) catch |err| switch (err) {
             error.Cancelled => return error.Cancelled,
-            error.Unexpected, error.SystemResources, error.NetworkSubsystemFailed => |e| return e,
+            error.Unexpected, error.SystemResources, error.NetworkDown => |e| return e,
             else => |e| {
                 var buf: [256]u8 = undefined;
                 const hint = if (e == error.NoSuchSession or e == error.StaleSession) " (see headterm_list)" else "";
@@ -504,23 +507,23 @@ const Dispatch = struct {
                 return .{ .text = text, .is_error = true, .request_failed = true };
             },
         };
-        const body = std.mem.trimRight(u8, resp.body, "\n");
+        const body = std.mem.trimEnd(u8, resp.body, "\n");
         return switch (resp.status) {
             .ok => .{ .text = body, .is_error = false, .request_failed = false },
             .timeout => .{ .text = body, .is_error = true, .request_failed = false },
-            .@"error" => .{ .text = std.mem.trimRight(u8, resp.body, "\n"), .is_error = true, .request_failed = true },
+            .@"error" => .{ .text = std.mem.trimEnd(u8, resp.body, "\n"), .is_error = true, .request_failed = true },
         };
     }
 
     fn callSession(self: *Dispatch, name: []const u8, args: []const []const u8) (client.CallError || error{Cancelled} || posix.PollError)!client.Response {
-        const io = self.io orelse return client.call(self.arena, name, args);
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const stream = try client.connect(try client.sessionSocket(&path_buf, name));
+        const stdin = self.stdin orelse return client.call(self.arena, name, args);
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const fd = try client.connect(try client.sessionSocket(&path_buf, name));
         // Closing the connection early cancels a wait on the session server.
-        defer stream.close();
-        try client.sendRequest(self.arena, stream.handle, args);
-        if (!try io.waitReadable(stream.handle, self.id_json)) return error.Cancelled;
-        return client.readResponse(self.arena, stream.handle);
+        defer sys.close(fd);
+        try client.sendRequest(self.arena, fd, args);
+        if (!try stdin.waitReadable(fd, self.id_json)) return error.Cancelled;
+        return client.readResponse(self.arena, fd);
     }
 
     fn runTool(self: *Dispatch, a: Args) DispatchError!ToolResult {
@@ -536,7 +539,7 @@ const Dispatch = struct {
         };
 
         var opts: run_mod.Options = .{
-            .name = existing orelse (try a.string("name")) orelse try std.fmt.allocPrint(self.arena, "run-{d}-{d}", .{ std.c.getpid(), @mod(std.time.milliTimestamp(), 1_000_000) }),
+            .name = existing orelse (try a.string("name")) orelse try std.fmt.allocPrint(self.arena, "run-{d}-{d}", .{ sys.getpid(), @mod(sys.milliTimestamp(), 1_000_000) }),
             .argv = command,
             .keep = try a.boolean("keep") orelse false,
             .styles = try a.boolean("styles") orelse false,
@@ -564,7 +567,7 @@ const Dispatch = struct {
     }
 
     fn list(self: *Dispatch) DispatchError!ToolResult {
-        const sessions = client.listSessions(self.arena) catch |err| switch (err) {
+        const sessions = client.listSessions(self.io, self.arena) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .text = try std.fmt.allocPrint(self.arena, "list failed: {s}", .{@errorName(err)}), .is_error = true },
         };
@@ -572,7 +575,7 @@ const Dispatch = struct {
         var out: std.Io.Writer.Allocating = .init(self.arena);
         out.writer.writeAll("NAME             PID      SIZE      STATUS     COMMAND\n") catch return error.OutOfMemory;
         client.writeSessionTable(&out.writer, sessions.infos) catch return error.OutOfMemory;
-        return .{ .text = std.mem.trimRight(u8, out.written(), "\n") };
+        return .{ .text = std.mem.trimEnd(u8, out.written(), "\n") };
     }
 };
 
@@ -607,7 +610,7 @@ const Args = struct {
         const v = a.get(key) orelse return null;
         const n: i64 = switch (v) {
             .integer => |i| i,
-            .float => |f| if (@floor(f) == f and @abs(f) < 1e15) @intFromFloat(f) else return a.d.fail(error.InvalidParams, "'{s}' must be an integer", .{key}),
+            .float => |f| if (@floor(f) == f and @abs(f) < 1e15) @trunc(f) else return a.d.fail(error.InvalidParams, "'{s}' must be an integer", .{key}),
             else => return a.d.fail(error.InvalidParams, "'{s}' must be an integer", .{key}),
         };
         if (n < min or n > max) return a.d.fail(error.InvalidParams, "'{s}' must be between {d} and {d}", .{ key, min, max });
@@ -738,9 +741,9 @@ const tools_json_src =
 const testing = std.testing;
 
 fn roundTrip(line: []const u8) !?json.Parsed(json.Value) {
-    const reply = try handleLine(testing.allocator, line) orelse return null;
+    const reply = try handleLine(testing.io, testing.allocator, line) orelse return null;
     defer testing.allocator.free(reply);
-    try testing.expect(std.mem.indexOfScalar(u8, reply, '\n') == null);
+    try testing.expect(std.mem.findScalar(u8, reply, '\n') == null);
     return try json.parseFromSlice(json.Value, testing.allocator, reply, .{});
 }
 
@@ -843,13 +846,13 @@ test "tool failures are results with isError" {
         try testing.expect(r.get("isError").?.bool);
         const content = r.get("content").?.array.items[0].object;
         try testing.expectEqualStrings("text", content.get("type").?.string);
-        try testing.expect(std.mem.indexOf(u8, content.get("text").?.string, "invalid session name") != null);
+        try testing.expect(std.mem.find(u8, content.get("text").?.string, "invalid session name") != null);
     }
     {
         const p = try toolCall("{\"name\":\"headterm_kill\",\"arguments\":{\"name\":\"headterm-unit-test-no-such-session\"}}");
         defer p.deinit();
         const r = p.value.object.get("result").?.object;
         try testing.expect(r.get("isError").?.bool);
-        try testing.expect(std.mem.indexOf(u8, r.get("content").?.array.items[0].object.get("text").?.string, "no session named") != null);
+        try testing.expect(std.mem.find(u8, r.get("content").?.array.items[0].object.get("text").?.string, "no session named") != null);
     }
 }

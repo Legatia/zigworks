@@ -50,8 +50,8 @@ pub const Mods = struct {
 pub fn isKeySyntax(arg: []const u8) bool {
     if (arg.len < 3 or arg[0] != '<' or arg[arg.len - 1] != '>') return false;
     const inner = arg[1 .. arg.len - 1];
-    if (std.mem.indexOfAny(u8, inner, "<>") != null) return false;
-    const sp = std.mem.indexOfScalar(u8, inner, ' ') orelse return true;
+    if (std.mem.findAny(u8, inner, "<>") != null) return false;
+    const sp = std.mem.findScalar(u8, inner, ' ') orelse return true;
     // Only mouse events have a space: "<Click 3,4>".
     return mouseEvent(splitMods(inner[0..sp]).name) != null;
 }
@@ -72,7 +72,7 @@ const bare_names = [_][]const u8{
 pub fn isBareKey(arg: []const u8) bool {
     var name = arg;
     var mods = false;
-    while (name.len > 2 and name[1] == '-' and std.mem.indexOfScalar(u8, "CMSA", name[0]) != null) {
+    while (name.len > 2 and name[1] == '-' and std.mem.findScalar(u8, "CMSA", name[0]) != null) {
         mods = true;
         name = name[2..];
     }
@@ -108,7 +108,7 @@ pub fn encodeArg(gpa: Allocator, out: *std.ArrayList(u8), arg: []const u8, ctx: 
     if (isBareKey(arg)) return encodeKey(gpa, out, arg, ctx.app_cursor);
     if (!isKeySyntax(arg)) return out.appendSlice(gpa, arg);
     const inner = arg[1 .. arg.len - 1];
-    if (std.mem.indexOfScalar(u8, inner, ' ')) |sp| return encodeMouse(gpa, out, inner[0..sp], inner[sp + 1 ..], ctx);
+    if (std.mem.findScalar(u8, inner, ' ')) |sp| return encodeMouse(gpa, out, inner[0..sp], inner[sp + 1 ..], ctx);
     return encodeKey(gpa, out, inner, ctx.app_cursor);
 }
 
@@ -154,7 +154,7 @@ const Pos = struct { row: usize, col: usize };
 
 fn parsePos(text: []const u8) Error!Pos {
     const t = std.mem.trim(u8, text, " ");
-    const comma = std.mem.indexOfScalar(u8, t, ',') orelse return error.BadMousePosition;
+    const comma = std.mem.findScalar(u8, t, ',') orelse return error.BadMousePosition;
     return .{
         .row = std.fmt.parseInt(usize, std.mem.trim(u8, t[0..comma], " "), 10) catch return error.BadMousePosition,
         .col = std.fmt.parseInt(usize, std.mem.trim(u8, t[comma + 1 ..], " "), 10) catch return error.BadMousePosition,
@@ -169,7 +169,7 @@ fn encodeMouse(gpa: Allocator, out: *std.ArrayList(u8), head: []const u8, rest: 
     if (ev.kind == .drag) {
         // "<Drag r1,c1 r2,c2>"
         const t = std.mem.trim(u8, rest, " ");
-        const sp = std.mem.lastIndexOfScalar(u8, t, ' ') orelse return error.BadMousePosition;
+        const sp = std.mem.findScalarLast(u8, t, ' ') orelse return error.BadMousePosition;
         from = try parsePos(t[0..sp]);
         to = try parsePos(t[sp + 1 ..]);
     } else {

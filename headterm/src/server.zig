@@ -10,6 +10,7 @@
 const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
+const sys = @import("sys.zig");
 const stylenote = @import("stylenote.zig");
 const vt = @import("vt.zig");
 const keys = @import("keys.zig");
@@ -42,53 +43,53 @@ pub const Config = struct {
 const max_markers = 64;
 pub const max_client_id = 64;
 
-pub const StartError = error{StartFailed} || posix.ForkError || posix.PipeError;
+pub const StartError = error{StartFailed} || sys.ForkError || sys.PipeError;
 
 /// Forks the session server and waits until it has bound its socket and
 /// started the child. Returns the child's pid. On failure `msg` holds the
 /// reason.
 pub fn start(gpa: Allocator, cfg: Config, msg: *[256]u8) StartError!posix.pid_t {
-    const ready = try posix.pipe2(.{ .CLOEXEC = true });
-    const pid = try posix.fork();
+    const ready = try sys.pipe2(.{ .cloexec = true });
+    const pid = try sys.fork();
     if (pid == 0) {
-        posix.close(ready[0]);
+        sys.close(ready[0]);
         // Double fork: the server must not be a session leader or a child
         // of the CLI process.
-        _ = posix.setsid() catch {};
-        const pid2 = posix.fork() catch posix.exit(1);
-        if (pid2 != 0) posix.exit(0);
+        sys.setsid();
+        const pid2 = sys.fork() catch sys.exit(1);
+        if (pid2 != 0) sys.exit(0);
         daemonMain(gpa, cfg, ready[1]);
     }
-    posix.close(ready[1]);
-    defer posix.close(ready[0]);
-    _ = posix.waitpid(pid, 0);
+    sys.close(ready[1]);
+    defer sys.close(ready[0]);
+    _ = sys.waitpid(pid, 0);
 
     var buf: [512]u8 = undefined;
     var n: usize = 0;
     while (n < buf.len) {
-        const r = posix.read(ready[0], buf[n..]) catch break;
+        const r = sys.read(ready[0], buf[n..]) catch break;
         if (r == 0) break;
         n += r;
     }
-    const reply = std.mem.trimRight(u8, buf[0..n], "\n");
+    const reply = std.mem.trimEnd(u8, buf[0..n], "\n");
     if (std.mem.startsWith(u8, reply, "ok ")) {
         return std.fmt.parseInt(posix.pid_t, reply[3..], 10) catch error.StartFailed;
     }
     const reason = if (std.mem.startsWith(u8, reply, "err ")) reply[4..] else "session server exited during startup";
-    _ = std.fmt.bufPrintZ(msg, "{s}", .{reason[0..@min(reason.len, msg.len - 1)]}) catch {};
+    _ = std.mem.printSentinel(msg, "{s}", .{reason[0..@min(reason.len, msg.len - 1)]}, 0) catch {};
     return error.StartFailed;
 }
 
 fn daemonMain(gpa: Allocator, cfg: Config, ready_fd: posix.fd_t) noreturn {
     // Detach from the caller's stdio so `$(headterm start ...)` returns, and
     // drop any other inherited descriptors.
-    if (posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0)) |null_fd| {
-        for (0..3) |fd| posix.dup2(null_fd, @intCast(fd)) catch {};
-        if (null_fd > 2) posix.close(null_fd);
+    if (sys.open("/dev/null", .{ .ACCMODE = .RDWR }, 0)) |null_fd| {
+        for (0..3) |fd| sys.dup2(null_fd, @intCast(fd)) catch {};
+        if (null_fd > 2) sys.close(null_fd);
     } else |_| {}
     var fd: posix.fd_t = 3;
     while (fd < 1024) : (fd += 1) {
-        if (fd != ready_fd) _ = std.c.close(fd);
+        if (fd != ready_fd) sys.close(fd);
     }
 
     var session = Session.init(gpa, cfg) catch |err| {
@@ -99,31 +100,31 @@ fn daemonMain(gpa: Allocator, cfg: Config, ready_fd: posix.fd_t) noreturn {
             else => @errorName(err),
         };
         const line = std.fmt.bufPrint(&buf, "err {s}\n", .{reason}) catch "err startup failed\n";
-        _ = posix.write(ready_fd, line) catch {};
-        posix.exit(1);
+        _ = sys.write(ready_fd, line) catch {};
+        sys.exit(1);
     };
 
     var buf: [64]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "ok {d}\n", .{session.pty.pid}) catch unreachable;
-    _ = posix.write(ready_fd, line) catch {};
-    posix.close(ready_fd);
+    _ = sys.write(ready_fd, line) catch {};
+    sys.close(ready_fd);
 
     session.run() catch {};
     session.deinit();
-    posix.exit(0);
+    sys.exit(0);
 }
 
-var spawn_err: [256]u8 = .{0} ** 256;
+var spawn_err: [256]u8 = @splat(0);
 var sigchld_write_fd: posix.fd_t = -1;
 
-fn onSigchld(_: i32) callconv(.c) void {
+fn onSigchld(_: posix.SIG) callconv(.c) void {
     const saved = std.c._errno().*;
-    _ = posix.write(sigchld_write_fd, "c") catch {};
+    _ = std.c.write(sigchld_write_fd, "c", 1);
     std.c._errno().* = saved;
 }
 
 fn nowMs() i64 {
-    return std.time.milliTimestamp();
+    return sys.milliTimestamp();
 }
 
 /// How long `--settle` waits for a program to print anything after keys were
@@ -244,19 +245,18 @@ const Session = struct {
 
     fn init(gpa: Allocator, cfg: Config) !Session {
         const ignore: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
-        posix.sigaction(posix.SIG.PIPE, &ignore, null);
-        posix.sigaction(posix.SIG.HUP, &ignore, null);
+        posix.sigaction(.PIPE, &ignore, null);
+        posix.sigaction(.HUP, &ignore, null);
 
-        const sig_pipe = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+        const sig_pipe = try sys.pipe2(.{ .cloexec = true, .nonblock = true });
         sigchld_write_fd = sig_pipe[1];
         const on_chld: posix.Sigaction = .{ .handler = .{ .handler = onSigchld }, .mask = posix.sigemptyset(), .flags = posix.SA.RESTART | posix.SA.NOCLDSTOP };
-        posix.sigaction(posix.SIG.CHLD, &on_chld, null);
+        posix.sigaction(.CHLD, &on_chld, null);
 
-        const addr = try std.net.Address.initUnix(cfg.socket_path);
-        var server = try addr.listen(.{});
-        errdefer server.deinit();
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (std.fmt.bufPrintZ(&path_buf, "{s}", .{cfg.socket_path})) |path_z| {
+        const listen_fd = try sys.listenUnix(cfg.socket_path);
+        errdefer sys.close(listen_fd);
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        if (std.mem.printSentinel(&path_buf, "{s}", .{cfg.socket_path}, 0)) |path_z| {
             _ = std.c.chmod(path_z, 0o600);
         } else |_| {}
 
@@ -270,21 +270,21 @@ const Session = struct {
         var recorder: ?record.Recorder = null;
         if (cfg.record_path) |rp| {
             recorder = record.Recorder.create(gpa, rp, cfg.cols, cfg.rows, cfg.argv) catch |err| {
-                _ = std.fmt.bufPrintZ(&spawn_err, "cannot write recording {s}: {s}", .{ rp, @errorName(err) }) catch {};
-                posix.unlink(cfg.socket_path) catch {};
+                _ = std.mem.printSentinel(&spawn_err, "cannot write recording {s}: {s}", .{ rp, @errorName(err) }, 0) catch {};
+                sys.unlink(cfg.socket_path) catch {};
                 return error.RecordFailed;
             };
         }
         errdefer if (recorder) |*r| r.deinit();
 
         const p = pty.spawn(gpa, cfg.argv, cfg.cwd, cfg.cols, cfg.rows, &spawn_err) catch |err| {
-            posix.unlink(cfg.socket_path) catch {};
+            sys.unlink(cfg.socket_path) catch {};
             return err;
         };
-        _ = try posix.fcntl(p.master, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+        try sys.setNonblock(p.master);
 
         const log_fd: ?posix.fd_t = if (cfg.log_path) |lp|
-            posix.open(lp, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o600) catch null
+            sys.open(lp, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o600) catch null
         else
             null;
 
@@ -296,7 +296,7 @@ const Session = struct {
             .cfg = cfg,
             .term = term,
             .pty = p,
-            .listen_fd = server.stream.handle,
+            .listen_fd = listen_fd,
             .sig_pipe = sig_pipe,
             .started_ms = now,
             .last_output_ms = now,
@@ -307,15 +307,15 @@ const Session = struct {
 
     fn closeListener(self: *Session) void {
         if (self.listen_fd < 0) return;
-        posix.unlink(self.cfg.socket_path) catch {};
-        posix.close(self.listen_fd);
+        sys.unlink(self.cfg.socket_path) catch {};
+        sys.close(self.listen_fd);
         self.listen_fd = -1;
     }
 
     fn deinit(self: *Session) void {
         self.closeListener();
         for (self.waiters.items) |w| {
-            posix.close(w.fd);
+            sys.close(w.fd);
             if (w.text) |t| self.gpa.free(t);
         }
         self.waiters.deinit(self.gpa);
@@ -412,7 +412,7 @@ const Session = struct {
         var buf: [65536]u8 = undefined;
         var total: usize = 0;
         while (total < 4 << 20) {
-            const n = posix.read(self.pty.master, &buf) catch |err| switch (err) {
+            const n = sys.read(self.pty.master, &buf) catch |err| switch (err) {
                 error.WouldBlock => break,
                 else => {
                     self.pty_open = false;
@@ -450,7 +450,7 @@ const Session = struct {
 
     fn flushInput(self: *Session) void {
         while (self.input.items.len > 0) {
-            const n = posix.write(self.pty.master, self.input.items) catch break;
+            const n = sys.write(self.pty.master, self.input.items) catch break;
             std.mem.copyForwards(u8, self.input.items, self.input.items[n..]);
             self.input.shrinkRetainingCapacity(self.input.items.len - n);
         }
@@ -458,13 +458,13 @@ const Session = struct {
 
     fn reapChild(self: *Session) !void {
         if (self.child_exited) return;
-        const r = posix.waitpid(self.pty.pid, posix.W.NOHANG);
+        const r = sys.waitpid(self.pty.pid, posix.W.NOHANG);
         if (r.pid != self.pty.pid) return;
         self.child_exited = true;
         if (posix.W.IFEXITED(r.status)) {
             self.exit_code = posix.W.EXITSTATUS(r.status);
         } else if (posix.W.IFSIGNALED(r.status)) {
-            self.exit_signal = @intCast(posix.W.TERMSIG(r.status));
+            self.exit_signal = @intCast(@backingInt(posix.W.TERMSIG(r.status)));
         }
         // Output written just before exit is still buffered in the PTY.
         try self.readPty();
@@ -472,7 +472,7 @@ const Session = struct {
 
     fn terminateChild(self: *Session) !void {
         const pid = self.pty.pid;
-        const signals = [_]u8{ posix.SIG.HUP, posix.SIG.TERM, posix.SIG.KILL };
+        const signals = [_]posix.SIG{ .HUP, .TERM, .KILL };
         for (signals) |sig| {
             if (self.child_exited) return;
             posix.kill(-pid, sig) catch {};
@@ -488,7 +488,7 @@ const Session = struct {
     }
 
     fn acceptClient(self: *Session) void {
-        const fd = posix.accept(self.listen_fd, null, null, posix.SOCK.CLOEXEC) catch return;
+        const fd = sys.accept(self.listen_fd) catch return;
         self.last_activity_ms = nowMs();
         const tv: posix.timeval = .{ .sec = 2, .usec = 0 };
         // libc directly: macOS fails with EINVAL if the client has already
@@ -498,7 +498,7 @@ const Session = struct {
         var req: std.ArrayList(u8) = .empty;
         defer req.deinit(self.gpa);
         const payload = self.readRequest(fd, &req) orelse {
-            posix.close(fd);
+            sys.close(fd);
             return;
         };
 
@@ -508,7 +508,7 @@ const Session = struct {
         while (it.next()) |a| {
             if (it.peek() == null and a.len == 0) break; // trailing terminator
             args.append(self.gpa, a) catch {
-                posix.close(fd);
+                sys.close(fd);
                 return;
             };
         }
@@ -518,7 +518,7 @@ const Session = struct {
             respond(fd, .@"error", std.fmt.bufPrint(&msg, "internal error: {s}\n", .{@errorName(err)}) catch "internal error\n");
             break :blk false;
         };
-        if (!keep_open) posix.close(fd);
+        if (!keep_open) sys.close(fd);
     }
 
     fn readRequest(self: *Session, fd: posix.fd_t, req: *std.ArrayList(u8)) ?[]const u8 {
@@ -527,7 +527,7 @@ const Session = struct {
         var header_len: usize = 0;
         while (true) {
             if (want == null) {
-                if (std.mem.indexOfScalar(u8, req.items, '\n')) |nl| {
+                if (std.mem.findScalar(u8, req.items, '\n')) |nl| {
                     const len = std.fmt.parseInt(usize, req.items[0..nl], 10) catch return null;
                     if (len > max_request) return null;
                     want = len;
@@ -537,7 +537,7 @@ const Session = struct {
             if (want) |len| {
                 if (req.items.len >= header_len + len) return req.items[header_len..][0..len];
             }
-            const n = posix.read(fd, &buf) catch return null;
+            const n = sys.read(fd, &buf) catch return null;
             if (n == 0) return null;
             req.appendSlice(self.gpa, buf[0..n]) catch return null;
             if (req.items.len > max_request + 32) return null;
@@ -592,7 +592,7 @@ const Session = struct {
             pty.setSize(self.pty.master, cols, rows);
             try self.term.resize(cols, rows);
             if (self.recorder) |*r| r.resize(cols, rows);
-            if (!self.child_exited) posix.kill(-self.pty.pid, posix.SIG.WINCH) catch {};
+            if (!self.child_exited) posix.kill(-self.pty.pid, .WINCH) catch {};
             respond(fd, .ok, "");
             return false;
         }
@@ -881,7 +881,7 @@ const Session = struct {
 
     fn dropWaiter(self: *Session, i: usize) void {
         const w = self.waiters.orderedRemove(i);
-        posix.close(w.fd);
+        sys.close(w.fd);
         self.freeWaiter(w);
     }
 
@@ -946,7 +946,7 @@ const Session = struct {
         }
         if (w.regex) |re| {
             for (lines) |l| {
-                if (try re.search(self.gpa, std.mem.trimRight(u8, l, " "))) {
+                if (try re.search(self.gpa, std.mem.trimEnd(u8, l, " "))) {
                     out.reason = "regex";
                     return out;
                 }
@@ -1280,7 +1280,7 @@ const Session = struct {
         try jw.write(t.alt_active);
         try self.writeExit(&jw);
         try jw.objectField("server_pid");
-        try jw.write(std.c.getpid());
+        try jw.write(sys.getpid());
         try jw.objectField("started_at_ms");
         try jw.write(self.started_ms);
         try jw.objectField("ttl_s");
@@ -1443,7 +1443,7 @@ fn writeRunsJson(jw: *std.json.Stringify, runs: []const Session.Run) !void {
 
 fn containsText(lines: []const []const u8, needle: []const u8) bool {
     for (lines) |l| {
-        if (std.mem.indexOf(u8, l, needle) != null) return true;
+        if (std.mem.find(u8, l, needle) != null) return true;
     }
     return false;
 }
@@ -1458,10 +1458,7 @@ fn respond(fd: posix.fd_t, status: Status, body: []const u8) void {
     writeAll(fd, body) catch return;
 }
 
-fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) off += try posix.write(fd, bytes[off..]);
-}
+const writeAll = sys.writeAll;
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;

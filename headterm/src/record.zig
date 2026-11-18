@@ -4,10 +4,13 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const sys = @import("sys.zig");
 
 pub const Recorder = struct {
     gpa: Allocator,
-    file: std.fs.File,
+    /// A plain descriptor: the recorder runs in the forked session server,
+    /// which does not use `std.Io`.
+    fd: sys.fd_t,
     start_ns: i128,
     /// Start of a UTF-8 character split across two PTY reads.
     pending: [3]u8 = undefined,
@@ -15,9 +18,11 @@ pub const Recorder = struct {
 
     /// Creates (or truncates) `path` and writes the header.
     pub fn create(gpa: Allocator, path: []const u8, cols: usize, rows: usize, argv: []const []const u8) !Recorder {
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-        errdefer file.close();
-        var r: Recorder = .{ .gpa = gpa, .file = file, .start_ns = std.time.nanoTimestamp() };
+        var flags: sys.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true };
+        if (@hasField(sys.O, "LARGEFILE")) flags.LARGEFILE = true;
+        const fd = try sys.open(path, flags, 0o666);
+        errdefer sys.close(fd);
+        const r: Recorder = .{ .gpa = gpa, .fd = fd, .start_ns = sys.nanoTimestamp() };
 
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
@@ -32,12 +37,12 @@ pub const Recorder = struct {
             .env = .{ .TERM = "xterm-256color" },
         }, .{}, &out.writer);
         try out.writer.writeByte('\n');
-        try r.file.writeAll(out.written());
+        try sys.writeAll(r.fd, out.written());
         return r;
     }
 
     pub fn deinit(r: *Recorder) void {
-        r.file.close();
+        sys.close(r.fd);
     }
 
     /// Program output. Errors are ignored: recording is best effort and must
@@ -75,14 +80,14 @@ pub const Recorder = struct {
     }
 
     fn event(r: *Recorder, kind: []const u8, data: []const u8) !void {
-        const elapsed_ns = std.time.nanoTimestamp() - r.start_ns;
+        const elapsed_ns = sys.nanoTimestamp() - r.start_ns;
         const secs = @as(f64, @floatFromInt(@max(elapsed_ns, 0))) / std.time.ns_per_s;
         var out: std.Io.Writer.Allocating = .init(r.gpa);
         defer out.deinit();
         try out.writer.print("[{d:.6}, \"{s}\", ", .{ secs, kind });
         try std.json.Stringify.encodeJsonString(data, .{}, &out.writer);
         try out.writer.writeAll("]\n");
-        try r.file.writeAll(out.written());
+        try sys.writeAll(r.fd, out.written());
     }
 };
 
@@ -133,8 +138,9 @@ const testing = std.testing;
 test "asciicast v2: header, events and UTF-8 split across reads" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path = try tmp.dir.realpath(".", &path_buf);
+    const io = testing.io;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "rec.cast" });
     defer testing.allocator.free(path);
 
@@ -146,9 +152,9 @@ test "asciicast v2: header, events and UTF-8 split across reads" {
     r.resize(100, 30);
     r.deinit();
 
-    const data = try tmp.dir.readFileAlloc(testing.allocator, "rec.cast", 1 << 20);
+    const data = try tmp.dir.readFileAlloc(io, "rec.cast", testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(data);
-    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, data, "\n"), '\n');
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, data, "\n"), '\n');
 
     const header = try std.json.parseFromSlice(std.json.Value, testing.allocator, lines.next().?, .{});
     defer header.deinit();

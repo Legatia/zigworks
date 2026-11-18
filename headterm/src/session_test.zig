@@ -5,6 +5,7 @@ const std = @import("std");
 const posix = std.posix;
 const testing = std.testing;
 const client = @import("client.zig");
+const sys = @import("sys.zig");
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -15,19 +16,19 @@ const gpa = std.heap.c_allocator;
 const SessionDir = struct {
     path_buf: [64]u8 = undefined,
     path: [:0]const u8 = "",
-    old_buf: [std.fs.max_path_bytes]u8 = undefined,
+    old_buf: [std.Io.Dir.max_path_bytes]u8 = undefined,
     old: ?[:0]const u8 = null,
 
     fn init(self: *SessionDir, tag: []const u8) !void {
-        self.path = try std.fmt.bufPrintZ(&self.path_buf, "/tmp/headterm-test-{d}-{s}", .{ std.c.getpid(), tag });
-        std.fs.makeDirAbsolute(self.path) catch |e| if (e != error.PathAlreadyExists) return e;
-        if (posix.getenv("XDG_RUNTIME_DIR")) |old| self.old = try std.fmt.bufPrintZ(&self.old_buf, "{s}", .{old});
+        self.path = try std.mem.printSentinel(&self.path_buf, "/tmp/headterm-test-{d}-{s}", .{ sys.getpid(), tag }, 0);
+        std.Io.Dir.createDirAbsolute(testing.io, self.path, .default_dir) catch |e| if (e != error.PathAlreadyExists) return e;
+        if (sys.getenv("XDG_RUNTIME_DIR")) |old| self.old = try std.mem.printSentinel(&self.old_buf, "{s}", .{old}, 0);
         _ = setenv("XDG_RUNTIME_DIR", self.path, 1);
     }
 
     fn deinit(self: *SessionDir) void {
         if (self.old) |old| _ = setenv("XDG_RUNTIME_DIR", old, 1) else _ = unsetenv("XDG_RUNTIME_DIR");
-        std.fs.deleteTreeAbsolute(self.path) catch {};
+        std.Io.Dir.cwd().deleteTree(testing.io, self.path) catch {};
     }
 };
 
@@ -47,6 +48,10 @@ fn call(name: []const u8, args: []const []const u8) !client.Response {
     return client.call(gpa, name, args);
 }
 
+fn sleepMs(ms: i64) !void {
+    try std.Io.sleep(testing.io, .fromMilliseconds(ms), .awake);
+}
+
 test "a client that hangs up before the reply does not take the session down" {
     var dir: SessionDir = .{};
     try dir.init("hangup");
@@ -54,7 +59,7 @@ test "a client that hangs up before the reply does not take the session down" {
     try start("hangup", &.{ "sleep", "30" }, .{});
     defer kill("hangup");
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const sock = try client.sessionSocket(&path_buf, "hangup");
     // macOS fails setsockopt with EINVAL on an accepted socket whose peer
     // has already closed; std.posix.setsockopt treated that as unreachable
@@ -68,9 +73,9 @@ test "a client that hangs up before the reply does not take the session down" {
     };
     for (requests) |args| {
         for (0..3) |_| {
-            const s = try client.connect(sock);
-            try client.sendRequest(gpa, s.handle, args);
-            s.close();
+            const fd = try client.connect(sock);
+            try client.sendRequest(gpa, fd, args);
+            sys.close(fd);
         }
     }
     const resp = try call("hangup", &.{"info"});
@@ -87,11 +92,11 @@ test "a session with a TTL ends after that long without requests or output" {
 
     const info = try call("ttl", &.{"info"});
     defer gpa.free(info.body);
-    try testing.expect(std.mem.indexOf(u8, info.body, "\"ttl_s\":1") != null);
+    try testing.expect(std.mem.find(u8, info.body, "\"ttl_s\":1") != null);
 
     // Every request counts as activity, so stay quiet for longer than the
     // TTL, then look once.
-    std.Thread.sleep(2200 * std.time.ns_per_ms);
+    try sleepMs(2200);
     try testing.expectError(error.NoSuchSession, call("ttl", &.{"info"}));
 }
 
@@ -106,22 +111,22 @@ test "each client has its own diff marker" {
     gpa.free(first.body);
     const b_first = try call("markers", &.{ "screen", "--diff", "--client", "b" });
     defer gpa.free(b_first.body);
-    try testing.expect(std.mem.indexOf(u8, b_first.body, "0|one") != null);
+    try testing.expect(std.mem.find(u8, b_first.body, "0|one") != null);
 
     const sent = try call("markers", &.{ "send", "<Enter>" });
     gpa.free(sent.body);
     const a_wait = try call("markers", &.{ "wait", "--text", "two", "--diff", "--client", "a" });
     defer gpa.free(a_wait.body);
-    try testing.expect(std.mem.indexOf(u8, a_wait.body, "2|two") != null);
-    try testing.expect(std.mem.indexOf(u8, a_wait.body, "0|one") == null);
+    try testing.expect(std.mem.find(u8, a_wait.body, "2|two") != null);
+    try testing.expect(std.mem.find(u8, a_wait.body, "0|one") == null);
 
     // Client a has seen "two"; client b has not, and still gets it.
     const b_diff = try call("markers", &.{ "screen", "--diff", "--client", "b" });
     defer gpa.free(b_diff.body);
-    try testing.expect(std.mem.indexOf(u8, b_diff.body, "2|two") != null);
+    try testing.expect(std.mem.find(u8, b_diff.body, "2|two") != null);
     const a_diff = try call("markers", &.{ "screen", "--diff", "--client", "a" });
     defer gpa.free(a_diff.body);
-    try testing.expect(std.mem.indexOf(u8, a_diff.body, "changed=0") != null);
+    try testing.expect(std.mem.find(u8, a_diff.body, "changed=0") != null);
 }
 
 test "settle after a send waits for the program to react to the keys" {
@@ -136,23 +141,23 @@ test "settle after a send waits for the program to react to the keys" {
     const ready = try call("settle", &.{ "wait", "--text", "ready" });
     gpa.free(ready.body);
     // The last output is now older than the settle time.
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    try sleepMs(300);
 
     const sent = try call("settle", &.{ "send", "a", "<Enter>" });
     gpa.free(sent.body);
     const after = try call("settle", &.{ "wait", "--settle", "100", "--timeout", "3000" });
     defer gpa.free(after.body);
     try testing.expectEqual(client.Status.ok, after.status);
-    try testing.expect(std.mem.indexOf(u8, after.body, "got-a") != null);
+    try testing.expect(std.mem.find(u8, after.body, "got-a") != null);
 
     // Keys the program doesn't answer: settle gives up after the grace
     // period instead of running into the timeout.
     const quiet = try call("settle", &.{ "send", "b", "<Enter>" });
     gpa.free(quiet.body);
-    const t0 = std.time.milliTimestamp();
+    const t0 = sys.milliTimestamp();
     const none = try call("settle", &.{ "wait", "--settle", "100", "--timeout", "5000" });
     defer gpa.free(none.body);
-    const took = std.time.milliTimestamp() - t0;
+    const took = sys.milliTimestamp() - t0;
     try testing.expectEqual(client.Status.ok, none.status);
     try testing.expect(took >= 300 and took < 2000);
 }
@@ -164,34 +169,34 @@ test "wait --exit gives up early when the program is reading keys" {
 
     try start("pw", &.{ "/bin/sh", "-c", "stty -echo; printf 'pw: '; read x; stty echo; echo got:$x" }, .{ .cols = 40, .rows = 5 });
     defer kill("pw");
-    var t0 = std.time.milliTimestamp();
+    var t0 = sys.milliTimestamp();
     const first = try call("pw", &.{ "wait", "--exit", "--timeout", "9000" });
     defer gpa.free(first.body);
     try testing.expectEqual(client.Status.timeout, first.status);
-    try testing.expect(std.time.milliTimestamp() - t0 < 6000);
-    try testing.expect(std.mem.indexOf(u8, first.body, "wait=failed(awaiting-input)") != null);
-    try testing.expect(std.mem.indexOf(u8, first.body, "echo is off, so it is probably waiting for input") != null);
+    try testing.expect(sys.milliTimestamp() - t0 < 6000);
+    try testing.expect(std.mem.find(u8, first.body, "wait=failed(awaiting-input)") != null);
+    try testing.expect(std.mem.find(u8, first.body, "echo is off, so it is probably waiting for input") != null);
 
     // Once per send: a second wait runs to its timeout.
     const second = try call("pw", &.{ "wait", "--exit", "--timeout", "2600" });
     defer gpa.free(second.body);
-    try testing.expect(std.mem.indexOf(u8, second.body, "wait=failed(timeout)") != null);
+    try testing.expect(std.mem.find(u8, second.body, "wait=failed(timeout)") != null);
 
     const sent = try call("pw", &.{ "send", "s3cret", "<Enter>" });
     gpa.free(sent.body);
     const done = try call("pw", &.{ "wait", "--exit", "--timeout", "5000" });
     defer gpa.free(done.body);
     try testing.expectEqual(client.Status.ok, done.status);
-    try testing.expect(std.mem.indexOf(u8, done.body, "got:s3cret") != null);
+    try testing.expect(std.mem.find(u8, done.body, "got:s3cret") != null);
 
     // A line prompt with echo looks like any quiet program: no early stop.
     try start("line", &.{ "/bin/sh", "-c", "printf 'name: '; read x" }, .{ .cols = 40, .rows = 5 });
     defer kill("line");
-    t0 = std.time.milliTimestamp();
+    t0 = sys.milliTimestamp();
     const line = try call("line", &.{ "wait", "--exit", "--timeout", "2600" });
     defer gpa.free(line.body);
-    try testing.expect(std.mem.indexOf(u8, line.body, "wait=failed(timeout)") != null);
-    try testing.expect(std.time.milliTimestamp() - t0 >= 2500);
+    try testing.expect(std.mem.find(u8, line.body, "wait=failed(timeout)") != null);
+    try testing.expect(sys.milliTimestamp() - t0 >= 2500);
 }
 
 test "wait --idle ignores a blinking cursor but not other output" {
@@ -206,7 +211,7 @@ test "wait --idle ignores a blinking cursor but not other output" {
     const idle = try call("blink", &.{ "wait", "--idle", "500", "--timeout", "4000" });
     defer gpa.free(idle.body);
     try testing.expectEqual(client.Status.ok, idle.status);
-    try testing.expect(std.mem.indexOf(u8, idle.body, "name:") != null);
+    try testing.expect(std.mem.find(u8, idle.body, "name:") != null);
 
     // A cell going through four colors: the text stays the same, but no
     // screen is the one before the last.
@@ -240,9 +245,9 @@ test "start --record writes a valid asciicast v2 file" {
     gpa.free(waited.body);
     kill("rec"); // closes the recording
 
-    const data = try std.fs.cwd().readFileAlloc(gpa, cast, 1 << 20);
+    const data = try std.Io.Dir.cwd().readFileAlloc(testing.io, cast, gpa, .limited(1 << 20));
     defer gpa.free(data);
-    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, data, "\n"), '\n');
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, data, "\n"), '\n');
     const header = try std.json.parseFromSlice(std.json.Value, gpa, lines.next().?, .{});
     defer header.deinit();
     try testing.expectEqual(@as(i64, 2), header.value.object.get("version").?.integer);
@@ -265,5 +270,5 @@ test "start --record writes a valid asciicast v2 file" {
         }
     }
     try testing.expect(input_seen);
-    try testing.expect(std.mem.indexOf(u8, output.items, "got:hi") != null);
+    try testing.expect(std.mem.find(u8, output.items, "got:hi") != null);
 }
