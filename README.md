@@ -18,7 +18,7 @@ Download a binary for Linux (x86_64, arm64) or macOS (Apple Silicon; headsight o
 
 ## Building
 
-Zig 0.15.1:
+Zig 0.17.1:
 
 ```sh
 cd trigrep && zig build -Doptimize=ReleaseFast && zig build test

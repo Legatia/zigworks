@@ -21,7 +21,8 @@ jobs:
         include:
           - { os: ubuntu-latest, target: x86_64-linux-musl, name: x86_64-linux }
           - { os: ubuntu-latest, target: aarch64-linux-musl, name: aarch64-linux }
-          # Zig 0.15.1 can't link against the macOS 26 SDK on macos-latest; macos-15 works.
+          # macos-15: Zig 0.15.1 couldn't link against the macOS 26 SDK on macos-latest.
+          # Not tried again with Zig 0.17.1.
           # Native build: an explicit -Dtarget would make Zig treat it as a cross
           # build and not find the SDK frameworks trigrep links (CoreServices).
           # -Dcpu=apple_m1 keeps the binary runnable on every Apple Silicon Mac.
@@ -33,7 +34,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.15.1
+          version: 0.17.1
       - name: Build
         shell: bash
         run: |
