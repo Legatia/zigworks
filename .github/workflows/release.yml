@@ -4,10 +4,11 @@ name: Release
 # Builds static Linux binaries (x86_64, arm64) and an Apple Silicon macOS binary, and
 # attaches them to a GitHub release for that tag. headsight's Linux binaries
 # capture the camera only (V4L2); the screen, windows and text need macOS.
-# headsound also gets a Windows x86_64 binary (a zip).
+# headsound and llmcheck also get a Windows x86_64 binary (a zip); llmcheck's
+# packages also hold its stand-in server, llmcheck-fake.
 on:
   push:
-    tags: ["trigrep-v*", "headterm-v*", "headsight-v*", "headsound-v*"]
+    tags: ["trigrep-v*", "headterm-v*", "headsight-v*", "headsound-v*", "llmcheck-v*"]
 
 permissions:
   contents: read
@@ -25,7 +26,7 @@ jobs:
           # build and not find the SDK frameworks trigrep links (CoreServices).
           # -Dcpu=apple_m1 keeps the binary runnable on every Apple Silicon Mac.
           - { os: macos-15, target: native, name: aarch64-macos }
-          # headsound only (other projects skip it below)
+          # headsound and llmcheck only (other projects skip it below)
           - { os: windows-latest, target: x86_64-windows-gnu, name: x86_64-windows }
     runs-on: ${{ matrix.os }}
     steps:
@@ -38,8 +39,8 @@ jobs:
         run: |
           project="${GITHUB_REF_NAME%%-v*}"
           version="${GITHUB_REF_NAME#*-v}"
-          case "$project" in trigrep|headterm|headsight|headsound) ;; *) echo "unknown project in tag: $project"; exit 1 ;; esac
-          if [ "${{ matrix.name }}" = x86_64-windows ] && [ "$project" != headsound ]; then
+          case "$project" in trigrep|headterm|headsight|headsound|llmcheck) ;; *) echo "unknown project in tag: $project"; exit 1 ;; esac
+          if [ "${{ matrix.name }}" = x86_64-windows ] && [ "$project" != headsound ] && [ "$project" != llmcheck ]; then
             echo "SKIP=1" >> "$GITHUB_ENV"; exit 0
           fi
           echo "PKG_DIR=$project" >> "$GITHUB_ENV"
@@ -53,6 +54,7 @@ jobs:
           mkdir "$pkg"
           if [ "${{ matrix.name }}" = x86_64-windows ]; then
             cp out/bin/"$project".exe README.md LICENSE "$pkg"/
+            if [ "$project" = llmcheck ]; then cp out/bin/llmcheck-fake.exe "$pkg"/; fi
             7z a "$pkg.zip" "$pkg" > /dev/null
             sha256sum "$pkg.zip" > "$pkg.zip.sha256"
             exit 0
@@ -61,6 +63,7 @@ jobs:
             file out/bin/"$project" | grep -q "statically linked" || { echo "not static: $(file out/bin/$project)"; exit 1; }
           fi
           cp out/bin/"$project" README.md LICENSE "$pkg"/
+          if [ "$project" = llmcheck ]; then cp out/bin/llmcheck-fake "$pkg"/; fi
           tar czf "$pkg.tar.gz" "$pkg"
           shasum -a 256 "$pkg.tar.gz" > "$pkg.tar.gz.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
