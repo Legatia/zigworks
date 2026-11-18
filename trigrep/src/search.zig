@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const regex = @import("regex.zig");
 const query = @import("query.zig");
 const index = @import("index.zig");
@@ -75,8 +76,8 @@ pub fn countNewlines(s: []const u8) usize {
 }
 
 fn findLiteral(hay: []const u8, start: usize, lit: query.Literal) ?usize {
-    if (lit.ignore_case) return std.ascii.indexOfIgnoreCasePos(hay, start, lit.bytes);
-    return std.mem.indexOfPos(u8, hay, start, lit.bytes);
+    if (lit.ignore_case) return std.ascii.findIgnoreCasePos(hay, start, lit.bytes);
+    return std.mem.findPos(u8, hay, start, lit.bytes);
 }
 
 /// Earliest occurrence of any of several literals, remembering each one's next hit so a
@@ -84,7 +85,7 @@ fn findLiteral(hay: []const u8, start: usize, lit: query.Literal) ?usize {
 const MultiFinder = struct {
     lits: []const query.Literal,
     next: [max]?usize = undefined,
-    valid: [max]bool = [_]bool{false} ** max,
+    valid: [max]bool = @splat(false),
 
     const max = 16;
 
@@ -113,6 +114,7 @@ pub const Found = struct {
 /// Searches one file's contents. Appends output to `out`.
 pub fn searchBuffer(
     gpa: Allocator,
+    io: Io,
     m: *regex.Matcher,
     cfg: Config,
     data: []const u8,
@@ -135,7 +137,7 @@ pub fn searchBuffer(
     const one_pass = !prefiltered and m.canScan();
     const with_context = cfg.mode == .lines and cfg.context.active() and !cfg.only_matching;
     var ctx = ContextState{ .n = cfg.context.before };
-    var pr = Printer{ .gpa = gpa, .out = out, .cfg = cfg, .display = display, .data = data, .m = m, .t0 = std.time.nanoTimestamp(), .out_start = out.items.len };
+    var pr = Printer{ .gpa = gpa, .out = out, .cfg = cfg, .display = display, .data = data, .m = m, .io = io, .t0 = nowNs(io), .out_start = out.items.len };
 
     while (pos <= data.len and matches < limit) {
         var line_start = pos;
@@ -143,14 +145,14 @@ pub fn searchBuffer(
         if (one_pass) {
             // No literal worth jumping to: let the DFA find the next matching line.
             line_start = m.nextMatchingLine(data, pos) orelse break;
-            line_end = std.mem.indexOfScalarPos(u8, data, line_start, '\n') orelse data.len;
+            line_end = std.mem.findScalarPos(u8, data, line_start, '\n') orelse data.len;
         } else if (prefiltered) {
             const hit = (if (cfg.plan.required) |lit| findLiteral(data, pos, lit) else multi.?.find(data, pos)) orelse break;
-            if (std.mem.lastIndexOfScalar(u8, data[pos..hit], '\n')) |nl| line_start = pos + nl + 1;
-            line_end = std.mem.indexOfScalarPos(u8, data, hit, '\n') orelse data.len;
+            if (std.mem.findScalarLast(u8, data[pos..hit], '\n')) |nl| line_start = pos + nl + 1;
+            line_end = std.mem.findScalarPos(u8, data, hit, '\n') orelse data.len;
         } else {
             if (pos == data.len and (data.len == 0 or data[data.len - 1] == '\n')) break;
-            line_end = std.mem.indexOfScalarPos(u8, data, pos, '\n') orelse data.len;
+            line_end = std.mem.findScalarPos(u8, data, pos, '\n') orelse data.len;
         }
         const line = data[line_start..line_end];
         if (one_pass or (prefiltered and cfg.plan.pure_literal) or m.isMatch(line)) {
@@ -168,7 +170,7 @@ pub fn searchBuffer(
                     var p = line_end + 1;
                     var no = line_no + 1;
                     while (left > 0 and p < data.len and matches < limit) : (no += 1) {
-                        const e = std.mem.indexOfScalarPos(u8, data, p, '\n') orelse data.len;
+                        const e = std.mem.findScalarPos(u8, data, p, '\n') orelse data.len;
                         if (m.isMatch(data[p..e])) {
                             matches += 1;
                             try pr.matchLine(no, p, e);
@@ -232,6 +234,11 @@ fn writeJsonData(gpa: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
     try out.append(gpa, '}');
 }
 
+/// Nanoseconds on a monotonic clock; only differences are meaningful.
+fn nowNs(io: Io) i128 {
+    return Io.Timestamp.now(io, .awake).nanoseconds;
+}
+
 fn writeElapsed(gpa: Allocator, out: *std.ArrayList(u8), ns: i128) !void {
     const n: u64 = @intCast(@max(ns, 0));
     try out.print(gpa, "{{\"secs\":{d},\"nanos\":{d},\"human\":\"{d:.6}s\"}}", .{ n / std.time.ns_per_s, n % std.time.ns_per_s, @as(f64, @floatFromInt(n)) / 1e9 });
@@ -246,6 +253,7 @@ const Printer = struct {
     display: []const u8,
     data: []const u8,
     m: *regex.Matcher,
+    io: Io,
     t0: i128,
     out_start: usize,
     began: bool = false,
@@ -327,7 +335,7 @@ const Printer = struct {
         try p.out.appendSlice(p.gpa, "{\"type\":\"end\",\"data\":{\"path\":");
         try writeJsonData(p.gpa, p.out, p.display);
         try p.out.appendSlice(p.gpa, ",\"binary_offset\":null,\"stats\":{\"elapsed\":");
-        try writeElapsed(p.gpa, p.out, std.time.nanoTimestamp() - p.t0);
+        try writeElapsed(p.gpa, p.out, nowNs(p.io) - p.t0);
         try p.out.print(p.gpa, ",\"searches\":1,\"searches_with_match\":1,\"bytes_searched\":{d},\"bytes_printed\":{d},\"matched_lines\":{d},\"matches\":{d}}}}}}}\n", .{ p.data.len, printed, matched_lines, p.submatches });
     }
 };
@@ -353,7 +361,7 @@ const ContextState = struct {
         var first = start;
         var count: usize = 0;
         while (count < c.n and first > 0 and first > c.end) {
-            const prev = if (std.mem.lastIndexOfScalar(u8, data[0 .. first - 1], '\n')) |nl| nl + 1 else 0;
+            const prev = if (std.mem.findScalarLast(u8, data[0 .. first - 1], '\n')) |nl| nl + 1 else 0;
             if (prev < c.end) break;
             first = prev;
             count += 1;
@@ -363,7 +371,7 @@ const ContextState = struct {
         var p = first;
         var k = first_no;
         while (p < start) : (k += 1) {
-            const e = std.mem.indexOfScalarPos(u8, data, p, '\n').?;
+            const e = std.mem.findScalarPos(u8, data, p, '\n').?;
             try pr.contextLine(k, p, e);
             p = e + 1;
         }
@@ -373,16 +381,17 @@ const ContextState = struct {
 const Result = struct { out: std.ArrayList(u8) = .empty, matches: usize = 0, submatches: usize = 0, bytes: u64 = 0, scanned: bool = false };
 
 const Shared = struct {
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: Io.Mutex = .init,
+    cond: Io.Condition = .init,
     stop: std.atomic.Value(bool) = .init(false),
     failed: ?anyerror = null,
 };
 
 const Worker = struct {
     gpa: Allocator,
+    io: Io,
     cfg: Config,
-    root: std.fs.Dir,
+    root: Io.Dir,
     jobs: []const Job,
     results: []Result,
     done: []std.atomic.Value(bool),
@@ -392,34 +401,35 @@ const Worker = struct {
     buf: std.ArrayList(u8) = .empty,
 
     fn run(w: *Worker) void {
+        const io = w.io;
         while (!w.shared.stop.load(.monotonic)) {
             const i = w.next.fetchAdd(1, .monotonic);
             if (i >= w.jobs.len) break;
             w.scan(i) catch |err| if (err == error.OutOfMemory) {
-                w.shared.mutex.lock();
+                w.shared.mutex.lockUncancelable(io);
                 w.shared.failed = err;
-                w.shared.mutex.unlock();
+                w.shared.mutex.unlock(io);
             };
             w.done[i].store(true, .release);
-            w.shared.mutex.lock();
-            w.shared.cond.broadcast();
-            w.shared.mutex.unlock();
+            w.shared.mutex.lockUncancelable(io);
+            w.shared.cond.broadcast(io);
+            w.shared.mutex.unlock(io);
         }
     }
 
     fn scan(w: *Worker, i: usize) !void {
         const job = w.jobs[i];
         const r = &w.results[i];
-        var f = try w.root.openFile(job.path, .{});
-        defer f.close();
-        const size = (try f.stat()).size;
+        const f = try w.root.openFile(w.io, job.path, .{});
+        defer f.close(w.io);
+        const size = (try f.stat(w.io)).size;
         try w.buf.resize(w.gpa, @intCast(size));
-        const n = try f.readAll(w.buf.items);
+        const n = try f.readPositionalAll(w.io, w.buf.items, 0);
         const data = w.buf.items[0..n];
         if (index.isBinary(data)) return;
         r.scanned = true;
         r.bytes = n;
-        const found = try searchBuffer(w.gpa, &w.matcher, w.cfg, data, job.display, &r.out);
+        const found = try searchBuffer(w.gpa, w.io, &w.matcher, w.cfg, data, job.display, &r.out);
         r.matches = found.lines;
         r.submatches = found.matches;
     }
@@ -427,17 +437,17 @@ const Worker = struct {
 
 /// Scans `jobs` with `threads` workers and writes their output, in job order, to `out`,
 /// stopping after `limit` output lines.
-pub fn run(gpa: Allocator, root: std.fs.Dir, jobs: []const Job, cfg: Config, threads: usize, limit: ?usize, out: *std.Io.Writer) !Totals {
-    const t0 = std.time.nanoTimestamp();
-    const totals = try runJobs(gpa, root, jobs, cfg, threads, limit, out);
+pub fn run(gpa: Allocator, io: Io, root: Io.Dir, jobs: []const Job, cfg: Config, threads: usize, limit: ?usize, out: *Io.Writer) !Totals {
+    const t0 = nowNs(io);
+    const totals = try runJobs(gpa, io, root, jobs, cfg, threads, limit, out);
     if (cfg.format == .json and cfg.mode == .lines) {
         // ripgrep ends --json output with a summary record, matches or not.
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(gpa);
         try buf.appendSlice(gpa, "{\"data\":{\"elapsed_total\":");
-        try writeElapsed(gpa, &buf, std.time.nanoTimestamp() - t0);
+        try writeElapsed(gpa, &buf, nowNs(io) - t0);
         try buf.print(gpa, ",\"stats\":{{\"bytes_printed\":{d},\"bytes_searched\":{d},\"elapsed\":", .{ totals.bytes_printed, totals.bytes_scanned });
-        try writeElapsed(gpa, &buf, std.time.nanoTimestamp() - t0);
+        try writeElapsed(gpa, &buf, nowNs(io) - t0);
         try buf.print(gpa, ",\"matched_lines\":{d},\"matches\":{d},\"searches\":{d},\"searches_with_match\":{d}}}}},\"type\":\"summary\"}}\n", .{ totals.lines_matched, totals.matches, totals.files_scanned, totals.files_matched });
         try out.writeAll(buf.items);
     }
@@ -446,7 +456,7 @@ pub fn run(gpa: Allocator, root: std.fs.Dir, jobs: []const Job, cfg: Config, thr
 
 /// Workers take files in any order and run ahead; this thread prints each file's
 /// output, in job order, as soon as it's ready.
-fn runJobs(gpa: Allocator, root: std.fs.Dir, jobs: []const Job, cfg: Config, threads: usize, limit: ?usize, out: *std.Io.Writer) !Totals {
+fn runJobs(gpa: Allocator, io: Io, root: Io.Dir, jobs: []const Job, cfg: Config, threads: usize, limit: ?usize, out: *Io.Writer) !Totals {
     var totals = Totals{};
     if (jobs.len == 0) return totals;
     const n_threads = @max(1, @min(threads, jobs.len));
@@ -470,6 +480,7 @@ fn runJobs(gpa: Allocator, root: std.fs.Dir, jobs: []const Job, cfg: Config, thr
     for (workers) |*w| {
         w.* = .{
             .gpa = gpa,
+            .io = io,
             .cfg = cfg,
             .root = root,
             .jobs = jobs,
@@ -502,9 +513,9 @@ fn runJobs(gpa: Allocator, root: std.fs.Dir, jobs: []const Job, cfg: Config, thr
     const max_lines = limit orelse std.math.maxInt(usize);
     while (printed < jobs.len) : (printed += 1) {
         if (!done[printed].load(.acquire)) {
-            shared.mutex.lock();
-            while (!done[printed].load(.acquire)) shared.cond.wait(&shared.mutex);
-            shared.mutex.unlock();
+            shared.mutex.lockUncancelable(io);
+            while (!done[printed].load(.acquire)) shared.cond.waitUncancelable(io, &shared.mutex);
+            shared.mutex.unlock(io);
         }
         if (shared.failed) |err| return err;
         const r = &results[printed];
@@ -520,7 +531,7 @@ fn runJobs(gpa: Allocator, root: std.fs.Dir, jobs: []const Job, cfg: Config, thr
         const lines = countNewlines(text);
         if (lines > room) {
             var cut: usize = 0;
-            for (0..room) |_| cut = std.mem.indexOfScalarPos(u8, text, cut, '\n').? + 1;
+            for (0..room) |_| cut = std.mem.findScalarPos(u8, text, cut, '\n').? + 1;
             text = text[0..cut];
             totals.truncated = true;
         }
@@ -549,7 +560,7 @@ fn runSearch(pattern: []const u8, opts: regex.Options, mode: Mode, data: []const
     var m = try regex.Matcher.init(gpa, &prog);
     defer m.deinit(gpa);
     var out: std.ArrayList(u8) = .empty;
-    _ = try searchBuffer(gpa, &m, .{ .prog = &prog, .plan = p, .mode = mode }, data, "f", &out);
+    _ = try searchBuffer(gpa, std.testing.io, &m, .{ .prog = &prog, .plan = p, .mode = mode }, data, "f", &out);
     return out.toOwnedSlice(gpa);
 }
 
@@ -587,7 +598,7 @@ fn runContext(pattern: []const u8, before: usize, after: usize, data: []const u8
     var m = try regex.Matcher.init(gpa, &prog);
     defer m.deinit(gpa);
     var out: std.ArrayList(u8) = .empty;
-    _ = try searchBuffer(gpa, &m, .{ .prog = &prog, .plan = p, .context = .{ .before = before, .after = after } }, data, "f", &out);
+    _ = try searchBuffer(gpa, std.testing.io, &m, .{ .prog = &prog, .plan = p, .context = .{ .before = before, .after = after } }, data, "f", &out);
     return out.toOwnedSlice(gpa);
 }
 
@@ -621,7 +632,7 @@ fn runWith(pattern: []const u8, cfg_in: Config, data: []const u8) ![]u8 {
     var m = try regex.Matcher.init(gpa, &prog);
     defer m.deinit(gpa);
     var out: std.ArrayList(u8) = .empty;
-    _ = try searchBuffer(gpa, &m, cfg, data, "j.txt", &out);
+    _ = try searchBuffer(gpa, std.testing.io, &m, cfg, data, "j.txt", &out);
     return out.toOwnedSlice(gpa);
 }
 
@@ -636,14 +647,14 @@ test "json records match ripgrep's shape" {
     const gpa = std.testing.allocator;
     const a = try runWith("fo+", .{ .prog = undefined, .plan = undefined, .format = .json }, "one foo two foo\nbar\nfoofoo\n");
     defer gpa.free(a);
-    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, a, "\n"), '\n');
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, a, "\n"), '\n');
     try std.testing.expectEqualStrings("{\"type\":\"begin\",\"data\":{\"path\":{\"text\":\"j.txt\"}}}", lines.next().?);
     try std.testing.expectEqualStrings("{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"j.txt\"},\"lines\":{\"text\":\"one foo two foo\\n\"},\"line_number\":1,\"absolute_offset\":0,\"submatches\":[{\"match\":{\"text\":\"foo\"},\"start\":4,\"end\":7},{\"match\":{\"text\":\"foo\"},\"start\":12,\"end\":15}]}}", lines.next().?);
     try std.testing.expectEqualStrings("{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"j.txt\"},\"lines\":{\"text\":\"foofoo\\n\"},\"line_number\":3,\"absolute_offset\":20,\"submatches\":[{\"match\":{\"text\":\"foo\"},\"start\":0,\"end\":3},{\"match\":{\"text\":\"foo\"},\"start\":3,\"end\":6}]}}", lines.next().?);
     const end = lines.next().?;
     try std.testing.expect(std.mem.startsWith(u8, end, "{\"type\":\"end\",\"data\":{\"path\":{\"text\":\"j.txt\"},\"binary_offset\":null,\"stats\":{\"elapsed\":"));
     try std.testing.expect(std.mem.endsWith(u8, end, "\"matched_lines\":2,\"matches\":4}}}"));
-    var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, a, "\n"), '\n');
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, a, "\n"), '\n');
     while (it.next()) |l| {
         const parsed = try std.json.parseFromSlice(std.json.Value, gpa, l, .{});
         parsed.deinit();
@@ -654,8 +665,8 @@ test "json escapes and non-UTF-8 bytes" {
     const gpa = std.testing.allocator;
     const a = try runWith("x", .{ .prog = undefined, .plan = undefined, .format = .json }, "\"x\"\t\\\n\xffx\n");
     defer gpa.free(a);
-    try std.testing.expect(std.mem.indexOf(u8, a, "{\"text\":\"\\\"x\\\"\\t\\\\\\n\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a, "{\"bytes\":\"/3gK\"}") != null);
+    try std.testing.expect(std.mem.find(u8, a, "{\"text\":\"\\\"x\\\"\\t\\\\\\n\"}") != null);
+    try std.testing.expect(std.mem.find(u8, a, "{\"bytes\":\"/3gK\"}") != null);
 }
 
 test "count and files-with-matches" {
@@ -678,6 +689,6 @@ test "a match on the first line and the last unterminated line" {
 test "countNewlines" {
     try std.testing.expectEqual(@as(usize, 0), countNewlines(""));
     try std.testing.expectEqual(@as(usize, 3), countNewlines("a\nb\nc\n"));
-    const long = "\n" ** 100;
-    try std.testing.expectEqual(@as(usize, 100), countNewlines(long));
+    const long: [100]u8 = @splat('\n');
+    try std.testing.expectEqual(@as(usize, 100), countNewlines(&long));
 }

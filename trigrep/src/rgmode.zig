@@ -12,6 +12,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const Environ = std.process.Environ;
 const engine = @import("engine.zig");
 const index = @import("index.zig");
 const search = @import("search.zig");
@@ -51,7 +53,7 @@ fn parse(arena: Allocator, args: []const []const u8) !?Parsed {
         var name = a;
         var inline_value: ?[]const u8 = null;
         if (std.mem.startsWith(u8, a, "--")) {
-            if (std.mem.indexOfScalar(u8, a, '=')) |eq| {
+            if (std.mem.findScalar(u8, a, '=')) |eq| {
                 name = a[0..eq];
                 inline_value = a[eq + 1 ..];
             }
@@ -133,126 +135,141 @@ fn parse(arena: Allocator, args: []const []const u8) !?Parsed {
 }
 
 /// The real ripgrep: $TRIGREP_REAL_RG, or the first `rg` on PATH that isn't us.
-pub fn realRg(arena: Allocator) ?[]const u8 {
-    if (std.posix.getenv("TRIGREP_REAL_RG")) |p| return p;
-    const self = std.fs.selfExePathAlloc(arena) catch return null;
-    const self_real = std.fs.cwd().realpathAlloc(arena, self) catch self;
-    const path = std.posix.getenv("PATH") orelse return null;
+pub fn realRg(arena: Allocator, io: Io, env: Environ) ?[]const u8 {
+    if (env.getPosix("TRIGREP_REAL_RG")) |p| return p;
+    const cwd = Io.Dir.cwd();
+    const self: []const u8 = std.process.executablePathAlloc(io, arena) catch return null;
+    const self_real: []const u8 = cwd.realPathFileAlloc(io, self, arena) catch self;
+    const path = env.getPosix("PATH") orelse return null;
     var it = std.mem.tokenizeScalar(u8, path, ':');
     while (it.next()) |dir| {
         const cand = std.fs.path.join(arena, &.{ dir, "rg" }) catch continue;
-        const real = std.fs.cwd().realpathAlloc(arena, cand) catch continue;
+        const real: []const u8 = cwd.realPathFileAlloc(io, cand, arena) catch continue;
         if (std.mem.eql(u8, real, self_real)) continue;
         if (std.mem.eql(u8, std.fs.path.basename(real), "trigrep")) continue;
-        std.posix.access(real, std.posix.X_OK) catch continue;
+        cwd.access(io, real, .{ .execute = true }) catch continue;
         return real;
     }
     return null;
 }
 
-fn passthrough(arena: Allocator, argv: []const []const u8) noreturn {
-    const rg = realRg(arena) orelse {
+fn passthrough(arena: Allocator, io: Io, env: Environ, argv: []const []const u8) noreturn {
+    const rg = realRg(arena, io, env) orelse {
         std.debug.print("rg (trigrep): no real ripgrep found on PATH; set TRIGREP_REAL_RG\n", .{});
         std.process.exit(2);
     };
     var full = arena.alloc([]const u8, argv.len) catch std.process.exit(2);
     full[0] = rg;
     @memcpy(full[1..], argv[1..]);
-    const err = std.process.execv(arena, full);
+    const err = std.process.replace(io, .{ .argv = full });
     std.debug.print("rg (trigrep): can't run {s}: {s}\n", .{ rg, @errorName(err) });
     std.process.exit(2);
 }
 
 /// Runs real rg as a child (output goes straight through) and returns its exit
 /// code and how long it took.
-fn timedRg(gpa: Allocator, arena: Allocator, argv: []const []const u8) !struct { code: u8, ms: i64 } {
-    const rg = realRg(arena) orelse return error.NoRealRg;
+fn timedRg(arena: Allocator, io: Io, env: Environ, argv: []const []const u8) !struct { code: u8, ms: i64 } {
+    const rg = realRg(arena, io, env) orelse return error.NoRealRg;
     var full = try arena.alloc([]const u8, argv.len);
     full[0] = rg;
     @memcpy(full[1..], argv[1..]);
-    const t0 = std.time.milliTimestamp();
-    var child = std.process.Child.init(full, gpa);
-    const term = try child.spawnAndWait();
+    const t0 = Io.Timestamp.now(io, .awake);
+    var child = try std.process.spawn(io, .{ .argv = full });
+    const term = try child.wait(io);
     const code: u8 = switch (term) {
-        .Exited => |c| c,
+        .exited => |c| c,
         else => 2,
     };
-    return .{ .code = code, .ms = std.time.milliTimestamp() - t0 };
+    return .{ .code = code, .ms = t0.untilNow(io, .awake).toMilliseconds() };
 }
 
 /// Starts `trigrep __bg-index ROOT LOCK` detached, unless a build is already running.
-fn startBackgroundIndex(gpa: Allocator, arena: Allocator, root: []const u8) void {
-    const idx = index.pathFor(arena, root) catch return;
-    if (std.fs.path.dirname(idx)) |d| std.fs.cwd().makePath(d) catch return;
+fn startBackgroundIndex(arena: Allocator, io: Io, env: Environ, root: []const u8) void {
+    const cwd = Io.Dir.cwd();
+    const idx = index.pathFor(arena, env, root) catch return;
+    if (std.fs.path.dirname(idx)) |d| cwd.createDirPath(io, d) catch return;
     const lock = std.fmt.allocPrint(arena, "{s}.building", .{idx}) catch return;
-    if (std.fs.cwd().statFile(lock)) |st| {
+    if (cwd.statFile(io, lock, .{})) |st| {
         // A build that started under 30 minutes ago is still running (or crashed recently).
-        if (std.time.nanoTimestamp() - st.mtime < 30 * 60 * std.time.ns_per_s) return;
+        if (age(io, st) < 30 * 60 * std.time.ns_per_s) return;
     } else |_| {}
-    const f = std.fs.cwd().createFile(lock, .{}) catch return;
-    f.close();
-    const self = std.fs.selfExePathAlloc(arena) catch return;
-    var child = std.process.Child.init(&.{ self, "__bg-index", root, lock }, gpa);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.pgid = 0; // own process group: not killed with the caller's
-    child.spawn() catch {
-        std.fs.cwd().deleteFile(lock) catch {};
+    const f = cwd.createFile(io, lock, .{}) catch return;
+    f.close(io);
+    const self = std.process.executablePathAlloc(io, arena) catch return;
+    spawnDetached(io, &.{ self, "__bg-index", root, lock }) catch {
+        cwd.deleteFile(io, lock) catch {};
         return;
     };
 }
 
+/// Nanoseconds since the file was last modified.
+fn age(io: Io, st: Io.File.Stat) i128 {
+    return Io.Timestamp.now(io, .real).nanoseconds - st.mtime.nanoseconds;
+}
+
+/// Starts `argv` without waiting for it: no stdio, and its own process group, so
+/// it isn't killed with the caller's.
+fn spawnDetached(io: Io, argv: []const []const u8) !void {
+    _ = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+}
+
 /// Starts `trigrep watch --idle-exit 30 ROOT` detached if nothing answers on its socket.
-fn ensureDaemon(gpa: Allocator, arena: Allocator, root: []const u8, index_path: []const u8) void {
+fn ensureDaemon(arena: Allocator, io: Io, root: []const u8, index_path: []const u8) void {
     const watch = @import("watch.zig");
+    const cwd = Io.Dir.cwd();
     const sock = watch.socketPath(arena, index_path) catch return;
-    if (std.net.connectUnixSocket(sock)) |stream| {
-        stream.close();
+    if (connectUnix(io, sock)) |stream| {
+        stream.close(io);
         return; // already running
     } else |_| {}
     // Don't start a second one while the first is still starting up.
     const lock = std.fmt.allocPrint(arena, "{s}.starting", .{sock}) catch return;
-    watch.ensureSocketDir(sock) catch return;
-    if (std.fs.cwd().statFile(lock)) |st| {
-        if (std.time.nanoTimestamp() - st.mtime < 60 * std.time.ns_per_s) return;
+    watch.ensureSocketDir(io, sock) catch return;
+    if (cwd.statFile(io, lock, .{})) |st| {
+        if (age(io, st) < 60 * std.time.ns_per_s) return;
     } else |_| {}
-    const f = std.fs.cwd().createFile(lock, .{}) catch return;
-    f.close();
-    const self = std.fs.selfExePathAlloc(arena) catch return;
-    var child = std.process.Child.init(&.{ self, "watch", "--idle-exit", "30", root }, gpa);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.pgid = 0;
-    child.spawn() catch {};
+    const f = cwd.createFile(io, lock, .{}) catch return;
+    f.close(io);
+    const self = std.process.executablePathAlloc(io, arena) catch return;
+    spawnDetached(io, &.{ self, "watch", "--idle-exit", "30", root }) catch {};
+}
+
+fn connectUnix(io: Io, sock: []const u8) !Io.net.Stream {
+    const addr = try @import("watch.zig").unixAddress(sock);
+    return addr.connect(io);
 }
 
 extern "c" fn nice(inc: c_int) c_int;
 
 /// `trigrep __bg-index ROOT LOCK`: build the index at low priority, remove the
 /// lock, then drop indexes of repositories that have been deleted.
-pub fn backgroundIndex(gpa: Allocator, arena: Allocator, root: []const u8, lock: []const u8) void {
+pub fn backgroundIndex(gpa: Allocator, arena: Allocator, io: Io, env: Environ, root: []const u8, lock: []const u8) void {
     _ = nice(10);
     {
-        defer std.fs.cwd().deleteFile(lock) catch {};
-        _ = engine.buildIndex(gpa, arena, root, null) catch return;
+        defer Io.Dir.cwd().deleteFile(io, lock) catch {};
+        _ = engine.buildIndex(gpa, arena, io, env, root, null) catch return;
     }
-    const dir = index.cacheDir(arena) catch return;
-    _ = index.prune(arena, dir, null) catch {};
+    const dir = index.cacheDir(arena, env) catch return;
+    _ = index.prune(arena, io, dir, null) catch {};
 }
 
 /// The directory to index after a slow search under `target`: the enclosing
 /// git repository. Null outside a repository, and when the repository is the
 /// home directory or above it (dotfiles kept in git), where an index would
 /// take in everything the user owns. `trigrep index` still works anywhere.
-fn autoIndexRoot(arena: Allocator, target: []const u8) !?[]const u8 {
-    if (std.posix.getenv("TRIGREP_RG_AUTO_INDEX")) |v| {
+fn autoIndexRoot(arena: Allocator, io: Io, env: Environ, target: []const u8) !?[]const u8 {
+    if (env.getPosix("TRIGREP_RG_AUTO_INDEX")) |v| {
         if (std.mem.eql(u8, v, "0")) return null;
     }
-    const root = (try engine.gitRoot(arena, target)) orelse return null;
-    if (std.posix.getenv("HOME")) |home| {
-        const real = std.fs.cwd().realpathAlloc(arena, home) catch home;
+    const root = (try engine.gitRoot(arena, io, target)) orelse return null;
+    if (env.getPosix("HOME")) |home| {
+        const real: []const u8 = Io.Dir.cwd().realPathFileAlloc(io, home, arena) catch home;
         if (contains(root, real)) return null;
     }
     return root;
@@ -264,23 +281,23 @@ fn contains(dir: []const u8, path: []const u8) bool {
     return path.len == dir.len or dir[dir.len - 1] == '/' or path[dir.len] == '/';
 }
 
-pub fn main(gpa: Allocator, arena: Allocator, argv: []const []const u8) !noreturn {
-    const parsed = (try parse(arena, argv[1..])) orelse passthrough(arena, argv);
+pub fn main(gpa: Allocator, arena: Allocator, io: Io, env: Environ, argv: []const []const u8) !noreturn {
+    const parsed = (try parse(arena, argv[1..])) orelse passthrough(arena, io, env, argv);
     var req = parsed.req;
     var diag = engine.Diag{};
 
-    const target = engine.resolve(arena, req.path, &diag) catch passthrough(arena, argv);
-    const st = std.fs.cwd().statFile(target) catch passthrough(arena, argv);
-    if (st.kind != .directory) passthrough(arena, argv);
+    const target = engine.resolve(arena, io, req.path, &diag) catch passthrough(arena, io, env, argv);
+    const st = Io.Dir.cwd().statFile(io, target, .{}) catch passthrough(arena, io, env, argv);
+    if (st.kind != .directory) passthrough(arena, io, env, argv);
 
-    const found = try engine.findIndex(arena, target);
-    if (found == null or view.stateId(arena, found.?.path) == null) {
+    const found = try engine.findIndex(arena, io, env, target);
+    if (found == null or view.stateId(arena, io, found.?.path) == null) {
         // No usable index: real rg answers; index only if this was slow.
-        const r = timedRg(gpa, arena, argv) catch passthrough(arena, argv);
-        const min_ms: i64 = if (std.posix.getenv("TRIGREP_RG_MIN_MS")) |s| (std.fmt.parseInt(i64, s, 10) catch 300) else 300;
+        const r = timedRg(arena, io, env, argv) catch passthrough(arena, io, env, argv);
+        const min_ms: i64 = if (env.getPosix("TRIGREP_RG_MIN_MS")) |s| (std.fmt.parseInt(i64, s, 10) catch 300) else 300;
         if (r.ms >= min_ms) {
-            const root = if (found) |f| f.root else try autoIndexRoot(arena, target);
-            if (root) |dir| startBackgroundIndex(gpa, arena, dir);
+            const root = if (found) |f| f.root else try autoIndexRoot(arena, io, env, target);
+            if (root) |dir| startBackgroundIndex(arena, io, env, dir);
         }
         std.process.exit(r.code);
     }
@@ -289,11 +306,11 @@ pub fn main(gpa: Allocator, arena: Allocator, argv: []const []const u8) !noretur
     // check freshness: hand it over.
     if (found.?.root.len < target.len) {
         const prefix = target[found.?.root.len + 1 ..];
-        const min_files: u32 = if (std.posix.getenv("TRIGREP_RG_MIN_FILES")) |s| (std.fmt.parseInt(u32, s, 10) catch 3000) else 3000;
-        var ix = index.Index.open(found.?.path) catch passthrough(arena, argv);
+        const min_files: u32 = if (env.getPosix("TRIGREP_RG_MIN_FILES")) |s| (std.fmt.parseInt(u32, s, 10) catch 3000) else 3000;
+        var ix = index.Index.open(io, found.?.path) catch passthrough(arena, io, env, argv);
         const n = ix.countUnder(prefix);
         ix.close();
-        if (n < min_files) passthrough(arena, argv);
+        if (n < min_files) passthrough(arena, io, env, argv);
     }
 
     // The daemon keeps freshness cheap; without one, this search walks the tree and a
@@ -301,16 +318,16 @@ pub fn main(gpa: Allocator, arena: Allocator, argv: []const []const u8) !noretur
     req.watch = null;
     if (@import("watch.zig").supported) {
         req.watch = daemonHook();
-        ensureDaemon(gpa, arena, found.?.root, found.?.path);
+        ensureDaemon(arena, io, found.?.root, found.?.path);
     }
 
     var out_buf: [1 << 16]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&out_buf);
+    var stdout = Io.File.stdout().writerStreaming(io, &out_buf);
     const out = &stdout.interface;
-    const outcome = engine.run(gpa, arena, req, out, &diag) catch |err| {
+    const outcome = engine.run(gpa, arena, io, env, req, out, &diag) catch |err| {
         // Errors before any output (pattern features trigrep lacks, index trouble):
         // let rg handle the whole search.
-        if (stdout.interface.end == 0) passthrough(arena, argv);
+        if (stdout.interface.end == 0) passthrough(arena, io, env, argv);
         out.flush() catch {};
         std.debug.print("rg (trigrep): {s}\n", .{if (err == error.Failed) diag.message else @errorName(err)});
         std.process.exit(2);

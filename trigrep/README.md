@@ -121,7 +121,7 @@ Reproduce: `zig build -Doptimize=ReleaseFast`, then `python3 scripts/bench.py DI
 
 ## Building
 
-Zig 0.15.1. `zig build -Doptimize=ReleaseFast` puts the binary in `zig-out/bin/trigrep`; `zig build test` runs the tests. No dependencies beyond the Zig standard library and libc (and CoreServices on macOS, for FSEvents).
+Zig 0.17.1. `zig build -Doptimize=ReleaseFast` puts the binary in `zig-out/bin/trigrep`; `zig build test` runs the tests. No dependencies beyond the Zig standard library and libc (and CoreServices on macOS, for FSEvents).
 
 ## License
 

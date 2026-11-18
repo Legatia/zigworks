@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const walk = @import("walk.zig");
 
 pub const supported = builtin.os.tag == .macos or builtin.os.tag == .linux;
@@ -27,11 +28,13 @@ pub const Changes = struct {
 
 pub const Watcher = struct {
     gpa: Allocator,
+    /// Also used from the backend's own threads, so it must be safe to share.
+    io: Io,
     /// When a search last asked (ms since epoch), for `trigrep watch --idle-exit`.
     last_query_ms: std.atomic.Value(i64) = .init(0),
     root: []const u8,
     hidden: bool,
-    mutex: std.Thread.Mutex = .{},
+    mutex: Io.Mutex = .init,
     files: std.StringHashMapUnmanaged(u64) = .empty,
     dirs: std.StringHashMapUnmanaged(u64) = .empty,
     seq: u64 = 0,
@@ -47,22 +50,23 @@ pub const Watcher = struct {
     cookie_prefix: []const u8 = "",
     cookie_sent: u64 = 0,
     cookie_seen: u64 = 0,
-    cookie_cond: std.Thread.Condition = .{},
+    cookie_cond: Io.Condition = .init,
 
     /// Starts watching `root` (absolute). The watcher reports `full` until `seed`.
-    pub fn create(gpa: Allocator, root: []const u8, hidden: bool) !*Watcher {
+    pub fn create(gpa: Allocator, io: Io, root: []const u8, hidden: bool) !*Watcher {
         const w = try gpa.create(Watcher);
         errdefer gpa.destroy(w);
         w.* = .{
             .gpa = gpa,
+            .io = io,
             .root = try gpa.dupe(u8, root),
             .hidden = hidden,
-            .checker = try walk.Checker.init(gpa, root, hidden),
+            .checker = try walk.Checker.init(gpa, io, root, hidden),
         };
         // Cookies go in .git when it's a directory (git ignores unknown files there).
         const git = try std.fmt.allocPrint(gpa, "{s}/.git", .{root});
         defer gpa.free(git);
-        const in_git = if (std.fs.cwd().statFile(git)) |st| st.kind == .directory else |_| false;
+        const in_git = if (Io.Dir.cwd().statFile(io, git, .{})) |st| st.kind == .directory else |_| false;
         w.cookie_dir = try gpa.dupe(u8, if (in_git) git else root);
         w.cookie_prefix = try std.fmt.allocPrint(gpa, "{s}.trigrep-cookie-{d}-", .{ if (in_git) ".git/" else "", std.c.getpid() });
         w.backend.start(w) catch |err| {
@@ -74,12 +78,12 @@ pub const Watcher = struct {
 
     pub fn destroy(w: *Watcher) void {
         w.backend.stop();
-        w.mutex.lock();
+        w.mutex.lockUncancelable(w.io);
         w.clearLocked();
         w.files.deinit(w.gpa);
         w.dirs.deinit(w.gpa);
         w.checker.deinit();
-        w.mutex.unlock();
+        w.mutex.unlock(w.io);
         w.gpa.free(w.cookie_dir);
         w.gpa.free(w.cookie_prefix);
         w.gpa.free(w.root);
@@ -118,10 +122,10 @@ pub const Watcher = struct {
         if (std.mem.startsWith(u8, rel, w.cookie_prefix)) {
             const n = std.fmt.parseInt(u64, rel[w.cookie_prefix.len..], 10) catch return;
             if (n > w.cookie_seen) w.cookie_seen = n;
-            w.cookie_cond.broadcast();
+            w.cookie_cond.broadcast(w.io);
             return;
         }
-        const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |i| rel[i + 1 ..] else rel;
+        const base = if (std.mem.findScalarLast(u8, rel, '/')) |i| rel[i + 1 ..] else rel;
         if (std.mem.eql(u8, rel, ".git/info/exclude") or std.mem.eql(u8, base, ".gitignore") or std.mem.eql(u8, base, ".ignore")) {
             // Ignore rules changed: what the walker returns may change anywhere.
             w.checker.reset();
@@ -141,28 +145,28 @@ pub const Watcher = struct {
             return true;
         }
         if (w.failed) return false;
-        w.mutex.lock();
+        const io = w.io;
+        w.mutex.lockUncancelable(io);
         w.cookie_sent += 1;
         const n = w.cookie_sent;
-        w.mutex.unlock();
+        w.mutex.unlock(io);
         var name_buf: [std.fs.max_path_bytes]u8 = undefined;
         const base = std.fs.path.basename(w.cookie_prefix);
         const path = std.fmt.bufPrint(&name_buf, "{s}/{s}{d}", .{ w.cookie_dir, base, n }) catch return false;
-        const f = std.fs.cwd().createFile(path, .{}) catch return false;
-        f.close();
-        defer std.fs.cwd().deleteFile(path) catch {};
-        w.mutex.lock();
-        defer w.mutex.unlock();
-        const deadline = std.time.nanoTimestamp() + std.time.ns_per_s;
+        const f = Io.Dir.cwd().createFile(io, path, .{}) catch return false;
+        f.close(io);
+        defer Io.Dir.cwd().deleteFile(io, path) catch {};
+        w.mutex.lockUncancelable(io);
+        defer w.mutex.unlock(io);
+        const deadline: Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromSeconds(1), .clock = .awake });
         while (w.cookie_seen < n) {
-            const left = deadline - std.time.nanoTimestamp();
-            if (left <= 0) {
+            if (deadline.untilNow(io).raw.nanoseconds >= 0) {
                 // Events aren't arriving (e.g. a network filesystem): stop relying on them.
                 w.failed = true;
                 std.debug.print("trigrep: file events for {s} aren't arriving; searches will walk the tree\n", .{w.root});
                 return false;
             }
-            w.cookie_cond.timedWait(&w.mutex, @intCast(left)) catch {};
+            w.cookie_cond.waitTimeout(io, &w.mutex, .{ .deadline = deadline }) catch {};
         }
         return true;
     }
@@ -170,8 +174,8 @@ pub const Watcher = struct {
     /// Changes since the index `build_id` was built. Copies into `arena`.
     pub fn changes(w: *Watcher, arena: Allocator, build_id: u64) !Changes {
         if (!w.sync()) return .{ .full = true, .files = &.{}, .dirs = &.{} };
-        w.mutex.lock();
-        defer w.mutex.unlock();
+        w.mutex.lockUncancelable(w.io);
+        defer w.mutex.unlock(w.io);
         if (w.failed or w.full or w.base_id != build_id or build_id == 0)
             return .{ .full = true, .files = &.{}, .dirs = &.{} };
         const files = try arena.alloc([]const u8, w.files.count());
@@ -189,8 +193,8 @@ pub const Watcher = struct {
     /// far. Events from now on are kept, so nothing that happens during the walk is lost.
     pub fn beginSeed(w: *Watcher) void {
         _ = w.sync();
-        w.mutex.lock();
-        defer w.mutex.unlock();
+        w.mutex.lockUncancelable(w.io);
+        defer w.mutex.unlock(w.io);
         w.clearLocked();
         w.full = false;
         w.base_id = 0;
@@ -199,8 +203,8 @@ pub const Watcher = struct {
     /// After that walk: `changed` are the paths the walk found to differ from index
     /// `build_id`. Unless something forced `full` meanwhile, the watcher is now current.
     pub fn seed(w: *Watcher, build_id: u64, changed: []const []const u8) u64 {
-        w.mutex.lock();
-        defer w.mutex.unlock();
+        w.mutex.lockUncancelable(w.io);
+        defer w.mutex.unlock(w.io);
         for (changed) |p| w.insertLocked(p, false);
         w.base_id = build_id;
         return w.seq;
@@ -209,15 +213,15 @@ pub const Watcher = struct {
     /// Before rebuilding the index: a mark to pass to `rebased` afterwards.
     pub fn mark(w: *Watcher) u64 {
         _ = w.sync();
-        w.mutex.lock();
-        defer w.mutex.unlock();
+        w.mutex.lockUncancelable(w.io);
+        defer w.mutex.unlock(w.io);
         return w.seq;
     }
 
     /// The index was rebuilt as `new_id` after `mark`: drop changes the rebuild saw.
     pub fn rebased(w: *Watcher, at: u64, new_id: u64) void {
-        w.mutex.lock();
-        defer w.mutex.unlock();
+        w.mutex.lockUncancelable(w.io);
+        defer w.mutex.unlock(w.io);
         for ([_]*std.StringHashMapUnmanaged(u64){ &w.files, &w.dirs }) |map| {
             var stale: std.ArrayList([]const u8) = .empty;
             defer stale.deinit(w.gpa);
@@ -238,8 +242,8 @@ pub const Watcher = struct {
 
     /// Number of recorded changes, and whether the watcher needs a re-seed.
     pub fn pending(w: *Watcher) struct { count: usize, needs_seed: bool } {
-        w.mutex.lock();
-        defer w.mutex.unlock();
+        w.mutex.lockUncancelable(w.io);
+        defer w.mutex.unlock(w.io);
         return .{ .count = w.files.count() + w.dirs.count(), .needs_seed = w.failed or w.full or w.base_id == 0 };
     }
 };
@@ -345,8 +349,8 @@ const FsEvents = struct {
     fn callback(_: ?*anyopaque, info: ?*anyopaque, n: usize, raw_paths: ?*anyopaque, flags: [*]const u32, _: [*]const u64) callconv(.c) void {
         const w: *Watcher = @ptrCast(@alignCast(info.?));
         const paths: [*]const [*:0]const u8 = @ptrCast(@alignCast(raw_paths.?));
-        w.mutex.lock();
-        defer w.mutex.unlock();
+        w.mutex.lockUncancelable(w.io);
+        defer w.mutex.unlock(w.io);
         for (0..n) |i| {
             const fl = flags[i];
             const p = std.mem.span(paths[i]);
@@ -388,11 +392,38 @@ const Inotify = struct {
     const mask: u32 = linux.IN.CREATE | linux.IN.DELETE | linux.IN.MODIFY | linux.IN.ATTRIB | linux.IN.CLOSE_WRITE |
         linux.IN.MOVED_FROM | linux.IN.MOVED_TO | linux.IN.DELETE_SELF | linux.IN.MOVE_SELF | linux.IN.ONLYDIR | linux.IN.EXCL_UNLINK;
 
+    fn init1(flags: u32) !i32 {
+        const rc = linux.inotify_init1(flags);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            .MFILE => error.ProcessFdQuotaExceeded,
+            .NFILE => error.SystemFdQuotaExceeded,
+            .NOMEM => error.SystemResources,
+            else => error.Unexpected,
+        };
+    }
+
+    fn addWatch(fd: i32, path: []const u8, watch_mask: u32) !i32 {
+        const path_z = try std.posix.toPosixPath(path);
+        const rc = linux.inotify_add_watch(fd, &path_z, watch_mask);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            .ACCES => error.AccessDenied,
+            .NAMETOOLONG => error.NameTooLong,
+            .NOENT => error.FileNotFound,
+            .NOMEM => error.SystemResources,
+            .NOSPC => error.UserResourceLimitReached,
+            .NOTDIR => error.NotDir,
+            .EXIST => error.WatchAlreadyExists,
+            else => error.Unexpected,
+        };
+    }
+
     fn start(in: *Inotify, w: *Watcher) !void {
-        in.fd = try std.posix.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
+        in.fd = try init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
         in.owner = w;
-        w.mutex.lock();
-        defer w.mutex.unlock();
+        w.mutex.lockUncancelable(w.io);
+        defer w.mutex.unlock(w.io);
         try in.addTree(w, "");
         in.thread = try std.Thread.spawn(.{}, loop, .{in});
     }
@@ -401,7 +432,7 @@ const Inotify = struct {
         if (in.fd < 0) return;
         in.stopping.store(true, .release);
         if (in.thread) |t| t.join();
-        std.posix.close(in.fd);
+        _ = linux.close(in.fd);
         in.fd = -1;
         const gpa = in.owner.?.gpa;
         var it = in.wds.valueIterator();
@@ -416,7 +447,7 @@ const Inotify = struct {
         else
             try std.fmt.allocPrint(w.gpa, "{s}/{s}", .{ w.root, rel });
         defer w.gpa.free(abs);
-        const wd = std.posix.inotify_add_watch(in.fd, abs, mask) catch |err| switch (err) {
+        const wd = addWatch(in.fd, abs, mask) catch |err| switch (err) {
             error.FileNotFound, error.AccessDenied, error.NotDir => return,
             else => return err, // e.g. watch limit reached
         };
@@ -424,10 +455,10 @@ const Inotify = struct {
         if (gop.found_existing) w.gpa.free(gop.value_ptr.*);
         gop.value_ptr.* = try w.gpa.dupe(u8, rel);
 
-        var dir = std.fs.cwd().openDir(abs, .{ .iterate = true }) catch return;
-        defer dir.close();
-        var it = dir.iterate();
-        while (it.next() catch null) |e| {
+        const dir = Io.Dir.cwd().openDir(w.io, abs, .{ .iterate = true }) catch return;
+        defer dir.close(w.io);
+        var it = dir.iterateAssumeFirstIteration();
+        while (it.next(w.io) catch null) |e| {
             if (e.kind != .directory) continue;
             const child = if (rel.len == 0)
                 try w.gpa.dupe(u8, e.name)
@@ -449,8 +480,8 @@ const Inotify = struct {
 
     fn flush(in: *Inotify, w: *Watcher) void {
         if (in.fd < 0) return;
-        w.mutex.lock();
-        defer w.mutex.unlock();
+        w.mutex.lockUncancelable(w.io);
+        defer w.mutex.unlock(w.io);
         var buf: [64 * 1024]u8 align(@alignOf(linux.inotify_event)) = undefined;
         while (true) {
             const n = std.posix.read(in.fd, &buf) catch |err| switch (err) {
@@ -520,37 +551,78 @@ const Inotify = struct {
 /// (short, because Unix socket paths are limited to ~104 bytes).
 pub fn socketPath(arena: Allocator, index_path: []const u8) ![]const u8 {
     const base = std.fs.path.stem(index_path);
-    return std.fmt.allocPrint(arena, "/tmp/trigrep-{d}/{s}.sock", .{ std.posix.getuid(), base });
+    return std.fmt.allocPrint(arena, "/tmp/trigrep-{d}/{s}.sock", .{ std.posix.system.getuid(), base });
 }
 
 /// Creates the socket directory, mode 0700, and refuses one owned by someone else.
-pub fn ensureSocketDir(sock: []const u8) !void {
+pub fn ensureSocketDir(io: Io, sock: []const u8) !void {
     const dir = std.fs.path.dirname(sock).?;
-    std.posix.mkdir(dir, 0o700) catch |err| switch (err) {
+    Io.Dir.cwd().createDir(io, dir, .fromMode(0o700)) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
-    const st = try std.posix.fstatat(std.fs.cwd().fd, dir, std.posix.AT.SYMLINK_NOFOLLOW);
-    if (st.uid != std.posix.getuid() or (st.mode & 0o077) != 0) return error.InsecureSocketDir;
+    const st = try lstatOwner(dir);
+    if (st.uid != std.posix.system.getuid() or (st.mode & 0o077) != 0) return error.InsecureSocketDir;
+}
+
+const Owner = struct { uid: std.posix.uid_t, mode: u32 };
+
+/// Owner and mode of `path` itself, not following a symlink. (`Io.File.Stat` has
+/// no owner, so this asks the OS directly.)
+fn lstatOwner(path: []const u8) !Owner {
+    const path_z = try std.posix.toPosixPath(path);
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var sx = std.mem.zeroes(linux.Statx);
+        const rc = linux.statx(linux.AT.FDCWD, &path_z, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true, .MODE = true, .UID = true }, &sx);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => .{ .uid = sx.uid, .mode = sx.mode },
+            .ACCES => error.AccessDenied,
+            .NOENT => error.FileNotFound,
+            .NOTDIR => error.NotDir,
+            .LOOP => error.SymLinkLoop,
+            .NOMEM => error.SystemResources,
+            else => error.Unexpected,
+        };
+    }
+    var st: std.c.Stat = undefined;
+    return switch (std.c.errno(std.c.fstatat(std.c.AT.FDCWD, &path_z, &st, std.c.AT.SYMLINK_NOFOLLOW))) {
+        .SUCCESS => .{ .uid = st.uid, .mode = st.mode },
+        .ACCES => error.AccessDenied,
+        .NOENT => error.FileNotFound,
+        .NOTDIR => error.NotDir,
+        .LOOP => error.SymLinkLoop,
+        .NOMEM => error.SystemResources,
+        else => error.Unexpected,
+    };
+}
+
+/// A Unix socket address, refusing paths that don't fit `sun_path` with its
+/// terminating zero (std's own limit is looser than macOS's 104 bytes).
+pub fn unixAddress(path: []const u8) !Io.net.UnixAddress {
+    if (path.len >= @typeInfo(@FieldType(std.posix.sockaddr.un, "path")).array.len) return error.NameTooLong;
+    return .init(path);
 }
 
 /// Asks a running `trigrep watch`. Returns null if none is listening.
-pub fn query(arena: Allocator, sock: []const u8, build_id: u64) ?Changes {
-    var stream = std.net.connectUnixSocket(sock) catch return null;
-    defer stream.close();
+pub fn query(arena: Allocator, io: Io, sock: []const u8, build_id: u64) ?Changes {
+    const addr = unixAddress(sock) catch return null;
+    const stream = addr.connect(io) catch return null;
+    defer stream.close(io);
     var req_buf: [64]u8 = undefined;
-    const req = std.fmt.bufPrint(&req_buf, "changes {x}\n", .{build_id}) catch return null;
-    stream.writeAll(req) catch return null;
+    var writer = stream.writer(io, &req_buf);
+    writer.interface.print("changes {x}\n", .{build_id}) catch return null;
+    writer.interface.flush() catch return null;
     var rbuf: [64 * 1024]u8 = undefined;
-    var reader = stream.reader(&rbuf);
-    const r = reader.interface();
-    const first = r.takeDelimiterExclusive('\n') catch return null;
+    var reader = stream.reader(io, &rbuf);
+    const r = &reader.interface;
+    const first = takeLine(r) catch return null;
     if (std.mem.eql(u8, first, "full")) return .{ .full = true, .files = &.{}, .dirs = &.{} };
     if (!std.mem.eql(u8, first, "ok")) return null;
     var files: std.ArrayList([]const u8) = .empty;
     var dirs: std.ArrayList([]const u8) = .empty;
     while (true) {
-        const line = r.takeDelimiterExclusive('\n') catch return null;
+        const line = takeLine(r) catch return null;
         if (std.mem.eql(u8, line, "end")) break;
         if (line.len < 3) return null;
         const p = arena.dupe(u8, line[2..]) catch return null;
@@ -563,39 +635,47 @@ pub fn query(arena: Allocator, sock: []const u8, build_id: u64) ?Changes {
     return .{ .full = false, .files = files.items, .dirs = dirs.items };
 }
 
+/// The next line without its newline; the rest of the input if it doesn't end in
+/// one. (`takeDelimiterExclusive` no longer consumes the delimiter.)
+fn takeLine(r: *Io.Reader) ![]u8 {
+    return (try r.takeDelimiter('\n')) orelse error.EndOfStream;
+}
+
 /// Answers `query` requests for `w` forever (run it on its own thread).
 pub fn serve(w: *Watcher, sock: []const u8) !void {
-    try ensureSocketDir(sock);
-    std.fs.cwd().deleteFile(sock) catch {};
-    const addr = try std.net.Address.initUnix(sock);
-    var server = try addr.listen(.{});
-    defer server.deinit();
+    const io = w.io;
+    try ensureSocketDir(io, sock);
+    Io.Dir.cwd().deleteFile(io, sock) catch {};
+    const addr = try unixAddress(sock);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
     while (true) {
-        var conn = server.accept() catch continue;
-        answer(w, conn.stream) catch {};
-        conn.stream.close();
+        const stream = server.accept(io) catch continue;
+        answer(w, stream) catch {};
+        stream.close(io);
     }
 }
 
-fn answer(w: *Watcher, stream: std.net.Stream) !void {
+fn answer(w: *Watcher, stream: Io.net.Stream) !void {
+    const io = w.io;
     var rbuf: [256]u8 = undefined;
-    var reader = stream.reader(&rbuf);
-    const line = try reader.interface().takeDelimiterExclusive('\n');
+    var reader = stream.reader(io, &rbuf);
+    const line = try takeLine(&reader.interface);
     if (!std.mem.startsWith(u8, line, "changes ")) return error.BadRequest;
     const id = try std.fmt.parseInt(u64, line["changes ".len..], 16);
     var arena = std.heap.ArenaAllocator.init(w.gpa);
     defer arena.deinit();
-    w.last_query_ms.store(std.time.milliTimestamp(), .monotonic);
+    w.last_query_ms.store(Io.Timestamp.now(io, .real).toMilliseconds(), .monotonic);
     const ch = try w.changes(arena.allocator(), id);
     var wbuf: [64 * 1024]u8 = undefined;
-    var writer = stream.writer(&wbuf);
+    var writer = stream.writer(io, &wbuf);
     const out = &writer.interface;
     var full = ch.full;
     if (!full) for (ch.files) |p| {
-        if (std.mem.indexOfScalar(u8, p, '\n') != null) full = true;
+        if (std.mem.findScalar(u8, p, '\n') != null) full = true;
     };
     if (!full) for (ch.dirs) |p| {
-        if (std.mem.indexOfScalar(u8, p, '\n') != null) full = true;
+        if (std.mem.findScalar(u8, p, '\n') != null) full = true;
     };
     if (full) {
         try out.writeAll("full\n");
@@ -621,15 +701,16 @@ fn contains(list: []const []const u8, s: []const u8) bool {
 test "watcher records edits, creations and ignores ignored files" {
     if (!supported) return error.SkipZigTest;
     const gpa = std.testing.allocator;
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.makePath("src");
-    try tmp.dir.writeFile(.{ .sub_path = ".gitignore", .data = "*.log\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "src/a.txt", .data = "one\n" });
-    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    try tmp.dir.createDirPath(io, "src");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/a.txt", .data = "one\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
 
-    const w = try Watcher.create(gpa, root, false);
+    const w = try Watcher.create(gpa, io, root, false);
     defer w.destroy();
     try std.testing.expect(!w.failed);
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -638,14 +719,14 @@ test "watcher records edits, creations and ignores ignored files" {
     w.beginSeed();
     _ = w.seed(7, &.{});
     // FSEvents may deliver events from before the stream started; let them settle.
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    try io.sleep(.fromMilliseconds(200), .awake);
     w.beginSeed();
     _ = w.seed(7, &.{});
 
-    try tmp.dir.writeFile(.{ .sub_path = "src/a.txt", .data = "two\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "b.txt", .data = "new\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "x.log", .data = "ignored\n" });
-    try tmp.dir.makePath("newdir");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/a.txt", .data = "two\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "new\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "x.log", .data = "ignored\n" });
+    try tmp.dir.createDirPath(io, "newdir");
 
     const ch = try w.changes(arena.allocator(), 7);
     try std.testing.expect(!ch.full);
@@ -657,25 +738,26 @@ test "watcher records edits, creations and ignores ignored files" {
     try std.testing.expect((try w.changes(arena.allocator(), 8)).full);
 
     // Changing an ignore file forces a full walk.
-    try tmp.dir.writeFile(.{ .sub_path = ".gitignore", .data = "*.log\n*.tmp\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\n*.tmp\n" });
     try std.testing.expect((try w.changes(arena.allocator(), 7)).full);
 }
 
 test "rebased drops changes the rebuild saw" {
     if (!supported) return error.SkipZigTest;
     const gpa = std.testing.allocator;
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
-    const w = try Watcher.create(gpa, root, false);
+    const w = try Watcher.create(gpa, io, root, false);
     defer w.destroy();
     w.beginSeed();
     _ = w.seed(1, &.{ "a", "b" });
     const at = w.mark();
-    w.mutex.lock();
+    w.mutex.lockUncancelable(io);
     w.insertLocked("c", false);
-    w.mutex.unlock();
+    w.mutex.unlock(io);
     w.rebased(at, 2);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

@@ -4,6 +4,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const Environ = std.process.Environ;
 const engine = @import("engine.zig");
 const search = @import("search.zig");
 const watch = @import("watch.zig");
@@ -80,11 +82,11 @@ pub const Registry = struct {
         return r.watchers.get(root);
     }
 
-    fn changes(ptr: *anyopaque, arena: Allocator, root: []const u8, _: []const u8, build_id: u64) ?watch.Changes {
+    fn changes(ptr: *anyopaque, arena: Allocator, io: Io, root: []const u8, _: []const u8, build_id: u64) ?watch.Changes {
         if (!watch.supported) return null;
         const r: *Registry = @ptrCast(@alignCast(ptr));
         const w = r.watchers.get(root) orelse blk: {
-            const nw = watch.Watcher.create(r.gpa, root, true) catch return null;
+            const nw = watch.Watcher.create(r.gpa, io, root, true) catch return null;
             r.watchers.put(r.gpa, nw.root, nw) catch {
                 nw.destroy();
                 return null;
@@ -127,7 +129,7 @@ fn int(obj: std.json.ObjectMap, key: []const u8) ?usize {
     return if (v == .integer and v.integer > 0) @intCast(v.integer) else null;
 }
 
-fn toolSearch(gpa: Allocator, arena: Allocator, reg: ?*Registry, args: std.json.ObjectMap) !ToolResult {
+fn toolSearch(gpa: Allocator, arena: Allocator, io: Io, env: Environ, reg: ?*Registry, args: std.json.ObjectMap) !ToolResult {
     const pattern = str(args, "pattern") orelse return .{ .text = "missing argument: pattern", .is_error = true };
     var globs: std.ArrayList([]const u8) = .empty;
     if (args.get("glob")) |g| switch (g) {
@@ -165,7 +167,7 @@ fn toolSearch(gpa: Allocator, arena: Allocator, reg: ?*Registry, args: std.json.
     };
     var aw = std.Io.Writer.Allocating.init(arena);
     var diag = engine.Diag{};
-    const outcome = engine.run(gpa, arena, req, &aw.writer, &diag) catch |err| {
+    const outcome = engine.run(gpa, arena, io, env, req, &aw.writer, &diag) catch |err| {
         return .{ .text = if (err == error.Failed) diag.message else @errorName(err), .is_error = true };
     };
     const w = &aw.writer;
@@ -178,22 +180,22 @@ fn toolSearch(gpa: Allocator, arena: Allocator, reg: ?*Registry, args: std.json.
     return .{ .text = aw.written() };
 }
 
-fn toolIndex(gpa: Allocator, arena: Allocator, reg: ?*Registry, args: std.json.ObjectMap) !ToolResult {
+fn toolIndex(gpa: Allocator, arena: Allocator, io: Io, env: Environ, reg: ?*Registry, args: std.json.ObjectMap) !ToolResult {
     var diag = engine.Diag{};
-    const target = engine.resolve(arena, str(args, "path"), &diag) catch return .{ .text = diag.message, .is_error = true };
+    const target = engine.resolve(arena, io, str(args, "path"), &diag) catch return .{ .text = diag.message, .is_error = true };
     const w = if (reg) |r| r.get(target) else null;
     const at = if (w) |x| x.mark() else 0;
-    const b = engine.buildIndex(gpa, arena, target, null) catch |err|
+    const b = engine.buildIndex(gpa, arena, io, env, target, null) catch |err|
         return .{ .text = try std.fmt.allocPrint(arena, "indexing failed: {s}", .{@errorName(err)}), .is_error = true };
     // Changes the rebuild saw are in the new index; keep only what happened after it began.
     if (w) |x| x.rebased(at, b.stats.build_id);
     return .{ .text = try engine.describeBuild(arena, target, b) };
 }
 
-fn toolStatus(arena: Allocator, args: std.json.ObjectMap) !ToolResult {
+fn toolStatus(arena: Allocator, io: Io, env: Environ, args: std.json.ObjectMap) !ToolResult {
     var diag = engine.Diag{};
-    const target = engine.resolve(arena, str(args, "path"), &diag) catch return .{ .text = diag.message, .is_error = true };
-    const st = (try engine.status(arena, target)) orelse
+    const target = engine.resolve(arena, io, str(args, "path"), &diag) catch return .{ .text = diag.message, .is_error = true };
+    const st = (try engine.status(arena, io, env, target)) orelse
         return .{ .text = try std.fmt.allocPrint(arena, "No index covers {s} yet; the first trigrep_search there builds one.", .{target}) };
     return .{ .text = try engine.describeStatus(arena, st) };
 }
@@ -216,7 +218,7 @@ fn writeError(w: *std.Io.Writer, id: Value, e: RpcError) !void {
 
 /// Handles one JSON-RPC message and writes the reply (if any) to `w`. Returns false
 /// when the message was a notification (nothing written).
-pub fn handle(gpa: Allocator, arena: Allocator, reg: ?*Registry, line: []const u8, w: *std.Io.Writer) !bool {
+pub fn handle(gpa: Allocator, arena: Allocator, io: Io, env: Environ, reg: ?*Registry, line: []const u8, w: *std.Io.Writer) !bool {
     const parsed = std.json.parseFromSliceLeaky(Value, arena, line, .{}) catch {
         try writeError(w, .null, .{ .code = -32700, .message = "parse error" });
         return true;
@@ -231,7 +233,7 @@ pub fn handle(gpa: Allocator, arena: Allocator, reg: ?*Registry, line: []const u
         try writeError(w, id, .{ .code = -32600, .message = "invalid request" });
         return true;
     };
-    const params: std.json.ObjectMap = if (msg.get("params")) |p| (if (p == .object) p.object else .init(arena)) else .init(arena);
+    const params: std.json.ObjectMap = if (msg.get("params")) |p| (if (p == .object) p.object else .empty) else .empty;
 
     if (std.mem.eql(u8, method, "initialize")) {
         var proto: []const u8 = default_version;
@@ -251,13 +253,13 @@ pub fn handle(gpa: Allocator, arena: Allocator, reg: ?*Registry, line: []const u
             try writeError(w, id, .{ .code = -32602, .message = "missing tool name" });
             return true;
         };
-        const args: std.json.ObjectMap = if (params.get("arguments")) |a| (if (a == .object) a.object else .init(arena)) else .init(arena);
+        const args: std.json.ObjectMap = if (params.get("arguments")) |a| (if (a == .object) a.object else .empty) else .empty;
         const result: ToolResult = if (std.mem.eql(u8, name, "trigrep_search"))
-            try toolSearch(gpa, arena, reg, args)
+            try toolSearch(gpa, arena, io, env, reg, args)
         else if (std.mem.eql(u8, name, "trigrep_index"))
-            try toolIndex(gpa, arena, reg, args)
+            try toolIndex(gpa, arena, io, env, reg, args)
         else if (std.mem.eql(u8, name, "trigrep_status"))
-            try toolStatus(arena, args)
+            try toolStatus(arena, io, env, args)
         else {
             try writeError(w, id, .{ .code = -32602, .message = "unknown tool" });
             return true;
@@ -274,20 +276,19 @@ pub fn handle(gpa: Allocator, arena: Allocator, reg: ?*Registry, line: []const u
     return true;
 }
 
-pub fn serve(gpa: Allocator) !void {
+pub fn serve(gpa: Allocator, io: Io, env: Environ) !void {
     const in_buf = try gpa.alloc(u8, 4 << 20);
     defer gpa.free(in_buf);
-    var reader = std.fs.File.stdin().readerStreaming(in_buf);
+    var reader = Io.File.stdin().readerStreaming(io, in_buf);
     const r = &reader.interface;
     var out_buf: [1 << 16]u8 = undefined;
-    var writer = std.fs.File.stdout().writerStreaming(&out_buf);
+    var writer = Io.File.stdout().writerStreaming(io, &out_buf);
     const w = &writer.interface;
     var reg = Registry{ .gpa = gpa };
     defer reg.deinit();
 
     while (true) {
-        const raw = r.takeDelimiterExclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => return,
+        const raw = (r.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => {
                 // Skip the rest of an oversized line and report it.
                 _ = r.discardDelimiterInclusive('\n') catch return;
@@ -297,12 +298,12 @@ pub fn serve(gpa: Allocator) !void {
                 continue;
             },
             else => return err,
-        };
+        }) orelse return;
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0) continue;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
-        const replied = handle(gpa, arena_state.allocator(), &reg, line, w) catch |err| blk: {
+        const replied = handle(gpa, arena_state.allocator(), io, env, &reg, line, w) catch |err| blk: {
             std.debug.print("trigrep mcp: {s}\n", .{@errorName(err)});
             break :blk false;
         };
@@ -322,7 +323,7 @@ fn call(line: []const u8) ![]u8 {
     defer arena.deinit();
     var aw = std.Io.Writer.Allocating.init(gpa);
     defer aw.deinit();
-    _ = try handle(gpa, arena.allocator(), null, line, &aw.writer);
+    _ = try handle(gpa, arena.allocator(), std.testing.io, std.testing.environ, null, line, &aw.writer);
     return gpa.dupe(u8, aw.written());
 }
 
@@ -332,15 +333,15 @@ test "initialize echoes a known protocol version" {
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}
     );
     defer gpa.free(a);
-    try std.testing.expect(std.mem.indexOf(u8, a, "\"protocolVersion\":\"2025-03-26\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a, "\"id\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a, "\"capabilities\":{\"tools\":{}}") != null);
+    try std.testing.expect(std.mem.find(u8, a, "\"protocolVersion\":\"2025-03-26\"") != null);
+    try std.testing.expect(std.mem.find(u8, a, "\"id\":1") != null);
+    try std.testing.expect(std.mem.find(u8, a, "\"capabilities\":{\"tools\":{}}") != null);
     const b = try call(
         \\{"jsonrpc":"2.0","id":"x","method":"initialize","params":{"protocolVersion":"1999-01-01"}}
     );
     defer gpa.free(b);
-    try std.testing.expect(std.mem.indexOf(u8, b, "\"protocolVersion\":\"" ++ default_version ++ "\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, b, "\"id\":\"x\"") != null);
+    try std.testing.expect(std.mem.find(u8, b, "\"protocolVersion\":\"" ++ default_version ++ "\"") != null);
+    try std.testing.expect(std.mem.find(u8, b, "\"id\":\"x\"") != null);
 }
 
 test "notifications get no reply; errors are JSON-RPC errors" {
@@ -352,12 +353,12 @@ test "notifications get no reply; errors are JSON-RPC errors" {
     try std.testing.expectEqualStrings("", a);
     const b = try call("{not json");
     defer gpa.free(b);
-    try std.testing.expect(std.mem.indexOf(u8, b, "-32700") != null);
+    try std.testing.expect(std.mem.find(u8, b, "-32700") != null);
     const c = try call(
         \\{"jsonrpc":"2.0","id":2,"method":"nope"}
     );
     defer gpa.free(c);
-    try std.testing.expect(std.mem.indexOf(u8, c, "-32601") != null);
+    try std.testing.expect(std.mem.find(u8, c, "-32601") != null);
 }
 
 test "tools/list is valid JSON with three tools" {
@@ -368,7 +369,7 @@ test "tools/list is valid JSON with three tools" {
     defer gpa.free(a);
     const parsed = try std.json.parseFromSlice(Value, gpa, a, .{});
     defer parsed.deinit();
-    try std.testing.expect(std.mem.indexOfScalar(u8, a, '\n') == null);
+    try std.testing.expect(std.mem.findScalar(u8, a, '\n') == null);
     const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
     try std.testing.expectEqual(@as(usize, 3), tools.items.len);
     for (tools.items) |t| try std.testing.expect(t.object.get("inputSchema").? == .object);
@@ -378,23 +379,24 @@ test "search tool output, truncation and a bad pattern as a tool error" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "one needle\ntwo\nneedle three \"quoted\"\n" });
-    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "one needle\ntwo\nneedle three \"quoted\"\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     // Scan without an index: an index would be written to the user's cache dir.
-    var args = std.json.ObjectMap.init(arena.allocator());
-    try args.put("pattern", .{ .string = "needle" });
-    try args.put("path", .{ .string = root });
-    try args.put("max_results", .{ .integer = 1 });
+    var args: std.json.ObjectMap = .empty;
+    try args.put(arena.allocator(), "pattern", .{ .string = "needle" });
+    try args.put(arena.allocator(), "path", .{ .string = root });
+    try args.put(arena.allocator(), "max_results", .{ .integer = 1 });
     const res = try toolSearchNoIndex(gpa, arena.allocator(), args);
     try std.testing.expect(!res.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, res.text, "/a.txt:1:one needle\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.text, "[stopped at 1 lines") != null);
+    try std.testing.expect(std.mem.find(u8, res.text, "/a.txt:1:one needle\n") != null);
+    try std.testing.expect(std.mem.find(u8, res.text, "[stopped at 1 lines") != null);
 
-    try args.put("pattern", .{ .string = "(" });
+    try args.put(arena.allocator(), "pattern", .{ .string = "(" });
     const bad = try toolSearchNoIndex(gpa, arena.allocator(), args);
     try std.testing.expect(bad.is_error);
     try std.testing.expectEqualStrings("invalid pattern", bad.text);
@@ -404,7 +406,7 @@ test "search tool output, truncation and a bad pattern as a tool error" {
 fn toolSearchNoIndex(gpa: Allocator, arena: Allocator, args: std.json.ObjectMap) !ToolResult {
     var aw = std.Io.Writer.Allocating.init(arena);
     var diag = engine.Diag{};
-    const outcome = engine.run(gpa, arena, .{
+    const outcome = engine.run(gpa, arena, std.testing.io, std.testing.environ, .{
         .pattern = str(args, "pattern").?,
         .path = str(args, "path"),
         .no_index = true,

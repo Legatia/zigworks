@@ -17,6 +17,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const Environ = std.process.Environ;
 const walk = @import("walk.zig");
 const Query = @import("query.zig").Query;
 
@@ -37,7 +39,7 @@ pub fn deltaPath(arena: Allocator, index_path: []const u8) ![]u8 {
 }
 
 pub fn isBinary(data: []const u8) bool {
-    return std.mem.indexOfScalar(u8, data[0..@min(data.len, binary_probe)], 0) != null;
+    return std.mem.findScalar(u8, data[0..@min(data.len, binary_probe)], 0) != null;
 }
 
 const fold_table = blk: {
@@ -71,19 +73,19 @@ pub fn extractTrigrams(gpa: Allocator, data: []const u8, seen: []u64, out: *std.
 
 /// Where the index for `root` (an absolute path) lives: $TRIGREP_INDEX_DIR,
 /// $XDG_CACHE_HOME/trigrep or ~/.cache/trigrep, named by a hash of the root.
-pub fn pathFor(arena: Allocator, root: []const u8) ![]u8 {
-    const dir = try cacheDir(arena);
+pub fn pathFor(arena: Allocator, env: Environ, root: []const u8) ![]u8 {
+    const dir = try cacheDir(arena, env);
     const h = std.hash.Wyhash.hash(0, root);
     return std.fmt.allocPrint(arena, "{s}/{x:0>16}.idx", .{ dir, h });
 }
 
 /// The directory all indexes live in.
-pub fn cacheDir(arena: Allocator) ![]u8 {
-    return if (std.posix.getenv("TRIGREP_INDEX_DIR")) |d|
+pub fn cacheDir(arena: Allocator, env: Environ) ![]u8 {
+    return if (env.getPosix("TRIGREP_INDEX_DIR")) |d|
         try arena.dupe(u8, d)
-    else if (std.posix.getenv("XDG_CACHE_HOME")) |d|
+    else if (env.getPosix("XDG_CACHE_HOME")) |d|
         try std.fs.path.join(arena, &.{ d, "trigrep" })
-    else if (std.posix.getenv("HOME")) |h|
+    else if (env.getPosix("HOME")) |h|
         try std.fs.path.join(arena, &.{ h, ".cache", "trigrep" })
     else
         error.NoCacheDir;
@@ -99,16 +101,17 @@ pub const Pruned = struct {
 /// Deletes the indexes in `dir_path` whose root directory no longer exists (a
 /// removed checkout or worktree). With `report`, lists every index and what
 /// happened to it. Indexes this version can't read are left alone.
-pub fn prune(arena: Allocator, dir_path: []const u8, report: ?*std.Io.Writer) !Pruned {
+pub fn prune(arena: Allocator, io: Io, dir_path: []const u8, report: ?*Io.Writer) !Pruned {
     var res: Pruned = .{};
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+    const cwd = Io.Dir.cwd();
+    const dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return res,
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(io);
     var names: std.ArrayList([]const u8) = .empty;
-    var it = dir.iterate();
-    while (try it.next()) |e| {
+    var it = dir.iterateAssumeFirstIteration();
+    while (try it.next(io)) |e| {
         if (e.kind == .file and std.mem.endsWith(u8, e.name, ".idx")) try names.append(arena, try arena.dupe(u8, e.name));
     }
     std.mem.sort([]const u8, names.items, {}, struct {
@@ -119,17 +122,17 @@ pub fn prune(arena: Allocator, dir_path: []const u8, report: ?*std.Io.Writer) !P
     for (names.items) |name| {
         const path = try std.fs.path.join(arena, &.{ dir_path, name });
         const delta = try deltaPath(arena, path);
-        const bytes = fileSize(path) + fileSize(delta);
-        var ix = Index.open(path) catch {
+        const bytes = fileSize(io, path) + fileSize(io, delta);
+        var ix = Index.open(io, path) catch {
             if (report) |w| try w.print("skipped  {d:>7.1} MB  {s} (not readable by this version)\n", .{ mb(bytes), path });
             continue;
         };
         const root = try arena.dupe(u8, ix.root);
         ix.close();
-        if (rootGone(root)) {
-            std.fs.cwd().deleteFile(path) catch {};
-            std.fs.cwd().deleteFile(delta) catch {};
-            std.fs.cwd().deleteFile(try std.fmt.allocPrint(arena, "{s}.building", .{path})) catch {};
+        if (rootGone(io, root)) {
+            cwd.deleteFile(io, path) catch {};
+            cwd.deleteFile(io, delta) catch {};
+            cwd.deleteFile(io, try std.fmt.allocPrint(arena, "{s}.building", .{path})) catch {};
             res.removed += 1;
             res.removed_bytes += bytes;
             if (report) |w| try w.print("removed  {d:>7.1} MB  {s}\n", .{ mb(bytes), root });
@@ -146,24 +149,24 @@ fn mb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1e6;
 }
 
-fn fileSize(path: []const u8) u64 {
-    const st = std.fs.cwd().statFile(path) catch return 0;
+fn fileSize(io: Io, path: []const u8) u64 {
+    const st = Io.Dir.cwd().statFile(io, path, .{}) catch return 0;
     return st.size;
 }
 
-fn missing(path: []const u8) bool {
-    std.fs.cwd().access(path, .{}) catch |err| return err == error.FileNotFound;
+fn missing(io: Io, path: []const u8) bool {
+    Io.Dir.cwd().access(io, path, .{}) catch |err| return err == error.FileNotFound;
     return false;
 }
 
 /// True if `root` has been deleted. A root on a volume that isn't mounted
 /// right now is not gone.
-fn rootGone(root: []const u8) bool {
-    if (!missing(root)) return false;
+fn rootGone(io: Io, root: []const u8) bool {
+    if (!missing(io, root)) return false;
     for ([_][]const u8{ "/Volumes/", "/mnt/", "/media/", "/run/media/" }) |mounts| {
         if (!std.mem.startsWith(u8, root, mounts)) continue;
-        const end = std.mem.indexOfScalarPos(u8, root, mounts.len, '/') orelse root.len;
-        if (missing(root[0..end])) return false;
+        const end = std.mem.findScalarPos(u8, root, mounts.len, '/') orelse root.len;
+        if (missing(io, root[0..end])) return false;
     }
     return true;
 }
@@ -197,7 +200,8 @@ fn putVarint(list: *std.ArrayList(u8), gpa: Allocator, value: u32) !void {
 
 const Extractor = struct {
     gpa: Allocator,
-    root: std.fs.Dir,
+    io: Io,
+    root: Io.Dir,
     entries: []const walk.Entry,
     results: []?[]u32,
     base: usize,
@@ -219,11 +223,11 @@ const Extractor = struct {
 
     fn process(x: *Extractor, entry: walk.Entry) ![]u32 {
         if (entry.size == tombstone) return try x.gpa.alloc(u32, 0);
-        var f = try x.root.openFile(entry.path, .{});
-        defer f.close();
-        const size = (try f.stat()).size;
+        const f = try x.root.openFile(x.io, entry.path, .{});
+        defer f.close(x.io);
+        const size = (try f.stat(x.io)).size;
         try x.buf.resize(x.gpa, @intCast(size));
-        const n = try f.readAll(x.buf.items);
+        const n = try f.readPositionalAll(x.io, x.buf.items, 0);
         const data = x.buf.items[0..n];
         x.bytes += n;
         if (isBinary(data)) {
@@ -250,12 +254,15 @@ pub const BuildOptions = struct {
 
 /// Indexes `entries` (files under `root`) and writes the index to `out_path`
 /// atomically.
-pub fn build(gpa: Allocator, root: []const u8, entries: []const walk.Entry, out_path: []const u8, threads: usize, opts: BuildOptions) !BuildStats {
-    var stats = BuildStats{ .files = entries.len, .build_id = std.crypto.random.int(u64) | 1 };
+pub fn build(gpa: Allocator, io: Io, root: []const u8, entries: []const walk.Entry, out_path: []const u8, threads: usize, opts: BuildOptions) !BuildStats {
+    var id_bytes: [8]u8 = undefined;
+    io.random(&id_bytes);
+    var stats = BuildStats{ .files = entries.len, .build_id = std.mem.readInt(u64, &id_bytes, .little) | 1 };
     if (entries.len > std.math.maxInt(u32)) return error.TooManyFiles;
 
-    var root_dir = try std.fs.cwd().openDir(root, .{});
-    defer root_dir.close();
+    const cwd = Io.Dir.cwd();
+    const root_dir = try cwd.openDir(io, root, .{});
+    defer root_dir.close(io);
 
     const slot = try gpa.alloc(u32, tri_space);
     defer gpa.free(slot);
@@ -280,6 +287,7 @@ pub fn build(gpa: Allocator, root: []const u8, entries: []const walk.Entry, out_
 
     for (extractors, 0..) |*x, i| x.* = .{
         .gpa = gpa,
+        .io = io,
         .root = root_dir,
         .entries = entries,
         .results = results,
@@ -353,16 +361,16 @@ pub fn build(gpa: Allocator, root: []const u8, entries: []const walk.Entry, out_
 
     const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{out_path});
     defer gpa.free(tmp_path);
-    if (std.fs.path.dirname(out_path)) |d| try std.fs.cwd().makePath(d);
-    var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
-    errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+    if (std.fs.path.dirname(out_path)) |d| try cwd.createDirPath(io, d);
+    const file = try cwd.createFile(io, tmp_path, .{ .truncate = true });
+    errdefer cwd.deleteFile(io, tmp_path) catch {};
     {
-        defer file.close();
+        defer file.close(io);
         var wbuf: [1 << 16]u8 = undefined;
-        var fw = file.writer(&wbuf);
+        var fw = file.writer(io, &wbuf);
         const w = &fw.interface;
 
-        var head = [_]u8{0} ** header_len;
+        var head: [header_len]u8 = @splat(0);
         @memcpy(head[0..8], magic);
         writeU32(&head, 8, format_version);
         writeU32(&head, 12, @intCast(entries.len));
@@ -412,7 +420,7 @@ pub fn build(gpa: Allocator, root: []const u8, entries: []const walk.Entry, out_
         }
         try w.flush();
     }
-    try std.fs.cwd().rename(tmp_path, out_path);
+    try cwd.rename(tmp_path, cwd, out_path, io);
     return stats;
 }
 
@@ -436,12 +444,12 @@ pub const Index = struct {
     /// Nonzero for a delta index.
     base_id: u64,
 
-    pub fn open(path: []const u8) !Index {
-        var f = try std.fs.cwd().openFile(path, .{});
-        defer f.close();
-        const size: usize = @intCast((try f.stat()).size);
+    pub fn open(io: Io, path: []const u8) !Index {
+        const f = try Io.Dir.cwd().openFile(io, path, .{});
+        defer f.close(io);
+        const size: usize = @intCast((try f.stat(io)).size);
         if (size < header_len) return error.BadIndex;
-        const data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, f.handle, 0);
+        const data = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, f.handle, 0);
         errdefer std.posix.munmap(data);
         if (!std.mem.eql(u8, data[0..8], magic)) return error.BadIndex;
         if (rd32(data, 8) != format_version) return error.BadIndex;
@@ -663,61 +671,63 @@ test "trigram extraction folds case and skips newlines" {
 }
 
 test "prune removes indexes whose root is gone" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.makePath("cache");
-    try tmp.dir.makePath("here");
-    try tmp.dir.makePath("gone");
-    try tmp.dir.writeFile(.{ .sub_path = "here/a.txt", .data = "hello\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "gone/b.txt", .data = "world\n" });
+    try tmp.dir.createDirPath(io, "cache");
+    try tmp.dir.createDirPath(io, "here");
+    try tmp.dir.createDirPath(io, "gone");
+    try tmp.dir.writeFile(io, .{ .sub_path = "here/a.txt", .data = "hello\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "gone/b.txt", .data = "world\n" });
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const base = try tmp.dir.realpathAlloc(arena, ".");
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
     const cache = try std.fs.path.join(arena, &.{ base, "cache" });
     for ([_][]const u8{ "here", "gone" }) |name| {
         const root = try std.fs.path.join(arena, &.{ base, name });
-        const entries = try walk.walk(arena, root, .{});
-        _ = try build(gpa, root, entries, try std.fmt.allocPrint(arena, "{s}/{s}.idx", .{ cache, name }), 1, .{});
+        const entries = try walk.walk(arena, io, root, .{});
+        _ = try build(gpa, io, root, entries, try std.fmt.allocPrint(arena, "{s}/{s}.idx", .{ cache, name }), 1, .{});
     }
-    try tmp.dir.writeFile(.{ .sub_path = "cache/gone.idx.delta", .data = "x" });
-    try tmp.dir.writeFile(.{ .sub_path = "cache/old.idx", .data = "not an index" });
-    try tmp.dir.deleteTree("gone");
+    try tmp.dir.writeFile(io, .{ .sub_path = "cache/gone.idx.delta", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "cache/old.idx", .data = "not an index" });
+    try tmp.dir.deleteTree(io, "gone");
 
     var out: std.Io.Writer.Allocating = .init(arena);
-    const res = try prune(arena, cache, &out.writer);
+    const res = try prune(arena, io, cache, &out.writer);
     try std.testing.expectEqual(@as(usize, 1), res.removed);
     try std.testing.expectEqual(@as(usize, 1), res.kept);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "removed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "skipped") != null);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("cache/gone.idx", .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("cache/gone.idx.delta", .{}));
-    try tmp.dir.access("cache/here.idx", .{});
-    try tmp.dir.access("cache/old.idx", .{});
-    try std.testing.expect(!rootGone("/Volumes/trigrep-no-such-volume/repo"));
+    try std.testing.expect(std.mem.find(u8, out.written(), "removed") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "skipped") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "cache/gone.idx", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "cache/gone.idx.delta", .{}));
+    try tmp.dir.access(io, "cache/here.idx", .{});
+    try tmp.dir.access(io, "cache/old.idx", .{});
+    try std.testing.expect(!rootGone(io, "/Volumes/trigrep-no-such-volume/repo"));
 }
 
 test "build, open and query an index" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "hello world\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "b.txt", .data = "goodbye world\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "c.bin", .data = "hello\x00world" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hello world\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "goodbye world\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.bin", .data = "hello\x00world" });
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = try tmp.dir.realpathAlloc(arena, ".");
-    const entries = try walk.walk(arena, root, .{});
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const entries = try walk.walk(arena, io, root, .{});
     const out = try std.fmt.allocPrint(arena, "{s}/index.idx", .{root});
-    const stats = try build(gpa, root, entries, out, 2, .{});
+    const stats = try build(gpa, io, root, entries, out, 2, .{});
     try std.testing.expectEqual(@as(usize, 3), stats.files);
     try std.testing.expectEqual(@as(usize, 1), stats.binary);
 
-    var ix = try Index.open(out);
+    var ix = try Index.open(io, out);
     defer ix.close();
     try std.testing.expectEqualStrings(root, ix.root);
     try std.testing.expectEqual(@as(u32, 3), ix.file_count);

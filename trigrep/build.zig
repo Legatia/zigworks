@@ -12,14 +12,14 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run trigrep").dependOn(&run.step);
 
     const tests = b.addTest(.{ .root_module = module(b, target, optimize) });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
 }
 
-fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

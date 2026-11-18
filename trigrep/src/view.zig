@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const index = @import("index.zig");
 const Query = @import("query.zig").Query;
 
@@ -19,8 +20,8 @@ pub const View = struct {
     file_count: u32,
     root: []const u8,
 
-    pub fn open(arena: Allocator, path: []const u8) !View {
-        var base = try index.Index.open(path);
+    pub fn open(arena: Allocator, io: Io, path: []const u8) !View {
+        var base = try index.Index.open(io, path);
         errdefer base.close();
         if (base.base_id != 0) return error.BadIndex;
         var v = View{
@@ -31,7 +32,7 @@ pub const View = struct {
             .root = base.root,
         };
         const dp = try index.deltaPath(arena, path);
-        var d = index.Index.open(dp) catch return v;
+        var d = index.Index.open(io, dp) catch return v;
         if (d.base_id != base.build_id or !std.mem.eql(u8, d.root, base.root)) {
             d.close();
             return v;
@@ -106,11 +107,11 @@ pub const View = struct {
 
 /// The state id of the index at `path` without mapping it: the delta's build id if a
 /// valid delta exists, else the base's. Null if there is no usable index.
-pub fn stateId(arena: Allocator, path: []const u8) ?u64 {
-    const base = readHeader(path) orelse return null;
+pub fn stateId(arena: Allocator, io: Io, path: []const u8) ?u64 {
+    const base = readHeader(io, path) orelse return null;
     if (base.base_id != 0) return null;
     const dp = index.deltaPath(arena, path) catch return base.build_id;
-    if (readHeader(dp)) |d| {
+    if (readHeader(io, dp)) |d| {
         if (d.base_id == base.build_id) return d.build_id;
     }
     return base.build_id;
@@ -118,11 +119,11 @@ pub fn stateId(arena: Allocator, path: []const u8) ?u64 {
 
 const Header = struct { build_id: u64, base_id: u64 };
 
-fn readHeader(path: []const u8) ?Header {
-    var f = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer f.close();
+fn readHeader(io: Io, path: []const u8) ?Header {
+    const f = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer f.close(io);
     var head: [88]u8 = undefined;
-    const n = f.readAll(&head) catch return null;
+    const n = f.readPositionalAll(io, &head, 0) catch return null;
     if (n < head.len or !std.mem.eql(u8, head[0..8], index.magic)) return null;
     if (std.mem.readInt(u32, head[8..12], .little) != index.format_version) return null;
     return .{

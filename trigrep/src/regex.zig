@@ -241,7 +241,7 @@ const Parser = struct {
                 if (p.peek() == '<') {
                     p.pos += 1;
                     if (p.peek() == '=' or p.peek() == '!') return error.Unsupported;
-                    const close = std.mem.indexOfScalarPos(u8, p.src, p.pos, '>') orelse return error.BadPattern;
+                    const close = std.mem.findScalarPos(u8, p.src, p.pos, '>') orelse return error.BadPattern;
                     p.pos = close + 1;
                     return try p.groupBody(p.fold);
                 }
@@ -298,7 +298,7 @@ const Parser = struct {
 
     fn lit(p: *Parser, c: u8) Node {
         if (p.fold and std.ascii.isAlphabetic(c)) {
-            var s = Set{ .bytes = ByteSet.initEmpty() };
+            var s = Set{ .bytes = ByteSet.empty };
             s.bytes.set(std.ascii.toLower(c));
             s.bytes.set(std.ascii.toUpper(c));
             return .{ .set = s };
@@ -322,7 +322,7 @@ const Parser = struct {
                     var list: std.ArrayList(Range) = .empty;
                     try list.append(p.arena, .{ cp, cp });
                     for (variants) |v| if (v[1] >= 0x80) try list.append(p.arena, .{ v[1], v[1] });
-                    var s = Set{ .bytes = ByteSet.initEmpty(), .ranges = normalize(list.items) };
+                    var s = Set{ .bytes = ByteSet.empty, .ranges = normalize(list.items) };
                     // A non-ASCII letter whose variant is ASCII (e.g. U+212A Kelvin -> k).
                     for (variants) |v| if (v[1] < 0x80) s.bytes.set(v[1]);
                     return .{ .set = s };
@@ -394,7 +394,7 @@ const Parser = struct {
             negate = true;
             p.pos += 1;
         }
-        var bytes = ByteSet.initEmpty();
+        var bytes = ByteSet.empty;
         var ranges: std.ArrayList(Range) = .empty;
         var first = true;
         while (true) {
@@ -405,7 +405,7 @@ const Parser = struct {
             }
             first = false;
             if (c == '[' and p.peekAt(1) == ':') {
-                const end = std.mem.indexOfPos(u8, p.src, p.pos + 2, ":]") orelse return error.BadPattern;
+                const end = std.mem.findPos(u8, p.src, p.pos + 2, ":]") orelse return error.BadPattern;
                 bytes.setUnion(try posixClass(p.src[p.pos + 2 .. end]));
                 p.pos = end + 2;
                 continue;
@@ -459,7 +459,7 @@ const Parser = struct {
         }
         const norm = normalize(ranges.items);
         if (negate) {
-            var neg = ByteSet.initEmpty();
+            var neg = ByteSet.empty;
             for (0..0x80) |i| {
                 if (!bytes.isSet(i)) neg.set(i);
             }
@@ -471,7 +471,7 @@ const Parser = struct {
 };
 
 fn dotSet() Set {
-    var s = Set{ .bytes = ByteSet.initEmpty(), .ranges = &all_non_ascii };
+    var s = Set{ .bytes = ByteSet.empty, .ranges = &all_non_ascii };
     for (0..0x80) |i| s.bytes.set(i);
     s.bytes.unset('\n');
     return s;
@@ -479,7 +479,7 @@ fn dotSet() Set {
 
 /// \d \w \s (Unicode) and their negations.
 fn classEscape(arena: Allocator, c: u8) Error!Set {
-    var s = Set{ .bytes = ByteSet.initEmpty() };
+    var s = Set{ .bytes = ByteSet.empty };
     const kind = std.ascii.toLower(c);
     for (0..0x80) |i| {
         const b: u8 = @intCast(i);
@@ -498,7 +498,7 @@ fn classEscape(arena: Allocator, c: u8) Error!Set {
         else => unreachable,
     };
     if (std.ascii.isUpper(c)) {
-        var neg = ByteSet.initEmpty();
+        var neg = ByteSet.empty;
         for (0..0x80) |i| {
             if (!s.bytes.isSet(i)) neg.set(i);
         }
@@ -508,7 +508,7 @@ fn classEscape(arena: Allocator, c: u8) Error!Set {
 }
 
 fn posixClass(name: []const u8) Error!ByteSet {
-    var s = ByteSet.initEmpty();
+    var s = ByteSet.empty;
     for (0..0x80) |i| {
         const b: u8 = @intCast(i);
         const in = if (std.mem.eql(u8, name, "alpha")) std.ascii.isAlphabetic(b)
@@ -643,7 +643,7 @@ const Compiler = struct {
             _ = try c.emit(.{ .byte = lo });
             return;
         }
-        var bs = ByteSet.initEmpty();
+        var bs = ByteSet.empty;
         bs.setRangeValue(.{ .start = lo, .end = @as(usize, hi) + 1 }, true);
         const idx: u32 = @intCast(c.sets.items.len);
         try c.sets.append(c.arena, bs);
@@ -1031,7 +1031,7 @@ pub const Dfa = struct {
             if (f == 0) continue;
             if (f & 1 != 0) return line_start;
             // Dead state: nothing on this line can match.
-            const nl = std.mem.indexOfScalarPos(u8, data, i, '\n') orelse return null;
+            const nl = std.mem.findScalarPos(u8, data, i, '\n') orelse return null;
             i = nl - 1;
         }
         if (line_start < data.len and try d.eolMatch(s)) return line_start;
@@ -1272,7 +1272,7 @@ pub const Matcher = struct {
                         if (d.nextMatchingLine(data, pos, m.empty_matches.?)) |r| return r else |_| d.reset();
                         // This line alone needs more states than fit: check it with the
                         // Pike VM, then carry on with the DFA.
-                        const e = std.mem.indexOfScalarPos(u8, data, pos, '\n') orelse data.len;
+                        const e = std.mem.findScalarPos(u8, data, pos, '\n') orelse data.len;
                         if (m.pikeMatch(data[pos..e])) return pos;
                         pos = e + 1;
                         continue;
@@ -1283,7 +1283,7 @@ pub const Matcher = struct {
                     },
                 }
             }
-            const e = std.mem.indexOfScalarPos(u8, data, pos, '\n') orelse data.len;
+            const e = std.mem.findScalarPos(u8, data, pos, '\n') orelse data.len;
             if (m.isMatch(data[pos..e])) return pos;
             pos = e + 1;
         }
@@ -1506,14 +1506,14 @@ test "one-pass line scan agrees with per-line matching" {
         defer got.deinit(gpa);
         var p: usize = 0;
         while (p <= data.len) {
-            const e = std.mem.indexOfScalarPos(u8, data, p, '\n') orelse data.len;
+            const e = std.mem.findScalarPos(u8, data, p, '\n') orelse data.len;
             if (m.pikeMatch(data[p..e])) try want.append(gpa, p);
             p = e + 1;
         }
         p = 0;
         while (m.nextMatchingLine(data, p)) |ls| {
             try got.append(gpa, ls);
-            p = (std.mem.indexOfScalarPos(u8, data, ls, '\n') orelse data.len) + 1;
+            p = (std.mem.findScalarPos(u8, data, ls, '\n') orelse data.len) + 1;
             if (p > data.len) break;
         }
         std.testing.expectEqualSlices(usize, want.items, got.items) catch |err| {

@@ -1,5 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const Environ = std.process.Environ;
 const regex = @import("regex.zig");
 const query = @import("query.zig");
 const index = @import("index.zig");
@@ -88,7 +90,7 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
-fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
+fn parseArgs(arena: Allocator, io: Io, argv: []const []const u8) !Args {
     var a = Args{};
     var positionals: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
@@ -106,7 +108,7 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
         if (std.mem.startsWith(u8, arg, "--")) {
             var name = arg[2..];
             var inline_value: ?[]const u8 = null;
-            if (std.mem.indexOfScalar(u8, name, '=')) |eq| {
+            if (std.mem.findScalar(u8, name, '=')) |eq| {
                 inline_value = name[eq + 1 ..];
                 name = name[0..eq];
             }
@@ -140,7 +142,7 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
             else if (std.mem.eql(u8, name, "type-list")) {
                 const types = @import("types.zig");
                 var buf: [8192]u8 = undefined;
-                var w = std.fs.File.stdout().writerStreaming(&buf);
+                var w = Io.File.stdout().writerStreaming(io, &buf);
                 for (types.all) |t| {
                     w.interface.print("{s}: ", .{t.name}) catch {};
                     for (t.globs, 0..) |g, k| w.interface.print("{s}{s}", .{ if (k > 0) ", " else "", g }) catch {};
@@ -156,10 +158,10 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
             else if (std.mem.eql(u8, name, "threads")) a.threads = std.fmt.parseInt(usize, value(argv, &i, inline_value, name), 10) catch fail("bad --threads", .{})
             else if (std.mem.eql(u8, name, "stats")) a.stats = true
             else if (std.mem.eql(u8, name, "help")) {
-                std.fs.File.stdout().writeAll(usage) catch {};
+                Io.File.stdout().writeStreamingAll(io, usage) catch {};
                 std.process.exit(0);
             } else if (std.mem.eql(u8, name, "version")) {
-                std.fs.File.stdout().writeAll("trigrep " ++ version ++ "\n") catch {};
+                Io.File.stdout().writeStreamingAll(io, "trigrep " ++ version ++ "\n") catch {};
                 std.process.exit(0);
             }
             // Accepted for ripgrep compatibility; output already looks like this.
@@ -204,11 +206,11 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
                     a.context = .{ .before = n, .after = n };
                 },
                 'h' => {
-                    std.fs.File.stdout().writeAll(usage) catch {};
+                    Io.File.stdout().writeStreamingAll(io, usage) catch {};
                     std.process.exit(0);
                 },
                 'V' => {
-                    std.fs.File.stdout().writeAll("trigrep " ++ version ++ "\n") catch {};
+                    Io.File.stdout().writeStreamingAll(io, "trigrep " ++ version ++ "\n") catch {};
                     std.process.exit(0);
                 },
                 'n', 'H' => {},
@@ -236,7 +238,7 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
     }
     if (a.command == .search and a.pattern == null) {
         if (pos.len == 0) {
-            std.fs.File.stderr().writeAll(usage) catch {};
+            Io.File.stderr().writeStreamingAll(io, usage) catch {};
             std.process.exit(2);
         }
         a.pattern = pos[0];
@@ -247,37 +249,41 @@ fn parseArgs(arena: Allocator, argv: []const []const u8) !Args {
     return a;
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = std.heap.smp_allocator;
+    var threaded: Io.Threaded = .init(gpa, .{ .argv0 = .init(init.args), .environ = init.environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const env = init.environ;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const argv = try std.process.argsAlloc(arena);
+    const argv = try init.args.toSlice(arena);
     if (argv.len > 0 and rgmode.invokedAsRg(argv[0])) {
         const args = try arena.alloc([]const u8, argv.len);
         for (argv, 0..) |x, i| args[i] = x;
-        try rgmode.main(gpa, arena, args);
+        try rgmode.main(gpa, arena, io, env, args);
     }
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "install-rg-shim")) {
-        return installShim(arena, if (argv.len >= 3) argv[2] else null);
+        return installShim(arena, io, env, if (argv.len >= 3) argv[2] else null);
     }
     if (argv.len == 4 and std.mem.eql(u8, argv[1], "__bg-index")) {
-        rgmode.backgroundIndex(gpa, arena, argv[2], argv[3]);
+        rgmode.backgroundIndex(gpa, arena, io, env, argv[2], argv[3]);
         return;
     }
-    const a = try parseArgs(arena, argv);
+    const a = try parseArgs(arena, io, argv);
     var diag = engine.Diag{};
 
     switch (a.command) {
-        .mcp => return mcp.serve(gpa),
-        .watch => return watchMain(gpa, arena, a),
+        .mcp => return mcp.serve(gpa, io, env),
+        .watch => return watchMain(gpa, arena, io, env, a),
         .index => {
             if (a.prune) {
-                const dir = index.cacheDir(arena) catch fail("no index directory: set HOME or TRIGREP_INDEX_DIR", .{});
+                const dir = index.cacheDir(arena, env) catch fail("no index directory: set HOME or TRIGREP_INDEX_DIR", .{});
                 var buf: [4096]u8 = undefined;
-                var w = std.fs.File.stdout().writerStreaming(&buf);
-                const p = index.prune(arena, dir, &w.interface) catch |err| fail("can't read {s}: {s}", .{ dir, @errorName(err) });
+                var w = Io.File.stdout().writerStreaming(io, &buf);
+                const p = index.prune(arena, io, dir, &w.interface) catch |err| fail("can't read {s}: {s}", .{ dir, @errorName(err) });
                 try w.interface.flush();
                 std.debug.print("trigrep: removed {d} ({d:.1} MB), kept {d} ({d:.1} MB) in {s}\n", .{
                     p.removed, @as(f64, @floatFromInt(p.removed_bytes)) / 1e6,
@@ -286,35 +292,35 @@ pub fn main() !void {
                 });
                 return;
             }
-            const target = engine.resolve(arena, a.path, &diag) catch fail("{s}", .{diag.message});
+            const target = engine.resolve(arena, io, a.path, &diag) catch fail("{s}", .{diag.message});
             if (a.update) {
-                const found = (try engine.findIndex(arena, target)) orelse fail("no index covers {s}; run `trigrep index` first", .{target});
-                var v = View.open(arena, found.path) catch |err| fail("can't read index: {s}; run `trigrep index`", .{@errorName(err)});
+                const found = (try engine.findIndex(arena, io, env, target)) orelse fail("no index covers {s}; run `trigrep index` first", .{target});
+                var v = View.open(arena, io, found.path) catch |err| fail("can't read index: {s}; run `trigrep index`", .{@errorName(err)});
                 defer v.close();
-                const entries = try walk.walk(arena, found.root, .{ .hidden = true });
+                const entries = try walk.walk(arena, io, found.root, .{ .hidden = true });
                 const changed = try engine.diffIndex(arena, &v, entries);
-                const u = engine.updateDelta(gpa, arena, found.root, found.path, &v, changed, a.threads) catch |err| fail("update failed: {s}", .{@errorName(err)});
+                const u = engine.updateDelta(gpa, arena, io, env, found.root, found.path, &v, changed, a.threads) catch |err| fail("update failed: {s}", .{@errorName(err)});
                 std.debug.print("trigrep: {s}\n", .{try engine.describeUpdate(arena, u)});
                 return;
             }
-            const b = engine.buildIndex(gpa, arena, target, a.threads) catch |err| fail("indexing failed: {s}", .{@errorName(err)});
+            const b = engine.buildIndex(gpa, arena, io, env, target, a.threads) catch |err| fail("indexing failed: {s}", .{@errorName(err)});
             std.debug.print("trigrep: {s}\n", .{try engine.describeBuild(arena, target, b)});
             return;
         },
         .status => {
-            const target = engine.resolve(arena, a.path, &diag) catch fail("{s}", .{diag.message});
-            const st = (try engine.status(arena, target)) orelse {
+            const target = engine.resolve(arena, io, a.path, &diag) catch fail("{s}", .{diag.message});
+            const st = (try engine.status(arena, io, env, target)) orelse {
                 std.debug.print("trigrep: no index covers {s}; run `trigrep index`\n", .{target});
                 std.process.exit(1);
             };
-            try std.fs.File.stdout().writeAll(try engine.describeStatus(arena, st));
+            try Io.File.stdout().writeStreamingAll(io, try engine.describeStatus(arena, st));
             return;
         },
         .search => {},
     }
 
     var out_buf: [1 << 16]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&out_buf);
+    var stdout = Io.File.stdout().writerStreaming(io, &out_buf);
     const out = &stdout.interface;
     const req = engine.Request{
         .pattern = a.pattern.?,
@@ -334,7 +340,7 @@ pub fn main() !void {
         .threads = a.threads,
         .watch = if (watch.supported) daemonWatchHook() else null,
     };
-    const outcome = engine.run(gpa, arena, req, out, &diag) catch |err| {
+    const outcome = engine.run(gpa, arena, io, env, req, out, &diag) catch |err| {
         out.flush() catch {};
         if (err == error.Failed) fail("{s}", .{diag.message});
         fail("{s}", .{@errorName(err)});
@@ -349,18 +355,19 @@ pub fn main() !void {
 
 /// `trigrep install-rg-shim [DIR]`: make `DIR/rg` a symlink to trigrep, so programs
 /// that run `rg` (Claude Code's Grep with USE_BUILTIN_RIPGREP=0) use the index.
-fn installShim(arena: Allocator, dir_arg: ?[]const u8) !void {
-    const home = std.posix.getenv("HOME") orelse fail("HOME is not set", .{});
+fn installShim(arena: Allocator, io: Io, env: Environ, dir_arg: ?[]const u8) !void {
+    const cwd = Io.Dir.cwd();
+    const home = env.getPosix("HOME") orelse fail("HOME is not set", .{});
     const dir = dir_arg orelse try std.fs.path.join(arena, &.{ home, ".local", "share", "trigrep", "bin" });
-    std.fs.cwd().makePath(dir) catch |err| fail("can't create {s}: {s}", .{ dir, @errorName(err) });
-    const self = try std.fs.selfExePathAlloc(arena);
+    cwd.createDirPath(io, dir) catch |err| fail("can't create {s}: {s}", .{ dir, @errorName(err) });
+    const self = try std.process.executablePathAlloc(io, arena);
     const link = try std.fs.path.join(arena, &.{ dir, "rg" });
-    std.fs.cwd().deleteFile(link) catch {};
-    std.fs.cwd().symLink(self, link, .{}) catch |err| fail("can't create {s}: {s}", .{ link, @errorName(err) });
+    cwd.deleteFile(io, link) catch {};
+    cwd.symLink(io, self, link, .{}) catch |err| fail("can't create {s}: {s}", .{ link, @errorName(err) });
     // The PATH to paste: this directory first, then the current PATH without it.
     var path: std.ArrayList(u8) = .empty;
     try path.appendSlice(arena, dir);
-    var it = std.mem.tokenizeScalar(u8, std.posix.getenv("PATH") orelse "", ':');
+    var it = std.mem.tokenizeScalar(u8, env.getPosix("PATH") orelse "", ':');
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     try seen.put(arena, dir, {});
     while (it.next()) |d| {
@@ -368,10 +375,10 @@ fn installShim(arena: Allocator, dir_arg: ?[]const u8) !void {
         try path.append(arena, ':');
         try path.appendSlice(arena, d);
     }
-    const real = rgmode.realRg(arena);
+    const real = rgmode.realRg(arena, io, env);
 
     var buf: [2048]u8 = undefined;
-    var w = std.fs.File.stdout().writerStreaming(&buf);
+    var w = Io.File.stdout().writerStreaming(io, &buf);
     const out = &w.interface;
     try out.print("Created {s} -> {s}\n\n", .{ link, self });
     if (real == null) try out.writeAll(
@@ -408,9 +415,9 @@ pub fn daemonWatchHook() engine.WatchHook {
     return .{ .ptr = undefined, .changes = daemonChanges, .seeded = daemonSeeded, .rebased = daemonRebased, .auto_update = false };
 }
 
-fn daemonChanges(_: *anyopaque, arena: Allocator, _: []const u8, index_path: []const u8, build_id: u64) ?watch.Changes {
+fn daemonChanges(_: *anyopaque, arena: Allocator, io: Io, _: []const u8, index_path: []const u8, build_id: u64) ?watch.Changes {
     const sock = watch.socketPath(arena, index_path) catch return null;
-    return watch.query(arena, sock, build_id);
+    return watch.query(arena, io, sock, build_id);
 }
 
 fn daemonSeeded(_: *anyopaque, _: []const u8, _: u64, _: []const []const u8) u64 {
@@ -419,37 +426,37 @@ fn daemonSeeded(_: *anyopaque, _: []const u8, _: u64, _: []const []const u8) u64
 
 fn daemonRebased(_: *anyopaque, _: []const u8, _: u64, _: u64) void {}
 
-fn readBuildId(path: []const u8) ?u64 {
+fn readBuildId(io: Io, path: []const u8) ?u64 {
     var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
-    return view.stateId(fba.allocator(), path);
+    return view.stateId(fba.allocator(), io, path);
 }
 
-fn reseed(gpa: Allocator, w: *watch.Watcher, root: []const u8, index_path: []const u8) !void {
+fn reseed(gpa: Allocator, io: Io, w: *watch.Watcher, root: []const u8, index_path: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     w.beginSeed();
-    var v = try View.open(arena, index_path);
+    var v = try View.open(arena, io, index_path);
     defer v.close();
-    const entries = try walk.walk(arena, root, .{ .hidden = true });
+    const entries = try walk.walk(arena, io, root, .{ .hidden = true });
     const changed = try engine.diffIndex(arena, &v, entries);
     _ = w.seed(v.state_id, changed);
     std.debug.print("trigrep: tracking {d} files, {d} changed since indexing\n", .{ entries.len, changed.len });
 }
 
-fn updateFromWatcher(gpa: Allocator, w: *watch.Watcher, root: []const u8, index_path: []const u8, threads: ?usize) !void {
+fn updateFromWatcher(gpa: Allocator, io: Io, env: Environ, w: *watch.Watcher, root: []const u8, index_path: []const u8, threads: ?usize) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var v = try View.open(arena, index_path);
+    var v = try View.open(arena, io, index_path);
     defer v.close();
     const ch = try w.changes(arena, v.state_id);
     if (ch.full) return; // the main loop re-seeds first
     var changed: std.ArrayList([]const u8) = .empty;
     try changed.appendSlice(arena, ch.files);
     for (ch.dirs) |d| {
-        for (try walk.walk(arena, root, .{ .hidden = true, .prefix = d })) |e| try changed.append(arena, e.path);
+        for (try walk.walk(arena, io, root, .{ .hidden = true, .prefix = d })) |e| try changed.append(arena, e.path);
         var id: u32 = 0;
         while (id < v.file_count) : (id += 1) {
             const pth = v.file(id).path;
@@ -457,61 +464,66 @@ fn updateFromWatcher(gpa: Allocator, w: *watch.Watcher, root: []const u8, index_
                 try changed.append(arena, try arena.dupe(u8, pth));
         }
     }
-    const u = try engine.updateDelta(gpa, arena, root, index_path, &v, changed.items, threads);
+    const u = try engine.updateDelta(gpa, arena, io, env, root, index_path, &v, changed.items, threads);
     w.rebased(ch.seq, u.state_id);
     std.debug.print("trigrep: {d} changes; {s}\n", .{ changed.items.len, try engine.describeUpdate(arena, u) });
 }
 
-fn watchMain(gpa: Allocator, arena: Allocator, a: Args) !void {
+/// Wall-clock milliseconds, the clock `Watcher.last_query_ms` is kept in.
+fn nowMs(io: Io) i64 {
+    return Io.Timestamp.now(io, .real).toMilliseconds();
+}
+
+fn watchMain(gpa: Allocator, arena: Allocator, io: Io, env: Environ, a: Args) !void {
     if (!watch.supported) fail("watch is only supported on macOS and Linux", .{});
     var diag = engine.Diag{};
-    const target = engine.resolve(arena, a.path, &diag) catch fail("{s}", .{diag.message});
-    var found = try engine.findIndex(arena, target);
-    if (found == null or readBuildId(found.?.path) == null) {
-        const r = if (found) |f| f.root else ((try engine.gitRoot(arena, target)) orelse target);
-        const b = engine.buildIndex(gpa, arena, r, a.threads) catch |err| fail("indexing failed: {s}", .{@errorName(err)});
+    const target = engine.resolve(arena, io, a.path, &diag) catch fail("{s}", .{diag.message});
+    var found = try engine.findIndex(arena, io, env, target);
+    if (found == null or readBuildId(io, found.?.path) == null) {
+        const r = if (found) |f| f.root else ((try engine.gitRoot(arena, io, target)) orelse target);
+        const b = engine.buildIndex(gpa, arena, io, env, r, a.threads) catch |err| fail("indexing failed: {s}", .{@errorName(err)});
         std.debug.print("trigrep: {s}\n", .{try engine.describeBuild(arena, r, b)});
         found = .{ .root = r, .path = b.path };
     }
     const root = found.?.root;
     const index_path = found.?.path;
-    const w = try watch.Watcher.create(gpa, root, true);
+    const w = try watch.Watcher.create(gpa, io, root, true);
     if (w.failed) fail("can't watch {s}", .{root});
     const sock = try watch.socketPath(arena, index_path);
-    watch.ensureSocketDir(sock) catch |err| fail("socket directory for {s}: {s}", .{ sock, @errorName(err) });
+    watch.ensureSocketDir(io, sock) catch |err| fail("socket directory for {s}: {s}", .{ sock, @errorName(err) });
     _ = try std.Thread.spawn(.{}, watch.serve, .{ w, sock });
     std.debug.print("trigrep: watching {s} (socket {s}); Ctrl-C stops\n", .{ root, sock });
 
-    var quiet_since = std.time.milliTimestamp();
-    w.last_query_ms.store(std.time.milliTimestamp(), .monotonic);
+    var quiet_since = nowMs(io);
+    w.last_query_ms.store(nowMs(io), .monotonic);
     var last_count: usize = 0;
     while (true) {
         const p = w.pending();
-        const current = readBuildId(index_path);
+        const current = readBuildId(io, index_path);
         if (p.needs_seed or current == null or current.? != w.base_id) {
             if (current == null) {
-                const b = engine.buildIndex(gpa, arena, root, a.threads) catch |err| fail("indexing failed: {s}", .{@errorName(err)});
+                const b = engine.buildIndex(gpa, arena, io, env, root, a.threads) catch |err| fail("indexing failed: {s}", .{@errorName(err)});
                 std.debug.print("trigrep: {s}\n", .{try engine.describeBuild(arena, root, b)});
             }
-            reseed(gpa, w, root, index_path) catch |err| std.debug.print("trigrep: re-seed failed: {s}\n", .{@errorName(err)});
+            reseed(gpa, io, w, root, index_path) catch |err| std.debug.print("trigrep: re-seed failed: {s}\n", .{@errorName(err)});
         } else {
-            if (p.count != last_count) quiet_since = std.time.milliTimestamp();
+            if (p.count != last_count) quiet_since = nowMs(io);
             last_count = p.count;
             // Enough changes and a quiet second (e.g. after a branch switch): fold them
             // into the index delta (or rebuild, if the delta would get too big).
-            if (p.count >= engine.auto_update_threshold and std.time.milliTimestamp() - quiet_since > 1000) {
-                updateFromWatcher(gpa, w, root, index_path, a.threads) catch |err|
+            if (p.count >= engine.auto_update_threshold and nowMs(io) - quiet_since > 1000) {
+                updateFromWatcher(gpa, io, env, w, root, index_path, a.threads) catch |err|
                     std.debug.print("trigrep: index update failed: {s}\n", .{@errorName(err)});
             }
         }
         if (a.idle_exit_min) |mins| {
-            if (std.time.milliTimestamp() - w.last_query_ms.load(.monotonic) > mins * 60 * 1000) {
-                std.fs.cwd().deleteFile(sock) catch {};
+            if (nowMs(io) - w.last_query_ms.load(.monotonic) > mins * 60 * 1000) {
+                Io.Dir.cwd().deleteFile(io, sock) catch {};
                 std.debug.print("trigrep: no searches for {d} minutes, exiting\n", .{mins});
                 std.process.exit(0);
             }
         }
-        std.Thread.sleep(500 * std.time.ns_per_ms);
+        io.sleep(.fromMilliseconds(500), .awake) catch {};
     }
 }
 

@@ -62,7 +62,7 @@ const Analyzer = struct {
         var items: std.ArrayList(Query) = .empty;
         var i: usize = 0;
         while (i + 3 <= s.len) : (i += 1) {
-            if (std.mem.indexOfScalar(u8, s[i .. i + 3], '\n') != null) continue;
+            if (std.mem.findScalar(u8, s[i .. i + 3], '\n') != null) continue;
             const t = trigramKey(s[i], s[i + 1], s[i + 2]);
             for (items.items) |q| {
                 if (q.tri == t) break;
