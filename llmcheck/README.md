@@ -23,8 +23,8 @@ standard library; one binary of about 1 MB, static on Linux. It talks only to
 the addresses you give it.
 
 **State: 0.1.0, tested only against the stand-in server that ships with it
-(`llmcheck-fake`), on macOS. Not yet run against a real model server, and the
-Windows binary has been compiled but not run.** See [Limits](#limits).
+(`llmcheck-fake`): by hand on macOS, and by the tests in CI on macOS, Linux
+and Windows. Not yet run against a real model server.** See [Limits](#limits).
 
 ## Using it from an agent
 
@@ -236,7 +236,9 @@ Faults: `drops_grammar`, `tool_in_content`, `truncate_context`,
   the token probabilities: servers differ in whether and how they return them
   (stock `llama-server`, for one, is reported not to return them for
   prompt tokens).
-- **The Windows and Linux binaries have been compiled, not run.**
+- **On Linux and Windows only the tests have run it** (the unit tests and
+  `scripts/smoke.sh`, in CI, against the stand-in server); nobody has used it
+  there by hand yet.
 - On Windows the system takes a while (a second or two) to report that
   nothing listens at an address. With a `--timeout` shorter than that, a
   server that is not there is reported as "no answer within …" instead of
