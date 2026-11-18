@@ -1,5 +1,5 @@
 //! Keeps a list of paths changed since an index was built, from OS file events
-//! (FSEvents on macOS, inotify on Linux), so a search can re-check only those instead
+//! (FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on Windows), so a search can re-check only those instead
 //! of stat-ing every file.
 //!
 //! Correctness rule: whenever the watcher can't vouch for its list (dropped events, an
@@ -12,7 +12,18 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const walk = @import("walk.zig");
 
-pub const supported = builtin.os.tag == .macos or builtin.os.tag == .linux;
+pub const supported = builtin.os.tag == .macos or builtin.os.tag == .linux or builtin.os.tag == .windows;
+/// `trigrep watch`, the daemon other processes ask over a Unix socket. Not on
+/// Windows, where only the MCP server watches (in its own process).
+pub const daemon = builtin.os.tag == .macos or builtin.os.tag == .linux;
+/// Whether `sync` proves delivery with a cookie file (the backend has no
+/// queue to drain on demand).
+const cookies = builtin.os.tag == .macos or builtin.os.tag == .windows;
+
+fn processId() u32 {
+    if (builtin.os.tag == .windows) return DirChanges.win.GetCurrentProcessId();
+    return @intCast(std.c.getpid());
+}
 
 pub const Changes = struct {
     /// The caller must walk the whole tree; `files` and `dirs` are empty.
@@ -44,7 +55,7 @@ pub const Watcher = struct {
     backend: Backend = .{},
     /// The backend couldn't start or broke: always report `full`.
     failed: bool = false,
-    /// Cookie files (macOS): `sync` creates one and waits for its event, which proves
+    /// Cookie files (macOS, Windows): `sync` creates one and waits for its event, which proves
     /// every earlier change has been delivered.
     cookie_dir: []const u8 = "",
     cookie_prefix: []const u8 = "",
@@ -68,7 +79,7 @@ pub const Watcher = struct {
         defer gpa.free(git);
         const in_git = if (Io.Dir.cwd().statFile(io, git, .{})) |st| st.kind == .directory else |_| false;
         w.cookie_dir = try gpa.dupe(u8, if (in_git) git else root);
-        w.cookie_prefix = try std.fmt.allocPrint(gpa, "{s}.trigrep-cookie-{d}-", .{ if (in_git) ".git/" else "", std.c.getpid() });
+        w.cookie_prefix = try std.fmt.allocPrint(gpa, "{s}.trigrep-cookie-{d}-", .{ if (in_git) ".git/" else "", processId() });
         w.backend.start(w) catch |err| {
             std.debug.print("trigrep: can't watch {s} ({s}); searches will walk the tree\n", .{ root, @errorName(err) });
             w.failed = true;
@@ -140,7 +151,7 @@ pub const Watcher = struct {
     /// Makes sure every change made before this call has been recorded. False if that
     /// can't be confirmed (the caller must then walk).
     fn sync(w: *Watcher) bool {
-        if (builtin.os.tag != .macos) {
+        if (!cookies) {
             w.backend.flush(w);
             return true;
         }
@@ -254,6 +265,7 @@ pub const Watcher = struct {
 const Backend = switch (builtin.os.tag) {
     .macos => FsEvents,
     .linux => Inotify,
+    .windows => DirChanges,
     else => Unsupported,
 };
 
@@ -538,6 +550,155 @@ const Inotify = struct {
             return;
         }
         w.record(rel, false);
+    }
+};
+
+/// Windows: one ReadDirectoryChangesW request on the root covers the whole
+/// tree. The request is pending from `start` on and renewed by a thread, and
+/// the system keeps events that arrive between two requests, so none is lost.
+const DirChanges = struct {
+    dir: ?*anyopaque = null,
+    event: ?*anyopaque = null,
+    ov: win.Overlapped = .{},
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+    owner: ?*Watcher = null,
+    buf: [64 * 1024]u8 align(@alignOf(u32)) = undefined,
+
+    const win = struct {
+        const Overlapped = extern struct {
+            internal: usize = 0,
+            internal_high: usize = 0,
+            offset: u32 = 0,
+            offset_high: u32 = 0,
+            event: ?*anyopaque = null,
+        };
+        extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+        extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, security: ?*anyopaque, disposition: u32, flags: u32, template: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+        extern "kernel32" fn CreateEventW(security: ?*anyopaque, manual_reset: i32, initial: i32, name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+        extern "kernel32" fn ReadDirectoryChangesW(dir: ?*anyopaque, buf: *anyopaque, len: u32, subtree: i32, filter: u32, returned: ?*u32, overlapped: ?*Overlapped, completion: ?*anyopaque) callconv(.winapi) i32;
+        extern "kernel32" fn GetOverlappedResult(file: ?*anyopaque, overlapped: *Overlapped, transferred: *u32, wait: i32) callconv(.winapi) i32;
+        extern "kernel32" fn WaitForSingleObject(handle: ?*anyopaque, ms: u32) callconv(.winapi) u32;
+        extern "kernel32" fn CancelIoEx(file: ?*anyopaque, overlapped: ?*Overlapped) callconv(.winapi) i32;
+        extern "kernel32" fn CloseHandle(handle: ?*anyopaque) callconv(.winapi) i32;
+
+        const invalid_handle: usize = std.math.maxInt(usize);
+        const file_list_directory: u32 = 0x1;
+        const share_all: u32 = 0x7;
+        const open_existing: u32 = 3;
+        const flag_backup_semantics: u32 = 0x02000000;
+        const flag_overlapped: u32 = 0x40000000;
+        // names of files and directories, size, last write, creation
+        const filter: u32 = 0x1 | 0x2 | 0x8 | 0x10 | 0x40;
+        const wait_object_0: u32 = 0;
+        const action_removed: u32 = 2;
+        const action_modified: u32 = 3;
+        const action_renamed_old: u32 = 4;
+    };
+
+    fn start(dc: *DirChanges, w: *Watcher) !void {
+        const root16 = try std.unicode.wtf8ToWtf16LeAllocZ(w.gpa, w.root);
+        defer w.gpa.free(root16);
+        const dir = win.CreateFileW(root16, win.file_list_directory, win.share_all, null, win.open_existing, win.flag_backup_semantics | win.flag_overlapped, null);
+        if (dir == null or @intFromPtr(dir) == win.invalid_handle) return error.FileNotFound;
+        errdefer _ = win.CloseHandle(dir);
+        const event = win.CreateEventW(null, 1, 0, null) orelse return error.SystemResources;
+        errdefer _ = win.CloseHandle(event);
+        dc.* = .{ .dir = dir, .event = event, .owner = w };
+        dc.ov.event = event;
+        if (!dc.request()) return error.Unexpected;
+        dc.thread = try std.Thread.spawn(.{}, loop, .{dc});
+    }
+
+    fn stop(dc: *DirChanges) void {
+        if (dc.dir == null) return;
+        dc.stopping.store(true, .release);
+        if (dc.thread) |t| t.join();
+        // The request is still pending: cancel it and wait until the system
+        // has let go of the buffer.
+        _ = win.CancelIoEx(dc.dir, &dc.ov);
+        var n: u32 = 0;
+        _ = win.GetOverlappedResult(dc.dir, &dc.ov, &n, 1);
+        _ = win.CloseHandle(dc.event);
+        _ = win.CloseHandle(dc.dir);
+        dc.dir = null;
+    }
+
+    fn flush(_: *DirChanges, _: *Watcher) void {}
+
+    fn request(dc: *DirChanges) bool {
+        return win.ReadDirectoryChangesW(dc.dir, &dc.buf, dc.buf.len, 1, win.filter, null, &dc.ov, null) != 0;
+    }
+
+    fn loop(dc: *DirChanges) void {
+        const w = dc.owner.?;
+        while (!dc.stopping.load(.acquire)) {
+            if (win.WaitForSingleObject(dc.event, 200) != win.wait_object_0) continue;
+            var n: u32 = 0;
+            const ok = win.GetOverlappedResult(dc.dir, &dc.ov, &n, 0) != 0;
+            w.mutex.lockUncancelable(w.io);
+            // No bytes: more happened than the buffer holds.
+            if (!ok or n == 0) w.full = true else dc.handle(w, dc.buf[0..n]);
+            const renewed = dc.request();
+            if (!renewed) w.failed = true;
+            w.mutex.unlock(w.io);
+            if (!renewed) {
+                std.debug.print("trigrep: can't watch {s} any more; searches will walk the tree\n", .{w.root});
+                // `stop` still expects a request it can wait for.
+                while (!dc.stopping.load(.acquire)) w.io.sleep(.fromMilliseconds(200), .awake) catch {};
+                return;
+            }
+        }
+    }
+
+    /// The records in `data` (FILE_NOTIFY_INFORMATION: next offset, action,
+    /// name length in bytes, name in UTF-16 with backslashes).
+    fn handle(dc: *DirChanges, w: *Watcher, data: []align(@alignOf(u32)) const u8) void {
+        _ = dc;
+        var off: usize = 0;
+        while (off + 12 <= data.len) {
+            const next = std.mem.readInt(u32, data[off..][0..4], .little);
+            const action = std.mem.readInt(u32, data[off + 4 ..][0..4], .little);
+            const name_len = std.mem.readInt(u32, data[off + 8 ..][0..4], .little);
+            if (off + 12 + name_len > data.len) break;
+            // records start on 4-byte boundaries, so the name is aligned
+            const name16: []const u16 = @ptrCast(@alignCast(data[off + 12 ..][0..name_len]));
+            one(w, action, name16);
+            if (next == 0) break;
+            off += next;
+        }
+    }
+
+    fn one(w: *Watcher, action: u32, name16: []const u16) void {
+        var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (name16.len * 3 > rel_buf.len) {
+            w.full = true;
+            return;
+        }
+        const rel = rel_buf[0..std.unicode.wtf16LeToWtf8(&rel_buf, name16)];
+        std.mem.replaceScalar(u8, rel, '\\', '/');
+        if (action == win.action_removed or action == win.action_renamed_old) {
+            // Gone, so there is no telling what it was: a file, and a
+            // directory whose files are all gone with it.
+            w.record(rel, false);
+            w.record(rel, true);
+            return;
+        }
+        var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs = std.fmt.bufPrint(&abs_buf, "{s}/{s}", .{ w.root, rel }) catch {
+            w.full = true;
+            return;
+        };
+        const st = Io.Dir.cwd().statFile(w.io, abs, .{}) catch {
+            // Already gone again (a cookie, a temporary file).
+            w.record(rel, false);
+            return;
+        };
+        if (st.kind == .directory) {
+            // A directory is "modified" whenever something in it is: those
+            // changes come with their own records.
+            if (action != win.action_modified) w.record(rel, true);
+        } else w.record(rel, false);
     }
 };
 

@@ -17,6 +17,8 @@ trigrep watch &                      # optional: searches skip the freshness wal
 
 Output is `path:line:text`, like `rg -n --no-heading`. Exit status is 0 if something matched, 1 if not, 2 on error.
 
+macOS, Linux and Windows (x86_64). [On Windows](#windows) a few things differ.
+
 ## MCP server
 
 `trigrep mcp` speaks the Model Context Protocol over stdio, so agents can call it as a tool. To register it with Claude Code:
@@ -62,9 +64,9 @@ The index has a base and a small *delta*: files that changed, appeared or were d
 
 ## Watching
 
-`trigrep watch [PATH]` keeps a list of files changed since indexing, from FSEvents (macOS) or inotify (Linux), and serves it over a Unix socket in `/tmp/trigrep-$UID/`. While it runs, searches under that root re-check only those files instead of walking the whole tree. It updates the index delta on its own after a burst of 300 or more changes (a branch switch, say) once things are quiet for a second. `trigrep mcp` does the same in-process.
+`trigrep watch [PATH]` keeps a list of files changed since indexing, from FSEvents (macOS) or inotify (Linux), and serves it over a Unix socket in `/tmp/trigrep-$UID/`. While it runs, searches under that root re-check only those files instead of walking the whole tree. It updates the index delta on its own after a burst of 300 or more changes (a branch switch, say) once things are quiet for a second. `trigrep mcp` does the same in-process, on Windows too (ReadDirectoryChangesW), where there is no `trigrep watch`.
 
-Results stay correct when the watcher can't vouch for its list: dropped events, a changed `.gitignore`, an index rebuilt by someone else, or a filesystem without events all make the next search walk the tree and re-seed the watcher. On macOS, each search first writes a cookie file (in `.git` when there is one) and waits for its event, as Watchman does, so an edit made just before the search is never missed. On Linux, inotify queues events synchronously, so draining the queue is enough.
+Results stay correct when the watcher can't vouch for its list: dropped events, a changed `.gitignore`, an index rebuilt by someone else, or a filesystem without events all make the next search walk the tree and re-seed the watcher. On macOS, each search first writes a cookie file (in `.git` when there is one) and waits for its event, as Watchman does, so an edit made just before the search is never missed. On Linux, inotify queues events synchronously, so draining the queue is enough. Windows uses the cookie file, as macOS does.
 
 ## Benchmarks
 
@@ -119,9 +121,20 @@ Reproduce: `zig build -Doptimize=ReleaseFast`, then `python3 scripts/bench.py DI
 - Faster scans for patterns the index can't narrow (a reverse-DFA "inner literal" search, as ripgrep's regex engine does).
 - Multiple PATH arguments.
 
+## Windows
+
+Search, the index, `--json`, the ripgrep shim and the MCP server work as elsewhere. What differs:
+
+- Paths are printed with forward slashes (`src/deep/b.zig`, `D:/repo/src/a.c`), also where ripgrep would print backslashes. Arguments may use either.
+- Indexes live in `%LOCALAPPDATA%\trigrep` (or `TRIGREP_INDEX_DIR`).
+- There is no `trigrep watch`: CLI searches check every file's size and time on each run. The MCP server watches the repositories it has searched by itself, so its later searches skip that walk.
+- An index is read into memory instead of mapped, so that it can be replaced while a search has it open. A search in a very large repository pays for reading the whole index each time.
+- `install-rg-shim` makes `rg.exe` a copy of trigrep (a symlink needs a privilege); run it again after updating trigrep. The shim takes any `rg.exe` on PATH of trigrep's own size for another copy of itself.
+- Tested on Windows 11 with the unit tests and by hand (search, updates, ignore files, the MCP server under a few hundred changes). Handing a search on to a real ripgrep has not been run there.
+
 ## Building
 
-Zig 0.17.1. `zig build -Doptimize=ReleaseFast` puts the binary in `zig-out/bin/trigrep`; `zig build test` runs the tests. No dependencies beyond the Zig standard library and libc (and CoreServices on macOS, for FSEvents).
+Zig 0.17.1. `zig build -Doptimize=ReleaseFast` puts the binary in `zig-out/bin/trigrep` (`trigrep.exe` on Windows); `zig build test` runs the tests. No dependencies beyond the Zig standard library and libc (and CoreServices on macOS, for FSEvents).
 
 ## License
 

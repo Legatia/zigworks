@@ -216,18 +216,19 @@ pub const Checker = struct {
         const arena = c.arena_state.allocator();
         var rules: std.ArrayList(Rule) = .empty;
         const base = try arena.dupe(u8, dir_rel);
-        const opened: ?Io.Dir = if (dir_rel.len == 0) null else (c.root.openDir(c.io, dir_rel, .{}) catch null);
-        defer if (opened) |d| d.close(c.io);
-        const dir = if (dir_rel.len == 0) c.root else opened;
-        if (dir) |d| {
-            const names = if (dir_rel.len == 0)
-                &[_][]const u8{ ".git/info/exclude", ".gitignore", ".ignore" }
-            else
-                &[_][]const u8{ ".gitignore", ".ignore" };
-            for (names) |name| {
-                const text = d.readFileAlloc(c.io, name, arena, ignore_file_limit) catch continue;
-                try parseIgnoreFile(arena, text, base, &rules);
-            }
+        const names = if (dir_rel.len == 0)
+            &[_][]const u8{ ".git/info/exclude", ".gitignore", ".ignore" }
+        else
+            &[_][]const u8{ ".gitignore", ".ignore" };
+        for (names) |name| {
+            // By path from the root, without opening the directory: on
+            // Windows a directory that is deleted while this holds it open
+            // only goes away when it is closed, and until then opening a
+            // file in it is retried for seconds.
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const path = if (dir_rel.len == 0) name else std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_rel, name }) catch continue;
+            const text = c.root.readFileAlloc(c.io, path, arena, ignore_file_limit) catch continue;
+            try parseIgnoreFile(arena, text, base, &rules);
         }
         var node = parent;
         if (rules.items.len > 0) {

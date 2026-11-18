@@ -18,9 +18,10 @@ const engine = @import("engine.zig");
 const index = @import("index.zig");
 const search = @import("search.zig");
 const view = @import("view.zig");
+const plat = @import("plat.zig");
 
 pub fn invokedAsRg(argv0: []const u8) bool {
-    return std.mem.eql(u8, std.fs.path.basename(argv0), "rg");
+    return std.mem.eql(u8, plat.stripExe(std.fs.path.basename(argv0)), "rg");
 }
 
 const Parsed = struct {
@@ -136,18 +137,24 @@ fn parse(arena: Allocator, args: []const []const u8) !?Parsed {
 
 /// The real ripgrep: $TRIGREP_REAL_RG, or the first `rg` on PATH that isn't us.
 pub fn realRg(arena: Allocator, io: Io, env: Environ) ?[]const u8 {
-    if (env.getPosix("TRIGREP_REAL_RG")) |p| return p;
+    if (plat.getenv(arena, env, "TRIGREP_REAL_RG")) |p| return p;
     const cwd = Io.Dir.cwd();
     const self: []const u8 = std.process.executablePathAlloc(io, arena) catch return null;
     const self_real: []const u8 = cwd.realPathFileAlloc(io, self, arena) catch self;
-    const path = env.getPosix("PATH") orelse return null;
-    var it = std.mem.tokenizeScalar(u8, path, ':');
+    const path = plat.getenv(arena, env, "PATH") orelse return null;
+    const self_size: ?u64 = if (plat.windows) (if (cwd.statFile(io, self_real, .{})) |st| st.size else |_| null) else null;
+    var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
     while (it.next()) |dir| {
-        const cand = std.fs.path.join(arena, &.{ dir, "rg" }) catch continue;
+        const cand = std.fs.path.join(arena, &.{ dir, plat.exeName("rg") }) catch continue;
         const real: []const u8 = cwd.realPathFileAlloc(io, cand, arena) catch continue;
         if (std.mem.eql(u8, real, self_real)) continue;
-        if (std.mem.eql(u8, std.fs.path.basename(real), "trigrep")) continue;
-        cwd.access(io, real, .{ .execute = true }) catch continue;
+        if (std.mem.eql(u8, plat.stripExe(std.fs.path.basename(real)), "trigrep")) continue;
+        if (plat.windows) {
+            // The shim is a copy of trigrep there, not a link to it: a
+            // file of the same size as this program is taken for one.
+            const st = cwd.statFile(io, real, .{}) catch continue;
+            if (self_size != null and st.size == self_size.?) continue;
+        } else cwd.access(io, real, .{ .execute = true }) catch continue;
         return real;
     }
     return null;
@@ -207,10 +214,16 @@ fn age(io: Io, st: Io.File.Stat) i128 {
     return Io.Timestamp.now(io, .real).nanoseconds - st.mtime.nanoseconds;
 }
 
-/// Starts `argv` without waiting for it: no stdio, and its own process group, so
-/// it isn't killed with the caller's.
+/// Starts `argv` without waiting for it: no stdio, and its own process group
+/// (on Windows: no console), so it isn't killed with the caller's.
 fn spawnDetached(io: Io, argv: []const []const u8) !void {
-    _ = try std.process.spawn(io, .{
+    _ = try std.process.spawn(io, if (plat.windows) .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .create_no_window = true,
+    } else .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .ignore,
@@ -222,6 +235,7 @@ fn spawnDetached(io: Io, argv: []const []const u8) !void {
 /// Starts `trigrep watch --idle-exit 30 ROOT` detached if nothing answers on its socket.
 fn ensureDaemon(arena: Allocator, io: Io, root: []const u8, index_path: []const u8) void {
     const watch = @import("watch.zig");
+    if (!watch.daemon) return;
     const cwd = Io.Dir.cwd();
     const sock = watch.socketPath(arena, index_path) catch return;
     if (connectUnix(io, sock)) |stream| {
@@ -245,12 +259,14 @@ fn connectUnix(io: Io, sock: []const u8) !Io.net.Stream {
     return addr.connect(io);
 }
 
-extern "c" fn nice(inc: c_int) c_int;
+const posix_c = struct {
+    extern "c" fn nice(inc: c_int) c_int;
+};
 
 /// `trigrep __bg-index ROOT LOCK`: build the index at low priority, remove the
 /// lock, then drop indexes of repositories that have been deleted.
 pub fn backgroundIndex(gpa: Allocator, arena: Allocator, io: Io, env: Environ, root: []const u8, lock: []const u8) void {
-    _ = nice(10);
+    if (!plat.windows) _ = posix_c.nice(10);
     {
         defer Io.Dir.cwd().deleteFile(io, lock) catch {};
         _ = engine.buildIndex(gpa, arena, io, env, root, null) catch return;
@@ -264,12 +280,12 @@ pub fn backgroundIndex(gpa: Allocator, arena: Allocator, io: Io, env: Environ, r
 /// home directory or above it (dotfiles kept in git), where an index would
 /// take in everything the user owns. `trigrep index` still works anywhere.
 fn autoIndexRoot(arena: Allocator, io: Io, env: Environ, target: []const u8) !?[]const u8 {
-    if (env.getPosix("TRIGREP_RG_AUTO_INDEX")) |v| {
+    if (plat.getenv(arena, env, "TRIGREP_RG_AUTO_INDEX")) |v| {
         if (std.mem.eql(u8, v, "0")) return null;
     }
     const root = (try engine.gitRoot(arena, io, target)) orelse return null;
-    if (env.getPosix("HOME")) |home| {
-        const real: []const u8 = Io.Dir.cwd().realPathFileAlloc(io, home, arena) catch home;
+    if (plat.home(arena, env)) |home| {
+        const real: []const u8 = if (Io.Dir.cwd().realPathFileAlloc(io, home, arena)) |r| plat.slashes(r) else |_| home;
         if (contains(root, real)) return null;
     }
     return root;
@@ -294,7 +310,7 @@ pub fn main(gpa: Allocator, arena: Allocator, io: Io, env: Environ, argv: []cons
     if (found == null or view.stateId(arena, io, found.?.path) == null) {
         // No usable index: real rg answers; index only if this was slow.
         const r = timedRg(arena, io, env, argv) catch passthrough(arena, io, env, argv);
-        const min_ms: i64 = if (env.getPosix("TRIGREP_RG_MIN_MS")) |s| (std.fmt.parseInt(i64, s, 10) catch 300) else 300;
+        const min_ms: i64 = if (plat.getenv(arena, env, "TRIGREP_RG_MIN_MS")) |s| (std.fmt.parseInt(i64, s, 10) catch 300) else 300;
         if (r.ms >= min_ms) {
             const root = if (found) |f| f.root else try autoIndexRoot(arena, io, env, target);
             if (root) |dir| startBackgroundIndex(arena, io, env, dir);
@@ -306,7 +322,7 @@ pub fn main(gpa: Allocator, arena: Allocator, io: Io, env: Environ, argv: []cons
     // check freshness: hand it over.
     if (found.?.root.len < target.len) {
         const prefix = target[found.?.root.len + 1 ..];
-        const min_files: u32 = if (env.getPosix("TRIGREP_RG_MIN_FILES")) |s| (std.fmt.parseInt(u32, s, 10) catch 3000) else 3000;
+        const min_files: u32 = if (plat.getenv(arena, env, "TRIGREP_RG_MIN_FILES")) |s| (std.fmt.parseInt(u32, s, 10) catch 3000) else 3000;
         var ix = index.Index.open(io, found.?.path) catch passthrough(arena, io, env, argv);
         const n = ix.countUnder(prefix);
         ix.close();
@@ -316,7 +332,7 @@ pub fn main(gpa: Allocator, arena: Allocator, io: Io, env: Environ, argv: []cons
     // The daemon keeps freshness cheap; without one, this search walks the tree and a
     // daemon is started for the next ones (it exits after 30 idle minutes).
     req.watch = null;
-    if (@import("watch.zig").supported) {
+    if (@import("watch.zig").daemon) {
         req.watch = daemonHook();
         ensureDaemon(arena, io, found.?.root, found.?.path);
     }

@@ -19,6 +19,7 @@ jobs:
         include:
           # headsound's file commands also run on Windows (for GoldWave users)
           - { os: windows-latest, project: headsound }
+          - { os: windows-latest, project: trigrep }
           - { os: windows-latest, project: llmcheck }
     runs-on: ${{ matrix.os }}
     defaults:

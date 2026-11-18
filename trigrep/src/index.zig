@@ -16,6 +16,7 @@
 //! id is stale and ignored.
 
 const std = @import("std");
+const plat = @import("plat.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Environ = std.process.Environ;
@@ -72,7 +73,8 @@ pub fn extractTrigrams(gpa: Allocator, data: []const u8, seen: []u64, out: *std.
 }
 
 /// Where the index for `root` (an absolute path) lives: $TRIGREP_INDEX_DIR,
-/// $XDG_CACHE_HOME/trigrep or ~/.cache/trigrep, named by a hash of the root.
+/// $XDG_CACHE_HOME/trigrep or ~/.cache/trigrep (on Windows %LOCALAPPDATA%\trigrep),
+/// named by a hash of the root.
 pub fn pathFor(arena: Allocator, env: Environ, root: []const u8) ![]u8 {
     const dir = try cacheDir(arena, env);
     const h = std.hash.Wyhash.hash(0, root);
@@ -81,11 +83,17 @@ pub fn pathFor(arena: Allocator, env: Environ, root: []const u8) ![]u8 {
 
 /// The directory all indexes live in.
 pub fn cacheDir(arena: Allocator, env: Environ) ![]u8 {
-    return if (env.getPosix("TRIGREP_INDEX_DIR")) |d|
+    return plat.slashes(try cacheDirRaw(arena, env));
+}
+
+fn cacheDirRaw(arena: Allocator, env: Environ) ![]u8 {
+    return if (plat.getenv(arena, env, "TRIGREP_INDEX_DIR")) |d|
         try arena.dupe(u8, d)
-    else if (env.getPosix("XDG_CACHE_HOME")) |d|
+    else if (plat.getenv(arena, env, "XDG_CACHE_HOME")) |d|
         try std.fs.path.join(arena, &.{ d, "trigrep" })
-    else if (env.getPosix("HOME")) |h|
+    else if (plat.windows)
+        try std.fs.path.join(arena, &.{ plat.getenv(arena, env, "LOCALAPPDATA") orelse return error.NoCacheDir, "trigrep" })
+    else if (plat.getenv(arena, env, "HOME")) |h|
         try std.fs.path.join(arena, &.{ h, ".cache", "trigrep" })
     else
         error.NoCacheDir;
@@ -449,8 +457,8 @@ pub const Index = struct {
         defer f.close(io);
         const size: usize = @intCast((try f.stat(io)).size);
         if (size < header_len) return error.BadIndex;
-        const data = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, f.handle, 0);
-        errdefer std.posix.munmap(data);
+        const data = try plat.mapFile(io, f, size);
+        errdefer plat.unmapFile(data);
         if (!std.mem.eql(u8, data[0..8], magic)) return error.BadIndex;
         if (rd32(data, 8) != format_version) return error.BadIndex;
         const end = rd64(data, 64);
@@ -477,7 +485,7 @@ pub const Index = struct {
     }
 
     pub fn close(ix: *Index) void {
-        std.posix.munmap(ix.data);
+        plat.unmapFile(ix.data);
     }
 
     fn rd32(d: []const u8, off: usize) u32 {

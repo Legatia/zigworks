@@ -13,6 +13,7 @@ const View = @import("view.zig").View;
 const walk = @import("walk.zig");
 const search = @import("search.zig");
 const watch = @import("watch.zig");
+const plat = @import("plat.zig");
 
 pub const Diag = struct {
     message: []const u8 = "",
@@ -116,9 +117,13 @@ pub fn findIndex(arena: Allocator, io: Io, env: Environ, target: []const u8) !?F
     }
 }
 
+/// The absolute path of `path` (default: the current directory). On Windows
+/// with forward slashes, which is what paths in an index, ignore rules and
+/// globs are compared by.
 pub fn resolve(arena: Allocator, io: Io, path: ?[]const u8, diag: *Diag) ![]const u8 {
-    return Io.Dir.cwd().realPathFileAlloc(io, path orelse ".", arena) catch |err|
-        failWith(diag, arena, "{s}: {s}", .{ path orelse ".", @errorName(err) });
+    const real = Io.Dir.cwd().realPathFileAlloc(io, path orelse ".", arena) catch |err|
+        return failWith(diag, arena, "{s}: {s}", .{ path orelse ".", @errorName(err) });
+    return plat.slashes(real);
 }
 
 pub const Built = struct { path: []const u8, stats: index.BuildStats, ms: f64 };
@@ -218,7 +223,8 @@ fn relUnder(root: []const u8, target: []const u8) []const u8 {
 }
 
 fn displayPath(arena: Allocator, arg: ?[]const u8, rel_to_target: []const u8) ![]const u8 {
-    const p = arg orelse return rel_to_target;
+    const given = arg orelse return rel_to_target;
+    const p = if (plat.windows) plat.slashes(try arena.dupe(u8, given)) else given;
     const trimmed = std.mem.trimEnd(u8, p, "/");
     if (trimmed.len == 0) return std.fmt.allocPrint(arena, "/{s}", .{rel_to_target});
     return std.fmt.allocPrint(arena, "{s}/{s}", .{ trimmed, rel_to_target });

@@ -12,6 +12,7 @@ const mcp = @import("mcp.zig");
 const watch = @import("watch.zig");
 const view = @import("view.zig");
 const rgmode = @import("rgmode.zig");
+const plat = @import("plat.zig");
 const View = view.View;
 
 pub const version = "0.3.0";
@@ -55,7 +56,8 @@ const usage =
     \\  -V, --version              show the version
     \\
     \\Output is path:line:text. Exit status: 0 if something matched, 1 if not, 2 on error.
-    \\Indexes live in $TRIGREP_INDEX_DIR, $XDG_CACHE_HOME/trigrep or ~/.cache/trigrep.
+    \\Indexes live in $TRIGREP_INDEX_DIR, $XDG_CACHE_HOME/trigrep or ~/.cache/trigrep
+    \\(on Windows: %LOCALAPPDATA%\trigrep).
     \\
 ;
 
@@ -338,7 +340,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .no_index = a.no_index,
         .trust_index = a.trust_index,
         .threads = a.threads,
-        .watch = if (watch.supported) daemonWatchHook() else null,
+        .watch = if (watch.daemon) daemonWatchHook() else null,
     };
     const outcome = engine.run(gpa, arena, io, env, req, out, &diag) catch |err| {
         out.flush() catch {};
@@ -357,22 +359,28 @@ pub fn main(init: std.process.Init.Minimal) !void {
 /// that run `rg` (Claude Code's Grep with USE_BUILTIN_RIPGREP=0) use the index.
 fn installShim(arena: Allocator, io: Io, env: Environ, dir_arg: ?[]const u8) !void {
     const cwd = Io.Dir.cwd();
-    const home = env.getPosix("HOME") orelse fail("HOME is not set", .{});
-    const dir = dir_arg orelse try std.fs.path.join(arena, &.{ home, ".local", "share", "trigrep", "bin" });
+    const dir = dir_arg orelse if (plat.windows)
+        try std.fs.path.join(arena, &.{ plat.getenv(arena, env, "LOCALAPPDATA") orelse fail("LOCALAPPDATA is not set", .{}), "trigrep", "bin" })
+    else
+        try std.fs.path.join(arena, &.{ plat.home(arena, env) orelse fail("HOME is not set", .{}), ".local", "share", "trigrep", "bin" });
     cwd.createDirPath(io, dir) catch |err| fail("can't create {s}: {s}", .{ dir, @errorName(err) });
     const self = try std.process.executablePathAlloc(io, arena);
-    const link = try std.fs.path.join(arena, &.{ dir, "rg" });
+    const link = try std.fs.path.join(arena, &.{ dir, plat.exeName("rg") });
     cwd.deleteFile(io, link) catch {};
-    cwd.symLink(io, self, link, .{}) catch |err| fail("can't create {s}: {s}", .{ link, @errorName(err) });
+    // A copy on Windows, where making a symlink needs a privilege.
+    if (plat.windows)
+        cwd.copyFile(self, cwd, link, io, .{}) catch |err| fail("can't create {s}: {s}", .{ link, @errorName(err) })
+    else
+        cwd.symLink(io, self, link, .{}) catch |err| fail("can't create {s}: {s}", .{ link, @errorName(err) });
     // The PATH to paste: this directory first, then the current PATH without it.
     var path: std.ArrayList(u8) = .empty;
     try path.appendSlice(arena, dir);
-    var it = std.mem.tokenizeScalar(u8, env.getPosix("PATH") orelse "", ':');
+    var it = std.mem.tokenizeScalar(u8, plat.getenv(arena, env, "PATH") orelse "", std.fs.path.delimiter);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     try seen.put(arena, dir, {});
     while (it.next()) |d| {
         if ((try seen.getOrPut(arena, d)).found_existing) continue;
-        try path.append(arena, ':');
+        try path.append(arena, std.fs.path.delimiter);
         try path.appendSlice(arena, d);
     }
     const real = rgmode.realRg(arena, io, env);
@@ -380,7 +388,7 @@ fn installShim(arena: Allocator, io: Io, env: Environ, dir_arg: ?[]const u8) !vo
     var buf: [2048]u8 = undefined;
     var w = Io.File.stdout().writerStreaming(io, &buf);
     const out = &w.interface;
-    try out.print("Created {s} -> {s}\n\n", .{ link, self });
+    try out.print("Created {s} {s} {s}\n\n", .{ link, if (plat.windows) "as a copy of" else "->", self });
     if (real == null) try out.writeAll(
         \\ripgrep was not found on PATH. Install it first: searches trigrep can't
         \\reproduce exactly, and searches in small repositories, are handed to it.
@@ -396,17 +404,28 @@ fn installShim(arena: Allocator, io: Io, env: Environ, dir_arg: ?[]const u8) !vo
     }
     try out.writeAll("  \"PATH\": ");
     try std.json.Stringify.encodeJsonString(path.items, .{}, out);
-    try out.print(
+    try out.print(if (plat.windows)
+        \\
+        \\
+        \\or start Claude Code from PowerShell with:
+        \\  $env:USE_BUILTIN_RIPGREP = "0"; $env:PATH = "{s};$env:PATH"; claude
+        \\After updating trigrep, run install-rg-shim again: the shim is a copy.
+        \\
+        \\
+    else
         \\
         \\
         \\or start Claude Code with: USE_BUILTIN_RIPGREP=0 PATH="{s}:$PATH" claude
         \\
+        \\
+    , .{dir});
+    try out.writeAll(
         \\Repositories where ripgrep is already fast are left alone. A git repository
         \\where a search takes 300 ms or more gets an index built in the background.
         \\`trigrep index --prune` lists the indexes and removes those of deleted
         \\repositories.
         \\
-    , .{dir});
+    );
     try w.interface.flush();
 }
 
@@ -416,6 +435,7 @@ pub fn daemonWatchHook() engine.WatchHook {
 }
 
 fn daemonChanges(_: *anyopaque, arena: Allocator, io: Io, _: []const u8, index_path: []const u8, build_id: u64) ?watch.Changes {
+    if (!watch.daemon) return null;
     const sock = watch.socketPath(arena, index_path) catch return null;
     return watch.query(arena, io, sock, build_id);
 }
@@ -475,7 +495,7 @@ fn nowMs(io: Io) i64 {
 }
 
 fn watchMain(gpa: Allocator, arena: Allocator, io: Io, env: Environ, a: Args) !void {
-    if (!watch.supported) fail("watch is only supported on macOS and Linux", .{});
+    if (!watch.daemon) fail("watch is only supported on macOS and Linux; searches still see every edit, by checking each file's size and time, and the MCP server watches by itself", .{});
     var diag = engine.Diag{};
     const target = engine.resolve(arena, io, a.path, &diag) catch fail("{s}", .{diag.message});
     var found = try engine.findIndex(arena, io, env, target);
