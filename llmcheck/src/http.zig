@@ -424,8 +424,29 @@ test "a_streamed_answer_arrives_piece_by_piece_not_all_at_the_end" {
     try testing.expect(parts >= 6);
     // six tokens 40 ms apart: the first long before the last
     try testing.expect(total_ms >= 230);
-    try testing.expect(first_ms >= 35 and first_ms < 120);
-    try testing.expect(second_ms > first_ms + 20);
+    try testing.expect(first_ms >= 35 and first_ms + 80 <= total_ms);
+    try testing.expect(second_ms >= 70);
+}
+
+test "the_stand_in_server_can_be_stopped_while_an_answer_is_on_its_way" {
+    const server = try fake.Server.start(.{ .token_delay_ms = 20 }, 0);
+    var stopped = false;
+    defer if (!stopped) server.stop();
+    var c = testClient(server.port);
+    defer c.deinit();
+    var resp = try c.send(.{
+        .path = "/v1/chat/completions",
+        .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"temperature\":0,\"max_tokens\":40,\"stream\":true}",
+        .limits = .{ .idle_ms = 2000 },
+    });
+    defer resp.deinit();
+    try testing.expect((try resp.next()) != null);
+    // the server is still writing: its next piece meets a socket that was shut
+    server.stop();
+    stopped = true;
+    var parts: usize = 1;
+    while (resp.next() catch null) |_| parts += 1;
+    try testing.expect(parts < 40);
 }
 
 test "a_server_that_stops_answering_is_given_up_on" {

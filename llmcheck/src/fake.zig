@@ -8,6 +8,7 @@
 //! of that text, so the same input gives the same probabilities every time.
 const std = @import("std");
 const jv = @import("jv.zig");
+const sock = @import("sock.zig");
 const Value = jv.Value;
 
 pub const Faults = struct {
@@ -242,6 +243,8 @@ pub const Server = struct {
     open: std.ArrayList(std.net.Stream) = .empty,
 
     const gpa = std.heap.page_allocator;
+    /// How long a connection may sit without a request before it is closed.
+    const idle_ms = 60 * 60 * 1000;
 
     /// Listens on 127.0.0.1; `port` 0 takes a free one (see `Server.port`).
     pub fn start(faults: Faults, port: u16) !*Server {
@@ -314,9 +317,12 @@ pub const Server = struct {
         defer s.done(stream);
         var rbuf: [32 * 1024]u8 = undefined;
         var wbuf: [16 * 1024]u8 = undefined;
-        var r = stream.reader(&rbuf);
-        var w = stream.writer(&wbuf);
-        var http_server = std.http.Server.init(r.interface(), &w.interface);
+        // The socket layer the client uses, not std's stream: on Windows that
+        // one takes some Winsock errors for impossible and panics, a write
+        // after stop() shut the socket down among them.
+        var sk: sock.Socket = undefined;
+        sk.init(stream.handle, &rbuf, &wbuf, idle_ms);
+        var http_server = std.http.Server.init(&sk.reader, &sk.writer);
         while (!s.stopping.load(.acquire)) {
             var req = http_server.receiveHead() catch return;
             var arena_state = std.heap.ArenaAllocator.init(gpa);

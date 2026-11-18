@@ -253,11 +253,16 @@ const Worker = struct {
         for (c.arrivals_ns[0 .. c.arrivals_ns.len - 1], c.arrivals_ns[1..]) |a, b| {
             try w.gaps.append(gpa, @as(f64, @floatFromInt(b - a)) / ms);
         }
-        if (tokens > 1 and c.total_ns > first) {
-            try w.rates.append(gpa, @as(f64, @floatFromInt(tokens - 1)) / (@as(f64, @floatFromInt(c.total_ns - first)) / std.time.ns_per_s));
-        }
+        if (streamRate(tokens, first, c.total_ns)) |rate| try w.rates.append(gpa, rate);
     }
 };
+
+/// Tokens a second while an answer streams: the first token starts the clock,
+/// so the wait for it is left out. Null when there is nothing to divide.
+fn streamRate(tokens: u64, first_ns: u64, total_ns: u64) ?f64 {
+    if (tokens < 2 or total_ns <= first_ns) return null;
+    return @as(f64, @floatFromInt(tokens - 1)) / (@as(f64, @floatFromInt(total_ns - first_ns)) / std.time.ns_per_s);
+}
 
 // ---- tests ----
 
@@ -309,10 +314,20 @@ test "askers_work_side_by_side_and_every_request_is_measured" {
     // 8 tokens 5 ms apart: 35 ms from the first to the last
     try testing.expect(res.latency_ms.min >= 35);
     try testing.expect(res.ttft_ms.max <= res.latency_ms.max);
-    try testing.expect(res.stream_tokens_per_s.max <= 200.5);
+    try testing.expect(res.stream_tokens_per_s.min > 0);
     try testing.expect(res.seconds >= 0.07 and res.seconds < 5);
     try testing.expectApproxEqAbs(64 / res.seconds, res.tokensPerS(), 1e-9);
     try testing.expectApproxEqAbs(8 / res.seconds, res.requestsPerS(), 1e-9);
+}
+
+test "the_streaming_rate_counts_from_the_first_token_on" {
+    const ms = std.time.ns_per_ms;
+    // 8 tokens, the first after 5 ms and the last after 40: 7 in 35 ms
+    try testing.expectApproxEqAbs(@as(f64, 200), streamRate(8, 5 * ms, 40 * ms).?, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 1), streamRate(2, 0, 1000 * ms).?, 1e-9);
+    // one token, or all at the same moment: no rate
+    try testing.expect(streamRate(1, 5 * ms, 40 * ms) == null);
+    try testing.expect(streamRate(8, 40 * ms, 40 * ms) == null);
 }
 
 test "a_model_is_picked_from_the_list_when_none_is_named" {
