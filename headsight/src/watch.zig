@@ -177,7 +177,7 @@ pub const Watch = struct {
         }
         try read(w.ocr_ctx, w.alloc, cur, w.opts.region, &lines);
         for (lines.items, 0..) |l, i| {
-            if (std.ascii.indexOfIgnoreCase(l.text, w.opts.mode.text) != null) {
+            if (std.ascii.findIgnoreCase(l.text, w.opts.mode.text) != null) {
                 _ = lines.swapRemove(i);
                 if (w.found) |old| w.alloc.free(old.text);
                 w.found = l;

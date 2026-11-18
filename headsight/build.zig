@@ -6,6 +6,9 @@ pub fn build(b: *std.Build) void {
         // Run on macOS 14 and later, not only on the build machine's version.
         var q = target.query;
         q.os_version_min = .{ .semver = .{ .major = 14, .minor = 0, .patch = 0 } };
+        // A plain native build keeps targeting this machine's CPU; without this the
+        // changed query is sent to the compiler as the baseline CPU for the architecture.
+        if (q.cpu_arch == null and q.cpu_model == .determined_by_arch_os) q.cpu_model = .native;
         target = b.resolveTargetQuery(q);
     }
     const optimize = b.standardOptimizeOption(.{});
@@ -21,10 +24,13 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .macos) {
         // With an explicit minimum version Zig treats this as a cross build and
         // doesn't look for the SDK itself, so give it Xcode's SDK paths.
-        if (std.zig.system.darwin.getSdk(b.allocator, &target.result)) |sdk| {
-            mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
-            mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
-            mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
+        // The path comes from asking xcrun, which the build cache can't track
+        // (it changes with Xcode updates and xcode-select), so ask every time.
+        b.graph.poisonCache();
+        if (std.zig.system.darwin.getSdk(b.graph.arena, b.graph.io, &target.result)) |sdk| {
+            mod.addSystemFrameworkPath(b.graph.cwdRelativePath(b.pathJoin(&.{ sdk, "System/Library/Frameworks" })));
+            mod.addSystemIncludePath(b.graph.cwdRelativePath(b.pathJoin(&.{ sdk, "usr/include" })));
+            mod.addLibraryPath(b.graph.cwdRelativePath(b.pathJoin(&.{ sdk, "usr/lib" })));
         }
         mod.addCSourceFile(.{ .file = b.path("src/mac/capture.m"), .flags = &.{"-fobjc-arc"} });
         for ([_][]const u8{ "Foundation", "ScreenCaptureKit", "AVFoundation", "CoreMedia", "CoreVideo", "CoreGraphics", "CoreText", "ImageIO", "Vision" }) |f|
@@ -42,7 +48,7 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run headsight").dependOn(&run.step);
 
     const unit = b.addTest(.{ .root_module = mod });
@@ -50,7 +56,7 @@ pub fn build(b: *std.Build) void {
 
     // CLI paths that need no capture permission.
     const smoke = b.addSystemCommand(&.{ "/bin/sh", "scripts/smoke.sh" });
-    smoke.addArtifactArg(exe);
+    smoke.addArtifactArg2(exe, .{});
     smoke.has_side_effects = true;
     smoke.step.dependOn(&run_unit.step);
 

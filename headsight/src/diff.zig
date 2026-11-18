@@ -55,7 +55,7 @@ pub fn score(g: *Grid, prev: Frame, cur: Frame) void {
                     const b: V = pb[0 .. B * 4].*;
                     // max - min never goes below zero; the wrapping operator only
                     // skips a safety check that fires wrongly on vectors in
-                    // optimized builds (Zig 0.15.1, ReleaseSafe).
+                    // optimized builds (seen with Zig 0.15.1 and 0.17.1, ReleaseSafe).
                     sum += @reduce(.Add, @as(W, @max(a, b) -% @min(a, b)));
                 } else {
                     for (pa[0 .. @as(usize, r.w) * 4], pb[0 .. @as(usize, r.w) * 4]) |x, z|
@@ -189,7 +189,7 @@ test "small_patch_found" {
     const out = try testing.allocator.alloc(bool, g.scores.len);
     defer testing.allocator.free(out);
     try testing.expectEqual(@as(u32, 1), changedUniform(g, 50, out));
-    const idx = std.mem.indexOfScalar(bool, out, true).?;
+    const idx = std.mem.findScalar(bool, out, true).?;
     const bx: u32 = @intCast(idx % g.bw);
     const by: u32 = @intCast(idx / g.bw);
     try testing.expectEqual(Rect{ .x = 992, .y = 496, .w = 16, .h = 16 }, g.blockRect(bx, by));

@@ -11,13 +11,13 @@ pub fn fitSize(w: u32, h: u32, max_side: u32) struct { w: u32, h: u32, scale: f6
     const long = @max(w, h);
     if (long <= max_side or long == 0) return .{ .w = w, .h = h, .scale = 1 };
     const scale = @as(f64, @floatFromInt(max_side)) / @as(f64, @floatFromInt(long));
-    const ow: u32 = @max(1, @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(w)) * scale))));
-    const oh: u32 = @max(1, @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(h)) * scale))));
+    const ow: u32 = @max(1, @as(u32, @round(@as(f64, @floatFromInt(w)) * scale)));
+    const oh: u32 = @max(1, @as(u32, @round(@as(f64, @floatFromInt(h)) * scale)));
     return .{ .w = ow, .h = oh, .scale = scale };
 }
 
 /// Writes `r` of `f` to `path`. Returns the scale (output pixels per source pixel).
-pub fn write(alloc: std.mem.Allocator, path: []const u8, f: Frame, r: Rect, max_side: u32) !f64 {
+pub fn write(alloc: std.mem.Allocator, io: std.Io, path: []const u8, f: Frame, r: Rect, max_side: u32) !f64 {
     if (r.w == 0 or r.h == 0 or r.right() > f.w or r.bottom() > f.h) return error.BadRegion;
     const fit = fitSize(r.w, r.h, max_side);
     const row_len = fit.w * 3 + 1;
@@ -78,9 +78,9 @@ pub fn write(alloc: std.mem.Allocator, path: []const u8, f: Frame, r: Rect, max_
     try chunk(alloc, &out, "IDAT", z.items);
     try chunk(alloc, &out, "IEND", "");
 
-    var file = try std.fs.cwd().createFile(path, .{ .mode = 0o600 });
-    defer file.close();
-    try file.writeAll(out.items);
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    try file.writeStreamingAll(io, out.items);
     return fit.scale;
 }
 
@@ -157,13 +157,13 @@ test "png_pixels_roundtrip" {
     const f = Frame{ .px = &px, .w = 3, .h = 2, .stride = 16 };
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir);
-    const path = try std.fs.path.join(testing.allocator, &.{ dir, "a.png" });
+    const path = try std.Io.Dir.path.join(testing.allocator, &.{ dir, "a.png" });
     defer testing.allocator.free(path);
-    const scale = try write(testing.allocator, path, f, .{ .x = 1, .y = 0, .w = 2, .h = 2 }, 1024);
+    const scale = try write(testing.allocator, testing.io, path, f, .{ .x = 1, .y = 0, .w = 2, .h = 2 }, 1024);
     try testing.expectEqual(@as(f64, 1), scale);
-    const bytes = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 20);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(bytes);
     const img = try readPng(testing.allocator, bytes);
     defer testing.allocator.free(img.rgb);
@@ -186,15 +186,15 @@ test "png_downscale_averages_and_spans_blocks" {
     };
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir);
-    const path = try std.fs.path.join(testing.allocator, &.{ dir, "b.png" });
+    const path = try std.Io.Dir.path.join(testing.allocator, &.{ dir, "b.png" });
     defer testing.allocator.free(path);
-    const big = try write(testing.allocator, path, .{ .px = px, .w = w, .h = h, .stride = w * 4 }, .{ .x = 0, .y = 0, .w = w, .h = h }, 1024);
+    const big = try write(testing.allocator, testing.io, path, .{ .px = px, .w = w, .h = h, .stride = w * 4 }, .{ .x = 0, .y = 0, .w = w, .h = h }, 1024);
     try testing.expectEqual(@as(f64, 1), big);
-    const scale = try write(testing.allocator, path, .{ .px = px, .w = w, .h = h, .stride = w * 4 }, .{ .x = 0, .y = 0, .w = w, .h = h }, 100);
+    const scale = try write(testing.allocator, testing.io, path, .{ .px = px, .w = w, .h = h, .stride = w * 4 }, .{ .x = 0, .y = 0, .w = w, .h = h }, 100);
     try testing.expectApproxEqAbs(@as(f64, 0.25), scale, 1e-9);
-    const bytes = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 20);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(bytes);
     const img = try readPng(testing.allocator, bytes);
     defer testing.allocator.free(img.rgb);

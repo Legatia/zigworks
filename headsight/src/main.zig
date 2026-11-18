@@ -111,38 +111,40 @@ const command_help = [_]Help{
 
 const Exit = enum(u8) { ok = 0, timeout = 1, usage = 2, permission = 3, failed = 4 };
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init) u8 {
     const alloc = std.heap.c_allocator;
+    const io = init.io;
     var out_buf: [8192]u8 = undefined;
     var err_buf: [2048]u8 = undefined;
-    var out_w = std.fs.File.stdout().writerStreaming(&out_buf);
-    var err_w = std.fs.File.stderr().writerStreaming(&err_buf);
+    var out_w = std.Io.File.stdout().writerStreaming(io, &out_buf);
+    var err_w = std.Io.File.stderr().writerStreaming(io, &err_buf);
     const out = &out_w.interface;
     const err = &err_w.interface;
     defer {
         out.flush() catch {};
         err.flush() catch {};
     }
-    const argv = std.process.argsAlloc(alloc) catch return @intFromEnum(Exit.failed);
-    defer std.process.argsFree(alloc, argv);
+    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return @backingInt(Exit.failed);
 
     var diag = args.Diag{};
     var req = args.parse(alloc, argv[1..], &diag) catch {
         err.print("headsight: {s}\n", .{diag.msg()}) catch {};
-        return @intFromEnum(Exit.usage);
+        return @backingInt(Exit.usage);
     };
     defer req.deinit(alloc);
 
-    var app = App{ .alloc = alloc, .req = req, .out = .{ .w = out, .json = req.json }, .err = err };
+    var app = App{ .alloc = alloc, .io = io, .environ = init.minimal.environ, .req = req, .out = .{ .w = out, .json = req.json }, .err = err };
     const code = app.run() catch |e| blk: {
         err.print("headsight: {s}\n", .{errorText(e)}) catch {};
         break :blk Exit.failed;
     };
-    return @intFromEnum(code);
+    return @backingInt(code);
 }
 
 const App = struct {
     alloc: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
     req: args.Request,
     out: output.Out,
     err: *Writer,
@@ -196,9 +198,14 @@ const App = struct {
     }
 
     fn openStore(a: *App) !store.Store {
-        const base = try store.baseDir(a.alloc, std.posix.getenv("TMPDIR"), std.posix.getuid());
+        const base = try store.baseDir(a.alloc, a.environ.getPosix("TMPDIR"), std.posix.system.getuid());
         defer a.alloc.free(base);
-        return store.Store.open(a.alloc, base, std.time.timestamp());
+        return store.Store.open(a.alloc, a.io, base, a.nowS());
+    }
+
+    /// Wall-clock seconds since 1970.
+    fn nowS(a: *App) i64 {
+        return std.Io.Timestamp.now(a.io, .real).toSeconds();
     }
 
     fn drop(a: *App) !Exit {
@@ -236,7 +243,7 @@ const App = struct {
         switch (source) {
             .screen => return .{ .src = .{ .kind = 0, .window_id = 0, .camera_name = null, .fps = @intCast(a.req.fps) }, .label = "screen", .gone = "display stopped" },
             .camera => |name| {
-                const z = if (name) |n| try a.alloc.dupeZ(u8, n) else null;
+                const z = if (name) |n| try a.alloc.dupeSentinel(u8, n, 0) else null;
                 return .{ .src = .{ .kind = 2, .window_id = 0, .camera_name = if (z) |p| p.ptr else null, .fps = 30 }, .label = "camera", .gone = "camera stopped", .cam_name = z };
             },
             .window => |wanted| {
@@ -248,7 +255,7 @@ const App = struct {
                     break;
                 };
                 if (pick == null) for (list.items) |w| {
-                    if (std.ascii.indexOfIgnoreCase(w.app, wanted) != null or std.ascii.indexOfIgnoreCase(w.title, wanted) != null) {
+                    if (std.ascii.findIgnoreCase(w.app, wanted) != null or std.ascii.findIgnoreCase(w.title, wanted) != null) {
                         pick = w;
                         break;
                     }
@@ -380,9 +387,9 @@ const App = struct {
 
     fn writeCrop(a: *App, s: *store.Store, f: Frame, r: Rect, origin_x: u32, origin_y: u32) !output.CropInfo {
         const path = try s.cropPath();
-        const z = try a.alloc.dupeZ(u8, path);
+        const z = try a.alloc.dupeSentinel(u8, path, 0);
         defer a.alloc.free(z);
-        const scale = try platform.writePng(z, f, r, 1024);
+        const scale = try platform.writePng(a.io, z, f, r, 1024);
         return .{ .path = path, .origin_x = origin_x + r.x, .origin_y = origin_y + r.y, .scale = @floatCast(scale) };
     }
 
@@ -412,7 +419,7 @@ const App = struct {
         const crop = try a.writeCrop(&s, f, region, 0, 0);
         defer a.alloc.free(crop.path);
         if (a.req.name) |name| {
-            try s.saveRef(name, .{ .source = a.req.source, .window_id = r.src.window_id, .region = region, .created_s = std.time.timestamp(), .src_w = f.w, .src_h = f.h }, f);
+            try s.saveRef(name, .{ .source = a.req.source, .window_id = r.src.window_id, .region = region, .created_s = a.nowS(), .src_w = f.w, .src_h = f.h }, f);
         }
         try a.out.snap(.{ .source = r.label, .src_w = f.w, .src_h = f.h, .pixel_scale = @floatCast(cap.pixel_scale), .region = region, .crop = crop, .ref = a.req.name });
         return .ok;
@@ -438,7 +445,7 @@ const App = struct {
     }
 
     fn openRef(a: *App, s: *store.Store, name: []const u8) !?store.Ref {
-        return s.loadRef(name, std.time.timestamp()) catch |e| switch (e) {
+        return s.loadRef(name, a.nowS()) catch |e| switch (e) {
             error.NoSuchRef => {
                 _ = try a.usage("no reference named \"{s}\"", .{name});
                 return null;
@@ -498,7 +505,7 @@ const App = struct {
             try shown.append(a.alloc, .{ .x = b.x + region.x, .y = b.y + region.y, .w = b.w, .h = b.h });
             try crops.append(a.alloc, try a.writeCrop(&s, cur, b.pad(16, cur.w, cur.h), region.x, region.y));
         }
-        try a.out.diffResult(name, std.time.timestamp() - ref.meta.created_s, shown.items, res.total, crops.items);
+        try a.out.diffResult(name, a.nowS() - ref.meta.created_s, shown.items, res.total, crops.items);
         return .ok;
     }
 
@@ -519,7 +526,7 @@ const App = struct {
         const r = (try a.resolve(source, window_id)) orelse return if (a.req.since != null) .failed else .usage;
         defer if (r.cam_name) |n| a.alloc.free(n);
 
-        var st = WaitState{ .app = a, .store = &s, .ref = if (ref) |*x| x else null, .camera = r.src.kind == 2, .window = r.src.kind == 1, .timer = try std.time.Timer.start() };
+        var st = WaitState{ .app = a, .store = &s, .ref = if (ref) |*x| x else null, .camera = r.src.kind == 2, .window = r.src.kind == 1, .started = std.Io.Timestamp.now(a.io, wait_clock) };
         defer st.deinit();
         const rc = try platform.stream(r.src, a.req.timeout_ms, WaitState.onFrame, &st);
         if (st.failure) |code| return code;
@@ -544,6 +551,10 @@ const App = struct {
 };
 
 /// State for one `wait`, fed from the capture queue.
+/// The clock the wait timings run on, the one they have always used: on Linux
+/// it keeps counting while the machine is suspended, on macOS it doesn't.
+const wait_clock: std.Io.Clock = if (@import("builtin").os.tag == .linux) .boot else .awake;
+
 const WaitState = struct {
     app: *App,
     store: *store.Store,
@@ -552,7 +563,7 @@ const WaitState = struct {
     window: bool,
     scale: f64 = 1,
     /// Monotonic: a wall-clock step must not break timings.
-    timer: std.time.Timer,
+    started: std.Io.Timestamp,
     w: ?watch.Watch = null,
     region: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     event: ?watch.Event = null,
@@ -567,7 +578,7 @@ const WaitState = struct {
     }
 
     fn elapsedMs(st: *WaitState) u64 {
-        return st.timer.read() / std.time.ns_per_ms;
+        return @intCast(@max(0, st.started.untilNow(st.app.io, wait_clock).toMilliseconds()));
     }
 
     fn onFrame(ctx: ?*anyopaque, hf: ?*const platform.HsFrame) callconv(.c) c_int {
@@ -698,7 +709,7 @@ pub fn lockNote(source: args.Source, locked: bool) ?[]const u8 {
 /// indicator while it is captured, so window sources leave out the top
 /// strip. Returns that strip relative to `region`, or null if they don't meet.
 pub fn titleBar(region: Rect, pixel_scale: f64) ?Rect {
-    const bar_h: u32 = @intFromFloat(@round(28 * @max(pixel_scale, 1)));
+    const bar_h: u32 = @round(28 * @max(pixel_scale, 1));
     if (region.y >= bar_h) return null;
     return .{ .x = 0, .y = 0, .w = region.w, .h = @min(bar_h - region.y, region.h) };
 }
@@ -711,24 +722,24 @@ test "platform_gap_explains_what_needs_macos" {
     const linux: Caps = .{ .screen = false, .text = false };
     try std.testing.expect(platformGap(linux, .snap, camera, null) == null);
     try std.testing.expect(platformGap(linux, .wait, camera, .change) == null);
-    try std.testing.expect(std.mem.indexOf(u8, platformGap(linux, .snap, .screen, null).?, "--source camera") != null);
+    try std.testing.expect(std.mem.find(u8, platformGap(linux, .snap, .screen, null).?, "--source camera") != null);
     try std.testing.expect(platformGap(linux, .wait, .{ .window = "x" }, .change) != null);
     try std.testing.expect(platformGap(linux, .windows, .screen, null) != null);
     // text recognition
-    try std.testing.expect(std.mem.indexOf(u8, platformGap(linux, .text, camera, null).?, "text") != null);
+    try std.testing.expect(std.mem.find(u8, platformGap(linux, .text, camera, null).?, "text") != null);
     try std.testing.expect(platformGap(linux, .wait, camera, .{ .text = "Done" }) != null);
 }
 
 test "error_text_is_a_sentence" {
-    try std.testing.expect(std.mem.indexOf(u8, errorText(error.NotDir), "not a folder") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errorText(error.UnsafeStore), "other users") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errorText(error.OutOfMemory), "memory") != null);
+    try std.testing.expect(std.mem.find(u8, errorText(error.NotDir), "not a folder") != null);
+    try std.testing.expect(std.mem.find(u8, errorText(error.UnsafeStore), "other users") != null);
+    try std.testing.expect(std.mem.find(u8, errorText(error.OutOfMemory), "memory") != null);
     try std.testing.expectEqualStrings("capture failed", errorText(error.Failed));
 }
 
 test "lock_note_only_for_the_screen" {
     try std.testing.expect(lockNote(.screen, false) == null);
-    try std.testing.expect(std.mem.indexOf(u8, lockNote(.screen, true).?, "--window") != null);
+    try std.testing.expect(std.mem.find(u8, lockNote(.screen, true).?, "--window") != null);
     try std.testing.expect(lockNote(.{ .window = "Export" }, true) == null);
     try std.testing.expect(lockNote(.{ .camera = null }, true) == null);
 }

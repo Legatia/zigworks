@@ -206,7 +206,7 @@ Without any instruction line, the agent in this setup didn't try
 
 ## Build
 
-Requires Zig 0.15.1, plus Xcode's command line tools on the Mac. Linux builds need nothing else; `zig build -Dtarget=aarch64-linux-musl` cross-compiles from either.
+Requires Zig 0.17.1, plus Xcode's command line tools on the Mac. Linux builds need nothing else; `zig build -Dtarget=aarch64-linux-musl` cross-compiles from either.
 
 ```sh
 zig build                          # zig-out/bin/headsight

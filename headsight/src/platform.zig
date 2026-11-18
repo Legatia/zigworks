@@ -171,10 +171,10 @@ pub fn ocr(alloc: std.mem.Allocator, f: Frame, r: Rect, accurate: bool, out: *st
 }
 
 /// Writes `r` of `f` as a PNG, downscaled so the long side is at most `max_side`. Returns the scale.
-pub fn writePng(path: [:0]const u8, f: Frame, r: Rect, max_side: u32) !f64 {
+pub fn writePng(io: std.Io, path: [:0]const u8, f: Frame, r: Rect, max_side: u32) !f64 {
     if (!supported) return error.Unsupported;
     // Errors such as a full disk keep their name, so the message says what happened.
-    if (!is_mac) return png.write(std.heap.page_allocator, path, f, r, max_side);
+    if (!is_mac) return png.write(std.heap.page_allocator, io, path, f, r, max_side);
     var scale: f64 = 1;
     const hf = hsFrame(f);
     if (c.hs_write_png(path.ptr, &hf, ci(r.x), ci(r.y), ci(r.w), ci(r.h), ci(max_side), &scale) != OK) return error.Failed;
@@ -194,18 +194,19 @@ test "png_roundtrip_size" {
     @memset(px, 128);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const io = testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/a.png", .{dir}, 0);
+    const path = try testing.allocator.printSentinel("{s}/a.png", .{dir}, 0);
     defer testing.allocator.free(path);
-    const scale = try writePng(path, .{ .px = px, .w = w, .h = h, .stride = w * 4 }, .{ .x = 0, .y = 0, .w = w, .h = h }, 1024);
+    const scale = try writePng(io, path, .{ .px = px, .w = w, .h = h, .stride = w * 4 }, .{ .x = 0, .y = 0, .w = w, .h = h }, 1024);
     try testing.expectApproxEqAbs(@as(f64, 0.512), scale, 0.001);
-    const st = try std.fs.cwd().statFile(path);
+    const st = try std.Io.Dir.cwd().statFile(io, path, .{});
     try testing.expect(st.size > 0);
-    var f = try std.fs.cwd().openFile(path, .{});
-    defer f.close();
+    var f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
     var hdr: [24]u8 = undefined;
-    _ = try f.readAll(&hdr);
+    _ = try f.readPositionalAll(io, &hdr, 0);
     try testing.expectEqualSlices(u8, "\x89PNG", hdr[0..4]);
     try testing.expectEqual(@as(u32, 1024), std.mem.readInt(u32, hdr[16..20], .big));
     try testing.expectEqual(@as(u32, 256), std.mem.readInt(u32, hdr[20..24], .big));
@@ -226,7 +227,7 @@ test "ocr_synthetic" {
     try ocr(testing.allocator, f, .{ .x = 0, .y = 0, .w = w, .h = h }, false, &lines);
     var found = false;
     for (lines.items) |l| {
-        if (std.ascii.indexOfIgnoreCase(l.text, "Export Done") != null) {
+        if (std.ascii.findIgnoreCase(l.text, "Export Done") != null) {
             found = true;
             try testing.expect(l.box.w > 100 and l.box.x < w and l.box.y < h);
         }
@@ -246,5 +247,5 @@ test "host_app_found_from_a_terminal" {
     if (name) |n| try testing.expect(n.len > 0);
     // Set HEADSIGHT_EXPECT_HOST=1 when running the tests from a terminal app;
     // the parent chain goes through root-owned `login`.
-    if (std.posix.getenv("HEADSIGHT_EXPECT_HOST") != null) try testing.expect(name != null);
+    if (testing.environ.getPosix("HEADSIGHT_EXPECT_HOST") != null) try testing.expect(name != null);
 }

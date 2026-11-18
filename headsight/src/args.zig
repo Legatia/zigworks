@@ -31,7 +31,7 @@ pub const Diag = struct {
     len: usize = 0,
 
     pub fn set(d: *Diag, comptime fmt: []const u8, a: anytype) void {
-        const s = std.fmt.bufPrint(&d.buf, fmt, a) catch d.buf[0..];
+        const s = std.mem.print(&d.buf, fmt, a) catch d.buf[0..];
         d.len = s.len;
     }
     pub fn msg(d: *const Diag) []const u8 {
@@ -106,7 +106,7 @@ pub fn parse(alloc: std.mem.Allocator, argv: []const []const u8, diag: *Diag) Er
             positional = arg;
             continue;
         }
-        const eq = std.mem.indexOfScalar(u8, arg, '=');
+        const eq = std.mem.findScalar(u8, arg, '=');
         const key = arg[2 .. eq orelse arg.len];
         const inline_val: ?[]const u8 = if (eq) |e| arg[e + 1 ..] else null;
         const flag = std.meta.stringToEnum(Flag, key) orelse {
@@ -210,7 +210,7 @@ pub fn parse(alloc: std.mem.Allocator, argv: []const []const u8, diag: *Diag) Er
                     diag.set("--timeout needs seconds, e.g. --timeout 30", .{});
                     return error.Usage;
                 }
-                req.timeout_ms = @intFromFloat(@round(secs * 1000));
+                req.timeout_ms = @round(secs * 1000);
             },
             .fps => {
                 const n = std.fmt.parseInt(u32, val, 10) catch 0;
@@ -343,9 +343,9 @@ test "still_default_and_value" {
 
 test "wait_needs_one_mode" {
     const m = try bad(&.{"wait"});
-    try testing.expect(std.mem.indexOf(u8, m, "--change") != null);
-    try testing.expect(std.mem.indexOf(u8, m, "--still") != null);
-    try testing.expect(std.mem.indexOf(u8, m, "--text") != null);
+    try testing.expect(std.mem.find(u8, m, "--change") != null);
+    try testing.expect(std.mem.find(u8, m, "--still") != null);
+    try testing.expect(std.mem.find(u8, m, "--text") != null);
     _ = try bad(&.{ "wait", "--change", "--still" });
 }
 
@@ -361,7 +361,7 @@ test "region_parse_errors" {
 test "region_outside_source" {
     var d = Diag{};
     try testing.expectError(error.Usage, checkRegion(.{ .x = 3000, .y = 0, .w = 100, .h = 100 }, 3024, 1964, &d));
-    try testing.expect(std.mem.indexOf(u8, d.msg(), "3024x1964") != null);
+    try testing.expect(std.mem.find(u8, d.msg(), "3024x1964") != null);
     try checkRegion(.{ .x = 0, .y = 0, .w = 3024, .h = 1964 }, 3024, 1964, &d);
 }
 
@@ -382,7 +382,7 @@ test "conflicting_sources_refused" {
         &.{ "snap", "--source", "camera", "--window", "Safari" },
     }) |argv| {
         const m = try bad(argv);
-        try testing.expect(std.mem.indexOf(u8, m, "can't be combined") != null);
+        try testing.expect(std.mem.find(u8, m, "can't be combined") != null);
     }
     // the same kind twice is fine
     var r = try ok(&.{ "snap", "--camera", "FaceTime", "--source", "camera" });
@@ -392,7 +392,7 @@ test "conflicting_sources_refused" {
 
 test "still_zero_refused" {
     const m = try bad(&.{ "wait", "--still=0" });
-    try testing.expect(std.mem.indexOf(u8, m, "--still") != null);
+    try testing.expect(std.mem.find(u8, m, "--still") != null);
 }
 
 test "diff_requires_since" {
@@ -406,7 +406,7 @@ test "bad_names_rejected" {
     try testing.expect(!validName("../x"));
     try testing.expect(!validName("a/b"));
     try testing.expect(!validName(""));
-    try testing.expect(!validName("a" ** 65));
+    try testing.expect(!validName(&@as([65]u8, @splat('a'))));
     try testing.expect(validName("before-1.v_2"));
     _ = try bad(&.{ "snap", "--name", "../x" });
     _ = try bad(&.{ "drop", "a/b" });
@@ -414,7 +414,7 @@ test "bad_names_rejected" {
 
 test "unknown_flag" {
     const m = try bad(&.{ "wait", "--change", "--frobnicate" });
-    try testing.expect(std.mem.indexOf(u8, m, "--frobnicate") != null);
+    try testing.expect(std.mem.find(u8, m, "--frobnicate") != null);
 }
 
 test "timeout_decimal" {
@@ -426,7 +426,7 @@ test "timeout_decimal" {
 
 test "since_refuses_an_explicit_source" {
     const m = try bad(&.{ "wait", "--change", "--since", "before", "--window", "Safari" });
-    try testing.expect(std.mem.indexOf(u8, m, "--since") != null);
+    try testing.expect(std.mem.find(u8, m, "--since") != null);
     _ = try bad(&.{ "wait", "--change", "--source", "camera", "--since", "before" });
     var r = try ok(&.{ "wait", "--change", "--since", "before" });
     defer r.deinit(testing.allocator);

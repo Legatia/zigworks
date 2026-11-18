@@ -180,9 +180,9 @@ fn secs(w: *Writer, ms: u64) !void {
 /// 2 -> "2", 0.5 -> "0.5", 0.3386 -> "0.34".
 fn num(w: *Writer, v: f32) !void {
     const r = @round(v);
-    if (@abs(v - r) < 0.005) return w.print("{d}", .{@as(i64, @intFromFloat(r))});
+    if (@abs(v - r) < 0.005) return w.print("{d}", .{@as(i64, @trunc(r))});
     var buf: [32]u8 = undefined;
-    var s = try std.fmt.bufPrint(&buf, "{d:.2}", .{v});
+    var s = try std.mem.print(&buf, "{d:.2}", .{v});
     while (s.len > 0 and s[s.len - 1] == '0') s = s[0 .. s.len - 1];
     try w.writeAll(s);
 }
@@ -304,7 +304,7 @@ test "crop_line_has_origin_and_scale" {
     var buf: [512]u8 = undefined;
     var w: Writer = .fixed(&buf);
     try (Out{ .w = &w }).event(.{ .still = .{ .at_ms = 1 } }, .{ .path = "/c.png", .origin_x = 7, .origin_y = 9, .scale = 0.25 }, "");
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "origin=7,9 scale=0.25") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "origin=7,9 scale=0.25") != null);
 }
 
 test "json_changed_event" {
