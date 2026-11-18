@@ -41,7 +41,7 @@ pub fn chunks(alloc: std.mem.Allocator, speech: []const Span, duration: f64, max
         while (i < speech.len and speech[i].end - cur.start <= max_s) : (i += 1) cur.end = speech[i].end;
         // one stretch longer than max_s: cut it into equal pieces
         const len = cur.end - cur.start;
-        const pieces: usize = @max(1, @as(usize, @intFromFloat(@ceil(len / max_s))));
+        const pieces: usize = @max(1, @as(usize, @trunc(@ceil(len / max_s))));
         const step = len / @as(f64, @floatFromInt(pieces));
         for (0..pieces) |p| {
             const s = cur.start + step * @as(f64, @floatFromInt(p));

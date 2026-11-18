@@ -5,7 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Audio = @import("audio.zig").Audio;
 
-pub const is_mac = builtin.os.tag == .macos;
+pub const is_mac = builtin.target.os.tag == .macos;
 
 const c = struct {
     extern fn hsnd_decode(path: [*:0]const u8, out: *?[*]f32, frames: *c_longlong, rate: *c_int, channels: *c_int, codec: [*]u8, codec_len: c_int) c_int;
@@ -32,7 +32,7 @@ pub const Decoded = struct { audio: Audio, codec: []const u8 };
 /// error.UnsupportedFormat where there is no such decoder (Linux).
 pub fn decode(alloc: std.mem.Allocator, path: []const u8, codec_buf: []u8) !Decoded {
     if (!is_mac) return error.UnsupportedFormat;
-    const z = try alloc.dupeZ(u8, path);
+    const z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(z);
     var ptr: ?[*]f32 = null;
     var frames: c_longlong = 0;
@@ -170,7 +170,7 @@ pub fn transcribe(arena: std.mem.Allocator, x: []const f32, rate: u32, locale: ?
         }
     };
     var ctx = Ctx{ .arena = arena };
-    const z: ?[:0]u8 = if (locale) |l| try arena.dupeZ(u8, l) else null;
+    const z: ?[:0]u8 = if (locale) |l| try arena.dupeSentinel(u8, l, 0) else null;
     @memset(used, 0);
     const rc = c.hsnd_transcribe(x.ptr, @intCast(x.len), @floatFromInt(rate), if (z) |v| v.ptr else null, used.ptr, @intCast(used.len), &Ctx.f, &ctx);
     switch (rc) {

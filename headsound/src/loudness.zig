@@ -111,7 +111,7 @@ pub fn measure(alloc: std.mem.Allocator, a: Audio) !Measure {
         std.mem.sort(f64, kept.items, {}, std.sort.asc(f64));
         const at = struct {
             fn f(s: []const f64, p: f64) f64 {
-                return s[@intFromFloat(@round(p * @as(f64, @floatFromInt(s.len - 1))))];
+                return s[@trunc(@round(p * @as(f64, @floatFromInt(s.len - 1))))];
             }
         }.f;
         m.lra = at(kept.items, 0.95) - at(kept.items, 0.10);
@@ -185,8 +185,8 @@ const testing = std.testing;
 
 /// `secs` of a 1 kHz sine at `dbfs` (peak), with `silence` seconds of zeros after.
 fn sine(alloc: std.mem.Allocator, rate: u32, channels: u16, dbfs: f64, secs: f64, silence: f64) !Audio {
-    const n: usize = @intFromFloat(secs * @as(f64, @floatFromInt(rate)));
-    const z: usize = @intFromFloat(silence * @as(f64, @floatFromInt(rate)));
+    const n: usize = @trunc(secs * @as(f64, @floatFromInt(rate)));
+    const z: usize = @trunc(silence * @as(f64, @floatFromInt(rate)));
     const s = try alloc.alloc(f32, (n + z) * channels);
     @memset(s, 0);
     const amp = std.math.pow(f64, 10.0, dbfs / 20.0);

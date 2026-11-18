@@ -32,15 +32,15 @@ const Block = struct { found: bool, base: f64 = 0, freq: f64 = 0, power: f64 = 0
 /// Peak bin power (3 bins) around `hz` and its height over the median of
 /// the bins 2 to 8 Hz away, in dB.
 fn prominence(p: []const f64, binw: f64, hz: f64, scratch: []f64) struct { db: f64, power: f64, at: f64 } {
-    const c: usize = @intFromFloat(@round(hz / binw));
+    const c: usize = @trunc(@round(hz / binw));
     if (c < 2 or c + 2 >= p.len) return .{ .db = 0, .power = 0, .at = hz };
     var best = c;
     for (c - 1..c + 2) |i| if (p[i] > p[best]) {
         best = i;
     };
     const pw = p[best - 1] + p[best] + p[best + 1];
-    const near: usize = @intFromFloat(@ceil(2.0 / binw));
-    const far: usize = @intFromFloat(@ceil(8.0 / binw));
+    const near: usize = @trunc(@ceil(2.0 / binw));
+    const far: usize = @trunc(@ceil(8.0 / binw));
     var n: usize = 0;
     var i: usize = c -| far;
     while (i <= @min(p.len - 1, c + far)) : (i += 1) {
@@ -251,7 +251,7 @@ const testing = std.testing;
 
 /// A voice-like buzz around 140 Hz whose pitch wanders, plus hum.
 fn voiceWithHum(alloc: std.mem.Allocator, rate: u32, secs: f64, hum_hz: f64, hum_db: f64, hum_from: f64) ![]f32 {
-    const n: usize = @intFromFloat(secs * @as(f64, @floatFromInt(rate)));
+    const n: usize = @trunc(secs * @as(f64, @floatFromInt(rate)));
     const s = try alloc.alloc(f32, n);
     const fs: f64 = @floatFromInt(rate);
     const amp = audio.fromDb(hum_db);

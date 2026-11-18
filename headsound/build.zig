@@ -21,7 +21,10 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .macos) {
         // With an explicit minimum version Zig treats this as a cross build and
         // doesn't look for the SDK itself, so give it Xcode's SDK paths.
-        if (std.zig.system.darwin.getSdk(b.allocator, &target.result)) |sdk| {
+        // The path comes from xcrun and moves with Xcode, so the configuration
+        // is not kept between builds.
+        b.graph.poisonCache();
+        if (std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result)) |sdk| {
             mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
             mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
             mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
@@ -39,7 +42,7 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run headsound").dependOn(&run.step);
 
     const unit = b.addTest(.{ .root_module = mod });
@@ -47,9 +50,9 @@ pub fn build(b: *std.Build) void {
 
     // The CLI on generated audio files; no microphone needed.
     // On Windows: the sh of Git for Windows (on PATH on GitHub's runners).
-    const sh = if (@import("builtin").os.tag == .windows) "sh" else "/bin/sh";
+    const sh = if (b.graph.host.result.os.tag == .windows) "sh" else "/bin/sh";
     const smoke = b.addSystemCommand(&.{ sh, "scripts/smoke.sh" });
-    smoke.addArtifactArg(exe);
+    smoke.addArtifactArg2(exe, .{});
     smoke.has_side_effects = true;
     smoke.step.dependOn(&run_unit.step);
 

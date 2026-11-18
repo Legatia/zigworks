@@ -10,15 +10,15 @@ pub const Pitch = struct { hz: f32, aperiodicity: f32 };
 
 /// Frame length YIN needs at `rate`: a 25 ms window plus the longest period.
 pub fn frameLen(rate: u32) usize {
-    return @as(usize, rate) / 40 + @as(usize, @intFromFloat(@ceil(@as(f32, @floatFromInt(rate)) / fmin))) + 2;
+    return @as(usize, rate) / 40 + @as(usize, @trunc(@ceil(@as(f32, @floatFromInt(rate)) / fmin))) + 2;
 }
 
 /// Pitch of `x` (at least frameLen(rate) samples), or null when it isn't
 /// periodic enough to be voiced. `scratch` needs frameLen(rate) floats.
 pub fn yin(x: []const f32, rate: u32, scratch: []f32) ?Pitch {
     const w: usize = rate / 40;
-    const tau_max: usize = @intFromFloat(@ceil(@as(f32, @floatFromInt(rate)) / fmin));
-    const tau_min: usize = @intFromFloat(@floor(@as(f32, @floatFromInt(rate)) / fmax));
+    const tau_max: usize = @trunc(@ceil(@as(f32, @floatFromInt(rate)) / fmin));
+    const tau_min: usize = @trunc(@floor(@as(f32, @floatFromInt(rate)) / fmax));
     std.debug.assert(x.len >= w + tau_max + 1 and scratch.len >= tau_max + 2);
     var energy: f32 = 0;
     for (x[0 .. w + tau_max]) |v| energy += v * v;
@@ -101,7 +101,7 @@ pub fn stats(alloc: std.mem.Allocator, hz: []const f32) !?Stats {
     std.mem.sort(f32, v.items, {}, std.sort.asc(f32));
     const at = struct {
         fn f(s: []const f32, p: f32) f32 {
-            const i: usize = @intFromFloat(@round(p * @as(f32, @floatFromInt(s.len - 1))));
+            const i: usize = @trunc(@round(p * @as(f32, @floatFromInt(s.len - 1))));
             return s[i];
         }
     }.f;
@@ -114,7 +114,7 @@ const testing = std.testing;
 
 fn harmonic(alloc: std.mem.Allocator, rate: u32, hz: f64, secs: f64) ![]f32 {
     // a buzzy voice-like tone: five harmonics falling off
-    const n: usize = @intFromFloat(secs * @as(f64, @floatFromInt(rate)));
+    const n: usize = @trunc(secs * @as(f64, @floatFromInt(rate)));
     const s = try alloc.alloc(f32, n);
     for (s, 0..) |*v, i| {
         const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(rate));

@@ -223,7 +223,7 @@ the private folder (mode 0700) are deleted after a day.
 
 ## Building
 
-Zig 0.15.1:
+Zig 0.17.1:
 
 ```sh
 zig build -Doptimize=ReleaseFast                            # zig-out/bin/headsound

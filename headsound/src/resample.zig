@@ -8,8 +8,8 @@ const phases = 512; // table entries per zero crossing
 const beta = 8.6;
 
 var table: [zero_crossings * phases + 2]f32 = undefined;
-var table_ready = std.atomic.Value(bool).init(false);
-var table_lock: std.Thread.Mutex = .{};
+/// 0: not built, 1: one thread is building it, 2: ready.
+var table_state = std.atomic.Value(u8).init(0);
 
 fn bessel0(x: f64) f64 {
     var sum: f64 = 1;
@@ -24,10 +24,8 @@ fn bessel0(x: f64) f64 {
 }
 
 fn kernel() *const [zero_crossings * phases + 2]f32 {
-    if (table_ready.load(.acquire)) return &table;
-    table_lock.lock();
-    defer table_lock.unlock();
-    if (!table_ready.load(.acquire)) {
+    if (table_state.load(.acquire) == 2) return &table;
+    if (table_state.cmpxchgStrong(0, 1, .acquire, .acquire) == null) {
         const norm = bessel0(beta);
         for (&table, 0..) |*t, i| {
             const u = @as(f64, @floatFromInt(i)) / phases; // in zero crossings
@@ -39,8 +37,11 @@ fn kernel() *const [zero_crossings * phases + 2]f32 {
             const r = u / zero_crossings;
             t.* = @floatCast(sinc * bessel0(beta * @sqrt(1 - r * r)) / norm);
         }
-        table_ready.store(true, .release);
+        table_state.store(2, .release);
+        return &table;
     }
+    // Another thread is filling the table (a few milliseconds of work).
+    while (table_state.load(.acquire) != 2) std.atomic.spinLoopHint();
     return &table;
 }
 
@@ -51,18 +52,18 @@ pub fn resample(alloc: std.mem.Allocator, x: []const f32, from: u32, to: u32) ![
     const ratio = @as(f64, @floatFromInt(to)) / @as(f64, @floatFromInt(from));
     const cutoff = @min(1.0, ratio) * 0.94; // relative to the input's Nyquist
     const half_width = @as(f64, zero_crossings) / cutoff; // in input samples
-    const n_out: usize = @intFromFloat(@floor(@as(f64, @floatFromInt(x.len)) * ratio));
+    const n_out: usize = @trunc(@floor(@as(f64, @floatFromInt(x.len)) * ratio));
     const out = try alloc.alloc(f32, n_out);
     const len: i64 = @intCast(x.len);
     for (out, 0..) |*o, n| {
         const center = @as(f64, @floatFromInt(n)) / ratio;
-        const lo: i64 = @max(0, @as(i64, @intFromFloat(@ceil(center - half_width))));
-        const hi: i64 = @min(len - 1, @as(i64, @intFromFloat(@floor(center + half_width))));
+        const lo: i64 = @max(0, @as(i64, @trunc(@ceil(center - half_width))));
+        const hi: i64 = @min(len - 1, @as(i64, @trunc(@floor(center + half_width))));
         var acc: f64 = 0;
         var k = lo;
         while (k <= hi) : (k += 1) {
             const u = @abs(center - @as(f64, @floatFromInt(k))) * cutoff * phases;
-            const idx: usize = @intFromFloat(u);
+            const idx: usize = @trunc(u);
             if (idx >= zero_crossings * phases) continue;
             const frac: f32 = @floatCast(u - @as(f64, @floatFromInt(idx)));
             const w = t[idx] + (t[idx + 1] - t[idx]) * frac;
@@ -78,7 +79,7 @@ pub fn resample(alloc: std.mem.Allocator, x: []const f32, from: u32, to: u32) ![
 const testing = std.testing;
 
 fn tone(alloc: std.mem.Allocator, rate: u32, hz: f64, secs: f64) ![]f32 {
-    const n: usize = @intFromFloat(secs * @as(f64, @floatFromInt(rate)));
+    const n: usize = @trunc(secs * @as(f64, @floatFromInt(rate)));
     const s = try alloc.alloc(f32, n);
     for (s, 0..) |*v, i| v.* = @floatCast(0.5 * @sin(2.0 * std.math.pi * hz * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(rate))));
     return s;

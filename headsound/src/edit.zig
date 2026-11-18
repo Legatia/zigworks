@@ -36,7 +36,7 @@ pub fn pauseKeeps(alloc: std.mem.Allocator, segs: []const Segment, duration: f64
 }
 
 fn frameAt(a: Audio, t: f64) usize {
-    const f: usize = @intFromFloat(@max(0, @round(t * @as(f64, @floatFromInt(a.rate)))));
+    const f: usize = @trunc(@max(0, @round(t * @as(f64, @floatFromInt(a.rate)))));
     return @min(f, a.frames());
 }
 
@@ -46,7 +46,7 @@ pub fn join(alloc: std.mem.Allocator, a: Audio, spans: []const Span) !Audio {
     var total: usize = 0;
     for (spans) |sp| total += frameAt(a, sp.end) - frameAt(a, sp.start);
     const out = try alloc.alloc(f32, total * a.channels);
-    const fade_n: usize = @intFromFloat(fade_s * @as(f64, @floatFromInt(a.rate)));
+    const fade_n: usize = @trunc(fade_s * @as(f64, @floatFromInt(a.rate)));
     var p: usize = 0;
     for (spans, 0..) |sp, k| {
         const f0 = frameAt(a, sp.start);
@@ -132,7 +132,9 @@ test "join_concatenates_with_fades" {
 }
 
 test "gain_and_convert" {
-    var s = [_]f32{ 0.5, -0.5, 0.25, -0.25 } ** 100;
+    const frame = [_]f32{ 0.5, -0.5, 0.25, -0.25 };
+    var s: [frame.len * 100]f32 = undefined;
+    for (&s, 0..) |*v, i| v.* = frame[i % frame.len];
     const a = Audio{ .rate = 8000, .channels = 2, .samples = &s };
     gain(a, -6.0206);
     try testing.expectApproxEqAbs(@as(f32, 0.25), s[0], 1e-4);

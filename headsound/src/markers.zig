@@ -214,7 +214,7 @@ pub fn writeLabels(w: *std.Io.Writer, ms: []const Marker, rate: u32) !void {
 /// 1/75 s. Returns how many markers it holds.
 pub fn writeCueSheet(alloc: std.mem.Allocator, w: *std.Io.Writer, ms: []const Marker, rate: u32, audio_name: []const u8) !usize {
     try w.writeAll("FILE \"");
-    try writeClean(w, std.fs.path.basename(audio_name), '"');
+    try writeClean(w, std.Io.Dir.path.basename(audio_name), '"');
     try w.print("\" {s}\n", .{if (std.ascii.endsWithIgnoreCase(audio_name, ".mp3")) "MP3" else "WAVE"});
     // the first 99 by time
     const sorted = try alloc.dupe(Marker, ms);
@@ -496,15 +496,15 @@ test "odd_last_chunk_gets_its_pad_so_the_markers_stay_aligned" {
 
 test "existing_cue_points_and_notes_are_kept_as_they_were" {
     // a cue point with play position 7 and offset 3, its label and a note
-    const cue = "cue \x1c\x00\x00\x00\x01\x00\x00\x00" ++ "\xff\xff\xff\xff" ++ "\x07\x00\x00\x00" ++ "data" ++ "\x00" ** 8 ++ "\x03\x00\x00\x00";
+    const cue = "cue \x1c\x00\x00\x00\x01\x00\x00\x00" ++ "\xff\xff\xff\xff" ++ "\x07\x00\x00\x00" ++ "data" ++ "\x00\x00\x00\x00\x00\x00\x00\x00" ++ "\x03\x00\x00\x00";
     const list = "LIST\x26\x00\x00\x00adtl" ++ "labl\x08\x00\x00\x00\xff\xff\xff\xffmine" ++ "note\x0a\x00\x00\x00\xff\xff\xff\xffhello\x00";
     const bytes = try wavWith(testing.allocator, &.{ cue, list });
     defer testing.allocator.free(bytes);
     const out = try addToWav(testing.allocator, bytes, &.{.{ .start = 1, .name = "click 1" }});
     defer testing.allocator.free(out);
     // the old entry byte for byte, the note too
-    try testing.expect(std.mem.indexOf(u8, out, cue[12..]) != null);
-    try testing.expect(std.mem.indexOf(u8, out, "note\x0a\x00\x00\x00\xff\xff\xff\xffhello\x00") != null);
+    try testing.expect(std.mem.find(u8, out, cue[12..]) != null);
+    try testing.expect(std.mem.find(u8, out, "note\x0a\x00\x00\x00\xff\xff\xff\xffhello\x00") != null);
     const ms = try read(testing.allocator, out);
     defer testing.allocator.free(ms);
     try testing.expectEqual(@as(usize, 2), ms.len);
@@ -512,7 +512,7 @@ test "existing_cue_points_and_notes_are_kept_as_they_were" {
     try testing.expectEqualStrings("click 1", ms[1].name);
     // the new id doesn't wrap onto an old one
     var ids: [2]u32 = undefined;
-    var pos: usize = std.mem.indexOf(u8, out, "cue ").? + 12;
+    var pos: usize = std.mem.find(u8, out, "cue ").? + 12;
     for (&ids) |*v| {
         v.* = std.mem.readInt(u32, out[pos..][0..4], .little);
         pos += 24;
@@ -598,8 +598,8 @@ test "edl_keeps_the_first_999_markers" {
     defer out.deinit();
     const n = try writeEdl(&out.writer, &many, 48000, Fps.parse("25").?, 0, "t");
     try testing.expectEqual(@as(usize, 999), n);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "\n999  001") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "1000  001") == null);
+    try testing.expect(std.mem.find(u8, out.written(), "\n999  001") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "1000  001") == null);
 }
 
 test "a_short_caption_is_not_stretched_over_the_next" {
@@ -612,9 +612,9 @@ test "a_short_caption_is_not_stretched_over_the_next" {
         .{ .start = 48000 * 5, .length = 48000 * 2, .name = "music" }, // overlaps for real: kept
     };
     try writeSubtitles(testing.allocator, &w, &ms, 48000, .srt);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "00:00:01,000 --> 00:00:01,500\nclick 1") != null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "00:00:01,500 --> 00:00:02,500\nclick 2") != null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "00:00:05,000 --> 00:00:08,000\nspeech") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "00:00:01,000 --> 00:00:01,500\nclick 1") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "00:00:01,500 --> 00:00:02,500\nclick 2") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "00:00:05,000 --> 00:00:08,000\nspeech") != null);
 }
 
 test "subtitles_srt_and_vtt" {

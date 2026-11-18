@@ -48,7 +48,7 @@ pub const Finding = struct {
     label: []const u8 = "",
 
     pub fn lessThan(_: void, a: Finding, b: Finding) bool {
-        return a.start < b.start or (a.start == b.start and @intFromEnum(a.kind) < @intFromEnum(b.kind));
+        return a.start < b.start or (a.start == b.start and @backingInt(a.kind) < @backingInt(b.kind));
     }
 };
 

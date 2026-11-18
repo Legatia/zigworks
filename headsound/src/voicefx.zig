@@ -19,7 +19,7 @@ const frame_s = 0.01;
 
 /// RMS level (dB) of each 10 ms frame of `x` after the filters in `chain`.
 fn bandLevels(alloc: std.mem.Allocator, x: []const f32, rate: u32, chain: []const Biquad) ![]f64 {
-    const hop: usize = @intFromFloat(@as(f64, @floatFromInt(rate)) * frame_s);
+    const hop: usize = @trunc(@as(f64, @floatFromInt(rate)) * frame_s);
     const n = x.len / hop;
     const out = try alloc.alloc(f64, n);
     var fs: [8]Biquad = undefined;
@@ -43,7 +43,7 @@ fn percentile(alloc: std.mem.Allocator, v: []const f64, p: f64) !f64 {
     for (v) |x| if (std.math.isFinite(x)) try tmp.append(alloc, x);
     if (tmp.items.len == 0) return -std.math.inf(f64);
     std.mem.sort(f64, tmp.items, {}, std.sort.asc(f64));
-    return tmp.items[@intFromFloat(@round(p * @as(f64, @floatFromInt(tmp.items.len - 1))))];
+    return tmp.items[@trunc(@round(p * @as(f64, @floatFromInt(tmp.items.len - 1))))];
 }
 
 /// Frames where `hit` holds, grouped (one quiet frame may split nothing),
@@ -93,8 +93,8 @@ pub fn pops(alloc: std.mem.Allocator, x: []const f32, rate: u32) ![]Burst {
     const bs = try group(alloc, hit, lf, ref, 1, 15);
     // each pop reaches as far as its thump is still 6 dB over (up to 100 ms)
     for (bs) |*b| {
-        var i: usize = @intFromFloat(@round(b.start / frame_s));
-        var j: usize = @intFromFloat(@round(b.end / frame_s));
+        var i: usize = @trunc(@round(b.start / frame_s));
+        var j: usize = @trunc(@round(b.end / frame_s));
         const first = i;
         const last = j;
         while (i > 0 and first - (i - 1) <= 10 and lf[i - 1] >= ref + 6) i -= 1;
@@ -190,7 +190,7 @@ fn talk(alloc: std.mem.Allocator, rate: u32, s_gain: f64, pop_at: ?f64) ![]f32 {
     var prng = std.Random.DefaultPrng.init(4);
     const rnd = prng.random();
     const fs: f64 = @floatFromInt(rate);
-    const n: usize = @intFromFloat(4 * fs);
+    const n: usize = @trunc(4 * fs);
     const out = try alloc.alloc(f32, n);
     // a gentle high-pass for the s noise: differences of white noise
     var prev: f64 = 0;

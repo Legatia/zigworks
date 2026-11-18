@@ -87,7 +87,7 @@ pub const FileIterator = struct {
             const is_short = a.len == 2 and a[0] == '-' and a[1] != '-';
             if (!std.mem.startsWith(u8, a, "--") and !is_short) return a;
             const body = if (is_short) a[1..] else a[2..];
-            if (std.mem.indexOfScalar(u8, body, '=') != null) continue;
+            if (std.mem.findScalar(u8, body, '=') != null) continue;
             if (parseFlag(body)) |f| if (takesValue(f)) {
                 it.i += 1;
             };
@@ -175,7 +175,7 @@ fn parseFlag(name: []const u8) ?Flag {
     if (std.mem.eql(u8, name, "min-pause")) return .min_pause;
     if (std.mem.eql(u8, name, "min-confidence")) return .min_confidence;
     if (std.mem.eql(u8, name, "edl-start")) return .edl_start;
-    if (std.mem.indexOfScalar(u8, name, '_') != null) return null;
+    if (std.mem.findScalar(u8, name, '_') != null) return null;
     return std.meta.stringToEnum(Flag, name);
 }
 
@@ -207,7 +207,7 @@ pub fn parse(argv: []const []const u8, diag: *Diag) Error!Request {
             continue;
         }
         const body = if (is_short) a[1..] else a[2..];
-        const eq = std.mem.indexOfScalar(u8, body, '=');
+        const eq = std.mem.findScalar(u8, body, '=');
         const name = if (eq) |e| body[0..e] else body;
         const flag = parseFlag(name) orelse {
             diag.set("unknown option '{s}' (try 'headsound help {s}')", .{ a, @tagName(cmd) });
@@ -452,7 +452,7 @@ fn ok(argv: []const []const u8) !Request {
 fn bad(argv: []const []const u8, want: []const u8) !void {
     var d = Diag{};
     try testing.expectError(error.Usage, parse(argv, &d));
-    if (std.mem.indexOf(u8, d.msg(), want) == null) {
+    if (std.mem.find(u8, d.msg(), want) == null) {
         std.debug.print("message '{s}' lacks '{s}'\n", .{ d.msg(), want });
         return error.TestUnexpectedResult;
     }

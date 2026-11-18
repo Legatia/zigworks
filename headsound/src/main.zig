@@ -240,29 +240,29 @@ const command_help = [_]Help{
 
 pub const Exit = enum(u8) { ok = 0, nothing = 1, usage = 2, permission = 3, failed = 4 };
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init) u8 {
     const alloc = std.heap.c_allocator;
+    const io = init.io;
     var out_buf: [8192]u8 = undefined;
     var err_buf: [2048]u8 = undefined;
-    var out_w = std.fs.File.stdout().writerStreaming(&out_buf);
-    var err_w = std.fs.File.stderr().writerStreaming(&err_buf);
+    var out_w = std.Io.File.stdout().writerStreaming(io, &out_buf);
+    var err_w = std.Io.File.stderr().writerStreaming(io, &err_buf);
     const out = &out_w.interface;
     const err = &err_w.interface;
     defer {
         out.flush() catch {};
         err.flush() catch {};
     }
-    const argv = std.process.argsAlloc(alloc) catch return @intFromEnum(Exit.failed);
-    defer std.process.argsFree(alloc, argv);
+    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return @backingInt(Exit.failed);
 
     var diag = args.Diag{};
     const req = args.parse(argv[1..], &diag) catch {
         err.print("headsound: {s}\n", .{diag.msg()}) catch {};
-        return @intFromEnum(Exit.usage);
+        return @backingInt(Exit.usage);
     };
-    var app = App{ .alloc = alloc, .req = req, .argv = argv[1..], .out = out, .err = err };
+    var app = App{ .alloc = alloc, .io = io, .env = init.environ_map, .req = req, .argv = argv[1..], .out = out, .err = err };
     const code = app.run() catch |e| app.failure(e, null);
-    return @intFromEnum(code);
+    return @backingInt(code);
 }
 
 pub fn errorText(e: anyerror, file: []const u8) []const u8 {
@@ -375,19 +375,36 @@ pub const Loaded = struct {
     }
 };
 
-pub fn load(alloc: std.mem.Allocator, path: []const u8) !Loaded {
-    var f = try std.fs.cwd().openFile(path, .{});
-    defer f.close();
+/// Opens an audio file for reading. A folder is error.IsDir on every system.
+fn openForRead(io: std.Io, path: []const u8) !std.Io.File {
+    return std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false });
+}
+
+/// Reads from where the file stands until `buf` is full or the file ends
+/// (also from a pipe).
+fn readHead(io: std.Io, f: std.Io.File, buf: []u8) !usize {
+    var n: usize = 0;
+    while (n < buf.len) {
+        n += f.readStreaming(io, &.{buf[n..]}) catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => return e,
+        };
+    }
+    return n;
+}
+
+pub fn load(io: std.Io, alloc: std.mem.Allocator, path: []const u8) !Loaded {
+    var f = try openForRead(io, path);
+    defer f.close(io);
     var head: [12]u8 = undefined;
-    const got = try f.readAll(&head);
+    const got = try readHead(io, f, &head);
     var l = Loaded{ .audio = undefined };
     if (wav.isWav(head[0..got])) {
-        const st = try f.stat();
+        const st = try f.stat(io);
         if (st.size > std.math.maxInt(u32)) return error.FileTooBig;
-        try f.seekTo(0);
         const bytes = try alloc.alloc(u8, @intCast(st.size));
         defer alloc.free(bytes);
-        _ = try f.readAll(bytes);
+        _ = try f.readPositionalAll(io, bytes, 0);
         const d = try wav.decode(alloc, bytes);
         l.audio = d.audio;
         _ = std.fmt.bufPrint(l.format_buf[0 .. l.format_buf.len - 1], "wav/{s}{d}", .{ if (d.format.float) "f" else "", d.format.bits }) catch {};
@@ -407,13 +424,13 @@ fn outBits(format: []const u8, want: ?u16) u16 {
 }
 
 fn frames(t: f64, rate: u32) u64 {
-    return @intFromFloat(@max(0, @round(t * @as(f64, @floatFromInt(rate)))));
+    return @trunc(@max(0, @round(t * @as(f64, @floatFromInt(rate)))));
 }
 
-fn writeFile(path: []const u8, bytes: []const u8) !void {
-    var f = try std.fs.cwd().createFile(path, .{});
-    defer f.close();
-    try f.writeAll(bytes);
+fn writeFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    var f = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, bytes);
 }
 
 /// A classifier name as words: "electric_piano" as "electric piano".
@@ -434,6 +451,8 @@ pub fn analyzeSpeech(alloc: std.mem.Allocator, a: Audio, opts: vad.Options) !vad
 
 const App = struct {
     alloc: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
     req: args.Request,
     argv: []const []const u8 = &.{},
     out: *Writer,
@@ -512,7 +531,7 @@ const App = struct {
     }
 
     fn one(a: *App, path: []const u8) !Exit {
-        var l = try load(a.alloc, path);
+        var l = try load(a.io, a.alloc, path);
         defer l.deinit(a.alloc);
         if (l.audio.frames() == 0) {
             try a.out.flush();
@@ -604,7 +623,7 @@ const App = struct {
             const dur = l.audio.seconds();
             if (an.segments[0].start > 0.01) try all.append(ar, .{ .start = 0, .name = "silence [-Exclude-]" });
             for (an.segments, 1..) |sg, i| {
-                const m = markers.Marker{ .start = frames(sg.start, r), .length = frames(sg.end, r) - frames(sg.start, r), .name = try std.fmt.allocPrint(ar, "speech {d}", .{i}) };
+                const m = markers.Marker{ .start = frames(sg.start, r), .length = frames(sg.end, r) - frames(sg.start, r), .name = try ar.print("speech {d}", .{i}) };
                 try all.append(ar, m);
                 try spans.append(ar, m);
                 if (sg.end < dur - 0.01) try all.append(ar, .{ .start = frames(sg.end, r), .name = "pause [-Exclude-]" });
@@ -679,8 +698,8 @@ const App = struct {
         const lang = try ar.alloc(u8, 64);
         @memset(lang, 0);
         for (cs) |ch| {
-            const s: usize = @intFromFloat(ch.start * vad.rate);
-            const e: usize = @min(x.len, @as(usize, @intFromFloat(ch.end * vad.rate)));
+            const s: usize = @trunc(ch.start * vad.rate);
+            const e: usize = @min(x.len, @as(usize, @trunc(ch.end * vad.rate)));
             if (e <= s) continue;
             const ws = try platform.transcribe(ar, x[s..e], vad.rate, a.req.lang, lang);
             for (ws) |w| {
@@ -746,7 +765,7 @@ const App = struct {
     /// Writes `bytes` to the output file `path`; on failure says which file
     /// and why, and returns error.Reported.
     fn writeMarkerFile(a: *App, path: []const u8, bytes: []const u8) !void {
-        writeFile(path, bytes) catch |e| {
+        writeFile(a.io, path, bytes) catch |e| {
             try a.out.flush();
             try a.err.print("headsound: can't write {s}: {s}\n", .{ path, errorText(e, path) });
             try a.err.flush();
@@ -768,17 +787,16 @@ const App = struct {
             const src = a.req.file.?;
             // A WAV keeps its own bytes; anything else is written out as WAV first.
             const original = blk: {
-                var f = try std.fs.cwd().openFile(src, .{});
-                defer f.close();
+                var f = try openForRead(a.io, src);
+                defer f.close(a.io);
                 var head: [12]u8 = undefined;
-                const got = try f.readAll(&head);
+                const got = try readHead(a.io, f, &head);
                 if (!wav.isWav(head[0..got])) break :blk null;
-                const st = try f.stat();
+                const st = try f.stat(a.io);
                 if (st.size > std.math.maxInt(u32)) return error.FileTooBig;
-                try f.seekTo(0);
                 const bytes = try a.alloc.alloc(u8, @intCast(st.size));
                 errdefer a.alloc.free(bytes);
-                _ = try f.readAll(bytes);
+                _ = try f.readPositionalAll(a.io, bytes, 0);
                 break :blk bytes;
             };
             const base = original orelse try wav.encode(a.alloc, l.audio, outBits(l.format(), null));
@@ -816,8 +834,8 @@ const App = struct {
         }
         if (a.req.edl) |path| {
             buf.clearRetainingCapacity();
-            const name = std.fs.path.basename(a.req.file.?);
-            const title = name[0 .. std.mem.lastIndexOfScalar(u8, name, '.') orelse name.len];
+            const name = std.Io.Dir.path.basename(a.req.file.?);
+            const title = name[0 .. std.mem.findScalarLast(u8, name, '.') orelse name.len];
             const n = try markers.writeEdl(w, label_ms, rate, a.req.fps.?, a.req.edlStart(), title);
             try a.writeMarkerFile(path, buf.written());
             if (n < label_ms.len) edl_kept = n; // three-digit event numbers
@@ -897,10 +915,10 @@ const App = struct {
 
     fn findingMarker(ar: std.mem.Allocator, f: fnd.Finding, rate: u32, n: u32) !markers.Marker {
         const name = switch (f.kind) {
-            .hum => try std.fmt.allocPrint(ar, "hum {d:.0} Hz", .{f.freq}),
-            .dc => try std.fmt.allocPrint(ar, "DC offset {d:.2}% (channel {d})", .{ f.value, f.channel }),
+            .hum => try ar.print("hum {d:.0} Hz", .{f.freq}),
+            .dc => try ar.print("DC offset {d:.2}% (channel {d})", .{ f.value, f.channel }),
             .sound => try spaced(ar, f.label),
-            else => try std.fmt.allocPrint(ar, "{s} {d}", .{ f.kind.label(), n }),
+            else => try ar.print("{s} {d}", .{ f.kind.label(), n }),
         };
         const s = frames(f.start, rate);
         const len = if (f.kind == .dc) 0 else frames(f.end, rate) -| s;
@@ -1092,7 +1110,7 @@ const App = struct {
     }
 
     fn writeOut(a: *App, x: Audio, bits: u16) !void {
-        try wav.write(a.alloc, a.req.out.?, x, bits);
+        try wav.write(a.io, a.alloc, a.req.out.?, x, bits);
     }
 
     fn cut(a: *App, l: *Loaded) !Exit {
@@ -1226,7 +1244,7 @@ const App = struct {
         defer live.deinit();
         var sink = Sink{ .live = &live, .timeout_s = a.req.timeout_s };
         if (a.req.input) |path| {
-            var l = try load(a.alloc, path);
+            var l = try load(a.io, a.alloc, path);
             defer l.deinit(a.alloc);
             var c = try edit.convert(a.alloc, l.audio, vad.rate, true);
             defer c.deinit(a.alloc);
@@ -1237,14 +1255,14 @@ const App = struct {
             }
             // A recording that ends while someone speaks ends the utterance.
             if (!stopped and live.state == .speaking) {
-                const pad = try a.alloc.alloc(f32, @intFromFloat(@ceil((live.silence_s + 0.5) * vad.rate)));
+                const pad = try a.alloc.alloc(f32, @trunc(@ceil((live.silence_s + 0.5) * vad.rate)));
                 defer a.alloc.free(pad);
                 @memset(pad, 0);
                 _ = sink.feed(pad);
             }
         } else {
             if (!platform.is_mac) {
-                try a.err.writeAll(if (builtin.os.tag == .windows)
+                try a.err.writeAll(if (builtin.target.os.tag == .windows)
                     "headsound: listening to the microphone needs macOS so far (record with Sound Recorder or GoldWave, then use the file commands)\n"
                 else
                     "headsound: listening to the microphone needs macOS so far (on Linux: record with arecord, then use the file commands)\n");
@@ -1267,7 +1285,7 @@ const App = struct {
                     return .permission;
                 },
             }
-            const max_ms: u32 = @intFromFloat((a.req.timeout_s + a.req.max_s + 5) * 1000);
+            const max_ms: u32 = @trunc((a.req.timeout_s + a.req.max_s + 5) * 1000);
             try platform.listen(vad.rate, &sink, max_ms);
         }
         if (sink.failed) return error.OutOfMemory;
@@ -1279,24 +1297,25 @@ const App = struct {
         }
         const u = live.utterance();
         const clip = Audio{ .rate = vad.rate, .channels = 1, .samples = @constCast(u) };
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const path = if (a.req.out) |o| blk: {
-            try wav.write(a.alloc, o, clip, 16);
+            try wav.write(a.io, a.alloc, o, clip, 16);
             break :blk o;
         } else blk: {
-            const base = try store.defaultDir(a.alloc);
+            const base = try store.defaultDir(a.alloc, a.env);
             defer a.alloc.free(base);
-            var dir = try store.open(base, std.time.timestamp());
-            defer dir.close();
-            const pid = if (builtin.os.tag == .windows) std.os.windows.GetCurrentProcessId() else std.c.getpid();
-            const name = try std.fmt.allocPrint(a.alloc, "listen-{d}-{d}.wav", .{ std.time.milliTimestamp(), pid });
+            const now = std.Io.Timestamp.now(a.io, .real);
+            var dir = try store.open(a.io, base, now.toSeconds());
+            defer dir.close(a.io);
+            const pid = if (builtin.target.os.tag == .windows) std.os.windows.GetCurrentProcessId() else std.c.getpid();
+            const name = try a.alloc.print("listen-{d}-{d}.wav", .{ now.toMilliseconds(), pid });
             defer a.alloc.free(name);
             const bytes = try wav.encode(a.alloc, clip, 16);
             defer a.alloc.free(bytes);
-            var f = try dir.createFile(name, .{ .mode = store.file_mode });
-            defer f.close();
-            try f.writeAll(bytes);
-            break :blk try std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{ base, std.fs.path.sep, name });
+            var f = try dir.createFile(a.io, name, .{ .permissions = store.file_permissions });
+            defer f.close(a.io);
+            try f.writeStreamingAll(a.io, bytes);
+            break :blk try std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{ base, std.Io.Dir.path.sep, name });
         };
         var arena = std.heap.ArenaAllocator.init(a.alloc);
         defer arena.deinit();
@@ -1384,14 +1403,14 @@ test "out_bits_follow_the_input" {
 }
 
 test "every_command_has_help" {
-    inline for (@typeInfo(args.Command).@"enum".fields) |f| {
-        if (comptime !std.mem.eql(u8, f.name, "help") and !std.mem.eql(u8, f.name, "version")) {
+    inline for (@typeInfo(args.Command).@"enum".field_names) |name| {
+        if (comptime !std.mem.eql(u8, name, "help") and !std.mem.eql(u8, name, "version")) {
             var found = false;
-            for (command_help) |h| if (std.mem.eql(u8, h[0], f.name)) {
+            for (command_help) |h| if (std.mem.eql(u8, h[0], name)) {
                 found = true;
             };
             try testing.expect(found);
-            try testing.expect(std.mem.indexOf(u8, usage_text, "  " ++ f.name) != null);
+            try testing.expect(std.mem.find(u8, usage_text, "  " ++ name) != null);
         }
     }
 }

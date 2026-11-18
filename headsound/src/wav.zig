@@ -110,9 +110,9 @@ pub fn encode(alloc: std.mem.Allocator, a: Audio, bits: u16) ![]u8 {
     // this bit depth and left alone are written back exactly.
     for (a.samples) |x| {
         if (bits == 16) {
-            std.mem.writeInt(i16, out[p..][0..2], @intFromFloat(std.math.clamp(@round(@as(f64, x) * 32768.0), -32768.0, 32767.0)), .little);
+            std.mem.writeInt(i16, out[p..][0..2], @trunc(std.math.clamp(@round(@as(f64, x) * 32768.0), -32768.0, 32767.0)), .little);
         } else {
-            std.mem.writeInt(i24, out[p..][0..3], @intFromFloat(std.math.clamp(@round(@as(f64, x) * 8388608.0), -8388608.0, 8388607.0)), .little);
+            std.mem.writeInt(i24, out[p..][0..3], @trunc(std.math.clamp(@round(@as(f64, x) * 8388608.0), -8388608.0, 8388607.0)), .little);
         }
         p += bytes_per;
     }
@@ -120,12 +120,12 @@ pub fn encode(alloc: std.mem.Allocator, a: Audio, bits: u16) ![]u8 {
 }
 
 /// Writes `a` to `path` as WAV (replacing it).
-pub fn write(alloc: std.mem.Allocator, path: []const u8, a: Audio, bits: u16) !void {
+pub fn write(io: std.Io, alloc: std.mem.Allocator, path: []const u8, a: Audio, bits: u16) !void {
     const bytes = try encode(alloc, a, bits);
     defer alloc.free(bytes);
-    var file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(bytes);
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
 }
 
 // ---- tests ----

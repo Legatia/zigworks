@@ -73,7 +73,7 @@ fn percentile(alloc: std.mem.Allocator, v: []const f32, p: f32) !f32 {
     const s = try alloc.dupe(f32, v);
     defer alloc.free(s);
     std.mem.sort(f32, s, {}, std.sort.asc(f32));
-    return s[@intFromFloat(@round(p * @as(f32, @floatFromInt(s.len - 1))))];
+    return s[@trunc(@round(p * @as(f32, @floatFromInt(s.len - 1))))];
 }
 
 /// The background level: the 10th percentile of frame levels. When the levels
@@ -328,7 +328,7 @@ fn build(alloc: std.mem.Allocator, parts: []const Part, seed: u64) ![]f32 {
     errdefer out.deinit(alloc);
     var t: usize = 0;
     for (parts) |p| {
-        const n: usize = @intFromFloat(p.secs * rate);
+        const n: usize = @trunc(p.secs * rate);
         for (0..n) |k| {
             const bg = (r.float(f32) - 0.5) * 0.002; // about -60 dBFS
             const ts = @as(f64, @floatFromInt(t)) / rate;

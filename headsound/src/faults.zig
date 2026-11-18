@@ -243,7 +243,7 @@ pub fn phase(alloc: std.mem.Allocator, a: Audio, out: *std.ArrayList(Finding)) !
 const testing = std.testing;
 
 fn tone(alloc: std.mem.Allocator, rate: u32, secs_: f64, amp: f64, hz: f64) ![]f32 {
-    const n: usize = @intFromFloat(secs_ * @as(f64, @floatFromInt(rate)));
+    const n: usize = @trunc(secs_ * @as(f64, @floatFromInt(rate)));
     const s = try alloc.alloc(f32, n);
     for (s, 0..) |*v, i| v.* = @floatCast(amp * @sin(2.0 * std.math.pi * hz * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(rate))));
     return s;

@@ -91,7 +91,7 @@ pub fn detect(alloc: std.mem.Allocator, x: []const f32, rate: u32, floor: f32) !
     var b: usize = 0;
     while (b < x.len) : (b += block) {
         const end = @min(x.len, b + block);
-        var r = [_]f64{0} ** (order + 1);
+        var r: [order + 1]f64 = @splat(0);
         autocorr(x[b..end], &r);
         if (!levinson(&r, &a)) continue; // silence
         for (b..end) |n| {
@@ -206,7 +206,7 @@ pub fn repair(alloc: std.mem.Allocator, x: []f32, start: usize, end: usize, rate
     const c0 = start -| ctx;
     const c1 = @min(x.len, end + ctx);
     // AR model from the clean context on both sides
-    var r = [_]f64{0} ** (p + 1);
+    var r: [p + 1]f64 = @splat(0);
     autocorr(x[c0..start], &r);
     autocorr(x[end..c1], &r);
     var a: [p + 1]f64 = undefined;
@@ -282,7 +282,7 @@ const testing = std.testing;
 fn music(alloc: std.mem.Allocator, rate: u32, secs: f64, seed: u64) ![]f32 {
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
-    const n: usize = @intFromFloat(secs * @as(f64, @floatFromInt(rate)));
+    const n: usize = @trunc(secs * @as(f64, @floatFromInt(rate)));
     const s = try alloc.alloc(f32, n);
     const fs: f64 = @floatFromInt(rate);
     for (s, 0..) |*v, i| {
