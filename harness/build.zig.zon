@@ -1,0 +1,14 @@
+.{
+    .name = .harness,
+    .version = "0.1.0",
+    .fingerprint = 0x3d7431e445abd9e1,
+    .minimum_zig_version = "0.17.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "README.md",
+        "LICENSE",
+    },
+}
