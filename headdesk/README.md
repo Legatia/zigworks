@@ -308,6 +308,27 @@ frames, or anything from the network, and headdesk does not change what they
 read (that would mean putting code into the app). Freezing makes those apps
 stop drawing, not stop counting: they jump ahead when stepped.
 
+## Many at once
+
+A desktop is one process with no GPU and no display behind it, so many fit
+on a machine. `scripts/many.sh N` starts `N` desktops with the test client in
+each and measures them. On a 20-core machine with 12 GB (Ubuntu 24.04 in
+WSL2, one run each):
+
+| Desktops | Size | Memory, desktop + test client | All together | CPU while idle | A picture of one |
+|---|---|---|---|---|---|
+| 10 | 1280x800 | 8.9 MB + 4.3 MB | 128 MB | 0.00% of a core | 8 ms |
+| 100 | 1280x800 | 8.9 MB + 4.3 MB | 1.3 GB | 0.00% | 10 ms |
+| 300 | 1280x800 | 8.9 MB + 4.3 MB | 3.9 GB | 0.60% | 10 ms |
+| 100 | 640x400 | 2.9 MB + 1.3 MB | 410 MB | 0.00% | 2 ms |
+
+Starting took 133 ms per desktop, one after the other, and a click on every
+one of 300 with a wait for each to settle 32 s (the wait itself is 100 ms of
+quiet). The memory is mostly pictures: each window's last picture is kept,
+4 MB at 1280x800. A real app costs what the app costs (a browser takes
+hundreds of megabytes); the numbers above are the floor. More than 300 was
+not tried.
+
 ## How it works
 
 - **One process per desktop.** `start` forks a process that listens on a
@@ -433,6 +454,7 @@ zig build test                        # unit tests, then scripts/smoke.sh with t
 | `src/sys.zig` | Linux system calls |
 | `src/testclient.zig` | The test client: a window, a button, a menu |
 | `scripts/smoke.sh` | The end-to-end test, run by `zig build test` |
+| `scripts/many.sh` | Starts N desktops and measures what they cost |
 | `HANDOFF.md`, `research/` | Where the project came from |
 
 ## License
