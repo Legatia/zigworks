@@ -33,6 +33,11 @@ fail() {
     echo "FAIL: $*" >&2
     echo "--- replies:" >&2
     cat "$STATE/out" >&2
+    # on GitHub the failure also goes onto the run, where it can be read
+    # without the log
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        echo "::error::headterm mcp smoke: $(printf '%s' "$*" | tr '\n' ' ' | cut -c1-300) replies: $(tr '\n' ' ' <"$STATE/out" | tail -c 500)"
+    fi
     exit 1
 }
 
@@ -135,7 +140,7 @@ echo "ok - record option writes an asciicast file"
 # headterm_run: a whole interaction in one call, and a failure mid-script.
 printf '%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"headterm_run","arguments":{"command":["'"$SH"'","-c","read x; echo got:$x"],"cols":30,"rows":4,"steps":[{"send":["hi","<Enter>"]},{"wait":{"exit":true}}]}}}' \
-    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"headterm_run","arguments":{"name":"mcprun","command":["'"$SH"'","-c","read x; read y"],"cols":30,"rows":4,"steps":[{"send":["a<b>","<Enter>"],"literal":true},{"wait":{"text":"never","timeout_ms":300}},{"send":["x"]}]}}}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"headterm_run","arguments":{"name":"mcprun","command":["'"$SH"'","-c","read x; read y"],"cols":30,"rows":4,"steps":[{"send":["a<b>","<Enter>"],"literal":true},{"wait":{"text":"never","timeout_ms":2000}},{"send":["x"]}]}}}' \
     '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"headterm_run","arguments":{"session":"mcprun","steps":[{"screen":true}]}}}' \
     '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"headterm_run","arguments":{"session":"mcprun","steps":[{"send":["enter"]},{"send":["<Enter>"]},{"wait":{"exit":true}}]}}}' |
     "$HT" mcp >"$STATE/out" 2>"$STATE/err" || fail "mcp exited with $?"

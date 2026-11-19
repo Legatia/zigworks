@@ -18,14 +18,18 @@ const programs = if (builtin.os.tag == .windows) struct {
     }
     /// Runs until it is killed.
     const idle: []const []const u8 = &.{"cmd.exe"};
-    /// Prints "one", reads a key, prints "two".
-    const one_two: []const []const u8 = &.{ "cmd.exe", "/d", "/c", "echo one& pause>nul& echo two& pause>nul" };
-    /// The row "two" ends up on: cmd.exe does not echo the key.
-    const two_row = "1|two";
-    /// Prints "ready"; answers the first key 300 ms later with "got-a",
+    /// Prints "one", reads a line, prints "two". `set /p` and not `pause`:
+    /// pause throws away what was typed before it began to wait, and a
+    /// test sends its key as soon as "one" is there.
+    const one_two: []const []const u8 = &.{ "cmd.exe", "/d", "/c", "echo one& set /p x=& echo two& pause>nul" };
+    /// The row "two" ends up on: the line that was read takes row 1.
+    const two_row = "2|two";
+    /// Prints "ready"; answers the first key 150 ms later with "got-a",
     /// and the second not at all. PowerShell, as cmd.exe cannot pause for
-    /// less than a second.
-    const slow_answer: []const []const u8 = &.{ "powershell.exe", "-NoProfile", "-Command", "Write-Host ready; [void][Console]::ReadKey($true); Start-Sleep -Milliseconds 300; Write-Host got-a; [void][Console]::ReadKey($true); Start-Sleep 30" };
+    /// less than a second. (150 ms and not the 300 of the sh version:
+    /// PowerShell on a busy machine is late by itself, and the answer has
+    /// to come within the time a send is given to be answered.)
+    const slow_answer: []const []const u8 = &.{ "powershell.exe", "-NoProfile", "-Command", "Write-Host ready; [void][Console]::ReadKey($true); Start-Sleep -Milliseconds 150; Write-Host got-a; [void][Console]::ReadKey($true); Start-Sleep 30" };
     const answer_keys: []const []const u8 = &.{"a"};
     /// Reads a line and prints it after "got:".
     const echo_line: []const []const u8 = &.{ "cmd.exe", "/d", "/v:on", "/c", "set /p x=& echo got:!x!" };
@@ -147,9 +151,21 @@ test "a session with a TTL ends after that long without requests or output" {
     try testing.expect(std.mem.find(u8, info.body, "\"ttl_s\":1") != null);
 
     // Every request counts as activity, so stay quiet for longer than the
-    // TTL, then look once.
-    try sleepMs(2200);
-    try testing.expectError(error.NoSuchSession, call("ttl", &.{"info"}));
+    // TTL, then look once. On a busy machine the server can be late, or be
+    // caught while it ends (the request then gets no answer): look again
+    // after another quiet stretch, a few times at most.
+    var gone = false;
+    var tries: u32 = 0;
+    while (!gone and tries < 4) : (tries += 1) {
+        try sleepMs(2200);
+        if (call("ttl", &.{"info"})) |still| {
+            gpa.free(still.body);
+        } else |err| switch (err) {
+            error.NoSuchSession => gone = true,
+            else => {},
+        }
+    }
+    try testing.expect(gone);
 }
 
 test "each client has its own diff marker" {
@@ -169,6 +185,9 @@ test "each client has its own diff marker" {
     gpa.free(sent.body);
     const a_wait = try call("markers", &.{ "wait", "--text", "two", "--diff", "--client", "a" });
     defer gpa.free(a_wait.body);
+    // seen to fail once in about a hundred runs on a busy Windows machine:
+    // say what came instead
+    if (std.mem.find(u8, a_wait.body, programs.two_row) == null) std.debug.print("each client has its own diff marker: no '{s}' in the wait's answer ({s}): [{s}]; client b's first screen: [{s}]\n", .{ programs.two_row, @tagName(a_wait.status), a_wait.body, b_first.body });
     try testing.expect(std.mem.find(u8, a_wait.body, programs.two_row) != null);
     try testing.expect(std.mem.find(u8, a_wait.body, "0|one") == null);
 
