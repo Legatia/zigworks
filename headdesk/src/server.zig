@@ -252,6 +252,8 @@ pub const Server = struct {
     last_change_ms: u64 = 0,
     /// Where pictures changed since `clearChanged`, on the desktop.
     changed: Rect = .{},
+    /// The same since a recording's last picture; the recorder empties it.
+    changed_recorded: Rect = .{},
 
     log: std.ArrayList([]u8) = .empty,
     log_base: u64 = 0,
@@ -880,13 +882,13 @@ pub const Server = struct {
                 };
                 s.send(surf.client, b.id, 0, .{});
                 // another size: the old place changed too
-                if (before.w != surf.w or before.h != surf.h) s.changed = s.changed.join(before);
+                if (before.w != surf.w or before.h != surf.h) s.markChanged(before);
             } else if (surf.hasContent()) {
                 s.gpa.free(surf.pixels);
                 surf.pixels = &.{};
                 surf.w = 0;
                 surf.h = 0;
-                s.changed = s.changed.join(before);
+                s.markChanged(before);
                 s.changes += 1;
                 s.last_change_ms = sys.nowMs();
             }
@@ -928,7 +930,7 @@ pub const Server = struct {
         const y0 = @max(whole.y, surf.y + local.y);
         const x1 = @min(whole.x + whole.w, surf.x + local.x + local.w);
         const y1 = @min(whole.y + whole.h, surf.y + local.y + local.h);
-        if (x1 > x0 and y1 > y0) s.changed = s.changed.join(.{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 });
+        if (x1 > x0 and y1 > y0) s.markChanged(.{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 });
         var root = surf;
         while (root.parent) |p| root = p;
         const win: u32 = if (root.xdg) |x| x.win else 0;
@@ -940,7 +942,7 @@ pub const Server = struct {
         s.changes += 1;
         s.last_change_ms = sys.nowMs();
         s.layout();
-        s.changed = s.changed.join(s.surfaceRect(surf));
+        s.markChanged(s.surfaceRect(surf));
     }
 
     fn surfaceRect(s: *Server, surf: *const Surface) Rect {
@@ -1050,7 +1052,7 @@ pub const Server = struct {
     fn unmapped(s: *Server, x: *Xdg) void {
         if (!x.mapped) return;
         x.mapped = false;
-        s.changed = s.changed.join(s.surfaceRect(x.surface));
+        s.markChanged(s.surfaceRect(x.surface));
         s.changes += 1;
         s.last_change_ms = sys.nowMs();
         s.note("window {d} closes", .{x.win});
@@ -1090,7 +1092,7 @@ pub const Server = struct {
         if (surf.xdg) |x| {
             s.unrole(x);
         }
-        s.changed = s.changed.join(s.surfaceRect(surf));
+        s.markChanged(s.surfaceRect(surf));
         if (s.pointer_focus == surf) s.pointer_focus = null;
         if (s.keyboard_focus == surf) s.keyboard_focus = null;
         for (s.surfaces.items) |other| {
@@ -1246,6 +1248,11 @@ pub const Server = struct {
         s.changed = .{};
     }
 
+    fn markChanged(s: *Server, r: Rect) void {
+        s.changed = s.changed.join(r);
+        s.changed_recorded = s.changed_recorded.join(r);
+    }
+
     // -----------------------------------------------------------------
     // Windows, for the agent
 
@@ -1278,7 +1285,7 @@ pub const Server = struct {
         s.note("window {d} to the front", .{x.win});
         s.changes += 1;
         s.last_change_ms = sys.nowMs();
-        s.changed = s.changed.join(s.windowRect(x));
+        s.markChanged(s.windowRect(x));
     }
 
     /// Asks a toplevel to close, as a close button would.

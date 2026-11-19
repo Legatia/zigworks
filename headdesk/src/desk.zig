@@ -8,6 +8,7 @@ const keymap = @import("keymap.zig");
 const server = @import("server.zig");
 const box = @import("box.zig");
 const boxes = @import("boxes.zig");
+const Recorder = @import("record.zig").Recorder;
 const Server = server.Server;
 
 /// Separates the fields of a command on the control socket.
@@ -62,6 +63,7 @@ pub const Desk = struct {
     rt_dir: []const u8 = "",
     /// Process 1 of the box, while there is one.
     box_init: ?sys.pid_t = null,
+    rec: ?*Recorder = null,
     last_frame_ms: u64 = 0,
     quit: bool = false,
 
@@ -200,6 +202,10 @@ pub const Desk = struct {
             for (d.conns.items) |c| {
                 if (c.wait != null) busy = true;
             }
+            // a picture is owed to the recording
+            if (d.rec) |rec| {
+                if (rec.last_changes != d.srv.changes) busy = true;
+            }
             sys.poll(items.items, if (busy) 8 else 500);
 
             if (sys.readable(items.items[0])) {
@@ -230,6 +236,7 @@ pub const Desk = struct {
                 if (d.srv.frameTick()) d.last_frame_ms = now;
             }
             d.srv.flush();
+            if (d.rec) |rec| rec.tick(&d.srv);
             d.checkWaits();
             d.reapApps();
 
@@ -260,6 +267,10 @@ pub const Desk = struct {
     }
 
     fn shutdown(d: *Desk) void {
+        if (d.rec) |rec| {
+            _ = rec.stop(&d.srv);
+            d.rec = null;
+        }
         for (d.apps.items) |a| {
             if (a.exit == .running) sys.killGroup(a.pid, .TERM);
         }
@@ -371,7 +382,35 @@ pub const Desk = struct {
         const args = fields[1..count];
         const s = &d.srv;
 
-        if (std.mem.eql(u8, cmd, "ping")) {
+        // inputs go into the recording as they came, to be sent again
+        const is_input = std.mem.eql(u8, cmd, "click") or std.mem.eql(u8, cmd, "move") or std.mem.eql(u8, cmd, "scroll") or std.mem.eql(u8, cmd, "key") or std.mem.eql(u8, cmd, "type");
+        defer if (is_input) {
+            if (d.rec) |rec| {
+                if (std.mem.startsWith(u8, reply.items, "ok")) rec.input(line);
+            }
+        };
+
+        if (std.mem.eql(u8, cmd, "record")) {
+            // dir fps, or "stop"
+            if (args.len >= 1 and std.mem.eql(u8, args[0], "stop")) {
+                const rec = d.rec orelse return fail(d, reply, "nothing is being recorded");
+                d.rec = null;
+                const dir = try d.gpa.dupe(u8, rec.dir);
+                defer d.gpa.free(dir);
+                const totals = rec.stop(s);
+                try reply.print(d.gpa, "ok stopped pictures={d} inputs={d} dir={s}\n", .{ totals.pictures, totals.inputs, dir });
+                return true;
+            }
+            if (args.len < 1) return fail(d, reply, "record needs a directory");
+            if (d.rec != null) return fail(d, reply, "a recording is already running; stop it first");
+            const fps = if (args.len >= 2) (std.fmt.parseInt(u32, args[1], 10) catch 10) else 10;
+            d.rec = Recorder.start(d.gpa, args[0], fps, s) catch return fail(d, reply, "can't write to that directory");
+            try reply.print(d.gpa, "ok recording dir={s} fps={d}\n", .{ args[0], @max(1, @min(fps, 60)) });
+        } else if (std.mem.eql(u8, cmd, "hash")) {
+            const pixels = try s.render(d.gpa);
+            defer d.gpa.free(pixels);
+            try reply.print(d.gpa, "ok {x:0>16}\n", .{std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(pixels))});
+        } else if (std.mem.eql(u8, cmd, "ping")) {
             try reply.print(d.gpa, "ok {s} {d}x{d} pid={d}\n", .{ d.opts.name, s.width, s.height, sys.getpid() });
         } else if (std.mem.eql(u8, cmd, "windows")) {
             s.layout();

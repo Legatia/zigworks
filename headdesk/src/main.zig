@@ -51,6 +51,17 @@ const usage =
     \\  log NAME [--since N]  every input and every drawing, in order
     \\  output NAME           what the apps printed
     \\
+    \\  record NAME DIR [--fps N]
+    \\                        from now on keep the log, every input, and a picture
+    \\                        whenever the desktop changed (at most N a second, 10)
+    \\                        in DIR, with a page to look at them (index.html)
+    \\  record NAME --stop    end the recording (kill ends it too)
+    \\  replay NAME DIR [--settle] [--speed X]
+    \\                        send a recording's inputs to this desktop again,
+    \\                        at the recorded times (X times as fast), or with
+    \\                        --settle each once the desktop is quiet; then say
+    \\                        whether the desktop ends up looking the same
+    \\
     \\  box list              the boxes, their snapshots, and which are open
     \\  box diff BOX          what was added, changed or deleted in the box
     \\                        since its last snapshot
@@ -195,6 +206,10 @@ const Parsed = struct {
     windows: ?[]const u8 = null,
     since: ?[]const u8 = null,
     box: ?[]const u8 = null,
+    fps: ?[]const u8 = null,
+    speed: ?[]const u8 = null,
+    stop: bool = false,
+    settle: bool = false,
     sandbox: bool = false,
     no_network: bool = false,
     as_root: bool = false,
@@ -224,6 +239,8 @@ fn parse(args: []const [:0]const u8, flags: []const []const u8) Parsed {
             if (!known) die(2, "unknown option {s}", .{a});
             const switches = [_]struct { name: []const u8, at: *bool }{
                 .{ .name = "--double", .at = &p.double },
+                .{ .name = "--stop", .at = &p.stop },
+                .{ .name = "--settle", .at = &p.settle },
                 .{ .name = "--sandbox", .at = &p.sandbox },
                 .{ .name = "--no-network", .at = &p.no_network },
                 .{ .name = "--as-root", .at = &p.as_root },
@@ -248,6 +265,8 @@ fn parse(args: []const [:0]const u8, flags: []const []const u8) Parsed {
             if (std.mem.eql(u8, a, "--windows")) p.windows = v;
             if (std.mem.eql(u8, a, "--since")) p.since = v;
             if (std.mem.eql(u8, a, "--box")) p.box = v;
+            if (std.mem.eql(u8, a, "--fps")) p.fps = v;
+            if (std.mem.eql(u8, a, "--speed")) p.speed = v;
             if (std.mem.eql(u8, a, "--share") or std.mem.eql(u8, a, "--share-ro")) {
                 if (p.share_count == p.shares.len) die(2, "too many shared directories", .{});
                 p.shares[p.share_count] = .{ .path = v, .read_only = std.mem.eql(u8, a, "--share-ro") };
@@ -395,6 +414,82 @@ fn start(gpa: std.mem.Allocator, args: []const [:0]const u8) u8 {
     die(2, "the desktop did not come up; see {s}/desktop.log", .{dir});
 }
 
+fn readFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+    var buf: [1100]u8 = undefined;
+    const fd = sys.openRead(std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return null) catch return null;
+    defer sys.close(fd);
+    var all: std.ArrayList(u8) = .empty;
+    var chunk: [8192]u8 = undefined;
+    while (true) {
+        const n = sys.read(fd, &chunk) catch break;
+        if (n == 0) break;
+        all.appendSlice(gpa, chunk[0..n]) catch return null;
+    }
+    return all.items;
+}
+
+/// The first word after "ok " of what a desktop answers to `fields`.
+fn ask(gpa: std.mem.Allocator, name: []const u8, fields: []const []const u8) ?[]const u8 {
+    const answer = request(gpa, name, fields) catch return null;
+    if (!std.mem.startsWith(u8, answer, "ok ")) return null;
+    return std.mem.trim(u8, answer[3..], " \n");
+}
+
+/// Sends the inputs of the recording in `dir` to desktop `name` again and
+/// compares how the desktop looks at the end with the recording's last picture.
+fn replay(gpa: std.mem.Allocator, name: []const u8, dir: []const u8, settle: bool, speed: f64) u8 {
+    const inputs = readFile(gpa, std.fmt.allocPrint(gpa, "{s}/inputs.txt", .{dir}) catch return 2) orelse die(2, "no recording in {s} (inputs.txt is missing)", .{dir});
+    const frames = readFile(gpa, std.fmt.allocPrint(gpa, "{s}/frames.txt", .{dir}) catch return 2) orelse die(2, "no recording in {s} (frames.txt is missing)", .{dir});
+    const meta = readFile(gpa, std.fmt.allocPrint(gpa, "{s}/meta.txt", .{dir}) catch return 2) orelse "";
+    const ping = ask(gpa, name, &.{"ping"}) orelse die(4, "no desktop named {s} (see `headdesk list`)", .{name});
+    // "size WxH" in the recording, "NAME WxH pid=N" from the desktop
+    var ping_words = std.mem.tokenizeScalar(u8, ping, ' ');
+    _ = ping_words.next();
+    const size_now = ping_words.next() orelse "";
+    if (std.mem.startsWith(u8, meta, "size ")) {
+        const size_then = meta[5 .. std.mem.findScalar(u8, meta, '\n') orelse meta.len];
+        if (!std.mem.eql(u8, size_then, size_now)) die(2, "the recording is of a {s} desktop and {s} is {s}", .{ size_then, name, size_now });
+    }
+    const begun = sys.nowMs();
+    var sent: u32 = 0;
+    var lines = std.mem.tokenizeScalar(u8, inputs, '\n');
+    while (lines.next()) |line| {
+        const tab = std.mem.findScalar(u8, line, '\t') orelse continue;
+        const at = std.fmt.parseInt(u64, line[0..tab], 10) catch continue;
+        if (settle) {
+            _ = request(gpa, name, &.{ "wait", "200", "10000", "0" }) catch {};
+        } else {
+            const due: u64 = @intFromFloat(@as(f64, @floatFromInt(at)) / speed);
+            const now = sys.nowMs() - begun;
+            if (due > now) sys.sleepMs(due - now);
+        }
+        var fields: [64][]const u8 = undefined;
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, line[tab + 1 ..], desk.field_sep);
+        while (it.next()) |f| {
+            if (count == fields.len) break;
+            fields[count] = f;
+            count += 1;
+        }
+        const answer = request(gpa, name, fields[0..count]) catch die(2, "desktop {s} went away during the replay", .{name});
+        if (!std.mem.startsWith(u8, answer, "ok")) die(2, "input {d} of the recording was refused: {s}", .{ sent + 1, std.mem.trim(u8, answer, "\n") });
+        sent += 1;
+    }
+    _ = request(gpa, name, &.{ "wait", "300", "10000", "0" }) catch {};
+    const now_hash = ask(gpa, name, &.{"hash"}) orelse die(2, "desktop {s} went away during the replay", .{name});
+    // the hash is the third word of the last line of frames.txt
+    var last: []const u8 = "";
+    var frame_lines = std.mem.tokenizeScalar(u8, frames, '\n');
+    while (frame_lines.next()) |l| last = l;
+    var words = std.mem.tokenizeScalar(u8, last, ' ');
+    _ = words.next();
+    _ = words.next();
+    const then_hash = words.next() orelse "";
+    const same = std.mem.eql(u8, now_hash, then_hash);
+    out("replayed inputs={d} picture={s}\n", .{ sent, if (same) "same" else "differs" });
+    return if (same) 0 else 1;
+}
+
 fn list(gpa: std.mem.Allocator) u8 {
     var base_buf: [512]u8 = undefined;
     var z_buf: [600]u8 = undefined;
@@ -498,6 +593,19 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const p = parse(rest, &.{"--since"});
         return talk(gpa, p.pos(0, "the desktop's name"), &.{ "log", p.since orelse "0" });
     }
+    if (std.mem.eql(u8, cmd, "record")) {
+        const p = parse(rest, &.{ "--fps", "--stop" });
+        const name = p.pos(0, "the desktop's name");
+        if (p.stop) return talk(gpa, name, &.{ "record", "stop" });
+        return talk(gpa, name, &.{ "record", absolute(gpa, p.pos(1, "the directory to record into")), p.fps orelse "10" });
+    }
+    if (std.mem.eql(u8, cmd, "replay")) {
+        const p = parse(rest, &.{ "--settle", "--speed" });
+        const name = p.pos(0, "the desktop's name");
+        const speed = if (p.speed) |s| (std.fmt.parseFloat(f64, s) catch die(2, "--speed is a number, as in 2 or 0.5", .{})) else 1.0;
+        if (!(speed > 0.01 and speed <= 100)) die(2, "--speed is between 0.01 and 100", .{});
+        return replay(gpa, name, absolute(gpa, p.pos(1, "the recording's directory")), p.settle, speed);
+    }
     if (std.mem.eql(u8, cmd, "output")) {
         const p = parse(rest, &.{});
         return output(p.pos(0, "the desktop's name"));
@@ -518,7 +626,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (rest.len != 2) die(2, "scroll needs a desktop and a number of steps", .{});
         return talk(gpa, rest[0], &.{ "scroll", rest[1] });
     }
-    const simple = [_][]const u8{ "windows", "status", "kill", "freeze", "thaw", "step", "close", "focus" };
+    if (std.mem.eql(u8, cmd, "kill")) {
+        const p = parse(rest, &.{});
+        const name = p.pos(0, "the desktop's name");
+        const code = talk(gpa, name, &.{"kill"});
+        // back only when the desktop is gone, so that its name is free again
+        var tries: u32 = 0;
+        while (code == 0 and tries < 200) : (tries += 1) {
+            const answer = request(gpa, name, &.{"ping"}) catch break;
+            gpa.free(answer);
+            sys.sleepMs(10);
+        }
+        return code;
+    }
+    const simple = [_][]const u8{ "windows", "status", "freeze", "thaw", "step", "close", "focus" };
     for (simple) |s| {
         if (!std.mem.eql(u8, cmd, s)) continue;
         const p = parse(rest, &.{});
@@ -538,6 +659,7 @@ test {
     _ = @import("desk.zig");
     _ = @import("box.zig");
     _ = @import("boxes.zig");
+    _ = @import("record.zig");
 }
 
 test "desktop names" {

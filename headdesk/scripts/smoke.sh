@@ -19,6 +19,7 @@ cleanup() {
     "$HD" kill "$D" >/dev/null 2>&1
     "$HD" kill "$D-2" >/dev/null 2>&1
     "$HD" kill "$D-b" >/dev/null 2>&1
+    "$HD" kill "$D-r" >/dev/null 2>&1
     "$HD" box delete "$BOX" >/dev/null 2>&1
     rm -rf "$WORK"
 }
@@ -170,6 +171,39 @@ if [ "$later" -gt $((after + 3)) ]; then echo "ok - thawed, frames run again"; e
     echo "FAIL: after thaw only $((later - after)) frames" >&2
     FAILS=$((FAILS + 1))
 fi
+
+# a recording: the log, the inputs, a picture per change, and a page; then the same inputs again
+expect 0 "started $D-r" -- start "$D-r" --size 320x200 -- "$TC" recorded
+expect 0 "settled" -- wait "$D-r" --windows 1
+expect 2 "nothing is being recorded" -- record "$D-r" --stop
+expect 0 "recording dir=$WORK/rec fps=20" -- record "$D-r" "$WORK/rec" --fps 20
+expect 2 "already running" -- record "$D-r" "$WORK/rec2"
+expect 0 "window=1" -- click "$D-r" 50 40
+expect 0 "windows=2" -- wait "$D-r" --windows 2
+expect 0 "window=2" -- click "$D-r" 40 40 --window 2
+expect 0 "windows=1" -- wait "$D-r"
+expect 0 "" -- key "$D-r" a ctrl+s
+expect 0 "" -- type "$D-r" 'Hi'
+expect 0 "settled" -- wait "$D-r"
+expect 0 "inputs=4 dir=$WORK/rec" -- record "$D-r" --stop
+if [ "$(wc -l <"$WORK/rec/inputs.txt")" = 4 ] && [ -s "$WORK/rec/frames/000003.png" ] && grep -q "20,60,120x80" "$WORK/rec/frames.txt" && grep -q "button left down" "$WORK/rec/events.txt" && grep -q "frames/" "$WORK/rec/index.html"; then echo "ok - the recording has its inputs, pictures, log and page"; else
+    echo "FAIL: the recording is incomplete: $(ls "$WORK/rec" "$WORK/rec/frames" | tr '
+' ' ')" >&2
+    FAILS=$((FAILS + 1))
+fi
+expect 0 "" -- kill "$D-r"
+expect 0 "started $D-r" -- start "$D-r" --size 320x200 -- "$TC" again
+expect 0 "settled" -- wait "$D-r" --windows 1
+expect 0 "replayed inputs=4 picture=same" -- replay "$D-r" "$WORK/rec" --settle
+expect 0 "" -- kill "$D-r"
+# a desktop that is not as the recording's was ends up looking different
+expect 0 "started $D-r" -- start "$D-r" --size 320x200 -- "$TC" other
+expect 0 "settled" -- wait "$D-r" --windows 1
+expect 0 "" -- key "$D-r" z
+expect 1 "replayed inputs=4 picture=differs" -- replay "$D-r" "$WORK/rec" --speed 4
+expect 0 "" -- kill "$D-r"
+expect 2 "the recording is of a 320x200 desktop" -- replay "$D" "$WORK/rec"
+expect 2 "no recording in" -- replay "$D" "$WORK/norec"
 
 # boxes: apps that read the system but write only into a box
 expect 2 "go with --sandbox" -- start "$D-b" --no-network -- "$TC"

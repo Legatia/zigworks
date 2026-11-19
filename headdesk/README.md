@@ -81,7 +81,7 @@ out), 2 a wrong command, 4 no such desktop.
 | `exec NAME -- CMD...` | One more program on that desktop. |
 | `list` | The desktops that are running. |
 | `status NAME` | Size, number of windows and apps, each app's pid or exit code, the box if there is one, and every request an app made that this server does not know (`unknown ...`). |
-| `kill NAME` | Ends the apps (SIGTERM, then SIGKILL after half a second) and the desktop. |
+| `kill NAME` | Ends the apps (SIGTERM, then SIGKILL after half a second) and the desktop; returns when the desktop is gone. |
 | `windows NAME` | Every window, menu and popup: number, kind, place, size, parent, which one has the keyboard, title. |
 | `shot NAME FILE.png [--window N]` | The whole desktop as a PNG, or window `N` alone at full size, whatever covers it. |
 | `wait NAME [--idle MS] [--timeout MS] [--windows N]` | Until nothing has been drawn for `--idle` (300 ms) and at least `N` windows are open. Says how long it took and the area that changed since the last wait that settled (`changed=X,Y,WxH` or `changed=none`). After `--timeout` (10 s): `timeout`, exit 1. |
@@ -97,6 +97,9 @@ out), 2 a wrong command, 4 no such desktop.
 | `thaw NAME` | Back to normal. |
 | `log NAME [--since N]` | One numbered record of every input and every drawing, in order, with the area each drawing changed. |
 | `output NAME` | What the apps printed (stdout and stderr). |
+| `record NAME DIR [--fps N]` | From now on, keeps a [recording](#recordings) in `DIR`: the log, every input, and a picture whenever the desktop changed (at most `N` a second, default 10). |
+| `record NAME --stop` | Ends the recording and writes its page. `kill` ends it too. |
+| `replay NAME DIR [--settle] [--speed X]` | Sends a recording's inputs to this desktop again, at the recorded times (`X` times as fast), or with `--settle` each one once the desktop has been quiet for 200 ms. Then says whether the desktop ends up looking the same: `picture=same`, or `picture=differs` and exit 1. |
 | `box list` | The boxes: name, number of snapshots, open or closed. |
 | `box diff BOX` | What was `added`, `changed` or `deleted` in the box since its last snapshot, as paths the apps saw. |
 | `box snapshot BOX LABEL` | Keeps the box as it is now under `LABEL`; the box goes on from there. |
@@ -172,6 +175,43 @@ Tried on Ubuntu 24.04 in WSL2 (kernel 6.18), as root and as an ordinary
 user: the tests, and by hand the GTK 4 demo and Chrome (which loaded a page
 and left its 261 profile files in the box). Not tried: installing packages
 inside a box, and other distributions.
+
+## Recordings
+
+```
+$ headdesk record demo run1 --fps 20
+recording dir=/home/me/run1 fps=20
+  ... clicks, keys ...
+$ headdesk record demo --stop
+stopped pictures=5 inputs=4 dir=/home/me/run1
+```
+
+A recording is a directory:
+
+| File | |
+|---|---|
+| `index.html` | A page with the pictures in order, a slider, and the log up to the picture shown, inputs in bold. Open it in a browser; it needs nothing else. |
+| `frames/000001.png` ... | The desktop each time it looked different. |
+| `frames.txt` | Per picture: number, milliseconds since the start, a hash of the pixels, and the area that changed (`20,60,120x80`). |
+| `inputs.txt` | Per input: milliseconds, and the command as it was given. |
+| `events.txt` | The log: inputs, windows opening and closing, every drawing. |
+| `meta.txt` | The desktop's size and when the recording started. |
+
+`replay` sends the inputs to a desktop again and compares the hash of how
+it looks at the end with the recording's last picture, so a recording made
+once is a test that can be run again:
+
+```
+$ headdesk start demo2 --size 640x400 -- the-app
+$ headdesk replay demo2 run1 --settle
+replayed inputs=4 picture=same
+```
+
+The desktop must have the recording's size, and the app must be in the state
+it was in when the recording began: inputs are positions and keys, not
+names of buttons. A picture that differs in one pixel differs; an app that
+shows the time, a caret that blinks or an animation will differ for no good
+reason (`freeze` helps with the last two).
 
 ## How it works
 
@@ -289,6 +329,7 @@ zig build test                        # unit tests, then scripts/smoke.sh with t
 | `src/png.zig` | PNG files |
 | `src/box.zig` | Boxes: namespaces and the file system view an app gets |
 | `src/boxes.zig` | Boxes on disk: snapshots, restore, what changed |
+| `src/record.zig` | Recordings: pictures, inputs, log, the page |
 | `src/sys.zig` | Linux system calls |
 | `src/testclient.zig` | The test client: a window, a button, a menu |
 | `scripts/smoke.sh` | The end-to-end test, run by `zig build test` |
