@@ -56,6 +56,21 @@ expect() {
     esac
 }
 
+# await 'text' -- headdesk arguments...: runs the command again and again
+# until its output holds the text, 20 s at most. For what a program in a
+# box does in its own time: making a box takes a slow machine a second.
+await() {
+    text=$1
+    shift 2
+    tries=0
+    while [ "$tries" -lt 200 ]; do
+        case $("$HD" "$@" 2>&1) in *"$text"*) return 0 ;; esac
+        tries=$((tries + 1))
+        sleep 0.1
+    done
+    return 1
+}
+
 # lacks 'text the output must not hold' -- headdesk arguments...
 lacks() {
     text=$1
@@ -245,6 +260,11 @@ expect 0 "frozen" -- status "$D-f1"
 expect 2 "choose one" -- replay "$D-f1" "$WORK/rec" --frozen --settle
 expect 0 "" -- kill "$D-f1"
 
+# names instead of pixels need an app that describes itself; the test client does not
+expect 2 "accessibility bus" -- tree "$D"
+expect 2 "accessibility bus" -- click "$D" --name Save
+expect 2 "accessibility bus" -- find "$D" Save
+
 # boxes: apps that read the system but write only into a box
 expect 2 "go with --sandbox" -- start "$D-b" --no-network -- "$TC"
 expect 4 "no box named" -- box diff nosuchbox
@@ -262,7 +282,7 @@ if why=$("$HD" check 2>&1); then
     expect 0 "$BOX snapshots=0 open" -- box list
     # a second program joins the box: it is root there, writes to the system and its home, and sees none of ours
     expect 0 "pid=" -- exec "$D-b" -- sh -c "echo \"id=\$(id -u) home=\$HOME procs=\$(ls /proc | grep -c '^[0-9]')\"; touch /etc/$marker; echo one >\$HOME/one; cat $WORK/secret 2>/dev/null || echo cannot-read-secret; echo out >$WORK/shared/from-box"
-    sleep 0.7
+    await "cannot-read-secret" -- output "$D-b"
     expect 0 "id=0 home=/root procs=" -- output "$D-b"
     expect 0 "cannot-read-secret" -- output "$D-b"
     expect 0 "" -- kill "$D-b"
@@ -279,7 +299,7 @@ if why=$("$HD" check 2>&1); then
     expect 0 "0 changed" -- box diff "$BOX"
     expect 0 "snapshot first" -- box snapshots "$BOX"
     expect 0 "box=$BOX" -- start "$D-b" --sandbox --box "$BOX" --as-root --no-network --size 320x200 -- sh -c "ls \$HOME; ls /etc/$marker; rm \$HOME/one; echo two >\$HOME/two; echo links: \$(ls /sys/class/net | xargs); sleep 0.3"
-    sleep 1
+    await "exited=0" -- status "$D-b"
     expect 0 "/etc/$marker" -- output "$D-b"
     expect 0 "links: lo" -- output "$D-b"
     expect 0 "network=no" -- status "$D-b"

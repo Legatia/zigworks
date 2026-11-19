@@ -7,6 +7,8 @@ const sys = @import("sys.zig");
 const desk = @import("desk.zig");
 const box = @import("box.zig");
 const boxes = @import("boxes.zig");
+const dbus = @import("dbus.zig");
+const a11y = @import("a11y.zig");
 
 pub const version = "0.1.0";
 
@@ -39,6 +41,21 @@ const usage =
     \\                        until nothing has been drawn for MS (300) and at
     \\                        least N windows are open; says what area changed
     \\
+    \\  tree NAME [--all] [--max N]
+    \\                        what the apps say is on the desktop: every button,
+    \\                        field, menu entry and label by role and name, with
+    \\                        its place (needs apps that speak AT-SPI)
+    \\  find NAME TEXT [--role ROLE]
+    \\                        the things whose name holds TEXT, and where to click
+    \\  click NAME --name TEXT [--role ROLE] [--nth N]
+    \\                        click the one thing called TEXT; if several are,
+    \\                        the Nth of them as `find` lists them
+    \\  press NAME TEXT [--role ROLE] [--nth N]
+    \\                        do what a click on it would, without the pointer
+    \\  fill NAME FIELD TEXT [--role ROLE] [--nth N]
+    \\                        put TEXT into the field called FIELD, whatever the
+    \\                        keyboard layout (any characters)
+    \\                        TEXT and FIELD may be "" with --role: any of that role
     \\  click NAME X Y [--window N] [--button left|right|middle] [--double]
     \\  move NAME X Y [--window N]
     \\  scroll NAME STEPS     wheel notches down (negative: up)
@@ -217,6 +234,11 @@ const Parsed = struct {
     since: ?[]const u8 = null,
     box: ?[]const u8 = null,
     fps: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    role: ?[]const u8 = null,
+    max: ?[]const u8 = null,
+    nth: ?[]const u8 = null,
+    all: bool = false,
     speed: ?[]const u8 = null,
     stop: bool = false,
     settle: bool = false,
@@ -252,6 +274,7 @@ fn parse(args: []const [:0]const u8, flags: []const []const u8) Parsed {
             const switches = [_]struct { name: []const u8, at: *bool }{
                 .{ .name = "--double", .at = &p.double },
                 .{ .name = "--stop", .at = &p.stop },
+                .{ .name = "--all", .at = &p.all },
                 .{ .name = "--settle", .at = &p.settle },
                 .{ .name = "--frozen", .at = &p.frozen },
                 .{ .name = "--until-quiet", .at = &p.until_quiet },
@@ -280,6 +303,10 @@ fn parse(args: []const [:0]const u8, flags: []const []const u8) Parsed {
             if (std.mem.eql(u8, a, "--since")) p.since = v;
             if (std.mem.eql(u8, a, "--box")) p.box = v;
             if (std.mem.eql(u8, a, "--fps")) p.fps = v;
+            if (std.mem.eql(u8, a, "--name")) p.name = v;
+            if (std.mem.eql(u8, a, "--role")) p.role = v;
+            if (std.mem.eql(u8, a, "--max")) p.max = v;
+            if (std.mem.eql(u8, a, "--nth")) p.nth = v;
             if (std.mem.eql(u8, a, "--speed")) p.speed = v;
             if (std.mem.eql(u8, a, "--share") or std.mem.eql(u8, a, "--share-ro")) {
                 if (p.share_count == p.shares.len) die(2, "too many shared directories", .{});
@@ -428,6 +455,264 @@ fn start(gpa: std.mem.Allocator, args: []const [:0]const u8) u8 {
     die(2, "the desktop did not come up; see {s}/desktop.log", .{dir});
 }
 
+// ---------------------------------------------------------------------
+// What apps say about themselves (the accessibility bus)
+
+const Win = struct {
+    n: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    title: []const u8,
+    /// The surface the window is drawn on: the same, or larger by shadows.
+    /// Apps count places from its corner.
+    sx: i32 = 0,
+    sy: i32 = 0,
+    sw: i32 = 0,
+    sh: i32 = 0,
+};
+
+const Seen = struct {
+    conn: dbus.Conn,
+    tree: a11y.Tree,
+    wins: []Win,
+
+    /// The desktop window a node is in. Apps give places relative to "the
+    /// window", which for something in a menu is the menu's own window: the
+    /// nearest thing around the node that sits at 0,0 with exactly the size
+    /// of a desktop window is that window. Else the window with the title
+    /// of the node's top-level frame.
+    fn window(s: *const Seen, node: a11y.Node, index: usize) ?Win {
+        const nodes = s.tree.nodes.items;
+        var up: ?usize = index;
+        while (up) |i| : (up = a11y.parentOf(nodes, i)) {
+            const n = nodes[i];
+            if (n.depth < 2 or !n.has_rect or n.rect.x != 0 or n.rect.y != 0) continue;
+            // the last windows are the topmost: a menu before what is under it
+            var k = s.wins.len;
+            while (k > 0) {
+                k -= 1;
+                const w = s.wins[k];
+                if ((w.sw == n.rect.w and w.sh == n.rect.h) or (w.w == n.rect.w and w.h == n.rect.h)) {
+                    // the main window's own frame is found by its title below
+                    if (i == node.top and w.title.len > 0 and !std.mem.eql(u8, w.title, n.name)) continue;
+                    return w;
+                }
+            }
+        }
+        const top = nodes[node.top];
+        for (s.wins) |w| {
+            if (w.title.len > 0 and std.mem.eql(u8, w.title, top.name)) return w;
+        }
+        return if (s.wins.len == 1) s.wins[0] else null;
+    }
+};
+
+fn parseWindows(gpa: std.mem.Allocator, text: []const u8) []Win {
+    var wins: std.ArrayList(Win) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "window ")) continue;
+        var w: Win = .{ .n = 0, .x = 0, .y = 0, .w = 0, .h = 0, .title = "" };
+        var words = std.mem.tokenizeScalar(u8, line, ' ');
+        _ = words.next();
+        w.n = std.fmt.parseInt(u32, words.next() orelse continue, 10) catch continue;
+        while (words.next()) |word| {
+            if (std.mem.startsWith(u8, word, "at=")) {
+                const comma = std.mem.findScalar(u8, word, ',') orelse continue;
+                w.x = std.fmt.parseInt(i32, word[3..comma], 10) catch 0;
+                w.y = std.fmt.parseInt(i32, word[comma + 1 ..], 10) catch 0;
+            } else if (std.mem.startsWith(u8, word, "size=")) {
+                const x = std.mem.findScalar(u8, word, 'x') orelse continue;
+                w.w = std.fmt.parseInt(i32, word[5..x], 10) catch 0;
+                w.h = std.fmt.parseInt(i32, word[x + 1 ..], 10) catch 0;
+            } else if (std.mem.startsWith(u8, word, "surface=")) {
+                // X,Y,WxH
+                var parts = std.mem.tokenizeAny(u8, word[8..], ",x");
+                w.sx = std.fmt.parseInt(i32, parts.next() orelse "0", 10) catch 0;
+                w.sy = std.fmt.parseInt(i32, parts.next() orelse "0", 10) catch 0;
+                w.sw = std.fmt.parseInt(i32, parts.next() orelse "0", 10) catch 0;
+                w.sh = std.fmt.parseInt(i32, parts.next() orelse "0", 10) catch 0;
+            }
+        }
+        if (w.sw == 0) {
+            w.sx = w.x;
+            w.sy = w.y;
+            w.sw = w.w;
+            w.sh = w.h;
+        }
+        if (std.mem.find(u8, line, "title=\"")) |t| {
+            const rest = line[t + 7 ..];
+            w.title = rest[0 .. std.mem.findScalarLast(u8, rest, '"') orelse rest.len];
+        }
+        wins.append(gpa, w) catch break;
+    }
+    return wins.items;
+}
+
+fn see(gpa: std.mem.Allocator, name: []const u8, max: usize) Seen {
+    const where = ask(gpa, name, &.{"a11y"}) orelse die(4, "no desktop named {s} (see `headdesk list`)", .{name});
+    var words = std.mem.tokenizeScalar(u8, where, ' ');
+    const socket = words.next() orelse die(2, "desktop {s} gave no answer", .{name});
+    const uid = std.fmt.parseInt(u32, words.next() orelse "0", 10) catch 0;
+    var conn = dbus.Conn.connect(gpa, socket, uid) catch |err| switch (err) {
+        error.Refused => die(2, "no app on {s} has an accessibility bus: start the app under `dbus-run-session --` on a system with at-spi2-core, and see the README for what each toolkit needs", .{name}),
+        else => die(2, "the accessibility bus of {s} does not answer ({s})", .{ name, @errorName(err) }),
+    };
+    const tree = a11y.read(gpa, &conn, max, true);
+    const windows = request(gpa, name, &.{"windows"}) catch "";
+    return .{ .conn = conn, .tree = tree, .wins = parseWindows(gpa, windows) };
+}
+
+fn stateWords(buf: []u8, n: a11y.Node) []const u8 {
+    var len: usize = 0;
+    const words = [_]struct { bit: u6, word: []const u8 }{
+        .{ .bit = a11y.State.focused, .word = " focused" },
+        .{ .bit = a11y.State.checked, .word = " checked" },
+        .{ .bit = a11y.State.selected, .word = " selected" },
+        .{ .bit = a11y.State.expanded, .word = " expanded" },
+        .{ .bit = a11y.State.editable, .word = " editable" },
+    };
+    for (words) |w| {
+        if (n.is(w.bit)) {
+            @memcpy(buf[len..][0..w.word.len], w.word);
+            len += w.word.len;
+        }
+    }
+    if (!n.is(a11y.State.sensitive) and !n.is(a11y.State.enabled)) {
+        const word = " disabled";
+        @memcpy(buf[len..][0..word.len], word);
+        len += word.len;
+    }
+    return buf[0..len];
+}
+
+fn describe(gpa: std.mem.Allocator, s: *const Seen, index: usize) []const u8 {
+    const n = s.tree.nodes.items[index];
+    var line: std.ArrayList(u8) = .empty;
+    var states: [64]u8 = undefined;
+    line.print(gpa, "{s} \"{s}\"", .{ if (n.role.len > 0) n.role else "thing", n.name }) catch return "";
+    if (n.text.len > 0) {
+        line.appendSlice(gpa, " text=\"") catch {};
+        for (n.text) |ch| line.append(gpa, if (ch < 0x20) ' ' else ch) catch {};
+        line.append(gpa, '"') catch {};
+    }
+    if (n.has_rect) {
+        if (s.window(n, index)) |w| {
+            line.print(gpa, " at={d},{d} size={d}x{d} window={d}", .{ w.sx + n.rect.x, w.sy + n.rect.y, n.rect.w, n.rect.h, w.n }) catch {};
+        } else line.print(gpa, " in-window={d},{d} size={d}x{d}", .{ n.rect.x, n.rect.y, n.rect.w, n.rect.h }) catch {};
+    }
+    line.appendSlice(gpa, stateWords(&states, n)) catch {};
+    return line.items;
+}
+
+fn treeCommand(gpa: std.mem.Allocator, name: []const u8, all: bool, max: usize) u8 {
+    var s = see(gpa, name, max);
+    defer s.conn.close();
+    if (s.tree.nodes.items.len == 0) {
+        out("no app on {s} describes itself (see the README for what each toolkit needs)\n", .{name});
+        return 1;
+    }
+    // indent by the ancestors that were printed
+    var level: [64]u32 = @splat(0);
+    var hidden_below: u32 = 0;
+    var printed: usize = 0;
+    for (s.tree.nodes.items, 0..) |n, index| {
+        const d = @min(n.depth, 62);
+        if (hidden_below != 0 and d > hidden_below) continue;
+        hidden_below = 0;
+        // a window or part that is not on screen hides all that is in it
+        if (!all and d >= 2 and !n.shown()) {
+            hidden_below = d;
+            continue;
+        }
+        if (d == 1) {
+            level[1] = 1;
+            out("app \"{s}\"\n", .{n.name});
+            continue;
+        }
+        const plain = n.name.len == 0 and n.text.len == 0 and a11y.isContainer(n.role);
+        level[d] = level[d - 1] + @intFromBool(!plain);
+        if (plain) continue;
+        var indent: [128]u8 = @splat(' ');
+        out("{s}{s}\n", .{ indent[0..@min(indent.len, (level[d] - 1) * 2)], describe(gpa, &s, index) });
+        printed += 1;
+    }
+    if (s.tree.cut) out("... more than {d} things: the rest is left out (--max N)\n", .{max});
+    return 0;
+}
+
+const Pick = struct { index: usize, fit: a11y.Fit };
+
+/// The things on screen called `text` (and of role `role`), the best fits
+/// first. A label inside a button of the same name is the button.
+fn pick(gpa: std.mem.Allocator, s: *const Seen, text: []const u8, role: ?[]const u8) []Pick {
+    const nodes = s.tree.nodes.items;
+    var found: std.ArrayList(Pick) = .empty;
+    for ([_]a11y.Fit{ .same, .same_but_case, .holds }) |want| {
+        for (nodes, 0..) |n, i| {
+            if (n.depth < 2 or !n.shown()) continue;
+            if (role) |r| {
+                if (a11y.fit(n.role, r) == .none) continue;
+            }
+            // no text asked for: everything of the role, once
+            if (text.len == 0) {
+                if (role == null or want != .same) continue;
+                found.append(gpa, .{ .index = i, .fit = .same }) catch break;
+                continue;
+            }
+            const by_name = a11y.fit(n.name, text);
+            const by_text = if (n.text.len > 0) a11y.fit(n.text, text) else a11y.Fit.none;
+            const best = if (@backingInt(by_text) < @backingInt(by_name)) by_text else by_name;
+            if (best != want) continue;
+            // inside something that fits as well: that is the thing
+            var inside = false;
+            var up = a11y.parentOf(nodes, i);
+            while (up) |pi| : (up = a11y.parentOf(nodes, pi)) {
+                const pn = nodes[pi];
+                if (pn.depth >= 2 and pn.shown() and @backingInt(a11y.fit(pn.name, text)) <= @backingInt(want)) {
+                    if (role == null or a11y.fit(pn.role, role.?) != .none) inside = true;
+                }
+            }
+            if (inside) continue;
+            // an app may list one thing twice
+            var twice = false;
+            for (found.items) |f| {
+                const o = nodes[f.index];
+                if (std.mem.eql(u8, o.role, n.role) and std.mem.eql(u8, o.name, n.name) and std.meta.eql(o.rect, n.rect)) twice = true;
+            }
+            if (twice) continue;
+            found.append(gpa, .{ .index = i, .fit = want }) catch break;
+        }
+    }
+    return found.items;
+}
+
+/// The one thing meant by `text`: the only one among the best fits. Its
+/// index in the tree.
+fn pickOne(gpa: std.mem.Allocator, s: *const Seen, name: []const u8, text: []const u8, role: ?[]const u8, nth: ?[]const u8) usize {
+    if (text.len == 0 and role == null) die(2, "an empty name needs --role", .{});
+    const all = pick(gpa, s, text, role);
+    if (all.len == 0) die(1, "nothing on {s} is called \"{s}\" (see `headdesk tree {s}`)", .{ name, text, name });
+    if (nth) |n_text| {
+        const n = std.fmt.parseInt(usize, n_text, 10) catch die(2, "--nth is a number, 1 for the first", .{});
+        if (n == 0 or n > all.len) die(1, "there are {d} such things on {s}, not {d}", .{ all.len, name, n });
+        return all[n - 1].index;
+    }
+    var best: usize = 0;
+    for (all) |p| best += @intFromBool(p.fit == all[0].fit);
+    if (best == 1) return all[0].index;
+    const picks = all[0..best];
+    var buf: [2000]u8 = undefined;
+    var len: usize = 0;
+    for (picks[0..@min(picks.len, 8)]) |p| {
+        const line = std.fmt.bufPrint(buf[len..], "\n  {s}", .{describe(gpa, s, p.index)}) catch break;
+        len += line.len;
+    }
+    die(2, "{d} things on {s} are called \"{s}\"; say which with --role or --nth, or click by position:{s}", .{ picks.len, name, text, buf[0..len] });
+}
+
 fn readFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     var buf: [1100]u8 = undefined;
     const fd = sys.openRead(std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return null) catch return null;
@@ -557,6 +842,8 @@ fn output(name: []const u8) u8 {
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     environ = init.environ.block.slice;
+    // a desktop or a bus that went away is an error to report, not a signal to die of
+    sys.ignoreSigpipe();
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const gpa = arena_state.allocator();
     const args = init.args.toSlice(gpa) catch die(2, "out of memory", .{});
@@ -601,9 +888,83 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const file = absolute(gpa, p.pos(1, "the file to write"));
         return if (p.window) |w| talk(gpa, name, &.{ "shot", file, w }) else talk(gpa, name, &.{ "shot", file });
     }
-    if (std.mem.eql(u8, cmd, "click") or std.mem.eql(u8, cmd, "move")) {
-        const p = parse(rest, &.{ "--window", "--button", "--double" });
+    if (std.mem.eql(u8, cmd, "tree")) {
+        const p = parse(rest, &.{ "--all", "--max" });
+        const max = if (p.max) |m| (std.fmt.parseInt(usize, m, 10) catch die(2, "--max is a number", .{})) else 1500;
+        return treeCommand(gpa, p.pos(0, "the desktop's name"), p.all, @max(1, max));
+    }
+    if (std.mem.eql(u8, cmd, "find")) {
+        const p = parse(rest, &.{"--role"});
         const name = p.pos(0, "the desktop's name");
+        var s = see(gpa, name, 5000);
+        defer s.conn.close();
+        const picks = pick(gpa, &s, p.pos(1, "the text to look for"), p.role);
+        for (picks) |pk| {
+            const n = s.tree.nodes.items[pk.index];
+            if (n.has_rect) {
+                if (s.window(n, pk.index)) |w| {
+                    out("click={d},{d} {s}\n", .{ w.sx + n.rect.x + @divTrunc(n.rect.w, 2), w.sy + n.rect.y + @divTrunc(n.rect.h, 2), describe(gpa, &s, pk.index) });
+                    continue;
+                }
+            }
+            out("{s}\n", .{describe(gpa, &s, pk.index)});
+        }
+        if (picks.len == 0) out("nothing is called that\n", .{});
+        return if (picks.len == 0) 1 else 0;
+    }
+    if (std.mem.eql(u8, cmd, "press") or std.mem.eql(u8, cmd, "fill")) {
+        const p = parse(rest, &.{ "--role", "--nth" });
+        const name = p.pos(0, "the desktop's name");
+        var s = see(gpa, name, 5000);
+        defer s.conn.close();
+        const index = pickOne(gpa, &s, name, p.pos(1, "the thing's name"), p.role, p.nth);
+        const n = s.tree.nodes.items[index];
+        if (std.mem.eql(u8, cmd, "press")) {
+            if (!n.actions) die(2, "{s} \"{s}\" can't be pressed that way; click it by position (`headdesk find`)", .{ n.role, n.name });
+            if (!a11y.press(&s.conn, n)) die(1, "the app did not do it", .{});
+            out("pressed {s} \"{s}\"\n", .{ n.role, n.name });
+            return 0;
+        }
+        const text = p.pos(2, "the text to put in");
+        if (a11y.setText(&s.conn, n, text)) {
+            out("filled {s} \"{s}\"\n", .{ n.role, n.name });
+            return 0;
+        }
+        // The app does not take text directly: click the field, select what
+        // it holds and type over it, which only ASCII can do.
+        for (text) |ch| {
+            if (ch >= 0x80) die(1, "{s} \"{s}\" does not take text directly, and typing can only do ASCII", .{ n.role, n.name });
+        }
+        const w = s.window(n, index) orelse die(1, "{s} \"{s}\" does not take text directly, and its window can't be told", .{ n.role, n.name });
+        if (!n.has_rect) die(1, "{s} \"{s}\" does not take text directly, and the app does not say where it is", .{ n.role, n.name });
+        var xb: [16]u8 = undefined;
+        var yb: [16]u8 = undefined;
+        const x = std.fmt.bufPrint(&xb, "{d}", .{w.sx + n.rect.x + @divTrunc(n.rect.w, 2)}) catch unreachable;
+        const y = std.fmt.bufPrint(&yb, "{d}", .{w.sy + n.rect.y + @divTrunc(n.rect.h, 2)}) catch unreachable;
+        for ([_][]const []const u8{ &.{ "click", x, y, "", "1", "" }, &.{ "key", "ctrl+a" }, &.{ "type", text } }) |fields| {
+            const answer = request(gpa, name, fields) catch die(2, "desktop {s} went away", .{name});
+            if (!std.mem.startsWith(u8, answer, "ok")) die(1, "{s} \"{s}\" could not be typed into: {s}", .{ n.role, n.name, std.mem.trim(u8, answer, "\n") });
+        }
+        out("typed into {s} \"{s}\"\n", .{ n.role, n.name });
+        return 0;
+    }
+    if (std.mem.eql(u8, cmd, "click") or std.mem.eql(u8, cmd, "move")) {
+        const p = parse(rest, &.{ "--window", "--button", "--double", "--name", "--role", "--nth" });
+        const name = p.pos(0, "the desktop's name");
+        if (p.name) |text| {
+            // by name: where the app says the thing is
+            var s = see(gpa, name, 5000);
+            defer s.conn.close();
+            const index = pickOne(gpa, &s, name, text, p.role, p.nth);
+            const n = s.tree.nodes.items[index];
+            const w = s.window(n, index) orelse die(2, "can't tell which window {s} \"{s}\" is in; click it by position", .{ n.role, n.name });
+            if (!n.has_rect) die(2, "the app does not say where {s} \"{s}\" is", .{ n.role, n.name });
+            var xb: [16]u8 = undefined;
+            var yb: [16]u8 = undefined;
+            const x = std.fmt.bufPrint(&xb, "{d}", .{w.sx + n.rect.x + @divTrunc(n.rect.w, 2)}) catch unreachable;
+            const y = std.fmt.bufPrint(&yb, "{d}", .{w.sy + n.rect.y + @divTrunc(n.rect.h, 2)}) catch unreachable;
+            return talk(gpa, name, &.{ cmd, x, y, p.button orelse "", if (p.double) "2" else "1", "" });
+        }
         return talk(gpa, name, &.{ cmd, p.pos(1, "X"), p.pos(2, "Y"), p.button orelse "", if (p.double) "2" else "1", p.window orelse "" });
     }
     if (std.mem.eql(u8, cmd, "wait")) {
@@ -688,6 +1049,8 @@ test {
     _ = @import("box.zig");
     _ = @import("boxes.zig");
     _ = @import("record.zig");
+    _ = @import("dbus.zig");
+    _ = @import("a11y.zig");
 }
 
 test "desktop names" {

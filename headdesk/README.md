@@ -85,6 +85,11 @@ out), 2 a wrong command, 4 no such desktop.
 | `windows NAME` | Every window, menu and popup: number, kind, place, size, parent, which one has the keyboard, title. |
 | `shot NAME FILE.png [--window N]` | The whole desktop as a PNG, or window `N` alone at full size, whatever covers it. |
 | `wait NAME [--idle MS] [--timeout MS] [--windows N]` | Until nothing has been drawn for `--idle` (300 ms) and at least `N` windows are open. Says how long it took and the area that changed since the last wait that settled (`changed=X,Y,WxH` or `changed=none`). After `--timeout` (10 s): `timeout`, exit 1. |
+| `tree NAME [--all] [--max N]` | What the apps say is on the desktop, see [Names instead of pixels](#names-instead-of-pixels): every button, field, menu entry and label with its role, name, place and state. `--all` also lists what is not on screen. |
+| `find NAME TEXT [--role ROLE]` | The things whose name (or text) holds `TEXT`, best fits first, each with the point to click. Exit 1 if there are none. |
+| `click NAME --name TEXT [--role ROLE] [--nth N]` | Clicks the one thing called `TEXT`. If several fit equally well it lists them and does nothing; `--role` narrows, `--nth` takes the Nth as `find` lists them. |
+| `press NAME TEXT [--role ROLE] [--nth N]` | Does what a click on it would, without the pointer (the app's own action). |
+| `fill NAME FIELD TEXT [--role ROLE] [--nth N]` | Puts `TEXT` into the field called `FIELD`: handed to the app as text, so any characters, whatever the keyboard layout. An app that refuses gets the field clicked, its content selected and the text typed (ASCII only). |
 | `click NAME X Y [--window N] [--button left\|right\|middle] [--double]` | Moves the pointer there and clicks. `X Y` are desktop pixels from the top left, or with `--window` pixels of that window. |
 | `move NAME X Y [--window N]` | Moves the pointer only. |
 | `scroll NAME STEPS` | Wheel notches down (negative: up) where the pointer is. |
@@ -177,6 +182,65 @@ user: the tests, and by hand the GTK 4 demo and Chrome (which loaded a page
 and left its 261 profile files in the box). Not tried: installing packages
 inside a box, and other distributions.
 
+## Names instead of pixels
+
+Apps describe themselves to screen readers over the accessibility bus
+(AT-SPI). headdesk reads the same description, so that an agent can click
+"Save" instead of 412,88. Real output, GTK 4 demo and Chrome:
+
+```
+$ headdesk tree gtk
+app "gtk4-widget-factory"
+  application "GTK Widget Factory" at=0,0 size=1400x800 window=1
+    tab panel "Page _1" at=10,57 size=1380x733 window=1
+      text box "" at=19,146 size=412x34 window=1 editable
+      checkbox "checkbutton" at=14,413 size=118x26 window=1 checked
+      ...
+
+$ headdesk find chrome "Press me"
+click=44,220 push button "Press me" at=8,209 size=73x22 window=1
+
+$ headdesk click chrome --name "Press me"
+at=44,220 window=1
+
+$ headdesk press chrome "Press me"
+pressed push button "Press me"
+
+$ headdesk fill gtk "" "héllo wörld ✓" --role "text box" --nth 3
+filled text box ""
+```
+
+Places are desktop pixels, ready for `click`. A name fits best when it is
+the same, then when it is the same but for case, then when it holds the
+text; a label inside a button of the same name counts as the button.
+Containers without a name are left out of `tree`, and so is everything the
+app says is not on screen.
+
+What it needs: the app started under a D-Bus session (`headdesk start NAME
+-- dbus-run-session -- APP`), and `at-spi2-core` installed, which desktop
+systems have. Per toolkit, as tried on Ubuntu 24.04:
+
+| | |
+|---|---|
+| GTK 4.14 | Describes itself without being asked. `tree` (about 150 things in 0.3 s), `click --name`, `press` and `fill` worked. The entries of an old-style combo box's popup are not in its description. |
+| Chrome 158 | Needs `--force-renderer-accessibility`; then the page is described too (headings, buttons, fields). `click --name` worked on a page button and on an entry of the main menu, `press` on a page button; `fill` fell back to typing. |
+| Firefox 160 | Describes itself (headdesk sets `GNOME_ACCESSIBILITY=1`); `tree` listed its welcome screen. Nothing more was tried. |
+| Qt 6.4 | Did not put itself on the accessibility bus at all, with `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1` set. By position only. |
+
+What to know:
+
+- The description is the app's, and apps differ: roles have each toolkit's
+  names (`push button` in Chrome, `button` in GTK), many things have no
+  name, and some are not described at all.
+- Reading it asks the app several questions per thing, so a large window
+  takes a moment (`--max`, default 1500 things for `tree`). It is read by
+  the `headdesk` command itself, not by the desktop's process, so a slow app
+  holds nothing else up.
+- headdesk asks each thing only about what it says it offers. Asked about
+  more, GTK 4.14 crashed.
+- The tests can't cover this (the test client does not describe itself);
+  everything above was done by hand, once.
+
 ## Recordings
 
 ```
@@ -252,8 +316,9 @@ stop drawing, not stop counting: they jump ahead when stepped.
   `HEADDESK_DIR` overrides the base). Apps are started with
   `XDG_RUNTIME_DIR` set to that directory and `WAYLAND_DISPLAY=wayland-0`,
   so nothing of theirs meets another desktop. `GDK_BACKEND`,
-  `QT_QPA_PLATFORM` and `MOZ_ENABLE_WAYLAND` are set to Wayland unless the
-  caller set them; `DISPLAY` is removed.
+  `QT_QPA_PLATFORM` and `MOZ_ENABLE_WAYLAND` are set to Wayland, and
+  `GNOME_ACCESSIBILITY` and `QT_LINUX_ACCESSIBILITY_ALWAYS_ON` to 1, unless
+  the caller set them; `DISPLAY` is removed.
 - **The protocol by hand.** No libwayland, no wlroots: messages are parsed
   and built in `src/wire.zig`. Offered to apps: `wl_compositor`,
   `wl_subcompositor`, `wl_shm`, `wl_seat` (pointer and keyboard),
@@ -331,8 +396,9 @@ click or two and some typing in each.
   memory shows nothing.
 - **Text** is ASCII on a US layout, typed as keys. No input method, no
   clipboard, no drag and drop; the data-device interface is there but empty.
-- **No accessibility tree**: windows are known by rectangle and title, their
-  contents only as pixels.
+- **Names** only where the app gives them, see [Names instead of
+  pixels](#names-instead-of-pixels); elsewhere a window's contents are
+  pixels.
 - **No X11 apps** (no Xwayland), no touch, no cursor in pictures, one output
   at scale 1, no window decorations drawn by the server.
 - **Without `--sandbox`** apps run as the calling user with its files; the
@@ -361,6 +427,8 @@ zig build test                        # unit tests, then scripts/smoke.sh with t
 | `src/png.zig` | PNG files |
 | `src/box.zig` | Boxes: namespaces and the file system view an app gets |
 | `src/boxes.zig` | Boxes on disk: snapshots, restore, what changed |
+| `src/a11y.zig` | What apps say about themselves (AT-SPI): roles, names, places |
+| `src/dbus.zig` | A small D-Bus client, for the accessibility bus |
 | `src/record.zig` | Recordings: pictures, inputs, log, the page |
 | `src/sys.zig` | Linux system calls |
 | `src/testclient.zig` | The test client: a window, a button, a menu |

@@ -120,7 +120,9 @@ pub const Desk = struct {
             .{ "GDK_BACKEND", "wayland" },
             .{ "QT_QPA_PLATFORM", "wayland" },
             .{ "MOZ_ENABLE_WAYLAND", "1" },
-            .{ "NO_AT_BRIDGE", "1" },
+            // apps describe themselves on the accessibility bus (`headdesk tree`)
+            .{ "QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1" },
+            .{ "GNOME_ACCESSIBILITY", "1" },
         };
         const drop = [_][]const u8{ "DISPLAY", "WAYLAND_SOCKET" };
         var have_default: [defaults.len]bool = @splat(false);
@@ -447,6 +449,10 @@ pub const Desk = struct {
             const fps = if (args.len >= 2) (std.fmt.parseInt(u32, args[1], 10) catch 10) else 10;
             d.rec = Recorder.start(d.gpa, args[0], fps, s) catch return fail(d, reply, "can't write to that directory");
             try reply.print(d.gpa, "ok recording dir={s} fps={d}\n", .{ args[0], @max(1, @min(fps, 60)) });
+        } else if (std.mem.eql(u8, cmd, "a11y")) {
+            // where the apps' accessibility bus is, and who to be there
+            const inside: u32 = if (d.opts.sandbox) |spec| (if (spec.as_root) 0 else sys.getuid()) else sys.getuid();
+            try reply.print(d.gpa, "ok {s}/at-spi/bus {d}\n", .{ d.rt_dir, inside });
         } else if (std.mem.eql(u8, cmd, "hash")) {
             const pixels = try s.render(d.gpa);
             defer d.gpa.free(pixels);
@@ -460,6 +466,8 @@ pub const Desk = struct {
                 if (!x.mapped) continue;
                 const r = s.windowRect(x);
                 try reply.print(d.gpa, "window {d} {s} at={d},{d} size={d}x{d}", .{ x.win, @tagName(x.kind), r.x, r.y, r.w, r.h });
+                // the whole surface, where it is larger than the window (shadows)
+                if (x.surface.w != r.w or x.surface.h != r.h) try reply.print(d.gpa, " surface={d},{d},{d}x{d}", .{ x.surface.x, x.surface.y, x.surface.w, x.surface.h });
                 if (x.parent) |p| try reply.print(d.gpa, " parent={d}", .{p.win});
                 if (s.keyboard_focus == x.surface) try reply.appendSlice(d.gpa, " keyboard");
                 if (x.app_id.len > 0) try reply.print(d.gpa, " app={s}", .{x.app_id});
