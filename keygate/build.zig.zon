@@ -1,0 +1,14 @@
+.{
+    .name = .keygate,
+    .version = "0.1.0",
+    .fingerprint = 0x21499cbebb9f2e8a,
+    .minimum_zig_version = "0.17.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "README.md",
+        "LICENSE",
+    },
+}
