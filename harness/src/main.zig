@@ -9,6 +9,8 @@ pub fn main(init: std.process.Init) u8 {
 
 test {
     _ = @import("config.zig");
+    _ = @import("rules.zig");
+    _ = @import("gate.zig");
     _ = @import("http.zig");
     _ = @import("jv.zig");
     _ = @import("sock.zig");
