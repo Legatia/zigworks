@@ -11,10 +11,11 @@ Wayland wire protocol itself. Linux only (x86_64, arm64). On Windows it runs
 inside WSL2, on macOS inside a Linux VM or container; it does not control the
 host's own apps.
 
-**State: 0.1.0, an experiment. Tested only against the small test client
-that ships with it (`headdesk-testclient`), by the tests in this folder. No
-real app (GTK, Qt, Firefox, Chromium) has been run on it yet**, so which of
-them work is not known. See [Limits](#limits).
+**State: 0.1.0, an experiment.** The tests in this folder use a small test
+client that ships with it (`headdesk-testclient`). Real apps have each been
+started once by hand, see [Apps tried](#apps-tried): GTK 4, Qt 6 and Chrome
+drew correctly and opened a menu; Firefox drew correctly and was not taken
+further. See [Limits](#limits).
 
 ## Using it from an agent
 
@@ -124,11 +125,37 @@ out), 2 a wrong command, 4 no such desktop.
 - **Freezing.** An app draws when the server tells it a frame is due.
   `freeze` stops telling; `step` tells once.
 
+## Apps tried
+
+The experiment this version was built for: do real apps start, draw and open
+a menu on a display server that offers shared-memory buffers only? Each app
+below was started once, by hand, on 19 November 2026 (Ubuntu 24.04 in WSL2,
+x86_64, as root, each under `dbus-run-session`, desktop 1024x700), and its
+pictures were looked at.
+
+| App | Started with | Connects | Draws | Picture right | Menu after a click | Asked for something unknown |
+|---|---|---|---|---|---|---|
+| GTK 4.14, `gtk4-widget-factory` | `GSK_RENDERER=cairo` | yes | yes | yes | yes: a dropdown opened under its button, and a click on an entry chose it | no |
+| Qt 6.4, Qt Linguist | | yes | yes | yes | yes: the File menu | no |
+| Chrome 158 | `--ozone-platform=wayland --disable-gpu --no-sandbox --no-first-run` | yes | yes | yes | yes: the main menu; Escape closed it | no |
+| Firefox 160.0.1 | `--no-remote --profile DIR` | yes | yes | yes (its welcome screen) | not tried: the first screen asks to agree to terms of use, and nobody had | no |
+| Qt 5.15, FeatherPad | | yes | yes | yes | not checked | no |
+
+Also seen: an address typed into Chrome with `type` loaded, and text typed
+into the page arrived whole, shifted characters included
+(`~!@#$%^&*()_+{}|:"<>?`). The layout's XKB text compiles with
+libxkbcommon's `xkbcli`. GTK's window asked for 1391x757 on the 1024x700
+desktop and was cut off at the edges. The GTK demo (spinners) and FeatherPad
+(a blinking caret) never settled, as the limits below say.
+
+Not tried: GTK without `GSK_RENDERER=cairo`, Chromium itself (Chrome stood
+in for it), Electron apps, anything on arm64, anything twice.
+
 ## Limits
 
-- **No real app has been run yet.** The starting set of interfaces is a
-  guess at what GTK 4, Qt 6, Firefox and Chromium need; `status` lists what
-  an app asked for and did not get.
+- **Few apps, each tried once.** The set of interfaces was a guess at what
+  GTK 4, Qt 6, Firefox and Chromium need, and held for the five above;
+  `status` lists what an app asked for and did not get.
 - **"Settled" is not "done".** An app that waits for the network looks idle;
   an app with a blinking caret or a spinner never settles (use `--timeout`,
   or `freeze`).
