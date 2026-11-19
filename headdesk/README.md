@@ -4,7 +4,9 @@ A headless desktop for AI agents on Linux. headdesk is its own Wayland
 display server: graphical apps run inside it with no monitor and no GPU, and
 an agent lists their windows, takes pictures of them, clicks, types, waits
 until they have stopped drawing, and can freeze them and let single frames
-through. "headterm, but for graphical apps."
+through. "headterm, but for graphical apps." With `--sandbox` the apps run in
+a box: they read the system but write only into the box, their home is
+empty, and what they changed can be listed, kept as a snapshot or thrown away.
 
 One static binary of about 300 KB, pure Zig, no C libraries: it speaks the
 Wayland wire protocol itself. Linux only (x86_64, arm64). On Windows it runs
@@ -75,10 +77,10 @@ out), 2 a wrong command, 4 no such desktop.
 
 | Command | |
 |---|---|
-| `start NAME [--size WxH] [--cwd DIR] -- CMD...` | A new desktop (default 1280x800) with `CMD` in it. Returns once the desktop answers; it keeps running in the background. |
+| `start NAME [--size WxH] [--cwd DIR] [--sandbox ...] -- CMD...` | A new desktop (default 1280x800) with `CMD` in it. Returns once the desktop answers; it keeps running in the background. With `--sandbox` the apps run in a [box](#boxes). |
 | `exec NAME -- CMD...` | One more program on that desktop. |
 | `list` | The desktops that are running. |
-| `status NAME` | Size, number of windows and apps, each app's pid or exit code, and every request an app made that this server does not know (`unknown ...`). |
+| `status NAME` | Size, number of windows and apps, each app's pid or exit code, the box if there is one, and every request an app made that this server does not know (`unknown ...`). |
 | `kill NAME` | Ends the apps (SIGTERM, then SIGKILL after half a second) and the desktop. |
 | `windows NAME` | Every window, menu and popup: number, kind, place, size, parent, which one has the keyboard, title. |
 | `shot NAME FILE.png [--window N]` | The whole desktop as a PNG, or window `N` alone at full size, whatever covers it. |
@@ -95,6 +97,81 @@ out), 2 a wrong command, 4 no such desktop.
 | `thaw NAME` | Back to normal. |
 | `log NAME [--since N]` | One numbered record of every input and every drawing, in order, with the area each drawing changed. |
 | `output NAME` | What the apps printed (stdout and stderr). |
+| `box list` | The boxes: name, number of snapshots, open or closed. |
+| `box diff BOX` | What was `added`, `changed` or `deleted` in the box since its last snapshot, as paths the apps saw. |
+| `box snapshot BOX LABEL` | Keeps the box as it is now under `LABEL`; the box goes on from there. |
+| `box snapshots BOX` | Its snapshots, oldest first. |
+| `box restore BOX LABEL` | Back to that snapshot: what was written after it, and later snapshots, are gone. |
+| `box reset BOX`, `box delete BOX` | Empties the box, snapshots included; removes it. |
+| `check` | Whether this system lets you make boxes, and if not, why. |
+
+## Boxes
+
+```
+$ headdesk start work --sandbox --share ~/project -- some-app
+started work pid=439 size=1280x800 box=work
+```
+
+Options that go with `--sandbox`: `--box BOX` (which box; default the
+desktop's name), `--share DIR` and `--share-ro DIR` (a directory of yours the
+apps may use, or only read; shown at the same path), `--no-network`, and
+`--as-root` (the apps are root inside the box, so that they can write
+anywhere in it).
+
+What an app in a box sees:
+
+- **The system, to read.** `/usr`, `/etc`, `/var`, `/opt` and the rest of the
+  root file system are there. Anything written, changed or deleted goes into
+  the box's directory and nowhere else.
+- **An empty home** of its own, kept in the box. Nothing of `/home`, `/root`,
+  `/mnt` or `/media` is there, except what `--share` names.
+- **Fresh `/tmp`, `/run` and `/dev`** (null, zero, full, random, urandom, tty,
+  terminals of its own), its own `/proc` with only its own processes, and its
+  own host name.
+- **The network** as the host has it, or with `--no-network` only a loopback
+  that is down.
+- **The desktop's Wayland socket**, and not the desktop's control socket: an
+  app can't drive its own desktop.
+
+`exec` starts further programs in the same box while its first program
+lives. When that ends, everything left in the box is ended with it.
+
+A box outlives its desktop: start another desktop with the same `--box` and
+the apps find what they left. Real output, after an app had written four
+things:
+
+```
+$ headdesk box diff b1
+added   /usr/hello-from-box
+added   /root/note.txt
+deleted /etc/hostname
+changed /etc/issue
+4 changed in box b1
+
+$ headdesk box snapshot b1 clean
+$ headdesk box restore b1 clean      # later: everything since is gone
+```
+
+`snapshot`, `restore`, `reset` and `delete` need the box closed (no desktop
+using it). A snapshot costs nothing: what was written so far is set aside as
+a layer and the box goes on writing above it.
+
+Boxes are kept in `$HEADDESK_BOXES`, else `$XDG_DATA_HOME/headdesk/boxes`,
+else `~/.local/share/headdesk/boxes`.
+
+**How strong it is.** A box is made of Linux namespaces (user, mount, pid,
+ipc, uts, and network with `--no-network`) with an overlay over each
+top-level directory of the system, as containers and bubblewrap are made.
+The apps have no privileges outside it and can't gain any (`no_new_privs`).
+It is not a virtual machine: the kernel is shared, so a kernel bug can be a
+way out, and nothing limits the CPU, memory or disk a box uses. With the
+network on, an app can reach whatever the host can, including services on
+localhost.
+
+Tried on Ubuntu 24.04 in WSL2 (kernel 6.18), as root and as an ordinary
+user: the tests, and by hand the GTK 4 demo and Chrome (which loaded a page
+and left its 261 profile files in the box). Not tried: installing packages
+inside a box, and other distributions.
 
 ## How it works
 
@@ -157,7 +234,20 @@ Not tried: GTK without `GSK_RENDERER=cairo`, Chromium itself (Chrome stood
 in for it), Electron apps, any real app on arm64, and more than a start, a
 click or two and some typing in each.
 
+- **Boxes** are the namespaces above, set up by hand with system calls (no
+  bubblewrap, no container runtime). A directory that has other file systems
+  mounted inside it can't be overlaid in one piece (WSL mounts drivers under
+  `/usr/lib`): it is taken apart, its directories overlaid one by one, and
+  the files directly in it and the other file systems shown read-only.
+
 ## Limits
+
+- **A box is not a virtual machine**, see [Boxes](#boxes). Systems that
+  forbid unprivileged user namespaces can't make one (`headdesk check` says
+  so; on Ubuntu 24.04 `sysctl kernel.apparmor_restrict_unprivileged_userns=0`
+  allows it). With `--as-root` an ordinary user is root only over the box's
+  own files: programs that switch to other users, as package managers do,
+  may fail.
 
 - **Few apps, each tried briefly.** The set of interfaces was a guess at what
   GTK 4, Qt 6, Firefox and Chromium need, and held for the five above;
@@ -173,8 +263,8 @@ click or two and some typing in each.
   contents only as pixels.
 - **No X11 apps** (no Xwayland), no touch, no cursor in pictures, one output
   at scale 1, no window decorations drawn by the server.
-- **No sandbox.** Apps run as the calling user with its files; the desktop
-  only gives them their own display.
+- **Without `--sandbox`** apps run as the calling user with its files; the
+  desktop only gives them their own display.
 - Subsurfaces apply on every commit (no synchronized mode) and are stacked
   in the order they were made.
 
@@ -197,6 +287,8 @@ zig build test                        # unit tests, then scripts/smoke.sh with t
 | `src/wire.zig` | The Wayland wire format |
 | `src/keymap.zig` | The keyboard layout: key table and XKB text |
 | `src/png.zig` | PNG files |
+| `src/box.zig` | Boxes: namespaces and the file system view an app gets |
+| `src/boxes.zig` | Boxes on disk: snapshots, restore, what changed |
 | `src/sys.zig` | Linux system calls |
 | `src/testclient.zig` | The test client: a window, a button, a menu |
 | `scripts/smoke.sh` | The end-to-end test, run by `zig build test` |

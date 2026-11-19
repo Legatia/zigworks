@@ -6,6 +6,8 @@ const sys = @import("sys.zig");
 const png = @import("png.zig");
 const keymap = @import("keymap.zig");
 const server = @import("server.zig");
+const box = @import("box.zig");
+const boxes = @import("boxes.zig");
 const Server = server.Server;
 
 /// Separates the fields of a command on the control socket.
@@ -21,6 +23,9 @@ pub const Options = struct {
     argv: []const []const u8,
     cwd: ?[]const u8 = null,
     envp: [:null]const ?[*:0]const u8,
+    /// Apps run in this box instead of on the system as it is.
+    sandbox: ?box.Spec = null,
+    box_name: []const u8 = "",
 };
 
 const App = struct {
@@ -53,12 +58,18 @@ pub const Desk = struct {
     apps: std.ArrayList(App) = .empty,
     env: std.ArrayList(?[*:0]const u8) = .empty,
     log_fd: ?sys.fd_t = null,
+    /// What apps get as XDG_RUNTIME_DIR: the Wayland socket and nothing else.
+    rt_dir: []const u8 = "",
+    /// Process 1 of the box, while there is one.
+    box_init: ?sys.pid_t = null,
     last_frame_ms: u64 = 0,
     quit: bool = false,
 
     pub fn init(gpa: Allocator, opts: Options) !Desk {
         var buf: [256]u8 = undefined;
-        const wayland = try sys.listenUnix(try std.fmt.bufPrint(&buf, "{s}/wayland-0", .{opts.dir}));
+        const rt_dir = try std.fmt.allocPrint(gpa, "{s}/rt", .{opts.dir});
+        try sys.mkdir(try std.fmt.bufPrintSentinel(&buf, "{s}", .{rt_dir}, 0));
+        const wayland = try sys.listenUnix(try std.fmt.bufPrint(&buf, "{s}/wayland-0", .{rt_dir}));
         errdefer sys.close(wayland);
         const control = try sys.listenUnix(try std.fmt.bufPrint(&buf, "{s}/control.sock", .{opts.dir}));
         errdefer sys.close(control);
@@ -68,7 +79,12 @@ pub const Desk = struct {
             .srv = try Server.init(gpa, opts.width, opts.height),
             .wayland_fd = wayland,
             .control_fd = control,
+            .rt_dir = rt_dir,
         };
+        if (d.opts.sandbox) |*spec| {
+            spec.rt_dir = rt_dir;
+            boxes.lock(spec.box_dir, spec.home);
+        }
         const log_path = try std.fmt.bufPrintSentinel(&buf, "{s}/app.log", .{opts.dir}, 0);
         d.log_fd = sys.openAppend(log_path) catch null;
         try d.buildEnv();
@@ -77,11 +93,15 @@ pub const Desk = struct {
 
     /// The environment apps get: the caller's, pointed at this desktop.
     fn buildEnv(d: *Desk) !void {
-        const set = [_][2][]const u8{
-            .{ "XDG_RUNTIME_DIR", d.opts.dir },
+        // in a box the home is where the box shows it (root's, with --as-root)
+        const home: []const u8 = if (d.opts.sandbox) |spec| spec.home else "";
+        const all = [_][2][]const u8{
+            .{ "XDG_RUNTIME_DIR", d.rt_dir },
             .{ "WAYLAND_DISPLAY", "wayland-0" },
             .{ "XDG_SESSION_TYPE", "wayland" },
+            .{ "HOME", home },
         };
+        const set = all[0..if (home.len > 0) all.len else all.len - 1];
         // only if the caller did not choose otherwise
         const defaults = [_][2][]const u8{
             .{ "GDK_BACKEND", "wayland" },
@@ -123,9 +143,43 @@ pub const Desk = struct {
         args[argv.len] = null;
         const dir: ?[*:0]const u8 = if (cwd) |c| (try arena.dupeSentinel(u8, c, 0)).ptr else null;
         const envp: [*:null]const ?[*:0]const u8 = @ptrCast(d.env.items.ptr);
-        const pid = try sys.spawn(@ptrCast(args.ptr), envp, dir, d.log_fd);
+        const pid = if (d.opts.sandbox != null) try d.spawnBoxed(@ptrCast(args.ptr), envp, dir) else try sys.spawn(@ptrCast(args.ptr), envp, dir, d.log_fd, null);
         try d.apps.append(d.gpa, .{ .pid = pid, .name = try d.gpa.dupe(u8, argv[0]) });
-        d.srv.note("start {s} pid {d}", .{ argv[0], pid });
+        d.srv.note("start {s} pid {d}{s}", .{ argv[0], pid, if (d.opts.sandbox != null) " in the box" else "" });
+        return pid;
+    }
+
+    fn enterBox(ctx: *const anyopaque) void {
+        box.enter(@ptrCast(@alignCast(ctx)));
+    }
+
+    fn joinBox(ctx: *const anyopaque) void {
+        const pid: *const sys.pid_t = @ptrCast(@alignCast(ctx));
+        box.join(pid.*);
+    }
+
+    /// The first program makes the box; later ones join it while it lives.
+    fn spawnBoxed(d: *Desk, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, cwd: ?[*:0]const u8) !sys.pid_t {
+        if (d.box_init) |init_pid| {
+            if (sys.alive(init_pid)) return sys.spawn(argv, envp, cwd, d.log_fd, .{ .ctx = &init_pid, .run = joinBox });
+            d.box_init = null;
+        }
+        const report = try sys.pipe();
+        var spec = d.opts.sandbox.?;
+        spec.report_fd = report[1];
+        const pid = sys.spawn(argv, envp, cwd, d.log_fd, .{ .ctx = &spec, .run = enterBox }) catch |err| {
+            sys.close(report[0]);
+            sys.close(report[1]);
+            return err;
+        };
+        sys.close(report[1]);
+        defer sys.close(report[0]);
+        // the box's first process says who it is, or the box failed
+        var items = [_]sys.PollItem{sys.pollIn(report[0])};
+        sys.poll(&items, 5000);
+        var init_pid: sys.pid_t = 0;
+        const n = sys.read(report[0], std.mem.asBytes(&init_pid)) catch 0;
+        if (n == @sizeOf(sys.pid_t)) d.box_init = init_pid;
         return pid;
     }
 
@@ -223,7 +277,8 @@ pub const Desk = struct {
             if (a.exit == .running) sys.killGroup(a.pid, .KILL);
         }
         var buf: [256]u8 = undefined;
-        for ([_][]const u8{ "wayland-0", "control.sock" }) |f| {
+        if (d.opts.sandbox) |spec| boxes.unlock(spec.box_dir);
+        for ([_][]const u8{ "rt/wayland-0", "control.sock" }) |f| {
             if (std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ d.opts.dir, f }, 0)) |p| sys.unlink(p) else |_| {}
         }
     }
@@ -458,6 +513,7 @@ pub const Desk = struct {
                     .signal => |sig| try reply.print(d.gpa, "app pid={d} signal={d} {s}\n", .{ a.pid, sig, a.name }),
                 }
             }
+            if (d.opts.sandbox) |spec| try reply.print(d.gpa, "sandbox box={s} network={s} user={s} shared={d}\n", .{ d.opts.box_name, if (spec.network) "yes" else "no", if (spec.as_root) "root" else "same", spec.shares.len });
             for (s.unknown.items) |u| try reply.print(d.gpa, "unknown {s}\n", .{u});
         } else if (std.mem.eql(u8, cmd, "exec")) {
             if (args.len < 1) return fail(d, reply, "exec needs a program");

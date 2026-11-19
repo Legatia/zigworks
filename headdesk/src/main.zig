@@ -5,14 +5,25 @@ const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
 const desk = @import("desk.zig");
+const box = @import("box.zig");
+const boxes = @import("boxes.zig");
 
 pub const version = "0.1.0";
 
 const usage =
     \\usage: headdesk <command> [options]
     \\
-    \\  start NAME [--size WxH] [--cwd DIR] -- CMD...
+    \\  start NAME [--size WxH] [--cwd DIR] [--sandbox ...] -- CMD...
     \\                        a new desktop with CMD running in it
+    \\      --sandbox         the apps run in a box: they read the system but
+    \\                        what they write stays in the box, their home is
+    \\                        empty, and they see none of your files
+    \\      --box BOX         which box (default: the desktop's name); a box
+    \\                        keeps what was written in it between runs
+    \\      --share DIR, --share-ro DIR
+    \\                        a directory of yours the apps may use (or only read)
+    \\      --no-network      no network in the box
+    \\      --as-root         the apps are root inside the box (to install things)
     \\  exec NAME -- CMD...   one more program on that desktop
     \\  list                  the desktops that are running
     \\  status NAME           its apps, windows, and what apps asked for that
@@ -39,6 +50,15 @@ const usage =
     \\  thaw NAME             back to normal
     \\  log NAME [--since N]  every input and every drawing, in order
     \\  output NAME           what the apps printed
+    \\
+    \\  box list              the boxes, their snapshots, and which are open
+    \\  box diff BOX          what was added, changed or deleted in the box
+    \\                        since its last snapshot
+    \\  box snapshot BOX LABEL   keep the box as it is now under LABEL
+    \\  box restore BOX LABEL    back to that snapshot; what came after is gone
+    \\  box reset BOX         empty the box, snapshots included
+    \\  box delete BOX        remove the box
+    \\  check                 whether this system lets you make boxes
     \\
     \\  help, version
     \\
@@ -174,6 +194,12 @@ const Parsed = struct {
     timeout: ?[]const u8 = null,
     windows: ?[]const u8 = null,
     since: ?[]const u8 = null,
+    box: ?[]const u8 = null,
+    sandbox: bool = false,
+    no_network: bool = false,
+    as_root: bool = false,
+    shares: [16]box.Share = undefined,
+    share_count: usize = 0,
 
     fn pos(p: *const Parsed, i: usize, what: []const u8) []const u8 {
         if (i >= p.count) die(2, "{s} is missing (see `headdesk help`)", .{what});
@@ -196,10 +222,20 @@ fn parse(args: []const [:0]const u8, flags: []const []const u8) Parsed {
                 if (std.mem.eql(u8, f, a)) break true;
             } else false;
             if (!known) die(2, "unknown option {s}", .{a});
-            if (std.mem.eql(u8, a, "--double")) {
-                p.double = true;
-                continue;
+            const switches = [_]struct { name: []const u8, at: *bool }{
+                .{ .name = "--double", .at = &p.double },
+                .{ .name = "--sandbox", .at = &p.sandbox },
+                .{ .name = "--no-network", .at = &p.no_network },
+                .{ .name = "--as-root", .at = &p.as_root },
+            };
+            var was_switch = false;
+            for (switches) |sw| {
+                if (std.mem.eql(u8, a, sw.name)) {
+                    sw.at.* = true;
+                    was_switch = true;
+                }
             }
+            if (was_switch) continue;
             if (i + 1 >= args.len) die(2, "{s} needs a value", .{a});
             i += 1;
             const v: []const u8 = args[i];
@@ -211,6 +247,12 @@ fn parse(args: []const [:0]const u8, flags: []const []const u8) Parsed {
             if (std.mem.eql(u8, a, "--timeout")) p.timeout = v;
             if (std.mem.eql(u8, a, "--windows")) p.windows = v;
             if (std.mem.eql(u8, a, "--since")) p.since = v;
+            if (std.mem.eql(u8, a, "--box")) p.box = v;
+            if (std.mem.eql(u8, a, "--share") or std.mem.eql(u8, a, "--share-ro")) {
+                if (p.share_count == p.shares.len) die(2, "too many shared directories", .{});
+                p.shares[p.share_count] = .{ .path = v, .read_only = std.mem.eql(u8, a, "--share-ro") };
+                p.share_count += 1;
+            }
             continue;
         }
         if (p.count == p.positional.len) die(2, "too many arguments", .{});
@@ -220,10 +262,86 @@ fn parse(args: []const [:0]const u8, flags: []const []const u8) Parsed {
     return p;
 }
 
+/// Where boxes are kept: $HEADDESK_BOXES, else $XDG_DATA_HOME/headdesk/boxes,
+/// else ~/.local/share/headdesk/boxes.
+fn boxesDir(buf: []u8) []const u8 {
+    if (getenv("HEADDESK_BOXES")) |d| {
+        if (d.len > 0) return d;
+    }
+    if (getenv("XDG_DATA_HOME")) |x| {
+        if (x.len > 0) return std.fmt.bufPrint(buf, "{s}/headdesk/boxes", .{std.mem.trimEnd(u8, x, "/")}) catch die(2, "XDG_DATA_HOME is too long", .{});
+    }
+    const home = getenv("HOME") orelse die(2, "HOME is not set; set HEADDESK_BOXES to where boxes are kept", .{});
+    return std.fmt.bufPrint(buf, "{s}/.local/share/headdesk/boxes", .{std.mem.trimEnd(u8, home, "/")}) catch die(2, "HOME is too long", .{});
+}
+
+fn boxDir(gpa: std.mem.Allocator, name: []const u8) []const u8 {
+    if (!validName(name)) die(2, "a box's name is 1 to 32 letters, digits, '_', '-' or '.': {s}", .{name});
+    var buf: [512]u8 = undefined;
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ boxesDir(&buf), name }) catch die(2, "out of memory", .{});
+}
+
+fn boxCommand(gpa: std.mem.Allocator, args: []const [:0]const u8) u8 {
+    if (args.len == 0) die(2, "box needs list, diff, snapshot, restore, reset or delete", .{});
+    const sub_cmd: []const u8 = args[0];
+    if (std.mem.eql(u8, sub_cmd, "list")) {
+        var buf: [512]u8 = undefined;
+        boxes.list(boxesDir(&buf));
+        return 0;
+    }
+    if (args.len < 2) die(2, "box {s} needs a box's name", .{sub_cmd});
+    const name: []const u8 = args[1];
+    const dir = boxDir(gpa, name);
+    const result: boxes.Error!void = blk: {
+        if (std.mem.eql(u8, sub_cmd, "diff")) {
+            const n = boxes.diff(dir) catch |err| break :blk err;
+            out("{d} changed in box {s}\n", .{ n, name });
+            break :blk {};
+        }
+        if (std.mem.eql(u8, sub_cmd, "snapshots")) {
+            if (!boxes.exists(dir)) break :blk error.NoSuchBox;
+            boxes.listSnapshots(dir);
+            break :blk {};
+        }
+        if (std.mem.eql(u8, sub_cmd, "reset")) break :blk boxes.reset(dir);
+        if (std.mem.eql(u8, sub_cmd, "delete")) break :blk boxes.delete(dir);
+        if (std.mem.eql(u8, sub_cmd, "snapshot") or std.mem.eql(u8, sub_cmd, "restore")) {
+            if (args.len < 3) die(2, "box {s} needs a label", .{sub_cmd});
+            const label: []const u8 = args[2];
+            if (!boxes.validLabel(label)) die(2, "a label is 1 to 40 letters, digits, '_', '-' or '.': {s}", .{label});
+            break :blk if (std.mem.eql(u8, sub_cmd, "snapshot")) boxes.snapshot(dir, label) else boxes.restore(dir, label);
+        }
+        die(2, "unknown box command: {s}", .{sub_cmd});
+    };
+    result catch |err| switch (err) {
+        error.NoSuchBox => die(4, "no box named {s} (see `headdesk box list`)", .{name}),
+        error.InUse => die(2, "box {s} is open in a desktop; end that desktop first", .{name}),
+        error.NoSuchSnapshot => die(2, "box {s} has no snapshot with that label (see `headdesk box snapshots {s}`)", .{ name, name }),
+        error.Exists => die(2, "box {s} already has a snapshot with that label", .{name}),
+        error.Failed => die(2, "the box's directory could not be changed", .{}),
+    };
+    return 0;
+}
+
 fn start(gpa: std.mem.Allocator, args: []const [:0]const u8) u8 {
-    const p = parse(args, &.{ "--size", "--cwd" });
+    const p = parse(args, &.{ "--size", "--cwd", "--sandbox", "--box", "--share", "--share-ro", "--no-network", "--as-root" });
     const name = p.pos(0, "the desktop's name");
     if (p.rest.len == 0) die(2, "start needs a program after --", .{});
+    const boxed = p.sandbox or p.box != null;
+    if (!boxed and (p.share_count > 0 or p.no_network or p.as_root)) die(2, "--share, --no-network and --as-root go with --sandbox", .{});
+    var sandbox: ?box.Spec = null;
+    const box_name = p.box orelse name;
+    if (boxed) {
+        if (box.unsupported()) |why| die(2, "can't make a sandbox here: {s}", .{why});
+        const dir = boxDir(gpa, box_name);
+        if (boxes.inUse(dir)) |pid| die(2, "box {s} is already open in a desktop (pid {d})", .{ box_name, pid });
+        const shares = gpa.alloc(box.Share, p.share_count) catch die(2, "out of memory", .{});
+        for (p.shares[0..p.share_count], 0..) |s, i| shares[i] = .{ .path = absolute(gpa, s.path), .read_only = s.read_only };
+        const home = if (p.as_root) "/root" else (getenv("HOME") orelse "/home/user");
+        sandbox = .{ .box_dir = dir, .rt_dir = "", .home = home, .network = !p.no_network, .as_root = p.as_root, .shares = shares };
+        var base_buf: [512]u8 = undefined;
+        box.mkdirAll(boxesDir(&base_buf));
+    }
     var width: i32 = 1280;
     var height: i32 = 800;
     if (p.size) |sz| {
@@ -258,7 +376,7 @@ fn start(gpa: std.mem.Allocator, args: []const [:0]const u8) u8 {
         const err_fd = sys.create(err_path) catch null_fd;
         _ = linux.dup2(err_fd, 2);
         sys.ignoreSigpipe();
-        var d = desk.Desk.init(gpa, .{ .name = name, .dir = dir, .width = width, .height = height, .argv = argv, .cwd = cwd, .envp = environ }) catch |err| die(2, "can't set up the desktop: {s}", .{@errorName(err)});
+        var d = desk.Desk.init(gpa, .{ .name = name, .dir = dir, .width = width, .height = height, .argv = argv, .cwd = cwd, .envp = environ, .sandbox = sandbox, .box_name = box_name }) catch |err| die(2, "can't set up the desktop: {s}", .{@errorName(err)});
         _ = d.spawn(argv, cwd) catch |err| die(2, "can't start {s}: {s}", .{ argv[0], @errorName(err) });
         d.run();
         sys.exit(0);
@@ -268,7 +386,7 @@ fn start(gpa: std.mem.Allocator, args: []const [:0]const u8) u8 {
     while (tries < 200) : (tries += 1) {
         if (request(gpa, name, &.{"ping"})) |answer| {
             defer gpa.free(answer);
-            out("started {s} pid={d} size={d}x{d}\n", .{ name, pid, width, height });
+            if (boxed) out("started {s} pid={d} size={d}x{d} box={s}\n", .{ name, pid, width, height, box_name }) else out("started {s} pid={d} size={d}x{d}\n", .{ name, pid, width, height });
             return 0;
         } else |_| {}
         if (sys.reap(pid) != .running) break;
@@ -341,6 +459,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 0;
     }
     if (std.mem.eql(u8, cmd, "start")) return start(gpa, rest);
+    if (std.mem.eql(u8, cmd, "box")) return boxCommand(gpa, rest);
+    if (std.mem.eql(u8, cmd, "check")) {
+        if (box.unsupported()) |why| {
+            out("sandbox no: {s}\n", .{why});
+            return 1;
+        }
+        out("sandbox yes\n", .{});
+        return 0;
+    }
     if (std.mem.eql(u8, cmd, "list")) return list(gpa);
 
     if (std.mem.eql(u8, cmd, "exec")) {
@@ -409,6 +536,8 @@ test {
     _ = @import("keymap.zig");
     _ = @import("server.zig");
     _ = @import("desk.zig");
+    _ = @import("box.zig");
+    _ = @import("boxes.zig");
 }
 
 test "desktop names" {

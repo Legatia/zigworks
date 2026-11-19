@@ -288,9 +288,23 @@ pub fn exit(code: u8) noreturn {
     linux.exit_group(code);
 }
 
+/// Something to do in the new process before it becomes the program.
+pub const Hook = struct {
+    ctx: *const anyopaque,
+    run: *const fn (*const anyopaque) void,
+};
+
+/// A pipe: `[0]` to read from, `[1]` to write to.
+pub fn pipe() Error![2]fd_t {
+    var fds: [2]fd_t = undefined;
+    _ = try check(linux.pipe2(&fds, .{ .CLOEXEC = true }));
+    return fds;
+}
+
 /// Starts `argv` with environment `envp` in a new session, stdin from
-/// /dev/null, stdout and stderr to `log_fd` (or /dev/null). Returns its pid.
-pub fn spawn(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, cwd: ?[*:0]const u8, log_fd: ?fd_t) Error!pid_t {
+/// /dev/null, stdout and stderr to `log_fd` (or /dev/null). `hook` runs in
+/// the new process first. Returns its pid.
+pub fn spawn(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, cwd: ?[*:0]const u8, log_fd: ?fd_t, hook: ?Hook) Error!pid_t {
     const rc = try check(linux.fork());
     if (rc != 0) return @intCast(rc);
     // the child: only system calls from here on
@@ -299,6 +313,7 @@ pub fn spawn(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const
     _ = linux.dup2(null_fd, 0);
     _ = linux.dup2(log_fd orelse null_fd, 1);
     _ = linux.dup2(log_fd orelse null_fd, 2);
+    if (hook) |h| h.run(h.ctx);
     if (cwd) |d| _ = linux.chdir(d);
     execvpe(argv, envp);
     linux.exit_group(127);

@@ -12,9 +12,14 @@ export HEADDESK_DIR=$WORK/d
 D=smoke-$$
 FAILS=0
 
+export HEADDESK_BOXES=$WORK/boxes
+BOX=box-$$
+
 cleanup() {
     "$HD" kill "$D" >/dev/null 2>&1
     "$HD" kill "$D-2" >/dev/null 2>&1
+    "$HD" kill "$D-b" >/dev/null 2>&1
+    "$HD" box delete "$BOX" >/dev/null 2>&1
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -164,6 +169,62 @@ later=$("$HD" output "$D-2" | grep -c '^frame ')
 if [ "$later" -gt $((after + 3)) ]; then echo "ok - thawed, frames run again"; else
     echo "FAIL: after thaw only $((later - after)) frames" >&2
     FAILS=$((FAILS + 1))
+fi
+
+# boxes: apps that read the system but write only into a box
+expect 2 "go with --sandbox" -- start "$D-b" --no-network -- "$TC"
+expect 4 "no box named" -- box diff nosuchbox
+expect 2 "needs list, diff" -- box
+if why=$("$HD" check 2>&1); then
+    marker=headdesk-smoke-$$
+    echo secret >"$WORK/secret"
+    mkdir "$WORK/shared"
+    expect 0 "box=$BOX" -- start "$D-b" --sandbox --box "$BOX" --as-root --size 320x200 --share-ro "$(dirname "$TC")" --share "$WORK/shared" -- "$TC" boxed
+    expect 0 "settled" -- wait "$D-b" --windows 1
+    expect 0 'title="boxed"' -- windows "$D-b"
+    expect 0 "sandbox box=$BOX network=yes user=root shared=2" -- status "$D-b"
+    expect 2 "already open" -- start "$D-b2" --sandbox --box "$BOX" -- "$TC"
+    expect 2 "is open in a desktop" -- box snapshot "$BOX" early
+    expect 0 "$BOX snapshots=0 open" -- box list
+    # a second program joins the box: it is root there, writes to the system and its home, and sees none of ours
+    expect 0 "pid=" -- exec "$D-b" -- sh -c "echo \"id=\$(id -u) home=\$HOME procs=\$(ls /proc | grep -c '^[0-9]')\"; touch /etc/$marker; echo one >\$HOME/one; cat $WORK/secret 2>/dev/null || echo cannot-read-secret; echo out >$WORK/shared/from-box"
+    sleep 0.7
+    expect 0 "id=0 home=/root procs=" -- output "$D-b"
+    expect 0 "cannot-read-secret" -- output "$D-b"
+    expect 0 "" -- kill "$D-b"
+    sleep 0.3
+    if [ ! -e "/etc/$marker" ] && [ "$(cat "$WORK/shared/from-box" 2>/dev/null)" = out ]; then echo "ok - the system is untouched and the shared directory was written"; else
+        echo "FAIL: /etc/$marker exists on the system, or the shared directory was not written" >&2
+        FAILS=$((FAILS + 1))
+    fi
+    expect 0 "added   /etc/$marker" -- box diff "$BOX"
+    expect 0 "added   /root/one" -- box diff "$BOX"
+
+    # snapshots: keep, go on, go back
+    expect 0 "" -- box snapshot "$BOX" first
+    expect 2 "already has a snapshot" -- box snapshot "$BOX" first
+    expect 0 "0 changed" -- box diff "$BOX"
+    expect 0 "snapshot first" -- box snapshots "$BOX"
+    expect 0 "box=$BOX" -- start "$D-b" --sandbox --box "$BOX" --as-root --no-network --size 320x200 -- sh -c "ls \$HOME; ls /etc/$marker; rm \$HOME/one; echo two >\$HOME/two; echo links: \$(ls /sys/class/net | xargs); sleep 0.3"
+    sleep 1
+    expect 0 "/etc/$marker" -- output "$D-b"
+    expect 0 "links: lo" -- output "$D-b"
+    expect 0 "network=no" -- status "$D-b"
+    expect 0 "exited=0" -- status "$D-b"
+    expect 0 "" -- kill "$D-b"
+    sleep 0.3
+    expect 0 "deleted /root/one" -- box diff "$BOX"
+    expect 0 "added   /root/two" -- box diff "$BOX"
+    expect 2 "no snapshot with that label" -- box restore "$BOX" nosuch
+    expect 0 "" -- box restore "$BOX" first
+    expect 0 "0 changed" -- box diff "$BOX"
+    expect 0 "$BOX snapshots=1 closed" -- box list
+    expect 0 "" -- box reset "$BOX"
+    lacks "snapshot" -- box snapshots "$BOX"
+    expect 0 "" -- box delete "$BOX"
+    lacks "$BOX" -- box list
+else
+    echo "skip - no boxes on this system: $why"
 fi
 
 # the end
