@@ -17,6 +17,8 @@ test {
     _ = @import("model.zig");
     _ = @import("tools.zig");
     _ = @import("agent.zig");
+    _ = @import("feeds.zig");
+    _ = @import("brief.zig");
     _ = @import("http.zig");
     _ = @import("jv.zig");
     _ = @import("sock.zig");
