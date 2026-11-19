@@ -1,0 +1,14 @@
+.{
+    .name = .headdesk,
+    .version = "0.1.0",
+    .fingerprint = 0x3492f12dbca30e96,
+    .minimum_zig_version = "0.17.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "README.md",
+        "LICENSE",
+    },
+}
