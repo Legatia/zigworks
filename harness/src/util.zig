@@ -2,6 +2,9 @@
 const std = @import("std");
 const Io = std.Io;
 
+/// Files only the owner can read (POSIX); the default on Windows.
+pub const private_file: Io.File.Permissions = if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600);
+
 pub fn nowSeconds(io: Io) i64 {
     return @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
 }

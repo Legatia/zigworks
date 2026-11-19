@@ -81,7 +81,7 @@ pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
     }
     const files = [_][2][]const u8{ .{ p.config, config.defaults_ini }, .{ p.rules, config.rules_example }, .{ p.briefs, config.briefs_example }, .{ p.tasks, config.tasks_example } };
     for (files) |f| {
-        var file = Io.Dir.cwd().createFile(io, f[0], .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch |e| switch (e) {
+        var file = Io.Dir.cwd().createFile(io, f[0], .{ .exclusive = true, .permissions = util.private_file }) catch |e| switch (e) {
             error.PathAlreadyExists => continue,
             else => return e,
         };
@@ -989,7 +989,7 @@ pub const Core = struct {
     }
 
     fn appendSettingsLine(c: *Core, path: []const u8, text: []const u8) !void {
-        var f = try Io.Dir.cwd().createFile(c.io, path, .{ .truncate = false, .permissions = .fromMode(0o600) });
+        var f = try Io.Dir.cwd().createFile(c.io, path, .{ .truncate = false, .permissions = util.private_file });
         defer f.close(c.io);
         const len = try f.length(c.io);
         try f.writePositionalAll(c.io, text, len);

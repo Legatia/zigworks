@@ -2,6 +2,7 @@
 //! then the owner's rules, grants with an expiry, and each tool's default.
 const std = @import("std");
 const rules = @import("rules.zig");
+const util = @import("util.zig");
 const Io = std.Io;
 
 pub const Tool = enum {
@@ -115,7 +116,7 @@ pub const Grants = struct {
             if (it.expires_s <= now_s) continue;
             try out.print(g.gpa, "{s}\t{d}\t{s}\n", .{ @tagName(it.tool), it.expires_s, it.key });
         }
-        var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = .fromMode(0o600) });
+        var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = util.private_file });
         defer f.close(io);
         try f.writeStreamingAll(io, out.items);
     }

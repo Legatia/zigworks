@@ -26,7 +26,7 @@ pub const Log = struct {
     /// Opens (or creates) the log, drops a last line cut off by a crash and
     /// notes that it did.
     pub fn open(gpa: std.mem.Allocator, io: Io, path: []const u8) !Log {
-        var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true, .permissions = .fromMode(0o600) });
+        var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true, .permissions = util.private_file });
         errdefer f.close(io);
         const len = try f.length(io);
         var l: Log = .{ .gpa = gpa, .io = io, .file = f, .offset = len, .seq = 0, .last = zero_hash };
