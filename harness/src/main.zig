@@ -13,6 +13,7 @@ test {
     _ = @import("gate.zig");
     _ = @import("util.zig");
     _ = @import("log.zig");
+    _ = @import("memory.zig");
     _ = @import("http.zig");
     _ = @import("jv.zig");
     _ = @import("sock.zig");
