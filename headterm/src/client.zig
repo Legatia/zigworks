@@ -1,7 +1,6 @@
 //! Session directory layout and the client side of the socket protocol.
 
 const std = @import("std");
-const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const sys = @import("sys.zig");
 const server = @import("server.zig");
@@ -16,35 +15,12 @@ pub fn validName(name: []const u8) bool {
     return true;
 }
 
-/// `$XDG_RUNTIME_DIR/headterm`, else `$TMPDIR/headterm-$UID` (TMPDIR
-/// defaulting to /tmp).
-pub fn sessionDir(buf: []u8) ![]const u8 {
-    if (sys.getenv("XDG_RUNTIME_DIR")) |xdg| {
-        if (xdg.len > 0) return std.fmt.bufPrint(buf, "{s}/headterm", .{std.mem.trimEnd(u8, xdg, "/")});
-    }
-    const tmp = sys.getenv("TMPDIR") orelse "/tmp";
-    const base = if (tmp.len == 0) "/tmp" else std.mem.trimEnd(u8, tmp, "/");
-    return std.fmt.bufPrint(buf, "{s}/headterm-{d}", .{ base, sys.getuid() });
-}
-
-pub const DirError = error{ NotOwned, NotADirectory } || sys.MakeDirError || sys.OpenError || sys.FStatError || sys.FChmodError;
-
-/// Creates the session directory with mode 0700, refusing one owned by
-/// another user.
-pub fn ensureSessionDir(dir: []const u8) DirError!void {
-    sys.mkdir(dir, 0o700) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => |e| return e,
-    };
-    const fd = try sys.open(dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-    defer sys.close(fd);
-    const st = try sys.fstatOwner(fd);
-    if (st.uid != sys.getuid()) return error.NotOwned;
-    if (st.mode & 0o777 != 0o700) try sys.fchmod(fd, 0o700);
-}
+/// The directory that holds one socket per session; where it is depends
+/// on the operating system.
+pub const sessionDir = sys.sessionDir;
 
 pub fn socketPath(buf: []u8, dir: []const u8, name: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(buf, "{s}/{s}.sock", .{ dir, name });
+    return std.fmt.bufPrint(buf, "{s}" ++ std.fs.path.sep_str ++ "{s}.sock", .{ dir, name });
 }
 
 pub const Status = enum { ok, timeout, @"error" };
@@ -65,14 +41,14 @@ pub fn request(gpa: Allocator, socket_path: []const u8, args: []const []const u8
 }
 
 /// Connects to a session server. The caller closes the descriptor.
-pub fn connect(socket_path: []const u8) RequestError!posix.fd_t {
+pub fn connect(socket_path: []const u8) RequestError!sys.fd_t {
     return sys.connectUnix(socket_path) catch |err| switch (err) {
         error.ConnectionRefused => error.StaleSession,
         else => error.NoSuchSession,
     };
 }
 
-pub fn sendRequest(gpa: Allocator, fd: posix.fd_t, args: []const []const u8) RequestError!void {
+pub fn sendRequest(gpa: Allocator, fd: sys.fd_t, args: []const []const u8) RequestError!void {
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(gpa);
     for (args) |a| {
@@ -85,7 +61,7 @@ pub fn sendRequest(gpa: Allocator, fd: posix.fd_t, args: []const []const u8) Req
 }
 
 /// Reads until the server closes the connection.
-pub fn readResponse(gpa: Allocator, fd: posix.fd_t) RequestError!Response {
+pub fn readResponse(gpa: Allocator, fd: sys.fd_t) RequestError!Response {
     var resp: std.ArrayList(u8) = .empty;
     errdefer resp.deinit(gpa);
     var buf: [16384]u8 = undefined;
@@ -117,7 +93,7 @@ pub const StartOptions = struct {
 
 /// Starts session `name` running `argv`. Returns the program's pid; on
 /// failure `msg` holds a human-readable reason.
-pub fn startSession(gpa: Allocator, name: []const u8, argv: []const []const u8, opts: StartOptions, msg: *[256]u8) error{StartFailed}!posix.pid_t {
+pub fn startSession(gpa: Allocator, name: []const u8, argv: []const []const u8, opts: StartOptions, msg: *[256]u8) error{StartFailed}!sys.pid_t {
     @memset(msg, 0);
     if (!validName(name)) return failMsg(msg, "invalid session name '{s}': use 1-64 letters, digits, '.', '_' or '-', not starting with '.' or '-'", .{name});
     if (argv.len == 0) return failMsg(msg, "missing command", .{});
@@ -125,7 +101,7 @@ pub fn startSession(gpa: Allocator, name: []const u8, argv: []const []const u8, 
 
     var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = sessionDir(&dir_buf) catch return failMsg(msg, "session directory path too long", .{});
-    ensureSessionDir(dir) catch |err| return failMsg(msg, "cannot use session directory {s}: {s}", .{ dir, @errorName(err) });
+    sys.ensureSessionDir(dir) catch |err| return failMsg(msg, "cannot use session directory {s}: {s}", .{ dir, @errorName(err) });
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const sock = socketPath(&path_buf, dir, name) catch return failMsg(msg, "socket path too long", .{});
 
@@ -137,7 +113,7 @@ pub fn startSession(gpa: Allocator, name: []const u8, argv: []const []const u8, 
         error.StaleSession => sys.unlink(sock) catch {},
         else => {},
     }
-    _ = sys.unixAddress(sock) catch return failMsg(msg, "socket path too long: {s} (set XDG_RUNTIME_DIR or TMPDIR to a shorter directory)", .{sock});
+    _ = sys.unixAddress(sock) catch return failMsg(msg, "socket path too long: {s} (" ++ sys.session_dir_hint ++ ")", .{sock});
 
     var server_msg: [256]u8 = @splat(0);
     return server.start(gpa, .{
@@ -196,7 +172,7 @@ pub const SessionInfo = struct {
     rows: usize,
     pid: u32,
     exited: bool,
-    exit_code: ?u8,
+    exit_code: ?u32,
     exit_signal: ?u8,
 };
 

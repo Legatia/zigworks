@@ -8,8 +8,8 @@ const sys = @import("sys.zig");
 
 pub const Recorder = struct {
     gpa: Allocator,
-    /// A plain descriptor: the recorder runs in the forked session server,
-    /// which does not use `std.Io`.
+    /// A plain descriptor: the recorder runs in the session server, which
+    /// does not use `std.Io`.
     fd: sys.fd_t,
     start_ns: i128,
     /// Start of a UTF-8 character split across two PTY reads.
@@ -18,9 +18,7 @@ pub const Recorder = struct {
 
     /// Creates (or truncates) `path` and writes the header.
     pub fn create(gpa: Allocator, path: []const u8, cols: usize, rows: usize, argv: []const []const u8) !Recorder {
-        var flags: sys.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true };
-        if (@hasField(sys.O, "LARGEFILE")) flags.LARGEFILE = true;
-        const fd = try sys.open(path, flags, 0o666);
+        const fd = try sys.openForWrite(path, .truncate, 0o666);
         errdefer sys.close(fd);
         const r: Recorder = .{ .gpa = gpa, .fd = fd, .start_ns = sys.nanoTimestamp() };
 

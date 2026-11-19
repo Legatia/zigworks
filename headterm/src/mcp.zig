@@ -5,7 +5,6 @@
 //! to session servers in-process, not through the CLI.
 
 const std = @import("std");
-const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const json = std.json;
 const client = @import("client.zig");
@@ -36,7 +35,7 @@ pub fn serve(io: std.Io, gpa: Allocator) !void {
     var writer = std.Io.File.stdout().writerStreaming(io, &out_buf);
     const out = &writer.interface;
 
-    var stdin: Stdin = .{ .gpa = gpa, .in = &reader.interface, .in_fd = posix.STDIN_FILENO };
+    var stdin: Stdin = .{ .gpa = gpa, .in = &reader.interface, .in_fd = sys.stdin() };
     // One diff marker per MCP server process, separate from CLI users and
     // other agents watching the same session.
     stdin.client_id = std.fmt.bufPrint(&stdin.client_id_buf, "mcp-{d}", .{sys.getpid()}) catch "mcp";
@@ -72,7 +71,7 @@ fn writeLine(out: *std.Io.Writer, msg: []const u8) !void {
 const Stdin = struct {
     gpa: Allocator,
     in: *std.Io.Reader,
-    in_fd: posix.fd_t,
+    in_fd: sys.fd_t,
     client_id_buf: [32]u8 = undefined,
     client_id: []const u8 = "mcp",
     pending: std.ArrayList([]u8) = .empty,
@@ -108,20 +107,19 @@ const Stdin = struct {
     /// Blocks until `fd` is readable. Returns false if request `id` (JSON
     /// encoded) was cancelled in the meantime. After end of input the
     /// current request still runs to completion.
-    fn waitReadable(self: *Stdin, fd: posix.fd_t, id: []const u8) !bool {
+    fn waitReadable(self: *Stdin, fd: sys.fd_t, id: []const u8) !bool {
         while (true) {
             // Complete lines already buffered never show up in poll().
             while (std.mem.findScalar(u8, self.in.buffered(), '\n') != null) {
                 const line = (self.in.takeDelimiter('\n') catch break) orelse break;
                 if (try self.absorb(try self.gpa.dupe(u8, line), id)) return false;
             }
-            var fds = [_]posix.pollfd{
-                .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
-                .{ .fd = if (self.eof) -1 else self.in_fd, .events = posix.POLL.IN, .revents = 0 },
-            };
-            _ = try posix.poll(&fds, -1);
-            if (fds[0].revents != 0) return true;
-            if (fds[1].revents != 0) {
+            // After end of input only the session is waited for.
+            var fds = [_]sys.PollItem{ sys.pollItem(fd, false), sys.pollItem(self.in_fd, false) };
+            const watched: []sys.PollItem = if (self.eof) fds[0..1] else &fds;
+            try sys.poll(watched, -1);
+            if (sys.readable(fds[0])) return true;
+            if (!self.eof and sys.readable(fds[1])) {
                 if (self.in.buffered().len == self.in.buffer.len) {
                     // A line longer than the buffer: drop it.
                     self.in.toss(self.in.buffered().len);
@@ -288,7 +286,7 @@ const Result = union(enum) {
     tool: ToolResult,
 };
 
-const DispatchError = error{ MethodNotFound, InvalidParams, Cancelled } || Allocator.Error || posix.PollError;
+const DispatchError = error{ MethodNotFound, InvalidParams, Cancelled } || Allocator.Error || sys.PollError;
 
 const Dispatch = struct {
     io: std.Io,
@@ -515,7 +513,7 @@ const Dispatch = struct {
         };
     }
 
-    fn callSession(self: *Dispatch, name: []const u8, args: []const []const u8) (client.CallError || error{Cancelled} || posix.PollError)!client.Response {
+    fn callSession(self: *Dispatch, name: []const u8, args: []const []const u8) (client.CallError || error{Cancelled} || sys.PollError)!client.Response {
         const stdin = self.stdin orelse return client.call(self.arena, name, args);
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const fd = try client.connect(try client.sessionSocket(&path_buf, name));

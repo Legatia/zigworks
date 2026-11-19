@@ -3,11 +3,11 @@
 //! One call for a whole menu, wizard or passphrase prompt.
 
 const std = @import("std");
-const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const json = std.json;
 const client = @import("client.zig");
 const regex = @import("regex.zig");
+const sys = @import("sys.zig");
 
 pub const Wait = struct {
     text: ?[]const u8 = null,
@@ -58,7 +58,7 @@ pub const failure_ttl_s = 600;
 pub const keep_ttl_s = 3600;
 const max_ms = 60_000;
 
-pub const Error = client.CallError || error{Cancelled} || posix.PollError;
+pub const Error = client.CallError || error{Cancelled} || sys.PollError;
 
 /// Sends one request to a session. The MCP server's version watches stdin
 /// for cancellation.

@@ -4,7 +4,7 @@ name: Release
 # Builds static Linux binaries (x86_64, arm64) and an Apple Silicon macOS binary, and
 # attaches them to a GitHub release for that tag. headsight's Linux binaries
 # capture the camera only (V4L2); the screen, windows and text need macOS.
-# trigrep, headsound and llmcheck also get a Windows x86_64 binary (a zip); llmcheck's
+# All but headsight also get a Windows x86_64 binary (a zip); llmcheck's
 # packages also hold its stand-in server, llmcheck-fake.
 on:
   push:
@@ -27,7 +27,7 @@ jobs:
           # build and not find the SDK frameworks trigrep links (CoreServices).
           # -Dcpu=apple_m1 keeps the binary runnable on every Apple Silicon Mac.
           - { os: macos-15, target: native, name: aarch64-macos }
-          # trigrep, headsound and llmcheck only (other projects skip it below)
+          # not headsight (it skips this below)
           - { os: windows-latest, target: x86_64-windows-gnu, name: x86_64-windows }
     runs-on: ${{ matrix.os }}
     steps:
@@ -41,7 +41,7 @@ jobs:
           project="${GITHUB_REF_NAME%%-v*}"
           version="${GITHUB_REF_NAME#*-v}"
           case "$project" in trigrep|headterm|headsight|headsound|llmcheck) ;; *) echo "unknown project in tag: $project"; exit 1 ;; esac
-          if [ "${{ matrix.name }}" = x86_64-windows ] && [ "$project" != trigrep ] && [ "$project" != headsound ] && [ "$project" != llmcheck ]; then
+          if [ "${{ matrix.name }}" = x86_64-windows ] && [ "$project" = headsight ]; then
             echo "SKIP=1" >> "$GITHUB_ENV"; exit 0
           fi
           echo "PKG_DIR=$project" >> "$GITHUB_ENV"
