@@ -75,7 +75,8 @@ pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
     const p = try Paths.init(a, home);
     for ([_][]const u8{ home, p.memory, p.workspace, p.state, p.log_dir }) |d| try Io.Dir.cwd().createDirPath(io, d);
     if (builtin.os.tag != .windows) {
-        var d = try Io.Dir.cwd().openDir(io, home, .{});
+        // iterate: on Linux a plain open is O_PATH, and fchmod on it fails with EBADF
+        var d = try Io.Dir.cwd().openDir(io, home, .{ .iterate = true });
         defer d.close(io);
         try d.setPermissions(io, .fromMode(0o700));
     }

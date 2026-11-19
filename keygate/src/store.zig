@@ -72,7 +72,8 @@ pub fn default(override: ?[]const u8, data_dir: ?[]const u8) Store {
 
 fn dirPut(io: Io, path: []const u8, name: []const u8, value: []const u8) !void {
     try Io.Dir.cwd().createDirPath(io, path);
-    var dir = try Io.Dir.cwd().openDir(io, path, .{});
+    // iterate: on Linux a plain open is O_PATH, and fchmod on it fails with EBADF
+    var dir = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
     defer dir.close(io);
     if (!is_windows) {
         // the directory too: nobody else may list it
