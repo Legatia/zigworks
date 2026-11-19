@@ -27,6 +27,8 @@ pub const Options = struct {
     /// Apps run in this box instead of on the system as it is.
     sandbox: ?box.Spec = null,
     box_name: []const u8 = "",
+    /// Start frozen: apps get no frame until the first step.
+    frozen: bool = false,
 };
 
 const App = struct {
@@ -42,10 +44,18 @@ const Wait = struct {
     windows: u32,
 };
 
+/// A `step --until-quiet` in progress.
+const Stepping = struct {
+    max: u32,
+    done: u32 = 0,
+    last_ms: u64,
+};
+
 const Conn = struct {
     fd: sys.fd_t,
     buf: std.ArrayList(u8) = .empty,
     wait: ?Wait = null,
+    stepping: ?Stepping = null,
     done: bool = false,
 };
 
@@ -83,6 +93,7 @@ pub const Desk = struct {
             .control_fd = control,
             .rt_dir = rt_dir,
         };
+        if (opts.frozen) d.srv.freeze();
         if (d.opts.sandbox) |*spec| {
             spec.rt_dir = rt_dir;
             boxes.lock(spec.box_dir, spec.home);
@@ -200,7 +211,7 @@ pub const Desk = struct {
 
             var busy = d.srv.framesWaiting() and !(d.srv.frozen and d.srv.step_budget == 0);
             for (d.conns.items) |c| {
-                if (c.wait != null) busy = true;
+                if (c.wait != null or c.stepping != null) busy = true;
             }
             // a picture is owed to the recording
             if (d.rec) |rec| {
@@ -232,12 +243,14 @@ pub const Desk = struct {
             }
 
             const now = sys.nowMs();
-            if (now - d.last_frame_ms >= 16) {
+            // frozen, frames come when stepped, as fast as the apps take them
+            if (d.srv.frozen or now - d.last_frame_ms >= Server.frame_ms) {
                 if (d.srv.frameTick()) d.last_frame_ms = now;
             }
             d.srv.flush();
             if (d.rec) |rec| rec.tick(&d.srv);
             d.checkWaits();
+            d.checkSteps();
             d.reapApps();
 
             var i: usize = 0;
@@ -298,7 +311,7 @@ pub const Desk = struct {
     // Commands
 
     fn readConn(d: *Desk, c: *Conn) void {
-        if (c.wait != null) {
+        if (c.wait != null or c.stepping != null) {
             // nothing more is expected; the caller went away
             var scratch: [64]u8 = undefined;
             const n = sys.read(c.fd, &scratch) catch 0;
@@ -329,6 +342,34 @@ pub const Desk = struct {
         if (finished) {
             sys.writeAll(c.fd, reply.items) catch {};
             c.done = true;
+        }
+    }
+
+    /// `step --until-quiet`: one frame at a time, each when the apps have
+    /// answered the one before, until no app asks for another.
+    fn checkSteps(d: *Desk) void {
+        const now = sys.nowMs();
+        for (d.conns.items) |c| {
+            const st = &(c.stepping orelse continue);
+            if (d.srv.step_budget > 0) continue; // a frame is on its way
+            const waiting = d.srv.framesWaiting();
+            var answer: ?bool = null;
+            if (waiting and st.done < st.max) {
+                d.srv.step_budget = 1;
+                st.done += 1;
+                st.last_ms = now;
+            } else if (waiting) {
+                answer = false;
+            } else if (now - @max(st.last_ms, d.srv.last_commit_ms) >= 150) {
+                // nothing asked for a frame, and nothing was committed for a while
+                answer = true;
+            }
+            if (answer) |quiet| {
+                var buf: [96]u8 = undefined;
+                sys.writeAll(c.fd, std.fmt.bufPrint(&buf, "ok frames={d} quiet={s}\n", .{ st.done, if (quiet) "yes" else "no" }) catch "ok\n") catch {};
+                c.stepping = null;
+                c.done = true;
+            }
         }
     }
 
@@ -512,17 +553,18 @@ pub const Desk = struct {
             c.wait = .{ .start_ms = now, .idle_ms = idle, .deadline_ms = now + timeout, .windows = windows };
             return false;
         } else if (std.mem.eql(u8, cmd, "freeze")) {
-            s.frozen = true;
-            s.step_budget = 0;
-            s.note("freeze", .{});
+            s.freeze();
             try reply.appendSlice(d.gpa, "ok frozen\n");
         } else if (std.mem.eql(u8, cmd, "thaw")) {
-            s.frozen = false;
-            s.note("thaw", .{});
+            s.thaw();
             try reply.appendSlice(d.gpa, "ok running\n");
         } else if (std.mem.eql(u8, cmd, "step")) {
             if (!s.frozen) return fail(d, reply, "step needs a frozen desktop: run freeze first");
             const n = if (args.len >= 1) (std.fmt.parseInt(u32, args[0], 10) catch 1) else 1;
+            if (args.len >= 2 and std.mem.eql(u8, args[1], "quiet")) {
+                c.stepping = .{ .max = @max(1, n), .last_ms = sys.nowMs() };
+                return false;
+            }
             s.step_budget += @max(1, n);
             try reply.print(d.gpa, "ok {d} waiting={s}\n", .{ @max(1, n), if (s.framesWaiting()) "yes" else "no" });
         } else if (std.mem.eql(u8, cmd, "log")) {
@@ -544,7 +586,7 @@ pub const Desk = struct {
             for (s.windows.items) |x| {
                 if (x.mapped) open += 1;
             }
-            try reply.print(d.gpa, "ok {s} size={d}x{d} windows={d} clients={d} {s} draws={d}\n", .{ d.opts.name, s.width, s.height, open, s.clients.items.len, if (s.frozen) "frozen" else "running", s.changes });
+            try reply.print(d.gpa, "ok {s} size={d}x{d} windows={d} clients={d} {s} draws={d} clock={d}ms\n", .{ d.opts.name, s.width, s.height, open, s.clients.items.len, if (s.frozen) "frozen" else "running", s.changes, s.clockMs() });
             for (d.apps.items) |a| {
                 switch (a.exit) {
                     .running => try reply.print(d.gpa, "app pid={d} running {s}\n", .{ a.pid, a.name }),

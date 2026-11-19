@@ -77,7 +77,7 @@ out), 2 a wrong command, 4 no such desktop.
 
 | Command | |
 |---|---|
-| `start NAME [--size WxH] [--cwd DIR] [--sandbox ...] -- CMD...` | A new desktop (default 1280x800) with `CMD` in it. Returns once the desktop answers; it keeps running in the background. With `--sandbox` the apps run in a [box](#boxes). |
+| `start NAME [--size WxH] [--cwd DIR] [--frozen] [--sandbox ...] -- CMD...` | A new desktop (default 1280x800) with `CMD` in it. Returns once the desktop answers; it keeps running in the background. With `--frozen` it starts [frozen](#frozen-desktops); with `--sandbox` the apps run in a [box](#boxes). |
 | `exec NAME -- CMD...` | One more program on that desktop. |
 | `list` | The desktops that are running. |
 | `status NAME` | Size, number of windows and apps, each app's pid or exit code, the box if there is one, and every request an app made that this server does not know (`unknown ...`). |
@@ -92,14 +92,15 @@ out), 2 a wrong command, 4 no such desktop.
 | `type NAME TEXT` | ASCII text, key by key, on a US layout. |
 | `focus NAME N` | Brings window `N` to the front and gives it the keyboard. |
 | `close NAME N` | Asks window `N` to close, as its close button would. |
-| `freeze NAME` | Apps are no longer told to draw (they get no frame callbacks). |
-| `step NAME [N]` | While frozen: lets `N` frames (1) through. |
+| `freeze NAME` | Apps are no longer told to draw (they get no frame callbacks), and the time they are given with frames and input stands still. |
+| `step NAME [N] [--until-quiet]` | While frozen: lets `N` frames (1) through, each 16 ms later on that clock. With `--until-quiet`: one frame at a time, each when the apps have answered the one before, until no app asks for another (at most `N`, default 600); answers `frames=K quiet=yes` or `quiet=no`. |
 | `thaw NAME` | Back to normal. |
+| `hash NAME` | A number for how the desktop looks now: the same picture, the same number. |
 | `log NAME [--since N]` | One numbered record of every input and every drawing, in order, with the area each drawing changed. |
 | `output NAME` | What the apps printed (stdout and stderr). |
 | `record NAME DIR [--fps N]` | From now on, keeps a [recording](#recordings) in `DIR`: the log, every input, and a picture whenever the desktop changed (at most `N` a second, default 10). |
 | `record NAME --stop` | Ends the recording and writes its page. `kill` ends it too. |
-| `replay NAME DIR [--settle] [--speed X]` | Sends a recording's inputs to this desktop again, at the recorded times (`X` times as fast), or with `--settle` each one once the desktop has been quiet for 200 ms. Then says whether the desktop ends up looking the same: `picture=same`, or `picture=differs` and exit 1. |
+| `replay NAME DIR [--settle \| --frozen] [--speed X]` | Sends a recording's inputs to this desktop again, at the recorded times (`X` times as fast), or with `--settle` each one once the desktop has been quiet for 200 ms, or with `--frozen` on a [frozen desktop](#frozen-desktops), stepping until the apps are quiet after each. Then says whether the desktop ends up looking the same: `picture=same`, or `picture=differs` and exit 1. |
 | `box list` | The boxes: name, number of snapshots, open or closed. |
 | `box diff BOX` | What was `added`, `changed` or `deleted` in the box since its last snapshot, as paths the apps saw. |
 | `box snapshot BOX LABEL` | Keeps the box as it is now under `LABEL`; the box goes on from there. |
@@ -213,6 +214,36 @@ names of buttons. A picture that differs in one pixel differs; an app that
 shows the time, a caret that blinks or an animation will differ for no good
 reason (`freeze` helps with the last two).
 
+## Frozen desktops
+
+An app draws when the display server tells it that a frame is due. A frozen
+desktop tells it only when stepped, and counts time for it in frames: the
+timestamp that goes out with each frame, and with input, is a clock that
+moves 16 ms per step and not at all in between. What an app draws from
+frames and their timestamps is then the same on every run, however long the
+steps take in real time.
+
+```
+$ headdesk start a --frozen -- the-app     # draws its first picture, then waits
+$ headdesk step a 5 --until-quiet
+frames=5 quiet=no                           # it wanted a sixth: it is animating
+$ headdesk hash a
+3f8a6c0d5e21b794
+```
+
+The tests start two frozen desktops with an animating client, step each five
+frames with a different pause, and get the same hash from both.
+
+`step --until-quiet` is the frozen way to wait: after an input, let frames
+through until the app stops asking. `replay --frozen` does that after every
+input of a recording.
+
+What this does not reach: an app's own clock. Apps read the system's time
+themselves, for a blinking caret, a timer, an animation that is not driven by
+frames, or anything from the network, and headdesk does not change what they
+read (that would mean putting code into the app). Freezing makes those apps
+stop drawing, not stop counting: they jump ahead when stepped.
+
 ## How it works
 
 - **One process per desktop.** `start` forks a process that listens on a
@@ -240,7 +271,8 @@ reason (`freeze` helps with the last two).
   holds the point. The keyboard is one fixed US layout that apps get as
   XKB text.
 - **Freezing.** An app draws when the server tells it a frame is due.
-  `freeze` stops telling; `step` tells once.
+  `freeze` stops telling; `step` tells once, with a timestamp 16 ms after
+  the last.
 
 ## Apps tried
 

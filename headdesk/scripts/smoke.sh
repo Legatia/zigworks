@@ -20,6 +20,8 @@ cleanup() {
     "$HD" kill "$D-2" >/dev/null 2>&1
     "$HD" kill "$D-b" >/dev/null 2>&1
     "$HD" kill "$D-r" >/dev/null 2>&1
+    "$HD" kill "$D-f1" >/dev/null 2>&1
+    "$HD" kill "$D-f2" >/dev/null 2>&1
     "$HD" box delete "$BOX" >/dev/null 2>&1
     rm -rf "$WORK"
 }
@@ -204,6 +206,44 @@ expect 1 "replayed inputs=4 picture=differs" -- replay "$D-r" "$WORK/rec" --spee
 expect 0 "" -- kill "$D-r"
 expect 2 "the recording is of a 320x200 desktop" -- replay "$D" "$WORK/rec"
 expect 2 "no recording in" -- replay "$D" "$WORK/norec"
+
+# frozen from the start: frames come only by steps, each 16 ms later on the apps' clock,
+# so two runs of the same steps look the same whatever the real time between them
+for run in 1 2; do
+    expect 0 "started $D-f$run" -- start "$D-f$run" --frozen --size 320x200 -- "$TC" --frames
+    expect 0 "settled" -- wait "$D-f$run" --windows 1 --idle 150
+    expect 0 "frozen" -- status "$D-f$run"
+    lacks "frame 1" -- output "$D-f$run"
+    [ "$run" = 2 ] && sleep 0.4
+    expect 0 "frames=5 quiet=no" -- step "$D-f$run" 5 --until-quiet
+    "$HD" wait "$D-f$run" --idle 150 >/dev/null
+    expect 0 "frame 5 +16" -- output "$D-f$run"
+    lacks "frame 6" -- output "$D-f$run"
+    expect 0 "clock=80ms" -- status "$D-f$run"
+done
+first=$("$HD" hash "$D-f1")
+second=$("$HD" hash "$D-f2")
+if [ -n "$first" ] && [ "$first" = "$second" ]; then echo "ok - two frozen runs of five frames look the same ($first)"; else
+    echo "FAIL: two frozen runs differ: $first and $second" >&2
+    FAILS=$((FAILS + 1))
+fi
+expect 0 "frames=3 quiet=no" -- step "$D-f1" 3 --until-quiet
+"$HD" wait "$D-f1" --idle 150 >/dev/null
+third=$("$HD" hash "$D-f1")
+if [ "$third" != "$first" ]; then echo "ok - three frames more look different"; else
+    echo "FAIL: the picture did not change after three more frames" >&2
+    FAILS=$((FAILS + 1))
+fi
+expect 0 "" -- kill "$D-f1"
+expect 0 "" -- kill "$D-f2"
+# an app that asks for no frames is quiet at once, and the recording replays frozen
+expect 0 "started $D-f1" -- start "$D-f1" --frozen --size 320x200 -- "$TC" frozen
+expect 0 "settled" -- wait "$D-f1" --windows 1 --idle 150
+expect 0 "frames=0 quiet=yes" -- step "$D-f1" --until-quiet
+expect 0 "replayed inputs=4 picture=same" -- replay "$D-f1" "$WORK/rec" --frozen
+expect 0 "frozen" -- status "$D-f1"
+expect 2 "choose one" -- replay "$D-f1" "$WORK/rec" --frozen --settle
+expect 0 "" -- kill "$D-f1"
 
 # boxes: apps that read the system but write only into a box
 expect 2 "go with --sandbox" -- start "$D-b" --no-network -- "$TC"

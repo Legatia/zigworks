@@ -33,6 +33,7 @@ var keys_seen: u32 = 0;
 var frames_seen: u32 = 0;
 var animate = false;
 var frame_cb: u32 = 0;
+var last_frame_at: u32 = 0;
 
 var popup_surface: u32 = 0;
 var popup_xdg: u32 = 0;
@@ -247,7 +248,9 @@ fn event(object: u32, opcode: u16, r: *wire.Reader) !void {
     if (frame_cb != 0 and object == frame_cb) {
         frame_cb = 0;
         frames_seen += 1;
-        say("frame {d}", .{frames_seen});
+        const at = try r.uint();
+        say("frame {d} +{d}", .{ frames_seen, if (frames_seen == 1) 0 else at -% last_frame_at });
+        last_frame_at = at;
         drawWindow();
         return;
     }

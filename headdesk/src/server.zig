@@ -247,6 +247,12 @@ pub const Server = struct {
     /// Apps get no frame callbacks while frozen, except `step_budget` rounds.
     frozen: bool = false,
     step_budget: u32 = 0,
+    /// Milliseconds as apps see them while frozen: 16 more with each frame
+    /// let through, whatever the real time between steps.
+    frame_clock: u32 = 0,
+    clock_offset: i64 = 0,
+    /// When an app last committed anything, drawn or not (real time).
+    last_commit_ms: u64 = 0,
     /// Counts every commit that changed a surface's picture.
     changes: u64 = 0,
     last_change_ms: u64 = 0,
@@ -404,8 +410,34 @@ pub const Server = struct {
         return s.serial;
     }
 
+    /// The time apps are given with frames and input. While frozen it is
+    /// the frame clock, which only steps move; else the real clock, carried
+    /// on from where the frame clock stood.
     fn timeMs(s: *Server) u32 {
-        return @truncate(sys.nowMs() - s.start_ms);
+        if (s.frozen) return s.frame_clock;
+        const real: i64 = @intCast(sys.nowMs() - s.start_ms);
+        return @truncate(@as(u64, @intCast(@max(0, real + s.clock_offset))));
+    }
+
+    pub fn clockMs(s: *Server) u32 {
+        return s.timeMs();
+    }
+
+    /// Apps are no longer told to draw; time stands still for them.
+    pub fn freeze(s: *Server) void {
+        if (s.frozen) return;
+        s.frame_clock = s.timeMs();
+        s.frozen = true;
+        s.step_budget = 0;
+        s.note("freeze", .{});
+    }
+
+    pub fn thaw(s: *Server) void {
+        if (!s.frozen) return;
+        s.frozen = false;
+        const real: i64 = @intCast(sys.nowMs() - s.start_ms);
+        s.clock_offset = @as(i64, s.frame_clock) - real;
+        s.note("thaw", .{});
     }
 
     fn send(s: *Server, c: *Client, object: u32, opcode: u16, args: anytype) void {
@@ -897,6 +929,7 @@ pub const Server = struct {
         try surf.frames.appendSlice(s.gpa, surf.pending_frames.items);
         surf.pending_frames.clearRetainingCapacity();
         surf.commits += 1;
+        s.last_commit_ms = sys.nowMs();
         if (surf.pending_input_set) {
             if (surf.input) |old| s.gpa.free(old);
             surf.input = surf.pending_input;
@@ -1120,6 +1153,8 @@ pub const Server = struct {
         if (s.frozen) {
             if (s.step_budget == 0) return false;
         }
+        if (!s.framesWaiting()) return false;
+        if (s.frozen) s.frame_clock +%= frame_ms;
         var any = false;
         const t = s.timeMs();
         for (s.surfaces.items) |surf| {
@@ -1137,6 +1172,9 @@ pub const Server = struct {
         }
         return any;
     }
+
+    /// What one step adds to the frame clock.
+    pub const frame_ms = 16;
 
     /// Whether any app waits to be told to draw.
     pub fn framesWaiting(s: *const Server) bool {

@@ -13,8 +13,10 @@ pub const version = "0.1.0";
 const usage =
     \\usage: headdesk <command> [options]
     \\
-    \\  start NAME [--size WxH] [--cwd DIR] [--sandbox ...] -- CMD...
+    \\  start NAME [--size WxH] [--cwd DIR] [--frozen] [--sandbox ...] -- CMD...
     \\                        a new desktop with CMD running in it
+    \\      --frozen          frozen from the start: the apps draw once and
+    \\                        then only when stepped
     \\      --sandbox         the apps run in a box: they read the system but
     \\                        what they write stays in the box, their home is
     \\                        empty, and they see none of your files
@@ -45,9 +47,15 @@ const usage =
     \\  focus NAME N          bring window N to the front
     \\  close NAME N          ask window N to close
     \\
-    \\  freeze NAME           apps are not told to draw any more
-    \\  step NAME [N]         let N frames (1) through while frozen
+    \\  freeze NAME           apps are not told to draw any more, and the time
+    \\                        they are given with frames and input stands still
+    \\  step NAME [N] [--until-quiet]
+    \\                        let N frames (1) through while frozen, each 16 ms
+    \\                        later on the apps' frame clock; with --until-quiet
+    \\                        until no app asks for another (at most N, 600)
     \\  thaw NAME             back to normal
+    \\  hash NAME             a number for how the desktop looks now: the same
+    \\                        picture, the same number
     \\  log NAME [--since N]  every input and every drawing, in order
     \\  output NAME           what the apps printed
     \\
@@ -56,11 +64,13 @@ const usage =
     \\                        whenever the desktop changed (at most N a second, 10)
     \\                        in DIR, with a page to look at them (index.html)
     \\  record NAME --stop    end the recording (kill ends it too)
-    \\  replay NAME DIR [--settle] [--speed X]
+    \\  replay NAME DIR [--settle | --frozen] [--speed X]
     \\                        send a recording's inputs to this desktop again,
     \\                        at the recorded times (X times as fast), or with
-    \\                        --settle each once the desktop is quiet; then say
-    \\                        whether the desktop ends up looking the same
+    \\                        --settle each once the desktop is quiet, or with
+    \\                        --frozen on a frozen desktop, stepping frames until
+    \\                        the apps are quiet after each; then say whether
+    \\                        the desktop ends up looking the same
     \\
     \\  box list              the boxes, their snapshots, and which are open
     \\  box diff BOX          what was added, changed or deleted in the box
@@ -210,6 +220,8 @@ const Parsed = struct {
     speed: ?[]const u8 = null,
     stop: bool = false,
     settle: bool = false,
+    frozen: bool = false,
+    until_quiet: bool = false,
     sandbox: bool = false,
     no_network: bool = false,
     as_root: bool = false,
@@ -241,6 +253,8 @@ fn parse(args: []const [:0]const u8, flags: []const []const u8) Parsed {
                 .{ .name = "--double", .at = &p.double },
                 .{ .name = "--stop", .at = &p.stop },
                 .{ .name = "--settle", .at = &p.settle },
+                .{ .name = "--frozen", .at = &p.frozen },
+                .{ .name = "--until-quiet", .at = &p.until_quiet },
                 .{ .name = "--sandbox", .at = &p.sandbox },
                 .{ .name = "--no-network", .at = &p.no_network },
                 .{ .name = "--as-root", .at = &p.as_root },
@@ -343,7 +357,7 @@ fn boxCommand(gpa: std.mem.Allocator, args: []const [:0]const u8) u8 {
 }
 
 fn start(gpa: std.mem.Allocator, args: []const [:0]const u8) u8 {
-    const p = parse(args, &.{ "--size", "--cwd", "--sandbox", "--box", "--share", "--share-ro", "--no-network", "--as-root" });
+    const p = parse(args, &.{ "--size", "--cwd", "--frozen", "--sandbox", "--box", "--share", "--share-ro", "--no-network", "--as-root" });
     const name = p.pos(0, "the desktop's name");
     if (p.rest.len == 0) die(2, "start needs a program after --", .{});
     const boxed = p.sandbox or p.box != null;
@@ -395,7 +409,7 @@ fn start(gpa: std.mem.Allocator, args: []const [:0]const u8) u8 {
         const err_fd = sys.create(err_path) catch null_fd;
         _ = linux.dup2(err_fd, 2);
         sys.ignoreSigpipe();
-        var d = desk.Desk.init(gpa, .{ .name = name, .dir = dir, .width = width, .height = height, .argv = argv, .cwd = cwd, .envp = environ, .sandbox = sandbox, .box_name = box_name }) catch |err| die(2, "can't set up the desktop: {s}", .{@errorName(err)});
+        var d = desk.Desk.init(gpa, .{ .name = name, .dir = dir, .width = width, .height = height, .argv = argv, .cwd = cwd, .envp = environ, .sandbox = sandbox, .box_name = box_name, .frozen = p.frozen }) catch |err| die(2, "can't set up the desktop: {s}", .{@errorName(err)});
         _ = d.spawn(argv, cwd) catch |err| die(2, "can't start {s}: {s}", .{ argv[0], @errorName(err) });
         d.run();
         sys.exit(0);
@@ -437,7 +451,9 @@ fn ask(gpa: std.mem.Allocator, name: []const u8, fields: []const []const u8) ?[]
 
 /// Sends the inputs of the recording in `dir` to desktop `name` again and
 /// compares how the desktop looks at the end with the recording's last picture.
-fn replay(gpa: std.mem.Allocator, name: []const u8, dir: []const u8, settle: bool, speed: f64) u8 {
+const Pace = enum { timed, settle, frozen };
+
+fn replay(gpa: std.mem.Allocator, name: []const u8, dir: []const u8, pace: Pace, speed: f64) u8 {
     const inputs = readFile(gpa, std.fmt.allocPrint(gpa, "{s}/inputs.txt", .{dir}) catch return 2) orelse die(2, "no recording in {s} (inputs.txt is missing)", .{dir});
     const frames = readFile(gpa, std.fmt.allocPrint(gpa, "{s}/frames.txt", .{dir}) catch return 2) orelse die(2, "no recording in {s} (frames.txt is missing)", .{dir});
     const meta = readFile(gpa, std.fmt.allocPrint(gpa, "{s}/meta.txt", .{dir}) catch return 2) orelse "";
@@ -450,18 +466,21 @@ fn replay(gpa: std.mem.Allocator, name: []const u8, dir: []const u8, settle: boo
         const size_then = meta[5 .. std.mem.findScalar(u8, meta, '\n') orelse meta.len];
         if (!std.mem.eql(u8, size_then, size_now)) die(2, "the recording is of a {s} desktop and {s} is {s}", .{ size_then, name, size_now });
     }
+    if (pace == .frozen) _ = request(gpa, name, &.{"freeze"}) catch {};
     const begun = sys.nowMs();
     var sent: u32 = 0;
     var lines = std.mem.tokenizeScalar(u8, inputs, '\n');
     while (lines.next()) |line| {
         const tab = std.mem.findScalar(u8, line, '\t') orelse continue;
         const at = std.fmt.parseInt(u64, line[0..tab], 10) catch continue;
-        if (settle) {
-            _ = request(gpa, name, &.{ "wait", "200", "10000", "0" }) catch {};
-        } else {
-            const due: u64 = @intFromFloat(@as(f64, @floatFromInt(at)) / speed);
-            const now = sys.nowMs() - begun;
-            if (due > now) sys.sleepMs(due - now);
+        switch (pace) {
+            .settle => _ = request(gpa, name, &.{ "wait", "200", "10000", "0" }) catch {},
+            .frozen => {},
+            .timed => {
+                const due: u64 = @intFromFloat(@as(f64, @floatFromInt(at)) / speed);
+                const now = sys.nowMs() - begun;
+                if (due > now) sys.sleepMs(due - now);
+            },
         }
         var fields: [64][]const u8 = undefined;
         var count: usize = 0;
@@ -474,8 +493,10 @@ fn replay(gpa: std.mem.Allocator, name: []const u8, dir: []const u8, settle: boo
         const answer = request(gpa, name, fields[0..count]) catch die(2, "desktop {s} went away during the replay", .{name});
         if (!std.mem.startsWith(u8, answer, "ok")) die(2, "input {d} of the recording was refused: {s}", .{ sent + 1, std.mem.trim(u8, answer, "\n") });
         sent += 1;
+        // frozen: the apps draw what the input asks for, frame by frame
+        if (pace == .frozen) _ = request(gpa, name, &.{ "step", "600", "quiet" }) catch {};
     }
-    _ = request(gpa, name, &.{ "wait", "300", "10000", "0" }) catch {};
+    if (pace != .frozen) _ = request(gpa, name, &.{ "wait", "300", "10000", "0" }) catch {};
     const now_hash = ask(gpa, name, &.{"hash"}) orelse die(2, "desktop {s} went away during the replay", .{name});
     // the hash is the third word of the last line of frames.txt
     var last: []const u8 = "";
@@ -600,11 +621,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return talk(gpa, name, &.{ "record", absolute(gpa, p.pos(1, "the directory to record into")), p.fps orelse "10" });
     }
     if (std.mem.eql(u8, cmd, "replay")) {
-        const p = parse(rest, &.{ "--settle", "--speed" });
+        const p = parse(rest, &.{ "--settle", "--frozen", "--speed" });
         const name = p.pos(0, "the desktop's name");
+        if (p.settle and p.frozen) die(2, "--settle and --frozen are two ways to do the same thing; choose one", .{});
         const speed = if (p.speed) |s| (std.fmt.parseFloat(f64, s) catch die(2, "--speed is a number, as in 2 or 0.5", .{})) else 1.0;
         if (!(speed > 0.01 and speed <= 100)) die(2, "--speed is between 0.01 and 100", .{});
-        return replay(gpa, name, absolute(gpa, p.pos(1, "the recording's directory")), p.settle, speed);
+        return replay(gpa, name, absolute(gpa, p.pos(1, "the recording's directory")), if (p.frozen) .frozen else if (p.settle) .settle else .timed, speed);
     }
     if (std.mem.eql(u8, cmd, "output")) {
         const p = parse(rest, &.{});
@@ -639,7 +661,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
         return code;
     }
-    const simple = [_][]const u8{ "windows", "status", "freeze", "thaw", "step", "close", "focus" };
+    if (std.mem.eql(u8, cmd, "step")) {
+        const p = parse(rest, &.{"--until-quiet"});
+        const name = p.pos(0, "the desktop's name");
+        if (p.until_quiet) return talk(gpa, name, &.{ "step", if (p.count >= 2) p.positional[1] else "600", "quiet" });
+        return talk(gpa, name, &.{ "step", if (p.count >= 2) p.positional[1] else "1" });
+    }
+    const simple = [_][]const u8{ "windows", "status", "freeze", "thaw", "hash", "close", "focus" };
     for (simple) |s| {
         if (!std.mem.eql(u8, cmd, s)) continue;
         const p = parse(rest, &.{});
