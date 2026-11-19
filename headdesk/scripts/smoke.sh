@@ -27,6 +27,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# One failed check: counted, printed, and on GitHub also shown as an
+# annotation on the run (the first 600 characters, on one line).
+failed() {
+    FAILS=$((FAILS + 1))
+    echo "FAIL: $*" >&2
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        echo "::error::$(printf '%s' "$*" | xargs | cut -c1-600)"
+    fi
+}
+
 # expect CODE 'text the output must hold' -- headdesk arguments...
 expect() {
     want=$1
@@ -35,15 +45,13 @@ expect() {
     out=$("$HD" "$@" 2>&1)
     code=$?
     if [ "$code" != "$want" ]; then
-        echo "FAIL: headdesk $*: exit $code, expected $want: $out" >&2
-        FAILS=$((FAILS + 1))
+        failed "headdesk $*: exit $code, expected $want: $out"
         return
     fi
     case $out in
     *"$text"*) echo "ok - headdesk $*" ;;
     *)
-        echo "FAIL: headdesk $*: output lacks '$text': $out" >&2
-        FAILS=$((FAILS + 1))
+        failed "headdesk $*: output lacks '$text': $out"
         ;;
     esac
 }
@@ -55,8 +63,7 @@ lacks() {
     out=$("$HD" "$@" 2>&1)
     case $out in
     *"$text"*)
-        echo "FAIL: headdesk $*: output holds '$text': $out" >&2
-        FAILS=$((FAILS + 1))
+        failed "headdesk $*: output holds '$text': $out"
         ;;
     *) echo "ok - headdesk $* (without '$text')" ;;
     esac
@@ -87,8 +94,7 @@ expect 0 "size=640x400" -- shot "$D" "$WORK/desk.png"
 expect 0 "size=640x400" -- shot "$D" "$WORK/win.png" --window 1
 expect 2 "no window 9" -- shot "$D" "$WORK/x.png" --window 9
 if [ "$(head -c 4 "$WORK/desk.png" | tail -c 3)" = PNG ]; then echo "ok - the shot is a PNG file"; else
-    echo "FAIL: the shot is not a PNG file" >&2
-    FAILS=$((FAILS + 1))
+    failed "the shot is not a PNG file"
 fi
 
 # a click on the button opens a menu: a second window, placed under the button
@@ -162,16 +168,14 @@ expect 0 "1 waiting=yes" -- step "$D-2"
 "$HD" wait "$D-2" --idle 150 >/dev/null
 after=$("$HD" output "$D-2" | grep -c '^frame ')
 if [ "$after" = $((before + 1)) ]; then echo "ok - one step, one frame ($before to $after)"; else
-    echo "FAIL: a step let $((after - before)) frames through, expected 1" >&2
-    FAILS=$((FAILS + 1))
+    failed "a step let $((after - before)) frames through, expected 1"
 fi
 expect 2 "frozen desktop" -- step "$D"
 expect 0 "running" -- thaw "$D-2"
 sleep 0.3
 later=$("$HD" output "$D-2" | grep -c '^frame ')
 if [ "$later" -gt $((after + 3)) ]; then echo "ok - thawed, frames run again"; else
-    echo "FAIL: after thaw only $((later - after)) frames" >&2
-    FAILS=$((FAILS + 1))
+    failed "after thaw only $((later - after)) frames"
 fi
 
 # a recording: the log, the inputs, a picture per change, and a page; then the same inputs again
@@ -189,9 +193,7 @@ expect 0 "" -- type "$D-r" 'Hi'
 expect 0 "settled" -- wait "$D-r"
 expect 0 "inputs=4 dir=$WORK/rec" -- record "$D-r" --stop
 if [ "$(wc -l <"$WORK/rec/inputs.txt")" = 4 ] && [ -s "$WORK/rec/frames/000003.png" ] && grep -q "20,60,120x80" "$WORK/rec/frames.txt" && grep -q "button left down" "$WORK/rec/events.txt" && grep -q "frames/" "$WORK/rec/index.html"; then echo "ok - the recording has its inputs, pictures, log and page"; else
-    echo "FAIL: the recording is incomplete: $(ls "$WORK/rec" "$WORK/rec/frames" | tr '
-' ' ')" >&2
-    FAILS=$((FAILS + 1))
+    failed "the recording is incomplete: $(ls "$WORK/rec" "$WORK/rec/frames" | xargs) $(cat "$WORK/rec/frames.txt" | xargs)"
 fi
 expect 0 "" -- kill "$D-r"
 expect 0 "started $D-r" -- start "$D-r" --size 320x200 -- "$TC" again
@@ -202,7 +204,7 @@ expect 0 "" -- kill "$D-r"
 expect 0 "started $D-r" -- start "$D-r" --size 320x200 -- "$TC" other
 expect 0 "settled" -- wait "$D-r" --windows 1
 expect 0 "" -- key "$D-r" z
-expect 1 "replayed inputs=4 picture=differs" -- replay "$D-r" "$WORK/rec" --speed 4
+expect 1 "replayed inputs=4 picture=differs" -- replay "$D-r" "$WORK/rec" --settle
 expect 0 "" -- kill "$D-r"
 expect 2 "the recording is of a 320x200 desktop" -- replay "$D" "$WORK/rec"
 expect 2 "no recording in" -- replay "$D" "$WORK/norec"
@@ -224,15 +226,13 @@ done
 first=$("$HD" hash "$D-f1")
 second=$("$HD" hash "$D-f2")
 if [ -n "$first" ] && [ "$first" = "$second" ]; then echo "ok - two frozen runs of five frames look the same ($first)"; else
-    echo "FAIL: two frozen runs differ: $first and $second" >&2
-    FAILS=$((FAILS + 1))
+    failed "two frozen runs differ: $first and $second"
 fi
 expect 0 "frames=3 quiet=no" -- step "$D-f1" 3 --until-quiet
 "$HD" wait "$D-f1" --idle 150 >/dev/null
 third=$("$HD" hash "$D-f1")
 if [ "$third" != "$first" ]; then echo "ok - three frames more look different"; else
-    echo "FAIL: the picture did not change after three more frames" >&2
-    FAILS=$((FAILS + 1))
+    failed "the picture did not change after three more frames"
 fi
 expect 0 "" -- kill "$D-f1"
 expect 0 "" -- kill "$D-f2"
@@ -268,8 +268,7 @@ if why=$("$HD" check 2>&1); then
     expect 0 "" -- kill "$D-b"
     sleep 0.3
     if [ ! -e "/etc/$marker" ] && [ "$(cat "$WORK/shared/from-box" 2>/dev/null)" = out ]; then echo "ok - the system is untouched and the shared directory was written"; else
-        echo "FAIL: /etc/$marker exists on the system, or the shared directory was not written" >&2
-        FAILS=$((FAILS + 1))
+        failed "/etc/$marker exists on the system, or the shared directory was not written"
     fi
     expect 0 "added   /etc/$marker" -- box diff "$BOX"
     expect 0 "added   /root/one" -- box diff "$BOX"
