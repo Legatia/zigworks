@@ -1,8 +1,30 @@
 //! harness-fake: stand-ins for omnigate, the Telegram Bot API, feeds and
-//! search, for the tests.
+//! search, for the end-to-end tests. `harness-fake --dir DIR [--port N]`
+//! prints `port N` and serves until killed.
 const std = @import("std");
+const fake = @import("fake.zig");
 
 pub fn main(init: std.process.Init) u8 {
-    _ = init;
-    return 0;
+    const io = init.io;
+    const args = init.minimal.args.toSlice(init.arena.allocator()) catch return 2;
+    var dir: ?[]const u8 = null;
+    var port: u16 = 0;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--dir") and i + 1 < args.len) {
+            i += 1;
+            dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
+            i += 1;
+            port = std.fmt.parseInt(u16, args[i], 10) catch return 2;
+        } else return 2;
+    }
+    const s = fake.Server.start(io, dir orelse return 2, port) catch |e| {
+        std.debug.print("harness-fake: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    var buf: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "port {d}\n", .{s.port}) catch return 1;
+    std.Io.File.stdout().writeStreamingAll(io, line) catch return 1;
+    while (true) io.sleep(.fromSeconds(3600), .awake) catch return 0;
 }

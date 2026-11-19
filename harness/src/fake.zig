@@ -1,0 +1,257 @@
+//! Stand-ins for the services harness talks to, driven by files in a script
+//! directory so tests can say exactly what each service answers:
+//!
+//! - omnigate: `POST /v1/messages` answers `model/001.json`, `002.json`, …
+//!   in order; a file `{"status":402}` or `{"status":429,"retry_after":1}`
+//!   answers that error instead, `{"delay_ms":N, ...}` waits first. Each
+//!   request is saved as `requests/001.json`, … with its headers.
+//! - search: `GET /res/v1/web/search?q=…` answers `search.json`.
+//! - pages and feeds: `GET /page/NAME` answers the file `pages/NAME`.
+//! - Telegram: see `telegram` below.
+const std = @import("std");
+const sock = @import("sock.zig");
+const jv = @import("jv.zig");
+const Io = std.Io;
+
+pub const Server = struct {
+    io: Io,
+    dir: []const u8,
+    listener: sock.Listener,
+    port: u16,
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+    active: std.atomic.Value(u32) = .init(0),
+    model_n: std.atomic.Value(u32) = .init(0),
+    tg_n: std.atomic.Value(u32) = .init(0),
+    mutex: Io.Mutex = .init,
+    open: std.ArrayList(sock.Handle) = .empty,
+
+    const gpa = std.heap.page_allocator;
+    const idle_ms = 60 * 60 * 1000;
+
+    pub fn start(io: Io, dir: []const u8, port: u16) !*Server {
+        const listener = try sock.Listener.open(port);
+        errdefer listener.close();
+        const s = try gpa.create(Server);
+        errdefer gpa.destroy(s);
+        s.* = .{ .io = io, .dir = try gpa.dupe(u8, dir), .listener = listener, .port = listener.port };
+        inline for (.{ "requests", "model", "pages", "telegram/in" }) |sub| {
+            const p = try std.fs.path.join(gpa, &.{ dir, sub });
+            defer gpa.free(p);
+            try Io.Dir.cwd().createDirPath(io, p);
+        }
+        s.thread = try std.Thread.spawn(.{}, acceptLoop, .{s});
+        return s;
+    }
+
+    pub fn stop(s: *Server) void {
+        s.stopping.store(true, .release);
+        if (sock.connect(s.io, "127.0.0.1", s.port, 1000)) |c| sock.closeHandle(c) else |_| {}
+        if (s.thread) |th| th.join();
+        {
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            for (s.open.items) |c| sock.shutdown(c);
+        }
+        while (s.active.load(.acquire) > 0) s.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        s.listener.close();
+        s.open.deinit(gpa);
+        gpa.free(s.dir);
+        gpa.destroy(s);
+    }
+
+    /// Model requests seen so far.
+    pub fn modelRequests(s: *Server) u32 {
+        return s.model_n.load(.acquire);
+    }
+
+    fn acceptLoop(s: *Server) void {
+        while (true) {
+            const conn = s.listener.accept() catch {
+                if (s.stopping.load(.acquire)) return;
+                continue;
+            };
+            if (s.stopping.load(.acquire)) {
+                sock.closeHandle(conn);
+                return;
+            }
+            {
+                s.mutex.lockUncancelable(s.io);
+                defer s.mutex.unlock(s.io);
+                s.open.append(gpa, conn) catch {};
+            }
+            _ = s.active.fetchAdd(1, .acq_rel);
+            const th = std.Thread.spawn(.{}, serve, .{ s, conn }) catch {
+                s.done(conn);
+                continue;
+            };
+            th.detach();
+        }
+    }
+
+    fn done(s: *Server, conn: sock.Handle) void {
+        {
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            for (s.open.items, 0..) |c, i| if (c == conn) {
+                _ = s.open.swapRemove(i);
+                break;
+            };
+        }
+        sock.closeHandle(conn);
+        _ = s.active.fetchSub(1, .acq_rel);
+    }
+
+    fn serve(s: *Server, conn: sock.Handle) void {
+        defer s.done(conn);
+        var rbuf: [64 * 1024]u8 = undefined;
+        var wbuf: [16 * 1024]u8 = undefined;
+        var sk: sock.Socket = undefined;
+        sk.init(s.io, conn, &rbuf, &wbuf, idle_ms);
+        var http_server = std.http.Server.init(&sk.reader, &sk.writer);
+        while (!s.stopping.load(.acquire)) {
+            var req = http_server.receiveHead() catch return;
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            s.handle(arena_state.allocator(), &req) catch return;
+        }
+    }
+
+    fn path(s: *Server, a: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+        var all: std.ArrayList([]const u8) = .empty;
+        try all.append(a, s.dir);
+        try all.appendSlice(a, parts);
+        return std.fs.path.join(a, all.items);
+    }
+
+    fn readScript(s: *Server, a: std.mem.Allocator, parts: []const []const u8) ?[]u8 {
+        const p = s.path(a, parts) catch return null;
+        return Io.Dir.cwd().readFileAlloc(s.io, p, a, .limited(16 << 20)) catch null;
+    }
+
+    fn handle(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request) !void {
+        const target = try a.dupe(u8, req.head.target);
+        const method = req.head.method;
+        var headers: std.ArrayList(u8) = .empty;
+        var it = req.iterateHeaders();
+        while (it.next()) |h| try headers.print(a, "{f}:{f},", .{ std.json.fmt(h.name, .{}), std.json.fmt(h.value, .{}) });
+        var body_buf: [8192]u8 = undefined;
+        const body_reader = try req.readerExpectContinue(&body_buf);
+        const body = try body_reader.allocRemaining(a, .limited(32 << 20));
+        const route = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+
+        if (method == .POST and std.mem.eql(u8, route, "/v1/messages")) return s.model(a, req, body, headers.items);
+        if (method == .GET and std.mem.eql(u8, route, "/res/v1/web/search")) {
+            const text = s.readScript(a, &.{"search.json"}) orelse "{\"web\":{\"results\":[]}}";
+            return json(req, .ok, text);
+        }
+        if (method == .GET and std.mem.startsWith(u8, route, "/page/")) {
+            const name = route["/page/".len..];
+            if (name.len == 0 or std.mem.indexOf(u8, name, "..") != null) return json(req, .not_found, "{}");
+            const text = s.readScript(a, &.{ "pages", name }) orelse return json(req, .not_found, "{}");
+            const ct = if (std.mem.endsWith(u8, name, ".bin")) "application/octet-stream" else if (std.mem.endsWith(u8, name, ".xml")) "application/rss+xml" else "text/html; charset=utf-8";
+            return req.respond(text, .{ .extra_headers = &.{.{ .name = "content-type", .value = ct }} });
+        }
+        if (std.mem.startsWith(u8, route, "/bot")) return s.telegram(a, req, route, body);
+        return json(req, .not_found, "{\"error\":\"no such route\"}");
+    }
+
+    fn model(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, body: []const u8, headers: []const u8) !void {
+        const n = s.model_n.fetchAdd(1, .acq_rel) + 1;
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "{d:0>3}.json", .{n});
+        const saved = try std.fmt.allocPrint(a, "{{\"headers\":{{{s}\"\":\"\"}},\"body\":{s}}}", .{ headers, if (body.len > 0) body else "null" });
+        const rp = try s.path(a, &.{ "requests", name });
+        try Io.Dir.cwd().writeFile(s.io, .{ .sub_path = rp, .data = saved });
+        const script = s.readScript(a, &.{ "model", name }) orelse
+            return json(req, .internal_server_error, "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"no script for this request\"}}");
+        const v = jv.parse(a, script);
+        if (jv.int(jv.get(v, "delay_ms"))) |ms| {
+            var waited: i64 = 0;
+            while (waited < ms and !s.stopping.load(.acquire)) : (waited += 20) s.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        }
+        if (jv.int(jv.get(v, "status"))) |st| {
+            const status: std.http.Status = @fromBackingInt(@as(u10, @intCast(st)));
+            const retry = jv.int(jv.get(v, "retry_after"));
+            var rb: [16]u8 = undefined;
+            const err_body = "{\"type\":\"error\",\"error\":{\"type\":\"scripted\",\"message\":\"scripted error\"}}";
+            if (retry) |r| {
+                return req.respond(err_body, .{ .status = status, .extra_headers = &.{
+                    .{ .name = "content-type", .value = "application/json" },
+                    .{ .name = "retry-after", .value = try std.fmt.bufPrint(&rb, "{d}", .{r}) },
+                } });
+            }
+            return json(req, status, err_body);
+        }
+        return json(req, .ok, script);
+    }
+
+    /// Telegram Bot API: `getUpdates` hands out the files in
+    /// `telegram/in/` in name order (each one update object, the update_id
+    /// is assigned here), at most one batch per call; sent messages and
+    /// other calls are appended to `telegram/out.jsonl`.
+    fn telegram(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, route: []const u8, body: []const u8) !void {
+        const slash = std.mem.indexOfScalarPos(u8, route, 1, '/') orelse return json(req, .not_found, "{\"ok\":false}");
+        const method = route[slash + 1 ..];
+        if (std.mem.eql(u8, method, "getUpdates")) {
+            const v = jv.parse(a, body);
+            const offset = jv.int(jv.get(v, "offset")) orelse 0;
+            const timeout = jv.int(jv.get(v, "timeout")) orelse 0;
+            var waited: i64 = 0;
+            while (true) {
+                const batch = try s.pending(a, offset);
+                if (batch.len > 2 or waited >= timeout * 1000 or s.stopping.load(.acquire)) {
+                    const out = try std.fmt.allocPrint(a, "{{\"ok\":true,\"result\":[{s}]}}", .{batch});
+                    return json(req, .ok, out);
+                }
+                s.io.sleep(.fromMilliseconds(50), .awake) catch {};
+                waited += 50;
+            }
+        }
+        // record everything else
+        {
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            const op = try s.path(a, &.{ "telegram", "out.jsonl" });
+            var f = try Io.Dir.cwd().createFile(s.io, op, .{ .truncate = false });
+            defer f.close(s.io);
+            const len = try f.length(s.io);
+            const line = try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"body\":{s}}}\n", .{ method, if (body.len > 0) body else "null" });
+            try f.writePositionalAll(s.io, line, len);
+        }
+        const n = s.tg_n.fetchAdd(1, .acq_rel) + 1;
+        const out = try std.fmt.allocPrint(a, "{{\"ok\":true,\"result\":{{\"message_id\":{d}}}}}", .{n});
+        return json(req, .ok, out);
+    }
+
+    /// Updates with id ≥ offset, as a JSON list body (no brackets).
+    fn pending(s: *Server, a: std.mem.Allocator, offset: i64) ![]u8 {
+        const dir = try s.path(a, &.{ "telegram", "in" });
+        var d = Io.Dir.cwd().openDir(s.io, dir, .{ .iterate = true }) catch return a.dupe(u8, "");
+        defer d.close(s.io);
+        var names: std.ArrayList([]const u8) = .empty;
+        var it = d.iterate();
+        while (try it.next(s.io)) |e| {
+            if (e.kind == .file and std.mem.endsWith(u8, e.name, ".json")) try names.append(a, try a.dupe(u8, e.name));
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.order(u8, x, y) == .lt;
+            }
+        }.lt);
+        var out: std.ArrayList(u8) = .empty;
+        for (names.items, 1..) |name, id| {
+            if (@as(i64, @intCast(id)) < offset) continue;
+            const text = d.readFileAlloc(s.io, name, a, .limited(1 << 20)) catch continue;
+            const trimmed = std.mem.trim(u8, text, " \r\n\t");
+            if (trimmed.len < 2 or trimmed[0] != '{') continue;
+            if (out.items.len > 0) try out.append(a, ',');
+            try out.print(a, "{{\"update_id\":{d},{s}", .{ id, trimmed[1..] });
+        }
+        return out.items;
+    }
+};
+
+fn json(req: *std.http.Server.Request, status: std.http.Status, body: []const u8) !void {
+    try req.respond(body, .{ .status = status, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
+}
