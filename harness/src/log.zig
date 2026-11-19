@@ -60,6 +60,25 @@ pub const Log = struct {
         l.file.close(l.io);
     }
 
+    /// Whether some line near the end of the log hashes to `h`: the log
+    /// only grew since `h` was its last line.
+    pub fn contains(l: *Log, h: *const [64]u8) !bool {
+        l.mutex.lockUncancelable(l.io);
+        defer l.mutex.unlock(l.io);
+        if (std.mem.eql(u8, h, &l.last)) return true;
+        const tail_len: usize = @intCast(@min(l.offset, 4 * 1024 * 1024));
+        const tail = try l.gpa.alloc(u8, tail_len);
+        defer l.gpa.free(tail);
+        _ = try l.file.readPositionalAll(l.io, tail, l.offset - tail_len);
+        var it = std.mem.splitScalar(u8, tail, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            const lh = hashLine(line);
+            if (std.mem.eql(u8, &lh, h)) return true;
+        }
+        return false;
+    }
+
     pub fn lastHash(l: *Log) [64]u8 {
         l.mutex.lockUncancelable(l.io);
         defer l.mutex.unlock(l.io);
@@ -153,8 +172,13 @@ pub fn verify(io: Io, path: []const u8) !Verdict {
     var n: u64 = 0;
     while (true) {
         const raw = (try r.interface.takeDelimiter('\n')) orelse break;
-        if (raw.len == 0) break;
         n += 1;
+        // a blank line is only allowed as the very end
+        if (raw.len == 0) {
+            const more = (try r.interface.takeDelimiter('\n')) orelse return .{ .lines = n - 1, .broken_at = null, .last = prev };
+            _ = more;
+            return .{ .lines = n, .broken_at = n, .last = prev };
+        }
         const line = raw;
         const p = prevOf(line) orelse return .{ .lines = n, .broken_at = n, .last = prev };
         if (!std.mem.eql(u8, p, &prev) or (seqOf(line) orelse 0) != n) return .{ .lines = n, .broken_at = n, .last = prev };
@@ -285,4 +309,38 @@ test "reopen_continues_seq_and_chain" {
     const v = try verify(t.io, path);
     try t.expectEqual(6, v.lines);
     try t.expectEqual(null, v.broken_at);
+}
+
+test "blank_line_inserted_is_found_by_verify" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const path = try tmpPath(&tmp, arena.allocator());
+    var l = try Log.open(t.allocator, t.io, path);
+    for (0..3) |_| try l.write(.tool, false, .{ .arg = "rm -rf build" });
+    l.close();
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, path, arena.allocator(), .unlimited);
+    const first = std.mem.indexOfScalar(u8, text, '\n').? + 1;
+    const edited = try std.mem.concat(arena.allocator(), u8, &.{ text[0..first], "\n", try std.mem.replaceOwned(u8, arena.allocator(), text[first..], "rm -rf", "ls -la") });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = edited });
+    try t.expectEqual(2, (try verify(t.io, path)).broken_at.?);
+}
+
+test "a_log_that_only_grew_contains_the_old_end" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const path = try tmpPath(&tmp, arena.allocator());
+    var l = try Log.open(t.allocator, t.io, path);
+    try l.write(.chat, false, .{ .text = "a" });
+    const mid = l.lastHash();
+    try l.write(.chat, false, .{ .text = "b" });
+    l.close();
+    var l2 = try Log.open(t.allocator, t.io, path);
+    defer l2.close();
+    try t.expect(try l2.contains(&mid));
+    const other: [64]u8 = @splat('f');
+    try t.expect(!try l2.contains(&other));
 }

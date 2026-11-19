@@ -108,6 +108,26 @@ const Collector = struct {
     total: usize = 0,
     cap: usize,
     gpa: std.mem.Allocator,
+    finished: std.atomic.Value(u32) = .init(0),
+
+    /// POSIX: reads until the pipe closes or `ended` is set, looking every
+    /// 100 ms, so a process that kept the pipe open can't hold us.
+    fn pumpUntil(c: *Collector, io: Io, from: Io.File, ended: *std.atomic.Value(bool)) void {
+        var chunk: [8192]u8 = undefined;
+        while (!ended.load(.acquire)) {
+            var fds = [_]std.posix.pollfd{.{ .fd = from.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&fds, 100) catch break;
+            if (ready == 0) continue;
+            const got = from.readStreaming(io, &.{&chunk}) catch break;
+            if (got == 0) break;
+            c.mutex.lockUncancelable(io);
+            defer c.mutex.unlock(io);
+            c.total += got;
+            const room = c.cap -| c.buf.items.len;
+            c.buf.appendSlice(c.gpa, chunk[0..@min(room, got)]) catch {};
+        }
+        _ = c.finished.fetchAdd(1, .acq_rel);
+    }
 
     fn pump(c: *Collector, io: Io, from: Io.File) void {
         var chunk: [8192]u8 = undefined;
@@ -186,13 +206,35 @@ fn shell(env: Env, arena: std.mem.Allocator, command: []const u8) !Output {
         .deadline_ns = Io.Clock.awake.now(env.io).nanoseconds + @as(i128, env.shell_seconds) * std.time.ns_per_s,
     };
     const th_watch = try std.Thread.spawn(.{}, Watch.run, .{&watch});
-    const th_out = try std.Thread.spawn(.{}, Collector.pump, .{ &col, env.io, child.stdout.? });
-    const th_err = try std.Thread.spawn(.{}, Collector.pump, .{ &col, env.io, child.stderr.? });
-    th_out.join();
-    th_err.join();
-    const term = child.wait(env.io) catch null;
-    // nothing the command started may outlive it
-    if (!is_windows) std.posix.kill(-watch.id, .KILL) catch {};
+    var term: ?std.process.Child.Term = null;
+    if (is_windows) {
+        const th_out = try std.Thread.spawn(.{}, Collector.pump, .{ &col, env.io, child.stdout.? });
+        const th_err = try std.Thread.spawn(.{}, Collector.pump, .{ &col, env.io, child.stderr.? });
+        th_out.join();
+        th_err.join();
+        term = child.wait(env.io) catch null;
+    } else {
+        // the pipes are ours: `wait` must not close them under the readers
+        const out_f = child.stdout.?;
+        const err_f = child.stderr.?;
+        child.stdout = null;
+        child.stderr = null;
+        defer out_f.close(env.io);
+        defer err_f.close(env.io);
+        var ended: std.atomic.Value(bool) = .init(false);
+        const th_out = try std.Thread.spawn(.{}, Collector.pumpUntil, .{ &col, env.io, out_f, &ended });
+        const th_err = try std.Thread.spawn(.{}, Collector.pumpUntil, .{ &col, env.io, err_f, &ended });
+        term = child.wait(env.io) catch null;
+        // nothing the command started may outlive it
+        std.posix.kill(-watch.id, .KILL) catch {};
+        // what is left in the pipes, for up to 2 s; a process that left the
+        // group and kept them open is not waited for
+        var waited: u32 = 0;
+        while (col.finished.load(.acquire) < 2 and waited < 2000) : (waited += 20) env.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        ended.store(true, .release);
+        th_out.join();
+        th_err.join();
+    }
     watch.done.store(true, .release);
     th_watch.join();
 
@@ -467,4 +509,19 @@ test "search_returns_titles_and_links" {
     try t.expect(std.mem.indexOf(u8, o.text, "Zig 0.18 released\nhttps://ziglang.org/news/0.18\nNew release") != null);
     f.env.search_key = null;
     try t.expect((try f.call(.search, "{\"query\":\"x\"}")).is_error);
+}
+
+test "a_child_that_leaves_the_group_does_not_hang_the_command" {
+    if (is_windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    f.env.shell_seconds = 20;
+    const start = Io.Clock.awake.now(t.io).nanoseconds;
+    // a detached child that keeps the output pipe open, and a background job
+    const o = try f.call(.shell, "{\"command\":\"perl -e 'use POSIX; POSIX::setsid(); sleep 8' & sleep 30 & echo started\"}");
+    const took_ms = @divFloor(Io.Clock.awake.now(t.io).nanoseconds - start, std.time.ns_per_ms);
+    try t.expect(took_ms < 5000);
+    try t.expect(std.mem.indexOf(u8, o.text, "started") != null);
+    try t.expect(std.mem.startsWith(u8, o.text, "exit code 0"));
 }

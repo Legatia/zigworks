@@ -31,6 +31,8 @@ pub const Conversation = struct {
         arena: std.heap.ArenaAllocator,
         messages: std.ArrayList(model.Message) = .empty,
         bytes: usize = 0,
+        /// Said while private mode was on: never written to memory.
+        private: bool = false,
     };
 
     pub fn init(gpa: std.mem.Allocator) Conversation {
@@ -51,6 +53,13 @@ pub const Conversation = struct {
         errdefer c.gpa.destroy(tn);
         try c.turns.append(c.gpa, tn);
         return tn;
+    }
+
+    /// Drops the newest turn (one that failed half way).
+    pub fn dropLast(c: *Conversation) void {
+        const tn = c.turns.pop() orelse return;
+        tn.arena.deinit();
+        c.gpa.destroy(tn);
     }
 
     pub fn bytes(c: *const Conversation) usize {
@@ -189,6 +198,10 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     try r.log.write(.turn, r.private, .{ .run = r.label, .text = user_text });
 
     const tn = try conv.begin();
+    // a turn that fails half way could leave a tool call without its result,
+    // which the model API refuses from then on: drop it whole
+    errdefer conv.dropLast();
+    tn.private = r.private;
     try keep(tn, .{ .role = .user, .blocks = &.{.{ .text = user_text }} });
 
     var result: TurnResult = .{ .text = "" };
@@ -207,15 +220,11 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
             break;
         }
         result.steps += 1;
-        const recalled = blk: {
-            r.lock.lockUncancelable(r.io);
-            defer r.lock.unlock(r.io);
-            break :blk try r.mem.recall(a, user_text, r.now(), r.top_size, r.auto_recall);
-        };
-        // pinned items and the top level are copied out while locked
+        // one lock for both: the items are read while no one can forget them
         const system = blk: {
             r.lock.lockUncancelable(r.io);
             defer r.lock.unlock(r.io);
+            const recalled = try r.mem.recall(a, user_text, r.now(), r.top_size, r.auto_recall);
             break :blk try systemPrompt(a, r, recalled, conv.dropped, r.now());
         };
         const msgs = try conv.messages(a);
@@ -230,6 +239,16 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
             break;
         };
         try r.log.write(.model, false, .{ .run = r.label, .result = "ok", .stop_reason = reply.stop_reason, .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
+        // stopped while the model was answering: its answer is dropped
+        if (r.env.stop.load(.acquire)) {
+            result.stopped = true;
+            result.ended_by = try r.gpa.dupe(u8, "Stopped.");
+            break;
+        }
+        if (reply.blocks.len == 0) {
+            result.ended_by = try r.gpa.dupe(u8, "The model gave an empty answer.");
+            break;
+        }
         try keep(tn, .{ .role = .assistant, .blocks = reply.blocks });
         const text = try reply.text(a);
         if (text.len > 0) {
@@ -537,4 +556,19 @@ test "owner_mention_raises_item_agent_text_does_not" {
     const r2 = try f.say("ok");
     freeResult(&f.run, r2);
     try t.expectEqual(2, it.mentions.items.len);
+}
+
+test "empty_answer_is_not_kept" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.e.script(1, "{\"content\":[],\"stop_reason\":\"end_turn\"}");
+    try f.e.script(2, model.textReply("fine now"));
+    const r1 = try f.say("hello");
+    freeResult(&f.run, r1);
+    const r2 = try f.say("hello again");
+    defer freeResult(&f.run, r2);
+    try t.expectEqualStrings("fine now", r2.text);
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "\"role\":\"assistant\",\"content\":[]") == null);
 }

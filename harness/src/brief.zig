@@ -36,6 +36,10 @@ pub const Seen = struct {
         return d[0..16].*;
     }
 
+    pub fn clone(s: *const Seen) !Seen {
+        return .{ .gpa = s.gpa, .map = try s.map.clone(s.gpa) };
+    }
+
     pub fn has(s: *const Seen, link: []const u8) bool {
         return s.map.contains(key(link));
     }
@@ -93,6 +97,7 @@ pub fn collect(r: *agent.Run, arena: std.mem.Allocator, b: config.Brief, seen: *
         var notes: std.ArrayList([]const u8) = .empty;
         var links_here: std.StringHashMapUnmanaged(void) = .empty;
         for (topic.feeds) |url| {
+            if (r.env.stop.load(.acquire)) break;
             const entries = fetchFeed(r, arena, url) catch |e| {
                 try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: {s}", .{ url, @errorName(e) }));
                 continue;
@@ -100,6 +105,7 @@ pub fn collect(r: *agent.Run, arena: std.mem.Allocator, b: config.Brief, seen: *
             for (entries) |en| try addNew(arena, &new, &links_here, seen, en);
         }
         for (topic.searches) |q| {
+            if (r.env.stop.load(.acquire)) break;
             const entries = searchEntries(r, arena, q) catch |e| {
                 try notes.append(arena, try std.fmt.allocPrint(arena, "search \"{s}\": {s}", .{ q, @errorName(e) }));
                 continue;
@@ -119,7 +125,11 @@ fn addNew(arena: std.mem.Allocator, new: *std.ArrayList(feeds.Entry), here: *std
 }
 
 fn fetchFeed(r: *agent.Run, arena: std.mem.Allocator, url: []const u8) ![]const feeds.Entry {
-    const d = r.gate.decide(arena, .fetch, url, util.nowSeconds(r.io), .{ .scheduled = true, .brief_source = true });
+    const d = blk: {
+        r.lock.lockUncancelable(r.io);
+        defer r.lock.unlock(r.io);
+        break :blk r.gate.decide(arena, .fetch, url, util.nowSeconds(r.io), .{ .scheduled = true, .brief_source = true });
+    };
     try r.log.write(.gate, false, .{ .run = r.label, .tool = "fetch", .decision = @tagName(d.action), .why = d.why, .arg = url });
     if (d.action != .allow) return error.Refused;
     const g = try tools.get(r.gpa, r.io, arena, url, &.{}, feed_max);
@@ -129,7 +139,11 @@ fn fetchFeed(r: *agent.Run, arena: std.mem.Allocator, url: []const u8) ![]const 
 }
 
 fn searchEntries(r: *agent.Run, arena: std.mem.Allocator, q: []const u8) ![]const feeds.Entry {
-    const d = r.gate.decide(arena, .search, q, util.nowSeconds(r.io), .{ .scheduled = true, .brief_source = true });
+    const d = blk: {
+        r.lock.lockUncancelable(r.io);
+        defer r.lock.unlock(r.io);
+        break :blk r.gate.decide(arena, .search, q, util.nowSeconds(r.io), .{ .scheduled = true, .brief_source = true });
+    };
     try r.log.write(.gate, false, .{ .run = r.label, .tool = "search", .decision = @tagName(d.action), .why = d.why, .arg = q });
     if (d.action != .allow) return error.Refused;
     const key = r.env.search_key orelse return error.NoSearchKey;
@@ -176,8 +190,13 @@ pub fn compose(r: *agent.Run, arena: std.mem.Allocator, b: config.Brief, c: Coll
             continue;
         }
         try items.print(arena, "\nTopic: {s}\n", .{tp.name});
-        const known = try r.mem.search(arena, tp.name);
-        for (known) |it| try items.print(arena, "(the owner: {s})\n", .{it.body});
+        {
+            // items may be changed or forgotten by the chat meanwhile
+            r.lock.lockUncancelable(r.io);
+            defer r.lock.unlock(r.io);
+            const known = try r.mem.search(arena, tp.name);
+            for (known) |it| try items.print(arena, "(the owner: {s})\n", .{it.body});
+        }
         for (tp.new) |en| {
             try items.print(arena, "- {s} | {s}{s}{s}\n", .{ en.title, en.link, if (en.date.len > 0) " | " else "", en.date });
             try links.append(arena, en.link);

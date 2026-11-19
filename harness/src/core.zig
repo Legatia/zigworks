@@ -136,7 +136,16 @@ pub const Core = struct {
     mem: memory.Store,
     lock: Io.Mutex = .init,
     seen: brief.Seen,
+    /// Set on close: nothing new starts.
     stop: std.atomic.Value(bool) = .init(false),
+    /// The stop flag of every run going on; /stop sets them all and nothing
+    /// clears them, so a stopped run stays stopped however long it takes.
+    runs_mutex: Io.Mutex = .init,
+    run_flags: std.ArrayList(*std.atomic.Value(bool)) = .empty,
+    /// Held while settings are read by the scheduler or replaced by /reload.
+    settings_mutex: Io.Mutex = .init,
+    /// Guards `seen` (briefs read a copy).
+    seen_mutex: Io.Mutex = .init,
 
     chan: ?Channel = null,
     owner: ?i64 = null,
@@ -153,6 +162,8 @@ pub const Core = struct {
     last_owner_s: i64 = 0,
     turns_since_memory: u32 = 0,
     worker: ?std.Thread = null,
+    /// /new: the chat worker starts a fresh conversation before its next turn.
+    reset_conv: std.atomic.Value(bool) = .init(false),
     quitting: std.atomic.Value(bool) = .init(false),
 
     // background runs
@@ -168,6 +179,8 @@ pub const Core = struct {
     fixed_now: ?i64 = null,
     /// Seconds of quiet before memories are written from the chat.
     memory_quiet_s: i64 = 30 * 60,
+    /// How long /stop waits for runs to end before answering.
+    stop_wait_ms: u32 = 15_000,
     path_var: []const u8 = "/usr/local/bin:/usr/bin:/bin",
     home_var: []const u8 = "",
     paths_arena: std.heap.ArenaAllocator,
@@ -223,6 +236,10 @@ pub const Core = struct {
         c.seen.load(io, c.paths.seen) catch {};
         c.lock = .init;
         c.stop = .init(false);
+        c.runs_mutex = .init;
+        c.run_flags = .empty;
+        c.seen_mutex = .init;
+        c.settings_mutex = .init;
         c.chan = null;
         c.owner = readOwner(io, c.paths.owner);
         c.auto_recall = c.cfg.memory.auto;
@@ -237,6 +254,7 @@ pub const Core = struct {
         c.last_owner_s = 0;
         c.turns_since_memory = 0;
         c.worker = null;
+        c.reset_conv = .init(false);
         c.quitting = .init(false);
         c.bg_active = .init(0);
         c.state_mutex = .init;
@@ -246,6 +264,7 @@ pub const Core = struct {
         c.last_status_s = 0;
         c.fixed_now = null;
         c.memory_quiet_s = 30 * 60;
+        c.stop_wait_ms = 15_000;
         c.path_var = "/usr/local/bin:/usr/bin:/bin";
         c.home_var = "";
         c.told_settings_changed = false;
@@ -259,12 +278,14 @@ pub const Core = struct {
     pub fn close(c: *Core) void {
         c.quitting.store(true, .release);
         c.stop.store(true, .release);
+        c.stopRuns();
         if (c.worker) |w| w.join();
         while (c.bg_active.load(.acquire) > 0) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         for (c.queue.items) |q| c.gpa.free(q);
         c.queue.deinit(c.gpa);
+        c.run_flags.deinit(c.gpa);
         c.conv.deinit();
         c.chat_client.deinit();
         c.seen.deinit();
@@ -320,7 +341,13 @@ pub const Core = struct {
 
     /// Re-reads the settings files; refused while anything runs.
     pub fn reload(c: *Core) ![]const u8 {
-        if (c.busy.load(.acquire) or c.bg_active.load(.acquire) > 0) return "Busy; send /reload again when nothing is running.";
+        // nothing may start while the settings are replaced: the scheduler
+        // waits on settings_mutex, the chat worker on queue_mutex
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
+        c.queue_mutex.lockUncancelable(c.io);
+        defer c.queue_mutex.unlock(c.io);
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0) return "Busy; send /reload again when nothing is running.";
         var fresh: std.heap.ArenaAllocator = .init(c.gpa);
         const saved_cfg = c.cfg;
         const saved_rules = c.rule_list;
@@ -426,8 +453,9 @@ pub const Core = struct {
         const got = Io.Dir.cwd().readFile(c.io, c.paths.status, &buf) catch return;
         const i = std.mem.indexOf(u8, got, "\nlog ") orelse return;
         const h = std.mem.trim(u8, got[i + 5 ..], " \n");
-        const last = c.log.lastHash();
-        if (h.len == 64 and !std.mem.eql(u8, h, &last)) {
+        // the log may have grown after the last status (an unclean stop);
+        // only a log that no longer contains that point is a warning
+        if (h.len == 64 and !(c.log.contains(h[0..64]) catch true)) {
             c.log.write(.config, false, .{ .event = "the log does not end where the last run left it", .expected = h }) catch {};
             c.pending_warning = "Warning: the action log changed while harness was not running. Run `harness log verify`.";
         }
@@ -528,8 +556,11 @@ pub const Core = struct {
         return c.approval.waiting;
     }
 
+    const ChatAsk = struct { core: *Core, flag: *std.atomic.Value(bool) };
+
     fn askOwner(ctx: *anyopaque, what: []const u8) agent.Answer {
-        const c: *Core = @ptrCast(@alignCast(ctx));
+        const ca: *ChatAsk = @ptrCast(@alignCast(ctx));
+        const c = ca.core;
         const ch = c.chan orelse return .deny;
         var id_buf: [3][24]u8 = undefined;
         const id = blk: {
@@ -557,7 +588,7 @@ pub const Core = struct {
                     break;
                 }
             }
-            if (c.stop.load(.acquire)) {
+            if (ca.flag.load(.acquire)) {
                 ans = .deny;
                 break;
             }
@@ -588,6 +619,15 @@ pub const Core = struct {
         return c.queue.orderedRemove(0);
     }
 
+    /// Marks the worker busy if nothing is queued (so /reload waits).
+    fn claimIdle(c: *Core) bool {
+        c.queue_mutex.lockUncancelable(c.io);
+        defer c.queue_mutex.unlock(c.io);
+        if (c.queue.items.len > 0 or c.busy.load(.acquire)) return false;
+        c.busy.store(true, .release);
+        return true;
+    }
+
     fn workerLoop(c: *Core) void {
         while (!c.quitting.load(.acquire)) {
             if (c.popQueue()) |text| {
@@ -596,8 +636,7 @@ pub const Core = struct {
                 c.busy.store(false, .release);
                 continue;
             }
-            if (c.turns_since_memory > 0 and !c.private and c.last_owner_s > 0 and c.now() - c.last_owner_s >= c.memory_quiet_s) {
-                c.busy.store(true, .release);
+            if (c.turns_since_memory > 0 and !c.private and c.last_owner_s > 0 and c.now() - c.last_owner_s >= c.memory_quiet_s and c.claimIdle()) {
                 c.writeMemories() catch |e| c.log.write(.memory, false, .{ .event = "writer failed", .why = @errorName(e) }) catch {};
                 c.turns_since_memory = 0;
                 c.busy.store(false, .release);
@@ -606,7 +645,29 @@ pub const Core = struct {
         }
     }
 
-    fn baseRun(c: *Core, client: *model.Client, label: []const u8, scheduled: bool) agent.Run {
+    fn register(c: *Core, flag: *std.atomic.Value(bool)) void {
+        c.runs_mutex.lockUncancelable(c.io);
+        defer c.runs_mutex.unlock(c.io);
+        c.run_flags.append(c.gpa, flag) catch {};
+        if (c.stop.load(.acquire)) flag.store(true, .release);
+    }
+
+    fn unregister(c: *Core, flag: *std.atomic.Value(bool)) void {
+        c.runs_mutex.lockUncancelable(c.io);
+        defer c.runs_mutex.unlock(c.io);
+        for (c.run_flags.items, 0..) |f, i| if (f == flag) {
+            _ = c.run_flags.swapRemove(i);
+            return;
+        };
+    }
+
+    fn stopRuns(c: *Core) void {
+        c.runs_mutex.lockUncancelable(c.io);
+        defer c.runs_mutex.unlock(c.io);
+        for (c.run_flags.items) |f| f.store(true, .release);
+    }
+
+    fn baseRun(c: *Core, client: *model.Client, label: []const u8, scheduled: bool, flag: *std.atomic.Value(bool)) agent.Run {
         return .{
             .gpa = c.gpa,
             .io = c.io,
@@ -627,7 +688,7 @@ pub const Core = struct {
                 .search_key = c.secrets.search,
                 .path_var = c.path_var,
                 .home = c.home_var,
-                .stop = &c.stop,
+                .stop = flag,
             },
             .limits = c.cfg.limits,
             .top_size = c.cfg.memory.top_size,
@@ -640,8 +701,16 @@ pub const Core = struct {
     }
 
     fn chatTurn(c: *Core, text: []const u8) void {
-        var run = c.baseRun(&c.chat_client, "chat", false);
-        run.asker = .{ .ctx = c, .ask = askOwner };
+        if (c.reset_conv.swap(false, .acq_rel)) {
+            c.conv.deinit();
+            c.conv = .init(c.gpa);
+        }
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag);
+        defer c.unregister(&flag);
+        var ask: ChatAsk = .{ .core = c, .flag = &flag };
+        var run = c.baseRun(&c.chat_client, "chat", false, &flag);
+        run.asker = .{ .ctx = &ask, .ask = askOwner };
         const res = agent.turn(&run, &c.conv, text, true) catch |e| {
             var buf: [128]u8 = undefined;
             c.say(std.fmt.bufPrint(&buf, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
@@ -649,7 +718,7 @@ pub const Core = struct {
         };
         defer agent.freeResult(&run, res);
         if (!res.stopped) c.say(res.text);
-        c.turns_since_memory += 1;
+        if (!run.private) c.turns_since_memory += 1;
     }
 
     const memory_prompt =
@@ -661,7 +730,7 @@ pub const Core = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var transcript: std.ArrayList(u8) = .empty;
-        for (c.conv.turns.items) |tn| for (tn.messages.items) |m| for (m.blocks) |b| if (b == .text) {
+        for (c.conv.turns.items) |tn| if (!tn.private) for (tn.messages.items) |m| for (m.blocks) |b| if (b == .text) {
             try transcript.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(b.text, 2000) });
         };
         if (transcript.items.len == 0) return;
@@ -699,10 +768,9 @@ pub const Core = struct {
             dropped = c.queue.items.len;
             c.queue.clearRetainingCapacity();
         }
-        c.stop.store(true, .release);
+        c.stopRuns();
         var waited: u32 = 0;
-        while ((c.busy.load(.acquire) or c.bg_active.load(.acquire) > 0) and waited < 15_000) : (waited += 20) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
-        c.stop.store(false, .release);
+        while ((c.busy.load(.acquire) or c.bg_active.load(.acquire) > 0) and waited < c.stop_wait_ms) : (waited += 20) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.chat, false, .{ .event = "stop", .chat_turn = chat_busy, .background_runs = bg, .queued_dropped = dropped }) catch {};
         if (!chat_busy and bg == 0 and dropped == 0) return "Nothing was running.";
         return "Stopped everything that was running.";
@@ -728,6 +796,8 @@ pub const Core = struct {
             c.checkSettingsChanged();
         }
         if (c.stop.load(.acquire)) return;
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
         const today = c.localDay(now_s);
         const minutes = c.localMinutes(now_s);
         for (c.briefs) |b| {
@@ -806,12 +876,12 @@ pub const Core = struct {
             c.state_mutex.unlock(c.io);
             _ = c.bg_active.fetchSub(1, .acq_rel);
         }
-        const finished = switch (job) {
+        // a run that failed or was stopped still counts for its slot, so
+        // the scheduler does not start it again right away
+        _ = switch (job) {
             .brief => |b| c.runBrief(b) catch false,
             .task => |tk| c.runTask(tk) catch false,
         };
-        // a run cut short by /stop is not counted as done
-        if (!finished) return;
         const now_s = c.now();
         c.state_mutex.lockUncancelable(c.io);
         defer c.state_mutex.unlock(c.io);
@@ -831,19 +901,25 @@ pub const Core = struct {
         var client = try model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens);
         defer client.deinit();
         const label = try std.fmt.allocPrint(a, "brief {s}", .{b.name});
-        var run = c.baseRun(&client, label, true);
-        const collected = blk: {
-            c.lock.lockUncancelable(c.io);
-            defer c.lock.unlock(c.io);
-            break :blk try brief.collect(&run, a, b, &c.seen);
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag);
+        defer c.unregister(&flag);
+        var run = c.baseRun(&client, label, true, &flag);
+        // a copy, so the fetches hold no lock
+        var snap = blk: {
+            c.seen_mutex.lockUncancelable(c.io);
+            defer c.seen_mutex.unlock(c.io);
+            break :blk try c.seen.clone();
         };
-        if (c.stop.load(.acquire)) return false;
+        defer snap.deinit();
+        const collected = try brief.collect(&run, a, b, &snap);
+        if (flag.load(.acquire)) return false;
         const w = try brief.compose(&run, a, b, collected);
-        if (c.stop.load(.acquire)) return false;
+        if (flag.load(.acquire)) return false;
         if (c.chan == null) return false;
         c.say(w.text);
-        c.lock.lockUncancelable(c.io);
-        defer c.lock.unlock(c.io);
+        c.seen_mutex.lockUncancelable(c.io);
+        defer c.seen_mutex.unlock(c.io);
         const now_s = c.now();
         for (w.links) |l| try c.seen.add(l, now_s);
         c.seen.prune(now_s);
@@ -859,7 +935,10 @@ pub const Core = struct {
         var client = try model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens);
         defer client.deinit();
         const label = try std.fmt.allocPrint(a, "task {s}", .{tk.name});
-        var run = c.baseRun(&client, label, true);
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag);
+        defer c.unregister(&flag);
+        var run = c.baseRun(&client, label, true, &flag);
         run.extra_instructions = try std.fmt.allocPrint(a, "This is the scheduled task \"{s}\". If there is nothing worth telling the owner this time, answer exactly NOTHING.", .{tk.name});
         var conv: agent.Conversation = .init(c.gpa);
         defer conv.deinit();
@@ -890,6 +969,7 @@ pub const Core = struct {
     const help_text =
         \\Commands
         \\/stop: stop everything running now
+        \\/new: start a new conversation (memory stays)
         \\/status: what is running and the switches
         \\/brief [NAME]: send a brief now
         \\/topics: list brief topics
@@ -914,6 +994,10 @@ pub const Core = struct {
         if (eql(u8, cmd, "/help") or eql(u8, cmd, "/start")) return help_text;
         if (eql(u8, cmd, "/pair")) return "Already paired.";
         if (eql(u8, cmd, "/stop")) return c.stopAll();
+        if (eql(u8, cmd, "/new")) {
+            c.reset_conv.store(true, .release);
+            return "New conversation.";
+        }
         if (eql(u8, cmd, "/reload")) return c.reload();
         if (eql(u8, cmd, "/status")) {
             return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}.", .{
@@ -973,6 +1057,8 @@ pub const Core = struct {
                 if (rest.len == 0 or eql(u8, b.name, rest)) break b;
             } else return "No brief with that name.";
             const key = keyFor("brief-now", b.name);
+            c.settings_mutex.lockUncancelable(c.io);
+            defer c.settings_mutex.unlock(c.io);
             c.startBackground(.{ .brief = b }, key.slice());
             return "Collecting.";
         }
@@ -1433,7 +1519,7 @@ test "stop_ends_running_turn_and_reports" {
     try f.rec.waitFor("Stopped everything that was running.");
     try t.expect(Io.Clock.awake.now(t.io).nanoseconds - start < 5 * std.time.ns_per_s);
     try t.expectEqual(1, f.e.server.modelRequests());
-    try t.expect(!f.core.stop.load(.acquire));
+    try t.expectEqual(0, f.core.run_flags.items.len);
 }
 
 test "missed_brief_runs_once_on_start" {
@@ -1535,4 +1621,117 @@ test "task_paused_after_budget_spent_until_resume" {
     try f.e.script(2, model.textReply("Back."));
     f.core.tick();
     try f.rec.waitFor("[check] Back.");
+}
+
+test "log_that_grew_after_the_last_status_is_not_a_warning" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    const home = f.home;
+    const a = f.e.arena.allocator();
+    const p = try Paths.init(a, home);
+    f.core.close();
+    // the killed run wrote more after its last status
+    {
+        var l = try log_mod.Log.open(t.allocator, t.io, p.log);
+        defer l.close();
+        try l.write(.chat, false, .{ .text = "after the last status" });
+    }
+    f.core = try Core.open(t.allocator, t.io, home, .{});
+    try t.expectEqual(null, f.core.pending_warning);
+    f.core.close();
+    // a status hash that is nowhere in the log is a warning
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.status, .data = "pid 1\ntick 2026-11-19T00:00:00Z\nlog abababababababababababababababababababababababababababababababab\n" });
+    f.core = try Core.open(t.allocator, t.io, home, .{});
+    try t.expect(f.core.pending_warning != null);
+    f.core.close();
+    f.rec.deinit();
+    f.e.deinit();
+}
+
+fn waitFile(e: *model.TestEnv, name: []const u8) !void {
+    var waited: u32 = 0;
+    while (waited < 5000) : (waited += 20) {
+        if (e.tmp.dir.access(t.io, name, .{})) |_| return else |_| {}
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    return error.TestTimedOut;
+}
+
+test "stop_holds_through_a_slow_model_call" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
+    _ = try f.core.reload();
+    f.core.stop_wait_ms = 200;
+    const slow = comptime "{\"delay_ms\":1500," ++ model.toolReply("tu_1", "shell", "{\"command\":\"echo after-stop\"}")[1..];
+    try f.e.script(1, slow);
+    try f.e.script(2, model.textReply("should not happen"));
+    try f.core.startWorker();
+    try f.core.handleText("go");
+    try waitFile(&f.e, "requests/001.json");
+    try f.core.handleText("/stop");
+    t.io.sleep(.fromMilliseconds(2500), .awake) catch {};
+    try t.expectEqual(1, f.e.server.modelRequests());
+    const lt = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, f.e.arena.allocator(), .unlimited);
+    try t.expect(std.mem.indexOf(u8, lt, "\"kind\":\"tool\"") == null);
+}
+
+test "stopped_task_does_not_restart" {
+    var f: Fix = undefined;
+    try f.init("", "", "[check]\nevery = 5m\ndo = Check the price.\n");
+    defer f.deinit();
+    f.core.stop_wait_ms = 200;
+    const slow = comptime "{\"delay_ms\":1000," ++ model.textReply("late")[1..];
+    try f.e.script(1, slow);
+    try f.e.script(2, model.textReply("again"));
+    f.core.tick();
+    try waitFile(&f.e, "requests/001.json");
+    try f.core.handleText("/stop");
+    var waited: u32 = 0;
+    while (f.core.bg_active.load(.acquire) > 0 and waited < 5000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    f.core.tick();
+    t.io.sleep(.fromMilliseconds(400), .awake) catch {};
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expectEqual(0, f.rec.count("[check]"));
+}
+
+test "private_turns_stay_out_of_memory" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.core.handleText("/private on");
+    try f.e.script(1, model.textReply("noted"));
+    f.core.chatTurn("my private diagnosis xyzzy");
+    try f.core.handleText("/private off");
+    try f.e.script(2, model.textReply("fine"));
+    f.core.chatTurn("ok then");
+    try t.expectEqual(1, f.core.turns_since_memory);
+    try f.e.script(3, model.textReply("- likes plain answers"));
+    try f.core.writeMemories();
+    const req = try f.e.request(3);
+    try t.expect(std.mem.indexOf(u8, req, "xyzzy") == null);
+    try t.expect(std.mem.indexOf(u8, req, "ok then") != null);
+}
+
+test "reload_waits_while_a_message_is_queued" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.core.handleText("a message nobody has picked up yet");
+    try t.expect(std.mem.startsWith(u8, try f.core.reload(), "Busy"));
+}
+
+test "new_clears_the_conversation" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.textReply("one"));
+    f.core.chatTurn("first message");
+    try f.core.handleText("/new");
+    try f.rec.waitFor("New conversation.");
+    try f.e.script(2, model.textReply("two"));
+    f.core.chatTurn("second message");
+    const req = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req, "first message") == null);
 }

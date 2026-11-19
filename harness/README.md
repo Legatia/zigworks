@@ -19,7 +19,7 @@ Security framework on macOS). Models are reached only through
 [omnigate](https://github.com/Legatia/omnigate), which holds the provider
 keys and the budgets.
 
-**State: 0.1.0, tested by its own tests (91 unit tests, and an end-to-end
+**State: 0.1.0, tested by its own tests (101 unit tests, and an end-to-end
 script that drives the real binary against stand-ins for omnigate,
 Telegram, feeds and search) on macOS. Not yet run against a real omnigate
 or a real Telegram bot; the Windows build has only been compiled.** See
@@ -88,7 +88,8 @@ scheduled run nobody can answer, so `ask` is Deny there, and the run says
 what it skipped.
 
 `/stop` stops everything at once: the running turn, any shell command and
-everything it started, and background runs.
+everything it started, and background runs. `/new` starts a fresh
+conversation; memory stays.
 
 Shell commands get only `PATH`, `HOME`, `LANG` and `TERM`. Stored secrets
 are masked in all tool output as `[secret:NAME]` before the model or the
@@ -159,7 +160,7 @@ gate (with `ask` as Deny). Its answer is sent to you unless it is
 
 ## Commands
 
-`/stop`, `/status`, `/brief [NAME]`, `/topics`, `/topic add|rm`, `/tasks`,
+`/stop`, `/new`, `/status`, `/brief [NAME]`, `/topics`, `/topic add|rm`, `/tasks`,
 `/task add|rm|resume`, `/memory`, `/remember`, `/pin`, `/unpin`,
 `/forget`, `/private on|off`, `/reload`, `/help`.
 
@@ -176,8 +177,10 @@ CLI: `init`, `secret add|rm|list`, `pair`, `run`, `chat`, `brief [NAME]`,
   instance is the fix, and is planned for the hosted version.
 - **The log is tamper-evident, not tamper-proof.** Someone who can write
   the file can rewrite the whole chain.
-- **No streaming.** Answers arrive whole. Model calls are not interrupted
-  by `/stop`; it takes effect before the next call.
+- **No streaming.** Answers arrive whole. A model call already under way
+  when you send `/stop` is not cut off, but its answer is dropped and
+  nothing it asked for runs. A stopped brief or task waits for its next
+  scheduled time.
 - **Windows.** `/stop` ends a shell command but not processes it started.
   The lock is judged by the status file's age, so after a crash a new
   instance can start 90 seconds later.
