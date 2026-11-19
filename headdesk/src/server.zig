@@ -96,6 +96,23 @@ const Buffer = struct {
     format: u32,
 };
 
+/// A wl_region: rectangles added and taken away, in order.
+const Region = struct {
+    const Op = struct { rect: Rect, add: bool };
+    ops: std.ArrayList(Op) = .empty,
+
+    /// Whether a point is in a region made of `ops`: the last rectangle
+    /// that holds it decides.
+    fn holds(ops: []const Op, x: i32, y: i32) bool {
+        var i = ops.len;
+        while (i > 0) {
+            i -= 1;
+            if (ops[i].rect.contains(x, y)) return ops[i].add;
+        }
+        return false;
+    }
+};
+
 const Positioner = struct {
     w: i32 = 0,
     h: i32 = 0,
@@ -140,6 +157,9 @@ pub const Surface = struct {
     pending_buffer: ?*Buffer = null,
     pending_scale: i32 = 1,
     pending_frames: std.ArrayList(u32) = .empty,
+    /// Set by set_input_region: the new region, null for "all of it".
+    pending_input: ?[]Region.Op = null,
+    pending_input_set: bool = false,
     scale: i32 = 1,
     view_dst: ?[2]i32 = null,
     view_src: ?[4]f64 = null,
@@ -149,6 +169,8 @@ pub const Surface = struct {
     w: i32 = 0,
     h: i32 = 0,
     frames: std.ArrayList(u32) = .empty,
+    /// Where the surface takes pointer input; null: everywhere on it.
+    input: ?[]Region.Op = null,
     /// Top left corner on the desktop, set by `layout`.
     x: i32 = 0,
     y: i32 = 0,
@@ -360,6 +382,11 @@ pub const Server = struct {
                 s.gpa.destroy(b);
             },
             .positioner => s.gpa.destroy(@as(*Positioner, @ptrFromInt(e.value_ptr.data))),
+            .region => {
+                const region: *Region = @ptrFromInt(e.value_ptr.data);
+                region.ops.deinit(s.gpa);
+                s.gpa.destroy(region);
+            },
             else => {},
         };
         c.objects.deinit(s.gpa);
@@ -466,10 +493,25 @@ pub const Server = struct {
                     try s.surfaces.append(s.gpa, surf);
                     try s.add(c, id, .surface, o.version, @intFromPtr(surf));
                 },
-                1 => try s.add(c, try r.uint(), .region, 1, 0),
+                1 => {
+                    const region = try s.gpa.create(Region);
+                    region.* = .{};
+                    try s.add(c, try r.uint(), .region, 1, @intFromPtr(region));
+                },
                 else => s.complain("wl_compositor request {d}", .{opcode}),
             },
-            .region => if (opcode == 0) s.remove(c, object),
+            .region => {
+                const region: *Region = @ptrFromInt(o.data);
+                switch (opcode) {
+                    0 => {
+                        region.ops.deinit(s.gpa);
+                        s.gpa.destroy(region);
+                        s.remove(c, object);
+                    },
+                    1, 2 => try region.ops.append(s.gpa, .{ .rect = .{ .x = try r.int(), .y = try r.int(), .w = try r.int(), .h = try r.int() }, .add = opcode == 1 }),
+                    else => s.complain("wl_region request {d}", .{opcode}),
+                }
+            },
             .shm => switch (opcode) {
                 0 => {
                     const id = try r.uint();
@@ -716,9 +758,18 @@ pub const Server = struct {
                 surf.pending_buffer = if (c.objects.get(id)) |bo| (if (bo.iface == .buffer) @as(*Buffer, @ptrFromInt(bo.data)) else null) else null;
             },
             3 => try surf.pending_frames.append(s.gpa, try r.uint()),
+            5 => {
+                const id = try r.uint();
+                if (surf.pending_input) |old| s.gpa.free(old);
+                surf.pending_input = null;
+                surf.pending_input_set = true;
+                if (c.objects.get(id)) |ro| {
+                    if (ro.iface == .region) surf.pending_input = try s.gpa.dupe(Region.Op, @as(*Region, @ptrFromInt(ro.data)).ops.items);
+                }
+            },
             6 => try s.commit(surf),
             8 => surf.pending_scale = @max(1, try r.int()),
-            else => {}, // damage, regions, transform, offset: the whole surface is taken on every commit
+            else => {}, // damage, opaque region, transform, offset: the whole surface is taken on every commit
         }
     }
 
@@ -844,6 +895,12 @@ pub const Server = struct {
         try surf.frames.appendSlice(s.gpa, surf.pending_frames.items);
         surf.pending_frames.clearRetainingCapacity();
         surf.commits += 1;
+        if (surf.pending_input_set) {
+            if (surf.input) |old| s.gpa.free(old);
+            surf.input = surf.pending_input;
+            surf.pending_input = null;
+            surf.pending_input_set = false;
+        }
 
         if (surf.xdg) |x| {
             if (x.kind != .none and !x.configured) {
@@ -1045,6 +1102,8 @@ pub const Server = struct {
             if (std.mem.findScalar(*Xdg, s.windows.items, x)) |i| _ = s.windows.orderedRemove(i);
         }
         s.gpa.free(surf.pixels);
+        if (surf.input) |ops| s.gpa.free(ops);
+        if (surf.pending_input) |ops| s.gpa.free(ops);
         surf.pending_frames.deinit(s.gpa);
         surf.frames.deinit(s.gpa);
         s.gpa.destroy(surf);
@@ -1245,7 +1304,12 @@ pub const Server = struct {
         }
         if (!surf.hasContent()) return null;
         const r: Rect = .{ .x = surf.x, .y = surf.y, .w = surf.w, .h = surf.h };
-        return if (r.contains(px, py)) surf else null;
+        if (!r.contains(px, py)) return null;
+        // a surface can leave input to what lies under it
+        if (surf.input) |ops| {
+            if (!Region.holds(ops, px - surf.x, py - surf.y)) return null;
+        }
+        return surf;
     }
 
     /// The surface under a desktop point: popups before windows, the
@@ -1415,6 +1479,19 @@ test "a popup is placed by its anchor and gravity" {
     // centred above the button
     const q: Positioner = .{ .w = 40, .h = 10, .anchor_rect = .{ .x = 10, .y = 20, .w = 100, .h = 30 }, .anchor = 1, .gravity = 1, .off_y = -2 };
     try testing.expectEqual(Rect{ .x = 40, .y = 8, .w = 40, .h = 10 }, q.place());
+}
+
+test "a region is its rectangles in order, and an empty one holds nothing" {
+    const ops = [_]Region.Op{
+        .{ .rect = .{ .x = 0, .y = 0, .w = 100, .h = 100 }, .add = true },
+        .{ .rect = .{ .x = 10, .y = 10, .w = 20, .h = 20 }, .add = false },
+        .{ .rect = .{ .x = 15, .y = 15, .w = 5, .h = 5 }, .add = true },
+    };
+    try testing.expect(Region.holds(&ops, 5, 5));
+    try testing.expect(!Region.holds(&ops, 12, 12));
+    try testing.expect(Region.holds(&ops, 16, 16));
+    try testing.expect(!Region.holds(&ops, 100, 5));
+    try testing.expect(!Region.holds(&.{}, 0, 0));
 }
 
 test "rectangles join and know what they hold" {

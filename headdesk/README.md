@@ -13,9 +13,8 @@ host's own apps.
 
 **State: 0.1.0, an experiment.** The tests in this folder use a small test
 client that ships with it (`headdesk-testclient`). Real apps have each been
-started once by hand, see [Apps tried](#apps-tried): GTK 4, Qt 6 and Chrome
-drew correctly and opened a menu; Firefox drew correctly and was not taken
-further. See [Limits](#limits).
+started by hand, see [Apps tried](#apps-tried): GTK 4, Qt 6, Chrome and
+Firefox drew correctly and opened a menu. See [Limits](#limits).
 
 ## Using it from an agent
 
@@ -120,7 +119,8 @@ out), 2 a wrong command, 4 no such desktop.
   maximized); a window with a parent (a dialog) keeps its own size and is
   centred. Popups go where their positioner says, slid onto the desktop.
 - **Input** goes straight into the protocol: there is no input device and no
-  permission prompt. The keyboard is one fixed US layout that apps get as
+  permission prompt. A click goes to the topmost surface whose input region
+  holds the point. The keyboard is one fixed US layout that apps get as
   XKB text.
 - **Freezing.** An app draws when the server tells it a frame is due.
   `freeze` stops telling; `step` tells once.
@@ -129,7 +129,7 @@ out), 2 a wrong command, 4 no such desktop.
 
 The experiment this version was built for: do real apps start, draw and open
 a menu on a display server that offers shared-memory buffers only? Each app
-below was started once, by hand, on 19 November 2026 (Ubuntu 24.04 in WSL2,
+below was started by hand on 19 November 2026 (Ubuntu 24.04 in WSL2,
 x86_64, as root, each under `dbus-run-session`, desktop 1024x700), and its
 pictures were looked at.
 
@@ -138,8 +138,13 @@ pictures were looked at.
 | GTK 4.14, `gtk4-widget-factory` | `GSK_RENDERER=cairo` | yes | yes | yes | yes: a dropdown opened under its button, and a click on an entry chose it | no |
 | Qt 6.4, Qt Linguist | | yes | yes | yes | yes: the File menu | no |
 | Chrome 158 | `--ozone-platform=wayland --disable-gpu --no-sandbox --no-first-run` | yes | yes | yes | yes: the main menu; Escape closed it | no |
-| Firefox 160.0.1 | `--no-remote --profile DIR` | yes | yes | yes (its welcome screen) | not tried: the first screen asks to agree to terms of use, and nobody had | no |
+| Firefox 160.0.1 | `--no-remote --profile DIR` | yes | yes | yes | yes: the main menu, after the welcome screen's button | no |
 | Qt 5.15, FeatherPad | | yes | yes | yes | not checked | no |
+
+Firefox did not react to clicks at first: it draws into a child surface
+whose input region is empty, so that clicks reach its window underneath, and
+this server ignored input regions. It honours them now; GTK, Qt and Chrome
+were run again afterwards and still opened their menus.
 
 Also seen: an address typed into Chrome with `type` loaded, and text typed
 into the page arrived whole, shifted characters included
@@ -149,11 +154,12 @@ desktop and was cut off at the edges. The GTK demo (spinners) and FeatherPad
 (a blinking caret) never settled, as the limits below say.
 
 Not tried: GTK without `GSK_RENDERER=cairo`, Chromium itself (Chrome stood
-in for it), Electron apps, anything on arm64, anything twice.
+in for it), Electron apps, any real app on arm64, and more than a start, a
+click or two and some typing in each.
 
 ## Limits
 
-- **Few apps, each tried once.** The set of interfaces was a guess at what
+- **Few apps, each tried briefly.** The set of interfaces was a guess at what
   GTK 4, Qt 6, Firefox and Chromium need, and held for the five above;
   `status` lists what an app asked for and did not get.
 - **"Settled" is not "done".** An app that waits for the network looks idle;

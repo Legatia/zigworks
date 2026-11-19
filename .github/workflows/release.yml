@@ -1,6 +1,8 @@
 name: Release
 
 # Push a tag named <project>-v<version>, e.g. `trigrep-v0.2.0` or `headterm-v0.2.0`.
+# headdesk is Linux only: its tag builds the two Linux binaries and nothing else;
+# its package also holds its test client, headdesk-testclient.
 # Builds static Linux binaries (x86_64, arm64) and an Apple Silicon macOS binary, and
 # attaches them to a GitHub release for that tag. headsight's Linux binaries
 # capture the camera only (V4L2); the screen, windows and text need macOS.
@@ -8,7 +10,7 @@ name: Release
 # packages also hold its stand-in server, llmcheck-fake.
 on:
   push:
-    tags: ["trigrep-v*", "headterm-v*", "headsight-v*", "headsound-v*", "llmcheck-v*"]
+    tags: ["trigrep-v*", "headterm-v*", "headsight-v*", "headsound-v*", "llmcheck-v*", "headdesk-v*"]
 
 permissions:
   contents: read
@@ -40,8 +42,11 @@ jobs:
         run: |
           project="${GITHUB_REF_NAME%%-v*}"
           version="${GITHUB_REF_NAME#*-v}"
-          case "$project" in trigrep|headterm|headsight|headsound|llmcheck) ;; *) echo "unknown project in tag: $project"; exit 1 ;; esac
+          case "$project" in trigrep|headterm|headsight|headsound|llmcheck|headdesk) ;; *) echo "unknown project in tag: $project"; exit 1 ;; esac
           if [ "${{ matrix.name }}" = x86_64-windows ] && [ "$project" = headsight ]; then
+            echo "SKIP=1" >> "$GITHUB_ENV"; exit 0
+          fi
+          if [ "$project" = headdesk ] && [ "${{ runner.os }}" != Linux ]; then
             echo "SKIP=1" >> "$GITHUB_ENV"; exit 0
           fi
           echo "PKG_DIR=$project" >> "$GITHUB_ENV"
@@ -65,6 +70,7 @@ jobs:
           fi
           cp out/bin/"$project" README.md LICENSE "$pkg"/
           if [ "$project" = llmcheck ]; then cp out/bin/llmcheck-fake "$pkg"/; fi
+          if [ "$project" = headdesk ]; then cp out/bin/headdesk-testclient "$pkg"/; fi
           tar czf "$pkg.tar.gz" "$pkg"
           shasum -a 256 "$pkg.tar.gz" > "$pkg.tar.gz.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
