@@ -11,6 +11,8 @@ test {
     _ = @import("config.zig");
     _ = @import("rules.zig");
     _ = @import("gate.zig");
+    _ = @import("util.zig");
+    _ = @import("log.zig");
     _ = @import("http.zig");
     _ = @import("jv.zig");
     _ = @import("sock.zig");
