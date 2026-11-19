@@ -15,6 +15,7 @@ test {
     _ = @import("log.zig");
     _ = @import("memory.zig");
     _ = @import("model.zig");
+    _ = @import("tools.zig");
     _ = @import("http.zig");
     _ = @import("jv.zig");
     _ = @import("sock.zig");

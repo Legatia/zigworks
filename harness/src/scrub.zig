@@ -35,7 +35,7 @@ pub const Scrubber = struct {
         var list: std.ArrayList(Pattern) = .empty;
         for (secrets) |sec| {
             if (sec.value.len == 0) continue;
-            const label = try std.fmt.allocPrint(a, "[keygate:{s}]", .{sec.name});
+            const label = try std.fmt.allocPrint(a, "[secret:{s}]", .{sec.name});
             for (try forms(a, sec.value)) |f| {
                 if (f.len == 0) continue;
                 var dup = false;
@@ -173,14 +173,14 @@ const key: Secret = .{ .name = "gh", .value = "ghp_Abc123DEF456ghi789+/=" };
 test "masks the plain value" {
     const got = try scrubOnce(&.{key}, "token=ghp_Abc123DEF456ghi789+/= end");
     defer t.allocator.free(got);
-    try t.expectEqualStrings("token=[keygate:gh] end", got);
+    try t.expectEqualStrings("token=[secret:gh] end", got);
 }
 
 test "masks hex and percent-encoded forms" {
     const hex = "6768705f416263313233444546343536676869373839" ++ "2b2f3d";
     const got = try scrubOnce(&.{key}, "h=" ++ hex ++ " p=ghp_Abc123DEF456ghi789%2B%2F%3D q=ghp_Abc123DEF456ghi789%2b%2f%3d");
     defer t.allocator.free(got);
-    try t.expectEqualStrings("h=[keygate:gh] p=[keygate:gh] q=[keygate:gh]", got);
+    try t.expectEqualStrings("h=[secret:gh] p=[secret:gh] q=[secret:gh]", got);
 }
 
 test "masks base64 at every alignment, as in a Basic header" {
@@ -193,7 +193,7 @@ test "masks base64 at every alignment, as in a Basic header" {
         const enc = std.base64.standard.Encoder.encode(&buf, r);
         const got = try scrubOnce(&.{key}, enc);
         defer t.allocator.free(got);
-        try t.expect(std.mem.indexOf(u8, got, "[keygate:gh]") != null);
+        try t.expect(std.mem.indexOf(u8, got, "[secret:gh]") != null);
         // what is left can't give the value back
         try t.expect(got.len < enc.len);
     }
@@ -213,7 +213,7 @@ test "a value cut across two chunks is still masked" {
     const text = "a ghp_Abc123DEF456ghi789+/= b";
     for (text) |c| try s.feed(&.{c}, &w.writer);
     try s.finish(&w.writer);
-    try t.expectEqualStrings("a [keygate:gh] b", w.written());
+    try t.expectEqualStrings("a [secret:gh] b", w.written());
     try t.expectEqual(1, s.hits);
 }
 
