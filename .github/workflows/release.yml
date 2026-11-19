@@ -31,7 +31,9 @@ jobs:
           - { os: macos-15, target: native, name: aarch64-macos }
           # not headsight (it skips this below)
           - { os: windows-latest, target: x86_64-windows-gnu, name: x86_64-windows }
-    runs-on: ${{ matrix.os }}
+    # headdesk is Linux only: its macOS and Windows jobs have nothing to do,
+    # so they do it on a Linux runner instead of waiting for a scarce one
+    runs-on: ${{ startsWith(github.ref_name, 'headdesk-') && 'ubuntu-latest' || matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -46,7 +48,7 @@ jobs:
           if [ "${{ matrix.name }}" = x86_64-windows ] && [ "$project" = headsight ]; then
             echo "SKIP=1" >> "$GITHUB_ENV"; exit 0
           fi
-          if [ "$project" = headdesk ] && [ "${{ runner.os }}" != Linux ]; then
+          if [ "$project" = headdesk ] && [ "${{ matrix.name }}" != x86_64-linux ] && [ "${{ matrix.name }}" != aarch64-linux ]; then
             echo "SKIP=1" >> "$GITHUB_ENV"; exit 0
           fi
           echo "PKG_DIR=$project" >> "$GITHUB_ENV"
