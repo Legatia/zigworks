@@ -10,6 +10,8 @@ const config = @import("config.zig");
 const util = @import("util.zig");
 const skills = @import("skills.zig");
 const jv = @import("jv.zig");
+const mcp = @import("mcp.zig");
+const scrub = @import("scrub.zig");
 const Io = std.Io;
 
 pub const Answer = enum { once, day, deny, timeout };
@@ -18,7 +20,8 @@ pub const Answer = enum { once, day, deny, timeout };
 /// approval time runs out.
 pub const Asker = struct {
     ctx: *anyopaque,
-    ask: *const fn (ctx: *anyopaque, what: []const u8) Answer,
+    /// `allow_day`: whether "Allow 24 h" may be offered (never for money).
+    ask: *const fn (ctx: *anyopaque, what: []const u8, allow_day: bool) Answer,
 };
 
 /// A conversation, kept as whole turns so the oldest can be dropped
@@ -160,6 +163,13 @@ pub const Run = struct {
     /// Input tokens this run may use; 0: no limit.
     token_cap: u64 = 0,
     skills_dir: []const u8 = "",
+    /// Tools of the MCP servers that are running.
+    mcp: []const McpTool = &.{},
+    money: config.Config.Money = .{},
+    /// What money tools moved today; shared by all runs.
+    money_ledger: ?*MoneyLedger = null,
+    /// /dryrun on: money tools are not called.
+    dry_run: bool = false,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -173,9 +183,12 @@ pub const Run = struct {
         };
         switch (tool) {
             .delegate => if (r.model_cfg == null) return false,
+            .mcp => if (r.mcp.len == 0) return false,
+            // helpers never move money; the owner asks for it in the chat
+            .money => if (r.helper or r.mcp.len == 0) return false,
             .skill, .skill_save => if (r.skills_dir.len == 0) return false,
-            // offered once their modules are wired in
-            .browse, .mcp, .money => return false,
+            // offered once its module is wired in
+            .browse => return false,
             else => {},
         }
         const list = r.allowed orelse return true;
@@ -205,8 +218,68 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
     }
     if (r.allows(.delegate)) try out.append(arena, delegate_def);
     for (skill_defs) |d| if (r.allows(gate.Tool.fromName(d.name).?)) try out.append(arena, d);
+    for (r.mcp) |m| if (r.allows(if (m.money) .money else .mcp)) try out.append(arena, m.def);
     return out.items;
 }
+
+/// One MCP tool as the model sees it ("server__tool").
+pub const McpTool = struct {
+    def: model.ToolDef,
+    server: *mcp.Server,
+    tool: []const u8,
+    money: bool,
+    /// The input field holding the amount, for money tools.
+    amount: []const u8,
+};
+
+pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, money: []const []const u8, amount: []const u8) ![]McpTool {
+    var out: std.ArrayList(McpTool) = .empty;
+    for (s.tools()) |tl| {
+        var is_money = false;
+        for (money) |m| if (std.mem.eql(u8, m, tl.name)) {
+            is_money = true;
+        };
+        const name = try std.fmt.allocPrint(arena, "{s}__{s}", .{ tl.server, tl.name });
+        if (name.len > 64) continue;
+        const desc = if (is_money) try std.fmt.allocPrint(arena, "{s} (Moves money: the owner approves every call.)", .{tl.description}) else tl.description;
+        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = amount });
+    }
+    return out.items;
+}
+
+/// What money tools moved today, in the owner's day.
+pub const MoneyLedger = struct {
+    mutex: Io.Mutex = .init,
+    day: i64 = 0,
+    total: f64 = 0,
+    /// Where it is kept ("DAY TOTAL"); null in tests.
+    path: ?[]const u8 = null,
+
+    pub fn load(l: *MoneyLedger, io: Io) void {
+        const p = l.path orelse return;
+        var buf: [128]u8 = undefined;
+        const got = Io.Dir.cwd().readFile(io, p, &buf) catch return;
+        var it = std.mem.tokenizeAny(u8, got, " \n");
+        l.day = std.fmt.parseInt(i64, it.next() orelse return, 10) catch return;
+        l.total = std.fmt.parseFloat(f64, it.next() orelse return) catch 0;
+    }
+
+    fn spent(l: *MoneyLedger, day: i64) f64 {
+        return if (l.day == day) l.total else 0;
+    }
+
+    fn add(l: *MoneyLedger, io: Io, day: i64, amount: f64) void {
+        if (l.day != day) {
+            l.day = day;
+            l.total = 0;
+        }
+        l.total += amount;
+        const p = l.path orelse return;
+        var buf: [128]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d} {d}\n", .{ l.day, l.total }) catch return;
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = text, .flags = .{ .permissions = util.private_file } }) catch {};
+    }
+};
 
 pub const ModelCfg = struct {
     url: []const u8,
@@ -477,17 +550,36 @@ pub fn freeResult(r: *Run, res: TurnResult) void {
 
 fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const u8) !tools.Output {
     if (r.env.stop.load(.acquire)) return .{ .text = "stopped by the owner", .is_error = true };
-    const tool = gate.Tool.fromName(name) orelse return .{ .text = "no such tool", .is_error = true };
+    var mt: ?*const McpTool = null;
+    const tool: gate.Tool = if (gate.Tool.fromName(name)) |tl| switch (tl) {
+        // only reachable through an MCP tool's own name
+        .mcp, .money => return .{ .text = "no such tool", .is_error = true },
+        else => tl,
+    } else blk: {
+        for (r.mcp) |*m| if (std.mem.eql(u8, m.def.name, name)) {
+            mt = m;
+            break :blk if (m.money) .money else .mcp;
+        };
+        return .{ .text = "no such tool", .is_error = true };
+    };
     if (!r.allows(tool)) return .{ .text = "this tool is not available here", .is_error = true };
     const arg = switch (tool) {
         .delegate => delegateArg(a, input_json) catch return .{ .text = "delegate needs a list of 1 to 8 tasks", .is_error = true },
+        .mcp, .money => try std.fmt.allocPrint(a, "{s}/{s} {s}", .{ mt.?.server.name, mt.?.tool, util.cut(input_json, 1500) }),
         else => tools.mainArg(a, tool, input_json) catch return .{ .text = "the tool's input is missing its main field", .is_error = true },
     };
     const now_s = r.now();
+    var amount: f64 = 0;
+    if (tool == .money) {
+        if (moneyCheck(r, a, mt.?, input_json, now_s, &amount)) |why| {
+            try r.log.write(.gate, r.private, .{ .run = r.label, .tool = name, .decision = "deny", .why = why, .arg = arg });
+            return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+        }
+    }
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        break :blk r.gate.decide(a, tool, arg, now_s, .{ .scheduled = r.scheduled });
+        break :blk r.gate.decide(a, tool, arg, now_s, .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled });
     };
     var action = d.action;
     var why = d.why;
@@ -497,7 +589,9 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
             const what = try std.fmt.allocPrint(a, "{s}{s}: {s}", .{ who, name, util.cut(arg, 1500) });
             // helpers working at once still ask one question at a time
             if (r.ask_lock) |l| l.lockUncancelable(r.io);
-            const ans = if (r.env.stop.load(.acquire)) Answer.deny else asker.ask(asker.ctx, what);
+            var ans = if (r.env.stop.load(.acquire)) Answer.deny else asker.ask(asker.ctx, what, tool != .money);
+            // money is never granted for a day, whatever came back
+            if (tool == .money and ans == .day) ans = .once;
             if (r.ask_lock) |l| l.unlock(r.io);
             switch (ans) {
                 .once => {
@@ -547,6 +641,7 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
             break :blk .{ .text = try std.fmt.allocPrint(a, "saved as {s}", .{res.id}) };
         },
         .delegate => try delegate(r, a, input_json),
+        .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, amount),
         .skill => blk: {
             const v = jv.parse(a, input_json).?;
             const text = if (jv.str(jv.get(v, "file"))) |file|
@@ -577,6 +672,64 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
 
 // ---- tests ----
 
+
+
+// ---- MCP calls and money ----
+
+/// The amount in a money call's input: a number or a numeric string.
+fn amountOf(a: std.mem.Allocator, input_json: []const u8, field: []const u8) ?f64 {
+    if (field.len == 0) return null;
+    const v = jv.parse(a, input_json) orelse return null;
+    const x = jv.get(v, field) orelse return null;
+    return switch (x) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        .number_string, .string => |s| std.fmt.parseFloat(f64, std.mem.trim(u8, s, " ")) catch null,
+        else => null,
+    };
+}
+
+fn moneyDay(r: *const Run, now_s: i64) i64 {
+    return @divFloor(now_s + @as(i64, r.utc_offset) * 60, 86400);
+}
+
+/// Why a money call is refused before anyone is asked, or null.
+fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []const u8, now_s: i64, amount: *f64) ?[]const u8 {
+    const capped = r.money.max_per_call > 0 or r.money.max_per_day > 0;
+    const got = amountOf(a, input_json, m.amount);
+    if (got) |x| {
+        if (x < 0 or std.math.isNan(x)) return "the amount is not a positive number";
+        amount.* = x;
+    } else if (capped) {
+        return std.fmt.allocPrint(a, "no amount in the field \"{s}\", so the caps cannot be checked", .{m.amount}) catch "no amount";
+    }
+    if (r.money.max_per_call > 0 and amount.* > @as(f64, @floatFromInt(r.money.max_per_call)))
+        return std.fmt.allocPrint(a, "{d} is over the cap of {d} per call", .{ amount.*, r.money.max_per_call }) catch "over the cap per call";
+    if (r.money.max_per_day > 0) {
+        const l = r.money_ledger orelse return "no record of today's total";
+        l.mutex.lockUncancelable(r.io);
+        defer l.mutex.unlock(r.io);
+        const spent = l.spent(moneyDay(r, now_s));
+        if (spent + amount.* > @as(f64, @floatFromInt(r.money.max_per_day)))
+            return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount.*, r.money.max_per_day, spent }) catch "over the cap per day";
+    }
+    return null;
+}
+
+fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, amount: f64) !tools.Output {
+    if (m.money and r.dry_run) return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
+    const timeout_ms: u32 = @intCast(@min(@as(u64, r.limits.turn_seconds) * 1000, std.math.maxInt(u32)));
+    const res = m.server.call(a, m.tool, input_json, r.env.stop, timeout_ms, r.env.tool_output_bytes) catch |e|
+        return .{ .text = try std.fmt.allocPrint(a, "failed: {s}", .{@errorName(e)}), .is_error = true };
+    var sc = try scrub.Scrubber.init(a, r.env.secrets);
+    const text = try sc.scrubAlloc(a, res.text);
+    if (m.money and !res.is_error) if (r.money_ledger) |l| {
+        l.mutex.lockUncancelable(r.io);
+        defer l.mutex.unlock(r.io);
+        l.add(r.io, moneyDay(r, r.now()), amount);
+    };
+    return .{ .text = text, .is_error = res.is_error };
+}
 
 // ---- helpers ----
 
@@ -777,6 +930,9 @@ const Fix = struct {
     pool: Pool = .{},
     ask_lock: Io.Mutex = .init,
     ask_ms: u32 = 0,
+    last_allow_day: bool = false,
+    mcp_tools: []const McpTool = &.{},
+    ledger: MoneyLedger = .{},
     in_flight: std.atomic.Value(u32) = .init(0),
     max_in_flight: std.atomic.Value(u32) = .init(0),
 
@@ -797,6 +953,9 @@ const Fix = struct {
         f.pool = .{};
         f.ask_lock = .init;
         f.ask_ms = 0;
+        f.last_allow_day = false;
+        f.mcp_tools = &.{};
+        f.ledger = .{};
         f.in_flight = .init(0);
         f.max_in_flight = .init(0);
         f.conv = .init(t.allocator);
@@ -814,9 +973,10 @@ const Fix = struct {
         };
     }
 
-    fn askFn(ctx: *anyopaque, what: []const u8) Answer {
+    fn askFn(ctx: *anyopaque, what: []const u8, allow_day: bool) Answer {
         _ = what;
         const f: *Fix = @ptrCast(@alignCast(ctx));
+        f.last_allow_day = allow_day;
         const now_in = f.in_flight.fetchAdd(1, .acq_rel) + 1;
         _ = f.max_in_flight.fetchMax(now_in, .acq_rel);
         if (f.ask_ms > 0) t.io.sleep(.fromMilliseconds(f.ask_ms), .awake) catch {};
@@ -1091,4 +1251,144 @@ test "long_conversation_is_summarised_not_dropped" {
     const r = try f.say("and next week?");
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(8), "Summary of the earlier conversation") != null);
+}
+
+// ---- MCP tools and money ----
+
+const mcp_fake_path = if (@import("builtin").is_test) @import("build_options").fake_path else "";
+
+fn withMcp(f: *Fix, money: bool) !*mcp.Server {
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, mcp_fake_path, a);
+    const s = try mcp.Server.start(t.allocator, t.io, .{ .name = "fake", .command = try std.fmt.allocPrint(a, "\"{s}\" --mcp", .{fake}), .secrets = &.{}, .money = &.{} }, .{
+        .workspace = f.run.env.workspace,
+        .path_var = "/usr/bin:/bin",
+        .home = "/tmp",
+        .secret_values = &.{},
+    });
+    f.mcp_tools = try mcpTools(a, s, if (money) &.{"echo"} else &.{}, "amount");
+    f.run.mcp = f.mcp_tools;
+    f.run.money_ledger = &f.ledger;
+    return s;
+}
+
+test "mcp_tool_is_offered_and_runs_after_the_gate" {
+    var f: Fix = undefined;
+    try f.init("allow mcp fake/echo *\n");
+    defer f.deinit();
+    const s = try withMcp(&f, false);
+    defer s.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"from-mcp\"}"));
+    try f.e.script(2, model.textReply("Echoed."));
+    const r = try f.say("echo it");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Echoed.", r.text);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "\"name\":\"fake__echo\"") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "from-mcp") != null);
+    try t.expectEqual(0, f.asked);
+}
+
+test "mcp_tool_asks_by_default" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, false);
+    defer s.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\"}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("echo");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    try t.expect(f.last_allow_day);
+}
+
+test "money_is_asked_every_time_and_never_granted" {
+    var f: Fix = undefined;
+    try f.init("allow mcp *\n");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.answer = .day; // even if the owner somehow answers "24 h"
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"buy\",\"amount\":5}"));
+    try f.e.script(2, model.toolReply("tu_2", "fake__echo", "{\"text\":\"buy\",\"amount\":5}"));
+    try f.e.script(3, model.textReply("Bought twice."));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(2, f.asked);
+    try t.expect(!f.last_allow_day);
+    try t.expectEqual(0, f.grants.items.items.len);
+}
+
+test "money_caps_refuse_before_asking" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.money = .{ .max_per_call = 100, .max_per_day = 80 };
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"big\",\"amount\":150}"));
+    try f.e.script(2, model.toolReply("tu_2", "fake__echo", "{\"text\":\"ok\",\"amount\":50}"));
+    try f.e.script(3, model.toolReply("tu_3", "fake__echo", "{\"text\":\"again\",\"amount\":\"50\"}"));
+    try f.e.script(4, model.toolReply("tu_4", "fake__echo", "{\"text\":\"no amount\"}"));
+    try f.e.script(5, model.textReply("done"));
+    const r = try f.say("trade");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked); // only the 50 within both caps
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "over the cap of 100 per call") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "over the cap of 80 per day") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), "no amount") != null);
+}
+
+test "money_dry_run_does_not_call_the_tool" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.dry_run = true;
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"env\",\"amount\":1}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    const req = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req, "dry run: would call fake/echo") != null);
+    try t.expect(std.mem.indexOf(u8, req, "home=") == null); // the server never ran it
+    try t.expectEqual(@as(f64, 0), f.ledger.total);
+}
+
+test "money_in_scheduled_runs_only_when_switched_on" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.scheduled = true;
+    f.run.asker = null;
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"one\",\"amount\":1}"));
+    try f.e.script(2, model.textReply("refused"));
+    var r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "not moved in scheduled runs") != null);
+    f.run.money = .{ .scheduled = true, .max_per_call = 10 };
+    try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"two\",\"amount\":2}"));
+    try f.e.script(4, model.textReply("bought"));
+    r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "two") != null);
+    try t.expectEqual(@as(f64, 2), f.ledger.total);
+}
+
+test "helpers_never_get_money_tools" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"buy\",\"tools\":[\"mcp\",\"money\"]}]}"));
+    try f.e.script(2, model.textReply("helper done"));
+    try f.e.script(3, model.textReply("ok"));
+    const r = try f.say("go");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "fake__echo") == null);
 }

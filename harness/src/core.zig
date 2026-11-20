@@ -572,7 +572,7 @@ pub const Core = struct {
 
     const ChatAsk = struct { core: *Core, flag: *std.atomic.Value(bool) };
 
-    fn askOwner(ctx: *anyopaque, what: []const u8) agent.Answer {
+    fn askOwner(ctx: *anyopaque, what: []const u8, allow_day: bool) agent.Answer {
         const ca: *ChatAsk = @ptrCast(@alignCast(ctx));
         const c = ca.core;
         const ch = c.chan orelse return .deny;
@@ -590,7 +590,10 @@ pub const Core = struct {
         const deny = std.fmt.bufPrint(&id_buf[2], "a{d}:deny", .{id}) catch return .deny;
         var text_buf: [1700]u8 = undefined;
         const text = std.fmt.bufPrint(&text_buf, "Allow this?\n{s}", .{what}) catch what;
-        const msg = ch.buttons(ch.ctx, text, &.{ .{ "Allow once", once }, .{ "Allow 24 h", day }, .{ "Deny", deny } });
+        const msg = if (allow_day)
+            ch.buttons(ch.ctx, text, &.{ .{ "Allow once", once }, .{ "Allow 24 h", day }, .{ "Deny", deny } })
+        else
+            ch.buttons(ch.ctx, text, &.{ .{ "Allow once", once }, .{ "Deny", deny } });
         const deadline = c.now() + c.cfg.limits.approval_seconds;
         var ans: agent.Answer = .timeout;
         while (true) {
