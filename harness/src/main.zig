@@ -628,4 +628,5 @@ test {
     _ = @import("sock.zig");
     _ = @import("store.zig");
     _ = @import("scrub.zig");
+    _ = @import("page.zig");
 }
