@@ -187,8 +187,7 @@ pub const Run = struct {
             // helpers never move money; the owner asks for it in the chat
             .money => if (r.helper or r.mcp.len == 0) return false,
             .skill, .skill_save => if (r.skills_dir.len == 0) return false,
-            // offered once its module is wired in
-            .browse => return false,
+            .browse => if (r.env.browser.len == 0) return false,
             else => {},
         }
         const list = r.allowed orelse return true;

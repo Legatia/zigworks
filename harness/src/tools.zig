@@ -9,6 +9,7 @@ const scrub = @import("scrub.zig");
 const gate = @import("gate.zig");
 const model = @import("model.zig");
 const util = @import("util.zig");
+const page = @import("page.zig");
 const Io = std.Io;
 
 const is_windows = builtin.os.tag == .windows;
@@ -30,6 +31,11 @@ pub const Env = struct {
     path_var: []const u8 = "/usr/local/bin:/usr/bin:/bin",
     home: []const u8 = "",
     stop: *std.atomic.Value(bool),
+    /// Chrome or Chromium for `browse`; empty: none found.
+    browser: []const u8 = "",
+    browser_seconds: u32 = 30,
+    /// Where a throwaway browser profile goes.
+    tmp_root: []const u8 = "",
 };
 
 pub const Output = struct { text: []const u8, is_error: bool = false };
@@ -39,7 +45,8 @@ pub fn defs() []const model.ToolDef {
         .{ .name = "shell", .description = "Run a shell command in the workspace folder. Returns the exit code and output.", .schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}" },
         .{ .name = "read_file", .description = "Read a text file in the workspace.", .schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}" },
         .{ .name = "write_file", .description = "Write a text file in the workspace, replacing it if it exists.", .schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}" },
-        .{ .name = "fetch", .description = "Fetch a web page or API over http(s) with GET. Returns its text.", .schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}" },
+        .{ .name = "fetch", .description = "Fetch a web page or API over http(s) with GET. Pages come back as readable text (headings, lists, tables, links), in parts: a long page says where the next part starts.", .schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"},\"start\":{\"type\":\"integer\",\"description\":\"where to continue a long page\"}},\"required\":[\"url\"]}" },
+        .{ .name = "browse", .description = "Like fetch, but the page is first rendered by a headless browser, for pages built by JavaScript. Slower; use fetch first.", .schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"},\"start\":{\"type\":\"integer\"}},\"required\":[\"url\"]}" },
         .{ .name = "search", .description = "Search the web. Returns titles, links and snippets.", .schema_json = "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}" },
         .{ .name = "recall", .description = "Search your memory of the owner for these words.", .schema_json = "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}" },
         .{ .name = "remember", .description = "Save a short fact about the owner or their wishes for later conversations.", .schema_json = "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}" },
@@ -92,9 +99,10 @@ fn runRaw(env: Env, arena: std.mem.Allocator, tool: gate.Tool, input_json: []con
             try Io.Dir.cwd().writeFile(env.io, .{ .sub_path = p, .data = content });
             return .{ .text = try std.fmt.allocPrint(arena, "wrote {d} bytes to {s}", .{ content.len, arg }) };
         },
-        .fetch => fetch(env, arena, arg),
+        .fetch => fetch(env, arena, arg, startOf(arena, input_json)),
+        .browse => browse(env, arena, arg, startOf(arena, input_json)),
         .search => search(env, arena, arg),
-        .recall, .remember, .browse, .delegate, .skill, .skill_save, .mcp, .money => error.NotHere,
+        .recall, .remember, .delegate, .skill, .skill_save, .mcp, .money => error.NotHere,
     };
 }
 
@@ -290,15 +298,52 @@ fn isText(ct: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(ct, "text/") or std.ascii.findIgnoreCase(ct, "json") != null or std.ascii.findIgnoreCase(ct, "xml") != null;
 }
 
-fn fetch(env: Env, arena: std.mem.Allocator, url: []const u8) !Output {
+fn startOf(arena: std.mem.Allocator, input_json: []const u8) usize {
+    const v = jv.parse(arena, input_json) orelse return 0;
+    const n = jv.int(jv.get(v, "start")) orelse return 0;
+    return if (n > 0) @intCast(n) else 0;
+}
+
+fn fetch(env: Env, arena: std.mem.Allocator, url: []const u8, start: usize) !Output {
     const g = try get(env.gpa, env.io, arena, url, &.{}, fetch_max);
     if (!isText(g.content_type)) return .{ .text = try std.fmt.allocPrint(arena, "not text ({s}); only text pages are fetched", .{g.content_type}), .is_error = true };
-    const body = if (std.ascii.findIgnoreCase(g.content_type, "html") != null) try stripHtml(arena, g.body) else g.body;
+    var head: std.ArrayList(u8) = .empty;
+    try head.print(arena, "status {d}\n", .{g.status});
+    var text: []const u8 = g.body;
+    if (std.ascii.findIgnoreCase(g.content_type, "html") != null) {
+        const pg = try page.extract(arena, g.body, url);
+        if (pg.title.len > 0) try head.print(arena, "title: {s}\n", .{pg.title});
+        text = pg.text;
+    }
+    if (g.truncated) try head.appendSlice(arena, "[page cut at 1 MiB]\n");
+    return .{ .text = try textPart(env, arena, head.items, text, url, start), .is_error = g.status >= 400 };
+}
+
+fn browse(env: Env, arena: std.mem.Allocator, url: []const u8, start: usize) !Output {
+    if (env.browser.len == 0) return .{ .text = "no Chrome or Chromium found (set [browser] path in config.ini); use fetch instead", .is_error = true };
+    const html = page.render(env.gpa, env.io, arena, env.browser, url, if (env.tmp_root.len > 0) env.tmp_root else env.workspace, env.stop, env.browser_seconds * 1000, 4 << 20) catch |e|
+        return .{ .text = try std.fmt.allocPrint(arena, "the browser failed: {s}", .{@errorName(e)}), .is_error = true };
+    const pg = try page.extract(arena, html, url);
+    var head: std.ArrayList(u8) = .empty;
+    if (pg.title.len > 0) try head.print(arena, "title: {s}\n", .{pg.title});
+    return .{ .text = try textPart(env, arena, head.items, pg.text, url, start) };
+}
+
+/// One part of a long text, with where the next one starts.
+fn textPart(env: Env, arena: std.mem.Allocator, head: []const u8, text: []const u8, url: []const u8, start: usize) ![]const u8 {
+    const room = @max(env.tool_output_bytes, 600) - 300;
+    if (start > text.len) return std.fmt.allocPrint(arena, "{s}nothing at {d}: the text is {d} bytes", .{ head, start, text.len });
+    const c = page.chunk(text, start, room);
     var out: std.ArrayList(u8) = .empty;
-    try out.print(arena, "status {d}\n", .{g.status});
-    try out.appendSlice(arena, body);
-    if (g.truncated) try out.appendSlice(arena, "\n[page cut at 1 MiB]");
-    return .{ .text = capText(arena, out.items, env.tool_output_bytes), .is_error = g.status >= 400 };
+    try out.appendSlice(arena, head);
+    if (start > 0 or c.next != null) try out.print(arena, "[bytes {d}-{d} of {d}]\n", .{ start, start + c.text.len, c.total });
+    try out.appendSlice(arena, c.text);
+    if (c.next) |n| {
+        try out.appendSlice(arena, "\n[more: continue with {\"url\":");
+        try util.jsonString(&out, arena, url);
+        try out.print(arena, ",\"start\":{d}}}]", .{n});
+    }
+    return out.items;
 }
 
 /// Text of an HTML page: scripts, styles and tags out, entities for the
@@ -492,13 +537,15 @@ test "fetch_caps_body_and_refuses_binary" {
     @memset(big, 'a');
     try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/big.xml", .data = big });
     const base = try f.e.url();
-    const page = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/hello.html\"}}", .{base}));
-    try t.expectEqualStrings("status 200\nHello & welcome second", page.text);
+    const pg = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/hello.html\"}}", .{base}));
+    try t.expect(std.mem.startsWith(u8, pg.text, "status 200\n"));
+    try t.expect(std.mem.indexOf(u8, pg.text, "Hello & welcome") != null);
+    try t.expect(std.mem.indexOf(u8, pg.text, "var x") == null);
     const bin = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/blob.bin\"}}", .{base}));
     try t.expect(bin.is_error);
     f.env.tool_output_bytes = 5 * fetch_max;
     const long = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/big.xml\"}}", .{base}));
-    try t.expect(std.mem.endsWith(u8, long.text, "[page cut at 1 MiB]"));
+    try t.expect(std.mem.indexOf(u8, long.text, "[page cut at 1 MiB]") != null);
     try t.expect(long.text.len < fetch_max + 100);
 }
 
@@ -527,4 +574,59 @@ test "a_child_that_leaves_the_group_does_not_hang_the_command" {
     try t.expect(took_ms < 5000);
     try t.expect(std.mem.indexOf(u8, o.text, "started") != null);
     try t.expect(std.mem.startsWith(u8, o.text, "exit code 0"));
+}
+
+test "fetch_gives_readable_text_in_pages" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    var body: std.ArrayList(u8) = .empty;
+    try body.appendSlice(a, "<html><head><title>Story</title></head><body><nav>Home | Menu</nav><article><h1>Big news</h1><p>See <a href=\"/more\">more</a>.</p>");
+    for (0..60) |i| try body.print(a, "<p>Paragraph {d} of the story goes on for a while.</p>", .{i});
+    try body.appendSlice(a, "<p>THE END</p></article><footer>Copyright</footer></body></html>");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/story.html", .data = body.items });
+    f.env.tool_output_bytes = 1000;
+    const base = try f.e.url();
+    const first = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/story.html\"}}", .{base}));
+    try t.expect(!first.is_error);
+    try t.expect(std.mem.indexOf(u8, first.text, "# Big news") != null);
+    try t.expect(std.mem.indexOf(u8, first.text, try std.fmt.allocPrint(a, "[more]({s}/more)", .{base})) != null);
+    try t.expect(std.mem.indexOf(u8, first.text, "Menu") == null);
+    try t.expect(std.mem.indexOf(u8, first.text, "THE END") == null);
+    const at = std.mem.indexOf(u8, first.text, "\"start\":").?;
+    const n = std.fmt.parseInt(usize, first.text[at + 8 .. std.mem.indexOfScalarPos(u8, first.text, at, '}').?], 10) catch unreachable;
+    var start = n;
+    var found = false;
+    for (0..20) |_| {
+        const next = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/story.html\",\"start\":{d}}}", .{ base, start }));
+        if (std.mem.indexOf(u8, next.text, "THE END") != null) {
+            found = true;
+            try t.expect(std.mem.indexOf(u8, next.text, "\"start\":") == null);
+            break;
+        }
+        const k = std.mem.indexOf(u8, next.text, "\"start\":").?;
+        start = std.fmt.parseInt(usize, next.text[k + 8 .. std.mem.indexOfScalarPos(u8, next.text, k, '}').?], 10) catch unreachable;
+    }
+    try t.expect(found);
+}
+
+test "browse_renders_through_the_browser" {
+    if (is_windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const none = try f.call(.browse, "{\"url\":\"https://example.com/\"}");
+    try t.expect(none.is_error);
+    try t.expect(std.mem.indexOf(u8, none.text, "no Chrome or Chromium") != null);
+    // a stand-in browser that prints a page made by "JavaScript"
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "chrome.sh", .data = "#!/bin/sh\necho '<html><body><div id=app><p>Rendered by script</p></div></body></html>'\n" });
+    const sh = try f.e.tmp.dir.realPathFileAlloc(t.io, "chrome.sh", a);
+    try Io.Dir.cwd().setFilePermissions(t.io, sh, .fromMode(0o755), .{});
+    f.env.browser = sh;
+    f.env.tmp_root = try f.e.tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const o = try f.call(.browse, "{\"url\":\"https://example.com/\"}");
+    try t.expect(!o.is_error);
+    try t.expect(std.mem.indexOf(u8, o.text, "Rendered by script") != null);
 }

@@ -12,6 +12,7 @@ const model = @import("model.zig");
 const tools = @import("tools.zig");
 const skills = @import("skills.zig");
 const mcp = @import("mcp.zig");
+const page = @import("page.zig");
 const agent = @import("agent.zig");
 const brief = @import("brief.zig");
 const scrub = @import("scrub.zig");
@@ -164,6 +165,8 @@ pub const Core = struct {
     mcp_note: []const u8 = "",
     money_ledger: agent.MoneyLedger = .{},
     dry_run: bool = false,
+    /// Chrome or Chromium for `browse`; empty: none.
+    browser: []const u8 = "",
     seen: brief.Seen,
     /// Set on close: nothing new starts.
     stop: std.atomic.Value(bool) = .init(false),
@@ -308,6 +311,7 @@ pub const Core = struct {
         c.loadRan();
         c.checkLogAgainstStatus();
         try c.log.write(.config, false, .{ .event = "start", .pid = pidNumber() });
+        c.findBrowser();
         c.startMcp();
         return c;
     }
@@ -416,6 +420,7 @@ pub const Core = struct {
         c.settings_arena.deinit();
         c.settings_arena = fresh;
         c.gate.rules = c.rule_list;
+        c.findBrowser();
         c.told_settings_changed = false;
         // nothing runs now (reload waits for that), so servers can restart
         c.stopMcp();
@@ -734,6 +739,9 @@ pub const Core = struct {
                 .path_var = c.path_var,
                 .home = c.home_var,
                 .stop = flag,
+                .browser = c.browser,
+                .browser_seconds = c.cfg.browser.seconds,
+                .tmp_root = c.paths.state,
             },
             .limits = c.cfg.limits,
             .top_size = c.cfg.memory.top_size,
@@ -759,6 +767,10 @@ pub const Core = struct {
             .money_ledger = &c.money_ledger,
             .dry_run = c.dry_run,
         };
+    }
+
+    fn findBrowser(c: *Core) void {
+        c.browser = (page.findBrowser(c.settings_arena.allocator(), c.io, c.cfg.browser.path, "", c.path_var) catch null) orelse "";
     }
 
     // ---- MCP servers ----
