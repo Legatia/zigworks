@@ -23,6 +23,9 @@ pub const Reply = struct {
     stop_reason: []const u8,
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
+    /// Prompt-cache figures: input read from cache, input written to it.
+    cache_read_tokens: u64 = 0,
+    cache_write_tokens: u64 = 0,
 
     pub fn text(r: Reply, arena: std.mem.Allocator) ![]const u8 {
         var out: std.ArrayList(u8) = .empty;
@@ -71,7 +74,13 @@ pub const Client = struct {
     }
 
     pub fn send(c: *Client, arena: std.mem.Allocator, system: []const u8, messages: []const Message, tools: []const ToolDef) Error!Reply {
-        const body = try requestBody(arena, c.model, c.max_tokens, system, messages, tools);
+        return c.sendParts(arena, system, "", messages, tools);
+    }
+
+    /// `stable` is the part of the system prompt that stays the same from
+    /// call to call (marked for the prompt cache), `changing` the rest.
+    pub fn sendParts(c: *Client, arena: std.mem.Allocator, stable: []const u8, changing: []const u8, messages: []const Message, tools: []const ToolDef) Error!Reply {
+        const body = try requestBody(arena, c.model, c.max_tokens, stable, changing, messages, tools);
         var limited = false;
         var conn_retry = false;
         while (true) {
@@ -132,22 +141,37 @@ pub const Client = struct {
     }
 };
 
-pub fn requestBody(arena: std.mem.Allocator, model: []const u8, max_tokens: u32, system: []const u8, messages: []const Message, tools: []const ToolDef) ![]u8 {
+const cache_mark = ",\"cache_control\":{\"type\":\"ephemeral\"}";
+
+/// Prompt-cache marks (at most 4 are allowed): the last tool, the stable
+/// system part when there is a changing part, and the last message's last
+/// block, so each step of a turn reads the steps before it from cache.
+pub fn requestBody(arena: std.mem.Allocator, model: []const u8, max_tokens: u32, stable: []const u8, changing: []const u8, messages: []const Message, tools: []const ToolDef) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "{\"model\":");
     try util.jsonString(&out, arena, model);
     try out.print(arena, ",\"max_tokens\":{d},\"system\":", .{max_tokens});
-    try util.jsonString(&out, arena, system);
+    if (changing.len == 0) {
+        try util.jsonString(&out, arena, stable);
+    } else {
+        try out.appendSlice(arena, "[{\"type\":\"text\",\"text\":");
+        try util.jsonString(&out, arena, stable);
+        try out.appendSlice(arena, cache_mark ++ "},{\"type\":\"text\",\"text\":");
+        try util.jsonString(&out, arena, changing);
+        try out.appendSlice(arena, "}]");
+    }
     try out.appendSlice(arena, ",\"messages\":[");
     for (messages, 0..) |m, i| {
         if (i > 0) try out.append(arena, ',');
         try out.print(arena, "{{\"role\":\"{s}\",\"content\":[", .{@tagName(m.role)});
         for (m.blocks, 0..) |b, j| {
             if (j > 0) try out.append(arena, ',');
+            const mark = i + 1 == messages.len and j + 1 == m.blocks.len;
             switch (b) {
                 .text => |s| {
                     try out.appendSlice(arena, "{\"type\":\"text\",\"text\":");
                     try util.jsonString(&out, arena, s);
+                    if (mark) try out.appendSlice(arena, cache_mark);
                     try out.append(arena, '}');
                 },
                 .tool_use => |u| {
@@ -155,14 +179,18 @@ pub fn requestBody(arena: std.mem.Allocator, model: []const u8, max_tokens: u32,
                     try util.jsonString(&out, arena, u.id);
                     try out.appendSlice(arena, ",\"name\":");
                     try util.jsonString(&out, arena, u.name);
-                    try out.print(arena, ",\"input\":{s}}}", .{if (u.input_json.len > 0) u.input_json else "{}"});
+                    try out.print(arena, ",\"input\":{s}", .{if (u.input_json.len > 0) u.input_json else "{}"});
+                    if (mark) try out.appendSlice(arena, cache_mark);
+                    try out.append(arena, '}');
                 },
                 .tool_result => |r| {
                     try out.appendSlice(arena, "{\"type\":\"tool_result\",\"tool_use_id\":");
                     try util.jsonString(&out, arena, r.id);
                     try out.appendSlice(arena, ",\"content\":");
                     try util.jsonString(&out, arena, r.content);
-                    try out.print(arena, ",\"is_error\":{s}}}", .{if (r.is_error) "true" else "false"});
+                    try out.print(arena, ",\"is_error\":{s}", .{if (r.is_error) "true" else "false"});
+                    if (mark) try out.appendSlice(arena, cache_mark);
+                    try out.append(arena, '}');
                 },
             }
         }
@@ -177,7 +205,9 @@ pub fn requestBody(arena: std.mem.Allocator, model: []const u8, max_tokens: u32,
             try util.jsonString(&out, arena, td.name);
             try out.appendSlice(arena, ",\"description\":");
             try util.jsonString(&out, arena, td.description);
-            try out.print(arena, ",\"input_schema\":{s}}}", .{td.schema_json});
+            try out.print(arena, ",\"input_schema\":{s}", .{td.schema_json});
+            if (i + 1 == tools.len) try out.appendSlice(arena, cache_mark);
+            try out.append(arena, '}');
         }
         try out.append(arena, ']');
     }
@@ -208,6 +238,8 @@ pub fn parseReply(arena: std.mem.Allocator, body: []const u8) ?Reply {
         .stop_reason = jv.str(jv.get(v, "stop_reason")) orelse "",
         .input_tokens = @intCast(@max(0, jv.int(jv.at(v, &.{ "usage", "input_tokens" })) orelse 0)),
         .output_tokens = @intCast(@max(0, jv.int(jv.at(v, &.{ "usage", "output_tokens" })) orelse 0)),
+        .cache_read_tokens = @intCast(@max(0, jv.int(jv.at(v, &.{ "usage", "cache_read_input_tokens" })) orelse 0)),
+        .cache_write_tokens = @intCast(@max(0, jv.int(jv.at(v, &.{ "usage", "cache_creation_input_tokens" })) orelse 0)),
     };
 }
 
@@ -359,4 +391,48 @@ test "rate_limited_twice_gives_up" {
     defer c.deinit();
     try t.expectError(error.RateLimited, c.send(e.arena.allocator(), "", &.{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }}, &.{}));
     try t.expectEqual(2, e.server.modelRequests());
+}
+
+test "cache_marks_on_last_tool_stable_system_and_last_message" {
+    var e: TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try e.script(1, "{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1,\"cache_read_input_tokens\":900,\"cache_creation_input_tokens\":40}}");
+    var c = try e.client();
+    defer c.deinit();
+    const a = e.arena.allocator();
+    const r = try c.sendParts(a, "stable part", "changing part", &.{
+        .{ .role = .user, .blocks = &.{.{ .text = "first" }} },
+        .{ .role = .assistant, .blocks = &.{.{ .text = "answer" }} },
+        .{ .role = .user, .blocks = &.{ .{ .text = "a" }, .{ .text = "last" } } },
+    }, &.{
+        .{ .name = "one", .description = "1", .schema_json = "{\"type\":\"object\"}" },
+        .{ .name = "two", .description = "2", .schema_json = "{\"type\":\"object\"}" },
+    });
+    try t.expectEqual(900, r.cache_read_tokens);
+    try t.expectEqual(40, r.cache_write_tokens);
+    const v = jv.parse(a, try e.request(1)).?;
+    const sys = jv.arr(jv.at(v, &.{ "body", "system" })).?;
+    try t.expectEqual(2, sys.len);
+    try t.expectEqualStrings("stable part", jv.str(jv.get(sys[0], "text")).?);
+    try t.expectEqualStrings("ephemeral", jv.str(jv.at(sys[0], &.{ "cache_control", "type" })).?);
+    try t.expectEqualStrings("changing part", jv.str(jv.get(sys[1], "text")).?);
+    try t.expect(jv.get(sys[1], "cache_control") == null);
+    const tl = jv.arr(jv.at(v, &.{ "body", "tools" })).?;
+    try t.expect(jv.get(tl[0], "cache_control") == null);
+    try t.expect(jv.get(tl[1], "cache_control") != null);
+    const msgs = jv.arr(jv.at(v, &.{ "body", "messages" })).?;
+    try t.expect(jv.get(jv.arr(jv.get(msgs[0], "content")).?[0], "cache_control") == null);
+    const last = jv.arr(jv.get(msgs[2], "content")).?;
+    try t.expect(jv.get(last[0], "cache_control") == null);
+    try t.expect(jv.get(last[1], "cache_control") != null);
+}
+
+test "plain_send_keeps_system_a_string" {
+    const a = t.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const body = try requestBody(arena.allocator(), "m", 10, "sys", "", &.{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }}, &.{});
+    const v = jv.parse(arena.allocator(), body).?;
+    try t.expectEqualStrings("sys", jv.str(jv.get(v, "system")).?);
 }

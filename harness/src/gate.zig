@@ -13,10 +13,20 @@ pub const Tool = enum {
     search,
     recall,
     remember,
+    /// A page rendered by a headless browser; the same limits as fetch.
+    browse,
+    /// Work handed to helpers; each helper's own calls pass the gate.
+    delegate,
+    skill,
+    skill_save,
+    /// A tool of an MCP server; the argument is "server/tool {input}".
+    mcp,
+    /// An MCP tool listed as moving money: asked every time, never granted.
+    money,
 
     pub fn default(tool: Tool) rules.Action {
         return switch (tool) {
-            .shell, .fetch => .ask,
+            .shell, .fetch, .browse, .skill_save, .mcp, .money => .ask,
             else => .allow,
         };
     }
@@ -36,12 +46,19 @@ pub const Ctx = struct {
     scheduled: bool = false,
     /// A feed or search the owner listed in briefs.ini.
     brief_source: bool = false,
+    /// The owner switched on money calls in scheduled runs ([money]
+    /// scheduled = on); the caps were checked before the gate.
+    money_unattended: bool = false,
 };
 
 /// What a grant covers: the exact argument, or for `fetch` the URL's host.
 pub fn grantKey(tool: Tool, arg: []const u8) []const u8 {
-    if (tool == .fetch) return urlHost(arg) orelse arg;
-    return arg;
+    return switch (tool) {
+        .fetch, .browse => urlHost(arg) orelse arg,
+        // the tool, whatever its input
+        .mcp, .money => arg[0 .. std.mem.indexOfScalar(u8, arg, ' ') orelse arg.len],
+        else => arg,
+    };
 }
 
 /// "https://Host:8080/x" → "Host:8080"; null if not an http(s) URL.
@@ -132,7 +149,7 @@ pub const Gate = struct {
     pub fn decide(g: *const Gate, arena: std.mem.Allocator, tool: Tool, arg: []const u8, now_s: i64, ctx: Ctx) Decision {
         // hard limits first: no rule, grant or listing lifts these
         switch (tool) {
-            .fetch => if (urlHost(arg) == null) return .{ .action = .deny, .why = "only http and https addresses can be fetched" },
+            .fetch, .browse => if (urlHost(arg) == null) return .{ .action = .deny, .why = "only http and https addresses can be fetched" },
             .read_file, .write_file => {
                 _ = confine(arena, g.io, g.workspace, arg) catch return .{ .action = .deny, .why = "outside the workspace" };
             },
@@ -143,6 +160,12 @@ pub const Gate = struct {
         for (g.rules) |r| {
             if (r.action == .deny and std.mem.eql(u8, r.tool, name) and rules.glob(r.pattern, arg))
                 return .{ .action = .deny, .why = std.fmt.allocPrint(arena, "rule on line {d}", .{r.line}) catch "rule" };
+        }
+        if (tool == .money) {
+            // no grant or allow rule lifts this: the owner is asked every time
+            if (!ctx.scheduled) return .{ .action = .ask, .why = "money is asked every time" };
+            if (ctx.money_unattended) return .{ .action = .allow, .why = "money in scheduled runs is switched on, within the caps" };
+            return .{ .action = .deny, .why = "money is not moved in scheduled runs" };
         }
         if (g.grants.has(tool, grantKey(tool, arg), now_s)) return .{ .action = .allow, .why = "granted for 24 hours" };
         var d: Decision = .{ .action = tool.default(), .why = "default for this tool" };
@@ -304,4 +327,45 @@ test "fetch_refuses_non_http_schemes" {
     try t.expectEqual(.deny, f.act(.fetch, "ftp://x/y", .{}));
     try t.expectEqual(.deny, f.act(.fetch, "https:///nohost", .{}));
     try t.expectEqual(.allow, f.act(.fetch, "http://example.com", .{}));
+}
+
+test "new_tool_kinds_have_their_defaults" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    try t.expectEqual(.ask, f.act(.browse, "https://x.org/a", .{}));
+    try t.expectEqual(.deny, f.act(.browse, "file:///etc/passwd", .{}));
+    try t.expectEqual(.allow, f.act(.delegate, "2 tasks", .{}));
+    try t.expectEqual(.allow, f.act(.skill, "weekly-report", .{}));
+    try t.expectEqual(.ask, f.act(.skill_save, "weekly-report", .{}));
+    try t.expectEqual(.ask, f.act(.mcp, "github/list_issues {}", .{}));
+    try t.expectEqual(.ask, f.act(.money, "broker/place_order {}", .{}));
+}
+
+test "mcp_grant_covers_the_tool_with_any_input" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    try t.expectEqualStrings("github/list_issues", grantKey(.mcp, "github/list_issues {\"repo\":\"a\"}"));
+    try f.grants.add(.mcp, "github/list_issues", 5000);
+    try t.expectEqual(.allow, f.act(.mcp, "github/list_issues {\"repo\":\"b\"}", .{}));
+    try t.expectEqual(.ask, f.act(.mcp, "github/create_issue {}", .{}));
+}
+
+test "money_ignores_grants_and_allow_rules_and_is_refused_unattended" {
+    var f: Fixture = undefined;
+    try f.init("allow money *\n");
+    defer f.deinit();
+    try f.grants.add(.money, "broker/place_order", 5000);
+    try t.expectEqual(.ask, f.act(.money, "broker/place_order {}", .{}));
+    try t.expectEqual(.deny, f.act(.money, "broker/place_order {}", .{ .scheduled = true }));
+    try t.expectEqual(.allow, f.act(.money, "broker/place_order {}", .{ .scheduled = true, .money_unattended = true }));
+}
+
+test "money_deny_rule_still_applies" {
+    var f: Fixture = undefined;
+    try f.init("deny money broker/withdraw *\n");
+    defer f.deinit();
+    try t.expectEqual(.deny, f.act(.money, "broker/withdraw {}", .{}));
+    try t.expectEqual(.deny, f.act(.money, "broker/withdraw {}", .{ .scheduled = true, .money_unattended = true }));
 }

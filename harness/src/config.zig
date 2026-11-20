@@ -12,11 +12,16 @@ pub const Config = struct {
     chat: Chat = .{},
     limits: Limits = .{},
     memory: Memory = .{},
+    agents: Agents = .{},
+    browser: Browser = .{},
+    money: Money = .{},
 
     pub const Model = struct {
         url: []const u8 = "http://127.0.0.1:8080",
         model: []const u8 = "claude-sonnet",
         memory_model: []const u8 = "claude-haiku",
+        /// Route for helpers started with `delegate`.
+        worker_model: []const u8 = "claude-haiku",
         key: []const u8 = "omnigate",
         max_tokens: u32 = 4096,
     };
@@ -42,6 +47,28 @@ pub const Config = struct {
     pub const Memory = struct {
         auto: bool = true,
         top_size: u32 = 20,
+    };
+    /// Helpers started with `delegate`.
+    pub const Agents = struct {
+        /// Most helpers running at once, in the whole process.
+        parallel: u32 = 4,
+        steps: u32 = 12,
+        /// Input tokens one helper may use, summed over its calls.
+        tokens: u32 = 150000,
+        answer_bytes: u32 = 4000,
+    };
+    pub const Browser = struct {
+        /// Chrome or Chromium; empty: look in the usual places.
+        path: []const u8 = "",
+        seconds: u32 = 30,
+    };
+    /// For MCP tools listed under `money =` in mcp.ini. Caps are in the
+    /// units of the tool's amount field; 0 means no cap.
+    pub const Money = struct {
+        max_per_call: u32 = 0,
+        max_per_day: u32 = 0,
+        /// Money calls in scheduled runs, without asking, inside the caps.
+        scheduled: bool = false,
     };
 };
 
@@ -287,6 +314,7 @@ pub const defaults_ini =
     \\url = http://127.0.0.1:8080        ; omnigate
     \\model = claude-sonnet               ; omnigate route for the agent
     \\memory_model = claude-haiku         ; omnigate route for writing memories
+    \\worker_model = claude-haiku         ; omnigate route for helpers (delegate)
     \\key = omnigate                      ; secret holding the omnigate key
     \\max_tokens = 4096
     \\
@@ -311,6 +339,21 @@ pub const defaults_ini =
     \\[memory]
     \\auto = on
     \\top_size = 20
+    \\
+    \\[agents]                            ; helpers started with delegate
+    \\parallel = 4                        ; most running at once
+    \\steps = 12                          ; model calls per helper
+    \\tokens = 150000                     ; input tokens per helper
+    \\answer_bytes = 4000
+    \\
+    \\[browser]
+    \\; path = /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+    \\seconds = 30
+    \\
+    \\[money]                             ; MCP tools listed under money = in mcp.ini
+    \\max_per_call = 0                    ; in the tool's amount units; 0 = no cap
+    \\max_per_day = 0
+    \\scheduled = off                     ; on: scheduled runs may move money, within the caps
     \\
 ;
 
@@ -488,4 +531,25 @@ test "tasks_parse_at_every_days_and_refuse_every_under_5m" {
     try t.expectError(error.BadConfig, parseTasks(a, "[x]\nat = 07:00\nevery = 5m\ndo = y"));
     try t.expectError(error.BadConfig, parseTasks(a, "[x]\ndo = y"));
     try t.expectError(error.BadConfig, parseTasks(a, "[x]\nat = 07:00\ndays = someday\ndo = y"));
+}
+
+test "agents_browser_and_money_sections" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const d = try parse(arena.allocator(), "");
+    try t.expectEqualStrings("claude-haiku", d.model.worker_model);
+    try t.expectEqual(4, d.agents.parallel);
+    try t.expectEqual(12, d.agents.steps);
+    try t.expectEqual(150000, d.agents.tokens);
+    try t.expectEqual(4000, d.agents.answer_bytes);
+    try t.expectEqual(0, d.money.max_per_call);
+    try t.expect(!d.money.scheduled);
+    const c = try parse(arena.allocator(), "[model]\nworker_model = tiny\n[agents]\nparallel = 2\n[browser]\npath = /opt/chrome\n[money]\nmax_per_call = 100\nmax_per_day = 500\nscheduled = on\n");
+    try t.expectEqualStrings("tiny", c.model.worker_model);
+    try t.expectEqual(2, c.agents.parallel);
+    try t.expectEqualStrings("/opt/chrome", c.browser.path);
+    try t.expectEqual(100, c.money.max_per_call);
+    try t.expectEqual(500, c.money.max_per_day);
+    try t.expect(c.money.scheduled);
+    _ = try parse(arena.allocator(), defaults_ini);
 }

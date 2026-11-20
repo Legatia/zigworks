@@ -52,9 +52,12 @@ pub fn mainArg(arena: std.mem.Allocator, tool: gate.Tool, input_json: []const u8
     const key = switch (tool) {
         .shell => "command",
         .read_file, .write_file => "path",
-        .fetch => "url",
+        .fetch, .browse => "url",
         .search, .recall => "query",
         .remember => "text",
+        .skill, .skill_save => "name",
+        // the agent builds these arguments itself
+        .delegate, .mcp, .money => return error.NotHere,
     };
     return jv.str(jv.get(v, key)) orelse error.BadInput;
 }
@@ -91,7 +94,7 @@ fn runRaw(env: Env, arena: std.mem.Allocator, tool: gate.Tool, input_json: []con
         },
         .fetch => fetch(env, arena, arg),
         .search => search(env, arena, arg),
-        .recall, .remember => error.NotHere,
+        .recall, .remember, .browse, .delegate, .skill, .skill_save, .mcp, .money => error.NotHere,
     };
 }
 
