@@ -227,9 +227,26 @@ pub const McpTool = struct {
     server: *mcp.Server,
     tool: []const u8,
     money: bool,
-    /// The input field holding the amount, for money tools.
+    /// The input field holding the amount, for money tools; empty: the
+    /// tool moves no amount (like cancelling an order).
     amount: []const u8,
 };
+
+/// The amount field of one tool from mcp.ini's `amount =`: one field for
+/// all money tools ("notional_usd"), or per tool
+/// ("place_order:notional_usd, cancel_order:none").
+pub fn amountField(spec: []const u8, tool: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, spec, ':') == null) return std.mem.trim(u8, spec, " ");
+    var it = std.mem.splitScalar(u8, spec, ',');
+    while (it.next()) |item| {
+        const colon = std.mem.indexOfScalar(u8, item, ':') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, item[0..colon], " "), tool)) continue;
+        const field = std.mem.trim(u8, item[colon + 1 ..], " ");
+        return if (std.mem.eql(u8, field, "none")) "" else field;
+    }
+    // not listed: an amount is required, under a name that cannot match
+    return "(not set in mcp.ini)";
+}
 
 pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, money: []const []const u8, amount: []const u8) ![]McpTool {
     var out: std.ArrayList(McpTool) = .empty;
@@ -241,7 +258,7 @@ pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, money: []const []const
         const name = try std.fmt.allocPrint(arena, "{s}__{s}", .{ tl.server, tl.name });
         if (name.len > 64) continue;
         const desc = if (is_money) try std.fmt.allocPrint(arena, "{s} (Moves money: the owner approves every call.)", .{tl.description}) else tl.description;
-        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = amount });
+        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = amountField(amount, tl.name) });
     }
     return out.items;
 }
@@ -620,7 +637,10 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
         }
     }
     try r.log.write(.gate, r.private, .{ .run = r.label, .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
-    if (action != .allow) return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+    if (action != .allow) {
+        if (tool == .money) releaseMoney(r, now_s, amount);
+        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+    }
 
     const out: tools.Output = switch (tool) {
         .recall => blk: {
@@ -692,41 +712,56 @@ fn moneyDay(r: *const Run, now_s: i64) i64 {
     return @divFloor(now_s + @as(i64, r.utc_offset) * 60, 86400);
 }
 
-/// Why a money call is refused before anyone is asked, or null.
+/// Why a money call is refused before anyone is asked, or null. When it
+/// passes, its amount is already counted in today's total (checked and
+/// counted under one lock, so two runs cannot both pass the same cap);
+/// `releaseMoney` takes it back if the call is not made.
 fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []const u8, now_s: i64, amount: *f64) ?[]const u8 {
     const capped = r.money.max_per_call > 0 or r.money.max_per_day > 0;
-    const got = amountOf(a, input_json, m.amount);
-    if (got) |x| {
-        if (x < 0 or std.math.isNan(x)) return "the amount is not a positive number";
-        amount.* = x;
-    } else if (capped) {
-        return std.fmt.allocPrint(a, "no amount in the field \"{s}\", so the caps cannot be checked", .{m.amount}) catch "no amount";
+    if (r.scheduled and r.money.scheduled and !capped)
+        return "money in scheduled runs needs max_per_call or max_per_day in [money]";
+    if (m.amount.len > 0) {
+        if (amountOf(a, input_json, m.amount)) |x| {
+            if (x < 0 or std.math.isNan(x) or std.math.isInf(x)) return "the amount is not a positive number";
+            amount.* = x;
+        } else if (capped) {
+            return std.fmt.allocPrint(a, "no amount in the field \"{s}\", so the caps cannot be checked", .{m.amount}) catch "no amount";
+        }
     }
     if (r.money.max_per_call > 0 and amount.* > @as(f64, @floatFromInt(r.money.max_per_call)))
         return std.fmt.allocPrint(a, "{d} is over the cap of {d} per call", .{ amount.*, r.money.max_per_call }) catch "over the cap per call";
-    if (r.money.max_per_day > 0) {
-        const l = r.money_ledger orelse return "no record of today's total";
-        l.mutex.lockUncancelable(r.io);
-        defer l.mutex.unlock(r.io);
-        const spent = l.spent(moneyDay(r, now_s));
-        if (spent + amount.* > @as(f64, @floatFromInt(r.money.max_per_day)))
-            return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount.*, r.money.max_per_day, spent }) catch "over the cap per day";
-    }
+    const l = r.money_ledger orelse return if (r.money.max_per_day > 0) "no record of today's total" else null;
+    l.mutex.lockUncancelable(r.io);
+    defer l.mutex.unlock(r.io);
+    const day = moneyDay(r, now_s);
+    const spent = l.spent(day);
+    if (r.money.max_per_day > 0 and spent + amount.* > @as(f64, @floatFromInt(r.money.max_per_day)))
+        return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount.*, r.money.max_per_day, spent }) catch "over the cap per day";
+    l.add(r.io, day, amount.*);
     return null;
 }
 
+/// Takes back an amount counted by `moneyCheck` for a call not made.
+fn releaseMoney(r: *Run, now_s: i64, amount: f64) void {
+    const l = r.money_ledger orelse return;
+    if (amount == 0) return;
+    l.mutex.lockUncancelable(r.io);
+    defer l.mutex.unlock(r.io);
+    l.add(r.io, moneyDay(r, now_s), -amount);
+}
+
 fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, amount: f64) !tools.Output {
-    if (m.money and r.dry_run) return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
+    if (m.money and r.dry_run) {
+        releaseMoney(r, r.now(), amount);
+        return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
+    }
     const timeout_ms: u32 = @intCast(@min(@as(u64, r.limits.turn_seconds) * 1000, std.math.maxInt(u32)));
     const res = m.server.call(a, m.tool, input_json, r.env.stop, timeout_ms, r.env.tool_output_bytes) catch |e|
         return .{ .text = try std.fmt.allocPrint(a, "failed: {s}", .{@errorName(e)}), .is_error = true };
+    // a money call that was sent stays counted whatever came back: an
+    // error, a timeout or /stop does not prove the order was not placed
     var sc = try scrub.Scrubber.init(a, r.env.secrets);
     const text = try sc.scrubAlloc(a, res.text);
-    if (m.money and !res.is_error) if (r.money_ledger) |l| {
-        l.mutex.lockUncancelable(r.io);
-        defer l.mutex.unlock(r.io);
-        l.add(r.io, moneyDay(r, r.now()), amount);
-    };
     return .{ .text = text, .is_error = res.is_error };
 }
 
@@ -932,6 +967,7 @@ const Fix = struct {
     last_allow_day: bool = false,
     mcp_tools: []const McpTool = &.{},
     ledger: MoneyLedger = .{},
+    ledger_at_ask: f64 = -1,
     in_flight: std.atomic.Value(u32) = .init(0),
     max_in_flight: std.atomic.Value(u32) = .init(0),
 
@@ -955,6 +991,7 @@ const Fix = struct {
         f.last_allow_day = false;
         f.mcp_tools = &.{};
         f.ledger = .{};
+        f.ledger_at_ask = -1;
         f.in_flight = .init(0);
         f.max_in_flight = .init(0);
         f.conv = .init(t.allocator);
@@ -976,6 +1013,7 @@ const Fix = struct {
         _ = what;
         const f: *Fix = @ptrCast(@alignCast(ctx));
         f.last_allow_day = allow_day;
+        f.ledger_at_ask = f.ledger.total;
         const now_in = f.in_flight.fetchAdd(1, .acq_rel) + 1;
         _ = f.max_in_flight.fetchMax(now_in, .acq_rel);
         if (f.ask_ms > 0) t.io.sleep(.fromMilliseconds(f.ask_ms), .awake) catch {};
@@ -1265,7 +1303,7 @@ fn withMcp(f: *Fix, money: bool) !*mcp.Server {
         .home = "/tmp",
         .secret_values = &.{},
     });
-    f.mcp_tools = try mcpTools(a, s, if (money) &.{"echo"} else &.{}, "amount");
+    f.mcp_tools = try mcpTools(a, s, if (money) &.{ "echo", "fail" } else &.{}, "amount");
     f.run.mcp = f.mcp_tools;
     f.run.money_ledger = &f.ledger;
     return s;
@@ -1390,4 +1428,68 @@ test "helpers_never_get_money_tools" {
     const r = try f.say("go");
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "fake__echo") == null);
+}
+
+test "money_is_reserved_while_asked_and_released_when_denied" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.money = .{ .max_per_day = 100 };
+    f.answer = .deny;
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":30}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(@as(f64, 30), f.ledger_at_ask);
+    try t.expectEqual(@as(f64, 0), f.ledger.total);
+}
+
+test "money_call_that_fails_still_counts" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "fake__fail", "{\"amount\":7}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(@as(f64, 7), f.ledger.total);
+}
+
+test "unattended_money_needs_a_cap" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.scheduled = true;
+    f.run.asker = null;
+    f.run.money = .{ .scheduled = true };
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":1}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "needs max_per_call or max_per_day") != null);
+}
+
+test "amount_field_can_differ_per_tool" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.mcp_tools = try mcpTools(f.e.arena.allocator(), s, &.{ "echo", "fail" }, "echo:amount, fail:none");
+    f.run.mcp = f.mcp_tools;
+    f.run.money = .{ .max_per_call = 10 };
+    // like cancel_order: no amount, still allowed with a cap set
+    try f.e.script(1, model.toolReply("tu_1", "fake__fail", "{}"));
+    try f.e.script(2, model.toolReply("tu_2", "fake__echo", "{\"text\":\"x\"}"));
+    try f.e.script(3, model.textReply("ok"));
+    const r = try f.say("cancel then buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "no amount in the field \\\"amount\\\"") != null);
 }

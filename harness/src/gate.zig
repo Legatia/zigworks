@@ -158,7 +158,9 @@ pub const Gate = struct {
         if (ctx.brief_source) return .{ .action = .allow, .why = "listed in briefs.ini" };
         const name = @tagName(tool);
         for (g.rules) |r| {
-            if (r.action == .deny and std.mem.eql(u8, r.tool, name) and rules.glob(r.pattern, arg))
+            // a deny on a server's MCP tools covers its money tools too
+            const same = std.mem.eql(u8, r.tool, name) or (tool == .money and std.mem.eql(u8, r.tool, "mcp"));
+            if (r.action == .deny and same and rules.glob(r.pattern, arg))
                 return .{ .action = .deny, .why = std.fmt.allocPrint(arena, "rule on line {d}", .{r.line}) catch "rule" };
         }
         if (tool == .money) {
@@ -368,4 +370,11 @@ test "money_deny_rule_still_applies" {
     defer f.deinit();
     try t.expectEqual(.deny, f.act(.money, "broker/withdraw {}", .{}));
     try t.expectEqual(.deny, f.act(.money, "broker/withdraw {}", .{ .scheduled = true, .money_unattended = true }));
+}
+
+test "deny_mcp_rule_covers_money_tools_of_that_server" {
+    var f: Fixture = undefined;
+    try f.init("deny mcp broker/*\n");
+    defer f.deinit();
+    try t.expectEqual(.deny, f.act(.money, "broker/place_order {}", .{}));
 }
