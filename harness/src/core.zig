@@ -10,6 +10,7 @@ const log_mod = @import("log.zig");
 const memory = @import("memory.zig");
 const model = @import("model.zig");
 const tools = @import("tools.zig");
+const skills = @import("skills.zig");
 const agent = @import("agent.zig");
 const brief = @import("brief.zig");
 const scrub = @import("scrub.zig");
@@ -37,6 +38,9 @@ pub const Paths = struct {
     status: []const u8,
     lock: []const u8,
     telegram: []const u8,
+    skills: []const u8,
+    mcp: []const u8,
+    money: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -66,6 +70,9 @@ pub const Paths = struct {
             .status = try j(a, &.{ state, "status" }),
             .lock = try j(a, &.{ state, "lock" }),
             .telegram = try j(a, &.{ state, "telegram" }),
+            .skills = try j(a, &.{ home, "skills" }),
+            .mcp = try j(a, &.{ home, "mcp.ini" }),
+            .money = try j(a, &.{ state, "money" }),
         };
     }
 };
@@ -73,7 +80,7 @@ pub const Paths = struct {
 /// Writes the data folder with commented defaults; existing files are kept.
 pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
     const p = try Paths.init(a, home);
-    for ([_][]const u8{ home, p.memory, p.workspace, p.state, p.log_dir }) |d| try Io.Dir.cwd().createDirPath(io, d);
+    for ([_][]const u8{ home, p.memory, p.workspace, p.state, p.log_dir, p.skills }) |d| try Io.Dir.cwd().createDirPath(io, d);
     if (builtin.os.tag != .windows) {
         // iterate: on Linux a plain open is O_PATH, and fchmod on it fails with EBADF
         var d = try Io.Dir.cwd().openDir(io, home, .{ .iterate = true });
@@ -136,6 +143,10 @@ pub const Core = struct {
     log: log_mod.Log,
     mem: memory.Store,
     lock: Io.Mutex = .init,
+    /// How many helpers run at once, across all runs.
+    helper_pool: agent.Pool = .{},
+    /// The owner is asked one question at a time.
+    ask_lock: Io.Mutex = .init,
     seen: brief.Seen,
     /// Set on close: nothing new starts.
     stop: std.atomic.Value(bool) = .init(false),
@@ -236,6 +247,8 @@ pub const Core = struct {
         c.seen = .init(gpa);
         c.seen.load(io, c.paths.seen) catch {};
         c.lock = .init;
+        c.helper_pool = .{};
+        c.ask_lock = .init;
         c.stop = .init(false);
         c.runs_mutex = .init;
         c.run_flags = .empty;
@@ -698,6 +711,18 @@ pub const Core = struct {
             .private = c.private,
             .auto_recall = c.auto_recall,
             .label = label,
+            .model_cfg = if (c.secrets.omnigate) |key| .{
+                .url = c.cfg.model.url,
+                .key = key,
+                .main = c.cfg.model.model,
+                .worker = c.cfg.model.worker_model,
+                .memory = c.cfg.model.memory_model,
+                .max_tokens = c.cfg.model.max_tokens,
+            } else null,
+            .agents = c.cfg.agents,
+            .pool = &c.helper_pool,
+            .ask_lock = &c.ask_lock,
+            .skills_dir = c.paths.skills,
         };
     }
 
@@ -983,6 +1008,7 @@ pub const Core = struct {
         \\/memory auto on|off: automatic recall
         \\/remember TEXT, /pin ID, /unpin ID, /forget ID
         \\/private on|off: no memories written while on
+        \\/skills: list saved skills, /skill rm NAME
         \\/reload: apply changed settings files
     ;
 
@@ -1072,6 +1098,24 @@ pub const Core = struct {
             return if (out.items.len > 0) out.items else "No scheduled tasks. Add one with /task add NAME | every 15m | instruction";
         }
         if (eql(u8, cmd, "/task")) return c.taskCommand(a, rest);
+        if (eql(u8, cmd, "/skills")) {
+            const list = try skills.list(a, c.io, c.paths.skills);
+            if (list.len == 0) return "No skills yet. The agent saves one (with your approval) when it learns how to do a kind of task.";
+            var out: std.ArrayList(u8) = .empty;
+            for (list) |sk| try out.print(a, "{s}: {s}\n", .{ sk.name, sk.description });
+            return out.items;
+        }
+        if (eql(u8, cmd, "/skill")) {
+            if (std.mem.startsWith(u8, rest, "rm ")) {
+                const name = std.mem.trim(u8, rest[3..], " ");
+                if (try skills.remove(c.io, c.paths.skills, name)) {
+                    try c.log.write(.config, false, .{ .event = "skill removed", .name = name });
+                    return "Removed.";
+                }
+                return "No such skill.";
+            }
+            return "Use /skills or /skill rm NAME.";
+        }
         return "Unknown command. Send /help for the list.";
     }
 
@@ -1735,4 +1779,19 @@ test "new_clears_the_conversation" {
     f.core.chatTurn("second message");
     const req = try f.e.request(2);
     try t.expect(std.mem.indexOf(u8, req, "first message") == null);
+}
+
+test "skills_command_lists_saved_skills_and_chat_offers_helpers" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try skills.save(t.io, f.core.paths.skills, "weekly-report", "How to write the weekly report", "Steps.");
+    try f.core.handleText("/skills");
+    try f.rec.waitFor("weekly-report: How to write the weekly report");
+    try f.e.script(1, model.textReply("ok"));
+    f.core.chatTurn("hello");
+    const req = try f.e.request(1);
+    try t.expect(std.mem.indexOf(u8, req, "\"name\":\"delegate\"") != null);
+    try t.expect(std.mem.indexOf(u8, req, "\"name\":\"skill\"") != null);
+    try t.expect(std.mem.indexOf(u8, req, "weekly-report") != null);
 }
