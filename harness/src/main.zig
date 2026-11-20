@@ -629,4 +629,5 @@ test {
     _ = @import("store.zig");
     _ = @import("scrub.zig");
     _ = @import("skills.zig");
+    _ = @import("mcp.zig");
 }
