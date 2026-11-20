@@ -61,13 +61,14 @@ serve HANGS --fault hang
 serve SLOW --delay 5
 # nothing listens here
 DEAD=http://127.0.0.1:1
-# What a closed port looks like here. Normally the connection is refused at
-# once. Where nothing answers at all (WSL with mirrored networking), llmcheck
-# rightly says so after its timeout; the checks below then ask for a short
-# one and expect that message.
+# What a closed port looks like here. Normally the connection is refused:
+# at once on Linux and macOS, after about two seconds on Windows. Where
+# nothing answers at all (WSL with mirrored networking), llmcheck rightly
+# says so after its timeout; the checks below then ask for a short one and
+# expect that message. Six seconds tell the two apart.
 DEAD_SAYS="could not connect"
 DEAD_OPTS=
-case $("$LC" probe "$DEAD" --timeout 2 2>&1) in
+case $("$LC" probe "$DEAD" --timeout 6 2>&1) in
 *"no answer within"*)
     DEAD_SAYS="no answer within 2 s"
     DEAD_OPTS="--timeout 2"
