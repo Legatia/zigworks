@@ -201,6 +201,28 @@ fn wasThere(d: *const Diff, rel: []const u8) bool {
     return info(p.z()).kind != .none;
 }
 
+/// Whether a directory holds nothing, or only directories that hold nothing.
+fn isEmptyDir(dir: [:0]const u8) bool {
+    const rc = linux.open(dir.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return true;
+    const fd: sys.fd_t = @intCast(rc);
+    defer sys.close(fd);
+    var buf: [4096]u8 align(8) = undefined;
+    while (true) {
+        const n = linux.getdents64(fd, &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS or n == 0) return true;
+        var off: usize = 0;
+        while (off < n) {
+            const ent: *align(1) linux.dirent64 = @ptrCast(&buf[off]);
+            off += ent.reclen;
+            const name = std.mem.sliceTo(@as([*:0]u8, @ptrCast(&ent.name)), 0);
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            const child = path("{s}/{s}", .{ dir, name });
+            if (info(child.z()).kind != .dir or !isEmptyDir(child.z())) return false;
+        }
+    }
+}
+
 fn diffDir(d: *Diff, dir: [:0]const u8, rel: []const u8) void {
     const rc = linux.open(dir.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return;
@@ -243,7 +265,11 @@ fn diffDir(d: *Diff, dir: [:0]const u8, rel: []const u8) void {
                 say("deleted {s}", .{shown.z()});
                 d.count += 1;
             } else if (kind == linux.S.IFDIR) {
-                if (rel.len > 0 and !wasThere(d, child.z())) {
+                // A new directory with nothing in it says little, and is
+                // what sharing a directory leaves behind (the place it
+                // was shown at): only new directories that hold something.
+                const new_dir = rel.len > 0 and !wasThere(d, child.z());
+                if (new_dir and !isEmptyDir(full.z())) {
                     say("added   {s}/", .{shown.z()});
                     d.count += 1;
                 }
@@ -254,6 +280,17 @@ fn diffDir(d: *Diff, dir: [:0]const u8, rel: []const u8) void {
             }
         }
     }
+}
+
+test "a directory with only empty directories in it is empty" {
+    const base = "/tmp/headdesk-emptytest";
+    box.removeTree(base);
+    defer box.removeTree(base);
+    box.mkdirAll(base ++ "/a/b/c");
+    try std.testing.expect(isEmptyDir(base));
+    try std.testing.expect(box.writeFile(base ++ "/a/b/f", "x"));
+    try std.testing.expect(!isEmptyDir(base));
+    try std.testing.expect(isEmptyDir(base ++ "/a/b/c"));
 }
 
 test "labels" {

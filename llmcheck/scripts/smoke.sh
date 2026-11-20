@@ -61,6 +61,18 @@ serve HANGS --fault hang
 serve SLOW --delay 5
 # nothing listens here
 DEAD=http://127.0.0.1:1
+# What a closed port looks like here. Normally the connection is refused at
+# once. Where nothing answers at all (WSL with mirrored networking), llmcheck
+# rightly says so after its timeout; the checks below then ask for a short
+# one and expect that message.
+DEAD_SAYS="could not connect"
+DEAD_OPTS=
+case $("$LC" probe "$DEAD" --timeout 2 2>&1) in
+*"no answer within"*)
+    DEAD_SAYS="no answer within 2 s"
+    DEAD_OPTS="--timeout 2"
+    ;;
+esac
 
 # ---- help, version, wrong usage ----
 expect 0 "llmcheck check URL" -- help
@@ -88,7 +100,7 @@ expect 1 "not returned as tool_calls" -- check "$LOOSE" --only tools
 expect 0 "fail=0" -- check "$LOOSE" --skip json_schema,json_object,tools,tools_stream
 expect 1 "without a word" -- check "$CUTS" --only context
 expect 1 "id=stream status=fail" -- check "$HANGS" --timeout 1 --only stream
-expect 4 "$DEAD: could not connect" -- check "$DEAD"
+expect 4 "$DEAD: $DEAD_SAYS" -- check "$DEAD" $DEAD_OPTS
 
 # the key: by option, by environment, and missing
 expect 0 "a request without the key is refused (HTTP 401)" -- check "$KEYED" --key sesame
@@ -101,7 +113,7 @@ expect 1 "HTTP 401" -- check "$KEYED" --key wrong
 # with a reference: token counts of the same conversations
 expect 0 "id=usage_match status=pass" -- check "$GOOD" --ref "$TWIN"
 expect 1 "another chat template or tokenizer" -- check "$TEMPLATE" --ref "$GOOD"
-expect 4 "$DEAD: could not connect" -- check "$GOOD" --ref "$DEAD"
+expect 4 "$DEAD: $DEAD_SAYS" -- check "$GOOD" --ref "$DEAD" $DEAD_OPTS
 # the reference has its own key; the server's is not sent to it
 expect 0 "id=usage_match status=pass" -- check "$GOOD" --ref "$KEYED" --ref-key sesame
 expect 4 "$KEYED: the reference answers HTTP 401" -- check "$GOOD" --key sesame --ref "$KEYED"
@@ -115,8 +127,8 @@ expect 1 "other weights" -- fidelity "$WEIGHTS" --ref "$GOOD"
 expect 1 "the chat template" -- fidelity "$TEMPLATE" --ref "$GOOD"
 expect 1 "fidelity group=raw prompts=8 positions=128 mean_kl=0.0000" -- fidelity "$TEMPLATE" --ref "$GOOD"
 expect 4 "verdict result=unknown" -- fidelity "$BLIND" --ref "$GOOD"
-expect 4 "$DEAD: could not connect" -- fidelity "$GOOD" --ref "$DEAD"
-expect 4 "$DEAD: could not connect" -- fidelity "$DEAD" --ref "$GOOD"
+expect 4 "$DEAD: $DEAD_SAYS" -- fidelity "$GOOD" --ref "$DEAD" $DEAD_OPTS
+expect 4 "$DEAD: $DEAD_SAYS" -- fidelity "$DEAD" --ref "$GOOD" $DEAD_OPTS
 
 expect 0 "recorded file=good.json model=fake-1 prompts=16 answered=16" -- fidelity "$GOOD" --record good.json
 [ -s good.json ] || fail "--record wrote nothing"
@@ -141,12 +153,12 @@ expect 0 "late=" -- bench "$GOOD" --requests 20 --rate 200
 expect 0 "errors=0" -- bench "$SLOW" --duration 0.5 --concurrency 2 --max-tokens 8
 expect 0 "requests=6 errors=0" -- bench "$KEYED" --key sesame --requests 6 --concurrency 2
 expect 4 "HTTP 401" -- bench "$KEYED" --requests 6 --concurrency 2
-expect 4 "$DEAD: could not connect" -- bench "$DEAD" --requests 4
+expect 4 "$DEAD: $DEAD_SAYS" -- bench "$DEAD" --requests 4 $DEAD_OPTS
 
 # ---- probe ----
 expect 0 "probe status=ok time=20" -- probe "$GOOD"
 expect 0 '"status":"ok"' -- probe "$GOOD" --json
-expect 4 "probe status=down" -- probe "$DEAD"
+expect 4 "probe status=down" -- probe "$DEAD" $DEAD_OPTS
 expect 1 "probe status=fail" -- probe "$HANGS" --timeout 1
 expect 1 "models: HTTP 401" -- probe "$KEYED"
 expect 0 "drift_kl=0.0000" -- probe "$TWIN" --baseline good.json

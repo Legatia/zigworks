@@ -89,7 +89,8 @@ fn analyzeBlock(p: []const f64, binw: f64, scratch: []f64, strong_db: f64) Block
             const kf: f64 = @floatFromInt(k);
             if (f * kf >= @as(f64, @floatFromInt(rate_lo)) * 0.47) break;
             const pr = prominence(p, binw, f * kf, scratch);
-            if (pr.db >= 10) {
+            // a line under the floor is the rounding's, not a harmonic
+            if (pr.db >= 10 and pr.power >= min_power) {
                 mask |= @as(u32, 1) << @intCast(k - 1);
                 power += pr.power;
                 if (k <= 3 and pr.db >= strong_db) strong = true;
@@ -115,7 +116,7 @@ fn knownHum(p: []const f64, binw: f64, freq: f64, mask: u32, scratch: []f64) Blo
     for (1..max_harmonics + 1) |k| {
         if (mask & (@as(u32, 1) << @intCast(k - 1)) == 0) continue;
         const pr = prominence(p, binw, freq * @as(f64, @floatFromInt(k)), scratch);
-        if (pr.db >= 6) {
+        if (pr.db >= 6 and pr.power >= min_power) {
             found |= @as(u32, 1) << @intCast(k - 1);
             power += pr.power;
         }
@@ -321,6 +322,8 @@ test "rounding_lines_of_a_clean_tone_are_not_hum" {
     try testing.expectApproxEqAbs(@as(f64, 50), hs[0].freq, 0.2);
     try testing.expectApproxEqAbs(@as(f64, 2), hs[0].end, 0.01);
     try testing.expect(hs[0].level > -30 and hs[0].level < -22);
+    // one sine: the fundamental and nothing else
+    try testing.expectEqual(@as(u32, 1), hs[0].harmonics());
 }
 
 test "remove_takes_the_hum_out_and_leaves_the_voice" {
