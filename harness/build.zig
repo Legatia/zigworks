@@ -16,17 +16,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = target.result.os.tag == .macos,
     });
     mod.addOptions("build_options", options);
-    switch (target.result.os.tag) {
-        .windows => {
-            mod.linkSystemLibrary("ws2_32", .{});
-            mod.linkSystemLibrary("advapi32", .{});
-        },
-        .macos => {
-            mod.linkFramework("Security", .{});
-            mod.linkFramework("CoreFoundation", .{});
-        },
-        else => {},
-    }
+    linkSystem(mod, target);
     const exe = b.addExecutable(.{ .name = "harness", .root_module = mod });
     b.installArtifact(exe);
 
@@ -44,7 +34,20 @@ pub fn build(b: *std.Build) void {
     run.addPassthruArgs();
     b.step("run", "Run harness").dependOn(&run.step);
 
-    const unit = b.addTest(.{ .root_module = mod });
+    // The unit tests get their own module so they can know where harness-fake
+    // is (the MCP tests start it as a server).
+    const test_options = b.addOptions();
+    test_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    test_options.addOptionPath("fake_path", fake.getEmittedBin());
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = target.result.os.tag == .macos,
+    });
+    test_mod.addOptions("build_options", test_options);
+    linkSystem(test_mod, target);
+    const unit = b.addTest(.{ .root_module = test_mod });
     const run_unit = b.addRunArtifact(unit);
 
     // The CLI end to end against a local stand-in upstream; no real keys.
@@ -60,4 +63,18 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests and the CLI smoke tests");
     test_step.dependOn(&run_unit.step);
     test_step.dependOn(&smoke.step);
+}
+
+fn linkSystem(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    switch (target.result.os.tag) {
+        .windows => {
+            mod.linkSystemLibrary("ws2_32", .{});
+            mod.linkSystemLibrary("advapi32", .{});
+        },
+        .macos => {
+            mod.linkFramework("Security", .{});
+            mod.linkFramework("CoreFoundation", .{});
+        },
+        else => {},
+    }
 }

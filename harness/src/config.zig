@@ -46,11 +46,11 @@ pub const Config = struct {
 };
 
 /// One `key = value` line, with the section it is in.
-const Line = struct { section: []const u8, key: []const u8, value: []const u8, n: usize };
+pub const Line = struct { section: []const u8, key: []const u8, value: []const u8, n: usize };
 
 /// Splits INI text into its lines; section headers become the `section` of
 /// what follows. Lines that are neither are an error.
-fn lines(arena: std.mem.Allocator, text: []const u8) Error![]Line {
+pub fn lines(arena: std.mem.Allocator, text: []const u8) Error![]Line {
     var out: std.ArrayList(Line) = .empty;
     var section: []const u8 = "";
     var it = std.mem.splitScalar(u8, text, '\n');

@@ -1,14 +1,17 @@
 //! harness-fake: stand-ins for omnigate, the Telegram Bot API, feeds and
 //! search, for the end-to-end tests. `harness-fake --dir DIR [--port N]`
-//! prints `port N` and serves until killed.
+//! prints `port N` and serves until killed. `harness-fake --mcp` is an MCP
+//! server on stdio instead (see fake_mcp.zig).
 const std = @import("std");
 const fake = @import("fake.zig");
+const fake_mcp = @import("fake_mcp.zig");
 
 pub fn main(init: std.process.Init) u8 {
     const io = init.io;
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return 2;
     var dir: ?[]const u8 = null;
     var port: u16 = 0;
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--mcp")) return fake_mcp.run(io, init.gpa, init.environ_map);
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--dir") and i + 1 < args.len) {
