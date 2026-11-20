@@ -141,7 +141,7 @@ secret = GITHUB_PERSONAL_ACCESS_TOKEN:github   ; env var : stored secret
 command = /opt/broker-mcp/server
 secret = BROKER_KEY:broker
 money = place_order, cancel_order              ; tools that move money
-amount = notional_usd                          ; the input field with the amount
+amount = place_order:notional_usd, cancel_order:none   ; or one field for all: amount = notional_usd
 ```
 
 Servers are started when harness starts and on `/reload`, in the workspace
@@ -157,8 +157,12 @@ Tools listed under `money =` are asked every time, with no "Allow 24 h"
 button; no grant or `allow` rule lifts that (a `deny` rule still applies).
 Helpers never get them. `[money] max_per_call` and `max_per_day` are hard
 caps checked before you are asked; with a cap set, a call without its
-amount is refused. Scheduled runs never move money unless you set
-`[money] scheduled = on`, and then only inside the caps. `/dryrun on`
+amount is refused (a tool listed as `:none` moves no amount). An amount
+counts toward the day from the moment you are asked, so two runs cannot
+both pass the same cap; it is taken back only if the call is not made. A
+call that was sent stays counted even if it failed or timed out, since
+that does not prove nothing happened. Scheduled runs never move money
+unless you set `[money] scheduled = on` and at least one cap. `/dryrun on`
 stops money calls from being made: the agent is told what would have been
 sent.
 
@@ -264,8 +268,12 @@ CLI: `init`, `secret add|rm|list`, `pair`, `run`, `chat`, `brief [NAME]`,
 - **MCP servers and the browser** run as you, like shell commands. An MCP
   server is a program you chose to run; harness limits its environment,
   not what it does. The browser keeps harness's environment.
-- **Money caps** are in whole units of the tool's amount field and trust
-  the tool to mean what that field says.
+- **Money caps** are whole numbers in the units of the tools' amount
+  fields, one day total across all servers: keep all money tools in one
+  unit (say USD). They trust the tool to mean what that field says.
+- **MCP servers start one after another** when harness starts (up to 20 s
+  each), and a secret added for a new server needs a restart, not just
+  `/reload`.
 - **One owner, one chat.** Messages sent while the agent works are queued.
 
 Not in 0.2.0: the Agent Client Protocol server, desktop use (headdesk), a

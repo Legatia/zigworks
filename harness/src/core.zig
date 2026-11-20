@@ -809,8 +809,11 @@ pub const Core = struct {
             }
             var diag: mcp.Diag = .{};
             const srv = mcp.Server.start(c.gpa, c.io, sc, .{ .workspace = c.workspace, .path_var = c.path_var, .home = c.home_var, .secret_values = values, .diag = &diag }) catch |e| {
-                note.print(a, "{s}: did not start ({s}) {s}\n", .{ sc.name, @errorName(e), util.cut(diag.text(), 200) }) catch {};
-                c.log.write(.config, false, .{ .event = "mcp failed", .server = sc.name, .why = @errorName(e), .detail = diag.text() }) catch {};
+                // a server may print its key when it fails: mask before keeping
+                var sc_mask = scrub.Scrubber.init(a, c.secret_list) catch return;
+                const detail = sc_mask.scrubAlloc(a, diag.text()) catch "";
+                note.print(a, "{s}: did not start ({s}) {s}\n", .{ sc.name, @errorName(e), util.cut(detail, 200) }) catch {};
+                c.log.write(.config, false, .{ .event = "mcp failed", .server = sc.name, .why = @errorName(e), .detail = detail }) catch {};
                 continue;
             };
             c.mcp_servers.append(c.gpa, srv) catch {
@@ -865,7 +868,7 @@ pub const Core = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var transcript: std.ArrayList(u8) = .empty;
-        for (c.conv.turns.items) |tn| if (!tn.private) for (tn.messages.items) |m| for (m.blocks) |b| if (b == .text) {
+        for (c.conv.turns.items) |tn| if (!tn.private) for (tn.messages.items) |m| for (m.blocks) |b| if (b == .text and !std.mem.startsWith(u8, b.text, agent.context_mark)) {
             try transcript.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(b.text, 2000) });
         };
         if (transcript.items.len == 0) return;
@@ -1934,4 +1937,17 @@ test "mcp_servers_start_from_mcp_ini_and_dryrun_switch" {
     const req = try f.e.request(1);
     try t.expect(std.mem.indexOf(u8, req, "\"name\":\"fake__echo\"") != null);
     try t.expect(std.mem.indexOf(u8, req, "Moves money") != null);
+}
+
+test "mcp_start_errors_are_masked_in_the_log" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const key = f.core.secrets.omnigate.?;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(f.e.arena.allocator(), "[leaky]\ncommand = /bin/sh -c \"echo auth failed for {s} >&2; exit 1\"\n", .{key}) });
+    _ = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "leaky: did not start") != null);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, key) == null);
+    const log_text = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, f.e.arena.allocator(), .unlimited);
+    try t.expect(std.mem.indexOf(u8, log_text, key) == null);
 }

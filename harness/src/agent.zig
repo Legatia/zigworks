@@ -163,6 +163,8 @@ pub const Run = struct {
     /// Input tokens this run may use; 0: no limit.
     token_cap: u64 = 0,
     skills_dir: []const u8 = "",
+    /// When the running turn must end; helpers get what is left of it.
+    deadline_s: i64 = 0,
     /// Tools of the MCP servers that are running.
     mcp: []const McpTool = &.{},
     money: config.Config.Money = .{},
@@ -406,6 +408,10 @@ const delegate_guide =
     \\Use `delegate` to hand independent pieces of work to helpers that run at the same time, each with a clean context: research across several sources, comparisons, anything that splits into parts. Each task must stand alone and include every detail the helper needs; you get back each helper's short answer, not its working.
 ;
 
+/// Starts the per-turn context block kept with the owner's message (time,
+/// recalled items); readers of the conversation skip it.
+pub const context_mark = "[context]";
+
 /// The system prompt in two parts: `stable` stays the same from call to
 /// call (it is marked for the prompt cache), `changing` is the rest.
 pub const Prompt = struct { stable: []const u8, changing: []const u8 };
@@ -439,6 +445,7 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
         try out.print(arena, "- {s}\n", .{it.body});
     };
     if (summary) |sm| try out.print(arena, "\nSummary of the earlier conversation:\n{s}\n", .{sm});
+    if (dropped > 0 and summary == null) try out.print(arena, "\n{d} earlier turns of this conversation were dropped to keep it short.\n", .{dropped});
     const stable = out.items;
 
     out = .empty;
@@ -450,7 +457,6 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
         try out.appendSlice(arena, "\nPossibly relevant from earlier:\n");
         for (recalled.found) |it| try out.print(arena, "- {s}\n", .{it.body});
     }
-    if (dropped > 0 and summary == null) try out.print(arena, "\n{d} earlier turns of this conversation were dropped to keep it short.\n", .{dropped});
     return .{ .stable = stable, .changing = out.items };
 }
 
@@ -478,7 +484,18 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     // which the model API refuses from then on: drop it whole
     errdefer conv.dropLast();
     tn.private = r.private;
-    try keep(tn, .{ .role = .user, .blocks = &.{.{ .text = user_text }} });
+    // the time and what memory found go with the message, not the system
+    // prompt: the system prompt and every earlier turn then stay the same
+    // from call to call, and the prompt cache holds across turns
+    const context = blk: {
+        r.lock.lockUncancelable(r.io);
+        defer r.lock.unlock(r.io);
+        const recalled = try r.mem.recall(a, user_text, started, r.top_size, r.auto_recall);
+        const p = try systemParts(a, r, recalled, conv.summary, conv.dropped, started);
+        break :blk try std.fmt.allocPrint(a, "{s}{s}", .{ context_mark, p.changing });
+    };
+    try keep(tn, .{ .role = .user, .blocks = &.{ .{ .text = context }, .{ .text = user_text } } });
+    r.deadline_s = deadline;
 
     var result: TurnResult = .{ .text = "" };
     var used_tokens: u64 = 0;
@@ -506,11 +523,11 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
         const system = blk: {
             r.lock.lockUncancelable(r.io);
             defer r.lock.unlock(r.io);
-            const recalled = try r.mem.recall(a, user_text, r.now(), r.top_size, r.auto_recall);
-            break :blk try systemParts(a, r, recalled, conv.summary, conv.dropped, r.now());
+            const recalled = try r.mem.recall(a, user_text, started, r.top_size, r.auto_recall);
+            break :blk try systemParts(a, r, recalled, conv.summary, conv.dropped, started);
         };
         const msgs = try conv.messages(a);
-        const reply = r.client.sendParts(a, system.stable, system.changing, msgs, defs) catch |e| {
+        const reply = r.client.sendParts(a, system.stable, "", msgs, defs) catch |e| {
             const why: []const u8 = switch (e) {
                 error.BudgetSpent => "Model budget used up.",
                 error.RateLimited => "The model is rate limited; try again later.",
@@ -820,7 +837,8 @@ fn delegate(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
     const tasks = try parseTasks(a, input_json);
     var cache = PageCache.init(r.gpa);
     defer cache.deinit();
-    const deadline = r.now() + r.limits.turn_seconds;
+    // what is left of the turn that asked, not a new turn's worth
+    const deadline = if (r.deadline_s > 0) r.deadline_s else r.now() + r.limits.turn_seconds;
     const hs = try a.alloc(Helper, tasks.len);
     const threads = try a.alloc(?std.Thread, tasks.len);
     for (tasks, 0..) |task, i| {
@@ -929,8 +947,13 @@ fn summarise(r: *Run, conv: *Conversation, n: usize) ![]u8 {
     if (conv.summary) |old| try text.print(a, "Earlier summary:\n{s}\n\n", .{old});
     for (conv.turns.items[0..n]) |tn| for (tn.messages.items) |m| for (m.blocks) |b| {
         if (text.items.len > 60000) break;
+        // private turns never leave their turn: not into memory, not here
+        if (tn.private) {
+            if (m.role == .user and b == .text and !std.mem.startsWith(u8, b.text, context_mark)) try text.appendSlice(a, "(a private part of the conversation, left out)\n");
+            continue;
+        }
         switch (b) {
-            .text => |x| try text.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(x, 2000) }),
+            .text => |x| if (!std.mem.startsWith(u8, x, context_mark)) try text.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(x, 2000) }),
             .tool_use => |u| try text.print(a, "(tool {s}: {s})\n", .{ u.name, util.cut(u.input_json, 300) }),
             .tool_result => |x| try text.print(a, "(result: {s})\n", .{util.cut(x.content, 500)}),
         }
@@ -1273,8 +1296,8 @@ test "long_conversation_is_summarised_not_dropped" {
     try f.init("");
     defer f.deinit();
     try withHelpers(&f);
-    // each turn is about 121 bytes: five fit, the sixth crosses the limit
-    f.run.limits.conversation_bytes = 700;
+    // each turn is about 180 bytes with its context: five fit, the sixth crosses
+    f.run.limits.conversation_bytes = 1000;
     for (1..9) |n| try f.e.script(@intCast(n), model.textReply("It will be sunny and mild with light wind in the afternoon."));
     for (0..6) |_| {
         const r = try f.say("tell me about the weather in the mountains this weekend please");
@@ -1492,4 +1515,63 @@ test "amount_field_can_differ_per_tool" {
     freeResult(&f.run, r);
     try t.expectEqual(1, f.asked);
     try t.expect(std.mem.indexOf(u8, try f.e.request(3), "no amount in the field \\\"amount\\\"") != null);
+}
+
+test "private_turns_are_left_out_of_summaries" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    f.run.limits.conversation_bytes = 1000;
+    for (1..9) |n| try f.e.script(@intCast(n), model.textReply("It will be sunny and mild with light wind in the afternoon."));
+    for (0..6) |i| {
+        f.run.private = i < 2;
+        const r = try f.say(if (i < 2) "my zebra-secret is the code for the door at home ok" else "tell me about the weather in the mountains this weekend please");
+        freeResult(&f.run, r);
+    }
+    try t.expect(f.conv.summary != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(7), "zebra-secret") == null);
+}
+
+test "system_prompt_is_the_same_across_turns" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.e.script(1, model.textReply("one"));
+    try f.e.script(2, model.textReply("two"));
+    var r = try f.say("first question");
+    freeResult(&f.run, r);
+    r = try f.say("second question");
+    freeResult(&f.run, r);
+    const a = f.e.arena.allocator();
+    const v1 = jv.parse(a, try f.e.request(1)).?;
+    const v2 = jv.parse(a, try f.e.request(2)).?;
+    const s1 = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(jv.at(v1, &.{ "body", "system" }).?, .{})});
+    const s2 = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(jv.at(v2, &.{ "body", "system" }).?, .{})});
+    try t.expectEqualStrings(s1, s2);
+    try t.expect(std.mem.indexOf(u8, s1, "Now:") == null);
+    // the time goes with the newest message instead, and is not kept
+    const msgs = jv.arr(jv.at(v2, &.{ "body", "messages" })).?;
+    const last = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(msgs[msgs.len - 1], .{})});
+    try t.expect(std.mem.indexOf(u8, last, "Now:") != null);
+    // earlier turns are sent with the same text as before, so the cache holds
+    const old = jv.arr(jv.get(jv.arr(jv.at(v1, &.{ "body", "messages" })).?[0], "content")).?;
+    const now = jv.arr(jv.get(msgs[0], "content")).?;
+    try t.expectEqual(old.len, now.len);
+    for (old, now) |x, y| try t.expectEqualStrings(jv.str(jv.get(x, "text")).?, jv.str(jv.get(y, "text")).?);
+}
+
+test "helpers_get_the_rest_of_the_turn_not_a_new_one" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    f.run.limits.turn_seconds = 3;
+    try f.e.script(1, "{\"delay_ms\":2000,\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"delegate\",\"input\":{\"tasks\":[{\"task\":\"dig\",\"tools\":[\"recall\"]}]}}],\"stop_reason\":\"tool_use\"}");
+    try f.e.script(2, "{\"delay_ms\":1500,\"content\":[{\"type\":\"tool_use\",\"id\":\"w1\",\"name\":\"recall\",\"input\":{\"query\":\"x\"}}],\"stop_reason\":\"tool_use\"}");
+    try f.e.script(3, model.textReply("helper had more time than the turn"));
+    try f.e.script(4, model.textReply("parent"));
+    const r = try f.say("dig");
+    freeResult(&f.run, r);
+    try t.expect(f.e.server.modelRequests() <= 2);
 }
