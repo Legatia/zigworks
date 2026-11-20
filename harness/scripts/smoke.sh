@@ -4,7 +4,8 @@
 # Usage: smoke.sh HARNESS HARNESS_FAKE
 set -u
 H=$1
-F=$2
+# absolute: MCP servers start in the workspace folder
+F=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
 T=$(mktemp -d)
 FPID=""
 RPID=""
@@ -66,7 +67,8 @@ api = $URL
 [limits]
 approval_seconds = 30
 EOF
-printf 'allow shell sleep *\n' >"$HARNESS_HOME/rules"
+printf 'allow shell sleep *\nallow mcp fake/echo *\n' >"$HARNESS_HOME/rules"
+printf '[fake]\ncommand = "%s" --mcp\n' "$F" >"$HARNESS_HOME/mcp.ini"
 chmod 600 "$HARNESS_HOME/config.ini" "$HARNESS_HOME/rules"
 printf 'og-smoke-key-123\n' | "$H" secret add omnigate --stdin 2>/dev/null
 printf '111:telegram-smoke-token\n' | "$H" secret add telegram --stdin 2>/dev/null
@@ -141,6 +143,22 @@ fi
 say "/remember I prefer short briefs"
 say "/memory"
 check "a remembered item is listed" 'wait_for "$OUT" "I prefer short briefs"'
+
+# the next model script number: on POSIX the stop check used 8, and 9 (never asked for) is free
+if [ $windows = 0 ]; then m=9; else m=8; fi
+say "/status"
+check "the MCP server started" 'wait_for "$OUT" "MCP: fake (3 tools)"'
+model $m '{"content":[{"type":"tool_use","id":"tu_m","name":"fake__echo","input":{"text":"echoed-by-mcp"}}],"stop_reason":"tool_use"}'
+model $((m + 1)) "$(text_reply 'mcp done')"
+say "use the echo server"
+check "an MCP tool runs through the gate" 'wait_for "$OUT" "mcp done" && grep -qF "echoed-by-mcp" "$S/requests/$(printf %03d $((m + 1))).json"'
+m=$((m + 2))
+model $m '{"content":[{"type":"tool_use","id":"tu_d","name":"delegate","input":{"tasks":[{"task":"part one"},{"task":"part two"}]}}],"stop_reason":"tool_use"}'
+model $((m + 1)) "$(text_reply 'helper said hi')"
+model $((m + 2)) "$(text_reply 'helper said hi')"
+model $((m + 3)) "$(text_reply 'delegated ok')"
+say "split this"
+check "helpers answer the agent" 'wait_for "$OUT" "delegated ok" && [ "$(grep -o "helper said hi" "$S/requests/$(printf %03d $((m + 3))).json" | wc -l | tr -d " ")" = 2 ]'
 
 kill "$RPID" 2>/dev/null
 wait "$RPID" 2>/dev/null

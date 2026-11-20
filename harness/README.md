@@ -1,16 +1,18 @@
 # harness
 
 A personal agent you talk to in Telegram (or the terminal). It does
-research, sends a morning brief on the topics you follow, runs scheduled
-tasks, and remembers what you bring up. Every action it takes passes one
-gate and is written to one log you can check.
+research, hands parts of a job to helpers that work in parallel, sends a
+morning brief on the topics you follow, runs scheduled tasks, uses MCP
+servers and saved skills, and remembers what you bring up. Every action it
+takes, and every action of its helpers, passes one gate and is written to
+one log you can check.
 
 ```
-Telegram ⇄ ┐                         ┌─ shell, files, fetch, search
-terminal ⇄ ┼─► agent ─► gate ─► tools │
-schedule ──┘    │  ▲      │           
-                ▼  │      ▼           
-          omnigate  memory  action log
+Telegram ⇄ ┐                          ┌─ shell, files, fetch, browse, search
+terminal ⇄ ┼─► agent ─► gate ─► tools ┼─ MCP servers (money tools: asked every time)
+schedule ──┘    │  ▲  ▲   │           └─ delegate ─► helpers ─► gate ─► tools
+                ▼  │  │   ▼
+          omnigate memory skills  action log
 ```
 
 One binary for macOS, Linux (x86_64, arm64) and Windows (x86_64), about
@@ -19,11 +21,11 @@ Security framework on macOS). Models are reached only through
 [omnigate](https://github.com/Legatia/omnigate), which holds the provider
 keys and the budgets.
 
-**State: 0.1.0, tested by its own tests (101 unit tests, and an end-to-end
-script that drives the real binary against stand-ins for omnigate,
-Telegram, feeds and search) on macOS. Not yet run against a real omnigate
-or a real Telegram bot; the Windows build has only been compiled.** See
-[Limits](#limits).
+**State: 0.2.0, tested by its own tests (156 unit tests, and an end-to-end
+script of 25 checks that drives the real binary against stand-ins for
+omnigate, Telegram, feeds, search and an MCP server) on macOS; 0.1.0's
+tests also passed in CI on Linux and Windows. Not yet run against a real
+omnigate, a real Telegram bot or a real MCP server.** See [Limits](#limits).
 
 ## Quick start
 
@@ -55,6 +57,8 @@ store, not in the folder.
 | `rules` | gate rules |
 | `briefs.ini` | briefs and their topics |
 | `tasks.ini` | scheduled tasks |
+| `mcp.ini` | MCP servers (optional) |
+| `skills/` | saved skills, one folder each (`NAME/SKILL.md`) |
 | `memory/` | one file per memory item |
 | `workspace/` | where the agent's files and commands live |
 | `log/actions.jsonl` | the action log |
@@ -73,8 +77,9 @@ Every tool call is decided in one place, in this order:
 2. A matching `deny` line in `rules`.
 3. A grant you gave with "Allow 24 h".
 4. The first matching `allow` or `ask` line.
-5. The tool's default: `shell` and `fetch` ask; files, search and memory
-   are allowed.
+5. The tool's default: `shell`, `fetch`, `browse`, `skill_save` and MCP
+   tools ask; files, search, memory, `skill` and `delegate` are allowed
+   (each helper's own calls pass the gate like any other).
 
 ```
 deny  shell rm -rf *
@@ -94,6 +99,75 @@ conversation; memory stays.
 Shell commands get only `PATH`, `HOME`, `LANG` and `TERM`. Stored secrets
 are masked in all tool output as `[secret:NAME]` before the model or the
 log sees it.
+
+Money tools (below) are the exception: asked every time.
+
+## Helpers
+
+`delegate` hands up to 8 tasks to helpers that run at the same time:
+research across several sources, comparisons, anything that splits into
+parts. Each helper starts with a clean context, gets only the tools it was
+given (never `delegate`, `remember`, `skill_save` or money tools), uses
+`worker_model` unless the task asks for the strong one, and returns a short
+answer, not its working. Limits per helper in `[agents]`: model calls,
+input tokens and answer size; at most `parallel` run at once in the whole
+instance. Helpers of one call share fetched pages, so none is downloaded
+twice, and they ask you one question at a time. `/stop` stops them too.
+
+Every model call marks its unchanging start (tools, the stable part of the
+instructions) for omnigate's prompt cache, and each step of a turn reads
+the earlier steps from cache. When a conversation outgrows
+`conversation_bytes`, the oldest turns are replaced by a summary instead
+of being dropped.
+
+## Research
+
+`fetch` turns pages into readable text (headings, lists, tables, links
+with full addresses; menus, footers and scripts dropped) and returns long
+pages in parts, each saying where the next starts. `browse` does the same
+after a headless Chrome or Chromium has run the page's JavaScript, with a
+fresh throwaway profile each time (no cookies, no sign-ins). It is offered
+only when a browser is found (`[browser] path`, or the usual install
+places).
+
+## MCP
+
+```ini
+[github]
+command = npx -y @modelcontextprotocol/server-github
+secret = GITHUB_PERSONAL_ACCESS_TOKEN:github   ; env var : stored secret
+
+[broker]
+command = /opt/broker-mcp/server
+secret = BROKER_KEY:broker
+money = place_order, cancel_order              ; tools that move money
+amount = notional_usd                          ; the input field with the amount
+```
+
+Servers are started when harness starts and on `/reload`, in the workspace
+folder, with only PATH, HOME, LANG, TERM and their named secrets
+(`harness secret add github`). Their tools appear as `github__list_issues`
+and ask by default; a 24 h grant covers that tool with any input; rules
+match `mcp github/list_issues *` (the server, the tool, then the input as
+JSON). `/status` shows what started.
+
+### Money
+
+Tools listed under `money =` are asked every time, with no "Allow 24 h"
+button; no grant or `allow` rule lifts that (a `deny` rule still applies).
+Helpers never get them. `[money] max_per_call` and `max_per_day` are hard
+caps checked before you are asked; with a cap set, a call without its
+amount is refused. Scheduled runs never move money unless you set
+`[money] scheduled = on`, and then only inside the caps. `/dryrun on`
+stops money calls from being made: the agent is told what would have been
+sent.
+
+## Skills
+
+Skills are folders in the agentskills.io format (`skills/NAME/SKILL.md`
+with `name` and `description`). The agent sees their names and
+descriptions, loads one with `skill` when it fits, and can save one with
+`skill_save` (asked). `/skills` lists them, `/skill rm NAME` removes one.
 
 ## The log
 
@@ -162,7 +236,8 @@ gate (with `ask` as Deny). Its answer is sent to you unless it is
 
 `/stop`, `/new`, `/status`, `/brief [NAME]`, `/topics`, `/topic add|rm`, `/tasks`,
 `/task add|rm|resume`, `/memory`, `/remember`, `/pin`, `/unpin`,
-`/forget`, `/private on|off`, `/reload`, `/help`.
+`/forget`, `/private on|off`, `/skills`, `/skill rm`, `/dryrun on|off`,
+`/reload`, `/help`.
 
 CLI: `init`, `secret add|rm|list`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `memory [list|pin|unpin|forget ID]`, `log verify|tail`,
@@ -184,12 +259,18 @@ CLI: `init`, `secret add|rm|list`, `pair`, `run`, `chat`, `brief [NAME]`,
 - **Windows.** `/stop` ends a shell command but not processes it started.
   The lock is judged by the status file's age, so after a crash a new
   instance can start 90 seconds later.
-- **Feeds** are read up to 4 MiB, fetched pages up to 1 MiB.
+- **Feeds** are read up to 4 MiB, fetched pages up to 1 MiB, rendered
+  pages up to 4 MiB.
+- **MCP servers and the browser** run as you, like shell commands. An MCP
+  server is a program you chose to run; harness limits its environment,
+  not what it does. The browser keeps harness's environment.
+- **Money caps** are in whole units of the tool's amount field and trust
+  the tool to mean what that field says.
 - **One owner, one chat.** Messages sent while the agent works are queued.
 
-Not in 0.1.0: the Agent Client Protocol server, browser and desktop use
-(headdesk), a sandbox per command, WhatsApp and voice, trading safeguards
-beyond the gate, and the hosted service.
+Not in 0.2.0: the Agent Client Protocol server, desktop use (headdesk), a
+sandbox per command, WhatsApp and voice, helpers that report back later,
+and the hosted service.
 
 ## Build
 
