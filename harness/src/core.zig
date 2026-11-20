@@ -11,6 +11,7 @@ const memory = @import("memory.zig");
 const model = @import("model.zig");
 const tools = @import("tools.zig");
 const skills = @import("skills.zig");
+const mcp = @import("mcp.zig");
 const agent = @import("agent.zig");
 const brief = @import("brief.zig");
 const scrub = @import("scrub.zig");
@@ -110,6 +111,15 @@ pub const Secrets = struct {
     omnigate: ?[]const u8 = null,
     telegram: ?[]const u8 = null,
     search: ?[]const u8 = null,
+    /// Other stored secrets by name, for MCP servers.
+    named: []const Named = &.{},
+
+    pub const Named = struct { name: []const u8, value: []const u8 };
+
+    pub fn get(s: Secrets, name: []const u8) ?[]const u8 {
+        for (s.named) |n| if (std.mem.eql(u8, n.name, name)) return n.value;
+        return null;
+    }
 };
 
 pub const Error = error{ AlreadyRunning, BadSettings, NoModelKey };
@@ -147,6 +157,13 @@ pub const Core = struct {
     helper_pool: agent.Pool = .{},
     /// The owner is asked one question at a time.
     ask_lock: Io.Mutex = .init,
+    mcp_arena: std.heap.ArenaAllocator = undefined,
+    mcp_servers: std.ArrayList(*mcp.Server) = .empty,
+    mcp_tools: []const agent.McpTool = &.{},
+    /// What started and what did not, for /status.
+    mcp_note: []const u8 = "",
+    money_ledger: agent.MoneyLedger = .{},
+    dry_run: bool = false,
     seen: brief.Seen,
     /// Set on close: nothing new starts.
     stop: std.atomic.Value(bool) = .init(false),
@@ -233,6 +250,7 @@ pub const Core = struct {
         if (secrets.omnigate) |v| try sl.append(c.paths_arena.allocator(), .{ .name = "omnigate", .value = v });
         if (secrets.telegram) |v| try sl.append(c.paths_arena.allocator(), .{ .name = "telegram", .value = v });
         if (secrets.search) |v| try sl.append(c.paths_arena.allocator(), .{ .name = "search", .value = v });
+        for (secrets.named) |n| try sl.append(c.paths_arena.allocator(), .{ .name = n.name, .value = n.value });
         c.secret_list = sl.items;
 
         c.grants = .init(gpa);
@@ -249,6 +267,10 @@ pub const Core = struct {
         c.lock = .init;
         c.helper_pool = .{};
         c.ask_lock = .init;
+        c.dry_run = false;
+        c.money_ledger = .{ .path = c.paths.money };
+        c.money_ledger.load(io);
+        c.mcp_servers = .empty;
         c.stop = .init(false);
         c.runs_mutex = .init;
         c.run_flags = .empty;
@@ -286,6 +308,7 @@ pub const Core = struct {
         c.loadRan();
         c.checkLogAgainstStatus();
         try c.log.write(.config, false, .{ .event = "start", .pid = pidNumber() });
+        c.startMcp();
         return c;
     }
 
@@ -297,6 +320,7 @@ pub const Core = struct {
         while (c.bg_active.load(.acquire) > 0) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
+        c.stopMcp();
         for (c.queue.items) |q| c.gpa.free(q);
         c.queue.deinit(c.gpa);
         c.run_flags.deinit(c.gpa);
@@ -393,6 +417,9 @@ pub const Core = struct {
         c.settings_arena = fresh;
         c.gate.rules = c.rule_list;
         c.told_settings_changed = false;
+        // nothing runs now (reload waits for that), so servers can restart
+        c.stopMcp();
+        c.startMcp();
         try c.log.write(.config, false, .{ .event = "reload" });
         return "Settings reloaded.";
     }
@@ -419,12 +446,13 @@ pub const Core = struct {
             if (std.mem.eql(u8, line, "auto off")) c.auto_recall = false;
             if (std.mem.eql(u8, line, "auto on")) c.auto_recall = true;
             if (std.mem.eql(u8, line, "private on")) c.private = true;
+            if (std.mem.eql(u8, line, "dryrun on")) c.dry_run = true;
         }
     }
 
     fn saveSwitches(c: *Core) void {
-        var buf: [64]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "auto {s}\nprivate {s}\n", .{ if (c.auto_recall) "on" else "off", if (c.private) "on" else "off" }) catch return;
+        var buf: [96]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "auto {s}\nprivate {s}\ndryrun {s}\n", .{ if (c.auto_recall) "on" else "off", if (c.private) "on" else "off", if (c.dry_run) "on" else "off" }) catch return;
         Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.switches, .data = s }) catch {};
     }
 
@@ -726,7 +754,63 @@ pub const Core = struct {
             .pool = &c.helper_pool,
             .ask_lock = &c.ask_lock,
             .skills_dir = c.paths.skills,
+            .mcp = c.mcp_tools,
+            .money = c.cfg.money,
+            .money_ledger = &c.money_ledger,
+            .dry_run = c.dry_run,
         };
+    }
+
+    // ---- MCP servers ----
+
+    /// Starts the servers in mcp.ini; one that fails is noted and skipped.
+    fn startMcp(c: *Core) void {
+        c.mcp_arena = .init(c.gpa);
+        c.mcp_servers = .empty;
+        c.mcp_tools = &.{};
+        c.mcp_note = "";
+        const a = c.mcp_arena.allocator();
+        const text = Io.Dir.cwd().readFileAlloc(c.io, c.paths.mcp, a, .limited(1 << 20)) catch return;
+        const cfgs = mcp.parseConfig(a, text) catch {
+            c.mcp_note = "mcp.ini has an error; no servers started.";
+            return;
+        };
+        var note: std.ArrayList(u8) = .empty;
+        var all: std.ArrayList(agent.McpTool) = .empty;
+        next: for (cfgs) |sc| {
+            const values = a.alloc([]const u8, sc.secrets.len) catch return;
+            for (sc.secrets, 0..) |es, i| {
+                values[i] = c.secrets.get(es.secret) orelse {
+                    note.print(a, "{s}: secret \"{s}\" is not stored (harness secret add {s})\n", .{ sc.name, es.secret, es.secret }) catch {};
+                    continue :next;
+                };
+            }
+            var diag: mcp.Diag = .{};
+            const srv = mcp.Server.start(c.gpa, c.io, sc, .{ .workspace = c.workspace, .path_var = c.path_var, .home = c.home_var, .secret_values = values, .diag = &diag }) catch |e| {
+                note.print(a, "{s}: did not start ({s}) {s}\n", .{ sc.name, @errorName(e), util.cut(diag.text(), 200) }) catch {};
+                c.log.write(.config, false, .{ .event = "mcp failed", .server = sc.name, .why = @errorName(e), .detail = diag.text() }) catch {};
+                continue;
+            };
+            c.mcp_servers.append(c.gpa, srv) catch {
+                srv.deinit();
+                continue;
+            };
+            const tl = agent.mcpTools(a, srv, sc.money, sc.amount) catch &.{};
+            all.appendSlice(a, tl) catch {};
+            note.print(a, "{s} ({d} tools)\n", .{ sc.name, tl.len }) catch {};
+            c.log.write(.config, false, .{ .event = "mcp started", .server = sc.name, .tools = tl.len }) catch {};
+        }
+        c.mcp_tools = all.items;
+        c.mcp_note = note.items;
+    }
+
+    fn stopMcp(c: *Core) void {
+        for (c.mcp_servers.items) |srv| srv.deinit();
+        c.mcp_servers.deinit(c.gpa);
+        c.mcp_servers = .empty;
+        c.mcp_tools = &.{};
+        c.mcp_note = "";
+        c.mcp_arena.deinit();
     }
 
     fn chatTurn(c: *Core, text: []const u8) void {
@@ -1012,6 +1096,7 @@ pub const Core = struct {
         \\/remember TEXT, /pin ID, /unpin ID, /forget ID
         \\/private on|off: no memories written while on
         \\/skills: list saved skills, /skill rm NAME
+        \\/dryrun on|off: money tools are not called while on
         \\/reload: apply changed settings files
     ;
 
@@ -1030,10 +1115,20 @@ pub const Core = struct {
         }
         if (eql(u8, cmd, "/reload")) return c.reload();
         if (eql(u8, cmd, "/status")) {
-            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}.", .{
+            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
                 if (c.auto_recall) "on" else "off",                                                         if (c.private) "on" else "off",
+                if (c.dry_run) "on" else "off",
+                if (c.mcp_note.len > 0) "\nMCP: " else "",
+                std.mem.trimEnd(u8, c.mcp_note, "\n"),
             });
+        }
+        if (eql(u8, cmd, "/dryrun")) {
+            const v = config.parseBool(rest) orelse return "Use /dryrun on or /dryrun off.";
+            c.dry_run = v;
+            c.saveSwitches();
+            try c.log.write(.config, false, .{ .event = "dry run", .on = v });
+            return if (v) "Dry run is on: tools that move money are not called; the agent is told what would have been sent." else "Dry run is off: approved money calls are made.";
         }
         if (eql(u8, cmd, "/memory")) {
             if (rest.len == 0) {
@@ -1797,4 +1892,24 @@ test "skills_command_lists_saved_skills_and_chat_offers_helpers" {
     try t.expect(std.mem.indexOf(u8, req, "\"name\":\"delegate\"") != null);
     try t.expect(std.mem.indexOf(u8, req, "\"name\":\"skill\"") != null);
     try t.expect(std.mem.indexOf(u8, req, "weekly-report") != null);
+}
+
+test "mcp_servers_start_from_mcp_ini_and_dryrun_switch" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\nmoney = echo\namount = amount\n[broken]\ncommand = /no/such/server\n", .{fake}) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.core.handleText("/status");
+    try f.rec.waitFor("MCP: fake (3 tools)");
+    try f.rec.waitFor("broken: did not start");
+    try f.core.handleText("/dryrun on");
+    try f.rec.waitFor("Dry run is on");
+    try f.e.script(1, model.textReply("ok"));
+    f.core.chatTurn("hello");
+    const req = try f.e.request(1);
+    try t.expect(std.mem.indexOf(u8, req, "\"name\":\"fake__echo\"") != null);
+    try t.expect(std.mem.indexOf(u8, req, "Moves money") != null);
 }

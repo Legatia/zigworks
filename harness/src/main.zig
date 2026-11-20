@@ -2,6 +2,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const mcp = @import("mcp.zig");
 const config = @import("config.zig");
 const core_mod = @import("core.zig");
 const store_mod = @import("store.zig");
@@ -86,7 +87,21 @@ const App = struct {
             .omnigate = s.get(app.io, app.arena, cfg.model.key) catch null,
             .telegram = s.get(app.io, app.arena, cfg.chat.token) catch null,
             .search = s.get(app.io, app.arena, cfg.search.key) catch null,
+            .named = app.mcpSecrets(s),
         };
+    }
+
+    /// The stored secrets the servers in mcp.ini name.
+    fn mcpSecrets(app: *App, s: store_mod.Store) []const core_mod.Secrets.Named {
+        const p = std.fs.path.join(app.arena, &.{ app.home, "mcp.ini" }) catch return &.{};
+        const text = Io.Dir.cwd().readFileAlloc(app.io, p, app.arena, .limited(1 << 20)) catch return &.{};
+        const cfgs = mcp.parseConfig(app.arena, text) catch return &.{};
+        var out: std.ArrayList(core_mod.Secrets.Named) = .empty;
+        for (cfgs) |sc| for (sc.secrets) |es| {
+            const v = (s.get(app.io, app.arena, es.secret) catch null) orelse continue;
+            out.append(app.arena, .{ .name = es.secret, .value = v }) catch {};
+        };
+        return out.items;
     }
 
     /// Opens the instance, or explains why not.
@@ -191,6 +206,14 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
             const v = s.get(app.io, app.arena, pair[1]) catch null;
             try outPrint(app.io, "{s} ({s}): {s}\n", .{ pair[1], pair[0], if (v != null) "stored" else "not stored" });
         }
+        const p = try std.fs.path.join(app.arena, &.{ app.home, "mcp.ini" });
+        if (Io.Dir.cwd().readFileAlloc(app.io, p, app.arena, .limited(1 << 20))) |text| {
+            const cfgs = mcp.parseConfig(app.arena, text) catch &.{};
+            for (cfgs) |sc| for (sc.secrets) |es| {
+                const v = s.get(app.io, app.arena, es.secret) catch null;
+                try outPrint(app.io, "{s} (MCP {s}): {s}\n", .{ es.secret, sc.name, if (v != null) "stored" else "not stored" });
+            };
+        } else |_| {}
         return .ok;
     }
     if (args.len < 2 or !validName(args[1])) {
