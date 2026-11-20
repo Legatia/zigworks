@@ -311,8 +311,10 @@ pub const Core = struct {
         c.loadRan();
         c.checkLogAgainstStatus();
         try c.log.write(.config, false, .{ .event = "start", .pid = pidNumber() });
-        c.findBrowser();
-        c.startMcp();
+        c.mcp_arena = .init(gpa);
+        c.mcp_tools = &.{};
+        c.mcp_note = "";
+        c.browser = "";
         return c;
     }
 
@@ -767,6 +769,14 @@ pub const Core = struct {
             .money_ledger = &c.money_ledger,
             .dry_run = c.dry_run,
         };
+    }
+
+    /// Starts the MCP servers and looks for a browser. Call after setting
+    /// `path_var` and `home_var`: the servers get them.
+    pub fn startExtras(c: *Core) void {
+        c.findBrowser();
+        c.stopMcp();
+        c.startMcp();
     }
 
     fn findBrowser(c: *Core) void {

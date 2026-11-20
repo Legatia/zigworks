@@ -148,10 +148,11 @@ check "a remembered item is listed" 'wait_for "$OUT" "I prefer short briefs"'
 if [ $windows = 0 ]; then m=9; else m=8; fi
 say "/status"
 check "the MCP server started" 'wait_for "$OUT" "MCP: fake (3 tools)"'
-model $m '{"content":[{"type":"tool_use","id":"tu_m","name":"fake__echo","input":{"text":"echoed-by-mcp"}}],"stop_reason":"tool_use"}'
+model $m '{"content":[{"type":"tool_use","id":"tu_m","name":"fake__echo","input":{"text":"env"}}],"stop_reason":"tool_use"}'
 model $((m + 1)) "$(text_reply 'mcp done')"
 say "use the echo server"
-check "an MCP tool runs through the gate" 'wait_for "$OUT" "mcp done" && grep -qF "echoed-by-mcp" "$S/requests/$(printf %03d $((m + 1))).json"'
+# the server reports its HOME: the real one, not the default before start-up finished
+check "an MCP tool runs through the gate with the real HOME" 'wait_for "$OUT" "mcp done" && grep -qF "home=$HOME" "$S/requests/$(printf %03d $((m + 1))).json"'
 m=$((m + 2))
 model $m '{"content":[{"type":"tool_use","id":"tu_d","name":"delegate","input":{"tasks":[{"task":"part one"},{"task":"part two"}]}}],"stop_reason":"tool_use"}'
 model $((m + 1)) "$(text_reply 'helper said hi')"
