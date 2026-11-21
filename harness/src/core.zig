@@ -208,6 +208,10 @@ pub const Core = struct {
     masks: masks.List,
     /// The list the log and memory mask with (see masksChanged).
     mask_snap: []const scrub.Secret,
+    /// One masksChanged at a time (see there).
+    mask_mutex: Io.Mutex = .init,
+    /// Tests: called in masksChanged between taking the list and setting it.
+    mask_pause: ?*const fn (c: *Core) void = null,
     workspace: []const u8,
 
     grants: gate.Grants,
@@ -372,6 +376,8 @@ pub const Core = struct {
         // values added later (a sign-up password, a secret found on
         // /reload) reach the log's and memory's masks too
         c.mask_snap = &.{};
+        c.mask_mutex = .init;
+        c.mask_pause = null;
         c.masks.on_change = .{ .ctx = c, .changed = masksChanged };
         c.seen = .init(gpa);
         c.seen.load(io, c.paths.seen) catch {};
@@ -481,10 +487,16 @@ pub const Core = struct {
     }
 
     /// The mask list grew: the log and memory mask with the new list from
-    /// now on. The strings belong to the list; only the slice is ours.
+    /// now on. The strings belong to the list; only the slice is ours. One
+    /// at a time, each taking the list as it is then: of two values added
+    /// at once, the one that sets its list last has both, so the log and
+    /// memory never end on the older list.
     fn masksChanged(ctx: *anyopaque) void {
         const c: *Core = @ptrCast(@alignCast(ctx));
+        c.mask_mutex.lockUncancelable(c.io);
+        defer c.mask_mutex.unlock(c.io);
         const snap = c.masks.snapshot(c.gpa) catch return;
+        if (c.mask_pause) |p| p(c);
         c.log.setSecrets(snap) catch {
             c.gpa.free(snap);
             return;
@@ -4010,6 +4022,54 @@ test "a_value_added_to_the_mask_list_is_masked_in_the_log_and_memory_too" {
         _ = try f.core.mem.add("The sign-up password is made-at-signup-Pass-5813", null, f.core.now());
     }
     for (f.core.mem.items.items) |it| try t.expect(std.mem.indexOf(u8, it.body, "made-at-signup-Pass-5813") == null);
+}
+
+/// Holds the first masksChanged between taking the list and setting it,
+/// until `go`, so a second value can be added meanwhile.
+const MaskRace = struct {
+    var held: std.atomic.Value(bool) = .init(false);
+    var go: std.atomic.Value(bool) = .init(false);
+    var first: std.atomic.Value(bool) = .init(true);
+
+    fn pause(_: *Core) void {
+        if (!first.swap(false, .acq_rel)) return;
+        held.store(true, .release);
+        while (!go.load(.acquire)) t.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+
+    fn add(c: *Core, name: []const u8, value: []const u8) void {
+        c.masks.add(name, value) catch {};
+    }
+};
+
+test "two_values_added_at_once_are_both_masked_in_the_log_and_memory" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.mask_pause = MaskRace.pause;
+    // one sign-up's password is added and its list taken, then held there
+    const one = try std.Thread.spawn(.{}, MaskRace.add, .{ f.core, "login-one-password", "made-at-signup-One-1111" });
+    var waited: u32 = 0;
+    while (!MaskRace.held.load(.acquire) and waited < 5000) : (waited += 5) t.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    try t.expect(MaskRace.held.load(.acquire));
+    // another's is added meanwhile
+    const two = try std.Thread.spawn(.{}, MaskRace.add, .{ f.core, "login-two-password", "made-at-signup-Two-2222" });
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    MaskRace.go.store(true, .release);
+    one.join();
+    two.join();
+    f.core.mask_pause = null;
+    // the log and memory end with the list that has both
+    try f.core.log.write(.config, false, .{ .event = "probe", .detail = "made-at-signup-One-1111 and made-at-signup-Two-2222" });
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "made-at-signup-Two-2222") == null);
+    try t.expect(std.mem.indexOf(u8, lt, "made-at-signup-One-1111") == null);
+    {
+        f.core.lock.lockUncancelable(t.io);
+        defer f.core.lock.unlock(t.io);
+        _ = try f.core.mem.add("The passwords are made-at-signup-One-1111 and made-at-signup-Two-2222", null, f.core.now());
+    }
+    for (f.core.mem.items.items) |it| try t.expect(std.mem.indexOf(u8, it.body, "made-at-signup-Two-2222") == null);
 }
 
 test "reload_takes_a_secret_stored_since_start_and_masks_it" {
