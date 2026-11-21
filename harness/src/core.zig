@@ -365,9 +365,14 @@ pub const Core = struct {
 
     // ---- settings ----
 
-    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![5][]const u8 {
-        var out: [5][]const u8 = undefined;
-        for ([_][]const u8{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins }, 0..) |p, i| {
+    /// The settings files, in this order; a change to any of them is noticed.
+    fn settingsFiles(c: *const Core) [6][]const u8 {
+        return .{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins, c.paths.mcp };
+    }
+
+    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![6][]const u8 {
+        var out: [6][]const u8 = undefined;
+        for (c.settingsFiles(), 0..) |p, i| {
             out[i] = Io.Dir.cwd().readFileAlloc(c.io, p, a, .limited(1 << 20)) catch |e| switch (e) {
                 error.FileNotFound => "",
                 else => return e,
@@ -376,7 +381,7 @@ pub const Core = struct {
         return out;
     }
 
-    fn hashSettings(texts: [5][]const u8) [32]u8 {
+    fn hashSettings(texts: [6][]const u8) [32]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
         for (texts) |tx| {
             h.update(tx);
@@ -387,7 +392,7 @@ pub const Core = struct {
 
     fn loadSettings(c: *Core, a: std.mem.Allocator) !void {
         if (builtin.os.tag != .windows) {
-            for ([_][]const u8{ c.paths.config, c.paths.rules, c.paths.logins }) |p| {
+            for (guardedFiles(c.paths)) |p| {
                 const st = Io.Dir.cwd().statFile(c.io, p, .{}) catch continue;
                 if (st.permissions.toMode() & 0o022 != 0) return error.BadSettings;
             }
@@ -425,7 +430,7 @@ pub const Core = struct {
             c.tasks = saved_tasks;
             c.login_list = saved_logins;
             c.settings_hash = saved_hash;
-            return "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini and logins.ini.";
+            return "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, logins.ini and mcp.ini.";
         };
         // the chat's client points into the old settings: build it again
         const client = model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens) catch {
@@ -1416,6 +1421,12 @@ fn insertInSection(a: std.mem.Allocator, text: []const u8, name: []const u8, lin
     return out.items;
 }
 
+/// The settings files other users must not be able to change: they decide
+/// what runs (rules, MCP servers' commands) and where values are typed.
+pub fn guardedFiles(p: Paths) [4][]const u8 {
+    return .{ p.config, p.rules, p.logins, p.mcp };
+}
+
 pub const LoginState = struct { password: bool = false, totp: bool = false, passkeys: usize = 0, passkeys_stored: bool = false };
 
 /// What the key store holds for a login.
@@ -2072,4 +2083,22 @@ test "logins_command_lists_what_is_stored_and_status_counts_them" {
         lf.close(t.io);
         try t.expect(std.mem.startsWith(u8, try f.core.reload(), "The settings files have an error"));
     }
+}
+
+test "mcp_ini_is_guarded_and_watched_like_config_ini" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    // a change to mcp.ini is noticed, like one to config.ini
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = "; no servers yet\n", .flags = .{ .permissions = util.private_file } });
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try f.rec.waitFor("not applied until you send /reload");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    if (builtin.os.tag == .windows) return;
+    // and one that other users can change is refused: it names the commands harness runs
+    var mf = try Io.Dir.cwd().openFile(t.io, f.core.paths.mcp, .{});
+    try mf.setPermissions(t.io, .fromMode(0o666));
+    mf.close(t.io);
+    try t.expect(!std.mem.startsWith(u8, try f.core.reload(), "Settings reloaded"));
 }
