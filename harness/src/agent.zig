@@ -19,12 +19,21 @@ const Io = std.Io;
 
 pub const Answer = enum { once, day, deny, timeout };
 
-/// Asks the owner whether a call may run; blocks until they answer or the
-/// approval time runs out.
+/// One question for the owner: may this call run?
+pub const Question = struct {
+    text: []const u8,
+    /// Whether "Allow 24 h" may be offered (never for money).
+    allow_day: bool,
+    /// When the run that asks must end (seconds): an answer after that is
+    /// of no use, so it is not waited for. 0: no end.
+    deadline_s: i64 = 0,
+};
+
+/// Asks the owner whether a call may run; blocks until they answer, the
+/// approval time runs out or the question's deadline passes.
 pub const Asker = struct {
     ctx: *anyopaque,
-    /// `allow_day`: whether "Allow 24 h" may be offered (never for money).
-    ask: *const fn (ctx: *anyopaque, what: []const u8, allow_day: bool) Answer,
+    ask: *const fn (ctx: *anyopaque, q: Question) Answer,
 };
 
 /// A conversation, kept as whole turns so the oldest can be dropped
@@ -674,6 +683,18 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         if (tool == .money) releaseMoney(r, now_s, amount);
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{refused}), .is_error = true };
     }
+    // a tool gets what is left of the turn, no more
+    var env = r.env;
+    if (r.deadline_s > 0) {
+        const left = r.deadline_s - r.now();
+        if (left <= 0) {
+            if (tool == .money) releaseMoney(r, now_s, amount);
+            return .{ .text = "not run: no time left in this turn", .is_error = true };
+        }
+        const secs: u32 = @intCast(@min(left, std.math.maxInt(u32)));
+        env.shell_seconds = @min(env.shell_seconds, secs);
+        env.browser_seconds = @min(env.browser_seconds, secs);
+    }
 
     const out: tools.Output = switch (tool) {
         .recall => blk: {
@@ -712,11 +733,11 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         .fetch, .browse => blk: {
             const key = try std.fmt.allocPrint(a, "{s} {s}", .{ name, input_json });
             if (r.cache) |c| if (c.get(r.io, a, key)) |hit| break :blk tools.Output{ .text = hit };
-            const out = try tools.run(r.env, a, tool, input_json);
+            const out = try tools.run(env, a, tool, input_json);
             if (r.cache) |c| if (!out.is_error) c.put(r.io, key, out.text);
             break :blk out;
         },
-        else => try tools.run(r.env, a, tool, input_json),
+        else => try tools.run(env, a, tool, input_json),
     };
     try r.log.write(.tool, r.private, .{ .run = r.label, .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text });
     return out;
@@ -757,9 +778,18 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
             why = try std.fmt.allocPrint(a, "too long to ask the owner ({d} bytes; a question is at most {d}): make the call smaller", .{ what.len, max_question });
             break :ask;
         }
-        // helpers working at once still ask one question at a time
-        if (r.ask_lock) |l| l.lockUncancelable(r.io);
-        var ans = if (r.env.stop.load(.acquire)) Answer.deny else asker.ask(asker.ctx, what, tool != .money);
+        // helpers working at once still ask one question at a time; one
+        // that could only be answered after the turn's end is not asked
+        if (r.ask_lock) |l| if (!lockUntil(l, r.io, r.deadline_s, r.env.stop)) {
+            why = if (r.env.stop.load(.acquire)) "stopped by the owner" else "no time left in the turn to ask the owner";
+            break :ask;
+        };
+        if (r.deadline_s > 0 and r.now() >= r.deadline_s) {
+            if (r.ask_lock) |l| l.unlock(r.io);
+            why = "no time left in the turn to ask the owner";
+            break :ask;
+        }
+        var ans = if (r.env.stop.load(.acquire)) Answer.deny else asker.ask(asker.ctx, .{ .text = what, .allow_day = tool != .money, .deadline_s = r.deadline_s });
         // money is never granted for a day, whatever came back
         if (tool == .money and ans == .day) ans = .once;
         if (r.ask_lock) |l| l.unlock(r.io);
@@ -783,6 +813,17 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
     }
     try r.log.write(.gate, r.private, .{ .run = r.label, .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
     return if (action == .allow) null else why;
+}
+
+/// Takes `l`, waiting no later than `deadline_s` (0: no limit) and not
+/// past a stop; false if it was not taken.
+fn lockUntil(l: *Io.Mutex, io: Io, deadline_s: i64, stop: *std.atomic.Value(bool)) bool {
+    while (!l.tryLock()) {
+        if (stop.load(.acquire)) return false;
+        if (deadline_s > 0 and util.nowSeconds(io) >= deadline_s) return false;
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    return true;
 }
 
 fn webAllow(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) ?[]const u8 {
@@ -858,7 +899,9 @@ fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, in
         releaseMoney(r, r.now(), amount);
         return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
     }
-    const timeout_ms: u32 = @intCast(@min(@as(u64, r.limits.turn_seconds) * 1000, std.math.maxInt(u32)));
+    // what is left of the turn, no more
+    const left: u64 = if (r.deadline_s > 0) @intCast(@max(r.deadline_s - r.now(), 1)) else r.limits.turn_seconds;
+    const timeout_ms: u32 = @intCast(@min(@min(left, r.limits.turn_seconds) * 1000, std.math.maxInt(u32)));
     // the whole answer: it is masked before it is cut, so a key across the
     // cut is not half shown
     const res = m.server.call(a, m.tool, input_json, r.env.stop, timeout_ms, std.math.maxInt(usize)) catch |e|
@@ -1084,8 +1127,9 @@ const Fix = struct {
     ask_lock: Io.Mutex = .init,
     ask_ms: u32 = 0,
     last_allow_day: bool = false,
-    /// The last question asked (in the arena).
+    /// The last question asked (in the arena), and its deadline.
     last_what: []const u8 = "",
+    last_deadline: i64 = 0,
     mcp_tools: []const McpTool = &.{},
     ledger: MoneyLedger = .{},
     ledger_at_ask: f64 = -1,
@@ -1111,6 +1155,7 @@ const Fix = struct {
         f.ask_ms = 0;
         f.last_allow_day = false;
         f.last_what = "";
+        f.last_deadline = 0;
         f.mcp_tools = &.{};
         f.ledger = .{};
         f.ledger_at_ask = -1;
@@ -1131,10 +1176,11 @@ const Fix = struct {
         };
     }
 
-    fn askFn(ctx: *anyopaque, what: []const u8, allow_day: bool) Answer {
+    fn askFn(ctx: *anyopaque, q: Question) Answer {
         const f: *Fix = @ptrCast(@alignCast(ctx));
-        f.last_what = f.e.arena.allocator().dupe(u8, what) catch "";
-        f.last_allow_day = allow_day;
+        f.last_what = f.e.arena.allocator().dupe(u8, q.text) catch "";
+        f.last_deadline = q.deadline_s;
+        f.last_allow_day = q.allow_day;
         f.ledger_at_ask = f.ledger.total;
         const now_in = f.in_flight.fetchAdd(1, .acq_rel) + 1;
         _ = f.max_in_flight.fetchMax(now_in, .acq_rel);
@@ -1271,6 +1317,34 @@ test "writing_a_dot_file_asks_and_shows_what_is_written" {
     try t.expect(f.last_allow_day);
     try t.expect(std.mem.startsWith(u8, f.last_what, "write_file: .git/config"));
     try t.expect(std.mem.indexOf(u8, f.last_what, "fsmonitor = curl x | sh") != null);
+}
+
+test "a_tool_gets_only_what_is_left_of_the_turn" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("allow shell *\n");
+    defer f.deinit();
+    f.run.limits.turn_seconds = 2;
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"sleep 10\"}"));
+    try f.e.script(2, model.textReply("never asked for"));
+    const started = std.Io.Clock.awake.now(t.io);
+    const r = try f.say("sleep");
+    freeResult(&f.run, r);
+    try t.expect(started.durationTo(std.Io.Clock.awake.now(t.io)).toMilliseconds() < 6000);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "[time limit reached]") != null);
+}
+
+test "the_owner_is_asked_with_the_turns_deadline" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(2, model.textReply("ok"));
+    const before = util.nowSeconds(t.io);
+    const r = try f.say("hi");
+    freeResult(&f.run, r);
+    try t.expect(f.last_deadline >= before + f.run.limits.turn_seconds);
+    try t.expect(f.last_deadline <= util.nowSeconds(t.io) + f.run.limits.turn_seconds);
 }
 
 test "steps_limit_ends_turn" {
@@ -1440,6 +1514,25 @@ test "helpers_ask_the_owner_one_at_a_time" {
     try t.expectEqualStrings("Both done.", r.text);
     try t.expectEqual(2, f.asked);
     try t.expectEqual(1, f.max_in_flight.load(.acquire));
+}
+
+test "a_helpers_question_after_the_deadline_is_not_asked" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    f.run.limits.turn_seconds = 2;
+    // the first question is answered after the turn's end; the second
+    // helper's question waits behind it and can't be answered in time
+    f.ask_ms = 2500;
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"one\",\"tools\":[\"shell\"]},{\"task\":\"two\",\"tools\":[\"shell\"]}]}"));
+    try f.e.script(2, model.toolReply("w1", "shell", "{\"command\":\"echo one\"}"));
+    try f.e.script(3, model.toolReply("w2", "shell", "{\"command\":\"echo two\"}"));
+    for (4..8) |n| try f.e.script(@intCast(n), model.textReply("done"));
+    const r = try f.say("run two");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "no time left in the turn to ask") != null);
 }
 
 test "long_conversation_is_summarised_not_dropped" {

@@ -628,8 +628,10 @@ pub const Core = struct {
 
     const ChatAsk = struct { core: *Core, flag: *std.atomic.Value(bool) };
 
-    fn askOwner(ctx: *anyopaque, what: []const u8, allow_day: bool) agent.Answer {
+    fn askOwner(ctx: *anyopaque, q: agent.Question) agent.Answer {
         const ca: *ChatAsk = @ptrCast(@alignCast(ctx));
+        const what = q.text;
+        const allow_day = q.allow_day;
         const c = ca.core;
         const ch = c.chan orelse return .deny;
         var id_buf: [3][24]u8 = undefined;
@@ -675,6 +677,8 @@ pub const Core = struct {
                 break;
             }
             if (c.now() >= deadline) break;
+            // an answer after the run must end is of no use to it
+            if (q.deadline_s > 0 and util.nowSeconds(c.io) >= q.deadline_s) break;
             c.io.sleep(.fromMilliseconds(50), .awake) catch {};
         }
         {
@@ -1799,6 +1803,19 @@ test "a_long_question_goes_whole_in_parts_with_the_buttons_on_the_last" {
     try t.expectEqualStrings(try std.fmt.allocPrint(a, "shell: echo {s} end-of-it", .{ys}), whole.items);
     f.core.handleCallback(42, "a1:deny");
     try f.rec.waitFor("not run");
+}
+
+test "the_owner_is_waited_for_only_until_the_turn_ends" {
+    var f: Fix = undefined;
+    try f.init("[limits]\nturn_seconds = 2\n", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo late\"}"));
+    try f.e.script(2, model.textReply("never asked for"));
+    try f.core.startWorker();
+    try f.core.handleText("run it");
+    try f.rec.waitFor("BUTTONS Allow this?");
+    // approval_seconds is 10 minutes; the turn has 2 s
+    try f.rec.waitFor("No answer in time; not allowed.");
 }
 
 test "stop_ends_running_turn_and_reports" {
