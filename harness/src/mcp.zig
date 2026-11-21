@@ -73,7 +73,7 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig,
                         const colon = std.mem.indexOfScalar(u8, item, ':') orelse return error.BadConfig;
                         const env = std.mem.trim(u8, item[0..colon], " \t");
                         const sec = std.mem.trim(u8, item[colon + 1 ..], " \t");
-                        if (!validEnv(env) or sec.len == 0 or std.mem.indexOfAny(u8, sec, " \t") != null) return error.BadConfig;
+                        if (!validEnv(env) or !validSecretName(sec)) return error.BadConfig;
                         try list.append(arena, .{ .env = env, .secret = sec });
                     }
                     cfg.secrets = list.items;
@@ -110,6 +110,15 @@ fn items(arena: std.mem.Allocator, value: []const u8) error{ BadConfig, OutOfMem
 
 fn validName(name: []const u8) bool {
     if (name.len == 0 or name.len > 32) return false;
+    for (name) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_' or c == '-')) return false;
+    return true;
+}
+
+/// A stored secret's name, as `harness secret add` takes it: a-z, 0-9,
+/// `-` and `_`, at most 64, not starting with `-`. So no name reaches
+/// outside the secrets folder or past the Credential Manager's name.
+pub fn validSecretName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64 or name[0] == '-') return false;
     for (name) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_' or c == '-')) return false;
     return true;
 }
@@ -662,6 +671,31 @@ test "parse_config_refuses_bad_lines" {
         "[a]\ncommand = \"unterminated\n",
         "[a]\ncommand = x\n[a]\ncommand = y\n", // same server twice
         "[a]\njust words\n",
+    };
+    for (bad) |text| {
+        if (parseConfig(a, text)) |_| {
+            std.debug.print("accepted: {s}\n", .{text});
+            return error.TestUnexpectedResult;
+        } else |e| try t.expectEqual(error.BadConfig, e);
+    }
+}
+
+test "parse_config_takes_only_secret_names_the_store_can_hold" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // the names `harness secret add` takes: a-z, 0-9, - and _, at most 64
+    const longest: [64]u8 = @splat('s');
+    const ok = try parseConfig(a, "[a]\ncommand = x\nsecret = K:" ++ longest ++ ", L:my_key-2\n");
+    try t.expectEqualStrings(&longest, ok[0].secrets[0].secret);
+    const bad = [_][]const u8{
+        "[a]\ncommand = x\nsecret = K:../config.ini\n", // a file outside the secrets folder
+        "[a]\ncommand = x\nsecret = K:sub/name\n",
+        "[a]\ncommand = x\nsecret = K:..\n",
+        "[a]\ncommand = x\nsecret = K:Upper\n", // never stored under that name
+        "[a]\ncommand = x\nsecret = K:-flag\n",
+        "[a]\ncommand = x\nsecret = K:" ++ longest ++ "s\n", // too long for the Credential Manager's name
+        "[a]\ncommand = x\nsecret = K:na\\me\n",
     };
     for (bad) |text| {
         if (parseConfig(a, text)) |_| {
