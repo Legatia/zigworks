@@ -335,6 +335,7 @@ pub const Web = struct {
         var nb: [96]u8 = undefined;
         const raw = st.get(w.io, w.gpa, logins.secretName(&nb, l.name, .passkeys)) catch {
             w.passkeys_bad = true;
+            try w.notes.appendSlice(w.arena.allocator(), "The stored passkeys of this login could not be read from the key store; none were loaded, and a new one would not be saved.\n");
             return;
         } orelse return;
         defer {
@@ -343,7 +344,7 @@ pub const Web = struct {
         }
         const list = logins.decode(w.arena.allocator(), raw) catch {
             w.passkeys_bad = true;
-            try w.notes.appendSlice(w.arena.allocator(), "The stored passkeys of this login could not be read; none were loaded.\n");
+            try w.notes.appendSlice(w.arena.allocator(), "The stored passkeys of this login could not be read; none were loaded, and a new one would not be saved.\n");
             return;
         };
         w.stored = list;
@@ -402,22 +403,26 @@ pub const Web = struct {
             w.hooks.note(w.hooks.ctx, "web passkey removed", l.name, pk.rp_id);
             try w.notes.print(w.arena.allocator(), "A passkey for {s} was removed: this login is for {s}.\n", .{ pk.rp_id, l.site });
         }
-        if (w.passkeys_bad) return;
         const merged = try mergePasskeys(a, w.stored, f.keep);
         if (!merged.changed) return;
-        const st = w.env.store orelse return;
-        var nb: [96]u8 = undefined;
-        const json = try logins.encode(a, merged.list);
-        defer std.crypto.secureZero(u8, @constCast(json));
-        st.put(w.io, logins.secretName(&nb, l.name, .passkeys), json) catch {
-            try w.notes.appendSlice(w.arena.allocator(), "A new passkey could not be saved to the key store.\n");
-            return;
-        };
-        for (merged.added) |rp| {
-            w.hooks.note(w.hooks.ctx, "web passkey saved", l.name, rp);
-            try w.notes.print(w.arena.allocator(), "A passkey for {s} was saved for this login.\n", .{rp});
+        if (w.passkeys_bad) {
+            // the stored list could not be read: writing would replace it
+            for (merged.added) |rp| try w.notes.print(w.arena.allocator(), "A passkey for {s} was made but not saved: the stored passkeys of this login could not be read.\n", .{rp});
+        } else {
+            const st = w.env.store orelse return;
+            var nb: [96]u8 = undefined;
+            const json = try logins.encode(a, merged.list);
+            defer std.crypto.secureZero(u8, @constCast(json));
+            st.put(w.io, logins.secretName(&nb, l.name, .passkeys), json) catch {
+                try w.notes.appendSlice(w.arena.allocator(), "A new passkey could not be saved to the key store.\n");
+                return;
+            };
+            for (merged.added) |rp| {
+                w.hooks.note(w.hooks.ctx, "web passkey saved", l.name, rp);
+                try w.notes.print(w.arena.allocator(), "A passkey for {s} was saved for this login.\n", .{rp});
+            }
         }
-        // the new list, kept for the next comparison
+        // the new list, kept for the next comparison (said once)
         const keep = try w.arena.allocator().alloc(logins.Passkey, merged.list.len);
         const wa = w.arena.allocator();
         for (merged.list, 0..) |pk, i| keep[i] = .{ .id = try wa.dupe(u8, pk.id), .rp_id = try wa.dupe(u8, pk.rp_id), .key = try wa.dupe(u8, pk.key), .user = try wa.dupe(u8, pk.user), .count = pk.count };
@@ -1221,6 +1226,35 @@ test "web_passkey_made_just_before_close_is_kept" {
     f.web.close();
     const saved = try logins.decode(a, (try f.stored("login-p-passkeys")) orelse "");
     try t.expectEqual(1, saved.len);
+}
+
+test "web_says_when_the_stored_passkeys_cannot_be_read" {
+    var f: Fix = undefined;
+    try f.init("[p]\nsite = localhost\nusername = agent-bot\n");
+    defer f.deinit();
+    // the key store fails to read this login's passkeys (a folder where
+    // the value should be)
+    try f.e.tmp.dir.createDirPath(t.io, "secrets/login-p-passkeys");
+    try f.page("pk.html", passkey_page);
+    const r0 = try f.act(try f.openJson("pk.html", "p"));
+    try expectHas(r0.text, "could not be read");
+    // everything said from the click until the page says it registered,
+    // and once more
+    var said: std.ArrayList(u8) = .empty;
+    const a = f.e.arena.allocator();
+    try said.appendSlice(a, (try f.act("{\"action\":\"click\",\"ref\":1}")).text);
+    var tries: u32 = 0;
+    while (!has(said.items, "registered") and tries < 20) : (tries += 1) {
+        t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        try said.appendSlice(a, (try f.act("{\"action\":\"read\"}")).text);
+    }
+    try said.appendSlice(a, (try f.act("{\"action\":\"read\"}")).text);
+    try expectHas(said.items, "registered");
+    try expectHas(said.items, "was made but not saved");
+    // said once, not after every action
+    try t.expectEqual(1, std.mem.count(u8, said.items, "not saved"));
+    // what is stored was left as it was
+    try t.expectEqual(.directory, (try f.e.tmp.dir.statFile(t.io, "secrets/login-p-passkeys", .{})).kind);
 }
 
 test "web_passkey_for_another_site_is_removed" {
