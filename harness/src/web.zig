@@ -39,6 +39,9 @@ pub const Env = struct {
     /// Masked in everything returned (stored login values among them).
     secrets: []const scrub.Secret = &.{},
     stop: *std.atomic.Value(bool),
+    /// Unix seconds by which each action must be over (the turn's end);
+    /// 0: only `timeout_ms`.
+    deadline_s: i64 = 0,
 };
 
 /// What the tool asks of the run it is part of.
@@ -142,6 +145,9 @@ pub const Web = struct {
     /// Ends the session: the browser, the throwaway profile, the grants.
     pub fn close(w: *Web) void {
         if (w.s) |s| {
+            // closing has its own limits, not what was left of the last action
+            s.timeout_ms = w.env.timeout_ms;
+            s.endBy(null);
             // a passkey made since the last action is not lost
             if (!s.inbox.closed.load(.acquire) and !w.env.stop.load(.acquire)) {
                 var arena_state: std.heap.ArenaAllocator = .init(w.gpa);
@@ -166,9 +172,25 @@ pub const Web = struct {
         return w.s != null;
     }
 
+    /// What one action may take: `timeout_ms`, or less to be over by the
+    /// turn's end; null once that has passed.
+    fn actionMs(w: *const Web) ?u32 {
+        if (w.env.deadline_s == 0) return w.env.timeout_ms;
+        const now_ms: i64 = @intCast(@divFloor(Io.Clock.real.now(w.io).nanoseconds, std.time.ns_per_ms));
+        const left = w.env.deadline_s * 1000 - now_ms;
+        if (left <= 0) return null;
+        return @intCast(@min(left, w.env.timeout_ms));
+    }
+
     /// One action; every one but close returns the page afterwards.
     pub fn run(w: *Web, a: Allocator, input_json: []const u8) !Output {
         w.notes.clearRetainingCapacity();
+        // an action gets what is left of the turn, all its waits together
+        const ms = w.actionMs() orelse return .{ .text = "not run: no time left in this turn", .is_error = true };
+        if (w.s) |s| {
+            s.timeout_ms = ms;
+            s.endBy(if (w.env.deadline_s > 0) ms else null);
+        }
         const raw = w.runRaw(a, input_json) catch |e| blk: {
             const detail = if (w.s) |s| s.lastError() else "";
             break :blk Output{ .text = try std.fmt.allocPrint(a, "failed: {s}{s}{s}", .{ @errorName(e), if (detail.len > 0) ": " else "", detail }), .is_error = true };
@@ -336,7 +358,10 @@ pub const Web = struct {
         // a login's cookies stay, those that end with the session too; its
         // last tabs don't come back
         if (w.login != null) try cdp.forgetLastTabs(w.io, a, profile);
-        w.s = try cdp.Session.open(w.gpa, w.io, w.env.browser, profile, w.env.stop, w.env.timeout_ms, .{ .env = w.env.chrome_env, .keep_session = w.login != null });
+        // started within what is left of the action, which goes on with the rest
+        const ms = w.actionMs() orelse return error.TimeUp;
+        w.s = try cdp.Session.open(w.gpa, w.io, w.env.browser, profile, w.env.stop, ms, .{ .env = w.env.chrome_env, .keep_session = w.login != null });
+        if (w.env.deadline_s > 0) w.s.?.endBy(w.actionMs() orelse 1);
         if (w.login) |l| try w.loadPasskeys(a, l);
     }
 
@@ -1487,6 +1512,27 @@ test "web_page_hosts_are_lowercase_without_user_or_default_port" {
     }) |c| try t.expectEqualStrings(c[1], (try pageHost(a, c[0])).?);
     // a name before @, a backslash: refused, never read as one host or another
     for ([_][]const u8{ "ftp://x.org/", "https://", "https:///x", "javascript:alert(1)", "https://user@/", "https://user:pw@Evil.example:443/", "https://github.com\\@evil.example/", "https://bücher.de/" }) |u| try t.expectEqual(null, try pageHost(a, u));
+}
+
+test "web_actions_get_only_what_is_left_of_the_turn" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.page("quick.html", "<html><body><p>quick</p></body></html>");
+    try f.page("slow.html", "<html><body><p>late</p></body></html>");
+    // a browser started with time to spare, then a page that answers late
+    _ = try f.act(try f.openJson("quick.html", null));
+    f.web.env.deadline_s = util.nowSeconds(t.io) + 1;
+    const start = Io.Clock.awake.now(t.io);
+    const r = try f.act(try std.fmt.allocPrint(a, "{{\"action\":\"open\",\"url\":\"{s}?delay_ms=5000\"}}", .{try f.url("slow.html")}));
+    try t.expect(start.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2500);
+    try t.expect(r.is_error);
+    // past the turn's end no action is taken
+    f.web.env.deadline_s = util.nowSeconds(t.io) - 1;
+    const late = try f.act("{\"action\":\"read\"}");
+    try t.expect(late.is_error);
+    try expectHas(late.text, "no time left in this turn");
 }
 
 test "web_refuses_an_address_with_a_name_before_the_at_without_asking" {

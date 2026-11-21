@@ -42,6 +42,9 @@ pub const Env = struct {
     /// Decides each redirect of `fetch` and `search` (the agent's gate);
     /// null: only redirects on a host the request already reached.
     redirect: ?Redirect = null,
+    /// Unix seconds by which fetch, search and browse must be over (the
+    /// turn's end); 0: only their own limits.
+    deadline_s: i64 = 0,
 };
 
 pub const Output = struct { text: []const u8, is_error: bool = false };
@@ -77,7 +80,11 @@ pub fn mainArg(arena: std.mem.Allocator, tool: gate.Tool, input_json: []const u8
 
 /// Runs a tool other than recall/remember (the agent handles those).
 pub fn run(env: Env, arena: std.mem.Allocator, tool: gate.Tool, input_json: []const u8) !Output {
-    const raw = runRaw(env, arena, tool, input_json) catch |e| Output{ .text = try std.fmt.allocPrint(arena, "failed: {s}", .{@errorName(e)}), .is_error = true };
+    const raw = runRaw(env, arena, tool, input_json) catch |e| Output{ .text = switch (e) {
+        error.TimeUp => "not finished: the turn's time is up",
+        error.Stopped => "stopped by the owner",
+        else => try std.fmt.allocPrint(arena, "failed: {s}", .{@errorName(e)}),
+    }, .is_error = true };
     var s = try scrub.Scrubber.init(arena, env.secrets);
     const text = try s.scrubAlloc(arena, raw.text);
     return .{ .text = text, .is_error = raw.is_error };
@@ -337,11 +344,41 @@ pub const Redirect = struct {
     allow: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, url: []const u8, known_host: bool) ?[]const u8,
 };
 
+/// What ends a request before its own limits (30 s without a byte, 2
+/// minutes a hop).
+pub const Until = struct {
+    /// Unix seconds by which every hop must be over (the turn's end):
+    /// error.TimeUp; 0: none.
+    deadline_s: i64 = 0,
+    /// Set: the hop under way ends, and no other starts (error.Stopped).
+    stop: ?*const std.atomic.Value(bool) = null,
+
+    fn stopped(u: Until) bool {
+        const f = u.stop orelse return false;
+        return f.load(.acquire);
+    }
+
+    /// Milliseconds left until the deadline; null for none.
+    fn leftMs(u: Until, io: Io) ?i64 {
+        if (u.deadline_s == 0) return null;
+        return u.deadline_s * 1000 - nowMs(io);
+    }
+};
+
+fn nowMs(io: Io) i64 {
+    return @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
+}
+
 /// GET `url`, reading at most `max` bytes of the body. Up to
 /// `max_redirects` redirects are followed, never from https to http, each
 /// only if `redirect` allows it (without one: only those on a host already
 /// reached); `headers` are not sent on once the host changes.
 pub fn get(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, raw_url: []const u8, headers: []const std.http.Header, max: usize, redirect: ?Redirect) !Got {
+    return getUntil(gpa, io, arena, raw_url, headers, max, redirect, .{});
+}
+
+/// `get`, every hop over by `until`'s deadline, and ended by its stop.
+pub fn getUntil(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, raw_url: []const u8, headers: []const std.http.Header, max: usize, redirect: ?Redirect, until: Until) !Got {
     // the address as the gate read it (see url.zig): the host it decided
     // on is the one reached
     var cur = url_mod.parse(arena, raw_url) catch |e| return if (e == error.OutOfMemory) e else error.BadUrl;
@@ -350,7 +387,8 @@ pub fn get(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, raw_url: []
     try hosts.append(arena, cur.host_port);
     var hops: u8 = 0;
     while (true) {
-        var g = try getOne(gpa, io, arena, cur, hdrs, max);
+        if (until.stopped()) return error.Stopped;
+        var g = try getOne(gpa, io, arena, cur, hdrs, max, until);
         g.got.redirects = hops;
         const loc = g.location orelse return g.got;
         const to = resolveUrl(arena, cur.href, loc) catch {
@@ -418,10 +456,16 @@ fn resolveUrl(arena: std.mem.Allocator, base: []const u8, loc: []const u8) ![]co
 /// location.
 const One = struct { got: Got, location: ?[]const u8 };
 
-fn getOne(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, u: url_mod.Url, headers: []const std.http.Header, max: usize) !One {
+fn getOne(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, u: url_mod.Url, headers: []const std.http.Header, max: usize, until: Until) !One {
+    // a hop gets what is left of the turn, no more
+    var total_ms: u32 = 120_000;
+    if (until.leftMs(io)) |left| {
+        if (left <= 0) return error.TimeUp;
+        total_ms = @intCast(@min(left, total_ms));
+    }
     var c = http.Client.init(gpa, io, .{ .https = u.https, .host = u.connectHost(), .port = u.port, .prefix = "" });
     defer c.deinit();
-    var resp = try c.send(.{ .method = .GET, .path = u.target, .headers = headers, .limits = .{ .idle_ms = 30_000, .total_ms = 120_000 } });
+    var resp = c.send(.{ .method = .GET, .path = u.target, .headers = headers, .limits = .{ .idle_ms = @min(30_000, total_ms), .total_ms = total_ms, .stop = until.stop } }) catch |e| return cutShort(e, io, until);
     defer resp.deinit();
     const ct = try arena.dupe(u8, resp.contentType());
     if (isRedirect(resp.status)) if (resp.location) |l| {
@@ -430,7 +474,7 @@ fn getOne(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, u: url_mod.U
     };
     var body: std.ArrayList(u8) = .empty;
     var truncated = false;
-    while (try resp.next()) |part| {
+    while (resp.next() catch |e| return cutShort(e, io, until)) |part| {
         const room = max - body.items.len;
         if (part.len > room) {
             try body.appendSlice(arena, part[0..room]);
@@ -440,6 +484,14 @@ fn getOne(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, u: url_mod.U
         try body.appendSlice(arena, part);
     }
     return .{ .got = .{ .status = resp.status, .content_type = ct, .body = body.items, .truncated = truncated, .url = u.href }, .location = null };
+}
+
+/// A request that failed: because of /stop or the turn's end, when one of
+/// them came, else as it failed.
+fn cutShort(e: http.Error, io: Io, until: Until) (http.Error || error{ Stopped, TimeUp }) {
+    if (until.stopped()) return error.Stopped;
+    if (e == error.Timeout) if (until.leftMs(io)) |left| if (left <= 100) return error.TimeUp;
+    return e;
 }
 
 fn isText(ct: []const u8) bool {
@@ -454,7 +506,7 @@ fn startOf(arena: std.mem.Allocator, input_json: []const u8) usize {
 }
 
 fn fetch(env: Env, arena: std.mem.Allocator, url: []const u8, start: usize) !Output {
-    const g = try get(env.gpa, env.io, arena, url, &.{}, fetch_max, env.redirect);
+    const g = try getUntil(env.gpa, env.io, arena, url, &.{}, fetch_max, env.redirect, limitsOf(env));
     var head: std.ArrayList(u8) = .empty;
     // the status, and where it came from when that is not where it was asked
     try head.print(arena, "status {d}", .{g.status});
@@ -475,9 +527,20 @@ fn fetch(env: Env, arena: std.mem.Allocator, url: []const u8, start: usize) !Out
     return .{ .text = try textPart(env, arena, head.items, text, g.url, start), .is_error = g.status >= 400 };
 }
 
+/// What ends fetch and search besides their own limits: the turn's end, /stop.
+fn limitsOf(env: Env) Until {
+    return .{ .deadline_s = env.deadline_s, .stop = env.stop };
+}
+
 fn browse(env: Env, arena: std.mem.Allocator, url: []const u8, start: usize) !Output {
     if (env.browser.len == 0) return .{ .text = "no Chrome or Chromium found (set [browser] path in config.ini); use fetch instead", .is_error = true };
-    const html = page.render(env.gpa, env.io, arena, env.browser, url, if (env.tmp_root.len > 0) env.tmp_root else env.workspace, env.stop, env.browser_seconds * 1000, 4 << 20, .{ .path = env.path_var, .home = env.home, .system = env.system_vars }) catch |e|
+    // what is left of the turn, to the millisecond
+    var limit_ms: u32 = env.browser_seconds *| 1000;
+    if (limitsOf(env).leftMs(env.io)) |left| {
+        if (left <= 0) return error.TimeUp;
+        limit_ms = @intCast(@min(left, limit_ms));
+    }
+    const html = page.render(env.gpa, env.io, arena, env.browser, url, if (env.tmp_root.len > 0) env.tmp_root else env.workspace, env.stop, limit_ms, 4 << 20, .{ .path = env.path_var, .home = env.home, .system = env.system_vars }) catch |e|
         return .{ .text = try std.fmt.allocPrint(arena, "the browser failed: {s}", .{@errorName(e)}), .is_error = true };
     const pg = try page.extract(arena, html, url);
     var head: std.ArrayList(u8) = .empty;
@@ -553,10 +616,10 @@ fn search(env: Env, arena: std.mem.Allocator, query: []const u8) !Output {
     for (query) |c| {
         if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') try url.append(arena, c) else try url.print(arena, "%{X:0>2}", .{c});
     }
-    const g = try get(env.gpa, env.io, arena, url.items, &.{
+    const g = try getUntil(env.gpa, env.io, arena, url.items, &.{
         .{ .name = "X-Subscription-Token", .value = key },
         .{ .name = "Accept", .value = "application/json" },
-    }, fetch_max, env.redirect);
+    }, fetch_max, env.redirect, limitsOf(env));
     if (g.stopped) |st| return .{ .text = try std.fmt.allocPrint(arena, "search failed: the redirect to {s} was not followed: {s}", .{ st.to, st.why }), .is_error = true };
     if (g.status != 200) return .{ .text = try std.fmt.allocPrint(arena, "search failed with status {d}", .{g.status}), .is_error = true };
     const v = jv.parse(arena, g.body) orelse return .{ .text = "search answered something that is not JSON", .is_error = true };
@@ -864,6 +927,48 @@ test "redirects_stop_after_five_and_headers_stay_with_their_host" {
         }
     }
     try t.expectEqual(2, checked);
+}
+
+test "fetch_and_search_end_when_the_turns_time_is_up" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const base = try f.e.url();
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/slow.html", .data = "<p>late</p>" });
+    f.env.deadline_s = util.nowSeconds(t.io) + 1;
+    const start = Io.Clock.awake.now(t.io);
+    const o = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/slow.html?delay_ms=4000\"}}", .{base}));
+    try t.expect(start.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2000);
+    try t.expect(o.is_error);
+    try t.expect(std.mem.indexOf(u8, o.text, "time is up") != null);
+    // search the same way (a slow stand-in for the search API)
+    f.env.search_url = try std.fmt.allocPrint(a, "{s}/page/s?delay_ms=4000&", .{base});
+    f.env.deadline_s = util.nowSeconds(t.io) + 1;
+    const s_start = Io.Clock.awake.now(t.io);
+    const s = try f.call(.search, "{\"query\":\"zig\"}");
+    try t.expect(s_start.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2000);
+    try t.expect(s.is_error);
+    // with no time left nothing is sent
+    const before = try f.e.tmp.dir.readFileAlloc(t.io, "page-requests.jsonl", a, .unlimited);
+    f.env.deadline_s = util.nowSeconds(t.io) - 1;
+    try t.expect((try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/slow.html\"}}", .{base}))).is_error);
+    try t.expectEqualStrings(before, try f.e.tmp.dir.readFileAlloc(t.io, "page-requests.jsonl", a, .unlimited));
+}
+
+test "stop_ends_a_fetch_under_way" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/slow.html", .data = "<p>late</p>" });
+    const th = try std.Thread.spawn(.{}, stopLater, .{&f.stop});
+    defer th.join();
+    const start = Io.Clock.awake.now(t.io);
+    const o = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/slow.html?delay_ms=5000\"}}", .{try f.e.url()}));
+    try t.expect(start.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 1500);
+    try t.expect(o.is_error);
+    try t.expect(std.mem.indexOf(u8, o.text, "stopped by the owner") != null);
 }
 
 test "a_redirect_to_an_address_with_a_name_before_the_at_is_not_followed" {

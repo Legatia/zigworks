@@ -190,7 +190,9 @@ install places).
 `fetch` follows up to 5 redirects, never from https to http or to an
 address with a name before `@`; each passes the gate as a fetch of its own
 (on a host the call already reached only a `deny` rule stops it), and the
-answer says where it ended.
+answer says where it ended. `fetch`, `search`, `browse` and each `web`
+action end when the turn's time is up, redirects and all; `/stop` ends
+one under way.
 
 ## Logins
 

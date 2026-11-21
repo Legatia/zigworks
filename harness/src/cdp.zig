@@ -275,6 +275,9 @@ pub const Session = struct {
     stop: *std.atomic.Value(bool),
     /// How long one call may take.
     timeout_ms: u32,
+    /// No wait goes on past this (`Io.Clock.awake`), however long its own
+    /// limit: the end of the action under way (see `endBy`); null: none.
+    end_ns: ?i96 = null,
     pid: Pid = 0,
     child: std.process.Child = undefined,
     /// `child` is set: there is a process to end.
@@ -301,6 +304,18 @@ pub const Session = struct {
 
     pub fn lastError(s: *const Session) []const u8 {
         return s.err_buf[0..s.err_len];
+    }
+
+    /// Every wait from now on ends within `ms`, however many an action
+    /// takes; null: each by its own limit only.
+    pub fn endBy(s: *Session, ms: ?u32) void {
+        s.end_ns = if (ms) |x| deadline(s.io, x) else null;
+    }
+
+    /// When a wait of `ms` must end: then, or at `end_ns` if sooner.
+    fn waitEnd(s: *const Session, ms: u32) i96 {
+        const d = deadline(s.io, ms);
+        return if (s.end_ns) |e| @min(d, e) else d;
     }
 
     fn setError(s: *Session, msg: []const u8) void {
@@ -370,7 +385,7 @@ pub const Session = struct {
         defer arena_state.deinit();
         const a = arena_state.allocator();
         // the first page may take a moment to appear
-        const until = deadline(s.io, s.timeout_ms);
+        const until = s.waitEnd(s.timeout_ms);
         const target = outer: while (true) {
             const res = try s.callIn(a, "Target.getTargets", "{}", null);
             if (jv.arr(jv.get(res, "targetInfos"))) |infos| for (infos) |info| {
@@ -530,7 +545,7 @@ pub const Session = struct {
             const f = s.to_chrome orelse return error.BrowserGone;
             f.writeStreamingAll(s.io, msg.items) catch return error.BrowserGone;
         }
-        const until = deadline(s.io, s.timeout_ms);
+        const until = s.waitEnd(s.timeout_ms);
         while (true) {
             if (s.inbox.take(s.io, id)) |reply| {
                 defer s.gpa.free(reply);
@@ -617,7 +632,7 @@ pub const Session = struct {
     /// document has loaded (bounded by the timeout), else until this one
     /// has.
     pub fn settle(s: *Session, arena: Allocator, m: Mark) !void {
-        const grace = deadline(s.io, nav_grace_ms);
+        const grace = s.waitEnd(nav_grace_ms);
         while (Io.Clock.awake.now(s.io).nanoseconds < grace) {
             const l = s.inbox.loading(s.io);
             if (l.started_at > m.seq) break;
@@ -628,7 +643,7 @@ pub const Session = struct {
 
     /// Until the main frame has stopped loading and the document is complete.
     pub fn waitLoaded(s: *Session, arena: Allocator) !void {
-        const until = deadline(s.io, s.timeout_ms);
+        const until = s.waitEnd(s.timeout_ms);
         while (s.inbox.loading(s.io).busy) {
             if (Io.Clock.awake.now(s.io).nanoseconds >= until) return error.Timeout;
             try s.sleep(20);
@@ -649,7 +664,7 @@ pub const Session = struct {
     /// isolated world: the page's scripts can't change what it reads (a
     /// `readyState` of their own would stall every wait).
     fn waitFor(s: *Session, arena: Allocator, cond: []const u8) !void {
-        const until = deadline(s.io, s.timeout_ms);
+        const until = s.waitEnd(s.timeout_ms);
         while (true) {
             const v = s.evaluateIsolated(arena, cond) catch |e| switch (e) {
                 error.Script, error.Cdp, error.Timeout, error.NoPage => "false",
@@ -664,6 +679,8 @@ pub const Session = struct {
     /// Ends the browser and everything it started; safe to call twice.
     pub fn close(s: *Session) void {
         if (s.closed) return;
+        // closing is not an action: its own short limits, even past the turn's end
+        s.end_ns = null;
         if (!is_windows and s.spawned) {
             if (s.page_session.len > 0 and !s.inbox.closed.load(.acquire) and !s.stop.load(.acquire)) {
                 var arena_state: std.heap.ArenaAllocator = .init(s.gpa);

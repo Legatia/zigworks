@@ -936,6 +936,8 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         // the tool asks the gate itself: for each host and login it uses
         const w = r.web orelse return .{ .text = "this tool is not available here", .is_error = true };
         w.env.secrets = r.env.secrets;
+        // each action gets what is left of the turn, no more
+        w.env.deadline_s = r.deadline_s;
         const out = try w.run(a, input_json);
         // the model's input, placeholders and all: never a value
         try r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = name, .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text });
@@ -1032,10 +1034,12 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     return out;
 }
 
-/// The run's tool environment, with its gate for redirects.
+/// The run's tool environment, with its gate for redirects and the turn's
+/// end (fetch, search and browse get no more than what is left of it).
 fn redirectEnv(r: *Run) tools.Env {
     var env = r.env;
     env.redirect = .{ .ctx = r, .allow = redirectAllow };
+    env.deadline_s = r.deadline_s;
     return env;
 }
 
@@ -1767,6 +1771,29 @@ test "a_tool_gets_only_what_is_left_of_the_turn" {
     freeResult(&f.run, r);
     try t.expect(started.durationTo(std.Io.Clock.awake.now(t.io)).toMilliseconds() < 6000);
     try t.expect(std.mem.indexOf(u8, try f.logText(), "[time limit reached]") != null);
+}
+
+test "a_fetch_and_a_web_action_get_only_what_is_left_of_the_turn" {
+    var f: Fix = undefined;
+    try f.init("allow fetch http://127.0.0.1:*\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.run.limits.turn_seconds = 1;
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/slow.html", .data = "<p>late</p>" });
+    // web is offered (a browser is named; none is started in time)
+    f.run.env.browser = "/no/such/chrome";
+    f.run.profiles_dir = try std.fs.path.join(a, &.{ f.e.dir, "profiles" });
+    try f.e.script(1, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"fetch\",\"input\":{{\"url\":\"http://127.0.0.1:{d}/page/slow.html?delay_ms=4000\"}}}},{{\"type\":\"tool_use\",\"id\":\"tu_2\",\"name\":\"web\",\"input\":{{\"action\":\"open\",\"url\":\"http://127.0.0.1:{d}/page/slow.html\"}}}}],\"stop_reason\":\"tool_use\"}}", .{ f.e.server.port, f.e.server.port }));
+    try f.e.script(2, model.textReply("never asked for"));
+    const started = Io.Clock.awake.now(t.io);
+    const r = try f.say("read it");
+    freeResult(&f.run, r);
+    try t.expect(started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2500);
+    const log = try f.logText();
+    try t.expect(std.mem.indexOf(u8, log, "the turn's time is up") != null);
+    try t.expect(std.mem.indexOf(u8, log, "no time left in this turn") != null);
+    // the web call asked nobody
+    try t.expectEqual(0, f.asked);
 }
 
 test "the_owner_is_asked_with_the_turns_deadline" {
