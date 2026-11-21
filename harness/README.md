@@ -305,7 +305,10 @@ on.
 
 `max_per_call` and `max_per_day` are hard caps checked before you are
 asked: the server's own lines in mcp.ini, else `[money]` in config.ini
-(0: no cap). Each server has its own day total in `state/money`. With a
+(there 0: no cap). In a server's section `none` lifts config.ini's cap
+for that server, and harness says so at start and in `/status`; `0` there
+is an error (write `none`, or remove the line to use config.ini's). Each
+server has its own day total in `state/money`. With a
 cap set, a money tool that `amount =` gives no field is refused, and so is
 a call without its amount (`tool:none` moves no amount). An amount counts
 toward the day from the moment you are asked, so two runs cannot both
