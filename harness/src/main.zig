@@ -775,16 +775,15 @@ fn memoryCmd(app: *App, args: []const []const u8) !Exit {
 fn logCmd(app: *App, args: []const []const u8) !Exit {
     const p = try core_mod.Paths.init(app.arena, app.home);
     if (args.len >= 1 and eql(args[0], "verify")) {
-        const v = log_mod.verify(app.io, p.log) catch |e| {
+        // where harness last left the log, so a cut end is found too
+        var sbuf: [512]u8 = undefined;
+        const expect = if (Io.Dir.cwd().readFile(app.io, p.status, &sbuf)) |got| log_mod.statusLogHash(got) else |_| null;
+        const r = log_mod.check(app.io, app.arena, p.log, expect) catch |e| {
             complain("can't read {s}: {s}", .{ p.log, @errorName(e) });
             return .failed;
         };
-        if (v.broken_at) |n| {
-            try outPrint(app.io, "Broken at line {d} of {s}: that line, or one before it, was changed, removed or reordered.\n", .{ n, p.log });
-            return .failed;
-        }
-        try outPrint(app.io, "OK: {d} lines, chain intact.\n", .{v.lines});
-        return .ok;
+        try outPrint(app.io, "{s}\n", .{r.text});
+        return if (r.ok) .ok else .failed;
     }
     if (args.len >= 1 and eql(args[0], "tail")) {
         const n = if (args.len > 1) std.fmt.parseInt(usize, args[1], 10) catch 20 else 20;

@@ -217,32 +217,77 @@ fn prevOf(line: []const u8) ?[]const u8 {
     return line[start .. start + 64];
 }
 
-pub const Verdict = struct { lines: u64, broken_at: ?u64, last: [64]u8 };
+pub const Verdict = struct {
+    lines: u64,
+    broken_at: ?u64,
+    last: [64]u8,
+    /// Whether the hash `verifyTo` looked for is a line's (or the start's,
+    /// before the first line).
+    has: bool = false,
+};
 
 /// Checks the chain from the first line; `broken_at` is the first line (1-based)
 /// whose `prev` does not match the line before or whose seq is out of order.
 pub fn verify(io: Io, path: []const u8) !Verdict {
+    return verifyTo(io, path, null);
+}
+
+/// Like `verify`, and notes whether some line hashes to `expect`.
+pub fn verifyTo(io: Io, path: []const u8, expect: ?*const [64]u8) !Verdict {
     var f = try Io.Dir.cwd().openFile(io, path, .{});
     defer f.close(io);
     var buf: [256 * 1024]u8 = undefined;
     var r = f.reader(io, &buf);
     var prev: [64]u8 = zero_hash;
+    var has = if (expect) |e| std.mem.eql(u8, e, &zero_hash) else false;
     var n: u64 = 0;
     while (true) {
         const raw = (try r.interface.takeDelimiter('\n')) orelse break;
         n += 1;
         // a blank line is only allowed as the very end
         if (raw.len == 0) {
-            const more = (try r.interface.takeDelimiter('\n')) orelse return .{ .lines = n - 1, .broken_at = null, .last = prev };
+            const more = (try r.interface.takeDelimiter('\n')) orelse return .{ .lines = n - 1, .broken_at = null, .last = prev, .has = has };
             _ = more;
-            return .{ .lines = n, .broken_at = n, .last = prev };
+            return .{ .lines = n, .broken_at = n, .last = prev, .has = has };
         }
         const line = raw;
-        const p = prevOf(line) orelse return .{ .lines = n, .broken_at = n, .last = prev };
-        if (!std.mem.eql(u8, p, &prev) or (seqOf(line) orelse 0) != n) return .{ .lines = n, .broken_at = n, .last = prev };
+        const p = prevOf(line) orelse return .{ .lines = n, .broken_at = n, .last = prev, .has = has };
+        if (!std.mem.eql(u8, p, &prev) or (seqOf(line) orelse 0) != n) return .{ .lines = n, .broken_at = n, .last = prev, .has = has };
         prev = hashLine(line);
+        if (expect) |e| if (std.mem.eql(u8, e, &prev)) {
+            has = true;
+        };
     }
-    return .{ .lines = n, .broken_at = null, .last = prev };
+    return .{ .lines = n, .broken_at = null, .last = prev, .has = has };
+}
+
+/// What `harness log verify` says, and whether all is well.
+pub const Check = struct { ok: bool, text: []const u8 };
+
+/// The chain from the first line, and, with `expect` (the last line
+/// harness noted in its status file), whether the log still reaches that
+/// line: lines cut from the end leave an intact chain behind.
+pub fn check(io: Io, arena: std.mem.Allocator, path: []const u8, expect: ?[64]u8) !Check {
+    const wrote = if (expect) |e| !std.mem.eql(u8, &e, &zero_hash) else false;
+    const v = verifyTo(io, path, if (expect) |*e| e else null) catch |e| switch (e) {
+        error.FileNotFound => return if (wrote)
+            .{ .ok = false, .text = try std.fmt.allocPrint(arena, "There is no log at {s}, though harness wrote one (state/status names its last line): it was removed.", .{path}) }
+        else
+            .{ .ok = true, .text = try std.fmt.allocPrint(arena, "No log yet at {s}: harness starts it when it first runs.", .{path}) },
+        else => return e,
+    };
+    if (v.broken_at) |n| return .{ .ok = false, .text = try std.fmt.allocPrint(arena, "Broken at line {d} of {s}: that line, or one before it, was changed, removed or reordered.", .{ n, path }) };
+    if (wrote and !v.has) return .{ .ok = false, .text = try std.fmt.allocPrint(arena, "Lines are missing from the end of {s}: its {d} lines chain, but the last line harness wrote (state/status names it) is not among them.", .{ path, v.lines }) };
+    return .{ .ok = true, .text = try std.fmt.allocPrint(arena, "OK: {d} lines, chain intact.", .{v.lines}) };
+}
+
+/// The log's last line as harness's status file names it ("log HASH").
+pub fn statusLogHash(status: []const u8) ?[64]u8 {
+    const i = std.mem.indexOf(u8, status, "\nlog ") orelse return null;
+    const rest = status[i + 5 ..];
+    if (rest.len < 64) return null;
+    for (rest[0..64]) |c| if (!std.ascii.isHex(c)) return null;
+    return rest[0..64].*;
 }
 
 const t = std.testing;
@@ -436,6 +481,39 @@ test "blank_line_inserted_is_found_by_verify" {
     const edited = try std.mem.concat(arena.allocator(), u8, &.{ text[0..first], "\n", try std.mem.replaceOwned(u8, arena.allocator(), text[first..], "rm -rf", "ls -la") });
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = edited });
     try t.expectEqual(2, (try verify(t.io, path)).broken_at.?);
+}
+
+test "verify_finds_lines_cut_from_the_end_and_says_when_there_is_no_log" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try tmpPath(&tmp, a);
+    const none = try check(t.io, a, path, null);
+    try t.expect(none.ok);
+    try t.expect(std.mem.startsWith(u8, none.text, "No log yet at "));
+    var l = try Log.open(t.allocator, t.io, path);
+    for (0..3) |_| try l.write(.chat, false, .{ .text = "hello" });
+    const end = l.lastHash();
+    l.close();
+    try t.expect((try check(t.io, a, path, end)).ok);
+    // harness's status file names that end
+    const status = try std.fmt.allocPrint(a, "pid 1\ntick 2026-11-19T00:00:00Z\nlog {s}\n", .{&end});
+    try t.expectEqualSlices(u8, &end, &statusLogHash(status).?);
+    // the last line cut off: the chain still holds, the end is gone
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
+    const last = std.mem.lastIndexOfScalar(u8, text[0 .. text.len - 1], '\n').? + 1;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = text[0..last] });
+    try t.expectEqual(null, (try verify(t.io, path)).broken_at);
+    const cut = try check(t.io, a, path, end);
+    try t.expect(!cut.ok);
+    try t.expect(std.mem.indexOf(u8, cut.text, "missing from the end") != null);
+    // the whole log removed
+    try Io.Dir.cwd().deleteFile(t.io, path);
+    const gone = try check(t.io, a, path, end);
+    try t.expect(!gone.ok);
+    try t.expect(std.mem.indexOf(u8, gone.text, "removed") != null);
 }
 
 test "a_log_that_only_grew_contains_the_old_end" {
