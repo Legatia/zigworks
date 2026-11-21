@@ -254,8 +254,7 @@ pub const Web = struct {
         } else if (eql(u8, action, "click")) {
             const ref = jv.int(jv.get(v, "ref")) orelse return fail(a, "click needs a ref", .{});
             const m = w.s.?.mark();
-            const r = try w.s.?.evaluateIsolated(a, try refScript(a, ref, "el.scrollIntoView({block: 'center'}); el.click(); return 'ok';"));
-            if (!eql(u8, r, "\"ok\"")) return fail(a, "no element [{d}] on the page; read it again", .{ref});
+            if (try w.click(a, ref)) |why| return fail(a, "{s}", .{why});
             try w.s.?.settle(a, m);
         } else if (eql(u8, action, "key")) {
             const key = jv.str(jv.get(v, "key")) orelse return fail(a, "key needs Enter, Tab or Escape", .{});
@@ -589,6 +588,26 @@ pub const Web = struct {
         return fail(a, "no element [{d}] on the page; read it again", .{ref});
     }
 
+    /// A click as a person's: the mouse pressed and released at the
+    /// element's centre, scrolled into view first. Not when something else
+    /// is on top of it there (a banner, a dialog): why not, then.
+    fn click(w: *Web, a: Allocator, ref: i64) !?[]const u8 {
+        const s = w.s.?;
+        const r = jv.parse(a, try s.evaluateIsolated(a, try refScript(a, ref, click_point_body)));
+        if (jv.str(r)) |no| {
+            if (std.mem.eql(u8, no, "no-element")) return try std.fmt.allocPrint(a, "no element [{d}] on the page; read it again", .{ref});
+            if (std.mem.startsWith(u8, no, "covered ")) return try std.fmt.allocPrint(a, "[{d}] is under another element where it would be clicked ({s}); close or answer that first", .{ ref, util.cut(no["covered ".len..], 100) });
+            return try std.fmt.allocPrint(a, "[{d}] can't be clicked: it takes no room on the page", .{ref});
+        }
+        const x = jv.num(jv.get(r, "x")) orelse return error.Script;
+        const y = jv.num(jv.get(r, "y")) orelse return error.Script;
+        for ([_][]const u8{ "mouseMoved", "mousePressed", "mouseReleased" }) |kind| {
+            const params = try std.fmt.allocPrint(a, "{{\"type\":\"{s}\",\"x\":{d},\"y\":{d}{s}}}", .{ kind, x, y, if (kind[5] == 'P') ",\"button\":\"left\",\"buttons\":1,\"clickCount\":1" else if (kind[5] == 'R') ",\"button\":\"left\",\"buttons\":0,\"clickCount\":1" else "" });
+            _ = try s.call(a, "Input.dispatchMouseEvent", params);
+        }
+        return null;
+    }
+
     fn pressKey(w: *Web, a: Allocator, key: []const u8) !void {
         const s = w.s.?;
         const Key = struct { code: u8, text: []const u8 };
@@ -728,6 +747,27 @@ const snapshot_script =
     \\  }
     \\  return {protocol: location.protocol, host: location.host, url: location.href, title: document.title, html: document.documentElement ? document.documentElement.outerHTML.slice(0, 4194304) : '', items};
     \\})()
+;
+
+/// Where to click `el`: the centre of the first of its boxes where it (or
+/// what is in it, or its label) is what a click there would hit, after
+/// scrolling it into view; else 'covered WHAT', or 'no-room'.
+const click_point_body =
+    \\el.scrollIntoView({block: 'center', inline: 'center'});
+    \\const root = el.getRootNode();
+    \\const hits = (h) => h && (h === el || el.contains(h) || (el.labels && Array.from(el.labels).some((l) => l === h || l.contains(h))));
+    \\const boxes = Array.from(el.getClientRects()).filter((b) => b.width > 0 && b.height > 0);
+    \\for (const b of boxes) {
+    \\  const x = b.left + b.width / 2, y = b.top + b.height / 2;
+    \\  if (hits(root.elementFromPoint(x, y))) return {x, y};
+    \\}
+    \\if (el.labels) for (const l of el.labels) for (const b of Array.from(l.getClientRects())) {
+    \\  const x = b.left + b.width / 2, y = b.top + b.height / 2;
+    \\  if (b.width > 0 && b.height > 0 && hits(root.elementFromPoint(x, y))) return {x, y};
+    \\}
+    \\if (boxes.length === 0) return 'no-room';
+    \\const top = root.elementFromPoint(boxes[0].left + boxes[0].width / 2, boxes[0].top + boxes[0].height / 2);
+    \\return 'covered ' + (top ? top.tagName.toLowerCase() + ' "' + (top.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 60) + '"' : 'by nothing it can reach');
 ;
 
 /// `body` runs with `el` the element marked `ref`; 'no-element' if none.
@@ -1527,6 +1567,74 @@ test "web_closes_a_new_tab_before_it_loads_and_says_where_it_went" {
     const r2 = try f.act("{\"action\":\"read\"}");
     try expectHas(r2.text, "/page/tab.html?from=link was closed before it loaded");
     try expectHas(r2.text, "A new tab the page opened was closed.");
+    try t.expectEqual(1, try pageTargets(&f));
+    try t.expectEqualStrings("null", try f.eval("localStorage.getItem('tab')"));
+}
+
+test "web_clicks_like_a_person" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.page("trust.html",
+        \\<html><body><p id="o"></p><button onclick="document.getElementById('o').textContent = event.isTrusted ? 'a trusted click' : 'a script click'">Press</button>
+        \\<div style="height: 1500px"></div><button onclick="document.getElementById('o').textContent = 'far one ' + event.isTrusted">Far</button>
+        \\<div style="position: relative"><button onclick="document.getElementById('o').textContent = 'under was clicked'">Under</button>
+        \\<div style="position: absolute; left: 0; top: 0; width: 100%; height: 100%; background: white">Accept our cookies</div></div>
+        \\<label><input type="checkbox" id="c" style="opacity: 0; position: absolute"><span>Remember me</span></label></body></html>
+    );
+    _ = try f.act(try f.openJson("trust.html", null));
+    const r1 = try f.act("{\"action\":\"click\",\"ref\":1}");
+    try expectHas(r1.text, "a trusted click");
+    // below the fold: scrolled to first
+    const r2 = try f.act("{\"action\":\"click\",\"ref\":2}");
+    try expectHas(r2.text, "far one true");
+    // under something else: not clicked, and said
+    const r3 = try f.act("{\"action\":\"click\",\"ref\":3}");
+    try t.expect(r3.is_error);
+    try expectHas(r3.text, "under another element where it would be clicked (div \"Accept our cookies\")");
+    try t.expect(!has(try f.eval("document.getElementById('o').textContent"), "under was clicked"));
+    // a box hidden under its own label is clicked through the label
+    const r4 = try f.act("{\"action\":\"click\",\"ref\":4}");
+    try t.expect(!r4.is_error);
+    try t.expectEqualStrings("true", try f.eval("document.getElementById('c').checked"));
+}
+
+test "web_click_on_a_select_leaves_the_page_usable" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.page("sel.html", "<html><body><select aria-label=\"Size\"><option value=\"s\">Small</option><option value=\"l\">Large</option></select><input aria-label=\"Name\"><button onclick=\"document.getElementById('o').textContent = 'pressed'\">Go</button><p id=\"o\"></p></body></html>");
+    _ = try f.act(try f.openJson("sel.html", null));
+    const r1 = try f.act("{\"action\":\"click\",\"ref\":1}");
+    try t.expect(!r1.is_error);
+    const r2 = try f.act("{\"action\":\"type\",\"ref\":1,\"text\":\"l\"}");
+    try t.expect(!r2.is_error);
+    const r3 = try f.act("{\"action\":\"type\",\"ref\":2,\"text\":\"agent\"}");
+    try t.expect(!r3.is_error);
+    const r4 = try f.act("{\"action\":\"click\",\"ref\":3}");
+    try expectHas(r4.text, "pressed");
+    try t.expectEqualStrings("[\"l\",\"agent\"]", try f.eval("[document.querySelector('select').value, document.querySelector('input').value]"));
+}
+
+test "web_clicks_that_open_a_tab_or_a_download_are_handled" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.page("both.html", "<html><body><a target=\"_blank\" href=\"/page/tab.html?by=click\">tab</a> <button onclick=\"window.open('/page/tab.html?by=script')\">win</button> <a href=\"/page/f.bin\" download>file</a></body></html>");
+    try f.page("tab.html", "<html><body><script>localStorage.setItem('tab', 'loaded')</script></body></html>");
+    try f.page("f.bin", "bytes");
+    _ = try f.act(try f.openJson("both.html", null));
+    var said: std.ArrayList(u8) = .empty;
+    const a = f.e.arena.allocator();
+    for ([_][]const u8{ "1", "2", "3" }) |ref| try said.appendSlice(a, (try f.act(try std.fmt.allocPrint(a, "{{\"action\":\"click\",\"ref\":{s}}}", .{ref}))).text);
+    var tries: u32 = 0;
+    while (tries < 20 and !(has(said.items, "by=click") and has(said.items, "by=script") and has(said.items, "refused"))) : (tries += 1) {
+        t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        try said.appendSlice(a, (try f.act("{\"action\":\"read\"}")).text);
+    }
+    try expectHas(said.items, "/page/tab.html?by=click was closed before it loaded");
+    try expectHas(said.items, "/page/tab.html?by=script was closed before it loaded");
+    try expectHas(said.items, "A download was refused (downloads are off): ");
     try t.expectEqual(1, try pageTargets(&f));
     try t.expectEqualStrings("null", try f.eval("localStorage.getItem('tab')"));
 }
