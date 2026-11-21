@@ -94,6 +94,68 @@ fn isWordByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c >= 0x80;
 }
 
+/// Whether two texts that share their key words can be the same fact: a
+/// correction usually changes a number ("at 9" → "at 10") or denies what
+/// the other says, and is then a new item, not a repeat.
+pub fn sameFacts(a: []const u8, b: []const u8) bool {
+    if (negations(a) != negations(b)) return false;
+    var na: [16][]const u8 = undefined;
+    var nb: [16][]const u8 = undefined;
+    const xa = numbers(a, &na);
+    const xb = numbers(b, &nb);
+    if (xa.len != xb.len) return false;
+    const lt = struct {
+        fn f(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.f;
+    std.mem.sort([]const u8, xa, {}, lt);
+    std.mem.sort([]const u8, xb, {}, lt);
+    for (xa, xb) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+/// How many words of `text` deny something: not, no, never, … and any
+/// word ending in n't.
+fn negations(text: []const u8) usize {
+    const words_that_deny = [_][]const u8{ "not", "no", "never", "none", "nothing", "nobody", "nowhere", "neither", "nor", "cannot", "without" };
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        while (i < text.len and !isWordByte(text[i]) and text[i] != '\'') i += 1;
+        const start = i;
+        while (i < text.len and (isWordByte(text[i]) or text[i] == '\'')) i += 1;
+        const w = text[start..i];
+        if (w.len == 0) continue;
+        if (std.ascii.endsWithIgnoreCase(w, "n't") or std.ascii.endsWithIgnoreCase(w, "n\u{2019}t")) {
+            n += 1;
+            continue;
+        }
+        for (words_that_deny) |d| if (std.ascii.eqlIgnoreCase(w, d)) {
+            n += 1;
+            break;
+        };
+    }
+    return n;
+}
+
+/// The numbers in `text` ("9", "10:30", "3.5"), the first `out.len` of them.
+fn numbers(text: []const u8, out: [][]const u8) [][]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and n < out.len) {
+        if (!std.ascii.isDigit(text[i])) {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        while (i < text.len and (std.ascii.isDigit(text[i]) or ((text[i] == '.' or text[i] == ',' or text[i] == ':') and i + 1 < text.len and std.ascii.isDigit(text[i + 1])))) i += 1;
+        out[n] = text[start..i];
+        n += 1;
+    }
+    return out[0..n];
+}
+
 /// Fraction of the item's terms that appear among `ws`.
 pub fn match(terms: []const []const u8, ws: []const []const u8) f64 {
     if (terms.len == 0) return 0;
@@ -190,7 +252,7 @@ pub const Store = struct {
         if (ts.len == 0) ts = try words(a, body);
         for (s.items.items) |it| {
             const overlap = match(ts, @ptrCast(it.terms));
-            if (ts.len > 0 and overlap >= same_item) {
+            if (ts.len > 0 and overlap >= same_item and sameFacts(body, it.body)) {
                 if (from == .owner) try s.mention(it, now_s);
                 return .{ .id = it.id, .merged = true };
             }
@@ -557,6 +619,25 @@ test "near_duplicate_becomes_a_mention" {
     try t.expectEqualStrings(first.id, again.id);
     try t.expectEqual(1, f.store.items.items.len);
     try t.expectEqual(2, f.store.items.items[0].mentions.items.len);
+}
+
+test "a_correction_is_not_merged_into_the_fact_it_corrects" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const nine = try f.store.add("Owner's flight to Oslo leaves at 9 am", null, now - day);
+    const ten = try f.store.add("Owner's flight to Oslo leaves at 10 am", null, now);
+    try t.expect(!ten.merged);
+    try t.expect(!std.mem.eql(u8, nine.id, ten.id));
+    _ = try f.store.add("The owner likes coffee", null, now - day);
+    try t.expect(!(try f.store.add("The owner does not like coffee", null, now)).merged);
+    _ = try f.store.add("The owner can't stand loud music at dinner", null, now - day);
+    try t.expect(!(try f.store.add("The owner can stand loud music at dinner", null, now)).merged);
+    // a plain repeat still merges, into the item it agrees with
+    const again = try f.store.add("Owner's flight to Oslo leaves at 10 am sharp", null, now);
+    try t.expect(again.merged);
+    try t.expectEqualStrings(ten.id, again.id);
+    try t.expectEqual(6, f.store.items.items.len);
 }
 
 test "a_repeat_by_the_agent_or_the_writer_is_not_a_mention" {
