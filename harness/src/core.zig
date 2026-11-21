@@ -948,7 +948,7 @@ pub const Core = struct {
                 st.skipped = "out of memory";
                 continue;
             };
-            for (sc.secrets, values) |es, *v| v.* = c.secrets.get(es.secret) orelse {
+            for (sc.secrets, values) |es, *v| v.* = c.secretValue(a, es.secret) orelse {
                 st.skipped = std.fmt.allocPrint(a, "secret \"{s}\" is not stored (harness secret add {s})", .{ es.secret, es.secret }) catch "a secret is not stored";
                 break;
             };
@@ -999,6 +999,18 @@ pub const Core = struct {
         }
         c.mcp_tools = all.items;
         c.mcp_note = note.items;
+    }
+
+    /// A stored secret for an MCP server: one read at start, else from the
+    /// store now (a secret added since, picked up by /reload), which is
+    /// then masked like the others. Null when none is stored.
+    fn secretValue(c: *Core, a: std.mem.Allocator, name: []const u8) ?[]const u8 {
+        if (c.secrets.get(name)) |v| return v;
+        const st = c.store orelse return null;
+        const v = (st.get(c.io, a, name) catch null) orelse return null;
+        // never handed to a server unless it is masked from now on
+        c.masks.add(name, v) catch return null;
+        return v;
     }
 
     /// A folder of the server's own, state/mcp/NAME (0700): never the
@@ -2611,4 +2623,29 @@ test "a_value_added_while_a_turn_runs_is_masked_in_every_tool_from_then_on" {
     const req2 = try f.e.request(2);
     try t.expect(std.mem.indexOf(u8, req2, "made-at-signup-Pass-9271") == null);
     try t.expect(std.mem.indexOf(u8, req2, "[secret:login-new-password]") != null);
+}
+
+test "reload_takes_a_secret_stored_since_start_and_masks_it" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    f.core.store = st;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp fresh/echo *\n" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fresh]\ncommand = \"{s}\" --mcp\nsecret = FAKE_SECRET:fresh-key\n", .{fake}) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "secret \"fresh-key\" is not stored") != null);
+    // `harness secret add fresh-key` while harness runs, then /reload
+    try st.put(t.io, "fresh-key", "fresh-mcp-value-4711");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "fresh (3 tools)") != null);
+    // the server got it; what it says back is masked like any stored secret
+    try f.e.script(1, "{\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_m\",\"name\":\"fresh__echo\",\"input\":{\"text\":\"env\"}}],\"stop_reason\":\"tool_use\"}");
+    try f.e.script(2, model.textReply("ok"));
+    f.core.chatTurn("use it");
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "secret=[secret:fresh-key]") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "fresh-mcp-value-4711") == null);
 }
