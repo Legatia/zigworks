@@ -644,8 +644,17 @@ pub const Core = struct {
         const once = std.fmt.bufPrint(&id_buf[0], "a{d}:once", .{id}) catch return .deny;
         const day = std.fmt.bufPrint(&id_buf[1], "a{d}:day", .{id}) catch return .deny;
         const deny = std.fmt.bufPrint(&id_buf[2], "a{d}:deny", .{id}) catch return .deny;
-        var text_buf: [1700]u8 = undefined;
-        const text = std.fmt.bufPrint(&text_buf, "Allow this?\n{s}", .{what}) catch what;
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        // the whole question, in as many messages as it takes; the buttons
+        // go on the last, so it is answered after all of it was shown
+        const parts = questionParts(a, what) catch return .deny;
+        for (parts[0 .. parts.len - 1], 1..) |p, i| c.say(std.fmt.allocPrint(a, "Allow this? ({d}/{d})\n{s}", .{ i, parts.len, p }) catch return .deny);
+        const text = (if (parts.len == 1)
+            std.fmt.allocPrint(a, "Allow this?\n{s}", .{what})
+        else
+            std.fmt.allocPrint(a, "Allow this? ({d}/{d})\n{s}", .{ parts.len, parts.len, parts[parts.len - 1] })) catch return .deny;
         const msg = if (allow_day)
             ch.buttons(ch.ctx, text, &.{ .{ "Allow once", once }, .{ "Allow 24 h", day }, .{ "Deny", deny } })
         else
@@ -656,8 +665,8 @@ pub const Core = struct {
             {
                 c.approval.mutex.lockUncancelable(c.io);
                 defer c.approval.mutex.unlock(c.io);
-                if (c.approval.answer) |a| {
-                    ans = a;
+                if (c.approval.answer) |got| {
+                    ans = got;
                     break;
                 }
             }
@@ -676,6 +685,29 @@ pub const Core = struct {
         if (msg) |m| ch.clear(ch.ctx, m);
         if (ans == .timeout) c.say("No answer in time; not allowed.");
         return ans;
+    }
+
+    /// Telegram's limit for one message, in bytes (it counts characters, and
+    /// a character takes at least a byte).
+    const message_max = 4096;
+
+    /// `what` in parts that each fit one message with their heading ("Allow
+    /// this? (2/3)"), cut after a line break near the end where there is one.
+    fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
+        const room = message_max - 32;
+        var out: std.ArrayList([]const u8) = .empty;
+        var rest = what;
+        while (rest.len > room) {
+            var n = util.cut(rest, room).len;
+            const from = room - room / 5;
+            if (n > from) if (std.mem.lastIndexOfScalar(u8, rest[from..n], '\n')) |k| {
+                n = from + k + 1;
+            };
+            try out.append(a, rest[0..n]);
+            rest = rest[n..];
+        }
+        try out.append(a, rest);
+        return out.items;
     }
 
     // ---- the chat worker ----
@@ -1735,6 +1767,38 @@ test "text_during_approval_is_queued_button_answers" {
     try f.rec.waitFor("answer to the queued text");
     const req2 = try f.e.request(2);
     try t.expect(std.mem.indexOf(u8, req2, "approved-run") != null);
+}
+
+test "a_long_question_goes_whole_in_parts_with_the_buttons_on_the_last" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const ys = try a.alloc(u8, 6000);
+    @memset(ys, 'y');
+    try f.e.script(1, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"shell\",\"input\":{{\"command\":\"echo {s} end-of-it\"}}}}],\"stop_reason\":\"tool_use\"}}", .{ys}));
+    try f.e.script(2, model.textReply("not run"));
+    try f.core.startWorker();
+    try f.core.handleText("run the long one");
+    try f.rec.waitFor("BUTTONS Allow this? (2/2)\n");
+    var whole: std.ArrayList(u8) = .empty;
+    {
+        f.rec.mutex.lockUncancelable(t.io);
+        defer f.rec.mutex.unlock(t.io);
+        try t.expectEqual(2, f.rec.lines.items.len);
+        const first = f.rec.lines.items[0];
+        const last = f.rec.lines.items[1];
+        try t.expect(std.mem.startsWith(u8, first, "Allow this? (1/2)\n"));
+        try t.expect(first.len <= 4096);
+        // "BUTTONS " and " [a1:once]" are the recorder's
+        const last_text = last["BUTTONS ".len .. std.mem.lastIndexOf(u8, last, " [").?];
+        try t.expect(last_text.len <= 4096);
+        try whole.appendSlice(a, first["Allow this? (1/2)\n".len..]);
+        try whole.appendSlice(a, last_text["Allow this? (2/2)\n".len..]);
+    }
+    try t.expectEqualStrings(try std.fmt.allocPrint(a, "shell: echo {s} end-of-it", .{ys}), whole.items);
+    f.core.handleCallback(42, "a1:deny");
+    try f.rec.waitFor("not run");
 }
 
 test "stop_ends_running_turn_and_reports" {
