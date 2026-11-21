@@ -56,9 +56,16 @@ const App = struct {
     io: Io,
     env: *std.process.Environ.Map,
     home: []const u8 = "",
+    /// Where this folder's secrets are kept (`prepareStore`).
+    store_cache: ?store_mod.Store = null,
 
     fn defaultHome(app: *App) ![]const u8 {
         if (app.env.get("HARNESS_HOME")) |h| if (h.len > 0) return h;
+        return app.builtinHome();
+    }
+
+    /// The folder harness uses with no --home and no HARNESS_HOME.
+    fn builtinHome(app: *App) ![]const u8 {
         if (builtin.os.tag == .windows) {
             const base = app.env.get("LOCALAPPDATA") orelse return error.NoHomeDirectory;
             return std.fs.path.join(app.arena, &.{ base, "harness" });
@@ -68,10 +75,25 @@ const App = struct {
         return std.fs.path.join(app.arena, &.{ home, ".local", "share", "harness" });
     }
 
+    /// Works out where this folder's secrets are kept: HARNESS_STORE=DIR as
+    /// given; the Keychain or the Credential Manager under the folder's own
+    /// namespace (the built-in folder keeps the one every earlier harness
+    /// used); elsewhere DATA/secrets.
+    fn prepareStore(app: *App) !void {
+        if (app.env.get("HARNESS_STORE")) |d| if (d.len > 0) {
+            app.store_cache = .{ .dir = d };
+            return;
+        };
+        if (builtin.os.tag == .macos or builtin.os.tag == .windows) {
+            const is_default = if (app.builtinHome()) |d| samePath(app.io, app.arena, app.home, d) else |_| false;
+            app.store_cache = store_mod.system(try store_mod.namespace(app.io, app.arena, app.home, is_default)).?;
+            return;
+        }
+        app.store_cache = .{ .dir = try std.fs.path.join(app.arena, &.{ app.home, "secrets" }) };
+    }
+
     fn store(app: *App) store_mod.Store {
-        const override = if (app.env.get("HARNESS_STORE")) |s| (if (s.len > 0) s else null) else null;
-        if (override != null or builtin.os.tag == .macos or builtin.os.tag == .windows) return store_mod.default(override, null);
-        return store_mod.default(null, std.fs.path.join(app.arena, &.{ app.home, "secrets" }) catch "harness-secrets");
+        return app.store_cache.?;
     }
 
     fn settings(app: *App) !config.Config {
@@ -226,6 +248,12 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory" }) |c| if (eql(cmd, c)) {
+        app.prepareStore() catch |e| {
+            complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
+            return .failed;
+        };
+    };
     if (eql(cmd, "version")) {
         try outAll(app.io, "harness " ++ build_options.version ++ "\n");
         return .ok;
@@ -1021,6 +1049,23 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+/// Whether two paths name the same folder: their real paths when they
+/// exist, else the paths made absolute (case ignored where the file system
+/// usually does).
+fn samePath(io: Io, a: std.mem.Allocator, x: []const u8, y: []const u8) bool {
+    const rx = absolute(io, a, x) orelse return false;
+    const ry = absolute(io, a, y) orelse return false;
+    if (builtin.os.tag == .macos or builtin.os.tag == .windows) return std.ascii.eqlIgnoreCase(rx, ry);
+    return std.mem.eql(u8, rx, ry);
+}
+
+fn absolute(io: Io, a: std.mem.Allocator, p: []const u8) ?[]const u8 {
+    if (Io.Dir.cwd().realPathFileAlloc(io, p, a)) |r| return r else |_| {}
+    if (std.fs.path.isAbsolute(p)) return std.fs.path.resolve(a, &.{p}) catch null;
+    const cwd = Io.Dir.cwd().realPathFileAlloc(io, ".", a) catch return null;
+    return std.fs.path.resolve(a, &.{ cwd, p }) catch null;
+}
+
 const t = std.testing;
 
 test "global_options_count_anywhere_on_the_line" {
@@ -1123,11 +1168,26 @@ test "mcp_servers_and_the_browser_only_for_commands_that_use_tools" {
 
 test "a_value_too_long_for_the_store_is_refused_with_its_limit" {
     var buf: [200]u8 = undefined;
-    const why = valueProblem(&buf, .wincred, 3000) orelse return error.TestUnexpectedResult;
+    const why = valueProblem(&buf, .{ .wincred = store_mod.legacy_namespace }, 3000) orelse return error.TestUnexpectedResult;
     try t.expect(std.mem.indexOf(u8, why, "Credential Manager") != null);
     try t.expect(std.mem.indexOf(u8, why, "2560") != null);
-    try t.expect(valueProblem(&buf, .wincred, 2560) == null);
-    try t.expect(valueProblem(&buf, .wincred, 7) != null);
+    try t.expect(valueProblem(&buf, .{ .wincred = store_mod.legacy_namespace }, 2560) == null);
+    try t.expect(valueProblem(&buf, .{ .wincred = store_mod.legacy_namespace }, 7) != null);
+}
+
+test "same_path_sees_one_folder_however_it_is_written" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(t.io, "data/harness");
+    const real = try tmp.dir.realPathFileAlloc(t.io, "data/harness", a);
+    try t.expect(samePath(t.io, a, real, try std.fmt.allocPrint(a, "{s}/", .{real})));
+    try t.expect(samePath(t.io, a, real, try std.fs.path.join(a, &.{ real, "..", "harness" })));
+    try t.expect(!samePath(t.io, a, real, try std.fs.path.join(a, &.{ real, "..", "other" })));
+    // not made yet: compared as written
+    try t.expect(samePath(t.io, a, "/no/such/place", "/no/such/./place"));
 }
 
 fn printLine(what: []const u8, line: []const []const u8) void {
