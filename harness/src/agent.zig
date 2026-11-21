@@ -733,12 +733,18 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
             break :blk try systemParts(a, r, recalled, conv.summary, conv.dropped, started);
         };
         const msgs = try conv.messages(a);
-        const reply = r.client.sendParts(a, system.stable, "", msgs, defs) catch |e| {
+        const reply = r.client.sendParts(a, system.stable, "", msgs, defs, .{ .stop = r.env.stop, .deadline_s = deadline }) catch |e| {
+            if (e == error.Stopped) {
+                result.stopped = true;
+                result.ended_by = try r.gpa.dupe(u8, "Stopped.");
+                break;
+            }
             const why: []const u8 = switch (e) {
                 error.BudgetSpent => "Model budget used up.",
                 error.RateLimited => "The model is rate limited; try again later.",
                 error.NoKey => "Model calls are refused: no omnigate key is stored (harness secret add omnigate).",
                 error.NoUrl => "Model calls are refused: no omnigate url is set ([model] url in config.ini, then /reload).",
+                error.Timeout => if (r.now() >= deadline) "Time limit reached for this turn." else try std.fmt.allocPrint(a, "Model call failed: Timeout {s}", .{r.client.lastError()}),
                 else => try std.fmt.allocPrint(a, "Model call failed: {s} {s}", .{ @errorName(e), r.client.lastError() }),
             };
             try r.log.write(.model, false, .{ .run = r.label, .result = @errorName(e), .detail = r.client.lastError() });
@@ -1402,6 +1408,20 @@ test "a_turn_without_a_key_says_model_calls_are_refused" {
     defer freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, r.text, "no omnigate key is stored") != null);
     try t.expectEqual(0, f.e.server.modelRequests());
+}
+
+test "a_slow_model_call_ends_with_the_turn" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    f.run.limits.turn_seconds = 2;
+    try f.e.script(1, comptime "{\"delay_ms\":6000," ++ model.textReply("too late")[1..]);
+    const start = Io.Clock.awake.now(t.io);
+    const r = try f.say("hello");
+    defer freeResult(&f.run, r);
+    try t.expect(start.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 4500);
+    try t.expectEqualStrings("Time limit reached for this turn.", r.text);
+    try t.expectEqual(1, f.e.server.modelRequests());
 }
 
 test "stop_before_next_call" {

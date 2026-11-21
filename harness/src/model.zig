@@ -50,6 +50,8 @@ pub const Error = error{
     NoKey,
     /// No url is set: the call is refused before anything is sent.
     NoUrl,
+    /// /stop came while waiting to send again: nothing more was sent.
+    Stopped,
 } || http.Error;
 
 pub const Client = struct {
@@ -65,6 +67,8 @@ pub const Client = struct {
     last_error_len: usize = 0,
     /// Longest wait on a 429 (seconds).
     max_retry_wait: u32 = 60,
+    /// Longest one call may take (ms), whatever the deadline.
+    call_ms: u32 = 900_000,
 
     /// An empty `url` or `key` gives a client whose calls are refused
     /// (error.NoUrl, error.NoKey), so nothing is sent without both.
@@ -81,25 +85,40 @@ pub const Client = struct {
         return c.last_error[0..c.last_error_len];
     }
 
+    /// What a call's waits end on.
+    pub const Limits = struct {
+        /// Set: no retry and no wait after it is true.
+        stop: ?*const std.atomic.Value(bool) = null,
+        /// Unix seconds by which the call must be over; 0: none.
+        deadline_s: i64 = 0,
+    };
+
     pub fn send(c: *Client, arena: std.mem.Allocator, system: []const u8, messages: []const Message, tools: []const ToolDef) Error!Reply {
-        return c.sendParts(arena, system, "", messages, tools);
+        return c.sendParts(arena, system, "", messages, tools, .{});
     }
 
     /// `stable` is the part of the system prompt that stays the same from
     /// call to call (marked for the prompt cache), `changing` the rest.
-    pub fn sendParts(c: *Client, arena: std.mem.Allocator, stable: []const u8, changing: []const u8, messages: []const Message, tools: []const ToolDef) Error!Reply {
+    pub fn sendParts(c: *Client, arena: std.mem.Allocator, stable: []const u8, changing: []const u8, messages: []const Message, tools: []const ToolDef, lim: Limits) Error!Reply {
         if (c.http == null) return error.NoUrl;
         if (c.key.len == 0) return error.NoKey;
         const body = try requestBody(arena, c.model, c.max_tokens, stable, changing, messages, tools);
         var limited = false;
-        var conn_retry = false;
+        var connect_retry = false;
         while (true) {
-            const r = c.post(arena, body) catch |e| switch (e) {
-                error.ConnectFailed, error.ConnectionClosed, error.Timeout => {
-                    if (conn_retry) return e;
-                    conn_retry = true;
+            if (stopped(lim)) return error.Stopped;
+            // past the deadline nothing is sent; before it, the answer is
+            // waited for only until then
+            const ms = c.callLimit(lim) orelse return error.Timeout;
+            const r = c.post(arena, body, ms) catch |e| switch (e) {
+                // nothing reached the server: once more
+                error.ConnectFailed => {
+                    if (connect_retry) return e;
+                    connect_retry = true;
                     continue;
                 },
+                // timed out, or cut off after it was sent: the model may
+                // have answered it, and sent again it may be billed twice
                 else => return e,
             };
             switch (r.status) {
@@ -112,8 +131,7 @@ pub const Client = struct {
                     c.note(r.body);
                     if (limited) return error.RateLimited;
                     limited = true;
-                    const wait_s = @min(r.retry_after_s orelse 5, c.max_retry_wait);
-                    c.io.sleep(.fromSeconds(wait_s), .awake) catch {};
+                    try c.pause(@min(r.retry_after_s orelse 5, c.max_retry_wait), lim);
                 },
                 else => {
                     c.note(r.body);
@@ -123,9 +141,40 @@ pub const Client = struct {
         }
     }
 
+    fn stopped(lim: Limits) bool {
+        const f = lim.stop orelse return false;
+        return f.load(.acquire);
+    }
+
+    /// How long the next call may take (ms): `call_ms`, or less to end by
+    /// the deadline; null once the deadline has passed.
+    fn callLimit(c: *const Client, lim: Limits) ?u32 {
+        if (lim.deadline_s == 0) return c.call_ms;
+        const left = lim.deadline_s * 1000 - nowMs(c.io);
+        if (left <= 0) return null;
+        return @intCast(@min(left, c.call_ms));
+    }
+
+    /// Waits `seconds` before asking again: error.Stopped on /stop,
+    /// error.RateLimited at once when the wait would end past the deadline.
+    fn pause(c: *Client, seconds: u32, lim: Limits) Error!void {
+        const wait_ms = @as(i64, seconds) * 1000;
+        if (lim.deadline_s > 0 and nowMs(c.io) + wait_ms >= lim.deadline_s * 1000) return error.RateLimited;
+        const until = Io.Clock.awake.now(c.io).nanoseconds + @as(i96, wait_ms) * std.time.ns_per_ms;
+        while (Io.Clock.awake.now(c.io).nanoseconds < until) {
+            if (stopped(lim)) return error.Stopped;
+            c.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        }
+        if (stopped(lim)) return error.Stopped;
+    }
+
+    fn nowMs(io: Io) i64 {
+        return @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
+    }
+
     const Raw = struct { status: u16, body: []u8, retry_after_s: ?u32 };
 
-    fn post(c: *Client, arena: std.mem.Allocator, body: []const u8) http.Error!Raw {
+    fn post(c: *Client, arena: std.mem.Allocator, body: []const u8, total_ms: u32) http.Error!Raw {
         var resp = try c.http.?.send(.{
             .path = "/v1/messages",
             .body = body,
@@ -133,7 +182,7 @@ pub const Client = struct {
                 .{ .name = "x-api-key", .value = c.key },
                 .{ .name = "anthropic-version", .value = "2023-06-01" },
             },
-            .limits = .{ .idle_ms = 300_000, .total_ms = 900_000 },
+            .limits = .{ .idle_ms = @min(300_000, total_ms), .total_ms = total_ms },
         });
         defer resp.deinit();
         const got = try resp.readAll(arena, 32 << 20);
@@ -421,6 +470,69 @@ test "no_url_or_no_key_refuses_the_call_without_sending_it" {
     try t.expectEqual(0, e.server.modelRequests());
 }
 
+fn sinceMs(start: Io.Timestamp) i64 {
+    return start.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
+}
+
+const hi: []const Message = &.{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }};
+
+test "a_timed_out_call_is_not_sent_again" {
+    var e: TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    // the model may be at work on it: sent again, it may be billed again
+    try e.script(1, comptime "{\"delay_ms\":2000," ++ textReply("late")[1..]);
+    try e.script(2, textReply("sent twice"));
+    var c = try e.client();
+    defer c.deinit();
+    c.call_ms = 500;
+    try t.expectError(error.Timeout, c.send(e.arena.allocator(), "", hi, &.{}));
+    try t.expectEqual(1, e.server.modelRequests());
+}
+
+test "a_call_ends_by_the_turn_deadline" {
+    var e: TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try e.script(1, comptime "{\"delay_ms\":5000," ++ textReply("too late")[1..]);
+    var c = try e.client();
+    defer c.deinit();
+    const start = Io.Clock.awake.now(t.io);
+    try t.expectError(error.Timeout, c.sendParts(e.arena.allocator(), "", "", hi, &.{}, .{ .deadline_s = util.nowSeconds(t.io) + 1 }));
+    try t.expect(sinceMs(start) < 3000);
+}
+
+fn stopSoon(flag: *std.atomic.Value(bool)) void {
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    flag.store(true, .release);
+}
+
+test "stop_and_the_deadline_end_the_wait_after_a_429" {
+    var e: TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try e.script(1, "{\"status\":429,\"retry_after\":10}");
+    try e.script(2, "{\"status\":429,\"retry_after\":10}");
+    try e.script(3, textReply("after the wait"));
+    var c = try e.client();
+    defer c.deinit();
+    c.max_retry_wait = 10;
+    const a = e.arena.allocator();
+    var stop: std.atomic.Value(bool) = .init(false);
+    const th = try std.Thread.spawn(.{}, stopSoon, .{&stop});
+    var start = Io.Clock.awake.now(t.io);
+    const stopped = c.sendParts(a, "", "", hi, &.{}, .{ .stop = &stop });
+    th.join();
+    try t.expectError(error.Stopped, stopped);
+    try t.expect(sinceMs(start) < 3000);
+    try t.expectEqual(1, e.server.modelRequests());
+    // a wait that would end past the deadline is not begun
+    start = Io.Clock.awake.now(t.io);
+    try t.expectError(error.RateLimited, c.sendParts(a, "", "", hi, &.{}, .{ .deadline_s = util.nowSeconds(t.io) + 2 }));
+    try t.expect(sinceMs(start) < 3000);
+    try t.expectEqual(2, e.server.modelRequests());
+}
+
 test "cache_marks_on_last_tool_stable_system_and_last_message" {
     var e: TestEnv = undefined;
     try e.init();
@@ -436,7 +548,7 @@ test "cache_marks_on_last_tool_stable_system_and_last_message" {
     }, &.{
         .{ .name = "one", .description = "1", .schema_json = "{\"type\":\"object\"}" },
         .{ .name = "two", .description = "2", .schema_json = "{\"type\":\"object\"}" },
-    });
+    }, .{});
     try t.expectEqual(900, r.cache_read_tokens);
     try t.expectEqual(40, r.cache_write_tokens);
     const v = jv.parse(a, try e.request(1)).?;
