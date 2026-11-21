@@ -184,6 +184,8 @@ pub const StartOptions = struct {
     start_timeout_ms: u32 = 20000,
     /// When start fails, the end of the server's stderr goes here.
     diag: ?*Diag = null,
+    /// Set: the start ends at once (error.Stopped).
+    stop: ?*std.atomic.Value(bool) = null,
 };
 
 extern "kernel32" fn TerminateProcess(h: std.os.windows.HANDLE, code: u32) callconv(.winapi) std.os.windows.BOOL;
@@ -283,8 +285,9 @@ pub const Server = struct {
         s.name = try a.dupe(u8, cfg.name);
 
         var never: std.atomic.Value(bool) = .init(false);
+        const stop = opts.stop orelse &never;
         const deadline = nowNs(io) + @as(i128, opts.start_timeout_ms) * std.time.ns_per_ms;
-        const init_raw = try s.request(tmp, "initialize", "{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"harness\",\"version\":\"" ++ @import("build_options").version ++ "\"}}", &never, deadline);
+        const init_raw = try s.request(tmp, "initialize", "{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"harness\",\"version\":\"" ++ @import("build_options").version ++ "\"}}", stop, deadline);
         const init_v = jv.parse(tmp, init_raw) orelse return error.BadResponse;
         if (jv.get(init_v, "result") == null) return error.InitFailed;
         try s.send(tmp, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
@@ -300,7 +303,7 @@ pub const Server = struct {
                 try util.jsonString(&params, tmp, c);
             }
             try params.appendSlice(tmp, "}");
-            const raw = try s.request(tmp, "tools/list", params.items, &never, deadline);
+            const raw = try s.request(tmp, "tools/list", params.items, stop, deadline);
             const v = jv.parse(tmp, raw) orelse return error.BadResponse;
             const result = jv.get(v, "result") orelse return error.ListFailed;
             for (jv.arr(jv.get(result, "tools")) orelse &.{}) |tv| {

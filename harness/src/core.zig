@@ -170,6 +170,10 @@ pub const Core = struct {
     mcp_arena: std.heap.ArenaAllocator = undefined,
     /// Guards the list of servers (endBySignal reads it from its thread).
     mcp_mutex: Io.Mutex = .init,
+    /// startMcp is under way (endBySignal waits for it to end).
+    mcp_starting: std.atomic.Value(bool) = .init(false),
+    /// /reload is restarting the MCP servers: no run starts meanwhile.
+    restarting: std.atomic.Value(bool) = .init(false),
     mcp_servers: std.ArrayList(*mcp.Server) = .empty,
     mcp_tools: []const agent.McpTool = &.{},
     /// What started and what did not, for /status.
@@ -228,6 +232,8 @@ pub const Core = struct {
     memory_quiet_s: i64 = 30 * 60,
     /// How long /stop waits for runs to end before answering.
     stop_wait_ms: u32 = 3_000,
+    /// How long the MCP servers have to start, all of them together.
+    mcp_start_ms: u32 = 20_000,
     path_var: []const u8 = "/usr/local/bin:/usr/bin:/bin",
     home_var: []const u8 = "",
     /// On Windows, the system's own variables, for commands and MCP servers.
@@ -300,6 +306,8 @@ pub const Core = struct {
         c.money_ledger.load(io);
         c.mcp_servers = .empty;
         c.mcp_mutex = .init;
+        c.mcp_starting = .init(false);
+        c.restarting = .init(false);
         c.watcher = null;
         c.stop = .init(false);
         c.runs_mutex = .init;
@@ -331,6 +339,7 @@ pub const Core = struct {
         c.fixed_now = null;
         c.memory_quiet_s = 30 * 60;
         c.stop_wait_ms = 3_000;
+        c.mcp_start_ms = 20_000;
         c.path_var = "/usr/local/bin:/usr/bin:/bin";
         c.home_var = "";
         c.system_vars = &.{};
@@ -436,10 +445,12 @@ pub const Core = struct {
         // nothing may start while the settings are replaced: the scheduler
         // waits on settings_mutex, the chat worker on queue_mutex
         c.settings_mutex.lockUncancelable(c.io);
-        defer c.settings_mutex.unlock(c.io);
+        var settings_locked = true;
+        defer if (settings_locked) c.settings_mutex.unlock(c.io);
         c.queue_mutex.lockUncancelable(c.io);
-        defer c.queue_mutex.unlock(c.io);
-        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0) return "Busy; send /reload again when nothing is running.";
+        var queue_locked = true;
+        defer if (queue_locked) c.queue_mutex.unlock(c.io);
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire)) return "Busy; send /reload again when nothing is running.";
         var fresh: std.heap.ArenaAllocator = .init(c.gpa);
         const saved_cfg = c.cfg;
         const saved_rules = c.rule_list;
@@ -475,7 +486,21 @@ pub const Core = struct {
         c.gate.rules = c.rule_list;
         c.findBrowser();
         c.told_settings_changed = false;
-        // nothing runs now (reload waits for that), so servers can restart
+        // nothing runs now (reload waits for that), so servers can restart;
+        // nothing may start until they have (popQueue, claimIdle and
+        // startBackground look at `restarting`), but the locks are let go:
+        // /stop, a signal and the scheduler's status do not wait for it
+        c.restarting.store(true, .release);
+        queue_locked = false;
+        c.queue_mutex.unlock(c.io);
+        settings_locked = false;
+        c.settings_mutex.unlock(c.io);
+        return c.restartMcp();
+    }
+
+    /// The second half of reload, outside its locks.
+    fn restartMcp(c: *Core) ![]const u8 {
+        defer c.restarting.store(false, .release);
         c.stopMcp();
         c.startMcp();
         try c.log.write(.config, false, .{ .event = "reload" });
@@ -727,7 +752,8 @@ pub const Core = struct {
     fn popQueue(c: *Core) ?[]u8 {
         c.queue_mutex.lockUncancelable(c.io);
         defer c.queue_mutex.unlock(c.io);
-        if (c.queue.items.len == 0) return null;
+        // while the MCP servers restart, messages wait
+        if (c.queue.items.len == 0 or c.restarting.load(.acquire)) return null;
         c.busy.store(true, .release);
         return c.queue.orderedRemove(0);
     }
@@ -736,7 +762,7 @@ pub const Core = struct {
     fn claimIdle(c: *Core) bool {
         c.queue_mutex.lockUncancelable(c.io);
         defer c.queue_mutex.unlock(c.io);
-        if (c.queue.items.len > 0 or c.busy.load(.acquire)) return false;
+        if (c.queue.items.len > 0 or c.busy.load(.acquire) or c.restarting.load(.acquire)) return false;
         c.busy.store(true, .release);
         return true;
     }
@@ -850,10 +876,45 @@ pub const Core = struct {
 
     // ---- MCP servers ----
 
-    /// Starts the servers in mcp.ini; one that fails is noted and skipped.
+    /// One server being started, on a thread of its own.
+    const McpStart = struct {
+        core: *Core,
+        cfg: mcp.ServerConfig,
+        values: []const []const u8 = &.{},
+        dir: []const u8 = "",
+        timeout_ms: u32 = 0,
+        stop: *std.atomic.Value(bool),
+        /// Why it was not even tried.
+        skipped: ?[]const u8 = null,
+        srv: ?*mcp.Server = null,
+        err: anyerror = error.NotStarted,
+        diag: mcp.Diag = .{},
+
+        fn run(st: *McpStart) void {
+            const c = st.core;
+            st.srv = mcp.Server.start(c.gpa, c.io, st.cfg, .{
+                .cwd = st.dir,
+                .path_var = c.path_var,
+                .home = c.home_var,
+                .system_vars = c.system_vars,
+                .secret_values = st.values,
+                .start_timeout_ms = st.timeout_ms,
+                .diag = &st.diag,
+                .stop = st.stop,
+            }) catch |e| {
+                st.err = e;
+                return;
+            };
+        }
+    };
+
+    /// Starts the servers in mcp.ini, all at once under one deadline
+    /// (`mcp_start_ms`); one that fails is noted and skipped. /stop and a
+    /// signal cut the starts short.
     fn startMcp(c: *Core) void {
+        c.mcp_starting.store(true, .release);
+        defer c.mcp_starting.store(false, .release);
         c.mcp_arena = .init(c.gpa);
-        c.mcp_servers = .empty;
         c.mcp_tools = &.{};
         c.mcp_note = "";
         const a = c.mcp_arena.allocator();
@@ -863,27 +924,53 @@ pub const Core = struct {
             c.mcp_note = std.fmt.allocPrint(a, "{s}; no servers started.", .{why}) catch "mcp.ini has an error; no servers started.";
             return;
         };
-        var note: std.ArrayList(u8) = .empty;
-        var all: std.ArrayList(agent.McpTool) = .empty;
-        next: for (cfgs) |sc| {
-            const values = a.alloc([]const u8, sc.secrets.len) catch return;
-            for (sc.secrets, 0..) |es, i| {
-                values[i] = c.secrets.get(es.secret) orelse {
-                    note.print(a, "{s}: secret \"{s}\" is not stored (harness secret add {s})\n", .{ sc.name, es.secret, es.secret }) catch {};
-                    continue :next;
-                };
-            }
-            const dir = c.mcpDir(a, sc.name) catch |e| {
-                note.print(a, "{s}: did not start (its folder: {s})\n", .{ sc.name, @errorName(e) }) catch {};
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag);
+        defer c.unregister(&flag);
+        const starts = a.alloc(McpStart, cfgs.len) catch return;
+        const threads = a.alloc(?std.Thread, cfgs.len) catch return;
+        const deadline = Io.Clock.awake.now(c.io).nanoseconds + @as(i96, c.mcp_start_ms) * std.time.ns_per_ms;
+        for (cfgs, starts, threads) |sc, *st, *th| {
+            st.* = .{ .core = c, .cfg = sc, .stop = &flag };
+            th.* = null;
+            const values = a.alloc([]const u8, sc.secrets.len) catch {
+                st.skipped = "out of memory";
                 continue;
             };
-            var diag: mcp.Diag = .{};
-            const srv = mcp.Server.start(c.gpa, c.io, sc, .{ .cwd = dir, .path_var = c.path_var, .home = c.home_var, .system_vars = c.system_vars, .secret_values = values, .diag = &diag }) catch |e| {
+            for (sc.secrets, values) |es, *v| v.* = c.secrets.get(es.secret) orelse {
+                st.skipped = std.fmt.allocPrint(a, "secret \"{s}\" is not stored (harness secret add {s})", .{ es.secret, es.secret }) catch "a secret is not stored";
+                break;
+            };
+            if (st.skipped != null) continue;
+            st.values = values;
+            st.dir = c.mcpDir(a, sc.name) catch |e| {
+                st.skipped = std.fmt.allocPrint(a, "did not start (its folder: {s})", .{@errorName(e)}) catch "did not start";
+                continue;
+            };
+            const left_ms = @divFloor(deadline - Io.Clock.awake.now(c.io).nanoseconds, std.time.ns_per_ms);
+            st.timeout_ms = @intCast(std.math.clamp(left_ms, 1, std.math.maxInt(u32)));
+            th.* = std.Thread.spawn(.{}, McpStart.run, .{st}) catch blk: {
+                st.run();
+                break :blk null;
+            };
+        }
+        for (threads) |th| if (th) |x| x.join();
+
+        // said and kept in mcp.ini's order
+        var note: std.ArrayList(u8) = .empty;
+        var all: std.ArrayList(agent.McpTool) = .empty;
+        for (starts) |*st| {
+            const name = st.cfg.name;
+            if (st.skipped) |why| {
+                note.print(a, "{s}: {s}\n", .{ name, why }) catch {};
+                continue;
+            }
+            const srv = st.srv orelse {
                 // a server may print its key when it fails: mask before keeping
-                var sc_mask = scrub.Scrubber.init(a, c.secret_list) catch return;
-                const detail = sc_mask.scrubAlloc(a, diag.text()) catch "";
-                note.print(a, "{s}: did not start ({s}) {s}\n", .{ sc.name, @errorName(e), util.cut(detail, 200) }) catch {};
-                c.log.write(.config, false, .{ .event = "mcp failed", .server = sc.name, .why = @errorName(e), .detail = detail }) catch {};
+                var sc_mask = scrub.Scrubber.init(a, c.secret_list) catch continue;
+                const detail = sc_mask.scrubAlloc(a, st.diag.text()) catch "";
+                note.print(a, "{s}: did not start ({s}) {s}\n", .{ name, @errorName(st.err), util.cut(detail, 200) }) catch {};
+                c.log.write(.config, false, .{ .event = "mcp failed", .server = name, .why = @errorName(st.err), .detail = detail }) catch {};
                 continue;
             };
             {
@@ -894,10 +981,10 @@ pub const Core = struct {
                     continue;
                 };
             }
-            const tl = agent.mcpTools(a, srv, sc.money, sc.amount) catch &.{};
+            const tl = agent.mcpTools(a, srv, st.cfg.money, st.cfg.amount) catch &.{};
             all.appendSlice(a, tl) catch {};
-            note.print(a, "{s} ({d} tools)\n", .{ sc.name, tl.len }) catch {};
-            c.log.write(.config, false, .{ .event = "mcp started", .server = sc.name, .tools = tl.len }) catch {};
+            note.print(a, "{s} ({d} tools)\n", .{ name, tl.len }) catch {};
+            c.log.write(.config, false, .{ .event = "mcp started", .server = name, .tools = tl.len }) catch {};
         }
         c.mcp_tools = all.items;
         c.mcp_note = note.items;
@@ -1034,6 +1121,9 @@ pub const Core = struct {
         c.stop.store(true, .release);
         c.log.write(.config, false, .{ .event = "signal", .signal = what }) catch {};
         _ = c.stopAll();
+        // servers being started end their starts at the stop; then all go
+        var waited: u32 = 0;
+        while (c.mcp_starting.load(.acquire) and waited < 3000) : (waited += 20) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.killMcp();
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
@@ -1118,7 +1208,8 @@ pub const Core = struct {
     fn startBackground(c: *Core, job: Job, key: []const u8) void {
         c.state_mutex.lockUncancelable(c.io);
         defer c.state_mutex.unlock(c.io);
-        if (c.running.contains(key)) return;
+        // the next tick starts it once the MCP servers are back
+        if (c.running.contains(key) or c.restarting.load(.acquire)) return;
         // the chat keeps one of the slots
         const slots = @max(1, c.cfg.limits.concurrent_runs) - 1;
         if (c.bg_active.load(.acquire) >= @max(1, slots)) return;
@@ -2438,4 +2529,52 @@ test "mcp_servers_run_in_a_folder_of_their_own_not_the_workspace" {
         const st = try Io.Dir.cwd().statFile(t.io, d, .{});
         try t.expectEqual(@as(u32, 0o700), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
     }
+}
+
+fn reloadQuietly(c: *Core) void {
+    _ = c.reload() catch {};
+}
+
+test "mcp_servers_start_together_under_one_deadline" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    f.core.mcp_start_ms = 1500;
+    // two that take half a second to come up, one that never answers
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[one]\ncommand = /bin/sh -c \"sleep 0.5; exec '{s}' --mcp\"\n[two]\ncommand = /bin/sh -c \"sleep 0.5; exec '{s}' --mcp\"\n[mute]\ncommand = /bin/sh -c \"exec sleep 30\"\n", .{ fake, fake }) });
+    const t0 = Io.Clock.awake.now(t.io).nanoseconds;
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const took_ms = @divFloor(Io.Clock.awake.now(t.io).nanoseconds - t0, std.time.ns_per_ms);
+    // one after another: 0.5 + 0.5 + 1.5 s; together: the deadline
+    try t.expect(took_ms < 2300);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "one (3 tools)") != null);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "two (3 tools)") != null);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "mute: did not start (Timeout)") != null);
+    // in mcp.ini's order
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "one").? < std.mem.indexOf(u8, f.core.mcp_note, "two").?);
+}
+
+test "reload_holds_no_lock_while_servers_start_and_stop_cuts_it_short" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[slow]\ncommand = /bin/sh -c \"sleep 3; exec '{s}' --mcp\"\n", .{fake}) });
+    const t0 = Io.Clock.awake.now(t.io).nanoseconds;
+    const th = try std.Thread.spawn(.{}, reloadQuietly, .{f.core});
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    // /stop and the scheduler's tick do not wait for the start
+    _ = f.core.stopAll();
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - t0 < 1500 * std.time.ns_per_ms);
+    th.join();
+    // and the stop ended the start instead of waiting it out
+    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - t0 < 2800 * std.time.ns_per_ms);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "slow: did not start (Stopped)") != null);
 }

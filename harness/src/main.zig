@@ -138,7 +138,23 @@ const App = struct {
 
     /// What a command opens the instance for (in the status file; only
     /// `run` counts for `harness health`).
-    const Role = enum { run, chat, brief, task, memory };
+    const Role = enum {
+        run,
+        chat,
+        brief,
+        task,
+        memory,
+
+        /// Whether it needs the MCP servers and the browser: a brief is
+        /// one model call without tools, memory commands make none, and
+        /// starting servers for them costs up to 20 s and runs their code.
+        fn usesTools(r: Role) bool {
+            return switch (r) {
+                .run, .chat, .task => true,
+                .brief, .memory => false,
+            };
+        }
+    };
 
     /// Opens the instance, or explains why not.
     fn open(app: *App, role: Role) !*Core {
@@ -168,7 +184,7 @@ const App = struct {
         // so a slow start of the MCP servers can be ended too)
         catchSignals();
         c.watcher = std.Thread.spawn(.{}, watchSignals, .{c}) catch null;
-        c.startExtras();
+        if (role.usesTools()) c.startExtras();
         return c;
     }
 };
@@ -1084,6 +1100,15 @@ test "sigterm_is_caught_and_noted_not_the_end_of_the_process" {
     }
     try std.posix.raise(.TERM);
     try t.expectEqualStrings("SIGTERM", signalName(got_signal.load(.acquire)));
+}
+
+test "mcp_servers_and_the_browser_only_for_commands_that_use_tools" {
+    // a brief is one model call without tools; memory commands make none
+    try t.expect(!App.Role.memory.usesTools());
+    try t.expect(!App.Role.brief.usesTools());
+    try t.expect(App.Role.task.usesTools());
+    try t.expect(App.Role.chat.usesTools());
+    try t.expect(App.Role.run.usesTools());
 }
 
 fn printLine(what: []const u8, line: []const []const u8) void {
