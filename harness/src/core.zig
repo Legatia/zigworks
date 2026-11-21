@@ -142,6 +142,8 @@ const Approval = struct {
     id: u32 = 0,
     loaded: bool = false,
     waiting: bool = false,
+    /// Whether the waiting question offers "Allow 24 h" (money does not).
+    allow_day: bool = true,
     answer: ?agent.Answer = null,
     msg: ?i64 = null,
 };
@@ -610,14 +612,18 @@ pub const Core = struct {
         const ans: agent.Answer = if (std.mem.eql(u8, data[colon + 1 ..], "once")) .once else if (std.mem.eql(u8, data[colon + 1 ..], "day")) .day else .deny;
         c.approval.mutex.lockUncancelable(c.io);
         defer c.approval.mutex.unlock(c.io);
+        // a "24 h" the question never offered is no answer
+        if (ans == .day and !c.approval.allow_day) return;
         if (c.approval.waiting and c.approval.id == id) c.approval.answer = ans;
     }
 
-    /// The terminal's way to answer: "o", "d" or "n" while asked.
+    /// The terminal's way to answer: "o", "d" or "n" while asked; false if
+    /// nothing is asked or the question does not offer that answer.
     pub fn answerPending(c: *Core, ans: agent.Answer) bool {
         c.approval.mutex.lockUncancelable(c.io);
         defer c.approval.mutex.unlock(c.io);
         if (!c.approval.waiting) return false;
+        if (ans == .day and !c.approval.allow_day) return false;
         c.approval.answer = ans;
         return true;
     }
@@ -648,6 +654,7 @@ pub const Core = struct {
             c.saveApprovalId(c.approval.id + 1) catch break :blk null;
             c.approval.id += 1;
             c.approval.waiting = true;
+            c.approval.allow_day = allow_day;
             c.approval.answer = null;
             break :blk c.approval.id;
         } orelse {
@@ -2192,6 +2199,29 @@ test "dryrun_sent_while_a_money_question_waits_stops_the_call" {
     f.core.handleCallback(42, "a1:once");
     try f.rec.waitFor("finished the order");
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "dry run: would call fake/echo") != null);
+}
+
+test "an_answer_the_question_does_not_offer_is_not_taken" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\nmoney = echo\namount = amount\n", .{fake}) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"buy\",\"amount\":5}"));
+    try f.e.script(2, model.textReply("answered"));
+    try f.core.startWorker();
+    try f.core.handleText("buy");
+    try f.rec.waitFor("BUTTONS Allow this?");
+    // money is never granted for a day: neither "d" nor its button counts
+    try t.expect(!f.core.answerPending(.day));
+    f.core.handleCallback(42, "a1:day");
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expect(f.core.approvalWaiting());
+    try t.expect(f.core.answerPending(.deny));
+    try f.rec.waitFor("answered");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "denied by the owner") != null);
 }
 
 test "mcp_start_errors_are_masked_in_the_log" {
