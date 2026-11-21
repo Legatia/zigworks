@@ -215,6 +215,8 @@ pub const Core = struct {
     stop_wait_ms: u32 = 3_000,
     path_var: []const u8 = "/usr/local/bin:/usr/bin:/bin",
     home_var: []const u8 = "",
+    /// On Windows, the system's own variables, for commands and MCP servers.
+    system_vars: []const util.Var = &.{},
     paths_arena: std.heap.ArenaAllocator,
     home_owned: []u8,
     /// Said to the owner when a channel is attached.
@@ -306,6 +308,7 @@ pub const Core = struct {
         c.stop_wait_ms = 3_000;
         c.path_var = "/usr/local/bin:/usr/bin:/bin";
         c.home_var = "";
+        c.system_vars = &.{};
         c.told_settings_changed = false;
         c.pending_warning = null;
         c.loadRan();
@@ -740,6 +743,7 @@ pub const Core = struct {
                 .search_key = c.secrets.search,
                 .path_var = c.path_var,
                 .home = c.home_var,
+                .system_vars = c.system_vars,
                 .stop = flag,
                 .browser = c.browser,
                 .browser_seconds = c.cfg.browser.seconds,
@@ -808,7 +812,7 @@ pub const Core = struct {
                 };
             }
             var diag: mcp.Diag = .{};
-            const srv = mcp.Server.start(c.gpa, c.io, sc, .{ .workspace = c.workspace, .path_var = c.path_var, .home = c.home_var, .secret_values = values, .diag = &diag }) catch |e| {
+            const srv = mcp.Server.start(c.gpa, c.io, sc, .{ .workspace = c.workspace, .path_var = c.path_var, .home = c.home_var, .system_vars = c.system_vars, .secret_values = values, .diag = &diag }) catch |e| {
                 // a server may print its key when it fails: mask before keeping
                 var sc_mask = scrub.Scrubber.init(a, c.secret_list) catch return;
                 const detail = sc_mask.scrubAlloc(a, diag.text()) catch "";

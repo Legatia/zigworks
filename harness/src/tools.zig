@@ -27,9 +27,11 @@ pub const Env = struct {
     secrets: []const scrub.Secret = &.{},
     search_url: []const u8 = "",
     search_key: ?[]const u8 = null,
-    /// The only variables a shell command gets.
+    /// The only variables a shell command gets (with LANG and TERM).
     path_var: []const u8 = "/usr/local/bin:/usr/bin:/bin",
     home: []const u8 = "",
+    /// And, on Windows, the system's own (`util.system_var_names`).
+    system_vars: []const util.Var = &.{},
     stop: *std.atomic.Value(bool),
     /// Chrome or Chromium for `browse`; empty: none found.
     browser: []const u8 = "",
@@ -194,6 +196,7 @@ const Watch = struct {
 
 fn shell(env: Env, arena: std.mem.Allocator, command: []const u8) !Output {
     var vars = std.process.Environ.Map.init(arena);
+    for (env.system_vars) |v| try vars.put(v.name, v.value);
     try vars.put("PATH", env.path_var);
     if (env.home.len > 0) try vars.put("HOME", env.home);
     try vars.put("LANG", "C.UTF-8");
@@ -460,6 +463,17 @@ test "shell_runs_in_workspace_with_reduced_env" {
     const bad = try f.call(.shell, "{\"command\":\"exit 3\"}");
     try t.expect(bad.is_error);
     try t.expect(std.mem.startsWith(u8, bad.text, "exit code 3"));
+}
+
+test "system_vars_reach_a_shell_command" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    f.env.system_vars = &.{.{ .name = "HARNESS_T_SYSVAR", .value = "from-the-system" }};
+    const cmd = if (is_windows) "{\"command\":\"echo %HARNESS_T_SYSVAR%\"}" else "{\"command\":\"echo $HARNESS_T_SYSVAR\"}";
+    const o = try f.call(.shell, cmd);
+    try t.expect(!o.is_error);
+    try t.expect(std.mem.indexOf(u8, o.text, "from-the-system") != null);
 }
 
 fn stopLater(flag: *std.atomic.Value(bool)) void {

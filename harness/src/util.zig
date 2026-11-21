@@ -5,6 +5,33 @@ const Io = std.Io;
 /// Files only the owner can read (POSIX); the default on Windows.
 pub const private_file: Io.File.Permissions = if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600);
 
+/// One environment variable.
+pub const Var = struct { name: []const u8, value: []const u8 };
+
+/// Variables of the system itself that programs on Windows cannot do
+/// without, and that hold no secrets: without SystemRoot name lookups fail
+/// (so nothing reaches the network), without PATHEXT and ComSpec commands
+/// are not found, and without the profile folders npm, node and others
+/// have nowhere to keep their files. Other systems need none.
+pub const system_var_names: []const []const u8 = if (@import("builtin").os.tag == .windows) &.{
+    "SystemRoot",   "SystemDrive",       "windir",            "ComSpec",
+    "PATHEXT",      "TEMP",              "TMP",               "USERPROFILE",
+    "HOMEDRIVE",    "HOMEPATH",          "APPDATA",           "LOCALAPPDATA",
+    "ProgramData",  "ProgramFiles",      "ProgramFiles(x86)", "ProgramW6432",
+    "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432", "USERNAME",
+    "USERDOMAIN",   "COMPUTERNAME",      "OS",                "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
+} else &.{};
+
+/// The named variables that are set in `map`, in the order named.
+pub fn pickVars(arena: std.mem.Allocator, map: *const std.process.Environ.Map, names: []const []const u8) ![]const Var {
+    var out: std.ArrayList(Var) = .empty;
+    for (names) |n| {
+        if (map.get(n)) |v| try out.append(arena, .{ .name = n, .value = try arena.dupe(u8, v) });
+    }
+    return out.items;
+}
+
 pub fn nowSeconds(io: Io) i64 {
     return @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
 }
@@ -94,6 +121,20 @@ pub fn cut(s: []const u8, max: usize) []const u8 {
 }
 
 const t = std.testing;
+
+test "systemVars_takes_only_the_named_ones_that_are_set" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var map = std.process.Environ.Map.init(arena.allocator());
+    try map.put("SystemRoot", "C:\\Windows");
+    try map.put("TEMP", "C:\\Temp");
+    try map.put("MY_API_KEY", "secret");
+    const got = try pickVars(arena.allocator(), &map, &.{ "SystemRoot", "ComSpec", "TEMP" });
+    try t.expectEqual(2, got.len);
+    try t.expectEqualStrings("SystemRoot", got[0].name);
+    try t.expectEqualStrings("C:\\Windows", got[0].value);
+    try t.expectEqualStrings("TEMP", got[1].name);
+}
 
 test "dates_round_trip" {
     var buf: [20]u8 = undefined;

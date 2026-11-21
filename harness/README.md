@@ -96,7 +96,10 @@ what it skipped.
 everything it started, and background runs. `/new` starts a fresh
 conversation; memory stays.
 
-Shell commands get only `PATH`, `HOME`, `LANG` and `TERM`. Stored secrets
+Shell commands get only `PATH`, `HOME`, `LANG` and `TERM` (on Windows also
+the system's own variables such as `SystemRoot`, `TEMP` and `APPDATA`,
+without which programs there cannot reach the network or find their
+files; MCP servers get the same). Stored secrets
 are masked in all tool output as `[secret:NAME]` before the model or the
 log sees it.
 

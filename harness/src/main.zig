@@ -119,6 +119,7 @@ const App = struct {
         };
         c.path_var = app.env.get("PATH") orelse c.path_var;
         c.home_var = app.env.get(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME") orelse "";
+        c.system_vars = util.pickVars(app.arena, app.env, util.system_var_names) catch &.{};
         c.startExtras();
         return c;
     }

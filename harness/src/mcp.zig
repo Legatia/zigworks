@@ -173,6 +173,8 @@ pub const StartOptions = struct {
     workspace: []const u8,
     path_var: []const u8,
     home: []const u8,
+    /// On Windows, the system's own variables (`util.system_var_names`).
+    system_vars: []const util.Var = &.{},
     /// `secret_values[i]` is the value for `cfg.secrets[i]`.
     secret_values: []const []const u8,
     start_timeout_ms: u32 = 20000,
@@ -227,6 +229,7 @@ pub const Server = struct {
         const tmp = tmp_state.allocator();
         const argv = try splitCommand(tmp, cfg.command);
         var vars = std.process.Environ.Map.init(tmp);
+        for (opts.system_vars) |v| try vars.put(v.name, v.value);
         try vars.put("PATH", opts.path_var);
         if (opts.home.len > 0) try vars.put("HOME", opts.home);
         try vars.put("LANG", "C.UTF-8");
@@ -766,6 +769,24 @@ test "the_secret_and_home_reach_the_server_and_nothing_else" {
     defer s.deinit();
     const r = try f.call(s, "echo", "{\"text\":\"env\"}", 5000);
     try t.expectEqualStrings("secret=s3cr3t-value home=/home/tester user=", r.text);
+}
+
+test "system_vars_reach_the_server" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const cmd = try std.fmt.allocPrint(f.a(), "\"{s}\" --mcp", .{f.fake});
+    const s = try Server.start(t.allocator, t.io, .{ .name = "fake", .command = cmd, .secrets = &.{}, .money = &.{} }, .{
+        .workspace = f.ws,
+        .path_var = "/usr/bin:/bin",
+        .home = "/home/tester",
+        .system_vars = &.{.{ .name = "USER", .value = "from-the-system" }},
+        .secret_values = &.{},
+        .start_timeout_ms = 10000,
+    });
+    defer s.deinit();
+    const r = try f.call(s, "echo", "{\"text\":\"env\"}", 5000);
+    try t.expectEqualStrings("secret= home=/home/tester user=from-the-system", r.text);
 }
 
 fn stopLater(flag: *std.atomic.Value(bool)) void {
