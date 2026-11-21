@@ -1238,15 +1238,23 @@ pub const browser_flags = [_][]const u8{
     "--password-store=basic",
 };
 
+/// The host of an http or https `url` with its port if it has one, as
+/// written (no user info); null for any other address.
+pub fn urlHostPort(url: []const u8) ?struct { https: bool, host: []const u8 } {
+    const https = std.ascii.startsWithIgnoreCase(url, "https://");
+    const rest = if (https) url[8..] else if (std.ascii.startsWithIgnoreCase(url, "http://")) url[7..] else return null;
+    // a backslash ends the host as a slash does (the browser reads it so)
+    const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#\\") orelse rest.len];
+    const host = authority[if (std.mem.lastIndexOfScalar(u8, authority, '@')) |i| i + 1 else 0..];
+    if (host.len == 0) return null;
+    return .{ .https = https, .host = host };
+}
+
 /// The host name of an http(s) `url`, lowercase, without user info or
 /// port; null unless it is made of letters, digits, dots and dashes only
 /// (it goes into the browser's host rules).
 pub fn urlHostname(arena: Allocator, url: []const u8) !?[]const u8 {
-    const n: usize = if (std.ascii.startsWithIgnoreCase(url, "https://")) 8 else if (std.ascii.startsWithIgnoreCase(url, "http://")) 7 else return null;
-    const rest = url[n..];
-    // a backslash ends the host as a slash does (the browser reads it so)
-    const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#\\") orelse rest.len];
-    var host = authority[if (std.mem.lastIndexOfScalar(u8, authority, '@')) |i| i + 1 else 0..];
+    var host = (urlHostPort(url) orelse return null).host;
     if (std.mem.lastIndexOfScalar(u8, host, ':')) |i| host = host[0..i];
     if (host.len == 0) return null;
     for (host) |c| if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-')) return null;

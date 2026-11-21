@@ -54,7 +54,7 @@ pub const Hooks = struct {
 pub fn toolDef(arena: Allocator, list: []const logins.Login) !model.ToolDef {
     var d: std.ArrayList(u8) = .empty;
     try d.appendSlice(arena,
-        \\An interactive browser. Actions: open (a url, optionally with one of your logins), type (into an element by ref; enter: true presses Enter after), click (ref), key (Enter, Tab or Escape), read, close. Every action returns the page: its address, its interactive elements numbered by ref, and its text. One session per turn; it closes when the turn ends.
+        \\An interactive browser. Actions: open (a url, optionally with one of your logins), type (into an element by ref; enter: true presses Enter after), click (ref), key (Enter, Tab or Escape), read, close. Every action returns the page: its address, its interactive elements numbered by ref, and its text. One session per turn; it closes when the turn ends. A new tab or window a page opens is closed at once (you are told its address); downloads are refused.
         \\To sign in, open with `login` (its own cookies and passkeys) and type placeholders: {login:NAME.username}, {login:NAME.password}, {login:NAME.code} (the current one-time code). They are filled in only on the login's site; you never see the values. A login without a password gets a new one the first time its password placeholder is typed on its site (for signing up). Passkeys made on the login's site are kept for it. CAPTCHAs and codes sent by SMS or e-mail: ask the owner.
     );
     if (list.len == 0) {
@@ -611,10 +611,12 @@ pub const Web = struct {
         }
         const x = jv.num(jv.get(r, "x")) orelse return error.Script;
         const y = jv.num(jv.get(r, "y")) orelse return error.Script;
-        for ([_][]const u8{ "mouseMoved", "mousePressed", "mouseReleased" }) |kind| {
-            const params = try std.fmt.allocPrint(a, "{{\"type\":\"{s}\",\"x\":{d},\"y\":{d}{s}}}", .{ kind, x, y, if (kind[5] == 'P') ",\"button\":\"left\",\"buttons\":1,\"clickCount\":1" else if (kind[5] == 'R') ",\"button\":\"left\",\"buttons\":0,\"clickCount\":1" else "" });
-            _ = try s.call(a, "Input.dispatchMouseEvent", params);
-        }
+        const steps = [_][2][]const u8{
+            .{ "mouseMoved", "" },
+            .{ "mousePressed", ",\"button\":\"left\",\"buttons\":1,\"clickCount\":1" },
+            .{ "mouseReleased", ",\"button\":\"left\",\"buttons\":0,\"clickCount\":1" },
+        };
+        for (steps) |st| _ = try s.call(a, "Input.dispatchMouseEvent", try std.fmt.allocPrint(a, "{{\"type\":\"{s}\",\"x\":{d},\"y\":{d}{s}}}", .{ st[0], x, y, st[1] }));
         return null;
     }
 
@@ -691,8 +693,12 @@ pub const Web = struct {
             // its text only from the host the gate allowed (not a frame of
             // another, not a page that was refused)
             const from = try pageHost(a, d.url) orelse "";
-            if (from.len == 0 or !std.ascii.eqlIgnoreCase(from, w.granted_host)) {
-                try out.print(a, "A dialog ({s}) from another host ({s}) was answered; its text is not shown.\n", .{ d.kind, if (from.len > 0) util.cut(from, 200) else "a page without one" });
+            if (from.len == 0) {
+                try out.print(a, "A dialog ({s}) from a frame with no web address was answered; its text is not shown.\n", .{d.kind});
+                continue;
+            }
+            if (!std.ascii.eqlIgnoreCase(from, w.granted_host)) {
+                try out.print(a, "A dialog ({s}) from another host ({s}) was answered; its text is not shown.\n", .{ d.kind, util.cut(from, 200) });
                 continue;
             }
             try out.print(a, "Dialog ({s}): {s}{s}\n", .{ d.kind, d.message, if (std.mem.eql(u8, d.kind, "alert") or std.mem.eql(u8, d.kind, "beforeunload")) "" else " (dismissed)" });
@@ -721,12 +727,9 @@ pub const Web = struct {
 /// it: lowercase, without user info or the scheme's default port. Null for
 /// any other address.
 pub fn pageHost(a: Allocator, url: []const u8) !?[]const u8 {
-    const https = std.ascii.startsWithIgnoreCase(url, "https://");
-    const rest = if (https) url[8..] else if (std.ascii.startsWithIgnoreCase(url, "http://")) url[7..] else return null;
-    // a backslash ends the host as a slash does (the browser reads it so)
-    const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#\\") orelse rest.len];
-    var host = authority[if (std.mem.lastIndexOfScalar(u8, authority, '@')) |i| i + 1 else 0..];
-    const default_port = if (https) ":443" else ":80";
+    const hp = page.urlHostPort(url) orelse return null;
+    var host = hp.host;
+    const default_port = if (hp.https) ":443" else ":80";
     if (std.mem.endsWith(u8, host, default_port)) host = host[0 .. host.len - default_port.len];
     if (host.len == 0) return null;
     return try std.ascii.allocLowerString(a, host);

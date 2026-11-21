@@ -53,8 +53,8 @@ pub const Tab = struct {
 /// only.)
 const own_ids: u32 = 1 << 30;
 
-/// Replies by id. Of the events, only the main frame's loading and
-/// JavaScript dialogs are kept.
+/// Replies by id. Of the events, only the main frame's loading, JavaScript
+/// dialogs, refused downloads and new tabs are kept.
 pub const Inbox = struct {
     gpa: Allocator,
     mutex: Io.Mutex = .init,
@@ -191,7 +191,8 @@ pub const Inbox = struct {
         gpa.free(list);
     }
 
-    /// The dialogs seen since the last call; the caller frees with freeDialogs.
+    /// The dialogs answered since the last call; the caller frees each
+    /// (Dialog.free, with the inbox's allocator).
     pub fn takeDialogs(b: *Inbox, io: Io, gpa: Allocator) ![]Dialog {
         b.mutex.lockUncancelable(io);
         defer b.mutex.unlock(io);
@@ -434,18 +435,7 @@ pub const Session = struct {
             if (d.answered) continue;
             d.answered = true;
             const accept = std.mem.eql(u8, d.kind, "alert") or std.mem.eql(u8, d.kind, "beforeunload");
-            var msg: std.ArrayList(u8) = .empty;
-            defer msg.deinit(s.gpa);
-            s.own_id +%= 1;
-            msg.print(s.gpa, "{{\"id\":{d},\"method\":\"Page.handleJavaScriptDialog\",\"params\":{{\"accept\":{s}}}", .{ own_ids + (s.own_id & 0x3fff_ffff), if (accept) "true" else "false" }) catch continue;
-            if (d.session.len > 0) {
-                msg.appendSlice(s.gpa, ",\"sessionId\":") catch continue;
-                util.jsonString(&msg, s.gpa, d.session) catch continue;
-            }
-            msg.appendSlice(s.gpa, "}\x00") catch continue;
-            s.write_mutex.lockUncancelable(s.io);
-            defer s.write_mutex.unlock(s.io);
-            if (s.to_chrome) |f| f.writeStreamingAll(s.io, msg.items) catch {};
+            s.sendOwn("Page.handleJavaScriptDialog", if (accept) "{\"accept\":true}" else "{\"accept\":false}", if (d.session.len > 0) d.session else null);
         }
     }
 
