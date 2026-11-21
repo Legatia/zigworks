@@ -8,7 +8,7 @@ takes, and every action of its helpers, passes one gate and is written to
 one log you can check.
 
 ```
-Telegram ⇄ ┐                          ┌─ shell, files, fetch, browse, search
+Telegram ⇄ ┐                          ┌─ shell, files, fetch, browse, web, search
 terminal ⇄ ┼─► agent ─► gate ─► tools ┼─ MCP servers (money tools: asked every time)
 schedule ──┘    │  ▲  ▲   │           └─ delegate ─► helpers ─► gate ─► tools
                 ▼  │  │   ▼
@@ -21,11 +21,13 @@ Security framework on macOS). Models are reached only through
 [omnigate](https://github.com/Legatia/omnigate), which holds the provider
 keys and the budgets.
 
-**State: 0.2.0, tested by its own tests (156 unit tests, and an end-to-end
-script of 25 checks that drives the real binary against stand-ins for
-omnigate, Telegram, feeds, search and an MCP server) on macOS; 0.1.0's
-tests also passed in CI on Linux and Windows. Not yet run against a real
-omnigate, a real Telegram bot or a real MCP server.** See [Limits](#limits).
+**State: 0.3.0, tested by its own tests (197 unit tests, among them
+the browser and login tests against headless Chrome and local pages, and an
+end-to-end script of 27 checks that drives the real binary against
+stand-ins for omnigate, Telegram, feeds, search and an MCP server) on
+macOS; 0.1.0's tests also passed in CI on Linux and Windows. Not yet run
+against a real omnigate, a real Telegram bot, a real MCP server or a real
+website's sign-in.** See [Limits](#limits).
 
 ## Quick start
 
@@ -58,13 +60,15 @@ store, not in the folder.
 | `briefs.ini` | briefs and their topics |
 | `tasks.ini` | scheduled tasks |
 | `mcp.ini` | MCP servers (optional) |
+| `logins.ini` | the agent's own logins: name, site, username (no secrets) |
+| `profiles/` | each login's browser profile (its cookies) |
 | `skills/` | saved skills, one folder each (`NAME/SKILL.md`) |
 | `memory/` | one file per memory item |
 | `workspace/` | where the agent's files and commands live |
 | `log/actions.jsonl` | the action log |
 | `state/` | grants, seen feed items, owner, status, lock |
 
-`config.ini` and `rules` are refused if other users can write them. Changes
+`config.ini`, `rules` and `logins.ini` are refused if other users can write them. Changes
 to the settings files apply after `/reload`; harness tells you when it
 notices one.
 
@@ -77,9 +81,10 @@ Every tool call is decided in one place, in this order:
 2. A matching `deny` line in `rules`.
 3. A grant you gave with "Allow 24 h".
 4. The first matching `allow` or `ask` line.
-5. The tool's default: `shell`, `fetch`, `browse`, `skill_save` and MCP
-   tools ask; files, search, memory, `skill` and `delegate` are allowed
-   (each helper's own calls pass the gate like any other).
+5. The tool's default: `shell`, `fetch`, `browse`, `web`, `login`,
+   `skill_save` and MCP tools ask; files, search, memory, `skill` and
+   `delegate` are allowed (each helper's own calls pass the gate like any
+   other).
 
 ```
 deny  shell rm -rf *
@@ -132,6 +137,65 @@ after a headless Chrome or Chromium has run the page's JavaScript, with a
 fresh throwaway profile each time (no cookies, no sign-ins). It is offered
 only when a browser is found (`[browser] path`, or the usual install
 places).
+
+## Logins
+
+The agent can have accounts of its own: a GitHub account for a bot, a
+newsletter sign-up, a test shop. They are the agent's accounts, never
+yours: don't give it your own passwords.
+
+```
+harness login add github-bot --site github.com --username agent-bot@example.com
+Password for github-bot (not shown; empty: the agent makes one when it signs up):
+TOTP secret for github-bot (not shown; empty for none):
+Stored github-bot in the macOS Keychain.
+
+harness login list
+harness login rm github-bot       # its secrets and its browser profile too
+```
+
+`logins.ini` holds the name, site and username; the password, the TOTP
+secret and the passkeys go to the key store (`login-NAME-password`,
+`login-NAME-totp`, `login-NAME-passkeys`). `/logins` lists them in chat.
+
+The agent uses them through `web`, an interactive headless Chrome: open a
+page, type into a field, click, press Enter, Tab or Escape, read. Each
+action returns the address, the page's fields, buttons and links numbered
+by `ref`, and its text. One browser per turn, closed when the turn ends
+or on `/stop`. Opened with a login, it uses the login's own profile in
+`profiles/NAME`, so the cookies, and with them the sign-in, stay for the
+next turn. Without one, a throwaway profile is deleted afterwards.
+
+The model types placeholders, never values: `{login:NAME.username}`,
+`{login:NAME.password}`, `{login:NAME.code}` (the current TOTP code).
+Harness fills them in, and the log, the gate and the model see only the
+placeholder.
+
+- **Bound to the site.** A value is typed only into a page on the login's
+  site or a name below it (`github.com`, `gist.github.com`; not
+  `github.com.evil.com`), over https (http only for `localhost`). The
+  check and the typing are one script in the page, run where the page's
+  own scripts can't change what it sees, so a redirect in between can't
+  catch the value. Only fields of the page itself, never of frames.
+- **Sign-ups.** A login stored without a password gets one (24 letters,
+  digits and symbols) the first time its password placeholder is typed on
+  its site; it is stored before it is typed.
+- **Passkeys.** A browser opened with a login has a software security key
+  holding that login's passkeys. After every action harness reads it back:
+  new passkeys for the login's site are stored, any other is removed and
+  the agent is told. So the agent can add a passkey in a site's settings
+  and sign in with it next time, and can't make or use one for another
+  site.
+- **The gate.** `web` asks for each host (a 24 h grant covers the host),
+  again when a click lands on a host not yet allowed in this session;
+  `login` asks the first time a browser uses a login on a host (`NAME
+  HOST`; a 24 h grant covers that login there). Scheduled runs: asking is
+  refusing, as everywhere. Helpers never get `web`.
+- **Masked.** Every login's password, TOTP secret and current code are
+  masked in what `web` returns; stored login passwords in all tool output.
+
+Not handled: CAPTCHAs, codes sent by SMS or e-mail (the agent asks you),
+cards and payments.
 
 ## MCP
 
@@ -243,10 +307,10 @@ gate (with `ask` as Deny). Its answer is sent to you unless it is
 
 `/stop`, `/new`, `/status`, `/brief [NAME]`, `/topics`, `/topic add|rm`, `/tasks`,
 `/task add|rm|resume`, `/memory`, `/remember`, `/pin`, `/unpin`,
-`/forget`, `/private on|off`, `/skills`, `/skill rm`, `/dryrun on|off`,
-`/reload`, `/help`.
+`/forget`, `/private on|off`, `/skills`, `/skill rm`, `/logins`,
+`/dryrun on|off`, `/reload`, `/help`.
 
-CLI: `init`, `secret add|rm|list`, `pair`, `run`, `chat`, `brief [NAME]`,
+CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `memory [list|pin|unpin|forget ID]`, `log verify|tail`,
 `health`, `version`.
 
@@ -279,9 +343,21 @@ CLI: `init`, `secret add|rm|list`, `pair`, `run`, `chat`, `brief [NAME]`,
   each), and a secret added for a new server needs a restart, not just
   `/reload`.
 - **One owner, one chat.** Messages sent while the agent works are queued.
+- **`web` is macOS and Linux only** for now (Chrome is driven through
+  pipes on file descriptors 3 and 4); on Windows it is not offered.
+- **Login cookies are on disk** in `profiles/NAME`, readable by you (the
+  folder is 0700), like any browser profile. Anyone who can read the data
+  folder can use those sessions.
+- **Site binding is by host name.** A login for `example.com` is typed on
+  any name below it, and a passkey may be made for a parent domain of the
+  site, but not for a bare top-level name like `com`; harness doesn't know
+  the public suffix list, so set the site no wider than needed.
+- **A password made at sign-up** is masked in `web` output at once, and in
+  other tools' output from the next start.
 
-Not in 0.2.0: the Agent Client Protocol server, desktop use (headdesk), a
+Not in 0.3.0: the Agent Client Protocol server, desktop use (headdesk), a
 sandbox per command, WhatsApp and voice, helpers that report back later,
+cards and payments for the agent, the browser on Windows, screenshots,
 and the hosted service.
 
 ## Build

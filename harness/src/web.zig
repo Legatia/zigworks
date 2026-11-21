@@ -115,6 +115,10 @@ pub const Web = struct {
     passkeys_bad: bool = false,
     /// Said with the next result.
     notes: std.ArrayList(u8) = .empty,
+    /// Every login's stored password and TOTP seed were read for masking.
+    loaded_all: bool = false,
+    /// The TOTP seeds (raw), by login, for masking their current codes.
+    seeds: std.ArrayList(struct { name: []const u8, seed: []const u8 }) = .empty,
 
     pub fn init(gpa: Allocator, io: Io, env: Env, hooks: Hooks) Web {
         return .{ .gpa = gpa, .io = io, .env = env, .hooks = hooks, .arena = .init(gpa) };
@@ -123,6 +127,7 @@ pub const Web = struct {
     pub fn deinit(w: *Web) void {
         w.close();
         for (w.extra.items) |x| std.crypto.secureZero(u8, @constCast(x.value));
+        for (w.seeds.items) |x| std.crypto.secureZero(u8, @constCast(x.seed));
         w.arena.deinit();
     }
 
@@ -159,10 +164,41 @@ pub const Web = struct {
         return .{ .text = try w.mask(a, raw.text), .is_error = raw.is_error };
     }
 
+    /// Reads every login's password and TOTP seed once a turn, so the
+    /// output masks them even when they were stored after harness started.
+    fn loadAll(w: *Web) void {
+        if (w.loaded_all) return;
+        w.loaded_all = true;
+        const st = w.env.store orelse return;
+        const wa = w.arena.allocator();
+        for (w.env.logins) |l| for ([_]logins.Kind{ .password, .totp }) |k| {
+            var nb: [96]u8 = undefined;
+            const name = logins.secretName(&nb, l.name, k);
+            const raw = (st.get(w.io, w.gpa, name) catch null) orelse continue;
+            defer {
+                std.crypto.secureZero(u8, raw);
+                w.gpa.free(raw);
+            }
+            const v = w.keepValue(name, std.mem.trim(u8, raw, " \r\n\t")) catch continue;
+            if (k != .totp) continue;
+            var buf: [128]u8 = undefined;
+            defer std.crypto.secureZero(u8, &buf);
+            const seed = totp.base32Decode(&buf, v) catch continue;
+            w.seeds.append(wa, .{ .name = wa.dupe(u8, l.name) catch continue, .seed = wa.dupe(u8, seed) catch continue }) catch {};
+        };
+    }
+
     fn mask(w: *Web, a: Allocator, text: []const u8) ![]const u8 {
+        w.loadAll();
         var all: std.ArrayList(scrub.Secret) = .empty;
         try all.appendSlice(a, w.env.secrets);
         try all.appendSlice(a, w.extra.items);
+        // the current one-time code of every login, and the one before
+        const now = util.nowSeconds(w.io);
+        for (w.seeds.items) |sd| for ([_]i64{ now, now - totp.step_s }) |at| {
+            const c = totp.code(sd.seed, at);
+            try all.append(a, .{ .name = try std.fmt.allocPrint(a, "login-{s}-code", .{sd.name}), .value = try a.dupe(u8, &c) });
+        };
         var sc = try scrub.Scrubber.init(a, all.items);
         return sc.scrubAlloc(a, text);
     }
@@ -874,6 +910,19 @@ test "web_fill_script_refuses_a_page_that_lies_about_its_host" {
     const ok = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "fine", &.{"localhost"}));
     try t.expectEqualStrings("\"ok\"", ok);
     try t.expectEqualStrings("\"fine\"", try f.eval("document.getElementById('pw').value"));
+}
+
+test "web_output_masks_every_login_value_typed_or_not" {
+    var f: Fix = undefined;
+    try f.init("[a]\nsite = example.com\n[b]\nsite = example.org\n");
+    defer f.deinit();
+    try f.store.put(t.io, "login-a-password", "stored-Pass-a-991");
+    try f.store.put(t.io, "login-b-totp", "JBSWY3DPEHPK3PXP");
+    var seed_buf: [32]u8 = undefined;
+    const c = totp.code(try totp.base32Decode(&seed_buf, "JBSWY3DPEHPK3PXP"), util.nowSeconds(t.io));
+    try f.page("leak.html", try std.fmt.allocPrint(f.e.arena.allocator(), "<html><body><p>pw stored-Pass-a-991 seed JBSWY3DPEHPK3PXP code {s}</p></body></html>", .{&c}));
+    const r = try f.act(try f.openJson("leak.html", null));
+    try expectHas(r.text, "pw [secret:login-a-password] seed [secret:login-b-totp] code [secret:login-b-code]");
 }
 
 test "web_makes_a_password_on_sign_up" {

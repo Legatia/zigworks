@@ -238,7 +238,8 @@ pub const Session = struct {
         {
             s.write_mutex.lockUncancelable(s.io);
             defer s.write_mutex.unlock(s.io);
-            s.to_chrome.?.writeStreamingAll(s.io, msg.items) catch return error.BrowserGone;
+            const f = s.to_chrome orelse return error.BrowserGone;
+            f.writeStreamingAll(s.io, msg.items) catch return error.BrowserGone;
         }
         const until = deadline(s.io, s.timeout_ms);
         while (true) {
@@ -449,6 +450,26 @@ test "chrome_over_a_pipe_evaluates_and_closes_without_leftovers" {
     var waited: u32 = 0;
     while (waited < 3000 and !processGone(-%pid)) : (waited += 50) t.io.sleep(.fromMilliseconds(50), .awake) catch {};
     try t.expect(processGone(-%pid));
+}
+
+test "chrome_ends_when_harness_goes_away" {
+    // harness gone (crashed, killed): its end of the pipe closes, and
+    // Chrome must end on its own, without being killed
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const browser = (try testBrowser(a)) orelse return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const profile = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    var stop: std.atomic.Value(bool) = .init(false);
+    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000);
+    defer s.destroy();
+    s.to_chrome.?.close(t.io);
+    s.to_chrome = null;
+    var waited: u32 = 0;
+    while (waited < 10_000 and !s.inbox.closed.load(.acquire)) : (waited += 50) t.io.sleep(.fromMilliseconds(50), .awake) catch {};
+    try t.expect(s.inbox.closed.load(.acquire));
 }
 
 test "a_stop_ends_chrome_at_once" {
