@@ -991,7 +991,7 @@ pub const Core = struct {
             const key = keyFor("brief", b.name);
             if ((c.getRan(key.slice()) orelse -1) >= today) continue;
             if (c.retryLater(key.slice(), now_s)) continue;
-            c.startBackground(.{ .brief = b }, key.slice(), now_s);
+            _ = c.startBackground(.{ .brief = b }, key.slice(), now_s);
         }
         const weekday = util.weekday(today);
         for (c.tasks) |tk| {
@@ -1006,7 +1006,7 @@ pub const Core = struct {
                 if (last) |l| if (c.localDay(l) >= today) continue;
             }
             if (c.retryLater(key.slice(), now_s)) continue;
-            c.startBackground(.{ .task = tk }, key.slice(), now_s);
+            _ = c.startBackground(.{ .task = tk }, key.slice(), now_s);
         }
     }
 
@@ -1048,24 +1048,27 @@ pub const Core = struct {
 
     const Job = union(enum) { brief: config.Brief, task: config.Task };
 
+    const Start = enum { started, already_running, slots_taken, failed };
+
     /// Starts a brief or task found due at `due_s`, unless it is running
     /// already or the background slots are taken.
-    fn startBackground(c: *Core, job: Job, key: []const u8, due_s: i64) void {
+    fn startBackground(c: *Core, job: Job, key: []const u8, due_s: i64) Start {
         c.state_mutex.lockUncancelable(c.io);
         defer c.state_mutex.unlock(c.io);
-        if (c.running.contains(key)) return;
+        if (c.running.contains(key)) return .already_running;
         // the chat keeps one of the slots
         const slots = @max(1, c.cfg.limits.concurrent_runs) - 1;
-        if (c.bg_active.load(.acquire) >= @max(1, slots)) return;
-        putKey(c.gpa, &c.running, key, {}) catch return;
+        if (c.bg_active.load(.acquire) >= @max(1, slots)) return .slots_taken;
+        putKey(c.gpa, &c.running, key, {}) catch return .failed;
         _ = c.bg_active.fetchAdd(1, .acq_rel);
         const owned_key = c.running.getKey(key).?;
         const th = std.Thread.spawn(.{}, background, .{ c, job, owned_key, due_s }) catch {
             _ = c.bg_active.fetchSub(1, .acq_rel);
             removeKey(c.gpa, &c.running, key);
-            return;
+            return .failed;
         };
         th.detach();
+        return .started;
     }
 
     fn background(c: *Core, job: Job, key: []const u8, due_s: i64) void {
@@ -1299,8 +1302,12 @@ pub const Core = struct {
             const key = keyFor("brief-now", b.name);
             c.settings_mutex.lockUncancelable(c.io);
             defer c.settings_mutex.unlock(c.io);
-            c.startBackground(.{ .brief = b }, key.slice(), c.now());
-            return "Collecting.";
+            return switch (c.startBackground(.{ .brief = b }, key.slice(), c.now())) {
+                .started => "Collecting.",
+                .already_running => "That brief is being collected already.",
+                .slots_taken => "Busy: another brief or task is running. Send /brief again when it is done.",
+                .failed => "Could not start the brief.",
+            };
         }
         if (eql(u8, cmd, "/tasks")) {
             var out: std.ArrayList(u8) = .empty;
@@ -2033,6 +2040,29 @@ test "a_task_answer_that_did_not_arrive_is_logged_as_not_sent" {
     const lt = try logText(&f);
     try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"done\",\"sent\":false,\"why\":\"not paired yet\"") != null);
     try t.expect(std.mem.indexOf(u8, lt, "\"sent\":true") == null);
+}
+
+test "brief_command_says_when_it_could_not_start" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/z.xml", .data = "<rss><channel><item><title>New thing</title><link>https://z.org/1</link></item></channel></rss>" });
+    const url = try f.e.url();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.briefs, .data = try std.fmt.allocPrint(a, "[morning]\nat = 07:00\ntopic = Zig | {s}/page/z.xml\n[evening]\nat = 19:00\ntopic = Zig | {s}/page/z.xml\n", .{ url, url }) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const slow = comptime "{\"delay_ms\":1000," ++ model.textReply("Zig: New thing (https://z.org/1)")[1..];
+    try f.e.script(1, slow);
+    try f.core.handleText("/brief morning");
+    try f.rec.waitFor("Collecting.");
+    try f.core.handleText("/brief morning");
+    try f.rec.waitFor("That brief is being collected already.");
+    // the one background slot is taken
+    try f.core.handleText("/brief evening");
+    try f.rec.waitFor("Busy: ");
+    try f.rec.waitFor("Zig: New thing");
+    waitIdle(f.core);
+    try t.expectEqual(1, f.rec.count("Collecting."));
 }
 
 test "a_run_that_ends_after_midnight_counts_for_the_day_it_was_due" {
