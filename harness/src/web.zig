@@ -311,11 +311,8 @@ pub const Web = struct {
             try setPrivate(w.io, p);
             break :blk p;
         } else blk: {
-            var rnd: [8]u8 = undefined;
-            w.io.random(&rnd);
-            try Io.Dir.cwd().createDirPath(w.io, w.env.tmp_root);
-            const p = try std.fs.path.join(w.arena.allocator(), &.{ w.env.tmp_root, try std.fmt.allocPrint(a, "harness-web-{x}", .{rnd}) });
-            try Io.Dir.cwd().createDir(w.io, p, .default_dir);
+            // (the first one also removes those a killed run left)
+            const p = try page.newProfile(w.io, w.arena.allocator(), w.env.tmp_root, "harness-web-");
             w.throwaway = p;
             break :blk p;
         };
@@ -1448,6 +1445,20 @@ test "web_waits_for_a_slow_navigation_after_a_click" {
     const r2 = try f.act(frag);
     try t.expect(!r2.is_error);
     try expectHas(r2.text, "#part");
+}
+
+test "web_removes_throwaway_profiles_a_killed_run_left" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.e.tmp.dir.createDirPath(t.io, "tmp/harness-web-89abcdef/Default");
+    try f.e.tmp.dir.createDirPath(t.io, "tmp/harness-browser-01234567");
+    try f.page("here.html", "<html><body><p>here</p></body></html>");
+    _ = try f.act(try f.openJson("here.html", null));
+    for ([_][]const u8{ "tmp/harness-web-89abcdef", "tmp/harness-browser-01234567" }) |p| try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, p, .{}));
+    // its own is there until it closes
+    try t.expect(f.web.throwaway != null);
+    _ = try Io.Dir.cwd().statFile(t.io, f.web.throwaway.?, .{});
 }
 
 test "web_page_scripts_cannot_stall_the_waits" {

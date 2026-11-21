@@ -1252,6 +1252,52 @@ pub fn urlHostname(arena: Allocator, url: []const u8) !?[]const u8 {
     return try std.ascii.allocLowerString(arena, host);
 }
 
+/// The folders of throwaway profiles in a `tmp_root`: browse's, web's.
+pub const throwaway_prefixes = [_][]const u8{ "harness-browser-", "harness-web-" };
+
+var profiles_mutex: Io.Mutex = .init;
+/// The roots swept in this process (page_allocator).
+var swept: std.StringHashMapUnmanaged(void) = .empty;
+
+/// A new empty throwaway profile `PREFIX<random>` in `tmp_root`. The first
+/// one this process makes there first removes those left by an earlier
+/// run (killed before it could remove its own); this process has none
+/// there yet then.
+pub fn newProfile(io: Io, arena: Allocator, tmp_root: []const u8, prefix: []const u8) ![]const u8 {
+    profiles_mutex.lockUncancelable(io);
+    defer profiles_mutex.unlock(io);
+    try Io.Dir.cwd().createDirPath(io, tmp_root);
+    if (!swept.contains(tmp_root)) {
+        sweepProfiles(io, tmp_root);
+        const k = try std.heap.page_allocator.dupe(u8, tmp_root);
+        swept.put(std.heap.page_allocator, k, {}) catch std.heap.page_allocator.free(k);
+    }
+    var rnd: [8]u8 = undefined;
+    io.random(&rnd);
+    const p = try std.fs.path.join(arena, &.{ tmp_root, try std.fmt.allocPrint(arena, "{s}{x}", .{ prefix, rnd }) });
+    try Io.Dir.cwd().createDir(io, p, .default_dir);
+    return p;
+}
+
+/// Removes the throwaway profiles in `root` (folders only, not links).
+fn sweepProfiles(io: Io, root: []const u8) void {
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var dir = Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    // the names first: removing while listing may skip some
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .directory) continue;
+        for (throwaway_prefixes) |pre| if (std.mem.startsWith(u8, e.name, pre)) {
+            names.append(a, a.dupe(u8, e.name) catch continue) catch {};
+        };
+    }
+    for (names.items) |n| dir.deleteTree(io, n) catch {};
+}
+
 /// Renders `url` in a headless browser with a fresh throwaway profile and
 /// returns the DOM as HTML (at most max_bytes). Ends it on `stop`
 /// (error.Stopped) or after timeout_ms (error.Timeout).
@@ -1259,12 +1305,7 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
     if (!validUrl(url)) return error.BadUrl;
     const host = try urlHostname(arena, url) orelse return error.BadUrl;
 
-    var rnd: [8]u8 = undefined;
-    io.random(&rnd);
-    const name = try std.fmt.allocPrint(arena, "harness-browser-{x}", .{rnd});
-    try Io.Dir.cwd().createDirPath(io, tmp_root);
-    const profile = try std.fs.path.join(arena, &.{ tmp_root, name });
-    try Io.Dir.cwd().createDir(io, profile, .default_dir);
+    const profile = try newProfile(io, arena, tmp_root, "harness-browser-");
     defer removeProfile(io, profile);
 
     var argv: std.ArrayList([]const u8) = .empty;
@@ -1825,6 +1866,36 @@ test "render_gives_the_browser_a_small_environment_and_keeps_it_on_the_host" {
     try expectHas(out, "ARG --password-store=basic\n");
     // no other host than the one the gate allowed is even looked up
     try expectHas(out, "ARG --host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE docs.example.com\n");
+}
+
+test "render_removes_throwaway_profiles_a_killed_run_left" {
+    if (is_windows) return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "quick", .data = "#!/bin/sh\necho '<html><body><p>dom</p></body></html>'\n" });
+    var f = try tmp.dir.openFile(t.io, "quick", .{});
+    try f.setPermissions(t.io, .fromMode(0o755));
+    f.close(t.io);
+    // what a harness killed in the middle of a page left behind
+    try tmp.dir.createDirPath(t.io, "state/harness-browser-0123abcd/Default");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "state/harness-browser-0123abcd/Default/Cookies", .data = "x" });
+    try tmp.dir.createDirPath(t.io, "state/harness-web-4567ef01");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "state/grants", .data = "kept" });
+    try tmp.dir.createDirPath(t.io, "state/harness-webby");
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    var stop: std.atomic.Value(bool) = .init(false);
+    _ = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", try std.fs.path.join(a, &.{ root, "state" }), &stop, 5000, 1 << 20, test_env);
+    var dir = try tmp.dir.openDir(t.io, "state", .{ .iterate = true });
+    defer dir.close(t.io);
+    var it = dir.iterate();
+    var names: std.ArrayList(u8) = .empty;
+    while (try it.next(t.io)) |e| try names.print(a, "{s} ", .{e.name});
+    try t.expect(!has(names.items, "harness-browser-") and !has(names.items, "harness-web-"));
+    try expectHas(names.items, "grants");
+    try expectHas(names.items, "harness-webby");
 }
 
 test "render_loads_nothing_from_another_host" {
