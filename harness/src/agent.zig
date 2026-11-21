@@ -249,23 +249,17 @@ pub const McpTool = struct {
     amount: []const u8,
 };
 
-/// The amount field of one tool from mcp.ini's `amount =`: one field for
-/// all money tools ("notional_usd"), or per tool
-/// ("place_order:notional_usd, cancel_order:none").
-pub fn amountField(spec: []const u8, tool: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, spec, ':') == null) return std.mem.trim(u8, spec, " ");
-    var it = std.mem.splitScalar(u8, spec, ',');
-    while (it.next()) |item| {
-        const colon = std.mem.indexOfScalar(u8, item, ':') orelse continue;
-        if (!std.mem.eql(u8, std.mem.trim(u8, item[0..colon], " "), tool)) continue;
-        const field = std.mem.trim(u8, item[colon + 1 ..], " ");
-        return if (std.mem.eql(u8, field, "none")) "" else field;
-    }
-    // not listed: an amount is required, under a name that cannot match
-    return "(not set in mcp.ini)";
+/// The amount field of one tool from mcp.ini's `amount =`.
+fn amountField(amount: mcp.Amount, tool: []const u8) []const u8 {
+    return switch (amount.of(tool)) {
+        .name => |f| f,
+        .none => "",
+        // not listed: an amount is required, under a name that cannot match
+        .unset => if (amount == .unset) "" else "(not set in mcp.ini)",
+    };
 }
 
-pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, money: []const []const u8, amount: []const u8) ![]McpTool {
+pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, money: []const []const u8, amount: mcp.Amount) ![]McpTool {
     var out: std.ArrayList(McpTool) = .empty;
     for (s.tools()) |tl| {
         var is_money = false;
@@ -1380,6 +1374,12 @@ test "long_conversation_is_summarised_not_dropped" {
 
 const mcp_fake_path = if (@import("builtin").is_test) @import("build_options").fake_path else "";
 
+/// `amount = TEXT` as mcp.ini's parser reads it, for the fake's money tools.
+fn amountSpec(a: std.mem.Allocator, text: []const u8) !mcp.Amount {
+    const cfgs = try mcp.parseConfig(a, try std.fmt.allocPrint(a, "[fake]\ncommand = x\nmoney = echo, fail\namount = {s}\n", .{text}));
+    return cfgs[0].amount;
+}
+
 fn withMcp(f: *Fix, money: bool) !*mcp.Server {
     const a = f.e.arena.allocator();
     const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, mcp_fake_path, a);
@@ -1389,7 +1389,7 @@ fn withMcp(f: *Fix, money: bool) !*mcp.Server {
         .home = "/tmp",
         .secret_values = &.{},
     });
-    f.mcp_tools = try mcpTools(a, s, if (money) &.{ "echo", "fail" } else &.{}, "amount");
+    f.mcp_tools = try mcpTools(a, s, if (money) &.{ "echo", "fail" } else &.{}, if (money) try amountSpec(a, "amount") else .unset);
     f.run.mcp = f.mcp_tools;
     f.run.money_ledger = &f.ledger;
     return s;
@@ -1567,7 +1567,7 @@ test "amount_field_can_differ_per_tool" {
     defer f.deinit();
     const s = try withMcp(&f, true);
     defer s.deinit();
-    f.mcp_tools = try mcpTools(f.e.arena.allocator(), s, &.{ "echo", "fail" }, "echo:amount, fail:none");
+    f.mcp_tools = try mcpTools(f.e.arena.allocator(), s, &.{ "echo", "fail" }, try amountSpec(f.e.arena.allocator(), "echo:amount, fail:none"));
     f.run.mcp = f.mcp_tools;
     f.run.money = .{ .max_per_call = 10 };
     // like cancel_order: no amount, still allowed with a cap set

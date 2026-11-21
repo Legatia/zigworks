@@ -33,11 +33,44 @@ pub const ServerConfig = struct {
     secrets: []const EnvSecret,
     /// `money = a, b`: tools that move money.
     money: []const []const u8,
-    /// `amount = field`: the input field holding a money call's amount.
-    amount: []const u8 = "",
+    /// `amount =`: where the money tools' inputs hold their amounts.
+    amount: Amount = .unset,
 };
 
 pub const EnvSecret = struct { env: []const u8, secret: []const u8 };
+
+/// Where a money tool's input holds the amount it moves.
+pub const Field = union(enum) {
+    /// mcp.ini does not say.
+    unset,
+    /// `tool:none`: the tool moves no amount (like cancelling an order).
+    none,
+    /// The input field's name.
+    name: []const u8,
+};
+
+/// `amount =`: one field for every money tool (`amount = notional_usd`),
+/// or a field per tool (`amount = place_order:notional_usd,
+/// cancel_order:none`).
+pub const Amount = union(enum) {
+    unset,
+    all: []const u8,
+    each: []const ToolField,
+
+    pub const ToolField = struct { tool: []const u8, field: Field };
+
+    /// The field holding `tool`'s amount; `.unset` for a tool the list
+    /// leaves out.
+    pub fn of(am: Amount, tool: []const u8) Field {
+        return switch (am) {
+            .unset => .unset,
+            .all => |f| .{ .name = f },
+            .each => |list| for (list) |tf| {
+                if (std.mem.eql(u8, tf.tool, tool)) break tf.field;
+            } else .unset,
+        };
+    }
+};
 
 /// Servers in the order they appear. Unknown keys, a missing `command`,
 /// bad names and the same server twice are errors.
@@ -83,17 +116,48 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig,
                     for (names) |n| if (std.mem.indexOfAny(u8, n, " \t") != null) return error.BadConfig;
                     cfg.money = names;
                 },
-                3 => {
-                    if (l.value.len == 0 or std.mem.indexOfAny(u8, l.value, " \t,") != null) return error.BadConfig;
-                    cfg.amount = l.value;
-                },
+                3 => cfg.amount = try parseAmount(arena, l.value),
                 else => unreachable,
             }
         }
         if (cfg.command.len == 0) return error.BadConfig;
+        // an amount names money tools: without them it is a mistake
+        switch (cfg.amount) {
+            .unset => {},
+            .all => if (cfg.money.len == 0) return error.BadConfig,
+            .each => |list| for (list) |tf| {
+                for (cfg.money) |m| {
+                    if (std.mem.eql(u8, m, tf.tool)) break;
+                } else return error.BadConfig;
+            },
+        }
         try out.append(arena, cfg);
     }
     return out.items;
+}
+
+/// `field` alone, or `tool:field, tool:none, ...` (each tool once). A
+/// field alone may not be `none`: that is said per tool.
+fn parseAmount(arena: std.mem.Allocator, value: []const u8) error{ BadConfig, OutOfMemory }!Amount {
+    if (std.mem.indexOfAny(u8, value, ":,") == null) {
+        if (!validField(value) or std.mem.eql(u8, value, "none")) return error.BadConfig;
+        return .{ .all = value };
+    }
+    var list: std.ArrayList(Amount.ToolField) = .empty;
+    for (try items(arena, value)) |item| {
+        const colon = std.mem.indexOfScalar(u8, item, ':') orelse return error.BadConfig;
+        const tool = std.mem.trim(u8, item[0..colon], " \t");
+        const field = std.mem.trim(u8, item[colon + 1 ..], " \t");
+        if (!validToolName(tool) or !validField(field)) return error.BadConfig;
+        for (list.items) |tf| if (std.mem.eql(u8, tf.tool, tool)) return error.BadConfig;
+        try list.append(arena, .{ .tool = tool, .field = if (std.mem.eql(u8, field, "none")) .none else .{ .name = field } });
+    }
+    return .{ .each = list.items };
+}
+
+/// An input field's name in mcp.ini: no spaces, commas or colons.
+fn validField(f: []const u8) bool {
+    return f.len > 0 and std.mem.indexOfAny(u8, f, " \t,:") == null;
 }
 
 /// "a, b ,c" → {"a","b","c"}; an empty item is an error.
@@ -635,7 +699,7 @@ test "parse_config_reads_servers_secrets_and_money_tools" {
     try t.expectEqualStrings("GITHUB_PERSONAL_ACCESS_TOKEN", servers[0].secrets[0].env);
     try t.expectEqualStrings("github", servers[0].secrets[0].secret);
     try t.expectEqual(0, servers[0].money.len);
-    try t.expectEqualStrings("", servers[0].amount);
+    try t.expect(servers[0].amount == .unset);
     const b = servers[1];
     try t.expectEqualStrings("broker-1", b.name);
     try t.expectEqual(2, b.secrets.len);
@@ -644,7 +708,7 @@ test "parse_config_reads_servers_secrets_and_money_tools" {
     try t.expectEqual(2, b.money.len);
     try t.expectEqualStrings("place_order", b.money[0]);
     try t.expectEqualStrings("cancel_order", b.money[1]);
-    try t.expectEqualStrings("notional_usd", b.amount);
+    try t.expectEqualStrings("notional_usd", b.amount.of("place_order").name);
     const argv = try splitCommand(a, b.command);
     try t.expectEqual(3, argv.len);
     try t.expectEqualStrings("/opt/my broker/bin/mcp", argv[0]);
@@ -671,6 +735,46 @@ test "parse_config_refuses_bad_lines" {
         "[a]\ncommand = \"unterminated\n",
         "[a]\ncommand = x\n[a]\ncommand = y\n", // same server twice
         "[a]\njust words\n",
+    };
+    for (bad) |text| {
+        if (parseConfig(a, text)) |_| {
+            std.debug.print("accepted: {s}\n", .{text});
+            return error.TestUnexpectedResult;
+        } else |e| try t.expectEqual(error.BadConfig, e);
+    }
+}
+
+test "parse_config_takes_the_amount_field_per_tool" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // README's example, as written there
+    const servers = try parseConfig(a,
+        \\[broker]
+        \\command = /opt/broker-mcp/server
+        \\secret = BROKER_KEY:broker
+        \\money = place_order, cancel_order              ; tools that move money
+        \\amount = place_order:notional_usd, cancel_order:none   ; or one field for all: amount = notional_usd
+    );
+    try t.expectEqual(1, servers.len);
+    const am = servers[0].amount;
+    try t.expectEqualStrings("notional_usd", am.of("place_order").name);
+    try t.expect(am.of("cancel_order") == .none);
+    try t.expect(am.of("other_tool") == .unset);
+    // one field for all money tools
+    const one = try parseConfig(a, "[b]\ncommand = x\nmoney = p, q\namount = notional_usd\n");
+    try t.expectEqualStrings("notional_usd", one[0].amount.of("q").name);
+    try t.expect((try parseConfig(a, "[b]\ncommand = x\nmoney = p\n"))[0].amount == .unset);
+    const bad = [_][]const u8{
+        "[b]\ncommand = x\nmoney = p\namount = p:\n",
+        "[b]\ncommand = x\nmoney = p\namount = :usd\n",
+        "[b]\ncommand = x\nmoney = p\namount = p:usd:eur\n",
+        "[b]\ncommand = x\nmoney = p\namount = p:usd, p:none\n", // the same tool twice
+        "[b]\ncommand = x\nmoney = p, q\namount = p:usd,, q:none\n",
+        "[b]\ncommand = x\nmoney = p\namount = q:usd\n", // not a money tool: a typo
+        "[b]\ncommand = x\namount = usd\n", // an amount without money tools
+        "[b]\ncommand = x\nmoney = p\namount = none\n", // none is said per tool
+        "[b]\ncommand = x\nmoney = p\namount = notional usd\n",
     };
     for (bad) |text| {
         if (parseConfig(a, text)) |_| {
