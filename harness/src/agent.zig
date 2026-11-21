@@ -379,6 +379,14 @@ pub const MoneyLedger = struct {
         return e;
     }
 
+    /// The day a reservation made on `day` counts toward: a later one when
+    /// another run already counted past midnight (so today's total is
+    /// never wiped by yesterday's).
+    fn dayFor(l: *MoneyLedger, server: []const u8, day: i64) i64 {
+        const e = l.find(server) orelse return day;
+        return @max(e.day, day);
+    }
+
     /// What `server` moved on `day`.
     fn spent(l: *MoneyLedger, server: []const u8, day: i64) f64 {
         var so_far: f64 = 0;
@@ -388,16 +396,29 @@ pub const MoneyLedger = struct {
         return so_far;
     }
 
-    /// Counts `amount` toward `server`'s `day`; false when no entry is free.
-    fn add(l: *MoneyLedger, io: Io, server: []const u8, day: i64, amount: f64) bool {
-        const e = l.entry(server, day) orelse return false;
+    /// Counts `amount` toward `server`'s day (`dayFor`); the reservation,
+    /// or null when no entry is free.
+    fn reserve(l: *MoneyLedger, io: Io, server: []const u8, day_in: i64, amount: f64) ?Reservation {
+        const day = l.dayFor(server, day_in);
+        const e = l.entry(server, day) orelse return null;
         if (e.day != day) {
             e.day = day;
             e.total = 0;
         }
         e.total += amount;
         l.save(io);
-        return true;
+        return .{ .day = day, .amount = amount };
+    }
+
+    /// Takes back what `reserve` counted, for a call not made. A day that
+    /// is over is left as it was (it no longer counts), and a total never
+    /// goes below 0.
+    fn release(l: *MoneyLedger, io: Io, server: []const u8, res: Reservation) void {
+        if (res.amount == 0) return;
+        const e = l.find(server) orelse return;
+        if (e.day != res.day) return;
+        e.total = @max(0, e.total - res.amount);
+        l.save(io);
     }
 
     fn save(l: *MoneyLedger, io: Io) void {
@@ -415,6 +436,9 @@ pub const MoneyLedger = struct {
         return total;
     }
 };
+
+/// An amount counted toward a server's day before its call is asked.
+const Reservation = struct { day: i64 = 0, amount: f64 = 0 };
 
 pub const ModelCfg = struct {
     url: []const u8,
@@ -749,15 +773,15 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
         else => tools.mainArg(a, tool, input_json) catch return .{ .text = "the tool's input is missing its main field", .is_error = true },
     };
     const now_s = r.now();
-    var amount: f64 = 0;
+    var reserved: Reservation = .{};
     if (tool == .money) {
-        if (moneyCheck(r, a, mt.?, input_json, now_s, &amount)) |why| {
+        if (moneyCheck(r, a, mt.?, input_json, now_s, &reserved)) |why| {
             try r.log.write(.gate, r.private, .{ .run = r.label, .tool = name, .decision = "deny", .why = why, .arg = arg });
             return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
         }
     }
     if (try decideAndAsk(r, a, tool, name, arg, now_s)) |refused| {
-        if (tool == .money) releaseMoney(r, mt.?, now_s, amount);
+        if (tool == .money) releaseMoney(r, mt.?, reserved);
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{refused}), .is_error = true };
     }
 
@@ -779,7 +803,7 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
             break :blk .{ .text = try std.fmt.allocPrint(a, "saved as {s}", .{res.id}) };
         },
         .delegate => try delegate(r, a, input_json),
-        .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, amount),
+        .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
         .skill => blk: {
             const v = jv.parse(a, input_json).?;
             const text = if (jv.str(jv.get(v, "file"))) |file|
@@ -894,9 +918,10 @@ fn moneyDay(r: *const Run, now_s: i64) i64 {
 
 /// Why a money call is refused before anyone is asked, or null. When it
 /// passes, its amount is already counted in today's total (checked and
-/// counted under one lock, so two runs cannot both pass the same cap);
-/// `releaseMoney` takes it back if the call is not made.
-fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []const u8, now_s: i64, amount: *f64) ?[]const u8 {
+/// counted under one lock, so two runs cannot both pass the same cap) as
+/// `res`; `releaseMoney` takes it back if the call is not made.
+fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []const u8, now_s: i64, res: *Reservation) ?[]const u8 {
+    var amount: f64 = 0;
     // the server's own caps, else config.ini's
     const per_call = m.max_per_call orelse r.money.max_per_call;
     const per_day = m.max_per_day orelse r.money.max_per_day;
@@ -909,37 +934,37 @@ fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []co
         .unset => if (capped) return "no amount field is set for this tool in mcp.ini (amount =), so the money caps cannot be checked",
         .name => |field| if (amountOf(a, input_json, field)) |x| {
             if (x < 0 or std.math.isNan(x) or std.math.isInf(x)) return "the amount is not a positive number";
-            amount.* = x;
+            amount = x;
         } else if (capped) {
             return std.fmt.allocPrint(a, "no amount in the field \"{s}\", so the caps cannot be checked", .{field}) catch "no amount";
         },
     }
-    if (per_call > 0 and amount.* > @as(f64, @floatFromInt(per_call)))
-        return std.fmt.allocPrint(a, "{d} is over the cap of {d} per call", .{ amount.*, per_call }) catch "over the cap per call";
+    if (per_call > 0 and amount > @as(f64, @floatFromInt(per_call)))
+        return std.fmt.allocPrint(a, "{d} is over the cap of {d} per call", .{ amount, per_call }) catch "over the cap per call";
     const l = r.money_ledger orelse return if (per_day > 0) "no record of today's total" else null;
     l.mutex.lockUncancelable(r.io);
     defer l.mutex.unlock(r.io);
     // each server has its own total: its caps are in its own units
-    const day = moneyDay(r, now_s);
+    const day = l.dayFor(m.server.name, moneyDay(r, now_s));
     const spent = l.spent(m.server.name, day);
-    if (per_day > 0 and spent + amount.* > @as(f64, @floatFromInt(per_day)))
-        return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount.*, per_day, spent }) catch "over the cap per day";
-    if (!l.add(r.io, m.server.name, day, amount.*)) return "the day totals of too many servers are kept already";
+    if (per_day > 0 and spent + amount > @as(f64, @floatFromInt(per_day)))
+        return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount, per_day, spent }) catch "over the cap per day";
+    res.* = l.reserve(r.io, m.server.name, day, amount) orelse return "the day totals of too many servers are kept already";
     return null;
 }
 
-/// Takes back an amount counted by `moneyCheck` for a call not made.
-fn releaseMoney(r: *Run, m: *const McpTool, now_s: i64, amount: f64) void {
+/// Takes back an amount counted by `moneyCheck` for a call not made: from
+/// the day it was counted toward, not the day it is now.
+fn releaseMoney(r: *Run, m: *const McpTool, res: Reservation) void {
     const l = r.money_ledger orelse return;
-    if (amount == 0) return;
     l.mutex.lockUncancelable(r.io);
     defer l.mutex.unlock(r.io);
-    _ = l.add(r.io, m.server.name, moneyDay(r, now_s), -amount);
+    l.release(r.io, m.server.name, res);
 }
 
-fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, amount: f64) !tools.Output {
+fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, reserved: Reservation) !tools.Output {
     if (m.money and r.dry_run) {
-        releaseMoney(r, m, r.now(), amount);
+        releaseMoney(r, m, reserved);
         return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
     }
     const timeout_ms: u32 = @intCast(@min(@as(u64, r.limits.turn_seconds) * 1000, std.math.maxInt(u32)));
@@ -1822,11 +1847,30 @@ test "money_ledger_keeps_a_total_per_server_and_reads_the_old_file" {
     try t.expectEqual(@as(f64, 40), l.spent("broker", 20000));
     try t.expectEqual(@as(f64, 40), l.spent("other", 20000));
     try t.expectEqual(@as(f64, 0), l.spent("broker", 20001));
-    try t.expect(l.add(t.io, "broker", 20000, 5));
+    try t.expect(l.reserve(t.io, "broker", 20000, 5) != null);
     var again: MoneyLedger = .{ .path = p };
     again.load(t.io);
     try t.expectEqual(@as(f64, 45), again.spent("broker", 20000));
     try t.expectEqual(@as(f64, 40), again.spent("other", 20000));
+}
+
+test "a_release_for_a_day_that_is_over_leaves_today_alone" {
+    var l: MoneyLedger = .{};
+    // 30 counted late on day 100 while the owner is asked; after midnight
+    // another run moves 5
+    const late = l.reserve(t.io, "broker", 100, 30).?;
+    try t.expect(l.reserve(t.io, "broker", 101, 5) != null);
+    // the owner says no after midnight: day 100's 30 is taken back
+    l.release(t.io, "broker", late);
+    try t.expectEqual(@as(f64, 5), l.spent("broker", 101));
+    // a run that read the clock just before midnight but counts after
+    // another run did counts toward the new day, not over it
+    const behind = l.reserve(t.io, "broker", 100, 2).?;
+    try t.expectEqual(101, behind.day);
+    try t.expectEqual(@as(f64, 7), l.spent("broker", 101));
+    // and a total never goes below 0
+    l.release(t.io, "broker", .{ .day = 101, .amount = 50 });
+    try t.expectEqual(@as(f64, 0), l.spent("broker", 101));
 }
 
 test "private_turns_are_left_out_of_summaries" {
