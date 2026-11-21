@@ -97,8 +97,9 @@ fn runRaw(env: Env, arena: std.mem.Allocator, tool: gate.Tool, input_json: []con
             const content = jv.str(jv.get(v, "content")) orelse return error.BadInput;
             if (std.fs.path.dirname(p)) |d| try Io.Dir.cwd().createDirPath(env.io, d);
             // check again now that the folders exist
-            _ = try gate.confine(arena, env.io, env.workspace, arg);
-            try Io.Dir.cwd().writeFile(env.io, .{ .sub_path = p, .data = content });
+            const cf = try gate.confined(arena, env.io, env.workspace, arg);
+            if (cf.link) return .{ .text = "a symbolic link: files are not written through one", .is_error = true };
+            try writeNoFollow(env.io, p, content);
             return .{ .text = try std.fmt.allocPrint(arena, "wrote {d} bytes to {s}", .{ content.len, arg }) };
         },
         .fetch => fetch(env, arena, arg, startOf(arena, input_json)),
@@ -106,6 +107,24 @@ fn runRaw(env: Env, arena: std.mem.Allocator, tool: gate.Tool, input_json: []con
         .search => search(env, arena, arg),
         .recall, .remember, .delegate, .skill, .skill_save, .mcp, .money, .web, .login => error.NotHere,
     };
+}
+
+/// Writes `p` as a new file, or over the regular file that is there; never
+/// through a symlink, even one made since the gate looked.
+fn writeNoFollow(io: Io, p: []const u8, content: []const u8) !void {
+    var f = Io.Dir.cwd().createFile(io, p, .{ .exclusive = true }) catch |e| switch (e) {
+        error.PathAlreadyExists => blk: {
+            // not a pipe either: opening one would wait for a reader
+            if ((try Io.Dir.cwd().statFile(io, p, .{ .follow_symlinks = false })).kind != .file) return error.NotAFile;
+            break :blk try Io.Dir.cwd().openFile(io, p, .{ .mode = .write_only, .follow_symlinks = false, .allow_directory = false });
+        },
+        else => return e,
+    };
+    defer f.close(io);
+    // Windows opens the link itself rather than refusing it
+    if ((try f.stat(io)).kind != .file) return error.NotAFile;
+    try f.setLength(io, 0);
+    try f.writeStreamingAll(io, content);
 }
 
 /// `raw` with the stored secrets masked, before anything is cut from it.
@@ -607,6 +626,26 @@ test "files_confined_to_workspace" {
     const out = try f.call(.write_file, "{\"path\":\"../escape.txt\",\"content\":\"x\"}");
     try t.expect(out.is_error);
     try t.expectError(error.FileNotFound, f.e.tmp.dir.access(t.io, "escape.txt", .{}));
+}
+
+test "write_file_never_writes_through_a_symlink" {
+    if (is_windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.e.tmp.dir.symLink(t.io, "../outside.txt", "ws/dangle", .{});
+    const w = try f.call(.write_file, "{\"path\":\"dangle\",\"content\":\"planted\"}");
+    try t.expect(w.is_error);
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.access(t.io, "outside.txt", .{}));
+    // nor through one to a file that is there
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "target.txt", .data = "before" });
+    try f.e.tmp.dir.symLink(t.io, "../target.txt", "ws/to-target", .{});
+    try t.expect((try f.call(.write_file, "{\"path\":\"to-target\",\"content\":\"after\"}")).is_error);
+    try t.expectEqualStrings("before", try f.e.tmp.dir.readFileAlloc(t.io, "target.txt", f.e.arena.allocator(), .unlimited));
+    // a file that is there is replaced
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/plain.txt", .data = "old and long" });
+    try t.expect(!(try f.call(.write_file, "{\"path\":\"plain.txt\",\"content\":\"new\"}")).is_error);
+    try t.expectEqualStrings("new", try f.e.tmp.dir.readFileAlloc(t.io, "ws/plain.txt", f.e.arena.allocator(), .unlimited));
 }
 
 test "fetch_caps_body_and_refuses_binary" {

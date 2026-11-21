@@ -176,6 +176,7 @@ pub const Gate = struct {
                 const cf = confined(arena, g.io, g.workspace, arg) catch return .{ .action = .deny, .why = "outside the workspace" };
                 subject = cf.rel;
                 given = cf.given;
+                if (tool == .write_file and cf.link) return .{ .action = .deny, .why = "a symbolic link: files are not written through one", .subject = subject };
             },
             .web => if (arg.len == 0 or std.mem.indexOfAny(u8, arg, " /\\?#@") != null) return .{ .action = .deny, .why = "not a host name" },
             else => {},
@@ -246,6 +247,8 @@ pub const Confined = struct {
     rel: []const u8,
     /// The same before symlinks are followed.
     given: []const u8,
+    /// The last part is a symlink (to something inside the workspace).
+    link: bool,
 };
 
 pub fn confined(arena: std.mem.Allocator, io: Io, workspace: []const u8, path: []const u8) !Confined {
@@ -260,13 +263,23 @@ pub fn confined(arena: std.mem.Allocator, io: Io, workspace: []const u8, path: [
             if (!inside(workspace, real)) return error.OutsideWorkspace;
             break real;
         } else |e| switch (e) {
-            error.FileNotFound, error.NotDir => probe = std.fs.path.dirname(probe) orelse return error.OutsideWorkspace,
+            error.FileNotFound, error.NotDir => {
+                // a symlink to something missing: where a write through it
+                // would land can't be checked
+                if (isLink(io, probe)) return error.OutsideWorkspace;
+                probe = std.fs.path.dirname(probe) orelse return error.OutsideWorkspace;
+            },
             else => return error.OutsideWorkspace,
         }
     };
     // what exists as it really is, then the parts not made yet
     const full = try std.mem.concat(arena, u8, &.{ real, resolved[probe.len..] });
-    return .{ .path = resolved, .rel = relTo(arena, workspace, full), .given = relTo(arena, workspace, resolved) };
+    return .{ .path = resolved, .rel = relTo(arena, workspace, full), .given = relTo(arena, workspace, resolved), .link = isLink(io, resolved) };
+}
+
+fn isLink(io: Io, p: []const u8) bool {
+    const st = Io.Dir.cwd().statFile(io, p, .{ .follow_symlinks = false }) catch return false;
+    return st.kind == .sym_link;
 }
 
 /// `p` (inside `root`) relative to it, with `/` between the parts.
@@ -421,6 +434,25 @@ test "file_rules_see_the_path_inside_the_workspace" {
     try t.expectEqual(if (fold_paths) .deny else .allow, f.act(.write_file, "plans/x.md", .{}));
     // the decision says which form it matched
     try t.expectEqualStrings("drafts/y.md", f.gate.decide(a, .write_file, "a/../drafts/y.md", 1000, .{}).subject);
+}
+
+test "a_symlink_whose_target_is_missing_is_refused_and_written_files_are_never_links" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    // a link out of the workspace to nothing yet: writing it would make the file outside
+    try f.tmp.dir.symLink(t.io, "../outside.txt", "ws/dangle", .{});
+    try f.tmp.dir.symLink(t.io, "../nowhere", "ws/dangle-dir", .{ .is_directory = true });
+    try t.expectEqual(.deny, f.act(.write_file, "dangle", .{}));
+    try t.expectEqual(.deny, f.act(.write_file, "dangle-dir/x.txt", .{}));
+    try t.expectEqual(.deny, f.act(.read_file, "dangle", .{}));
+    // a link to a file inside may be read, but a write would go through it
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/notes.txt", .data = "x" });
+    try f.tmp.dir.symLink(t.io, "notes.txt", "ws/in-link", .{});
+    try t.expectEqual(.allow, f.act(.read_file, "in-link", .{}));
+    try t.expectEqual(.deny, f.act(.write_file, "in-link", .{}));
+    try t.expectEqual(.allow, f.act(.write_file, "notes.txt", .{}));
 }
 
 test "fetch_refuses_non_http_schemes" {
