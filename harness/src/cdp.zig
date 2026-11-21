@@ -405,8 +405,9 @@ pub const Session = struct {
 
     /// Loads `url` and waits until the new document has loaded.
     pub fn navigate(s: *Session, arena: Allocator, url: []const u8) !void {
-        // a mark on the old document: gone once the new one is there
-        _ = s.evaluate(arena, "window.__hxOld = true") catch {};
+        // a mark on the old document, in harness's own world: gone once the
+        // new one is there, and no page can set it
+        _ = s.evaluateIsolated(arena, "window.__hxOld = true") catch {};
         var p: std.ArrayList(u8) = .empty;
         try p.appendSlice(arena, "{\"url\":");
         try util.jsonString(&p, arena, url);
@@ -462,12 +463,14 @@ pub const Session = struct {
     }
 
     /// Polls `cond` every 50 ms until it is true; a script that fails
-    /// while the document is replaced is tried again.
+    /// while the document is replaced is tried again. It runs in an
+    /// isolated world: the page's scripts can't change what it reads (a
+    /// `readyState` of their own would stall every wait).
     fn waitFor(s: *Session, arena: Allocator, cond: []const u8) !void {
         const until = deadline(s.io, s.timeout_ms);
         while (true) {
-            const v = s.evaluate(arena, cond) catch |e| switch (e) {
-                error.Script, error.Cdp, error.Timeout => "false",
+            const v = s.evaluateIsolated(arena, cond) catch |e| switch (e) {
+                error.Script, error.Cdp, error.Timeout, error.NoPage => "false",
                 else => return e,
             };
             if (std.mem.eql(u8, v, "true")) return;

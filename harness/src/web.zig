@@ -1448,6 +1448,26 @@ test "web_waits_for_a_slow_navigation_after_a_click" {
     try expectHas(r2.text, "#part");
 }
 
+test "web_page_scripts_cannot_stall_the_waits" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    f.web.env.timeout_ms = 4000;
+    // a page that says it is never loaded, and fakes the mark of an old page
+    try f.page("stall.html", "<html><head><title>Stall</title></head><body><p>stalling page</p><script>Object.defineProperty(document, 'readyState', {get: () => 'loading'}); window.__hxOld = true;</script></body></html>");
+    try f.page("to.html", "<html><body><a href=\"/page/stall.html\">go</a></body></html>");
+    const r = try f.act(try f.openJson("stall.html", null));
+    if (r.is_error) std.debug.print("\n{s}\n", .{r.text});
+    try t.expect(!r.is_error);
+    try expectHas(r.text, "stalling page");
+    _ = try f.act(try f.openJson("to.html", null));
+    const r2 = try f.act("{\"action\":\"click\",\"ref\":1}");
+    try t.expect(!r2.is_error);
+    try expectHas(r2.text, "Title: Stall");
+    const r3 = try f.act(try f.openJson("to.html", null));
+    try t.expect(!r3.is_error);
+}
+
 test "web_snapshot_never_shows_a_host_the_gate_did_not_allow" {
     var f: Fix = undefined;
     try f.init("");
