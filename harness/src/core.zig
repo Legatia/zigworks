@@ -19,6 +19,7 @@ const scrub = @import("scrub.zig");
 const util = @import("util.zig");
 const logins = @import("logins.zig");
 const store_mod = @import("store.zig");
+const masks = @import("masks.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -163,7 +164,12 @@ pub const Core = struct {
     settings_hash: [32]u8,
     told_settings_changed: bool = false,
     secrets: Secrets,
+    /// The stored secrets read at open. What every tool's output is
+    /// masked against is `masks`: these and the values added since.
     secret_list: []const scrub.Secret,
+    /// The values masked in tool output: the stored secrets, secrets
+    /// fetched later for MCP servers, passwords made at sign-ups.
+    masks: masks.List,
     workspace: []const u8,
 
     grants: gate.Grants,
@@ -176,6 +182,12 @@ pub const Core = struct {
     /// The owner is asked one question at a time.
     ask_lock: Io.Mutex = .init,
     mcp_arena: std.heap.ArenaAllocator = undefined,
+    /// Guards the list of servers (endBySignal reads it from its thread).
+    mcp_mutex: Io.Mutex = .init,
+    /// startMcp is under way (endBySignal waits for it to end).
+    mcp_starting: std.atomic.Value(bool) = .init(false),
+    /// /reload is restarting the MCP servers: no run starts meanwhile.
+    restarting: std.atomic.Value(bool) = .init(false),
     mcp_servers: std.ArrayList(*mcp.Server) = .empty,
     mcp_tools: []const agent.McpTool = &.{},
     /// What started and what did not, for /status.
@@ -233,14 +245,24 @@ pub const Core = struct {
     memory_quiet_s: i64 = 30 * 60,
     /// How long /stop waits for runs to end before answering.
     stop_wait_ms: u32 = 3_000,
+    /// How long the MCP servers have to start, all of them together.
+    mcp_start_ms: u32 = 20_000,
     path_var: []const u8 = "/usr/local/bin:/usr/bin:/bin",
     home_var: []const u8 = "",
     /// On Windows, the system's own variables, for commands and MCP servers.
     system_vars: []const util.Var = &.{},
     paths_arena: std.heap.ArenaAllocator,
     home_owned: []u8,
+    /// state/lock, open and locked while this core holds the folder.
+    folder_lock: ?Io.File = null,
+    /// What holds the folder ("run", "chat", "task" ...), in the status file.
+    role: []const u8 = "open",
+    /// main's thread acting on SIGINT/SIGTERM; joined first by close.
+    watcher: ?std.Thread = null,
     /// Said to the owner when a channel is attached.
     pending_warning: ?[]const u8 = null,
+    /// What /reload says when the settings files have an error.
+    problem_buf: [800]u8 = undefined,
 
     pub fn now(c: *const Core) i64 {
         return c.fixed_now orelse util.nowSeconds(c.io);
@@ -264,8 +286,8 @@ pub const Core = struct {
         c.paths = try Paths.init(paths_arena.allocator(), home_owned);
         c.paths_arena = paths_arena;
         c.home_owned = home_owned;
-        try takeLock(io, c.paths, gpa);
-        errdefer releaseLock(io, c.paths);
+        c.folder_lock = try takeLock(io, c.paths);
+        errdefer c.releaseFolder();
 
         try Io.Dir.cwd().createDirPath(io, c.paths.workspace);
         c.workspace = try Io.Dir.cwd().realPathFileAlloc(io, c.paths.workspace, c.paths_arena.allocator());
@@ -277,6 +299,9 @@ pub const Core = struct {
         if (secrets.search) |v| try sl.append(c.paths_arena.allocator(), .{ .name = "search", .value = v });
         for (secrets.named) |n| try sl.append(c.paths_arena.allocator(), .{ .name = n.name, .value = n.value });
         c.secret_list = sl.items;
+        c.masks = .init(gpa, io);
+        errdefer c.masks.deinit();
+        for (sl.items) |x| try c.masks.add(x.name, x.value);
 
         c.grants = .init(gpa);
         errdefer c.grants.deinit();
@@ -295,6 +320,10 @@ pub const Core = struct {
         c.money_ledger = .{ .path = c.paths.money };
         c.money_ledger.load(io);
         c.mcp_servers = .empty;
+        c.mcp_mutex = .init;
+        c.mcp_starting = .init(false);
+        c.restarting = .init(false);
+        c.watcher = null;
         c.stop = .init(false);
         c.runs_mutex = .init;
         c.run_flags = .empty;
@@ -325,14 +354,19 @@ pub const Core = struct {
         c.fixed_now = null;
         c.memory_quiet_s = 30 * 60;
         c.stop_wait_ms = 3_000;
+        c.mcp_start_ms = 20_000;
         c.path_var = "/usr/local/bin:/usr/bin:/bin";
         c.home_var = "";
         c.system_vars = &.{};
         c.told_settings_changed = false;
         c.pending_warning = null;
+        c.role = "open";
+        // problem_buf: written before it is read
         c.loadRan();
         c.checkLogAgainstStatus();
         try c.log.write(.config, false, .{ .event = "start", .pid = pidNumber() });
+        // the status says who holds the folder now, not who held it last
+        c.writeStatus() catch {};
         c.mcp_arena = .init(gpa);
         c.mcp_tools = &.{};
         c.mcp_note = "";
@@ -344,6 +378,9 @@ pub const Core = struct {
     pub fn close(c: *Core) void {
         c.quitting.store(true, .release);
         c.stop.store(true, .release);
+        // first: once it is gone no signal handling can touch the core
+        if (c.watcher) |w| w.join();
+        c.watcher = null;
         c.stopRuns();
         if (c.worker) |w| w.join();
         while (c.bg_active.load(.acquire) > 0) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
@@ -359,21 +396,33 @@ pub const Core = struct {
         c.mem.deinit();
         c.log.close();
         c.grants.deinit();
+        c.masks.deinit();
         freeKeys(c.gpa, &c.ran);
         freeKeys(c.gpa, &c.running);
         freeKeys(c.gpa, &c.paused);
-        releaseLock(c.io, c.paths);
+        c.releaseFolder();
         c.settings_arena.deinit();
         c.paths_arena.deinit();
         c.gpa.free(c.home_owned);
         c.gpa.destroy(c);
     }
 
+    /// Lets go of the data folder (the lock file stays: the lock is what counts).
+    fn releaseFolder(c: *Core) void {
+        if (c.folder_lock) |f| f.close(c.io);
+        c.folder_lock = null;
+    }
+
     // ---- settings ----
 
-    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![5][]const u8 {
-        var out: [5][]const u8 = undefined;
-        for ([_][]const u8{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins }, 0..) |p, i| {
+    /// The settings files, in this order; a change to any of them is noticed.
+    fn settingsFiles(c: *const Core) [6][]const u8 {
+        return .{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins, c.paths.mcp };
+    }
+
+    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![6][]const u8 {
+        var out: [6][]const u8 = undefined;
+        for (c.settingsFiles(), 0..) |p, i| {
             out[i] = Io.Dir.cwd().readFileAlloc(c.io, p, a, .limited(1 << 20)) catch |e| switch (e) {
                 error.FileNotFound => "",
                 else => return e,
@@ -382,7 +431,7 @@ pub const Core = struct {
         return out;
     }
 
-    fn hashSettings(texts: [5][]const u8) [32]u8 {
+    fn hashSettings(texts: [6][]const u8) [32]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
         for (texts) |tx| {
             h.update(tx);
@@ -393,7 +442,7 @@ pub const Core = struct {
 
     fn loadSettings(c: *Core, a: std.mem.Allocator) !void {
         if (builtin.os.tag != .windows) {
-            for ([_][]const u8{ c.paths.config, c.paths.rules, c.paths.logins }) |p| {
+            for (guardedFiles(c.paths)) |p| {
                 const st = Io.Dir.cwd().statFile(c.io, p, .{}) catch continue;
                 if (st.permissions.toMode() & 0o022 != 0) return error.BadSettings;
             }
@@ -412,10 +461,12 @@ pub const Core = struct {
         // nothing may start while the settings are replaced: the scheduler
         // waits on settings_mutex, the chat worker on queue_mutex
         c.settings_mutex.lockUncancelable(c.io);
-        defer c.settings_mutex.unlock(c.io);
+        var settings_locked = true;
+        defer if (settings_locked) c.settings_mutex.unlock(c.io);
         c.queue_mutex.lockUncancelable(c.io);
-        defer c.queue_mutex.unlock(c.io);
-        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0) return "Busy; send /reload again when nothing is running.";
+        var queue_locked = true;
+        defer if (queue_locked) c.queue_mutex.unlock(c.io);
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire)) return "Busy; send /reload again when nothing is running.";
         var fresh: std.heap.ArenaAllocator = .init(c.gpa);
         const saved_cfg = c.cfg;
         const saved_rules = c.rule_list;
@@ -431,7 +482,7 @@ pub const Core = struct {
             c.tasks = saved_tasks;
             c.login_list = saved_logins;
             c.settings_hash = saved_hash;
-            return "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini and logins.ini.";
+            return c.settingsErrorReply();
         };
         // the chat's client points into the old settings: build it again
         const client = model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens) catch {
@@ -451,11 +502,35 @@ pub const Core = struct {
         c.gate.rules = c.rule_list;
         c.findBrowser();
         c.told_settings_changed = false;
-        // nothing runs now (reload waits for that), so servers can restart
+        // nothing runs now (reload waits for that), so servers can restart;
+        // nothing may start until they have (popQueue, claimIdle and
+        // startBackground look at `restarting`), but the locks are let go:
+        // /stop, a signal and the scheduler's status do not wait for it
+        c.restarting.store(true, .release);
+        queue_locked = false;
+        c.queue_mutex.unlock(c.io);
+        settings_locked = false;
+        c.settings_mutex.unlock(c.io);
+        return c.restartMcp();
+    }
+
+    /// The second half of reload, outside its locks.
+    fn restartMcp(c: *Core) ![]const u8 {
+        defer c.restarting.store(false, .release);
         c.stopMcp();
         c.startMcp();
         try c.log.write(.config, false, .{ .event = "reload" });
         return "Settings reloaded.";
+    }
+
+    /// The answer to a /reload the settings files refused, naming the file
+    /// and line (in `problem_buf`).
+    fn settingsErrorReply(c: *Core) []const u8 {
+        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, logins.ini and mcp.ini.";
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const why = (settingsProblem(c.io, arena.allocator(), c.paths) catch return generic) orelse return generic;
+        return std.fmt.bufPrint(&c.problem_buf, "The settings files have an error; nothing changed: {s}", .{why}) catch generic;
     }
 
     fn checkSettingsChanged(c: *Core) void {
@@ -520,7 +595,7 @@ pub const Core = struct {
     pub fn writeStatus(c: *Core) !void {
         var tb: [20]u8 = undefined;
         var buf: [256]u8 = undefined;
-        const s = try std.fmt.bufPrint(&buf, "pid {d}\ntick {s}\nlog {s}\n", .{ pidNumber(), util.isoTime(&tb, util.nowSeconds(c.io)), c.log.lastHash() });
+        const s = try std.fmt.bufPrint(&buf, "pid {d}\nrole {s}\ntick {s}\nlog {s}\n", .{ pidNumber(), c.role, util.isoTime(&tb, util.nowSeconds(c.io)), c.log.lastHash() });
         try Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.status, .data = s });
     }
 
@@ -773,7 +848,8 @@ pub const Core = struct {
     fn popQueue(c: *Core) ?[]u8 {
         c.queue_mutex.lockUncancelable(c.io);
         defer c.queue_mutex.unlock(c.io);
-        if (c.queue.items.len == 0) return null;
+        // while the MCP servers restart, messages wait
+        if (c.queue.items.len == 0 or c.restarting.load(.acquire)) return null;
         c.busy.store(true, .release);
         return c.queue.orderedRemove(0);
     }
@@ -782,7 +858,7 @@ pub const Core = struct {
     fn claimIdle(c: *Core) bool {
         c.queue_mutex.lockUncancelable(c.io);
         defer c.queue_mutex.unlock(c.io);
-        if (c.queue.items.len > 0 or c.busy.load(.acquire)) return false;
+        if (c.queue.items.len > 0 or c.busy.load(.acquire) or c.restarting.load(.acquire)) return false;
         c.busy.store(true, .release);
         return true;
     }
@@ -880,6 +956,7 @@ pub const Core = struct {
             .logins = c.login_list,
             .store = c.store,
             .profiles_dir = c.paths.profiles,
+            .masks = &c.masks,
         };
     }
 
@@ -897,57 +974,170 @@ pub const Core = struct {
 
     // ---- MCP servers ----
 
-    /// Starts the servers in mcp.ini; one that fails is noted and skipped.
+    /// One server being started, on a thread of its own.
+    const McpStart = struct {
+        core: *Core,
+        cfg: mcp.ServerConfig,
+        values: []const []const u8 = &.{},
+        dir: []const u8 = "",
+        timeout_ms: u32 = 0,
+        stop: *std.atomic.Value(bool),
+        /// Why it was not even tried.
+        skipped: ?[]const u8 = null,
+        srv: ?*mcp.Server = null,
+        err: anyerror = error.NotStarted,
+        diag: mcp.Diag = .{},
+
+        fn run(st: *McpStart) void {
+            const c = st.core;
+            st.srv = mcp.Server.start(c.gpa, c.io, st.cfg, .{
+                .cwd = st.dir,
+                .path_var = c.path_var,
+                .home = c.home_var,
+                .system_vars = c.system_vars,
+                .secret_values = st.values,
+                .start_timeout_ms = st.timeout_ms,
+                .diag = &st.diag,
+                .stop = st.stop,
+            }) catch |e| {
+                st.err = e;
+                return;
+            };
+        }
+    };
+
+    /// Starts the servers in mcp.ini, all at once under one deadline
+    /// (`mcp_start_ms`); one that fails is noted and skipped. /stop and a
+    /// signal cut the starts short.
     fn startMcp(c: *Core) void {
+        c.mcp_starting.store(true, .release);
+        defer c.mcp_starting.store(false, .release);
         c.mcp_arena = .init(c.gpa);
-        c.mcp_servers = .empty;
         c.mcp_tools = &.{};
         c.mcp_note = "";
         const a = c.mcp_arena.allocator();
         const text = Io.Dir.cwd().readFileAlloc(c.io, c.paths.mcp, a, .limited(1 << 20)) catch return;
         const cfgs = mcp.parseConfig(a, text) catch {
-            c.mcp_note = "mcp.ini has an error; no servers started.";
+            const why = (parseProblem(a, "mcp.ini", text, mcp.parseConfig) catch null) orelse "mcp.ini has an error";
+            c.mcp_note = std.fmt.allocPrint(a, "{s}; no servers started.", .{why}) catch "mcp.ini has an error; no servers started.";
             return;
         };
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag);
+        defer c.unregister(&flag);
+        const starts = a.alloc(McpStart, cfgs.len) catch return;
+        const threads = a.alloc(?std.Thread, cfgs.len) catch return;
+        const deadline = Io.Clock.awake.now(c.io).nanoseconds + @as(i96, c.mcp_start_ms) * std.time.ns_per_ms;
+        for (cfgs, starts, threads) |sc, *st, *th| {
+            st.* = .{ .core = c, .cfg = sc, .stop = &flag };
+            th.* = null;
+            const values = a.alloc([]const u8, sc.secrets.len) catch {
+                st.skipped = "out of memory";
+                continue;
+            };
+            for (sc.secrets, values) |es, *v| v.* = c.secretValue(a, es.secret) orelse {
+                st.skipped = std.fmt.allocPrint(a, "secret \"{s}\" is not stored (harness secret add {s})", .{ es.secret, es.secret }) catch "a secret is not stored";
+                break;
+            };
+            if (st.skipped != null) continue;
+            st.values = values;
+            st.dir = c.mcpDir(a, sc.name) catch |e| {
+                st.skipped = std.fmt.allocPrint(a, "did not start (its folder: {s})", .{@errorName(e)}) catch "did not start";
+                continue;
+            };
+            const left_ms = @divFloor(deadline - Io.Clock.awake.now(c.io).nanoseconds, std.time.ns_per_ms);
+            st.timeout_ms = @intCast(std.math.clamp(left_ms, 1, std.math.maxInt(u32)));
+            th.* = std.Thread.spawn(.{}, McpStart.run, .{st}) catch blk: {
+                st.run();
+                break :blk null;
+            };
+        }
+        for (threads) |th| if (th) |x| x.join();
+
+        // said and kept in mcp.ini's order
         var note: std.ArrayList(u8) = .empty;
         var all: std.ArrayList(agent.McpTool) = .empty;
-        next: for (cfgs) |sc| {
-            const values = a.alloc([]const u8, sc.secrets.len) catch return;
-            for (sc.secrets, 0..) |es, i| {
-                values[i] = c.secrets.get(es.secret) orelse {
-                    note.print(a, "{s}: secret \"{s}\" is not stored (harness secret add {s})\n", .{ sc.name, es.secret, es.secret }) catch {};
-                    continue :next;
+        for (starts) |*st| {
+            const name = st.cfg.name;
+            if (st.skipped) |why| {
+                note.print(a, "{s}: {s}\n", .{ name, why }) catch {};
+                continue;
+            }
+            const srv = st.srv orelse {
+                // a server may print its key when it fails: mask before keeping
+                var sc_mask = scrub.Scrubber.init(a, c.masks.snapshot(a) catch c.secret_list) catch continue;
+                const detail = sc_mask.scrubAlloc(a, st.diag.text()) catch "";
+                note.print(a, "{s}: did not start ({s}) {s}\n", .{ name, @errorName(st.err), util.cut(detail, 200) }) catch {};
+                c.log.write(.config, false, .{ .event = "mcp failed", .server = name, .why = @errorName(st.err), .detail = detail }) catch {};
+                continue;
+            };
+            {
+                c.mcp_mutex.lockUncancelable(c.io);
+                defer c.mcp_mutex.unlock(c.io);
+                c.mcp_servers.append(c.gpa, srv) catch {
+                    srv.deinit();
+                    continue;
                 };
             }
-            var diag: mcp.Diag = .{};
-            const srv = mcp.Server.start(c.gpa, c.io, sc, .{ .workspace = c.workspace, .path_var = c.path_var, .home = c.home_var, .system_vars = c.system_vars, .secret_values = values, .diag = &diag }) catch |e| {
-                // a server may print its key when it fails: mask before keeping
-                var sc_mask = scrub.Scrubber.init(a, c.secret_list) catch return;
-                const detail = sc_mask.scrubAlloc(a, diag.text()) catch "";
-                note.print(a, "{s}: did not start ({s}) {s}\n", .{ sc.name, @errorName(e), util.cut(detail, 200) }) catch {};
-                c.log.write(.config, false, .{ .event = "mcp failed", .server = sc.name, .why = @errorName(e), .detail = detail }) catch {};
-                continue;
-            };
-            c.mcp_servers.append(c.gpa, srv) catch {
-                srv.deinit();
-                continue;
-            };
-            const tl = agent.mcpTools(a, srv, sc.money, sc.amount) catch &.{};
+            const tl = agent.mcpTools(a, srv, st.cfg.money, st.cfg.amount) catch &.{};
             all.appendSlice(a, tl) catch {};
-            note.print(a, "{s} ({d} tools)\n", .{ sc.name, tl.len }) catch {};
-            c.log.write(.config, false, .{ .event = "mcp started", .server = sc.name, .tools = tl.len }) catch {};
+            note.print(a, "{s} ({d} tools)\n", .{ name, tl.len }) catch {};
+            c.log.write(.config, false, .{ .event = "mcp started", .server = name, .tools = tl.len }) catch {};
         }
         c.mcp_tools = all.items;
         c.mcp_note = note.items;
     }
 
+    /// A stored secret for an MCP server: one read at start, else from the
+    /// store now (a secret added since, picked up by /reload), which is
+    /// then masked like the others. Null when none is stored.
+    fn secretValue(c: *Core, a: std.mem.Allocator, name: []const u8) ?[]const u8 {
+        if (c.secrets.get(name)) |v| return v;
+        const st = c.store orelse return null;
+        const v = (st.get(c.io, a, name) catch null) orelse return null;
+        // never handed to a server unless it is masked from now on
+        c.masks.add(name, v) catch return null;
+        return v;
+    }
+
+    /// A folder of the server's own, state/mcp/NAME (0700): never the
+    /// workspace, where what the agent writes would become the server's
+    /// code or settings.
+    fn mcpDir(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        const base = try std.fs.path.join(a, &.{ c.paths.state, "mcp" });
+        const dir = try std.fs.path.join(a, &.{ base, name });
+        try Io.Dir.cwd().createDirPath(c.io, dir);
+        if (builtin.os.tag != .windows) for ([_][]const u8{ base, dir }) |d| {
+            // iterate: on Linux a plain open is O_PATH, and fchmod on it fails with EBADF
+            var h = try Io.Dir.cwd().openDir(c.io, d, .{ .iterate = true });
+            defer h.close(c.io);
+            try h.setPermissions(c.io, .fromMode(0o700));
+        };
+        return dir;
+    }
+
     fn stopMcp(c: *Core) void {
-        for (c.mcp_servers.items) |srv| srv.deinit();
-        c.mcp_servers.deinit(c.gpa);
-        c.mcp_servers = .empty;
+        const list = blk: {
+            c.mcp_mutex.lockUncancelable(c.io);
+            defer c.mcp_mutex.unlock(c.io);
+            const l = c.mcp_servers;
+            c.mcp_servers = .empty;
+            break :blk l;
+        };
+        var servers = list;
+        for (servers.items) |srv| srv.deinit();
+        servers.deinit(c.gpa);
         c.mcp_tools = &.{};
         c.mcp_note = "";
         c.mcp_arena.deinit();
+    }
+
+    /// Kills the MCP servers' processes, each with its group, freeing
+    /// nothing (for endBySignal, while other threads may still hold them).
+    fn killMcp(c: *Core) void {
+        c.mcp_mutex.lockUncancelable(c.io);
+        defer c.mcp_mutex.unlock(c.io);
+        for (c.mcp_servers.items) |srv| srv.kill();
     }
 
     fn chatTurn(c: *Core, text: []const u8) void {
@@ -1032,6 +1222,24 @@ pub const Core = struct {
         return "Stopped everything that was running.";
     }
 
+    /// SIGINT or SIGTERM (on Windows the console's Ctrl-C, Ctrl-Break or
+    /// close): what /stop does, then what close does that matters outside
+    /// this process — the log, the status, the MCP servers' processes and
+    /// the lock. Nothing is freed: the caller ends the process right after.
+    pub fn endBySignal(c: *Core, what: []const u8) void {
+        c.quitting.store(true, .release);
+        c.stop.store(true, .release);
+        c.log.write(.config, false, .{ .event = "signal", .signal = what }) catch {};
+        _ = c.stopAll();
+        // servers being started end their starts at the stop; then all go
+        var waited: u32 = 0;
+        while (c.mcp_starting.load(.acquire) and waited < 3000) : (waited += 20) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        c.killMcp();
+        c.log.write(.config, false, .{ .event = "stop" }) catch {};
+        c.writeStatus() catch {};
+        c.releaseFolder();
+    }
+
     // ---- scheduler ----
 
     fn localDay(c: *const Core, now_s: i64) i64 {
@@ -1110,7 +1318,8 @@ pub const Core = struct {
     fn startBackground(c: *Core, job: Job, key: []const u8) void {
         c.state_mutex.lockUncancelable(c.io);
         defer c.state_mutex.unlock(c.io);
-        if (c.running.contains(key)) return;
+        // the next tick starts it once the MCP servers are back
+        if (c.running.contains(key) or c.restarting.load(.acquire)) return;
         // the chat keeps one of the slots
         const slots = @max(1, c.cfg.limits.concurrent_runs) - 1;
         if (c.bg_active.load(.acquire) >= @max(1, slots)) return;
@@ -1503,6 +1712,80 @@ fn insertInSection(a: std.mem.Allocator, text: []const u8, name: []const u8, lin
     return out.items;
 }
 
+/// The settings files other users must not be able to change: they decide
+/// what runs (rules, MCP servers' commands) and where values are typed.
+pub fn guardedFiles(p: Paths) [4][]const u8 {
+    return .{ p.config, p.rules, p.logins, p.mcp };
+}
+
+/// What is wrong with the settings files, said so the owner can fix it:
+/// the file other users can change, or the file and line that does not
+/// read. Null when nothing is.
+pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
+    if (builtin.os.tag != .windows) {
+        for (guardedFiles(p)) |path| {
+            const st = Io.Dir.cwd().statFile(io, path, .{}) catch continue;
+            if (st.permissions.toMode() & 0o022 != 0)
+                return try std.fmt.allocPrint(a, "{s} can be changed by other users; run chmod 600 {s} (config.ini, rules, logins.ini and mcp.ini must be writable only by you)", .{ path, path });
+        }
+    }
+    inline for (.{
+        .{ p.config, config.parse },
+        .{ p.rules, rules.parse },
+        .{ p.briefs, config.parseBriefs },
+        .{ p.tasks, config.parseTasks },
+        .{ p.logins, logins.parse },
+    }) |item| {
+        const text = Io.Dir.cwd().readFileAlloc(io, item[0], a, .limited(1 << 20)) catch |e| switch (e) {
+            error.FileNotFound => "",
+            else => return try std.fmt.allocPrint(a, "{s} can't be read: {s}", .{ item[0], @errorName(e) }),
+        };
+        if (try parseProblem(a, std.fs.path.basename(item[0]), text, item[1])) |why| return why;
+    }
+    return null;
+}
+
+/// "rules line 3 has an error: alow shell ls"; null when `text` reads.
+pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, comptime parseFn: anytype) !?[]const u8 {
+    var scratch: std.heap.ArenaAllocator = .init(a);
+    defer scratch.deinit();
+    if (parseFn(scratch.allocator(), text)) |_| return null else |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {},
+    }
+    const n = badLine(&scratch, text, parseFn);
+    if (n == 0) return try std.fmt.allocPrint(a, "{s} has an error", .{name});
+    var it = std.mem.splitScalar(u8, text, '\n');
+    var line: []const u8 = "";
+    for (0..n) |_| line = it.next() orelse "";
+    return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80) });
+}
+
+/// The first line of `text` that does not read: the one after the longest
+/// start of the text that still parses (an unfinished section counts from
+/// its header). 0 for files too long to search this way.
+fn badLine(scratch: *std.heap.ArenaAllocator, text: []const u8, comptime parseFn: anytype) usize {
+    // ends[j]: where the first j lines end
+    var ends: [2001]usize = undefined;
+    ends[0] = 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const end = if (std.mem.indexOfScalarPos(u8, text, i, '\n')) |nl| nl + 1 else text.len;
+        n += 1;
+        if (n >= ends.len) return 0;
+        ends[n] = end;
+        i = end;
+    }
+    var j = n;
+    while (j > 0) {
+        j -= 1;
+        _ = scratch.reset(.retain_capacity);
+        if (parseFn(scratch.allocator(), text[0..ends[j]])) |_| return j + 1 else |_| {}
+    }
+    return 1;
+}
+
 pub const LoginState = struct { password: bool = false, totp: bool = false, passkeys: usize = 0, passkeys_stored: bool = false };
 
 /// What the key store holds for a login.
@@ -1587,35 +1870,71 @@ pub fn pidNumber() i64 {
     };
 }
 
-fn pidAlive(pid: i64) bool {
-    if (builtin.os.tag == .windows) return true;
-    if (pid <= 0) return false;
-    std.posix.kill(@intCast(pid), @enumFromInt(0)) catch |e| return e == error.PermissionDenied;
-    return true;
-}
-
-/// Refuses when another live process holds the folder.
-pub fn takeLock(io: Io, p: Paths, gpa: std.mem.Allocator) !void {
+/// Takes the data folder for this process: an exclusive lock on
+/// state/lock, held as long as the file is open and dropped by the system
+/// when the process ends, however it ends. error.AlreadyRunning while
+/// another process holds it, or another core of this one.
+pub fn takeLock(io: Io, p: Paths) !Io.File {
     try Io.Dir.cwd().createDirPath(io, p.state);
-    var buf: [32]u8 = undefined;
-    if (Io.Dir.cwd().readFile(io, p.lock, &buf)) |got| {
-        const pid = std.fmt.parseInt(i64, std.mem.trim(u8, got, " \n"), 10) catch 0;
-        const recent = blk: {
-            if (builtin.os.tag != .windows) break :blk true;
-            // Windows: trust a lock whose status was refreshed in the last 90 s
-            const st = Io.Dir.cwd().statFile(io, p.status, .{}) catch break :blk false;
-            const age_ns = Io.Clock.real.now(io).nanoseconds - st.mtime.nanoseconds;
-            break :blk age_ns < 90 * std.time.ns_per_s;
+    var tries: u32 = 0;
+    while (true) : (tries += 1) {
+        const f = Io.Dir.cwd().createFile(io, p.lock, .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .permissions = util.private_file,
+        }) catch |e| switch (e) {
+            // `health` looks at it for a moment; a running instance keeps it
+            error.WouldBlock => {
+                if (tries >= 10) return error.AlreadyRunning;
+                io.sleep(.fromMilliseconds(30), .awake) catch {};
+                continue;
+            },
+            else => return e,
         };
-        if (pid != pidNumber() and pidAlive(pid) and recent) return error.AlreadyRunning;
-    } else |_| {}
-    _ = gpa;
-    var out: [32]u8 = undefined;
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = p.lock, .data = try std.fmt.bufPrint(&out, "{d}\n", .{pidNumber()}) });
+        // the pid, for people (on Windows others can't read the locked first byte)
+        var b: [32]u8 = undefined;
+        f.setLength(io, 0) catch {};
+        f.writePositionalAll(io, std.fmt.bufPrint(&b, "{d}\n", .{pidNumber()}) catch "", 0) catch {};
+        return f;
+    }
 }
 
-pub fn releaseLock(io: Io, p: Paths) void {
-    Io.Dir.cwd().deleteFile(io, p.lock) catch {};
+/// Whether some process holds the data folder (`takeLock`).
+pub fn lockHeld(io: Io, p: Paths) bool {
+    const f = Io.Dir.cwd().openFile(io, p.lock, .{}) catch return false;
+    defer f.close(io);
+    const got = f.tryLock(io, .shared) catch return false;
+    if (got) f.unlock(io);
+    return !got;
+}
+
+pub const Health = struct { ok: bool, text: []const u8 };
+
+/// What `harness health` says: ok only while `harness run` holds the
+/// folder (its lock, not just a lock file left behind) and has ticked in
+/// the last 90 s.
+pub fn health(io: Io, p: Paths, now_s: i64, buf: []u8) Health {
+    if (!lockHeld(io, p)) return .{ .ok = false, .text = "not running" };
+    var sbuf: [256]u8 = undefined;
+    const got = Io.Dir.cwd().readFile(io, p.status, &sbuf) catch return .{ .ok = false, .text = "the folder is held, but its status file can't be read" };
+    const role = statusField(got, "role") orelse "";
+    if (!std.mem.eql(u8, role, "run"))
+        return .{ .ok = false, .text = std.fmt.bufPrint(buf, "not running: harness {s} holds the folder, not harness run", .{if (role.len > 0) role else "(an older one)"}) catch "not running" };
+    const tick = util.parseIso(statusField(got, "tick") orelse "") orelse return .{ .ok = false, .text = "no tick in the status file" };
+    const age = now_s - tick;
+    if (age > 90) return .{ .ok = false, .text = std.fmt.bufPrint(buf, "stale: last tick {d} s ago", .{age}) catch "stale" };
+    return .{ .ok = true, .text = std.fmt.bufPrint(buf, "running: last tick {d} s ago", .{age}) catch "running" };
+}
+
+/// The value of a `key value` line of the status file.
+fn statusField(text: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (line.len > key.len and std.mem.startsWith(u8, line, key) and line[key.len] == ' ') return std.mem.trim(u8, line[key.len + 1 ..], " \r");
+    }
+    return null;
 }
 
 /// Writes a pairing code valid for 10 minutes; returns it.
@@ -1739,20 +2058,53 @@ const Fix = struct {
     }
 };
 
-test "second_process_refused_by_lock" {
+test "a_folder_is_held_by_one_core_at_a_time" {
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
-    var arena: std.heap.ArenaAllocator = .init(t.allocator);
-    defer arena.deinit();
-    const p = try Paths.init(arena.allocator(), f.home);
-    // a lock held by another live process (pid 1 always exists on POSIX)
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.lock, .data = "1\n" });
-    try t.expectError(error.AlreadyRunning, Core.open(t.allocator, t.io, f.home, .{}));
-    // a stale lock (no such process) is taken over
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.lock, .data = "999999\n" });
-    try takeLock(t.io, p, t.allocator);
+    // the open core holds the folder: a second open is refused, even in
+    // the same process (the old pid check let that through)
+    if (Core.open(t.allocator, t.io, f.home, .{})) |second| {
+        second.close();
+        return error.TestUnexpectedResult;
+    } else |e| try t.expectEqual(error.AlreadyRunning, e);
+    // closed, it lets go; a lock file left behind (a killed process's pid,
+    // here a live one's) holds nothing by itself
+    const home = f.home;
+    f.core.close();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(f.e.arena.allocator(), &.{ home, "state", "lock" }), .data = "1\n" });
+    f.core = try Core.open(t.allocator, t.io, home, .{});
+}
+
+const Opener = struct {
+    home: []const u8,
+    core: ?*Core = null,
+    fn run(o: *Opener) void {
+        o.core = Core.open(t.allocator, t.io, o.home, .{}) catch null;
+    }
+};
+
+test "simultaneous_starts_let_one_through" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const home = f.home;
+    f.core.close();
+    // they all check at once: one must win, the rest are refused
+    var openers: [8]Opener = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (&openers, &threads) |*o, *th| {
+        o.* = .{ .home = home };
+        th.* = try std.Thread.spawn(.{}, Opener.run, .{o});
+    }
+    for (threads) |th| th.join();
+    var winners: usize = 0;
+    for (&openers) |*o| if (o.core) |c| {
+        winners += 1;
+        if (winners > 1) c.close() else f.core = c;
+    };
+    if (winners == 0) f.core = try Core.open(t.allocator, t.io, home, .{});
+    try t.expectEqual(1, winners);
 }
 
 test "stranger_messages_dropped_and_logged" {
@@ -2298,4 +2650,228 @@ test "logins_command_lists_what_is_stored_and_status_counts_them" {
         lf.close(t.io);
         try t.expect(std.mem.startsWith(u8, try f.core.reload(), "The settings files have an error"));
     }
+}
+
+test "mcp_ini_is_guarded_and_watched_like_config_ini" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    // a change to mcp.ini is noticed, like one to config.ini
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = "; no servers yet\n", .flags = .{ .permissions = util.private_file } });
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try f.rec.waitFor("not applied until you send /reload");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    if (builtin.os.tag == .windows) return;
+    // and one that other users can change is refused: it names the commands harness runs
+    var mf = try Io.Dir.cwd().openFile(t.io, f.core.paths.mcp, .{});
+    try mf.setPermissions(t.io, .fromMode(0o666));
+    mf.close(t.io);
+    try t.expect(!std.mem.startsWith(u8, try f.core.reload(), "Settings reloaded"));
+}
+
+test "settings_errors_name_the_file_and_line" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell ls\nalow shell rm -rf x\n" });
+    const r1 = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, r1, "rules line 2") != null);
+    try t.expect(std.mem.indexOf(u8, r1, "alow shell rm") != null);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "" });
+    // the same words for the command line, which opens nothing
+    const old_cfg = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.config, a, .unlimited);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.fmt.allocPrint(a, "{s}[limits]\nsteps_per_turn = many\n", .{old_cfg}) });
+    const n_lines = std.mem.count(u8, old_cfg, "\n");
+    const want = try std.fmt.allocPrint(a, "config.ini line {d}", .{n_lines + 2});
+    try t.expect(std.mem.indexOf(u8, try f.core.reload(), want) != null);
+    const said = (try settingsProblem(t.io, a, f.core.paths)).?;
+    try t.expect(std.mem.indexOf(u8, said, want) != null);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = old_cfg });
+    try t.expectEqual(null, try settingsProblem(t.io, a, f.core.paths));
+    if (builtin.os.tag == .windows) return;
+    // a file others can change: which one, and every file that must not be
+    var cf = try Io.Dir.cwd().openFile(t.io, f.core.paths.config, .{});
+    try cf.setPermissions(t.io, .fromMode(0o666));
+    cf.close(t.io);
+    const perm = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, perm, f.core.paths.config) != null);
+    try t.expect(std.mem.indexOf(u8, perm, "chmod 600") != null);
+    try t.expect(std.mem.indexOf(u8, perm, "config.ini, rules, logins.ini and mcp.ini") != null);
+}
+
+test "health_counts_only_harness_run_while_it_holds_the_folder" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    var buf: [256]u8 = undefined;
+    const now_s = util.nowSeconds(t.io);
+    // `harness chat` holds the folder and ticks: it is not the service
+    f.core.role = "chat";
+    try f.core.writeStatus();
+    const chat = health(t.io, f.core.paths, now_s, &buf);
+    try t.expect(!chat.ok);
+    try t.expect(std.mem.indexOf(u8, chat.text, "chat") != null);
+    f.core.role = "run";
+    try f.core.writeStatus();
+    try t.expect(health(t.io, f.core.paths, now_s, &buf).ok);
+    // ticks that stopped
+    try t.expect(!health(t.io, f.core.paths, now_s + 91, &buf).ok);
+    // a run that was killed left a recent status and the lock file: nobody holds it
+    const home = f.home;
+    f.core.close();
+    const p = try Paths.init(f.e.arena.allocator(), home);
+    const zeros: [64]u8 = @splat('0');
+    var tb: [20]u8 = undefined;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.status, .data = try std.fmt.allocPrint(f.e.arena.allocator(), "pid 1\nrole run\ntick {s}\nlog {s}\n", .{ util.isoTime(&tb, now_s), &zeros }) });
+    try t.expect(!health(t.io, p, now_s, &buf).ok);
+    f.core = try Core.open(t.allocator, t.io, home, .{});
+}
+
+test "a_signal_stops_what_runs_logs_it_and_lets_go_of_the_folder" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell sleep *\n" });
+    _ = try f.core.reload();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"sleep 30\"}"));
+    try f.e.script(2, model.textReply("never"));
+    try f.core.startWorker();
+    try f.core.handleText("sleep a while");
+    var waited: u32 = 0;
+    while (!f.core.busy.load(.acquire) and waited < 3000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    // what main's watcher does on SIGTERM before it ends the process
+    f.core.endBySignal("SIGTERM");
+    // the command and its process group are gone: the turn ends at once
+    waited = 0;
+    while (f.core.busy.load(.acquire) and waited < 5000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    try t.expect(!f.core.busy.load(.acquire));
+    try t.expectEqual(1, f.e.server.modelRequests());
+    // said in the log, then the stop, and the folder is free for the next start
+    const lt = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, f.e.arena.allocator(), .unlimited);
+    const sig_at = std.mem.indexOf(u8, lt, "\"event\":\"signal\",\"signal\":\"SIGTERM\"") orelse return error.TestUnexpectedResult;
+    try t.expect(std.mem.indexOfPos(u8, lt, sig_at, "\"event\":\"stop\"") != null);
+    try t.expect(!lockHeld(t.io, f.core.paths));
+}
+
+test "mcp_servers_run_in_a_folder_of_their_own_not_the_workspace" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // the server says where it runs, then fails (its stderr goes to the log)
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = "[where]\ncommand = /bin/sh -c \"pwd >&2; exit 1\"\n" });
+    _ = try f.core.reload();
+    const lt = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, a, .unlimited);
+    const own = try std.fs.path.join(a, &.{ try Io.Dir.cwd().realPathFileAlloc(t.io, f.core.paths.state, a), "mcp", "where" });
+    if (std.mem.indexOf(u8, lt, own) == null) {
+        std.debug.print("wanted {s} in:\n{s}\n", .{ own, lt });
+        return error.TestUnexpectedResult;
+    }
+    // files the agent writes into the workspace are not the server's
+    try t.expect(std.mem.indexOf(u8, lt, f.core.workspace) == null);
+    for ([_][]const u8{ own, std.fs.path.dirname(own).? }) |d| {
+        const st = try Io.Dir.cwd().statFile(t.io, d, .{});
+        try t.expectEqual(@as(u32, 0o700), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    }
+}
+
+fn reloadQuietly(c: *Core) void {
+    _ = c.reload() catch {};
+}
+
+test "mcp_servers_start_together_under_one_deadline" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    f.core.mcp_start_ms = 1500;
+    // two that take half a second to come up, one that never answers
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[one]\ncommand = /bin/sh -c \"sleep 0.5; exec '{s}' --mcp\"\n[two]\ncommand = /bin/sh -c \"sleep 0.5; exec '{s}' --mcp\"\n[mute]\ncommand = /bin/sh -c \"exec sleep 30\"\n", .{ fake, fake }) });
+    const t0 = Io.Clock.awake.now(t.io).nanoseconds;
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const took_ms = @divFloor(Io.Clock.awake.now(t.io).nanoseconds - t0, std.time.ns_per_ms);
+    // one after another: 0.5 + 0.5 + 1.5 s; together: the deadline
+    try t.expect(took_ms < 2300);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "one (3 tools)") != null);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "two (3 tools)") != null);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "mute: did not start (Timeout)") != null);
+    // in mcp.ini's order
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "one").? < std.mem.indexOf(u8, f.core.mcp_note, "two").?);
+}
+
+test "reload_holds_no_lock_while_servers_start_and_stop_cuts_it_short" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[slow]\ncommand = /bin/sh -c \"sleep 3; exec '{s}' --mcp\"\n", .{fake}) });
+    const t0 = Io.Clock.awake.now(t.io).nanoseconds;
+    const th = try std.Thread.spawn(.{}, reloadQuietly, .{f.core});
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    // /stop and the scheduler's tick do not wait for the start
+    _ = f.core.stopAll();
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - t0 < 1500 * std.time.ns_per_ms);
+    th.join();
+    // and the stop ended the start instead of waiting it out
+    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - t0 < 2800 * std.time.ns_per_ms);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "slow: did not start (Stopped)") != null);
+}
+
+test "a_value_added_while_a_turn_runs_is_masked_in_every_tool_from_then_on" {
+    // the command makes the value without spelling it out ($((...)) is POSIX sh)
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
+    _ = try f.core.reload();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo made-at-signup-Pass-$((9000+271))\"}"));
+    try f.e.script(2, model.textReply("ok"));
+    var flag: std.atomic.Value(bool) = .init(false);
+    var run = f.core.baseRun(&f.core.chat_client, "chat", false, &flag);
+    // made after the run began, as web makes a password at a sign-up
+    try f.core.masks.add("login-new-password", "made-at-signup-Pass-9271");
+    var conv: agent.Conversation = .init(t.allocator);
+    defer conv.deinit();
+    const res = try agent.turn(&run, &conv, "echo it", false);
+    defer agent.freeResult(&run, res);
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "made-at-signup-Pass-9271") == null);
+    try t.expect(std.mem.indexOf(u8, req2, "[secret:login-new-password]") != null);
+}
+
+test "reload_takes_a_secret_stored_since_start_and_masks_it" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    f.core.store = st;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp fresh/echo *\n" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fresh]\ncommand = \"{s}\" --mcp\nsecret = FAKE_SECRET:fresh-key\n", .{fake}) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "secret \"fresh-key\" is not stored") != null);
+    // `harness secret add fresh-key` while harness runs, then /reload
+    try st.put(t.io, "fresh-key", "fresh-mcp-value-4711");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "fresh (3 tools)") != null);
+    // the server got it; what it says back is masked like any stored secret
+    try f.e.script(1, "{\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_m\",\"name\":\"fresh__echo\",\"input\":{\"text\":\"env\"}}],\"stop_reason\":\"tool_use\"}");
+    try f.e.script(2, model.textReply("ok"));
+    f.core.chatTurn("use it");
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "secret=[secret:fresh-key]") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "fresh-mcp-value-4711") == null);
 }

@@ -170,7 +170,11 @@ pub const Diag = struct {
 };
 
 pub const StartOptions = struct {
-    workspace: []const u8,
+    /// The folder the server runs in: one of its own, never the agent's
+    /// workspace, where a file the agent wrote (an .npmrc, a module named
+    /// like one the server loads, a .git/config) would become its code or
+    /// settings.
+    cwd: []const u8,
     path_var: []const u8,
     home: []const u8,
     /// On Windows, the system's own variables (`util.system_var_names`).
@@ -180,6 +184,8 @@ pub const StartOptions = struct {
     start_timeout_ms: u32 = 20000,
     /// When start fails, the end of the server's stderr goes here.
     diag: ?*Diag = null,
+    /// Set: the start ends at once (error.Stopped).
+    stop: ?*std.atomic.Value(bool) = null,
 };
 
 extern "kernel32" fn TerminateProcess(h: std.os.windows.HANDLE, code: u32) callconv(.winapi) std.os.windows.BOOL;
@@ -218,7 +224,7 @@ pub const Server = struct {
     th_out: ?std.Thread = null,
     th_err: ?std.Thread = null,
 
-    /// Starts `cfg.command` in its own process group in the workspace, with
+    /// Starts `cfg.command` in its own process group in `opts.cwd`, with
     /// only PATH, HOME, LANG, TERM and the named secrets in its
     /// environment; then initialize, notifications/initialized and
     /// tools/list.
@@ -238,7 +244,7 @@ pub const Server = struct {
 
         var child = try std.process.spawn(io, .{
             .argv = argv,
-            .cwd = .{ .path = opts.workspace },
+            .cwd = .{ .path = opts.cwd },
             .environ_map = &vars,
             .stdin = .pipe,
             .stdout = .pipe,
@@ -279,8 +285,9 @@ pub const Server = struct {
         s.name = try a.dupe(u8, cfg.name);
 
         var never: std.atomic.Value(bool) = .init(false);
+        const stop = opts.stop orelse &never;
         const deadline = nowNs(io) + @as(i128, opts.start_timeout_ms) * std.time.ns_per_ms;
-        const init_raw = try s.request(tmp, "initialize", "{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"harness\",\"version\":\"" ++ @import("build_options").version ++ "\"}}", &never, deadline);
+        const init_raw = try s.request(tmp, "initialize", "{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"harness\",\"version\":\"" ++ @import("build_options").version ++ "\"}}", stop, deadline);
         const init_v = jv.parse(tmp, init_raw) orelse return error.BadResponse;
         if (jv.get(init_v, "result") == null) return error.InitFailed;
         try s.send(tmp, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
@@ -296,7 +303,7 @@ pub const Server = struct {
                 try util.jsonString(&params, tmp, c);
             }
             try params.appendSlice(tmp, "}");
-            const raw = try s.request(tmp, "tools/list", params.items, &never, deadline);
+            const raw = try s.request(tmp, "tools/list", params.items, stop, deadline);
             const v = jv.parse(tmp, raw) orelse return error.BadResponse;
             const result = jv.get(v, "result") orelse return error.ListFailed;
             for (jv.arr(jv.get(result, "tools")) orelse &.{}) |tv| {
@@ -384,6 +391,12 @@ pub const Server = struct {
         defer s.state_mutex.unlock(s.io);
         @memcpy(buf[0..s.err_len], s.err_tail[0..s.err_len]);
         return buf[0..s.err_len];
+    }
+
+    /// Kills the server's process and its group at once; frees nothing
+    /// (`deinit` still has to follow, unless the process is ending).
+    pub fn kill(s: *Server) void {
+        killTree(s.pid);
     }
 
     /// Closes stdin, gives the server a moment to exit, kills its process
@@ -701,7 +714,7 @@ const Fx = struct {
 
     fn startWith(f: *Fx, command: []const u8, secrets: []const EnvSecret, values: []const []const u8) !*Server {
         return Server.start(t.allocator, t.io, .{ .name = "fake", .command = command, .secrets = secrets, .money = &.{} }, .{
-            .workspace = f.ws,
+            .cwd = f.ws,
             .path_var = "/usr/bin:/bin",
             .home = "/home/tester",
             .secret_values = values,
@@ -777,7 +790,7 @@ test "system_vars_reach_the_server" {
     defer f.deinit();
     const cmd = try std.fmt.allocPrint(f.a(), "\"{s}\" --mcp", .{f.fake});
     const s = try Server.start(t.allocator, t.io, .{ .name = "fake", .command = cmd, .secrets = &.{}, .money = &.{} }, .{
-        .workspace = f.ws,
+        .cwd = f.ws,
         .path_var = "/usr/bin:/bin",
         .home = "/home/tester",
         .system_vars = &.{.{ .name = "USER", .value = "from-the-system" }},
@@ -863,7 +876,7 @@ test "a_missing_or_broken_command_fails_to_start_with_its_stderr" {
     var diag: Diag = .{};
     const t0 = nowMs();
     const r = Server.start(t.allocator, t.io, .{ .name = "x", .command = "/bin/sh -c \"echo broken >&2; exit 3\"", .secrets = &.{}, .money = &.{} }, .{
-        .workspace = f.ws,
+        .cwd = f.ws,
         .path_var = "/usr/bin:/bin",
         .home = "",
         .secret_values = &.{},

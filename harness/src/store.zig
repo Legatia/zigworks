@@ -1,17 +1,32 @@
 //! Where secret values are kept: the macOS Keychain, the Windows
 //! Credential Manager, or (elsewhere, and in tests) one file per secret in
-//! a directory only the user can read.
+//! a directory only the user can read. In the system's stores each data
+//! folder has a namespace of its own (`namespace`), so one instance never
+//! reads, replaces or removes another's secrets.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 
-pub const Error = error{ StoreFailed, OutOfMemory };
+pub const Error = error{
+    StoreFailed,
+    OutOfMemory,
+    /// Longer than the store keeps (`maxValue`).
+    ValueTooLong,
+    /// Not a name the store can use (too long, or not printable ASCII).
+    BadName,
+};
+
+/// The Credential Manager keeps at most this much of a value
+/// (CRED_MAX_CREDENTIAL_BLOB_SIZE).
+pub const wincred_max_value = 5 * 512;
 
 pub const Store = union(enum) {
     /// A directory; each secret is a file in it, readable by the user only.
     dir: []const u8,
-    keychain,
-    wincred,
+    /// The macOS Keychain; the namespace is the items' service.
+    keychain: []const u8,
+    /// The Windows Credential Manager; targets are "NAMESPACE:NAME".
+    wincred: []const u8,
 
     pub fn describe(s: Store) []const u8 {
         return switch (s) {
@@ -21,11 +36,22 @@ pub const Store = union(enum) {
         };
     }
 
+    /// The longest value it keeps, if it has a limit: 2560 bytes in the
+    /// Credential Manager, 64 KiB in the directory store (what `get` reads).
+    pub fn maxValue(s: Store) ?usize {
+        return switch (s) {
+            .dir => 64 * 1024,
+            .keychain => null,
+            .wincred => wincred_max_value,
+        };
+    }
+
     pub fn put(s: Store, io: Io, name: []const u8, value: []const u8) Error!void {
+        if (s.maxValue()) |m| if (value.len > m) return error.ValueTooLong;
         switch (s) {
             .dir => |d| dirPut(io, d, name, value) catch return error.StoreFailed,
-            .keychain => if (is_mac) try mac.put(name, value) else unreachable,
-            .wincred => if (is_windows) try win.put(name, value) else unreachable,
+            .keychain => |ns| if (is_mac) try mac.put(ns, name, value) else unreachable,
+            .wincred => |ns| if (is_windows) try win.put(ns, name, value) else unreachable,
         }
     }
 
@@ -33,8 +59,8 @@ pub const Store = union(enum) {
     pub fn get(s: Store, io: Io, gpa: std.mem.Allocator, name: []const u8) Error!?[]u8 {
         return switch (s) {
             .dir => |d| dirGet(io, gpa, d, name),
-            .keychain => if (is_mac) mac.get(gpa, name) else unreachable,
-            .wincred => if (is_windows) win.get(gpa, name) else unreachable,
+            .keychain => |ns| if (is_mac) mac.get(gpa, ns, name) else unreachable,
+            .wincred => |ns| if (is_windows) win.get(gpa, ns, name) else unreachable,
         };
     }
 
@@ -53,8 +79,8 @@ pub const Store = union(enum) {
                 };
                 return true;
             },
-            .keychain => if (is_mac) mac.remove(name) else unreachable,
-            .wincred => if (is_windows) win.remove(name) else unreachable,
+            .keychain => |ns| if (is_mac) mac.remove(ns, name) else unreachable,
+            .wincred => |ns| if (is_windows) win.remove(ns, name) else unreachable,
         };
     }
 };
@@ -62,12 +88,12 @@ pub const Store = union(enum) {
 const is_mac = builtin.os.tag == .macos;
 const is_windows = builtin.os.tag == .windows;
 
-/// The system's store, unless `override` names a directory.
-pub fn default(override: ?[]const u8, data_dir: ?[]const u8) Store {
-    if (override) |d| return .{ .dir = d };
-    if (is_mac) return .keychain;
-    if (is_windows) return .wincred;
-    return .{ .dir = data_dir orelse "keygate-secrets" };
+/// The system's store (macOS, Windows) under a data folder's namespace;
+/// null elsewhere.
+pub fn system(ns: []const u8) ?Store {
+    if (is_mac) return .{ .keychain = ns };
+    if (is_windows) return .{ .wincred = ns };
+    return null;
 }
 
 fn dirPut(io: Io, path: []const u8, name: []const u8, value: []const u8) !void {
@@ -105,7 +131,66 @@ fn dirGet(io: Io, gpa: std.mem.Allocator, path: []const u8, name: []const u8) Er
     };
 }
 
-const service = "harness";
+/// Where every harness before this one kept every folder's secrets.
+pub const legacy_namespace = "harness";
+
+/// The namespace a data folder's secrets are kept under in the system's
+/// store: "harness" for the built-in folder (`is_default`), where every
+/// harness before this one kept them all, so they keep working;
+/// "harness-" and 16 random hex digits for any other folder. Made once and
+/// kept in DATA/state/store-id: a folder moved or copied keeps its
+/// secrets, two folders made apart never share them. A damaged id is
+/// error.BadStoreId, never a guess.
+pub fn namespace(io: Io, a: std.mem.Allocator, home: []const u8, is_default: bool) ![]const u8 {
+    const state = try std.fs.path.join(a, &.{ home, "state" });
+    const path = try std.fs.path.join(a, &.{ state, "store-id" });
+    var tries: u32 = 0;
+    while (tries < 20) : (tries += 1) {
+        var buf: [64]u8 = undefined;
+        if (Io.Dir.cwd().readFile(io, path, &buf)) |got| {
+            const ns = std.mem.trim(u8, got, " \t\r\n");
+            if (validNamespace(ns)) return a.dupe(u8, ns);
+            if (ns.len > 0) return error.BadStoreId;
+            // empty: being written by another harness right now, or left by
+            // one that died before it wrote (so nothing was stored under it)
+            if (tries >= 5) Io.Dir.cwd().deleteFile(io, path) catch {};
+            io.sleep(.fromMilliseconds(20), .awake) catch {};
+            continue;
+        } else |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        }
+        var made: [legacy_namespace.len + 1 + 16]u8 = undefined;
+        const ns: []const u8 = if (is_default) legacy_namespace else blk: {
+            var raw: [8]u8 = undefined;
+            try io.randomSecure(&raw);
+            break :blk std.fmt.bufPrint(&made, "{s}-{s}", .{ legacy_namespace, &std.fmt.bytesToHex(raw, .lower) }) catch unreachable;
+        };
+        try Io.Dir.cwd().createDirPath(io, state);
+        var f = Io.Dir.cwd().createFile(io, path, .{
+            .exclusive = true,
+            .permissions = if (is_windows) .default_file else .fromMode(0o600),
+        }) catch |e| switch (e) {
+            // another harness made it first: use that one
+            error.PathAlreadyExists => continue,
+            else => return e,
+        };
+        defer f.close(io);
+        var line: [made.len + 1]u8 = undefined;
+        try f.writeStreamingAll(io, std.fmt.bufPrint(&line, "{s}\n", .{ns}) catch unreachable);
+        return a.dupe(u8, ns);
+    }
+    return error.BadStoreId;
+}
+
+/// "harness", or "harness-" and 16 lowercase hex digits.
+pub fn validNamespace(ns: []const u8) bool {
+    if (std.mem.eql(u8, ns, legacy_namespace)) return true;
+    const pre = legacy_namespace ++ "-";
+    if (ns.len != pre.len + 16 or !std.mem.startsWith(u8, ns, pre)) return false;
+    for (ns[pre.len..]) |c| if (!(std.ascii.isDigit(c) or (c >= 'a' and c <= 'f'))) return false;
+    return true;
+}
 
 const mac = struct {
     const OSStatus = i32;
@@ -117,26 +202,26 @@ const mac = struct {
     extern "Security" fn SecKeychainItemDelete(item: *anyopaque) OSStatus;
     extern "CoreFoundation" fn CFRelease(cf: *anyopaque) void;
 
-    fn find(name: []const u8, item: *?*anyopaque, len: ?*u32, data: ?*?[*]u8) OSStatus {
-        return SecKeychainFindGenericPassword(null, service.len, service, @intCast(name.len), name.ptr, len, data, item);
+    fn find(service: []const u8, name: []const u8, item: ?*?*anyopaque, len: ?*u32, data: ?*?[*]u8) OSStatus {
+        return SecKeychainFindGenericPassword(null, @intCast(service.len), service.ptr, @intCast(name.len), name.ptr, len, data, item);
     }
 
-    fn put(name: []const u8, value: []const u8) Error!void {
+    fn put(service: []const u8, name: []const u8, value: []const u8) Error!void {
         var item: ?*anyopaque = null;
-        const st = find(name, &item, null, null);
+        const st = find(service, name, &item, null, null);
         if (st == 0) {
             defer CFRelease(item.?);
             if (SecKeychainItemModifyAttributesAndData(item.?, null, @intCast(value.len), value.ptr) != 0) return error.StoreFailed;
             return;
         }
         if (st != errSecItemNotFound) return error.StoreFailed;
-        if (SecKeychainAddGenericPassword(null, service.len, service, @intCast(name.len), name.ptr, @intCast(value.len), value.ptr, null) != 0) return error.StoreFailed;
+        if (SecKeychainAddGenericPassword(null, @intCast(service.len), service.ptr, @intCast(name.len), name.ptr, @intCast(value.len), value.ptr, null) != 0) return error.StoreFailed;
     }
 
-    fn get(gpa: std.mem.Allocator, name: []const u8) Error!?[]u8 {
+    fn get(gpa: std.mem.Allocator, service: []const u8, name: []const u8) Error!?[]u8 {
         var len: u32 = 0;
         var data: ?[*]u8 = null;
-        const st = SecKeychainFindGenericPassword(null, service.len, service, @intCast(name.len), name.ptr, &len, &data, null);
+        const st = find(service, name, null, &len, &data);
         if (st == errSecItemNotFound) return null;
         if (st != 0) return error.StoreFailed;
         defer _ = SecKeychainItemFreeContent(null, data);
@@ -145,9 +230,9 @@ const mac = struct {
         return out;
     }
 
-    fn remove(name: []const u8) Error!bool {
+    fn remove(service: []const u8, name: []const u8) Error!bool {
         var item: ?*anyopaque = null;
-        const st = find(name, &item, null, null);
+        const st = find(service, name, &item, null, null);
         if (st == errSecItemNotFound) return false;
         if (st != 0) return error.StoreFailed;
         defer CFRelease(item.?);
@@ -183,25 +268,11 @@ const win = struct {
     extern "advapi32" fn CredFree(buf: *anyopaque) callconv(.winapi) void;
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
-    fn target(buf: *[128]u16, name: []const u8) [*:0]const u16 {
-        var i: usize = 0;
-        for (service ++ ":") |c| {
-            buf[i] = c;
-            i += 1;
-        }
-        for (name) |c| {
-            buf[i] = c;
-            i += 1;
-        }
-        buf[i] = 0;
-        return buf[0..i :0].ptr;
-    }
-
-    fn put(name: []const u8, value: []const u8) Error!void {
-        var tb: [128]u16 = undefined;
+    fn put(ns: []const u8, name: []const u8, value: []const u8) Error!void {
+        var tb: [256]u16 = undefined;
         const cred: CREDENTIALW = .{
             .Type = CRED_TYPE_GENERIC,
-            .TargetName = target(&tb, name),
+            .TargetName = (try targetName(&tb, ns, name)).ptr,
             .CredentialBlobSize = @intCast(value.len),
             .CredentialBlob = value.ptr,
             .Persist = CRED_PERSIST_LOCAL_MACHINE,
@@ -209,10 +280,10 @@ const win = struct {
         if (CredWriteW(&cred, 0) == .FALSE) return error.StoreFailed;
     }
 
-    fn get(gpa: std.mem.Allocator, name: []const u8) Error!?[]u8 {
-        var tb: [128]u16 = undefined;
+    fn get(gpa: std.mem.Allocator, ns: []const u8, name: []const u8) Error!?[]u8 {
+        var tb: [256]u16 = undefined;
         var cred: ?*CREDENTIALW = null;
-        if (CredReadW(target(&tb, name), CRED_TYPE_GENERIC, 0, &cred) == .FALSE) {
+        if (CredReadW((try targetName(&tb, ns, name)).ptr, CRED_TYPE_GENERIC, 0, &cred) == .FALSE) {
             if (GetLastError() == ERROR_NOT_FOUND) return null;
             return error.StoreFailed;
         }
@@ -223,9 +294,9 @@ const win = struct {
         return out;
     }
 
-    fn remove(name: []const u8) Error!bool {
-        var tb: [128]u16 = undefined;
-        if (CredDeleteW(target(&tb, name), CRED_TYPE_GENERIC, 0) == .FALSE) {
+    fn remove(ns: []const u8, name: []const u8) Error!bool {
+        var tb: [256]u16 = undefined;
+        if (CredDeleteW((try targetName(&tb, ns, name)).ptr, CRED_TYPE_GENERIC, 0) == .FALSE) {
             if (GetLastError() == ERROR_NOT_FOUND) return false;
             return error.StoreFailed;
         }
@@ -233,7 +304,40 @@ const win = struct {
     }
 };
 
+/// The Credential Manager's target for a secret, "NAMESPACE:NAME" (for
+/// the default folder "harness:NAME", as before), in `buf`; a name that
+/// doesn't fit, or isn't printable ASCII, is refused (mcp.ini's secret
+/// names come straight from the file).
+pub fn targetName(buf: []u16, ns: []const u8, name: []const u8) error{BadName}![:0]const u16 {
+    if (name.len == 0 or ns.len + 1 + name.len + 1 > buf.len) return error.BadName;
+    var i: usize = 0;
+    for ([_][]const u8{ ns, ":", name }) |part| for (part) |c| {
+        if (c < 0x21 or c > 0x7e) return error.BadName;
+        buf[i] = c;
+        i += 1;
+    };
+    buf[i] = 0;
+    return buf[0..i :0];
+}
+
 const t = std.testing;
+
+test "credential_manager_targets_are_bounded_and_values_capped" {
+    var buf: [128]u16 = undefined;
+    // the target an existing secret has (the Windows session may have stored some)
+    const want = std.unicode.utf8ToUtf16LeStringLiteral("harness:omnigate");
+    try t.expectEqualSlices(u16, want, try targetName(&buf, legacy_namespace, "omnigate"));
+    // an mcp.ini secret name longer than the buffer is refused, not written past it
+    const long: [200]u8 = @splat('x');
+    try t.expectError(error.BadName, targetName(&buf, legacy_namespace, &long));
+    try t.expectError(error.BadName, targetName(&buf, legacy_namespace, "caf\xc3\xa9"));
+    // it keeps at most 2560 bytes of a value: a longer one is refused up
+    // front, with a reason `secret add` can give
+    const wc: Store = .{ .wincred = legacy_namespace };
+    try t.expectEqual(2560, wc.maxValue().?);
+    const big: [2561]u8 = @splat('v');
+    try t.expectError(error.ValueTooLong, wc.put(t.io, "big", &big));
+}
 
 test "the directory store keeps, replaces and removes values" {
     const io = t.io;
@@ -264,4 +368,46 @@ test "the directory store keeps, replaces and removes values" {
     try t.expect(try s.remove(io, "gh"));
     try t.expect(!try s.remove(io, "gh"));
     try t.expectEqual(null, try s.get(io, t.allocator, "gh"));
+}
+
+test "each_data_folder_keeps_its_secrets_under_a_namespace_of_its_own" {
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const def = try std.fs.path.join(a, &.{ root, "default" });
+    const one = try std.fs.path.join(a, &.{ root, "one" });
+    const two = try std.fs.path.join(a, &.{ root, "two" });
+    // the default folder keeps the secrets every harness stored so far
+    try t.expectEqualStrings(legacy_namespace, try namespace(io, a, def, true));
+    try t.expectEqualStrings(legacy_namespace, try namespace(io, a, def, true));
+    // another folder gets one of its own, kept
+    const n1 = try namespace(io, a, one, false);
+    try t.expect(validNamespace(n1));
+    try t.expect(!std.mem.eql(u8, n1, legacy_namespace));
+    try t.expectEqualStrings(n1, try namespace(io, a, one, false));
+    const n2 = try namespace(io, a, two, false);
+    try t.expect(!std.mem.eql(u8, n1, n2));
+    // a folder copied (or moved) keeps its secrets: the namespace is in it
+    for ([_][2][]const u8{ .{ one, n1 }, .{ def, legacy_namespace } }, 0..) |pair, i| {
+        const copy = try std.fs.path.join(a, &.{ root, if (i == 0) "copy-one" else "copy-default" });
+        const id = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ pair[0], "state", "store-id" }), a, .limited(64));
+        try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ copy, "state" }));
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ copy, "state", "store-id" }), .data = id });
+        try t.expectEqualStrings(pair[1], try namespace(io, a, copy, false));
+    }
+    // a damaged id is refused, not guessed
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ two, "state", "store-id" }), .data = "harness-../../x\n" });
+    try t.expectError(error.BadStoreId, namespace(io, a, two, false));
+    // what the system stores are given: the Keychain's service is the
+    // namespace, the Credential Manager's target NAMESPACE:NAME
+    var buf: [256]u16 = undefined;
+    try t.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("harness:omnigate"), try targetName(&buf, legacy_namespace, "omnigate"));
+    const want = try std.unicode.utf8ToUtf16LeAlloc(a, try std.fmt.allocPrint(a, "{s}:omnigate", .{n1}));
+    try t.expectEqualSlices(u16, want, try targetName(&buf, n1, "omnigate"));
+    const ks: Store = .{ .keychain = n1 };
+    try t.expectEqualStrings(n1, ks.keychain);
 }

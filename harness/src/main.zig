@@ -40,8 +40,9 @@ const usage =
     \\  health                     exit 0 if `harness run` is running and recent
     \\  version | help
     \\
-    \\The data folder is --home, else HARNESS_HOME, else ~/.local/share/harness
-    \\(%LOCALAPPDATA%\harness on Windows). Secrets go to the macOS Keychain,
+    \\The data folder is --home (anywhere on the line), else HARNESS_HOME, else
+    \\~/.local/share/harness (%LOCALAPPDATA%\harness on Windows). Arguments a
+    \\command does not take are refused. Secrets go to the macOS Keychain,
     \\the Windows Credential Manager, or (Linux, or HARNESS_STORE=DIR) files
     \\readable only by you.
     \\
@@ -55,9 +56,16 @@ const App = struct {
     io: Io,
     env: *std.process.Environ.Map,
     home: []const u8 = "",
+    /// Where this folder's secrets are kept (`prepareStore`).
+    store_cache: ?store_mod.Store = null,
 
     fn defaultHome(app: *App) ![]const u8 {
         if (app.env.get("HARNESS_HOME")) |h| if (h.len > 0) return h;
+        return app.builtinHome();
+    }
+
+    /// The folder harness uses with no --home and no HARNESS_HOME.
+    fn builtinHome(app: *App) ![]const u8 {
         if (builtin.os.tag == .windows) {
             const base = app.env.get("LOCALAPPDATA") orelse return error.NoHomeDirectory;
             return std.fs.path.join(app.arena, &.{ base, "harness" });
@@ -67,10 +75,25 @@ const App = struct {
         return std.fs.path.join(app.arena, &.{ home, ".local", "share", "harness" });
     }
 
+    /// Works out where this folder's secrets are kept: HARNESS_STORE=DIR as
+    /// given; the Keychain or the Credential Manager under the folder's own
+    /// namespace (the built-in folder keeps the one every earlier harness
+    /// used); elsewhere DATA/secrets.
+    fn prepareStore(app: *App) !void {
+        if (app.env.get("HARNESS_STORE")) |d| if (d.len > 0) {
+            app.store_cache = .{ .dir = d };
+            return;
+        };
+        if (builtin.os.tag == .macos or builtin.os.tag == .windows) {
+            const is_default = if (app.builtinHome()) |d| samePath(app.io, app.arena, app.home, d) else |_| false;
+            app.store_cache = store_mod.system(try store_mod.namespace(app.io, app.arena, app.home, is_default)).?;
+            return;
+        }
+        app.store_cache = .{ .dir = try std.fs.path.join(app.arena, &.{ app.home, "secrets" }) };
+    }
+
     fn store(app: *App) store_mod.Store {
-        const override = if (app.env.get("HARNESS_STORE")) |s| (if (s.len > 0) s else null) else null;
-        if (override != null or builtin.os.tag == .macos or builtin.os.tag == .windows) return store_mod.default(override, null);
-        return store_mod.default(null, std.fs.path.join(app.arena, &.{ app.home, "secrets" }) catch "harness-secrets");
+        return app.store_cache.?;
     }
 
     fn settings(app: *App) !config.Config {
@@ -83,7 +106,8 @@ const App = struct {
             else => return e,
         };
         return config.parse(app.arena, text) catch {
-            complain("{s} has an error", .{p});
+            const why = (core_mod.parseProblem(app.arena, p, text, config.parse) catch null) orelse "it has an error";
+            complain("{s}", .{why});
             return error.Reported;
         };
     }
@@ -134,15 +158,40 @@ const App = struct {
         return out.items;
     }
 
+    /// What a command opens the instance for (in the status file; only
+    /// `run` counts for `harness health`).
+    const Role = enum {
+        run,
+        chat,
+        brief,
+        task,
+        memory,
+
+        /// Whether it needs the MCP servers and the browser: a brief is
+        /// one model call without tools, memory commands make none, and
+        /// starting servers for them costs up to 20 s and runs their code.
+        fn usesTools(r: Role) bool {
+            return switch (r) {
+                .run, .chat, .task => true,
+                .brief, .memory => false,
+            };
+        }
+    };
+
     /// Opens the instance, or explains why not.
-    fn open(app: *App) !*Core {
+    fn open(app: *App, role: Role) !*Core {
         const cfg = try app.settings();
         const sec = app.secrets(cfg);
         if (sec.omnigate == null) complain("note: no omnigate key stored under \"{s}\"; model calls will be refused. Run: harness secret add {s}", .{ cfg.model.key, cfg.model.key });
         const c = Core.open(app.gpa, app.io, app.home, sec) catch |e| {
             switch (e) {
                 error.AlreadyRunning => complain("harness is already running on {s}; talk to it there (or stop it first)", .{app.home}),
-                error.BadSettings => complain("a settings file in {s} has an error, or config.ini/rules can be changed by other users (chmod 600 them)", .{app.home}),
+                error.BadUrl => complain("the omnigate url in config.ini ([model] url) is {s}", .{if (cfg.model.url.len == 0) "not set yet" else "not valid"}),
+                error.BadSettings => {
+                    const paths = core_mod.Paths.init(app.arena, app.home) catch return error.Reported;
+                    const why = (core_mod.settingsProblem(app.io, app.arena, paths) catch null) orelse "a settings file has an error, or one of config.ini, rules, logins.ini and mcp.ini can be changed by other users (chmod 600 them)";
+                    complain("{s}", .{why});
+                },
                 else => complain("can't open {s}: {s}", .{ app.home, @errorName(e) }),
             }
             return error.Reported;
@@ -151,7 +200,13 @@ const App = struct {
         c.home_var = app.env.get(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME") orelse "";
         c.system_vars = util.pickVars(app.arena, app.env, util.system_var_names) catch &.{};
         c.store = app.store();
-        c.startExtras();
+        c.role = @tagName(role);
+        c.writeStatus() catch {};
+        // Ctrl-C and kill end it the way /stop and close do (from here on,
+        // so a slow start of the MCP servers can be ended too)
+        catchSignals();
+        c.watcher = std.Thread.spawn(.{}, watchSignals, .{c}) catch null;
+        if (role.usesTools()) c.startExtras();
         return c;
     }
 };
@@ -161,17 +216,18 @@ pub fn main(init: std.process.Init) u8 {
     const arena = init.arena.allocator();
     const raw = init.minimal.args.toSlice(arena) catch return @intFromEnum(Exit.failed);
     var app: App = .{ .gpa = gpa, .arena = arena, .io = init.io, .env = init.environ_map };
-    var args: []const []const u8 = raw[1..];
-    var home: ?[]const u8 = null;
-    if (args.len >= 2 and eql(args[0], "--home")) {
-        home = args[1];
-        args = args[2..];
-    }
-    app.home = home orelse app.defaultHome() catch {
+    const cli = parseCli(arena, raw[1..]) catch |e| switch (e) {
+        error.Usage => {
+            complain("--home takes one folder: harness --home DIR COMMAND (or after the command)", .{});
+            return @intFromEnum(Exit.usage);
+        },
+        error.OutOfMemory => return @intFromEnum(Exit.failed),
+    };
+    app.home = cli.home orelse app.defaultHome() catch {
         complain("no home folder found; pass --home DIR", .{});
         return @intFromEnum(Exit.failed);
     };
-    const code = dispatch(&app, args) catch |e| switch (e) {
+    const code = dispatch(&app, cli.args) catch |e| switch (e) {
         error.Reported => Exit.failed,
         else => blk: {
             complain("{s}", .{@errorName(e)});
@@ -182,12 +238,22 @@ pub fn main(init: std.process.Init) u8 {
 }
 
 fn dispatch(app: *App, args: []const []const u8) !Exit {
+    if (badArgs(args)) |line| {
+        complain("{s}", .{line});
+        return .usage;
+    }
     if (args.len == 0 or eql(args[0], "help") or eql(args[0], "--help") or eql(args[0], "-h")) {
         try outAll(app.io, usage);
         return if (args.len == 0) .usage else .ok;
     }
     const cmd = args[0];
     const rest = args[1..];
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory" }) |c| if (eql(cmd, c)) {
+        app.prepareStore() catch |e| {
+            complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
+            return .failed;
+        };
+    };
     if (eql(cmd, "version")) {
         try outAll(app.io, "harness " ++ build_options.version ++ "\n");
         return .ok;
@@ -212,7 +278,7 @@ fn initCmd(app: *App) !Exit {
     try outPrint(app.io,
         \\Data folder: {s}
         \\Next:
-        \\  1. Set the omnigate url and route names in config.ini.
+        \\  1. Set the omnigate url (there is none by default) and route names in config.ini.
         \\  2. harness secret add omnigate     (your omnigate key)
         \\  3. harness secret add telegram     (the bot token from @BotFather)
         \\  4. harness secret add search       (optional: Brave Search API key)
@@ -222,19 +288,22 @@ fn initCmd(app: *App) !Exit {
     return .ok;
 }
 
+/// a-z, 0-9, - and _, starting with a letter or digit (so an option like
+/// `--stdin` is never taken for a name).
 fn validName(n: []const u8) bool {
     if (n.len == 0 or n.len > 64) return false;
+    if (!(std.ascii.isLower(n[0]) or std.ascii.isDigit(n[0]))) return false;
     for (n) |ch| if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-' or ch == '_')) return false;
     return true;
 }
 
 fn secretCmd(app: *App, args: []const []const u8) !Exit {
-    if (args.len == 0) {
-        complain("usage: harness secret add|rm|list NAME", .{});
+    const sa = secretArgs(args) orelse {
+        complain(secret_usage, .{});
         return .usage;
-    }
+    };
     const s = app.store();
-    if (eql(args[0], "list")) {
+    if (sa.op == .list) {
         const cfg = try app.settings();
         for ([_][2][]const u8{ .{ "model key", cfg.model.key }, .{ "bot token", cfg.chat.token }, .{ "search key", cfg.search.key } }) |pair| {
             const v = s.get(app.io, app.arena, pair[1]) catch null;
@@ -250,12 +319,12 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         } else |_| {}
         return .ok;
     }
-    if (args.len < 2 or !validName(args[1])) {
-        complain("secret names use a-z, 0-9, - and _", .{});
+    if (!validName(sa.name)) {
+        complain("secret names use a-z, 0-9, - and _, start with a letter or digit, and have at most 64 characters", .{});
         return .usage;
     }
-    const name = args[1];
-    if (eql(args[0], "rm")) {
+    const name = sa.name;
+    if (sa.op == .rm) {
         const gone = s.remove(app.io, name) catch {
             complain("could not remove {s}", .{name});
             return .failed;
@@ -263,11 +332,7 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         try outPrint(app.io, "{s}\n", .{if (gone) "Removed." else "Nothing stored under that name."});
         return .ok;
     }
-    if (!eql(args[0], "add")) {
-        complain("usage: harness secret add|rm|list NAME", .{});
-        return .usage;
-    }
-    const from_stdin = args.len > 2 and eql(args[2], "--stdin");
+    const from_stdin = sa.stdin;
     const stdin = Io.File.stdin();
     const tty = stdin.isTty(app.io) catch false;
     if (!tty and !from_stdin) {
@@ -288,8 +353,9 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         try errAll(app.io, "\n");
     }
     defer std.crypto.secureZero(u8, value);
-    if (value.len < 8) {
-        complain("values shorter than 8 characters can't be masked reliably; nothing stored", .{});
+    var why_buf: [200]u8 = undefined;
+    if (valueProblem(&why_buf, s, value.len)) |why| {
+        complain("{s}", .{why});
         return .failed;
     }
     s.put(app.io, name, value) catch {
@@ -298,6 +364,15 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
     };
     try errPrint(app.io, "Stored {s} in {s}.\n", .{ name, s.describe() });
     return .ok;
+}
+
+/// Why a value of `len` bytes is not stored, or null: too short to mask,
+/// or longer than the store keeps (the Credential Manager: 2560 bytes).
+fn valueProblem(buf: []u8, s: store_mod.Store, len: usize) ?[]const u8 {
+    if (len < 8) return "values shorter than 8 characters can't be masked reliably; nothing stored";
+    if (s.maxValue()) |m| if (len > m)
+        return std.fmt.bufPrint(buf, "{s} keeps at most {d} bytes of a value and this one has {d}; nothing stored", .{ s.describe(), m, len }) catch "the value is longer than the store keeps; nothing stored";
+    return null;
 }
 
 // ---- logins ----
@@ -521,7 +596,7 @@ fn ticker(c: *Core) void {
 }
 
 fn runCmd(app: *App) !Exit {
-    const c = try app.open();
+    const c = try app.open(.run);
     defer c.close();
     if (!c.cfg.chat.telegram) {
         complain("Telegram is off in config.ini; use harness chat", .{});
@@ -622,7 +697,7 @@ fn keysLine(buf: []u8, bs: []const [2][]const u8) []const u8 {
 }
 
 fn chatCmd(app: *App) !Exit {
-    const c = try app.open();
+    const c = try app.open(.chat);
     defer c.close();
     var tc: TermChan = .{ .io = app.io };
     c.attach(tc.channel());
@@ -662,7 +737,7 @@ fn chatCmd(app: *App) !Exit {
 // ---- one-off runs ----
 
 fn briefCmd(app: *App, args: []const []const u8) !Exit {
-    const c = try app.open();
+    const c = try app.open(.brief);
     defer c.close();
     var tc: TermChan = .{ .io = app.io };
     c.attach(tc.channel());
@@ -685,7 +760,7 @@ fn taskCmd(app: *App, args: []const []const u8) !Exit {
         complain("usage: harness task run NAME", .{});
         return .usage;
     }
-    const c = try app.open();
+    const c = try app.open(.task);
     defer c.close();
     var tc: TermChan = .{ .io = app.io };
     c.attach(tc.channel());
@@ -708,7 +783,7 @@ fn memoryCmd(app: *App, args: []const []const u8) !Exit {
         complain("usage: harness memory [list|pin|unpin|forget ID]", .{});
         return .usage;
     };
-    const c = try app.open();
+    const c = try app.open(.memory);
     defer c.close();
     try outPrint(app.io, "{s}\n", .{try c.command(app.arena, text)});
     return .ok;
@@ -747,24 +822,86 @@ fn logCmd(app: *App, args: []const []const u8) !Exit {
 fn healthCmd(app: *App) !Exit {
     const p = try core_mod.Paths.init(app.arena, app.home);
     var buf: [256]u8 = undefined;
-    var lbuf: [32]u8 = undefined;
-    _ = Io.Dir.cwd().readFile(app.io, p.lock, &lbuf) catch {
-        try outAll(app.io, "not running\n");
-        return .failed;
-    };
-    const got = Io.Dir.cwd().readFile(app.io, p.status, &buf) catch {
-        try outAll(app.io, "not running\n");
-        return .failed;
-    };
-    const i = std.mem.indexOf(u8, got, "tick ") orelse return .failed;
-    const tick = util.parseIso(got[i + 5 .. @min(got.len, i + 25)]) orelse return .failed;
-    const age = util.nowSeconds(app.io) - tick;
-    if (age > 90) {
-        try outPrint(app.io, "stale: last tick {d} s ago\n", .{age});
-        return .failed;
+    const h = core_mod.health(app.io, p, util.nowSeconds(app.io), &buf);
+    try outPrint(app.io, "{s}\n", .{h.text});
+    return if (h.ok) .ok else .failed;
+}
+
+// ---- ending on a signal ----
+
+/// The signal that asked harness to end; 0 until one came. On Windows the
+/// console event plus one.
+var got_signal: std.atomic.Value(u32) = .init(0);
+
+fn onSignal(sig: std.posix.SIG) callconv(.c) void {
+    // all a handler may do: the watcher does the rest. A second signal ends
+    // the process the default way (SA.RESETHAND).
+    got_signal.store(@intFromEnum(sig), .release);
+}
+
+const console = struct {
+    const CTRL_C_EVENT = 0;
+    const CTRL_BREAK_EVENT = 1;
+    const CTRL_CLOSE_EVENT = 2;
+    const CTRL_LOGOFF_EVENT = 5;
+    const CTRL_SHUTDOWN_EVENT = 6;
+    extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (u32) callconv(.winapi) std.os.windows.BOOL, add: std.os.windows.BOOL) callconv(.winapi) std.os.windows.BOOL;
+    extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+
+    /// Runs on a thread of its own, not in a signal context.
+    fn handler(event: u32) callconv(.winapi) std.os.windows.BOOL {
+        // a second Ctrl-C: end now
+        if (got_signal.swap(event + 1, .acq_rel) != 0) std.process.exit(1);
+        // after close, logoff and shutdown Windows ends the process when
+        // this returns: give the watcher its time (it exits the process)
+        if (event == CTRL_CLOSE_EVENT or event == CTRL_LOGOFF_EVENT or event == CTRL_SHUTDOWN_EVENT) Sleep(4500);
+        return .TRUE;
     }
-    try outPrint(app.io, "running: last tick {d} s ago\n", .{age});
-    return .ok;
+};
+
+/// SIGINT and SIGTERM (Windows: the console's Ctrl-C, Ctrl-Break and
+/// close) no longer end the process on the spot, leaving approved commands
+/// running in their own process groups and the folder held.
+fn catchSignals() void {
+    if (builtin.os.tag == .windows) {
+        _ = console.SetConsoleCtrlHandler(console.handler, .TRUE);
+        return;
+    }
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART | std.posix.SA.RESETHAND,
+    };
+    std.posix.sigaction(.INT, &act, null);
+    std.posix.sigaction(.TERM, &act, null);
+}
+
+fn signalName(n: u32) []const u8 {
+    if (builtin.os.tag == .windows) return switch (n -| 1) {
+        console.CTRL_C_EVENT => "Ctrl-C",
+        console.CTRL_BREAK_EVENT => "Ctrl-Break",
+        console.CTRL_CLOSE_EVENT => "console closed",
+        console.CTRL_LOGOFF_EVENT => "logoff",
+        console.CTRL_SHUTDOWN_EVENT => "shutdown",
+        else => "console event",
+    };
+    if (n == @intFromEnum(std.posix.SIG.INT)) return "SIGINT";
+    if (n == @intFromEnum(std.posix.SIG.TERM)) return "SIGTERM";
+    return "signal";
+}
+
+/// Beside the command until the core closes: on a signal, runs the stop
+/// and the end (Core.endBySignal), then ends the process.
+fn watchSignals(c: *Core) void {
+    while (true) {
+        const n = got_signal.load(.acquire);
+        if (n != 0) {
+            c.endBySignal(signalName(n));
+            std.process.exit(0);
+        }
+        if (c.quitting.load(.acquire)) return;
+        c.io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
 }
 
 // ---- terminal input ----
@@ -830,8 +967,249 @@ const Echo = struct {
     }
 };
 
+/// The command line without the global options. `--home DIR` (or
+/// `--home=DIR`) counts wherever it is, so `harness init --home X` and
+/// `harness login rm NAME --home X` act on X.
+const Cli = struct { home: ?[]const u8 = null, args: []const []const u8 };
+
+fn parseCli(a: std.mem.Allocator, raw: []const []const u8) error{ Usage, OutOfMemory }!Cli {
+    var out: std.ArrayList([]const u8) = .empty;
+    var home: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        const arg = raw[i];
+        const value = if (eql(arg, "--home")) blk: {
+            i += 1;
+            if (i >= raw.len) return error.Usage;
+            break :blk raw[i];
+        } else if (std.mem.startsWith(u8, arg, "--home=")) arg["--home=".len..] else {
+            try out.append(a, arg);
+            continue;
+        };
+        // a folder, not the next option; and one only
+        if (value.len == 0 or value[0] == '-' or home != null) return error.Usage;
+        home = value;
+    }
+    return .{ .home = home, .args = out.items };
+}
+
+const secret_usage = "usage: harness secret add NAME [--stdin] | secret rm NAME | secret list";
+const login_usage = "usage: harness login add NAME --site HOST [--username U] [--stdin] | login list | login rm NAME";
+
+const SecretArgs = struct {
+    op: enum { add, rm, list },
+    name: []const u8 = "",
+    stdin: bool = false,
+};
+
+/// `secret add NAME [--stdin]` (the option before or after the name),
+/// `secret rm NAME`, `secret list`; null for anything else.
+fn secretArgs(rest: []const []const u8) ?SecretArgs {
+    if (rest.len == 0) return null;
+    var out: SecretArgs = .{ .op = std.meta.stringToEnum(@FieldType(SecretArgs, "op"), rest[0]) orelse return null };
+    var names: usize = 0;
+    for (rest[1..]) |arg| {
+        if (eql(arg, "--stdin") and out.op == .add and !out.stdin) {
+            out.stdin = true;
+            continue;
+        }
+        // an option it does not take; no name starts with "-"
+        if (arg.len > 0 and arg[0] == '-') return null;
+        names += 1;
+        out.name = arg;
+    }
+    return switch (out.op) {
+        .list => if (names == 0) out else null,
+        .add, .rm => if (names == 1) out else null,
+    };
+}
+
+/// The usage line when a command's arguments are wrong, else null: extra
+/// or unknown arguments are refused, never ignored.
+fn badArgs(args: []const []const u8) ?[]const u8 {
+    if (args.len == 0) return null;
+    const cmd = args[0];
+    const rest = args[1..];
+    inline for (.{ "help", "--help", "-h", "version", "init", "pair", "run", "chat", "health" }) |c| {
+        if (eql(cmd, c)) return if (rest.len == 0) null else "usage: harness " ++ c ++ " (it takes no arguments)";
+    }
+    if (eql(cmd, "brief")) return if (rest.len <= 1) null else "usage: harness brief [NAME]";
+    if (eql(cmd, "task")) return if (rest.len == 2 and eql(rest[0], "run")) null else "usage: harness task run NAME";
+    if (eql(cmd, "memory")) {
+        if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "list"))) return null;
+        if (rest.len == 2) for ([_][]const u8{ "pin", "unpin", "forget" }) |op| if (eql(rest[0], op)) return null;
+        return "usage: harness memory [list|pin|unpin|forget ID]";
+    }
+    if (eql(cmd, "log")) {
+        if (rest.len == 1 and eql(rest[0], "verify")) return null;
+        if (rest.len >= 1 and eql(rest[0], "tail")) {
+            if (rest.len == 1) return null;
+            if (rest.len == 2 and (std.fmt.parseInt(usize, rest[1], 10) catch null) != null) return null;
+        }
+        return "usage: harness log verify | harness log tail [N]";
+    }
+    if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
+    if (eql(cmd, "login")) {
+        if (rest.len == 0) return login_usage;
+        if (eql(rest[0], "list") and rest.len != 1) return login_usage;
+        if (eql(rest[0], "rm") and rest.len != 2) return login_usage;
+        // an option is never a login's name (`login add --stdin x` is no login "--stdin")
+        if (rest.len >= 2 and rest[1].len > 0 and rest[1][0] == '-') return login_usage;
+        // `login add` checks its own options
+        return null;
+    }
+    return null;
+}
+
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+/// Whether two paths name the same folder: their real paths when they
+/// exist, else the paths made absolute (case ignored where the file system
+/// usually does).
+fn samePath(io: Io, a: std.mem.Allocator, x: []const u8, y: []const u8) bool {
+    const rx = absolute(io, a, x) orelse return false;
+    const ry = absolute(io, a, y) orelse return false;
+    if (builtin.os.tag == .macos or builtin.os.tag == .windows) return std.ascii.eqlIgnoreCase(rx, ry);
+    return std.mem.eql(u8, rx, ry);
+}
+
+fn absolute(io: Io, a: std.mem.Allocator, p: []const u8) ?[]const u8 {
+    if (Io.Dir.cwd().realPathFileAlloc(io, p, a)) |r| return r else |_| {}
+    if (std.fs.path.isAbsolute(p)) return std.fs.path.resolve(a, &.{p}) catch null;
+    const cwd = Io.Dir.cwd().realPathFileAlloc(io, ".", a) catch return null;
+    return std.fs.path.resolve(a, &.{ cwd, p }) catch null;
+}
+
+const t = std.testing;
+
+test "global_options_count_anywhere_on_the_line" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c1 = try parseCli(a, &.{ "init", "--home", "/x" });
+    try t.expectEqualStrings("/x", c1.home.?);
+    try t.expectEqual(1, c1.args.len);
+    try t.expectEqualStrings("init", c1.args[0]);
+    const c2 = try parseCli(a, &.{ "login", "rm", "victim", "--home", "other" });
+    try t.expectEqualStrings("other", c2.home.?);
+    try t.expectEqual(3, c2.args.len);
+    try t.expectEqualStrings("victim", c2.args[2]);
+    const c3 = try parseCli(a, &.{ "--home=/y", "run" });
+    try t.expectEqualStrings("/y", c3.home.?);
+    try t.expectEqualStrings("run", c3.args[0]);
+    const c4 = try parseCli(a, &.{ "--home", "/z", "chat" });
+    try t.expectEqualStrings("/z", c4.home.?);
+    try t.expectEqual(1, c4.args.len);
+    try t.expectEqual(null, (try parseCli(a, &.{"health"})).home);
+    // no folder, or two
+    try t.expectError(error.Usage, parseCli(a, &.{ "run", "--home" }));
+    try t.expectError(error.Usage, parseCli(a, &.{ "run", "--home", "--stdin" }));
+    try t.expectError(error.Usage, parseCli(a, &.{ "--home", "a", "run", "--home", "b" }));
+    try t.expectError(error.Usage, parseCli(a, &.{ "run", "--home=" }));
+}
+
+test "extra_or_unknown_arguments_are_refused" {
+    const bad = [_][]const []const u8{
+        &.{ "init", "x" },              &.{ "run", "x" },               &.{ "chat", "now" },
+        &.{ "pair", "x" },              &.{ "health", "x" },            &.{ "version", "x" },
+        &.{ "help", "x" },              &.{ "brief", "a", "b" },        &.{ "task", "run" },
+        &.{ "task", "run", "a", "b" },  &.{ "task", "go", "a" },        &.{ "memory", "list", "x" },
+        &.{ "memory", "pin" },          &.{ "memory", "drop", "m" },    &.{ "log" },
+        &.{ "log", "verify", "x" },     &.{ "log", "tail", "x" },       &.{ "log", "tail", "5", "6" },
+        &.{ "secret" },                 &.{ "secret", "list", "x" },    &.{ "secret", "rm" },
+        &.{ "secret", "rm", "a", "b" }, &.{ "secret", "add", "a", "b" }, &.{ "secret", "add", "a", "--x" },
+        &.{ "secret", "rm", "a", "--stdin" }, &.{ "secret", "add", "--stdin" }, &.{ "login", "list", "x" },
+        &.{ "login", "rm", "a", "b" },  &.{ "login", "rm", "-x" },      &.{ "login", "add", "--stdin", "x", "--site", "a.org" },
+    };
+    for (bad) |line| if (badArgs(line) == null) {
+        printLine("accepted:", line);
+        return error.TestUnexpectedResult;
+    };
+    const good = [_][]const []const u8{
+        &.{"init"},                     &.{"run"},                       &.{"brief"},
+        &.{ "brief", "morning" },       &.{ "task", "run", "x" },        &.{"memory"},
+        &.{ "memory", "list" },         &.{ "memory", "forget", "m-1" }, &.{ "log", "verify" },
+        &.{ "log", "tail" },            &.{ "log", "tail", "5" },        &.{ "secret", "list" },
+        &.{ "secret", "add", "a" },     &.{ "secret", "add", "a", "--stdin" }, &.{ "secret", "add", "--stdin", "a" },
+        &.{ "secret", "rm", "a" },      &.{ "login", "list" },           &.{ "login", "rm", "a" },
+        &.{ "login", "add", "a", "--site", "x.org" }, &.{"help"},         &.{"version"},
+        &.{"nonsense"}, // unknown commands are refused by dispatch
+    };
+    for (good) |line| if (badArgs(line)) |why| {
+        printLine("refused:", line);
+        std.debug.print("  {s}\n", .{why});
+        return error.TestUnexpectedResult;
+    };
+}
+
+test "names_start_with_a_letter_or_digit" {
+    try t.expect(validName("omnigate"));
+    try t.expect(validName("login-bot-password"));
+    try t.expect(validName("2fa_seed"));
+    try t.expect(!validName("--stdin"));
+    try t.expect(!validName("-x"));
+    try t.expect(!validName("_x"));
+    try t.expect(!validName(""));
+    try t.expect(!validName("Upper"));
+    // `secret add --stdin foo` stores foo
+    const sa = secretArgs(&.{ "add", "--stdin", "foo" }).?;
+    try t.expectEqualStrings("foo", sa.name);
+    try t.expect(sa.stdin);
+}
+
+test "sigterm_is_caught_and_noted_not_the_end_of_the_process" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    got_signal.store(0, .release);
+    catchSignals();
+    defer {
+        const dfl: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.DFL }, .mask = std.posix.sigemptyset(), .flags = 0 };
+        std.posix.sigaction(.INT, &dfl, null);
+        std.posix.sigaction(.TERM, &dfl, null);
+        got_signal.store(0, .release);
+    }
+    try std.posix.raise(.TERM);
+    try t.expectEqualStrings("SIGTERM", signalName(got_signal.load(.acquire)));
+}
+
+test "mcp_servers_and_the_browser_only_for_commands_that_use_tools" {
+    // a brief is one model call without tools; memory commands make none
+    try t.expect(!App.Role.memory.usesTools());
+    try t.expect(!App.Role.brief.usesTools());
+    try t.expect(App.Role.task.usesTools());
+    try t.expect(App.Role.chat.usesTools());
+    try t.expect(App.Role.run.usesTools());
+}
+
+test "a_value_too_long_for_the_store_is_refused_with_its_limit" {
+    var buf: [200]u8 = undefined;
+    const why = valueProblem(&buf, .{ .wincred = store_mod.legacy_namespace }, 3000) orelse return error.TestUnexpectedResult;
+    try t.expect(std.mem.indexOf(u8, why, "Credential Manager") != null);
+    try t.expect(std.mem.indexOf(u8, why, "2560") != null);
+    try t.expect(valueProblem(&buf, .{ .wincred = store_mod.legacy_namespace }, 2560) == null);
+    try t.expect(valueProblem(&buf, .{ .wincred = store_mod.legacy_namespace }, 7) != null);
+}
+
+test "same_path_sees_one_folder_however_it_is_written" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(t.io, "data/harness");
+    const real = try tmp.dir.realPathFileAlloc(t.io, "data/harness", a);
+    try t.expect(samePath(t.io, a, real, try std.fmt.allocPrint(a, "{s}/", .{real})));
+    try t.expect(samePath(t.io, a, real, try std.fs.path.join(a, &.{ real, "..", "harness" })));
+    try t.expect(!samePath(t.io, a, real, try std.fs.path.join(a, &.{ real, "..", "other" })));
+    // not made yet: compared as written
+    try t.expect(samePath(t.io, a, "/no/such/place", "/no/such/./place"));
+}
+
+fn printLine(what: []const u8, line: []const []const u8) void {
+    std.debug.print("{s}", .{what});
+    for (line) |w| std.debug.print(" {s}", .{w});
+    std.debug.print("\n", .{});
 }
 
 fn outAll(io: Io, s: []const u8) !void {
@@ -876,6 +1254,7 @@ test {
     _ = @import("sock.zig");
     _ = @import("store.zig");
     _ = @import("scrub.zig");
+    _ = @import("masks.zig");
     _ = @import("skills.zig");
     _ = @import("mcp.zig");
     _ = @import("page.zig");

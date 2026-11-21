@@ -17,7 +17,9 @@ pub const Config = struct {
     money: Money = .{},
 
     pub const Model = struct {
-        url: []const u8 = "http://127.0.0.1:8080",
+        /// omnigate's address; empty until the owner sets it (no default,
+        /// so the key never goes to whatever happens to listen there).
+        url: []const u8 = "",
         model: []const u8 = "claude-sonnet",
         memory_model: []const u8 = "claude-haiku",
         /// Route for helpers started with `delegate`.
@@ -133,7 +135,9 @@ fn setField(sec: anytype, l: Line) Error!void {
                 @field(sec.*, fname) = parseOffset(l.value) catch return error.BadConfig;
             } else switch (ftype) {
                 []const u8 => {
-                    if (l.value.len == 0) return error.BadConfig;
+                    // only omnigate's address may be left empty (not set yet)
+                    const may_be_empty = comptime (T == Config.Model and std.mem.eql(u8, fname, "url"));
+                    if (l.value.len == 0 and !may_be_empty) return error.BadConfig;
                     @field(sec.*, fname) = l.value;
                 },
                 u32 => @field(sec.*, fname) = std.fmt.parseInt(u32, l.value, 10) catch return error.BadConfig,
@@ -311,7 +315,7 @@ pub fn parseDays(v: []const u8) error{BadDays}!u7 {
 pub const defaults_ini =
     \\; harness settings. Lines starting with ; are comments.
     \\[model]
-    \\url = http://127.0.0.1:8080        ; omnigate
+    \\url =                               ; required: your omnigate's address, like https://omnigate.example.com
     \\model = claude-sonnet               ; omnigate route for the agent
     \\memory_model = claude-haiku         ; omnigate route for writing memories
     \\worker_model = claude-haiku         ; omnigate route for helpers (delegate)
@@ -360,7 +364,10 @@ pub const defaults_ini =
 pub const rules_example =
     \\# Gate rules: allow | ask | deny, a tool, a pattern (* matches anything).
     \\# A matching deny always wins; otherwise the first matching line decides;
-    \\# otherwise the tool's default (shell: ask, fetch: ask, others: allow).
+    \\# otherwise the tool's default: shell, fetch, browse, web, login,
+    \\# skill_save and mcp (MCP tools, matched as "mcp SERVER/TOOL INPUT") ask;
+    \\# money tools are asked every time, whatever the rules; the others are
+    \\# allowed.
     \\#
     \\# deny  shell rm -rf *
     \\# allow fetch https://news.ycombinator.com/*
@@ -396,7 +403,12 @@ test "config_defaults_when_empty" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const c = try parse(arena.allocator(), "");
-    try t.expectEqualStrings("http://127.0.0.1:8080", c.model.url);
+    // no omnigate address until the owner sets one: a default could hand the key to whatever listens there
+    try t.expectEqualStrings("", c.model.url);
+    try t.expectEqualStrings("", (try parse(arena.allocator(), "[model]\nurl =\n")).model.url);
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "127.0.0.1") == null);
+    try t.expectError(error.BadConfig, parse(arena.allocator(), "[model]\nmodel =\n"));
+    try t.expectError(error.BadConfig, parse(arena.allocator(), "[search]\nurl =\n"));
     try t.expectEqual(20, c.limits.steps_per_turn);
     try t.expectEqual(600, c.limits.turn_seconds);
     try t.expectEqual(16384, c.limits.tool_output_bytes);
@@ -552,4 +564,32 @@ test "agents_browser_and_money_sections" {
     try t.expectEqual(500, c.money.max_per_day);
     try t.expect(c.money.scheduled);
     _ = try parse(arena.allocator(), defaults_ini);
+}
+
+test "inits_rules_comment_names_each_tool_that_asks_by_default" {
+    const gate = @import("gate.zig");
+    // the comment is what an owner reads to learn the defaults: every tool
+    // that asks must be named there, and none that is allowed
+    const comment = rules_example[0 .. std.mem.indexOf(u8, rules_example, "#\n") orelse rules_example.len];
+    inline for (@typeInfo(gate.Tool).@"enum".field_names) |name| {
+        const tool = @field(gate.Tool, name);
+        const named = hasWord(comment, name);
+        if ((tool.default() == .ask) != named) {
+            std.debug.print("{s} (default {s}) is {s} in:\n{s}\n", .{ name, @tagName(tool.default()), if (named) "named" else "not named", comment });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+/// `word` as a whole word in `text` ("skill" is not in "skill_save").
+fn hasWord(text: []const u8, word: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, word)) |i| {
+        const end = i + word.len;
+        const before_ok = i == 0 or !(std.ascii.isAlphanumeric(text[i - 1]) or text[i - 1] == '_');
+        const after_ok = end == text.len or !(std.ascii.isAlphanumeric(text[end]) or text[end] == '_');
+        if (before_ok and after_ok) return true;
+        from = i + 1;
+    }
+    return false;
 }
