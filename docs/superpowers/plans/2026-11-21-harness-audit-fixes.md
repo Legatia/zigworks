@@ -339,3 +339,7 @@ Seams hold (Core.open sets all fields, close order, no lock inversion, mask hook
 - Noted, not fixed: K13 a page could move a cross-site frame under the pointer between the cover check and the press (theoretical); Keychain/Credential Manager namespace code has no test (HARNESS_STORE set everywhere) — add a pure-function test if missing.
 
 Assignment: X (F1-F5, F7, F8) branch fix2/core; Y (F6, F9, F10, F11) branch fix2/urls.
+
+### X fix2/core (8 commits) — merged, 358/360, smoke 45 ok, cross builds ok
+- F1 1c31e3e (composed message kept per key; only delivery retried; briefs resent as written, links seen once it arrives); F2 2e00e9c (every part via deliver; a failed part or no message id → refused, Answer.unsent, owner told); F3 881fbbc (name, description, body shown; >12 KB refused); F4 b14f983 (agent.Written in Core, shared with helpers, kept in state/written; shell allowed by a rule or grant is asked naming the files; an allow clears what it showed; scheduled runs skip it); F5 ed14681; F7 7fd8699 (mask_mutex); F8 23e4567 (store.forFolder/claimNamespace; init writes store-id first; old folders keep "harness"); b438adf tidy.
+- Rulings: kept undelivered messages are in memory only (a restart while one waits runs that brief/task once more); the written mark persists in state/written; deleting store-id in a copy gives it "harness" (README: make a second folder with init and copy everything except state/store-id).
