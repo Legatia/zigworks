@@ -485,9 +485,63 @@ fn pairCmd(app: *App) !Exit {
 
 // ---- Telegram ----
 
+/// `harness run`'s Telegram side: one bot for the long poll and one for
+/// sending, so sends and button presses never wait behind the poll. Each
+/// bot keeps its own copy of the api url; `refresh` makes both again when
+/// /reload changed `[chat] api`.
 const TgChan = struct {
-    bot: *telegram.Bot,
+    gpa: std.mem.Allocator,
+    io: Io,
     core: *Core,
+    token: []const u8,
+    /// The long poll: only the thread that polls uses it.
+    poll: telegram.Bot,
+    /// Held while `send_bot` is used or replaced.
+    mutex: Io.Mutex = .init,
+    send_bot: telegram.Bot,
+    /// An api url from config.ini that is not valid (owned), so it is
+    /// refused once, not after every poll.
+    rejected: ?[]u8 = null,
+
+    fn init(tc: *TgChan, gpa: std.mem.Allocator, io: Io, core: *Core, api: []const u8, token: []const u8) !void {
+        var poll = try telegram.Bot.init(gpa, io, api, token);
+        errdefer poll.deinit();
+        const send_bot = try telegram.Bot.init(gpa, io, api, token);
+        tc.* = .{ .gpa = gpa, .io = io, .core = core, .token = token, .poll = poll, .send_bot = send_bot };
+    }
+
+    fn deinit(tc: *TgChan) void {
+        tc.poll.deinit();
+        tc.send_bot.deinit();
+        if (tc.rejected) |r| tc.gpa.free(r);
+    }
+
+    /// After /reload: makes both bots again if `[chat] api` changed; true
+    /// when it did. Call from the polling thread, where commands (and so
+    /// /reload) run.
+    fn refresh(tc: *TgChan) !bool {
+        const api = tc.core.cfg.chat.api;
+        if (std.mem.eql(u8, api, tc.poll.api)) return false;
+        if (tc.rejected) |r| if (std.mem.eql(u8, api, r)) return false;
+        var poll = telegram.Bot.init(tc.gpa, tc.io, api, tc.token) catch |e| switch (e) {
+            error.BadUrl => {
+                if (tc.rejected) |r| tc.gpa.free(r);
+                tc.rejected = try tc.gpa.dupe(u8, api);
+                tc.core.say("The Telegram api url in config.ini is not valid; I keep using the one from before.");
+                return false;
+            },
+            else => return e,
+        };
+        errdefer poll.deinit();
+        const send_bot = try telegram.Bot.init(tc.gpa, tc.io, api, tc.token);
+        tc.poll.deinit();
+        tc.poll = poll;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        tc.send_bot.deinit();
+        tc.send_bot = send_bot;
+        return true;
+    }
 
     fn channel(tc: *TgChan) core_mod.Channel {
         return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear };
@@ -496,19 +550,32 @@ const TgChan = struct {
     fn send(ctx: *anyopaque, text: []const u8) void {
         const tc: *TgChan = @ptrCast(@alignCast(ctx));
         const chat = tc.core.owner orelse return;
-        tc.bot.send(chat, text) catch |e| complain("telegram: sending failed: {s}", .{@errorName(e)});
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        tc.send_bot.send(chat, text) catch |e| complain("telegram: sending failed: {s}", .{@errorName(e)});
     }
 
     fn buttons(ctx: *anyopaque, text: []const u8, bs: []const [2][]const u8) ?i64 {
         const tc: *TgChan = @ptrCast(@alignCast(ctx));
         const chat = tc.core.owner orelse return null;
-        return tc.bot.sendButtons(chat, text, bs) catch null;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return tc.send_bot.sendButtons(chat, text, bs) catch null;
     }
 
     fn clear(ctx: *anyopaque, id: i64) void {
         const tc: *TgChan = @ptrCast(@alignCast(ctx));
         const chat = tc.core.owner orelse return;
-        tc.bot.clearButtons(chat, id) catch {};
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        tc.send_bot.clearButtons(chat, id) catch {};
+    }
+
+    /// Takes a button press, so Telegram stops showing it as pending.
+    fn answer(tc: *TgChan, callback_id: []const u8) void {
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        tc.send_bot.answer(callback_id) catch {};
     }
 };
 
@@ -522,7 +589,13 @@ fn ticker(c: *Core) void {
 
 fn runCmd(app: *App) !Exit {
     const c = try app.open();
-    defer c.close();
+    // the bots outlive the core: its threads talk through them until close
+    var tc: TgChan = undefined;
+    var tc_made = false;
+    defer {
+        c.close();
+        if (tc_made) tc.deinit();
+    }
     if (!c.cfg.chat.telegram) {
         complain("Telegram is off in config.ini; use harness chat", .{});
         return .failed;
@@ -531,15 +604,11 @@ fn runCmd(app: *App) !Exit {
         complain("no bot token stored under \"{s}\"; run: harness secret add {s}", .{ c.cfg.chat.token, c.cfg.chat.token });
         return .failed;
     };
-    var bot = telegram.Bot.init(app.gpa, app.io, c.cfg.chat.api, token) catch {
+    tc.init(app.gpa, app.io, c, c.cfg.chat.api, token) catch {
         complain("the Telegram api url in config.ini is not valid", .{});
         return .failed;
     };
-    defer bot.deinit();
-    // sends and button presses must not wait behind the long poll
-    var send_bot = try telegram.Bot.init(app.gpa, app.io, c.cfg.chat.api, token);
-    defer send_bot.deinit();
-    var tc: TgChan = .{ .bot = &send_bot, .core = c };
+    tc_made = true;
     c.attach(tc.channel());
     try c.startWorker();
     const tick_thread = try std.Thread.spawn(.{}, ticker, .{c});
@@ -553,7 +622,7 @@ fn runCmd(app: *App) !Exit {
         var arena_state: std.heap.ArenaAllocator = .init(app.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        const ups = bot.getUpdates(a, offset, 50) catch |e| {
+        const ups = tc.poll.getUpdates(a, offset, 50) catch |e| {
             failures += 1;
             if (failures == 1 or failures % 20 == 0) complain("telegram: {s}; retrying", .{@errorName(e)});
             app.io.sleep(.fromSeconds(@min(60, 2 * failures)), .awake) catch {};
@@ -567,11 +636,13 @@ fn runCmd(app: *App) !Exit {
             switch (u) {
                 .message => |m| if (m.text.len > 0) c.handleMessage(m.from_id, m.text) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
                 .callback => |cb| {
-                    send_bot.answer(cb.id) catch {};
+                    tc.answer(cb.id);
                     c.handleCallback(cb.from_id, cb.data);
                 },
             }
         }
+        // a /reload among those messages may have changed the api url
+        _ = tc.refresh() catch |e| complain("telegram: {s}", .{@errorName(e)});
     }
 }
 
@@ -839,6 +910,113 @@ fn errPrint(io: Io, comptime fmt: []const u8, args: anytype) !void {
 
 fn complain(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("harness: " ++ fmt ++ "\n", args);
+}
+
+// ---- tests ----
+
+const t = std.testing;
+const model = @import("model.zig");
+
+/// Frees nothing until `deinit` and fills what is freed with 0xaa first: a
+/// pointer kept into freed memory reads garbage, every time.
+const Quarantine = struct {
+    child: std.mem.Allocator,
+    mutex: Io.Mutex = .init,
+    freed: std.ArrayList(Block) = .empty,
+
+    const Block = struct { mem: []u8, alignment: std.mem.Alignment };
+
+    fn allocator(q: *Quarantine) std.mem.Allocator {
+        return .{ .ptr = q, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn deinit(q: *Quarantine) void {
+        for (q.freed.items) |b| q.child.rawFree(b.mem, b.alignment, @returnAddress());
+        q.freed.deinit(q.child);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const q: *Quarantine = @ptrCast(@alignCast(ctx));
+        return q.child.rawAlloc(len, alignment, ret);
+    }
+
+    // never in place: growing goes through alloc, copy and free
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, mem: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const q: *Quarantine = @ptrCast(@alignCast(ctx));
+        @memset(mem, 0xaa);
+        q.mutex.lockUncancelable(t.io);
+        defer q.mutex.unlock(t.io);
+        q.freed.append(q.child, .{ .mem = mem, .alignment = alignment }) catch q.child.rawFree(mem, alignment, ret);
+    }
+};
+
+/// A data folder whose config.ini points the model, search and Telegram at
+/// the fake server.
+fn testHome(e: *model.TestEnv) ![]const u8 {
+    const a = e.arena.allocator();
+    const home = try std.fs.path.join(a, &.{ e.dir, "home" });
+    try core_mod.initHome(t.io, a, home);
+    const p = try core_mod.Paths.init(a, home);
+    const url = try e.url();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.config, .data = try std.fmt.allocPrint(a, "[model]\nurl = {s}\n[search]\nurl = {s}\n[chat]\napi = {s}\n", .{ url, url, url }) });
+    return home;
+}
+
+test "a_telegram_bot_keeps_its_server_after_reload" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    var q: Quarantine = .{ .child = t.allocator };
+    defer q.deinit();
+    const c = try Core.open(q.allocator(), t.io, try testHome(&e), .{ .telegram = "123:abc" });
+    defer c.close();
+    // made from the settings, as `harness run` makes its bots
+    var bot = try telegram.Bot.init(t.allocator, t.io, c.cfg.chat.api, "123:abc");
+    defer bot.deinit();
+    // /reload frees the settings the bot was made from
+    try t.expectEqualStrings("Settings reloaded.", try c.reload());
+    try t.expectEqualStrings("127.0.0.1", bot.http.target.host);
+    try bot.send(42, "after the reload");
+    try t.expect(std.mem.indexOf(u8, try telegram.outbox(&e), "after the reload") != null);
+}
+
+test "telegram_bots_follow_a_changed_api_after_reload" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    var moved: model.TestEnv = undefined;
+    try moved.init();
+    defer moved.deinit();
+    const a = e.arena.allocator();
+    const c = try Core.open(t.allocator, t.io, try testHome(&e), .{ .telegram = "123:abc" });
+    var tc: TgChan = undefined;
+    tc.init(t.allocator, t.io, c, c.cfg.chat.api, "123:abc") catch |err| {
+        c.close();
+        return err;
+    };
+    defer {
+        c.close();
+        tc.deinit();
+    }
+    c.attach(tc.channel());
+    try c.setOwner(42);
+    try t.expect(!try tc.refresh());
+    const url = try e.url();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = c.paths.config, .data = try std.fmt.allocPrint(a, "[model]\nurl = {s}\n[chat]\napi = {s}\n", .{ url, try moved.url() }) });
+    try t.expectEqualStrings("Settings reloaded.", try c.reload());
+    try t.expect(try tc.refresh());
+    try t.expectEqualStrings(try moved.url(), tc.poll.api);
+    c.say("sent after the move");
+    try t.expect(std.mem.indexOf(u8, try telegram.outbox(&moved), "sent after the move") != null);
+    try t.expect(std.mem.indexOf(u8, try telegram.outbox(&e), "sent after the move") == null);
 }
 
 test {

@@ -23,15 +23,21 @@ pub const Bot = struct {
     gpa: std.mem.Allocator,
     io: Io,
     http: http.Client,
+    /// The Bot API's address, the bot's own copy: the settings it came from
+    /// are replaced on /reload.
+    api: []u8,
     token: []const u8,
     mutex: Io.Mutex = .init,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, api: []const u8, token: []const u8) !Bot {
-        return .{ .gpa = gpa, .io = io, .http = .init(gpa, io, try http.Target.parse(api)), .token = token };
+        const own = try gpa.dupe(u8, api);
+        errdefer gpa.free(own);
+        return .{ .gpa = gpa, .io = io, .http = .init(gpa, io, try http.Target.parse(own)), .api = own, .token = token };
     }
 
     pub fn deinit(b: *Bot) void {
         b.http.deinit();
+        b.gpa.free(b.api);
     }
 
     /// One Bot API call; returns the `result` value (in `arena`).
