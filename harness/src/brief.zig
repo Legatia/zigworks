@@ -84,14 +84,22 @@ pub const Seen = struct {
 pub const TopicItems = struct {
     name: []const u8,
     new: []const feeds.Entry,
+    /// New items beyond `max_new_per_topic`, left out.
+    more: usize = 0,
     notes: []const []const u8,
 };
 
-pub const Collected = struct { topics: []const TopicItems };
+pub const Collected = struct {
+    topics: []const TopicItems,
+    /// Every link the sources gave, new or seen before: all are marked
+    /// once the brief is delivered, so what is still in a feed stays seen.
+    links: []const []const u8 = &.{},
+};
 
 /// Fetches every source of the brief; nothing here calls the model.
 pub fn collect(r: *agent.Run, arena: std.mem.Allocator, b: config.Brief, seen: *const Seen) !Collected {
     var out: std.ArrayList(TopicItems) = .empty;
+    var found: Found = .{};
     for (b.topics) |topic| {
         var new: std.ArrayList(feeds.Entry) = .empty;
         var notes: std.ArrayList([]const u8) = .empty;
@@ -102,7 +110,7 @@ pub fn collect(r: *agent.Run, arena: std.mem.Allocator, b: config.Brief, seen: *
                 try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: {s}", .{ url, @errorName(e) }));
                 continue;
             };
-            for (entries) |en| try addNew(arena, &new, &links_here, seen, en);
+            for (entries) |en| try found.add(arena, &new, &links_here, seen, en);
         }
         for (topic.searches) |q| {
             if (r.env.stop.load(.acquire)) break;
@@ -110,19 +118,31 @@ pub fn collect(r: *agent.Run, arena: std.mem.Allocator, b: config.Brief, seen: *
                 try notes.append(arena, try std.fmt.allocPrint(arena, "search \"{s}\": {s}", .{ q, @errorName(e) }));
                 continue;
             };
-            for (entries) |en| try addNew(arena, &new, &links_here, seen, en);
+            for (entries) |en| try found.add(arena, &new, &links_here, seen, en);
         }
         const kept = new.items[0..@min(new.items.len, max_new_per_topic)];
-        try out.append(arena, .{ .name = topic.name, .new = kept, .notes = notes.items });
+        try out.append(arena, .{ .name = topic.name, .new = kept, .more = new.items.len - kept.len, .notes = notes.items });
     }
-    return .{ .topics = out.items };
+    return .{ .topics = out.items, .links = found.list.items };
 }
 
-fn addNew(arena: std.mem.Allocator, new: *std.ArrayList(feeds.Entry), here: *std.StringHashMapUnmanaged(void), seen: *const Seen, en: feeds.Entry) !void {
-    if (seen.has(en.link) or here.contains(en.link)) return;
-    try here.put(arena, en.link, {});
-    try new.append(arena, en);
-}
+/// The links of one brief's sources, each once.
+const Found = struct {
+    set: std.StringHashMapUnmanaged(void) = .empty,
+    list: std.ArrayList([]const u8) = .empty,
+
+    /// Notes `en`'s link; keeps `en` as new unless it was seen before or
+    /// is already among this topic's new ones.
+    fn add(f: *Found, arena: std.mem.Allocator, new: *std.ArrayList(feeds.Entry), here: *std.StringHashMapUnmanaged(void), seen: *const Seen, en: feeds.Entry) !void {
+        if (!f.set.contains(en.link)) {
+            try f.set.put(arena, en.link, {});
+            try f.list.append(arena, en.link);
+        }
+        if (seen.has(en.link) or here.contains(en.link)) return;
+        try here.put(arena, en.link, {});
+        try new.append(arena, en);
+    }
+};
 
 fn fetchFeed(r: *agent.Run, arena: std.mem.Allocator, url: []const u8) ![]const feeds.Entry {
     const d = blk: {
@@ -168,7 +188,8 @@ fn searchEntries(r: *agent.Run, arena: std.mem.Allocator, q: []const u8) ![]cons
 
 pub const Written = struct {
     text: []const u8,
-    /// Links to mark as seen once the brief has been delivered.
+    /// Links to mark as seen once the brief has been delivered: every link
+    /// the sources gave, not only the new ones shown.
     links: []const []const u8,
     model_calls: u32,
 };
@@ -185,6 +206,7 @@ pub fn compose(r: *agent.Run, arena: std.mem.Allocator, b: config.Brief, c: Coll
     var items: std.ArrayList(u8) = .empty;
     for (c.topics) |tp| {
         for (tp.notes) |n| try notes.print(arena, "Could not read {s}\n", .{n});
+        if (tp.more > 0) try notes.print(arena, "{s}: {d} more new item{s} not shown.\n", .{ tp.name, tp.more, if (tp.more == 1) "" else "s" });
         if (tp.new.len == 0) {
             try quiet.append(arena, tp.name);
             continue;
@@ -226,7 +248,7 @@ pub fn compose(r: *agent.Run, arena: std.mem.Allocator, b: config.Brief, c: Coll
     }
     if (notes.items.len > 0) try out.print(arena, "\n\n{s}", .{std.mem.trimEnd(u8, notes.items, "\n")});
     try r.log.write(.brief, false, .{ .name = b.name, .new_items = links.items.len, .model_calls = calls });
-    return .{ .text = out.items, .links = links.items, .model_calls = calls };
+    return .{ .text = out.items, .links = c.links, .model_calls = calls };
 }
 
 // ---- tests ----
@@ -340,7 +362,8 @@ test "nothing_new_needs_no_model_call" {
     const w = try compose(&f.run, a, b, c);
     try t.expectEqualStrings("Nothing new on: Zig.", w.text);
     try t.expectEqual(0, f.e.server.modelRequests());
-    try t.expectEqual(0, w.links.len);
+    // marked again: they are still in the feed
+    try t.expectEqual(2, w.links.len);
 }
 
 test "new_items_one_model_call_with_links" {
@@ -355,11 +378,36 @@ test "new_items_one_model_call_with_links" {
     const w = try compose(&f.run, a, b, try collect(&f.run, a, b, &f.seen));
     try t.expectEqual(1, f.e.server.modelRequests());
     try t.expectEqualStrings("Zig: something new (https://z.org/new)", w.text);
-    try t.expectEqual(1, w.links.len);
-    try t.expectEqualStrings("https://z.org/new", w.links[0]);
+    try t.expectEqual(2, w.links.len);
+    try t.expectEqualStrings("https://z.org/new", w.links[1]);
     const req = try f.e.request(1);
     try t.expect(std.mem.indexOf(u8, req, "https://z.org/new") != null);
     try t.expect(std.mem.indexOf(u8, req, "https://z.org/old") == null);
+}
+
+test "every_link_of_the_feeds_is_marked_and_old_ones_stay_seen" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // 20 new items, and one sent 59 days ago that is still in the feed
+    var links: std.ArrayList([]const u8) = .empty;
+    try links.append(a, "https://z.org/old");
+    for (0..20) |i| try links.append(a, try std.fmt.allocPrint(a, "https://z.org/n{d}", .{i}));
+    try f.feed("zig.xml", links.items);
+    const now: i64 = 1796083200;
+    try f.seen.add("https://z.org/old", now - 59 * 86400);
+    try f.e.script(1, model.textReply("Zig: the news (https://z.org/n0)"));
+    const b = try f.brief(&.{"zig.xml"});
+    const w = try compose(&f.run, a, b, try collect(&f.run, a, b, &f.seen));
+    // the model gets 15 of the new ones; the owner hears of the rest
+    try t.expectEqual(15, std.mem.count(u8, try f.e.request(1), "https://z.org/n"));
+    try t.expect(std.mem.indexOf(u8, w.text, "Zig: 5 more new items not shown.") != null);
+    // once delivered, every link of the feed is marked, the old one again
+    try t.expectEqual(21, w.links.len);
+    for (w.links) |l| try f.seen.add(l, now);
+    f.seen.prune(now + 30 * 86400);
+    for (links.items) |l| try t.expect(f.seen.has(l));
 }
 
 test "failed_feed_becomes_note" {
