@@ -248,6 +248,9 @@ pub const McpTool = struct {
     /// `amount =`), `.none` for a tool that moves no amount, `.unset` when
     /// mcp.ini does not say (refused while a cap is set).
     amount: mcp.Field = .unset,
+    /// The server's own caps (mcp.ini); null: config.ini's [money].
+    max_per_call: ?u32 = null,
+    max_per_day: ?u32 = null,
 };
 
 /// What one server offers the model, and what the owner should know about
@@ -274,7 +277,7 @@ pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, cfg: mcp.ServerConfig,
     }
     var out: std.ArrayList(McpTool) = .empty;
     var notes: std.ArrayList(u8) = .empty;
-    const capped = caps.max_per_call > 0 or caps.max_per_day > 0;
+    const capped = (cfg.max_per_call orelse caps.max_per_call) > 0 or (cfg.max_per_day orelse caps.max_per_day) > 0;
     for (s.tools()) |tl| {
         var is_money = false;
         for (cfg.money) |m| if (std.mem.eql(u8, m, tl.name)) {
@@ -300,42 +303,116 @@ pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, cfg: mcp.ServerConfig,
         const field: mcp.Field = if (is_money) cfg.amount.of(tl.name) else .unset;
         if (is_money and field == .unset and capped)
             try notes.print(arena, "{s}: {s} has no amount field in mcp.ini (amount =), so its calls are refused while a money cap is set\n", .{ tl.server, tl.name });
-        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = field });
+        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = field, .max_per_call = cfg.max_per_call, .max_per_day = cfg.max_per_day });
     }
     return .{ .tools = out.items, .notes = notes.items };
 }
 
-/// What money tools moved today, in the owner's day.
+/// What each server's money tools moved today, in the owner's day.
 pub const MoneyLedger = struct {
     mutex: Io.Mutex = .init,
-    day: i64 = 0,
-    total: f64 = 0,
-    /// Where it is kept ("DAY TOTAL"); null in tests.
+    entries: [max_servers]Entry = undefined,
+    len: usize = 0,
+    /// Where it is kept, a line "SERVER DAY TOTAL" each; null in tests.
     path: ?[]const u8 = null,
+
+    /// Servers whose totals are kept at once.
+    pub const max_servers = 64;
+    /// A total from before totals were kept per server ("DAY TOTAL"): it
+    /// counts for every server, so none can pass its cap on that day.
+    const everyone = "*";
+
+    const Entry = struct {
+        name_buf: [32]u8 = undefined,
+        name_len: u8 = 0,
+        day: i64 = 0,
+        total: f64 = 0,
+
+        fn name(e: *const Entry) []const u8 {
+            return e.name_buf[0..e.name_len];
+        }
+    };
 
     pub fn load(l: *MoneyLedger, io: Io) void {
         const p = l.path orelse return;
-        var buf: [128]u8 = undefined;
+        var buf: [8192]u8 = undefined;
         const got = Io.Dir.cwd().readFile(io, p, &buf) catch return;
-        var it = std.mem.tokenizeAny(u8, got, " \n");
-        l.day = std.fmt.parseInt(i64, it.next() orelse return, 10) catch return;
-        l.total = std.fmt.parseFloat(f64, it.next() orelse return) catch 0;
-    }
-
-    fn spent(l: *MoneyLedger, day: i64) f64 {
-        return if (l.day == day) l.total else 0;
-    }
-
-    fn add(l: *MoneyLedger, io: Io, day: i64, amount: f64) void {
-        if (l.day != day) {
-            l.day = day;
-            l.total = 0;
+        var lines = std.mem.tokenizeAny(u8, got, "\r\n");
+        while (lines.next()) |line| {
+            var parts: [3][]const u8 = undefined;
+            var n: usize = 0;
+            var it = std.mem.tokenizeAny(u8, line, " \t");
+            while (it.next()) |x| {
+                if (n == parts.len) break;
+                parts[n] = x;
+                n += 1;
+            }
+            if (it.next() != null or n < 2) continue;
+            const name = if (n == 2) everyone else parts[0];
+            const day = std.fmt.parseInt(i64, parts[n - 2], 10) catch continue;
+            const total = std.fmt.parseFloat(f64, parts[n - 1]) catch continue;
+            const e = l.entry(name, day) orelse continue;
+            e.day = day;
+            e.total = total;
         }
-        l.total += amount;
+    }
+
+    fn find(l: *MoneyLedger, name: []const u8) ?*Entry {
+        for (l.entries[0..l.len]) |*e| if (std.mem.eql(u8, e.name(), name)) return e;
+        return null;
+    }
+
+    /// The entry for `name`, made if there is none (in place of one of a
+    /// day before `day` when all are taken); null when none is free.
+    fn entry(l: *MoneyLedger, name: []const u8, day: i64) ?*Entry {
+        if (l.find(name)) |e| return e;
+        if (name.len == 0 or name.len > 32) return null;
+        const e = if (l.len < max_servers) blk: {
+            l.len += 1;
+            break :blk &l.entries[l.len - 1];
+        } else for (l.entries[0..l.len]) |*old| {
+            if (old.day < day) break old;
+        } else return null;
+        e.* = .{ .day = day };
+        @memcpy(e.name_buf[0..name.len], name);
+        e.name_len = @intCast(name.len);
+        return e;
+    }
+
+    /// What `server` moved on `day`.
+    fn spent(l: *MoneyLedger, server: []const u8, day: i64) f64 {
+        var so_far: f64 = 0;
+        for ([_][]const u8{ server, everyone }) |n| if (l.find(n)) |e| {
+            if (e.day == day) so_far += e.total;
+        };
+        return so_far;
+    }
+
+    /// Counts `amount` toward `server`'s `day`; false when no entry is free.
+    fn add(l: *MoneyLedger, io: Io, server: []const u8, day: i64, amount: f64) bool {
+        const e = l.entry(server, day) orelse return false;
+        if (e.day != day) {
+            e.day = day;
+            e.total = 0;
+        }
+        e.total += amount;
+        l.save(io);
+        return true;
+    }
+
+    fn save(l: *MoneyLedger, io: Io) void {
         const p = l.path orelse return;
-        var buf: [128]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "{d} {d}\n", .{ l.day, l.total }) catch return;
-        Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = text, .flags = .{ .permissions = util.private_file } }) catch {};
+        var buf: [max_servers * 80]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        for (l.entries[0..l.len]) |*e| w.print("{s} {d} {d}\n", .{ e.name(), e.day, e.total }) catch return;
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = w.buffered(), .flags = .{ .permissions = util.private_file } }) catch {};
+    }
+
+    /// Everything counted, whatever the server and day (for tests).
+    fn sum(l: *const MoneyLedger) f64 {
+        var total: f64 = 0;
+        for (l.entries[0..l.len]) |e| total += e.total;
+        return total;
     }
 };
 
@@ -680,7 +757,7 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
         }
     }
     if (try decideAndAsk(r, a, tool, name, arg, now_s)) |refused| {
-        if (tool == .money) releaseMoney(r, now_s, amount);
+        if (tool == .money) releaseMoney(r, mt.?, now_s, amount);
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{refused}), .is_error = true };
     }
 
@@ -820,9 +897,12 @@ fn moneyDay(r: *const Run, now_s: i64) i64 {
 /// counted under one lock, so two runs cannot both pass the same cap);
 /// `releaseMoney` takes it back if the call is not made.
 fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []const u8, now_s: i64, amount: *f64) ?[]const u8 {
-    const capped = r.money.max_per_call > 0 or r.money.max_per_day > 0;
+    // the server's own caps, else config.ini's
+    const per_call = m.max_per_call orelse r.money.max_per_call;
+    const per_day = m.max_per_day orelse r.money.max_per_day;
+    const capped = per_call > 0 or per_day > 0;
     if (r.scheduled and r.money.scheduled and !capped)
-        return "money in scheduled runs needs max_per_call or max_per_day in [money]";
+        return "money in scheduled runs needs max_per_call or max_per_day ([money] in config.ini, or the server's section in mcp.ini)";
     switch (m.amount) {
         .none => {},
         // without its field the caps cannot be checked: refused, not let through
@@ -834,31 +914,32 @@ fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []co
             return std.fmt.allocPrint(a, "no amount in the field \"{s}\", so the caps cannot be checked", .{field}) catch "no amount";
         },
     }
-    if (r.money.max_per_call > 0 and amount.* > @as(f64, @floatFromInt(r.money.max_per_call)))
-        return std.fmt.allocPrint(a, "{d} is over the cap of {d} per call", .{ amount.*, r.money.max_per_call }) catch "over the cap per call";
-    const l = r.money_ledger orelse return if (r.money.max_per_day > 0) "no record of today's total" else null;
+    if (per_call > 0 and amount.* > @as(f64, @floatFromInt(per_call)))
+        return std.fmt.allocPrint(a, "{d} is over the cap of {d} per call", .{ amount.*, per_call }) catch "over the cap per call";
+    const l = r.money_ledger orelse return if (per_day > 0) "no record of today's total" else null;
     l.mutex.lockUncancelable(r.io);
     defer l.mutex.unlock(r.io);
+    // each server has its own total: its caps are in its own units
     const day = moneyDay(r, now_s);
-    const spent = l.spent(day);
-    if (r.money.max_per_day > 0 and spent + amount.* > @as(f64, @floatFromInt(r.money.max_per_day)))
-        return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount.*, r.money.max_per_day, spent }) catch "over the cap per day";
-    l.add(r.io, day, amount.*);
+    const spent = l.spent(m.server.name, day);
+    if (per_day > 0 and spent + amount.* > @as(f64, @floatFromInt(per_day)))
+        return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount.*, per_day, spent }) catch "over the cap per day";
+    if (!l.add(r.io, m.server.name, day, amount.*)) return "the day totals of too many servers are kept already";
     return null;
 }
 
 /// Takes back an amount counted by `moneyCheck` for a call not made.
-fn releaseMoney(r: *Run, now_s: i64, amount: f64) void {
+fn releaseMoney(r: *Run, m: *const McpTool, now_s: i64, amount: f64) void {
     const l = r.money_ledger orelse return;
     if (amount == 0) return;
     l.mutex.lockUncancelable(r.io);
     defer l.mutex.unlock(r.io);
-    l.add(r.io, moneyDay(r, now_s), -amount);
+    _ = l.add(r.io, m.server.name, moneyDay(r, now_s), -amount);
 }
 
 fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, amount: f64) !tools.Output {
     if (m.money and r.dry_run) {
-        releaseMoney(r, r.now(), amount);
+        releaseMoney(r, m, r.now(), amount);
         return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
     }
     const timeout_ms: u32 = @intCast(@min(@as(u64, r.limits.turn_seconds) * 1000, std.math.maxInt(u32)));
@@ -1126,7 +1207,7 @@ const Fix = struct {
         _ = what;
         const f: *Fix = @ptrCast(@alignCast(ctx));
         f.last_allow_day = allow_day;
-        f.ledger_at_ask = f.ledger.total;
+        f.ledger_at_ask = f.ledger.sum();
         const now_in = f.in_flight.fetchAdd(1, .acq_rel) + 1;
         _ = f.max_in_flight.fetchMax(now_in, .acq_rel);
         if (f.ask_ms > 0) t.io.sleep(.fromMilliseconds(f.ask_ms), .awake) catch {};
@@ -1418,15 +1499,20 @@ fn fakeTools(f: *Fix, s: *mcp.Server, extra: []const u8) !Offer {
     return offer;
 }
 
-fn withMcp(f: *Fix, money: bool) !*mcp.Server {
+/// The fake MCP server, started under `name`.
+fn startFake(f: *Fix, name: []const u8) !*mcp.Server {
     const a = f.e.arena.allocator();
     const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, mcp_fake_path, a);
-    const s = try mcp.Server.start(t.allocator, t.io, .{ .name = "fake", .command = try std.fmt.allocPrint(a, "\"{s}\" --mcp", .{fake}), .secrets = &.{}, .money = &.{} }, .{
+    return mcp.Server.start(t.allocator, t.io, .{ .name = name, .command = try std.fmt.allocPrint(a, "\"{s}\" --mcp", .{fake}), .secrets = &.{}, .money = &.{} }, .{
         .workspace = f.run.env.workspace,
         .path_var = "/usr/bin:/bin",
         .home = "/tmp",
         .secret_values = &.{},
     });
+}
+
+fn withMcp(f: *Fix, money: bool) !*mcp.Server {
+    const s = try startFake(f, "fake");
     _ = try fakeTools(f, s, if (money) "money = echo, fail\namount = amount\n" else "");
     f.run.money_ledger = &f.ledger;
     return s;
@@ -1513,7 +1599,7 @@ test "money_dry_run_does_not_call_the_tool" {
     const req = try f.e.request(2);
     try t.expect(std.mem.indexOf(u8, req, "dry run: would call fake/echo") != null);
     try t.expect(std.mem.indexOf(u8, req, "home=") == null); // the server never ran it
-    try t.expectEqual(@as(f64, 0), f.ledger.total);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
 }
 
 test "money_in_scheduled_runs_only_when_switched_on" {
@@ -1535,7 +1621,7 @@ test "money_in_scheduled_runs_only_when_switched_on" {
     r = try f.say("buy");
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(4), "two") != null);
-    try t.expectEqual(@as(f64, 2), f.ledger.total);
+    try t.expectEqual(@as(f64, 2), f.ledger.sum());
 }
 
 test "helpers_never_get_money_tools" {
@@ -1566,7 +1652,7 @@ test "money_is_reserved_while_asked_and_released_when_denied" {
     const r = try f.say("buy");
     freeResult(&f.run, r);
     try t.expectEqual(@as(f64, 30), f.ledger_at_ask);
-    try t.expectEqual(@as(f64, 0), f.ledger.total);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
 }
 
 test "money_call_that_fails_still_counts" {
@@ -1579,7 +1665,7 @@ test "money_call_that_fails_still_counts" {
     try f.e.script(2, model.textReply("ok"));
     const r = try f.say("buy");
     freeResult(&f.run, r);
-    try t.expectEqual(@as(f64, 7), f.ledger.total);
+    try t.expectEqual(@as(f64, 7), f.ledger.sum());
 }
 
 test "unattended_money_needs_a_cap" {
@@ -1633,7 +1719,7 @@ test "money_tool_without_an_amount_field_is_refused_under_a_cap" {
     freeResult(&f.run, r);
     try t.expectEqual(0, f.asked);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "no amount field") != null);
-    try t.expectEqual(@as(f64, 0), f.ledger.total);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
 }
 
 test "a_money_tool_the_server_does_not_list_stops_the_server" {
@@ -1677,6 +1763,70 @@ test "mcp_tool_names_never_collide" {
     try t.expectEqualStrings("a__c", second.tools[0].def.name);
     try t.expect(std.mem.indexOf(u8, second.notes, "a: _b left out: another tool already has the name a___b") != null);
     try t.expect(std.mem.indexOf(u8, second.notes, "is longer than 64 characters") != null);
+}
+
+test "a_server_can_have_its_own_money_caps" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    // config.ini's [money] is the default; the server's section says less
+    f.run.money = .{ .max_per_call = 100 };
+    _ = try fakeTools(&f, s, "money = echo, fail\namount = amount\nmax_per_call = 10\n");
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":20}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "over the cap of 10 per call") != null);
+}
+
+test "each_server_keeps_its_own_day_total" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    const s2 = try startFake(&f, "other");
+    defer s2.deinit();
+    const cfgs = try mcp.parseConfig(a, "[other]\ncommand = x\nmoney = echo\namount = amount\n");
+    const second = try mcpTools(a, s2, cfgs[0], f.run.money, f.mcp_tools);
+    f.mcp_tools = try std.mem.concat(a, McpTool, &.{ f.mcp_tools, second.tools });
+    f.run.mcp = f.mcp_tools;
+    f.run.money = .{ .max_per_day = 50 };
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":30}"));
+    try f.e.script(2, model.toolReply("tu_2", "other__echo", "{\"text\":\"y\",\"amount\":30}"));
+    try f.e.script(3, model.toolReply("tu_3", "fake__echo", "{\"text\":\"z\",\"amount\":30}"));
+    try f.e.script(4, model.textReply("ok"));
+    const r = try f.say("buy on both");
+    freeResult(&f.run, r);
+    // 30 on each server is within its own 50; a second 30 on one is not
+    try t.expectEqual(2, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "over the cap of 50 per day (30 so far today)") != null);
+}
+
+test "money_ledger_keeps_a_total_per_server_and_reads_the_old_file" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const p = try std.fs.path.join(t.allocator, &.{ dir, "money" });
+    defer t.allocator.free(p);
+    // the file from before totals were kept per server
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "money", .data = "20000 40\n" });
+    var l: MoneyLedger = .{ .path = p };
+    l.load(t.io);
+    // that day's total counts for every server: none passes its cap anew
+    try t.expectEqual(@as(f64, 40), l.spent("broker", 20000));
+    try t.expectEqual(@as(f64, 40), l.spent("other", 20000));
+    try t.expectEqual(@as(f64, 0), l.spent("broker", 20001));
+    try t.expect(l.add(t.io, "broker", 20000, 5));
+    var again: MoneyLedger = .{ .path = p };
+    again.load(t.io);
+    try t.expectEqual(@as(f64, 45), again.spent("broker", 20000));
+    try t.expectEqual(@as(f64, 40), again.spent("other", 20000));
 }
 
 test "private_turns_are_left_out_of_summaries" {

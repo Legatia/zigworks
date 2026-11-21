@@ -36,6 +36,10 @@ pub const ServerConfig = struct {
     money: []const []const u8,
     /// `amount =`: where the money tools' inputs hold their amounts.
     amount: Amount = .unset,
+    /// `max_per_call =`, `max_per_day =`: this server's money caps (0: no
+    /// cap); null: the ones in config.ini's [money].
+    max_per_call: ?u32 = null,
+    max_per_day: ?u32 = null,
 };
 
 pub const EnvSecret = struct { env: []const u8, secret: []const u8 };
@@ -84,10 +88,10 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig,
         if (!validName(name)) return error.BadConfig;
         for (out.items) |o| if (std.mem.eql(u8, o.name, name)) return error.BadConfig;
         var cfg: ServerConfig = .{ .name = name, .command = "", .secrets = &.{}, .money = &.{} };
-        var seen: [4]bool = @splat(false);
+        var seen: [6]bool = @splat(false);
         while (i < ls.len and std.mem.eql(u8, ls[i].section, name)) : (i += 1) {
             const l = ls[i];
-            const keys = [_][]const u8{ "command", "secret", "money", "amount" };
+            const keys = [_][]const u8{ "command", "secret", "money", "amount", "max_per_call", "max_per_day" };
             const k = for (keys, 0..) |key, n| {
                 if (std.mem.eql(u8, l.key, key)) break n;
             } else return error.BadConfig;
@@ -118,10 +122,14 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig,
                     cfg.money = names;
                 },
                 3 => cfg.amount = try parseAmount(arena, l.value),
+                4 => cfg.max_per_call = std.fmt.parseInt(u32, l.value, 10) catch return error.BadConfig,
+                5 => cfg.max_per_day = std.fmt.parseInt(u32, l.value, 10) catch return error.BadConfig,
                 else => unreachable,
             }
         }
         if (cfg.command.len == 0) return error.BadConfig;
+        // caps are for money tools: without them they are a mistake
+        if ((cfg.max_per_call != null or cfg.max_per_day != null) and cfg.money.len == 0) return error.BadConfig;
         // an amount names money tools: without them it is a mistake
         switch (cfg.amount) {
             .unset => {},
@@ -777,6 +785,31 @@ test "parse_config_takes_the_amount_field_per_tool" {
         "[b]\ncommand = x\namount = usd\n", // an amount without money tools
         "[b]\ncommand = x\nmoney = p\namount = none\n", // none is said per tool
         "[b]\ncommand = x\nmoney = p\namount = notional usd\n",
+    };
+    for (bad) |text| {
+        if (parseConfig(a, text)) |_| {
+            std.debug.print("accepted: {s}\n", .{text});
+            return error.TestUnexpectedResult;
+        } else |e| try t.expectEqual(error.BadConfig, e);
+    }
+}
+
+test "parse_config_takes_money_caps_per_server" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const servers = try parseConfig(a, "[b]\ncommand = x\nmoney = p\namount = usd\nmax_per_call = 100\nmax_per_day = 0   ; none for this one\n[c]\ncommand = y\nmoney = q\n");
+    try t.expectEqual(100, servers[0].max_per_call.?);
+    try t.expectEqual(0, servers[0].max_per_day.?);
+    try t.expectEqual(null, servers[1].max_per_call);
+    try t.expectEqual(null, servers[1].max_per_day);
+    const bad = [_][]const u8{
+        "[b]\ncommand = x\nmoney = p\nmax_per_call = -1\n",
+        "[b]\ncommand = x\nmoney = p\nmax_per_call = 2.5\n",
+        "[b]\ncommand = x\nmoney = p\nmax_per_day = lots\n",
+        "[b]\ncommand = x\nmoney = p\nmax_per_day =\n",
+        "[b]\ncommand = x\nmax_per_day = 10\n", // a cap without money tools
+        "[b]\ncommand = x\nmoney = p\nmax_per_day = 1\nmax_per_day = 2\n",
     };
     for (bad) |text| {
         if (parseConfig(a, text)) |_| {
