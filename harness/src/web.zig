@@ -323,7 +323,10 @@ pub const Web = struct {
             break :blk p;
         };
         try page.prepareProfile(w.io, a, profile);
-        w.s = try cdp.Session.open(w.gpa, w.io, w.env.browser, profile, w.env.stop, w.env.timeout_ms, .{ .env = w.env.chrome_env });
+        // a login's cookies stay, those that end with the session too; its
+        // last tabs don't come back
+        if (w.login != null) try cdp.forgetLastTabs(w.io, a, profile);
+        w.s = try cdp.Session.open(w.gpa, w.io, w.env.browser, profile, w.env.stop, w.env.timeout_ms, .{ .env = w.env.chrome_env, .keep_session = w.login != null });
         if (w.login) |l| try w.loadPasskeys(a, l);
     }
 
@@ -1125,6 +1128,28 @@ test "web_login_cookies_survive_to_the_next_browser" {
     // a throwaway profile has none of them
     _ = try f.act(try f.openJson("c.html", null));
     try t.expectEqualStrings("\"\"", try f.eval("document.cookie"));
+}
+
+test "web_login_session_cookies_survive_and_no_old_tab_comes_back" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\n");
+    defer f.deinit();
+    try f.page("c.html", "<html><body><p>cookies</p></body></html>");
+    try f.page("last.html", "<html><body><script>localStorage.setItem('last', String(Number(localStorage.getItem('last') || 0) + 1))</script></body></html>");
+    _ = try f.act(try f.openJson("c.html", "agent"));
+    // most sign-ins: a cookie that ends with the session
+    _ = try f.eval("document.cookie = 'sid=7; path=/'");
+    // the last page of a browser is not opened again by the next one
+    _ = try f.act(try f.openJson("last.html", "agent"));
+    try t.expectEqualStrings("\"1\"", try f.eval("localStorage.getItem('last')"));
+    _ = try f.act("{\"action\":\"close\"}");
+    for (0..2) |_| {
+        _ = try f.act(try f.openJson("c.html", "agent"));
+        try expectHas(try f.eval("document.cookie"), "sid=7");
+        try t.expectEqual(1, try pageTargets(&f));
+        try t.expectEqualStrings("\"1\"", try f.eval("localStorage.getItem('last')"));
+        _ = try f.act("{\"action\":\"close\"}");
+    }
 }
 
 test "web_profiles_keep_no_saved_passwords" {

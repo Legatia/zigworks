@@ -311,6 +311,11 @@ pub const Session = struct {
     pub const Options = struct {
         /// The browser's whole environment.
         env: page.BrowserEnv = .{},
+        /// Chrome's "continue where you left off" (--restore-last-session):
+        /// cookies that end with the session are kept for the next. The
+        /// caller removes the tabs it would bring back (see
+        /// forgetLastTabs).
+        keep_session: bool = false,
     };
 
     /// Starts `browser` with `profile_dir` and attaches to its page.
@@ -337,6 +342,7 @@ pub const Session = struct {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(a, &.{ "/bin/sh", "-c", "exec \"$@\" 3<&0 4>&1 0</dev/null 1>/dev/null", "sh", browser });
         try argv.appendSlice(a, &page.browser_flags);
+        if (opts.keep_session) try argv.append(a, "--restore-last-session");
         try argv.appendSlice(a, &.{ "--remote-debugging-pipe", try std.fmt.allocPrint(a, "--user-data-dir={s}", .{profile_dir}), "about:blank" });
         var vars = try opts.env.map(a);
         s.child = try std.process.spawn(s.io, .{
@@ -710,6 +716,16 @@ pub const Session = struct {
         s.gpa.destroy(s);
     }
 };
+
+/// Removes what Chrome would open again from `profile`'s last session (its
+/// tabs and windows): with keep_session only its cookies come back, and
+/// no page is loaded that the gate was not asked about.
+pub fn forgetLastTabs(io: Io, a: Allocator, profile: []const u8) !void {
+    for ([_][]const u8{ "Sessions", "Sessions_Encrypted", "Current Session", "Current Tabs", "Last Session", "Last Tabs" }) |name| {
+        // (one that is not there is no error)
+        try Io.Dir.cwd().deleteTree(io, try std.fs.path.join(a, &.{ profile, "Default", name }));
+    }
+}
 
 /// How long after a click or key a navigation may take to start.
 pub const nav_grace_ms = 600;
