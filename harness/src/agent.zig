@@ -261,8 +261,10 @@ pub const Offer = struct {
 };
 
 /// The tools of a started server, as its mcp.ini section `cfg` says;
-/// `caps`: config.ini's [money].
-pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, cfg: mcp.ServerConfig, caps: config.Config.Money) !Offer {
+/// `caps`: config.ini's [money]; `taken`: the tools of the servers before
+/// it. A name the model would see twice is offered once (the first), so
+/// one name always means one tool.
+pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, cfg: mcp.ServerConfig, caps: config.Config.Money, taken: []const McpTool) !Offer {
     // a money tool the server does not have is a typo for one it has,
     // which would then be offered as an ordinary tool: none are offered
     for (cfg.money) |m| {
@@ -279,7 +281,21 @@ pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, cfg: mcp.ServerConfig,
             is_money = true;
         };
         const name = try std.fmt.allocPrint(arena, "{s}__{s}", .{ tl.server, tl.name });
-        if (name.len > 64) continue;
+        // what model APIs take as a tool name: [A-Za-z0-9_-]{1,64}
+        if (name.len > 64) {
+            try notes.print(arena, "{s}: {s} left out: {s} is longer than 64 characters\n", .{ tl.server, tl.name, name });
+            continue;
+        }
+        const dup = blk: {
+            for ([_][]const McpTool{ taken, out.items }) |list| {
+                for (list) |m| if (std.mem.eql(u8, m.def.name, name)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (dup) {
+            try notes.print(arena, "{s}: {s} left out: another tool already has the name {s}\n", .{ tl.server, tl.name, name });
+            continue;
+        }
         const desc = if (is_money) try std.fmt.allocPrint(arena, "{s} (Moves money: the owner approves every call.)", .{tl.description}) else tl.description;
         const field: mcp.Field = if (is_money) cfg.amount.of(tl.name) else .unset;
         if (is_money and field == .unset and capped)
@@ -1396,7 +1412,7 @@ const mcp_fake_path = if (@import("builtin").is_test) @import("build_options").f
 fn fakeTools(f: *Fix, s: *mcp.Server, extra: []const u8) !Offer {
     const a = f.e.arena.allocator();
     const cfgs = try mcp.parseConfig(a, try std.fmt.allocPrint(a, "[fake]\ncommand = x\n{s}", .{extra}));
-    const offer = try mcpTools(a, s, cfgs[0], f.run.money);
+    const offer = try mcpTools(a, s, cfgs[0], f.run.money, &.{});
     f.mcp_tools = offer.tools;
     f.run.mcp = f.mcp_tools;
     return offer;
@@ -1631,6 +1647,36 @@ test "a_money_tool_the_server_does_not_list_stops_the_server" {
     try t.expectEqual(0, offer.tools.len);
     try t.expect(std.mem.indexOf(u8, offer.refused.?, "money = names \"ech\", which is not one of its tools") != null);
     try t.expectEqual(null, (try fakeTools(&f, s, "money = echo\namount = amount\n")).refused);
+}
+
+test "mcp_tool_names_never_collide" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const tool = struct {
+        fn of(server: []const u8, name: []const u8) mcp.Tool {
+            return .{ .server = server, .name = name, .description = "", .schema_json = "{}" };
+        }
+    }.of;
+    const long: [62]u8 = @splat('x'); // a__ and this: 65
+    // only the tool list is read
+    var one: mcp.Server = undefined;
+    one.name = "a_";
+    one.tool_list = try a.dupe(mcp.Tool, &.{ tool("a_", "b"), tool("a_", "b") });
+    var two: mcp.Server = undefined;
+    two.name = "a";
+    two.tool_list = try a.dupe(mcp.Tool, &.{ tool("a", "_b"), tool("a", &long), tool("a", "c") });
+    const cfg: mcp.ServerConfig = .{ .name = "a", .command = "x", .secrets = &.{}, .money = &.{} };
+    const first = try mcpTools(a, &one, cfg, .{}, &.{});
+    // the server listed b twice: the model gets it once
+    try t.expectEqual(1, first.tools.len);
+    try t.expectEqualStrings("a___b", first.tools[0].def.name);
+    // a's _b is also "a___b": the first server's keeps the name
+    const second = try mcpTools(a, &two, cfg, .{}, first.tools);
+    try t.expectEqual(1, second.tools.len);
+    try t.expectEqualStrings("a__c", second.tools[0].def.name);
+    try t.expect(std.mem.indexOf(u8, second.notes, "a: _b left out: another tool already has the name a___b") != null);
+    try t.expect(std.mem.indexOf(u8, second.notes, "is longer than 64 characters") != null);
 }
 
 test "private_turns_are_left_out_of_summaries" {

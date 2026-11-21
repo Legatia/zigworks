@@ -846,7 +846,7 @@ pub const Core = struct {
                 c.log.write(.config, false, .{ .event = "mcp failed", .server = sc.name, .why = @errorName(e), .detail = detail }) catch {};
                 continue;
             };
-            const offer = agent.mcpTools(a, srv, sc, c.cfg.money) catch agent.Offer{ .tools = &.{}, .refused = "out of memory" };
+            const offer = agent.mcpTools(a, srv, sc, c.cfg.money, all.items) catch agent.Offer{ .tools = &.{}, .refused = "out of memory" };
             if (offer.refused) |why| {
                 srv.deinit();
                 note.print(a, "{s}: not started: {s}\n", .{ sc.name, why }) catch {};

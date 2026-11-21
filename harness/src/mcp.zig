@@ -25,7 +25,8 @@ const protocol_version = "2025-06-18";
 // ---- mcp.ini ----
 
 pub const ServerConfig = struct {
-    /// Section name, [a-z0-9_-]{1,32}.
+    /// Section name, [a-z0-9_-]{1,32} without "__" (the model sees its
+    /// tools as "server__tool").
     name: []const u8,
     /// Whole command line, split on spaces; "double quotes" group.
     command: []const u8,
@@ -173,7 +174,7 @@ fn items(arena: std.mem.Allocator, value: []const u8) error{ BadConfig, OutOfMem
 }
 
 fn validName(name: []const u8) bool {
-    if (name.len == 0 or name.len > 32) return false;
+    if (name.len == 0 or name.len > 32 or std.mem.indexOf(u8, name, "__") != null) return false;
     for (name) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_' or c == '-')) return false;
     return true;
 }
@@ -735,6 +736,7 @@ test "parse_config_refuses_bad_lines" {
         "[a]\ncommand = \"unterminated\n",
         "[a]\ncommand = x\n[a]\ncommand = y\n", // same server twice
         "[a]\njust words\n",
+        "[a__b]\ncommand = x\n", // a__b's tool c and a's tool b__c would both be a__b__c
     };
     for (bad) |text| {
         if (parseConfig(a, text)) |_| {
