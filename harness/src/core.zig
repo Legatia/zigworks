@@ -846,11 +846,18 @@ pub const Core = struct {
                 c.log.write(.config, false, .{ .event = "mcp failed", .server = sc.name, .why = @errorName(e), .detail = detail }) catch {};
                 continue;
             };
+            const offer = agent.mcpTools(a, srv, sc, c.cfg.money) catch agent.Offer{ .tools = &.{}, .refused = "out of memory" };
+            if (offer.refused) |why| {
+                srv.deinit();
+                note.print(a, "{s}: not started: {s}\n", .{ sc.name, why }) catch {};
+                warn.print(a, "{s}: not started: {s}\n", .{ sc.name, why }) catch {};
+                c.log.write(.config, false, .{ .event = "mcp refused", .server = sc.name, .why = why }) catch {};
+                continue;
+            }
             c.mcp_servers.append(c.gpa, srv) catch {
                 srv.deinit();
                 continue;
             };
-            const offer = agent.mcpTools(a, srv, sc, c.cfg.money) catch agent.Offer{ .tools = &.{} };
             all.appendSlice(a, offer.tools) catch {};
             note.print(a, "{s} ({d} tools)\n{s}", .{ sc.name, offer.tools.len, offer.notes }) catch {};
             warn.appendSlice(a, offer.notes) catch {};
@@ -2048,6 +2055,20 @@ test "status_says_which_money_tools_have_no_amount_field" {
     try t.expect(std.mem.indexOf(u8, f.core.mcp_warn, "fake: echo has no amount field") != null);
     try f.core.handleText("/status");
     try f.rec.waitFor("fake: echo has no amount field in mcp.ini");
+}
+
+test "a_server_whose_money_list_names_a_missing_tool_is_not_started" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\nmoney = echo, place_order\namount = amount\n", .{fake}) });
+    _ = try f.core.reload();
+    try t.expectEqual(0, f.core.mcp_servers.items.len);
+    try t.expectEqual(0, f.core.mcp_tools.len);
+    try f.core.handleText("/status");
+    try f.rec.waitFor("fake: not started: money = names \"place_order\", which is not one of its tools");
 }
 
 test "mcp_start_errors_are_masked_in_the_log" {

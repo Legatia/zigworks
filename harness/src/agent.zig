@@ -256,11 +256,20 @@ pub const Offer = struct {
     tools: []McpTool,
     /// One line each, "SERVER: ...\n".
     notes: []const u8 = "",
+    /// Why the server must not be used at all (it is stopped); then no tools.
+    refused: ?[]const u8 = null,
 };
 
 /// The tools of a started server, as its mcp.ini section `cfg` says;
 /// `caps`: config.ini's [money].
 pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, cfg: mcp.ServerConfig, caps: config.Config.Money) !Offer {
+    // a money tool the server does not have is a typo for one it has,
+    // which would then be offered as an ordinary tool: none are offered
+    for (cfg.money) |m| {
+        for (s.tools()) |tl| {
+            if (std.mem.eql(u8, tl.name, m)) break;
+        } else return .{ .tools = &.{}, .refused = try std.fmt.allocPrint(arena, "money = names \"{s}\", which is not one of its tools", .{m}) };
+    }
     var out: std.ArrayList(McpTool) = .empty;
     var notes: std.ArrayList(u8) = .empty;
     const capped = caps.max_per_call > 0 or caps.max_per_day > 0;
@@ -1609,6 +1618,19 @@ test "money_tool_without_an_amount_field_is_refused_under_a_cap" {
     try t.expectEqual(0, f.asked);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "no amount field") != null);
     try t.expectEqual(@as(f64, 0), f.ledger.total);
+}
+
+test "a_money_tool_the_server_does_not_list_stops_the_server" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, false);
+    defer s.deinit();
+    // a typo: the real tool would be offered as an ordinary MCP tool
+    const offer = try fakeTools(&f, s, "money = echo, ech\namount = amount\n");
+    try t.expectEqual(0, offer.tools.len);
+    try t.expect(std.mem.indexOf(u8, offer.refused.?, "money = names \"ech\", which is not one of its tools") != null);
+    try t.expectEqual(null, (try fakeTools(&f, s, "money = echo\namount = amount\n")).refused);
 }
 
 test "private_turns_are_left_out_of_summaries" {
