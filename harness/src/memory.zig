@@ -5,6 +5,7 @@
 //! closer the match must be.
 const std = @import("std");
 const util = @import("util.zig");
+const scrub = @import("scrub.zig");
 const Io = std.Io;
 
 pub const Level = enum { pinned, top, middle, bottom };
@@ -185,6 +186,8 @@ pub const Store = struct {
     io: Io,
     dir: []u8,
     items: std.ArrayList(*Item) = .empty,
+    /// Stored secrets: masked as `[secret:NAME]` in every item written.
+    secrets: []const scrub.Secret = &.{},
 
     pub fn load(gpa: std.mem.Allocator, io: Io, dir: []const u8) !Store {
         try Io.Dir.cwd().createDirPath(io, dir);
@@ -238,7 +241,9 @@ pub const Store = struct {
         var arena: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const body = std.mem.trim(u8, util.cut(body_in, max_body), " \t\r\n");
+        var sc = try scrub.Scrubber.init(a, s.secrets);
+        const masked = try sc.scrubAlloc(a, body_in);
+        const body = std.mem.trim(u8, util.cut(masked, max_body), " \t\r\n");
         if (body.len == 0) return error.EmptyMemory;
         var ts = if (given_terms) |g| blk: {
             var lowered: std.ArrayList([]const u8) = .empty;
@@ -657,6 +662,19 @@ test "a_repeat_by_the_agent_or_the_writer_is_not_a_mention" {
     try t.expect(again.merged);
     try t.expectEqualStrings(first.id, again.id);
     try t.expectEqual(1, f.store.items.items[0].mentions.items.len);
+}
+
+test "a_secret_in_an_item_is_masked" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    f.store.secrets = &.{.{ .name = "omnigate", .value = "og-secret-value-123" }};
+    const r = try f.store.add("my omnigate key is og-secret-value-123", null, now);
+    try t.expectEqualStrings("my omnigate key is [secret:omnigate]", f.store.find(r.id).?.body);
+    var d = try Io.Dir.cwd().openDir(t.io, f.store.dir, .{});
+    defer d.close(t.io);
+    const file = try d.readFileAlloc(t.io, try std.fmt.allocPrint(f.arena.allocator(), "{s}.md", .{r.id}), f.arena.allocator(), .unlimited);
+    try t.expect(std.mem.indexOf(u8, file, "og-secret-value-123") == null);
 }
 
 test "files_round_trip" {

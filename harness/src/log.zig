@@ -4,6 +4,7 @@
 //! file can rewrite the whole chain.
 const std = @import("std");
 const util = @import("util.zig");
+const scrub = @import("scrub.zig");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -22,6 +23,8 @@ pub const Log = struct {
     seq: u64,
     last: [64]u8,
     mutex: Io.Mutex = .init,
+    /// Masks the stored secrets in every string written (`setSecrets`).
+    scrubber: ?scrub.Scrubber = null,
 
     /// Opens (or creates) the log, drops a last line cut off by a crash and
     /// notes that it did.
@@ -57,7 +60,20 @@ pub const Log = struct {
     }
 
     pub fn close(l: *Log) void {
+        if (l.scrubber) |*sc| sc.deinit();
         l.file.close(l.io);
+    }
+
+    /// From now on every string field written has these values masked as
+    /// `[secret:NAME]`; call again when the list changes. The values must
+    /// outlive the log.
+    pub fn setSecrets(l: *Log, secrets: []const scrub.Secret) !void {
+        var sc = try scrub.Scrubber.init(l.gpa, secrets);
+        errdefer sc.deinit();
+        l.mutex.lockUncancelable(l.io);
+        defer l.mutex.unlock(l.io);
+        if (l.scrubber) |*old| old.deinit();
+        l.scrubber = sc;
     }
 
     /// Whether some line near the end of the log hashes to `h`: the log
@@ -98,9 +114,10 @@ pub const Log = struct {
         try line.print(gpa, "{{\"seq\":{d},\"time\":\"{s}\",\"kind\":\"{s}\"", .{ l.seq + 1, util.isoTime(&tbuf, util.nowSeconds(l.io)), @tagName(kind) });
         const T = @TypeOf(fields);
         const info = @typeInfo(T).@"struct";
+        const sc: ?*scrub.Scrubber = if (l.scrubber) |*x| x else null;
         inline for (info.field_names) |name| {
             try line.print(gpa, ",\"{s}\":", .{name});
-            try value(&line, gpa, name, @field(fields, name), private);
+            try value(&line, gpa, name, @field(fields, name), private, sc);
         }
         try line.print(gpa, ",\"prev\":\"{s}\"}}", .{l.last});
         const h = hashLine(line.items);
@@ -112,17 +129,21 @@ pub const Log = struct {
     }
 };
 
-fn value(line: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime name: []const u8, v: anytype, private: bool) !void {
+fn value(line: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime name: []const u8, v: anytype, private: bool, sc: ?*scrub.Scrubber) !void {
     const V = @TypeOf(v);
     switch (@typeInfo(V)) {
-        .optional => if (v) |inner| return value(line, gpa, name, inner, private) else return line.appendSlice(gpa, "null"),
+        .optional => if (v) |inner| return value(line, gpa, name, inner, private, sc) else return line.appendSlice(gpa, "null"),
         .bool => return line.appendSlice(gpa, if (v) "true" else "false"),
         .int, .comptime_int => return line.print(gpa, "{d}", .{v}),
         .float, .comptime_float => return line.print(gpa, "{d}", .{v}),
         .@"enum", .enum_literal => return util.jsonString(line, gpa, @tagName(v)),
         else => {},
     }
-    const s: []const u8 = v;
+    const raw: []const u8 = v;
+    // a value the owner typed or a tool read never reaches the file
+    const masked: ?[]u8 = if (sc) |x| try x.scrubAlloc(gpa, raw) else null;
+    defer if (masked) |m| gpa.free(m);
+    const s: []const u8 = masked orelse raw;
     const kept = comptime (std.mem.eql(u8, name, "tool") or std.mem.eql(u8, name, "decision") or std.mem.eql(u8, name, "why"));
     if (private and !kept) {
         var d: [32]u8 = undefined;
@@ -275,6 +296,24 @@ test "private_lines_keep_only_metadata" {
     try t.expect(std.mem.indexOf(u8, text, "diary") == null);
     try t.expect(std.mem.indexOf(u8, text, "\"tool\":\"shell\"") != null);
     try t.expect(std.mem.indexOf(u8, text, "\"arg\":{\"bytes\":13,\"sha256\":\"") != null);
+}
+
+test "secrets_are_masked_in_every_field" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const path = try tmpPath(&tmp, arena.allocator());
+    var l = try Log.open(t.allocator, t.io, path);
+    try l.setSecrets(&.{.{ .name = "omnigate", .value = "og-secret-value-123" }});
+    try l.write(.turn, false, .{ .run = "chat", .text = "my key is og-secret-value-123, keep it", .why = "og-secret-value-123" });
+    try l.write(.tool, true, .{ .tool = "og-secret-value-123", .arg = "og-secret-value-123" });
+    l.close();
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, path, arena.allocator(), .unlimited);
+    try t.expect(std.mem.indexOf(u8, text, "og-secret-value-123") == null);
+    try t.expect(std.mem.indexOf(u8, text, "\"text\":\"my key is [secret:omnigate], keep it\"") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"tool\":\"[secret:omnigate]\"") != null);
+    try t.expectEqual(null, (try verify(t.io, path)).broken_at);
 }
 
 test "long_fields_are_cut_at_2kb" {

@@ -286,8 +286,10 @@ pub const Core = struct {
         try Io.Dir.cwd().createDirPath(io, c.paths.log_dir);
         c.log = try log_mod.Log.open(gpa, io, c.paths.log);
         errdefer c.log.close();
+        try c.log.setSecrets(c.secret_list);
         c.mem = try memory.Store.load(gpa, io, c.paths.memory);
         errdefer c.mem.deinit();
+        c.mem.secrets = c.secret_list;
         c.seen = .init(gpa);
         c.seen.load(io, c.paths.seen) catch {};
         c.lock = .init;
@@ -2268,6 +2270,22 @@ test "the_owner_hears_of_every_memory_the_agent_or_the_writer_saves" {
     try f.rec.waitFor("Saved to memory: The owner plays chess on Sundays (/forget ");
     // what was known already is not said again
     try t.expectEqual(1, f.rec.count("sister is called Ada (/forget"));
+}
+
+test "secrets_the_owner_types_are_masked_in_the_log_and_memory" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const key = f.core.secrets.omnigate.?;
+    const a = f.e.arena.allocator();
+    try f.e.script(1, model.textReply("I will not repeat it."));
+    f.core.chatTurn(try std.fmt.allocPrint(a, "my omnigate key is {s}", .{key}));
+    try f.core.handleText(try std.fmt.allocPrint(a, "/remember my omnigate key is {s}", .{key}));
+    try f.rec.waitFor("Remembered as");
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, key) == null);
+    try t.expect(std.mem.indexOf(u8, lt, "my omnigate key is [secret:omnigate]") != null);
+    try t.expectEqualStrings("my omnigate key is [secret:omnigate]", f.core.mem.items.items[0].body);
 }
 
 test "memory_writer_reads_only_new_turns_and_knows_what_is_kept" {
