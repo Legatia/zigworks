@@ -658,4 +658,5 @@ test {
     _ = @import("page.zig");
     _ = @import("totp.zig");
     _ = @import("logins.zig");
+    _ = @import("cdp.zig");
 }
