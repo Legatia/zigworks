@@ -357,9 +357,12 @@ topic go in; the brief says how many more there were, and those are not
 sent later. A quiet day costs no model call. A feed's redirect is
 followed on its own host, to another host only with an `allow fetch` rule
 or a grant. A brief missed while harness was down runs when it starts. A
-brief or task whose answer does not get through runs again after 5
-minutes, then 10, 20 … up to 2 hours. `/brief` sends one now; `/topic add`
-and `/topic rm` change the topics from chat.
+brief or task whose message does not get through is sent again as it was
+written after 5 minutes, then 10, 20 … up to 2 hours; nothing is fetched,
+written or run again for it, and it does not run again until it is
+delivered. The message is kept in memory only: after a restart the brief
+or task runs again. `/brief` sends one now; `/topic add` and `/topic rm`
+change the topics from chat.
 
 ## Scheduled tasks
 

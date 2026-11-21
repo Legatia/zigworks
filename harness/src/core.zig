@@ -282,7 +282,8 @@ pub const Core = struct {
     running: std.StringHashMapUnmanaged(void) = .empty,
     paused: std.StringHashMapUnmanaged(void) = .empty,
     /// Briefs and tasks whose message did not get through, by the same
-    /// keys as `ran`: when they run again.
+    /// keys as `ran`: the message, and when it is sent again. Kept in
+    /// memory only: after a restart such a brief or task runs again.
     retry: std.StringHashMapUnmanaged(Retry) = .empty,
     last_status_s: i64 = 0,
 
@@ -462,6 +463,8 @@ pub const Core = struct {
         freeKeys(c.gpa, &c.ran);
         freeKeys(c.gpa, &c.running);
         freeKeys(c.gpa, &c.paused);
+        var kept = c.retry.valueIterator();
+        while (kept.next()) |r| r.msg.deinit(c.gpa);
         freeKeys(c.gpa, &c.retry);
         c.releaseFolder();
         c.settings_arena.deinit();
@@ -1494,13 +1497,15 @@ pub const Core = struct {
         if (c.stop.load(.acquire)) return;
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
+        // messages that did not get through go again when their wait is over
+        c.resendDue(now_s);
         const today = c.localDay(now_s);
         const minutes = c.localMinutes(now_s);
         for (c.briefs) |b| {
             if (minutes < b.at_minutes) continue;
             const key = keyFor("brief", b.name);
             if ((c.getRan(key.slice()) orelse -1) >= today) continue;
-            if (c.retryLater(key.slice(), now_s)) continue;
+            if (c.waitsToBeSent(key.slice())) continue;
             _ = c.startBackground(.{ .brief = b }, key.slice(), now_s);
         }
         const weekday = util.weekday(today);
@@ -1515,18 +1520,60 @@ pub const Core = struct {
                 if (minutes < at) continue;
                 if (last) |l| if (c.localDay(l) >= today) continue;
             }
-            if (c.retryLater(key.slice(), now_s)) continue;
+            if (c.waitsToBeSent(key.slice())) continue;
             _ = c.startBackground(.{ .task = tk }, key.slice(), now_s);
         }
     }
 
-    /// Whether `key`'s last message did not get through and it waits
-    /// before it runs again.
-    fn retryLater(c: *Core, key: []const u8, now_s: i64) bool {
+    /// Whether `key`'s last message did not get through: until it has, the
+    /// brief or task does not run again (`resendDue` sends it).
+    fn waitsToBeSent(c: *Core, key: []const u8) bool {
         c.state_mutex.lockUncancelable(c.io);
         defer c.state_mutex.unlock(c.io);
-        const r = c.retry.get(key) orelse return false;
-        return now_s < r.at;
+        return c.retry.contains(key);
+    }
+
+    /// Starts sending again each kept message whose wait is over.
+    fn resendDue(c: *Core, now_s: i64) void {
+        var due: [16]Key = undefined;
+        var n: usize = 0;
+        {
+            c.state_mutex.lockUncancelable(c.io);
+            defer c.state_mutex.unlock(c.io);
+            var it = c.retry.iterator();
+            while (it.next()) |e| {
+                if (n == due.len) break;
+                if (now_s < e.value_ptr.at or c.running.contains(e.key_ptr.*)) continue;
+                const k = e.key_ptr.*;
+                due[n] = .{};
+                if (k.len > due[n].buf.len) continue;
+                @memcpy(due[n].buf[0..k.len], k);
+                due[n].len = k.len;
+                n += 1;
+            }
+        }
+        for (due[0..n]) |*k| _ = c.startBackground(.resend, k.slice(), now_s);
+    }
+
+    /// A message kept for `key` (it did not get through): from now on it is
+    /// what goes, after a wait of 5 minutes, then 10, 20, … 2 hours. A
+    /// message kept before for the key is replaced. Under state_mutex.
+    fn keepUndelivered(c: *Core, key: []const u8, msg: Undelivered, ran: i64, now_s: i64) void {
+        var tries: u32 = 1;
+        if (c.retry.getPtr(key)) |old| {
+            tries = old.tries + 1;
+            old.msg.deinit(c.gpa);
+            old.msg = .{ .text = &.{} };
+        }
+        putKey(c.gpa, &c.retry, key, Retry{ .at = now_s + retryWait(tries), .tries = tries, .msg = msg, .ran = ran }) catch msg.deinit(c.gpa);
+    }
+
+    /// Drops the message kept for `key`, if any. Under state_mutex.
+    fn dropUndelivered(c: *Core, key: []const u8) void {
+        if (c.retry.fetchRemove(key)) |kv| {
+            kv.value.msg.deinit(c.gpa);
+            c.gpa.free(kv.key);
+        }
     }
 
     const Key = struct {
@@ -1556,7 +1603,9 @@ pub const Core = struct {
         return c.paused.contains(name);
     }
 
-    const Job = union(enum) { brief: config.Brief, task: config.Task };
+    /// A brief or task to run, or a message of one to send again (the
+    /// key's, in `retry`).
+    const Job = union(enum) { brief: config.Brief, task: config.Task, resend };
 
     const Start = enum { started, already_running, restarting, slots_taken, failed };
 
@@ -1590,43 +1639,126 @@ pub const Core = struct {
             c.state_mutex.unlock(c.io);
             _ = c.bg_active.fetchSub(1, .acq_rel);
         }
+        if (job == .resend) return c.resend(key);
         // a run that failed or was stopped still counts for its slot, so
         // the scheduler does not start it again right away
+        var kept: ?Undelivered = null;
         const outcome: Outcome = switch (job) {
-            .brief => |b| c.runBrief(b) catch .done,
-            .task => |tk| c.runTask(tk) catch .done,
+            .brief => |b| c.runBriefKeeping(b, &kept) catch .done,
+            .task => |tk| c.runTaskKeeping(tk, &kept) catch .done,
+            .resend => unreachable,
         };
-        const now_s = c.now();
-        c.state_mutex.lockUncancelable(c.io);
-        defer c.state_mutex.unlock(c.io);
-        if (outcome == .undelivered) {
-            // not counted as run: again in 5 minutes, then 10, 20, … 2 hours
-            const tries: u32 = if (c.retry.get(key)) |r| r.tries + 1 else 1;
-            const wait = @min(@as(i64, 5 * 60) << @intCast(@min(tries - 1, 8)), 2 * 3600);
-            putKey(c.gpa, &c.retry, key, Retry{ .at = now_s + wait, .tries = tries }) catch {};
-            return;
-        }
-        removeKey(c.gpa, &c.retry, key);
         // the day it was due, though it may have ended after midnight
         const v: i64 = switch (job) {
             .brief => c.localDay(due_s),
             .task => due_s,
+            .resend => unreachable,
         };
+        const now_s = c.now();
+        c.state_mutex.lockUncancelable(c.io);
+        defer c.state_mutex.unlock(c.io);
+        if (outcome == .undelivered) if (kept) |msg| {
+            // not counted as run until its message is delivered
+            c.keepUndelivered(key, msg, v, now_s);
+            return;
+        };
+        // a message kept from before is not sent after this one
+        c.dropUndelivered(key);
         putKey(c.gpa, &c.ran, key, v) catch {};
         c.saveRan();
+    }
+
+    /// Sends again the message kept for `key`. Delivered, the brief or task
+    /// counts as run when it was due, and a brief's links as seen.
+    fn resend(c: *Core, key: []const u8) void {
+        // the entry stays while it is sent; only this key's run (which
+        // `running` keeps from starting) changes or drops it
+        const r = blk: {
+            c.state_mutex.lockUncancelable(c.io);
+            defer c.state_mutex.unlock(c.io);
+            break :blk c.retry.get(key) orelse return;
+        };
+        const kp = keyParts(key);
+        c.deliver(r.msg.text) catch |e| {
+            c.log.write(kp.kind, false, .{ .name = kp.name, .event = "not delivered", .why = whyUndelivered(e), .tries = r.tries + 1 }) catch {};
+            c.state_mutex.lockUncancelable(c.io);
+            defer c.state_mutex.unlock(c.io);
+            if (worthRetry(e)) {
+                if (c.retry.getPtr(key)) |p| {
+                    p.tries += 1;
+                    p.at = c.now() + retryWait(p.tries);
+                }
+                return;
+            }
+            c.dropUndelivered(key);
+            putKey(c.gpa, &c.ran, key, r.ran) catch {};
+            c.saveRan();
+            return;
+        };
+        c.log.write(kp.kind, false, .{ .name = kp.name, .event = "sent", .tries = r.tries + 1 }) catch {};
+        c.markSeen(r.msg.links) catch {};
+        c.state_mutex.lockUncancelable(c.io);
+        defer c.state_mutex.unlock(c.io);
+        c.dropUndelivered(key);
+        putKey(c.gpa, &c.ran, key, r.ran) catch {};
+        c.saveRan();
+    }
+
+    /// The links of a delivered brief count as seen from now.
+    fn markSeen(c: *Core, links: []const []const u8) !void {
+        if (links.len == 0) return;
+        c.seen_mutex.lockUncancelable(c.io);
+        defer c.seen_mutex.unlock(c.io);
+        const now_s = c.now();
+        for (links) |l| try c.seen.add(l, now_s);
+        c.seen.prune(now_s);
+        c.seen.save(c.io, c.paths.seen) catch {};
     }
 
     /// How a brief or task run ended, for the scheduler.
     pub const Outcome = enum {
         /// Done, failed or stopped: it waits for its next time.
         done,
-        /// Its message did not get through: it runs again a little later.
+        /// Its message did not get through: it is sent again a little later.
         undelivered,
+    };
+
+    /// A message that did not get through, kept to be sent again as it is.
+    pub const Undelivered = struct {
+        text: []u8,
+        /// A brief's links: seen once it is delivered.
+        links: [][]u8 = &.{},
+
+        fn of(gpa: std.mem.Allocator, text: []const u8, links: []const []const u8) !Undelivered {
+            const out_links = try gpa.alloc([]u8, links.len);
+            var n: usize = 0;
+            errdefer {
+                for (out_links[0..n]) |l| gpa.free(l);
+                gpa.free(out_links);
+            }
+            for (links) |l| {
+                out_links[n] = try gpa.dupe(u8, l);
+                n += 1;
+            }
+            return .{ .text = try gpa.dupe(u8, text), .links = out_links };
+        }
+
+        fn deinit(u: Undelivered, gpa: std.mem.Allocator) void {
+            for (u.links) |l| gpa.free(l);
+            gpa.free(u.links);
+            gpa.free(u.text);
+        }
     };
 
     /// Collects, writes and sends a brief. Its items count as seen only
     /// once it got through.
     pub fn runBrief(c: *Core, b: config.Brief) !Outcome {
+        return c.runBriefKeeping(b, null);
+    }
+
+    /// runBrief; a brief that did not get through is kept in `keep` (when
+    /// given), to be sent again as it was written.
+    fn runBriefKeeping(c: *Core, b: config.Brief, keep: ?*?Undelivered) !Outcome {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1650,19 +1782,22 @@ pub const Core = struct {
         if (flag.load(.acquire)) return .done;
         c.deliver(w.text) catch |e| {
             try c.log.write(.brief, false, .{ .name = b.name, .event = "not delivered", .why = whyUndelivered(e) });
-            return if (worthRetry(e)) .undelivered else .done;
+            if (!worthRetry(e)) return .done;
+            if (keep) |k| k.* = try .of(c.gpa, w.text, w.links);
+            return .undelivered;
         };
-        c.seen_mutex.lockUncancelable(c.io);
-        defer c.seen_mutex.unlock(c.io);
-        const now_s = c.now();
-        for (w.links) |l| try c.seen.add(l, now_s);
-        c.seen.prune(now_s);
-        c.seen.save(c.io, c.paths.seen) catch {};
+        try c.markSeen(w.links);
         return .done;
     }
 
     /// Runs a scheduled task once.
     pub fn runTask(c: *Core, tk: config.Task) !Outcome {
+        return c.runTaskKeeping(tk, null);
+    }
+
+    /// runTask; an answer that did not get through is kept in `keep` (when
+    /// given), to be sent again as it is: the task does not run again for it.
+    fn runTaskKeeping(c: *Core, tk: config.Task, keep: ?*?Undelivered) !Outcome {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1709,7 +1844,9 @@ pub const Core = struct {
             try std.fmt.allocPrint(a, "[{s}] {s}{s}{s}", .{ tk.name, res.text, if (note.len > 0) "\n\n" else "", note });
         c.deliver(msg) catch |e| {
             try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = whyUndelivered(e) });
-            return if (worthRetry(e)) .undelivered else .done;
+            if (!worthRetry(e)) return .done;
+            if (keep) |k| k.* = try .of(c.gpa, msg, &.{});
+            return .undelivered;
         };
         try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = true });
         return .done;
@@ -2122,8 +2259,29 @@ pub fn removeSection(a: std.mem.Allocator, text: []const u8, name: []const u8) !
     return out.items;
 }
 
-/// When a brief or task whose message did not get through runs again.
-const Retry = struct { at: i64, tries: u32 };
+/// A brief's or task's message that did not get through: sent again as it
+/// was written when `at` comes, so nothing runs again for it.
+const Retry = struct {
+    at: i64,
+    tries: u32,
+    /// Owned by the core.
+    msg: Core.Undelivered,
+    /// What `ran` gets for the key once the message is delivered.
+    ran: i64,
+};
+
+/// How long a message that did not get through waits before it is sent
+/// again, after `tries` attempts: 5 minutes, then 10, 20, … 2 hours.
+fn retryWait(tries: u32) i64 {
+    return @min(@as(i64, 5 * 60) << @intCast(@min(@max(tries, 1) - 1, 8)), 2 * 3600);
+}
+
+/// The log kind and the name in a key of `ran` ("task:NAME", "brief:NAME",
+/// "brief-now:NAME").
+fn keyParts(key: []const u8) struct { kind: log_mod.Kind, name: []const u8 } {
+    const colon = std.mem.indexOfScalar(u8, key, ':') orelse key.len;
+    return .{ .kind = if (std.mem.startsWith(u8, key, "task:")) .task else .brief, .name = key[@min(colon + 1, key.len)..] };
+}
 
 /// Why a message did not get to the owner, in words for the log.
 fn whyUndelivered(e: anyerror) []const u8 {
@@ -2959,7 +3117,13 @@ fn dueBrief(f: *Fix, items: []const u8) !void {
     try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
 }
 
-test "an_undelivered_brief_is_not_marked_seen_and_is_tried_later" {
+/// How many page and feed requests the stand-in has answered.
+fn pageRequests(f: *Fix) usize {
+    const text = f.e.tmp.dir.readFileAlloc(t.io, "page-requests.jsonl", f.e.arena.allocator(), .unlimited) catch return 0;
+    return std.mem.count(u8, text, "\n");
+}
+
+test "an_undelivered_brief_is_sent_again_as_written_and_marked_seen_once_it_arrives" {
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
@@ -2969,6 +3133,8 @@ test "an_undelivered_brief_is_not_marked_seen_and_is_tried_later" {
     f.core.tick();
     waitIdle(f.core);
     try t.expectEqual(1, f.e.server.modelRequests());
+    const fetched = pageRequests(&f);
+    try t.expect(fetched > 0);
     try t.expect(!f.core.seen.has("https://z.org/1"));
     try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"not delivered\"") != null);
     // not again at once
@@ -2976,14 +3142,61 @@ test "an_undelivered_brief_is_not_marked_seen_and_is_tried_later" {
     t.io.sleep(.fromMilliseconds(300), .awake) catch {};
     waitIdle(f.core);
     try t.expectEqual(1, f.e.server.modelRequests());
-    // a while later it runs again, and this time it arrives
+    // a while later the brief as it was written is sent: nothing is
+    // fetched or written again
     f.rec.setFail(null);
-    try f.e.script(2, model.textReply("Zig: New thing, again (https://z.org/1)"));
+    try f.e.script(2, model.textReply("Zig: New thing, written again (https://z.org/1)"));
     f.core.fixed_now = util.nowSeconds(t.io) + 15 * 60;
     f.core.tick();
-    try f.rec.waitFor("New thing, again");
+    try f.rec.waitFor("Zig: New thing (https://z.org/1)");
     waitIdle(f.core);
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expectEqual(fetched, pageRequests(&f));
     try t.expect(f.core.seen.has("https://z.org/1"));
+    // it counts for the day it was due: not collected again today
+    f.core.tick();
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    waitIdle(f.core);
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expectEqual(1, f.rec.count("New thing"));
+}
+
+test "an_undelivered_task_answer_is_sent_again_without_running_the_task_again" {
+    var f: Fix = undefined;
+    try f.init("", "", "[check]\nevery = 5m\ndo = Check the price.\n");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"prices.txt\",\"content\":\"up 4%\"}"));
+    try f.e.script(2, model.textReply("Price moved 4%."));
+    try f.e.script(3, model.toolReply("tu_2", "write_file", "{\"path\":\"prices.txt\",\"content\":\"run again\"}"));
+    try f.e.script(4, model.textReply("Price moved again."));
+    const t0 = util.nowSeconds(t.io);
+    f.rec.setFail(error.ConnectionClosed);
+    f.core.tick();
+    waitIdle(f.core);
+    try t.expectEqual(2, f.e.server.modelRequests());
+    // after 5 minutes it is sent again; it fails again, so the next try
+    // waits 10 minutes
+    f.core.fixed_now = t0 + 6 * 60;
+    f.core.tick();
+    waitIdle(f.core);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"name\":\"check\",\"event\":\"not delivered\",\"why\":\"ConnectionClosed\",\"tries\":2") != null);
+    f.rec.setFail(null);
+    f.core.fixed_now = t0 + 12 * 60;
+    f.core.tick();
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    waitIdle(f.core);
+    try t.expectEqual(0, f.rec.count("[check]"));
+    // Telegram is back: once the wait is over the answer is sent as it
+    // was written, and the task's tools do not run a second time
+    f.core.fixed_now = t0 + 17 * 60;
+    f.core.tick();
+    try f.rec.waitFor("[check] Price moved 4%.");
+    waitIdle(f.core);
+    try t.expectEqual(2, f.e.server.modelRequests());
+    const lt = try logText(&f);
+    try t.expectEqual(1, std.mem.count(u8, lt, "\"tool\":\"write_file\",\"arg\""));
+    try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"sent\",\"tries\":3") != null);
+    try t.expectEqual(0, f.rec.count("again"));
 }
 
 test "a_task_answer_that_did_not_arrive_is_logged_as_not_sent" {
