@@ -234,6 +234,8 @@ pub const Core = struct {
     home_owned: []u8,
     /// state/lock, open and locked while this core holds the folder.
     folder_lock: ?Io.File = null,
+    /// What holds the folder ("run", "chat", "task" ...), in the status file.
+    role: []const u8 = "open",
     /// Said to the owner when a channel is attached.
     pending_warning: ?[]const u8 = null,
     /// What /reload says when the settings files have an error.
@@ -328,10 +330,13 @@ pub const Core = struct {
         c.system_vars = &.{};
         c.told_settings_changed = false;
         c.pending_warning = null;
+        c.role = "open";
         // problem_buf: written before it is read
         c.loadRan();
         c.checkLogAgainstStatus();
         try c.log.write(.config, false, .{ .event = "start", .pid = pidNumber() });
+        // the status says who holds the folder now, not who held it last
+        c.writeStatus() catch {};
         c.mcp_arena = .init(gpa);
         c.mcp_tools = &.{};
         c.mcp_note = "";
@@ -540,7 +545,7 @@ pub const Core = struct {
     pub fn writeStatus(c: *Core) !void {
         var tb: [20]u8 = undefined;
         var buf: [256]u8 = undefined;
-        const s = try std.fmt.bufPrint(&buf, "pid {d}\ntick {s}\nlog {s}\n", .{ pidNumber(), util.isoTime(&tb, util.nowSeconds(c.io)), c.log.lastHash() });
+        const s = try std.fmt.bufPrint(&buf, "pid {d}\nrole {s}\ntick {s}\nlog {s}\n", .{ pidNumber(), c.role, util.isoTime(&tb, util.nowSeconds(c.io)), c.log.lastHash() });
         try Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.status, .data = s });
     }
 
@@ -1637,6 +1642,33 @@ pub fn lockHeld(io: Io, p: Paths) bool {
     return !got;
 }
 
+pub const Health = struct { ok: bool, text: []const u8 };
+
+/// What `harness health` says: ok only while `harness run` holds the
+/// folder (its lock, not just a lock file left behind) and has ticked in
+/// the last 90 s.
+pub fn health(io: Io, p: Paths, now_s: i64, buf: []u8) Health {
+    if (!lockHeld(io, p)) return .{ .ok = false, .text = "not running" };
+    var sbuf: [256]u8 = undefined;
+    const got = Io.Dir.cwd().readFile(io, p.status, &sbuf) catch return .{ .ok = false, .text = "the folder is held, but its status file can't be read" };
+    const role = statusField(got, "role") orelse "";
+    if (!std.mem.eql(u8, role, "run"))
+        return .{ .ok = false, .text = std.fmt.bufPrint(buf, "not running: harness {s} holds the folder, not harness run", .{if (role.len > 0) role else "(an older one)"}) catch "not running" };
+    const tick = util.parseIso(statusField(got, "tick") orelse "") orelse return .{ .ok = false, .text = "no tick in the status file" };
+    const age = now_s - tick;
+    if (age > 90) return .{ .ok = false, .text = std.fmt.bufPrint(buf, "stale: last tick {d} s ago", .{age}) catch "stale" };
+    return .{ .ok = true, .text = std.fmt.bufPrint(buf, "running: last tick {d} s ago", .{age}) catch "running" };
+}
+
+/// The value of a `key value` line of the status file.
+fn statusField(text: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (line.len > key.len and std.mem.startsWith(u8, line, key) and line[key.len] == ' ') return std.mem.trim(u8, line[key.len + 1 ..], " \r");
+    }
+    return null;
+}
+
 /// Writes a pairing code valid for 10 minutes; returns it.
 pub fn newPairCode(io: Io, p: Paths, now_s: i64, out: *[8]u8) ![]const u8 {
     var raw: [8]u8 = undefined;
@@ -2264,4 +2296,32 @@ test "settings_errors_name_the_file_and_line" {
     try t.expect(std.mem.indexOf(u8, perm, f.core.paths.config) != null);
     try t.expect(std.mem.indexOf(u8, perm, "chmod 600") != null);
     try t.expect(std.mem.indexOf(u8, perm, "config.ini, rules, logins.ini and mcp.ini") != null);
+}
+
+test "health_counts_only_harness_run_while_it_holds_the_folder" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    var buf: [256]u8 = undefined;
+    const now_s = util.nowSeconds(t.io);
+    // `harness chat` holds the folder and ticks: it is not the service
+    f.core.role = "chat";
+    try f.core.writeStatus();
+    const chat = health(t.io, f.core.paths, now_s, &buf);
+    try t.expect(!chat.ok);
+    try t.expect(std.mem.indexOf(u8, chat.text, "chat") != null);
+    f.core.role = "run";
+    try f.core.writeStatus();
+    try t.expect(health(t.io, f.core.paths, now_s, &buf).ok);
+    // ticks that stopped
+    try t.expect(!health(t.io, f.core.paths, now_s + 91, &buf).ok);
+    // a run that was killed left a recent status and the lock file: nobody holds it
+    const home = f.home;
+    f.core.close();
+    const p = try Paths.init(f.e.arena.allocator(), home);
+    const zeros: [64]u8 = @splat('0');
+    var tb: [20]u8 = undefined;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.status, .data = try std.fmt.allocPrint(f.e.arena.allocator(), "pid 1\nrole run\ntick {s}\nlog {s}\n", .{ util.isoTime(&tb, now_s), &zeros }) });
+    try t.expect(!health(t.io, p, now_s, &buf).ok);
+    f.core = try Core.open(t.allocator, t.io, home, .{});
 }

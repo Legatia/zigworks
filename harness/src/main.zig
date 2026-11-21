@@ -136,8 +136,12 @@ const App = struct {
         return out.items;
     }
 
+    /// What a command opens the instance for (in the status file; only
+    /// `run` counts for `harness health`).
+    const Role = enum { run, chat, brief, task, memory };
+
     /// Opens the instance, or explains why not.
-    fn open(app: *App) !*Core {
+    fn open(app: *App, role: Role) !*Core {
         const cfg = try app.settings();
         const sec = app.secrets(cfg);
         if (sec.omnigate == null) complain("note: no omnigate key stored under \"{s}\"; model calls will be refused. Run: harness secret add {s}", .{ cfg.model.key, cfg.model.key });
@@ -158,6 +162,8 @@ const App = struct {
         c.home_var = app.env.get(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME") orelse "";
         c.system_vars = util.pickVars(app.arena, app.env, util.system_var_names) catch &.{};
         c.store = app.store();
+        c.role = @tagName(role);
+        c.writeStatus() catch {};
         c.startExtras();
         return c;
     }
@@ -532,7 +538,7 @@ fn ticker(c: *Core) void {
 }
 
 fn runCmd(app: *App) !Exit {
-    const c = try app.open();
+    const c = try app.open(.run);
     defer c.close();
     if (!c.cfg.chat.telegram) {
         complain("Telegram is off in config.ini; use harness chat", .{});
@@ -619,7 +625,7 @@ const TermChan = struct {
 };
 
 fn chatCmd(app: *App) !Exit {
-    const c = try app.open();
+    const c = try app.open(.chat);
     defer c.close();
     var tc: TermChan = .{ .io = app.io };
     c.attach(tc.channel());
@@ -657,7 +663,7 @@ fn chatCmd(app: *App) !Exit {
 // ---- one-off runs ----
 
 fn briefCmd(app: *App, args: []const []const u8) !Exit {
-    const c = try app.open();
+    const c = try app.open(.brief);
     defer c.close();
     var tc: TermChan = .{ .io = app.io };
     c.attach(tc.channel());
@@ -680,7 +686,7 @@ fn taskCmd(app: *App, args: []const []const u8) !Exit {
         complain("usage: harness task run NAME", .{});
         return .usage;
     }
-    const c = try app.open();
+    const c = try app.open(.task);
     defer c.close();
     var tc: TermChan = .{ .io = app.io };
     c.attach(tc.channel());
@@ -703,7 +709,7 @@ fn memoryCmd(app: *App, args: []const []const u8) !Exit {
         complain("usage: harness memory [list|pin|unpin|forget ID]", .{});
         return .usage;
     };
-    const c = try app.open();
+    const c = try app.open(.memory);
     defer c.close();
     try outPrint(app.io, "{s}\n", .{try c.command(app.arena, text)});
     return .ok;
@@ -742,24 +748,9 @@ fn logCmd(app: *App, args: []const []const u8) !Exit {
 fn healthCmd(app: *App) !Exit {
     const p = try core_mod.Paths.init(app.arena, app.home);
     var buf: [256]u8 = undefined;
-    var lbuf: [32]u8 = undefined;
-    _ = Io.Dir.cwd().readFile(app.io, p.lock, &lbuf) catch {
-        try outAll(app.io, "not running\n");
-        return .failed;
-    };
-    const got = Io.Dir.cwd().readFile(app.io, p.status, &buf) catch {
-        try outAll(app.io, "not running\n");
-        return .failed;
-    };
-    const i = std.mem.indexOf(u8, got, "tick ") orelse return .failed;
-    const tick = util.parseIso(got[i + 5 .. @min(got.len, i + 25)]) orelse return .failed;
-    const age = util.nowSeconds(app.io) - tick;
-    if (age > 90) {
-        try outPrint(app.io, "stale: last tick {d} s ago\n", .{age});
-        return .failed;
-    }
-    try outPrint(app.io, "running: last tick {d} s ago\n", .{age});
-    return .ok;
+    const h = core_mod.health(app.io, p, util.nowSeconds(app.io), &buf);
+    try outPrint(app.io, "{s}\n", .{h.text});
+    return if (h.ok) .ok else .failed;
 }
 
 // ---- terminal input ----
