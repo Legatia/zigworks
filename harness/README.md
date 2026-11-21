@@ -21,9 +21,9 @@ Security framework on macOS). Models are reached only through
 [omnigate](https://github.com/Legatia/omnigate), which holds the provider
 keys and the budgets.
 
-**State: 0.3.0, tested by its own tests (197 unit tests, among them
+**State: 0.3.0, tested by its own tests (206 unit tests, among them
 the browser and login tests against headless Chrome and local pages, and an
-end-to-end script of 27 checks that drives the real binary against
+end-to-end script of 28 checks that drives the real binary against
 stand-ins for omnigate, Telegram, feeds, search and an MCP server) on
 macOS; 0.1.0's tests also passed in CI on Linux and Windows. Not yet run
 against a real omnigate, a real Telegram bot, a real MCP server or a real
@@ -165,6 +165,9 @@ by `ref`, and its text. One browser per turn, closed when the turn ends
 or on `/stop`. Opened with a login, it uses the login's own profile in
 `profiles/NAME`, so the cookies, and with them the sign-in, stay for the
 next turn. Without one, a throwaway profile is deleted afterwards.
+Chrome's own password manager is off in every profile. Alerts and
+leaving-the-page questions are accepted, confirm and prompt dialogs
+dismissed, and the agent sees their text.
 
 The model types placeholders, never values: `{login:NAME.username}`,
 `{login:NAME.password}`, `{login:NAME.code}` (the current TOTP code).
@@ -176,7 +179,11 @@ placeholder.
   `github.com.evil.com`), over https (http only for `localhost`). The
   check and the typing are one script in the page, run where the page's
   own scripts can't change what it sees, so a redirect in between can't
-  catch the value. Only fields of the page itself, never of frames.
+  catch the value. Only fields of the page itself, never of frames. A
+  placeholder is the whole text of a `type` action, and goes only into a
+  matching field: a password into a password field, a username into a
+  text or e-mail field, a code into a text, number or phone field (or one
+  marked for one-time codes).
 - **Sign-ups.** A login stored without a password gets one (24 letters,
   digits and symbols) the first time its password placeholder is typed on
   its site; it is stored before it is typed.

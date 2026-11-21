@@ -315,6 +315,7 @@ pub const Web = struct {
             w.throwaway = p;
             break :blk p;
         };
+        try noPasswordManager(w.io, a, profile);
         w.s = try cdp.Session.open(w.gpa, w.io, w.env.browser, profile, w.env.stop, w.env.timeout_ms);
         if (w.login) |l| try w.loadPasskeys(a, l);
     }
@@ -783,6 +784,32 @@ fn mergePasskeys(a: Allocator, stored: []const logins.Passkey, now: []const logi
     return .{ .list = list.items, .changed = changed, .added = added.items };
 }
 
+/// Chrome's own password manager off in `profile` (its Default/Preferences,
+/// written before Chrome starts): typed passwords must not end up saved
+/// in the profile's Login Data.
+fn noPasswordManager(io: Io, a: Allocator, profile: []const u8) !void {
+    const dir = try std.fs.path.join(a, &.{ profile, "Default" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(a, &.{ dir, "Preferences" });
+    const old = Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => return e,
+    };
+    var root: std.json.Value = .{ .object = .empty };
+    if (jv.parse(a, old)) |v| if (v == .object) {
+        root = v;
+    };
+    try root.object.put(a, "credentials_enable_service", .{ .bool = false });
+    var prof: std.json.Value = root.object.get("profile") orelse .{ .object = .empty };
+    if (prof != .object) prof = .{ .object = .empty };
+    try prof.object.put(a, "password_manager_enabled", .{ .bool = false });
+    try root.object.put(a, "profile", prof);
+    const text = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(root, .{})});
+    var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = if (is_windows) .default_file else .fromMode(0o600) });
+    defer f.close(io);
+    try f.writeStreamingAll(io, text);
+}
+
 fn setPrivate(io: Io, path: []const u8) !void {
     if (is_windows) return;
     var d = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
@@ -940,6 +967,42 @@ test "web_fills_a_login_on_its_site" {
         const st = try f.e.tmp.dir.statFile(t.io, "profiles/agent", .{});
         try t.expectEqual(@as(u32, 0o700), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
     }
+}
+
+/// Whether any file below `dir` holds `needle`.
+fn treeHas(io: Io, a: Allocator, dir: []const u8, needle: []const u8) !bool {
+    var d = try Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
+    defer d.close(io);
+    var walker = try d.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |e| {
+        if (e.kind != .file) continue;
+        const data = d.readFileAlloc(io, e.path, a, .limited(64 << 20)) catch continue;
+        if (has(data, needle)) return true;
+    }
+    return false;
+}
+
+test "web_profiles_keep_no_saved_passwords" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\nusername = agent-bot\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.store.put(t.io, "login-agent-password", "fake-Pass-7351!");
+    try f.page("real.html", "<html><head><title>Sign in</title></head><body><form method=\"post\" action=\"/page/in.html\"><input name=\"user\" autocomplete=\"username\"><input name=\"pw\" type=\"password\" autocomplete=\"current-password\"><button>Sign in</button></form></body></html>");
+    try f.page("in.html", "<html><head><title>Welcome</title></head><body><p>signed in</p></body></html>");
+    _ = try f.act(try f.openJson("real.html", "agent"));
+    _ = try f.act("{\"action\":\"type\",\"ref\":1,\"text\":\"{login:agent.username}\"}");
+    _ = try f.act("{\"action\":\"type\",\"ref\":2,\"text\":\"{login:agent.password}\"}");
+    const r = try f.act("{\"action\":\"click\",\"ref\":3}");
+    try expectHas(r.text, "Title: Welcome");
+    f.web.close();
+    const profile = try std.fs.path.join(a, &.{ f.e.dir, "profiles", "agent" });
+    const prefs = try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ profile, "Default", "Preferences" }), a, .limited(4 << 20));
+    const v = jv.parse(a, prefs);
+    try t.expectEqual(false, jv.boolean(jv.get(v, "credentials_enable_service")) orelse true);
+    try t.expectEqual(false, jv.boolean(jv.at(v, &.{ "profile", "password_manager_enabled" })) orelse true);
+    try t.expect(!try treeHas(t.io, a, profile, "fake-Pass-7351!"));
 }
 
 test "web_refuses_a_login_on_another_site" {
