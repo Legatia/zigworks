@@ -62,3 +62,10 @@ labels, no slogans. Check each against the merged code before writing it.
 7. Passkeys: "If the stored passkeys can't be read, none are loaded and new ones aren't saved; the agent is told."
 8. Limits: "...and a passkey only for the site or a name below it; a site needs a dot (but `localhost`)..."
 9. Limits: "The browser keeps harness's environment." → "The browser gets only PATH, HOME and LANG (on Windows also the system's own variables), and never the macOS Keychain or a desktop keyring."
+
+## S (smoke, approval buttons)
+- Gate step 5: `write_file` to a path with a part starting with "." asks by default.
+- `ask` paragraph: a button from before a restart, or under another question, answers nothing, and harness says it is out of date.
+- State line: unit test and end-to-end check counts (re-count); the stand-ins include two MCP servers.
+- Optional: a command notes at start when no omnigate url is set.
+- Stale since I26: Limits note that Windows judges the lock by the status file's age (remove); smoke.sh's comment for skipping "memory list" on Windows.
