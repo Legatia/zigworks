@@ -18,7 +18,9 @@ const store_mod = @import("store.zig");
 const masks_mod = @import("masks.zig");
 const Io = std.Io;
 
-pub const Answer = enum { once, day, deny, timeout };
+/// `unsent`: the question did not get to the owner (a part or its buttons
+/// could not be sent), so nobody could answer it.
+pub const Answer = enum { once, day, deny, timeout, unsent };
 
 /// One question for the owner: may this call run?
 pub const Question = struct {
@@ -1126,6 +1128,7 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
             },
             .deny => why = "denied by the owner",
             .timeout => why = "no answer from the owner in time",
+            .unsent => why = "the question could not be sent to the owner",
         }
     }
     try r.log.write(.gate, r.isPrivate(), .{ .run = r.label, .tool = name, .decision = @tagName(action), .why = why, .arg = arg });

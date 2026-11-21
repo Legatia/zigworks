@@ -114,7 +114,8 @@ applies to briefs.ini sources too.
 
 `ask` sends you the whole call (a file's content too) with three buttons:
 Allow once, Allow 24 h, Deny. A long one comes in several messages with
-the buttons on the last; a call over 12 KB is refused. A button from
+the buttons on the last; a call over 12 KB is refused, and so is one
+whose question, or any part of it, could not be sent. A button from
 before a restart, or under another question, answers nothing, and harness
 says it is out of date. No answer in `approval_seconds` (default 10
 minutes), or before the turn's time (`turn_seconds`) is up, counts as

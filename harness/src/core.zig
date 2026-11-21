@@ -898,7 +898,13 @@ pub const Core = struct {
             c.approval.shown = false;
             c.approval.early = null;
         }
-        for (heads) |h| c.say(h);
+        // a part that did not get through: the owner would answer what they
+        // did not see, so no buttons go out and nothing is allowed
+        for (heads) |h| c.deliver(h) catch {
+            c.endQuestion();
+            c.say(not_sent_note);
+            return .unsent;
+        };
         const msg = if (allow_day)
             ch.buttons(ch.ctx, text, &.{ .{ "Allow once", data[0] }, .{ "Allow 24 h", data[1] }, .{ "Deny", data[2] } })
         else
@@ -919,6 +925,14 @@ pub const Core = struct {
             break :blk e.msg;
         };
         if (early_elsewhere) |m| c.tellOutOfDate(m);
+        // no message id: no press can be told to be this question's, so
+        // none would count; refused now rather than after approval_seconds
+        if (msg == null) {
+            c.endQuestion();
+            c.log.write(.chat, false, .{ .event = "not delivered", .why = "the question's buttons could not be sent", .bytes = text.len }) catch {};
+            c.say(not_sent_note);
+            return .unsent;
+        }
         const deadline = c.now() + c.cfg.limits.approval_seconds;
         var ans: agent.Answer = .timeout;
         while (true) {
@@ -939,17 +953,22 @@ pub const Core = struct {
             if (q.deadline_s > 0 and util.nowSeconds(c.io) >= q.deadline_s) break;
             c.io.sleep(.fromMilliseconds(50), .awake) catch {};
         }
-        {
-            c.approval.mutex.lockUncancelable(c.io);
-            defer c.approval.mutex.unlock(c.io);
-            c.approval.waiting = false;
-            c.approval.msg = null;
-            c.approval.shown = false;
-            c.approval.early = null;
-        }
+        c.endQuestion();
         if (msg) |m| ch.clear(ch.ctx, m);
         if (ans == .timeout) c.say("No answer in time; not allowed.");
         return ans;
+    }
+
+    const not_sent_note = "The question could not be sent, so the call is not allowed.";
+
+    /// Nothing is asked any more: a press from now on is out of date.
+    fn endQuestion(c: *Core) void {
+        c.approval.mutex.lockUncancelable(c.io);
+        defer c.approval.mutex.unlock(c.io);
+        c.approval.waiting = false;
+        c.approval.msg = null;
+        c.approval.shown = false;
+        c.approval.early = null;
     }
 
     fn approvalsPath(c: *Core, buf: []u8) ![]const u8 {
@@ -2440,6 +2459,8 @@ const Recorder = struct {
     next_id: i64 = 0,
     /// While set, sends fail with it and nothing is recorded.
     fail: ?anyerror = null,
+    /// While set, a message with buttons is not sent: no message id.
+    buttons_fail: bool = false,
     /// The last question's buttons and the message they are in.
     last: Buttons = .{},
     /// Called once buttons are recorded, before their message id is
@@ -2500,6 +2521,7 @@ const Recorder = struct {
         const shown = blk: {
             r.mutex.lockUncancelable(t.io);
             defer r.mutex.unlock(t.io);
+            if (r.buttons_fail) return null;
             const line = std.fmt.allocPrint(t.allocator, "BUTTONS {s} [{s}]", .{ text, bs[0][1] }) catch return null;
             r.lines.append(t.allocator, line) catch {};
             r.next_id += 1;
@@ -2763,6 +2785,46 @@ test "a_long_question_goes_whole_in_parts_with_the_buttons_on_the_last" {
     try t.expectEqualStrings(try std.fmt.allocPrint(a, "shell: echo {s} end-of-it", .{ys}), whole.items);
     try f.press("deny");
     try f.rec.waitFor("not run");
+}
+
+const not_sent = "the question could not be sent to the owner";
+
+test "a_question_with_a_part_that_did_not_arrive_is_refused_without_buttons" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const ys = try a.alloc(u8, 6000);
+    @memset(ys, 'y');
+    try f.e.script(1, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"shell\",\"input\":{{\"command\":\"echo {s} end-of-it\"}}}}],\"stop_reason\":\"tool_use\"}}", .{ys}));
+    try f.e.script(2, model.textReply("not run"));
+    // the first part does not get through: no buttons go under the rest
+    f.rec.setFail(error.ConnectionClosed);
+    try f.core.startWorker();
+    try f.core.handleText("run the long one");
+    try waitFile(&f.e, "requests/002.json");
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    try t.expect(!f.core.approvalWaiting());
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), not_sent) != null);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"decision\":\"deny\",\"why\":\"" ++ not_sent ++ "\"") != null);
+}
+
+test "a_question_whose_buttons_could_not_be_sent_is_refused_at_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo unasked\"}"));
+    try f.e.script(2, model.textReply("not run"));
+    f.rec.buttons_fail = true;
+    try f.core.startWorker();
+    const start = Io.Clock.awake.now(t.io).nanoseconds;
+    try f.core.handleText("run it");
+    // not approval_seconds (10 minutes) of waiting for an answer that can't come
+    try f.rec.waitFor("not run");
+    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - start < 3 * std.time.ns_per_s);
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    try f.rec.waitFor("The question could not be sent, so the call is not allowed.");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), not_sent) != null);
 }
 
 test "the_owner_is_waited_for_only_until_the_turn_ends" {
