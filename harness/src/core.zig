@@ -232,6 +232,8 @@ pub const Core = struct {
     system_vars: []const util.Var = &.{},
     paths_arena: std.heap.ArenaAllocator,
     home_owned: []u8,
+    /// state/lock, open and locked while this core holds the folder.
+    folder_lock: ?Io.File = null,
     /// Said to the owner when a channel is attached.
     pending_warning: ?[]const u8 = null,
     /// What /reload says when the settings files have an error.
@@ -259,8 +261,8 @@ pub const Core = struct {
         c.paths = try Paths.init(paths_arena.allocator(), home_owned);
         c.paths_arena = paths_arena;
         c.home_owned = home_owned;
-        try takeLock(io, c.paths, gpa);
-        errdefer releaseLock(io, c.paths);
+        c.folder_lock = try takeLock(io, c.paths);
+        errdefer c.releaseFolder();
 
         try Io.Dir.cwd().createDirPath(io, c.paths.workspace);
         c.workspace = try Io.Dir.cwd().realPathFileAlloc(io, c.paths.workspace, c.paths_arena.allocator());
@@ -359,11 +361,17 @@ pub const Core = struct {
         freeKeys(c.gpa, &c.ran);
         freeKeys(c.gpa, &c.running);
         freeKeys(c.gpa, &c.paused);
-        releaseLock(c.io, c.paths);
+        c.releaseFolder();
         c.settings_arena.deinit();
         c.paths_arena.deinit();
         c.gpa.free(c.home_owned);
         c.gpa.destroy(c);
+    }
+
+    /// Lets go of the data folder (the lock file stays: the lock is what counts).
+    fn releaseFolder(c: *Core) void {
+        if (c.folder_lock) |f| f.close(c.io);
+        c.folder_lock = null;
     }
 
     // ---- settings ----
@@ -1589,35 +1597,44 @@ pub fn pidNumber() i64 {
     };
 }
 
-fn pidAlive(pid: i64) bool {
-    if (builtin.os.tag == .windows) return true;
-    if (pid <= 0) return false;
-    std.posix.kill(@intCast(pid), @enumFromInt(0)) catch |e| return e == error.PermissionDenied;
-    return true;
-}
-
-/// Refuses when another live process holds the folder.
-pub fn takeLock(io: Io, p: Paths, gpa: std.mem.Allocator) !void {
+/// Takes the data folder for this process: an exclusive lock on
+/// state/lock, held as long as the file is open and dropped by the system
+/// when the process ends, however it ends. error.AlreadyRunning while
+/// another process holds it, or another core of this one.
+pub fn takeLock(io: Io, p: Paths) !Io.File {
     try Io.Dir.cwd().createDirPath(io, p.state);
-    var buf: [32]u8 = undefined;
-    if (Io.Dir.cwd().readFile(io, p.lock, &buf)) |got| {
-        const pid = std.fmt.parseInt(i64, std.mem.trim(u8, got, " \n"), 10) catch 0;
-        const recent = blk: {
-            if (builtin.os.tag != .windows) break :blk true;
-            // Windows: trust a lock whose status was refreshed in the last 90 s
-            const st = Io.Dir.cwd().statFile(io, p.status, .{}) catch break :blk false;
-            const age_ns = Io.Clock.real.now(io).nanoseconds - st.mtime.nanoseconds;
-            break :blk age_ns < 90 * std.time.ns_per_s;
+    var tries: u32 = 0;
+    while (true) : (tries += 1) {
+        const f = Io.Dir.cwd().createFile(io, p.lock, .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .permissions = util.private_file,
+        }) catch |e| switch (e) {
+            // `health` looks at it for a moment; a running instance keeps it
+            error.WouldBlock => {
+                if (tries >= 10) return error.AlreadyRunning;
+                io.sleep(.fromMilliseconds(30), .awake) catch {};
+                continue;
+            },
+            else => return e,
         };
-        if (pid != pidNumber() and pidAlive(pid) and recent) return error.AlreadyRunning;
-    } else |_| {}
-    _ = gpa;
-    var out: [32]u8 = undefined;
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = p.lock, .data = try std.fmt.bufPrint(&out, "{d}\n", .{pidNumber()}) });
+        // the pid, for people (on Windows others can't read the locked first byte)
+        var b: [32]u8 = undefined;
+        f.setLength(io, 0) catch {};
+        f.writePositionalAll(io, std.fmt.bufPrint(&b, "{d}\n", .{pidNumber()}) catch "", 0) catch {};
+        return f;
+    }
 }
 
-pub fn releaseLock(io: Io, p: Paths) void {
-    Io.Dir.cwd().deleteFile(io, p.lock) catch {};
+/// Whether some process holds the data folder (`takeLock`).
+pub fn lockHeld(io: Io, p: Paths) bool {
+    const f = Io.Dir.cwd().openFile(io, p.lock, .{}) catch return false;
+    defer f.close(io);
+    const got = f.tryLock(io, .shared) catch return false;
+    if (got) f.unlock(io);
+    return !got;
 }
 
 /// Writes a pairing code valid for 10 minutes; returns it.
@@ -1741,20 +1758,53 @@ const Fix = struct {
     }
 };
 
-test "second_process_refused_by_lock" {
+test "a_folder_is_held_by_one_core_at_a_time" {
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
-    var arena: std.heap.ArenaAllocator = .init(t.allocator);
-    defer arena.deinit();
-    const p = try Paths.init(arena.allocator(), f.home);
-    // a lock held by another live process (pid 1 always exists on POSIX)
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.lock, .data = "1\n" });
-    try t.expectError(error.AlreadyRunning, Core.open(t.allocator, t.io, f.home, .{}));
-    // a stale lock (no such process) is taken over
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.lock, .data = "999999\n" });
-    try takeLock(t.io, p, t.allocator);
+    // the open core holds the folder: a second open is refused, even in
+    // the same process (the old pid check let that through)
+    if (Core.open(t.allocator, t.io, f.home, .{})) |second| {
+        second.close();
+        return error.TestUnexpectedResult;
+    } else |e| try t.expectEqual(error.AlreadyRunning, e);
+    // closed, it lets go; a lock file left behind (a killed process's pid,
+    // here a live one's) holds nothing by itself
+    const home = f.home;
+    f.core.close();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(f.e.arena.allocator(), &.{ home, "state", "lock" }), .data = "1\n" });
+    f.core = try Core.open(t.allocator, t.io, home, .{});
+}
+
+const Opener = struct {
+    home: []const u8,
+    core: ?*Core = null,
+    fn run(o: *Opener) void {
+        o.core = Core.open(t.allocator, t.io, o.home, .{}) catch null;
+    }
+};
+
+test "simultaneous_starts_let_one_through" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const home = f.home;
+    f.core.close();
+    // they all check at once: one must win, the rest are refused
+    var openers: [8]Opener = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (&openers, &threads) |*o, *th| {
+        o.* = .{ .home = home };
+        th.* = try std.Thread.spawn(.{}, Opener.run, .{o});
+    }
+    for (threads) |th| th.join();
+    var winners: usize = 0;
+    for (&openers) |*o| if (o.core) |c| {
+        winners += 1;
+        if (winners > 1) c.close() else f.core = c;
+    };
+    if (winners == 0) f.core = try Core.open(t.allocator, t.io, home, .{});
+    try t.expectEqual(1, winners);
 }
 
 test "stranger_messages_dropped_and_logged" {
