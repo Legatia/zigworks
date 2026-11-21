@@ -198,9 +198,12 @@ pub const Store = struct {
         var it = d.iterate();
         while (try it.next(io)) |e| {
             if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".md")) continue;
+            // the file's name is the item's id, whatever its text says
+            const id = e.name[0 .. e.name.len - 3];
+            if (!validId(id)) continue;
             const text = d.readFileAlloc(io, e.name, gpa, .limited(64 * 1024)) catch continue;
             defer gpa.free(text);
-            const item = parseItem(gpa, text) catch continue;
+            const item = parseItem(gpa, id, text) catch continue;
             try s.items.append(gpa, item);
         }
         // a stable order for ties
@@ -453,9 +456,21 @@ fn firstLine(s: []const u8) []const u8 {
     return s[0 .. std.mem.indexOfScalar(u8, s, '\n') orelse s.len];
 }
 
-fn parseItem(gpa: std.mem.Allocator, text: []const u8) !*Item {
+/// An id that names a file in the memory folder and nothing else.
+fn validId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 40 or std.mem.indexOf(u8, id, "..") != null) return false;
+    for (id) |c| if (c == '/' or c == '\\' or c < ' ' or c == 0x7f) return false;
+    return true;
+}
+
+/// A time read from an item's file; none before 1970.
+fn parseTime(v: []const u8) ?i64 {
+    const x = util.parseIso(v) orelse return null;
+    return if (x >= 0) x else null;
+}
+
+fn parseItem(gpa: std.mem.Allocator, id_s: []const u8, text: []const u8) !*Item {
     const sep = std.mem.indexOf(u8, text, "\n---\n") orelse return error.BadItem;
-    var id: ?[]const u8 = null;
     var created: ?i64 = null;
     var pinned = false;
     var mentions_line: []const u8 = "";
@@ -465,16 +480,15 @@ fn parseItem(gpa: std.mem.Allocator, text: []const u8) !*Item {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const key = line[0..colon];
         const val = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
-        if (std.mem.eql(u8, key, "id")) id = val else if (std.mem.eql(u8, key, "created")) {
-            created = util.parseIso(val);
+        if (std.mem.eql(u8, key, "created")) {
+            created = parseTime(val);
         } else if (std.mem.eql(u8, key, "pinned")) {
             pinned = std.mem.eql(u8, val, "yes");
         } else if (std.mem.eql(u8, key, "mentions")) {
             mentions_line = val;
         } else if (std.mem.eql(u8, key, "terms")) terms_line = val;
     }
-    const id_s = id orelse return error.BadItem;
-    if (id_s.len == 0 or id_s.len > 40) return error.BadItem;
+    if (!validId(id_s)) return error.BadItem;
     const item = try gpa.create(Item);
     errdefer gpa.destroy(item);
     var tl: std.ArrayList([]u8) = .empty;
@@ -494,7 +508,7 @@ fn parseItem(gpa: std.mem.Allocator, text: []const u8) !*Item {
     item.* = .{ .id = id_owned, .created_s = created orelse 0, .pinned = pinned, .terms = try tl.toOwnedSlice(gpa), .body = body };
     var mw = std.mem.tokenizeAny(u8, mentions_line, " \t");
     while (mw.next()) |m| {
-        if (util.parseIso(m)) |v| try item.mentions.append(gpa, v);
+        if (parseTime(m)) |v| try item.mentions.append(gpa, v);
     }
     if (item.mentions.items.len == 0) try item.mentions.append(gpa, item.created_s);
     return item;
@@ -693,6 +707,54 @@ test "files_round_trip" {
     try t.expectEqual(it.created_s, back.created_s);
     try t.expectEqual(it.terms.len, back.terms.len);
     try t.expect(std.mem.startsWith(u8, it.id, "20261130-"));
+}
+
+test "an_items_id_is_its_file_name" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const it = try f.addAt("Prefers tea in the morning", now - day);
+    const id = try a.dupe(u8, it.id);
+    var d = try Io.Dir.cwd().openDir(t.io, f.store.dir, .{});
+    defer d.close(t.io);
+    const text = try d.readFileAlloc(t.io, try std.fmt.allocPrint(a, "{s}.md", .{id}), a, .unlimited);
+    // a copy under another name is an item of its own
+    try d.writeFile(t.io, .{ .sub_path = "backup.md", .data = text });
+    // an id line naming a place outside the folder counts for nothing
+    try d.writeFile(t.io, .{ .sub_path = "planted.md", .data = "id: ../escaped\ncreated: 2026-11-01T00:00:00Z\nmentions: 2026-11-01T00:00:00Z\npinned: no\nterms: planted\n---\nplanted item\n" });
+    try d.writeFile(t.io, .{ .sub_path = "...md", .data = text });
+    var s2 = try Store.load(t.allocator, t.io, f.store.dir);
+    defer s2.deinit();
+    try t.expectEqual(3, s2.items.items.len);
+    try t.expect(s2.find("backup") != null);
+    try t.expect(s2.find("../escaped") == null);
+    _ = try s2.setPinned("planted", true);
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().access(t.io, try std.fs.path.join(a, &.{ f.store.dir, "..", "escaped.md" }), .{}));
+    // forget removes the item asked for; the copy stays, as its own item
+    try t.expect(try s2.forget(id));
+    var s3 = try Store.load(t.allocator, t.io, f.store.dir);
+    defer s3.deinit();
+    try t.expect(s3.find(id) == null);
+    try t.expect(s3.find("backup") != null);
+}
+
+test "an_item_with_a_date_no_clock_shows_is_read_without_a_crash" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    var d = try Io.Dir.cwd().openDir(t.io, f.store.dir, .{});
+    defer d.close(t.io);
+    try d.writeFile(t.io, .{ .sub_path = "old.md", .data = "id: old\ncreated: -001-01-01T00:00:00Z\nmentions: -001-01-01T00:00:00Z\npinned: no\nterms: ancient\n---\nvery old\n" });
+    var s2 = try Store.load(t.allocator, t.io, f.store.dir);
+    defer s2.deinit();
+    const it = s2.find("old").?;
+    try s2.save(it);
+    _ = try s2.render(f.arena.allocator(), now, 20);
+    try t.expect(it.created_s >= 0);
+    // and a time before year 0 prints, if it ever comes to that
+    var tb: [20]u8 = undefined;
+    try t.expectEqualStrings("0000", util.isoTime(&tb, -2100 * 365 * day)[0..4]);
 }
 
 test "forget_removes_file" {

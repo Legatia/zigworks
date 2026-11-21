@@ -51,7 +51,7 @@ pub fn isoTime(buf: *[20]u8, secs: i64) []const u8 {
     const m = if (mp < 10) mp + 3 else mp - 9;
     const y = yoe + era * 400 + @as(i64, if (m <= 2) 1 else 0);
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-        @as(u64, @intCast(y)), @as(u64, @intCast(m)), @as(u64, @intCast(d)), sod / 3600, sod / 60 % 60, sod % 60,
+        @as(u64, @intCast(std.math.clamp(y, 0, 9999))), @as(u64, @intCast(m)), @as(u64, @intCast(d)), sod / 3600, sod / 60 % 60, sod % 60,
     }) catch unreachable;
 }
 
