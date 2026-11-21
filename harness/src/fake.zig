@@ -167,8 +167,9 @@ pub const Server = struct {
             return json(req, .internal_server_error, "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"no script for this request\"}}");
         const v = jv.parse(a, script);
         if (jv.int(jv.get(v, "delay_ms"))) |ms| {
-            var waited: i64 = 0;
-            while (waited < ms and !s.stopping.load(.acquire)) : (waited += 20) s.io.sleep(.fromMilliseconds(20), .awake) catch {};
+            // By the clock, not by counting sleeps: on a busy machine each sleep runs long.
+            const until = Io.Clock.awake.now(s.io).nanoseconds + @as(i96, ms) * std.time.ns_per_ms;
+            while (Io.Clock.awake.now(s.io).nanoseconds < until and !s.stopping.load(.acquire)) s.io.sleep(.fromMilliseconds(20), .awake) catch {};
         }
         if (jv.int(jv.get(v, "status"))) |st| {
             const status: std.http.Status = @fromBackingInt(@as(u10, @intCast(st)));
