@@ -71,6 +71,26 @@ reply() {
 req() { printf '%s/requests/%03d.json' "$S" "${1:-$mn}"; }
 text_reply() { printf '{"content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn"}' "$1"; }
 tool_reply() { printf '{"content":[{"type":"tool_use","id":"%s","name":"shell","input":{"command":"%s"}}],"stop_reason":"tool_use"}' "$1" "$2"; }
+# call_reply ID TOOL INPUT_JSON: the model calls any tool
+call_reply() { printf '{"content":[{"type":"tool_use","id":"%s","name":"%s","input":%s}],"stop_reason":"tool_use"}' "$1" "$2" "$3"; }
+# result N ID TEXT: request N carries the result of call ID, starting with TEXT
+result() { grep -qF "\"tool_use_id\":\"$2\",\"content\":\"$3" "$(req "$1")"; }
+# the questions asked so far (messages with buttons), and the last one
+asked() {
+	q=$(grep -c '"inline_keyboard":\[\[' "$OUT" 2>/dev/null)
+	echo "${q:-0}"
+}
+last_question() { grep -F '"inline_keyboard":[[' "$OUT" | tail -n 1; }
+# wait_asked N: until N questions have been asked
+wait_asked() {
+	i=0
+	while [ $i -lt 100 ]; do
+		[ "$(asked)" -ge "$1" ] && return 0
+		sleep 0.1
+		i=$((i + 1))
+	done
+	return 1
+}
 sha() { if command -v sha256sum >/dev/null; then printf '%s' "$1" | sha256sum; else printf '%s' "$1" | shasum -a 256; fi | cut -c1-32; }
 
 "$F" --dir "$S" >"$T/fake.out" &
@@ -96,7 +116,8 @@ api = $URL
 approval_seconds = 30
 EOF
 printf 'allow shell sleep *\nallow mcp fake/echo *\n' >"$HARNESS_HOME/rules"
-printf '[fake]\ncommand = "%s" --mcp\n' "$F" >"$HARNESS_HOME/mcp.ini"
+# shop: the same server, its echo a money tool capped at 10 a call
+printf '[fake]\ncommand = "%s" --mcp\n[shop]\ncommand = "%s" --mcp\nmoney = echo\namount = amount\nmax_per_call = 10\n' "$F" "$F" >"$HARNESS_HOME/mcp.ini"
 chmod 600 "$HARNESS_HOME/config.ini" "$HARNESS_HOME/rules"
 printf 'og-smoke-key-123\n' | "$H" secret add omnigate --stdin 2>/dev/null
 printf '111:telegram-smoke-token\n' | "$H" secret add telegram --stdin 2>/dev/null
@@ -198,6 +219,50 @@ reply "$(text_reply 'helper said hi')"
 reply "$(text_reply 'delegated ok')"
 say "split this"
 check "helpers answer the agent" 'wait_for "$OUT" "delegated ok" && [ "$(grep -o "helper said hi" "$(req)" | wc -l | tr -d " ")" = 2 ]'
+
+# an MCP tool no rule allows asks by default: once it runs, denied it doesn't
+reply "$(call_reply tu_s1 fake__sleep '{"ms":1}')"
+reply "$(call_reply tu_s2 fake__sleep '{"ms":2}')"
+reply "$(text_reply 'slept once')"
+say "sleep twice"
+check "an MCP tool with no rule asks" 'wait_asked 2 && last_question | grep -qF "fake__sleep: fake/sleep" && [ -n "$(button day)" ]'
+press once
+wait_asked 3
+press deny
+check "allowed once it runs, denied it does not" 'wait_for "$OUT" "slept once" && result $((mn - 1)) tu_s1 slept && result $mn tu_s2 "refused by the gate: denied by the owner"'
+# "Allow 24 h" covers the tool whatever its input
+reply "$(call_reply tu_s3 fake__sleep '{"ms":3}')"
+reply "$(call_reply tu_s4 fake__sleep '{"ms":4}')"
+reply "$(text_reply 'slept on the grant')"
+say "sleep on"
+wait_asked 4
+press day
+check "an Allow 24 h grant covers the next call" 'wait_for "$OUT" "slept on the grant" && [ "$(asked)" = 4 ] && result $mn tu_s4 slept'
+
+# a money tool: asked every time, never for 24 h, capped, not made in a dry run
+reply "$(call_reply tu_o1 shop__echo '{"text":"order one","amount":5}')"
+reply "$(call_reply tu_o2 shop__echo '{"text":"order two","amount":5}')"
+reply "$(text_reply 'two orders placed')"
+say "buy twice"
+check "a money call asks with no Allow 24 h" 'wait_asked 5 && last_question | grep -qF "Dry run is off: this call is made." && [ -n "$(button once)" ] && [ -z "$(button day)" ]'
+press once
+wait_asked 6
+press once
+check "a money call is asked every time" 'wait_for "$OUT" "two orders placed" && [ "$(asked)" = 6 ] && result $((mn - 1)) tu_o1 "order one" && result $mn tu_o2 "order two"'
+reply "$(call_reply tu_o3 shop__echo '{"text":"big order","amount":50}')"
+reply "$(text_reply 'too big')"
+say "buy big"
+check "a money call over the cap is refused before asking" 'wait_for "$OUT" "too big" && [ "$(asked)" = 6 ] && result $mn tu_o3 "refused by the gate: 50 is over the cap of 10 per call"'
+say "/dryrun on"
+wait_for "$OUT" "Dry run is on: tools that move money are not called"
+reply "$(call_reply tu_o4 shop__echo '{"text":"order four","amount":5}')"
+reply "$(text_reply 'dry order done')"
+say "buy in a dry run"
+wait_asked 7
+press once
+check "with /dryrun on an approved money call is not made" 'wait_for "$OUT" "dry order done" && last_question | grep -qF "Dry run is on: this call is not made." && result $mn tu_o4 "dry run: would call shop/echo"'
+say "/dryrun off"
+wait_for "$OUT" "Dry run is off: approved money calls are made."
 
 kill "$RPID" 2>/dev/null
 wait "$RPID" 2>/dev/null
