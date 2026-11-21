@@ -24,9 +24,11 @@ pub fn validName(n: []const u8) bool {
 }
 
 /// A lowercase host name: labels of a-z, 0-9 and `-`, joined by dots; no
-/// scheme, port or path.
+/// scheme, port or path. At least two labels, but for `localhost`: a site
+/// of one (`com`) would cover every name in it.
 pub fn validSite(s: []const u8) bool {
     if (s.len == 0 or s.len > 253) return false;
+    if (std.mem.indexOfScalar(u8, s, '.') == null and !std.mem.eql(u8, s, "localhost")) return false;
     var it = std.mem.splitScalar(u8, s, '.');
     while (it.next()) |label| {
         if (label.len == 0 or label.len > 63) return false;
@@ -87,14 +89,11 @@ fn underSite(site: []const u8, host: []const u8) bool {
 }
 
 /// Whether a passkey for `rp_id` belongs to a login for `site`: the site
-/// itself, a name below it, or a parent domain of it that is not a bare
-/// top-level name (`com`).
+/// itself or a name below it, never a parent domain (its passkey would be
+/// good on every name below that, other sites among them).
 pub fn rpIdAllowed(site: []const u8, rp_id: []const u8) bool {
     if (rp_id.len == 0) return false;
-    if (std.mem.eql(u8, rp_id, site)) return true;
-    if (underSite(site, rp_id)) return true;
-    if (underSite(rp_id, site)) return std.mem.indexOfScalar(u8, rp_id, '.') != null;
-    return false;
+    return underSite(site, rp_id);
 }
 
 // ---- placeholders ----
@@ -134,12 +133,14 @@ pub fn placeholders(arena: std.mem.Allocator, text: []const u8) ![]Span {
 const lower = "abcdefghijklmnopqrstuvwxyz";
 const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const digits = "0123456789";
-const symbols = "!#$%&*+-=?@^_";
+/// No `!` or `*` (left as they are by some URL encoders, not by others),
+/// `%` (a decoded form would escape masking) or `^`.
+const symbols = "#$&+-=?@_";
 const alphabet = lower ++ upper ++ digits ++ symbols;
 
 pub const password_len = 24;
 
-/// 24 characters from letters, digits and `!#$%&*+-=?@^_`, with at least
+/// 24 characters from letters, digits and `#$&+-=?@_`, with at least
 /// one lowercase and one uppercase letter, one digit and one symbol.
 pub fn genPassword(io: Io) ![password_len]u8 {
     while (true) {
@@ -243,7 +244,11 @@ test "logins_ini_parses_and_refuses_bad_names_and_sites" {
         "[x]\nusername = u\n",
         "[x]\nsite = a.com\n[x]\nsite = b.com\n",
         "[x]\nsite = a.com\npassword = no\n",
+        // one label: a top-level name would bind the login to every site in it
+        "[x]\nsite = com\n",
     }) |bad| try t.expectError(error.BadLogins, parse(a, bad));
+    try t.expect(validSite("localhost") and validSite("a.b.example.com"));
+    try t.expect(!validSite("com") and !validSite("intranet"));
 }
 
 test "host_binding_follows_the_site" {
@@ -264,7 +269,10 @@ test "host_binding_follows_the_site" {
 test "passkey_rp_ids_must_belong_to_the_site" {
     try t.expect(rpIdAllowed("github.com", "github.com"));
     try t.expect(rpIdAllowed("github.com", "auth.github.com"));
-    try t.expect(rpIdAllowed("login.github.com", "github.com"));
+    // a parent domain is wider than the site: its passkey would sign in
+    // on every name below it
+    try t.expect(!rpIdAllowed("login.github.com", "github.com"));
+    try t.expect(!rpIdAllowed("a.b.github.com", "b.github.com"));
     try t.expect(!rpIdAllowed("github.com", "com"));
     try t.expect(!rpIdAllowed("login.github.com", "com"));
     try t.expect(!rpIdAllowed("github.com", "evil.com"));
@@ -298,6 +306,9 @@ test "generated_passwords_have_every_class" {
         const p = try genPassword(t.io);
         try t.expect(hasAny(&p, lower) and hasAny(&p, upper) and hasAny(&p, digits) and hasAny(&p, symbols));
         for (p) |c| try t.expect(std.mem.indexOfScalar(u8, alphabet, c) != null);
+        // none that encoders treat differently (`!*`), the escape sign
+        // itself (`%`: a decoded form would not be masked), or `^`
+        try t.expect(!hasAny(&p, "!%*^"));
         if (i > 0) try t.expect(!std.mem.eql(u8, &p, &seen));
         seen = p;
     }

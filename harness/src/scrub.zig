@@ -128,37 +128,31 @@ fn forms(a: std.mem.Allocator, v: []const u8) ![]const []const u8 {
     }
     try out.append(a, hex_lower);
     try out.append(a, hex_upper);
-    // percent-encoding of everything outside the unreserved set
-    var pct: std.ArrayList(u8) = .empty;
-    var pct_lower: std.ArrayList(u8) = .empty;
-    for (v) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~') {
-            try pct.append(a, c);
-            try pct_lower.append(a, c);
-        } else {
-            try pct.print(a, "%{X:0>2}", .{c});
-            try pct_lower.print(a, "%{x:0>2}", .{c});
+    // percent-encodings, each with upper- and lowercase hex: of everything
+    // outside the unreserved set (RFC 3986); application/x-www-form-urlencoded
+    // (`*-._` stay, space is `+`); what a page's encodeURIComponent and
+    // encodeURI leave as it is
+    const kinds = [_]struct { keep: []const u8, plus: bool }{
+        .{ .keep = "-._~", .plus = false },
+        .{ .keep = "*-._", .plus = true },
+        .{ .keep = "-_.!~*'()", .plus = false },
+        .{ .keep = "-_.!~*'();,/?:@&=+$#", .plus = false },
+    };
+    for (kinds) |k| for ([_]bool{ true, false }) |upper| {
+        var e: std.ArrayList(u8) = .empty;
+        for (v) |c| {
+            if (std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, k.keep, c) != null) {
+                try e.append(a, c);
+            } else if (c == ' ' and k.plus) {
+                try e.append(a, '+');
+            } else if (upper) {
+                try e.print(a, "%{X:0>2}", .{c});
+            } else {
+                try e.print(a, "%{x:0>2}", .{c});
+            }
         }
-    }
-    try out.append(a, pct.items);
-    try out.append(a, pct_lower.items);
-    // application/x-www-form-urlencoded: `*-._` stay, space is `+`
-    var form: std.ArrayList(u8) = .empty;
-    var form_lower: std.ArrayList(u8) = .empty;
-    for (v) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '*' or c == '-' or c == '.' or c == '_') {
-            try form.append(a, c);
-            try form_lower.append(a, c);
-        } else if (c == ' ') {
-            try form.append(a, '+');
-            try form_lower.append(a, '+');
-        } else {
-            try form.print(a, "%{X:0>2}", .{c});
-            try form_lower.print(a, "%{x:0>2}", .{c});
-        }
-    }
-    try out.append(a, form.items);
-    try out.append(a, form_lower.items);
+        try out.append(a, e.items);
+    };
     // base64, standard and url-safe, at each of the three alignments a
     // value can have inside a longer encoded text ("user:" ++ value)
     for ([_]std.base64.Base64Encoder{ std.base64.standard_no_pad.Encoder, std.base64.url_safe_no_pad.Encoder }) |enc| {
@@ -250,4 +244,14 @@ test "masks the form-urlencoded form" {
     const got = try scrubOnce(&.{v}, "user=x&pw=a+b*c%21d%7Ee-Q&n=1 lower=a+b*c%21d%7ee-Q");
     defer t.allocator.free(got);
     try t.expectEqualStrings("user=x&pw=[secret:pw]&n=1 lower=[secret:pw]", got);
+}
+
+test "masks what encodeURIComponent and encodeURI make of a value" {
+    const v: Secret = .{ .name = "pw", .value = "Ab1!*'()~;,/?:@&=+$#^%x y\u{e9}" };
+    // as a page's script makes them (node: encodeURIComponent(v), encodeURI(v))
+    const comp = "Ab1!*'()~%3B%2C%2F%3F%3A%40%26%3D%2B%24%23%5E%25x%20y%C3%A9";
+    const uri = "Ab1!*'()~;,/?:@&=+$#%5E%25x%20y%C3%A9";
+    const got = try scrubOnce(&.{v}, "c=" ++ comp ++ " u=" ++ uri ++ " lc=Ab1!*'()~%3b%2c%2f%3f%3a%40%26%3d%2b%24%23%5e%25x%20y%c3%a9 lu=Ab1!*'()~;,/?:@&=+$#%5e%25x%20y%c3%a9");
+    defer t.allocator.free(got);
+    try t.expectEqualStrings("c=[secret:pw] u=[secret:pw] lc=[secret:pw] lu=[secret:pw]", got);
 }

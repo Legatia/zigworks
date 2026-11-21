@@ -25,6 +25,8 @@ pub const Output = tools.Output;
 
 pub const Env = struct {
     browser: []const u8,
+    /// All of the browser's environment (PATH and HOME of harness's own).
+    chrome_env: page.BrowserEnv = .{},
     /// The data folder's `profiles/`: one folder per login.
     profiles: []const u8,
     /// Where a throwaway profile goes.
@@ -55,7 +57,7 @@ pub const Hooks = struct {
 pub fn toolDef(arena: Allocator, list: []const logins.Login) !model.ToolDef {
     var d: std.ArrayList(u8) = .empty;
     try d.appendSlice(arena,
-        \\An interactive browser. Actions: open (a url, optionally with one of your logins), type (into an element by ref; enter: true presses Enter after), click (ref), key (Enter, Tab or Escape), read, close. Every action returns the page: its address, its interactive elements numbered by ref, and its text. One session per turn; it closes when the turn ends.
+        \\An interactive browser. Actions: open (a url, optionally with one of your logins), type (into an element by ref; enter: true presses Enter after), click (ref), key (Enter, Tab or Escape), read, close. Every action returns the page: its address, its interactive elements numbered by ref, and its text. One session per turn; it closes when the turn ends. A new tab or window a page opens is closed at once (you are told its address); downloads are refused.
         \\To sign in, open with `login` (its own cookies and passkeys) and type placeholders: {login:NAME.username}, {login:NAME.password}, {login:NAME.code} (the current one-time code). They are filled in only on the login's site; you never see the values. A login without a password gets a new one the first time its password placeholder is typed on its site (for signing up). Passkeys made on the login's site are kept for it. CAPTCHAs and codes sent by SMS or e-mail: ask the owner.
     );
     if (list.len == 0) {
@@ -255,8 +257,7 @@ pub const Web = struct {
         } else if (eql(u8, action, "click")) {
             const ref = jv.int(jv.get(v, "ref")) orelse return fail(a, "click needs a ref", .{});
             const m = w.s.?.mark();
-            const r = try w.s.?.evaluateIsolated(a, try refScript(a, ref, "el.scrollIntoView({block: 'center'}); el.click(); return 'ok';"));
-            if (!eql(u8, r, "\"ok\"")) return fail(a, "no element [{d}] on the page; read it again", .{ref});
+            if (try w.click(a, ref)) |why| return fail(a, "{s}", .{why});
             try w.s.?.settle(a, m);
         } else if (eql(u8, action, "key")) {
             const key = jv.str(jv.get(v, "key")) orelse return fail(a, "key needs Enter, Tab or Escape", .{});
@@ -271,6 +272,13 @@ pub const Web = struct {
     /// Passkeys, the gate for where the page is now, then the page.
     fn after(w: *Web, a: Allocator, said: []const u8) !Output {
         try w.syncPasskeys(a);
+        // a load under way now (one that began later than the action
+        // waited for one, from a timer, say): the page once it has loaded,
+        // or as far as it got in the time allowed
+        if (w.s.?.inbox.loading(w.io).busy) w.s.?.waitLoaded(a) catch |e| switch (e) {
+            error.Timeout => {},
+            else => return e,
+        };
         const text = w.snapshot(a, said) catch |e| switch (e) {
             error.HostRefused => return fail(a, "{s}", .{w.refused}),
             else => return e,
@@ -279,7 +287,9 @@ pub const Web = struct {
     }
 
     fn open(w: *Web, a: Allocator, url: []const u8, login_name: ?[]const u8) !Output {
-        const host = gate.urlHost(url) orelse return fail(a, "only http and https addresses can be opened", .{});
+        // as the page's location.host will have it, so that the grants,
+        // the login's key and the later checks all name the same host
+        const host = try pageHost(a, url) orelse return fail(a, "only http and https addresses can be opened", .{});
         const want: ?logins.Login = if (login_name) |n| (logins.find(w.env.logins, n) orelse return fail(a, "no login called {s}", .{util.cut(n, 60)})) else null;
         if (w.hooks.allow(w.hooks.ctx, a, .web, host)) |why| return fail(a, "refused by the gate: {s}", .{why});
         // the same session goes on if it has the same login
@@ -310,16 +320,16 @@ pub const Web = struct {
             try setPrivate(w.io, p);
             break :blk p;
         } else blk: {
-            var rnd: [8]u8 = undefined;
-            w.io.random(&rnd);
-            try Io.Dir.cwd().createDirPath(w.io, w.env.tmp_root);
-            const p = try std.fs.path.join(w.arena.allocator(), &.{ w.env.tmp_root, try std.fmt.allocPrint(a, "harness-web-{x}", .{rnd}) });
-            try Io.Dir.cwd().createDir(w.io, p, .default_dir);
+            // (the first one also removes those a killed run left)
+            const p = try page.newProfile(w.io, w.arena.allocator(), w.env.tmp_root, "harness-web-");
             w.throwaway = p;
             break :blk p;
         };
-        try noPasswordManager(w.io, a, profile);
-        w.s = try cdp.Session.open(w.gpa, w.io, w.env.browser, profile, w.env.stop, w.env.timeout_ms);
+        try page.prepareProfile(w.io, a, profile);
+        // a login's cookies stay, those that end with the session too; its
+        // last tabs don't come back
+        if (w.login != null) try cdp.forgetLastTabs(w.io, a, profile);
+        w.s = try cdp.Session.open(w.gpa, w.io, w.env.browser, profile, w.env.stop, w.env.timeout_ms, .{ .env = w.env.chrome_env, .keep_session = w.login != null });
         if (w.login) |l| try w.loadPasskeys(a, l);
     }
 
@@ -336,6 +346,7 @@ pub const Web = struct {
         var nb: [96]u8 = undefined;
         const raw = st.get(w.io, w.gpa, logins.secretName(&nb, l.name, .passkeys)) catch {
             w.passkeys_bad = true;
+            try w.notes.appendSlice(w.arena.allocator(), "The stored passkeys of this login could not be read from the key store; none were loaded, and a new one would not be saved.\n");
             return;
         } orelse return;
         defer {
@@ -344,7 +355,7 @@ pub const Web = struct {
         }
         const list = logins.decode(w.arena.allocator(), raw) catch {
             w.passkeys_bad = true;
-            try w.notes.appendSlice(w.arena.allocator(), "The stored passkeys of this login could not be read; none were loaded.\n");
+            try w.notes.appendSlice(w.arena.allocator(), "The stored passkeys of this login could not be read; none were loaded, and a new one would not be saved.\n");
             return;
         };
         w.stored = list;
@@ -403,22 +414,26 @@ pub const Web = struct {
             w.hooks.note(w.hooks.ctx, "web passkey removed", l.name, pk.rp_id);
             try w.notes.print(w.arena.allocator(), "A passkey for {s} was removed: this login is for {s}.\n", .{ pk.rp_id, l.site });
         }
-        if (w.passkeys_bad) return;
         const merged = try mergePasskeys(a, w.stored, f.keep);
         if (!merged.changed) return;
-        const st = w.env.store orelse return;
-        var nb: [96]u8 = undefined;
-        const json = try logins.encode(a, merged.list);
-        defer std.crypto.secureZero(u8, @constCast(json));
-        st.put(w.io, logins.secretName(&nb, l.name, .passkeys), json) catch {
-            try w.notes.appendSlice(w.arena.allocator(), "A new passkey could not be saved to the key store.\n");
-            return;
-        };
-        for (merged.added) |rp| {
-            w.hooks.note(w.hooks.ctx, "web passkey saved", l.name, rp);
-            try w.notes.print(w.arena.allocator(), "A passkey for {s} was saved for this login.\n", .{rp});
+        if (w.passkeys_bad) {
+            // the stored list could not be read: writing would replace it
+            for (merged.added) |rp| try w.notes.print(w.arena.allocator(), "A passkey for {s} was made but not saved: the stored passkeys of this login could not be read.\n", .{rp});
+        } else {
+            const st = w.env.store orelse return;
+            var nb: [96]u8 = undefined;
+            const json = try logins.encode(a, merged.list);
+            defer std.crypto.secureZero(u8, @constCast(json));
+            st.put(w.io, logins.secretName(&nb, l.name, .passkeys), json) catch {
+                try w.notes.appendSlice(w.arena.allocator(), "A new passkey could not be saved to the key store.\n");
+                return;
+            };
+            for (merged.added) |rp| {
+                w.hooks.note(w.hooks.ctx, "web passkey saved", l.name, rp);
+                try w.notes.print(w.arena.allocator(), "A passkey for {s} was saved for this login.\n", .{rp});
+            }
         }
-        // the new list, kept for the next comparison
+        // the new list, kept for the next comparison (said once)
         const keep = try w.arena.allocator().alloc(logins.Passkey, merged.list.len);
         const wa = w.arena.allocator();
         for (merged.list, 0..) |pk, i| keep[i] = .{ .id = try wa.dupe(u8, pk.id), .rp_id = try wa.dupe(u8, pk.rp_id), .key = try wa.dupe(u8, pk.key), .user = try wa.dupe(u8, pk.user), .count = pk.count };
@@ -454,7 +469,7 @@ pub const Web = struct {
 
     fn typeInto(w: *Web, a: Allocator, ref: i64, text: []const u8) !Output {
         const spans = logins.placeholders(a, text) catch return fail(a, "a placeholder is not valid; use {{login:NAME.username}}, {{login:NAME.password}} or {{login:NAME.code}}", .{});
-        if (spans.len == 0) return w.fill(a, ref, text, &.{}, &.{}, null);
+        if (spans.len == 0) return w.fill(a, ref, text, &.{}, &.{}, null, "");
         // a value goes in alone: no text around it, one per field, so it
         // can't be made part of a message or a comment
         if (spans.len > 1 or spans[0].start != 0 or spans[0].end != text.len)
@@ -501,7 +516,8 @@ pub const Web = struct {
         try out.appendSlice(a, text[last..]);
         var sites: std.ArrayList([]const u8) = .empty;
         for (used.items) |l| try sites.append(a, l.site);
-        const r = try w.fill(a, ref, out.items, sites.items, used.items, spans[0].field);
+        // the host the gate allowed the login on, not just any on its site
+        const r = try w.fill(a, ref, out.items, sites.items, used.items, spans[0].field, loc.host);
         if (made and !r.is_error) try w.notes.appendSlice(w.arena.allocator(), "A new password was made and stored for this login.\n");
         return r;
     }
@@ -560,10 +576,10 @@ pub const Web = struct {
 
     /// One script in the page checks where it is and types (see
     /// fillScript); `sites` empty: no check (no login value in the text).
-    fn fill(w: *Web, a: Allocator, ref: i64, text: []const u8, sites: []const []const u8, used: []const logins.Login, field: ?logins.Field) !Output {
-        const script = try fillScript(a, ref, text, sites, field);
+    /// `host`: the one the gate allowed the login on.
+    fn fill(w: *Web, a: Allocator, ref: i64, text: []const u8, sites: []const []const u8, used: []const logins.Login, field: ?logins.Field, host: []const u8) !Output {
+        const script = try fillScript(a, ref, text, sites, field, host);
         defer std.crypto.secureZero(u8, @constCast(script));
-        const host = if (used.len > 0) (try w.location(a)).host else "";
         const r = try w.s.?.evaluateIsolated(a, script);
         const res = jv.str(jv.parse(a, r)) orelse "";
         if (std.mem.eql(u8, res, "ok")) {
@@ -584,6 +600,28 @@ pub const Web = struct {
             }, ref, util.cut(res["wrong-field".len..], 40) });
         }
         return fail(a, "no element [{d}] on the page; read it again", .{ref});
+    }
+
+    /// A click as a person's: the mouse pressed and released at the
+    /// element's centre, scrolled into view first. Not when something else
+    /// is on top of it there (a banner, a dialog): why not, then.
+    fn click(w: *Web, a: Allocator, ref: i64) !?[]const u8 {
+        const s = w.s.?;
+        const r = jv.parse(a, try s.evaluateIsolated(a, try refScript(a, ref, click_point_body)));
+        if (jv.str(r)) |no| {
+            if (std.mem.eql(u8, no, "no-element")) return try std.fmt.allocPrint(a, "no element [{d}] on the page; read it again", .{ref});
+            if (std.mem.startsWith(u8, no, "covered ")) return try std.fmt.allocPrint(a, "[{d}] is under another element where it would be clicked ({s}); close or answer that first", .{ ref, util.cut(no["covered ".len..], 100) });
+            return try std.fmt.allocPrint(a, "[{d}] can't be clicked: it takes no room on the page", .{ref});
+        }
+        const x = jv.num(jv.get(r, "x")) orelse return error.Script;
+        const y = jv.num(jv.get(r, "y")) orelse return error.Script;
+        const steps = [_][2][]const u8{
+            .{ "mouseMoved", "" },
+            .{ "mousePressed", ",\"button\":\"left\",\"buttons\":1,\"clickCount\":1" },
+            .{ "mouseReleased", ",\"button\":\"left\",\"buttons\":0,\"clickCount\":1" },
+        };
+        for (steps) |st| _ = try s.call(a, "Input.dispatchMouseEvent", try std.fmt.allocPrint(a, "{{\"type\":\"{s}\",\"x\":{d},\"y\":{d}{s}}}", .{ st[0], x, y, st[1] }));
+        return null;
     }
 
     fn pressKey(w: *Web, a: Allocator, key: []const u8) !void {
@@ -631,12 +669,43 @@ pub const Web = struct {
         var out: std.ArrayList(u8) = .empty;
         if (said.len > 0) try out.print(a, "{s}\n", .{said});
         try out.appendSlice(a, w.notes.items);
+        const downloads = try w.s.?.inbox.takeDownloads(w.io, w.gpa);
+        defer {
+            for (downloads) |d| w.gpa.free(d);
+            w.gpa.free(downloads);
+        }
+        for (downloads) |d| try out.print(a, "A download was refused (downloads are off): {s}\n", .{util.cut(d, 300)});
+        // new tabs and windows: closed before they load anything
+        const tabs = try w.s.?.inbox.takeTabs(w.io, w.gpa);
+        defer w.s.?.inbox.freeTabs(w.gpa, tabs);
+        for (tabs) |x| {
+            if (x.state != .closing) {
+                var p: std.ArrayList(u8) = .empty;
+                try p.appendSlice(a, "{\"targetId\":");
+                try util.jsonString(&p, a, x.target);
+                try p.append(a, '}');
+                _ = w.s.?.callIn(a, "Target.closeTarget", p.items, null) catch {};
+            }
+            if (x.url.len > 0)
+                try out.print(a, "A new tab for {s} was closed before it loaded; open that address to go there.\n", .{util.cut(x.url, 300)})
+            else
+                try out.appendSlice(a, "A new tab the page opened was closed.\n");
+        }
         const dialogs = try w.s.?.inbox.takeDialogs(w.io, a);
         for (dialogs) |d| {
+            defer d.free(w.gpa);
+            // its text only from the host the gate allowed (not a frame of
+            // another, not a page that was refused)
+            const from = try pageHost(a, d.url) orelse "";
+            if (from.len == 0) {
+                try out.print(a, "A dialog ({s}) from a frame with no web address was answered; its text is not shown.\n", .{d.kind});
+                continue;
+            }
+            if (!std.ascii.eqlIgnoreCase(from, w.granted_host)) {
+                try out.print(a, "A dialog ({s}) from another host ({s}) was answered; its text is not shown.\n", .{ d.kind, util.cut(from, 200) });
+                continue;
+            }
             try out.print(a, "Dialog ({s}): {s}{s}\n", .{ d.kind, d.message, if (std.mem.eql(u8, d.kind, "alert") or std.mem.eql(u8, d.kind, "beforeunload")) "" else " (dismissed)" });
-            w.gpa.free(d.kind);
-            w.gpa.free(d.message);
-            w.gpa.free(d.session);
         }
         try out.print(a, "URL: {s}\nTitle: {s}\n", .{ url, util.cut(jv.str(jv.get(v, "title")) orelse "", 300) });
         const items = jv.arr(jv.get(v, "items")) orelse &.{};
@@ -658,14 +727,40 @@ pub const Web = struct {
     }
 };
 
-/// Marks the top document's interactive elements with data-hx-ref and
-/// lists them; the page's HTML for its text. Never reads a field's value.
+/// The host of an http or https `url` as the page's `location.host` gives
+/// it: lowercase, without user info or the scheme's default port. Null for
+/// any other address.
+pub fn pageHost(a: Allocator, url: []const u8) !?[]const u8 {
+    const hp = page.urlHostPort(url) orelse return null;
+    var host = hp.host;
+    const default_port = if (hp.https) ":443" else ":80";
+    if (std.mem.endsWith(u8, host, default_port)) host = host[0 .. host.len - default_port.len];
+    if (host.len == 0) return null;
+    return try std.ascii.allocLowerString(a, host);
+}
+
+/// `hxAll(sel)`: the elements of the top document matching `sel`, open
+/// shadow roots included (each right after its host), in page order.
+const deep_js =
+    \\const hxAll = (sel) => {
+    \\  const out = [];
+    \\  const walk = (root) => { for (const el of root.querySelectorAll('*')) { if (el.matches(sel)) out.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
+    \\  walk(document);
+    \\  return out;
+    \\};
+    \\
+;
+
+/// Marks the top document's interactive elements (those in open shadow
+/// roots too) with data-hx-ref and lists them; the page's HTML for its
+/// text. Never reads a field's value.
 const snapshot_script =
     \\(() => {
-    \\  for (const el of document.querySelectorAll('[data-hx-ref]')) el.removeAttribute('data-hx-ref');
+++ deep_js ++
+    \\  for (const el of hxAll('[data-hx-ref]')) el.removeAttribute('data-hx-ref');
     \\  const items = [];
     \\  let n = 0;
-    \\  for (const el of document.querySelectorAll('input, textarea, select, button, a[href], [role=button]')) {
+    \\  for (const el of hxAll('input, textarea, select, button, a[href], [role=button]')) {
     \\    const tag = el.tagName.toLowerCase();
     \\    const type = tag === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : (tag === 'button' ? (el.getAttribute('type') || 'submit').toLowerCase() : '');
     \\    if (type === 'hidden' || el.getClientRects().length === 0) continue;
@@ -685,20 +780,44 @@ const snapshot_script =
     \\})()
 ;
 
+/// Where to click `el`: the centre of the first of its boxes where it (or
+/// what is in it, or its label) is what a click there would hit, after
+/// scrolling it into view; else 'covered WHAT', or 'no-room'.
+const click_point_body =
+    \\el.scrollIntoView({block: 'center', inline: 'center'});
+    \\const root = el.getRootNode();
+    \\const hits = (h) => h && (h === el || el.contains(h) || (el.labels && Array.from(el.labels).some((l) => l === h || l.contains(h))));
+    \\const boxes = Array.from(el.getClientRects()).filter((b) => b.width > 0 && b.height > 0);
+    \\for (const b of boxes) {
+    \\  const x = b.left + b.width / 2, y = b.top + b.height / 2;
+    \\  if (hits(root.elementFromPoint(x, y))) return {x, y};
+    \\}
+    \\if (el.labels) for (const l of el.labels) for (const b of Array.from(l.getClientRects())) {
+    \\  const x = b.left + b.width / 2, y = b.top + b.height / 2;
+    \\  if (b.width > 0 && b.height > 0 && hits(root.elementFromPoint(x, y))) return {x, y};
+    \\}
+    \\if (boxes.length === 0) return 'no-room';
+    \\const top = root.elementFromPoint(boxes[0].left + boxes[0].width / 2, boxes[0].top + boxes[0].height / 2);
+    \\return 'covered ' + (top ? top.tagName.toLowerCase() + ' "' + (top.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 60) + '"' : 'by nothing it can reach');
+;
+
 /// `body` runs with `el` the element marked `ref`; 'no-element' if none.
 fn refScript(a: Allocator, ref: i64, body: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "(() => {{ const el = document.querySelector('[data-hx-ref=\"{d}\"]'); if (!el) return 'no-element'; {s} }})()", .{ ref, body });
+    return std.fmt.allocPrint(a, "(() => {{\n{s}const el = hxAll('[data-hx-ref=\"{d}\"]')[0]; if (!el) return 'no-element'; {s} }})()", .{ deep_js, ref, body });
 }
 
 /// Checks that the page is on every one of `sites` (the rules of
-/// logins.hostAllowed, with string indexing and comparisons only), then
-/// sets the field's value with its prototype's own setter and sends input
-/// and change. Check and fill are one script: no navigation can come
+/// logins.hostAllowed, with string indexing and comparisons only) and on
+/// `host`, the very host the gate allowed (unless empty: no login value),
+/// then sets the field's value with its prototype's own setter and sends
+/// input and change. Check and fill are one script: no navigation can come
 /// between them. It runs in an isolated world, where the page can't have
 /// changed `location` or the prototypes it uses.
-fn fillScript(a: Allocator, ref: i64, value: []const u8, sites: []const []const u8, field: ?logins.Field) ![]const u8 {
+fn fillScript(a: Allocator, ref: i64, value: []const u8, sites: []const []const u8, field: ?logins.Field, host: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(a, "(() => {\nconst sites = [");
+    try out.appendSlice(a, "(() => {\nconst approved = ");
+    try util.jsonString(&out, a, host);
+    try out.appendSlice(a, ";\nif (approved !== '' && location.host !== approved) return 'wrong-site ' + location.protocol + '//' + location.host;\nconst sites = [");
     for (sites, 0..) |s, i| {
         if (i > 0) try out.append(a, ',');
         try util.jsonString(&out, a, s);
@@ -719,7 +838,8 @@ fn fillScript(a: Allocator, ref: i64, value: []const u8, sites: []const []const 
         \\if (window !== window.top) return 'wrong-site (a frame)';
         \\
     );
-    try out.print(a, "const el = document.querySelector('[data-hx-ref=\"{d}\"]');\n", .{ref});
+    try out.appendSlice(a, deep_js);
+    try out.print(a, "const el = hxAll('[data-hx-ref=\"{d}\"]')[0];\n", .{ref});
     try out.appendSlice(a,
         \\if (!el) return 'no-element';
         \\let proto = null;
@@ -788,32 +908,6 @@ fn mergePasskeys(a: Allocator, stored: []const logins.Passkey, now: []const logi
     return .{ .list = list.items, .changed = changed, .added = added.items };
 }
 
-/// Chrome's own password manager off in `profile` (its Default/Preferences,
-/// written before Chrome starts): typed passwords must not end up saved
-/// in the profile's Login Data.
-fn noPasswordManager(io: Io, a: Allocator, profile: []const u8) !void {
-    const dir = try std.fs.path.join(a, &.{ profile, "Default" });
-    try Io.Dir.cwd().createDirPath(io, dir);
-    const path = try std.fs.path.join(a, &.{ dir, "Preferences" });
-    const old = Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch |e| switch (e) {
-        error.FileNotFound => "",
-        else => return e,
-    };
-    var root: std.json.Value = .{ .object = .empty };
-    if (jv.parse(a, old)) |v| if (v == .object) {
-        root = v;
-    };
-    try root.object.put(a, "credentials_enable_service", .{ .bool = false });
-    var prof: std.json.Value = root.object.get("profile") orelse .{ .object = .empty };
-    if (prof != .object) prof = .{ .object = .empty };
-    try prof.object.put(a, "password_manager_enabled", .{ .bool = false });
-    try root.object.put(a, "profile", prof);
-    const text = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(root, .{})});
-    var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = if (is_windows) .default_file else .fromMode(0o600) });
-    defer f.close(io);
-    try f.writeStreamingAll(io, text);
-}
-
 fn setPrivate(io: Io, path: []const u8) !void {
     if (is_windows) return;
     var d = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
@@ -845,6 +939,9 @@ const Fix = struct {
     asked: std.ArrayList(u8) = .empty,
     /// What the gate refuses: a tool's name, or "" for nothing.
     refuse: []const u8 = "",
+    /// Where the page goes while the gate is asked about a login (a
+    /// navigation between the check and the fill).
+    move_to: []const u8 = "",
     web: Web,
     browser: []const u8,
 
@@ -857,6 +954,7 @@ const Fix = struct {
         f.notes = .empty;
         f.asked = .empty;
         f.refuse = "";
+        f.move_to = "";
         f.store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
         try f.e.tmp.dir.createDirPath(t.io, "profiles");
         try f.e.tmp.dir.createDirPath(t.io, "tmp");
@@ -879,9 +977,12 @@ const Fix = struct {
     }
 
     fn allowFn(ctx: *anyopaque, arena: Allocator, tool: gate.Tool, arg: []const u8) ?[]const u8 {
-        _ = arena;
         const f: *Fix = @ptrCast(@alignCast(ctx));
         f.asked.print(t.allocator, "{s} {s}\n", .{ @tagName(tool), arg }) catch {};
+        if (tool == .login and f.move_to.len > 0) {
+            f.web.s.?.navigate(arena, f.move_to) catch {};
+            f.move_to = "";
+        }
         if (std.mem.eql(u8, f.refuse, @tagName(tool))) return "denied by the owner";
         return null;
     }
@@ -987,6 +1088,77 @@ fn treeHas(io: Io, a: Allocator, dir: []const u8, needle: []const u8) !bool {
     return false;
 }
 
+/// The names in `dir` (relative to the test's folder), or "" if it is not there.
+fn listDir(f: *Fix, dir: []const u8) ![]const u8 {
+    const a = f.e.arena.allocator();
+    var d = f.e.tmp.dir.openDir(t.io, dir, .{ .iterate = true }) catch return "";
+    defer d.close(t.io);
+    var out: std.ArrayList(u8) = .empty;
+    var it = d.iterate();
+    while (try it.next(t.io)) |e| try out.print(a, "{s} ", .{e.name});
+    return out.items;
+}
+
+test "web_refuses_downloads_and_says_so" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\n");
+    defer f.deinit();
+    // where a download would land (never the real Downloads folder)
+    try f.e.tmp.dir.createDirPath(t.io, "dl");
+    try f.e.tmp.dir.createDirPath(t.io, "profiles/agent/Default");
+    const prefs = try std.fmt.allocPrint(f.e.arena.allocator(), "{{\"download\":{{\"default_directory\":\"{s}/dl\",\"prompt_for_download\":false}}}}", .{f.e.dir});
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "profiles/agent/Default/Preferences", .data = prefs });
+    try f.page("get.html", "<html><body><a href=\"/page/file.bin\">get it</a></body></html>");
+    try f.page("file.bin", "\x00\x01 some bytes");
+    _ = try f.act(try f.openJson("get.html", "agent"));
+    const r = try f.act("{\"action\":\"click\",\"ref\":1}");
+    // a finished download would be there by now
+    var tries: u32 = 0;
+    while (tries < 30 and (try listDir(&f, "dl")).len == 0) : (tries += 1) t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    try t.expectEqualStrings("", try listDir(&f, "dl"));
+    try t.expectEqualStrings("", try listDir(&f, "profiles/agent/Downloads"));
+    try expectHas(r.text, "A download was refused");
+    try expectHas(r.text, "/page/file.bin");
+}
+
+test "web_login_cookies_survive_to_the_next_browser" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\n");
+    defer f.deinit();
+    try f.page("c.html", "<html><body><p>cookies</p></body></html>");
+    _ = try f.act(try f.openJson("c.html", "agent"));
+    // one that expires in an hour (as a site's \"remember me\")
+    _ = try f.eval("document.cookie = 'kept=1; max-age=3600; path=/'");
+    _ = try f.act("{\"action\":\"close\"}");
+    _ = try f.act(try f.openJson("c.html", "agent"));
+    try expectHas(try f.eval("document.cookie"), "kept=1");
+    // a throwaway profile has none of them
+    _ = try f.act(try f.openJson("c.html", null));
+    try t.expectEqualStrings("\"\"", try f.eval("document.cookie"));
+}
+
+test "web_login_session_cookies_survive_and_no_old_tab_comes_back" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\n");
+    defer f.deinit();
+    try f.page("c.html", "<html><body><p>cookies</p></body></html>");
+    try f.page("last.html", "<html><body><script>localStorage.setItem('last', String(Number(localStorage.getItem('last') || 0) + 1))</script></body></html>");
+    _ = try f.act(try f.openJson("c.html", "agent"));
+    // most sign-ins: a cookie that ends with the session
+    _ = try f.eval("document.cookie = 'sid=7; path=/'");
+    // the last page of a browser is not opened again by the next one
+    _ = try f.act(try f.openJson("last.html", "agent"));
+    try t.expectEqualStrings("\"1\"", try f.eval("localStorage.getItem('last')"));
+    _ = try f.act("{\"action\":\"close\"}");
+    for (0..2) |_| {
+        _ = try f.act(try f.openJson("c.html", "agent"));
+        try expectHas(try f.eval("document.cookie"), "sid=7");
+        try t.expectEqual(1, try pageTargets(&f));
+        try t.expectEqualStrings("\"1\"", try f.eval("localStorage.getItem('last')"));
+        _ = try f.act("{\"action\":\"close\"}");
+    }
+}
+
 test "web_profiles_keep_no_saved_passwords" {
     var f: Fix = undefined;
     try f.init("[agent]\nsite = localhost\nusername = agent-bot\n");
@@ -1026,6 +1198,26 @@ test "web_refuses_a_login_on_another_site" {
     try t.expect(!has(f.asked.items, "login other"));
 }
 
+test "web_types_a_login_value_only_on_the_host_the_gate_allowed" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\n");
+    defer f.deinit();
+    try f.store.put(t.io, "login-agent-password", "fake-Pass-7351!");
+    try f.page("login.html", login_page);
+    // a page that marks its own field the way the snapshot would have
+    try f.page("trap.html", "<html><body><input id=\"pw\" type=\"password\" data-hx-ref=\"2\"></body></html>");
+    _ = try f.act(try f.openJson("login.html", null));
+    // the owner allows the login on localhost; meanwhile the page went to
+    // another host under the same site
+    f.move_to = try std.fmt.allocPrint(f.e.arena.allocator(), "http://a.localhost:{d}/page/trap.html", .{f.e.server.port});
+    const r = try f.act("{\"action\":\"type\",\"ref\":2,\"text\":\"{login:agent.password}\"}");
+    try expectHas(f.asked.items, "login agent localhost:");
+    try expectHas(try f.eval("location.host"), "a.localhost:");
+    try t.expect(r.is_error);
+    try expectHas(r.text, "Not typed");
+    try t.expectEqualStrings("\"\"", try f.eval("document.getElementById('pw').value"));
+}
+
 test "web_fill_script_refuses_a_page_that_lies_about_its_host" {
     // the page's own globals can't fool the check: it runs in an isolated world
     var f: Fix = undefined;
@@ -1038,12 +1230,13 @@ test "web_fill_script_refuses_a_page_that_lies_about_its_host" {
     );
     _ = try f.act(try f.openJson("liar.html", null));
     const a = f.e.arena.allocator();
-    for ([_][]const u8{ "example.com", "calhost" }) |site| {
-        const r = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "must-not-arrive", &.{site}, null));
+    const here = try std.fmt.allocPrint(a, "localhost:{d}", .{f.e.server.port});
+    for ([_][2][]const u8{ .{ "example.com", here }, .{ "calhost", here }, .{ "localhost", "localhost:1" } }) |c| {
+        const r = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "must-not-arrive", &.{c[0]}, null, c[1]));
         try t.expect(std.mem.startsWith(u8, r, "\"wrong-site http://localhost:"));
     }
     try t.expectEqualStrings("\"\"", try f.eval("document.getElementById('pw').value"));
-    const ok = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "fine", &.{"localhost"}, null));
+    const ok = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "fine", &.{"localhost"}, null, here));
     try t.expectEqualStrings("\"ok\"", ok);
     try t.expectEqualStrings("\"fine\"", try f.eval("document.getElementById('pw').value"));
 }
@@ -1178,6 +1371,35 @@ test "web_passkey_made_just_before_close_is_kept" {
     try t.expectEqual(1, saved.len);
 }
 
+test "web_says_when_the_stored_passkeys_cannot_be_read" {
+    var f: Fix = undefined;
+    try f.init("[p]\nsite = localhost\nusername = agent-bot\n");
+    defer f.deinit();
+    // the key store fails to read this login's passkeys (a folder where
+    // the value should be)
+    try f.e.tmp.dir.createDirPath(t.io, "secrets/login-p-passkeys");
+    try f.page("pk.html", passkey_page);
+    const r0 = try f.act(try f.openJson("pk.html", "p"));
+    try expectHas(r0.text, "could not be read");
+    // everything said from the click until the page says it registered,
+    // and once more
+    var said: std.ArrayList(u8) = .empty;
+    const a = f.e.arena.allocator();
+    try said.appendSlice(a, (try f.act("{\"action\":\"click\",\"ref\":1}")).text);
+    var tries: u32 = 0;
+    while (!has(said.items, "registered") and tries < 20) : (tries += 1) {
+        t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        try said.appendSlice(a, (try f.act("{\"action\":\"read\"}")).text);
+    }
+    try said.appendSlice(a, (try f.act("{\"action\":\"read\"}")).text);
+    try expectHas(said.items, "registered");
+    try expectHas(said.items, "was made but not saved");
+    // said once, not after every action
+    try t.expectEqual(1, std.mem.count(u8, said.items, "not saved"));
+    // what is stored was left as it was
+    try t.expectEqual(.directory, (try f.e.tmp.dir.statFile(t.io, "secrets/login-p-passkeys", .{})).kind);
+}
+
 test "web_passkey_for_another_site_is_removed" {
     var f: Fix = undefined;
     try f.init("[p]\nsite = localhost\n");
@@ -1209,6 +1431,38 @@ test "web_passkey_for_another_site_is_removed" {
     const lc = jv.arr(jv.get(left, "credentials")).?;
     try t.expectEqual(1, lc.len);
     try t.expectEqualStrings("localhost", jv.str(jv.get(lc[0], "rpId")).?);
+}
+
+test "web_asks_once_for_a_host_written_in_capitals" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\nusername = agent-bot\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.page("login.html", login_page);
+    const r0 = try f.act(try std.fmt.allocPrint(a, "{{\"action\":\"open\",\"url\":\"http://LocalHost:{d}/page/login.html\",\"login\":\"agent\"}}", .{f.e.server.port}));
+    try t.expect(!r0.is_error);
+    const r1 = try f.act("{\"action\":\"type\",\"ref\":1,\"text\":\"{login:agent.username}\"}");
+    try expectHas(r1.text, "Typed into [1].");
+    // the host as the page has it: asked once for the page, once for the login
+    try t.expectEqualStrings(try std.fmt.allocPrint(a, "web localhost:{d}\nlogin agent localhost:{d}\n", .{ f.e.server.port, f.e.server.port }), f.asked.items);
+}
+
+test "web_page_hosts_are_lowercase_without_user_or_default_port" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][2][]const u8{
+        .{ "https://GitHub.com/login", "github.com" },
+        .{ "https://github.com:443/x", "github.com" },
+        .{ "http://Example.org:80", "example.org" },
+        .{ "https://example.org:80/", "example.org:80" },
+        .{ "http://example.org:443/", "example.org:443" },
+        .{ "http://localhost:8080/a?b#c", "localhost:8080" },
+        .{ "https://user:pw@Evil.example:443/", "evil.example" },
+        .{ "https://github.com\\@evil.example/", "github.com" },
+        .{ "HTTPS://[::1]:443/", "[::1]" },
+    }) |c| try t.expectEqualStrings(c[1], (try pageHost(a, c[0])).?);
+    for ([_][]const u8{ "ftp://x.org/", "https://", "https:///x", "javascript:alert(1)", "https://user@/" }) |u| try t.expectEqual(null, try pageHost(a, u));
 }
 
 test "web_asks_the_gate_when_a_click_lands_on_another_host" {
@@ -1314,6 +1568,171 @@ test "web_answers_dialogs_and_shows_them" {
     try t.expect(!has(r2.text, "hello there"));
 }
 
+test "web_shows_no_dialog_text_from_a_host_not_allowed" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // a frame from another host (127.0.0.1) on an allowed page (localhost)
+    try f.page("framed.html", try std.fmt.allocPrint(a, "<html><body><p>outer page</p><iframe src=\"http://127.0.0.1:{d}/page/inner.html\"></iframe></body></html>", .{f.e.server.port}));
+    try f.page("inner.html", "<html><body><script>alert('iframe secret text')</script></body></html>");
+    const r = try f.act(try f.openJson("framed.html", null));
+    try expectHas(r.text, "outer page");
+    try t.expect(!has(r.text, "iframe secret text"));
+    try expectHas(r.text, "from another host (127.0.0.1:");
+    // a refused page's dialog doesn't come out later either
+    try f.page("loud.html", "<html><body><script>alert('refused page text')</script></body></html>");
+    try f.page("to.html", try std.fmt.allocPrint(a, "<html><body><a href=\"http://127.0.0.1:{d}/page/loud.html\">away</a></body></html>", .{f.e.server.port}));
+    _ = try f.act(try f.openJson("to.html", null));
+    f.refuse = "web";
+    const r2 = try f.act("{\"action\":\"click\",\"ref\":1}");
+    try t.expect(r2.is_error);
+    f.refuse = "";
+    const r3 = try f.act(try f.openJson("to.html", null));
+    for ([_][]const u8{ r2.text, r3.text }) |x| try t.expect(!has(x, "refused page text"));
+}
+
+/// The page targets the browser has now.
+fn pageTargets(f: *Fix) !usize {
+    const a = f.e.arena.allocator();
+    const got = try f.web.s.?.callIn(a, "Target.getTargets", "{}", null);
+    var n: usize = 0;
+    for (jv.arr(jv.get(got, "targetInfos")) orelse &.{}) |ti| {
+        if (std.mem.eql(u8, jv.str(jv.get(ti, "type")) orelse "", "page")) n += 1;
+    }
+    return n;
+}
+
+test "web_closes_a_new_tab_before_it_loads_and_says_where_it_went" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.page("opener.html", "<html><body><button id=\"b\" onclick=\"window.open('/page/tab.html?from=opener')\">open</button><p id=\"o\"></p></body></html>");
+    // it would leave a mark the opener can see, had it loaded
+    try f.page("tab.html", "<html><body><script>localStorage.setItem('tab', 'loaded')</script></body></html>");
+    _ = try f.act(try f.openJson("opener.html", null));
+    // as a person's click would (a popup needs one)
+    _ = try f.web.s.?.call(a, "Runtime.evaluate", "{\"expression\":\"document.getElementById('b').click()\",\"userGesture\":true}");
+    var tries: u32 = 0;
+    var r = try f.act("{\"action\":\"read\"}");
+    var said: std.ArrayList(u8) = .empty;
+    try said.appendSlice(a, r.text);
+    while (!has(said.items, "new tab") and tries < 20) : (tries += 1) {
+        t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        r = try f.act("{\"action\":\"read\"}");
+        try said.appendSlice(a, r.text);
+    }
+    try expectHas(said.items, "A new tab for ");
+    try expectHas(said.items, "/page/tab.html?from=opener");
+    try t.expectEqual(1, try pageTargets(&f));
+    try t.expectEqualStrings("null", try f.eval("localStorage.getItem('tab')"));
+    // a link to a new tab, and an empty window (no address ever)
+    try f.page("more.html", "<html><body><a id=\"l\" target=\"_blank\" href=\"/page/tab.html?from=link\">link</a><button id=\"e\" onclick=\"window.open()\">empty</button></body></html>");
+    _ = try f.act(try f.openJson("more.html", null));
+    for ([_][]const u8{ "l", "e" }) |id| {
+        _ = try f.web.s.?.call(a, "Runtime.evaluate", try std.fmt.allocPrint(a, "{{\"expression\":\"document.getElementById('{s}').click()\",\"userGesture\":true}}", .{id}));
+        t.io.sleep(.fromMilliseconds(500), .awake) catch {};
+    }
+    const r2 = try f.act("{\"action\":\"read\"}");
+    try expectHas(r2.text, "/page/tab.html?from=link was closed before it loaded");
+    try expectHas(r2.text, "A new tab the page opened was closed.");
+    try t.expectEqual(1, try pageTargets(&f));
+    try t.expectEqualStrings("null", try f.eval("localStorage.getItem('tab')"));
+}
+
+test "web_clicks_like_a_person" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.page("trust.html",
+        \\<html><body><p id="o"></p><button onclick="document.getElementById('o').textContent = event.isTrusted ? 'a trusted click' : 'a script click'">Press</button>
+        \\<div style="height: 1500px"></div><button onclick="document.getElementById('o').textContent = 'far one ' + event.isTrusted">Far</button>
+        \\<div style="position: relative"><button onclick="document.getElementById('o').textContent = 'under was clicked'">Under</button>
+        \\<div style="position: absolute; left: 0; top: 0; width: 100%; height: 100%; background: white">Accept our cookies</div></div>
+        \\<label><input type="checkbox" id="c" style="opacity: 0; position: absolute"><span>Remember me</span></label></body></html>
+    );
+    _ = try f.act(try f.openJson("trust.html", null));
+    const r1 = try f.act("{\"action\":\"click\",\"ref\":1}");
+    try expectHas(r1.text, "a trusted click");
+    // below the fold: scrolled to first
+    const r2 = try f.act("{\"action\":\"click\",\"ref\":2}");
+    try expectHas(r2.text, "far one true");
+    // under something else: not clicked, and said
+    const r3 = try f.act("{\"action\":\"click\",\"ref\":3}");
+    try t.expect(r3.is_error);
+    try expectHas(r3.text, "under another element where it would be clicked (div \"Accept our cookies\")");
+    try t.expect(!has(try f.eval("document.getElementById('o').textContent"), "under was clicked"));
+    // a box hidden under its own label is clicked through the label
+    const r4 = try f.act("{\"action\":\"click\",\"ref\":4}");
+    try t.expect(!r4.is_error);
+    try t.expectEqualStrings("true", try f.eval("document.getElementById('c').checked"));
+}
+
+test "web_sees_and_fills_fields_inside_open_shadow_roots" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\n");
+    defer f.deinit();
+    try f.store.put(t.io, "login-agent-password", "fake-Pass-7351!");
+    try f.page("shadow.html",
+        \\<html><head><title>Shadow</title></head><body><sign-in></sign-in><p id="o"></p><script>
+        \\customElements.define('sign-in', class extends HTMLElement { constructor() { super();
+        \\  const r = this.attachShadow({mode: 'open'});
+        \\  r.innerHTML = '<label for="pw">Password</label><input id="pw" type="password"><button id="go">Sign in</button>';
+        \\  r.getElementById('go').onclick = () => { document.getElementById('o').textContent = r.getElementById('pw').value === 'fake-Pass-7351!' ? 'shadow welcome' : 'wrong'; };
+        \\} });
+        \\</script></body></html>
+    );
+    const r0 = try f.act(try f.openJson("shadow.html", "agent"));
+    try expectHas(r0.text, "[1] input password \"Password\"");
+    try expectHas(r0.text, "[2] button submit \"Sign in\"");
+    const r1 = try f.act("{\"action\":\"type\",\"ref\":1,\"text\":\"{login:agent.password}\"}");
+    try expectHas(r1.text, "Typed into [1].");
+    const r2 = try f.act("{\"action\":\"click\",\"ref\":2}");
+    try expectHas(r2.text, "shadow welcome");
+    for ([_][]const u8{ r0.text, r1.text, r2.text }) |x| try t.expect(!has(x, "fake-Pass-7351!"));
+}
+
+test "web_click_on_a_select_leaves_the_page_usable" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.page("sel.html", "<html><body><select aria-label=\"Size\"><option value=\"s\">Small</option><option value=\"l\">Large</option></select><input aria-label=\"Name\"><button onclick=\"document.getElementById('o').textContent = 'pressed'\">Go</button><p id=\"o\"></p></body></html>");
+    _ = try f.act(try f.openJson("sel.html", null));
+    const r1 = try f.act("{\"action\":\"click\",\"ref\":1}");
+    try t.expect(!r1.is_error);
+    const r2 = try f.act("{\"action\":\"type\",\"ref\":1,\"text\":\"l\"}");
+    try t.expect(!r2.is_error);
+    const r3 = try f.act("{\"action\":\"type\",\"ref\":2,\"text\":\"agent\"}");
+    try t.expect(!r3.is_error);
+    const r4 = try f.act("{\"action\":\"click\",\"ref\":3}");
+    try expectHas(r4.text, "pressed");
+    try t.expectEqualStrings("[\"l\",\"agent\"]", try f.eval("[document.querySelector('select').value, document.querySelector('input').value]"));
+}
+
+test "web_clicks_that_open_a_tab_or_a_download_are_handled" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.page("both.html", "<html><body><a target=\"_blank\" href=\"/page/tab.html?by=click\">tab</a> <button onclick=\"window.open('/page/tab.html?by=script')\">win</button> <a href=\"/page/f.bin\" download>file</a></body></html>");
+    try f.page("tab.html", "<html><body><script>localStorage.setItem('tab', 'loaded')</script></body></html>");
+    try f.page("f.bin", "bytes");
+    _ = try f.act(try f.openJson("both.html", null));
+    var said: std.ArrayList(u8) = .empty;
+    const a = f.e.arena.allocator();
+    for ([_][]const u8{ "1", "2", "3" }) |ref| try said.appendSlice(a, (try f.act(try std.fmt.allocPrint(a, "{{\"action\":\"click\",\"ref\":{s}}}", .{ref}))).text);
+    var tries: u32 = 0;
+    while (tries < 20 and !(has(said.items, "by=click") and has(said.items, "by=script") and has(said.items, "refused"))) : (tries += 1) {
+        t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        try said.appendSlice(a, (try f.act("{\"action\":\"read\"}")).text);
+    }
+    try expectHas(said.items, "/page/tab.html?by=click was closed before it loaded");
+    try expectHas(said.items, "/page/tab.html?by=script was closed before it loaded");
+    try expectHas(said.items, "A download was refused (downloads are off): ");
+    try t.expectEqual(1, try pageTargets(&f));
+    try t.expectEqualStrings("null", try f.eval("localStorage.getItem('tab')"));
+}
+
 test "web_waits_for_a_slow_navigation_after_a_click" {
     var f: Fix = undefined;
     try f.init("");
@@ -1335,6 +1754,61 @@ test "web_waits_for_a_slow_navigation_after_a_click" {
     const r2 = try f.act(frag);
     try t.expect(!r2.is_error);
     try expectHas(r2.text, "#part");
+}
+
+test "web_removes_throwaway_profiles_a_killed_run_left" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.e.tmp.dir.createDirPath(t.io, "tmp/harness-web-89abcdef/Default");
+    try f.e.tmp.dir.createDirPath(t.io, "tmp/harness-browser-01234567");
+    try f.page("here.html", "<html><body><p>here</p></body></html>");
+    _ = try f.act(try f.openJson("here.html", null));
+    for ([_][]const u8{ "tmp/harness-web-89abcdef", "tmp/harness-browser-01234567" }) |p| try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, p, .{}));
+    // its own is there until it closes
+    try t.expect(f.web.throwaway != null);
+    _ = try Io.Dir.cwd().statFile(t.io, f.web.throwaway.?, .{});
+}
+
+test "web_waits_for_a_load_under_way_when_the_page_is_read" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.page("here.html", "<html><head><title>Here</title></head><body><p>the old page</p></body></html>");
+    // there at once, but loaded only when its slow image is
+    try f.page("late.html", "<html><head><title>Arrived</title></head><body><p>the new page</p><img src=\"/page/img.bin?delay_ms=1500\"><script>window.addEventListener('load', () => { document.body.append('and all of it'); });</script></body></html>");
+    try f.page("img.bin", "not an image");
+    _ = try f.act(try f.openJson("here.html", null));
+    // a load that starts later than an action waits for one (a script's
+    // timer), still under way when the page is read
+    _ = try f.web.s.?.evaluate(a, "setTimeout(() => { location.href = '/page/late.html'; }, 0)");
+    var tries: u32 = 0;
+    while (!f.web.s.?.inbox.loading(t.io).busy and tries < 100) : (tries += 1) t.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    try t.expect(f.web.s.?.inbox.loading(t.io).busy);
+    const r = try f.web.after(a, "");
+    try expectHas(r.text, "Title: Arrived");
+    try expectHas(r.text, "and all of it");
+}
+
+test "web_page_scripts_cannot_stall_the_waits" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    f.web.env.timeout_ms = 4000;
+    // a page that says it is never loaded, and fakes the mark of an old page
+    try f.page("stall.html", "<html><head><title>Stall</title></head><body><p>stalling page</p><script>Object.defineProperty(document, 'readyState', {get: () => 'loading'}); window.__hxOld = true;</script></body></html>");
+    try f.page("to.html", "<html><body><a href=\"/page/stall.html\">go</a></body></html>");
+    const r = try f.act(try f.openJson("stall.html", null));
+    if (r.is_error) std.debug.print("\n{s}\n", .{r.text});
+    try t.expect(!r.is_error);
+    try expectHas(r.text, "stalling page");
+    _ = try f.act(try f.openJson("to.html", null));
+    const r2 = try f.act("{\"action\":\"click\",\"ref\":1}");
+    try t.expect(!r2.is_error);
+    try expectHas(r2.text, "Title: Stall");
+    const r3 = try f.act(try f.openJson("to.html", null));
+    try t.expect(!r3.is_error);
 }
 
 test "web_snapshot_never_shows_a_host_the_gate_did_not_allow" {

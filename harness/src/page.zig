@@ -7,6 +7,8 @@
 //! content, and a writer that turns the chosen tokens into text.
 const std = @import("std");
 const builtin = @import("builtin");
+const util = @import("util.zig");
+const jv = @import("jv.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -1136,6 +1138,8 @@ const Watch = struct {
     deadline_ns: i128,
     done: std.atomic.Value(bool) = .init(false),
     reason: ?Ended = null,
+    /// The browser was reaped: its pid and group id may be another's now.
+    reaped: std.atomic.Value(bool) = .init(false),
 
     fn run(w: *Watch) void {
         while (!w.done.load(.acquire)) {
@@ -1149,50 +1153,229 @@ const Watch = struct {
             }
             w.io.sleep(.fromMilliseconds(50), .awake) catch {};
         }
-        if (w.reason != null) killAll(w.id);
+        if (w.reason != null) w.killAll();
+    }
+
+    /// The whole process group on POSIX (the browser's helpers go too);
+    /// the process itself on Windows.
+    fn killAll(w: *Watch) void {
+        if (is_windows) {
+            _ = std.os.windows.ntdll.NtTerminateProcess(w.id, @fromBackingInt(@intCast(1)));
+        } else {
+            w.killGroup();
+            std.posix.kill(w.id, .KILL) catch {};
+        }
+    }
+
+    fn killGroup(w: *Watch) void {
+        if (is_windows) return else {
+            if (w.reaped.load(.acquire)) _ = late_group_kills.fetchAdd(1, .acq_rel);
+            std.posix.kill(-w.id, .KILL) catch {};
+        }
     }
 };
 
-/// The whole process group on POSIX (the browser's helpers go too); the
-/// process itself on Windows.
-fn killAll(id: std.process.Child.Id) void {
-    if (is_windows) {
-        _ = std.os.windows.ntdll.NtTerminateProcess(id, @fromBackingInt(@intCast(1)));
-    } else {
-        std.posix.kill(-id, .KILL) catch {};
-        std.posix.kill(id, .KILL) catch {};
+/// Group kills sent after the browser was reaped (must stay 0; for tests).
+pub var late_group_kills: std.atomic.Value(u32) = .init(0);
+
+/// Blocks until the child `pid` has ended, without reaping it: until it is
+/// reaped, its pid and its process group id stay its own, so its group can
+/// still be killed safely. (Elsewhere than Linux and macOS: at once.)
+pub fn waitExited(pid: std.posix.pid_t) void {
+    switch (builtin.os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            var info: linux.siginfo_t = undefined;
+            while (true) switch (linux.errno(linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOWAIT, null))) {
+                .INTR => continue,
+                else => return,
+            };
+        },
+        .macos => {
+            // <sys/wait.h>: P_PID 1, WEXITED 0x4, WNOWAIT 0x20
+            var info: [256]u8 align(16) = undefined;
+            while (true) {
+                if (darwin_waitid(1, @intCast(pid), &info, 0x4 | 0x20) == 0) return;
+                if (std.c.errno(@as(c_int, -1)) != .INTR) return;
+            }
+        },
+        else => {},
     }
+}
+
+extern "c" fn waitid(idtype: c_int, id: c_uint, infop: *anyopaque, options: c_int) c_int;
+const darwin_waitid = if (builtin.os.tag == .macos) waitid else undefined;
+
+/// What a browser's environment is made of: nothing else of harness's own
+/// environment (keys and tokens among it) reaches it.
+pub const BrowserEnv = struct {
+    path: []const u8 = "",
+    home: []const u8 = "",
+    /// Windows: the system's own variables (util.system_var_names).
+    system: []const util.Var = &.{},
+
+    pub fn map(e: BrowserEnv, arena: Allocator) !std.process.Environ.Map {
+        var m = std.process.Environ.Map.init(arena);
+        for (e.system) |v| try m.put(v.name, v.value);
+        try m.put("PATH", if (e.path.len > 0) e.path else "/usr/local/bin:/usr/bin:/bin");
+        if (e.home.len > 0) try m.put("HOME", e.home);
+        try m.put("LANG", "C.UTF-8");
+        return m;
+    }
+};
+
+/// Every browser harness starts: headless, no first-run screens, and the
+/// system's own key store left alone (a mock of the macOS Keychain, no
+/// desktop keyring on Linux).
+pub const browser_flags = [_][]const u8{
+    "--headless=new",
+    "--disable-gpu",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-extensions",
+    "--mute-audio",
+    "--use-mock-keychain",
+    "--password-store=basic",
+};
+
+/// The host of an http or https `url` with its port if it has one, as
+/// written (no user info); null for any other address.
+pub fn urlHostPort(url: []const u8) ?struct { https: bool, host: []const u8 } {
+    const https = std.ascii.startsWithIgnoreCase(url, "https://");
+    const rest = if (https) url[8..] else if (std.ascii.startsWithIgnoreCase(url, "http://")) url[7..] else return null;
+    // a backslash ends the host as a slash does (the browser reads it so)
+    const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#\\") orelse rest.len];
+    const host = authority[if (std.mem.lastIndexOfScalar(u8, authority, '@')) |i| i + 1 else 0..];
+    if (host.len == 0) return null;
+    return .{ .https = https, .host = host };
+}
+
+/// The host name of an http(s) `url`, lowercase, without user info or
+/// port; null unless it is made of letters, digits, dots and dashes only
+/// (it goes into the browser's host rules).
+pub fn urlHostname(arena: Allocator, url: []const u8) !?[]const u8 {
+    var host = (urlHostPort(url) orelse return null).host;
+    if (std.mem.lastIndexOfScalar(u8, host, ':')) |i| host = host[0..i];
+    if (host.len == 0) return null;
+    for (host) |c| if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-')) return null;
+    return try std.ascii.allocLowerString(arena, host);
+}
+
+/// Settings harness needs in a browser `profile`, written to its
+/// Default/Preferences before the browser starts (whatever else is there
+/// stays): Chrome's own password manager off (typed passwords must not end
+/// up in the profile's Login Data), and downloads blocked, with their
+/// folder inside the profile should one get through: a page never saves a
+/// file anywhere else (the user's Downloads among them).
+pub fn prepareProfile(io: Io, a: Allocator, profile: []const u8) !void {
+    const dir = try std.fs.path.join(a, &.{ profile, "Default" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(a, &.{ dir, "Preferences" });
+    const old = Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => return e,
+    };
+    var root: std.json.Value = .{ .object = .empty };
+    if (jv.parse(a, old)) |v| if (v == .object) {
+        root = v;
+    };
+    const downloads = try std.fs.path.join(a, &.{ profile, "Downloads" });
+    try setPref(a, &root, &.{"credentials_enable_service"}, .{ .bool = false });
+    try setPref(a, &root, &.{ "profile", "password_manager_enabled" }, .{ .bool = false });
+    // 3: every download blocked
+    try setPref(a, &root, &.{"download_restrictions"}, .{ .integer = 3 });
+    try setPref(a, &root, &.{ "download", "default_directory" }, .{ .string = downloads });
+    try setPref(a, &root, &.{ "download", "prompt_for_download" }, .{ .bool = false });
+    try setPref(a, &root, &.{ "download", "directory_upgrade" }, .{ .bool = true });
+    try setPref(a, &root, &.{ "savefile", "default_directory" }, .{ .string = downloads });
+    const text = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(root, .{})});
+    var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = util.private_file });
+    defer f.close(io);
+    try f.writeStreamingAll(io, text);
+}
+
+/// Sets `value` at `keys` below `v`, making the objects on the way.
+fn setPref(a: Allocator, v: *std.json.Value, keys: []const []const u8, value: std.json.Value) !void {
+    if (v.* != .object) v.* = .{ .object = .empty };
+    if (keys.len == 1) return v.object.put(a, keys[0], value);
+    const slot = try v.object.getOrPut(a, keys[0]);
+    if (!slot.found_existing) slot.value_ptr.* = .{ .object = .empty };
+    return setPref(a, slot.value_ptr, keys[1..], value);
+}
+
+/// The folders of throwaway profiles in a `tmp_root`: browse's, web's.
+pub const throwaway_prefixes = [_][]const u8{ "harness-browser-", "harness-web-" };
+
+var profiles_mutex: Io.Mutex = .init;
+/// The roots swept in this process (page_allocator).
+var swept: std.StringHashMapUnmanaged(void) = .empty;
+
+/// A new empty throwaway profile `PREFIX<random>` in `tmp_root`. The first
+/// one this process makes there first removes those left by an earlier
+/// run (killed before it could remove its own); this process has none
+/// there yet then.
+pub fn newProfile(io: Io, arena: Allocator, tmp_root: []const u8, prefix: []const u8) ![]const u8 {
+    profiles_mutex.lockUncancelable(io);
+    defer profiles_mutex.unlock(io);
+    try Io.Dir.cwd().createDirPath(io, tmp_root);
+    if (!swept.contains(tmp_root)) {
+        sweepProfiles(io, tmp_root);
+        const k = try std.heap.page_allocator.dupe(u8, tmp_root);
+        swept.put(std.heap.page_allocator, k, {}) catch std.heap.page_allocator.free(k);
+    }
+    var rnd: [8]u8 = undefined;
+    io.random(&rnd);
+    const p = try std.fs.path.join(arena, &.{ tmp_root, try std.fmt.allocPrint(arena, "{s}{x}", .{ prefix, rnd }) });
+    try Io.Dir.cwd().createDir(io, p, .default_dir);
+    return p;
+}
+
+/// Removes the throwaway profiles in `root` (folders only, not links).
+fn sweepProfiles(io: Io, root: []const u8) void {
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var dir = Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    // the names first: removing while listing may skip some
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .directory) continue;
+        for (throwaway_prefixes) |pre| if (std.mem.startsWith(u8, e.name, pre)) {
+            names.append(a, a.dupe(u8, e.name) catch continue) catch {};
+        };
+    }
+    for (names.items) |n| dir.deleteTree(io, n) catch {};
 }
 
 /// Renders `url` in a headless browser with a fresh throwaway profile and
 /// returns the DOM as HTML (at most max_bytes). Ends it on `stop`
 /// (error.Stopped) or after timeout_ms (error.Timeout).
-pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url: []const u8, tmp_root: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32, max_bytes: usize) ![]const u8 {
+pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url: []const u8, tmp_root: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32, max_bytes: usize, benv: BrowserEnv) ![]const u8 {
     if (!validUrl(url)) return error.BadUrl;
+    const host = try urlHostname(arena, url) orelse return error.BadUrl;
 
-    var rnd: [8]u8 = undefined;
-    io.random(&rnd);
-    const name = try std.fmt.allocPrint(arena, "harness-browser-{x}", .{rnd});
-    try Io.Dir.cwd().createDirPath(io, tmp_root);
-    const profile = try std.fs.path.join(arena, &.{ tmp_root, name });
-    try Io.Dir.cwd().createDir(io, profile, .default_dir);
+    const profile = try newProfile(io, arena, tmp_root, "harness-browser-");
     defer removeProfile(io, profile);
+    try prepareProfile(io, arena, profile);
 
-    const argv: []const []const u8 = &.{
-        browser,
-        "--headless=new",
-        "--disable-gpu",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-extensions",
-        "--mute-audio",
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(arena, browser);
+    try argv.appendSlice(arena, &browser_flags);
+    try argv.appendSlice(arena, &.{
         try std.fmt.allocPrint(arena, "--user-data-dir={s}", .{profile}),
+        // the gate allowed this host: no other is even looked up (the
+        // page's scripts, images and frames from elsewhere don't load)
+        try std.fmt.allocPrint(arena, "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE {s}", .{host}),
         "--virtual-time-budget=8000",
         "--dump-dom",
         url,
-    };
+    });
+    var vars = try benv.map(arena);
     var child = try std.process.spawn(io, .{
-        .argv = argv,
+        .argv = argv.items,
+        .environ_map = &vars,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .ignore,
@@ -1220,22 +1403,34 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
         defer out_f.close(io);
         var ended: std.atomic.Value(bool) = .init(false);
         const th_out = try std.Thread.spawn(.{}, Collector.pumpUntil, .{ &col, io, out_f, &ended });
-        term = child.wait(io) catch null;
+        // ended (on its own, or killed by the watch) but not reaped: its
+        // group id is still its own, and the watch kills nothing after this
+        waitExited(watch.id);
+        watch.done.store(true, .release);
+        th_watch.join();
         // nothing it started may outlive it
-        std.posix.kill(-watch.id, .KILL) catch {};
+        watch.killGroup();
+        term = child.wait(io) catch null;
+        watch.reaped.store(true, .release);
         var waited: u32 = 0;
         while (!col.finished.load(.acquire) and waited < 2000) : (waited += 20) io.sleep(.fromMilliseconds(20), .awake) catch {};
         ended.store(true, .release);
         th_out.join();
     }
-    watch.done.store(true, .release);
-    th_watch.join();
+    if (is_windows) {
+        watch.done.store(true, .release);
+        th_watch.join();
+    }
 
     if (watch.reason) |r| return switch (r) {
         .stopped => error.Stopped,
         .timeout => error.Timeout,
     };
     if (col.buf.items.len == 0) {
+        // the address was a download: refused (see prepareProfile), and
+        // nothing to show; its folder is made when one starts
+        const dl = try std.fs.path.join(arena, &.{ profile, "Downloads" });
+        if (Io.Dir.cwd().statFile(io, dl, .{})) |_| return error.DownloadRefused else |_| {}
         const ok = if (term) |tm| tm == .exited and tm.exited == 0 else false;
         return if (ok) "" else error.BrowserFailed;
     }
@@ -1257,6 +1452,9 @@ fn removeProfile(io: Io, path: []const u8) void {
 // ---- tests ----
 
 const t = std.testing;
+
+/// What the stand-in browsers in the tests need: `sleep` and `echo`.
+const test_env: BrowserEnv = .{ .path = "/usr/bin:/bin" };
 
 fn ex(html: []const u8, base: []const u8) !Page {
     return extract(t.allocator, html, base);
@@ -1607,7 +1805,7 @@ test "render_refuses_non_http_urls" {
     defer arena.deinit();
     var stop: std.atomic.Value(bool) = .init(false);
     for ([_][]const u8{ "file:///etc/passwd", "javascript:alert(1)", "ftp://x.example/", "about:blank", "--headless", "http://x.example/a b", "" }) |u| {
-        try t.expectError(error.BadUrl, render(t.allocator, t.io, arena.allocator(), "/no/such/chrome", u, "/tmp", &stop, 1000, 1 << 20));
+        try t.expectError(error.BadUrl, render(t.allocator, t.io, arena.allocator(), "/no/such/chrome", u, "/tmp", &stop, 1000, 1 << 20, .{}));
     }
 }
 
@@ -1632,7 +1830,7 @@ test "render_stops_and_times_out_and_cleans_up" {
     var stop: std.atomic.Value(bool) = .init(false);
 
     const start = Io.Clock.awake.now(t.io).nanoseconds;
-    try t.expectError(error.Timeout, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "slow" }), "https://example.com/", profiles, &stop, 500, 1 << 20));
+    try t.expectError(error.Timeout, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "slow" }), "https://example.com/", profiles, &stop, 500, 1 << 20, test_env));
     const took_ms = @divFloor(Io.Clock.awake.now(t.io).nanoseconds - start, std.time.ns_per_ms);
     try t.expect(took_ms < 3000);
 
@@ -1642,13 +1840,13 @@ test "render_stops_and_times_out_and_cleans_up" {
             flag.store(true, .release);
         }
     }.f, .{&stop});
-    try t.expectError(error.Stopped, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "slow" }), "https://example.com/", profiles, &stop, 20_000, 1 << 20));
+    try t.expectError(error.Stopped, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "slow" }), "https://example.com/", profiles, &stop, 20_000, 1 << 20, test_env));
     th.join();
     stop.store(false, .release);
 
-    const dom = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", profiles, &stop, 5000, 1 << 20);
+    const dom = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", profiles, &stop, 5000, 1 << 20, test_env);
     try t.expectEqualStrings("<html><body><p>dom</p></body></html>\n", dom);
-    const capped = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", profiles, &stop, 5000, 6);
+    const capped = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", profiles, &stop, 5000, 6, test_env);
     try t.expectEqualStrings("<html>", capped);
 
     // every throwaway profile is gone
@@ -1656,6 +1854,195 @@ test "render_stops_and_times_out_and_cleans_up" {
     defer dir.close(t.io);
     var it = dir.iterate();
     try t.expectEqual(@as(?Io.Dir.Entry, null), try it.next(t.io));
+}
+
+test "render_never_kills_a_group_after_the_browser_was_reaped" {
+    // once reaped, its pid and group id can be given to another process
+    if (is_windows) return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "quick", .data = "#!/bin/sh\necho '<html><body><p>dom</p></body></html>'\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "slow", .data = "#!/bin/sh\nsleep 30 &\nsleep 30\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    for ([_][]const u8{ "quick", "slow" }) |n| {
+        var f = try tmp.dir.openFile(t.io, n, .{});
+        defer f.close(t.io);
+        try f.setPermissions(t.io, .fromMode(0o755));
+    }
+    var stop: std.atomic.Value(bool) = .init(false);
+    const before = late_group_kills.load(.acquire);
+    _ = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", root, &stop, 5000, 1 << 20, test_env);
+    try t.expectError(error.Timeout, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "slow" }), "http://example.com/", root, &stop, 300, 1 << 20, test_env));
+    try t.expectEqual(before, late_group_kills.load(.acquire));
+}
+
+/// The variables in `env` output (one NAME=value a line) other than those
+/// in `allowed` and those a shell sets itself (for tests).
+pub fn otherVars(a: Allocator, env_out: []const u8, allowed: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, env_out, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "ARG ") or std.mem.startsWith(u8, line, "<")) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const name = line[0..eq];
+        if (name.len == 0) continue;
+        const ok = for ([_][]const u8{ "PWD", "OLDPWD", "SHLVL", "_" } ++ .{}) |n| {
+            if (std.mem.eql(u8, n, name)) break true;
+        } else for (allowed) |n| {
+            if (std.mem.eql(u8, n, name)) break true;
+        } else false;
+        if (!ok) try out.print(a, "{s} ", .{name});
+    }
+    return out.items;
+}
+
+test "render_gives_the_browser_a_small_environment_and_keeps_it_on_the_host" {
+    if (is_windows) return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // a stand-in browser that shows its environment and arguments
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "show", .data = "#!/bin/sh\necho '<html><body><pre>'\nenv\nfor a in \"$@\"; do echo \"ARG $a\"; done\necho '</pre></body></html>'\n" });
+    var f = try tmp.dir.openFile(t.io, "show", .{});
+    try f.setPermissions(t.io, .fromMode(0o755));
+    f.close(t.io);
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    var stop: std.atomic.Value(bool) = .init(false);
+    const out = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "show" }), "https://user@Docs.Example.com:8443/a", root, &stop, 5000, 1 << 20, .{ .path = "/usr/bin:/bin", .home = "/no/such/home" });
+    try t.expectEqualStrings("", try otherVars(a, out, &.{ "PATH", "HOME", "LANG" }));
+    try expectHas(out, "PATH=/usr/bin:/bin\n");
+    try expectHas(out, "HOME=/no/such/home\n");
+    // the system's key store is left alone (macOS Keychain, a desktop keyring)
+    try expectHas(out, "ARG --use-mock-keychain\n");
+    try expectHas(out, "ARG --password-store=basic\n");
+    // no other host than the one the gate allowed is even looked up
+    try expectHas(out, "ARG --host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE docs.example.com\n");
+}
+
+test "render_keeps_downloads_off_and_inside_the_profile" {
+    if (is_windows) return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // a stand-in that shows the settings the browser would start with
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "prefs", .data = "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --user-data-dir=*) d=\"${a#--user-data-dir=}\";; esac; done\necho \"PROFILE $d\"\ncat \"$d/Default/Preferences\"\n" });
+    var f = try tmp.dir.openFile(t.io, "prefs", .{});
+    try f.setPermissions(t.io, .fromMode(0o755));
+    f.close(t.io);
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    var stop: std.atomic.Value(bool) = .init(false);
+    const out = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "prefs" }), "http://example.com/", root, &stop, 5000, 1 << 20, test_env);
+    const nl = std.mem.indexOfScalar(u8, out, '\n') orelse return error.TestUnexpectedResult;
+    const profile = out["PROFILE ".len..nl];
+    const v = jv.parse(a, out[nl + 1 ..]) orelse {
+        std.debug.print("\nno settings:\n{s}\n", .{out});
+        return error.TestUnexpectedResult;
+    };
+    try t.expectEqual(@as(?i64, 3), jv.int(jv.get(v, "download_restrictions")));
+    const dl = try std.fs.path.join(a, &.{ profile, "Downloads" });
+    try t.expectEqualStrings(dl, jv.str(jv.at(v, &.{ "download", "default_directory" })).?);
+    try t.expectEqualStrings(dl, jv.str(jv.at(v, &.{ "savefile", "default_directory" })).?);
+    try t.expectEqual(false, jv.boolean(jv.at(v, &.{ "download", "prompt_for_download" })).?);
+    try t.expectEqual(false, jv.boolean(jv.get(v, "credentials_enable_service")).?);
+    // an address that is a download: Chrome prints nothing and starts the
+    // download (refused): that is said, not an empty page
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "dl", .data = "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --user-data-dir=*) d=\"${a#--user-data-dir=}\";; esac; done\nmkdir -p \"$d/Downloads\"\n" });
+    var g = try tmp.dir.openFile(t.io, "dl", .{});
+    try g.setPermissions(t.io, .fromMode(0o755));
+    g.close(t.io);
+    try t.expectError(error.DownloadRefused, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "dl" }), "http://example.com/file.zip", root, &stop, 5000, 1 << 20, test_env));
+}
+
+test "render_removes_throwaway_profiles_a_killed_run_left" {
+    if (is_windows) return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "quick", .data = "#!/bin/sh\necho '<html><body><p>dom</p></body></html>'\n" });
+    var f = try tmp.dir.openFile(t.io, "quick", .{});
+    try f.setPermissions(t.io, .fromMode(0o755));
+    f.close(t.io);
+    // what a harness killed in the middle of a page left behind
+    try tmp.dir.createDirPath(t.io, "state/harness-browser-0123abcd/Default");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "state/harness-browser-0123abcd/Default/Cookies", .data = "x" });
+    try tmp.dir.createDirPath(t.io, "state/harness-web-4567ef01");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "state/grants", .data = "kept" });
+    try tmp.dir.createDirPath(t.io, "state/harness-webby");
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    var stop: std.atomic.Value(bool) = .init(false);
+    _ = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", try std.fs.path.join(a, &.{ root, "state" }), &stop, 5000, 1 << 20, test_env);
+    var dir = try tmp.dir.openDir(t.io, "state", .{ .iterate = true });
+    defer dir.close(t.io);
+    var it = dir.iterate();
+    var names: std.ArrayList(u8) = .empty;
+    while (try it.next(t.io)) |e| try names.print(a, "{s} ", .{e.name});
+    try t.expect(!has(names.items, "harness-browser-") and !has(names.items, "harness-web-"));
+    try expectHas(names.items, "grants");
+    try expectHas(names.items, "harness-webby");
+}
+
+test "render_of_a_download_saves_nothing_and_says_so" {
+    if (is_windows) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const browser = (try @import("cdp.zig").testBrowser(a)) orelse return error.SkipZigTest;
+    var e: @import("model.zig").TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    var rnd: [6]u8 = undefined;
+    t.io.random(&rnd);
+    const name = try std.fmt.allocPrint(a, "harness-probe-{x}.bin", .{rnd});
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = try std.fmt.allocPrint(a, "pages/{s}", .{name}), .data = "\x00probe bytes" });
+    // Chrome starts only with downloads off and inside the profile, so
+    // this test can't save a file anywhere else, whatever render does
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "guard", .data = try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\for a in "$@"; do case "$a" in --user-data-dir=*) d="${{a#--user-data-dir=}}";; esac; done
+        \\grep -qF '"download_restrictions":3' "$d/Default/Preferences" || exit 3
+        \\grep -qF "\"default_directory\":\"$d/Downloads\"" "$d/Default/Preferences" || exit 3
+        \\exec "{s}" "$@"
+        \\
+    , .{browser}) });
+    var f = try e.tmp.dir.openFile(t.io, "guard", .{});
+    try f.setPermissions(t.io, .fromMode(0o755));
+    f.close(t.io);
+    const guard = try std.fs.path.join(a, &.{ e.dir, "guard" });
+    var stop: std.atomic.Value(bool) = .init(false);
+    try t.expectError(error.DownloadRefused, render(t.allocator, t.io, a, guard, try std.fmt.allocPrint(a, "http://localhost:{d}/page/{s}", .{ e.server.port, name }), e.dir, &stop, 30_000, 4 << 20, test_env));
+    // (looked at, never written: the folder downloads go to by default)
+    if (t.environ.getPosix("HOME")) |home| {
+        const there = try std.fs.path.join(a, &.{ home, "Downloads", name });
+        try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, there, .{}));
+    }
+}
+
+test "render_loads_nothing_from_another_host" {
+    if (is_windows) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const browser = (try @import("cdp.zig").testBrowser(a)) orelse return error.SkipZigTest;
+    var e: @import("model.zig").TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    // 127.0.0.1 is another host than localhost, though the same server
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/h.html", .data = try std.fmt.allocPrint(a, "<html><body><p>page</p><script src=\"http://127.0.0.1:{d}/page/o.bin\"></script><script src=\"/page/s.bin\"></script></body></html>", .{e.server.port}) });
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/o.bin", .data = "document.body.append('other host ran');" });
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/s.bin", .data = "document.body.append('same host ran');" });
+    var stop: std.atomic.Value(bool) = .init(false);
+    const dom = try render(t.allocator, t.io, a, browser, try std.fmt.allocPrint(a, "http://localhost:{d}/page/h.html", .{e.server.port}), e.dir, &stop, 30_000, 4 << 20, test_env);
+    try expectHas(dom, "same host ran");
+    try expectLacks(dom, "other host ran");
 }
 
 test "render_example_com_with_a_real_browser" {
@@ -1671,7 +2058,7 @@ test "render_example_com_with_a_real_browser" {
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     var stop: std.atomic.Value(bool) = .init(false);
-    const dom = try render(t.allocator, t.io, a, browser, "https://example.com/", root, &stop, 30_000, 4 << 20);
+    const dom = try render(t.allocator, t.io, a, browser, "https://example.com/", root, &stop, 30_000, 4 << 20, test_env);
     const p = try extract(a, dom, "https://example.com/");
     std.debug.print("\nbrowser: {s}\ntitle: {s}\ntext: {s}\n", .{ browser, p.title, p.text });
     try t.expect(has(p.title, "Example Domain"));

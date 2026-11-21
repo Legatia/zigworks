@@ -6,20 +6,55 @@ const std = @import("std");
 const builtin = @import("builtin");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
+const page = @import("page.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const is_windows = builtin.os.tag == .windows;
 
-/// A JavaScript dialog the page opened (answered at once).
-pub const Dialog = struct { kind: []u8, message: []u8, session: []u8, answered: bool = false };
+/// A JavaScript dialog the page opened (answered at once); `url`: of the
+/// frame that opened it.
+pub const Dialog = struct {
+    kind: []u8,
+    message: []u8,
+    session: []u8,
+    url: []u8,
+    answered: bool = false,
 
-/// Ids at or above this are the reader's own commands (dialog answers);
-/// their replies are dropped. (Chrome takes ids up to 2^31 - 1 only.)
+    pub fn free(d: Dialog, gpa: Allocator) void {
+        gpa.free(d.kind);
+        gpa.free(d.message);
+        gpa.free(d.session);
+        gpa.free(d.url);
+    }
+};
+
+/// A tab (or window) a page opened. It starts paused; the reader lets it
+/// go on with every request held back, takes the address of its first
+/// one, fails it and closes the tab: it loads nothing.
+pub const Tab = struct {
+    session: []u8,
+    target: []u8,
+    /// Where it was going (owned; empty until its first request).
+    url: []u8 = &.{},
+    request: []u8 = &.{},
+    state: enum { new, running, blocked, closing } = .new,
+
+    fn free(x: Tab, gpa: Allocator) void {
+        gpa.free(x.session);
+        gpa.free(x.target);
+        gpa.free(x.url);
+        gpa.free(x.request);
+    }
+};
+
+/// Ids at or above this are the reader's own commands (dialog answers,
+/// new tabs); their replies are dropped. (Chrome takes ids up to 2^31 - 1
+/// only.)
 const own_ids: u32 = 1 << 30;
 
-/// Replies by id. Of the events, only the main frame's loading and
-/// JavaScript dialogs are kept.
+/// Replies by id. Of the events, only the main frame's loading, JavaScript
+/// dialogs, refused downloads and new tabs are kept.
 pub const Inbox = struct {
     gpa: Allocator,
     mutex: Io.Mutex = .init,
@@ -31,6 +66,11 @@ pub const Inbox = struct {
     started_at: u32 = 0,
     stopped_at: u32 = 0,
     dialogs: std.ArrayList(Dialog) = .empty,
+    /// Addresses of downloads the browser refused (owned).
+    downloads: std.ArrayList([]u8) = .empty,
+    /// The page harness drives (owned); every other page is a new tab.
+    main_target: []u8 = &.{},
+    tabs: std.ArrayList(Tab) = .empty,
     /// Bytes of a message not yet ended by its NUL.
     partial: std.ArrayList(u8) = .empty,
     /// The pipe closed: Chrome is gone.
@@ -41,12 +81,13 @@ pub const Inbox = struct {
         while (it.next()) |v| b.gpa.free(v.*);
         b.replies.deinit(b.gpa);
         b.partial.deinit(b.gpa);
-        for (b.dialogs.items) |d| {
-            b.gpa.free(d.kind);
-            b.gpa.free(d.message);
-            b.gpa.free(d.session);
-        }
+        for (b.dialogs.items) |d| d.free(b.gpa);
         b.dialogs.deinit(b.gpa);
+        for (b.downloads.items) |u| b.gpa.free(u);
+        b.downloads.deinit(b.gpa);
+        for (b.tabs.items) |x| x.free(b.gpa);
+        b.tabs.deinit(b.gpa);
+        b.gpa.free(b.main_target);
         if (b.main_frame.len > 0) b.gpa.free(b.main_frame);
     }
 
@@ -58,7 +99,7 @@ pub const Inbox = struct {
     }
 
     fn event(b: *Inbox, io: Io, msg: []const u8) void {
-        const watched = [_][]const u8{ "Page.frameStartedLoading", "Page.frameStoppedLoading", "Page.javascriptDialogOpening" };
+        const watched = [_][]const u8{ "Page.frameStartedLoading", "Page.frameStoppedLoading", "Page.javascriptDialogOpening", "Browser.downloadWillBegin", "Target.attachedToTarget", "Target.detachedFromTarget", "Fetch.requestPaused" };
         const m = for (watched) |w| {
             if (std.mem.indexOf(u8, msg[0..@min(msg.len, 64)], w) != null) break w;
         } else return;
@@ -70,13 +111,27 @@ pub const Inbox = struct {
         b.mutex.lockUncancelable(io);
         defer b.mutex.unlock(io);
         b.seq += 1;
+        if (std.mem.eql(u8, m, "Browser.downloadWillBegin")) {
+            // refused (Browser.setDownloadBehavior deny): only said
+            const url = b.gpa.dupe(u8, util.cut(jv.str(jv.get(params, "url")) orelse "", 2000)) catch return;
+            b.downloads.append(b.gpa, url) catch b.gpa.free(url);
+            return;
+        }
+        if (m[0] == 'T' or m[0] == 'F') return b.tabEvent(m, v, params);
         if (m[5] == 'j') {
-            const d: Dialog = .{
-                .kind = b.gpa.dupe(u8, jv.str(jv.get(params, "type")) orelse "dialog") catch return,
-                .message = b.gpa.dupe(u8, util.cut(jv.str(jv.get(params, "message")) orelse "", 2000)) catch return,
-                .session = b.gpa.dupe(u8, jv.str(jv.get(v, "sessionId")) orelse "") catch return,
+            const kind = b.gpa.dupe(u8, jv.str(jv.get(params, "type")) orelse "dialog") catch return;
+            const message = b.gpa.dupe(u8, util.cut(jv.str(jv.get(params, "message")) orelse "", 2000)) catch return b.gpa.free(kind);
+            const session = b.gpa.dupe(u8, jv.str(jv.get(v, "sessionId")) orelse "") catch {
+                b.gpa.free(kind);
+                return b.gpa.free(message);
             };
-            b.dialogs.append(b.gpa, d) catch {};
+            const url = b.gpa.dupe(u8, util.cut(jv.str(jv.get(params, "url")) orelse "", 2000)) catch {
+                b.gpa.free(kind);
+                b.gpa.free(message);
+                return b.gpa.free(session);
+            };
+            const d: Dialog = .{ .kind = kind, .message = message, .session = session, .url = url };
+            b.dialogs.append(b.gpa, d) catch d.free(b.gpa);
             return;
         }
         const frame = jv.str(jv.get(params, "frameId")) orelse return;
@@ -84,7 +139,60 @@ pub const Inbox = struct {
         if (m[10] == 'S' and m[11] == 't' and m[12] == 'a') b.started_at = b.seq else b.stopped_at = b.seq;
     }
 
-    /// The dialogs seen since the last call; the caller frees with freeDialogs.
+    /// A new tab attached (paused), detached (gone), or its request held.
+    /// Under the mutex.
+    fn tabEvent(b: *Inbox, m: []const u8, v: jv.Value, params: ?jv.Value) void {
+        if (std.mem.eql(u8, m, "Target.attachedToTarget")) {
+            const target = jv.str(jv.at(params, &.{ "targetInfo", "targetId" })) orelse return;
+            const kind = jv.str(jv.at(params, &.{ "targetInfo", "type" })) orelse return;
+            const session = jv.str(jv.get(params, "sessionId")) orelse return;
+            // harness's own page (attached twice: by harness, and as one
+            // that was there when new ones began to be watched)
+            if (!std.mem.eql(u8, kind, "page") or std.mem.eql(u8, target, b.main_target)) return;
+            const x: Tab = .{ .session = b.gpa.dupe(u8, session) catch return, .target = b.gpa.dupe(u8, target) catch return };
+            b.tabs.append(b.gpa, x) catch x.free(b.gpa);
+            return;
+        }
+        const session = (if (m[0] == 'F') jv.str(jv.get(v, "sessionId")) else jv.str(jv.get(params, "sessionId"))) orelse return;
+        const x = for (b.tabs.items) |*x| {
+            if (std.mem.eql(u8, x.session, session)) break x;
+        } else return;
+        if (m[0] == 'F') {
+            const request = jv.str(jv.get(params, "requestId")) orelse return;
+            if (x.state != .running) return;
+            if (x.url.len == 0) x.url = b.gpa.dupe(u8, util.cut(jv.str(jv.at(params, &.{ "request", "url" })) orelse "", 2000)) catch return;
+            x.request = b.gpa.dupe(u8, request) catch return;
+            x.state = .blocked;
+        } else x.state = .closing;
+    }
+
+    /// The new tabs a page opened since the last call: closed or being
+    /// closed, or let go without a request yet (the caller closes those).
+    /// Ones still paused stay for the reader. Free with `freeTabs`.
+    pub fn takeTabs(b: *Inbox, io: Io, gpa: Allocator) ![]Tab {
+        b.mutex.lockUncancelable(io);
+        defer b.mutex.unlock(io);
+        var out: std.ArrayList(Tab) = .empty;
+        errdefer out.deinit(gpa);
+        var i: usize = 0;
+        while (i < b.tabs.items.len) {
+            if (b.tabs.items[i].state == .new) {
+                i += 1;
+                continue;
+            }
+            try out.append(gpa, b.tabs.items[i]);
+            _ = b.tabs.orderedRemove(i);
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    pub fn freeTabs(b: *Inbox, gpa: Allocator, list: []Tab) void {
+        for (list) |x| x.free(b.gpa);
+        gpa.free(list);
+    }
+
+    /// The dialogs answered since the last call; the caller frees each
+    /// (Dialog.free, with the inbox's allocator).
     pub fn takeDialogs(b: *Inbox, io: Io, gpa: Allocator) ![]Dialog {
         b.mutex.lockUncancelable(io);
         defer b.mutex.unlock(io);
@@ -98,6 +206,16 @@ pub const Inbox = struct {
             try out.append(gpa, b.dialogs.orderedRemove(i));
         }
         return out.items;
+    }
+
+    /// The addresses of the downloads refused since the last call; the
+    /// caller frees each and the list with `gpa`.
+    pub fn takeDownloads(b: *Inbox, io: Io, gpa: Allocator) ![][]u8 {
+        b.mutex.lockUncancelable(io);
+        defer b.mutex.unlock(io);
+        const out = try gpa.dupe([]u8, b.downloads.items);
+        b.downloads.clearRetainingCapacity();
+        return out;
     }
 
     /// Splits `bytes` into messages and keeps the replies among them.
@@ -159,6 +277,12 @@ pub const Session = struct {
     timeout_ms: u32,
     pid: Pid = 0,
     child: std.process.Child = undefined,
+    /// `child` is set: there is a process to end.
+    spawned: bool = false,
+    /// The browser was reaped: its pid and group id may be another's now.
+    reaped: std.atomic.Value(bool) = .init(false),
+    /// Group signals sent after that (must stay 0).
+    late_signals: std.atomic.Value(u32) = .init(0),
     to_chrome: ?Io.File = null,
     from_chrome: ?Io.File = null,
     reader: ?std.Thread = null,
@@ -185,56 +309,60 @@ pub const Session = struct {
         s.err_len = m.len;
     }
 
+    pub const Options = struct {
+        /// The browser's whole environment.
+        env: page.BrowserEnv = .{},
+        /// Chrome's "continue where you left off" (--restore-last-session):
+        /// cookies that end with the session are kept for the next. The
+        /// caller removes the tabs it would bring back (see
+        /// forgetLastTabs).
+        keep_session: bool = false,
+    };
+
     /// Starts `browser` with `profile_dir` and attaches to its page.
-    pub fn open(gpa: Allocator, io: Io, browser: []const u8, profile_dir: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32) !*Session {
-        if (is_windows) return error.Unsupported else return openPosix(gpa, io, browser, profile_dir, stop, timeout_ms);
+    pub fn open(gpa: Allocator, io: Io, browser: []const u8, profile_dir: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32, opts: Options) !*Session {
+        if (is_windows) return error.Unsupported else return openPosix(gpa, io, browser, profile_dir, stop, timeout_ms, opts);
     }
 
-    fn openPosix(gpa: Allocator, io: Io, browser: []const u8, profile_dir: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32) !*Session {
+    fn openPosix(gpa: Allocator, io: Io, browser: []const u8, profile_dir: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32, opts: Options) !*Session {
         const s = try gpa.create(Session);
-        errdefer gpa.destroy(s);
         s.* = .{ .gpa = gpa, .io = io, .stop = stop, .timeout_ms = timeout_ms, .inbox = .{ .gpa = gpa } };
-        const data_dir = try std.fmt.allocPrint(gpa, "--user-data-dir={s}", .{profile_dir});
-        defer gpa.free(data_dir);
-        // our stdin pipe becomes Chrome's fd 3, our stdout pipe its fd 4
-        const argv: []const []const u8 = &.{
-            "/bin/sh",
-            "-c",
-            "exec \"$@\" 3<&0 4>&1 0</dev/null 1>/dev/null",
-            "sh",
-            browser,
-            "--headless=new",
-            "--disable-gpu",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--mute-audio",
-            "--remote-debugging-pipe",
-            data_dir,
-            "about:blank",
+        // whatever fails, the browser is ended and all of it freed
+        s.start(browser, profile_dir, opts) catch |e| {
+            s.destroy();
+            return e;
         };
-        s.child = try std.process.spawn(io, .{
-            .argv = argv,
+        return s;
+    }
+
+    fn start(s: *Session, browser: []const u8, profile_dir: []const u8, opts: Options) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        // our stdin pipe becomes Chrome's fd 3, our stdout pipe its fd 4
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(a, &.{ "/bin/sh", "-c", "exec \"$@\" 3<&0 4>&1 0</dev/null 1>/dev/null", "sh", browser });
+        try argv.appendSlice(a, &page.browser_flags);
+        if (opts.keep_session) try argv.append(a, "--restore-last-session");
+        try argv.appendSlice(a, &.{ "--remote-debugging-pipe", try std.fmt.allocPrint(a, "--user-data-dir={s}", .{profile_dir}), "about:blank" });
+        var vars = try opts.env.map(a);
+        s.child = try std.process.spawn(s.io, .{
+            .argv = argv.items,
+            .environ_map = &vars,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
             .pgid = 0,
         });
+        s.spawned = true;
         s.pid = s.child.id.?;
         // the pipes are ours: `wait` must not close them under the reader
         s.to_chrome = s.child.stdin;
         s.from_chrome = s.child.stdout;
         s.child.stdin = null;
         s.child.stdout = null;
-        s.reader = std.Thread.spawn(.{}, readLoop, .{s}) catch |e| {
-            s.close();
-            return e;
-        };
-        s.attach() catch |e| {
-            s.close();
-            return e;
-        };
-        return s;
+        s.reader = try std.Thread.spawn(.{}, readLoop, .{s});
+        try s.attach();
     }
 
     fn attach(s: *Session) !void {
@@ -252,6 +380,16 @@ pub const Session = struct {
             if (Io.Clock.awake.now(s.io).nanoseconds >= until) return error.NoPage;
             s.io.sleep(.fromMilliseconds(50), .awake) catch {};
         };
+        {
+            const copy = try s.gpa.dupe(u8, target);
+            s.inbox.mutex.lockUncancelable(s.io);
+            defer s.inbox.mutex.unlock(s.io);
+            s.inbox.main_target = copy;
+        }
+        // no page may save a file: downloads are refused, and said
+        _ = try s.callIn(a, "Browser.setDownloadBehavior", "{\"behavior\":\"deny\",\"eventsEnabled\":true}", null);
+        // every tab or window a page opens is seen, paused at its start
+        _ = try s.callIn(a, "Target.setAutoAttach", "{\"autoAttach\":true,\"waitForDebuggerOnStart\":true,\"flatten\":true,\"filter\":[{\"type\":\"page\"}]}", null);
         var p: std.ArrayList(u8) = .empty;
         try p.appendSlice(a, "{\"targetId\":");
         try util.jsonString(&p, a, target);
@@ -282,6 +420,7 @@ pub const Session = struct {
             if (got == 0) break;
             s.inbox.feed(s.io, buf[0..got]);
             s.answerDialogs();
+            s.handleTabs();
         }
         s.inbox.closed.store(true, .release);
     }
@@ -296,26 +435,69 @@ pub const Session = struct {
             if (d.answered) continue;
             d.answered = true;
             const accept = std.mem.eql(u8, d.kind, "alert") or std.mem.eql(u8, d.kind, "beforeunload");
-            var msg: std.ArrayList(u8) = .empty;
-            defer msg.deinit(s.gpa);
-            s.own_id +%= 1;
-            msg.print(s.gpa, "{{\"id\":{d},\"method\":\"Page.handleJavaScriptDialog\",\"params\":{{\"accept\":{s}}}", .{ own_ids + (s.own_id & 0x3fff_ffff), if (accept) "true" else "false" }) catch continue;
-            if (d.session.len > 0) {
-                msg.appendSlice(s.gpa, ",\"sessionId\":") catch continue;
-                util.jsonString(&msg, s.gpa, d.session) catch continue;
-            }
-            msg.appendSlice(s.gpa, "}\x00") catch continue;
-            s.write_mutex.lockUncancelable(s.io);
-            defer s.write_mutex.unlock(s.io);
-            if (s.to_chrome) |f| f.writeStreamingAll(s.io, msg.items) catch {};
+            s.sendOwn("Page.handleJavaScriptDialog", if (accept) "{\"accept\":true}" else "{\"accept\":false}", if (d.session.len > 0) d.session else null);
         }
+    }
+
+    /// New tabs: a paused one goes on with its requests held back (so the
+    /// page that opened it isn't held up), one whose first request came is
+    /// closed without it. From the reader thread, without waiting.
+    fn handleTabs(s: *Session) void {
+        s.inbox.mutex.lockUncancelable(s.io);
+        defer s.inbox.mutex.unlock(s.io);
+        for (s.inbox.tabs.items) |*x| switch (x.state) {
+            .new => {
+                s.sendOwn("Fetch.enable", "{\"patterns\":[{\"urlPattern\":\"*\"}]}", x.session);
+                s.sendOwn("Runtime.runIfWaitingForDebugger", "{}", x.session);
+                x.state = .running;
+            },
+            .blocked => {
+                var p: std.ArrayList(u8) = .empty;
+                defer p.deinit(s.gpa);
+                p.appendSlice(s.gpa, "{\"requestId\":") catch continue;
+                util.jsonString(&p, s.gpa, x.request) catch continue;
+                p.appendSlice(s.gpa, ",\"errorReason\":\"BlockedByClient\"}") catch continue;
+                s.sendOwn("Fetch.failRequest", p.items, x.session);
+                p.clearRetainingCapacity();
+                p.appendSlice(s.gpa, "{\"targetId\":") catch continue;
+                util.jsonString(&p, s.gpa, x.target) catch continue;
+                p.append(s.gpa, '}') catch continue;
+                s.sendOwn("Target.closeTarget", p.items, null);
+                x.state = .closing;
+            },
+            .running, .closing => {},
+        };
+    }
+
+    /// A command of the reader's own (its reply is dropped).
+    fn sendOwn(s: *Session, method: []const u8, params_json: []const u8, sid: ?[]const u8) void {
+        var msg: std.ArrayList(u8) = .empty;
+        defer msg.deinit(s.gpa);
+        s.own_id +%= 1;
+        msg.print(s.gpa, "{{\"id\":{d},\"method\":\"{s}\",\"params\":{s}", .{ own_ids + (s.own_id & 0x3fff_ffff), method, params_json }) catch return;
+        if (sid) |x| {
+            msg.appendSlice(s.gpa, ",\"sessionId\":") catch return;
+            util.jsonString(&msg, s.gpa, x) catch return;
+        }
+        msg.appendSlice(s.gpa, "}\x00") catch return;
+        s.write_mutex.lockUncancelable(s.io);
+        defer s.write_mutex.unlock(s.io);
+        if (s.to_chrome) |f| f.writeStreamingAll(s.io, msg.items) catch {};
     }
 
     fn killGroup(s: *Session) void {
         if (is_windows) return else {
             if (s.pid == 0) return;
-            std.posix.kill(-s.pid, .KILL) catch {};
+            s.signalGroup();
             std.posix.kill(s.pid, .KILL) catch {};
+        }
+    }
+
+    /// SIGKILL to the browser's process group.
+    fn signalGroup(s: *Session) void {
+        if (is_windows) return else {
+            if (s.reaped.load(.acquire)) _ = s.late_signals.fetchAdd(1, .acq_rel);
+            std.posix.kill(-s.pid, .KILL) catch {};
         }
     }
 
@@ -405,8 +587,9 @@ pub const Session = struct {
 
     /// Loads `url` and waits until the new document has loaded.
     pub fn navigate(s: *Session, arena: Allocator, url: []const u8) !void {
-        // a mark on the old document: gone once the new one is there
-        _ = s.evaluate(arena, "window.__hxOld = true") catch {};
+        // a mark on the old document, in harness's own world: gone once the
+        // new one is there, and no page can set it
+        _ = s.evaluateIsolated(arena, "window.__hxOld = true") catch {};
         var p: std.ArrayList(u8) = .empty;
         try p.appendSlice(arena, "{\"url\":");
         try util.jsonString(&p, arena, url);
@@ -444,7 +627,7 @@ pub const Session = struct {
     }
 
     /// Until the main frame has stopped loading and the document is complete.
-    fn waitLoaded(s: *Session, arena: Allocator) !void {
+    pub fn waitLoaded(s: *Session, arena: Allocator) !void {
         const until = deadline(s.io, s.timeout_ms);
         while (s.inbox.loading(s.io).busy) {
             if (Io.Clock.awake.now(s.io).nanoseconds >= until) return error.Timeout;
@@ -462,12 +645,14 @@ pub const Session = struct {
     }
 
     /// Polls `cond` every 50 ms until it is true; a script that fails
-    /// while the document is replaced is tried again.
+    /// while the document is replaced is tried again. It runs in an
+    /// isolated world: the page's scripts can't change what it reads (a
+    /// `readyState` of their own would stall every wait).
     fn waitFor(s: *Session, arena: Allocator, cond: []const u8) !void {
         const until = deadline(s.io, s.timeout_ms);
         while (true) {
-            const v = s.evaluate(arena, cond) catch |e| switch (e) {
-                error.Script, error.Cdp, error.Timeout => "false",
+            const v = s.evaluateIsolated(arena, cond) catch |e| switch (e) {
+                error.Script, error.Cdp, error.Timeout, error.NoPage => "false",
                 else => return e,
             };
             if (std.mem.eql(u8, v, "true")) return;
@@ -479,7 +664,7 @@ pub const Session = struct {
     /// Ends the browser and everything it started; safe to call twice.
     pub fn close(s: *Session) void {
         if (s.closed) return;
-        if (!is_windows) {
+        if (!is_windows and s.spawned) {
             if (s.page_session.len > 0 and !s.inbox.closed.load(.acquire) and !s.stop.load(.acquire)) {
                 var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
                 defer arena_state.deinit();
@@ -496,11 +681,17 @@ pub const Session = struct {
             }
             s.closed = true;
             s.killGroup();
-            if (s.child.id != null) _ = s.child.wait(s.io) catch {};
-            // its helpers too, should one have kept the group alive
-            std.posix.kill(-s.pid, .KILL) catch {};
+            // the reader kills too (on a stop): it ends before the reap
             s.ended.store(true, .release);
             if (s.reader) |th| th.join();
+            if (s.child.id != null) {
+                // ended, not reaped: the group id is still the browser's
+                page.waitExited(s.pid);
+                // its helpers too, should one have outlived the first kill
+                s.signalGroup();
+                _ = s.child.wait(s.io) catch {};
+            }
+            s.reaped.store(true, .release);
             if (s.to_chrome) |f| f.close(s.io);
             if (s.from_chrome) |f| f.close(s.io);
         }
@@ -515,6 +706,16 @@ pub const Session = struct {
         s.gpa.destroy(s);
     }
 };
+
+/// Removes what Chrome would open again from `profile`'s last session (its
+/// tabs and windows): with keep_session only its cookies come back, and
+/// no page is loaded that the gate was not asked about.
+pub fn forgetLastTabs(io: Io, a: Allocator, profile: []const u8) !void {
+    for ([_][]const u8{ "Sessions", "Sessions_Encrypted", "Current Session", "Current Tabs", "Last Session", "Last Tabs" }) |name| {
+        // (one that is not there is no error)
+        try Io.Dir.cwd().deleteTree(io, try std.fs.path.join(a, &.{ profile, "Default", name }));
+    }
+}
 
 /// How long after a click or key a navigation may take to start.
 pub const nav_grace_ms = 600;
@@ -549,7 +750,6 @@ test "messages_are_split_at_nul_and_events_skipped" {
 /// Chrome, for the tests that need one; null skips them.
 pub fn testBrowser(a: Allocator) !?[]const u8 {
     if (is_windows) return null;
-    const page = @import("page.zig");
     const env_chrome: []const u8 = if (t.environ.getPosix("HARNESS_CHROME")) |v| v else "";
     const env_path: []const u8 = if (t.environ.getPosix("PATH")) |v| v else "";
     return page.findBrowser(a, t.io, "", env_chrome, env_path);
@@ -571,7 +771,7 @@ test "chrome_over_a_pipe_evaluates_and_closes_without_leftovers" {
     defer tmp.cleanup();
     const profile = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     var stop: std.atomic.Value(bool) = .init(false);
-    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000);
+    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000, .{});
     const pid = s.pid;
     try t.expectEqualStrings("2", try s.evaluate(a, "1+1"));
     // the page's globals don't reach an isolated world
@@ -588,6 +788,79 @@ test "chrome_over_a_pipe_evaluates_and_closes_without_leftovers" {
     try t.expect(processGone(-%pid));
 }
 
+/// A stand-in browser: a shell script at `name` in `dir`.
+fn standIn(dir: std.Io.Dir, name: []const u8, script: []const u8) !void {
+    try dir.writeFile(t.io, .{ .sub_path = name, .data = script });
+    var f = try dir.openFile(t.io, name, .{});
+    defer f.close(t.io);
+    try f.setPermissions(t.io, .fromMode(0o755));
+}
+
+test "a_browser_that_fails_to_start_leaves_nothing_allocated" {
+    if (is_windows) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    // half a message, then gone: the reader has bytes in hand
+    try standIn(tmp.dir, "fake-chrome", "#!/bin/sh\nprintf '{\"id\":1,\"res' >&4\n");
+    var stop: std.atomic.Value(bool) = .init(false);
+    if (Session.open(t.allocator, t.io, try std.fs.path.join(a, &.{ root, "fake-chrome" }), root, &stop, 5000, .{})) |s| {
+        s.destroy();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "chrome_gets_a_small_environment_and_leaves_the_key_store_alone" {
+    if (is_windows) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    // a stand-in that notes its environment and arguments in the profile
+    try standIn(tmp.dir, "fake-chrome", "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --user-data-dir=*) d=\"${a#--user-data-dir=}\";; esac; done\nenv > \"$d/env.txt\"\nprintf '%s\\n' \"$@\" > \"$d/args.txt\"\n");
+    var stop: std.atomic.Value(bool) = .init(false);
+    if (Session.open(t.allocator, t.io, try std.fs.path.join(a, &.{ root, "fake-chrome" }), root, &stop, 5000, .{})) |s| {
+        s.destroy();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    const env = try tmp.dir.readFileAlloc(t.io, "env.txt", a, .limited(1 << 20));
+    const args = try tmp.dir.readFileAlloc(t.io, "args.txt", a, .limited(1 << 20));
+    try t.expectEqualStrings("", try page.otherVars(a, env, &.{ "PATH", "HOME", "LANG" }));
+    for ([_][]const u8{ "--use-mock-keychain\n", "--password-store=basic\n", "--remote-debugging-pipe\n" }) |flag| {
+        if (std.mem.indexOf(u8, args, flag) == null) {
+            std.debug.print("\nno {s} in:\n{s}\n", .{ flag, args });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "chrome_is_never_signalled_after_it_was_reaped" {
+    // once reaped, its pid and group id can be given to another process
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const browser = (try testBrowser(a)) orelse return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const profile = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    for ([_]bool{ false, true }) |stopped| {
+        var stop: std.atomic.Value(bool) = .init(false);
+        const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000, .{});
+        defer s.destroy();
+        try t.expectEqualStrings("2", try s.evaluate(a, "1+1"));
+        // a stop: the reader kills the group again and again until it sees the pipe close
+        if (stopped) stop.store(true, .release);
+        s.close();
+        try t.expect(s.reaped.load(.acquire));
+        try t.expectEqual(0, s.late_signals.load(.acquire));
+    }
+}
+
 test "chrome_ends_when_harness_goes_away" {
     // harness gone (crashed, killed): its end of the pipe closes, and
     // Chrome must end on its own, without being killed
@@ -599,7 +872,7 @@ test "chrome_ends_when_harness_goes_away" {
     defer tmp.cleanup();
     const profile = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     var stop: std.atomic.Value(bool) = .init(false);
-    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000);
+    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000, .{});
     defer s.destroy();
     s.to_chrome.?.close(t.io);
     s.to_chrome = null;
@@ -617,7 +890,7 @@ test "a_stop_ends_chrome_at_once" {
     defer tmp.cleanup();
     const profile = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     var stop: std.atomic.Value(bool) = .init(false);
-    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000);
+    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000, .{});
     defer s.destroy();
     const th = try std.Thread.spawn(.{}, struct {
         fn f(flag: *std.atomic.Value(bool)) void {
