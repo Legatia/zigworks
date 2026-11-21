@@ -113,11 +113,19 @@ pub fn jsonString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8
 }
 
 /// Cuts `s` to at most `max` bytes without splitting a UTF-8 sequence.
+/// Where the bytes are not UTF-8 (no sequence starts in the 3 bytes before
+/// the cut), it is a hard cut at `max`, so cutting parts off a text always
+/// moves on.
 pub fn cut(s: []const u8, max: usize) []const u8 {
     if (s.len <= max) return s;
     var n = max;
-    while (n > 0 and (s[n] & 0xc0) == 0x80) n -= 1;
+    while (n > 0 and max - n < 3 and isCont(s[n])) n -= 1;
+    if (n == 0 or isCont(s[n])) return s[0..max];
     return s[0..n];
+}
+
+fn isCont(c: u8) bool {
+    return c & 0xc0 == 0x80;
 }
 
 const t = std.testing;
@@ -152,4 +160,18 @@ test "json_strings_are_escaped" {
     try jsonString(&out, t.allocator, "a\"b\\c\nd\x01");
     try t.expectEqualStrings("\"a\\\"b\\\\c\\nd\\u0001\"", out.items);
     try t.expectEqualStrings("ab", cut("ab\xc3\xa9", 3));
+}
+
+test "cut_moves_on_through_bytes_that_are_not_utf8" {
+    // no sequence starts anywhere near the cut: a hard cut at the limit
+    const junk: [5000]u8 = @splat(0x80);
+    try t.expectEqual(4096, cut(&junk, 4096).len);
+    // so cutting parts off a text, as telegram.split does, always ends
+    var rest: []const u8 = &junk;
+    var parts: usize = 0;
+    while (rest.len > 4096) : (parts += 1) rest = rest[cut(rest, 4096).len..];
+    try t.expectEqual(1, parts);
+    // a character is still never split
+    try t.expectEqualStrings("a", cut("a\xf0\x9f\x98\x80", 4));
+    try t.expectEqualStrings("a\xf0\x9f\x98\x80", cut("a\xf0\x9f\x98\x80b", 5));
 }
