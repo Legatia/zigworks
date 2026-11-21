@@ -19,6 +19,7 @@ const scrub = @import("scrub.zig");
 const util = @import("util.zig");
 const logins = @import("logins.zig");
 const store_mod = @import("store.zig");
+const masks = @import("masks.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -155,7 +156,12 @@ pub const Core = struct {
     settings_hash: [32]u8,
     told_settings_changed: bool = false,
     secrets: Secrets,
+    /// The stored secrets read at open. What every tool's output is
+    /// masked against is `masks`: these and the values added since.
     secret_list: []const scrub.Secret,
+    /// The values masked in tool output: the stored secrets, secrets
+    /// fetched later for MCP servers, passwords made at sign-ups.
+    masks: masks.List,
     workspace: []const u8,
 
     grants: gate.Grants,
@@ -286,6 +292,9 @@ pub const Core = struct {
         if (secrets.search) |v| try sl.append(c.paths_arena.allocator(), .{ .name = "search", .value = v });
         for (secrets.named) |n| try sl.append(c.paths_arena.allocator(), .{ .name = n.name, .value = n.value });
         c.secret_list = sl.items;
+        c.masks = .init(gpa, io);
+        errdefer c.masks.deinit();
+        for (sl.items) |x| try c.masks.add(x.name, x.value);
 
         c.grants = .init(gpa);
         errdefer c.grants.deinit();
@@ -381,6 +390,7 @@ pub const Core = struct {
         c.mem.deinit();
         c.log.close();
         c.grants.deinit();
+        c.masks.deinit();
         freeKeys(c.gpa, &c.ran);
         freeKeys(c.gpa, &c.running);
         freeKeys(c.gpa, &c.paused);
@@ -859,6 +869,7 @@ pub const Core = struct {
             .logins = c.login_list,
             .store = c.store,
             .profiles_dir = c.paths.profiles,
+            .masks = &c.masks,
         };
     }
 
@@ -967,7 +978,7 @@ pub const Core = struct {
             }
             const srv = st.srv orelse {
                 // a server may print its key when it fails: mask before keeping
-                var sc_mask = scrub.Scrubber.init(a, c.secret_list) catch continue;
+                var sc_mask = scrub.Scrubber.init(a, c.masks.snapshot(a) catch c.secret_list) catch continue;
                 const detail = sc_mask.scrubAlloc(a, st.diag.text()) catch "";
                 note.print(a, "{s}: did not start ({s}) {s}\n", .{ name, @errorName(st.err), util.cut(detail, 200) }) catch {};
                 c.log.write(.config, false, .{ .event = "mcp failed", .server = name, .why = @errorName(st.err), .detail = detail }) catch {};
@@ -2577,4 +2588,27 @@ test "reload_holds_no_lock_while_servers_start_and_stop_cuts_it_short" {
     // and the stop ended the start instead of waiting it out
     try t.expect(Io.Clock.awake.now(t.io).nanoseconds - t0 < 2800 * std.time.ns_per_ms);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "slow: did not start (Stopped)") != null);
+}
+
+test "a_value_added_while_a_turn_runs_is_masked_in_every_tool_from_then_on" {
+    // the command makes the value without spelling it out ($((...)) is POSIX sh)
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
+    _ = try f.core.reload();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo made-at-signup-Pass-$((9000+271))\"}"));
+    try f.e.script(2, model.textReply("ok"));
+    var flag: std.atomic.Value(bool) = .init(false);
+    var run = f.core.baseRun(&f.core.chat_client, "chat", false, &flag);
+    // made after the run began, as web makes a password at a sign-up
+    try f.core.masks.add("login-new-password", "made-at-signup-Pass-9271");
+    var conv: agent.Conversation = .init(t.allocator);
+    defer conv.deinit();
+    const res = try agent.turn(&run, &conv, "echo it", false);
+    defer agent.freeResult(&run, res);
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "made-at-signup-Pass-9271") == null);
+    try t.expect(std.mem.indexOf(u8, req2, "[secret:login-new-password]") != null);
 }

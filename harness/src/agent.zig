@@ -15,6 +15,7 @@ const scrub = @import("scrub.zig");
 const web_mod = @import("web.zig");
 const logins_mod = @import("logins.zig");
 const store_mod = @import("store.zig");
+const masks_mod = @import("masks.zig");
 const Io = std.Io;
 
 pub const Answer = enum { once, day, deny, timeout };
@@ -182,6 +183,10 @@ pub const Run = struct {
     profiles_dir: []const u8 = "",
     /// The browser session of the running turn.
     web: ?*web_mod.Web = null,
+    /// The instance's mask list: each tool's output is masked against it
+    /// as it is when the tool runs, values added meanwhile too. null: only
+    /// `env.secrets`.
+    masks: ?*masks_mod.List = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -526,7 +531,7 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
             .store = r.store,
             .secrets = r.env.secrets,
             .stop = r.env.stop,
-        }, .{ .ctx = r, .allow = webAllow, .note = webNote });
+        }, .{ .ctx = r, .allow = webAllow, .note = webNote, .secret = webSecret });
         r.web = &web_state;
     }
     defer if (own_web) {
@@ -620,6 +625,8 @@ pub fn freeResult(r: *Run, res: TurnResult) void {
 
 fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const u8) !tools.Output {
     if (r.env.stop.load(.acquire)) return .{ .text = "stopped by the owner", .is_error = true };
+    // what to mask: as the list is now (a password made a moment ago too)
+    if (r.masks) |m| r.env.secrets = try m.snapshot(a);
     var mt: ?*const McpTool = null;
     const tool: gate.Tool = if (gate.Tool.fromName(name)) |tl| switch (tl) {
         // only reachable through an MCP tool's own name
@@ -636,6 +643,7 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
     if (tool == .web) {
         // the tool asks the gate itself: for each host and login it uses
         const w = r.web orelse return .{ .text = "this tool is not available here", .is_error = true };
+        w.env.secrets = r.env.secrets;
         const out = try w.run(a, input_json);
         // the model's input, placeholders and all: never a value
         try r.log.write(.tool, r.private, .{ .run = r.label, .tool = name, .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text });
@@ -765,6 +773,12 @@ fn webAllow(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const
     const r: *Run = @ptrCast(@alignCast(ctx));
     if (r.env.stop.load(.acquire)) return "stopped by the owner";
     return decideAndAsk(r, a, tool, @tagName(tool), arg, r.now()) catch "the gate could not decide";
+}
+
+/// A value web made (a password at a sign-up): masked everywhere at once.
+fn webSecret(ctx: *anyopaque, name: []const u8, value: []const u8) void {
+    const r: *Run = @ptrCast(@alignCast(ctx));
+    if (r.masks) |m| m.add(name, value) catch {};
 }
 
 fn webNote(ctx: *anyopaque, event: []const u8, login: []const u8, detail: []const u8) void {

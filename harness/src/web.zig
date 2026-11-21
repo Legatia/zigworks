@@ -47,6 +47,9 @@ pub const Hooks = struct {
     /// A line for the log: "web fill", "web fill refused", "web passkey
     /// saved", "web passkey removed"; names and hosts only.
     note: *const fn (ctx: *anyopaque, event: []const u8, login: []const u8, detail: []const u8) void,
+    /// A value made here (a new password): masked in every tool's output
+    /// from now on, not only in web's.
+    secret: ?*const fn (ctx: *anyopaque, name: []const u8, value: []const u8) void = null,
 };
 
 pub fn toolDef(arena: Allocator, list: []const logins.Login) !model.ToolDef {
@@ -522,6 +525,7 @@ pub const Web = struct {
                 var pw = try logins.genPassword(w.io);
                 defer std.crypto.secureZero(u8, &pw);
                 try st.put(w.io, name, &pw);
+                if (w.hooks.secret) |h| h(w.hooks.ctx, name, &pw);
                 made.* = true;
                 return w.keepValue(name, &pw);
             },
