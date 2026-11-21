@@ -78,6 +78,8 @@ check "secrets stored" '[ "$("$H" secret list | grep -c ": stored")" = 3 ]'
 check "a short secret is refused" '! printf "short\n" | "$H" secret add x --stdin 2>/dev/null'
 printf 'smoke-login-pass-1\n\n' | "$H" login add bot --site localhost --username agent-bot --stdin 2>/dev/null
 check "a login is added and listed" '"$H" login list | grep -qF "bot: localhost, username agent-bot, password yes, TOTP no, passkeys 0"'
+printf 'leftover-pass-1\n' | "$H" secret add login-zed-password --stdin 2>/dev/null
+check "a login is not added over secrets left from an old one" '! printf "\n\n" | "$H" login add zed --site example.com --stdin 2>"$T/zed.err" && grep -qF "harness login rm zed" "$T/zed.err" && ! grep -qF "[zed]" "$HARNESS_HOME/logins.ini"'
 
 # a scheduled task, run by hand before the service starts
 printf '[check]\nevery = 5m\ndo = Check the price.\n' >"$HARNESS_HOME/tasks.ini"

@@ -1416,7 +1416,7 @@ fn insertInSection(a: std.mem.Allocator, text: []const u8, name: []const u8, lin
     return out.items;
 }
 
-pub const LoginState = struct { password: bool = false, totp: bool = false, passkeys: usize = 0 };
+pub const LoginState = struct { password: bool = false, totp: bool = false, passkeys: usize = 0, passkeys_stored: bool = false };
 
 /// What the key store holds for a login.
 pub fn loginState(io: Io, a: std.mem.Allocator, store: ?store_mod.Store, name: []const u8) LoginState {
@@ -1432,6 +1432,7 @@ pub fn loginState(io: Io, a: std.mem.Allocator, store: ?store_mod.Store, name: [
         std.crypto.secureZero(u8, v);
     }
     if (st.get(io, a, logins.secretName(&nb, name, .passkeys)) catch null) |v| {
+        out.passkeys_stored = true;
         out.passkeys = if (logins.decode(a, v)) |l| l.len else |_| 0;
         std.crypto.secureZero(u8, v);
     }

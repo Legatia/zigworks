@@ -395,6 +395,16 @@ fn loginCmd(app: *App, args: []const []const u8) !Exit {
         complain("a login called {s} exists; remove it first (harness login rm {s})", .{ name, name });
         return .failed;
     }
+    // what an old login of this name left behind would go to the new one
+    {
+        const left = core_mod.loginState(app.io, app.arena, s, name);
+        const profile = try std.fs.path.join(app.arena, &.{ app.home, "profiles", name });
+        const has_profile = if (Io.Dir.cwd().statFile(app.io, profile, .{})) |_| true else |_| false;
+        if (left.password or left.totp or left.passkeys_stored or has_profile) {
+            complain("secrets or a browser profile of an earlier login called {s} are still there; run harness login rm {s} first", .{ name, name });
+            return .failed;
+        }
+    }
     const stdin = Io.File.stdin();
     const tty = stdin.isTty(app.io) catch false;
     if (!tty and !from_stdin) {
