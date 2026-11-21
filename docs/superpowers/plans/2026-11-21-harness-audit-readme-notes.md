@@ -51,3 +51,14 @@ labels, no slogans. Check each against the merged code before writing it.
 
 ## W (browser, logins) — pending
 ## S (smoke, approval buttons) — pending
+
+## W (browser, logins)
+1. Research: "...with a fresh throwaway profile each time (no cookies, no sign-ins), loading nothing from any host but the page's own and saving no downloads."
+2. Logins example output: "Added github-bot to logins.ini (site github.com). Stored its password and TOTP secret in the macOS Keychain."
+3. "so the cookies (those that end with the session too), and with them the sign-in, stay for the next turn."
+4. "Chrome's own password manager is off in every profile." → "Chrome's own password manager is off in every profile; downloads are refused, and a tab or window a page opens is closed before it loads anything (the agent is told its address). A click is the mouse's, at the element's centre; one under a banner or dialog is refused."
+5. Dialogs: "...and the agent sees their text when they come from the page's own host."
+6. Bound to the site: "...on the very host the gate allowed the login on, over https..."; "Only fields of the page itself (its open shadow roots too), never of frames."
+7. Passkeys: "If the stored passkeys can't be read, none are loaded and new ones aren't saved; the agent is told."
+8. Limits: "...and a passkey only for the site or a name below it; a site needs a dot (but `localhost`)..."
+9. Limits: "The browser keeps harness's environment." → "The browser gets only PATH, HOME and LANG (on Windows also the system's own variables), and never the macOS Keychain or a desktop keyring."
