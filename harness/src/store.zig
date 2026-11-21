@@ -5,7 +5,18 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 
-pub const Error = error{ StoreFailed, OutOfMemory };
+pub const Error = error{
+    StoreFailed,
+    OutOfMemory,
+    /// Longer than the store keeps (`maxValue`).
+    ValueTooLong,
+    /// Not a name the store can use (too long, or not printable ASCII).
+    BadName,
+};
+
+/// The Credential Manager keeps at most this much of a value
+/// (CRED_MAX_CREDENTIAL_BLOB_SIZE).
+pub const wincred_max_value = 5 * 512;
 
 pub const Store = union(enum) {
     /// A directory; each secret is a file in it, readable by the user only.
@@ -21,7 +32,18 @@ pub const Store = union(enum) {
         };
     }
 
+    /// The longest value it keeps, if it has a limit: 2560 bytes in the
+    /// Credential Manager, 64 KiB in the directory store (what `get` reads).
+    pub fn maxValue(s: Store) ?usize {
+        return switch (s) {
+            .dir => 64 * 1024,
+            .keychain => null,
+            .wincred => wincred_max_value,
+        };
+    }
+
     pub fn put(s: Store, io: Io, name: []const u8, value: []const u8) Error!void {
+        if (s.maxValue()) |m| if (value.len > m) return error.ValueTooLong;
         switch (s) {
             .dir => |d| dirPut(io, d, name, value) catch return error.StoreFailed,
             .keychain => if (is_mac) try mac.put(name, value) else unreachable,
@@ -183,25 +205,11 @@ const win = struct {
     extern "advapi32" fn CredFree(buf: *anyopaque) callconv(.winapi) void;
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
-    fn target(buf: *[128]u16, name: []const u8) [*:0]const u16 {
-        var i: usize = 0;
-        for (service ++ ":") |c| {
-            buf[i] = c;
-            i += 1;
-        }
-        for (name) |c| {
-            buf[i] = c;
-            i += 1;
-        }
-        buf[i] = 0;
-        return buf[0..i :0].ptr;
-    }
-
     fn put(name: []const u8, value: []const u8) Error!void {
-        var tb: [128]u16 = undefined;
+        var tb: [256]u16 = undefined;
         const cred: CREDENTIALW = .{
             .Type = CRED_TYPE_GENERIC,
-            .TargetName = target(&tb, name),
+            .TargetName = (try targetName(&tb, name)).ptr,
             .CredentialBlobSize = @intCast(value.len),
             .CredentialBlob = value.ptr,
             .Persist = CRED_PERSIST_LOCAL_MACHINE,
@@ -210,9 +218,9 @@ const win = struct {
     }
 
     fn get(gpa: std.mem.Allocator, name: []const u8) Error!?[]u8 {
-        var tb: [128]u16 = undefined;
+        var tb: [256]u16 = undefined;
         var cred: ?*CREDENTIALW = null;
-        if (CredReadW(target(&tb, name), CRED_TYPE_GENERIC, 0, &cred) == .FALSE) {
+        if (CredReadW((try targetName(&tb, name)).ptr, CRED_TYPE_GENERIC, 0, &cred) == .FALSE) {
             if (GetLastError() == ERROR_NOT_FOUND) return null;
             return error.StoreFailed;
         }
@@ -224,8 +232,8 @@ const win = struct {
     }
 
     fn remove(name: []const u8) Error!bool {
-        var tb: [128]u16 = undefined;
-        if (CredDeleteW(target(&tb, name), CRED_TYPE_GENERIC, 0) == .FALSE) {
+        var tb: [256]u16 = undefined;
+        if (CredDeleteW((try targetName(&tb, name)).ptr, CRED_TYPE_GENERIC, 0) == .FALSE) {
             if (GetLastError() == ERROR_NOT_FOUND) return false;
             return error.StoreFailed;
         }
@@ -233,7 +241,40 @@ const win = struct {
     }
 };
 
+/// The Credential Manager's target for a secret, "harness:NAME", in
+/// `buf`; a name that doesn't fit, or isn't printable ASCII, is refused
+/// (mcp.ini's secret names come straight from the file).
+pub fn targetName(buf: []u16, name: []const u8) error{BadName}![:0]const u16 {
+    const prefix = service ++ ":";
+    if (name.len == 0 or prefix.len + name.len + 1 > buf.len) return error.BadName;
+    var i: usize = 0;
+    for ([_][]const u8{ prefix, name }) |part| for (part) |c| {
+        if (c < 0x21 or c > 0x7e) return error.BadName;
+        buf[i] = c;
+        i += 1;
+    };
+    buf[i] = 0;
+    return buf[0..i :0];
+}
+
 const t = std.testing;
+
+test "credential_manager_targets_are_bounded_and_values_capped" {
+    var buf: [128]u16 = undefined;
+    // the target an existing secret has (the Windows session may have stored some)
+    const want = std.unicode.utf8ToUtf16LeStringLiteral("harness:omnigate");
+    try t.expectEqualSlices(u16, want, try targetName(&buf, "omnigate"));
+    // an mcp.ini secret name longer than the buffer is refused, not written past it
+    const long: [200]u8 = @splat('x');
+    try t.expectError(error.BadName, targetName(&buf, &long));
+    try t.expectError(error.BadName, targetName(&buf, "caf\xc3\xa9"));
+    // it keeps at most 2560 bytes of a value: a longer one is refused up
+    // front, with a reason `secret add` can give
+    const wc: Store = .wincred;
+    try t.expectEqual(2560, wc.maxValue().?);
+    const big: [2561]u8 = @splat('v');
+    try t.expectError(error.ValueTooLong, wc.put(t.io, "big", &big));
+}
 
 test "the directory store keeps, replaces and removes values" {
     const io = t.io;

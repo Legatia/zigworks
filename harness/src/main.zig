@@ -325,8 +325,9 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         try errAll(app.io, "\n");
     }
     defer std.crypto.secureZero(u8, value);
-    if (value.len < 8) {
-        complain("values shorter than 8 characters can't be masked reliably; nothing stored", .{});
+    var why_buf: [200]u8 = undefined;
+    if (valueProblem(&why_buf, s, value.len)) |why| {
+        complain("{s}", .{why});
         return .failed;
     }
     s.put(app.io, name, value) catch {
@@ -335,6 +336,15 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
     };
     try errPrint(app.io, "Stored {s} in {s}.\n", .{ name, s.describe() });
     return .ok;
+}
+
+/// Why a value of `len` bytes is not stored, or null: too short to mask,
+/// or longer than the store keeps (the Credential Manager: 2560 bytes).
+fn valueProblem(buf: []u8, s: store_mod.Store, len: usize) ?[]const u8 {
+    if (len < 8) return "values shorter than 8 characters can't be masked reliably; nothing stored";
+    if (s.maxValue()) |m| if (len > m)
+        return std.fmt.bufPrint(buf, "{s} keeps at most {d} bytes of a value and this one has {d}; nothing stored", .{ s.describe(), m, len }) catch "the value is longer than the store keeps; nothing stored";
+    return null;
 }
 
 // ---- logins ----
@@ -1109,6 +1119,15 @@ test "mcp_servers_and_the_browser_only_for_commands_that_use_tools" {
     try t.expect(App.Role.task.usesTools());
     try t.expect(App.Role.chat.usesTools());
     try t.expect(App.Role.run.usesTools());
+}
+
+test "a_value_too_long_for_the_store_is_refused_with_its_limit" {
+    var buf: [200]u8 = undefined;
+    const why = valueProblem(&buf, .wincred, 3000) orelse return error.TestUnexpectedResult;
+    try t.expect(std.mem.indexOf(u8, why, "Credential Manager") != null);
+    try t.expect(std.mem.indexOf(u8, why, "2560") != null);
+    try t.expect(valueProblem(&buf, .wincred, 2560) == null);
+    try t.expect(valueProblem(&buf, .wincred, 7) != null);
 }
 
 fn printLine(what: []const u8, line: []const []const u8) void {
