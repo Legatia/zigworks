@@ -781,9 +781,17 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
         }
 
         var results: std.ArrayList(model.Block) = .empty;
+        // a reply cut at max_tokens may end in a call cut half way (a
+        // command missing its end): none of its calls run, each answered
+        const cut = std.mem.eql(u8, reply.stop_reason, "max_tokens");
         for (reply.blocks) |b| {
             if (b != .tool_use) continue;
             const u = b.tool_use;
+            if (cut) {
+                try r.log.write(.tool, r.private, .{ .run = r.label, .tool = u.name, .event = "not run: the reply was cut at max_tokens" });
+                try results.append(a, .{ .tool_result = .{ .id = u.id, .content = cut_note, .is_error = true } });
+                continue;
+            }
             const out = try callTool(r, a, u.name, u.input_json);
             calls_made += 1;
             try results.append(a, .{ .tool_result = .{ .id = u.id, .content = out.text, .is_error = out.is_error } });
@@ -807,6 +815,8 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     try r.log.write(.turn, r.private, .{ .run = r.label, .answer = result.text, .steps = result.steps, .ended_by = result.ended_by, .dropped_turns = dropped });
     return result;
 }
+
+const cut_note = "not run: your reply was cut off at the output limit (max_tokens) before it was complete, so this call may be cut too; make it again, in smaller parts if it was long";
 
 /// Frees what `turn` allocated in its result.
 pub fn freeResult(r: *Run, res: TurnResult) void {
@@ -1462,6 +1472,22 @@ test "a_turn_the_model_api_refuses_is_dropped" {
     defer freeResult(&f.run, r2);
     try t.expectEqualStrings("fine again", r2.text);
     try t.expect(std.mem.indexOf(u8, try f.e.request(3), "first message") == null);
+}
+
+test "tool_calls_in_a_reply_cut_at_max_tokens_are_not_run" {
+    var f: Fix = undefined;
+    try f.init("allow write_file *\n");
+    defer f.deinit();
+    // the reply ran out of room in the middle of its call
+    try f.e.script(1, "{\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"write_file\",\"input\":{\"path\":\"a.txt\",\"content\":\"the start of\"}}],\"stop_reason\":\"max_tokens\"}");
+    try f.e.script(2, model.textReply("I will write it in parts."));
+    const r = try f.say("write a long file");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("I will write it in parts.", r.text);
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "ws/a.txt", .{}));
+    // the model is told, in the call's own result
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "\"tool_use_id\":\"tu_1\",\"content\":\"not run: your reply was cut off") != null);
 }
 
 test "stop_before_next_call" {
