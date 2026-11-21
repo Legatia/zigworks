@@ -164,6 +164,10 @@ const App = struct {
         c.store = app.store();
         c.role = @tagName(role);
         c.writeStatus() catch {};
+        // Ctrl-C and kill end it the way /stop and close do (from here on,
+        // so a slow start of the MCP servers can be ended too)
+        catchSignals();
+        c.watcher = std.Thread.spawn(.{}, watchSignals, .{c}) catch null;
         c.startExtras();
         return c;
     }
@@ -753,6 +757,83 @@ fn healthCmd(app: *App) !Exit {
     return if (h.ok) .ok else .failed;
 }
 
+// ---- ending on a signal ----
+
+/// The signal that asked harness to end; 0 until one came. On Windows the
+/// console event plus one.
+var got_signal: std.atomic.Value(u32) = .init(0);
+
+fn onSignal(sig: std.posix.SIG) callconv(.c) void {
+    // all a handler may do: the watcher does the rest. A second signal ends
+    // the process the default way (SA.RESETHAND).
+    got_signal.store(@intFromEnum(sig), .release);
+}
+
+const console = struct {
+    const CTRL_C_EVENT = 0;
+    const CTRL_BREAK_EVENT = 1;
+    const CTRL_CLOSE_EVENT = 2;
+    const CTRL_LOGOFF_EVENT = 5;
+    const CTRL_SHUTDOWN_EVENT = 6;
+    extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (u32) callconv(.winapi) std.os.windows.BOOL, add: std.os.windows.BOOL) callconv(.winapi) std.os.windows.BOOL;
+    extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+
+    /// Runs on a thread of its own, not in a signal context.
+    fn handler(event: u32) callconv(.winapi) std.os.windows.BOOL {
+        // a second Ctrl-C: end now
+        if (got_signal.swap(event + 1, .acq_rel) != 0) std.process.exit(1);
+        // after close, logoff and shutdown Windows ends the process when
+        // this returns: give the watcher its time (it exits the process)
+        if (event == CTRL_CLOSE_EVENT or event == CTRL_LOGOFF_EVENT or event == CTRL_SHUTDOWN_EVENT) Sleep(4500);
+        return .TRUE;
+    }
+};
+
+/// SIGINT and SIGTERM (Windows: the console's Ctrl-C, Ctrl-Break and
+/// close) no longer end the process on the spot, leaving approved commands
+/// running in their own process groups and the folder held.
+fn catchSignals() void {
+    if (builtin.os.tag == .windows) {
+        _ = console.SetConsoleCtrlHandler(console.handler, .TRUE);
+        return;
+    }
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART | std.posix.SA.RESETHAND,
+    };
+    std.posix.sigaction(.INT, &act, null);
+    std.posix.sigaction(.TERM, &act, null);
+}
+
+fn signalName(n: u32) []const u8 {
+    if (builtin.os.tag == .windows) return switch (n -| 1) {
+        console.CTRL_C_EVENT => "Ctrl-C",
+        console.CTRL_BREAK_EVENT => "Ctrl-Break",
+        console.CTRL_CLOSE_EVENT => "console closed",
+        console.CTRL_LOGOFF_EVENT => "logoff",
+        console.CTRL_SHUTDOWN_EVENT => "shutdown",
+        else => "console event",
+    };
+    if (n == @intFromEnum(std.posix.SIG.INT)) return "SIGINT";
+    if (n == @intFromEnum(std.posix.SIG.TERM)) return "SIGTERM";
+    return "signal";
+}
+
+/// Beside the command until the core closes: on a signal, runs the stop
+/// and the end (Core.endBySignal), then ends the process.
+fn watchSignals(c: *Core) void {
+    while (true) {
+        const n = got_signal.load(.acquire);
+        if (n != 0) {
+            c.endBySignal(signalName(n));
+            std.process.exit(0);
+        }
+        if (c.quitting.load(.acquire)) return;
+        c.io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+}
+
 // ---- terminal input ----
 
 fn readLine(app: *App, f: Io.File) ![]u8 {
@@ -989,6 +1070,20 @@ test "names_start_with_a_letter_or_digit" {
     const sa = secretArgs(&.{ "add", "--stdin", "foo" }).?;
     try t.expectEqualStrings("foo", sa.name);
     try t.expect(sa.stdin);
+}
+
+test "sigterm_is_caught_and_noted_not_the_end_of_the_process" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    got_signal.store(0, .release);
+    catchSignals();
+    defer {
+        const dfl: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.DFL }, .mask = std.posix.sigemptyset(), .flags = 0 };
+        std.posix.sigaction(.INT, &dfl, null);
+        std.posix.sigaction(.TERM, &dfl, null);
+        got_signal.store(0, .release);
+    }
+    try std.posix.raise(.TERM);
+    try t.expectEqualStrings("SIGTERM", signalName(got_signal.load(.acquire)));
 }
 
 fn printLine(what: []const u8, line: []const []const u8) void {

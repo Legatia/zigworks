@@ -168,6 +168,8 @@ pub const Core = struct {
     /// The owner is asked one question at a time.
     ask_lock: Io.Mutex = .init,
     mcp_arena: std.heap.ArenaAllocator = undefined,
+    /// Guards the list of servers (endBySignal reads it from its thread).
+    mcp_mutex: Io.Mutex = .init,
     mcp_servers: std.ArrayList(*mcp.Server) = .empty,
     mcp_tools: []const agent.McpTool = &.{},
     /// What started and what did not, for /status.
@@ -236,6 +238,8 @@ pub const Core = struct {
     folder_lock: ?Io.File = null,
     /// What holds the folder ("run", "chat", "task" ...), in the status file.
     role: []const u8 = "open",
+    /// main's thread acting on SIGINT/SIGTERM; joined first by close.
+    watcher: ?std.Thread = null,
     /// Said to the owner when a channel is attached.
     pending_warning: ?[]const u8 = null,
     /// What /reload says when the settings files have an error.
@@ -295,6 +299,8 @@ pub const Core = struct {
         c.money_ledger = .{ .path = c.paths.money };
         c.money_ledger.load(io);
         c.mcp_servers = .empty;
+        c.mcp_mutex = .init;
+        c.watcher = null;
         c.stop = .init(false);
         c.runs_mutex = .init;
         c.run_flags = .empty;
@@ -348,6 +354,9 @@ pub const Core = struct {
     pub fn close(c: *Core) void {
         c.quitting.store(true, .release);
         c.stop.store(true, .release);
+        // first: once it is gone no signal handling can touch the core
+        if (c.watcher) |w| w.join();
+        c.watcher = null;
         c.stopRuns();
         if (c.worker) |w| w.join();
         while (c.bg_active.load(.acquire) > 0) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
@@ -873,10 +882,14 @@ pub const Core = struct {
                 c.log.write(.config, false, .{ .event = "mcp failed", .server = sc.name, .why = @errorName(e), .detail = detail }) catch {};
                 continue;
             };
-            c.mcp_servers.append(c.gpa, srv) catch {
-                srv.deinit();
-                continue;
-            };
+            {
+                c.mcp_mutex.lockUncancelable(c.io);
+                defer c.mcp_mutex.unlock(c.io);
+                c.mcp_servers.append(c.gpa, srv) catch {
+                    srv.deinit();
+                    continue;
+                };
+            }
             const tl = agent.mcpTools(a, srv, sc.money, sc.amount) catch &.{};
             all.appendSlice(a, tl) catch {};
             note.print(a, "{s} ({d} tools)\n", .{ sc.name, tl.len }) catch {};
@@ -887,12 +900,27 @@ pub const Core = struct {
     }
 
     fn stopMcp(c: *Core) void {
-        for (c.mcp_servers.items) |srv| srv.deinit();
-        c.mcp_servers.deinit(c.gpa);
-        c.mcp_servers = .empty;
+        const list = blk: {
+            c.mcp_mutex.lockUncancelable(c.io);
+            defer c.mcp_mutex.unlock(c.io);
+            const l = c.mcp_servers;
+            c.mcp_servers = .empty;
+            break :blk l;
+        };
+        var servers = list;
+        for (servers.items) |srv| srv.deinit();
+        servers.deinit(c.gpa);
         c.mcp_tools = &.{};
         c.mcp_note = "";
         c.mcp_arena.deinit();
+    }
+
+    /// Kills the MCP servers' processes, each with its group, freeing
+    /// nothing (for endBySignal, while other threads may still hold them).
+    fn killMcp(c: *Core) void {
+        c.mcp_mutex.lockUncancelable(c.io);
+        defer c.mcp_mutex.unlock(c.io);
+        for (c.mcp_servers.items) |srv| srv.kill();
     }
 
     fn chatTurn(c: *Core, text: []const u8) void {
@@ -975,6 +1003,21 @@ pub const Core = struct {
         if (!chat_busy and bg == 0 and dropped == 0) return "Nothing was running.";
         if (still) return "Stopped. A model call already under way ends on its own; its answer is dropped and nothing it asked for runs.";
         return "Stopped everything that was running.";
+    }
+
+    /// SIGINT or SIGTERM (on Windows the console's Ctrl-C, Ctrl-Break or
+    /// close): what /stop does, then what close does that matters outside
+    /// this process — the log, the status, the MCP servers' processes and
+    /// the lock. Nothing is freed: the caller ends the process right after.
+    pub fn endBySignal(c: *Core, what: []const u8) void {
+        c.quitting.store(true, .release);
+        c.stop.store(true, .release);
+        c.log.write(.config, false, .{ .event = "signal", .signal = what }) catch {};
+        _ = c.stopAll();
+        c.killMcp();
+        c.log.write(.config, false, .{ .event = "stop" }) catch {};
+        c.writeStatus() catch {};
+        c.releaseFolder();
     }
 
     // ---- scheduler ----
@@ -2324,4 +2367,32 @@ test "health_counts_only_harness_run_while_it_holds_the_folder" {
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.status, .data = try std.fmt.allocPrint(f.e.arena.allocator(), "pid 1\nrole run\ntick {s}\nlog {s}\n", .{ util.isoTime(&tb, now_s), &zeros }) });
     try t.expect(!health(t.io, p, now_s, &buf).ok);
     f.core = try Core.open(t.allocator, t.io, home, .{});
+}
+
+test "a_signal_stops_what_runs_logs_it_and_lets_go_of_the_folder" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell sleep *\n" });
+    _ = try f.core.reload();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"sleep 30\"}"));
+    try f.e.script(2, model.textReply("never"));
+    try f.core.startWorker();
+    try f.core.handleText("sleep a while");
+    var waited: u32 = 0;
+    while (!f.core.busy.load(.acquire) and waited < 3000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    // what main's watcher does on SIGTERM before it ends the process
+    f.core.endBySignal("SIGTERM");
+    // the command and its process group are gone: the turn ends at once
+    waited = 0;
+    while (f.core.busy.load(.acquire) and waited < 5000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    try t.expect(!f.core.busy.load(.acquire));
+    try t.expectEqual(1, f.e.server.modelRequests());
+    // said in the log, then the stop, and the folder is free for the next start
+    const lt = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, f.e.arena.allocator(), .unlimited);
+    const sig_at = std.mem.indexOf(u8, lt, "\"event\":\"signal\",\"signal\":\"SIGTERM\"") orelse return error.TestUnexpectedResult;
+    try t.expect(std.mem.indexOfPos(u8, lt, sig_at, "\"event\":\"stop\"") != null);
+    try t.expect(!lockHeld(t.io, f.core.paths));
 }

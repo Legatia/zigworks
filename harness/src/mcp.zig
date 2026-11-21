@@ -386,6 +386,12 @@ pub const Server = struct {
         return buf[0..s.err_len];
     }
 
+    /// Kills the server's process and its group at once; frees nothing
+    /// (`deinit` still has to follow, unless the process is ending).
+    pub fn kill(s: *Server) void {
+        killTree(s.pid);
+    }
+
     /// Closes stdin, gives the server a moment to exit, kills its process
     /// group, waits for it and frees everything.
     pub fn deinit(s: *Server) void {
