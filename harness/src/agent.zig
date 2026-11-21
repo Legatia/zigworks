@@ -666,7 +666,8 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     const tn = try conv.begin();
     // a turn that fails half way could leave a tool call without its result,
     // which the model API refuses from then on: drop it whole
-    errdefer conv.dropLast();
+    var tn_kept = true;
+    errdefer if (tn_kept) conv.dropLast();
     tn.private = r.private;
     // the time and what memory found go with the message, not the system
     // prompt: the system prompt and every earlier turn then stay the same
@@ -705,6 +706,9 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
 
     var result: TurnResult = .{ .text = "" };
     var used_tokens: u64 = 0;
+    var calls_made: usize = 0;
+    // the model API refused the request: this turn is not kept
+    var rejected = false;
     const defs = try toolDefs(r, a);
     while (true) {
         if (r.env.stop.load(.acquire)) {
@@ -745,10 +749,16 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
                 error.NoKey => "Model calls are refused: no omnigate key is stored (harness secret add omnigate).",
                 error.NoUrl => "Model calls are refused: no omnigate url is set ([model] url in config.ini, then /reload).",
                 error.Timeout => if (r.now() >= deadline) "Time limit reached for this turn." else try std.fmt.allocPrint(a, "Model call failed: Timeout {s}", .{r.client.lastError()}),
+                // kept, every later request would carry it and be refused too
+                error.Rejected => try std.fmt.allocPrint(a, "The model API refused the request: {s}. This turn is left out of the conversation, so the next message starts without it{s}.", .{
+                    r.client.lastError(),
+                    if (calls_made == 0) "" else try std.fmt.allocPrint(a, "; the agent will not remember the {d} tool call{s} it made in it", .{ calls_made, if (calls_made == 1) "" else "s" }),
+                }),
                 else => try std.fmt.allocPrint(a, "Model call failed: {s} {s}", .{ @errorName(e), r.client.lastError() }),
             };
             try r.log.write(.model, false, .{ .run = r.label, .result = @errorName(e), .detail = r.client.lastError() });
             result.ended_by = try r.gpa.dupe(u8, why);
+            rejected = e == error.Rejected;
             break;
         };
         used_tokens += reply.input_tokens + reply.cache_read_tokens + reply.cache_write_tokens;
@@ -775,12 +785,21 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
             if (b != .tool_use) continue;
             const u = b.tool_use;
             const out = try callTool(r, a, u.name, u.input_json);
+            calls_made += 1;
             try results.append(a, .{ .tool_result = .{ .id = u.id, .content = out.text, .is_error = out.is_error } });
         }
         if (results.items.len == 0) break;
         try keep(tn, .{ .role = .user, .blocks = results.items });
     }
-    if (result.ended_by) |why| if (result.text.len == 0 or result.stopped) {
+    if (rejected) {
+        conv.dropLast();
+        tn_kept = false;
+        // whatever the agent said before, the owner is told why it ended
+        const why = result.ended_by.?;
+        const said = if (result.text.len == 0) try r.gpa.dupe(u8, why) else try std.fmt.allocPrint(r.gpa, "{s}\n\n{s}", .{ result.text, why });
+        r.gpa.free(result.text);
+        result.text = said;
+    } else if (result.ended_by) |why| if (result.text.len == 0 or result.stopped) {
         r.gpa.free(result.text);
         result.text = try r.gpa.dupe(u8, why);
     };
@@ -1422,6 +1441,27 @@ test "a_slow_model_call_ends_with_the_turn" {
     try t.expect(start.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 4500);
     try t.expectEqualStrings("Time limit reached for this turn.", r.text);
     try t.expectEqual(1, f.e.server.modelRequests());
+}
+
+test "a_turn_the_model_api_refuses_is_dropped" {
+    var f: Fix = undefined;
+    try f.init("allow write_file *\n");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"a.txt\",\"content\":\"hi\"}"));
+    // the request with the tool's result is refused as invalid
+    try f.e.script(2, "{\"status\":400}");
+    try f.e.script(3, model.textReply("fine again"));
+    const r1 = try f.say("first message");
+    defer freeResult(&f.run, r1);
+    // the owner is told what the API said and what the agent will not remember
+    try t.expect(std.mem.indexOf(u8, r1.text, "refused the request: scripted error") != null);
+    try t.expect(std.mem.indexOf(u8, r1.text, "1 tool call") != null);
+    try t.expectEqual(0, f.conv.turns.items.len);
+    // so the next request is not refused for it again
+    const r2 = try f.say("second message");
+    defer freeResult(&f.run, r2);
+    try t.expectEqualStrings("fine again", r2.text);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "first message") == null);
 }
 
 test "stop_before_next_call" {

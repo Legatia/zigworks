@@ -42,6 +42,9 @@ pub const Error = error{
     BudgetSpent,
     /// 429 twice in a row.
     RateLimited,
+    /// 400 or 413: the request itself was refused (invalid, or too
+    /// large); sent again unchanged it would be refused again.
+    Rejected,
     /// Any other error status from omnigate or the provider.
     Upstream,
     /// The answer was not the expected JSON.
@@ -126,6 +129,10 @@ pub const Client = struct {
                 402 => {
                     c.note(r.body);
                     return error.BudgetSpent;
+                },
+                400, 413 => {
+                    c.note(r.body);
+                    return error.Rejected;
                 },
                 429 => {
                     c.note(r.body);
