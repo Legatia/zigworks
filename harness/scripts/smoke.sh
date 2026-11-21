@@ -267,11 +267,16 @@ check "with /dryrun on an approved money call is not made" 'wait_for "$OUT" "dry
 say "/dryrun off"
 wait_for "$OUT" "Dry run is off: approved money calls are made."
 
+# a secret the owner types reaches the log masked (and below: not at all in clear)
+reply "$(text_reply 'noted, not repeated')"
+say "my omnigate key is og-smoke-key-123"
+check "a secret the owner types is masked in the log" 'wait_for "$OUT" "noted, not repeated" && grep -qF "my omnigate key is [secret:omnigate]" "$HARNESS_HOME/log/actions.jsonl"'
+
 kill "$RPID" 2>/dev/null
 wait "$RPID" 2>/dev/null
 RPID=""
 check "the log chain verifies" '"$H" log verify | grep -qF "chain intact"'
-check "no secret value in the log" '! grep -qE "og-smoke-key-123|telegram-smoke-token|brave-smoke-key|smoke-login-pass" "$HARNESS_HOME/log/actions.jsonl"'
+check "no secret value in the log, typed by the owner or not" '! grep -qE "og-smoke-key-123|telegram-smoke-token|brave-smoke-key|smoke-login-pass" "$HARNESS_HOME/log/actions.jsonl"'
 check "a login is removed with its secrets" '"$H" login rm bot >/dev/null && "$H" login list | grep -qF "No logins." && [ ! -e "$HARNESS_STORE/login-bot-password" ] && ! grep -qF "[bot]" "$HARNESS_HOME/logins.ini"'
 # Windows keeps a killed instance's lock for 90 s (no pid check there)
 if [ $windows = 0 ]; then
