@@ -45,6 +45,11 @@ trap cleanup EXIT
 
 fail() {
     echo "FAIL: $*" >&2
+    # on GitHub the failure also goes onto the run, where it can be read
+    # without the log
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        echo "::error::headterm smoke: $(printf '%s' "$*" | tr '\n' ' ' | cut -c1-600)"
+    fi
     exit 1
 }
 
@@ -87,7 +92,10 @@ check "list shows session" sh -c '"$1" list | grep -q "^$2 "' _ "$HT" "$S"
 check "kill removes session" sh -c '! "$1" list | grep -q "^$2 "' _ "$HT" "$S"
 
 # Idle wait, resize and cursor-key mode on a second session.
-"$HT" start "$S-x" --cols 30 --rows 5 -- "$SH" -c 'printf "\033[?1h"; stty -echo raw; dd bs=1 count=3 2>/dev/null | od -An -c; sleep 30' >/dev/null
+"$HT" start "$S-x" --cols 30 --rows 5 -- "$SH" -c 'printf "\033[?1hready"; stty -echo raw; dd bs=1 count=3 2>/dev/null | od -An -c; sleep 30' >/dev/null
+# The mode switch shows nothing, so the program says when it has made it:
+# on a busy machine it can take longer to start than any idle time.
+"$HT" wait "$S-x" --text ready --timeout 20000 >/dev/null || fail "the program did not start"
 "$HT" wait "$S-x" --idle 300 --timeout 5000 >/dev/null || fail "wait --idle"
 check "DECCKM tracked" sh -c '"$1" screen "$2" --json | grep -q "\"app_cursor_keys\":true"' _ "$HT" "$S-x"
 "$HT" send "$S-x" '<Up>'
@@ -143,7 +151,8 @@ check "mouse refused without mouse reporting" sh -c '[ "$1" -eq 2 ] && printf "%
 
 # Mouse: a drag in SGR mode with button-event tracking (1002) sends press,
 # motion and release.
-"$HT" start "$S-x" --cols 40 --rows 4 -- "$SH" -c 'printf "\033[?1002h\033[?1006h"; stty raw -echo; dd bs=1 count=38 2>/dev/null | tr "\033" E; sleep 30' >/dev/null
+"$HT" start "$S-x" --cols 40 --rows 4 -- "$SH" -c 'printf "\033[?1002h\033[?1006hready"; stty raw -echo; dd bs=1 count=38 2>/dev/null | tr "\033" E; sleep 30' >/dev/null
+"$HT" wait "$S-x" --text ready --timeout 20000 >/dev/null || fail "the program did not start"
 "$HT" wait "$S-x" --idle 300 --timeout 5000 >/dev/null
 "$HT" send "$S-x" '<Drag 0,0 0,2>'
 check "drag sends press, motion and release" quiet "$HT" wait "$S-x" --text 'E[<0;1;1ME[<32;2;1ME[<32;3;1ME[<0;3;1m' --timeout 5000

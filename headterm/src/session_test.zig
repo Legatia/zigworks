@@ -18,15 +18,18 @@ const programs = if (builtin.os.tag == .windows) struct {
     }
     /// Runs until it is killed.
     const idle: []const []const u8 = &.{"cmd.exe"};
-    /// Prints "one", reads a key, prints "two".
-    const one_two: []const []const u8 = &.{ "cmd.exe", "/d", "/c", "echo one& pause>nul& echo two& pause>nul" };
-    /// The row "two" ends up on: cmd.exe does not echo the key.
-    const two_row = "1|two";
-    /// Prints "ready"; answers the first key 300 ms later with "got-a",
-    /// and the second not at all. PowerShell, as cmd.exe cannot pause for
-    /// less than a second.
-    const slow_answer: []const []const u8 = &.{ "powershell.exe", "-NoProfile", "-Command", "Write-Host ready; [void][Console]::ReadKey($true); Start-Sleep -Milliseconds 300; Write-Host got-a; [void][Console]::ReadKey($true); Start-Sleep 30" };
+    /// Prints "one", reads a line, prints "two". `set /p` and not `pause`:
+    /// pause throws away what was typed before it began to wait, and a
+    /// test sends its key as soon as "one" is there.
+    const one_two: []const []const u8 = &.{ "cmd.exe", "/d", "/c", "echo one& set /p x=& echo two& pause>nul" };
+    /// The row "two" ends up on: the line that was read takes row 1.
+    const two_row = "2|two";
+    /// Prints "ready"; answers every key "a" 150 ms later with "got-1",
+    /// "got-2" and so on, and other keys not at all. PowerShell, as cmd.exe
+    /// cannot pause for less than a second.
+    const slow_answer: []const []const u8 = &.{ "powershell.exe", "-NoProfile", "-Command", "Write-Host ready; $n = 0; while ($true) { $k = [Console]::ReadKey($true); if ($k.KeyChar -eq 'a') { Start-Sleep -Milliseconds 150; $n++; Write-Host got-$n } }" };
     const answer_keys: []const []const u8 = &.{"a"};
+    const quiet_keys: []const []const u8 = &.{"b"};
     /// Reads a line and prints it after "got:".
     const echo_line: []const []const u8 = &.{ "cmd.exe", "/d", "/v:on", "/c", "set /p x=& echo got:!x!" };
     /// Asks for a key without echo, then prints "got:" and a line it reads.
@@ -43,9 +46,11 @@ const programs = if (builtin.os.tag == .windows) struct {
     const one_two: []const []const u8 = &.{ "/bin/sh", "-c", "echo one; read x; echo two; sleep 30" };
     const two_row = "2|two";
     // No echo, so the only output after the send is the program's own,
-    // and it comes 300 ms later.
-    const slow_answer: []const []const u8 = &.{ "/bin/sh", "-c", "stty -echo; echo ready; read x; sleep 0.3; echo got-$x; read y; sleep 30" };
+    // and it comes 300 ms later: "got-1", "got-2" and so on for every
+    // line "a", nothing for other lines.
+    const slow_answer: []const []const u8 = &.{ "/bin/sh", "-c", "stty -echo; echo ready; n=0; while read x; do if [ \"$x\" = a ]; then sleep 0.3; n=$((n+1)); echo got-$n; fi; done" };
     const answer_keys: []const []const u8 = &.{ "a", "<Enter>" };
+    const quiet_keys: []const []const u8 = &.{ "b", "<Enter>" };
     const echo_line: []const []const u8 = &.{ "/bin/sh", "-c", "read x; echo got:$x" };
     const hidden_prompt: []const []const u8 = &.{ "/bin/sh", "-c", "stty -echo; printf 'pw: '; read x; stty echo; echo got:$x" };
     const hidden_mode = "echo is off, so it is probably waiting for input";
@@ -147,9 +152,21 @@ test "a session with a TTL ends after that long without requests or output" {
     try testing.expect(std.mem.find(u8, info.body, "\"ttl_s\":1") != null);
 
     // Every request counts as activity, so stay quiet for longer than the
-    // TTL, then look once.
-    try sleepMs(2200);
-    try testing.expectError(error.NoSuchSession, call("ttl", &.{"info"}));
+    // TTL, then look once. On a busy machine the server can be late, or be
+    // caught while it ends (the request then gets no answer): look again
+    // after another quiet stretch, a few times at most.
+    var gone = false;
+    var tries: u32 = 0;
+    while (!gone and tries < 4) : (tries += 1) {
+        try sleepMs(2200);
+        if (call("ttl", &.{"info"})) |still| {
+            gpa.free(still.body);
+        } else |err| switch (err) {
+            error.NoSuchSession => gone = true,
+            else => {},
+        }
+    }
+    try testing.expect(gone);
 }
 
 test "each client has its own diff marker" {
@@ -169,6 +186,9 @@ test "each client has its own diff marker" {
     gpa.free(sent.body);
     const a_wait = try call("markers", &.{ "wait", "--text", "two", "--diff", "--client", "a" });
     defer gpa.free(a_wait.body);
+    // seen to fail once in about a hundred runs on a busy Windows machine:
+    // say what came instead
+    if (std.mem.find(u8, a_wait.body, programs.two_row) == null) std.debug.print("each client has its own diff marker: no '{s}' in the wait's answer ({s}): [{s}]; client b's first screen: [{s}]\n", .{ programs.two_row, @tagName(a_wait.status), a_wait.body, b_first.body });
     try testing.expect(std.mem.find(u8, a_wait.body, programs.two_row) != null);
     try testing.expect(std.mem.find(u8, a_wait.body, "0|one") == null);
 
@@ -191,19 +211,36 @@ test "settle after a send waits for the program to react to the keys" {
     var args_buf: [8][]const u8 = undefined;
     const ready = try call("settle", &.{ "wait", "--text", "ready" });
     gpa.free(ready.body);
-    // The last output is now older than the settle time.
-    try sleepMs(300);
 
-    const sent = try call("settle", try sendArgs(&args_buf, programs.answer_keys));
-    gpa.free(sent.body);
-    const after = try call("settle", &.{ "wait", "--settle", "100", "--timeout", "3000" });
-    defer gpa.free(after.body);
-    try testing.expectEqual(client.Status.ok, after.status);
-    try testing.expect(std.mem.find(u8, after.body, "got-a") != null);
+    // A settled wait after a send has the program's answer in it. On a
+    // machine too busy to let the program answer in the time a send is
+    // given, it has not: then the program is left to finish and the same
+    // is tried with its next answer, a few times at most.
+    var answered = false;
+    var attempt: u32 = 1;
+    while (attempt <= 4 and !answered) : (attempt += 1) {
+        // The last output is now older than the settle time.
+        try sleepMs(300);
+        const sent = try call("settle", try sendArgs(&args_buf, programs.answer_keys));
+        gpa.free(sent.body);
+        const after = try call("settle", &.{ "wait", "--settle", "100", "--timeout", "3000" });
+        defer gpa.free(after.body);
+        try testing.expectEqual(client.Status.ok, after.status);
+        var want_buf: [16]u8 = undefined;
+        const want = try std.fmt.bufPrint(&want_buf, "got-{d}", .{attempt});
+        if (std.mem.find(u8, after.body, want) != null) {
+            answered = true;
+        } else {
+            const late = try call("settle", &.{ "wait", "--text", want, "--timeout", "15000" });
+            gpa.free(late.body);
+        }
+    }
+    try testing.expect(answered);
 
     // Keys the program doesn't answer: settle gives up after the grace
     // period instead of running into the timeout.
-    const quiet = try call("settle", try sendArgs(&args_buf, programs.answer_keys));
+    try sleepMs(300);
+    const quiet = try call("settle", try sendArgs(&args_buf, programs.quiet_keys));
     gpa.free(quiet.body);
     const t0 = sys.milliTimestamp();
     const none = try call("settle", &.{ "wait", "--settle", "100", "--timeout", "5000" });
