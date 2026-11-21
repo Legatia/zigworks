@@ -86,6 +86,22 @@ pub fn urlHost(url: []const u8) ?[]const u8 {
     return rest[0..end];
 }
 
+/// Whether two grant keys are the same: exactly, except that a host is
+/// the same in any case, and so is a file's path where volumes ignore case.
+fn sameKey(tool: Tool, a: []const u8, b: []const u8) bool {
+    return switch (tool) {
+        .fetch, .browse, .web => std.ascii.eqlIgnoreCase(a, b),
+        // "NAME HOST"
+        .login => {
+            const sa = std.mem.indexOfScalar(u8, a, ' ') orelse return std.mem.eql(u8, a, b);
+            const sb = std.mem.indexOfScalar(u8, b, ' ') orelse return false;
+            return std.mem.eql(u8, a[0..sa], b[0..sb]) and std.ascii.eqlIgnoreCase(a[sa + 1 ..], b[sb + 1 ..]);
+        },
+        .read_file, .write_file => if (fold_paths) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b),
+        else => std.mem.eql(u8, a, b),
+    };
+}
+
 pub const Grants = struct {
     gpa: std.mem.Allocator,
     items: std.ArrayList(Grant) = .empty,
@@ -103,7 +119,7 @@ pub const Grants = struct {
 
     pub fn add(g: *Grants, tool: Tool, key: []const u8, expires_s: i64) !void {
         for (g.items.items) |*it| {
-            if (it.tool == tool and std.ascii.eqlIgnoreCase(it.key, key)) {
+            if (it.tool == tool and sameKey(tool, it.key, key)) {
                 it.expires_s = expires_s;
                 return;
             }
@@ -115,7 +131,7 @@ pub const Grants = struct {
 
     pub fn has(g: *const Grants, tool: Tool, key: []const u8, now_s: i64) bool {
         for (g.items.items) |it| {
-            if (it.tool == tool and it.expires_s > now_s and std.ascii.eqlIgnoreCase(it.key, key)) return true;
+            if (it.tool == tool and it.expires_s > now_s and sameKey(tool, it.key, key)) return true;
         }
         return false;
     }
@@ -378,6 +394,29 @@ test "grant_allows_until_expiry" {
     try g2.load(t.io, path, 1600);
     try t.expect(g2.has(.fetch, "news.example.com", 1600));
     try t.expect(!g2.has(.shell, "ls -l", 1600));
+}
+
+test "grants_compare_exactly_except_hosts" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.grants.add(.shell, "rm -rf build", 5000);
+    try t.expectEqual(.allow, f.act(.shell, "rm -rf build", .{}));
+    try t.expectEqual(.ask, f.act(.shell, "rm -rf BUILD", .{}));
+    try f.grants.add(.mcp, "github/list_issues", 5000);
+    try t.expectEqual(.ask, f.act(.mcp, "GitHub/List_Issues {}", .{}));
+    // a host is the same host in any case; a login's name is not
+    try f.grants.add(.web, "github.com", 5000);
+    try t.expectEqual(.allow, f.act(.web, "GitHub.COM", .{}));
+    try f.grants.add(.login, "bot github.com", 5000);
+    try t.expectEqual(.allow, f.act(.login, "bot GitHub.com", .{}));
+    try t.expectEqual(.ask, f.act(.login, "BOT github.com", .{}));
+    // a file's path in any case where the volume ignores case
+    try f.grants.add(.write_file, ".npmrc", 5000);
+    try t.expectEqual(if (fold_paths) .allow else .ask, f.act(.write_file, ".NPMRC", .{}));
+    // the same command in another case is a grant of its own, not a renewal
+    try f.grants.add(.shell, "rm -rf BUILD", 6000);
+    try t.expectEqual(5000, f.grants.items.items[0].expires_s);
 }
 
 test "scheduled_run_turns_ask_into_deny" {
