@@ -134,12 +134,14 @@ pub fn placeholders(arena: std.mem.Allocator, text: []const u8) ![]Span {
 const lower = "abcdefghijklmnopqrstuvwxyz";
 const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const digits = "0123456789";
-const symbols = "!#$%&*+-=?@^_";
+/// No `!` or `*` (left as they are by some URL encoders, not by others),
+/// `%` (a decoded form would escape masking) or `^`.
+const symbols = "#$&+-=?@_";
 const alphabet = lower ++ upper ++ digits ++ symbols;
 
 pub const password_len = 24;
 
-/// 24 characters from letters, digits and `!#$%&*+-=?@^_`, with at least
+/// 24 characters from letters, digits and `#$&+-=?@_`, with at least
 /// one lowercase and one uppercase letter, one digit and one symbol.
 pub fn genPassword(io: Io) ![password_len]u8 {
     while (true) {
@@ -298,6 +300,9 @@ test "generated_passwords_have_every_class" {
         const p = try genPassword(t.io);
         try t.expect(hasAny(&p, lower) and hasAny(&p, upper) and hasAny(&p, digits) and hasAny(&p, symbols));
         for (p) |c| try t.expect(std.mem.indexOfScalar(u8, alphabet, c) != null);
+        // none that encoders treat differently (`!*`), the escape sign
+        // itself (`%`: a decoded form would not be masked), or `^`
+        try t.expect(!hasAny(&p, "!%*^"));
         if (i > 0) try t.expect(!std.mem.eql(u8, &p, &seen));
         seen = p;
     }
