@@ -616,14 +616,22 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
         const text = try skills.promptList(arena, list, 4096);
         if (text.len > 0) try out.print(arena, "\n{s}\n", .{text});
     }
+    // in id order, not by strength: a mention then changes no byte here,
+    // and the prompt cache holds
+    const always = try arena.dupe(*memory.Item, recalled.always);
+    std.mem.sort(*memory.Item, always, {}, struct {
+        fn lt(_: void, x: *memory.Item, y: *memory.Item) bool {
+            return std.mem.order(u8, x.id, y.id) == .lt;
+        }
+    }.lt);
     var pinned_header = false;
-    for (recalled.always) |it| if (it.pinned) {
+    for (always) |it| if (it.pinned) {
         if (!pinned_header) try out.appendSlice(arena, "\nStanding instructions from the owner (always follow):\n");
         pinned_header = true;
         try out.print(arena, "- {s}\n", .{it.body});
     };
     var top_header = false;
-    for (recalled.always) |it| if (!it.pinned) {
+    for (always) |it| if (!it.pinned) {
         if (!top_header) try out.appendSlice(arena, "\nWhat you know about the owner:\n");
         top_header = true;
         try out.print(arena, "- {s}\n", .{it.body});
@@ -669,16 +677,19 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     var tn_kept = true;
     errdefer if (tn_kept) conv.dropLast();
     tn.private = r.private;
-    // the time and what memory found go with the message, not the system
-    // prompt: the system prompt and every earlier turn then stay the same
-    // from call to call, and the prompt cache holds across turns
-    const context = blk: {
+    // the instructions are made once a turn, so their stable part is the
+    // same for every step (a `remember` meanwhile shows from the next
+    // turn); one lock: the items are read while no one can forget them
+    const system = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
         const recalled = try r.mem.recall(a, user_text, started, r.top_size, r.auto_recall);
-        const p = try systemParts(a, r, recalled, conv.summary, conv.dropped, started);
-        break :blk try std.fmt.allocPrint(a, "{s}{s}", .{ context_mark, p.changing });
+        break :blk try systemParts(a, r, recalled, conv.summary, conv.dropped, started);
     };
+    // the time and what memory found go with the message, not the system
+    // prompt: the system prompt and every earlier turn then stay the same
+    // from call to call, and the prompt cache holds across turns
+    const context = try std.fmt.allocPrint(a, "{s}{s}", .{ context_mark, system.changing });
     try keep(tn, .{ .role = .user, .blocks = &.{ .{ .text = context }, .{ .text = user_text } } });
     r.deadline_s = deadline;
 
@@ -729,13 +740,6 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
             break;
         }
         result.steps += 1;
-        // one lock for both: the items are read while no one can forget them
-        const system = blk: {
-            r.lock.lockUncancelable(r.io);
-            defer r.lock.unlock(r.io);
-            const recalled = try r.mem.recall(a, user_text, started, r.top_size, r.auto_recall);
-            break :blk try systemParts(a, r, recalled, conv.summary, conv.dropped, started);
-        };
         const msgs = try conv.messages(a);
         const reply = r.client.sendParts(a, system.stable, "", msgs, defs, .{ .stop = r.env.stop, .deadline_s = deadline }) catch |e| {
             if (e == error.Stopped) {
@@ -2117,6 +2121,46 @@ test "system_prompt_is_the_same_across_turns" {
     const now = jv.arr(jv.get(msgs[0], "content")).?;
     try t.expectEqual(old.len, now.len);
     for (old, now) |x, y| try t.expectEqualStrings(jv.str(jv.get(x, "text")).?, jv.str(jv.get(y, "text")).?);
+}
+
+/// The system prompt of the n-th model request, as sent.
+fn systemOf(f: *Fix, n: u32) ![]const u8 {
+    const a = f.e.arena.allocator();
+    const v = jv.parse(a, try f.e.request(n)).?;
+    return std.fmt.allocPrint(a, "{f}", .{std.json.fmt(jv.at(v, &.{ "body", "system" }).?, .{})});
+}
+
+test "the_stable_instructions_keep_memories_in_one_order" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const now = util.nowSeconds(t.io);
+    // the tea item is older, so weaker, until the owner mentions it
+    _ = try f.mem.add("likes green tea in the morning", null, now - 5 * 86400);
+    _ = try f.mem.add("plays chess on weekends", null, now - 86400);
+    try f.e.script(1, model.textReply("one"));
+    try f.e.script(2, model.textReply("two"));
+    var r = try f.say("hello");
+    freeResult(&f.run, r);
+    r = try f.say("green tea in the morning, as always");
+    freeResult(&f.run, r);
+    const s1 = try systemOf(&f, 1);
+    try t.expect(std.mem.indexOf(u8, s1, "likes green tea") != null);
+    // a mention changes strengths, not the cached start of the prompt
+    try t.expectEqualStrings(s1, try systemOf(&f, 2));
+}
+
+test "the_stable_instructions_stay_the_same_through_a_turn" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    _ = try f.mem.add("plays chess on weekends", null, util.nowSeconds(t.io));
+    try f.e.script(1, model.toolReply("tu_1", "remember", "{\"text\":\"prefers short answers without lists\"}"));
+    try f.e.script(2, model.textReply("Noted."));
+    const r = try f.say("keep answers short from now on");
+    freeResult(&f.run, r);
+    // what the turn saved is in the next turn's instructions, not this one's
+    try t.expectEqualStrings(try systemOf(&f, 1), try systemOf(&f, 2));
 }
 
 test "helpers_get_the_rest_of_the_turn_not_a_new_one" {
