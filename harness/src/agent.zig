@@ -19,6 +19,12 @@ const Io = std.Io;
 
 pub const Answer = enum { once, day, deny, timeout };
 
+/// Tells the owner something beside the answer, at once.
+pub const Notice = struct {
+    ctx: *anyopaque,
+    say: *const fn (ctx: *anyopaque, text: []const u8) void,
+};
+
 /// Asks the owner whether a call may run; blocks until they answer or the
 /// approval time runs out.
 pub const Asker = struct {
@@ -185,6 +191,9 @@ pub const Run = struct {
     /// Where calls refused only because nobody could approve them are
     /// noted (a scheduled run says what it skipped); helpers share it.
     skipped: ?*Skipped = null,
+    /// Tells the owner, beside the answer, of each memory item `remember`
+    /// saves.
+    notice: ?Notice = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -677,6 +686,8 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
             defer r.lock.unlock(r.io);
             const res = r.mem.addFrom(arg, null, now_s, .other) catch |e| break :blk tools.Output{ .text = @errorName(e), .is_error = true };
             try r.log.write(.memory, false, .{ .event = if (res.merged) "known" else "add", .id = res.id, .by = "agent" });
+            // the owner sees what goes into every later prompt
+            if (!res.merged) if (r.notice) |n| if (r.mem.find(res.id)) |it| n.say(n.ctx, try memory.savedNote(a, it.id, it.body));
             break :blk .{ .text = try std.fmt.allocPrint(a, "{s} {s}", .{ if (res.merged) "already in memory as" else "saved as", res.id }) };
         },
         .delegate => try delegate(r, a, input_json),

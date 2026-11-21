@@ -436,6 +436,14 @@ pub const Store = struct {
     }
 };
 
+/// What the owner is told when the agent or the memory writer saves an
+/// item: one line, with how to take it back.
+pub fn savedNote(arena: std.mem.Allocator, id: []const u8, body: []const u8) ![]u8 {
+    const short = util.cut(body, 200);
+    const line = try std.mem.replaceOwned(u8, arena, short, "\n", " ");
+    return std.fmt.allocPrint(arena, "Saved to memory: {s}{s} (/forget {s})", .{ line, if (short.len < body.len) "…" else "", id });
+}
+
 fn firstLine(s: []const u8) []const u8 {
     return s[0 .. std.mem.indexOfScalar(u8, s, '\n') orelse s.len];
 }

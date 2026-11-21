@@ -896,6 +896,7 @@ pub const Core = struct {
         var ask: ChatAsk = .{ .core = c, .flag = &flag };
         var run = c.baseRun(&c.chat_client, "chat", false, &flag);
         run.asker = .{ .ctx = &ask, .ask = askOwner };
+        run.notice = .{ .ctx = c, .say = noticeSay };
         const res = agent.turn(&run, &c.conv, text, true) catch |e| {
             var buf: [128]u8 = undefined;
             c.say(std.fmt.bufPrint(&buf, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
@@ -985,7 +986,14 @@ pub const Core = struct {
             defer c.lock.unlock(c.io);
             const res = c.mem.addFrom(l[2..], null, c.now(), .other) catch continue;
             try c.log.write(.memory, false, .{ .event = if (res.merged) "known" else "add", .id = res.id, .by = "memory writer" });
+            // the owner sees what goes into every later prompt
+            if (!res.merged) if (c.mem.find(res.id)) |item| c.say(try memory.savedNote(a, item.id, item.body));
         }
+    }
+
+    fn noticeSay(ctx: *anyopaque, text: []const u8) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        c.say(text);
     }
 
     // ---- stop ----
@@ -1218,6 +1226,7 @@ pub const Core = struct {
         var skipped: agent.Skipped = .init(c.gpa);
         defer skipped.deinit();
         run.skipped = &skipped;
+        run.notice = .{ .ctx = c, .say = noticeSay };
         var conv: agent.Conversation = .init(c.gpa);
         defer conv.deinit();
         try c.log.write(.task, false, .{ .name = tk.name, .event = "start" });
@@ -2242,6 +2251,23 @@ test "private_turns_stay_out_of_memory" {
     const req = try f.e.request(3);
     try t.expect(std.mem.indexOf(u8, req, "xyzzy") == null);
     try t.expect(std.mem.indexOf(u8, req, "ok then") != null);
+}
+
+test "the_owner_hears_of_every_memory_the_agent_or_the_writer_saves" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.script(1, model.toolReply("tu_1", "remember", "{\"text\":\"The owner's sister is called Ada\"}"));
+    try f.e.script(2, model.textReply("Got it."));
+    f.core.chatTurn("my sister is called Ada");
+    const id = f.core.mem.items.items[0].id;
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "Saved to memory: The owner's sister is called Ada (/forget {s})", .{id}));
+    try f.e.script(3, model.textReply("- The owner plays chess on Sundays\\n- The owner's sister is called Ada"));
+    try f.core.writeMemories();
+    try f.rec.waitFor("Saved to memory: The owner plays chess on Sundays (/forget ");
+    // what was known already is not said again
+    try t.expectEqual(1, f.rec.count("sister is called Ada (/forget"));
 }
 
 test "memory_writer_reads_only_new_turns_and_knows_what_is_kept" {
