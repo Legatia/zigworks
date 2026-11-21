@@ -1443,12 +1443,19 @@ pub const Core = struct {
             // switched on while the writer's call ran
             if (c.switches.private.load(.acquire)) break;
             n += 1;
-            c.lock.lockUncancelable(c.io);
-            defer c.lock.unlock(c.io);
-            const res = c.mem.addFrom(l[2..], null, c.now(), .other) catch continue;
-            try c.log.write(.memory, false, .{ .event = if (res.merged) "known" else "add", .id = res.id, .by = "memory writer" });
-            // the owner sees what goes into every later prompt
-            if (!res.merged) if (c.mem.find(res.id)) |item| c.say(try memory.savedNote(a, item.id, item.body));
+            // the owner sees what goes into every later prompt: the note is
+            // made under the lock and sent after it, as a send can wait on
+            // the network while every run needs the lock
+            const note = note: {
+                c.lock.lockUncancelable(c.io);
+                defer c.lock.unlock(c.io);
+                const res = c.mem.addFrom(l[2..], null, c.now(), .other) catch break :note null;
+                try c.log.write(.memory, false, .{ .event = if (res.merged) "known" else "add", .id = res.id, .by = "memory writer" });
+                if (res.merged) break :note null;
+                const item = c.mem.find(res.id) orelse break :note null;
+                break :note try memory.savedNote(a, item.id, item.body);
+            };
+            if (note) |text| c.say(text);
         }
     }
 
@@ -2469,6 +2476,9 @@ const Recorder = struct {
     fail: ?anyerror = null,
     /// While set, a message with buttons is not sent: no message id.
     buttons_fail: bool = false,
+    /// A lock no send may be made under: one made while it is held is
+    /// recorded with "[lock held] " in front.
+    probe: ?*Io.Mutex = null,
     /// The last question's buttons and the message they are in.
     last: Buttons = .{},
     /// Called once buttons are recorded, before their message id is
@@ -2521,7 +2531,12 @@ const Recorder = struct {
         r.mutex.lockUncancelable(t.io);
         defer r.mutex.unlock(t.io);
         if (r.fail) |e| return e;
-        try r.lines.append(t.allocator, try t.allocator.dupe(u8, text));
+        const held = if (r.probe) |m| blk: {
+            if (!m.tryLock()) break :blk true;
+            m.unlock(t.io);
+            break :blk false;
+        } else false;
+        try r.lines.append(t.allocator, try std.fmt.allocPrint(t.allocator, "{s}{s}", .{ if (held) "[lock held] " else "", text }));
     }
 
     fn buttons(ctx: *anyopaque, text: []const u8, bs: []const [2][]const u8) ?i64 {
@@ -3478,6 +3493,23 @@ test "the_owner_hears_of_every_memory_the_agent_or_the_writer_saves" {
     try f.rec.waitFor("Saved to memory: The owner plays chess on Sundays (/forget ");
     // what was known already is not said again
     try t.expectEqual(1, f.rec.count("sister is called Ada (/forget"));
+}
+
+test "memory_notices_are_sent_after_the_memory_lock_is_let_go" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    // a send that waits on Telegram must not hold up every run's gate and
+    // memory meanwhile
+    f.rec.probe = &f.core.lock;
+    try f.e.script(1, model.toolReply("tu_1", "remember", "{\"text\":\"The owner's sister is called Ada\"}"));
+    try f.e.script(2, model.textReply("Got it."));
+    f.core.chatTurn("my sister is called Ada");
+    try f.e.script(3, model.textReply("- The owner plays chess on Sundays"));
+    try f.core.writeMemories();
+    try f.rec.waitFor("Saved to memory: The owner's sister is called Ada");
+    try f.rec.waitFor("Saved to memory: The owner plays chess on Sundays");
+    try t.expectEqual(0, f.rec.count("[lock held]"));
 }
 
 test "remember_in_private_mode_says_it_is_not_saved" {

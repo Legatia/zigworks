@@ -1012,13 +1012,22 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         },
         .remember => blk: {
             if (r.isPrivate()) break :blk tools.Output{ .text = "not saved: this conversation is private" };
-            r.lock.lockUncancelable(r.io);
-            defer r.lock.unlock(r.io);
-            const res = r.mem.addFrom(arg, null, now_s, .other) catch |e| break :blk tools.Output{ .text = @errorName(e), .is_error = true };
-            try r.log.write(.memory, false, .{ .event = if (res.merged) "known" else "add", .id = res.id, .by = "agent" });
-            // the owner sees what goes into every later prompt
-            if (!res.merged) if (r.notice) |n| if (r.mem.find(res.id)) |it| n.say(n.ctx, try memory.savedNote(a, it.id, it.body));
-            break :blk .{ .text = try std.fmt.allocPrint(a, "{s} {s}", .{ if (res.merged) "already in memory as" else "saved as", res.id }) };
+            // the owner sees what goes into every later prompt: the note is
+            // made under the lock and sent after it, as a send can wait on
+            // the network while every run needs the lock
+            var note: ?[]const u8 = null;
+            const said = said: {
+                r.lock.lockUncancelable(r.io);
+                defer r.lock.unlock(r.io);
+                const res = r.mem.addFrom(arg, null, now_s, .other) catch |e| break :blk tools.Output{ .text = @errorName(e), .is_error = true };
+                try r.log.write(.memory, false, .{ .event = if (res.merged) "known" else "add", .id = res.id, .by = "agent" });
+                if (!res.merged and r.notice != null) if (r.mem.find(res.id)) |it| {
+                    note = try memory.savedNote(a, it.id, it.body);
+                };
+                break :said try std.fmt.allocPrint(a, "{s} {s}", .{ if (res.merged) "already in memory as" else "saved as", res.id });
+            };
+            if (note) |text| r.notice.?.say(r.notice.?.ctx, text);
+            break :blk .{ .text = said };
         },
         .delegate => try delegate(r, a, input_json),
         .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
