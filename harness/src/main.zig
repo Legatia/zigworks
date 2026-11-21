@@ -657,4 +657,5 @@ test {
     _ = @import("mcp.zig");
     _ = @import("page.zig");
     _ = @import("totp.zig");
+    _ = @import("logins.zig");
 }
