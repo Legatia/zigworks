@@ -46,6 +46,20 @@ inbox() {
 	printf '%s' "$1" >"$S/telegram/in/$(printf %03d $inbox_n).json"
 }
 say() { inbox "{\"message\":{\"from\":{\"id\":42},\"chat\":{\"id\":42},\"text\":\"$1\"}}"; }
+# what the bot sent, a line per call with the message id it got
+OUT="$S/telegram/out.jsonl"
+# button once|day|deny: "MESSAGE_ID DATA" of that button under the last question
+button() {
+	grep -F '"inline_keyboard":[[' "$OUT" 2>/dev/null | tail -n 1 |
+		sed -n 's/^{"method":"sendMessage","message_id":\([0-9]*\),.*"callback_data":"\([^"]*:'"$1"'\)".*/\1 \2/p'
+}
+# press once|day|deny [MESSAGE_ID]: the owner presses that button of the last
+# question, in the message it is in unless another is given
+press() {
+	b=$(button "$1")
+	[ -n "$b" ] || return 1
+	inbox "{\"callback_query\":{\"id\":\"cb$inbox_n\",\"from\":{\"id\":42},\"message\":{\"message_id\":${2:-${b%% *}},\"chat\":{\"id\":42}},\"data\":\"${b#* }\"}}"
+}
 model() { printf '%s' "$2" >"$S/model/$(printf %03d "$1").json"; }
 text_reply() { printf '{"content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn"}' "$1"; }
 tool_reply() { printf '{"content":[{"type":"tool_use","id":"%s","name":"shell","input":{"command":"%s"}}],"stop_reason":"tool_use"}' "$1" "$2"; }
@@ -108,15 +122,18 @@ check "health says running" '"$H" health >/dev/null'
 CODE=$("$H" pair | sed -n 's|^/pair ||p')
 inbox "{\"message\":{\"from\":{\"id\":7},\"chat\":{\"id\":7},\"text\":\"hello\"}}"
 say "/pair $CODE"
-OUT="$S/telegram/out.jsonl"
 check "pairing answers the owner" 'wait_for "$OUT" "Paired."'
 check "a stranger is dropped and logged" 'grep -qF "\"from\":7" "$HARNESS_HOME/log/actions.jsonl"'
 
 model 2 "$(tool_reply tu_1 'echo smoke-ran')"
 model 3 "$(text_reply 'done: smoke-ran')"
 say "run the echo"
-check "the shell call asks for approval" 'wait_for "$OUT" "a1:day"'
-inbox '{"callback_query":{"id":"cb1","from":{"id":42},"message":{"message_id":1,"chat":{"id":42}},"data":"a1:day"}}'
+# the buttons carry the question's number and this start's nonce
+check "the shell call asks for approval" 'wait_for "$OUT" "\"inline_keyboard\":[[" && button day | grep -qE "^[0-9]+ a[0-9]+-[0-9a-f]{16}:day$"'
+b=$(button day)
+press day $((${b%% *} + 1))
+check "a press in another message answers nothing" 'wait_for "$OUT" "That button is out of date" && [ ! -f "$S/requests/003.json" ]'
+press day
 check "after approval the answer arrives" 'wait_for "$OUT" "done: smoke-ran"'
 check "the command ran" 'grep -qF "smoke-ran" "$S/requests/003.json"'
 

@@ -725,7 +725,7 @@ fn runCmd(app: *App) !Exit {
                 .message => |m| if (m.text.len > 0) c.handleMessage(m.from_id, m.text) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
                 .callback => |cb| {
                     tc.answer(cb.id);
-                    c.handleCallback(cb.from_id, cb.data);
+                    c.handleCallback(cb.from_id, cb.message_id, cb.data);
                 },
             }
         }
