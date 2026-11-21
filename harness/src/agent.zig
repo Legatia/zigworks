@@ -54,6 +54,8 @@ pub const Conversation = struct {
     turns: std.ArrayList(*Turn) = .empty,
     /// Turns dropped to stay under the size limit.
     dropped: usize = 0,
+    /// Those of them dropped without a summary of them.
+    lost: usize = 0,
     /// What the turns summarised away said (owned).
     summary: ?[]u8 = null,
 
@@ -109,6 +111,7 @@ pub const Conversation = struct {
             n += 1;
         }
         c.dropped += n;
+        c.lost += n;
         return n;
     }
 
@@ -288,75 +291,248 @@ pub const McpTool = struct {
     server: *mcp.Server,
     tool: []const u8,
     money: bool,
-    /// The input field holding the amount, for money tools; empty: the
-    /// tool moves no amount (like cancelling an order).
-    amount: []const u8,
+    /// For money tools: the input field holding the amount (mcp.ini's
+    /// `amount =`), `.none` for a tool that moves no amount, `.unset` when
+    /// mcp.ini does not say (refused while a cap is set).
+    amount: mcp.Field = .unset,
+    /// The server's own caps (mcp.ini); null: config.ini's [money].
+    max_per_call: ?u32 = null,
+    max_per_day: ?u32 = null,
 };
 
-/// The amount field of one tool from mcp.ini's `amount =`: one field for
-/// all money tools ("notional_usd"), or per tool
-/// ("place_order:notional_usd, cancel_order:none").
-pub fn amountField(spec: []const u8, tool: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, spec, ':') == null) return std.mem.trim(u8, spec, " ");
-    var it = std.mem.splitScalar(u8, spec, ',');
-    while (it.next()) |item| {
-        const colon = std.mem.indexOfScalar(u8, item, ':') orelse continue;
-        if (!std.mem.eql(u8, std.mem.trim(u8, item[0..colon], " "), tool)) continue;
-        const field = std.mem.trim(u8, item[colon + 1 ..], " ");
-        return if (std.mem.eql(u8, field, "none")) "" else field;
-    }
-    // not listed: an amount is required, under a name that cannot match
-    return "(not set in mcp.ini)";
-}
+/// What one server offers the model, and what the owner should know about
+/// it (for /status and the start).
+pub const Offer = struct {
+    tools: []McpTool,
+    /// One line each, "SERVER: ...\n".
+    notes: []const u8 = "",
+    /// Why the server must not be used at all (it is stopped); then no tools.
+    refused: ?[]const u8 = null,
+};
 
-pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, money: []const []const u8, amount: []const u8) ![]McpTool {
+/// The tools of a started server, as its mcp.ini section `cfg` says;
+/// `caps`: config.ini's [money]; `taken`: the tools of the servers before
+/// it. A name the model would see twice is offered once (the first), so
+/// one name always means one tool.
+pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, cfg: mcp.ServerConfig, caps: config.Config.Money, taken: []const McpTool) !Offer {
+    // a money tool the server does not have is a typo for one it has,
+    // which would then be offered as an ordinary tool: none are offered
+    for (cfg.money) |m| {
+        for (s.tools()) |tl| {
+            if (std.mem.eql(u8, tl.name, m)) break;
+        } else return .{ .tools = &.{}, .refused = try std.fmt.allocPrint(arena, "money = names \"{s}\", which is not one of its tools", .{m}) };
+    }
     var out: std.ArrayList(McpTool) = .empty;
+    var notes: std.ArrayList(u8) = .empty;
+    const capped = (cfg.max_per_call orelse caps.max_per_call) > 0 or (cfg.max_per_day orelse caps.max_per_day) > 0;
     for (s.tools()) |tl| {
         var is_money = false;
-        for (money) |m| if (std.mem.eql(u8, m, tl.name)) {
+        for (cfg.money) |m| if (std.mem.eql(u8, m, tl.name)) {
             is_money = true;
         };
         const name = try std.fmt.allocPrint(arena, "{s}__{s}", .{ tl.server, tl.name });
-        if (name.len > 64) continue;
+        // what model APIs take as a tool name: [A-Za-z0-9_-]{1,64}
+        if (name.len > 64) {
+            try notes.print(arena, "{s}: {s} left out: {s} is longer than 64 characters\n", .{ tl.server, tl.name, name });
+            continue;
+        }
+        const dup = blk: {
+            for ([_][]const McpTool{ taken, out.items }) |list| {
+                for (list) |m| if (std.mem.eql(u8, m.def.name, name)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (dup) {
+            try notes.print(arena, "{s}: {s} left out: another tool already has the name {s}\n", .{ tl.server, tl.name, name });
+            continue;
+        }
         const desc = if (is_money) try std.fmt.allocPrint(arena, "{s} (Moves money: the owner approves every call.)", .{tl.description}) else tl.description;
-        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = amountField(amount, tl.name) });
+        const field: mcp.Field = if (is_money) cfg.amount.of(tl.name) else .unset;
+        if (is_money and field == .unset and capped)
+            try notes.print(arena, "{s}: {s} has no amount field in mcp.ini (amount =), so its calls are refused while a money cap is set\n", .{ tl.server, tl.name });
+        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = field, .max_per_call = cfg.max_per_call, .max_per_day = cfg.max_per_day });
     }
-    return out.items;
+    return .{ .tools = out.items, .notes = notes.items };
 }
 
-/// What money tools moved today, in the owner's day.
+/// What each server's money tools moved today, in the owner's day.
 pub const MoneyLedger = struct {
     mutex: Io.Mutex = .init,
-    day: i64 = 0,
-    total: f64 = 0,
-    /// Where it is kept ("DAY TOTAL"); null in tests.
+    entries: [max_servers]Entry = undefined,
+    len: usize = 0,
+    /// Where it is kept, a line "SERVER DAY TOTAL" each; null in tests.
     path: ?[]const u8 = null,
+    /// Why the record read at start cannot be trusted; while set, every
+    /// money call is refused with it.
+    trouble_buf: [160]u8 = undefined,
+    trouble_len: usize = 0,
 
+    /// Servers whose totals are kept at once.
+    pub const max_servers = 64;
+    /// The longest line: a name, a day and a total printed whole (up to
+    /// 309 digits for the largest f64).
+    const max_line = 32 + 1 + 20 + 1 + 330 + 1;
+    const max_file = max_servers * max_line;
+    /// A total from before totals were kept per server ("DAY TOTAL"): it
+    /// counts for every server, so none can pass its cap on that day.
+    const everyone = "*";
+
+    const Entry = struct {
+        name_buf: [32]u8 = undefined,
+        name_len: u8 = 0,
+        day: i64 = 0,
+        total: f64 = 0,
+
+        fn name(e: *const Entry) []const u8 {
+            return e.name_buf[0..e.name_len];
+        }
+    };
+
+    /// Reads the record. One that is there but cannot be read, or is
+    /// damaged, refuses money calls (see `trouble`) rather than starting
+    /// the day from 0.
     pub fn load(l: *MoneyLedger, io: Io) void {
         const p = l.path orelse return;
-        var buf: [128]u8 = undefined;
-        const got = Io.Dir.cwd().readFile(io, p, &buf) catch return;
-        var it = std.mem.tokenizeAny(u8, got, " \n");
-        l.day = std.fmt.parseInt(i64, it.next() orelse return, 10) catch return;
-        l.total = std.fmt.parseFloat(f64, it.next() orelse return) catch 0;
-    }
-
-    fn spent(l: *MoneyLedger, day: i64) f64 {
-        return if (l.day == day) l.total else 0;
-    }
-
-    fn add(l: *MoneyLedger, io: Io, day: i64, amount: f64) void {
-        if (l.day != day) {
-            l.day = day;
-            l.total = 0;
+        var buf: [max_file + 1]u8 = undefined;
+        const got = Io.Dir.cwd().readFile(io, p, &buf) catch |e| switch (e) {
+            error.FileNotFound => return,
+            else => return l.setTrouble("the money record (state/money) could not be read ({s})", .{@errorName(e)}),
+        };
+        if (got.len == buf.len) return l.setTrouble("the money record (state/money) is too large", .{});
+        var lines = std.mem.tokenizeAny(u8, got, "\r\n");
+        var n_line: usize = 0;
+        while (lines.next()) |line| {
+            n_line += 1;
+            var parts: [3][]const u8 = undefined;
+            var n: usize = 0;
+            var it = std.mem.tokenizeAny(u8, line, " \t");
+            while (it.next()) |x| {
+                if (n == parts.len) break;
+                parts[n] = x;
+                n += 1;
+            }
+            const bad = it.next() != null or n < 2;
+            const name = if (n == 2) everyone else parts[0];
+            const day = if (bad) null else std.fmt.parseInt(i64, parts[n - 2], 10) catch null;
+            const total = if (bad) null else std.fmt.parseFloat(f64, parts[n - 1]) catch null;
+            const good_total = if (total) |x| x >= 0 and !std.math.isNan(x) and !std.math.isInf(x) else false;
+            const e = if (day != null and good_total) l.entry(name, day.?) else null;
+            const slot = e orelse return l.setTrouble("the money record (state/money) is damaged at line {d}", .{n_line});
+            slot.day = day.?;
+            slot.total = total.?;
         }
-        l.total += amount;
+    }
+
+    fn setTrouble(l: *MoneyLedger, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.bufPrint(&l.trouble_buf, fmt, args) catch l.trouble_buf[0..];
+        l.trouble_len = text.len;
+    }
+
+    /// Why money calls are refused whatever they are; null: they are not.
+    pub fn trouble(l: *const MoneyLedger) ?[]const u8 {
+        return if (l.trouble_len > 0) l.trouble_buf[0..l.trouble_len] else null;
+    }
+
+    fn find(l: *MoneyLedger, name: []const u8) ?*Entry {
+        for (l.entries[0..l.len]) |*e| if (std.mem.eql(u8, e.name(), name)) return e;
+        return null;
+    }
+
+    /// The entry for `name`, made if there is none (in place of one of a
+    /// day before `day` when all are taken); null when none is free.
+    fn entry(l: *MoneyLedger, name: []const u8, day: i64) ?*Entry {
+        if (l.find(name)) |e| return e;
+        if (name.len == 0 or name.len > 32) return null;
+        const e = if (l.len < max_servers) blk: {
+            l.len += 1;
+            break :blk &l.entries[l.len - 1];
+        } else for (l.entries[0..l.len]) |*old| {
+            if (old.day < day) break old;
+        } else return null;
+        e.* = .{ .day = day };
+        @memcpy(e.name_buf[0..name.len], name);
+        e.name_len = @intCast(name.len);
+        return e;
+    }
+
+    /// The day a reservation made on `day` counts toward: a later one when
+    /// another run already counted past midnight (so today's total is
+    /// never wiped by yesterday's).
+    fn dayFor(l: *MoneyLedger, server: []const u8, day: i64) i64 {
+        const e = l.find(server) orelse return day;
+        return @max(e.day, day);
+    }
+
+    /// What `server` moved on `day`.
+    fn spent(l: *MoneyLedger, server: []const u8, day: i64) f64 {
+        var so_far: f64 = 0;
+        for ([_][]const u8{ server, everyone }) |n| if (l.find(n)) |e| {
+            if (e.day == day) so_far += e.total;
+        };
+        return so_far;
+    }
+
+    /// Counts `amount` toward `server`'s day (`dayFor`) and saves it.
+    /// error.NoRoom when no entry is free; when the save fails, nothing is
+    /// counted and its error is returned: a reservation that would be
+    /// forgotten at the next start is not made.
+    fn reserve(l: *MoneyLedger, io: Io, server: []const u8, day_in: i64, amount: f64) !Reservation {
+        const day = l.dayFor(server, day_in);
+        const before = l.entries;
+        const before_len = l.len;
+        const e = l.entry(server, day) orelse return error.NoRoom;
+        if (e.day != day) {
+            e.day = day;
+            e.total = 0;
+        }
+        e.total += amount;
+        l.save(io, day) catch |err| {
+            l.entries = before;
+            l.len = before_len;
+            return err;
+        };
+        return .{ .day = day, .amount = amount };
+    }
+
+    /// Takes back what `reserve` counted, for a call not made. A day that
+    /// is over is left as it was (it no longer counts), and a total never
+    /// goes below 0.
+    /// When the save fails, the file keeps the higher total, which is
+    /// the safe side; the next reservation saves both or is refused.
+    fn release(l: *MoneyLedger, io: Io, server: []const u8, res: Reservation) !void {
+        if (res.amount == 0) return;
+        const e = l.find(server) orelse return;
+        if (e.day != res.day) return;
+        e.total = @max(0, e.total - res.amount);
+        try l.save(io, res.day);
+    }
+
+    /// Writes the totals of `today` and later (an older day no longer
+    /// counts) to a new file that then replaces the old one, so a crash
+    /// half way leaves the old record, not a cut one.
+    fn save(l: *MoneyLedger, io: Io, today: i64) !void {
         const p = l.path orelse return;
-        var buf: [128]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "{d} {d}\n", .{ l.day, l.total }) catch return;
-        Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = text, .flags = .{ .permissions = util.private_file } }) catch {};
+        var buf: [max_file]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        for (l.entries[0..l.len]) |*e| if (e.day >= today) try w.print("{s} {d} {d}\n", .{ e.name(), e.day, e.total });
+        var tmp_buf: [4096]u8 = undefined;
+        const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{p});
+        const cwd = Io.Dir.cwd();
+        try cwd.writeFile(io, .{ .sub_path = tmp, .data = w.buffered(), .flags = .{ .permissions = util.private_file } });
+        errdefer cwd.deleteFile(io, tmp) catch {};
+        try cwd.rename(tmp, cwd, p, io);
+    }
+
+    /// Everything counted, whatever the server and day (for tests).
+    fn sum(l: *const MoneyLedger) f64 {
+        var total: f64 = 0;
+        for (l.entries[0..l.len]) |e| total += e.total;
+        return total;
     }
 };
+
+/// An amount counted toward a server's day before its call is asked.
+const Reservation = struct { day: i64 = 0, amount: f64 = 0 };
 
 pub const ModelCfg = struct {
     url: []const u8,
@@ -476,11 +652,24 @@ pub const context_mark = "[context]";
 pub const Prompt = struct { stable: []const u8, changing: []const u8 };
 
 pub fn systemPrompt(arena: std.mem.Allocator, r: *const Run, recalled: memory.Recall, dropped: usize, now_s: i64) ![]const u8 {
-    const p = try systemParts(arena, r, recalled, null, dropped, now_s);
+    const p = try systemParts(arena, r, recalled, .{ .dropped = dropped, .lost = dropped }, now_s);
     return std.mem.concat(arena, u8, &.{ p.stable, p.changing });
 }
 
-pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Recall, summary: ?[]const u8, dropped: usize, now_s: i64) !Prompt {
+/// What became of the conversation's earlier turns.
+pub const Past = struct {
+    summary: ?[]const u8 = null,
+    /// Turns gone, summarised or not.
+    dropped: usize = 0,
+    /// Turns gone without a summary.
+    lost: usize = 0,
+
+    fn of(c: *const Conversation) Past {
+        return .{ .summary = c.summary, .dropped = c.dropped, .lost = c.lost };
+    }
+};
+
+pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Recall, past: Past, now_s: i64) !Prompt {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, if (r.helper) helper_prompt else base_prompt);
     if (!r.helper and r.model_cfg != null) try out.appendSlice(arena, delegate_guide);
@@ -491,20 +680,30 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
         const text = try skills.promptList(arena, list, 4096);
         if (text.len > 0) try out.print(arena, "\n{s}\n", .{text});
     }
+    // in id order, not by strength: a mention then changes no byte here,
+    // and the prompt cache holds
+    const always = try arena.dupe(*memory.Item, recalled.always);
+    std.mem.sort(*memory.Item, always, {}, struct {
+        fn lt(_: void, x: *memory.Item, y: *memory.Item) bool {
+            return std.mem.order(u8, x.id, y.id) == .lt;
+        }
+    }.lt);
     var pinned_header = false;
-    for (recalled.always) |it| if (it.pinned) {
+    for (always) |it| if (it.pinned) {
         if (!pinned_header) try out.appendSlice(arena, "\nStanding instructions from the owner (always follow):\n");
         pinned_header = true;
         try out.print(arena, "- {s}\n", .{it.body});
     };
     var top_header = false;
-    for (recalled.always) |it| if (!it.pinned) {
+    for (always) |it| if (!it.pinned) {
         if (!top_header) try out.appendSlice(arena, "\nWhat you know about the owner:\n");
         top_header = true;
         try out.print(arena, "- {s}\n", .{it.body});
     };
-    if (summary) |sm| try out.print(arena, "\nSummary of the earlier conversation:\n{s}\n", .{sm});
-    if (dropped > 0 and summary == null) try out.print(arena, "\n{d} earlier turns of this conversation were dropped to keep it short.\n", .{dropped});
+    if (past.summary) |sm| {
+        try out.print(arena, "\nSummary of the earlier conversation:\n{s}\n", .{sm});
+        if (past.lost > 0) try out.print(arena, "{d} turns of this conversation were dropped without being summarised, to keep it short.\n", .{past.lost});
+    } else if (past.dropped > 0) try out.print(arena, "\n{d} earlier turns of this conversation were dropped to keep it short.\n", .{past.dropped});
     const stable = out.items;
 
     out = .empty;
@@ -541,18 +740,22 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     const tn = try conv.begin();
     // a turn that fails half way could leave a tool call without its result,
     // which the model API refuses from then on: drop it whole
-    errdefer conv.dropLast();
+    var tn_kept = true;
+    errdefer if (tn_kept) conv.dropLast();
     tn.private = r.isPrivate();
-    // the time and what memory found go with the message, not the system
-    // prompt: the system prompt and every earlier turn then stay the same
-    // from call to call, and the prompt cache holds across turns
-    const context = blk: {
+    // the instructions are made once a turn, so their stable part is the
+    // same for every step (a `remember` meanwhile shows from the next
+    // turn); one lock: the items are read while no one can forget them
+    const system = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
         const recalled = try r.mem.recall(a, user_text, started, r.top_size, r.autoRecall());
-        const p = try systemParts(a, r, recalled, conv.summary, conv.dropped, started);
-        break :blk try std.fmt.allocPrint(a, "{s}{s}", .{ context_mark, p.changing });
+        break :blk try systemParts(a, r, recalled, .of(conv), started);
     };
+    // the time and what memory found go with the message, not the system
+    // prompt: the system prompt and every earlier turn then stay the same
+    // from call to call, and the prompt cache holds across turns
+    const context = try std.fmt.allocPrint(a, "{s}{s}", .{ context_mark, system.changing });
     try keep(tn, .{ .role = .user, .blocks = &.{ .{ .text = context }, .{ .text = user_text } } });
     r.deadline_s = deadline;
 
@@ -580,6 +783,9 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
 
     var result: TurnResult = .{ .text = "" };
     var used_tokens: u64 = 0;
+    var calls_made: usize = 0;
+    // the model API refused the request: this turn is not kept
+    var rejected = false;
     const defs = try toolDefs(r, a);
     while (true) {
         if (r.env.stop.load(.acquire)) {
@@ -600,22 +806,29 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
             break;
         }
         result.steps += 1;
-        // one lock for both: the items are read while no one can forget them
-        const system = blk: {
-            r.lock.lockUncancelable(r.io);
-            defer r.lock.unlock(r.io);
-            const recalled = try r.mem.recall(a, user_text, started, r.top_size, r.autoRecall());
-            break :blk try systemParts(a, r, recalled, conv.summary, conv.dropped, started);
-        };
         const msgs = try conv.messages(a);
-        const reply = r.client.sendParts(a, system.stable, "", msgs, defs) catch |e| {
+        const reply = r.client.sendParts(a, system.stable, "", msgs, defs, .{ .stop = r.env.stop, .deadline_s = deadline }) catch |e| {
+            if (e == error.Stopped) {
+                result.stopped = true;
+                result.ended_by = try r.gpa.dupe(u8, "Stopped.");
+                break;
+            }
             const why: []const u8 = switch (e) {
                 error.BudgetSpent => "Model budget used up.",
                 error.RateLimited => "The model is rate limited; try again later.",
+                error.NoKey => "Model calls are refused: no omnigate key is stored (harness secret add omnigate).",
+                error.NoUrl => "Model calls are refused: no omnigate url is set ([model] url in config.ini, then /reload).",
+                error.Timeout => if (r.now() >= deadline) "Time limit reached for this turn." else try std.fmt.allocPrint(a, "Model call failed: Timeout {s}", .{r.client.lastError()}),
+                // kept, every later request would carry it and be refused too
+                error.Rejected => try std.fmt.allocPrint(a, "The model API refused the request: {s}. This turn is left out of the conversation, so the next message starts without it{s}.", .{
+                    r.client.lastError(),
+                    if (calls_made == 0) "" else try std.fmt.allocPrint(a, "; the agent will not remember the {d} tool call{s} it made in it", .{ calls_made, if (calls_made == 1) "" else "s" }),
+                }),
                 else => try std.fmt.allocPrint(a, "Model call failed: {s} {s}", .{ @errorName(e), r.client.lastError() }),
             };
             try r.log.write(.model, false, .{ .run = r.label, .result = @errorName(e), .detail = r.client.lastError() });
             result.ended_by = try r.gpa.dupe(u8, why);
+            rejected = e == error.Rejected;
             break;
         };
         used_tokens += reply.input_tokens + reply.cache_read_tokens + reply.cache_write_tokens;
@@ -638,16 +851,33 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
         }
 
         var results: std.ArrayList(model.Block) = .empty;
+        // a reply cut at max_tokens may end in a call cut half way (a
+        // command missing its end): none of its calls run, each answered
+        const cut = std.mem.eql(u8, reply.stop_reason, "max_tokens");
         for (reply.blocks) |b| {
             if (b != .tool_use) continue;
             const u = b.tool_use;
+            if (cut) {
+                try r.log.write(.tool, r.private, .{ .run = r.label, .tool = u.name, .event = "not run: the reply was cut at max_tokens" });
+                try results.append(a, .{ .tool_result = .{ .id = u.id, .content = cut_note, .is_error = true } });
+                continue;
+            }
             const out = try callTool(r, a, u.name, u.input_json);
+            calls_made += 1;
             try results.append(a, .{ .tool_result = .{ .id = u.id, .content = out.text, .is_error = out.is_error } });
         }
         if (results.items.len == 0) break;
         try keep(tn, .{ .role = .user, .blocks = results.items });
     }
-    if (result.ended_by) |why| if (result.text.len == 0 or result.stopped) {
+    if (rejected) {
+        conv.dropLast();
+        tn_kept = false;
+        // whatever the agent said before, the owner is told why it ended
+        const why = result.ended_by.?;
+        const said = if (result.text.len == 0) try r.gpa.dupe(u8, why) else try std.fmt.allocPrint(r.gpa, "{s}\n\n{s}", .{ result.text, why });
+        r.gpa.free(result.text);
+        result.text = said;
+    } else if (result.ended_by) |why| if (result.text.len == 0 or result.stopped) {
         r.gpa.free(result.text);
         result.text = try r.gpa.dupe(u8, why);
     };
@@ -655,6 +885,8 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .answer = result.text, .steps = result.steps, .ended_by = result.ended_by, .dropped_turns = dropped });
     return result;
 }
+
+const cut_note = "not run: your reply was cut off at the output limit (max_tokens) before it was complete, so this call may be cut too; make it again, in smaller parts if it was long";
 
 /// Frees what `turn` allocated in its result.
 pub fn freeResult(r: *Run, res: TurnResult) void {
@@ -702,9 +934,9 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         else => tools.mainArg(a, tool, input_json) catch return .{ .text = "the tool's input is missing its main field", .is_error = true },
     };
     const now_s = r.now();
-    var amount: f64 = 0;
+    var reserved: Reservation = .{};
     if (tool == .money) {
-        if (moneyCheck(r, a, mt.?, input_json, now_s, &amount)) |why| {
+        if (moneyCheck(r, a, mt.?, input_json, now_s, &reserved)) |why| {
             try r.log.write(.gate, r.isPrivate(), .{ .run = r.label, .tool = name, .decision = "deny", .why = why, .arg = arg });
             return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
         }
@@ -718,7 +950,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         else => "",
     };
     if (try decideAndAsk(r, a, tool, name, arg, detail, now_s)) |refused| {
-        if (tool == .money) releaseMoney(r, now_s, amount);
+        if (tool == .money) releaseMoney(r, mt.?, reserved);
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{refused}), .is_error = true };
     }
     // a tool gets what is left of the turn, no more
@@ -726,7 +958,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     if (r.deadline_s > 0) {
         const left = r.deadline_s - r.now();
         if (left <= 0) {
-            if (tool == .money) releaseMoney(r, now_s, amount);
+            if (tool == .money) releaseMoney(r, mt.?, reserved);
             const late: tools.Output = .{ .text = "not run: no time left in this turn", .is_error = true };
             try r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = name, .arg = arg, .is_error = true, .output = late.text });
             return late;
@@ -754,7 +986,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
             break :blk .{ .text = try std.fmt.allocPrint(a, "saved as {s}", .{res.id}) };
         },
         .delegate => try delegate(r, a, input_json),
-        .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, amount),
+        .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
         .skill => blk: {
             const v = jv.parse(a, input_json).?;
             const text = if (jv.str(jv.get(v, "file"))) |file|
@@ -889,7 +1121,6 @@ fn webNote(ctx: *anyopaque, event: []const u8, login: []const u8, detail: []cons
 
 /// The amount in a money call's input: a number or a numeric string.
 fn amountOf(a: std.mem.Allocator, input_json: []const u8, field: []const u8) ?f64 {
-    if (field.len == 0) return null;
     const v = jv.parse(a, input_json) orelse return null;
     const x = jv.get(v, field) orelse return null;
     return switch (x) {
@@ -906,45 +1137,58 @@ fn moneyDay(r: *const Run, now_s: i64) i64 {
 
 /// Why a money call is refused before anyone is asked, or null. When it
 /// passes, its amount is already counted in today's total (checked and
-/// counted under one lock, so two runs cannot both pass the same cap);
-/// `releaseMoney` takes it back if the call is not made.
-fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []const u8, now_s: i64, amount: *f64) ?[]const u8 {
-    const capped = r.money.max_per_call > 0 or r.money.max_per_day > 0;
+/// counted under one lock, so two runs cannot both pass the same cap) as
+/// `res`; `releaseMoney` takes it back if the call is not made.
+fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []const u8, now_s: i64, res: *Reservation) ?[]const u8 {
+    var amount: f64 = 0;
+    // the server's own caps, else config.ini's
+    const per_call = m.max_per_call orelse r.money.max_per_call;
+    const per_day = m.max_per_day orelse r.money.max_per_day;
+    const capped = per_call > 0 or per_day > 0;
     if (r.scheduled and r.money.scheduled and !capped)
-        return "money in scheduled runs needs max_per_call or max_per_day in [money]";
-    if (m.amount.len > 0) {
-        if (amountOf(a, input_json, m.amount)) |x| {
+        return "money in scheduled runs needs max_per_call or max_per_day ([money] in config.ini, or the server's section in mcp.ini)";
+    switch (m.amount) {
+        .none => {},
+        // without its field the caps cannot be checked: refused, not let through
+        .unset => if (capped) return "no amount field is set for this tool in mcp.ini (amount =), so the money caps cannot be checked",
+        .name => |field| if (amountOf(a, input_json, field)) |x| {
             if (x < 0 or std.math.isNan(x) or std.math.isInf(x)) return "the amount is not a positive number";
-            amount.* = x;
+            amount = x;
         } else if (capped) {
-            return std.fmt.allocPrint(a, "no amount in the field \"{s}\", so the caps cannot be checked", .{m.amount}) catch "no amount";
-        }
+            return std.fmt.allocPrint(a, "no amount in the field \"{s}\", so the caps cannot be checked", .{field}) catch "no amount";
+        },
     }
-    if (r.money.max_per_call > 0 and amount.* > @as(f64, @floatFromInt(r.money.max_per_call)))
-        return std.fmt.allocPrint(a, "{d} is over the cap of {d} per call", .{ amount.*, r.money.max_per_call }) catch "over the cap per call";
-    const l = r.money_ledger orelse return if (r.money.max_per_day > 0) "no record of today's total" else null;
+    if (per_call > 0 and amount > @as(f64, @floatFromInt(per_call)))
+        return std.fmt.allocPrint(a, "{d} is over the cap of {d} per call", .{ amount, per_call }) catch "over the cap per call";
+    const l = r.money_ledger orelse return if (per_day > 0) "no record of today's total" else null;
     l.mutex.lockUncancelable(r.io);
     defer l.mutex.unlock(r.io);
-    const day = moneyDay(r, now_s);
-    const spent = l.spent(day);
-    if (r.money.max_per_day > 0 and spent + amount.* > @as(f64, @floatFromInt(r.money.max_per_day)))
-        return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount.*, r.money.max_per_day, spent }) catch "over the cap per day";
-    l.add(r.io, day, amount.*);
+    if (l.trouble()) |why| return std.fmt.allocPrint(a, "{s}; no money call is made until it is fixed and harness restarted", .{why}) catch "the money record cannot be trusted";
+    // each server has its own total: its caps are in its own units
+    const day = l.dayFor(m.server.name, moneyDay(r, now_s));
+    const spent = l.spent(m.server.name, day);
+    if (per_day > 0 and spent + amount > @as(f64, @floatFromInt(per_day)))
+        return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount, per_day, spent }) catch "over the cap per day";
+    res.* = l.reserve(r.io, m.server.name, day, amount) catch |e| return switch (e) {
+        error.NoRoom => "the day totals of too many servers are kept already",
+        else => std.fmt.allocPrint(a, "today's money total could not be saved to state/money ({s}), so no money call is made while it cannot be", .{@errorName(e)}) catch "the money record could not be saved",
+    };
     return null;
 }
 
-/// Takes back an amount counted by `moneyCheck` for a call not made.
-fn releaseMoney(r: *Run, now_s: i64, amount: f64) void {
+/// Takes back an amount counted by `moneyCheck` for a call not made: from
+/// the day it was counted toward, not the day it is now.
+fn releaseMoney(r: *Run, m: *const McpTool, res: Reservation) void {
     const l = r.money_ledger orelse return;
-    if (amount == 0) return;
     l.mutex.lockUncancelable(r.io);
     defer l.mutex.unlock(r.io);
-    l.add(r.io, moneyDay(r, now_s), -amount);
+    l.release(r.io, m.server.name, res) catch |e|
+        r.log.write(.gate, false, .{ .run = r.label, .tool = m.def.name, .event = "money record not saved", .why = @errorName(e) }) catch {};
 }
 
-fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, amount: f64) !tools.Output {
+fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, reserved: Reservation) !tools.Output {
     if (m.money and r.dryRun()) {
-        releaseMoney(r, r.now(), amount);
+        releaseMoney(r, m, reserved);
         return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
     }
     // what is left of the turn, no more
@@ -1113,38 +1357,69 @@ fn compact(r: *Run, conv: *Conversation) !usize {
     var gone: usize = 0;
     if (r.model_cfg != null and !r.helper and conv.turns.items.len > keep_last) {
         const n = conv.turns.items.len - keep_last;
-        if (summarise(r, conv, n)) |text| {
+        if (summarise(r, conv, n)) |sum| {
             if (conv.summary) |old| conv.gpa.free(old);
-            conv.summary = text;
+            conv.summary = sum.text;
             conv.dropOldest(n);
+            conv.lost += sum.left_out;
             gone = n;
-            try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .event = "summarised", .turns = n });
+            try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .event = "summarised", .turns = n - sum.left_out });
+            if (sum.left_out > 0) try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .event = "dropped unsummarised", .turns = sum.left_out, .summary = true });
         } else |e| {
             try r.log.write(.model, false, .{ .run = r.label, .event = "summary failed", .result = @errorName(e) });
         }
     }
-    return gone + conv.trim(limit);
+    // still over (or no summary): the oldest go whole, and it is said
+    const trimmed = conv.trim(limit);
+    if (trimmed > 0) try r.log.write(.turn, r.private, .{ .run = r.label, .event = "dropped unsummarised", .turns = trimmed, .summary = conv.summary != null });
+    return gone + trimmed;
 }
 
-fn summarise(r: *Run, conv: *Conversation, n: usize) ![]u8 {
+/// The most a summary call is sent.
+const summary_input_max = 60000;
+
+const Summary = struct {
+    /// Owned by `r.gpa`.
+    text: []u8,
+    /// The oldest turns that did not fit in the call.
+    left_out: usize,
+};
+
+/// A summary of the oldest `n` turns (with the earlier summary).
+fn summarise(r: *Run, conv: *Conversation, n: usize) !Summary {
     var arena_state: std.heap.ArenaAllocator = .init(r.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
+    // each turn as text, so that the newest are the ones kept
+    const parts = try a.alloc([]const u8, n);
+    for (conv.turns.items[0..n], parts) |tn, *part| {
+        var turn_text: std.ArrayList(u8) = .empty;
+        for (tn.messages.items) |m| for (m.blocks) |b| {
+            // private turns never leave their turn: not into memory, not here
+            if (tn.private) {
+                if (m.role == .user and b == .text and !std.mem.startsWith(u8, b.text, context_mark)) try turn_text.appendSlice(a, "(a private part of the conversation, left out)\n");
+                continue;
+            }
+            switch (b) {
+                .text => |x| if (!std.mem.startsWith(u8, x, context_mark)) try turn_text.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(x, 2000) }),
+                .tool_use => |u| try turn_text.print(a, "(tool {s}: {s})\n", .{ u.name, util.cut(u.input_json, 300) }),
+                .tool_result => |x| try turn_text.print(a, "(result: {s})\n", .{util.cut(x.content, 500)}),
+            }
+        };
+        part.* = turn_text.items;
+    }
     var text: std.ArrayList(u8) = .empty;
     if (conv.summary) |old| try text.print(a, "Earlier summary:\n{s}\n\n", .{old});
-    for (conv.turns.items[0..n]) |tn| for (tn.messages.items) |m| for (m.blocks) |b| {
-        if (text.items.len > 60000) break;
-        // private turns never leave their turn: not into memory, not here
-        if (tn.private) {
-            if (m.role == .user and b == .text and !std.mem.startsWith(u8, b.text, context_mark)) try text.appendSlice(a, "(a private part of the conversation, left out)\n");
-            continue;
-        }
-        switch (b) {
-            .text => |x| if (!std.mem.startsWith(u8, x, context_mark)) try text.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(x, 2000) }),
-            .tool_use => |u| try text.print(a, "(tool {s}: {s})\n", .{ u.name, util.cut(u.input_json, 300) }),
-            .tool_result => |x| try text.print(a, "(result: {s})\n", .{util.cut(x.content, 500)}),
-        }
-    };
+    // over the limit, the oldest turns are left out: the newest matter most
+    var first = n;
+    var size = text.items.len;
+    while (first > 0 and size + parts[first - 1].len <= summary_input_max) : (first -= 1) size += parts[first - 1].len;
+    const left_out = if (first == n) n - 1 else first;
+    if (left_out > 0) try text.print(a, "({d} older turns left out: too long to summarise)\n", .{left_out});
+    if (first == n) {
+        // not even the newest fits: its start, rather than nothing
+        try text.appendSlice(a, util.cut(parts[n - 1], summary_input_max -| text.items.len));
+    } else for (parts[first..]) |part| try text.appendSlice(a, part);
     const cfg = r.model_cfg.?;
     var client = try model.Client.init(r.gpa, r.io, cfg.url, cfg.key, cfg.memory, 1024);
     defer client.deinit();
@@ -1152,7 +1427,7 @@ fn summarise(r: *Run, conv: *Conversation, n: usize) ![]u8 {
     try r.log.write(.model, false, .{ .run = r.label, .result = "ok", .purpose = "summary", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
     const out = try reply.text(a);
     if (out.len == 0) return error.EmptySummary;
-    return r.gpa.dupe(u8, out);
+    return .{ .text = try r.gpa.dupe(u8, out), .left_out = left_out };
 }
 
 const t = std.testing;
@@ -1233,7 +1508,7 @@ const Fix = struct {
         f.last_deadline = q.deadline_s;
         f.last_allow_day = q.allow_day;
         if (f.on_ask) |flag| flag.store(true, .release);
-        f.ledger_at_ask = f.ledger.total;
+        f.ledger_at_ask = f.ledger.sum();
         const now_in = f.in_flight.fetchAdd(1, .acq_rel) + 1;
         _ = f.max_in_flight.fetchMax(now_in, .acq_rel);
         if (f.ask_ms > 0) t.io.sleep(.fromMilliseconds(f.ask_ms), .awake) catch {};
@@ -1424,6 +1699,68 @@ test "budget_spent_ends_turn_with_message" {
     try t.expectEqual(1, f.e.server.modelRequests());
 }
 
+test "a_turn_without_a_key_says_model_calls_are_refused" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    f.client.key = "";
+    const r = try f.say("hello");
+    defer freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, r.text, "no omnigate key is stored") != null);
+    try t.expectEqual(0, f.e.server.modelRequests());
+}
+
+test "a_slow_model_call_ends_with_the_turn" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    f.run.limits.turn_seconds = 2;
+    try f.e.script(1, comptime "{\"delay_ms\":6000," ++ model.textReply("too late")[1..]);
+    const start = Io.Clock.awake.now(t.io);
+    const r = try f.say("hello");
+    defer freeResult(&f.run, r);
+    try t.expect(start.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 4500);
+    try t.expectEqualStrings("Time limit reached for this turn.", r.text);
+    try t.expectEqual(1, f.e.server.modelRequests());
+}
+
+test "a_turn_the_model_api_refuses_is_dropped" {
+    var f: Fix = undefined;
+    try f.init("allow write_file *\n");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"a.txt\",\"content\":\"hi\"}"));
+    // the request with the tool's result is refused as invalid
+    try f.e.script(2, "{\"status\":400}");
+    try f.e.script(3, model.textReply("fine again"));
+    const r1 = try f.say("first message");
+    defer freeResult(&f.run, r1);
+    // the owner is told what the API said and what the agent will not remember
+    try t.expect(std.mem.indexOf(u8, r1.text, "refused the request: scripted error") != null);
+    try t.expect(std.mem.indexOf(u8, r1.text, "1 tool call") != null);
+    try t.expectEqual(0, f.conv.turns.items.len);
+    // so the next request is not refused for it again
+    const r2 = try f.say("second message");
+    defer freeResult(&f.run, r2);
+    try t.expectEqualStrings("fine again", r2.text);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "first message") == null);
+}
+
+test "tool_calls_in_a_reply_cut_at_max_tokens_are_not_run" {
+    var f: Fix = undefined;
+    try f.init("allow write_file *\n");
+    defer f.deinit();
+    // the reply ran out of room in the middle of its call
+    try f.e.script(1, "{\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"write_file\",\"input\":{\"path\":\"a.txt\",\"content\":\"the start of\"}}],\"stop_reason\":\"max_tokens\"}");
+    try f.e.script(2, model.textReply("I will write it in parts."));
+    const r = try f.say("write a long file");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("I will write it in parts.", r.text);
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "ws/a.txt", .{}));
+    // the model is told, in the call's own result
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "\"tool_use_id\":\"tu_1\",\"content\":\"not run: your reply was cut off") != null);
+}
+
 test "stop_before_next_call" {
     var f: Fix = undefined;
     try f.init("allow read_file *\n");
@@ -1612,21 +1949,96 @@ test "long_conversation_is_summarised_not_dropped" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(8), "Summary of the earlier conversation") != null);
 }
 
+test "turns_dropped_after_a_summary_are_logged_and_said" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    f.run.limits.conversation_bytes = 1000;
+    const a = f.e.arena.allocator();
+    for (1..6) |n| try f.e.script(@intCast(n), model.textReply("It will be sunny."));
+    // the sixth answer is long: after the summary the newest turns alone
+    // are still over the limit
+    const long: [900]u8 = @splat('w');
+    try f.e.script(6, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"stop_reason\":\"end_turn\"}}", .{&long}));
+    try f.e.script(7, model.textReply("The owner asked about the weather."));
+    try f.e.script(8, model.textReply("ok"));
+    for (0..6) |_| {
+        const r = try f.say("and the weather?");
+        freeResult(&f.run, r);
+    }
+    try t.expect(f.conv.summary != null);
+    const r = try f.say("thanks");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"event\":\"dropped unsummarised\"") != null);
+    const req8 = try f.e.request(8);
+    try t.expect(std.mem.indexOf(u8, req8, "Summary of the earlier conversation") != null);
+    try t.expect(std.mem.indexOf(u8, req8, "dropped without being summarised") != null);
+}
+
+test "a_summary_too_long_to_send_keeps_the_newest_turns" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    // about 2 KB a turn: the turns to summarise are over the 60 KB sent
+    f.run.limits.conversation_bytes = 72000;
+    const a = f.e.arena.allocator();
+    const filler: [1990]u8 = @splat('x');
+    for (1..41) |n| try f.e.script(@intCast(n), try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"text\",\"text\":\"answer-{d:0>2} {s}\"}}],\"stop_reason\":\"end_turn\"}}", .{ n, &filler }));
+    var asked: u32 = 0;
+    while (f.conv.summary == null and asked < 40) : (asked += 1) {
+        const r = try f.say(try std.fmt.allocPrint(a, "question {d:0>2}", .{asked + 1}));
+        freeResult(&f.run, r);
+    }
+    try t.expect(f.conv.summary != null);
+    // the summary call came right after the last turn's
+    const req = try f.e.request(asked + 1);
+    try t.expect(std.mem.indexOf(u8, req, "\"model\":\"claude-mem\"") != null);
+    // all but the last 4 turns were summarised: the newest of them is in
+    const newest = try std.fmt.allocPrint(a, "answer-{d:0>2} ", .{asked - 4});
+    try t.expect(std.mem.indexOf(u8, req, newest) != null);
+    // and the oldest made room for it, said so
+    try t.expect(std.mem.indexOf(u8, req, "answer-01 ") == null);
+    try t.expect(std.mem.indexOf(u8, req, "older turns left out") != null);
+    // those are gone without a summary, and the model is told
+    try t.expect(f.conv.lost > 0);
+    try f.e.script(asked + 2, model.textReply("ok"));
+    const r = try f.say("thanks");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(asked + 2), "dropped without being summarised") != null);
+}
+
 // ---- MCP tools and money ----
 
 const mcp_fake_path = if (@import("builtin").is_test) @import("build_options").fake_path else "";
 
-fn withMcp(f: *Fix, money: bool) !*mcp.Server {
+/// The fake server's tools as the mcp.ini section `[fake]` with the lines
+/// `extra` makes them; they become the run's MCP tools.
+fn fakeTools(f: *Fix, s: *mcp.Server, extra: []const u8) !Offer {
+    const a = f.e.arena.allocator();
+    const cfgs = try mcp.parseConfig(a, try std.fmt.allocPrint(a, "[fake]\ncommand = x\n{s}", .{extra}));
+    const offer = try mcpTools(a, s, cfgs[0], f.run.money, &.{});
+    f.mcp_tools = offer.tools;
+    f.run.mcp = f.mcp_tools;
+    return offer;
+}
+
+/// The fake MCP server, started under `name`.
+fn startFake(f: *Fix, name: []const u8) !*mcp.Server {
     const a = f.e.arena.allocator();
     const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, mcp_fake_path, a);
-    const s = try mcp.Server.start(t.allocator, t.io, .{ .name = "fake", .command = try std.fmt.allocPrint(a, "\"{s}\" --mcp", .{fake}), .secrets = &.{}, .money = &.{} }, .{
+    return mcp.Server.start(t.allocator, t.io, .{ .name = name, .command = try std.fmt.allocPrint(a, "\"{s}\" --mcp", .{fake}), .secrets = &.{}, .money = &.{} }, .{
         .cwd = f.run.env.workspace,
         .path_var = "/usr/bin:/bin",
         .home = "/tmp",
         .secret_values = &.{},
     });
-    f.mcp_tools = try mcpTools(a, s, if (money) &.{ "echo", "fail" } else &.{}, "amount");
-    f.run.mcp = f.mcp_tools;
+}
+
+fn withMcp(f: *Fix, money: bool) !*mcp.Server {
+    const s = try startFake(f, "fake");
+    _ = try fakeTools(f, s, if (money) "money = echo, fail\namount = amount\n" else "");
     f.run.money_ledger = &f.ledger;
     return s;
 }
@@ -1789,7 +2201,7 @@ test "money_dry_run_does_not_call_the_tool" {
     const req = try f.e.request(2);
     try t.expect(std.mem.indexOf(u8, req, "dry run: would call fake/echo") != null);
     try t.expect(std.mem.indexOf(u8, req, "home=") == null); // the server never ran it
-    try t.expectEqual(@as(f64, 0), f.ledger.total);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
 }
 
 test "the_money_question_says_whether_the_call_is_made" {
@@ -1849,7 +2261,7 @@ test "money_in_scheduled_runs_only_when_switched_on" {
     r = try f.say("buy");
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(4), "two") != null);
-    try t.expectEqual(@as(f64, 2), f.ledger.total);
+    try t.expectEqual(@as(f64, 2), f.ledger.sum());
 }
 
 test "helpers_never_get_money_tools" {
@@ -1880,7 +2292,7 @@ test "money_is_reserved_while_asked_and_released_when_denied" {
     const r = try f.say("buy");
     freeResult(&f.run, r);
     try t.expectEqual(@as(f64, 30), f.ledger_at_ask);
-    try t.expectEqual(@as(f64, 0), f.ledger.total);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
 }
 
 test "money_call_that_fails_still_counts" {
@@ -1893,7 +2305,7 @@ test "money_call_that_fails_still_counts" {
     try f.e.script(2, model.textReply("ok"));
     const r = try f.say("buy");
     freeResult(&f.run, r);
-    try t.expectEqual(@as(f64, 7), f.ledger.total);
+    try t.expectEqual(@as(f64, 7), f.ledger.sum());
 }
 
 test "unattended_money_needs_a_cap" {
@@ -1918,9 +2330,8 @@ test "amount_field_can_differ_per_tool" {
     defer f.deinit();
     const s = try withMcp(&f, true);
     defer s.deinit();
-    f.mcp_tools = try mcpTools(f.e.arena.allocator(), s, &.{ "echo", "fail" }, "echo:amount, fail:none");
-    f.run.mcp = f.mcp_tools;
     f.run.money = .{ .max_per_call = 10 };
+    _ = try fakeTools(&f, s, "money = echo, fail\namount = echo:amount, fail:none\n");
     // like cancel_order: no amount, still allowed with a cap set
     try f.e.script(1, model.toolReply("tu_1", "fake__fail", "{}"));
     try f.e.script(2, model.toolReply("tu_2", "fake__echo", "{\"text\":\"x\"}"));
@@ -1929,6 +2340,224 @@ test "amount_field_can_differ_per_tool" {
     freeResult(&f.run, r);
     try t.expectEqual(1, f.asked);
     try t.expect(std.mem.indexOf(u8, try f.e.request(3), "no amount in the field \\\"amount\\\"") != null);
+}
+
+test "money_tool_without_an_amount_field_is_refused_under_a_cap" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.money = .{ .max_per_day = 100 };
+    // mcp.ini lists the money tools but says nothing about their amounts
+    const offer = try fakeTools(&f, s, "money = echo, fail\n");
+    // the owner is told when the server starts (and in /status)
+    try t.expect(std.mem.indexOf(u8, offer.notes, "fake: echo has no amount field in mcp.ini") != null);
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"buy\",\"amount\":500}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "no amount field") != null);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
+}
+
+test "a_money_tool_the_server_does_not_list_stops_the_server" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, false);
+    defer s.deinit();
+    // a typo: the real tool would be offered as an ordinary MCP tool
+    const offer = try fakeTools(&f, s, "money = echo, ech\namount = amount\n");
+    try t.expectEqual(0, offer.tools.len);
+    try t.expect(std.mem.indexOf(u8, offer.refused.?, "money = names \"ech\", which is not one of its tools") != null);
+    try t.expectEqual(null, (try fakeTools(&f, s, "money = echo\namount = amount\n")).refused);
+}
+
+test "mcp_tool_names_never_collide" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const tool = struct {
+        fn of(server: []const u8, name: []const u8) mcp.Tool {
+            return .{ .server = server, .name = name, .description = "", .schema_json = "{}" };
+        }
+    }.of;
+    const long: [62]u8 = @splat('x'); // a__ and this: 65
+    // only the tool list is read
+    var one: mcp.Server = undefined;
+    one.name = "a_";
+    one.tool_list = try a.dupe(mcp.Tool, &.{ tool("a_", "b"), tool("a_", "b") });
+    var two: mcp.Server = undefined;
+    two.name = "a";
+    two.tool_list = try a.dupe(mcp.Tool, &.{ tool("a", "_b"), tool("a", &long), tool("a", "c") });
+    const cfg: mcp.ServerConfig = .{ .name = "a", .command = "x", .secrets = &.{}, .money = &.{} };
+    const first = try mcpTools(a, &one, cfg, .{}, &.{});
+    // the server listed b twice: the model gets it once
+    try t.expectEqual(1, first.tools.len);
+    try t.expectEqualStrings("a___b", first.tools[0].def.name);
+    // a's _b is also "a___b": the first server's keeps the name
+    const second = try mcpTools(a, &two, cfg, .{}, first.tools);
+    try t.expectEqual(1, second.tools.len);
+    try t.expectEqualStrings("a__c", second.tools[0].def.name);
+    try t.expect(std.mem.indexOf(u8, second.notes, "a: _b left out: another tool already has the name a___b") != null);
+    try t.expect(std.mem.indexOf(u8, second.notes, "is longer than 64 characters") != null);
+}
+
+test "a_server_can_have_its_own_money_caps" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    // config.ini's [money] is the default; the server's section says less
+    f.run.money = .{ .max_per_call = 100 };
+    _ = try fakeTools(&f, s, "money = echo, fail\namount = amount\nmax_per_call = 10\n");
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":20}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "over the cap of 10 per call") != null);
+}
+
+test "each_server_keeps_its_own_day_total" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    const s2 = try startFake(&f, "other");
+    defer s2.deinit();
+    const cfgs = try mcp.parseConfig(a, "[other]\ncommand = x\nmoney = echo\namount = amount\n");
+    const second = try mcpTools(a, s2, cfgs[0], f.run.money, f.mcp_tools);
+    f.mcp_tools = try std.mem.concat(a, McpTool, &.{ f.mcp_tools, second.tools });
+    f.run.mcp = f.mcp_tools;
+    f.run.money = .{ .max_per_day = 50 };
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":30}"));
+    try f.e.script(2, model.toolReply("tu_2", "other__echo", "{\"text\":\"y\",\"amount\":30}"));
+    try f.e.script(3, model.toolReply("tu_3", "fake__echo", "{\"text\":\"z\",\"amount\":30}"));
+    try f.e.script(4, model.textReply("ok"));
+    const r = try f.say("buy on both");
+    freeResult(&f.run, r);
+    // 30 on each server is within its own 50; a second 30 on one is not
+    try t.expectEqual(2, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "over the cap of 50 per day (30 so far today)") != null);
+}
+
+test "money_ledger_keeps_a_total_per_server_and_reads_the_old_file" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const p = try std.fs.path.join(t.allocator, &.{ dir, "money" });
+    defer t.allocator.free(p);
+    // the file from before totals were kept per server
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "money", .data = "20000 40\n" });
+    var l: MoneyLedger = .{ .path = p };
+    l.load(t.io);
+    // that day's total counts for every server: none passes its cap anew
+    try t.expectEqual(@as(f64, 40), l.spent("broker", 20000));
+    try t.expectEqual(@as(f64, 40), l.spent("other", 20000));
+    try t.expectEqual(@as(f64, 0), l.spent("broker", 20001));
+    _ = try l.reserve(t.io, "broker", 20000, 5);
+    var again: MoneyLedger = .{ .path = p };
+    again.load(t.io);
+    try t.expectEqual(@as(f64, 45), again.spent("broker", 20000));
+    try t.expectEqual(@as(f64, 40), again.spent("other", 20000));
+    // written whole to a new file that replaced the old one
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(t.io, "money.tmp", .{}));
+    const first = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(1024));
+    defer t.allocator.free(first);
+    try t.expectEqualStrings("* 20000 40\nbroker 20000 5\n", first);
+    // a day that is over is not written again
+    _ = try again.reserve(t.io, "broker", 20001, 1);
+    const later = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(1024));
+    defer t.allocator.free(later);
+    try t.expectEqualStrings("broker 20001 1\n", later);
+}
+
+test "the_money_record_holds_every_server_however_large_its_total" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const p = try std.fs.path.join(t.allocator, &.{ dir, "money" });
+    defer t.allocator.free(p);
+    var l: MoneyLedger = .{ .path = p };
+    var name_buf: [32]u8 = undefined;
+    // with no cap nothing bounds an amount: the largest still fits
+    for (0..MoneyLedger.max_servers) |i| _ = try l.reserve(t.io, try std.fmt.bufPrint(&name_buf, "server-{d}", .{i}), 20000, std.math.floatMax(f64));
+    var again: MoneyLedger = .{ .path = p };
+    again.load(t.io);
+    try t.expectEqual(null, again.trouble());
+    try t.expectEqual(std.math.floatMax(f64), again.spent("server-63", 20000));
+}
+
+test "a_money_record_that_cannot_be_trusted_refuses_money_calls" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "money", .data = "fake 20000 5\nfake 20001 lots\n" });
+    f.ledger.path = try std.fs.path.join(a, &.{ f.e.dir, "money" });
+    f.ledger.load(t.io);
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":5}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "the money record (state/money) is damaged at line 2") != null);
+    // one that cannot be read at all: the same
+    var dir_ledger: MoneyLedger = .{ .path = f.e.dir };
+    dir_ledger.load(t.io);
+    try t.expect(std.mem.indexOf(u8, dir_ledger.trouble().?, "could not be read") != null);
+    // none there yet is the first day, not trouble
+    var fresh: MoneyLedger = .{ .path = try std.fs.path.join(a, &.{ f.e.dir, "nothing-yet" }) };
+    fresh.load(t.io);
+    try t.expectEqual(null, fresh.trouble());
+}
+
+test "a_release_for_a_day_that_is_over_leaves_today_alone" {
+    var l: MoneyLedger = .{};
+    // 30 counted late on day 100 while the owner is asked; after midnight
+    // another run moves 5
+    const late = try l.reserve(t.io, "broker", 100, 30);
+    _ = try l.reserve(t.io, "broker", 101, 5);
+    // the owner says no after midnight: day 100's 30 is taken back
+    try l.release(t.io, "broker", late);
+    try t.expectEqual(@as(f64, 5), l.spent("broker", 101));
+    // a run that read the clock just before midnight but counts after
+    // another run did counts toward the new day, not over it
+    const behind = try l.reserve(t.io, "broker", 100, 2);
+    try t.expectEqual(101, behind.day);
+    try t.expectEqual(@as(f64, 7), l.spent("broker", 101));
+    // and a total never goes below 0
+    try l.release(t.io, "broker", .{ .day = 101, .amount = 50 });
+    try t.expectEqual(@as(f64, 0), l.spent("broker", 101));
+}
+
+test "a_money_total_that_cannot_be_saved_refuses_the_call" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.money = .{ .max_per_day = 100 };
+    // its folder is not there: every save fails
+    f.ledger.path = try std.fs.path.join(f.e.arena.allocator(), &.{ f.e.dir, "gone", "money" });
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":5}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "could not be saved") != null);
+    // not counted either: it was not made
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
 }
 
 test "private_turns_are_left_out_of_summaries" {
@@ -1973,6 +2602,46 @@ test "system_prompt_is_the_same_across_turns" {
     const now = jv.arr(jv.get(msgs[0], "content")).?;
     try t.expectEqual(old.len, now.len);
     for (old, now) |x, y| try t.expectEqualStrings(jv.str(jv.get(x, "text")).?, jv.str(jv.get(y, "text")).?);
+}
+
+/// The system prompt of the n-th model request, as sent.
+fn systemOf(f: *Fix, n: u32) ![]const u8 {
+    const a = f.e.arena.allocator();
+    const v = jv.parse(a, try f.e.request(n)).?;
+    return std.fmt.allocPrint(a, "{f}", .{std.json.fmt(jv.at(v, &.{ "body", "system" }).?, .{})});
+}
+
+test "the_stable_instructions_keep_memories_in_one_order" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const now = util.nowSeconds(t.io);
+    // the tea item is older, so weaker, until the owner mentions it
+    _ = try f.mem.add("likes green tea in the morning", null, now - 5 * 86400);
+    _ = try f.mem.add("plays chess on weekends", null, now - 86400);
+    try f.e.script(1, model.textReply("one"));
+    try f.e.script(2, model.textReply("two"));
+    var r = try f.say("hello");
+    freeResult(&f.run, r);
+    r = try f.say("green tea in the morning, as always");
+    freeResult(&f.run, r);
+    const s1 = try systemOf(&f, 1);
+    try t.expect(std.mem.indexOf(u8, s1, "likes green tea") != null);
+    // a mention changes strengths, not the cached start of the prompt
+    try t.expectEqualStrings(s1, try systemOf(&f, 2));
+}
+
+test "the_stable_instructions_stay_the_same_through_a_turn" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    _ = try f.mem.add("plays chess on weekends", null, util.nowSeconds(t.io));
+    try f.e.script(1, model.toolReply("tu_1", "remember", "{\"text\":\"prefers short answers without lists\"}"));
+    try f.e.script(2, model.textReply("Noted."));
+    const r = try f.say("keep answers short from now on");
+    freeResult(&f.run, r);
+    // what the turn saved is in the next turn's instructions, not this one's
+    try t.expectEqualStrings(try systemOf(&f, 1), try systemOf(&f, 2));
 }
 
 test "helpers_get_the_rest_of_the_turn_not_a_new_one" {

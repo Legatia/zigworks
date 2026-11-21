@@ -192,6 +192,8 @@ pub const Core = struct {
     mcp_tools: []const agent.McpTool = &.{},
     /// What started and what did not, for /status.
     mcp_note: []const u8 = "",
+    /// What the owner should fix in mcp.ini (also in `mcp_note`), said at start.
+    mcp_warn: []const u8 = "",
     money_ledger: agent.MoneyLedger = .{},
     /// Chrome or Chromium for `browse` and `web`; empty: none.
     browser: []const u8 = "",
@@ -370,6 +372,7 @@ pub const Core = struct {
         c.mcp_arena = .init(gpa);
         c.mcp_tools = &.{};
         c.mcp_note = "";
+        c.mcp_warn = "";
         c.browser = "";
         c.store = null;
         return c;
@@ -1015,6 +1018,7 @@ pub const Core = struct {
         c.mcp_arena = .init(c.gpa);
         c.mcp_tools = &.{};
         c.mcp_note = "";
+        c.mcp_warn = "";
         const a = c.mcp_arena.allocator();
         const text = Io.Dir.cwd().readFileAlloc(c.io, c.paths.mcp, a, .limited(1 << 20)) catch return;
         const cfgs = mcp.parseConfig(a, text) catch {
@@ -1056,6 +1060,7 @@ pub const Core = struct {
 
         // said and kept in mcp.ini's order
         var note: std.ArrayList(u8) = .empty;
+        var warn: std.ArrayList(u8) = .empty;
         var all: std.ArrayList(agent.McpTool) = .empty;
         for (starts) |*st| {
             const name = st.cfg.name;
@@ -1071,6 +1076,16 @@ pub const Core = struct {
                 c.log.write(.config, false, .{ .event = "mcp failed", .server = name, .why = @errorName(st.err), .detail = detail }) catch {};
                 continue;
             };
+            // the money list is checked against what the server offers
+            // before the server is kept: a name it doesn't have stops it
+            const offer = agent.mcpTools(a, srv, st.cfg, c.cfg.money, all.items) catch agent.Offer{ .tools = &.{}, .refused = "out of memory" };
+            if (offer.refused) |why| {
+                srv.deinit();
+                note.print(a, "{s}: not started: {s}\n", .{ name, why }) catch {};
+                warn.print(a, "{s}: not started: {s}\n", .{ name, why }) catch {};
+                c.log.write(.config, false, .{ .event = "mcp refused", .server = name, .why = why }) catch {};
+                continue;
+            }
             {
                 c.mcp_mutex.lockUncancelable(c.io);
                 defer c.mcp_mutex.unlock(c.io);
@@ -1079,13 +1094,14 @@ pub const Core = struct {
                     continue;
                 };
             }
-            const tl = agent.mcpTools(a, srv, st.cfg.money, st.cfg.amount) catch &.{};
-            all.appendSlice(a, tl) catch {};
-            note.print(a, "{s} ({d} tools)\n", .{ name, tl.len }) catch {};
-            c.log.write(.config, false, .{ .event = "mcp started", .server = name, .tools = tl.len }) catch {};
+            all.appendSlice(a, offer.tools) catch {};
+            note.print(a, "{s} ({d} tools)\n{s}", .{ name, offer.tools.len, offer.notes }) catch {};
+            warn.appendSlice(a, offer.notes) catch {};
+            c.log.write(.config, false, .{ .event = "mcp started", .server = name, .tools = offer.tools.len, .notes = offer.notes }) catch {};
         }
         c.mcp_tools = all.items;
         c.mcp_note = note.items;
+        c.mcp_warn = warn.items;
     }
 
     /// A stored secret for an MCP server: one read at start, else from the
@@ -1129,6 +1145,7 @@ pub const Core = struct {
         servers.deinit(c.gpa);
         c.mcp_tools = &.{};
         c.mcp_note = "";
+        c.mcp_warn = "";
         c.mcp_arena.deinit();
     }
 
@@ -2605,6 +2622,33 @@ test "an_answer_the_question_does_not_offer_is_not_taken" {
     try t.expect(f.core.answerPending(.deny));
     try f.rec.waitFor("answered");
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "denied by the owner") != null);
+}
+
+test "status_says_which_money_tools_have_no_amount_field" {
+    var f: Fix = undefined;
+    try f.init("[money]\nmax_per_day = 50\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\nmoney = echo\n", .{fake}) });
+    _ = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_warn, "fake: echo has no amount field") != null);
+    try f.core.handleText("/status");
+    try f.rec.waitFor("fake: echo has no amount field in mcp.ini");
+}
+
+test "a_server_whose_money_list_names_a_missing_tool_is_not_started" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\nmoney = echo, place_order\namount = amount\n", .{fake}) });
+    _ = try f.core.reload();
+    try t.expectEqual(0, f.core.mcp_servers.items.len);
+    try t.expectEqual(0, f.core.mcp_tools.len);
+    try f.core.handleText("/status");
+    try f.rec.waitFor("fake: not started: money = names \"place_order\", which is not one of its tools");
 }
 
 test "mcp_start_errors_are_masked_in_the_log" {
