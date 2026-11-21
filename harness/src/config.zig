@@ -369,6 +369,9 @@ pub const rules_example =
     \\# write_file to a path with a part starting with "." (.git/config,
     \\# .npmrc: programs read those as settings) ask; money tools are asked
     \\# every time, whatever the rules; the others are allowed.
+    \\# After the agent writes a file in the workspace, a shell command that
+    \\# a rule or a 24 h grant allows is asked first, naming the files, until
+    \\# you allow one; a scheduled run skips it.
     \\#
     \\# deny  shell rm -rf *
     \\# allow fetch https://news.ycombinator.com/*

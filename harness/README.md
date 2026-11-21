@@ -78,7 +78,7 @@ DIR.
 | `workspace/` | where the agent's files and commands live |
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
-| `state/` | grants, seen feed items, owner, status, lock, approval numbers, money totals, the log's key, `store-id`, `mcp/NAME` (each MCP server's own folder) |
+| `state/` | grants, seen feed items, owner, status, lock, approval numbers, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command (`written`), `mcp/NAME` (each MCP server's own folder) |
 
 On macOS and Linux, `config.ini`, `rules`, `logins.ini` and `mcp.ini` are
 refused if other users can write them. Harness names a settings file it
@@ -105,6 +105,12 @@ deny  shell rm -rf *
 allow fetch https://news.ycombinator.com/*
 allow shell git status
 ```
+
+After the agent writes a file in the workspace, a shell command that a
+rule or a grant allows is asked first, naming the files written since you
+last allowed a command (a `pkg.py` or `Makefile` can change what a
+command runs), until you allow one; a scheduled run skips it. The list
+is kept in `state/written`.
 
 File rules and grants see the path inside the workspace: `./notes/a`,
 `x/../notes/a`, its absolute path or a symlink to it count as `notes/a`,
