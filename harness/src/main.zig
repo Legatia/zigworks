@@ -143,6 +143,7 @@ const App = struct {
         const c = Core.open(app.gpa, app.io, app.home, sec) catch |e| {
             switch (e) {
                 error.AlreadyRunning => complain("harness is already running on {s}; talk to it there (or stop it first)", .{app.home}),
+                error.BadUrl => complain("the omnigate url in config.ini ([model] url) is {s}", .{if (cfg.model.url.len == 0) "not set yet" else "not valid"}),
                 error.BadSettings => complain("a settings file in {s} has an error, or config.ini/rules can be changed by other users (chmod 600 them)", .{app.home}),
                 else => complain("can't open {s}: {s}", .{ app.home, @errorName(e) }),
             }
@@ -218,7 +219,7 @@ fn initCmd(app: *App) !Exit {
     try outPrint(app.io,
         \\Data folder: {s}
         \\Next:
-        \\  1. Set the omnigate url and route names in config.ini.
+        \\  1. Set the omnigate url (there is none by default) and route names in config.ini.
         \\  2. harness secret add omnigate     (your omnigate key)
         \\  3. harness secret add telegram     (the bot token from @BotFather)
         \\  4. harness secret add search       (optional: Brave Search API key)

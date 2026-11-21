@@ -17,7 +17,9 @@ pub const Config = struct {
     money: Money = .{},
 
     pub const Model = struct {
-        url: []const u8 = "http://127.0.0.1:8080",
+        /// omnigate's address; empty until the owner sets it (no default,
+        /// so the key never goes to whatever happens to listen there).
+        url: []const u8 = "",
         model: []const u8 = "claude-sonnet",
         memory_model: []const u8 = "claude-haiku",
         /// Route for helpers started with `delegate`.
@@ -133,7 +135,9 @@ fn setField(sec: anytype, l: Line) Error!void {
                 @field(sec.*, fname) = parseOffset(l.value) catch return error.BadConfig;
             } else switch (ftype) {
                 []const u8 => {
-                    if (l.value.len == 0) return error.BadConfig;
+                    // only omnigate's address may be left empty (not set yet)
+                    const may_be_empty = comptime (T == Config.Model and std.mem.eql(u8, fname, "url"));
+                    if (l.value.len == 0 and !may_be_empty) return error.BadConfig;
                     @field(sec.*, fname) = l.value;
                 },
                 u32 => @field(sec.*, fname) = std.fmt.parseInt(u32, l.value, 10) catch return error.BadConfig,
@@ -311,7 +315,7 @@ pub fn parseDays(v: []const u8) error{BadDays}!u7 {
 pub const defaults_ini =
     \\; harness settings. Lines starting with ; are comments.
     \\[model]
-    \\url = http://127.0.0.1:8080        ; omnigate
+    \\url =                               ; required: your omnigate's address, like https://omnigate.example.com
     \\model = claude-sonnet               ; omnigate route for the agent
     \\memory_model = claude-haiku         ; omnigate route for writing memories
     \\worker_model = claude-haiku         ; omnigate route for helpers (delegate)
@@ -396,7 +400,12 @@ test "config_defaults_when_empty" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const c = try parse(arena.allocator(), "");
-    try t.expectEqualStrings("http://127.0.0.1:8080", c.model.url);
+    // no omnigate address until the owner sets one: a default could hand the key to whatever listens there
+    try t.expectEqualStrings("", c.model.url);
+    try t.expectEqualStrings("", (try parse(arena.allocator(), "[model]\nurl =\n")).model.url);
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "127.0.0.1") == null);
+    try t.expectError(error.BadConfig, parse(arena.allocator(), "[model]\nmodel =\n"));
+    try t.expectError(error.BadConfig, parse(arena.allocator(), "[search]\nurl =\n"));
     try t.expectEqual(20, c.limits.steps_per_turn);
     try t.expectEqual(600, c.limits.turn_seconds);
     try t.expectEqual(16384, c.limits.tool_output_bytes);
