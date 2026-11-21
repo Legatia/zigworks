@@ -991,7 +991,7 @@ pub const Core = struct {
             const key = keyFor("brief", b.name);
             if ((c.getRan(key.slice()) orelse -1) >= today) continue;
             if (c.retryLater(key.slice(), now_s)) continue;
-            c.startBackground(.{ .brief = b }, key.slice());
+            c.startBackground(.{ .brief = b }, key.slice(), now_s);
         }
         const weekday = util.weekday(today);
         for (c.tasks) |tk| {
@@ -1006,7 +1006,7 @@ pub const Core = struct {
                 if (last) |l| if (c.localDay(l) >= today) continue;
             }
             if (c.retryLater(key.slice(), now_s)) continue;
-            c.startBackground(.{ .task = tk }, key.slice());
+            c.startBackground(.{ .task = tk }, key.slice(), now_s);
         }
     }
 
@@ -1048,7 +1048,9 @@ pub const Core = struct {
 
     const Job = union(enum) { brief: config.Brief, task: config.Task };
 
-    fn startBackground(c: *Core, job: Job, key: []const u8) void {
+    /// Starts a brief or task found due at `due_s`, unless it is running
+    /// already or the background slots are taken.
+    fn startBackground(c: *Core, job: Job, key: []const u8, due_s: i64) void {
         c.state_mutex.lockUncancelable(c.io);
         defer c.state_mutex.unlock(c.io);
         if (c.running.contains(key)) return;
@@ -1058,7 +1060,7 @@ pub const Core = struct {
         putKey(c.gpa, &c.running, key, {}) catch return;
         _ = c.bg_active.fetchAdd(1, .acq_rel);
         const owned_key = c.running.getKey(key).?;
-        const th = std.Thread.spawn(.{}, background, .{ c, job, owned_key }) catch {
+        const th = std.Thread.spawn(.{}, background, .{ c, job, owned_key, due_s }) catch {
             _ = c.bg_active.fetchSub(1, .acq_rel);
             removeKey(c.gpa, &c.running, key);
             return;
@@ -1066,7 +1068,7 @@ pub const Core = struct {
         th.detach();
     }
 
-    fn background(c: *Core, job: Job, key: []const u8) void {
+    fn background(c: *Core, job: Job, key: []const u8, due_s: i64) void {
         defer {
             c.state_mutex.lockUncancelable(c.io);
             removeKey(c.gpa, &c.running, key);
@@ -1090,9 +1092,10 @@ pub const Core = struct {
             return;
         }
         removeKey(c.gpa, &c.retry, key);
+        // the day it was due, though it may have ended after midnight
         const v: i64 = switch (job) {
-            .brief => c.localDay(now_s),
-            .task => now_s,
+            .brief => c.localDay(due_s),
+            .task => due_s,
         };
         putKey(c.gpa, &c.ran, key, v) catch {};
         c.saveRan();
@@ -1296,7 +1299,7 @@ pub const Core = struct {
             const key = keyFor("brief-now", b.name);
             c.settings_mutex.lockUncancelable(c.io);
             defer c.settings_mutex.unlock(c.io);
-            c.startBackground(.{ .brief = b }, key.slice());
+            c.startBackground(.{ .brief = b }, key.slice(), c.now());
             return "Collecting.";
         }
         if (eql(u8, cmd, "/tasks")) {
@@ -2030,6 +2033,27 @@ test "a_task_answer_that_did_not_arrive_is_logged_as_not_sent" {
     const lt = try logText(&f);
     try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"done\",\"sent\":false,\"why\":\"not paired yet\"") != null);
     try t.expect(std.mem.indexOf(u8, lt, "\"sent\":true") == null);
+}
+
+test "a_run_that_ends_after_midnight_counts_for_the_day_it_was_due" {
+    var f: Fix = undefined;
+    try f.init("", "", "[late]\nat = 23:59\ndo = Check the day.\n");
+    defer f.deinit();
+    const due = @divFloor(util.nowSeconds(t.io), 86400) * 86400 + 23 * 3600 + 59 * 60 + 10;
+    f.core.fixed_now = due;
+    const slow = comptime "{\"delay_ms\":800," ++ model.textReply("Late answer.")[1..];
+    try f.e.script(1, slow);
+    f.core.tick();
+    try waitFile(&f.e, "requests/001.json");
+    // the clock passes midnight while it runs
+    f.core.fixed_now = due + 120;
+    try f.rec.waitFor("[late] Late answer.");
+    waitIdle(f.core);
+    // so the next evening it runs again
+    try f.e.script(2, model.textReply("Next day."));
+    f.core.fixed_now = due + 86400;
+    f.core.tick();
+    try f.rec.waitFor("[late] Next day.");
 }
 
 test "stop_holds_through_a_slow_model_call" {
