@@ -136,6 +136,12 @@ pub const Web = struct {
     /// Ends the session: the browser, the throwaway profile, the grants.
     pub fn close(w: *Web) void {
         if (w.s) |s| {
+            // a passkey made since the last action is not lost
+            if (!s.inbox.closed.load(.acquire) and !w.env.stop.load(.acquire)) {
+                var arena_state: std.heap.ArenaAllocator = .init(w.gpa);
+                defer arena_state.deinit();
+                w.syncPasskeys(arena_state.allocator()) catch {};
+            }
             s.destroy();
             w.s = null;
         }
@@ -1084,6 +1090,25 @@ test "web_passkey_registers_then_signs_in" {
     try expectHas(r2.text, "signed in as agent-bot");
     // the private key never shows
     try t.expect(!has(r1.text, saved[0].key) and !has(r2.text, saved[0].key));
+}
+
+test "web_passkey_made_just_before_close_is_kept" {
+    var f: Fix = undefined;
+    try f.init("[p]\nsite = localhost\nusername = agent-bot\n");
+    defer f.deinit();
+    try f.page("pk.html", passkey_page);
+    _ = try f.act(try f.openJson("pk.html", "p"));
+    const a = f.e.arena.allocator();
+    // made by the page after the last action's read-back (a script, a timer)
+    _ = try f.web.s.?.evaluate(a, "document.getElementById('reg').click()");
+    var tries: u32 = 0;
+    while (tries < 40) : (tries += 1) {
+        if (std.mem.eql(u8, try f.eval("document.getElementById('out').textContent"), "\"registered\"")) break;
+        t.io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+    f.web.close();
+    const saved = try logins.decode(a, (try f.stored("login-p-passkeys")) orelse "");
+    try t.expectEqual(1, saved.len);
 }
 
 test "web_passkey_for_another_site_is_removed" {
