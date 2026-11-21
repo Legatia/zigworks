@@ -194,6 +194,12 @@ pub const Web = struct {
     }
 
     fn mask(w: *Web, a: Allocator, text: []const u8) ![]const u8 {
+        var sc = try w.scrubber(a);
+        return sc.scrubAlloc(a, text);
+    }
+
+    /// Masks every login value known in this turn (see mask).
+    fn scrubber(w: *Web, a: Allocator) !scrub.Scrubber {
         w.loadAll();
         var all: std.ArrayList(scrub.Secret) = .empty;
         try all.appendSlice(a, w.env.secrets);
@@ -204,8 +210,7 @@ pub const Web = struct {
             const c = totp.code(sd.seed, at);
             try all.append(a, .{ .name = try std.fmt.allocPrint(a, "login-{s}-code", .{sd.name}), .value = try a.dupe(u8, &c) });
         };
-        var sc = try scrub.Scrubber.init(a, all.items);
-        return sc.scrubAlloc(a, text);
+        return scrub.Scrubber.init(a, all.items);
     }
 
     fn fail(a: Allocator, comptime fmt: []const u8, args: anytype) !Output {
@@ -625,11 +630,14 @@ pub const Web = struct {
         try out.print(a, "URL: {s}\nTitle: {s}\n", .{ url, util.cut(jv.str(jv.get(v, "title")) orelse "", 300) });
         const items = jv.arr(jv.get(v, "items")) orelse &.{};
         if (items.len > 0) try out.appendSlice(a, "Elements:\n");
+        // labels are masked before they are escaped: an escaped value
+        // (a quote, a backslash) would no longer match
+        var sc = try w.scrubber(a);
         for (items) |it| {
             const tag = jv.str(jv.get(it, "tag")) orelse "";
             const typ = jv.str(jv.get(it, "type")) orelse "";
             try out.print(a, "[{d}] {s}{s}{s} ", .{ jv.int(jv.get(it, "ref")) orelse 0, tag, if (typ.len > 0) " " else "", typ });
-            try util.jsonString(&out, a, jv.str(jv.get(it, "label")) orelse "");
+            try util.jsonString(&out, a, try sc.scrubAlloc(a, jv.str(jv.get(it, "label")) orelse ""));
             try out.append(a, '\n');
         }
         const p = page.extract(a, html, url) catch page.Page{ .title = "", .text = "" };
@@ -1180,6 +1188,17 @@ test "web_output_is_masked_before_it_is_cut" {
     const r = try f.act("{\"action\":\"read\"}");
     try t.expect(!has(r.text, "Zq9-f"));
     try expectHas(r.text, "[page cut at");
+}
+
+test "web_labels_are_masked_before_they_are_escaped" {
+    var f: Fix = undefined;
+    try f.init("[a]\nsite = example.com\n");
+    defer f.deinit();
+    try f.store.put(t.io, "login-a-password", "fake\"Pass\\7351x");
+    try f.page("label.html", "<html><body><input aria-label='hint fake\"Pass\\7351x'></body></html>");
+    const r = try f.act(try f.openJson("label.html", null));
+    try expectHas(r.text, "[1] input text \"hint [secret:login-a-password]\"");
+    try t.expect(!has(r.text, "7351x"));
 }
 
 test "web_answers_dialogs_and_shows_them" {

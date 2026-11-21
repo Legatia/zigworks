@@ -142,6 +142,23 @@ fn forms(a: std.mem.Allocator, v: []const u8) ![]const []const u8 {
     }
     try out.append(a, pct.items);
     try out.append(a, pct_lower.items);
+    // application/x-www-form-urlencoded: `*-._` stay, space is `+`
+    var form: std.ArrayList(u8) = .empty;
+    var form_lower: std.ArrayList(u8) = .empty;
+    for (v) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '*' or c == '-' or c == '.' or c == '_') {
+            try form.append(a, c);
+            try form_lower.append(a, c);
+        } else if (c == ' ') {
+            try form.append(a, '+');
+            try form_lower.append(a, '+');
+        } else {
+            try form.print(a, "%{X:0>2}", .{c});
+            try form_lower.print(a, "%{x:0>2}", .{c});
+        }
+    }
+    try out.append(a, form.items);
+    try out.append(a, form_lower.items);
     // base64, standard and url-safe, at each of the three alignments a
     // value can have inside a longer encoded text ("user:" ++ value)
     for ([_]std.base64.Base64Encoder{ std.base64.standard_no_pad.Encoder, std.base64.url_safe_no_pad.Encoder }) |enc| {
@@ -226,4 +243,11 @@ test "a held-back tail that was not a value comes out at the end" {
     try t.expectEqualStrings("x ", w.written());
     try s.finish(&w.writer);
     try t.expectEqualStrings("x ghp_Abc", w.written());
+}
+
+test "masks the form-urlencoded form" {
+    const v: Secret = .{ .name = "pw", .value = "a b*c!d~e-Q" };
+    const got = try scrubOnce(&.{v}, "user=x&pw=a+b*c%21d%7Ee-Q&n=1 lower=a+b*c%21d%7ee-Q");
+    defer t.allocator.free(got);
+    try t.expectEqualStrings("user=x&pw=[secret:pw]&n=1 lower=[secret:pw]", got);
 }
