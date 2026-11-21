@@ -1227,14 +1227,14 @@ test "delegate_runs_helpers_in_parallel_and_returns_their_answers" {
     defer f.deinit();
     try withHelpers(&f);
     try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"find a\"},{\"task\":\"find b\"},{\"task\":\"find c\",\"strong\":true}]}"));
-    for (2..5) |n| try f.e.script(@intCast(n), "{\"delay_ms\":600,\"content\":[{\"type\":\"text\",\"text\":\"helper answer\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}");
+    for (2..5) |n| try f.e.script(@intCast(n), "{\"delay_ms\":2000,\"content\":[{\"type\":\"text\",\"text\":\"helper answer\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}");
     try f.e.script(5, model.textReply("Combined."));
     const started = std.Io.Clock.awake.now(t.io);
     const r = try f.say("research three things");
     defer freeResult(&f.run, r);
     const ms = started.durationTo(std.Io.Clock.awake.now(t.io)).toMilliseconds();
     try t.expectEqualStrings("Combined.", r.text);
-    try t.expect(ms < 1500); // three 600 ms helpers at once, not one after another
+    try t.expect(ms < 4000); // three 2 s helpers at once; one after another would take 6 s or more
     const last = try f.e.request(5);
     try t.expectEqual(3, std.mem.count(u8, last, "helper answer"));
     var workers: u32 = 0;
