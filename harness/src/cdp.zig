@@ -11,11 +11,26 @@ const Allocator = std.mem.Allocator;
 
 const is_windows = builtin.os.tag == .windows;
 
-/// Replies by id; events are dropped (nothing here waits for one).
+/// A JavaScript dialog the page opened (answered at once).
+pub const Dialog = struct { kind: []u8, message: []u8, session: []u8, answered: bool = false };
+
+/// Ids at or above this are the reader's own commands (dialog answers);
+/// their replies are dropped. (Chrome takes ids up to 2^31 - 1 only.)
+const own_ids: u32 = 1 << 30;
+
+/// Replies by id. Of the events, only the main frame's loading and
+/// JavaScript dialogs are kept.
 pub const Inbox = struct {
     gpa: Allocator,
     mutex: Io.Mutex = .init,
     replies: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
+    /// The top document's frame id, once known (owned).
+    main_frame: []u8 = &.{},
+    /// Event numbers of the main frame's last load start and stop.
+    seq: u32 = 0,
+    started_at: u32 = 0,
+    stopped_at: u32 = 0,
+    dialogs: std.ArrayList(Dialog) = .empty,
     /// Bytes of a message not yet ended by its NUL.
     partial: std.ArrayList(u8) = .empty,
     /// The pipe closed: Chrome is gone.
@@ -26,6 +41,63 @@ pub const Inbox = struct {
         while (it.next()) |v| b.gpa.free(v.*);
         b.replies.deinit(b.gpa);
         b.partial.deinit(b.gpa);
+        for (b.dialogs.items) |d| {
+            b.gpa.free(d.kind);
+            b.gpa.free(d.message);
+            b.gpa.free(d.session);
+        }
+        b.dialogs.deinit(b.gpa);
+        if (b.main_frame.len > 0) b.gpa.free(b.main_frame);
+    }
+
+    /// Whether the main frame is loading, and the number of the last event.
+    pub fn loading(b: *Inbox, io: Io) struct { busy: bool, started_at: u32, seq: u32 } {
+        b.mutex.lockUncancelable(io);
+        defer b.mutex.unlock(io);
+        return .{ .busy = b.started_at > b.stopped_at, .started_at = b.started_at, .seq = b.seq };
+    }
+
+    fn event(b: *Inbox, io: Io, msg: []const u8) void {
+        const watched = [_][]const u8{ "Page.frameStartedLoading", "Page.frameStoppedLoading", "Page.javascriptDialogOpening" };
+        const m = for (watched) |w| {
+            if (std.mem.indexOf(u8, msg[0..@min(msg.len, 64)], w) != null) break w;
+        } else return;
+        var arena_state: std.heap.ArenaAllocator = .init(b.gpa);
+        defer arena_state.deinit();
+        const v = jv.parse(arena_state.allocator(), msg) orelse return;
+        if (!std.mem.eql(u8, jv.str(jv.get(v, "method")) orelse "", m)) return;
+        const params = jv.get(v, "params");
+        b.mutex.lockUncancelable(io);
+        defer b.mutex.unlock(io);
+        b.seq += 1;
+        if (m[5] == 'j') {
+            const d: Dialog = .{
+                .kind = b.gpa.dupe(u8, jv.str(jv.get(params, "type")) orelse "dialog") catch return,
+                .message = b.gpa.dupe(u8, util.cut(jv.str(jv.get(params, "message")) orelse "", 2000)) catch return,
+                .session = b.gpa.dupe(u8, jv.str(jv.get(v, "sessionId")) orelse "") catch return,
+            };
+            b.dialogs.append(b.gpa, d) catch {};
+            return;
+        }
+        const frame = jv.str(jv.get(params, "frameId")) orelse return;
+        if (b.main_frame.len > 0 and !std.mem.eql(u8, frame, b.main_frame)) return;
+        if (m[10] == 'S' and m[11] == 't' and m[12] == 'a') b.started_at = b.seq else b.stopped_at = b.seq;
+    }
+
+    /// The dialogs seen since the last call; the caller frees with freeDialogs.
+    pub fn takeDialogs(b: *Inbox, io: Io, gpa: Allocator) ![]Dialog {
+        b.mutex.lockUncancelable(io);
+        defer b.mutex.unlock(io);
+        var out: std.ArrayList(Dialog) = .empty;
+        var i: usize = 0;
+        while (i < b.dialogs.items.len) {
+            if (!b.dialogs.items[i].answered) {
+                i += 1;
+                continue;
+            }
+            try out.append(gpa, b.dialogs.orderedRemove(i));
+        }
+        return out.items;
     }
 
     /// Splits `bytes` into messages and keeps the replies among them.
@@ -43,7 +115,8 @@ pub const Inbox = struct {
     }
 
     fn keep(b: *Inbox, io: Io, msg: []const u8) void {
-        const id = replyId(msg) orelse return;
+        const id = replyId(msg) orelse return b.event(io, msg);
+        if (id >= own_ids) return;
         const copy = b.gpa.dupe(u8, msg) catch return;
         b.mutex.lockUncancelable(io);
         defer b.mutex.unlock(io);
@@ -91,6 +164,8 @@ pub const Session = struct {
     reader: ?std.Thread = null,
     inbox: Inbox,
     next_id: u32 = 1,
+    /// The reader's own command ids (see own_ids).
+    own_id: u32 = 0,
     write_mutex: Io.Mutex = .init,
     /// The page's session id (flat mode).
     page_session: []u8 = &.{},
@@ -186,6 +261,12 @@ pub const Session = struct {
         s.page_session = try s.gpa.dupe(u8, sid);
         _ = try s.call(a, "Page.enable", "{}");
         _ = try s.call(a, "Runtime.enable", "{}");
+        const tree = try s.call(a, "Page.getFrameTree", "{}");
+        const fid = jv.str(jv.at(tree, &.{ "frameTree", "frame", "id" })) orelse return error.NoPage;
+        const copy = try s.gpa.dupe(u8, fid);
+        s.inbox.mutex.lockUncancelable(s.io);
+        defer s.inbox.mutex.unlock(s.io);
+        s.inbox.main_frame = copy;
     }
 
     fn readLoop(s: *Session) void {
@@ -200,8 +281,34 @@ pub const Session = struct {
             const got = f.readStreaming(s.io, &.{&buf}) catch break;
             if (got == 0) break;
             s.inbox.feed(s.io, buf[0..got]);
+            s.answerDialogs();
         }
         s.inbox.closed.store(true, .release);
+    }
+
+    /// A dialog blocks the page's scripts until it is answered: alerts and
+    /// leaving the page (beforeunload) are accepted, confirm and prompt
+    /// dismissed. From the reader thread, without waiting for the reply.
+    fn answerDialogs(s: *Session) void {
+        s.inbox.mutex.lockUncancelable(s.io);
+        defer s.inbox.mutex.unlock(s.io);
+        for (s.inbox.dialogs.items) |*d| {
+            if (d.answered) continue;
+            d.answered = true;
+            const accept = std.mem.eql(u8, d.kind, "alert") or std.mem.eql(u8, d.kind, "beforeunload");
+            var msg: std.ArrayList(u8) = .empty;
+            defer msg.deinit(s.gpa);
+            s.own_id +%= 1;
+            msg.print(s.gpa, "{{\"id\":{d},\"method\":\"Page.handleJavaScriptDialog\",\"params\":{{\"accept\":{s}}}", .{ own_ids + (s.own_id & 0x3fff_ffff), if (accept) "true" else "false" }) catch continue;
+            if (d.session.len > 0) {
+                msg.appendSlice(s.gpa, ",\"sessionId\":") catch continue;
+                util.jsonString(&msg, s.gpa, d.session) catch continue;
+            }
+            msg.appendSlice(s.gpa, "}\x00") catch continue;
+            s.write_mutex.lockUncancelable(s.io);
+            defer s.write_mutex.unlock(s.io);
+            if (s.to_chrome) |f| f.writeStreamingAll(s.io, msg.items) catch {};
+        }
     }
 
     fn killGroup(s: *Session) void {
@@ -309,14 +416,40 @@ pub const Session = struct {
             s.setError(why);
             return error.Cdp;
         };
-        try s.waitFor(arena, "window.__hxOld !== true && document.readyState === 'complete'");
-        try s.settle(arena);
+        // no loader: a move within the document (a fragment), nothing to load
+        if (jv.str(jv.get(res, "loaderId")) != null)
+            try s.waitFor(arena, "window.__hxOld !== true && document.readyState === 'complete'");
+        try s.waitLoaded(arena);
+    }
+
+    /// Where things stand before an action that may navigate.
+    pub const Mark = struct { seq: u32 };
+
+    pub fn mark(s: *Session) Mark {
+        return .{ .seq = s.inbox.loading(s.io).seq };
     }
 
     /// After something that may have started a navigation (a click, Enter):
-    /// waits until the document, old or new, has loaded and stayed so.
-    pub fn settle(s: *Session, arena: Allocator) !void {
-        try s.sleep(300);
+    /// waits a moment for one to start; if one did, waits until the new
+    /// document has loaded (bounded by the timeout), else until this one
+    /// has.
+    pub fn settle(s: *Session, arena: Allocator, m: Mark) !void {
+        const grace = deadline(s.io, nav_grace_ms);
+        while (Io.Clock.awake.now(s.io).nanoseconds < grace) {
+            const l = s.inbox.loading(s.io);
+            if (l.started_at > m.seq) break;
+            try s.sleep(20);
+        }
+        try s.waitLoaded(arena);
+    }
+
+    /// Until the main frame has stopped loading and the document is complete.
+    fn waitLoaded(s: *Session, arena: Allocator) !void {
+        const until = deadline(s.io, s.timeout_ms);
+        while (s.inbox.loading(s.io).busy) {
+            if (Io.Clock.awake.now(s.io).nanoseconds >= until) return error.Timeout;
+            try s.sleep(20);
+        }
         try s.waitFor(arena, "document.readyState === 'complete'");
     }
 
@@ -382,6 +515,9 @@ pub const Session = struct {
         s.gpa.destroy(s);
     }
 };
+
+/// How long after a click or key a navigation may take to start.
+pub const nav_grace_ms = 600;
 
 fn deadline(io: Io, ms: u32) i96 {
     return Io.Clock.awake.now(io).nanoseconds + @as(i96, ms) * std.time.ns_per_ms;

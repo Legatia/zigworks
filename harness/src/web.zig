@@ -115,6 +115,8 @@ pub const Web = struct {
     passkeys_bad: bool = false,
     /// Said with the next result.
     notes: std.ArrayList(u8) = .empty,
+    /// Why the last snapshot was refused (error.HostRefused).
+    refused: []const u8 = "",
     /// Every login's stored password and TOTP seed were read for masking.
     loaded_all: bool = false,
     /// The TOTP seeds (raw), by login, for masking their current codes.
@@ -229,19 +231,22 @@ pub const Web = struct {
             if (r.is_error) return r;
             said = r.text;
             if (jv.boolean(jv.get(v, "enter")) orelse false) {
+                const m = w.s.?.mark();
                 try w.pressKey(a, "Enter");
-                try w.s.?.settle(a);
+                try w.s.?.settle(a, m);
             }
         } else if (eql(u8, action, "click")) {
             const ref = jv.int(jv.get(v, "ref")) orelse return fail(a, "click needs a ref", .{});
+            const m = w.s.?.mark();
             const r = try w.s.?.evaluateIsolated(a, try refScript(a, ref, "el.scrollIntoView({block: 'center'}); el.click(); return 'ok';"));
             if (!eql(u8, r, "\"ok\"")) return fail(a, "no element [{d}] on the page; read it again", .{ref});
-            try w.s.?.settle(a);
+            try w.s.?.settle(a, m);
         } else if (eql(u8, action, "key")) {
             const key = jv.str(jv.get(v, "key")) orelse return fail(a, "key needs Enter, Tab or Escape", .{});
             if (!(eql(u8, key, "Enter") or eql(u8, key, "Tab") or eql(u8, key, "Escape"))) return fail(a, "key needs Enter, Tab or Escape", .{});
+            const m = w.s.?.mark();
             try w.pressKey(a, key);
-            try w.s.?.settle(a);
+            try w.s.?.settle(a, m);
         } else return fail(a, "unknown action {s}; use open, type, click, key, read or close", .{util.cut(action, 40)});
         return w.after(a, said);
     }
@@ -249,11 +254,11 @@ pub const Web = struct {
     /// Passkeys, the gate for where the page is now, then the page.
     fn after(w: *Web, a: Allocator, said: []const u8) !Output {
         try w.syncPasskeys(a);
-        if (try w.checkHost(a)) |why| {
-            _ = w.s.?.navigate(a, "about:blank") catch {};
-            return fail(a, "{s}", .{why});
-        }
-        return .{ .text = try w.snapshot(a, said) };
+        const text = w.snapshot(a, said) catch |e| switch (e) {
+            error.HostRefused => return fail(a, "{s}", .{w.refused}),
+            else => return e,
+        };
+        return .{ .text = text };
     }
 
     fn open(w: *Web, a: Allocator, url: []const u8, login_name: ?[]const u8) !Output {
@@ -569,11 +574,39 @@ pub const Web = struct {
     fn snapshot(w: *Web, a: Allocator, said: []const u8) ![]const u8 {
         const r = try w.s.?.evaluateIsolated(a, snapshot_script);
         const v = jv.parse(a, r);
+        // the host of the very document read, not of an earlier check: its
+        // text reaches the model only if the gate allowed that host
+        const protocol = jv.str(jv.get(v, "protocol")) orelse "";
+        const host = jv.str(jv.get(v, "host")) orelse "";
+        if (!std.mem.eql(u8, protocol, "about:")) {
+            const why: ?[]const u8 = if (!std.mem.eql(u8, protocol, "http:") and !std.mem.eql(u8, protocol, "https:"))
+                try std.fmt.allocPrint(a, "the page went to a {s} address; only http and https pages can be used", .{util.cut(protocol, 20)})
+            else if (std.ascii.eqlIgnoreCase(host, w.granted_host))
+                null
+            else if (w.hooks.allow(w.hooks.ctx, a, .web, host)) |no|
+                try std.fmt.allocPrint(a, "the page is now on {s}: refused by the gate: {s}", .{ host, no })
+            else blk: {
+                w.granted_host = try w.arena.allocator().dupe(u8, host);
+                break :blk null;
+            };
+            if (why) |x| {
+                w.refused = x;
+                _ = w.s.?.navigate(a, "about:blank") catch {};
+                return error.HostRefused;
+            }
+        }
         const url = jv.str(jv.get(v, "url")) orelse "";
         const html = jv.str(jv.get(v, "html")) orelse "";
         var out: std.ArrayList(u8) = .empty;
         if (said.len > 0) try out.print(a, "{s}\n", .{said});
         try out.appendSlice(a, w.notes.items);
+        const dialogs = try w.s.?.inbox.takeDialogs(w.io, a);
+        for (dialogs) |d| {
+            try out.print(a, "Dialog ({s}): {s}{s}\n", .{ d.kind, d.message, if (std.mem.eql(u8, d.kind, "alert") or std.mem.eql(u8, d.kind, "beforeunload")) "" else " (dismissed)" });
+            w.gpa.free(d.kind);
+            w.gpa.free(d.message);
+            w.gpa.free(d.session);
+        }
         try out.print(a, "URL: {s}\nTitle: {s}\n", .{ url, util.cut(jv.str(jv.get(v, "title")) orelse "", 300) });
         const items = jv.arr(jv.get(v, "items")) orelse &.{};
         if (items.len > 0) try out.appendSlice(a, "Elements:\n");
@@ -618,7 +651,7 @@ const snapshot_script =
     \\    items.push({ref: n, tag, type: tag === 'a' ? '' : type, label});
     \\    if (n >= 300) break;
     \\  }
-    \\  return {url: location.href, title: document.title, html: document.documentElement ? document.documentElement.outerHTML.slice(0, 4194304) : '', items};
+    \\  return {protocol: location.protocol, host: location.host, url: location.href, title: document.title, html: document.documentElement ? document.documentElement.outerHTML.slice(0, 4194304) : '', items};
     \\})()
 ;
 
@@ -1070,6 +1103,67 @@ test "web_asks_the_gate_when_a_click_lands_on_another_host" {
     try t.expect(r.is_error);
     try expectHas(r.text, "refused by the gate");
     try t.expect(!has(r.text, "secret page text"));
+    try expectHas(f.asked.items, "web 127.0.0.1:");
+}
+
+test "web_answers_dialogs_and_shows_them" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    f.web.env.timeout_ms = 4000;
+    try f.page("dlg.html",
+        \\<html><body><button onclick="alert('hello there')">Alert</button>
+        \\<button onclick="document.getElementById('o').textContent = 'answer ' + (confirm('sure?') ? 'yes' : 'no')">Ask</button>
+        \\<p id="o"></p></body></html>
+    );
+    _ = try f.act(try f.openJson("dlg.html", null));
+    const r1 = try f.act("{\"action\":\"click\",\"ref\":1}");
+    try t.expect(!r1.is_error);
+    try expectHas(r1.text, "Dialog (alert): hello there");
+    const r2 = try f.act("{\"action\":\"click\",\"ref\":2}");
+    try t.expect(!r2.is_error);
+    try expectHas(r2.text, "Dialog (confirm): sure?");
+    try expectHas(r2.text, "answer no");
+    try t.expect(!has(r2.text, "hello there"));
+}
+
+test "web_waits_for_a_slow_navigation_after_a_click" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.page("form.html", "<html><head><title>Form</title></head><body><form method=\"post\" action=\"/page/slow.html?delay_ms=1500\"><input name=\"q\"><button>Go</button></form><a href=\"/page/slow.html?delay_ms=1500&amp;b\">link</a><button onclick=\"setTimeout(() => { location.href = '/page/slow.html?delay_ms=1500&c'; }, 450)\">Later</button></body></html>");
+    try f.page("slow.html", "<html><head><title>Arrived</title></head><body><p>the slow page</p></body></html>");
+    _ = try f.act(try f.openJson("form.html", null));
+    const r = try f.act("{\"action\":\"click\",\"ref\":2}");
+    try expectHas(r.text, "Title: Arrived");
+    try expectHas(r.text, "the slow page");
+    // a link, and a navigation a script starts a moment after the click
+    for ([_][]const u8{ "3", "4" }) |ref| {
+        _ = try f.act(try f.openJson("form.html", null));
+        const rl = try f.act(try std.fmt.allocPrint(f.e.arena.allocator(), "{{\"action\":\"click\",\"ref\":{s}}}", .{ref}));
+        try expectHas(rl.text, "Title: Arrived");
+    }
+    // a same-document move (a fragment) needs no new document
+    const frag = try std.fmt.allocPrint(f.e.arena.allocator(), "{{\"action\":\"open\",\"url\":\"{s}#part\"}}", .{try f.url("slow.html")});
+    const r2 = try f.act(frag);
+    try t.expect(!r2.is_error);
+    try expectHas(r2.text, "#part");
+}
+
+test "web_snapshot_never_shows_a_host_the_gate_did_not_allow" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.page("here.html", "<html><body><p>here</p></body></html>");
+    try f.page("there.html", "<html><body><p>secret page text</p></body></html>");
+    _ = try f.act(try f.openJson("here.html", null));
+    // the page moves to another host behind the tool's back (as between
+    // the host check and the snapshot)
+    try f.web.s.?.navigate(a, try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/page/there.html", .{f.e.server.port}));
+    f.refuse = "web";
+    const text = f.web.snapshot(a, "") catch "";
+    try t.expect(!has(text, "secret page text"));
     try expectHas(f.asked.items, "web 127.0.0.1:");
 }
 

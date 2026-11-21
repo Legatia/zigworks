@@ -6,7 +6,8 @@
 //!   answers that error instead, `{"delay_ms":N, ...}` waits first. Each
 //!   request is saved as `requests/001.json`, … with its headers.
 //! - search: `GET /res/v1/web/search?q=…` answers `search.json`.
-//! - pages and feeds: `GET /page/NAME` answers the file `pages/NAME`.
+//! - pages and feeds: `GET /page/NAME` answers the file `pages/NAME`
+//!   (POST too; `?delay_ms=N` answers after N ms).
 //! - Telegram: see `telegram` below.
 const std = @import("std");
 const sock = @import("sock.zig");
@@ -145,8 +146,17 @@ pub const Server = struct {
             const text = s.readScript(a, &.{"search.json"}) orelse "{\"web\":{\"results\":[]}}";
             return json(req, .ok, text);
         }
-        if (method == .GET and std.mem.startsWith(u8, route, "/page/")) {
+        if ((method == .GET or method == .POST) and std.mem.startsWith(u8, route, "/page/")) {
             const name = route["/page/".len..];
+            // `?delay_ms=N`: a slow page
+            if (std.mem.indexOf(u8, target, "delay_ms=")) |at| {
+                const digits = target[at + "delay_ms=".len ..];
+                var n: usize = 0;
+                while (n < digits.len and std.ascii.isDigit(digits[n])) n += 1;
+                const ms = std.fmt.parseInt(i96, digits[0..n], 10) catch 0;
+                const until = Io.Clock.awake.now(s.io).nanoseconds + ms * std.time.ns_per_ms;
+                while (Io.Clock.awake.now(s.io).nanoseconds < until and !s.stopping.load(.acquire)) s.io.sleep(.fromMilliseconds(20), .awake) catch {};
+            }
             if (name.len == 0 or std.mem.indexOf(u8, name, "..") != null) return json(req, .not_found, "{}");
             const text = s.readScript(a, &.{ "pages", name }) orelse return json(req, .not_found, "{}");
             const ct = if (std.mem.endsWith(u8, name, ".bin")) "application/octet-stream" else if (std.mem.endsWith(u8, name, ".xml")) "application/rss+xml" else "text/html; charset=utf-8";
