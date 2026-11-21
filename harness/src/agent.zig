@@ -34,6 +34,8 @@ pub const Conversation = struct {
     turns: std.ArrayList(*Turn) = .empty,
     /// Turns dropped to stay under the size limit.
     dropped: usize = 0,
+    /// Those of them dropped without a summary of them.
+    lost: usize = 0,
     /// What the turns summarised away said (owned).
     summary: ?[]u8 = null,
 
@@ -89,6 +91,7 @@ pub const Conversation = struct {
             n += 1;
         }
         c.dropped += n;
+        c.lost += n;
         return n;
     }
 
@@ -601,11 +604,24 @@ pub const context_mark = "[context]";
 pub const Prompt = struct { stable: []const u8, changing: []const u8 };
 
 pub fn systemPrompt(arena: std.mem.Allocator, r: *const Run, recalled: memory.Recall, dropped: usize, now_s: i64) ![]const u8 {
-    const p = try systemParts(arena, r, recalled, null, dropped, now_s);
+    const p = try systemParts(arena, r, recalled, .{ .dropped = dropped, .lost = dropped }, now_s);
     return std.mem.concat(arena, u8, &.{ p.stable, p.changing });
 }
 
-pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Recall, summary: ?[]const u8, dropped: usize, now_s: i64) !Prompt {
+/// What became of the conversation's earlier turns.
+pub const Past = struct {
+    summary: ?[]const u8 = null,
+    /// Turns gone, summarised or not.
+    dropped: usize = 0,
+    /// Turns gone without a summary.
+    lost: usize = 0,
+
+    fn of(c: *const Conversation) Past {
+        return .{ .summary = c.summary, .dropped = c.dropped, .lost = c.lost };
+    }
+};
+
+pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Recall, past: Past, now_s: i64) !Prompt {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, if (r.helper) helper_prompt else base_prompt);
     if (!r.helper and r.model_cfg != null) try out.appendSlice(arena, delegate_guide);
@@ -636,8 +652,10 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
         top_header = true;
         try out.print(arena, "- {s}\n", .{it.body});
     };
-    if (summary) |sm| try out.print(arena, "\nSummary of the earlier conversation:\n{s}\n", .{sm});
-    if (dropped > 0 and summary == null) try out.print(arena, "\n{d} earlier turns of this conversation were dropped to keep it short.\n", .{dropped});
+    if (past.summary) |sm| {
+        try out.print(arena, "\nSummary of the earlier conversation:\n{s}\n", .{sm});
+        if (past.lost > 0) try out.print(arena, "{d} turns of this conversation were dropped without being summarised, to keep it short.\n", .{past.lost});
+    } else if (past.dropped > 0) try out.print(arena, "\n{d} earlier turns of this conversation were dropped to keep it short.\n", .{past.dropped});
     const stable = out.items;
 
     out = .empty;
@@ -684,7 +702,7 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
         const recalled = try r.mem.recall(a, user_text, started, r.top_size, r.auto_recall);
-        break :blk try systemParts(a, r, recalled, conv.summary, conv.dropped, started);
+        break :blk try systemParts(a, r, recalled, .of(conv), started);
     };
     // the time and what memory found go with the message, not the system
     // prompt: the system prompt and every earlier turn then stay the same
@@ -1221,7 +1239,10 @@ fn compact(r: *Run, conv: *Conversation) !usize {
             try r.log.write(.model, false, .{ .run = r.label, .event = "summary failed", .result = @errorName(e) });
         }
     }
-    return gone + conv.trim(limit);
+    // still over (or no summary): the oldest go whole, and it is said
+    const trimmed = conv.trim(limit);
+    if (trimmed > 0) try r.log.write(.turn, r.private, .{ .run = r.label, .event = "dropped unsummarised", .turns = trimmed, .summary = conv.summary != null });
+    return gone + trimmed;
 }
 
 fn summarise(r: *Run, conv: *Conversation, n: usize) ![]u8 {
@@ -1658,6 +1679,33 @@ test "long_conversation_is_summarised_not_dropped" {
     const r = try f.say("and next week?");
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(8), "Summary of the earlier conversation") != null);
+}
+
+test "turns_dropped_after_a_summary_are_logged_and_said" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    f.run.limits.conversation_bytes = 1000;
+    const a = f.e.arena.allocator();
+    for (1..6) |n| try f.e.script(@intCast(n), model.textReply("It will be sunny."));
+    // the sixth answer is long: after the summary the newest turns alone
+    // are still over the limit
+    const long: [900]u8 = @splat('w');
+    try f.e.script(6, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"stop_reason\":\"end_turn\"}}", .{&long}));
+    try f.e.script(7, model.textReply("The owner asked about the weather."));
+    try f.e.script(8, model.textReply("ok"));
+    for (0..6) |_| {
+        const r = try f.say("and the weather?");
+        freeResult(&f.run, r);
+    }
+    try t.expect(f.conv.summary != null);
+    const r = try f.say("thanks");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"event\":\"dropped unsummarised\"") != null);
+    const req8 = try f.e.request(8);
+    try t.expect(std.mem.indexOf(u8, req8, "Summary of the earlier conversation") != null);
+    try t.expect(std.mem.indexOf(u8, req8, "dropped without being summarised") != null);
 }
 
 // ---- MCP tools and money ----
