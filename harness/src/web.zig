@@ -1111,6 +1111,22 @@ test "web_refuses_downloads_and_says_so" {
     try expectHas(r.text, "/page/file.bin");
 }
 
+test "web_login_cookies_survive_to_the_next_browser" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\n");
+    defer f.deinit();
+    try f.page("c.html", "<html><body><p>cookies</p></body></html>");
+    _ = try f.act(try f.openJson("c.html", "agent"));
+    // one that expires in an hour (as a site's \"remember me\")
+    _ = try f.eval("document.cookie = 'kept=1; max-age=3600; path=/'");
+    _ = try f.act("{\"action\":\"close\"}");
+    _ = try f.act(try f.openJson("c.html", "agent"));
+    try expectHas(try f.eval("document.cookie"), "kept=1");
+    // a throwaway profile has none of them
+    _ = try f.act(try f.openJson("c.html", null));
+    try t.expectEqualStrings("\"\"", try f.eval("document.cookie"));
+}
+
 test "web_profiles_keep_no_saved_passwords" {
     var f: Fix = undefined;
     try f.init("[agent]\nsite = localhost\nusername = agent-bot\n");
