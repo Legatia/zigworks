@@ -89,7 +89,7 @@ fn runRaw(env: Env, arena: std.mem.Allocator, tool: gate.Tool, input_json: []con
                 error.StreamTooLong => return .{ .text = "file is larger than 1 MiB", .is_error = true },
                 else => return e,
             };
-            return .{ .text = capText(arena, data, env.tool_output_bytes) };
+            return .{ .text = capText(arena, try mask(arena, env.secrets, data, true), env.tool_output_bytes) };
         },
         .write_file => {
             const p = try gate.confine(arena, env.io, env.workspace, arg);
@@ -108,7 +108,22 @@ fn runRaw(env: Env, arena: std.mem.Allocator, tool: gate.Tool, input_json: []con
     };
 }
 
-fn capText(arena: std.mem.Allocator, s: []const u8, max: u32) []const u8 {
+/// `raw` with the stored secrets masked, before anything is cut from it.
+/// When `raw` is only the start of a longer output (`whole` false), a tail
+/// that could be the start of a value is left out, so a value cut in two
+/// is never half shown.
+pub fn mask(arena: std.mem.Allocator, secrets: []const scrub.Secret, raw: []const u8, whole: bool) ![]const u8 {
+    if (secrets.len == 0) return raw;
+    var s = try scrub.Scrubber.init(arena, secrets);
+    var w: Io.Writer.Allocating = .init(arena);
+    s.feed(raw, &w.writer) catch return error.OutOfMemory;
+    if (whole) s.finish(&w.writer) catch return error.OutOfMemory;
+    return w.written();
+}
+
+/// At most `max` bytes of `s`, never inside a UTF-8 sequence, saying so
+/// when cut. Mask first: see `mask`.
+pub fn capText(arena: std.mem.Allocator, s: []const u8, max: u32) []const u8 {
     if (s.len <= max) return s;
     return std.fmt.allocPrint(arena, "{s}\n[output cut at {d} bytes of {d}]", .{ util.cut(s, max), max, s.len }) catch util.cut(s, max);
 }
@@ -212,7 +227,9 @@ fn shell(env: Env, arena: std.mem.Allocator, command: []const u8) !Output {
         .pgid = if (is_windows) null else 0,
         .create_no_window = true,
     });
-    var col: Collector = .{ .cap = env.tool_output_bytes, .gpa = arena };
+    // more than is shown: masking can shorten it, and a value cut at the
+    // end is left out
+    var col: Collector = .{ .cap = @as(usize, env.tool_output_bytes) * 2 + 4096, .gpa = arena };
     var watch: Watch = .{
         .io = env.io,
         .id = child.id.?,
@@ -259,8 +276,11 @@ fn shell(env: Env, arena: std.mem.Allocator, command: []const u8) !Output {
         .exited => |code| try out.print(arena, "exit code {d}\n", .{code}),
         else => try out.print(arena, "ended: {s}\n", .{@tagName(tm)}),
     };
-    try out.appendSlice(arena, col.buf.items);
-    if (col.total > col.buf.items.len) try out.print(arena, "\n[output cut at {d} bytes of {d}]", .{ col.cap, col.total });
+    const whole = col.total == col.buf.items.len;
+    const masked = try mask(arena, env.secrets, col.buf.items, whole);
+    const shown = util.cut(masked, env.tool_output_bytes);
+    try out.appendSlice(arena, shown);
+    if (!whole or shown.len < masked.len) try out.print(arena, "\n[output cut at {d} bytes of {d}]", .{ env.tool_output_bytes, if (whole) masked.len else col.total });
     const failed = watch.reason != null or if (term) |tm| !(tm == .exited and tm.exited == 0) else true;
     return .{ .text = out.items, .is_error = failed };
 }
@@ -319,6 +339,9 @@ fn fetch(env: Env, arena: std.mem.Allocator, url: []const u8, start: usize) !Out
         text = pg.text;
     }
     if (g.truncated) try head.appendSlice(arena, "[page cut at 1 MiB]\n");
+    // masked whole before it is cut into parts: a value across two parts
+    // would be half shown in each
+    text = try mask(arena, env.secrets, text, !g.truncated);
     return .{ .text = try textPart(env, arena, head.items, text, url, start), .is_error = g.status >= 400 };
 }
 
@@ -329,7 +352,7 @@ fn browse(env: Env, arena: std.mem.Allocator, url: []const u8, start: usize) !Ou
     const pg = try page.extract(arena, html, url);
     var head: std.ArrayList(u8) = .empty;
     if (pg.title.len > 0) try head.print(arena, "title: {s}\n", .{pg.title});
-    return .{ .text = try textPart(env, arena, head.items, pg.text, url, start) };
+    return .{ .text = try textPart(env, arena, head.items, try mask(arena, env.secrets, pg.text, true), url, start) };
 }
 
 /// One part of a long text, with where the next one starts.
@@ -411,7 +434,7 @@ fn search(env: Env, arena: std.mem.Allocator, query: []const u8) !Output {
         try out.print(arena, "{s}\n{s}\n{s}\n\n", .{ jv.str(jv.get(r, "title")) orelse "", jv.str(jv.get(r, "url")) orelse "", jv.str(jv.get(r, "description")) orelse "" });
     }
     if (out.items.len == 0) return .{ .text = "no results" };
-    return .{ .text = capText(arena, out.items, env.tool_output_bytes) };
+    return .{ .text = capText(arena, try mask(arena, env.secrets, out.items, true), env.tool_output_bytes) };
 }
 
 // ---- tests ----
@@ -525,6 +548,52 @@ test "secret_in_output_is_masked" {
     const o = try f.call(.shell, "{\"command\":\"echo token=123456:SECRET-bot-token-value\"}");
     try t.expect(std.mem.indexOf(u8, o.text, "SECRET") == null);
     try t.expect(std.mem.indexOf(u8, o.text, "token=[secret:telegram]") != null);
+}
+
+/// `n` bytes of padding, then the secret of `Fix`: a cut at `n` + 10 bytes
+/// falls inside the secret.
+fn paddedSecret(a: std.mem.Allocator, n: usize) ![]const u8 {
+    const pad = try a.alloc(u8, n);
+    @memset(pad, 'x');
+    return std.fmt.allocPrint(a, "{s}123456:SECRET-bot-token-value end", .{pad});
+}
+
+test "a_secret_cut_by_the_output_limit_is_not_half_shown" {
+    if (is_windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.env.tool_output_bytes = 100;
+    const text = try paddedSecret(a, 90);
+    const sh = try f.call(.shell, try std.fmt.allocPrint(a, "{{\"command\":\"printf '%s' '{s}'\"}}", .{text}));
+    try t.expect(std.mem.indexOf(u8, sh.text, "[output cut at 100 bytes of") != null);
+    try t.expect(std.mem.indexOf(u8, sh.text, "123456:S") == null);
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/long.txt", .data = text });
+    const rd = try f.call(.read_file, "{\"path\":\"long.txt\"}");
+    try t.expect(std.mem.indexOf(u8, rd.text, "[output cut at 100 bytes of") != null);
+    try t.expect(std.mem.indexOf(u8, rd.text, "123456:S") == null);
+}
+
+test "a_secret_across_two_parts_of_a_page_is_masked_in_both" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // not html, so the text is the body as it is, in parts of 300 bytes
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/s.xml", .data = try paddedSecret(a, 290) });
+    f.env.tool_output_bytes = 600;
+    const base = try f.e.url();
+    var start: usize = 0;
+    var parts: usize = 0;
+    while (parts < 10) : (parts += 1) {
+        const part = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/s.xml\",\"start\":{d}}}", .{ base, start }));
+        try t.expect(std.mem.indexOf(u8, part.text, "123456:S") == null);
+        try t.expect(std.mem.indexOf(u8, part.text, "bot-token-value") == null);
+        const k = std.mem.indexOf(u8, part.text, "\"start\":") orelse break;
+        start = try std.fmt.parseInt(usize, part.text[k + 8 .. std.mem.indexOfScalarPos(u8, part.text, k, '}').?], 10);
+    }
+    try t.expectEqual(1, parts);
 }
 
 test "files_confined_to_workspace" {

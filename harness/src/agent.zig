@@ -842,12 +842,18 @@ fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, in
         return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
     }
     const timeout_ms: u32 = @intCast(@min(@as(u64, r.limits.turn_seconds) * 1000, std.math.maxInt(u32)));
-    const res = m.server.call(a, m.tool, input_json, r.env.stop, timeout_ms, r.env.tool_output_bytes) catch |e|
+    // the whole answer: it is masked before it is cut, so a key across the
+    // cut is not half shown
+    const res = m.server.call(a, m.tool, input_json, r.env.stop, timeout_ms, std.math.maxInt(usize)) catch |e|
         return .{ .text = try std.fmt.allocPrint(a, "failed: {s}", .{@errorName(e)}), .is_error = true };
     // a money call that was sent stays counted whatever came back: an
     // error, a timeout or /stop does not prove the order was not placed
-    var sc = try scrub.Scrubber.init(a, r.env.secrets);
-    const text = try sc.scrubAlloc(a, res.text);
+    const max = r.env.tool_output_bytes;
+    const upto = @min(res.text.len, @as(usize, max) * 2 + 4096);
+    const whole = upto == res.text.len;
+    const masked = try tools.mask(a, r.env.secrets, res.text[0..upto], whole);
+    const shown = util.cut(masked, max);
+    const text = if (whole and shown.len == masked.len) masked else try std.fmt.allocPrint(a, "{s}\n[output cut at {d} bytes of {d}]", .{ shown, max, if (whole) masked.len else res.text.len });
     return .{ .text = text, .is_error = res.is_error };
 }
 
@@ -1440,6 +1446,26 @@ test "mcp_tool_is_offered_and_runs_after_the_gate" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(1), "\"name\":\"fake__echo\"") != null);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "from-mcp") != null);
     try t.expectEqual(0, f.asked);
+}
+
+test "an_mcp_answer_cut_at_the_limit_does_not_show_half_a_secret" {
+    var f: Fix = undefined;
+    try f.init("allow mcp fake/echo *\n");
+    defer f.deinit();
+    const s = try withMcp(&f, false);
+    defer s.deinit();
+    f.run.env.secrets = &.{.{ .name = "broker", .value = "123456:SECRET-broker-key-value" }};
+    f.run.env.tool_output_bytes = 100;
+    // the server says it back: 90 bytes, then the key across the cut at 100
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"" ++ ("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") ++ "123456:SECRET-broker-key-value\"}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("echo it");
+    freeResult(&f.run, r);
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "[output cut at 100 bytes of") != null);
+    // the model's own call carries the key; its result must not
+    const result = req2[std.mem.indexOf(u8, req2, "\"tool_result\"").?..];
+    try t.expect(std.mem.indexOf(u8, result, "123456:S") == null);
 }
 
 test "mcp_tool_asks_by_default" {
