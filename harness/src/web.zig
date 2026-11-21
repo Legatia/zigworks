@@ -16,6 +16,7 @@ const jv = @import("jv.zig");
 const util = @import("util.zig");
 const model = @import("model.zig");
 const tools = @import("tools.zig");
+const url_mod = @import("url.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -287,9 +288,15 @@ pub const Web = struct {
     }
 
     fn open(w: *Web, a: Allocator, url: []const u8, login_name: ?[]const u8) !Output {
-        // as the page's location.host will have it, so that the grants,
-        // the login's key and the later checks all name the same host
-        const host = try pageHost(a, url) orelse return fail(a, "only http and https addresses can be opened", .{});
+        // read as the gate reads every address, so that the grants, the
+        // login's key and the later checks all name the same host, and
+        // the browser is sent there in that form
+        const u = url_mod.parse(a, url) catch |e| return switch (e) {
+            error.OutOfMemory => e,
+            error.NotWeb => fail(a, "only http and https addresses can be opened", .{}),
+            else => fail(a, "not opened: {s}", .{url_mod.why(e)}),
+        };
+        const host = u.host_port;
         const want: ?logins.Login = if (login_name) |n| (logins.find(w.env.logins, n) orelse return fail(a, "no login called {s}", .{util.cut(n, 60)})) else null;
         if (w.hooks.allow(w.hooks.ctx, a, .web, host)) |why| return fail(a, "refused by the gate: {s}", .{why});
         // the same session goes on if it has the same login
@@ -306,7 +313,7 @@ pub const Web = struct {
             try w.start(a);
         }
         w.granted_host = try w.arena.allocator().dupe(u8, host);
-        try w.s.?.navigate(a, url);
+        try w.s.?.navigate(a, u.href);
         return w.after(a, "");
     }
 
@@ -461,9 +468,11 @@ pub const Web = struct {
         const loc = try w.location(a);
         if (std.mem.eql(u8, loc.protocol, "about:")) return null;
         if (!std.mem.eql(u8, loc.protocol, "http:") and !std.mem.eql(u8, loc.protocol, "https:")) return try std.fmt.allocPrint(a, "the page went to a {s} address; only http and https pages can be used", .{util.cut(loc.protocol, 20)});
-        if (std.ascii.eqlIgnoreCase(loc.host, w.granted_host)) return null;
-        if (w.hooks.allow(w.hooks.ctx, a, .web, loc.host)) |why| return try std.fmt.allocPrint(a, "the page is now on {s}: refused by the gate: {s}", .{ loc.host, why });
-        w.granted_host = try w.arena.allocator().dupe(u8, loc.host);
+        // the host as harness reads the address, not as the page says it
+        const host = try pageHost(a, loc.href) orelse return try whyNot(a, loc.href);
+        if (std.ascii.eqlIgnoreCase(host, w.granted_host)) return null;
+        if (w.hooks.allow(w.hooks.ctx, a, .web, host)) |why| return try std.fmt.allocPrint(a, "the page is now on {s}: refused by the gate: {s}", .{ host, why });
+        w.granted_host = try w.arena.allocator().dupe(u8, host);
         return null;
     }
 
@@ -487,8 +496,11 @@ pub const Web = struct {
             w.hooks.note(w.hooks.ctx, "web fill refused", l.name, loc.host);
             return fail(a, "Not typed: the page is on {s}//{s}, and the login {s} is for {s}{s}.", .{ loc.protocol, loc.host, l.name, if (std.mem.eql(u8, l.site, "localhost")) "" else "https://", l.site });
         };
+        // the gate is asked about the host as harness reads the address,
+        // as when the page was opened
+        const page_host = try pageHost(a, loc.href) orelse return fail(a, "Not typed: {s}", .{try whyNot(a, loc.href)});
         for (used.items) |l| {
-            const key = try std.fmt.allocPrint(a, "{s} {s}", .{ l.name, loc.host });
+            const key = try std.fmt.allocPrint(a, "{s} {s}", .{ l.name, page_host });
             const ok = for (w.login_ok.items) |k| {
                 if (std.mem.eql(u8, k, key)) break true;
             } else false;
@@ -646,10 +658,14 @@ pub const Web = struct {
         // the host of the very document read, not of an earlier check: its
         // text reaches the model only if the gate allowed that host
         const protocol = jv.str(jv.get(v, "protocol")) orelse "";
-        const host = jv.str(jv.get(v, "host")) orelse "";
+        const href = jv.str(jv.get(v, "url")) orelse "";
         if (!std.mem.eql(u8, protocol, "about:")) {
+            // the host as harness reads the address (url.zig)
+            const host = try pageHost(a, href) orelse "";
             const why: ?[]const u8 = if (!std.mem.eql(u8, protocol, "http:") and !std.mem.eql(u8, protocol, "https:"))
                 try std.fmt.allocPrint(a, "the page went to a {s} address; only http and https pages can be used", .{util.cut(protocol, 20)})
+            else if (host.len == 0)
+                try whyNot(a, href)
             else if (std.ascii.eqlIgnoreCase(host, w.granted_host))
                 null
             else if (w.hooks.allow(w.hooks.ctx, a, .web, host)) |no|
@@ -664,7 +680,7 @@ pub const Web = struct {
                 return error.HostRefused;
             }
         }
-        const url = jv.str(jv.get(v, "url")) orelse "";
+        const url = href;
         const html = jv.str(jv.get(v, "html")) orelse "";
         var out: std.ArrayList(u8) = .empty;
         if (said.len > 0) try out.print(a, "{s}\n", .{said});
@@ -727,16 +743,21 @@ pub const Web = struct {
     }
 };
 
-/// The host of an http or https `url` as the page's `location.host` gives
-/// it: lowercase, without user info or the scheme's default port. Null for
-/// any other address.
+/// The host of an http or https `url`, with its port when not the scheme's
+/// own, as the gate, fetch and browse read it (url.zig). Null for any other
+/// address, and for one harness refuses (a name before @, a backslash).
 pub fn pageHost(a: Allocator, url: []const u8) !?[]const u8 {
-    const hp = page.urlHostPort(url) orelse return null;
-    var host = hp.host;
-    const default_port = if (hp.https) ":443" else ":80";
-    if (std.mem.endsWith(u8, host, default_port)) host = host[0 .. host.len - default_port.len];
-    if (host.len == 0) return null;
-    return try std.ascii.allocLowerString(a, host);
+    const u = url_mod.parse(a, url) catch |e| return if (e == error.OutOfMemory) e else null;
+    return u.host_port;
+}
+
+/// Why the page's address is not used, for a check after it moved.
+fn whyNot(a: Allocator, href: []const u8) ![]const u8 {
+    const reason = if (url_mod.parse(a, href)) |_| "it can't be read" else |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => url_mod.why(e),
+    };
+    return std.fmt.allocPrint(a, "the page went to {s}, which is refused: {s}", .{ util.cut(href, 200), reason });
 }
 
 /// `hxAll(sel)`: the elements of the top document matching `sel`, open
@@ -1458,11 +1479,25 @@ test "web_page_hosts_are_lowercase_without_user_or_default_port" {
         .{ "https://example.org:80/", "example.org:80" },
         .{ "http://example.org:443/", "example.org:443" },
         .{ "http://localhost:8080/a?b#c", "localhost:8080" },
-        .{ "https://user:pw@Evil.example:443/", "evil.example" },
-        .{ "https://github.com\\@evil.example/", "github.com" },
         .{ "HTTPS://[::1]:443/", "[::1]" },
+        // the same host as the gate and fetch read it
+        .{ "https://GitHub.com./", "github.com" },
+        .{ "http://0x7f.1:8080/", "127.0.0.1:8080" },
+        .{ "https://XN--BCHER-KVA.de/", "xn--bcher-kva.de" },
     }) |c| try t.expectEqualStrings(c[1], (try pageHost(a, c[0])).?);
-    for ([_][]const u8{ "ftp://x.org/", "https://", "https:///x", "javascript:alert(1)", "https://user@/" }) |u| try t.expectEqual(null, try pageHost(a, u));
+    // a name before @, a backslash: refused, never read as one host or another
+    for ([_][]const u8{ "ftp://x.org/", "https://", "https:///x", "javascript:alert(1)", "https://user@/", "https://user:pw@Evil.example:443/", "https://github.com\\@evil.example/", "https://bücher.de/" }) |u| try t.expectEqual(null, try pageHost(a, u));
+}
+
+test "web_refuses_an_address_with_a_name_before_the_at_without_asking" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.page("a.html", "<html><body><p>a page</p></body></html>");
+    const r = try f.act(try std.fmt.allocPrint(f.e.arena.allocator(), "{{\"action\":\"open\",\"url\":\"http://localhost@127.0.0.1:{d}/page/a.html\"}}", .{f.e.server.port}));
+    try t.expect(r.is_error);
+    try expectHas(r.text, "before @");
+    try t.expectEqualStrings("", f.asked.items);
 }
 
 test "web_asks_the_gate_when_a_click_lands_on_another_host" {

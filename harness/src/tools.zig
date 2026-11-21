@@ -10,6 +10,7 @@ const gate = @import("gate.zig");
 const model = @import("model.zig");
 const util = @import("util.zig");
 const page = @import("page.zig");
+const url_mod = @import("url.zig");
 const Io = std.Io;
 
 const is_windows = builtin.os.tag == .windows;
@@ -340,38 +341,40 @@ pub const Redirect = struct {
 /// `max_redirects` redirects are followed, never from https to http, each
 /// only if `redirect` allows it (without one: only those on a host already
 /// reached); `headers` are not sent on once the host changes.
-pub fn get(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, max: usize, redirect: ?Redirect) !Got {
-    var cur = url;
+pub fn get(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, raw_url: []const u8, headers: []const std.http.Header, max: usize, redirect: ?Redirect) !Got {
+    // the address as the gate read it (see url.zig): the host it decided
+    // on is the one reached
+    var cur = url_mod.parse(arena, raw_url) catch |e| return if (e == error.OutOfMemory) e else error.BadUrl;
     var hdrs = headers;
     var hosts: std.ArrayList([]const u8) = .empty;
-    try hosts.append(arena, gate.urlHost(url) orelse return error.BadUrl);
+    try hosts.append(arena, cur.host_port);
     var hops: u8 = 0;
     while (true) {
         var g = try getOne(gpa, io, arena, cur, hdrs, max);
         g.got.redirects = hops;
         const loc = g.location orelse return g.got;
-        const next = resolveUrl(arena, cur, loc) catch {
+        const to = resolveUrl(arena, cur.href, loc) catch {
             g.got.stopped = .{ .to = loc, .why = "its address is not valid" };
             return g.got;
         };
+        var next: url_mod.Url = undefined;
         const why: ?[]const u8 = blk: {
             if (hops >= max_redirects) break :blk "more than 5 redirects";
-            if (hopRefusal(cur, next)) |w| break :blk w;
-            const host = gate.urlHost(next).?;
+            if (hopRefusal(arena, cur.href, to)) |w| break :blk w;
+            next = try url_mod.parse(arena, to);
             const known = for (hosts.items) |h| {
-                if (std.ascii.eqlIgnoreCase(h, host)) break true;
+                if (std.mem.eql(u8, h, next.host_port)) break true;
             } else false;
-            if (redirect) |r| break :blk r.allow(r.ctx, arena, next, known);
+            if (redirect) |r| break :blk r.allow(r.ctx, arena, next.href, known);
             break :blk if (known) null else "redirects to another host are not followed here";
         };
         if (why) |w| {
-            g.got.stopped = .{ .to = next, .why = w };
+            g.got.stopped = .{ .to = if (url_mod.parse(arena, to)) |n| n.href else |_| to, .why = w };
             return g.got;
         }
-        const host = gate.urlHost(next).?;
         // what was meant for one host does not go on to another
-        if (!std.ascii.eqlIgnoreCase(host, gate.urlHost(cur).?)) hdrs = &.{};
-        try hosts.append(arena, host);
+        if (!std.mem.eql(u8, next.host_port, cur.host_port)) hdrs = &.{};
+        try hosts.append(arena, next.host_port);
         cur = next;
         hops += 1;
     }
@@ -379,9 +382,13 @@ pub fn get(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, url: []cons
 
 /// Why a redirect from `from` to `to` is never followed, whatever the
 /// gate says; null if it may be.
-pub fn hopRefusal(from: []const u8, to: []const u8) ?[]const u8 {
-    if (gate.urlHost(to) == null) return "it does not lead to an http or https address";
-    if (std.ascii.startsWithIgnoreCase(from, "https://") and !std.ascii.startsWithIgnoreCase(to, "https://")) return "it leads from https to http";
+pub fn hopRefusal(arena: std.mem.Allocator, from: []const u8, to: []const u8) ?[]const u8 {
+    const n = url_mod.parse(arena, to) catch |e| return switch (e) {
+        error.NotWeb => "it does not lead to an http or https address",
+        error.UserInfo => "it leads to an address with a name before @, whose host is what follows the @",
+        else => url_mod.why(e),
+    };
+    if (std.ascii.startsWithIgnoreCase(from, "https://") and !n.https) return "it leads from https to http";
     return null;
 }
 
@@ -392,7 +399,8 @@ fn isRedirect(status: u16) bool {
     };
 }
 
-/// `loc` (a Location header) read against `base`; fragments dropped.
+/// `loc` (a Location header) read against `base`; fragments dropped. A
+/// name before @ is kept, so that url.parse sees it and refuses it.
 fn resolveUrl(arena: std.mem.Allocator, base: []const u8, loc: []const u8) ![]const u8 {
     const base_uri = std.Uri.parse(base) catch return error.BadUrl;
     if (loc.len == 0 or std.mem.indexOfAny(u8, loc, " \r\n\t") != null) return error.BadUrl;
@@ -400,7 +408,7 @@ fn resolveUrl(arena: std.mem.Allocator, base: []const u8, loc: []const u8) ![]co
     @memcpy(buf[0..loc.len], loc);
     var aux: []u8 = buf;
     const uri = base_uri.resolveInPlace(loc.len, &aux) catch return error.BadUrl;
-    const out = try std.fmt.allocPrint(arena, "{f}", .{uri.fmt(.{ .scheme = true, .authority = true, .path = true, .query = true })});
+    const out = try std.fmt.allocPrint(arena, "{f}", .{uri.fmt(.{ .scheme = true, .authentication = true, .authority = true, .path = true, .query = true })});
     // "HTTPS://…" works as well as "https://…" from here on
     for (out[0..uri.scheme.len]) |*ch| ch.* = std.ascii.toLower(ch.*);
     return out;
@@ -410,22 +418,15 @@ fn resolveUrl(arena: std.mem.Allocator, base: []const u8, loc: []const u8) ![]co
 /// location.
 const One = struct { got: Got, location: ?[]const u8 };
 
-fn getOne(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, max: usize) !One {
-    const host = gate.urlHost(url) orelse return error.BadUrl;
-    const scheme_len: usize = if (std.ascii.startsWithIgnoreCase(url, "https://")) 8 else 7;
-    const path_start = scheme_len + host.len;
-    const base = url[0..path_start];
-    const rest = if (path_start < url.len) url[path_start..] else "/";
-    const p = if (rest[0] == '/') rest else try std.fmt.allocPrint(arena, "/{s}", .{rest});
-    if (std.mem.indexOfAny(u8, p, " \r\n") != null) return error.BadUrl;
-    var c = http.Client.init(gpa, io, try http.Target.parse(base));
+fn getOne(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, u: url_mod.Url, headers: []const std.http.Header, max: usize) !One {
+    var c = http.Client.init(gpa, io, .{ .https = u.https, .host = u.connectHost(), .port = u.port, .prefix = "" });
     defer c.deinit();
-    var resp = try c.send(.{ .method = .GET, .path = p, .headers = headers, .limits = .{ .idle_ms = 30_000, .total_ms = 120_000 } });
+    var resp = try c.send(.{ .method = .GET, .path = u.target, .headers = headers, .limits = .{ .idle_ms = 30_000, .total_ms = 120_000 } });
     defer resp.deinit();
     const ct = try arena.dupe(u8, resp.contentType());
     if (isRedirect(resp.status)) if (resp.location) |l| {
         // a redirect's own body is not wanted
-        return .{ .got = .{ .status = resp.status, .content_type = ct, .body = "", .truncated = false, .url = url }, .location = try arena.dupe(u8, l) };
+        return .{ .got = .{ .status = resp.status, .content_type = ct, .body = "", .truncated = false, .url = u.href }, .location = try arena.dupe(u8, l) };
     };
     var body: std.ArrayList(u8) = .empty;
     var truncated = false;
@@ -438,7 +439,7 @@ fn getOne(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, url: []const
         }
         try body.appendSlice(arena, part);
     }
-    return .{ .got = .{ .status = resp.status, .content_type = ct, .body = body.items, .truncated = truncated, .url = url }, .location = null };
+    return .{ .got = .{ .status = resp.status, .content_type = ct, .body = body.items, .truncated = truncated, .url = u.href }, .location = null };
 }
 
 fn isText(ct: []const u8) bool {
@@ -865,11 +866,34 @@ test "redirects_stop_after_five_and_headers_stay_with_their_host" {
     try t.expectEqual(2, checked);
 }
 
+test "a_redirect_to_an_address_with_a_name_before_the_at_is_not_followed" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const base = try f.e.url();
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/b.html", .data = "<html><body><p>Landed on b</p></body></html>" });
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/u.redirect", .data = try std.fmt.allocPrint(a, "302 http://good.com@127.0.0.1:{d}/page/b.html", .{f.e.server.port}) });
+    var hops: HopLog = .{};
+    f.env.redirect = hops.redirect();
+    const o = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/u\"}}", .{base}));
+    try t.expect(o.is_error);
+    try t.expect(std.mem.indexOf(u8, o.text, "was not followed") != null);
+    try t.expect(std.mem.indexOf(u8, o.text, "before @") != null);
+    try t.expect(std.mem.indexOf(u8, o.text, "Landed on b") == null);
+    // the gate is not even asked
+    try t.expectEqual(0, hops.n);
+}
+
 test "a_redirect_from_https_to_http_or_off_the_web_is_refused" {
-    try t.expect(hopRefusal("https://a.example/x", "http://a.example/y") != null);
-    try t.expect(hopRefusal("https://a.example/x", "file:///etc/passwd") != null);
-    try t.expect(hopRefusal("http://a.example/x", "https://b.example/y") == null);
-    try t.expect(hopRefusal("https://a.example/x", "https://b.example/y") == null);
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expect(hopRefusal(a, "https://a.example/x", "http://a.example/y") != null);
+    try t.expect(hopRefusal(a, "https://a.example/x", "file:///etc/passwd") != null);
+    try t.expect(hopRefusal(a, "https://a.example/x", "https://a.example@b.example/y") != null);
+    try t.expect(hopRefusal(a, "http://a.example/x", "https://b.example/y") == null);
+    try t.expect(hopRefusal(a, "https://a.example/x", "https://b.example/y") == null);
 }
 
 test "search_returns_titles_and_links" {

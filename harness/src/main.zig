@@ -1514,6 +1514,7 @@ test {
     _ = @import("logins.zig");
     _ = @import("cdp.zig");
     _ = @import("web.zig");
+    _ = @import("url.zig");
 }
 
 test "the_terminal_offers_only_the_answers_the_question_has" {

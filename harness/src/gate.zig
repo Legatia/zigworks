@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rules = @import("rules.zig");
 const util = @import("util.zig");
+const url = @import("url.zig");
 const Io = std.Io;
 
 pub const Tool = enum {
@@ -63,27 +64,20 @@ pub const Ctx = struct {
     money_unattended: bool = false,
 };
 
-/// What a grant covers: the exact argument, or for `fetch` the URL's host.
+/// What a grant covers: the exact argument, or for `fetch` and `browse`
+/// the address's host (with its port when not the scheme's own). `arg`:
+/// the decision's subject, for an address the form `url.parse` gives it.
 pub fn grantKey(tool: Tool, arg: []const u8) []const u8 {
     return switch (tool) {
-        .fetch, .browse => urlHost(arg) orelse arg,
+        .fetch, .browse => blk: {
+            const at = std.mem.indexOf(u8, arg, "://") orelse break :blk arg;
+            const rest = arg[at + 3 ..];
+            break :blk rest[0 .. std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len];
+        },
         // the tool, whatever its input
         .mcp, .money => arg[0 .. std.mem.indexOfScalar(u8, arg, ' ') orelse arg.len],
         else => arg,
     };
-}
-
-/// "https://Host:8080/x" → "Host:8080"; null if not an http(s) URL.
-pub fn urlHost(url: []const u8) ?[]const u8 {
-    const rest = if (std.ascii.startsWithIgnoreCase(url, "https://"))
-        url[8..]
-    else if (std.ascii.startsWithIgnoreCase(url, "http://"))
-        url[7..]
-    else
-        return null;
-    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
-    if (end == 0) return null;
-    return rest[0..end];
 }
 
 /// Whether two grant keys are the same: exactly, except that a host is
@@ -187,14 +181,20 @@ pub const Gate = struct {
         var given: []const u8 = "";
         // hard limits first: no rule, grant or listing lifts these
         switch (tool) {
-            .fetch, .browse => if (urlHost(arg) == null) return .{ .action = .deny, .why = "only http and https addresses can be fetched" },
+            // the address as fetch and the browser will use it, so the
+            // rules and grants see the host that is reached
+            .fetch, .browse => {
+                const u = url.parse(arena, arg) catch |e| return .{ .action = .deny, .why = if (e == error.NotWeb) "only http and https addresses can be fetched" else url.why(e) };
+                subject = u.href;
+                given = arg;
+            },
             .read_file, .write_file => {
                 const cf = confined(arena, g.io, g.workspace, arg) catch return .{ .action = .deny, .why = "outside the workspace" };
                 subject = cf.rel;
                 given = cf.given;
                 if (tool == .write_file and cf.link) return .{ .action = .deny, .why = "a symbolic link: files are not written through one", .subject = subject };
             },
-            .web => if (arg.len == 0 or std.mem.indexOfAny(u8, arg, " /\\?#@") != null) return .{ .action = .deny, .why = "not a host name" },
+            .web => subject = (url.hostPort(arena, arg) catch return .{ .action = .deny, .why = "not a host name" }).text,
             else => {},
         }
         const name = @tagName(tool);
@@ -545,6 +545,43 @@ test "fetch_refuses_non_http_schemes" {
     try t.expectEqual(.deny, f.act(.fetch, "ftp://x/y", .{}));
     try t.expectEqual(.deny, f.act(.fetch, "https:///nohost", .{}));
     try t.expectEqual(.allow, f.act(.fetch, "http://example.com", .{}));
+}
+
+test "an_address_with_a_name_before_the_at_is_refused" {
+    var f: Fixture = undefined;
+    try f.init("allow fetch *\nallow browse *\n");
+    defer f.deinit();
+    try f.grants.add(.fetch, "good.com", 5000);
+    for ([_]Tool{ .fetch, .browse }) |tool| {
+        for ([_][]const u8{ "https://good.com@evil.com/", "https://good.com:pw@evil.com/x", "http://@evil.com/" }) |u| {
+            const d = f.gate.decide(f.arena.allocator(), tool, u, 1000, .{});
+            try t.expectEqual(.deny, d.action);
+            try t.expect(std.mem.indexOf(u8, d.why, "@") != null);
+        }
+    }
+    // an @ after the host is part of the path
+    try t.expectEqual(.allow, f.act(.fetch, "https://medium.com/@someone", .{}));
+}
+
+test "every_spelling_of_a_host_is_the_same_host" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.grants.add(.fetch, "good.com", 5000);
+    for ([_][]const u8{ "HTTPS://Good.COM./x", "https://good.com:443/y", "https://GOOD.com/a/../b" }) |u| try t.expectEqual(.allow, f.act(.fetch, u, .{}));
+    try t.expectEqual(.ask, f.act(.fetch, "https://good.com:8443/", .{}));
+    try f.grants.add(.browse, "127.0.0.1", 5000);
+    for ([_][]const u8{ "http://0x7f.1/", "http://2130706433/", "http://127.1/", "http://0177.0.0.1/", "http://[::ffff:127.0.0.1]/" }) |u| try t.expectEqual(.allow, f.act(.browse, u, .{}));
+    // what does not read one way is refused: an international name not in
+    // its xn-- form, an IPv4 address of five parts, a backslash, a % in the host
+    for ([_][]const u8{ "https://bücher.de/", "http://1.2.3.4.5/", "https://good.com\\@evil.com/", "https://ev%69l.com/" }) |u| try t.expectEqual(.deny, f.act(.fetch, u, .{}));
+    // web's hosts the same way
+    try f.grants.add(.web, "good.com", 5000);
+    try t.expectEqual(.allow, f.act(.web, "Good.COM.", .{}));
+    // the decision says the address as it is used
+    try t.expectEqualStrings("https://good.com/b", f.gate.decide(a, .fetch, "HTTPS://Good.COM./a/../b", 1000, .{}).subject);
+    try t.expectEqualStrings("good.com", f.gate.decide(a, .web, "Good.COM.", 1000, .{}).subject);
 }
 
 test "new_tool_kinds_have_their_defaults" {
