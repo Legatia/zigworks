@@ -258,7 +258,8 @@ CLI: `init`, `secret add|rm|list`, `pair`, `run`, `chat`, `brief [NAME]`,
   the file can rewrite the whole chain.
 - **No streaming.** Answers arrive whole. A model call already under way
   when you send `/stop` is not cut off, but its answer is dropped and
-  nothing it asked for runs. A stopped brief or task waits for its next
+  nothing it asked for runs. `/stop` waits up to 3 seconds for things to end,
+  then answers and says a model call is still ending. A stopped brief or task waits for its next
   scheduled time.
 - **Windows.** `/stop` ends a shell command but not processes it started.
   The lock is judged by the status file's age, so after a crash a new

@@ -212,7 +212,7 @@ pub const Core = struct {
     /// Seconds of quiet before memories are written from the chat.
     memory_quiet_s: i64 = 30 * 60,
     /// How long /stop waits for runs to end before answering.
-    stop_wait_ms: u32 = 15_000,
+    stop_wait_ms: u32 = 3_000,
     path_var: []const u8 = "/usr/local/bin:/usr/bin:/bin",
     home_var: []const u8 = "",
     paths_arena: std.heap.ArenaAllocator,
@@ -303,7 +303,7 @@ pub const Core = struct {
         c.last_status_s = 0;
         c.fixed_now = null;
         c.memory_quiet_s = 30 * 60;
-        c.stop_wait_ms = 15_000;
+        c.stop_wait_ms = 3_000;
         c.path_var = "/usr/local/bin:/usr/bin:/bin";
         c.home_var = "";
         c.told_settings_changed = false;
@@ -907,10 +907,16 @@ pub const Core = struct {
             c.queue.clearRetainingCapacity();
         }
         c.stopRuns();
-        var waited: u32 = 0;
-        while ((c.busy.load(.acquire) or c.bg_active.load(.acquire) > 0) and waited < c.stop_wait_ms) : (waited += 20) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
-        c.log.write(.chat, false, .{ .event = "stop", .chat_turn = chat_busy, .background_runs = bg, .queued_dropped = dropped }) catch {};
+        // by the clock: a 20 ms sleep lasts longer than that on Windows
+        const until = Io.Clock.awake.now(c.io).nanoseconds + @as(i96, c.stop_wait_ms) * std.time.ns_per_ms;
+        while ((c.busy.load(.acquire) or c.bg_active.load(.acquire) > 0) and Io.Clock.awake.now(c.io).nanoseconds < until) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        // Commands and their processes end at once. A model call under way
+        // cannot be cut off: the owner is not kept waiting for it, and is
+        // told (the run's stop flag stays set, so nothing follows it).
+        const still = c.busy.load(.acquire) or c.bg_active.load(.acquire) > 0;
+        c.log.write(.chat, false, .{ .event = "stop", .chat_turn = chat_busy, .background_runs = bg, .queued_dropped = dropped, .still_ending = still }) catch {};
         if (!chat_busy and bg == 0 and dropped == 0) return "Nothing was running.";
+        if (still) return "Stopped. A model call already under way ends on its own; its answer is dropped and nothing it asked for runs.";
         return "Stopped everything that was running.";
     }
 
@@ -1843,6 +1849,27 @@ test "stop_holds_through_a_slow_model_call" {
     try t.expectEqual(1, f.e.server.modelRequests());
     const lt = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, f.e.arena.allocator(), .unlimited);
     try t.expect(std.mem.indexOf(u8, lt, "\"kind\":\"tool\"") == null);
+}
+
+test "stop_answers_soon_while_a_model_call_is_under_way" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    // the wait is the one a real instance has
+    const slow = comptime "{\"delay_ms\":7000," ++ model.textReply("late")[1..];
+    try f.e.script(1, slow);
+    try f.core.startWorker();
+    try f.core.handleText("go");
+    try waitFile(&f.e, "requests/001.json");
+    const start = Io.Clock.awake.now(t.io).nanoseconds;
+    try f.core.handleText("/stop");
+    try f.rec.waitFor("Stopped. A model call already under way");
+    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - start < 4 * std.time.ns_per_s);
+    // the call ends on its own; its answer is not said
+    var waited: u32 = 0;
+    while (f.core.busy.load(.acquire) and waited < 10_000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    try t.expect(!f.core.busy.load(.acquire));
+    try t.expectEqual(0, f.rec.count("late"));
 }
 
 test "stopped_task_does_not_restart" {

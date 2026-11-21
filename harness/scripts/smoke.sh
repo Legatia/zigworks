@@ -5,7 +5,8 @@
 set -u
 H=$1
 # absolute: MCP servers start in the workspace folder
-F=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
+# (pwd -W under Git for Windows: D:/..., a path the Windows program can open)
+F=$(cd "$(dirname "$2")" && { pwd -W 2>/dev/null || pwd; })/$(basename "$2")
 T=$(mktemp -d)
 FPID=""
 RPID=""
@@ -152,7 +153,9 @@ model $m '{"content":[{"type":"tool_use","id":"tu_m","name":"fake__echo","input"
 model $((m + 1)) "$(text_reply 'mcp done')"
 say "use the echo server"
 # the server reports its HOME: the real one, not the default before start-up finished
-check "an MCP tool runs through the gate with the real HOME" 'wait_for "$OUT" "mcp done" && grep -qF "home=$HOME" "$S/requests/$(printf %03d $((m + 1))).json"'
+# (on Windows that is USERPROFILE, with its backslashes doubled in the JSON)
+if [ $windows = 0 ]; then home_json=$HOME; else home_json=$(printf %s "$USERPROFILE" | sed 's/\\/\\\\/g'); fi
+check "an MCP tool runs through the gate with the real HOME" 'wait_for "$OUT" "mcp done" && grep -qF "home=$home_json" "$S/requests/$(printf %03d $((m + 1))).json"'
 m=$((m + 2))
 model $m '{"content":[{"type":"tool_use","id":"tu_d","name":"delegate","input":{"tasks":[{"task":"part one"},{"task":"part two"}]}}],"stop_reason":"tool_use"}'
 model $((m + 1)) "$(text_reply 'helper said hi')"
