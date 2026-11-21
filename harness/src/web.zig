@@ -722,14 +722,28 @@ pub fn pageHost(a: Allocator, url: []const u8) !?[]const u8 {
     return try std.ascii.allocLowerString(a, host);
 }
 
-/// Marks the top document's interactive elements with data-hx-ref and
-/// lists them; the page's HTML for its text. Never reads a field's value.
+/// `hxAll(sel)`: the elements of the top document matching `sel`, open
+/// shadow roots included (each right after its host), in page order.
+const deep_js =
+    \\const hxAll = (sel) => {
+    \\  const out = [];
+    \\  const walk = (root) => { for (const el of root.querySelectorAll('*')) { if (el.matches(sel)) out.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
+    \\  walk(document);
+    \\  return out;
+    \\};
+    \\
+;
+
+/// Marks the top document's interactive elements (those in open shadow
+/// roots too) with data-hx-ref and lists them; the page's HTML for its
+/// text. Never reads a field's value.
 const snapshot_script =
     \\(() => {
-    \\  for (const el of document.querySelectorAll('[data-hx-ref]')) el.removeAttribute('data-hx-ref');
+++ deep_js ++
+    \\  for (const el of hxAll('[data-hx-ref]')) el.removeAttribute('data-hx-ref');
     \\  const items = [];
     \\  let n = 0;
-    \\  for (const el of document.querySelectorAll('input, textarea, select, button, a[href], [role=button]')) {
+    \\  for (const el of hxAll('input, textarea, select, button, a[href], [role=button]')) {
     \\    const tag = el.tagName.toLowerCase();
     \\    const type = tag === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : (tag === 'button' ? (el.getAttribute('type') || 'submit').toLowerCase() : '');
     \\    if (type === 'hidden' || el.getClientRects().length === 0) continue;
@@ -772,7 +786,7 @@ const click_point_body =
 
 /// `body` runs with `el` the element marked `ref`; 'no-element' if none.
 fn refScript(a: Allocator, ref: i64, body: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "(() => {{ const el = document.querySelector('[data-hx-ref=\"{d}\"]'); if (!el) return 'no-element'; {s} }})()", .{ ref, body });
+    return std.fmt.allocPrint(a, "(() => {{\n{s}const el = hxAll('[data-hx-ref=\"{d}\"]')[0]; if (!el) return 'no-element'; {s} }})()", .{ deep_js, ref, body });
 }
 
 /// Checks that the page is on every one of `sites` (the rules of
@@ -807,7 +821,8 @@ fn fillScript(a: Allocator, ref: i64, value: []const u8, sites: []const []const 
         \\if (window !== window.top) return 'wrong-site (a frame)';
         \\
     );
-    try out.print(a, "const el = document.querySelector('[data-hx-ref=\"{d}\"]');\n", .{ref});
+    try out.appendSlice(a, deep_js);
+    try out.print(a, "const el = hxAll('[data-hx-ref=\"{d}\"]')[0];\n", .{ref});
     try out.appendSlice(a,
         \\if (!el) return 'no-element';
         \\let proto = null;
@@ -1597,6 +1612,30 @@ test "web_clicks_like_a_person" {
     const r4 = try f.act("{\"action\":\"click\",\"ref\":4}");
     try t.expect(!r4.is_error);
     try t.expectEqualStrings("true", try f.eval("document.getElementById('c').checked"));
+}
+
+test "web_sees_and_fills_fields_inside_open_shadow_roots" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\n");
+    defer f.deinit();
+    try f.store.put(t.io, "login-agent-password", "fake-Pass-7351!");
+    try f.page("shadow.html",
+        \\<html><head><title>Shadow</title></head><body><sign-in></sign-in><p id="o"></p><script>
+        \\customElements.define('sign-in', class extends HTMLElement { constructor() { super();
+        \\  const r = this.attachShadow({mode: 'open'});
+        \\  r.innerHTML = '<label for="pw">Password</label><input id="pw" type="password"><button id="go">Sign in</button>';
+        \\  r.getElementById('go').onclick = () => { document.getElementById('o').textContent = r.getElementById('pw').value === 'fake-Pass-7351!' ? 'shadow welcome' : 'wrong'; };
+        \\} });
+        \\</script></body></html>
+    );
+    const r0 = try f.act(try f.openJson("shadow.html", "agent"));
+    try expectHas(r0.text, "[1] input password \"Password\"");
+    try expectHas(r0.text, "[2] button submit \"Sign in\"");
+    const r1 = try f.act("{\"action\":\"type\",\"ref\":1,\"text\":\"{login:agent.password}\"}");
+    try expectHas(r1.text, "Typed into [1].");
+    const r2 = try f.act("{\"action\":\"click\",\"ref\":2}");
+    try expectHas(r2.text, "shadow welcome");
+    for ([_][]const u8{ r0.text, r1.text, r2.text }) |x| try t.expect(!has(x, "fake-Pass-7351!"));
 }
 
 test "web_click_on_a_select_leaves_the_page_usable" {
