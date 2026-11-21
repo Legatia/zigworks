@@ -436,7 +436,11 @@ pub const Web = struct {
 
     fn typeInto(w: *Web, a: Allocator, ref: i64, text: []const u8) !Output {
         const spans = logins.placeholders(a, text) catch return fail(a, "a placeholder is not valid; use {{login:NAME.username}}, {{login:NAME.password}} or {{login:NAME.code}}", .{});
-        if (spans.len == 0) return w.fill(a, ref, text, &.{}, &.{});
+        if (spans.len == 0) return w.fill(a, ref, text, &.{}, &.{}, null);
+        // a value goes in alone: no text around it, one per field, so it
+        // can't be made part of a message or a comment
+        if (spans.len > 1 or spans[0].start != 0 or spans[0].end != text.len)
+            return fail(a, "a login placeholder must be the whole text, one per type action", .{});
         const loc = try w.location(a);
         // every login named, checked before any value is fetched
         var used: std.ArrayList(logins.Login) = .empty;
@@ -479,7 +483,7 @@ pub const Web = struct {
         try out.appendSlice(a, text[last..]);
         var sites: std.ArrayList([]const u8) = .empty;
         for (used.items) |l| try sites.append(a, l.site);
-        const r = try w.fill(a, ref, out.items, sites.items, used.items);
+        const r = try w.fill(a, ref, out.items, sites.items, used.items, spans[0].field);
         if (made and !r.is_error) try w.notes.appendSlice(w.arena.allocator(), "A new password was made and stored for this login.\n");
         return r;
     }
@@ -537,8 +541,8 @@ pub const Web = struct {
 
     /// One script in the page checks where it is and types (see
     /// fillScript); `sites` empty: no check (no login value in the text).
-    fn fill(w: *Web, a: Allocator, ref: i64, text: []const u8, sites: []const []const u8, used: []const logins.Login) !Output {
-        const script = try fillScript(a, ref, text, sites);
+    fn fill(w: *Web, a: Allocator, ref: i64, text: []const u8, sites: []const []const u8, used: []const logins.Login, field: ?logins.Field) !Output {
+        const script = try fillScript(a, ref, text, sites, field);
         defer std.crypto.secureZero(u8, @constCast(script));
         const host = if (used.len > 0) (try w.location(a)).host else "";
         const r = try w.s.?.evaluateIsolated(a, script);
@@ -552,6 +556,14 @@ pub const Web = struct {
             return fail(a, "Not typed: the page moved to{s}, which is not the login's site.", .{util.cut(res["wrong-site".len..], 200)});
         }
         if (std.mem.eql(u8, res, "not-a-field")) return fail(a, "[{d}] is not a field that takes text", .{ref});
+        if (std.mem.startsWith(u8, res, "wrong-field")) {
+            for (used) |l| w.hooks.note(w.hooks.ctx, "web fill refused", l.name, host);
+            return fail(a, "Not typed: a {s} goes only into {s}; [{d}] is a{s}.", .{ @tagName(field.?), switch (field.?) {
+                .password => "a password field",
+                .username => "a text or e-mail field",
+                .code => "a text, number or phone field, or one marked for one-time codes",
+            }, ref, util.cut(res["wrong-field".len..], 40) });
+        }
         return fail(a, "no element [{d}] on the page; read it again", .{ref});
     }
 
@@ -666,7 +678,7 @@ fn refScript(a: Allocator, ref: i64, body: []const u8) ![]const u8 {
 /// and change. Check and fill are one script: no navigation can come
 /// between them. It runs in an isolated world, where the page can't have
 /// changed `location` or the prototypes it uses.
-fn fillScript(a: Allocator, ref: i64, value: []const u8, sites: []const []const u8) ![]const u8 {
+fn fillScript(a: Allocator, ref: i64, value: []const u8, sites: []const []const u8, field: ?logins.Field) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(a, "(() => {\nconst sites = [");
     for (sites, 0..) |s, i| {
@@ -697,6 +709,17 @@ fn fillScript(a: Allocator, ref: i64, value: []const u8, sites: []const []const 
         \\else if (el instanceof HTMLTextAreaElement) proto = HTMLTextAreaElement.prototype;
         \\else if (el instanceof HTMLSelectElement) proto = HTMLSelectElement.prototype;
         \\if (!proto) return 'not-a-field';
+        \\const kind = el instanceof HTMLInputElement ? el.type : (el instanceof HTMLTextAreaElement ? 'textarea' : 'select');
+        \\const field = '
+    );
+    try out.appendSlice(a, if (field) |x| @tagName(x) else "");
+    try out.appendSlice(a,
+        \\';
+        \\const fits = field === '' ||
+        \\  (field === 'password' && kind === 'password') ||
+        \\  (field === 'username' && (kind === 'text' || kind === 'email')) ||
+        \\  (field === 'code' && el instanceof HTMLInputElement && (kind === 'text' || kind === 'number' || kind === 'tel' || el.getAttribute('autocomplete') === 'one-time-code'));
+        \\if (!fits) return 'wrong-field ' + kind;
         \\el.focus();
         \\Object.getOwnPropertyDescriptor(proto, 'value').set.call(el,
     );
@@ -936,11 +959,11 @@ test "web_fill_script_refuses_a_page_that_lies_about_its_host" {
     _ = try f.act(try f.openJson("liar.html", null));
     const a = f.e.arena.allocator();
     for ([_][]const u8{ "example.com", "calhost" }) |site| {
-        const r = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "must-not-arrive", &.{site}));
+        const r = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "must-not-arrive", &.{site}, null));
         try t.expect(std.mem.startsWith(u8, r, "\"wrong-site http://localhost:"));
     }
     try t.expectEqualStrings("\"\"", try f.eval("document.getElementById('pw').value"));
-    const ok = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "fine", &.{"localhost"}));
+    const ok = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "fine", &.{"localhost"}, null));
     try t.expectEqualStrings("\"ok\"", ok);
     try t.expectEqualStrings("\"fine\"", try f.eval("document.getElementById('pw').value"));
 }
@@ -1104,6 +1127,45 @@ test "web_asks_the_gate_when_a_click_lands_on_another_host" {
     try expectHas(r.text, "refused by the gate");
     try t.expect(!has(r.text, "secret page text"));
     try expectHas(f.asked.items, "web 127.0.0.1:");
+}
+
+test "web_login_values_go_only_into_matching_fields" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\nusername = agent-bot\n");
+    defer f.deinit();
+    try f.store.put(t.io, "login-agent-password", "fake-Pass-7351!");
+    try f.store.put(t.io, "login-agent-totp", "JBSWY3DPEHPK3PXP");
+    try f.page("fields.html",
+        \\<html><body><input id="user" aria-label="Name"><input id="pw" type="password" aria-label="Password">
+        \\<textarea id="c" aria-label="Comment"></textarea><input id="e" type="email" aria-label="Mail">
+        \\<input id="otp" type="text" autocomplete="one-time-code" aria-label="Code"><input id="s" type="search" aria-label="Search"></body></html>
+    );
+    _ = try f.act(try f.openJson("fields.html", "agent"));
+    const refused = [_][]const u8{
+        "{\"action\":\"type\",\"ref\":1,\"text\":\"{login:agent.password}\"}",
+        "{\"action\":\"type\",\"ref\":3,\"text\":\"{login:agent.password}\"}",
+        "{\"action\":\"type\",\"ref\":3,\"text\":\"{login:agent.username}\"}",
+        "{\"action\":\"type\",\"ref\":6,\"text\":\"{login:agent.username}\"}",
+        "{\"action\":\"type\",\"ref\":2,\"text\":\"{login:agent.code}\"}",
+        "{\"action\":\"type\",\"ref\":2,\"text\":\"x{login:agent.password}\"}",
+        "{\"action\":\"type\",\"ref\":2,\"text\":\"{login:agent.password}{login:agent.password}\"}",
+    };
+    for (refused) |j| {
+        const r = try f.act(j);
+        if (!r.is_error) std.debug.print("\nnot refused: {s}\n", .{j});
+        try t.expect(r.is_error);
+    }
+    try t.expectEqualStrings("[\"\",\"\",\"\",\"\",\"\"]", try f.eval("['user','pw','c','s','otp'].map((i) => document.getElementById(i).value)"));
+    for ([_][]const u8{
+        "{\"action\":\"type\",\"ref\":1,\"text\":\"{login:agent.username}\"}",
+        "{\"action\":\"type\",\"ref\":4,\"text\":\"{login:agent.username}\"}",
+        "{\"action\":\"type\",\"ref\":2,\"text\":\"{login:agent.password}\"}",
+        "{\"action\":\"type\",\"ref\":5,\"text\":\"{login:agent.code}\"}",
+    }) |j| {
+        const r = try f.act(j);
+        if (r.is_error) std.debug.print("\nrefused: {s}\n{s}\n", .{ j, r.text });
+        try t.expect(!r.is_error);
+    }
 }
 
 test "web_answers_dialogs_and_shows_them" {
