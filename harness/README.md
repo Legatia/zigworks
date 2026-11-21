@@ -112,7 +112,8 @@ and on macOS and Windows so does `Notes/A`. A grant covers the exact
 command, path or MCP tool, or a host in any letter case. A `deny` rule
 applies to briefs.ini sources too.
 
-`ask` sends you the whole call (a file's content too) with three buttons:
+`ask` sends you the whole call (a file's content, a skill's description
+and body too) with three buttons:
 Allow once, Allow 24 h, Deny. A long one comes in several messages with
 the buttons on the last; a call over 12 KB is refused, and so is one
 whose question, or any part of it, could not be sent. A button from
@@ -305,7 +306,8 @@ not have is not started.
 Skills are folders in the agentskills.io format (`skills/NAME/SKILL.md`
 with `name` and `description`). The agent sees their names and
 descriptions, loads one with `skill` when it fits, and can save one with
-`skill_save` (asked). `/skills` lists them, `/skill rm NAME` removes one.
+`skill_save` (asked, showing its name, description and body). `/skills`
+lists them, `/skill rm NAME` removes one.
 
 ## The log
 
