@@ -737,6 +737,8 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
             const why: []const u8 = switch (e) {
                 error.BudgetSpent => "Model budget used up.",
                 error.RateLimited => "The model is rate limited; try again later.",
+                error.NoKey => "Model calls are refused: no omnigate key is stored (harness secret add omnigate).",
+                error.NoUrl => "Model calls are refused: no omnigate url is set ([model] url in config.ini, then /reload).",
                 else => try std.fmt.allocPrint(a, "Model call failed: {s} {s}", .{ @errorName(e), r.client.lastError() }),
             };
             try r.log.write(.model, false, .{ .run = r.label, .result = @errorName(e), .detail = r.client.lastError() });
@@ -1389,6 +1391,17 @@ test "budget_spent_ends_turn_with_message" {
     defer freeResult(&f.run, r);
     try t.expectEqualStrings("Model budget used up.", r.text);
     try t.expectEqual(1, f.e.server.modelRequests());
+}
+
+test "a_turn_without_a_key_says_model_calls_are_refused" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    f.client.key = "";
+    const r = try f.say("hello");
+    defer freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, r.text, "no omnigate key is stored") != null);
+    try t.expectEqual(0, f.e.server.modelRequests());
 }
 
 test "stop_before_next_call" {

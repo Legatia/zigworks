@@ -46,12 +46,17 @@ pub const Error = error{
     Upstream,
     /// The answer was not the expected JSON.
     BadReply,
+    /// No key is stored: the call is refused before anything is sent.
+    NoKey,
+    /// No url is set: the call is refused before anything is sent.
+    NoUrl,
 } || http.Error;
 
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: Io,
-    http: http.Client,
+    /// Null when no url is set: every call is refused.
+    http: ?http.Client,
     key: []const u8,
     model: []const u8,
     max_tokens: u32,
@@ -61,12 +66,15 @@ pub const Client = struct {
     /// Longest wait on a 429 (seconds).
     max_retry_wait: u32 = 60,
 
+    /// An empty `url` or `key` gives a client whose calls are refused
+    /// (error.NoUrl, error.NoKey), so nothing is sent without both.
     pub fn init(gpa: std.mem.Allocator, io: Io, url: []const u8, key: []const u8, model: []const u8, max_tokens: u32) http.Error!Client {
-        return .{ .gpa = gpa, .io = io, .http = .init(gpa, io, try http.Target.parse(url)), .key = key, .model = model, .max_tokens = max_tokens };
+        const target: ?http.Target = if (url.len == 0) null else try http.Target.parse(url);
+        return .{ .gpa = gpa, .io = io, .http = if (target) |tg| .init(gpa, io, tg) else null, .key = key, .model = model, .max_tokens = max_tokens };
     }
 
     pub fn deinit(c: *Client) void {
-        c.http.deinit();
+        if (c.http) |*h| h.deinit();
     }
 
     pub fn lastError(c: *const Client) []const u8 {
@@ -80,6 +88,8 @@ pub const Client = struct {
     /// `stable` is the part of the system prompt that stays the same from
     /// call to call (marked for the prompt cache), `changing` the rest.
     pub fn sendParts(c: *Client, arena: std.mem.Allocator, stable: []const u8, changing: []const u8, messages: []const Message, tools: []const ToolDef) Error!Reply {
+        if (c.http == null) return error.NoUrl;
+        if (c.key.len == 0) return error.NoKey;
         const body = try requestBody(arena, c.model, c.max_tokens, stable, changing, messages, tools);
         var limited = false;
         var conn_retry = false;
@@ -116,7 +126,7 @@ pub const Client = struct {
     const Raw = struct { status: u16, body: []u8, retry_after_s: ?u32 };
 
     fn post(c: *Client, arena: std.mem.Allocator, body: []const u8) http.Error!Raw {
-        var resp = try c.http.send(.{
+        var resp = try c.http.?.send(.{
             .path = "/v1/messages",
             .body = body,
             .headers = &.{
@@ -391,6 +401,24 @@ test "rate_limited_twice_gives_up" {
     defer c.deinit();
     try t.expectError(error.RateLimited, c.send(e.arena.allocator(), "", &.{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }}, &.{}));
     try t.expectEqual(2, e.server.modelRequests());
+}
+
+test "no_url_or_no_key_refuses_the_call_without_sending_it" {
+    var e: TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try e.script(1, textReply("should not be reached"));
+    const a = e.arena.allocator();
+    const msgs: []const Message = &.{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }};
+    // config.ini has no url yet
+    var no_url = try Client.init(t.allocator, t.io, "", "og-test-key", "claude-test", 100);
+    defer no_url.deinit();
+    try t.expectError(error.NoUrl, no_url.send(a, "", msgs, &.{}));
+    // no key stored: the request would go out with an empty key
+    var no_key = try Client.init(t.allocator, t.io, try e.url(), "", "claude-test", 100);
+    defer no_key.deinit();
+    try t.expectError(error.NoKey, no_key.send(a, "", msgs, &.{}));
+    try t.expectEqual(0, e.server.modelRequests());
 }
 
 test "cache_marks_on_last_tool_stable_system_and_last_message" {
