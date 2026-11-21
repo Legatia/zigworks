@@ -77,19 +77,17 @@ const App = struct {
 
     /// Works out where this folder's secrets are kept: HARNESS_STORE=DIR as
     /// given; the Keychain or the Credential Manager under the folder's own
-    /// namespace (the built-in folder keeps the one every earlier harness
-    /// used); elsewhere DATA/secrets.
+    /// namespace (the built-in folder, and any an earlier harness used, keep
+    /// the one every earlier harness used); elsewhere DATA/secrets.
     fn prepareStore(app: *App) !void {
-        if (app.env.get("HARNESS_STORE")) |d| if (d.len > 0) {
-            app.store_cache = .{ .dir = d };
-            return;
-        };
-        if (builtin.os.tag == .macos or builtin.os.tag == .windows) {
-            const is_default = if (app.builtinHome()) |d| samePath(app.io, app.arena, app.home, d) else |_| false;
-            app.store_cache = store_mod.system(try store_mod.namespace(app.io, app.arena, app.home, is_default)).?;
-            return;
-        }
-        app.store_cache = .{ .dir = try std.fs.path.join(app.arena, &.{ app.home, "secrets" }) };
+        app.store_cache = try store_mod.forFolder(app.io, app.arena, builtin.os.tag, app.env.get("HARNESS_STORE"), app.home, app.isDefaultHome());
+    }
+
+    /// Whether `home` is the folder harness uses with no --home and no
+    /// HARNESS_HOME.
+    fn isDefaultHome(app: *App) bool {
+        const d = app.builtinHome() catch return false;
+        return samePath(app.io, app.arena, app.home, d);
     }
 
     fn store(app: *App) store_mod.Store {
@@ -278,6 +276,13 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
 }
 
 fn initCmd(app: *App) !Exit {
+    // a folder made now gets a namespace of its own in the system's key
+    // store before it has files: one with files and no state/store-id is
+    // taken for a folder an earlier harness used (store.namespace)
+    store_mod.claimNamespace(app.io, app.arena, builtin.os.tag, app.home, app.isDefaultHome()) catch |e| {
+        complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
+        return .failed;
+    };
     try core_mod.initHome(app.io, app.arena, app.home);
     try outPrint(app.io,
         \\Data folder: {s}

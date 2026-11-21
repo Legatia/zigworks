@@ -57,12 +57,14 @@ Everything for one instance is in one folder (`--home DIR`,
 `HARNESS_HOME`, or `$XDG_DATA_HOME/harness`, by default
 `~/.local/share/harness`; `%LOCALAPPDATA%\harness` on Windows). Copy it to
 move the instance. On macOS and Windows the secrets are in the system's
-key store under a name kept in `state/store-id` (`harness` for the default
-folder), so a copy keeps them and each folder made apart has its own; a
-copy you run as a second instance shares them until you delete its
-`state/store-id`. On Linux they are in `secrets/`, files only you can
-read, so a copy carries them. With `HARNESS_STORE=DIR` they are files in
-DIR.
+key store under a name kept in `state/store-id`: `harness` for the
+default folder and for a folder an earlier harness used, a name of its
+own for a folder made since. So a copy keeps them, and each folder made
+apart has its own. A copy you run as a second instance shares them; to
+give it secrets of its own, make its folder with `harness init --home
+DIR`, copy everything but `state/store-id` into it, and add its secrets
+there. On Linux they are in `secrets/`, files only you can read, so a
+copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 
 | Path | What |
 |---|---|
