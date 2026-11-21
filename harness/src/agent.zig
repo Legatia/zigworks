@@ -675,9 +675,9 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
             if (r.private) break :blk tools.Output{ .text = "not saved: this conversation is private" };
             r.lock.lockUncancelable(r.io);
             defer r.lock.unlock(r.io);
-            const res = r.mem.add(arg, null, now_s) catch |e| break :blk tools.Output{ .text = @errorName(e), .is_error = true };
-            try r.log.write(.memory, false, .{ .event = if (res.merged) "mention" else "add", .id = res.id, .by = "agent" });
-            break :blk .{ .text = try std.fmt.allocPrint(a, "saved as {s}", .{res.id}) };
+            const res = r.mem.addFrom(arg, null, now_s, .other) catch |e| break :blk tools.Output{ .text = @errorName(e), .is_error = true };
+            try r.log.write(.memory, false, .{ .event = if (res.merged) "known" else "add", .id = res.id, .by = "agent" });
+            break :blk .{ .text = try std.fmt.allocPrint(a, "{s} {s}", .{ if (res.merged) "already in memory as" else "saved as", res.id }) };
         },
         .delegate => try delegate(r, a, input_json),
         .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, amount),
@@ -1372,6 +1372,18 @@ test "a_redirect_to_another_host_is_asked_like_a_fetch" {
     const req2 = try f.e.request(2);
     try t.expect(std.mem.indexOf(u8, req2, "was not followed: denied by the owner") != null);
     try t.expect(std.mem.indexOf(u8, req2, "Far away") == null);
+}
+
+test "remember_repeating_an_item_is_not_a_mention" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const res = try f.mem.add("The owner follows Zig compiler releases", null, util.nowSeconds(t.io) - 86400);
+    try f.e.script(1, model.toolReply("tu_1", "remember", "{\"text\":\"The owner follows zig compiler releases closely\"}"));
+    try f.e.script(2, model.textReply("Noted."));
+    const r = try f.say("ok");
+    defer freeResult(&f.run, r);
+    try t.expectEqual(1, f.mem.find(res.id).?.mentions.items.len);
 }
 
 test "empty_answer_is_not_kept" {

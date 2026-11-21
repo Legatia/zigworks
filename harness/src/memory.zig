@@ -161,8 +161,18 @@ pub const Store = struct {
         return null;
     }
 
-    /// Writes a new item, or adds a mention to one it nearly repeats.
+    /// Who is writing an item.
+    pub const From = enum { owner, other };
+
+    /// The owner's own words (`/remember`): writes a new item, or adds a
+    /// mention to one it nearly repeats.
     pub fn add(s: *Store, body_in: []const u8, given_terms: ?[]const []const u8, now_s: i64) !AddResult {
+        return s.addFrom(body_in, given_terms, now_s, .owner);
+    }
+
+    /// Like `add`; an item nearly repeated by `.other` (the agent, the
+    /// memory writer) gets no mention, as only the owner's words count.
+    pub fn addFrom(s: *Store, body_in: []const u8, given_terms: ?[]const []const u8, now_s: i64, from: From) !AddResult {
         var arena: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -181,7 +191,7 @@ pub const Store = struct {
         for (s.items.items) |it| {
             const overlap = match(ts, @ptrCast(it.terms));
             if (ts.len > 0 and overlap >= same_item) {
-                try s.mention(it, now_s);
+                if (from == .owner) try s.mention(it, now_s);
                 return .{ .id = it.id, .merged = true };
             }
         }
@@ -547,6 +557,17 @@ test "near_duplicate_becomes_a_mention" {
     try t.expectEqualStrings(first.id, again.id);
     try t.expectEqual(1, f.store.items.items.len);
     try t.expectEqual(2, f.store.items.items[0].mentions.items.len);
+}
+
+test "a_repeat_by_the_agent_or_the_writer_is_not_a_mention" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const first = try f.store.add("User follows Zig compiler releases", null, now - day);
+    const again = try f.store.addFrom("The user follows zig compiler releases closely", null, now, .other);
+    try t.expect(again.merged);
+    try t.expectEqualStrings(first.id, again.id);
+    try t.expectEqual(1, f.store.items.items[0].mentions.items.len);
 }
 
 test "files_round_trip" {

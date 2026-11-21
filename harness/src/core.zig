@@ -208,6 +208,9 @@ pub const Core = struct {
     approval: Approval = .{},
     last_owner_s: i64 = 0,
     turns_since_memory: u32 = 0,
+    /// The memory writer has read the conversation's turns before this one
+    /// (counted from the start, dropped turns included).
+    memory_upto: usize = 0,
     worker: ?std.Thread = null,
     /// /new: the chat worker starts a fresh conversation before its next turn.
     reset_conv: std.atomic.Value(bool) = .init(false),
@@ -312,6 +315,7 @@ pub const Core = struct {
         c.approval = .{};
         c.last_owner_s = 0;
         c.turns_since_memory = 0;
+        c.memory_upto = 0;
         c.worker = null;
         c.reset_conv = .init(false);
         c.quitting = .init(false);
@@ -884,6 +888,7 @@ pub const Core = struct {
         if (c.reset_conv.swap(false, .acq_rel)) {
             c.conv.deinit();
             c.conv = .init(c.gpa);
+            c.memory_upto = 0;
         }
         var flag: std.atomic.Value(bool) = .init(false);
         c.register(&flag);
@@ -902,24 +907,72 @@ pub const Core = struct {
     }
 
     const memory_prompt =
-        \\From the conversation below, list at most 5 lasting facts about the owner or their wishes that would help in later conversations: preferences, standing instructions, projects, people. One per line, each starting with "- ". Leave out passing details and anything already obvious. If there is nothing worth keeping, answer NONE.
+        \\From the conversation below, list at most 5 lasting facts about the owner or their wishes that would help in later conversations: preferences, standing instructions, projects, people. One per line, each starting with "- ". Leave out passing details, anything already obvious, and anything already in memory. If there is nothing worth keeping, answer NONE.
     ;
+    /// Most of the conversation one writer call reads; the newest turns are
+    /// kept.
+    const memory_transcript_max = 60_000;
+    /// Most of the memory items it is shown, so it does not repeat them.
+    const memory_known_max = 8_000;
 
+    /// The quiet-time writer: one model call over the turns since its last
+    /// run (not private ones), which picks up to 5 lasting facts.
     fn writeMemories(c: *Core) !void {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        var transcript: std.ArrayList(u8) = .empty;
-        for (c.conv.turns.items) |tn| if (!tn.private) for (tn.messages.items) |m| for (m.blocks) |b| if (b == .text and !std.mem.startsWith(u8, b.text, agent.context_mark)) {
-            try transcript.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(b.text, 2000) });
-        };
-        if (transcript.items.len == 0) return;
+        const turns = c.conv.turns.items;
+        const first_new = c.memory_upto -| c.conv.dropped;
+        // newest first, so a long talk keeps its latest part
+        var parts: std.ArrayList([]const u8) = .empty;
+        var size: usize = 0;
+        var i = turns.len;
+        while (i > first_new) {
+            i -= 1;
+            const tn = turns[i];
+            if (tn.private) continue;
+            var one: std.ArrayList(u8) = .empty;
+            for (tn.messages.items) |m| for (m.blocks) |b| if (b == .text and !std.mem.startsWith(u8, b.text, agent.context_mark)) {
+                try one.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(b.text, 2000) });
+            };
+            if (size + one.items.len > memory_transcript_max) break;
+            size += one.items.len;
+            try parts.append(a, one.items);
+        }
+        const upto = c.conv.dropped + turns.len;
+        if (parts.items.len == 0) {
+            c.memory_upto = upto;
+            return;
+        }
+        var msg: std.ArrayList(u8) = .empty;
+        {
+            c.lock.lockUncancelable(c.io);
+            defer c.lock.unlock(c.io);
+            const known = try c.mem.levels(a, c.now(), c.cfg.memory.top_size);
+            var known_size: usize = 0;
+            for (known) |r| {
+                const line = util.cut(r.item.body, 300);
+                if (known_size + line.len > memory_known_max) break;
+                if (known_size == 0) try msg.appendSlice(a, "Already in memory:\n");
+                known_size += line.len;
+                try msg.print(a, "- {s}\n", .{line});
+            }
+        }
+        if (msg.items.len > 0) try msg.append(a, '\n');
+        try msg.appendSlice(a, "The conversation:\n");
+        var j = parts.items.len;
+        while (j > 0) {
+            j -= 1;
+            try msg.appendSlice(a, parts.items[j]);
+        }
         var client = try model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", c.cfg.model.memory_model, 1024);
         defer client.deinit();
-        const reply = client.send(a, memory_prompt, &.{.{ .role = .user, .blocks = &.{.{ .text = util.cut(transcript.items, 60_000) }} }}, &.{}) catch |e| {
+        const reply = client.send(a, memory_prompt, &.{.{ .role = .user, .blocks = &.{.{ .text = msg.items }} }}, &.{}) catch |e| {
+            // the same turns are read again next time
             try c.log.write(.model, false, .{ .run = "memory writer", .result = @errorName(e) });
             return;
         };
+        c.memory_upto = upto;
         try c.log.write(.model, false, .{ .run = "memory writer", .result = "ok", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
         const out = try reply.text(a);
         var it = std.mem.splitScalar(u8, out, '\n');
@@ -930,8 +983,8 @@ pub const Core = struct {
             n += 1;
             c.lock.lockUncancelable(c.io);
             defer c.lock.unlock(c.io);
-            const res = c.mem.add(l[2..], null, c.now()) catch continue;
-            try c.log.write(.memory, false, .{ .event = if (res.merged) "mention" else "add", .id = res.id, .by = "memory writer" });
+            const res = c.mem.addFrom(l[2..], null, c.now(), .other) catch continue;
+            try c.log.write(.memory, false, .{ .event = if (res.merged) "known" else "add", .id = res.id, .by = "memory writer" });
         }
     }
 
@@ -2189,6 +2242,49 @@ test "private_turns_stay_out_of_memory" {
     const req = try f.e.request(3);
     try t.expect(std.mem.indexOf(u8, req, "xyzzy") == null);
     try t.expect(std.mem.indexOf(u8, req, "ok then") != null);
+}
+
+test "memory_writer_reads_only_new_turns_and_knows_what_is_kept" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.textReply("noted"));
+    f.core.chatTurn("I paddle a kayak every weekend");
+    try f.e.script(2, model.textReply("- The owner paddles a kayak every weekend"));
+    try f.core.writeMemories();
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "I paddle a kayak every weekend") != null);
+    try f.e.script(3, model.textReply("fine"));
+    f.core.chatTurn("my tomatoes are ripening");
+    try f.e.script(4, model.textReply("- The owner paddles a kayak every weekend"));
+    try f.core.writeMemories();
+    const req4 = try f.e.request(4);
+    // only the turn since the last run, with what is kept already
+    try t.expect(std.mem.indexOf(u8, req4, "my tomatoes are ripening") != null);
+    try t.expect(std.mem.indexOf(u8, req4, "I paddle a kayak every weekend") == null);
+    try t.expect(std.mem.indexOf(u8, req4, "Already in memory") != null);
+    try t.expect(std.mem.indexOf(u8, req4, "The owner paddles a kayak every weekend") != null);
+    // the writer repeating an item is not the owner mentioning it
+    try t.expectEqual(1, f.core.mem.items.items.len);
+    try t.expectEqual(1, f.core.mem.items.items[0].mentions.items.len);
+}
+
+test "memory_writer_keeps_the_newest_turns_of_a_long_talk" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const pad = try a.alloc(u8, 1900);
+    @memset(pad, 'x');
+    for (0..40) |i| {
+        try f.e.script(@intCast(i + 1), model.textReply("ok"));
+        const mark = if (i == 0) "OLDEST-TURN" else if (i == 39) "NEWEST-TURN" else "middle";
+        f.core.chatTurn(try std.fmt.allocPrint(a, "{s} {s}", .{ mark, pad }));
+    }
+    try f.e.script(41, model.textReply("NONE"));
+    try f.core.writeMemories();
+    const req = try f.e.request(41);
+    try t.expect(std.mem.indexOf(u8, req, "NEWEST-TURN") != null);
+    try t.expect(std.mem.indexOf(u8, req, "OLDEST-TURN") == null);
 }
 
 test "reload_waits_while_a_message_is_queued" {
