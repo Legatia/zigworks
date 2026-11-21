@@ -364,7 +364,10 @@ pub const defaults_ini =
 pub const rules_example =
     \\# Gate rules: allow | ask | deny, a tool, a pattern (* matches anything).
     \\# A matching deny always wins; otherwise the first matching line decides;
-    \\# otherwise the tool's default (shell: ask, fetch: ask, others: allow).
+    \\# otherwise the tool's default: shell, fetch, browse, web, login,
+    \\# skill_save and mcp (MCP tools, matched as "mcp SERVER/TOOL INPUT") ask;
+    \\# money tools are asked every time, whatever the rules; the others are
+    \\# allowed.
     \\#
     \\# deny  shell rm -rf *
     \\# allow fetch https://news.ycombinator.com/*
@@ -561,4 +564,32 @@ test "agents_browser_and_money_sections" {
     try t.expectEqual(500, c.money.max_per_day);
     try t.expect(c.money.scheduled);
     _ = try parse(arena.allocator(), defaults_ini);
+}
+
+test "inits_rules_comment_names_each_tool_that_asks_by_default" {
+    const gate = @import("gate.zig");
+    // the comment is what an owner reads to learn the defaults: every tool
+    // that asks must be named there, and none that is allowed
+    const comment = rules_example[0 .. std.mem.indexOf(u8, rules_example, "#\n") orelse rules_example.len];
+    inline for (@typeInfo(gate.Tool).@"enum".field_names) |name| {
+        const tool = @field(gate.Tool, name);
+        const named = hasWord(comment, name);
+        if ((tool.default() == .ask) != named) {
+            std.debug.print("{s} (default {s}) is {s} in:\n{s}\n", .{ name, @tagName(tool.default()), if (named) "named" else "not named", comment });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+/// `word` as a whole word in `text` ("skill" is not in "skill_save").
+fn hasWord(text: []const u8, word: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, word)) |i| {
+        const end = i + word.len;
+        const before_ok = i == 0 or !(std.ascii.isAlphanumeric(text[i - 1]) or text[i - 1] == '_');
+        const after_ok = end == text.len or !(std.ascii.isAlphanumeric(text[end]) or text[end] == '_');
+        if (before_ok and after_ok) return true;
+        from = i + 1;
+    }
+    return false;
 }
