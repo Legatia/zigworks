@@ -544,7 +544,14 @@ const TgChan = struct {
     }
 
     fn channel(tc: *TgChan) core_mod.Channel {
-        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear };
+        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .send_to = sendTo };
+    }
+
+    fn sendTo(ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        try tc.send_bot.send(chat_id, text);
     }
 
     fn send(ctx: *anyopaque, text: []const u8) anyerror!void {

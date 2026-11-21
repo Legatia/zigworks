@@ -117,6 +117,9 @@ pub const Channel = struct {
     /// Returns an id for `clear`, or null when buttons can't be shown.
     buttons: *const fn (ctx: *anyopaque, text: []const u8, buttons: []const [2][]const u8) ?i64,
     clear: *const fn (ctx: *anyopaque, id: i64) void,
+    /// Sends to someone other than the owner (an account trying to pair);
+    /// null where there is no one else (the terminal).
+    send_to: ?*const fn (ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void = null,
 };
 
 pub const Secrets = struct {
@@ -576,27 +579,49 @@ pub const Core = struct {
         try Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.owner, .data = try std.fmt.bufPrint(&buf, "{d}\n", .{id}) });
     }
 
-    /// A Telegram message. Strangers are dropped; `/pair` pairs the first
-    /// owner with a valid code.
+    /// A Telegram message. Strangers are dropped, though an attempt to
+    /// pair is answered; `/pair CODE` with a code from `harness pair` pairs
+    /// the account it comes from, also when another one was paired before.
     pub fn handleMessage(c: *Core, from_id: i64, text: []const u8) !void {
-        if (c.owner == null) {
-            if (std.mem.startsWith(u8, text, "/pair ")) {
-                if (checkPairCode(c.io, c.paths.pair, std.mem.trim(u8, text[6..], " "), c.now())) {
-                    try c.setOwner(from_id);
-                    Io.Dir.cwd().deleteFile(c.io, c.paths.pair) catch {};
-                    try c.log.write(.chat, false, .{ .event = "paired", .from = from_id });
-                    c.say("Paired. I answer only you from now on. Send /help for commands.");
-                    return;
+        const is_owner = if (c.owner) |o| o == from_id else false;
+        if (!is_owner and std.mem.startsWith(u8, text, "/pair ")) {
+            if (checkPairCode(c.io, c.paths.pair, std.mem.trim(u8, text[6..], " "), c.now())) {
+                const before = c.owner;
+                try c.setOwner(from_id);
+                Io.Dir.cwd().deleteFile(c.io, c.paths.pair) catch {};
+                if (before) |old| {
+                    // another account: the old one is told, the new one
+                    // starts a fresh conversation
+                    c.sayTo(old, "This bot is now paired with another account, with a code from harness pair.");
+                    c.reset_conv.store(true, .release);
                 }
+                try c.log.write(.chat, false, .{ .event = "paired", .from = from_id, .before = before });
+                c.say("Paired. I answer only you from now on. Send /help for commands.");
+                return;
             }
+            try c.log.write(.chat, false, .{ .event = "dropped", .from = from_id, .why = "pairing code wrong or expired" });
+            c.sayTo(from_id, if (c.owner == null)
+                "That pairing code is wrong or has expired. Run `harness pair` where harness runs for a new one."
+            else
+                "This bot is paired with another account. To pair a new one, its owner runs `harness pair` where harness runs and sends the code it prints from that account.");
+            return;
+        }
+        if (c.owner == null) {
             try c.log.write(.chat, false, .{ .event = "dropped", .from = from_id, .why = "not paired" });
             return;
         }
-        if (from_id != c.owner.?) {
+        if (!is_owner) {
             try c.log.write(.chat, false, .{ .event = "dropped", .from = from_id, .why = "not the owner" });
             return;
         }
         try c.handleText(text);
+    }
+
+    /// Sends to an account other than the owner, where the channel can.
+    fn sayTo(c: *Core, chat_id: i64, text: []const u8) void {
+        const ch = c.chan orelse return;
+        const f = ch.send_to orelse return;
+        f(ch.ctx, chat_id, text) catch {};
     }
 
     /// The owner's text: a command now, or a message for the chat queue.
@@ -1735,7 +1760,14 @@ const Recorder = struct {
     }
 
     fn channel(r: *Recorder) Channel {
-        return .{ .ctx = r, .send = send, .buttons = buttons, .clear = clear };
+        return .{ .ctx = r, .send = send, .buttons = buttons, .clear = clear, .send_to = sendTo };
+    }
+
+    fn sendTo(ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void {
+        const r: *Recorder = @ptrCast(@alignCast(ctx));
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        try r.lines.append(t.allocator, try std.fmt.allocPrint(t.allocator, "TO {d}: {s}", .{ chat_id, text }));
     }
 
     fn setFail(r: *Recorder, e: ?anyerror) void {
@@ -1871,6 +1903,27 @@ test "pairing_code_sets_owner_once_and_expires" {
     f.core.fixed_now = util.nowSeconds(t.io) + 601;
     try f.core.handleMessage(6, try std.fmt.allocPrint(a, "/pair {s}", .{code2}));
     try t.expectEqual(null, f.core.owner);
+}
+
+test "a_pair_from_another_account_is_answered_and_a_fresh_code_pairs_it" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.core.handleMessage(77, "/pair ABCDEFGH");
+    try f.rec.waitFor("TO 77: This bot is paired with another account. To pair a new one, its owner runs `harness pair` where harness runs and sends the code it prints from that account.");
+    try t.expectEqual(42, f.core.owner.?);
+    // the owner runs `harness pair` and sends the code from the new account
+    var buf: [8]u8 = undefined;
+    const code = try newPairCode(t.io, f.core.paths, f.core.now(), &buf);
+    try f.core.handleMessage(77, try std.fmt.allocPrint(a, "/pair {s}", .{code}));
+    try t.expectEqual(77, f.core.owner.?);
+    try t.expectEqual(77, readOwner(t.io, f.core.paths.owner).?);
+    try f.rec.waitFor("TO 42: This bot is now paired with another account");
+    try f.rec.waitFor("Paired. I answer only you from now on.");
+    // the old account is a stranger now
+    try f.core.handleMessage(42, "hello?");
+    try t.expectEqual(0, f.core.queue.items.len);
 }
 
 test "message_during_turn_is_queued" {
