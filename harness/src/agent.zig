@@ -747,7 +747,8 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
                     why = "allowed for 24 hours by the owner";
                     r.lock.lockUncancelable(r.io);
                     defer r.lock.unlock(r.io);
-                    try r.gate.grants.add(tool, gate.grantKey(tool, arg), now_s + 86400);
+                    // the form the gate matches (for files, the path inside the workspace)
+                    try r.gate.grants.add(tool, gate.grantKey(tool, d.subject), now_s + 86400);
                     if (r.grants_path) |p| r.gate.grants.save(r.io, p, now_s) catch {};
                 },
                 .deny => {
@@ -1220,6 +1221,20 @@ test "ask_day_stores_grant_and_second_call_skips_asking" {
     try t.expect(f.grants.has(.shell, "echo hi", util.nowSeconds(t.io)));
     const req3 = try f.e.request(3);
     try t.expect(std.mem.indexOf(u8, req3, "exit code 0") != null);
+}
+
+test "a_day_grant_for_a_file_covers_the_path_however_it_is_written" {
+    var f: Fix = undefined;
+    try f.init("ask write_file *\n");
+    defer f.deinit();
+    f.answer = .day;
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"./notes/a.txt\",\"content\":\"one\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "write_file", "{\"path\":\"notes/x/../a.txt\",\"content\":\"two\"}"));
+    try f.e.script(3, model.textReply("written twice"));
+    const r = try f.say("write it twice");
+    defer freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    try t.expect(f.grants.has(.write_file, "notes/a.txt", util.nowSeconds(t.io)));
 }
 
 test "steps_limit_ends_turn" {

@@ -35,6 +35,11 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Error![]Rule {
 
 /// `*` matches any run of characters; everything else matches itself.
 pub fn glob(pattern: []const u8, s: []const u8) bool {
+    return globCase(pattern, s, false);
+}
+
+/// `glob`, with ASCII letters matching either case when `fold` is set.
+pub fn globCase(pattern: []const u8, s: []const u8, fold: bool) bool {
     var p: usize = 0;
     var i: usize = 0;
     var star: ?usize = null;
@@ -44,7 +49,7 @@ pub fn glob(pattern: []const u8, s: []const u8) bool {
             star = p;
             p += 1;
             mark = i;
-        } else if (p < pattern.len and pattern[p] == s[i]) {
+        } else if (p < pattern.len and (pattern[p] == s[i] or (fold and std.ascii.toLower(pattern[p]) == std.ascii.toLower(s[i])))) {
             p += 1;
             i += 1;
         } else if (star) |st| {
@@ -86,4 +91,7 @@ test "glob_matches_runs" {
     try t.expect(!glob("a*b*c", "aXXbYY"));
     try t.expect(glob("git status", "git status"));
     try t.expect(!glob("git status", "git status; rm x"));
+    try t.expect(!glob("Private/*", "private/k"));
+    try t.expect(globCase("Private/*", "private/k", true));
+    try t.expect(!globCase("private/*", "public/k", true));
 }
