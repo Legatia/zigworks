@@ -173,7 +173,6 @@ pub const Core = struct {
     /// What started and what did not, for /status.
     mcp_note: []const u8 = "",
     money_ledger: agent.MoneyLedger = .{},
-    dry_run: bool = false,
     /// Chrome or Chromium for `browse` and `web`; empty: none.
     browser: []const u8 = "",
     /// The agent's logins (logins.ini, in the settings arena).
@@ -194,8 +193,8 @@ pub const Core = struct {
 
     chan: ?Channel = null,
     owner: ?i64 = null,
-    auto_recall: bool = true,
-    private: bool = false,
+    /// /dryrun, /private, /memory auto: runs read them when they use them.
+    switches: agent.Switches = .{},
 
     // the chat
     chat_client: model.Client,
@@ -285,7 +284,6 @@ pub const Core = struct {
         c.lock = .init;
         c.helper_pool = .{};
         c.ask_lock = .init;
-        c.dry_run = false;
         c.money_ledger = .{ .path = c.paths.money };
         c.money_ledger.load(io);
         c.mcp_servers = .empty;
@@ -296,8 +294,8 @@ pub const Core = struct {
         c.settings_mutex = .init;
         c.chan = null;
         c.owner = readOwner(io, c.paths.owner);
-        c.auto_recall = c.cfg.memory.auto;
-        c.private = false;
+        c.switches = .{};
+        c.switches.auto_recall.store(c.cfg.memory.auto, .release);
         c.loadSwitches();
         c.chat_client = try model.Client.init(gpa, io, c.cfg.model.url, secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens);
         c.conv = .init(gpa);
@@ -471,16 +469,16 @@ pub const Core = struct {
         const got = Io.Dir.cwd().readFile(c.io, c.paths.switches, &buf) catch return;
         var it = std.mem.splitScalar(u8, got, '\n');
         while (it.next()) |line| {
-            if (std.mem.eql(u8, line, "auto off")) c.auto_recall = false;
-            if (std.mem.eql(u8, line, "auto on")) c.auto_recall = true;
-            if (std.mem.eql(u8, line, "private on")) c.private = true;
-            if (std.mem.eql(u8, line, "dryrun on")) c.dry_run = true;
+            if (std.mem.eql(u8, line, "auto off")) c.switches.auto_recall.store(false, .release);
+            if (std.mem.eql(u8, line, "auto on")) c.switches.auto_recall.store(true, .release);
+            if (std.mem.eql(u8, line, "private on")) c.switches.private.store(true, .release);
+            if (std.mem.eql(u8, line, "dryrun on")) c.switches.dry_run.store(true, .release);
         }
     }
 
     fn saveSwitches(c: *Core) void {
         var buf: [96]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "auto {s}\nprivate {s}\ndryrun {s}\n", .{ if (c.auto_recall) "on" else "off", if (c.private) "on" else "off", if (c.dry_run) "on" else "off" }) catch return;
+        const s = std.fmt.bufPrint(&buf, "auto {s}\nprivate {s}\ndryrun {s}\n", .{ onOff(c.switches.auto_recall.load(.acquire)), onOff(c.switches.private.load(.acquire)), onOff(c.switches.dry_run.load(.acquire)) }) catch return;
         Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.switches, .data = s }) catch {};
     }
 
@@ -745,7 +743,7 @@ pub const Core = struct {
                 c.busy.store(false, .release);
                 continue;
             }
-            if (c.turns_since_memory > 0 and !c.private and c.last_owner_s > 0 and c.now() - c.last_owner_s >= c.memory_quiet_s and c.claimIdle()) {
+            if (c.turns_since_memory > 0 and !c.switches.private.load(.acquire) and c.last_owner_s > 0 and c.now() - c.last_owner_s >= c.memory_quiet_s and c.claimIdle()) {
                 c.writeMemories() catch |e| c.log.write(.memory, false, .{ .event = "writer failed", .why = @errorName(e) }) catch {};
                 c.turns_since_memory = 0;
                 c.busy.store(false, .release);
@@ -807,8 +805,9 @@ pub const Core = struct {
             .top_size = c.cfg.memory.top_size,
             .utc_offset = c.cfg.chat.utc_offset,
             .scheduled = scheduled,
-            .private = c.private,
-            .auto_recall = c.auto_recall,
+            // on from the start stays on for the run; the switches are read again when used
+            .private = c.switches.private.load(.acquire),
+            .switches = &c.switches,
             .label = label,
             .model_cfg = if (c.secrets.omnigate) |key| .{
                 .url = c.cfg.model.url,
@@ -825,7 +824,7 @@ pub const Core = struct {
             .mcp = c.mcp_tools,
             .money = c.cfg.money,
             .money_ledger = &c.money_ledger,
-            .dry_run = c.dry_run,
+            .dry_run = c.switches.dry_run.load(.acquire),
             .logins = c.login_list,
             .store = c.store,
             .profiles_dir = c.paths.profiles,
@@ -917,7 +916,7 @@ pub const Core = struct {
         };
         defer agent.freeResult(&run, res);
         if (!res.stopped) c.say(res.text);
-        if (!run.private) c.turns_since_memory += 1;
+        if (!run.isPrivate()) c.turns_since_memory += 1;
     }
 
     const memory_prompt =
@@ -1197,7 +1196,7 @@ pub const Core = struct {
         var words = std.mem.tokenizeAny(u8, text, " \t");
         const cmd = words.next() orelse return "";
         const rest = std.mem.trim(u8, words.rest(), " \t");
-        try c.log.write(.chat, c.private, .{ .event = "command", .command = cmd, .args = rest });
+        try c.log.write(.chat, c.switches.private.load(.acquire), .{ .event = "command", .command = cmd, .args = rest });
         const eql = std.mem.eql;
         if (eql(u8, cmd, "/help") or eql(u8, cmd, "/start")) return help_text;
         if (eql(u8, cmd, "/pair")) return "Already paired.";
@@ -1210,8 +1209,8 @@ pub const Core = struct {
         if (eql(u8, cmd, "/status")) {
             return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
-                if (c.auto_recall) "on" else "off",                                                         if (c.private) "on" else "off",
-                if (c.dry_run) "on" else "off",
+                onOff(c.switches.auto_recall.load(.acquire)), onOff(c.switches.private.load(.acquire)),
+                onOff(c.switches.dry_run.load(.acquire)),
                 if (c.browser.len == 0) "none found" else if (builtin.os.tag == .windows) "found (web not available on Windows yet)" else "found",
                 c.login_list.len,
                 if (c.mcp_note.len > 0) "\nMCP: " else "",
@@ -1220,7 +1219,7 @@ pub const Core = struct {
         }
         if (eql(u8, cmd, "/dryrun")) {
             const v = config.parseBool(rest) orelse return "Use /dryrun on or /dryrun off.";
-            c.dry_run = v;
+            c.switches.dry_run.store(v, .release);
             c.saveSwitches();
             try c.log.write(.config, false, .{ .event = "dry run", .on = v });
             return if (v) "Dry run is on: tools that move money are not called; the agent is told what would have been sent." else "Dry run is off: approved money calls are made.";
@@ -1233,7 +1232,7 @@ pub const Core = struct {
             }
             if (std.mem.startsWith(u8, rest, "auto ")) {
                 const v = config.parseBool(std.mem.trim(u8, rest[5..], " ")) orelse return "Use /memory auto on or /memory auto off.";
-                c.auto_recall = v;
+                c.switches.auto_recall.store(v, .release);
                 c.saveSwitches();
                 return if (v) "Automatic recall is on." else "Automatic recall is off. Pinned items still apply; I look things up only when asked.";
             }
@@ -1241,7 +1240,7 @@ pub const Core = struct {
         }
         if (eql(u8, cmd, "/private")) {
             const v = config.parseBool(rest) orelse return "Use /private on or /private off.";
-            c.private = v;
+            c.switches.private.store(v, .release);
             c.saveSwitches();
             return if (v) "Private: nothing from this chat is written to memory, and the log keeps only sizes and hashes." else "Private is off.";
         }
@@ -1514,6 +1513,10 @@ fn freeKeys(gpa: std.mem.Allocator, map: anytype) void {
     var it = map.keyIterator();
     while (it.next()) |k| gpa.free(k.*);
     map.deinit(gpa);
+}
+
+fn onOff(v: bool) []const u8 {
+    return if (v) "on" else "off";
 }
 
 fn readOwner(io: Io, path: []const u8) ?i64 {
@@ -2108,6 +2111,26 @@ test "mcp_servers_start_from_mcp_ini_and_dryrun_switch" {
     const req = try f.e.request(1);
     try t.expect(std.mem.indexOf(u8, req, "\"name\":\"fake__echo\"") != null);
     try t.expect(std.mem.indexOf(u8, req, "Moves money") != null);
+}
+
+test "dryrun_sent_while_a_money_question_waits_stops_the_call" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\nmoney = echo\namount = amount\n", .{fake}) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"order placed\",\"amount\":5}"));
+    try f.e.script(2, model.textReply("finished the order"));
+    try f.core.startWorker();
+    try f.core.handleText("buy");
+    try f.rec.waitFor("BUTTONS Allow this?");
+    try f.core.handleText("/dryrun on");
+    try f.rec.waitFor("Dry run is on");
+    f.core.handleCallback(42, "a1:once");
+    try f.rec.waitFor("finished the order");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "dry run: would call fake/echo") != null);
 }
 
 test "mcp_start_errors_are_masked_in_the_log" {

@@ -36,6 +36,16 @@ pub const Asker = struct {
     ask: *const fn (ctx: *anyopaque, q: Question) Answer,
 };
 
+/// The owner's switches, shared by all runs and read when used, so that
+/// /dryrun, /private and /memory auto apply to a run already going.
+pub const Switches = struct {
+    dry_run: std.atomic.Value(bool) = .init(false),
+    private: std.atomic.Value(bool) = .init(false),
+    auto_recall: std.atomic.Value(bool) = .init(true),
+};
+
+const no_switches: Switches = .{};
+
 /// A conversation, kept as whole turns so the oldest can be dropped
 /// without leaving a tool result without its call.
 pub const Conversation = struct {
@@ -153,8 +163,14 @@ pub const Run = struct {
     utc_offset: i32 = 0,
     asker: ?Asker = null,
     scheduled: bool = false,
+    /// Private from the start of this run, whatever the switch says later
+    /// (see `isPrivate`).
     private: bool = false,
+    /// Whether this run may recall at all (helpers don't); the switch
+    /// decides when it does (see `autoRecall`).
     auto_recall: bool = true,
+    /// The owner's switches, read when used.
+    switches: *const Switches = &no_switches,
     /// What the run is, for the log ("chat", "task btc-watch", …).
     label: []const u8 = "chat",
     extra_instructions: []const u8 = "",
@@ -182,7 +198,8 @@ pub const Run = struct {
     money: config.Config.Money = .{},
     /// What money tools moved today; shared by all runs.
     money_ledger: ?*MoneyLedger = null,
-    /// /dryrun on: money tools are not called.
+    /// /dryrun on from the start of this run: money tools are not called,
+    /// whatever the switch says later (see `dryRun`).
     dry_run: bool = false,
     /// The agent's logins (logins.ini) and where their values are kept.
     logins: []const logins_mod.Login = &.{},
@@ -194,6 +211,19 @@ pub const Run = struct {
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
+    }
+
+    /// Switched on now, or when the run started: on either way.
+    pub fn isPrivate(r: *const Run) bool {
+        return r.private or r.switches.private.load(.acquire);
+    }
+
+    pub fn dryRun(r: *const Run) bool {
+        return r.dry_run or r.switches.dry_run.load(.acquire);
+    }
+
+    pub fn autoRecall(r: *const Run) bool {
+        return r.auto_recall and r.switches.auto_recall.load(.acquire);
     }
 
     /// Whether this run may use `tool` at all (helpers get a subset).
@@ -496,25 +526,25 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        if (from_owner and !r.private) {
+        if (from_owner and !r.isPrivate()) {
             const ids = try r.mem.noteMentions(a, user_text, started);
             for (ids) |id| try r.log.write(.memory, false, .{ .event = "mention", .id = id });
         }
     }
-    try r.log.write(.turn, r.private, .{ .run = r.label, .text = user_text });
+    try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .text = user_text });
 
     const tn = try conv.begin();
     // a turn that fails half way could leave a tool call without its result,
     // which the model API refuses from then on: drop it whole
     errdefer conv.dropLast();
-    tn.private = r.private;
+    tn.private = r.isPrivate();
     // the time and what memory found go with the message, not the system
     // prompt: the system prompt and every earlier turn then stay the same
     // from call to call, and the prompt cache holds across turns
     const context = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        const recalled = try r.mem.recall(a, user_text, started, r.top_size, r.auto_recall);
+        const recalled = try r.mem.recall(a, user_text, started, r.top_size, r.autoRecall());
         const p = try systemParts(a, r, recalled, conv.summary, conv.dropped, started);
         break :blk try std.fmt.allocPrint(a, "{s}{s}", .{ context_mark, p.changing });
     };
@@ -569,7 +599,7 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
         const system = blk: {
             r.lock.lockUncancelable(r.io);
             defer r.lock.unlock(r.io);
-            const recalled = try r.mem.recall(a, user_text, started, r.top_size, r.auto_recall);
+            const recalled = try r.mem.recall(a, user_text, started, r.top_size, r.autoRecall());
             break :blk try systemParts(a, r, recalled, conv.summary, conv.dropped, started);
         };
         const msgs = try conv.messages(a);
@@ -617,7 +647,7 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
         result.text = try r.gpa.dupe(u8, why);
     };
     const dropped = try compact(r, conv);
-    try r.log.write(.turn, r.private, .{ .run = r.label, .answer = result.text, .steps = result.steps, .ended_by = result.ended_by, .dropped_turns = dropped });
+    try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .answer = result.text, .steps = result.steps, .ended_by = result.ended_by, .dropped_turns = dropped });
     return result;
 }
 
@@ -654,7 +684,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         const w = r.web orelse return .{ .text = "this tool is not available here", .is_error = true };
         const out = try w.run(a, input_json);
         // the model's input, placeholders and all: never a value
-        try r.log.write(.tool, r.private, .{ .run = r.label, .tool = name, .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text });
+        try r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = name, .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text });
         return out;
     }
     const arg = switch (tool) {
@@ -667,7 +697,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     var amount: f64 = 0;
     if (tool == .money) {
         if (moneyCheck(r, a, mt.?, input_json, now_s, &amount)) |why| {
-            try r.log.write(.gate, r.private, .{ .run = r.label, .tool = name, .decision = "deny", .why = why, .arg = arg });
+            try r.log.write(.gate, r.isPrivate(), .{ .run = r.label, .tool = name, .decision = "deny", .why = why, .arg = arg });
             return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
         }
     }
@@ -706,7 +736,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
             break :blk .{ .text = if (s.items.len > 0) s.items else "nothing found" };
         },
         .remember => blk: {
-            if (r.private) break :blk tools.Output{ .text = "not saved: this conversation is private" };
+            if (r.isPrivate()) break :blk tools.Output{ .text = "not saved: this conversation is private" };
             r.lock.lockUncancelable(r.io);
             defer r.lock.unlock(r.io);
             const res = r.mem.add(arg, null, now_s) catch |e| break :blk tools.Output{ .text = @errorName(e), .is_error = true };
@@ -739,7 +769,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         },
         else => try tools.run(env, a, tool, input_json),
     };
-    try r.log.write(.tool, r.private, .{ .run = r.label, .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text });
+    try r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text });
     return out;
 }
 
@@ -773,7 +803,9 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
         // the form the gate matched (for files, the path inside the
         // workspace), and what the model gave when that differs
         const given = if (std.mem.eql(u8, d.subject, arg)) "" else try std.fmt.allocPrint(a, " (given as {s})", .{arg});
-        const what = try std.fmt.allocPrint(a, "{s}{s}: {s}{s}{s}{s}", .{ who, name, d.subject, given, if (detail.len > 0) ", " else "", detail });
+        // a money call says whether it is made: the switch can change while asked
+        const dry: []const u8 = if (tool != .money) "" else if (r.dryRun()) "\nDry run is on: this call is not made." else "\nDry run is off: this call is made.";
+        const what = try std.fmt.allocPrint(a, "{s}{s}: {s}{s}{s}{s}{s}", .{ who, name, d.subject, given, if (detail.len > 0) ", " else "", detail, dry });
         if (what.len > max_question) {
             why = try std.fmt.allocPrint(a, "too long to ask the owner ({d} bytes; a question is at most {d}): make the call smaller", .{ what.len, max_question });
             break :ask;
@@ -811,7 +843,7 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
             .timeout => why = "no answer from the owner in time",
         }
     }
-    try r.log.write(.gate, r.private, .{ .run = r.label, .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
+    try r.log.write(.gate, r.isPrivate(), .{ .run = r.label, .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
     return if (action == .allow) null else why;
 }
 
@@ -834,7 +866,7 @@ fn webAllow(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const
 
 fn webNote(ctx: *anyopaque, event: []const u8, login: []const u8, detail: []const u8) void {
     const r: *Run = @ptrCast(@alignCast(ctx));
-    r.log.write(.tool, r.private, .{ .run = r.label, .tool = "web", .event = event, .login = login, .detail = detail }) catch {};
+    r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = "web", .event = event, .login = login, .detail = detail }) catch {};
 }
 
 // ---- MCP calls and money ----
@@ -895,7 +927,7 @@ fn releaseMoney(r: *Run, now_s: i64, amount: f64) void {
 }
 
 fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, amount: f64) !tools.Output {
-    if (m.money and r.dry_run) {
+    if (m.money and r.dryRun()) {
         releaseMoney(r, r.now(), amount);
         return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
     }
@@ -1070,7 +1102,7 @@ fn compact(r: *Run, conv: *Conversation) !usize {
             conv.summary = text;
             conv.dropOldest(n);
             gone = n;
-            try r.log.write(.turn, r.private, .{ .run = r.label, .event = "summarised", .turns = n });
+            try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .event = "summarised", .turns = n });
         } else |e| {
             try r.log.write(.model, false, .{ .run = r.label, .event = "summary failed", .result = @errorName(e) });
         }
@@ -1130,6 +1162,8 @@ const Fix = struct {
     /// The last question asked (in the arena), and its deadline.
     last_what: []const u8 = "",
     last_deadline: i64 = 0,
+    /// Switched on while the owner is asked (as /private on would be).
+    on_ask: ?*std.atomic.Value(bool) = null,
     mcp_tools: []const McpTool = &.{},
     ledger: MoneyLedger = .{},
     ledger_at_ask: f64 = -1,
@@ -1156,6 +1190,7 @@ const Fix = struct {
         f.last_allow_day = false;
         f.last_what = "";
         f.last_deadline = 0;
+        f.on_ask = null;
         f.mcp_tools = &.{};
         f.ledger = .{};
         f.ledger_at_ask = -1;
@@ -1181,6 +1216,7 @@ const Fix = struct {
         f.last_what = f.e.arena.allocator().dupe(u8, q.text) catch "";
         f.last_deadline = q.deadline_s;
         f.last_allow_day = q.allow_day;
+        if (f.on_ask) |flag| flag.store(true, .release);
         f.ledger_at_ask = f.ledger.total;
         const now_in = f.in_flight.fetchAdd(1, .acq_rel) + 1;
         _ = f.max_in_flight.fetchMax(now_in, .acq_rel);
@@ -1735,6 +1771,44 @@ test "money_dry_run_does_not_call_the_tool" {
     try t.expect(std.mem.indexOf(u8, req, "dry run: would call fake/echo") != null);
     try t.expect(std.mem.indexOf(u8, req, "home=") == null); // the server never ran it
     try t.expectEqual(@as(f64, 0), f.ledger.total);
+}
+
+test "the_money_question_says_whether_the_call_is_made" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    var sw: Switches = .{};
+    f.run.switches = &sw;
+    f.answer = .deny;
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":1}"));
+    try f.e.script(2, model.textReply("ok"));
+    var r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.endsWith(u8, f.last_what, "\nDry run is off: this call is made."));
+    sw.dry_run.store(true, .release);
+    try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"x\",\"amount\":1}"));
+    try f.e.script(4, model.textReply("ok"));
+    r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.endsWith(u8, f.last_what, "\nDry run is on: this call is not made."));
+}
+
+test "private_switched_on_during_a_turn_covers_the_rest_of_it" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    var sw: Switches = .{};
+    f.run.switches = &sw;
+    f.on_ask = &sw.private;
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo zebra-private-word\"}"));
+    try f.e.script(2, model.textReply("done"));
+    const r = try f.say("run it");
+    freeResult(&f.run, r);
+    const lt = try f.logText();
+    try t.expect(std.mem.indexOf(u8, lt, "\"kind\":\"tool\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "zebra-private-word") == null);
 }
 
 test "money_in_scheduled_runs_only_when_switched_on" {
