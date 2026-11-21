@@ -30,6 +30,12 @@ pub const Question = struct {
     deadline_s: i64 = 0,
 };
 
+/// Tells the owner something beside the answer, at once.
+pub const Notice = struct {
+    ctx: *anyopaque,
+    say: *const fn (ctx: *anyopaque, text: []const u8) void,
+};
+
 /// Asks the owner whether a call may run; blocks until they answer, the
 /// approval time runs out or the question's deadline passes.
 pub const Asker = struct {
@@ -216,6 +222,12 @@ pub const Run = struct {
     /// as it is when the tool runs, values added meanwhile too. null: only
     /// `env.secrets`.
     masks: ?*masks_mod.List = null,
+    /// Where calls refused only because nobody could approve them are
+    /// noted (a scheduled run says what it skipped); helpers share it.
+    skipped: ?*Skipped = null,
+    /// Tells the owner, beside the answer, of each memory item `remember`
+    /// saves.
+    notice: ?Notice = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -858,7 +870,7 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
             if (b != .tool_use) continue;
             const u = b.tool_use;
             if (cut) {
-                try r.log.write(.tool, r.private, .{ .run = r.label, .tool = u.name, .event = "not run: the reply was cut at max_tokens" });
+                try r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = u.name, .event = "not run: the reply was cut at max_tokens" });
                 try results.append(a, .{ .tool_result = .{ .id = u.id, .content = cut_note, .is_error = true } });
                 continue;
             }
@@ -953,8 +965,9 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         if (tool == .money) releaseMoney(r, mt.?, reserved);
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{refused}), .is_error = true };
     }
-    // a tool gets what is left of the turn, no more
-    var env = r.env;
+    // a tool gets what is left of the turn, no more; fetch and search
+    // send each redirect through the gate
+    var env = redirectEnv(r);
     if (r.deadline_s > 0) {
         const left = r.deadline_s - r.now();
         if (left <= 0) {
@@ -981,9 +994,11 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
             if (r.isPrivate()) break :blk tools.Output{ .text = "not saved: this conversation is private" };
             r.lock.lockUncancelable(r.io);
             defer r.lock.unlock(r.io);
-            const res = r.mem.add(arg, null, now_s) catch |e| break :blk tools.Output{ .text = @errorName(e), .is_error = true };
-            try r.log.write(.memory, false, .{ .event = if (res.merged) "mention" else "add", .id = res.id, .by = "agent" });
-            break :blk .{ .text = try std.fmt.allocPrint(a, "saved as {s}", .{res.id}) };
+            const res = r.mem.addFrom(arg, null, now_s, .other) catch |e| break :blk tools.Output{ .text = @errorName(e), .is_error = true };
+            try r.log.write(.memory, false, .{ .event = if (res.merged) "known" else "add", .id = res.id, .by = "agent" });
+            // the owner sees what goes into every later prompt
+            if (!res.merged) if (r.notice) |n| if (r.mem.find(res.id)) |it| n.say(n.ctx, try memory.savedNote(a, it.id, it.body));
+            break :blk .{ .text = try std.fmt.allocPrint(a, "{s} {s}", .{ if (res.merged) "already in memory as" else "saved as", res.id }) };
         },
         .delegate => try delegate(r, a, input_json),
         .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
@@ -1015,6 +1030,31 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     return out;
 }
 
+/// The run's tool environment, with its gate for redirects.
+fn redirectEnv(r: *Run) tools.Env {
+    var env = r.env;
+    env.redirect = .{ .ctx = r, .allow = redirectAllow };
+    return env;
+}
+
+/// A redirect of `fetch` or `search` passes the gate as a fetch of its
+/// own: on a host the call already reached only a deny rule stops it (the
+/// call was allowed for that host); another host is decided, and asked,
+/// like any fetch.
+fn redirectAllow(ctx: *anyopaque, a: std.mem.Allocator, url: []const u8, known_host: bool) ?[]const u8 {
+    const r: *Run = @ptrCast(@alignCast(ctx));
+    if (r.env.stop.load(.acquire)) return "stopped by the owner";
+    if (!known_host) return decideAndAsk(r, a, .fetch, "fetch", url, "", r.now()) catch "the gate could not decide";
+    const d = blk: {
+        r.lock.lockUncancelable(r.io);
+        defer r.lock.unlock(r.io);
+        break :blk r.gate.decide(a, .fetch, url, r.now(), .{});
+    };
+    const refused = d.action == .deny;
+    r.log.write(.gate, r.isPrivate(), .{ .run = r.label, .tool = "fetch", .decision = if (refused) "deny" else "allow", .why = if (refused) d.why else "a redirect on a host this call reached", .arg = url }) catch {};
+    return if (refused) d.why else null;
+}
+
 // ---- tests ----
 
 
@@ -1033,6 +1073,7 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
         defer r.lock.unlock(r.io);
         break :blk r.gate.decide(a, tool, arg, now_s, .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled });
     };
+    noteSkipped(r, a, tool, name, arg, now_s, d);
     var action = d.action;
     var why = d.why;
     if (action == .ask) ask: {
@@ -1098,6 +1139,71 @@ fn lockUntil(l: *Io.Mutex, io: Io, deadline_s: i64, stop: *std.atomic.Value(bool
         io.sleep(.fromMilliseconds(20), .awake) catch {};
     }
     return true;
+}
+
+/// What a run left out because nobody could approve it; shared by the
+/// run and its helpers.
+pub const Skipped = struct {
+    gpa: std.mem.Allocator,
+    mutex: Io.Mutex = .init,
+    items: std.ArrayList([]u8) = .empty,
+    /// Calls past the first `max`, only counted.
+    more: usize = 0,
+    const max = 8;
+
+    pub fn init(gpa: std.mem.Allocator) Skipped {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(s: *Skipped) void {
+        for (s.items.items) |x| s.gpa.free(x);
+        s.items.deinit(s.gpa);
+    }
+
+    fn add(s: *Skipped, io: Io, name: []const u8, arg: []const u8) void {
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        const short = util.cut(arg, 100);
+        const line = std.fmt.allocPrint(s.gpa, "{s}: {s}{s}", .{ name, short, if (short.len < arg.len) "…" else "" }) catch return;
+        for (s.items.items) |x| if (std.mem.eql(u8, x, line)) {
+            s.gpa.free(line);
+            return;
+        };
+        if (s.items.items.len >= max) {
+            s.gpa.free(line);
+            s.more += 1;
+            return;
+        }
+        s.items.append(s.gpa, line) catch s.gpa.free(line);
+    }
+
+    /// "Skipped (needs approval): shell: df -h; …", or "" if nothing was.
+    pub fn text(s: *Skipped, io: Io, arena: std.mem.Allocator) ![]const u8 {
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        if (s.items.items.len == 0) return "";
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(arena, "Skipped (needs approval): ");
+        for (s.items.items, 0..) |x, i| try out.print(arena, "{s}{s}", .{ if (i > 0) "; " else "", x });
+        if (s.more > 0) try out.print(arena, "; and {d} more", .{s.more});
+        return out.items;
+    }
+};
+
+/// Notes a call refused only because nobody could approve it: the gate
+/// said ask with no one to ask, or turned ask into deny in a scheduled run.
+fn noteSkipped(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, now_s: i64, d: gate.Decision) void {
+    const s = r.skipped orelse return;
+    const unattended = switch (d.action) {
+        .ask => r.asker == null,
+        .deny => r.scheduled and blk: {
+            r.lock.lockUncancelable(r.io);
+            defer r.lock.unlock(r.io);
+            break :blk r.gate.decide(a, tool, arg, now_s, .{}).action == .ask;
+        },
+        .allow => false,
+    };
+    if (unattended) s.add(r.io, name, arg);
 }
 
 fn webAllow(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) ?[]const u8 {
@@ -1371,7 +1477,7 @@ fn compact(r: *Run, conv: *Conversation) !usize {
     }
     // still over (or no summary): the oldest go whole, and it is said
     const trimmed = conv.trim(limit);
-    if (trimmed > 0) try r.log.write(.turn, r.private, .{ .run = r.label, .event = "dropped unsummarised", .turns = trimmed, .summary = conv.summary != null });
+    if (trimmed > 0) try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .event = "dropped unsummarised", .turns = trimmed, .summary = conv.summary != null });
     return gone + trimmed;
 }
 
@@ -1810,6 +1916,37 @@ test "owner_mention_raises_item_agent_text_does_not" {
     const r2 = try f.say("ok");
     freeResult(&f.run, r2);
     try t.expectEqual(2, it.mentions.items.len);
+}
+
+test "a_redirect_to_another_host_is_asked_like_a_fetch" {
+    var f: Fix = undefined;
+    try f.init("allow fetch http://127.0.0.1:*\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/far.html", .data = "<p>Far away</p>" });
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/a.redirect", .data = try std.fmt.allocPrint(a, "302 http://localhost:{d}/page/far.html", .{f.e.server.port}) });
+    try f.e.script(1, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"fetch\",\"input\":{{\"url\":\"http://127.0.0.1:{d}/page/a\"}}}}],\"stop_reason\":\"tool_use\"}}", .{f.e.server.port}));
+    try f.e.script(2, model.textReply("Could not follow it."));
+    f.answer = .deny;
+    const r = try f.say("read it");
+    defer freeResult(&f.run, r);
+    // the address asked for is allowed by the rule; the redirect's host is asked
+    try t.expectEqual(1, f.asked);
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "was not followed: denied by the owner") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "Far away") == null);
+}
+
+test "remember_repeating_an_item_is_not_a_mention" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const res = try f.mem.add("The owner follows Zig compiler releases", null, util.nowSeconds(t.io) - 86400);
+    try f.e.script(1, model.toolReply("tu_1", "remember", "{\"text\":\"The owner follows zig compiler releases closely\"}"));
+    try f.e.script(2, model.textReply("Noted."));
+    const r = try f.say("ok");
+    defer freeResult(&f.run, r);
+    try t.expectEqual(1, f.mem.find(res.id).?.mentions.items.len);
 }
 
 test "empty_answer_is_not_kept" {

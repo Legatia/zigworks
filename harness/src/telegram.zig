@@ -23,28 +23,48 @@ pub const Bot = struct {
     gpa: std.mem.Allocator,
     io: Io,
     http: http.Client,
+    /// The Bot API's address, the bot's own copy: the settings it came from
+    /// are replaced on /reload.
+    api: []u8,
     token: []const u8,
     mutex: Io.Mutex = .init,
+    /// Longest wait Telegram may ask for before a call is tried again
+    /// (seconds); asked to wait longer, the call fails with RateLimited.
+    max_retry_wait_s: u32 = 60,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, api: []const u8, token: []const u8) !Bot {
-        return .{ .gpa = gpa, .io = io, .http = .init(gpa, io, try http.Target.parse(api)), .token = token };
+        const own = try gpa.dupe(u8, api);
+        errdefer gpa.free(own);
+        return .{ .gpa = gpa, .io = io, .http = .init(gpa, io, try http.Target.parse(own)), .api = own, .token = token };
     }
 
     pub fn deinit(b: *Bot) void {
         b.http.deinit();
+        b.gpa.free(b.api);
     }
 
-    /// One Bot API call; returns the `result` value (in `arena`).
+    /// One Bot API call; returns the `result` value (in `arena`). Told to
+    /// slow down (429), it waits as long as Telegram says and tries again,
+    /// twice at most.
     fn call(b: *Bot, arena: std.mem.Allocator, method: []const u8, body: []const u8, idle_ms: u32) !?jv.Value {
         b.mutex.lockUncancelable(b.io);
         defer b.mutex.unlock(b.io);
         const path = try std.fmt.allocPrint(arena, "/bot{s}/{s}", .{ b.token, method });
-        var resp = try b.http.send(.{ .path = path, .body = body, .limits = .{ .idle_ms = idle_ms, .total_ms = idle_ms + 30_000 } });
-        defer resp.deinit();
-        const got = try resp.readAll(arena, 8 << 20);
-        const v = jv.parse(arena, got) orelse return error.BadReply;
-        if (!(jv.boolean(jv.get(v, "ok")) orelse false)) return error.TelegramRefused;
-        return jv.get(v, "result");
+        var tries: u32 = 0;
+        while (true) : (tries += 1) {
+            var resp = try b.http.send(.{ .path = path, .body = body, .limits = .{ .idle_ms = idle_ms, .total_ms = idle_ms + 30_000 } });
+            defer resp.deinit();
+            const got = try resp.readAll(arena, 8 << 20);
+            const v = jv.parse(arena, got) orelse return error.BadReply;
+            if (jv.boolean(jv.get(v, "ok")) orelse false) return jv.get(v, "result");
+            if (resp.status == 429 or (jv.int(jv.get(v, "error_code")) orelse 0) == 429) {
+                const wait = jv.int(jv.at(v, &.{ "parameters", "retry_after" })) orelse @as(i64, resp.retry_after_s orelse 1);
+                if (tries >= 2 or wait > b.max_retry_wait_s) return error.RateLimited;
+                b.io.sleep(.fromSeconds(@max(wait, 1)), .awake) catch {};
+                continue;
+            }
+            return error.TelegramRefused;
+        }
     }
 
     pub fn getUpdates(b: *Bot, arena: std.mem.Allocator, offset: i64, timeout_s: u32) ![]Update {
@@ -242,6 +262,23 @@ test "buttons_sent_as_inline_keyboard" {
     try t.expect(std.mem.indexOf(u8, out, "\"inline_keyboard\":[[{\"text\":\"Allow once\",\"callback_data\":\"a1:once\"},{\"text\":\"Deny\",\"callback_data\":\"a1:deny\"}]]") != null);
     try t.expect(std.mem.indexOf(u8, out, "answerCallbackQuery") != null);
     try t.expect(std.mem.indexOf(u8, out, "editMessageReplyMarkup") != null);
+}
+
+test "a_rate_limited_send_waits_as_told_and_goes_through" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "telegram/fail.json", .data = "{\"status\":429,\"retry_after\":1,\"count\":1}" });
+    var b = try Bot.init(t.allocator, t.io, try e.url(), "123:abc");
+    defer b.deinit();
+    const start = Io.Clock.awake.now(t.io).nanoseconds;
+    try b.send(42, "after the wait");
+    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - start >= 900 * std.time.ns_per_ms);
+    try t.expectEqual(1, std.mem.count(u8, try outbox(&e), "after the wait"));
+    // told to wait longer than a send may: an error, not a silent loss
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "telegram/fail.json", .data = "{\"status\":429,\"retry_after\":3600,\"count\":5}" });
+    try t.expectError(error.RateLimited, b.send(42, "far too soon"));
+    try t.expectEqual(0, std.mem.count(u8, try outbox(&e), "far too soon"));
 }
 
 test "offset_persists_across_restart" {

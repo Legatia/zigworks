@@ -38,6 +38,9 @@ pub const Env = struct {
     browser_seconds: u32 = 30,
     /// Where a throwaway browser profile goes.
     tmp_root: []const u8 = "",
+    /// Decides each redirect of `fetch` and `search` (the agent's gate);
+    /// null: only redirects on a host the request already reached.
+    redirect: ?Redirect = null,
 };
 
 pub const Output = struct { text: []const u8, is_error: bool = false };
@@ -306,10 +309,108 @@ fn shell(env: Env, arena: std.mem.Allocator, command: []const u8) !Output {
 
 // ---- web ----
 
-pub const Got = struct { status: u16, content_type: []const u8, body: []const u8, truncated: bool };
+pub const Got = struct {
+    status: u16,
+    content_type: []const u8,
+    body: []const u8,
+    truncated: bool,
+    /// Where the answer came from: the address asked for, or where its
+    /// redirects led.
+    url: []const u8 = "",
+    /// Redirects followed.
+    redirects: u8 = 0,
+    /// A redirect that was not followed, and why; `status` is then the
+    /// redirect's own and `url` the address that answered with it.
+    stopped: ?Stopped = null,
 
-/// GET `url`, reading at most `max` bytes of the body.
-pub fn get(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, max: usize) !Got {
+    pub const Stopped = struct { to: []const u8, why: []const u8 };
+};
+
+/// Most redirects one request follows.
+pub const max_redirects = 5;
+
+/// Decides each redirect of a request: null when it may be followed, else
+/// why not. `known_host`: the request has already reached that host.
+pub const Redirect = struct {
+    ctx: *anyopaque,
+    allow: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, url: []const u8, known_host: bool) ?[]const u8,
+};
+
+/// GET `url`, reading at most `max` bytes of the body. Up to
+/// `max_redirects` redirects are followed, never from https to http, each
+/// only if `redirect` allows it (without one: only those on a host already
+/// reached); `headers` are not sent on once the host changes.
+pub fn get(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, max: usize, redirect: ?Redirect) !Got {
+    var cur = url;
+    var hdrs = headers;
+    var hosts: std.ArrayList([]const u8) = .empty;
+    try hosts.append(arena, gate.urlHost(url) orelse return error.BadUrl);
+    var hops: u8 = 0;
+    while (true) {
+        var g = try getOne(gpa, io, arena, cur, hdrs, max);
+        g.got.redirects = hops;
+        const loc = g.location orelse return g.got;
+        const next = resolveUrl(arena, cur, loc) catch {
+            g.got.stopped = .{ .to = loc, .why = "its address is not valid" };
+            return g.got;
+        };
+        const why: ?[]const u8 = blk: {
+            if (hops >= max_redirects) break :blk "more than 5 redirects";
+            if (hopRefusal(cur, next)) |w| break :blk w;
+            const host = gate.urlHost(next).?;
+            const known = for (hosts.items) |h| {
+                if (std.ascii.eqlIgnoreCase(h, host)) break true;
+            } else false;
+            if (redirect) |r| break :blk r.allow(r.ctx, arena, next, known);
+            break :blk if (known) null else "redirects to another host are not followed here";
+        };
+        if (why) |w| {
+            g.got.stopped = .{ .to = next, .why = w };
+            return g.got;
+        }
+        const host = gate.urlHost(next).?;
+        // what was meant for one host does not go on to another
+        if (!std.ascii.eqlIgnoreCase(host, gate.urlHost(cur).?)) hdrs = &.{};
+        try hosts.append(arena, host);
+        cur = next;
+        hops += 1;
+    }
+}
+
+/// Why a redirect from `from` to `to` is never followed, whatever the
+/// gate says; null if it may be.
+pub fn hopRefusal(from: []const u8, to: []const u8) ?[]const u8 {
+    if (gate.urlHost(to) == null) return "it does not lead to an http or https address";
+    if (std.ascii.startsWithIgnoreCase(from, "https://") and !std.ascii.startsWithIgnoreCase(to, "https://")) return "it leads from https to http";
+    return null;
+}
+
+fn isRedirect(status: u16) bool {
+    return switch (status) {
+        301, 302, 303, 307, 308 => true,
+        else => false,
+    };
+}
+
+/// `loc` (a Location header) read against `base`; fragments dropped.
+fn resolveUrl(arena: std.mem.Allocator, base: []const u8, loc: []const u8) ![]const u8 {
+    const base_uri = std.Uri.parse(base) catch return error.BadUrl;
+    if (loc.len == 0 or std.mem.indexOfAny(u8, loc, " \r\n\t") != null) return error.BadUrl;
+    const buf = try arena.alloc(u8, loc.len * 2 + base.len + 8);
+    @memcpy(buf[0..loc.len], loc);
+    var aux: []u8 = buf;
+    const uri = base_uri.resolveInPlace(loc.len, &aux) catch return error.BadUrl;
+    const out = try std.fmt.allocPrint(arena, "{f}", .{uri.fmt(.{ .scheme = true, .authority = true, .path = true, .query = true })});
+    // "HTTPS://…" works as well as "https://…" from here on
+    for (out[0..uri.scheme.len]) |*ch| ch.* = std.ascii.toLower(ch.*);
+    return out;
+}
+
+/// One request, no redirects followed; a redirect comes back with its
+/// location.
+const One = struct { got: Got, location: ?[]const u8 };
+
+fn getOne(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, max: usize) !One {
     const host = gate.urlHost(url) orelse return error.BadUrl;
     const scheme_len: usize = if (std.ascii.startsWithIgnoreCase(url, "https://")) 8 else 7;
     const path_start = scheme_len + host.len;
@@ -321,6 +422,11 @@ pub fn get(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, url: []cons
     defer c.deinit();
     var resp = try c.send(.{ .method = .GET, .path = p, .headers = headers, .limits = .{ .idle_ms = 30_000, .total_ms = 120_000 } });
     defer resp.deinit();
+    const ct = try arena.dupe(u8, resp.contentType());
+    if (isRedirect(resp.status)) if (resp.location) |l| {
+        // a redirect's own body is not wanted
+        return .{ .got = .{ .status = resp.status, .content_type = ct, .body = "", .truncated = false, .url = url }, .location = try arena.dupe(u8, l) };
+    };
     var body: std.ArrayList(u8) = .empty;
     var truncated = false;
     while (try resp.next()) |part| {
@@ -332,7 +438,7 @@ pub fn get(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, url: []cons
         }
         try body.appendSlice(arena, part);
     }
-    return .{ .status = resp.status, .content_type = try arena.dupe(u8, resp.contentType()), .body = body.items, .truncated = truncated };
+    return .{ .got = .{ .status = resp.status, .content_type = ct, .body = body.items, .truncated = truncated, .url = url }, .location = null };
 }
 
 fn isText(ct: []const u8) bool {
@@ -347,13 +453,17 @@ fn startOf(arena: std.mem.Allocator, input_json: []const u8) usize {
 }
 
 fn fetch(env: Env, arena: std.mem.Allocator, url: []const u8, start: usize) !Output {
-    const g = try get(env.gpa, env.io, arena, url, &.{}, fetch_max);
-    if (!isText(g.content_type)) return .{ .text = try std.fmt.allocPrint(arena, "not text ({s}); only text pages are fetched", .{g.content_type}), .is_error = true };
+    const g = try get(env.gpa, env.io, arena, url, &.{}, fetch_max, env.redirect);
     var head: std.ArrayList(u8) = .empty;
-    try head.print(arena, "status {d}\n", .{g.status});
+    // the status, and where it came from when that is not where it was asked
+    try head.print(arena, "status {d}", .{g.status});
+    if (g.redirects > 0) try head.print(arena, " from {s} (after {d} redirect{s})", .{ g.url, g.redirects, if (g.redirects == 1) "" else "s" });
+    if (g.stopped) |st| return .{ .text = try std.fmt.allocPrint(arena, "{s}: the redirect to {s} was not followed: {s}", .{ head.items, st.to, st.why }), .is_error = true };
+    try head.append(arena, '\n');
+    if (!isText(g.content_type)) return .{ .text = try std.fmt.allocPrint(arena, "not text ({s}); only text pages are fetched", .{g.content_type}), .is_error = true };
     var text: []const u8 = g.body;
     if (std.ascii.findIgnoreCase(g.content_type, "html") != null) {
-        const pg = try page.extract(arena, g.body, url);
+        const pg = try page.extract(arena, g.body, g.url);
         if (pg.title.len > 0) try head.print(arena, "title: {s}\n", .{pg.title});
         text = pg.text;
     }
@@ -361,7 +471,7 @@ fn fetch(env: Env, arena: std.mem.Allocator, url: []const u8, start: usize) !Out
     // masked whole before it is cut into parts: a value across two parts
     // would be half shown in each
     text = try mask(arena, env.secrets, text, !g.truncated);
-    return .{ .text = try textPart(env, arena, head.items, text, url, start), .is_error = g.status >= 400 };
+    return .{ .text = try textPart(env, arena, head.items, text, g.url, start), .is_error = g.status >= 400 };
 }
 
 fn browse(env: Env, arena: std.mem.Allocator, url: []const u8, start: usize) !Output {
@@ -445,7 +555,8 @@ fn search(env: Env, arena: std.mem.Allocator, query: []const u8) !Output {
     const g = try get(env.gpa, env.io, arena, url.items, &.{
         .{ .name = "X-Subscription-Token", .value = key },
         .{ .name = "Accept", .value = "application/json" },
-    }, fetch_max);
+    }, fetch_max, env.redirect);
+    if (g.stopped) |st| return .{ .text = try std.fmt.allocPrint(arena, "search failed: the redirect to {s} was not followed: {s}", .{ st.to, st.why }), .is_error = true };
     if (g.status != 200) return .{ .text = try std.fmt.allocPrint(arena, "search failed with status {d}", .{g.status}), .is_error = true };
     const v = jv.parse(arena, g.body) orelse return .{ .text = "search answered something that is not JSON", .is_error = true };
     var out: std.ArrayList(u8) = .empty;
@@ -669,6 +780,96 @@ test "fetch_caps_body_and_refuses_binary" {
     const long = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/big.xml\"}}", .{base}));
     try t.expect(std.mem.indexOf(u8, long.text, "[page cut at 1 MiB]") != null);
     try t.expect(long.text.len < fetch_max + 100);
+}
+
+/// A redirect gate for tests: says what it was asked, refuses when told to.
+const HopLog = struct {
+    n: u32 = 0,
+    last: []const u8 = "",
+    last_known: bool = false,
+    refuse: ?[]const u8 = null,
+
+    fn redirect(h: *HopLog) Redirect {
+        return .{ .ctx = h, .allow = allow };
+    }
+
+    fn allow(ctx: *anyopaque, arena: std.mem.Allocator, url: []const u8, known_host: bool) ?[]const u8 {
+        const h: *HopLog = @ptrCast(@alignCast(ctx));
+        h.n += 1;
+        h.last = arena.dupe(u8, url) catch "";
+        h.last_known = known_host;
+        return h.refuse;
+    }
+};
+
+test "fetch_follows_redirects_through_the_gate_and_says_where_it_ended" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const base = try f.e.url();
+    const other = try std.fmt.allocPrint(a, "http://localhost:{d}", .{f.e.server.port});
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/a.redirect", .data = "301 /page/b.html" });
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/b.html", .data = "<html><body><p>Landed on b</p></body></html>" });
+    var hops: HopLog = .{};
+    f.env.redirect = hops.redirect();
+    const o = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/a\"}}", .{base}));
+    try t.expect(!o.is_error);
+    try t.expect(std.mem.indexOf(u8, o.text, "Landed on b") != null);
+    try t.expect(std.mem.indexOf(u8, o.text, try std.fmt.allocPrint(a, "status 200 from {s}/page/b.html (after 1 redirect)", .{base})) != null);
+    // the same host still passes the gate (its deny rules), as a known one
+    try t.expectEqual(1, hops.n);
+    try t.expect(hops.last_known);
+    // another host: the gate decides; refused, the redirect is not followed
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/away.redirect", .data = try std.fmt.allocPrint(a, "302 {s}/page/b.html", .{other}) });
+    hops.refuse = "denied by the owner";
+    const away = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/away\"}}", .{base}));
+    try t.expect(away.is_error);
+    try t.expect(!hops.last_known);
+    try t.expect(std.mem.indexOf(u8, away.text, try std.fmt.allocPrint(a, "status 302: the redirect to {s}/page/b.html was not followed: denied by the owner", .{other})) != null);
+    try t.expect(std.mem.indexOf(u8, away.text, "Landed on b") == null);
+}
+
+test "redirects_stop_after_five_and_headers_stay_with_their_host" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const base = try f.e.url();
+    for (0..6) |i| try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = try std.fmt.allocPrint(a, "pages/r{d}.redirect", .{i}), .data = try std.fmt.allocPrint(a, "302 r{d}", .{i + 1}) });
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/r6", .data = "the end" });
+    // without a gate only redirects on the same host are followed
+    const g = try get(t.allocator, t.io, a, try std.fmt.allocPrint(a, "{s}/page/r0", .{base}), &.{}, 1000, null);
+    try t.expectEqual(302, g.status);
+    try t.expectEqualStrings("more than 5 redirects", g.stopped.?.why);
+    try t.expectEqual(5, g.redirects);
+    // a header for one host is not sent on to another
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/h.redirect", .data = try std.fmt.allocPrint(a, "307 http://localhost:{d}/page/r6", .{f.e.server.port}) });
+    var hops: HopLog = .{};
+    const h = try get(t.allocator, t.io, a, try std.fmt.allocPrint(a, "{s}/page/h", .{base}), &.{.{ .name = "X-Subscription-Token", .value = "brave-key" }}, 1000, hops.redirect());
+    try t.expectEqualStrings("the end", h.body);
+    try t.expectEqual(1, h.redirects);
+    const reqs = try f.e.tmp.dir.readFileAlloc(t.io, "page-requests.jsonl", a, .unlimited);
+    var it = std.mem.splitScalar(u8, reqs, '\n');
+    var checked: u32 = 0;
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"/page/h\"") != null) {
+            try t.expect(std.mem.indexOf(u8, line, "brave-key") != null);
+            checked += 1;
+        }
+        if (std.mem.indexOf(u8, line, "\"/page/r6\"") != null) {
+            try t.expect(std.mem.indexOf(u8, line, "brave-key") == null);
+            checked += 1;
+        }
+    }
+    try t.expectEqual(2, checked);
+}
+
+test "a_redirect_from_https_to_http_or_off_the_web_is_refused" {
+    try t.expect(hopRefusal("https://a.example/x", "http://a.example/y") != null);
+    try t.expect(hopRefusal("https://a.example/x", "file:///etc/passwd") != null);
+    try t.expect(hopRefusal("http://a.example/x", "https://b.example/y") == null);
+    try t.expect(hopRefusal("https://a.example/x", "https://b.example/y") == null);
 }
 
 test "search_returns_titles_and_links" {

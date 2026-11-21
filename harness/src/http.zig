@@ -277,8 +277,13 @@ pub const Client = struct {
         }
         var hit = head.iterateHeaders();
         while (hit.next()) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) resp.retry_after_s = std.fmt.parseInt(u32, std.mem.trim(u8, h.value, " "), 10) catch null;
+            if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) {
+                resp.retry_after_s = std.fmt.parseInt(u32, std.mem.trim(u8, h.value, " "), 10) catch null;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "location") and resp.location == null) {
+                resp.location = try c.gpa.dupe(u8, std.mem.trim(u8, h.value, " \t"));
+            }
         }
+        errdefer if (resp.location) |l| c.gpa.free(l);
         conn.keep = head.keep_alive;
         const no_body = req.method == .GET and head.content_length == null and head.transfer_encoding == .none and head.keep_alive;
         const buf = try c.gpa.alloc(u8, body_buf_len);
@@ -313,6 +318,9 @@ pub const Response = struct {
     content_type_len: usize = 0,
     /// The answer's retry-after, in seconds, when it gave one.
     retry_after_s: ?u32 = null,
+    /// Where a redirect points (its Location header, as sent), when the
+    /// answer has one.
+    location: ?[]u8 = null,
     ended: bool = false,
 
     pub fn contentType(r: *const Response) []const u8 {
@@ -351,6 +359,7 @@ pub const Response = struct {
     pub fn deinit(r: *Response) void {
         const c = r.client;
         c.gpa.free(r.body_buf);
+        if (r.location) |l| c.gpa.free(l);
         const conn = c.conn orelse return;
         if (!(r.ended and conn.keep and conn.reader.state == .ready)) c.drop();
     }
@@ -390,6 +399,20 @@ test "a_server_address_is_split_into_its_parts" {
     const d = try Target.parse("http://[::1]:8000");
     try testing.expectEqualStrings("::1", d.host);
     try testing.expectEqual(@as(u16, 8000), d.port);
+}
+
+test "a_redirect_says_where_it_points" {
+    const model = @import("model.zig");
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try e.tmp.dir.writeFile(testing.io, .{ .sub_path = "pages/old.redirect", .data = "301 /page/new" });
+    var c = Client.init(testing.allocator, testing.io, try Target.parse(try e.url()));
+    defer c.deinit();
+    var resp = try c.send(.{ .method = .GET, .path = "/page/old" });
+    defer resp.deinit();
+    try testing.expectEqual(301, resp.status);
+    try testing.expectEqualStrings("/page/new", resp.location.?);
 }
 
 test "addresses_that_are_not_servers_are_refused" {

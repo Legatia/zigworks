@@ -15,6 +15,14 @@ pub const List = struct {
     /// a snapshot live as long as the list.
     arena: std.heap.ArenaAllocator,
     items: std.ArrayList(scrub.Secret) = .empty,
+    /// Told after a value is added (outside the lock): the log and memory
+    /// keep their own copy of the list and take the new one.
+    on_change: ?Hook = null,
+
+    pub const Hook = struct {
+        ctx: *anyopaque,
+        changed: *const fn (ctx: *anyopaque) void,
+    };
 
     pub fn init(gpa: std.mem.Allocator, io: Io) List {
         return .{ .io = io, .arena = .init(gpa) };
@@ -29,12 +37,15 @@ pub const List = struct {
     /// already there, is not added.
     pub fn add(l: *List, name: []const u8, value: []const u8) !void {
         if (value.len == 0) return;
-        l.mutex.lockUncancelable(l.io);
-        defer l.mutex.unlock(l.io);
-        for (l.items.items) |x| if (std.mem.eql(u8, x.value, value)) return;
-        const a = l.arena.allocator();
-        const v = try a.dupe(u8, value);
-        try l.items.append(a, .{ .name = try a.dupe(u8, name), .value = v });
+        {
+            l.mutex.lockUncancelable(l.io);
+            defer l.mutex.unlock(l.io);
+            for (l.items.items) |x| if (std.mem.eql(u8, x.value, value)) return;
+            const a = l.arena.allocator();
+            const v = try a.dupe(u8, value);
+            try l.items.append(a, .{ .name = try a.dupe(u8, name), .value = v });
+        }
+        if (l.on_change) |h| h.changed(h.ctx);
     }
 
     /// The values now, in a slice of `a` (the strings stay the list's).

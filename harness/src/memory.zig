@@ -5,6 +5,7 @@
 //! closer the match must be.
 const std = @import("std");
 const util = @import("util.zig");
+const scrub = @import("scrub.zig");
 const Io = std.Io;
 
 pub const Level = enum { pinned, top, middle, bottom };
@@ -94,6 +95,68 @@ fn isWordByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c >= 0x80;
 }
 
+/// Whether two texts that share their key words can be the same fact: a
+/// correction usually changes a number ("at 9" → "at 10") or denies what
+/// the other says, and is then a new item, not a repeat.
+pub fn sameFacts(a: []const u8, b: []const u8) bool {
+    if (negations(a) != negations(b)) return false;
+    var na: [16][]const u8 = undefined;
+    var nb: [16][]const u8 = undefined;
+    const xa = numbers(a, &na);
+    const xb = numbers(b, &nb);
+    if (xa.len != xb.len) return false;
+    const lt = struct {
+        fn f(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.f;
+    std.mem.sort([]const u8, xa, {}, lt);
+    std.mem.sort([]const u8, xb, {}, lt);
+    for (xa, xb) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+/// How many words of `text` deny something: not, no, never, … and any
+/// word ending in n't.
+fn negations(text: []const u8) usize {
+    const words_that_deny = [_][]const u8{ "not", "no", "never", "none", "nothing", "nobody", "nowhere", "neither", "nor", "cannot", "without" };
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        while (i < text.len and !isWordByte(text[i]) and text[i] != '\'') i += 1;
+        const start = i;
+        while (i < text.len and (isWordByte(text[i]) or text[i] == '\'')) i += 1;
+        const w = text[start..i];
+        if (w.len == 0) continue;
+        if (std.ascii.endsWithIgnoreCase(w, "n't") or std.ascii.endsWithIgnoreCase(w, "n\u{2019}t")) {
+            n += 1;
+            continue;
+        }
+        for (words_that_deny) |d| if (std.ascii.eqlIgnoreCase(w, d)) {
+            n += 1;
+            break;
+        };
+    }
+    return n;
+}
+
+/// The numbers in `text` ("9", "10:30", "3.5"), the first `out.len` of them.
+fn numbers(text: []const u8, out: [][]const u8) [][]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and n < out.len) {
+        if (!std.ascii.isDigit(text[i])) {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        while (i < text.len and (std.ascii.isDigit(text[i]) or ((text[i] == '.' or text[i] == ',' or text[i] == ':') and i + 1 < text.len and std.ascii.isDigit(text[i + 1])))) i += 1;
+        out[n] = text[start..i];
+        n += 1;
+    }
+    return out[0..n];
+}
+
 /// Fraction of the item's terms that appear among `ws`.
 pub fn match(terms: []const []const u8, ws: []const []const u8) f64 {
     if (terms.len == 0) return 0;
@@ -123,6 +186,8 @@ pub const Store = struct {
     io: Io,
     dir: []u8,
     items: std.ArrayList(*Item) = .empty,
+    /// Stored secrets: masked as `[secret:NAME]` in every item written.
+    secrets: []const scrub.Secret = &.{},
 
     pub fn load(gpa: std.mem.Allocator, io: Io, dir: []const u8) !Store {
         try Io.Dir.cwd().createDirPath(io, dir);
@@ -133,9 +198,12 @@ pub const Store = struct {
         var it = d.iterate();
         while (try it.next(io)) |e| {
             if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".md")) continue;
+            // the file's name is the item's id, whatever its text says
+            const id = e.name[0 .. e.name.len - 3];
+            if (!validId(id)) continue;
             const text = d.readFileAlloc(io, e.name, gpa, .limited(64 * 1024)) catch continue;
             defer gpa.free(text);
-            const item = parseItem(gpa, text) catch continue;
+            const item = parseItem(gpa, id, text) catch continue;
             try s.items.append(gpa, item);
         }
         // a stable order for ties
@@ -161,12 +229,24 @@ pub const Store = struct {
         return null;
     }
 
-    /// Writes a new item, or adds a mention to one it nearly repeats.
+    /// Who is writing an item.
+    pub const From = enum { owner, other };
+
+    /// The owner's own words (`/remember`): writes a new item, or adds a
+    /// mention to one it nearly repeats.
     pub fn add(s: *Store, body_in: []const u8, given_terms: ?[]const []const u8, now_s: i64) !AddResult {
+        return s.addFrom(body_in, given_terms, now_s, .owner);
+    }
+
+    /// Like `add`; an item nearly repeated by `.other` (the agent, the
+    /// memory writer) gets no mention, as only the owner's words count.
+    pub fn addFrom(s: *Store, body_in: []const u8, given_terms: ?[]const []const u8, now_s: i64, from: From) !AddResult {
         var arena: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const body = std.mem.trim(u8, util.cut(body_in, max_body), " \t\r\n");
+        var sc = try scrub.Scrubber.init(a, s.secrets);
+        const masked = try sc.scrubAlloc(a, body_in);
+        const body = std.mem.trim(u8, util.cut(masked, max_body), " \t\r\n");
         if (body.len == 0) return error.EmptyMemory;
         var ts = if (given_terms) |g| blk: {
             var lowered: std.ArrayList([]const u8) = .empty;
@@ -180,8 +260,8 @@ pub const Store = struct {
         if (ts.len == 0) ts = try words(a, body);
         for (s.items.items) |it| {
             const overlap = match(ts, @ptrCast(it.terms));
-            if (ts.len > 0 and overlap >= same_item) {
-                try s.mention(it, now_s);
+            if (ts.len > 0 and overlap >= same_item and sameFacts(body, it.body)) {
+                if (from == .owner) try s.mention(it, now_s);
                 return .{ .id = it.id, .merged = true };
             }
         }
@@ -364,13 +444,33 @@ pub const Store = struct {
     }
 };
 
+/// What the owner is told when the agent or the memory writer saves an
+/// item: one line, with how to take it back.
+pub fn savedNote(arena: std.mem.Allocator, id: []const u8, body: []const u8) ![]u8 {
+    const short = util.cut(body, 200);
+    const line = try std.mem.replaceOwned(u8, arena, short, "\n", " ");
+    return std.fmt.allocPrint(arena, "Saved to memory: {s}{s} (/forget {s})", .{ line, if (short.len < body.len) "…" else "", id });
+}
+
 fn firstLine(s: []const u8) []const u8 {
     return s[0 .. std.mem.indexOfScalar(u8, s, '\n') orelse s.len];
 }
 
-fn parseItem(gpa: std.mem.Allocator, text: []const u8) !*Item {
+/// An id that names a file in the memory folder and nothing else.
+fn validId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 40 or std.mem.indexOf(u8, id, "..") != null) return false;
+    for (id) |c| if (c == '/' or c == '\\' or c < ' ' or c == 0x7f) return false;
+    return true;
+}
+
+/// A time read from an item's file; none before 1970.
+fn parseTime(v: []const u8) ?i64 {
+    const x = util.parseIso(v) orelse return null;
+    return if (x >= 0) x else null;
+}
+
+fn parseItem(gpa: std.mem.Allocator, id_s: []const u8, text: []const u8) !*Item {
     const sep = std.mem.indexOf(u8, text, "\n---\n") orelse return error.BadItem;
-    var id: ?[]const u8 = null;
     var created: ?i64 = null;
     var pinned = false;
     var mentions_line: []const u8 = "";
@@ -380,16 +480,15 @@ fn parseItem(gpa: std.mem.Allocator, text: []const u8) !*Item {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const key = line[0..colon];
         const val = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
-        if (std.mem.eql(u8, key, "id")) id = val else if (std.mem.eql(u8, key, "created")) {
-            created = util.parseIso(val);
+        if (std.mem.eql(u8, key, "created")) {
+            created = parseTime(val);
         } else if (std.mem.eql(u8, key, "pinned")) {
             pinned = std.mem.eql(u8, val, "yes");
         } else if (std.mem.eql(u8, key, "mentions")) {
             mentions_line = val;
         } else if (std.mem.eql(u8, key, "terms")) terms_line = val;
     }
-    const id_s = id orelse return error.BadItem;
-    if (id_s.len == 0 or id_s.len > 40) return error.BadItem;
+    if (!validId(id_s)) return error.BadItem;
     const item = try gpa.create(Item);
     errdefer gpa.destroy(item);
     var tl: std.ArrayList([]u8) = .empty;
@@ -409,7 +508,7 @@ fn parseItem(gpa: std.mem.Allocator, text: []const u8) !*Item {
     item.* = .{ .id = id_owned, .created_s = created orelse 0, .pinned = pinned, .terms = try tl.toOwnedSlice(gpa), .body = body };
     var mw = std.mem.tokenizeAny(u8, mentions_line, " \t");
     while (mw.next()) |m| {
-        if (util.parseIso(m)) |v| try item.mentions.append(gpa, v);
+        if (parseTime(m)) |v| try item.mentions.append(gpa, v);
     }
     if (item.mentions.items.len == 0) try item.mentions.append(gpa, item.created_s);
     return item;
@@ -549,6 +648,49 @@ test "near_duplicate_becomes_a_mention" {
     try t.expectEqual(2, f.store.items.items[0].mentions.items.len);
 }
 
+test "a_correction_is_not_merged_into_the_fact_it_corrects" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const nine = try f.store.add("Owner's flight to Oslo leaves at 9 am", null, now - day);
+    const ten = try f.store.add("Owner's flight to Oslo leaves at 10 am", null, now);
+    try t.expect(!ten.merged);
+    try t.expect(!std.mem.eql(u8, nine.id, ten.id));
+    _ = try f.store.add("The owner likes coffee", null, now - day);
+    try t.expect(!(try f.store.add("The owner does not like coffee", null, now)).merged);
+    _ = try f.store.add("The owner can't stand loud music at dinner", null, now - day);
+    try t.expect(!(try f.store.add("The owner can stand loud music at dinner", null, now)).merged);
+    // a plain repeat still merges, into the item it agrees with
+    const again = try f.store.add("Owner's flight to Oslo leaves at 10 am sharp", null, now);
+    try t.expect(again.merged);
+    try t.expectEqualStrings(ten.id, again.id);
+    try t.expectEqual(6, f.store.items.items.len);
+}
+
+test "a_repeat_by_the_agent_or_the_writer_is_not_a_mention" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const first = try f.store.add("User follows Zig compiler releases", null, now - day);
+    const again = try f.store.addFrom("The user follows zig compiler releases closely", null, now, .other);
+    try t.expect(again.merged);
+    try t.expectEqualStrings(first.id, again.id);
+    try t.expectEqual(1, f.store.items.items[0].mentions.items.len);
+}
+
+test "a_secret_in_an_item_is_masked" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    f.store.secrets = &.{.{ .name = "omnigate", .value = "og-secret-value-123" }};
+    const r = try f.store.add("my omnigate key is og-secret-value-123", null, now);
+    try t.expectEqualStrings("my omnigate key is [secret:omnigate]", f.store.find(r.id).?.body);
+    var d = try Io.Dir.cwd().openDir(t.io, f.store.dir, .{});
+    defer d.close(t.io);
+    const file = try d.readFileAlloc(t.io, try std.fmt.allocPrint(f.arena.allocator(), "{s}.md", .{r.id}), f.arena.allocator(), .unlimited);
+    try t.expect(std.mem.indexOf(u8, file, "og-secret-value-123") == null);
+}
+
 test "files_round_trip" {
     var f: Fix = undefined;
     try f.init();
@@ -565,6 +707,54 @@ test "files_round_trip" {
     try t.expectEqual(it.created_s, back.created_s);
     try t.expectEqual(it.terms.len, back.terms.len);
     try t.expect(std.mem.startsWith(u8, it.id, "20261130-"));
+}
+
+test "an_items_id_is_its_file_name" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const it = try f.addAt("Prefers tea in the morning", now - day);
+    const id = try a.dupe(u8, it.id);
+    var d = try Io.Dir.cwd().openDir(t.io, f.store.dir, .{});
+    defer d.close(t.io);
+    const text = try d.readFileAlloc(t.io, try std.fmt.allocPrint(a, "{s}.md", .{id}), a, .unlimited);
+    // a copy under another name is an item of its own
+    try d.writeFile(t.io, .{ .sub_path = "backup.md", .data = text });
+    // an id line naming a place outside the folder counts for nothing
+    try d.writeFile(t.io, .{ .sub_path = "planted.md", .data = "id: ../escaped\ncreated: 2026-11-01T00:00:00Z\nmentions: 2026-11-01T00:00:00Z\npinned: no\nterms: planted\n---\nplanted item\n" });
+    try d.writeFile(t.io, .{ .sub_path = "...md", .data = text });
+    var s2 = try Store.load(t.allocator, t.io, f.store.dir);
+    defer s2.deinit();
+    try t.expectEqual(3, s2.items.items.len);
+    try t.expect(s2.find("backup") != null);
+    try t.expect(s2.find("../escaped") == null);
+    _ = try s2.setPinned("planted", true);
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().access(t.io, try std.fs.path.join(a, &.{ f.store.dir, "..", "escaped.md" }), .{}));
+    // forget removes the item asked for; the copy stays, as its own item
+    try t.expect(try s2.forget(id));
+    var s3 = try Store.load(t.allocator, t.io, f.store.dir);
+    defer s3.deinit();
+    try t.expect(s3.find(id) == null);
+    try t.expect(s3.find("backup") != null);
+}
+
+test "an_item_with_a_date_no_clock_shows_is_read_without_a_crash" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    var d = try Io.Dir.cwd().openDir(t.io, f.store.dir, .{});
+    defer d.close(t.io);
+    try d.writeFile(t.io, .{ .sub_path = "old.md", .data = "id: old\ncreated: -001-01-01T00:00:00Z\nmentions: -001-01-01T00:00:00Z\npinned: no\nterms: ancient\n---\nvery old\n" });
+    var s2 = try Store.load(t.allocator, t.io, f.store.dir);
+    defer s2.deinit();
+    const it = s2.find("old").?;
+    try s2.save(it);
+    _ = try s2.render(f.arena.allocator(), now, 20);
+    try t.expect(it.created_s >= 0);
+    // and a time before year 0 prints, if it ever comes to that
+    var tb: [20]u8 = undefined;
+    try t.expectEqualStrings("0000", util.isoTime(&tb, -2100 * 365 * day)[0..4]);
 }
 
 test "forget_removes_file" {
