@@ -188,10 +188,95 @@ bad names/sites; MCP default ask, 24 h grant, money (asked every time, caps, dry
 run); `harness brief` CLI; scheduled ask-means-deny with the skipped note; the
 "no secret in log" check extended to owner messages.
 
-## Pending reports
+## Runtime / platform (A3)
 
-A3 runtime/platform (K1 MCP startup serial, K2 MCP secret needs restart, K3
-browse redirects/env/profile/Keychain).
+Critical:
+- C3 Agent-written files become code run outside the gate: write_file asks
+  nothing; MCP servers (mcp.zig:241) and shell (tools.zig:207) run in the
+  workspace. Verified: planted workspace/.npmrc changes npx's registry (MCP
+  restart on /reload or any CLI command), `python3 -m pkg` runs a planted
+  pkg.py, `git status` (README's allow example) runs core.fsmonitor from a
+  planted .git/config. Fix: MCP servers run in a folder the agent can't
+  write; write_file asks for any path with a component starting with "."
+  (default ask, grants allowed).
+- C4 Telegram clients use freed memory after /reload (and /topic, /task
+  add|rm, which reload): main.zig:534,540 pass c.cfg.chat.api from the
+  settings arena freed at core.zig:443 (http Target points into it,
+  http.zig:35). Real bot likely deaf until restart. Copy the URL into a
+  long-lived allocation; rebuild the bots on reload.
+
+Important:
+- I25 write_file escapes the workspace through a dangling symlink (confine,
+  gate.zig:199-209, walks past an unresolved final component; tools.zig:101
+  creates the target). Refuse a final component that is a symlink; open
+  without following.
+- I26 The lock doesn't hold: check-then-write race (core.zig:1507-1524; 18/40
+  simultaneous starts both ran → broken log chain, per-process money
+  ledgers); EPERM pid counts alive after reboot (core.zig:1502); Windows never
+  checks the pid (core.zig:1500) and whichever exits first deletes the lock
+  (core.zig:1527). Hold an exclusive lock file (createFile .lock=.exclusive,
+  nonblocking) for the process lifetime. (Signals: see I20.)
+- I27 Windows: output reader threads joined without a time limit
+  (tools.zig:224-229, mcp.zig:414-415, page.zig:1212-1215); a grandchild
+  holding the pipe (start /b, MSBuild, gradle, npx .cmd) hangs the call,
+  /stop and /reload. Job object with KILL_ON_JOB_CLOSE + TerminateJobObject;
+  bounded drain. → Windows session (handoff), can't be run here.
+- I28 (= I5, wider) path deny rules match the raw argument: `./private/k`,
+  `a/../private/k`, absolute paths, `Private/k` on case-insensitive volumes,
+  `private\k`. Match the confined, normalized, workspace-relative path,
+  case-folded where the volume is case-insensitive.
+
+Minor: Windows hidden input echoes under mintty/MSYS (main.zig:794-799 unchecked
+console-mode calls) → Windows handoff; mcp.ini secret names unvalidated
+(mcp.zig:73-77): wincred target() writes [128]u16 unbounded (store.zig:186-198),
+dir store reads `../config.ini`; Credential Manager 2560-byte cap vs 64 KiB
+accepted with a vague error.
+K1 present (core.zig:814-855, mcp.zig:180; reload holds queue/settings
+mutexes so /stop waits): start in parallel under one deadline, skip for memory
+and brief, don't hold queue_mutex while starting.
+K2 present (main.zig:91-135, core.zig:830; new secret never masked,
+core.zig:267-272): fetch missing names from the store in startMcp and add them
+to the mask list.
+K3 present (page.zig:1181-1201 and cdp.zig:216 pass the whole environment, no
+--use-mock-keychain/--password-store=basic; profile removed only by defer;
+grant covers the first host only): reduced environment, both flags, sweep
+state/harness-browser-* at open, --host-resolver-rules to keep browse on the
+granted host.
+
+## Assignment (parallel builders, one worktree and branch each)
+
+- G1 gate, approvals, tool output — branch fix/gate: C2, C3 (write_file
+  dot-path ask), I4, I5/I28, I6 (UTF-8 at the tool boundary), I7, I25, K5,
+  K6, A2 minors: grants case, brief sources and deny; A4 minor split(); A5
+  minors: terminal money approval offers 24 h, Ctrl-D with a pending approval.
+  Owns gate.zig, rules.zig, util.zig, tools.zig (shell/read_file/write_file/
+  fetch paging), core.zig askOwner/handleCallback/run flags, main.zig chat
+  approval UI, agent.zig callTool's approval text and rule argument.
+- G2 money, MCP config, model — branch fix/money: C1, I1, I2, I3, K4, K7,
+  mcp.ini secret-name validation, A2 minors: cache ordering, max_tokens tool
+  calls, Timeout retry, ledger write, silent trimming, summary input cap,
+  drop a turn the API rejects (I6 second half); model calls refused without
+  a key or url (A5). Owns agent.zig money/ledger/mcpTools/toolDefs/turn/
+  compact/systemParts, mcp.zig parseConfig, model.zig.
+- D network, briefs, memory, log, Telegram — branch fix/data: C4, I8-I13,
+  I17, I18, I22, A4 minors (midnight day, /brief reply, private gaps, HMAC
+  hashes, memory ids/paths/isoTime), A5 minors (re-pair reply, task before
+  pairing, `log verify` with no log). Owns http.zig, telegram.zig, feeds.zig,
+  brief.zig, memory.zig, log.zig, tools.zig get(), core.zig briefs/tasks/
+  scheduler/memory writer/private/pair, main.zig Telegram channel.
+- W browser and logins — branch fix/web: I14, I15, I16, A1 minors, K3, K8-K16,
+  K18, A5 minors (`--site` single label, login add/rm messages). Owns web.zig,
+  cdp.zig, logins.zig, totp.zig, scrub.zig, page.zig, main.zig loginCmd.
+- R runtime, CLI, store — branch fix/runtime: C3 (MCP servers' folder), I19,
+  I20, I21, I23, I26, K1, K2, K12 (Core-owned mask list behind a lock, with a
+  hook web uses), A3 minors (wincred bounds and size cap), A5 minors (names
+  starting with "-", settings errors name file/line, permission hint, health,
+  default omnigate url removed); writes harness/HANDOFF-windows-audit.md for
+  I27 and the mintty echo. Owns core.zig open/settings/lock/reload/startMcp/
+  health/status/secret list, main.zig args/signals/secret cmd/App.store,
+  store.zig, config.zig, mcp.zig Server.start, skills.zig.
+- After the merge: README and docs (I24 and every doc note the builders
+  report), smoke gaps, full suite, cross builds, CI.
 
 ## Fix ledger
 
