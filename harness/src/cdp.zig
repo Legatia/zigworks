@@ -6,6 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
+const page = @import("page.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -161,6 +162,10 @@ pub const Session = struct {
     child: std.process.Child = undefined,
     /// `child` is set: there is a process to end.
     spawned: bool = false,
+    /// The browser was reaped: its pid and group id may be another's now.
+    reaped: std.atomic.Value(bool) = .init(false),
+    /// Group signals sent after that (must stay 0).
+    late_signals: std.atomic.Value(u32) = .init(0),
     to_chrome: ?Io.File = null,
     from_chrome: ?Io.File = null,
     reader: ?std.Thread = null,
@@ -319,8 +324,16 @@ pub const Session = struct {
     fn killGroup(s: *Session) void {
         if (is_windows) return else {
             if (s.pid == 0) return;
-            std.posix.kill(-s.pid, .KILL) catch {};
+            s.signalGroup();
             std.posix.kill(s.pid, .KILL) catch {};
+        }
+    }
+
+    /// SIGKILL to the browser's process group.
+    fn signalGroup(s: *Session) void {
+        if (is_windows) return else {
+            if (s.reaped.load(.acquire)) _ = s.late_signals.fetchAdd(1, .acq_rel);
+            std.posix.kill(-s.pid, .KILL) catch {};
         }
     }
 
@@ -504,11 +517,17 @@ pub const Session = struct {
             }
             s.closed = true;
             s.killGroup();
-            if (s.child.id != null) _ = s.child.wait(s.io) catch {};
-            // its helpers too, should one have kept the group alive
-            std.posix.kill(-s.pid, .KILL) catch {};
+            // the reader kills too (on a stop): it ends before the reap
             s.ended.store(true, .release);
             if (s.reader) |th| th.join();
+            if (s.child.id != null) {
+                // ended, not reaped: the group id is still the browser's
+                page.waitExited(s.pid);
+                // its helpers too, should one have outlived the first kill
+                s.signalGroup();
+                _ = s.child.wait(s.io) catch {};
+            }
+            s.reaped.store(true, .release);
             if (s.to_chrome) |f| f.close(s.io);
             if (s.from_chrome) |f| f.close(s.io);
         }
@@ -557,7 +576,6 @@ test "messages_are_split_at_nul_and_events_skipped" {
 /// Chrome, for the tests that need one; null skips them.
 pub fn testBrowser(a: Allocator) !?[]const u8 {
     if (is_windows) return null;
-    const page = @import("page.zig");
     const env_chrome: []const u8 = if (t.environ.getPosix("HARNESS_CHROME")) |v| v else "";
     const env_path: []const u8 = if (t.environ.getPosix("PATH")) |v| v else "";
     return page.findBrowser(a, t.io, "", env_chrome, env_path);
@@ -619,6 +637,28 @@ test "a_browser_that_fails_to_start_leaves_nothing_allocated" {
         s.destroy();
         return error.TestUnexpectedResult;
     } else |_| {}
+}
+
+test "chrome_is_never_signalled_after_it_was_reaped" {
+    // once reaped, its pid and group id can be given to another process
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const browser = (try testBrowser(a)) orelse return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const profile = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    for ([_]bool{ false, true }) |stopped| {
+        var stop: std.atomic.Value(bool) = .init(false);
+        const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000);
+        defer s.destroy();
+        try t.expectEqualStrings("2", try s.evaluate(a, "1+1"));
+        // a stop: the reader kills the group again and again until it sees the pipe close
+        if (stopped) stop.store(true, .release);
+        s.close();
+        try t.expect(s.reaped.load(.acquire));
+        try t.expectEqual(0, s.late_signals.load(.acquire));
+    }
 }
 
 test "chrome_ends_when_harness_goes_away" {

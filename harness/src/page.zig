@@ -1136,6 +1136,8 @@ const Watch = struct {
     deadline_ns: i128,
     done: std.atomic.Value(bool) = .init(false),
     reason: ?Ended = null,
+    /// The browser was reaped: its pid and group id may be another's now.
+    reaped: std.atomic.Value(bool) = .init(false),
 
     fn run(w: *Watch) void {
         while (!w.done.load(.acquire)) {
@@ -1149,20 +1151,58 @@ const Watch = struct {
             }
             w.io.sleep(.fromMilliseconds(50), .awake) catch {};
         }
-        if (w.reason != null) killAll(w.id);
+        if (w.reason != null) w.killAll();
+    }
+
+    /// The whole process group on POSIX (the browser's helpers go too);
+    /// the process itself on Windows.
+    fn killAll(w: *Watch) void {
+        if (is_windows) {
+            _ = std.os.windows.ntdll.NtTerminateProcess(w.id, @fromBackingInt(@intCast(1)));
+        } else {
+            w.killGroup();
+            std.posix.kill(w.id, .KILL) catch {};
+        }
+    }
+
+    fn killGroup(w: *Watch) void {
+        if (is_windows) return else {
+            if (w.reaped.load(.acquire)) _ = late_group_kills.fetchAdd(1, .acq_rel);
+            std.posix.kill(-w.id, .KILL) catch {};
+        }
     }
 };
 
-/// The whole process group on POSIX (the browser's helpers go too); the
-/// process itself on Windows.
-fn killAll(id: std.process.Child.Id) void {
-    if (is_windows) {
-        _ = std.os.windows.ntdll.NtTerminateProcess(id, @fromBackingInt(@intCast(1)));
-    } else {
-        std.posix.kill(-id, .KILL) catch {};
-        std.posix.kill(id, .KILL) catch {};
+/// Group kills sent after the browser was reaped (must stay 0; for tests).
+pub var late_group_kills: std.atomic.Value(u32) = .init(0);
+
+/// Blocks until the child `pid` has ended, without reaping it: until it is
+/// reaped, its pid and its process group id stay its own, so its group can
+/// still be killed safely. (Elsewhere than Linux and macOS: at once.)
+pub fn waitExited(pid: std.posix.pid_t) void {
+    switch (builtin.os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            var info: linux.siginfo_t = undefined;
+            while (true) switch (linux.errno(linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOWAIT, null))) {
+                .INTR => continue,
+                else => return,
+            };
+        },
+        .macos => {
+            // <sys/wait.h>: P_PID 1, WEXITED 0x4, WNOWAIT 0x20
+            var info: [256]u8 align(16) = undefined;
+            while (true) {
+                if (darwin_waitid(1, @intCast(pid), &info, 0x4 | 0x20) == 0) return;
+                if (std.c.errno(@as(c_int, -1)) != .INTR) return;
+            }
+        },
+        else => {},
     }
 }
+
+extern "c" fn waitid(idtype: c_int, id: c_uint, infop: *anyopaque, options: c_int) c_int;
+const darwin_waitid = if (builtin.os.tag == .macos) waitid else undefined;
 
 /// Renders `url` in a headless browser with a fresh throwaway profile and
 /// returns the DOM as HTML (at most max_bytes). Ends it on `stop`
@@ -1220,16 +1260,24 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
         defer out_f.close(io);
         var ended: std.atomic.Value(bool) = .init(false);
         const th_out = try std.Thread.spawn(.{}, Collector.pumpUntil, .{ &col, io, out_f, &ended });
-        term = child.wait(io) catch null;
+        // ended (on its own, or killed by the watch) but not reaped: its
+        // group id is still its own, and the watch kills nothing after this
+        waitExited(watch.id);
+        watch.done.store(true, .release);
+        th_watch.join();
         // nothing it started may outlive it
-        std.posix.kill(-watch.id, .KILL) catch {};
+        watch.killGroup();
+        term = child.wait(io) catch null;
+        watch.reaped.store(true, .release);
         var waited: u32 = 0;
         while (!col.finished.load(.acquire) and waited < 2000) : (waited += 20) io.sleep(.fromMilliseconds(20), .awake) catch {};
         ended.store(true, .release);
         th_out.join();
     }
-    watch.done.store(true, .release);
-    th_watch.join();
+    if (is_windows) {
+        watch.done.store(true, .release);
+        th_watch.join();
+    }
 
     if (watch.reason) |r| return switch (r) {
         .stopped => error.Stopped,
@@ -1656,6 +1704,29 @@ test "render_stops_and_times_out_and_cleans_up" {
     defer dir.close(t.io);
     var it = dir.iterate();
     try t.expectEqual(@as(?Io.Dir.Entry, null), try it.next(t.io));
+}
+
+test "render_never_kills_a_group_after_the_browser_was_reaped" {
+    // once reaped, its pid and group id can be given to another process
+    if (is_windows) return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "quick", .data = "#!/bin/sh\necho '<html><body><p>dom</p></body></html>'\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "slow", .data = "#!/bin/sh\nsleep 30 &\nsleep 30\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    for ([_][]const u8{ "quick", "slow" }) |n| {
+        var f = try tmp.dir.openFile(t.io, n, .{});
+        defer f.close(t.io);
+        try f.setPermissions(t.io, .fromMode(0o755));
+    }
+    var stop: std.atomic.Value(bool) = .init(false);
+    const before = late_group_kills.load(.acquire);
+    _ = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", root, &stop, 5000, 1 << 20);
+    try t.expectError(error.Timeout, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "slow" }), "http://example.com/", root, &stop, 300, 1 << 20));
+    try t.expectEqual(before, late_group_kills.load(.acquire));
 }
 
 test "render_example_com_with_a_real_browser" {
