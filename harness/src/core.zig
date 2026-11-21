@@ -234,6 +234,8 @@ pub const Core = struct {
     home_owned: []u8,
     /// Said to the owner when a channel is attached.
     pending_warning: ?[]const u8 = null,
+    /// What /reload says when the settings files have an error.
+    problem_buf: [800]u8 = undefined,
 
     pub fn now(c: *const Core) i64 {
         return c.fixed_now orelse util.nowSeconds(c.io);
@@ -324,6 +326,7 @@ pub const Core = struct {
         c.system_vars = &.{};
         c.told_settings_changed = false;
         c.pending_warning = null;
+        // problem_buf: written before it is read
         c.loadRan();
         c.checkLogAgainstStatus();
         try c.log.write(.config, false, .{ .event = "start", .pid = pidNumber() });
@@ -430,7 +433,7 @@ pub const Core = struct {
             c.tasks = saved_tasks;
             c.login_list = saved_logins;
             c.settings_hash = saved_hash;
-            return "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, logins.ini and mcp.ini.";
+            return c.settingsErrorReply();
         };
         // the chat's client points into the old settings: build it again
         const client = model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens) catch {
@@ -455,6 +458,16 @@ pub const Core = struct {
         c.startMcp();
         try c.log.write(.config, false, .{ .event = "reload" });
         return "Settings reloaded.";
+    }
+
+    /// The answer to a /reload the settings files refused, naming the file
+    /// and line (in `problem_buf`).
+    fn settingsErrorReply(c: *Core) []const u8 {
+        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, logins.ini and mcp.ini.";
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const why = (settingsProblem(c.io, arena.allocator(), c.paths) catch return generic) orelse return generic;
+        return std.fmt.bufPrint(&c.problem_buf, "The settings files have an error; nothing changed: {s}", .{why}) catch generic;
     }
 
     fn checkSettingsChanged(c: *Core) void {
@@ -824,7 +837,8 @@ pub const Core = struct {
         const a = c.mcp_arena.allocator();
         const text = Io.Dir.cwd().readFileAlloc(c.io, c.paths.mcp, a, .limited(1 << 20)) catch return;
         const cfgs = mcp.parseConfig(a, text) catch {
-            c.mcp_note = "mcp.ini has an error; no servers started.";
+            const why = (parseProblem(a, "mcp.ini", text, mcp.parseConfig) catch null) orelse "mcp.ini has an error";
+            c.mcp_note = std.fmt.allocPrint(a, "{s}; no servers started.", .{why}) catch "mcp.ini has an error; no servers started.";
             return;
         };
         var note: std.ArrayList(u8) = .empty;
@@ -1425,6 +1439,74 @@ fn insertInSection(a: std.mem.Allocator, text: []const u8, name: []const u8, lin
 /// what runs (rules, MCP servers' commands) and where values are typed.
 pub fn guardedFiles(p: Paths) [4][]const u8 {
     return .{ p.config, p.rules, p.logins, p.mcp };
+}
+
+/// What is wrong with the settings files, said so the owner can fix it:
+/// the file other users can change, or the file and line that does not
+/// read. Null when nothing is.
+pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
+    if (builtin.os.tag != .windows) {
+        for (guardedFiles(p)) |path| {
+            const st = Io.Dir.cwd().statFile(io, path, .{}) catch continue;
+            if (st.permissions.toMode() & 0o022 != 0)
+                return try std.fmt.allocPrint(a, "{s} can be changed by other users; run chmod 600 {s} (config.ini, rules, logins.ini and mcp.ini must be writable only by you)", .{ path, path });
+        }
+    }
+    inline for (.{
+        .{ p.config, config.parse },
+        .{ p.rules, rules.parse },
+        .{ p.briefs, config.parseBriefs },
+        .{ p.tasks, config.parseTasks },
+        .{ p.logins, logins.parse },
+    }) |item| {
+        const text = Io.Dir.cwd().readFileAlloc(io, item[0], a, .limited(1 << 20)) catch |e| switch (e) {
+            error.FileNotFound => "",
+            else => return try std.fmt.allocPrint(a, "{s} can't be read: {s}", .{ item[0], @errorName(e) }),
+        };
+        if (try parseProblem(a, std.fs.path.basename(item[0]), text, item[1])) |why| return why;
+    }
+    return null;
+}
+
+/// "rules line 3 has an error: alow shell ls"; null when `text` reads.
+pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, comptime parseFn: anytype) !?[]const u8 {
+    var scratch: std.heap.ArenaAllocator = .init(a);
+    defer scratch.deinit();
+    if (parseFn(scratch.allocator(), text)) |_| return null else |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {},
+    }
+    const n = badLine(&scratch, text, parseFn);
+    if (n == 0) return try std.fmt.allocPrint(a, "{s} has an error", .{name});
+    var it = std.mem.splitScalar(u8, text, '\n');
+    var line: []const u8 = "";
+    for (0..n) |_| line = it.next() orelse "";
+    return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80) });
+}
+
+/// The first line of `text` that does not read: the one after the longest
+/// start of the text that still parses (an unfinished section counts from
+/// its header). 0 for files too long to search this way.
+fn badLine(scratch: *std.heap.ArenaAllocator, text: []const u8, comptime parseFn: anytype) usize {
+    // ends[j]: where the first j lines end
+    var ends: [2001]usize = undefined;
+    ends[0] = 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const end = if (std.mem.indexOfScalarPos(u8, text, i, '\n')) |nl| nl + 1 else text.len;
+        n += 1;
+        if (n >= ends.len) return 0;
+        ends[n] = end;
+        i = end;
+    }
+    var j = n;
+    while (j > 0) {
+        j -= 1;
+        _ = scratch.reset(.retain_capacity);
+        if (parseFn(scratch.allocator(), text[0..ends[j]])) |_| return j + 1 else |_| {}
+    }
+    return 1;
 }
 
 pub const LoginState = struct { password: bool = false, totp: bool = false, passkeys: usize = 0, passkeys_stored: bool = false };
@@ -2101,4 +2183,35 @@ test "mcp_ini_is_guarded_and_watched_like_config_ini" {
     try mf.setPermissions(t.io, .fromMode(0o666));
     mf.close(t.io);
     try t.expect(!std.mem.startsWith(u8, try f.core.reload(), "Settings reloaded"));
+}
+
+test "settings_errors_name_the_file_and_line" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell ls\nalow shell rm -rf x\n" });
+    const r1 = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, r1, "rules line 2") != null);
+    try t.expect(std.mem.indexOf(u8, r1, "alow shell rm") != null);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "" });
+    // the same words for the command line, which opens nothing
+    const old_cfg = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.config, a, .unlimited);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.fmt.allocPrint(a, "{s}[limits]\nsteps_per_turn = many\n", .{old_cfg}) });
+    const n_lines = std.mem.count(u8, old_cfg, "\n");
+    const want = try std.fmt.allocPrint(a, "config.ini line {d}", .{n_lines + 2});
+    try t.expect(std.mem.indexOf(u8, try f.core.reload(), want) != null);
+    const said = (try settingsProblem(t.io, a, f.core.paths)).?;
+    try t.expect(std.mem.indexOf(u8, said, want) != null);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = old_cfg });
+    try t.expectEqual(null, try settingsProblem(t.io, a, f.core.paths));
+    if (builtin.os.tag == .windows) return;
+    // a file others can change: which one, and every file that must not be
+    var cf = try Io.Dir.cwd().openFile(t.io, f.core.paths.config, .{});
+    try cf.setPermissions(t.io, .fromMode(0o666));
+    cf.close(t.io);
+    const perm = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, perm, f.core.paths.config) != null);
+    try t.expect(std.mem.indexOf(u8, perm, "chmod 600") != null);
+    try t.expect(std.mem.indexOf(u8, perm, "config.ini, rules, logins.ini and mcp.ini") != null);
 }

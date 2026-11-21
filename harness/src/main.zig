@@ -84,7 +84,8 @@ const App = struct {
             else => return e,
         };
         return config.parse(app.arena, text) catch {
-            complain("{s} has an error", .{p});
+            const why = (core_mod.parseProblem(app.arena, p, text, config.parse) catch null) orelse "it has an error";
+            complain("{s}", .{why});
             return error.Reported;
         };
     }
@@ -144,7 +145,11 @@ const App = struct {
             switch (e) {
                 error.AlreadyRunning => complain("harness is already running on {s}; talk to it there (or stop it first)", .{app.home}),
                 error.BadUrl => complain("the omnigate url in config.ini ([model] url) is {s}", .{if (cfg.model.url.len == 0) "not set yet" else "not valid"}),
-                error.BadSettings => complain("a settings file in {s} has an error, or config.ini/rules can be changed by other users (chmod 600 them)", .{app.home}),
+                error.BadSettings => {
+                    const paths = core_mod.Paths.init(app.arena, app.home) catch return error.Reported;
+                    const why = (core_mod.settingsProblem(app.io, app.arena, paths) catch null) orelse "a settings file has an error, or one of config.ini, rules, logins.ini and mcp.ini can be changed by other users (chmod 600 them)";
+                    complain("{s}", .{why});
+                },
                 else => complain("can't open {s}: {s}", .{ app.home, @errorName(e) }),
             }
             return error.Reported;
