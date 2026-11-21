@@ -136,7 +136,11 @@ pub const Error = error{ AlreadyRunning, BadSettings, NoModelKey };
 
 const Approval = struct {
     mutex: Io.Mutex = .init,
+    /// The last question's number; it goes on from the last instance's
+    /// (state/approvals), so a button left under an old question in the
+    /// chat never matches a new one.
     id: u32 = 0,
+    loaded: bool = false,
     waiting: bool = false,
     answer: ?agent.Answer = null,
     msg: ?i64 = null,
@@ -636,10 +640,19 @@ pub const Core = struct {
         const id = blk: {
             c.approval.mutex.lockUncancelable(c.io);
             defer c.approval.mutex.unlock(c.io);
+            if (!c.approval.loaded) {
+                c.approval.id = c.loadApprovalId();
+                c.approval.loaded = true;
+            }
+            // kept before the buttons go out: after a restart the numbers go on
+            c.saveApprovalId(c.approval.id + 1) catch break :blk null;
             c.approval.id += 1;
             c.approval.waiting = true;
             c.approval.answer = null;
             break :blk c.approval.id;
+        } orelse {
+            c.say("Could not keep the question's number in state/approvals, so it was not asked: not allowed.");
+            return .deny;
         };
         const once = std.fmt.bufPrint(&id_buf[0], "a{d}:once", .{id}) catch return .deny;
         const day = std.fmt.bufPrint(&id_buf[1], "a{d}:day", .{id}) catch return .deny;
@@ -687,6 +700,26 @@ pub const Core = struct {
         if (msg) |m| ch.clear(ch.ctx, m);
         if (ans == .timeout) c.say("No answer in time; not allowed.");
         return ans;
+    }
+
+    fn approvalsPath(c: *Core, buf: []u8) ![]const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(buf);
+        return std.fs.path.join(fba.allocator(), &.{ c.paths.state, "approvals" });
+    }
+
+    fn loadApprovalId(c: *Core) u32 {
+        var pbuf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const p = c.approvalsPath(&pbuf) catch return 0;
+        var buf: [32]u8 = undefined;
+        const got = Io.Dir.cwd().readFile(c.io, p, &buf) catch return 0;
+        return std.fmt.parseInt(u32, std.mem.trim(u8, got, " \r\n"), 10) catch 0;
+    }
+
+    fn saveApprovalId(c: *Core, id: u32) !void {
+        var pbuf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const p = try c.approvalsPath(&pbuf);
+        var buf: [32]u8 = undefined;
+        try Io.Dir.cwd().writeFile(c.io, .{ .sub_path = p, .data = try std.fmt.bufPrint(&buf, "{d}\n", .{id}) });
     }
 
     /// Telegram's limit for one message, in bytes (it counts characters, and
@@ -1819,6 +1852,34 @@ test "the_owner_is_waited_for_only_until_the_turn_ends" {
     try f.rec.waitFor("BUTTONS Allow this?");
     // approval_seconds is 10 minutes; the turn has 2 s
     try f.rec.waitFor("No answer in time; not allowed.");
+}
+
+test "approval_ids_go_on_after_a_restart_so_an_old_button_answers_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo one\"}"));
+    try f.e.script(2, model.textReply("first done"));
+    try f.core.startWorker();
+    try f.core.handleText("one");
+    try f.rec.waitFor("[a1:once]");
+    f.core.handleCallback(42, "a1:once");
+    try f.rec.waitFor("first done");
+    // a restart: the buttons under the old question are still in the chat
+    f.core.close();
+    f.core = try Core.open(t.allocator, t.io, f.home, .{ .omnigate = "og-key-for-tests", .search = "search-key-123" });
+    f.core.attach(f.rec.channel());
+    try f.e.script(3, model.toolReply("tu_2", "shell", "{\"command\":\"echo two\"}"));
+    try f.e.script(4, model.textReply("second done"));
+    try f.core.startWorker();
+    try f.core.handleText("two");
+    try f.rec.waitFor("[a2:once]");
+    f.core.handleCallback(42, "a1:once");
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expect(f.core.approvalWaiting());
+    f.core.handleCallback(42, "a2:deny");
+    try f.rec.waitFor("second done");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "denied by the owner") != null);
 }
 
 test "stop_ends_running_turn_and_reports" {
