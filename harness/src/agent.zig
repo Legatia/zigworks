@@ -325,6 +325,10 @@ pub const MoneyLedger = struct {
 
     /// Servers whose totals are kept at once.
     pub const max_servers = 64;
+    /// The longest line: a name, a day and a total printed whole (up to
+    /// 309 digits for the largest f64).
+    const max_line = 32 + 1 + 20 + 1 + 330 + 1;
+    const max_file = max_servers * max_line;
     /// A total from before totals were kept per server ("DAY TOTAL"): it
     /// counts for every server, so none can pass its cap on that day.
     const everyone = "*";
@@ -345,7 +349,7 @@ pub const MoneyLedger = struct {
     /// the day from 0.
     pub fn load(l: *MoneyLedger, io: Io) void {
         const p = l.path orelse return;
-        var buf: [8192]u8 = undefined;
+        var buf: [max_file + 1]u8 = undefined;
         const got = Io.Dir.cwd().readFile(io, p, &buf) catch |e| switch (e) {
             error.FileNotFound => return,
             else => return l.setTrouble("the money record (state/money) could not be read ({s})", .{@errorName(e)}),
@@ -464,7 +468,7 @@ pub const MoneyLedger = struct {
     /// half way leaves the old record, not a cut one.
     fn save(l: *MoneyLedger, io: Io, today: i64) !void {
         const p = l.path orelse return;
-        var buf: [max_servers * 80]u8 = undefined;
+        var buf: [max_file]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
         for (l.entries[0..l.len]) |*e| if (e.day >= today) try w.print("{s} {d} {d}\n", .{ e.name(), e.day, e.total });
         var tmp_buf: [4096]u8 = undefined;
@@ -2122,6 +2126,23 @@ test "money_ledger_keeps_a_total_per_server_and_reads_the_old_file" {
     const later = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(1024));
     defer t.allocator.free(later);
     try t.expectEqualStrings("broker 20001 1\n", later);
+}
+
+test "the_money_record_holds_every_server_however_large_its_total" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const p = try std.fs.path.join(t.allocator, &.{ dir, "money" });
+    defer t.allocator.free(p);
+    var l: MoneyLedger = .{ .path = p };
+    var name_buf: [32]u8 = undefined;
+    // with no cap nothing bounds an amount: the largest still fits
+    for (0..MoneyLedger.max_servers) |i| _ = try l.reserve(t.io, try std.fmt.bufPrint(&name_buf, "server-{d}", .{i}), 20000, std.math.floatMax(f64));
+    var again: MoneyLedger = .{ .path = p };
+    again.load(t.io);
+    try t.expectEqual(null, again.trouble());
+    try t.expectEqual(std.math.floatMax(f64), again.spent("server-63", 20000));
 }
 
 test "a_money_record_that_cannot_be_trusted_refuses_money_calls" {
