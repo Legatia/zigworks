@@ -61,6 +61,14 @@ press() {
 	inbox "{\"callback_query\":{\"id\":\"cb$inbox_n\",\"from\":{\"id\":42},\"message\":{\"message_id\":${2:-${b%% *}},\"chat\":{\"id\":42}},\"data\":\"${b#* }\"}}"
 }
 model() { printf '%s' "$2" >"$S/model/$(printf %03d "$1").json"; }
+# the model's requests are answered in order: reply ANSWER is the answer to
+# the next one, req [N] the file of request N (default: the last replied to)
+mn=0
+reply() {
+	mn=$((mn + 1))
+	model $mn "$1"
+}
+req() { printf '%s/requests/%03d.json' "$S" "${1:-$mn}"; }
 text_reply() { printf '{"content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn"}' "$1"; }
 tool_reply() { printf '{"content":[{"type":"tool_use","id":"%s","name":"shell","input":{"command":"%s"}}],"stop_reason":"tool_use"}' "$1" "$2"; }
 sha() { if command -v sha256sum >/dev/null; then printf '%s' "$1" | sha256sum; else printf '%s' "$1" | shasum -a 256; fi | cut -c1-32; }
@@ -105,9 +113,9 @@ check "a login is not added over secrets left from an old one" '! printf "\n\n" 
 
 # a scheduled task, run by hand before the service starts
 printf '[check]\nevery = 5m\ndo = Check the price.\n' >"$HARNESS_HOME/tasks.ini"
-model 1 "$(text_reply 'Price is flat.')"
+reply "$(text_reply 'Price is flat.')"
 check "task run prints the answer" '"$H" task run check 2>/dev/null | grep -qF "[check] Price is flat."'
-check "the model got the omnigate key" 'grep -qF "\"x-api-key\":\"og-smoke-key-123\"" "$S/requests/001.json"'
+check "the model got the omnigate key" 'grep -qF "\"x-api-key\":\"og-smoke-key-123\"" "$(req)"'
 : >"$HARNESS_HOME/tasks.ini"
 
 # a brief source with one item sent before
@@ -133,65 +141,63 @@ say "/pair $CODE"
 check "pairing answers the owner" 'wait_for "$OUT" "Paired."'
 check "a stranger is dropped and logged" 'grep -qF "\"from\":7" "$HARNESS_HOME/log/actions.jsonl"'
 
-model 2 "$(tool_reply tu_1 'echo smoke-ran')"
-model 3 "$(text_reply 'done: smoke-ran')"
+reply "$(tool_reply tu_1 'echo smoke-ran')"
+reply "$(text_reply 'done: smoke-ran')"
 say "run the echo"
 # the buttons carry the question's number and this start's nonce
 check "the shell call asks for approval" 'wait_for "$OUT" "\"inline_keyboard\":[[" && button day | grep -qE "^[0-9]+ a[0-9]+-[0-9a-f]{16}:day$"'
 b=$(button day)
 press day $((${b%% *} + 1))
-check "a press in another message answers nothing" 'wait_for "$OUT" "That button is out of date" && [ ! -f "$S/requests/003.json" ]'
+check "a press in another message answers nothing" 'wait_for "$OUT" "That button is out of date" && [ ! -f "$(req)" ]'
 press day
 check "after approval the answer arrives" 'wait_for "$OUT" "done: smoke-ran"'
-check "the command ran" 'grep -qF "smoke-ran" "$S/requests/003.json"'
+check "the command ran" 'grep -qF "smoke-ran" "$(req)"'
 
-model 4 "$(tool_reply tu_2 'echo smoke-ran')"
-model 5 "$(text_reply 'again done')"
+reply "$(tool_reply tu_2 'echo smoke-ran')"
+reply "$(text_reply 'again done')"
 say "again"
 check "the 24 h grant skips asking" 'wait_for "$OUT" "again done" && [ "$(grep -c "inline_keyboard\":\[\[" "$OUT")" = 1 ]'
 
-model 6 "$(text_reply 'Zig: New item (https://z.org/new)')"
+reply "$(text_reply 'Zig: New item (https://z.org/new)')"
 say "/brief"
 check "the brief has the new item" 'wait_for "$OUT" "Zig: New item (https://z.org/new)"'
-check "the seen item was not sent to the model" '! grep -qF "z.org/old" "$S/requests/006.json"'
+check "the seen item was not sent to the model" '! grep -qF "z.org/old" "$(req)"'
 
-model 7 '{"status":402}'
+reply '{"status":402}'
 say "hello"
 check "a spent budget is reported" 'wait_for "$OUT" "Model budget used up."'
 
 if [ $windows = 0 ]; then
-	model 8 "$(tool_reply tu_3 'sleep 30')"
-	model 9 "$(text_reply 'never')"
+	reply "$(tool_reply tu_3 'sleep 30')"
+	# never asked for: the next reply takes its number
+	model $((mn + 1)) "$(text_reply 'never')"
 	say "sleep"
-	wait_for "$S/requests/008.json" "sleep" 5
+	wait_for "$(req)" "sleep" 5
 	sleep 0.5
 	say "/stop"
 	check "stop ends a running command" 'wait_for "$OUT" "Stopped everything that was running." 10'
-	check "no model call after stop" '[ ! -f "$S/requests/009.json" ]'
+	check "no model call after stop" '[ ! -f "$(req $((mn + 1)))" ]'
 fi
 
 say "/remember I prefer short briefs"
 say "/memory"
 check "a remembered item is listed" 'wait_for "$OUT" "I prefer short briefs"'
 
-# the next model script number: on POSIX the stop check used 8, and 9 (never asked for) is free
-if [ $windows = 0 ]; then m=9; else m=8; fi
 say "/status"
 check "the MCP server started" 'wait_for "$OUT" "MCP: fake (3 tools)"'
-model $m '{"content":[{"type":"tool_use","id":"tu_m","name":"fake__echo","input":{"text":"env"}}],"stop_reason":"tool_use"}'
-model $((m + 1)) "$(text_reply 'mcp done')"
+reply '{"content":[{"type":"tool_use","id":"tu_m","name":"fake__echo","input":{"text":"env"}}],"stop_reason":"tool_use"}'
+reply "$(text_reply 'mcp done')"
 say "use the echo server"
 # the server reports its HOME: the real one, not the default before start-up finished
 # (on Windows that is USERPROFILE, with its backslashes doubled in the JSON)
 if [ $windows = 0 ]; then home_json=$HOME; else home_json=$(printf %s "$USERPROFILE" | sed 's/\\/\\\\/g'); fi
-check "an MCP tool runs through the gate with the real HOME" 'wait_for "$OUT" "mcp done" && grep -qF "home=$home_json" "$S/requests/$(printf %03d $((m + 1))).json"'
-m=$((m + 2))
-model $m '{"content":[{"type":"tool_use","id":"tu_d","name":"delegate","input":{"tasks":[{"task":"part one"},{"task":"part two"}]}}],"stop_reason":"tool_use"}'
-model $((m + 1)) "$(text_reply 'helper said hi')"
-model $((m + 2)) "$(text_reply 'helper said hi')"
-model $((m + 3)) "$(text_reply 'delegated ok')"
+check "an MCP tool runs through the gate with the real HOME" 'wait_for "$OUT" "mcp done" && grep -qF "home=$home_json" "$(req)"'
+reply '{"content":[{"type":"tool_use","id":"tu_d","name":"delegate","input":{"tasks":[{"task":"part one"},{"task":"part two"}]}}],"stop_reason":"tool_use"}'
+reply "$(text_reply 'helper said hi')"
+reply "$(text_reply 'helper said hi')"
+reply "$(text_reply 'delegated ok')"
 say "split this"
-check "helpers answer the agent" 'wait_for "$OUT" "delegated ok" && [ "$(grep -o "helper said hi" "$S/requests/$(printf %03d $((m + 3))).json" | wc -l | tr -d " ")" = 2 ]'
+check "helpers answer the agent" 'wait_for "$OUT" "delegated ok" && [ "$(grep -o "helper said hi" "$(req)" | wc -l | tr -d " ")" = 2 ]'
 
 kill "$RPID" 2>/dev/null
 wait "$RPID" 2>/dev/null
