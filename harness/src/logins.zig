@@ -87,14 +87,11 @@ fn underSite(site: []const u8, host: []const u8) bool {
 }
 
 /// Whether a passkey for `rp_id` belongs to a login for `site`: the site
-/// itself, a name below it, or a parent domain of it that is not a bare
-/// top-level name (`com`).
+/// itself or a name below it, never a parent domain (its passkey would be
+/// good on every name below that, other sites among them).
 pub fn rpIdAllowed(site: []const u8, rp_id: []const u8) bool {
     if (rp_id.len == 0) return false;
-    if (std.mem.eql(u8, rp_id, site)) return true;
-    if (underSite(site, rp_id)) return true;
-    if (underSite(rp_id, site)) return std.mem.indexOfScalar(u8, rp_id, '.') != null;
-    return false;
+    return underSite(site, rp_id);
 }
 
 // ---- placeholders ----
@@ -266,7 +263,10 @@ test "host_binding_follows_the_site" {
 test "passkey_rp_ids_must_belong_to_the_site" {
     try t.expect(rpIdAllowed("github.com", "github.com"));
     try t.expect(rpIdAllowed("github.com", "auth.github.com"));
-    try t.expect(rpIdAllowed("login.github.com", "github.com"));
+    // a parent domain is wider than the site: its passkey would sign in
+    // on every name below it
+    try t.expect(!rpIdAllowed("login.github.com", "github.com"));
+    try t.expect(!rpIdAllowed("a.b.github.com", "b.github.com"));
     try t.expect(!rpIdAllowed("github.com", "com"));
     try t.expect(!rpIdAllowed("login.github.com", "com"));
     try t.expect(!rpIdAllowed("github.com", "evil.com"));
