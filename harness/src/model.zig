@@ -96,16 +96,22 @@ pub const Client = struct {
         deadline_s: i64 = 0,
     };
 
+    /// A one-off call: the system prompt goes as plain text, unmarked.
     pub fn send(c: *Client, arena: std.mem.Allocator, system: []const u8, messages: []const Message, tools: []const ToolDef) Error!Reply {
-        return c.sendParts(arena, system, "", messages, tools, .{});
+        return c.sendSystem(arena, .{ .stable = system, .cache = false }, messages, tools, .{});
     }
 
-    /// `stable` is the part of the system prompt that stays the same from
-    /// call to call (marked for the prompt cache), `changing` the rest.
+    /// A call of a turn: `stable` is the part of the system prompt that
+    /// stays the same from call to call (marked for the prompt cache),
+    /// `changing` the rest.
     pub fn sendParts(c: *Client, arena: std.mem.Allocator, stable: []const u8, changing: []const u8, messages: []const Message, tools: []const ToolDef, lim: Limits) Error!Reply {
+        return c.sendSystem(arena, .{ .stable = stable, .changing = changing }, messages, tools, lim);
+    }
+
+    fn sendSystem(c: *Client, arena: std.mem.Allocator, system: System, messages: []const Message, tools: []const ToolDef, lim: Limits) Error!Reply {
         if (c.http == null) return error.NoUrl;
         if (c.key.len == 0) return error.NoKey;
-        const body = try requestBody(arena, c.model, c.max_tokens, stable, changing, messages, tools);
+        const body = try requestBody(arena, c.model, c.max_tokens, system, messages, tools);
         var limited = false;
         var connect_retry = false;
         while (true) {
@@ -209,22 +215,44 @@ pub const Client = struct {
 
 const cache_mark = ",\"cache_control\":{\"type\":\"ephemeral\"}";
 
+/// The system prompt of one request.
+pub const System = struct {
+    /// The same from call to call: marked for the prompt cache when `cache`.
+    stable: []const u8,
+    /// The rest, after it; never marked.
+    changing: []const u8 = "",
+    /// false: a one-off call, sent as plain text.
+    cache: bool = true,
+};
+
 /// Prompt-cache marks (at most 4 are allowed): the last tool, the stable
-/// system part when there is a changing part, and the last message's last
-/// block, so each step of a turn reads the steps before it from cache.
-pub fn requestBody(arena: std.mem.Allocator, model: []const u8, max_tokens: u32, stable: []const u8, changing: []const u8, messages: []const Message, tools: []const ToolDef) ![]u8 {
+/// system part (calls of a turn), and the last message's last block, so
+/// each step of a turn reads the steps before it from cache, and a new
+/// turn reads at least the tools and the instructions.
+pub fn requestBody(arena: std.mem.Allocator, model: []const u8, max_tokens: u32, system: System, messages: []const Message, tools: []const ToolDef) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "{\"model\":");
     try util.jsonString(&out, arena, model);
     try out.print(arena, ",\"max_tokens\":{d},\"system\":", .{max_tokens});
-    if (changing.len == 0) {
-        try util.jsonString(&out, arena, stable);
+    // an empty text block is refused, so an empty part is left out
+    const marked = system.cache and system.stable.len > 0;
+    if (!marked and system.changing.len == 0) {
+        try util.jsonString(&out, arena, system.stable);
     } else {
-        try out.appendSlice(arena, "[{\"type\":\"text\",\"text\":");
-        try util.jsonString(&out, arena, stable);
-        try out.appendSlice(arena, cache_mark ++ "},{\"type\":\"text\",\"text\":");
-        try util.jsonString(&out, arena, changing);
-        try out.appendSlice(arena, "}]");
+        try out.append(arena, '[');
+        if (system.stable.len > 0) {
+            try out.appendSlice(arena, "{\"type\":\"text\",\"text\":");
+            try util.jsonString(&out, arena, system.stable);
+            if (marked) try out.appendSlice(arena, cache_mark);
+            try out.append(arena, '}');
+        }
+        if (system.changing.len > 0) {
+            if (system.stable.len > 0) try out.append(arena, ',');
+            try out.appendSlice(arena, "{\"type\":\"text\",\"text\":");
+            try util.jsonString(&out, arena, system.changing);
+            try out.append(arena, '}');
+        }
+        try out.append(arena, ']');
     }
     try out.appendSlice(arena, ",\"messages\":[");
     for (messages, 0..) |m, i| {
@@ -575,11 +603,28 @@ test "cache_marks_on_last_tool_stable_system_and_last_message" {
     try t.expect(jv.get(last[1], "cache_control") != null);
 }
 
+test "a_turn_call_marks_its_stable_instructions_for_the_cache" {
+    var e: TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try e.script(1, textReply("ok"));
+    var c = try e.client();
+    defer c.deinit();
+    const a = e.arena.allocator();
+    // what a turn sends: nothing changing in the system prompt
+    _ = try c.sendParts(a, "stable part", "", hi, &.{}, .{});
+    const v = jv.parse(a, try e.request(1)).?;
+    const sys = jv.arr(jv.at(v, &.{ "body", "system" })).?;
+    try t.expectEqual(1, sys.len);
+    try t.expectEqualStrings("stable part", jv.str(jv.get(sys[0], "text")).?);
+    try t.expectEqualStrings("ephemeral", jv.str(jv.at(sys[0], &.{ "cache_control", "type" })).?);
+}
+
 test "plain_send_keeps_system_a_string" {
     const a = t.allocator;
     var arena: std.heap.ArenaAllocator = .init(a);
     defer arena.deinit();
-    const body = try requestBody(arena.allocator(), "m", 10, "sys", "", &.{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }}, &.{});
+    const body = try requestBody(arena.allocator(), "m", 10, .{ .stable = "sys", .cache = false }, &.{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }}, &.{});
     const v = jv.parse(arena.allocator(), body).?;
     try t.expectEqualStrings("sys", jv.str(jv.get(v, "system")).?);
 }
