@@ -146,9 +146,12 @@ cat >"$S/pages/z.xml" <<'EOF'
 <item><title>New item</title><link>https://z.org/new</link></item>
 </channel></rss>
 EOF
-printf '[morning]\nat = 23:59\ntopic = Zig | %s/page/z.xml\n' "$URL" >"$HARNESS_HOME/briefs.ini"
+printf '<rss><channel><item><title>Fresh item</title><link>https://y.org/fresh</link></item></channel></rss>\n' >"$S/pages/y.xml"
+printf '[morning]\nat = 23:59\ntopic = Zig | %s/page/z.xml\n[evening]\nat = 23:59\ntopic = Zag | %s/page/y.xml\n' "$URL" "$URL" >"$HARNESS_HOME/briefs.ini"
 mkdir -p "$HARNESS_HOME/state"
 printf '%s\t%s\n' "$(sha https://z.org/old)" "$(date +%s)" >"$HARNESS_HOME/state/seen"
+reply "$(text_reply 'Zag: Fresh item (https://y.org/fresh)')"
+check "harness brief collects and prints a brief" '"$H" brief evening 2>/dev/null | grep -qF "Zag: Fresh item (https://y.org/fresh)" && grep -qF "y.org/fresh" "$(req)"'
 
 "$H" run >"$T/run.out" 2>&1 &
 RPID=$!
