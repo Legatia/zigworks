@@ -619,6 +619,13 @@ pub fn freeResult(r: *Run, res: TurnResult) void {
 }
 
 fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const u8) !tools.Output {
+    const out = try callToolRaw(r, a, name, input_json);
+    // the model's API refuses a request that is not UTF-8, and with it every
+    // later one that carries this turn: a tool's bytes are made valid here
+    return .{ .text = try util.validUtf8(a, out.text), .is_error = out.is_error };
+}
+
+fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const u8) !tools.Output {
     if (r.env.stop.load(.acquire)) return .{ .text = "stopped by the owner", .is_error = true };
     var mt: ?*const McpTool = null;
     const tool: gate.Tool = if (gate.Tool.fromName(name)) |tl| switch (tl) {
@@ -1153,6 +1160,30 @@ test "tool_call_then_answer" {
     const lt = try f.logText();
     try t.expect(std.mem.indexOf(u8, lt, "\"kind\":\"gate\"") != null);
     try t.expect(std.mem.indexOf(u8, lt, "\"kind\":\"tool\"") != null);
+}
+
+test "tool_output_that_is_not_utf8_reaches_the_model_as_valid_json" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("allow shell *\n");
+    defer f.deinit();
+    // a lone continuation byte, then a sequence cut off at the end
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"printf 'a\\\\200b\\\\303'\"}"));
+    try f.e.script(2, model.textReply("read it"));
+    try f.e.script(3, model.textReply("and the next turn works"));
+    const r1 = try f.say("print bytes");
+    freeResult(&f.run, r1);
+    const a = f.e.arena.allocator();
+    const req2 = try f.e.request(2);
+    try t.expect(jv.parse(a, req2) != null);
+    try t.expect(std.mem.indexOf(u8, req2, "a\u{fffd}b\u{fffd}") != null);
+    const r2 = try f.say("next");
+    defer freeResult(&f.run, r2);
+    try t.expectEqualStrings("and the next turn works", r2.text);
+    try t.expect(jv.parse(a, try f.e.request(3)) != null);
+    // every log line is JSON too
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, try f.logText(), "\n"), '\n');
+    while (lines.next()) |l| try t.expect(jv.parse(a, l) != null);
 }
 
 test "denied_tool_returns_error_result_to_model" {
