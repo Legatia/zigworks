@@ -269,6 +269,13 @@ pub const Web = struct {
     /// Passkeys, the gate for where the page is now, then the page.
     fn after(w: *Web, a: Allocator, said: []const u8) !Output {
         try w.syncPasskeys(a);
+        // a load under way now (one that began later than the action
+        // waited for one, from a timer, say): the page once it has loaded,
+        // or as far as it got in the time allowed
+        if (w.s.?.inbox.loading(w.io).busy) w.s.?.waitLoaded(a) catch |e| switch (e) {
+            error.Timeout => {},
+            else => return e,
+        };
         const text = w.snapshot(a, said) catch |e| switch (e) {
             error.HostRefused => return fail(a, "{s}", .{w.refused}),
             else => return e,
@@ -1713,6 +1720,27 @@ test "web_removes_throwaway_profiles_a_killed_run_left" {
     // its own is there until it closes
     try t.expect(f.web.throwaway != null);
     _ = try Io.Dir.cwd().statFile(t.io, f.web.throwaway.?, .{});
+}
+
+test "web_waits_for_a_load_under_way_when_the_page_is_read" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.page("here.html", "<html><head><title>Here</title></head><body><p>the old page</p></body></html>");
+    // there at once, but loaded only when its slow image is
+    try f.page("late.html", "<html><head><title>Arrived</title></head><body><p>the new page</p><img src=\"/page/img.bin?delay_ms=1500\"><script>window.addEventListener('load', () => { document.body.append('and all of it'); });</script></body></html>");
+    try f.page("img.bin", "not an image");
+    _ = try f.act(try f.openJson("here.html", null));
+    // a load that starts later than an action waits for one (a script's
+    // timer), still under way when the page is read
+    _ = try f.web.s.?.evaluate(a, "setTimeout(() => { location.href = '/page/late.html'; }, 0)");
+    var tries: u32 = 0;
+    while (!f.web.s.?.inbox.loading(t.io).busy and tries < 100) : (tries += 1) t.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    try t.expect(f.web.s.?.inbox.loading(t.io).busy);
+    const r = try f.web.after(a, "");
+    try expectHas(r.text, "Title: Arrived");
+    try expectHas(r.text, "and all of it");
 }
 
 test "web_page_scripts_cannot_stall_the_waits" {

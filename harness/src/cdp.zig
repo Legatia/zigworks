@@ -631,7 +631,7 @@ pub const Session = struct {
     }
 
     /// Until the main frame has stopped loading and the document is complete.
-    fn waitLoaded(s: *Session, arena: Allocator) !void {
+    pub fn waitLoaded(s: *Session, arena: Allocator) !void {
         const until = deadline(s.io, s.timeout_ms);
         while (s.inbox.loading(s.io).busy) {
             if (Io.Clock.awake.now(s.io).nanoseconds >= until) return error.Timeout;
