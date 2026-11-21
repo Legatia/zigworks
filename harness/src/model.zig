@@ -55,6 +55,10 @@ pub const Error = error{
     NoUrl,
     /// /stop came while waiting to send again: nothing more was sent.
     Stopped,
+    /// The turn's time ran out: the call was not sent, or was cut off at
+    /// the turn's deadline (told apart from a call that took too long by
+    /// itself, whatever the clocks round to).
+    TimeUp,
 } || http.Error;
 
 pub const Client = struct {
@@ -118,7 +122,9 @@ pub const Client = struct {
             if (stopped(lim)) return error.Stopped;
             // past the deadline nothing is sent; before it, the answer is
             // waited for only until then
-            const ms = c.callLimit(lim) orelse return error.Timeout;
+            const ms = c.callLimit(lim) orelse return error.TimeUp;
+            // shorter than a call may take: the turn's deadline set it
+            const by_deadline = lim.deadline_s > 0 and ms < c.call_ms;
             const r = c.post(arena, body, ms) catch |e| switch (e) {
                 // nothing reached the server: once more
                 error.ConnectFailed => {
@@ -126,8 +132,9 @@ pub const Client = struct {
                     connect_retry = true;
                     continue;
                 },
-                // timed out, or cut off after it was sent: the model may
-                // have answered it, and sent again it may be billed twice
+                error.Timeout => return if (by_deadline) error.TimeUp else e,
+                // cut off after it was sent: the model may have answered
+                // it, and sent again it may be billed twice
                 else => return e,
             };
             switch (r.status) {
@@ -533,7 +540,9 @@ test "a_call_ends_by_the_turn_deadline" {
     var c = try e.client();
     defer c.deinit();
     const start = Io.Clock.awake.now(t.io);
-    try t.expectError(error.Timeout, c.sendParts(e.arena.allocator(), "", "", hi, &.{}, .{ .deadline_s = util.nowSeconds(t.io) + 1 }));
+    // said as the turn's time running out, not as a failed call: the
+    // limit was the deadline, however the clocks round
+    try t.expectError(error.TimeUp, c.sendParts(e.arena.allocator(), "", "", hi, &.{}, .{ .deadline_s = util.nowSeconds(t.io) + 1 }));
     try t.expect(sinceMs(start) < 3000);
 }
 

@@ -831,7 +831,8 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
                 error.RateLimited => "The model is rate limited; try again later.",
                 error.NoKey => "Model calls are refused: no omnigate key is stored (harness secret add omnigate).",
                 error.NoUrl => "Model calls are refused: no omnigate url is set ([model] url in config.ini, then /reload).",
-                error.Timeout => if (r.now() >= deadline) "Time limit reached for this turn." else try std.fmt.allocPrint(a, "Model call failed: Timeout {s}", .{r.client.lastError()}),
+                error.TimeUp => "Time limit reached for this turn.",
+                error.Timeout => try std.fmt.allocPrint(a, "Model call failed: Timeout {s}", .{r.client.lastError()}),
                 // kept, every later request would carry it and be refused too
                 error.Rejected => try std.fmt.allocPrint(a, "The model API refused the request: {s}. This turn is left out of the conversation, so the next message starts without it{s}.", .{
                     r.client.lastError(),
