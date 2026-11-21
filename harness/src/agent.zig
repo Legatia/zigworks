@@ -1229,12 +1229,14 @@ fn compact(r: *Run, conv: *Conversation) !usize {
     var gone: usize = 0;
     if (r.model_cfg != null and !r.helper and conv.turns.items.len > keep_last) {
         const n = conv.turns.items.len - keep_last;
-        if (summarise(r, conv, n)) |text| {
+        if (summarise(r, conv, n)) |sum| {
             if (conv.summary) |old| conv.gpa.free(old);
-            conv.summary = text;
+            conv.summary = sum.text;
             conv.dropOldest(n);
+            conv.lost += sum.left_out;
             gone = n;
-            try r.log.write(.turn, r.private, .{ .run = r.label, .event = "summarised", .turns = n });
+            try r.log.write(.turn, r.private, .{ .run = r.label, .event = "summarised", .turns = n - sum.left_out });
+            if (sum.left_out > 0) try r.log.write(.turn, r.private, .{ .run = r.label, .event = "dropped unsummarised", .turns = sum.left_out, .summary = true });
         } else |e| {
             try r.log.write(.model, false, .{ .run = r.label, .event = "summary failed", .result = @errorName(e) });
         }
@@ -1245,25 +1247,51 @@ fn compact(r: *Run, conv: *Conversation) !usize {
     return gone + trimmed;
 }
 
-fn summarise(r: *Run, conv: *Conversation, n: usize) ![]u8 {
+/// The most a summary call is sent.
+const summary_input_max = 60000;
+
+const Summary = struct {
+    /// Owned by `r.gpa`.
+    text: []u8,
+    /// The oldest turns that did not fit in the call.
+    left_out: usize,
+};
+
+/// A summary of the oldest `n` turns (with the earlier summary).
+fn summarise(r: *Run, conv: *Conversation, n: usize) !Summary {
     var arena_state: std.heap.ArenaAllocator = .init(r.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
+    // each turn as text, so that the newest are the ones kept
+    const parts = try a.alloc([]const u8, n);
+    for (conv.turns.items[0..n], parts) |tn, *part| {
+        var turn_text: std.ArrayList(u8) = .empty;
+        for (tn.messages.items) |m| for (m.blocks) |b| {
+            // private turns never leave their turn: not into memory, not here
+            if (tn.private) {
+                if (m.role == .user and b == .text and !std.mem.startsWith(u8, b.text, context_mark)) try turn_text.appendSlice(a, "(a private part of the conversation, left out)\n");
+                continue;
+            }
+            switch (b) {
+                .text => |x| if (!std.mem.startsWith(u8, x, context_mark)) try turn_text.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(x, 2000) }),
+                .tool_use => |u| try turn_text.print(a, "(tool {s}: {s})\n", .{ u.name, util.cut(u.input_json, 300) }),
+                .tool_result => |x| try turn_text.print(a, "(result: {s})\n", .{util.cut(x.content, 500)}),
+            }
+        };
+        part.* = turn_text.items;
+    }
     var text: std.ArrayList(u8) = .empty;
     if (conv.summary) |old| try text.print(a, "Earlier summary:\n{s}\n\n", .{old});
-    for (conv.turns.items[0..n]) |tn| for (tn.messages.items) |m| for (m.blocks) |b| {
-        if (text.items.len > 60000) break;
-        // private turns never leave their turn: not into memory, not here
-        if (tn.private) {
-            if (m.role == .user and b == .text and !std.mem.startsWith(u8, b.text, context_mark)) try text.appendSlice(a, "(a private part of the conversation, left out)\n");
-            continue;
-        }
-        switch (b) {
-            .text => |x| if (!std.mem.startsWith(u8, x, context_mark)) try text.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(x, 2000) }),
-            .tool_use => |u| try text.print(a, "(tool {s}: {s})\n", .{ u.name, util.cut(u.input_json, 300) }),
-            .tool_result => |x| try text.print(a, "(result: {s})\n", .{util.cut(x.content, 500)}),
-        }
-    };
+    // over the limit, the oldest turns are left out: the newest matter most
+    var first = n;
+    var size = text.items.len;
+    while (first > 0 and size + parts[first - 1].len <= summary_input_max) : (first -= 1) size += parts[first - 1].len;
+    const left_out = if (first == n) n - 1 else first;
+    if (left_out > 0) try text.print(a, "({d} older turns left out: too long to summarise)\n", .{left_out});
+    if (first == n) {
+        // not even the newest fits: its start, rather than nothing
+        try text.appendSlice(a, util.cut(parts[n - 1], summary_input_max -| text.items.len));
+    } else for (parts[first..]) |part| try text.appendSlice(a, part);
     const cfg = r.model_cfg.?;
     var client = try model.Client.init(r.gpa, r.io, cfg.url, cfg.key, cfg.memory, 1024);
     defer client.deinit();
@@ -1271,7 +1299,7 @@ fn summarise(r: *Run, conv: *Conversation, n: usize) ![]u8 {
     try r.log.write(.model, false, .{ .run = r.label, .result = "ok", .purpose = "summary", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
     const out = try reply.text(a);
     if (out.len == 0) return error.EmptySummary;
-    return r.gpa.dupe(u8, out);
+    return .{ .text = try r.gpa.dupe(u8, out), .left_out = left_out };
 }
 
 const t = std.testing;
@@ -1706,6 +1734,39 @@ test "turns_dropped_after_a_summary_are_logged_and_said" {
     const req8 = try f.e.request(8);
     try t.expect(std.mem.indexOf(u8, req8, "Summary of the earlier conversation") != null);
     try t.expect(std.mem.indexOf(u8, req8, "dropped without being summarised") != null);
+}
+
+test "a_summary_too_long_to_send_keeps_the_newest_turns" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    // about 2 KB a turn: the turns to summarise are over the 60 KB sent
+    f.run.limits.conversation_bytes = 72000;
+    const a = f.e.arena.allocator();
+    const filler: [1990]u8 = @splat('x');
+    for (1..41) |n| try f.e.script(@intCast(n), try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"text\",\"text\":\"answer-{d:0>2} {s}\"}}],\"stop_reason\":\"end_turn\"}}", .{ n, &filler }));
+    var asked: u32 = 0;
+    while (f.conv.summary == null and asked < 40) : (asked += 1) {
+        const r = try f.say(try std.fmt.allocPrint(a, "question {d:0>2}", .{asked + 1}));
+        freeResult(&f.run, r);
+    }
+    try t.expect(f.conv.summary != null);
+    // the summary call came right after the last turn's
+    const req = try f.e.request(asked + 1);
+    try t.expect(std.mem.indexOf(u8, req, "\"model\":\"claude-mem\"") != null);
+    // all but the last 4 turns were summarised: the newest of them is in
+    const newest = try std.fmt.allocPrint(a, "answer-{d:0>2} ", .{asked - 4});
+    try t.expect(std.mem.indexOf(u8, req, newest) != null);
+    // and the oldest made room for it, said so
+    try t.expect(std.mem.indexOf(u8, req, "answer-01 ") == null);
+    try t.expect(std.mem.indexOf(u8, req, "older turns left out") != null);
+    // those are gone without a summary, and the model is told
+    try t.expect(f.conv.lost > 0);
+    try f.e.script(asked + 2, model.textReply("ok"));
+    const r = try f.say("thanks");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(asked + 2), "dropped without being summarised") != null);
 }
 
 // ---- MCP tools and money ----
