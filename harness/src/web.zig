@@ -244,6 +244,9 @@ pub const Web = struct {
 
     fn start(w: *Web, a: Allocator) !void {
         const profile = if (w.login) |l| blk: {
+            // a data folder from before 0.3 has no profiles/ yet
+            try Io.Dir.cwd().createDirPath(w.io, w.env.profiles);
+            try setPrivate(w.io, w.env.profiles);
             const p = try std.fs.path.join(a, &.{ w.env.profiles, l.name });
             try Io.Dir.cwd().createDirPath(w.io, p);
             try setPrivate(w.io, p);
@@ -828,8 +831,10 @@ test "web_fills_a_login_on_its_site" {
     try expectHas(f.notes.items, "web fill agent localhost:");
     try expectHas(f.asked.items, "login agent localhost:");
     // the login's profile is kept, private
-    const st = try f.e.tmp.dir.statFile(t.io, "profiles/agent", .{});
-    try t.expectEqual(@as(u32, 0o700), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    if (is_windows) return else {
+        const st = try f.e.tmp.dir.statFile(t.io, "profiles/agent", .{});
+        try t.expectEqual(@as(u32, 0o700), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    }
 }
 
 test "web_refuses_a_login_on_another_site" {

@@ -10,6 +10,8 @@ const telegram = @import("telegram.zig");
 const log_mod = @import("log.zig");
 const util = @import("util.zig");
 const agent = @import("agent.zig");
+const logins = @import("logins.zig");
+const totp = @import("totp.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -22,6 +24,11 @@ const usage =
     \\  secret add NAME [--stdin]  store a secret (typed, not shown)
     \\  secret rm NAME             remove a stored secret
     \\  secret list                which of the configured secrets are stored
+    \\  login add NAME --site HOST [--username U] [--stdin]
+    \\                             an account of the agent's own (password and
+    \\                             TOTP secret typed, not shown)
+    \\  login list                 the agent's logins and what is stored for them
+    \\  login rm NAME              remove a login, its secrets and its browser profile
     \\  pair                       print a code to send to the bot as /pair CODE
     \\  run                        run the agent: Telegram and the scheduler
     \\  chat                       talk to the agent in this terminal
@@ -87,8 +94,31 @@ const App = struct {
             .omnigate = s.get(app.io, app.arena, cfg.model.key) catch null,
             .telegram = s.get(app.io, app.arena, cfg.chat.token) catch null,
             .search = s.get(app.io, app.arena, cfg.search.key) catch null,
-            .named = app.mcpSecrets(s),
+            .named = app.namedSecrets(s),
         };
+    }
+
+    /// The MCP servers' secrets, and the logins' passwords and TOTP seeds
+    /// (masked in all tool output).
+    fn namedSecrets(app: *App, s: store_mod.Store) []const core_mod.Secrets.Named {
+        var out: std.ArrayList(core_mod.Secrets.Named) = .empty;
+        out.appendSlice(app.arena, app.mcpSecrets(s)) catch {};
+        for (app.loginList()) |l| for ([_]logins.Kind{ .password, .totp }) |k| {
+            var nb: [96]u8 = undefined;
+            const name = logins.secretName(&nb, l.name, k);
+            const v = (s.get(app.io, app.arena, name) catch null) orelse continue;
+            out.append(app.arena, .{ .name = app.arena.dupe(u8, name) catch continue, .value = v }) catch {};
+        };
+        return out.items;
+    }
+
+    fn loginsPath(app: *App) []const u8 {
+        return std.fs.path.join(app.arena, &.{ app.home, "logins.ini" }) catch "logins.ini";
+    }
+
+    fn loginList(app: *App) []const logins.Login {
+        const text = Io.Dir.cwd().readFileAlloc(app.io, app.loginsPath(), app.arena, .limited(1 << 20)) catch return &.{};
+        return logins.parse(app.arena, text) catch &.{};
     }
 
     /// The stored secrets the servers in mcp.ini name.
@@ -120,6 +150,7 @@ const App = struct {
         c.path_var = app.env.get("PATH") orelse c.path_var;
         c.home_var = app.env.get(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME") orelse "";
         c.system_vars = util.pickVars(app.arena, app.env, util.system_var_names) catch &.{};
+        c.store = app.store();
         c.startExtras();
         return c;
     }
@@ -163,6 +194,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     if (eql(cmd, "init")) return initCmd(app);
     if (eql(cmd, "secret")) return secretCmd(app, rest);
+    if (eql(cmd, "login")) return loginCmd(app, rest);
     if (eql(cmd, "pair")) return pairCmd(app);
     if (eql(cmd, "run")) return runCmd(app);
     if (eql(cmd, "chat")) return chatCmd(app);
@@ -266,6 +298,171 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
     };
     try errPrint(app.io, "Stored {s} in {s}.\n", .{ name, s.describe() });
     return .ok;
+}
+
+// ---- logins ----
+
+fn loginCmd(app: *App, args: []const []const u8) !Exit {
+    const usage_line = "usage: harness login add NAME --site HOST [--username U] [--stdin] | login list | login rm NAME";
+    if (args.len == 0) {
+        complain(usage_line, .{});
+        return .usage;
+    }
+    const s = app.store();
+    const path = app.loginsPath();
+    const text = Io.Dir.cwd().readFileAlloc(app.io, path, app.arena, .limited(1 << 20)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => return e,
+    };
+    const list = logins.parse(app.arena, text) catch {
+        complain("{s} has an error", .{path});
+        return .failed;
+    };
+    if (eql(args[0], "list")) {
+        if (list.len == 0) {
+            try outAll(app.io, "No logins.\n");
+            return .ok;
+        }
+        for (list) |l| {
+            const st = core_mod.loginState(app.io, app.arena, s, l.name);
+            try outPrint(app.io, "{s}: {s}, username {s}, password {s}, TOTP {s}, passkeys {d}\n", .{ l.name, l.site, if (l.username.len > 0) l.username else "(none)", if (st.password) "yes" else "no", if (st.totp) "yes" else "no", st.passkeys });
+        }
+        return .ok;
+    }
+    if (args.len < 2 or !logins.validName(args[1])) {
+        complain("login names use a-z, 0-9, - and _ (at most {d})", .{logins.max_name});
+        return .usage;
+    }
+    const name = args[1];
+    if (eql(args[0], "rm")) {
+        const known = logins.find(list, name) != null;
+        var removed: u32 = 0;
+        for ([_]logins.Kind{ .password, .totp, .passkeys }) |k| {
+            var nb: [96]u8 = undefined;
+            if (s.remove(app.io, logins.secretName(&nb, name, k)) catch {
+                complain("could not remove the secrets of {s}", .{name});
+                return .failed;
+            }) removed += 1;
+        }
+        const profile = try std.fs.path.join(app.arena, &.{ app.home, "profiles", name });
+        const had_profile = if (Io.Dir.cwd().statFile(app.io, profile, .{})) |_| true else |_| false;
+        if (had_profile) Io.Dir.cwd().deleteTree(app.io, profile) catch {
+            complain("could not delete {s}", .{profile});
+            return .failed;
+        };
+        if (known) {
+            const rest = try core_mod.removeSection(app.arena, text, name);
+            try writePrivate(app.io, path, rest);
+        }
+        if (!known and removed == 0 and !had_profile) {
+            try outAll(app.io, "No login with that name.\n");
+            return .ok;
+        }
+        try outPrint(app.io, "Removed {s}: its entry, {d} stored secret{s} and its browser profile.\n", .{ name, removed, if (removed == 1) "" else "s" });
+        return .ok;
+    }
+    if (!eql(args[0], "add")) {
+        complain(usage_line, .{});
+        return .usage;
+    }
+    var site: []const u8 = "";
+    var username: []const u8 = "";
+    var from_stdin = false;
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        if (eql(args[i], "--site") and i + 1 < args.len) {
+            i += 1;
+            site = args[i];
+        } else if (eql(args[i], "--username") and i + 1 < args.len) {
+            i += 1;
+            username = args[i];
+        } else if (eql(args[i], "--stdin")) {
+            from_stdin = true;
+        } else {
+            complain(usage_line, .{});
+            return .usage;
+        }
+    }
+    if (!logins.validSite(site)) {
+        complain("--site takes a host name in lowercase, like github.com (no https://, no path)", .{});
+        return .usage;
+    }
+    if (std.mem.indexOfAny(u8, username, "\n\r;#") != null) {
+        complain("the username can't hold line breaks, ; or #", .{});
+        return .usage;
+    }
+    if (logins.find(list, name) != null) {
+        complain("a login called {s} exists; remove it first (harness login rm {s})", .{ name, name });
+        return .failed;
+    }
+    const stdin = Io.File.stdin();
+    const tty = stdin.isTty(app.io) catch false;
+    if (!tty and !from_stdin) {
+        complain("type the values at a terminal, or pass --stdin to read two lines (password, TOTP secret) from a pipe", .{});
+        return .usage;
+    }
+    const password = try readHidden(app, stdin, tty, "Password for {s} (not shown; empty: the agent makes one when it signs up): ", name);
+    defer std.crypto.secureZero(u8, password);
+    const seed = try readHidden(app, stdin, tty, "TOTP secret for {s} (not shown; empty for none): ", name);
+    defer std.crypto.secureZero(u8, seed);
+    if (password.len > 0 and password.len < 8) {
+        complain("passwords shorter than 8 characters can't be masked reliably; nothing stored", .{});
+        return .failed;
+    }
+    if (seed.len > 0) {
+        var buf: [128]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf);
+        const raw = totp.base32Decode(&buf, seed) catch {
+            complain("the TOTP secret is not base32 (letters A-Z and digits 2-7); nothing stored", .{});
+            return .failed;
+        };
+        if (raw.len < 10) {
+            complain("the TOTP secret is too short; nothing stored", .{});
+            return .failed;
+        }
+    }
+    var nb: [96]u8 = undefined;
+    if (password.len > 0) s.put(app.io, logins.secretName(&nb, name, .password), password) catch {
+        complain("could not store the password in {s}", .{s.describe()});
+        return .failed;
+    };
+    if (seed.len > 0) s.put(app.io, logins.secretName(&nb, name, .totp), seed) catch {
+        complain("could not store the TOTP secret in {s}", .{s.describe()});
+        return .failed;
+    };
+    const entry = try std.fmt.allocPrint(app.arena, "{s}{s}[{s}]\nsite = {s}\n{s}{s}{s}", .{
+        std.mem.trimEnd(u8, text, "\n"),             if (std.mem.trim(u8, text, " \n").len > 0) "\n\n" else "",
+        name,                                          site,
+        if (username.len > 0) "username = " else "", username,
+        if (username.len > 0) "\n" else "",
+    });
+    try writePrivate(app.io, path, entry);
+    try errPrint(app.io, "Stored {s} in {s}.\n", .{ name, s.describe() });
+    return .ok;
+}
+
+/// One line, read with the terminal's echo off when it is one.
+fn readHidden(app: *App, stdin: Io.File, tty: bool, comptime prompt: []const u8, name: []const u8) ![]u8 {
+    var echo: ?Echo = null;
+    if (tty) {
+        try errPrint(app.io, prompt, .{name});
+        echo = Echo.off(stdin);
+    }
+    const v = readLine(app, stdin) catch |e| {
+        if (echo) |*x| x.restore();
+        return e;
+    };
+    if (echo) |*x| {
+        x.restore();
+        try errAll(app.io, "\n");
+    }
+    return @constCast(std.mem.trim(u8, v, " \t"));
+}
+
+fn writePrivate(io: Io, path: []const u8, data: []const u8) !void {
+    var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = util.private_file });
+    defer f.close(io);
+    try f.writeStreamingAll(io, data);
 }
 
 fn pairCmd(app: *App) !Exit {

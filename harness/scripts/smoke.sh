@@ -76,6 +76,8 @@ printf '111:telegram-smoke-token\n' | "$H" secret add telegram --stdin 2>/dev/nu
 printf 'brave-smoke-key-1\n' | "$H" secret add search --stdin 2>/dev/null
 check "secrets stored" '[ "$("$H" secret list | grep -c ": stored")" = 3 ]'
 check "a short secret is refused" '! printf "short\n" | "$H" secret add x --stdin 2>/dev/null'
+printf 'smoke-login-pass-1\n\n' | "$H" login add bot --site localhost --username agent-bot --stdin 2>/dev/null
+check "a login is added and listed" '"$H" login list | grep -qF "bot: localhost, username agent-bot, password yes, TOTP no, passkeys 0"'
 
 # a scheduled task, run by hand before the service starts
 printf '[check]\nevery = 5m\ndo = Check the price.\n' >"$HARNESS_HOME/tasks.ini"
@@ -168,7 +170,8 @@ kill "$RPID" 2>/dev/null
 wait "$RPID" 2>/dev/null
 RPID=""
 check "the log chain verifies" '"$H" log verify | grep -qF "chain intact"'
-check "no secret value in the log" '! grep -qE "og-smoke-key-123|telegram-smoke-token|brave-smoke-key" "$HARNESS_HOME/log/actions.jsonl"'
+check "no secret value in the log" '! grep -qE "og-smoke-key-123|telegram-smoke-token|brave-smoke-key|smoke-login-pass" "$HARNESS_HOME/log/actions.jsonl"'
+check "a login is removed with its secrets" '"$H" login rm bot >/dev/null && "$H" login list | grep -qF "No logins." && [ ! -e "$HARNESS_STORE/login-bot-password" ] && ! grep -qF "[bot]" "$HARNESS_HOME/logins.ini"'
 # Windows keeps a killed instance's lock for 90 s (no pid check there)
 if [ $windows = 0 ]; then
 	check "memory list works offline" '"$H" memory list 2>/dev/null | grep -qF "I prefer short briefs"'

@@ -74,6 +74,8 @@ fn replyId(msg: []const u8) ?u32 {
     return n;
 }
 
+const Pid = if (is_windows) usize else std.posix.pid_t;
+
 pub const Error = error{ Cdp, Script, Timeout, Stopped, BrowserGone, Unsupported, NoPage };
 
 pub const Session = struct {
@@ -82,7 +84,7 @@ pub const Session = struct {
     stop: *std.atomic.Value(bool),
     /// How long one call may take.
     timeout_ms: u32,
-    pid: std.posix.pid_t = 0,
+    pid: Pid = 0,
     child: std.process.Child = undefined,
     to_chrome: ?Io.File = null,
     from_chrome: ?Io.File = null,
@@ -203,9 +205,11 @@ pub const Session = struct {
     }
 
     fn killGroup(s: *Session) void {
-        if (is_windows or s.pid == 0) return;
-        std.posix.kill(-s.pid, .KILL) catch {};
-        std.posix.kill(s.pid, .KILL) catch {};
+        if (is_windows) return else {
+            if (s.pid == 0) return;
+            std.posix.kill(-s.pid, .KILL) catch {};
+            std.posix.kill(s.pid, .KILL) catch {};
+        }
     }
 
     /// A method on the page; returns its `result`.
@@ -414,9 +418,11 @@ pub fn testBrowser(a: Allocator) !?[]const u8 {
     return page.findBrowser(a, t.io, "", env_chrome, env_path);
 }
 
-fn processGone(pid: std.posix.pid_t) bool {
-    std.posix.kill(pid, @enumFromInt(0)) catch return true;
-    return false;
+fn processGone(pid: Pid) bool {
+    if (is_windows) return true else {
+        std.posix.kill(pid, @enumFromInt(0)) catch return true;
+        return false;
+    }
 }
 
 test "chrome_over_a_pipe_evaluates_and_closes_without_leftovers" {
@@ -441,8 +447,8 @@ test "chrome_over_a_pipe_evaluates_and_closes_without_leftovers" {
     try t.expect(processGone(pid));
     // nothing of its group is left either (helpers die a moment later)
     var waited: u32 = 0;
-    while (waited < 3000 and !processGone(-pid)) : (waited += 50) t.io.sleep(.fromMilliseconds(50), .awake) catch {};
-    try t.expect(processGone(-pid));
+    while (waited < 3000 and !processGone(-%pid)) : (waited += 50) t.io.sleep(.fromMilliseconds(50), .awake) catch {};
+    try t.expect(processGone(-%pid));
 }
 
 test "a_stop_ends_chrome_at_once" {

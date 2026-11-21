@@ -17,6 +17,8 @@ const agent = @import("agent.zig");
 const brief = @import("brief.zig");
 const scrub = @import("scrub.zig");
 const util = @import("util.zig");
+const logins = @import("logins.zig");
+const store_mod = @import("store.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -43,6 +45,8 @@ pub const Paths = struct {
     skills: []const u8,
     mcp: []const u8,
     money: []const u8,
+    logins: []const u8,
+    profiles: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -75,6 +79,8 @@ pub const Paths = struct {
             .skills = try j(a, &.{ home, "skills" }),
             .mcp = try j(a, &.{ home, "mcp.ini" }),
             .money = try j(a, &.{ state, "money" }),
+            .logins = try j(a, &.{ home, "logins.ini" }),
+            .profiles = try j(a, &.{ home, "profiles" }),
         };
     }
 };
@@ -82,12 +88,15 @@ pub const Paths = struct {
 /// Writes the data folder with commented defaults; existing files are kept.
 pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
     const p = try Paths.init(a, home);
-    for ([_][]const u8{ home, p.memory, p.workspace, p.state, p.log_dir, p.skills }) |d| try Io.Dir.cwd().createDirPath(io, d);
+    for ([_][]const u8{ home, p.memory, p.workspace, p.state, p.log_dir, p.skills, p.profiles }) |d| try Io.Dir.cwd().createDirPath(io, d);
     if (builtin.os.tag != .windows) {
-        // iterate: on Linux a plain open is O_PATH, and fchmod on it fails with EBADF
-        var d = try Io.Dir.cwd().openDir(io, home, .{ .iterate = true });
-        defer d.close(io);
-        try d.setPermissions(io, .fromMode(0o700));
+        // the logins' browser profiles hold their cookies
+        for ([_][]const u8{ home, p.profiles }) |dir| {
+            // iterate: on Linux a plain open is O_PATH, and fchmod on it fails with EBADF
+            var d = try Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
+            defer d.close(io);
+            try d.setPermissions(io, .fromMode(0o700));
+        }
     }
     const files = [_][2][]const u8{ .{ p.config, config.defaults_ini }, .{ p.rules, config.rules_example }, .{ p.briefs, config.briefs_example }, .{ p.tasks, config.tasks_example } };
     for (files) |f| {
@@ -165,8 +174,12 @@ pub const Core = struct {
     mcp_note: []const u8 = "",
     money_ledger: agent.MoneyLedger = .{},
     dry_run: bool = false,
-    /// Chrome or Chromium for `browse`; empty: none.
+    /// Chrome or Chromium for `browse` and `web`; empty: none.
     browser: []const u8 = "",
+    /// The agent's logins (logins.ini, in the settings arena).
+    login_list: []const logins.Login = &.{},
+    /// Where secrets are kept, for the logins' values; set by main.
+    store: ?store_mod.Store = null,
     seen: brief.Seen,
     /// Set on close: nothing new starts.
     stop: std.atomic.Value(bool) = .init(false),
@@ -318,6 +331,7 @@ pub const Core = struct {
         c.mcp_tools = &.{};
         c.mcp_note = "";
         c.browser = "";
+        c.store = null;
         return c;
     }
 
@@ -351,9 +365,9 @@ pub const Core = struct {
 
     // ---- settings ----
 
-    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![4][]const u8 {
-        var out: [4][]const u8 = undefined;
-        for ([_][]const u8{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks }, 0..) |p, i| {
+    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![5][]const u8 {
+        var out: [5][]const u8 = undefined;
+        for ([_][]const u8{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins }, 0..) |p, i| {
             out[i] = Io.Dir.cwd().readFileAlloc(c.io, p, a, .limited(1 << 20)) catch |e| switch (e) {
                 error.FileNotFound => "",
                 else => return e,
@@ -362,7 +376,7 @@ pub const Core = struct {
         return out;
     }
 
-    fn hashSettings(texts: [4][]const u8) [32]u8 {
+    fn hashSettings(texts: [5][]const u8) [32]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
         for (texts) |tx| {
             h.update(tx);
@@ -373,7 +387,7 @@ pub const Core = struct {
 
     fn loadSettings(c: *Core, a: std.mem.Allocator) !void {
         if (builtin.os.tag != .windows) {
-            for ([_][]const u8{ c.paths.config, c.paths.rules }) |p| {
+            for ([_][]const u8{ c.paths.config, c.paths.rules, c.paths.logins }) |p| {
                 const st = Io.Dir.cwd().statFile(c.io, p, .{}) catch continue;
                 if (st.permissions.toMode() & 0o022 != 0) return error.BadSettings;
             }
@@ -383,6 +397,7 @@ pub const Core = struct {
         c.rule_list = rules.parse(a, texts[1]) catch return error.BadSettings;
         c.briefs = config.parseBriefs(a, texts[2]) catch return error.BadSettings;
         c.tasks = config.parseTasks(a, texts[3]) catch return error.BadSettings;
+        c.login_list = logins.parse(a, texts[4]) catch return error.BadSettings;
         c.settings_hash = hashSettings(texts);
     }
 
@@ -400,6 +415,7 @@ pub const Core = struct {
         const saved_rules = c.rule_list;
         const saved_briefs = c.briefs;
         const saved_tasks = c.tasks;
+        const saved_logins = c.login_list;
         const saved_hash = c.settings_hash;
         c.loadSettings(fresh.allocator()) catch {
             fresh.deinit();
@@ -407,8 +423,9 @@ pub const Core = struct {
             c.rule_list = saved_rules;
             c.briefs = saved_briefs;
             c.tasks = saved_tasks;
+            c.login_list = saved_logins;
             c.settings_hash = saved_hash;
-            return "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini and tasks.ini.";
+            return "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini and logins.ini.";
         };
         // the chat's client points into the old settings: build it again
         const client = model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens) catch {
@@ -417,6 +434,7 @@ pub const Core = struct {
             c.rule_list = saved_rules;
             c.briefs = saved_briefs;
             c.tasks = saved_tasks;
+            c.login_list = saved_logins;
             c.settings_hash = saved_hash;
             return "The model url in config.ini is not valid; nothing changed.";
         };
@@ -772,6 +790,9 @@ pub const Core = struct {
             .money = c.cfg.money,
             .money_ledger = &c.money_ledger,
             .dry_run = c.dry_run,
+            .logins = c.login_list,
+            .store = c.store,
+            .profiles_dir = c.paths.profiles,
         };
     }
 
@@ -1131,6 +1152,7 @@ pub const Core = struct {
         \\/remember TEXT, /pin ID, /unpin ID, /forget ID
         \\/private on|off: no memories written while on
         \\/skills: list saved skills, /skill rm NAME
+        \\/logins: the agent's own logins
         \\/dryrun on|off: money tools are not called while on
         \\/reload: apply changed settings files
     ;
@@ -1150,10 +1172,12 @@ pub const Core = struct {
         }
         if (eql(u8, cmd, "/reload")) return c.reload();
         if (eql(u8, cmd, "/status")) {
-            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.{s}{s}", .{
+            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
                 if (c.auto_recall) "on" else "off",                                                         if (c.private) "on" else "off",
                 if (c.dry_run) "on" else "off",
+                if (c.browser.len == 0) "none found" else if (builtin.os.tag == .windows) "found (web not available on Windows yet)" else "found",
+                c.login_list.len,
                 if (c.mcp_note.len > 0) "\nMCP: " else "",
                 std.mem.trimEnd(u8, c.mcp_note, "\n"),
             });
@@ -1231,6 +1255,7 @@ pub const Core = struct {
             return if (out.items.len > 0) out.items else "No scheduled tasks. Add one with /task add NAME | every 15m | instruction";
         }
         if (eql(u8, cmd, "/task")) return c.taskCommand(a, rest);
+        if (eql(u8, cmd, "/logins")) return c.loginsText(a);
         if (eql(u8, cmd, "/skills")) {
             const list = try skills.list(a, c.io, c.paths.skills);
             if (list.len == 0) return "No skills yet. The agent saves one (with your approval) when it learns how to do a kind of task.";
@@ -1250,6 +1275,17 @@ pub const Core = struct {
             return "Use /skills or /skill rm NAME.";
         }
         return "Unknown command. Send /help for the list.";
+    }
+
+    /// One line per login: what is stored for it (never the values).
+    pub fn loginsText(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        if (c.login_list.len == 0) return "No logins. Add one with: harness login add NAME --site HOST --username U";
+        var out: std.ArrayList(u8) = .empty;
+        for (c.login_list) |l| {
+            const st = loginState(c.io, a, c.store, l.name);
+            try out.print(a, "{s}: {s}, username {s}, password {s}, TOTP {s}, passkeys {d}\n", .{ l.name, l.site, if (l.username.len > 0) l.username else "(none)", if (st.password) "yes" else "no", if (st.totp) "yes" else "no", st.passkeys });
+        }
+        return out.items;
     }
 
     fn appendSettingsLine(c: *Core, path: []const u8, text: []const u8) !void {
@@ -1380,7 +1416,29 @@ fn insertInSection(a: std.mem.Allocator, text: []const u8, name: []const u8, lin
     return out.items;
 }
 
-fn removeSection(a: std.mem.Allocator, text: []const u8, name: []const u8) ![]u8 {
+pub const LoginState = struct { password: bool = false, totp: bool = false, passkeys: usize = 0 };
+
+/// What the key store holds for a login.
+pub fn loginState(io: Io, a: std.mem.Allocator, store: ?store_mod.Store, name: []const u8) LoginState {
+    const st = store orelse return .{};
+    var out: LoginState = .{};
+    var nb: [96]u8 = undefined;
+    if (st.get(io, a, logins.secretName(&nb, name, .password)) catch null) |v| {
+        out.password = true;
+        std.crypto.secureZero(u8, v);
+    }
+    if (st.get(io, a, logins.secretName(&nb, name, .totp)) catch null) |v| {
+        out.totp = true;
+        std.crypto.secureZero(u8, v);
+    }
+    if (st.get(io, a, logins.secretName(&nb, name, .passkeys)) catch null) |v| {
+        out.passkeys = if (logins.decode(a, v)) |l| l.len else |_| 0;
+        std.crypto.secureZero(u8, v);
+    }
+    return out;
+}
+
+pub fn removeSection(a: std.mem.Allocator, text: []const u8, name: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     var it = std.mem.splitScalar(u8, text, '\n');
     var skipping = false;
@@ -1981,4 +2039,36 @@ test "mcp_start_errors_are_masked_in_the_log" {
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, key) == null);
     const log_text = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, f.e.arena.allocator(), .unlimited);
     try t.expect(std.mem.indexOf(u8, log_text, key) == null);
+}
+
+test "logins_command_lists_what_is_stored_and_status_counts_them" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.core.handleText("/logins");
+    try f.rec.waitFor("No logins.");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.logins, .data = "[github-bot]\nsite = github.com\nusername = agent-bot@example.com\n[local]\nsite = localhost\n", .flags = .{ .permissions = util.private_file } });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    f.core.store = st;
+    try st.put(t.io, "login-github-bot-password", "fake-pass-for-tests");
+    try st.put(t.io, "login-github-bot-passkeys", try logins.encode(a, &.{.{ .id = "aWQ=", .rp_id = "github.com", .key = "a2V5" }}));
+    try st.put(t.io, "login-local-totp", "JBSWY3DPEHPK3PXP");
+    try f.core.handleText("/logins");
+    try f.rec.waitFor("github-bot: github.com, username agent-bot@example.com, password yes, TOTP no, passkeys 1");
+    try f.rec.waitFor("local: localhost, username (none), password no, TOTP yes, passkeys 0");
+    try t.expectEqual(0, f.rec.count("fake-pass-for-tests"));
+    try f.core.handleText("/status");
+    try f.rec.waitFor("Logins: 2.");
+    // the profiles folder is there, private
+    if (builtin.os.tag != .windows) {
+        const pst = try Io.Dir.cwd().statFile(t.io, f.core.paths.profiles, .{});
+        try t.expectEqual(@as(u32, 0o700), @as(u32, @intCast(pst.permissions.toMode() & 0o777)));
+        // logins.ini others can change is refused, like rules
+        var lf = try Io.Dir.cwd().openFile(t.io, f.core.paths.logins, .{});
+        try lf.setPermissions(t.io, .fromMode(0o666));
+        lf.close(t.io);
+        try t.expect(std.mem.startsWith(u8, try f.core.reload(), "The settings files have an error"));
+    }
 }

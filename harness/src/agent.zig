@@ -12,6 +12,9 @@ const skills = @import("skills.zig");
 const jv = @import("jv.zig");
 const mcp = @import("mcp.zig");
 const scrub = @import("scrub.zig");
+const web_mod = @import("web.zig");
+const logins_mod = @import("logins.zig");
+const store_mod = @import("store.zig");
 const Io = std.Io;
 
 pub const Answer = enum { once, day, deny, timeout };
@@ -172,6 +175,13 @@ pub const Run = struct {
     money_ledger: ?*MoneyLedger = null,
     /// /dryrun on: money tools are not called.
     dry_run: bool = false,
+    /// The agent's logins (logins.ini) and where their values are kept.
+    logins: []const logins_mod.Login = &.{},
+    store: ?store_mod.Store = null,
+    /// The data folder's `profiles/`; empty: no `web` tool.
+    profiles_dir: []const u8 = "",
+    /// The browser session of the running turn.
+    web: ?*web_mod.Web = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -190,6 +200,10 @@ pub const Run = struct {
             .money => if (r.helper or r.mcp.len == 0) return false,
             .skill, .skill_save => if (r.skills_dir.len == 0) return false,
             .browse => if (r.env.browser.len == 0) return false,
+            // helpers never get the browser with the logins; POSIX only for now
+            .web => if (r.helper or r.env.browser.len == 0 or r.profiles_dir.len == 0 or @import("builtin").os.tag == .windows) return false,
+            // only through `web`
+            .login => return false,
             else => {},
         }
         const list = r.allowed orelse return true;
@@ -217,6 +231,7 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
         const tool = gate.Tool.fromName(d.name).?;
         if (r.allows(tool)) try out.append(arena, d);
     }
+    if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
     if (r.allows(.delegate)) try out.append(arena, delegate_def);
     for (skill_defs) |d| if (r.allows(gate.Tool.fromName(d.name).?)) try out.append(arena, d);
     for (r.mcp) |m| if (r.allows(if (m.money) .money else .mcp)) try out.append(arena, m.def);
@@ -497,6 +512,28 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     try keep(tn, .{ .role = .user, .blocks = &.{ .{ .text = context }, .{ .text = user_text } } });
     r.deadline_s = deadline;
 
+    // the browser lives for this turn: closed when it ends, however it ends
+    var web_state: web_mod.Web = undefined;
+    const own_web = r.web == null and r.allows(.web);
+    if (own_web) {
+        web_state = web_mod.Web.init(r.gpa, r.io, .{
+            .browser = r.env.browser,
+            .profiles = r.profiles_dir,
+            .tmp_root = r.env.tmp_root,
+            .timeout_ms = @intCast(@min(@as(u64, r.env.browser_seconds) * 1000, std.math.maxInt(u32))),
+            .max_bytes = r.env.tool_output_bytes,
+            .logins = r.logins,
+            .store = r.store,
+            .secrets = r.env.secrets,
+            .stop = r.env.stop,
+        }, .{ .ctx = r, .allow = webAllow, .note = webNote });
+        r.web = &web_state;
+    }
+    defer if (own_web) {
+        web_state.deinit();
+        r.web = null;
+    };
+
     var result: TurnResult = .{ .text = "" };
     var used_tokens: u64 = 0;
     const defs = try toolDefs(r, a);
@@ -596,6 +633,14 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
         return .{ .text = "no such tool", .is_error = true };
     };
     if (!r.allows(tool)) return .{ .text = "this tool is not available here", .is_error = true };
+    if (tool == .web) {
+        // the tool asks the gate itself: for each host and login it uses
+        const w = r.web orelse return .{ .text = "this tool is not available here", .is_error = true };
+        const out = try w.run(a, input_json);
+        // the model's input, placeholders and all: never a value
+        try r.log.write(.tool, r.private, .{ .run = r.label, .tool = name, .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text });
+        return out;
+    }
     const arg = switch (tool) {
         .delegate => delegateArg(a, input_json) catch return .{ .text = "delegate needs a list of 1 to 8 tasks", .is_error = true },
         .mcp, .money => try std.fmt.allocPrint(a, "{s}/{s} {s}", .{ mt.?.server.name, mt.?.tool, util.cut(input_json, 1500) }),
@@ -609,54 +654,9 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
             return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
         }
     }
-    const d = blk: {
-        r.lock.lockUncancelable(r.io);
-        defer r.lock.unlock(r.io);
-        break :blk r.gate.decide(a, tool, arg, now_s, .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled });
-    };
-    var action = d.action;
-    var why = d.why;
-    if (action == .ask) {
-        if (r.asker) |asker| {
-            const who = if (r.helper) try std.fmt.allocPrint(a, "[{s}] ", .{r.label}) else "";
-            const what = try std.fmt.allocPrint(a, "{s}{s}: {s}", .{ who, name, util.cut(arg, 1500) });
-            // helpers working at once still ask one question at a time
-            if (r.ask_lock) |l| l.lockUncancelable(r.io);
-            var ans = if (r.env.stop.load(.acquire)) Answer.deny else asker.ask(asker.ctx, what, tool != .money);
-            // money is never granted for a day, whatever came back
-            if (tool == .money and ans == .day) ans = .once;
-            if (r.ask_lock) |l| l.unlock(r.io);
-            switch (ans) {
-                .once => {
-                    action = .allow;
-                    why = "allowed once by the owner";
-                },
-                .day => {
-                    action = .allow;
-                    why = "allowed for 24 hours by the owner";
-                    r.lock.lockUncancelable(r.io);
-                    defer r.lock.unlock(r.io);
-                    try r.gate.grants.add(tool, gate.grantKey(tool, arg), now_s + 86400);
-                    if (r.grants_path) |p| r.gate.grants.save(r.io, p, now_s) catch {};
-                },
-                .deny => {
-                    action = .deny;
-                    why = "denied by the owner";
-                },
-                .timeout => {
-                    action = .deny;
-                    why = "no answer from the owner in time";
-                },
-            }
-        } else {
-            action = .deny;
-            why = "no one to ask";
-        }
-    }
-    try r.log.write(.gate, r.private, .{ .run = r.label, .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
-    if (action != .allow) {
+    if (try decideAndAsk(r, a, tool, name, arg, now_s)) |refused| {
         if (tool == .money) releaseMoney(r, now_s, amount);
-        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{refused}), .is_error = true };
     }
 
     const out: tools.Output = switch (tool) {
@@ -709,6 +709,68 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
 // ---- tests ----
 
 
+
+/// The gate's decision for one call, asking the owner when it says ask;
+/// logged. Null when the call may run, else why not.
+fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, now_s: i64) !?[]const u8 {
+    const d = blk: {
+        r.lock.lockUncancelable(r.io);
+        defer r.lock.unlock(r.io);
+        break :blk r.gate.decide(a, tool, arg, now_s, .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled });
+    };
+    var action = d.action;
+    var why = d.why;
+    if (action == .ask) {
+        if (r.asker) |asker| {
+            const who = if (r.helper) try std.fmt.allocPrint(a, "[{s}] ", .{r.label}) else "";
+            const what = try std.fmt.allocPrint(a, "{s}{s}: {s}", .{ who, name, util.cut(arg, 1500) });
+            // helpers working at once still ask one question at a time
+            if (r.ask_lock) |l| l.lockUncancelable(r.io);
+            var ans = if (r.env.stop.load(.acquire)) Answer.deny else asker.ask(asker.ctx, what, tool != .money);
+            // money is never granted for a day, whatever came back
+            if (tool == .money and ans == .day) ans = .once;
+            if (r.ask_lock) |l| l.unlock(r.io);
+            switch (ans) {
+                .once => {
+                    action = .allow;
+                    why = "allowed once by the owner";
+                },
+                .day => {
+                    action = .allow;
+                    why = "allowed for 24 hours by the owner";
+                    r.lock.lockUncancelable(r.io);
+                    defer r.lock.unlock(r.io);
+                    try r.gate.grants.add(tool, gate.grantKey(tool, arg), now_s + 86400);
+                    if (r.grants_path) |p| r.gate.grants.save(r.io, p, now_s) catch {};
+                },
+                .deny => {
+                    action = .deny;
+                    why = "denied by the owner";
+                },
+                .timeout => {
+                    action = .deny;
+                    why = "no answer from the owner in time";
+                },
+            }
+        } else {
+            action = .deny;
+            why = "no one to ask";
+        }
+    }
+    try r.log.write(.gate, r.private, .{ .run = r.label, .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
+    return if (action == .allow) null else why;
+}
+
+fn webAllow(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) ?[]const u8 {
+    const r: *Run = @ptrCast(@alignCast(ctx));
+    if (r.env.stop.load(.acquire)) return "stopped by the owner";
+    return decideAndAsk(r, a, tool, @tagName(tool), arg, r.now()) catch "the gate could not decide";
+}
+
+fn webNote(ctx: *anyopaque, event: []const u8, login: []const u8, detail: []const u8) void {
+    const r: *Run = @ptrCast(@alignCast(ctx));
+    r.log.write(.tool, r.private, .{ .run = r.label, .tool = "web", .event = event, .login = login, .detail = detail }) catch {};
+}
 
 // ---- MCP calls and money ----
 
@@ -898,6 +960,7 @@ fn helperRun(h: *Helper) !void {
     w.top_size = 0;
     w.extra_instructions = "";
     w.cache = h.cache;
+    w.web = null;
     w.token_cap = p.agents.tokens;
     w.limits.steps_per_turn = p.agents.steps;
     w.limits.turn_seconds = @intCast(@min(left, std.math.maxInt(u32)));
@@ -1574,4 +1637,83 @@ test "helpers_get_the_rest_of_the_turn_not_a_new_one" {
     const r = try f.say("dig");
     freeResult(&f.run, r);
     try t.expect(f.e.server.modelRequests() <= 2);
+}
+
+test "web_is_offered_only_with_a_browser_and_never_to_helpers" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const names = struct {
+        fn of(r: *const Run, arena: std.mem.Allocator) ![]const u8 {
+            var out: std.ArrayList(u8) = .empty;
+            for (try toolDefs(r, arena)) |d| try out.print(arena, "{s},", .{d.name});
+            return out.items;
+        }
+    }.of;
+    f.run.profiles_dir = "/tmp/profiles";
+    try t.expect(std.mem.indexOf(u8, try names(&f.run, a), "web,") == null);
+    f.run.env.browser = "/opt/chrome";
+    f.run.logins = &.{.{ .name = "github-bot", .site = "github.com", .username = "agent-bot@example.com" }};
+    const with = try names(&f.run, a);
+    if (@import("builtin").os.tag == .windows) {
+        try t.expect(std.mem.indexOf(u8, with, "web,") == null);
+    } else {
+        try t.expect(std.mem.indexOf(u8, with, "web,") != null);
+        const defs = try toolDefs(&f.run, a);
+        for (defs) |d| if (std.mem.eql(u8, d.name, "web")) {
+            try t.expect(std.mem.indexOf(u8, d.description, "github-bot: github.com, username agent-bot@example.com") != null);
+        };
+    }
+    try t.expect(std.mem.indexOf(u8, with, "login,") == null);
+    var h = f.run;
+    h.helper = true;
+    try t.expect(std.mem.indexOf(u8, try names(&h, a), "web,") == null);
+    // and asked for by name, a helper is refused
+    try t.expect(!h.allows(.web));
+}
+
+test "web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const browser = (try @import("cdp.zig").testBrowser(a)) orelse return error.SkipZigTest;
+    try f.e.tmp.dir.createDirPath(t.io, "profiles");
+    try f.e.tmp.dir.createDirPath(t.io, "tmp");
+    const store: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    try store.put(t.io, "login-agent-password", "fake-Pass-7351!");
+    f.run.env.browser = browser;
+    f.run.env.tmp_root = try std.fs.path.join(a, &.{ f.e.dir, "tmp" });
+    f.run.profiles_dir = try std.fs.path.join(a, &.{ f.e.dir, "profiles" });
+    f.run.logins = &.{.{ .name = "agent", .site = "localhost", .username = "agent-bot" }};
+    f.run.store = store;
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/login.html", .data =
+        \\<html><head><title>Sign in</title></head><body>
+        \\<form id="f"><input id="user" aria-label="Email"><input id="pw" type="password" aria-label="Password"><button>Sign in</button></form>
+        \\<p id="out"></p><script>
+        \\document.getElementById('f').addEventListener('submit', (e) => { e.preventDefault();
+        \\  const v = document.getElementById('pw').value;
+        \\  document.getElementById('out').textContent = (v === 'fake-Pass-7351!' ? 'welcome ' : 'wrong ') + document.getElementById('user').value + ' typed ' + v; });
+        \\</script></body></html>
+    });
+    const open = try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"web\",\"input\":{{\"action\":\"open\",\"url\":\"http://localhost:{d}/page/login.html\",\"login\":\"agent\"}}}}],\"stop_reason\":\"tool_use\"}}", .{f.e.server.port});
+    try f.e.script(1, open);
+    try f.e.script(2, model.toolReply("tu_2", "web", "{\"action\":\"type\",\"ref\":1,\"text\":\"{login:agent.username}\"}"));
+    try f.e.script(3, model.toolReply("tu_3", "web", "{\"action\":\"type\",\"ref\":2,\"text\":\"{login:agent.password}\",\"enter\":true}"));
+    try f.e.script(4, model.textReply("Signed in."));
+    const r = try f.say("sign in to the local site");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Signed in.", r.text);
+    // the owner was asked for the host and for the login, once each
+    try t.expectEqual(2, f.asked);
+    const req4 = try f.e.request(4);
+    try t.expect(std.mem.indexOf(u8, req4, "welcome agent-bot typed [secret:login-agent-password]") != null);
+    const lt = try f.logText();
+    try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"web fill\",\"login\":\"agent\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "{login:agent.password}") != null);
+    for (1..5) |n| try t.expect(std.mem.indexOf(u8, try f.e.request(@intCast(n)), "fake-Pass-7351!") == null);
+    try t.expect(std.mem.indexOf(u8, lt, "fake-Pass-7351!") == null);
+    // the browser is gone with the turn
+    try t.expect(f.run.web == null);
 }

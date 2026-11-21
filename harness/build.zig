@@ -58,6 +58,10 @@ pub fn build(b: *std.Build) void {
     smoke.has_side_effects = true;
     smoke.step.dependOn(&run_unit.step);
 
+    // compile the unit tests without running them (for other targets)
+    const unit_build = b.step("unit-build", "Build the unit tests without running them");
+    unit_build.dependOn(&unit.step);
+
     const unit_step = b.step("unit", "Run unit tests only");
     unit_step.dependOn(&run_unit.step);
     const test_step = b.step("test", "Run unit tests and the CLI smoke tests");
