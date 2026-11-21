@@ -159,6 +159,8 @@ pub const Session = struct {
     timeout_ms: u32,
     pid: Pid = 0,
     child: std.process.Child = undefined,
+    /// `child` is set: there is a process to end.
+    spawned: bool = false,
     to_chrome: ?Io.File = null,
     from_chrome: ?Io.File = null,
     reader: ?std.Thread = null,
@@ -192,8 +194,17 @@ pub const Session = struct {
 
     fn openPosix(gpa: Allocator, io: Io, browser: []const u8, profile_dir: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32) !*Session {
         const s = try gpa.create(Session);
-        errdefer gpa.destroy(s);
         s.* = .{ .gpa = gpa, .io = io, .stop = stop, .timeout_ms = timeout_ms, .inbox = .{ .gpa = gpa } };
+        // whatever fails, the browser is ended and all of it freed
+        s.start(browser, profile_dir) catch |e| {
+            s.destroy();
+            return e;
+        };
+        return s;
+    }
+
+    fn start(s: *Session, browser: []const u8, profile_dir: []const u8) !void {
+        const gpa = s.gpa;
         const data_dir = try std.fmt.allocPrint(gpa, "--user-data-dir={s}", .{profile_dir});
         defer gpa.free(data_dir);
         // our stdin pipe becomes Chrome's fd 3, our stdout pipe its fd 4
@@ -213,28 +224,22 @@ pub const Session = struct {
             data_dir,
             "about:blank",
         };
-        s.child = try std.process.spawn(io, .{
+        s.child = try std.process.spawn(s.io, .{
             .argv = argv,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
             .pgid = 0,
         });
+        s.spawned = true;
         s.pid = s.child.id.?;
         // the pipes are ours: `wait` must not close them under the reader
         s.to_chrome = s.child.stdin;
         s.from_chrome = s.child.stdout;
         s.child.stdin = null;
         s.child.stdout = null;
-        s.reader = std.Thread.spawn(.{}, readLoop, .{s}) catch |e| {
-            s.close();
-            return e;
-        };
-        s.attach() catch |e| {
-            s.close();
-            return e;
-        };
-        return s;
+        s.reader = try std.Thread.spawn(.{}, readLoop, .{s});
+        try s.attach();
     }
 
     fn attach(s: *Session) !void {
@@ -482,7 +487,7 @@ pub const Session = struct {
     /// Ends the browser and everything it started; safe to call twice.
     pub fn close(s: *Session) void {
         if (s.closed) return;
-        if (!is_windows) {
+        if (!is_windows and s.spawned) {
             if (s.page_session.len > 0 and !s.inbox.closed.load(.acquire) and !s.stop.load(.acquire)) {
                 var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
                 defer arena_state.deinit();
@@ -589,6 +594,31 @@ test "chrome_over_a_pipe_evaluates_and_closes_without_leftovers" {
     var waited: u32 = 0;
     while (waited < 3000 and !processGone(-%pid)) : (waited += 50) t.io.sleep(.fromMilliseconds(50), .awake) catch {};
     try t.expect(processGone(-%pid));
+}
+
+/// A stand-in browser: a shell script at `name` in `dir`.
+fn standIn(dir: std.Io.Dir, name: []const u8, script: []const u8) !void {
+    try dir.writeFile(t.io, .{ .sub_path = name, .data = script });
+    var f = try dir.openFile(t.io, name, .{});
+    defer f.close(t.io);
+    try f.setPermissions(t.io, .fromMode(0o755));
+}
+
+test "a_browser_that_fails_to_start_leaves_nothing_allocated" {
+    if (is_windows) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    // half a message, then gone: the reader has bytes in hand
+    try standIn(tmp.dir, "fake-chrome", "#!/bin/sh\nprintf '{\"id\":1,\"res' >&4\n");
+    var stop: std.atomic.Value(bool) = .init(false);
+    if (Session.open(t.allocator, t.io, try std.fs.path.join(a, &.{ root, "fake-chrome" }), root, &stop, 5000)) |s| {
+        s.destroy();
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }
 
 test "chrome_ends_when_harness_goes_away" {
