@@ -320,3 +320,22 @@ granted host.
 - Smoke gaps 0d1cc79 (version/help/health/start notes; App.open notes a missing url), c78d644 (secret rm, pipe without --stdin), c27b353 (counter refactor), 84500fb (MCP ask/grant/money/cap/dry run on a second server), b7df580 (`harness brief` CLI), 9964c53 (owner-typed secret masked), 46c600d (scheduled ask-means-deny with the skipped note). Rules comment 4d49d74.
 - Ruling: a failed write of state/approvals no longer refuses the question (the nonce tells old buttons apart).
 - Found: a_slow_model_call_ends_with_the_turn flaky (deadline compared in seconds, call timed in ms) → fixed after the merge: client returns TimeUp when the deadline set the call's limit (a_call_ends_by_the_turn_deadline RED→GREEN).
+
+## Final review of the merged branch (ce92875..harness-logins @ 1b8ef3d)
+
+Seams hold (Core.open sets all fields, close order, no lock inversion, mask hook outside locks, money-list check after parallel start, nonce+message id end to end); C1, C4 closed; C2 closed except F2; C3 partly (F4). Second fix pass:
+
+- F1 (Important) An undelivered task re-runs its tools: background() reschedules the whole task (core.zig:1602-1607, 1712); side effects repeat every retry. Keep the composed text per key; retry only its delivery (briefs too, unless re-collecting is intended).
+- F2 (Important) askOwner ignores send failures: parts before the last go out with c.say, which drops errors (core.zig:898), so buttons can sit under a partial question and Allow runs it; and when sending the buttons fails (main.zig:679 → null) every press is "out of date" and the run waits approval_seconds. Send parts with deliver; deny if any part fails; deny at once with no message id.
+- F3 (Important) skill_save is approved without showing what is saved (agent.zig:959-965 detail only for write_file; tools.zig:70). Show name, description and body as the detail (12 KB limit applies).
+- F4 (Important) C3 partly closed: non-dot files the agent writes (pkg.py, conftest.py, Makefile) run under a later rule- or grant-allowed shell command (gate.zig:219, tools.zig:244). After any agent write in the workspace, the next shell call that a rule or grant would allow is asked once, listing the files written; scheduled runs skip it with the skipped note. Rules comment and README say so.
+- F5 (Minor) Owner notices sent while c.lock is held (agent.zig:1002, core.zig:1416-1421): build under the lock, send after.
+- F6 (Minor) K6 caps only shell/browser/MCP: web returns before the cap (agent.zig:935); fetch/search use fixed 30 s idle / 120 s per hop, up to 6 hops (tools.zig:423); a 1 s turn took 4.0 s. Pass the remaining time (total_ms) and honour /stop per hop.
+- F7 (Minor) masksChanged can lose an update when two values are added at once (core.zig:475-488): serialize its body.
+- F8 (Minor) I19 migration: an existing non-default folder on macOS/Windows gets a new random namespace (store.zig:164) and its keys stop being found. Use "harness" when state/store-id is missing but the folder already existed (e.g. has a log or config older than this version); README: delete state/store-id when a copy becomes a second instance.
+- F9 (Ruling reversed) `max_per_day = 0` / `max_per_call = 0` in an mcp.ini section silently lifts config.ini's cap. Make it explicit: `none` lifts the cap for that server (said in start notes and /status); `0` in a section is an error.
+- F10 (Important, pre-existing) URL rules match the raw URL as a glob: `allow fetch https://*.good.com/*` matches `https://evil.com/.good.com/`. Match URL-tool rules by parts: scheme, host (glob on the host only) and path.
+- F11 (Important, pre-existing) userinfo URLs: browse follows `https://good.com@evil.com/` to evil.com. Refuse URLs with userinfo (or parse the real host with std.Uri everywhere a host is taken: gate grant keys, browse host rules, fetch, web).
+- Noted, not fixed: K13 a page could move a cross-site frame under the pointer between the cover check and the press (theoretical); Keychain/Credential Manager namespace code has no test (HARNESS_STORE set everywhere) — add a pure-function test if missing.
+
+Assignment: X (F1-F5, F7, F8) branch fix2/core; Y (F6, F9, F10, F11) branch fix2/urls.
