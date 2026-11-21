@@ -4,7 +4,7 @@
 # Usage: smoke.sh HARNESS HARNESS_FAKE
 set -u
 H=$1
-# absolute: MCP servers start in the workspace folder
+# absolute: MCP servers start in a folder of their own (state/mcp/NAME)
 # (pwd -W under Git for Windows: D:/..., a path the Windows program can open)
 F=$(cd "$(dirname "$2")" && { pwd -W 2>/dev/null || pwd; })/$(basename "$2")
 T=$(mktemp -d)
@@ -287,7 +287,8 @@ RPID=""
 check "the log chain verifies" '"$H" log verify | grep -qF "chain intact"'
 check "no secret value in the log, typed by the owner or not" '! grep -qE "og-smoke-key-123|telegram-smoke-token|brave-smoke-key|smoke-login-pass" "$HARNESS_HOME/log/actions.jsonl"'
 check "a login is removed with its secrets" '"$H" login rm bot >/dev/null && "$H" login list | grep -qF "No logins." && [ ! -e "$HARNESS_STORE/login-bot-password" ] && ! grep -qF "[bot]" "$HARNESS_HOME/logins.ini"'
-# Windows keeps a killed instance's lock for 90 s (no pid check there)
+# left out on Windows until it has been seen to pass there: the 90 s lock
+# it was skipped for is gone (HANDOFF-windows-audit.md, section 3)
 if [ $windows = 0 ]; then
 	check "memory list works offline" '"$H" memory list 2>/dev/null | grep -qF "I prefer short briefs"'
 fi
