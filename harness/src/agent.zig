@@ -719,7 +719,9 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         const left = r.deadline_s - r.now();
         if (left <= 0) {
             if (tool == .money) releaseMoney(r, now_s, amount);
-            return .{ .text = "not run: no time left in this turn", .is_error = true };
+            const late: tools.Output = .{ .text = "not run: no time left in this turn", .is_error = true };
+            try r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = name, .arg = arg, .is_error = true, .output = late.text });
+            return late;
         }
         const secs: u32 = @intCast(@min(left, std.math.maxInt(u32)));
         env.shell_seconds = @min(env.shell_seconds, secs);
@@ -1568,7 +1570,10 @@ test "a_helpers_question_after_the_deadline_is_not_asked" {
     const r = try f.say("run two");
     freeResult(&f.run, r);
     try t.expectEqual(1, f.asked);
-    try t.expect(std.mem.indexOf(u8, try f.logText(), "no time left in the turn to ask") != null);
+    const lt = try f.logText();
+    try t.expect(std.mem.indexOf(u8, lt, "no time left in the turn to ask") != null);
+    // the one answered after the end is not run either, and the log says so
+    try t.expect(std.mem.indexOf(u8, lt, "not run: no time left in this turn") != null);
 }
 
 test "long_conversation_is_summarised_not_dropped" {
