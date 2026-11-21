@@ -645,6 +645,8 @@ fn chatCmd(app: *App) !Exit {
         }
         try c.handleText(line);
     }
+    // no one is left to answer: the question waiting, and any after it, is Deny
+    c.closeQuestions();
     // let queued and running turns finish their answers
     var waited: u32 = 0;
     while (waited < 15 * 60 * 1000) : (waited += 50) {

@@ -144,6 +144,8 @@ const Approval = struct {
     waiting: bool = false,
     /// Whether the waiting question offers "Allow 24 h" (money does not).
     allow_day: bool = true,
+    /// No one is there to answer: nothing more is asked.
+    closed: bool = false,
     answer: ?agent.Answer = null,
     msg: ?i64 = null,
 };
@@ -628,6 +630,15 @@ pub const Core = struct {
         return true;
     }
 
+    /// No one is there to answer any more (the terminal's input ended): the
+    /// question waiting is denied, and later calls that would ask are too.
+    pub fn closeQuestions(c: *Core) void {
+        c.approval.mutex.lockUncancelable(c.io);
+        defer c.approval.mutex.unlock(c.io);
+        c.approval.closed = true;
+        if (c.approval.waiting) c.approval.answer = .deny;
+    }
+
     pub fn approvalWaiting(c: *Core) bool {
         c.approval.mutex.lockUncancelable(c.io);
         defer c.approval.mutex.unlock(c.io);
@@ -646,6 +657,7 @@ pub const Core = struct {
         const id = blk: {
             c.approval.mutex.lockUncancelable(c.io);
             defer c.approval.mutex.unlock(c.io);
+            if (c.approval.closed) return .deny;
             if (!c.approval.loaded) {
                 c.approval.id = c.loadApprovalId();
                 c.approval.loaded = true;
@@ -1887,6 +1899,25 @@ test "approval_ids_go_on_after_a_restart_so_an_old_button_answers_nothing" {
     f.core.handleCallback(42, "a2:deny");
     try f.rec.waitFor("second done");
     try t.expect(std.mem.indexOf(u8, try f.e.request(4), "denied by the owner") != null);
+}
+
+test "closing_the_terminal_denies_the_question_and_any_after_it" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo one\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "shell", "{\"command\":\"echo two\"}"));
+    try f.e.script(3, model.textReply("gave up"));
+    try f.core.startWorker();
+    try f.core.handleText("run both");
+    try f.rec.waitFor("BUTTONS Allow this?\nshell: echo one");
+    const start = Io.Clock.awake.now(t.io).nanoseconds;
+    f.core.closeQuestions();
+    try f.rec.waitFor("gave up");
+    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - start < 3 * std.time.ns_per_s);
+    // the second call was not asked at all
+    try t.expectEqual(1, f.rec.count("BUTTONS"));
+    try t.expectEqual(2, std.mem.count(u8, try f.e.request(3), "denied by the owner"));
 }
 
 test "stop_ends_running_turn_and_reports" {
