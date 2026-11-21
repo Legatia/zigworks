@@ -57,12 +57,14 @@ Everything for one instance is in one folder (`--home DIR`,
 `HARNESS_HOME`, or `$XDG_DATA_HOME/harness`, by default
 `~/.local/share/harness`; `%LOCALAPPDATA%\harness` on Windows). Copy it to
 move the instance. On macOS and Windows the secrets are in the system's
-key store under a name kept in `state/store-id` (`harness` for the default
-folder), so a copy keeps them and each folder made apart has its own; a
-copy you run as a second instance shares them until you delete its
-`state/store-id`. On Linux they are in `secrets/`, files only you can
-read, so a copy carries them. With `HARNESS_STORE=DIR` they are files in
-DIR.
+key store under a name kept in `state/store-id`: `harness` for the
+default folder and for a folder an earlier harness used, a name of its
+own for a folder made since. So a copy keeps them, and each folder made
+apart has its own. A copy you run as a second instance shares them; to
+give it secrets of its own, make its folder with `harness init --home
+DIR`, copy everything but `state/store-id` into it, and add its secrets
+there. On Linux they are in `secrets/`, files only you can read, so a
+copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 
 | Path | What |
 |---|---|
@@ -78,7 +80,7 @@ DIR.
 | `workspace/` | where the agent's files and commands live |
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
-| `state/` | grants, seen feed items, owner, status, lock, approval numbers, money totals, the log's key, `store-id`, `mcp/NAME` (each MCP server's own folder) |
+| `state/` | grants, seen feed items, owner, status, lock, approval numbers, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command (`written`), `mcp/NAME` (each MCP server's own folder) |
 
 On macOS and Linux, `config.ini`, `rules`, `logins.ini` and `mcp.ini` are
 refused if other users can write them. Harness names a settings file it
@@ -106,15 +108,23 @@ allow fetch https://news.ycombinator.com/*
 allow shell git status
 ```
 
+After the agent writes a file in the workspace, a shell command that a
+rule or a grant allows is asked first, naming the files written since you
+last allowed a command (a `pkg.py` or `Makefile` can change what a
+command runs), until you allow one; a scheduled run skips it. The list
+is kept in `state/written`.
+
 File rules and grants see the path inside the workspace: `./notes/a`,
 `x/../notes/a`, its absolute path or a symlink to it count as `notes/a`,
 and on macOS and Windows so does `Notes/A`. A grant covers the exact
 command, path or MCP tool, or a host in any letter case. A `deny` rule
 applies to briefs.ini sources too.
 
-`ask` sends you the whole call (a file's content too) with three buttons:
+`ask` sends you the whole call (a file's content, a skill's description
+and body too) with three buttons:
 Allow once, Allow 24 h, Deny. A long one comes in several messages with
-the buttons on the last; a call over 12 KB is refused. A button from
+the buttons on the last; a call over 12 KB is refused, and so is one
+whose question, or any part of it, could not be sent. A button from
 before a restart, or under another question, answers nothing, and harness
 says it is out of date. No answer in `approval_seconds` (default 10
 minutes), or before the turn's time (`turn_seconds`) is up, counts as
@@ -304,7 +314,8 @@ not have is not started.
 Skills are folders in the agentskills.io format (`skills/NAME/SKILL.md`
 with `name` and `description`). The agent sees their names and
 descriptions, loads one with `skill` when it fits, and can save one with
-`skill_save` (asked). `/skills` lists them, `/skill rm NAME` removes one.
+`skill_save` (asked, showing its name, description and body). `/skills`
+lists them, `/skill rm NAME` removes one.
 
 ## The log
 
@@ -357,9 +368,12 @@ topic go in; the brief says how many more there were, and those are not
 sent later. A quiet day costs no model call. A feed's redirect is
 followed on its own host, to another host only with an `allow fetch` rule
 or a grant. A brief missed while harness was down runs when it starts. A
-brief or task whose answer does not get through runs again after 5
-minutes, then 10, 20 … up to 2 hours. `/brief` sends one now; `/topic add`
-and `/topic rm` change the topics from chat.
+brief or task whose message does not get through is sent again as it was
+written after 5 minutes, then 10, 20 … up to 2 hours; nothing is fetched,
+written or run again for it, and it does not run again until it is
+delivered. The message is kept in memory only: after a restart the brief
+or task runs again. `/brief` sends one now; `/topic add` and `/topic rm`
+change the topics from chat.
 
 ## Scheduled tasks
 

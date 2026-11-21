@@ -88,12 +88,25 @@ pub const Store = union(enum) {
 const is_mac = builtin.os.tag == .macos;
 const is_windows = builtin.os.tag == .windows;
 
-/// The system's store (macOS, Windows) under a data folder's namespace;
-/// null elsewhere.
-pub fn system(ns: []const u8) ?Store {
-    if (is_mac) return .{ .keychain = ns };
-    if (is_windows) return .{ .wincred = ns };
-    return null;
+/// Where the secrets of the data folder `home` are kept on `os`:
+/// HARNESS_STORE=DIR (`store_env`) as given; on macOS the Keychain and on
+/// Windows the Credential Manager, under the folder's namespace
+/// (`namespace`; `is_default`: the built-in folder); elsewhere a file per
+/// secret in DATA/secrets.
+pub fn forFolder(io: Io, a: std.mem.Allocator, os: std.Target.Os.Tag, store_env: ?[]const u8, home: []const u8, is_default: bool) !Store {
+    if (store_env) |d| if (d.len > 0) return .{ .dir = d };
+    return switch (os) {
+        .macos => .{ .keychain = try namespace(io, a, home, is_default) },
+        .windows => .{ .wincred = try namespace(io, a, home, is_default) },
+        else => .{ .dir = try std.fs.path.join(a, &.{ home, "secrets" }) },
+    };
+}
+
+/// For `harness init`, before it writes the folder's files: on macOS and
+/// Windows the folder's namespace is made now, so a folder made by this
+/// harness is never taken for one an earlier harness used.
+pub fn claimNamespace(io: Io, a: std.mem.Allocator, os: std.Target.Os.Tag, home: []const u8, is_default: bool) !void {
+    if (os == .macos or os == .windows) _ = try namespace(io, a, home, is_default);
 }
 
 fn dirPut(io: Io, path: []const u8, name: []const u8, value: []const u8) !void {
@@ -135,12 +148,14 @@ fn dirGet(io: Io, gpa: std.mem.Allocator, path: []const u8, name: []const u8) Er
 pub const legacy_namespace = "harness";
 
 /// The namespace a data folder's secrets are kept under in the system's
-/// store: "harness" for the built-in folder (`is_default`), where every
-/// harness before this one kept them all, so they keep working;
-/// "harness-" and 16 random hex digits for any other folder. Made once and
-/// kept in DATA/state/store-id: a folder moved or copied keeps its
-/// secrets, two folders made apart never share them. A damaged id is
-/// error.BadStoreId, never a guess.
+/// store: "harness" for the built-in folder (`is_default`) and for any
+/// folder an earlier harness used (it has settings or a log, but no
+/// store-id), since every harness before this one kept all secrets there,
+/// so they keep working; "harness-" and 16 random hex digits for a new
+/// folder. Made once and kept in DATA/state/store-id: a folder moved or
+/// copied keeps its secrets, two folders made apart never share them (init
+/// makes the id before the folder's files: `claimNamespace`). A damaged id
+/// is error.BadStoreId, never a guess.
 pub fn namespace(io: Io, a: std.mem.Allocator, home: []const u8, is_default: bool) ![]const u8 {
     const state = try std.fs.path.join(a, &.{ home, "state" });
     const path = try std.fs.path.join(a, &.{ state, "store-id" });
@@ -161,7 +176,7 @@ pub fn namespace(io: Io, a: std.mem.Allocator, home: []const u8, is_default: boo
             else => return e,
         }
         var made: [legacy_namespace.len + 1 + 16]u8 = undefined;
-        const ns: []const u8 = if (is_default) legacy_namespace else blk: {
+        const ns: []const u8 = if (is_default or usedBefore(io, a, home)) legacy_namespace else blk: {
             var raw: [8]u8 = undefined;
             try io.randomSecure(&raw);
             break :blk std.fmt.bufPrint(&made, "{s}-{s}", .{ legacy_namespace, &std.fmt.bytesToHex(raw, .lower) }) catch unreachable;
@@ -181,6 +196,20 @@ pub fn namespace(io: Io, a: std.mem.Allocator, home: []const u8, is_default: boo
         return a.dupe(u8, ns);
     }
     return error.BadStoreId;
+}
+
+/// Whether a harness used `home` before it had a store-id: it has the
+/// settings init writes, or the log every start writes.
+fn usedBefore(io: Io, a: std.mem.Allocator, home: []const u8) bool {
+    for ([_][]const []const u8{ &.{ home, "config.ini" }, &.{ home, "log", "actions.jsonl" } }) |parts| {
+        const p = std.fs.path.join(a, parts) catch return true;
+        if (Io.Dir.cwd().access(io, p, .{})) |_| return true else |e| switch (e) {
+            error.FileNotFound => {},
+            // can't tell: the old namespace loses nothing that was stored
+            else => return true,
+        }
+    }
+    return false;
 }
 
 /// "harness", or "harness-" and 16 lowercase hex digits.
@@ -368,6 +397,105 @@ test "the directory store keeps, replaces and removes values" {
     try t.expect(try s.remove(io, "gh"));
     try t.expect(!try s.remove(io, "gh"));
     try t.expectEqual(null, try s.get(io, t.allocator, "gh"));
+}
+
+test "a_folder_from_before_namespaces_keeps_the_old_one_and_only_a_new_folder_gets_its_own" {
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    // made and used by a harness before namespaces: its settings, or its
+    // log, and no state/store-id
+    try tmp.dir.createDirPath(io, "old-settings");
+    try tmp.dir.writeFile(io, .{ .sub_path = "old-settings/config.ini", .data = "[model]\n" });
+    try tmp.dir.createDirPath(io, "old-log/log");
+    try tmp.dir.writeFile(io, .{ .sub_path = "old-log/log/actions.jsonl", .data = "{}\n" });
+    for ([_][]const u8{ "old-settings", "old-log" }) |name| {
+        const home = try std.fs.path.join(a, &.{ root, name });
+        // its secrets were stored under "harness": they keep being found
+        try t.expectEqualStrings(legacy_namespace, try namespace(io, a, home, false));
+        // and that is what it keeps from now on
+        try t.expectEqualStrings("harness\n", try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ home, "state", "store-id" }), a, .limited(64)));
+        try t.expectEqualStrings(legacy_namespace, try namespace(io, a, home, false));
+    }
+    // a folder not made yet, or still empty, gets one of its own
+    try tmp.dir.createDirPath(io, "empty");
+    for ([_][]const u8{ "new", "empty" }) |name| {
+        const ns = try namespace(io, a, try std.fs.path.join(a, &.{ root, name }), false);
+        try t.expect(validNamespace(ns));
+        try t.expect(!std.mem.eql(u8, ns, legacy_namespace));
+    }
+}
+
+test "init_makes_a_new_folders_namespace_before_its_files" {
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    // what init does: the namespace first, then the settings files
+    const home = try std.fs.path.join(a, &.{ root, "made-by-init" });
+    try claimNamespace(io, a, .macos, home, false);
+    try Io.Dir.cwd().createDirPath(io, home);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ home, "config.ini" }), .data = "[model]\n" });
+    // so with its settings in place it is still a new folder, not an old one
+    const ns = try namespace(io, a, home, false);
+    try t.expect(validNamespace(ns));
+    try t.expect(!std.mem.eql(u8, ns, legacy_namespace));
+    // where the system's store is not used, nothing is written
+    const lin = try std.fs.path.join(a, &.{ root, "linux" });
+    try claimNamespace(io, a, .linux, lin, false);
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try std.fs.path.join(a, &.{ lin, "state", "store-id" }), .{}));
+}
+
+test "the_store_a_folder_uses_and_the_names_its_secrets_get_there" {
+    // only which store and under which names: the Keychain and the
+    // Credential Manager themselves are never touched
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const def = try std.fs.path.join(a, &.{ root, "default" });
+    const other = try std.fs.path.join(a, &.{ root, "other" });
+    const old = try std.fs.path.join(a, &.{ root, "old" });
+    try Io.Dir.cwd().createDirPath(io, old);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ old, "config.ini" }), .data = "[model]\n" });
+    // HARNESS_STORE=DIR is used as given, on every system
+    for ([_]std.Target.Os.Tag{ .macos, .windows, .linux }) |os| {
+        const s = try forFolder(io, a, os, "/srv/harness-secrets", other, false);
+        try t.expect(s == .dir);
+        try t.expectEqualStrings("/srv/harness-secrets", s.dir);
+    }
+    // macOS: the Keychain, the folder's namespace as the items' service
+    // (their account is the secret's name)
+    const k_def = try forFolder(io, a, .macos, null, def, true);
+    try t.expect(k_def == .keychain);
+    try t.expectEqualStrings(legacy_namespace, k_def.keychain);
+    const k_other = try forFolder(io, a, .macos, null, other, false);
+    try t.expect(validNamespace(k_other.keychain));
+    try t.expect(!std.mem.eql(u8, k_other.keychain, legacy_namespace));
+    try t.expectEqualStrings(legacy_namespace, (try forFolder(io, a, .macos, null, old, false)).keychain);
+    // Windows: the Credential Manager, targets NAMESPACE:NAME; the same
+    // folder has the same namespace
+    const w_other = try forFolder(io, a, .windows, null, other, false);
+    try t.expect(w_other == .wincred);
+    try t.expectEqualStrings(k_other.keychain, w_other.wincred);
+    var buf: [256]u16 = undefined;
+    const want = try std.unicode.utf8ToUtf16LeAlloc(a, try std.fmt.allocPrint(a, "{s}:login-bot-password", .{w_other.wincred}));
+    try t.expectEqualSlices(u16, want, try targetName(&buf, w_other.wincred, "login-bot-password"));
+    try t.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("harness:omnigate"), try targetName(&buf, (try forFolder(io, a, .windows, null, def, true)).wincred, "omnigate"));
+    // elsewhere: a file per secret in DATA/secrets
+    const l_other = try forFolder(io, a, .linux, null, other, false);
+    try t.expect(l_other == .dir);
+    try t.expectEqualStrings(try std.fs.path.join(a, &.{ other, "secrets" }), l_other.dir);
 }
 
 test "each_data_folder_keeps_its_secrets_under_a_namespace_of_its_own" {

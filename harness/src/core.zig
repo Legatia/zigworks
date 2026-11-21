@@ -48,6 +48,7 @@ pub const Paths = struct {
     money: []const u8,
     logins: []const u8,
     profiles: []const u8,
+    written: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -82,6 +83,7 @@ pub const Paths = struct {
             .money = try j(a, &.{ state, "money" }),
             .logins = try j(a, &.{ home, "logins.ini" }),
             .profiles = try j(a, &.{ home, "profiles" }),
+            .written = try j(a, &.{ state, "written" }),
         };
     }
 };
@@ -206,6 +208,10 @@ pub const Core = struct {
     masks: masks.List,
     /// The list the log and memory mask with (see masksChanged).
     mask_snap: []const scrub.Secret,
+    /// One masksChanged at a time (see there).
+    mask_mutex: Io.Mutex = .init,
+    /// Tests: called in masksChanged between taking the list and setting it.
+    mask_pause: ?*const fn (c: *Core) void = null,
     workspace: []const u8,
 
     grants: gate.Grants,
@@ -248,6 +254,9 @@ pub const Core = struct {
     settings_mutex: Io.Mutex = .init,
     /// Guards `seen` (briefs read a copy).
     seen_mutex: Io.Mutex = .init,
+    /// The files the agent wrote since the owner last allowed a shell
+    /// command (state/written): a command a rule or grant allows asks first.
+    written: agent.Written,
 
     chan: ?Channel = null,
     owner: ?i64 = null,
@@ -282,7 +291,8 @@ pub const Core = struct {
     running: std.StringHashMapUnmanaged(void) = .empty,
     paused: std.StringHashMapUnmanaged(void) = .empty,
     /// Briefs and tasks whose message did not get through, by the same
-    /// keys as `ran`: when they run again.
+    /// keys as `ran`: the message, and when it is sent again. Kept in
+    /// memory only: after a restart such a brief or task runs again.
     retry: std.StringHashMapUnmanaged(Retry) = .empty,
     last_status_s: i64 = 0,
 
@@ -366,9 +376,13 @@ pub const Core = struct {
         // values added later (a sign-up password, a secret found on
         // /reload) reach the log's and memory's masks too
         c.mask_snap = &.{};
+        c.mask_mutex = .init;
+        c.mask_pause = null;
         c.masks.on_change = .{ .ctx = c, .changed = masksChanged };
         c.seen = .init(gpa);
         c.seen.load(io, c.paths.seen) catch {};
+        c.written = .init(gpa, io, c.paths.written);
+        errdefer c.written.deinit();
         c.lock = .init;
         c.helper_pool = .{};
         c.ask_lock = .init;
@@ -454,6 +468,7 @@ pub const Core = struct {
         c.conv.deinit();
         c.chat_client.deinit();
         c.seen.deinit();
+        c.written.deinit();
         c.mem.deinit();
         c.log.close();
         c.grants.deinit();
@@ -462,6 +477,8 @@ pub const Core = struct {
         freeKeys(c.gpa, &c.ran);
         freeKeys(c.gpa, &c.running);
         freeKeys(c.gpa, &c.paused);
+        var kept = c.retry.valueIterator();
+        while (kept.next()) |r| r.msg.deinit(c.gpa);
         freeKeys(c.gpa, &c.retry);
         c.releaseFolder();
         c.settings_arena.deinit();
@@ -471,10 +488,16 @@ pub const Core = struct {
     }
 
     /// The mask list grew: the log and memory mask with the new list from
-    /// now on. The strings belong to the list; only the slice is ours.
+    /// now on. The strings belong to the list; only the slice is ours. One
+    /// at a time, each taking the list as it is then: of two values added
+    /// at once, the one that sets its list last has both, so the log and
+    /// memory never end on the older list.
     fn masksChanged(ctx: *anyopaque) void {
         const c: *Core = @ptrCast(@alignCast(ctx));
+        c.mask_mutex.lockUncancelable(c.io);
+        defer c.mask_mutex.unlock(c.io);
         const snap = c.masks.snapshot(c.gpa) catch return;
+        if (c.mask_pause) |p| p(c);
         c.log.setSecrets(snap) catch {
             c.gpa.free(snap);
             return;
@@ -895,7 +918,13 @@ pub const Core = struct {
             c.approval.shown = false;
             c.approval.early = null;
         }
-        for (heads) |h| c.say(h);
+        // a part that did not get through: the owner would answer what they
+        // did not see, so no buttons go out and nothing is allowed
+        for (heads) |h| c.deliver(h) catch {
+            c.endQuestion();
+            c.say(not_sent_note);
+            return .unsent;
+        };
         const msg = if (allow_day)
             ch.buttons(ch.ctx, text, &.{ .{ "Allow once", data[0] }, .{ "Allow 24 h", data[1] }, .{ "Deny", data[2] } })
         else
@@ -916,6 +945,14 @@ pub const Core = struct {
             break :blk e.msg;
         };
         if (early_elsewhere) |m| c.tellOutOfDate(m);
+        // no message id: no press can be told to be this question's, so
+        // none would count; refused now rather than after approval_seconds
+        if (msg == null) {
+            c.endQuestion();
+            c.log.write(.chat, false, .{ .event = "not delivered", .why = "the question's buttons could not be sent", .bytes = text.len }) catch {};
+            c.say(not_sent_note);
+            return .unsent;
+        }
         const deadline = c.now() + c.cfg.limits.approval_seconds;
         var ans: agent.Answer = .timeout;
         while (true) {
@@ -936,17 +973,22 @@ pub const Core = struct {
             if (q.deadline_s > 0 and util.nowSeconds(c.io) >= q.deadline_s) break;
             c.io.sleep(.fromMilliseconds(50), .awake) catch {};
         }
-        {
-            c.approval.mutex.lockUncancelable(c.io);
-            defer c.approval.mutex.unlock(c.io);
-            c.approval.waiting = false;
-            c.approval.msg = null;
-            c.approval.shown = false;
-            c.approval.early = null;
-        }
+        c.endQuestion();
         if (msg) |m| ch.clear(ch.ctx, m);
         if (ans == .timeout) c.say("No answer in time; not allowed.");
         return ans;
+    }
+
+    const not_sent_note = "The question could not be sent, so the call is not allowed.";
+
+    /// Nothing is asked any more: a press from now on is out of date.
+    fn endQuestion(c: *Core) void {
+        c.approval.mutex.lockUncancelable(c.io);
+        defer c.approval.mutex.unlock(c.io);
+        c.approval.waiting = false;
+        c.approval.msg = null;
+        c.approval.shown = false;
+        c.approval.early = null;
     }
 
     fn approvalsPath(c: *Core, buf: []u8) ![]const u8 {
@@ -1110,6 +1152,7 @@ pub const Core = struct {
             .store = c.store,
             .profiles_dir = c.paths.profiles,
             .masks = &c.masks,
+            .written = &c.written,
         };
     }
 
@@ -1413,12 +1456,19 @@ pub const Core = struct {
             // switched on while the writer's call ran
             if (c.switches.private.load(.acquire)) break;
             n += 1;
-            c.lock.lockUncancelable(c.io);
-            defer c.lock.unlock(c.io);
-            const res = c.mem.addFrom(l[2..], null, c.now(), .other) catch continue;
-            try c.log.write(.memory, false, .{ .event = if (res.merged) "known" else "add", .id = res.id, .by = "memory writer" });
-            // the owner sees what goes into every later prompt
-            if (!res.merged) if (c.mem.find(res.id)) |item| c.say(try memory.savedNote(a, item.id, item.body));
+            // the owner sees what goes into every later prompt: the note is
+            // made under the lock and sent after it, as a send can wait on
+            // the network while every run needs the lock
+            const note = note: {
+                c.lock.lockUncancelable(c.io);
+                defer c.lock.unlock(c.io);
+                const res = c.mem.addFrom(l[2..], null, c.now(), .other) catch break :note null;
+                try c.log.write(.memory, false, .{ .event = if (res.merged) "known" else "add", .id = res.id, .by = "memory writer" });
+                if (res.merged) break :note null;
+                const item = c.mem.find(res.id) orelse break :note null;
+                break :note try memory.savedNote(a, item.id, item.body);
+            };
+            if (note) |text| c.say(text);
         }
     }
 
@@ -1494,13 +1544,15 @@ pub const Core = struct {
         if (c.stop.load(.acquire)) return;
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
+        // messages that did not get through go again when their wait is over
+        c.resendDue(now_s);
         const today = c.localDay(now_s);
         const minutes = c.localMinutes(now_s);
         for (c.briefs) |b| {
             if (minutes < b.at_minutes) continue;
             const key = keyFor("brief", b.name);
             if ((c.getRan(key.slice()) orelse -1) >= today) continue;
-            if (c.retryLater(key.slice(), now_s)) continue;
+            if (c.waitsToBeSent(key.slice())) continue;
             _ = c.startBackground(.{ .brief = b }, key.slice(), now_s);
         }
         const weekday = util.weekday(today);
@@ -1515,18 +1567,60 @@ pub const Core = struct {
                 if (minutes < at) continue;
                 if (last) |l| if (c.localDay(l) >= today) continue;
             }
-            if (c.retryLater(key.slice(), now_s)) continue;
+            if (c.waitsToBeSent(key.slice())) continue;
             _ = c.startBackground(.{ .task = tk }, key.slice(), now_s);
         }
     }
 
-    /// Whether `key`'s last message did not get through and it waits
-    /// before it runs again.
-    fn retryLater(c: *Core, key: []const u8, now_s: i64) bool {
+    /// Whether `key`'s last message did not get through: until it has, the
+    /// brief or task does not run again (`resendDue` sends it).
+    fn waitsToBeSent(c: *Core, key: []const u8) bool {
         c.state_mutex.lockUncancelable(c.io);
         defer c.state_mutex.unlock(c.io);
-        const r = c.retry.get(key) orelse return false;
-        return now_s < r.at;
+        return c.retry.contains(key);
+    }
+
+    /// Starts sending again each kept message whose wait is over.
+    fn resendDue(c: *Core, now_s: i64) void {
+        var due: [16]Key = undefined;
+        var n: usize = 0;
+        {
+            c.state_mutex.lockUncancelable(c.io);
+            defer c.state_mutex.unlock(c.io);
+            var it = c.retry.iterator();
+            while (it.next()) |e| {
+                if (n == due.len) break;
+                if (now_s < e.value_ptr.at or c.running.contains(e.key_ptr.*)) continue;
+                const k = e.key_ptr.*;
+                due[n] = .{};
+                if (k.len > due[n].buf.len) continue;
+                @memcpy(due[n].buf[0..k.len], k);
+                due[n].len = k.len;
+                n += 1;
+            }
+        }
+        for (due[0..n]) |*k| _ = c.startBackground(.resend, k.slice(), now_s);
+    }
+
+    /// A message kept for `key` (it did not get through): from now on it is
+    /// what goes, after a wait of 5 minutes, then 10, 20, … 2 hours. A
+    /// message kept before for the key is replaced. Under state_mutex.
+    fn keepUndelivered(c: *Core, key: []const u8, msg: Undelivered, ran: i64, now_s: i64) void {
+        var tries: u32 = 1;
+        if (c.retry.getPtr(key)) |old| {
+            tries = old.tries + 1;
+            old.msg.deinit(c.gpa);
+            old.msg = .{ .text = &.{} };
+        }
+        putKey(c.gpa, &c.retry, key, Retry{ .at = now_s + retryWait(tries), .tries = tries, .msg = msg, .ran = ran }) catch msg.deinit(c.gpa);
+    }
+
+    /// Drops the message kept for `key`, if any. Under state_mutex.
+    fn dropUndelivered(c: *Core, key: []const u8) void {
+        if (c.retry.fetchRemove(key)) |kv| {
+            kv.value.msg.deinit(c.gpa);
+            c.gpa.free(kv.key);
+        }
     }
 
     const Key = struct {
@@ -1556,7 +1650,9 @@ pub const Core = struct {
         return c.paused.contains(name);
     }
 
-    const Job = union(enum) { brief: config.Brief, task: config.Task };
+    /// A brief or task to run, or a message of one to send again (the
+    /// key's, in `retry`).
+    const Job = union(enum) { brief: config.Brief, task: config.Task, resend };
 
     const Start = enum { started, already_running, restarting, slots_taken, failed };
 
@@ -1590,43 +1686,126 @@ pub const Core = struct {
             c.state_mutex.unlock(c.io);
             _ = c.bg_active.fetchSub(1, .acq_rel);
         }
+        if (job == .resend) return c.resend(key);
         // a run that failed or was stopped still counts for its slot, so
         // the scheduler does not start it again right away
+        var kept: ?Undelivered = null;
         const outcome: Outcome = switch (job) {
-            .brief => |b| c.runBrief(b) catch .done,
-            .task => |tk| c.runTask(tk) catch .done,
+            .brief => |b| c.runBriefKeeping(b, &kept) catch .done,
+            .task => |tk| c.runTaskKeeping(tk, &kept) catch .done,
+            .resend => unreachable,
         };
-        const now_s = c.now();
-        c.state_mutex.lockUncancelable(c.io);
-        defer c.state_mutex.unlock(c.io);
-        if (outcome == .undelivered) {
-            // not counted as run: again in 5 minutes, then 10, 20, … 2 hours
-            const tries: u32 = if (c.retry.get(key)) |r| r.tries + 1 else 1;
-            const wait = @min(@as(i64, 5 * 60) << @intCast(@min(tries - 1, 8)), 2 * 3600);
-            putKey(c.gpa, &c.retry, key, Retry{ .at = now_s + wait, .tries = tries }) catch {};
-            return;
-        }
-        removeKey(c.gpa, &c.retry, key);
         // the day it was due, though it may have ended after midnight
         const v: i64 = switch (job) {
             .brief => c.localDay(due_s),
             .task => due_s,
+            .resend => unreachable,
         };
+        const now_s = c.now();
+        c.state_mutex.lockUncancelable(c.io);
+        defer c.state_mutex.unlock(c.io);
+        if (outcome == .undelivered) if (kept) |msg| {
+            // not counted as run until its message is delivered
+            c.keepUndelivered(key, msg, v, now_s);
+            return;
+        };
+        // a message kept from before is not sent after this one
+        c.dropUndelivered(key);
         putKey(c.gpa, &c.ran, key, v) catch {};
         c.saveRan();
+    }
+
+    /// Sends again the message kept for `key`. Delivered, the brief or task
+    /// counts as run when it was due, and a brief's links as seen.
+    fn resend(c: *Core, key: []const u8) void {
+        // the entry stays while it is sent; only this key's run (which
+        // `running` keeps from starting) changes or drops it
+        const r = blk: {
+            c.state_mutex.lockUncancelable(c.io);
+            defer c.state_mutex.unlock(c.io);
+            break :blk c.retry.get(key) orelse return;
+        };
+        const kp = keyParts(key);
+        c.deliver(r.msg.text) catch |e| {
+            c.log.write(kp.kind, false, .{ .name = kp.name, .event = "not delivered", .why = whyUndelivered(e), .tries = r.tries + 1 }) catch {};
+            c.state_mutex.lockUncancelable(c.io);
+            defer c.state_mutex.unlock(c.io);
+            if (worthRetry(e)) {
+                if (c.retry.getPtr(key)) |p| {
+                    p.tries += 1;
+                    p.at = c.now() + retryWait(p.tries);
+                }
+                return;
+            }
+            c.dropUndelivered(key);
+            putKey(c.gpa, &c.ran, key, r.ran) catch {};
+            c.saveRan();
+            return;
+        };
+        c.log.write(kp.kind, false, .{ .name = kp.name, .event = "sent", .tries = r.tries + 1 }) catch {};
+        c.markSeen(r.msg.links) catch {};
+        c.state_mutex.lockUncancelable(c.io);
+        defer c.state_mutex.unlock(c.io);
+        c.dropUndelivered(key);
+        putKey(c.gpa, &c.ran, key, r.ran) catch {};
+        c.saveRan();
+    }
+
+    /// The links of a delivered brief count as seen from now.
+    fn markSeen(c: *Core, links: []const []const u8) !void {
+        if (links.len == 0) return;
+        c.seen_mutex.lockUncancelable(c.io);
+        defer c.seen_mutex.unlock(c.io);
+        const now_s = c.now();
+        for (links) |l| try c.seen.add(l, now_s);
+        c.seen.prune(now_s);
+        c.seen.save(c.io, c.paths.seen) catch {};
     }
 
     /// How a brief or task run ended, for the scheduler.
     pub const Outcome = enum {
         /// Done, failed or stopped: it waits for its next time.
         done,
-        /// Its message did not get through: it runs again a little later.
+        /// Its message did not get through: it is sent again a little later.
         undelivered,
+    };
+
+    /// A message that did not get through, kept to be sent again as it is.
+    pub const Undelivered = struct {
+        text: []u8,
+        /// A brief's links: seen once it is delivered.
+        links: [][]u8 = &.{},
+
+        fn of(gpa: std.mem.Allocator, text: []const u8, links: []const []const u8) !Undelivered {
+            const out_links = try gpa.alloc([]u8, links.len);
+            var n: usize = 0;
+            errdefer {
+                for (out_links[0..n]) |l| gpa.free(l);
+                gpa.free(out_links);
+            }
+            for (links) |l| {
+                out_links[n] = try gpa.dupe(u8, l);
+                n += 1;
+            }
+            return .{ .text = try gpa.dupe(u8, text), .links = out_links };
+        }
+
+        fn deinit(u: Undelivered, gpa: std.mem.Allocator) void {
+            for (u.links) |l| gpa.free(l);
+            gpa.free(u.links);
+            gpa.free(u.text);
+        }
     };
 
     /// Collects, writes and sends a brief. Its items count as seen only
     /// once it got through.
     pub fn runBrief(c: *Core, b: config.Brief) !Outcome {
+        return c.runBriefKeeping(b, null);
+    }
+
+    /// runBrief; a brief that did not get through is kept in `keep` (when
+    /// given), to be sent again as it was written.
+    fn runBriefKeeping(c: *Core, b: config.Brief, keep: ?*?Undelivered) !Outcome {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1650,19 +1829,22 @@ pub const Core = struct {
         if (flag.load(.acquire)) return .done;
         c.deliver(w.text) catch |e| {
             try c.log.write(.brief, false, .{ .name = b.name, .event = "not delivered", .why = whyUndelivered(e) });
-            return if (worthRetry(e)) .undelivered else .done;
+            if (!worthRetry(e)) return .done;
+            if (keep) |k| k.* = try .of(c.gpa, w.text, w.links);
+            return .undelivered;
         };
-        c.seen_mutex.lockUncancelable(c.io);
-        defer c.seen_mutex.unlock(c.io);
-        const now_s = c.now();
-        for (w.links) |l| try c.seen.add(l, now_s);
-        c.seen.prune(now_s);
-        c.seen.save(c.io, c.paths.seen) catch {};
+        try c.markSeen(w.links);
         return .done;
     }
 
     /// Runs a scheduled task once.
     pub fn runTask(c: *Core, tk: config.Task) !Outcome {
+        return c.runTaskKeeping(tk, null);
+    }
+
+    /// runTask; an answer that did not get through is kept in `keep` (when
+    /// given), to be sent again as it is: the task does not run again for it.
+    fn runTaskKeeping(c: *Core, tk: config.Task, keep: ?*?Undelivered) !Outcome {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1709,7 +1891,9 @@ pub const Core = struct {
             try std.fmt.allocPrint(a, "[{s}] {s}{s}{s}", .{ tk.name, res.text, if (note.len > 0) "\n\n" else "", note });
         c.deliver(msg) catch |e| {
             try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = whyUndelivered(e) });
-            return if (worthRetry(e)) .undelivered else .done;
+            if (!worthRetry(e)) return .done;
+            if (keep) |k| k.* = try .of(c.gpa, msg, &.{});
+            return .undelivered;
         };
         try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = true });
         return .done;
@@ -2122,8 +2306,29 @@ pub fn removeSection(a: std.mem.Allocator, text: []const u8, name: []const u8) !
     return out.items;
 }
 
-/// When a brief or task whose message did not get through runs again.
-const Retry = struct { at: i64, tries: u32 };
+/// A brief's or task's message that did not get through: sent again as it
+/// was written when `at` comes, so nothing runs again for it.
+const Retry = struct {
+    at: i64,
+    tries: u32,
+    /// Owned by the core.
+    msg: Core.Undelivered,
+    /// What `ran` gets for the key once the message is delivered.
+    ran: i64,
+};
+
+/// How long a message that did not get through waits before it is sent
+/// again, after `tries` attempts: 5 minutes, then 10, 20, … 2 hours.
+fn retryWait(tries: u32) i64 {
+    return @min(@as(i64, 5 * 60) << @intCast(@min(@max(tries, 1) - 1, 8)), 2 * 3600);
+}
+
+/// The log kind and the name in a key of `ran` ("task:NAME", "brief:NAME",
+/// "brief-now:NAME").
+fn keyParts(key: []const u8) struct { kind: log_mod.Kind, name: []const u8 } {
+    const colon = std.mem.indexOfScalar(u8, key, ':') orelse key.len;
+    return .{ .kind = if (std.mem.startsWith(u8, key, "task:")) .task else .brief, .name = key[@min(colon + 1, key.len)..] };
+}
 
 /// Why a message did not get to the owner, in words for the log.
 fn whyUndelivered(e: anyerror) []const u8 {
@@ -2282,6 +2487,11 @@ const Recorder = struct {
     next_id: i64 = 0,
     /// While set, sends fail with it and nothing is recorded.
     fail: ?anyerror = null,
+    /// While set, a message with buttons is not sent: no message id.
+    buttons_fail: bool = false,
+    /// A lock no send may be made under: one made while it is held is
+    /// recorded with "[lock held] " in front.
+    probe: ?*Io.Mutex = null,
     /// The last question's buttons and the message they are in.
     last: Buttons = .{},
     /// Called once buttons are recorded, before their message id is
@@ -2334,7 +2544,12 @@ const Recorder = struct {
         r.mutex.lockUncancelable(t.io);
         defer r.mutex.unlock(t.io);
         if (r.fail) |e| return e;
-        try r.lines.append(t.allocator, try t.allocator.dupe(u8, text));
+        const held = if (r.probe) |m| blk: {
+            if (!m.tryLock()) break :blk true;
+            m.unlock(t.io);
+            break :blk false;
+        } else false;
+        try r.lines.append(t.allocator, try std.fmt.allocPrint(t.allocator, "{s}{s}", .{ if (held) "[lock held] " else "", text }));
     }
 
     fn buttons(ctx: *anyopaque, text: []const u8, bs: []const [2][]const u8) ?i64 {
@@ -2342,6 +2557,7 @@ const Recorder = struct {
         const shown = blk: {
             r.mutex.lockUncancelable(t.io);
             defer r.mutex.unlock(t.io);
+            if (r.buttons_fail) return null;
             const line = std.fmt.allocPrint(t.allocator, "BUTTONS {s} [{s}]", .{ text, bs[0][1] }) catch return null;
             r.lines.append(t.allocator, line) catch {};
             r.next_id += 1;
@@ -2605,6 +2821,46 @@ test "a_long_question_goes_whole_in_parts_with_the_buttons_on_the_last" {
     try t.expectEqualStrings(try std.fmt.allocPrint(a, "shell: echo {s} end-of-it", .{ys}), whole.items);
     try f.press("deny");
     try f.rec.waitFor("not run");
+}
+
+const not_sent = "the question could not be sent to the owner";
+
+test "a_question_with_a_part_that_did_not_arrive_is_refused_without_buttons" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const ys = try a.alloc(u8, 6000);
+    @memset(ys, 'y');
+    try f.e.script(1, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"shell\",\"input\":{{\"command\":\"echo {s} end-of-it\"}}}}],\"stop_reason\":\"tool_use\"}}", .{ys}));
+    try f.e.script(2, model.textReply("not run"));
+    // the first part does not get through: no buttons go under the rest
+    f.rec.setFail(error.ConnectionClosed);
+    try f.core.startWorker();
+    try f.core.handleText("run the long one");
+    try waitFile(&f.e, "requests/002.json");
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    try t.expect(!f.core.approvalWaiting());
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), not_sent) != null);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"decision\":\"deny\",\"why\":\"" ++ not_sent ++ "\"") != null);
+}
+
+test "a_question_whose_buttons_could_not_be_sent_is_refused_at_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo unasked\"}"));
+    try f.e.script(2, model.textReply("not run"));
+    f.rec.buttons_fail = true;
+    try f.core.startWorker();
+    const start = Io.Clock.awake.now(t.io).nanoseconds;
+    try f.core.handleText("run it");
+    // not approval_seconds (10 minutes) of waiting for an answer that can't come
+    try f.rec.waitFor("not run");
+    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - start < 3 * std.time.ns_per_s);
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    try f.rec.waitFor("The question could not be sent, so the call is not allowed.");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), not_sent) != null);
 }
 
 test "the_owner_is_waited_for_only_until_the_turn_ends" {
@@ -2959,7 +3215,13 @@ fn dueBrief(f: *Fix, items: []const u8) !void {
     try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
 }
 
-test "an_undelivered_brief_is_not_marked_seen_and_is_tried_later" {
+/// How many page and feed requests the stand-in has answered.
+fn pageRequests(f: *Fix) usize {
+    const text = f.e.tmp.dir.readFileAlloc(t.io, "page-requests.jsonl", f.e.arena.allocator(), .unlimited) catch return 0;
+    return std.mem.count(u8, text, "\n");
+}
+
+test "an_undelivered_brief_is_sent_again_as_written_and_marked_seen_once_it_arrives" {
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
@@ -2969,6 +3231,8 @@ test "an_undelivered_brief_is_not_marked_seen_and_is_tried_later" {
     f.core.tick();
     waitIdle(f.core);
     try t.expectEqual(1, f.e.server.modelRequests());
+    const fetched = pageRequests(&f);
+    try t.expect(fetched > 0);
     try t.expect(!f.core.seen.has("https://z.org/1"));
     try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"not delivered\"") != null);
     // not again at once
@@ -2976,14 +3240,61 @@ test "an_undelivered_brief_is_not_marked_seen_and_is_tried_later" {
     t.io.sleep(.fromMilliseconds(300), .awake) catch {};
     waitIdle(f.core);
     try t.expectEqual(1, f.e.server.modelRequests());
-    // a while later it runs again, and this time it arrives
+    // a while later the brief as it was written is sent: nothing is
+    // fetched or written again
     f.rec.setFail(null);
-    try f.e.script(2, model.textReply("Zig: New thing, again (https://z.org/1)"));
+    try f.e.script(2, model.textReply("Zig: New thing, written again (https://z.org/1)"));
     f.core.fixed_now = util.nowSeconds(t.io) + 15 * 60;
     f.core.tick();
-    try f.rec.waitFor("New thing, again");
+    try f.rec.waitFor("Zig: New thing (https://z.org/1)");
     waitIdle(f.core);
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expectEqual(fetched, pageRequests(&f));
     try t.expect(f.core.seen.has("https://z.org/1"));
+    // it counts for the day it was due: not collected again today
+    f.core.tick();
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    waitIdle(f.core);
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expectEqual(1, f.rec.count("New thing"));
+}
+
+test "an_undelivered_task_answer_is_sent_again_without_running_the_task_again" {
+    var f: Fix = undefined;
+    try f.init("", "", "[check]\nevery = 5m\ndo = Check the price.\n");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"prices.txt\",\"content\":\"up 4%\"}"));
+    try f.e.script(2, model.textReply("Price moved 4%."));
+    try f.e.script(3, model.toolReply("tu_2", "write_file", "{\"path\":\"prices.txt\",\"content\":\"run again\"}"));
+    try f.e.script(4, model.textReply("Price moved again."));
+    const t0 = util.nowSeconds(t.io);
+    f.rec.setFail(error.ConnectionClosed);
+    f.core.tick();
+    waitIdle(f.core);
+    try t.expectEqual(2, f.e.server.modelRequests());
+    // after 5 minutes it is sent again; it fails again, so the next try
+    // waits 10 minutes
+    f.core.fixed_now = t0 + 6 * 60;
+    f.core.tick();
+    waitIdle(f.core);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"name\":\"check\",\"event\":\"not delivered\",\"why\":\"ConnectionClosed\",\"tries\":2") != null);
+    f.rec.setFail(null);
+    f.core.fixed_now = t0 + 12 * 60;
+    f.core.tick();
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    waitIdle(f.core);
+    try t.expectEqual(0, f.rec.count("[check]"));
+    // Telegram is back: once the wait is over the answer is sent as it
+    // was written, and the task's tools do not run a second time
+    f.core.fixed_now = t0 + 17 * 60;
+    f.core.tick();
+    try f.rec.waitFor("[check] Price moved 4%.");
+    waitIdle(f.core);
+    try t.expectEqual(2, f.e.server.modelRequests());
+    const lt = try logText(&f);
+    try t.expectEqual(1, std.mem.count(u8, lt, "\"tool\":\"write_file\",\"arg\""));
+    try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"sent\",\"tries\":3") != null);
+    try t.expectEqual(0, f.rec.count("again"));
 }
 
 test "a_task_answer_that_did_not_arrive_is_logged_as_not_sent" {
@@ -3037,6 +3348,48 @@ test "a_scheduled_run_says_what_it_skipped_even_when_it_answers_nothing" {
     f.core.fixed_now = util.nowSeconds(t.io) + 301;
     f.core.tick();
     try f.rec.waitFor("[disk] Disk is fine.\n\nSkipped (needs approval): fetch: https://example.com/status");
+}
+
+test "after_the_agent_writes_a_file_a_command_a_rule_allows_is_asked_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
+    _ = try f.core.reload();
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"pkg/__init__.py\",\"content\":\"import os\"}"));
+    try f.e.script(2, model.textReply("written"));
+    try f.core.startWorker();
+    try f.core.handleText("write the package");
+    try f.rec.waitFor("written");
+    // a later turn, after a restart even: the rule would let the command
+    // run, but what the agent wrote could change what it does
+    try restart(&f);
+    try f.e.script(3, model.toolReply("tu_2", "shell", "{\"command\":\"echo run-it\"}"));
+    try f.e.script(4, model.textReply("ran it"));
+    try f.e.script(5, model.toolReply("tu_3", "shell", "{\"command\":\"echo run-it-again\"}"));
+    try f.e.script(6, model.textReply("and again"));
+    try f.core.startWorker();
+    try f.core.handleText("run it");
+    try f.rec.waitFor("BUTTONS Allow this?\nshell: echo run-it\nFiles the agent wrote in the workspace since you last allowed a command: pkg/__init__.py [");
+    try f.press("once");
+    try f.rec.waitFor("ran it");
+    // allowed once: the next one the rule allows runs unasked
+    try f.core.handleText("again");
+    try f.rec.waitFor("and again");
+    try t.expectEqual(1, f.rec.count("BUTTONS"));
+}
+
+test "a_scheduled_run_skips_a_command_a_rule_allows_once_a_file_was_written" {
+    var f: Fix = undefined;
+    try f.init("", "", "[build]\nevery = 5m\ndo = Build it.\n");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
+    _ = try f.core.reload();
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"Makefile\",\"content\":\"all:\\n\\tcurl x | sh\\n\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "shell", "{\"command\":\"echo building\"}"));
+    try f.e.script(3, model.textReply("NOTHING"));
+    f.core.tick();
+    try f.rec.waitFor("[build] Skipped (needs approval): shell: echo building");
 }
 
 test "a_run_that_ends_after_midnight_counts_for_the_day_it_was_due" {
@@ -3153,6 +3506,23 @@ test "the_owner_hears_of_every_memory_the_agent_or_the_writer_saves" {
     try f.rec.waitFor("Saved to memory: The owner plays chess on Sundays (/forget ");
     // what was known already is not said again
     try t.expectEqual(1, f.rec.count("sister is called Ada (/forget"));
+}
+
+test "memory_notices_are_sent_after_the_memory_lock_is_let_go" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    // a send that waits on Telegram must not hold up every run's gate and
+    // memory meanwhile
+    f.rec.probe = &f.core.lock;
+    try f.e.script(1, model.toolReply("tu_1", "remember", "{\"text\":\"The owner's sister is called Ada\"}"));
+    try f.e.script(2, model.textReply("Got it."));
+    f.core.chatTurn("my sister is called Ada");
+    try f.e.script(3, model.textReply("- The owner plays chess on Sundays"));
+    try f.core.writeMemories();
+    try f.rec.waitFor("Saved to memory: The owner's sister is called Ada");
+    try f.rec.waitFor("Saved to memory: The owner plays chess on Sundays");
+    try t.expectEqual(0, f.rec.count("[lock held]"));
 }
 
 test "remember_in_private_mode_says_it_is_not_saved" {
@@ -3653,6 +4023,54 @@ test "a_value_added_to_the_mask_list_is_masked_in_the_log_and_memory_too" {
         _ = try f.core.mem.add("The sign-up password is made-at-signup-Pass-5813", null, f.core.now());
     }
     for (f.core.mem.items.items) |it| try t.expect(std.mem.indexOf(u8, it.body, "made-at-signup-Pass-5813") == null);
+}
+
+/// Holds the first masksChanged between taking the list and setting it,
+/// until `go`, so a second value can be added meanwhile.
+const MaskRace = struct {
+    var held: std.atomic.Value(bool) = .init(false);
+    var go: std.atomic.Value(bool) = .init(false);
+    var first: std.atomic.Value(bool) = .init(true);
+
+    fn pause(_: *Core) void {
+        if (!first.swap(false, .acq_rel)) return;
+        held.store(true, .release);
+        while (!go.load(.acquire)) t.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+
+    fn add(c: *Core, name: []const u8, value: []const u8) void {
+        c.masks.add(name, value) catch {};
+    }
+};
+
+test "two_values_added_at_once_are_both_masked_in_the_log_and_memory" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.mask_pause = MaskRace.pause;
+    // one sign-up's password is added and its list taken, then held there
+    const one = try std.Thread.spawn(.{}, MaskRace.add, .{ f.core, "login-one-password", "made-at-signup-One-1111" });
+    var waited: u32 = 0;
+    while (!MaskRace.held.load(.acquire) and waited < 5000) : (waited += 5) t.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    try t.expect(MaskRace.held.load(.acquire));
+    // another's is added meanwhile
+    const two = try std.Thread.spawn(.{}, MaskRace.add, .{ f.core, "login-two-password", "made-at-signup-Two-2222" });
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    MaskRace.go.store(true, .release);
+    one.join();
+    two.join();
+    f.core.mask_pause = null;
+    // the log and memory end with the list that has both
+    try f.core.log.write(.config, false, .{ .event = "probe", .detail = "made-at-signup-One-1111 and made-at-signup-Two-2222" });
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "made-at-signup-Two-2222") == null);
+    try t.expect(std.mem.indexOf(u8, lt, "made-at-signup-One-1111") == null);
+    {
+        f.core.lock.lockUncancelable(t.io);
+        defer f.core.lock.unlock(t.io);
+        _ = try f.core.mem.add("The passwords are made-at-signup-One-1111 and made-at-signup-Two-2222", null, f.core.now());
+    }
+    for (f.core.mem.items.items) |it| try t.expect(std.mem.indexOf(u8, it.body, "made-at-signup-Two-2222") == null);
 }
 
 test "reload_takes_a_secret_stored_since_start_and_masks_it" {
