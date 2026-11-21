@@ -315,6 +315,10 @@ pub const MoneyLedger = struct {
     len: usize = 0,
     /// Where it is kept, a line "SERVER DAY TOTAL" each; null in tests.
     path: ?[]const u8 = null,
+    /// Why the record read at start cannot be trusted; while set, every
+    /// money call is refused with it.
+    trouble_buf: [160]u8 = undefined,
+    trouble_len: usize = 0,
 
     /// Servers whose totals are kept at once.
     pub const max_servers = 64;
@@ -333,12 +337,21 @@ pub const MoneyLedger = struct {
         }
     };
 
+    /// Reads the record. One that is there but cannot be read, or is
+    /// damaged, refuses money calls (see `trouble`) rather than starting
+    /// the day from 0.
     pub fn load(l: *MoneyLedger, io: Io) void {
         const p = l.path orelse return;
         var buf: [8192]u8 = undefined;
-        const got = Io.Dir.cwd().readFile(io, p, &buf) catch return;
+        const got = Io.Dir.cwd().readFile(io, p, &buf) catch |e| switch (e) {
+            error.FileNotFound => return,
+            else => return l.setTrouble("the money record (state/money) could not be read ({s})", .{@errorName(e)}),
+        };
+        if (got.len == buf.len) return l.setTrouble("the money record (state/money) is too large", .{});
         var lines = std.mem.tokenizeAny(u8, got, "\r\n");
+        var n_line: usize = 0;
         while (lines.next()) |line| {
+            n_line += 1;
             var parts: [3][]const u8 = undefined;
             var n: usize = 0;
             var it = std.mem.tokenizeAny(u8, line, " \t");
@@ -347,14 +360,26 @@ pub const MoneyLedger = struct {
                 parts[n] = x;
                 n += 1;
             }
-            if (it.next() != null or n < 2) continue;
+            const bad = it.next() != null or n < 2;
             const name = if (n == 2) everyone else parts[0];
-            const day = std.fmt.parseInt(i64, parts[n - 2], 10) catch continue;
-            const total = std.fmt.parseFloat(f64, parts[n - 1]) catch continue;
-            const e = l.entry(name, day) orelse continue;
-            e.day = day;
-            e.total = total;
+            const day = if (bad) null else std.fmt.parseInt(i64, parts[n - 2], 10) catch null;
+            const total = if (bad) null else std.fmt.parseFloat(f64, parts[n - 1]) catch null;
+            const good_total = if (total) |x| x >= 0 and !std.math.isNan(x) and !std.math.isInf(x) else false;
+            const e = if (day != null and good_total) l.entry(name, day.?) else null;
+            const slot = e orelse return l.setTrouble("the money record (state/money) is damaged at line {d}", .{n_line});
+            slot.day = day.?;
+            slot.total = total.?;
         }
+    }
+
+    fn setTrouble(l: *MoneyLedger, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.bufPrint(&l.trouble_buf, fmt, args) catch l.trouble_buf[0..];
+        l.trouble_len = text.len;
+    }
+
+    /// Why money calls are refused whatever they are; null: they are not.
+    pub fn trouble(l: *const MoneyLedger) ?[]const u8 {
+        return if (l.trouble_len > 0) l.trouble_buf[0..l.trouble_len] else null;
     }
 
     fn find(l: *MoneyLedger, name: []const u8) ?*Entry {
@@ -396,37 +421,55 @@ pub const MoneyLedger = struct {
         return so_far;
     }
 
-    /// Counts `amount` toward `server`'s day (`dayFor`); the reservation,
-    /// or null when no entry is free.
-    fn reserve(l: *MoneyLedger, io: Io, server: []const u8, day_in: i64, amount: f64) ?Reservation {
+    /// Counts `amount` toward `server`'s day (`dayFor`) and saves it.
+    /// error.NoRoom when no entry is free; when the save fails, nothing is
+    /// counted and its error is returned: a reservation that would be
+    /// forgotten at the next start is not made.
+    fn reserve(l: *MoneyLedger, io: Io, server: []const u8, day_in: i64, amount: f64) !Reservation {
         const day = l.dayFor(server, day_in);
-        const e = l.entry(server, day) orelse return null;
+        const before = l.entries;
+        const before_len = l.len;
+        const e = l.entry(server, day) orelse return error.NoRoom;
         if (e.day != day) {
             e.day = day;
             e.total = 0;
         }
         e.total += amount;
-        l.save(io);
+        l.save(io, day) catch |err| {
+            l.entries = before;
+            l.len = before_len;
+            return err;
+        };
         return .{ .day = day, .amount = amount };
     }
 
     /// Takes back what `reserve` counted, for a call not made. A day that
     /// is over is left as it was (it no longer counts), and a total never
     /// goes below 0.
-    fn release(l: *MoneyLedger, io: Io, server: []const u8, res: Reservation) void {
+    /// When the save fails, the file keeps the higher total, which is
+    /// the safe side; the next reservation saves both or is refused.
+    fn release(l: *MoneyLedger, io: Io, server: []const u8, res: Reservation) !void {
         if (res.amount == 0) return;
         const e = l.find(server) orelse return;
         if (e.day != res.day) return;
         e.total = @max(0, e.total - res.amount);
-        l.save(io);
+        try l.save(io, res.day);
     }
 
-    fn save(l: *MoneyLedger, io: Io) void {
+    /// Writes the totals of `today` and later (an older day no longer
+    /// counts) to a new file that then replaces the old one, so a crash
+    /// half way leaves the old record, not a cut one.
+    fn save(l: *MoneyLedger, io: Io, today: i64) !void {
         const p = l.path orelse return;
         var buf: [max_servers * 80]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
-        for (l.entries[0..l.len]) |*e| w.print("{s} {d} {d}\n", .{ e.name(), e.day, e.total }) catch return;
-        Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = w.buffered(), .flags = .{ .permissions = util.private_file } }) catch {};
+        for (l.entries[0..l.len]) |*e| if (e.day >= today) try w.print("{s} {d} {d}\n", .{ e.name(), e.day, e.total });
+        var tmp_buf: [4096]u8 = undefined;
+        const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{p});
+        const cwd = Io.Dir.cwd();
+        try cwd.writeFile(io, .{ .sub_path = tmp, .data = w.buffered(), .flags = .{ .permissions = util.private_file } });
+        errdefer cwd.deleteFile(io, tmp) catch {};
+        try cwd.rename(tmp, cwd, p, io);
     }
 
     /// Everything counted, whatever the server and day (for tests).
@@ -944,12 +987,16 @@ fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []co
     const l = r.money_ledger orelse return if (per_day > 0) "no record of today's total" else null;
     l.mutex.lockUncancelable(r.io);
     defer l.mutex.unlock(r.io);
+    if (l.trouble()) |why| return std.fmt.allocPrint(a, "{s}; no money call is made until it is fixed and harness restarted", .{why}) catch "the money record cannot be trusted";
     // each server has its own total: its caps are in its own units
     const day = l.dayFor(m.server.name, moneyDay(r, now_s));
     const spent = l.spent(m.server.name, day);
     if (per_day > 0 and spent + amount > @as(f64, @floatFromInt(per_day)))
         return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount, per_day, spent }) catch "over the cap per day";
-    res.* = l.reserve(r.io, m.server.name, day, amount) orelse return "the day totals of too many servers are kept already";
+    res.* = l.reserve(r.io, m.server.name, day, amount) catch |e| return switch (e) {
+        error.NoRoom => "the day totals of too many servers are kept already",
+        else => std.fmt.allocPrint(a, "today's money total could not be saved to state/money ({s}), so no money call is made while it cannot be", .{@errorName(e)}) catch "the money record could not be saved",
+    };
     return null;
 }
 
@@ -959,7 +1006,8 @@ fn releaseMoney(r: *Run, m: *const McpTool, res: Reservation) void {
     const l = r.money_ledger orelse return;
     l.mutex.lockUncancelable(r.io);
     defer l.mutex.unlock(r.io);
-    l.release(r.io, m.server.name, res);
+    l.release(r.io, m.server.name, res) catch |e|
+        r.log.write(.gate, false, .{ .run = r.label, .tool = m.def.name, .event = "money record not saved", .why = @errorName(e) }) catch {};
 }
 
 fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, reserved: Reservation) !tools.Output {
@@ -1847,30 +1895,85 @@ test "money_ledger_keeps_a_total_per_server_and_reads_the_old_file" {
     try t.expectEqual(@as(f64, 40), l.spent("broker", 20000));
     try t.expectEqual(@as(f64, 40), l.spent("other", 20000));
     try t.expectEqual(@as(f64, 0), l.spent("broker", 20001));
-    try t.expect(l.reserve(t.io, "broker", 20000, 5) != null);
+    _ = try l.reserve(t.io, "broker", 20000, 5);
     var again: MoneyLedger = .{ .path = p };
     again.load(t.io);
     try t.expectEqual(@as(f64, 45), again.spent("broker", 20000));
     try t.expectEqual(@as(f64, 40), again.spent("other", 20000));
+    // written whole to a new file that replaced the old one
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(t.io, "money.tmp", .{}));
+    const first = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(1024));
+    defer t.allocator.free(first);
+    try t.expectEqualStrings("* 20000 40\nbroker 20000 5\n", first);
+    // a day that is over is not written again
+    _ = try again.reserve(t.io, "broker", 20001, 1);
+    const later = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(1024));
+    defer t.allocator.free(later);
+    try t.expectEqualStrings("broker 20001 1\n", later);
+}
+
+test "a_money_record_that_cannot_be_trusted_refuses_money_calls" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "money", .data = "fake 20000 5\nfake 20001 lots\n" });
+    f.ledger.path = try std.fs.path.join(a, &.{ f.e.dir, "money" });
+    f.ledger.load(t.io);
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":5}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "the money record (state/money) is damaged at line 2") != null);
+    // one that cannot be read at all: the same
+    var dir_ledger: MoneyLedger = .{ .path = f.e.dir };
+    dir_ledger.load(t.io);
+    try t.expect(std.mem.indexOf(u8, dir_ledger.trouble().?, "could not be read") != null);
+    // none there yet is the first day, not trouble
+    var fresh: MoneyLedger = .{ .path = try std.fs.path.join(a, &.{ f.e.dir, "nothing-yet" }) };
+    fresh.load(t.io);
+    try t.expectEqual(null, fresh.trouble());
 }
 
 test "a_release_for_a_day_that_is_over_leaves_today_alone" {
     var l: MoneyLedger = .{};
     // 30 counted late on day 100 while the owner is asked; after midnight
     // another run moves 5
-    const late = l.reserve(t.io, "broker", 100, 30).?;
-    try t.expect(l.reserve(t.io, "broker", 101, 5) != null);
+    const late = try l.reserve(t.io, "broker", 100, 30);
+    _ = try l.reserve(t.io, "broker", 101, 5);
     // the owner says no after midnight: day 100's 30 is taken back
-    l.release(t.io, "broker", late);
+    try l.release(t.io, "broker", late);
     try t.expectEqual(@as(f64, 5), l.spent("broker", 101));
     // a run that read the clock just before midnight but counts after
     // another run did counts toward the new day, not over it
-    const behind = l.reserve(t.io, "broker", 100, 2).?;
+    const behind = try l.reserve(t.io, "broker", 100, 2);
     try t.expectEqual(101, behind.day);
     try t.expectEqual(@as(f64, 7), l.spent("broker", 101));
     // and a total never goes below 0
-    l.release(t.io, "broker", .{ .day = 101, .amount = 50 });
+    try l.release(t.io, "broker", .{ .day = 101, .amount = 50 });
     try t.expectEqual(@as(f64, 0), l.spent("broker", 101));
+}
+
+test "a_money_total_that_cannot_be_saved_refuses_the_call" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.money = .{ .max_per_day = 100 };
+    // its folder is not there: every save fails
+    f.ledger.path = try std.fs.path.join(f.e.arena.allocator(), &.{ f.e.dir, "gone", "money" });
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":5}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "could not be saved") != null);
+    // not counted either: it was not made
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
 }
 
 test "private_turns_are_left_out_of_summaries" {

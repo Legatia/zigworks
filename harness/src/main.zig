@@ -154,6 +154,7 @@ const App = struct {
         c.startExtras();
         var warns = std.mem.tokenizeScalar(u8, c.mcp_warn, '\n');
         while (warns.next()) |w| complain("note: mcp.ini: {s}", .{w});
+        if (c.money_ledger.trouble()) |why| complain("note: {s}; money calls are refused until it is fixed", .{why});
         return c;
     }
 };
