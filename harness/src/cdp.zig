@@ -32,6 +32,8 @@ pub const Inbox = struct {
     started_at: u32 = 0,
     stopped_at: u32 = 0,
     dialogs: std.ArrayList(Dialog) = .empty,
+    /// Addresses of downloads the browser refused (owned).
+    downloads: std.ArrayList([]u8) = .empty,
     /// Bytes of a message not yet ended by its NUL.
     partial: std.ArrayList(u8) = .empty,
     /// The pipe closed: Chrome is gone.
@@ -48,6 +50,8 @@ pub const Inbox = struct {
             b.gpa.free(d.session);
         }
         b.dialogs.deinit(b.gpa);
+        for (b.downloads.items) |u| b.gpa.free(u);
+        b.downloads.deinit(b.gpa);
         if (b.main_frame.len > 0) b.gpa.free(b.main_frame);
     }
 
@@ -59,7 +63,7 @@ pub const Inbox = struct {
     }
 
     fn event(b: *Inbox, io: Io, msg: []const u8) void {
-        const watched = [_][]const u8{ "Page.frameStartedLoading", "Page.frameStoppedLoading", "Page.javascriptDialogOpening" };
+        const watched = [_][]const u8{ "Page.frameStartedLoading", "Page.frameStoppedLoading", "Page.javascriptDialogOpening", "Browser.downloadWillBegin" };
         const m = for (watched) |w| {
             if (std.mem.indexOf(u8, msg[0..@min(msg.len, 64)], w) != null) break w;
         } else return;
@@ -71,6 +75,12 @@ pub const Inbox = struct {
         b.mutex.lockUncancelable(io);
         defer b.mutex.unlock(io);
         b.seq += 1;
+        if (std.mem.eql(u8, m, "Browser.downloadWillBegin")) {
+            // refused (Browser.setDownloadBehavior deny): only said
+            const url = b.gpa.dupe(u8, util.cut(jv.str(jv.get(params, "url")) orelse "", 2000)) catch return;
+            b.downloads.append(b.gpa, url) catch b.gpa.free(url);
+            return;
+        }
         if (m[5] == 'j') {
             const d: Dialog = .{
                 .kind = b.gpa.dupe(u8, jv.str(jv.get(params, "type")) orelse "dialog") catch return,
@@ -99,6 +109,16 @@ pub const Inbox = struct {
             try out.append(gpa, b.dialogs.orderedRemove(i));
         }
         return out.items;
+    }
+
+    /// The addresses of the downloads refused since the last call; the
+    /// caller frees each and the list with `gpa`.
+    pub fn takeDownloads(b: *Inbox, io: Io, gpa: Allocator) ![][]u8 {
+        b.mutex.lockUncancelable(io);
+        defer b.mutex.unlock(io);
+        const out = try gpa.dupe([]u8, b.downloads.items);
+        b.downloads.clearRetainingCapacity();
+        return out;
     }
 
     /// Splits `bytes` into messages and keeps the replies among them.
@@ -257,6 +277,8 @@ pub const Session = struct {
             if (Io.Clock.awake.now(s.io).nanoseconds >= until) return error.NoPage;
             s.io.sleep(.fromMilliseconds(50), .awake) catch {};
         };
+        // no page may save a file: downloads are refused, and said
+        _ = try s.callIn(a, "Browser.setDownloadBehavior", "{\"behavior\":\"deny\",\"eventsEnabled\":true}", null);
         var p: std.ArrayList(u8) = .empty;
         try p.appendSlice(a, "{\"targetId\":");
         try util.jsonString(&p, a, target);

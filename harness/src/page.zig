@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const util = @import("util.zig");
+const jv = @import("jv.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -1252,6 +1253,48 @@ pub fn urlHostname(arena: Allocator, url: []const u8) !?[]const u8 {
     return try std.ascii.allocLowerString(arena, host);
 }
 
+/// Settings harness needs in a browser `profile`, written to its
+/// Default/Preferences before the browser starts (whatever else is there
+/// stays): Chrome's own password manager off (typed passwords must not end
+/// up in the profile's Login Data), and downloads blocked, with their
+/// folder inside the profile should one get through: a page never saves a
+/// file anywhere else (the user's Downloads among them).
+pub fn prepareProfile(io: Io, a: Allocator, profile: []const u8) !void {
+    const dir = try std.fs.path.join(a, &.{ profile, "Default" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(a, &.{ dir, "Preferences" });
+    const old = Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => return e,
+    };
+    var root: std.json.Value = .{ .object = .empty };
+    if (jv.parse(a, old)) |v| if (v == .object) {
+        root = v;
+    };
+    const downloads = try std.fs.path.join(a, &.{ profile, "Downloads" });
+    try setPref(a, &root, &.{"credentials_enable_service"}, .{ .bool = false });
+    try setPref(a, &root, &.{ "profile", "password_manager_enabled" }, .{ .bool = false });
+    // 3: every download blocked
+    try setPref(a, &root, &.{"download_restrictions"}, .{ .integer = 3 });
+    try setPref(a, &root, &.{ "download", "default_directory" }, .{ .string = downloads });
+    try setPref(a, &root, &.{ "download", "prompt_for_download" }, .{ .bool = false });
+    try setPref(a, &root, &.{ "download", "directory_upgrade" }, .{ .bool = true });
+    try setPref(a, &root, &.{ "savefile", "default_directory" }, .{ .string = downloads });
+    const text = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(root, .{})});
+    var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = util.private_file });
+    defer f.close(io);
+    try f.writeStreamingAll(io, text);
+}
+
+/// Sets `value` at `keys` below `v`, making the objects on the way.
+fn setPref(a: Allocator, v: *std.json.Value, keys: []const []const u8, value: std.json.Value) !void {
+    if (v.* != .object) v.* = .{ .object = .empty };
+    if (keys.len == 1) return v.object.put(a, keys[0], value);
+    const slot = try v.object.getOrPut(a, keys[0]);
+    if (!slot.found_existing) slot.value_ptr.* = .{ .object = .empty };
+    return setPref(a, slot.value_ptr, keys[1..], value);
+}
+
 /// The folders of throwaway profiles in a `tmp_root`: browse's, web's.
 pub const throwaway_prefixes = [_][]const u8{ "harness-browser-", "harness-web-" };
 
@@ -1307,6 +1350,7 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
 
     const profile = try newProfile(io, arena, tmp_root, "harness-browser-");
     defer removeProfile(io, profile);
+    try prepareProfile(io, arena, profile);
 
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(arena, browser);
@@ -1375,6 +1419,10 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
         .timeout => error.Timeout,
     };
     if (col.buf.items.len == 0) {
+        // the address was a download: refused (see prepareProfile), and
+        // nothing to show; its folder is made when one starts
+        const dl = try std.fs.path.join(arena, &.{ profile, "Downloads" });
+        if (Io.Dir.cwd().statFile(io, dl, .{})) |_| return error.DownloadRefused else |_| {}
         const ok = if (term) |tm| tm == .exited and tm.exited == 0 else false;
         return if (ok) "" else error.BrowserFailed;
     }
@@ -1868,6 +1916,42 @@ test "render_gives_the_browser_a_small_environment_and_keeps_it_on_the_host" {
     try expectHas(out, "ARG --host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE docs.example.com\n");
 }
 
+test "render_keeps_downloads_off_and_inside_the_profile" {
+    if (is_windows) return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // a stand-in that shows the settings the browser would start with
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "prefs", .data = "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --user-data-dir=*) d=\"${a#--user-data-dir=}\";; esac; done\necho \"PROFILE $d\"\ncat \"$d/Default/Preferences\"\n" });
+    var f = try tmp.dir.openFile(t.io, "prefs", .{});
+    try f.setPermissions(t.io, .fromMode(0o755));
+    f.close(t.io);
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    var stop: std.atomic.Value(bool) = .init(false);
+    const out = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "prefs" }), "http://example.com/", root, &stop, 5000, 1 << 20, test_env);
+    const nl = std.mem.indexOfScalar(u8, out, '\n') orelse return error.TestUnexpectedResult;
+    const profile = out["PROFILE ".len..nl];
+    const v = jv.parse(a, out[nl + 1 ..]) orelse {
+        std.debug.print("\nno settings:\n{s}\n", .{out});
+        return error.TestUnexpectedResult;
+    };
+    try t.expectEqual(@as(?i64, 3), jv.int(jv.get(v, "download_restrictions")));
+    const dl = try std.fs.path.join(a, &.{ profile, "Downloads" });
+    try t.expectEqualStrings(dl, jv.str(jv.at(v, &.{ "download", "default_directory" })).?);
+    try t.expectEqualStrings(dl, jv.str(jv.at(v, &.{ "savefile", "default_directory" })).?);
+    try t.expectEqual(false, jv.boolean(jv.at(v, &.{ "download", "prompt_for_download" })).?);
+    try t.expectEqual(false, jv.boolean(jv.get(v, "credentials_enable_service")).?);
+    // an address that is a download: Chrome prints nothing and starts the
+    // download (refused): that is said, not an empty page
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "dl", .data = "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --user-data-dir=*) d=\"${a#--user-data-dir=}\";; esac; done\nmkdir -p \"$d/Downloads\"\n" });
+    var g = try tmp.dir.openFile(t.io, "dl", .{});
+    try g.setPermissions(t.io, .fromMode(0o755));
+    g.close(t.io);
+    try t.expectError(error.DownloadRefused, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "dl" }), "http://example.com/file.zip", root, &stop, 5000, 1 << 20, test_env));
+}
+
 test "render_removes_throwaway_profiles_a_killed_run_left" {
     if (is_windows) return error.SkipZigTest;
     var tmp = t.tmpDir(.{});
@@ -1896,6 +1980,42 @@ test "render_removes_throwaway_profiles_a_killed_run_left" {
     try t.expect(!has(names.items, "harness-browser-") and !has(names.items, "harness-web-"));
     try expectHas(names.items, "grants");
     try expectHas(names.items, "harness-webby");
+}
+
+test "render_of_a_download_saves_nothing_and_says_so" {
+    if (is_windows) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const browser = (try @import("cdp.zig").testBrowser(a)) orelse return error.SkipZigTest;
+    var e: @import("model.zig").TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    var rnd: [6]u8 = undefined;
+    t.io.random(&rnd);
+    const name = try std.fmt.allocPrint(a, "harness-probe-{x}.bin", .{rnd});
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = try std.fmt.allocPrint(a, "pages/{s}", .{name}), .data = "\x00probe bytes" });
+    // Chrome starts only with downloads off and inside the profile, so
+    // this test can't save a file anywhere else, whatever render does
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "guard", .data = try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\for a in "$@"; do case "$a" in --user-data-dir=*) d="${{a#--user-data-dir=}}";; esac; done
+        \\grep -qF '"download_restrictions":3' "$d/Default/Preferences" || exit 3
+        \\grep -qF "\"default_directory\":\"$d/Downloads\"" "$d/Default/Preferences" || exit 3
+        \\exec "{s}" "$@"
+        \\
+    , .{browser}) });
+    var f = try e.tmp.dir.openFile(t.io, "guard", .{});
+    try f.setPermissions(t.io, .fromMode(0o755));
+    f.close(t.io);
+    const guard = try std.fs.path.join(a, &.{ e.dir, "guard" });
+    var stop: std.atomic.Value(bool) = .init(false);
+    try t.expectError(error.DownloadRefused, render(t.allocator, t.io, a, guard, try std.fmt.allocPrint(a, "http://localhost:{d}/page/{s}", .{ e.server.port, name }), e.dir, &stop, 30_000, 4 << 20, test_env));
+    // (looked at, never written: the folder downloads go to by default)
+    if (t.environ.getPosix("HOME")) |home| {
+        const there = try std.fs.path.join(a, &.{ home, "Downloads", name });
+        try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, there, .{}));
+    }
 }
 
 test "render_loads_nothing_from_another_host" {

@@ -316,7 +316,7 @@ pub const Web = struct {
             w.throwaway = p;
             break :blk p;
         };
-        try noPasswordManager(w.io, a, profile);
+        try page.prepareProfile(w.io, a, profile);
         w.s = try cdp.Session.open(w.gpa, w.io, w.env.browser, profile, w.env.stop, w.env.timeout_ms, .{ .env = w.env.chrome_env });
         if (w.login) |l| try w.loadPasskeys(a, l);
     }
@@ -634,6 +634,12 @@ pub const Web = struct {
         var out: std.ArrayList(u8) = .empty;
         if (said.len > 0) try out.print(a, "{s}\n", .{said});
         try out.appendSlice(a, w.notes.items);
+        const downloads = try w.s.?.inbox.takeDownloads(w.io, w.gpa);
+        defer {
+            for (downloads) |d| w.gpa.free(d);
+            w.gpa.free(downloads);
+        }
+        for (downloads) |d| try out.print(a, "A download was refused (downloads are off): {s}\n", .{util.cut(d, 300)});
         const dialogs = try w.s.?.inbox.takeDialogs(w.io, a);
         for (dialogs) |d| {
             try out.print(a, "Dialog ({s}): {s}{s}\n", .{ d.kind, d.message, if (std.mem.eql(u8, d.kind, "alert") or std.mem.eql(u8, d.kind, "beforeunload")) "" else " (dismissed)" });
@@ -807,32 +813,6 @@ fn mergePasskeys(a: Allocator, stored: []const logins.Passkey, now: []const logi
         }
     }
     return .{ .list = list.items, .changed = changed, .added = added.items };
-}
-
-/// Chrome's own password manager off in `profile` (its Default/Preferences,
-/// written before Chrome starts): typed passwords must not end up saved
-/// in the profile's Login Data.
-fn noPasswordManager(io: Io, a: Allocator, profile: []const u8) !void {
-    const dir = try std.fs.path.join(a, &.{ profile, "Default" });
-    try Io.Dir.cwd().createDirPath(io, dir);
-    const path = try std.fs.path.join(a, &.{ dir, "Preferences" });
-    const old = Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch |e| switch (e) {
-        error.FileNotFound => "",
-        else => return e,
-    };
-    var root: std.json.Value = .{ .object = .empty };
-    if (jv.parse(a, old)) |v| if (v == .object) {
-        root = v;
-    };
-    try root.object.put(a, "credentials_enable_service", .{ .bool = false });
-    var prof: std.json.Value = root.object.get("profile") orelse .{ .object = .empty };
-    if (prof != .object) prof = .{ .object = .empty };
-    try prof.object.put(a, "password_manager_enabled", .{ .bool = false });
-    try root.object.put(a, "profile", prof);
-    const text = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(root, .{})});
-    var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = if (is_windows) .default_file else .fromMode(0o600) });
-    defer f.close(io);
-    try f.writeStreamingAll(io, text);
 }
 
 fn setPrivate(io: Io, path: []const u8) !void {
@@ -1013,6 +993,39 @@ fn treeHas(io: Io, a: Allocator, dir: []const u8, needle: []const u8) !bool {
         if (has(data, needle)) return true;
     }
     return false;
+}
+
+/// The names in `dir` (relative to the test's folder), or "" if it is not there.
+fn listDir(f: *Fix, dir: []const u8) ![]const u8 {
+    const a = f.e.arena.allocator();
+    var d = f.e.tmp.dir.openDir(t.io, dir, .{ .iterate = true }) catch return "";
+    defer d.close(t.io);
+    var out: std.ArrayList(u8) = .empty;
+    var it = d.iterate();
+    while (try it.next(t.io)) |e| try out.print(a, "{s} ", .{e.name});
+    return out.items;
+}
+
+test "web_refuses_downloads_and_says_so" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\n");
+    defer f.deinit();
+    // where a download would land (never the real Downloads folder)
+    try f.e.tmp.dir.createDirPath(t.io, "dl");
+    try f.e.tmp.dir.createDirPath(t.io, "profiles/agent/Default");
+    const prefs = try std.fmt.allocPrint(f.e.arena.allocator(), "{{\"download\":{{\"default_directory\":\"{s}/dl\",\"prompt_for_download\":false}}}}", .{f.e.dir});
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "profiles/agent/Default/Preferences", .data = prefs });
+    try f.page("get.html", "<html><body><a href=\"/page/file.bin\">get it</a></body></html>");
+    try f.page("file.bin", "\x00\x01 some bytes");
+    _ = try f.act(try f.openJson("get.html", "agent"));
+    const r = try f.act("{\"action\":\"click\",\"ref\":1}");
+    // a finished download would be there by now
+    var tries: u32 = 0;
+    while (tries < 30 and (try listDir(&f, "dl")).len == 0) : (tries += 1) t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    try t.expectEqualStrings("", try listDir(&f, "dl"));
+    try t.expectEqualStrings("", try listDir(&f, "profiles/agent/Downloads"));
+    try expectHas(r.text, "A download was refused");
+    try expectHas(r.text, "/page/file.bin");
 }
 
 test "web_profiles_keep_no_saved_passwords" {
