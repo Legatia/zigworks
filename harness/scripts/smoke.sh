@@ -71,7 +71,12 @@ wait_for "$T/fake.out" "port " 5 || { echo "harness-fake did not start"; exit 1;
 PORT=$(sed -n 's/^port //p' "$T/fake.out")
 URL="http://127.0.0.1:$PORT"
 
+check "version prints the version" '"$H" version >"$T/version.out" && grep -qxE "harness [0-9]+[.][0-9]+[.][0-9]+" "$T/version.out"'
+check "help lists the commands" '"$H" help >"$T/help.out" && grep -qF "secret add NAME [--stdin]" "$T/help.out" && grep -qF "task run NAME" "$T/help.out"'
 check "init writes the data folder" '"$H" init >/dev/null && [ -f "$HARNESS_HOME/config.ini" ] && [ -d "$HARNESS_HOME/workspace" ]'
+check "health fails when nothing runs" '! "$H" health >"$T/health.out" && grep -qxF "not running" "$T/health.out"'
+# init's config.ini has no omnigate url, and no key is stored yet
+check "a command says when no omnigate key or url is set" '"$H" memory list >/dev/null 2>"$T/notes.err" && grep -qF "no omnigate key stored" "$T/notes.err" && grep -qF "no omnigate url" "$T/notes.err"'
 cat >"$HARNESS_HOME/config.ini" <<EOF
 [model]
 url = $URL
