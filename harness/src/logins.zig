@@ -24,9 +24,11 @@ pub fn validName(n: []const u8) bool {
 }
 
 /// A lowercase host name: labels of a-z, 0-9 and `-`, joined by dots; no
-/// scheme, port or path.
+/// scheme, port or path. At least two labels, but for `localhost`: a site
+/// of one (`com`) would cover every name in it.
 pub fn validSite(s: []const u8) bool {
     if (s.len == 0 or s.len > 253) return false;
+    if (std.mem.indexOfScalar(u8, s, '.') == null and !std.mem.eql(u8, s, "localhost")) return false;
     var it = std.mem.splitScalar(u8, s, '.');
     while (it.next()) |label| {
         if (label.len == 0 or label.len > 63) return false;
@@ -242,7 +244,11 @@ test "logins_ini_parses_and_refuses_bad_names_and_sites" {
         "[x]\nusername = u\n",
         "[x]\nsite = a.com\n[x]\nsite = b.com\n",
         "[x]\nsite = a.com\npassword = no\n",
+        // one label: a top-level name would bind the login to every site in it
+        "[x]\nsite = com\n",
     }) |bad| try t.expectError(error.BadLogins, parse(a, bad));
+    try t.expect(validSite("localhost") and validSite("a.b.example.com"));
+    try t.expect(!validSite("com") and !validSite("intranet"));
 }
 
 test "host_binding_follows_the_site" {

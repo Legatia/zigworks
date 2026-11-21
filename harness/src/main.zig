@@ -336,13 +336,13 @@ fn loginCmd(app: *App, args: []const []const u8) !Exit {
     const name = args[1];
     if (eql(args[0], "rm")) {
         const known = logins.find(list, name) != null;
-        var removed: u32 = 0;
-        for ([_]logins.Kind{ .password, .totp, .passkeys }) |k| {
+        var gone: [3]bool = .{ false, false, false };
+        for ([_]logins.Kind{ .password, .totp, .passkeys }, &gone) |k, *g| {
             var nb: [96]u8 = undefined;
-            if (s.remove(app.io, logins.secretName(&nb, name, k)) catch {
+            g.* = s.remove(app.io, logins.secretName(&nb, name, k)) catch {
                 complain("could not remove the secrets of {s}", .{name});
                 return .failed;
-            }) removed += 1;
+            };
         }
         const profile = try std.fs.path.join(app.arena, &.{ app.home, "profiles", name });
         const had_profile = if (Io.Dir.cwd().statFile(app.io, profile, .{})) |_| true else |_| false;
@@ -354,11 +354,11 @@ fn loginCmd(app: *App, args: []const []const u8) !Exit {
             const rest = try core_mod.removeSection(app.arena, text, name);
             try writePrivate(app.io, path, rest);
         }
-        if (!known and removed == 0 and !had_profile) {
+        const said = try removedText(app.arena, name, known, gone, had_profile) orelse {
             try outAll(app.io, "No login with that name.\n");
             return .ok;
-        }
-        try outPrint(app.io, "Removed {s}: its entry, {d} stored secret{s} and its browser profile.\n", .{ name, removed, if (removed == 1) "" else "s" });
+        };
+        try outPrint(app.io, "{s}\n", .{said});
         return .ok;
     }
     if (!eql(args[0], "add")) {
@@ -384,7 +384,7 @@ fn loginCmd(app: *App, args: []const []const u8) !Exit {
         }
     }
     if (!logins.validSite(site)) {
-        complain("--site takes a host name in lowercase, like github.com (no https://, no path)", .{});
+        complain("--site takes a host name in lowercase with at least one dot, like github.com, or localhost (no https://, no port, no path)", .{});
         return .usage;
     }
     if (std.mem.indexOfAny(u8, username, "\n\r;#") != null) {
@@ -447,8 +447,35 @@ fn loginCmd(app: *App, args: []const []const u8) !Exit {
         if (username.len > 0) "\n" else "",
     });
     try writePrivate(app.io, path, entry);
-    try errPrint(app.io, "Stored {s} in {s}.\n", .{ name, s.describe() });
+    try errPrint(app.io, "{s}\n", .{try addedText(app.arena, name, site, password.len > 0, seed.len > 0, s.describe())});
     return .ok;
+}
+
+/// What `login add` says it did.
+fn addedText(a: std.mem.Allocator, name: []const u8, site: []const u8, password: bool, totp_seed: bool, store: []const u8) ![]const u8 {
+    const head = try std.fmt.allocPrint(a, "Added {s} to logins.ini (site {s}).", .{ name, site });
+    if (password and totp_seed) return std.fmt.allocPrint(a, "{s} Stored its password and TOTP secret in {s}.", .{ head, store });
+    if (password) return std.fmt.allocPrint(a, "{s} Stored its password in {s}; no TOTP secret.", .{ head, store });
+    if (totp_seed) return std.fmt.allocPrint(a, "{s} Stored its TOTP secret in {s}; no password: the agent makes one when it signs up.", .{ head, store });
+    return std.fmt.allocPrint(a, "{s} Nothing stored: no password (the agent makes one when it signs up), no TOTP secret.", .{head});
+}
+
+/// What `login rm` says it removed (`secrets`: the password, the TOTP
+/// secret, the passkeys); null when there was nothing to remove.
+fn removedText(a: std.mem.Allocator, name: []const u8, entry: bool, secrets: [3]bool, profile: bool) !?[]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    if (entry) try parts.append(a, "its entry in logins.ini");
+    for (secrets, [_][]const u8{ "its password", "its TOTP secret", "its passkeys" }) |g, what| if (g) try parts.append(a, what);
+    if (profile) try parts.append(a, "its browser profile");
+    if (parts.items.len == 0) return null;
+    var out: std.ArrayList(u8) = .empty;
+    if (entry) try out.print(a, "Removed {s}: ", .{name}) else try out.print(a, "Removed what was left of {s} (it had no entry in logins.ini): ", .{name});
+    for (parts.items, 0..) |p, i| {
+        if (i > 0) try out.appendSlice(a, if (i == parts.items.len - 1) " and " else ", ");
+        try out.appendSlice(a, p);
+    }
+    try out.append(a, '.');
+    return out.items;
 }
 
 /// One line, read with the terminal's echo off when it is one.
@@ -839,6 +866,23 @@ fn errPrint(io: Io, comptime fmt: []const u8, args: anytype) !void {
 
 fn complain(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("harness: " ++ fmt ++ "\n", args);
+}
+
+test "login_add_and_rm_say_exactly_what_they_stored_and_removed" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const kc = "the macOS Keychain";
+    try t.expectEqualStrings("Added bot to logins.ini (site github.com). Stored its password and TOTP secret in the macOS Keychain.", try addedText(a, "bot", "github.com", true, true, kc));
+    try t.expectEqualStrings("Added bot to logins.ini (site github.com). Stored its password in the macOS Keychain; no TOTP secret.", try addedText(a, "bot", "github.com", true, false, kc));
+    try t.expectEqualStrings("Added bot to logins.ini (site github.com). Stored its TOTP secret in the macOS Keychain; no password: the agent makes one when it signs up.", try addedText(a, "bot", "github.com", false, true, kc));
+    try t.expectEqualStrings("Added bot to logins.ini (site github.com). Nothing stored: no password (the agent makes one when it signs up), no TOTP secret.", try addedText(a, "bot", "github.com", false, false, kc));
+    try t.expectEqualStrings("Removed bot: its entry in logins.ini, its password, its TOTP secret, its passkeys and its browser profile.", (try removedText(a, "bot", true, .{ true, true, true }, true)).?);
+    try t.expectEqualStrings("Removed bot: its entry in logins.ini.", (try removedText(a, "bot", true, .{ false, false, false }, false)).?);
+    try t.expectEqualStrings("Removed bot: its entry in logins.ini and its passkeys.", (try removedText(a, "bot", true, .{ false, false, true }, false)).?);
+    try t.expectEqualStrings("Removed what was left of bot (it had no entry in logins.ini): its password and its browser profile.", (try removedText(a, "bot", false, .{ true, false, false }, true)).?);
+    try t.expectEqual(null, try removedText(a, "bot", false, .{ false, false, false }, false));
 }
 
 test {
