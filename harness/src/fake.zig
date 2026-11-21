@@ -225,7 +225,9 @@ pub const Server = struct {
     /// Telegram Bot API: `getUpdates` hands out the files in
     /// `telegram/in/` in name order (each one update object, the update_id
     /// is assigned here), at most one batch per call; sent messages and
-    /// other calls are appended to `telegram/out.jsonl`. With
+    /// other calls are appended to `telegram/out.jsonl`, each line with the
+    /// message id the call is answered with
+    /// (`{"method":"sendMessage","message_id":3,"body":{...}}`). With
     /// `telegram/fail.json` (`{"status":429,"retry_after":1,"count":N}`)
     /// the first N other calls of the server's life answer that error
     /// instead, and are not recorded.
@@ -260,18 +262,20 @@ pub const Server = struct {
                 return json(req, status, out);
             }
         }
-        // record everything else
-        {
+        // record everything else, with the message id it is answered with
+        // (numbered under the lock, so the lines and the ids agree)
+        const n = blk: {
             s.mutex.lockUncancelable(s.io);
             defer s.mutex.unlock(s.io);
+            const id = s.tg_n.fetchAdd(1, .acq_rel) + 1;
             const op = try s.path(a, &.{ "telegram", "out.jsonl" });
             var f = try Io.Dir.cwd().createFile(s.io, op, .{ .truncate = false });
             defer f.close(s.io);
             const len = try f.length(s.io);
-            const line = try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"body\":{s}}}\n", .{ method, if (body.len > 0) body else "null" });
+            const line = try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"message_id\":{d},\"body\":{s}}}\n", .{ method, id, if (body.len > 0) body else "null" });
             try f.writePositionalAll(s.io, line, len);
-        }
-        const n = s.tg_n.fetchAdd(1, .acq_rel) + 1;
+            break :blk id;
+        };
         const out = try std.fmt.allocPrint(a, "{{\"ok\":true,\"result\":{{\"message_id\":{d}}}}}", .{n});
         return json(req, .ok, out);
     }

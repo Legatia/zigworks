@@ -140,11 +140,14 @@ pub const Secrets = struct {
 
 pub const Error = error{ AlreadyRunning, BadSettings, NoModelKey };
 
+/// The question waiting for the owner. Its buttons carry its number and
+/// the instance's nonce (`a7-9f3c0a1be27d4c55:once`), and a press counts
+/// only from the message they were sent in: a button left in the chat from
+/// before a restart, or under another question, answers nothing.
 const Approval = struct {
     mutex: Io.Mutex = .init,
     /// The last question's number; it goes on from the last instance's
-    /// (state/approvals), so a button left under an old question in the
-    /// chat never matches a new one.
+    /// (state/approvals).
     id: u32 = 0,
     loaded: bool = false,
     waiting: bool = false,
@@ -153,7 +156,33 @@ const Approval = struct {
     /// No one is there to answer: nothing more is asked.
     closed: bool = false,
     answer: ?agent.Answer = null,
+    /// The message the waiting question's buttons are in, as the channel
+    /// said when it sent them (null: it said none).
     msg: ?i64 = null,
+    /// The buttons have been sent and `msg` is what the channel said.
+    shown: bool = false,
+    /// A press of the waiting question's buttons that came before the
+    /// channel said where they are: checked against `msg` once it has.
+    early: ?Early = null,
+
+    const Early = struct { msg: i64, ans: agent.Answer };
+};
+
+/// What a button's data says: `a<number>-<nonce>:once|day|deny`.
+const Press = struct {
+    id: u32,
+    nonce: []const u8,
+    ans: agent.Answer,
+
+    fn parse(data: []const u8) ?Press {
+        if (data.len < 4 or data[0] != 'a') return null;
+        const colon = std.mem.lastIndexOfScalar(u8, data, ':') orelse return null;
+        const dash = std.mem.indexOfScalar(u8, data[0..colon], '-') orelse return null;
+        const id = std.fmt.parseInt(u32, data[1..dash], 10) catch return null;
+        const word = data[colon + 1 ..];
+        const ans: agent.Answer = if (std.mem.eql(u8, word, "once")) .once else if (std.mem.eql(u8, word, "day")) .day else if (std.mem.eql(u8, word, "deny")) .deny else return null;
+        return .{ .id = id, .nonce = data[dash + 1 .. colon], .ans = ans };
+    }
 };
 
 pub const Core = struct {
@@ -232,6 +261,9 @@ pub const Core = struct {
     queue: std.ArrayList([]u8) = .empty,
     busy: std.atomic.Value(bool) = .init(false),
     approval: Approval = .{},
+    /// Random for each start, in every question's button data: a button
+    /// from before a restart never matches, whatever its number.
+    approval_nonce: [16]u8 = undefined,
     last_owner_s: i64 = 0,
     turns_since_memory: u32 = 0,
     /// The memory writer has read the conversation's turns before this one
@@ -363,6 +395,9 @@ pub const Core = struct {
         c.queue = .empty;
         c.busy = .init(false);
         c.approval = .{};
+        var nonce_raw: [8]u8 = undefined;
+        io.random(&nonce_raw);
+        c.approval_nonce = std.fmt.bytesToHex(nonce_raw, .lower);
         c.last_owner_s = 0;
         c.turns_since_memory = 0;
         c.memory_upto = 0;
@@ -754,21 +789,40 @@ pub const Core = struct {
         if (queued_behind) c.say("Queued; /stop cancels the current turn.");
     }
 
-    /// A button press: `a<id>:once|day|deny`.
-    pub fn handleCallback(c: *Core, from_id: i64, data: []const u8) void {
+    /// A button press (`data`, see Approval) in message `message_id`. It
+    /// answers the waiting question only if it is one of that question's
+    /// buttons: this start's nonce, the question's number, and the message
+    /// the question was sent in. Any other press of the owner's is out of
+    /// date (from before a restart, or under another question), and the
+    /// owner is told so.
+    pub fn handleCallback(c: *Core, from_id: i64, message_id: i64, data: []const u8) void {
         if (c.owner == null or from_id != c.owner.?) {
             c.log.write(.chat, false, .{ .event = "dropped", .from = from_id, .why = "button from someone else" }) catch {};
             return;
         }
-        if (data.len < 3 or data[0] != 'a') return;
-        const colon = std.mem.indexOfScalar(u8, data, ':') orelse return;
-        const id = std.fmt.parseInt(u32, data[1..colon], 10) catch return;
-        const ans: agent.Answer = if (std.mem.eql(u8, data[colon + 1 ..], "once")) .once else if (std.mem.eql(u8, data[colon + 1 ..], "day")) .day else .deny;
-        c.approval.mutex.lockUncancelable(c.io);
-        defer c.approval.mutex.unlock(c.io);
-        // a "24 h" the question never offered is no answer
-        if (ans == .day and !c.approval.allow_day) return;
-        if (c.approval.waiting and c.approval.id == id) c.approval.answer = ans;
+        const current = blk: {
+            const p = Press.parse(data) orelse break :blk false;
+            c.approval.mutex.lockUncancelable(c.io);
+            defer c.approval.mutex.unlock(c.io);
+            const ap = &c.approval;
+            if (!ap.waiting or p.id != ap.id or !std.mem.eql(u8, p.nonce, &c.approval_nonce)) break :blk false;
+            // a "24 h" the question never offered is no answer
+            if (p.ans == .day and !ap.allow_day) break :blk true;
+            if (!ap.shown) {
+                // pressed before the channel said where the buttons are
+                ap.early = .{ .msg = message_id, .ans = p.ans };
+                break :blk true;
+            }
+            if (ap.msg == null or ap.msg.? != message_id) break :blk false;
+            ap.answer = p.ans;
+            break :blk true;
+        };
+        if (!current) c.tellOutOfDate(message_id);
+    }
+
+    fn tellOutOfDate(c: *Core, message_id: i64) void {
+        c.log.write(.chat, false, .{ .event = "button out of date", .message = message_id }) catch {};
+        c.say("That button is out of date: it answers nothing.");
     }
 
     /// The terminal's way to answer: "o", "d" or "n" while asked; false if
@@ -805,8 +859,22 @@ pub const Core = struct {
         const allow_day = q.allow_day;
         const c = ca.core;
         const ch = c.chan orelse return .deny;
-        var id_buf: [3][24]u8 = undefined;
-        const id = blk: {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        // the whole question, in as many messages as it takes; the buttons
+        // go on the last, so it is answered after all of it was shown
+        const parts = questionParts(a, what) catch return .deny;
+        const heads = a.alloc([]const u8, parts.len - 1) catch return .deny;
+        for (heads, parts[0 .. parts.len - 1], 1..) |*h, p, i| h.* = std.fmt.allocPrint(a, "Allow this? ({d}/{d})\n{s}", .{ i, parts.len, p }) catch return .deny;
+        const text = (if (parts.len == 1)
+            std.fmt.allocPrint(a, "Allow this?\n{s}", .{what})
+        else
+            std.fmt.allocPrint(a, "Allow this? ({d}/{d})\n{s}", .{ parts.len, parts.len, parts[parts.len - 1] })) catch return .deny;
+        // once, day, deny
+        var data_buf: [3][48]u8 = undefined;
+        var data: [3][]const u8 = undefined;
+        {
             c.approval.mutex.lockUncancelable(c.io);
             defer c.approval.mutex.unlock(c.io);
             if (c.approval.closed) return .deny;
@@ -814,35 +882,40 @@ pub const Core = struct {
                 c.approval.id = c.loadApprovalId();
                 c.approval.loaded = true;
             }
-            // kept before the buttons go out: after a restart the numbers go on
-            c.saveApprovalId(c.approval.id + 1) catch break :blk null;
             c.approval.id += 1;
+            // the numbers go on after a restart; the nonce is what tells an
+            // old button from a new one, so a number not kept asks all the same
+            c.saveApprovalId(c.approval.id) catch {};
+            for (&data, &data_buf, [_][]const u8{ "once", "day", "deny" }) |*d, *buf, word|
+                d.* = std.fmt.bufPrint(buf, "a{d}-{s}:{s}", .{ c.approval.id, &c.approval_nonce, word }) catch return .deny;
             c.approval.waiting = true;
             c.approval.allow_day = allow_day;
             c.approval.answer = null;
-            break :blk c.approval.id;
-        } orelse {
-            c.say("Could not keep the question's number in state/approvals, so it was not asked: not allowed.");
-            return .deny;
-        };
-        const once = std.fmt.bufPrint(&id_buf[0], "a{d}:once", .{id}) catch return .deny;
-        const day = std.fmt.bufPrint(&id_buf[1], "a{d}:day", .{id}) catch return .deny;
-        const deny = std.fmt.bufPrint(&id_buf[2], "a{d}:deny", .{id}) catch return .deny;
-        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
-        defer arena_state.deinit();
-        const a = arena_state.allocator();
-        // the whole question, in as many messages as it takes; the buttons
-        // go on the last, so it is answered after all of it was shown
-        const parts = questionParts(a, what) catch return .deny;
-        for (parts[0 .. parts.len - 1], 1..) |p, i| c.say(std.fmt.allocPrint(a, "Allow this? ({d}/{d})\n{s}", .{ i, parts.len, p }) catch return .deny);
-        const text = (if (parts.len == 1)
-            std.fmt.allocPrint(a, "Allow this?\n{s}", .{what})
-        else
-            std.fmt.allocPrint(a, "Allow this? ({d}/{d})\n{s}", .{ parts.len, parts.len, parts[parts.len - 1] })) catch return .deny;
+            c.approval.msg = null;
+            c.approval.shown = false;
+            c.approval.early = null;
+        }
+        for (heads) |h| c.say(h);
         const msg = if (allow_day)
-            ch.buttons(ch.ctx, text, &.{ .{ "Allow once", once }, .{ "Allow 24 h", day }, .{ "Deny", deny } })
+            ch.buttons(ch.ctx, text, &.{ .{ "Allow once", data[0] }, .{ "Allow 24 h", data[1] }, .{ "Deny", data[2] } })
         else
-            ch.buttons(ch.ctx, text, &.{ .{ "Allow once", once }, .{ "Deny", deny } });
+            ch.buttons(ch.ctx, text, &.{ .{ "Allow once", data[0] }, .{ "Deny", data[2] } });
+        // a press that came before the channel said where the buttons are
+        // counts only if it was in that message
+        const early_elsewhere: ?i64 = blk: {
+            c.approval.mutex.lockUncancelable(c.io);
+            defer c.approval.mutex.unlock(c.io);
+            c.approval.msg = msg;
+            c.approval.shown = true;
+            const e = c.approval.early orelse break :blk null;
+            c.approval.early = null;
+            if (msg != null and msg.? == e.msg) {
+                c.approval.answer = e.ans;
+                break :blk null;
+            }
+            break :blk e.msg;
+        };
+        if (early_elsewhere) |m| c.tellOutOfDate(m);
         const deadline = c.now() + c.cfg.limits.approval_seconds;
         var ans: agent.Answer = .timeout;
         while (true) {
@@ -867,6 +940,9 @@ pub const Core = struct {
             c.approval.mutex.lockUncancelable(c.io);
             defer c.approval.mutex.unlock(c.io);
             c.approval.waiting = false;
+            c.approval.msg = null;
+            c.approval.shown = false;
+            c.approval.early = null;
         }
         if (msg) |m| ch.clear(ch.ctx, m);
         if (ans == .timeout) c.say("No answer in time; not allowed.");
@@ -2206,6 +2282,30 @@ const Recorder = struct {
     next_id: i64 = 0,
     /// While set, sends fail with it and nothing is recorded.
     fail: ?anyerror = null,
+    /// The last question's buttons and the message they are in.
+    last: Buttons = .{},
+    /// Called once buttons are recorded, before their message id is
+    /// returned: an owner who presses before harness knows the message.
+    early: ?Early = null,
+
+    const Early = struct { ctx: *anyopaque, press: *const fn (ctx: *anyopaque, b: *const Buttons) void };
+
+    const Buttons = struct {
+        msg: i64 = 0,
+        n: usize = 0,
+        buf: [3][64]u8 = undefined,
+        len: [3]usize = @splat(0),
+
+        /// The data of the button that answers `which` ("once", "day", "deny").
+        fn get(b: *const Buttons, which: []const u8) ?[]const u8 {
+            for (0..b.n) |i| {
+                const d = b.buf[i][0..b.len[i]];
+                const colon = std.mem.lastIndexOfScalar(u8, d, ':') orelse continue;
+                if (std.mem.eql(u8, d[colon + 1 ..], which)) return d;
+            }
+            return null;
+        }
+    };
 
     fn deinit(r: *Recorder) void {
         for (r.lines.items) |l| t.allocator.free(l);
@@ -2239,12 +2339,21 @@ const Recorder = struct {
 
     fn buttons(ctx: *anyopaque, text: []const u8, bs: []const [2][]const u8) ?i64 {
         const r: *Recorder = @ptrCast(@alignCast(ctx));
-        r.mutex.lockUncancelable(t.io);
-        defer r.mutex.unlock(t.io);
-        const line = std.fmt.allocPrint(t.allocator, "BUTTONS {s} [{s}]", .{ text, bs[0][1] }) catch return null;
-        r.lines.append(t.allocator, line) catch {};
-        r.next_id += 1;
-        return r.next_id;
+        const shown = blk: {
+            r.mutex.lockUncancelable(t.io);
+            defer r.mutex.unlock(t.io);
+            const line = std.fmt.allocPrint(t.allocator, "BUTTONS {s} [{s}]", .{ text, bs[0][1] }) catch return null;
+            r.lines.append(t.allocator, line) catch {};
+            r.next_id += 1;
+            r.last = .{ .msg = r.next_id, .n = @min(bs.len, 3) };
+            for (bs[0..r.last.n], 0..) |b, i| {
+                r.last.len[i] = @min(b[1].len, 64);
+                @memcpy(r.last.buf[i][0..r.last.len[i]], b[1][0..r.last.len[i]]);
+            }
+            break :blk r.last;
+        };
+        if (r.early) |e| e.press(e.ctx, &shown);
+        return shown.msg;
     }
 
     fn clear(ctx: *anyopaque, id: i64) void {
@@ -2305,6 +2414,19 @@ const Fix = struct {
         f.core.close();
         f.rec.deinit();
         f.e.deinit();
+    }
+
+    /// The buttons under the last question, as the owner sees them.
+    fn lastButtons(f: *Fix) Recorder.Buttons {
+        f.rec.mutex.lockUncancelable(t.io);
+        defer f.rec.mutex.unlock(t.io);
+        return f.rec.last;
+    }
+
+    /// The owner presses the last question's button that answers `which`.
+    fn press(f: *Fix, which: []const u8) !void {
+        const b = f.lastButtons();
+        f.core.handleCallback(42, b.msg, b.get(which) orelse return error.NoSuchButton);
     }
 };
 
@@ -2437,14 +2559,16 @@ test "text_during_approval_is_queued_button_answers" {
     try f.e.script(3, model.textReply("answer to the queued text"));
     try f.core.startWorker();
     try f.core.handleText("run echo");
-    try f.rec.waitFor("BUTTONS Allow this?\nshell: echo approved-run [a1:once]");
+    try f.rec.waitFor("BUTTONS Allow this?\nshell: echo approved-run [");
     try f.core.handleText("what about this?");
     try f.rec.waitFor("Queued");
     try t.expect(f.core.approvalWaiting());
-    f.core.handleCallback(99, "a1:once"); // not the owner: ignored
+    const b = f.lastButtons();
+    f.core.handleCallback(99, b.msg, b.get("once").?); // not the owner: ignored
     t.io.sleep(.fromMilliseconds(100), .awake) catch {};
     try t.expect(f.core.approvalWaiting());
-    f.core.handleCallback(42, "a1:once");
+    try t.expectEqual(0, f.rec.count("out of date"));
+    try f.press("once");
     try f.rec.waitFor("ran it");
     try f.rec.waitFor("answer to the queued text");
     const req2 = try f.e.request(2);
@@ -2479,7 +2603,7 @@ test "a_long_question_goes_whole_in_parts_with_the_buttons_on_the_last" {
         try whole.appendSlice(a, last_text["Allow this? (2/2)\n".len..]);
     }
     try t.expectEqualStrings(try std.fmt.allocPrint(a, "shell: echo {s} end-of-it", .{ys}), whole.items);
-    f.core.handleCallback(42, "a1:deny");
+    try f.press("deny");
     try f.rec.waitFor("not run");
 }
 
@@ -2496,7 +2620,16 @@ test "the_owner_is_waited_for_only_until_the_turn_ends" {
     try f.rec.waitFor("No answer in time; not allowed.");
 }
 
-test "approval_ids_go_on_after_a_restart_so_an_old_button_answers_nothing" {
+/// Closes the core and opens the folder again, as a restart does.
+fn restart(f: *Fix) !void {
+    f.core.close();
+    f.core = try Core.open(t.allocator, t.io, f.home, .{ .omnigate = "og-key-for-tests", .search = "search-key-123" });
+    f.core.attach(f.rec.channel());
+}
+
+const out_of_date = "That button is out of date: it answers nothing.";
+
+test "approval_numbers_go_on_after_a_restart_and_an_old_button_answers_nothing" {
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
@@ -2504,24 +2637,132 @@ test "approval_ids_go_on_after_a_restart_so_an_old_button_answers_nothing" {
     try f.e.script(2, model.textReply("first done"));
     try f.core.startWorker();
     try f.core.handleText("one");
-    try f.rec.waitFor("[a1:once]");
-    f.core.handleCallback(42, "a1:once");
+    try f.rec.waitFor("BUTTONS Allow this?\nshell: echo one [a1");
+    const old = f.lastButtons();
+    try f.press("once");
     try f.rec.waitFor("first done");
-    // a restart: the buttons under the old question are still in the chat
-    f.core.close();
-    f.core = try Core.open(t.allocator, t.io, f.home, .{ .omnigate = "og-key-for-tests", .search = "search-key-123" });
-    f.core.attach(f.rec.channel());
+    // a restart: the buttons under the old question may still be in the chat
+    try restart(&f);
+    // pressed with nothing asked
+    f.core.handleCallback(42, old.msg, old.get("once").?);
+    try f.rec.waitFor(out_of_date);
     try f.e.script(3, model.toolReply("tu_2", "shell", "{\"command\":\"echo two\"}"));
     try f.e.script(4, model.textReply("second done"));
     try f.core.startWorker();
     try f.core.handleText("two");
-    try f.rec.waitFor("[a2:once]");
-    f.core.handleCallback(42, "a1:once");
+    // the numbers go on from before the restart
+    try f.rec.waitFor("BUTTONS Allow this?\nshell: echo two [a2");
+    // pressed while another question waits: it answers nothing either
+    f.core.handleCallback(42, old.msg, old.get("once").?);
     t.io.sleep(.fromMilliseconds(200), .awake) catch {};
     try t.expect(f.core.approvalWaiting());
-    f.core.handleCallback(42, "a2:deny");
+    try t.expectEqual(2, f.rec.count(out_of_date));
+    try f.press("deny");
     try f.rec.waitFor("second done");
     try t.expect(std.mem.indexOf(u8, try f.e.request(4), "denied by the owner") != null);
+}
+
+test "a_button_from_before_a_restart_answers_nothing_even_with_the_same_number_and_message" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo one\"}"));
+    try f.e.script(2, model.textReply("first done"));
+    try f.core.startWorker();
+    try f.core.handleText("one");
+    try f.rec.waitFor("BUTTONS Allow this?\nshell: echo one");
+    const old = f.lastButtons();
+    try f.press("deny");
+    try f.rec.waitFor("first done");
+    // a restart with the numbers lost (a state folder restored from a
+    // backup) and a chat whose message ids are the same again: only the
+    // instance's nonce tells the old button from the new one
+    f.core.close();
+    try Io.Dir.cwd().deleteFile(t.io, try std.fs.path.join(f.e.arena.allocator(), &.{ f.home, "state", "approvals" }));
+    f.core = try Core.open(t.allocator, t.io, f.home, .{ .omnigate = "og-key-for-tests", .search = "search-key-123" });
+    f.core.attach(f.rec.channel());
+    f.rec.next_id = old.msg - 1;
+    try f.e.script(3, model.toolReply("tu_2", "shell", "{\"command\":\"echo two\"}"));
+    try f.e.script(4, model.textReply("second done"));
+    try f.core.startWorker();
+    try f.core.handleText("two");
+    try f.rec.waitFor("BUTTONS Allow this?\nshell: echo two [a1");
+    const now = f.lastButtons();
+    try t.expectEqual(old.msg, now.msg);
+    try t.expect(!std.mem.eql(u8, old.get("once").?, now.get("once").?));
+    f.core.handleCallback(42, old.msg, old.get("once").?);
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expect(f.core.approvalWaiting());
+    try f.rec.waitFor(out_of_date);
+    try f.press("deny");
+    try f.rec.waitFor("second done");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "denied by the owner") != null);
+}
+
+test "a_press_counts_only_in_the_message_its_question_was_sent_in" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo one\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "shell", "{\"command\":\"echo two\"}"));
+    try f.e.script(3, model.textReply("both asked"));
+    try f.core.startWorker();
+    try f.core.handleText("one, then two");
+    try f.rec.waitFor("BUTTONS Allow this?\nshell: echo one");
+    const first = f.lastButtons();
+    // the question's own data, but from another message
+    f.core.handleCallback(42, first.msg + 7, first.get("once").?);
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expect(f.core.approvalWaiting());
+    try f.rec.waitFor(out_of_date);
+    try f.press("deny");
+    try f.rec.waitFor("BUTTONS Allow this?\nshell: echo two");
+    // a button under the question before answers nothing
+    f.core.handleCallback(42, first.msg, first.get("once").?);
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expect(f.core.approvalWaiting());
+    try t.expectEqual(2, f.rec.count(out_of_date));
+    try f.press("deny");
+    try f.rec.waitFor("both asked");
+    try t.expectEqual(2, std.mem.count(u8, try f.e.request(3), "denied by the owner"));
+}
+
+/// Presses "Allow once" before the channel has returned the buttons'
+/// message id, from message `id + offset`.
+const EarlyPress = struct {
+    core: *Core,
+    offset: std.atomic.Value(i64) = .init(0),
+
+    fn press(ctx: *anyopaque, b: *const Recorder.Buttons) void {
+        const ep: *EarlyPress = @ptrCast(@alignCast(ctx));
+        ep.core.handleCallback(42, b.msg + ep.offset.load(.acquire), b.get("once").?);
+    }
+};
+
+test "a_press_before_the_message_id_is_known_is_checked_once_it_is" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo one\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "shell", "{\"command\":\"echo early-two\"}"));
+    try f.e.script(3, model.textReply("done"));
+    var ep: EarlyPress = .{ .core = f.core };
+    ep.offset.store(5, .release);
+    f.rec.early = .{ .ctx = &ep, .press = EarlyPress.press };
+    try f.core.startWorker();
+    try f.core.handleText("one, then two");
+    // pressed in another message: out of date once the message is known
+    try f.rec.waitFor(out_of_date);
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expect(f.core.approvalWaiting());
+    // pressed in the question's own message: it answers
+    ep.offset.store(0, .release);
+    try f.press("deny");
+    try f.rec.waitFor("done");
+    try t.expectEqual(1, f.rec.count(out_of_date));
+    const req3 = try f.e.request(3);
+    try t.expectEqual(1, std.mem.count(u8, req3, "denied by the owner"));
+    try t.expect(std.mem.indexOf(u8, req3, "early-two") != null);
 }
 
 test "closing_the_terminal_denies_the_question_and_any_after_it" {
@@ -3092,7 +3333,7 @@ test "dryrun_sent_while_a_money_question_waits_stops_the_call" {
     try f.rec.waitFor("BUTTONS Allow this?");
     try f.core.handleText("/dryrun on");
     try f.rec.waitFor("Dry run is on");
-    f.core.handleCallback(42, "a1:once");
+    try f.press("once");
     try f.rec.waitFor("finished the order");
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "dry run: would call fake/echo") != null);
 }
@@ -3110,9 +3351,13 @@ test "an_answer_the_question_does_not_offer_is_not_taken" {
     try f.core.startWorker();
     try f.core.handleText("buy");
     try f.rec.waitFor("BUTTONS Allow this?");
-    // money is never granted for a day: neither "d" nor its button counts
+    // money is never granted for a day: neither "d" nor a "24 h" press
+    // (there is no such button) counts
     try t.expect(!f.core.answerPending(.day));
-    f.core.handleCallback(42, "a1:day");
+    const b = f.lastButtons();
+    try t.expect(b.get("day") == null);
+    const once = b.get("once").?;
+    f.core.handleCallback(42, b.msg, try std.fmt.allocPrint(a, "{s}:day", .{once[0..std.mem.lastIndexOfScalar(u8, once, ':').?]}));
     t.io.sleep(.fromMilliseconds(200), .awake) catch {};
     try t.expect(f.core.approvalWaiting());
     try t.expect(f.core.answerPending(.deny));

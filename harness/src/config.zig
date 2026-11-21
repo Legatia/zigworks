@@ -365,9 +365,10 @@ pub const rules_example =
     \\# Gate rules: allow | ask | deny, a tool, a pattern (* matches anything).
     \\# A matching deny always wins; otherwise the first matching line decides;
     \\# otherwise the tool's default: shell, fetch, browse, web, login,
-    \\# skill_save and mcp (MCP tools, matched as "mcp SERVER/TOOL INPUT") ask;
-    \\# money tools are asked every time, whatever the rules; the others are
-    \\# allowed.
+    \\# skill_save, mcp (MCP tools, matched as "mcp SERVER/TOOL INPUT") and
+    \\# write_file to a path with a part starting with "." (.git/config,
+    \\# .npmrc: programs read those as settings) ask; money tools are asked
+    \\# every time, whatever the rules; the others are allowed.
     \\#
     \\# deny  shell rm -rf *
     \\# allow fetch https://news.ycombinator.com/*
@@ -569,16 +570,28 @@ test "agents_browser_and_money_sections" {
 test "inits_rules_comment_names_each_tool_that_asks_by_default" {
     const gate = @import("gate.zig");
     // the comment is what an owner reads to learn the defaults: every tool
-    // that asks must be named there, and none that is allowed
+    // that asks must be named there, and none that is always allowed; one
+    // that asks only for some arguments (write_file to a dot path, which
+    // programs read as settings) is named with when
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var grants: gate.Grants = .init(t.allocator);
+    defer grants.deinit();
+    const g: gate.Gate = .{ .io = t.io, .rules = &.{}, .grants = &grants, .workspace = try tmp.dir.realPathFileAlloc(t.io, ".", a) };
     const comment = rules_example[0 .. std.mem.indexOf(u8, rules_example, "#\n") orelse rules_example.len];
     inline for (@typeInfo(gate.Tool).@"enum".field_names) |name| {
         const tool = @field(gate.Tool, name);
+        const asks = tool.default() == .ask or g.decide(a, tool, ".npmrc", 1000, .{}).action == .ask;
         const named = hasWord(comment, name);
-        if ((tool.default() == .ask) != named) {
-            std.debug.print("{s} (default {s}) is {s} in:\n{s}\n", .{ name, @tagName(tool.default()), if (named) "named" else "not named", comment });
+        if (asks != named) {
+            std.debug.print("{s} (asks by default: {}) is {s} in:\n{s}\n", .{ name, asks, if (named) "named" else "not named", comment });
             return error.TestUnexpectedResult;
         }
     }
+    try t.expect(std.mem.indexOf(u8, comment, "write_file to a path with a part starting with \".\"") != null);
 }
 
 /// `word` as a whole word in `text` ("skill" is not in "skill_save").

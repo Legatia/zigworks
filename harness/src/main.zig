@@ -183,6 +183,7 @@ const App = struct {
         const cfg = try app.settings();
         const sec = app.secrets(cfg);
         if (sec.omnigate == null) complain("note: no omnigate key stored under \"{s}\"; model calls will be refused. Run: harness secret add {s}", .{ cfg.model.key, cfg.model.key });
+        if (cfg.model.url.len == 0) complain("note: no omnigate url is set ([model] url in config.ini); model calls will be refused", .{});
         const c = Core.open(app.gpa, app.io, app.home, sec) catch |e| {
             switch (e) {
                 error.AlreadyRunning => complain("harness is already running on {s}; talk to it there (or stop it first)", .{app.home}),
@@ -752,7 +753,7 @@ fn runCmd(app: *App) !Exit {
                 .message => |m| if (m.text.len > 0) c.handleMessage(m.from_id, m.text) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
                 .callback => |cb| {
                     tc.answer(cb.id);
-                    c.handleCallback(cb.from_id, cb.data);
+                    c.handleCallback(cb.from_id, cb.message_id, cb.data);
                 },
             }
         }
