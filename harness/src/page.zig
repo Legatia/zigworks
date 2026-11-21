@@ -7,6 +7,7 @@
 //! content, and a writer that turns the chosen tokens into text.
 const std = @import("std");
 const builtin = @import("builtin");
+const util = @import("util.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -1204,11 +1205,59 @@ pub fn waitExited(pid: std.posix.pid_t) void {
 extern "c" fn waitid(idtype: c_int, id: c_uint, infop: *anyopaque, options: c_int) c_int;
 const darwin_waitid = if (builtin.os.tag == .macos) waitid else undefined;
 
+/// What a browser's environment is made of: nothing else of harness's own
+/// environment (keys and tokens among it) reaches it.
+pub const BrowserEnv = struct {
+    path: []const u8 = "",
+    home: []const u8 = "",
+    /// Windows: the system's own variables (util.system_var_names).
+    system: []const util.Var = &.{},
+
+    pub fn map(e: BrowserEnv, arena: Allocator) !std.process.Environ.Map {
+        var m = std.process.Environ.Map.init(arena);
+        for (e.system) |v| try m.put(v.name, v.value);
+        try m.put("PATH", if (e.path.len > 0) e.path else "/usr/local/bin:/usr/bin:/bin");
+        if (e.home.len > 0) try m.put("HOME", e.home);
+        try m.put("LANG", "C.UTF-8");
+        return m;
+    }
+};
+
+/// Every browser harness starts: headless, no first-run screens, and the
+/// system's own key store left alone (a mock of the macOS Keychain, no
+/// desktop keyring on Linux).
+pub const browser_flags = [_][]const u8{
+    "--headless=new",
+    "--disable-gpu",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-extensions",
+    "--mute-audio",
+    "--use-mock-keychain",
+    "--password-store=basic",
+};
+
+/// The host name of an http(s) `url`, lowercase, without user info or
+/// port; null unless it is made of letters, digits, dots and dashes only
+/// (it goes into the browser's host rules).
+pub fn urlHostname(arena: Allocator, url: []const u8) !?[]const u8 {
+    const n: usize = if (std.ascii.startsWithIgnoreCase(url, "https://")) 8 else if (std.ascii.startsWithIgnoreCase(url, "http://")) 7 else return null;
+    const rest = url[n..];
+    // a backslash ends the host as a slash does (the browser reads it so)
+    const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#\\") orelse rest.len];
+    var host = authority[if (std.mem.lastIndexOfScalar(u8, authority, '@')) |i| i + 1 else 0..];
+    if (std.mem.lastIndexOfScalar(u8, host, ':')) |i| host = host[0..i];
+    if (host.len == 0) return null;
+    for (host) |c| if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-')) return null;
+    return try std.ascii.allocLowerString(arena, host);
+}
+
 /// Renders `url` in a headless browser with a fresh throwaway profile and
 /// returns the DOM as HTML (at most max_bytes). Ends it on `stop`
 /// (error.Stopped) or after timeout_ms (error.Timeout).
-pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url: []const u8, tmp_root: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32, max_bytes: usize) ![]const u8 {
+pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url: []const u8, tmp_root: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32, max_bytes: usize, benv: BrowserEnv) ![]const u8 {
     if (!validUrl(url)) return error.BadUrl;
+    const host = try urlHostname(arena, url) orelse return error.BadUrl;
 
     var rnd: [8]u8 = undefined;
     io.random(&rnd);
@@ -1218,21 +1267,22 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
     try Io.Dir.cwd().createDir(io, profile, .default_dir);
     defer removeProfile(io, profile);
 
-    const argv: []const []const u8 = &.{
-        browser,
-        "--headless=new",
-        "--disable-gpu",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-extensions",
-        "--mute-audio",
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(arena, browser);
+    try argv.appendSlice(arena, &browser_flags);
+    try argv.appendSlice(arena, &.{
         try std.fmt.allocPrint(arena, "--user-data-dir={s}", .{profile}),
+        // the gate allowed this host: no other is even looked up (the
+        // page's scripts, images and frames from elsewhere don't load)
+        try std.fmt.allocPrint(arena, "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE {s}", .{host}),
         "--virtual-time-budget=8000",
         "--dump-dom",
         url,
-    };
+    });
+    var vars = try benv.map(arena);
     var child = try std.process.spawn(io, .{
-        .argv = argv,
+        .argv = argv.items,
+        .environ_map = &vars,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .ignore,
@@ -1305,6 +1355,9 @@ fn removeProfile(io: Io, path: []const u8) void {
 // ---- tests ----
 
 const t = std.testing;
+
+/// What the stand-in browsers in the tests need: `sleep` and `echo`.
+const test_env: BrowserEnv = .{ .path = "/usr/bin:/bin" };
 
 fn ex(html: []const u8, base: []const u8) !Page {
     return extract(t.allocator, html, base);
@@ -1655,7 +1708,7 @@ test "render_refuses_non_http_urls" {
     defer arena.deinit();
     var stop: std.atomic.Value(bool) = .init(false);
     for ([_][]const u8{ "file:///etc/passwd", "javascript:alert(1)", "ftp://x.example/", "about:blank", "--headless", "http://x.example/a b", "" }) |u| {
-        try t.expectError(error.BadUrl, render(t.allocator, t.io, arena.allocator(), "/no/such/chrome", u, "/tmp", &stop, 1000, 1 << 20));
+        try t.expectError(error.BadUrl, render(t.allocator, t.io, arena.allocator(), "/no/such/chrome", u, "/tmp", &stop, 1000, 1 << 20, .{}));
     }
 }
 
@@ -1680,7 +1733,7 @@ test "render_stops_and_times_out_and_cleans_up" {
     var stop: std.atomic.Value(bool) = .init(false);
 
     const start = Io.Clock.awake.now(t.io).nanoseconds;
-    try t.expectError(error.Timeout, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "slow" }), "https://example.com/", profiles, &stop, 500, 1 << 20));
+    try t.expectError(error.Timeout, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "slow" }), "https://example.com/", profiles, &stop, 500, 1 << 20, test_env));
     const took_ms = @divFloor(Io.Clock.awake.now(t.io).nanoseconds - start, std.time.ns_per_ms);
     try t.expect(took_ms < 3000);
 
@@ -1690,13 +1743,13 @@ test "render_stops_and_times_out_and_cleans_up" {
             flag.store(true, .release);
         }
     }.f, .{&stop});
-    try t.expectError(error.Stopped, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "slow" }), "https://example.com/", profiles, &stop, 20_000, 1 << 20));
+    try t.expectError(error.Stopped, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "slow" }), "https://example.com/", profiles, &stop, 20_000, 1 << 20, test_env));
     th.join();
     stop.store(false, .release);
 
-    const dom = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", profiles, &stop, 5000, 1 << 20);
+    const dom = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", profiles, &stop, 5000, 1 << 20, test_env);
     try t.expectEqualStrings("<html><body><p>dom</p></body></html>\n", dom);
-    const capped = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", profiles, &stop, 5000, 6);
+    const capped = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", profiles, &stop, 5000, 6, test_env);
     try t.expectEqualStrings("<html>", capped);
 
     // every throwaway profile is gone
@@ -1724,9 +1777,73 @@ test "render_never_kills_a_group_after_the_browser_was_reaped" {
     }
     var stop: std.atomic.Value(bool) = .init(false);
     const before = late_group_kills.load(.acquire);
-    _ = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", root, &stop, 5000, 1 << 20);
-    try t.expectError(error.Timeout, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "slow" }), "http://example.com/", root, &stop, 300, 1 << 20));
+    _ = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quick" }), "http://example.com/", root, &stop, 5000, 1 << 20, test_env);
+    try t.expectError(error.Timeout, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "slow" }), "http://example.com/", root, &stop, 300, 1 << 20, test_env));
     try t.expectEqual(before, late_group_kills.load(.acquire));
+}
+
+/// The variables in `env` output (one NAME=value a line) other than those
+/// in `allowed` and those a shell sets itself (for tests).
+pub fn otherVars(a: Allocator, env_out: []const u8, allowed: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, env_out, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "ARG ") or std.mem.startsWith(u8, line, "<")) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const name = line[0..eq];
+        if (name.len == 0) continue;
+        const ok = for ([_][]const u8{ "PWD", "OLDPWD", "SHLVL", "_" } ++ .{}) |n| {
+            if (std.mem.eql(u8, n, name)) break true;
+        } else for (allowed) |n| {
+            if (std.mem.eql(u8, n, name)) break true;
+        } else false;
+        if (!ok) try out.print(a, "{s} ", .{name});
+    }
+    return out.items;
+}
+
+test "render_gives_the_browser_a_small_environment_and_keeps_it_on_the_host" {
+    if (is_windows) return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // a stand-in browser that shows its environment and arguments
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "show", .data = "#!/bin/sh\necho '<html><body><pre>'\nenv\nfor a in \"$@\"; do echo \"ARG $a\"; done\necho '</pre></body></html>'\n" });
+    var f = try tmp.dir.openFile(t.io, "show", .{});
+    try f.setPermissions(t.io, .fromMode(0o755));
+    f.close(t.io);
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    var stop: std.atomic.Value(bool) = .init(false);
+    const out = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "show" }), "https://user@Docs.Example.com:8443/a", root, &stop, 5000, 1 << 20, .{ .path = "/usr/bin:/bin", .home = "/no/such/home" });
+    try t.expectEqualStrings("", try otherVars(a, out, &.{ "PATH", "HOME", "LANG" }));
+    try expectHas(out, "PATH=/usr/bin:/bin\n");
+    try expectHas(out, "HOME=/no/such/home\n");
+    // the system's key store is left alone (macOS Keychain, a desktop keyring)
+    try expectHas(out, "ARG --use-mock-keychain\n");
+    try expectHas(out, "ARG --password-store=basic\n");
+    // no other host than the one the gate allowed is even looked up
+    try expectHas(out, "ARG --host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE docs.example.com\n");
+}
+
+test "render_loads_nothing_from_another_host" {
+    if (is_windows) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const browser = (try @import("cdp.zig").testBrowser(a)) orelse return error.SkipZigTest;
+    var e: @import("model.zig").TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    // 127.0.0.1 is another host than localhost, though the same server
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/h.html", .data = try std.fmt.allocPrint(a, "<html><body><p>page</p><script src=\"http://127.0.0.1:{d}/page/o.bin\"></script><script src=\"/page/s.bin\"></script></body></html>", .{e.server.port}) });
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/o.bin", .data = "document.body.append('other host ran');" });
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/s.bin", .data = "document.body.append('same host ran');" });
+    var stop: std.atomic.Value(bool) = .init(false);
+    const dom = try render(t.allocator, t.io, a, browser, try std.fmt.allocPrint(a, "http://localhost:{d}/page/h.html", .{e.server.port}), e.dir, &stop, 30_000, 4 << 20, test_env);
+    try expectHas(dom, "same host ran");
+    try expectLacks(dom, "other host ran");
 }
 
 test "render_example_com_with_a_real_browser" {
@@ -1742,7 +1859,7 @@ test "render_example_com_with_a_real_browser" {
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     var stop: std.atomic.Value(bool) = .init(false);
-    const dom = try render(t.allocator, t.io, a, browser, "https://example.com/", root, &stop, 30_000, 4 << 20);
+    const dom = try render(t.allocator, t.io, a, browser, "https://example.com/", root, &stop, 30_000, 4 << 20, test_env);
     const p = try extract(a, dom, "https://example.com/");
     std.debug.print("\nbrowser: {s}\ntitle: {s}\ntext: {s}\n", .{ browser, p.title, p.text });
     try t.expect(has(p.title, "Example Domain"));

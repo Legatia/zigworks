@@ -25,6 +25,8 @@ pub const Output = tools.Output;
 
 pub const Env = struct {
     browser: []const u8,
+    /// All of the browser's environment (PATH and HOME of harness's own).
+    chrome_env: page.BrowserEnv = .{},
     /// The data folder's `profiles/`: one folder per login.
     profiles: []const u8,
     /// Where a throwaway profile goes.
@@ -318,7 +320,7 @@ pub const Web = struct {
             break :blk p;
         };
         try noPasswordManager(w.io, a, profile);
-        w.s = try cdp.Session.open(w.gpa, w.io, w.env.browser, profile, w.env.stop, w.env.timeout_ms);
+        w.s = try cdp.Session.open(w.gpa, w.io, w.env.browser, profile, w.env.stop, w.env.timeout_ms, .{ .env = w.env.chrome_env });
         if (w.login) |l| try w.loadPasskeys(a, l);
     }
 

@@ -192,45 +192,40 @@ pub const Session = struct {
         s.err_len = m.len;
     }
 
+    pub const Options = struct {
+        /// The browser's whole environment.
+        env: page.BrowserEnv = .{},
+    };
+
     /// Starts `browser` with `profile_dir` and attaches to its page.
-    pub fn open(gpa: Allocator, io: Io, browser: []const u8, profile_dir: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32) !*Session {
-        if (is_windows) return error.Unsupported else return openPosix(gpa, io, browser, profile_dir, stop, timeout_ms);
+    pub fn open(gpa: Allocator, io: Io, browser: []const u8, profile_dir: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32, opts: Options) !*Session {
+        if (is_windows) return error.Unsupported else return openPosix(gpa, io, browser, profile_dir, stop, timeout_ms, opts);
     }
 
-    fn openPosix(gpa: Allocator, io: Io, browser: []const u8, profile_dir: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32) !*Session {
+    fn openPosix(gpa: Allocator, io: Io, browser: []const u8, profile_dir: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32, opts: Options) !*Session {
         const s = try gpa.create(Session);
         s.* = .{ .gpa = gpa, .io = io, .stop = stop, .timeout_ms = timeout_ms, .inbox = .{ .gpa = gpa } };
         // whatever fails, the browser is ended and all of it freed
-        s.start(browser, profile_dir) catch |e| {
+        s.start(browser, profile_dir, opts) catch |e| {
             s.destroy();
             return e;
         };
         return s;
     }
 
-    fn start(s: *Session, browser: []const u8, profile_dir: []const u8) !void {
-        const gpa = s.gpa;
-        const data_dir = try std.fmt.allocPrint(gpa, "--user-data-dir={s}", .{profile_dir});
-        defer gpa.free(data_dir);
+    fn start(s: *Session, browser: []const u8, profile_dir: []const u8, opts: Options) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
         // our stdin pipe becomes Chrome's fd 3, our stdout pipe its fd 4
-        const argv: []const []const u8 = &.{
-            "/bin/sh",
-            "-c",
-            "exec \"$@\" 3<&0 4>&1 0</dev/null 1>/dev/null",
-            "sh",
-            browser,
-            "--headless=new",
-            "--disable-gpu",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--mute-audio",
-            "--remote-debugging-pipe",
-            data_dir,
-            "about:blank",
-        };
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(a, &.{ "/bin/sh", "-c", "exec \"$@\" 3<&0 4>&1 0</dev/null 1>/dev/null", "sh", browser });
+        try argv.appendSlice(a, &page.browser_flags);
+        try argv.appendSlice(a, &.{ "--remote-debugging-pipe", try std.fmt.allocPrint(a, "--user-data-dir={s}", .{profile_dir}), "about:blank" });
+        var vars = try opts.env.map(a);
         s.child = try std.process.spawn(s.io, .{
-            .argv = argv,
+            .argv = argv.items,
+            .environ_map = &vars,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
@@ -597,7 +592,7 @@ test "chrome_over_a_pipe_evaluates_and_closes_without_leftovers" {
     defer tmp.cleanup();
     const profile = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     var stop: std.atomic.Value(bool) = .init(false);
-    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000);
+    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000, .{});
     const pid = s.pid;
     try t.expectEqualStrings("2", try s.evaluate(a, "1+1"));
     // the page's globals don't reach an isolated world
@@ -633,10 +628,36 @@ test "a_browser_that_fails_to_start_leaves_nothing_allocated" {
     // half a message, then gone: the reader has bytes in hand
     try standIn(tmp.dir, "fake-chrome", "#!/bin/sh\nprintf '{\"id\":1,\"res' >&4\n");
     var stop: std.atomic.Value(bool) = .init(false);
-    if (Session.open(t.allocator, t.io, try std.fs.path.join(a, &.{ root, "fake-chrome" }), root, &stop, 5000)) |s| {
+    if (Session.open(t.allocator, t.io, try std.fs.path.join(a, &.{ root, "fake-chrome" }), root, &stop, 5000, .{})) |s| {
         s.destroy();
         return error.TestUnexpectedResult;
     } else |_| {}
+}
+
+test "chrome_gets_a_small_environment_and_leaves_the_key_store_alone" {
+    if (is_windows) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    // a stand-in that notes its environment and arguments in the profile
+    try standIn(tmp.dir, "fake-chrome", "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --user-data-dir=*) d=\"${a#--user-data-dir=}\";; esac; done\nenv > \"$d/env.txt\"\nprintf '%s\\n' \"$@\" > \"$d/args.txt\"\n");
+    var stop: std.atomic.Value(bool) = .init(false);
+    if (Session.open(t.allocator, t.io, try std.fs.path.join(a, &.{ root, "fake-chrome" }), root, &stop, 5000, .{})) |s| {
+        s.destroy();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    const env = try tmp.dir.readFileAlloc(t.io, "env.txt", a, .limited(1 << 20));
+    const args = try tmp.dir.readFileAlloc(t.io, "args.txt", a, .limited(1 << 20));
+    try t.expectEqualStrings("", try page.otherVars(a, env, &.{ "PATH", "HOME", "LANG" }));
+    for ([_][]const u8{ "--use-mock-keychain\n", "--password-store=basic\n", "--remote-debugging-pipe\n" }) |flag| {
+        if (std.mem.indexOf(u8, args, flag) == null) {
+            std.debug.print("\nno {s} in:\n{s}\n", .{ flag, args });
+            return error.TestExpectedEqual;
+        }
+    }
 }
 
 test "chrome_is_never_signalled_after_it_was_reaped" {
@@ -650,7 +671,7 @@ test "chrome_is_never_signalled_after_it_was_reaped" {
     const profile = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     for ([_]bool{ false, true }) |stopped| {
         var stop: std.atomic.Value(bool) = .init(false);
-        const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000);
+        const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000, .{});
         defer s.destroy();
         try t.expectEqualStrings("2", try s.evaluate(a, "1+1"));
         // a stop: the reader kills the group again and again until it sees the pipe close
@@ -672,7 +693,7 @@ test "chrome_ends_when_harness_goes_away" {
     defer tmp.cleanup();
     const profile = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     var stop: std.atomic.Value(bool) = .init(false);
-    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000);
+    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000, .{});
     defer s.destroy();
     s.to_chrome.?.close(t.io);
     s.to_chrome = null;
@@ -690,7 +711,7 @@ test "a_stop_ends_chrome_at_once" {
     defer tmp.cleanup();
     const profile = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     var stop: std.atomic.Value(bool) = .init(false);
-    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000);
+    const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000, .{});
     defer s.destroy();
     const th = try std.Thread.spawn(.{}, struct {
         fn f(flag: *std.atomic.Value(bool)) void {

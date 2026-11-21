@@ -324,7 +324,7 @@ fn fetch(env: Env, arena: std.mem.Allocator, url: []const u8, start: usize) !Out
 
 fn browse(env: Env, arena: std.mem.Allocator, url: []const u8, start: usize) !Output {
     if (env.browser.len == 0) return .{ .text = "no Chrome or Chromium found (set [browser] path in config.ini); use fetch instead", .is_error = true };
-    const html = page.render(env.gpa, env.io, arena, env.browser, url, if (env.tmp_root.len > 0) env.tmp_root else env.workspace, env.stop, env.browser_seconds * 1000, 4 << 20) catch |e|
+    const html = page.render(env.gpa, env.io, arena, env.browser, url, if (env.tmp_root.len > 0) env.tmp_root else env.workspace, env.stop, env.browser_seconds * 1000, 4 << 20, .{ .path = env.path_var, .home = env.home, .system = env.system_vars }) catch |e|
         return .{ .text = try std.fmt.allocPrint(arena, "the browser failed: {s}", .{@errorName(e)}), .is_error = true };
     const pg = try page.extract(arena, html, url);
     var head: std.ArrayList(u8) = .empty;

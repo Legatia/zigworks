@@ -518,6 +518,7 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     if (own_web) {
         web_state = web_mod.Web.init(r.gpa, r.io, .{
             .browser = r.env.browser,
+            .chrome_env = .{ .path = r.env.path_var, .home = r.env.home },
             .profiles = r.profiles_dir,
             .tmp_root = r.env.tmp_root,
             .timeout_ms = @intCast(@min(@as(u64, r.env.browser_seconds) * 1000, std.math.maxInt(u32))),
