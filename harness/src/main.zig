@@ -152,6 +152,8 @@ const App = struct {
         c.system_vars = util.pickVars(app.arena, app.env, util.system_var_names) catch &.{};
         c.store = app.store();
         c.startExtras();
+        var warns = std.mem.tokenizeScalar(u8, c.mcp_warn, '\n');
+        while (warns.next()) |w| complain("note: mcp.ini: {s}", .{w});
         return c;
     }
 };

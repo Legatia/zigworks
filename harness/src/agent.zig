@@ -244,34 +244,40 @@ pub const McpTool = struct {
     server: *mcp.Server,
     tool: []const u8,
     money: bool,
-    /// The input field holding the amount, for money tools; empty: the
-    /// tool moves no amount (like cancelling an order).
-    amount: []const u8,
+    /// For money tools: the input field holding the amount (mcp.ini's
+    /// `amount =`), `.none` for a tool that moves no amount, `.unset` when
+    /// mcp.ini does not say (refused while a cap is set).
+    amount: mcp.Field = .unset,
 };
 
-/// The amount field of one tool from mcp.ini's `amount =`.
-fn amountField(amount: mcp.Amount, tool: []const u8) []const u8 {
-    return switch (amount.of(tool)) {
-        .name => |f| f,
-        .none => "",
-        // not listed: an amount is required, under a name that cannot match
-        .unset => if (amount == .unset) "" else "(not set in mcp.ini)",
-    };
-}
+/// What one server offers the model, and what the owner should know about
+/// it (for /status and the start).
+pub const Offer = struct {
+    tools: []McpTool,
+    /// One line each, "SERVER: ...\n".
+    notes: []const u8 = "",
+};
 
-pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, money: []const []const u8, amount: mcp.Amount) ![]McpTool {
+/// The tools of a started server, as its mcp.ini section `cfg` says;
+/// `caps`: config.ini's [money].
+pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, cfg: mcp.ServerConfig, caps: config.Config.Money) !Offer {
     var out: std.ArrayList(McpTool) = .empty;
+    var notes: std.ArrayList(u8) = .empty;
+    const capped = caps.max_per_call > 0 or caps.max_per_day > 0;
     for (s.tools()) |tl| {
         var is_money = false;
-        for (money) |m| if (std.mem.eql(u8, m, tl.name)) {
+        for (cfg.money) |m| if (std.mem.eql(u8, m, tl.name)) {
             is_money = true;
         };
         const name = try std.fmt.allocPrint(arena, "{s}__{s}", .{ tl.server, tl.name });
         if (name.len > 64) continue;
         const desc = if (is_money) try std.fmt.allocPrint(arena, "{s} (Moves money: the owner approves every call.)", .{tl.description}) else tl.description;
-        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = amountField(amount, tl.name) });
+        const field: mcp.Field = if (is_money) cfg.amount.of(tl.name) else .unset;
+        if (is_money and field == .unset and capped)
+            try notes.print(arena, "{s}: {s} has no amount field in mcp.ini (amount =), so its calls are refused while a money cap is set\n", .{ tl.server, tl.name });
+        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = field });
     }
-    return out.items;
+    return .{ .tools = out.items, .notes = notes.items };
 }
 
 /// What money tools moved today, in the owner's day.
@@ -770,7 +776,6 @@ fn webNote(ctx: *anyopaque, event: []const u8, login: []const u8, detail: []cons
 
 /// The amount in a money call's input: a number or a numeric string.
 fn amountOf(a: std.mem.Allocator, input_json: []const u8, field: []const u8) ?f64 {
-    if (field.len == 0) return null;
     const v = jv.parse(a, input_json) orelse return null;
     const x = jv.get(v, field) orelse return null;
     return switch (x) {
@@ -793,13 +798,16 @@ fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []co
     const capped = r.money.max_per_call > 0 or r.money.max_per_day > 0;
     if (r.scheduled and r.money.scheduled and !capped)
         return "money in scheduled runs needs max_per_call or max_per_day in [money]";
-    if (m.amount.len > 0) {
-        if (amountOf(a, input_json, m.amount)) |x| {
+    switch (m.amount) {
+        .none => {},
+        // without its field the caps cannot be checked: refused, not let through
+        .unset => if (capped) return "no amount field is set for this tool in mcp.ini (amount =), so the money caps cannot be checked",
+        .name => |field| if (amountOf(a, input_json, field)) |x| {
             if (x < 0 or std.math.isNan(x) or std.math.isInf(x)) return "the amount is not a positive number";
             amount.* = x;
         } else if (capped) {
-            return std.fmt.allocPrint(a, "no amount in the field \"{s}\", so the caps cannot be checked", .{m.amount}) catch "no amount";
-        }
+            return std.fmt.allocPrint(a, "no amount in the field \"{s}\", so the caps cannot be checked", .{field}) catch "no amount";
+        },
     }
     if (r.money.max_per_call > 0 and amount.* > @as(f64, @floatFromInt(r.money.max_per_call)))
         return std.fmt.allocPrint(a, "{d} is over the cap of {d} per call", .{ amount.*, r.money.max_per_call }) catch "over the cap per call";
@@ -1374,10 +1382,15 @@ test "long_conversation_is_summarised_not_dropped" {
 
 const mcp_fake_path = if (@import("builtin").is_test) @import("build_options").fake_path else "";
 
-/// `amount = TEXT` as mcp.ini's parser reads it, for the fake's money tools.
-fn amountSpec(a: std.mem.Allocator, text: []const u8) !mcp.Amount {
-    const cfgs = try mcp.parseConfig(a, try std.fmt.allocPrint(a, "[fake]\ncommand = x\nmoney = echo, fail\namount = {s}\n", .{text}));
-    return cfgs[0].amount;
+/// The fake server's tools as the mcp.ini section `[fake]` with the lines
+/// `extra` makes them; they become the run's MCP tools.
+fn fakeTools(f: *Fix, s: *mcp.Server, extra: []const u8) !Offer {
+    const a = f.e.arena.allocator();
+    const cfgs = try mcp.parseConfig(a, try std.fmt.allocPrint(a, "[fake]\ncommand = x\n{s}", .{extra}));
+    const offer = try mcpTools(a, s, cfgs[0], f.run.money);
+    f.mcp_tools = offer.tools;
+    f.run.mcp = f.mcp_tools;
+    return offer;
 }
 
 fn withMcp(f: *Fix, money: bool) !*mcp.Server {
@@ -1389,8 +1402,7 @@ fn withMcp(f: *Fix, money: bool) !*mcp.Server {
         .home = "/tmp",
         .secret_values = &.{},
     });
-    f.mcp_tools = try mcpTools(a, s, if (money) &.{ "echo", "fail" } else &.{}, if (money) try amountSpec(a, "amount") else .unset);
-    f.run.mcp = f.mcp_tools;
+    _ = try fakeTools(f, s, if (money) "money = echo, fail\namount = amount\n" else "");
     f.run.money_ledger = &f.ledger;
     return s;
 }
@@ -1567,9 +1579,8 @@ test "amount_field_can_differ_per_tool" {
     defer f.deinit();
     const s = try withMcp(&f, true);
     defer s.deinit();
-    f.mcp_tools = try mcpTools(f.e.arena.allocator(), s, &.{ "echo", "fail" }, try amountSpec(f.e.arena.allocator(), "echo:amount, fail:none"));
-    f.run.mcp = f.mcp_tools;
     f.run.money = .{ .max_per_call = 10 };
+    _ = try fakeTools(&f, s, "money = echo, fail\namount = echo:amount, fail:none\n");
     // like cancel_order: no amount, still allowed with a cap set
     try f.e.script(1, model.toolReply("tu_1", "fake__fail", "{}"));
     try f.e.script(2, model.toolReply("tu_2", "fake__echo", "{\"text\":\"x\"}"));
@@ -1578,6 +1589,26 @@ test "amount_field_can_differ_per_tool" {
     freeResult(&f.run, r);
     try t.expectEqual(1, f.asked);
     try t.expect(std.mem.indexOf(u8, try f.e.request(3), "no amount in the field \\\"amount\\\"") != null);
+}
+
+test "money_tool_without_an_amount_field_is_refused_under_a_cap" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.money = .{ .max_per_day = 100 };
+    // mcp.ini lists the money tools but says nothing about their amounts
+    const offer = try fakeTools(&f, s, "money = echo, fail\n");
+    // the owner is told when the server starts (and in /status)
+    try t.expect(std.mem.indexOf(u8, offer.notes, "fake: echo has no amount field in mcp.ini") != null);
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"buy\",\"amount\":500}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "no amount field") != null);
+    try t.expectEqual(@as(f64, 0), f.ledger.total);
 }
 
 test "private_turns_are_left_out_of_summaries" {
