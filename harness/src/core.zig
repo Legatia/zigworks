@@ -907,8 +907,14 @@ pub const Core = struct {
             return;
         };
         defer agent.freeResult(&run, res);
+        // /private switched on while the turn ran: it stays out of memory
+        // and summaries too
+        const private = run.private or c.private;
+        if (private and !run.private) if (c.conv.turns.getLastOrNull()) |tn| {
+            tn.private = true;
+        };
         if (!res.stopped) c.say(res.text);
-        if (!run.private) c.turns_since_memory += 1;
+        if (!private) c.turns_since_memory += 1;
     }
 
     const memory_prompt =
@@ -985,6 +991,8 @@ pub const Core = struct {
         while (it.next()) |line| {
             const l = std.mem.trim(u8, line, " \t\r");
             if (!std.mem.startsWith(u8, l, "- ") or n >= 5) continue;
+            // switched on while the writer's call ran
+            if (c.private) break;
             n += 1;
             c.lock.lockUncancelable(c.io);
             defer c.lock.unlock(c.io);
@@ -1346,6 +1354,7 @@ pub const Core = struct {
         }
         if (eql(u8, cmd, "/remember")) {
             if (rest.len == 0) return "Use /remember TEXT.";
+            if (c.private) return "Not saved: private is on, so nothing is written to memory. Send /private off first.";
             c.lock.lockUncancelable(c.io);
             defer c.lock.unlock(c.io);
             const res = try c.mem.add(rest, null, c.now());
@@ -2272,6 +2281,36 @@ test "the_owner_hears_of_every_memory_the_agent_or_the_writer_saves" {
     try f.rec.waitFor("Saved to memory: The owner plays chess on Sundays (/forget ");
     // what was known already is not said again
     try t.expectEqual(1, f.rec.count("sister is called Ada (/forget"));
+}
+
+test "remember_in_private_mode_says_it_is_not_saved" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.core.handleText("/private on");
+    try f.core.handleText("/remember my door code is 4711");
+    try f.rec.waitFor("Not saved: private is on");
+    try t.expectEqual(0, f.core.mem.items.items.len);
+}
+
+test "a_turn_running_when_private_goes_on_stays_out_of_memory" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const slow = comptime "{\"delay_ms\":800," ++ model.textReply("noted")[1..];
+    try f.e.script(1, slow);
+    try f.core.startWorker();
+    try f.core.handleText("my private plans for tomorrow");
+    try waitFile(&f.e, "requests/001.json");
+    try f.core.handleText("/private on");
+    try f.rec.waitFor("noted");
+    var waited: u32 = 0;
+    while (f.core.busy.load(.acquire) and waited < 3000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    try t.expect(f.core.conv.turns.items[f.core.conv.turns.items.len - 1].private);
+    try t.expectEqual(0, f.core.turns_since_memory);
+    // so the writer has nothing to read
+    try f.core.writeMemories();
+    try t.expectEqual(1, f.e.server.modelRequests());
 }
 
 test "private_lines_are_hashed_with_the_instance_key" {
