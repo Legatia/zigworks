@@ -197,6 +197,9 @@ pub const Gate = struct {
         }
         if (g.grants.has(tool, grantKey(tool, subject), now_s)) return .{ .action = .allow, .why = "granted for 24 hours", .subject = subject };
         var d: Decision = .{ .action = tool.default(), .why = "default for this tool", .subject = subject };
+        // programs read these as their settings (.git/config, .npmrc, .env):
+        // a file written there can make the next command run something else
+        if (tool == .write_file and dotPart(subject)) d = .{ .action = .ask, .why = "a name starting with \".\" asks: programs read those as settings", .subject = subject };
         for (g.rules) |r| {
             if (r.action != .deny and std.mem.eql(u8, r.tool, name) and g.matches(arena, tool, r.pattern, subject)) {
                 d = .{ .action = r.action, .why = std.fmt.allocPrint(arena, "rule on line {d}", .{r.line}) catch "rule", .subject = subject };
@@ -222,6 +225,13 @@ pub const Gate = struct {
         return rules.globCase(p, s, fold_paths);
     }
 };
+
+/// Whether a part of `rel` (with `/` between the parts) starts with `.`.
+fn dotPart(rel: []const u8) bool {
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |part| if (part.len > 0 and part[0] == '.') return true;
+    return false;
+}
 
 /// `/` for each separator (on Windows `\\` is one too).
 fn slashes(arena: std.mem.Allocator, p: []const u8) []const u8 {
@@ -453,6 +463,29 @@ test "a_symlink_whose_target_is_missing_is_refused_and_written_files_are_never_l
     try t.expectEqual(.allow, f.act(.read_file, "in-link", .{}));
     try t.expectEqual(.deny, f.act(.write_file, "in-link", .{}));
     try t.expectEqual(.allow, f.act(.write_file, "notes.txt", .{}));
+}
+
+test "writing_a_path_with_a_part_starting_with_a_dot_asks" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    for ([_][]const u8{ ".npmrc", ".git/config", "src/.env", "./a/../.git/hooks/pre-commit", "pkg/.venv/bin/x" }) |p|
+        try t.expectEqual(.ask, f.act(.write_file, p, .{}));
+    try t.expectEqual(.allow, f.act(.write_file, "notes/a.md", .{}));
+    try t.expectEqual(.allow, f.act(.write_file, "./notes/./b.md", .{}));
+    try t.expectEqual(.allow, f.act(.read_file, ".git/config", .{}));
+    try t.expectEqual(.deny, f.act(.write_file, ".npmrc", .{ .scheduled = true }));
+    // a grant covers that path, and an allow rule lifts it
+    try f.grants.add(.write_file, ".npmrc", 5000);
+    try t.expectEqual(.allow, f.act(.write_file, "./.npmrc", .{}));
+    f.gate.rules = try rules.parse(f.arena.allocator(), "allow write_file .github/*\n");
+    try t.expectEqual(.allow, f.act(.write_file, ".github/workflows/ci.yml", .{}));
+    // a symlink to a dot folder is that folder
+    if (builtin.os.tag != .windows) {
+        try f.tmp.dir.createDirPath(t.io, "ws/.git");
+        try f.tmp.dir.symLink(t.io, ".git", "ws/g", .{ .is_directory = true });
+        try t.expectEqual(.ask, f.act(.write_file, "g/config", .{}));
+    }
 }
 
 test "fetch_refuses_non_http_schemes" {
