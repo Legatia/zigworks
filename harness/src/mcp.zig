@@ -170,7 +170,11 @@ pub const Diag = struct {
 };
 
 pub const StartOptions = struct {
-    workspace: []const u8,
+    /// The folder the server runs in: one of its own, never the agent's
+    /// workspace, where a file the agent wrote (an .npmrc, a module named
+    /// like one the server loads, a .git/config) would become its code or
+    /// settings.
+    cwd: []const u8,
     path_var: []const u8,
     home: []const u8,
     /// On Windows, the system's own variables (`util.system_var_names`).
@@ -218,7 +222,7 @@ pub const Server = struct {
     th_out: ?std.Thread = null,
     th_err: ?std.Thread = null,
 
-    /// Starts `cfg.command` in its own process group in the workspace, with
+    /// Starts `cfg.command` in its own process group in `opts.cwd`, with
     /// only PATH, HOME, LANG, TERM and the named secrets in its
     /// environment; then initialize, notifications/initialized and
     /// tools/list.
@@ -238,7 +242,7 @@ pub const Server = struct {
 
         var child = try std.process.spawn(io, .{
             .argv = argv,
-            .cwd = .{ .path = opts.workspace },
+            .cwd = .{ .path = opts.cwd },
             .environ_map = &vars,
             .stdin = .pipe,
             .stdout = .pipe,
@@ -707,7 +711,7 @@ const Fx = struct {
 
     fn startWith(f: *Fx, command: []const u8, secrets: []const EnvSecret, values: []const []const u8) !*Server {
         return Server.start(t.allocator, t.io, .{ .name = "fake", .command = command, .secrets = secrets, .money = &.{} }, .{
-            .workspace = f.ws,
+            .cwd = f.ws,
             .path_var = "/usr/bin:/bin",
             .home = "/home/tester",
             .secret_values = values,
@@ -783,7 +787,7 @@ test "system_vars_reach_the_server" {
     defer f.deinit();
     const cmd = try std.fmt.allocPrint(f.a(), "\"{s}\" --mcp", .{f.fake});
     const s = try Server.start(t.allocator, t.io, .{ .name = "fake", .command = cmd, .secrets = &.{}, .money = &.{} }, .{
-        .workspace = f.ws,
+        .cwd = f.ws,
         .path_var = "/usr/bin:/bin",
         .home = "/home/tester",
         .system_vars = &.{.{ .name = "USER", .value = "from-the-system" }},
@@ -869,7 +873,7 @@ test "a_missing_or_broken_command_fails_to_start_with_its_stderr" {
     var diag: Diag = .{};
     const t0 = nowMs();
     const r = Server.start(t.allocator, t.io, .{ .name = "x", .command = "/bin/sh -c \"echo broken >&2; exit 3\"", .secrets = &.{}, .money = &.{} }, .{
-        .workspace = f.ws,
+        .cwd = f.ws,
         .path_var = "/usr/bin:/bin",
         .home = "",
         .secret_values = &.{},

@@ -1384,7 +1384,7 @@ fn withMcp(f: *Fix, money: bool) !*mcp.Server {
     const a = f.e.arena.allocator();
     const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, mcp_fake_path, a);
     const s = try mcp.Server.start(t.allocator, t.io, .{ .name = "fake", .command = try std.fmt.allocPrint(a, "\"{s}\" --mcp", .{fake}), .secrets = &.{}, .money = &.{} }, .{
-        .workspace = f.run.env.workspace,
+        .cwd = f.run.env.workspace,
         .path_var = "/usr/bin:/bin",
         .home = "/tmp",
         .secret_values = &.{},

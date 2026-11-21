@@ -873,8 +873,12 @@ pub const Core = struct {
                     continue :next;
                 };
             }
+            const dir = c.mcpDir(a, sc.name) catch |e| {
+                note.print(a, "{s}: did not start (its folder: {s})\n", .{ sc.name, @errorName(e) }) catch {};
+                continue;
+            };
             var diag: mcp.Diag = .{};
-            const srv = mcp.Server.start(c.gpa, c.io, sc, .{ .workspace = c.workspace, .path_var = c.path_var, .home = c.home_var, .system_vars = c.system_vars, .secret_values = values, .diag = &diag }) catch |e| {
+            const srv = mcp.Server.start(c.gpa, c.io, sc, .{ .cwd = dir, .path_var = c.path_var, .home = c.home_var, .system_vars = c.system_vars, .secret_values = values, .diag = &diag }) catch |e| {
                 // a server may print its key when it fails: mask before keeping
                 var sc_mask = scrub.Scrubber.init(a, c.secret_list) catch return;
                 const detail = sc_mask.scrubAlloc(a, diag.text()) catch "";
@@ -897,6 +901,22 @@ pub const Core = struct {
         }
         c.mcp_tools = all.items;
         c.mcp_note = note.items;
+    }
+
+    /// A folder of the server's own, state/mcp/NAME (0700): never the
+    /// workspace, where what the agent writes would become the server's
+    /// code or settings.
+    fn mcpDir(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        const base = try std.fs.path.join(a, &.{ c.paths.state, "mcp" });
+        const dir = try std.fs.path.join(a, &.{ base, name });
+        try Io.Dir.cwd().createDirPath(c.io, dir);
+        if (builtin.os.tag != .windows) for ([_][]const u8{ base, dir }) |d| {
+            // iterate: on Linux a plain open is O_PATH, and fchmod on it fails with EBADF
+            var h = try Io.Dir.cwd().openDir(c.io, d, .{ .iterate = true });
+            defer h.close(c.io);
+            try h.setPermissions(c.io, .fromMode(0o700));
+        };
+        return dir;
     }
 
     fn stopMcp(c: *Core) void {
@@ -2395,4 +2415,27 @@ test "a_signal_stops_what_runs_logs_it_and_lets_go_of_the_folder" {
     const sig_at = std.mem.indexOf(u8, lt, "\"event\":\"signal\",\"signal\":\"SIGTERM\"") orelse return error.TestUnexpectedResult;
     try t.expect(std.mem.indexOfPos(u8, lt, sig_at, "\"event\":\"stop\"") != null);
     try t.expect(!lockHeld(t.io, f.core.paths));
+}
+
+test "mcp_servers_run_in_a_folder_of_their_own_not_the_workspace" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // the server says where it runs, then fails (its stderr goes to the log)
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = "[where]\ncommand = /bin/sh -c \"pwd >&2; exit 1\"\n" });
+    _ = try f.core.reload();
+    const lt = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, a, .unlimited);
+    const own = try std.fs.path.join(a, &.{ try Io.Dir.cwd().realPathFileAlloc(t.io, f.core.paths.state, a), "mcp", "where" });
+    if (std.mem.indexOf(u8, lt, own) == null) {
+        std.debug.print("wanted {s} in:\n{s}\n", .{ own, lt });
+        return error.TestUnexpectedResult;
+    }
+    // files the agent writes into the workspace are not the server's
+    try t.expect(std.mem.indexOf(u8, lt, f.core.workspace) == null);
+    for ([_][]const u8{ own, std.fs.path.dirname(own).? }) |d| {
+        const st = try Io.Dir.cwd().statFile(t.io, d, .{});
+        try t.expectEqual(@as(u32, 0o700), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    }
 }
