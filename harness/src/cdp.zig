@@ -12,8 +12,22 @@ const Allocator = std.mem.Allocator;
 
 const is_windows = builtin.os.tag == .windows;
 
-/// A JavaScript dialog the page opened (answered at once).
-pub const Dialog = struct { kind: []u8, message: []u8, session: []u8, answered: bool = false };
+/// A JavaScript dialog the page opened (answered at once); `url`: of the
+/// frame that opened it.
+pub const Dialog = struct {
+    kind: []u8,
+    message: []u8,
+    session: []u8,
+    url: []u8,
+    answered: bool = false,
+
+    pub fn free(d: Dialog, gpa: Allocator) void {
+        gpa.free(d.kind);
+        gpa.free(d.message);
+        gpa.free(d.session);
+        gpa.free(d.url);
+    }
+};
 
 /// Ids at or above this are the reader's own commands (dialog answers);
 /// their replies are dropped. (Chrome takes ids up to 2^31 - 1 only.)
@@ -44,11 +58,7 @@ pub const Inbox = struct {
         while (it.next()) |v| b.gpa.free(v.*);
         b.replies.deinit(b.gpa);
         b.partial.deinit(b.gpa);
-        for (b.dialogs.items) |d| {
-            b.gpa.free(d.kind);
-            b.gpa.free(d.message);
-            b.gpa.free(d.session);
-        }
+        for (b.dialogs.items) |d| d.free(b.gpa);
         b.dialogs.deinit(b.gpa);
         for (b.downloads.items) |u| b.gpa.free(u);
         b.downloads.deinit(b.gpa);
@@ -82,12 +92,19 @@ pub const Inbox = struct {
             return;
         }
         if (m[5] == 'j') {
-            const d: Dialog = .{
-                .kind = b.gpa.dupe(u8, jv.str(jv.get(params, "type")) orelse "dialog") catch return,
-                .message = b.gpa.dupe(u8, util.cut(jv.str(jv.get(params, "message")) orelse "", 2000)) catch return,
-                .session = b.gpa.dupe(u8, jv.str(jv.get(v, "sessionId")) orelse "") catch return,
+            const kind = b.gpa.dupe(u8, jv.str(jv.get(params, "type")) orelse "dialog") catch return;
+            const message = b.gpa.dupe(u8, util.cut(jv.str(jv.get(params, "message")) orelse "", 2000)) catch return b.gpa.free(kind);
+            const session = b.gpa.dupe(u8, jv.str(jv.get(v, "sessionId")) orelse "") catch {
+                b.gpa.free(kind);
+                return b.gpa.free(message);
             };
-            b.dialogs.append(b.gpa, d) catch {};
+            const url = b.gpa.dupe(u8, util.cut(jv.str(jv.get(params, "url")) orelse "", 2000)) catch {
+                b.gpa.free(kind);
+                b.gpa.free(message);
+                return b.gpa.free(session);
+            };
+            const d: Dialog = .{ .kind = kind, .message = message, .session = session, .url = url };
+            b.dialogs.append(b.gpa, d) catch d.free(b.gpa);
             return;
         }
         const frame = jv.str(jv.get(params, "frameId")) orelse return;

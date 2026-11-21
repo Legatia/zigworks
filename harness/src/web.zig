@@ -642,10 +642,15 @@ pub const Web = struct {
         for (downloads) |d| try out.print(a, "A download was refused (downloads are off): {s}\n", .{util.cut(d, 300)});
         const dialogs = try w.s.?.inbox.takeDialogs(w.io, a);
         for (dialogs) |d| {
+            defer d.free(w.gpa);
+            // its text only from the host the gate allowed (not a frame of
+            // another, not a page that was refused)
+            const from = try pageHost(a, d.url) orelse "";
+            if (from.len == 0 or !std.ascii.eqlIgnoreCase(from, w.granted_host)) {
+                try out.print(a, "A dialog ({s}) from another host ({s}) was answered; its text is not shown.\n", .{ d.kind, if (from.len > 0) util.cut(from, 200) else "a page without one" });
+                continue;
+            }
             try out.print(a, "Dialog ({s}): {s}{s}\n", .{ d.kind, d.message, if (std.mem.eql(u8, d.kind, "alert") or std.mem.eql(u8, d.kind, "beforeunload")) "" else " (dismissed)" });
-            w.gpa.free(d.kind);
-            w.gpa.free(d.message);
-            w.gpa.free(d.session);
         }
         try out.print(a, "URL: {s}\nTitle: {s}\n", .{ url, util.cut(jv.str(jv.get(v, "title")) orelse "", 300) });
         const items = jv.arr(jv.get(v, "items")) orelse &.{};
@@ -1435,6 +1440,30 @@ test "web_answers_dialogs_and_shows_them" {
     try expectHas(r2.text, "Dialog (confirm): sure?");
     try expectHas(r2.text, "answer no");
     try t.expect(!has(r2.text, "hello there"));
+}
+
+test "web_shows_no_dialog_text_from_a_host_not_allowed" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // a frame from another host (127.0.0.1) on an allowed page (localhost)
+    try f.page("framed.html", try std.fmt.allocPrint(a, "<html><body><p>outer page</p><iframe src=\"http://127.0.0.1:{d}/page/inner.html\"></iframe></body></html>", .{f.e.server.port}));
+    try f.page("inner.html", "<html><body><script>alert('iframe secret text')</script></body></html>");
+    const r = try f.act(try f.openJson("framed.html", null));
+    try expectHas(r.text, "outer page");
+    try t.expect(!has(r.text, "iframe secret text"));
+    try expectHas(r.text, "from another host (127.0.0.1:");
+    // a refused page's dialog doesn't come out later either
+    try f.page("loud.html", "<html><body><script>alert('refused page text')</script></body></html>");
+    try f.page("to.html", try std.fmt.allocPrint(a, "<html><body><a href=\"http://127.0.0.1:{d}/page/loud.html\">away</a></body></html>", .{f.e.server.port}));
+    _ = try f.act(try f.openJson("to.html", null));
+    f.refuse = "web";
+    const r2 = try f.act("{\"action\":\"click\",\"ref\":1}");
+    try t.expect(r2.is_error);
+    f.refuse = "";
+    const r3 = try f.act(try f.openJson("to.html", null));
+    for ([_][]const u8{ r2.text, r3.text }) |x| try t.expect(!has(x, "refused page text"));
 }
 
 test "web_waits_for_a_slow_navigation_after_a_click" {
