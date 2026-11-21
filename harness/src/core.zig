@@ -382,6 +382,7 @@ pub const Core = struct {
         c.seen = .init(gpa);
         c.seen.load(io, c.paths.seen) catch {};
         c.written = .init(gpa, io, c.paths.written);
+        errdefer c.written.deinit();
         c.lock = .init;
         c.helper_pool = .{};
         c.ask_lock = .init;
