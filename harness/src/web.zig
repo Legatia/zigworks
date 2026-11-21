@@ -276,7 +276,9 @@ pub const Web = struct {
     }
 
     fn open(w: *Web, a: Allocator, url: []const u8, login_name: ?[]const u8) !Output {
-        const host = gate.urlHost(url) orelse return fail(a, "only http and https addresses can be opened", .{});
+        // as the page's location.host will have it, so that the grants,
+        // the login's key and the later checks all name the same host
+        const host = try pageHost(a, url) orelse return fail(a, "only http and https addresses can be opened", .{});
         const want: ?logins.Login = if (login_name) |n| (logins.find(w.env.logins, n) orelse return fail(a, "no login called {s}", .{util.cut(n, 60)})) else null;
         if (w.hooks.allow(w.hooks.ctx, a, .web, host)) |why| return fail(a, "refused by the gate: {s}", .{why});
         // the same session goes on if it has the same login
@@ -653,6 +655,21 @@ pub const Web = struct {
         return out.items;
     }
 };
+
+/// The host of an http or https `url` as the page's `location.host` gives
+/// it: lowercase, without user info or the scheme's default port. Null for
+/// any other address.
+pub fn pageHost(a: Allocator, url: []const u8) !?[]const u8 {
+    const https = std.ascii.startsWithIgnoreCase(url, "https://");
+    const rest = if (https) url[8..] else if (std.ascii.startsWithIgnoreCase(url, "http://")) url[7..] else return null;
+    // a backslash ends the host as a slash does (the browser reads it so)
+    const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#\\") orelse rest.len];
+    var host = authority[if (std.mem.lastIndexOfScalar(u8, authority, '@')) |i| i + 1 else 0..];
+    const default_port = if (https) ":443" else ":80";
+    if (std.mem.endsWith(u8, host, default_port)) host = host[0 .. host.len - default_port.len];
+    if (host.len == 0) return null;
+    return try std.ascii.allocLowerString(a, host);
+}
 
 /// Marks the top document's interactive elements with data-hx-ref and
 /// lists them; the page's HTML for its text. Never reads a field's value.
@@ -1205,6 +1222,38 @@ test "web_passkey_for_another_site_is_removed" {
     const lc = jv.arr(jv.get(left, "credentials")).?;
     try t.expectEqual(1, lc.len);
     try t.expectEqualStrings("localhost", jv.str(jv.get(lc[0], "rpId")).?);
+}
+
+test "web_asks_once_for_a_host_written_in_capitals" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\nusername = agent-bot\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.page("login.html", login_page);
+    const r0 = try f.act(try std.fmt.allocPrint(a, "{{\"action\":\"open\",\"url\":\"http://LocalHost:{d}/page/login.html\",\"login\":\"agent\"}}", .{f.e.server.port}));
+    try t.expect(!r0.is_error);
+    const r1 = try f.act("{\"action\":\"type\",\"ref\":1,\"text\":\"{login:agent.username}\"}");
+    try expectHas(r1.text, "Typed into [1].");
+    // the host as the page has it: asked once for the page, once for the login
+    try t.expectEqualStrings(try std.fmt.allocPrint(a, "web localhost:{d}\nlogin agent localhost:{d}\n", .{ f.e.server.port, f.e.server.port }), f.asked.items);
+}
+
+test "web_page_hosts_are_lowercase_without_user_or_default_port" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][2][]const u8{
+        .{ "https://GitHub.com/login", "github.com" },
+        .{ "https://github.com:443/x", "github.com" },
+        .{ "http://Example.org:80", "example.org" },
+        .{ "https://example.org:80/", "example.org:80" },
+        .{ "http://example.org:443/", "example.org:443" },
+        .{ "http://localhost:8080/a?b#c", "localhost:8080" },
+        .{ "https://user:pw@Evil.example:443/", "evil.example" },
+        .{ "https://github.com\\@evil.example/", "github.com" },
+        .{ "HTTPS://[::1]:443/", "[::1]" },
+    }) |c| try t.expectEqualStrings(c[1], (try pageHost(a, c[0])).?);
+    for ([_][]const u8{ "ftp://x.org/", "https://", "https:///x", "javascript:alert(1)", "https://user@/" }) |u| try t.expectEqual(null, try pageHost(a, u));
 }
 
 test "web_asks_the_gate_when_a_click_lands_on_another_host" {
