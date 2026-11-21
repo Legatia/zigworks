@@ -453,7 +453,7 @@ pub const Web = struct {
 
     fn typeInto(w: *Web, a: Allocator, ref: i64, text: []const u8) !Output {
         const spans = logins.placeholders(a, text) catch return fail(a, "a placeholder is not valid; use {{login:NAME.username}}, {{login:NAME.password}} or {{login:NAME.code}}", .{});
-        if (spans.len == 0) return w.fill(a, ref, text, &.{}, &.{}, null);
+        if (spans.len == 0) return w.fill(a, ref, text, &.{}, &.{}, null, "");
         // a value goes in alone: no text around it, one per field, so it
         // can't be made part of a message or a comment
         if (spans.len > 1 or spans[0].start != 0 or spans[0].end != text.len)
@@ -500,7 +500,8 @@ pub const Web = struct {
         try out.appendSlice(a, text[last..]);
         var sites: std.ArrayList([]const u8) = .empty;
         for (used.items) |l| try sites.append(a, l.site);
-        const r = try w.fill(a, ref, out.items, sites.items, used.items, spans[0].field);
+        // the host the gate allowed the login on, not just any on its site
+        const r = try w.fill(a, ref, out.items, sites.items, used.items, spans[0].field, loc.host);
         if (made and !r.is_error) try w.notes.appendSlice(w.arena.allocator(), "A new password was made and stored for this login.\n");
         return r;
     }
@@ -558,10 +559,10 @@ pub const Web = struct {
 
     /// One script in the page checks where it is and types (see
     /// fillScript); `sites` empty: no check (no login value in the text).
-    fn fill(w: *Web, a: Allocator, ref: i64, text: []const u8, sites: []const []const u8, used: []const logins.Login, field: ?logins.Field) !Output {
-        const script = try fillScript(a, ref, text, sites, field);
+    /// `host`: the one the gate allowed the login on.
+    fn fill(w: *Web, a: Allocator, ref: i64, text: []const u8, sites: []const []const u8, used: []const logins.Login, field: ?logins.Field, host: []const u8) !Output {
+        const script = try fillScript(a, ref, text, sites, field, host);
         defer std.crypto.secureZero(u8, @constCast(script));
-        const host = if (used.len > 0) (try w.location(a)).host else "";
         const r = try w.s.?.evaluateIsolated(a, script);
         const res = jv.str(jv.parse(a, r)) orelse "";
         if (std.mem.eql(u8, res, "ok")) {
@@ -704,14 +705,17 @@ fn refScript(a: Allocator, ref: i64, body: []const u8) ![]const u8 {
 }
 
 /// Checks that the page is on every one of `sites` (the rules of
-/// logins.hostAllowed, with string indexing and comparisons only), then
-/// sets the field's value with its prototype's own setter and sends input
-/// and change. Check and fill are one script: no navigation can come
+/// logins.hostAllowed, with string indexing and comparisons only) and on
+/// `host`, the very host the gate allowed (unless empty: no login value),
+/// then sets the field's value with its prototype's own setter and sends
+/// input and change. Check and fill are one script: no navigation can come
 /// between them. It runs in an isolated world, where the page can't have
 /// changed `location` or the prototypes it uses.
-fn fillScript(a: Allocator, ref: i64, value: []const u8, sites: []const []const u8, field: ?logins.Field) ![]const u8 {
+fn fillScript(a: Allocator, ref: i64, value: []const u8, sites: []const []const u8, field: ?logins.Field, host: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(a, "(() => {\nconst sites = [");
+    try out.appendSlice(a, "(() => {\nconst approved = ");
+    try util.jsonString(&out, a, host);
+    try out.appendSlice(a, ";\nif (approved !== '' && location.host !== approved) return 'wrong-site ' + location.protocol + '//' + location.host;\nconst sites = [");
     for (sites, 0..) |s, i| {
         if (i > 0) try out.append(a, ',');
         try util.jsonString(&out, a, s);
@@ -858,6 +862,9 @@ const Fix = struct {
     asked: std.ArrayList(u8) = .empty,
     /// What the gate refuses: a tool's name, or "" for nothing.
     refuse: []const u8 = "",
+    /// Where the page goes while the gate is asked about a login (a
+    /// navigation between the check and the fill).
+    move_to: []const u8 = "",
     web: Web,
     browser: []const u8,
 
@@ -870,6 +877,7 @@ const Fix = struct {
         f.notes = .empty;
         f.asked = .empty;
         f.refuse = "";
+        f.move_to = "";
         f.store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
         try f.e.tmp.dir.createDirPath(t.io, "profiles");
         try f.e.tmp.dir.createDirPath(t.io, "tmp");
@@ -892,9 +900,12 @@ const Fix = struct {
     }
 
     fn allowFn(ctx: *anyopaque, arena: Allocator, tool: gate.Tool, arg: []const u8) ?[]const u8 {
-        _ = arena;
         const f: *Fix = @ptrCast(@alignCast(ctx));
         f.asked.print(t.allocator, "{s} {s}\n", .{ @tagName(tool), arg }) catch {};
+        if (tool == .login and f.move_to.len > 0) {
+            f.web.s.?.navigate(arena, f.move_to) catch {};
+            f.move_to = "";
+        }
         if (std.mem.eql(u8, f.refuse, @tagName(tool))) return "denied by the owner";
         return null;
     }
@@ -1039,6 +1050,26 @@ test "web_refuses_a_login_on_another_site" {
     try t.expect(!has(f.asked.items, "login other"));
 }
 
+test "web_types_a_login_value_only_on_the_host_the_gate_allowed" {
+    var f: Fix = undefined;
+    try f.init("[agent]\nsite = localhost\n");
+    defer f.deinit();
+    try f.store.put(t.io, "login-agent-password", "fake-Pass-7351!");
+    try f.page("login.html", login_page);
+    // a page that marks its own field the way the snapshot would have
+    try f.page("trap.html", "<html><body><input id=\"pw\" type=\"password\" data-hx-ref=\"2\"></body></html>");
+    _ = try f.act(try f.openJson("login.html", null));
+    // the owner allows the login on localhost; meanwhile the page went to
+    // another host under the same site
+    f.move_to = try std.fmt.allocPrint(f.e.arena.allocator(), "http://a.localhost:{d}/page/trap.html", .{f.e.server.port});
+    const r = try f.act("{\"action\":\"type\",\"ref\":2,\"text\":\"{login:agent.password}\"}");
+    try expectHas(f.asked.items, "login agent localhost:");
+    try expectHas(try f.eval("location.host"), "a.localhost:");
+    try t.expect(r.is_error);
+    try expectHas(r.text, "Not typed");
+    try t.expectEqualStrings("\"\"", try f.eval("document.getElementById('pw').value"));
+}
+
 test "web_fill_script_refuses_a_page_that_lies_about_its_host" {
     // the page's own globals can't fool the check: it runs in an isolated world
     var f: Fix = undefined;
@@ -1051,12 +1082,13 @@ test "web_fill_script_refuses_a_page_that_lies_about_its_host" {
     );
     _ = try f.act(try f.openJson("liar.html", null));
     const a = f.e.arena.allocator();
-    for ([_][]const u8{ "example.com", "calhost" }) |site| {
-        const r = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "must-not-arrive", &.{site}, null));
+    const here = try std.fmt.allocPrint(a, "localhost:{d}", .{f.e.server.port});
+    for ([_][2][]const u8{ .{ "example.com", here }, .{ "calhost", here }, .{ "localhost", "localhost:1" } }) |c| {
+        const r = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "must-not-arrive", &.{c[0]}, null, c[1]));
         try t.expect(std.mem.startsWith(u8, r, "\"wrong-site http://localhost:"));
     }
     try t.expectEqualStrings("\"\"", try f.eval("document.getElementById('pw').value"));
-    const ok = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "fine", &.{"localhost"}, null));
+    const ok = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "fine", &.{"localhost"}, null, here));
     try t.expectEqualStrings("\"ok\"", ok);
     try t.expectEqualStrings("\"fine\"", try f.eval("document.getElementById('pw').value"));
 }
