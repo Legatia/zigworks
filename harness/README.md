@@ -90,7 +90,8 @@ files apply after `/reload`; harness tells you when it notices one.
 Every tool call is decided in one place, in this order:
 
 1. Hard limits no rule lifts: files only inside `workspace/` and no write
-   to a symlink, fetch only http and https.
+   to a symlink; fetch, browse and web only http and https, and no
+   address with a name before `@`.
 2. A matching `deny` line in `rules`.
 3. A grant you gave with "Allow 24 h".
 4. The first matching `allow` or `ask` line.
@@ -111,6 +112,24 @@ File rules and grants see the path inside the workspace: `./notes/a`,
 and on macOS and Windows so does `Notes/A`. A grant covers the exact
 command, path or MCP tool, or a host in any letter case. A `deny` rule
 applies to briefs.ini sources too.
+
+Rules for `fetch` and `browse` match an address by its parts: the scheme,
+the host (`*.example.com` is every name below example.com, `*` any host),
+the port (none: the scheme's own; `:*` any) and the path with its query
+(none: any). `allow fetch https://*.example.com/*` covers
+`https://docs.example.com/a`, never `https://evil.com/.example.com/`.
+`web` rules name a host the same way (`*.example.com`, `localhost:8080`).
+An `allow` rule for these must be written so, and harness names the line
+that is not; a `deny` or `ask` rule may be any pattern, matched against
+the whole address.
+
+The gate, fetch, browse and web read an address the same way. One with a
+name before `@` (`good.com@evil.com`), a backslash or a space, or a host
+with `%` or letters outside ASCII, is refused (an international name is
+written in its `xn--` form). Otherwise every spelling of a host is the
+same host: any letter case, a trailing dot, the scheme's own port, an IPv4
+address written as `0x7f.1` or `2130706433`. `.` and `..` in a path are
+resolved before the rules see it.
 
 `ask` sends you the whole call (a file's content too) with three buttons:
 Allow once, Allow 24 h, Deny. A long one comes in several messages with
@@ -168,9 +187,10 @@ nothing from any host but the page's own and saving no downloads. It is
 offered only when a browser is found (`[browser] path`, or the usual
 install places).
 
-`fetch` follows up to 5 redirects, never from https to http; each passes
-the gate as a fetch of its own (on a host the call already reached only a
-`deny` rule stops it), and the answer says where it ended.
+`fetch` follows up to 5 redirects, never from https to http or to an
+address with a name before `@`; each passes the gate as a fetch of its own
+(on a host the call already reached only a `deny` rule stops it), and the
+answer says where it ended.
 
 ## Logins
 

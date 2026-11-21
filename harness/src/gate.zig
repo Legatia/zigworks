@@ -230,9 +230,12 @@ pub const Gate = struct {
     /// Whether a rule's pattern matches; file patterns are read like file
     /// arguments: a leading `./` or the workspace's own path is dropped,
     /// `\` is a separator on Windows, case is ignored where volumes ignore it.
+    /// Address patterns match by parts (rules.zig).
     fn matches(g: *const Gate, arena: std.mem.Allocator, tool: Tool, pattern: []const u8, s: []const u8) bool {
         switch (tool) {
             .read_file, .write_file => {},
+            .fetch, .browse => return rules.matchUrl(arena, pattern, s),
+            .web => return rules.matchHost(arena, pattern, s),
             else => return rules.glob(pattern, s),
         }
         var p = slashes(arena, pattern);
@@ -582,6 +585,41 @@ test "every_spelling_of_a_host_is_the_same_host" {
     // the decision says the address as it is used
     try t.expectEqualStrings("https://good.com/b", f.gate.decide(a, .fetch, "HTTPS://Good.COM./a/../b", 1000, .{}).subject);
     try t.expectEqualStrings("good.com", f.gate.decide(a, .web, "Good.COM.", 1000, .{}).subject);
+}
+
+test "address_rules_match_by_parts_not_as_one_glob" {
+    var f: Fixture = undefined;
+    try f.init("allow fetch https://*.good.com/*\nallow browse https://docs.example.com/guide/*\nallow fetch http://127.0.0.1:*\nallow web *.good.com\n");
+    defer f.deinit();
+    // the host is the host, wherever else the name appears
+    for ([_][]const u8{ "https://evil.com/.good.com/", "https://good.com.evil.com/", "https://evil.com/?x=.good.com", "https://evil.com/#.good.com/", "https://good.com/", "http://a.good.com/x", "https://a.good.com:8443/x" }) |u|
+        try t.expectEqual(.ask, f.act(.fetch, u, .{}));
+    for ([_][]const u8{ "https://a.good.com/x", "https://A.B.Good.COM./x?y=1", "https://a.good.com:443/" }) |u|
+        try t.expectEqual(.allow, f.act(.fetch, u, .{}));
+    // the path as the server gets it
+    try t.expectEqual(.allow, f.act(.browse, "https://docs.example.com/guide/intro", .{}));
+    for ([_][]const u8{ "https://docs.example.com/guide/../admin", "https://docs.example.com/guide/%2e%2e/admin", "https://docs.example.com/admin?/guide/" }) |u|
+        try t.expectEqual(.ask, f.act(.browse, u, .{}));
+    // a port of * is any port; no path is any path
+    try t.expectEqual(.allow, f.act(.fetch, "http://127.0.0.1:8080/page/a", .{}));
+    try t.expectEqual(.ask, f.act(.fetch, "http://127.0.0.1.evil.com:8080/", .{}));
+    // web: the host, and its port
+    try t.expectEqual(.allow, f.act(.web, "a.good.com", .{}));
+    try t.expectEqual(.ask, f.act(.web, "good.com.evil.com", .{}));
+    try t.expectEqual(.ask, f.act(.web, "a.good.com:8443", .{}));
+}
+
+test "deny_and_ask_rules_that_are_not_addresses_match_the_whole_address" {
+    var f: Fixture = undefined;
+    try f.init("deny fetch *evil*\nask fetch *tracker*\ndeny web *bad*\nallow fetch https://*.good.com/*\nallow web *\n");
+    defer f.deinit();
+    // matched against the address as it is used, and as it was given
+    try t.expectEqual(.deny, f.act(.fetch, "https://EVIL.com/", .{}));
+    try t.expectEqual(.deny, f.act(.fetch, "https://a.good.com/?q=evil", .{}));
+    try t.expectEqual(.ask, f.act(.fetch, "https://a.good.com/tracker.js", .{}));
+    try t.expectEqual(.allow, f.act(.fetch, "https://a.good.com/x", .{}));
+    try t.expectEqual(.deny, f.act(.web, "very.BAD.example", .{}));
+    try t.expectEqual(.allow, f.act(.web, "localhost:8080", .{}));
 }
 
 test "new_tool_kinds_have_their_defaults" {

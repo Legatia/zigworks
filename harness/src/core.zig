@@ -2050,7 +2050,10 @@ pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, co
     var it = std.mem.splitScalar(u8, text, '\n');
     var line: []const u8 = "";
     for (0..n) |_| line = it.next() orelse "";
-    return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80) });
+    // what the parser says of that line (the lines up to it are fine)
+    _ = scratch.reset(.retain_capacity);
+    const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e);
+    return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
 }
 
 /// The first line of `text` that does not read: the one after the longest
@@ -3484,6 +3487,15 @@ test "settings_errors_name_the_file_and_line" {
     try t.expect(std.mem.indexOf(u8, perm, f.core.paths.config) != null);
     try t.expect(std.mem.indexOf(u8, perm, "chmod 600") != null);
     try t.expect(std.mem.indexOf(u8, perm, "config.ini, rules, logins.ini and mcp.ini") != null);
+}
+
+test "a_rule_refused_at_load_says_why_and_where" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell ls\nallow fetch *.good.com/*\n" });
+    const r = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, r, "nothing changed: rules line 2 has an error: allow fetch *.good.com/* (an allow rule for fetch or browse takes an address") != null);
 }
 
 test "health_counts_only_harness_run_while_it_holds_the_folder" {
