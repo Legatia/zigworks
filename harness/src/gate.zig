@@ -197,7 +197,6 @@ pub const Gate = struct {
             .web => if (arg.len == 0 or std.mem.indexOfAny(u8, arg, " /\\?#@") != null) return .{ .action = .deny, .why = "not a host name" },
             else => {},
         }
-        if (ctx.brief_source) return .{ .action = .allow, .why = "listed in briefs.ini", .subject = subject };
         const name = @tagName(tool);
         for (g.rules) |r| {
             // a deny on a server's MCP tools covers its money tools too
@@ -205,6 +204,8 @@ pub const Gate = struct {
             if (r.action == .deny and same and (g.matches(arena, tool, r.pattern, subject) or (given.len > 0 and g.matches(arena, tool, r.pattern, given))))
                 return .{ .action = .deny, .why = std.fmt.allocPrint(arena, "rule on line {d}", .{r.line}) catch "rule", .subject = subject };
         }
+        // listing a source in briefs.ini allows it, as an allow rule would
+        if (ctx.brief_source) return .{ .action = .allow, .why = "listed in briefs.ini", .subject = subject };
         if (tool == .money) {
             // no grant or allow rule lifts this: the owner is asked every time
             if (!ctx.scheduled) return .{ .action = .ask, .why = "money is asked every time", .subject = subject };
@@ -434,6 +435,15 @@ test "listed_brief_source_is_allowed" {
     try t.expectEqual(.allow, f.act(.fetch, "https://feeds.example.com/rss", .{ .scheduled = true, .brief_source = true }));
     // but not past the hard limits
     try t.expectEqual(.deny, f.act(.fetch, "file:///etc/passwd", .{ .brief_source = true }));
+}
+
+test "a_deny_rule_applies_to_brief_sources_too" {
+    var f: Fixture = undefined;
+    try f.init("deny fetch https://feeds.example.com/*\ndeny search *passwords*\n");
+    defer f.deinit();
+    try t.expectEqual(.deny, f.act(.fetch, "https://feeds.example.com/rss", .{ .scheduled = true, .brief_source = true }));
+    try t.expectEqual(.deny, f.act(.search, "leaked passwords list", .{ .scheduled = true, .brief_source = true }));
+    try t.expectEqual(.allow, f.act(.fetch, "https://other.example.com/rss", .{ .scheduled = true, .brief_source = true }));
 }
 
 test "paths_outside_workspace_are_refused" {
