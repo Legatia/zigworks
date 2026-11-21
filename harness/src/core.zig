@@ -287,6 +287,8 @@ pub const Core = struct {
         c.log = try log_mod.Log.open(gpa, io, c.paths.log);
         errdefer c.log.close();
         try c.log.setSecrets(c.secret_list);
+        // without it private lines keep only sizes
+        c.log.useKey(io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "log-key" })) catch {};
         c.mem = try memory.Store.load(gpa, io, c.paths.memory);
         errdefer c.mem.deinit();
         c.mem.secrets = c.secret_list;
@@ -2270,6 +2272,23 @@ test "the_owner_hears_of_every_memory_the_agent_or_the_writer_saves" {
     try f.rec.waitFor("Saved to memory: The owner plays chess on Sundays (/forget ");
     // what was known already is not said again
     try t.expectEqual(1, f.rec.count("sister is called Ada (/forget"));
+}
+
+test "private_lines_are_hashed_with_the_instance_key" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.core.handleText("/private on");
+    try f.e.script(1, model.textReply("ok"));
+    f.core.chatTurn("my private diagnosis xyzzy");
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "xyzzy") == null);
+    try t.expect(std.mem.indexOf(u8, lt, "\"text\":{\"bytes\":26,\"hmac\":\"") != null);
+    if (builtin.os.tag != .windows) {
+        const key_path = try std.fs.path.join(f.e.arena.allocator(), &.{ f.core.paths.state, "log-key" });
+        const st = try Io.Dir.cwd().statFile(t.io, key_path, .{});
+        try t.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    }
 }
 
 test "secrets_the_owner_types_are_masked_in_the_log_and_memory" {

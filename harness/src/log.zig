@@ -25,6 +25,9 @@ pub const Log = struct {
     mutex: Io.Mutex = .init,
     /// Masks the stored secrets in every string written (`setSecrets`).
     scrubber: ?scrub.Scrubber = null,
+    /// The instance's key for the hashes of private lines (`useKey`), so
+    /// a guessable text cannot be confirmed from the log alone.
+    key: ?[32]u8 = null,
 
     /// Opens (or creates) the log, drops a last line cut off by a crash and
     /// notes that it did.
@@ -62,6 +65,36 @@ pub const Log = struct {
     pub fn close(l: *Log) void {
         if (l.scrubber) |*sc| sc.deinit();
         l.file.close(l.io);
+    }
+
+    /// Takes the key for private lines' hashes from `path` (hex), making
+    /// one there (readable only by the owner) if there is none. Without a
+    /// key, private lines keep only sizes.
+    pub fn useKey(l: *Log, io: Io, path: []const u8) !void {
+        for (0..2) |_| {
+            var buf: [80]u8 = undefined;
+            if (Io.Dir.cwd().readFile(io, path, &buf)) |got| {
+                var k: [32]u8 = undefined;
+                const hex = std.mem.trim(u8, got, " \r\n");
+                if (hex.len != 64) return error.BadLogKey;
+                _ = std.fmt.hexToBytes(&k, hex) catch return error.BadLogKey;
+                l.key = k;
+                return;
+            } else |e| if (e != error.FileNotFound) return e;
+            var k: [32]u8 = undefined;
+            try io.randomSecure(&k);
+            var f = Io.Dir.cwd().createFile(io, path, .{ .exclusive = true, .permissions = util.private_file }) catch |e| switch (e) {
+                // made by another process meanwhile: read that one
+                error.PathAlreadyExists => continue,
+                else => return e,
+            };
+            defer f.close(io);
+            const hex = std.fmt.bytesToHex(k, .lower);
+            try f.writeStreamingAll(io, &hex ++ "\n");
+            l.key = k;
+            return;
+        }
+        return error.BadLogKey;
     }
 
     /// From now on every string field written has these values masked as
@@ -114,10 +147,10 @@ pub const Log = struct {
         try line.print(gpa, "{{\"seq\":{d},\"time\":\"{s}\",\"kind\":\"{s}\"", .{ l.seq + 1, util.isoTime(&tbuf, util.nowSeconds(l.io)), @tagName(kind) });
         const T = @TypeOf(fields);
         const info = @typeInfo(T).@"struct";
-        const sc: ?*scrub.Scrubber = if (l.scrubber) |*x| x else null;
+        const ctx: Ctx = .{ .private = private, .scrubber = if (l.scrubber) |*x| x else null, .key = if (l.key) |*k| k else null };
         inline for (info.field_names) |name| {
             try line.print(gpa, ",\"{s}\":", .{name});
-            try value(&line, gpa, name, @field(fields, name), private, sc);
+            try value(&line, gpa, name, @field(fields, name), ctx);
         }
         try line.print(gpa, ",\"prev\":\"{s}\"}}", .{l.last});
         const h = hashLine(line.items);
@@ -129,10 +162,13 @@ pub const Log = struct {
     }
 };
 
-fn value(line: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime name: []const u8, v: anytype, private: bool, sc: ?*scrub.Scrubber) !void {
+/// How a line's fields are written.
+const Ctx = struct { private: bool, scrubber: ?*scrub.Scrubber, key: ?*const [32]u8 };
+
+fn value(line: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime name: []const u8, v: anytype, ctx: Ctx) !void {
     const V = @TypeOf(v);
     switch (@typeInfo(V)) {
-        .optional => if (v) |inner| return value(line, gpa, name, inner, private, sc) else return line.appendSlice(gpa, "null"),
+        .optional => if (v) |inner| return value(line, gpa, name, inner, ctx) else return line.appendSlice(gpa, "null"),
         .bool => return line.appendSlice(gpa, if (v) "true" else "false"),
         .int, .comptime_int => return line.print(gpa, "{d}", .{v}),
         .float, .comptime_float => return line.print(gpa, "{d}", .{v}),
@@ -141,14 +177,15 @@ fn value(line: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime name: []cons
     }
     const raw: []const u8 = v;
     // a value the owner typed or a tool read never reaches the file
-    const masked: ?[]u8 = if (sc) |x| try x.scrubAlloc(gpa, raw) else null;
+    const masked: ?[]u8 = if (ctx.scrubber) |x| try x.scrubAlloc(gpa, raw) else null;
     defer if (masked) |m| gpa.free(m);
     const s: []const u8 = masked orelse raw;
     const kept = comptime (std.mem.eql(u8, name, "tool") or std.mem.eql(u8, name, "decision") or std.mem.eql(u8, name, "why"));
-    if (private and !kept) {
+    if (ctx.private and !kept) {
+        const key = ctx.key orelse return line.print(gpa, "{{\"bytes\":{d}}}", .{s.len});
         var d: [32]u8 = undefined;
-        Sha256.hash(s, &d, .{});
-        return line.print(gpa, "{{\"bytes\":{d},\"sha256\":\"{x}\"}}", .{ s.len, &d });
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&d, s, key);
+        return line.print(gpa, "{{\"bytes\":{d},\"hmac\":\"{x}\"}}", .{ s.len, &d });
     }
     if (s.len > max_field) {
         try util.jsonString(line, gpa, util.cut(s, max_field));
@@ -295,7 +332,42 @@ test "private_lines_keep_only_metadata" {
     const text = try Io.Dir.cwd().readFileAlloc(t.io, path, arena.allocator(), .unlimited);
     try t.expect(std.mem.indexOf(u8, text, "diary") == null);
     try t.expect(std.mem.indexOf(u8, text, "\"tool\":\"shell\"") != null);
-    try t.expect(std.mem.indexOf(u8, text, "\"arg\":{\"bytes\":13,\"sha256\":\"") != null);
+    // without the instance key, only the size
+    try t.expect(std.mem.indexOf(u8, text, "\"arg\":{\"bytes\":13}") != null);
+}
+
+test "private_hashes_are_keyed_with_the_instance_key" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try tmpPath(&tmp, a);
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const key_path = try std.fs.path.join(a, &.{ dir, "log-key" });
+    var hashes: [3][]const u8 = undefined;
+    for (0..3) |i| {
+        // the third time with another instance's key
+        const kp = if (i == 2) try std.fs.path.join(a, &.{ dir, "other-key" }) else key_path;
+        var l = try Log.open(t.allocator, t.io, path);
+        try l.useKey(t.io, kp);
+        try l.write(.tool, true, .{ .arg = "cat diary.txt" });
+        l.close();
+        const text = try Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
+        const at = std.mem.lastIndexOf(u8, text, "\"arg\":{\"bytes\":13,\"hmac\":\"").? + 29;
+        hashes[i] = text[at .. at + 64];
+    }
+    // keyed: not the plain SHA-256 of the text, the same with the same key
+    var d: [32]u8 = undefined;
+    Sha256.hash("cat diary.txt", &d, .{});
+    try t.expect(!std.mem.eql(u8, hashes[0], &std.fmt.bytesToHex(d, .lower)));
+    try t.expectEqualStrings(hashes[0], hashes[1]);
+    try t.expect(!std.mem.eql(u8, hashes[0], hashes[2]));
+    if (@import("builtin").os.tag != .windows) {
+        const st = try Io.Dir.cwd().statFile(t.io, key_path, .{});
+        try t.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    }
+    try t.expectEqual(null, (try verify(t.io, path)).broken_at);
 }
 
 test "secrets_are_masked_in_every_field" {
