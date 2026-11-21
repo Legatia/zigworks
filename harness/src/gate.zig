@@ -1,6 +1,7 @@
 //! The one place every tool call is decided: hard limits no rule can lift,
 //! then the owner's rules, grants with an expiry, and each tool's default.
 const std = @import("std");
+const builtin = @import("builtin");
 const rules = @import("rules.zig");
 const util = @import("util.zig");
 const Io = std.Io;
@@ -43,7 +44,14 @@ pub const Tool = enum {
 pub const Decision = struct {
     action: rules.Action,
     why: []const u8,
+    /// What the rules and grants were matched against: the argument, or
+    /// for files the path inside the workspace (see `Confined.rel`).
+    subject: []const u8 = "",
 };
+
+/// Volumes on macOS and Windows ignore case by default, so file rules and
+/// grants do too there: `Private/k` is the file `private/k`.
+pub const fold_paths = builtin.os.tag == .macos or builtin.os.tag == .windows;
 
 pub const Ctx = struct {
     /// No one is there to answer: `ask` becomes `deny`.
@@ -78,6 +86,22 @@ pub fn urlHost(url: []const u8) ?[]const u8 {
     return rest[0..end];
 }
 
+/// Whether two grant keys are the same: exactly, except that a host is
+/// the same in any case, and so is a file's path where volumes ignore case.
+fn sameKey(tool: Tool, a: []const u8, b: []const u8) bool {
+    return switch (tool) {
+        .fetch, .browse, .web => std.ascii.eqlIgnoreCase(a, b),
+        // "NAME HOST"
+        .login => {
+            const sa = std.mem.indexOfScalar(u8, a, ' ') orelse return std.mem.eql(u8, a, b);
+            const sb = std.mem.indexOfScalar(u8, b, ' ') orelse return false;
+            return std.mem.eql(u8, a[0..sa], b[0..sb]) and std.ascii.eqlIgnoreCase(a[sa + 1 ..], b[sb + 1 ..]);
+        },
+        .read_file, .write_file => if (fold_paths) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b),
+        else => std.mem.eql(u8, a, b),
+    };
+}
+
 pub const Grants = struct {
     gpa: std.mem.Allocator,
     items: std.ArrayList(Grant) = .empty,
@@ -95,7 +119,7 @@ pub const Grants = struct {
 
     pub fn add(g: *Grants, tool: Tool, key: []const u8, expires_s: i64) !void {
         for (g.items.items) |*it| {
-            if (it.tool == tool and std.ascii.eqlIgnoreCase(it.key, key)) {
+            if (it.tool == tool and sameKey(tool, it.key, key)) {
                 it.expires_s = expires_s;
                 return;
             }
@@ -107,7 +131,7 @@ pub const Grants = struct {
 
     pub fn has(g: *const Grants, tool: Tool, key: []const u8, now_s: i64) bool {
         for (g.items.items) |it| {
-            if (it.tool == tool and it.expires_s > now_s and std.ascii.eqlIgnoreCase(it.key, key)) return true;
+            if (it.tool == tool and it.expires_s > now_s and sameKey(tool, it.key, key)) return true;
         }
         return false;
     }
@@ -151,62 +175,143 @@ pub const Gate = struct {
     workspace: []const u8,
 
     pub fn decide(g: *const Gate, arena: std.mem.Allocator, tool: Tool, arg: []const u8, now_s: i64, ctx: Ctx) Decision {
+        var d = g.decideRaw(arena, tool, arg, now_s, ctx);
+        if (d.subject.len == 0) d.subject = arg;
+        return d;
+    }
+
+    fn decideRaw(g: *const Gate, arena: std.mem.Allocator, tool: Tool, arg: []const u8, now_s: i64, ctx: Ctx) Decision {
+        // what rules and grants see; for files, `given` is the path before
+        // symlinks are followed, which deny rules see too
+        var subject = arg;
+        var given: []const u8 = "";
         // hard limits first: no rule, grant or listing lifts these
         switch (tool) {
             .fetch, .browse => if (urlHost(arg) == null) return .{ .action = .deny, .why = "only http and https addresses can be fetched" },
             .read_file, .write_file => {
-                _ = confine(arena, g.io, g.workspace, arg) catch return .{ .action = .deny, .why = "outside the workspace" };
+                const cf = confined(arena, g.io, g.workspace, arg) catch return .{ .action = .deny, .why = "outside the workspace" };
+                subject = cf.rel;
+                given = cf.given;
+                if (tool == .write_file and cf.link) return .{ .action = .deny, .why = "a symbolic link: files are not written through one", .subject = subject };
             },
             .web => if (arg.len == 0 or std.mem.indexOfAny(u8, arg, " /\\?#@") != null) return .{ .action = .deny, .why = "not a host name" },
             else => {},
         }
-        if (ctx.brief_source) return .{ .action = .allow, .why = "listed in briefs.ini" };
         const name = @tagName(tool);
         for (g.rules) |r| {
             // a deny on a server's MCP tools covers its money tools too
             const same = std.mem.eql(u8, r.tool, name) or (tool == .money and std.mem.eql(u8, r.tool, "mcp"));
-            if (r.action == .deny and same and rules.glob(r.pattern, arg))
-                return .{ .action = .deny, .why = std.fmt.allocPrint(arena, "rule on line {d}", .{r.line}) catch "rule" };
+            if (r.action == .deny and same and (g.matches(arena, tool, r.pattern, subject) or (given.len > 0 and g.matches(arena, tool, r.pattern, given))))
+                return .{ .action = .deny, .why = std.fmt.allocPrint(arena, "rule on line {d}", .{r.line}) catch "rule", .subject = subject };
         }
+        // listing a source in briefs.ini allows it, as an allow rule would
+        if (ctx.brief_source) return .{ .action = .allow, .why = "listed in briefs.ini", .subject = subject };
         if (tool == .money) {
             // no grant or allow rule lifts this: the owner is asked every time
-            if (!ctx.scheduled) return .{ .action = .ask, .why = "money is asked every time" };
-            if (ctx.money_unattended) return .{ .action = .allow, .why = "money in scheduled runs is switched on, within the caps" };
-            return .{ .action = .deny, .why = "money is not moved in scheduled runs" };
+            if (!ctx.scheduled) return .{ .action = .ask, .why = "money is asked every time", .subject = subject };
+            if (ctx.money_unattended) return .{ .action = .allow, .why = "money in scheduled runs is switched on, within the caps", .subject = subject };
+            return .{ .action = .deny, .why = "money is not moved in scheduled runs", .subject = subject };
         }
-        if (g.grants.has(tool, grantKey(tool, arg), now_s)) return .{ .action = .allow, .why = "granted for 24 hours" };
-        var d: Decision = .{ .action = tool.default(), .why = "default for this tool" };
+        if (g.grants.has(tool, grantKey(tool, subject), now_s)) return .{ .action = .allow, .why = "granted for 24 hours", .subject = subject };
+        var d: Decision = .{ .action = tool.default(), .why = "default for this tool", .subject = subject };
+        // programs read these as their settings (.git/config, .npmrc, .env):
+        // a file written there can make the next command run something else
+        if (tool == .write_file and dotPart(subject)) d = .{ .action = .ask, .why = "a name starting with \".\" asks: programs read those as settings", .subject = subject };
         for (g.rules) |r| {
-            if (r.action != .deny and std.mem.eql(u8, r.tool, name) and rules.glob(r.pattern, arg)) {
-                d = .{ .action = r.action, .why = std.fmt.allocPrint(arena, "rule on line {d}", .{r.line}) catch "rule" };
+            if (r.action != .deny and std.mem.eql(u8, r.tool, name) and g.matches(arena, tool, r.pattern, subject)) {
+                d = .{ .action = r.action, .why = std.fmt.allocPrint(arena, "rule on line {d}", .{r.line}) catch "rule", .subject = subject };
                 break;
             }
         }
-        if (d.action == .ask and ctx.scheduled) return .{ .action = .deny, .why = "no one to ask in a scheduled run" };
+        if (d.action == .ask and ctx.scheduled) return .{ .action = .deny, .why = "no one to ask in a scheduled run", .subject = subject };
         return d;
+    }
+
+    /// Whether a rule's pattern matches; file patterns are read like file
+    /// arguments: a leading `./` or the workspace's own path is dropped,
+    /// `\` is a separator on Windows, case is ignored where volumes ignore it.
+    fn matches(g: *const Gate, arena: std.mem.Allocator, tool: Tool, pattern: []const u8, s: []const u8) bool {
+        switch (tool) {
+            .read_file, .write_file => {},
+            else => return rules.glob(pattern, s),
+        }
+        var p = slashes(arena, pattern);
+        const ws = slashes(arena, g.workspace);
+        if (p.len > ws.len and std.mem.startsWith(u8, p, ws) and p[ws.len] == '/') p = p[ws.len + 1 ..];
+        while (std.mem.startsWith(u8, p, "./")) p = std.mem.trimStart(u8, p[2..], "/");
+        return rules.globCase(p, s, fold_paths);
     }
 };
 
-/// The real path of `path` (relative to the workspace, or absolute), or
-/// error.OutsideWorkspace if it is not inside `workspace` (a real path) —
-/// lexically or after following symlinks of the parts that exist.
+/// Whether a part of `rel` (with `/` between the parts) starts with `.`.
+fn dotPart(rel: []const u8) bool {
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |part| if (part.len > 0 and part[0] == '.') return true;
+    return false;
+}
+
+/// `/` for each separator (on Windows `\\` is one too).
+fn slashes(arena: std.mem.Allocator, p: []const u8) []const u8 {
+    if (std.fs.path.sep == '/' or std.mem.indexOfScalar(u8, p, '\\') == null) return p;
+    const out = arena.dupe(u8, p) catch return p;
+    std.mem.replaceScalar(u8, out, '\\', '/');
+    return out;
+}
+
+/// The path to open for `path` (relative to the workspace, or absolute),
+/// or error.OutsideWorkspace if it is not inside `workspace` (a real path)
+/// — lexically or after following symlinks of the parts that exist.
 pub fn confine(arena: std.mem.Allocator, io: Io, workspace: []const u8, path: []const u8) ![]const u8 {
+    return (try confined(arena, io, workspace, path)).path;
+}
+
+pub const Confined = struct {
+    /// What to open: absolute, `.` and `..` resolved.
+    path: []const u8,
+    /// What file rules and grants see: the path inside the workspace with
+    /// the symlinks of the parts that exist followed (so their names as
+    /// they are on disk), `/` between the parts; "" for the workspace.
+    rel: []const u8,
+    /// The same before symlinks are followed.
+    given: []const u8,
+    /// The last part is a symlink (to something inside the workspace).
+    link: bool,
+};
+
+pub fn confined(arena: std.mem.Allocator, io: Io, workspace: []const u8, path: []const u8) !Confined {
     if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.OutsideWorkspace;
     const joined = if (std.fs.path.isAbsolute(path)) path else try std.fs.path.join(arena, &.{ workspace, path });
     const resolved = try std.fs.path.resolve(arena, &.{joined});
     if (!inside(workspace, resolved)) return error.OutsideWorkspace;
     // the deepest part that exists, with symlinks followed, must be inside too
     var probe: []const u8 = resolved;
-    while (true) {
+    const real = while (true) {
         if (Io.Dir.cwd().realPathFileAlloc(io, probe, arena)) |real| {
             if (!inside(workspace, real)) return error.OutsideWorkspace;
-            break;
+            break real;
         } else |e| switch (e) {
-            error.FileNotFound, error.NotDir => probe = std.fs.path.dirname(probe) orelse return error.OutsideWorkspace,
+            error.FileNotFound, error.NotDir => {
+                // a symlink to something missing: where a write through it
+                // would land can't be checked
+                if (isLink(io, probe)) return error.OutsideWorkspace;
+                probe = std.fs.path.dirname(probe) orelse return error.OutsideWorkspace;
+            },
             else => return error.OutsideWorkspace,
         }
-    }
-    return resolved;
+    };
+    // what exists as it really is, then the parts not made yet
+    const full = try std.mem.concat(arena, u8, &.{ real, resolved[probe.len..] });
+    return .{ .path = resolved, .rel = relTo(arena, workspace, full), .given = relTo(arena, workspace, resolved), .link = isLink(io, resolved) };
+}
+
+fn isLink(io: Io, p: []const u8) bool {
+    const st = Io.Dir.cwd().statFile(io, p, .{ .follow_symlinks = false }) catch return false;
+    return st.kind == .sym_link;
+}
+
+/// `p` (inside `root`) relative to it, with `/` between the parts.
+fn relTo(arena: std.mem.Allocator, root: []const u8, p: []const u8) []const u8 {
+    return slashes(arena, std.mem.trimStart(u8, p[root.len..], "/\\"));
 }
 
 fn inside(root: []const u8, p: []const u8) bool {
@@ -292,6 +397,29 @@ test "grant_allows_until_expiry" {
     try t.expect(!g2.has(.shell, "ls -l", 1600));
 }
 
+test "grants_compare_exactly_except_hosts" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.grants.add(.shell, "rm -rf build", 5000);
+    try t.expectEqual(.allow, f.act(.shell, "rm -rf build", .{}));
+    try t.expectEqual(.ask, f.act(.shell, "rm -rf BUILD", .{}));
+    try f.grants.add(.mcp, "github/list_issues", 5000);
+    try t.expectEqual(.ask, f.act(.mcp, "GitHub/List_Issues {}", .{}));
+    // a host is the same host in any case; a login's name is not
+    try f.grants.add(.web, "github.com", 5000);
+    try t.expectEqual(.allow, f.act(.web, "GitHub.COM", .{}));
+    try f.grants.add(.login, "bot github.com", 5000);
+    try t.expectEqual(.allow, f.act(.login, "bot GitHub.com", .{}));
+    try t.expectEqual(.ask, f.act(.login, "BOT github.com", .{}));
+    // a file's path in any case where the volume ignores case
+    try f.grants.add(.write_file, ".npmrc", 5000);
+    try t.expectEqual(if (fold_paths) .allow else .ask, f.act(.write_file, ".NPMRC", .{}));
+    // the same command in another case is a grant of its own, not a renewal
+    try f.grants.add(.shell, "rm -rf BUILD", 6000);
+    try t.expectEqual(5000, f.grants.items.items[0].expires_s);
+}
+
 test "scheduled_run_turns_ask_into_deny" {
     var f: Fixture = undefined;
     try f.init("allow shell date\n");
@@ -309,6 +437,15 @@ test "listed_brief_source_is_allowed" {
     try t.expectEqual(.deny, f.act(.fetch, "file:///etc/passwd", .{ .brief_source = true }));
 }
 
+test "a_deny_rule_applies_to_brief_sources_too" {
+    var f: Fixture = undefined;
+    try f.init("deny fetch https://feeds.example.com/*\ndeny search *passwords*\n");
+    defer f.deinit();
+    try t.expectEqual(.deny, f.act(.fetch, "https://feeds.example.com/rss", .{ .scheduled = true, .brief_source = true }));
+    try t.expectEqual(.deny, f.act(.search, "leaked passwords list", .{ .scheduled = true, .brief_source = true }));
+    try t.expectEqual(.allow, f.act(.fetch, "https://other.example.com/rss", .{ .scheduled = true, .brief_source = true }));
+}
+
 test "paths_outside_workspace_are_refused" {
     var f: Fixture = undefined;
     try f.init("allow read_file *\nallow write_file *\n");
@@ -323,6 +460,80 @@ test "paths_outside_workspace_are_refused" {
         try f.tmp.dir.symLink(t.io, "..", "ws/out", .{ .is_directory = true });
         try t.expectEqual(.deny, f.act(.read_file, "out/secret", .{}));
         try t.expectEqual(.deny, f.act(.write_file, "out/new.txt", .{}));
+    }
+}
+
+test "file_rules_see_the_path_inside_the_workspace" {
+    var f: Fixture = undefined;
+    try f.init("deny read_file private/*\nallow write_file notes/*\nask write_file *\n");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.tmp.dir.createDirPath(t.io, "ws/private");
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/private/k", .data = "key" });
+    for ([_][]const u8{ "private/k", "./private/k", "a/../private/k", ".//private//k", "private/../private/./k" }) |p|
+        try t.expectEqual(.deny, f.act(.read_file, p, .{}));
+    try t.expectEqual(.deny, f.act(.read_file, try std.fs.path.join(a, &.{ f.gate.workspace, "private", "k" }), .{}));
+    if (fold_paths) try t.expectEqual(.deny, f.act(.read_file, "PRIVATE/K", .{}));
+    if (builtin.os.tag == .windows) try t.expectEqual(.deny, f.act(.read_file, "private\\k", .{}));
+    // a symlink to the file is the file
+    if (builtin.os.tag != .windows) {
+        try f.tmp.dir.symLink(t.io, "private/k", "ws/k-link", .{});
+        try t.expectEqual(.deny, f.act(.read_file, "k-link", .{}));
+    }
+    try t.expectEqual(.allow, f.act(.read_file, "notes/k", .{}));
+    // allow and ask rules and grants see the same form
+    try t.expectEqual(.ask, f.act(.write_file, "./notes/../todo.md", .{}));
+    try t.expectEqual(.allow, f.act(.write_file, "./notes/a.md", .{}));
+    try f.grants.add(.write_file, "todo.md", 5000);
+    try t.expectEqual(.allow, f.act(.write_file, "./todo.md", .{}));
+    // rules written with ./ or the workspace's own path, and in another case where case is ignored
+    f.gate.rules = try rules.parse(a, try std.fmt.allocPrint(a, "deny write_file ./drafts/*\ndeny write_file {s}/old/*\ndeny write_file Plans/*\n", .{f.gate.workspace}));
+    try t.expectEqual(.deny, f.act(.write_file, "drafts/x.md", .{}));
+    try t.expectEqual(.deny, f.act(.write_file, "old/x.md", .{}));
+    try t.expectEqual(if (fold_paths) .deny else .allow, f.act(.write_file, "plans/x.md", .{}));
+    // the decision says which form it matched
+    try t.expectEqualStrings("drafts/y.md", f.gate.decide(a, .write_file, "a/../drafts/y.md", 1000, .{}).subject);
+}
+
+test "a_symlink_whose_target_is_missing_is_refused_and_written_files_are_never_links" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    // a link out of the workspace to nothing yet: writing it would make the file outside
+    try f.tmp.dir.symLink(t.io, "../outside.txt", "ws/dangle", .{});
+    try f.tmp.dir.symLink(t.io, "../nowhere", "ws/dangle-dir", .{ .is_directory = true });
+    try t.expectEqual(.deny, f.act(.write_file, "dangle", .{}));
+    try t.expectEqual(.deny, f.act(.write_file, "dangle-dir/x.txt", .{}));
+    try t.expectEqual(.deny, f.act(.read_file, "dangle", .{}));
+    // a link to a file inside may be read, but a write would go through it
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/notes.txt", .data = "x" });
+    try f.tmp.dir.symLink(t.io, "notes.txt", "ws/in-link", .{});
+    try t.expectEqual(.allow, f.act(.read_file, "in-link", .{}));
+    try t.expectEqual(.deny, f.act(.write_file, "in-link", .{}));
+    try t.expectEqual(.allow, f.act(.write_file, "notes.txt", .{}));
+}
+
+test "writing_a_path_with_a_part_starting_with_a_dot_asks" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    for ([_][]const u8{ ".npmrc", ".git/config", "src/.env", "./a/../.git/hooks/pre-commit", "pkg/.venv/bin/x" }) |p|
+        try t.expectEqual(.ask, f.act(.write_file, p, .{}));
+    try t.expectEqual(.allow, f.act(.write_file, "notes/a.md", .{}));
+    try t.expectEqual(.allow, f.act(.write_file, "./notes/./b.md", .{}));
+    try t.expectEqual(.allow, f.act(.read_file, ".git/config", .{}));
+    try t.expectEqual(.deny, f.act(.write_file, ".npmrc", .{ .scheduled = true }));
+    // a grant covers that path, and an allow rule lifts it
+    try f.grants.add(.write_file, ".npmrc", 5000);
+    try t.expectEqual(.allow, f.act(.write_file, "./.npmrc", .{}));
+    f.gate.rules = try rules.parse(f.arena.allocator(), "allow write_file .github/*\n");
+    try t.expectEqual(.allow, f.act(.write_file, ".github/workflows/ci.yml", .{}));
+    // a symlink to a dot folder is that folder
+    if (builtin.os.tag != .windows) {
+        try f.tmp.dir.createDirPath(t.io, "ws/.git");
+        try f.tmp.dir.symLink(t.io, ".git", "ws/g", .{ .is_directory = true });
+        try t.expectEqual(.ask, f.act(.write_file, "g/config", .{}));
     }
 }
 

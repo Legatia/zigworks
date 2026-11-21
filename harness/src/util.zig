@@ -97,27 +97,99 @@ pub fn weekday(days: i64) u3 {
     return @intCast(@mod(days + 3, 7));
 }
 
-/// Appends `s` as a JSON string (with quotes).
+/// Appends `s` as a JSON string (with quotes). JSON is UTF-8: bytes that
+/// are not go in as U+FFFD, so the result is always valid.
 pub fn jsonString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
     try out.append(gpa, '"');
-    for (s) |c| switch (c) {
-        '"' => try out.appendSlice(gpa, "\\\""),
-        '\\' => try out.appendSlice(gpa, "\\\\"),
-        '\n' => try out.appendSlice(gpa, "\\n"),
-        '\r' => try out.appendSlice(gpa, "\\r"),
-        '\t' => try out.appendSlice(gpa, "\\t"),
-        0...8, 11, 12, 14...0x1f, 0x7f => try out.print(gpa, "\\u{x:0>4}", .{c}),
-        else => try out.append(gpa, c),
-    };
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c >= 0x80) {
+            i += try appendUtf8Seq(out, gpa, s[i..]);
+            continue;
+        }
+        switch (c) {
+            '"' => try out.appendSlice(gpa, "\\\""),
+            '\\' => try out.appendSlice(gpa, "\\\\"),
+            '\n' => try out.appendSlice(gpa, "\\n"),
+            '\r' => try out.appendSlice(gpa, "\\r"),
+            '\t' => try out.appendSlice(gpa, "\\t"),
+            0...8, 11, 12, 14...0x1f, 0x7f => try out.print(gpa, "\\u{x:0>4}", .{c}),
+            else => try out.append(gpa, c),
+        }
+        i += 1;
+    }
     try out.append(gpa, '"');
 }
 
+const replacement = "\u{fffd}";
+
+/// `s` with each run of bytes that is not UTF-8 replaced by U+FFFD; `s`
+/// itself when it is valid.
+pub fn validUtf8(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(s)) return s;
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(arena, s.len + 16);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] < 0x80) {
+            try out.append(arena, s[i]);
+            i += 1;
+        } else i += try appendUtf8Seq(&out, arena, s[i..]);
+    }
+    return out.items;
+}
+
+/// Appends the sequence `s` starts with (its first byte is 0x80 or more),
+/// or U+FFFD for as many bytes as could have begun one (the "maximal
+/// subpart"); returns how many bytes of `s` it took.
+fn appendUtf8Seq(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !usize {
+    const need: usize = switch (s[0]) {
+        0xc2...0xdf => 2,
+        0xe0...0xef => 3,
+        0xf0...0xf4 => 4,
+        else => {
+            try out.appendSlice(gpa, replacement);
+            return 1;
+        },
+    };
+    var k: usize = 1;
+    while (k < need and k < s.len and isCont(s[k])) : (k += 1) {
+        // the second byte's narrower ranges: no overlong forms, no
+        // surrogate halves, nothing above U+10FFFF
+        if (k == 1) {
+            const ok = switch (s[0]) {
+                0xe0 => s[1] >= 0xa0,
+                0xed => s[1] <= 0x9f,
+                0xf0 => s[1] >= 0x90,
+                0xf4 => s[1] <= 0x8f,
+                else => true,
+            };
+            if (!ok) break;
+        }
+    }
+    if (k == need) {
+        try out.appendSlice(gpa, s[0..k]);
+    } else {
+        try out.appendSlice(gpa, replacement);
+    }
+    return k;
+}
+
 /// Cuts `s` to at most `max` bytes without splitting a UTF-8 sequence.
+/// Where the bytes are not UTF-8 (no sequence starts in the 3 bytes before
+/// the cut), it is a hard cut at `max`, so cutting parts off a text always
+/// moves on.
 pub fn cut(s: []const u8, max: usize) []const u8 {
     if (s.len <= max) return s;
     var n = max;
-    while (n > 0 and (s[n] & 0xc0) == 0x80) n -= 1;
+    while (n > 0 and max - n < 3 and isCont(s[n])) n -= 1;
+    if (n == 0 or isCont(s[n])) return s[0..max];
     return s[0..n];
+}
+
+fn isCont(c: u8) bool {
+    return c & 0xc0 == 0x80;
 }
 
 const t = std.testing;
@@ -152,4 +224,37 @@ test "json_strings_are_escaped" {
     try jsonString(&out, t.allocator, "a\"b\\c\nd\x01");
     try t.expectEqualStrings("\"a\\\"b\\\\c\\nd\\u0001\"", out.items);
     try t.expectEqualStrings("ab", cut("ab\xc3\xa9", 3));
+}
+
+test "bytes_that_are_not_utf8_become_replacement_characters" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ok = "plain, caf\xc3\xa9, \xf0\x9f\x98\x80";
+    try t.expectEqual(ok.ptr, (try validUtf8(a, ok)).ptr);
+    // a lone continuation byte, an overlong form, a surrogate half, too large, a cut-off sequence
+    try t.expectEqualStrings("a\u{fffd}b", try validUtf8(a, "a\x80b"));
+    try t.expectEqualStrings("\u{fffd}\u{fffd}x", try validUtf8(a, "\xc0\x80x"));
+    try t.expectEqualStrings("\u{fffd}\u{fffd}\u{fffd}", try validUtf8(a, "\xed\xa0\x80"));
+    try t.expectEqualStrings("\u{fffd}\u{fffd}\u{fffd}\u{fffd}", try validUtf8(a, "\xf4\x90\x80\x80"));
+    try t.expectEqualStrings("ok \u{fffd}", try validUtf8(a, "ok \xf0\x9f\x98"));
+    // JSON strings come out valid whatever they were given
+    var out: std.ArrayList(u8) = .empty;
+    try jsonString(&out, a, "a\x80b\xc3 \xc3\xa9");
+    try t.expectEqualStrings("\"a\u{fffd}b\u{fffd} \xc3\xa9\"", out.items);
+    try t.expect(std.unicode.utf8ValidateSlice(out.items));
+}
+
+test "cut_moves_on_through_bytes_that_are_not_utf8" {
+    // no sequence starts anywhere near the cut: a hard cut at the limit
+    const junk: [5000]u8 = @splat(0x80);
+    try t.expectEqual(4096, cut(&junk, 4096).len);
+    // so cutting parts off a text, as telegram.split does, always ends
+    var rest: []const u8 = &junk;
+    var parts: usize = 0;
+    while (rest.len > 4096) : (parts += 1) rest = rest[cut(rest, 4096).len..];
+    try t.expectEqual(1, parts);
+    // a character is still never split
+    try t.expectEqualStrings("a", cut("a\xf0\x9f\x98\x80", 4));
+    try t.expectEqualStrings("a\xf0\x9f\x98\x80", cut("a\xf0\x9f\x98\x80b", 5));
 }

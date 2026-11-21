@@ -593,11 +593,12 @@ const TermChan = struct {
     }
 
     fn buttons(ctx: *anyopaque, text: []const u8, bs: []const [2][]const u8) ?i64 {
-        _ = bs;
         const tc: *TermChan = @ptrCast(@alignCast(ctx));
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
-        outPrint(tc.io, "{s}\n[o] allow once  [d] allow 24 h  [n] deny\n", .{text}) catch {};
+        // only the answers this question has: money has no 24 h
+        var buf: [128]u8 = undefined;
+        outPrint(tc.io, "{s}\n{s}\n", .{ text, keysLine(&buf, bs) }) catch {};
         return 0;
     }
 
@@ -606,6 +607,19 @@ const TermChan = struct {
         _ = id;
     }
 };
+
+/// The keys for the buttons a question has ("[o] allow once  [n] deny"),
+/// by what each button answers.
+fn keysLine(buf: []u8, bs: []const [2][]const u8) []const u8 {
+    var n: usize = 0;
+    for (bs) |b| {
+        if (b[0].len == 0) continue;
+        const key: []const u8 = if (std.mem.endsWith(u8, b[1], ":once")) "o" else if (std.mem.endsWith(u8, b[1], ":day")) "d" else "n";
+        const part = std.fmt.bufPrint(buf[n..], "{s}[{s}] {c}{s}", .{ if (n > 0) "  " else "", key, std.ascii.toLower(b[0][0]), b[0][1..] }) catch break;
+        n += part.len;
+    }
+    return buf[0..n];
+}
 
 fn chatCmd(app: *App) !Exit {
     const c = try app.open();
@@ -625,12 +639,14 @@ fn chatCmd(app: *App) !Exit {
         if (c.approvalWaiting()) {
             const ans: ?agent.Answer = if (eql(line, "o")) .once else if (eql(line, "d")) .day else if (eql(line, "n")) .deny else null;
             if (ans) |x| {
-                _ = c.answerPending(x);
+                if (!c.answerPending(x) and c.approvalWaiting()) try errAll(app.io, "That answer is not offered for this question.\n");
                 continue;
             }
         }
         try c.handleText(line);
     }
+    // no one is left to answer: the question waiting, and any after it, is Deny
+    c.closeQuestions();
     // let queued and running turns finish their answers
     var waited: u32 = 0;
     while (waited < 15 * 60 * 1000) : (waited += 50) {
@@ -867,4 +883,10 @@ test {
     _ = @import("logins.zig");
     _ = @import("cdp.zig");
     _ = @import("web.zig");
+}
+
+test "the_terminal_offers_only_the_answers_the_question_has" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("[o] allow once  [n] deny", keysLine(&buf, &.{ .{ "Allow once", "a3:once" }, .{ "Deny", "a3:deny" } }));
+    try std.testing.expectEqualStrings("[o] allow once  [d] allow 24 h  [n] deny", keysLine(&buf, &.{ .{ "Allow once", "a4:once" }, .{ "Allow 24 h", "a4:day" }, .{ "Deny", "a4:deny" } }));
 }

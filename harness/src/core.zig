@@ -136,8 +136,16 @@ pub const Error = error{ AlreadyRunning, BadSettings, NoModelKey };
 
 const Approval = struct {
     mutex: Io.Mutex = .init,
+    /// The last question's number; it goes on from the last instance's
+    /// (state/approvals), so a button left under an old question in the
+    /// chat never matches a new one.
     id: u32 = 0,
+    loaded: bool = false,
     waiting: bool = false,
+    /// Whether the waiting question offers "Allow 24 h" (money does not).
+    allow_day: bool = true,
+    /// No one is there to answer: nothing more is asked.
+    closed: bool = false,
     answer: ?agent.Answer = null,
     msg: ?i64 = null,
 };
@@ -173,7 +181,6 @@ pub const Core = struct {
     /// What started and what did not, for /status.
     mcp_note: []const u8 = "",
     money_ledger: agent.MoneyLedger = .{},
-    dry_run: bool = false,
     /// Chrome or Chromium for `browse` and `web`; empty: none.
     browser: []const u8 = "",
     /// The agent's logins (logins.ini, in the settings arena).
@@ -194,8 +201,8 @@ pub const Core = struct {
 
     chan: ?Channel = null,
     owner: ?i64 = null,
-    auto_recall: bool = true,
-    private: bool = false,
+    /// /dryrun, /private, /memory auto: runs read them when they use them.
+    switches: agent.Switches = .{},
 
     // the chat
     chat_client: model.Client,
@@ -285,7 +292,6 @@ pub const Core = struct {
         c.lock = .init;
         c.helper_pool = .{};
         c.ask_lock = .init;
-        c.dry_run = false;
         c.money_ledger = .{ .path = c.paths.money };
         c.money_ledger.load(io);
         c.mcp_servers = .empty;
@@ -296,8 +302,8 @@ pub const Core = struct {
         c.settings_mutex = .init;
         c.chan = null;
         c.owner = readOwner(io, c.paths.owner);
-        c.auto_recall = c.cfg.memory.auto;
-        c.private = false;
+        c.switches = .{};
+        c.switches.auto_recall.store(c.cfg.memory.auto, .release);
         c.loadSwitches();
         c.chat_client = try model.Client.init(gpa, io, c.cfg.model.url, secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens);
         c.conv = .init(gpa);
@@ -471,16 +477,16 @@ pub const Core = struct {
         const got = Io.Dir.cwd().readFile(c.io, c.paths.switches, &buf) catch return;
         var it = std.mem.splitScalar(u8, got, '\n');
         while (it.next()) |line| {
-            if (std.mem.eql(u8, line, "auto off")) c.auto_recall = false;
-            if (std.mem.eql(u8, line, "auto on")) c.auto_recall = true;
-            if (std.mem.eql(u8, line, "private on")) c.private = true;
-            if (std.mem.eql(u8, line, "dryrun on")) c.dry_run = true;
+            if (std.mem.eql(u8, line, "auto off")) c.switches.auto_recall.store(false, .release);
+            if (std.mem.eql(u8, line, "auto on")) c.switches.auto_recall.store(true, .release);
+            if (std.mem.eql(u8, line, "private on")) c.switches.private.store(true, .release);
+            if (std.mem.eql(u8, line, "dryrun on")) c.switches.dry_run.store(true, .release);
         }
     }
 
     fn saveSwitches(c: *Core) void {
         var buf: [96]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "auto {s}\nprivate {s}\ndryrun {s}\n", .{ if (c.auto_recall) "on" else "off", if (c.private) "on" else "off", if (c.dry_run) "on" else "off" }) catch return;
+        const s = std.fmt.bufPrint(&buf, "auto {s}\nprivate {s}\ndryrun {s}\n", .{ onOff(c.switches.auto_recall.load(.acquire)), onOff(c.switches.private.load(.acquire)), onOff(c.switches.dry_run.load(.acquire)) }) catch return;
         Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.switches, .data = s }) catch {};
     }
 
@@ -608,16 +614,29 @@ pub const Core = struct {
         const ans: agent.Answer = if (std.mem.eql(u8, data[colon + 1 ..], "once")) .once else if (std.mem.eql(u8, data[colon + 1 ..], "day")) .day else .deny;
         c.approval.mutex.lockUncancelable(c.io);
         defer c.approval.mutex.unlock(c.io);
+        // a "24 h" the question never offered is no answer
+        if (ans == .day and !c.approval.allow_day) return;
         if (c.approval.waiting and c.approval.id == id) c.approval.answer = ans;
     }
 
-    /// The terminal's way to answer: "o", "d" or "n" while asked.
+    /// The terminal's way to answer: "o", "d" or "n" while asked; false if
+    /// nothing is asked or the question does not offer that answer.
     pub fn answerPending(c: *Core, ans: agent.Answer) bool {
         c.approval.mutex.lockUncancelable(c.io);
         defer c.approval.mutex.unlock(c.io);
         if (!c.approval.waiting) return false;
+        if (ans == .day and !c.approval.allow_day) return false;
         c.approval.answer = ans;
         return true;
+    }
+
+    /// No one is there to answer any more (the terminal's input ended): the
+    /// question waiting is denied, and later calls that would ask are too.
+    pub fn closeQuestions(c: *Core) void {
+        c.approval.mutex.lockUncancelable(c.io);
+        defer c.approval.mutex.unlock(c.io);
+        c.approval.closed = true;
+        if (c.approval.waiting) c.approval.answer = .deny;
     }
 
     pub fn approvalWaiting(c: *Core) bool {
@@ -628,24 +647,46 @@ pub const Core = struct {
 
     const ChatAsk = struct { core: *Core, flag: *std.atomic.Value(bool) };
 
-    fn askOwner(ctx: *anyopaque, what: []const u8, allow_day: bool) agent.Answer {
+    fn askOwner(ctx: *anyopaque, q: agent.Question) agent.Answer {
         const ca: *ChatAsk = @ptrCast(@alignCast(ctx));
+        const what = q.text;
+        const allow_day = q.allow_day;
         const c = ca.core;
         const ch = c.chan orelse return .deny;
         var id_buf: [3][24]u8 = undefined;
         const id = blk: {
             c.approval.mutex.lockUncancelable(c.io);
             defer c.approval.mutex.unlock(c.io);
+            if (c.approval.closed) return .deny;
+            if (!c.approval.loaded) {
+                c.approval.id = c.loadApprovalId();
+                c.approval.loaded = true;
+            }
+            // kept before the buttons go out: after a restart the numbers go on
+            c.saveApprovalId(c.approval.id + 1) catch break :blk null;
             c.approval.id += 1;
             c.approval.waiting = true;
+            c.approval.allow_day = allow_day;
             c.approval.answer = null;
             break :blk c.approval.id;
+        } orelse {
+            c.say("Could not keep the question's number in state/approvals, so it was not asked: not allowed.");
+            return .deny;
         };
         const once = std.fmt.bufPrint(&id_buf[0], "a{d}:once", .{id}) catch return .deny;
         const day = std.fmt.bufPrint(&id_buf[1], "a{d}:day", .{id}) catch return .deny;
         const deny = std.fmt.bufPrint(&id_buf[2], "a{d}:deny", .{id}) catch return .deny;
-        var text_buf: [1700]u8 = undefined;
-        const text = std.fmt.bufPrint(&text_buf, "Allow this?\n{s}", .{what}) catch what;
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        // the whole question, in as many messages as it takes; the buttons
+        // go on the last, so it is answered after all of it was shown
+        const parts = questionParts(a, what) catch return .deny;
+        for (parts[0 .. parts.len - 1], 1..) |p, i| c.say(std.fmt.allocPrint(a, "Allow this? ({d}/{d})\n{s}", .{ i, parts.len, p }) catch return .deny);
+        const text = (if (parts.len == 1)
+            std.fmt.allocPrint(a, "Allow this?\n{s}", .{what})
+        else
+            std.fmt.allocPrint(a, "Allow this? ({d}/{d})\n{s}", .{ parts.len, parts.len, parts[parts.len - 1] })) catch return .deny;
         const msg = if (allow_day)
             ch.buttons(ch.ctx, text, &.{ .{ "Allow once", once }, .{ "Allow 24 h", day }, .{ "Deny", deny } })
         else
@@ -656,8 +697,8 @@ pub const Core = struct {
             {
                 c.approval.mutex.lockUncancelable(c.io);
                 defer c.approval.mutex.unlock(c.io);
-                if (c.approval.answer) |a| {
-                    ans = a;
+                if (c.approval.answer) |got| {
+                    ans = got;
                     break;
                 }
             }
@@ -666,6 +707,8 @@ pub const Core = struct {
                 break;
             }
             if (c.now() >= deadline) break;
+            // an answer after the run must end is of no use to it
+            if (q.deadline_s > 0 and util.nowSeconds(c.io) >= q.deadline_s) break;
             c.io.sleep(.fromMilliseconds(50), .awake) catch {};
         }
         {
@@ -676,6 +719,49 @@ pub const Core = struct {
         if (msg) |m| ch.clear(ch.ctx, m);
         if (ans == .timeout) c.say("No answer in time; not allowed.");
         return ans;
+    }
+
+    fn approvalsPath(c: *Core, buf: []u8) ![]const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(buf);
+        return std.fs.path.join(fba.allocator(), &.{ c.paths.state, "approvals" });
+    }
+
+    fn loadApprovalId(c: *Core) u32 {
+        var pbuf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const p = c.approvalsPath(&pbuf) catch return 0;
+        var buf: [32]u8 = undefined;
+        const got = Io.Dir.cwd().readFile(c.io, p, &buf) catch return 0;
+        return std.fmt.parseInt(u32, std.mem.trim(u8, got, " \r\n"), 10) catch 0;
+    }
+
+    fn saveApprovalId(c: *Core, id: u32) !void {
+        var pbuf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const p = try c.approvalsPath(&pbuf);
+        var buf: [32]u8 = undefined;
+        try Io.Dir.cwd().writeFile(c.io, .{ .sub_path = p, .data = try std.fmt.bufPrint(&buf, "{d}\n", .{id}) });
+    }
+
+    /// Telegram's limit for one message, in bytes (it counts characters, and
+    /// a character takes at least a byte).
+    const message_max = 4096;
+
+    /// `what` in parts that each fit one message with their heading ("Allow
+    /// this? (2/3)"), cut after a line break near the end where there is one.
+    fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
+        const room = message_max - 32;
+        var out: std.ArrayList([]const u8) = .empty;
+        var rest = what;
+        while (rest.len > room) {
+            var n = util.cut(rest, room).len;
+            const from = room - room / 5;
+            if (n > from) if (std.mem.lastIndexOfScalar(u8, rest[from..n], '\n')) |k| {
+                n = from + k + 1;
+            };
+            try out.append(a, rest[0..n]);
+            rest = rest[n..];
+        }
+        try out.append(a, rest);
+        return out.items;
     }
 
     // ---- the chat worker ----
@@ -709,7 +795,7 @@ pub const Core = struct {
                 c.busy.store(false, .release);
                 continue;
             }
-            if (c.turns_since_memory > 0 and !c.private and c.last_owner_s > 0 and c.now() - c.last_owner_s >= c.memory_quiet_s and c.claimIdle()) {
+            if (c.turns_since_memory > 0 and !c.switches.private.load(.acquire) and c.last_owner_s > 0 and c.now() - c.last_owner_s >= c.memory_quiet_s and c.claimIdle()) {
                 c.writeMemories() catch |e| c.log.write(.memory, false, .{ .event = "writer failed", .why = @errorName(e) }) catch {};
                 c.turns_since_memory = 0;
                 c.busy.store(false, .release);
@@ -771,8 +857,9 @@ pub const Core = struct {
             .top_size = c.cfg.memory.top_size,
             .utc_offset = c.cfg.chat.utc_offset,
             .scheduled = scheduled,
-            .private = c.private,
-            .auto_recall = c.auto_recall,
+            // on from the start stays on for the run; the switches are read again when used
+            .private = c.switches.private.load(.acquire),
+            .switches = &c.switches,
             .label = label,
             .model_cfg = if (c.secrets.omnigate) |key| .{
                 .url = c.cfg.model.url,
@@ -789,7 +876,7 @@ pub const Core = struct {
             .mcp = c.mcp_tools,
             .money = c.cfg.money,
             .money_ledger = &c.money_ledger,
-            .dry_run = c.dry_run,
+            .dry_run = c.switches.dry_run.load(.acquire),
             .logins = c.login_list,
             .store = c.store,
             .profiles_dir = c.paths.profiles,
@@ -881,7 +968,7 @@ pub const Core = struct {
         };
         defer agent.freeResult(&run, res);
         if (!res.stopped) c.say(res.text);
-        if (!run.private) c.turns_since_memory += 1;
+        if (!run.isPrivate()) c.turns_since_memory += 1;
     }
 
     const memory_prompt =
@@ -1161,7 +1248,7 @@ pub const Core = struct {
         var words = std.mem.tokenizeAny(u8, text, " \t");
         const cmd = words.next() orelse return "";
         const rest = std.mem.trim(u8, words.rest(), " \t");
-        try c.log.write(.chat, c.private, .{ .event = "command", .command = cmd, .args = rest });
+        try c.log.write(.chat, c.switches.private.load(.acquire), .{ .event = "command", .command = cmd, .args = rest });
         const eql = std.mem.eql;
         if (eql(u8, cmd, "/help") or eql(u8, cmd, "/start")) return help_text;
         if (eql(u8, cmd, "/pair")) return "Already paired.";
@@ -1174,8 +1261,8 @@ pub const Core = struct {
         if (eql(u8, cmd, "/status")) {
             return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
-                if (c.auto_recall) "on" else "off",                                                         if (c.private) "on" else "off",
-                if (c.dry_run) "on" else "off",
+                onOff(c.switches.auto_recall.load(.acquire)), onOff(c.switches.private.load(.acquire)),
+                onOff(c.switches.dry_run.load(.acquire)),
                 if (c.browser.len == 0) "none found" else if (builtin.os.tag == .windows) "found (web not available on Windows yet)" else "found",
                 c.login_list.len,
                 if (c.mcp_note.len > 0) "\nMCP: " else "",
@@ -1184,7 +1271,7 @@ pub const Core = struct {
         }
         if (eql(u8, cmd, "/dryrun")) {
             const v = config.parseBool(rest) orelse return "Use /dryrun on or /dryrun off.";
-            c.dry_run = v;
+            c.switches.dry_run.store(v, .release);
             c.saveSwitches();
             try c.log.write(.config, false, .{ .event = "dry run", .on = v });
             return if (v) "Dry run is on: tools that move money are not called; the agent is told what would have been sent." else "Dry run is off: approved money calls are made.";
@@ -1197,7 +1284,7 @@ pub const Core = struct {
             }
             if (std.mem.startsWith(u8, rest, "auto ")) {
                 const v = config.parseBool(std.mem.trim(u8, rest[5..], " ")) orelse return "Use /memory auto on or /memory auto off.";
-                c.auto_recall = v;
+                c.switches.auto_recall.store(v, .release);
                 c.saveSwitches();
                 return if (v) "Automatic recall is on." else "Automatic recall is off. Pinned items still apply; I look things up only when asked.";
             }
@@ -1205,7 +1292,7 @@ pub const Core = struct {
         }
         if (eql(u8, cmd, "/private")) {
             const v = config.parseBool(rest) orelse return "Use /private on or /private off.";
-            c.private = v;
+            c.switches.private.store(v, .release);
             c.saveSwitches();
             return if (v) "Private: nothing from this chat is written to memory, and the log keeps only sizes and hashes." else "Private is off.";
         }
@@ -1480,6 +1567,10 @@ fn freeKeys(gpa: std.mem.Allocator, map: anytype) void {
     map.deinit(gpa);
 }
 
+fn onOff(v: bool) []const u8 {
+    return if (v) "on" else "off";
+}
+
 fn readOwner(io: Io, path: []const u8) ?i64 {
     var buf: [32]u8 = undefined;
     const got = Io.Dir.cwd().readFile(io, path, &buf) catch return null;
@@ -1735,6 +1826,98 @@ test "text_during_approval_is_queued_button_answers" {
     try f.rec.waitFor("answer to the queued text");
     const req2 = try f.e.request(2);
     try t.expect(std.mem.indexOf(u8, req2, "approved-run") != null);
+}
+
+test "a_long_question_goes_whole_in_parts_with_the_buttons_on_the_last" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const ys = try a.alloc(u8, 6000);
+    @memset(ys, 'y');
+    try f.e.script(1, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"shell\",\"input\":{{\"command\":\"echo {s} end-of-it\"}}}}],\"stop_reason\":\"tool_use\"}}", .{ys}));
+    try f.e.script(2, model.textReply("not run"));
+    try f.core.startWorker();
+    try f.core.handleText("run the long one");
+    try f.rec.waitFor("BUTTONS Allow this? (2/2)\n");
+    var whole: std.ArrayList(u8) = .empty;
+    {
+        f.rec.mutex.lockUncancelable(t.io);
+        defer f.rec.mutex.unlock(t.io);
+        try t.expectEqual(2, f.rec.lines.items.len);
+        const first = f.rec.lines.items[0];
+        const last = f.rec.lines.items[1];
+        try t.expect(std.mem.startsWith(u8, first, "Allow this? (1/2)\n"));
+        try t.expect(first.len <= 4096);
+        // "BUTTONS " and " [a1:once]" are the recorder's
+        const last_text = last["BUTTONS ".len .. std.mem.lastIndexOf(u8, last, " [").?];
+        try t.expect(last_text.len <= 4096);
+        try whole.appendSlice(a, first["Allow this? (1/2)\n".len..]);
+        try whole.appendSlice(a, last_text["Allow this? (2/2)\n".len..]);
+    }
+    try t.expectEqualStrings(try std.fmt.allocPrint(a, "shell: echo {s} end-of-it", .{ys}), whole.items);
+    f.core.handleCallback(42, "a1:deny");
+    try f.rec.waitFor("not run");
+}
+
+test "the_owner_is_waited_for_only_until_the_turn_ends" {
+    var f: Fix = undefined;
+    try f.init("[limits]\nturn_seconds = 2\n", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo late\"}"));
+    try f.e.script(2, model.textReply("never asked for"));
+    try f.core.startWorker();
+    try f.core.handleText("run it");
+    try f.rec.waitFor("BUTTONS Allow this?");
+    // approval_seconds is 10 minutes; the turn has 2 s
+    try f.rec.waitFor("No answer in time; not allowed.");
+}
+
+test "approval_ids_go_on_after_a_restart_so_an_old_button_answers_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo one\"}"));
+    try f.e.script(2, model.textReply("first done"));
+    try f.core.startWorker();
+    try f.core.handleText("one");
+    try f.rec.waitFor("[a1:once]");
+    f.core.handleCallback(42, "a1:once");
+    try f.rec.waitFor("first done");
+    // a restart: the buttons under the old question are still in the chat
+    f.core.close();
+    f.core = try Core.open(t.allocator, t.io, f.home, .{ .omnigate = "og-key-for-tests", .search = "search-key-123" });
+    f.core.attach(f.rec.channel());
+    try f.e.script(3, model.toolReply("tu_2", "shell", "{\"command\":\"echo two\"}"));
+    try f.e.script(4, model.textReply("second done"));
+    try f.core.startWorker();
+    try f.core.handleText("two");
+    try f.rec.waitFor("[a2:once]");
+    f.core.handleCallback(42, "a1:once");
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expect(f.core.approvalWaiting());
+    f.core.handleCallback(42, "a2:deny");
+    try f.rec.waitFor("second done");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "denied by the owner") != null);
+}
+
+test "closing_the_terminal_denies_the_question_and_any_after_it" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo one\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "shell", "{\"command\":\"echo two\"}"));
+    try f.e.script(3, model.textReply("gave up"));
+    try f.core.startWorker();
+    try f.core.handleText("run both");
+    try f.rec.waitFor("BUTTONS Allow this?\nshell: echo one");
+    const start = Io.Clock.awake.now(t.io).nanoseconds;
+    f.core.closeQuestions();
+    try f.rec.waitFor("gave up");
+    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - start < 3 * std.time.ns_per_s);
+    // the second call was not asked at all
+    try t.expectEqual(1, f.rec.count("BUTTONS"));
+    try t.expectEqual(2, std.mem.count(u8, try f.e.request(3), "denied by the owner"));
 }
 
 test "stop_ends_running_turn_and_reports" {
@@ -2027,6 +2210,49 @@ test "mcp_servers_start_from_mcp_ini_and_dryrun_switch" {
     const req = try f.e.request(1);
     try t.expect(std.mem.indexOf(u8, req, "\"name\":\"fake__echo\"") != null);
     try t.expect(std.mem.indexOf(u8, req, "Moves money") != null);
+}
+
+test "dryrun_sent_while_a_money_question_waits_stops_the_call" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\nmoney = echo\namount = amount\n", .{fake}) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"order placed\",\"amount\":5}"));
+    try f.e.script(2, model.textReply("finished the order"));
+    try f.core.startWorker();
+    try f.core.handleText("buy");
+    try f.rec.waitFor("BUTTONS Allow this?");
+    try f.core.handleText("/dryrun on");
+    try f.rec.waitFor("Dry run is on");
+    f.core.handleCallback(42, "a1:once");
+    try f.rec.waitFor("finished the order");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "dry run: would call fake/echo") != null);
+}
+
+test "an_answer_the_question_does_not_offer_is_not_taken" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\nmoney = echo\namount = amount\n", .{fake}) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"buy\",\"amount\":5}"));
+    try f.e.script(2, model.textReply("answered"));
+    try f.core.startWorker();
+    try f.core.handleText("buy");
+    try f.rec.waitFor("BUTTONS Allow this?");
+    // money is never granted for a day: neither "d" nor its button counts
+    try t.expect(!f.core.answerPending(.day));
+    f.core.handleCallback(42, "a1:day");
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expect(f.core.approvalWaiting());
+    try t.expect(f.core.answerPending(.deny));
+    try f.rec.waitFor("answered");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "denied by the owner") != null);
 }
 
 test "mcp_start_errors_are_masked_in_the_log" {
