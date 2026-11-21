@@ -163,7 +163,10 @@ pub const Web = struct {
         };
         // a browser that died or was stopped is no use for the next action
         if (w.s) |s| if (s.inbox.closed.load(.acquire)) w.close();
-        return .{ .text = try w.mask(a, raw.text), .is_error = raw.is_error };
+        const masked = try w.mask(a, raw.text);
+        if (masked.len <= w.env.max_bytes) return .{ .text = masked, .is_error = raw.is_error };
+        const cut = util.cut(masked, w.env.max_bytes);
+        return .{ .text = try std.fmt.allocPrint(a, "{s}\n[page cut at {d} bytes of {d}]", .{ cut, w.env.max_bytes, masked.len }), .is_error = raw.is_error };
     }
 
     /// Reads every login's password and TOTP seed once a turn, so the
@@ -631,11 +634,7 @@ pub const Web = struct {
         }
         const p = page.extract(a, html, url) catch page.Page{ .title = "", .text = "" };
         try out.print(a, "\n{s}", .{p.text});
-        if (out.items.len > w.env.max_bytes) {
-            const total = out.items.len;
-            const cut = util.cut(out.items, w.env.max_bytes);
-            return std.fmt.allocPrint(a, "{s}\n[page cut at {d} bytes of {d}]", .{ cut, w.env.max_bytes, total });
-        }
+        // cut by run(), after masking: a cut must not leave half a value
         return out.items;
     }
 };
@@ -1166,6 +1165,21 @@ test "web_login_values_go_only_into_matching_fields" {
         if (r.is_error) std.debug.print("\nrefused: {s}\n{s}\n", .{ j, r.text });
         try t.expect(!r.is_error);
     }
+}
+
+test "web_output_is_masked_before_it_is_cut" {
+    var f: Fix = undefined;
+    try f.init("[a]\nsite = example.com\n");
+    defer f.deinit();
+    try f.store.put(t.io, "login-a-password", "Zq9-fake-Pass-77");
+    try f.page("cut.html", "<html><body><p>some words first, then Zq9-fake-Pass-77 and more words after it</p></body></html>");
+    const whole = try f.act(try f.openJson("cut.html", null));
+    const at = std.mem.indexOf(u8, whole.text, "[secret:login-a-password]").?;
+    // a cut in the middle of where the value is on the page
+    f.web.env.max_bytes = @intCast(at + 5);
+    const r = try f.act("{\"action\":\"read\"}");
+    try t.expect(!has(r.text, "Zq9-f"));
+    try expectHas(r.text, "[page cut at");
 }
 
 test "web_answers_dialogs_and_shows_them" {
