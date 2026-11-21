@@ -656,4 +656,5 @@ test {
     _ = @import("skills.zig");
     _ = @import("mcp.zig");
     _ = @import("page.zig");
+    _ = @import("totp.zig");
 }
