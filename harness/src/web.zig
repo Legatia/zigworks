@@ -640,6 +640,22 @@ pub const Web = struct {
             w.gpa.free(downloads);
         }
         for (downloads) |d| try out.print(a, "A download was refused (downloads are off): {s}\n", .{util.cut(d, 300)});
+        // new tabs and windows: closed before they load anything
+        const tabs = try w.s.?.inbox.takeTabs(w.io, w.gpa);
+        defer w.s.?.inbox.freeTabs(w.gpa, tabs);
+        for (tabs) |x| {
+            if (x.state != .closing) {
+                var p: std.ArrayList(u8) = .empty;
+                try p.appendSlice(a, "{\"targetId\":");
+                try util.jsonString(&p, a, x.target);
+                try p.append(a, '}');
+                _ = w.s.?.callIn(a, "Target.closeTarget", p.items, null) catch {};
+            }
+            if (x.url.len > 0)
+                try out.print(a, "A new tab for {s} was closed before it loaded; open that address to go there.\n", .{util.cut(x.url, 300)})
+            else
+                try out.appendSlice(a, "A new tab the page opened was closed.\n");
+        }
         const dialogs = try w.s.?.inbox.takeDialogs(w.io, a);
         for (dialogs) |d| {
             defer d.free(w.gpa);
@@ -1464,6 +1480,55 @@ test "web_shows_no_dialog_text_from_a_host_not_allowed" {
     f.refuse = "";
     const r3 = try f.act(try f.openJson("to.html", null));
     for ([_][]const u8{ r2.text, r3.text }) |x| try t.expect(!has(x, "refused page text"));
+}
+
+/// The page targets the browser has now.
+fn pageTargets(f: *Fix) !usize {
+    const a = f.e.arena.allocator();
+    const got = try f.web.s.?.callIn(a, "Target.getTargets", "{}", null);
+    var n: usize = 0;
+    for (jv.arr(jv.get(got, "targetInfos")) orelse &.{}) |ti| {
+        if (std.mem.eql(u8, jv.str(jv.get(ti, "type")) orelse "", "page")) n += 1;
+    }
+    return n;
+}
+
+test "web_closes_a_new_tab_before_it_loads_and_says_where_it_went" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.page("opener.html", "<html><body><button id=\"b\" onclick=\"window.open('/page/tab.html?from=opener')\">open</button><p id=\"o\"></p></body></html>");
+    // it would leave a mark the opener can see, had it loaded
+    try f.page("tab.html", "<html><body><script>localStorage.setItem('tab', 'loaded')</script></body></html>");
+    _ = try f.act(try f.openJson("opener.html", null));
+    // as a person's click would (a popup needs one)
+    _ = try f.web.s.?.call(a, "Runtime.evaluate", "{\"expression\":\"document.getElementById('b').click()\",\"userGesture\":true}");
+    var tries: u32 = 0;
+    var r = try f.act("{\"action\":\"read\"}");
+    var said: std.ArrayList(u8) = .empty;
+    try said.appendSlice(a, r.text);
+    while (!has(said.items, "new tab") and tries < 20) : (tries += 1) {
+        t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        r = try f.act("{\"action\":\"read\"}");
+        try said.appendSlice(a, r.text);
+    }
+    try expectHas(said.items, "A new tab for ");
+    try expectHas(said.items, "/page/tab.html?from=opener");
+    try t.expectEqual(1, try pageTargets(&f));
+    try t.expectEqualStrings("null", try f.eval("localStorage.getItem('tab')"));
+    // a link to a new tab, and an empty window (no address ever)
+    try f.page("more.html", "<html><body><a id=\"l\" target=\"_blank\" href=\"/page/tab.html?from=link\">link</a><button id=\"e\" onclick=\"window.open()\">empty</button></body></html>");
+    _ = try f.act(try f.openJson("more.html", null));
+    for ([_][]const u8{ "l", "e" }) |id| {
+        _ = try f.web.s.?.call(a, "Runtime.evaluate", try std.fmt.allocPrint(a, "{{\"expression\":\"document.getElementById('{s}').click()\",\"userGesture\":true}}", .{id}));
+        t.io.sleep(.fromMilliseconds(500), .awake) catch {};
+    }
+    const r2 = try f.act("{\"action\":\"read\"}");
+    try expectHas(r2.text, "/page/tab.html?from=link was closed before it loaded");
+    try expectHas(r2.text, "A new tab the page opened was closed.");
+    try t.expectEqual(1, try pageTargets(&f));
+    try t.expectEqualStrings("null", try f.eval("localStorage.getItem('tab')"));
 }
 
 test "web_waits_for_a_slow_navigation_after_a_click" {

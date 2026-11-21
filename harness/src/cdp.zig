@@ -29,8 +29,28 @@ pub const Dialog = struct {
     }
 };
 
-/// Ids at or above this are the reader's own commands (dialog answers);
-/// their replies are dropped. (Chrome takes ids up to 2^31 - 1 only.)
+/// A tab (or window) a page opened. It starts paused; the reader lets it
+/// go on with every request held back, takes the address of its first
+/// one, fails it and closes the tab: it loads nothing.
+pub const Tab = struct {
+    session: []u8,
+    target: []u8,
+    /// Where it was going (owned; empty until its first request).
+    url: []u8 = &.{},
+    request: []u8 = &.{},
+    state: enum { new, running, blocked, closing } = .new,
+
+    fn free(x: Tab, gpa: Allocator) void {
+        gpa.free(x.session);
+        gpa.free(x.target);
+        gpa.free(x.url);
+        gpa.free(x.request);
+    }
+};
+
+/// Ids at or above this are the reader's own commands (dialog answers,
+/// new tabs); their replies are dropped. (Chrome takes ids up to 2^31 - 1
+/// only.)
 const own_ids: u32 = 1 << 30;
 
 /// Replies by id. Of the events, only the main frame's loading and
@@ -48,6 +68,9 @@ pub const Inbox = struct {
     dialogs: std.ArrayList(Dialog) = .empty,
     /// Addresses of downloads the browser refused (owned).
     downloads: std.ArrayList([]u8) = .empty,
+    /// The page harness drives (owned); every other page is a new tab.
+    main_target: []u8 = &.{},
+    tabs: std.ArrayList(Tab) = .empty,
     /// Bytes of a message not yet ended by its NUL.
     partial: std.ArrayList(u8) = .empty,
     /// The pipe closed: Chrome is gone.
@@ -62,6 +85,9 @@ pub const Inbox = struct {
         b.dialogs.deinit(b.gpa);
         for (b.downloads.items) |u| b.gpa.free(u);
         b.downloads.deinit(b.gpa);
+        for (b.tabs.items) |x| x.free(b.gpa);
+        b.tabs.deinit(b.gpa);
+        b.gpa.free(b.main_target);
         if (b.main_frame.len > 0) b.gpa.free(b.main_frame);
     }
 
@@ -73,7 +99,7 @@ pub const Inbox = struct {
     }
 
     fn event(b: *Inbox, io: Io, msg: []const u8) void {
-        const watched = [_][]const u8{ "Page.frameStartedLoading", "Page.frameStoppedLoading", "Page.javascriptDialogOpening", "Browser.downloadWillBegin" };
+        const watched = [_][]const u8{ "Page.frameStartedLoading", "Page.frameStoppedLoading", "Page.javascriptDialogOpening", "Browser.downloadWillBegin", "Target.attachedToTarget", "Target.detachedFromTarget", "Fetch.requestPaused" };
         const m = for (watched) |w| {
             if (std.mem.indexOf(u8, msg[0..@min(msg.len, 64)], w) != null) break w;
         } else return;
@@ -91,6 +117,7 @@ pub const Inbox = struct {
             b.downloads.append(b.gpa, url) catch b.gpa.free(url);
             return;
         }
+        if (m[0] == 'T' or m[0] == 'F') return b.tabEvent(m, v, params);
         if (m[5] == 'j') {
             const kind = b.gpa.dupe(u8, jv.str(jv.get(params, "type")) orelse "dialog") catch return;
             const message = b.gpa.dupe(u8, util.cut(jv.str(jv.get(params, "message")) orelse "", 2000)) catch return b.gpa.free(kind);
@@ -110,6 +137,58 @@ pub const Inbox = struct {
         const frame = jv.str(jv.get(params, "frameId")) orelse return;
         if (b.main_frame.len > 0 and !std.mem.eql(u8, frame, b.main_frame)) return;
         if (m[10] == 'S' and m[11] == 't' and m[12] == 'a') b.started_at = b.seq else b.stopped_at = b.seq;
+    }
+
+    /// A new tab attached (paused), detached (gone), or its request held.
+    /// Under the mutex.
+    fn tabEvent(b: *Inbox, m: []const u8, v: jv.Value, params: ?jv.Value) void {
+        if (std.mem.eql(u8, m, "Target.attachedToTarget")) {
+            const target = jv.str(jv.at(params, &.{ "targetInfo", "targetId" })) orelse return;
+            const kind = jv.str(jv.at(params, &.{ "targetInfo", "type" })) orelse return;
+            const session = jv.str(jv.get(params, "sessionId")) orelse return;
+            // harness's own page (attached twice: by harness, and as one
+            // that was there when new ones began to be watched)
+            if (!std.mem.eql(u8, kind, "page") or std.mem.eql(u8, target, b.main_target)) return;
+            const x: Tab = .{ .session = b.gpa.dupe(u8, session) catch return, .target = b.gpa.dupe(u8, target) catch return };
+            b.tabs.append(b.gpa, x) catch x.free(b.gpa);
+            return;
+        }
+        const session = (if (m[0] == 'F') jv.str(jv.get(v, "sessionId")) else jv.str(jv.get(params, "sessionId"))) orelse return;
+        const x = for (b.tabs.items) |*x| {
+            if (std.mem.eql(u8, x.session, session)) break x;
+        } else return;
+        if (m[0] == 'F') {
+            const request = jv.str(jv.get(params, "requestId")) orelse return;
+            if (x.state != .running) return;
+            if (x.url.len == 0) x.url = b.gpa.dupe(u8, util.cut(jv.str(jv.at(params, &.{ "request", "url" })) orelse "", 2000)) catch return;
+            x.request = b.gpa.dupe(u8, request) catch return;
+            x.state = .blocked;
+        } else x.state = .closing;
+    }
+
+    /// The new tabs a page opened since the last call: closed or being
+    /// closed, or let go without a request yet (the caller closes those).
+    /// Ones still paused stay for the reader. Free with `freeTabs`.
+    pub fn takeTabs(b: *Inbox, io: Io, gpa: Allocator) ![]Tab {
+        b.mutex.lockUncancelable(io);
+        defer b.mutex.unlock(io);
+        var out: std.ArrayList(Tab) = .empty;
+        errdefer out.deinit(gpa);
+        var i: usize = 0;
+        while (i < b.tabs.items.len) {
+            if (b.tabs.items[i].state == .new) {
+                i += 1;
+                continue;
+            }
+            try out.append(gpa, b.tabs.items[i]);
+            _ = b.tabs.orderedRemove(i);
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    pub fn freeTabs(b: *Inbox, gpa: Allocator, list: []Tab) void {
+        for (list) |x| x.free(b.gpa);
+        gpa.free(list);
     }
 
     /// The dialogs seen since the last call; the caller frees with freeDialogs.
@@ -294,8 +373,16 @@ pub const Session = struct {
             if (Io.Clock.awake.now(s.io).nanoseconds >= until) return error.NoPage;
             s.io.sleep(.fromMilliseconds(50), .awake) catch {};
         };
+        {
+            const copy = try s.gpa.dupe(u8, target);
+            s.inbox.mutex.lockUncancelable(s.io);
+            defer s.inbox.mutex.unlock(s.io);
+            s.inbox.main_target = copy;
+        }
         // no page may save a file: downloads are refused, and said
         _ = try s.callIn(a, "Browser.setDownloadBehavior", "{\"behavior\":\"deny\",\"eventsEnabled\":true}", null);
+        // every tab or window a page opens is seen, paused at its start
+        _ = try s.callIn(a, "Target.setAutoAttach", "{\"autoAttach\":true,\"waitForDebuggerOnStart\":true,\"flatten\":true,\"filter\":[{\"type\":\"page\"}]}", null);
         var p: std.ArrayList(u8) = .empty;
         try p.appendSlice(a, "{\"targetId\":");
         try util.jsonString(&p, a, target);
@@ -326,6 +413,7 @@ pub const Session = struct {
             if (got == 0) break;
             s.inbox.feed(s.io, buf[0..got]);
             s.answerDialogs();
+            s.handleTabs();
         }
         s.inbox.closed.store(true, .release);
     }
@@ -353,6 +441,52 @@ pub const Session = struct {
             defer s.write_mutex.unlock(s.io);
             if (s.to_chrome) |f| f.writeStreamingAll(s.io, msg.items) catch {};
         }
+    }
+
+    /// New tabs: a paused one goes on with its requests held back (so the
+    /// page that opened it isn't held up), one whose first request came is
+    /// closed without it. From the reader thread, without waiting.
+    fn handleTabs(s: *Session) void {
+        s.inbox.mutex.lockUncancelable(s.io);
+        defer s.inbox.mutex.unlock(s.io);
+        for (s.inbox.tabs.items) |*x| switch (x.state) {
+            .new => {
+                s.sendOwn("Fetch.enable", "{\"patterns\":[{\"urlPattern\":\"*\"}]}", x.session);
+                s.sendOwn("Runtime.runIfWaitingForDebugger", "{}", x.session);
+                x.state = .running;
+            },
+            .blocked => {
+                var p: std.ArrayList(u8) = .empty;
+                defer p.deinit(s.gpa);
+                p.appendSlice(s.gpa, "{\"requestId\":") catch continue;
+                util.jsonString(&p, s.gpa, x.request) catch continue;
+                p.appendSlice(s.gpa, ",\"errorReason\":\"BlockedByClient\"}") catch continue;
+                s.sendOwn("Fetch.failRequest", p.items, x.session);
+                p.clearRetainingCapacity();
+                p.appendSlice(s.gpa, "{\"targetId\":") catch continue;
+                util.jsonString(&p, s.gpa, x.target) catch continue;
+                p.append(s.gpa, '}') catch continue;
+                s.sendOwn("Target.closeTarget", p.items, null);
+                x.state = .closing;
+            },
+            .running, .closing => {},
+        };
+    }
+
+    /// A command of the reader's own (its reply is dropped).
+    fn sendOwn(s: *Session, method: []const u8, params_json: []const u8, sid: ?[]const u8) void {
+        var msg: std.ArrayList(u8) = .empty;
+        defer msg.deinit(s.gpa);
+        s.own_id +%= 1;
+        msg.print(s.gpa, "{{\"id\":{d},\"method\":\"{s}\",\"params\":{s}", .{ own_ids + (s.own_id & 0x3fff_ffff), method, params_json }) catch return;
+        if (sid) |x| {
+            msg.appendSlice(s.gpa, ",\"sessionId\":") catch return;
+            util.jsonString(&msg, s.gpa, x) catch return;
+        }
+        msg.appendSlice(s.gpa, "}\x00") catch return;
+        s.write_mutex.lockUncancelable(s.io);
+        defer s.write_mutex.unlock(s.io);
+        if (s.to_chrome) |f| f.writeStreamingAll(s.io, msg.items) catch {};
     }
 
     fn killGroup(s: *Session) void {
