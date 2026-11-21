@@ -40,8 +40,9 @@ const usage =
     \\  health                     exit 0 if `harness run` is running and recent
     \\  version | help
     \\
-    \\The data folder is --home, else HARNESS_HOME, else ~/.local/share/harness
-    \\(%LOCALAPPDATA%\harness on Windows). Secrets go to the macOS Keychain,
+    \\The data folder is --home (anywhere on the line), else HARNESS_HOME, else
+    \\~/.local/share/harness (%LOCALAPPDATA%\harness on Windows). Arguments a
+    \\command does not take are refused. Secrets go to the macOS Keychain,
     \\the Windows Credential Manager, or (Linux, or HARNESS_STORE=DIR) files
     \\readable only by you.
     \\
@@ -161,17 +162,18 @@ pub fn main(init: std.process.Init) u8 {
     const arena = init.arena.allocator();
     const raw = init.minimal.args.toSlice(arena) catch return @intFromEnum(Exit.failed);
     var app: App = .{ .gpa = gpa, .arena = arena, .io = init.io, .env = init.environ_map };
-    var args: []const []const u8 = raw[1..];
-    var home: ?[]const u8 = null;
-    if (args.len >= 2 and eql(args[0], "--home")) {
-        home = args[1];
-        args = args[2..];
-    }
-    app.home = home orelse app.defaultHome() catch {
+    const cli = parseCli(arena, raw[1..]) catch |e| switch (e) {
+        error.Usage => {
+            complain("--home takes one folder: harness --home DIR COMMAND (or after the command)", .{});
+            return @intFromEnum(Exit.usage);
+        },
+        error.OutOfMemory => return @intFromEnum(Exit.failed),
+    };
+    app.home = cli.home orelse app.defaultHome() catch {
         complain("no home folder found; pass --home DIR", .{});
         return @intFromEnum(Exit.failed);
     };
-    const code = dispatch(&app, args) catch |e| switch (e) {
+    const code = dispatch(&app, cli.args) catch |e| switch (e) {
         error.Reported => Exit.failed,
         else => blk: {
             complain("{s}", .{@errorName(e)});
@@ -182,6 +184,10 @@ pub fn main(init: std.process.Init) u8 {
 }
 
 fn dispatch(app: *App, args: []const []const u8) !Exit {
+    if (badArgs(args)) |line| {
+        complain("{s}", .{line});
+        return .usage;
+    }
     if (args.len == 0 or eql(args[0], "help") or eql(args[0], "--help") or eql(args[0], "-h")) {
         try outAll(app.io, usage);
         return if (args.len == 0) .usage else .ok;
@@ -222,19 +228,22 @@ fn initCmd(app: *App) !Exit {
     return .ok;
 }
 
+/// a-z, 0-9, - and _, starting with a letter or digit (so an option like
+/// `--stdin` is never taken for a name).
 fn validName(n: []const u8) bool {
     if (n.len == 0 or n.len > 64) return false;
+    if (!(std.ascii.isLower(n[0]) or std.ascii.isDigit(n[0]))) return false;
     for (n) |ch| if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-' or ch == '_')) return false;
     return true;
 }
 
 fn secretCmd(app: *App, args: []const []const u8) !Exit {
-    if (args.len == 0) {
-        complain("usage: harness secret add|rm|list NAME", .{});
+    const sa = secretArgs(args) orelse {
+        complain(secret_usage, .{});
         return .usage;
-    }
+    };
     const s = app.store();
-    if (eql(args[0], "list")) {
+    if (sa.op == .list) {
         const cfg = try app.settings();
         for ([_][2][]const u8{ .{ "model key", cfg.model.key }, .{ "bot token", cfg.chat.token }, .{ "search key", cfg.search.key } }) |pair| {
             const v = s.get(app.io, app.arena, pair[1]) catch null;
@@ -250,12 +259,12 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         } else |_| {}
         return .ok;
     }
-    if (args.len < 2 or !validName(args[1])) {
-        complain("secret names use a-z, 0-9, - and _", .{});
+    if (!validName(sa.name)) {
+        complain("secret names use a-z, 0-9, - and _, start with a letter or digit, and have at most 64 characters", .{});
         return .usage;
     }
-    const name = args[1];
-    if (eql(args[0], "rm")) {
+    const name = sa.name;
+    if (sa.op == .rm) {
         const gone = s.remove(app.io, name) catch {
             complain("could not remove {s}", .{name});
             return .failed;
@@ -263,11 +272,7 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         try outPrint(app.io, "{s}\n", .{if (gone) "Removed." else "Nothing stored under that name."});
         return .ok;
     }
-    if (!eql(args[0], "add")) {
-        complain("usage: harness secret add|rm|list NAME", .{});
-        return .usage;
-    }
-    const from_stdin = args.len > 2 and eql(args[2], "--stdin");
+    const from_stdin = sa.stdin;
     const stdin = Io.File.stdin();
     const tty = stdin.isTty(app.io) catch false;
     if (!tty and !from_stdin) {
@@ -814,8 +819,185 @@ const Echo = struct {
     }
 };
 
+/// The command line without the global options. `--home DIR` (or
+/// `--home=DIR`) counts wherever it is, so `harness init --home X` and
+/// `harness login rm NAME --home X` act on X.
+const Cli = struct { home: ?[]const u8 = null, args: []const []const u8 };
+
+fn parseCli(a: std.mem.Allocator, raw: []const []const u8) error{ Usage, OutOfMemory }!Cli {
+    var out: std.ArrayList([]const u8) = .empty;
+    var home: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        const arg = raw[i];
+        const value = if (eql(arg, "--home")) blk: {
+            i += 1;
+            if (i >= raw.len) return error.Usage;
+            break :blk raw[i];
+        } else if (std.mem.startsWith(u8, arg, "--home=")) arg["--home=".len..] else {
+            try out.append(a, arg);
+            continue;
+        };
+        // a folder, not the next option; and one only
+        if (value.len == 0 or value[0] == '-' or home != null) return error.Usage;
+        home = value;
+    }
+    return .{ .home = home, .args = out.items };
+}
+
+const secret_usage = "usage: harness secret add NAME [--stdin] | secret rm NAME | secret list";
+const login_usage = "usage: harness login add NAME --site HOST [--username U] [--stdin] | login list | login rm NAME";
+
+const SecretArgs = struct {
+    op: enum { add, rm, list },
+    name: []const u8 = "",
+    stdin: bool = false,
+};
+
+/// `secret add NAME [--stdin]` (the option before or after the name),
+/// `secret rm NAME`, `secret list`; null for anything else.
+fn secretArgs(rest: []const []const u8) ?SecretArgs {
+    if (rest.len == 0) return null;
+    var out: SecretArgs = .{ .op = std.meta.stringToEnum(@FieldType(SecretArgs, "op"), rest[0]) orelse return null };
+    var names: usize = 0;
+    for (rest[1..]) |arg| {
+        if (eql(arg, "--stdin") and out.op == .add and !out.stdin) {
+            out.stdin = true;
+            continue;
+        }
+        // an option it does not take; no name starts with "-"
+        if (arg.len > 0 and arg[0] == '-') return null;
+        names += 1;
+        out.name = arg;
+    }
+    return switch (out.op) {
+        .list => if (names == 0) out else null,
+        .add, .rm => if (names == 1) out else null,
+    };
+}
+
+/// The usage line when a command's arguments are wrong, else null: extra
+/// or unknown arguments are refused, never ignored.
+fn badArgs(args: []const []const u8) ?[]const u8 {
+    if (args.len == 0) return null;
+    const cmd = args[0];
+    const rest = args[1..];
+    inline for (.{ "help", "--help", "-h", "version", "init", "pair", "run", "chat", "health" }) |c| {
+        if (eql(cmd, c)) return if (rest.len == 0) null else "usage: harness " ++ c ++ " (it takes no arguments)";
+    }
+    if (eql(cmd, "brief")) return if (rest.len <= 1) null else "usage: harness brief [NAME]";
+    if (eql(cmd, "task")) return if (rest.len == 2 and eql(rest[0], "run")) null else "usage: harness task run NAME";
+    if (eql(cmd, "memory")) {
+        if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "list"))) return null;
+        if (rest.len == 2) for ([_][]const u8{ "pin", "unpin", "forget" }) |op| if (eql(rest[0], op)) return null;
+        return "usage: harness memory [list|pin|unpin|forget ID]";
+    }
+    if (eql(cmd, "log")) {
+        if (rest.len == 1 and eql(rest[0], "verify")) return null;
+        if (rest.len >= 1 and eql(rest[0], "tail")) {
+            if (rest.len == 1) return null;
+            if (rest.len == 2 and (std.fmt.parseInt(usize, rest[1], 10) catch null) != null) return null;
+        }
+        return "usage: harness log verify | harness log tail [N]";
+    }
+    if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
+    if (eql(cmd, "login")) {
+        if (rest.len == 0) return login_usage;
+        if (eql(rest[0], "list") and rest.len != 1) return login_usage;
+        if (eql(rest[0], "rm") and rest.len != 2) return login_usage;
+        // an option is never a login's name (`login add --stdin x` is no login "--stdin")
+        if (rest.len >= 2 and rest[1].len > 0 and rest[1][0] == '-') return login_usage;
+        // `login add` checks its own options
+        return null;
+    }
+    return null;
+}
+
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+const t = std.testing;
+
+test "global_options_count_anywhere_on_the_line" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c1 = try parseCli(a, &.{ "init", "--home", "/x" });
+    try t.expectEqualStrings("/x", c1.home.?);
+    try t.expectEqual(1, c1.args.len);
+    try t.expectEqualStrings("init", c1.args[0]);
+    const c2 = try parseCli(a, &.{ "login", "rm", "victim", "--home", "other" });
+    try t.expectEqualStrings("other", c2.home.?);
+    try t.expectEqual(3, c2.args.len);
+    try t.expectEqualStrings("victim", c2.args[2]);
+    const c3 = try parseCli(a, &.{ "--home=/y", "run" });
+    try t.expectEqualStrings("/y", c3.home.?);
+    try t.expectEqualStrings("run", c3.args[0]);
+    const c4 = try parseCli(a, &.{ "--home", "/z", "chat" });
+    try t.expectEqualStrings("/z", c4.home.?);
+    try t.expectEqual(1, c4.args.len);
+    try t.expectEqual(null, (try parseCli(a, &.{"health"})).home);
+    // no folder, or two
+    try t.expectError(error.Usage, parseCli(a, &.{ "run", "--home" }));
+    try t.expectError(error.Usage, parseCli(a, &.{ "run", "--home", "--stdin" }));
+    try t.expectError(error.Usage, parseCli(a, &.{ "--home", "a", "run", "--home", "b" }));
+    try t.expectError(error.Usage, parseCli(a, &.{ "run", "--home=" }));
+}
+
+test "extra_or_unknown_arguments_are_refused" {
+    const bad = [_][]const []const u8{
+        &.{ "init", "x" },              &.{ "run", "x" },               &.{ "chat", "now" },
+        &.{ "pair", "x" },              &.{ "health", "x" },            &.{ "version", "x" },
+        &.{ "help", "x" },              &.{ "brief", "a", "b" },        &.{ "task", "run" },
+        &.{ "task", "run", "a", "b" },  &.{ "task", "go", "a" },        &.{ "memory", "list", "x" },
+        &.{ "memory", "pin" },          &.{ "memory", "drop", "m" },    &.{ "log" },
+        &.{ "log", "verify", "x" },     &.{ "log", "tail", "x" },       &.{ "log", "tail", "5", "6" },
+        &.{ "secret" },                 &.{ "secret", "list", "x" },    &.{ "secret", "rm" },
+        &.{ "secret", "rm", "a", "b" }, &.{ "secret", "add", "a", "b" }, &.{ "secret", "add", "a", "--x" },
+        &.{ "secret", "rm", "a", "--stdin" }, &.{ "secret", "add", "--stdin" }, &.{ "login", "list", "x" },
+        &.{ "login", "rm", "a", "b" },  &.{ "login", "rm", "-x" },      &.{ "login", "add", "--stdin", "x", "--site", "a.org" },
+    };
+    for (bad) |line| if (badArgs(line) == null) {
+        printLine("accepted:", line);
+        return error.TestUnexpectedResult;
+    };
+    const good = [_][]const []const u8{
+        &.{"init"},                     &.{"run"},                       &.{"brief"},
+        &.{ "brief", "morning" },       &.{ "task", "run", "x" },        &.{"memory"},
+        &.{ "memory", "list" },         &.{ "memory", "forget", "m-1" }, &.{ "log", "verify" },
+        &.{ "log", "tail" },            &.{ "log", "tail", "5" },        &.{ "secret", "list" },
+        &.{ "secret", "add", "a" },     &.{ "secret", "add", "a", "--stdin" }, &.{ "secret", "add", "--stdin", "a" },
+        &.{ "secret", "rm", "a" },      &.{ "login", "list" },           &.{ "login", "rm", "a" },
+        &.{ "login", "add", "a", "--site", "x.org" }, &.{"help"},         &.{"version"},
+        &.{"nonsense"}, // unknown commands are refused by dispatch
+    };
+    for (good) |line| if (badArgs(line)) |why| {
+        printLine("refused:", line);
+        std.debug.print("  {s}\n", .{why});
+        return error.TestUnexpectedResult;
+    };
+}
+
+test "names_start_with_a_letter_or_digit" {
+    try t.expect(validName("omnigate"));
+    try t.expect(validName("login-bot-password"));
+    try t.expect(validName("2fa_seed"));
+    try t.expect(!validName("--stdin"));
+    try t.expect(!validName("-x"));
+    try t.expect(!validName("_x"));
+    try t.expect(!validName(""));
+    try t.expect(!validName("Upper"));
+    // `secret add --stdin foo` stores foo
+    const sa = secretArgs(&.{ "add", "--stdin", "foo" }).?;
+    try t.expectEqualStrings("foo", sa.name);
+    try t.expect(sa.stdin);
+}
+
+fn printLine(what: []const u8, line: []const []const u8) void {
+    std.debug.print("{s}", .{what});
+    for (line) |w| std.debug.print(" {s}", .{w});
+    std.debug.print("\n", .{});
 }
 
 fn outAll(io: Io, s: []const u8) !void {
