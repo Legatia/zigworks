@@ -106,16 +106,18 @@ pub fn collect(r: *agent.Run, arena: std.mem.Allocator, b: config.Brief, seen: *
         var links_here: std.StringHashMapUnmanaged(void) = .empty;
         for (topic.feeds) |url| {
             if (r.env.stop.load(.acquire)) break;
-            const entries = fetchFeed(r, arena, url) catch |e| {
-                try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: {s}", .{ url, @errorName(e) }));
+            var why: []const u8 = "";
+            const entries = fetchFeed(r, arena, url, &why) catch |e| {
+                try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: {s}", .{ url, if (why.len > 0) why else @errorName(e) }));
                 continue;
             };
             for (entries) |en| try found.add(arena, &new, &links_here, seen, en);
         }
         for (topic.searches) |q| {
             if (r.env.stop.load(.acquire)) break;
-            const entries = searchEntries(r, arena, q) catch |e| {
-                try notes.append(arena, try std.fmt.allocPrint(arena, "search \"{s}\": {s}", .{ q, @errorName(e) }));
+            var why: []const u8 = "";
+            const entries = searchEntries(r, arena, q, &why) catch |e| {
+                try notes.append(arena, try std.fmt.allocPrint(arena, "search \"{s}\": {s}", .{ q, if (why.len > 0) why else @errorName(e) }));
                 continue;
             };
             for (entries) |en| try found.add(arena, &new, &links_here, seen, en);
@@ -144,7 +146,27 @@ const Found = struct {
     }
 };
 
-fn fetchFeed(r: *agent.Run, arena: std.mem.Allocator, url: []const u8) ![]const feeds.Entry {
+/// A listed feed's (or search's) redirect passes the gate as a fetch of
+/// its own: on a host the request already reached only a deny rule stops
+/// it, since the listing covers that host; to another host it needs an
+/// allow rule or a grant, as nobody can be asked.
+fn feedHop(ctx: *anyopaque, arena: std.mem.Allocator, url: []const u8, known_host: bool) ?[]const u8 {
+    const r: *agent.Run = @ptrCast(@alignCast(ctx));
+    if (r.env.stop.load(.acquire)) return "stopped by the owner";
+    const d = blk: {
+        r.lock.lockUncancelable(r.io);
+        defer r.lock.unlock(r.io);
+        break :blk r.gate.decide(arena, .fetch, url, util.nowSeconds(r.io), .{ .scheduled = !known_host });
+    };
+    const allowed = d.action == .allow or (known_host and d.action == .ask);
+    const why = if (allowed and d.action == .ask) "a redirect on a host the request reached" else d.why;
+    r.log.write(.gate, false, .{ .run = r.label, .tool = "fetch", .decision = if (allowed) "allow" else "deny", .why = why, .arg = url }) catch {};
+    return if (allowed) null else d.why;
+}
+
+/// The feed's entries; on failure `why` says what happened, when more can
+/// be said than the error's name.
+fn fetchFeed(r: *agent.Run, arena: std.mem.Allocator, url: []const u8, why: *[]const u8) ![]const feeds.Entry {
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
@@ -152,13 +174,20 @@ fn fetchFeed(r: *agent.Run, arena: std.mem.Allocator, url: []const u8) ![]const 
     };
     try r.log.write(.gate, false, .{ .run = r.label, .tool = "fetch", .decision = @tagName(d.action), .why = d.why, .arg = url });
     if (d.action != .allow) return error.Refused;
-    const g = try tools.get(r.gpa, r.io, arena, url, &.{}, feed_max);
-    if (g.status != 200) return error.NotFound;
+    const g = try tools.get(r.gpa, r.io, arena, url, &.{}, feed_max, .{ .ctx = r, .allow = feedHop });
+    if (g.stopped) |st| {
+        why.* = try std.fmt.allocPrint(arena, "the redirect to {s} was not followed: {s}", .{ st.to, st.why });
+        return error.Redirected;
+    }
+    if (g.status != 200) {
+        why.* = try std.fmt.allocPrint(arena, "status {d}", .{g.status});
+        return error.NotFound;
+    }
     if (g.truncated) return error.FeedTooLarge;
     return feeds.parse(arena, g.body);
 }
 
-fn searchEntries(r: *agent.Run, arena: std.mem.Allocator, q: []const u8) ![]const feeds.Entry {
+fn searchEntries(r: *agent.Run, arena: std.mem.Allocator, q: []const u8, why: *[]const u8) ![]const feeds.Entry {
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
@@ -175,8 +204,15 @@ fn searchEntries(r: *agent.Run, arena: std.mem.Allocator, q: []const u8) ![]cons
     const g = try tools.get(r.gpa, r.io, arena, url.items, &.{
         .{ .name = "X-Subscription-Token", .value = key },
         .{ .name = "Accept", .value = "application/json" },
-    }, feed_max);
-    if (g.status != 200) return error.SearchFailed;
+    }, feed_max, .{ .ctx = r, .allow = feedHop });
+    if (g.stopped) |st| {
+        why.* = try std.fmt.allocPrint(arena, "the redirect to {s} was not followed: {s}", .{ st.to, st.why });
+        return error.Redirected;
+    }
+    if (g.status != 200) {
+        why.* = try std.fmt.allocPrint(arena, "status {d}", .{g.status});
+        return error.SearchFailed;
+    }
     const v = jv.parse(arena, g.body) orelse return error.SearchFailed;
     var out: std.ArrayList(feeds.Entry) = .empty;
     for (jv.arr(jv.at(v, &.{ "web", "results" })) orelse &.{}) |res| {
@@ -419,7 +455,27 @@ test "failed_feed_becomes_note" {
     const w = try compose(&f.run, a, b, try collect(&f.run, a, b, &f.seen));
     try t.expect(std.mem.startsWith(u8, w.text, "Nothing new on: Zig."));
     try t.expect(std.mem.indexOf(u8, w.text, "Could not read") != null);
-    try t.expect(std.mem.indexOf(u8, w.text, "NotFound") != null);
+    try t.expect(std.mem.indexOf(u8, w.text, "missing.xml: status 404") != null);
+}
+
+test "a_feed_that_moved_is_followed_on_its_host_and_not_beyond" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.feed("new.xml", &.{"https://z.org/moved"});
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/old.xml.redirect", .data = "301 /page/new.xml" });
+    const away = try std.fmt.allocPrint(a, "http://localhost:{d}/page/new.xml", .{f.e.server.port});
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/away.xml.redirect", .data = try std.fmt.allocPrint(a, "302 {s}", .{away}) });
+    try f.e.script(1, model.textReply("Zig: moved (https://z.org/moved)"));
+    const b = try f.brief(&.{ "old.xml", "away.xml" });
+    const w = try compose(&f.run, a, b, try collect(&f.run, a, b, &f.seen));
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "https://z.org/moved") != null);
+    try t.expect(std.mem.indexOf(u8, w.text, try std.fmt.allocPrint(a, "away.xml: the redirect to {s} was not followed: ", .{away})) != null);
+    // with a rule for that host it is followed too
+    f.g.rules = try rules.parse(a, "allow fetch http://localhost:*\n");
+    const c2 = try collect(&f.run, a, b, &f.seen);
+    try t.expectEqual(0, c2.topics[0].notes.len);
 }
 
 test "budget_spent_still_sends_the_items" {

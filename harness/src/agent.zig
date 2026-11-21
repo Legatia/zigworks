@@ -696,14 +696,39 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
         .fetch, .browse => blk: {
             const key = try std.fmt.allocPrint(a, "{s} {s}", .{ name, input_json });
             if (r.cache) |c| if (c.get(r.io, a, key)) |hit| break :blk tools.Output{ .text = hit };
-            const out = try tools.run(r.env, a, tool, input_json);
+            const out = try tools.run(redirectEnv(r), a, tool, input_json);
             if (r.cache) |c| if (!out.is_error) c.put(r.io, key, out.text);
             break :blk out;
         },
-        else => try tools.run(r.env, a, tool, input_json),
+        else => try tools.run(redirectEnv(r), a, tool, input_json),
     };
     try r.log.write(.tool, r.private, .{ .run = r.label, .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text });
     return out;
+}
+
+/// The run's tool environment, with its gate for redirects.
+fn redirectEnv(r: *Run) tools.Env {
+    var env = r.env;
+    env.redirect = .{ .ctx = r, .allow = redirectAllow };
+    return env;
+}
+
+/// A redirect of `fetch` or `search` passes the gate as a fetch of its
+/// own: on a host the call already reached only a deny rule stops it (the
+/// call was allowed for that host); another host is decided, and asked,
+/// like any fetch.
+fn redirectAllow(ctx: *anyopaque, a: std.mem.Allocator, url: []const u8, known_host: bool) ?[]const u8 {
+    const r: *Run = @ptrCast(@alignCast(ctx));
+    if (r.env.stop.load(.acquire)) return "stopped by the owner";
+    if (!known_host) return decideAndAsk(r, a, .fetch, "fetch", url, r.now()) catch "the gate could not decide";
+    const d = blk: {
+        r.lock.lockUncancelable(r.io);
+        defer r.lock.unlock(r.io);
+        break :blk r.gate.decide(a, .fetch, url, r.now(), .{});
+    };
+    const refused = d.action == .deny;
+    r.log.write(.gate, r.private, .{ .run = r.label, .tool = "fetch", .decision = if (refused) "deny" else "allow", .why = if (refused) d.why else "a redirect on a host this call reached", .arg = url }) catch {};
+    return if (refused) d.why else null;
 }
 
 // ---- tests ----
@@ -1259,6 +1284,25 @@ test "owner_mention_raises_item_agent_text_does_not" {
     const r2 = try f.say("ok");
     freeResult(&f.run, r2);
     try t.expectEqual(2, it.mentions.items.len);
+}
+
+test "a_redirect_to_another_host_is_asked_like_a_fetch" {
+    var f: Fix = undefined;
+    try f.init("allow fetch http://127.0.0.1:*\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/far.html", .data = "<p>Far away</p>" });
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/a.redirect", .data = try std.fmt.allocPrint(a, "302 http://localhost:{d}/page/far.html", .{f.e.server.port}) });
+    try f.e.script(1, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"fetch\",\"input\":{{\"url\":\"http://127.0.0.1:{d}/page/a\"}}}}],\"stop_reason\":\"tool_use\"}}", .{f.e.server.port}));
+    try f.e.script(2, model.textReply("Could not follow it."));
+    f.answer = .deny;
+    const r = try f.say("read it");
+    defer freeResult(&f.run, r);
+    // the address asked for is allowed by the rule; the redirect's host is asked
+    try t.expectEqual(1, f.asked);
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "was not followed: denied by the owner") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "Far away") == null);
 }
 
 test "empty_answer_is_not_kept" {

@@ -7,7 +7,10 @@
 //!   request is saved as `requests/001.json`, … with its headers.
 //! - search: `GET /res/v1/web/search?q=…` answers `search.json`.
 //! - pages and feeds: `GET /page/NAME` answers the file `pages/NAME`
-//!   (POST too; `?delay_ms=N` answers after N ms).
+//!   (POST too; `?delay_ms=N` answers after N ms), or, when there is a
+//!   file `pages/NAME.redirect` holding "STATUS LOCATION", that redirect.
+//!   Each page request is appended to `page-requests.jsonl` with its
+//!   headers.
 //! - Telegram: see `telegram` below.
 const std = @import("std");
 const sock = @import("sock.zig");
@@ -150,6 +153,26 @@ pub const Server = struct {
         }
         if ((method == .GET or method == .POST) and std.mem.startsWith(u8, route, "/page/")) {
             const name = route["/page/".len..];
+            {
+                // every page request, with its headers
+                s.mutex.lockUncancelable(s.io);
+                defer s.mutex.unlock(s.io);
+                const lp = try s.path(a, &.{"page-requests.jsonl"});
+                var f = try Io.Dir.cwd().createFile(s.io, lp, .{ .truncate = false });
+                defer f.close(s.io);
+                const len = try f.length(s.io);
+                const line = try std.fmt.allocPrint(a, "{{\"target\":{f},\"headers\":{{{s}\"\":\"\"}}}}\n", .{ std.json.fmt(target, .{}), headers.items });
+                try f.writePositionalAll(s.io, line, len);
+            }
+            // `pages/NAME.redirect` holds "STATUS LOCATION"
+            if (name.len > 0 and std.mem.indexOf(u8, name, "..") == null) {
+                if (s.readScript(a, &.{ "pages", try std.fmt.allocPrint(a, "{s}.redirect", .{name}) })) |r| {
+                    const line = std.mem.trim(u8, r, " \r\n\t");
+                    const sp = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+                    const st = std.fmt.parseInt(u10, line[0..sp], 10) catch 302;
+                    return req.respond("", .{ .status = @fromBackingInt(st), .extra_headers = &.{.{ .name = "location", .value = std.mem.trim(u8, line[sp..], " ") }} });
+                }
+            }
             // `?delay_ms=N`: a slow page
             if (std.mem.indexOf(u8, target, "delay_ms=")) |at| {
                 const digits = target[at + "delay_ms=".len ..];
