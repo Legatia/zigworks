@@ -547,12 +547,15 @@ const TgChan = struct {
         return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear };
     }
 
-    fn send(ctx: *anyopaque, text: []const u8) void {
+    fn send(ctx: *anyopaque, text: []const u8) anyerror!void {
         const tc: *TgChan = @ptrCast(@alignCast(ctx));
-        const chat = tc.core.owner orelse return;
+        const chat = tc.core.owner orelse return error.NotPaired;
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
-        tc.send_bot.send(chat, text) catch |e| complain("telegram: sending failed: {s}", .{@errorName(e)});
+        tc.send_bot.send(chat, text) catch |e| {
+            complain("telegram: sending failed: {s}", .{@errorName(e)});
+            return e;
+        };
     }
 
     fn buttons(ctx: *anyopaque, text: []const u8, bs: []const [2][]const u8) ?i64 {
@@ -656,11 +659,11 @@ const TermChan = struct {
         return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear };
     }
 
-    fn send(ctx: *anyopaque, text: []const u8) void {
+    fn send(ctx: *anyopaque, text: []const u8) anyerror!void {
         const tc: *TermChan = @ptrCast(@alignCast(ctx));
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
-        outPrint(tc.io, "{s}\n", .{text}) catch {};
+        try outPrint(tc.io, "{s}\n", .{text});
     }
 
     fn buttons(ctx: *anyopaque, text: []const u8, bs: []const [2][]const u8) ?i64 {
@@ -986,6 +989,25 @@ test "a_telegram_bot_keeps_its_server_after_reload" {
     try t.expectEqualStrings("127.0.0.1", bot.http.target.host);
     try bot.send(42, "after the reload");
     try t.expect(std.mem.indexOf(u8, try telegram.outbox(&e), "after the reload") != null);
+}
+
+test "telegram_send_before_pairing_is_an_error" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const c = try Core.open(t.allocator, t.io, try testHome(&e), .{ .telegram = "123:abc" });
+    var tc: TgChan = undefined;
+    tc.init(t.allocator, t.io, c, c.cfg.chat.api, "123:abc") catch |err| {
+        c.close();
+        return err;
+    };
+    defer {
+        c.close();
+        tc.deinit();
+    }
+    const ch = tc.channel();
+    try t.expectError(error.NotPaired, ch.send(ch.ctx, "hello, anyone?"));
+    try t.expectEqual(0, std.mem.count(u8, try telegram.outbox(&e), "hello, anyone?"));
 }
 
 test "telegram_bots_follow_a_changed_api_after_reload" {

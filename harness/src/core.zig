@@ -111,7 +111,9 @@ pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
 
 pub const Channel = struct {
     ctx: *anyopaque,
-    send: *const fn (ctx: *anyopaque, text: []const u8) void,
+    /// Sends `text` to the owner; an error when it did not get there
+    /// (error.NotPaired: there is no owner to send it to yet).
+    send: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,
     /// Returns an id for `clear`, or null when buttons can't be shown.
     buttons: *const fn (ctx: *anyopaque, text: []const u8, buttons: []const [2][]const u8) ?i64,
     clear: *const fn (ctx: *anyopaque, id: i64) void,
@@ -218,6 +220,9 @@ pub const Core = struct {
     ran: std.StringHashMapUnmanaged(i64) = .empty,
     running: std.StringHashMapUnmanaged(void) = .empty,
     paused: std.StringHashMapUnmanaged(void) = .empty,
+    /// Briefs and tasks whose message did not get through, by the same
+    /// keys as `ran`: when they run again.
+    retry: std.StringHashMapUnmanaged(Retry) = .empty,
     last_status_s: i64 = 0,
 
     /// Tests set this to fix the clock.
@@ -315,6 +320,7 @@ pub const Core = struct {
         c.ran = .empty;
         c.running = .empty;
         c.paused = .empty;
+        c.retry = .empty;
         c.last_status_s = 0;
         c.fixed_now = null;
         c.memory_quiet_s = 30 * 60;
@@ -356,6 +362,7 @@ pub const Core = struct {
         freeKeys(c.gpa, &c.ran);
         freeKeys(c.gpa, &c.running);
         freeKeys(c.gpa, &c.paused);
+        freeKeys(c.gpa, &c.retry);
         releaseLock(c.io, c.paths);
         c.settings_arena.deinit();
         c.paths_arena.deinit();
@@ -534,7 +541,17 @@ pub const Core = struct {
     // ---- talking to the owner ----
 
     pub fn say(c: *Core, text: []const u8) void {
-        if (c.chan) |ch| ch.send(ch.ctx, text);
+        c.deliver(text) catch {};
+    }
+
+    /// Sends `text` to the owner; an error (logged) when it did not get
+    /// there. error.NoChannel: nothing to send it through.
+    pub fn deliver(c: *Core, text: []const u8) !void {
+        const ch = c.chan orelse return error.NoChannel;
+        ch.send(ch.ctx, text) catch |e| {
+            c.log.write(.chat, false, .{ .event = "not delivered", .why = whyUndelivered(e), .bytes = text.len }) catch {};
+            return e;
+        };
     }
 
     pub fn attach(c: *Core, ch: Channel) void {
@@ -973,6 +990,7 @@ pub const Core = struct {
             if (minutes < b.at_minutes) continue;
             const key = keyFor("brief", b.name);
             if ((c.getRan(key.slice()) orelse -1) >= today) continue;
+            if (c.retryLater(key.slice(), now_s)) continue;
             c.startBackground(.{ .brief = b }, key.slice());
         }
         const weekday = util.weekday(today);
@@ -987,8 +1005,18 @@ pub const Core = struct {
                 if (minutes < at) continue;
                 if (last) |l| if (c.localDay(l) >= today) continue;
             }
+            if (c.retryLater(key.slice(), now_s)) continue;
             c.startBackground(.{ .task = tk }, key.slice());
         }
+    }
+
+    /// Whether `key`'s last message did not get through and it waits
+    /// before it runs again.
+    fn retryLater(c: *Core, key: []const u8, now_s: i64) bool {
+        c.state_mutex.lockUncancelable(c.io);
+        defer c.state_mutex.unlock(c.io);
+        const r = c.retry.get(key) orelse return false;
+        return now_s < r.at;
     }
 
     const Key = struct {
@@ -1047,13 +1075,21 @@ pub const Core = struct {
         }
         // a run that failed or was stopped still counts for its slot, so
         // the scheduler does not start it again right away
-        _ = switch (job) {
-            .brief => |b| c.runBrief(b) catch false,
-            .task => |tk| c.runTask(tk) catch false,
+        const outcome: Outcome = switch (job) {
+            .brief => |b| c.runBrief(b) catch .done,
+            .task => |tk| c.runTask(tk) catch .done,
         };
         const now_s = c.now();
         c.state_mutex.lockUncancelable(c.io);
         defer c.state_mutex.unlock(c.io);
+        if (outcome == .undelivered) {
+            // not counted as run: again in 5 minutes, then 10, 20, … 2 hours
+            const tries: u32 = if (c.retry.get(key)) |r| r.tries + 1 else 1;
+            const wait = @min(@as(i64, 5 * 60) << @intCast(@min(tries - 1, 8)), 2 * 3600);
+            putKey(c.gpa, &c.retry, key, Retry{ .at = now_s + wait, .tries = tries }) catch {};
+            return;
+        }
+        removeKey(c.gpa, &c.retry, key);
         const v: i64 = switch (job) {
             .brief => c.localDay(now_s),
             .task => now_s,
@@ -1062,8 +1098,17 @@ pub const Core = struct {
         c.saveRan();
     }
 
-    /// Collects, writes and sends a brief; returns whether it was delivered.
-    pub fn runBrief(c: *Core, b: config.Brief) !bool {
+    /// How a brief or task run ended, for the scheduler.
+    pub const Outcome = enum {
+        /// Done, failed or stopped: it waits for its next time.
+        done,
+        /// Its message did not get through: it runs again a little later.
+        undelivered,
+    };
+
+    /// Collects, writes and sends a brief. Its items count as seen only
+    /// once it got through.
+    pub fn runBrief(c: *Core, b: config.Brief) !Outcome {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1082,22 +1127,24 @@ pub const Core = struct {
         };
         defer snap.deinit();
         const collected = try brief.collect(&run, a, b, &snap);
-        if (flag.load(.acquire)) return false;
+        if (flag.load(.acquire)) return .done;
         const w = try brief.compose(&run, a, b, collected);
-        if (flag.load(.acquire)) return false;
-        if (c.chan == null) return false;
-        c.say(w.text);
+        if (flag.load(.acquire)) return .done;
+        c.deliver(w.text) catch |e| {
+            try c.log.write(.brief, false, .{ .name = b.name, .event = "not delivered", .why = whyUndelivered(e) });
+            return if (worthRetry(e)) .undelivered else .done;
+        };
         c.seen_mutex.lockUncancelable(c.io);
         defer c.seen_mutex.unlock(c.io);
         const now_s = c.now();
         for (w.links) |l| try c.seen.add(l, now_s);
         c.seen.prune(now_s);
         c.seen.save(c.io, c.paths.seen) catch {};
-        return true;
+        return .done;
     }
 
-    /// Runs a scheduled task once; returns whether it finished.
-    pub fn runTask(c: *Core, tk: config.Task) !bool {
+    /// Runs a scheduled task once.
+    pub fn runTask(c: *Core, tk: config.Task) !Outcome {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1114,7 +1161,7 @@ pub const Core = struct {
         try c.log.write(.task, false, .{ .name = tk.name, .event = "start" });
         const res = try agent.turn(&run, &conv, tk.do, false);
         defer agent.freeResult(&run, res);
-        if (res.stopped) return false;
+        if (res.stopped) return .done;
         if (res.ended_by) |why| if (std.mem.eql(u8, why, "Model budget used up.")) {
             {
                 c.state_mutex.lockUncancelable(c.io);
@@ -1124,13 +1171,19 @@ pub const Core = struct {
             }
             try c.log.write(.task, false, .{ .name = tk.name, .event = "paused", .why = why });
             c.say(try std.fmt.allocPrint(a, "Task {s} is paused: model budget used up. Send /task resume {s} to start it again.", .{ tk.name, tk.name }));
-            return true;
+            return .done;
         };
         const answer = std.mem.trim(u8, res.text, " \t\r\n.");
-        const silent = std.mem.eql(u8, answer, "NOTHING");
-        try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = !silent });
-        if (!silent) c.say(try std.fmt.allocPrint(a, "[{s}] {s}", .{ tk.name, res.text }));
-        return true;
+        if (std.mem.eql(u8, answer, "NOTHING")) {
+            try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = "the answer was NOTHING" });
+            return .done;
+        }
+        c.deliver(try std.fmt.allocPrint(a, "[{s}] {s}", .{ tk.name, res.text })) catch |e| {
+            try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = whyUndelivered(e) });
+            return if (worthRetry(e)) .undelivered else .done;
+        };
+        try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = true });
+        return .done;
     }
 
     // ---- commands ----
@@ -1460,6 +1513,24 @@ pub fn removeSection(a: std.mem.Allocator, text: []const u8, name: []const u8) !
     return out.items;
 }
 
+/// When a brief or task whose message did not get through runs again.
+const Retry = struct { at: i64, tries: u32 };
+
+/// Why a message did not get to the owner, in words for the log.
+fn whyUndelivered(e: anyerror) []const u8 {
+    return switch (e) {
+        error.NotPaired => "not paired yet",
+        error.NoChannel => "nothing to send it through",
+        else => @errorName(e),
+    };
+}
+
+/// Whether a message that did not get through is worth sending again
+/// later: not while there is nobody to send it to.
+fn worthRetry(e: anyerror) bool {
+    return e != error.NotPaired and e != error.NoChannel;
+}
+
 fn putKey(gpa: std.mem.Allocator, map: anytype, key: []const u8, v: anytype) !void {
     if (map.getPtr(key)) |p| {
         p.* = v;
@@ -1560,6 +1631,8 @@ const Recorder = struct {
     mutex: Io.Mutex = .init,
     lines: std.ArrayList([]u8) = .empty,
     next_id: i64 = 0,
+    /// While set, sends fail with it and nothing is recorded.
+    fail: ?anyerror = null,
 
     fn deinit(r: *Recorder) void {
         for (r.lines.items) |l| t.allocator.free(l);
@@ -1570,11 +1643,18 @@ const Recorder = struct {
         return .{ .ctx = r, .send = send, .buttons = buttons, .clear = clear };
     }
 
-    fn send(ctx: *anyopaque, text: []const u8) void {
+    fn setFail(r: *Recorder, e: ?anyerror) void {
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        r.fail = e;
+    }
+
+    fn send(ctx: *anyopaque, text: []const u8) anyerror!void {
         const r: *Recorder = @ptrCast(@alignCast(ctx));
         r.mutex.lockUncancelable(t.io);
         defer r.mutex.unlock(t.io);
-        r.lines.append(t.allocator, t.allocator.dupe(u8, text) catch return) catch {};
+        if (r.fail) |e| return e;
+        try r.lines.append(t.allocator, try t.allocator.dupe(u8, text));
     }
 
     fn buttons(ctx: *anyopaque, text: []const u8, bs: []const [2][]const u8) ?i64 {
@@ -1892,6 +1972,64 @@ fn waitFile(e: *model.TestEnv, name: []const u8) !void {
         t.io.sleep(.fromMilliseconds(20), .awake) catch {};
     }
     return error.TestTimedOut;
+}
+
+/// Waits until no brief or task runs.
+fn waitIdle(c: *Core) void {
+    var waited: u32 = 0;
+    while (c.bg_active.load(.acquire) > 0 and waited < 8000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+}
+
+fn logText(f: *Fix) ![]u8 {
+    return Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, f.e.arena.allocator(), .unlimited);
+}
+
+/// A brief due at midnight (so due whenever the test runs) on one feed.
+fn dueBrief(f: *Fix, items: []const u8) !void {
+    const a = f.e.arena.allocator();
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/z.xml", .data = try std.fmt.allocPrint(a, "<rss><channel>{s}</channel></rss>", .{items}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.briefs, .data = try std.fmt.allocPrint(a, "[morning]\nat = 00:00\ntopic = Zig | {s}/page/z.xml\n", .{try f.e.url()}) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+}
+
+test "an_undelivered_brief_is_not_marked_seen_and_is_tried_later" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try dueBrief(&f, "<item><title>New thing</title><link>https://z.org/1</link></item>");
+    try f.e.script(1, model.textReply("Zig: New thing (https://z.org/1)"));
+    f.rec.setFail(error.ConnectionClosed);
+    f.core.tick();
+    waitIdle(f.core);
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expect(!f.core.seen.has("https://z.org/1"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"not delivered\"") != null);
+    // not again at once
+    f.core.tick();
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    waitIdle(f.core);
+    try t.expectEqual(1, f.e.server.modelRequests());
+    // a while later it runs again, and this time it arrives
+    f.rec.setFail(null);
+    try f.e.script(2, model.textReply("Zig: New thing, again (https://z.org/1)"));
+    f.core.fixed_now = util.nowSeconds(t.io) + 15 * 60;
+    f.core.tick();
+    try f.rec.waitFor("New thing, again");
+    waitIdle(f.core);
+    try t.expect(f.core.seen.has("https://z.org/1"));
+}
+
+test "a_task_answer_that_did_not_arrive_is_logged_as_not_sent" {
+    var f: Fix = undefined;
+    try f.init("", "", "[check]\nevery = 5m\ndo = Check the price.\n");
+    defer f.deinit();
+    f.rec.setFail(error.NotPaired);
+    try f.e.script(1, model.textReply("Price moved 4%."));
+    f.core.tick();
+    waitIdle(f.core);
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"done\",\"sent\":false,\"why\":\"not paired yet\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "\"sent\":true") == null);
 }
 
 test "stop_holds_through_a_slow_model_call" {

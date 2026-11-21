@@ -24,6 +24,8 @@ pub const Server = struct {
     active: std.atomic.Value(u32) = .init(0),
     model_n: std.atomic.Value(u32) = .init(0),
     tg_n: std.atomic.Value(u32) = .init(0),
+    /// Telegram calls answered with `telegram/fail.json`'s error so far.
+    tg_failed: std.atomic.Value(i64) = .init(0),
     mutex: Io.Mutex = .init,
     open: std.ArrayList(sock.Handle) = .empty,
 
@@ -200,7 +202,10 @@ pub const Server = struct {
     /// Telegram Bot API: `getUpdates` hands out the files in
     /// `telegram/in/` in name order (each one update object, the update_id
     /// is assigned here), at most one batch per call; sent messages and
-    /// other calls are appended to `telegram/out.jsonl`.
+    /// other calls are appended to `telegram/out.jsonl`. With
+    /// `telegram/fail.json` (`{"status":429,"retry_after":1,"count":N}`)
+    /// the first N other calls of the server's life answer that error
+    /// instead, and are not recorded.
     fn telegram(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, route: []const u8, body: []const u8) !void {
         const slash = std.mem.indexOfScalarPos(u8, route, 1, '/') orelse return json(req, .not_found, "{\"ok\":false}");
         const method = route[slash + 1 ..];
@@ -217,6 +222,19 @@ pub const Server = struct {
                 }
                 s.io.sleep(.fromMilliseconds(50), .awake) catch {};
                 waited += 50;
+            }
+        }
+        if (s.readScript(a, &.{ "telegram", "fail.json" })) |script| {
+            const v = jv.parse(a, script);
+            const count = jv.int(jv.get(v, "count")) orelse 1;
+            if (s.tg_failed.fetchAdd(1, .acq_rel) < count) {
+                const st = jv.int(jv.get(v, "status")) orelse 500;
+                const status: std.http.Status = @fromBackingInt(@as(u10, @intCast(st)));
+                const out = if (jv.int(jv.get(v, "retry_after"))) |r|
+                    try std.fmt.allocPrint(a, "{{\"ok\":false,\"error_code\":{d},\"description\":\"Too Many Requests: retry after {d}\",\"parameters\":{{\"retry_after\":{d}}}}}", .{ st, r, r })
+                else
+                    try std.fmt.allocPrint(a, "{{\"ok\":false,\"error_code\":{d},\"description\":\"scripted\"}}", .{st});
+                return json(req, status, out);
             }
         }
         // record everything else
