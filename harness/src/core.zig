@@ -1162,6 +1162,9 @@ pub const Core = struct {
         defer c.unregister(&flag);
         var run = c.baseRun(&client, label, true, &flag);
         run.extra_instructions = try std.fmt.allocPrint(a, "This is the scheduled task \"{s}\". If there is nothing worth telling the owner this time, answer exactly NOTHING.", .{tk.name});
+        var skipped: agent.Skipped = .init(c.gpa);
+        defer skipped.deinit();
+        run.skipped = &skipped;
         var conv: agent.Conversation = .init(c.gpa);
         defer conv.deinit();
         try c.log.write(.task, false, .{ .name = tk.name, .event = "start" });
@@ -1180,11 +1183,18 @@ pub const Core = struct {
             return .done;
         };
         const answer = std.mem.trim(u8, res.text, " \t\r\n.");
-        if (std.mem.eql(u8, answer, "NOTHING")) {
+        const silent = std.mem.eql(u8, answer, "NOTHING");
+        // what it could not do without the owner is said even then
+        const note = try skipped.text(c.io, a);
+        if (silent and note.len == 0) {
             try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = "the answer was NOTHING" });
             return .done;
         }
-        c.deliver(try std.fmt.allocPrint(a, "[{s}] {s}", .{ tk.name, res.text })) catch |e| {
+        const msg = if (silent)
+            try std.fmt.allocPrint(a, "[{s}] {s}", .{ tk.name, note })
+        else
+            try std.fmt.allocPrint(a, "[{s}] {s}{s}{s}", .{ tk.name, res.text, if (note.len > 0) "\n\n" else "", note });
+        c.deliver(msg) catch |e| {
             try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = whyUndelivered(e) });
             return if (worthRetry(e)) .undelivered else .done;
         };
@@ -2063,6 +2073,23 @@ test "brief_command_says_when_it_could_not_start" {
     try f.rec.waitFor("Zig: New thing");
     waitIdle(f.core);
     try t.expectEqual(1, f.rec.count("Collecting."));
+}
+
+test "a_scheduled_run_says_what_it_skipped_even_when_it_answers_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "[disk]\nevery = 5m\ndo = Check the disk.\n");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"df -h\"}"));
+    try f.e.script(2, model.textReply("NOTHING"));
+    f.core.tick();
+    try f.rec.waitFor("[disk] Skipped (needs approval): shell: df -h");
+    waitIdle(f.core);
+    // with an answer, the note goes after it
+    try f.e.script(3, model.toolReply("tu_2", "fetch", "{\"url\":\"https://example.com/status\"}"));
+    try f.e.script(4, model.textReply("Disk is fine."));
+    f.core.fixed_now = util.nowSeconds(t.io) + 301;
+    f.core.tick();
+    try f.rec.waitFor("[disk] Disk is fine.\n\nSkipped (needs approval): fetch: https://example.com/status");
 }
 
 test "a_run_that_ends_after_midnight_counts_for_the_day_it_was_due" {

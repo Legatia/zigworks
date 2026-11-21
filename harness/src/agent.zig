@@ -182,6 +182,9 @@ pub const Run = struct {
     profiles_dir: []const u8 = "",
     /// The browser session of the running turn.
     web: ?*web_mod.Web = null,
+    /// Where calls refused only because nobody could approve them are
+    /// noted (a scheduled run says what it skipped); helpers share it.
+    skipped: ?*Skipped = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -743,6 +746,7 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
         defer r.lock.unlock(r.io);
         break :blk r.gate.decide(a, tool, arg, now_s, .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled });
     };
+    noteSkipped(r, a, tool, name, arg, now_s, d);
     var action = d.action;
     var why = d.why;
     if (action == .ask) {
@@ -784,6 +788,71 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
     }
     try r.log.write(.gate, r.private, .{ .run = r.label, .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
     return if (action == .allow) null else why;
+}
+
+/// What a run left out because nobody could approve it; shared by the
+/// run and its helpers.
+pub const Skipped = struct {
+    gpa: std.mem.Allocator,
+    mutex: Io.Mutex = .init,
+    items: std.ArrayList([]u8) = .empty,
+    /// Calls past the first `max`, only counted.
+    more: usize = 0,
+    const max = 8;
+
+    pub fn init(gpa: std.mem.Allocator) Skipped {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(s: *Skipped) void {
+        for (s.items.items) |x| s.gpa.free(x);
+        s.items.deinit(s.gpa);
+    }
+
+    fn add(s: *Skipped, io: Io, name: []const u8, arg: []const u8) void {
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        const short = util.cut(arg, 100);
+        const line = std.fmt.allocPrint(s.gpa, "{s}: {s}{s}", .{ name, short, if (short.len < arg.len) "…" else "" }) catch return;
+        for (s.items.items) |x| if (std.mem.eql(u8, x, line)) {
+            s.gpa.free(line);
+            return;
+        };
+        if (s.items.items.len >= max) {
+            s.gpa.free(line);
+            s.more += 1;
+            return;
+        }
+        s.items.append(s.gpa, line) catch s.gpa.free(line);
+    }
+
+    /// "Skipped (needs approval): shell: df -h; …", or "" if nothing was.
+    pub fn text(s: *Skipped, io: Io, arena: std.mem.Allocator) ![]const u8 {
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        if (s.items.items.len == 0) return "";
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(arena, "Skipped (needs approval): ");
+        for (s.items.items, 0..) |x, i| try out.print(arena, "{s}{s}", .{ if (i > 0) "; " else "", x });
+        if (s.more > 0) try out.print(arena, "; and {d} more", .{s.more});
+        return out.items;
+    }
+};
+
+/// Notes a call refused only because nobody could approve it: the gate
+/// said ask with no one to ask, or turned ask into deny in a scheduled run.
+fn noteSkipped(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, now_s: i64, d: gate.Decision) void {
+    const s = r.skipped orelse return;
+    const unattended = switch (d.action) {
+        .ask => r.asker == null,
+        .deny => r.scheduled and blk: {
+            r.lock.lockUncancelable(r.io);
+            defer r.lock.unlock(r.io);
+            break :blk r.gate.decide(a, tool, arg, now_s, .{}).action == .ask;
+        },
+        .allow => false,
+    };
+    if (unattended) s.add(r.io, name, arg);
 }
 
 fn webAllow(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) ?[]const u8 {
