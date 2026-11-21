@@ -23,10 +23,14 @@ pub const Tool = enum {
     mcp,
     /// An MCP tool listed as moving money: asked every time, never granted.
     money,
+    /// The interactive browser; the argument is the page's host.
+    web,
+    /// A login's values or passkeys used in the browser: "NAME HOST".
+    login,
 
     pub fn default(tool: Tool) rules.Action {
         return switch (tool) {
-            .shell, .fetch, .browse, .skill_save, .mcp, .money => .ask,
+            .shell, .fetch, .browse, .skill_save, .mcp, .money, .web, .login => .ask,
             else => .allow,
         };
     }
@@ -153,6 +157,7 @@ pub const Gate = struct {
             .read_file, .write_file => {
                 _ = confine(arena, g.io, g.workspace, arg) catch return .{ .action = .deny, .why = "outside the workspace" };
             },
+            .web => if (arg.len == 0 or std.mem.indexOfAny(u8, arg, " /\\?#@") != null) return .{ .action = .deny, .why = "not a host name" },
             else => {},
         }
         if (ctx.brief_source) return .{ .action = .allow, .why = "listed in briefs.ini" };
@@ -342,6 +347,27 @@ test "new_tool_kinds_have_their_defaults" {
     try t.expectEqual(.ask, f.act(.skill_save, "weekly-report", .{}));
     try t.expectEqual(.ask, f.act(.mcp, "github/list_issues {}", .{}));
     try t.expectEqual(.ask, f.act(.money, "broker/place_order {}", .{}));
+}
+
+test "web_and_login_ask_by_default_and_grants_cover_host_and_login" {
+    var f: Fixture = undefined;
+    try f.init("allow web docs.example.com\n");
+    defer f.deinit();
+    try t.expectEqual(.ask, f.act(.web, "github.com", .{}));
+    try t.expectEqual(.allow, f.act(.web, "docs.example.com", .{}));
+    try t.expectEqual(.deny, f.act(.web, "", .{}));
+    try t.expectEqual(.deny, f.act(.web, "github.com/x", .{}));
+    try t.expectEqual(.ask, f.act(.login, "github-bot github.com", .{}));
+    try t.expectEqual(.deny, f.act(.login, "github-bot github.com", .{ .scheduled = true }));
+    try t.expectEqual(.deny, f.act(.web, "github.com", .{ .scheduled = true }));
+    try t.expectEqualStrings("github.com", grantKey(.web, "github.com"));
+    try t.expectEqualStrings("github-bot github.com", grantKey(.login, "github-bot github.com"));
+    try f.grants.add(.login, "github-bot github.com", 5000);
+    try t.expectEqual(.allow, f.act(.login, "github-bot github.com", .{}));
+    try t.expectEqual(.ask, f.act(.login, "github-bot gist.github.com", .{}));
+    try t.expectEqual(.ask, f.act(.login, "other github.com", .{}));
+    try f.grants.add(.web, "github.com", 5000);
+    try t.expectEqual(.allow, f.act(.web, "GitHub.com", .{}));
 }
 
 test "mcp_grant_covers_the_tool_with_any_input" {

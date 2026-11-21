@@ -257,9 +257,29 @@ pub const Session = struct {
     /// Runs `expr` in the page and returns its value as JSON; an exception
     /// is error.Script.
     pub fn evaluate(s: *Session, arena: Allocator, expr: []const u8) ![]const u8 {
+        return s.evaluateIn(arena, expr, null);
+    }
+
+    /// Like evaluate, but in a fresh isolated world of the top document:
+    /// the page's own scripts can't see it or change the globals it uses
+    /// (prototypes, `location`); the DOM is shared.
+    pub fn evaluateIsolated(s: *Session, arena: Allocator, expr: []const u8) ![]const u8 {
+        const tree = try s.call(arena, "Page.getFrameTree", "{}");
+        const fid = jv.str(jv.at(tree, &.{ "frameTree", "frame", "id" })) orelse return error.NoPage;
+        var p: std.ArrayList(u8) = .empty;
+        try p.appendSlice(arena, "{\"frameId\":");
+        try util.jsonString(&p, arena, fid);
+        try p.appendSlice(arena, ",\"worldName\":\"harness\"}");
+        const w = try s.call(arena, "Page.createIsolatedWorld", p.items);
+        const ctx = jv.int(jv.get(w, "executionContextId")) orelse return error.NoPage;
+        return s.evaluateIn(arena, expr, ctx);
+    }
+
+    fn evaluateIn(s: *Session, arena: Allocator, expr: []const u8, context: ?i64) ![]const u8 {
         var p: std.ArrayList(u8) = .empty;
         try p.appendSlice(arena, "{\"expression\":");
         try util.jsonString(&p, arena, expr);
+        if (context) |c| try p.print(arena, ",\"contextId\":{d}", .{c});
         try p.appendSlice(arena, ",\"returnByValue\":true,\"awaitPromise\":true}");
         const res = try s.call(arena, "Runtime.evaluate", p.items);
         if (jv.get(res, "exceptionDetails")) |ex| {
@@ -327,8 +347,14 @@ pub const Session = struct {
                 defer arena_state.deinit();
                 const saved = s.timeout_ms;
                 s.timeout_ms = 1000;
-                _ = s.callIn(arena_state.allocator(), "Browser.close", "{}", null) catch {};
+                const asked = if (s.callIn(arena_state.allocator(), "Browser.close", "{}", null)) |_| true else |_| false;
                 s.timeout_ms = saved;
+                // a moment to write its cookies to the profile; the pipe
+                // closes when it has ended
+                if (asked) {
+                    const until = deadline(s.io, 3000);
+                    while (!s.inbox.closed.load(.acquire) and Io.Clock.awake.now(s.io).nanoseconds < until) s.io.sleep(.fromMilliseconds(20), .awake) catch {};
+                }
             }
             s.closed = true;
             s.killGroup();
@@ -405,6 +431,9 @@ test "chrome_over_a_pipe_evaluates_and_closes_without_leftovers" {
     const s = try Session.open(t.allocator, t.io, browser, profile, &stop, 20_000);
     const pid = s.pid;
     try t.expectEqualStrings("2", try s.evaluate(a, "1+1"));
+    // the page's globals don't reach an isolated world
+    _ = try s.evaluate(a, "String.prototype.endsWith = () => true; window.mine = 1");
+    try t.expectEqualStrings("[false,\"undefined\"]", try s.evaluateIsolated(a, "['abc'.endsWith('x'), typeof window.mine]"));
     try t.expectEqualStrings("\"ab\"", try s.evaluate(a, "Promise.resolve('a' + 'b')"));
     try t.expectError(error.Script, s.evaluate(a, "no_such_name.x"));
     try t.expectError(error.Cdp, s.call(a, "No.suchMethod", "{}"));

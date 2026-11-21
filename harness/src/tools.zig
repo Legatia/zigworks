@@ -66,7 +66,7 @@ pub fn mainArg(arena: std.mem.Allocator, tool: gate.Tool, input_json: []const u8
         .remember => "text",
         .skill, .skill_save => "name",
         // the agent builds these arguments itself
-        .delegate, .mcp, .money => return error.NotHere,
+        .delegate, .mcp, .money, .web, .login => return error.NotHere,
     };
     return jv.str(jv.get(v, key)) orelse error.BadInput;
 }
@@ -104,7 +104,7 @@ fn runRaw(env: Env, arena: std.mem.Allocator, tool: gate.Tool, input_json: []con
         .fetch => fetch(env, arena, arg, startOf(arena, input_json)),
         .browse => browse(env, arena, arg, startOf(arena, input_json)),
         .search => search(env, arena, arg),
-        .recall, .remember, .delegate, .skill, .skill_save, .mcp, .money => error.NotHere,
+        .recall, .remember, .delegate, .skill, .skill_save, .mcp, .money, .web, .login => error.NotHere,
     };
 }
 
