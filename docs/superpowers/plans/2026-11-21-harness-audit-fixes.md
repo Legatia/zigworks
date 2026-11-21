@@ -281,3 +281,15 @@ granted host.
 ## Fix ledger
 
 (entries: `ID: fixed — test RED→GREEN — commit`, or `ID: Ruling: … — why — cost`)
+
+### G1 fix/gate (65238ac..37ea9bc, 15 commits) — suite 233/235 (2 skipped), smoke ok, cross builds ok
+- C2 fixed 1c48386 (rules see whole MCP input and every delegate task; question never cut: parts ≤4096 B with buttons on the last; >12 KB refused).
+- C3 write_file part fixed a4059eb (dot-path writes ask; question shows the content).
+- I4 fixed a36756c (mask, then cut/page; a tail that could start a secret is dropped when cut).
+- I5/I28 fixed be975ef (confined, normalized path; symlinks followed; case ignored on macOS/Windows; deny also on the pre-symlink path).
+- I6 first half fixed 9188d55 (U+FFFD at the tool boundary; util.jsonString always valid UTF-8).
+- I7 Ruling c14894e: approval numbers continue across restarts (state/approvals) instead of nonce+message_id, because smoke.sh answers with fixed `a1:day`/message 1. FOLLOW-UP after merge: smoke reads callback data and message_id from the outbox; then add the nonce and the message-id check.
+- I25 fixed d2214d0. K5 fixed 46f19b9 (switches are atomics; money question says whether dry run is on). K6 fixed 2f65664, 37ea9bc.
+- Minors fixed: grants exact except hosts ab1d391 (Ruling: paths case-insensitive on macOS/Windows); deny before brief sources 4931230; split() 65238ac; terminal shows only offered answers ca6a064; Ctrl-D denies and leaves e3ec7a5.
+- Merge points: agent.zig callMcp/turn/compact (G2), `Asker.ask(ctx, Question{text, allow_day, deadline_s})`, Run.switches; core.zig `switches: agent.Switches` replaces dry_run/private/auto_recall (R's Core.open, D's private code must use c.switches.private.load(.acquire)).
+- Flaky once under load: web_profiles_keep_no_saved_passwords ("no page is open"); passed alone and on rerun — watch after merge.
