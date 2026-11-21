@@ -95,6 +95,9 @@ printf '111:telegram-smoke-token\n' | "$H" secret add telegram --stdin 2>/dev/nu
 printf 'brave-smoke-key-1\n' | "$H" secret add search --stdin 2>/dev/null
 check "secrets stored" '[ "$("$H" secret list | grep -c ": stored")" = 3 ]'
 check "a short secret is refused" '! printf "short\n" | "$H" secret add x --stdin 2>/dev/null'
+printf 'spare-value-123\n' | "$H" secret add spare --stdin 2>/dev/null
+check "a secret is removed" '[ -e "$HARNESS_STORE/spare" ] && "$H" secret rm spare >"$T/rm.out" && grep -qxF "Removed." "$T/rm.out" && [ ! -e "$HARNESS_STORE/spare" ] && "$H" secret rm spare | grep -qxF "Nothing stored under that name."'
+check "a value piped without --stdin is refused" '! printf "piped-value-123\n" | "$H" secret add piped 2>"$T/piped.err" && grep -qF -- "--stdin" "$T/piped.err" && [ ! -e "$HARNESS_STORE/piped" ]'
 printf 'smoke-login-pass-1\n\n' | "$H" login add bot --site localhost --username agent-bot --stdin 2>/dev/null
 check "a login is added and listed" '"$H" login list | grep -qF "bot: localhost, username agent-bot, password yes, TOTP no, passkeys 0"'
 printf 'leftover-pass-1\n' | "$H" secret add login-zed-password --stdin 2>/dev/null
