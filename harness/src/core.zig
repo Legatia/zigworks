@@ -1648,7 +1648,9 @@ pub const Core = struct {
             defer c.inbox.mutex.unlock(c.io);
             const it = c.inbox.find(p.id) orelse break :blk .out_of_date;
             if (!std.mem.eql(u8, p.token, &it.token)) break :blk .out_of_date;
-            if (it.status != .open or it.settling) break :blk .{ .already = inbox_mod.already(a, it, c.cfg.chat.utc_offset) catch "It is closed." };
+            if (it.status != .open) break :blk .{ .already = inbox_mod.already(a, it, c.cfg.chat.utc_offset) catch "It is closed." };
+            // an answer is being acted on (a grant written, a post sent)
+            if (it.settling) break :blk .ignore;
             if (!it.offers(p.key)) break :blk .ignore;
             for (it.shown.items) |s| if (s.chat == chat and s.message == message_id) break :blk .take;
             if (it.showing and p.key.len <= 16) {
@@ -1733,6 +1735,11 @@ pub const Core = struct {
                 it.settling = true;
             };
         }
+        // the owner's words hold no stored secret either
+        const said: ?[]const u8 = if (words) |w| c.masks.scrubAlloc(a, w) catch {
+            c.unsettle(id);
+            return .not_offered;
+        } else null;
         if (post) |p| if (std.mem.eql(u8, key, "again")) {
             // sent again now: it closes only once it got through
             c.deliverIn(p.conversation, p.text) catch |e| {
@@ -1757,9 +1764,7 @@ pub const Core = struct {
             c.say(std.fmt.allocPrint(a, "Item {d}: the grant could not be written ({s}); nothing changed.", .{ id, @errorName(e) }) catch "The grant could not be written; nothing changed.");
             return .not_offered;
         };
-        // the owner's words hold no stored secret either
-        const said: ?[]const u8 = if (words) |w| c.masks.scrubAlloc(a, w) catch return .not_offered else null;
-        c.unsettle(id);
+        // closing it ends `settling`: no other answer slips in before
         if (!c.settle(id, .answered, .{ .key = key, .text = said, .at = c.now(), .via = via })) return .closed;
         return .taken;
     }
@@ -3084,13 +3089,14 @@ pub const Core = struct {
             c.checkSettingsChanged();
         }
         if (c.stop.load(.acquire)) return;
+        // items past their time close; the daily reminder (both may wait on
+        // the network: outside the settings lock)
+        c.expireDue(now_s);
+        c.remindDue(now_s);
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
         // posts that did not get through go again when their wait is over
         c.resendDue(now_s);
-        // items past their time close; the daily reminder
-        c.expireDue(now_s);
-        c.remindDue(now_s);
         const today = c.localDay(now_s);
         const minutes = c.localMinutes(now_s);
         for (c.briefs) |b| {
@@ -3355,7 +3361,7 @@ pub const Core = struct {
         };
         if (p.of.len > 0) c.log.write(kp.kind, false, .{ .name = kp.name, .event = "sent", .tries = p.tries + 1 }) catch {};
         c.markSeen(p.links) catch {};
-        c.unsettle(id);
+        // closing it ends `settling`: no "Send again" slips in before
         _ = c.settle(id, .done, .{ .at = c.now(), .via = .harness });
         if (p.of.len > 0) c.markRan(p.of, p.ran);
     }
