@@ -15,7 +15,7 @@ jobs:
         # macos-15: Zig 0.15.1 couldn't link against the macOS 26 SDK on macos-latest.
         # Not tried again with Zig 0.17.1.
         os: [ubuntu-latest, macos-15]
-        project: [trigrep, headterm, headsight, headsound, llmcheck, keygate, harness]
+        project: [trigrep, headterm, headsight, headsound, llmcheck, keygate, harness, homemcp, carcloud]
         include:
           # Windows: everything but headsight (headsound's file commands, for
           # GoldWave users; headterm on ConPTY)
@@ -28,6 +28,10 @@ jobs:
           - { os: windows-latest, project: llmcheck }
           - { os: windows-latest, project: keygate }
           - { os: windows-latest, project: harness }
+          - { os: windows-latest, project: homemcp }
+          - { os: windows-latest, project: carcloud }
+          # Linux only: SocketCAN
+          - { os: ubuntu-latest, project: canmcp }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -41,6 +45,12 @@ jobs:
       # headdesk's boxes need user namespaces, which Ubuntu's runners restrict
       - if: matrix.project == 'headdesk'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # homemcp's Zigbee2MQTT checks need a broker; they are skipped without one
+      - if: matrix.project == 'homemcp' && runner.os == 'Linux'
+        run: sudo apt-get install -y -qq --no-install-recommends mosquitto
+      # canmcp's bus checks need vcan0; they are skipped without it
+      - if: matrix.project == 'canmcp'
+        run: sudo modprobe vcan && sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0 || echo "no vcan on this runner"
       - run: zig build test --summary all
       # Optimized code with safety checks on: catches overflow that only shows
       # up after optimization (headsight's diff did, on Zig 0.15.1 and 0.17.1).
