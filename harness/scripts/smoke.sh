@@ -267,6 +267,26 @@ check "with /dryrun on an approved money call is not made" 'wait_for "$OUT" "dry
 say "/dryrun off"
 wait_for "$OUT" "Dry run is off: approved money calls are made."
 
+# folders.ini: notes written by the agent itself, not its helpers, and
+# snapshotted around the runs that change it
+printf '[notes]\nwrite = agent:main\nsnapshots = on\n' >"$HARNESS_HOME/folders.ini"
+chmod 600 "$HARNESS_HOME/folders.ini"
+say "/reload"
+check "folders.ini applies after /reload" 'wait_for "$OUT" "Settings reloaded."'
+reply "$(call_reply tu_f1 delegate '{"tasks":[{"task":"write the note","tools":["write_file"]}]}')"
+reply "$(call_reply tu_f2 write_file '{"path":"notes/h.md","content":"from the helper"}')"
+reply "$(text_reply 'the helper could not')"
+reply "$(call_reply tu_f3 write_file '{"path":"notes/a.md","content":"one"}')"
+reply "$(text_reply 'note written')"
+say "write a note"
+check "a delegated write in notes is refused with the reason" 'wait_for "$OUT" "note written" && result $((mn - 2)) tu_f2 "refused by the gate: folders.ini [notes] write: agent:helper is not listed" && [ -f "$HARNESS_HOME/workspace/notes/a.md" ] && [ ! -e "$HARNESS_HOME/workspace/notes/h.md" ]'
+say "/snapshots notes"
+check "the run's snapshots of notes are listed" 'wait_for "$OUT" "Snapshots of notes:" && grep -F "Snapshots of notes:" "$OUT" | tail -n 1 | grep -qF "before  chat (main, owner)" && grep -F "Snapshots of notes:" "$OUT" | tail -n 1 | grep -qF "after  chat (main, owner)"'
+say "/changes notes 2"
+check "changes says what the run added" 'wait_for "$OUT" "Since 1: added a.md."'
+say "/restore notes 1"
+check "restore puts notes back as before the run and says how to undo it" 'wait_for "$OUT" "Restored notes to 1: deleted a.md. /restore notes 3 undoes it." && [ ! -e "$HARNESS_HOME/workspace/notes/a.md" ]'
+
 # a secret the owner types reaches the log masked (and below: not at all in clear)
 reply "$(text_reply 'noted, not repeated')"
 say "my omnigate key is og-smoke-key-123"
@@ -291,6 +311,7 @@ check "a login is removed with its secrets" '"$H" login rm bot >/dev/null && "$H
 # it was skipped for is gone (HANDOFF-windows-audit.md, section 3)
 if [ $windows = 0 ]; then
 	check "memory list works offline" '"$H" memory list 2>/dev/null | grep -qF "I prefer short briefs"'
+	check "snapshot list works offline" '"$H" snapshot list notes 2>/dev/null | grep -qF "Snapshots of notes:"'
 fi
 
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
