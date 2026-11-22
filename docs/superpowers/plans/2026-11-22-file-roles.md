@@ -133,7 +133,7 @@
   - `folder_vars_reach_a_host_command_masked`: a dir store with `stripe-test` = `sk_test_51Hq3vY2eZvKYlo2C`; rules `allow shell *`; folders `[work]\nvars = STRIPE_KEY:stripe-test\n[work/x]\nvars = MISSING_KEY:nope`: `echo k=$STRIPE_KEY` (Windows `%STRIPE_KEY%`) with dir `work` → request has `k=[secret:stripe-test]`, no request or log line has the value; `echo k=$STRIPE_KEY.` without dir → `k=.`; dir `work/x` → `refused by the gate: folders.ini [work/x] vars: secret nope is not stored (harness secret add nope)`, not asked; `folderVars(&f.run, a, "box", "work")` is empty.
 - [ ] **Step 2:** run; expect failures (no dir in the schema, no vars).
 - [ ] **Step 3:** implement.
-- [ ] **Step 4:** whole suite green (+3).
+- [ ] **Step 4:** whole suite green (+4: the schema without folders is a test of its own, `without_folders_ini_shell_offers_no_dir`).
 - [ ] **Step 5:** commit `harness: shell starts in its dir; a folder's vars reach host commands, masked (gap 3)`.
 
 ### Task 5: the Written list names who wrote each file

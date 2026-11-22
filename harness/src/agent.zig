@@ -17,6 +17,7 @@ const logins_mod = @import("logins.zig");
 const store_mod = @import("store.zig");
 const masks_mod = @import("masks.zig");
 const who_mod = @import("who.zig");
+const folders_mod = @import("folders.zig");
 const Io = std.Io;
 
 /// `unsent`: the question did not get to the owner (a part or its buttons
@@ -307,6 +308,13 @@ const delegate_def: model.ToolDef = .{
     \\{"type":"object","properties":{"tasks":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"task":{"type":"string","description":"The whole task, standing alone."},"tools":{"type":"array","items":{"type":"string"},"description":"Tools the helper may use; default: search, fetch, browse, read_file, recall, skill."},"strong":{"type":"boolean","description":"Use the stronger, costlier model for this task."}},"required":["task"]}}},"required":["tasks"]}
     ,
 };
+/// shell where folders.ini has a section: it may start in a folder of the
+/// workspace, where `run` is checked and the folder's `vars` apply.
+const shell_dir_def: model.ToolDef = .{
+    .name = "shell",
+    .description = "Run a shell command in the workspace folder, or in `dir`, a folder inside it. Returns the exit code and output.",
+    .schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"dir\":{\"type\":\"string\",\"description\":\"a folder in the workspace to start in; default the workspace\"}},\"required\":[\"command\"]}",
+};
 const skill_defs = [_]model.ToolDef{
     .{ .name = "skill", .description = "Load one of your skills (saved instructions for a kind of task) by name; with `file`, read one of the skill's other files.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"file\":{\"type\":\"string\"}},\"required\":[\"name\"]}" },
     .{ .name = "skill_save", .description = "Save a skill: instructions for a kind of task you may meet again (steps, sources, pitfalls). Replaces a skill of the same name. The owner approves it.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"lowercase letters, digits and hyphens\"},\"description\":{\"type\":\"string\",\"description\":\"one line: when to use it\"},\"body\":{\"type\":\"string\"}},\"required\":[\"name\",\"description\",\"body\"]}" },
@@ -318,7 +326,8 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
     var out: std.ArrayList(model.ToolDef) = .empty;
     for (tools.defs()) |d| {
         const tool = gate.Tool.fromName(d.name).?;
-        if (r.allows(tool)) try out.append(arena, d);
+        if (!r.allows(tool)) continue;
+        try out.append(arena, if (tool == .shell and r.gate.folders != null) shell_dir_def else d);
     }
     if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
     if (r.allows(.delegate)) try out.append(arena, delegate_def);
@@ -999,6 +1008,26 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         else => tools.mainArg(a, tool, input_json) catch return .{ .text = "the tool's input is missing its main field", .is_error = true },
     };
     const now_s = r.now();
+    // where a command starts, as the model gave it
+    const dir: []const u8 = if (tool == .shell) jv.str(jv.get(jv.parse(a, input_json), "dir")) orelse "" else "";
+    // the variables folders.ini gives a command started there; one whose
+    // secret is not stored refuses the call before anyone is asked
+    var cmd_vars: CommandVars = .{};
+    if (tool == .shell) {
+        const rel: ?[]const u8 = if (dir.len == 0) "" else if (gate.confined(a, r.io, r.env.workspace, dir)) |cf| cf.rel else |_| null;
+        // (outside the workspace: the gate refuses it below)
+        if (rel) |d| {
+            // gap 2 passes the run's environment: no secret leaves the host
+            cmd_vars = try folderVars(r, a, "host", d);
+            if (cmd_vars.missing) |why| {
+                if (dir.len > 0)
+                    try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg, .dir = dir })
+                else
+                    try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+                return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            }
+        }
+    }
     var reserved: Reservation = .{};
     if (tool == .money) {
         if (moneyCheck(r, a, mt.?, input_json, now_s, &reserved)) |why| {
@@ -1021,13 +1050,18 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         },
         else => "",
     };
-    if (try decideAndAsk(r, a, tool, name, arg, detail, now_s)) |refused| {
+    if (try decideAndAskIn(r, a, tool, name, arg, detail, dir, now_s)) |refused| {
         if (tool == .money) releaseMoney(r, mt.?, reserved);
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{refused}), .is_error = true };
     }
     // a tool gets what is left of the turn, no more; fetch and search
     // send each redirect through the gate
     var env = redirectEnv(r);
+    if (cmd_vars.vars.len > 0) {
+        env.vars = cmd_vars.vars;
+        // masked in this command's output like any stored secret
+        env.secrets = try std.mem.concat(a, scrub.Secret, &.{ env.secrets, cmd_vars.secrets });
+    }
     if (r.deadline_s > 0) {
         // in milliseconds: in whole seconds a call cut a moment before the
         // deadline's second began would leave "1 s" that isn't there; with
@@ -1104,8 +1138,49 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         },
         else => try tools.run(env, a, tool, input_json),
     };
-    try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text });
+    if (dir.len > 0)
+        try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .dir = dir, .is_error = out.is_error, .output = out.text })
+    else
+        try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text });
     return out;
+}
+
+/// The variables of a command, with what to mask, or why it can't run.
+pub const CommandVars = struct {
+    vars: []const util.Var = &.{},
+    /// The values, as the stored secrets they are, for masking.
+    secrets: []const scrub.Secret = &.{},
+    /// A variable whose secret is not stored: the call is refused.
+    missing: ?[]const u8 = null,
+};
+
+/// The variables a command started in `dir` (inside the workspace, ""
+/// for the workspace) gets from folders.ini, with their values: none
+/// unless it runs on the host (`env`), since no secret crosses into a
+/// sandbox or to a remote.
+pub fn folderVars(r: *Run, a: std.mem.Allocator, env: []const u8, dir: []const u8) !CommandVars {
+    if (!std.mem.eql(u8, env, "host")) return .{};
+    const f = r.gate.folders orelse return .{};
+    const list = try folders_mod.varsFor(f.*, a, r.gate.realFolders(a, f), dir);
+    if (list.len == 0) return .{};
+    const vars = try a.alloc(util.Var, list.len);
+    const secrets = try a.alloc(scrub.Secret, list.len);
+    for (list, vars, secrets) |v, *o, *sec| {
+        const value = secretValue(r, a, v.secret) orelse return .{ .missing = try std.fmt.allocPrint(a, "folders.ini [{s}] vars: secret {s} is not stored (harness secret add {s})", .{ v.section, v.secret, v.secret }) };
+        o.* = .{ .name = v.name, .value = value };
+        sec.* = .{ .name = v.secret, .value = value };
+    }
+    return .{ .vars = vars, .secrets = secrets };
+}
+
+/// A stored secret's value: one read at start (they are all masked), else
+/// from the key store now, masked from then on in every run.
+fn secretValue(r: *Run, a: std.mem.Allocator, name: []const u8) ?[]const u8 {
+    for (r.env.secrets) |sec| if (std.mem.eql(u8, sec.name, name)) return sec.value;
+    const st = r.store orelse return null;
+    const v = (st.get(r.io, a, name) catch null) orelse return null;
+    if (r.masks) |m| m.add(name, v) catch return null;
+    return v;
 }
 
 /// The run's tool environment, with its gate for redirects and the turn's
@@ -1148,7 +1223,13 @@ pub const max_question = 12 * 1024;
 /// logged. Null when the call may run, else why not. `detail`: what the
 /// owner sees besides the argument (a file's content).
 fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, now_s: i64) !?[]const u8 {
-    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who };
+    return decideAndAskIn(r, a, tool, name, arg, detail, "", now_s);
+}
+
+/// `decideAndAsk` for a shell command that names where it starts (`dir`,
+/// as the model gave it): the question says where, and the lines carry it.
+fn decideAndAskIn(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, dir: []const u8, now_s: i64) !?[]const u8 {
+    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who, .dir = dir };
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
@@ -1180,7 +1261,8 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
         // a money call says whether it is made: the switch can change while asked
         const dry: []const u8 = if (tool != .money) "" else if (r.dryRun()) "\nDry run is on: this call is not made." else "\nDry run is off: this call is made.";
         const files: []const u8 = if (wrote) |wr| try std.fmt.allocPrint(a, "\nFiles the agent wrote in the workspace since you last allowed a command: {s}", .{wr.text}) else "";
-        const what = try std.fmt.allocPrint(a, "{s}{s}: {s}{s}{s}{s}{s}{s}", .{ who, name, d.subject, given, if (detail.len > 0) ", " else "", detail, dry, files });
+        const in_dir: []const u8 = if (d.dir.len > 0) try std.fmt.allocPrint(a, " (in {s})", .{d.dir}) else "";
+        const what = try std.fmt.allocPrint(a, "{s}{s}: {s}{s}{s}{s}{s}{s}{s}", .{ who, name, d.subject, in_dir, given, if (detail.len > 0) ", " else "", detail, dry, files });
         if (what.len > max_question) {
             why = try std.fmt.allocPrint(a, "too long to ask the owner ({d} bytes; a question is at most {d}): make the call smaller", .{ what.len, max_question });
             break :ask;
@@ -1224,7 +1306,10 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
         // the owner saw those files and allowed a command all the same
         if (action == .allow) if (wrote) |wr| r.written.?.clear(wr.upto);
     }
-    try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
+    if (dir.len > 0)
+        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = @tagName(action), .why = why, .arg = arg, .dir = dir })
+    else
+        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
     return if (action == .allow) null else why;
 }
 
@@ -3422,4 +3507,99 @@ test "web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log" {
     try t.expect(std.mem.indexOf(u8, lt, "fake-Pass-7351!") == null);
     // the browser is gone with the turn
     try t.expect(f.run.web == null);
+}
+
+const folders_t = folders_mod;
+const is_windows_t = @import("builtin").os.tag == .windows;
+
+test "a_role_refusal_is_final_and_nothing_is_asked" {
+    var f: Fix = undefined;
+    try f.init("allow write_file *\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fs = try folders_t.parse(a, "[notes]\nwrite = agent:coder\n");
+    f.g.folders = &fs;
+    try f.grants.add(.write_file, "notes/a.md", util.nowSeconds(t.io) + 5000);
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/a.md\",\"content\":\"x\"}"));
+    try f.e.script(2, model.textReply("refused"));
+    const r1 = try f.say("write it");
+    freeResult(&f.run, r1);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: folders.ini [notes] write: agent:main is not listed") != null);
+    try t.expectEqual(0, f.asked);
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "ws/notes/a.md", .{}));
+    // where nobody can answer, it is not listed as skipped either
+    var skipped: Skipped = .init(t.allocator);
+    defer skipped.deinit();
+    f.run.skipped = &skipped;
+    f.run.scheduled = true;
+    try f.e.script(3, model.toolReply("tu_2", "write_file", "{\"path\":\"notes/a.md\",\"content\":\"x\"}"));
+    try f.e.script(4, model.textReply("refused again"));
+    const r2 = try f.say("write it again");
+    freeResult(&f.run, r2);
+    try t.expectEqualStrings("", try skipped.text(t.io, a));
+}
+
+test "shell_starts_in_its_dir_and_the_question_and_lines_name_it" {
+    if (is_windows_t) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fs = try folders_t.parse(a, "[/]\nread = owner\n");
+    f.g.folders = &fs;
+    try f.e.tmp.dir.createDirPath(t.io, "ws/work");
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"pwd\",\"dir\":\"work\"}"));
+    try f.e.script(2, model.textReply("there"));
+    const r = try f.say("where");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    try t.expectEqualStrings("shell: pwd (in work)", f.last_what);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "ws/work\\n") != null);
+    const lt = try f.logText();
+    try t.expect(std.mem.indexOf(u8, lt, "\"tool\":\"shell\",\"decision\":\"allow\",\"why\":\"allowed once by the owner\",\"arg\":\"pwd\",\"dir\":\"work\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "\"tool\":\"shell\",\"arg\":\"pwd\",\"dir\":\"work\",\"is_error\":false") != null);
+    // shell offers dir where folders.ini has a section
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "\"dir\"") != null);
+}
+
+test "without_folders_ini_shell_offers_no_dir" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.e.script(1, model.textReply("hi"));
+    const r = try f.say("hello");
+    freeResult(&f.run, r);
+    const req1 = try f.e.request(1);
+    try t.expect(std.mem.indexOf(u8, req1, "\"name\":\"shell\"") != null);
+    try t.expect(std.mem.indexOf(u8, req1, "\"dir\"") == null);
+}
+
+test "folder_vars_reach_a_host_command_masked" {
+    var f: Fix = undefined;
+    try f.init("allow shell *\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const value = "sk_test_51Hq3vY2eZvKYlo2C";
+    const store: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    try store.put(t.io, "stripe-test", value);
+    f.run.store = store;
+    const fs = try folders_t.parse(a, "[work]\nvars = STRIPE_KEY:stripe-test\n[work/x]\nvars = MISSING_KEY:nope\n");
+    f.g.folders = &fs;
+    try f.e.tmp.dir.createDirPath(t.io, "ws/work/x");
+    const echo = if (is_windows_t) "echo k=%STRIPE_KEY%." else "echo k=$STRIPE_KEY.";
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"" ++ echo ++ "\",\"dir\":\"work\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "shell", "{\"command\":\"" ++ echo ++ "\"}"));
+    try f.e.script(3, model.toolReply("tu_3", "shell", "{\"command\":\"" ++ echo ++ "\",\"dir\":\"work/x\"}"));
+    try f.e.script(4, model.textReply("done"));
+    const r = try f.say("use the key");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "k=[secret:stripe-test].") != null);
+    // started in the workspace, the command gets no folder's variables
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), if (is_windows_t) "k=%STRIPE_KEY%." else "k=.") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "refused by the gate: folders.ini [work/x] vars: secret nope is not stored (harness secret add nope)") != null);
+    try t.expectEqual(0, f.asked);
+    for (1..5) |n| try t.expect(std.mem.indexOf(u8, try f.e.request(@intCast(n)), value) == null);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), value) == null);
+    // no secret crosses into a sandbox
+    try t.expectEqual(0, (try folderVars(&f.run, a, "box", "work")).vars.len);
 }
