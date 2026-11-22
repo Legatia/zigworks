@@ -402,7 +402,7 @@ const send_def: model.ToolDef = .{
     .name = "send",
     .description = "Post to a conversation the owner reads: your reply (final: true; your turn ends with it), or a note while you keep working.",
     .schema_json =
-    \\{"type":"object","properties":{"to":{"type":"string","description":"a conversation's name; default: this one"},"text":{"type":"string"},"final":{"type":"boolean","description":"this is your reply: the turn ends with it"}},"required":["text"]}
+    \\{"type":"object","properties":{"to":{"type":"string","description":"a conversation's name; default: this one"},"text":{"type":"string"},"files":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"workspace files, sent as documents (up to 20 MB each)"},"final":{"type":"boolean","description":"this is your reply: the turn ends with it"}},"required":["text"]}
     ,
 };
 const skill_defs = [_]model.ToolDef{
@@ -1237,26 +1237,49 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
 
 /// The longest post: 16 KB, sent in messages of 4096 bytes.
 pub const max_post = 16 * 1024;
+/// Files a post may carry, and the largest (read whole).
+pub const max_files = 4;
+pub const max_file_bytes = 20 << 20;
 
 /// `send`: a post to a conversation (default the run's); `final` makes it
 /// the reply, and the turn ends once it went out.
 fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
     const ob = r.outbox orelse return .{ .text = "this tool is not available here", .is_error = true };
     const v = jv.parse(a, input_json);
-    const text = jv.str(jv.get(v, "text")) orelse return .{ .text = "send needs its text", .is_error = true };
+    const text = jv.str(jv.get(v, "text")) orelse return refusePost(r, a, r.conversation, "", "send needs its text");
     const to = jv.str(jv.get(v, "to")) orelse r.conversation;
     const final = jv.boolean(jv.get(v, "final")) orelse false;
-    if (text.len > max_post) return .{ .text = try std.fmt.allocPrint(a, "refused: the text has {d} bytes; a post has at most {d}", .{ text.len, max_post }), .is_error = true };
+    if (text.len > max_post) return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "the text has {d} bytes; a post has at most {d}", .{ text.len, max_post }));
     // only the owner and the settings make conversations
     const target = ob.find(ob.ctx, a, to) orelse if (std.mem.eql(u8, to, r.conversation)) Target{ .name = to, .exists = false } else {
         const known = try std.mem.join(a, ", ", ob.names(ob.ctx, a));
-        return .{ .text = try std.fmt.allocPrint(a, "refused: there is no conversation called {s}; they are: {s}", .{ to, known }), .is_error = true };
+        return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "there is no conversation called {s}; they are: {s}", .{ to, known }));
     };
+    // the files, read whole from the workspace as read_file sees it
+    const paths = jv.arr(jv.get(v, "files")) orelse &.{};
+    if (paths.len > max_files) return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "a post carries at most {d} files", .{max_files}));
+    const files = try a.alloc(Attachment, paths.len);
+    var dot: ?[]const u8 = null;
+    for (paths, files) |pv, *att| {
+        const path = jv.str(pv) orelse return refusePost(r, a, to, text, "files are workspace paths");
+        const cf = gate.confined(a, r.io, r.env.workspace, path) catch
+            return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "{s} is outside the workspace", .{path}));
+        const data = Io.Dir.cwd().readFileAlloc(r.io, cf.path, a, .limited(max_file_bytes)) catch |e| return refusePost(r, a, to, text, switch (e) {
+            error.StreamTooLong => try std.fmt.allocPrint(a, "{s} is over 20 MB", .{path}),
+            else => try std.fmt.allocPrint(a, "{s} can't be read: {s}", .{ path, @errorName(e) }),
+        });
+        // a stored secret never leaves in a file
+        for (r.env.secrets) |sec| if (sec.value.len > 0 and std.mem.indexOf(u8, data, sec.value) != null)
+            return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "{s} holds a stored secret ({s})", .{ path, sec.name }));
+        // a name programs read as settings is asked, as write_file asks it
+        if (dot == null and dotPart(cf.rel)) dot = cf.rel;
+        att.* = .{ .name = std.fs.path.basename(cf.rel), .data = data };
+    }
     if (r.sends >= r.limits.sends_per_run)
-        return .{ .text = try std.fmt.allocPrint(a, "refused: this run has posted {d} times, the most one run may (sends_per_run)", .{r.sends}), .is_error = true };
+        return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "this run has posted {d} times, the most one run may (sends_per_run)", .{r.sends}));
     r.sends += 1;
-    const post: Post = .{ .to = target.name, .text = text, .final = final };
-    const got = try postThrough(r, a, &post, target);
+    const post: Post = .{ .to = target.name, .text = text, .files = files, .final = final };
+    const got = try postThrough(r, a, &post, target, if (dot) |d| try std.fmt.allocPrint(a, "a file name with a part starting with \".\" asks: {s}", .{d}) else null);
     if (got.refused) |why| return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
     const d = got.delivery;
     // went out, or never will now: either way it was the reply (R1)
@@ -1270,19 +1293,36 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
     };
 }
 
+/// A `send` refused before the gate: logged, and the model told why.
+fn refusePost(r: *Run, a: std.mem.Allocator, to: []const u8, text: []const u8, why: []const u8) !tools.Output {
+    try r.logRun(.send, r.isPrivate(), .{ .to = to, .event = "refused", .bytes = text.len, .text = text, .delivered = false, .why = why });
+    return .{ .text = try std.fmt.allocPrint(a, "refused: {s}", .{why}), .is_error = true };
+}
+
+/// Whether a part of `rel` (with `/` between the parts) starts with `.`.
+fn dotPart(rel: []const u8) bool {
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |part| if (part.len > 0 and part[0] == '.') return true;
+    return false;
+}
+
 /// How a post through the gate went: refused, or what the outbox did.
 pub const Posted = struct { refused: ?[]const u8 = null, delivery: Delivery = .{ .status = .failed } };
 
 /// A post through the gate (`send`, its argument the conversation; asked
 /// every time where others read it), then the outbox; logged as a `send`
 /// line, private when the run or the target is.
-fn postThrough(r: *Run, a: std.mem.Allocator, p: *const Post, target: Target) !Posted {
+fn postThrough(r: *Run, a: std.mem.Allocator, p: *const Post, target: Target, ask_why: ?[]const u8) !Posted {
     const ob = r.outbox.?;
-    const detail = try std.fmt.allocPrint(a, "{d} bytes:\n{s}", .{ p.text.len, p.text });
-    const refused = try decideAndAskWith(r, a, .send, "send", target.name, detail, r.now(), .{ .shared = target.shared });
+    var names: std.ArrayList(u8) = .empty;
+    for (p.files, 0..) |f, i| try names.print(a, "{s}{s}", .{ if (i > 0) ", " else "", f.name });
+    // the whole post and the files' names
+    const detail = try std.fmt.allocPrint(a, "{d} bytes:\n{s}{s}{s}", .{ p.text.len, p.text, if (names.items.len > 0) "\nfiles: " else "", names.items });
+    const refused = try decideAndAskWith(r, a, .send, "send", target.name, detail, r.now(), .{ .shared = target.shared, .ask_why = ask_why });
     const private = r.isPrivate() or target.private;
+    const files: ?[]const u8 = if (names.items.len > 0) names.items else null;
     if (refused) |why| {
-        try r.logRun(.send, private, .{ .to = target.name, .event = "refused", .bytes = p.text.len, .text = p.text, .final = p.final, .implicit = p.implicit, .delivered = false, .why = why });
+        try r.logRun(.send, private, .{ .to = target.name, .event = "refused", .bytes = p.text.len, .text = p.text, .files = files, .final = p.final, .implicit = p.implicit, .delivered = false, .why = why });
         return .{ .refused = why };
     }
     const d = ob.post(ob.ctx, a, p);
@@ -1291,6 +1331,7 @@ fn postThrough(r: *Run, a: std.mem.Allocator, p: *const Post, target: Target) !P
         .event = @tagName(d.status),
         .bytes = p.text.len,
         .text = p.text,
+        .files = files,
         .final = p.final,
         .implicit = p.implicit,
         .delivered = d.status == .sent,
@@ -1308,7 +1349,7 @@ pub fn postReply(r: *Run, a: std.mem.Allocator, text: []const u8) !Posted {
     const ob = r.outbox orelse return .{ .refused = "nowhere to post" };
     const target = ob.find(ob.ctx, a, r.conversation) orelse Target{ .name = r.conversation, .exists = false };
     const post: Post = .{ .to = target.name, .text = text, .final = true, .implicit = true };
-    return postThrough(r, a, &post, target);
+    return postThrough(r, a, &post, target, null);
 }
 
 /// The text of a `send` call (the agent's words, for memory and
@@ -1365,6 +1406,9 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
 const AskExtra = struct {
     /// A post to a conversation others read: asked every time.
     shared: bool = false,
+    /// Why a call the gate allows is asked all the same (a file a post
+    /// carries whose name programs read as settings).
+    ask_why: ?[]const u8 = null,
 };
 
 fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, now_s: i64, extra: AskExtra) !?[]const u8 {
@@ -1387,6 +1431,16 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             if (r.skipped) |s| s.add(r.io, name, arg);
         } else action = .ask;
     }
+    if (extra.ask_why) |w| if (action == .allow) {
+        if (r.scheduled or r.asker == null) {
+            action = .deny;
+            why = try std.fmt.allocPrint(a, "{s}, and no one can be asked", .{w});
+            if (r.skipped) |s| s.add(r.io, name, arg);
+        } else {
+            action = .ask;
+            why = w;
+        }
+    };
     if (action == .ask) ask: {
         action = .deny;
         const asker = r.asker orelse {

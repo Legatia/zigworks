@@ -1765,6 +1765,7 @@ pub const Core = struct {
             c.convs.mutex.lockUncancelable(c.io);
             defer c.convs.mutex.unlock(c.io);
             const e = c.convs.find(name) orelse return null;
+            if (!c.reachable(e)) return null;
             return .{ .name = a.dupe(u8, e.name) catch return null, .shared = e.audience == .shared, .private = e.isPrivate() };
         }
 
@@ -1773,7 +1774,9 @@ pub const Core = struct {
             const c = o.core;
             c.convs.mutex.lockUncancelable(c.io);
             defer c.convs.mutex.unlock(c.io);
-            return c.convs.names(a) catch &.{};
+            var out: std.ArrayList([]const u8) = .empty;
+            for (c.convs.items.items) |e| if (c.reachable(e)) out.append(a, a.dupe(u8, e.name) catch continue) catch {};
+            return out.items;
         }
 
         fn post(ctx: *anyopaque, a: std.mem.Allocator, p: *const agent.Post) agent.Delivery {
@@ -1782,13 +1785,72 @@ pub const Core = struct {
         }
     };
 
+    /// Whether a run can post to `e` through the attached channel (the
+    /// terminal is not reached from Telegram). Under convs.mutex.
+    fn reachable(c: *const Core, e: *const conversations.Entry) bool {
+        const telegram = if (c.chan) |ch| ch.open_topic != null else false;
+        return !(telegram and e.channel == .terminal);
+    }
+
     /// A run's post, past the gate: to its conversation's place, with the
-    /// run's tag in front.
+    /// run's tag in front, its files as documents, within the
+    /// conversation's hourly limit.
     fn postOut(c: *Core, a: std.mem.Allocator, o: *RunOut, p: *const agent.Post) agent.Delivery {
+        if (c.overHourly(a, p.to)) |why| return .{ .status = .held, .why = why };
         const text = if (o.tag.len > 0) std.fmt.allocPrint(a, "{s}{s}", .{ o.tag, p.text }) catch p.text else p.text;
         const sent = c.sendText(p.to, text) catch |e| return .{ .status = .failed, .why = whyUndelivered(e) };
         c.touch(p.to);
-        return .{ .status = .sent, .message = sent.first, .parts = sent.count };
+        var d: agent.Delivery = .{ .status = .sent, .message = sent.first, .parts = sent.count };
+        for (p.files) |f| {
+            c.sendFile(a, p.to, f) catch |e| {
+                d.status = .failed;
+                d.why = std.fmt.allocPrint(a, "{s} was not delivered ({s})", .{ f.name, whyUndelivered(e) }) catch "a file was not delivered";
+                return d;
+            };
+            d.files += 1;
+        }
+        return d;
+    }
+
+    /// Sends a file of a post to conversation `conv`'s place, as a document.
+    fn sendFile(c: *Core, a: std.mem.Allocator, conv: []const u8, f: agent.Attachment) !void {
+        const ch = c.chan orelse return error.NoChannel;
+        const doc = ch.document orelse return error.NoFiles;
+        const r = try c.placeOf(a, conv);
+        _ = try doc(ch.ctx, r.place, f.name, f.data);
+    }
+
+    /// Why a post to `conv` is not sent now: it would be over
+    /// `sends_per_hour` (counted per conversation, all runs and replies);
+    /// main hears of it once an hour. Null: it may go, and is counted.
+    fn overHourly(c: *Core, a: std.mem.Allocator, conv: []const u8) ?[]const u8 {
+        const now_s = util.nowSeconds(c.io);
+        const limit = c.cfg.limits.sends_per_hour;
+        const tell: ?u32 = blk: {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            // a name harness does not know counts against main, where it goes
+            const e = c.convs.find(conv) orelse c.convs.find("main") orelse return null;
+            var i: usize = 0;
+            while (i < e.posts.items.len) {
+                if (now_s - e.posts.items[i] >= 3600) _ = e.posts.orderedRemove(i) else i += 1;
+            }
+            if (e.posts.items.len < limit) {
+                e.posts.append(c.gpa, now_s) catch {};
+                return null;
+            }
+            e.held += 1;
+            if (e.told_held_s != 0 and now_s - e.told_held_s < 3600) break :blk null;
+            const n = e.held;
+            e.held = 0;
+            e.told_held_s = now_s;
+            break :blk n;
+        };
+        if (tell) |n| {
+            c.log.write(.chat, false, .{ .event = "posts held", .name = conv, .count = n }) catch {};
+            c.say(std.fmt.allocPrint(a, "Posts to {s} are over {d} an hour: {d} not sent. /session shows them.", .{ conv, limit, n }) catch "Posts are over the hourly limit; /session shows them.");
+        }
+        return std.fmt.allocPrint(a, "posts to {s} are over {d} an hour", .{ conv, limit }) catch "over the hourly limit";
     }
 
     /// The context of conversation `name`: the one kept, or a new one. A
@@ -1907,8 +1969,6 @@ pub const Core = struct {
     fn contextNote(c: *Core, a: std.mem.Allocator, conv: []const u8) ![]const u8 {
         c.convs.mutex.lockUncancelable(c.io);
         defer c.convs.mutex.unlock(c.io);
-        // the terminal is not reached from Telegram
-        const telegram = if (c.chan) |ch| ch.open_topic != null else false;
         var out: std.ArrayList(u8) = .empty;
         if (c.convs.find(conv)) |e|
             try out.print(a, "Conversation: {s} ({s}).", .{ conv, e.where() })
@@ -1916,7 +1976,7 @@ pub const Core = struct {
             try out.print(a, "Conversation: {s} (a Telegram topic opened at the first post).", .{conv});
         var others: usize = 0;
         for (c.convs.items.items) |e| {
-            if (std.mem.eql(u8, e.name, conv) or (telegram and e.channel == .terminal)) continue;
+            if (std.mem.eql(u8, e.name, conv) or !c.reachable(e)) continue;
             try out.print(a, "{s}{s}", .{ if (others == 0) " Others: " else ", ", e.name });
             others += 1;
         }
@@ -3768,6 +3828,196 @@ test "a_rule_that_stops_the_reply_is_said_in_main" {
     const sends = try sendLines(&f);
     try t.expectEqual(1, sends.len);
     try t.expect(std.mem.indexOf(u8, sends[0], "\"event\":\"refused\"") != null);
+}
+
+/// A group the owner registered, known as conversation `name`.
+fn addGroup(f: *Fix, name: []const u8, chat: i64) !void {
+    f.core.convs.mutex.lockUncancelable(t.io);
+    defer f.core.convs.mutex.unlock(t.io);
+    _ = try f.core.convs.add(.{ .name = name, .chat = chat, .audience = .shared });
+}
+
+test "send_to_another_conversation_is_allowed_and_logged" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "trading", 5013);
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"to\":\"trading\",\"text\":\"BTC is up 4%.\"}"));
+    try f.e.script(2, model.textReply("Told trading."));
+    f.core.chatTurn("tell trading");
+    try t.expectEqual(1, f.rec.countIn("trading", "BTC is up 4%."));
+    try t.expectEqual(5013, f.rec.whereOf("BTC is up 4%.").?.thread);
+    try t.expectEqual(1, f.rec.countIn("main", "Told trading."));
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    const sends = try sendLines(&f);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"conversation\":\"main\",\"run\":\"chat\",\"to\":\"trading\",\"event\":\"sent\"") != null);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"delivered\":true") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "posted to trading (1 message)") != null);
+}
+
+test "send_to_an_unknown_conversation_names_the_known_ones" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "trading", 5013);
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"to\":\"nowhere\",\"text\":\"lost words\"}"));
+    try f.e.script(2, model.textReply("ok"));
+    f.core.chatTurn("post it");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused: there is no conversation called nowhere; they are: main, trading") != null);
+    try t.expectEqual(0, f.rec.count("lost words"));
+    // every send is logged, a refused one too
+    const sends = try sendLines(&f);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"to\":\"nowhere\",\"event\":\"refused\"") != null);
+}
+
+test "send_to_a_shared_conversation_asks_every_time_without_24h_and_is_denied_unattended" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addGroup(&f, "family", -1001234567890);
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"to\":\"family\",\"text\":\"Dinner at 7.\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "send", "{\"to\":\"family\",\"text\":\"Bring salad.\"}"));
+    try f.e.script(3, model.textReply("asked twice"));
+    try f.core.startWorker();
+    try f.core.handleText("tell the family");
+    // the whole post is shown, in main, with no Allow 24 h
+    try f.rec.waitIn("main", "BUTTONS Allow this?\nsend: family, 12 bytes:\nDinner at 7.");
+    try t.expect(f.lastButtons().get("day") == null);
+    try f.press("once");
+    try f.rec.waitIn("family", "Dinner at 7.");
+    // asked again: an answer covers one post
+    try f.rec.waitIn("main", "BUTTONS Allow this?\nsend: family, 12 bytes:\nBring salad.");
+    try t.expect(f.lastButtons().get("day") == null);
+    try f.press("deny");
+    try f.rec.waitFor("asked twice");
+    try t.expectEqual(0, f.rec.countIn("family", "Bring salad."));
+    try t.expectEqual(0, f.core.grants.items.items.len);
+    // a run nobody watches is refused, and says what it skipped
+    var flag: std.atomic.Value(bool) = .init(false);
+    var run = f.core.runIn(&f.core.chat_client, "task fam", .{ .by = "schedule:fam" }, "main", &flag);
+    var out: Core.RunOut = .{ .core = f.core, .tag = "[fam] " };
+    run.outbox = out.outbox();
+    var skipped: agent.Skipped = .init(t.allocator);
+    defer skipped.deinit();
+    run.skipped = &skipped;
+    var conv: agent.Conversation = .init(t.allocator);
+    defer conv.deinit();
+    try f.e.script(4, model.toolReply("tu_3", "send", "{\"to\":\"family\",\"text\":\"Unasked.\"}"));
+    try f.e.script(5, model.textReply("NOTHING"));
+    const res = try agent.turn(&run, &conv, "Tell the family.", false);
+    defer agent.freeResult(&run, res);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), "refused by the gate: no one to ask in a scheduled run") != null);
+    try t.expect(std.mem.indexOf(u8, try skipped.text(t.io, f.e.arena.allocator()), "send: family") != null);
+    try t.expectEqual(0, f.rec.count("Unasked."));
+}
+
+test "the_11th_send_of_a_run_is_refused" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    var blocks: std.ArrayList(u8) = .empty;
+    for (1..12) |i| try blocks.print(a, "{s}{{\"type\":\"tool_use\",\"id\":\"tu_{d}\",\"name\":\"send\",\"input\":{{\"text\":\"note-{d:0>2}\"}}}}", .{ if (i > 1) "," else "", i, i });
+    try f.e.script(1, try replyOf(&f, blocks.items, "tool_use"));
+    try f.e.script(2, model.textReply("done"));
+    f.core.chatTurn("post a lot");
+    try t.expectEqual(10, f.rec.count("note-"));
+    try t.expectEqual(0, f.rec.count("note-11"));
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused: this run has posted 10 times, the most one run may (sends_per_run)") != null);
+}
+
+test "posts_over_the_hourly_limit_are_not_sent_and_main_is_told_once" {
+    var f: Fix = undefined;
+    try f.init("[limits]\nsends_per_hour = 2\n", "", "");
+    defer f.deinit();
+    try addTopic(&f, "trading", 5013);
+    const a = f.e.arena.allocator();
+    var blocks: std.ArrayList(u8) = .empty;
+    for (1..5) |i| try blocks.print(a, "{s}{{\"type\":\"tool_use\",\"id\":\"tu_{d}\",\"name\":\"send\",\"input\":{{\"to\":\"trading\",\"text\":\"tick-{d}\"}}}}", .{ if (i > 1) "," else "", i, i });
+    try f.e.script(1, try replyOf(&f, blocks.items, "tool_use"));
+    try f.e.script(2, model.textReply("done"));
+    f.core.chatTurn("watch the market");
+    try t.expectEqual(2, f.rec.countIn("trading", "tick-"));
+    try t.expectEqual(1, f.rec.countIn("main", "Posts to trading are over 2 an hour: 1 not sent. /session shows them."));
+    try t.expectEqual(1, f.rec.count("are over 2 an hour"));
+    const sends = try sendLines(&f);
+    try t.expectEqual(5, sends.len);
+    for (sends[2..4]) |l| {
+        try t.expect(std.mem.indexOf(u8, l, "\"event\":\"held\"") != null);
+        try t.expect(std.mem.indexOf(u8, l, "\"delivered\":false") != null);
+    }
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "not sent: posts to trading are over 2 an hour") != null);
+}
+
+test "private_is_per_conversation_and_covers_sends_into_it" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "diary", 5014);
+    try f.core.handleTextIn("diary", "/private on");
+    try f.rec.waitIn("diary", "Private here");
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"to\":\"diary\",\"text\":\"secret-entry-words\"}"));
+    try f.e.script(2, model.textReply("noted in your diary"));
+    f.core.chatTurn("write in my diary");
+    try f.e.script(3, model.textReply("a private reply"));
+    f.core.chatTurnIn("diary", "my private thoughts xyzzy");
+    const lt = try logText(&f);
+    // main is not private: its turn reads; a post into the diary does not
+    try t.expect(std.mem.indexOf(u8, lt, "\"text\":\"write in my diary\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "\"text\":\"noted in your diary\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "secret-entry-words") == null);
+    try t.expect(std.mem.indexOf(u8, lt, "\"to\":\"diary\",\"event\":\"sent\"") != null);
+    // the diary's own turn is private, its reply too
+    try t.expect(std.mem.indexOf(u8, lt, "xyzzy") == null);
+    try t.expect(std.mem.indexOf(u8, lt, "a private reply") == null);
+    try t.expectEqual(1, f.core.contextOf("main").?.turns_since_memory);
+    try t.expectEqual(0, f.core.contextOf("diary").?.turns_since_memory);
+    try t.expect(std.mem.indexOf(u8, try conversationsText(&f), "\"name\":\"diary\",\"channel\":\"telegram\",\"chat\":42,\"thread\":5014,\"audience\":\"own\",\"private\":true") != null);
+}
+
+test "an_attachment_outside_the_workspace_or_holding_a_stored_secret_is_refused" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const ws = f.core.workspace;
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ ws, "flats.csv" }), .data = "street,rooms\n" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ ws, "leak.txt" }), .data = "the key is og-key-for-tests\n" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ ws, ".env" }), .data = "A=1\n" });
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"text\":\"the settings\",\"files\":[\"../config.ini\"]}"));
+    try f.e.script(2, model.toolReply("tu_2", "send", "{\"text\":\"a leak\",\"files\":[\"leak.txt\"]}"));
+    try f.e.script(3, model.toolReply("tu_3", "send", "{\"text\":\"env\",\"files\":[\".env\"]}"));
+    try f.e.script(4, model.toolReply("tu_4", "send", "{\"text\":\"Here is the list.\",\"files\":[\"flats.csv\"],\"final\":true}"));
+    try f.core.startWorker();
+    try f.core.handleText("send me the files");
+    // a name starting with "." is asked, as write_file is
+    try f.rec.waitFor("BUTTONS Allow this?\nsend: main, 3 bytes:\nenv\nfiles: .env");
+    try f.press("deny");
+    try f.rec.waitFor("DOC flats.csv (13 bytes)");
+    try f.rec.waitIn("main", "Here is the list.");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused: ../config.ini is outside the workspace") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "refused: leak.txt holds a stored secret (omnigate)") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "refused by the gate: denied by the owner") != null);
+    try t.expectEqual(0, f.rec.count("a leak"));
+    try t.expectEqual(0, f.rec.count("the settings"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "og-key-for-tests") == null);
+    const sends = try sendLines(&f);
+    try t.expect(std.mem.indexOf(u8, sends[sends.len - 1], "\"files\":\"flats.csv\"") != null);
+}
+
+test "a_refused_topic_posts_to_main_with_its_name_in_front" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "trading", 5013);
+    f.rec.threads_fail = true;
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"to\":\"trading\",\"text\":\"BTC is up.\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "send", "{\"to\":\"trading\",\"text\":\"ETH too.\"}"));
+    try f.e.script(3, model.textReply("ok"));
+    f.core.chatTurn("tell trading");
+    try t.expectEqual(1, f.rec.countIn("main", "[trading] BTC is up."));
+    try t.expectEqual(1, f.rec.countIn("main", "[trading] ETH too."));
+    try t.expectEqual(1, f.rec.count("Telegram refused the topic of trading"));
 }
 
 test "a_bad_rules_line_names_its_section_or_environment" {
