@@ -40,6 +40,15 @@ pub const Notice = struct {
     say: *const fn (ctx: *anyopaque, text: []const u8) void,
 };
 
+/// Where a delegated run registers its own stop flag, set with its
+/// parent's: `/stop NAME` then stops NAME's runs and only those, and the
+/// runs they delegated.
+pub const Registry = struct {
+    ctx: *anyopaque,
+    add: *const fn (ctx: *anyopaque, flag: *std.atomic.Value(bool), agent: []const u8, parent: *std.atomic.Value(bool)) void,
+    remove: *const fn (ctx: *anyopaque, flag: *std.atomic.Value(bool)) void,
+};
+
 /// What a conversation is, as a run's outbox knows it.
 pub const Target = struct {
     name: []const u8,
@@ -338,6 +347,11 @@ pub const Run = struct {
     /// The definitions, for `delegate` and `agent_save`; null: the
     /// built-ins only, and no `agent_save`.
     defs: ?*agents.Set = null,
+    /// The run holds a place of its definition (its `parallel`).
+    holds_place: bool = false,
+    /// Where a delegated run registers its own stop flag (so `/stop NAME`
+    /// reaches it alone); null: helpers share their parent's flag.
+    registry: ?Registry = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -777,10 +791,75 @@ pub const ModelCfg = struct {
     max_tokens: u32,
 };
 
-/// A counting limit on helpers running at once, across the process.
+/// A counting limit on helpers running at once, across the process, and
+/// the runs going of each definition (for its `parallel`).
 pub const Pool = struct {
     mutex: Io.Mutex = .init,
     active: u32 = 0,
+    going_list: [max_names]Going = undefined,
+    n_going: usize = 0,
+
+    const max_names = 64;
+    const Going = struct { name: [64]u8 = undefined, len: usize = 0, n: u32 = 0 };
+
+    /// Definition `name`'s count, made if there is none (null when there
+    /// is no room: it is not counted). Under the mutex.
+    fn slot(p: *Pool, name: []const u8, make: bool) ?*Going {
+        for (p.going_list[0..p.n_going]) |*g| if (std.mem.eql(u8, g.name[0..g.len], name)) return g;
+        if (!make or p.n_going == max_names or name.len > 64) return null;
+        const g = &p.going_list[p.n_going];
+        p.n_going += 1;
+        g.* = .{ .len = name.len };
+        @memcpy(g.name[0..name.len], name);
+        return g;
+    }
+
+    /// Takes a place of definition `name` if fewer than `cap` of its runs
+    /// go (0: no cap of its own, only counted).
+    pub fn take(p: *Pool, io: Io, name: []const u8, cap: u32) bool {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        const g = p.slot(name, true) orelse return true;
+        if (cap > 0 and g.n >= cap) return false;
+        g.n += 1;
+        return true;
+    }
+
+    /// Counts a run of `name` that never waits for a place (the owner's).
+    pub fn takeAlways(p: *Pool, io: Io, name: []const u8) void {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        if (p.slot(name, true)) |g| g.n += 1;
+    }
+
+    pub fn give(p: *Pool, io: Io, name: []const u8) void {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        if (p.slot(name, false)) |g| g.n -|= 1;
+    }
+
+    /// How many runs of definition `name` go.
+    pub fn going(p: *Pool, io: Io, name: []const u8) u32 {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        return if (p.slot(name, false)) |g| g.n else 0;
+    }
+
+    /// Whether a run of `name` would find a place now.
+    pub fn hasRoom(p: *Pool, io: Io, name: []const u8, cap: u32) bool {
+        return cap == 0 or p.going(io, name) < cap;
+    }
+
+    /// Waits for a place of `name`; false if stopped first or `deadline_s`
+    /// (0: none) passed.
+    fn takeUntil(p: *Pool, io: Io, name: []const u8, cap: u32, stop: *std.atomic.Value(bool), deadline_s: i64) bool {
+        while (true) {
+            if (stop.load(.acquire)) return false;
+            if (p.take(io, name, cap)) return true;
+            if (deadline_s > 0 and util.nowSeconds(io) >= deadline_s) return false;
+            io.sleep(.fromMilliseconds(20), .awake) catch {};
+        }
+    }
 
     /// Waits for a free place; false if stopped first.
     fn acquire(p: *Pool, io: Io, max: u32, stop: *std.atomic.Value(bool)) bool {
@@ -2109,6 +2188,9 @@ const Helper = struct {
     ended_by: ?[]u8 = null,
     steps: u32 = 0,
     failed: ?[]const u8 = null,
+    /// Where a `failed` made at run time is written (helpers run at once:
+    /// never in the shared arena).
+    failed_buf: [200]u8 = undefined,
 };
 
 fn delegate(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
@@ -2155,19 +2237,41 @@ fn helperMain(h: *Helper) void {
 fn helperRun(h: *Helper) !void {
     const p = h.parent;
     const cfg = p.model_cfg.?;
+    const d = h.def;
+    // its own stop flag, set with its parent's, so /stop NAME reaches it alone
+    var own_stop: std.atomic.Value(bool) = .init(p.env.stop.load(.acquire));
+    const stop = if (p.registry) |reg| blk: {
+        reg.add(reg.ctx, &own_stop, d.name, p.env.stop);
+        break :blk &own_stop;
+    } else p.env.stop;
+    defer if (p.registry) |reg| reg.remove(reg.ctx, &own_stop);
     if (p.pool) |pool| {
-        if (!pool.acquire(p.io, p.agents.parallel, p.env.stop)) {
+        if (!pool.acquire(p.io, p.agents.parallel, stop)) {
             h.failed = "stopped before it started";
             return;
         }
     }
     defer if (p.pool) |pool| pool.release(p.io);
+    // a place of its definition: waited for until the turn ends; the run
+    // that delegated it never waits on a place it holds itself
+    var placed = false;
+    if (p.pool) |pool| {
+        if (d.parallel == 1 and p.holds_place and std.mem.eql(u8, p.def.name, d.name)) {
+            h.failed = std.fmt.bufPrint(&h.failed_buf, "{s} runs one at a time, and the run that delegated it holds that place", .{d.name}) catch "the run that delegated it holds that place";
+            return;
+        }
+        if (!pool.takeUntil(p.io, d.name, d.parallel, stop, h.deadline_s)) {
+            h.failed = if (stop.load(.acquire)) "stopped before it started" else std.fmt.bufPrint(&h.failed_buf, "no place for {s} before the turn's end (it runs at most {d} at once)", .{ d.name, d.parallel }) catch "no place before the turn's end";
+            return;
+        }
+        placed = true;
+    }
+    defer if (placed) p.pool.?.give(p.io, d.name);
     if (h.deadline_s * 1000 - util.nowMs(p.io) < 100) {
         h.failed = "no time left in the turn";
         return;
     }
     const left = @max(h.deadline_s - p.now(), 1);
-    const d = h.def;
     // `strong`: the main model; else the definition's, else the workers'
     const route = if (h.task.strong) cfg.main else if (d.model.len > 0) d.model else cfg.worker;
     var client = try model.Client.init(p.gpa, p.io, cfg.url, cfg.key, route, cfg.max_tokens);
@@ -2177,6 +2281,8 @@ fn helperRun(h: *Helper) !void {
     w.client = &client;
     w.helper = true;
     w.useDefinition(d);
+    w.env.stop = stop;
+    w.holds_place = placed;
     w.label = std.fmt.bufPrint(&label_buf, "{s}/h{d}", .{ util.cut(p.label, 40), h.n }) catch "helper";
     // started by what started its parent, delegated by its parent's definition
     w.who = .{ .agent = d.name, .by = p.who.by, .parent = &p.who };
@@ -4308,4 +4414,55 @@ test "an_allowed_change_keeps_the_old_file_and_applies_to_the_next_run" {
     r = try f.say("and now");
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try systemOf(&f, 3), "Research with dates.") != null);
+}
+
+// ---- places ----
+
+test "parallel_holds_for_delegated_runs" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    var set = try defsWith(&f, &.{
+        .{ "one", "---\nname: one\ndescription: One at a time.\nparallel: 1\ntools: recall, delegate\n---\nOne.\n" },
+        .{ "many", "---\nname: many\ndescription: Many.\ntools: recall\n---\nMany.\n" },
+    });
+    defer set.deinit();
+    f.run.defs = &set;
+    const slow = "{\"delay_ms\":700,\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"stop_reason\":\"end_turn\"}";
+    // two tasks of a definition that runs one at a time: one after the other
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"a\",\"agent\":\"one\"},{\"task\":\"b\",\"agent\":\"one\"}]}"));
+    try f.e.script(2, slow);
+    try f.e.script(3, slow);
+    try f.e.script(4, model.textReply("parent"));
+    var started = Io.Clock.awake.now(t.io);
+    var r = try f.say("two of one");
+    freeResult(&f.run, r);
+    const serial_ms = started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
+    // without a parallel of its own: side by side
+    try f.e.script(5, model.toolReply("tu_2", "delegate", "{\"tasks\":[{\"task\":\"a\",\"agent\":\"many\"},{\"task\":\"b\",\"agent\":\"many\"}]}"));
+    try f.e.script(6, slow);
+    try f.e.script(7, slow);
+    try f.e.script(8, model.textReply("parent"));
+    started = Io.Clock.awake.now(t.io);
+    r = try f.say("two of many");
+    freeResult(&f.run, r);
+    const side_ms = started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
+    if (serial_ms < 1300 or side_ms >= 1300) std.debug.print("two 0.7 s tasks of one took {d} ms, of many {d} ms\n", .{ serial_ms, side_ms });
+    try t.expect(serial_ms >= 1300);
+    try t.expect(side_ms < 1300);
+    // a run of `one` holding its only place delegates to `one`: refused at
+    // once, not after waiting out the turn
+    f.run.useDefinition((try set.get(a, "one")).?);
+    f.run.holds_place = true;
+    try f.e.script(9, model.toolReply("tu_3", "delegate", "{\"tasks\":[{\"task\":\"c\",\"agent\":\"one\"}]}"));
+    try f.e.script(10, model.textReply("ok"));
+    started = Io.Clock.awake.now(t.io);
+    r = try f.say("one delegates to one");
+    freeResult(&f.run, r);
+    const ms = started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
+    if (ms >= 1500) std.debug.print("the refusal took {d} ms\n", .{ms});
+    try t.expect(ms < 1500);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(10), "the run that delegated it holds that place") != null);
 }

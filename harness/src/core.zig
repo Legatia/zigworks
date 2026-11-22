@@ -179,6 +179,14 @@ pub const Incoming = struct {
     text: []const u8,
 };
 
+/// A run's stop flag, its definition, and the flag of the run that
+/// delegated it.
+const RunFlag = struct {
+    flag: *std.atomic.Value(bool),
+    agent: []const u8,
+    parent: ?*std.atomic.Value(bool) = null,
+};
+
 /// One instance's context, a definition in a conversation: its turns
 /// and where its memory writer is.
 const Context = struct {
@@ -373,10 +381,12 @@ pub const Core = struct {
     seen: brief.Seen,
     /// Set on close: nothing new starts.
     stop: std.atomic.Value(bool) = .init(false),
-    /// The stop flag of every run going on; /stop sets them all and nothing
-    /// clears them, so a stopped run stays stopped however long it takes.
+    /// The stop flag of every run going on, with its definition; /stop
+    /// sets them all (/stop NAME those of NAME and the runs they
+    /// delegated) and nothing clears them, so a stopped run stays stopped
+    /// however long it takes.
     runs_mutex: Io.Mutex = .init,
-    run_flags: std.ArrayList(*std.atomic.Value(bool)) = .empty,
+    run_flags: std.ArrayList(RunFlag) = .empty,
     /// Held while settings are read by the scheduler or replaced by /reload.
     settings_mutex: Io.Mutex = .init,
     /// Guards `seen` (briefs read a copy).
@@ -1599,17 +1609,24 @@ pub const Core = struct {
         }
     }
 
-    fn register(c: *Core, flag: *std.atomic.Value(bool)) void {
+    /// A run of definition `agent_name` is going (its name must outlive it).
+    fn register(c: *Core, flag: *std.atomic.Value(bool), agent_name: []const u8) void {
+        c.registerUnder(flag, agent_name, null);
+    }
+
+    /// A run delegated by the run whose flag is `parent`: stopped with it.
+    fn registerUnder(c: *Core, flag: *std.atomic.Value(bool), agent_name: []const u8, parent: ?*std.atomic.Value(bool)) void {
         c.runs_mutex.lockUncancelable(c.io);
         defer c.runs_mutex.unlock(c.io);
-        c.run_flags.append(c.gpa, flag) catch {};
+        c.run_flags.append(c.gpa, .{ .flag = flag, .agent = agent_name, .parent = parent }) catch {};
         if (c.stop.load(.acquire)) flag.store(true, .release);
+        if (parent) |pf| if (pf.load(.acquire)) flag.store(true, .release);
     }
 
     fn unregister(c: *Core, flag: *std.atomic.Value(bool)) void {
         c.runs_mutex.lockUncancelable(c.io);
         defer c.runs_mutex.unlock(c.io);
-        for (c.run_flags.items, 0..) |f, i| if (f == flag) {
+        for (c.run_flags.items, 0..) |f, i| if (f.flag == flag) {
             _ = c.run_flags.swapRemove(i);
             return;
         };
@@ -1618,7 +1635,30 @@ pub const Core = struct {
     fn stopRuns(c: *Core) void {
         c.runs_mutex.lockUncancelable(c.io);
         defer c.runs_mutex.unlock(c.io);
-        for (c.run_flags.items) |f| f.store(true, .release);
+        for (c.run_flags.items) |f| f.flag.store(true, .release);
+    }
+
+    /// Where delegated runs register their own stop flags.
+    fn registry(c: *Core) agent.Registry {
+        return .{ .ctx = c, .add = registryAdd, .remove = registryRemove };
+    }
+
+    fn registryAdd(ctx: *anyopaque, flag: *std.atomic.Value(bool), agent_name: []const u8, parent: *std.atomic.Value(bool)) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        c.registerUnder(flag, agent_name, parent);
+    }
+
+    fn registryRemove(ctx: *anyopaque, flag: *std.atomic.Value(bool)) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        c.unregister(flag);
+    }
+
+    /// Whether a run of definition `name` is registered.
+    fn agentRunning(c: *Core, name: []const u8) bool {
+        c.runs_mutex.lockUncancelable(c.io);
+        defer c.runs_mutex.unlock(c.io);
+        for (c.run_flags.items) |f| if (std.mem.eql(u8, f.agent, name)) return true;
+        return false;
     }
 
     fn baseRun(c: *Core, client: *model.Client, label: []const u8, scheduled: bool, flag: *std.atomic.Value(bool)) agent.Run {
@@ -1679,6 +1719,7 @@ pub const Core = struct {
             .masks = &c.masks,
             .written = &c.written,
             .defs = &c.defs,
+            .registry = c.registry(),
         };
     }
 
@@ -1761,7 +1802,8 @@ pub const Core = struct {
             return;
         };
         var flag: std.atomic.Value(bool) = .init(false);
-        c.register(&flag);
+        // harness's own work: no definition's, so only /stop reaches it
+        c.register(&flag, "");
         defer c.unregister(&flag);
         const starts = a.alloc(McpStart, cfgs.len) catch return;
         const threads = a.alloc(?std.Thread, cfgs.len) catch return;
@@ -1932,11 +1974,15 @@ pub const Core = struct {
         }
         x.last_owner_s = c.now();
         var flag: std.atomic.Value(bool) = .init(false);
-        c.register(&flag);
+        c.register(&flag, def.name);
         defer c.unregister(&flag);
+        // the owner's place: counted toward its definition's, never waited for
+        c.helper_pool.takeAlways(c.io, def.name);
+        defer c.helper_pool.give(c.io, def.name);
         var ask: ChatAsk = .{ .core = c, .flag = &flag, .conv = conv };
         var run = c.runIn(&c.chat_client, "chat", .{ .agent = def.name }, conv, &flag);
         run.useDefinition(def);
+        run.holds_place = true;
         // its model for this turn (the chat worker is the client's only user)
         c.chat_client.model = if (def.model.len > 0) def.model else c.cfg.model.model;
         defer c.chat_client.model = c.cfg.model.model;
@@ -2498,6 +2544,48 @@ pub const Core = struct {
         return "Stopped everything that was running.";
     }
 
+    /// `/stop NAME`: NAME's runs stop, and the runs they delegated; its
+    /// queued messages are dropped. Waits up to `stop_wait_ms` for them to end.
+    fn stopAgent(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        if (!c.defs.has(name)) return std.fmt.allocPrint(a, "No definition called {s}.", .{name});
+        var dropped: usize = 0;
+        {
+            c.queue_mutex.lockUncancelable(c.io);
+            defer c.queue_mutex.unlock(c.io);
+            var i: usize = 0;
+            while (i < c.queue.items.len) {
+                if (!std.mem.eql(u8, c.queue.items[i].agent, name)) {
+                    i += 1;
+                    continue;
+                }
+                c.queue.orderedRemove(i).deinit(c.gpa);
+                dropped += 1;
+            }
+        }
+        var stopped: usize = 0;
+        {
+            c.runs_mutex.lockUncancelable(c.io);
+            defer c.runs_mutex.unlock(c.io);
+            for (c.run_flags.items) |f| if (std.mem.eql(u8, f.agent, name) and !f.flag.load(.acquire)) {
+                f.flag.store(true, .release);
+                stopped += 1;
+            };
+            // and what they delegated
+            for (c.run_flags.items) |f| if (f.parent) |pf| if (pf.load(.acquire)) f.flag.store(true, .release);
+        }
+        const until = Io.Clock.awake.now(c.io).nanoseconds + @as(i96, c.stop_wait_ms) * std.time.ns_per_ms;
+        while (stopped > 0 and c.agentRunning(name) and Io.Clock.awake.now(c.io).nanoseconds < until) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        const still = stopped > 0 and c.agentRunning(name);
+        c.log.write(.chat, false, .{ .event = "stop", .agent = name, .runs = stopped, .queued_dropped = dropped, .still_ending = still }) catch {};
+        if (stopped == 0 and dropped == 0) return std.fmt.allocPrint(a, "Nothing of {s} was running.", .{name});
+        return std.fmt.allocPrint(a, "Stopped {s}'s runs ({d}){s}{s}", .{
+            name,
+            stopped,
+            if (dropped > 0) try std.fmt.allocPrint(a, " and dropped its {d} queued message{s}", .{ dropped, if (dropped == 1) "" else "s" }) else "",
+            if (still) ". A model call already under way ends on its own; its answer is dropped and nothing it asked for runs." else ".",
+        });
+    }
+
     /// SIGINT or SIGTERM (on Windows the console's Ctrl-C, Ctrl-Break or
     /// close): what /stop does, then what close does that matters outside
     /// this process — the log, the status, the MCP servers' processes and
@@ -2562,6 +2650,8 @@ pub const Core = struct {
                 if (last) |l| if (c.localDay(l) >= today) continue;
             }
             if (c.waitsToBeSent(key.slice())) continue;
+            // its definition runs at most `parallel` at once
+            if (!c.helper_pool.hasRoom(c.io, tk.agent, c.defs.parallelOf(tk.agent))) continue;
             _ = c.startBackground(.{ .task = tk }, key.slice(), now_s);
         }
     }
@@ -2695,6 +2785,8 @@ pub const Core = struct {
             .task => due_s,
             .resend => unreachable,
         };
+        // not run yet: due again at the next tick
+        if (outcome == .later) return;
         const now_s = c.now();
         c.state_mutex.lockUncancelable(c.io);
         defer c.state_mutex.unlock(c.io);
@@ -2762,6 +2854,9 @@ pub const Core = struct {
         done,
         /// Its message did not get through: it is sent again a little later.
         undelivered,
+        /// Not run: its definition had no place free (`parallel`); a later
+        /// tick runs it.
+        later,
     };
 
     /// A message that did not get through, kept to be sent again as it is,
@@ -2812,7 +2907,7 @@ pub const Core = struct {
         defer client.deinit();
         const label = try std.fmt.allocPrint(a, "brief {s}", .{b.name});
         var flag: std.atomic.Value(bool) = .init(false);
-        c.register(&flag);
+        c.register(&flag, "main");
         defer c.unregister(&flag);
         var run = c.runIn(&client, label, .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{b.name}) }, b.to, &flag);
         // a copy, so the fetches hold no lock
@@ -2873,12 +2968,16 @@ pub const Core = struct {
         };
         var client = try model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", if (def.model.len > 0) def.model else c.cfg.model.model, c.cfg.model.max_tokens);
         defer client.deinit();
+        // a place of its definition; with none free it runs at a later tick
+        if (!c.helper_pool.take(c.io, def.name, def.parallel)) return .later;
+        defer c.helper_pool.give(c.io, def.name);
         const label = try std.fmt.allocPrint(a, "task {s}", .{tk.name});
         var flag: std.atomic.Value(bool) = .init(false);
-        c.register(&flag);
+        c.register(&flag, def.name);
         defer c.unregister(&flag);
         var run = c.runIn(&client, label, .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{tk.name}), .agent = def.name }, tk.to, &flag);
         run.useDefinition(def);
+        run.holds_place = true;
         run.extra_instructions = try std.fmt.allocPrint(a, "This is the scheduled task \"{s}\". If there is nothing worth telling the owner this time, answer exactly NOTHING.", .{tk.name});
         var skipped: agent.Skipped = .init(c.gpa);
         defer skipped.deinit();
@@ -2961,7 +3060,7 @@ pub const Core = struct {
 
     const help_text =
         \\Commands
-        \\/stop: stop everything running now
+        \\/stop [NAME]: stop everything running now, or NAME's runs
         \\/new: start fresh in this conversation (memory stays)
         \\/status: what is running and the switches
         \\/brief [NAME]: send a brief now
@@ -3004,7 +3103,7 @@ pub const Core = struct {
         const eql = std.mem.eql;
         if (eql(u8, cmd, "/help") or eql(u8, cmd, "/start")) return help_text;
         if (eql(u8, cmd, "/pair")) return "Already paired.";
-        if (eql(u8, cmd, "/stop")) return c.stopAll();
+        if (eql(u8, cmd, "/stop")) return if (rest.len == 0) c.stopAll() else c.stopAgent(a, rest);
         if (eql(u8, cmd, "/new")) {
             c.resetContext(conv);
             return "New conversation.";
@@ -3242,6 +3341,8 @@ pub const Core = struct {
                 try out.appendSlice(a, if (d.builtin) "; built in" else "; written by hand");
             const v = c.defs.versions(d.name);
             if (v > 0) try out.print(a, "; {d} earlier version{s}", .{ v, if (v == 1) "" else "s" });
+            const going = c.helper_pool.going(c.io, d.name);
+            if (going > 0) try out.print(a, "; {d} running", .{going});
             try out.appendSlice(a, "\n");
         }
         return out.items;
@@ -6473,4 +6574,80 @@ test "a_definitions_rules_section_applies_to_its_runs" {
     try t.expect(std.mem.indexOf(u8, lt, "\"agent\":\"coder\",\"tool\":\"shell\",\"decision\":\"allow\",\"why\":\"rule on line 2\"") != null);
     try t.expect(std.mem.indexOf(u8, lt, "\"agent\":\"main\",\"tool\":\"shell\",\"decision\":\"deny\",\"why\":\"rule on line 4\"") != null);
     try t.expectEqual(0, f.rec.count("BUTTONS"));
+}
+
+// ---- places ----
+
+test "owner_runs_keep_a_place_when_tasks_fill_the_rest" {
+    var f: Fix = undefined;
+    // concurrent_runs = 2: one place for tasks, one kept for the owner
+    try f.init("", "", "[a]\nevery = 5m\ndo = Task a.\n[b]\nevery = 5m\ndo = Task b.\n");
+    defer f.deinit();
+    try f.e.script(1, comptime "{\"delay_ms\":1500," ++ model.textReply("task done")[1..]);
+    try f.e.script(2, model.textReply("chat answered"));
+    f.core.tick();
+    try waitFile(&f.e, "requests/001.json");
+    // the second task finds no place; the owner's message is answered all the same
+    try t.expectEqual(1, f.core.bg_active.load(.acquire));
+    try f.core.startWorker();
+    try f.core.handleText("hello");
+    try f.rec.waitFor("chat answered");
+    try t.expectEqual(0, f.rec.count("task done"));
+    try f.rec.waitFor("task done");
+    waitIdle(f.core);
+}
+
+test "a_scheduled_run_waits_for_its_definitions_place" {
+    var f: Fix = undefined;
+    // two places for tasks, but researcher runs one at a time
+    try f.init("[limits]\nconcurrent_runs = 3\n", "", "");
+    defer f.deinit();
+    try addDefinition(&f, "researcher", "---\nname: researcher\ndescription: R.\nparallel: 1\n---\nR.\n");
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[a]\nevery = 5m\nagent = researcher\ndo = Task a.\n[b]\nevery = 5m\nagent = researcher\ndo = Task b.\n"));
+    try f.e.script(1, comptime "{\"delay_ms\":800," ++ model.textReply("first done")[1..]);
+    try f.e.script(2, model.textReply("second done"));
+    f.core.tick();
+    try waitFile(&f.e, "requests/001.json");
+    for (0..5) |_| {
+        f.core.tick();
+        t.io.sleep(.fromMilliseconds(40), .awake) catch {};
+    }
+    // the other waits while the first runs
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.access(t.io, "requests/002.json", .{}));
+    try f.rec.waitFor("first done");
+    try t.expectEqual(0, f.rec.count("second done"));
+    waitIdle(f.core);
+    // and runs at a later tick
+    var waited: u32 = 0;
+    while (f.rec.count("second done") == 0 and waited < 5000) : (waited += 50) {
+        f.core.tick();
+        t.io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+    try f.rec.waitFor("second done");
+    waitIdle(f.core);
+}
+
+test "stop_name_stops_only_that_definitions_runs" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addDefinition(&f, "researcher", researcher_md);
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[watch]\nevery = 5m\nagent = researcher\ndo = Look.\n"));
+    try f.e.script(1, comptime "{\"delay_ms\":2500," ++ model.textReply("too late")[1..]);
+    f.core.tick();
+    try waitFile(&f.e, "requests/001.json");
+    try f.core.handleText("/stop main");
+    try f.rec.waitFor("Nothing of main was running.");
+    try f.core.handleText("/stop researcher");
+    try f.rec.waitFor("Stopped researcher's runs (1)");
+    waitIdle(f.core);
+    try t.expectEqual(0, f.rec.count("too late"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"stop\",\"agent\":\"researcher\"") != null);
+    // main goes on
+    try f.e.script(2, model.textReply("main still here"));
+    try f.core.startWorker();
+    try f.core.handleText("hello");
+    try f.rec.waitFor("main still here");
+    try f.core.handleText("/stop nobody");
+    try f.rec.waitFor("No definition called nobody.");
 }
