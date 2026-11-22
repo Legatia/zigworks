@@ -21,6 +21,7 @@ const logins = @import("logins.zig");
 const store_mod = @import("store.zig");
 const masks = @import("masks.zig");
 const who_mod = @import("who.zig");
+const folders_mod = @import("folders.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -2254,7 +2255,7 @@ pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, co
     for (0..n) |_| line = it.next() orelse "";
     // what the parser says of that line (the lines up to it are fine)
     _ = scratch.reset(.retain_capacity);
-    const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e);
+    const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e) orelse folders_mod.reason(e);
     return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
 }
 
@@ -2675,6 +2676,16 @@ test "a_bad_rules_line_names_its_section_or_environment" {
     try t.expect(std.mem.startsWith(u8, section, "rules line 2 has an error: [agnet:coder] (a section is [all] or a who"));
     const env = (try parseProblem(a, "rules", "allow fetch@box https://a.com/*\n", rules.parse)).?;
     try t.expect(std.mem.startsWith(u8, env, "rules line 1 has an error: allow fetch@box https://a.com/* (only shell takes an environment"));
+}
+
+test "a_bad_folders_line_is_named" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const who = (try parseProblem(a, "folders.ini", "[notes]\nwrite = agnet:x\n", folders_mod.parse)).?;
+    try t.expect(std.mem.startsWith(u8, who, "folders.ini line 2 has an error: write = agnet:x (read, write and run list who may"));
+    const folder = (try parseProblem(a, "folders.ini", "[/etc]\nread = owner\n", folders_mod.parse)).?;
+    try t.expect(std.mem.startsWith(u8, folder, "folders.ini line 1 has an error: [/etc] (a section is a folder inside the workspace"));
 }
 
 test "a_folder_is_held_by_one_core_at_a_time" {

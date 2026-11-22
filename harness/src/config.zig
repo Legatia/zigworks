@@ -104,7 +104,7 @@ pub fn lines(arena: std.mem.Allocator, text: []const u8) Error![]Line {
 
 /// A comment starts at `;` or `#` at the start of a line or after a space,
 /// so URLs with `#` fragments and values like `a;b` survive.
-fn stripComment(raw: []const u8) []const u8 {
+pub fn stripComment(raw: []const u8) []const u8 {
     for (raw, 0..) |c, i| {
         if ((c == ';' or c == '#') and (i == 0 or raw[i - 1] == ' ' or raw[i - 1] == '\t')) return raw[0..i];
     }
