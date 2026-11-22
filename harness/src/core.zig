@@ -3537,7 +3537,7 @@ pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, co
     for (0..n) |_| line = it.next() orelse "";
     // what the parser says of that line (the lines up to it are fine)
     _ = scratch.reset(.retain_capacity);
-    const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e) orelse folders_mod.reason(e);
+    const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e) orelse folders_mod.reason(e) orelse config.reason(e);
     return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
 }
 

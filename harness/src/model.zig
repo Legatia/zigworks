@@ -61,6 +61,235 @@ pub const Error = error{
     TimeUp,
 } || http.Error;
 
+// ---- providers ----
+
+/// The request format a provider speaks.
+pub const Api = enum {
+    /// Anthropic Messages: POST URL/messages.
+    anthropic,
+    /// OpenAI Chat Completions: POST URL/chat/completions.
+    openai,
+};
+
+/// How a provider takes its key: `x-api-key: KEY`, `Authorization:
+/// Bearer KEY`, or not at all.
+pub const Auth = enum { x_api_key, bearer, none };
+
+pub fn parseApi(w: []const u8) ?Api {
+    if (std.mem.eql(u8, w, "anthropic")) return .anthropic;
+    if (std.mem.eql(u8, w, "openai")) return .openai;
+    return null;
+}
+
+pub fn parseAuth(w: []const u8) ?Auth {
+    if (std.mem.eql(u8, w, "x-api-key")) return .x_api_key;
+    if (std.mem.eql(u8, w, "bearer")) return .bearer;
+    if (std.mem.eql(u8, w, "none")) return .none;
+    return null;
+}
+
+pub const Header = std.http.Header;
+
+/// Most `header =` lines one provider takes.
+pub const max_headers = 8;
+
+/// What a `[provider NAME]` section says (config.zig reads it); null: the
+/// preset's value, or for a new provider the default.
+pub const Section = struct {
+    name: []const u8,
+    api: ?Api = null,
+    url: ?[]const u8 = null,
+    auth: ?Auth = null,
+    /// The stored secret holding its key.
+    key: ?[]const u8 = null,
+    cache: ?bool = null,
+    headers: []const Header = &.{},
+};
+
+pub const Preset = struct {
+    name: []const u8,
+    api: Api,
+    url: []const u8,
+    auth: Auth,
+    cache: bool,
+    key: []const u8,
+    tokens_field: []const u8 = "max_tokens",
+};
+
+/// The providers that need no section. omnigate's url and key secret are
+/// `[model] url` and `[model] key`.
+pub const presets = [_]Preset{
+    .{ .name = "omnigate", .api = .anthropic, .url = "", .auth = .x_api_key, .cache = true, .key = "omnigate" },
+    .{ .name = "anthropic", .api = .anthropic, .url = "https://api.anthropic.com/v1", .auth = .x_api_key, .cache = true, .key = "anthropic" },
+    // its cache marks reach Anthropic's models
+    .{ .name = "openrouter", .api = .openai, .url = "https://openrouter.ai/api/v1", .auth = .bearer, .cache = true, .key = "openrouter" },
+    .{ .name = "opencode", .api = .openai, .url = "https://opencode.ai/zen/v1", .auth = .bearer, .cache = false, .key = "opencode" },
+    // OpenAI caches by itself, and refuses max_tokens for its reasoning models
+    .{ .name = "openai", .api = .openai, .url = "https://api.openai.com/v1", .auth = .bearer, .cache = false, .key = "openai", .tokens_field = "max_completion_tokens" },
+};
+
+pub fn isPreset(name: []const u8) bool {
+    for (presets) |p| if (std.mem.eql(u8, p.name, name)) return true;
+    return false;
+}
+
+/// A provider's name: a-z, 0-9, `-` and `_`, up to 32, starting with a
+/// letter or digit (never `:`, which ends it in a model value).
+pub fn validName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 32) return false;
+    if (!(std.ascii.isLower(name[0]) or std.ascii.isDigit(name[0]))) return false;
+    for (name) |ch| if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-' or ch == '_')) return false;
+    return true;
+}
+
+/// A provider's address: http:// or https://, host, port, path.
+pub fn validUrl(u: []const u8) bool {
+    if (!std.mem.startsWith(u8, u, "http://") and !std.mem.startsWith(u8, u, "https://")) return false;
+    _ = http.Target.parse(u) catch return false;
+    return true;
+}
+
+/// omnigate's address as 0.3 used it: the path before an optional
+/// trailing /v1, then /v1 ("" stays "": not set).
+pub fn omnigateUrl(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
+    var u = url;
+    while (u.len > 0 and u[u.len - 1] == '/') u = u[0 .. u.len - 1];
+    if (u.len == 0) return "";
+    if (std.mem.endsWith(u8, u, "/v1")) return u;
+    return std.fmt.allocPrint(arena, "{s}/v1", .{u});
+}
+
+pub const Provider = struct {
+    name: []const u8,
+    api: Api,
+    /// What comes before /messages or /chat/completions; "": not set.
+    url: []const u8,
+    auth: Auth,
+    headers: []const Header = &.{},
+    /// Prompt-cache marks in its requests.
+    cache: bool,
+    /// The stored secret holding its key.
+    key_name: []const u8,
+    /// Its key; "" when none is stored.
+    key: []const u8 = "",
+    /// The request's field for the most tokens an answer may have.
+    tokens_field: []const u8 = "max_tokens",
+
+    /// Whether its calls can be made as far as the key goes.
+    pub fn hasKey(p: Provider) bool {
+        return p.auth == .none or p.key.len > 0;
+    }
+
+    pub fn apiName(p: Provider) []const u8 {
+        return switch (p.api) {
+            .anthropic => "Anthropic Messages",
+            .openai => "OpenAI Chat Completions",
+        };
+    }
+
+    fn override(p: *Provider, s: Section) void {
+        if (s.api) |v| p.api = v;
+        if (s.url) |v| p.url = v;
+        if (s.auth) |v| p.auth = v;
+        if (s.key) |v| p.key_name = v;
+        if (s.cache) |v| p.cache = v;
+        if (s.headers.len > 0) p.headers = s.headers;
+    }
+};
+
+/// What the providers are made from: config.ini's `[model] provider`,
+/// `url`, `key` and its `[provider NAME]` sections.
+pub const Settings = struct {
+    default: []const u8 = "omnigate",
+    omnigate_url: []const u8 = "",
+    omnigate_key: []const u8 = "omnigate",
+    sections: []const Section = &.{},
+};
+
+/// Where providers' keys come from: the value stored under `secret` for
+/// `provider`, allocated in `a` (or living longer), or null.
+pub const KeyLookup = struct {
+    ctx: ?*anyopaque = null,
+    get: *const fn (ctx: ?*anyopaque, a: std.mem.Allocator, provider: []const u8, secret: []const u8) ?[]const u8,
+};
+
+pub const no_keys: KeyLookup = .{ .get = noKey };
+
+fn noKey(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) ?[]const u8 {
+    return null;
+}
+
+/// The provider and model a model value names.
+pub const Choice = struct { provider: *const Provider, model: []const u8 };
+
+pub const Providers = struct {
+    /// The presets, then the other sections in the order they appear.
+    list: []const Provider,
+    /// The provider of a model value without a known prefix.
+    default: usize = 0,
+
+    /// The presets, each overridden by its section, and the other
+    /// sections; each one's key looked up unless it needs none.
+    pub fn resolve(arena: std.mem.Allocator, s: Settings, keys: KeyLookup) error{OutOfMemory}!Providers {
+        var list: std.ArrayList(Provider) = .empty;
+        for (presets) |pr| {
+            const omni = std.mem.eql(u8, pr.name, "omnigate");
+            var p: Provider = .{ .name = pr.name, .api = pr.api, .url = if (omni) s.omnigate_url else pr.url, .auth = pr.auth, .cache = pr.cache, .key_name = if (omni) s.omnigate_key else pr.key, .tokens_field = pr.tokens_field };
+            if (sectionOf(s.sections, pr.name)) |sec| p.override(sec);
+            if (omni) p.url = try omnigateUrl(arena, p.url);
+            try list.append(arena, p);
+        }
+        for (s.sections) |sec| {
+            if (isPreset(sec.name)) continue;
+            // config.ini refuses a new provider without api and url
+            const api = sec.api orelse continue;
+            var p: Provider = .{ .name = sec.name, .api = api, .url = "", .auth = if (api == .anthropic) .x_api_key else .bearer, .cache = api == .anthropic, .key_name = sec.name };
+            p.override(sec);
+            try list.append(arena, p);
+        }
+        for (list.items) |*p| {
+            if (p.auth != .none) p.key = keys.get(keys.ctx, arena, p.name, p.key_name) orelse "";
+        }
+        var default: usize = 0;
+        for (list.items, 0..) |p, i| if (std.mem.eql(u8, p.name, s.default)) {
+            default = i;
+            break;
+        };
+        return .{ .list = list.items, .default = default };
+    }
+
+    fn sectionOf(sections: []const Section, name: []const u8) ?Section {
+        for (sections) |s| if (std.mem.eql(u8, s.name, name)) return s;
+        return null;
+    }
+
+    pub fn find(p: *const Providers, name: []const u8) ?*const Provider {
+        for (p.list) |*x| if (std.mem.eql(u8, x.name, name)) return x;
+        return null;
+    }
+
+    /// The one way a model value is read, wherever it is written
+    /// (`[model]`, agent definitions, workflow steps): `PROVIDER:MODEL`
+    /// when the part before the first `:` is a provider's name, else a
+    /// model of the default provider (so `llama3.1:8b` stays whole).
+    pub fn pick(p: *const Providers, value: []const u8) Choice {
+        if (std.mem.indexOfScalar(u8, value, ':')) |i| {
+            if (p.find(value[0..i])) |prov| return .{ .provider = prov, .model = value[i + 1 ..] };
+        }
+        return .{ .provider = &p.list[p.default], .model = value };
+    }
+
+    /// The providers `values` pick, each once, in the order first picked.
+    pub fn used(p: *const Providers, arena: std.mem.Allocator, values: []const []const u8) ![]const *const Provider {
+        var out: std.ArrayList(*const Provider) = .empty;
+        for (values) |v| {
+            const prov = p.pick(v).provider;
+            if (std.mem.indexOfScalar(*const Provider, out.items, prov) == null) try out.append(arena, prov);
+        }
+        return out.items;
+    }
+};
+
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -637,4 +866,41 @@ test "plain_send_keeps_system_a_string" {
     const body = try requestBody(arena.allocator(), "m", 10, .{ .stable = "sys", .cache = false }, &.{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }}, &.{});
     const v = jv.parse(arena.allocator(), body).?;
     try t.expectEqualStrings("sys", jv.str(jv.get(v, "system")).?);
+}
+
+fn testKeys(_: ?*anyopaque, _: std.mem.Allocator, provider: []const u8, _: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, provider, "openrouter")) return "or-test-key";
+    if (std.mem.eql(u8, provider, "local")) return "never-asked";
+    return null;
+}
+
+test "a_model_value_picks_its_provider_by_its_prefix" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const local: Section = .{ .name = "local", .api = .openai, .url = "http://127.0.0.1:11434/v1", .auth = .none };
+    const set = try Providers.resolve(a, .{ .sections = &.{local} }, .{ .get = testKeys });
+    const cases = [_][3][]const u8{
+        .{ "claude-sonnet", "omnigate", "claude-sonnet" },
+        .{ "openrouter:deepseek/deepseek-chat", "openrouter", "deepseek/deepseek-chat" },
+        .{ "local:llama3.1:8b", "local", "llama3.1:8b" },
+        // no provider is called llama3.1: a model of the default one
+        .{ "llama3.1:8b", "omnigate", "llama3.1:8b" },
+        .{ "openrouter:meta-llama/llama-3.3-70b-instruct:free", "openrouter", "meta-llama/llama-3.3-70b-instruct:free" },
+    };
+    for (cases) |c| {
+        const ch = set.pick(c[0]);
+        try t.expectEqualStrings(c[1], ch.provider.name);
+        try t.expectEqualStrings(c[2], ch.model);
+    }
+    const on_local = try Providers.resolve(a, .{ .default = "local", .sections = &.{local} }, no_keys);
+    try t.expectEqualStrings("local", on_local.pick("qwen2:7b").provider.name);
+    try t.expectEqualStrings("qwen2:7b", on_local.pick("qwen2:7b").model);
+    // keys are looked up by provider; one that needs none is never asked
+    try t.expectEqualStrings("or-test-key", set.find("openrouter").?.key);
+    try t.expect(set.find("openrouter").?.hasKey());
+    try t.expectEqualStrings("", set.find("local").?.key);
+    try t.expect(set.find("local").?.hasKey());
+    try t.expect(!set.find("anthropic").?.hasKey());
+    try t.expectEqual(2, (try set.used(a, &.{ "claude-sonnet", "local:x", "claude-haiku" })).len);
 }
