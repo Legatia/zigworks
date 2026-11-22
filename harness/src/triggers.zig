@@ -188,11 +188,13 @@ fn badf(a: Allocator, diag: *Diag, n: usize, comptime fmt: []const u8, args: any
 }
 
 /// The sections of `text` in the order they appear, as config.zig reads
-/// INI: comments after `;` or `#`, `[section]`, `key = value`; a line
-/// that is neither is an error. A section's lines are those after its
+/// INI: `[section]`, `key = value`, comments (in triggers.ini only whole
+/// lines starting with `;` or `#`, so free text keeps them: `say = PR
+/// #{number}`; elsewhere also after a space); a line that is neither is
+/// an error. A section's lines are those after its
 /// header up to the next header of another name; a name again later is an
 /// error; a header with no keys makes no section.
-fn groups(a: Allocator, text: []const u8, diag: *Diag) Error![]Group {
+fn groups(a: Allocator, text: []const u8, file: File, diag: *Diag) Error![]Group {
     var lines: std.ArrayList(Line) = .empty;
     var heads: std.ArrayList(Head) = .empty;
     var section: []const u8 = "";
@@ -202,7 +204,7 @@ fn groups(a: Allocator, text: []const u8, diag: *Diag) Error![]Group {
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |raw| {
         n += 1;
-        const line = std.mem.trim(u8, config.stripComment(raw), " \t\r");
+        const line = std.mem.trim(u8, if (file == .triggers) wholeLineComment(raw) else config.stripComment(raw), " \t\r");
         if (line.len == 0) {
             // "; added by …" right above a header marks it
             const whole = std.mem.trim(u8, raw, " \t\r");
@@ -250,13 +252,20 @@ fn groups(a: Allocator, text: []const u8, diag: *Diag) Error![]Group {
     return out.items;
 }
 
+/// `raw` unless it is a comment line (its first character past spaces `;`
+/// or `#`): "".
+fn wholeLineComment(raw: []const u8) []const u8 {
+    const tl = std.mem.trimStart(u8, raw, " \t");
+    return if (tl.len > 0 and (tl[0] == ';' or tl[0] == '#')) "" else raw;
+}
+
 /// Reads a tasks.ini, briefs.ini or triggers.ini: its sections as
 /// triggers. tasks.ini and briefs.ini take only their keys, as before; a
 /// name there that breaks the rule still reads (`name_ok` false). In
 /// triggers.ini the keys give the kind and a name must follow the rule.
 pub fn parse(a: Allocator, text: []const u8, file: File, diag: *Diag) Error![]Trigger {
     var out: std.ArrayList(Trigger) = .empty;
-    for (try groups(a, text, diag)) |g| {
+    for (try groups(a, text, file, diag)) |g| {
         var tr = switch (file) {
             .tasks => try taskSection(a, g, diag),
             .briefs => try briefSection(a, g, diag),
@@ -1183,4 +1192,17 @@ test "a_reading_says_what_runs_without_the_model" {
     try t.expectEqualStrings("Reads https://api.example.com/btc every 5 min (the value at data.amount), no model call; a new value whose move > 3 says: BTC {value}.", try reading(a, btc, "claude-haiku"));
     const bills = try parseOne(a, "[bills]\nfile = inbox/*.pdf\nskip = path has draft\ncheck = Is this a bill?\nagent = scout\ntools = read_file\nto = home\ndo = Say who wants how much.\n");
     try t.expectEqualStrings("Watches inbox/*.pdf every 1 min, asks claude-haiku \"Is this a bill?\" of each item the rules pass (at most 50 a day); a new, changed or removed file, unless path has \"draft\", starts a run of scout with tools read_file; at most 6 runs an hour; posts to home.", try reading(a, bills, "claude-haiku"));
+}
+
+test "in_triggers_ini_only_whole_lines_are_comments" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // free text keeps # and ; (an issue number, a list)
+    const tr = try parseOne(a, "; a comment\n# another\n[issues]\nsearch = zig\nsay = PR #{title}; see {link} # here\n");
+    try t.expectEqualStrings("PR #{title}; see {link} # here", tr.action.say);
+    // tasks.ini keeps config.ini's rule: after a space, a comment
+    var d: Diag = .{};
+    const ts = try parse(a, "[x]\nevery = 5m ; five minutes\ndo = Look #now\n", .tasks, &d);
+    try t.expectEqualStrings("Look", ts[0].action.do);
 }

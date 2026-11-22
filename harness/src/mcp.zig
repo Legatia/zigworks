@@ -3,7 +3,8 @@
 //!
 //! One reader thread per server takes lines off its stdout: responses are
 //! matched to the one call waiting (by id; late answers to calls that were
-//! stopped or timed out are dropped), notifications are skipped, and
+//! stopped or timed out are dropped), notifications are skipped but
+//! `notifications/resources/updated`, passed on to `updated`, and
 //! requests from the server are answered (`ping` with an empty result,
 //! anything else with -32601). A second thread drains stderr, keeping the
 //! last 2 KB for error messages.
@@ -291,6 +292,16 @@ pub const StartOptions = struct {
     diag: ?*Diag = null,
     /// Set: the start ends at once (error.Stopped).
     stop: ?*std.atomic.Value(bool) = null,
+    /// Where `notifications/resources/updated` goes (a trigger reads the
+    /// resource again).
+    updated: ?Updated = null,
+};
+
+/// Told a resource the server was asked to watch changed: the server's
+/// name and the resource's uri. Called on the server's reader thread.
+pub const Updated = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque, server: []const u8, uri: []const u8) void,
 };
 
 pub const Server = struct {
@@ -307,6 +318,11 @@ pub const Server = struct {
     stdout: Io.File,
     stderr: Io.File,
     tool_list: []Tool = &.{},
+    /// It offers `resources/subscribe` (its capabilities say so).
+    subscribes: bool = false,
+    /// Where `notifications/resources/updated` goes; set before its
+    /// reader starts.
+    updated: ?Updated = null,
 
     /// One call at a time.
     call_mutex: Io.Mutex = .init,
@@ -383,6 +399,7 @@ pub const Server = struct {
             .stdin = child.stdin.?,
             .stdout = child.stdout.?,
             .stderr = child.stderr.?,
+            .updated = opts.updated,
         };
         s.child.stdin = null;
         s.child.stdout = null;
@@ -407,6 +424,7 @@ pub const Server = struct {
         const init_raw = try s.request(tmp, "initialize", "{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"harness\",\"version\":\"" ++ @import("build_options").version ++ "\"}}", stop, deadline);
         const init_v = jv.parse(tmp, init_raw) orelse return error.BadResponse;
         if (jv.get(init_v, "result") == null) return error.InitFailed;
+        s.subscribes = jv.boolean(jv.at(init_v, &.{ "result", "capabilities", "resources", "subscribe" })) orelse false;
         try s.send(tmp, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
 
         var list: std.ArrayList(Tool) = .empty;
@@ -495,6 +513,46 @@ pub const Server = struct {
             if (jv.get(result, "structuredContent")) |sc| try out.appendSlice(arena, try std.json.Stringify.valueAlloc(arena, sc, .{}));
         }
         return .{ .text = cap(arena, out.items, max_bytes), .is_error = jv.boolean(jv.get(result, "isError")) orelse false };
+    }
+
+    /// resources/read: the text of its contents joined by "\n" (a blob as
+    /// "[blob]"), capped at `max_bytes`; is_error for a JSON-RPC error.
+    pub fn readResource(s: *Server, arena: std.mem.Allocator, uri: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32, max_bytes: usize) !Result {
+        var params: std.ArrayList(u8) = .empty;
+        try params.appendSlice(arena, "{\"uri\":");
+        try util.jsonString(&params, arena, uri);
+        try params.append(arena, '}');
+        s.call_mutex.lockUncancelable(s.io);
+        defer s.call_mutex.unlock(s.io);
+        const deadline = nowNs(s.io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
+        const raw = try s.request(arena, "resources/read", params.items, stop, deadline);
+        const v = jv.parse(arena, raw) orelse return error.BadResponse;
+        if (jv.get(v, "error")) |e| {
+            const msg = jv.str(jv.get(e, "message")) orelse "";
+            const code = jv.int(jv.get(e, "code")) orelse 0;
+            return .{ .text = cap(arena, try std.fmt.allocPrint(arena, "error {d}: {s}", .{ code, msg }), max_bytes), .is_error = true };
+        }
+        const result = jv.get(v, "result") orelse return error.BadResponse;
+        var out: std.ArrayList(u8) = .empty;
+        for (jv.arr(jv.get(result, "contents")) orelse &.{}) |item| {
+            if (out.items.len > 0) try out.append(arena, '\n');
+            try out.appendSlice(arena, jv.str(jv.get(item, "text")) orelse "[blob]");
+        }
+        return .{ .text = cap(arena, out.items, max_bytes), .is_error = false };
+    }
+
+    /// resources/subscribe: the server says when `uri` changes (`updated`).
+    pub fn subscribe(s: *Server, arena: std.mem.Allocator, uri: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32) !void {
+        var params: std.ArrayList(u8) = .empty;
+        try params.appendSlice(arena, "{\"uri\":");
+        try util.jsonString(&params, arena, uri);
+        try params.append(arena, '}');
+        s.call_mutex.lockUncancelable(s.io);
+        defer s.call_mutex.unlock(s.io);
+        const deadline = nowNs(s.io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
+        const raw = try s.request(arena, "resources/subscribe", params.items, stop, deadline);
+        const v = jv.parse(arena, raw) orelse return error.BadResponse;
+        if (jv.get(v, "error") != null) return error.Refused;
     }
 
     /// False once the server closed its output (it exited or crashed).
@@ -672,8 +730,12 @@ pub const Server = struct {
         const v = jv.parse(a, text) orelse return;
         if (v != .object) return;
         if (jv.str(jv.get(v, "method"))) |method| {
-            // a request needs an answer; a notification doesn't
-            const idv = jv.get(v, "id") orelse return;
+            // a request needs an answer; a notification doesn't (a
+            // resource that changed is passed on)
+            const idv = jv.get(v, "id") orelse {
+                if (std.mem.eql(u8, method, "notifications/resources/updated")) if (s.updated) |u| if (jv.str(jv.at(v, &.{ "params", "uri" }))) |uri| u.f(u.ctx, s.name, uri);
+                return;
+            };
             const id_json = std.json.Stringify.valueAlloc(a, idv, .{}) catch return;
             const reply = if (std.mem.eql(u8, method, "ping"))
                 std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{}}}}", .{id_json})
@@ -1223,4 +1285,51 @@ test "a_missing_or_broken_command_fails_to_start_with_its_stderr" {
     try t.expectError(error.ServerExited, r);
     try t.expect(nowMs() - t0 < 3000);
     try t.expect(std.mem.indexOf(u8, diag.text(), "broken") != null);
+}
+
+/// What `Server.updated` was told, for the tests.
+const Updates = struct {
+    n: std.atomic.Value(u32) = .init(0),
+    buf: [64]u8 = undefined,
+    len: usize = 0,
+
+    fn note(ctx: *anyopaque, server: []const u8, uri: []const u8) void {
+        const u: *Updates = @ptrCast(@alignCast(ctx));
+        _ = server;
+        const n = @min(uri.len, u.buf.len);
+        @memcpy(u.buf[0..n], uri[0..n]);
+        u.len = n;
+        _ = u.n.fetchAdd(1, .release);
+    }
+};
+
+test "resources_are_read_and_updates_passed_on" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/res.txt", .data = "version one" });
+    var ups: Updates = .{};
+    const s = try Server.start(t.allocator, t.io, .{ .name = "fake", .command = try std.fmt.allocPrint(f.a(), "\"{s}\" --mcp", .{f.fake}), .secrets = &.{}, .money = &.{} }, .{
+        .cwd = f.ws,
+        .path_var = "/usr/bin:/bin",
+        .home = "/home/tester",
+        .secret_values = &.{},
+        .start_timeout_ms = 10000,
+        .updated = .{ .ctx = &ups, .f = Updates.note },
+    });
+    defer s.deinit();
+    try t.expect(s.subscribes);
+    const r = try s.readResource(f.a(), "fake://res.txt", &f.stop, 5000, 4096);
+    try t.expect(!r.is_error);
+    try t.expectEqualStrings("version one", r.text);
+    try t.expect((try s.readResource(f.a(), "fake://none.txt", &f.stop, 5000, 4096)).is_error);
+    try s.subscribe(f.a(), "fake://res.txt", &f.stop, 5000);
+    // the server says it changed: passed on, not dropped
+    try t.expectEqualStrings("notified", (try f.call(s, "echo", "{\"text\":\"notify:fake://res.txt\"}", 5000)).text);
+    var waited: u32 = 0;
+    while (ups.n.load(.acquire) == 0 and waited < 3000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    try t.expectEqual(1, ups.n.load(.acquire));
+    try t.expectEqualStrings("fake://res.txt", ups.buf[0..ups.len]);
+    // the stand-in's echo reads a file of its folder
+    try t.expectEqualStrings("version one", (try f.call(s, "echo", "{\"text\":\"file:res.txt\"}", 5000)).text);
 }

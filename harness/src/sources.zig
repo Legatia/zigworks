@@ -18,8 +18,9 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 /// Why a read was refused; `final` when it can't mend itself (a role in
-/// folders.ini): the trigger pauses.
-pub const Refused = struct { why: []const u8, final: bool = false };
+/// folders.ini): the trigger pauses; `skipped` when it waits for the
+/// owner's grant (a skipped item says so): no failure.
+pub const Refused = struct { why: []const u8, final: bool = false, skipped: bool = false };
 
 /// How a poll's reads are decided and logged.
 pub const Decider = struct {
@@ -28,13 +29,17 @@ pub const Decider = struct {
     decide: *const fn (ctx: *anyopaque, a: Allocator, tool: gate.Tool, arg: []const u8) ?Refused,
     /// A redirect to `url`; `known_host`: the request reached that host.
     hop: *const fn (ctx: *anyopaque, a: Allocator, url: []const u8, known_host: bool) ?[]const u8,
+    /// A call no listing allows (a polled MCP tool): a rule or a grant for
+    /// the trigger; null: `decide`.
+    unlisted: ?*const fn (ctx: *anyopaque, a: Allocator, tool: gate.Tool, arg: []const u8) ?Refused = null,
 };
 
 /// How a poll reaches an MCP server.
 pub const Mcp = struct {
     ctx: *anyopaque,
+    /// tools/call; error.MoneyTool for a tool that moves money.
     call: *const fn (ctx: *anyopaque, a: Allocator, server: []const u8, tool: []const u8, input: []const u8) anyerror!Called,
-    read: *const fn (ctx: *anyopaque, a: Allocator, server: []const u8, uri: []const u8) anyerror![]const u8,
+    read: *const fn (ctx: *anyopaque, a: Allocator, server: []const u8, uri: []const u8) anyerror!Called,
 };
 
 pub const Called = struct { text: []const u8, is_error: bool = false };
@@ -71,6 +76,8 @@ pub const Outcome = struct {
     retry_after_s: ?u32 = null,
     /// It can't go on: why (the trigger pauses).
     pause: ?[]const u8 = null,
+    /// It waits for the owner's grant (a skipped item): why; no failure.
+    skipped: ?[]const u8 = null,
 };
 
 /// Polls `tr` once against `prev` (its state), `seen` (what it found
@@ -494,15 +501,115 @@ fn fileEvent(a: Allocator, path: []const u8, change: []const u8, size: u64, id: 
     }) };
 }
 
-/// mcp: read in a later step (Task 7).
+/// mcp: a resource (a listed read; one event when it changed) or a tool
+/// (no listed read: a rule or a grant for its trigger; a list gives an
+/// event per item whose `key` is new, anything else one when it changed).
+/// A money tool is never polled.
 fn pollMcp(env: Env, a: Allocator, tr: triggers.Trigger, prev: tstate.State, seen: *const brief.Seen, now_s: i64, out: *Outcome) !void {
-    _ = env;
-    _ = a;
-    _ = tr;
-    _ = prev;
-    _ = seen;
-    _ = now_s;
-    out.failed = "MCP sources are not read yet";
+    const m = tr.mcp.?;
+    const mc = env.mcp orelse {
+        out.failed = "no MCP server runs here";
+        return;
+    };
+    if (m.tool.len == 0) {
+        var arg: std.ArrayList(u8) = .empty;
+        try arg.print(a, "{s}/resources/read {{\"uri\":", .{m.server});
+        try util.jsonString(&arg, a, m.uri);
+        try arg.append(a, '}');
+        if (env.decider.decide(env.decider.ctx, a, .mcp, arg.items)) |r| return refusedRead(out, a, arg.items, r);
+        const got = mc.read(mc.ctx, a, m.server, m.uri) catch |e| {
+            out.failed = try std.fmt.allocPrint(a, "{s} resource {s}: {s}", .{ m.server, m.uri, @errorName(e) });
+            return;
+        };
+        out.bytes = got.text.len;
+        if (got.is_error) {
+            out.failed = try std.fmt.allocPrint(a, "{s} resource {s}: {s}", .{ m.server, m.uri, util.cut(got.text, 200) });
+            return;
+        }
+        return changedText(a, prev, got.text, now_s, out);
+    }
+    const arg = try std.fmt.allocPrint(a, "{s}/{s} {s}", .{ m.server, m.tool, m.input });
+    const decide = env.decider.unlisted orelse env.decider.decide;
+    if (decide(env.decider.ctx, a, .mcp, arg)) |r| {
+        if (r.skipped) {
+            out.skipped = r.why;
+            return;
+        }
+        return refusedRead(out, a, arg, r);
+    }
+    const got = mc.call(mc.ctx, a, m.server, m.tool, m.input) catch |e| {
+        if (e == error.MoneyTool) {
+            out.pause = try std.fmt.allocPrint(a, "{s}/{s} moves money: it is never polled", .{ m.server, m.tool });
+        } else out.failed = try std.fmt.allocPrint(a, "{s}/{s}: {s}", .{ m.server, m.tool, @errorName(e) });
+        return;
+    };
+    out.bytes = got.text.len;
+    if (got.is_error) {
+        out.failed = try std.fmt.allocPrint(a, "{s}/{s} said: {s}", .{ m.server, m.tool, util.cut(got.text, 200) });
+        return;
+    }
+    if (jv.parse(a, got.text)) |v| if (v == .array) {
+        var found: std.ArrayList(Found) = .empty;
+        var all: std.ArrayList([]const u8) = .empty;
+        for (v.array.items) |item| {
+            const key = try itemKey(a, item, tr.key);
+            const known = for (all.items) |k| {
+                if (std.mem.eql(u8, k, key)) break true;
+            } else false;
+            if (known) continue;
+            try all.append(a, key);
+            // a first poll only marks
+            if (!prev.polled or seen.has(key)) continue;
+            var fields: std.ArrayList(triggers.Field) = .empty;
+            if (item == .object) {
+                var it = item.object.iterator();
+                while (it.next()) |e| try fields.append(a, .{ .name = e.key_ptr.*, .value = util.cut(try valueText(a, e.value_ptr.*), field_max) });
+            } else try fields.append(a, .{ .name = "text", .value = util.cut(try valueText(a, item), field_max) });
+            try found.append(a, .{ .event = .{ .id = try hashHex(a, key), .at = now_s, .fields = fields.items }, .seen = key });
+        }
+        out.found = found.items;
+        out.seen_all = all.items;
+        out.next.polled = true;
+        return;
+    };
+    return changedText(a, prev, got.text, now_s, out);
+}
+
+/// What tells an MCP tool's list item apart: its `key` field as text, else
+/// the hash of the whole item.
+fn itemKey(a: Allocator, item: jv.Value, key: []const u8) ![]const u8 {
+    if (item == .object) if (item.object.get(key)) |k| return std.fmt.allocPrint(a, "{s}={s}", .{ key, try valueText(a, k) });
+    return hashHex(a, try std.json.Stringify.valueAlloc(a, item, .{}));
+}
+
+/// A JSON value as text: a string as it is, a number as written, anything
+/// else as JSON.
+fn valueText(a: Allocator, v: jv.Value) ![]const u8 {
+    return switch (v) {
+        .string => |x| x,
+        .number_string => |x| x,
+        .integer => |x| std.fmt.allocPrint(a, "{d}", .{x}),
+        .float => |x| std.fmt.allocPrint(a, "{d}", .{x}),
+        .bool => |x| if (x) "true" else "false",
+        .null => "null",
+        else => std.json.Stringify.valueAlloc(a, v, .{}),
+    };
+}
+
+/// One event `{text}` when `text` is not what the last poll saw (by its
+/// hash); a first poll only marks.
+fn changedText(a: Allocator, prev: tstate.State, text: []const u8, now_s: i64, out: *Outcome) !void {
+    const h = try hashHex(a, text);
+    out.next.polled = true;
+    if (!prev.polled) {
+        out.next.hash = h;
+        return;
+    }
+    if (std.mem.eql(u8, h, prev.hash)) return;
+    out.next.hash = h;
+    const id = try hashHex(a, try std.mem.concat(a, u8, &.{ prev.hash, "\x00", h }));
+    const fields = try a.dupe(triggers.Field, &.{.{ .name = "text", .value = util.cut(text, field_max) }});
+    out.found = try a.dupe(Found, &.{.{ .event = .{ .id = id, .at = now_s, .fields = fields } }});
 }
 
 // ---- tests ----

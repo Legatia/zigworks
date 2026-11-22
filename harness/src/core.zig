@@ -251,11 +251,15 @@ const TrigInfo = struct {
     /// Events queued and not done, and of them those not checked yet.
     pending: u32 = 0,
     unchecked: u32 = 0,
+    /// An MCP resource it reads, "SERVER\x00URI" ("" none): read again
+    /// when the server says it changed.
+    source: []u8 = &.{},
 };
 
 fn freeInfo(gpa: std.mem.Allocator, info: *TrigInfo) void {
     info.arena.deinit();
     gpa.free(info.name);
+    gpa.free(info.source);
     gpa.destroy(info);
 }
 
@@ -366,6 +370,9 @@ pub const Core = struct {
     trig_stop_after_queue: bool = false,
     /// Schedules and triggers told that their workflow can't start yet.
     told_workflows: std.ArrayList([]u8) = .empty,
+    /// The MCP resources subscribed to since the servers started
+    /// ("SERVER\x00URI"); under mcp_mutex.
+    subscribed: std.ArrayList([]u8) = .empty,
     told_settings_changed: bool = false,
     secrets: Secrets,
     /// The stored secrets read at open. What every tool's output is
@@ -554,6 +561,7 @@ pub const Core = struct {
         c.poller_on = false;
         c.trig_stop_after_queue = false;
         c.told_workflows = .empty;
+        c.subscribed = .empty;
         try c.loadSettings(sa);
         c.secrets = secrets;
         var sl: std.ArrayList(scrub.Secret) = .empty;
@@ -713,6 +721,8 @@ pub const Core = struct {
         c.told_topics.deinit(c.gpa);
         for (c.told_workflows.items) |n| c.gpa.free(n);
         c.told_workflows.deinit(c.gpa);
+        for (c.subscribed.items) |n| c.gpa.free(n);
+        c.subscribed.deinit(c.gpa);
         for (c.trig_info.items) |info| freeInfo(c.gpa, info);
         c.trig_info.deinit(c.gpa);
         c.trig_arena.deinit();
@@ -2617,6 +2627,7 @@ pub const Core = struct {
                 .deadline_ns = st.deadline_ns,
                 .diag = &st.diag,
                 .stop = st.stop,
+                .updated = .{ .ctx = c, .f = resourceUpdated },
             }) catch |e| {
                 st.err = e;
                 return;
@@ -2630,6 +2641,14 @@ pub const Core = struct {
     fn startMcp(c: *Core) void {
         c.mcp_starting.store(true, .release);
         defer c.mcp_starting.store(false, .release);
+        {
+            c.mcp_mutex.lockUncancelable(c.io);
+            defer c.mcp_mutex.unlock(c.io);
+            for (c.subscribed.items) |n| c.gpa.free(n);
+            c.subscribed.clearRetainingCapacity();
+        }
+        // the resources triggers read, once the servers are up
+        defer c.subscribeResources();
         c.mcp_arena = .init(c.gpa);
         c.mcp_tools = &.{};
         c.mcp_note = "";
@@ -4119,9 +4138,21 @@ pub const Core = struct {
             freeInfo(c.gpa, info);
         }
         for (c.trig_list) |tr| {
-            if (!tr.isEvent() or c.infoOf(tr.name) != null) continue;
-            const info = c.loadInfo(tr.name) catch continue;
-            c.trig_info.append(c.gpa, info) catch freeInfo(c.gpa, info);
+            if (!tr.isEvent()) continue;
+            const info = c.infoOf(tr.name) orelse blk: {
+                const made = c.loadInfo(tr.name) catch continue;
+                c.trig_info.append(c.gpa, made) catch {
+                    freeInfo(c.gpa, made);
+                    continue;
+                };
+                break :blk made;
+            };
+            // the resource it reads, as the list says now
+            const m = tr.mcp orelse continue;
+            if (m.tool.len > 0) continue;
+            const source = std.mem.concat(c.gpa, u8, &.{ m.server, "\x00", m.uri }) catch continue;
+            c.gpa.free(info.source);
+            info.source = source;
         }
     }
 
@@ -4253,6 +4284,49 @@ pub const Core = struct {
     /// of the poll's run. A redirect is followed as for briefs.
     const ListedReads = struct {
         run: *agent.Run,
+        core: *Core,
+        /// "trigger NAME", and the conversation its items go to.
+        label: []const u8,
+        to: []const u8,
+
+        /// A polled MCP tool: no listing allows it (harness can't know it
+        /// only reads), so a rule or a grant for this trigger must; a
+        /// call that only the owner could allow is kept as a skipped item
+        /// ("Allow for this trigger"), once, counted up after.
+        fn unlisted(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) ?sources.Refused {
+            const l: *ListedReads = @ptrCast(@alignCast(ctx));
+            const r = l.run;
+            const now_s = util.nowSeconds(r.io);
+            const d = blk: {
+                r.lock.lockUncancelable(r.io);
+                defer r.lock.unlock(r.io);
+                break :blk r.gate.decide(a, tool, arg, now_s, .{ .scheduled = true, .who = r.who });
+            };
+            r.logRun(.gate, false, .{ .tool = @tagName(tool), .decision = @tagName(d.action), .why = d.why, .arg = arg }) catch {};
+            if (d.action == .allow) return null;
+            if (d.role) return .{ .why = d.why, .final = true };
+            // the same call where someone could answer: asked, so a grant can let it
+            const attended = blk: {
+                r.lock.lockUncancelable(r.io);
+                defer r.lock.unlock(r.io);
+                break :blk r.gate.decide(a, tool, arg, now_s, .{ .who = r.who });
+            };
+            if (attended.action != .ask) return .{ .why = d.why };
+            const item = l.core.keepSkip(a, .{
+                .tool = tool,
+                .env = "",
+                .name = @tagName(tool),
+                .arg = arg,
+                .key = gate.grantKey(tool, d.subject),
+                .grantable = true,
+                .who = r.who,
+                .rid = r.rid,
+                .label = l.label,
+                .conversation = l.to,
+                .private = false,
+            }) catch 0;
+            return .{ .why = std.fmt.allocPrint(a, "it needs an allow rule or a grant for {s} (item {d})", .{ r.who.by, item }) catch "it needs an allow rule or a grant", .skipped = true };
+        }
 
         fn decide(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) ?sources.Refused {
             const l: *ListedReads = @ptrCast(@alignCast(ctx));
@@ -4286,6 +4360,91 @@ pub const Core = struct {
     /// A poll's longest time, its reads and redirects all.
     const poll_seconds = 120;
 
+    /// How a poll reaches the MCP servers.
+    const McpReads = struct {
+        core: *Core,
+        stop: *std.atomic.Value(bool),
+
+        fn call(ctx: *anyopaque, a: std.mem.Allocator, server: []const u8, tool: []const u8, input: []const u8) anyerror!sources.Called {
+            const m: *McpReads = @ptrCast(@alignCast(ctx));
+            const mt = for (m.core.mcp_tools) |*x| {
+                if (std.mem.eql(u8, x.server.name, server) and std.mem.eql(u8, x.tool, tool)) break x;
+            } else return error.NoSuchTool;
+            if (mt.money) return error.MoneyTool;
+            const res = try mt.server.call(a, tool, input, m.stop, poll_seconds * 1000, 1 << 20);
+            return .{ .text = res.text, .is_error = res.is_error };
+        }
+
+        fn read(ctx: *anyopaque, a: std.mem.Allocator, server: []const u8, uri: []const u8) anyerror!sources.Called {
+            const m: *McpReads = @ptrCast(@alignCast(ctx));
+            const srv = m.core.serverNamed(server) orelse return error.ServerNotRunning;
+            const res = try srv.readResource(a, uri, m.stop, poll_seconds * 1000, 1 << 20);
+            return .{ .text = res.text, .is_error = res.is_error };
+        }
+    };
+
+    /// The MCP server called `name`, if it runs.
+    fn serverNamed(c: *Core, name: []const u8) ?*mcp.Server {
+        c.mcp_mutex.lockUncancelable(c.io);
+        defer c.mcp_mutex.unlock(c.io);
+        for (c.mcp_servers.items) |s| if (std.mem.eql(u8, s.name, name)) return s;
+        return null;
+    }
+
+    /// A server says a resource changed: the triggers that read it poll
+    /// at the next tick. On the server's reader thread.
+    fn resourceUpdated(ctx: *anyopaque, server: []const u8, uri: []const u8) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        c.trig_mutex.lockUncancelable(c.io);
+        defer c.trig_mutex.unlock(c.io);
+        for (c.trig_info.items) |info| {
+            const s = info.source;
+            if (s.len != server.len + 1 + uri.len or !std.mem.startsWith(u8, s, server) or s[server.len] != 0 or !std.mem.endsWith(u8, s, uri)) continue;
+            info.state.next = c.now();
+        }
+    }
+
+    /// Asks each MCP server that takes subscriptions to say when a
+    /// resource a trigger reads changes; once per server start.
+    fn subscribeResources(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var keys: std.ArrayList([]const u8) = .empty;
+        {
+            c.settings_mutex.lockUncancelable(c.io);
+            defer c.settings_mutex.unlock(c.io);
+            for (c.trig_list) |tr| if (tr.mcp) |m| if (m.tool.len == 0) {
+                keys.append(a, std.mem.concat(a, u8, &.{ m.server, "\x00", m.uri }) catch continue) catch {};
+            };
+        }
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "");
+        defer c.unregister(&flag);
+        for (keys.items) |key| {
+            const zero = std.mem.indexOfScalar(u8, key, 0).?;
+            const server = key[0..zero];
+            const uri = key[zero + 1 ..];
+            const srv = blk: {
+                c.mcp_mutex.lockUncancelable(c.io);
+                defer c.mcp_mutex.unlock(c.io);
+                for (c.subscribed.items) |x| if (std.mem.eql(u8, x, key)) break :blk null;
+                for (c.mcp_servers.items) |s| if (std.mem.eql(u8, s.name, server)) break :blk s;
+                break :blk null;
+            } orelse continue;
+            if (!srv.subscribes) continue;
+            srv.subscribe(a, uri, &flag, 5000) catch |e| {
+                c.log.write(.trigger, false, .{ .event = "not subscribed", .server = server, .uri = uri, .why = @errorName(e) }) catch {};
+                continue;
+            };
+            c.mcp_mutex.lockUncancelable(c.io);
+            defer c.mcp_mutex.unlock(c.io);
+            const owned = c.gpa.dupe(u8, key) catch continue;
+            c.subscribed.append(c.gpa, owned) catch c.gpa.free(owned);
+            c.log.write(.trigger, false, .{ .event = "subscribed", .server = server, .uri = uri }) catch {};
+        }
+    }
+
     /// Polls event trigger `name` now, on this thread: its reads pass the
     /// gate as listed, its events are masked and filtered, queued, and
     /// only then do its cursor and `seen` move.
@@ -4314,17 +4473,19 @@ pub const Core = struct {
         c.register(&flag, "");
         defer c.unregister(&flag);
         var run = c.runAs(&client, try std.fmt.allocPrint(a, "poll {s}", .{name}), .{ .by = try std.fmt.allocPrint(a, "trigger:{s}", .{name}), .agent = "" }, &flag);
-        var reads: ListedReads = .{ .run = &run };
+        var reads: ListedReads = .{ .run = &run, .core = c, .label = try std.fmt.allocPrint(a, "trigger {s}", .{name}), .to = tr.to };
+        var mcp_reads: McpReads = .{ .core = c, .stop = &flag };
         const now_s = c.now();
         const out = try sources.poll(.{
             .gpa = c.gpa,
             .io = c.io,
-            .decider = .{ .ctx = &reads, .decide = ListedReads.decide, .hop = ListedReads.hop },
+            .decider = .{ .ctx = &reads, .decide = ListedReads.decide, .hop = ListedReads.hop, .unlisted = ListedReads.unlisted },
             .workspace = c.workspace,
             .search_url = c.cfg.search.url,
             .search_key = c.secrets.search,
             .stop = &flag,
             .deadline_s = util.nowSeconds(c.io) + poll_seconds,
+            .mcp = .{ .ctx = &mcp_reads, .call = McpReads.call, .read = McpReads.read },
         }, a, tr, prev, &seen, last, now_s);
         return c.commitPoll(a, &run, tr, prev, out, &seen, now_s);
     }
@@ -4422,7 +4583,7 @@ pub const Core = struct {
             next.paused = info.state.paused;
             try c.setState(info, next);
         }
-        try run.logRun(.trigger, false, .{ .name = tr.name, .event = "poll", .status = out.status, .bytes = out.bytes, .new = out.found.len, .queued = queued.items.len, .why = out.failed orelse out.pause });
+        try run.logRun(.trigger, false, .{ .name = tr.name, .event = "poll", .status = out.status, .bytes = out.bytes, .new = out.found.len, .queued = queued.items.len, .why = out.failed orelse out.pause orelse out.skipped });
         if (out.pause) |why| c.pauseTrigger(tr.name, why);
         if (full) c.pauseTrigger(tr.name, try std.fmt.allocPrint(a, "its queue is full ({d} events wait)", .{c.cfg.triggers.queue}));
         return polled;
@@ -10701,4 +10862,85 @@ test "checks_past_the_cap_wait" {
     waitIdle(f.core);
     try f.rec.waitFor("[news] c");
     try t.expectEqual(2, f.e.server.modelRequests());
+}
+
+/// mcp.ini with the stand-in as server `fake` (its echo a money tool when
+/// `money`), applied; its folder for files it reads.
+fn withFake(f: *Fix, money: bool) ![]const u8 {
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\n{s}", .{ fake, if (money) "money = echo\namount = amount\n" else "" }) });
+    const dir = try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "fake" });
+    try Io.Dir.cwd().createDirPath(t.io, dir);
+    return dir;
+}
+
+test "a_polled_mcp_tool_needs_a_rule_or_a_grant_for_its_trigger" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const dir = try withFake(&f, false);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "issues.json" }), .data = "[{\"number\":1,\"title\":\"first\"}]" });
+    try setTriggers(&f, "[issues]\nmcp = fake/echo {\"text\":\"file:issues.json\"}\nkey = number\nsay = #{number} {title}\n");
+    // no rule, no grant: not called, kept as an item for this trigger, once
+    const got = try f.core.pollNow("issues");
+    try t.expectEqual(0, got.new);
+    try t.expectEqual(null, got.failed);
+    try f.rec.waitFor("BUTTONS Skipped [1]: trigger issues could not make this call without you:\nmcp: fake/echo {\"text\":\"file:issues.json\"}");
+    _ = try f.core.pollNow("issues");
+    try t.expectEqual(1, f.rec.count("BUTTONS Skipped ["));
+    try waitInbox(&f, "\"count\":2");
+    try t.expectEqual(0, stateOf(&f, "issues").failures);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"tool\":\"echo\"") == null);
+    // allowed for this trigger: the next poll calls it; a first call marks
+    const b = f.rec.buttonsWith("Skipped [1]").?;
+    f.core.handleCallback(42, b.msg, b.get("allow").?);
+    try f.rec.waitFor("\nAllowed for this trigger for 30 days, ");
+    try t.expect(std.mem.indexOf(u8, try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.grants, a, .unlimited), "\tfake/echo\ttrigger:issues\n") != null);
+    try t.expectEqual(0, (try f.core.pollNow("issues")).queued);
+    // a new item, by its number: once
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "issues.json" }), .data = "[{\"number\":1,\"title\":\"first\"},{\"number\":2,\"title\":\"second\"}]" });
+    try t.expectEqual(1, (try f.core.pollNow("issues")).queued);
+    try t.expectEqual(0, (try f.core.pollNow("issues")).queued);
+    f.core.tick();
+    waitIdle(f.core);
+    try f.rec.waitFor("[issues] #2 second");
+}
+
+test "a_polled_money_tool_pauses_its_trigger" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    _ = try withFake(&f, true);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp fake/echo *\n" });
+    try setTriggers(&f, "[buy]\nmcp = fake/echo {\"text\":\"x\",\"amount\":1}\nsay = {text}\n");
+    _ = try f.core.pollNow("buy");
+    try f.rec.waitFor("Trigger buy is paused: fake/echo moves money: it is never polled");
+}
+
+test "an_mcp_resource_is_read_again_when_it_says_it_changed" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const dir = try withFake(&f, false);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "notes.txt" }), .data = "v1" });
+    try setTriggers(&f, "[notes]\nmcp = fake resource fake://notes.txt\nsay = Notes changed: {text}\n");
+    _ = try f.core.pollNow("notes");
+    try t.expect(stateOf(&f, "notes").polled);
+    const t0 = util.nowSeconds(t.io);
+    try t.expect(stateOf(&f, "notes").next > t0);
+    // the server says it changed: due now
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "notes.txt" }), .data = "v2" });
+    var stop: std.atomic.Value(bool) = .init(false);
+    _ = try f.core.mcp_servers.items[0].call(a, "echo", "{\"text\":\"notify:fake://notes.txt\"}", &stop, 5000, 4096);
+    var waited: u32 = 0;
+    while (stateOf(&f, "notes").next > util.nowSeconds(t.io) and waited < 3000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    try t.expect(stateOf(&f, "notes").next <= util.nowSeconds(t.io));
+    try t.expectEqual(1, (try f.core.pollNow("notes")).queued);
+    f.core.tick();
+    waitIdle(f.core);
+    try f.rec.waitFor("[notes] Notes changed: v2");
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"tool\":\"mcp\",\"decision\":\"allow\",\"why\":\"listed in triggers.ini\",\"arg\":\"fake/resources/read {\\\"uri\\\":\\\"fake://notes.txt\\\"}\"") != null);
 }
