@@ -1,0 +1,15 @@
+.{
+    .name = .carcloud,
+    .version = "0.1.0",
+    .fingerprint = 0xa413726334d00903,
+    .minimum_zig_version = "0.17.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "examples",
+        "README.md",
+        "LICENSE",
+    },
+}
