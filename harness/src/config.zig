@@ -394,9 +394,11 @@ pub const rules_example =
     \\# every time, whatever the rules; the others are allowed.
     \\# send (a post) to a conversation others read is asked every time
     \\# unless an allow rule names it (allow send family).
+    \\# agent_save (a new agent definition, or a change to the agent's own)
+    \\# is asked every time, whatever the rules; a deny rule stops it.
     \\# Not used yet (their tools come later): mail, trigger rm and workflow
-    \\# start and stop ask; agent_save, app_save, env_save, trigger add and
-    \\# workflow save are asked every time.
+    \\# start and stop ask; app_save, env_save, trigger add and workflow save
+    \\# are asked every time.
     \\# A line [agent:NAME], [owner] or [schedule:NAME] starts rules for those
     \\# calls only; [all] goes back to rules for every call. shell@NAME is for
     \\# commands in environment NAME (host is the only one for now).

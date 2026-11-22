@@ -305,6 +305,184 @@ pub const builtin_helper: Def = .{
 /// The built-ins, in the order they are listed.
 pub const builtins = [_]*const Def{ &builtin_helper, &builtin_main };
 
+// ---- a change's reading ----
+
+/// What a definition's unset limits are: `[limits]` for a run of its
+/// own, `[agents]` for a delegated one.
+pub const Defaults = struct {
+    steps: u32 = 20,
+    seconds: u32 = 600,
+    delegated_steps: u32 = 12,
+    delegated_tokens: u32 = 150000,
+    answer_bytes: u32 = 4000,
+};
+
+/// Harness's reading of a new text against the old: each header field
+/// that changes, as a line ("model: claude-haiku → claude-sonnet").
+pub const Comparison = struct {
+    /// Tools, MCP tools or skills added; memory to shared; model or
+    /// environment changed; a limit raised. For a new definition: what it
+    /// may use.
+    widens: []const []const u8,
+    other: []const []const u8,
+};
+
+pub fn compare(a: std.mem.Allocator, old_def: ?Def, new: Def, d: Defaults) !Comparison {
+    var widens: std.ArrayList([]const u8) = .empty;
+    var other: std.ArrayList([]const u8) = .empty;
+    const old = old_def orelse {
+        // a new definition: what it may use, as harness reads it
+        try widens.append(a, try std.fmt.allocPrint(a, "tools: {s}", .{try listText(a, new.tools)}));
+        try widens.append(a, try std.fmt.allocPrint(a, "skills: {s}", .{try listText(a, new.skills)}));
+        try widens.append(a, try std.fmt.allocPrint(a, "model: {s}", .{if (new.model.len > 0) new.model else "default ([model] model; worker_model when delegated)"}));
+        try widens.append(a, try std.fmt.allocPrint(a, "memory: {s}", .{@tagName(new.memory)}));
+        inline for (limit_fields) |lf| if (@field(new, lf)) |v| try widens.append(a, try std.fmt.allocPrint(a, "{s}: {d}", .{ lf, v }));
+        if (new.parallel > 0) try widens.append(a, try std.fmt.allocPrint(a, "parallel: {d}", .{new.parallel}));
+        try widens.append(a, try std.fmt.allocPrint(a, "environment: {s}", .{new.environment}));
+        return .{ .widens = widens.items, .other = other.items };
+    };
+    if (!std.mem.eql(u8, old.description, new.description)) try other.append(a, try std.fmt.allocPrint(a, "description: {s} → {s}", .{ old.description, new.description }));
+    // tools and skills: one the old ones did not cover widens
+    inline for (.{ "tools", "skills" }) |field| {
+        const was = @field(old, field);
+        const now = @field(new, field);
+        if (!sameList(was, now)) {
+            var added: std.ArrayList([]const u8) = .empty;
+            var dropped: std.ArrayList([]const u8) = .empty;
+            for (now) |p| if (!covered(field, was, p)) try added.append(a, p);
+            for (was) |p| if (!covered(field, now, p)) try dropped.append(a, p);
+            var line: std.ArrayList(u8) = .empty;
+            try line.print(a, "{s}: {s} → {s}", .{ field, try listText(a, was), try listText(a, now) });
+            if (added.items.len > 0) try line.print(a, " (adds {s})", .{try std.mem.join(a, ", ", added.items)});
+            try (if (added.items.len > 0) &widens else &other).append(a, line.items);
+        }
+    }
+    if (!std.mem.eql(u8, old.model, new.model)) try widens.append(a, try std.fmt.allocPrint(a, "model: {s} → {s}", .{ orDefault(old.model), orDefault(new.model) }));
+    if (old.memory != new.memory) try (if (new.memory == .shared) &widens else &other).append(a, try std.fmt.allocPrint(a, "memory: {s} → {s}", .{ @tagName(old.memory), @tagName(new.memory) }));
+    if (!std.mem.eql(u8, old.environment, new.environment)) try widens.append(a, try std.fmt.allocPrint(a, "environment: {s} → {s}", .{ old.environment, new.environment }));
+    // a limit is raised when a run of its own or a delegated one may do more
+    inline for (limit_fields) |lf| {
+        const was = @field(old, lf);
+        const now = @field(new, lf);
+        if (was != now) {
+            const own = ownDefault(lf, d);
+            const del = delegatedDefault(lf, d);
+            const raised = effective(now, own) > effective(was, own) or effective(now, del) > effective(was, del);
+            try (if (raised) &widens else &other).append(a, try std.fmt.allocPrint(a, "{s}: {s} → {s}", .{ lf, try limitText(a, was), try limitText(a, now) }));
+        }
+    }
+    if (old.parallel != new.parallel) {
+        // 0 is no cap of its own: the most
+        const raised = old.parallel != 0 and (new.parallel == 0 or new.parallel > old.parallel);
+        try (if (raised) &widens else &other).append(a, try std.fmt.allocPrint(a, "parallel: {d} → {d}", .{ old.parallel, new.parallel }));
+    }
+    if (!std.mem.eql(u8, old.body, new.body)) try other.append(a, "instructions: changed (the whole file is below)");
+    return .{ .widens = widens.items, .other = other.items };
+}
+
+const limit_fields = .{ "steps", "tokens", "seconds", "answer_bytes" };
+
+/// The most a limit allows; none at all is the most there is.
+const unlimited = std.math.maxInt(u64);
+
+/// What an unset limit is for a run of its own.
+fn ownDefault(comptime field: []const u8, d: Defaults) u64 {
+    if (comptime std.mem.eql(u8, field, "steps")) return d.steps;
+    if (comptime std.mem.eql(u8, field, "seconds")) return d.seconds;
+    // no token cap of its own; an answer's size is a delegated run's
+    return unlimited;
+}
+
+/// What an unset limit is for a delegated run (its seconds never past its
+/// parent's turn).
+fn delegatedDefault(comptime field: []const u8, d: Defaults) u64 {
+    if (comptime std.mem.eql(u8, field, "steps")) return d.delegated_steps;
+    if (comptime std.mem.eql(u8, field, "tokens")) return d.delegated_tokens;
+    if (comptime std.mem.eql(u8, field, "seconds")) return d.seconds;
+    return d.answer_bytes;
+}
+
+fn effective(v: ?u32, default: u64) u64 {
+    return if (v) |x| x else default;
+}
+
+fn limitText(a: std.mem.Allocator, v: ?u32) ![]const u8 {
+    return if (v) |x| std.fmt.allocPrint(a, "{d}", .{x}) else "default";
+}
+
+fn orDefault(model: []const u8) []const u8 {
+    return if (model.len > 0) model else "default";
+}
+
+fn listText(a: std.mem.Allocator, list: []const []const u8) ![]const u8 {
+    if (list.len == 0) return "none";
+    return std.mem.join(a, ", ", list);
+}
+
+fn sameList(x: []const []const u8, y: []const []const u8) bool {
+    if (x.len != y.len) return false;
+    for (x, y) |p, q| if (!std.mem.eql(u8, p, q)) return false;
+    return true;
+}
+
+/// Whether one of `list` already takes all that pattern `p` takes.
+fn covered(comptime field: []const u8, list: []const []const u8, p: []const u8) bool {
+    for (list) |q| {
+        if (std.mem.eql(u8, q, "*") or std.mem.eql(u8, q, p)) return true;
+        if (comptime std.mem.eql(u8, field, "tools")) {
+            // a server's tools, or any MCP tool
+            const slash = std.mem.indexOfScalar(u8, p, '/') orelse continue;
+            if (std.mem.eql(u8, q, "*/*")) return true;
+            if (std.mem.endsWith(u8, q, "/*") and std.mem.eql(u8, q[0 .. q.len - 2], p[0..slash]) and !std.mem.eql(u8, p, "*/*")) return true;
+        } else if (rules.glob(q, p)) return true;
+    }
+    return false;
+}
+
+/// The question's part that says what changes: "Widens:" first, then the
+/// rest; for a new definition what it may use.
+pub fn readingText(a: std.mem.Allocator, old: ?Def, c: Comparison) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    if (old == null) {
+        try out.appendSlice(a, "It may use:\n");
+        for (c.widens) |l| try out.print(a, "- {s}\n", .{l});
+        return out.items;
+    }
+    if (c.widens.len > 0) {
+        try out.appendSlice(a, "Widens:\n");
+        for (c.widens) |l| try out.print(a, "- {s}\n", .{l});
+    }
+    if (c.other.len > 0) {
+        try out.appendSlice(a, "Other changes:\n");
+        for (c.other) |l| try out.print(a, "- {s}\n", .{l});
+    }
+    if (out.items.len == 0) try out.appendSlice(a, "No field changes.\n");
+    return out.items;
+}
+
+/// `text` with its header's `saved:` line saying `value` (any the text
+/// had dropped), put last in the header; the rest as it was. A text
+/// without a header is returned as it was (the parser refuses it).
+pub fn withSaved(a: std.mem.Allocator, text: []const u8, value: []const u8) ![]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const first = lines.next() orelse return text;
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, std.mem.trimStart(u8, first, "\xEF\xBB\xBF"), "\r"), "---")) return text;
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(a, "{s}\n", .{first});
+    while (lines.next()) |line| {
+        const bare = std.mem.trimEnd(u8, line, "\r");
+        if (std.mem.eql(u8, bare, "---")) {
+            try out.print(a, "saved: {s}\n{s}", .{ value, line });
+            if (lines.rest().len > 0 or lines.index != null) try out.append(a, '\n');
+            try out.appendSlice(a, lines.rest());
+            return out.items;
+        }
+        if (std.mem.startsWith(u8, bare, "saved:")) continue;
+        try out.print(a, "{s}\n", .{line});
+    }
+    return text;
+}
+
 // ---- the folder ----
 
 /// The definitions of a data folder: the built-ins, then each
@@ -1049,4 +1227,62 @@ test "a_change_on_disk_is_noticed_and_a_save_is_not" {
     try t.expect(!f.set.changedOnDisk());
     try f.tmp.dir.deleteFile(t.io, "agents/researcher.md");
     try t.expect(f.set.changedOnDisk());
+}
+
+test "agent_save_lists_what_widens_first" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diag = .{};
+    const old = try parse(a, "researcher", "---\nname: researcher\ndescription: Research.\nmodel: claude-haiku\ntools: search, fetch\nskills: zig-*\nmemory: pinned\nsteps: 8\n---\nOld.\n", &diag);
+    const new = try parse(a, "researcher", "---\nname: researcher\ndescription: Research across sources.\nmodel: claude-sonnet\ntools: search, fetch, shell, github/*\nskills: zig-build\nsteps: 50\n---\nNew.\n", &diag);
+    const c = try compare(a, old, new, .{});
+    const widens = try std.mem.join(a, "\n", c.widens);
+    const other = try std.mem.join(a, "\n", c.other);
+    for ([_][]const u8{
+        "tools: search, fetch → search, fetch, shell, github/* (adds shell, github/*)",
+        "model: claude-haiku → claude-sonnet",
+        "memory: pinned → shared",
+        "steps: 8 → 50",
+    }) |want| {
+        if (std.mem.indexOf(u8, widens, want) == null) std.debug.print("widens has no \"{s}\":\n{s}\n", .{ want, widens });
+        try t.expect(std.mem.indexOf(u8, widens, want) != null);
+    }
+    for ([_][]const u8{ "description: Research. → Research across sources.", "skills: zig-* → zig-build", "instructions: changed" }) |want| {
+        if (std.mem.indexOf(u8, other, want) == null) std.debug.print("other has no \"{s}\":\n{s}\n", .{ want, other });
+        try t.expect(std.mem.indexOf(u8, other, want) != null);
+    }
+    const text = try readingText(a, old, c);
+    const w = std.mem.indexOf(u8, text, "Widens:\n- ").?;
+    try t.expect(w < std.mem.indexOf(u8, text, "Other changes:\n- ").?);
+    try t.expect(std.mem.indexOf(u8, text, "- steps: 8 → 50") != null);
+    // a change that only narrows has nothing under Widens
+    const narrow = try parse(a, "researcher", "---\nname: researcher\ndescription: Research.\nmodel: claude-haiku\ntools: search\nskills: zig-*\nmemory: pinned\nsteps: 4\n---\nOld.\n", &diag);
+    const c2 = try compare(a, old, narrow, .{});
+    try t.expectEqual(0, c2.widens.len);
+    try t.expect(std.mem.indexOf(u8, try readingText(a, old, c2), "Widens:") == null);
+    // unset limits are the settings': 50 steps is over [limits]' 20, 5 under both
+    const plain = try parse(a, "p", "---\nname: p\ndescription: P.\n---\n", &diag);
+    const more = try parse(a, "p", "---\nname: p\ndescription: P.\nsteps: 50\ntokens: 1000000\n---\n", &diag);
+    const less = try parse(a, "p", "---\nname: p\ndescription: P.\nsteps: 5\n---\n", &diag);
+    const c3 = try compare(a, plain, more, .{});
+    try t.expectEqual(2, c3.widens.len);
+    try t.expectEqual(0, (try compare(a, plain, less, .{})).widens.len);
+    // a new definition: what it may use
+    const c4 = try compare(a, null, more, .{});
+    const t4 = try readingText(a, null, c4);
+    try t.expect(std.mem.indexOf(u8, t4, "It may use:\n") != null);
+    try t.expect(std.mem.indexOf(u8, t4, "- tools: search, fetch, browse, read_file, recall, skill") != null);
+    try t.expect(std.mem.indexOf(u8, t4, "- steps: 50") != null);
+}
+
+test "the_saved_line_is_harnesss" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqualStrings("---\nname: x\ndescription: X.\nsaved: agent:main 2026-11-22T14:02:11Z\n---\nBody\n---\nmore\n", try withSaved(a, "---\nname: x\ndescription: X.\n---\nBody\n---\nmore\n", "agent:main 2026-11-22T14:02:11Z"));
+    // one the model wrote is replaced, wherever it was
+    try t.expectEqualStrings("---\r\nname: x\r\ndescription: X.\r\nsaved: agent:x 2026-11-22T15:00:00Z\n---\r\nB\r\n", try withSaved(a, "---\r\nname: x\r\nsaved: owner, honest\r\ndescription: X.\r\n---\r\nB\r\n", "agent:x 2026-11-22T15:00:00Z"));
+    // no header: as it was (the parser refuses it)
+    try t.expectEqualStrings("no header", try withSaved(a, "no header", "v"));
 }

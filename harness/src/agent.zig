@@ -418,13 +418,26 @@ pub const Run = struct {
             // only through `web`
             .login => return false,
             .send => if (r.outbox == null) return false,
+            // a setup call: only in runs the owner started from a conversation
+            .agent_save => if (r.defs == null or r.outbox == null or !std.mem.eql(u8, r.who.by, "owner")) return false,
             // the platform's kinds: the gate decides them, their tools come later
-            .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save, .snapshot => return false,
+            .ask_owner, .mail, .trigger, .workflow, .app_read, .app_draft, .app_save, .env_save, .snapshot => return false,
             else => {},
         }
         if (tool == .mcp or tool == .money) return true;
         if (!r.permits(@tagName(tool))) return false;
         return if (r.starter) |s| s.allows(tool) else true;
+    }
+
+    /// What a definition's unset limits are here, for a change's reading.
+    pub fn defaults(r: *const Run) agents.Defaults {
+        return .{
+            .steps = r.base_limits.steps_per_turn,
+            .seconds = r.base_limits.turn_seconds,
+            .delegated_steps = r.agents.steps,
+            .delegated_tokens = r.agents.tokens,
+            .answer_bytes = r.agents.answer_bytes,
+        };
     }
 
     /// Whether the definition's tools and the starter's narrowing take
@@ -469,6 +482,11 @@ const send_def: model.ToolDef = .{
     \\{"type":"object","properties":{"to":{"type":"string","description":"a conversation's name; default: this one"},"text":{"type":"string"},"files":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"workspace files, sent as documents (up to 20 MB each)"},"buttons":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"quick replies the owner can press, up to 32 bytes each (not where others read)"},"final":{"type":"boolean","description":"this is your reply: the turn ends with it"}},"required":["text"]}
     ,
 };
+const agent_save_def: model.ToolDef = .{
+    .name = "agent_save",
+    .description = "Propose a new agent definition, or a change to your own: the whole file agents/NAME.md, a header between --- lines (name, description; and if needed model, tools, skills, memory, steps, tokens, seconds, answer_bytes, parallel) and then the instructions. The owner sees all of it and approves it every time; it applies from the next run.",
+    .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"a-z, 0-9 and -\"},\"text\":{\"type\":\"string\",\"description\":\"the whole file\"}},\"required\":[\"name\",\"text\"]}",
+};
 const skill_defs = [_]model.ToolDef{
     .{ .name = "skill", .description = "Load one of your skills (saved instructions for a kind of task) by name; with `file`, read one of the skill's other files.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"file\":{\"type\":\"string\"}},\"required\":[\"name\"]}" },
     .{ .name = "skill_save", .description = "Save a skill: instructions for a kind of task you may meet again (steps, sources, pitfalls). Replaces a skill of the same name. The owner approves it.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"lowercase letters, digits and hyphens\"},\"description\":{\"type\":\"string\",\"description\":\"one line: when to use it\"},\"body\":{\"type\":\"string\"}},\"required\":[\"name\",\"description\",\"body\"]}" },
@@ -486,6 +504,7 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
     if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
     if (r.allows(.delegate)) try out.append(arena, try delegateDef(r, arena));
     for (skill_defs) |d| if (r.allows(gate.Tool.fromName(d.name).?)) try out.append(arena, d);
+    if (r.allows(.agent_save)) try out.append(arena, agent_save_def);
     for (r.mcp) |*m| if (r.allowsMcp(m)) try out.append(arena, m.def);
     return out.items;
 }
@@ -1180,6 +1199,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     const offered = if (mt) |m| r.allowsMcp(m) else r.allows(tool);
     if (!offered) return .{ .text = "this tool is not available here", .is_error = true };
     if (tool == .send) return sendTool(r, a, input_json);
+    if (tool == .agent_save) return agentSave(r, a, input_json);
     if (tool == .web) {
         // the tool asks the gate itself: for each host and login it uses
         const w = r.web orelse return .{ .text = "this tool is not available here", .is_error = true };
@@ -1383,6 +1403,72 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
         .silent => .{ .text = "nothing posted" },
         .failed => .{ .text = try std.fmt.allocPrint(a, "not delivered: {s}", .{d.why}), .is_error = true },
     };
+}
+
+/// `agent_save`: a new definition, or a change to the run's own, written
+/// once the owner allows it (asked every time). Harness reads the text
+/// first, as it will be written; one that does not read goes back
+/// unasked. The question says who asks, new or change, what widens
+/// first, then the whole file.
+fn agentSave(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
+    const set = r.defs orelse return .{ .text = "this tool is not available here", .is_error = true };
+    const v = jv.parse(a, input_json);
+    const name = jv.str(jv.get(v, "name")) orelse "";
+    const text_in = jv.str(jv.get(v, "text")) orelse return saveRefused(r, a, name, "agent_save needs the name and the whole file as text");
+    if (!agents.validName(name)) return saveRefused(r, a, name, "a definition's name uses a-z, 0-9 and - (up to 64), and is not list, show or rm");
+    // a new definition, or this run's own: never another's
+    const old = try set.get(a, name);
+    if (old != null and !std.mem.eql(u8, name, r.def.name))
+        return saveRefused(r, a, name, try std.fmt.allocPrint(a, "{s} is another definition: agent_save makes a new one or changes this run's own ({s})", .{ name, r.def.name }));
+    var tb: [20]u8 = undefined;
+    const shown = try agents.withSaved(a, text_in, try std.fmt.allocPrint(a, "agent:{s} {s}", .{ r.who.agent, util.isoTime(&tb, r.now()) }));
+    var diag: agents.Diag = .{ .file = try std.fmt.allocPrint(a, "agents/{s}.md", .{name}) };
+    const new = agents.parse(a, name, shown, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.BadDefinition => return saveRefused(r, a, name, try diag.text(a)),
+    };
+    const cmp = try agents.compare(a, old, new, r.defaults());
+    const detail = try std.fmt.allocPrint(a, "{s}, asked by {s}\n{s}The whole file, {d} bytes:\n{s}", .{
+        if (old == null) "a new definition" else "a change to its own definition",
+        r.def.name,
+        try agents.readingText(a, old, cmp),
+        shown.len,
+        shown,
+    });
+    if (try decideAndAsk(r, a, .agent_save, "agent_save", name, detail, r.now())) |why| {
+        const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+        try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = true, .output = out.text, .bytes = out.text.len });
+        return out;
+    }
+    // as it was shown, stamped with the time it was allowed
+    const text = try agents.withSaved(a, text_in, try std.fmt.allocPrint(a, "agent:{s} {s}", .{ r.who.agent, util.isoTime(&tb, r.now()) }));
+    set.save(name, text) catch |e| {
+        const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "not saved: {s}", .{@errorName(e)}), .is_error = true };
+        try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = true, .output = out.text, .bytes = out.text.len });
+        return out;
+    };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+    // the inbox's item number comes with gap 5
+    try r.log.write(.agent, false, .{
+        .event = "saved",
+        .name = name,
+        .by = r.who.by,
+        .agent = r.who.agent,
+        .item = @as(?u32, null),
+        .widens = try std.mem.join(a, "; ", cmp.widens),
+        .sha256 = &std.fmt.bytesToHex(digest, .lower),
+    });
+    const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "saved agents/{s}.md; runs that start from now on use it", .{name}) };
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = false, .output = out.text, .bytes = out.text.len });
+    return out;
+}
+
+/// An `agent_save` refused before the gate: logged, and the model told why.
+fn saveRefused(r: *Run, a: std.mem.Allocator, name: []const u8, why: []const u8) !tools.Output {
+    const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "not saved: {s}", .{why}), .is_error = true };
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = true, .output = out.text, .bytes = out.text.len });
+    return out;
 }
 
 /// A `send` refused before the gate: logged, and the model told why.
@@ -3766,7 +3852,7 @@ test "kinds_without_a_tool_yet_are_not_offered_or_run" {
     freeResult(&f.run, r);
     const a = f.e.arena.allocator();
     const req1 = try f.e.request(1);
-    for ([_][]const u8{ "send", "ask_owner", "mail", "trigger", "workflow", "agent_save", "app_read", "app_draft", "app_save", "env_save", "snapshot" }) |name|
+    for ([_][]const u8{ "send", "ask_owner", "mail", "trigger", "workflow", "app_read", "app_draft", "app_save", "env_save", "snapshot" }) |name|
         try t.expect(std.mem.indexOf(u8, req1, try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{name})) == null);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "this tool is not available here") != null);
     try t.expectEqual(0, f.asked);
@@ -4083,4 +4169,143 @@ test "an_unknown_definition_is_refused_before_the_gate" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "no definition called researchr; they are: helper, main, researcher") != null);
     try t.expectEqual(2, f.e.server.modelRequests());
     try t.expect(std.mem.indexOf(u8, try f.logText(), "\"kind\":\"gate\"") == null);
+}
+
+// ---- agent_save ----
+
+/// A run the owner started from a conversation, with the definitions `set`.
+fn ownerRunWith(f: *Fix, set: *agents.Set) void {
+    f.run.defs = set;
+    f.run.outbox = NullOutbox.outbox();
+    f.run.conversation = "main";
+}
+
+/// The model calls `agent_save` with `name` and the whole `text`.
+fn saveCall(f: *Fix, id: []const u8, name: []const u8, text: []const u8) ![]const u8 {
+    const a = f.e.arena.allocator();
+    const input = try std.fmt.allocPrint(a, "{{\"name\":\"{s}\",\"text\":{f}}}", .{ name, std.json.fmt(text, .{}) });
+    return toolReplyOf(f, id, "agent_save", input);
+}
+
+fn researcherWith(a: std.mem.Allocator, body: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "---\nname: researcher\ndescription: Research across sources.\nmodel: claude-r\ntools: search, recall, agent_save\n---\n{s}\n", .{body});
+}
+
+test "agent_save_asks_every_time_with_the_whole_file" {
+    var f: Fix = undefined;
+    // an allow rule does not lift it
+    try f.init("allow agent_save *\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    var set = try defsWith(&f, &.{.{ "researcher", try researcherWith(a, "Research with two sources.") }});
+    defer set.deinit();
+    ownerRunWith(&f, &set);
+    f.run.useDefinition((try set.get(a, "researcher")).?);
+    // nor a grant, nor a day's answer
+    try f.grants.addFor(.agent_save, "host", "researcher", "", util.nowSeconds(t.io) + 3600);
+    f.answer = .day;
+    try f.e.script(1, try saveCall(&f, "tu_1", "researcher", try researcherWith(a, "Cite dates.")));
+    try f.e.script(2, try saveCall(&f, "tu_2", "researcher", try researcherWith(a, "Cite dates and places.")));
+    try f.e.script(3, model.textReply("saved twice"));
+    var r = try f.say("cite dates");
+    freeResult(&f.run, r);
+    try t.expectEqual(2, f.asked);
+    try t.expect(!f.last_allow_day);
+    try t.expectEqual(1, f.grants.items.items.len);
+    try t.expect(std.mem.startsWith(u8, f.last_what, "[researcher] agent_save: researcher, a change to its own definition, asked by researcher"));
+    try t.expect(std.mem.indexOf(u8, f.last_what, "The whole file, ") != null);
+    try t.expect(std.mem.indexOf(u8, f.last_what, "Cite dates and places.") != null);
+    try t.expect(std.mem.indexOf(u8, f.last_what, "saved: agent:researcher ") != null);
+    // a deny rule stops it, unasked
+    f.g.rules = try rules.parse(a, "deny agent_save *\n");
+    try f.e.script(4, try saveCall(&f, "tu_3", "researcher", try researcherWith(a, "Denied.")));
+    try f.e.script(5, model.textReply("refused"));
+    r = try f.say("once more");
+    freeResult(&f.run, r);
+    try t.expectEqual(2, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), "refused by the gate: rule on line 1") != null);
+}
+
+test "agent_save_refuses_another_definition_and_a_bad_file_unasked" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const first = try researcherWith(a, "Research with two sources.");
+    var set = try defsWith(&f, &.{.{ "researcher", first }});
+    defer set.deinit();
+    ownerRunWith(&f, &set);
+    try f.e.script(1, try saveCall(&f, "tu_1", "researcher", try researcherWith(a, "Taken over.")));
+    try f.e.script(2, try saveCall(&f, "tu_2", "writer", "---\nname: writer\ndescription: W.\ncolour: red\n---\n"));
+    try f.e.script(3, try saveCall(&f, "tu_3", "main", "---\nname: main\ndescription: M.\ntools: telnet\n---\n"));
+    try f.e.script(4, model.textReply("could not"));
+    const r = try f.say("change things");
+    freeResult(&f.run, r);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "researcher is another definition") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "agents/writer.md line 4 has an error: unknown key colour") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "unknown tool telnet") != null);
+    try t.expectEqualStrings(first, try f.e.tmp.dir.readFileAlloc(t.io, "agents/researcher.md", a, .unlimited));
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "agents/writer.md", .{}));
+}
+
+test "agent_save_is_offered_only_in_runs_the_owner_started_from_a_conversation" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    var set = try defsWith(&f, &.{});
+    defer set.deinit();
+    ownerRunWith(&f, &set);
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "agent_save,") != null);
+    // not where no one reads its question in a conversation
+    var no_conv = f.run;
+    no_conv.outbox = null;
+    try t.expect(!no_conv.allows(.agent_save));
+    // not in a run a schedule started
+    var task = f.run;
+    task.who.by = "schedule:x";
+    task.scheduled = true;
+    try t.expect(!task.allows(.agent_save));
+    // not in a delegated run
+    var helper = f.run;
+    helper.helper = true;
+    try t.expect(!helper.allows(.agent_save));
+    // not when its definition leaves it out
+    var plain = f.run;
+    plain.useDefinition(try defOf(&f, "plain", "---\nname: plain\ndescription: P.\ntools: recall\n---\n"));
+    try t.expect(!plain.allows(.agent_save));
+}
+
+test "an_allowed_change_keeps_the_old_file_and_applies_to_the_next_run" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    var set = try defsWith(&f, &.{.{ "researcher", try researcherWith(a, "Research with two sources.") }});
+    defer set.deinit();
+    ownerRunWith(&f, &set);
+    f.run.useDefinition((try set.get(a, "researcher")).?);
+    try f.e.script(1, try saveCall(&f, "tu_1", "researcher", try researcherWith(a, "Research with dates.")));
+    try f.e.script(2, model.textReply("saved"));
+    var r = try f.say("cite dates");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    const file = try f.e.tmp.dir.readFileAlloc(t.io, "agents/researcher.md", a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, file, "Research with dates.") != null);
+    try t.expect(std.mem.indexOf(u8, file, "\nsaved: agent:researcher 20") != null);
+    try t.expectEqual(1, set.versions("researcher"));
+    // the run that saved it keeps the version it started with
+    const sys2 = try systemOf(&f, 2);
+    try t.expect(std.mem.indexOf(u8, sys2, "Research with two sources.") != null);
+    try t.expect(std.mem.indexOf(u8, sys2, "Research with dates.") == null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "saved agents/researcher.md") != null);
+    const lt = try f.logText();
+    try t.expect(std.mem.indexOf(u8, lt, "\"kind\":\"agent\",\"event\":\"saved\",\"name\":\"researcher\",\"by\":\"owner\",\"agent\":\"researcher\",\"item\":null") != null);
+    // the next run takes the new one
+    f.run.useDefinition((try set.get(a, "researcher")).?);
+    try f.e.script(3, model.textReply("ok"));
+    r = try f.say("and now");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try systemOf(&f, 3), "Research with dates.") != null);
 }
