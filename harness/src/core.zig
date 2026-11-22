@@ -1465,7 +1465,7 @@ pub const Core = struct {
                 .answered => if (!approval) .answered else if (eql(u8, key, "once")) .once else if (eql(u8, key, "day")) .day else .deny,
             },
             // the owner's words, or a question's chosen label
-            .text = a.dupe(u8, ans.text orelse if (approval) "" else it.choiceLabel(key) orelse "") catch "",
+            .text = a.dupe(u8, ans.text orelse if (eql(u8, it.kind, "question")) it.choiceLabel(key) orelse "" else "") catch "",
         };
         if (it.private) {
             c.inbox.hide(it);
@@ -1584,7 +1584,12 @@ pub const Core = struct {
             _ = ch.send(ch.ctx, place, std.fmt.allocPrint(a, "{s}{s}", .{ prefix, part }) catch part) catch return c.notShown(id);
         }
         const last = std.fmt.allocPrint(a, "{s}{s}", .{ prefix, parts[parts.len - 1] }) catch parts[parts.len - 1];
-        const msg = ch.buttons(ch.ctx, place, last, bs) orelse return c.notShown(id);
+        // a question answered in words only has no buttons: its message is
+        // the one a reply answers
+        const msg = if (bs.len == 0)
+            (ch.send(ch.ctx, place, last) catch return c.notShown(id)).first
+        else
+            ch.buttons(ch.ctx, place, last, bs) orelse return c.notShown(id);
         // noted; a press that came meanwhile counts only from this message
         var early_take: ?[]const u8 = null;
         var early_elsewhere: ?i64 = null;
@@ -5324,6 +5329,88 @@ test "the_21st_question_waits_for_a_place_until_its_turn_ends" {
     const lt = try logText(&f);
     if (std.mem.indexOf(u8, lt, "no place in the inbox") == null) std.debug.print("{s}\n", .{lt});
     try t.expect(std.mem.indexOf(u8, lt, "\"why\":\"no place in the inbox until the turn's end: 1 question was open (questions in config.ini)\"") != null);
+}
+
+/// The message item `id` was shown in first.
+fn shownIn(f: *Fix, id: u64) i64 {
+    f.core.inbox.mutex.lockUncancelable(t.io);
+    defer f.core.inbox.mutex.unlock(t.io);
+    return f.core.inbox.find(id).?.shown.items[0].message;
+}
+
+test "ask_owner_returns_the_choice_or_the_text" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "ask_owner", "{\"question\":\"Which account should I order from?\",\"choices\":[\"Personal\",\"Work\"]}"));
+    try f.e.script(2, model.toolReply("tu_2", "ask_owner", "{\"question\":\"Which colour?\"}"));
+    try f.e.script(3, model.textReply("Ordering the blue one from Work."));
+    try f.core.startWorker();
+    try f.core.handleText("order it");
+    try f.rec.waitFor("BUTTONS Question [1]\nWhich account should I order from? [i1-");
+    const b = f.lastButtons();
+    try t.expectEqual(2, b.n);
+    try f.press("2");
+    // a question without choices is answered in words, by a reply
+    try f.rec.waitFor("Question [2]\nWhich colour?\n(Reply with text to answer.)");
+    try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = "the blue one", .reply_to = shownIn(&f, 2) });
+    try f.rec.waitFor("Ordering the blue one from Work.");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "chose: Work") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "wrote: the blue one") != null);
+    try f.rec.waitFor("\nAnswered: Work, ");
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "\"tool\":\"ask_owner\",\"decision\":\"allow\",\"why\":\"default for this tool\",\"arg\":\"Which colour?\"") != null);
+    try t.expect(std.mem.indexOf(u8, try inboxFile(&f), "\"kind\":\"question\"") != null);
+}
+
+test "a_draft_answered_with_text_returns_the_owners_version" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "ask_owner", "{\"question\":\"Send this reply to Anna?\",\"draft\":\"Hi Anna, see you at 6.\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "ask_owner", "{\"question\":\"And this one to Ben?\",\"draft\":\"Hi Ben, thanks.\"}"));
+    try f.e.script(3, model.textReply("Sent both."));
+    try f.core.startWorker();
+    try f.core.handleText("answer my mail");
+    try f.rec.waitFor("BUTTONS Draft to review [1]\nSend this reply to Anna?\n\nHi Anna, see you at 6.\n(Reply with text to use your own version instead.) [i1-");
+    const b = f.lastButtons();
+    try t.expect(b.get("use") != null);
+    try t.expect(b.get("drop") != null);
+    try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = "Hi Anna, see you at 7.", .reply_to = b.msg });
+    try f.rec.waitFor("BUTTONS Draft to review [2]");
+    try f.press("use");
+    try f.rec.waitFor("Sent both.");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "draft replaced by the owner: Hi Anna, see you at 7.") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "draft used as it is") != null);
+    try f.rec.waitFor("\nReplaced with your version, ");
+    try f.rec.waitFor("\nUsed as it is, ");
+}
+
+test "ask_owner_is_not_offered_to_helpers_or_unattended_runs" {
+    var f: Fix = undefined;
+    try f.init("", "", "[check]\nevery = 5m\ndo = Check the price.\n");
+    defer f.deinit();
+    // a chat turn has it
+    try f.e.script(1, model.textReply("hi"));
+    f.core.chatTurn("hello");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "\"name\":\"ask_owner\"") != null);
+    // a helper does not; asked for by name, it is refused
+    try f.e.script(2, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"ask them\",\"tools\":[\"ask_owner\",\"recall\"]}]}"));
+    try f.e.script(3, model.toolReply("h1", "ask_owner", "{\"question\":\"Which one?\"}"));
+    try f.e.script(4, model.textReply("helper done"));
+    try f.e.script(5, model.textReply("done"));
+    f.core.chatTurn("split it");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "\"name\":\"ask_owner\"") == null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "this tool is not available here") != null);
+    // nor does a task's run, which nobody watches
+    try f.e.script(6, model.toolReply("tu_2", "ask_owner", "{\"question\":\"Buy now?\"}"));
+    try f.e.script(7, model.textReply("NOTHING"));
+    f.core.tick();
+    try waitFile(&f.e, "requests/007.json");
+    waitIdle(f.core);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(6), "\"name\":\"ask_owner\"") == null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(7), "this tool is not available here") != null);
+    try t.expectEqual(0, f.rec.count("Question ["));
 }
 
 /// Waits until `needle` was said `n` times.

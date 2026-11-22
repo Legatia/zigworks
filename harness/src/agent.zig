@@ -416,8 +416,11 @@ pub const Run = struct {
             .login => return false,
             // a run that posts: helpers answer the run that started them
             .send => if (r.helper or r.outbox == null) return false,
+            // only where the owner can answer: not helpers (their run asks),
+            // not runs nobody watches
+            .ask_owner => if (r.helper or r.scheduled or r.asker == null) return false,
             // the platform's kinds: the gate decides them, their tools come later
-            .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save, .snapshot => return false,
+            .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save, .snapshot => return false,
             else => {},
         }
         const list = r.allowed orelse return true;
@@ -439,6 +442,13 @@ const send_def: model.ToolDef = .{
     \\{"type":"object","properties":{"to":{"type":"string","description":"a conversation's name; default: this one"},"text":{"type":"string"},"files":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"workspace files, sent as documents (up to 20 MB each)"},"buttons":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"quick replies the owner can press, up to 32 bytes each (not where others read)"},"final":{"type":"boolean","description":"this is your reply: the turn ends with it"}},"required":["text"]}
     ,
 };
+const ask_owner_def: model.ToolDef = .{
+    .name = "ask_owner",
+    .description = "Ask the owner a question, or show them a draft to review, and wait for the answer. With choices the owner picks one; with text: true they may also answer in words; without choices they answer in words. With a draft they use it, drop it, or reply with their own version.",
+    .schema_json =
+    \\{"type":"object","properties":{"question":{"type":"string"},"choices":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"up to 4 answers to pick from, 1 to 64 bytes each"},"text":{"type":"boolean","description":"the owner may also answer in words"},"draft":{"type":"string","description":"a draft for the owner to use, drop or replace (then no choices)"}},"required":["question"]}
+    ,
+};
 const skill_defs = [_]model.ToolDef{
     .{ .name = "skill", .description = "Load one of your skills (saved instructions for a kind of task) by name; with `file`, read one of the skill's other files.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"file\":{\"type\":\"string\"}},\"required\":[\"name\"]}" },
     .{ .name = "skill_save", .description = "Save a skill: instructions for a kind of task you may meet again (steps, sources, pitfalls). Replaces a skill of the same name. The owner approves it.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"lowercase letters, digits and hyphens\"},\"description\":{\"type\":\"string\",\"description\":\"one line: when to use it\"},\"body\":{\"type\":\"string\"}},\"required\":[\"name\",\"description\",\"body\"]}" },
@@ -453,6 +463,7 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
         if (r.allows(tool)) try out.append(arena, d);
     }
     if (r.allows(.send)) try out.append(arena, send_def);
+    if (r.allows(.ask_owner)) try out.append(arena, ask_owner_def);
     if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
     if (r.allows(.delegate)) try out.append(arena, delegate_def);
     for (skill_defs) |d| if (r.allows(gate.Tool.fromName(d.name).?)) try out.append(arena, d);
@@ -1142,6 +1153,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     };
     if (!r.allows(tool)) return .{ .text = "this tool is not available here", .is_error = true };
     if (tool == .send) return sendTool(r, a, input_json);
+    if (tool == .ask_owner) return askOwnerTool(r, a, input_json);
     if (tool == .web) {
         // the tool asks the gate itself: for each host and login it uses
         const w = r.web orelse return .{ .text = "this tool is not available here", .is_error = true };
@@ -1338,6 +1350,62 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
         .silent => .{ .text = "nothing posted" },
         .failed => .{ .text = try std.fmt.allocPrint(a, "not delivered: {s}", .{d.why}), .is_error = true },
     };
+}
+
+/// Choices a question offers at most, and the longest label.
+pub const max_choices = 4;
+pub const max_choice_bytes = 64;
+
+/// `ask_owner`: the agent's question, or a draft to review; an inbox item
+/// the run waits on like an approval. The gate decides it as `ask_owner`,
+/// its argument the question (allowed by default).
+fn askOwnerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
+    const v = jv.parse(a, input_json);
+    const question = jv.str(jv.get(v, "question")) orelse "";
+    if (std.mem.trim(u8, question, " \t\r\n").len == 0) return .{ .text = "refused: ask_owner needs its question", .is_error = true };
+    const draft = jv.str(jv.get(v, "draft"));
+    const list = jv.arr(jv.get(v, "choices")) orelse &.{};
+    if (list.len > max_choices) return .{ .text = "refused: a question has at most 4 choices", .is_error = true };
+    if (draft != null and list.len > 0) return .{ .text = "refused: a draft takes no choices; the owner uses it, drops it or writes their own", .is_error = true };
+    const choices = try a.alloc([]const u8, list.len);
+    for (list, choices) |cv, *ch| {
+        const label = jv.str(cv) orelse return .{ .text = "refused: choices are labels", .is_error = true };
+        if (label.len == 0 or label.len > max_choice_bytes) return .{ .text = "refused: a choice has 1 to 64 bytes", .is_error = true };
+        ch.* = label;
+    }
+    const size = question.len + if (draft) |d| d.len else 0;
+    if (size > max_question) return .{ .text = try std.fmt.allocPrint(a, "refused: too long to ask the owner ({d} bytes; a question and its draft are at most {d})", .{ size, max_question }), .is_error = true };
+    if (try decideAndAsk(r, a, .ask_owner, "ask_owner", question, "", r.now())) |why|
+        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+    const out: tools.Output = out: {
+        const asker = r.asker orelse break :out .{ .text = "no one to ask", .is_error = true };
+        if (r.deadline_s > 0 and r.deadline_s * 1000 - util.nowMs(r.io) < 100) break :out .{ .text = "no time left in the turn to ask the owner", .is_error = true };
+        const got = asker.ask(asker.ctx, a, .{
+            .kind = if (draft != null) .draft else .question,
+            .text = question,
+            .choices = choices,
+            .takes_text = (jv.boolean(jv.get(v, "text")) orelse false) or choices.len == 0,
+            .draft = draft,
+            .deadline_s = r.deadline_s,
+            .who = r.who,
+            .rid = r.rid,
+            .label = r.label,
+            .private = r.isPrivate(),
+        });
+        const eql = std.mem.eql;
+        break :out switch (got.answer) {
+            .answered => if (draft != null)
+                (if (eql(u8, got.key, "drop")) tools.Output{ .text = "dropped" } else if (got.text.len > 0) tools.Output{ .text = try std.fmt.allocPrint(a, "draft replaced by the owner: {s}", .{got.text}) } else tools.Output{ .text = "draft used as it is" })
+            else if (eql(u8, got.key, "text")) tools.Output{ .text = try std.fmt.allocPrint(a, "wrote: {s}", .{got.text}) } else tools.Output{ .text = try std.fmt.allocPrint(a, "chose: {s}", .{got.text}) },
+            .timeout => .{ .text = "no answer in time", .is_error = true },
+            .unsent => .{ .text = "the question could not be sent to the owner", .is_error = true },
+            .withdrawn => .{ .text = if (r.env.stop.load(.acquire)) "stopped by the owner" else "no one is left to answer", .is_error = true },
+            .full => .{ .text = if (got.text.len > 0) got.text else "no place in the inbox until the turn's end", .is_error = true },
+            .once, .day, .deny => .{ .text = "not an answer to this question", .is_error = true },
+        };
+    };
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = "ask_owner", .arg = question, .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
+    return out;
 }
 
 /// A `send` refused before the gate: logged, and the model told why.
@@ -3670,7 +3738,7 @@ test "kinds_without_a_tool_yet_are_not_offered_or_run" {
     freeResult(&f.run, r);
     const a = f.e.arena.allocator();
     const req1 = try f.e.request(1);
-    for ([_][]const u8{ "send", "ask_owner", "mail", "trigger", "workflow", "agent_save", "app_read", "app_draft", "app_save", "env_save", "snapshot" }) |name|
+    for ([_][]const u8{ "send", "mail", "trigger", "workflow", "agent_save", "app_read", "app_draft", "app_save", "env_save", "snapshot" }) |name|
         try t.expect(std.mem.indexOf(u8, req1, try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{name})) == null);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "this tool is not available here") != null);
     try t.expectEqual(0, f.asked);
