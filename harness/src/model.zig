@@ -171,7 +171,8 @@ pub const Client = struct {
     fn callLimit(c: *const Client, lim: Limits) ?u32 {
         if (lim.deadline_s == 0) return c.call_ms;
         const left = lim.deadline_s * 1000 - nowMs(c.io);
-        if (left <= 0) return null;
+        // under 0.1 s no answer can come back: not sent
+        if (left < 100) return null;
         return @intCast(@min(left, c.call_ms));
     }
 

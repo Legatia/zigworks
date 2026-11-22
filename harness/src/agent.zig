@@ -828,7 +828,9 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
             result.ended_by = try r.gpa.dupe(u8, "Step limit reached for this turn.");
             break;
         }
-        if (r.now() >= deadline) {
+        // in milliseconds (whole seconds would see a second that has
+        // almost run out as a whole one); under 0.1 s nothing is started
+        if (deadline * 1000 - util.nowMs(r.io) < 100) {
             result.ended_by = try r.gpa.dupe(u8, "Time limit reached for this turn.");
             break;
         }
@@ -1503,8 +1505,9 @@ fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, in
         return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
     }
     // what is left of the turn, no more
-    const left: u64 = if (r.deadline_s > 0) @intCast(@max(r.deadline_s - r.now(), 1)) else r.limits.turn_seconds;
-    const timeout_ms: u32 = @intCast(@min(@min(left, r.limits.turn_seconds) * 1000, std.math.maxInt(u32)));
+    const full_ms: i64 = @as(i64, r.limits.turn_seconds) * 1000;
+    const left_ms: i64 = if (r.deadline_s > 0) @max(r.deadline_s * 1000 - util.nowMs(r.io), 1) else full_ms;
+    const timeout_ms: u32 = @intCast(std.math.clamp(@min(left_ms, full_ms), 1, std.math.maxInt(u32)));
     // the whole answer: it is masked before it is cut, so a key across the
     // cut is not half shown
     const res = m.server.call(a, m.tool, input_json, r.env.stop, timeout_ms, std.math.maxInt(usize)) catch |e|
@@ -1622,11 +1625,11 @@ fn helperRun(h: *Helper) !void {
         }
     }
     defer if (p.pool) |pool| pool.release(p.io);
-    const left = h.deadline_s - p.now();
-    if (left <= 0) {
+    if (h.deadline_s * 1000 - util.nowMs(p.io) < 100) {
         h.failed = "no time left in the turn";
         return;
     }
+    const left = @max(h.deadline_s - p.now(), 1);
     var client = try model.Client.init(p.gpa, p.io, cfg.url, cfg.key, if (h.task.strong) cfg.main else cfg.worker, cfg.max_tokens);
     defer client.deinit();
     var label_buf: [64]u8 = undefined;
@@ -2044,9 +2047,12 @@ test "a_fetch_and_a_web_action_get_only_what_is_left_of_the_turn" {
     freeResult(&f.run, r);
     try t.expect(started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2500);
     const log = try f.logText();
-    if (std.mem.indexOf(u8, log, "no time left in this turn") == null) std.debug.print("log:\n{s}\n", .{util.cut(log, 6000)});
     try t.expect(std.mem.indexOf(u8, log, "the turn's time is up") != null);
-    try t.expect(std.mem.indexOf(u8, log, "no time left in this turn") != null);
+    // refused for want of time, before the browser or the owner: by the
+    // gate ("no time left in the turn to ask the owner") or before the
+    // tool ("no time left in this turn"), whichever comes first
+    if (std.mem.indexOf(u8, log, "no time left in t") == null) std.debug.print("log:\n{s}\n", .{util.cut(log, 6000)});
+    try t.expect(std.mem.indexOf(u8, log, "no time left in t") != null);
     // the web call asked nobody
     try t.expectEqual(0, f.asked);
 }
