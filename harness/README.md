@@ -27,10 +27,11 @@ them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 54 checks that drives the real binary against
 stand-ins for omnigate, Telegram, feeds, search and two MCP servers. An
 earlier build of 0.3.0 also passed its tests in CI on Linux and Windows.
-On Windows 11 the browser and login tests also run, against Chrome 157
-(357 unit tests pass, 36 skip there), and the console, lock, Credential
-Manager and process-cleanup checks of HANDOFF-windows-audit.md were run by
-hand.
+On Windows 11 the browser and login tests also run, against Chrome 157,
+and the console, lock, Credential Manager and process-cleanup checks of
+HANDOFF-windows-audit.md were run by hand. With environments, apps,
+clones and safe state files added: Windows 11 and Linux (WSL, bubblewrap
+0.9, OpenSSH 9.6) pass their unit tests and the end-to-end script.
 Nothing has run yet against a real omnigate, Telegram bot, MCP server or
 website.** See [Limits](#limits).
 

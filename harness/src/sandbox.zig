@@ -55,12 +55,40 @@ pub var bwrap_override: ?[]const u8 = null;
 /// Why sandboxes can't run here; null when they can.
 pub fn unavailable(io: Io, arena: std.mem.Allocator) !?[]const u8 {
     return switch (builtin.os.tag) {
-        .linux => if (try findBwrap(io, arena) == null) "install bubblewrap (the bwrap command) to use sandboxes" else null,
+        .linux => blk: {
+            const bwrap = (try findBwrap(io, arena)) orelse break :blk "install bubblewrap (the bwrap command) to use sandboxes";
+            break :blk try canSandbox(io, arena, bwrap);
+        },
         .windows => null,
         .macos => "sandboxes on macOS (sandbox-exec) are not built yet",
         else => "sandboxes are not built for this system",
     };
 }
+
+/// Whether bwrap can make a sandbox here: on some systems (Ubuntu 24.04
+/// with its AppArmor rule for user namespaces, a container) it is there
+/// and can't. Tried once per bwrap.
+fn canSandbox(io: Io, arena: std.mem.Allocator, bwrap: []const u8) !?[]const u8 {
+    probe_mutex.lockUncancelable(io);
+    defer probe_mutex.unlock(io);
+    if (probed) |p| if (std.mem.eql(u8, p.bwrap[0..p.len], bwrap)) return if (p.why_len == 0) null else try arena.dupe(u8, p.why[0..p.why_len]);
+    const r = std.process.run(arena, io, .{ .argv = &.{ bwrap, "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "true" } }) catch |e| return try std.fmt.allocPrint(arena, "bubblewrap didn't start: {s}", .{@errorName(e)});
+    var p: Probed = .{};
+    if (!r.term.success()) {
+        const first = std.mem.trim(u8, r.stderr[0 .. std.mem.indexOfScalar(u8, r.stderr, '\n') orelse r.stderr.len], " \r");
+        const why = try std.fmt.allocPrint(arena, "bubblewrap can't make a sandbox here ({s}); on Ubuntu, user namespaces may be restricted (kernel.apparmor_restrict_unprivileged_userns)", .{util.cut(first, 200)});
+        p.why_len = @min(why.len, p.why.len);
+        @memcpy(p.why[0..p.why_len], why[0..p.why_len]);
+    }
+    p.len = @min(bwrap.len, p.bwrap.len);
+    @memcpy(p.bwrap[0..p.len], bwrap[0..p.len]);
+    probed = p;
+    return if (p.why_len == 0) null else try arena.dupe(u8, p.why[0..p.why_len]);
+}
+
+const Probed = struct { bwrap: [256]u8 = undefined, len: usize = 0, why: [512]u8 = undefined, why_len: usize = 0 };
+var probed: ?Probed = null;
+var probe_mutex: Io.Mutex = .init;
 
 /// The AppContainer name of environment `name` of the data folder
 /// `data_home`: two data folders' environments of one name are two.
@@ -754,6 +782,20 @@ test "linux_without_bwrap_refuses_plainly" {
     const o = try f.run("echo should-not-run");
     try t.expect(o.is_error);
     try expectHas(o.text, "install bubblewrap");
+    try expectNot(o.text, "should-not-run");
+}
+
+test "linux_where_bwrap_cannot_make_a_sandbox_it_says_why" {
+    if (!is_linux) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init(.{ .name = "box", .line = 1, .kind = .sandbox });
+    defer f.deinit();
+    // a bwrap that fails as one does under Ubuntu's user-namespace rule
+    bwrap_override = "/bin/false";
+    defer bwrap_override = null;
+    const o = try f.run("echo should-not-run");
+    try t.expect(o.is_error);
+    try expectHas(o.text, "bubblewrap can't make a sandbox here");
     try expectNot(o.text, "should-not-run");
 }
 
