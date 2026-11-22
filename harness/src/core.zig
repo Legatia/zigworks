@@ -6234,7 +6234,9 @@ test "run_items_are_void_after_a_restart_and_their_buttons_answer_nothing" {
     try f.rec.waitFor("BUTTONS Allow this? [1]");
     const b = f.lastButtons();
     // a crash: the process is gone while its item is open in state/inbox
-    const open = try inboxFile(&f);
+    // (with the message it was shown in: the recorder notes the message
+    // before harness has its id and writes it down)
+    const open = try inboxFileWith(&f, "\"shown\":[{\"chat\":42,");
     try t.expect(std.mem.indexOf(u8, open, "\"status\":\"open\"") != null);
     f.core.close();
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(f.e.arena.allocator(), &.{ f.home, "state", "inbox" }), .data = open });

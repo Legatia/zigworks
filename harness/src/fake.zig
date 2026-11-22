@@ -5,6 +5,8 @@
 //!   in order; a file `{"status":402}` or `{"status":429,"retry_after":1}`
 //!   answers that error instead, `{"delay_ms":N, ...}` waits first. Each
 //!   request is saved as `requests/001.json`, … with its headers.
+//! - Every file the stand-ins record is written whole, a temporary file
+//!   renamed into place, so a test that finds one never reads half of it.
 //! - search: `GET /res/v1/web/search?q=…` answers `search.json`.
 //! - pages and feeds: `GET /page/NAME` answers the file `pages/NAME`
 //!   (POST too; `?delay_ms=N` answers after N ms), or, when there is a
@@ -135,6 +137,34 @@ pub const Server = struct {
         return Io.Dir.cwd().readFileAlloc(s.io, p, a, .limited(16 << 20)) catch null;
     }
 
+    /// Writes record file `p` whole: a temporary file, then renamed into
+    /// place, so a test that finds `p` never reads it half written.
+    fn writeRecord(s: *Server, a: std.mem.Allocator, p: []const u8, data: []const u8) !void {
+        const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{p});
+        const cwd = Io.Dir.cwd();
+        try cwd.writeFile(s.io, .{ .sub_path = tmp, .data = data });
+        // on Windows a reader that has the old file open can hold the
+        // rename up for a moment
+        var tries: u32 = 0;
+        while (true) : (tries += 1) {
+            if (cwd.rename(tmp, cwd, p, s.io)) |_| return else |e| if (tries >= 100) {
+                cwd.deleteFile(s.io, tmp) catch {};
+                return e;
+            }
+            s.io.sleep(.fromMilliseconds(10), .awake) catch {};
+        }
+    }
+
+    /// Adds `line` to the end of record file `p`, written whole again
+    /// (callers hold `mutex`: one writer at a time).
+    fn appendRecord(s: *Server, a: std.mem.Allocator, p: []const u8, line: []const u8) !void {
+        const old: []const u8 = Io.Dir.cwd().readFileAlloc(s.io, p, a, .limited(256 << 20)) catch |e| switch (e) {
+            error.FileNotFound => "",
+            else => return e,
+        };
+        try s.writeRecord(a, p, try std.mem.concat(a, u8, &.{ old, line }));
+    }
+
     fn handle(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request) !void {
         const target = try a.dupe(u8, req.head.target);
         const method = req.head.method;
@@ -158,11 +188,8 @@ pub const Server = struct {
                 s.mutex.lockUncancelable(s.io);
                 defer s.mutex.unlock(s.io);
                 const lp = try s.path(a, &.{"page-requests.jsonl"});
-                var f = try Io.Dir.cwd().createFile(s.io, lp, .{ .truncate = false });
-                defer f.close(s.io);
-                const len = try f.length(s.io);
                 const line = try std.fmt.allocPrint(a, "{{\"target\":{f},\"headers\":{{{s}\"\":\"\"}}}}\n", .{ std.json.fmt(target, .{}), headers.items });
-                try f.writePositionalAll(s.io, line, len);
+                try s.appendRecord(a, lp, line);
             }
             // `pages/NAME.redirect` holds "STATUS LOCATION"
             if (name.len > 0 and std.mem.indexOf(u8, name, "..") == null) {
@@ -197,7 +224,7 @@ pub const Server = struct {
         const name = try std.fmt.bufPrint(&name_buf, "{d:0>3}.json", .{n});
         const saved = try std.fmt.allocPrint(a, "{{\"headers\":{{{s}\"\":\"\"}},\"body\":{s}}}", .{ headers, if (body.len > 0) body else "null" });
         const rp = try s.path(a, &.{ "requests", name });
-        try Io.Dir.cwd().writeFile(s.io, .{ .sub_path = rp, .data = saved });
+        try s.writeRecord(a, rp, saved);
         const script = s.readScript(a, &.{ "model", name }) orelse
             return json(req, .internal_server_error, "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"no script for this request\"}}");
         const v = jv.parse(a, script);
@@ -275,9 +302,6 @@ pub const Server = struct {
             defer s.mutex.unlock(s.io);
             const id = s.tg_n.fetchAdd(1, .acq_rel) + 1;
             const op = try s.path(a, &.{ "telegram", "out.jsonl" });
-            var f = try Io.Dir.cwd().createFile(s.io, op, .{ .truncate = false });
-            defer f.close(s.io);
-            const len = try f.length(s.io);
             // a body that is not JSON (a document's multipart) as a string
             const json_body = body.len > 0 and body[0] == '{';
             const line = if (body.len == 0)
@@ -286,7 +310,7 @@ pub const Server = struct {
                 try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"message_id\":{d},\"body\":{s}}}\n", .{ method, id, body })
             else
                 try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"message_id\":{d},\"body\":{f}}}\n", .{ method, id, std.json.fmt(body, .{}) });
-            try f.writePositionalAll(s.io, line, len);
+            try s.appendRecord(a, op, line);
             break :blk id;
         };
         // getMe: telegram/me.json, else a bot with topics in private chats
