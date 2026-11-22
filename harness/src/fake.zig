@@ -1,10 +1,15 @@
 //! Stand-ins for the services harness talks to, driven by files in a script
 //! directory so tests can say exactly what each service answers:
 //!
-//! - omnigate: `POST /v1/messages` answers `model/001.json`, `002.json`, …
-//!   in order; a file `{"status":402}` or `{"status":429,"retry_after":1}`
-//!   answers that error instead, `{"delay_ms":N, ...}` waits first. Each
-//!   request is saved as `requests/001.json`, … with its headers.
+//! - models (omnigate and any other provider): `POST …/messages` (Anthropic
+//!   Messages) and `POST …/chat/completions` (OpenAI Chat Completions)
+//!   answer `model/001.json`, `002.json`, … in order, one count for both,
+//!   each file in the format its request was in; a file `{"status":402}` or
+//!   `{"status":429,"retry_after":1}` answers that error instead (in the
+//!   request's format; with `"echo_key":true` its message says the key the
+//!   request carried, as some gateways do), `{"delay_ms":N, ...}` waits
+//!   first. Each request is saved as `requests/001.json`, … with its
+//!   target, headers and body.
 //! - search: `GET /res/v1/web/search?q=…` answers `search.json`.
 //! - pages and feeds: `GET /page/NAME` answers the file `pages/NAME`
 //!   (POST too; `?delay_ms=N` answers after N ms), or, when there is a
@@ -139,14 +144,23 @@ pub const Server = struct {
         const target = try a.dupe(u8, req.head.target);
         const method = req.head.method;
         var headers: std.ArrayList(u8) = .empty;
+        // the key a model request carries, for `echo_key`
+        var key: []const u8 = "";
         var it = req.iterateHeaders();
-        while (it.next()) |h| try headers.print(a, "{f}:{f},", .{ std.json.fmt(h.name, .{}), std.json.fmt(h.value, .{}) });
+        while (it.next()) |h| {
+            try headers.print(a, "{f}:{f},", .{ std.json.fmt(h.name, .{}), std.json.fmt(h.value, .{}) });
+            if (std.ascii.eqlIgnoreCase(h.name, "x-api-key")) key = try a.dupe(u8, h.value);
+            if (std.ascii.eqlIgnoreCase(h.name, "authorization") and std.mem.startsWith(u8, h.value, "Bearer ")) key = try a.dupe(u8, h.value["Bearer ".len..]);
+        }
         var body_buf: [8192]u8 = undefined;
         const body_reader = try req.readerExpectContinue(&body_buf);
         const body = try body_reader.allocRemaining(a, .limited(32 << 20));
         const route = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
 
-        if (method == .POST and std.mem.eql(u8, route, "/v1/messages")) return s.model(a, req, body, headers.items);
+        if (method == .POST and !std.mem.startsWith(u8, route, "/page/") and !std.mem.startsWith(u8, route, "/bot")) {
+            if (std.mem.endsWith(u8, route, "/messages")) return s.model(a, req, .anthropic, target, body, headers.items, key);
+            if (std.mem.endsWith(u8, route, "/chat/completions")) return s.model(a, req, .openai, target, body, headers.items, key);
+        }
         if (method == .GET and std.mem.eql(u8, route, "/res/v1/web/search")) {
             const text = s.readScript(a, &.{"search.json"}) orelse "{\"web\":{\"results\":[]}}";
             return json(req, .ok, text);
@@ -191,15 +205,18 @@ pub const Server = struct {
         return json(req, .not_found, "{\"error\":\"no such route\"}");
     }
 
-    fn model(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, body: []const u8, headers: []const u8) !void {
+    /// The format a model request is in, and its errors are answered in.
+    const Format = enum { anthropic, openai };
+
+    fn model(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, format: Format, target: []const u8, body: []const u8, headers: []const u8, key: []const u8) !void {
         const n = s.model_n.fetchAdd(1, .acq_rel) + 1;
         var name_buf: [16]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "{d:0>3}.json", .{n});
-        const saved = try std.fmt.allocPrint(a, "{{\"headers\":{{{s}\"\":\"\"}},\"body\":{s}}}", .{ headers, if (body.len > 0) body else "null" });
+        const saved = try std.fmt.allocPrint(a, "{{\"target\":{f},\"headers\":{{{s}\"\":\"\"}},\"body\":{s}}}", .{ std.json.fmt(target, .{}), headers, if (body.len > 0) body else "null" });
         const rp = try s.path(a, &.{ "requests", name });
         try Io.Dir.cwd().writeFile(s.io, .{ .sub_path = rp, .data = saved });
         const script = s.readScript(a, &.{ "model", name }) orelse
-            return json(req, .internal_server_error, "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"no script for this request\"}}");
+            return json(req, .internal_server_error, try errorBody(a, format, 500, "no script for this request"));
         const v = jv.parse(a, script);
         if (jv.int(jv.get(v, "delay_ms"))) |ms| {
             // By the clock, not by counting sleeps: on a busy machine each sleep runs long.
@@ -210,7 +227,9 @@ pub const Server = struct {
             const status: std.http.Status = @fromBackingInt(@as(u10, @intCast(st)));
             const retry = jv.int(jv.get(v, "retry_after"));
             var rb: [16]u8 = undefined;
-            const err_body = "{\"type\":\"error\",\"error\":{\"type\":\"scripted\",\"message\":\"scripted error\"}}";
+            const echo = jv.boolean(jv.get(v, "echo_key")) orelse false;
+            const msg = if (echo) try std.fmt.allocPrint(a, "scripted error for key {s}", .{key}) else "scripted error";
+            const err_body = try errorBody(a, format, st, msg);
             if (retry) |r| {
                 return req.respond(err_body, .{ .status = status, .extra_headers = &.{
                     .{ .name = "content-type", .value = "application/json" },
@@ -328,6 +347,15 @@ pub const Server = struct {
         return out.items;
     }
 };
+
+/// A model error's body: Anthropic's `{"type":"error","error":{...}}` or
+/// OpenAI's `{"error":{"message":...,"type":...,"code":N}}`.
+fn errorBody(a: std.mem.Allocator, format: Server.Format, status: i64, msg: []const u8) ![]u8 {
+    return switch (format) {
+        .anthropic => std.fmt.allocPrint(a, "{{\"type\":\"error\",\"error\":{{\"type\":\"scripted\",\"message\":{f}}}}}", .{std.json.fmt(msg, .{})}),
+        .openai => std.fmt.allocPrint(a, "{{\"error\":{{\"message\":{f},\"type\":\"scripted\",\"code\":{d}}}}}", .{ std.json.fmt(msg, .{}), status }),
+    };
+}
 
 fn json(req: *std.http.Server.Request, status: std.http.Status, body: []const u8) !void {
     try req.respond(body, .{ .status = status, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });

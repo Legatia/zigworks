@@ -1,5 +1,8 @@
-//! The model, through omnigate's Anthropic-style `/v1/messages`: one
-//! request with the conversation and the tools, one whole answer back.
+//! The model, through a provider: omnigate (the default), Anthropic,
+//! OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks Anthropic
+//! Messages (`…/messages`) or OpenAI Chat Completions
+//! (`…/chat/completions`): one request with the conversation and the
+//! tools, one whole answer back.
 const std = @import("std");
 const http = @import("http.zig");
 const jv = @import("jv.zig");
@@ -51,6 +54,8 @@ pub const Error = error{
     BadReply,
     /// No key is stored: the call is refused before anything is sent.
     NoKey,
+    /// 401 or 403: the provider refused the key. Never retried.
+    KeyRefused,
     /// No url is set: the call is refused before anything is sent.
     NoUrl,
     /// /stop came while waiting to send again: nothing more was sent.
@@ -279,6 +284,12 @@ pub const Providers = struct {
         return .{ .provider = &p.list[p.default], .model = value };
     }
 
+    /// A client for a model value (see `pick`).
+    pub fn client(p: *const Providers, gpa: std.mem.Allocator, io: Io, value: []const u8, max_tokens: u32) http.Error!Client {
+        const ch = p.pick(value);
+        return Client.open(gpa, io, ch.provider.*, ch.model, max_tokens);
+    }
+
     /// The providers `values` pick, each once, in the order first picked.
     pub fn used(p: *const Providers, arena: std.mem.Allocator, values: []const []const u8) ![]const *const Provider {
         var out: std.ArrayList(*const Provider) = .empty;
@@ -298,7 +309,19 @@ pub const Client = struct {
     key: []const u8,
     model: []const u8,
     max_tokens: u32,
-    /// The error message omnigate gave with the last failure, if any.
+    /// Its provider's name, said in errors and on the log's model lines.
+    provider: []const u8 = "omnigate",
+    /// The stored secret holding the key, named when it is missing or refused.
+    key_name: []const u8 = "omnigate",
+    api: Api = .anthropic,
+    auth: Auth = .x_api_key,
+    headers: []const Header = &.{},
+    /// Prompt-cache marks in its requests.
+    cache: bool = true,
+    /// Where requests go, after the address's path.
+    path: []const u8 = "/v1/messages",
+    tokens_field: []const u8 = "max_tokens",
+    /// The error message the provider gave with the last failure, if any.
     last_error: [256]u8 = undefined,
     last_error_len: usize = 0,
     /// Longest wait on a 429 (seconds).
@@ -306,11 +329,80 @@ pub const Client = struct {
     /// Longest one call may take (ms), whatever the deadline.
     call_ms: u32 = 900_000,
 
-    /// An empty `url` or `key` gives a client whose calls are refused
-    /// (error.NoUrl, error.NoKey), so nothing is sent without both.
+    /// omnigate as 0.3 reached it: `url` (its path before an optional
+    /// /v1), then /v1/messages, the key as x-api-key. An empty `url` or
+    /// `key` gives a client whose calls are refused (error.NoUrl,
+    /// error.NoKey), so nothing is sent without both.
     pub fn init(gpa: std.mem.Allocator, io: Io, url: []const u8, key: []const u8, model: []const u8, max_tokens: u32) http.Error!Client {
         const target: ?http.Target = if (url.len == 0) null else try http.Target.parse(url);
         return .{ .gpa = gpa, .io = io, .http = if (target) |tg| .init(gpa, io, tg) else null, .key = key, .model = model, .max_tokens = max_tokens };
+    }
+
+    /// A client for `model` at provider `p`: requests go to its url's
+    /// path as written, then /messages or /chat/completions. Its strings
+    /// must outlive the client. No url: every call is refused (NoUrl); no
+    /// key where one is needed: refused too (NoKey).
+    pub fn open(gpa: std.mem.Allocator, io: Io, p: Provider, model: []const u8, max_tokens: u32) http.Error!Client {
+        var target: ?http.Target = null;
+        if (p.url.len > 0) {
+            var tg = try http.Target.parse(p.url);
+            tg.prefix = urlPath(p.url);
+            target = tg;
+        }
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .http = if (target) |tg| .init(gpa, io, tg) else null,
+            .key = p.key,
+            .model = model,
+            .max_tokens = max_tokens,
+            .provider = p.name,
+            .key_name = p.key_name,
+            .api = p.api,
+            .auth = p.auth,
+            .headers = p.headers,
+            .cache = p.cache,
+            .path = switch (p.api) {
+                .anthropic => "/messages",
+                .openai => "/chat/completions",
+            },
+            .tokens_field = p.tokens_field,
+        };
+    }
+
+    /// The path of an address http.Target.parse took, as written,
+    /// without a trailing `/` ("" for none).
+    fn urlPath(url: []const u8) []const u8 {
+        var rest = url;
+        if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
+        var path = rest[std.mem.indexOfScalar(u8, rest, '/') orelse rest.len ..];
+        while (std.mem.endsWith(u8, path, "/")) path = path[0 .. path.len - 1];
+        return path;
+    }
+
+    /// What the owner is told when a call failed with `e`: the same words
+    /// for every provider, naming it (omnigate's are 0.3's, word for word).
+    pub fn failure(c: *const Client, a: std.mem.Allocator, e: anyerror) ![]const u8 {
+        const omni = std.mem.eql(u8, c.provider, "omnigate");
+        const at = if (omni) "" else try std.fmt.allocPrint(a, " at {s}", .{c.provider});
+        const msg = c.lastError();
+        const out: []const u8 = switch (e) {
+            error.BudgetSpent => try std.fmt.allocPrint(a, "Model budget used up{s}.", .{at}),
+            error.RateLimited => try std.fmt.allocPrint(a, "The model is rate limited{s}; try again later.", .{at}),
+            error.NoKey => try std.fmt.allocPrint(a, "Model calls are refused: no {s} key is stored (harness secret add {s}).", .{ c.provider, c.key_name }),
+            error.NoUrl => if (omni)
+                "Model calls are refused: no omnigate url is set ([model] url in config.ini, then /reload)."
+            else
+                try std.fmt.allocPrint(a, "Model calls are refused: no {s} url is set ([provider {s}] url in config.ini, then /reload).", .{ c.provider, c.provider }),
+            error.KeyRefused => try std.fmt.allocPrint(a, "Model calls are refused: {s} refused the key stored as {s}{s}{s}{s}; store the right key with harness secret add {s}.", .{
+                c.provider, c.key_name, if (msg.len > 0) " (" else "", msg, if (msg.len > 0) ")" else "", c.key_name,
+            }),
+            error.TimeUp => "Time limit reached for this turn.",
+            error.Timeout => try std.fmt.allocPrint(a, "Model call failed{s}: Timeout {s}", .{ at, msg }),
+            error.Rejected => try std.fmt.allocPrint(a, "The model API{s} refused the request: {s}", .{ at, msg }),
+            else => try std.fmt.allocPrint(a, "Model call failed{s}: {s} {s}", .{ at, @errorName(e), msg }),
+        };
+        return out;
     }
 
     pub fn deinit(c: *Client) void {
@@ -343,8 +435,12 @@ pub const Client = struct {
 
     fn sendSystem(c: *Client, arena: std.mem.Allocator, system: System, messages: []const Message, tools: []const ToolDef, lim: Limits) Error!Reply {
         if (c.http == null) return error.NoUrl;
-        if (c.key.len == 0) return error.NoKey;
-        const body = try requestBody(arena, c.model, c.max_tokens, system, messages, tools);
+        if (c.auth != .none and c.key.len == 0) return error.NoKey;
+        const body = switch (c.api) {
+            .anthropic => try anthropicBody(arena, c.model, c.max_tokens, system, messages, tools, c.cache),
+            // the OpenAI format comes next
+            .openai => try anthropicBody(arena, c.model, c.max_tokens, system, messages, tools, false),
+        };
         var limited = false;
         var connect_retry = false;
         while (true) {
@@ -367,7 +463,14 @@ pub const Client = struct {
                 else => return e,
             };
             switch (r.status) {
-                200 => return parseReply(arena, r.body) orelse error.BadReply,
+                200 => return switch (c.api) {
+                    .anthropic => parseReply(arena, r.body),
+                    .openai => null,
+                } orelse error.BadReply,
+                401, 403 => {
+                    c.note(r.body);
+                    return error.KeyRefused;
+                },
                 402 => {
                     c.note(r.body);
                     return error.BudgetSpent;
@@ -425,13 +528,27 @@ pub const Client = struct {
     const Raw = struct { status: u16, body: []u8, retry_after_s: ?u32 };
 
     fn post(c: *Client, arena: std.mem.Allocator, body: []const u8, total_ms: u32) http.Error!Raw {
+        // the key as its provider takes it, the format's version, then the
+        // provider's own headers
+        var hs: [max_headers + 2]Header = undefined;
+        var n: usize = 0;
+        if (c.auth == .x_api_key) {
+            hs[n] = .{ .name = "x-api-key", .value = c.key };
+            n += 1;
+        }
+        if (c.api == .anthropic) {
+            hs[n] = .{ .name = "anthropic-version", .value = "2023-06-01" };
+            n += 1;
+        }
+        for (c.headers[0..@min(c.headers.len, max_headers)]) |h| {
+            hs[n] = h;
+            n += 1;
+        }
         var resp = try c.http.?.send(.{
-            .path = "/v1/messages",
+            .path = c.path,
             .body = body,
-            .headers = &.{
-                .{ .name = "x-api-key", .value = c.key },
-                .{ .name = "anthropic-version", .value = "2023-06-01" },
-            },
+            .key = if (c.auth == .bearer) c.key else null,
+            .headers = hs[0..n],
             .limits = .{ .idle_ms = @min(300_000, total_ms), .total_ms = total_ms },
         });
         defer resp.deinit();
@@ -442,8 +559,14 @@ pub const Client = struct {
     fn note(c: *Client, body: []const u8) void {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
-        const v = jv.parse(arena.allocator(), body);
-        const msg = jv.str(jv.at(v, &.{ "error", "message" })) orelse body;
+        const a = arena.allocator();
+        const v = jv.parse(a, body);
+        var msg = jv.str(jv.at(v, &.{ "error", "message" })) orelse body;
+        // a gateway may say the key back: never kept, never shown
+        if (c.key.len > 0) {
+            const mark = std.fmt.allocPrint(a, "[secret:{s}]", .{c.key_name}) catch "[secret]";
+            msg = std.mem.replaceOwned(u8, a, msg, c.key, mark) catch "(an error message that could not be masked)";
+        }
         const s = util.cut(msg, c.last_error.len);
         @memcpy(c.last_error[0..s.len], s);
         c.last_error_len = s.len;
@@ -462,17 +585,23 @@ pub const System = struct {
     cache: bool = true,
 };
 
-/// Prompt-cache marks (at most 4 are allowed): the last tool, the stable
-/// system part (calls of a turn), and the last message's last block, so
-/// each step of a turn reads the steps before it from cache, and a new
-/// turn reads at least the tools and the instructions.
+/// An Anthropic Messages request, with omnigate's prompt-cache marks.
 pub fn requestBody(arena: std.mem.Allocator, model: []const u8, max_tokens: u32, system: System, messages: []const Message, tools: []const ToolDef) ![]u8 {
+    return anthropicBody(arena, model, max_tokens, system, messages, tools, true);
+}
+
+/// An Anthropic Messages request. Prompt-cache marks when `marks` (at
+/// most 4 are allowed): the last tool, the stable system part (calls of a
+/// turn), and the last message's last block, so each step of a turn reads
+/// the steps before it from cache, and a new turn reads at least the
+/// tools and the instructions.
+pub fn anthropicBody(arena: std.mem.Allocator, model: []const u8, max_tokens: u32, system: System, messages: []const Message, tools: []const ToolDef, marks: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "{\"model\":");
     try util.jsonString(&out, arena, model);
     try out.print(arena, ",\"max_tokens\":{d},\"system\":", .{max_tokens});
     // an empty text block is refused, so an empty part is left out
-    const marked = system.cache and system.stable.len > 0;
+    const marked = marks and system.cache and system.stable.len > 0;
     if (!marked and system.changing.len == 0) {
         try util.jsonString(&out, arena, system.stable);
     } else {
@@ -497,7 +626,7 @@ pub fn requestBody(arena: std.mem.Allocator, model: []const u8, max_tokens: u32,
         try out.print(arena, "{{\"role\":\"{s}\",\"content\":[", .{@tagName(m.role)});
         for (m.blocks, 0..) |b, j| {
             if (j > 0) try out.append(arena, ',');
-            const mark = i + 1 == messages.len and j + 1 == m.blocks.len;
+            const mark = marks and i + 1 == messages.len and j + 1 == m.blocks.len;
             switch (b) {
                 .text => |s| {
                     try out.appendSlice(arena, "{\"type\":\"text\",\"text\":");
@@ -537,7 +666,7 @@ pub fn requestBody(arena: std.mem.Allocator, model: []const u8, max_tokens: u32,
             try out.appendSlice(arena, ",\"description\":");
             try util.jsonString(&out, arena, td.description);
             try out.print(arena, ",\"input_schema\":{s}", .{td.schema_json});
-            if (i + 1 == tools.len) try out.appendSlice(arena, cache_mark);
+            if (marks and i + 1 == tools.len) try out.appendSlice(arena, cache_mark);
             try out.append(arena, '}');
         }
         try out.append(arena, ']');
@@ -615,6 +744,20 @@ pub const TestEnv = struct {
 
     pub fn client(e: *TestEnv) !Client {
         var c = try Client.init(t.allocator, t.io, try e.url(), "og-test-key", "claude-test", 1000);
+        c.max_retry_wait = 1;
+        return c;
+    }
+
+    /// A provider at the fake server: its address with /v1, its key
+    /// stored under its own name.
+    pub fn provider(e: *TestEnv, name: []const u8, api: Api, auth: Auth, key: []const u8) !Provider {
+        const address = try std.fmt.allocPrint(e.arena.allocator(), "http://127.0.0.1:{d}/v1", .{e.server.port});
+        return .{ .name = name, .api = api, .url = address, .auth = auth, .cache = api == .anthropic, .key_name = name, .key = key };
+    }
+
+    pub fn clientFor(e: *TestEnv, p: Provider, model_name: []const u8) !Client {
+        _ = e;
+        var c = try Client.open(t.allocator, t.io, p, model_name, 1000);
         c.max_retry_wait = 1;
         return c;
     }
@@ -903,4 +1046,106 @@ test "a_model_value_picks_its_provider_by_its_prefix" {
     try t.expect(set.find("local").?.hasKey());
     try t.expect(!set.find("anthropic").?.hasKey());
     try t.expectEqual(2, (try set.used(a, &.{ "claude-sonnet", "local:x", "claude-haiku" })).len);
+}
+
+fn ogKey(_: ?*anyopaque, _: std.mem.Allocator, provider: []const u8, _: []const u8) ?[]const u8 {
+    return if (std.mem.eql(u8, provider, "omnigate")) "og-test-key" else null;
+}
+
+test "provider_presets_resolve_and_old_settings_still_reach_omnigate" {
+    var e: TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const config = @import("config.zig");
+    // a 0.3 config.ini: omnigate's address without a path
+    const old = try config.parse(a, try std.fmt.allocPrint(a, "[model]\nurl = {s}\nmodel = claude-sonnet\nkey = omnigate\n", .{try e.url()}));
+    const set = try Providers.resolve(a, config.providerSettings(old), .{ .get = ogKey });
+    for (1..4) |n| try e.script(@intCast(n), textReply("ok"));
+    var c = try set.client(t.allocator, t.io, old.model.model, 1000);
+    defer c.deinit();
+    _ = try c.sendParts(a, "stable", "", hi, &.{.{ .name = "shell", .description = "run", .schema_json = "{\"type\":\"object\"}" }}, .{});
+    const v = jv.parse(a, try e.request(1)).?;
+    try t.expectEqualStrings("/v1/messages", jv.str(jv.get(v, "target")).?);
+    try t.expectEqualStrings("og-test-key", jv.str(jv.at(v, &.{ "headers", "x-api-key" })).?);
+    try t.expectEqualStrings("2023-06-01", jv.str(jv.at(v, &.{ "headers", "anthropic-version" })).?);
+    try t.expect(jv.at(v, &.{ "headers", "Authorization" }) == null);
+    try t.expectEqualStrings("claude-sonnet", jv.str(jv.at(v, &.{ "body", "model" })).?);
+    // the cache marks as before
+    try t.expect(jv.at(v, &.{ "body", "tools", "0", "cache_control" }) != null);
+    try t.expect(jv.at(v, &.{ "body", "system", "0", "cache_control" }) != null);
+    // an address ending in /v1, or with a path of its own, as 0.3 read it
+    for ([_][2][]const u8{ .{ "/v1/", "/v1/messages" }, .{ "/proxy", "/proxy/v1/messages" } }, 2..) |case, n| {
+        const s = try config.parse(a, try std.fmt.allocPrint(a, "[model]\nurl = {s}{s}\n", .{ try e.url(), case[0] }));
+        const ps = try Providers.resolve(a, config.providerSettings(s), .{ .get = ogKey });
+        var pc = try ps.client(t.allocator, t.io, "claude-sonnet", 1000);
+        defer pc.deinit();
+        _ = try pc.send(a, "", hi, &.{});
+        try t.expectEqualStrings(case[1], jv.str(jv.get(jv.parse(a, try e.request(@intCast(n))).?, "target")).?);
+    }
+    // the presets, as the spec's table has them
+    const Want = struct { name: []const u8, api: Api, url: []const u8, auth: Auth, cache: bool, key: []const u8 };
+    const want = [_]Want{
+        .{ .name = "omnigate", .api = .anthropic, .url = try std.fmt.allocPrint(a, "{s}/v1", .{try e.url()}), .auth = .x_api_key, .cache = true, .key = "omnigate" },
+        .{ .name = "anthropic", .api = .anthropic, .url = "https://api.anthropic.com/v1", .auth = .x_api_key, .cache = true, .key = "anthropic" },
+        .{ .name = "openrouter", .api = .openai, .url = "https://openrouter.ai/api/v1", .auth = .bearer, .cache = true, .key = "openrouter" },
+        .{ .name = "opencode", .api = .openai, .url = "https://opencode.ai/zen/v1", .auth = .bearer, .cache = false, .key = "opencode" },
+        .{ .name = "openai", .api = .openai, .url = "https://api.openai.com/v1", .auth = .bearer, .cache = false, .key = "openai" },
+    };
+    try t.expectEqual(want.len, set.list.len);
+    for (want, set.list) |w, p| {
+        try t.expectEqualStrings(w.name, p.name);
+        try t.expectEqual(w.api, p.api);
+        try t.expectEqualStrings(w.url, p.url);
+        try t.expectEqual(w.auth, p.auth);
+        try t.expectEqual(w.cache, p.cache);
+        try t.expectEqualStrings(w.key, p.key_name);
+    }
+    try t.expectEqualStrings("max_completion_tokens", set.find("openai").?.tokens_field);
+    try t.expectEqualStrings("max_tokens", set.find("openrouter").?.tokens_field);
+    try t.expectEqualStrings("og-test-key", set.find("omnigate").?.key);
+}
+
+test "bearer_and_none_auth_send_the_right_headers" {
+    var e: TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    for (1..4) |n| try e.script(@intCast(n), textReply("ok"));
+    // only the requests are looked at here
+    var p = try e.provider("local", .openai, .bearer, "sk-bearer-test-1");
+    p.headers = &.{.{ .name = "HTTP-Referer", .value = "https://example.org" }};
+    var c1 = try e.clientFor(p, "gpt-test");
+    defer c1.deinit();
+    _ = c1.send(a, "", hi, &.{}) catch {};
+    const r1 = jv.parse(a, try e.request(1)).?;
+    try t.expectEqualStrings("/v1/chat/completions", jv.str(jv.get(r1, "target")).?);
+    try t.expectEqualStrings("Bearer sk-bearer-test-1", jv.str(jv.at(r1, &.{ "headers", "Authorization" })).?);
+    try t.expectEqualStrings("https://example.org", jv.str(jv.at(r1, &.{ "headers", "HTTP-Referer" })).?);
+    try t.expect(jv.at(r1, &.{ "headers", "x-api-key" }) == null);
+    try t.expect(jv.at(r1, &.{ "headers", "anthropic-version" }) == null);
+    // an Anthropic-format gateway that takes a bearer token
+    var c2 = try e.clientFor(try e.provider("proxy", .anthropic, .bearer, "sk-bearer-test-2"), "claude-test");
+    defer c2.deinit();
+    _ = try c2.send(a, "", hi, &.{});
+    const r2 = jv.parse(a, try e.request(2)).?;
+    try t.expectEqualStrings("/v1/messages", jv.str(jv.get(r2, "target")).?);
+    try t.expectEqualStrings("Bearer sk-bearer-test-2", jv.str(jv.at(r2, &.{ "headers", "Authorization" })).?);
+    try t.expectEqualStrings("2023-06-01", jv.str(jv.at(r2, &.{ "headers", "anthropic-version" })).?);
+    try t.expect(jv.at(r2, &.{ "headers", "x-api-key" }) == null);
+    // none: no key needed, none sent
+    var c3 = try e.clientFor(try e.provider("ollama", .openai, .none, ""), "llama3.1:8b");
+    defer c3.deinit();
+    if (c3.send(a, "", hi, &.{})) |_| {} else |err| try t.expect(err != error.NoKey);
+    try t.expectEqual(3, e.server.modelRequests());
+    const r3 = jv.parse(a, try e.request(3)).?;
+    try t.expect(jv.at(r3, &.{ "headers", "Authorization" }) == null);
+    try t.expect(jv.at(r3, &.{ "headers", "x-api-key" }) == null);
+    // a refused key: the provider and the secret named, the key never said back
+    try e.script(4, "{\"status\":401,\"echo_key\":true}");
+    try t.expectError(error.KeyRefused, c1.send(a, "", hi, &.{}));
+    try t.expectEqual(4, e.server.modelRequests());
+    try t.expect(std.mem.indexOf(u8, c1.lastError(), "sk-bearer-test-1") == null);
+    try t.expect(std.mem.indexOf(u8, c1.lastError(), "[secret:local]") != null);
+    try t.expectEqualStrings("Model calls are refused: local refused the key stored as local (scripted error for key [secret:local]); store the right key with harness secret add local.", try c1.failure(a, error.KeyRefused));
 }
