@@ -1625,6 +1625,7 @@ test {
     _ = @import("scrub.zig");
     _ = @import("masks.zig");
     _ = @import("skills.zig");
+    _ = @import("agents.zig");
     _ = @import("mcp.zig");
     _ = @import("page.zig");
     _ = @import("totp.zig");
