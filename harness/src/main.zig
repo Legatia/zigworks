@@ -850,6 +850,11 @@ const TermChan = struct {
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
         var tb: [48]u8 = undefined;
+        // /inbox's Show buttons: the list says it all here
+        if (bs.len > 0 and bs[0][1].len > 0 and bs[0][1][0] == 's') {
+            outPrint(tc.io, "{s}{s}\n", .{ tc.tag(&tb, place), text }) catch {};
+            return 0;
+        }
         // quick replies: type one (a press is a message here)
         if (bs.len > 0 and bs[0][1].len > 0 and bs[0][1][0] == 'r') {
             outPrint(tc.io, "{s}{s}\n", .{ tc.tag(&tb, place), text }) catch {};

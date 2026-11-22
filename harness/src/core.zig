@@ -884,6 +884,11 @@ pub const Core = struct {
     /// out in. A topic Telegram refuses is noted (its posts go to main
     /// from then on, with its name in front) and the text goes there.
     fn sendText(c: *Core, conv: []const u8, text: []const u8) !Sent {
+        return c.sendTextAs(conv, text, false);
+    }
+
+    /// `sendText`, without a sound when `quiet`.
+    fn sendTextAs(c: *Core, conv: []const u8, text: []const u8, quiet: bool) !Sent {
         const ch = c.chan orelse return error.NoChannel;
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
@@ -892,7 +897,9 @@ pub const Core = struct {
         var again = false;
         while (true) {
             const msg = if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text }) else text;
-            if (ch.send(ch.ctx, r.place, msg)) |sent| return sent else |e| {
+            var place = r.place;
+            place.quiet = quiet;
+            if (ch.send(ch.ctx, place, msg)) |sent| return sent else |e| {
                 if (e == error.TopicRefused and !again) {
                     again = true;
                     c.topicRefused(conv);
@@ -1171,6 +1178,7 @@ pub const Core = struct {
             return;
         }
         if (data.len > 0 and data[0] == 'i') return c.itemPress(chat, thread, message_id, data);
+        if (data.len > 1 and data[0] == 's') if (std.fmt.parseInt(u64, data[1..], 10)) |id| return c.showPress(chat, thread, id) else |_| {};
         c.tellOutOfDate(chat, thread, message_id);
     }
 
@@ -1784,6 +1792,7 @@ pub const Core = struct {
     /// label), its texts masked; written, logged, and shown in its
     /// conversation, quietly when harness waits on it. Returns its id.
     pub fn addItem(c: *Core, n: inbox_mod.New) !u64 {
+        c.makeRoom();
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1824,6 +1833,7 @@ pub const Core = struct {
         if (offered) try choices.append(a, .{ .key = "allow", .label = try std.fmt.allocPrint(a, "Allow for this {s}", .{ranKind(s.who.by)}) });
         try choices.append(a, .{ .key = "dismiss", .label = "Dismiss" });
         const line = try c.masks.scrubAlloc(a, try std.fmt.allocPrint(a, "{s}: {s}", .{ s.name, s.arg }));
+        c.makeRoom();
         const id = blk: {
             c.inbox.mutex.lockUncancelable(c.io);
             defer c.inbox.mutex.unlock(c.io);
@@ -1900,9 +1910,6 @@ pub const Core = struct {
         return said;
     }
 
-    /// The terminal's "o", "d" or "n": answers the oldest open run item
-    /// that offers it; false when none does.
-
     /// A reply to one of an item's messages: its text answer (the owner is
     /// told what came of it unless it was taken). False when `reply_to` is
     /// no item's message.
@@ -1943,6 +1950,128 @@ pub const Core = struct {
         const text = std.mem.trim(u8, words.rest(), " \t");
         if (text.len == 0) return usage;
         return c.tookText(a, id, c.answerItem(id, "", text, if (std.mem.eql(u8, conv, "terminal")) .terminal else .telegram));
+    }
+
+    /// `/inbox`: a line per open item, oldest first, each with a Show
+    /// button that posts it again here (the oldest 20, R9); posted here,
+    /// so the reply is empty, unless nothing waits.
+    fn inboxCommand(c: *Core, a: std.mem.Allocator, conv: []const u8) ![]const u8 {
+        var lines: std.ArrayList(u8) = .empty;
+        var bs: std.ArrayList([2][]const u8) = .empty;
+        var more: usize = 0;
+        {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const now_s = c.now();
+            for (c.inbox.items.items) |it| {
+                if (it.status != .open) continue;
+                if (bs.items.len == 20) {
+                    more += 1;
+                    continue;
+                }
+                try lines.print(a, "\n{s}", .{util.cut(try inbox_mod.listLine(a, it, now_s), 180)});
+                try bs.append(a, .{ try std.fmt.allocPrint(a, "Show {d}", .{it.id}), try std.fmt.allocPrint(a, "s{d}", .{it.id}) });
+            }
+        }
+        if (bs.items.len == 0) return "Nothing is waiting for you.";
+        const text = try std.fmt.allocPrint(a, "Waiting for you, oldest first:{s}{s}", .{ lines.items, if (more > 0) try std.fmt.allocPrint(a, "\nAnd {d} more: harness inbox lists them all.", .{more}) else "" });
+        const ch = c.chan orelse return text;
+        const r = try c.placeOf(a, conv);
+        // the buttons could not go: the list alone
+        if (ch.buttons(ch.ctx, r.place, text, bs.items) == null) return text;
+        return "";
+    }
+
+    /// A press of Show (`s<id>`, from /inbox): the item posted again where
+    /// it was pressed, its buttons added to its shown messages. It answers
+    /// nothing.
+    fn showPress(c: *Core, chat: i64, thread: i64, id: u64) void {
+        var buf: [conversations.max_name]u8 = undefined;
+        const conv = c.convAt(&buf, chat, thread);
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const closed: ?[]const u8 = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = c.inbox.find(id) orelse break :blk std.fmt.allocPrint(a, "No item {d} is kept.", .{id}) catch "No such item is kept.";
+            if (it.status == .open) break :blk null;
+            break :blk inbox_mod.already(a, it, c.cfg.chat.utc_offset) catch "It is closed.";
+        };
+        if (closed) |text| return c.sayIn(conv, text);
+        if (!c.showItem(id, conv)) c.sayIn(conv, std.fmt.allocPrint(a, "Item {d} could not be shown here.", .{id}) catch "It could not be shown here.");
+    }
+
+    /// Past 200 open items other than runs', the oldest skipped expire.
+    fn makeRoom(c: *Core) void {
+        while (true) {
+            const id = blk: {
+                c.inbox.mutex.lockUncancelable(c.io);
+                defer c.inbox.mutex.unlock(c.io);
+                if (c.inbox.otherOpen() < inbox_mod.max_open_other) return;
+                var oldest: ?*inbox_mod.Item = null;
+                for (c.inbox.items.items) |it| {
+                    if (it.status != .open or !std.mem.eql(u8, it.kind, "skipped")) continue;
+                    if (oldest == null or it.created < oldest.?.created) oldest = it;
+                }
+                break :blk (oldest orelse return).id;
+            };
+            _ = c.settle(id, .expired, .{ .text = "200 items were open", .at = c.now(), .via = .harness });
+        }
+    }
+
+    /// The ticker's: items past their `expires` that no run waits on close
+    /// (a run's own waiter closes its item); a delivery's brief or task
+    /// then counts as run.
+    fn expireDue(c: *Core, now_s: i64) void {
+        var due: [32]u64 = undefined;
+        var n: usize = 0;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        var ran: std.ArrayList(Keep) = .empty;
+        {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            for (c.inbox.items.items) |it| {
+                if (n == due.len) break;
+                if (it.status != .open or it.isRun() or it.settling or it.expires == 0 or now_s < it.expires) continue;
+                due[n] = it.id;
+                n += 1;
+                if (it.post) |p| if (p.next > 0 and p.of.len > 0) {
+                    ran.append(arena.allocator(), .{ .key = arena.allocator().dupe(u8, p.of) catch continue, .ran = p.ran }) catch {};
+                };
+            }
+        }
+        for (due[0..n]) |id| _ = c.settle(id, .expired, .{ .at = now_s, .via = .harness });
+        for (ran.items) |k| c.markRan(k.key, k.ran);
+    }
+
+    /// Once a day at `[inbox] remind` (the owner's time), if an item has
+    /// been open over 12 hours: "Waiting for you: 3 items. /inbox" in main,
+    /// quietly. The day is kept in state/inbox, so a restart does not say
+    /// it twice.
+    fn remindDue(c: *Core, now_s: i64) void {
+        const at = c.cfg.inbox.remind orelse return;
+        if (c.localMinutes(now_s) < at) return;
+        const today = c.localDay(now_s);
+        const n = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            if (c.inbox.reminded >= today) return;
+            c.inbox.reminded = today;
+            c.saveInbox();
+            var waiting: usize = 0;
+            var old = false;
+            for (c.inbox.items.items) |it| if (it.status == .open) {
+                waiting += 1;
+                if (now_s - it.created > 12 * 3600) old = true;
+            };
+            if (!old) return;
+            break :blk waiting;
+        };
+        var buf: [64]u8 = undefined;
+        c.log.write(.inbox, false, .{ .event = "remind", .open = n }) catch {};
+        _ = c.sendTextAs("main", std.fmt.bufPrint(&buf, "Waiting for you: {d} item{s}. /inbox", .{ n, if (n == 1) "" else "s" }) catch "Waiting for you. /inbox", true) catch {};
     }
 
     /// The terminal's "o", "d" or "n": answers the oldest open run item
@@ -2925,8 +3054,11 @@ pub const Core = struct {
         if (c.stop.load(.acquire)) return;
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
-        // messages that did not get through go again when their wait is over
+        // posts that did not get through go again when their wait is over
         c.resendDue(now_s);
+        // items past their time close; the daily reminder
+        c.expireDue(now_s);
+        c.remindDue(now_s);
         const today = c.localDay(now_s);
         const minutes = c.localMinutes(now_s);
         for (c.briefs) |b| {
@@ -3019,6 +3151,7 @@ pub const Core = struct {
         const a = arena.allocator();
         const text = c.masks.scrubAlloc(a, d.text) catch return 0;
         const private = d.private or c.convPrivate(d.to);
+        c.makeRoom();
         const now_s = c.now();
         const id = blk: {
             c.inbox.mutex.lockUncancelable(c.io);
@@ -3395,6 +3528,7 @@ pub const Core = struct {
         \\/conversation rename OLD NEW, /conversation rm NAME
         \\/conversation add NAME: sent in a group, the agent may post there
         \\/session [N]: the steps behind the last answer here (N runs back)
+        \\/inbox: what waits for you, a Show button each
         \\/answer ID TEXT: answer an item in words (or reply to its message)
         \\/grants: what you allowed for later, /grant rm N
     ;
@@ -3523,6 +3657,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/logins")) return c.loginsText(a);
         if (eql(u8, cmd, "/conversations")) return c.conversationsText(a);
         if (eql(u8, cmd, "/session")) return c.sessionText(a, conv, rest);
+        if (eql(u8, cmd, "/inbox")) return c.inboxCommand(a, conv);
         if (eql(u8, cmd, "/answer")) return c.answerCommand(a, conv, rest);
         if (eql(u8, cmd, "/grants")) return c.grantsText(a);
         if (eql(u8, cmd, "/grant")) return c.grantCommand(a, rest);
@@ -5794,6 +5929,150 @@ test "money_shared_send_and_written_file_skips_offer_no_grant" {
     }
     try t.expectEqual(3, f.rec.count("BUTTONS Skipped ["));
     try t.expect(std.mem.indexOf(u8, try inboxFile(&f), "\"key\":\"allow\"") == null);
+}
+
+/// Waits until state/inbox holds `needle`.
+fn waitInbox(f: *Fix, needle: []const u8) !void {
+    var waited: u32 = 0;
+    while (waited < 8000) : (waited += 20) {
+        const text = inboxFile(f) catch "";
+        if (std.mem.indexOf(u8, text, needle) != null) return;
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    std.debug.print("state/inbox never held {s}\n", .{needle});
+    return error.TestTimedOut;
+}
+
+/// The data of the first button of `b`.
+fn firstData(b: *const Recorder.Buttons) []const u8 {
+    return b.buf[0][0..b.len[0]];
+}
+
+test "show_posts_an_item_again_and_its_new_buttons_count" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "house-search", 5012);
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo far-up\"}"));
+    try f.e.script(2, model.textReply("ran it"));
+    try f.core.startWorker();
+    try f.core.handleText("run it");
+    try f.rec.waitFor("BUTTONS Allow this? [1]");
+    const old = f.lastButtons();
+    // /inbox in a topic: a line per open item, a Show button each
+    try f.core.handleTextIn("house-search", "/inbox");
+    try f.rec.waitIn("house-search", "BUTTONS Waiting for you, oldest first:\n[1] approval, main, just now: shell: echo far-up [s1]");
+    const list = f.lastButtons();
+    try t.expectEqualStrings("s1", firstData(&list));
+    // Show posts it again where it was pressed
+    f.core.handleCallbackIn(42, 42, 5012, list.msg, "s1");
+    try f.rec.waitIn("house-search", "BUTTONS Allow this? [1]\nshell: echo far-up");
+    const again = f.lastButtons();
+    try t.expect(again.msg != old.msg);
+    try t.expectEqual(1, f.core.itemsWaiting());
+    // its new message's button answers it, and both messages are edited
+    f.core.handleCallbackIn(42, 42, 5012, again.msg, again.get("once").?);
+    try f.rec.waitFor("ran it");
+    const a = f.e.arena.allocator();
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "EDIT {d}: Allow this? [1]", .{old.msg}));
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "EDIT {d}: Allow this? [1]", .{again.msg}));
+    try f.core.handleText("/inbox");
+    try f.rec.waitFor("Nothing is waiting for you.");
+}
+
+test "skipped_and_delivery_items_make_no_sound" {
+    var f: Fix = undefined;
+    try f.init("", "", "[disk]\nevery = 5m\ndo = Check the disk.\n");
+    defer f.deinit();
+    // an approval a run waits on makes a sound
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo with-sound\"}"));
+    try f.e.script(2, model.textReply("denied it"));
+    try f.core.startWorker();
+    try f.core.handleText("run it");
+    try f.rec.waitFor("BUTTONS Allow this? [1]");
+    try t.expect(!f.rec.quietOf("BUTTONS Allow this? [1]").?);
+    try f.press("deny");
+    try f.rec.waitFor("denied it");
+    // a skipped call's item does not
+    try f.e.script(3, model.toolReply("d1", "shell", "{\"command\":\"echo disk-check\"}"));
+    try f.e.script(4, model.textReply("NOTHING"));
+    f.core.tick();
+    try f.rec.waitFor("BUTTONS Skipped [2]");
+    waitIdle(f.core);
+    try t.expect(f.rec.quietOf("BUTTONS Skipped [2]").?);
+    // nor a post that did not get through, shown with Show
+    try f.e.script(5, model.toolReply("s1", "send", "{\"text\":\"kept for later\",\"final\":true}"));
+    f.rec.setFail(error.ConnectionClosed);
+    try f.core.handleText("post it");
+    try waitInbox(&f, "\"kind\":\"delivery\"");
+    f.rec.setFail(null);
+    f.core.handleCallback(42, 0, "s3");
+    try f.rec.waitFor("BUTTONS Not delivered [3] to main:\nkept for later");
+    try t.expect(f.rec.quietOf("BUTTONS Not delivered [3]").?);
+}
+
+test "the_reminder_comes_once_a_day_for_items_open_over_12h" {
+    var f: Fix = undefined;
+    try f.init("[inbox]\nremind = 09:00\n", "", "");
+    defer f.deinit();
+    const day = @divFloor(util.nowSeconds(t.io), 86400) * 86400;
+    const paused: inbox_mod.New = .{ .kind = "paused", .title = "trigger feed paused", .body = "trigger feed paused", .choices = &.{.{ .key = "resume", .label = "Resume" }} };
+    // an item made at 20:00
+    f.core.fixed_now = day + 20 * 3600;
+    _ = try f.core.addItem(paused);
+    // 09:00 the next day: once, without a sound
+    f.core.fixed_now = day + 86400 + 9 * 3600 + 10;
+    f.core.tick();
+    try f.rec.waitFor("Waiting for you: 1 item. /inbox");
+    try t.expect(f.rec.quietOf("Waiting for you: 1 item.").?);
+    f.core.fixed_now = day + 86400 + 10 * 3600;
+    f.core.tick();
+    t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    try t.expectEqual(1, f.rec.count("Waiting for you:"));
+    // the day after, again
+    f.core.fixed_now = day + 2 * 86400 + 9 * 3600 + 5;
+    f.core.tick();
+    try waitCount(&f.rec, "Waiting for you: 1 item. /inbox", 2);
+    // one open under 12 hours brings none
+    try t.expectEqual(.taken, f.core.answerItem(1, "resume", null, .terminal));
+    f.core.fixed_now = day + 3 * 86400 + 8 * 3600;
+    _ = try f.core.addItem(paused);
+    f.core.fixed_now = day + 3 * 86400 + 9 * 3600 + 5;
+    f.core.tick();
+    t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    try t.expectEqual(2, f.rec.count("Waiting for you:"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"remind\"") != null);
+}
+
+test "items_hold_no_stored_secret_and_a_private_items_text_goes_when_it_closes" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "diary", 5014);
+    try f.core.handleTextIn("diary", "/private on");
+    try f.rec.waitIn("diary", "Private here");
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo og-key-for-tests\"}"));
+    try f.e.script(2, model.textReply("not run"));
+    try f.e.script(3, model.toolReply("tu_2", "shell", "{\"command\":\"echo dear-diary-words\"}"));
+    try f.e.script(4, model.textReply("noted in the diary"));
+    try f.core.startWorker();
+    try f.core.handleText("print the key");
+    try f.rec.waitFor("BUTTONS Allow this? [1]\nshell: echo [secret:omnigate]");
+    try t.expect(std.mem.indexOf(u8, try inboxFile(&f), "og-key-for-tests") == null);
+    try t.expectEqual(0, f.rec.count("og-key-for-tests"));
+    try f.press("deny");
+    try f.rec.waitFor("not run");
+    // a private conversation's item keeps its words while it is open
+    try f.core.handleTextIn("diary", "write it down");
+    try f.rec.waitIn("diary", "BUTTONS Allow this? [2]\nshell: echo dear-diary-words");
+    try t.expect(std.mem.indexOf(u8, try inboxFile(&f), "dear-diary-words") != null);
+    try f.press("once");
+    try f.rec.waitIn("diary", "noted in the diary");
+    // closed: only its size and keyed hash
+    const text = try inboxFile(&f);
+    try t.expect(std.mem.indexOf(u8, text, "dear-diary-words") == null);
+    try t.expect(std.mem.indexOf(u8, text, "\"title\":{\"bytes\":28,\"hmac\":\"") != null);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "og-key-for-tests") == null);
 }
 
 /// Waits until `needle` was said `n` times.
