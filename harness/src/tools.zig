@@ -123,11 +123,13 @@ fn runRaw(env: Env, arena: std.mem.Allocator, tool: gate.Tool, input_json: []con
 /// Writes `p` as a new file, or over the regular file that is there; never
 /// through a symlink, even one made since the gate looked.
 fn writeNoFollow(io: Io, p: []const u8, content: []const u8) !void {
-    var f = Io.Dir.cwd().createFile(io, p, .{ .exclusive = true }) catch |e| switch (e) {
+    // read access too: Windows refuses to stat a handle opened only to
+    // write (AccessDenied), and the check below needs the stat
+    var f = Io.Dir.cwd().createFile(io, p, .{ .exclusive = true, .read = true }) catch |e| switch (e) {
         error.PathAlreadyExists => blk: {
             // not a pipe either: opening one would wait for a reader
             if ((try Io.Dir.cwd().statFile(io, p, .{ .follow_symlinks = false })).kind != .file) return error.NotAFile;
-            break :blk try Io.Dir.cwd().openFile(io, p, .{ .mode = .write_only, .follow_symlinks = false, .allow_directory = false });
+            break :blk try Io.Dir.cwd().openFile(io, p, .{ .mode = .read_write, .follow_symlinks = false, .allow_directory = false });
         },
         else => return e,
     };

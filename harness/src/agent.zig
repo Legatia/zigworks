@@ -3096,8 +3096,12 @@ test "helpers_get_the_rest_of_the_turn_not_a_new_one" {
     try f.e.script(2, "{\"delay_ms\":1500,\"content\":[{\"type\":\"tool_use\",\"id\":\"w1\",\"name\":\"recall\",\"input\":{\"query\":\"x\"}}],\"stop_reason\":\"tool_use\"}");
     try f.e.script(3, model.textReply("helper had more time than the turn"));
     try f.e.script(4, model.textReply("parent"));
-    const r = try f.say("dig");
-    freeResult(&f.run, r);
+    const r = f.say("dig") catch |e| {
+        std.debug.print("the turn failed: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    defer freeResult(&f.run, r);
+    if (f.e.server.modelRequests() > 2) std.debug.print("{d} model requests; answer: {s}\n", .{ f.e.server.modelRequests(), r.text });
     try t.expect(f.e.server.modelRequests() <= 2);
 }
 
