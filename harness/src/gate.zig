@@ -107,41 +107,89 @@ fn sameKey(tool: Tool, a: []const u8, b: []const u8) bool {
     };
 }
 
+/// The grants the owner gave with "Allow 24 h", kept in `state/grants`. A
+/// file harness writes starts with `file_head`; then a grant a line:
+/// `TOOL[@ENV]`, expiry, key, who, separated by tabs, the key with `\`,
+/// tab, CR and LF escaped (`\\`, `\t`, `\r`, `\n`). A file without that
+/// first line is 0.3's (`TOOL`, expiry, the key to the end of the line) and
+/// is read as before: a shell grant there is for host and covers any run.
 pub const Grants = struct {
     gpa: std.mem.Allocator,
     items: std.ArrayList(Grant) = .empty,
 
-    pub const Grant = struct { tool: Tool, key: []u8, expires_s: i64 };
+    pub const Grant = struct {
+        tool: Tool,
+        key: []u8,
+        expires_s: i64,
+        /// A shell grant's environment (`host` until gap 2); "" for other
+        /// kinds, which run in none.
+        env: []const u8 = "",
+        /// Who it covers: "" any run (0.3's grants); `agent:NAME` that
+        /// definition's own calls; else the runs whose `by` it matches
+        /// (`schedule:NAME`, `workflow:NAME` for all of its steps, `app:NAME`).
+        who: []const u8 = "",
+    };
+
+    /// The first line of a grants file with who and environment.
+    pub const file_head = "# harness grants 2: tool[@environment], expiry (Unix seconds), key (with \\ \\t \\r \\n escaped), who (empty: any run); tab-separated\n";
 
     pub fn init(gpa: std.mem.Allocator) Grants {
         return .{ .gpa = gpa };
     }
 
     pub fn deinit(g: *Grants) void {
-        for (g.items.items) |it| g.gpa.free(it.key);
+        for (g.items.items) |it| {
+            g.gpa.free(it.key);
+            g.gpa.free(it.env);
+            g.gpa.free(it.who);
+        }
         g.items.deinit(g.gpa);
     }
 
+    /// A grant with no who, as 0.3 made them; a shell grant is for host.
     pub fn add(g: *Grants, tool: Tool, key: []const u8, expires_s: i64) !void {
+        return g.addFor(tool, "host", key, "", expires_s);
+    }
+
+    /// A grant for `who` (see `Grant.who`), for a shell command in `env`.
+    /// It renews one for the same tool, environment, who and key.
+    pub fn addFor(g: *Grants, tool: Tool, env: []const u8, key: []const u8, who: []const u8, expires_s: i64) !void {
+        if (who.len > 0 and !who_mod.isValue(who)) return error.BadWho;
+        const e = if (tool != .shell) "" else if (env.len == 0) "host" else env;
         for (g.items.items) |*it| {
-            if (it.tool == tool and sameKey(tool, it.key, key)) {
+            if (it.tool == tool and std.mem.eql(u8, it.env, e) and std.mem.eql(u8, it.who, who) and sameKey(tool, it.key, key)) {
                 it.expires_s = expires_s;
                 return;
             }
         }
         const k = try g.gpa.dupe(u8, key);
         errdefer g.gpa.free(k);
-        try g.items.append(g.gpa, .{ .tool = tool, .key = k, .expires_s = expires_s });
+        const ed = try g.gpa.dupe(u8, e);
+        errdefer g.gpa.free(ed);
+        const wd = try g.gpa.dupe(u8, who);
+        errdefer g.gpa.free(wd);
+        try g.items.append(g.gpa, .{ .tool = tool, .key = k, .expires_s = expires_s, .env = ed, .who = wd });
     }
 
+    /// Whether a grant covers this call by main, in a run the owner
+    /// started, on host.
     pub fn has(g: *const Grants, tool: Tool, key: []const u8, now_s: i64) bool {
+        return g.covers(tool, "host", key, .{}, now_s);
+    }
+
+    /// Whether an unexpired grant covers a call: the same tool (for shell,
+    /// in the same environment) and key, and a who that is empty, the
+    /// call's own definition (not one that delegated it), or matches what
+    /// started its run.
+    pub fn covers(g: *const Grants, tool: Tool, env: []const u8, key: []const u8, w: Who, now_s: i64) bool {
         for (g.items.items) |it| {
-            if (it.tool == tool and it.expires_s > now_s and sameKey(tool, it.key, key)) return true;
+            if (it.tool != tool or it.expires_s <= now_s) continue;
+            if (tool == .shell and !std.mem.eql(u8, it.env, env)) continue;
+            if (sameKey(tool, it.key, key) and whoCovers(it.who, w)) return true;
         }
         return false;
     }
 
-    /// One grant per line: tool, expiry, key, separated by tabs.
     pub fn load(g: *Grants, io: Io, path: []const u8, now_s: i64) !void {
         const text = Io.Dir.cwd().readFileAlloc(io, path, g.gpa, .limited(1 << 20)) catch |e| switch (e) {
             error.FileNotFound => return,
@@ -149,28 +197,104 @@ pub const Grants = struct {
         };
         defer g.gpa.free(text);
         var it = std.mem.splitScalar(u8, text, '\n');
+        if (!std.mem.startsWith(u8, text, "#")) {
+            // 0.3's: no who, and the key to the end of the line, tabs and all
+            while (it.next()) |line| {
+                var parts = std.mem.splitScalar(u8, line, '\t');
+                const tool = Tool.fromName(parts.next() orelse continue) orelse continue;
+                const exp = std.fmt.parseInt(i64, parts.next() orelse continue, 10) catch continue;
+                const key = parts.rest();
+                if (key.len == 0 or exp <= now_s) continue;
+                try g.add(tool, key, exp);
+            }
+            return;
+        }
+        // a line that does not read is left out: it never widens a grant
         while (it.next()) |line| {
+            if (line.len == 0 or line[0] == '#') continue;
             var parts = std.mem.splitScalar(u8, line, '\t');
-            const tool = Tool.fromName(parts.next() orelse continue) orelse continue;
-            const exp = std.fmt.parseInt(i64, parts.next() orelse continue, 10) catch continue;
-            const key = parts.rest();
-            if (key.len == 0 or exp <= now_s) continue;
-            try g.add(tool, key, exp);
+            const head = parts.next() orelse continue;
+            const exp_text = parts.next() orelse continue;
+            const key_text = parts.next() orelse continue;
+            const who = parts.next() orelse continue;
+            if (parts.next() != null) continue;
+            const at = std.mem.indexOfScalar(u8, head, '@');
+            const tool = Tool.fromName(head[0 .. at orelse head.len]) orelse continue;
+            const env = if (at) |i| head[i + 1 ..] else "host";
+            if (at != null and (tool != .shell or !rules.envName(env))) continue;
+            const exp = std.fmt.parseInt(i64, exp_text, 10) catch continue;
+            if (exp <= now_s) continue;
+            const key = unescape(g.gpa, key_text) catch |e| switch (e) {
+                error.BadEscape => continue,
+                else => |x| return x,
+            };
+            defer g.gpa.free(key);
+            if (key.len == 0) continue;
+            g.addFor(tool, env, key, who, exp) catch |e| switch (e) {
+                error.BadWho => continue,
+                else => |x| return x,
+            };
         }
     }
 
     pub fn save(g: *const Grants, io: Io, path: []const u8, now_s: i64) !void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(g.gpa);
+        try out.appendSlice(g.gpa, file_head);
         for (g.items.items) |it| {
             if (it.expires_s <= now_s) continue;
-            try out.print(g.gpa, "{s}\t{d}\t{s}\n", .{ @tagName(it.tool), it.expires_s, it.key });
+            try out.appendSlice(g.gpa, @tagName(it.tool));
+            if (it.tool == .shell) try out.print(g.gpa, "@{s}", .{it.env});
+            try out.print(g.gpa, "\t{d}\t", .{it.expires_s});
+            try escape(&out, g.gpa, it.key);
+            try out.print(g.gpa, "\t{s}\n", .{it.who});
         }
         var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = util.private_file });
         defer f.close(io);
         try f.writeStreamingAll(io, out.items);
     }
 };
+
+/// Whether a grant's who covers a call by `w`.
+fn whoCovers(grant_who: []const u8, w: Who) bool {
+    if (grant_who.len == 0) return true;
+    if (std.mem.startsWith(u8, grant_who, "agent:")) return std.mem.eql(u8, grant_who["agent:".len..], w.agent);
+    return who_mod.matchesBy(grant_who, w.by);
+}
+
+/// A key as a grants line holds it: `\`, tab, CR and LF escaped, so a key
+/// can't end its line or start another grant.
+fn escape(out: *std.ArrayList(u8), gpa: std.mem.Allocator, key: []const u8) !void {
+    for (key) |c| switch (c) {
+        '\\' => try out.appendSlice(gpa, "\\\\"),
+        '\t' => try out.appendSlice(gpa, "\\t"),
+        '\r' => try out.appendSlice(gpa, "\\r"),
+        '\n' => try out.appendSlice(gpa, "\\n"),
+        else => try out.append(gpa, c),
+    };
+}
+
+fn unescape(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] != '\\') {
+            try out.append(gpa, text[i]);
+            continue;
+        }
+        i += 1;
+        if (i == text.len) return error.BadEscape;
+        try out.append(gpa, switch (text[i]) {
+            '\\' => '\\',
+            't' => '\t',
+            'r' => '\r',
+            'n' => '\n',
+            else => return error.BadEscape,
+        });
+    }
+    return out.toOwnedSlice(gpa);
+}
 
 pub const Gate = struct {
     io: Io,
@@ -229,7 +353,9 @@ pub const Gate = struct {
             if (ctx.money_unattended) return .{ .action = .allow, .why = "money in scheduled runs is switched on, within the caps", .subject = subject };
             return .{ .action = .deny, .why = "money is not moved in scheduled runs", .subject = subject };
         }
-        if (g.grants.has(tool, grantKey(tool, subject), now_s)) return .{ .action = .allow, .why = "granted for 24 hours", .subject = subject };
+        // a grant for this tool (a shell command in this environment) and
+        // key, for any run, the call's definition or what started its run
+        if (g.grants.covers(tool, ctx.env, grantKey(tool, subject), w, now_s)) return .{ .action = .allow, .why = "granted for 24 hours", .subject = subject };
         var d: Decision = .{ .action = tool.default(), .why = "default for this tool", .subject = subject };
         // programs read these as their settings (.git/config, .npmrc, .env):
         // a file written there can make the next command run something else
@@ -859,6 +985,88 @@ test "a_shell_rule_for_an_environment_matches_only_there" {
     try t.expectEqual(.allow, f.act(.shell, "ls", .{}));
     try t.expectEqual(.allow, f.act(.shell, "make", .{ .env = "box" }));
     try t.expectEqual(.deny, f.act(.shell, "rm x", .{ .env = "box" }));
+}
+
+test "grants_cover_the_who_they_name" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    const main: Who = .{};
+    const helper: Who = .{ .agent = "helper", .parent = &main };
+    const task: Who = .{ .by = "schedule:btc-watch" };
+    const task_helper: Who = .{ .agent = "helper", .by = task.by, .parent = &task };
+    try f.grants.addFor(.shell, "host", "make", "agent:main", 5000);
+    try t.expectEqual(.allow, f.act(.shell, "make", .{ .who = main }));
+    try t.expectEqual(.allow, f.act(.shell, "make", .{ .who = task }));
+    try t.expectEqual(.ask, f.act(.shell, "make", .{ .who = helper }));
+    try f.grants.addFor(.fetch, "", "api.coinbase.com", "schedule:btc-watch", 5000);
+    try t.expectEqual(.allow, f.act(.fetch, "https://api.coinbase.com/x", .{ .who = task }));
+    try t.expectEqual(.allow, f.act(.fetch, "https://api.coinbase.com/x", .{ .who = task_helper }));
+    try t.expectEqual(.ask, f.act(.fetch, "https://api.coinbase.com/x", .{}));
+    // a workflow's grant covers all of its steps, no other workflow
+    try f.grants.addFor(.mcp, "", "github/add_issue_comment", "workflow:release", 5000);
+    try t.expectEqual(.allow, f.act(.mcp, "github/add_issue_comment {}", .{ .who = .{ .by = "workflow:release/post" } }));
+    try t.expectEqual(.ask, f.act(.mcp, "github/add_issue_comment {}", .{ .who = .{ .by = "workflow:other/post" } }));
+    // one with no who, as 0.3's, covers any run
+    try f.grants.add(.shell, "ls", 5000);
+    try t.expectEqual(.allow, f.act(.shell, "ls", .{ .who = helper }));
+    try t.expectError(error.BadWho, f.grants.addFor(.shell, "host", "x", "agent:*", 5000));
+}
+
+test "a_shell_grant_names_its_environment" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.grants.addFor(.shell, "box", "make test", "", 5000);
+    try t.expectEqual(.ask, f.act(.shell, "make test", .{}));
+    try t.expectEqual(.allow, f.act(.shell, "make test", .{ .env = "box" }));
+    try f.grants.add(.shell, "ls", 5000);
+    try t.expectEqual(.allow, f.act(.shell, "ls", .{}));
+    try t.expectEqual(.ask, f.act(.shell, "ls", .{ .env = "box" }));
+    // other kinds run in no environment
+    try f.grants.addFor(.fetch, "box", "a.com", "", 5000);
+    try t.expectEqual(.allow, f.act(.fetch, "https://a.com/", .{}));
+}
+
+test "the_grants_file_keeps_who_and_environment_and_reads_0_3_lines_as_before" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const path = try std.fs.path.join(a, &.{ f.gate.workspace, "grants" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = "shell\t5000\tls -l\nfetch\t5000\tnews.example.com\nwrite_file\t5000\tnotes/a\tb.md\nshell\t500\told\n" });
+    const main: Who = .{};
+    const helper: Who = .{ .agent = "helper", .parent = &main };
+    var g: Grants = .init(t.allocator);
+    defer g.deinit();
+    try g.load(t.io, path, 1000);
+    try t.expect(g.covers(.shell, "host", "ls -l", main, 1000));
+    try t.expect(!g.covers(.shell, "box", "ls -l", main, 1000));
+    try t.expect(g.covers(.fetch, "", "news.example.com", helper, 1000));
+    try t.expect(g.covers(.write_file, "", "notes/a\tb.md", main, 1000));
+    try t.expect(!g.covers(.shell, "host", "old", main, 1000));
+    // a line break in a key stays inside its grant
+    const heredoc = "cat <<EOF\nshell\t9999999999\trm -rf /\nEOF";
+    try g.addFor(.shell, "host", heredoc, "agent:main", 5000);
+    try g.save(t.io, path, 1000);
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
+    try t.expect(std.mem.startsWith(u8, text, "#"));
+    var g2: Grants = .init(t.allocator);
+    defer g2.deinit();
+    try g2.load(t.io, path, 1000);
+    try t.expectEqual(4, g2.items.items.len);
+    try t.expect(g2.covers(.shell, "host", heredoc, main, 1000));
+    try t.expect(!g2.covers(.shell, "host", heredoc, helper, 1000));
+    try t.expect(!g2.covers(.shell, "host", "rm -rf /", main, 1000));
+    try t.expect(!g2.covers(.shell, "host", "rm -rf /", helper, 1000));
+    try t.expect(g2.covers(.write_file, "", "notes/a\tb.md", helper, 1000));
+    // a line whose who is not a who value is left out
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = try std.mem.concat(a, u8, &.{ text, "fetch\t5000\tevil.com\tagent:*\n" }) });
+    var g3: Grants = .init(t.allocator);
+    defer g3.deinit();
+    try g3.load(t.io, path, 1000);
+    try t.expect(!g3.covers(.fetch, "", "evil.com", main, 1000));
+    try t.expectEqual(4, g3.items.items.len);
 }
 
 test "deny_mcp_rule_covers_money_tools_of_that_server" {
