@@ -438,8 +438,7 @@ pub const Client = struct {
         if (c.auth != .none and c.key.len == 0) return error.NoKey;
         const body = switch (c.api) {
             .anthropic => try anthropicBody(arena, c.model, c.max_tokens, system, messages, tools, c.cache),
-            // the OpenAI format comes next
-            .openai => try anthropicBody(arena, c.model, c.max_tokens, system, messages, tools, false),
+            .openai => try openaiBody(arena, c.model, c.tokens_field, c.max_tokens, system, messages, tools, c.cache),
         };
         var limited = false;
         var connect_retry = false;
@@ -465,7 +464,7 @@ pub const Client = struct {
             switch (r.status) {
                 200 => return switch (c.api) {
                     .anthropic => parseReply(arena, r.body),
-                    .openai => null,
+                    .openai => parseOpenAIReply(arena, r.body),
                 } orelse error.BadReply,
                 401, 403 => {
                     c.note(r.body);
@@ -675,6 +674,176 @@ pub fn anthropicBody(arena: std.mem.Allocator, model: []const u8, max_tokens: u3
     return out.items;
 }
 
+/// An OpenAI Chat Completions request. The system prompt is one message,
+/// its stable part first; with `marks` that part carries OpenRouter's
+/// `cache_control` (passed on to Anthropic's models). A tool result has
+/// no error flag in this format: its text says what failed.
+pub fn openaiBody(arena: std.mem.Allocator, model: []const u8, tokens_field: []const u8, max_tokens: u32, system: System, messages: []const Message, tools: []const ToolDef, marks: bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, "{\"model\":");
+    try util.jsonString(&out, arena, model);
+    try out.print(arena, ",\"{s}\":{d},\"messages\":[", .{ tokens_field, max_tokens });
+    var first = true;
+    if (system.stable.len > 0 or system.changing.len > 0) {
+        first = false;
+        try out.appendSlice(arena, "{\"role\":\"system\",\"content\":");
+        if (marks and system.cache and system.stable.len > 0) {
+            try out.appendSlice(arena, "[{\"type\":\"text\",\"text\":");
+            try util.jsonString(&out, arena, system.stable);
+            try out.appendSlice(arena, cache_mark);
+            try out.append(arena, '}');
+            if (system.changing.len > 0) {
+                try out.appendSlice(arena, ",{\"type\":\"text\",\"text\":");
+                try util.jsonString(&out, arena, system.changing);
+                try out.append(arena, '}');
+            }
+            try out.append(arena, ']');
+        } else if (system.stable.len > 0 and system.changing.len > 0) {
+            try util.jsonString(&out, arena, try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ system.stable, system.changing }));
+        } else {
+            try util.jsonString(&out, arena, if (system.stable.len > 0) system.stable else system.changing);
+        }
+        try out.append(arena, '}');
+    }
+    for (messages) |m| {
+        const text = try joinText(arena, m.blocks);
+        switch (m.role) {
+            .user => {
+                // the results answer the calls just before them: first
+                for (m.blocks) |b| if (b == .tool_result) {
+                    if (!first) try out.append(arena, ',');
+                    first = false;
+                    try out.appendSlice(arena, "{\"role\":\"tool\",\"tool_call_id\":");
+                    try util.jsonString(&out, arena, b.tool_result.id);
+                    try out.appendSlice(arena, ",\"content\":");
+                    try util.jsonString(&out, arena, b.tool_result.content);
+                    try out.append(arena, '}');
+                };
+                if (text) |tx| {
+                    if (!first) try out.append(arena, ',');
+                    first = false;
+                    try out.appendSlice(arena, "{\"role\":\"user\",\"content\":");
+                    try util.jsonString(&out, arena, tx);
+                    try out.append(arena, '}');
+                }
+            },
+            .assistant => {
+                if (!first) try out.append(arena, ',');
+                first = false;
+                var calls: usize = 0;
+                for (m.blocks) |b| if (b == .tool_use) {
+                    calls += 1;
+                };
+                try out.appendSlice(arena, "{\"role\":\"assistant\",\"content\":");
+                if (text) |tx| {
+                    try util.jsonString(&out, arena, tx);
+                } else try out.appendSlice(arena, if (calls > 0) "null" else "\"\"");
+                if (calls > 0) {
+                    try out.appendSlice(arena, ",\"tool_calls\":[");
+                    var i: usize = 0;
+                    for (m.blocks) |b| if (b == .tool_use) {
+                        if (i > 0) try out.append(arena, ',');
+                        i += 1;
+                        try out.appendSlice(arena, "{\"id\":");
+                        try util.jsonString(&out, arena, b.tool_use.id);
+                        try out.appendSlice(arena, ",\"type\":\"function\",\"function\":{\"name\":");
+                        try util.jsonString(&out, arena, b.tool_use.name);
+                        try out.appendSlice(arena, ",\"arguments\":");
+                        try util.jsonString(&out, arena, if (b.tool_use.input_json.len > 0) b.tool_use.input_json else "{}");
+                        try out.appendSlice(arena, "}}");
+                    };
+                    try out.append(arena, ']');
+                }
+                try out.append(arena, '}');
+            },
+        }
+    }
+    try out.append(arena, ']');
+    if (tools.len > 0) {
+        try out.appendSlice(arena, ",\"tools\":[");
+        for (tools, 0..) |td, i| {
+            if (i > 0) try out.append(arena, ',');
+            try out.appendSlice(arena, "{\"type\":\"function\",\"function\":{\"name\":");
+            try util.jsonString(&out, arena, td.name);
+            try out.appendSlice(arena, ",\"description\":");
+            try util.jsonString(&out, arena, td.description);
+            try out.print(arena, ",\"parameters\":{s}}}}}", .{td.schema_json});
+        }
+        try out.append(arena, ']');
+    }
+    try out.append(arena, '}');
+    return out.items;
+}
+
+/// A message's text blocks as one text; null when it has none.
+fn joinText(arena: std.mem.Allocator, blocks: []const Block) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var any = false;
+    for (blocks) |b| if (b == .text) {
+        if (any) try out.appendSlice(arena, "\n\n");
+        any = true;
+        try out.appendSlice(arena, b.text);
+    };
+    return if (any) out.items else null;
+}
+
+/// An OpenAI Chat Completions answer: its first choice's text and tool
+/// calls. Null when it is not one, or when a call's arguments are not a
+/// JSON object, so the call is not run (`""` reads as `{}`, as local
+/// servers send it; a call without an id gets one).
+pub fn parseOpenAIReply(arena: std.mem.Allocator, body: []const u8) ?Reply {
+    const v = jv.parse(arena, body) orelse return null;
+    const choices = jv.arr(jv.get(v, "choices")) orelse return null;
+    if (choices.len == 0) return null;
+    const msg = jv.get(choices[0], "message") orelse return null;
+    if (msg != .object) return null;
+    var blocks: std.ArrayList(Block) = .empty;
+    if (jv.get(msg, "content")) |content| switch (content) {
+        .string => |text| if (text.len > 0) blocks.append(arena, .{ .text = text }) catch return null,
+        .array => |parts| for (parts.items) |part| {
+            const text = jv.str(jv.get(part, "text")) orelse continue;
+            if (text.len > 0) blocks.append(arena, .{ .text = text }) catch return null;
+        },
+        else => {},
+    };
+    if (jv.arr(jv.get(msg, "tool_calls"))) |calls| for (calls, 0..) |call, i| {
+        const f = jv.get(call, "function") orelse return null;
+        const name = jv.str(jv.get(f, "name")) orelse return null;
+        const input_json: []const u8 = if (jv.get(f, "arguments")) |args| switch (args) {
+            .string => |raw| blk: {
+                const text = std.mem.trim(u8, raw, " \t\r\n");
+                if (text.len == 0) break :blk "{}";
+                const parsed = jv.parse(arena, text) orelse return null;
+                if (parsed != .object) return null;
+                break :blk text;
+            },
+            .object => std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(args, .{})}) catch return null,
+            else => return null,
+        } else "{}";
+        const given = jv.str(jv.get(call, "id")) orelse "";
+        const id = if (given.len > 0) given else std.fmt.allocPrint(arena, "call_{x}", .{std.hash.Wyhash.hash(@intCast(i), body)}) catch return null;
+        blocks.append(arena, .{ .tool_use = .{ .id = id, .name = name, .input_json = input_json } }) catch return null;
+    };
+    // prompt_tokens counts the cached ones too: input is what was not
+    const prompt: u64 = @intCast(@max(0, jv.int(jv.at(v, &.{ "usage", "prompt_tokens" })) orelse 0));
+    const cached: u64 = @intCast(@max(0, jv.int(jv.at(v, &.{ "usage", "prompt_tokens_details", "cached_tokens" })) orelse 0));
+    return .{
+        .blocks = blocks.items,
+        .stop_reason = stopReason(jv.str(jv.get(choices[0], "finish_reason")) orelse ""),
+        .input_tokens = prompt -| cached,
+        .output_tokens = @intCast(@max(0, jv.int(jv.at(v, &.{ "usage", "completion_tokens" })) orelse 0)),
+        .cache_read_tokens = cached,
+    };
+}
+
+/// OpenAI's finish reasons in the words the turn reads (Anthropic's).
+fn stopReason(finish: []const u8) []const u8 {
+    if (std.mem.eql(u8, finish, "stop")) return "end_turn";
+    if (std.mem.eql(u8, finish, "length")) return "max_tokens";
+    if (std.mem.eql(u8, finish, "tool_calls") or std.mem.eql(u8, finish, "function_call")) return "tool_use";
+    return finish;
+}
+
 pub fn parseReply(arena: std.mem.Allocator, body: []const u8) ?Reply {
     const v = jv.parse(arena, body) orelse return null;
     const content = jv.arr(jv.get(v, "content")) orelse return null;
@@ -765,6 +934,16 @@ pub const TestEnv = struct {
 
 pub fn textReply(comptime s: []const u8) []const u8 {
     return "{\"content\":[{\"type\":\"text\",\"text\":\"" ++ s ++ "\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":10,\"output_tokens\":3}}";
+}
+
+/// An OpenAI-format text answer.
+pub fn oaTextReply(comptime s: []const u8) []const u8 {
+    return "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" ++ s ++ "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}";
+}
+
+/// An OpenAI-format answer that says "Let me check." and calls `name`.
+pub fn oaToolReply(a: std.mem.Allocator, id: []const u8, name: []const u8, input_json: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{{\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"Let me check.\",\"tool_calls\":[{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":{f}}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}", .{ id, name, std.json.fmt(input_json, .{}) });
 }
 
 pub fn toolReply(comptime id: []const u8, comptime name: []const u8, comptime input: []const u8) []const u8 {
@@ -1148,4 +1327,135 @@ test "bearer_and_none_auth_send_the_right_headers" {
     try t.expect(std.mem.indexOf(u8, c1.lastError(), "sk-bearer-test-1") == null);
     try t.expect(std.mem.indexOf(u8, c1.lastError(), "[secret:local]") != null);
     try t.expectEqualStrings("Model calls are refused: local refused the key stored as local (scripted error for key [secret:local]); store the right key with harness secret add local.", try c1.failure(a, error.KeyRefused));
+}
+
+test "openai_requests_carry_system_messages_tools_and_tool_results" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const msgs: []const Message = &.{
+        .{ .role = .user, .blocks = &.{ .{ .text = "context" }, .{ .text = "list two files" } } },
+        .{ .role = .assistant, .blocks = &.{
+            .{ .text = "Checking." },
+            .{ .tool_use = .{ .id = "tu_1", .name = "shell", .input_json = "{\"command\":\"ls a\"}" } },
+            .{ .tool_use = .{ .id = "tu_2", .name = "read_file", .input_json = "{\"path\":\"b.txt\"}" } },
+        } },
+        .{ .role = .user, .blocks = &.{
+            .{ .tool_result = .{ .id = "tu_1", .content = "a.txt" } },
+            .{ .tool_result = .{ .id = "tu_2", .content = "no such file", .is_error = true } },
+        } },
+    };
+    const tools: []const ToolDef = &.{
+        .{ .name = "shell", .description = "run", .schema_json = "{\"type\":\"object\"}" },
+        .{ .name = "read_file", .description = "read", .schema_json = "{\"type\":\"object\"}" },
+    };
+    const golden =
+        \\{"model":"gpt-test","max_tokens":1000,"messages":[{"role":"system","content":"sys stable"},{"role":"user","content":"context\n\nlist two files"},{"role":"assistant","content":"Checking.","tool_calls":[{"id":"tu_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls a\"}"}},{"id":"tu_2","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"b.txt\"}"}}]},{"role":"tool","tool_call_id":"tu_1","content":"a.txt"},{"role":"tool","tool_call_id":"tu_2","content":"no such file"}],"tools":[{"type":"function","function":{"name":"shell","description":"run","parameters":{"type":"object"}}},{"type":"function","function":{"name":"read_file","description":"read","parameters":{"type":"object"}}}]}
+    ;
+    try t.expectEqualStrings(golden, try openaiBody(a, "gpt-test", "max_tokens", 1000, .{ .stable = "sys stable" }, msgs, tools, false));
+    // with cache marks (OpenRouter): the stable part of the system prompt marked
+    const marked = try openaiBody(a, "gpt-test", "max_tokens", 1000, .{ .stable = "sys stable" }, msgs[0..1], &.{}, true);
+    try t.expect(std.mem.indexOf(u8, marked, "\"messages\":[{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"sys stable\",\"cache_control\":{\"type\":\"ephemeral\"}}]}") != null);
+    // OpenAI's own field for the answer's length; a one-off call's system unmarked
+    const own = try openaiBody(a, "gpt-5", "max_completion_tokens", 1000, .{ .stable = "sys", .cache = false }, msgs[0..1], &.{}, true);
+    try t.expect(std.mem.startsWith(u8, own, "{\"model\":\"gpt-5\",\"max_completion_tokens\":1000,\"messages\":[{\"role\":\"system\",\"content\":\"sys\"}"));
+    // calls without text; their results, then the next message's text
+    const next = try openaiBody(a, "m", "max_tokens", 10, .{ .stable = "" }, &.{
+        .{ .role = .user, .blocks = &.{.{ .text = "go" }} },
+        .{ .role = .assistant, .blocks = &.{.{ .tool_use = .{ .id = "tu_3", .name = "shell", .input_json = "" } }} },
+        .{ .role = .user, .blocks = &.{ .{ .tool_result = .{ .id = "tu_3", .content = "done" } }, .{ .text = "next" } } },
+    }, &.{}, false);
+    try t.expectEqualStrings(
+        \\{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"go"},{"role":"assistant","content":null,"tool_calls":[{"id":"tu_3","type":"function","function":{"name":"shell","arguments":"{}"}}]},{"role":"tool","tool_call_id":"tu_3","content":"done"},{"role":"user","content":"next"}]}
+    , next);
+}
+
+test "openai_replies_become_text_and_tool_uses" {
+    var e: TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    try e.script(1, try oaToolReply(a, "call_1", "shell", "{\"command\":\"ls -l\"}"));
+    try e.script(2, "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"cut he\"},\"finish_reason\":\"length\"}]}");
+    try e.script(3, "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\"}}]},\"finish_reason\":\"tool_calls\"}]}");
+    var c = try e.clientFor(try e.provider("local", .openai, .bearer, "sk-local-test-1"), "gpt-test");
+    defer c.deinit();
+    const r = try c.send(a, "", hi, &.{});
+    try t.expectEqual(2, r.blocks.len);
+    try t.expectEqualStrings("Let me check.", r.blocks[0].text);
+    try t.expectEqualStrings("call_1", r.blocks[1].tool_use.id);
+    try t.expectEqualStrings("shell", r.blocks[1].tool_use.name);
+    try t.expectEqualStrings("{\"command\":\"ls -l\"}", r.blocks[1].tool_use.input_json);
+    try t.expectEqualStrings("tool_use", r.stop_reason);
+    const cut = try c.send(a, "", hi, &.{});
+    try t.expectEqualStrings("max_tokens", cut.stop_reason);
+    try t.expectEqualStrings("cut he", try cut.text(a));
+    // arguments that are not JSON: a bad reply, so the call is not run
+    try t.expectError(error.BadReply, c.send(a, "", hi, &.{}));
+    // what local servers send: text parts, no ids, arguments "" or an object
+    const lax = parseOpenAIReply(a,
+        \\{"choices":[{"message":{"content":[{"type":"text","text":"a"},{"type":"text","text":"b"}],"tool_calls":[
+        \\{"type":"function","function":{"name":"recall","arguments":""}},
+        \\{"id":"","type":"function","function":{"name":"shell","arguments":{"command":"ls"}}}]},"finish_reason":"stop"}],
+        \\"usage":{"prompt_tokens":100,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":60}}}
+    ).?;
+    try t.expectEqual(4, lax.blocks.len);
+    try t.expectEqualStrings("a", lax.blocks[0].text);
+    try t.expectEqualStrings("b", lax.blocks[1].text);
+    try t.expectEqualStrings("{}", lax.blocks[2].tool_use.input_json);
+    try t.expectEqualStrings("{\"command\":\"ls\"}", lax.blocks[3].tool_use.input_json);
+    try t.expect(std.mem.startsWith(u8, lax.blocks[2].tool_use.id, "call_"));
+    try t.expect(std.mem.startsWith(u8, lax.blocks[3].tool_use.id, "call_"));
+    try t.expect(!std.mem.eql(u8, lax.blocks[2].tool_use.id, lax.blocks[3].tool_use.id));
+    try t.expectEqualStrings("end_turn", lax.stop_reason);
+    // input as the log counts it: what was not read from the cache
+    try t.expectEqual(40, lax.input_tokens);
+    try t.expectEqual(7, lax.output_tokens);
+    try t.expectEqual(60, lax.cache_read_tokens);
+    try t.expect(parseOpenAIReply(a, "{\"choices\":[]}") == null);
+    try t.expect(parseOpenAIReply(a, "{\"choices\":[{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"x\",\"arguments\":\"[1]\"}}]}}]}") == null);
+}
+
+test "each_status_maps_to_the_same_message_for_every_provider" {
+    var e: TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    var og = try e.client();
+    defer og.deinit();
+    var local = try e.clientFor(try e.provider("local", .openai, .bearer, "sk-local-test-1"), "gpt-test");
+    defer local.deinit();
+    const Case = struct { script: []const u8, err: anyerror, said: []const u8, requests: u32 = 1 };
+    const cases = [_]Case{
+        .{ .script = "{\"status\":401}", .err = error.KeyRefused, .said = "Model calls are refused: omnigate refused the key stored as omnigate (scripted error); store the right key with harness secret add omnigate." },
+        .{ .script = "{\"status\":402}", .err = error.BudgetSpent, .said = "Model budget used up." },
+        .{ .script = "{\"status\":429,\"retry_after\":1}", .err = error.RateLimited, .said = "The model is rate limited; try again later.", .requests = 2 },
+        .{ .script = "{\"status\":400}", .err = error.Rejected, .said = "The model API refused the request: scripted error" },
+        .{ .script = "{\"status\":500}", .err = error.Upstream, .said = "Model call failed: Upstream scripted error" },
+    };
+    var n: u32 = 0;
+    for (cases) |cs| {
+        for ([_]*Client{ &og, &local }) |c| {
+            for (0..cs.requests) |_| {
+                n += 1;
+                try e.script(n, cs.script);
+            }
+            const before = e.server.modelRequests();
+            try t.expectError(cs.err, c.send(a, "", hi, &.{}));
+            // 429: waited as told, asked once more
+            try t.expectEqual(before + cs.requests, e.server.modelRequests());
+            const said = try c.failure(a, cs.err);
+            // omnigate's words are 0.3's; another provider's the same, naming it
+            if (c == &og) {
+                try t.expectEqualStrings(cs.said, said);
+            } else {
+                try t.expect(std.mem.indexOf(u8, said, "local") != null);
+                const as_omnigate = if (cs.err == error.KeyRefused)
+                    try std.mem.replaceOwned(u8, a, said, "local", "omnigate")
+                else
+                    try std.mem.replaceOwned(u8, a, said, " at local", "");
+                try t.expectEqualStrings(cs.said, as_omnigate);
+            }
+        }
+    }
 }
