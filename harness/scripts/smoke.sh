@@ -46,6 +46,9 @@ inbox() {
 	printf '%s' "$1" >"$S/telegram/in/$(printf %03d $inbox_n).json"
 }
 say() { inbox "{\"message\":{\"from\":{\"id\":42},\"chat\":{\"id\":42},\"text\":\"$1\"}}"; }
+# in_topic THREAD TEXT: the owner writes in topic THREAD ("House search") of
+# their chat with the bot
+in_topic() { inbox "{\"message\":{\"message_id\":$((inbox_n + 1000)),\"from\":{\"id\":42},\"chat\":{\"id\":42,\"type\":\"private\"},\"message_thread_id\":$1,\"is_topic_message\":true,\"reply_to_message\":{\"message_id\":1,\"forum_topic_created\":{\"name\":\"House search\"}},\"text\":\"$2\"}}"; }
 # what the bot sent, a line per call with the message id it got
 OUT="$S/telegram/out.jsonl"
 # button once|day|deny: "MESSAGE_ID DATA" of that button under the last question
@@ -280,6 +283,19 @@ reply "$(text_reply 'NOTHING')"
 before=$(asked)
 say "/task add disk | every 5m | Check the disk."
 check "a scheduled run skips what needs asking and says so, even answering NOTHING" 'wait_for "$OUT" "[disk] Skipped (needs approval): shell: df -h" 30 && result $mn tu_t1 "refused by the gate: no one to ask in a scheduled run" && [ "$(asked)" = "$before" ] && ! grep -qF "[disk] NOTHING" "$OUT"'
+
+# a topic of the owner's chat with the bot is a conversation of its own
+reply "$(call_reply tu_h1 recall '{"query":"flats"}')"
+reply "$(text_reply 'Three flats near the station.')"
+in_topic 5012 "find flats"
+check "a message in a topic is answered there" 'wait_for "$OUT" "\"message_thread_id\":5012,\"text\":\"Three flats near the station.\"" && grep -qF "\"name\":\"house-search\",\"channel\":\"telegram\",\"chat\":42,\"thread\":5012" "$HARNESS_HOME/state/conversations"'
+in_topic 5012 "/session"
+check "/session in the topic lists its tool call" 'wait_for "$OUT" "recall flats: allow (default for this tool), ok" && grep -F "recall flats: allow" "$OUT" | grep -qF "\"message_thread_id\":5012"'
+# a task whose to = names the topic posts there, with its name in front
+printf '[watch]\nevery = 5m\nto = house-search\ndo = Look for new flats.\n' >>"$HARNESS_HOME/tasks.ini"
+reply "$(text_reply 'Two new flats.')"
+say "/reload"
+check "a task with to = posts to its topic" 'wait_for "$OUT" "\"message_thread_id\":5012,\"text\":\"[watch] Two new flats.\"" 30'
 
 kill "$RPID" 2>/dev/null
 wait "$RPID" 2>/dev/null

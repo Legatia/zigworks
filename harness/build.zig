@@ -47,7 +47,9 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addOptions("build_options", test_options);
     linkSystem(test_mod, target);
-    const unit = b.addTest(.{ .root_module = test_mod });
+    // -Dtest-filter=NAME (more than once for more): only the unit tests whose name has it
+    const filters = b.option([]const []const u8, "test-filter", "Run only the unit tests whose names contain this") orelse &.{};
+    const unit = b.addTest(.{ .root_module = test_mod, .filters = filters });
     const run_unit = b.addRunArtifact(unit);
 
     // The CLI end to end against a local stand-in upstream; no real keys.

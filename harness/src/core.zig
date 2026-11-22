@@ -1,6 +1,7 @@
-//! The running instance: one data folder, one owner, one chat, the
-//! scheduler, and the commands the owner sends. Transport-free: Telegram
-//! and the terminal plug in as a `Channel`.
+//! The running instance: one data folder, one owner, the conversations
+//! (the private chat, its topics, groups, the terminal), the scheduler,
+//! and the commands the owner sends. Transport-free: Telegram and the
+//! terminal plug in as a `Channel`.
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
@@ -21,6 +22,9 @@ const logins = @import("logins.zig");
 const store_mod = @import("store.zig");
 const masks = @import("masks.zig");
 const who_mod = @import("who.zig");
+const conversations = @import("conversations.zig");
+const jv = @import("jv.zig");
+const session = @import("session.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -50,6 +54,7 @@ pub const Paths = struct {
     logins: []const u8,
     profiles: []const u8,
     written: []const u8,
+    conversations: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -85,6 +90,7 @@ pub const Paths = struct {
             .logins = try j(a, &.{ home, "logins.ini" }),
             .profiles = try j(a, &.{ home, "profiles" }),
             .written = try j(a, &.{ state, "written" }),
+            .conversations = try j(a, &.{ state, "conversations" }),
         };
     }
 };
@@ -113,18 +119,109 @@ pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
     }
 }
 
+/// Where a post goes: a conversation's Telegram chat and topic (thread 0:
+/// the chat itself), or the terminal. `name` is the conversation's.
+pub const Place = struct {
+    name: []const u8 = "main",
+    chat: i64 = 0,
+    thread: i64 = 0,
+};
+
+/// The messages a text went out in: the first one's id and how many.
+pub const Sent = struct { first: i64 = 0, count: u32 = 0 };
+
 pub const Channel = struct {
     ctx: *anyopaque,
-    /// Sends `text` to the owner; an error when it did not get there
-    /// (error.NotPaired: there is no owner to send it to yet).
-    send: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,
+    /// Sends `text` to `place`, in as many messages as it takes; an error
+    /// when it did not get there (error.NotPaired: there is no owner to
+    /// send it to yet; error.TopicRefused: Telegram refused the topic).
+    send: *const fn (ctx: *anyopaque, place: Place, text: []const u8) anyerror!Sent,
     /// Returns an id for `clear`, or null when buttons can't be shown.
-    buttons: *const fn (ctx: *anyopaque, text: []const u8, buttons: []const [2][]const u8) ?i64,
-    clear: *const fn (ctx: *anyopaque, id: i64) void,
+    buttons: *const fn (ctx: *anyopaque, place: Place, text: []const u8, buttons: []const [2][]const u8) ?i64,
+    clear: *const fn (ctx: *anyopaque, place: Place, id: i64) void,
     /// Sends to someone other than the owner (an account trying to pair);
     /// null where there is no one else (the terminal).
     send_to: ?*const fn (ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void = null,
+    /// Sends a file as a document; returns its message id. Null where files
+    /// can't be sent.
+    document: ?*const fn (ctx: *anyopaque, place: Place, name: []const u8, data: []const u8) anyerror!i64 = null,
+    /// Opens a topic called `name` in the private chat `chat`; returns its
+    /// thread. Null where there are no topics (the terminal).
+    open_topic: ?*const fn (ctx: *anyopaque, chat: i64, name: []const u8) anyerror!i64 = null,
 };
+
+/// A Telegram message, with where it came from.
+pub const Incoming = struct {
+    from: i64,
+    chat: i64,
+    /// "private", "group" or "supergroup".
+    chat_type: []const u8 = "private",
+    /// The topic it came from; 0: the chat itself.
+    thread: i64 = 0,
+    /// The topic's name, when the message says it.
+    topic: ?[]const u8 = null,
+    text: []const u8,
+};
+
+/// One conversation's context: its turns and where its memory writer is.
+const Context = struct {
+    name: []u8,
+    conv: agent.Conversation,
+    /// The memory writer has read the turns before this one (counted from
+    /// the start, dropped turns included).
+    memory_upto: usize = 0,
+    turns_since_memory: u32 = 0,
+    /// When the owner last wrote in it (its quiet time counts from then).
+    last_owner_s: i64 = 0,
+    /// When it was last used, by the core's count.
+    used: u64 = 0,
+    /// /new: a fresh context before its next turn.
+    reset: std.atomic.Value(bool) = .init(false),
+};
+
+/// Contexts kept at once; a new one past these drops the least used.
+const max_contexts = 16;
+
+/// A message waiting for the chat worker, with the conversation it came
+/// from.
+const Queued = struct {
+    conv: []u8,
+    text: []u8,
+    /// A quick reply: the post it answers, said in its turn's context.
+    note: ?[]u8 = null,
+
+    fn deinit(q: Queued, gpa: std.mem.Allocator) void {
+        gpa.free(q.conv);
+        gpa.free(q.text);
+        if (q.note) |n| gpa.free(n);
+    }
+};
+
+/// A post with quick replies: a press of one of its buttons, in the
+/// message they are in, is the owner's message in its conversation, once.
+/// Kept in memory only: its token is the start's nonce.
+const Quick = struct {
+    n: u32,
+    conv: []u8,
+    labels: [][]u8,
+    /// The post's start, said in the turn a press starts.
+    excerpt: []u8,
+    /// Where its buttons are (null: not yet sent).
+    msg: ?i64 = null,
+    chat: i64 = 0,
+    thread: i64 = 0,
+    used: bool = false,
+
+    fn deinit(q: Quick, gpa: std.mem.Allocator) void {
+        gpa.free(q.conv);
+        for (q.labels) |l| gpa.free(l);
+        gpa.free(q.labels);
+        gpa.free(q.excerpt);
+    }
+};
+
+/// Posts with quick replies kept at once; the oldest goes first.
+const max_quick = 32;
 
 pub const Secrets = struct {
     omnigate: ?[]const u8 = null,
@@ -261,27 +358,42 @@ pub const Core = struct {
 
     chan: ?Channel = null,
     owner: ?i64 = null,
+    /// The conversations (state/conversations).
+    convs: conversations.List,
+    /// The bot's username: a command may end in `@` and it (`setBot`).
+    bot_name_buf: [64]u8 = undefined,
+    bot_name_len: usize = 0,
+    /// Whether Telegram topics in private chats are on for the bot.
+    topics_on: bool = true,
+    /// One topic opened for a post at a time (two runs posting to the same
+    /// new name open it once).
+    topic_mutex: Io.Mutex = .init,
+    /// Names whose topic could not be opened, the owner told once each.
+    told_topics: std.ArrayList([]u8) = .empty,
+    /// The posts with quick replies, and the last post's number.
+    quick_mutex: Io.Mutex = .init,
+    quick: std.ArrayList(Quick) = .empty,
+    quick_seq: u32 = 0,
     /// /dryrun, /private, /memory auto: runs read them when they use them.
     switches: agent.Switches = .{},
 
     // the chat
     chat_client: model.Client,
-    conv: agent.Conversation,
+    /// A context per conversation the owner talks in (at most
+    /// `max_contexts`); only the chat worker adds and drops them.
+    contexts: std.ArrayList(*Context) = .empty,
+    /// Held while `contexts` is read or changed.
+    ctx_mutex: Io.Mutex = .init,
+    /// Counts the contexts' uses (the least used goes first).
+    ctx_clock: u64 = 0,
     queue_mutex: Io.Mutex = .init,
-    queue: std.ArrayList([]u8) = .empty,
+    queue: std.ArrayList(Queued) = .empty,
     busy: std.atomic.Value(bool) = .init(false),
     approval: Approval = .{},
     /// Random for each start, in every question's button data: a button
     /// from before a restart never matches, whatever its number.
     approval_nonce: [16]u8 = undefined,
-    last_owner_s: i64 = 0,
-    turns_since_memory: u32 = 0,
-    /// The memory writer has read the conversation's turns before this one
-    /// (counted from the start, dropped turns included).
-    memory_upto: usize = 0,
     worker: ?std.Thread = null,
-    /// /new: the chat worker starts a fresh conversation before its next turn.
-    reset_conv: std.atomic.Value(bool) = .init(false),
     quitting: std.atomic.Value(bool) = .init(false),
 
     // background runs
@@ -404,8 +516,21 @@ pub const Core = struct {
         c.switches = .{};
         c.switches.auto_recall.store(c.cfg.memory.auto, .release);
         c.loadSwitches();
+        c.convs = .init(gpa, io, c.paths.conversations);
+        errdefer c.convs.deinit();
+        try c.convs.load();
+        c.upgradeConversations();
+        c.bot_name_len = 0;
+        c.topics_on = true;
+        c.topic_mutex = .init;
+        c.told_topics = .empty;
+        c.quick_mutex = .init;
+        c.quick = .empty;
+        c.quick_seq = 0;
         c.chat_client = try model.Client.init(gpa, io, c.cfg.model.url, secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens);
-        c.conv = .init(gpa);
+        c.contexts = .empty;
+        c.ctx_mutex = .init;
+        c.ctx_clock = 0;
         c.queue_mutex = .init;
         c.queue = .empty;
         c.busy = .init(false);
@@ -413,11 +538,7 @@ pub const Core = struct {
         var nonce_raw: [8]u8 = undefined;
         io.random(&nonce_raw);
         c.approval_nonce = std.fmt.bytesToHex(nonce_raw, .lower);
-        c.last_owner_s = 0;
-        c.turns_since_memory = 0;
-        c.memory_upto = 0;
         c.worker = null;
-        c.reset_conv = .init(false);
         c.quitting = .init(false);
         c.bg_active = .init(0);
         c.state_mutex = .init;
@@ -463,10 +584,16 @@ pub const Core = struct {
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
-        for (c.queue.items) |q| c.gpa.free(q);
+        for (c.queue.items) |q| q.deinit(c.gpa);
         c.queue.deinit(c.gpa);
         c.run_flags.deinit(c.gpa);
-        c.conv.deinit();
+        c.convs.deinit();
+        for (c.told_topics.items) |n| c.gpa.free(n);
+        c.told_topics.deinit(c.gpa);
+        for (c.quick.items) |q| q.deinit(c.gpa);
+        c.quick.deinit(c.gpa);
+        for (c.contexts.items) |x| c.freeContext(x);
+        c.contexts.deinit(c.gpa);
         c.chat_client.deinit();
         c.seen.deinit();
         c.written.deinit();
@@ -669,6 +796,24 @@ pub const Core = struct {
         Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.switches, .data = s }) catch {};
     }
 
+    /// A folder from before conversations gets `terminal`, and `main` once
+    /// an owner is paired; 0.3's `private on` becomes main's.
+    fn upgradeConversations(c: *Core) void {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        const had_main = c.convs.find("main") != null;
+        _ = c.convs.ensure(c.owner, c.switches.private.load(.acquire), util.nowSeconds(c.io)) catch {};
+        c.mainTookPrivate(had_main);
+    }
+
+    /// `main` was just made: the instance-wide private switch of 0.3 is
+    /// its own from now on. Under convs.mutex.
+    fn mainTookPrivate(c: *Core, had_main: bool) void {
+        if (had_main or c.convs.find("main") == null or !c.switches.private.load(.acquire)) return;
+        c.switches.private.store(false, .release);
+        c.saveSwitches();
+    }
+
     fn loadRan(c: *Core) void {
         const text = Io.Dir.cwd().readFileAlloc(c.io, c.paths.ran, c.gpa, .limited(1 << 20)) catch return;
         defer c.gpa.free(text);
@@ -718,18 +863,121 @@ pub const Core = struct {
 
     // ---- talking to the owner ----
 
+    /// Says `text` in `main`: the instance's own lines.
     pub fn say(c: *Core, text: []const u8) void {
-        c.deliver(text) catch {};
+        c.sayIn("main", text);
     }
 
-    /// Sends `text` to the owner; an error (logged) when it did not get
-    /// there. error.NoChannel: nothing to send it through.
+    /// Says harness's own line (a command's reply, Queued, an error) in
+    /// conversation `conv`.
+    pub fn sayIn(c: *Core, conv: []const u8, text: []const u8) void {
+        c.deliverIn(conv, text) catch {};
+    }
+
+    /// Sends `text` to `main`; an error (logged) when it did not get there.
+    /// error.NoChannel: nothing to send it through.
     pub fn deliver(c: *Core, text: []const u8) !void {
-        const ch = c.chan orelse return error.NoChannel;
-        ch.send(ch.ctx, text) catch |e| {
-            c.log.write(.chat, false, .{ .event = "not delivered", .why = whyUndelivered(e), .bytes = text.len }) catch {};
-            return e;
+        return c.deliverIn("main", text);
+    }
+
+    pub fn deliverIn(c: *Core, conv: []const u8, text: []const u8) !void {
+        _ = try c.sendText(conv, text);
+    }
+
+    /// Where the posts for `conv` go, and the name put in front when that
+    /// is not its own place: main for a topic Telegram refused, or a name
+    /// harness does not know (where there are topics).
+    const Resolved = struct { place: Place, prefix: ?[]const u8 = null };
+
+    fn placeOf(c: *Core, a: std.mem.Allocator, conv: []const u8) !Resolved {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        if (c.convs.find(conv)) |e| {
+            if (!e.refused) return .{ .place = .{ .name = try a.dupe(u8, e.name), .chat = e.chat, .thread = e.thread } };
+        } else if (std.mem.eql(u8, conv, "main") or std.mem.eql(u8, conv, "terminal")) {
+            // main before an owner is paired (Telegram says NotPaired)
+            return .{ .place = .{ .name = try a.dupe(u8, conv) } };
+        } else if (c.chan) |ch| if (ch.open_topic == null) {
+            // no topics here (the terminal): the name says where it was for
+            return .{ .place = .{ .name = try a.dupe(u8, conv) } };
         };
+        const m = c.convs.find("main") orelse return .{ .place = .{}, .prefix = try a.dupe(u8, conv) };
+        return .{ .place = .{ .chat = m.chat, .thread = m.thread }, .prefix = try a.dupe(u8, conv) };
+    }
+
+    /// Sends `text` to conversation `conv`; returns the messages it went
+    /// out in. A topic Telegram refuses is noted (its posts go to main
+    /// from then on, with its name in front) and the text goes there.
+    fn sendText(c: *Core, conv: []const u8, text: []const u8) !Sent {
+        const ch = c.chan orelse return error.NoChannel;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var r = try c.placeOf(a, conv);
+        var again = false;
+        while (true) {
+            const msg = if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text }) else text;
+            if (ch.send(ch.ctx, r.place, msg)) |sent| return sent else |e| {
+                if (e == error.TopicRefused and !again) {
+                    again = true;
+                    c.topicRefused(conv);
+                    r = try c.placeOf(a, conv);
+                    continue;
+                }
+                c.log.write(.chat, false, .{ .event = "not delivered", .why = whyUndelivered(e), .bytes = text.len }) catch {};
+                return e;
+            }
+        }
+    }
+
+    /// Telegram refused `conv`'s topic: its posts go to main with its name
+    /// in front from now on, and the owner is told why, once.
+    fn topicRefused(c: *Core, conv: []const u8) void {
+        const tell = blk: {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            const e = c.convs.find(conv) orelse break :blk false;
+            e.refused = true;
+            defer e.told = true;
+            break :blk !e.told;
+        };
+        c.log.write(.chat, false, .{ .event = "topic refused", .name = conv }) catch {};
+        if (!tell) return;
+        var buf: [256]u8 = undefined;
+        c.say(std.fmt.bufPrint(&buf, "Telegram refused the topic of {s}, so its posts come here with [{s}] in front.", .{ conv, conv }) catch "Telegram refused a topic; its posts come here.");
+    }
+
+    /// Notes that a message came from `conv` or a post went to it.
+    fn touch(c: *Core, conv: []const u8) void {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        if (c.convs.find(conv)) |e| e.used_s = util.nowSeconds(c.io);
+    }
+
+    /// The name of the conversation at `chat` and `thread`, else main.
+    fn convAt(c: *Core, buf: *[conversations.max_name]u8, chat: i64, thread: i64) []const u8 {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        const e = c.convs.at(chat, thread) orelse return "main";
+        @memcpy(buf[0..e.name.len], e.name);
+        return buf[0..e.name.len];
+    }
+
+    /// The bot's username (a command may end in `@` and it) and whether
+    /// Telegram topics in private chats are on for it: `getMe` at start.
+    pub fn setBot(c: *Core, username: []const u8, topics_on: bool) void {
+        const n = @min(username.len, c.bot_name_buf.len);
+        @memcpy(c.bot_name_buf[0..n], username[0..n]);
+        c.bot_name_len = n;
+        c.topics_on = topics_on;
+    }
+
+    /// A command's word without the `@BOTNAME` Telegram may add.
+    fn commandWord(c: *const Core, word: []const u8) []const u8 {
+        const at = std.mem.indexOfScalar(u8, word, '@') orelse return word;
+        const bot = c.bot_name_buf[0..c.bot_name_len];
+        if (bot.len == 0 or std.ascii.eqlIgnoreCase(word[at + 1 ..], bot)) return word[0..at];
+        return word;
     }
 
     pub fn attach(c: *Core, ch: Channel) void {
@@ -741,29 +989,69 @@ pub const Core = struct {
     }
 
     pub fn setOwner(c: *Core, id: i64) !void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        _ = try c.pairOwner(arena.allocator(), id);
+    }
+
+    /// Makes `id` the owner: its private chat is `main` from now on, and
+    /// the topics of an account paired before are forgotten (their names
+    /// are returned, in `a`).
+    fn pairOwner(c: *Core, a: std.mem.Allocator, id: i64) ![]const []const u8 {
+        const before = c.owner;
         c.owner = id;
         var buf: [32]u8 = undefined;
         try Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.owner, .data = try std.fmt.bufPrint(&buf, "{d}\n", .{id}) });
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        const now_s = util.nowSeconds(c.io);
+        if (c.convs.find("main")) |m| {
+            if (before) |old| if (old != id) return c.convs.pair(a, old, id, now_s);
+            if (m.chat != id) {
+                m.chat = id;
+                try c.convs.save();
+            }
+            return &.{};
+        }
+        _ = try c.convs.ensure(id, c.switches.private.load(.acquire), now_s);
+        c.mainTookPrivate(false);
+        return &.{};
+    }
+
+    /// A Telegram message in the owner's private chat (`main`).
+    pub fn handleMessage(c: *Core, from_id: i64, text: []const u8) !void {
+        return c.handleIncoming(.{ .from = from_id, .chat = from_id, .text = text });
     }
 
     /// A Telegram message. Strangers are dropped, though an attempt to
     /// pair is answered; `/pair CODE` with a code from `harness pair` pairs
     /// the account it comes from, also when another one was paired before.
-    pub fn handleMessage(c: *Core, from_id: i64, text: []const u8) !void {
+    /// The owner's private chat is `main`, a topic of it that topic's
+    /// conversation (made at its first message); in a group only the
+    /// owner's `/conversation add NAME` is read.
+    pub fn handleIncoming(c: *Core, m: Incoming) !void {
+        const from_id = m.from;
+        const text = m.text;
         const is_owner = if (c.owner) |o| o == from_id else false;
-        if (!is_owner and std.mem.startsWith(u8, text, "/pair ")) {
+        const private_chat = std.mem.eql(u8, m.chat_type, "private");
+        if (!is_owner and private_chat and std.mem.startsWith(u8, text, "/pair ")) {
             if (checkPairCode(c.io, c.paths.pair, std.mem.trim(u8, text[6..], " "), c.now())) {
+                var arena: std.heap.ArenaAllocator = .init(c.gpa);
+                defer arena.deinit();
+                const a = arena.allocator();
                 const before = c.owner;
-                try c.setOwner(from_id);
+                const dropped = try c.pairOwner(a, from_id);
                 Io.Dir.cwd().deleteFile(c.io, c.paths.pair) catch {};
                 if (before) |old| {
                     // another account: the old one is told, the new one
                     // starts a fresh conversation
                     c.sayTo(old, "This bot is now paired with another account, with a code from harness pair.");
-                    c.reset_conv.store(true, .release);
+                    c.resetContext("main");
+                    for (dropped) |name| c.resetContext(name);
                 }
-                try c.log.write(.chat, false, .{ .event = "paired", .from = from_id, .before = before });
-                c.say("Paired. I answer only you from now on. Send /help for commands.");
+                try c.log.write(.chat, false, .{ .event = "paired", .from = from_id, .before = before, .topics_dropped = dropped.len });
+                const hello = "Paired. I answer only you from now on. Send /help for commands.";
+                if (dropped.len == 0) c.say(hello) else c.say(try std.fmt.allocPrint(a, "{s}\nThe topics of the account paired before are no longer conversations: {s}.", .{ hello, try std.mem.join(a, ", ", dropped) }));
                 return;
             }
             try c.log.write(.chat, false, .{ .event = "dropped", .from = from_id, .why = "pairing code wrong or expired" });
@@ -781,7 +1069,57 @@ pub const Core = struct {
             try c.log.write(.chat, false, .{ .event = "dropped", .from = from_id, .why = "not the owner" });
             return;
         }
-        try c.handleText(text);
+        if (!private_chat) return c.groupMessage(m);
+        if (m.thread == 0) return c.handleTextIn("main", text);
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const conv = c.topicConversation(arena.allocator(), m) catch |e| {
+            c.say(try std.fmt.allocPrint(arena.allocator(), "A message in a new topic was not taken: harness could not write state/conversations ({s}).", .{@errorName(e)}));
+            return;
+        };
+        return c.handleTextIn(conv, text);
+    }
+
+    /// The conversation of topic `m.thread` in the owner's chat: made, and
+    /// written down, at its first message, named after the topic.
+    fn topicConversation(c: *Core, a: std.mem.Allocator, m: Incoming) ![]const u8 {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        if (c.convs.at(m.chat, m.thread)) |e| return try a.dupe(u8, e.name);
+        const name = try c.convs.fromTopic(a, m.topic, m.thread);
+        _ = try c.convs.add(.{ .name = name, .chat = m.chat, .thread = m.thread, .created = util.nowSeconds(c.io) });
+        try c.log.write(.chat, false, .{ .event = "conversation added", .name = name, .thread = m.thread });
+        return name;
+    }
+
+    /// A message in a group: only the owner's `/conversation add NAME` is
+    /// read there (others read a group: the agent only posts there, each
+    /// post asked); anything else is dropped and logged.
+    fn groupMessage(c: *Core, m: Incoming) !void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var words = std.mem.tokenizeAny(u8, std.mem.trim(u8, m.text, " \t\r\n"), " \t");
+        const cmd = c.commandWord(words.next() orelse "");
+        const op = words.next() orelse "";
+        const name = std.mem.trim(u8, words.rest(), " \t");
+        if (!std.mem.eql(u8, cmd, "/conversation") or !std.mem.eql(u8, op, "add")) {
+            try c.log.write(.chat, false, .{ .event = "dropped", .from = m.from, .chat = m.chat, .why = "a group: only /conversation add is read there" });
+            return;
+        }
+        const reply = blk: {
+            if (!conversations.validName(name)) break :blk "Use /conversation add NAME, the name in a-z, 0-9, - and _ (up to 32).";
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            if (c.convs.at(m.chat, m.thread)) |e| break :blk try std.fmt.allocPrint(a, "This chat is the conversation {s} already.", .{e.name});
+            if (c.convs.find(name) != null) break :blk "Another conversation has that name; pick another.";
+            _ = c.convs.add(.{ .name = name, .chat = m.chat, .thread = m.thread, .audience = .shared, .created = util.nowSeconds(c.io) }) catch |e|
+                break :blk try std.fmt.allocPrint(a, "Not added: harness could not write state/conversations ({s}).", .{@errorName(e)});
+            try c.log.write(.config, false, .{ .event = "conversation added", .name = name, .chat = m.chat, .audience = "shared" });
+            break :blk try std.fmt.allocPrint(a, "Added: the agent may post here as {s}. Each post here is asked first; /conversation rm {s} in your chat with the bot ends it.", .{ name, name });
+        };
+        const ch = c.chan orelse return;
+        _ = ch.send(ch.ctx, .{ .name = name, .chat = m.chat, .thread = m.thread }, reply) catch {};
     }
 
     /// Sends to an account other than the owner, where the channel can.
@@ -791,26 +1129,45 @@ pub const Core = struct {
         f(ch.ctx, chat_id, text) catch {};
     }
 
-    /// The owner's text: a command now, or a message for the chat queue.
-    pub fn handleText(c: *Core, text_in: []const u8) !void {
+    /// The owner's text in `main`.
+    pub fn handleText(c: *Core, text: []const u8) !void {
+        return c.handleTextIn("main", text);
+    }
+
+    /// The owner's text in conversation `conv`: a command now (its reply
+    /// goes there), or a message for the chat queue.
+    pub fn handleTextIn(c: *Core, conv: []const u8, text_in: []const u8) !void {
         const text = std.mem.trim(u8, text_in, " \t\r\n");
         if (text.len == 0) return;
+        c.touch(conv);
         if (text[0] == '/') {
             var arena: std.heap.ArenaAllocator = .init(c.gpa);
             defer arena.deinit();
-            const reply = try c.command(arena.allocator(), text);
-            if (reply.len > 0) c.say(reply);
+            const reply = try c.commandIn(arena.allocator(), conv, text);
+            if (reply.len > 0) c.sayIn(conv, reply);
             return;
         }
-        c.last_owner_s = c.now();
-        const owned = try c.gpa.dupe(u8, text);
+        return c.queueMessage(conv, text, null);
+    }
+
+    /// Queues the owner's message `text` in `conv` for the chat worker
+    /// (`note`: the post a quick reply answers).
+    fn queueMessage(c: *Core, conv: []const u8, text: []const u8, note: ?[]const u8) !void {
+        const conv_owned = try c.gpa.dupe(u8, conv);
+        errdefer c.gpa.free(conv_owned);
+        const text_owned = try c.gpa.dupe(u8, text);
+        errdefer c.gpa.free(text_owned);
+        const item: Queued = .{ .conv = conv_owned, .text = text_owned, .note = if (note) |n| try c.gpa.dupe(u8, n) else null };
         const queued_behind = blk: {
             c.queue_mutex.lockUncancelable(c.io);
             defer c.queue_mutex.unlock(c.io);
-            try c.queue.append(c.gpa, owned);
+            c.queue.append(c.gpa, item) catch |e| {
+                if (item.note) |n| c.gpa.free(n);
+                return e;
+            };
             break :blk c.busy.load(.acquire) or c.queue.items.len > 1;
         };
-        if (queued_behind) c.say("Queued; /stop cancels the current turn.");
+        if (queued_behind) c.sayIn(conv, "Queued; /stop cancels the current turn.");
     }
 
     /// A button press (`data`, see Approval) in message `message_id`. It
@@ -820,8 +1177,17 @@ pub const Core = struct {
     /// date (from before a restart, or under another question), and the
     /// owner is told so.
     pub fn handleCallback(c: *Core, from_id: i64, message_id: i64, data: []const u8) void {
+        c.handleCallbackIn(from_id, from_id, 0, message_id, data);
+    }
+
+    /// `handleCallback` for a press in `chat`, topic `thread`.
+    pub fn handleCallbackIn(c: *Core, from_id: i64, chat: i64, thread: i64, message_id: i64, data: []const u8) void {
         if (c.owner == null or from_id != c.owner.?) {
             c.log.write(.chat, false, .{ .event = "dropped", .from = from_id, .why = "button from someone else" }) catch {};
+            return;
+        }
+        if (data.len > 0 and data[0] == 'r') {
+            if (!c.quickPress(message_id, data)) c.tellOutOfDate(chat, thread, message_id);
             return;
         }
         const current = blk: {
@@ -841,12 +1207,109 @@ pub const Core = struct {
             ap.answer = p.ans;
             break :blk true;
         };
-        if (!current) c.tellOutOfDate(message_id);
+        if (!current) c.tellOutOfDate(chat, thread, message_id);
     }
 
-    fn tellOutOfDate(c: *Core, message_id: i64) void {
+    /// A press of a quick reply (`r<post>-<token>:<n>`): once, from the
+    /// message its buttons are in, with this start's token; the label is
+    /// the owner's message in the post's conversation, and the buttons go.
+    /// False when it answers nothing.
+    fn quickPress(c: *Core, message_id: i64, data: []const u8) bool {
+        const colon = std.mem.lastIndexOfScalar(u8, data, ':') orelse return false;
+        const dash = std.mem.indexOfScalar(u8, data[0..colon], '-') orelse return false;
+        const n = std.fmt.parseInt(u32, data[1..dash], 10) catch return false;
+        const which = std.fmt.parseInt(usize, data[colon + 1 ..], 10) catch return false;
+        if (!std.mem.eql(u8, data[dash + 1 .. colon], &c.approval_nonce)) return false;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const got = blk: {
+            c.quick_mutex.lockUncancelable(c.io);
+            defer c.quick_mutex.unlock(c.io);
+            for (c.quick.items) |*q| if (q.n == n) {
+                if (q.used or q.msg == null or q.msg.? != message_id or which == 0 or which > q.labels.len) return false;
+                q.used = true;
+                break :blk .{
+                    .conv = a.dupe(u8, q.conv) catch return false,
+                    .label = a.dupe(u8, q.labels[which - 1]) catch return false,
+                    .excerpt = a.dupe(u8, q.excerpt) catch return false,
+                    .place = Place{ .name = "", .chat = q.chat, .thread = q.thread },
+                };
+            };
+            return false;
+        };
+        if (c.chan) |ch| ch.clear(ch.ctx, got.place, message_id);
+        c.log.write(.chat, c.convPrivate(got.conv), .{ .event = "quick reply", .post = n, .text = got.label }) catch {};
+        const note = std.fmt.allocPrint(a, "The owner pressed \"{s}\" under your post: \"{s}\"", .{ got.label, got.excerpt }) catch return true;
+        c.queueMessage(got.conv, got.label, note) catch {};
+        return true;
+    }
+
+    /// Notes a post with quick replies; returns its number. The oldest
+    /// goes past `max_quick`.
+    fn quickPost(c: *Core, conv: []const u8, labels: []const []const u8, text: []const u8) !u32 {
+        const owned = try c.gpa.alloc([]u8, labels.len);
+        var made: usize = 0;
+        errdefer {
+            for (owned[0..made]) |l| c.gpa.free(l);
+            c.gpa.free(owned);
+        }
+        for (labels) |l| {
+            owned[made] = try c.gpa.dupe(u8, l);
+            made += 1;
+        }
+        const conv_owned = try c.gpa.dupe(u8, conv);
+        errdefer c.gpa.free(conv_owned);
+        const excerpt = try c.gpa.dupe(u8, util.cut(text, 200));
+        errdefer c.gpa.free(excerpt);
+        c.quick_mutex.lockUncancelable(c.io);
+        defer c.quick_mutex.unlock(c.io);
+        if (c.quick.items.len >= max_quick) c.quick.orderedRemove(0).deinit(c.gpa);
+        c.quick_seq += 1;
+        try c.quick.append(c.gpa, .{ .n = c.quick_seq, .conv = conv_owned, .labels = owned, .excerpt = excerpt });
+        return c.quick_seq;
+    }
+
+    /// The post `n`'s buttons are in message `msg` at `place`.
+    fn quickShown(c: *Core, n: u32, msg: i64, place: Place) void {
+        c.quick_mutex.lockUncancelable(c.io);
+        defer c.quick_mutex.unlock(c.io);
+        for (c.quick.items) |*q| if (q.n == n) {
+            q.msg = msg;
+            q.chat = place.chat;
+            q.thread = place.thread;
+        };
+    }
+
+    /// Sends a post with quick replies to `conv`: the text in messages of
+    /// 4096 bytes, the buttons on the last; the post is noted so a press of
+    /// one counts.
+    fn sendWithButtons(c: *Core, a: std.mem.Allocator, conv: []const u8, text_in: []const u8, labels: []const []const u8) !Sent {
+        const ch = c.chan orelse return error.NoChannel;
+        const r = try c.placeOf(a, conv);
+        const text = if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text_in }) else text_in;
+        const n = try c.quickPost(conv, labels, text_in);
+        const bs = try a.alloc([2][]const u8, labels.len);
+        for (labels, bs, 1..) |l, *b, i| b.* = .{ l, try std.fmt.allocPrint(a, "r{d}-{s}:{d}", .{ n, &c.approval_nonce, i }) };
+        const parts = try questionParts(a, text);
+        var sent: Sent = .{};
+        for (parts[0 .. parts.len - 1]) |part| {
+            const s = try ch.send(ch.ctx, r.place, part);
+            if (sent.count == 0) sent.first = s.first;
+            sent.count += s.count;
+        }
+        const id = ch.buttons(ch.ctx, r.place, parts[parts.len - 1], bs) orelse return error.ButtonsNotSent;
+        c.quickShown(n, id, r.place);
+        if (sent.count == 0) sent.first = id;
+        sent.count += 1;
+        return sent;
+    }
+
+    /// Says where the press came from that it answers nothing.
+    fn tellOutOfDate(c: *Core, chat: i64, thread: i64, message_id: i64) void {
         c.log.write(.chat, false, .{ .event = "button out of date", .message = message_id }) catch {};
-        c.say("That button is out of date: it answers nothing.");
+        var buf: [conversations.max_name]u8 = undefined;
+        c.sayIn(c.convAt(&buf, chat, thread), "That button is out of date: it answers nothing.");
     }
 
     /// The terminal's way to answer: "o", "d" or "n" while asked; false if
@@ -875,7 +1338,8 @@ pub const Core = struct {
         return c.approval.waiting;
     }
 
-    const ChatAsk = struct { core: *Core, flag: *std.atomic.Value(bool) };
+    /// Who asks: the run's flag and its conversation (its questions go there).
+    const ChatAsk = struct { core: *Core, flag: *std.atomic.Value(bool), conv: []const u8 = "main" };
 
     fn askOwner(ctx: *anyopaque, q: agent.Question) agent.Answer {
         const ca: *ChatAsk = @ptrCast(@alignCast(ctx));
@@ -891,10 +1355,13 @@ pub const Core = struct {
         const parts = questionParts(a, what) catch return .deny;
         const heads = a.alloc([]const u8, parts.len - 1) catch return .deny;
         for (heads, parts[0 .. parts.len - 1], 1..) |*h, p, i| h.* = std.fmt.allocPrint(a, "Allow this? ({d}/{d})\n{s}", .{ i, parts.len, p }) catch return .deny;
-        const text = (if (parts.len == 1)
+        const last = (if (parts.len == 1)
             std.fmt.allocPrint(a, "Allow this?\n{s}", .{what})
         else
             std.fmt.allocPrint(a, "Allow this? ({d}/{d})\n{s}", .{ parts.len, parts.len, parts[parts.len - 1] })) catch return .deny;
+        // in the run's conversation (main, with its name, for a topic Telegram refused)
+        const where = c.placeOf(a, ca.conv) catch return .deny;
+        const text = if (where.prefix) |p| std.fmt.allocPrint(a, "[{s}] {s}", .{ p, last }) catch return .deny else last;
         // once, day, deny
         var data_buf: [3][48]u8 = undefined;
         var data: [3][]const u8 = undefined;
@@ -921,15 +1388,15 @@ pub const Core = struct {
         }
         // a part that did not get through: the owner would answer what they
         // did not see, so no buttons go out and nothing is allowed
-        for (heads) |h| c.deliver(h) catch {
+        for (heads) |h| c.deliverIn(ca.conv, h) catch {
             c.endQuestion();
-            c.say(not_sent_note);
+            c.sayIn(ca.conv, not_sent_note);
             return .unsent;
         };
         const msg = if (allow_day)
-            ch.buttons(ch.ctx, text, &.{ .{ "Allow once", data[0] }, .{ "Allow 24 h", data[1] }, .{ "Deny", data[2] } })
+            ch.buttons(ch.ctx, where.place, text, &.{ .{ "Allow once", data[0] }, .{ "Allow 24 h", data[1] }, .{ "Deny", data[2] } })
         else
-            ch.buttons(ch.ctx, text, &.{ .{ "Allow once", data[0] }, .{ "Deny", data[2] } });
+            ch.buttons(ch.ctx, where.place, text, &.{ .{ "Allow once", data[0] }, .{ "Deny", data[2] } });
         // a press that came before the channel said where the buttons are
         // counts only if it was in that message
         const early_elsewhere: ?i64 = blk: {
@@ -945,13 +1412,13 @@ pub const Core = struct {
             }
             break :blk e.msg;
         };
-        if (early_elsewhere) |m| c.tellOutOfDate(m);
+        if (early_elsewhere) |m| c.tellOutOfDate(where.place.chat, where.place.thread, m);
         // no message id: no press can be told to be this question's, so
         // none would count; refused now rather than after approval_seconds
         if (msg == null) {
             c.endQuestion();
             c.log.write(.chat, false, .{ .event = "not delivered", .why = "the question's buttons could not be sent", .bytes = text.len }) catch {};
-            c.say(not_sent_note);
+            c.sayIn(ca.conv, not_sent_note);
             return .unsent;
         }
         const deadline = c.now() + c.cfg.limits.approval_seconds;
@@ -975,8 +1442,8 @@ pub const Core = struct {
             c.io.sleep(.fromMilliseconds(50), .awake) catch {};
         }
         c.endQuestion();
-        if (msg) |m| ch.clear(ch.ctx, m);
-        if (ans == .timeout) c.say("No answer in time; not allowed.");
+        if (msg) |m| ch.clear(ch.ctx, where.place, m);
+        if (ans == .timeout) c.sayIn(ca.conv, "No answer in time; not allowed.");
         return ans;
     }
 
@@ -1041,7 +1508,7 @@ pub const Core = struct {
         c.worker = try std.Thread.spawn(.{}, workerLoop, .{c});
     }
 
-    fn popQueue(c: *Core) ?[]u8 {
+    fn popQueue(c: *Core) ?Queued {
         c.queue_mutex.lockUncancelable(c.io);
         defer c.queue_mutex.unlock(c.io);
         // while the MCP servers restart, messages wait
@@ -1061,17 +1528,18 @@ pub const Core = struct {
 
     fn workerLoop(c: *Core) void {
         while (!c.quitting.load(.acquire)) {
-            if (c.popQueue()) |text| {
-                defer c.gpa.free(text);
-                c.chatTurn(text);
+            if (c.popQueue()) |item| {
+                defer item.deinit(c.gpa);
+                c.chatTurnNoted(item.conv, item.text, item.note);
                 c.busy.store(false, .release);
                 continue;
             }
-            if (c.turns_since_memory > 0 and !c.switches.private.load(.acquire) and c.last_owner_s > 0 and c.now() - c.last_owner_s >= c.memory_quiet_s and c.claimIdle()) {
-                c.writeMemories() catch |e| c.log.write(.memory, false, .{ .event = "writer failed", .why = @errorName(e) }) catch {};
-                c.turns_since_memory = 0;
+            // a conversation quiet for memory_quiet_s: its writer reads what is new
+            if (c.quietContext()) |x| if (c.claimIdle()) {
+                c.writeMemoriesOf(x) catch |e| c.log.write(.memory, false, .{ .event = "writer failed", .why = @errorName(e) }) catch {};
+                x.turns_since_memory = 0;
                 c.busy.store(false, .release);
-            }
+            };
             c.io.sleep(.fromMilliseconds(50), .awake) catch {};
         }
     }
@@ -1368,34 +1836,413 @@ pub const Core = struct {
         for (c.mcp_servers.items) |srv| srv.kill();
     }
 
+    /// A chat turn in `main`.
     fn chatTurn(c: *Core, text: []const u8) void {
-        if (c.reset_conv.swap(false, .acq_rel)) {
-            c.conv.deinit();
-            c.conv = .init(c.gpa);
-            c.memory_upto = 0;
+        c.chatTurnIn("main", text);
+    }
+
+    /// The owner's message `text` in conversation `conv`: one turn, its
+    /// questions and its answer there.
+    fn chatTurnIn(c: *Core, conv: []const u8, text: []const u8) void {
+        c.chatTurnNoted(conv, text, null);
+    }
+
+    /// `chatTurnIn`; `note` (the post a quick reply answers) goes in the
+    /// turn's context block.
+    fn chatTurnNoted(c: *Core, conv: []const u8, text: []const u8, note: ?[]const u8) void {
+        const x = c.contextFor(conv) catch |e| {
+            var buf: [128]u8 = undefined;
+            c.sayIn(conv, std.fmt.bufPrint(&buf, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
+            return;
+        };
+        if (x.reset.swap(false, .acq_rel)) {
+            x.conv.deinit();
+            x.conv = .init(c.gpa);
+            x.memory_upto = 0;
+            x.turns_since_memory = 0;
         }
+        x.last_owner_s = c.now();
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
         var flag: std.atomic.Value(bool) = .init(false);
         c.register(&flag);
         defer c.unregister(&flag);
-        var ask: ChatAsk = .{ .core = c, .flag = &flag };
-        var run = c.runAs(&c.chat_client, "chat", .{}, &flag);
+        var ask: ChatAsk = .{ .core = c, .flag = &flag, .conv = conv };
+        var run = c.runIn(&c.chat_client, "chat", .{}, conv, &flag);
+        run.context_note = c.contextNote(arena.allocator(), conv) catch "";
+        if (note) |n| run.context_note = std.fmt.allocPrint(arena.allocator(), "{s}\n{s}", .{ run.context_note, n }) catch run.context_note;
         run.asker = .{ .ctx = &ask, .ask = askOwner };
-        run.notice = .{ .ctx = c, .say = noticeSay };
-        const res = agent.turn(&run, &c.conv, text, true) catch |e| {
+        var notify: Notify = .{ .core = c, .conv = conv };
+        run.notice = .{ .ctx = &notify, .say = Notify.say };
+        var out: RunOut = .{ .core = c };
+        run.outbox = out.outbox();
+        const res = agent.turn(&run, &x.conv, text, true) catch |e| {
             var buf: [128]u8 = undefined;
-            c.say(std.fmt.bufPrint(&buf, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
+            c.sayIn(conv, std.fmt.bufPrint(&buf, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
             return;
         };
         defer agent.freeResult(&run, res);
         // /private switched on while the turn ran: it stays out of memory
         // and summaries too
         const private = run.isPrivate();
-        if (private) if (c.conv.turns.getLastOrNull()) |tn| {
+        if (private) if (x.conv.turns.getLastOrNull()) |tn| {
             tn.private = true;
         };
-        if (!res.stopped) c.say(res.text);
-        if (!private) c.turns_since_memory += 1;
+        // the reply went out with a final send; a limit or an error is
+        // said in harness's words, never with working text; else the
+        // model's last text is the reply, through the same path as a send
+        if (!res.stopped and !res.replied) {
+            if (res.ended_by) |why| c.sayIn(conv, why) else c.implicitReply(&run, arena.allocator(), conv, res.text);
+        }
+        if (!private) x.turns_since_memory += 1;
     }
+
+    /// The model stopped on its own without a final `send`: its last text is
+    /// posted as the reply (the gate decides it like a send); one the gate
+    /// stops is said.
+    fn implicitReply(c: *Core, run: *agent.Run, a: std.mem.Allocator, conv: []const u8, text: []const u8) void {
+        if (text.len == 0) return c.sayIn(conv, "The model gave an empty answer.");
+        const got = agent.postReply(run, a, text) catch |e| {
+            c.sayIn(conv, std.fmt.allocPrint(a, "The answer was not posted: {s}.", .{@errorName(e)}) catch "The answer was not posted.");
+            return;
+        };
+        if (got.refused) |why| c.sayIn(conv, std.fmt.allocPrint(a, "The answer was not posted: {s}.", .{why}) catch "The answer was not posted.");
+    }
+
+    /// A run's way to post (its `agent.Outbox`): the conversations, and the
+    /// name of what started it in front of its posts when that was not the
+    /// owner.
+    const RunOut = struct {
+        core: *Core,
+        /// "[btc-watch] " for a run the owner did not start; "" otherwise.
+        tag: []const u8 = "",
+        /// A task's or brief's: what its reply needs and how it went.
+        sched: ?*Sched = null,
+
+        fn outbox(o: *RunOut) agent.Outbox {
+            return .{ .ctx = o, .find = find, .names = names, .post = post };
+        }
+
+        fn find(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) ?agent.Target {
+            const o: *RunOut = @ptrCast(@alignCast(ctx));
+            const c = o.core;
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            const e = c.convs.find(name) orelse return null;
+            if (!c.reachable(e)) return null;
+            return .{ .name = a.dupe(u8, e.name) catch return null, .shared = e.audience == .shared, .private = e.isPrivate() };
+        }
+
+        fn names(ctx: *anyopaque, a: std.mem.Allocator) []const []const u8 {
+            const o: *RunOut = @ptrCast(@alignCast(ctx));
+            const c = o.core;
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            var out: std.ArrayList([]const u8) = .empty;
+            for (c.convs.items.items) |e| if (c.reachable(e)) out.append(a, a.dupe(u8, e.name) catch continue) catch {};
+            return out.items;
+        }
+
+        fn post(ctx: *anyopaque, a: std.mem.Allocator, p: *const agent.Post) agent.Delivery {
+            const o: *RunOut = @ptrCast(@alignCast(ctx));
+            return o.core.postOut(a, o, p);
+        }
+    };
+
+    /// A task's or brief's reply: what the run skipped is added to it,
+    /// NOTHING (with nothing skipped) posts nothing, and one that did not
+    /// get through is kept to be sent again as it was.
+    const Sched = struct {
+        skipped: ?*agent.Skipped = null,
+        keep: ?*?Undelivered = null,
+        /// A brief's links, seen once it is delivered.
+        links: []const []const u8 = &.{},
+        /// How the reply went, and why when it did not.
+        outcome: enum { none, sent, kept, failed, silent, held } = .none,
+        why: []const u8 = "",
+    };
+
+    /// A task's or brief's reply as it is posted: its tag in front, what it
+    /// skipped after it; null for NOTHING with nothing skipped.
+    fn shapeReply(c: *Core, a: std.mem.Allocator, o: *const RunOut, sc: *const Sched, text: []const u8) ?[]const u8 {
+        const note = if (sc.skipped) |s| s.text(c.io, a) catch "" else "";
+        const silent = std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n."), "NOTHING");
+        if (silent and note.len == 0) return null;
+        if (silent) return std.fmt.allocPrint(a, "{s}{s}", .{ o.tag, note }) catch null;
+        return std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ o.tag, text, if (note.len > 0) "\n\n" else "", note }) catch null;
+    }
+
+    /// A post to a name that is no conversation yet (a task's or brief's
+    /// `to`) opens that topic in the owner's chat first. One that can't be
+    /// opened goes to main with its name in front; the owner is told why,
+    /// once.
+    fn ensureTopic(c: *Core, a: std.mem.Allocator, name: []const u8) void {
+        if (conversations.isFixed(name)) return;
+        const ch = c.chan orelse return;
+        // the terminal: printed with the name
+        const open_fn = ch.open_topic orelse return;
+        c.topic_mutex.lockUncancelable(c.io);
+        defer c.topic_mutex.unlock(c.io);
+        {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            if (c.convs.find(name) != null) return;
+        }
+        const owner = c.owner orelse return;
+        const why: []const u8 = blk: {
+            if (!c.topics_on) break :blk "topics are off for the bot; switch on topics in private chats in @BotFather";
+            const thread = open_fn(ch.ctx, owner, name) catch |e| break :blk std.fmt.allocPrint(a, "Telegram said {s}", .{@errorName(e)}) catch "Telegram refused";
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            _ = c.convs.add(.{ .name = name, .chat = owner, .thread = thread, .created = util.nowSeconds(c.io) }) catch |e|
+                break :blk std.fmt.allocPrint(a, "state/conversations could not be written ({s})", .{@errorName(e)}) catch "it could not be kept";
+            c.log.write(.config, false, .{ .event = "conversation added", .name = name, .thread = thread, .why = "a post to it" }) catch {};
+            return;
+        };
+        for (c.told_topics.items) |n| if (std.mem.eql(u8, n, name)) return;
+        c.told_topics.append(c.gpa, c.gpa.dupe(u8, name) catch return) catch {};
+        c.log.write(.chat, false, .{ .event = "topic not opened", .name = name, .why = why }) catch {};
+        c.say(std.fmt.allocPrint(a, "The topic {s} could not be opened ({s}), so its posts come here with [{s}] in front.", .{ name, why, name }) catch "A topic could not be opened; its posts come here.");
+    }
+
+    /// Whether a run can post to `e` through the attached channel (the
+    /// terminal is not reached from Telegram). Under convs.mutex.
+    fn reachable(c: *const Core, e: *const conversations.Entry) bool {
+        const telegram = if (c.chan) |ch| ch.open_topic != null else false;
+        return !(telegram and e.channel == .terminal);
+    }
+
+    /// A run's post, past the gate: to its conversation's place, with the
+    /// run's tag in front, its files as documents, within the
+    /// conversation's hourly limit.
+    fn postOut(c: *Core, a: std.mem.Allocator, o: *RunOut, p: *const agent.Post) agent.Delivery {
+        // a task's or brief's reply: what it skipped added, NOTHING silent
+        const sc: ?*Sched = if (p.final) o.sched else null;
+        const d = c.postShaped(a, o, sc, p);
+        if (sc) |x| {
+            x.outcome = switch (d.status) {
+                .sent => .sent,
+                .kept => .kept,
+                .held => .held,
+                .silent => .silent,
+                .failed => .failed,
+            };
+            x.why = d.why;
+        }
+        return d;
+    }
+
+    fn postShaped(c: *Core, a: std.mem.Allocator, o: *RunOut, sc: ?*Sched, p: *const agent.Post) agent.Delivery {
+        const text = if (sc) |x|
+            c.shapeReply(a, o, x, p.text) orelse return .{ .status = .silent }
+        else if (o.tag.len > 0) std.fmt.allocPrint(a, "{s}{s}", .{ o.tag, p.text }) catch p.text else p.text;
+        c.ensureTopic(a, p.to);
+        if (c.overHourly(a, p.to)) |why| return .{ .status = .held, .why = why };
+        const sending = if (p.buttons.len > 0) c.sendWithButtons(a, p.to, text, p.buttons) else c.sendText(p.to, text);
+        const sent = sending catch |e| {
+            // kept to be sent again as it is: nothing runs again for it
+            if (sc) |x| if (worthRetry(e)) if (x.keep) |k| if (Undelivered.of(c.gpa, p.to, text, x.links)) |u| {
+                if (k.*) |old| old.deinit(c.gpa);
+                k.* = u;
+                return .{ .status = .kept, .why = whyUndelivered(e) };
+            } else |_| {};
+            return .{ .status = .failed, .why = whyUndelivered(e) };
+        };
+        c.touch(p.to);
+        var d: agent.Delivery = .{ .status = .sent, .message = sent.first, .parts = sent.count };
+        for (p.files) |f| {
+            c.sendFile(a, p.to, f) catch |e| {
+                d.status = .failed;
+                d.why = std.fmt.allocPrint(a, "{s} was not delivered ({s})", .{ f.name, whyUndelivered(e) }) catch "a file was not delivered";
+                return d;
+            };
+            d.files += 1;
+        }
+        return d;
+    }
+
+    /// Sends a file of a post to conversation `conv`'s place, as a document.
+    fn sendFile(c: *Core, a: std.mem.Allocator, conv: []const u8, f: agent.Attachment) !void {
+        const ch = c.chan orelse return error.NoChannel;
+        const doc = ch.document orelse return error.NoFiles;
+        const r = try c.placeOf(a, conv);
+        _ = try doc(ch.ctx, r.place, f.name, f.data);
+    }
+
+    /// Why a post to `conv` is not sent now: it would be over
+    /// `sends_per_hour` (counted per conversation, all runs and replies);
+    /// main hears of it once an hour. Null: it may go, and is counted.
+    fn overHourly(c: *Core, a: std.mem.Allocator, conv: []const u8) ?[]const u8 {
+        const now_s = util.nowSeconds(c.io);
+        const limit = c.cfg.limits.sends_per_hour;
+        const tell: ?u32 = blk: {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            // a name harness does not know counts against main, where it goes
+            const e = c.convs.find(conv) orelse c.convs.find("main") orelse return null;
+            var i: usize = 0;
+            while (i < e.posts.items.len) {
+                if (now_s - e.posts.items[i] >= 3600) _ = e.posts.orderedRemove(i) else i += 1;
+            }
+            if (e.posts.items.len < limit) {
+                e.posts.append(c.gpa, now_s) catch {};
+                return null;
+            }
+            e.held += 1;
+            if (e.told_held_s != 0 and now_s - e.told_held_s < 3600) break :blk null;
+            const n = e.held;
+            e.held = 0;
+            e.told_held_s = now_s;
+            break :blk n;
+        };
+        if (tell) |n| {
+            c.log.write(.chat, false, .{ .event = "posts held", .name = conv, .count = n }) catch {};
+            c.say(std.fmt.allocPrint(a, "Posts to {s} are over {d} an hour: {d} not sent. /session shows them.", .{ conv, limit, n }) catch "Posts are over the hourly limit; /session shows them.");
+        }
+        return std.fmt.allocPrint(a, "posts to {s} are over {d} an hour", .{ conv, limit }) catch "over the hourly limit";
+    }
+
+    /// The context of conversation `name`: the one kept, or a new one. A
+    /// new one past `max_contexts` drops the least used, after its memory
+    /// writer has read it; when that conversation comes back, its model is
+    /// told turns were dropped. The chat worker's.
+    fn contextFor(c: *Core, name: []const u8) !*Context {
+        c.ctx_clock += 1;
+        if (c.contextOf(name)) |x| {
+            x.used = c.ctx_clock;
+            return x;
+        }
+        if (c.contexts.items.len >= max_contexts) c.dropLeastUsed();
+        const x = try c.gpa.create(Context);
+        errdefer c.gpa.destroy(x);
+        x.* = .{ .name = try c.gpa.dupe(u8, name), .conv = .init(c.gpa), .used = c.ctx_clock };
+        errdefer c.gpa.free(x.name);
+        {
+            // the turns its context had before it made room for others
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            if (c.convs.find(name)) |e| {
+                x.conv.dropped = e.dropped_turns;
+                x.conv.lost = e.dropped_turns;
+                x.memory_upto = e.dropped_turns;
+            }
+        }
+        c.ctx_mutex.lockUncancelable(c.io);
+        defer c.ctx_mutex.unlock(c.io);
+        try c.contexts.append(c.gpa, x);
+        return x;
+    }
+
+    /// The context kept for conversation `name`, if any.
+    pub fn contextOf(c: *Core, name: []const u8) ?*Context {
+        c.ctx_mutex.lockUncancelable(c.io);
+        defer c.ctx_mutex.unlock(c.io);
+        for (c.contexts.items) |x| if (std.mem.eql(u8, x.name, name)) return x;
+        return null;
+    }
+
+    /// /new: conversation `name` starts fresh at its next turn.
+    fn resetContext(c: *Core, name: []const u8) void {
+        if (c.contextOf(name)) |x| x.reset.store(true, .release);
+    }
+
+    /// Drops the least used context, its new turns read by the memory
+    /// writer first (not a private conversation's).
+    fn dropLeastUsed(c: *Core) void {
+        var least: usize = 0;
+        for (c.contexts.items, 0..) |x, i| if (x.used < c.contexts.items[least].used) {
+            least = i;
+        };
+        const x = c.contexts.items[least];
+        if (x.turns_since_memory > 0 and !c.convPrivate(x.name))
+            c.writeMemoriesOf(x) catch |e| c.log.write(.memory, false, .{ .event = "writer failed", .why = @errorName(e) }) catch {};
+        const turns = x.conv.dropped + x.conv.turns.items.len;
+        {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            if (c.convs.find(x.name)) |e| e.dropped_turns = turns;
+        }
+        c.log.write(.chat, false, .{ .event = "context dropped", .name = x.name, .turns = turns }) catch {};
+        {
+            c.ctx_mutex.lockUncancelable(c.io);
+            defer c.ctx_mutex.unlock(c.io);
+            _ = c.contexts.orderedRemove(least);
+        }
+        c.freeContext(x);
+    }
+
+    fn freeContext(c: *Core, x: *Context) void {
+        x.conv.deinit();
+        c.gpa.free(x.name);
+        c.gpa.destroy(x);
+    }
+
+    /// A context whose conversation was quiet for `memory_quiet_s` with
+    /// turns its writer has not read (not a private one's).
+    fn quietContext(c: *Core) ?*Context {
+        const now_s = c.now();
+        c.ctx_mutex.lockUncancelable(c.io);
+        const found = for (c.contexts.items) |x| {
+            if (x.turns_since_memory > 0 and x.last_owner_s > 0 and now_s - x.last_owner_s >= c.memory_quiet_s) break x;
+        } else null;
+        c.ctx_mutex.unlock(c.io);
+        const x = found orelse return null;
+        return if (c.convPrivate(x.name)) null else x;
+    }
+
+    /// Whether conversation `name` is private now (before an owner is
+    /// paired, 0.3's instance-wide switch).
+    fn convPrivate(c: *Core, name: []const u8) bool {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        if (c.convs.find(name)) |e| return e.isPrivate();
+        return c.switches.private.load(.acquire);
+    }
+
+    /// A run of `who` reporting to conversation `conv`: its lines name it,
+    /// and it is private while that conversation is.
+    fn runIn(c: *Core, client: *model.Client, label: []const u8, who: who_mod.Who, conv: []const u8, flag: *std.atomic.Value(bool)) agent.Run {
+        var run = c.runAs(client, label, who, flag);
+        run.conversation = conv;
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        if (c.convs.find(conv)) |e| {
+            run.conv_private = &e.private;
+            run.private = run.private or e.isPrivate();
+        }
+        return run;
+    }
+
+    /// What the per-turn context block says of the conversations: this
+    /// one and where it is, and the others the agent can post to.
+    fn contextNote(c: *Core, a: std.mem.Allocator, conv: []const u8) ![]const u8 {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        var out: std.ArrayList(u8) = .empty;
+        if (c.convs.find(conv)) |e|
+            try out.print(a, "Conversation: {s} ({s}).", .{ conv, e.where() })
+        else
+            try out.print(a, "Conversation: {s} (a Telegram topic opened at the first post).", .{conv});
+        var others: usize = 0;
+        for (c.convs.items.items) |e| {
+            if (std.mem.eql(u8, e.name, conv) or !c.reachable(e)) continue;
+            try out.print(a, "{s}{s}", .{ if (others == 0) " Others: " else ", ", e.name });
+            others += 1;
+        }
+        if (others > 0) try out.append(a, '.');
+        return out.items;
+    }
+
+    /// Where a run's memory notices go: its conversation.
+    const Notify = struct {
+        core: *Core,
+        conv: []const u8,
+
+        fn say(ctx: *anyopaque, text: []const u8) void {
+            const n: *Notify = @ptrCast(@alignCast(ctx));
+            n.core.sayIn(n.conv, text);
+        }
+    };
 
     const memory_prompt =
         \\From the conversation below, list at most 5 lasting facts about the owner or their wishes that would help in later conversations: preferences, standing instructions, projects, people. One per line, each starting with "- ". Leave out passing details, anything already obvious, and anything already in memory. If there is nothing worth keeping, answer NONE.
@@ -1406,14 +2253,24 @@ pub const Core = struct {
     /// Most of the memory items it is shown, so it does not repeat them.
     const memory_known_max = 8_000;
 
-    /// The quiet-time writer: one model call over the turns since its last
-    /// run (not private ones), which picks up to 5 lasting facts.
+    /// The quiet-time writer for every context with turns it has not read.
     fn writeMemories(c: *Core) !void {
+        c.ctx_mutex.lockUncancelable(c.io);
+        const list = try c.gpa.dupe(*Context, c.contexts.items);
+        c.ctx_mutex.unlock(c.io);
+        defer c.gpa.free(list);
+        for (list) |x| try c.writeMemoriesOf(x);
+    }
+
+    /// The quiet-time writer: one model call over the turns of context `x`
+    /// since its last run (not private ones), which picks up to 5 lasting
+    /// facts; what it saves is said in that conversation.
+    fn writeMemoriesOf(c: *Core, x: *Context) !void {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const turns = c.conv.turns.items;
-        const first_new = c.memory_upto -| c.conv.dropped;
+        const turns = x.conv.turns.items;
+        const first_new = x.memory_upto -| x.conv.dropped;
         // newest first, so a long talk keeps its latest part
         var parts: std.ArrayList([]const u8) = .empty;
         var size: usize = 0;
@@ -1423,16 +2280,19 @@ pub const Core = struct {
             const tn = turns[i];
             if (tn.private) continue;
             var one: std.ArrayList(u8) = .empty;
-            for (tn.messages.items) |m| for (m.blocks) |b| if (b == .text and !std.mem.startsWith(u8, b.text, agent.context_mark)) {
-                try one.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(b.text, 2000) });
+            for (tn.messages.items) |m| for (m.blocks) |b| switch (b) {
+                .text => |said| if (!std.mem.startsWith(u8, said, agent.context_mark)) try one.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(said, 2000) }),
+                // what it posted is the agent's words
+                .tool_use => |u| if (agent.sentText(a, u.name, u.input_json)) |said| try one.print(a, "Agent: {s}\n", .{util.cut(said, 2000)}),
+                .tool_result => {},
             };
             if (size + one.items.len > memory_transcript_max) break;
             size += one.items.len;
             try parts.append(a, one.items);
         }
-        const upto = c.conv.dropped + turns.len;
+        const upto = x.conv.dropped + turns.len;
         if (parts.items.len == 0) {
-            c.memory_upto = upto;
+            x.memory_upto = upto;
             return;
         }
         var msg: std.ArrayList(u8) = .empty;
@@ -1463,7 +2323,7 @@ pub const Core = struct {
             try c.log.write(.model, false, .{ .run = "memory writer", .result = @errorName(e) });
             return;
         };
-        c.memory_upto = upto;
+        x.memory_upto = upto;
         try c.log.write(.model, false, .{ .run = "memory writer", .result = "ok", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
         const out = try reply.text(a);
         var it = std.mem.splitScalar(u8, out, '\n');
@@ -1472,7 +2332,7 @@ pub const Core = struct {
             const l = std.mem.trim(u8, line, " \t\r");
             if (!std.mem.startsWith(u8, l, "- ") or n >= 5) continue;
             // switched on while the writer's call ran
-            if (c.switches.private.load(.acquire)) break;
+            if (c.convPrivate(x.name)) break;
             n += 1;
             // the owner sees what goes into every later prompt: the note is
             // made under the lock and sent after it, as a send can wait on
@@ -1486,7 +2346,7 @@ pub const Core = struct {
                 const item = c.mem.find(res.id) orelse break :note null;
                 break :note try memory.savedNote(a, item.id, item.body);
             };
-            if (note) |text| c.say(text);
+            if (note) |text| c.sayIn(x.name, text);
         }
     }
 
@@ -1504,7 +2364,7 @@ pub const Core = struct {
         {
             c.queue_mutex.lockUncancelable(c.io);
             defer c.queue_mutex.unlock(c.io);
-            for (c.queue.items) |q| c.gpa.free(q);
+            for (c.queue.items) |q| q.deinit(c.gpa);
             dropped = c.queue.items.len;
             c.queue.clearRetainingCapacity();
         }
@@ -1744,7 +2604,7 @@ pub const Core = struct {
             break :blk c.retry.get(key) orelse return;
         };
         const kp = keyParts(key);
-        c.deliver(r.msg.text) catch |e| {
+        c.deliverIn(if (r.msg.conv.len > 0) r.msg.conv else "main", r.msg.text) catch |e| {
             c.log.write(kp.kind, false, .{ .name = kp.name, .event = "not delivered", .why = whyUndelivered(e), .tries = r.tries + 1 }) catch {};
             c.state_mutex.lockUncancelable(c.io);
             defer c.state_mutex.unlock(c.io);
@@ -1788,13 +2648,15 @@ pub const Core = struct {
         undelivered,
     };
 
-    /// A message that did not get through, kept to be sent again as it is.
+    /// A message that did not get through, kept to be sent again as it is,
+    /// to its conversation.
     pub const Undelivered = struct {
         text: []u8,
         /// A brief's links: seen once it is delivered.
         links: [][]u8 = &.{},
+        conv: []u8 = &.{},
 
-        fn of(gpa: std.mem.Allocator, text: []const u8, links: []const []const u8) !Undelivered {
+        fn of(gpa: std.mem.Allocator, conv: []const u8, text: []const u8, links: []const []const u8) !Undelivered {
             const out_links = try gpa.alloc([]u8, links.len);
             var n: usize = 0;
             errdefer {
@@ -1805,13 +2667,16 @@ pub const Core = struct {
                 out_links[n] = try gpa.dupe(u8, l);
                 n += 1;
             }
-            return .{ .text = try gpa.dupe(u8, text), .links = out_links };
+            const conv_owned = try gpa.dupe(u8, conv);
+            errdefer gpa.free(conv_owned);
+            return .{ .text = try gpa.dupe(u8, text), .links = out_links, .conv = conv_owned };
         }
 
         fn deinit(u: Undelivered, gpa: std.mem.Allocator) void {
             for (u.links) |l| gpa.free(l);
             gpa.free(u.links);
             gpa.free(u.text);
+            gpa.free(u.conv);
         }
     };
 
@@ -1833,7 +2698,7 @@ pub const Core = struct {
         var flag: std.atomic.Value(bool) = .init(false);
         c.register(&flag);
         defer c.unregister(&flag);
-        var run = c.runAs(&client, label, .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{b.name}) }, &flag);
+        var run = c.runIn(&client, label, .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{b.name}) }, b.to, &flag);
         // a copy, so the fetches hold no lock
         var snap = blk: {
             c.seen_mutex.lockUncancelable(c.io);
@@ -1845,14 +2710,31 @@ pub const Core = struct {
         if (flag.load(.acquire)) return .done;
         const w = try brief.compose(&run, a, b, collected);
         if (flag.load(.acquire)) return .done;
-        c.deliver(w.text) catch |e| {
-            try c.log.write(.brief, false, .{ .name = b.name, .event = "not delivered", .why = whyUndelivered(e) });
-            if (!worthRetry(e)) return .done;
-            if (keep) |k| k.* = try .of(c.gpa, w.text, w.links);
-            return .undelivered;
-        };
-        try c.markSeen(w.links);
-        return .done;
+        // posted to its `to` the way a reply is: through the gate, with its
+        // name in front; kept when it did not get through
+        var sched: Sched = .{ .keep = keep, .links = w.links };
+        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{b.name}), .sched = &sched };
+        run.outbox = out.outbox();
+        const got = try agent.postReply(&run, a, w.text);
+        if (got.refused) |why| {
+            try c.log.write(.brief, false, .{ .name = b.name, .event = "not posted", .why = why });
+            c.say(try std.fmt.allocPrint(a, "The brief {s} was not posted: {s}.", .{ b.name, why }));
+            return .done;
+        }
+        switch (sched.outcome) {
+            .sent => {
+                try c.markSeen(w.links);
+                return .done;
+            },
+            .kept => {
+                try c.log.write(.brief, false, .{ .name = b.name, .event = "not delivered", .why = sched.why });
+                return .undelivered;
+            },
+            else => {
+                try c.log.write(.brief, false, .{ .name = b.name, .event = "not delivered", .why = sched.why });
+                return .done;
+            },
+        }
     }
 
     /// Runs a scheduled task once.
@@ -1872,12 +2754,18 @@ pub const Core = struct {
         var flag: std.atomic.Value(bool) = .init(false);
         c.register(&flag);
         defer c.unregister(&flag);
-        var run = c.runAs(&client, label, .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{tk.name}) }, &flag);
+        var run = c.runIn(&client, label, .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{tk.name}) }, tk.to, &flag);
         run.extra_instructions = try std.fmt.allocPrint(a, "This is the scheduled task \"{s}\". If there is nothing worth telling the owner this time, answer exactly NOTHING.", .{tk.name});
         var skipped: agent.Skipped = .init(c.gpa);
         defer skipped.deinit();
         run.skipped = &skipped;
-        run.notice = .{ .ctx = c, .say = noticeSay };
+        var notify: Notify = .{ .core = c, .conv = tk.to };
+        run.notice = .{ .ctx = &notify, .say = Notify.say };
+        // it posts to its `to` with its name in front, like its reply
+        var sched: Sched = .{ .skipped = &skipped, .keep = keep };
+        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{tk.name}), .sched = &sched };
+        run.outbox = out.outbox();
+        run.context_note = c.contextNote(a, tk.to) catch "";
         var conv: agent.Conversation = .init(c.gpa);
         defer conv.deinit();
         try c.log.write(.task, false, .{ .name = tk.name, .event = "start" });
@@ -1895,26 +2783,54 @@ pub const Core = struct {
             c.say(try std.fmt.allocPrint(a, "Task {s} is paused: model budget used up. Send /task resume {s} to start it again.", .{ tk.name, tk.name }));
             return .done;
         };
-        const answer = std.mem.trim(u8, res.text, " \t\r\n.");
-        const silent = std.mem.eql(u8, answer, "NOTHING");
-        // what it could not do without the owner is said even then
-        const note = try skipped.text(c.io, a);
-        if (silent and note.len == 0) {
-            try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = "the answer was NOTHING" });
-            return .done;
+        if (!res.replied) {
+            if (res.ended_by) |why| {
+                // a limit or an error: harness's line, with what it skipped
+                const note = try skipped.text(c.io, a);
+                return c.taskMessage(tk, keep, try std.fmt.allocPrint(a, "[{s}] {s}{s}{s}", .{ tk.name, why, if (note.len > 0) "\n\n" else "", note }));
+            }
+            // NOTHING, with nothing skipped: no post at all
+            if (c.shapeReply(a, &out, &sched, res.text) == null) {
+                try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = "the answer was NOTHING" });
+                return .done;
+            }
+            const got = try agent.postReply(&run, a, res.text);
+            if (got.refused) |why| {
+                try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = why });
+                c.say(try std.fmt.allocPrint(a, "The answer of task {s} was not posted: {s}.", .{ tk.name, why }));
+                return .done;
+            }
         }
-        const msg = if (silent)
-            try std.fmt.allocPrint(a, "[{s}] {s}", .{ tk.name, note })
-        else
-            try std.fmt.allocPrint(a, "[{s}] {s}{s}{s}", .{ tk.name, res.text, if (note.len > 0) "\n\n" else "", note });
-        c.deliver(msg) catch |e| {
+        // how its reply went, a final send's or harness's post of its text
+        switch (sched.outcome) {
+            .sent => try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = true }),
+            .silent => try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = "the answer was NOTHING" }),
+            else => try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = sched.why }),
+        }
+        return if (sched.outcome == .kept) .undelivered else .done;
+    }
+
+    /// Harness's own line for a task (a limit, an error, with what it
+    /// skipped): to its conversation (main when others read that); kept to
+    /// be sent again when it did not get through.
+    fn taskMessage(c: *Core, tk: config.Task, keep: ?*?Undelivered, msg: []const u8) !Outcome {
+        const where = if (c.isShared(tk.to)) "main" else tk.to;
+        c.deliverIn(where, msg) catch |e| {
             try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = whyUndelivered(e) });
             if (!worthRetry(e)) return .done;
-            if (keep) |k| k.* = try .of(c.gpa, msg, &.{});
+            if (keep) |k| k.* = try .of(c.gpa, where, msg, &.{});
             return .undelivered;
         };
         try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = true });
         return .done;
+    }
+
+    /// Whether others read conversation `name` (a group).
+    fn isShared(c: *Core, name: []const u8) bool {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        const e = c.convs.find(name) orelse return false;
+        return e.audience == .shared;
     }
 
     // ---- commands ----
@@ -1922,7 +2838,7 @@ pub const Core = struct {
     const help_text =
         \\Commands
         \\/stop: stop everything running now
-        \\/new: start a new conversation (memory stays)
+        \\/new: start fresh in this conversation (memory stays)
         \\/status: what is running and the switches
         \\/brief [NAME]: send a brief now
         \\/topics: list brief topics
@@ -1934,31 +2850,42 @@ pub const Core = struct {
         \\/memory: list memories by level
         \\/memory auto on|off: automatic recall
         \\/remember TEXT, /pin ID, /unpin ID, /forget ID
-        \\/private on|off: no memories written while on
+        \\/private on|off: in this conversation, no memories written while on
         \\/skills: list saved skills, /skill rm NAME
         \\/logins: the agent's own logins
         \\/dryrun on|off: money tools are not called while on
         \\/reload: apply changed settings files
+        \\/conversations: where you and the agent talk
+        \\/conversation new NAME: open a topic for a subject
+        \\/conversation rename OLD NEW, /conversation rm NAME
+        \\/conversation add NAME: sent in a group, the agent may post there
+        \\/session [N]: the steps behind the last answer here (N runs back)
     ;
 
+    /// A command sent in `main` (or from the command line).
     pub fn command(c: *Core, a: std.mem.Allocator, text: []const u8) ![]const u8 {
+        return c.commandIn(a, "main", text);
+    }
+
+    /// A command sent in conversation `conv`; returns its reply.
+    fn commandIn(c: *Core, a: std.mem.Allocator, conv: []const u8, text: []const u8) ![]const u8 {
         var words = std.mem.tokenizeAny(u8, text, " \t");
-        const cmd = words.next() orelse return "";
+        const cmd = c.commandWord(words.next() orelse return "");
         const rest = std.mem.trim(u8, words.rest(), " \t");
-        try c.log.write(.chat, c.switches.private.load(.acquire), .{ .event = "command", .command = cmd, .args = rest });
+        try c.log.write(.chat, c.convPrivate(conv), .{ .event = "command", .command = cmd, .args = rest });
         const eql = std.mem.eql;
         if (eql(u8, cmd, "/help") or eql(u8, cmd, "/start")) return help_text;
         if (eql(u8, cmd, "/pair")) return "Already paired.";
         if (eql(u8, cmd, "/stop")) return c.stopAll();
         if (eql(u8, cmd, "/new")) {
-            c.reset_conv.store(true, .release);
+            c.resetContext(conv);
             return "New conversation.";
         }
         if (eql(u8, cmd, "/reload")) return c.reload();
         if (eql(u8, cmd, "/status")) {
             return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
-                onOff(c.switches.auto_recall.load(.acquire)), onOff(c.switches.private.load(.acquire)),
+                onOff(c.switches.auto_recall.load(.acquire)), onOff(c.convPrivate(conv)),
                 onOff(c.switches.dry_run.load(.acquire)),
                 if (c.browser.len == 0) "none found" else if (builtin.os.tag == .windows) "found (web not available on Windows yet)" else "found",
                 c.login_list.len,
@@ -1989,13 +2916,24 @@ pub const Core = struct {
         }
         if (eql(u8, cmd, "/private")) {
             const v = config.parseBool(rest) orelse return "Use /private on or /private off.";
-            c.switches.private.store(v, .release);
-            c.saveSwitches();
-            return if (v) "Private: nothing from this chat is written to memory, and the log keeps only sizes and hashes." else "Private is off.";
+            {
+                c.convs.mutex.lockUncancelable(c.io);
+                defer c.convs.mutex.unlock(c.io);
+                if (c.convs.find(conv)) |e| {
+                    e.private.store(v, .release);
+                    c.convs.save() catch |err| return std.fmt.allocPrint(a, "Private is {s} until harness stops: state/conversations could not be written ({s}).", .{ onOff(v), @errorName(err) });
+                } else {
+                    // no main before an owner is paired: the instance's switch
+                    c.switches.private.store(v, .release);
+                    c.saveSwitches();
+                }
+            }
+            try c.log.write(.config, false, .{ .event = "private", .name = conv, .on = v });
+            return if (v) "Private here: nothing from this conversation is written to memory, and the log keeps only sizes and hashes of what is said in it." else "Private is off here.";
         }
         if (eql(u8, cmd, "/remember")) {
             if (rest.len == 0) return "Use /remember TEXT.";
-            if (c.switches.private.load(.acquire)) return "Not saved: private is on, so nothing is written to memory. Send /private off first.";
+            if (c.convPrivate(conv)) return "Not saved: private is on, so nothing is written to memory. Send /private off first.";
             c.lock.lockUncancelable(c.io);
             defer c.lock.unlock(c.io);
             const res = try c.mem.add(rest, null, c.now());
@@ -2046,6 +2984,9 @@ pub const Core = struct {
         }
         if (eql(u8, cmd, "/task")) return c.taskCommand(a, rest);
         if (eql(u8, cmd, "/logins")) return c.loginsText(a);
+        if (eql(u8, cmd, "/conversations")) return c.conversationsText(a);
+        if (eql(u8, cmd, "/session")) return c.sessionText(a, conv, rest);
+        if (eql(u8, cmd, "/conversation")) return c.conversationCommand(a, conv, rest);
         if (eql(u8, cmd, "/skills")) {
             const list = try skills.list(a, c.io, c.paths.skills);
             if (list.len == 0) return "No skills yet. The agent saves one (with your approval) when it learns how to do a kind of task.";
@@ -2065,6 +3006,106 @@ pub const Core = struct {
             return "Use /skills or /skill rm NAME.";
         }
         return "Unknown command. Send /help for the list.";
+    }
+
+    /// `/session [N]`: the steps behind the last answer in `conv` (N runs
+    /// back, up to 20), from the log's last 4 MB, in one message.
+    fn sessionText(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        const back = if (rest.len == 0) 1 else std.fmt.parseInt(usize, rest, 10) catch return "Use /session, or /session N for N runs back (up to 20).";
+        if (back == 0 or back > 20) return "Use /session N with N from 1 to 20.";
+        const text = session.tail(c.io, a, c.paths.log, 4 << 20) catch |e| return std.fmt.allocPrint(a, "The log can't be read: {s}", .{@errorName(e)});
+        const rid = (try session.lastRunIn(a, text, conv, back)) orelse return "No run here in the log's last 4 MB.";
+        return (try session.render(a, text, rid, 3500)) orelse "No run here in the log's last 4 MB.";
+    }
+
+    /// A line per conversation: its name, where it is, private, last used.
+    fn conversationsText(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        var out: std.ArrayList(u8) = .empty;
+        for (c.convs.items.items) |e| {
+            try out.print(a, "{s}: {s}, private {s}, ", .{ e.name, e.where(), onOff(e.isPrivate()) });
+            if (e.used_s == 0) try out.appendSlice(a, "not used since harness started\n") else {
+                var tb: [20]u8 = undefined;
+                try out.print(a, "last used {s}\n", .{util.isoTime(&tb, e.used_s)});
+            }
+        }
+        return out.items;
+    }
+
+    const conversation_usage = "Use /conversation new NAME, /conversation rename OLD NEW or /conversation rm NAME (/conversation add NAME is sent in a group).";
+    const name_rule = "A conversation's name uses a-z, 0-9, - and _ (up to 32), and is not new, rename, rm or add.";
+
+    /// `/conversation new|rename|rm|add`, sent in `from`.
+    fn conversationCommand(c: *Core, a: std.mem.Allocator, from: []const u8, rest: []const u8) ![]const u8 {
+        _ = from;
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const op = words.next() orelse return conversation_usage;
+        const x = words.next() orelse "";
+        const y = words.next() orelse "";
+        if (words.next() != null) return conversation_usage;
+        const eql = std.mem.eql;
+        if (eql(u8, op, "add")) return "Send /conversation add NAME in the group the agent may post in (add the bot to the group first).";
+        if (eql(u8, op, "new")) {
+            if (x.len == 0 or y.len > 0) return conversation_usage;
+            if (!conversations.validName(x)) return name_rule;
+            return c.openTopic(a, x);
+        }
+        if (eql(u8, op, "rename")) {
+            if (x.len == 0 or y.len == 0) return conversation_usage;
+            if (conversations.isFixed(x)) return "main and terminal keep their names.";
+            if (!conversations.validName(y)) return name_rule;
+            {
+                c.convs.mutex.lockUncancelable(c.io);
+                defer c.convs.mutex.unlock(c.io);
+                c.convs.rename(x, y) catch |e| return switch (e) {
+                    error.NotFound => "No conversation with that name.",
+                    error.Taken => "Another conversation has that name.",
+                    else => std.fmt.allocPrint(a, "Not renamed: harness could not write state/conversations ({s}).", .{@errorName(e)}),
+                };
+            }
+            try c.log.write(.config, false, .{ .event = "conversation renamed", .name = x, .to = y });
+            return std.fmt.allocPrint(a, "Renamed {s} to {s}.", .{ x, y });
+        }
+        if (eql(u8, op, "rm")) {
+            if (x.len == 0 or y.len > 0) return conversation_usage;
+            if (conversations.isFixed(x)) return "main and terminal stay.";
+            {
+                c.convs.mutex.lockUncancelable(c.io);
+                defer c.convs.mutex.unlock(c.io);
+                c.convs.remove(x) catch |e| return switch (e) {
+                    error.NotFound => "No conversation with that name.",
+                    else => std.fmt.allocPrint(a, "Not removed: harness could not write state/conversations ({s}).", .{@errorName(e)}),
+                };
+            }
+            try c.log.write(.config, false, .{ .event = "conversation removed", .name = x });
+            return std.fmt.allocPrint(a, "Forgot {s}: the agent no longer posts there. A topic stays in Telegram; a message in it makes it a conversation again.", .{x});
+        }
+        return conversation_usage;
+    }
+
+    /// Opens topic `name` in the owner's chat with the bot and keeps it as
+    /// a conversation; returns what to tell the owner.
+    fn openTopic(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        const owner = c.owner orelse return "Pair an account first (harness pair).";
+        const ch = c.chan orelse return "There is no chat to open a topic in.";
+        const open_fn = ch.open_topic orelse return "Topics are Telegram's: send /conversation new there.";
+        if (!c.topics_on) return "Topics are off for this bot: switch on topics in private chats in @BotFather (Bot API 9.3), then send /conversation new again.";
+        {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            if (c.convs.find(name) != null) return "A conversation has that name already.";
+        }
+        const thread = open_fn(ch.ctx, owner, name) catch |e|
+            return std.fmt.allocPrint(a, "Telegram did not open the topic ({s}). Are topics in private chats on for the bot in @BotFather?", .{@errorName(e)});
+        {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            _ = c.convs.add(.{ .name = name, .chat = owner, .thread = thread, .created = util.nowSeconds(c.io) }) catch |e|
+                return std.fmt.allocPrint(a, "The topic is open, but harness could not keep it ({s}).", .{@errorName(e)});
+        }
+        try c.log.write(.config, false, .{ .event = "conversation added", .name = name, .thread = thread });
+        return std.fmt.allocPrint(a, "Opened the topic {s}: write there to talk about it.", .{name});
     }
 
     /// One line per login: what is stored for it (never the values).
@@ -2505,7 +3546,19 @@ const t = std.testing;
 const Recorder = struct {
     mutex: Io.Mutex = .init,
     lines: std.ArrayList([]u8) = .empty,
+    /// Where each of `lines` went.
+    where: std.ArrayList(Where) = .empty,
     next_id: i64 = 0,
+    /// The id the next message without buttons gets (apart from theirs).
+    next_text: i64 = 100_000,
+    /// The thread the next topic opened gets, less one.
+    next_thread: i64 = 5000,
+    /// While set, Telegram opens no topic.
+    topics_fail: bool = false,
+    /// While set, a send to a topic is refused (Telegram lost the topic).
+    threads_fail: bool = false,
+    /// The messages whose buttons were taken off.
+    cleared: std.ArrayList(i64) = .empty,
     /// While set, sends fail with it and nothing is recorded.
     fail: ?anyerror = null,
     /// While set, a message with buttons is not sent: no message id.
@@ -2521,11 +3574,13 @@ const Recorder = struct {
 
     const Early = struct { ctx: *anyopaque, press: *const fn (ctx: *anyopaque, b: *const Buttons) void };
 
+    const Where = struct { name: []u8, chat: i64, thread: i64 };
+
     const Buttons = struct {
         msg: i64 = 0,
         n: usize = 0,
-        buf: [3][64]u8 = undefined,
-        len: [3]usize = @splat(0),
+        buf: [4][64]u8 = undefined,
+        len: [4]usize = @splat(0),
 
         /// The data of the button that answers `which` ("once", "day", "deny").
         fn get(b: *const Buttons, which: []const u8) ?[]const u8 {
@@ -2541,17 +3596,78 @@ const Recorder = struct {
     fn deinit(r: *Recorder) void {
         for (r.lines.items) |l| t.allocator.free(l);
         r.lines.deinit(t.allocator);
+        for (r.where.items) |w| t.allocator.free(w.name);
+        r.where.deinit(t.allocator);
+        r.cleared.deinit(t.allocator);
     }
 
     fn channel(r: *Recorder) Channel {
-        return .{ .ctx = r, .send = send, .buttons = buttons, .clear = clear, .send_to = sendTo };
+        return .{ .ctx = r, .send = send, .buttons = buttons, .clear = clear, .send_to = sendTo, .document = document, .open_topic = openTopic };
+    }
+
+    /// Notes a line and where it went (under the mutex).
+    fn note(r: *Recorder, place: Place, line: []u8) !void {
+        try r.lines.append(t.allocator, line);
+        try r.where.append(t.allocator, .{ .name = try t.allocator.dupe(u8, place.name), .chat = place.chat, .thread = place.thread });
+    }
+
+    fn document(ctx: *anyopaque, place: Place, name: []const u8, data: []const u8) anyerror!i64 {
+        const r: *Recorder = @ptrCast(@alignCast(ctx));
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        if (r.fail) |e| return e;
+        try r.note(place, try std.fmt.allocPrint(t.allocator, "DOC {s} ({d} bytes)", .{ name, data.len }));
+        r.next_text += 1;
+        return r.next_text;
+    }
+
+    fn openTopic(ctx: *anyopaque, chat: i64, name: []const u8) anyerror!i64 {
+        _ = chat;
+        _ = name;
+        const r: *Recorder = @ptrCast(@alignCast(ctx));
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        if (r.topics_fail) return error.TelegramRefused;
+        r.next_thread += 1;
+        return r.next_thread;
+    }
+
+    /// Where the first line containing `needle` went.
+    fn whereOf(r: *Recorder, needle: []const u8) ?Where {
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        for (r.lines.items, r.where.items) |l, w| if (std.mem.indexOf(u8, l, needle) != null) return w;
+        return null;
+    }
+
+    /// The lines containing `needle` that went to conversation `conv`.
+    fn countIn(r: *Recorder, conv: []const u8, needle: []const u8) usize {
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        var n: usize = 0;
+        for (r.lines.items, r.where.items) |l, w| if (std.mem.eql(u8, w.name, conv) and std.mem.indexOf(u8, l, needle) != null) {
+            n += 1;
+        };
+        return n;
+    }
+
+    /// Waits until a line containing `needle` went to `conv`.
+    fn waitIn(r: *Recorder, conv: []const u8, needle: []const u8) !void {
+        var waited: u32 = 0;
+        while (waited < 8000) : (waited += 20) {
+            if (r.countIn(conv, needle) > 0) return;
+            t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        }
+        std.debug.print("waited for {s} in {s}; got:\n", .{ needle, conv });
+        for (r.lines.items, r.where.items) |l, w| std.debug.print("  [{s} {d}/{d}] {s}\n", .{ w.name, w.chat, w.thread, l });
+        return error.TestTimedOut;
     }
 
     fn sendTo(ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void {
         const r: *Recorder = @ptrCast(@alignCast(ctx));
         r.mutex.lockUncancelable(t.io);
         defer r.mutex.unlock(t.io);
-        try r.lines.append(t.allocator, try std.fmt.allocPrint(t.allocator, "TO {d}: {s}", .{ chat_id, text }));
+        try r.note(.{ .name = "(another account)", .chat = chat_id }, try std.fmt.allocPrint(t.allocator, "TO {d}: {s}", .{ chat_id, text }));
     }
 
     fn setFail(r: *Recorder, e: ?anyerror) void {
@@ -2560,29 +3676,32 @@ const Recorder = struct {
         r.fail = e;
     }
 
-    fn send(ctx: *anyopaque, text: []const u8) anyerror!void {
+    fn send(ctx: *anyopaque, place: Place, text: []const u8) anyerror!Sent {
         const r: *Recorder = @ptrCast(@alignCast(ctx));
         r.mutex.lockUncancelable(t.io);
         defer r.mutex.unlock(t.io);
         if (r.fail) |e| return e;
+        if (r.threads_fail and place.thread != 0) return error.TopicRefused;
         const held = if (r.probe) |m| blk: {
             if (!m.tryLock()) break :blk true;
             m.unlock(t.io);
             break :blk false;
         } else false;
-        try r.lines.append(t.allocator, try std.fmt.allocPrint(t.allocator, "{s}{s}", .{ if (held) "[lock held] " else "", text }));
+        try r.note(place, try std.fmt.allocPrint(t.allocator, "{s}{s}", .{ if (held) "[lock held] " else "", text }));
+        r.next_text += 1;
+        return .{ .first = r.next_text, .count = 1 };
     }
 
-    fn buttons(ctx: *anyopaque, text: []const u8, bs: []const [2][]const u8) ?i64 {
+    fn buttons(ctx: *anyopaque, place: Place, text: []const u8, bs: []const [2][]const u8) ?i64 {
         const r: *Recorder = @ptrCast(@alignCast(ctx));
         const shown = blk: {
             r.mutex.lockUncancelable(t.io);
             defer r.mutex.unlock(t.io);
             if (r.buttons_fail) return null;
             const line = std.fmt.allocPrint(t.allocator, "BUTTONS {s} [{s}]", .{ text, bs[0][1] }) catch return null;
-            r.lines.append(t.allocator, line) catch {};
+            r.note(place, line) catch {};
             r.next_id += 1;
-            r.last = .{ .msg = r.next_id, .n = @min(bs.len, 3) };
+            r.last = .{ .msg = r.next_id, .n = @min(bs.len, 4) };
             for (bs[0..r.last.n], 0..) |b, i| {
                 r.last.len[i] = @min(b[1].len, 64);
                 @memcpy(r.last.buf[i][0..r.last.len[i]], b[1][0..r.last.len[i]]);
@@ -2593,9 +3712,12 @@ const Recorder = struct {
         return shown.msg;
     }
 
-    fn clear(ctx: *anyopaque, id: i64) void {
-        _ = ctx;
-        _ = id;
+    fn clear(ctx: *anyopaque, place: Place, id: i64) void {
+        _ = place;
+        const r: *Recorder = @ptrCast(@alignCast(ctx));
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        r.cleared.append(t.allocator, id) catch {};
     }
 
     /// Waits until some line contains `needle`.
@@ -2666,6 +3788,693 @@ const Fix = struct {
         f.core.handleCallback(42, b.msg, b.get(which) orelse return error.NoSuchButton);
     }
 };
+
+/// The text of state/conversations.
+fn conversationsText(f: *Fix) ![]u8 {
+    return Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.conversations, f.e.arena.allocator(), .unlimited);
+}
+
+/// A message from the owner in topic `thread` of their chat with the bot.
+fn inTopic(thread: i64, topic: ?[]const u8, text: []const u8) Incoming {
+    return .{ .from = 42, .chat = 42, .thread = thread, .topic = topic, .text = text };
+}
+
+test "a_reply_goes_to_the_conversation_the_message_came_from" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.textReply("Three flats match."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(inTopic(5012, "House search", "find flats"));
+    try f.rec.waitFor("Three flats match.");
+    const w = f.rec.whereOf("Three flats match.").?;
+    try t.expectEqualStrings("house-search", w.name);
+    try t.expectEqual(42, w.chat);
+    try t.expectEqual(5012, w.thread);
+    try t.expectEqual(0, f.rec.countIn("main", "Three flats"));
+    // a command's reply goes where the command came from
+    try f.core.handleIncoming(inTopic(5012, null, "/memory"));
+    try f.rec.waitIn("house-search", "No memories");
+}
+
+test "a_new_topic_is_a_conversation_named_after_it_before_its_turn_starts" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    // no worker: nothing has run when it is written down
+    try f.core.handleIncoming(inTopic(5012, "House search", "find flats"));
+    const text = try conversationsText(&f);
+    try t.expect(std.mem.indexOf(u8, text, "{\"name\":\"house-search\",\"channel\":\"telegram\",\"chat\":42,\"thread\":5012,\"audience\":\"own\",\"private\":false,") != null);
+    try t.expectEqual(1, f.core.queue.items.len);
+    try t.expectEqualStrings("house-search", f.core.queue.items[0].conv);
+    // another topic of the same name, and one whose name is not known
+    try f.core.handleIncoming(inTopic(5013, "House search", "and this one"));
+    try f.core.handleIncoming(inTopic(5014, null, "and here"));
+    const after = try conversationsText(&f);
+    try t.expect(std.mem.indexOf(u8, after, "\"name\":\"house-search-2\",\"channel\":\"telegram\",\"chat\":42,\"thread\":5013") != null);
+    try t.expect(std.mem.indexOf(u8, after, "\"name\":\"topic-5014\",\"channel\":\"telegram\",\"chat\":42,\"thread\":5014") != null);
+    // a later message in the first topic is the same conversation
+    try f.core.handleIncoming(inTopic(5012, null, "more"));
+    try t.expectEqualStrings("house-search", f.core.queue.items[3].conv);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"conversation added\",\"name\":\"house-search\"") != null);
+}
+
+test "pairing_another_account_moves_main_and_drops_the_old_topics" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.core.handleIncoming(inTopic(5012, "House search", "find flats"));
+    var buf: [8]u8 = undefined;
+    const code = try newPairCode(t.io, f.core.paths, f.core.now(), &buf);
+    try f.core.handleMessage(77, try std.fmt.allocPrint(a, "/pair {s}", .{code}));
+    try f.rec.waitFor("TO 42: This bot is now paired with another account");
+    try f.rec.waitFor("The topics of the account paired before are no longer conversations: house-search.");
+    // said in the new account's chat
+    try t.expectEqual(77, f.rec.whereOf("no longer conversations").?.chat);
+    {
+        f.core.convs.mutex.lockUncancelable(t.io);
+        defer f.core.convs.mutex.unlock(t.io);
+        try t.expectEqual(77, f.core.convs.find("main").?.chat);
+        try t.expectEqual(null, f.core.convs.find("house-search"));
+    }
+    const text = try conversationsText(&f);
+    try t.expect(std.mem.indexOf(u8, text, "house-search") == null);
+    try t.expect(std.mem.indexOf(u8, text, "{\"name\":\"main\",\"channel\":\"telegram\",\"chat\":77,") != null);
+}
+
+test "conversation_commands_open_rename_and_forget" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.core.handleText("/conversation new trading");
+    try f.rec.waitFor("Opened the topic trading");
+    {
+        f.core.convs.mutex.lockUncancelable(t.io);
+        defer f.core.convs.mutex.unlock(t.io);
+        const e = f.core.convs.find("trading").?;
+        try t.expectEqual(5001, e.thread);
+        try t.expectEqual(42, e.chat);
+    }
+    try f.core.handleText("/conversations");
+    try f.rec.waitFor("trading: Telegram topic, private off");
+    try f.rec.waitFor("main: Telegram chat, private off");
+    try f.rec.waitFor("terminal: terminal");
+    try f.core.handleText("/conversation new Bad");
+    try f.rec.waitFor("a-z, 0-9");
+    try f.core.handleText("/conversation rename trading markets");
+    try f.rec.waitFor("Renamed trading to markets.");
+    try f.core.handleText("/conversation rename main home");
+    try f.rec.waitFor("main and terminal keep their names");
+    try f.core.handleText("/conversation rm markets");
+    try f.rec.waitFor("Forgot markets");
+    try f.core.handleText("/conversation rm terminal");
+    try f.rec.waitFor("main and terminal stay");
+    const text = try conversationsText(&f);
+    try t.expect(std.mem.indexOf(u8, text, "markets") == null);
+    try t.expect(std.mem.indexOf(u8, text, "trading") == null);
+    // without topics for the bot: how to switch them on
+    f.core.topics_on = false;
+    try f.core.handleText("/conversation new flats");
+    try f.rec.waitFor("switch on topics in private chats in @BotFather");
+}
+
+test "a_group_is_read_only_for_conversation_add" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.setBot("harness_test_bot", true);
+    const group: Incoming = .{ .from = 42, .chat = -1001234567890, .chat_type = "supergroup", .text = "hello group" };
+    try f.core.handleIncoming(group);
+    try t.expectEqual(0, f.core.queue.items.len);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"dropped\",\"from\":42,\"chat\":-1001234567890") != null);
+    // a stranger's /conversation add is dropped too
+    var stranger = group;
+    stranger.from = 7;
+    stranger.text = "/conversation add evil";
+    try f.core.handleIncoming(stranger);
+    var add = group;
+    add.text = "/conversation@harness_test_bot add family";
+    try f.core.handleIncoming(add);
+    try f.rec.waitFor("Added: the agent may post here as family.");
+    try t.expectEqual(-1001234567890, f.rec.whereOf("Added: the agent").?.chat);
+    {
+        f.core.convs.mutex.lockUncancelable(t.io);
+        defer f.core.convs.mutex.unlock(t.io);
+        try t.expectEqual(.shared, f.core.convs.find("family").?.audience);
+        try t.expectEqual(null, f.core.convs.find("evil"));
+    }
+    try t.expectEqual(0, f.core.queue.items.len);
+}
+
+/// A topic of the owner's chat known as conversation `name`.
+fn addTopic(f: *Fix, name: []const u8, thread: i64) !void {
+    f.core.convs.mutex.lockUncancelable(t.io);
+    defer f.core.convs.mutex.unlock(t.io);
+    _ = try f.core.convs.add(.{ .name = name, .chat = 42, .thread = thread });
+}
+
+test "new_resets_only_its_conversation" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "house-search", 5012);
+    try f.e.script(1, model.textReply("one"));
+    try f.e.script(2, model.textReply("two"));
+    try f.e.script(3, model.textReply("three"));
+    try f.e.script(4, model.textReply("four"));
+    f.core.chatTurn("first in main");
+    f.core.chatTurnIn("house-search", "first in the topic");
+    try f.core.handleTextIn("house-search", "/new");
+    try f.rec.waitIn("house-search", "New conversation.");
+    f.core.chatTurnIn("house-search", "second in the topic");
+    f.core.chatTurn("second in main");
+    const req3 = try f.e.request(3);
+    try t.expect(std.mem.indexOf(u8, req3, "first in the topic") == null);
+    try t.expect(std.mem.indexOf(u8, req3, "first in main") == null);
+    const req4 = try f.e.request(4);
+    try t.expect(std.mem.indexOf(u8, req4, "first in main") != null);
+    try t.expect(std.mem.indexOf(u8, req4, "the topic") == null);
+}
+
+test "the_17th_context_drops_the_least_used_after_its_memories_are_written" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    var n: u32 = 0;
+    for (0..17) |i| {
+        const name = try std.fmt.allocPrint(a, "t{d}", .{i});
+        try addTopic(&f, name, 5000 + @as(i64, @intCast(i)));
+        n += 1;
+        // the 17th turn first has the writer read the least used context
+        if (i == 16) {
+            try f.e.script(n, model.textReply("NONE"));
+            n += 1;
+        }
+        try f.e.script(n, model.textReply("ok"));
+        f.core.chatTurnIn(name, try std.fmt.allocPrint(a, "message-{d:0>2} about kayaks", .{i}));
+    }
+    const writer = try f.e.request(17);
+    try t.expect(std.mem.indexOf(u8, writer, "lasting facts") != null);
+    try t.expect(std.mem.indexOf(u8, writer, "message-00 about kayaks") != null);
+    try t.expect(std.mem.indexOf(u8, writer, "message-01") == null);
+    try t.expectEqual(16, f.core.contexts.items.len);
+    try t.expectEqual(null, f.core.contextOf("t0"));
+    // t0 comes back (t1 makes room, read by the writer first) and its
+    // model is told turns were dropped
+    try f.e.script(19, model.textReply("NONE"));
+    try f.e.script(20, model.textReply("welcome back"));
+    f.core.chatTurnIn("t0", "back again");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(19), "message-01 about kayaks") != null);
+    const back = try f.e.request(20);
+    try t.expect(std.mem.indexOf(u8, back, "1 earlier turns of this conversation were dropped") != null);
+    try t.expect(std.mem.indexOf(u8, back, "message-00") == null);
+}
+
+test "every_line_of_a_run_carries_its_rid_and_conversation" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
+    _ = try f.core.reload();
+    try addTopic(&f, "house-search", 5012);
+    try addTopic(&f, "trading", 5013);
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(2, model.textReply("done"));
+    f.core.chatTurnIn("house-search", "say hi");
+    // the model knows where it is and where else it can post
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "Conversation: house-search (Telegram topic). Others: main, trading.") != null);
+    const a = f.e.arena.allocator();
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, try logText(&f), "\n"), '\n');
+    var rid: ?i64 = null;
+    var n: usize = 0;
+    while (lines.next()) |l| {
+        const v = jv.parse(a, l).?;
+        if (jv.get(v, "run") == null) continue;
+        n += 1;
+        if (rid == null) rid = jv.int(jv.get(v, "rid")).?;
+        try t.expectEqual(rid.?, jv.int(jv.get(v, "rid")).?);
+        try t.expectEqualStrings("house-search", jv.str(jv.get(v, "conversation")).?);
+    }
+    try t.expect(n >= 6);
+}
+
+/// The model's reply: `blocks` (JSON content blocks) and a stop reason.
+fn replyOf(f: *Fix, blocks: []const u8, stop: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(f.e.arena.allocator(), "{{\"content\":[{s}],\"stop_reason\":\"{s}\"}}", .{ blocks, stop });
+}
+
+/// The log lines of kind `send`, in order.
+fn sendLines(f: *Fix) ![]const []const u8 {
+    const a = f.e.arena.allocator();
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, try logText(f), '\n');
+    while (lines.next()) |l| if (std.mem.indexOf(u8, l, "\"kind\":\"send\"") != null) try out.append(a, l);
+    return out.items;
+}
+
+test "send_final_posts_once_and_ends_the_turn_without_another_model_call" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, try replyOf(&f,
+        \\{"type":"text","text":"Here you go."},{"type":"tool_use","id":"tu_1","name":"send","input":{"text":"Three flats match.","final":true}},{"type":"tool_use","id":"tu_2","name":"recall","input":{"query":"after"}}
+    , "tool_use"));
+    try f.e.script(2, model.textReply("You are welcome."));
+    f.core.chatTurn("find flats");
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expectEqual(1, f.rec.count("Three flats match."));
+    // working text is never posted, and the call after the final send never ran
+    try t.expectEqual(0, f.rec.count("Here you go."));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"tool\":\"recall\",\"event\":\"not run: the turn ended with the final send\"") != null);
+    const sends = try sendLines(&f);
+    try t.expectEqual(1, sends.len);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"to\":\"main\",\"event\":\"sent\"") != null);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"final\":true,\"implicit\":false,\"delivered\":true") != null);
+    // the next turn's message joins the results in one user message, results first
+    f.core.chatTurn("thanks");
+    const a = f.e.arena.allocator();
+    const msgs = jv.arr(jv.at(jv.parse(a, try f.e.request(2)), &.{ "body", "messages" })).?;
+    for (msgs[1..], msgs[0 .. msgs.len - 1]) |m, prev| try t.expect(!std.mem.eql(u8, jv.str(jv.get(m, "role")).?, jv.str(jv.get(prev, "role")).?));
+    const last = jv.arr(jv.get(msgs[msgs.len - 1], "content")).?;
+    try t.expectEqualStrings("tool_result", jv.str(jv.get(last[0], "type")).?);
+    try t.expectEqualStrings("tu_1", jv.str(jv.get(last[0], "tool_use_id")).?);
+    try t.expect(std.mem.startsWith(u8, jv.str(jv.get(last[0], "content")).?, "posted to main"));
+    try t.expectEqualStrings("tu_2", jv.str(jv.get(last[1], "tool_use_id")).?);
+    try t.expect(std.mem.startsWith(u8, jv.str(jv.get(last[1], "content")).?, "not run: the turn ended with your final send"));
+    try t.expectEqualStrings("thanks", jv.str(jv.get(last[last.len - 1], "text")).?);
+    try t.expectEqual(1, f.rec.count("You are welcome."));
+}
+
+test "a_turn_that_stops_without_send_posts_its_last_text_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.textReply("Plain answer."));
+    f.core.chatTurn("hello");
+    try t.expectEqual(1, f.rec.count("Plain answer."));
+    const sends = try sendLines(&f);
+    try t.expectEqual(1, sends.len);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"to\":\"main\",\"event\":\"sent\"") != null);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"text\":\"Plain answer.\"") != null);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"final\":true,\"implicit\":true,\"delivered\":true") != null);
+    // the model is told to use send; the fallback is not mentioned
+    const req = try f.e.request(1);
+    try t.expect(std.mem.indexOf(u8, req, "The owner sees only what you post with send.") != null);
+    try t.expect(std.mem.indexOf(u8, req, "\"name\":\"send\"") != null);
+}
+
+test "a_note_mid_turn_does_not_take_the_replys_place" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, try replyOf(&f,
+        \\{"type":"text","text":"working on it"},{"type":"tool_use","id":"tu_1","name":"send","input":{"text":"Looking at three sites now."}}
+    , "tool_use"));
+    try f.e.script(2, model.textReply("Found two flats."));
+    f.core.chatTurn("find flats");
+    try t.expectEqual(2, f.e.server.modelRequests());
+    try t.expectEqual(1, f.rec.count("Looking at three sites now."));
+    try t.expectEqual(1, f.rec.count("Found two flats."));
+    try t.expectEqual(0, f.rec.count("working on it"));
+    const sends = try sendLines(&f);
+    try t.expectEqual(2, sends.len);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"final\":false,\"implicit\":false") != null);
+    try t.expect(std.mem.indexOf(u8, sends[1], "\"final\":true,\"implicit\":true") != null);
+}
+
+test "working_text_is_never_posted" {
+    var f: Fix = undefined;
+    try f.init("[limits]\nsteps_per_turn = 1\n", "", "");
+    defer f.deinit();
+    // text and a tool call, then the step limit
+    try f.e.script(1, model.toolReply("tu_1", "recall", "{\"query\":\"flats\"}"));
+    f.core.chatTurn("look it up");
+    try t.expectEqual(0, f.rec.count("Let me check."));
+    try t.expectEqual(1, f.rec.count("Step limit reached for this turn."));
+    try t.expectEqual(0, (try sendLines(&f)).len);
+}
+
+test "helpers_never_get_send" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"post it\",\"tools\":[\"send\",\"recall\"]}]}"));
+    try f.e.script(2, model.toolReply("h1", "send", "{\"text\":\"from a helper\",\"final\":true}"));
+    try f.e.script(3, model.textReply("helper done"));
+    try f.e.script(4, model.textReply("All done."));
+    f.core.chatTurn("split it");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "\"name\":\"send\"") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "\"name\":\"send\"") == null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "this tool is not available here") != null);
+    try t.expectEqual(0, f.rec.count("from a helper"));
+    try t.expectEqual(1, f.rec.count("All done."));
+}
+
+test "a_rule_that_stops_the_reply_is_said_in_main" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "deny send main\n" });
+    _ = try f.core.reload();
+    try f.e.script(1, model.textReply("You will not see this."));
+    f.core.chatTurn("hello");
+    try t.expectEqual(0, f.rec.count("You will not see this."));
+    try f.rec.waitIn("main", "The answer was not posted: rule on line 1.");
+    const sends = try sendLines(&f);
+    try t.expectEqual(1, sends.len);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"event\":\"refused\"") != null);
+}
+
+/// A group the owner registered, known as conversation `name`.
+fn addGroup(f: *Fix, name: []const u8, chat: i64) !void {
+    f.core.convs.mutex.lockUncancelable(t.io);
+    defer f.core.convs.mutex.unlock(t.io);
+    _ = try f.core.convs.add(.{ .name = name, .chat = chat, .audience = .shared });
+}
+
+test "send_to_another_conversation_is_allowed_and_logged" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "trading", 5013);
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"to\":\"trading\",\"text\":\"BTC is up 4%.\"}"));
+    try f.e.script(2, model.textReply("Told trading."));
+    f.core.chatTurn("tell trading");
+    try t.expectEqual(1, f.rec.countIn("trading", "BTC is up 4%."));
+    try t.expectEqual(5013, f.rec.whereOf("BTC is up 4%.").?.thread);
+    try t.expectEqual(1, f.rec.countIn("main", "Told trading."));
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    const sends = try sendLines(&f);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"conversation\":\"main\",\"run\":\"chat\",\"to\":\"trading\",\"event\":\"sent\"") != null);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"delivered\":true") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "posted to trading (1 message)") != null);
+}
+
+test "send_to_an_unknown_conversation_names_the_known_ones" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "trading", 5013);
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"to\":\"nowhere\",\"text\":\"lost words\"}"));
+    try f.e.script(2, model.textReply("ok"));
+    f.core.chatTurn("post it");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused: there is no conversation called nowhere; they are: main, trading") != null);
+    try t.expectEqual(0, f.rec.count("lost words"));
+    // every send is logged, a refused one too
+    const sends = try sendLines(&f);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"to\":\"nowhere\",\"event\":\"refused\"") != null);
+}
+
+test "send_to_a_shared_conversation_asks_every_time_without_24h_and_is_denied_unattended" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addGroup(&f, "family", -1001234567890);
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"to\":\"family\",\"text\":\"Dinner at 7.\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "send", "{\"to\":\"family\",\"text\":\"Bring salad.\"}"));
+    try f.e.script(3, model.textReply("asked twice"));
+    try f.core.startWorker();
+    try f.core.handleText("tell the family");
+    // the whole post is shown, in main, with no Allow 24 h
+    try f.rec.waitIn("main", "BUTTONS Allow this?\nsend: family, 12 bytes:\nDinner at 7.");
+    try t.expect(f.lastButtons().get("day") == null);
+    try f.press("once");
+    try f.rec.waitIn("family", "Dinner at 7.");
+    // asked again: an answer covers one post
+    try f.rec.waitIn("main", "BUTTONS Allow this?\nsend: family, 12 bytes:\nBring salad.");
+    try t.expect(f.lastButtons().get("day") == null);
+    try f.press("deny");
+    try f.rec.waitFor("asked twice");
+    try t.expectEqual(0, f.rec.countIn("family", "Bring salad."));
+    try t.expectEqual(0, f.core.grants.items.items.len);
+    // a run nobody watches is refused, and says what it skipped
+    var flag: std.atomic.Value(bool) = .init(false);
+    var run = f.core.runIn(&f.core.chat_client, "task fam", .{ .by = "schedule:fam" }, "main", &flag);
+    var out: Core.RunOut = .{ .core = f.core, .tag = "[fam] " };
+    run.outbox = out.outbox();
+    var skipped: agent.Skipped = .init(t.allocator);
+    defer skipped.deinit();
+    run.skipped = &skipped;
+    var conv: agent.Conversation = .init(t.allocator);
+    defer conv.deinit();
+    try f.e.script(4, model.toolReply("tu_3", "send", "{\"to\":\"family\",\"text\":\"Unasked.\"}"));
+    try f.e.script(5, model.textReply("NOTHING"));
+    const res = try agent.turn(&run, &conv, "Tell the family.", false);
+    defer agent.freeResult(&run, res);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), "refused by the gate: no one to ask in a scheduled run") != null);
+    try t.expect(std.mem.indexOf(u8, try skipped.text(t.io, f.e.arena.allocator()), "send: family") != null);
+    try t.expectEqual(0, f.rec.count("Unasked."));
+}
+
+test "the_11th_send_of_a_run_is_refused" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    var blocks: std.ArrayList(u8) = .empty;
+    for (1..12) |i| try blocks.print(a, "{s}{{\"type\":\"tool_use\",\"id\":\"tu_{d}\",\"name\":\"send\",\"input\":{{\"text\":\"note-{d:0>2}\"}}}}", .{ if (i > 1) "," else "", i, i });
+    try f.e.script(1, try replyOf(&f, blocks.items, "tool_use"));
+    try f.e.script(2, model.textReply("done"));
+    f.core.chatTurn("post a lot");
+    try t.expectEqual(10, f.rec.count("note-"));
+    try t.expectEqual(0, f.rec.count("note-11"));
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused: this run has posted 10 times, the most one run may (sends_per_run)") != null);
+}
+
+test "posts_over_the_hourly_limit_are_not_sent_and_main_is_told_once" {
+    var f: Fix = undefined;
+    try f.init("[limits]\nsends_per_hour = 2\n", "", "");
+    defer f.deinit();
+    try addTopic(&f, "trading", 5013);
+    const a = f.e.arena.allocator();
+    var blocks: std.ArrayList(u8) = .empty;
+    for (1..5) |i| try blocks.print(a, "{s}{{\"type\":\"tool_use\",\"id\":\"tu_{d}\",\"name\":\"send\",\"input\":{{\"to\":\"trading\",\"text\":\"tick-{d}\"}}}}", .{ if (i > 1) "," else "", i, i });
+    try f.e.script(1, try replyOf(&f, blocks.items, "tool_use"));
+    try f.e.script(2, model.textReply("done"));
+    f.core.chatTurn("watch the market");
+    try t.expectEqual(2, f.rec.countIn("trading", "tick-"));
+    try t.expectEqual(1, f.rec.countIn("main", "Posts to trading are over 2 an hour: 1 not sent. /session shows them."));
+    try t.expectEqual(1, f.rec.count("are over 2 an hour"));
+    const sends = try sendLines(&f);
+    try t.expectEqual(5, sends.len);
+    for (sends[2..4]) |l| {
+        try t.expect(std.mem.indexOf(u8, l, "\"event\":\"held\"") != null);
+        try t.expect(std.mem.indexOf(u8, l, "\"delivered\":false") != null);
+    }
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "not sent: posts to trading are over 2 an hour") != null);
+}
+
+test "private_is_per_conversation_and_covers_sends_into_it" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "diary", 5014);
+    try f.core.handleTextIn("diary", "/private on");
+    try f.rec.waitIn("diary", "Private here");
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"to\":\"diary\",\"text\":\"secret-entry-words\"}"));
+    try f.e.script(2, model.textReply("noted in your diary"));
+    f.core.chatTurn("write in my diary");
+    try f.e.script(3, model.textReply("a private reply"));
+    f.core.chatTurnIn("diary", "my private thoughts xyzzy");
+    const lt = try logText(&f);
+    // main is not private: its turn reads; a post into the diary does not
+    try t.expect(std.mem.indexOf(u8, lt, "\"text\":\"write in my diary\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "\"text\":\"noted in your diary\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "secret-entry-words") == null);
+    try t.expect(std.mem.indexOf(u8, lt, "\"to\":\"diary\",\"event\":\"sent\"") != null);
+    // the diary's own turn is private, its reply too
+    try t.expect(std.mem.indexOf(u8, lt, "xyzzy") == null);
+    try t.expect(std.mem.indexOf(u8, lt, "a private reply") == null);
+    try t.expectEqual(1, f.core.contextOf("main").?.turns_since_memory);
+    try t.expectEqual(0, f.core.contextOf("diary").?.turns_since_memory);
+    try t.expect(std.mem.indexOf(u8, try conversationsText(&f), "\"name\":\"diary\",\"channel\":\"telegram\",\"chat\":42,\"thread\":5014,\"audience\":\"own\",\"private\":true") != null);
+}
+
+test "an_attachment_outside_the_workspace_or_holding_a_stored_secret_is_refused" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const ws = f.core.workspace;
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ ws, "flats.csv" }), .data = "street,rooms\n" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ ws, "leak.txt" }), .data = "the key is og-key-for-tests\n" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ ws, ".env" }), .data = "A=1\n" });
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"text\":\"the settings\",\"files\":[\"../config.ini\"]}"));
+    try f.e.script(2, model.toolReply("tu_2", "send", "{\"text\":\"a leak\",\"files\":[\"leak.txt\"]}"));
+    try f.e.script(3, model.toolReply("tu_3", "send", "{\"text\":\"env\",\"files\":[\".env\"]}"));
+    try f.e.script(4, model.toolReply("tu_4", "send", "{\"text\":\"Here is the list.\",\"files\":[\"flats.csv\"],\"final\":true}"));
+    try f.core.startWorker();
+    try f.core.handleText("send me the files");
+    // a name starting with "." is asked, as write_file is
+    try f.rec.waitFor("BUTTONS Allow this?\nsend: main, 3 bytes:\nenv\nfiles: .env");
+    try f.press("deny");
+    try f.rec.waitFor("DOC flats.csv (13 bytes)");
+    try f.rec.waitIn("main", "Here is the list.");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused: ../config.ini is outside the workspace") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "refused: leak.txt holds a stored secret (omnigate)") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "refused by the gate: denied by the owner") != null);
+    try t.expectEqual(0, f.rec.count("a leak"));
+    try t.expectEqual(0, f.rec.count("the settings"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "og-key-for-tests") == null);
+    const sends = try sendLines(&f);
+    try t.expect(std.mem.indexOf(u8, sends[sends.len - 1], "\"files\":\"flats.csv\"") != null);
+}
+
+test "a_refused_topic_posts_to_main_with_its_name_in_front" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "trading", 5013);
+    f.rec.threads_fail = true;
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"to\":\"trading\",\"text\":\"BTC is up.\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "send", "{\"to\":\"trading\",\"text\":\"ETH too.\"}"));
+    try f.e.script(3, model.textReply("ok"));
+    f.core.chatTurn("tell trading");
+    try t.expectEqual(1, f.rec.countIn("main", "[trading] BTC is up."));
+    try t.expectEqual(1, f.rec.countIn("main", "[trading] ETH too."));
+    try t.expectEqual(1, f.rec.count("Telegram refused the topic of trading"));
+}
+
+test "a_task_posts_to_its_conversation_with_its_name_in_front" {
+    var f: Fix = undefined;
+    try f.init("", "", "[check]\nevery = 5m\nto = house-search\ndo = Check the flats.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // house-search is no conversation yet: its topic opens at the first post
+    try f.e.script(1, model.textReply("Two new flats."));
+    f.core.tick();
+    try f.rec.waitIn("house-search", "[check] Two new flats.");
+    try t.expectEqual(5001, f.rec.whereOf("[check] Two new flats.").?.thread);
+    waitIdle(f.core);
+    try t.expect(std.mem.indexOf(u8, try conversationsText(&f), "\"name\":\"house-search\",\"channel\":\"telegram\",\"chat\":42,\"thread\":5001") != null);
+    try t.expectEqual(0, f.rec.countIn("main", "Two new flats."));
+    // the task could post with send too; its run is logged in its conversation
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "\"name\":\"send\"") != null);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"conversation\":\"house-search\",\"run\":\"task check\",\"by\":\"schedule:check\"") != null);
+    // a brief with `to` posts there the same way
+    try addTopic(&f, "news", 5020);
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/z.xml", .data = "<rss><channel><item><title>New thing</title><link>https://z.org/1</link></item></channel></rss>" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.briefs, .data = try std.fmt.allocPrint(a, "[morning]\nat = 00:00\nto = news\ntopic = Zig | {s}/page/z.xml\n", .{try f.e.url()}) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(2, model.textReply("Zig: New thing (https://z.org/1)"));
+    f.core.tick();
+    try f.rec.waitIn("news", "[morning] Zig: New thing (https://z.org/1)");
+    waitIdle(f.core);
+    try t.expect(f.core.seen.has("https://z.org/1"));
+    try t.expectEqual(0, f.rec.countIn("main", "New thing"));
+}
+
+test "a_task_whose_topic_can_not_open_posts_to_main_with_its_name" {
+    var f: Fix = undefined;
+    try f.init("", "", "[check]\nevery = 5m\nto = flats\ndo = Check the flats.\n");
+    defer f.deinit();
+    f.rec.topics_fail = true;
+    try f.e.script(1, model.textReply("Nothing new on the market."));
+    f.core.tick();
+    try f.rec.waitIn("main", "[flats] [check] Nothing new on the market.");
+    waitIdle(f.core);
+    try t.expectEqual(1, f.rec.count("could not be opened"));
+}
+
+test "a_quick_reply_counts_once_and_not_after_a_restart" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"text\":\"Three flats match.\",\"buttons\":[\"Book viewings\",\"Not now\"],\"final\":true}"));
+    try f.e.script(2, model.textReply("Booking them."));
+    try f.core.startWorker();
+    try f.core.handleText("find flats");
+    try f.rec.waitFor("BUTTONS Three flats match. [r");
+    const b = f.lastButtons();
+    try t.expectEqual(2, b.n);
+    // the label is the owner's message there, in a turn that names the post
+    f.core.handleCallback(42, b.msg, b.get("1").?);
+    try f.rec.waitFor("Booking them.");
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "{\"type\":\"text\",\"text\":\"Book viewings\"") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "The owner pressed \\\"Book viewings\\\" under your post: \\\"Three flats match.\\\"") != null);
+    {
+        f.rec.mutex.lockUncancelable(t.io);
+        defer f.rec.mutex.unlock(t.io);
+        try t.expect(std.mem.indexOfScalar(i64, f.rec.cleared.items, b.msg) != null);
+    }
+    // counted once: the other button answers nothing now
+    f.core.handleCallback(42, b.msg, b.get("2").?);
+    try f.rec.waitFor(out_of_date);
+    // from another message, nothing either
+    try restart(&f);
+    f.core.handleCallback(42, b.msg, b.get("1").?);
+    try t.expectEqual(2, f.rec.count(out_of_date));
+    try t.expectEqual(2, f.e.server.modelRequests());
+    // quick replies only where only the owner reads
+    try addGroup(&f, "family", -1001234567890);
+    try f.e.script(3, model.toolReply("tu_2", "send", "{\"to\":\"family\",\"text\":\"Pick one\",\"buttons\":[\"A\"]}"));
+    try f.e.script(4, model.textReply("ok"));
+    f.core.chatTurn("ask the family");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "refused: quick replies are only for conversations only you read") != null);
+}
+
+test "session_shows_the_last_run_here_and_only_labels_for_a_private_one" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
+    _ = try f.core.reload();
+    try addTopic(&f, "house-search", 5012);
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo found-it\"}"));
+    try f.e.script(2, model.textReply("Three flats."));
+    f.core.chatTurnIn("house-search", "find flats");
+    try f.core.handleTextIn("house-search", "/session");
+    try f.rec.waitIn("house-search", "Owner: find flats");
+    const w = f.rec.whereOf("Owner: find flats").?;
+    try t.expectEqual(5012, w.thread);
+    for ([_][]const u8{
+        ", by owner, in house-search, ",
+        "Model: 10 in, 3 out",
+        "shell echo found-it: allow (rule on line 1), ok, ",
+        "Posted to house-search: Three flats. (the reply, posted by harness)",
+        "Ended: answered in 2 steps",
+    }) |want| try t.expectEqual(1, f.rec.countIn("house-search", want));
+    // another conversation's session is its own
+    try f.core.handleText("/session");
+    try f.rec.waitIn("main", "No run here");
+    try f.core.handleTextIn("house-search", "/session 2");
+    try f.rec.waitIn("house-search", "No run here");
+    // a private conversation: labels, not what was said
+    try addTopic(&f, "diary", 5014);
+    try f.core.handleTextIn("diary", "/private on");
+    try f.e.script(3, model.toolReply("tu_2", "shell", "{\"command\":\"echo secret-diary\"}"));
+    try f.e.script(4, model.textReply("kept quiet"));
+    f.core.chatTurnIn("diary", "my secret plans");
+    try f.core.handleTextIn("diary", "/session");
+    try f.rec.waitIn("diary", ", by owner, in diary, ");
+    {
+        f.rec.mutex.lockUncancelable(t.io);
+        defer f.rec.mutex.unlock(t.io);
+        const shown = for (f.rec.lines.items) |l| {
+            if (std.mem.indexOf(u8, l, ", by owner, in diary, ") != null) break l;
+        } else unreachable;
+        try t.expect(std.mem.indexOf(u8, shown, "allow (rule on line 1)") != null);
+        try t.expect(std.mem.indexOf(u8, shown, "Owner: (private, 15 bytes)") != null);
+        for ([_][]const u8{ "secret-diary", "my secret plans", "kept quiet" }) |said| try t.expect(std.mem.indexOf(u8, shown, said) == null);
+    }
+    try t.expectEqual(0, f.rec.count("secret-diary"));
+    // a long run: one message, then where the rest is
+    f.core.cfg.limits.steps_per_turn = 40;
+    for (0..30) |i| try f.e.script(@intCast(5 + i), model.toolReply("tu_x", "shell", "{\"command\":\"echo a fairly long line of output to make the session long enough\"}"));
+    try f.e.script(35, model.textReply("done at last"));
+    f.core.chatTurnIn("house-search", "go on for a while");
+    try f.core.handleTextIn("house-search", "/session");
+    try f.rec.waitIn("house-search", " shows all");
+    f.rec.mutex.lockUncancelable(t.io);
+    defer f.rec.mutex.unlock(t.io);
+    for (f.rec.lines.items) |l| if (std.mem.endsWith(u8, l, " shows all")) {
+        try t.expect(l.len <= 3500);
+        try t.expect(std.mem.indexOf(u8, l, "harness log session ") != null);
+    };
+}
 
 test "a_bad_rules_line_names_its_section_or_environment" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
@@ -3554,7 +5363,7 @@ test "private_turns_stay_out_of_memory" {
     try f.core.handleText("/private off");
     try f.e.script(2, model.textReply("fine"));
     f.core.chatTurn("ok then");
-    try t.expectEqual(1, f.core.turns_since_memory);
+    try t.expectEqual(1, f.core.contextOf("main").?.turns_since_memory);
     try f.e.script(3, model.textReply("- likes plain answers"));
     try f.core.writeMemories();
     const req = try f.e.request(3);
@@ -3619,8 +5428,9 @@ test "a_turn_running_when_private_goes_on_stays_out_of_memory" {
     try f.rec.waitFor("noted");
     var waited: u32 = 0;
     while (f.core.busy.load(.acquire) and waited < 3000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
-    try t.expect(f.core.conv.turns.items[f.core.conv.turns.items.len - 1].private);
-    try t.expectEqual(0, f.core.turns_since_memory);
+    const main = f.core.contextOf("main").?;
+    try t.expect(main.conv.turns.items[main.conv.turns.items.len - 1].private);
+    try t.expectEqual(0, main.turns_since_memory);
     // so the writer has nothing to read
     try f.core.writeMemories();
     try t.expectEqual(1, f.e.server.modelRequests());
