@@ -1,6 +1,6 @@
-//! The instance's settings: config.ini (model, chat, limits, memory),
-//! briefs.ini (topics and their sources) and tasks.ini (scheduled
-//! instructions). All three are small INI files: `[section]`,
+//! The instance's settings: config.ini (models and providers, chat,
+//! limits, memory), briefs.ini (topics and their sources) and tasks.ini
+//! (scheduled instructions). All three are small INI files: `[section]`,
 //! `key = value`, comments after `;` or `#`.
 const std = @import("std");
 const conversations = @import("conversations.zig");

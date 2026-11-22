@@ -1,6 +1,6 @@
 #!/bin/sh
-# End to end: the real harness binary against harness-fake (omnigate,
-# Telegram, feeds, search). No network, no real keys.
+# End to end: the real harness binary against harness-fake (omnigate and
+# other model providers, Telegram, feeds, search). No network, no real keys.
 # Usage: smoke.sh HARNESS HARNESS_FAKE
 set -u
 H=$1
@@ -140,6 +140,26 @@ printf '[check]\nevery = 5m\ndo = Check the price.\n' >"$HARNESS_HOME/tasks.ini"
 reply "$(text_reply 'Price is flat.')"
 check "task run prints the answer" '"$H" task run check 2>/dev/null | grep -qF "[check] Price is flat."'
 check "the model got the omnigate key" 'grep -qF "\"x-api-key\":\"og-smoke-key-123\"" "$(req)"'
+# another provider: an OpenAI-format gateway that takes a bearer key
+printf 'sk-local-smoke-key-1\n' | "$H" secret add local --stdin 2>/dev/null
+cp "$HARNESS_HOME/config.ini" "$T/config.ini.saved"
+cat >"$HARNESS_HOME/config.ini" <<EOF
+[model]
+url = $URL
+model = local:gpt-smoke
+[provider local]
+api = openai
+url = $URL/v1
+auth = bearer
+[search]
+url = $URL
+[chat]
+api = $URL
+EOF
+check "secret list names the key of a provider in use" '"$H" secret list | grep -qxF "local (local key): stored"'
+reply '{"choices":[{"message":{"role":"assistant","content":"Price is up."},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":3}}'
+check "a task runs through an OpenAI-format provider with its bearer key" '"$H" task run check 2>/dev/null | grep -qF "[check] Price is up." && grep -qF "\"target\":\"/v1/chat/completions\"" "$(req)" && grep -qF "\"Authorization\":\"Bearer sk-local-smoke-key-1\"" "$(req)" && grep -qF "\"provider\":\"local\"" "$HARNESS_HOME/log/actions.jsonl" && ! grep -qF "sk-local-smoke-key-1" "$HARNESS_HOME/log/actions.jsonl"'
+cp "$T/config.ini.saved" "$HARNESS_HOME/config.ini"
 : >"$HARNESS_HOME/tasks.ini"
 
 # a brief source with one item sent before

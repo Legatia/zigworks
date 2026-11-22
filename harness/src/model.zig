@@ -41,7 +41,8 @@ pub const Reply = struct {
 };
 
 pub const Error = error{
-    /// omnigate answered 402: the key's budget is spent. Never retried.
+    /// 402: the key's budget or credits at the provider are spent. Never
+    /// retried.
     BudgetSpent,
     /// 429 twice in a row.
     RateLimited,

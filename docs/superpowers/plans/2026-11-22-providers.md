@@ -63,15 +63,15 @@
 
 **config.zig:** `Model.provider: []const u8 = "omnigate"`; `Config.providers: []const model.Section = &.{}` (not a section name: `parse` skips it in its field loop); `pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider }`; `parse` returns `ParseError!Config` (`Error` itself unchanged: `lines` and the other parsers keep their sets); `pub fn reason(e: anyerror) ?[]const u8`; `pub fn providerSettings(cfg: Config) model.Settings`. `[provider NAME]` keys: api, url, auth, key (a secret's name), cache, header (`Name: value`, repeatable, ≤ 8, Ruling 8). Every `[provider NAME]` header counts, one with no keys too (read from the text, so `parseProblem` names the header line); a non-preset needs api and url; `[model] provider` must be a preset or a section. `defaults_ini` gets `provider = omnigate` with a comment (no address in it).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
   - config.zig `a_provider_section_overrides_a_preset`: `[provider openrouter]` with `key = or-key`, `url = http://127.0.0.1:9/api/v1`, `header = HTTP-Referer: https://example.org`, `header = X-Title: harness`, `cache = off` → resolved openrouter: api openai, auth bearer (preset), url as written, key_name `or-key`, cache false, 2 headers in order; anthropic untouched (`https://api.anthropic.com/v1`, x_api_key, cache true, key `anthropic`); `parse(defaults_ini)` has no provider section and default `omnigate`.
   - config.zig `a_new_provider_needs_api_and_url`: `ProviderNeedsApiAndUrl` for `[provider local]` alone, with only `url`, with only `api`; with both: auth bearer, cache false, key_name `local` (api openai) / x_api_key, cache true (api anthropic); `[model]\nprovider = nowhere` → `UnknownProvider`, `provider = local` with the section → default `local`; `core.parseProblem(a, "config.ini", "[model]\nurl = http://127.0.0.1:1\n[provider local]\nurl = http://127.0.0.1:11434/v1\n", config.parse)` starts with `config.ini line 3 has an error: [provider local] (a provider that is not a preset needs api`.
   - config.zig `provider_sections_refuse_bad_values`: `BadProvider` for `api = grpc`, `auth = basic`, `cache = maybe`, `url = ftp://x`, `url = http://h/a b`, `key = Bad Key`, `colour = red`, `[provider Bad:Name]`, `[provider a/b]`; `BadHeader` for `header = NoColon`, `header = Authorization: Bearer x`, `header = x-api-key: y`, `header = Host: h`, `header = : v`, nine `header` lines; `reason` non-null for all four new errors.
   - model.zig `a_model_value_picks_its_provider_by_its_prefix`: sections local (openai, auth none) and default omnigate: `claude-sonnet` → omnigate/`claude-sonnet`; `openrouter:deepseek/deepseek-chat` → openrouter/`deepseek/deepseek-chat`; `local:llama3.1:8b` → local/`llama3.1:8b`; `llama3.1:8b` → omnigate/`llama3.1:8b`; `openrouter:meta-llama/llama-3.3-70b-instruct:free` → openrouter, the rest whole; default `local`: `qwen2:7b` → local/`qwen2:7b`; a lookup answering `or-test-key` gives openrouter that key and `hasKey`; local (auth none) is never looked up and `hasKey`; `used` of three values naming omnigate twice → 2 providers.
-- [ ] **Step 2:** run; expect compile errors (no `model.Section`, `Providers`, `ParseError`).
-- [ ] **Step 3:** implement.
-- [ ] **Step 4:** whole suite green (+4).
-- [ ] **Step 5:** commit `harness providers: [provider NAME] sections, presets and PROVIDER:MODEL`.
+- [x] **Step 2:** run; expect compile errors (no `model.Section`, `Providers`, `ParseError`).
+- [x] **Step 3:** implement.
+- [x] **Step 4:** whole suite green (+4).
+- [x] **Step 5:** commit `harness providers: [provider NAME] sections, presets and PROVIDER:MODEL`.
 
 ### Task 2: a client for a provider (Anthropic format, auth, errors)
 
@@ -88,13 +88,13 @@
 - fake.zig: a saved request is `{"target":…,"headers":…,"body":…}`; POST to any route ending in `/messages` (Anthropic) or `/chat/completions` (OpenAI), not `/page/…` or `/bot…`, answers the next script; a script `{"status":N,"echo_key":true}` says the request's key in its error message.
 - TestEnv: `pub fn provider(e, name, api: Api, auth: Auth, key) !Provider` (url `http://127.0.0.1:PORT/v1`, cache = api is anthropic, key_name = name), `pub fn clientFor(e, p: Provider, model) !Client` (max_retry_wait 1).
 
-- [ ] **Step 1: Write the failing tests** in model.zig:
+- [x] **Step 1: Write the failing tests** in model.zig:
   - `provider_presets_resolve_and_old_settings_still_reach_omnigate`: `config.parse` of `[model]\nurl = http://127.0.0.1:PORT\nkey = omnigate\n` resolved with omnigate's key `og-test-key` → `client("claude-sonnet")` → request 1: target `/v1/messages`, `x-api-key` `og-test-key`, `anthropic-version` `2023-06-01`, model `claude-sonnet`, the last tool marked; url `…/v1` → `/v1/messages`; url `…/proxy` → `/proxy/v1/messages`; the five presets' api, url, auth, cache and key name as in the spec's table.
   - `bearer_and_none_auth_send_the_right_headers`: openai/bearer key `sk-bearer-test-1` with header `HTTP-Referer: https://example.org` → `Authorization` `Bearer sk-bearer-test-1`, `HTTP-Referer` there, no `x-api-key`, no `anthropic-version`, target `/v1/chat/completions`; anthropic/bearer → Bearer and `anthropic-version`, no `x-api-key`; openai/none with key "" → answered (no NoKey), no `Authorization`, no `x-api-key`; `{"status":401,"echo_key":true}` → `KeyRefused`, one request, `lastError` holds `[secret:local]` not the key, `failure` = `Model calls are refused: local refused the key stored as local (scripted error for key [secret:local]); store the right key with harness secret add local.`
-- [ ] **Step 2:** run; expect compile errors (`Client.open`, `KeyRefused`).
-- [ ] **Step 3:** implement (the OpenAI branch may return `BadReply` until Task 3).
-- [ ] **Step 4:** whole suite green (+2).
-- [ ] **Step 5:** commit `harness providers: a client per provider, x-api-key, bearer or none, 401 says the key was refused`.
+- [x] **Step 2:** run; expect compile errors (`Client.open`, `KeyRefused`).
+- [x] **Step 3:** implement (the OpenAI branch may return `BadReply` until Task 3).
+- [x] **Step 4:** whole suite green (+2).
+- [x] **Step 5:** commit `harness providers: a client per provider, x-api-key, bearer or none, 401 says the key was refused`.
 
 ### Task 3: the OpenAI Chat Completions format
 
@@ -106,14 +106,14 @@
 - fake.zig: the OpenAI route's errors are `{"error":{"message":…,"type":"scripted","code":N}}`.
 - TestEnv: `pub fn oaTextReply(comptime s) []const u8`, `pub fn oaToolReply(a, id, name, input_json) ![]u8`.
 
-- [ ] **Step 1: Write the failing tests** in model.zig:
+- [x] **Step 1: Write the failing tests** in model.zig:
   - `openai_requests_carry_system_messages_tools_and_tool_results`: golden `openaiBody` for system `sys stable`, user [`context`, `list two files`], assistant [`Checking.`, shell `{"command":"ls a"}` as tu_1, read_file `{"path":"b.txt"}` as tu_2], user [result tu_1 `a.txt`, result tu_2 `no such file` (error)], tools shell and read_file, `max_tokens` 1000, no marks: `{"model":"gpt-test","max_tokens":1000,"messages":[{"role":"system","content":"sys stable"},{"role":"user","content":"context\n\nlist two files"},{"role":"assistant","content":"Checking.","tool_calls":[{"id":"tu_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls a\"}"}},{"id":"tu_2","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"b.txt\"}"}}]},{"role":"tool","tool_call_id":"tu_1","content":"a.txt"},{"role":"tool","tool_call_id":"tu_2","content":"no such file"}],"tools":[{"type":"function","function":{"name":"shell","description":"run","parameters":{"type":"object"}}},{"type":"function","function":{"name":"read_file","description":"read","parameters":{"type":"object"}}}]}`; with marks: system `[{"type":"text","text":"sys stable","cache_control":{"type":"ephemeral"}}]`; `max_completion_tokens` with that field; an assistant with only calls → `"content":null`; a user message [result, text] → the tool message, then `{"role":"user","content":"next"}`.
   - `openai_replies_become_text_and_tool_uses`: through the fake: text + call `call_1` shell `{"command":"ls -l"}`, `tool_calls` → [text `Let me check.`, tool_use call_1 shell with that input], stop `tool_use`; `finish_reason: length` → `max_tokens`; `arguments: "{\"command\":"` → `BadReply`; `parseOpenAIReply`: arguments "" → `{}`, an object → its JSON, no id → starts `call_`, content parts joined, usage 100/7/cached 60 → input 40, output 7, cache_read 60.
   - `each_status_maps_to_the_same_message_for_every_provider`: for an omnigate client and an openai client `local`: 401 → KeyRefused, 402 → BudgetSpent, 400 → Rejected, 500 → Upstream, 429 (retry_after 1) twice → RateLimited after 2 requests; omnigate's `failure` texts are 0.3's (`Model budget used up.`, `The model is rate limited; try again later.`, `The model API refused the request: scripted error`, `Model call failed: Upstream scripted error`); local's with " at local" removed equal them; local's 401 with `local` replaced by `omnigate` equals omnigate's.
-- [ ] **Step 2:** run; expect compile errors / failures (`openaiBody`, `parseOpenAIReply`).
-- [ ] **Step 3:** implement.
-- [ ] **Step 4:** whole suite green (+3).
-- [ ] **Step 5:** commit `harness providers: OpenAI Chat Completions requests and replies`.
+- [x] **Step 2:** run; expect compile errors / failures (`openaiBody`, `parseOpenAIReply`).
+- [x] **Step 3:** implement.
+- [x] **Step 4:** whole suite green (+3).
+- [x] **Step 5:** commit `harness providers: OpenAI Chat Completions requests and replies`.
 
 ### Task 4: runs through providers
 
@@ -124,16 +124,16 @@
 - `pub fn modelClient(r: *const Run, value: []const u8, max_tokens: u32) !model.Client` — helpers (`main`/`worker`) and summaries (`memory`) use it.
 - The turn's messages come from `r.client.failure` (Rejected adds today's ". This turn is left out …"); every model line (turn, summary, brief) carries `provider` after `result`; brief's budget line is `failure(BudgetSpent)`.
 
-- [ ] **Step 1: Write the failing tests** in agent.zig:
+- [x] **Step 1: Write the failing tests** in agent.zig:
   - `a_turn_with_a_tool_call_works_through_an_openai_provider`: client openai/bearer `local`; scripts: `oaToolReply("call_1", "recall", {"query":"flats"})`, `oaTextReply("Nothing about flats yet.")` → the answer; request 2: target `/v1/chat/completions`, messages system, user, assistant whose `tool_calls[0].id` is `call_1`, tool with `tool_call_id` `call_1`; the log has the recall tool line.
   - `usage_and_cached_tokens_are_logged_per_provider`: the openai client's reply with usage 100/7/cached 60 → a model line with `"provider":"local"`, `"input_tokens":40`, `"output_tokens":7`, `"cache_read":60`; then the 0.3 client's turn → `"provider":"omnigate"`, `"input_tokens":10`.
   - `a_provider_without_its_key_refuses_calls_with_one_line`: provider `openrouter` (openai, bearer, key "") → answer exactly `Model calls are refused: no openrouter key is stored (harness secret add openrouter).` (no line break), 0 requests.
   - `a_refused_key_is_named_and_kept_out_of_the_log`: bearer key `sk-echoed-test-key-1`, `{"status":401,"echo_key":true}` → the answer names `local` and `harness secret add local`; neither answer nor log holds the key.
   - `a_helper_runs_on_the_provider_its_value_names`: `model_cfg.providers` = omnigate and `local` (openai) at the fake, `worker = "local:gpt-worker"`; a delegate → the helper's request goes to `/v1/chat/completions` with model `gpt-worker`, the parent's to `/v1/messages`.
-- [ ] **Step 2:** run; expect failures (no `provider` field, 0.3 texts for other providers, helper on omnigate).
-- [ ] **Step 3:** implement.
-- [ ] **Step 4:** whole suite green (+5).
-- [ ] **Step 5:** commit `harness providers: helpers, summaries and briefs through providers; provider on model lines`.
+- [x] **Step 2:** run; expect failures (no `provider` field, 0.3 texts for other providers, helper on omnigate).
+- [x] **Step 3:** implement.
+- [x] **Step 4:** whole suite green (+5).
+- [x] **Step 5:** commit `harness providers: helpers, summaries and briefs through providers; provider on model lines`.
 
 ### Task 5: providers in the instance
 
@@ -146,24 +146,31 @@
 - main.zig: `App.secrets` loads omnigate's key by its resolved name and every other provider's key (auth ≠ none) into `named`; `pub fn startNotes(a, set: *const model.Providers, values) ![]const []const u8` — per provider in use: `note: no {P} key stored under "{S}"; model calls will be refused. Run: harness secret add {S}` and `note: no {P} url is set ([model] url in config.ini); model calls will be refused` (0.3's words for omnigate); `secret list` adds `S (P key): stored|not stored` for providers in use or with a section, other than omnigate.
 - session.zig: a model line of a provider other than omnigate reads `Model (P): …`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
   - core.zig `a_model_value_can_name_a_provider_in_routes_definitions_and_steps`: config `model = local:gpt-chat`, `worker_model = openrouter:deepseek/deepseek-chat`, `memory_model = anthropic:claude-haiku-4-5`, `[provider local]` openai/none at `FAKE/v1`, `[provider openrouter] url = FAKE/api/v1`, `[provider anthropic] url = FAKE/v1`; keys `sk-or-test-key-1`, `sk-ant-test-key-1` put in a test store after start, then `/reload` → `Settings reloaded.`; `/status` has `Providers: local (OpenAI Chat Completions, no key needed); openrouter (OpenAI Chat Completions, key stored); anthropic (Anthropic Messages, key stored)`; a chat turn that delegates once: request 1 target `/v1/chat/completions`, model `gpt-chat`, no Authorization; request 2 `/api/v1/chat/completions`, `Bearer sk-or-test-key-1`, model `deepseek/deepseek-chat`; `writeMemories` → a request to `/v1/messages` with `x-api-key` `sk-ant-test-key-1`, model `claude-haiku-4-5`; `pick("openrouter:x/y")` and `modelClient("anthropic:claude-opus-4-1", 100)` (a definition's and a workflow step's value) give openrouter/`x/y` and anthropic/`claude-opus-4-1`; the log has provider local, openrouter and anthropic, neither key.
   - core.zig `a_task_pauses_when_any_provider_says_its_budget_is_spent`: task on `local` (openai/none) answered 402 → `Task NAME is paused`.
   - main.zig `start_notes_name_each_provider_in_use_without_its_key`: default settings, no keys → 0.3's two omnigate notes word for word; all three values on `openrouter:` with no key → only `note: no openrouter key stored under "openrouter"; model calls will be refused. Run: harness secret add openrouter`.
   - session.zig: `render` of a run whose model line has `"provider":"local"` shows `Model (local): 5 in, 2 out`; with `omnigate` or none, `Model: …` as today.
-- [ ] **Step 2:** run; expect failures.
-- [ ] **Step 3:** implement.
-- [ ] **Step 4:** whole suite green (+4).
-- [ ] **Step 5:** commit `harness providers: the instance resolves providers at start and on /reload; /status, start notes and secret list name them`.
+- [x] **Step 2:** run; expect failures.
+- [x] **Step 3:** implement.
+- [x] **Step 4:** whole suite green (+4).
+- [x] **Step 5:** commit `harness providers: the instance resolves providers at start and on /reload; /status, start notes and secret list name them`.
 
 ### Task 6: smoke, README, final checks
 
 **Files:** `scripts/smoke.sh`, `harness/README.md`.
 
-- [ ] **Step 1:** smoke, after "the model got the omnigate key": store `sk-local-smoke-key-1` as `local`, write a config with `model = local:gpt-smoke` and `[provider local]` (openai, `$URL/v1`, bearer), script an OpenAI reply; checks: `secret list` says `local (local key): stored`; `task run check` prints `[check] Price is up.`, its request's target is `/v1/chat/completions` with `Authorization: Bearer sk-local-smoke-key-1`, the log has `"provider":"local"` and not the key. Then the saved config.ini goes back.
-- [ ] **Step 2:** README: "Models and providers" (presets table, `[provider NAME]` keys and defaults, `PROVIDER:MODEL` with Ruling 4's rule, keys via `harness secret add`, errors per provider, no Claude subscription logins: Anthropic's terms forbid third-party apps from using them; not yet: Responses API, Bedrock, Vertex, streaming, images); intro, quick start, config.ini row, helpers' cache note, tasks' budget note, State counts.
-- [ ] **Step 3:** `zig build test` (Debug) and `-Doptimize=ReleaseSafe` green; cross builds and `unit-build` for x86_64-windows, x86_64-linux-musl, aarch64-linux-musl.
-- [ ] **Step 4:** commit `harness providers: smoke check through an OpenAI-format provider; README: models and providers`.
+- [x] **Step 1:** smoke, after "the model got the omnigate key": store `sk-local-smoke-key-1` as `local`, write a config with `model = local:gpt-smoke` and `[provider local]` (openai, `$URL/v1`, bearer), script an OpenAI reply; checks: `secret list` says `local (local key): stored`; `task run check` prints `[check] Price is up.`, its request's target is `/v1/chat/completions` with `Authorization: Bearer sk-local-smoke-key-1`, the log has `"provider":"local"` and not the key. Then the saved config.ini goes back.
+- [x] **Step 2:** README: "Models and providers" (presets table, `[provider NAME]` keys and defaults, `PROVIDER:MODEL` with Ruling 4's rule, keys via `harness secret add`, errors per provider, no Claude subscription logins: Anthropic's terms forbid third-party apps from using them; not yet: Responses API, Bedrock, Vertex, streaming, images); intro, quick start, config.ini row, helpers' cache note, tasks' budget note, State counts.
+- [x] **Step 3:** `zig build test` (Debug) and `-Doptimize=ReleaseSafe` green; cross builds and `unit-build` for x86_64-windows, x86_64-linux-musl, aarch64-linux-musl.
+- [x] **Step 4:** commit `harness providers: smoke check through an OpenAI-format provider; README: models and providers`.
+
+## Done
+
+- Branch `platform/providers`: plan 85e555a; Task 1 ecec912, Task 2 2446100, Task 3 7235b5a, Task 4 c4da419, Task 5 3f8d4eb, Task 6 (smoke, README, this section).
+- Debug and ReleaseSafe: `Build Summary: 8/8 steps succeeded; 501/503 tests passed (2 skipped)` (baseline 483, +18); smoke all ok (56 checks: the two new ones); cross builds and `unit-build` for x86_64-windows, x86_64-linux-musl, aarch64-linux-musl compile. No existing test edited (main.zig lost a duplicate `const model` import in its tests section).
+- Beyond the tasks: the session view (`/session`, `harness log session`) writes `Model (NAME): …` for a provider other than omnigate; the "summary failed" line names its provider too.
+- Left out (the spec's "not in this spec", or for later builders): the Responses API, Bedrock, Vertex, streaming, images; agent definitions and workflow steps themselves (they call `Providers.pick` / `modelClient`); OpenRouter's cache mark goes on the stable instructions only, not on the last message as the Anthropic path does; `/reload` still keeps omnigate's key from the start, as 0.3 did (other providers' keys stored since are read).
 
 ## For the agent definitions builder (gap 1)
 
