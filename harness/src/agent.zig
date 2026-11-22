@@ -299,6 +299,9 @@ pub const Run = struct {
     /// Input tokens this run may use; 0: no limit.
     token_cap: u64 = 0,
     skills_dir: []const u8 = "",
+    /// Where a replaced skill's file is kept (`state/skills/`, as
+    /// definitions keep theirs); "": not kept.
+    skills_state: []const u8 = "",
     /// When the running turn must end; helpers get what is left of it.
     deadline_s: i64 = 0,
     /// Tools of the MCP servers that are running.
@@ -1397,6 +1400,14 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
             const v = jv.parse(a, input_json).?;
             const desc = jv.str(jv.get(v, "description")) orelse "";
             const body = jv.str(jv.get(v, "body")) orelse "";
+            // the file it replaces is kept, the last 10 (as definitions keep theirs)
+            if (r.skills_state.len > 0 and skills.validName(arg)) {
+                const old_path = try std.fs.path.join(a, &.{ r.skills_dir, arg, "SKILL.md" });
+                if (Io.Dir.cwd().readFileAlloc(r.io, old_path, a, .limited(skills.max_description + skills.max_body + 256))) |old| {
+                    agents.keepVersionIn(r.io, r.gpa, try std.fs.path.join(a, &.{ r.skills_state, arg, "versions" }), old) catch |e|
+                        break :blk tools.Output{ .text = try std.fmt.allocPrint(a, "not saved: the skill it replaces could not be kept ({s})", .{@errorName(e)}), .is_error = true };
+                } else |_| {}
+            }
             skills.save(r.io, r.skills_dir, arg, desc, body) catch |e| break :blk tools.Output{ .text = try std.fmt.allocPrint(a, "not saved: {s}", .{@errorName(e)}), .is_error = true };
             break :blk .{ .text = try std.fmt.allocPrint(a, "saved skill {s}", .{arg}) };
         },
@@ -4465,4 +4476,29 @@ test "parallel_holds_for_delegated_runs" {
     if (ms >= 1500) std.debug.print("the refusal took {d} ms\n", .{ms});
     try t.expect(ms < 1500);
     try t.expect(std.mem.indexOf(u8, try f.e.request(10), "the run that delegated it holds that place") != null);
+}
+
+test "a_replaced_skill_is_kept_like_a_definition" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.run.skills_dir = try std.fs.path.join(a, &.{ f.e.dir, "skills" });
+    f.run.skills_state = try std.fs.path.join(a, &.{ f.e.dir, "state", "skills" });
+    try skills.save(t.io, f.run.skills_dir, "deploy", "How to deploy", "make deploy");
+    try f.e.script(1, model.toolReply("tu_1", "skill_save", "{\"name\":\"deploy\",\"description\":\"How to deploy\",\"body\":\"make release\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "skill_save", "{\"name\":\"fresh\",\"description\":\"New one\",\"body\":\"new\"}"));
+    try f.e.script(3, model.textReply("saved"));
+    const r = try f.say("save how to deploy");
+    freeResult(&f.run, r);
+    try t.expectEqual(2, f.asked);
+    try t.expect(std.mem.indexOf(u8, try skills.load(a, t.io, f.run.skills_dir, "deploy"), "make release") != null);
+    // the file it replaced is kept; a new skill replaced nothing
+    var d = try f.e.tmp.dir.openDir(t.io, "state/skills/deploy/versions", .{ .iterate = true });
+    defer d.close(t.io);
+    var it = d.iterate();
+    const first = (try it.next(t.io)).?;
+    try t.expect(std.mem.indexOf(u8, try d.readFileAlloc(t.io, first.name, a, .unlimited), "make deploy") != null);
+    try t.expectEqual(null, try it.next(t.io));
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.access(t.io, "state/skills/fresh", .{}));
 }

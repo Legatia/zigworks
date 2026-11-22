@@ -60,6 +60,8 @@ pub const Paths = struct {
     agents: []const u8,
     /// Each definition's earlier versions, `state/agents/NAME/versions/`.
     agents_state: []const u8,
+    /// Each skill's replaced files, `state/skills/NAME/versions/`.
+    skills_state: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -98,6 +100,7 @@ pub const Paths = struct {
             .conversations = try j(a, &.{ state, "conversations" }),
             .agents = try j(a, &.{ home, "agents" }),
             .agents_state = try j(a, &.{ state, "agents" }),
+            .skills_state = try j(a, &.{ state, "skills" }),
         };
     }
 };
@@ -1709,6 +1712,7 @@ pub const Core = struct {
             .pool = &c.helper_pool,
             .ask_lock = &c.ask_lock,
             .skills_dir = c.paths.skills,
+            .skills_state = c.paths.skills_state,
             .mcp = c.mcp_tools,
             .money = c.cfg.money,
             .money_ledger = &c.money_ledger,

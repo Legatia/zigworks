@@ -26,7 +26,7 @@ standard library (and the system's Security framework on macOS). Models
 are reached only through [omnigate](https://github.com/Legatia/omnigate),
 which holds the provider keys and the budgets.
 
-**State: 0.3.0, tested on macOS by its own tests: 480 unit tests (2 skipped), among
+**State: 0.3.0, tested on macOS by its own tests: 481 unit tests (2 skipped), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 55 checks that drives the real binary against
 stand-ins for omnigate, Telegram, feeds, search and two MCP servers. An
@@ -554,7 +554,8 @@ Skills are folders in the agentskills.io format (`skills/NAME/SKILL.md`
 with `name` and `description`). The agent sees their names and
 descriptions (those its definition's `skills` take), loads one with
 `skill` when it fits, and can save one with
-`skill_save` (asked, showing its name, description and body). `/skills`
+`skill_save` (asked, showing its name, description and body; the file a
+save replaces is kept in `state/skills/NAME/versions/`, the last 10). `/skills`
 lists them, `/skill rm NAME` removes one.
 
 ## The log

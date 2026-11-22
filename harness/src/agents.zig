@@ -719,54 +719,11 @@ pub const Set = struct {
         return std.fmt.bufPrint(buf, "{s}{c}{s}{c}versions", .{ s.state, std.fs.path.sep, name, std.fs.path.sep });
     }
 
-    /// Keeps `text` as the newest of `name`'s versions
-    /// (`20261122T140211Z-001.md`), dropping all but the last 10.
+    /// Keeps `text` as the newest of `name`'s versions, dropping all but
+    /// the last 10.
     fn keepVersion(s: *Set, name: []const u8, text: []const u8) !void {
         var vbuf: [Io.Dir.max_path_bytes]u8 = undefined;
-        const vdir = try s.versionsDir(&vbuf, name);
-        const cwd = Io.Dir.cwd();
-        try cwd.createDirPath(s.io, vdir);
-        var d = try cwd.openDir(s.io, vdir, .{ .iterate = true });
-        defer d.close(s.io);
-        var tb: [20]u8 = undefined;
-        const iso = util.isoTime(&tb, util.nowSeconds(s.io));
-        var stamp: [16]u8 = undefined;
-        var n: usize = 0;
-        for (iso) |c| if (c != '-' and c != ':') {
-            stamp[n] = c;
-            n += 1;
-        };
-        // after the last of this second, so the names sort in time order
-        var last: u32 = 0;
-        var scan = d.iterate();
-        while (try scan.next(s.io)) |e| {
-            if (!std.mem.startsWith(u8, e.name, stamp[0..n]) or !std.mem.endsWith(u8, e.name, ".md")) continue;
-            const num = e.name[@min(n + 1, e.name.len) .. e.name.len - 3];
-            last = @max(last, std.fmt.parseInt(u32, num, 10) catch 0);
-        }
-        var nb: [40]u8 = undefined;
-        const file = try std.fmt.bufPrint(&nb, "{s}-{d:0>3}.md", .{ stamp[0..n], last + 1 });
-        try d.writeFile(s.io, .{ .sub_path = file, .data = text, .flags = .{ .permissions = util.private_file } });
-        // the names sort in time order: all but the last 10 go
-        var names: std.ArrayList([]u8) = .empty;
-        defer {
-            for (names.items) |x| s.gpa.free(x);
-            names.deinit(s.gpa);
-        }
-        var it = d.iterate();
-        while (try it.next(s.io)) |e| if (e.kind == .file and std.mem.endsWith(u8, e.name, ".md")) {
-            const x = try s.gpa.dupe(u8, e.name);
-            names.append(s.gpa, x) catch |err| {
-                s.gpa.free(x);
-                return err;
-            };
-        };
-        std.mem.sort([]u8, names.items, {}, struct {
-            fn lt(_: void, x: []u8, y: []u8) bool {
-                return std.mem.order(u8, x, y) == .lt;
-            }
-        }.lt);
-        if (names.items.len > keep_versions) for (names.items[0 .. names.items.len - keep_versions]) |x| d.deleteFile(s.io, x) catch {};
+        try keepVersionIn(s.io, s.gpa, try s.versionsDir(&vbuf, name), text);
     }
 
     /// How many earlier versions of `name` are kept.
@@ -824,6 +781,55 @@ pub const Set = struct {
 
 /// Versions kept of each definition.
 const keep_versions = 10;
+
+/// Keeps `text` as the newest file of the folder `vdir`
+/// (`20261122T140211Z-001.md`, so the names sort in time order), dropping
+/// all but the last 10. Definitions and skills keep their replaced files so.
+pub fn keepVersionIn(io: Io, gpa: std.mem.Allocator, vdir: []const u8, text: []const u8) !void {
+    const cwd = Io.Dir.cwd();
+    try cwd.createDirPath(io, vdir);
+    var d = try cwd.openDir(io, vdir, .{ .iterate = true });
+    defer d.close(io);
+    var tb: [20]u8 = undefined;
+    const iso = util.isoTime(&tb, util.nowSeconds(io));
+    var stamp: [16]u8 = undefined;
+    var n: usize = 0;
+    for (iso) |c| if (c != '-' and c != ':') {
+        stamp[n] = c;
+        n += 1;
+    };
+    // after the last of this second, so the names sort in time order
+    var last: u32 = 0;
+    var scan = d.iterate();
+    while (try scan.next(io)) |e| {
+        if (!std.mem.startsWith(u8, e.name, stamp[0..n]) or !std.mem.endsWith(u8, e.name, ".md")) continue;
+        const num = e.name[@min(n + 1, e.name.len) .. e.name.len - 3];
+        last = @max(last, std.fmt.parseInt(u32, num, 10) catch 0);
+    }
+    var nb: [40]u8 = undefined;
+    const file = try std.fmt.bufPrint(&nb, "{s}-{d:0>3}.md", .{ stamp[0..n], last + 1 });
+    try d.writeFile(io, .{ .sub_path = file, .data = text, .flags = .{ .permissions = util.private_file } });
+    // the names sort in time order: all but the last 10 go
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |x| gpa.free(x);
+        names.deinit(gpa);
+    }
+    var it = d.iterate();
+    while (try it.next(io)) |e| if (e.kind == .file and std.mem.endsWith(u8, e.name, ".md")) {
+        const x = try gpa.dupe(u8, e.name);
+        names.append(gpa, x) catch |err| {
+            gpa.free(x);
+            return err;
+        };
+    };
+    std.mem.sort([]u8, names.items, {}, struct {
+        fn lt(_: void, x: []u8, y: []u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.lt);
+    if (names.items.len > keep_versions) for (names.items[0 .. names.items.len - keep_versions]) |x| d.deleteFile(io, x) catch {};
+}
 
 /// On macOS and Linux a folder or file other users can write is refused.
 const others_can_write = @import("builtin").os.tag != .windows;
