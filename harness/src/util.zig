@@ -36,6 +36,10 @@ pub fn nowSeconds(io: Io) i64 {
     return @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
 }
 
+pub fn nowMs(io: Io) i64 {
+    return @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
+}
+
 /// "2026-11-19T08:12:00Z".
 pub fn isoTime(buf: *[20]u8, secs: i64) []const u8 {
     const days = @divFloor(secs, 86400);

@@ -998,14 +998,17 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     // send each redirect through the gate
     var env = redirectEnv(r);
     if (r.deadline_s > 0) {
-        const left = r.deadline_s - r.now();
-        if (left <= 0) {
+        // in milliseconds: in whole seconds a call cut a moment before the
+        // deadline's second began would leave "1 s" that isn't there; with
+        // under 0.1 s left no tool is started
+        const left_ms = r.deadline_s * 1000 - util.nowMs(r.io);
+        if (left_ms < 100) {
             if (tool == .money) releaseMoney(r, mt.?, reserved);
             const late: tools.Output = .{ .text = "not run: no time left in this turn", .is_error = true };
             try r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = name, .arg = arg, .is_error = true, .output = late.text });
             return late;
         }
-        const secs: u32 = @intCast(@min(left, std.math.maxInt(u32)));
+        const secs: u32 = @intCast(@min(@divFloor(left_ms + 999, 1000), std.math.maxInt(u32)));
         env.shell_seconds = @min(env.shell_seconds, secs);
         env.browser_seconds = @min(env.browser_seconds, secs);
     }
