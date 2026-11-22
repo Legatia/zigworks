@@ -42,9 +42,10 @@ jobs:
       - if: matrix.project == 'headdesk'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       # harness's Linux sandboxes are bubblewrap (its own AppArmor profile
-      # lets it make user namespaces)
+      # lets it make user namespaces); its remote tests start a sshd of
+      # their own on 127.0.0.1
       - if: matrix.project == 'harness' && runner.os == 'Linux'
-        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends bubblewrap
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends bubblewrap openssh-server
       - run: |
           set -o pipefail
           zig build test --summary all 2>&1 | tee "$RUNNER_TEMP/test.log"

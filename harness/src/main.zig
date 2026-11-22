@@ -13,6 +13,7 @@ const agent = @import("agent.zig");
 const logins = @import("logins.zig");
 const totp = @import("totp.zig");
 const session = @import("session.zig");
+const remote = @import("remote.zig");
 const folders = @import("folders.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
@@ -39,9 +40,10 @@ const usage =
     \\  memory [list|pin|unpin|forget ID]
     \\  snapshot list FOLDER | take FOLDER [LABEL] | changes FOLDER ID | restore FOLDER ID
     \\                             a folder's snapshots, one now, what changed, put it back
-    \\  env list | check NAME | rm NAME
+    \\  env list | check NAME | rm NAME | key NAME
     \\                             where commands can run (environments.ini): list them,
-    \\                             try what a sandbox can reach, remove one's home
+    \\                             try one, remove one's home; a remote's own SSH key
+    \\                             and its host key, kept once you confirm it
     \\  log verify                 check the action log's chain
     \\  log tail [N]               print the last N log lines (default 20)
     \\  log runs [N]               a line per run, the last N (default 20)
@@ -1053,24 +1055,67 @@ fn snapshotCmd(app: *App, args: []const []const u8) !Exit {
     return .ok;
 }
 
-const env_usage = "usage: harness env list | env check NAME | env rm NAME";
+const env_usage = "usage: harness env list | env check NAME | env rm NAME | env key NAME";
 
 fn envArgsOk(rest: []const []const u8) bool {
     if (rest.len == 1) return eql(rest[0], "list");
-    if (rest.len == 2) return eql(rest[0], "check") or eql(rest[0], "rm");
+    if (rest.len == 2) return eql(rest[0], "check") or eql(rest[0], "rm") or eql(rest[0], "key");
     return false;
 }
 
-/// `harness env ...`: the chat's /envs and /env commands, as `harness memory`.
+/// `harness env ...`: the chat's /envs and /env commands, as `harness
+/// memory`; `env key` is here alone, since it asks you in the terminal.
 fn envCmd(app: *App, args: []const []const u8) !Exit {
     if (!envArgsOk(args)) {
         complain(env_usage, .{});
         return .usage;
     }
+    if (eql(args[0], "key")) return envKeyCmd(app, args[1]);
     const text = if (eql(args[0], "list")) "/envs" else try std.fmt.allocPrint(app.arena, "/env {s} {s}", .{ args[0], args[1] });
     const c = try app.open(.env);
     defer c.close();
     try outPrint(app.io, "{s}\n", .{try c.command(app.arena, text)});
+    return .ok;
+}
+
+/// `harness env key NAME`: a remote's own key (made once, in its folder),
+/// the line that authorizes it there, and its host key, kept once you
+/// have compared its fingerprint with the machine's own.
+fn envKeyCmd(app: *App, name: []const u8) !Exit {
+    const c = try app.open(.env);
+    defer c.close();
+    const e = c.env_list.find(name) orelse {
+        complain("no environment {s} in environments.ini (harness env list)", .{name});
+        return .failed;
+    };
+    if (e.kind != .remote) {
+        complain("{s} is a sandbox; keys are for remotes", .{name});
+        return .failed;
+    }
+    const dir = try std.fs.path.join(app.arena, &.{ c.paths.env_dir, name });
+    const key = remote.makeKey(app.io, app.arena, name, dir) catch |err| {
+        complain("can't make its key: {s} (OpenSSH's ssh-keygen is needed)", .{@errorName(err)});
+        return .failed;
+    };
+    if (key.made) try c.log.write(.config, false, .{ .event = "env key made", .name = name, .fingerprint = key.fingerprint });
+    try outPrint(app.io, "{s}'s key{s}: {s}\nPut this line in ~/.ssh/authorized_keys of {s}:\n{s}\n\n", .{ name, if (key.made) " (made now)" else "", key.fingerprint, e.host, key.authorized });
+    const hk = remote.scanHost(app.io, app.arena, e, dir, c.path_var, c.system_vars) catch |err| {
+        complain("can't ask {s} for its host key: {s}", .{ e.host, @errorName(err) });
+        return .failed;
+    };
+    if (hk.lines.len == 0) {
+        complain("{s} (port {d}) gave no host key{s}{s}; run harness env key {s} again when it answers", .{ e.host, e.port, if (hk.why.len > 0) ": " else "", hk.why, name });
+        return .failed;
+    }
+    try outPrint(app.io, "{s} answers with these host keys:\n{s}\nCompare them with the machine's own (there: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub). Keep them? Type yes: ", .{ e.host, hk.fingerprints });
+    const answer = readLine(app, Io.File.stdin()) catch "";
+    if (!eql(std.mem.trim(u8, answer, " \t\r\n"), "yes")) {
+        try outPrint(app.io, "Not kept: commands in {s} are refused until its host key is.\n", .{name});
+        return .failed;
+    }
+    try remote.keepHostKeys(app.io, app.arena, dir, hk.lines);
+    try c.log.write(.config, false, .{ .event = "env host key kept", .name = name, .fingerprints = hk.fingerprints });
+    try outPrint(app.io, "Kept: {s} accepts only these keys. harness env check {s} tries it.\n", .{ name, name });
     return .ok;
 }
 
@@ -1785,6 +1830,7 @@ test {
     _ = @import("folders.zig");
     _ = @import("environments.zig");
     _ = @import("sandbox.zig");
+    _ = @import("remote.zig");
     _ = @import("snapshots.zig");
     _ = @import("sock.zig");
     _ = @import("store.zig");

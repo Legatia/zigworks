@@ -73,3 +73,42 @@ Rulings:
 For the Mac session: the macOS runner is `run`'s third branch (spawn
 `sandbox-exec -p PROFILE /bin/sh -c COMMAND` in its own process group,
 then `tools.runChild`), and `unavailable` returns null once it is in.
+
+## 2. The SSH remote (branch `win/remote`, on `win/sandbox`)
+
+Built: `remote.zig`. `run` starts the system's ssh (`-F none -T`, batch
+mode, this environment's key alone, no agent, no password, no
+forwarding, no control socket, the kept host key alone, global known
+hosts pointed at it too) with a POSIX sh wrapper as the one remote
+command: it starts where `dir` says (125 when the folder isn't there),
+runs the command with /dev/null as input, ends the whole session's
+process group when ssh's input closes (a stop or the time limit ends ssh
+here; the connection closing ends the remote side), ends what the command
+left at its end, and exits with the command's code. `harness env key NAME`
+makes the key (ed25519, `harness-NAME`), prints the `restrict` line for
+authorized_keys, gets the host key and keeps it once the owner types yes.
+`/envs` says whether a remote is ready; `/env check NAME` runs one command
+there; `/env rm NAME` removes the key and the kept host key.
+
+Tests: `remote_ssh_command_is_locked_down`, the wrapper run by a local sh
+(quoting, exit codes, the folder; its input closing ends the group, its
+end ends what the command left), `remote_stop_ends_the_remote_command`
+against a sshd of the test's own on 127.0.0.1 (Linux, when sshd is
+there: key made, host key got and kept, exit code and folder, a stop
+leaves nothing, another host key refused). By hand: harness on Windows
+(Windows' ssh.exe) against a sshd in WSL: env key, env check, env rm.
+
+Rulings:
+
+- The host key is got with ssh itself, accept-new into a scratch file,
+  not ssh-keyscan: Windows' ssh-keyscan fails the key exchange OpenSSH
+  9.6 servers offer ("unsupported KEX method sntrup761x25519"). Only the
+  key type ssh agrees on is kept, which is the one it checks.
+- Paths in ssh's -o values are quoted, with forward slashes on Windows
+  (OpenSSH reads `\` as an escape there; a user name with a space would
+  split the value).
+- A remote's login shell must be POSIX: the remote command is single
+  quoted for one.
+- `env key` writes to the log (key made, host key kept) through Core, so
+  it can't run while `harness run` holds the folder, like the other
+  commands that open it.

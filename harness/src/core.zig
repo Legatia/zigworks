@@ -28,6 +28,7 @@ const session = @import("session.zig");
 const folders_mod = @import("folders.zig");
 const environments_mod = @import("environments.zig");
 const sandbox = @import("sandbox.zig");
+const remote = @import("remote.zig");
 const snapshots_mod = @import("snapshots.zig");
 const Io = std.Io;
 
@@ -3373,7 +3374,11 @@ pub const Core = struct {
                 for (e.read, 0..) |r, i| try out.print(a, "{s}{s}", .{ if (i == 0) ", reads " else ", ", r });
                 try out.print(a, "; {s}\n", .{missing orelse "ready"});
             },
-            .remote => try out.print(a, "{s}: remote {s}, port {d}{s}{s}; remotes are not built yet\n", .{ e.name, e.host, e.port, if (e.dir.len > 0) ", starts in " else "", e.dir }),
+            .remote => {
+                const dir = try std.fs.path.join(a, &.{ c.paths.env_dir, e.name });
+                const why = try remote.notReady(c.io, a, e.name, dir);
+                try out.print(a, "{s}: remote {s}, port {d}{s}{s}; {s}\n", .{ e.name, e.host, e.port, if (e.dir.len > 0) ", starts in " else "", e.dir, why orelse "ready" });
+            },
         };
         try out.print(a, "Default: {s}.", .{c.env_list.default});
         for (c.env_list.pins, 0..) |p, i| try out.print(a, "{s}{s} runs in {s}", .{ if (i == 0) " Pinned: " else ", ", p.who, p.env });
@@ -3399,11 +3404,19 @@ pub const Core = struct {
     fn envCheck(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
         if (std.mem.eql(u8, name, "host")) return "host is this machine: commands there see what you see.";
         const e = c.env_list.find(name) orelse return std.fmt.allocPrint(a, "No environment {s}; /envs lists them.", .{name});
-        if (e.kind != .sandbox) return std.fmt.allocPrint(a, "{s} is a remote: checking remotes is not built yet.", .{name});
-        if (try sandbox.unavailable(c.io, a)) |why| return std.fmt.allocPrint(a, "{s} can't run here: {s}.", .{ name, why });
         var stop: std.atomic.Value(bool) = .init(false);
-        const tenv: tools.Env = .{ .gpa = c.gpa, .io = c.io, .workspace = c.workspace, .tool_output_bytes = 2048, .shell_seconds = 15, .stop = &stop, .path_var = c.path_var, .system_vars = c.system_vars };
+        const tenv: tools.Env = .{ .gpa = c.gpa, .io = c.io, .workspace = c.workspace, .tool_output_bytes = 2048, .shell_seconds = 30, .stop = &stop, .path_var = c.path_var, .system_vars = c.system_vars };
         const dir = try std.fs.path.join(a, &.{ c.paths.env_dir, name });
+        if (e.kind == .remote) {
+            // one command there: what answers, and from where
+            const o = try remote.run(tenv, a, .{ .env = e, .command = "echo reached; uname -snm; pwd", .dir = dir, .path_var = c.path_var, .system_vars = c.system_vars });
+            const said = std.mem.trim(u8, o.text, " \r\n");
+            return if (o.is_error)
+                std.fmt.allocPrint(a, "{s} (remote over ssh): not reached.\n{s}", .{ name, said })
+            else
+                std.fmt.allocPrint(a, "{s} (remote over ssh): {s}", .{ name, said });
+        }
+        if (try sandbox.unavailable(c.io, a)) |why| return std.fmt.allocPrint(a, "{s} can't run here: {s}.", .{ name, why });
         const req: sandbox.Request = .{
             .env = e,
             .command = "",
@@ -3455,13 +3468,18 @@ pub const Core = struct {
         if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire))
             return "Not now: a run is going. Send /env rm again when nothing is running.";
         const dir = try std.fs.path.join(a, &.{ c.paths.env_dir, name });
-        sandbox.remove(c.io, a, dir, try sandbox.profileName(a, c.paths.home, name)) catch |e| return std.fmt.allocPrint(a, "Not removed: {s}.", .{@errorName(e)});
+        // a remote's folder holds its key and kept host key; a sandbox's
+        // its home (and on Windows it has an AppContainer)
+        const is_remote = if (c.env_list.find(name)) |e| e.kind == .remote else false;
+        const profile = if (is_remote) "" else try sandbox.profileName(a, c.paths.home, name);
+        sandbox.remove(c.io, a, dir, profile) catch |e| return std.fmt.allocPrint(a, "Not removed: {s}.", .{@errorName(e)});
         const dropped = c.snaps.drop(a, try std.fmt.allocPrint(a, "env:{s}", .{name})) catch 0;
         if (dropped > 0) _ = c.snaps.prune(a, c.folderRoles()) catch {};
         try c.log.write(.config, false, .{ .event = "env removed", .name = name, .snapshots = dropped });
         const plural = if (dropped == 1) "" else "s";
-        const access = if (builtin.os.tag == .windows) " and its AppContainer with its access" else "";
+        const access = if (is_remote) "" else if (builtin.os.tag == .windows) " and its AppContainer with its access" else "";
         const still = if (c.env_list.find(name) != null) " It is still in environments.ini: take its section out, then /reload." else "";
+        if (is_remote) return std.fmt.allocPrint(a, "Removed {s}: its key and its kept host key (take the key's line out of the remote's authorized_keys too).{s}", .{ name, still });
         return std.fmt.allocPrint(a, "Removed {s}: its home, {d} snapshot{s}{s}.{s}", .{ name, dropped, plural, access, still });
     }
 

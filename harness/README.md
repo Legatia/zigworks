@@ -450,10 +450,29 @@ home, its snapshots (`env:NAME`) and, on Windows, its AppContainer and
 the access it was given. CLI: `harness env list`, `env check NAME`, `env
 rm NAME`. Names: a-z, 0-9, `-` and `_`, up to 32.
 
+A remote runs commands on another machine with a POSIX shell (Linux,
+macOS, BSD) through this machine's OpenSSH:
+
+```ini
+[buildbox]
+kind = remote
+host = agent@10.0.0.5    ; port = 22
+dir = /home/agent/work   ; where its commands start
+```
+
+`harness env key NAME` makes its own key (in `state/env/NAME`, never
+yours), prints the line to put in the remote's `~/.ssh/authorized_keys`
+(`restrict`: no forwarding, no terminal), then asks the remote for its
+host key: compare the fingerprint with the machine's own and type yes,
+and only that key is accepted from then on. Harness's ssh reads no
+config file and uses no agent or password. A stop or the time limit ends
+ssh here, and the command and what it started end there. `/env check
+NAME` runs one command on it; `/env rm NAME` removes its key and the kept
+host key.
+
 For now the agent's commands still run on host: environments are read,
 checked and can be tried, and the gate already takes `shell@NAME` rules,
-but runs don't pick an environment yet. Remotes (`kind = remote`, over
-SSH) are read and checked, not run.
+but runs don't pick an environment yet.
 
 ## Helpers
 
