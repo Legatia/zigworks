@@ -185,35 +185,25 @@ job with the helper from section 1 (that document's point 3), and mind the
 I15, K3, K9-K16, K18) change cdp.zig, web.zig and page.zig: read them
 after the merge before porting the pipe code.
 
-## 7. Three tests that fail on Windows in CI (run 44966458812, 0b65768)
+## 7. CI on Windows after the audit (run 45005072805, cfe408b)
 
-They pass on macOS and Linux. Run `zig build test --summary all` in
-`harness/` on Windows and fix each; the first two now print what went wrong.
+Fixed from here, checked in CI: a plain `write_file` failed with
+AccessDenied (Windows refuses to stat a handle opened only to write;
+tools.zig `writeNoFollow` now opens with read access), and every check of
+the turn's time is now in milliseconds.
 
-1. `tools.test.files_confined_to_workspace` (tools.zig, "write_file said: …")
-   and `agent.test.tool_call_then_answer` ("request 2: …"): a plain
-   `write_file` of a new file (`notes/a.txt`, `a.txt`) comes back as an
-   error. Before the audit it worked on Windows. What changed for writes
-   (commit d2214d0, "never written through a symlink"):
-   - tools.zig `.write_file`: `gate.confined` is called a second time after
-     the folders are made, and a result with `.link` set is refused
-     ("a symbolic link: files are not written through one");
-   - gate.zig `isLink` uses `statFile(.., .{ .follow_symlinks = false })`;
-   - tools.zig `writeNoFollow`: `createFile(.exclusive = true)`, then on an
-     existing file `statFile(.follow_symlinks = false)` and
-     `openFile(.follow_symlinks = false)`, then `f.stat()` must say `.file`.
-   One of these behaves differently on Windows (a guess to check first:
-   `isLink` or `f.stat().kind`). Done when both tests pass and a write
-   through a symlink or junction in the workspace is still refused
-   (`write_file_never_writes_through_a_symlink` and
-   `a_symlink_whose_target_is_missing_is_refused_and_written_files_are_never_links`
-   skip on Windows today — make them run there if Windows can make links).
-2. `agent.test.a_fetch_and_a_web_action_get_only_what_is_left_of_the_turn`
-   (agent.zig): a turn of 1 s with a fetch of a page delayed 4 s took over
-   2.5 s on Windows. The turn's time and /stop are checked every 100 ms in
-   socket waits (sock.zig, commit 9faca8e); on Windows the receive wait
-   probably isn't cut. Done when the test passes: a fetch ends when the
-   turn's time is up and on /stop, on Windows too.
+Left: `agent.test.a_fetch_and_a_web_action_get_only_what_is_left_of_the_turn`
+passes in the Debug run on Windows but failed in the ReleaseSafe run
+(`zig build test -Doptimize=ReleaseSafe`), where a failed check prints no
+trace. It now prints how long the 1 s turn took and its log. Most likely the
+receive wait of a fetch is not cut at the turn's end on Windows (sock.zig
+checks the turn's time and /stop every 100 ms; commit 9faca8e), so the turn
+can run past 2.5 s. Done when the test passes in both runs, and a fetch on
+Windows ends when the turn's time is up and on /stop.
+
+Also still open on Windows: `write_file_never_writes_through_a_symlink` and
+`a_symlink_whose_target_is_missing_is_refused_and_written_files_are_never_links`
+skip there; make them run if Windows can make the links (junctions count).
 
 ## Tests that skip on Windows (and their checks above)
 

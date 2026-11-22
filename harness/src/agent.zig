@@ -2045,8 +2045,12 @@ test "a_fetch_and_a_web_action_get_only_what_is_left_of_the_turn" {
     const started = Io.Clock.awake.now(t.io);
     const r = try f.say("read it");
     freeResult(&f.run, r);
-    try t.expect(started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2500);
+    const took_ms = started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
     const log = try f.logText();
+    // said in words too: an optimized build shows no trace of a failed check
+    if (took_ms >= 2500 or std.mem.indexOf(u8, log, "the turn's time is up") == null)
+        std.debug.print("a 1 s turn took {d} ms; log:\n{s}\n", .{ took_ms, util.cut(log, 6000) });
+    try t.expect(took_ms < 2500);
     try t.expect(std.mem.indexOf(u8, log, "the turn's time is up") != null);
     // the web call never runs: refused for want of time by the gate ("no
     // time left in the turn to ask the owner") or before the tool ("no time
