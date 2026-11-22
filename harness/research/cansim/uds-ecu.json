@@ -1,0 +1,16 @@
+{
+    "CURRENT_ECU": "BMS",
+
+    "BMS": {
+        "func_req_id": "",
+        "phy_req_id": "0x7E4",
+        "phy_resp_id": "0x7EC",
+        "DID_No_Security": {
+            "0x0101": "made-up battery data: SOC 67.5%, SOH 98.2%, 22 C",
+            "0xF18B": "2026.11.22"
+        },
+        "DID_Security_03": {},
+        "DID_Security_19": {},
+        "DID_IO_Control": []
+    }
+}
