@@ -344,6 +344,10 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
     const from_stdin = sa.stdin;
     const stdin = Io.File.stdin();
     const tty = stdin.isTty(app.io) catch false;
+    if (Echo.msysTerminal(stdin) or (tty and !Echo.canHide(stdin))) {
+        complain("{s}", .{would_show});
+        return .usage;
+    }
     if (!tty and !from_stdin) {
         complain("type the value at a terminal, or pass --stdin to read it from a pipe", .{});
         return .usage;
@@ -491,6 +495,10 @@ fn loginCmd(app: *App, args: []const []const u8) !Exit {
     }
     const stdin = Io.File.stdin();
     const tty = stdin.isTty(app.io) catch false;
+    if (Echo.msysTerminal(stdin) or (tty and !Echo.canHide(stdin))) {
+        complain("{s}", .{would_show});
+        return .usage;
+    }
     if (!tty and !from_stdin) {
         complain("type the values at a terminal, or pass --stdin to read two lines (password, TOTP secret) from a pipe", .{});
         return .usage;
@@ -1050,21 +1058,60 @@ fn readLineEof(app: *App, f: Io.File, ended: *bool) ![]u8 {
     return v;
 }
 
+/// Why a secret is not read at a terminal that can't hide it (Windows).
+const would_show = "this terminal would show what you type (Git Bash and other MSYS terminals do): type it in a Windows console (cmd, PowerShell, Windows Terminal), or pipe it in with --stdin; nothing stored";
+
 /// Terminal echo, off while a value is typed.
 const Echo = struct {
+    /// What to put back; null when nothing was changed.
     saved: Saved,
     file: Io.File,
-    const Saved = if (builtin.os.tag == .windows) u32 else ?std.posix.termios;
+    const Saved = if (builtin.os.tag == .windows) ?u32 else ?std.posix.termios;
     const k32 = struct {
         extern "kernel32" fn GetConsoleMode(h: std.os.windows.HANDLE, mode: *u32) callconv(.winapi) std.os.windows.BOOL;
         extern "kernel32" fn SetConsoleMode(h: std.os.windows.HANDLE, mode: u32) callconv(.winapi) std.os.windows.BOOL;
+        extern "kernel32" fn GetFileType(h: std.os.windows.HANDLE) callconv(.winapi) u32;
+        extern "kernel32" fn GetFileInformationByHandleEx(h: std.os.windows.HANDLE, class: c_int, info: *anyopaque, size: u32) callconv(.winapi) std.os.windows.BOOL;
     };
+
+    /// Windows: whether `f` is the terminal of an MSYS or Cygwin program,
+    /// as Git Bash's mintty gives one: a pipe named \msys-…-ptyN-… or
+    /// \cygwin-…-ptyN-… (what is typed there shows, whatever we do).
+    fn msysTerminal(f: Io.File) bool {
+        if (builtin.os.tag != .windows) return false;
+        if (k32.GetFileType(f.handle) != 3) return false; // FILE_TYPE_PIPE
+        // FILE_NAME_INFO: the name's length in bytes, then the name (UTF-16)
+        var info: [4 + 2 * 260]u8 align(4) = undefined;
+        if (!k32.GetFileInformationByHandleEx(f.handle, 2, &info, info.len).toBool()) return false; // FileNameInfo
+        const len = std.mem.readInt(u32, info[0..4], .little);
+        if (len > info.len - 4) return false;
+        var wide: [260]u16 = undefined;
+        const n = len / 2;
+        for (0..n) |i| wide[i] = std.mem.readInt(u16, info[4 + 2 * i ..][0..2], .little);
+        return msysPtyName(wide[0..n]);
+    }
+
+    fn msysPtyName(name: []const u16) bool {
+        const L = std.unicode.utf8ToUtf16LeStringLiteral;
+        return (std.mem.startsWith(u16, name, L("\\msys-")) or std.mem.startsWith(u16, name, L("\\cygwin-"))) and
+            std.mem.indexOf(u16, name, L("-pty")) != null;
+    }
+
+    /// Whether what is typed at the terminal `f` can be kept off the
+    /// screen. Windows: a console can; the terminals of Git Bash and other
+    /// MSYS or Cygwin programs (mintty) can't, since their input reaches us
+    /// through a pipe the console API can't switch the echo off for.
+    fn canHide(f: Io.File) bool {
+        if (builtin.os.tag != .windows) return true;
+        var mode: u32 = 0;
+        return k32.GetConsoleMode(f.handle, &mode).toBool();
+    }
 
     fn off(f: Io.File) Echo {
         if (builtin.os.tag == .windows) {
             var mode: u32 = 0;
-            _ = k32.GetConsoleMode(f.handle, &mode);
-            _ = k32.SetConsoleMode(f.handle, mode & ~@as(u32, 0x0004)); // ENABLE_ECHO_INPUT
+            if (!k32.GetConsoleMode(f.handle, &mode).toBool()) return .{ .saved = null, .file = f };
+            if (!k32.SetConsoleMode(f.handle, mode & ~@as(u32, 0x0004)).toBool()) return .{ .saved = null, .file = f }; // ENABLE_ECHO_INPUT
             return .{ .saved = mode, .file = f };
         }
         const old = std.posix.tcgetattr(f.handle) catch return .{ .saved = null, .file = f };
@@ -1076,7 +1123,7 @@ const Echo = struct {
 
     fn restore(e: *Echo) void {
         if (builtin.os.tag == .windows) {
-            _ = k32.SetConsoleMode(e.file.handle, e.saved);
+            if (e.saved) |mode| _ = k32.SetConsoleMode(e.file.handle, mode);
             return;
         }
         if (e.saved) |old| std.posix.tcsetattr(e.file.handle, .FLUSH, old) catch {};
@@ -1521,6 +1568,34 @@ test {
     _ = @import("web.zig");
     _ = @import("url.zig");
     _ = @import("proc.zig");
+}
+
+test "msys_and_cygwin_terminals_are_known_by_their_pipe_names" {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    try std.testing.expect(Echo.msysPtyName(L("\\msys-1888ae32e00d56aa-pty0-from-master")));
+    try std.testing.expect(Echo.msysPtyName(L("\\cygwin-1888ae32e00d56aa-pty3-to-master")));
+    // a pipe of bash's (`a | b`) is not a terminal, nor is anyone else's
+    try std.testing.expect(!Echo.msysPtyName(L("\\msys-1888ae32e00d56aa-pipe-0x15")));
+    try std.testing.expect(!Echo.msysPtyName(L("\\zig-childprocess-1234-pty")));
+    try std.testing.expect(!Echo.msysPtyName(L("")));
+}
+
+test "a_pipe_named_like_a_git_bash_terminal_is_one_and_a_plain_pipe_is_not" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const k = struct {
+        extern "kernel32" fn CreateNamedPipeW(name: [*:0]const u16, open_mode: u32, pipe_mode: u32, max: u32, out_size: u32, in_size: u32, timeout: u32, sa: ?*anyopaque) callconv(.winapi) std.os.windows.HANDLE;
+    };
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    const invalid: std.os.windows.HANDLE = @ptrFromInt(std.math.maxInt(usize));
+    // the end a program reads typed input from: the pipe's server end
+    const pty = k.CreateNamedPipeW(L("\\\\.\\pipe\\msys-harnesstest01-pty0-from-master"), 1, 0, 1, 4096, 4096, 0, null);
+    try std.testing.expect(pty != invalid);
+    defer std.os.windows.CloseHandle(pty);
+    try std.testing.expect(Echo.msysTerminal(.{ .handle = pty, .flags = .{ .nonblocking = false } }));
+    const plain = k.CreateNamedPipeW(L("\\\\.\\pipe\\harnesstest01-plain"), 1, 0, 1, 4096, 4096, 0, null);
+    try std.testing.expect(plain != invalid);
+    defer std.os.windows.CloseHandle(plain);
+    try std.testing.expect(!Echo.msysTerminal(.{ .handle = plain, .flags = .{ .nonblocking = false } }));
 }
 
 test "the_terminal_offers_only_the_answers_the_question_has" {
