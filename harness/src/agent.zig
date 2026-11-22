@@ -16,6 +16,7 @@ const web_mod = @import("web.zig");
 const logins_mod = @import("logins.zig");
 const store_mod = @import("store.zig");
 const masks_mod = @import("masks.zig");
+const who_mod = @import("who.zig");
 const Io = std.Io;
 
 /// `unsent`: the question did not get to the owner (a part or its buttons
@@ -185,6 +186,13 @@ pub const Run = struct {
     switches: *const Switches = &no_switches,
     /// What the run is, for the log ("chat", "task btc-watch", …).
     label: []const u8 = "chat",
+    /// Who started the run and its definition; a helper's names the run
+    /// that delegated it.
+    who: who_mod.Who = .{},
+    /// The run's id in the log: its first line's seq; 0 until written.
+    rid: u64 = 0,
+    /// The id of the run that delegated this one.
+    parent_rid: ?u64 = null,
     extra_instructions: []const u8 = "",
     /// Where helpers and summaries get their models; null: no `delegate`,
     /// and long conversations are cut instead of summarised.
@@ -249,6 +257,21 @@ pub const Run = struct {
 
     pub fn autoRecall(r: *const Run) bool {
         return r.auto_recall and r.switches.auto_recall.load(.acquire);
+    }
+
+    /// Writes one of the run's lines to the log: each carries its id and
+    /// label, its first also who started it, its definition and the run
+    /// that delegated it, gate and tool lines its definition.
+    pub fn logRun(r: *Run, kind: log_mod.Kind, private: bool, fields: anytype) !void {
+        const first = r.rid == 0;
+        const seq = try r.log.writeRun(kind, private, .{
+            .rid = r.rid,
+            .run = r.label,
+            .by = if (first) r.who.by else null,
+            .agent = if (first or kind == .gate or kind == .tool) r.who.agent else null,
+            .parent = if (first) r.parent_rid else null,
+        }, fields);
+        if (first) r.rid = seq;
     }
 
     /// Whether this run may use `tool` at all (helpers get a subset).
@@ -754,6 +777,8 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const started = r.now();
+    // a turn is one run: its first line gives it a new id
+    r.rid = 0;
     // a turn gets at least turn_seconds: deadlines are whole seconds, so
     // its end is rounded up (rounded down, a turn begun late in a second
     // lost up to a second of it, and a 1 s turn could get nothing)
@@ -769,7 +794,7 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
             for (ids) |id| try r.log.write(.memory, false, .{ .event = "mention", .id = id });
         }
     }
-    try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .text = user_text });
+    try r.logRun(.turn, r.isPrivate(), .{ .text = user_text });
 
     const tn = try conv.begin();
     // a turn that fails half way could leave a tool call without its result,
@@ -864,13 +889,13 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
                 }),
                 else => try std.fmt.allocPrint(a, "Model call failed: {s} {s}", .{ @errorName(e), r.client.lastError() }),
             };
-            try r.log.write(.model, false, .{ .run = r.label, .result = @errorName(e), .detail = r.client.lastError() });
+            try r.logRun(.model, false, .{ .result = @errorName(e), .detail = r.client.lastError() });
             result.ended_by = try r.gpa.dupe(u8, why);
             rejected = e == error.Rejected;
             break;
         };
         used_tokens += reply.input_tokens + reply.cache_read_tokens + reply.cache_write_tokens;
-        try r.log.write(.model, false, .{ .run = r.label, .result = "ok", .stop_reason = reply.stop_reason, .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens, .cache_read = reply.cache_read_tokens, .cache_write = reply.cache_write_tokens });
+        try r.logRun(.model, false, .{ .result = "ok", .stop_reason = reply.stop_reason, .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens, .cache_read = reply.cache_read_tokens, .cache_write = reply.cache_write_tokens });
         // stopped while the model was answering: its answer is dropped
         if (r.env.stop.load(.acquire)) {
             result.stopped = true;
@@ -896,7 +921,7 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
             if (b != .tool_use) continue;
             const u = b.tool_use;
             if (cut) {
-                try r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = u.name, .event = "not run: the reply was cut at max_tokens" });
+                try r.logRun(.tool, r.isPrivate(), .{ .tool = u.name, .event = "not run: the reply was cut at max_tokens" });
                 try results.append(a, .{ .tool_result = .{ .id = u.id, .content = cut_note, .is_error = true } });
                 continue;
             }
@@ -920,7 +945,7 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
         result.text = try r.gpa.dupe(u8, why);
     };
     const dropped = try compact(r, conv);
-    try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .answer = result.text, .steps = result.steps, .ended_by = result.ended_by, .dropped_turns = dropped });
+    try r.logRun(.turn, r.isPrivate(), .{ .answer = result.text, .steps = result.steps, .ended_by = result.ended_by, .dropped_turns = dropped });
     return result;
 }
 
@@ -964,7 +989,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         w.env.deadline_s = r.deadline_s;
         const out = try w.run(a, input_json);
         // the model's input, placeholders and all: never a value
-        try r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = name, .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text });
+        try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text });
         return out;
     }
     const arg = switch (tool) {
@@ -977,7 +1002,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     var reserved: Reservation = .{};
     if (tool == .money) {
         if (moneyCheck(r, a, mt.?, input_json, now_s, &reserved)) |why| {
-            try r.log.write(.gate, r.isPrivate(), .{ .run = r.label, .tool = name, .decision = "deny", .why = why, .arg = arg });
+            try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
             return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
         }
     }
@@ -1011,7 +1036,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         if (left_ms < 100) {
             if (tool == .money) releaseMoney(r, mt.?, reserved);
             const late: tools.Output = .{ .text = "not run: no time left in this turn", .is_error = true };
-            try r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = name, .arg = arg, .is_error = true, .output = late.text });
+            try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .is_error = true, .output = late.text });
             return late;
         }
         const secs: u32 = @intCast(@min(@divFloor(left_ms + 999, 1000), std.math.maxInt(u32)));
@@ -1079,7 +1104,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         },
         else => try tools.run(env, a, tool, input_json),
     };
-    try r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text });
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text });
     return out;
 }
 
@@ -1103,10 +1128,10 @@ fn redirectAllow(ctx: *anyopaque, a: std.mem.Allocator, url: []const u8, known_h
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        break :blk r.gate.decide(a, .fetch, url, r.now(), .{});
+        break :blk r.gate.decide(a, .fetch, url, r.now(), .{ .who = r.who });
     };
     const refused = d.action == .deny;
-    r.log.write(.gate, r.isPrivate(), .{ .run = r.label, .tool = "fetch", .decision = if (refused) "deny" else "allow", .why = if (refused) d.why else "a redirect on a host this call reached", .arg = url }) catch {};
+    r.logRun(.gate, r.isPrivate(), .{ .tool = "fetch", .decision = if (refused) "deny" else "allow", .why = if (refused) d.why else "a redirect on a host this call reached", .arg = url }) catch {};
     return if (refused) d.why else null;
 }
 
@@ -1123,12 +1148,13 @@ pub const max_question = 12 * 1024;
 /// logged. Null when the call may run, else why not. `detail`: what the
 /// owner sees besides the argument (a file's content).
 fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, now_s: i64) !?[]const u8 {
+    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who };
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        break :blk r.gate.decide(a, tool, arg, now_s, .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled });
+        break :blk r.gate.decide(a, tool, arg, now_s, ctx);
     };
-    noteSkipped(r, a, tool, name, arg, now_s, d);
+    noteSkipped(r, a, tool, name, arg, now_s, d, ctx);
     var action = d.action;
     var why = d.why;
     // files the agent wrote since the owner last allowed a command: one
@@ -1185,8 +1211,10 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
                 why = "allowed for 24 hours by the owner";
                 r.lock.lockUncancelable(r.io);
                 defer r.lock.unlock(r.io);
-                // the form the gate matches (for files, the path inside the workspace)
-                try r.gate.grants.add(tool, gate.grantKey(tool, d.subject), now_s + 86400);
+                // the form the gate matches (for files, the path inside the
+                // workspace), for the definition that asked
+                const definition = try std.fmt.allocPrint(a, "agent:{s}", .{r.who.agent});
+                try r.gate.grants.addFor(tool, ctx.env, gate.grantKey(tool, d.subject), definition, now_s + 86400);
                 if (r.grants_path) |p| r.gate.grants.save(r.io, p, now_s) catch {};
             },
             .deny => why = "denied by the owner",
@@ -1196,7 +1224,7 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
         // the owner saw those files and allowed a command all the same
         if (action == .allow) if (wrote) |wr| r.written.?.clear(wr.upto);
     }
-    try r.log.write(.gate, r.isPrivate(), .{ .run = r.label, .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
+    try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
     return if (action == .allow) null else why;
 }
 
@@ -1404,14 +1432,18 @@ pub const Written = struct {
 
 /// Notes a call refused only because nobody could approve it: the gate
 /// said ask with no one to ask, or turned ask into deny in a scheduled run.
-fn noteSkipped(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, now_s: i64, d: gate.Decision) void {
+fn noteSkipped(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, now_s: i64, d: gate.Decision, ctx: gate.Ctx) void {
     const s = r.skipped orelse return;
     const unattended = switch (d.action) {
         .ask => r.asker == null,
         .deny => r.scheduled and blk: {
+            // the same call where someone could answer
+            var attended = ctx;
+            attended.scheduled = false;
+            attended.money_unattended = false;
             r.lock.lockUncancelable(r.io);
             defer r.lock.unlock(r.io);
-            break :blk r.gate.decide(a, tool, arg, now_s, .{}).action == .ask;
+            break :blk r.gate.decide(a, tool, arg, now_s, attended).action == .ask;
         },
         .allow => false,
     };
@@ -1432,7 +1464,7 @@ fn webSecret(ctx: *anyopaque, name: []const u8, value: []const u8) void {
 
 fn webNote(ctx: *anyopaque, event: []const u8, login: []const u8, detail: []const u8) void {
     const r: *Run = @ptrCast(@alignCast(ctx));
-    r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = "web", .event = event, .login = login, .detail = detail }) catch {};
+    r.logRun(.tool, r.isPrivate(), .{ .tool = "web", .event = event, .login = login, .detail = detail }) catch {};
 }
 
 // ---- MCP calls and money ----
@@ -1501,7 +1533,7 @@ fn releaseMoney(r: *Run, m: *const McpTool, res: Reservation) void {
     l.mutex.lockUncancelable(r.io);
     defer l.mutex.unlock(r.io);
     l.release(r.io, m.server.name, res) catch |e|
-        r.log.write(.gate, false, .{ .run = r.label, .tool = m.def.name, .event = "money record not saved", .why = @errorName(e) }) catch {};
+        r.logRun(.gate, false, .{ .tool = m.def.name, .event = "money record not saved", .why = @errorName(e) }) catch {};
 }
 
 fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, reserved: Reservation) !tools.Output {
@@ -1642,6 +1674,9 @@ fn helperRun(h: *Helper) !void {
     w.client = &client;
     w.helper = true;
     w.label = std.fmt.bufPrint(&label_buf, "{s}/h{d}", .{ util.cut(p.label, 40), h.n }) catch "helper";
+    // started by what started its parent, delegated by its parent's definition
+    w.who = .{ .agent = "helper", .by = p.who.by, .parent = &p.who };
+    w.parent_rid = if (p.rid != 0) p.rid else null;
     w.allowed = h.task.tools;
     w.auto_recall = false;
     w.top_size = 0;
@@ -1682,15 +1717,15 @@ fn compact(r: *Run, conv: *Conversation) !usize {
             conv.dropOldest(n);
             conv.lost += sum.left_out;
             gone = n;
-            try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .event = "summarised", .turns = n - sum.left_out });
-            if (sum.left_out > 0) try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .event = "dropped unsummarised", .turns = sum.left_out, .summary = true });
+            try r.logRun(.turn, r.isPrivate(), .{ .event = "summarised", .turns = n - sum.left_out });
+            if (sum.left_out > 0) try r.logRun(.turn, r.isPrivate(), .{ .event = "dropped unsummarised", .turns = sum.left_out, .summary = true });
         } else |e| {
-            try r.log.write(.model, false, .{ .run = r.label, .event = "summary failed", .result = @errorName(e) });
+            try r.logRun(.model, false, .{ .event = "summary failed", .result = @errorName(e) });
         }
     }
     // still over (or no summary): the oldest go whole, and it is said
     const trimmed = conv.trim(limit);
-    if (trimmed > 0) try r.log.write(.turn, r.isPrivate(), .{ .run = r.label, .event = "dropped unsummarised", .turns = trimmed, .summary = conv.summary != null });
+    if (trimmed > 0) try r.logRun(.turn, r.isPrivate(), .{ .event = "dropped unsummarised", .turns = trimmed, .summary = conv.summary != null });
     return gone + trimmed;
 }
 
@@ -1743,7 +1778,7 @@ fn summarise(r: *Run, conv: *Conversation, n: usize) !Summary {
     var client = try model.Client.init(r.gpa, r.io, cfg.url, cfg.key, cfg.memory, 1024);
     defer client.deinit();
     const reply = try client.send(a, summary_prompt, &.{.{ .role = .user, .blocks = &.{.{ .text = text.items }} }}, &.{});
-    try r.log.write(.model, false, .{ .run = r.label, .result = "ok", .purpose = "summary", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
+    try r.logRun(.model, false, .{ .result = "ok", .purpose = "summary", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
     const out = try reply.text(a);
     if (out.len == 0) return error.EmptySummary;
     return .{ .text = try r.gpa.dupe(u8, out), .left_out = left_out };
@@ -3147,6 +3182,138 @@ test "helpers_get_the_rest_of_the_turn_not_a_new_one" {
     defer freeResult(&f.run, r);
     if (f.e.server.modelRequests() > 2) std.debug.print("{d} model requests; answer: {s}\n", .{ f.e.server.modelRequests(), r.text });
     try t.expect(f.e.server.modelRequests() <= 2);
+}
+
+test "every_line_of_a_run_carries_its_rid_and_the_first_says_who_started_it" {
+    var f: Fix = undefined;
+    try f.init("allow shell echo *\n");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(2, model.textReply("done"));
+    const r = try f.say("say hi");
+    freeResult(&f.run, r);
+    const a = f.e.arena.allocator();
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, try f.logText(), "\n"), '\n');
+    var rid: ?i64 = null;
+    var n: usize = 0;
+    while (lines.next()) |l| {
+        const v = jv.parse(a, l).?;
+        // memory lines are no run's
+        if (jv.get(v, "run") == null) continue;
+        n += 1;
+        const kind = jv.str(jv.get(v, "kind")).?;
+        if (rid == null) {
+            try t.expectEqualStrings("turn", kind);
+            rid = jv.int(jv.get(v, "seq")).?;
+            try t.expectEqual(rid.?, jv.int(jv.get(v, "rid")).?);
+            try t.expectEqualStrings("owner", jv.str(jv.get(v, "by")).?);
+            try t.expectEqualStrings("main", jv.str(jv.get(v, "agent")).?);
+            try t.expect(jv.get(v, "parent") == null);
+            continue;
+        }
+        try t.expectEqual(rid.?, jv.int(jv.get(v, "rid")).?);
+        try t.expect(jv.get(v, "by") == null);
+        if (std.mem.eql(u8, kind, "gate") or std.mem.eql(u8, kind, "tool"))
+            try t.expectEqualStrings("main", jv.str(jv.get(v, "agent")).?)
+        else
+            try t.expect(jv.get(v, "agent") == null);
+    }
+    // the turn, two model calls, the gate, the tool, the turn's end
+    try t.expectEqual(6, n);
+}
+
+test "helpers_log_their_definition_and_the_run_that_delegated_them" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"one\",\"tools\":[\"recall\"]},{\"task\":\"two\",\"tools\":[\"recall\"]}]}"));
+    // both helpers look something up at the same time
+    const look = "{\"delay_ms\":300,\"content\":[{\"type\":\"tool_use\",\"id\":\"r1\",\"name\":\"recall\",\"input\":{\"query\":\"x\"}}],\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
+    try f.e.script(2, look);
+    try f.e.script(3, look);
+    try f.e.script(4, model.textReply("helper done"));
+    try f.e.script(5, model.textReply("helper done"));
+    try f.e.script(6, model.textReply("both done"));
+    const r = try f.say("split it");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("both done", r.text);
+    const a = f.e.arena.allocator();
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, try f.logText(), "\n"), '\n');
+    var chat: ?i64 = null;
+    var helpers: [2]?i64 = .{ null, null };
+    while (lines.next()) |l| {
+        const v = jv.parse(a, l).?;
+        const run = jv.str(jv.get(v, "run")) orelse continue;
+        const line_rid = jv.int(jv.get(v, "rid")).?;
+        if (std.mem.eql(u8, run, "chat")) {
+            if (chat == null) chat = line_rid;
+            try t.expectEqual(chat.?, line_rid);
+            continue;
+        }
+        const i: usize = if (std.mem.eql(u8, run, "chat/h1")) 0 else if (std.mem.eql(u8, run, "chat/h2")) 1 else return error.TestUnexpectedResult;
+        if (helpers[i] == null) {
+            helpers[i] = line_rid;
+            try t.expectEqualStrings("turn", jv.str(jv.get(v, "kind")).?);
+            try t.expectEqual(jv.int(jv.get(v, "seq")).?, line_rid);
+            try t.expectEqualStrings("owner", jv.str(jv.get(v, "by")).?);
+            try t.expectEqualStrings("helper", jv.str(jv.get(v, "agent")).?);
+            try t.expectEqual(chat.?, jv.int(jv.get(v, "parent")).?);
+        } else {
+            try t.expectEqual(helpers[i].?, line_rid);
+            try t.expect(jv.get(v, "parent") == null);
+        }
+    }
+    try t.expect(helpers[0] != null and helpers[1] != null and helpers[0].? != helpers[1].?);
+}
+
+test "sections_reach_helpers_through_their_who" {
+    var f: Fix = undefined;
+    try f.init("[agent:helper]\nallow shell echo *\n");
+    defer f.deinit();
+    try withHelpers(&f);
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo a\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "delegate", "{\"tasks\":[{\"task\":\"echo b\",\"tools\":[\"shell\"]}]}"));
+    try f.e.script(3, model.toolReply("h1", "shell", "{\"command\":\"echo b\"}"));
+    try f.e.script(4, model.textReply("helper ran it"));
+    try f.e.script(5, model.textReply("done"));
+    const r1 = try f.say("echo twice");
+    freeResult(&f.run, r1);
+    // main's command is asked; the helper's own section lets its command run
+    try t.expectEqual(1, f.asked);
+    try t.expect(std.mem.startsWith(u8, f.last_what, "shell: echo a"));
+    // a section of the definition that delegated reaches its helpers too
+    f.g.rules = try rules.parse(f.e.arena.allocator(), "[agent:main]\ndeny shell *\n[agent:helper]\nallow shell echo *\n");
+    try f.e.script(6, model.toolReply("tu_3", "delegate", "{\"tasks\":[{\"task\":\"echo c\",\"tools\":[\"shell\"]}]}"));
+    try f.e.script(7, model.toolReply("h2", "shell", "{\"command\":\"echo c\"}"));
+    try f.e.script(8, model.textReply("refused"));
+    try f.e.script(9, model.textReply("done"));
+    const r2 = try f.say("once more");
+    freeResult(&f.run, r2);
+    try t.expectEqual(1, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(8), "refused by the gate: rule on line 2") != null);
+}
+
+test "a_day_grant_covers_the_definition_that_asked" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    f.answer = .day;
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(3, model.toolReply("tu_3", "delegate", "{\"tasks\":[{\"task\":\"say hi\",\"tools\":[\"shell\"]}]}"));
+    try f.e.script(4, model.toolReply("h1", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(5, model.textReply("said hi"));
+    try f.e.script(6, model.textReply("done"));
+    const r = try f.say("say hi");
+    freeResult(&f.run, r);
+    // main's grant covers main's next call, not its helper's
+    try t.expectEqual(2, f.asked);
+    try t.expectEqual(2, f.grants.items.items.len);
+    try t.expectEqualStrings("agent:main", f.grants.items.items[0].who);
+    try t.expectEqualStrings("host", f.grants.items.items[0].env);
+    try t.expectEqualStrings("agent:helper", f.grants.items.items[1].who);
 }
 
 test "a_setup_call_offers_no_day_and_a_day_answer_grants_nothing" {

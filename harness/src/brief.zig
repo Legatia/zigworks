@@ -156,11 +156,11 @@ fn feedHop(ctx: *anyopaque, arena: std.mem.Allocator, url: []const u8, known_hos
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        break :blk r.gate.decide(arena, .fetch, url, util.nowSeconds(r.io), .{ .scheduled = !known_host });
+        break :blk r.gate.decide(arena, .fetch, url, util.nowSeconds(r.io), .{ .scheduled = !known_host, .who = r.who });
     };
     const allowed = d.action == .allow or (known_host and d.action == .ask);
     const why = if (allowed and d.action == .ask) "a redirect on a host the request reached" else d.why;
-    r.log.write(.gate, false, .{ .run = r.label, .tool = "fetch", .decision = if (allowed) "allow" else "deny", .why = why, .arg = url }) catch {};
+    r.logRun(.gate, false, .{ .tool = "fetch", .decision = if (allowed) "allow" else "deny", .why = why, .arg = url }) catch {};
     return if (allowed) null else d.why;
 }
 
@@ -170,9 +170,9 @@ fn fetchFeed(r: *agent.Run, arena: std.mem.Allocator, url: []const u8, why: *[]c
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        break :blk r.gate.decide(arena, .fetch, url, util.nowSeconds(r.io), .{ .scheduled = true, .brief_source = true });
+        break :blk r.gate.decide(arena, .fetch, url, util.nowSeconds(r.io), .{ .scheduled = true, .brief_source = true, .who = r.who });
     };
-    try r.log.write(.gate, false, .{ .run = r.label, .tool = "fetch", .decision = @tagName(d.action), .why = d.why, .arg = url });
+    try r.logRun(.gate, false, .{ .tool = "fetch", .decision = @tagName(d.action), .why = d.why, .arg = url });
     if (d.action != .allow) return error.Refused;
     const g = try tools.get(r.gpa, r.io, arena, url, &.{}, feed_max, .{ .ctx = r, .allow = feedHop });
     if (g.stopped) |st| {
@@ -191,9 +191,9 @@ fn searchEntries(r: *agent.Run, arena: std.mem.Allocator, q: []const u8, why: *[
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        break :blk r.gate.decide(arena, .search, q, util.nowSeconds(r.io), .{ .scheduled = true, .brief_source = true });
+        break :blk r.gate.decide(arena, .search, q, util.nowSeconds(r.io), .{ .scheduled = true, .brief_source = true, .who = r.who });
     };
-    try r.log.write(.gate, false, .{ .run = r.label, .tool = "search", .decision = @tagName(d.action), .why = d.why, .arg = q });
+    try r.logRun(.gate, false, .{ .tool = "search", .decision = @tagName(d.action), .why = d.why, .arg = q });
     if (d.action != .allow) return error.Refused;
     const key = r.env.search_key orelse return error.NoSearchKey;
     var url: std.ArrayList(u8) = .empty;
@@ -267,10 +267,10 @@ pub fn compose(r: *agent.Run, arena: std.mem.Allocator, b: config.Brief, c: Coll
         const msg = try std.fmt.allocPrint(arena, "Brief \"{s}\".\n{s}", .{ b.name, items.items });
         const system = try std.fmt.allocPrint(arena, "{s}\n{s}", .{ brief_instructions, r.extra_instructions });
         if (r.client.send(arena, system, &.{.{ .role = .user, .blocks = &.{.{ .text = msg }} }}, &.{})) |reply| {
-            try r.log.write(.model, false, .{ .run = r.label, .result = "ok", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
+            try r.logRun(.model, false, .{ .result = "ok", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
             try out.appendSlice(arena, try reply.text(arena));
         } else |e| {
-            try r.log.write(.model, false, .{ .run = r.label, .result = @errorName(e), .detail = r.client.lastError() });
+            try r.logRun(.model, false, .{ .result = @errorName(e), .detail = r.client.lastError() });
             // the items themselves still reach the owner
             try out.print(arena, "{s} The new items:\n", .{if (e == error.BudgetSpent) "Model budget used up." else "The model could not write the brief."});
             for (c.topics) |tp| for (tp.new) |en| try out.print(arena, "- {s} ({s})\n", .{ en.title, en.link });
