@@ -26,7 +26,7 @@ standard library (and the system's Security framework on macOS). Models
 are reached only through [omnigate](https://github.com/Legatia/omnigate),
 which holds the provider keys and the budgets.
 
-**State: 0.3.0, tested on macOS by its own tests: 560 unit tests (2 skipped), among
+**State: 0.3.0, tested on macOS by its own tests: 563 unit tests (2 skipped), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 67 checks that drives the real binary against
 stand-ins for omnigate, Telegram, feeds, search and two MCP servers. An

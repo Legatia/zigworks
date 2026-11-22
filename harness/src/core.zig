@@ -8714,3 +8714,81 @@ test "agent_save_is_asked_as_an_item_without_24h_and_saved_with_its_number" {
     try t.expect(std.mem.indexOf(u8, try logText(&f), "\"kind\":\"agent\",\"event\":\"saved\",\"name\":\"scout\",\"by\":\"owner\",\"agent\":\"scout\",\"item\":1,") != null);
     try t.expect(std.mem.indexOf(u8, try inboxFile(&f), "\"status\":\"answered\"") != null);
 }
+
+test "a_definitions_task_keeps_it_on_its_skipped_item_and_the_grant_is_the_tasks" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addDefinition(&f, "scout", scout_md);
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[watch]\nevery = 5m\nagent = scout\ndo = Look.\n"));
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    try f.e.script(1, model.toolReply("s1", "shell", "{\"command\":\"echo scout-watch\"}"));
+    try f.e.script(2, model.textReply("NOTHING"));
+    f.core.tick();
+    try f.rec.waitFor("BUTTONS Skipped [1]: task watch could not make this call without you:\nshell: echo scout-watch");
+    waitIdle(f.core);
+    // the item names the task's definition and what started it
+    const text = try inboxFile(&f);
+    try t.expect(std.mem.indexOf(u8, text, "\"kind\":\"skipped\"") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"by\":\"schedule:watch\",\"agent\":\"scout\",") != null);
+    // Allow for this task: a grant for the task (its who), whatever it runs
+    const b = f.rec.buttonsWith("Skipped [1]").?;
+    f.core.handleCallback(42, b.msg, b.get("allow").?);
+    try f.rec.waitFor("\nAllowed for this task for 30 days, ");
+    const grants = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.grants, a, .unlimited);
+    const want = try std.fmt.allocPrint(a, "shell@host\t{d}\techo scout-watch\tschedule:watch\n", .{t0 + 30 * 86400});
+    if (std.mem.indexOf(u8, grants, want) == null) std.debug.print("{s}\n", .{grants});
+    try t.expect(std.mem.indexOf(u8, grants, want) != null);
+    // its next run, of scout, makes the call
+    try f.e.script(3, model.toolReply("s2", "shell", "{\"command\":\"echo scout-watch\"}"));
+    try f.e.script(4, model.textReply("NOTHING"));
+    f.core.fixed_now = t0 + 301;
+    f.core.tick();
+    try waitFile(&f.e, "requests/004.json");
+    waitIdle(f.core);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"run\":\"task watch\",\"agent\":\"scout\",\"tool\":\"shell\",\"decision\":\"allow\",\"why\":\"a grant covers it (/grants)\"") != null);
+}
+
+test "a_folders_ini_refusal_in_a_task_is_final_and_no_item" {
+    var f: Fix = undefined;
+    try f.init("", "", "[jot]\nevery = 5m\ndo = Jot it down.\n");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.folders, .data = "[notes]\nwrite = owner\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(1, model.toolReply("j1", "write_file", "{\"path\":\"notes/j.md\",\"content\":\"j\"}"));
+    try f.e.script(2, model.textReply("Could not jot."));
+    f.core.tick();
+    try f.rec.waitFor("[jot] Could not jot.");
+    waitIdle(f.core);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: folders.ini [notes] write: ") != null);
+    // final: not listed as skipped, and nothing waits in the inbox
+    try t.expectEqual(0, f.rec.count("Skipped"));
+    const text: []const u8 = inboxFile(&f) catch "";
+    try t.expect(std.mem.indexOf(u8, text, "\"kind\"") == null);
+}
+
+test "a_definitions_reply_that_did_not_get_through_goes_to_its_conversation_later" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addDefinition(&f, "scout", scout_md);
+    try addTopic(&f, "house-search", 5012);
+    // scout answers in the topic (an /ask there): the post fails, kept
+    try f.e.script(1, model.textReply("Two flats near the park."));
+    f.rec.setFail(error.ConnectionClosed);
+    f.core.chatTurnAs("house-search", "scout", "find flats", null);
+    f.rec.setFail(null);
+    const text = try inboxFile(&f);
+    try t.expect(std.mem.indexOf(u8, text, "\"kind\":\"delivery\"") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"agent\":\"scout\"") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"post\":{\"conversation\":\"house-search\",\"text\":\"[scout] Two flats near the park.\"") != null);
+    // its wait over, it goes to that conversation, marked as before
+    f.core.fixed_now = util.nowSeconds(t.io) + 6 * 60;
+    f.core.tick();
+    try f.rec.waitIn("house-search", "[scout] Two flats near the park.");
+    waitIdle(f.core);
+    try t.expectEqual(0, f.rec.countIn("main", "Two flats near the park."));
+    try t.expect(std.mem.indexOf(u8, try inboxFile(&f), "\"status\":\"done\"") != null);
+}
