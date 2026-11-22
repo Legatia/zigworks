@@ -185,25 +185,19 @@ job with the helper from section 1 (that document's point 3), and mind the
 I15, K3, K9-K16, K18) change cdp.zig, web.zig and page.zig: read them
 after the merge before porting the pipe code.
 
-## 7. CI on Windows after the audit (run 45005072805, cfe408b)
+## 7. CI on Windows after the audit (run 45008431071, 49725b9: all green)
 
-Fixed from here, checked in CI: a plain `write_file` failed with
-AccessDenied (Windows refuses to stat a handle opened only to write;
-tools.zig `writeNoFollow` now opens with read access), and every check of
-the turn's time is now in milliseconds.
+Fixed from here and passing in CI on Windows (Debug and ReleaseSafe):
+`write_file` failed with AccessDenied (Windows refuses to stat a handle
+opened only to write; `writeNoFollow` now opens with read access); every
+check of the turn's time is in milliseconds; a turn's end is rounded up to a
+whole second (a 1 s turn begun late in a second used to get nothing — that,
+not the socket wait, was the ReleaseSafe failure).
 
-Left: `agent.test.a_fetch_and_a_web_action_get_only_what_is_left_of_the_turn`
-passes in the Debug run on Windows but failed in the ReleaseSafe run
-(`zig build test -Doptimize=ReleaseSafe`), where a failed check prints no
-trace. It now prints how long the 1 s turn took and its log. Most likely the
-receive wait of a fetch is not cut at the turn's end on Windows (sock.zig
-checks the turn's time and /stop every 100 ms; commit 9faca8e), so the turn
-can run past 2.5 s. Done when the test passes in both runs, and a fetch on
-Windows ends when the turn's time is up and on /stop.
-
-Also still open on Windows: `write_file_never_writes_through_a_symlink` and
+Still open on Windows: `write_file_never_writes_through_a_symlink` and
 `a_symlink_whose_target_is_missing_is_refused_and_written_files_are_never_links`
-skip there; make them run if Windows can make the links (junctions count).
+skip there; make them run if Windows can make the links (junctions count),
+and check that a fetch is cut at the turn's end and on /stop in a real run.
 
 ## Tests that skip on Windows (and their checks above)
 

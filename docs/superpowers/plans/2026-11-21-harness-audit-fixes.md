@@ -357,3 +357,5 @@ Assignment: X (F1-F5, F7, F8) branch fix2/core; Y (F6, F9, F10, F11) branch fix2
 - c98743e: a helper's turn never ends later than its parent's (whole-second rounding gave it one more second: Linux helpers test); MCP start test proves parallelism by both servers being up by the deadline; stop test with an 8 s server.
 - 1d168a7, ada382b, e2486e4: every check of the turn's time in milliseconds (callTool cap, ask step, turn loop, helper start, MCP calls, model client), under 0.1 s nothing new is started or sent.
 - cfe408b: the fetch-and-web test judges what ran (Windows doesn't offer web; Linux refuses at the gate; macOS before the tool).
+- ff596eb: the Windows ReleaseSafe failure printed "a 1 s turn took 0 ms": a turn's end was rounded down to a whole second, so a turn begun late in a second lost up to a second (a 1 s turn begun in its last 0.1 s got nothing).
+- 49725b9: a turn's end is rounded up (a turn gets turn_seconds to one second more); test a_turn_begun_late_in_a_second_still_gets_its_time RED→GREEN. CI run 45008431071: all 22 jobs green; harness passes on Linux, macOS and Windows, Debug and ReleaseSafe.
