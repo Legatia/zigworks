@@ -406,6 +406,61 @@ pub fn varsFor(f: Folders, arena: std.mem.Allocator, real: ?[]const []const u8, 
     return out.items;
 }
 
+/// folders.ini as `/folders` says it: a line a section, variables by name
+/// and the secret they come from (never a value).
+pub fn render(f: Folders, arena: std.mem.Allocator) ![]const u8 {
+    if (f.sections.len == 0) return "No folders.ini sections: the rules alone decide where runs may read, write and start commands.";
+    var out: std.ArrayList(u8) = .empty;
+    for (f.sections) |s| {
+        try out.print(arena, "[{s}]", .{s.name});
+        var n: usize = 0;
+        for ([_]Access{ .read, .write, .run }) |acc| if (s.list(acc)) |l| {
+            try out.print(arena, "{s}{s} = ", .{ sep(n), @tagName(acc) });
+            n += 1;
+            for (l, 0..) |e, i| try out.print(arena, "{s}{s}", .{ if (i > 0) ", " else "", e });
+        };
+        if (s.vars.len > 0) {
+            try out.print(arena, "{s}vars = ", .{sep(n)});
+            n += 1;
+            for (s.vars, 0..) |v, i| try out.print(arena, "{s}{s} (from {s})", .{ if (i > 0) ", " else "", v.name, v.secret });
+        }
+        if (s.snapshots) |k| {
+            if (k == 0) try out.print(arena, "{s}snapshots = off", .{sep(n)}) else try out.print(arena, "{s}snapshots = {d}", .{ sep(n), k });
+            n += 1;
+        }
+        if (s.skip.len > 0) {
+            try out.print(arena, "{s}skip = ", .{sep(n)});
+            for (s.skip, 0..) |p, i| try out.print(arena, "{s}{s}", .{ if (i > 0) ", " else "", p });
+        }
+        try out.append(arena, '\n');
+    }
+    return out.items;
+}
+
+fn sep(n: usize) []const u8 {
+    return if (n == 0) " " else "; ";
+}
+
+/// What `w` may do in the workspace (`/`) and in each section's folder,
+/// after `heading`: `FOLDER: read, write, run`, or `nothing`.
+pub fn accessText(f: Folders, arena: std.mem.Allocator, real: ?[]const []const u8, w: who.Who, heading: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "{s}\n", .{heading});
+    var places: std.ArrayList([]const u8) = .empty;
+    try places.append(arena, "");
+    for (f.sections, 0..) |s, i| if (s.folder.len > 0) try places.append(arena, folderAt(f, real, i));
+    for (places.items) |folder| {
+        try out.print(arena, "{s}: ", .{if (folder.len == 0) "/" else folder});
+        var n: usize = 0;
+        for ([_]Access{ .read, .write, .run }) |acc| if (allows(f, arena, real, folder, acc, w) == null) {
+            try out.print(arena, "{s}{s}", .{ if (n > 0) ", " else "", @tagName(acc) });
+            n += 1;
+        };
+        try out.appendSlice(arena, if (n == 0) "nothing\n" else "\n");
+    }
+    return out.items;
+}
+
 const t = std.testing;
 
 const spec_example =

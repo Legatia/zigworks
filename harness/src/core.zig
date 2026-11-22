@@ -51,6 +51,10 @@ pub const Paths = struct {
     logins: []const u8,
     profiles: []const u8,
     written: []const u8,
+    /// Roles on workspace folders.
+    folders: []const u8,
+    /// Snapshots of folders: the store.
+    snapshots: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -86,6 +90,8 @@ pub const Paths = struct {
             .logins = try j(a, &.{ home, "logins.ini" }),
             .profiles = try j(a, &.{ home, "profiles" }),
             .written = try j(a, &.{ state, "written" }),
+            .folders = try j(a, &.{ home, "folders.ini" }),
+            .snapshots = try j(a, &.{ home, "snapshots" }),
         };
     }
 };
@@ -103,7 +109,7 @@ pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
             try d.setPermissions(io, .fromMode(0o700));
         }
     }
-    const files = [_][2][]const u8{ .{ p.config, config.defaults_ini }, .{ p.rules, config.rules_example }, .{ p.briefs, config.briefs_example }, .{ p.tasks, config.tasks_example } };
+    const files = [_][2][]const u8{ .{ p.config, config.defaults_ini }, .{ p.rules, config.rules_example }, .{ p.briefs, config.briefs_example }, .{ p.tasks, config.tasks_example }, .{ p.folders, folders_mod.example } };
     for (files) |f| {
         var file = Io.Dir.cwd().createFile(io, f[0], .{ .exclusive = true, .permissions = util.private_file }) catch |e| switch (e) {
             error.PathAlreadyExists => continue,
@@ -197,6 +203,8 @@ pub const Core = struct {
     settings_arena: std.heap.ArenaAllocator,
     cfg: config.Config,
     rule_list: []const rules.Rule,
+    /// folders.ini; the gate gets it when it has a section.
+    folder_list: folders_mod.Folders,
     briefs: []const config.Brief,
     tasks: []const config.Task,
     settings_hash: [32]u8,
@@ -365,7 +373,7 @@ pub const Core = struct {
         c.grants = .init(gpa);
         errdefer c.grants.deinit();
         c.grants.load(io, c.paths.grants, util.nowSeconds(io)) catch {};
-        c.gate = .{ .io = io, .rules = c.rule_list, .grants = &c.grants, .workspace = c.workspace };
+        c.gate = .{ .io = io, .rules = c.rule_list, .grants = &c.grants, .workspace = c.workspace, .folders = c.folderRoles() };
         try Io.Dir.cwd().createDirPath(io, c.paths.log_dir);
         c.log = try log_mod.Log.open(gpa, io, c.paths.log);
         errdefer c.log.close();
@@ -521,12 +529,12 @@ pub const Core = struct {
     // ---- settings ----
 
     /// The settings files, in this order; a change to any of them is noticed.
-    fn settingsFiles(c: *const Core) [6][]const u8 {
-        return .{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins, c.paths.mcp };
+    fn settingsFiles(c: *const Core) [7][]const u8 {
+        return .{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins, c.paths.mcp, c.paths.folders };
     }
 
-    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![6][]const u8 {
-        var out: [6][]const u8 = undefined;
+    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![7][]const u8 {
+        var out: [7][]const u8 = undefined;
         for (c.settingsFiles(), 0..) |p, i| {
             out[i] = Io.Dir.cwd().readFileAlloc(c.io, p, a, .limited(1 << 20)) catch |e| switch (e) {
                 error.FileNotFound => "",
@@ -536,7 +544,7 @@ pub const Core = struct {
         return out;
     }
 
-    fn hashSettings(texts: [6][]const u8) [32]u8 {
+    fn hashSettings(texts: [7][]const u8) [32]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
         for (texts) |tx| {
             h.update(tx);
@@ -558,7 +566,14 @@ pub const Core = struct {
         c.briefs = config.parseBriefs(a, texts[2]) catch return error.BadSettings;
         c.tasks = config.parseTasks(a, texts[3]) catch return error.BadSettings;
         c.login_list = logins.parse(a, texts[4]) catch return error.BadSettings;
+        c.folder_list = folders_mod.parse(a, texts[6]) catch return error.BadSettings;
         c.settings_hash = hashSettings(texts);
+    }
+
+    /// folders.ini for the gate: none without a section, so the file
+    /// `harness init` writes changes nothing.
+    fn folderRoles(c: *const Core) ?*const folders_mod.Folders {
+        return if (c.folder_list.sections.len > 0) &c.folder_list else null;
     }
 
     /// Re-reads the settings files; refused while anything runs.
@@ -578,6 +593,7 @@ pub const Core = struct {
         const saved_briefs = c.briefs;
         const saved_tasks = c.tasks;
         const saved_logins = c.login_list;
+        const saved_folders = c.folder_list;
         const saved_hash = c.settings_hash;
         c.loadSettings(fresh.allocator()) catch {
             fresh.deinit();
@@ -586,6 +602,7 @@ pub const Core = struct {
             c.briefs = saved_briefs;
             c.tasks = saved_tasks;
             c.login_list = saved_logins;
+            c.folder_list = saved_folders;
             c.settings_hash = saved_hash;
             return c.settingsErrorReply();
         };
@@ -597,6 +614,7 @@ pub const Core = struct {
             c.briefs = saved_briefs;
             c.tasks = saved_tasks;
             c.login_list = saved_logins;
+            c.folder_list = saved_folders;
             c.settings_hash = saved_hash;
             return "The model url in config.ini is not valid; nothing changed.";
         };
@@ -605,6 +623,7 @@ pub const Core = struct {
         c.settings_arena.deinit();
         c.settings_arena = fresh;
         c.gate.rules = c.rule_list;
+        c.gate.folders = c.folderRoles();
         c.findBrowser();
         c.told_settings_changed = false;
         // nothing runs now (reload waits for that), so servers can restart;
@@ -631,7 +650,7 @@ pub const Core = struct {
     /// The answer to a /reload the settings files refused, naming the file
     /// and line (in `problem_buf`).
     fn settingsErrorReply(c: *Core) []const u8 {
-        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, logins.ini and mcp.ini.";
+        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, logins.ini, mcp.ini and folders.ini.";
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const why = (settingsProblem(c.io, arena.allocator(), c.paths) catch return generic) orelse return generic;
@@ -1938,6 +1957,8 @@ pub const Core = struct {
         \\/private on|off: no memories written while on
         \\/skills: list saved skills, /skill rm NAME
         \\/logins: the agent's own logins
+        \\/folders: roles on workspace folders (folders.ini)
+        \\/access WHO: where WHO may read, write and start commands
         \\/dryrun on|off: money tools are not called while on
         \\/reload: apply changed settings files
     ;
@@ -2047,6 +2068,8 @@ pub const Core = struct {
         }
         if (eql(u8, cmd, "/task")) return c.taskCommand(a, rest);
         if (eql(u8, cmd, "/logins")) return c.loginsText(a);
+        if (eql(u8, cmd, "/folders")) return folders_mod.render(c.folder_list, a);
+        if (eql(u8, cmd, "/access")) return c.accessCommand(a, rest);
         if (eql(u8, cmd, "/skills")) {
             const list = try skills.list(a, c.io, c.paths.skills);
             if (list.len == 0) return "No skills yet. The agent saves one (with your approval) when it learns how to do a kind of task.";
@@ -2066,6 +2089,37 @@ pub const Core = struct {
             return "Use /skills or /skill rm NAME.";
         }
         return "Unknown command. Send /help for the list.";
+    }
+
+    /// `/access WHO [ORIGIN]`: where a definition (`agent:NAME`, in a run
+    /// you or ORIGIN started) or what starts runs (their runs of main; an
+    /// app's own reads and acts) may read, write and start commands.
+    fn accessCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        const usage = "Use /access WHO: /access agent:main, /access agent:main trigger:NAME, /access schedule:NAME or /access app:NAME.";
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const first = words.next() orelse return usage;
+        const second = words.next();
+        if (words.next() != null or !who_mod.isValue(first)) return usage;
+        var w: who_mod.Who = .{};
+        var heading: []const u8 = undefined;
+        if (std.mem.startsWith(u8, first, "agent:")) {
+            w.agent = first["agent:".len..];
+            if (second) |o| {
+                if (!who_mod.isValue(o) or std.mem.startsWith(u8, o, "agent:")) return usage;
+                w.by = o;
+            }
+            heading = try std.fmt.allocPrint(a, "{s}, in a run {s} started:", .{ first, if (second) |o| o else "you" });
+        } else {
+            if (second != null) return usage;
+            w.by = first;
+            if (std.mem.startsWith(u8, first, "app:")) {
+                // an app's own call has no definition
+                w.agent = "";
+                heading = try std.fmt.allocPrint(a, "{s}, its own reads and acts:", .{first});
+            } else heading = try std.fmt.allocPrint(a, "agent:main, in a run {s} started:", .{if (std.mem.eql(u8, first, "owner")) "you" else first});
+        }
+        const real = if (c.gate.folders) |fs| c.gate.realFolders(a, fs) else null;
+        return folders_mod.accessText(c.folder_list, a, real, w, heading);
     }
 
     /// One line per login: what is stored for it (never the values).
@@ -2208,9 +2262,10 @@ fn insertInSection(a: std.mem.Allocator, text: []const u8, name: []const u8, lin
 }
 
 /// The settings files other users must not be able to change: they decide
-/// what runs (rules, MCP servers' commands) and where values are typed.
-pub fn guardedFiles(p: Paths) [4][]const u8 {
-    return .{ p.config, p.rules, p.logins, p.mcp };
+/// what runs (rules, MCP servers' commands, roles on folders) and where
+/// values are typed.
+pub fn guardedFiles(p: Paths) [5][]const u8 {
+    return .{ p.config, p.rules, p.logins, p.mcp, p.folders };
 }
 
 /// What is wrong with the settings files, said so the owner can fix it:
@@ -2221,7 +2276,7 @@ pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
         for (guardedFiles(p)) |path| {
             const st = Io.Dir.cwd().statFile(io, path, .{}) catch continue;
             if (st.permissions.toMode() & 0o022 != 0)
-                return try std.fmt.allocPrint(a, "{s} can be changed by other users; run chmod 600 {s} (config.ini, rules, logins.ini and mcp.ini must be writable only by you)", .{ path, path });
+                return try std.fmt.allocPrint(a, "{s} can be changed by other users; run chmod 600 {s} (config.ini, rules, logins.ini and mcp.ini must be writable only by you, and folders.ini too)", .{ path, path });
         }
     }
     inline for (.{
@@ -2230,6 +2285,7 @@ pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
         .{ p.briefs, config.parseBriefs },
         .{ p.tasks, config.parseTasks },
         .{ p.logins, logins.parse },
+        .{ p.folders, folders_mod.parse },
     }) |item| {
         const text = Io.Dir.cwd().readFileAlloc(io, item[0], a, .limited(1 << 20)) catch |e| switch (e) {
             error.FileNotFound => "",
@@ -4222,4 +4278,52 @@ test "reload_takes_a_secret_stored_since_start_and_masks_it" {
     const req2 = try f.e.request(2);
     try t.expect(std.mem.indexOf(u8, req2, "secret=[secret:fresh-key]") != null);
     try t.expect(std.mem.indexOf(u8, req2, "fresh-mcp-value-4711") == null);
+}
+
+test "folders_ini_is_guarded_watched_and_applied_on_reload" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // init wrote one with comments only: no roles
+    try t.expect(std.mem.indexOf(u8, try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.folders, a, .unlimited), "; [notes]") != null);
+    try t.expectEqual(null, f.core.gate.folders);
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, "/folders"), "No folders.ini sections"));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.folders, .data = "[notes]\nwrite = agent:coder\n" });
+    // a change is noticed, and applies on /reload
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try f.rec.waitFor("not applied until you send /reload");
+    try t.expectEqual(null, f.core.gate.folders);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(f.core.gate.folders != null);
+    try t.expectEqualStrings("[notes] write = agent:coder\n", try f.core.command(a, "/folders"));
+    if (builtin.os.tag != .windows) {
+        try Io.Dir.cwd().setFilePermissions(t.io, f.core.paths.folders, .fromMode(0o666), .{});
+        try t.expect(std.mem.indexOf(u8, try f.core.reload(), "folders.ini can be changed by other users") != null);
+        try Io.Dir.cwd().setFilePermissions(t.io, f.core.paths.folders, .fromMode(0o600), .{});
+    }
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.folders, .data = "[notes]\nwrite = agnet:x\n" });
+    try t.expect(std.mem.indexOf(u8, try f.core.reload(), "folders.ini line 2 has an error") != null);
+    // the roles from before stay
+    try t.expectEqualStrings("[notes] write = agent:coder\n", try f.core.command(a, "/folders"));
+}
+
+test "access_says_what_a_who_may_read_write_and_run" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.folders, .data = "[/]\nwrite = agent:main\n[private]\nread = owner\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const helper = try f.core.command(a, "/access agent:helper");
+    for ([_][]const u8{ "/: read, run\n", "private: read, run\n" }) |want| if (std.mem.indexOf(u8, helper, want) == null) {
+        std.debug.print("missing {s} in {s}\n", .{ want, helper });
+        return error.TestUnexpectedResult;
+    };
+    const trig = try f.core.command(a, "/access trigger:mail");
+    try t.expect(std.mem.indexOf(u8, trig, "/: read, run\n") != null);
+    try t.expect(std.mem.indexOf(u8, trig, "private: run\n") != null);
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/access agent:main"), "/: read, write, run\n") != null);
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, "/access agent:x:y"), "Use /access WHO"));
 }

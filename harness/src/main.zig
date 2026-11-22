@@ -12,6 +12,7 @@ const util = @import("util.zig");
 const agent = @import("agent.zig");
 const logins = @import("logins.zig");
 const totp = @import("totp.zig");
+const folders = @import("folders.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -120,11 +121,12 @@ const App = struct {
         };
     }
 
-    /// The MCP servers' secrets, and the logins' passwords and TOTP seeds
-    /// (masked in all tool output).
+    /// The MCP servers' secrets, those folders.ini's vars name, and the
+    /// logins' passwords and TOTP seeds (masked in all tool output).
     fn namedSecrets(app: *App, s: store_mod.Store) []const core_mod.Secrets.Named {
         var out: std.ArrayList(core_mod.Secrets.Named) = .empty;
         out.appendSlice(app.arena, app.mcpSecrets(s)) catch {};
+        out.appendSlice(app.arena, app.folderSecrets(s)) catch {};
         for (app.loginList()) |l| for ([_]logins.Kind{ .password, .totp }) |k| {
             var nb: [96]u8 = undefined;
             const name = logins.secretName(&nb, l.name, k);
@@ -141,6 +143,19 @@ const App = struct {
     fn loginList(app: *App) []const logins.Login {
         const text = Io.Dir.cwd().readFileAlloc(app.io, app.loginsPath(), app.arena, .limited(1 << 20)) catch return &.{};
         return logins.parse(app.arena, text) catch &.{};
+    }
+
+    /// The stored secrets folders.ini's `vars` name.
+    fn folderSecrets(app: *App, s: store_mod.Store) []const core_mod.Secrets.Named {
+        const p = std.fs.path.join(app.arena, &.{ app.home, "folders.ini" }) catch return &.{};
+        const text = Io.Dir.cwd().readFileAlloc(app.io, p, app.arena, .limited(1 << 20)) catch return &.{};
+        const f = folders.parse(app.arena, text) catch return &.{};
+        var out: std.ArrayList(core_mod.Secrets.Named) = .empty;
+        for (f.sections) |sec| for (sec.vars) |v| {
+            const value = (s.get(app.io, app.arena, v.secret) catch null) orelse continue;
+            out.append(app.arena, .{ .name = v.secret, .value = value }) catch {};
+        };
+        return out.items;
     }
 
     /// The stored secrets the servers in mcp.ini name.
@@ -188,7 +203,7 @@ const App = struct {
                 error.BadUrl => complain("the omnigate url in config.ini ([model] url) is {s}", .{if (cfg.model.url.len == 0) "not set yet" else "not valid"}),
                 error.BadSettings => {
                     const paths = core_mod.Paths.init(app.arena, app.home) catch return error.Reported;
-                    const why = (core_mod.settingsProblem(app.io, app.arena, paths) catch null) orelse "a settings file has an error, or one of config.ini, rules, logins.ini and mcp.ini can be changed by other users (chmod 600 them)";
+                    const why = (core_mod.settingsProblem(app.io, app.arena, paths) catch null) orelse "a settings file has an error, or one of config.ini, rules, logins.ini, mcp.ini and folders.ini can be changed by other users (chmod 600 them)";
                     complain("{s}", .{why});
                 },
                 else => complain("can't open {s}: {s}", .{ app.home, @errorName(e) }),
