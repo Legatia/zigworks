@@ -249,29 +249,44 @@ fn shell(env: Env, arena: std.mem.Allocator, command: []const u8, dir: []const u
     if (env.home.len > 0) try vars.put("HOME", env.home);
     try vars.put("LANG", "C.UTF-8");
     try vars.put("TERM", "dumb");
-    const argv: []const []const u8 = if (is_windows) &.{ "cmd.exe", "/c", command } else &.{ "/bin/sh", "-c", command };
     // Windows: in a job before it can start anything (see proc.zig)
     var job = proc.Job.create();
     defer job.close();
-    var child = try std.process.spawn(env.io, .{
-        .argv = argv,
-        .cwd = .{ .path = cwd },
-        .environ_map = &vars,
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        .pgid = if (is_windows) null else 0,
-        .start_suspended = is_windows,
-        .create_no_window = true,
-    });
+    var child = if (is_windows)
+        // cmd reads the command as typed, quotes and all (proc.cmdLine)
+        try proc.spawnRaw(env.io, arena, .{
+            .app = try std.fs.path.join(arena, &.{ try proc.systemDir(arena), "cmd.exe" }),
+            .command_line = try proc.cmdLine(arena, command),
+            .env = &vars,
+            .cwd = cwd,
+        })
+    else
+        try std.process.spawn(env.io, .{
+            .argv = &.{ "/bin/sh", "-c", command },
+            .cwd = .{ .path = cwd },
+            .environ_map = &vars,
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .pgid = 0,
+        });
     job.adopt(&child);
+    return runChild(env, arena, &child, &job);
+}
+
+/// What a started command writes, under the shell's limits: its output
+/// masked and capped, and the time limit and a stop ending every process
+/// it started (its process group on POSIX, `job` on Windows), as when it
+/// ends by itself. `child` has stdout and stderr as pipes; on POSIX it
+/// leads its own process group, on Windows `job` has adopted it.
+pub fn runChild(env: Env, arena: std.mem.Allocator, child: *std.process.Child, job: *proc.Job) !Output {
     // more than is shown: masking can shorten it, and a value cut at the
     // end is left out
     var col: Collector = .{ .cap = @as(usize, env.tool_output_bytes) * 2 + 4096, .gpa = arena };
     var watch: Watch = .{
         .io = env.io,
         .id = child.id.?,
-        .job = &job,
+        .job = job,
         .stop = env.stop,
         .deadline_ns = Io.Clock.awake.now(env.io).nanoseconds + @as(i128, env.shell_seconds) * std.time.ns_per_s,
     };
@@ -1104,6 +1119,22 @@ test "a_child_that_keeps_the_output_open_does_not_hang_the_command_windows" {
     try t.expect(took_ms < 5000);
     try t.expect(std.mem.indexOf(u8, o.text, "started") != null);
     try t.expect(std.mem.startsWith(u8, o.text, "exit code 0"));
+}
+
+test "a_command_with_quotes_reads_as_typed_windows" {
+    if (!is_windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    f.env.path_var = try proc.systemDir(f.e.arena.allocator());
+    try f.e.tmp.dir.createDirPath(t.io, "ws/two words");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/two words/a b.txt", .data = "quoted path read\r\n" });
+    // a path with spaces, quoted, and a quote in what is echoed
+    const o = try f.call(.shell, "{\"command\":\"type \\\"two words\\\\a b.txt\\\" && echo say \\\"hi\\\"\"}");
+    if (o.is_error) std.debug.print("{s}\n", .{o.text});
+    try t.expect(!o.is_error);
+    try t.expect(std.mem.indexOf(u8, o.text, "quoted path read") != null);
+    try t.expect(std.mem.indexOf(u8, o.text, "say \"hi\"") != null);
 }
 
 test "fetch_gives_readable_text_in_pages" {
