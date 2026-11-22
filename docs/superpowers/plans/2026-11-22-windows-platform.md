@@ -112,3 +112,40 @@ Rulings:
 - `env key` writes to the log (key made, host key kept) through Core, so
   it can't run while `harness run` holds the folder, like the other
   commands that open it.
+
+## 3. The app server (branch `win/app-server`, on `win/remote`)
+
+Built: `apps.zig` (app.ini and the folder checked; approval by digest in
+`state/apps/NAME/approved`, a new version when the files changed),
+`appserver.zig` (127.0.0.1 alone on an exclusive port; per-start key and
+shell token, apps' tokens as HMACs of name and version; Host, Origin and
+frame checks; the headers and both CSPs; the sandboxed frame; paths mapped
+to files, never passed through; 32 connections; a stop within 2 s), the
+built-ins inbox, log and files, `[apps] on|port`, `harness run`/`chat`
+printing the link, `/apps`, `/app approve|rm`, `harness app
+list|approve|rm`, log kind `app`.
+
+Tests: the spec's server tests (manifests, paths over names and HTTP,
+loopback alone, Host/token/Origin, tokens per start and version, HTML
+only into a frame, headers and CSP, changed outside harness, built-ins,
+stop within 2 s) and the chat commands. By hand, headless Chrome on
+Windows over the DevTools pipe: the frame runs its own script and not an
+inline one, can't read the shell, storage or cookies, can't fetch another
+port or site or open a window, reaches its own `api/`, origin `null`.
+
+Rulings:
+
+- `[apps] on` is off by default (the spec has on): until the API is in,
+  apps read nothing and the built-ins say so.
+- The built-ins live in `src/apps/` (`@embedFile` reaches only the
+  module's folder), not `harness/apps/`.
+- Not built here (each needs the gate's app parts, phase 0 is in but the
+  inbox is not): the API (reads, acts, runs), `app_draft`/`app_save` and
+  the review page, versions, fork and revert, the bar.
+- On Windows a second bind on the exclusive port fails with access denied
+  (WSAEACCES) when it asks for SO_REUSEADDR, address in use otherwise;
+  both are refusals.
+- The desktop app's browser pane blocks frames to local servers
+  (ERR_BLOCKED_BY_CLIENT), so the frame was checked in headless Chrome;
+  `app_frame_cannot_get_out` as a unit test needs cdp.zig to attach to
+  frame targets, which it doesn't yet.
