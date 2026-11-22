@@ -1123,7 +1123,7 @@ const Collector = struct {
     }
 };
 
-const Ended = enum { stopped, timeout };
+const Ended = enum { stopped, timeout, download };
 
 const Watch = struct {
     io: Io,
@@ -1134,6 +1134,10 @@ const Watch = struct {
     reason: ?Ended = null,
     /// The browser was reaped: its pid and group id may be another's now.
     reaped: std.atomic.Value(bool) = .init(false),
+    /// Made by the browser when the address turns out to be a download
+    /// (refused, see prepareProfile). On Linux headless Chrome then waits
+    /// for a page that never comes, so its appearing ends the run.
+    download_dir: []const u8 = "",
 
     fn run(w: *Watch) void {
         while (!w.done.load(.acquire)) {
@@ -1141,6 +1145,10 @@ const Watch = struct {
                 w.reason = .stopped;
                 break;
             }
+            if (w.download_dir.len > 0) if (Io.Dir.cwd().statFile(w.io, w.download_dir, .{})) |_| {
+                w.reason = .download;
+                break;
+            } else |_| {};
             if (Io.Clock.awake.now(w.io).nanoseconds >= w.deadline_ns) {
                 w.reason = .timeout;
                 break;
@@ -1363,6 +1371,7 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
         .id = child.id.?,
         .stop = stop,
         .deadline_ns = Io.Clock.awake.now(io).nanoseconds + @as(i128, timeout_ms) * std.time.ns_per_ms,
+        .download_dir = try std.fs.path.join(arena, &.{ profile, "Downloads" }),
     };
     const th_watch = try std.Thread.spawn(.{}, Watch.run, .{&watch});
     var term: ?std.process.Child.Term = null;
@@ -1399,14 +1408,18 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
     if (watch.reason) |r| return switch (r) {
         .stopped => error.Stopped,
         .timeout => error.Timeout,
+        .download => error.DownloadRefused,
     };
     if (col.buf.items.len == 0) {
         // the address was a download: refused (see prepareProfile), and
-        // nothing to show; its folder is made when one starts
+        // nothing to show. Its folder is made when one starts, but a
+        // browser that ends at once may not have made it yet; a page
+        // always prints at least <html>…</html>, so printing nothing and
+        // ending well is a download too
         const dl = try std.fs.path.join(arena, &.{ profile, "Downloads" });
         if (Io.Dir.cwd().statFile(io, dl, .{})) |_| return error.DownloadRefused else |_| {}
         const ok = if (term) |tm| tm == .exited and tm.exited == 0 else false;
-        return if (ok) "" else error.BrowserFailed;
+        return if (ok) error.DownloadRefused else error.BrowserFailed;
     }
     return try arena.dupe(u8, col.buf.items);
 }
@@ -1937,6 +1950,24 @@ test "render_keeps_downloads_off_and_inside_the_profile" {
     try g.setPermissions(t.io, .fromMode(0o755));
     g.close(t.io);
     try t.expectError(error.DownloadRefused, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "dl" }), "http://example.com/file.zip", root, &stop, 5000, 1 << 20, test_env));
+}
+
+test "render_says_a_download_even_when_the_browser_ends_before_its_folder_is_made" {
+    if (is_windows) return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    // the browser ends at once, printing nothing and making no folder (a
+    // helper killed with it never made it): still a download, not a page
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "quiet", .data = "#!/bin/sh\nexit 0\n" });
+    var g = try tmp.dir.openFile(t.io, "quiet", .{});
+    try g.setPermissions(t.io, .fromMode(0o755));
+    g.close(t.io);
+    var stop: std.atomic.Value(bool) = .init(false);
+    try t.expectError(error.DownloadRefused, render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "quiet" }), "http://example.com/file.zip", root, &stop, 5000, 1 << 20, test_env));
 }
 
 test "render_removes_throwaway_profiles_a_killed_run_left" {

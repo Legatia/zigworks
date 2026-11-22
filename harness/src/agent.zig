@@ -1863,6 +1863,7 @@ test "tool_call_then_answer" {
     try t.expectEqualStrings("Written.", r.text);
     const req2 = try f.e.request(2);
     try t.expect(std.mem.indexOf(u8, req2, "\"tool_result\",\"tool_use_id\":\"tu_1\"") != null);
+    if (std.mem.indexOf(u8, req2, "wrote 2 bytes to a.txt") == null) std.debug.print("request 2: {s}\n", .{util.cut(req2, 3000)});
     try t.expect(std.mem.indexOf(u8, req2, "wrote 2 bytes to a.txt") != null);
     const lt = try f.logText();
     try t.expect(std.mem.indexOf(u8, lt, "\"kind\":\"gate\"") != null);

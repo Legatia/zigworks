@@ -795,6 +795,7 @@ test "files_confined_to_workspace" {
     try f.init();
     defer f.deinit();
     const w = try f.call(.write_file, "{\"path\":\"notes/a.txt\",\"content\":\"hello\"}");
+    if (w.is_error) std.debug.print("write_file said: {s}\n", .{w.text});
     try t.expect(!w.is_error);
     const r = try f.call(.read_file, "{\"path\":\"notes/a.txt\"}");
     try t.expectEqualStrings("hello", r.text);

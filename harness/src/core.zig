@@ -3985,14 +3985,15 @@ test "mcp_servers_start_together_under_one_deadline" {
     defer f.deinit();
     const a = f.e.arena.allocator();
     const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
-    f.core.mcp_start_ms = 1500;
-    // two that take half a second to come up, one that never answers
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[one]\ncommand = /bin/sh -c \"sleep 0.5; exec '{s}' --mcp\"\n[two]\ncommand = /bin/sh -c \"sleep 0.5; exec '{s}' --mcp\"\n[mute]\ncommand = /bin/sh -c \"exec sleep 30\"\n", .{ fake, fake }) });
+    f.core.mcp_start_ms = 2500;
+    // two that take a second to come up, one that never answers
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[one]\ncommand = /bin/sh -c \"sleep 1; exec '{s}' --mcp\"\n[two]\ncommand = /bin/sh -c \"sleep 1; exec '{s}' --mcp\"\n[mute]\ncommand = /bin/sh -c \"exec sleep 30\"\n", .{ fake, fake }) });
     const t0 = Io.Clock.awake.now(t.io).nanoseconds;
     try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
     const took_ms = @divFloor(Io.Clock.awake.now(t.io).nanoseconds - t0, std.time.ns_per_ms);
-    // one after another: 0.5 + 0.5 + 1.5 s; together: the deadline
-    try t.expect(took_ms < 2300);
+    // one after another: 1 + 1 + 2.5 s at least; together: the deadline,
+    // with room for a slow machine (a CI runner took over 2.3 s for 1.5)
+    try t.expect(took_ms < 4000);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "one (3 tools)") != null);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "two (3 tools)") != null);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "mute: did not start (Timeout)") != null);
