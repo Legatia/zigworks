@@ -2366,9 +2366,10 @@ test "a_helpers_question_after_the_deadline_is_not_asked" {
     defer f.deinit();
     try withHelpers(&f);
     f.run.limits.turn_seconds = 2;
-    // the first question is answered after the turn's end; the second
+    // the first question is answered after the turn's end (a 2 s turn ends
+    // 2 to 3 s after it began: its end is a whole second); the second
     // helper's question waits behind it and can't be answered in time
-    f.ask_ms = 2500;
+    f.ask_ms = 3500;
     try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"one\",\"tools\":[\"shell\"]},{\"task\":\"two\",\"tools\":[\"shell\"]}]}"));
     try f.e.script(2, model.toolReply("w1", "shell", "{\"command\":\"echo one\"}"));
     try f.e.script(3, model.toolReply("w2", "shell", "{\"command\":\"echo two\"}"));
