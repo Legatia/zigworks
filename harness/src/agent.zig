@@ -1081,7 +1081,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     // asked too; by its path inside the workspace, as the gate sees it
     if (tool == .write_file) if (r.written) |w| {
         const cf = gate.confined(a, r.io, r.env.workspace, arg) catch null;
-        w.add(if (cf) |x| x.rel else arg);
+        w.addBy(if (cf) |x| x.rel else arg, try std.fmt.allocPrint(a, "agent:{s}", .{r.who.agent}), r.label);
     };
 
     const out: tools.Output = switch (tool) {
@@ -1240,7 +1240,9 @@ fn decideAndAskIn(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const 
     var why = d.why;
     // files the agent wrote since the owner last allowed a command: one
     // that a rule or a grant allows is asked first, naming them
-    const wrote: ?Written.Listed = if (tool != .shell) null else if (r.written) |w| try w.list(a) else null;
+    // named for the asker: files it wrote itself go without who wrote them
+    const writer: Written.Writer = .{ .who = try std.fmt.allocPrint(a, "agent:{s}", .{r.who.agent}), .run = r.label };
+    const wrote: ?Written.Listed = if (tool != .shell) null else if (r.written) |w| try w.listFor(a, writer, null) else null;
     if (wrote != null and action == .allow) {
         if (r.scheduled or r.asker == null) {
             action = .deny;
@@ -1377,9 +1379,9 @@ pub const Skipped = struct {
 /// a shell command. Commands read files where they run (pkg.py for
 /// `python3 -m pkg`, conftest.py, a Makefile), so one that a rule or a 24 h
 /// grant allows could run what the agent wrote: while any is listed, a
-/// shell command is asked, naming them, until the owner allows one. One per
-/// instance, shared by its runs and their helpers, and kept in `path` (when
-/// set) so a restart does not drop it.
+/// shell command is asked, naming them and who wrote each, until the owner
+/// allows one. One per instance, shared by its runs and their helpers, and
+/// kept in `path` (when set) so a restart does not drop it.
 pub const Written = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -1393,13 +1395,22 @@ pub const Written = struct {
     /// The number of the last write.
     seq: u64 = 0,
 
-    const Entry = struct { path: []u8, seq: u64 };
+    /// `writer`: who wrote it and the run's label (`agent:helper chat/h1`);
+    /// "" when not known (a list kept by harness 0.3).
+    const Entry = struct { path: []u8, seq: u64, writer: []u8 };
     const max = 256;
     /// Names a question shows; the rest are counted.
     const shown = 20;
 
     /// What a question says, and the last write it covers.
     pub const Listed = struct { text: []const u8, upto: u64 };
+
+    /// Who writes a file: a definition (`agent:NAME`) or an app's own call
+    /// (`app:NAME`), and the run's label ("" for none).
+    pub const Writer = struct { who: []const u8, run: []const u8 = "" };
+
+    /// The first line of a list that names who wrote each file.
+    pub const file_head = "# harness written 2: files written since you last allowed a command: the path, then who wrote it and the run; tab-separated, with \\ \\t \\r \\n escaped\n";
 
     /// The list kept in `path` ("" for none), if there is one.
     pub fn init(gpa: std.mem.Allocator, io: Io, path: []const u8) Written {
@@ -1409,22 +1420,39 @@ pub const Written = struct {
     }
 
     pub fn deinit(w: *Written) void {
-        for (w.items.items) |e| w.gpa.free(e.path);
+        for (w.items.items) |e| {
+            w.gpa.free(e.path);
+            w.gpa.free(e.writer);
+        }
         w.items.deinit(w.gpa);
     }
 
-    /// `rel` (a path inside the workspace) is being written.
+    /// `rel` (a path inside the workspace) is being written, by someone not
+    /// named.
     pub fn add(w: *Written, rel: []const u8) void {
+        w.addBy(rel, "", "");
+    }
+
+    /// `rel` (a path inside the workspace) is being written by `who` (see
+    /// `Writer`) in the run labelled `run`.
+    pub fn addBy(w: *Written, rel: []const u8, who: []const u8, run: []const u8) void {
         w.mutex.lockUncancelable(w.io);
         defer w.mutex.unlock(w.io);
-        w.note(rel);
+        var buf: [256]u8 = undefined;
+        const writer = if (who.len == 0) "" else if (run.len == 0) who else std.fmt.bufPrint(&buf, "{s} {s}", .{ who, util.cut(run, 120) }) catch who;
+        w.note(rel, writer);
         w.save();
     }
 
-    fn note(w: *Written, rel: []const u8) void {
+    fn note(w: *Written, rel: []const u8, writer: []const u8) void {
         w.seq += 1;
         for (w.items.items) |*e| if (std.mem.eql(u8, e.path, rel)) {
             e.seq = w.seq;
+            // the last writer is the one named
+            if (!std.mem.eql(u8, e.writer, writer)) if (w.gpa.dupe(u8, writer)) |dup| {
+                w.gpa.free(e.writer);
+                e.writer = dup;
+            } else |_| {};
             return;
         };
         if (w.items.items.len >= max) {
@@ -1432,77 +1460,117 @@ pub const Written = struct {
             w.more_seq = w.seq;
             return;
         }
-        const p = w.gpa.dupe(u8, rel) catch {
-            w.more += 1;
-            w.more_seq = w.seq;
-            return;
-        };
-        w.items.append(w.gpa, .{ .path = p, .seq = w.seq }) catch {
+        const p = w.gpa.dupe(u8, rel) catch return w.counted();
+        const by = w.gpa.dupe(u8, writer) catch {
             w.gpa.free(p);
-            w.more += 1;
-            w.more_seq = w.seq;
+            return w.counted();
+        };
+        w.items.append(w.gpa, .{ .path = p, .seq = w.seq, .writer = by }) catch {
+            w.gpa.free(p);
+            w.gpa.free(by);
+            w.counted();
         };
     }
 
-    /// "a.py, b/c.txt and 3 more", or null when nothing was written.
+    /// A write that could not be kept by name.
+    fn counted(w: *Written) void {
+        w.more += 1;
+        w.more_seq = w.seq;
+    }
+
+    /// "a.py, b/c.txt (agent:helper, chat/h1) and 3 more", or null when
+    /// nothing was written.
     pub fn list(w: *Written, arena: std.mem.Allocator) !?Listed {
+        return w.listFor(arena, null, null);
+    }
+
+    /// The list as `asker` is asked about it: each file names who wrote it
+    /// (`(agent:helper, chat/h1)`, `(who unknown)` for one from harness
+    /// 0.3) unless that is the asker. With `view` (what a networked
+    /// sandbox mounts, gap 2), only the files it can see; counted ones stay
+    /// counted. Null when nothing is listed.
+    pub fn listFor(w: *Written, arena: std.mem.Allocator, asker: ?Writer, view: ?[]const folders_mod.Mount) !?Listed {
         w.mutex.lockUncancelable(w.io);
         defer w.mutex.unlock(w.io);
-        const n = w.items.items.len;
-        if (n == 0 and w.more == 0) return null;
         var out: std.ArrayList(u8) = .empty;
-        for (w.items.items[0..@min(n, shown)], 0..) |e, i| {
-            if (i > 0) try out.appendSlice(arena, ", ");
+        var n: usize = 0;
+        for (w.items.items) |e| {
+            if (view) |v| if (!folders_mod.sees(v, e.path)) continue;
+            n += 1;
+            if (n > shown) continue;
+            if (n > 1) try out.appendSlice(arena, ", ");
             // a name is the model's: no line breaks in the question from it
             for (util.cut(e.path, 200)) |ch| try out.append(arena, if (ch < 0x20 or ch == 0x7f) '?' else ch);
+            try out.appendSlice(arena, try writerNote(arena, e.writer, asker));
         }
+        if (n == 0 and w.more == 0) return null;
         const rest = n -| shown + w.more;
         if (rest > 0) try out.print(arena, "{s}{d} more", .{ if (out.items.len > 0) " and " else "", rest });
         return .{ .text = out.items, .upto = w.seq };
     }
 
+    /// " (WHO, RUN)" for a file someone other than `asker` wrote.
+    fn writerNote(arena: std.mem.Allocator, writer: []const u8, asker: ?Writer) ![]const u8 {
+        if (writer.len == 0) return " (who unknown)";
+        const sp = std.mem.indexOfScalar(u8, writer, ' ');
+        const who = writer[0 .. sp orelse writer.len];
+        const run = if (sp) |i| writer[i + 1 ..] else "";
+        if (asker) |as| if (std.mem.eql(u8, who, as.who) and std.mem.eql(u8, run, util.cut(as.run, 120))) return "";
+        return if (run.len == 0) try std.fmt.allocPrint(arena, " ({s})", .{who}) else try std.fmt.allocPrint(arena, " ({s}, {s})", .{ who, run });
+    }
+
     /// The owner allowed a command after seeing the files written up to
     /// write `upto`: those are no longer listed (one written again since is).
     pub fn clear(w: *Written, upto: u64) void {
+        w.clearIn(upto, null);
+    }
+
+    /// `clear` for a command asked about with `view`: the files it could
+    /// not see stay listed for the next command on the host.
+    pub fn clearIn(w: *Written, upto: u64, view: ?[]const folders_mod.Mount) void {
         w.mutex.lockUncancelable(w.io);
         defer w.mutex.unlock(w.io);
         var i: usize = 0;
         while (i < w.items.items.len) {
             const e = w.items.items[i];
-            if (e.seq <= upto) {
+            const seen = if (view) |v| folders_mod.sees(v, e.path) else true;
+            if (e.seq <= upto and seen) {
                 w.gpa.free(e.path);
+                w.gpa.free(e.writer);
                 _ = w.items.orderedRemove(i);
             } else i += 1;
         }
-        if (w.more_seq <= upto) w.more = 0;
+        if (view == null and w.more_seq <= upto) w.more = 0;
         w.save();
     }
 
-    /// One path a line; "/more N" (never a path inside the workspace) for
-    /// those only counted, and for names with a line break. Under the
-    /// mutex; a failed save keeps the list in memory all the same.
+    /// `file_head`, then a file a line (path, then who and run; escaped),
+    /// then "/more N" (never a path: those are escaped) for those only
+    /// counted. Under the mutex; a failed save keeps the list in memory
+    /// all the same.
     fn save(w: *Written) void {
         if (w.path.len == 0) return;
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(w.gpa);
-        var counted = w.more;
+        out.appendSlice(w.gpa, file_head) catch return;
         for (w.items.items) |e| {
-            if (std.mem.indexOfAny(u8, e.path, "\r\n") != null) {
-                counted += 1;
-                continue;
-            }
-            out.print(w.gpa, "{s}\n", .{e.path}) catch return;
+            util.escapeField(&out, w.gpa, e.path) catch return;
+            out.append(w.gpa, '\t') catch return;
+            util.escapeField(&out, w.gpa, e.writer) catch return;
+            out.append(w.gpa, '\n') catch return;
         }
-        if (counted > 0) out.print(w.gpa, "/more {d}\n", .{counted}) catch return;
+        if (w.more > 0) out.print(w.gpa, "/more {d}\n", .{w.more}) catch return;
         Io.Dir.cwd().writeFile(w.io, .{ .sub_path = w.path, .data = out.items, .flags = .{ .permissions = util.private_file } }) catch {};
     }
 
     fn load(w: *Written) void {
         const text = Io.Dir.cwd().readFileAlloc(w.io, w.path, w.gpa, .limited(1 << 20)) catch return;
         defer w.gpa.free(text);
+        // without the first line, harness 0.3's: a path a line, writer unknown
+        const named = std.mem.startsWith(u8, text, "#");
         var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |line| {
-            if (line.len == 0) continue;
+            if (line.len == 0 or (named and line[0] == '#')) continue;
             if (std.mem.startsWith(u8, line, "/more ")) {
                 const k = std.fmt.parseInt(usize, line[6..], 10) catch 1;
                 w.seq += 1;
@@ -1510,7 +1578,20 @@ pub const Written = struct {
                 w.more_seq = w.seq;
                 continue;
             }
-            w.note(line);
+            if (!named) {
+                w.note(line, "");
+                continue;
+            }
+            const tab = std.mem.indexOfScalar(u8, line, '\t') orelse line.len;
+            const p = util.unescapeField(w.gpa, line[0..tab]) catch {
+                w.seq += 1;
+                w.counted();
+                continue;
+            };
+            defer w.gpa.free(p);
+            const by = util.unescapeField(w.gpa, if (tab < line.len) line[tab + 1 ..] else "") catch "";
+            defer if (by.len > 0) w.gpa.free(by);
+            w.note(p, by);
         }
     }
 };
@@ -3602,4 +3683,72 @@ test "folder_vars_reach_a_host_command_masked" {
     try t.expect(std.mem.indexOf(u8, try f.logText(), value) == null);
     // no secret crosses into a sandbox
     try t.expectEqual(0, (try folderVars(&f.run, a, "box", "work")).vars.len);
+}
+
+test "written_entries_name_who_wrote_them" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(t.io, ".", a), "written" });
+    const asker: Written.Writer = .{ .who = "agent:main", .run = "chat" };
+    const want = "notes/a.md (agent:helper, chat/h1), b.py, odd?name?.txt (agent:main, task build)";
+    {
+        var w: Written = .init(t.allocator, t.io, path);
+        defer w.deinit();
+        w.addBy("notes/a.md", "agent:helper", "chat/h1");
+        w.addBy("b.py", "agent:main", "chat");
+        w.addBy("odd\tname\n.txt", "agent:main", "task build");
+        try t.expectEqualStrings(want, (try w.listFor(a, asker, null)).?.text);
+    }
+    // kept across a restart
+    var again: Written = .init(t.allocator, t.io, path);
+    defer again.deinit();
+    try t.expectEqualStrings(want, (try again.listFor(a, asker, null)).?.text);
+    // a file from harness 0.3: a path a line, who wrote them unknown
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "written", .data = "x.py\nold dir/y.txt\n/more 2\n" });
+    var old: Written = .init(t.allocator, t.io, path);
+    defer old.deinit();
+    try t.expectEqualStrings("x.py (who unknown), old dir/y.txt (who unknown) and 2 more", (try old.listFor(a, asker, null)).?.text);
+}
+
+test "a_networked_sandbox_is_asked_only_about_files_it_can_see" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var w: Written = .init(t.allocator, t.io, "");
+    defer w.deinit();
+    w.addBy("private/k", "agent:main", "chat");
+    w.addBy("notes/a", "agent:helper", "chat/h1");
+    const asker: Written.Writer = .{ .who = "agent:main", .run = "chat" };
+    // a stand-in for gap 2's networked sandbox: what it mounts
+    const view = [_]folders_mod.Mount{ .{ .folder = "", .access = .read }, .{ .folder = "private", .access = .none } };
+    const seen = (try w.listFor(a, asker, &view)).?;
+    try t.expectEqualStrings("notes/a (agent:helper, chat/h1)", seen.text);
+    // allowed after seeing those: the others stay listed for the host
+    w.clearIn(seen.upto, &view);
+    try t.expectEqualStrings("private/k", (try w.listFor(a, asker, null)).?.text);
+    const blind = [_]folders_mod.Mount{.{ .folder = "", .access = .none }};
+    try t.expectEqual(null, try w.listFor(a, asker, &blind));
+}
+
+test "a_helpers_write_is_named_in_the_next_question" {
+    var f: Fix = undefined;
+    try f.init("allow shell echo *\n");
+    defer f.deinit();
+    try withHelpers(&f);
+    var written: Written = .init(t.allocator, t.io, "");
+    defer written.deinit();
+    f.run.written = &written;
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"write h\",\"tools\":[\"write_file\"]}]}"));
+    try f.e.script(2, model.toolReply("h1", "write_file", "{\"path\":\"notes/h.md\",\"content\":\"x\"}"));
+    try f.e.script(3, model.textReply("written"));
+    try f.e.script(4, model.toolReply("tu_2", "shell", "{\"command\":\"echo x\"}"));
+    try f.e.script(5, model.textReply("done"));
+    const r = try f.say("go");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    if (!std.mem.endsWith(u8, f.last_what, "since you last allowed a command: notes/h.md (agent:helper, chat/h1)")) std.debug.print("asked: {s}\n", .{f.last_what});
+    try t.expect(std.mem.endsWith(u8, f.last_what, "since you last allowed a command: notes/h.md (agent:helper, chat/h1)"));
 }

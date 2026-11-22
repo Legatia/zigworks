@@ -196,6 +196,42 @@ fn isCont(c: u8) bool {
     return c & 0xc0 == 0x80;
 }
 
+/// `text` as a tab-separated field holds it: `\`, tab, CR and LF as `\\`,
+/// `\t`, `\r`, `\n`, so it can't end its line or its field.
+pub fn escapeField(out: *std.ArrayList(u8), gpa: std.mem.Allocator, text: []const u8) !void {
+    for (text) |c| switch (c) {
+        '\\' => try out.appendSlice(gpa, "\\\\"),
+        '\t' => try out.appendSlice(gpa, "\\t"),
+        '\r' => try out.appendSlice(gpa, "\\r"),
+        '\n' => try out.appendSlice(gpa, "\\n"),
+        else => try out.append(gpa, c),
+    };
+}
+
+/// The text an `escapeField` field holds; error.BadEscape for one it
+/// could not have written.
+pub fn unescapeField(gpa: std.mem.Allocator, field: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < field.len) : (i += 1) {
+        if (field[i] != '\\') {
+            try out.append(gpa, field[i]);
+            continue;
+        }
+        i += 1;
+        if (i == field.len) return error.BadEscape;
+        try out.append(gpa, switch (field[i]) {
+            '\\' => '\\',
+            't' => '\t',
+            'r' => '\r',
+            'n' => '\n',
+            else => return error.BadEscape,
+        });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 const t = std.testing;
 
 test "systemVars_takes_only_the_named_ones_that_are_set" {
