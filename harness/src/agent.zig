@@ -752,7 +752,10 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const started = r.now();
-    const deadline = started + r.limits.turn_seconds;
+    // a helper's run carries its parent's deadline: it never ends later,
+    // even when a second ticks over between the two (whole seconds)
+    const own_end = started + r.limits.turn_seconds;
+    const deadline = if (r.helper and r.deadline_s > 0) @min(own_end, r.deadline_s) else own_end;
 
     {
         r.lock.lockUncancelable(r.io);

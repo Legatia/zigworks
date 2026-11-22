@@ -3991,10 +3991,12 @@ test "mcp_servers_start_together_under_one_deadline" {
     const t0 = Io.Clock.awake.now(t.io).nanoseconds;
     try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
     const took_ms = @divFloor(Io.Clock.awake.now(t.io).nanoseconds - t0, std.time.ns_per_ms);
-    // one after another: 2 + 2 + 3 s at least; together: the deadline,
-    // with room for a slow machine (a CI runner went past 4 s with less)
-    if (took_ms >= 5500) std.debug.print("reload took {d} ms; notes:\n{s}\n", .{ took_ms, f.core.mcp_note });
-    try t.expect(took_ms < 5500);
+    // together: both two-second servers are up by the 3 s deadline (one
+    // after another, the second would be cut at it). The time only
+    // catches a hang: ending the servers took over 3 s more on a slow CI
+    // runner
+    if (took_ms >= 15000) std.debug.print("reload took {d} ms; notes:\n{s}\n", .{ took_ms, f.core.mcp_note });
+    try t.expect(took_ms < 15000);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "one (3 tools)") != null);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "two (3 tools)") != null);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "mute: did not start (Timeout)") != null);
@@ -4009,18 +4011,22 @@ test "reload_holds_no_lock_while_servers_start_and_stop_cuts_it_short" {
     defer f.deinit();
     const a = f.e.arena.allocator();
     const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[slow]\ncommand = /bin/sh -c \"sleep 3; exec '{s}' --mcp\"\n", .{fake}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[slow]\ncommand = /bin/sh -c \"sleep 8; exec '{s}' --mcp\"\n", .{fake}) });
     const t0 = Io.Clock.awake.now(t.io).nanoseconds;
     const th = try std.Thread.spawn(.{}, reloadQuietly, .{f.core});
     t.io.sleep(.fromMilliseconds(300), .awake) catch {};
-    // /stop and the scheduler's tick do not wait for the start
+    // /stop and the scheduler's tick do not wait for the start (8 s)
     _ = f.core.stopAll();
     f.core.last_status_s = 0;
     f.core.tick();
-    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - t0 < 1500 * std.time.ns_per_ms);
+    const t1 = Io.Clock.awake.now(t.io).nanoseconds - t0;
+    if (t1 >= 4000 * std.time.ns_per_ms) std.debug.print("stop and tick took {d} ms\n", .{@divFloor(t1, std.time.ns_per_ms)});
+    try t.expect(t1 < 4000 * std.time.ns_per_ms);
     th.join();
-    // and the stop ended the start instead of waiting it out
-    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - t0 < 2800 * std.time.ns_per_ms);
+    // and the stop ended the start instead of waiting it out (8 s)
+    const t2 = Io.Clock.awake.now(t.io).nanoseconds - t0;
+    if (t2 >= 6000 * std.time.ns_per_ms) std.debug.print("reload ended after {d} ms\n", .{@divFloor(t2, std.time.ns_per_ms)});
+    try t.expect(t2 < 6000 * std.time.ns_per_ms);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "slow: did not start (Stopped)") != null);
 }
 
