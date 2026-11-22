@@ -1159,7 +1159,7 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
             why = if (r.env.stop.load(.acquire)) "stopped by the owner" else "no time left in the turn to ask the owner";
             break :ask;
         };
-        if (r.deadline_s > 0 and r.now() >= r.deadline_s) {
+        if (r.deadline_s > 0 and r.deadline_s * 1000 - util.nowMs(r.io) < 100) {
             if (r.ask_lock) |l| l.unlock(r.io);
             why = "no time left in the turn to ask the owner";
             break :ask;
@@ -2044,6 +2044,7 @@ test "a_fetch_and_a_web_action_get_only_what_is_left_of_the_turn" {
     freeResult(&f.run, r);
     try t.expect(started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2500);
     const log = try f.logText();
+    if (std.mem.indexOf(u8, log, "no time left in this turn") == null) std.debug.print("log:\n{s}\n", .{util.cut(log, 6000)});
     try t.expect(std.mem.indexOf(u8, log, "the turn's time is up") != null);
     try t.expect(std.mem.indexOf(u8, log, "no time left in this turn") != null);
     // the web call asked nobody
