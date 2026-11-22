@@ -26,6 +26,10 @@ them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 45 checks that drives the real binary against
 stand-ins for omnigate, Telegram, feeds, search and two MCP servers. An
 earlier build of 0.3.0 also passed its tests in CI on Linux and Windows.
+On Windows 11 the browser and login tests also run, against Chrome 157
+(357 unit tests pass, 36 skip there), and the console, lock, Credential
+Manager and process-cleanup checks of HANDOFF-windows-audit.md were run by
+hand.
 Nothing has run yet against a real omnigate, Telegram bot, MCP server or
 website.** See [Limits](#limits).
 
@@ -465,13 +469,17 @@ while `harness run` holds the folder and has ticked in the last 90 s.
   fields, one day total per server: keep each server's money tools in one
   unit (say USD). They trust the tool to mean what that field says.
 - **The Windows Credential Manager** keeps at most 2560 bytes of a value;
-  `secret add` refuses longer ones.
+  `secret add` refuses longer ones. A login's passkeys (about 300 bytes
+  each) are kept there in parts once they don't fit in one.
 - **One owner, one chat.** Messages sent while the agent works are queued.
-- **`web` is macOS and Linux only** for now (Chrome is driven through
-  pipes on file descriptors 3 and 4); on Windows it is not offered.
+- **`web` drives Chrome through pipes**, never a network port: file
+  descriptors 3 and 4 on macOS and Linux; on Windows two pipe handles
+  Chrome inherits alone (`--remote-debugging-io-pipes`), with the browser
+  and its helpers in a job object.
 - **Login cookies are on disk** in `profiles/NAME`, readable by you (the
-  folder is 0700), like any browser profile. Anyone who can read the data
-  folder can use those sessions.
+  folder is 0700; on Windows the data folder's permissions protect it),
+  like any browser profile. Anyone who can read the data folder can use
+  those sessions.
 - **Site binding is by host name.** A login for `example.com` is typed on
   any name below it, and its passkeys are kept only for the site or a name
   below it; a site needs a dot (except `localhost`), but harness doesn't
@@ -479,8 +487,7 @@ while `harness run` holds the folder and has ticked in the last 90 s.
 
 Not in 0.3.0: the Agent Client Protocol server, desktop use (headdesk), a
 sandbox per command, WhatsApp and voice, helpers that report back later,
-cards and payments for the agent, the browser on Windows, screenshots,
-and the hosted service.
+cards and payments for the agent, screenshots, and the hosted service.
 
 ## Build
 

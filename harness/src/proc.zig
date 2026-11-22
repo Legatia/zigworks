@@ -87,20 +87,45 @@ pub const Job = struct {
 /// Looks every 100 ms on POSIX, 20 ms on Windows.
 pub fn waitReadable(io: Io, f: Io.File, ended: *const std.atomic.Value(bool)) bool {
     while (!ended.load(.acquire)) {
-        if (is_windows) {
+        if (readableWithin(io, f, 100)) return true;
+    }
+    return false;
+}
+
+/// Whether the pipe `f` has bytes to read, or its other end closed, within
+/// `ms` (true: a read now returns at once).
+pub fn readableWithin(io: Io, f: Io.File, ms: u32) bool {
+    if (is_windows) {
+        var waited: u32 = 0;
+        while (true) : (waited += 20) {
             var avail: u32 = 0;
             // fails when the writers are gone: the read then sees the end
             if (!win.PeekNamedPipe(f.handle, null, 0, null, &avail, null).toBool()) return true;
             if (avail > 0) return true;
+            if (waited >= ms) return false;
             io.sleep(.fromMilliseconds(20), .awake) catch {};
-        } else {
-            var fds = [_]std.posix.pollfd{.{ .fd = f.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-            const n = std.posix.poll(&fds, 100) catch return true;
-            if (n > 0) return true;
         }
+    } else {
+        var fds = [_]std.posix.pollfd{.{ .fd = f.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const n = std.posix.poll(&fds, @intCast(ms)) catch return true;
+        return n > 0;
     }
-    return false;
 }
+
+/// Windows: an anonymous pipe; neither end is inherited by children unless
+/// it is given to one (std.process.SpawnOptions.inherit_files).
+pub const Pipe = struct {
+    read: Io.File,
+    write: Io.File,
+
+    pub fn open() !Pipe {
+        if (!is_windows) return error.Unsupported;
+        var r: windows.HANDLE = undefined;
+        var w: windows.HANDLE = undefined;
+        if (!win.CreatePipe(&r, &w, null, 0).toBool()) return error.Unexpected;
+        return .{ .read = .{ .handle = r, .flags = .{ .nonblocking = false } }, .write = .{ .handle = w, .flags = .{ .nonblocking = false } } };
+    }
+};
 
 /// Windows: the system folder (C:\Windows\System32), where cmd, ping and
 /// the like are; a PATH for children in tests.
@@ -167,6 +192,7 @@ const win = struct {
     extern "kernel32" fn ResumeThread(thread: windows.HANDLE) callconv(.winapi) u32;
     extern "kernel32" fn PeekNamedPipe(pipe: windows.HANDLE, buf: ?*anyopaque, buf_len: u32, read: ?*u32, avail: ?*u32, left: ?*u32) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn GetSystemDirectoryW(buf: [*]u16, size: u32) callconv(.winapi) u32;
+    extern "kernel32" fn CreatePipe(read: *windows.HANDLE, write: *windows.HANDLE, attributes: ?*anyopaque, size: u32) callconv(.winapi) windows.BOOL;
 };
 
 const t = std.testing;

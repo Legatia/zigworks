@@ -1,5 +1,34 @@
 # Handoff: the `web` tool on Windows
 
+## Done (2026-11-22, branch `harness-windows`)
+
+`web` works on Windows. What was found and done:
+
+- **The pipe.** Chrome 157 takes raw handle values: two anonymous pipes
+  (`proc.Pipe`), Chrome's ends given in `inherit_files` (std makes them
+  inheritable for that spawn only) and named in
+  `--remote-debugging-io-pipes=READ,WRITE` (decimal handle values),
+  besides `--remote-debugging-pipe`. Checked by hand first: Browser.getVersion
+  answered over them. No C-runtime fd table (`lpReserved2`) was needed.
+- **The job.** Chrome is spawned suspended, put in a kill-on-close job
+  (`proc.Job`), then let run; a stop, `close` and harness's own end
+  terminate the job. The reader looks for bytes with PeekNamedPipe
+  (`proc.readableWithin`) instead of poll().
+- **Chrome reached no site** in the first runs: every page was a
+  `chrome-error:` one. Its environment had no `SystemRoot`, without which
+  Windows networking fails. The web tool's Chrome now gets the system's own
+  variables, as browse's already did (agent.zig; in production too, not
+  only in tests).
+- **Tests.** All the web, cdp and agent browser tests run on Windows and
+  pass; the cdp one checks that the job is empty after `close`. The
+  stand-in-browser tests (shell scripts) still skip there.
+- **Passkeys.** See the audit handoff, section 6: a long record goes into
+  parts in the Credential Manager.
+- By hand: harness chat, the model opens a page with `web`, the title and
+  text come back, and no chrome.exe of harness's is left after the turn.
+
+What follows is the handoff as it was written.
+
 `web` (harness 0.3) drives headless Chrome over the DevTools protocol
 through a pipe, never a network port. On macOS and Linux that pipe is file
 descriptors 3 (commands in) and 4 (replies out). Windows needs its own way

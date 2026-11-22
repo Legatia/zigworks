@@ -1950,7 +1950,7 @@ pub const Core = struct {
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
                 onOff(c.switches.auto_recall.load(.acquire)), onOff(c.switches.private.load(.acquire)),
                 onOff(c.switches.dry_run.load(.acquire)),
-                if (c.browser.len == 0) "none found" else if (builtin.os.tag == .windows) "found (web not available on Windows yet)" else "found",
+                if (c.browser.len == 0) "none found" else "found",
                 c.login_list.len,
                 if (c.mcp_note.len > 0) "\nMCP: " else "",
                 std.mem.trimEnd(u8, c.mcp_note, "\n"),
@@ -2288,7 +2288,7 @@ pub fn loginState(io: Io, a: std.mem.Allocator, store: ?store_mod.Store, name: [
         out.totp = true;
         std.crypto.secureZero(u8, v);
     }
-    if (st.get(io, a, logins.secretName(&nb, name, .passkeys)) catch null) |v| {
+    if (st.getLong(io, a, logins.secretName(&nb, name, .passkeys)) catch null) |v| {
         out.passkeys_stored = true;
         out.passkeys = if (logins.decode(a, v)) |l| l.len else |_| 0;
         std.crypto.secureZero(u8, v);

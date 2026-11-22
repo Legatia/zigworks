@@ -428,7 +428,9 @@ fn loginCmd(app: *App, args: []const []const u8) !Exit {
         var gone: [3]bool = .{ false, false, false };
         for ([_]logins.Kind{ .password, .totp, .passkeys }, &gone) |k, *g| {
             var nb: [96]u8 = undefined;
-            g.* = s.remove(app.io, logins.secretName(&nb, name, k)) catch {
+            // the passkeys may be in parts (store.Store.putLong)
+            const secret = logins.secretName(&nb, name, k);
+            g.* = (if (k == .passkeys) s.removeLong(app.io, app.arena, secret) else s.remove(app.io, secret)) catch {
                 complain("could not remove the secrets of {s}", .{name});
                 return .failed;
             };

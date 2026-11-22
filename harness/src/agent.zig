@@ -265,7 +265,7 @@ pub const Run = struct {
             .skill, .skill_save => if (r.skills_dir.len == 0) return false,
             .browse => if (r.env.browser.len == 0) return false,
             // helpers never get the browser with the logins; POSIX only for now
-            .web => if (r.helper or r.env.browser.len == 0 or r.profiles_dir.len == 0 or @import("builtin").os.tag == .windows) return false,
+            .web => if (r.helper or r.env.browser.len == 0 or r.profiles_dir.len == 0) return false,
             // only through `web`
             .login => return false,
             else => {},
@@ -797,7 +797,9 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     if (own_web) {
         web_state = web_mod.Web.init(r.gpa, r.io, .{
             .browser = r.env.browser,
-            .chrome_env = .{ .path = r.env.path_var, .home = r.env.home },
+            // as browse's: on Windows the system's own variables too, or
+            // Chrome reaches no site at all (no SystemRoot, no network)
+            .chrome_env = .{ .path = r.env.path_var, .home = r.env.home, .system = r.env.system_vars },
             .profiles = r.profiles_dir,
             .tmp_root = r.env.tmp_root,
             .timeout_ms = @intCast(@min(@as(u64, r.env.browser_seconds) * 1000, std.math.maxInt(u32))),
@@ -3163,15 +3165,11 @@ test "web_is_offered_only_with_a_browser_and_never_to_helpers" {
     f.run.env.browser = "/opt/chrome";
     f.run.logins = &.{.{ .name = "github-bot", .site = "github.com", .username = "agent-bot@example.com" }};
     const with = try names(&f.run, a);
-    if (@import("builtin").os.tag == .windows) {
-        try t.expect(std.mem.indexOf(u8, with, "web,") == null);
-    } else {
-        try t.expect(std.mem.indexOf(u8, with, "web,") != null);
-        const defs = try toolDefs(&f.run, a);
-        for (defs) |d| if (std.mem.eql(u8, d.name, "web")) {
-            try t.expect(std.mem.indexOf(u8, d.description, "github-bot: github.com, username agent-bot@example.com") != null);
-        };
-    }
+    try t.expect(std.mem.indexOf(u8, with, "web,") != null);
+    const defs = try toolDefs(&f.run, a);
+    for (defs) |d| if (std.mem.eql(u8, d.name, "web")) {
+        try t.expect(std.mem.indexOf(u8, d.description, "github-bot: github.com, username agent-bot@example.com") != null);
+    };
     try t.expect(std.mem.indexOf(u8, with, "login,") == null);
     var h = f.run;
     h.helper = true;
@@ -3191,6 +3189,7 @@ test "web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log" {
     const store: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
     try store.put(t.io, "login-agent-password", "fake-Pass-7351!");
     f.run.env.browser = browser;
+    f.run.env.system_vars = try @import("cdp.zig").testSystemVars(a);
     f.run.env.tmp_root = try std.fs.path.join(a, &.{ f.e.dir, "tmp" });
     f.run.profiles_dir = try std.fs.path.join(a, &.{ f.e.dir, "profiles" });
     f.run.logins = &.{.{ .name = "agent", .site = "localhost", .username = "agent-bot" }};

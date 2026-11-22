@@ -52,7 +52,10 @@ script that opens and closes one); the model was harness-fake.
   limit, a 2560-byte one stored and read back whole (CredReadW), then
   removed. There were no secrets from before to check the built-in
   folder's `harness:NAME` against (the unit tests cover the naming).
-- **6 (web), not started.** HANDOFF-windows-web.md stands.
+- **6 (web), done** (see HANDOFF-windows-web.md for how). The 2560-byte
+  limit on the passkeys record is met by keeping a long record in parts
+  (`Store.putLong`): `login-NAME-passkeys` holds "#parts N" and
+  `login-NAME-passkeys.1` … `.N` the record; one that fits stays as before.
 - **7, partly.** New Windows test: files are never written or read
   through a junction out of the workspace (junctions need no
   administrator, unlike symlinks; harness already refused). The two
