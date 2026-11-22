@@ -1071,6 +1071,14 @@ test "a_snapshot_keeps_each_content_once_and_unchanged_files_are_not_stored_agai
     try expectHas(try f.logText(), "\"kind\":\"files\",\"event\":\"snapshot\",\"folder\":\"src\",\"id\":1,\"when\":\"hand\",\"label\":\"first\",\"files\":3,\"changed\":3");
 }
 
+/// Sets a file's modification time through an open handle: std sets it by
+/// path only on POSIX (on Windows that is a TODO panic in std).
+fn setModified(dir: Io.Dir, path: []const u8, when: Io.Timestamp) !void {
+    var file = try dir.openFile(t.io, path, .{ .mode = .read_write });
+    defer file.close(t.io);
+    try file.setTimestamps(t.io, .{ .modify_timestamp = .{ .new = when } });
+}
+
 test "the_2_s_rule" {
     var f: Fx = undefined;
     try f.init();
@@ -1081,15 +1089,15 @@ test "the_2_s_rule" {
     // snapshot, so it is read again
     const st = try f.tmp.dir.statFile(t.io, "src/n.txt", .{});
     try f.put("n.txt", "new");
-    try f.tmp.dir.setTimestamps(t.io, "src/n.txt", .{ .modify_timestamp = .{ .new = st.mtime } });
+    try setModified(f.tmp.dir, "src/n.txt", st.mtime);
     try t.expectEqual(1, (try f.take("")).changed);
     // an older file whose content changes keeping its size and time is
     // not read again
     const old: Io.Timestamp = .{ .nanoseconds = st.mtime.nanoseconds - 100 * std.time.ns_per_s };
-    try f.tmp.dir.setTimestamps(t.io, "src/n.txt", .{ .modify_timestamp = .{ .new = old } });
+    try setModified(f.tmp.dir, "src/n.txt", old);
     try t.expectEqual(0, (try f.take("")).changed);
     try f.put("n.txt", "xyz");
-    try f.tmp.dir.setTimestamps(t.io, "src/n.txt", .{ .modify_timestamp = .{ .new = old } });
+    try setModified(f.tmp.dir, "src/n.txt", old);
     try t.expectEqual(0, (try f.take("")).changed);
 }
 
