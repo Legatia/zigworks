@@ -392,9 +392,11 @@ pub const rules_example =
     \\# write_file to a path with a part starting with "." (.git/config,
     \\# .npmrc: programs read those as settings) ask; money tools are asked
     \\# every time, whatever the rules; the others are allowed.
-    \\# Not used yet (their tools come later): mail, send to a conversation
-    \\# others read, trigger rm and workflow start and stop ask; agent_save,
-    \\# app_save, env_save, trigger add and workflow save are asked every time.
+    \\# send (a post) to a conversation others read is asked every time
+    \\# unless an allow rule names it (allow send family).
+    \\# Not used yet (their tools come later): mail, trigger rm and workflow
+    \\# start and stop ask; agent_save, app_save, env_save, trigger add and
+    \\# workflow save are asked every time.
     \\# A line [agent:NAME], [owner] or [schedule:NAME] starts rules for those
     \\# calls only; [all] goes back to rules for every call. shell@NAME is for
     \\# commands in environment NAME (host is the only one for now).

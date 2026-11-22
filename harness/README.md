@@ -1,11 +1,12 @@
 # harness
 
-A personal agent you talk to in Telegram (or the terminal). It does
-research, hands parts of a job to helpers that work in parallel, sends a
-morning brief on the topics you follow, runs scheduled tasks, uses MCP
-servers and saved skills, and remembers what you bring up. Every action it
-takes, and every action of its helpers, passes one gate and is written to
-one log you can check.
+A personal agent you talk to in Telegram (or the terminal), in your chat
+with the bot or in a topic of it per subject. It does research, hands
+parts of a job to helpers that work in parallel, sends a morning brief on
+the topics you follow, runs scheduled tasks, uses MCP servers and saved
+skills, and remembers what you bring up. Every action it takes, and every
+action of its helpers, passes one gate and is written to one log you can
+check.
 
 ```
 Telegram ⇄ ┐                          ┌─ shell, files, fetch, browse, web, search
@@ -21,9 +22,9 @@ standard library (and the system's Security framework on macOS). Models
 are reached only through [omnigate](https://github.com/Legatia/omnigate),
 which holds the provider keys and the budgets.
 
-**State: 0.3.0, tested on macOS by its own tests: 377 unit tests (2 skipped), among
+**State: 0.3.0, tested on macOS by its own tests: 444 unit tests (2 skipped), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 45 checks that drives the real binary against
+and an end-to-end script of 48 checks that drives the real binary against
 stand-ins for omnigate, Telegram, feeds, search and two MCP servers. An
 earlier build of 0.3.0 also passed its tests in CI on Linux and Windows.
 Nothing has run yet against a real omnigate, Telegram bot, MCP server or
@@ -80,7 +81,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `workspace/` | where the agent's files and commands live |
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
-| `state/` | grants, seen feed items, owner, status, lock, approval numbers, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command (`written`), `mcp/NAME` (each MCP server's own folder) |
+| `state/` | grants, seen feed items, owner, the conversations (`conversations`), status, lock, approval numbers, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command (`written`), `mcp/NAME` (each MCP server's own folder) |
 
 On macOS and Linux, `config.ini`, `rules`, `logins.ini` and `mcp.ini` are
 refused if other users can write them. Harness names a settings file it
@@ -219,6 +220,73 @@ model or the log sees it. A tool call gets at most what is left of the
 turn's time.
 
 Money tools (below) are the exception: asked every time.
+
+## Conversations
+
+You and the agent talk in conversations: `main`, your private chat with
+the bot; a topic of that chat per subject; groups you add; and `terminal`
+(`harness chat`). Each of yours has its own context, `/new` and
+`/private`. Messages wait in one queue, one turn at a time.
+
+- **Topics.** A topic you open in your chat with the bot is a conversation
+  from its first message, named after it ("House search" is
+  `house-search`; `-2` when the name is taken, `topic-THREAD` when nothing
+  is left of it). `/conversation new NAME` opens one from the chat.
+  Telegram must have topics in private chats switched on for the bot
+  (@BotFather, Bot API 9.3); a topic Telegram refuses has its posts come
+  to `main` with `[NAME]` in front, and you are told once.
+- **Groups.** In a group harness reads only your `/conversation add NAME`
+  (`/conversation@BOT add NAME` too); from then on the agent may post
+  there, each post asked. Nothing else said in a group reaches the agent.
+- **`send`.** The agent posts with `send`: text up to 16 KB; up to 4
+  workspace files up to 20 MB each, as documents (a file holding a stored
+  secret is refused, one with a part starting with "." is asked); up to 4
+  quick replies of up to 32 bytes, in your own conversations (a press is
+  your message there, counted once; one from before a restart answers
+  nothing). `final: true` is its reply and ends the turn. A turn that
+  stops without one has its last text posted the same way, logged
+  `implicit`; working text is never posted, and a turn ended by a limit
+  or an error says which.
+- **The gate.** `send` is a gate kind, its argument the conversation:
+  allowed to yours; where others read, asked every time with the whole
+  post and the files' names, with no "Allow 24 h" (an `allow send NAME`
+  rule lifts that, `deny` stops it, and a run nobody watches is refused).
+  The reply passes it too: after `deny send main` harness tells you a rule
+  stopped it.
+- **Limits** (`[limits]` in config.ini): `sends_per_run = 10` posts in one
+  run; `sends_per_hour = 60` to one conversation, all runs counted (past
+  it posts are logged, not sent, and `main` hears once an hour).
+- **Tasks and briefs** post to `to = NAME` in tasks.ini and briefs.ini
+  (default `main`; a name that is no conversation yet opens that topic at
+  its first post), with their name in front (`[btc-watch]`). Tasks get
+  `send` too.
+- **Where things go.** A command's reply goes where you sent it; settings
+  notices and the log warning at start to `main`; questions and memory
+  notices to the run's conversation. The agent is told its conversation
+  and the others' names with each message.
+- **Contexts.** At most 16 are kept: for a 17th the least used is dropped
+  after the memory writer has read it, and the agent is told when that
+  conversation comes back.
+- **Pairing** another account moves `main` to it and forgets the old
+  account's topics, saying which.
+
+`state/conversations` keeps them, a JSON line each, rewritten whole
+(a new file, then a rename) before harness acts on a change:
+
+```json
+{"name":"house-search","channel":"telegram","chat":123456789,"thread":5012,"audience":"own","private":false,"created":"2026-11-22T09:30:00Z"}
+```
+
+`/conversations` lists them; `/conversation rename OLD NEW` and
+`/conversation rm NAME` (harness forgets it; a topic stays in Telegram)
+work on any but `main` and `terminal`. `/session [N]` shows the steps
+behind the last answer in the conversation it is sent in (N runs back, up
+to 20): the message, each model call, each tool call with the gate's
+decision, each helper, the posts and how it ended, in one message of up
+to 3,500 bytes, read from the log's last 4 MB. `harness log runs [N]` lists
+the last runs; `harness log session RID [--json]` shows one with its
+helpers, whole or as its log lines. In the terminal every post is
+printed, with `[NAME]` in front when it is for another conversation.
 
 ## Helpers
 
@@ -400,14 +468,22 @@ lists them, `/skill rm NAME` removes one.
 
 One JSON line per action: messages, model calls (tokens), gate decisions
 with the reason, tool calls with their input and output (up to 2 KB each),
-memory changes, briefs, tasks, settings changes. Each line of a run (a
-chat turn, a task, a brief, a helper's task) carries `rid`, the run's id
-(the `seq` of its first line), and `run`, its label (`chat`, `task NAME`,
+memory changes, briefs, tasks, settings changes, posts. Each line of a
+run (a chat turn, a task, a brief, a helper's task) carries `rid`, the
+run's id (the `seq` of its first line), `conversation`, where it reports
+(a helper's is its parent's), and `run`, its label (`chat`, `task NAME`,
 `brief NAME`, `chat/h1`). Its first line also names who started it,
 `by` (`owner`, or `schedule:NAME` for a task or brief; a helper has its
 parent's), its definition, `agent` (`main` or `helper`), and for a
 helper `parent`, the rid of the run that delegated it; gate and tool
-lines carry `agent` too. Each line carries the
+lines carry `agent` too, and tool lines the output's whole size, `bytes`.
+A post is a line of kind `send`: `to`, `event` (`sent`, `refused`,
+`held`, `kept`, `failed`), `bytes`, `text`, `files`, `buttons`, `final`,
+`implicit`, `delivered`, the first message's id and the number of
+messages. A private run's lines, and a post into a private conversation,
+keep sizes and keyed hashes of what was said, while their labels (`run`,
+`conversation`, `by`, `agent`, `to`, `event`, `tool`, `decision`, `why`)
+stay readable. Each line carries the
 SHA-256 of the line before it; `harness log verify` finds the first line
 that was changed, removed or reordered, and also lines cut from the end,
 by the last line named in `state/status`. Harness warns at start if the
@@ -475,9 +551,9 @@ do = Summarise what you did for me this week.
 ```
 
 Each run is the same agent with a fresh short conversation and the same
-gate (with `ask` as Deny). Its answer is sent to you unless it is
-`NOTHING`; calls skipped for want of approval are listed either way
-("Skipped (needs approval): …"). A task whose omnigate budget is spent is
+gate (with `ask` as Deny). Its answer is posted to its `to` (`main` unless
+it names another conversation) unless it is `NOTHING`; calls skipped for
+want of approval are listed either way ("Skipped (needs approval): …"). A task whose omnigate budget is spent is
 paused until `/task resume NAME`. `/tasks`,
 `/task add NAME | every 15m | instruction`, `/task rm NAME`.
 
@@ -486,10 +562,14 @@ paused until `/task resume NAME`. `/tasks`,
 `/stop`, `/new`, `/status`, `/brief [NAME]`, `/topics`, `/topic add|rm`, `/tasks`,
 `/task add|rm|resume`, `/memory`, `/remember`, `/pin`, `/unpin`,
 `/forget`, `/private on|off`, `/skills`, `/skill rm`, `/logins`,
-`/dryrun on|off`, `/reload`, `/help`.
+`/dryrun on|off`, `/reload`, `/conversations`,
+`/conversation new|rename|rm|add`, `/session [N]`, `/help`. `/new` and
+`/private` act on the conversation they are sent in; `/stop`, `/dryrun`
+and `/memory auto` on everything.
 
 CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
-`task run NAME`, `memory [list|pin|unpin|forget ID]`, `log verify|tail`,
+`task run NAME`, `memory [list|pin|unpin|forget ID]`,
+`log verify|tail|runs|session`,
 `health`, `version`. `--home DIR` may come anywhere on the line;
 arguments a command does not take are refused. `health` exits 0 only
 while `harness run` holds the folder and has ticked in the last 90 s.
@@ -523,7 +603,9 @@ while `harness run` holds the folder and has ticked in the last 90 s.
   unit (say USD). They trust the tool to mean what that field says.
 - **The Windows Credential Manager** keeps at most 2560 bytes of a value;
   `secret add` refuses longer ones.
-- **One owner, one chat.** Messages sent while the agent works are queued.
+- **One owner, one turn at a time.** Messages sent in any conversation
+  while the agent works wait in one queue. Contexts do not survive a
+  restart.
 - **`web` is macOS and Linux only** for now (Chrome is driven through
   pipes on file descriptors 3 and 4); on Windows it is not offered.
 - **Login cookies are on disk** in `profiles/NAME`, readable by you (the
@@ -535,7 +617,8 @@ while `harness run` holds the folder and has ticked in the last 90 s.
   know the public suffix list, so set the site no wider than needed.
 
 Not in 0.3.0: the Agent Client Protocol server, desktop use (headdesk), a
-sandbox per command, WhatsApp and voice, helpers that report back later,
+sandbox per command, email, WhatsApp, Slack and voice as conversations,
+helpers that report back later,
 cards and payments for the agent, the browser on Windows, screenshots,
 and the hosted service.
 

@@ -43,6 +43,32 @@ intent (what – why – cost if wrong):
   other conversation print with `[NAME]` in front. – "Another
   conversation" needs a home, and this keeps `task run`'s output as it
   was. – None beyond what the terminal prints.
+- R3. Under Telegram (`harness run`) the agent is not offered `terminal`:
+  it is left out of "Others:" and a `send` to it is refused as an unknown
+  conversation. – No channel reaches the terminal there; a post would
+  only fail. – The agent can't leave a note for a later `harness chat`.
+- R4. Any refusal Telegram gives a send into a topic counts as that topic
+  refused (its posts go to main with `[NAME]` in front until restart). –
+  The Bot API client sees "refused", not why (a deleted topic is a 400 like
+  others). – A post refused for another reason sends that topic's posts
+  to main until harness restarts.
+- R5. A `send` line keeps the first message's id and how many messages
+  the post took (`message`, `parts`), not every id. – A channel returns
+  the first id; Telegram's ids for one post's parts follow each other. –
+  An app that wants each id infers them.
+
+Notes:
+
+- Tasks 5 and 6 landed as one commit (6bf975a): Task 6's edits were made
+  on top of Task 5's before Task 5 was committed. Each was tested on its
+  own (Task 5's suite green before Task 6 was written; Task 6's tests seen
+  failing against the old behaviour, then the whole suite green).
+- Existing tests changed on purpose: `a_runs_lines_carry_its_id_and_its_first_line_says_who_started_it`
+  (log.zig: labels readable when private); `telegram_send_before_pairing_is_an_error`
+  (main.zig: the channel takes a place); `private_turns_stay_out_of_memory`,
+  `a_turn_running_when_private_goes_on_stays_out_of_memory` (core.zig: a
+  context per conversation). The Recorder (test helper) notes each post's
+  place and keeps up to 4 buttons.
 
 ## File map
 
