@@ -3,6 +3,7 @@
 //! instructions). All three are small INI files: `[section]`,
 //! `key = value`, comments after `;` or `#`.
 const std = @import("std");
+const conversations = @import("conversations.zig");
 
 pub const Error = error{ BadConfig, OutOfMemory };
 
@@ -45,6 +46,11 @@ pub const Config = struct {
         conversation_bytes: u32 = 200000,
         concurrent_runs: u32 = 2,
         approval_seconds: u32 = 600,
+        /// Posts one run may make with `send`; the next is refused.
+        sends_per_run: u32 = 10,
+        /// Posts to one conversation in an hour, all runs and replies
+        /// counted; past it they are logged, not sent.
+        sends_per_hour: u32 = 60,
     };
     pub const Memory = struct {
         auto: bool = true,
@@ -187,6 +193,8 @@ pub const Brief = struct {
     name: []const u8,
     at_minutes: u16,
     topics: []const Topic,
+    /// The conversation it posts to (`to =`).
+    to: []const u8 = "main",
 };
 
 pub fn parseBriefs(arena: std.mem.Allocator, text: []const u8) Error![]Brief {
@@ -205,6 +213,8 @@ pub fn parseBriefs(arena: std.mem.Allocator, text: []const u8) Error![]Brief {
         }
         if (std.mem.eql(u8, l.key, "at")) {
             cur.?.at_minutes = parseClock(l.value) catch return error.BadConfig;
+        } else if (std.mem.eql(u8, l.key, "to")) {
+            cur.?.to = try conversationName(l.value);
         } else if (std.mem.eql(u8, l.key, "topic")) {
             try topics.append(arena, try parseTopic(arena, l.value));
         } else return error.BadConfig;
@@ -254,6 +264,8 @@ pub const Task = struct {
     /// Bit 0 = Monday … bit 6 = Sunday.
     days: u7 = 0x7f,
     do: []const u8 = "",
+    /// The conversation it posts to (`to =`).
+    to: []const u8 = "main",
 };
 
 pub const day_names = [_][]const u8{ "mon", "tue", "wed", "thu", "fri", "sat", "sun" };
@@ -275,6 +287,8 @@ pub fn parseTasks(arena: std.mem.Allocator, text: []const u8) Error![]Task {
             tk.days = parseDays(l.value) catch return error.BadConfig;
         } else if (std.mem.eql(u8, l.key, "do")) {
             tk.do = l.value;
+        } else if (std.mem.eql(u8, l.key, "to")) {
+            tk.to = try conversationName(l.value);
         } else return error.BadConfig;
     }
     for (tasks.items) |tk| {
@@ -282,6 +296,13 @@ pub fn parseTasks(arena: std.mem.Allocator, text: []const u8) Error![]Task {
         if ((tk.at_minutes == null) == (tk.every_minutes == null)) return error.BadConfig;
     }
     return tasks.items;
+}
+
+/// A `to =` value: a conversation's name (a-z, 0-9, - and _, up to 32);
+/// one that is no conversation yet opens that topic at its first post.
+fn conversationName(v: []const u8) Error![]const u8 {
+    if (!conversations.validName(v)) return error.BadConfig;
+    return v;
 }
 
 /// "15m", "2h" → minutes; at least 5.
@@ -339,6 +360,8 @@ pub const defaults_ini =
     \\conversation_bytes = 200000
     \\concurrent_runs = 2
     \\approval_seconds = 600
+    \\sends_per_run = 10                  ; posts one run may make with send
+    \\sends_per_hour = 60                 ; posts to one conversation an hour; past it: logged, not sent
     \\
     \\[memory]
     \\auto = on
@@ -388,6 +411,7 @@ pub const rules_example =
 pub const briefs_example =
     \\; Briefs: when to send, and topics with their sources.
     \\; topic = Name | feed URL | search: words
+    \\; to = NAME posts it to that conversation (default main, the private chat).
     \\;
     \\; [morning]
     \\; at = 07:00
@@ -398,7 +422,8 @@ pub const briefs_example =
 pub const tasks_example =
     \\; Scheduled tasks: the agent runs `do` at a time (`at`, optional `days`)
     \\; or every N minutes (`every = 15m`, at least 5m). Its answer is sent to
-    \\; you unless it is NOTHING.
+    \\; you unless it is NOTHING; to = NAME posts it to that conversation
+    \\; (default main, the private chat; a new name opens that topic).
     \\;
     \\; [weekly-review]
     \\; at = 18:00
@@ -553,6 +578,26 @@ test "tasks_parse_at_every_days_and_refuse_every_under_5m" {
     try t.expectError(error.BadConfig, parseTasks(a, "[x]\nat = 07:00\nevery = 5m\ndo = y"));
     try t.expectError(error.BadConfig, parseTasks(a, "[x]\ndo = y"));
     try t.expectError(error.BadConfig, parseTasks(a, "[x]\nat = 07:00\ndays = someday\ndo = y"));
+}
+
+test "tasks_and_briefs_name_their_conversation" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ts = try parseTasks(a, "[watch]\nevery = 5m\nto = house-search\ndo = Look for flats.\n[plain]\nevery = 5m\ndo = x\n");
+    try t.expectEqualStrings("house-search", ts[0].to);
+    // no `to`: the private chat
+    try t.expectEqualStrings("main", ts[1].to);
+    try t.expectError(error.BadConfig, parseTasks(a, "[x]\nevery = 5m\nto = House Search\ndo = y"));
+    try t.expectError(error.BadConfig, parseTasks(a, "[x]\nevery = 5m\nto = a/b\ndo = y"));
+    const bs = try parseBriefs(a, "[morning]\nat = 07:00\nto = news\ntopic = Zig | https://ziglang.org/news/index.xml\n");
+    try t.expectEqualStrings("news", bs[0].to);
+    try t.expectEqualStrings("main", (try parseBriefs(a, "[m]\ntopic = Z | https://z.org/f\n"))[0].to);
+    try t.expectError(error.BadConfig, parseBriefs(a, "[m]\nto = rm\ntopic = Z | https://z.org/f\n"));
+    const c = try parse(a, "");
+    try t.expectEqual(10, c.limits.sends_per_run);
+    try t.expectEqual(60, c.limits.sends_per_hour);
+    try t.expectEqual(3, (try parse(a, "[limits]\nsends_per_hour = 3\n")).limits.sends_per_hour);
 }
 
 test "agents_browser_and_money_sections" {
