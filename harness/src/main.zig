@@ -13,6 +13,7 @@ const agent = @import("agent.zig");
 const logins = @import("logins.zig");
 const totp = @import("totp.zig");
 const session = @import("session.zig");
+const inbox_mod = @import("inbox.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -40,6 +41,7 @@ const usage =
     \\  log tail [N]               print the last N log lines (default 20)
     \\  log runs [N]               a line per run, the last N (default 20)
     \\  log session RID [--json]   a run and its helpers, step by step
+    \\  inbox [--json]             what waits for you (--json: every item kept, format v1)
     \\  health                     exit 0 if `harness run` is running and recent
     \\  version | help
     \\
@@ -273,6 +275,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "task")) return taskCmd(app, rest);
     if (eql(cmd, "memory")) return memoryCmd(app, rest);
     if (eql(cmd, "log")) return logCmd(app, rest);
+    if (eql(cmd, "inbox")) return inboxCmd(app, rest);
     if (eql(cmd, "health")) return healthCmd(app);
     complain("unknown command {s}; see harness help", .{cmd});
     return .usage;
@@ -884,13 +887,15 @@ const TermChan = struct {
     }
 };
 
-/// The keys for the buttons a question has ("[o] allow once  [n] deny"),
-/// by what each button answers.
+/// The keys for an item's buttons ("[o] allow once  [n] deny"): an
+/// approval's by what each answers, another item's by their place
+/// ("[1] personal  [2] work").
 fn keysLine(buf: []u8, bs: []const [2][]const u8) []const u8 {
     var n: usize = 0;
-    for (bs) |b| {
+    const places = "1234";
+    for (bs, 0..) |b, i| {
         if (b[0].len == 0) continue;
-        const key: []const u8 = if (std.mem.endsWith(u8, b[1], ":once")) "o" else if (std.mem.endsWith(u8, b[1], ":day")) "d" else "n";
+        const key: []const u8 = if (std.mem.endsWith(u8, b[1], ":once")) "o" else if (std.mem.endsWith(u8, b[1], ":day")) "d" else if (std.mem.endsWith(u8, b[1], ":deny")) "n" else places[@min(i, 3) .. @min(i, 3) + 1];
         const part = std.fmt.bufPrint(buf[n..], "{s}[{s}] {c}{s}", .{ if (n > 0) "  " else "", key, std.ascii.toLower(b[0][0]), b[0][1..] }) catch break;
         n += part.len;
     }
@@ -912,12 +917,12 @@ fn chatCmd(app: *App) !Exit {
     while (!ended) {
         const line = try readLineEof(app, stdin, &ended);
         if (line.len == 0) continue;
-        if (c.itemsWaiting() > 0) {
-            const key: ?[]const u8 = if (eql(line, "o")) "once" else if (eql(line, "d")) "day" else if (eql(line, "n")) "deny" else null;
-            if (key) |k| {
-                if (!c.answerWaiting(k) and c.itemsWaiting() > 0) try errAll(app.io, "That answer is not offered for this question.\n");
-                continue;
-            }
+        // an item's answer: o, d, n or 1 to 4, with its id when several wait
+        var said_arena: std.heap.ArenaAllocator = .init(app.gpa);
+        defer said_arena.deinit();
+        if (c.terminalAnswer(said_arena.allocator(), line)) |said| {
+            if (said.len > 0) try errPrint(app.io, "{s}\n", .{said});
+            continue;
         }
         try c.handleTextIn("terminal", line);
     }
@@ -1053,6 +1058,34 @@ fn logCmd(app: *App, args: []const []const u8) !Exit {
     }
     complain("usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]", .{});
     return .usage;
+}
+
+/// `harness inbox [--json]`: reads state/inbox only, so it works while
+/// harness runs.
+fn inboxCmd(app: *App, args: []const []const u8) !Exit {
+    const p = try core_mod.Paths.init(app.arena, app.home);
+    var box: inbox_mod.Box = .init(app.gpa, app.io, p.inbox);
+    defer box.deinit();
+    box.load("") catch |e| {
+        complain("can't read {s}: {s}", .{ p.inbox, @errorName(e) });
+        return .failed;
+    };
+    try outAll(app.io, try inboxText(app.arena, &box, args.len == 1, util.nowSeconds(app.io)));
+    return .ok;
+}
+
+/// What `harness inbox` prints: a line per open item (or that nothing
+/// waits); with `json`, every item kept in format v1, a line each.
+fn inboxText(a: std.mem.Allocator, box: *const inbox_mod.Box, json: bool, now_s: i64) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (box.items.items) |it| {
+        if (json) {
+            try inbox_mod.render(&out, a, it, false);
+            try out.append(a, '\n');
+        } else if (it.status == .open) try out.print(a, "{s}\n", .{try inbox_mod.listLine(a, it, now_s)});
+    }
+    if (!json and out.items.len == 0) return "Nothing is waiting for you.\n";
+    return out.items;
 }
 
 fn healthCmd(app: *App) !Exit {
@@ -1288,6 +1321,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
         }
         return "usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]";
     }
+    if (eql(cmd, "inbox")) return if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "--json"))) null else "usage: harness inbox [--json]";
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "login")) {
         if (rest.len == 0) return login_usage;
@@ -1729,4 +1763,76 @@ test "the_terminal_offers_only_the_answers_the_question_has" {
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("[o] allow once  [n] deny", keysLine(&buf, &.{ .{ "Allow once", "a3:once" }, .{ "Deny", "a3:deny" } }));
     try std.testing.expectEqualStrings("[o] allow once  [d] allow 24 h  [n] deny", keysLine(&buf, &.{ .{ "Allow once", "a4:once" }, .{ "Allow 24 h", "a4:day" }, .{ "Deny", "a4:deny" } }));
+}
+
+test "the_terminal_answers_by_id_when_several_are_open" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const c = try Core.open(t.allocator, t.io, try testHome(&e), .{});
+    defer c.close();
+    const a = e.arena.allocator();
+    const two: inbox_mod.New = .{ .kind = "question", .title = "Which one?", .body = "Which one?", .choices = &.{ .{ .key = "1", .label = "Personal" }, .{ .key = "2", .label = "Work" } } };
+    _ = try c.addItem(two);
+    _ = try c.addItem(two);
+    // a key alone: several take it, so the id is needed
+    try t.expectEqualStrings("Several are waiting: 1, 2. Add the id, as in 1 1.", c.terminalAnswer(a, "1").?);
+    // with the id, that item
+    try t.expectEqualStrings("", c.terminalAnswer(a, "2 2").?);
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, c.paths.inbox, a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, text, "\"answer\":{\"key\":\"2\",\"text\":null,") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"via\":\"terminal\"") != null);
+    // one left: a key alone answers it
+    try t.expectEqualStrings("", c.terminalAnswer(a, "1").?);
+    try t.expectEqualStrings("No item 2 is waiting.", c.terminalAnswer(a, "1 2").?);
+    // with no approval waiting, o is a message for the agent
+    try t.expectEqual(null, c.terminalAnswer(a, "o"));
+    try t.expectEqual(null, c.terminalAnswer(a, "ok then"));
+    // the keys the terminal shows for a question
+    var buf: [128]u8 = undefined;
+    try t.expectEqualStrings("[1] personal  [2] work", keysLine(&buf, &.{ .{ "Personal", "i44-0123456789abcdef:1" }, .{ "Work", "i44-0123456789abcdef:2" } }));
+}
+
+test "harness_inbox_json_prints_v1_without_the_kept_fields" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(t.io, ".", a), "inbox" });
+    const at: i64 = 1795356180;
+    {
+        var box: inbox_mod.Box = .init(t.allocator, t.io, path);
+        defer box.deinit();
+        const it = try box.add(.{
+            .kind = "delivery",
+            .title = "Three flats match.",
+            .body = "Three flats match.",
+            .choices = &.{ .{ .key = "again", .label = "Send again" }, .{ .key = "drop", .label = "Drop" } },
+            .post = .{ .conversation = "main", .text = "Three flats match.", .next = at + 300 },
+            .grant = .{ .tool = "shell@host", .key = "ls", .who = "schedule:x" },
+            .skip = "schedule:x\tshell@host\tls",
+        }, at, "0123456789abcdef".*);
+        try it.shown.append(it.arena.allocator(), .{ .chat = 42, .thread = 0, .message = 7 });
+        const done = try box.add(.{ .kind = "approval", .title = "shell: ls", .body = "shell: ls" }, at, "fedcba9876543210".*);
+        box.close(done, .answered, .{ .key = "once", .at = at + 20, .via = .telegram });
+        try box.save(at + 120);
+    }
+    var read: inbox_mod.Box = .init(t.allocator, t.io, path);
+    defer read.deinit();
+    try read.load("");
+    const json = try inboxText(a, &read, true, at + 120);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, json, "\n"), '\n');
+    var n: usize = 0;
+    while (lines.next()) |l| {
+        n += 1;
+        try t.expect(std.mem.startsWith(u8, l, "{\"v\":1,"));
+        for ([_][]const u8{ "\"token\"", "\"shown\"", "\"post\"", "\"grant\"", "\"skip\"", "\"private\"", "0123456789abcdef" }) |k| try t.expect(std.mem.indexOf(u8, l, k) == null);
+    }
+    try t.expectEqual(2, n);
+    // without --json: what waits, a line each
+    try t.expectEqualStrings("[1] delivery, main, 2 min: Three flats match.\n", try inboxText(a, &read, false, at + 120));
+    try t.expect(badArgs(&.{"inbox"}) == null);
+    try t.expect(badArgs(&.{ "inbox", "--json" }) == null);
+    try t.expect(badArgs(&.{ "inbox", "x" }) != null);
 }

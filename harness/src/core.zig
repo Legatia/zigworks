@@ -2074,16 +2074,48 @@ pub const Core = struct {
         _ = c.sendTextAs("main", std.fmt.bufPrint(&buf, "Waiting for you: {d} item{s}. /inbox", .{ n, if (n == 1) "" else "s" }) catch "Waiting for you. /inbox", true) catch {};
     }
 
-    /// The terminal's "o", "d" or "n": answers the oldest open run item
-    /// that offers it; false when none does.
-    pub fn answerWaiting(c: *Core, key: []const u8) bool {
-        const id = blk: {
+    /// The terminal's keys: `o`, `d` and `n` answer an approval, `1` to `4`
+    /// another item's choices, with the item's id when several take the
+    /// key (`o 41`). Null when the line is no answer (a message for the
+    /// agent); "" when it was taken; else what to print.
+    pub fn terminalAnswer(c: *Core, a: std.mem.Allocator, line: []const u8) ?[]const u8 {
+        var words = std.mem.tokenizeAny(u8, std.mem.trim(u8, line, " \t\r\n"), " \t");
+        const k = words.next() orelse return null;
+        if (k.len != 1 or std.mem.indexOfScalar(u8, "odn1234", k[0]) == null) return null;
+        const letter = k[0];
+        const want: ?u64 = if (words.next()) |x| std.fmt.parseInt(u64, x, 10) catch return null else null;
+        if (words.next() != null) return null;
+        var target: u64 = 0;
+        var key: []const u8 = "";
+        {
             c.inbox.mutex.lockUncancelable(c.io);
             defer c.inbox.mutex.unlock(c.io);
-            for (c.inbox.items.items) |it| if (it.status == .open and it.isRun() and it.offers(key)) break :blk it.id;
-            return false;
-        };
-        return c.answerItem(id, key, null, .terminal) == .taken;
+            var ids: std.ArrayList(u8) = .empty;
+            var n: usize = 0;
+            var oldest: u64 = 0;
+            for (c.inbox.items.items) |it| {
+                if (it.status != .open) continue;
+                if (want) |w| if (it.id != w) continue;
+                const kk = terminalKey(it, letter) orelse continue;
+                n += 1;
+                if (n == 1) oldest = it.id;
+                ids.print(a, "{s}{d}", .{ if (n > 1) ", " else "", it.id }) catch return null;
+                target = it.id;
+                key = a.dupe(u8, kk) catch return null;
+            }
+            if (want) |w| {
+                if (n == 0) {
+                    const it = c.inbox.find(w) orelse return std.fmt.allocPrint(a, "No item {d} is waiting.", .{w}) catch "";
+                    if (it.status != .open) return std.fmt.allocPrint(a, "No item {d} is waiting.", .{w}) catch "";
+                    return std.fmt.allocPrint(a, "Item {d} does not take {c}.", .{ w, letter }) catch "";
+                }
+            } else {
+                if (n == 0) return null;
+                if (n > 1) return std.fmt.allocPrint(a, "Several are waiting: {s}. Add the id, as in {c} {d}.", .{ ids.items, letter, oldest }) catch "";
+            }
+        }
+        const took = c.answerItem(target, key, null, .terminal);
+        return if (took == .taken) "" else c.tookText(a, target, took);
     }
 
     /// No one is there to answer any more (the terminal's input ended): the
@@ -3893,6 +3925,24 @@ pub const Core = struct {
         return "Use /task add, /task rm NAME or /task resume NAME.";
     }
 };
+
+/// What the terminal's key `letter` answers on item `it`: `o`, `d`, `n`
+/// an approval's once, day and deny (when it offers them), `1` to `4` the
+/// choices of another kind.
+fn terminalKey(it: *const inbox_mod.Item, letter: u8) ?[]const u8 {
+    if (std.mem.eql(u8, it.kind, "approval")) {
+        const key: []const u8 = switch (letter) {
+            'o' => "once",
+            'd' => "day",
+            'n' => "deny",
+            else => return null,
+        };
+        return if (it.offers(key)) key else null;
+    }
+    if (letter < '1' or letter > '4') return null;
+    const i = letter - '1';
+    return if (i < it.choices.len) it.choices[i].key else null;
+}
 
 /// Who a task grant covers: the `by` of a task, trigger or workflow run
 /// (a workflow's without its step); null for another kind, or a name that
