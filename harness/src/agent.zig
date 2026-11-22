@@ -189,6 +189,15 @@ pub const Run = struct {
     /// Who started the run and its definition; a helper's names the run
     /// that delegated it.
     who: who_mod.Who = .{},
+    /// The conversation the run reports to (a chat turn's: where its
+    /// message came from; a task's or brief's: its `to`; a helper's: its
+    /// parent's); "": none (every line of the run names it).
+    conversation: []const u8 = "",
+    /// Its conversation's /private switch, read when used.
+    conv_private: ?*const std.atomic.Value(bool) = null,
+    /// What the per-turn context block says of the conversations
+    /// ("Conversation: house-search (Telegram topic). Others: main.").
+    context_note: []const u8 = "",
     /// The run's id in the log: its first line's seq; 0 until written.
     rid: u64 = 0,
     /// The id of the run that delegated this one.
@@ -246,8 +255,10 @@ pub const Run = struct {
         return util.nowSeconds(r.io);
     }
 
-    /// Switched on now, or when the run started: on either way.
+    /// Switched on now, or when the run started: on either way (its
+    /// conversation's switch, or before conversations the instance's).
     pub fn isPrivate(r: *const Run) bool {
+        if (r.conv_private) |p| if (p.load(.acquire)) return true;
         return r.private or r.switches.private.load(.acquire);
     }
 
@@ -259,13 +270,15 @@ pub const Run = struct {
         return r.auto_recall and r.switches.auto_recall.load(.acquire);
     }
 
-    /// Writes one of the run's lines to the log: each carries its id and
-    /// label, its first also who started it, its definition and the run
-    /// that delegated it, gate and tool lines its definition.
+    /// Writes one of the run's lines to the log: each carries its id, its
+    /// conversation and its label, its first also who started it, its
+    /// definition and the run that delegated it, gate and tool lines its
+    /// definition.
     pub fn logRun(r: *Run, kind: log_mod.Kind, private: bool, fields: anytype) !void {
         const first = r.rid == 0;
         const seq = try r.log.writeRun(kind, private, .{
             .rid = r.rid,
+            .conversation = if (r.conversation.len > 0) r.conversation else null,
             .run = r.label,
             .by = if (first) r.who.by else null,
             .agent = if (first or kind == .gate or kind == .tool) r.who.agent else null,
@@ -763,6 +776,8 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
     const c = util.civil(@divFloor(local, 86400));
     const mins: i64 = @divFloor(@mod(local, 86400), 60);
     try out.print(arena, "\nNow: {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} (owner's time, UTC{s}{d}min).\n", .{ @as(u64, @intCast(c.y)), c.m, c.d, @as(u64, @intCast(@divFloor(mins, 60))), @as(u64, @intCast(@mod(mins, 60))), if (r.utc_offset >= 0) "+" else "-", @abs(r.utc_offset) });
+    // where the run is: with the message, so the cached instructions hold
+    if (r.context_note.len > 0) try out.print(arena, "{s}\n", .{r.context_note});
     if (recalled.found.len > 0) {
         try out.appendSlice(arena, "\nPossibly relevant from earlier:\n");
         for (recalled.found) |it| try out.print(arena, "- {s}\n", .{it.body});

@@ -655,7 +655,7 @@ const TgChan = struct {
     }
 
     fn channel(tc: *TgChan) core_mod.Channel {
-        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .send_to = sendTo };
+        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .send_to = sendTo, .document = document, .open_topic = openTopic };
     }
 
     fn sendTo(ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void {
@@ -665,31 +665,52 @@ const TgChan = struct {
         try tc.send_bot.send(chat_id, text);
     }
 
-    fn send(ctx: *anyopaque, text: []const u8) anyerror!void {
+    /// To the place's chat and topic; a topic Telegram refuses is
+    /// error.TopicRefused (core then posts to main).
+    fn send(ctx: *anyopaque, place: core_mod.Place, text: []const u8) anyerror!core_mod.Sent {
         const tc: *TgChan = @ptrCast(@alignCast(ctx));
-        const chat = tc.core.owner orelse return error.NotPaired;
+        if (place.chat == 0) return error.NotPaired;
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
-        tc.send_bot.send(chat, text) catch |e| {
+        const sent = tc.send_bot.sendTo(place.chat, place.thread, text) catch |e| {
             complain("telegram: sending failed: {s}", .{@errorName(e)});
-            return e;
+            return if (e == error.TelegramRefused and place.thread != 0) error.TopicRefused else e;
+        };
+        return .{ .first = sent.first, .count = sent.count };
+    }
+
+    fn buttons(ctx: *anyopaque, place: core_mod.Place, text: []const u8, bs: []const [2][]const u8) ?i64 {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return null;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return tc.send_bot.sendButtonsTo(place.chat, place.thread, text, bs) catch null;
+    }
+
+    fn clear(ctx: *anyopaque, place: core_mod.Place, id: i64) void {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        tc.send_bot.clearButtons(place.chat, id) catch {};
+    }
+
+    fn document(ctx: *anyopaque, place: core_mod.Place, name: []const u8, data: []const u8) anyerror!i64 {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return error.NotPaired;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return tc.send_bot.sendDocument(place.chat, place.thread, name, data) catch |e| {
+            complain("telegram: sending a file failed: {s}", .{@errorName(e)});
+            return if (e == error.TelegramRefused and place.thread != 0) error.TopicRefused else e;
         };
     }
 
-    fn buttons(ctx: *anyopaque, text: []const u8, bs: []const [2][]const u8) ?i64 {
+    fn openTopic(ctx: *anyopaque, chat: i64, name: []const u8) anyerror!i64 {
         const tc: *TgChan = @ptrCast(@alignCast(ctx));
-        const chat = tc.core.owner orelse return null;
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
-        return tc.send_bot.sendButtons(chat, text, bs) catch null;
-    }
-
-    fn clear(ctx: *anyopaque, id: i64) void {
-        const tc: *TgChan = @ptrCast(@alignCast(ctx));
-        const chat = tc.core.owner orelse return;
-        tc.mutex.lockUncancelable(tc.io);
-        defer tc.mutex.unlock(tc.io);
-        tc.send_bot.clearButtons(chat, id) catch {};
+        return tc.send_bot.createForumTopic(chat, name);
     }
 
     /// Takes a button press, so Telegram stops showing it as pending.
@@ -731,6 +752,13 @@ fn runCmd(app: *App) !Exit {
     };
     tc_made = true;
     c.attach(tc.channel());
+    // the bot's name (a command may end in @ and it) and whether topics are on
+    {
+        var me_arena: std.heap.ArenaAllocator = .init(app.gpa);
+        defer me_arena.deinit();
+        if (tc.poll.getMe(me_arena.allocator())) |me| c.setBot(me.username, me.topics) else |e|
+            complain("telegram: getMe failed ({s}); topics are taken to be on", .{@errorName(e)});
+    }
     try c.startWorker();
     const tick_thread = try std.Thread.spawn(.{}, ticker, .{c});
     defer tick_thread.join();
@@ -755,10 +783,17 @@ fn runCmd(app: *App) !Exit {
             // saved first: after a crash an update is not handled twice
             telegram.Offset.save(app.io, c.paths.telegram, offset) catch {};
             switch (u) {
-                .message => |m| if (m.text.len > 0) c.handleMessage(m.from_id, m.text) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
+                .message => |m| if (m.text.len > 0) c.handleIncoming(.{
+                    .from = m.from_id,
+                    .chat = m.chat_id,
+                    .chat_type = m.chat_type,
+                    .thread = m.thread,
+                    .topic = m.topic,
+                    .text = m.text,
+                }) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
                 .callback => |cb| {
                     tc.answer(cb.id);
-                    c.handleCallback(cb.from_id, cb.message_id, cb.data);
+                    c.handleCallbackIn(cb.from_id, cb.chat_id, cb.thread, cb.message_id, cb.data);
                 },
             }
         }
@@ -769,34 +804,59 @@ fn runCmd(app: *App) !Exit {
 
 // ---- terminal ----
 
+/// The terminal: every post is printed, with its conversation's name in
+/// front when it is not this terminal's own.
 const TermChan = struct {
     io: Io,
     mutex: Io.Mutex = .init,
+    /// The conversation printed without its name: `terminal` for `harness
+    /// chat`, a brief's or task's `to` for `brief` and `task run`.
+    home: []const u8 = "terminal",
 
     fn channel(tc: *TermChan) core_mod.Channel {
-        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear };
+        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .document = document };
     }
 
-    fn send(ctx: *anyopaque, text: []const u8) anyerror!void {
+    /// "[NAME] " for a post that is not for this terminal's conversation.
+    fn tag(tc: *const TermChan, buf: []u8, place: core_mod.Place) []const u8 {
+        if (std.mem.eql(u8, place.name, tc.home)) return "";
+        return std.fmt.bufPrint(buf, "[{s}] ", .{util.cut(place.name, 40)}) catch "";
+    }
+
+    fn send(ctx: *anyopaque, place: core_mod.Place, text: []const u8) anyerror!core_mod.Sent {
         const tc: *TermChan = @ptrCast(@alignCast(ctx));
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
-        try outPrint(tc.io, "{s}\n", .{text});
+        var tb: [48]u8 = undefined;
+        try outPrint(tc.io, "{s}{s}\n", .{ tc.tag(&tb, place), text });
+        return .{};
     }
 
-    fn buttons(ctx: *anyopaque, text: []const u8, bs: []const [2][]const u8) ?i64 {
+    fn buttons(ctx: *anyopaque, place: core_mod.Place, text: []const u8, bs: []const [2][]const u8) ?i64 {
         const tc: *TermChan = @ptrCast(@alignCast(ctx));
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
         // only the answers this question has: money has no 24 h
         var buf: [128]u8 = undefined;
-        outPrint(tc.io, "{s}\n{s}\n", .{ text, keysLine(&buf, bs) }) catch {};
+        var tb: [48]u8 = undefined;
+        outPrint(tc.io, "{s}{s}\n{s}\n", .{ tc.tag(&tb, place), text, keysLine(&buf, bs) }) catch {};
         return 0;
     }
 
-    fn clear(ctx: *anyopaque, id: i64) void {
+    fn clear(ctx: *anyopaque, place: core_mod.Place, id: i64) void {
         _ = ctx;
+        _ = place;
         _ = id;
+    }
+
+    /// A file can't be shown here: its name and size are.
+    fn document(ctx: *anyopaque, place: core_mod.Place, name: []const u8, data: []const u8) anyerror!i64 {
+        const tc: *TermChan = @ptrCast(@alignCast(ctx));
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        var tb: [48]u8 = undefined;
+        try outPrint(tc.io, "{s}file {s} ({d} bytes)\n", .{ tc.tag(&tb, place), name, data.len });
+        return 0;
     }
 };
 
@@ -835,7 +895,7 @@ fn chatCmd(app: *App) !Exit {
                 continue;
             }
         }
-        try c.handleText(line);
+        try c.handleTextIn("terminal", line);
     }
     // no one is left to answer: the question waiting, and any after it, is Deny
     c.closeQuestions();
@@ -857,7 +917,6 @@ fn briefCmd(app: *App, args: []const []const u8) !Exit {
     const c = try app.open(.brief);
     defer c.close();
     var tc: TermChan = .{ .io = app.io };
-    c.attach(tc.channel());
     if (c.briefs.len == 0) {
         complain("no briefs in briefs.ini", .{});
         return .failed;
@@ -868,6 +927,8 @@ fn briefCmd(app: *App, args: []const []const u8) !Exit {
         complain("no brief called {s}", .{args[0]});
         return .failed;
     };
+    tc.home = b.to;
+    c.attach(tc.channel());
     _ = try c.runBrief(b);
     return .ok;
 }
@@ -880,13 +941,14 @@ fn taskCmd(app: *App, args: []const []const u8) !Exit {
     const c = try app.open(.task);
     defer c.close();
     var tc: TermChan = .{ .io = app.io };
-    c.attach(tc.channel());
     const tk = for (c.tasks) |tk| {
         if (eql(tk.name, args[1])) break tk;
     } else {
         complain("no task called {s}", .{args[1]});
         return .failed;
     };
+    tc.home = tk.to;
+    c.attach(tc.channel());
     _ = try c.runTask(tk);
     return .ok;
 }
@@ -1441,7 +1503,7 @@ test "telegram_send_before_pairing_is_an_error" {
         tc.deinit();
     }
     const ch = tc.channel();
-    try t.expectError(error.NotPaired, ch.send(ch.ctx, "hello, anyone?"));
+    try t.expectError(error.NotPaired, ch.send(ch.ctx, .{}, "hello, anyone?"));
     try t.expectEqual(0, std.mem.count(u8, try telegram.outbox(&e), "hello, anyone?"));
 }
 
