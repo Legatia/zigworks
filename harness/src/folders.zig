@@ -282,6 +282,130 @@ fn eqlPath(a: []const u8, b: []const u8) bool {
     return if (fold) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
 }
 
+/// Section i's folder: as the gate reads it (`real`, symbolic links
+/// followed), else as written.
+fn folderAt(f: Folders, real: ?[]const []const u8, i: usize) []const u8 {
+    return if (real) |r| r[i] else f.sections[i].folder;
+}
+
+/// Whether `w` may `access` the path `rel` (inside the workspace, `/`
+/// between parts): null if so, else why not, naming the section, the key
+/// and who is not listed. The deepest section holding `rel` that has the
+/// key decides; with none, the key does not limit. `real`: each section's
+/// folder as the gate reads it, in the sections' order; null: as written.
+pub fn allows(f: Folders, arena: std.mem.Allocator, real: ?[]const []const u8, rel: []const u8, access: Access, w: who.Who) ?[]const u8 {
+    var best: ?usize = null;
+    for (f.sections, 0..) |s, i| {
+        if (s.list(access) == null) continue;
+        const folder = folderAt(f, real, i);
+        if (!inFolder(rel, folder)) continue;
+        if (best == null or folder.len > folderAt(f, real, best.?).len) best = i;
+    }
+    const s = f.sections[best orelse return null];
+    const list = s.list(access).?;
+    if (list.len == 1 and std.mem.eql(u8, list[0], "none"))
+        return std.fmt.allocPrint(arena, "folders.ini [{s}] {s}: none", .{ s.name, @tagName(access) }) catch "folders.ini: none may";
+    const missing = notListed(list, w) orelse return null;
+    return std.fmt.allocPrint(arena, "folders.ini [{s}] {s}: {s}{s} is not listed", .{ s.name, @tagName(access), missing.prefix, missing.name }) catch "folders.ini: not listed";
+}
+
+const Missing = struct { prefix: []const u8, name: []const u8 };
+
+/// Who of `w` the list does not let through, or null when it does: a run
+/// the owner or a schedule started passes when that origin is listed (then
+/// any definition does); otherwise the definition, those that delegated
+/// it and (for other origins) the origin must each be listed. A call with
+/// no definition (`agent` "", an app's own) is its origin alone.
+fn notListed(list: []const []const u8, w: who.Who) ?Missing {
+    const kind = w.by[0 .. std.mem.indexOfScalar(u8, w.by, ':') orelse w.by.len];
+    const own = std.mem.eql(u8, kind, "owner") or std.mem.eql(u8, kind, "schedule");
+    if (own and originListed(list, w.by)) return null;
+    if (w.agent.len > 0) {
+        if (!agentListed(list, w.agent)) return .{ .prefix = "agent:", .name = w.agent };
+        var p = w.parent;
+        while (p) |x| : (p = x.parent) if (!agentListed(list, x.agent)) return .{ .prefix = "agent:", .name = x.agent };
+    }
+    if (!own and !originListed(list, w.by)) return .{ .prefix = "", .name = w.by };
+    return null;
+}
+
+fn agentListed(list: []const []const u8, agent: []const u8) bool {
+    for (list) |e| if (who.matchesAgent(e, agent)) return true;
+    return false;
+}
+
+fn originListed(list: []const []const u8, by: []const u8) bool {
+    for (list) |e| if (who.matchesBy(e, by)) return true;
+    return false;
+}
+
+/// A folder of the workspace and what a who may do there, for a sandbox to
+/// mount (gap 2): `write` reads and writes, `read` only reads, `none` not
+/// at all.
+pub const Mount = struct {
+    folder: []const u8,
+    access: enum { none, read, write },
+};
+
+/// What `w` may read and write: the workspace ("") and each section's
+/// folder, outermost first, so that a sandbox mounting them in this order
+/// lets a deeper one replace the one around it.
+pub fn view(f: Folders, arena: std.mem.Allocator, w: who.Who) ![]const Mount {
+    var folders: std.ArrayList([]const u8) = .empty;
+    try folders.append(arena, "");
+    for (f.sections) |s| if (s.folder.len > 0) try folders.append(arena, s.folder);
+    std.mem.sort([]const u8, folders.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            const dx = std.mem.count(u8, x, "/") + @intFromBool(x.len > 0);
+            const dy = std.mem.count(u8, y, "/") + @intFromBool(y.len > 0);
+            return if (dx != dy) dx < dy else std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    const out = try arena.alloc(Mount, folders.items.len);
+    for (folders.items, out) |folder, *m| {
+        const reads = allows(f, arena, null, folder, .read, w) == null;
+        const writes = allows(f, arena, null, folder, .write, w) == null;
+        m.* = .{ .folder = folder, .access = if (reads and writes) .write else if (reads) .read else .none };
+    }
+    return out;
+}
+
+/// Whether a sandbox with this view sees `rel`: the deepest folder holding
+/// it is mounted.
+pub fn sees(mounts: []const Mount, rel: []const u8) bool {
+    var best: ?Mount = null;
+    for (mounts) |m| {
+        if (!inFolder(rel, m.folder)) continue;
+        if (best == null or m.folder.len >= best.?.folder.len) best = m;
+    }
+    const m = best orelse return false;
+    return m.access != .none;
+}
+
+/// The variables a host command started in `dir` gets: those of every
+/// section holding it, outermost first, a nearer one replacing a variable
+/// of the same name.
+pub fn varsFor(f: Folders, arena: std.mem.Allocator, real: ?[]const []const u8, dir: []const u8) ![]const Var {
+    var holding: std.ArrayList(usize) = .empty;
+    for (f.sections, 0..) |s, i| if (s.vars.len > 0 and inFolder(dir, folderAt(f, real, i))) try holding.append(arena, i);
+    const Ctx = struct { f: Folders, real: ?[]const []const u8 };
+    std.mem.sort(usize, holding.items, Ctx{ .f = f, .real = real }, struct {
+        fn lt(c: Ctx, x: usize, y: usize) bool {
+            return folderAt(c.f, c.real, x).len < folderAt(c.f, c.real, y).len;
+        }
+    }.lt);
+    var out: std.ArrayList(Var) = .empty;
+    for (holding.items) |i| for (f.sections[i].vars) |v| {
+        for (out.items) |*o| {
+            if (sameVar(o.name, v.name)) {
+                o.* = v;
+                break;
+            }
+        } else try out.append(arena, v);
+    };
+    return out.items;
+}
+
 const t = std.testing;
 
 const spec_example =
@@ -415,4 +539,135 @@ test "in_folder_is_the_folder_or_below" {
     try t.expect(!inFolder("note", "notes"));
     try t.expect(!inFolder("", "notes"));
     try t.expectEqual(fold, inFolder("Notes/a", "notes"));
+}
+
+/// What `allows` says of `rel` for `w` in the folders.ini `text`.
+fn verdict(a: std.mem.Allocator, text: []const u8, rel: []const u8, access: Access, w: who.Who) !?[]const u8 {
+    return allows(try parse(a, text), a, null, rel, access, w);
+}
+
+fn expectRefused(want: []const u8, got: ?[]const u8) !void {
+    const g = got orelse {
+        std.debug.print("allowed, not refused with: {s}\n", .{want});
+        return error.TestExpectedRefusal;
+    };
+    try t.expectEqualStrings(want, g);
+}
+
+test "a_list_limits_only_its_access" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = "[notes]\nwrite = agent:coder\n";
+    const main: who.Who = .{};
+    try t.expectEqual(null, try verdict(a, text, "notes/a", .read, main));
+    try expectRefused("folders.ini [notes] write: agent:main is not listed", try verdict(a, text, "notes/a", .write, main));
+    try t.expectEqual(null, try verdict(a, text, "notes", .run, main));
+    try t.expectEqual(null, try verdict(a, text, "notes/a", .write, .{ .agent = "coder" }));
+    try t.expectEqual(null, try verdict(a, text, "notes2/a", .write, main));
+}
+
+test "the_nearest_folder_with_the_key_wins" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = "[/]\nwrite = agent:main\n[work]\nwrite = agent:coder\n[work/shop]\nread = owner, agent:main\n";
+    const main: who.Who = .{};
+    try t.expectEqual(null, try verdict(a, text, "notes/x", .write, main));
+    try expectRefused("folders.ini [work] write: agent:main is not listed", try verdict(a, text, "work/shop/x", .write, main));
+    try t.expectEqual(null, try verdict(a, text, "work/shop/x", .write, .{ .agent = "coder" }));
+    try expectRefused("folders.ini [work/shop] read: trigger:mail is not listed", try verdict(a, text, "work/shop/x", .read, .{ .by = "trigger:mail" }));
+}
+
+test "none_refuses_every_run" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = "[private]\nread = none\n";
+    for ([_]who.Who{ .{}, .{ .agent = "coder" }, .{ .by = "schedule:x" }, .{ .agent = "", .by = "app:notes" } }) |w|
+        try expectRefused("folders.ini [private] read: none", try verdict(a, text, "private/k", .read, w));
+}
+
+test "every_definition_in_the_chain_must_be_listed" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const main: who.Who = .{};
+    const helper: who.Who = .{ .agent = "helper", .parent = &main };
+    try expectRefused("folders.ini [notes] write: agent:main is not listed", try verdict(a, "[notes]\nwrite = agent:helper\n", "notes/a", .write, helper));
+    try t.expectEqual(null, try verdict(a, "[notes]\nwrite = agent:helper, agent:main\n", "notes/a", .write, helper));
+    try t.expectEqual(null, try verdict(a, "[notes]\nwrite = agent:*\n", "notes/a", .write, helper));
+}
+
+test "owner_listed_lets_its_runs_through" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const main: who.Who = .{};
+    const helper: who.Who = .{ .agent = "helper", .parent = &main };
+    try t.expectEqual(null, try verdict(a, "[notes]\nwrite = owner\n", "notes/a", .write, helper));
+    try expectRefused("folders.ini [notes] write: agent:main is not listed", try verdict(a, "[notes]\nwrite = owner\n", "notes/a", .write, .{ .by = "schedule:x" }));
+    try t.expectEqual(null, try verdict(a, "[notes]\nwrite = owner, schedule:*\n", "notes/a", .write, .{ .by = "schedule:x" }));
+    try t.expectEqual(null, try verdict(a, "[notes]\nread = agent:*\n", "notes/a", .read, .{ .by = "schedule:x" }));
+    try expectRefused("folders.ini [notes] read: trigger:mail is not listed", try verdict(a, "[notes]\nread = agent:*\n", "notes/a", .read, .{ .by = "trigger:mail" }));
+}
+
+test "trigger_workflow_and_app_origins_must_be_listed" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const trig: who.Who = .{ .by = "trigger:mail" };
+    try expectRefused("folders.ini [notes] write: trigger:mail is not listed", try verdict(a, "[notes]\nwrite = agent:main\n", "notes/a", .write, trig));
+    try t.expectEqual(null, try verdict(a, "[notes]\nwrite = agent:main, trigger:mail\n", "notes/a", .write, trig));
+    const step: who.Who = .{ .by = "workflow:release/draft" };
+    try t.expectEqual(null, try verdict(a, "[notes]\nwrite = agent:main, workflow:release\n", "notes/a", .write, step));
+    try expectRefused("folders.ini [notes] write: workflow:release/draft is not listed", try verdict(a, "[notes]\nwrite = agent:main, workflow:other\n", "notes/a", .write, step));
+    // an app's own call has no definition: the app alone must be listed
+    const app: who.Who = .{ .agent = "", .by = "app:notes" };
+    try t.expectEqual(null, try verdict(a, "[notes]\nwrite = app:notes\n", "notes/a", .write, app));
+    try expectRefused("folders.ini [notes] write: app:notes is not listed", try verdict(a, "[notes]\nwrite = agent:main\n", "notes/a", .write, app));
+}
+
+test "a_view_lists_what_a_who_may_mount" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try parse(a, "[/]\nwrite = agent:main\n[private]\nread = owner\n[shared]\nwrite = trigger:mail, agent:main\n");
+    const own = try view(f, a, .{});
+    try t.expectEqual(3, own.len);
+    try t.expectEqualStrings("", own[0].folder);
+    try t.expectEqual(.write, own[0].access);
+    try t.expectEqualStrings("private", own[1].folder);
+    try t.expectEqual(.write, own[1].access);
+    try t.expectEqualStrings("shared", own[2].folder);
+    try t.expectEqual(.write, own[2].access);
+    const trig = try view(f, a, .{ .by = "trigger:mail" });
+    try t.expectEqual(.read, trig[0].access);
+    try t.expectEqual(.none, trig[1].access);
+    try t.expectEqual(.write, trig[2].access);
+    try t.expect(sees(trig, "notes/a"));
+    try t.expect(!sees(trig, "private/k"));
+    try t.expect(sees(trig, "shared/x"));
+    try t.expect(!sees(&.{}, "notes/a"));
+}
+
+test "vars_come_from_every_folder_down_to_the_start_folder" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try parse(a, "[/]\nvars = A:a-all, B:b-all\n[work]\nvars = B:b-work\n[work/shop]\nvars = C:c-shop\n");
+    const deep = try varsFor(f, a, null, "work/shop/src");
+    try t.expectEqual(3, deep.len);
+    try t.expectEqualStrings("A", deep[0].name);
+    try t.expectEqualStrings("a-all", deep[0].secret);
+    try t.expectEqualStrings("B", deep[1].name);
+    try t.expectEqualStrings("b-work", deep[1].secret);
+    try t.expectEqualStrings("work", deep[1].section);
+    try t.expectEqualStrings("C", deep[2].name);
+    try t.expectEqualStrings("c-shop", deep[2].secret);
+    for ([_][]const u8{ "notes", "" }) |dir| {
+        const vs = try varsFor(f, a, null, dir);
+        try t.expectEqual(2, vs.len);
+        try t.expectEqualStrings("b-all", vs[1].secret);
+    }
 }

@@ -83,7 +83,7 @@
 
 - [ ] **Step 1: Write the failing tests** (Who values from who.zig):
   - `a_list_limits_only_its_access`: `[notes]\nwrite = agent:coder`: main reads `notes/a` (null), writes it (`folders.ini [notes] write: agent:main is not listed`), runs in `notes` (null); coder writes (null); `notes2/a` written by main (null).
-  - `the_nearest_folder_with_the_key_wins`: `[/]\nwrite = agent:main\n[work]\nwrite = agent:coder\n[work/shop]\nread = owner`: main writes `notes/x` (null), `work/shop/x` (`folders.ini [work] write: agent:main is not listed`); coder writes `work/shop/x` (null); a trigger run's main reads `work/shop/x` (`folders.ini [work/shop] read: trigger:mail is not listed`).
+  - `the_nearest_folder_with_the_key_wins`: `[/]\nwrite = agent:main\n[work]\nwrite = agent:coder\n[work/shop]\nread = owner, agent:main`: main writes `notes/x` (null), `work/shop/x` (`folders.ini [work] write: agent:main is not listed`); coder writes `work/shop/x` (null); a trigger run's main reads `work/shop/x` (`folders.ini [work/shop] read: trigger:mail is not listed`).
   - `none_refuses_every_run`: `[private]\nread = none`: main, coder, a schedule run, an app's own call: each `folders.ini [private] read: none`.
   - `every_definition_in_the_chain_must_be_listed`: `[notes]\nwrite = agent:helper`: main's helper → `… agent:main is not listed`; `write = agent:helper, agent:main` → null; `write = agent:*` → null.
   - `owner_listed_lets_its_runs_through`: `write = owner`: main's helper in an owner run → null; by `schedule:x` → `… agent:main is not listed`; `write = owner, schedule:*` → null for it; `read = agent:*` lets `schedule:x` through, not `trigger:mail` (`… trigger:mail is not listed`).
