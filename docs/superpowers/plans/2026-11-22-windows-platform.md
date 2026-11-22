@@ -192,3 +192,15 @@ thread against 60 replaces of 200 to 256 KiB: every read is one version
 whole), `a_replace_waits_for_a_program_that_holds_the_file_windows` (a
 handle sharing reads only, let go after 0.4 s: the replace waits and
 succeeds; one never let go: an error, the old content, nothing left).
+
+## 6. The hosted design (branch `win/hosted`, on `win/state-files`)
+
+`docs/superpowers/specs/2026-11-22-harness-hosted-design.md`: the three
+hosted notes (agents, file roles, environments) and the apps spec's
+hosted part joined into one design for the owner, grounded in omnigate
+(its control plane, keys, budgets and credit): a VM per customer instance
+with sandboxes by default; actors per agent instance with journaled
+turns; the customer's filesystem with roles at its front; cloned VMs;
+apps over https with the Telegram Mini App; isolation and what the
+operator sees; failure and recovery; a build order; five questions for
+the owner, each with a proposal. No code.
