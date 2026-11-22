@@ -152,7 +152,10 @@ Deny. In a scheduled run nobody can answer, so `ask` is Deny there, and
 the run says what it skipped.
 
 `/stop` stops everything at once: the running turn, any shell command and
-everything it started, and background runs. `/new` starts a fresh
+everything it started, and background runs. (On Windows, which has no
+process groups, each shell command, MCP server and browser runs in a job
+object of its own, so what it started ends with it, harness's own end
+included.) `/new` starts a fresh
 conversation; memory stays. Ctrl-C or a kill (SIGINT, SIGTERM; on Windows
 Ctrl-C or closing the console) does what `/stop` does, logs it, and ends
 harness; another instance can start at once.
@@ -450,7 +453,6 @@ while `harness run` holds the folder and has ticked in the last 90 s.
   or task waits for its next scheduled time. A model call ends by the
   turn's time limit; one that timed out is not sent again. A request the
   API refuses as invalid drops that turn, and you are told.
-- **Windows.** `/stop` ends a shell command but not processes it started.
 - **Feeds** are read up to 4 MiB, fetched pages up to 1 MiB, rendered
   pages up to 4 MiB.
 - **MCP servers and the browser** run as you, like shell commands. An MCP

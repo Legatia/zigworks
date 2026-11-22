@@ -12,6 +12,7 @@ const builtin = @import("builtin");
 const config = @import("config.zig");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
+const proc = @import("proc.zig");
 const Io = std.Io;
 
 const is_windows = builtin.os.tag == .windows;
@@ -292,8 +293,6 @@ pub const StartOptions = struct {
     stop: ?*std.atomic.Value(bool) = null,
 };
 
-extern "kernel32" fn TerminateProcess(h: std.os.windows.HANDLE, code: u32) callconv(.winapi) std.os.windows.BOOL;
-
 pub const Server = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -302,6 +301,8 @@ pub const Server = struct {
     child: std.process.Child,
     /// The process (and on POSIX its group).
     pid: std.process.Child.Id,
+    /// Windows: the server and all it started (see proc.zig).
+    job: proc.Job = .{},
     stdin: ?Io.File,
     stdout: Io.File,
     stderr: Io.File,
@@ -323,7 +324,9 @@ pub const Server = struct {
 
     /// stdout closed: the server is gone.
     eof: std.atomic.Value(bool) = .init(false),
-    /// Tells the readers to stop (POSIX).
+    /// stderr closed (its reader ended).
+    err_eof: std.atomic.Value(bool) = .init(false),
+    /// Tells the readers to stop.
     ended: std.atomic.Value(bool) = .init(false),
     th_out: ?std.Thread = null,
     th_err: ?std.Thread = null,
@@ -346,7 +349,9 @@ pub const Server = struct {
         try vars.put("TERM", "dumb");
         for (cfg.secrets, opts.secret_values) |sec, val| try vars.put(sec.env, val);
 
-        var child = try std.process.spawn(io, .{
+        // Windows: in a job before it can start anything (see proc.zig)
+        var job = proc.Job.create();
+        var child = std.process.spawn(io, .{
             .argv = argv,
             .cwd = .{ .path = opts.cwd },
             .environ_map = &vars,
@@ -354,12 +359,18 @@ pub const Server = struct {
             .stdout = .pipe,
             .stderr = .pipe,
             .pgid = if (is_windows) null else 0,
+            .start_suspended = is_windows,
             .create_no_window = true,
-        });
+        }) catch |e| {
+            job.close();
+            return e;
+        };
+        job.adopt(&child);
         // the pipes are ours: `wait` must not close them under the readers
         const s = gpa.create(Server) catch |e| {
-            killTree(child.id.?);
+            killTree(child.id.?, &job);
             _ = child.wait(io) catch {};
+            job.close();
             return e;
         };
         s.* = .{
@@ -368,6 +379,7 @@ pub const Server = struct {
             .arena_state = .init(gpa),
             .child = child,
             .pid = child.id.?,
+            .job = job,
             .stdin = child.stdin.?,
             .stdout = child.stdout.?,
             .stderr = child.stderr.?,
@@ -498,10 +510,11 @@ pub const Server = struct {
         return buf[0..s.err_len];
     }
 
-    /// Kills the server's process and its group at once; frees nothing
-    /// (`deinit` still has to follow, unless the process is ending).
+    /// Kills the server's process and its group (Windows: its job) at
+    /// once; frees nothing (`deinit` still has to follow, unless the
+    /// process is ending).
     pub fn kill(s: *Server) void {
-        killTree(s.pid);
+        killTree(s.pid, &s.job);
     }
 
     /// Closes stdin, gives the server a moment to exit, kills its process
@@ -535,16 +548,15 @@ pub const Server = struct {
         s.closeInput();
         var waited: u32 = 0;
         while (!s.outputClosed() and waited < grace_ms) : (waited += 10) io.sleep(.fromMilliseconds(10), .awake) catch {};
-        // the whole group, so whatever it started goes too
-        killTree(s.pid);
+        // the whole group (Windows: the job), so whatever it started goes too
+        killTree(s.pid, &s.job);
         _ = s.child.wait(io) catch {};
-        if (!is_windows) {
-            std.posix.kill(-s.pid, .KILL) catch {};
-            // a process that left the group and kept the pipes open is not waited for
-            waited = 0;
-            while (!s.eof.load(.acquire) and s.th_out != null and waited < 1000) : (waited += 10) io.sleep(.fromMilliseconds(10), .awake) catch {};
-            s.ended.store(true, .release);
-        }
+        if (is_windows) s.job.kill(null) else std.posix.kill(-s.pid, .KILL) catch {};
+        // what is left in both pipes (stderr says why a start failed); a
+        // process that left the group and kept them open is not waited for
+        waited = 0;
+        while (!(s.eof.load(.acquire) and s.err_eof.load(.acquire)) and s.th_out != null and waited < 1000) : (waited += 10) io.sleep(.fromMilliseconds(10), .awake) catch {};
+        s.ended.store(true, .release);
         if (s.th_out) |th| th.join();
         if (s.th_err) |th| th.join();
         s.th_out = null;
@@ -554,6 +566,7 @@ pub const Server = struct {
     }
 
     fn free(s: *Server) void {
+        s.job.close();
         if (s.got) |g| s.gpa.free(g);
         s.arena_state.deinit();
         s.gpa.destroy(s);
@@ -616,16 +629,7 @@ pub const Server = struct {
 
     /// Waits until the pipe has data; false when the readers should stop.
     fn ready(s: *Server, f: Io.File) bool {
-        if (is_windows) {
-            return true;
-        } else {
-            while (!s.ended.load(.acquire)) {
-                var fds = [_]std.posix.pollfd{.{ .fd = f.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-                const n = std.posix.poll(&fds, 100) catch return false;
-                if (n > 0) return true;
-            }
-            return false;
-        }
+        return proc.waitReadable(s.io, f, &s.ended);
     }
 
     fn readOut(s: *Server) void {
@@ -686,6 +690,7 @@ pub const Server = struct {
     }
 
     fn readErr(s: *Server) void {
+        defer s.err_eof.store(true, .release);
         var chunk: [4096]u8 = undefined;
         while (s.ready(s.stderr)) {
             const got = s.stderr.readStreaming(s.io, &.{&chunk}) catch break;
@@ -713,8 +718,7 @@ fn validToolName(name: []const u8) bool {
     return true;
 }
 
-/// The process group on POSIX; the process itself on Windows.
-/// Stops servers, each with its group, and frees them: all are told
+/// Stops servers, each with its group (Windows: its job), and frees them: all are told
 /// together (their stdin closed) and share one grace, so stopping many
 /// takes no longer than stopping one.
 pub fn stopAll(servers: []const *Server) void {
@@ -737,9 +741,11 @@ pub fn stopAll(servers: []const *Server) void {
     }
 }
 
-fn killTree(id: std.process.Child.Id) void {
+/// The process group on POSIX; the job on Windows (the process alone
+/// when it has none).
+fn killTree(id: std.process.Child.Id, job: *const proc.Job) void {
     if (is_windows) {
-        _ = TerminateProcess(id, 1);
+        job.kill(id);
     } else {
         std.posix.kill(-id, .KILL) catch {};
         std.posix.kill(id, .KILL) catch {};
@@ -1160,6 +1166,31 @@ test "deinit_leaves_no_process_behind" {
         t.io.sleep(.fromMilliseconds(20), .awake) catch {};
     }
     return error.TestUnexpectedResult;
+}
+
+test "deinit_leaves_no_process_behind_windows" {
+    if (!is_windows) return error.SkipZigTest;
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    // cmd starts a background child that holds the server's pipes and
+    // leaves a mark if it lives two seconds, then runs the server
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/bg.cmd", .data = "@ping -n 3 127.0.0.1 >nul\r\n@echo alive> left.txt\r\n" });
+    const cmd = try std.fmt.allocPrint(f.a(), "cmd /c start /b cmd /c bg.cmd & \"{s}\" --mcp", .{f.fake});
+    const s = try Server.start(t.allocator, t.io, .{ .name = "fake", .command = cmd, .secrets = &.{}, .money = &.{} }, .{
+        .cwd = f.ws,
+        .path_var = try proc.systemDir(f.a()),
+        .home = "",
+        .secret_values = &.{},
+        .start_timeout_ms = 10000,
+    });
+    try t.expect(s.alive());
+    const t0 = nowMs();
+    s.deinit();
+    try t.expect(nowMs() - t0 < 2000);
+    // what it started went with it: no mark, even well after
+    t.io.sleep(.fromMilliseconds(3000), .awake) catch {};
+    try t.expectError(error.FileNotFound, f.tmp.dir.statFile(t.io, "ws/left.txt", .{}));
 }
 
 test "a_missing_or_broken_command_fails_to_start_with_its_stderr" {
