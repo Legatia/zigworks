@@ -8,7 +8,7 @@ const scrub = @import("scrub.zig");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const Kind = enum { turn, model, tool, gate, memory, brief, task, chat, config, recovered };
+pub const Kind = enum { turn, model, tool, gate, memory, brief, task, chat, config, recovered, send };
 
 /// Longest string stored in a field.
 pub const max_field = 2048;
@@ -135,14 +135,16 @@ pub const Log = struct {
     }
 
     /// Appends one line. `fields` is a struct of strings, integers, bools
-    /// and optionals. When `private`, string fields other than `tool`,
-    /// `decision` and `why` are stored as their size and SHA-256 only.
+    /// and optionals. When `private`, string fields other than the labels
+    /// (`tool`, `decision`, `why`, `run`, `conversation`, `by`, `agent`,
+    /// `to`, `event`) are stored as their size and keyed hash only.
     pub fn write(l: *Log, kind: Kind, private: bool, fields: anytype) !void {
         _ = try l.writeLine(kind, private, null, fields);
     }
 
-    /// Appends one line of a run: `rid` and `run`, then `by`, `agent` and
-    /// `parent` when `tag` has them, then `fields` as `write` writes them.
+    /// Appends one line of a run: `rid`, its `conversation` when `tag` has
+    /// one, `run`, then `by`, `agent` and `parent` when `tag` has them,
+    /// then `fields` as `write` writes them.
     /// Returns the line's seq (a run's id is its first line's).
     pub fn writeRun(l: *Log, kind: Kind, private: bool, tag: Tag, fields: anytype) !u64 {
         return l.writeLine(kind, private, tag, fields);
@@ -161,7 +163,12 @@ pub const Log = struct {
         const info = @typeInfo(T).@"struct";
         const ctx: Ctx = .{ .private = private, .scrubber = if (l.scrubber) |*x| x else null, .key = if (l.key) |*k| k else null };
         if (tag) |tg| {
-            try line.print(gpa, ",\"rid\":{d},\"run\":", .{if (tg.rid == 0) seq else tg.rid});
+            try line.print(gpa, ",\"rid\":{d}", .{if (tg.rid == 0) seq else tg.rid});
+            if (tg.conversation) |cv| {
+                try line.appendSlice(gpa, ",\"conversation\":");
+                try value(&line, gpa, "conversation", cv, ctx);
+            }
+            try line.appendSlice(gpa, ",\"run\":");
             try value(&line, gpa, "run", tg.run, ctx);
             if (tg.by) |b| {
                 try line.appendSlice(gpa, ",\"by\":");
@@ -200,6 +207,8 @@ pub const Tag = struct {
     agent: ?[]const u8 = null,
     /// The id of the run that delegated this one (its first line).
     parent: ?u64 = null,
+    /// The conversation the run reports to (every line; gap 4).
+    conversation: ?[]const u8 = null,
 };
 
 /// How a line's fields are written.
@@ -220,7 +229,10 @@ fn value(line: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime name: []cons
     const masked: ?[]u8 = if (ctx.scrubber) |x| try x.scrubAlloc(gpa, raw) else null;
     defer if (masked) |m| gpa.free(m);
     const s: []const u8 = masked orelse raw;
-    const kept = comptime (std.mem.eql(u8, name, "tool") or std.mem.eql(u8, name, "decision") or std.mem.eql(u8, name, "why"));
+    // the labels stay readable when private, so the session view works
+    const kept = comptime for ([_][]const u8{ "tool", "decision", "why", "run", "conversation", "by", "agent", "to", "event" }) |k| {
+        if (std.mem.eql(u8, name, k)) break true;
+    } else false;
     if (ctx.private and !kept) {
         const key = ctx.key orelse return line.print(gpa, "{{\"bytes\":{d}}}", .{s.len});
         var d: [32]u8 = undefined;
@@ -373,7 +385,7 @@ test "a_runs_lines_carry_its_id_and_its_first_line_says_who_started_it" {
     _ = try l.writeRun(.model, false, .{ .rid = h, .run = "chat/h1" }, .{ .result = "ok" });
     // a line of no run has none of it
     try l.write(.config, false, .{ .event = "x" });
-    // private: the labels are kept as other strings are, the ids as they are
+    // private: the labels and the ids stay readable, the texts are hashed
     _ = try l.writeRun(.turn, true, .{ .run = "chat", .by = "owner", .agent = "main" }, .{ .text = "secret" });
     l.close();
     const text = try Io.Dir.cwd().readFileAlloc(t.io, path, arena.allocator(), .unlimited);
@@ -383,13 +395,36 @@ test "a_runs_lines_carry_its_id_and_its_first_line_says_who_started_it" {
         "\"kind\":\"turn\",\"rid\":3,\"run\":\"chat/h1\",\"by\":\"owner\",\"agent\":\"helper\",\"parent\":1,\"text\":\"part\"",
         "\"kind\":\"model\",\"rid\":3,\"run\":\"chat/h1\",\"result\":\"ok\"",
         "\"kind\":\"config\",\"event\":\"x\"",
-        "\"rid\":6,\"run\":{\"bytes\":4},\"by\":{\"bytes\":5}",
+        "\"rid\":6,\"run\":\"chat\",\"by\":\"owner\",\"agent\":\"main\",\"text\":{\"bytes\":6}",
     }) |want| {
         if (std.mem.indexOf(u8, text, want) == null) std.debug.print("missing {s} in:\n{s}\n", .{ want, text });
         try t.expect(std.mem.indexOf(u8, text, want) != null);
     }
     try t.expect(std.mem.indexOf(u8, text, "secret") == null);
     try t.expectEqual(null, (try verify(t.io, path)).broken_at);
+}
+
+test "labels_stay_readable_in_private_lines" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const path = try tmpPath(&tmp, arena.allocator());
+    var l = try Log.open(t.allocator, t.io, path);
+    // what the session view needs stays readable; what was said is hashed
+    const rid = try l.writeRun(.turn, true, .{ .run = "chat", .by = "owner", .agent = "main", .conversation = "house-search" }, .{ .text = "private words" });
+    _ = try l.writeRun(.send, true, .{ .rid = rid, .run = "chat", .conversation = "house-search" }, .{ .to = "main", .event = "posted", .text = "secret post" });
+    l.close();
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, path, arena.allocator(), .unlimited);
+    for ([_][]const u8{
+        "\"kind\":\"turn\",\"rid\":1,\"conversation\":\"house-search\",\"run\":\"chat\",\"by\":\"owner\",\"agent\":\"main\",\"text\":{\"bytes\":13}",
+        "\"kind\":\"send\",\"rid\":1,\"conversation\":\"house-search\",\"run\":\"chat\",\"to\":\"main\",\"event\":\"posted\",\"text\":{\"bytes\":11}",
+    }) |want| {
+        if (std.mem.indexOf(u8, text, want) == null) std.debug.print("missing {s} in:\n{s}\n", .{ want, text });
+        try t.expect(std.mem.indexOf(u8, text, want) != null);
+    }
+    try t.expect(std.mem.indexOf(u8, text, "private words") == null);
+    try t.expect(std.mem.indexOf(u8, text, "secret post") == null);
 }
 
 test "edited_line_is_found_by_verify" {
