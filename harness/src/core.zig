@@ -7045,3 +7045,48 @@ test "stop_name_stops_only_that_definitions_runs" {
     try f.core.handleText("/stop nobody");
     try f.rec.waitFor("No definition called nobody.");
 }
+
+// ---- agent definitions and roles on files ----
+
+test "a_definitions_chat_and_task_runs_are_held_to_folders_ini" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.folders, .data = "[notes]\nwrite = agent:researcher\nsnapshots = on\n" });
+    try addDefinition(&f, "researcher", "---\nname: researcher\ndescription: Notes.\ntools: write_file\n---\nKeep the notes.\n");
+    const notes = try std.fs.path.join(a, &.{ f.core.workspace, "notes" });
+    try Io.Dir.cwd().createDirPath(t.io, notes);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ notes, "old.md" }), .data = "old" });
+    // main may not write in notes
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/m.md\",\"content\":\"m\"}"));
+    try f.e.script(2, model.textReply("main could not"));
+    f.core.chatTurn("write as main");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: folders.ini [notes] write: agent:main is not listed") != null);
+    // the definition picked for the conversation may
+    try f.core.handleText("/agent researcher");
+    try f.e.script(3, model.toolReply("tu_2", "write_file", "{\"path\":\"notes/r.md\",\"content\":\"r\"}"));
+    try f.e.script(4, model.textReply("researcher wrote"));
+    f.core.chatTurn("write as researcher");
+    try t.expectEqualStrings("r", try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ notes, "r.md" }), a, .unlimited));
+    // and so may a task that runs it, started by its schedule
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[watch]\nevery = 5m\nagent = researcher\ndo = Note the news.\n"));
+    try f.e.script(5, model.toolReply("tu_3", "write_file", "{\"path\":\"notes/t.md\",\"content\":\"t\"}"));
+    try f.e.script(6, model.textReply("Task wrote."));
+    f.core.tick();
+    try f.rec.waitFor("[watch] Task wrote.");
+    waitIdle(f.core);
+    try t.expectEqualStrings("t", try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ notes, "t.md" }), a, .unlimited));
+    // the snapshots around each run and the written list name its
+    // definition and what started it
+    const list = try f.core.command(a, "/snapshots notes");
+    for ([_][]const u8{ "before  chat (researcher, owner)", "after  chat (researcher, owner)", "before  task watch (researcher, schedule:watch)", "after  task watch (researcher, schedule:watch)" }) |want| if (std.mem.indexOf(u8, list, want) == null) {
+        std.debug.print("missing {s} in {s}\n", .{ want, list });
+        return error.TestUnexpectedResult;
+    };
+    try t.expectEqual(5, std.mem.count(u8, list, "\n"));
+    const written = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.written, a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, written, "notes/r.md\tagent:researcher chat\n") != null);
+    try t.expect(std.mem.indexOf(u8, written, "notes/t.md\tagent:researcher task watch\n") != null);
+    try t.expect(std.mem.indexOf(u8, written, "notes/m.md") == null);
+}

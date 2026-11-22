@@ -5060,3 +5060,61 @@ test "a_replaced_skill_is_kept_like_a_definition" {
     try t.expectEqual(null, try it.next(t.io));
     try t.expectError(error.FileNotFound, f.e.tmp.dir.access(t.io, "state/skills/fresh", .{}));
 }
+
+// ---- definitions and roles on files ----
+
+test "a_definitions_runs_and_helpers_are_held_to_folders_ini" {
+    var f: Fix = undefined;
+    try f.init("allow shell echo *\n");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    const st = try withSnapshots(&f, "[notes]\nwrite = agent:researcher\nsnapshots = on\n[private]\nread = agent:main\n");
+    defer st.deinit();
+    var written: Written = .init(t.allocator, t.io, "");
+    defer written.deinit();
+    f.run.written = &written;
+    var set = try defsWith(&f, &.{.{ "researcher", "---\nname: researcher\ndescription: Notes.\ntools: write_file, read_file\n---\nKeep the notes.\n" }});
+    defer set.deinit();
+    f.run.defs = &set;
+    try f.e.tmp.dir.createDirPath(t.io, "ws/notes");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/notes/old.md", .data = "old" });
+    try f.e.tmp.dir.createDirPath(t.io, "ws/private");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/private/k.txt", .data = "key" });
+    // a run of researcher: notes lets it write, private does not let it read
+    f.run.useDefinition((try set.get(a, "researcher")).?);
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/r.md\",\"content\":\"r\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "read_file", "{\"path\":\"private/k.txt\"}"));
+    try f.e.script(3, model.textReply("noted"));
+    var r = try f.say("note it");
+    freeResult(&f.run, r);
+    try t.expectEqualStrings("r", try f.e.tmp.dir.readFileAlloc(t.io, "ws/notes/r.md", a, .unlimited));
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "refused by the gate: folders.ini [private] read: agent:researcher is not listed") != null);
+    // its snapshots, before its write and at its end, name it
+    const snaps = try st.list(a, "notes");
+    try t.expectEqual(2, snaps.len);
+    for (snaps) |s| {
+        try t.expectEqualStrings("researcher", s.agent);
+        try t.expectEqualStrings("owner", s.by);
+    }
+    // main: its command is asked, naming what researcher wrote; notes
+    // refuses main's write, and the write of the researcher main delegates
+    f.run.useDefinition(agents.builtin_main);
+    try f.e.script(4, model.toolReply("tu_3", "shell", "{\"command\":\"echo x\"}"));
+    try f.e.script(5, model.toolReply("tu_4", "write_file", "{\"path\":\"notes/m.md\",\"content\":\"m\"}"));
+    try f.e.script(6, model.toolReply("tu_5", "delegate", "{\"tasks\":[{\"task\":\"write h\",\"agent\":\"researcher\"}]}"));
+    try f.e.script(7, model.toolReply("h1", "write_file", "{\"path\":\"notes/h.md\",\"content\":\"h\"}"));
+    try f.e.script(8, model.textReply("could not"));
+    try f.e.script(9, model.textReply("done"));
+    r = try f.say("go on");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    if (!std.mem.endsWith(u8, f.last_what, "since you last allowed a command: notes/r.md (agent:researcher, chat)")) std.debug.print("asked: {s}\n", .{f.last_what});
+    try t.expect(std.mem.endsWith(u8, f.last_what, "since you last allowed a command: notes/r.md (agent:researcher, chat)"));
+    try t.expect(std.mem.indexOf(u8, try f.e.request(6), "refused by the gate: folders.ini [notes] write: agent:main is not listed") != null);
+    // the helper is researcher, but main delegated it and is not listed
+    try t.expect(std.mem.indexOf(u8, try f.e.request(8), "refused by the gate: folders.ini [notes] write: agent:main is not listed") != null);
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "ws/notes/m.md", .{}));
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "ws/notes/h.md", .{}));
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"run\":\"chat/h1\",\"agent\":\"researcher\",\"tool\":\"write_file\",\"decision\":\"deny\"") != null);
+}
