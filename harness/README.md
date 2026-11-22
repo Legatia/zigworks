@@ -26,9 +26,9 @@ standard library (and the system's Security framework on macOS). Models
 are reached only through [omnigate](https://github.com/Legatia/omnigate),
 which holds the provider keys and the budgets.
 
-**State: 0.3.0, tested on macOS by its own tests: 524 unit tests (2 skipped), among
+**State: 0.3.0, tested on macOS by its own tests: 557 unit tests (2 skipped), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 61 checks that drives the real binary against
+and an end-to-end script of 67 checks that drives the real binary against
 stand-ins for omnigate, Telegram, feeds, search and two MCP servers. An
 earlier build of 0.3.0 also passed its tests in CI on Linux and Windows.
 Nothing has run yet against a real omnigate, Telegram bot, MCP server or
@@ -54,7 +54,7 @@ answered. To move the bot to another account, run `harness pair` again and
 send the new code from that account; the old one is told.
 
 `harness chat` does the same in the terminal, for trying it out. Ctrl-D
-leaves; a question waiting for an answer is answered Deny.
+leaves; questions still waiting are withdrawn (not allowed).
 
 ## The data folder
 
@@ -73,7 +73,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 
 | Path | What |
 |---|---|
-| `config.ini` | omnigate url and routes, search, Telegram, limits, memory switches |
+| `config.ini` | omnigate url and routes, search, Telegram, limits, memory switches, the inbox |
 | `rules` | gate rules |
 | `briefs.ini` | briefs and their topics |
 | `tasks.ini` | scheduled tasks |
@@ -88,7 +88,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `snapshots/` | snapshots of folders: each content once, a file per snapshot |
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
-| `state/` | grants, seen feed items, owner, the conversations (`conversations`), status, lock, approval numbers, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files) |
+| `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files) |
 
 On macOS and Linux, `config.ini`, `rules`, `logins.ini`, `mcp.ini`,
 `folders.ini`, the folder `agents/` and its files are refused if other
@@ -202,16 +202,18 @@ address written as `0x7f.1` or `2130706433`. `.` and `..` in a path are
 resolved before the rules see it, and a path that hides one from them
 (`..%2F`, `..;`) is refused.
 
-`ask` sends you the whole call (a file's content, a skill's description
-and body too) with three buttons:
-Allow once, Allow 24 h, Deny. A long one comes in several messages with
-the buttons on the last; a call over 12 KB is refused, and so is one
-whose question, or any part of it, could not be sent. A button from
-before a restart, or under another question, answers nothing, and harness
-says it is out of date. No answer in `approval_seconds` (default 10
-minutes), or before the turn's time (`turn_seconds`) is up, counts as
-Deny. In a scheduled run nobody can answer, so `ask` is Deny there, and
-the run says what it skipped.
+`ask` makes an item in your inbox (see Inbox): you get the whole call (a
+file's content, a skill's description and body too) with three buttons,
+Allow once, Allow 24 h and Deny, and may instead reply to it with text,
+which denies it and gives the agent your reason. A long one comes in
+several messages with the buttons on the last; a call over 12 KB is
+refused, and so is one whose question, or any part of it, could not be
+sent. A button answers only its own item; one from before a restart, or
+of another item, answers nothing, and harness says why. No answer in
+`approval_seconds` (default 10 minutes), or before the turn's time
+(`turn_seconds`) is up, counts as Deny. In a scheduled run nobody can
+answer, so `ask` is Deny there; the run says what it skipped, and each
+skipped call is an item you can allow for that task.
 
 "Allow 24 h" covers that call for the definition that asked: given in
 the chat, it covers the agent's chat turns, tasks and briefs
@@ -221,7 +223,8 @@ question names a definition other than `main` and `helper`
 (`[researcher] shell: …`, `[chat/h1 researcher] …`). A grant kept without a who, as harness 0.3 kept them,
 covers every run. `state/grants` holds one a line: the tool
 (`shell@host` for a command), the expiry, the exact command, host, MCP
-tool or path, and who it covers.
+tool or path, and who it covers. `/grants` lists them with who they cover
+and until when; `/grant rm N` removes one.
 
 `/stop` stops everything at once: the running turn, any shell command and
 everything it started, and background runs. `/new` starts a fresh
@@ -266,7 +269,8 @@ one turn at a time.
   nothing). `final: true` is its reply and ends the turn. A turn that
   stops without one has its last text posted the same way, logged
   `implicit`; working text is never posted, and a turn ended by a limit
-  or an error says which.
+  or an error says which. A post that does not get through is kept and
+  sent again (see Inbox).
 - **The gate.** `send` is a gate kind, its argument the conversation:
   allowed to yours; where others read, asked every time with the whole
   post and the files' names, with no "Allow 24 h" (an `allow send NAME`
@@ -418,6 +422,83 @@ and after each run. Objects are copied for now; cloning, on the file
 systems that can share blocks (APFS, btrfs, XFS, ReFS and Dev Drives),
 comes with their helpers.
 
+## Inbox
+
+What waits for you is one list, kept in `state/inbox`: approvals (the
+gate's `ask`), the agent's questions and drafts (`ask_owner`), calls a
+scheduled task skipped, and posts that did not get through. Each is an
+item with a number, shown as its own message in the conversation it
+belongs to (a task's in its `to`, unless others read that; deliveries in
+`main`):
+
+```
+Allow this? [41]
+shell: git push origin main
+(Reply with text to deny it and say why.)
+```
+
+- **Several at once.** Items wait side by side and are answered in any
+  order: answering 44 leaves 41 waiting, helpers' questions too. At most
+  `[inbox] questions` (20) questions and approvals of runs are open; one
+  more waits for a place until its turn ends, then is refused.
+- **Answering.** Press a button, or reply to the item's message with
+  text: an approval's reason denies it (the agent gets your words), a
+  question's words answer it, a draft's replace it. `/answer ID TEXT` does
+  the same. A button answers only its own item, once, and only from a
+  message the item was shown in; a later press says how it closed
+  ("Already answered: allowed once, 14:03."), any other that it is out of
+  date. When an item closes, its messages lose their buttons and show the
+  outcome.
+- **Expiry.** A run's item closes as Deny at `approval_seconds` or when
+  its turn ends, others after 7 days. `/stop` withdraws the items of the
+  runs it stops, and leaving `harness chat` withdraws open questions;
+  after a crash, a run's open items are void.
+- **`/inbox`** lists what waits, oldest first (up to 20), with a Show
+  button each that posts the item again where you are. Once a day at
+  `[inbox] remind` (09:00, your time; `off` for never), if something has
+  waited over 12 hours, harness says how many items wait, without a sound.
+  Items a run waits on make a sound; skipped calls and deliveries don't.
+- **`ask_owner`.** The agent asks a question with up to 4 choices or to
+  be answered in words, or shows a draft to use, drop or replace, and
+  waits as for an approval. It gets "chose: Work", "wrote: …", "draft used
+  as it is", "draft replaced by the owner: …", "dropped" or "no answer in
+  time". It is offered only where you can answer: not to helpers, not in
+  scheduled runs. Gate kind `ask_owner`, allowed by default.
+- **Skipped calls.** Each call a scheduled task skipped for want of
+  approval is one item per task and call (a repeat counts up, also after
+  you dismiss it), posted once, without a sound. "Allow for this task"
+  adds a grant for that call and that task alone, for 30 days: its next
+  run makes the call; other tasks and the chat still can't. It is not
+  offered for money, a post others read, a command skipped because the
+  agent wrote files, or a task whose name has a space, `:`, `/` or `*`.
+- **Deliveries.** A post that does not get through (a reply, a `send`, a
+  brief, a task's answer) is kept and sent again after 5 minutes, then 10,
+  20 … 2 hours, also after a restart; meanwhile its brief or task does not
+  run again, and a brief is sent as written, not collected again. Its
+  files and quick replies are not kept. One that can't be sent for another
+  reason (no account paired yet) is posted with Send again and Drop.
+- **Terminal.** Items print the same way, with their keys: `o`, `d` and
+  `n` for an approval, `1` to `4` for other choices, with the item's
+  number when several take the key (`o 41`).
+
+`harness inbox` lists the open items; `harness inbox --json` prints every
+item kept (open, and closed in the last 7 days, at most 500), a JSON
+object a line, as apps will get them (format v1):
+
+```json
+{"v":1,"id":41,"kind":"approval","status":"open","created":"2026-11-22T14:02:11Z","expires":"2026-11-22T14:12:11Z","by":"owner","agent":"main","rid":18234,"run":"chat","conversation":"research","waiter":"run","app":null,"title":"shell: git push origin main","body":"shell: git push origin main","choices":[{"key":"once","label":"Allow once"},{"key":"day","label":"Allow 24 h"},{"key":"deny","label":"Deny"}],"text":"reason","draft":null,"count":1,"answer":null}
+```
+
+`status` is `open`, `answered`, `expired`, `void`, `withdrawn` or `done`
+(a kept post went out); `answer` is `{"key","text","at","via"}` with `via`
+`telegram`, `terminal` or `harness`. Texts are masked as in the log (a
+stored secret shows as `[secret:NAME]`, in the message too); a private
+conversation's item keeps its texts while open, then only their sizes and
+keyed hashes (`{"bytes":N,"hmac":"…"}`). `state/inbox` is rewritten whole
+before anyone acts on a change; its first line keeps the next number.
+Harness 0.3's `state/approvals` gives the first number and is then
+removed.
+
 ## Helpers
 
 `delegate` hands up to 8 tasks to helpers that run at the same time:
@@ -434,8 +515,9 @@ answer, not its working. Limits per helper: its definition's, else
 `[agents]`'s model calls, input tokens and answer size, and never past the
 delegating turn's end; at most `parallel` run at once in the whole
 instance. Helpers of one call share fetched pages, so none is downloaded
-twice, and they ask you one question at a time; one that can't be answered
-before the turn ends is refused without asking. `/stop` stops them too.
+twice; their questions wait at once, each its own item (see Inbox), and
+one that can't be answered before the turn ends is refused without
+asking. `/stop` stops them too.
 
 Every model call of a turn marks its unchanging start (tools, the stable
 part of the instructions) for omnigate's prompt cache, and each step of a
@@ -691,10 +773,15 @@ lines carry `agent` too, a `shell` call that names `dir` carries it on
 both, and tool lines carry the output's whole size, `bytes`.
 A post is a line of kind `send`: `to`, `event` (`sent`, `refused`,
 `held`, `kept`, `failed`), `bytes`, `text`, `files`, `buttons`, `final`,
-`implicit`, `delivered`, the first message's id and the number of
-messages. A definition saved or removed is a line of kind `agent`:
-`saved` (`name`, `by`, `agent`, `item`, `widens`, `sha256` of the new
-file) or `removed` (`name`, `by`). A private run's lines, and a post into a private conversation,
+`implicit`, `delivered`, the first message's id, the number of messages,
+and the item a post that did not get through is kept as. A definition
+saved or removed is a line of kind `agent`: `saved` (`name`, `by`,
+`agent`, `item`, `widens`, `sha256` of the new file) or `removed`
+(`name`, `by`). Inbox items are lines of kind `inbox`: `open` (`item`,
+`type`, `conversation`, `rid`, `title`), `shown`, `answered` (`item`,
+`key`, `via`, the size of its text), `expired`, `void`, `withdrawn`,
+`done`, `remind`; gate lines name the item ("allowed once by the owner
+(item 41)"). A private run's lines, and a post into a private conversation,
 keep sizes and keyed hashes of what was said, while their labels (`run`,
 `conversation`, `by`, `agent`, `to`, `event`, `tool`, `decision`, `why`)
 stay readable. Snapshots are `files` lines: `snapshot` (folder, id, why
@@ -751,9 +838,9 @@ or a grant. A brief missed while harness was down runs when it starts. A
 brief or task whose message does not get through is sent again as it was
 written after 5 minutes, then 10, 20 … up to 2 hours; nothing is fetched,
 written or run again for it, and it does not run again until it is
-delivered. The message is kept in memory only: after a restart the brief
-or task runs again. `/brief` sends one now; `/topic add` and `/topic rm`
-change the topics from chat.
+delivered or you drop it. It is kept in `state/inbox` (see Inbox), so a
+restart does not lose it. `/brief` sends one now; `/topic add` and
+`/topic rm` change the topics from chat.
 
 ## Scheduled tasks
 
@@ -771,7 +858,8 @@ do = Summarise what you did for me this week.
 Each run is the agent (or the definition `agent = NAME` names) with a
 fresh short conversation and the same gate (with `ask` as Deny). Its answer is posted to its `to` (`main` unless
 it names another conversation) unless it is `NOTHING`; calls skipped for
-want of approval are listed either way ("Skipped (needs approval): …"). A task whose omnigate budget is spent is
+want of approval are listed either way ("Skipped (needs approval): shell:
+df -h (item 45)"), each an item you can allow for that task (see Inbox). A task whose omnigate budget is spent is
 paused until `/task resume NAME`. `/tasks`,
 `/task add NAME | every 15m | instruction`, `/task rm NAME`.
 
@@ -783,15 +871,15 @@ paused until `/task resume NAME`. `/tasks`,
 `/folders`, `/access WHO`, `/snapshots [FOLDER]`, `/snapshot FOLDER
 [LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/dryrun on|off`,
 `/reload`, `/conversations`, `/conversation new|rename|rm|add`,
-`/session [N]`, `/agents`, `/agent [NAME]`, `/agent show|rm NAME`,
-`/ask NAME text`, `/help`. `/new`, `/private` and `/agent` act on the
-conversation they are sent in; `/stop`, `/dryrun` and `/memory auto` on
-everything.
+`/session [N]`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
+`/agents`, `/agent [NAME]`, `/agent show|rm NAME`, `/ask NAME text`,
+`/help`. `/new`, `/private` and `/agent` act on the conversation they are
+sent in; `/stop`, `/dryrun` and `/memory auto` on everything.
 
 CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `memory [list|pin|unpin|forget ID]`,
 `snapshot list|take|changes|restore`, `agent list|show|rm`,
-`log verify|tail|runs|session`,
+`log verify|tail|runs|session`, `inbox [--json]`,
 `health`, `version`. `--home DIR` may come anywhere on the line;
 arguments a command does not take are refused. `health` exits 0 only
 while `harness run` holds the folder and has ticked in the last 90 s.

@@ -17,6 +17,7 @@ pub const Config = struct {
     agents: Agents = .{},
     browser: Browser = .{},
     money: Money = .{},
+    inbox: Inbox = .{},
 
     pub const Model = struct {
         /// omnigate's address; empty until the owner sets it (no default,
@@ -81,6 +82,15 @@ pub const Config = struct {
         /// Money calls in scheduled runs, without asking, inside the caps.
         scheduled: bool = false,
     };
+    /// What waits for the owner (state/inbox).
+    pub const Inbox = struct {
+        /// Questions and approvals of runs open at once; one more waits
+        /// for a place until its turn ends.
+        questions: u32 = 20,
+        /// Minutes after midnight (owner's time) of the daily reminder of
+        /// items open over 12 hours; null: off.
+        remind: ?u16 = 9 * 60,
+    };
 };
 
 /// One `key = value` line, with the section it is in.
@@ -132,6 +142,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Error!Config {
         }
         if (!found) return error.BadConfig;
     }
+    if (cfg.inbox.questions == 0) return error.BadConfig;
     return cfg;
 }
 
@@ -142,6 +153,8 @@ fn setField(sec: anytype, l: Line) Error!void {
         if (std.mem.eql(u8, l.key, fname)) {
             if (comptime std.mem.eql(u8, fname, "utc_offset")) {
                 @field(sec.*, fname) = parseOffset(l.value) catch return error.BadConfig;
+            } else if (comptime std.mem.eql(u8, fname, "remind")) {
+                @field(sec.*, fname) = if (std.ascii.eqlIgnoreCase(l.value, "off")) null else parseClock(l.value) catch return error.BadConfig;
             } else switch (ftype) {
                 []const u8 => {
                     // only omnigate's address may be left empty (not set yet)
@@ -390,6 +403,10 @@ pub const defaults_ini =
     \\max_per_call = 0                    ; in the tool's amount units; 0 = no cap
     \\max_per_day = 0
     \\scheduled = off                     ; on: scheduled runs may move money, within the caps
+    \\
+    \\[inbox]                             ; what waits for you (/inbox)
+    \\questions = 20                      ; questions and approvals waiting at once
+    \\remind = 09:00                      ; once a day, if something waited over 12 hours; off: never
     \\
 ;
 
@@ -645,6 +662,22 @@ test "agents_browser_and_money_sections" {
     try t.expectEqual(500, c.money.max_per_day);
     try t.expect(c.money.scheduled);
     _ = try parse(arena.allocator(), defaults_ini);
+}
+
+test "inbox_settings_read_questions_and_remind" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try parse(a, "");
+    try t.expectEqual(20, d.inbox.questions);
+    try t.expectEqual(9 * 60, d.inbox.remind.?);
+    const c = try parse(a, "[inbox]\nquestions = 3\nremind = 18:30\n");
+    try t.expectEqual(3, c.inbox.questions);
+    try t.expectEqual(18 * 60 + 30, c.inbox.remind.?);
+    try t.expectEqual(null, (try parse(a, "[inbox]\nremind = off\n")).inbox.remind);
+    try t.expectError(error.BadConfig, parse(a, "[inbox]\nremind = 25:00\n"));
+    try t.expectError(error.BadConfig, parse(a, "[inbox]\nquestions = 0\n"));
+    try t.expectEqualDeep(d.inbox, (try parse(a, defaults_ini)).inbox);
 }
 
 test "inits_rules_comment_names_each_tool_that_asks_by_default" {

@@ -22,18 +22,53 @@ const snapshots_mod = @import("snapshots.zig");
 const agents = @import("agents.zig");
 const Io = std.Io;
 
-/// `unsent`: the question did not get to the owner (a part or its buttons
-/// could not be sent), so nobody could answer it.
-pub const Answer = enum { once, day, deny, timeout, unsent };
+/// What came of asking the owner. `once`, `day`, `deny`: an approval's
+/// answer; `answered`: a question's or a draft's (`Reply.key` says which);
+/// `timeout`: no answer in time; `unsent`: the question did not get to the
+/// owner (a part or its buttons could not be sent); `withdrawn`: no one is
+/// left to answer (the run stopped, the terminal was left); `full`: no
+/// place in the inbox before the turn's end.
+pub const Answer = enum { once, day, deny, answered, timeout, unsent, withdrawn, full };
 
-/// One question for the owner: may this call run?
+/// One question for the owner: may this call run (`approval`), the agent's
+/// question (`question`), or a draft to review (`draft`). It becomes an
+/// inbox item.
 pub const Question = struct {
+    kind: Kind = .approval,
+    /// The call as the owner sees it, or the agent's question.
     text: []const u8,
     /// Whether "Allow 24 h" may be offered (never for money).
-    allow_day: bool,
+    allow_day: bool = true,
     /// When the run that asks must end (seconds): an answer after that is
     /// of no use, so it is not waited for. 0: no end.
     deadline_s: i64 = 0,
+    /// A question's choices (up to 4); none: it is answered in words.
+    choices: []const []const u8 = &.{},
+    /// The owner may answer in words.
+    takes_text: bool = false,
+    /// A draft to use, drop or replace with the owner's own version.
+    draft: ?[]const u8 = null,
+    /// The run that asks: who started it and its definition, its id and
+    /// label, and whether it is private.
+    who: who_mod.Who = .{},
+    rid: u64 = 0,
+    label: []const u8 = "",
+    private: bool = false,
+
+    pub const Kind = enum { approval, question, draft };
+};
+
+/// The owner's answer to a `Question`.
+pub const Reply = struct {
+    answer: Answer,
+    /// The choice's key: `once`, `day`, `deny`, `1`…`4`, `text`, `use`, `drop`.
+    key: []const u8 = "",
+    /// The owner's words (a reason that denies an approval, a written
+    /// answer, their own version of a draft), or the chosen choice's label;
+    /// for `full`, why there was no place.
+    text: []const u8 = "",
+    /// The inbox item it was asked in; 0: none was made.
+    item: u64 = 0,
 };
 
 /// Tells the owner something beside the answer, at once.
@@ -87,6 +122,9 @@ pub const Delivery = struct {
     files: u32 = 0,
     /// Why it was not sent, in words.
     why: []const u8 = "",
+    /// The inbox item it is kept as (kept to be sent again, or failed and
+    /// kept for the owner); 0: none.
+    item: u64 = 0,
 
     pub const Status = enum {
         sent,
@@ -111,11 +149,12 @@ pub const Outbox = struct {
     post: *const fn (ctx: *anyopaque, a: std.mem.Allocator, p: *const Post) Delivery,
 };
 
-/// Asks the owner whether a call may run; blocks until they answer, the
-/// approval time runs out or the question's deadline passes.
+/// Asks the owner (an inbox item); blocks until they answer, the approval
+/// time runs out or the question's deadline passes. What the reply holds
+/// is in `a`.
 pub const Asker = struct {
     ctx: *anyopaque,
-    ask: *const fn (ctx: *anyopaque, q: Question) Answer,
+    ask: *const fn (ctx: *anyopaque, a: std.mem.Allocator, q: Question) Reply,
 };
 
 /// The owner's switches, shared by all runs and read when used, so that
@@ -291,8 +330,6 @@ pub const Run = struct {
     agents: config.Config.Agents = .{},
     /// Shared by all runs: how many helpers run at once.
     pool: ?*Pool = null,
-    /// Shared by all runs: the owner is asked one question at a time.
-    ask_lock: ?*Io.Mutex = null,
     /// Pages fetched in this run's helpers, shared between them.
     cache: ?*PageCache = null,
     /// A delegated run (a helper): a short task, a subset of tools, no
@@ -450,8 +487,11 @@ pub const Run = struct {
             .send => if (r.outbox == null) return false,
             // a setup call: only in runs the owner started from a conversation
             .agent_save => if (r.defs == null or r.outbox == null or !std.mem.eql(u8, r.who.by, "owner")) return false,
+            // only where the owner can answer: not helpers (their run asks,
+            // above), not runs nobody watches
+            .ask_owner => if (r.scheduled or r.asker == null) return false,
             // the platform's kinds: the gate decides them, their tools come later
-            .ask_owner, .mail, .trigger, .workflow, .app_read, .app_draft, .app_save, .env_save => return false,
+            .mail, .trigger, .workflow, .app_read, .app_draft, .app_save, .env_save => return false,
             // where there is a store and folders.ini has a section
             .snapshot => if (r.snaps == null or r.gate.folders == null) return false,
             else => {},
@@ -531,6 +571,13 @@ const agent_save_def: model.ToolDef = .{
     .description = "Propose a new agent definition, or a change to your own: the whole file agents/NAME.md, a header between --- lines (name, description; and if needed model, tools, skills, memory, steps, tokens, seconds, answer_bytes, parallel) and then the instructions. The owner sees all of it and approves it every time; it applies from the next run.",
     .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"a-z, 0-9 and -\"},\"text\":{\"type\":\"string\",\"description\":\"the whole file\"}},\"required\":[\"name\",\"text\"]}",
 };
+const ask_owner_def: model.ToolDef = .{
+    .name = "ask_owner",
+    .description = "Ask the owner a question, or show them a draft to review, and wait for the answer. With choices the owner picks one; with text: true they may also answer in words; without choices they answer in words. With a draft they use it, drop it, or reply with their own version.",
+    .schema_json =
+    \\{"type":"object","properties":{"question":{"type":"string"},"choices":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"up to 4 answers to pick from, 1 to 64 bytes each"},"text":{"type":"boolean","description":"the owner may also answer in words"},"draft":{"type":"string","description":"a draft for the owner to use, drop or replace (then no choices)"}},"required":["question"]}
+    ,
+};
 const skill_defs = [_]model.ToolDef{
     .{ .name = "skill", .description = "Load one of your skills (saved instructions for a kind of task) by name; with `file`, read one of the skill's other files.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"file\":{\"type\":\"string\"}},\"required\":[\"name\"]}" },
     .{ .name = "skill_save", .description = "Save a skill: instructions for a kind of task you may meet again (steps, sources, pitfalls). Replaces a skill of the same name. The owner approves it.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"lowercase letters, digits and hyphens\"},\"description\":{\"type\":\"string\",\"description\":\"one line: when to use it\"},\"body\":{\"type\":\"string\"}},\"required\":[\"name\",\"description\",\"body\"]}" },
@@ -546,6 +593,7 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
         try out.append(arena, if (tool == .shell and r.gate.folders != null) shell_dir_def else d);
     }
     if (r.allows(.send)) try out.append(arena, send_def);
+    if (r.allows(.ask_owner)) try out.append(arena, ask_owner_def);
     if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
     if (r.allows(.delegate)) try out.append(arena, try delegateDef(r, arena));
     for (skill_defs) |d| if (r.allows(gate.Tool.fromName(d.name).?)) try out.append(arena, d);
@@ -1324,6 +1372,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     if (!offered) return .{ .text = "this tool is not available here", .is_error = true };
     if (tool == .send) return sendTool(r, a, input_json);
     if (tool == .agent_save) return agentSave(r, a, input_json);
+    if (tool == .ask_owner) return askOwnerTool(r, a, input_json);
     if (tool == .web) {
         // the tool asks the gate itself: for each host and login it uses
         const w = r.web orelse return .{ .text = "this tool is not available here", .is_error = true };
@@ -1565,10 +1614,13 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
     if (final) r.posted_final = true;
     return switch (d.status) {
         .sent => .{ .text = try std.fmt.allocPrint(a, "posted to {s} ({d} message{s}{s})", .{ target.name, d.parts, if (d.parts == 1) "" else "s", if (d.files == 0) "" else try std.fmt.allocPrint(a, ", {d} file{s}", .{ d.files, if (d.files == 1) "" else "s" }) }) },
-        .kept => .{ .text = try std.fmt.allocPrint(a, "not delivered now ({s}); kept to be sent again", .{d.why}) },
+        .kept => .{ .text = try std.fmt.allocPrint(a, "not delivered now ({s}); kept as item {d} and sent again later", .{ d.why, d.item }) },
         .held => .{ .text = try std.fmt.allocPrint(a, "not sent: {s}; it is in the log", .{d.why}), .is_error = true },
         .silent => .{ .text = "nothing posted" },
-        .failed => .{ .text = try std.fmt.allocPrint(a, "not delivered: {s}", .{d.why}), .is_error = true },
+        .failed => if (d.item != 0)
+            .{ .text = try std.fmt.allocPrint(a, "not delivered ({s}); kept as item {d}", .{ d.why, d.item }), .is_error = true }
+        else
+            .{ .text = try std.fmt.allocPrint(a, "not delivered: {s}", .{d.why}), .is_error = true },
     };
 }
 
@@ -1638,6 +1690,62 @@ fn saveRefused(r: *Run, a: std.mem.Allocator, name: []const u8, why: []const u8)
     return out;
 }
 
+/// Choices a question offers at most, and the longest label.
+pub const max_choices = 4;
+pub const max_choice_bytes = 64;
+
+/// `ask_owner`: the agent's question, or a draft to review; an inbox item
+/// the run waits on like an approval. The gate decides it as `ask_owner`,
+/// its argument the question (allowed by default).
+fn askOwnerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
+    const v = jv.parse(a, input_json);
+    const question = jv.str(jv.get(v, "question")) orelse "";
+    if (std.mem.trim(u8, question, " \t\r\n").len == 0) return .{ .text = "refused: ask_owner needs its question", .is_error = true };
+    const draft = jv.str(jv.get(v, "draft"));
+    const list = jv.arr(jv.get(v, "choices")) orelse &.{};
+    if (list.len > max_choices) return .{ .text = "refused: a question has at most 4 choices", .is_error = true };
+    if (draft != null and list.len > 0) return .{ .text = "refused: a draft takes no choices; the owner uses it, drops it or writes their own", .is_error = true };
+    const choices = try a.alloc([]const u8, list.len);
+    for (list, choices) |cv, *ch| {
+        const label = jv.str(cv) orelse return .{ .text = "refused: choices are labels", .is_error = true };
+        if (label.len == 0 or label.len > max_choice_bytes) return .{ .text = "refused: a choice has 1 to 64 bytes", .is_error = true };
+        ch.* = label;
+    }
+    const size = question.len + if (draft) |d| d.len else 0;
+    if (size > max_question) return .{ .text = try std.fmt.allocPrint(a, "refused: too long to ask the owner ({d} bytes; a question and its draft are at most {d})", .{ size, max_question }), .is_error = true };
+    if (try decideAndAsk(r, a, .ask_owner, "ask_owner", question, "", r.now())) |why|
+        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+    const out: tools.Output = out: {
+        const asker = r.asker orelse break :out .{ .text = "no one to ask", .is_error = true };
+        if (r.deadline_s > 0 and r.deadline_s * 1000 - util.nowMs(r.io) < 100) break :out .{ .text = "no time left in the turn to ask the owner", .is_error = true };
+        const got = asker.ask(asker.ctx, a, .{
+            .kind = if (draft != null) .draft else .question,
+            .text = question,
+            .choices = choices,
+            .takes_text = (jv.boolean(jv.get(v, "text")) orelse false) or choices.len == 0,
+            .draft = draft,
+            .deadline_s = r.deadline_s,
+            .who = r.who,
+            .rid = r.rid,
+            .label = r.label,
+            .private = r.isPrivate(),
+        });
+        const eql = std.mem.eql;
+        break :out switch (got.answer) {
+            .answered => if (draft != null)
+                (if (eql(u8, got.key, "drop")) tools.Output{ .text = "dropped" } else if (got.text.len > 0) tools.Output{ .text = try std.fmt.allocPrint(a, "draft replaced by the owner: {s}", .{got.text}) } else tools.Output{ .text = "draft used as it is" })
+            else if (eql(u8, got.key, "text")) tools.Output{ .text = try std.fmt.allocPrint(a, "wrote: {s}", .{got.text}) } else tools.Output{ .text = try std.fmt.allocPrint(a, "chose: {s}", .{got.text}) },
+            .timeout => .{ .text = "no answer in time", .is_error = true },
+            .unsent => .{ .text = "the question could not be sent to the owner", .is_error = true },
+            .withdrawn => .{ .text = if (r.env.stop.load(.acquire)) "stopped by the owner" else "no one is left to answer", .is_error = true },
+            .full => .{ .text = if (got.text.len > 0) got.text else "no place in the inbox until the turn's end", .is_error = true },
+            .once, .day, .deny => .{ .text = "not an answer to this question", .is_error = true },
+        };
+    };
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = "ask_owner", .arg = question, .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
+    return out;
+}
+
 /// A `send` refused before the gate: logged, and the model told why.
 fn refusePost(r: *Run, a: std.mem.Allocator, to: []const u8, text: []const u8, why: []const u8) !tools.Output {
     try r.logRun(.send, r.isPrivate(), .{ .to = to, .event = "refused", .bytes = text.len, .text = text, .delivered = false, .why = why });
@@ -1686,6 +1794,7 @@ fn postThrough(r: *Run, a: std.mem.Allocator, p: *const Post, target: Target, as
         .message = d.message,
         .parts = d.parts,
         .why = if (d.why.len > 0) d.why else null,
+        .item = if (d.item != 0) d.item else null,
     });
     return .{ .delivery = d };
 }
@@ -1929,14 +2038,15 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
         if (r.scheduled or r.asker == null) {
             action = .deny;
             why = "the agent wrote files in the workspace since the owner last allowed a command, and no one can be asked";
-            if (r.skipped) |s| s.add(r.io, name, arg);
+            // a grant can't lift that check
+            skip(r, a, tool, name, arg, d.subject, ctx.env, false);
         } else action = .ask;
     }
     if (extra.ask_why) |w| if (action == .allow) {
         if (r.scheduled or r.asker == null) {
             action = .deny;
             why = try std.fmt.allocPrint(a, "{s}, and no one can be asked", .{w});
-            if (r.skipped) |s| s.add(r.io, name, arg);
+            skip(r, a, tool, name, arg, d.subject, ctx.env, false);
         } else {
             action = .ask;
             why = w;
@@ -1966,30 +2076,33 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             why = try std.fmt.allocPrint(a, "too long to ask the owner ({d} bytes; a question is at most {d}): make the call smaller", .{ what.len, max_question });
             break :ask;
         }
-        // helpers working at once still ask one question at a time; one
-        // that could only be answered after the turn's end is not asked
-        if (r.ask_lock) |l| if (!lockUntil(l, r.io, r.deadline_s, r.env.stop)) {
-            why = if (r.env.stop.load(.acquire)) "stopped by the owner" else "no time left in the turn to ask the owner";
-            break :ask;
-        };
+        // each question waits on its own item; one that could only be
+        // answered after the turn's end is not asked
         if (r.deadline_s > 0 and r.deadline_s * 1000 - util.nowMs(r.io) < 100) {
-            if (r.ask_lock) |l| l.unlock(r.io);
             why = "no time left in the turn to ask the owner";
             break :ask;
         }
-        var ans = if (r.env.stop.load(.acquire)) Answer.deny else asker.ask(asker.ctx, .{ .text = what, .allow_day = d.allow_day, .deadline_s = r.deadline_s });
+        const got: Reply = if (r.env.stop.load(.acquire)) .{ .answer = .withdrawn } else asker.ask(asker.ctx, a, .{
+            .text = what,
+            .allow_day = d.allow_day,
+            .deadline_s = r.deadline_s,
+            .who = r.who,
+            .rid = r.rid,
+            .label = r.label,
+            .private = r.isPrivate(),
+        });
+        var ans = got.answer;
         // money, setup calls and posts others read are never granted for a
         // day, whatever came back
         if (!d.allow_day and ans == .day) ans = .once;
-        if (r.ask_lock) |l| l.unlock(r.io);
         switch (ans) {
             .once => {
                 action = .allow;
-                why = "allowed once by the owner";
+                why = try ownerSaid(a, "allowed once by the owner", "", got.item);
             },
             .day => {
                 action = .allow;
-                why = "allowed for 24 hours by the owner";
+                why = try ownerSaid(a, "allowed for 24 hours by the owner", "", got.item);
                 r.lock.lockUncancelable(r.io);
                 defer r.lock.unlock(r.io);
                 // the form the gate matches (for files, the path inside the
@@ -1998,9 +2111,12 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
                 try r.gate.grants.addFor(tool, ctx.env, gate.grantKey(tool, d.subject), definition, now_s + 86400);
                 if (r.grants_path) |p| r.gate.grants.save(r.io, p, now_s) catch {};
             },
-            .deny => why = "denied by the owner",
-            .timeout => why = "no answer from the owner in time",
-            .unsent => why = "the question could not be sent to the owner",
+            .deny => why = try ownerSaid(a, "denied by the owner", got.text, got.item),
+            .timeout => why = try ownerSaid(a, "no answer from the owner in time", "", got.item),
+            .unsent => why = try ownerSaid(a, "the question could not be sent to the owner", "", got.item),
+            .withdrawn => why = try ownerSaid(a, if (r.env.stop.load(.acquire)) "stopped by the owner" else "withdrawn: no one is left to answer", "", got.item),
+            .full => why = if (got.text.len > 0) got.text else "no place in the inbox until the turn's end",
+            .answered => why = try ownerSaid(a, "not an answer to this question", "", got.item),
         }
         // the owner saw those files and allowed a command all the same
         if (action == .allow) if (wrote) |wr| r.written.?.clear(wr.upto);
@@ -2012,16 +2128,40 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
     return if (action == .allow) null else why;
 }
 
-/// Takes `l`, waiting no later than `deadline_s` (0: no limit) and not
-/// past a stop; false if it was not taken.
-fn lockUntil(l: *Io.Mutex, io: Io, deadline_s: i64, stop: *std.atomic.Value(bool)) bool {
-    while (!l.tryLock()) {
-        if (stop.load(.acquire)) return false;
-        if (deadline_s > 0 and util.nowSeconds(io) >= deadline_s) return false;
-        io.sleep(.fromMilliseconds(20), .awake) catch {};
-    }
-    return true;
+/// What the owner did, their words and the item, as the gate's line and
+/// the agent say it: "denied by the owner: use staging (item 41)".
+fn ownerSaid(a: std.mem.Allocator, what: []const u8, words: []const u8, item: u64) ![]const u8 {
+    const said = if (words.len > 0) try std.fmt.allocPrint(a, "{s}: {s}", .{ what, words }) else what;
+    if (item == 0) return said;
+    return std.fmt.allocPrint(a, "{s} (item {d})", .{ said, item });
 }
+
+/// A call an unattended run skipped for want of approval, as a `Keeper`
+/// gets it.
+pub const Skip = struct {
+    tool: gate.Tool,
+    /// Where a shell command would have run (`host`).
+    env: []const u8,
+    /// The tool's name and argument, as the run's post lists them.
+    name: []const u8,
+    arg: []const u8,
+    /// What a grant for it holds as its key (`gate.grantKey`).
+    key: []const u8,
+    /// A grant for the run's task could let it run: not money, a post
+    /// others read, files the agent wrote or a dot file a post carries.
+    grantable: bool,
+    who: who_mod.Who,
+    rid: u64,
+    label: []const u8,
+    conversation: []const u8,
+    private: bool,
+};
+
+/// Keeps a skipped call as an inbox item; returns its id (0: none).
+pub const Keeper = struct {
+    ctx: *anyopaque,
+    keep: *const fn (ctx: *anyopaque, a: std.mem.Allocator, s: Skip) u64,
+};
 
 /// What a run left out because nobody could approve it; shared by the
 /// run and its helpers.
@@ -2031,6 +2171,9 @@ pub const Skipped = struct {
     items: std.ArrayList([]u8) = .empty,
     /// Calls past the first `max`, only counted.
     more: usize = 0,
+    /// Each skipped call becomes an inbox item (a task's run); null: only
+    /// listed.
+    keeper: ?Keeper = null,
     const max = 8;
 
     pub fn init(gpa: std.mem.Allocator) Skipped {
@@ -2042,11 +2185,14 @@ pub const Skipped = struct {
         s.items.deinit(s.gpa);
     }
 
-    fn add(s: *Skipped, io: Io, name: []const u8, arg: []const u8) void {
+    /// Lists a call (once), with the item it is kept as.
+    fn add(s: *Skipped, io: Io, name: []const u8, arg: []const u8, item: u64) void {
         s.mutex.lockUncancelable(io);
         defer s.mutex.unlock(io);
         const short = util.cut(arg, 100);
-        const line = std.fmt.allocPrint(s.gpa, "{s}: {s}{s}", .{ name, short, if (short.len < arg.len) "…" else "" }) catch return;
+        var ib: [32]u8 = undefined;
+        const kept = if (item == 0) "" else std.fmt.bufPrint(&ib, " (item {d})", .{item}) catch "";
+        const line = std.fmt.allocPrint(s.gpa, "{s}: {s}{s}{s}", .{ name, short, if (short.len < arg.len) "…" else "", kept }) catch return;
         for (s.items.items) |x| if (std.mem.eql(u8, x, line)) {
             s.gpa.free(line);
             return;
@@ -2296,7 +2442,7 @@ pub const Written = struct {
 /// Notes a call refused only because nobody could approve it: the gate
 /// said ask with no one to ask, or turned ask into deny in a scheduled run.
 fn noteSkipped(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, now_s: i64, d: gate.Decision, ctx: gate.Ctx) void {
-    const s = r.skipped orelse return;
+    if (r.skipped == null) return;
     const unattended = switch (d.action) {
         .ask => r.asker == null,
         .deny => r.scheduled and blk: {
@@ -2310,7 +2456,28 @@ fn noteSkipped(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8,
         },
         .allow => false,
     };
-    if (unattended) s.add(r.io, name, arg);
+    // money and posts others read stay asked every time: no grant lifts them
+    if (unattended) skip(r, a, tool, name, arg, d.subject, ctx.env, tool != .money and !(tool == .send and ctx.shared) and !tool.setup(arg));
+}
+
+/// A call the run skipped: listed in its post, and kept as an inbox item
+/// when the run has a keeper (a task's).
+fn skip(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, subject: []const u8, env: []const u8, grantable: bool) void {
+    const s = r.skipped orelse return;
+    const item = if (s.keeper) |k| k.keep(k.ctx, a, .{
+        .tool = tool,
+        .env = env,
+        .name = name,
+        .arg = arg,
+        .key = gate.grantKey(tool, subject),
+        .grantable = grantable,
+        .who = r.who,
+        .rid = r.rid,
+        .label = r.label,
+        .conversation = r.conversation,
+        .private = r.isPrivate(),
+    }) else 0;
+    s.add(r.io, name, arg, item);
 }
 
 fn webAllow(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) ?[]const u8 {
@@ -2742,7 +2909,6 @@ const Fix = struct {
     asked: u32 = 0,
     answer: Answer = .once,
     pool: Pool = .{},
-    ask_lock: Io.Mutex = .init,
     ask_ms: u32 = 0,
     last_allow_day: bool = false,
     /// The last question asked (in the arena), and its deadline.
@@ -2771,7 +2937,6 @@ const Fix = struct {
         f.asked = 0;
         f.answer = .once;
         f.pool = .{};
-        f.ask_lock = .init;
         f.ask_ms = 0;
         f.last_allow_day = false;
         f.last_what = "";
@@ -2797,7 +2962,8 @@ const Fix = struct {
         };
     }
 
-    fn askFn(ctx: *anyopaque, q: Question) Answer {
+    fn askFn(ctx: *anyopaque, a: std.mem.Allocator, q: Question) Reply {
+        _ = a;
         const f: *Fix = @ptrCast(@alignCast(ctx));
         f.last_what = f.e.arena.allocator().dupe(u8, q.text) catch "";
         f.last_deadline = q.deadline_s;
@@ -2809,7 +2975,7 @@ const Fix = struct {
         if (f.ask_ms > 0) t.io.sleep(.fromMilliseconds(f.ask_ms), .awake) catch {};
         f.asked += 1;
         _ = f.in_flight.fetchSub(1, .acq_rel);
-        return f.answer;
+        return .{ .answer = f.answer };
     }
 
     fn deinit(f: *Fix) void {
@@ -3266,7 +3432,6 @@ test "empty_answer_is_not_kept" {
 fn withHelpers(f: *Fix) !void {
     f.run.model_cfg = .{ .url = try f.e.url(), .key = "og-test-key", .main = "claude-test", .worker = "claude-worker", .memory = "claude-mem", .max_tokens = 100 };
     f.run.pool = &f.pool;
-    f.run.ask_lock = &f.ask_lock;
 }
 
 test "delegate_runs_helpers_in_parallel_and_returns_their_answers" {
@@ -3320,12 +3485,13 @@ test "helper_stops_at_its_token_limit" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(4), "Token limit") != null);
 }
 
-test "helpers_ask_the_owner_one_at_a_time" {
+test "helpers_ask_the_owner_at_once" {
     var f: Fix = undefined;
     try f.init("");
     defer f.deinit();
     try withHelpers(&f);
-    f.ask_ms = 150;
+    // each question waits on its own: neither waits for the other
+    f.ask_ms = 600;
     try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"one\",\"tools\":[\"shell\"]},{\"task\":\"two\",\"tools\":[\"shell\"]}]}"));
     try f.e.script(2, model.toolReply("w1", "shell", "{\"command\":\"echo one\"}"));
     try f.e.script(3, model.toolReply("w2", "shell", "{\"command\":\"echo two\"}"));
@@ -3336,23 +3502,20 @@ test "helpers_ask_the_owner_one_at_a_time" {
     defer freeResult(&f.run, r);
     try t.expectEqualStrings("Both done.", r.text);
     try t.expectEqual(2, f.asked);
-    try t.expectEqual(1, f.max_in_flight.load(.acquire));
+    try t.expectEqual(2, f.max_in_flight.load(.acquire));
 }
 
-test "a_helpers_question_after_the_deadline_is_not_asked" {
+test "a_question_after_the_deadline_is_not_asked" {
     var f: Fix = undefined;
     try f.init("");
     defer f.deinit();
-    try withHelpers(&f);
     f.run.limits.turn_seconds = 2;
     // the first question is answered after the turn's end (a 2 s turn ends
-    // 2 to 3 s after it began: its end is a whole second); the second
-    // helper's question waits behind it and can't be answered in time
+    // 2 to 3 s after it began: its end is a whole second); the second call
+    // of the same reply comes after it and can't be answered in time
     f.ask_ms = 3500;
-    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"one\",\"tools\":[\"shell\"]},{\"task\":\"two\",\"tools\":[\"shell\"]}]}"));
-    try f.e.script(2, model.toolReply("w1", "shell", "{\"command\":\"echo one\"}"));
-    try f.e.script(3, model.toolReply("w2", "shell", "{\"command\":\"echo two\"}"));
-    for (4..8) |n| try f.e.script(@intCast(n), model.textReply("done"));
+    try f.e.script(1, "{\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"shell\",\"input\":{\"command\":\"echo one\"}},{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"shell\",\"input\":{\"command\":\"echo two\"}}],\"stop_reason\":\"tool_use\"}");
+    try f.e.script(2, model.textReply("done"));
     const r = try f.say("run two");
     freeResult(&f.run, r);
     try t.expectEqual(1, f.asked);
@@ -4282,7 +4445,7 @@ test "kinds_without_a_tool_yet_are_not_offered_or_run" {
     freeResult(&f.run, r);
     const a = f.e.arena.allocator();
     const req1 = try f.e.request(1);
-    for ([_][]const u8{ "send", "ask_owner", "mail", "trigger", "workflow", "app_read", "app_draft", "app_save", "env_save", "snapshot" }) |name|
+    for ([_][]const u8{ "send", "mail", "trigger", "workflow", "app_read", "app_draft", "app_save", "env_save", "snapshot" }) |name|
         try t.expect(std.mem.indexOf(u8, req1, try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{name})) == null);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "this tool is not available here") != null);
     try t.expectEqual(0, f.asked);
@@ -4654,8 +4817,9 @@ test "no_agents_folder_means_0_3" {
     defer f.deinit();
     try withHelpers(&f);
     const a = f.e.arena.allocator();
-    // main offers 0.3's tools
-    try t.expectEqualStrings("shell,read_file,write_file,fetch,search,recall,remember,delegate,", try toolNames(&f.run, a));
+    // main offers 0.3's tools, and the inbox's ask_owner where the owner
+    // can answer (gap 5)
+    try t.expectEqualStrings("shell,read_file,write_file,fetch,search,recall,remember,ask_owner,delegate,", try toolNames(&f.run, a));
     // a bare task gets the helper's six, a named one what it names
     try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"bare\"},{\"task\":\"with shell\",\"tools\":[\"shell\"]}]}"));
     try f.e.script(2, "{\"delay_ms\":200,\"content\":[{\"type\":\"text\",\"text\":\"one\"}],\"stop_reason\":\"end_turn\"}");
