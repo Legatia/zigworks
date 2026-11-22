@@ -304,6 +304,11 @@ pub const Client = struct {
             .body = undefined,
             .body_buf = undefined,
         };
+        errdefer {
+            if (resp.location) |l| c.gpa.free(l);
+            if (resp.etag) |x| c.gpa.free(x);
+            if (resp.last_modified) |x| c.gpa.free(x);
+        }
         if (head.content_type) |ct| {
             const n = @min(ct.len, resp.content_type_buf.len);
             @memcpy(resp.content_type_buf[0..n], ct[0..n]);
@@ -315,9 +320,12 @@ pub const Client = struct {
                 resp.retry_after_s = std.fmt.parseInt(u32, std.mem.trim(u8, h.value, " "), 10) catch null;
             } else if (std.ascii.eqlIgnoreCase(h.name, "location") and resp.location == null) {
                 resp.location = try c.gpa.dupe(u8, std.mem.trim(u8, h.value, " \t"));
+            } else if (std.ascii.eqlIgnoreCase(h.name, "etag") and resp.etag == null) {
+                resp.etag = try c.gpa.dupe(u8, std.mem.trim(u8, h.value, " \t"));
+            } else if (std.ascii.eqlIgnoreCase(h.name, "last-modified") and resp.last_modified == null) {
+                resp.last_modified = try c.gpa.dupe(u8, std.mem.trim(u8, h.value, " \t"));
             }
         }
-        errdefer if (resp.location) |l| c.gpa.free(l);
         conn.keep = head.keep_alive;
         const no_body = req.method == .GET and head.content_length == null and head.transfer_encoding == .none and head.keep_alive;
         const buf = try c.gpa.alloc(u8, body_buf_len);
@@ -355,6 +363,9 @@ pub const Response = struct {
     /// Where a redirect points (its Location header, as sent), when the
     /// answer has one.
     location: ?[]u8 = null,
+    /// Its ETag and Last-Modified, as sent, when it has them.
+    etag: ?[]u8 = null,
+    last_modified: ?[]u8 = null,
     ended: bool = false,
 
     pub fn contentType(r: *const Response) []const u8 {
@@ -394,6 +405,8 @@ pub const Response = struct {
         const c = r.client;
         c.gpa.free(r.body_buf);
         if (r.location) |l| c.gpa.free(l);
+        if (r.etag) |x| c.gpa.free(x);
+        if (r.last_modified) |x| c.gpa.free(x);
         const conn = c.conn orelse return;
         if (!(r.ended and conn.keep and conn.reader.state == .ready)) c.drop();
     }
