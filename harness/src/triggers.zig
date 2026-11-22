@@ -263,6 +263,7 @@ fn wholeLineComment(raw: []const u8) []const u8 {
 /// triggers. tasks.ini and briefs.ini take only their keys, as before; a
 /// name there that breaks the rule still reads (`name_ok` false). In
 /// triggers.ini the keys give the kind and a name must follow the rule.
+/// The triggers point into `text`: it must live as long as they do.
 pub fn parse(a: Allocator, text: []const u8, file: File, diag: *Diag) Error![]Trigger {
     var out: std.ArrayList(Trigger) = .empty;
     for (try groups(a, text, file, diag)) |g| {

@@ -254,6 +254,9 @@ const TrigInfo = struct {
     /// An MCP resource it reads, "SERVER\x00URI" ("" none): read again
     /// when the server says it changed.
     source: []u8 = &.{},
+    /// After a check that failed (the model did not answer), none is
+    /// asked before this (in memory: a restart asks at once).
+    check_after: i64 = 0,
 };
 
 fn freeInfo(gpa: std.mem.Allocator, info: *TrigInfo) void {
@@ -358,6 +361,9 @@ pub const Core = struct {
     trig_arena: std.heap.ArenaAllocator,
     /// Guards `trig_info` and the files in state/triggers.
     trig_mutex: Io.Mutex = .init,
+    /// One change of triggers.ini at a time (/trigger add|rm, the tool,
+    /// a paused item's Remove): read, written, applied.
+    trig_write_mutex: Io.Mutex = .init,
     /// Each event trigger's state as on disk, and what its queue holds.
     trig_info: std.ArrayList(*TrigInfo) = .empty,
     /// A poller is going (tick starts one; close waits for it).
@@ -556,6 +562,7 @@ pub const Core = struct {
         c.trig_tasks = &.{};
         c.trig_briefs = &.{};
         c.trig_mutex = .init;
+        c.trig_write_mutex = .init;
         c.trig_info = .empty;
         c.polling = .init(false);
         c.poller_on = false;
@@ -2875,6 +2882,8 @@ pub const Core = struct {
         run.context_note = c.contextNote(arena.allocator(), conv) catch "";
         if (note) |n| run.context_note = std.fmt.allocPrint(arena.allocator(), "{s}\n{s}", .{ run.context_note, n }) catch run.context_note;
         run.asker = .{ .ctx = &ask, .ask = askOwner };
+        // the trigger tool: only in runs the owner started from a conversation
+        run.desk = c.desk();
         var notify: Notify = .{ .core = c, .conv = conv };
         run.notice = .{ .ctx = &notify, .say = Notify.say };
         var here: [agents_name_max]u8 = undefined;
@@ -3709,7 +3718,7 @@ pub const Core = struct {
 
     /// A brief or task to run, a kept post to send again (its item), or a
     /// trigger's queued events to act on (its name).
-    const Job = union(enum) { brief: config.Brief, task: config.Task, resend: u64, trigger: []const u8 };
+    const Job = union(enum) { brief: config.Brief, task: config.Task, resend: u64, trigger: []const u8, poll: []const u8 };
 
     /// A job and what it holds, copied for the thread that runs it: the
     /// settings it came from may be replaced meanwhile (triggers.ini at once).
@@ -3726,6 +3735,7 @@ pub const Core = struct {
                 .task => |tk| .{ .task = tk.clone(a) catch |e| return box.fail(gpa, e) },
                 .resend => |id| .{ .resend = id },
                 .trigger => |n| .{ .trigger = a.dupe(u8, n) catch |e| return box.fail(gpa, e) },
+                .poll => |n| .{ .poll = a.dupe(u8, n) catch |e| return box.fail(gpa, e) },
             };
             return box;
         }
@@ -3783,18 +3793,23 @@ pub const Core = struct {
         const job = box.job;
         if (job == .resend) return c.resendItem(job.resend);
         if (job == .trigger) return c.triggerJob(job.trigger, false);
+        // /trigger run: a poll now, then what it queued
+        if (job == .poll) {
+            if (c.pollNow(job.poll)) |_| {} else |e| c.log.write(.trigger, false, .{ .name = job.poll, .event = "failed", .why = @errorName(e) }) catch {};
+            return c.triggerJob(job.poll, true);
+        }
         // the day it was due, though it may have ended after midnight
         const v: i64 = switch (job) {
             .brief => c.localDay(due_s),
             .task => due_s,
-            .resend, .trigger => unreachable,
+            .resend, .trigger, .poll => unreachable,
         };
         // a run that failed or was stopped still counts for its slot, so
         // the scheduler does not start it again right away
         const outcome: Outcome = switch (job) {
             .brief => |b| c.runBriefKeeping(b, .{ .key = key, .ran = v }) catch .done,
             .task => |tk| c.runTaskKeeping(tk, .{ .key = key, .ran = v }) catch .done,
-            .resend, .trigger => unreachable,
+            .resend, .trigger, .poll => unreachable,
         };
         // not run yet: due again at the next tick
         if (outcome == .later) return;
@@ -4181,8 +4196,10 @@ pub const Core = struct {
         var kept = false;
         defer if (!kept) fresh.deinit();
         const fa = fresh.allocator();
+        // the triggers point into their text: it lives in their arena
+        const owned = try fa.dupe(u8, text);
         var d: triggers.Diag = .{};
-        const list = triggers.parse(fa, text, .triggers, &d) catch |e| switch (e) {
+        const list = triggers.parse(fa, owned, .triggers, &d) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.BadTrigger => return try triggers.lineProblem(a, "triggers.ini", text, d),
         };
@@ -4218,6 +4235,443 @@ pub const Core = struct {
         const tr = c.findTrigger(name) orelse return null;
         return try tr.clone(a);
     }
+
+    // ---- triggers: commands, the tool's desk ----
+
+    /// The `trigger` tool's way in (see `agent.Desk`).
+    fn desk(c: *Core) agent.Desk {
+        return .{ .ctx = c, .check = deskCheck, .add = deskAdd, .remove = deskRemove, .list = deskList, .probe = deskProbe };
+    }
+
+    fn deskCheck(ctx: *anyopaque, a: std.mem.Allocator, text: []const u8) agent.Checked {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.checkSection(a, text) catch .{ .why = "out of memory" };
+    }
+
+    fn deskAdd(ctx: *anyopaque, a: std.mem.Allocator, section: []const u8, saved: agent.Saved) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.addTrigger(a, section, saved) catch |e| @errorName(e);
+    }
+
+    fn deskRemove(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, by: []const u8) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        const why = c.removeTrigger(a, name, by) catch |e| return @errorName(e);
+        if (why == null) c.closePausedItems(name, "remove");
+        return why;
+    }
+
+    fn deskList(ctx: *anyopaque, a: std.mem.Allocator) []const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.triggersText(a) catch "out of memory";
+    }
+
+    fn deskProbe(ctx: *anyopaque, a: std.mem.Allocator, r: *agent.Run, text: []const u8, by_name: bool) []const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        var reads: RunReads = .{ .run = r };
+        const decider: sources.Decider = .{ .ctx = &reads, .decide = RunReads.decide, .hop = RunReads.hop };
+        return c.probe(a, text, by_name, decider, r.env.stop) catch |e| @errorName(e);
+    }
+
+    /// The reads of a test the agent asked for: its run's own calls,
+    /// asked where the owner can answer, like any fetch.
+    const RunReads = struct {
+        run: *agent.Run,
+
+        fn decide(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) ?sources.Refused {
+            const rr: *RunReads = @ptrCast(@alignCast(ctx));
+            const why = agent.gateCall(rr.run, a, tool, arg) catch "the gate could not decide";
+            return if (why) |w| .{ .why = w } else null;
+        }
+
+        fn hop(ctx: *anyopaque, a: std.mem.Allocator, url: []const u8, known_host: bool) ?[]const u8 {
+            const rr: *RunReads = @ptrCast(@alignCast(ctx));
+            return agent.gateHop(rr.run, a, url, known_host);
+        }
+    };
+
+    /// Reads one section for `/trigger add` and the tool: harness's
+    /// reading, or why it can't be added: a line that does not read, a
+    /// name in use, an undefined definition, a money tool, a folder outside
+    /// the workspace.
+    fn checkSection(c: *Core, a: std.mem.Allocator, text: []const u8) !agent.Checked {
+        var d: triggers.Diag = .{};
+        const list = triggers.parse(a, text, .triggers, &d) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.BadTrigger => return .{ .why = try triggers.lineProblem(a, "the section's", text, d) },
+        };
+        if (list.len != 1) return .{ .why = "give one section: [NAME] and its lines" };
+        const tr = list[0];
+        if (c.nameTaken(tr.name)) |where| return .{ .why = try std.fmt.allocPrint(a, "the name {s} is taken ({s})", .{ tr.name, where }) };
+        if (tr.action == .do and !c.defs.has(tr.agent)) return .{ .why = try std.fmt.allocPrint(a, "agent {s} is not defined (no agents/{s}.md)", .{ tr.agent, tr.agent }) };
+        if (tr.mcp) |m| if (m.tool.len > 0 and c.isMoneyTool(m.server, m.tool))
+            return .{ .why = try std.fmt.allocPrint(a, "{s}/{s} moves money: it is never polled", .{ m.server, m.tool }) };
+        if (tr.kind == .file) {
+            const folder = folderOf(tr.sources[0]);
+            _ = gate.confined(a, c.io, c.workspace, if (folder.len == 0) "." else folder) catch
+                return .{ .why = try std.fmt.allocPrint(a, "the folder {s} is not inside the workspace", .{folder}) };
+        }
+        return .{ .name = tr.name, .reading = try triggers.reading(a, tr, c.checkModel()), .section = std.mem.trim(u8, text, " \t\r\n") };
+    }
+
+    /// Where a name is used already, across the three files; null: free.
+    fn nameTaken(c: *Core, name: []const u8) ?[]const u8 {
+        {
+            c.settings_mutex.lockUncancelable(c.io);
+            defer c.settings_mutex.unlock(c.io);
+            if (c.findTrigger(name) != null) return "a trigger in triggers.ini";
+        }
+        for (c.tasks) |tk| if (std.mem.eql(u8, tk.name, name)) return "a task in tasks.ini";
+        for (c.briefs) |b| if (std.mem.eql(u8, b.name, name)) return "a brief in briefs.ini";
+        return null;
+    }
+
+    /// Whether `server/tool` is a money tool of a server that runs.
+    fn isMoneyTool(c: *Core, server: []const u8, tool: []const u8) bool {
+        for (c.mcp_tools) |m| if (m.money and std.mem.eql(u8, m.server.name, server) and std.mem.eql(u8, m.tool, tool)) return true;
+        return false;
+    }
+
+    /// Appends `section` to triggers.ini (under `saved.mark` when the agent
+    /// proposed it) and applies it at once (R5); logged `saved` with the
+    /// sha256 of the section. Null when done; else why not, and the file is
+    /// as it was.
+    fn addTrigger(c: *Core, a: std.mem.Allocator, section: []const u8, saved: agent.Saved) !?[]const u8 {
+        const name = blk: {
+            var d: triggers.Diag = .{};
+            const list = triggers.parse(a, section, .triggers, &d) catch return "the section does not read";
+            if (list.len != 1) return "give one section";
+            break :blk list[0].name;
+        };
+        {
+            c.trig_write_mutex.lockUncancelable(c.io);
+            defer c.trig_write_mutex.unlock(c.io);
+            const old = Io.Dir.cwd().readFileAlloc(c.io, c.paths.triggers, a, .limited(1 << 20)) catch "";
+            var new: std.ArrayList(u8) = .empty;
+            try new.appendSlice(a, std.mem.trimEnd(u8, old, " \t\r\n"));
+            if (new.items.len > 0) try new.appendSlice(a, "\n\n");
+            if (saved.mark.len > 0) try new.print(a, "; {s}\n", .{saved.mark});
+            try new.print(a, "{s}\n", .{section});
+            try Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.triggers, .data = new.items, .flags = .{ .permissions = util.private_file } });
+            if (try c.applyTriggers(a, new.items)) |why| {
+                Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.triggers, .data = old, .flags = .{ .permissions = util.private_file } }) catch {};
+                return why;
+            }
+        }
+        // a resource it reads: its server says when it changes
+        c.subscribeResources();
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(section, &digest, .{});
+        try c.log.write(.trigger, false, .{
+            .name = name,
+            .event = "saved",
+            .by = saved.by,
+            .agent = if (saved.agent.len > 0) @as(?[]const u8, saved.agent) else null,
+            .item = if (saved.item != 0) @as(?u64, saved.item) else null,
+            .sha256 = &std.fmt.bytesToHex(digest, .lower),
+        });
+        return null;
+    }
+
+    /// "every 6 h", "at 07:00 on mon, fri".
+    fn whenText(a: std.mem.Allocator, every_s: ?u32, at: ?u16, days: u7) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        if (at) |m| try out.print(a, "at {d:0>2}:{d:0>2}", .{ m / 60, m % 60 }) else try out.print(a, "every {s}", .{try triggers.fmtDuration(a, every_s orelse 3600)});
+        if (days != 0x7f) {
+            try out.appendSlice(a, " on ");
+            var first = true;
+            for (config.day_names, 0..) |d, i| if (days & (@as(u7, 1) << @intCast(i)) != 0) {
+                try out.print(a, "{s}{s}", .{ if (first) "" else ", ", d });
+                first = false;
+            };
+        }
+        return out.items;
+    }
+
+    fn actionText(a: std.mem.Allocator, tr: triggers.Trigger) ![]const u8 {
+        return switch (tr.action) {
+            .do => std.fmt.allocPrint(a, "a run of {s}", .{tr.agent}),
+            .say => "says a line",
+            .start => |w| std.fmt.allocPrint(a, "starts workflow {s} (not built yet)", .{w}),
+            .none => "for waiting workflows",
+        };
+    }
+
+    /// `/triggers`: a line each, triggers.ini's first, then tasks.ini's
+    /// tasks and briefs.ini's briefs (an old name the rule can't hold
+    /// marked, R1).
+    fn triggersText(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        {
+            c.settings_mutex.lockUncancelable(c.io);
+            defer c.settings_mutex.unlock(c.io);
+            for (c.trig_list) |tr| {
+                try out.print(a, "{s} ({s}, triggers.ini): {s}, {s}", .{ tr.name, @tagName(tr.kind), try whenText(a, tr.every_s, tr.at, tr.days), try actionText(a, tr) });
+                if (tr.isEvent()) {
+                    c.trig_mutex.lockUncancelable(c.io);
+                    defer c.trig_mutex.unlock(c.io);
+                    if (c.infoOf(tr.name)) |info| {
+                        try out.print(a, "; {d} queued", .{info.pending});
+                        if (info.state.paused.len > 0) try out.print(a, "; paused: {s}", .{info.state.paused});
+                        if (info.state.failures > 0) try out.print(a, "; {d} failed poll{s}", .{ info.state.failures, if (info.state.failures == 1) "" else "s" });
+                    }
+                } else if (c.isPaused(tr.name)) try out.appendSlice(a, "; paused");
+                if (tr.added.len > 0) try out.print(a, "; {s}", .{tr.added});
+                try out.append(a, '\n');
+            }
+        }
+        const rename = "; rename it to name it in rules and grants";
+        for (c.tasks) |tk| {
+            try out.print(a, "{s} (schedule, tasks.ini): {s}, a run of {s}", .{ tk.name, try whenText(a, if (tk.every_minutes) |m| m * 60 else null, tk.at_minutes, tk.days), tk.agent });
+            if (c.isPaused(tk.name)) try out.appendSlice(a, "; paused");
+            if (!triggers.validName(tk.name)) try out.appendSlice(a, rename);
+            try out.append(a, '\n');
+        }
+        for (c.briefs) |b| {
+            try out.print(a, "{s} (brief, briefs.ini): at {d:0>2}:{d:0>2}{s}\n", .{ b.name, b.at_minutes / 60, b.at_minutes % 60, if (triggers.validName(b.name)) "" else rename });
+        }
+        if (out.items.len == 0) return "No triggers, tasks or briefs. Add a trigger with /trigger add and its section on the next lines (README: Triggers).";
+        return out.items;
+    }
+
+    /// `/trigger NAME`: its section as in triggers.ini, harness's reading,
+    /// and where it is.
+    fn triggerShow(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        const tr = (try c.triggerCopy(a, name)) orelse return std.fmt.allocPrint(a, "No trigger called {s}.", .{name});
+        const text = Io.Dir.cwd().readFileAlloc(c.io, c.paths.triggers, a, .limited(1 << 20)) catch "";
+        var out: std.ArrayList(u8) = .empty;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        var n: usize = 0;
+        while (it.next()) |l| {
+            n += 1;
+            if (n >= tr.first and n <= tr.last) try out.print(a, "{s}\n", .{l});
+        }
+        try out.print(a, "\nHarness reads it as: {s}", .{try triggers.reading(a, tr, c.checkModel())});
+        if (tr.isEvent()) {
+            c.trig_mutex.lockUncancelable(c.io);
+            defer c.trig_mutex.unlock(c.io);
+            if (c.infoOf(name)) |info| {
+                if (info.state.paused.len > 0) {
+                    try out.print(a, "\nPaused: {s}. /trigger resume {s} polls it again.", .{ info.state.paused, name });
+                } else if (info.state.polled) {
+                    var tb: [20]u8 = undefined;
+                    try out.print(a, "\nNext poll: {s}. {d} queued.", .{ localStamp(&tb, info.state.next, c.cfg.chat.utc_offset), info.pending });
+                } else try out.appendSlice(a, "\nNot polled yet: its first poll marks what is there.");
+            }
+        }
+        return out.items;
+    }
+
+    /// `/trigger add|rm|pause|resume|run|test NAME`, or `/trigger NAME`.
+    fn triggerCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        const usage = "Use /trigger NAME, /trigger add with the section on the next lines, or /trigger rm|pause|resume|run|test NAME.";
+        if (rest.len == 0) return usage;
+        const sp = std.mem.indexOfAny(u8, rest, " \t\r\n") orelse rest.len;
+        const word = rest[0..sp];
+        const arg = std.mem.trim(u8, rest[sp..], " \t\r\n");
+        const eql = std.mem.eql;
+        if (eql(u8, word, "add")) {
+            if (arg.len == 0) return usage;
+            const checked = try c.checkSection(a, arg);
+            if (checked.why) |why| return why;
+            if (try c.addTrigger(a, checked.section, .{ .mark = "", .by = "owner", .agent = "", .item = 0 })) |why| return why;
+            return std.fmt.allocPrint(a, "Added {s}: {s}", .{ checked.name, checked.reading });
+        }
+        if (!(eql(u8, word, "rm") or eql(u8, word, "pause") or eql(u8, word, "resume") or eql(u8, word, "run") or eql(u8, word, "test"))) {
+            if (arg.len > 0) return usage;
+            return c.triggerShow(a, word);
+        }
+        if (arg.len == 0) return usage;
+        const name = arg;
+        if (eql(u8, word, "rm")) {
+            if (try c.removeTrigger(a, name, "owner")) |why| return why;
+            c.closePausedItems(name, "remove");
+            return std.fmt.allocPrint(a, "Removed {s}.", .{name});
+        }
+        const tr = (try c.triggerCopy(a, name)) orelse return std.fmt.allocPrint(a, "No trigger called {s} in triggers.ini.", .{name});
+        if (eql(u8, word, "test")) return c.probe(a, name, true, null, null);
+        if (eql(u8, word, "pause")) {
+            if (!tr.isEvent()) {
+                c.state_mutex.lockUncancelable(c.io);
+                defer c.state_mutex.unlock(c.io);
+                putKey(c.gpa, &c.paused, name, {}) catch {};
+                c.saveRan();
+            } else {
+                c.trig_mutex.lockUncancelable(c.io);
+                defer c.trig_mutex.unlock(c.io);
+                const info = c.infoOf(name) orelse return std.fmt.allocPrint(a, "No trigger called {s}.", .{name});
+                if (info.state.paused.len > 0) return std.fmt.allocPrint(a, "{s} is paused already: {s}.", .{ name, info.state.paused });
+                var st = info.state;
+                st.paused = "paused by the owner";
+                try c.setState(info, st);
+            }
+            try c.log.write(.trigger, false, .{ .name = name, .event = "paused", .why = "paused by the owner" });
+            return std.fmt.allocPrint(a, "Paused {s}.", .{name});
+        }
+        if (eql(u8, word, "resume")) {
+            if (!tr.isEvent()) {
+                c.state_mutex.lockUncancelable(c.io);
+                defer c.state_mutex.unlock(c.io);
+                if (!c.paused.contains(name)) return std.fmt.allocPrint(a, "{s} is not paused.", .{name});
+                removeKey(c.gpa, &c.paused, name);
+                c.saveRan();
+            } else if (!c.resumeTrigger(name)) return std.fmt.allocPrint(a, "{s} is not paused.", .{name});
+            c.closePausedItems(name, "resume");
+            return std.fmt.allocPrint(a, "Resumed {s}.", .{name});
+        }
+        // run: now, in a background slot
+        const now_s = c.now();
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
+        const started = switch (tr.kind) {
+            .schedule => blk: {
+                const tk = for (c.trig_tasks) |x| {
+                    if (eql(u8, x.name, name)) break x;
+                } else return "It is gone.";
+                break :blk c.startBackground(.{ .task = tk }, keyFor("task-now", name).slice(), now_s);
+            },
+            .brief => blk: {
+                const b = for (c.trig_briefs) |x| {
+                    if (eql(u8, x.name, name)) break x;
+                } else return "It is gone.";
+                break :blk c.startBackground(.{ .brief = b }, keyFor("brief-now", name).slice(), now_s);
+            },
+            // the key of its action job: never two at once
+            else => c.startBackground(.{ .poll = name }, keyFor("trigger", name).slice(), now_s),
+        };
+        return switch (started) {
+            .started => std.fmt.allocPrint(a, "Running {s} now; what it finds comes to {s}.", .{ name, tr.to }),
+            .already_running => std.fmt.allocPrint(a, "{s} is running already.", .{name}),
+            .restarting => "Settings are being reloaded. Send it again in a moment.",
+            .slots_taken => "Busy: another run takes the background slots. Send it again when it is done.",
+            .failed => "Could not start it.",
+        };
+    }
+
+    /// A trigger's test: one poll now, its reads decided by `decider`
+    /// (null: listed, as its polls are), nothing kept; says what it found,
+    /// what passes the rules and what it would start. A trigger that was
+    /// never polled is read as if all were new (its first poll only marks).
+    fn probe(c: *Core, a: std.mem.Allocator, text: []const u8, by_name: bool, decider: ?sources.Decider, stop: ?*std.atomic.Value(bool)) ![]const u8 {
+        const tr = if (by_name)
+            (try c.triggerCopy(a, text)) orelse return std.fmt.allocPrint(a, "No trigger called {s}.", .{text})
+        else blk: {
+            var d: triggers.Diag = .{};
+            const list = triggers.parse(a, text, .triggers, &d) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                error.BadTrigger => return triggers.lineProblem(a, "the section's", text, d),
+            };
+            if (list.len != 1) return "give one section: [NAME] and its lines";
+            break :blk list[0];
+        };
+        if (!tr.isEvent()) return std.fmt.allocPrint(a, "{s} is a {s}: it runs at its time, no poll to test (/trigger run {s} runs it now).", .{ tr.name, @tagName(tr.kind), tr.name });
+        var prev: tstate.State = .{};
+        if (by_name) {
+            c.trig_mutex.lockUncancelable(c.io);
+            defer c.trig_mutex.unlock(c.io);
+            if (c.infoOf(tr.name)) |info| prev = try info.state.clone(a);
+        }
+        const first = !prev.polled;
+        const d = try c.trigDir(a, tr.name);
+        var seen: brief.Seen = .init(c.gpa);
+        defer seen.deinit();
+        if (!first) d.loadSeen(&seen);
+        const last = if (!first and tr.kind == .page and tr.json.len == 0) d.readLast(a) else "";
+        var probe_state = prev;
+        // as if new: but a folder's files count only once they hold still
+        if (first and tr.kind != .file) probe_state.polled = true;
+        var own_flag: std.atomic.Value(bool) = .init(false);
+        const flag = stop orelse &own_flag;
+        var client = try c.modelClient(c.cfg.model.model, c.cfg.model.max_tokens);
+        defer client.deinit();
+        var run = c.runAs(&client, try std.fmt.allocPrint(a, "test {s}", .{tr.name}), .{ .by = try std.fmt.allocPrint(a, "trigger:{s}", .{tr.name}), .agent = "" }, flag);
+        var reads: ListedReads = .{ .run = &run, .core = c, .label = try std.fmt.allocPrint(a, "trigger {s}", .{tr.name}), .to = tr.to };
+        var mcp_reads: McpReads = .{ .core = c, .stop = flag };
+        const out = try sources.poll(.{
+            .gpa = c.gpa,
+            .io = c.io,
+            .decider = decider orelse .{ .ctx = &reads, .decide = ListedReads.decide, .hop = ListedReads.hop, .unlisted = ListedReads.unlisted },
+            .workspace = c.workspace,
+            .search_url = c.cfg.search.url,
+            .search_key = c.secrets.search,
+            .stop = flag,
+            .deadline_s = util.nowSeconds(c.io) + 30,
+            .mcp = .{ .ctx = &mcp_reads, .call = McpReads.call, .read = McpReads.read },
+        }, a, tr, probe_state, &seen, last, c.now());
+        var o: std.ArrayList(u8) = .empty;
+        if (out.pause) |why| return std.fmt.allocPrint(a, "The poll would pause {s}: {s}.", .{ tr.name, why });
+        if (out.skipped) |why| return std.fmt.allocPrint(a, "The poll was skipped: {s}.", .{why});
+        if (out.failed) |why| try o.print(a, "The poll failed: {s}.\n", .{why});
+        if (first and tr.kind == .file) {
+            try o.print(a, "Its first poll would mark {d} file{s}", .{ out.next.files.len, if (out.next.files.len == 1) "" else "s" });
+            for (out.next.files[0..@min(out.next.files.len, 10)], 0..) |fl, i| try o.print(a, "{s}{s}", .{ if (i == 0) ": " else ", ", fl.path });
+            try o.appendSlice(a, ". After that a new, changed or removed file counts once it holds still for two polls.");
+            return o.items;
+        }
+        if (first) try o.appendSlice(a, "Its first poll would only mark what is there. As new: ");
+        var passing: std.ArrayList(tstate.Event) = .empty;
+        for (out.found) |found| {
+            var ev = found.event;
+            const fields = try a.alloc(triggers.Field, ev.fields.len);
+            for (ev.fields, fields) |fl, *m| m.* = .{ .name = fl.name, .value = try c.masks.scrubAlloc(a, fl.value) };
+            ev.fields = fields;
+            if (triggers.passes(tr, ev.fields)) try passing.append(a, ev);
+        }
+        try o.print(a, "{d} found, {d} pass{s} the filters", .{ out.found.len, passing.items.len, if (passing.items.len == 1) "es" else "" });
+        if (passing.items.len == 0) {
+            try o.append(a, '.');
+            return o.items;
+        }
+        try o.appendSlice(a, ":\n");
+        for (passing.items[0..@min(passing.items.len, 5)]) |ev| {
+            try o.appendSlice(a, "-");
+            for (ev.fields, 0..) |fl, i| try o.print(a, "{s} {s}: {s}", .{ if (i > 0) ";" else "", fl.name, util.cut(fl.value, 120) });
+            try o.append(a, '\n');
+        }
+        if (passing.items.len > 5) try o.print(a, "and {d} more\n", .{passing.items.len - 5});
+        if (tr.check.len > 0) try o.print(a, "Then {s} is asked: {s}\n", .{ c.checkModel(), tr.check });
+        switch (tr.action) {
+            .say => |template| {
+                try o.print(a, "It would say:\n[{s}] ", .{tr.name});
+                for (passing.items[0..@min(passing.items.len, tr.max_events)], 0..) |ev, i| try o.print(a, "{s}{s}", .{ if (i > 0) "\n" else "", try triggers.fill(a, template, ev.fields) });
+            },
+            .do => try o.print(a, "It would start a run of {s} with them.", .{tr.agent}),
+            .start => |w| try o.print(a, "It would start workflow {s} (workflows aren't built yet).", .{w}),
+            .none => try o.appendSlice(a, "Waiting workflows would get them (none yet)."),
+        }
+        return o.items;
+    }
+
+    /// The conversation trigger `name` posts to (main when there is none).
+    pub fn triggerTo(c: *Core, a: std.mem.Allocator, name: []const u8) []const u8 {
+        const tr = (c.triggerCopy(a, name) catch null) orelse return "main";
+        return tr.to;
+    }
+
+    /// `harness trigger run NAME`: polls it now and acts on what it
+    /// queued, here; a schedule or brief of triggers.ini runs now. A line
+    /// for the terminal.
+    pub fn runTriggerHere(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        const tr = (try c.triggerCopy(a, name)) orelse {
+            for (c.tasks) |tk| if (std.mem.eql(u8, tk.name, name)) return std.fmt.allocPrint(a, "{s} is a task of tasks.ini: harness task run {s}", .{ name, name });
+            return std.fmt.allocPrint(a, "No trigger called {s} in triggers.ini.", .{name});
+        };
+        switch (tr.kind) {
+            .schedule => for (c.trig_tasks) |tk| if (std.mem.eql(u8, tk.name, name)) {
+                _ = try c.runTask(try tk.clone(a));
+                return "";
+            },
+            .brief => for (c.trig_briefs) |b| if (std.mem.eql(u8, b.name, name)) {
+                _ = try c.runBrief(try b.clone(a));
+                return "";
+            },
+            else => {},
+        }
+        const polled = try c.pollNow(name);
+        c.triggerJob(name, true);
+        if (polled.paused) return std.fmt.allocPrint(a, "{s} is paused: /trigger resume {s} in the chat.", .{ name, name });
+        return std.fmt.allocPrint(a, "Polled {s}: {d} found, {d} queued{s}{s}.", .{ name, polled.new, polled.queued, if (polled.failed != null) "; it failed: " else "", polled.failed orelse "" });
+    }
+
 
     /// Starts the poller when a trigger is due and none is going.
     fn startPoller(c: *Core, now_s: i64) void {
@@ -4658,6 +5112,8 @@ pub const Core = struct {
     /// above it), at once, and deletes its state. Null when done; else why
     /// not (in `a`).
     fn removeTrigger(c: *Core, a: std.mem.Allocator, name: []const u8, by: []const u8) !?[]const u8 {
+        c.trig_write_mutex.lockUncancelable(c.io);
+        defer c.trig_write_mutex.unlock(c.io);
         const text = Io.Dir.cwd().readFileAlloc(c.io, c.paths.triggers, a, .limited(1 << 20)) catch "";
         var d: triggers.Diag = .{};
         const list = triggers.parse(a, text, .triggers, &d) catch return try triggers.lineProblem(a, "triggers.ini", text, d);
@@ -4665,6 +5121,7 @@ pub const Core = struct {
             if (std.mem.eql(u8, x.name, name)) break x;
         } else {
             for (c.tasks) |tk| if (std.mem.eql(u8, tk.name, name)) return try std.fmt.allocPrint(a, "{s} is a task of tasks.ini: /task rm {s}", .{ name, name });
+            for (c.briefs) |b| if (std.mem.eql(u8, b.name, name)) return try std.fmt.allocPrint(a, "{s} is a brief of briefs.ini: change briefs.ini, then /reload", .{name});
             return try std.fmt.allocPrint(a, "No trigger called {s} in triggers.ini.", .{name});
         };
         const new = try withoutLines(a, text, tr.first, tr.last);
@@ -4691,8 +5148,9 @@ pub const Core = struct {
             defer c.trig_mutex.unlock(c.io);
             const info = c.infoOf(tr.name) orelse return;
             if (info.pending == 0) return;
-            // all still to be checked, and no check left today: they wait
-            if (tr.check.len > 0 and info.unchecked == info.pending and !c.checksLeft(tr, info, now_s)) return;
+            // all still to be checked, and no check left today, or one
+            // failed a moment ago: they wait
+            if (tr.check.len > 0 and info.unchecked == info.pending and (!c.checksLeft(tr, info, now_s) or now_s < info.check_after)) return;
             if (tr.action == .do) {
                 // a spent budget stops its runs until Resume
                 if (std.mem.startsWith(u8, info.state.paused, "Model budget used up")) return;
@@ -4824,8 +5282,11 @@ pub const Core = struct {
             }
             const system = try std.fmt.allocPrint(a, "{s}\nQuestion: {s}\nAnswer with one line per item: its number, then yes or no.", .{ check_prompt, tr.check });
             const reply = client.send(a, system, &.{.{ .role = .user, .blocks = &.{.{ .text = items.items }} }}, &.{}) catch |e| {
-                // they wait for the next job
+                // they wait: ten minutes before the next try
                 try c.log.write(.trigger, false, .{ .name = tr.name, .event = "check", .events = n, .why = @errorName(e), .provider = client.provider });
+                c.trig_mutex.lockUncancelable(c.io);
+                defer c.trig_mutex.unlock(c.io);
+                if (c.infoOf(tr.name)) |info| info.check_after = c.now() + 600;
                 break;
             };
             const yes = try a.alloc(bool, n);
@@ -5140,6 +5601,10 @@ pub const Core = struct {
         \\/inbox: what waits for you, a Show button each
         \\/answer ID TEXT: answer an item in words (or reply to its message)
         \\/grants: what you allowed for later, /grant rm N
+        \\/triggers: the triggers, tasks and briefs
+        \\/trigger NAME: one in full, with harness's reading
+        \\/trigger add, then the section on the next lines
+        \\/trigger rm|pause|resume|run|test NAME
     ;
 
     /// A command sent in `main` (or from the command line).
@@ -5269,6 +5734,8 @@ pub const Core = struct {
             return if (out.items.len > 0) out.items else "No scheduled tasks. Add one with /task add NAME | every 15m | instruction";
         }
         if (eql(u8, cmd, "/task")) return c.taskCommand(a, rest);
+        if (eql(u8, cmd, "/triggers")) return c.triggersText(a);
+        if (eql(u8, cmd, "/trigger")) return c.triggerCommand(a, rest);
         if (eql(u8, cmd, "/logins")) return c.loginsText(a);
         if (eql(u8, cmd, "/conversations")) return c.conversationsText(a);
         if (eql(u8, cmd, "/session")) return c.sessionText(a, conv, rest);
@@ -10943,4 +11410,136 @@ test "an_mcp_resource_is_read_again_when_it_says_it_changed" {
     waitIdle(f.core);
     try f.rec.waitFor("[notes] Notes changed: v2");
     try t.expect(std.mem.indexOf(u8, try logText(&f), "\"tool\":\"mcp\",\"decision\":\"allow\",\"why\":\"listed in triggers.ini\",\"arg\":\"fake/resources/read {\\\"uri\\\":\\\"fake://notes.txt\\\"}\"") != null);
+}
+
+fn triggersFile(f: *Fix) ![]u8 {
+    return Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.triggers, f.e.arena.allocator(), .unlimited);
+}
+
+test "trigger_add_asks_every_time_with_its_reading" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.core.startWorker();
+    try f.e.script(1, model.toolReply("ta1", "trigger", "{\"action\":\"add\",\"text\":\"[news]\\nsearch = zig release\\nsay = {title}\\n\"}"));
+    try f.e.script(2, model.textReply("Added."));
+    try f.core.handleText("watch zig releases");
+    try f.rec.waitFor("BUTTONS Allow this? [1]\ntrigger: add news");
+    // asked every time: no Allow 24 h; harness's reading and the whole section
+    try t.expect(f.rec.buttonsWith("trigger: add news").?.get("day") == null);
+    try f.rec.waitFor("Harness reads it as: Searches for \"zig release\" every 6 h, no model call; a new item says: {title}.");
+    try f.rec.waitFor("[news]\nsearch = zig release\nsay = {title}");
+    try f.press("once");
+    try f.rec.waitFor("Added.");
+    const text = try triggersFile(&f);
+    try t.expect(std.mem.indexOf(u8, text, "; added by agent:main ") != null);
+    try t.expect(std.mem.indexOf(u8, text, " (item 1)\n[news]\nsearch = zig release\nsay = {title}\n") != null);
+    // applied at once and listed, marked
+    try t.expectEqual(1, f.core.trig_list.len);
+    const list = try f.core.command(a, "/triggers");
+    if (std.mem.indexOf(u8, list, "news (search, triggers.ini): every 6 h, says a line; 0 queued; added by agent:main ") == null) {
+        std.debug.print("got: {s}\n", .{list});
+        return error.TestUnexpectedResult;
+    }
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"kind\":\"trigger\",\"name\":\"news\",\"event\":\"saved\",\"by\":\"owner\",\"agent\":\"main\",\"item\":1,\"sha256\":\"") != null);
+    // the same name again: refused unasked
+    try f.e.script(3, model.toolReply("ta2", "trigger", "{\"action\":\"add\",\"text\":\"[news]\\nsearch = rust\\n\"}"));
+    try f.e.script(4, model.textReply("Taken."));
+    try f.core.handleText("again");
+    try f.rec.waitFor("Taken.");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "not added: the name news is taken (a trigger in triggers.ini)") != null);
+    // a bad line comes back unasked, named
+    try f.e.script(5, model.toolReply("ta3", "trigger", "{\"action\":\"add\",\"text\":\"[x]\\nfeed = https://z.org/f\\nevery = 1m\\n\"}"));
+    try f.e.script(6, model.textReply("Fixed."));
+    try f.core.handleText("one more");
+    try f.rec.waitFor("Fixed.");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(6), "not added: the section's line 3 has an error: every = 1m (every for a feed trigger is at least 5 min)") != null);
+    try t.expectEqual(1, f.rec.count("BUTTONS Allow this? ["));
+    // never offered where the owner did not start the run
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "\"name\":\"trigger\"") != null);
+}
+
+test "trigger_commands_list_show_add_pause_resume_rm" {
+    var f: Fix = undefined;
+    try f.init("", "[Morning News]\ntopic = Z | https://z.org/f\n", "[check]\nevery = 5m\ndo = Check.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // the owner's own section: no question
+    const added = try f.core.command(a, "/trigger add\n[zig]\nsearch = zig release\nsay = {title}\n");
+    if (!std.mem.startsWith(u8, added, "Added zig: Searches for \"zig release\"")) {
+        std.debug.print("got: {s}\n", .{added});
+        return error.TestUnexpectedResult;
+    }
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    const list = try f.core.command(a, "/triggers");
+    for ([_][]const u8{ "zig (search, triggers.ini): every 6 h, says a line; 0 queued", "check (schedule, tasks.ini): every 5 min, a run of main", "Morning News (brief, briefs.ini): at 07:00; rename it to name it in rules and grants" }) |needle|
+        if (std.mem.indexOf(u8, list, needle) == null) {
+            std.debug.print("no {s} in:\n{s}\n", .{ needle, list });
+            return error.TestUnexpectedResult;
+        };
+    const shown = try f.core.command(a, "/trigger zig");
+    try t.expect(std.mem.indexOf(u8, shown, "[zig]\nsearch = zig release\nsay = {title}") != null);
+    try t.expect(std.mem.indexOf(u8, shown, "Searches for \"zig release\" every 6 h") != null);
+    try t.expectEqualStrings("Paused zig.", try f.core.command(a, "/trigger pause zig"));
+    try t.expectEqualStrings("paused by the owner", stateOf(&f, "zig").paused);
+    try t.expectEqualStrings("Resumed zig.", try f.core.command(a, "/trigger resume zig"));
+    try t.expectEqualStrings("", stateOf(&f, "zig").paused);
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/trigger rm check"), "/task rm check") != null);
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/trigger add\n[x]\nfeed = ftp://x\n"), "line 2 has an error: feed = ftp://x") != null);
+    try t.expectEqualStrings("Removed zig.", try f.core.command(a, "/trigger rm zig"));
+    try t.expectEqual(0, f.core.trig_list.len);
+    try t.expectEqualStrings("No trigger called zig.", try f.core.command(a, "/trigger zig"));
+}
+
+test "trigger_test_shows_what_would_start_and_keeps_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try writePage(&f, "z.xml", try rssOf(&f, &.{ "old", "zig-b" }));
+    try setTriggers(&f, "[news]\nfeed = URL/page/z.xml\nmatch = title has zig\nsay = {title}\n");
+    // never polled: what is there, as if it were new
+    const first = try f.core.command(a, "/trigger test news");
+    for ([_][]const u8{ "Its first poll would only mark what is there.", "2 found, 1 passes the filters:", "title: zig-b", "It would say:\n[news] zig-b" }) |needle|
+        if (std.mem.indexOf(u8, first, needle) == null) {
+            std.debug.print("no {s} in:\n{s}\n", .{ needle, first });
+            return error.TestUnexpectedResult;
+        };
+    try t.expect(!stateOf(&f, "news").polled);
+    // polled: what is new since
+    _ = try f.core.pollNow("news");
+    try writePage(&f, "z.xml", try rssOf(&f, &.{ "old", "zig-b", "zig-c" }));
+    const later = try f.core.command(a, "/trigger test news");
+    try t.expect(std.mem.indexOf(u8, later, "1 found, 1 passes the filters:") != null);
+    try t.expect(std.mem.indexOf(u8, later, "zig-c") != null);
+    // kept nothing: the poll after still finds it
+    try t.expectEqual(1, (try f.core.pollNow("news")).queued);
+}
+
+test "a_failed_check_waits_before_it_asks_again" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try writePage(&f, "z.xml", try rssOf(&f, &.{"old"}));
+    try setTriggers(&f, "[news]\nfeed = URL/page/z.xml\ncheck = Worth it?\nsay = {title}\n");
+    _ = try f.core.pollNow("news");
+    try writePage(&f, "z.xml", try rssOf(&f, &.{ "old", "new" }));
+    _ = try f.core.pollNow("news");
+    try f.e.script(1, "{\"status\":500}");
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    f.core.tick();
+    waitIdle(f.core);
+    // not again at the next tick
+    f.core.tick();
+    waitIdle(f.core);
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expectEqual(1, stateOfPending(&f, "news"));
+    // ten minutes later it asks again
+    try f.e.script(2, model.textReply("1 yes"));
+    f.core.fixed_now = t0 + 601;
+    f.core.tick();
+    waitIdle(f.core);
+    try f.rec.waitFor("[news] new");
 }

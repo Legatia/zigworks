@@ -407,6 +407,9 @@ pub const Run = struct {
     /// runs it delegates, do not write files there (no loop of its own
     /// making). "": none.
     watch: ?[]const u8 = null,
+    /// Where the `trigger` tool reaches harness; null: no `trigger` tool
+    /// (only runs the owner started from a conversation get one).
+    desk: ?Desk = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -514,8 +517,11 @@ pub const Run = struct {
             // only where the owner can answer: not helpers (their run asks,
             // above), not runs nobody watches
             .ask_owner => if (r.scheduled or r.asker == null) return false,
+            // a setup call among its actions: only in runs the owner started
+            // from a conversation (helpers never: above)
+            .trigger => if (r.desk == null or r.outbox == null or !std.mem.eql(u8, r.who.by, "owner")) return false,
             // the platform's kinds: the gate decides them, their tools come later
-            .mail, .trigger, .workflow, .app_read, .app_draft, .app_save, .env_save => return false,
+            .mail, .workflow, .app_read, .app_draft, .app_save, .env_save => return false,
             // where there is a store and folders.ini has a section
             .snapshot => if (r.snaps == null or r.gate.folders == null) return false,
             else => {},
@@ -595,6 +601,34 @@ const agent_save_def: model.ToolDef = .{
     .description = "Propose a new agent definition, or a change to your own: the whole file agents/NAME.md, a header between --- lines (name, description; and if needed model, tools, skills, memory, steps, tokens, seconds, answer_bytes, parallel) and then the instructions. The owner sees all of it and approves it every time; it applies from the next run.",
     .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"a-z, 0-9 and -\"},\"text\":{\"type\":\"string\",\"description\":\"the whole file\"}},\"required\":[\"name\",\"text\"]}",
 };
+const trigger_def: model.ToolDef = .{
+    .name = "trigger",
+    .description = "Triggers act when something happens outside: a new feed or search item, a changed page or value, a file in a workspace folder, an MCP source; a match starts a run (do), says a line without the model (say, {field} filled in) or starts a workflow. add proposes a new trigger: the owner sees harness's reading of it and approves it every time, and it applies at once. test polls one now and says what it would start, keeping nothing. list lists them; rm removes one (asked). A section is [NAME] (a-z, 0-9, - and _), one source (feed = URL, search = WORDS, page = URL with json = PATH for a value, file = FOLDER/PATTERN, mcp = SERVER/TOOL {json} or SERVER resource URI), then every (30s, 5m, 1h), match = FIELD OP VALUE (OP has, is, starts, ends, like, >, <), skip, check = a yes/no question for the model, one of do, say and start = workflow NAME, and agent, tools, to.",
+    .schema_json = "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"add\",\"test\",\"list\",\"rm\"]},\"text\":{\"type\":\"string\",\"description\":\"add, test: the whole section, [NAME] and its lines\"},\"name\":{\"type\":\"string\",\"description\":\"test, rm: a trigger's name\"}},\"required\":[\"action\"]}",
+};
+
+/// What harness reads in a trigger section the agent proposes: its name,
+/// harness's own reading (never the model's) and the section as it will be
+/// written; or why it can't be added, with the line.
+pub const Checked = struct { name: []const u8 = "", reading: []const u8 = "", section: []const u8 = "", why: ?[]const u8 = null };
+
+/// Who saved a trigger: its mark in the file ("added by agent:main
+/// 2026-11-22 (item 41)") and the log's fields.
+pub const Saved = struct { mark: []const u8, by: []const u8, agent: []const u8, item: u64 };
+
+/// How the `trigger` tool reaches harness.
+pub const Desk = struct {
+    ctx: *anyopaque,
+    check: *const fn (ctx: *anyopaque, a: std.mem.Allocator, text: []const u8) Checked,
+    /// Appends the section under its mark and applies it; null, or why not.
+    add: *const fn (ctx: *anyopaque, a: std.mem.Allocator, section: []const u8, saved: Saved) ?[]const u8,
+    remove: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, by: []const u8) ?[]const u8,
+    list: *const fn (ctx: *anyopaque, a: std.mem.Allocator) []const u8,
+    /// Polls a trigger (by name, or a section's text) now, its reads
+    /// decided by `r`'s gate (asked like any fetch), and keeps nothing.
+    probe: *const fn (ctx: *anyopaque, a: std.mem.Allocator, r: *Run, text: []const u8, by_name: bool) []const u8,
+};
+
 const ask_owner_def: model.ToolDef = .{
     .name = "ask_owner",
     .description = "Ask the owner a question, or show them a draft to review, and wait for the answer. With choices the owner picks one; with text: true they may also answer in words; without choices they answer in words. With a draft they use it, drop it, or reply with their own version.",
@@ -623,6 +657,7 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
     for (skill_defs) |d| if (r.allows(gate.Tool.fromName(d.name).?)) try out.append(arena, d);
     if (r.allows(.snapshot)) try out.append(arena, snapshot_def);
     if (r.allows(.agent_save)) try out.append(arena, agent_save_def);
+    if (r.allows(.trigger)) try out.append(arena, trigger_def);
     for (r.mcp) |*m| if (r.allowsMcp(m)) try out.append(arena, m.def);
     return out.items;
 }
@@ -1397,6 +1432,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     if (!offered) return .{ .text = "this tool is not available here", .is_error = true };
     if (tool == .send) return sendTool(r, a, input_json);
     if (tool == .agent_save) return agentSave(r, a, input_json);
+    if (tool == .trigger) return triggerTool(r, a, input_json);
     if (tool == .ask_owner) return askOwnerTool(r, a, input_json);
     if (tool == .web) {
         // the tool asks the gate itself: for each host and login it uses
@@ -1726,6 +1762,80 @@ fn agentSave(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Outpu
     const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "saved agents/{s}.md; runs that start from now on use it", .{name}) };
     try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = false, .output = out.text, .bytes = out.text.len });
     return out;
+}
+
+/// `trigger`: add (checked first, then asked every time with harness's
+/// reading; written under its mark and applied at once), test (a poll now
+/// whose reads are asked like any fetch; nothing kept), list, rm (asked).
+fn triggerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
+    const desk = r.desk orelse return .{ .text = "this tool is not available here", .is_error = true };
+    const v = jv.parse(a, input_json);
+    const action = jv.str(jv.get(v, "action")) orelse "";
+    const text = jv.str(jv.get(v, "text")) orelse "";
+    const name = jv.str(jv.get(v, "name")) orelse "";
+    const eql = std.mem.eql;
+    const out: tools.Output = out: {
+        if (eql(u8, action, "add")) {
+            const checked = desk.check(desk.ctx, a, text);
+            if (checked.why) |why| break :out .{ .text = try std.fmt.allocPrint(a, "not added: {s}", .{why}), .is_error = true };
+            const detail = try std.fmt.allocPrint(a, "a new trigger, asked by {s}\nHarness reads it as: {s}\nThe section, {d} bytes:\n{s}", .{ r.def.name, checked.reading, checked.section.len, checked.section });
+            var item: u64 = 0;
+            if (try decideAndAskWith(r, a, .trigger, "trigger", try std.fmt.allocPrint(a, "add {s}", .{checked.name}), detail, r.now(), .{ .item = &item })) |why|
+                break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            var tb: [20]u8 = undefined;
+            const date = util.isoTime(&tb, r.now())[0..10];
+            const mark = if (item != 0)
+                try std.fmt.allocPrint(a, "added by agent:{s} {s} (item {d})", .{ r.who.agent, date, item })
+            else
+                try std.fmt.allocPrint(a, "added by agent:{s} {s}", .{ r.who.agent, date });
+            if (desk.add(desk.ctx, a, checked.section, .{ .mark = mark, .by = r.who.by, .agent = r.who.agent, .item = item })) |why|
+                break :out .{ .text = try std.fmt.allocPrint(a, "not added: {s}", .{why}), .is_error = true };
+            break :out .{ .text = try std.fmt.allocPrint(a, "added trigger {s}; it applies now. {s}", .{ checked.name, checked.reading }) };
+        }
+        if (eql(u8, action, "test")) {
+            const by_name = name.len > 0;
+            if (!by_name and text.len == 0) break :out .{ .text = "test needs the trigger's name or a section's text", .is_error = true };
+            if (try decideAndAsk(r, a, .trigger, "trigger", try std.fmt.allocPrint(a, "test {s}", .{if (by_name) name else sectionName(text)}), "", r.now())) |why|
+                break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            break :out .{ .text = desk.probe(desk.ctx, a, r, if (by_name) name else text, by_name) };
+        }
+        if (eql(u8, action, "list")) {
+            if (try decideAndAsk(r, a, .trigger, "trigger", "list", "", r.now())) |why|
+                break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            break :out .{ .text = desk.list(desk.ctx, a) };
+        }
+        if (eql(u8, action, "rm")) {
+            if (name.len == 0) break :out .{ .text = "rm needs the trigger's name", .is_error = true };
+            if (try decideAndAsk(r, a, .trigger, "trigger", try std.fmt.allocPrint(a, "rm {s}", .{name}), "", r.now())) |why|
+                break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            if (desk.remove(desk.ctx, a, name, r.who.by)) |why| break :out .{ .text = try std.fmt.allocPrint(a, "not removed: {s}", .{why}), .is_error = true };
+            break :out .{ .text = try std.fmt.allocPrint(a, "removed trigger {s}", .{name}) };
+        }
+        break :out .{ .text = "trigger takes action add, test, list or rm", .is_error = true };
+    };
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = "trigger", .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
+    return out;
+}
+
+/// The name in a section's first `[NAME]` line ("" for none).
+fn sectionName(text: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const l = std.mem.trim(u8, raw, " \t\r");
+        if (l.len >= 2 and l[0] == '[' and l[l.len - 1] == ']') return util.cut(std.mem.trim(u8, l[1 .. l.len - 1], " \t"), 64);
+    }
+    return "";
+}
+
+/// A read of a trigger's test from this run: decided as the run's own
+/// call (asked where the owner can answer); null when it may go.
+pub fn gateCall(r: *Run, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) !?[]const u8 {
+    return decideAndAsk(r, a, tool, @tagName(tool), arg, "", r.now());
+}
+
+/// A redirect of such a read, as this run's fetch follows one.
+pub fn gateHop(r: *Run, a: std.mem.Allocator, url: []const u8, known_host: bool) ?[]const u8 {
+    return redirectAllow(r, a, url, known_host);
 }
 
 /// An `agent_save` refused before the gate: logged, and the model told why.
