@@ -752,9 +752,11 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const started = r.now();
-    // a helper's run carries its parent's deadline: it never ends later,
-    // even when a second ticks over between the two (whole seconds)
-    const own_end = started + r.limits.turn_seconds;
+    // a turn gets at least turn_seconds: deadlines are whole seconds, so
+    // its end is rounded up (rounded down, a turn begun late in a second
+    // lost up to a second of it, and a 1 s turn could get nothing)
+    const own_end = @divFloor(util.nowMs(r.io) + @as(i64, r.limits.turn_seconds) * 1000 + 999, 1000);
+    // a helper's run carries its parent's deadline: it never ends later
     const deadline = if (r.helper and r.deadline_s > 0) @min(own_end, r.deadline_s) else own_end;
 
     {
@@ -2030,6 +2032,21 @@ test "a_tool_gets_only_what_is_left_of_the_turn" {
     try t.expect(std.mem.indexOf(u8, try f.logText(), "[time limit reached]") != null);
 }
 
+test "a_turn_begun_late_in_a_second_still_gets_its_time" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    f.run.limits.turn_seconds = 1;
+    // a model answer that takes 0.4 s fits a 1 s turn wherever it begins
+    try f.e.script(1, comptime "{\"delay_ms\":400," ++ model.textReply("in time")[1..]);
+    // begin in the last fifth of a second: rounded down, the turn's end
+    // would be at most 0.2 s away
+    while (@mod(util.nowMs(t.io), 1000) < 800) t.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    const r = try f.say("hello");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("in time", r.text);
+}
+
 test "a_fetch_and_a_web_action_get_only_what_is_left_of_the_turn" {
     var f: Fix = undefined;
     try f.init("allow fetch http://127.0.0.1:*\n");
@@ -2075,7 +2092,8 @@ test "the_owner_is_asked_with_the_turns_deadline" {
     const r = try f.say("hi");
     freeResult(&f.run, r);
     try t.expect(f.last_deadline >= before + f.run.limits.turn_seconds);
-    try t.expect(f.last_deadline <= util.nowSeconds(t.io) + f.run.limits.turn_seconds);
+    // rounded up to a whole second: at most one more
+    try t.expect(f.last_deadline <= util.nowSeconds(t.io) + f.run.limits.turn_seconds + 1);
 }
 
 test "steps_limit_ends_turn" {
@@ -3114,7 +3132,9 @@ test "helpers_get_the_rest_of_the_turn_not_a_new_one" {
     try withHelpers(&f);
     f.run.limits.turn_seconds = 3;
     try f.e.script(1, "{\"delay_ms\":2000,\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"delegate\",\"input\":{\"tasks\":[{\"task\":\"dig\",\"tools\":[\"recall\"]}]}}],\"stop_reason\":\"tool_use\"}");
-    try f.e.script(2, "{\"delay_ms\":1500,\"content\":[{\"type\":\"tool_use\",\"id\":\"w1\",\"name\":\"recall\",\"input\":{\"query\":\"x\"}}],\"stop_reason\":\"tool_use\"}");
+    // longer than the most the turn can have left after the first call (a
+    // 3 s turn ends 3 to 4 s after it began: its end is a whole second)
+    try f.e.script(2, "{\"delay_ms\":3000,\"content\":[{\"type\":\"tool_use\",\"id\":\"w1\",\"name\":\"recall\",\"input\":{\"query\":\"x\"}}],\"stop_reason\":\"tool_use\"}");
     try f.e.script(3, model.textReply("helper had more time than the turn"));
     try f.e.script(4, model.textReply("parent"));
     const r = f.say("dig") catch |e| {
