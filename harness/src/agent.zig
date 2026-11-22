@@ -307,7 +307,8 @@ pub const McpTool = struct {
     /// `amount =`), `.none` for a tool that moves no amount, `.unset` when
     /// mcp.ini does not say (refused while a cap is set).
     amount: mcp.Field = .unset,
-    /// The server's own caps (mcp.ini); null: config.ini's [money].
+    /// The server's own caps (mcp.ini); 0: none (no cap there); null:
+    /// config.ini's [money].
     max_per_call: ?u32 = null,
     max_per_day: ?u32 = null,
 };

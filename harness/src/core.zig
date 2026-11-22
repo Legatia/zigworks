@@ -1174,8 +1174,8 @@ pub const Core = struct {
         const cfgs = mcp.parseConfig(a, text) catch {
             const why = (parseProblem(a, "mcp.ini", text, mcp.parseConfig) catch null) orelse "mcp.ini has an error";
             c.mcp_note = std.fmt.allocPrint(a, "{s}; no servers started.", .{why}) catch "mcp.ini has an error; no servers started.";
-            // said at start too: the owner fixes the file
-            c.mcp_warn = c.mcp_note;
+            // said at start too (as "note: mcp.ini: line 5 has …"): the owner fixes the file
+            c.mcp_warn = if (std.mem.startsWith(u8, c.mcp_note, "mcp.ini ")) c.mcp_note["mcp.ini ".len..] else c.mcp_note;
             return;
         };
         var flag: std.atomic.Value(bool) = .init(false);
@@ -3394,7 +3394,8 @@ test "a_cap_of_0_in_mcp_ini_is_an_error_and_none_lifts_the_cap" {
     _ = try f.core.reload();
     try t.expectEqual(0, f.core.mcp_servers.items.len);
     // in the start notes and /status: the line, and what to write
-    try t.expect(std.mem.indexOf(u8, f.core.mcp_warn, "mcp.ini line 5 has an error: max_per_day = 0 (") != null);
+    try t.expect(std.mem.startsWith(u8, f.core.mcp_warn, "line 5 has an error: max_per_day = 0 ("));
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "mcp.ini line 5 has an error: max_per_day = 0 (") != null);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_warn, "write none") != null);
     try f.core.handleText("/status");
     try f.rec.waitFor("or remove the line");
