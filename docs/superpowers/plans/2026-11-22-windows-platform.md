@@ -149,3 +149,22 @@ Rulings:
   (ERR_BLOCKED_BY_CLIENT), so the frame was checked in headless Chrome;
   `app_frame_cannot_get_out` as a unit test needs cdp.zig to attach to
   frame targets, which it doesn't yet.
+
+## 4. Clone helpers (branch `win/clone`, on `win/app-server`)
+
+Built: `clone.zig`, plugged in as `snapshots.platform_clone`. Linux:
+FICLONE into a new file (btrfs; XFS with reflink). Windows: block cloning
+(FSCTL_DUPLICATE_EXTENTS_TO_FILE) a cluster-aligned range at a time, the
+new file sized first and given the source's integrity setting, only where
+the volume counts block references. Where the file system can't, the
+helper says false and leaves no file behind, and the store copies as
+before. macOS (clonefile on APFS) is the Mac session's: `platform` is null
+there.
+
+Tests: `a_clone_is_whole_where_the_file_system_can_and_nothing_where_it_cannot`
+(everywhere: ext4 and NTFS say false and leave nothing; an existing file
+is never overwritten) and `clones_share_blocks_on_copy_on_write_file_systems`
+(folders named in HARNESS_TEST_COW_DIRS): passed on XFS (reflink) and
+btrfs made on loop files in WSL. Not run: ReFS or a Dev Drive, which this
+machine doesn't have (making one needs an administrator and a new disk);
+set HARNESS_TEST_COW_DIRS to a folder on one to run it.

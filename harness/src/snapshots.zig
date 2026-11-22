@@ -31,9 +31,10 @@ const has_exec = Io.File.Permissions.has_executable_bit;
 /// never hashes.
 pub const CloneFn = *const fn (io: Io, src: []const u8, dst: []const u8) anyerror!bool;
 
-/// This platform's clone helper, where one is built (the per-file-system
-/// helpers plug in here); null: every object is copied.
-pub const platform_clone: ?CloneFn = null;
+/// This platform's clone helper, where one is built (clone.zig: FICLONE on
+/// Linux, block cloning on Windows; macOS's clonefile to come); null: every
+/// object is copied.
+pub const platform_clone: ?CloneFn = @import("clone.zig").platform;
 
 /// A `skip` pattern of the section for `folder` (inside the workspace):
 /// it matches an entry in that folder by its name or by its path from it.

@@ -410,9 +410,10 @@ reach: each content once in `objects/`, a file a snapshot in
 `folders/KEY/ID`. Snapshots past a folder's count go, and the oldest while
 all of them hold more than `[limits] snapshot_mb` (default 5120; each
 folder keeps its newest); content no snapshot names is deleted at start
-and after each run. Objects are copied for now; cloning, on the file
-systems that can share blocks (APFS, btrfs, XFS, ReFS and Dev Drives),
-comes with their helpers.
+and after each run. Where the file system can share blocks (btrfs, XFS
+made with reflink, ReFS and Dev Drives on Windows; APFS to come) an object
+is a clone that takes no space until the file changes; elsewhere it is a
+copy.
 
 ## Environments
 
