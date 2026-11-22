@@ -369,6 +369,12 @@ pub const rules_example =
     \\# write_file to a path with a part starting with "." (.git/config,
     \\# .npmrc: programs read those as settings) ask; money tools are asked
     \\# every time, whatever the rules; the others are allowed.
+    \\# Not used yet (their tools come later): mail, send to a conversation
+    \\# others read, trigger rm and workflow start and stop ask; agent_save,
+    \\# app_save, env_save, trigger add and workflow save are asked every time.
+    \\# A line [agent:NAME], [owner] or [schedule:NAME] starts rules for those
+    \\# calls only; [all] goes back to rules for every call. shell@NAME is for
+    \\# commands in environment NAME (host is the only one for now).
     \\# After the agent writes a file in the workspace, a shell command that
     \\# a rule or a 24 h grant allows is asked first, naming the files, until
     \\# you allow one; a scheduled run skips it.

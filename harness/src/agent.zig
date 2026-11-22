@@ -268,6 +268,8 @@ pub const Run = struct {
             .web => if (r.helper or r.env.browser.len == 0 or r.profiles_dir.len == 0 or @import("builtin").os.tag == .windows) return false,
             // only through `web`
             .login => return false,
+            // the platform's kinds: the gate decides them, their tools come later
+            .send, .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save, .snapshot => return false,
             else => {},
         }
         const list = r.allowed orelse return true;
@@ -1168,9 +1170,10 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
             why = "no time left in the turn to ask the owner";
             break :ask;
         }
-        var ans = if (r.env.stop.load(.acquire)) Answer.deny else asker.ask(asker.ctx, .{ .text = what, .allow_day = tool != .money, .deadline_s = r.deadline_s });
-        // money is never granted for a day, whatever came back
-        if (tool == .money and ans == .day) ans = .once;
+        var ans = if (r.env.stop.load(.acquire)) Answer.deny else asker.ask(asker.ctx, .{ .text = what, .allow_day = d.allow_day, .deadline_s = r.deadline_s });
+        // money, setup calls and posts others read are never granted for a
+        // day, whatever came back
+        if (!d.allow_day and ans == .day) ans = .once;
         if (r.ask_lock) |l| l.unlock(r.io);
         switch (ans) {
             .once => {
@@ -3144,6 +3147,35 @@ test "helpers_get_the_rest_of_the_turn_not_a_new_one" {
     defer freeResult(&f.run, r);
     if (f.e.server.modelRequests() > 2) std.debug.print("{d} model requests; answer: {s}\n", .{ f.e.server.modelRequests(), r.text });
     try t.expect(f.e.server.modelRequests() <= 2);
+}
+
+test "a_setup_call_offers_no_day_and_a_day_answer_grants_nothing" {
+    var f: Fix = undefined;
+    try f.init("allow agent_save *\n");
+    defer f.deinit();
+    f.answer = .day;
+    const refused = try decideAndAsk(&f.run, f.e.arena.allocator(), .agent_save, "agent_save", "researcher", "", util.nowSeconds(t.io));
+    try t.expectEqual(null, refused);
+    try t.expectEqual(1, f.asked);
+    try t.expect(!f.last_allow_day);
+    try t.expectEqual(0, f.grants.items.items.len);
+}
+
+test "kinds_without_a_tool_yet_are_not_offered_or_run" {
+    var f: Fix = undefined;
+    try f.init("allow send *\n");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"to\":\"main\",\"text\":\"hi\"}"));
+    try f.e.script(2, model.textReply("could not post"));
+    const r = try f.say("post it");
+    freeResult(&f.run, r);
+    const a = f.e.arena.allocator();
+    const req1 = try f.e.request(1);
+    for ([_][]const u8{ "send", "ask_owner", "mail", "trigger", "workflow", "agent_save", "app_read", "app_draft", "app_save", "env_save", "snapshot" }) |name|
+        try t.expect(std.mem.indexOf(u8, req1, try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{name})) == null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "this tool is not available here") != null);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"kind\":\"gate\"") == null);
 }
 
 test "web_is_offered_only_with_a_browser_and_never_to_helpers" {

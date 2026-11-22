@@ -1,7 +1,7 @@
 //! The one place every tool call is decided, in this order: hard limits no
 //! rule can lift; roles on folders (gap 3; none yet); a deny rule; listed
-//! sources and money; a grant with an expiry; the first allow or ask rule;
-//! the kind's default. Rules and grants are matched with the call's who:
+//! sources, money and setup calls; a grant with an expiry; the first allow
+//! or ask rule; the kind's default. Rules and grants are matched with the call's who:
 //! its definition, the definitions that delegated it and what started its
 //! run.
 const std = @import("std");
@@ -35,11 +35,52 @@ pub const Tool = enum {
     web,
     /// A login's values or passkeys used in the browser: "NAME HOST".
     login,
+    // The platform's kinds: decided here now, each tool built by its gap.
+    /// A post to a conversation (gap 4); the argument is its name. Asked
+    /// every time where others read it (`Ctx.shared`), else allowed.
+    send,
+    /// A question or draft for the owner (gap 5); the argument is the question.
+    ask_owner,
+    /// A mailbox read (gap 6); the argument is its name.
+    mail,
+    /// The trigger tool (gap 6): `add NAME` (a setup call), `rm NAME`,
+    /// `test NAME`, `list`.
+    trigger,
+    /// The workflow tool (gap 7): `save NAME` (a setup call), `start NAME`,
+    /// `stop NAME#N`, `check`, `list`, `show NAME`.
+    workflow,
+    /// A new or changed agent definition (gap 1); the argument is its name.
+    agent_save,
+    /// An app's read (gap 8): `NAME memory`, `NAME inbox` or `NAME log`.
+    app_read,
+    /// An app copied into the workspace to change (gap 8); the argument is its name.
+    app_draft,
+    /// An app installed (gap 8); the argument is its name.
+    app_save,
+    /// An environment saved (gap 2); the argument is its name.
+    env_save,
+    /// A snapshot of a workspace folder (gap 3); the argument is the folder.
+    snapshot,
 
+    /// The kind's default, as the rules file's comment names it: a send
+    /// asks where others read it, trigger and workflow for some actions
+    /// (see `defaultFor`).
     pub fn default(tool: Tool) rules.Action {
         return switch (tool) {
             .shell, .fetch, .browse, .skill_save, .mcp, .money, .web, .login => .ask,
+            .send, .mail, .trigger, .workflow, .agent_save, .app_save, .env_save => .ask,
             else => .allow,
+        };
+    }
+
+    /// A call that changes what runs without the owner watching: asked
+    /// every time, like money; no grant or allow rule lifts it.
+    pub fn setup(tool: Tool, arg: []const u8) bool {
+        return switch (tool) {
+            .agent_save, .app_save, .env_save => true,
+            .trigger => std.mem.eql(u8, firstWord(arg), "add"),
+            .workflow => std.mem.eql(u8, firstWord(arg), "save"),
+            else => false,
         };
     }
 
@@ -54,7 +95,31 @@ pub const Decision = struct {
     /// What the rules and grants were matched against: the argument, or
     /// for files the path inside the workspace (see `Confined.rel`).
     subject: []const u8 = "",
+    /// Whether a question may offer "Allow 24 h": never for money, a setup
+    /// call or a post others read, which are asked every time.
+    allow_day: bool = true,
 };
+
+/// A call's default: the kind's, except that a send to a conversation
+/// only the owner reads, a trigger's test and list, and a workflow's
+/// check, list and show are allowed.
+fn defaultFor(tool: Tool, arg: []const u8, ctx: Ctx) rules.Action {
+    return switch (tool) {
+        .send => if (ctx.shared) .ask else .allow,
+        .trigger => if (oneOf(firstWord(arg), &.{ "test", "list" })) .allow else .ask,
+        .workflow => if (oneOf(firstWord(arg), &.{ "check", "list", "show" })) .allow else .ask,
+        else => tool.default(),
+    };
+}
+
+fn firstWord(arg: []const u8) []const u8 {
+    return arg[0 .. std.mem.indexOfScalar(u8, arg, ' ') orelse arg.len];
+}
+
+fn oneOf(word: []const u8, words: []const []const u8) bool {
+    for (words) |w| if (std.mem.eql(u8, w, word)) return true;
+    return false;
+}
 
 /// Volumes on macOS and Windows ignore case by default, so file rules and
 /// grants do too there: `Private/k` is the file `private/k`.
@@ -73,6 +138,8 @@ pub const Ctx = struct {
     who: ?Who = null,
     /// Where a shell command runs; `host` is the only one until gap 2.
     env: []const u8 = "host",
+    /// A `send` to a conversation others read (gap 4): asked every time.
+    shared: bool = false,
 };
 
 /// What a grant covers: the exact argument, or for `fetch` and `browse`
@@ -306,6 +373,7 @@ pub const Gate = struct {
     pub fn decide(g: *const Gate, arena: std.mem.Allocator, tool: Tool, arg: []const u8, now_s: i64, ctx: Ctx) Decision {
         var d = g.decideRaw(arena, tool, arg, now_s, ctx);
         if (d.subject.len == 0) d.subject = arg;
+        d.allow_day = !(tool == .money or tool.setup(arg) or (tool == .send and ctx.shared));
         return d;
     }
 
@@ -353,10 +421,17 @@ pub const Gate = struct {
             if (ctx.money_unattended) return .{ .action = .allow, .why = "money in scheduled runs is switched on, within the caps", .subject = subject };
             return .{ .action = .deny, .why = "money is not moved in scheduled runs", .subject = subject };
         }
+        if (tool.setup(arg)) {
+            // like money: no grant or allow rule lifts this
+            if (ctx.scheduled) return .{ .action = .deny, .why = "no one to ask in a scheduled run", .subject = subject };
+            return .{ .action = .ask, .why = "asked every time: it changes what runs without you watching", .subject = subject };
+        }
         // a grant for this tool (a shell command in this environment) and
-        // key, for any run, the call's definition or what started its run
-        if (g.grants.covers(tool, ctx.env, grantKey(tool, subject), w, now_s)) return .{ .action = .allow, .why = "granted for 24 hours", .subject = subject };
-        var d: Decision = .{ .action = tool.default(), .why = "default for this tool", .subject = subject };
+        // key, for any run, the call's definition or what started its run;
+        // a post others read is asked every time (an allow rule lifts that)
+        const asked_every_time = tool == .send and ctx.shared;
+        if (!asked_every_time and g.grants.covers(tool, ctx.env, grantKey(tool, subject), w, now_s)) return .{ .action = .allow, .why = "granted for 24 hours", .subject = subject };
+        var d: Decision = .{ .action = defaultFor(tool, arg, ctx), .why = "default for this tool", .subject = subject };
         // programs read these as their settings (.git/config, .npmrc, .env):
         // a file written there can make the next command run something else
         if (tool == .write_file and dotPart(subject)) d = .{ .action = .ask, .why = "a name starting with \".\" asks: programs read those as settings", .subject = subject };
@@ -1067,6 +1142,64 @@ test "the_grants_file_keeps_who_and_environment_and_reads_0_3_lines_as_before" {
     try g3.load(t.io, path, 1000);
     try t.expect(!g3.covers(.fetch, "", "evil.com", main, 1000));
     try t.expectEqual(4, g3.items.items.len);
+}
+
+test "the_platforms_kinds_have_their_defaults" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    try t.expectEqual(.allow, f.act(.send, "main", .{}));
+    try t.expectEqual(.ask, f.act(.send, "family", .{ .shared = true }));
+    try t.expectEqual(.deny, f.act(.send, "family", .{ .shared = true, .scheduled = true }));
+    try t.expectEqual(.allow, f.act(.ask_owner, "Which account?", .{}));
+    try t.expectEqual(.ask, f.act(.mail, "home", .{}));
+    for ([_][]const u8{ "add btc", "rm btc" }) |arg| try t.expectEqual(.ask, f.act(.trigger, arg, .{}));
+    for ([_][]const u8{ "test btc", "list" }) |arg| try t.expectEqual(.allow, f.act(.trigger, arg, .{}));
+    for ([_][]const u8{ "save release", "start release", "stop release#3" }) |arg| try t.expectEqual(.ask, f.act(.workflow, arg, .{}));
+    for ([_][]const u8{ "check", "list", "show release" }) |arg| try t.expectEqual(.allow, f.act(.workflow, arg, .{}));
+    try t.expectEqual(.ask, f.act(.agent_save, "researcher", .{}));
+    try t.expectEqual(.ask, f.act(.app_save, "notes", .{}));
+    try t.expectEqual(.ask, f.act(.env_save, "box", .{}));
+    try t.expectEqual(.allow, f.act(.app_read, "notes log", .{}));
+    try t.expectEqual(.allow, f.act(.app_draft, "notes", .{}));
+    try t.expectEqual(.allow, f.act(.snapshot, "notes", .{}));
+}
+
+test "setup_calls_are_asked_every_time_like_money" {
+    var f: Fixture = undefined;
+    try f.init("allow agent_save *\nallow trigger *\nallow workflow save *\ndeny app_save evil\n");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.grants.add(.agent_save, "researcher", 5000);
+    try f.grants.addFor(.trigger, "", "add btc", "agent:main", 5000);
+    const d = f.gate.decide(a, .agent_save, "researcher", 1000, .{});
+    try t.expectEqual(.ask, d.action);
+    try t.expect(!d.allow_day);
+    const add = f.gate.decide(a, .trigger, "add btc", 1000, .{});
+    try t.expectEqual(.ask, add.action);
+    try t.expect(!add.allow_day);
+    try t.expectEqual(.allow, f.act(.trigger, "rm btc", .{}));
+    try t.expectEqual(.ask, f.act(.workflow, "save release", .{}));
+    try t.expectEqual(.deny, f.act(.app_save, "evil", .{}));
+    try t.expectEqual(.deny, f.act(.env_save, "box", .{ .scheduled = true }));
+    try t.expect(f.gate.decide(a, .shell, "ls", 1000, .{}).allow_day);
+    try t.expect(!f.gate.decide(a, .money, "broker/x {}", 1000, .{}).allow_day);
+}
+
+test "a_send_others_read_is_asked_every_time_and_an_allow_rule_lifts_it" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const d = f.gate.decide(a, .send, "family", 1000, .{ .shared = true });
+    try t.expectEqual(.ask, d.action);
+    try t.expect(!d.allow_day);
+    try f.grants.add(.send, "family", 5000);
+    try t.expectEqual(.ask, f.act(.send, "family", .{ .shared = true }));
+    f.gate.rules = try rules.parse(a, "allow send family\n");
+    try t.expectEqual(.allow, f.act(.send, "family", .{ .shared = true }));
+    f.gate.rules = try rules.parse(a, "deny send main\n");
+    try t.expectEqual(.deny, f.act(.send, "main", .{}));
 }
 
 test "deny_mcp_rule_covers_money_tools_of_that_server" {
