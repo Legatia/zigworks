@@ -1508,6 +1508,7 @@ test {
     _ = @import("core.zig");
     _ = @import("http.zig");
     _ = @import("jv.zig");
+    _ = @import("who.zig");
     _ = @import("sock.zig");
     _ = @import("store.zig");
     _ = @import("scrub.zig");

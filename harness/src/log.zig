@@ -138,16 +138,41 @@ pub const Log = struct {
     /// and optionals. When `private`, string fields other than `tool`,
     /// `decision` and `why` are stored as their size and SHA-256 only.
     pub fn write(l: *Log, kind: Kind, private: bool, fields: anytype) !void {
+        _ = try l.writeLine(kind, private, null, fields);
+    }
+
+    /// Appends one line of a run: `rid` and `run`, then `by`, `agent` and
+    /// `parent` when `tag` has them, then `fields` as `write` writes them.
+    /// Returns the line's seq (a run's id is its first line's).
+    pub fn writeRun(l: *Log, kind: Kind, private: bool, tag: Tag, fields: anytype) !u64 {
+        return l.writeLine(kind, private, tag, fields);
+    }
+
+    fn writeLine(l: *Log, kind: Kind, private: bool, tag: ?Tag, fields: anytype) !u64 {
         l.mutex.lockUncancelable(l.io);
         defer l.mutex.unlock(l.io);
         var line: std.ArrayList(u8) = .empty;
         defer line.deinit(l.gpa);
         const gpa = l.gpa;
         var tbuf: [20]u8 = undefined;
-        try line.print(gpa, "{{\"seq\":{d},\"time\":\"{s}\",\"kind\":\"{s}\"", .{ l.seq + 1, util.isoTime(&tbuf, util.nowSeconds(l.io)), @tagName(kind) });
+        const seq = l.seq + 1;
+        try line.print(gpa, "{{\"seq\":{d},\"time\":\"{s}\",\"kind\":\"{s}\"", .{ seq, util.isoTime(&tbuf, util.nowSeconds(l.io)), @tagName(kind) });
         const T = @TypeOf(fields);
         const info = @typeInfo(T).@"struct";
         const ctx: Ctx = .{ .private = private, .scrubber = if (l.scrubber) |*x| x else null, .key = if (l.key) |*k| k else null };
+        if (tag) |tg| {
+            try line.print(gpa, ",\"rid\":{d},\"run\":", .{if (tg.rid == 0) seq else tg.rid});
+            try value(&line, gpa, "run", tg.run, ctx);
+            if (tg.by) |b| {
+                try line.appendSlice(gpa, ",\"by\":");
+                try value(&line, gpa, "by", b, ctx);
+            }
+            if (tg.agent) |a| {
+                try line.appendSlice(gpa, ",\"agent\":");
+                try value(&line, gpa, "agent", a, ctx);
+            }
+            if (tg.parent) |p| try line.print(gpa, ",\"parent\":{d}", .{p});
+        }
         inline for (info.field_names) |name| {
             try line.print(gpa, ",\"{s}\":", .{name});
             try value(&line, gpa, name, @field(fields, name), ctx);
@@ -159,7 +184,22 @@ pub const Log = struct {
         l.offset += line.items.len;
         l.seq += 1;
         l.last = h;
+        return seq;
     }
+};
+
+/// What every line of a run carries (`Log.writeRun`).
+pub const Tag = struct {
+    /// The run's id: its first line's seq; 0 for that first line itself.
+    rid: u64 = 0,
+    /// The run's label: `chat`, `task NAME`, `brief NAME`, `chat/h2`.
+    run: []const u8,
+    /// What started the run (its first line).
+    by: ?[]const u8 = null,
+    /// The run's definition (its first line, and gate and tool lines).
+    agent: ?[]const u8 = null,
+    /// The id of the run that delegated this one (its first line).
+    parent: ?u64 = null,
 };
 
 /// How a line's fields are written.
@@ -316,6 +356,40 @@ test "lines_chain_and_verify" {
     try t.expect(std.mem.indexOf(u8, text, "\"seq\":1,") != null);
     try t.expect(std.mem.indexOf(u8, text, "\"arg\":\"ls -l\"") != null);
     try t.expect(std.mem.indexOf(u8, text, "\"note\":null") != null);
+}
+
+test "a_runs_lines_carry_its_id_and_its_first_line_says_who_started_it" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const path = try tmpPath(&tmp, arena.allocator());
+    var l = try Log.open(t.allocator, t.io, path);
+    const rid = try l.writeRun(.turn, false, .{ .run = "chat", .by = "owner", .agent = "main" }, .{ .text = "hi" });
+    try t.expectEqual(1, rid);
+    try t.expectEqual(2, try l.writeRun(.gate, false, .{ .rid = rid, .run = "chat", .agent = "main" }, .{ .tool = "shell", .decision = "allow" }));
+    const h = try l.writeRun(.turn, false, .{ .run = "chat/h1", .by = "owner", .agent = "helper", .parent = rid }, .{ .text = "part" });
+    try t.expectEqual(3, h);
+    _ = try l.writeRun(.model, false, .{ .rid = h, .run = "chat/h1" }, .{ .result = "ok" });
+    // a line of no run has none of it
+    try l.write(.config, false, .{ .event = "x" });
+    // private: the labels are kept as other strings are, the ids as they are
+    _ = try l.writeRun(.turn, true, .{ .run = "chat", .by = "owner", .agent = "main" }, .{ .text = "secret" });
+    l.close();
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, path, arena.allocator(), .unlimited);
+    for ([_][]const u8{
+        "\"kind\":\"turn\",\"rid\":1,\"run\":\"chat\",\"by\":\"owner\",\"agent\":\"main\",\"text\":\"hi\"",
+        "\"kind\":\"gate\",\"rid\":1,\"run\":\"chat\",\"agent\":\"main\",\"tool\":\"shell\"",
+        "\"kind\":\"turn\",\"rid\":3,\"run\":\"chat/h1\",\"by\":\"owner\",\"agent\":\"helper\",\"parent\":1,\"text\":\"part\"",
+        "\"kind\":\"model\",\"rid\":3,\"run\":\"chat/h1\",\"result\":\"ok\"",
+        "\"kind\":\"config\",\"event\":\"x\"",
+        "\"rid\":6,\"run\":{\"bytes\":4},\"by\":{\"bytes\":5}",
+    }) |want| {
+        if (std.mem.indexOf(u8, text, want) == null) std.debug.print("missing {s} in:\n{s}\n", .{ want, text });
+        try t.expect(std.mem.indexOf(u8, text, want) != null);
+    }
+    try t.expect(std.mem.indexOf(u8, text, "secret") == null);
+    try t.expectEqual(null, (try verify(t.io, path)).broken_at);
 }
 
 test "edited_line_is_found_by_verify" {

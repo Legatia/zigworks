@@ -20,6 +20,7 @@ const util = @import("util.zig");
 const logins = @import("logins.zig");
 const store_mod = @import("store.zig");
 const masks = @import("masks.zig");
+const who_mod = @import("who.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -1156,6 +1157,15 @@ pub const Core = struct {
         };
     }
 
+    /// A run started by `who`: a chat turn by the owner, a task or brief
+    /// by its schedule (`schedule:NAME`), both of the definition main.
+    /// Nobody can answer a run a schedule, trigger or workflow started.
+    fn runAs(c: *Core, client: *model.Client, label: []const u8, who: who_mod.Who, flag: *std.atomic.Value(bool)) agent.Run {
+        var run = c.baseRun(client, label, who.unattended(), flag);
+        run.who = who;
+        return run;
+    }
+
     /// Starts the MCP servers and looks for a browser. Call after setting
     /// `path_var` and `home_var`: the servers get them.
     pub fn startExtras(c: *Core) void {
@@ -1368,7 +1378,7 @@ pub const Core = struct {
         c.register(&flag);
         defer c.unregister(&flag);
         var ask: ChatAsk = .{ .core = c, .flag = &flag };
-        var run = c.baseRun(&c.chat_client, "chat", false, &flag);
+        var run = c.runAs(&c.chat_client, "chat", .{}, &flag);
         run.asker = .{ .ctx = &ask, .ask = askOwner };
         run.notice = .{ .ctx = c, .say = noticeSay };
         const res = agent.turn(&run, &c.conv, text, true) catch |e| {
@@ -1823,7 +1833,7 @@ pub const Core = struct {
         var flag: std.atomic.Value(bool) = .init(false);
         c.register(&flag);
         defer c.unregister(&flag);
-        var run = c.baseRun(&client, label, true, &flag);
+        var run = c.runAs(&client, label, .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{b.name}) }, &flag);
         // a copy, so the fetches hold no lock
         var snap = blk: {
             c.seen_mutex.lockUncancelable(c.io);
@@ -1862,7 +1872,7 @@ pub const Core = struct {
         var flag: std.atomic.Value(bool) = .init(false);
         c.register(&flag);
         defer c.unregister(&flag);
-        var run = c.baseRun(&client, label, true, &flag);
+        var run = c.runAs(&client, label, .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{tk.name}) }, &flag);
         run.extra_instructions = try std.fmt.allocPrint(a, "This is the scheduled task \"{s}\". If there is nothing worth telling the owner this time, answer exactly NOTHING.", .{tk.name});
         var skipped: agent.Skipped = .init(c.gpa);
         defer skipped.deinit();
@@ -2657,6 +2667,16 @@ const Fix = struct {
     }
 };
 
+test "a_bad_rules_line_names_its_section_or_environment" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const section = (try parseProblem(a, "rules", "allow shell ls\n[agnet:coder]\nallow shell make\n", rules.parse)).?;
+    try t.expect(std.mem.startsWith(u8, section, "rules line 2 has an error: [agnet:coder] (a section is [all] or a who"));
+    const env = (try parseProblem(a, "rules", "allow fetch@box https://a.com/*\n", rules.parse)).?;
+    try t.expect(std.mem.startsWith(u8, env, "rules line 1 has an error: allow fetch@box https://a.com/* (only shell takes an environment"));
+}
+
 test "a_folder_is_held_by_one_core_at_a_time" {
     var f: Fix = undefined;
     try f.init("", "", "");
@@ -3388,6 +3408,46 @@ test "after_the_agent_writes_a_file_a_command_a_rule_allows_is_asked_once" {
     try f.core.handleText("again");
     try f.rec.waitFor("and again");
     try t.expectEqual(1, f.rec.count("BUTTONS"));
+}
+
+test "chat_turns_are_started_by_the_owner_and_tasks_by_their_schedule" {
+    var f: Fix = undefined;
+    try f.init("", "", "[disk]\nevery = 5m\ndo = Check the disk.\n");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"df -h\"}"));
+    try f.e.script(2, model.textReply("NOTHING"));
+    f.core.tick();
+    try f.rec.waitFor("[disk] Skipped (needs approval): shell: df -h");
+    waitIdle(f.core);
+    try f.e.script(3, model.textReply("hello back"));
+    try f.core.startWorker();
+    try f.core.handleText("hello");
+    try f.rec.waitFor("hello back");
+    const lt = try logText(&f);
+    for ([_][]const u8{
+        "\"run\":\"task disk\",\"by\":\"schedule:disk\",\"agent\":\"main\",\"text\":\"Check the disk.\"",
+        // nobody can answer a run a schedule started
+        "\"run\":\"task disk\",\"agent\":\"main\",\"tool\":\"shell\",\"decision\":\"deny\",\"why\":\"no one to ask in a scheduled run\"",
+        "\"run\":\"chat\",\"by\":\"owner\",\"agent\":\"main\",\"text\":\"hello\"",
+    }) |want| {
+        if (std.mem.indexOf(u8, lt, want) == null) std.debug.print("missing {s} in:\n{s}\n", .{ want, lt });
+        try t.expect(std.mem.indexOf(u8, lt, want) != null);
+    }
+}
+
+test "a_briefs_reads_are_started_by_its_schedule_and_its_section_applies" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "[schedule:morning]\ndeny fetch *z.xml\n" });
+    try dueBrief(&f, "<item><title>New thing</title><link>https://z.org/1</link></item>");
+    f.core.tick();
+    waitIdle(f.core);
+    try t.expectEqual(0, f.e.server.modelRequests());
+    const want = "\"run\":\"brief morning\",\"by\":\"schedule:morning\",\"agent\":\"main\",\"tool\":\"fetch\",\"decision\":\"deny\",\"why\":\"rule on line 2\"";
+    const lt = try logText(&f);
+    if (std.mem.indexOf(u8, lt, want) == null) std.debug.print("missing {s} in:\n{s}\n", .{ want, lt });
+    try t.expect(std.mem.indexOf(u8, lt, want) != null);
 }
 
 test "a_scheduled_run_skips_a_command_a_rule_allows_once_a_file_was_written" {

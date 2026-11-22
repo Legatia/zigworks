@@ -94,9 +94,13 @@ Every tool call is decided in one place, in this order:
 1. Hard limits no rule lifts: files only inside `workspace/` and no write
    to a symlink; fetch, browse and web only http and https, and no
    address with a name before `@`.
-2. A matching `deny` line in `rules`.
-3. A grant you gave with "Allow 24 h".
-4. The first matching `allow` or `ask` line.
+2. A matching `deny` line in `rules`: in the shared part, or in a
+   section for the call (see Sections).
+3. A grant you gave with "Allow 24 h" for this call.
+4. The first matching `allow` or `ask` line: in a section for the call's
+   definition, then in one for what started its run, then in the shared
+   part. An `ask` in a section for a definition that delegated the call,
+   or for what started its run, makes an `allow` from elsewhere ask.
 5. The tool's default: `shell`, `fetch`, `browse`, `web`, `login`,
    `skill_save` and MCP tools ask; so does `write_file` for a path with a
    part starting with "." (`.git/config`, `.npmrc`); files, search,
@@ -108,6 +112,47 @@ deny  shell rm -rf *
 allow fetch https://news.ycombinator.com/*
 allow shell git status
 ```
+
+### Sections
+
+A line `[WHO]` in `rules` starts lines that apply only to the calls it
+names; the lines before the first section, or after `[all]`, apply to
+every call.
+
+| Section | Its lines apply to |
+|---|---|
+| `[owner]` | runs you started: your messages, buttons and commands |
+| `[schedule:NAME]` | runs of the task or brief NAME, on schedule or by hand |
+| `[agent:main]` | the agent's own calls in the chat, tasks and briefs |
+| `[agent:helper]` | helpers' calls |
+
+A kind alone covers all its names (`[schedule]`), and `*` works as in
+rules (`[schedule:btc-*]`). A section for the call's own definition may
+allow more for it, and so may one for what started its run, as a grant
+would. A section for a definition that delegated the call (`main`, for
+its helpers) only denies or asks: delegating never widens what a helper
+may do.
+
+```
+deny  shell rm -rf *
+
+[schedule:btc-watch]
+allow fetch https://api.coinbase.com/*
+
+[agent:helper]
+deny  shell *
+```
+
+Sections for `trigger:NAME`, `workflow:NAME/STEP`, `app:NAME` and other
+`agent:NAME` are read the same way; they apply once those parts exist. A
+task or brief whose name has a space, `:`, `/` or `*` can't be named
+exactly in a section; `[schedule]`, or a pattern with `*`, reaches it. A
+section harness can't read (`[agnet:main]`) is refused, naming its line.
+
+`shell@NAME` is a rule for commands in environment NAME; a `shell` rule
+covers every environment. `host`, the workspace on this machine, is the
+only environment for now, so `allow shell@host make*` is
+`allow shell make*`. Other tools take no `@`.
 
 After the agent writes a file in the workspace, a shell command that a
 rule or a grant allows is asked first, naming the files written since you
@@ -150,6 +195,14 @@ says it is out of date. No answer in `approval_seconds` (default 10
 minutes), or before the turn's time (`turn_seconds`) is up, counts as
 Deny. In a scheduled run nobody can answer, so `ask` is Deny there, and
 the run says what it skipped.
+
+"Allow 24 h" covers that call for the definition that asked: given in
+the chat, it covers the agent's chat turns, tasks and briefs
+(`agent:main`), not helpers; given to a helper, it covers helpers
+(`agent:helper`). A grant kept without a who, as harness 0.3 kept them,
+covers every run. `state/grants` holds one a line: the tool
+(`shell@host` for a command), the expiry, the exact command, host, MCP
+tool or path, and who it covers.
 
 `/stop` stops everything at once: the running turn, any shell command and
 everything it started, and background runs. `/new` starts a fresh
@@ -347,7 +400,14 @@ lists them, `/skill rm NAME` removes one.
 
 One JSON line per action: messages, model calls (tokens), gate decisions
 with the reason, tool calls with their input and output (up to 2 KB each),
-memory changes, briefs, tasks, settings changes. Each line carries the
+memory changes, briefs, tasks, settings changes. Each line of a run (a
+chat turn, a task, a brief, a helper's task) carries `rid`, the run's id
+(the `seq` of its first line), and `run`, its label (`chat`, `task NAME`,
+`brief NAME`, `chat/h1`). Its first line also names who started it,
+`by` (`owner`, or `schedule:NAME` for a task or brief; a helper has its
+parent's), its definition, `agent` (`main` or `helper`), and for a
+helper `parent`, the rid of the run that delegated it; gate and tool
+lines carry `agent` too. Each line carries the
 SHA-256 of the line before it; `harness log verify` finds the first line
 that was changed, removed or reordered, and also lines cut from the end,
 by the last line named in `state/status`. Harness warns at start if the
