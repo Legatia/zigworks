@@ -1,5 +1,5 @@
 //! The one place every tool call is decided, in this order: hard limits no
-//! rule can lift; roles on folders (gap 3; none yet); a deny rule; listed
+//! rule can lift; roles on folders (folders.ini, final); a deny rule; listed
 //! sources, money and setup calls; a grant with an expiry; the first allow
 //! or ask rule; the kind's default. Rules and grants are matched with the call's who:
 //! its definition, the definitions that delegated it and what started its
@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const rules = @import("rules.zig");
 const who_mod = @import("who.zig");
 pub const Who = who_mod.Who;
+const folders_mod = @import("folders.zig");
 const util = @import("util.zig");
 const url = @import("url.zig");
 const Io = std.Io;
@@ -98,6 +99,12 @@ pub const Decision = struct {
     /// Whether a question may offer "Allow 24 h": never for money, a setup
     /// call or a post others read, which are asked every time.
     allow_day: bool = true,
+    /// Refused by folders.ini: final, nothing is asked, and it is no
+    /// approval anyone could give.
+    role: bool = false,
+    /// Where a shell command starts: a folder inside the workspace, `/`
+    /// between parts; "" the workspace.
+    dir: []const u8 = "",
 };
 
 /// A call's default: the kind's, except that a send to a conversation
@@ -140,6 +147,9 @@ pub const Ctx = struct {
     env: []const u8 = "host",
     /// A `send` to a conversation others read (gap 4): asked every time.
     shared: bool = false,
+    /// Where a shell command starts, as the model gave it ("" the
+    /// workspace): confined like a file path, and `run` is checked there.
+    dir: []const u8 = "",
 };
 
 /// What a grant covers: the exact argument, or for `fetch` and `browse`
@@ -369,15 +379,30 @@ pub const Gate = struct {
     grants: *Grants,
     /// The workspace's real path.
     workspace: []const u8,
+    /// folders.ini, when it has a section: who may read, write and start
+    /// commands in each folder. null: no roles (0.3's decisions).
+    folders: ?*const folders_mod.Folders = null,
 
     pub fn decide(g: *const Gate, arena: std.mem.Allocator, tool: Tool, arg: []const u8, now_s: i64, ctx: Ctx) Decision {
-        var d = g.decideRaw(arena, tool, arg, now_s, ctx);
+        var dir: []const u8 = "";
+        var d = g.decideRaw(arena, tool, arg, now_s, ctx, &dir);
         if (d.subject.len == 0) d.subject = arg;
         d.allow_day = !(tool == .money or tool.setup(arg) or (tool == .send and ctx.shared));
+        d.dir = dir;
         return d;
     }
 
-    fn decideRaw(g: *const Gate, arena: std.mem.Allocator, tool: Tool, arg: []const u8, now_s: i64, ctx: Ctx) Decision {
+    /// Each section's folder as file rules read a path: inside the
+    /// workspace, symbolic links followed; as written where that fails.
+    pub fn realFolders(g: *const Gate, arena: std.mem.Allocator, f: *const folders_mod.Folders) ?[]const []const u8 {
+        const out = arena.alloc([]const u8, f.sections.len) catch return null;
+        for (f.sections, out) |s, *o| {
+            o.* = if (s.folder.len == 0) "" else if (confined(arena, g.io, g.workspace, s.folder)) |cf| cf.rel else |_| s.folder;
+        }
+        return out;
+    }
+
+    fn decideRaw(g: *const Gate, arena: std.mem.Allocator, tool: Tool, arg: []const u8, now_s: i64, ctx: Ctx, dir: *[]const u8) Decision {
         // what rules and grants see; for files, `given` is the path before
         // symlinks are followed, which deny rules see too
         var subject = arg;
@@ -398,10 +423,24 @@ pub const Gate = struct {
                 if (tool == .write_file and cf.link) return .{ .action = .deny, .why = "a symbolic link: files are not written through one", .subject = subject };
             },
             .web => subject = (url.hostPort(arena, arg) catch return .{ .action = .deny, .why = "not a host name" }).text,
+            // where the command starts, read like a file path
+            .shell => if (ctx.dir.len > 0) {
+                dir.* = (confined(arena, g.io, g.workspace, ctx.dir) catch return .{ .action = .deny, .why = "dir is outside the workspace" }).rel;
+            },
             else => {},
         }
-        // roles on folders come here (gap 3): a refusal there is final
         const w = ctx.who orelse Who{};
+        // roles on folders: a refusal is final, nothing is asked
+        if (g.folders) |f| {
+            const need: ?struct { rel: []const u8, access: folders_mod.Access } = switch (tool) {
+                .read_file => .{ .rel = subject, .access = .read },
+                .write_file => .{ .rel = subject, .access = .write },
+                .shell => .{ .rel = dir.*, .access = .run },
+                else => null,
+            };
+            if (need) |n| if (folders_mod.allows(f.*, arena, g.realFolders(arena, f), n.rel, n.access, w)) |why|
+                return .{ .action = .deny, .why = why, .subject = subject, .role = true };
+        }
         const name = @tagName(tool);
         // a deny in the shared part, or in a section for the call's
         // definition, one that delegated it, or what started its run
@@ -1207,4 +1246,110 @@ test "deny_mcp_rule_covers_money_tools_of_that_server" {
     try f.init("deny mcp broker/*\n");
     defer f.deinit();
     try t.expectEqual(.deny, f.act(.money, "broker/place_order {}", .{}));
+}
+
+test "no_folders_ini_keeps_every_0_3_decision" {
+    var f: Fixture = undefined;
+    try f.init("deny shell rm *\nallow fetch https://a.com/*\nask write_file secret/*\n");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.grants.add(.shell, "make", 5000);
+    // what harness init writes: comments only
+    const empty = try folders_mod.parse(a, folders_mod.example);
+    const Call = struct { tool: Tool, arg: []const u8, ctx: Ctx = .{} };
+    const calls = [_]Call{
+        .{ .tool = .shell, .arg = "rm -rf x" },
+        .{ .tool = .shell, .arg = "make" },
+        .{ .tool = .shell, .arg = "ls" },
+        .{ .tool = .shell, .arg = "ls", .ctx = .{ .scheduled = true } },
+        .{ .tool = .read_file, .arg = "notes/a" },
+        .{ .tool = .read_file, .arg = "../x" },
+        .{ .tool = .write_file, .arg = "secret/k" },
+        .{ .tool = .write_file, .arg = ".npmrc" },
+        .{ .tool = .write_file, .arg = "notes/a", .ctx = .{ .scheduled = true } },
+        .{ .tool = .fetch, .arg = "https://a.com/x" },
+        .{ .tool = .web, .arg = "a.com" },
+        .{ .tool = .money, .arg = "broker/x {}" },
+        .{ .tool = .skill_save, .arg = "s", .ctx = .{ .scheduled = true } },
+    };
+    for (calls) |c| {
+        f.gate.folders = null;
+        const before = f.gate.decide(a, c.tool, c.arg, 1000, c.ctx);
+        f.gate.folders = &empty;
+        const with = f.gate.decide(a, c.tool, c.arg, 1000, c.ctx);
+        try t.expectEqual(before.action, with.action);
+        try t.expectEqualStrings(before.why, with.why);
+        try t.expect(!with.role);
+    }
+}
+
+test "folders_match_like_file_rules" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const fs = try folders_mod.parse(a, "[notes]\nwrite = agent:coder\n");
+    f.gate.folders = &fs;
+    try f.tmp.dir.createDirPath(t.io, "ws/notes/sub");
+    const refused = [_][]const u8{ "notes/a", "./notes/a", "x/../notes/a", try std.fs.path.join(a, &.{ f.gate.workspace, "notes", "a" }) };
+    for (refused) |p| {
+        const d = f.gate.decide(a, .write_file, p, 1000, .{});
+        try t.expectEqual(.deny, d.action);
+        try t.expect(d.role);
+    }
+    if (fold_paths) try t.expectEqual(.deny, f.act(.write_file, "NOTES/a", .{}));
+    if (builtin.os.tag == .windows) try t.expectEqual(.deny, f.act(.write_file, "notes\\a", .{}));
+    try t.expectEqual(.allow, f.act(.write_file, "notes2/a", .{}));
+    if (builtin.os.tag != .windows) {
+        // a link into the folder is the folder
+        try f.tmp.dir.symLink(t.io, "notes/sub", "ws/short", .{ .is_directory = true });
+        try t.expectEqual(.deny, f.act(.write_file, "short/x", .{}));
+        // a section naming a link holds what it points to
+        try f.tmp.dir.symLink(t.io, "notes", "ws/alias", .{ .is_directory = true });
+        const via = try folders_mod.parse(a, "[alias]\nwrite = agent:coder\n");
+        f.gate.folders = &via;
+        try t.expectEqual(.deny, f.act(.write_file, "notes/x", .{}));
+    }
+}
+
+test "a_role_refusal_is_final" {
+    var f: Fixture = undefined;
+    try f.init("allow write_file *\n");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.grants.add(.write_file, "notes/a.md", 5000);
+    const fs = try folders_mod.parse(a, "[notes]\nwrite = agent:coder\n");
+    f.gate.folders = &fs;
+    for ([_]Ctx{ .{}, .{ .scheduled = true } }) |ctx| {
+        const d = f.gate.decide(a, .write_file, "notes/a.md", 1000, ctx);
+        try t.expectEqual(.deny, d.action);
+        try t.expect(d.role);
+        try t.expectEqualStrings("folders.ini [notes] write: agent:main is not listed", d.why);
+    }
+    try t.expectEqual(.allow, f.act(.read_file, "notes/a.md", .{}));
+}
+
+test "shell_dir_is_confined_and_needs_run" {
+    var f: Fixture = undefined;
+    try f.init("allow shell ls\n");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const out = f.gate.decide(a, .shell, "ls", 1000, .{ .dir = "../x" });
+    try t.expectEqual(.deny, out.action);
+    try t.expectEqualStrings("dir is outside the workspace", out.why);
+    const fs = try folders_mod.parse(a, "[work]\nrun = agent:coder\n");
+    f.gate.folders = &fs;
+    for ([_][]const u8{ "work", "work/sub" }) |dir| {
+        const d = f.gate.decide(a, .shell, "ls", 1000, .{ .dir = dir });
+        try t.expectEqual(.deny, d.action);
+        try t.expect(d.role);
+        try t.expectEqualStrings("folders.ini [work] run: agent:main is not listed", d.why);
+    }
+    try t.expectEqual(.allow, f.act(.shell, "ls", .{ .dir = "work", .who = .{ .agent = "coder" } }));
+    const moved = f.gate.decide(a, .shell, "make", 1000, .{ .dir = "./work/../notes" });
+    try t.expectEqual(.ask, moved.action);
+    try t.expectEqualStrings("notes", moved.dir);
+    const plain = f.gate.decide(a, .shell, "make", 1000, .{});
+    try t.expectEqual(.ask, plain.action);
+    try t.expectEqualStrings("", plain.dir);
 }

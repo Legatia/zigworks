@@ -33,6 +33,9 @@ pub const Env = struct {
     home: []const u8 = "",
     /// And, on Windows, the system's own (`util.system_var_names`).
     system_vars: []const util.Var = &.{},
+    /// The command's own: folders.ini's `vars` of the folders from the
+    /// workspace down to where it starts (host commands only).
+    vars: []const util.Var = &.{},
     stop: *std.atomic.Value(bool),
     /// Chrome or Chromium for `browse`; empty: none found.
     browser: []const u8 = "",
@@ -72,10 +75,11 @@ pub fn mainArg(arena: std.mem.Allocator, tool: gate.Tool, input_json: []const u8
         .search, .recall => "query",
         .remember => "text",
         .skill, .skill_save => "name",
+        .snapshot => "folder",
         // the agent builds these arguments itself
         .delegate, .mcp, .money, .web, .login => return error.NotHere,
         // the platform's kinds: their tools are not here (yet)
-        .send, .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save, .snapshot => return error.NotHere,
+        .send, .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save => return error.NotHere,
     };
     return jv.str(jv.get(v, key)) orelse error.BadInput;
 }
@@ -95,7 +99,7 @@ pub fn run(env: Env, arena: std.mem.Allocator, tool: gate.Tool, input_json: []co
 fn runRaw(env: Env, arena: std.mem.Allocator, tool: gate.Tool, input_json: []const u8) !Output {
     const arg = try mainArg(arena, tool, input_json);
     return switch (tool) {
-        .shell => shell(env, arena, arg),
+        .shell => shell(env, arena, arg, jv.str(jv.get(jv.parse(arena, input_json), "dir")) orelse ""),
         .read_file => {
             const p = try gate.confine(arena, env.io, env.workspace, arg);
             const data = Io.Dir.cwd().readFileAlloc(env.io, p, arena, .limited(fetch_max)) catch |e| switch (e) {
@@ -244,9 +248,18 @@ const Watch = struct {
     }
 };
 
-fn shell(env: Env, arena: std.mem.Allocator, command: []const u8) !Output {
+/// Runs `command` in `dir` (a folder in the workspace; "" the workspace).
+fn shell(env: Env, arena: std.mem.Allocator, command: []const u8, dir: []const u8) !Output {
+    const cwd = if (dir.len == 0) env.workspace else blk: {
+        const p = gate.confine(arena, env.io, env.workspace, dir) catch return .{ .text = "dir is outside the workspace", .is_error = true };
+        const st = Io.Dir.cwd().statFile(env.io, p, .{}) catch null;
+        if (st == null or st.?.kind != .directory) return .{ .text = try std.fmt.allocPrint(arena, "not a folder in the workspace: {s}", .{dir}), .is_error = true };
+        break :blk p;
+    };
     var vars = std.process.Environ.Map.init(arena);
     for (env.system_vars) |v| try vars.put(v.name, v.value);
+    // folders.ini can't name the ones below (nor the system's)
+    for (env.vars) |v| try vars.put(v.name, v.value);
     try vars.put("PATH", env.path_var);
     if (env.home.len > 0) try vars.put("HOME", env.home);
     try vars.put("LANG", "C.UTF-8");
@@ -254,7 +267,7 @@ fn shell(env: Env, arena: std.mem.Allocator, command: []const u8) !Output {
     const argv: []const []const u8 = if (is_windows) &.{ "cmd.exe", "/c", command } else &.{ "/bin/sh", "-c", command };
     var child = try std.process.spawn(env.io, .{
         .argv = argv,
-        .cwd = .{ .path = env.workspace },
+        .cwd = .{ .path = cwd },
         .environ_map = &vars,
         .stdin = .ignore,
         .stdout = .pipe,

@@ -22,9 +22,9 @@ standard library (and the system's Security framework on macOS). Models
 are reached only through [omnigate](https://github.com/Legatia/omnigate),
 which holds the provider keys and the budgets.
 
-**State: 0.3.0, tested on macOS by its own tests: 444 unit tests (2 skipped), among
+**State: 0.3.0, tested on macOS by its own tests: 484 unit tests (2 skipped), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 48 checks that drives the real binary against
+and an end-to-end script of 54 checks that drives the real binary against
 stand-ins for omnigate, Telegram, feeds, search and two MCP servers. An
 earlier build of 0.3.0 also passed its tests in CI on Linux and Windows.
 Nothing has run yet against a real omnigate, Telegram bot, MCP server or
@@ -74,17 +74,19 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `briefs.ini` | briefs and their topics |
 | `tasks.ini` | scheduled tasks |
 | `mcp.ini` | MCP servers (optional) |
+| `folders.ini` | roles on workspace folders: who may read, write and start commands there, their variables, snapshots (see Folders) |
 | `logins.ini` | the agent's own logins: name, site, username (no secrets) |
 | `profiles/` | each login's browser profile (its cookies) |
 | `skills/` | saved skills, one folder each (`NAME/SKILL.md`) |
 | `memory/` | one file per memory item |
 | `workspace/` | where the agent's files and commands live |
+| `snapshots/` | snapshots of folders: each content once, a file per snapshot |
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
-| `state/` | grants, seen feed items, owner, the conversations (`conversations`), status, lock, approval numbers, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command (`written`), `mcp/NAME` (each MCP server's own folder) |
+| `state/` | grants, seen feed items, owner, the conversations (`conversations`), status, lock, approval numbers, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder) |
 
-On macOS and Linux, `config.ini`, `rules`, `logins.ini` and `mcp.ini` are
-refused if other users can write them. Harness names a settings file it
+On macOS and Linux, `config.ini`, `rules`, `logins.ini`, `mcp.ini` and
+`folders.ini` are refused if other users can write them. Harness names a settings file it
 refuses, and the line of one that does not read. Changes to the settings
 files apply after `/reload`; harness tells you when it notices one.
 
@@ -93,20 +95,23 @@ files apply after `/reload`; harness tells you when it notices one.
 Every tool call is decided in one place, in this order:
 
 1. Hard limits no rule lifts: files only inside `workspace/` and no write
-   to a symlink; fetch, browse and web only http and https, and no
-   address with a name before `@`.
-2. A matching `deny` line in `rules`: in the shared part, or in a
+   to a symlink, and a command's start folder (`dir`) inside it too;
+   fetch, browse and web only http and https, and no address with a name
+   before `@`.
+2. Roles on folders (`folders.ini`, see Folders): a refusal there is
+   final, and nothing is asked.
+3. A matching `deny` line in `rules`: in the shared part, or in a
    section for the call (see Sections).
-3. A grant you gave with "Allow 24 h" for this call.
-4. The first matching `allow` or `ask` line: in a section for the call's
+4. A grant you gave with "Allow 24 h" for this call.
+5. The first matching `allow` or `ask` line: in a section for the call's
    definition, then in one for what started its run, then in the shared
    part. An `ask` in a section for a definition that delegated the call,
    or for what started its run, makes an `allow` from elsewhere ask.
-5. The tool's default: `shell`, `fetch`, `browse`, `web`, `login`,
+6. The tool's default: `shell`, `fetch`, `browse`, `web`, `login`,
    `skill_save` and MCP tools ask; so does `write_file` for a path with a
    part starting with "." (`.git/config`, `.npmrc`); files, search,
-   memory, `skill` and `delegate` are allowed (each helper's own calls
-   pass the gate like any other).
+   memory, `skill`, `snapshot` and `delegate` are allowed (each helper's
+   own calls pass the gate like any other).
 
 ```
 deny  shell rm -rf *
@@ -158,8 +163,11 @@ only environment for now, so `allow shell@host make*` is
 After the agent writes a file in the workspace, a shell command that a
 rule or a grant allows is asked first, naming the files written since you
 last allowed a command (a `pkg.py` or `Makefile` can change what a
-command runs), until you allow one; a scheduled run skips it. The list
-is kept in `state/written`.
+command runs), until you allow one; a scheduled run skips it. Each file
+written by another definition or run than the one asking says who wrote
+it: `notes/a.md (agent:helper, chat/h1)`. The list is kept in
+`state/written` (a path, who and the run a line; one from harness 0.3
+lists its files as `(who unknown)`).
 
 File rules and grants see the path inside the workspace: `./notes/a`,
 `x/../notes/a`, its absolute path or a symlink to it count as `notes/a`,
@@ -287,6 +295,112 @@ to 3,500 bytes, read from the log's last 4 MB. `harness log runs [N]` lists
 the last runs; `harness log session RID [--json]` shows one with its
 helpers, whole or as its log lines. In the terminal every post is
 printed, with `[NAME]` in front when it is for another conversation.
+
+## Folders
+
+`folders.ini` in the data folder gives workspace folders roles: who may
+read, write and start commands in each, the variables its commands get,
+and which folders keep snapshots. `harness init` writes it with comments
+only; without a section, the rules alone decide, as before.
+
+```ini
+[/]
+write = agent:main
+
+[notes]
+write = owner
+
+[work/shop]
+run = agent:main
+vars = STRIPE_KEY:stripe-test, DATABASE_URL:shop-db
+snapshots = on
+skip = node_modules, *.log
+
+[private]
+read = owner
+```
+
+A section is a folder inside the workspace, written from it (`work/shop`;
+`\` works on Windows), or `[/]` for all of it. `read`, `write` and `run`
+list who may: `owner`, `schedule:NAME`, `agent:main`, `agent:helper`
+(and `trigger:NAME`, `workflow:NAME/STEP`, `app:NAME` and other
+definitions once those exist), a kind alone for all its names, `*` as in
+rules, or `none`. A folder without a key takes the nearest folder above
+that has it; with none, that key doesn't limit. A run you or a schedule
+started passes when `owner` or its schedule is listed; otherwise its
+definition and every definition that delegated it must be listed (so
+`write = agent:main` keeps its helpers out), and so must what started a
+trigger's, workflow's or app's run. `read_file` needs `read` on the path,
+`write_file` needs `write`, and `shell` needs `run` where it starts.
+
+The gate checks roles right after the hard limits. A refusal is final: no
+rule, grant or answer lifts it, nothing is asked, and a scheduled run
+doesn't list it as skipped. It says what to change: `folders.ini
+[work/shop] write: agent:helper is not listed`. Paths are read as file
+rules read them: `./notes/a`, its absolute path, a link into the folder,
+and on macOS and Windows `Notes/A`, are `notes/a`; `notes2` is not in
+`notes`. `/folders` shows the sections (variable names and the secrets
+they come from, never values); `/access WHO` says where WHO may read,
+write and start commands (`/access agent:helper`, `/access
+schedule:NAME`, `/access agent:main trigger:NAME`).
+
+Roles bind harness's own file tools and where a command starts. On this
+machine an approved command still runs as you and can `cd` anywhere (see
+Limits).
+
+### Where commands start, and their variables
+
+With a section in `folders.ini`, `shell` takes `dir`, a folder in the
+workspace to start in (default the workspace), read like a file path;
+one outside the workspace is refused. The question shows it (`shell: make
+test (in work/shop)`), rules match the command alone, and the gate and
+tool lines carry `dir`.
+
+`vars = NAME:secret, ...` gives commands started in that folder or below
+those variables, from stored secrets (`harness secret add stripe-test`);
+a nearer folder's variable of the same name wins. The values are masked
+in all output like any stored secret, and never written to the
+workspace. A variable whose secret isn't stored refuses the command
+before you are asked. `PATH`, `HOME`, `LANG`, `TERM` and Windows's system
+variables can't be set, in any letter case. Only commands on this machine
+get them.
+
+### Snapshots
+
+`snapshots = on` keeps a folder's versions (the newest 50, or as many as
+the number given): one before a run's first call that can change it (a
+`write_file` in it, or any `shell` command, since harness can't see what
+a command changes) and one when that run ends; a helper's changes count
+for the run that delegated it. You take one with `/snapshot FOLDER
+[LABEL]`, and the agent with its `snapshot` tool (offered when
+`folders.ini` has a section), of any workspace folder. A folder inside one
+that keeps snapshots can't set its own.
+
+Not kept, and named in the snapshot: `.git` folders, `skip` matches (by
+name or by path), symbolic links, files over 100 MiB. A folder over 20,000
+files or 1 GiB gets none, and `/status` says why. A file is read again
+only if its size or modification time changed, or that time is within
+2 s of the last snapshot.
+
+`/snapshots [FOLDER]` lists them (id, time, why, run, definition, who
+started it, files, changes, label). `/changes FOLDER ID` says which files
+were added, changed and removed since the snapshot before. `/restore
+FOLDER ID` puts the folder back: refused while a run is going, it takes a
+snapshot first, writes back each file that differs (in place, never
+through a symbolic link), deletes files the snapshot doesn't have (files
+it skipped stay), and says what it wrote and deleted and the id that
+undoes it. Only you restore; no tool does. The CLI does the same:
+`harness snapshot list FOLDER`, `take FOLDER [LABEL]`, `changes FOLDER
+ID`, `restore FOLDER ID`.
+
+The store is `snapshots/` in the data folder, out of every file tool's
+reach: each content once in `objects/`, a file a snapshot in
+`folders/KEY/ID`. Snapshots past a folder's count go, and the oldest while
+all of them hold more than `[limits] snapshot_mb` (default 5120; each
+folder keeps its newest); content no snapshot names is deleted at start
+and after each run. Objects are copied for now; cloning, on the file
+systems that can share blocks (APFS, btrfs, XFS, ReFS and Dev Drives),
+comes with their helpers.
 
 ## Helpers
 
@@ -476,14 +590,19 @@ run's id (the `seq` of its first line), `conversation`, where it reports
 `by` (`owner`, or `schedule:NAME` for a task or brief; a helper has its
 parent's), its definition, `agent` (`main` or `helper`), and for a
 helper `parent`, the rid of the run that delegated it; gate and tool
-lines carry `agent` too, and tool lines the output's whole size, `bytes`.
+lines carry `agent` too, a `shell` call that names `dir` carries it on
+both, and tool lines carry the output's whole size, `bytes`.
 A post is a line of kind `send`: `to`, `event` (`sent`, `refused`,
 `held`, `kept`, `failed`), `bytes`, `text`, `files`, `buttons`, `final`,
 `implicit`, `delivered`, the first message's id and the number of
 messages. A private run's lines, and a post into a private conversation,
 keep sizes and keyed hashes of what was said, while their labels (`run`,
 `conversation`, `by`, `agent`, `to`, `event`, `tool`, `decision`, `why`)
-stay readable. Each line carries the
+stay readable. Snapshots are `files` lines: `snapshot` (folder, id, why
+it was taken, label, files, changed, bytes stored, and the run's rid,
+definition and who started it), `snapshot skipped` (folder, why),
+`restore` (folder, id, the id that undoes it, files written and
+deleted) and `prune` (snapshots and objects deleted). Each line carries the
 SHA-256 of the line before it; `harness log verify` finds the first line
 that was changed, removed or reordered, and also lines cut from the end,
 by the last line named in `state/status`. Harness warns at start if the
@@ -562,14 +681,15 @@ paused until `/task resume NAME`. `/tasks`,
 `/stop`, `/new`, `/status`, `/brief [NAME]`, `/topics`, `/topic add|rm`, `/tasks`,
 `/task add|rm|resume`, `/memory`, `/remember`, `/pin`, `/unpin`,
 `/forget`, `/private on|off`, `/skills`, `/skill rm`, `/logins`,
-`/dryrun on|off`, `/reload`, `/conversations`,
-`/conversation new|rename|rm|add`, `/session [N]`, `/help`. `/new` and
-`/private` act on the conversation they are sent in; `/stop`, `/dryrun`
-and `/memory auto` on everything.
+`/folders`, `/access WHO`, `/snapshots [FOLDER]`, `/snapshot FOLDER
+[LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/dryrun on|off`,
+`/reload`, `/conversations`, `/conversation new|rename|rm|add`,
+`/session [N]`, `/help`. `/new` and `/private` act on the conversation
+they are sent in; `/stop`, `/dryrun` and `/memory auto` on everything.
 
 CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `memory [list|pin|unpin|forget ID]`,
-`log verify|tail|runs|session`,
+`snapshot list|take|changes|restore`, `log verify|tail|runs|session`,
 `health`, `version`. `--home DIR` may come anywhere on the line;
 arguments a command does not take are refused. `health` exits 0 only
 while `harness run` holds the folder and has ticked in the last 90 s.

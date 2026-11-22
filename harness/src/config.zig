@@ -51,6 +51,8 @@ pub const Config = struct {
         /// Posts to one conversation in an hour, all runs and replies
         /// counted; past it they are logged, not sent.
         sends_per_hour: u32 = 60,
+        /// Snapshots of folders, all together, at most (MiB).
+        snapshot_mb: u32 = 5120,
     };
     pub const Memory = struct {
         auto: bool = true,
@@ -110,7 +112,7 @@ pub fn lines(arena: std.mem.Allocator, text: []const u8) Error![]Line {
 
 /// A comment starts at `;` or `#` at the start of a line or after a space,
 /// so URLs with `#` fragments and values like `a;b` survive.
-fn stripComment(raw: []const u8) []const u8 {
+pub fn stripComment(raw: []const u8) []const u8 {
     for (raw, 0..) |c, i| {
         if ((c == ';' or c == '#') and (i == 0 or raw[i - 1] == ' ' or raw[i - 1] == '\t')) return raw[0..i];
     }
@@ -362,6 +364,7 @@ pub const defaults_ini =
     \\approval_seconds = 600
     \\sends_per_run = 10                  ; posts one run may make with send
     \\sends_per_hour = 60                 ; posts to one conversation an hour; past it: logged, not sent
+    \\snapshot_mb = 5120                  ; snapshots of folders, all together, at most (MiB)
     \\
     \\[memory]
     \\auto = on

@@ -17,6 +17,8 @@ const logins_mod = @import("logins.zig");
 const store_mod = @import("store.zig");
 const masks_mod = @import("masks.zig");
 const who_mod = @import("who.zig");
+const folders_mod = @import("folders.zig");
+const snapshots_mod = @import("snapshots.zig");
 const Io = std.Io;
 
 /// `unsent`: the question did not get to the owner (a part or its buttons
@@ -326,6 +328,12 @@ pub const Run = struct {
     /// The instance's list of files the agent wrote since the owner last
     /// allowed a shell command (see `Written`); helpers share it.
     written: ?*Written = null,
+    /// The instance's snapshot store; null: no snapshots and no `snapshot`
+    /// tool.
+    snaps: ?*snapshots_mod.Store = null,
+    /// The folders this run snapshotted before changing them (shared with
+    /// its helpers); set by the top-level run's `turn`.
+    snap_run: ?*SnapRun = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -363,6 +371,11 @@ pub const Run = struct {
         if (first) r.rid = seq;
     }
 
+    /// Who takes a snapshot in this run.
+    fn snapBy(r: *const Run) snapshots_mod.By {
+        return .{ .rid = r.rid, .run = r.label, .agent = r.who.agent, .by = r.who.by };
+    }
+
     /// Whether this run may use `tool` at all (helpers get a subset).
     pub fn allows(r: *const Run, tool: gate.Tool) bool {
         if (r.helper) switch (tool) {
@@ -383,7 +396,9 @@ pub const Run = struct {
             // a run that posts: helpers answer the run that started them
             .send => if (r.helper or r.outbox == null) return false,
             // the platform's kinds: the gate decides them, their tools come later
-            .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save, .snapshot => return false,
+            .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save => return false,
+            // where there is a store and folders.ini has a section
+            .snapshot => if (r.snaps == null or r.gate.folders == null) return false,
             else => {},
         }
         const list = r.allowed orelse return true;
@@ -405,6 +420,18 @@ const send_def: model.ToolDef = .{
     \\{"type":"object","properties":{"to":{"type":"string","description":"a conversation's name; default: this one"},"text":{"type":"string"},"files":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"workspace files, sent as documents (up to 20 MB each)"},"buttons":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"quick replies the owner can press, up to 32 bytes each (not where others read)"},"final":{"type":"boolean","description":"this is your reply: the turn ends with it"}},"required":["text"]}
     ,
 };
+/// shell where folders.ini has a section: it may start in a folder of the
+/// workspace, where `run` is checked and the folder's `vars` apply.
+const shell_dir_def: model.ToolDef = .{
+    .name = "shell",
+    .description = "Run a shell command in the workspace folder, or in `dir`, a folder inside it. Returns the exit code and output.",
+    .schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"dir\":{\"type\":\"string\",\"description\":\"a folder in the workspace to start in; default the workspace\"}},\"required\":[\"command\"]}",
+};
+const snapshot_def: model.ToolDef = .{
+    .name = "snapshot",
+    .description = "Keep a snapshot of a workspace folder now (or of env:NAME, an environment's home), with a label, so that the owner can compare it and put it back later. Only the owner restores.",
+    .schema_json = "{\"type\":\"object\",\"properties\":{\"folder\":{\"type\":\"string\",\"description\":\"a folder in the workspace, / for all of it, or env:NAME\"},\"label\":{\"type\":\"string\",\"description\":\"what it is before or after\"}},\"required\":[\"folder\"]}",
+};
 const skill_defs = [_]model.ToolDef{
     .{ .name = "skill", .description = "Load one of your skills (saved instructions for a kind of task) by name; with `file`, read one of the skill's other files.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"file\":{\"type\":\"string\"}},\"required\":[\"name\"]}" },
     .{ .name = "skill_save", .description = "Save a skill: instructions for a kind of task you may meet again (steps, sources, pitfalls). Replaces a skill of the same name. The owner approves it.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"lowercase letters, digits and hyphens\"},\"description\":{\"type\":\"string\",\"description\":\"one line: when to use it\"},\"body\":{\"type\":\"string\"}},\"required\":[\"name\",\"description\",\"body\"]}" },
@@ -416,12 +443,14 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
     var out: std.ArrayList(model.ToolDef) = .empty;
     for (tools.defs()) |d| {
         const tool = gate.Tool.fromName(d.name).?;
-        if (r.allows(tool)) try out.append(arena, d);
+        if (!r.allows(tool)) continue;
+        try out.append(arena, if (tool == .shell and r.gate.folders != null) shell_dir_def else d);
     }
     if (r.allows(.send)) try out.append(arena, send_def);
     if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
     if (r.allows(.delegate)) try out.append(arena, delegate_def);
     for (skill_defs) |d| if (r.allows(gate.Tool.fromName(d.name).?)) try out.append(arena, d);
+    if (r.allows(.snapshot)) try out.append(arena, snapshot_def);
     for (r.mcp) |m| if (r.allows(if (m.money) .money else .mcp)) try out.append(arena, m.def);
     return out.items;
 }
@@ -905,6 +934,19 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
         }
     }
     try r.logRun(.turn, r.isPrivate(), .{ .text = user_text });
+    // the folders it changes are snapshotted before their first change and
+    // when it ends; its helpers share this
+    var snap_state: SnapRun = undefined;
+    const own_snaps = !r.helper and r.snap_run == null and r.snaps != null and r.gate.folders != null;
+    if (own_snaps) {
+        snap_state = .{ .gpa = r.gpa };
+        r.snap_run = &snap_state;
+    }
+    defer if (own_snaps) {
+        snapAfter(r, a);
+        snap_state.deinit();
+        r.snap_run = null;
+    };
 
     const tn = try conv.begin();
     // a turn that fails half way could leave a tool call without its result,
@@ -1126,6 +1168,26 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         else => tools.mainArg(a, tool, input_json) catch return .{ .text = "the tool's input is missing its main field", .is_error = true },
     };
     const now_s = r.now();
+    // where a command starts, as the model gave it
+    const dir: []const u8 = if (tool == .shell) jv.str(jv.get(jv.parse(a, input_json), "dir")) orelse "" else "";
+    // the variables folders.ini gives a command started there; one whose
+    // secret is not stored refuses the call before anyone is asked
+    var cmd_vars: CommandVars = .{};
+    if (tool == .shell) {
+        const rel: ?[]const u8 = if (dir.len == 0) "" else if (gate.confined(a, r.io, r.env.workspace, dir)) |cf| cf.rel else |_| null;
+        // (outside the workspace: the gate refuses it below)
+        if (rel) |d| {
+            // gap 2 passes the run's environment: no secret leaves the host
+            cmd_vars = try folderVars(r, a, "host", d);
+            if (cmd_vars.missing) |why| {
+                if (dir.len > 0)
+                    try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg, .dir = dir })
+                else
+                    try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+                return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            }
+        }
+    }
     var reserved: Reservation = .{};
     if (tool == .money) {
         if (moneyCheck(r, a, mt.?, input_json, now_s, &reserved)) |why| {
@@ -1148,13 +1210,21 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         },
         else => "",
     };
-    if (try decideAndAsk(r, a, tool, name, arg, detail, now_s)) |refused| {
+    if (try decideAndAskIn(r, a, tool, name, arg, detail, dir, now_s)) |refused| {
         if (tool == .money) releaseMoney(r, mt.?, reserved);
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{refused}), .is_error = true };
     }
+    // what it may change is kept first, once a run (before the time left
+    // is measured: a snapshot takes from the turn's time, not past it)
+    if (tool == .write_file or tool == .shell) snapBefore(r, a, tool, arg);
     // a tool gets what is left of the turn, no more; fetch and search
     // send each redirect through the gate
     var env = redirectEnv(r);
+    if (cmd_vars.vars.len > 0) {
+        env.vars = cmd_vars.vars;
+        // masked in this command's output like any stored secret
+        env.secrets = try std.mem.concat(a, scrub.Secret, &.{ env.secrets, cmd_vars.secrets });
+    }
     if (r.deadline_s > 0) {
         // in milliseconds: in whole seconds a call cut a moment before the
         // deadline's second began would leave "1 s" that isn't there; with
@@ -1174,7 +1244,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     // asked too; by its path inside the workspace, as the gate sees it
     if (tool == .write_file) if (r.written) |w| {
         const cf = gate.confined(a, r.io, r.env.workspace, arg) catch null;
-        w.add(if (cf) |x| x.rel else arg);
+        w.addBy(if (cf) |x| x.rel else arg, try std.fmt.allocPrint(a, "agent:{s}", .{r.who.agent}), r.label);
     };
 
     const out: tools.Output = switch (tool) {
@@ -1206,6 +1276,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
             break :blk .{ .text = said };
         },
         .delegate => try delegate(r, a, input_json),
+        .snapshot => try snapshotTool(r, a, arg, jv.str(jv.get(jv.parse(a, input_json), "label")) orelse ""),
         .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
         .skill => blk: {
             const v = jv.parse(a, input_json).?;
@@ -1231,7 +1302,10 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         },
         else => try tools.run(env, a, tool, input_json),
     };
-    try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
+    if (dir.len > 0)
+        try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .dir = dir, .is_error = out.is_error, .output = out.text, .bytes = out.text.len })
+    else
+        try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
     return out;
 }
 
@@ -1375,6 +1449,147 @@ pub fn sentText(a: std.mem.Allocator, name: []const u8, input_json: []const u8) 
     return jv.str(jv.get(jv.parse(a, input_json), "text"));
 }
 
+/// The folders a run snapshotted before its first change of each; when
+/// the run ends it takes their "after" snapshots. One for a top-level run
+/// and its helpers: helpers work at once on the same folders, so they
+/// share the run's pair (the plan's Ruling 5).
+pub const SnapRun = struct {
+    gpa: std.mem.Allocator,
+    /// Held while a "before" snapshot is taken: a helper's change waits.
+    mutex: Io.Mutex = .init,
+    taken: std.ArrayList(Taken) = .empty,
+
+    const Taken = struct { folder: []u8, ok: bool };
+
+    pub fn deinit(s: *SnapRun) void {
+        for (s.taken.items) |tk| s.gpa.free(tk.folder);
+        s.taken.deinit(s.gpa);
+    }
+
+    fn has(s: *const SnapRun, folder: []const u8) bool {
+        for (s.taken.items) |tk| if (std.mem.eql(u8, tk.folder, folder)) return true;
+        return false;
+    }
+};
+
+/// Before a run's first call that can change a folder that keeps
+/// snapshots (a write in it, or any shell command, since harness can't
+/// see what a command changes): that folder's "before" snapshot.
+fn snapBefore(r: *Run, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) void {
+    const store = r.snaps orelse return;
+    const sr = r.snap_run orelse return;
+    const f = r.gate.folders orelse return;
+    const rel: ?[]const u8 = if (tool != .write_file) null else if (gate.confined(a, r.io, r.env.workspace, arg)) |cf| cf.rel else |_| return;
+    const real = r.gate.realFolders(a, f);
+    sr.mutex.lockUncancelable(r.io);
+    defer sr.mutex.unlock(r.io);
+    for (f.sections, 0..) |s, i| {
+        const kept = s.snapshots orelse continue;
+        if (kept == 0) continue;
+        const folder = if (real) |x| x[i] else s.folder;
+        if (rel) |p| if (!folders_mod.inFolder(p, folder)) continue;
+        if (sr.has(folder)) continue;
+        const owned = r.gpa.dupe(u8, folder) catch continue;
+        sr.taken.append(r.gpa, .{ .folder = owned, .ok = false }) catch {
+            r.gpa.free(owned);
+            continue;
+        };
+        const got = takeSnapshot(r, a, store, f, folder, .before) orelse continue;
+        sr.taken.items[sr.taken.items.len - 1].ok = got.refused == null;
+    }
+}
+
+/// When the top-level run ends: the "after" snapshot of each folder it
+/// snapshotted before, then old snapshots and unnamed objects go.
+fn snapAfter(r: *Run, a: std.mem.Allocator) void {
+    const store = r.snaps orelse return;
+    const sr = r.snap_run orelse return;
+    const f = r.gate.folders orelse return;
+    if (sr.taken.items.len == 0) return;
+    for (sr.taken.items) |tk| if (tk.ok) {
+        _ = takeSnapshot(r, a, store, f, tk.folder, .after);
+    };
+    if (store.prune(a, f)) |_| {} else |e| r.log.write(.files, false, .{ .event = "prune failed", .why = @errorName(e) }) catch {};
+}
+
+/// A snapshot of the workspace folder `folder` (`/` between parts, "" the
+/// workspace) for this run; null when it failed (logged).
+fn takeSnapshot(r: *Run, a: std.mem.Allocator, store: *snapshots_mod.Store, f: *const folders_mod.Folders, folder: []const u8, when: snapshots_mod.When) ?snapshots_mod.Taken {
+    const name = if (folder.len == 0) "/" else folder;
+    const src: snapshots_mod.Source = .{
+        .name = name,
+        .path = if (folder.len == 0) r.env.workspace else std.fs.path.join(a, &.{ r.env.workspace, folder }) catch return null,
+        .base = folder,
+        .skip = snapshots_mod.skipsFor(f.*, a, folder) catch return null,
+    };
+    return store.take(a, src, .{ .when = when, .by = r.snapBy() }) catch |e| {
+        r.log.write(.files, false, .{ .event = "snapshot skipped", .folder = name, .why = @errorName(e) }) catch {};
+        return null;
+    };
+}
+
+/// The `snapshot` tool: one now, of a workspace folder or `env:NAME`.
+fn snapshotTool(r: *Run, a: std.mem.Allocator, folder: []const u8, label: []const u8) !tools.Output {
+    const store = r.snaps orelse return .{ .text = "this tool is not available here", .is_error = true };
+    const src = snapshots_mod.sourceFor(a, r.io, store, r.env.workspace, r.gate.folders, folder) catch |e| return .{
+        .text = switch (e) {
+            error.NoSuchEnv => try std.fmt.allocPrint(a, "not taken: no environment {s}", .{folder["env:".len..]}),
+            error.OutsideWorkspace => try std.fmt.allocPrint(a, "not taken: {s} is outside the workspace", .{folder}),
+            else => try std.fmt.allocPrint(a, "not taken: {s}", .{@errorName(e)}),
+        },
+        .is_error = true,
+    };
+    const got = store.take(a, src, .{ .when = .tool, .label = label, .by = r.snapBy(), .must_exist = true }) catch |e| return .{
+        .text = switch (e) {
+            error.NoSuchFolder => if (std.mem.startsWith(u8, src.name, "env:")) try std.fmt.allocPrint(a, "not taken: no environment {s}", .{src.name["env:".len..]}) else try std.fmt.allocPrint(a, "not taken: no folder {s} in the workspace", .{src.name}),
+            error.LinkOnTheWay => try std.fmt.allocPrint(a, "not taken: {s} is a symbolic link", .{src.name}),
+            else => try std.fmt.allocPrint(a, "not taken: {s}", .{@errorName(e)}),
+        },
+        .is_error = true,
+    };
+    if (got.refused) |why| return .{ .text = try std.fmt.allocPrint(a, "not taken: {s} is {s}", .{ src.name, why }), .is_error = true };
+    _ = store.prune(a, r.gate.folders) catch {};
+    return .{ .text = try std.fmt.allocPrint(a, "Took snapshot {d} of {s}: {d} file{s}, {d} changed since the one before.", .{ got.id, src.name, got.files, if (got.files == 1) "" else "s", got.changed }) };
+}
+
+/// The variables of a command, with what to mask, or why it can't run.
+pub const CommandVars = struct {
+    vars: []const util.Var = &.{},
+    /// The values, as the stored secrets they are, for masking.
+    secrets: []const scrub.Secret = &.{},
+    /// A variable whose secret is not stored: the call is refused.
+    missing: ?[]const u8 = null,
+};
+
+/// The variables a command started in `dir` (inside the workspace, ""
+/// for the workspace) gets from folders.ini, with their values: none
+/// unless it runs on the host (`env`), since no secret crosses into a
+/// sandbox or to a remote.
+pub fn folderVars(r: *Run, a: std.mem.Allocator, env: []const u8, dir: []const u8) !CommandVars {
+    if (!std.mem.eql(u8, env, "host")) return .{};
+    const f = r.gate.folders orelse return .{};
+    const list = try folders_mod.varsFor(f.*, a, r.gate.realFolders(a, f), dir);
+    if (list.len == 0) return .{};
+    const vars = try a.alloc(util.Var, list.len);
+    const secrets = try a.alloc(scrub.Secret, list.len);
+    for (list, vars, secrets) |v, *o, *sec| {
+        const value = secretValue(r, a, v.secret) orelse return .{ .missing = try std.fmt.allocPrint(a, "folders.ini [{s}] vars: secret {s} is not stored (harness secret add {s})", .{ v.section, v.secret, v.secret }) };
+        o.* = .{ .name = v.name, .value = value };
+        sec.* = .{ .name = v.secret, .value = value };
+    }
+    return .{ .vars = vars, .secrets = secrets };
+}
+
+/// A stored secret's value: one read at start (they are all masked), else
+/// from the key store now, masked from then on in every run.
+fn secretValue(r: *Run, a: std.mem.Allocator, name: []const u8) ?[]const u8 {
+    for (r.env.secrets) |sec| if (std.mem.eql(u8, sec.name, name)) return sec.value;
+    const st = r.store orelse return null;
+    const v = (st.get(r.io, a, name) catch null) orelse return null;
+    if (r.masks) |m| m.add(name, v) catch return null;
+    return v;
+}
+
 /// The run's tool environment, with its gate for redirects and the turn's
 /// end (fetch, search and browse get no more than what is left of it).
 fn redirectEnv(r: *Run) tools.Env {
@@ -1418,6 +1633,12 @@ fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8
     return decideAndAskWith(r, a, tool, name, arg, detail, now_s, .{});
 }
 
+/// `decideAndAsk` for a shell command that names where it starts (`dir`,
+/// as the model gave it): the question says where, and the lines carry it.
+fn decideAndAskIn(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, dir: []const u8, now_s: i64) !?[]const u8 {
+    return decideAndAskWith(r, a, tool, name, arg, detail, now_s, .{ .dir = dir });
+}
+
 /// What a call adds to the gate's decision.
 const AskExtra = struct {
     /// A post to a conversation others read: asked every time.
@@ -1425,10 +1646,14 @@ const AskExtra = struct {
     /// Why a call the gate allows is asked all the same (a file a post
     /// carries whose name programs read as settings).
     ask_why: ?[]const u8 = null,
+    /// Where a shell command starts, as the model gave it ("" the
+    /// workspace).
+    dir: []const u8 = "",
 };
 
 fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, now_s: i64, extra: AskExtra) !?[]const u8 {
-    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who, .shared = extra.shared };
+    const dir = extra.dir;
+    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who, .shared = extra.shared, .dir = dir };
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
@@ -1439,7 +1664,9 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
     var why = d.why;
     // files the agent wrote since the owner last allowed a command: one
     // that a rule or a grant allows is asked first, naming them
-    const wrote: ?Written.Listed = if (tool != .shell) null else if (r.written) |w| try w.list(a) else null;
+    // named for the asker: files it wrote itself go without who wrote them
+    const writer: Written.Writer = .{ .who = try std.fmt.allocPrint(a, "agent:{s}", .{r.who.agent}), .run = r.label };
+    const wrote: ?Written.Listed = if (tool != .shell) null else if (r.written) |w| try w.listFor(a, writer, null) else null;
     if (wrote != null and action == .allow) {
         if (r.scheduled or r.asker == null) {
             action = .deny;
@@ -1470,7 +1697,8 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
         // a money call says whether it is made: the switch can change while asked
         const dry: []const u8 = if (tool != .money) "" else if (r.dryRun()) "\nDry run is on: this call is not made." else "\nDry run is off: this call is made.";
         const files: []const u8 = if (wrote) |wr| try std.fmt.allocPrint(a, "\nFiles the agent wrote in the workspace since you last allowed a command: {s}", .{wr.text}) else "";
-        const what = try std.fmt.allocPrint(a, "{s}{s}: {s}{s}{s}{s}{s}{s}", .{ who, name, d.subject, given, if (detail.len > 0) ", " else "", detail, dry, files });
+        const in_dir: []const u8 = if (d.dir.len > 0) try std.fmt.allocPrint(a, " (in {s})", .{d.dir}) else "";
+        const what = try std.fmt.allocPrint(a, "{s}{s}: {s}{s}{s}{s}{s}{s}{s}", .{ who, name, d.subject, in_dir, given, if (detail.len > 0) ", " else "", detail, dry, files });
         if (what.len > max_question) {
             why = try std.fmt.allocPrint(a, "too long to ask the owner ({d} bytes; a question is at most {d}): make the call smaller", .{ what.len, max_question });
             break :ask;
@@ -1514,7 +1742,10 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
         // the owner saw those files and allowed a command all the same
         if (action == .allow) if (wrote) |wr| r.written.?.clear(wr.upto);
     }
-    try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
+    if (dir.len > 0)
+        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = @tagName(action), .why = why, .arg = arg, .dir = dir })
+    else
+        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
     return if (action == .allow) null else why;
 }
 
@@ -1582,9 +1813,9 @@ pub const Skipped = struct {
 /// a shell command. Commands read files where they run (pkg.py for
 /// `python3 -m pkg`, conftest.py, a Makefile), so one that a rule or a 24 h
 /// grant allows could run what the agent wrote: while any is listed, a
-/// shell command is asked, naming them, until the owner allows one. One per
-/// instance, shared by its runs and their helpers, and kept in `path` (when
-/// set) so a restart does not drop it.
+/// shell command is asked, naming them and who wrote each, until the owner
+/// allows one. One per instance, shared by its runs and their helpers, and
+/// kept in `path` (when set) so a restart does not drop it.
 pub const Written = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -1598,13 +1829,22 @@ pub const Written = struct {
     /// The number of the last write.
     seq: u64 = 0,
 
-    const Entry = struct { path: []u8, seq: u64 };
+    /// `writer`: who wrote it and the run's label (`agent:helper chat/h1`);
+    /// "" when not known (a list kept by harness 0.3).
+    const Entry = struct { path: []u8, seq: u64, writer: []u8 };
     const max = 256;
     /// Names a question shows; the rest are counted.
     const shown = 20;
 
     /// What a question says, and the last write it covers.
     pub const Listed = struct { text: []const u8, upto: u64 };
+
+    /// Who writes a file: a definition (`agent:NAME`) or an app's own call
+    /// (`app:NAME`), and the run's label ("" for none).
+    pub const Writer = struct { who: []const u8, run: []const u8 = "" };
+
+    /// The first line of a list that names who wrote each file.
+    pub const file_head = "# harness written 2: files written since you last allowed a command: the path, then who wrote it and the run; tab-separated, with \\ \\t \\r \\n escaped\n";
 
     /// The list kept in `path` ("" for none), if there is one.
     pub fn init(gpa: std.mem.Allocator, io: Io, path: []const u8) Written {
@@ -1614,22 +1854,39 @@ pub const Written = struct {
     }
 
     pub fn deinit(w: *Written) void {
-        for (w.items.items) |e| w.gpa.free(e.path);
+        for (w.items.items) |e| {
+            w.gpa.free(e.path);
+            w.gpa.free(e.writer);
+        }
         w.items.deinit(w.gpa);
     }
 
-    /// `rel` (a path inside the workspace) is being written.
+    /// `rel` (a path inside the workspace) is being written, by someone not
+    /// named.
     pub fn add(w: *Written, rel: []const u8) void {
+        w.addBy(rel, "", "");
+    }
+
+    /// `rel` (a path inside the workspace) is being written by `who` (see
+    /// `Writer`) in the run labelled `run`.
+    pub fn addBy(w: *Written, rel: []const u8, who: []const u8, run: []const u8) void {
         w.mutex.lockUncancelable(w.io);
         defer w.mutex.unlock(w.io);
-        w.note(rel);
+        var buf: [256]u8 = undefined;
+        const writer = if (who.len == 0) "" else if (run.len == 0) who else std.fmt.bufPrint(&buf, "{s} {s}", .{ who, util.cut(run, 120) }) catch who;
+        w.note(rel, writer);
         w.save();
     }
 
-    fn note(w: *Written, rel: []const u8) void {
+    fn note(w: *Written, rel: []const u8, writer: []const u8) void {
         w.seq += 1;
         for (w.items.items) |*e| if (std.mem.eql(u8, e.path, rel)) {
             e.seq = w.seq;
+            // the last writer is the one named
+            if (!std.mem.eql(u8, e.writer, writer)) if (w.gpa.dupe(u8, writer)) |dup| {
+                w.gpa.free(e.writer);
+                e.writer = dup;
+            } else |_| {};
             return;
         };
         if (w.items.items.len >= max) {
@@ -1637,77 +1894,117 @@ pub const Written = struct {
             w.more_seq = w.seq;
             return;
         }
-        const p = w.gpa.dupe(u8, rel) catch {
-            w.more += 1;
-            w.more_seq = w.seq;
-            return;
-        };
-        w.items.append(w.gpa, .{ .path = p, .seq = w.seq }) catch {
+        const p = w.gpa.dupe(u8, rel) catch return w.counted();
+        const by = w.gpa.dupe(u8, writer) catch {
             w.gpa.free(p);
-            w.more += 1;
-            w.more_seq = w.seq;
+            return w.counted();
+        };
+        w.items.append(w.gpa, .{ .path = p, .seq = w.seq, .writer = by }) catch {
+            w.gpa.free(p);
+            w.gpa.free(by);
+            w.counted();
         };
     }
 
-    /// "a.py, b/c.txt and 3 more", or null when nothing was written.
+    /// A write that could not be kept by name.
+    fn counted(w: *Written) void {
+        w.more += 1;
+        w.more_seq = w.seq;
+    }
+
+    /// "a.py, b/c.txt (agent:helper, chat/h1) and 3 more", or null when
+    /// nothing was written.
     pub fn list(w: *Written, arena: std.mem.Allocator) !?Listed {
+        return w.listFor(arena, null, null);
+    }
+
+    /// The list as `asker` is asked about it: each file names who wrote it
+    /// (`(agent:helper, chat/h1)`, `(who unknown)` for one from harness
+    /// 0.3) unless that is the asker. With `view` (what a networked
+    /// sandbox mounts, gap 2), only the files it can see; counted ones stay
+    /// counted. Null when nothing is listed.
+    pub fn listFor(w: *Written, arena: std.mem.Allocator, asker: ?Writer, view: ?[]const folders_mod.Mount) !?Listed {
         w.mutex.lockUncancelable(w.io);
         defer w.mutex.unlock(w.io);
-        const n = w.items.items.len;
-        if (n == 0 and w.more == 0) return null;
         var out: std.ArrayList(u8) = .empty;
-        for (w.items.items[0..@min(n, shown)], 0..) |e, i| {
-            if (i > 0) try out.appendSlice(arena, ", ");
+        var n: usize = 0;
+        for (w.items.items) |e| {
+            if (view) |v| if (!folders_mod.sees(v, e.path)) continue;
+            n += 1;
+            if (n > shown) continue;
+            if (n > 1) try out.appendSlice(arena, ", ");
             // a name is the model's: no line breaks in the question from it
             for (util.cut(e.path, 200)) |ch| try out.append(arena, if (ch < 0x20 or ch == 0x7f) '?' else ch);
+            try out.appendSlice(arena, try writerNote(arena, e.writer, asker));
         }
+        if (n == 0 and w.more == 0) return null;
         const rest = n -| shown + w.more;
         if (rest > 0) try out.print(arena, "{s}{d} more", .{ if (out.items.len > 0) " and " else "", rest });
         return .{ .text = out.items, .upto = w.seq };
     }
 
+    /// " (WHO, RUN)" for a file someone other than `asker` wrote.
+    fn writerNote(arena: std.mem.Allocator, writer: []const u8, asker: ?Writer) ![]const u8 {
+        if (writer.len == 0) return " (who unknown)";
+        const sp = std.mem.indexOfScalar(u8, writer, ' ');
+        const who = writer[0 .. sp orelse writer.len];
+        const run = if (sp) |i| writer[i + 1 ..] else "";
+        if (asker) |as| if (std.mem.eql(u8, who, as.who) and std.mem.eql(u8, run, util.cut(as.run, 120))) return "";
+        return if (run.len == 0) try std.fmt.allocPrint(arena, " ({s})", .{who}) else try std.fmt.allocPrint(arena, " ({s}, {s})", .{ who, run });
+    }
+
     /// The owner allowed a command after seeing the files written up to
     /// write `upto`: those are no longer listed (one written again since is).
     pub fn clear(w: *Written, upto: u64) void {
+        w.clearIn(upto, null);
+    }
+
+    /// `clear` for a command asked about with `view`: the files it could
+    /// not see stay listed for the next command on the host.
+    pub fn clearIn(w: *Written, upto: u64, view: ?[]const folders_mod.Mount) void {
         w.mutex.lockUncancelable(w.io);
         defer w.mutex.unlock(w.io);
         var i: usize = 0;
         while (i < w.items.items.len) {
             const e = w.items.items[i];
-            if (e.seq <= upto) {
+            const seen = if (view) |v| folders_mod.sees(v, e.path) else true;
+            if (e.seq <= upto and seen) {
                 w.gpa.free(e.path);
+                w.gpa.free(e.writer);
                 _ = w.items.orderedRemove(i);
             } else i += 1;
         }
-        if (w.more_seq <= upto) w.more = 0;
+        if (view == null and w.more_seq <= upto) w.more = 0;
         w.save();
     }
 
-    /// One path a line; "/more N" (never a path inside the workspace) for
-    /// those only counted, and for names with a line break. Under the
-    /// mutex; a failed save keeps the list in memory all the same.
+    /// `file_head`, then a file a line (path, then who and run; escaped),
+    /// then "/more N" (never a path: those are escaped) for those only
+    /// counted. Under the mutex; a failed save keeps the list in memory
+    /// all the same.
     fn save(w: *Written) void {
         if (w.path.len == 0) return;
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(w.gpa);
-        var counted = w.more;
+        out.appendSlice(w.gpa, file_head) catch return;
         for (w.items.items) |e| {
-            if (std.mem.indexOfAny(u8, e.path, "\r\n") != null) {
-                counted += 1;
-                continue;
-            }
-            out.print(w.gpa, "{s}\n", .{e.path}) catch return;
+            util.escapeField(&out, w.gpa, e.path) catch return;
+            out.append(w.gpa, '\t') catch return;
+            util.escapeField(&out, w.gpa, e.writer) catch return;
+            out.append(w.gpa, '\n') catch return;
         }
-        if (counted > 0) out.print(w.gpa, "/more {d}\n", .{counted}) catch return;
+        if (w.more > 0) out.print(w.gpa, "/more {d}\n", .{w.more}) catch return;
         Io.Dir.cwd().writeFile(w.io, .{ .sub_path = w.path, .data = out.items, .flags = .{ .permissions = util.private_file } }) catch {};
     }
 
     fn load(w: *Written) void {
         const text = Io.Dir.cwd().readFileAlloc(w.io, w.path, w.gpa, .limited(1 << 20)) catch return;
         defer w.gpa.free(text);
+        // without the first line, harness 0.3's: a path a line, writer unknown
+        const named = std.mem.startsWith(u8, text, "#");
         var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |line| {
-            if (line.len == 0) continue;
+            if (line.len == 0 or (named and line[0] == '#')) continue;
             if (std.mem.startsWith(u8, line, "/more ")) {
                 const k = std.fmt.parseInt(usize, line[6..], 10) catch 1;
                 w.seq += 1;
@@ -1715,7 +2012,20 @@ pub const Written = struct {
                 w.more_seq = w.seq;
                 continue;
             }
-            w.note(line);
+            if (!named) {
+                w.note(line, "");
+                continue;
+            }
+            const tab = std.mem.indexOfScalar(u8, line, '\t') orelse line.len;
+            const p = util.unescapeField(w.gpa, line[0..tab]) catch {
+                w.seq += 1;
+                w.counted();
+                continue;
+            };
+            defer w.gpa.free(p);
+            const by = util.unescapeField(w.gpa, if (tab < line.len) line[tab + 1 ..] else "") catch "";
+            defer if (by.len > 0) w.gpa.free(by);
+            w.note(p, by);
         }
     }
 };
@@ -3721,4 +4031,249 @@ test "web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log" {
     try t.expect(std.mem.indexOf(u8, lt, "fake-Pass-7351!") == null);
     // the browser is gone with the turn
     try t.expect(f.run.web == null);
+}
+
+const folders_t = folders_mod;
+const is_windows_t = @import("builtin").os.tag == .windows;
+
+test "a_role_refusal_is_final_and_nothing_is_asked" {
+    var f: Fix = undefined;
+    try f.init("allow write_file *\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fs = try folders_t.parse(a, "[notes]\nwrite = agent:coder\n");
+    f.g.folders = &fs;
+    try f.grants.add(.write_file, "notes/a.md", util.nowSeconds(t.io) + 5000);
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/a.md\",\"content\":\"x\"}"));
+    try f.e.script(2, model.textReply("refused"));
+    const r1 = try f.say("write it");
+    freeResult(&f.run, r1);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: folders.ini [notes] write: agent:main is not listed") != null);
+    try t.expectEqual(0, f.asked);
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "ws/notes/a.md", .{}));
+    // where nobody can answer, it is not listed as skipped either
+    var skipped: Skipped = .init(t.allocator);
+    defer skipped.deinit();
+    f.run.skipped = &skipped;
+    f.run.scheduled = true;
+    try f.e.script(3, model.toolReply("tu_2", "write_file", "{\"path\":\"notes/a.md\",\"content\":\"x\"}"));
+    try f.e.script(4, model.textReply("refused again"));
+    const r2 = try f.say("write it again");
+    freeResult(&f.run, r2);
+    try t.expectEqualStrings("", try skipped.text(t.io, a));
+}
+
+test "shell_starts_in_its_dir_and_the_question_and_lines_name_it" {
+    if (is_windows_t) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fs = try folders_t.parse(a, "[/]\nread = owner\n");
+    f.g.folders = &fs;
+    try f.e.tmp.dir.createDirPath(t.io, "ws/work");
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"pwd\",\"dir\":\"work\"}"));
+    try f.e.script(2, model.textReply("there"));
+    const r = try f.say("where");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    try t.expectEqualStrings("shell: pwd (in work)", f.last_what);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "ws/work\\n") != null);
+    const lt = try f.logText();
+    try t.expect(std.mem.indexOf(u8, lt, "\"tool\":\"shell\",\"decision\":\"allow\",\"why\":\"allowed once by the owner\",\"arg\":\"pwd\",\"dir\":\"work\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "\"tool\":\"shell\",\"arg\":\"pwd\",\"dir\":\"work\",\"is_error\":false") != null);
+    // shell offers dir where folders.ini has a section
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "\"dir\"") != null);
+}
+
+test "without_folders_ini_shell_offers_no_dir" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.e.script(1, model.textReply("hi"));
+    const r = try f.say("hello");
+    freeResult(&f.run, r);
+    const req1 = try f.e.request(1);
+    try t.expect(std.mem.indexOf(u8, req1, "\"name\":\"shell\"") != null);
+    try t.expect(std.mem.indexOf(u8, req1, "\"dir\"") == null);
+}
+
+test "folder_vars_reach_a_host_command_masked" {
+    var f: Fix = undefined;
+    try f.init("allow shell *\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const value = "sk_test_51Hq3vY2eZvKYlo2C";
+    const store: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    try store.put(t.io, "stripe-test", value);
+    f.run.store = store;
+    const fs = try folders_t.parse(a, "[work]\nvars = STRIPE_KEY:stripe-test\n[work/x]\nvars = MISSING_KEY:nope\n");
+    f.g.folders = &fs;
+    try f.e.tmp.dir.createDirPath(t.io, "ws/work/x");
+    const echo = if (is_windows_t) "echo k=%STRIPE_KEY%." else "echo k=$STRIPE_KEY.";
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"" ++ echo ++ "\",\"dir\":\"work\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "shell", "{\"command\":\"" ++ echo ++ "\"}"));
+    try f.e.script(3, model.toolReply("tu_3", "shell", "{\"command\":\"" ++ echo ++ "\",\"dir\":\"work/x\"}"));
+    try f.e.script(4, model.textReply("done"));
+    const r = try f.say("use the key");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "k=[secret:stripe-test].") != null);
+    // started in the workspace, the command gets no folder's variables
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), if (is_windows_t) "k=%STRIPE_KEY%." else "k=.") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "refused by the gate: folders.ini [work/x] vars: secret nope is not stored (harness secret add nope)") != null);
+    try t.expectEqual(0, f.asked);
+    for (1..5) |n| try t.expect(std.mem.indexOf(u8, try f.e.request(@intCast(n)), value) == null);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), value) == null);
+    // no secret crosses into a sandbox
+    try t.expectEqual(0, (try folderVars(&f.run, a, "box", "work")).vars.len);
+}
+
+test "written_entries_name_who_wrote_them" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(t.io, ".", a), "written" });
+    const asker: Written.Writer = .{ .who = "agent:main", .run = "chat" };
+    const want = "notes/a.md (agent:helper, chat/h1), b.py, odd?name?.txt (agent:main, task build)";
+    {
+        var w: Written = .init(t.allocator, t.io, path);
+        defer w.deinit();
+        w.addBy("notes/a.md", "agent:helper", "chat/h1");
+        w.addBy("b.py", "agent:main", "chat");
+        w.addBy("odd\tname\n.txt", "agent:main", "task build");
+        try t.expectEqualStrings(want, (try w.listFor(a, asker, null)).?.text);
+    }
+    // kept across a restart
+    var again: Written = .init(t.allocator, t.io, path);
+    defer again.deinit();
+    try t.expectEqualStrings(want, (try again.listFor(a, asker, null)).?.text);
+    // a file from harness 0.3: a path a line, who wrote them unknown
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "written", .data = "x.py\nold dir/y.txt\n/more 2\n" });
+    var old: Written = .init(t.allocator, t.io, path);
+    defer old.deinit();
+    try t.expectEqualStrings("x.py (who unknown), old dir/y.txt (who unknown) and 2 more", (try old.listFor(a, asker, null)).?.text);
+}
+
+test "a_networked_sandbox_is_asked_only_about_files_it_can_see" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var w: Written = .init(t.allocator, t.io, "");
+    defer w.deinit();
+    w.addBy("private/k", "agent:main", "chat");
+    w.addBy("notes/a", "agent:helper", "chat/h1");
+    const asker: Written.Writer = .{ .who = "agent:main", .run = "chat" };
+    // a stand-in for gap 2's networked sandbox: what it mounts
+    const view = [_]folders_mod.Mount{ .{ .folder = "", .access = .read }, .{ .folder = "private", .access = .none } };
+    const seen = (try w.listFor(a, asker, &view)).?;
+    try t.expectEqualStrings("notes/a (agent:helper, chat/h1)", seen.text);
+    // allowed after seeing those: the others stay listed for the host
+    w.clearIn(seen.upto, &view);
+    try t.expectEqualStrings("private/k", (try w.listFor(a, asker, null)).?.text);
+    const blind = [_]folders_mod.Mount{.{ .folder = "", .access = .none }};
+    try t.expectEqual(null, try w.listFor(a, asker, &blind));
+}
+
+test "a_helpers_write_is_named_in_the_next_question" {
+    var f: Fix = undefined;
+    try f.init("allow shell echo *\n");
+    defer f.deinit();
+    try withHelpers(&f);
+    var written: Written = .init(t.allocator, t.io, "");
+    defer written.deinit();
+    f.run.written = &written;
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"write h\",\"tools\":[\"write_file\"]}]}"));
+    try f.e.script(2, model.toolReply("h1", "write_file", "{\"path\":\"notes/h.md\",\"content\":\"x\"}"));
+    try f.e.script(3, model.textReply("written"));
+    try f.e.script(4, model.toolReply("tu_2", "shell", "{\"command\":\"echo x\"}"));
+    try f.e.script(5, model.textReply("done"));
+    const r = try f.say("go");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    if (!std.mem.endsWith(u8, f.last_what, "since you last allowed a command: notes/h.md (agent:helper, chat/h1)")) std.debug.print("asked: {s}\n", .{f.last_what});
+    try t.expect(std.mem.endsWith(u8, f.last_what, "since you last allowed a command: notes/h.md (agent:helper, chat/h1)"));
+}
+
+const snapshots_t = @import("snapshots.zig");
+
+/// folders.ini and a snapshot store for the Fix's runs.
+fn withSnapshots(f: *Fix, folders_text: []const u8) !*snapshots_t.Store {
+    const a = f.e.arena.allocator();
+    const fs = try a.create(folders_mod.Folders);
+    fs.* = try folders_mod.parse(a, folders_text);
+    f.g.folders = fs;
+    const st = try a.create(snapshots_t.Store);
+    st.* = .{ .gpa = t.allocator, .io = t.io, .dir = try std.fs.path.join(a, &.{ f.e.dir, "snapshots" }), .log = &f.log, .env_root = try std.fs.path.join(a, &.{ f.e.dir, "state", "env" }) };
+    f.run.snaps = st;
+    return st;
+}
+
+test "a_snapshot_is_taken_before_the_first_change_and_at_the_end" {
+    var f: Fix = undefined;
+    try f.init("allow shell echo *\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const st = try withSnapshots(&f, "[notes]\nsnapshots = on\n");
+    defer st.deinit();
+    try f.e.tmp.dir.createDirPath(t.io, "ws/notes");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/notes/old.txt", .data = "old" });
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/a.txt\",\"content\":\"a\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "write_file", "{\"path\":\"notes/b.txt\",\"content\":\"b\"}"));
+    try f.e.script(3, model.toolReply("tu_3", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(4, model.textReply("done"));
+    const r1 = try f.say("write two notes");
+    freeResult(&f.run, r1);
+    const infos = try st.list(a, "notes");
+    try t.expectEqual(2, infos.len);
+    try t.expectEqual(.before, infos[0].when);
+    try t.expectEqual(1, infos[0].files);
+    try t.expectEqual(.after, infos[1].when);
+    try t.expectEqual(3, infos[1].files);
+    try t.expectEqualStrings("chat", infos[1].run);
+    try t.expectEqualStrings("main", infos[1].agent);
+    try t.expectEqualStrings("owner", infos[1].by);
+    // the before was taken before the first write ran
+    const lt = try f.logText();
+    const snap_at = std.mem.indexOf(u8, lt, "\"event\":\"snapshot\",\"folder\":\"notes\",\"id\":1,\"when\":\"before\"").?;
+    const write_at = std.mem.indexOf(u8, lt, "\"tool\":\"write_file\",\"arg\":\"notes/a.txt\"").?;
+    try t.expect(snap_at < write_at);
+    // a turn that changes nothing takes none
+    try f.e.script(5, model.textReply("nothing to do"));
+    const r2 = try f.say("anything?");
+    freeResult(&f.run, r2);
+    try t.expectEqual(2, (try st.list(a, "notes")).len);
+}
+
+test "the_snapshot_tool_takes_one_with_its_label" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const st = try withSnapshots(&f, "[notes]\nread = owner\n");
+    defer st.deinit();
+    try f.e.tmp.dir.createDirPath(t.io, "ws/notes");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/notes/a.txt", .data = "a" });
+    try f.e.tmp.dir.createDirPath(t.io, "state/env/box/home");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "state/env/box/home/h.txt", .data = "h" });
+    try f.e.script(1, model.toolReply("tu_1", "snapshot", "{\"folder\":\"notes\",\"label\":\"before the edit\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "snapshot", "{\"folder\":\"env:box\"}"));
+    try f.e.script(3, model.toolReply("tu_3", "snapshot", "{\"folder\":\"env:nobox\"}"));
+    try f.e.script(4, model.toolReply("tu_4", "restore", "{\"folder\":\"notes\",\"id\":1}"));
+    try f.e.script(5, model.textReply("done"));
+    const r = try f.say("keep a copy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "\"name\":\"snapshot\"") != null);
+    const notes = try st.list(a, "notes");
+    try t.expectEqual(1, notes.len);
+    try t.expectEqual(.tool, notes[0].when);
+    try t.expectEqualStrings("before the edit", notes[0].label);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "Took snapshot 1 of notes") != null);
+    const home = try st.list(a, "env:box");
+    try t.expectEqual(1, home.len);
+    try t.expectEqual(1, home[0].files);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "not taken: no environment nobox") != null);
+    // no tool restores
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), "no such tool") != null);
 }
