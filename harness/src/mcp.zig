@@ -283,6 +283,9 @@ pub const StartOptions = struct {
     /// `secret_values[i]` is the value for `cfg.secrets[i]`.
     secret_values: []const []const u8,
     start_timeout_ms: u32 = 20000,
+    /// When the start must be over (awake clock, ns), spawning included;
+    /// several servers started together share one. 0: `start_timeout_ms`.
+    deadline_ns: i128 = 0,
     /// When start fails, the end of the server's stderr goes here.
     diag: ?*Diag = null,
     /// Set: the start ends at once (error.Stopped).
@@ -373,7 +376,8 @@ pub const Server = struct {
         s.child.stdout = null;
         s.child.stderr = null;
         errdefer {
-            s.shutdown();
+            // it never answered: no grace for it
+            s.shutdownWith(0);
             if (opts.diag) |d| {
                 @memcpy(d.buf[0..s.err_len], s.err_tail[0..s.err_len]);
                 d.len = s.err_len;
@@ -387,7 +391,7 @@ pub const Server = struct {
 
         var never: std.atomic.Value(bool) = .init(false);
         const stop = opts.stop orelse &never;
-        const deadline = nowNs(io) + @as(i128, opts.start_timeout_ms) * std.time.ns_per_ms;
+        const deadline = if (opts.deadline_ns > 0) opts.deadline_ns else nowNs(io) + @as(i128, opts.start_timeout_ms) * std.time.ns_per_ms;
         const init_raw = try s.request(tmp, "initialize", "{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"harness\",\"version\":\"" ++ @import("build_options").version ++ "\"}}", stop, deadline);
         const init_v = jv.parse(tmp, init_raw) orelse return error.BadResponse;
         if (jv.get(init_v, "result") == null) return error.InitFailed;
@@ -508,13 +512,29 @@ pub const Server = struct {
     }
 
     fn shutdown(s: *Server) void {
-        const io = s.io;
-        s.write_mutex.lockUncancelable(io);
-        if (s.stdin) |f| f.close(io);
+        s.shutdownWith(500);
+    }
+
+    /// Closes stdin: a server that reads it ends on its own.
+    fn closeInput(s: *Server) void {
+        s.write_mutex.lockUncancelable(s.io);
+        if (s.stdin) |f| f.close(s.io);
         s.stdin = null;
-        s.write_mutex.unlock(io);
+        s.write_mutex.unlock(s.io);
+    }
+
+    /// Ended (its output closed), or never had a reader.
+    fn outputClosed(s: *Server) bool {
+        return s.eof.load(.acquire) or s.th_out == null;
+    }
+
+    /// Closes stdin, waits up to `grace_ms` for the server to end, then
+    /// kills its group and waits for it.
+    fn shutdownWith(s: *Server, grace_ms: u32) void {
+        const io = s.io;
+        s.closeInput();
         var waited: u32 = 0;
-        while (!s.eof.load(.acquire) and s.th_out != null and waited < 500) : (waited += 10) io.sleep(.fromMilliseconds(10), .awake) catch {};
+        while (!s.outputClosed() and waited < grace_ms) : (waited += 10) io.sleep(.fromMilliseconds(10), .awake) catch {};
         // the whole group, so whatever it started goes too
         killTree(s.pid);
         _ = s.child.wait(io) catch {};
@@ -694,6 +714,29 @@ fn validToolName(name: []const u8) bool {
 }
 
 /// The process group on POSIX; the process itself on Windows.
+/// Stops servers, each with its group, and frees them: all are told
+/// together (their stdin closed) and share one grace, so stopping many
+/// takes no longer than stopping one.
+pub fn stopAll(servers: []const *Server) void {
+    if (servers.len == 0) return;
+    const io = servers[0].io;
+    for (servers) |srv| srv.closeInput();
+    const until = nowNs(io) + 500 * std.time.ns_per_ms;
+    while (nowNs(io) < until) {
+        var open = false;
+        for (servers) |srv| if (!srv.outputClosed()) {
+            open = true;
+            break;
+        };
+        if (!open) break;
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    for (servers) |srv| {
+        srv.shutdownWith(0);
+        srv.free();
+    }
+}
+
 fn killTree(id: std.process.Child.Id) void {
     if (is_windows) {
         _ = TerminateProcess(id, 1);
@@ -1035,6 +1078,66 @@ test "after_a_timeout_the_next_call_gets_its_own_answer" {
     // the server answers "slept" for the old call first; that must be dropped
     const r = try f.call(s, "echo", "{\"text\":\"mine\"}", 5000);
     try t.expectEqualStrings("mine", r.text);
+}
+
+test "a_start_ends_by_its_deadline_counted_from_before_the_spawn" {
+    if (is_windows) return error.SkipZigTest;
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const t0 = nowMs();
+    // up after a second: past a deadline 0.4 s from before it was spawned
+    const r = Server.start(t.allocator, t.io, .{ .name = "late", .command = try std.fmt.allocPrint(f.a(), "/bin/sh -c \"sleep 1; exec '{s}' --mcp\"", .{f.fake}), .secrets = &.{}, .money = &.{} }, .{
+        .cwd = f.ws,
+        .path_var = "/usr/bin:/bin",
+        .home = "/home/tester",
+        .secret_values = &.{},
+        .deadline_ns = Io.Clock.awake.now(t.io).nanoseconds + 400 * std.time.ns_per_ms,
+    });
+    if (r) |srv| {
+        srv.deinit();
+        return error.TestUnexpectedResult;
+    } else |e| try t.expectEqual(error.Timeout, e);
+    try t.expect(nowMs() - t0 < 900);
+}
+
+test "a_server_that_never_started_is_ended_at_once" {
+    if (is_windows) return error.SkipZigTest;
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const t0 = nowMs();
+    // never answers, and a closed input doesn't end it: no grace for it
+    const r = Server.start(t.allocator, t.io, .{ .name = "mute", .command = "/bin/sh -c \"exec sleep 30\"", .secrets = &.{}, .money = &.{} }, .{
+        .cwd = f.ws,
+        .path_var = "/usr/bin:/bin",
+        .home = "/home/tester",
+        .secret_values = &.{},
+        .deadline_ns = Io.Clock.awake.now(t.io).nanoseconds + 200 * std.time.ns_per_ms,
+    });
+    if (r) |srv| {
+        srv.deinit();
+        return error.TestUnexpectedResult;
+    } else |e| try t.expectEqual(error.Timeout, e);
+    const took = nowMs() - t0;
+    if (took >= 500) std.debug.print("a start that timed out after 200 ms took {d} ms\n", .{took});
+    try t.expect(took < 500);
+}
+
+test "servers_are_stopped_together" {
+    if (is_windows) return error.SkipZigTest;
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    // each keeps its output open after its input closes: each waits out
+    // the grace, so one after another three would take three of them
+    var list: [3]*Server = undefined;
+    for (&list) |*s| s.* = try f.startWith(try std.fmt.allocPrint(f.a(), "/bin/sh -c \"'{s}' --mcp; exec sleep 30\"", .{f.fake}), &.{}, &.{});
+    const t0 = nowMs();
+    stopAll(&list);
+    const took = nowMs() - t0;
+    if (took >= 1100) std.debug.print("stopping three servers took {d} ms\n", .{took});
+    try t.expect(took < 1100);
 }
 
 test "deinit_leaves_no_process_behind" {

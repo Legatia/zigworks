@@ -1177,6 +1177,9 @@ pub const Core = struct {
         values: []const []const u8 = &.{},
         dir: []const u8 = "",
         timeout_ms: u32 = 0,
+        /// The start of every server ends by this (awake clock, ns),
+        /// spawning included.
+        deadline_ns: i128 = 0,
         stop: *std.atomic.Value(bool),
         /// Why it was not even tried.
         skipped: ?[]const u8 = null,
@@ -1193,6 +1196,7 @@ pub const Core = struct {
                 .system_vars = c.system_vars,
                 .secret_values = st.values,
                 .start_timeout_ms = st.timeout_ms,
+                .deadline_ns = st.deadline_ns,
                 .diag = &st.diag,
                 .stop = st.stop,
             }) catch |e| {
@@ -1246,6 +1250,7 @@ pub const Core = struct {
             };
             const left_ms = @divFloor(deadline - Io.Clock.awake.now(c.io).nanoseconds, std.time.ns_per_ms);
             st.timeout_ms = @intCast(std.math.clamp(left_ms, 1, std.math.maxInt(u32)));
+            st.deadline_ns = deadline;
             th.* = std.Thread.spawn(.{}, McpStart.run, .{st}) catch blk: {
                 st.run();
                 break :blk null;
@@ -1336,7 +1341,8 @@ pub const Core = struct {
             break :blk l;
         };
         var servers = list;
-        for (servers.items) |srv| srv.deinit();
+        // together: one grace for all, not one each
+        mcp.stopAll(servers.items);
         servers.deinit(c.gpa);
         c.mcp_tools = &.{};
         c.mcp_note = "";
@@ -3992,11 +3998,12 @@ test "mcp_servers_start_together_under_one_deadline" {
     try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
     const took_ms = @divFloor(Io.Clock.awake.now(t.io).nanoseconds - t0, std.time.ns_per_ms);
     // together: both two-second servers are up by the 3 s deadline (one
-    // after another, the second would be cut at it). The time only
-    // catches a hang: ending the servers took over 3 s more on a slow CI
-    // runner
-    if (took_ms >= 15000) std.debug.print("reload took {d} ms; notes:\n{s}\n", .{ took_ms, f.core.mcp_note });
-    try t.expect(took_ms < 15000);
+    // after another, the second would be cut at it), and the one that
+    // never answers costs the deadline, no more: spawning counts against
+    // it and a server that never started is ended at once (on a slow CI
+    // runner both used to add over 3 s)
+    if (took_ms >= 4000) std.debug.print("reload took {d} ms; notes:\n{s}\n", .{ took_ms, f.core.mcp_note });
+    try t.expect(took_ms < 4000);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "one (3 tools)") != null);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "two (3 tools)") != null);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "mute: did not start (Timeout)") != null);
@@ -4020,13 +4027,14 @@ test "reload_holds_no_lock_while_servers_start_and_stop_cuts_it_short" {
     f.core.last_status_s = 0;
     f.core.tick();
     const t1 = Io.Clock.awake.now(t.io).nanoseconds - t0;
-    if (t1 >= 4000 * std.time.ns_per_ms) std.debug.print("stop and tick took {d} ms\n", .{@divFloor(t1, std.time.ns_per_ms)});
-    try t.expect(t1 < 4000 * std.time.ns_per_ms);
+    if (t1 >= 1500 * std.time.ns_per_ms) std.debug.print("stop and tick took {d} ms\n", .{@divFloor(t1, std.time.ns_per_ms)});
+    try t.expect(t1 < 1500 * std.time.ns_per_ms);
     th.join();
-    // and the stop ended the start instead of waiting it out (8 s)
+    // and the stop ended the start instead of waiting it out (8 s): a
+    // server that never started is ended at once
     const t2 = Io.Clock.awake.now(t.io).nanoseconds - t0;
-    if (t2 >= 6000 * std.time.ns_per_ms) std.debug.print("reload ended after {d} ms\n", .{@divFloor(t2, std.time.ns_per_ms)});
-    try t.expect(t2 < 6000 * std.time.ns_per_ms);
+    if (t2 >= 2800 * std.time.ns_per_ms) std.debug.print("reload ended after {d} ms\n", .{@divFloor(t2, std.time.ns_per_ms)});
+    try t.expect(t2 < 2800 * std.time.ns_per_ms);
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "slow: did not start (Stopped)") != null);
 }
 
