@@ -36,7 +36,9 @@ pub const Def = struct {
     name: []const u8,
     /// One line: when to use it.
     description: []const u8,
-    /// An omnigate route; "": `[model] model`, or `worker_model` when delegated.
+    /// A model value: `PROVIDER:MODEL`, or a model of `[model] provider`
+    /// (`model.Providers.pick`); "": `[model] model`, or `worker_model`
+    /// when delegated.
     model: []const u8 = "",
     /// Tool names, `server/tool`, `server/*`, `*` for all.
     tools: []const []const u8 = &default_tools,
@@ -147,7 +149,7 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, text: []const u8, diag: *Di
                 d.description = v;
             },
             .model => {
-                if (v.len == 0 or v.len > 128 or std.mem.indexOfAny(u8, v, " \t") != null or hasControl(v)) return fail(diag, f.line, "model is an omnigate route's name");
+                if (v.len == 0 or v.len > 128 or std.mem.indexOfAny(u8, v, " \t") != null or hasControl(v)) return fail(diag, f.line, "model is a model's name, or PROVIDER:MODEL");
                 d.model = v;
             },
             .tools => d.tools = try readList(a, v, diag, f.line, .tools),

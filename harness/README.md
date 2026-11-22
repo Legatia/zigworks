@@ -29,7 +29,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 581 unit tests (2 skipped), among
+**State: 0.3.0, tested on macOS by its own tests: 584 unit tests (2 skipped), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 69 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram, feeds,
@@ -93,7 +93,8 @@ auth = none                      ; x-api-key | bearer | none
 ```
 
 A model value is `PROVIDER:MODEL`, or a model of `[model] provider`:
-`model`, `worker_model` and `memory_model`, and later agent definitions and
+`model`, `worker_model`, `memory_model` and an agent definition's `model`
+(its runs in conversations, its tasks and its delegated runs), and later
 workflow steps. The part before the first `:` names a provider only when
 one has that name, so `llama3.1:8b` is a model of the default provider and
 `local:llama3.1:8b` is model `llama3.1:8b` at `local`.
@@ -626,7 +627,7 @@ Research one question at a time. Use at least two independent sources.
 |---|---|---|
 | `name` | the file's name: a-z, 0-9 and `-` (up to 64), not `list`, `show` or `rm` | required |
 | `description` | one line: when to use it | required |
-| `model` | an omnigate route | `[model] model`; delegated: `worker_model` |
+| `model` | a model of `[model] provider`, or `PROVIDER:MODEL` (see Models and providers); a provider without its stored key refuses its runs with one line naming the secret to add | `[model] model`; delegated: `worker_model` (`strong`: `[model] model`) |
 | `tools` | tool names, `server/tool`, `server/*`, `*` for all, `none` | search, fetch, browse, read_file, recall, skill |
 | `skills` | skill names or patterns (`zig-*`), `*`, `none` | `*` |
 | `memory` | `shared` (pinned items, the strongest, what a message recalls) or `pinned` | `shared` |

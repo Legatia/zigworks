@@ -2799,12 +2799,10 @@ fn helperRun(h: *Helper) !void {
         return;
     }
     const left = @max(h.deadline_s - p.now(), 1);
-    // `strong`: the main model; else the definition's, else the workers'
+    // `strong`: the main model; else the definition's, else the workers';
+    // each at the provider the value names
     const route = if (h.task.strong) cfg.main else if (d.model.len > 0) d.model else cfg.worker;
-    var client = if (!h.task.strong and d.model.len > 0)
-        try model.Client.init(p.gpa, p.io, cfg.url, cfg.key, route, cfg.max_tokens)
-    else
-        try p.modelClient(route, cfg.max_tokens);
+    var client = try p.modelClient(route, cfg.max_tokens);
     defer client.deinit();
     var label_buf: [64]u8 = undefined;
     var w = p.*;
@@ -5436,4 +5434,48 @@ test "a_helper_runs_on_the_provider_its_value_names" {
     const parent = try f.e.request(3);
     try t.expectEqualStrings("/v1/messages", jv.str(jv.get(jv.parse(a, parent).?, "target")).?);
     try t.expect(std.mem.indexOf(u8, parent, "helper answer") != null);
+}
+
+test "a_delegated_definition_uses_its_own_provider" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    const local_url = try std.fmt.allocPrint(a, "{s}/v1", .{try f.e.url()});
+    const set = try model.Providers.resolve(a, .{
+        .omnigate_url = try f.e.url(),
+        .sections = &.{.{ .name = "local", .api = .openai, .url = local_url }},
+    }, .{ .get = helperKeys });
+    f.run.model_cfg.?.providers = &set;
+    // the delegating run is on omnigate; researcher's model is at local
+    var defs = try defsWith(&f, &.{.{ "researcher", "---\nname: researcher\ndescription: Research across sources.\nmodel: local:gpt-r\ntools: recall\n---\nResearch with two sources.\n" }});
+    defer defs.deinit();
+    f.run.defs = &defs;
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"find zig news\",\"agent\":\"researcher\"}]}"));
+    try f.e.script(2, model.oaTextReply("Two sources agree."));
+    try f.e.script(3, model.textReply("Combined."));
+    const r = try f.say("research");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Combined.", r.text);
+    // the helper: its definition's model at that model's provider, with its key
+    const helper = jv.parse(a, try f.e.request(2)).?;
+    try t.expectEqualStrings("/v1/chat/completions", jv.str(jv.get(helper, "target")).?);
+    try t.expectEqualStrings("gpt-r", jv.str(jv.at(helper, &.{ "body", "model" })).?);
+    try t.expectEqualStrings("Bearer sk-local-test-1", jv.str(jv.at(helper, &.{ "headers", "Authorization" })).?);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "Research with two sources.") != null);
+    // the run that delegated it stays on its own provider
+    const parent = try f.e.request(3);
+    try t.expectEqualStrings("/v1/messages", jv.str(jv.get(jv.parse(a, parent).?, "target")).?);
+    try t.expect(std.mem.indexOf(u8, parent, "Two sources agree.") != null);
+    // strong: [model] model, whatever the definition names
+    try f.e.script(4, model.toolReply("tu_2", "delegate", "{\"tasks\":[{\"task\":\"check it\",\"agent\":\"researcher\",\"strong\":true}]}"));
+    try f.e.script(5, model.textReply("Checked."));
+    try f.e.script(6, model.textReply("Done."));
+    const r2 = try f.say("check it again");
+    defer freeResult(&f.run, r2);
+    try t.expectEqualStrings("Done.", r2.text);
+    const strong = jv.parse(a, try f.e.request(5)).?;
+    try t.expectEqualStrings("/v1/messages", jv.str(jv.get(strong, "target")).?);
+    try t.expectEqualStrings("claude-test", jv.str(jv.at(strong, &.{ "body", "model" })).?);
 }

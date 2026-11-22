@@ -2730,14 +2730,18 @@ pub const Core = struct {
         c.helper_pool.takeAlways(c.io, def.name);
         defer c.helper_pool.give(c.io, def.name);
         var ask: ChatAsk = .{ .core = c, .flag = &flag, .conv = conv };
-        var run = c.runIn(&c.chat_client, "chat", .{ .agent = def.name }, conv, &flag);
+        // its model: [model] model on the chat's client, or the one it
+        // names on a client of that model's provider
+        var def_client: ?model.Client = null;
+        if (def.model.len > 0) def_client = c.modelClient(def.model, c.cfg.model.max_tokens) catch |e| {
+            var buf: [128]u8 = undefined;
+            c.sayIn(conv, std.fmt.bufPrint(&buf, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
+            return;
+        };
+        defer if (def_client) |*dc| dc.deinit();
+        var run = c.runIn(if (def_client) |*dc| dc else &c.chat_client, "chat", .{ .agent = def.name }, conv, &flag);
         run.useDefinition(def);
         run.holds_place = true;
-        // its model for this turn (the chat worker is the client's only
-        // user); the client's own is the model its provider was opened for
-        const chat_model = c.chat_client.model;
-        if (def.model.len > 0) c.chat_client.model = def.model;
-        defer c.chat_client.model = chat_model;
         run.context_note = c.contextNote(arena.allocator(), conv) catch "";
         if (note) |n| run.context_note = std.fmt.allocPrint(arena.allocator(), "{s}\n{s}", .{ run.context_note, n }) catch run.context_note;
         run.asker = .{ .ctx = &ask, .ask = askOwner };
@@ -3766,10 +3770,8 @@ pub const Core = struct {
             c.say(try std.fmt.allocPrint(a, "Task {s} names agent {s}, which is not defined; it did not run.", .{ tk.name, tk.agent }));
             return .done;
         };
-        var client = if (def.model.len > 0)
-            try model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", def.model, c.cfg.model.max_tokens)
-        else
-            try c.modelClient(c.cfg.model.model, c.cfg.model.max_tokens);
+        // its model, else [model] model, at the provider the value names
+        var client = try c.modelClient(if (def.model.len > 0) def.model else c.cfg.model.model, c.cfg.model.max_tokens);
         defer client.deinit();
         // a place of its definition; with none free it runs at a later tick
         if (!c.helper_pool.take(c.io, def.name, def.parallel)) return .later;
@@ -8914,4 +8916,79 @@ test "a_task_pauses_when_any_provider_says_its_budget_is_spent" {
     try f.e.script(1, "{\"status\":402}");
     _ = try f.core.runTask(f.core.tasks[0]);
     try f.rec.waitFor("Task watch is paused: model budget used up.");
+}
+
+// ---- definitions on providers ----
+
+test "a_definition_can_name_a_provider_for_its_model" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const url = try f.e.url();
+    // fakeoai: an OpenAI-format gateway at the fake server, its key stored
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.fmt.allocPrint(a, "[model]\nurl = {s}\n[provider fakeoai]\napi = openai\nurl = {s}/v1\n[search]\nurl = {s}\n", .{ url, url, url }) });
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    f.core.store = st;
+    try st.put(t.io, "fakeoai", "sk-fakeoai-test-1");
+    try addDefinition(&f, "researcher", "---\nname: researcher\ndescription: Research across sources.\nmodel: fakeoai:gpt-test\ntools: search, recall\n---\nResearch with two sources.\n");
+    // a turn of it in a conversation: on fakeoai, its model without the prefix
+    try f.core.handleText("/agent researcher");
+    try f.rec.waitFor("researcher answers here from your next message.");
+    try f.e.script(1, model.oaTextReply("Two sources agree."));
+    f.core.chatTurn("what is new in zig");
+    try f.rec.waitFor("Two sources agree.");
+    const r1 = jv.parse(a, try f.e.request(1)).?;
+    try t.expectEqualStrings("/v1/chat/completions", jv.str(jv.get(r1, "target")).?);
+    try t.expectEqualStrings("gpt-test", jv.str(jv.at(r1, &.{ "body", "model" })).?);
+    try t.expectEqualStrings("Bearer sk-fakeoai-test-1", jv.str(jv.at(r1, &.{ "headers", "Authorization" })).?);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "Research with two sources.") != null);
+    // main names no model: [model] model at omnigate, as before
+    try f.core.handleText("/agent main");
+    try f.e.script(2, model.textReply("main here"));
+    f.core.chatTurn("hello");
+    try f.rec.waitFor("main here");
+    const r2 = jv.parse(a, try f.e.request(2)).?;
+    try t.expectEqualStrings("/v1/messages", jv.str(jv.get(r2, "target")).?);
+    try t.expectEqualStrings("claude-sonnet", jv.str(jv.at(r2, &.{ "body", "model" })).?);
+    // its task: the same provider
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[watch]\nevery = 5m\nagent = researcher\ndo = Look for zig news.\n"));
+    try f.e.script(3, model.oaTextReply("Zig 0.17.1 is out."));
+    _ = try f.core.runTask(f.core.tasks[0]);
+    try f.rec.waitFor("[watch] Zig 0.17.1 is out.");
+    const r3 = jv.parse(a, try f.e.request(3)).?;
+    try t.expectEqualStrings("/v1/chat/completions", jv.str(jv.get(r3, "target")).?);
+    try t.expectEqualStrings("gpt-test", jv.str(jv.at(r3, &.{ "body", "model" })).?);
+    // the log names the provider and holds no key
+    const log_text = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, log_text, "\"provider\":\"fakeoai\"") != null);
+    try t.expect(std.mem.indexOf(u8, log_text, "sk-fakeoai-test-1") == null);
+}
+
+test "a_definition_whose_provider_has_no_key_refuses_its_runs" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    // openrouter is a preset: no section needed, and no key is stored for it
+    try addDefinition(&f, "researcher", "---\nname: researcher\ndescription: Research across sources.\nmodel: openrouter:deepseek/deepseek-chat\ntools: search, recall\n---\nResearch with two sources.\n");
+    const refused = "Model calls are refused: no openrouter key is stored (harness secret add openrouter).";
+    // a turn of it: that one line, nothing sent
+    try f.core.handleText("/agent researcher");
+    try f.rec.waitFor("researcher answers here from your next message.");
+    f.core.chatTurn("what is new in zig");
+    try f.rec.waitFor(refused);
+    try t.expectEqual(0, f.e.server.modelRequests());
+    // its task: the same line, with the task's name
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[watch]\nevery = 5m\nagent = researcher\ndo = Look for zig news.\n"));
+    _ = try f.core.runTask(f.core.tasks[0]);
+    try f.rec.waitFor("[watch] " ++ refused);
+    try t.expectEqual(0, f.e.server.modelRequests());
+    // delegated by main: the helper ends with that line, told to main
+    try f.core.handleText("/agent main");
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"find zig news\",\"agent\":\"researcher\"}]}"));
+    try f.e.script(2, model.textReply("The researcher could not run."));
+    f.core.chatTurn("research zig");
+    try f.rec.waitFor("The researcher could not run.");
+    try t.expectEqual(2, f.e.server.modelRequests());
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), refused) != null);
 }
