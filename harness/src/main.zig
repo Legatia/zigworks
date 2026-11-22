@@ -1919,6 +1919,7 @@ test {
     _ = @import("web.zig");
     _ = @import("url.zig");
     _ = @import("proc.zig");
+    _ = @import("triggers.zig");
 }
 
 test "a_line_of_ctrl_d_leaves_the_chat_in_a_windows_console" {

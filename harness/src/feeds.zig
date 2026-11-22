@@ -3,7 +3,8 @@
 //! entries rather than an error.
 const std = @import("std");
 
-pub const Entry = struct { title: []const u8, link: []const u8, date: []const u8 = "" };
+/// `text`: the entry's summary (description, summary or content) as text.
+pub const Entry = struct { title: []const u8, link: []const u8, date: []const u8 = "", text: []const u8 = "" };
 
 /// At most this many entries are read from one feed.
 pub const max_entries = 200;
@@ -26,7 +27,8 @@ pub fn parse(arena: std.mem.Allocator, xml: []const u8) ![]Entry {
         const date = try text(arena, element(body, "pubDate") orelse element(body, "published") orelse element(body, "updated") orelse element(body, "dc:date") orelse "");
         const l = std.mem.trim(u8, try decode(arena, link), " \t\r\n");
         if (l.len == 0 or !(std.mem.startsWith(u8, l, "http://") or std.mem.startsWith(u8, l, "https://"))) continue;
-        try out.append(arena, .{ .title = title, .link = l, .date = date });
+        const summary = try text(arena, try decode(arena, element(body, "description") orelse element(body, "summary") orelse element(body, "content") orelse ""));
+        try out.append(arena, .{ .title = title, .link = l, .date = date, .text = summary });
     }
     return out.items;
 }
@@ -222,4 +224,16 @@ test "entities_and_cdata" {
     try t.expectEqualStrings("Fish & chips", e[0].title);
     try t.expectEqualStrings("https://x.com/?a=1&b=2", e[0].link);
     try t.expectEqualStrings("café — \"ok\"", e[1].title);
+}
+
+test "a_feed_entry_carries_its_summary_as_text" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rss = try parse(a, "<rss><channel><item><title>T</title><link>https://x.com/1</link><description><![CDATA[<p>Fish &amp; <b>chips</b></p>]]></description></item></channel></rss>");
+    try t.expectEqualStrings("Fish & chips", rss[0].text);
+    const atom = try parse(a, "<feed><entry><title>A</title><link href=\"https://b.com/a\"/><summary>Short one</summary></entry><entry><title>B</title><link href=\"https://b.com/b\"/><content type=\"html\">&lt;p&gt;Long&lt;/p&gt;</content></entry></feed>");
+    try t.expectEqualStrings("Short one", atom[0].text);
+    try t.expectEqualStrings("Long", atom[1].text);
+    try t.expectEqualStrings("", (try parse(a, "<rss><item><title>x</title><link>https://x.com/2</link></item></rss>"))[0].text);
 }
