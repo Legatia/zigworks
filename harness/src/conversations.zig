@@ -6,6 +6,7 @@
 const std = @import("std");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
+const agents = @import("agents.zig");
 const Io = std.Io;
 
 pub const max_name = 32;
@@ -39,6 +40,9 @@ pub const Entry = struct {
     /// keep only sizes and keyed hashes. Read by runs while they go.
     private: std.atomic.Value(bool),
     created: i64,
+    /// The definition that answers here (`/agent NAME`): `main` unless the
+    /// owner picked another; in the file only then.
+    agent: []u8,
 
     // in memory only
 
@@ -46,9 +50,9 @@ pub const Entry = struct {
     /// front; `told` once the owner heard why.
     refused: bool = false,
     told: bool = false,
-    /// Turns of its context dropped to make room for others' (the model
-    /// is told when it comes back).
-    dropped_turns: usize = 0,
+    /// Turns of a definition's context here dropped to make room for
+    /// others' (its model is told when it comes back).
+    dropped: std.ArrayList(Dropped) = .empty,
     /// When a message last came from it or a post went to it; 0: not since
     /// harness started.
     used_s: i64 = 0,
@@ -59,8 +63,16 @@ pub const Entry = struct {
     held: u32 = 0,
     told_held_s: i64 = 0,
 
+    pub const Dropped = struct { agent: []u8, turns: usize };
+
     pub fn isPrivate(e: *const Entry) bool {
         return e.private.load(.acquire);
+    }
+
+    /// Turns of definition `agent`'s context here that were dropped.
+    pub fn droppedOf(e: *const Entry, agent: []const u8) usize {
+        for (e.dropped.items) |d| if (std.mem.eql(u8, d.agent, agent)) return d.turns;
+        return 0;
     }
 
     /// What kind of place it is, for the model and /conversations.
@@ -80,6 +92,7 @@ pub const New = struct {
     audience: Audience = .own,
     private: bool = false,
     created: i64 = 0,
+    agent: []const u8 = "main",
 };
 
 pub const Error = error{
@@ -117,6 +130,9 @@ pub const List = struct {
 
     fn free(l: *List, e: *Entry) void {
         l.gpa.free(e.name);
+        l.gpa.free(e.agent);
+        for (e.dropped.items) |d| l.gpa.free(d.agent);
+        e.dropped.deinit(l.gpa);
         e.posts.deinit(l.gpa);
         l.gpa.destroy(e);
     }
@@ -126,7 +142,9 @@ pub const List = struct {
         errdefer l.gpa.destroy(e);
         const name = try l.gpa.dupe(u8, n.name);
         errdefer l.gpa.free(name);
-        e.* = .{ .name = name, .channel = n.channel, .chat = n.chat, .thread = n.thread, .audience = n.audience, .private = .init(n.private), .created = n.created };
+        const agent = try l.gpa.dupe(u8, n.agent);
+        errdefer l.gpa.free(agent);
+        e.* = .{ .name = name, .channel = n.channel, .chat = n.chat, .thread = n.thread, .audience = n.audience, .private = .init(n.private), .created = n.created, .agent = agent };
         try l.items.append(l.gpa, e);
         return e;
     }
@@ -159,6 +177,8 @@ pub const List = struct {
                 .audience = audience,
                 .private = jv.boolean(jv.get(v, "private")) orelse false,
                 .created = util.parseIso(jv.str(jv.get(v, "created")) orelse "") orelse 0,
+                // a name that is no definition's: main answers
+                .agent = if (jv.str(jv.get(v, "agent"))) |ag| (if (agents.validName(ag)) ag else "main") else "main",
             });
         }
     }
@@ -173,10 +193,16 @@ pub const List = struct {
             var tb: [20]u8 = undefined;
             try out.appendSlice(l.gpa, "{\"name\":");
             try util.jsonString(&out, l.gpa, e.name);
-            try out.print(l.gpa, ",\"channel\":\"{s}\",\"chat\":{d},\"thread\":{d},\"audience\":\"{s}\",\"private\":{s},\"created\":\"{s}\"}}\n", .{
+            try out.print(l.gpa, ",\"channel\":\"{s}\",\"chat\":{d},\"thread\":{d},\"audience\":\"{s}\",\"private\":{s},\"created\":\"{s}\"", .{
                 @tagName(e.channel), e.chat,                                     e.thread,
                 @tagName(e.audience), if (e.isPrivate()) "true" else "false", util.isoTime(&tb, e.created),
             });
+            // only when the owner picked another: main's lines stay as they were
+            if (!std.mem.eql(u8, e.agent, "main")) {
+                try out.appendSlice(l.gpa, ",\"agent\":");
+                try util.jsonString(&out, l.gpa, e.agent);
+            }
+            try out.appendSlice(l.gpa, "}\n");
         }
         try util.writeReplace(l.io, l.path, out.items);
     }
@@ -220,6 +246,47 @@ pub const List = struct {
             return err;
         };
         l.gpa.free(before);
+    }
+
+    /// Definition `agent` answers in conversation `name` from now on;
+    /// written before it applies (nothing changes when it can't be).
+    pub fn setAgent(l: *List, name: []const u8, agent: []const u8) !void {
+        const e = l.find(name) orelse return error.NotFound;
+        const owned = try l.gpa.dupe(u8, agent);
+        const before = e.agent;
+        e.agent = owned;
+        l.save() catch |err| {
+            e.agent = before;
+            l.gpa.free(owned);
+            return err;
+        };
+        l.gpa.free(before);
+    }
+
+    /// Every conversation definition `agent` answered in goes back to
+    /// main (it was removed); returns their names (in `a`).
+    pub fn resetAgent(l: *List, a: std.mem.Allocator, agent: []const u8) ![]const []const u8 {
+        var names_out: std.ArrayList([]const u8) = .empty;
+        for (l.items.items) |e| if (std.mem.eql(u8, e.agent, agent)) {
+            const main = try l.gpa.dupe(u8, "main");
+            l.gpa.free(e.agent);
+            e.agent = main;
+            try names_out.append(a, try a.dupe(u8, e.name));
+        };
+        if (names_out.items.len > 0) try l.save();
+        return names_out.items;
+    }
+
+    /// Notes that `turns` turns of definition `agent`'s context in `e`
+    /// were dropped.
+    pub fn setDropped(l: *List, e: *Entry, agent: []const u8, turns: usize) !void {
+        for (e.dropped.items) |*d| if (std.mem.eql(u8, d.agent, agent)) {
+            d.turns = turns;
+            return;
+        };
+        const owned = try l.gpa.dupe(u8, agent);
+        errdefer l.gpa.free(owned);
+        try e.dropped.append(l.gpa, .{ .agent = owned, .turns = turns });
     }
 
     /// Forgets a conversation (a topic stays in Telegram).
@@ -416,4 +483,46 @@ test "an_old_folder_gets_terminal_and_main_once_paired" {
     const text = try tmp.dir.readFileAlloc(t.io, "conversations", a, .unlimited);
     try t.expect(std.mem.indexOf(u8, text, "house-search") == null);
     try t.expect(std.mem.indexOf(u8, text, "\"chat\":77") != null);
+}
+
+test "each_conversation_keeps_its_agent" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var l = try tmpList(&tmp, a);
+    defer l.deinit();
+    const t0 = util.parseIso("2026-11-22T09:00:00Z").?;
+    _ = try l.add(.{ .name = "main", .chat = 42, .created = t0 });
+    _ = try l.add(.{ .name = "house-search", .chat = 42, .thread = 5012, .agent = "researcher", .created = t0 });
+    // main's line is as before; another definition is said at the end
+    try t.expectEqualStrings(
+        \\{"name":"main","channel":"telegram","chat":42,"thread":0,"audience":"own","private":false,"created":"2026-11-22T09:00:00Z"}
+        \\{"name":"house-search","channel":"telegram","chat":42,"thread":5012,"audience":"own","private":false,"created":"2026-11-22T09:00:00Z","agent":"researcher"}
+        \\
+    , try tmp.dir.readFileAlloc(t.io, "conversations", a, .unlimited));
+    try l.setAgent("main", "writer");
+    try t.expectError(error.NotFound, l.setAgent("nope", "writer"));
+    try t.expectEqualStrings("writer", l.find("main").?.agent);
+    // read back; an agent that is no definition's name reads as main
+    const text = try tmp.dir.readFileAlloc(t.io, "conversations", a, .unlimited);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "conversations", .data = try std.mem.concat(a, u8, &.{ text, "{\"name\":\"odd\",\"channel\":\"telegram\",\"chat\":1,\"thread\":0,\"audience\":\"own\",\"private\":false,\"created\":\"2026-11-22T09:00:00Z\",\"agent\":\"Not A Name\"}\n" }) });
+    var again: List = .init(t.allocator, t.io, l.path);
+    defer again.deinit();
+    try again.load();
+    try t.expectEqualStrings("writer", again.find("main").?.agent);
+    try t.expectEqualStrings("researcher", again.find("house-search").?.agent);
+    try t.expectEqualStrings("main", again.find("odd").?.agent);
+    // a removed definition: its conversations go back to main
+    const back = try again.resetAgent(a, "researcher");
+    try t.expectEqual(1, back.len);
+    try t.expectEqualStrings("house-search", back[0]);
+    try t.expectEqualStrings("main", again.find("house-search").?.agent);
+    // turns dropped are kept per definition
+    const e = again.find("main").?;
+    try again.setDropped(e, "researcher", 3);
+    try again.setDropped(e, "researcher", 5);
+    try t.expectEqual(5, e.droppedOf("researcher"));
+    try t.expectEqual(0, e.droppedOf("main"));
 }

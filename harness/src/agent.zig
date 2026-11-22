@@ -19,26 +19,74 @@ const masks_mod = @import("masks.zig");
 const who_mod = @import("who.zig");
 const folders_mod = @import("folders.zig");
 const snapshots_mod = @import("snapshots.zig");
+const agents = @import("agents.zig");
 const Io = std.Io;
 
-/// `unsent`: the question did not get to the owner (a part or its buttons
-/// could not be sent), so nobody could answer it.
-pub const Answer = enum { once, day, deny, timeout, unsent };
+/// What came of asking the owner. `once`, `day`, `deny`: an approval's
+/// answer; `answered`: a question's or a draft's (`Reply.key` says which);
+/// `timeout`: no answer in time; `unsent`: the question did not get to the
+/// owner (a part or its buttons could not be sent); `withdrawn`: no one is
+/// left to answer (the run stopped, the terminal was left); `full`: no
+/// place in the inbox before the turn's end.
+pub const Answer = enum { once, day, deny, answered, timeout, unsent, withdrawn, full };
 
-/// One question for the owner: may this call run?
+/// One question for the owner: may this call run (`approval`), the agent's
+/// question (`question`), or a draft to review (`draft`). It becomes an
+/// inbox item.
 pub const Question = struct {
+    kind: Kind = .approval,
+    /// The call as the owner sees it, or the agent's question.
     text: []const u8,
     /// Whether "Allow 24 h" may be offered (never for money).
-    allow_day: bool,
+    allow_day: bool = true,
     /// When the run that asks must end (seconds): an answer after that is
     /// of no use, so it is not waited for. 0: no end.
     deadline_s: i64 = 0,
+    /// A question's choices (up to 4); none: it is answered in words.
+    choices: []const []const u8 = &.{},
+    /// The owner may answer in words.
+    takes_text: bool = false,
+    /// A draft to use, drop or replace with the owner's own version.
+    draft: ?[]const u8 = null,
+    /// The run that asks: who started it and its definition, its id and
+    /// label, and whether it is private.
+    who: who_mod.Who = .{},
+    rid: u64 = 0,
+    label: []const u8 = "",
+    private: bool = false,
+    /// The asking run's own stop flag (a delegated run has one of its own,
+    /// which `/stop NAME` sets alone): once set, its item is withdrawn.
+    stop: ?*const std.atomic.Value(bool) = null,
+
+    pub const Kind = enum { approval, question, draft };
+};
+
+/// The owner's answer to a `Question`.
+pub const Reply = struct {
+    answer: Answer,
+    /// The choice's key: `once`, `day`, `deny`, `1`…`4`, `text`, `use`, `drop`.
+    key: []const u8 = "",
+    /// The owner's words (a reason that denies an approval, a written
+    /// answer, their own version of a draft), or the chosen choice's label;
+    /// for `full`, why there was no place.
+    text: []const u8 = "",
+    /// The inbox item it was asked in; 0: none was made.
+    item: u64 = 0,
 };
 
 /// Tells the owner something beside the answer, at once.
 pub const Notice = struct {
     ctx: *anyopaque,
     say: *const fn (ctx: *anyopaque, text: []const u8) void,
+};
+
+/// Where a delegated run registers its own stop flag, set with its
+/// parent's: `/stop NAME` then stops NAME's runs and only those, and the
+/// runs they delegated.
+pub const Registry = struct {
+    ctx: *anyopaque,
+    add: *const fn (ctx: *anyopaque, flag: *std.atomic.Value(bool), agent: []const u8, parent: *std.atomic.Value(bool)) void,
+    remove: *const fn (ctx: *anyopaque, flag: *std.atomic.Value(bool)) void,
 };
 
 /// What a conversation is, as a run's outbox knows it.
@@ -77,6 +125,9 @@ pub const Delivery = struct {
     files: u32 = 0,
     /// Why it was not sent, in words.
     why: []const u8 = "",
+    /// The inbox item it is kept as (kept to be sent again, or failed and
+    /// kept for the owner); 0: none.
+    item: u64 = 0,
 
     pub const Status = enum {
         sent,
@@ -101,11 +152,12 @@ pub const Outbox = struct {
     post: *const fn (ctx: *anyopaque, a: std.mem.Allocator, p: *const Post) Delivery,
 };
 
-/// Asks the owner whether a call may run; blocks until they answer, the
-/// approval time runs out or the question's deadline passes.
+/// Asks the owner (an inbox item); blocks until they answer, the approval
+/// time runs out or the question's deadline passes. What the reply holds
+/// is in `a`.
 pub const Asker = struct {
     ctx: *anyopaque,
-    ask: *const fn (ctx: *anyopaque, q: Question) Answer,
+    ask: *const fn (ctx: *anyopaque, a: std.mem.Allocator, q: Question) Reply,
 };
 
 /// The owner's switches, shared by all runs and read when used, so that
@@ -244,6 +296,9 @@ pub const Run = struct {
     lock: *Io.Mutex,
     env: tools.Env,
     limits: config.Config.Limits,
+    /// `[limits]` as config.ini says: what a definition's unset limits are
+    /// for a run of its own.
+    base_limits: config.Config.Limits = .{},
     top_size: u32 = 20,
     utc_offset: i32 = 0,
     asker: ?Asker = null,
@@ -251,9 +306,6 @@ pub const Run = struct {
     /// Private from the start of this run, whatever the switch says later
     /// (see `isPrivate`).
     private: bool = false,
-    /// Whether this run may recall at all (helpers don't); the switch
-    /// decides when it does (see `autoRecall`).
-    auto_recall: bool = true,
     /// The owner's switches, read when used.
     switches: *const Switches = &no_switches,
     /// What the run is, for the log ("chat", "task btc-watch", …).
@@ -281,17 +333,17 @@ pub const Run = struct {
     agents: config.Config.Agents = .{},
     /// Shared by all runs: how many helpers run at once.
     pool: ?*Pool = null,
-    /// Shared by all runs: the owner is asked one question at a time.
-    ask_lock: ?*Io.Mutex = null,
     /// Pages fetched in this run's helpers, shared between them.
     cache: ?*PageCache = null,
-    /// A helper: a short task, a subset of tools, no memory writes.
+    /// A delegated run (a helper): a short task, a subset of tools, no
+    /// memory writes, its answer to the run that started it.
     helper: bool = false,
-    /// A helper's tools; null: all of them.
-    allowed: ?[]const gate.Tool = null,
     /// Input tokens this run may use; 0: no limit.
     token_cap: u64 = 0,
     skills_dir: []const u8 = "",
+    /// Where a replaced skill's file is kept (`state/skills/`, as
+    /// definitions keep theirs); "": not kept.
+    skills_state: []const u8 = "",
     /// When the running turn must end; helpers get what is left of it.
     deadline_s: i64 = 0,
     /// Tools of the MCP servers that are running.
@@ -334,6 +386,23 @@ pub const Run = struct {
     /// The folders this run snapshotted before changing them (shared with
     /// its helpers); set by the top-level run's `turn`.
     snap_run: ?*SnapRun = null,
+    /// The definition the run is of: its own copy, taken when it starts
+    /// (a change saved meanwhile applies to the next run).
+    def: agents.Def = agents.builtin_main,
+    /// What the starter passes on when it narrows (a `delegate` task's
+    /// `tools`): tool names and patterns as `agents.toolMatches` reads
+    /// them; null: all.
+    narrow: ?[]const []const u8 = null,
+    /// The run that delegated this one: no tool it lacks reaches this one.
+    starter: ?*const Run = null,
+    /// The definitions, for `delegate` and `agent_save`; null: the
+    /// built-ins only, and no `agent_save`.
+    defs: ?*agents.Set = null,
+    /// The run holds a place of its definition (its `parallel`).
+    holds_place: bool = false,
+    /// Where a delegated run registers its own stop flag (so `/stop NAME`
+    /// reaches it alone); null: helpers share their parent's flag.
+    registry: ?Registry = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -350,8 +419,10 @@ pub const Run = struct {
         return r.dry_run or r.switches.dry_run.load(.acquire);
     }
 
+    /// Whether a message recalls memory items: a definition that reads
+    /// shared memory, while the switch is on.
     pub fn autoRecall(r: *const Run) bool {
-        return r.auto_recall and r.switches.auto_recall.load(.acquire);
+        return r.def.memory == .shared and r.switches.auto_recall.load(.acquire);
     }
 
     /// Writes one of the run's lines to the log: each carries its id, its
@@ -371,48 +442,131 @@ pub const Run = struct {
         if (first) r.rid = seq;
     }
 
+    /// A client for a model value ("PROVIDER:MODEL", or a model of the
+    /// default provider) through the instance's providers; without them
+    /// (tests), omnigate at `model_cfg.url`.
+    pub fn modelClient(r: *const Run, value: []const u8, max_tokens: u32) !model.Client {
+        const cfg = r.model_cfg orelse return error.NoModelSettings;
+        if (cfg.providers) |set| return set.client(r.gpa, r.io, value, max_tokens);
+        return model.Client.init(r.gpa, r.io, cfg.url, cfg.key, value, max_tokens);
+    }
+
+    /// The name of the provider a model value picks.
+    fn providerOf(r: *const Run, value: []const u8) []const u8 {
+        const cfg = r.model_cfg orelse return "";
+        const set = cfg.providers orelse return "omnigate";
+        return set.pick(value).provider.name;
+    }
+
     /// Who takes a snapshot in this run.
     fn snapBy(r: *const Run) snapshots_mod.By {
         return .{ .rid = r.rid, .run = r.label, .agent = r.who.agent, .by = r.who.by };
     }
 
-    /// Whether this run may use `tool` at all (helpers get a subset).
+    /// Makes the run one of definition `d`: its who names it, and a run
+    /// that is not delegated takes its limits over `[limits]`.
+    pub fn useDefinition(r: *Run, d: agents.Def) void {
+        r.def = d;
+        r.who.agent = d.name;
+        if (r.helper) return;
+        r.limits.steps_per_turn = d.steps orelse r.base_limits.steps_per_turn;
+        r.limits.turn_seconds = d.seconds orelse r.base_limits.turn_seconds;
+        r.token_cap = d.tokens orelse 0;
+    }
+
+    /// Whether this run may use the MCP tool `m`: by its name,
+    /// `server/tool`, as definitions and narrowings name it.
+    pub fn allowsMcp(r: *const Run, m: *const McpTool) bool {
+        if (!r.allows(if (m.money) .money else .mcp)) return false;
+        var buf: [160]u8 = undefined;
+        const name = std.fmt.bufPrint(&buf, "{s}/{s}", .{ m.server.name, m.tool }) catch return false;
+        if (!r.permits(name)) return false;
+        return if (r.starter) |s| s.allowsMcp(m) else true;
+    }
+
+    /// Whether this run may use `tool` at all: what this instance offers,
+    /// within the definition's tools, what the starter passes on and the
+    /// starter's own run's tools (an MCP tool by its name: `allowsMcp`).
     pub fn allows(r: *const Run, tool: gate.Tool) bool {
+        // delegated runs answer the run that started them: they never
+        // post, ask, save or move money (helpers since 0.3, the rest since)
         if (r.helper) switch (tool) {
-            .delegate, .remember, .skill_save => return false,
+            .delegate, .remember, .skill_save, .send, .ask_owner, .money, .web, .agent_save, .trigger, .workflow, .app_save, .env_save => return false,
             else => {},
         };
         switch (tool) {
             .delegate => if (r.model_cfg == null) return false,
-            .mcp => if (r.mcp.len == 0) return false,
-            // helpers never move money; the owner asks for it in the chat
-            .money => if (r.helper or r.mcp.len == 0) return false,
+            .mcp, .money => if (r.mcp.len == 0) return false,
             .skill, .skill_save => if (r.skills_dir.len == 0) return false,
             .browse => if (r.env.browser.len == 0) return false,
-            // helpers never get the browser with the logins; POSIX only for now
-            .web => if (r.helper or r.env.browser.len == 0 or r.profiles_dir.len == 0) return false,
+            // the browser with the logins (helpers never: above); on
+            // Windows too since Chrome's pipes there are inherited handles
+            .web => if (r.env.browser.len == 0 or r.profiles_dir.len == 0) return false,
             // only through `web`
             .login => return false,
-            // a run that posts: helpers answer the run that started them
-            .send => if (r.helper or r.outbox == null) return false,
+            .send => if (r.outbox == null) return false,
+            // a setup call: only in runs the owner started from a conversation
+            .agent_save => if (r.defs == null or r.outbox == null or !std.mem.eql(u8, r.who.by, "owner")) return false,
+            // only where the owner can answer: not helpers (their run asks,
+            // above), not runs nobody watches
+            .ask_owner => if (r.scheduled or r.asker == null) return false,
             // the platform's kinds: the gate decides them, their tools come later
-            .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save => return false,
+            .mail, .trigger, .workflow, .app_read, .app_draft, .app_save, .env_save => return false,
             // where there is a store and folders.ini has a section
             .snapshot => if (r.snaps == null or r.gate.folders == null) return false,
             else => {},
         }
-        const list = r.allowed orelse return true;
-        return std.mem.indexOfScalar(gate.Tool, list, tool) != null;
+        if (tool == .mcp or tool == .money) return true;
+        if (!r.permits(@tagName(tool))) return false;
+        return if (r.starter) |s| s.allows(tool) else true;
+    }
+
+    /// What a definition's unset limits are here, for a change's reading.
+    pub fn defaults(r: *const Run) agents.Defaults {
+        return .{
+            .steps = r.base_limits.steps_per_turn,
+            .seconds = r.base_limits.turn_seconds,
+            .delegated_steps = r.agents.steps,
+            .delegated_tokens = r.agents.tokens,
+            .answer_bytes = r.agents.answer_bytes,
+        };
+    }
+
+    /// Whether the definition's tools and the starter's narrowing take
+    /// the tool `name`.
+    fn permits(r: *const Run, name: []const u8) bool {
+        if (!r.def.allowsTool(name)) return false;
+        if (r.narrow) |n| if (!agents.toolMatches(n, name)) return false;
+        return true;
     }
 };
 
-const delegate_def: model.ToolDef = .{
-    .name = "delegate",
-    .description = "Hand independent tasks to helpers that work at the same time, each with a clean context and its own tools. Each task must include every detail the helper needs. Returns each helper's short answer.",
-    .schema_json =
-    \\{"type":"object","properties":{"tasks":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"task":{"type":"string","description":"The whole task, standing alone."},"tools":{"type":"array","items":{"type":"string"},"description":"Tools the helper may use; default: search, fetch, browse, read_file, recall, skill."},"strong":{"type":"boolean","description":"Use the stronger, costlier model for this task."}},"required":["task"]}}},"required":["tasks"]}
-    ,
-};
+const delegate_description = "Hand independent tasks to helpers that work at the same time, each with a clean context and its own tools. Each task must include every detail the helper needs. Returns each helper's short answer.";
+const delegate_schema =
+    \\{"type":"object","properties":{"tasks":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"task":{"type":"string","description":"The whole task, standing alone."},"agent":{"type":"string","description":"The definition that does it; default: helper."},"tools":{"type":"array","items":{"type":"string"},"description":"Tools it may use, within its definition's and yours; default for helper: search, fetch, browse, read_file, recall, skill; for another definition, its own."},"strong":{"type":"boolean","description":"Use the stronger, costlier model for this task."}},"required":["task"]}}},"required":["tasks"]}
+;
+
+/// The most the list of definitions adds to `delegate`'s description.
+const max_definitions_listed = 4096;
+
+/// `delegate` as this run offers it: its description lists the
+/// definitions a task may name.
+fn delegateDef(r: *const Run, a: std.mem.Allocator) !model.ToolDef {
+    var desc: std.ArrayList(u8) = .empty;
+    try desc.appendSlice(a, delegate_description);
+    try desc.appendSlice(a, " The definitions a task may name (agent):");
+    const start = desc.items.len;
+    const list = if (r.defs) |set| try set.list(a) else &[_]agents.Def{ agents.builtin_helper, agents.builtin_main };
+    for (list) |d| {
+        const line = try std.fmt.allocPrint(a, "\n- {s}: {s}", .{ d.name, d.description });
+        if (desc.items.len - start + line.len > max_definitions_listed) {
+            try desc.appendSlice(a, "\n- \u{2026}");
+            break;
+        }
+        try desc.appendSlice(a, line);
+    }
+    return .{ .name = "delegate", .description = desc.items, .schema_json = delegate_schema };
+}
 const send_def: model.ToolDef = .{
     .name = "send",
     .description = "Post to a conversation the owner reads: your reply (final: true; your turn ends with it), or a note while you keep working.",
@@ -432,6 +586,18 @@ const snapshot_def: model.ToolDef = .{
     .description = "Keep a snapshot of a workspace folder now (or of env:NAME, an environment's home), with a label, so that the owner can compare it and put it back later. Only the owner restores.",
     .schema_json = "{\"type\":\"object\",\"properties\":{\"folder\":{\"type\":\"string\",\"description\":\"a folder in the workspace, / for all of it, or env:NAME\"},\"label\":{\"type\":\"string\",\"description\":\"what it is before or after\"}},\"required\":[\"folder\"]}",
 };
+const agent_save_def: model.ToolDef = .{
+    .name = "agent_save",
+    .description = "Propose a new agent definition, or a change to your own: the whole file agents/NAME.md, a header between --- lines (name, description; and if needed model, tools, skills, memory, steps, tokens, seconds, answer_bytes, parallel) and then the instructions. The owner sees all of it and approves it every time; it applies from the next run.",
+    .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"a-z, 0-9 and -\"},\"text\":{\"type\":\"string\",\"description\":\"the whole file\"}},\"required\":[\"name\",\"text\"]}",
+};
+const ask_owner_def: model.ToolDef = .{
+    .name = "ask_owner",
+    .description = "Ask the owner a question, or show them a draft to review, and wait for the answer. With choices the owner picks one; with text: true they may also answer in words; without choices they answer in words. With a draft they use it, drop it, or reply with their own version.",
+    .schema_json =
+    \\{"type":"object","properties":{"question":{"type":"string"},"choices":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"up to 4 answers to pick from, 1 to 64 bytes each"},"text":{"type":"boolean","description":"the owner may also answer in words"},"draft":{"type":"string","description":"a draft for the owner to use, drop or replace (then no choices)"}},"required":["question"]}
+    ,
+};
 const skill_defs = [_]model.ToolDef{
     .{ .name = "skill", .description = "Load one of your skills (saved instructions for a kind of task) by name; with `file`, read one of the skill's other files.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"file\":{\"type\":\"string\"}},\"required\":[\"name\"]}" },
     .{ .name = "skill_save", .description = "Save a skill: instructions for a kind of task you may meet again (steps, sources, pitfalls). Replaces a skill of the same name. The owner approves it.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"lowercase letters, digits and hyphens\"},\"description\":{\"type\":\"string\",\"description\":\"one line: when to use it\"},\"body\":{\"type\":\"string\"}},\"required\":[\"name\",\"description\",\"body\"]}" },
@@ -447,11 +613,13 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
         try out.append(arena, if (tool == .shell and r.gate.folders != null) shell_dir_def else d);
     }
     if (r.allows(.send)) try out.append(arena, send_def);
+    if (r.allows(.ask_owner)) try out.append(arena, ask_owner_def);
     if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
-    if (r.allows(.delegate)) try out.append(arena, delegate_def);
+    if (r.allows(.delegate)) try out.append(arena, try delegateDef(r, arena));
     for (skill_defs) |d| if (r.allows(gate.Tool.fromName(d.name).?)) try out.append(arena, d);
     if (r.allows(.snapshot)) try out.append(arena, snapshot_def);
-    for (r.mcp) |m| if (r.allows(if (m.money) .money else .mcp)) try out.append(arena, m.def);
+    if (r.allows(.agent_save)) try out.append(arena, agent_save_def);
+    for (r.mcp) |*m| if (r.allowsMcp(m)) try out.append(arena, m.def);
     return out.items;
 }
 
@@ -710,18 +878,87 @@ pub const MoneyLedger = struct {
 const Reservation = struct { day: i64 = 0, amount: f64 = 0 };
 
 pub const ModelCfg = struct {
+    /// omnigate's address and key, used only without `providers` (tests).
     url: []const u8,
     key: []const u8,
+    /// Model values: "PROVIDER:MODEL", or a model of the default provider.
     main: []const u8,
     worker: []const u8,
     memory: []const u8,
     max_tokens: u32,
+    /// The instance's providers; null: omnigate at `url` with `key`.
+    providers: ?*const model.Providers = null,
 };
 
-/// A counting limit on helpers running at once, across the process.
+/// A counting limit on helpers running at once, across the process, and
+/// the runs going of each definition (for its `parallel`).
 pub const Pool = struct {
     mutex: Io.Mutex = .init,
     active: u32 = 0,
+    going_list: [max_names]Going = undefined,
+    n_going: usize = 0,
+
+    const max_names = 64;
+    const Going = struct { name: [64]u8 = undefined, len: usize = 0, n: u32 = 0 };
+
+    /// Definition `name`'s count, made if there is none (null when there
+    /// is no room: it is not counted). Under the mutex.
+    fn slot(p: *Pool, name: []const u8, make: bool) ?*Going {
+        for (p.going_list[0..p.n_going]) |*g| if (std.mem.eql(u8, g.name[0..g.len], name)) return g;
+        if (!make or p.n_going == max_names or name.len > 64) return null;
+        const g = &p.going_list[p.n_going];
+        p.n_going += 1;
+        g.* = .{ .len = name.len };
+        @memcpy(g.name[0..name.len], name);
+        return g;
+    }
+
+    /// Takes a place of definition `name` if fewer than `cap` of its runs
+    /// go (0: no cap of its own, only counted).
+    pub fn take(p: *Pool, io: Io, name: []const u8, cap: u32) bool {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        const g = p.slot(name, true) orelse return true;
+        if (cap > 0 and g.n >= cap) return false;
+        g.n += 1;
+        return true;
+    }
+
+    /// Counts a run of `name` that never waits for a place (the owner's).
+    pub fn takeAlways(p: *Pool, io: Io, name: []const u8) void {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        if (p.slot(name, true)) |g| g.n += 1;
+    }
+
+    pub fn give(p: *Pool, io: Io, name: []const u8) void {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        if (p.slot(name, false)) |g| g.n -|= 1;
+    }
+
+    /// How many runs of definition `name` go.
+    pub fn going(p: *Pool, io: Io, name: []const u8) u32 {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        return if (p.slot(name, false)) |g| g.n else 0;
+    }
+
+    /// Whether a run of `name` would find a place now.
+    pub fn hasRoom(p: *Pool, io: Io, name: []const u8, cap: u32) bool {
+        return cap == 0 or p.going(io, name) < cap;
+    }
+
+    /// Waits for a place of `name`; false if stopped first or `deadline_s`
+    /// (0: none) passed.
+    fn takeUntil(p: *Pool, io: Io, name: []const u8, cap: u32, stop: *std.atomic.Value(bool), deadline_s: i64) bool {
+        while (true) {
+            if (stop.load(.acquire)) return false;
+            if (p.take(io, name, cap)) return true;
+            if (deadline_s > 0 and util.nowSeconds(io) >= deadline_s) return false;
+            io.sleep(.fromMilliseconds(20), .awake) catch {};
+        }
+    }
 
     /// Waits for a free place; false if stopped first.
     fn acquire(p: *Pool, io: Io, max: u32, stop: *std.atomic.Value(bool)) bool {
@@ -804,17 +1041,16 @@ pub const TurnResult = struct {
     steps: u32 = 0,
 };
 
-const base_prompt =
-    \\You are a personal agent working for one person, the owner, who talks to you in a chat.
-    \\Be brief and plain. Do what was asked; ask when something is unclear.
+/// Harness's own line after a definition's instructions: what the gate is.
+const gate_line =
     \\Every tool call passes a gate: some need the owner's approval and may be refused. If a call is refused, say what you could not do instead of trying another way around it.
-    \\Use `remember` for lasting facts about the owner or their wishes, not for passing details.
+    \\
 ;
 
-const helper_prompt =
-    \\You are a helper doing one task for an agent that works for its owner. Do only this task, with the tools you have.
-    \\When done, answer in at most about 300 words: the result first, then the links you used, then anything you could not do and why. Your answer goes to the agent, not to the owner.
+/// The same for a delegated run.
+const delegated_gate_line =
     \\Every tool call passes a gate and may be refused. If a call is refused, say so instead of trying another way around it.
+    \\
 ;
 
 const send_guide =
@@ -824,6 +1060,7 @@ const send_guide =
 
 const delegate_guide =
     \\Use `delegate` to hand independent pieces of work to helpers that run at the same time, each with a clean context: research across several sources, comparisons, anything that splits into parts. Each task must stand alone and include every detail the helper needs; you get back each helper's short answer, not its working.
+    \\
 ;
 
 /// Starts the per-turn context block kept with the owner's message (time,
@@ -854,14 +1091,20 @@ pub const Past = struct {
 
 pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Recall, past: Past, now_s: i64) !Prompt {
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(arena, if (r.helper) helper_prompt else base_prompt);
-    if (!r.helper and r.model_cfg != null) try out.appendSlice(arena, delegate_guide);
+    // the definition's instructions, then harness's own lines
+    try out.appendSlice(arena, std.mem.trimEnd(u8, r.def.body, " \t\r\n"));
+    if (out.items.len > 0) try out.append(arena, '\n');
+    try out.appendSlice(arena, if (r.helper) delegated_gate_line else gate_line);
+    if (r.allows(.delegate)) try out.appendSlice(arena, delegate_guide);
     if (r.allows(.send)) try out.appendSlice(arena, send_guide);
     if (r.scheduled) try out.appendSlice(arena, "This is a scheduled run: the owner is not watching and cannot approve anything.\n");
     if (r.extra_instructions.len > 0) try out.print(arena, "{s}\n", .{r.extra_instructions});
     if (r.skills_dir.len > 0 and r.allows(.skill)) {
-        const list = skills.list(arena, r.io, r.skills_dir) catch &.{};
-        const text = try skills.promptList(arena, list, 4096);
+        const all = skills.list(arena, r.io, r.skills_dir) catch &.{};
+        // the definition's skills only
+        var list: std.ArrayList(skills.Skill) = .empty;
+        for (all) |sk| if (r.def.allowsSkill(sk.name)) try list.append(arena, sk);
+        const text = try skills.promptList(arena, list.items, 4096);
         if (text.len > 0) try out.print(arena, "\n{s}\n", .{text});
     }
     // in id order, not by strength: a mention then changes no byte here,
@@ -955,7 +1198,8 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     const system = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        const recalled = try r.mem.recall(a, user_text, started, r.top_size, r.autoRecall());
+        // a definition that reads pinned items only gets no strongest ones
+        const recalled = try r.mem.recall(a, user_text, started, if (r.def.memory == .shared) r.top_size else 0, r.autoRecall());
         break :blk try systemParts(a, r, recalled, .of(conv), started);
     };
     // the time and what memory found go with the message, not the system
@@ -1024,27 +1268,22 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
                 result.ended_by = try r.gpa.dupe(u8, "Stopped.");
                 break;
             }
+            // the same words for every provider, naming it
             const why: []const u8 = switch (e) {
-                error.BudgetSpent => "Model budget used up.",
-                error.RateLimited => "The model is rate limited; try again later.",
-                error.NoKey => "Model calls are refused: no omnigate key is stored (harness secret add omnigate).",
-                error.NoUrl => "Model calls are refused: no omnigate url is set ([model] url in config.ini, then /reload).",
-                error.TimeUp => "Time limit reached for this turn.",
-                error.Timeout => try std.fmt.allocPrint(a, "Model call failed: Timeout {s}", .{r.client.lastError()}),
                 // kept, every later request would carry it and be refused too
-                error.Rejected => try std.fmt.allocPrint(a, "The model API refused the request: {s}. This turn is left out of the conversation, so the next message starts without it{s}.", .{
-                    r.client.lastError(),
+                error.Rejected => try std.fmt.allocPrint(a, "{s}. This turn is left out of the conversation, so the next message starts without it{s}.", .{
+                    try r.client.failure(a, e),
                     if (calls_made == 0) "" else try std.fmt.allocPrint(a, "; the agent will not remember the {d} tool call{s} it made in it", .{ calls_made, if (calls_made == 1) "" else "s" }),
                 }),
-                else => try std.fmt.allocPrint(a, "Model call failed: {s} {s}", .{ @errorName(e), r.client.lastError() }),
+                else => try r.client.failure(a, e),
             };
-            try r.logRun(.model, false, .{ .result = @errorName(e), .detail = r.client.lastError() });
+            try r.logRun(.model, false, .{ .result = @errorName(e), .provider = r.client.provider, .detail = r.client.lastError() });
             result.ended_by = try r.gpa.dupe(u8, why);
             rejected = e == error.Rejected;
             break;
         };
         used_tokens += reply.input_tokens + reply.cache_read_tokens + reply.cache_write_tokens;
-        try r.logRun(.model, false, .{ .result = "ok", .stop_reason = reply.stop_reason, .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens, .cache_read = reply.cache_read_tokens, .cache_write = reply.cache_write_tokens });
+        try r.logRun(.model, false, .{ .result = "ok", .provider = r.client.provider, .stop_reason = reply.stop_reason, .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens, .cache_read = reply.cache_read_tokens, .cache_write = reply.cache_write_tokens });
         // stopped while the model was answering: its answer is dropped
         if (r.env.stop.load(.acquire)) {
             result.stopped = true;
@@ -1145,8 +1384,11 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         };
         return .{ .text = "no such tool", .is_error = true };
     };
-    if (!r.allows(tool)) return .{ .text = "this tool is not available here", .is_error = true };
+    const offered = if (mt) |m| r.allowsMcp(m) else r.allows(tool);
+    if (!offered) return .{ .text = "this tool is not available here", .is_error = true };
     if (tool == .send) return sendTool(r, a, input_json);
+    if (tool == .agent_save) return agentSave(r, a, input_json);
+    if (tool == .ask_owner) return askOwnerTool(r, a, input_json);
     if (tool == .web) {
         // the tool asks the gate itself: for each host and login it uses
         const w = r.web orelse return .{ .text = "this tool is not available here", .is_error = true };
@@ -1159,11 +1401,18 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         return out;
     }
     const arg = switch (tool) {
-        .delegate => delegateArg(a, input_json) catch return .{ .text = "delegate needs a list of 1 to 8 tasks", .is_error = true },
+        .delegate => blk: {
+            const tasks = parseTasks(a, input_json) catch return .{ .text = "delegate needs a list of 1 to 8 tasks", .is_error = true };
+            // a definition no file or built-in has: refused before the gate
+            for (tasks) |tk| if (try findDef(r, a, tk.agent) == null) return .{ .text = try unknownDef(r, a, tk.agent), .is_error = true };
+            break :blk try delegateArg(a, tasks);
+        },
         // the whole input: rules and the owner see all of it
         .mcp, .money => try std.fmt.allocPrint(a, "{s}/{s} {s}", .{ mt.?.server.name, mt.?.tool, input_json }),
         else => tools.mainArg(a, tool, input_json) catch return .{ .text = "the tool's input is missing its main field", .is_error = true },
     };
+    // a skill outside the definition's skills is no skill of this run's
+    if (tool == .skill and !r.def.allowsSkill(arg)) return .{ .text = "could not load the skill: NoSuchSkill", .is_error = true };
     const now_s = r.now();
     // where a command starts, as the model gave it
     const dir: []const u8 = if (tool == .shell) jv.str(jv.get(jv.parse(a, input_json), "dir")) orelse "" else "";
@@ -1287,6 +1536,14 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
             const v = jv.parse(a, input_json).?;
             const desc = jv.str(jv.get(v, "description")) orelse "";
             const body = jv.str(jv.get(v, "body")) orelse "";
+            // the file it replaces is kept, the last 10 (as definitions keep theirs)
+            if (r.skills_state.len > 0 and skills.validName(arg)) {
+                const old_path = try std.fs.path.join(a, &.{ r.skills_dir, arg, "SKILL.md" });
+                if (Io.Dir.cwd().readFileAlloc(r.io, old_path, a, .limited(skills.max_description + skills.max_body + 256))) |old| {
+                    agents.keepVersionIn(r.io, r.gpa, try std.fs.path.join(a, &.{ r.skills_state, arg, "versions" }), old) catch |e|
+                        break :blk tools.Output{ .text = try std.fmt.allocPrint(a, "not saved: the skill it replaces could not be kept ({s})", .{@errorName(e)}), .is_error = true };
+                } else |_| {}
+            }
             skills.save(r.io, r.skills_dir, arg, desc, body) catch |e| break :blk tools.Output{ .text = try std.fmt.allocPrint(a, "not saved: {s}", .{@errorName(e)}), .is_error = true };
             break :blk .{ .text = try std.fmt.allocPrint(a, "saved skill {s}", .{arg}) };
         },
@@ -1373,11 +1630,144 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
     if (final) r.posted_final = true;
     return switch (d.status) {
         .sent => .{ .text = try std.fmt.allocPrint(a, "posted to {s} ({d} message{s}{s})", .{ target.name, d.parts, if (d.parts == 1) "" else "s", if (d.files == 0) "" else try std.fmt.allocPrint(a, ", {d} file{s}", .{ d.files, if (d.files == 1) "" else "s" }) }) },
-        .kept => .{ .text = try std.fmt.allocPrint(a, "not delivered now ({s}); kept to be sent again", .{d.why}) },
+        .kept => .{ .text = try std.fmt.allocPrint(a, "not delivered now ({s}); kept as item {d} and sent again later", .{ d.why, d.item }) },
         .held => .{ .text = try std.fmt.allocPrint(a, "not sent: {s}; it is in the log", .{d.why}), .is_error = true },
         .silent => .{ .text = "nothing posted" },
-        .failed => .{ .text = try std.fmt.allocPrint(a, "not delivered: {s}", .{d.why}), .is_error = true },
+        .failed => if (d.item != 0)
+            .{ .text = try std.fmt.allocPrint(a, "not delivered ({s}); kept as item {d}", .{ d.why, d.item }), .is_error = true }
+        else
+            .{ .text = try std.fmt.allocPrint(a, "not delivered: {s}", .{d.why}), .is_error = true },
     };
+}
+
+/// `agent_save`: a new definition, or a change to the run's own, written
+/// once the owner allows it (asked every time). Harness reads the text
+/// first, as it will be written; one that does not read goes back
+/// unasked. The question says who asks, new or change, what widens
+/// first, then the whole file.
+fn agentSave(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
+    const set = r.defs orelse return .{ .text = "this tool is not available here", .is_error = true };
+    const v = jv.parse(a, input_json);
+    const name = jv.str(jv.get(v, "name")) orelse "";
+    const text_in = jv.str(jv.get(v, "text")) orelse return saveRefused(r, a, name, "agent_save needs the name and the whole file as text");
+    if (!agents.validName(name)) return saveRefused(r, a, name, "a definition's name uses a-z, 0-9 and - (up to 64), and is not list, show or rm");
+    // a new definition, or this run's own: never another's
+    const old = try set.get(a, name);
+    if (old != null and !std.mem.eql(u8, name, r.def.name))
+        return saveRefused(r, a, name, try std.fmt.allocPrint(a, "{s} is another definition: agent_save makes a new one or changes this run's own ({s})", .{ name, r.def.name }));
+    var tb: [20]u8 = undefined;
+    const shown = try agents.withSaved(a, text_in, try std.fmt.allocPrint(a, "agent:{s} {s}", .{ r.who.agent, util.isoTime(&tb, r.now()) }));
+    var diag: agents.Diag = .{ .file = try std.fmt.allocPrint(a, "agents/{s}.md", .{name}) };
+    const new = agents.parse(a, name, shown, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.BadDefinition => return saveRefused(r, a, name, try diag.text(a)),
+    };
+    const cmp = try agents.compare(a, old, new, r.defaults());
+    const detail = try std.fmt.allocPrint(a, "{s}, asked by {s}\n{s}The whole file, {d} bytes:\n{s}", .{
+        if (old == null) "a new definition" else "a change to its own definition",
+        r.def.name,
+        try agents.readingText(a, old, cmp),
+        shown.len,
+        shown,
+    });
+    // the inbox item it is asked in: its number goes in the saved line
+    var item: u64 = 0;
+    if (try decideAndAskWith(r, a, .agent_save, "agent_save", name, detail, r.now(), .{ .item = &item })) |why| {
+        const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+        try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = true, .output = out.text, .bytes = out.text.len });
+        return out;
+    }
+    // as it was shown, stamped with the time it was allowed and its item
+    const stamp = if (item != 0)
+        try std.fmt.allocPrint(a, "agent:{s} {s} (item {d})", .{ r.who.agent, util.isoTime(&tb, r.now()), item })
+    else
+        try std.fmt.allocPrint(a, "agent:{s} {s}", .{ r.who.agent, util.isoTime(&tb, r.now()) });
+    const text = try agents.withSaved(a, text_in, stamp);
+    set.save(name, text) catch |e| {
+        const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "not saved: {s}", .{@errorName(e)}), .is_error = true };
+        try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = true, .output = out.text, .bytes = out.text.len });
+        return out;
+    };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+    try r.log.write(.agent, false, .{
+        .event = "saved",
+        .name = name,
+        .by = r.who.by,
+        .agent = r.who.agent,
+        .item = if (item != 0) @as(?u64, item) else null,
+        .widens = try std.mem.join(a, "; ", cmp.widens),
+        .sha256 = &std.fmt.bytesToHex(digest, .lower),
+    });
+    const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "saved agents/{s}.md; runs that start from now on use it", .{name}) };
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = false, .output = out.text, .bytes = out.text.len });
+    return out;
+}
+
+/// An `agent_save` refused before the gate: logged, and the model told why.
+fn saveRefused(r: *Run, a: std.mem.Allocator, name: []const u8, why: []const u8) !tools.Output {
+    const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "not saved: {s}", .{why}), .is_error = true };
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = true, .output = out.text, .bytes = out.text.len });
+    return out;
+}
+
+/// Choices a question offers at most, and the longest label.
+pub const max_choices = 4;
+pub const max_choice_bytes = 64;
+
+/// `ask_owner`: the agent's question, or a draft to review; an inbox item
+/// the run waits on like an approval. The gate decides it as `ask_owner`,
+/// its argument the question (allowed by default).
+fn askOwnerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
+    const v = jv.parse(a, input_json);
+    const question = jv.str(jv.get(v, "question")) orelse "";
+    if (std.mem.trim(u8, question, " \t\r\n").len == 0) return .{ .text = "refused: ask_owner needs its question", .is_error = true };
+    const draft = jv.str(jv.get(v, "draft"));
+    const list = jv.arr(jv.get(v, "choices")) orelse &.{};
+    if (list.len > max_choices) return .{ .text = "refused: a question has at most 4 choices", .is_error = true };
+    if (draft != null and list.len > 0) return .{ .text = "refused: a draft takes no choices; the owner uses it, drops it or writes their own", .is_error = true };
+    const choices = try a.alloc([]const u8, list.len);
+    for (list, choices) |cv, *ch| {
+        const label = jv.str(cv) orelse return .{ .text = "refused: choices are labels", .is_error = true };
+        if (label.len == 0 or label.len > max_choice_bytes) return .{ .text = "refused: a choice has 1 to 64 bytes", .is_error = true };
+        ch.* = label;
+    }
+    // named like an approval when a definition other than main asks
+    const tag = try askerTag(r, a);
+    const size = tag.len + question.len + if (draft) |d| d.len else 0;
+    if (size > max_question) return .{ .text = try std.fmt.allocPrint(a, "refused: too long to ask the owner ({d} bytes; a question and its draft are at most {d})", .{ size, max_question }), .is_error = true };
+    if (try decideAndAsk(r, a, .ask_owner, "ask_owner", question, "", r.now())) |why|
+        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+    const out: tools.Output = out: {
+        const asker = r.asker orelse break :out .{ .text = "no one to ask", .is_error = true };
+        if (r.deadline_s > 0 and r.deadline_s * 1000 - util.nowMs(r.io) < 100) break :out .{ .text = "no time left in the turn to ask the owner", .is_error = true };
+        const got = asker.ask(asker.ctx, a, .{
+            .kind = if (draft != null) .draft else .question,
+            .text = try std.fmt.allocPrint(a, "{s}{s}", .{ tag, question }),
+            .choices = choices,
+            .takes_text = (jv.boolean(jv.get(v, "text")) orelse false) or choices.len == 0,
+            .draft = draft,
+            .deadline_s = r.deadline_s,
+            .who = r.who,
+            .rid = r.rid,
+            .label = r.label,
+            .private = r.isPrivate(),
+            .stop = r.env.stop,
+        });
+        const eql = std.mem.eql;
+        break :out switch (got.answer) {
+            .answered => if (draft != null)
+                (if (eql(u8, got.key, "drop")) tools.Output{ .text = "dropped" } else if (got.text.len > 0) tools.Output{ .text = try std.fmt.allocPrint(a, "draft replaced by the owner: {s}", .{got.text}) } else tools.Output{ .text = "draft used as it is" })
+            else if (eql(u8, got.key, "text")) tools.Output{ .text = try std.fmt.allocPrint(a, "wrote: {s}", .{got.text}) } else tools.Output{ .text = try std.fmt.allocPrint(a, "chose: {s}", .{got.text}) },
+            .timeout => .{ .text = "no answer in time", .is_error = true },
+            .unsent => .{ .text = "the question could not be sent to the owner", .is_error = true },
+            .withdrawn => .{ .text = if (r.env.stop.load(.acquire)) "stopped by the owner" else "no one is left to answer", .is_error = true },
+            .full => .{ .text = if (got.text.len > 0) got.text else "no place in the inbox until the turn's end", .is_error = true },
+            .once, .day, .deny => .{ .text = "not an answer to this question", .is_error = true },
+        };
+    };
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = "ask_owner", .arg = question, .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
+    return out;
 }
 
 /// A `send` refused before the gate: logged, and the model told why.
@@ -1428,6 +1818,7 @@ fn postThrough(r: *Run, a: std.mem.Allocator, p: *const Post, target: Target, as
         .message = d.message,
         .parts = d.parts,
         .why = if (d.why.len > 0) d.why else null,
+        .item = if (d.item != 0) d.item else null,
     });
     return .{ .delivery = d };
 }
@@ -1649,6 +2040,9 @@ const AskExtra = struct {
     /// Where a shell command starts, as the model gave it ("" the
     /// workspace).
     dir: []const u8 = "",
+    /// Gets the number of the inbox item the owner was asked in (0: not
+    /// asked).
+    item: ?*u64 = null,
 };
 
 fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, now_s: i64, extra: AskExtra) !?[]const u8 {
@@ -1671,14 +2065,15 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
         if (r.scheduled or r.asker == null) {
             action = .deny;
             why = "the agent wrote files in the workspace since the owner last allowed a command, and no one can be asked";
-            if (r.skipped) |s| s.add(r.io, name, arg);
+            // a grant can't lift that check
+            skip(r, a, tool, name, arg, d.subject, ctx.env, false);
         } else action = .ask;
     }
     if (extra.ask_why) |w| if (action == .allow) {
         if (r.scheduled or r.asker == null) {
             action = .deny;
             why = try std.fmt.allocPrint(a, "{s}, and no one can be asked", .{w});
-            if (r.skipped) |s| s.add(r.io, name, arg);
+            skip(r, a, tool, name, arg, d.subject, ctx.env, false);
         } else {
             action = .ask;
             why = w;
@@ -1690,7 +2085,8 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             why = "no one to ask";
             break :ask;
         };
-        const who = if (r.helper) try std.fmt.allocPrint(a, "[{s}] ", .{r.label}) else "";
+        // who asks (a day's grant goes to its definition)
+        const who = try askerTag(r, a);
         // the form the gate matched (for files, the path inside the
         // workspace), and what the model gave when that differs
         const given = if (std.mem.eql(u8, d.subject, arg)) "" else try std.fmt.allocPrint(a, " (given as {s})", .{arg});
@@ -1703,30 +2099,35 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             why = try std.fmt.allocPrint(a, "too long to ask the owner ({d} bytes; a question is at most {d}): make the call smaller", .{ what.len, max_question });
             break :ask;
         }
-        // helpers working at once still ask one question at a time; one
-        // that could only be answered after the turn's end is not asked
-        if (r.ask_lock) |l| if (!lockUntil(l, r.io, r.deadline_s, r.env.stop)) {
-            why = if (r.env.stop.load(.acquire)) "stopped by the owner" else "no time left in the turn to ask the owner";
-            break :ask;
-        };
+        // each question waits on its own item; one that could only be
+        // answered after the turn's end is not asked
         if (r.deadline_s > 0 and r.deadline_s * 1000 - util.nowMs(r.io) < 100) {
-            if (r.ask_lock) |l| l.unlock(r.io);
             why = "no time left in the turn to ask the owner";
             break :ask;
         }
-        var ans = if (r.env.stop.load(.acquire)) Answer.deny else asker.ask(asker.ctx, .{ .text = what, .allow_day = d.allow_day, .deadline_s = r.deadline_s });
+        const got: Reply = if (r.env.stop.load(.acquire)) .{ .answer = .withdrawn } else asker.ask(asker.ctx, a, .{
+            .text = what,
+            .allow_day = d.allow_day,
+            .deadline_s = r.deadline_s,
+            .who = r.who,
+            .rid = r.rid,
+            .label = r.label,
+            .private = r.isPrivate(),
+            .stop = r.env.stop,
+        });
+        if (extra.item) |p| p.* = got.item;
+        var ans = got.answer;
         // money, setup calls and posts others read are never granted for a
         // day, whatever came back
         if (!d.allow_day and ans == .day) ans = .once;
-        if (r.ask_lock) |l| l.unlock(r.io);
         switch (ans) {
             .once => {
                 action = .allow;
-                why = "allowed once by the owner";
+                why = try ownerSaid(a, "allowed once by the owner", "", got.item);
             },
             .day => {
                 action = .allow;
-                why = "allowed for 24 hours by the owner";
+                why = try ownerSaid(a, "allowed for 24 hours by the owner", "", got.item);
                 r.lock.lockUncancelable(r.io);
                 defer r.lock.unlock(r.io);
                 // the form the gate matches (for files, the path inside the
@@ -1735,9 +2136,12 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
                 try r.gate.grants.addFor(tool, ctx.env, gate.grantKey(tool, d.subject), definition, now_s + 86400);
                 if (r.grants_path) |p| r.gate.grants.save(r.io, p, now_s) catch {};
             },
-            .deny => why = "denied by the owner",
-            .timeout => why = "no answer from the owner in time",
-            .unsent => why = "the question could not be sent to the owner",
+            .deny => why = try ownerSaid(a, "denied by the owner", got.text, got.item),
+            .timeout => why = try ownerSaid(a, "no answer from the owner in time", "", got.item),
+            .unsent => why = try ownerSaid(a, "the question could not be sent to the owner", "", got.item),
+            .withdrawn => why = try ownerSaid(a, if (r.env.stop.load(.acquire)) "stopped by the owner" else "withdrawn: no one is left to answer", "", got.item),
+            .full => why = if (got.text.len > 0) got.text else "no place in the inbox until the turn's end",
+            .answered => why = try ownerSaid(a, "not an answer to this question", "", got.item),
         }
         // the owner saw those files and allowed a command all the same
         if (action == .allow) if (wrote) |wr| r.written.?.clear(wr.upto);
@@ -1749,16 +2153,49 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
     return if (action == .allow) null else why;
 }
 
-/// Takes `l`, waiting no later than `deadline_s` (0: no limit) and not
-/// past a stop; false if it was not taken.
-fn lockUntil(l: *Io.Mutex, io: Io, deadline_s: i64, stop: *std.atomic.Value(bool)) bool {
-    while (!l.tryLock()) {
-        if (stop.load(.acquire)) return false;
-        if (deadline_s > 0 and util.nowSeconds(io) >= deadline_s) return false;
-        io.sleep(.fromMilliseconds(20), .awake) catch {};
-    }
-    return true;
+/// Who asks, in front of a question: a helper by its label, a definition
+/// other than main and helper by its name too ("[chat/h1] ",
+/// "[chat/h1 researcher] ", "[researcher] "); "" for main.
+fn askerTag(r: *const Run, a: std.mem.Allocator) ![]const u8 {
+    const named = !std.mem.eql(u8, r.def.name, if (r.helper) "helper" else "main");
+    if (r.helper) return if (named) std.fmt.allocPrint(a, "[{s} {s}] ", .{ r.label, r.def.name }) else std.fmt.allocPrint(a, "[{s}] ", .{r.label});
+    return if (named) std.fmt.allocPrint(a, "[{s}] ", .{r.def.name}) else "";
 }
+
+/// What the owner did, their words and the item, as the gate's line and
+/// the agent say it: "denied by the owner: use staging (item 41)".
+fn ownerSaid(a: std.mem.Allocator, what: []const u8, words: []const u8, item: u64) ![]const u8 {
+    const said = if (words.len > 0) try std.fmt.allocPrint(a, "{s}: {s}", .{ what, words }) else what;
+    if (item == 0) return said;
+    return std.fmt.allocPrint(a, "{s} (item {d})", .{ said, item });
+}
+
+/// A call an unattended run skipped for want of approval, as a `Keeper`
+/// gets it.
+pub const Skip = struct {
+    tool: gate.Tool,
+    /// Where a shell command would have run (`host`).
+    env: []const u8,
+    /// The tool's name and argument, as the run's post lists them.
+    name: []const u8,
+    arg: []const u8,
+    /// What a grant for it holds as its key (`gate.grantKey`).
+    key: []const u8,
+    /// A grant for the run's task could let it run: not money, a post
+    /// others read, files the agent wrote or a dot file a post carries.
+    grantable: bool,
+    who: who_mod.Who,
+    rid: u64,
+    label: []const u8,
+    conversation: []const u8,
+    private: bool,
+};
+
+/// Keeps a skipped call as an inbox item; returns its id (0: none).
+pub const Keeper = struct {
+    ctx: *anyopaque,
+    keep: *const fn (ctx: *anyopaque, a: std.mem.Allocator, s: Skip) u64,
+};
 
 /// What a run left out because nobody could approve it; shared by the
 /// run and its helpers.
@@ -1768,6 +2205,9 @@ pub const Skipped = struct {
     items: std.ArrayList([]u8) = .empty,
     /// Calls past the first `max`, only counted.
     more: usize = 0,
+    /// Each skipped call becomes an inbox item (a task's run); null: only
+    /// listed.
+    keeper: ?Keeper = null,
     const max = 8;
 
     pub fn init(gpa: std.mem.Allocator) Skipped {
@@ -1779,11 +2219,14 @@ pub const Skipped = struct {
         s.items.deinit(s.gpa);
     }
 
-    fn add(s: *Skipped, io: Io, name: []const u8, arg: []const u8) void {
+    /// Lists a call (once), with the item it is kept as.
+    fn add(s: *Skipped, io: Io, name: []const u8, arg: []const u8, item: u64) void {
         s.mutex.lockUncancelable(io);
         defer s.mutex.unlock(io);
         const short = util.cut(arg, 100);
-        const line = std.fmt.allocPrint(s.gpa, "{s}: {s}{s}", .{ name, short, if (short.len < arg.len) "…" else "" }) catch return;
+        var ib: [32]u8 = undefined;
+        const kept = if (item == 0) "" else std.fmt.bufPrint(&ib, " (item {d})", .{item}) catch "";
+        const line = std.fmt.allocPrint(s.gpa, "{s}: {s}{s}{s}", .{ name, short, if (short.len < arg.len) "…" else "", kept }) catch return;
         for (s.items.items) |x| if (std.mem.eql(u8, x, line)) {
             s.gpa.free(line);
             return;
@@ -2033,7 +2476,7 @@ pub const Written = struct {
 /// Notes a call refused only because nobody could approve it: the gate
 /// said ask with no one to ask, or turned ask into deny in a scheduled run.
 fn noteSkipped(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, now_s: i64, d: gate.Decision, ctx: gate.Ctx) void {
-    const s = r.skipped orelse return;
+    if (r.skipped == null) return;
     const unattended = switch (d.action) {
         .ask => r.asker == null,
         .deny => r.scheduled and blk: {
@@ -2047,7 +2490,28 @@ fn noteSkipped(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8,
         },
         .allow => false,
     };
-    if (unattended) s.add(r.io, name, arg);
+    // money and posts others read stay asked every time: no grant lifts them
+    if (unattended) skip(r, a, tool, name, arg, d.subject, ctx.env, tool != .money and !(tool == .send and ctx.shared) and !tool.setup(arg));
+}
+
+/// A call the run skipped: listed in its post, and kept as an inbox item
+/// when the run has a keeper (a task's).
+fn skip(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, subject: []const u8, env: []const u8, grantable: bool) void {
+    const s = r.skipped orelse return;
+    const item = if (s.keeper) |k| k.keep(k.ctx, a, .{
+        .tool = tool,
+        .env = env,
+        .name = name,
+        .arg = arg,
+        .key = gate.grantKey(tool, subject),
+        .grantable = grantable,
+        .who = r.who,
+        .rid = r.rid,
+        .label = r.label,
+        .conversation = r.conversation,
+        .private = r.isPrivate(),
+    }) else 0;
+    s.add(r.io, name, arg, item);
 }
 
 fn webAllow(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) ?[]const u8 {
@@ -2163,11 +2627,13 @@ fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, in
 // ---- helpers ----
 
 const max_tasks = 8;
-const default_helper_tools = [_]gate.Tool{ .search, .fetch, .browse, .read_file, .recall, .skill };
 
 const Task = struct {
     text: []const u8,
-    tools: []const gate.Tool,
+    /// The definition that does it.
+    agent: []const u8,
+    /// What the task passes on (narrows its definition's tools); null: all.
+    tools: ?[]const []const u8,
     strong: bool,
 };
 
@@ -2179,31 +2645,66 @@ fn parseTasks(a: std.mem.Allocator, input_json: []const u8) ![]Task {
     for (list, 0..) |item, i| {
         const text = jv.str(jv.get(item, "task")) orelse return error.BadInput;
         if (text.len == 0) return error.BadInput;
-        var tl: std.ArrayList(gate.Tool) = .empty;
+        const agent_name = jv.str(jv.get(item, "agent")) orelse "helper";
+        var tl: ?[]const []const u8 = null;
         if (jv.arr(jv.get(item, "tools"))) |names| {
-            for (names) |n| {
-                const tool = gate.Tool.fromName(jv.str(n) orelse continue) orelse continue;
-                if (std.mem.indexOfScalar(gate.Tool, tl.items, tool) == null) try tl.append(a, tool);
-            }
-        } else try tl.appendSlice(a, &default_helper_tools);
+            var named: std.ArrayList([]const u8) = .empty;
+            for (names) |n| if (try toolPattern(a, jv.str(n) orelse continue)) |p| try named.append(a, p);
+            tl = named.items;
+        } else if (std.mem.eql(u8, agent_name, "helper")) {
+            // 0.3's helper: a task that names no tools gets these six
+            tl = &agents.default_tools;
+        }
         const strong = if (jv.get(item, "strong")) |sv| (sv == .bool and sv.bool) else false;
-        out[i] = .{ .text = text, .tools = tl.items, .strong = strong };
+        out[i] = .{ .text = text, .agent = agent_name, .tools = tl, .strong = strong };
     }
     return out;
 }
 
-/// What the gate and the log see for a delegate call: every task, whole.
-fn delegateArg(a: std.mem.Allocator, input_json: []const u8) ![]const u8 {
-    const tasks = try parseTasks(a, input_json);
+/// A tool a `delegate` task names, as definitions name tools: a built-in
+/// tool, `server/tool` (the model's `server__tool` too), `server/*`, and
+/// `mcp` for every MCP tool (as in 0.3); null for anything else.
+fn toolPattern(a: std.mem.Allocator, name: []const u8) !?[]const u8 {
+    if (gate.Tool.fromName(name)) |tl| return switch (tl) {
+        .mcp => "*/*",
+        .money, .login => null,
+        else => name,
+    };
+    if (std.mem.indexOf(u8, name, "__")) |i| return try std.fmt.allocPrint(a, "{s}/{s}", .{ name[0..i], name[i + 2 ..] });
+    if (std.mem.indexOfScalar(u8, name, '/') != null) return name;
+    return null;
+}
+
+/// What the gate and the log see for a delegate call: every task, whole,
+/// with the definition that does it.
+fn delegateArg(a: std.mem.Allocator, tasks: []const Task) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.print(a, "{d} task{s}:", .{ tasks.len, if (tasks.len == 1) "" else "s" });
-    for (tasks) |tk| try out.print(a, "\n- {s}", .{tk.text});
+    for (tasks) |tk| try out.print(a, "\n- [{s}] {s}", .{ tk.agent, tk.text });
     return out.items;
+}
+
+/// A copy of the definition `name` (in `a`): the run's set's, or with no
+/// set a built-in; null: none has that name.
+fn findDef(r: *const Run, a: std.mem.Allocator, name: []const u8) !?agents.Def {
+    if (r.defs) |set| return set.get(a, name);
+    for (agents.builtins) |b| if (std.mem.eql(u8, b.name, name)) return b.*;
+    return null;
+}
+
+/// "no definition called x; they are: helper, main".
+fn unknownDef(r: *const Run, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+    var names: std.ArrayList(u8) = .empty;
+    const list = if (r.defs) |set| try set.list(a) else &[_]agents.Def{ agents.builtin_helper, agents.builtin_main };
+    for (list, 0..) |d, i| try names.print(a, "{s}{s}", .{ if (i > 0) ", " else "", d.name });
+    return std.fmt.allocPrint(a, "no definition called {s}; they are: {s}", .{ name, names.items });
 }
 
 const Helper = struct {
     parent: *Run,
     task: Task,
+    /// Its definition, as it was when `delegate` was called.
+    def: agents.Def,
     n: usize,
     deadline_s: i64,
     cache: *PageCache,
@@ -2212,10 +2713,16 @@ const Helper = struct {
     ended_by: ?[]u8 = null,
     steps: u32 = 0,
     failed: ?[]const u8 = null,
+    /// Where a `failed` made at run time is written (helpers run at once:
+    /// never in the shared arena).
+    failed_buf: [200]u8 = undefined,
 };
 
 fn delegate(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
     const tasks = try parseTasks(a, input_json);
+    // each task's definition as it is now: a change saved later applies to the next
+    const defs = try a.alloc(agents.Def, tasks.len);
+    for (tasks, defs) |tk, *d| d.* = (try findDef(r, a, tk.agent)) orelse return .{ .text = try unknownDef(r, a, tk.agent), .is_error = true };
     var cache = PageCache.init(r.gpa);
     defer cache.deinit();
     // what is left of the turn that asked, not a new turn's worth
@@ -2223,7 +2730,7 @@ fn delegate(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
     const hs = try a.alloc(Helper, tasks.len);
     const threads = try a.alloc(?std.Thread, tasks.len);
     for (tasks, 0..) |task, i| {
-        hs[i] = .{ .parent = r, .task = task, .n = i + 1, .deadline_s = deadline, .cache = r.cache orelse &cache };
+        hs[i] = .{ .parent = r, .task = task, .def = defs[i], .n = i + 1, .deadline_s = deadline, .cache = r.cache orelse &cache };
         threads[i] = std.Thread.spawn(.{}, helperMain, .{&hs[i]}) catch null;
         if (threads[i] == null) hs[i].failed = "could not start";
     }
@@ -2254,46 +2761,76 @@ fn helperMain(h: *Helper) void {
 
 fn helperRun(h: *Helper) !void {
     const p = h.parent;
-    const cfg = p.model_cfg.?;
+    const cfg = p.model_cfg orelse return error.NoModelSettings;
+    const d = h.def;
+    // its own stop flag, set with its parent's, so /stop NAME reaches it alone
+    var own_stop: std.atomic.Value(bool) = .init(p.env.stop.load(.acquire));
+    const stop = if (p.registry) |reg| blk: {
+        reg.add(reg.ctx, &own_stop, d.name, p.env.stop);
+        break :blk &own_stop;
+    } else p.env.stop;
+    defer if (p.registry) |reg| reg.remove(reg.ctx, &own_stop);
     if (p.pool) |pool| {
-        if (!pool.acquire(p.io, p.agents.parallel, p.env.stop)) {
+        if (!pool.acquire(p.io, p.agents.parallel, stop)) {
             h.failed = "stopped before it started";
             return;
         }
     }
     defer if (p.pool) |pool| pool.release(p.io);
+    // a place of its definition: waited for until the turn ends; the run
+    // that delegated it never waits on a place it holds itself
+    var placed = false;
+    if (p.pool) |pool| {
+        if (d.parallel == 1 and p.holds_place and std.mem.eql(u8, p.def.name, d.name)) {
+            h.failed = std.fmt.bufPrint(&h.failed_buf, "{s} runs one at a time, and the run that delegated it holds that place", .{d.name}) catch "the run that delegated it holds that place";
+            return;
+        }
+        if (!pool.takeUntil(p.io, d.name, d.parallel, stop, h.deadline_s)) {
+            h.failed = if (stop.load(.acquire)) "stopped before it started" else std.fmt.bufPrint(&h.failed_buf, "no place for {s} before the turn's end (it runs at most {d} at once)", .{ d.name, d.parallel }) catch "no place before the turn's end";
+            return;
+        }
+        placed = true;
+    }
+    defer if (placed) p.pool.?.give(p.io, d.name);
     if (h.deadline_s * 1000 - util.nowMs(p.io) < 100) {
         h.failed = "no time left in the turn";
         return;
     }
     const left = @max(h.deadline_s - p.now(), 1);
-    var client = try model.Client.init(p.gpa, p.io, cfg.url, cfg.key, if (h.task.strong) cfg.main else cfg.worker, cfg.max_tokens);
+    // `strong`: the main model; else the definition's, else the workers';
+    // each at the provider the value names
+    const route = if (h.task.strong) cfg.main else if (d.model.len > 0) d.model else cfg.worker;
+    var client = try p.modelClient(route, cfg.max_tokens);
     defer client.deinit();
     var label_buf: [64]u8 = undefined;
     var w = p.*;
     w.client = &client;
     w.helper = true;
+    w.useDefinition(d);
+    w.env.stop = stop;
+    w.holds_place = placed;
     w.label = std.fmt.bufPrint(&label_buf, "{s}/h{d}", .{ util.cut(p.label, 40), h.n }) catch "helper";
     // started by what started its parent, delegated by its parent's definition
-    w.who = .{ .agent = "helper", .by = p.who.by, .parent = &p.who };
+    w.who = .{ .agent = d.name, .by = p.who.by, .parent = &p.who };
     w.parent_rid = if (p.rid != 0) p.rid else null;
-    w.allowed = h.task.tools;
-    w.auto_recall = false;
-    w.top_size = 0;
+    // its tools: its definition's, within the task's and its starter's
+    w.narrow = h.task.tools;
+    w.starter = p;
     w.extra_instructions = "";
     w.cache = h.cache;
     w.web = null;
     // a helper's answer goes to the run that started it
     w.outbox = null;
-    w.token_cap = p.agents.tokens;
-    w.limits.steps_per_turn = p.agents.steps;
-    w.limits.turn_seconds = @intCast(@min(left, std.math.maxInt(u32)));
+    // its own limits, else [agents]; never past its parent's turn
+    w.token_cap = d.tokens orelse p.agents.tokens;
+    w.limits.steps_per_turn = d.steps orelse p.agents.steps;
+    w.limits.turn_seconds = @intCast(@min(left, d.seconds orelse std.math.maxInt(u32), std.math.maxInt(u32)));
     var conv = Conversation.init(p.gpa);
     defer conv.deinit();
     const res = try turn(&w, &conv, h.task.text, false);
     defer freeResult(&w, res);
     h.steps = res.steps;
-    h.answer = try p.gpa.dupe(u8, util.cut(res.text, p.agents.answer_bytes));
+    h.answer = try p.gpa.dupe(u8, util.cut(res.text, d.answer_bytes orelse p.agents.answer_bytes));
     if (res.ended_by) |e| h.ended_by = try p.gpa.dupe(u8, e);
 }
 
@@ -2322,7 +2859,7 @@ fn compact(r: *Run, conv: *Conversation) !usize {
             try r.logRun(.turn, r.isPrivate(), .{ .event = "summarised", .turns = n - sum.left_out });
             if (sum.left_out > 0) try r.logRun(.turn, r.isPrivate(), .{ .event = "dropped unsummarised", .turns = sum.left_out, .summary = true });
         } else |e| {
-            try r.logRun(.model, false, .{ .event = "summary failed", .result = @errorName(e) });
+            try r.logRun(.model, false, .{ .event = "summary failed", .result = @errorName(e), .provider = r.providerOf(r.model_cfg.?.memory) });
         }
     }
     // still over (or no summary): the oldest go whole, and it is said
@@ -2380,11 +2917,11 @@ fn summarise(r: *Run, conv: *Conversation, n: usize) !Summary {
         // not even the newest fits: its start, rather than nothing
         try text.appendSlice(a, util.cut(parts[n - 1], summary_input_max -| text.items.len));
     } else for (parts[first..]) |part| try text.appendSlice(a, part);
-    const cfg = r.model_cfg.?;
-    var client = try model.Client.init(r.gpa, r.io, cfg.url, cfg.key, cfg.memory, 1024);
+    const cfg = r.model_cfg orelse return error.NoModelSettings;
+    var client = try r.modelClient(cfg.memory, 1024);
     defer client.deinit();
     const reply = try client.send(a, summary_prompt, &.{.{ .role = .user, .blocks = &.{.{ .text = text.items }} }}, &.{});
-    try r.logRun(.model, false, .{ .result = "ok", .purpose = "summary", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
+    try r.logRun(.model, false, .{ .result = "ok", .provider = client.provider, .purpose = "summary", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
     const out = try reply.text(a);
     if (out.len == 0) return error.EmptySummary;
     return .{ .text = try r.gpa.dupe(u8, out), .left_out = left_out };
@@ -2407,7 +2944,6 @@ const Fix = struct {
     asked: u32 = 0,
     answer: Answer = .once,
     pool: Pool = .{},
-    ask_lock: Io.Mutex = .init,
     ask_ms: u32 = 0,
     last_allow_day: bool = false,
     /// The last question asked (in the arena), and its deadline.
@@ -2436,7 +2972,6 @@ const Fix = struct {
         f.asked = 0;
         f.answer = .once;
         f.pool = .{};
-        f.ask_lock = .init;
         f.ask_ms = 0;
         f.last_allow_day = false;
         f.last_what = "";
@@ -2462,7 +2997,8 @@ const Fix = struct {
         };
     }
 
-    fn askFn(ctx: *anyopaque, q: Question) Answer {
+    fn askFn(ctx: *anyopaque, a: std.mem.Allocator, q: Question) Reply {
+        _ = a;
         const f: *Fix = @ptrCast(@alignCast(ctx));
         f.last_what = f.e.arena.allocator().dupe(u8, q.text) catch "";
         f.last_deadline = q.deadline_s;
@@ -2474,7 +3010,7 @@ const Fix = struct {
         if (f.ask_ms > 0) t.io.sleep(.fromMilliseconds(f.ask_ms), .awake) catch {};
         f.asked += 1;
         _ = f.in_flight.fetchSub(1, .acq_rel);
-        return f.answer;
+        return .{ .answer = f.answer };
     }
 
     fn deinit(f: *Fix) void {
@@ -2931,7 +3467,6 @@ test "empty_answer_is_not_kept" {
 fn withHelpers(f: *Fix) !void {
     f.run.model_cfg = .{ .url = try f.e.url(), .key = "og-test-key", .main = "claude-test", .worker = "claude-worker", .memory = "claude-mem", .max_tokens = 100 };
     f.run.pool = &f.pool;
-    f.run.ask_lock = &f.ask_lock;
 }
 
 test "delegate_runs_helpers_in_parallel_and_returns_their_answers" {
@@ -2985,12 +3520,13 @@ test "helper_stops_at_its_token_limit" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(4), "Token limit") != null);
 }
 
-test "helpers_ask_the_owner_one_at_a_time" {
+test "helpers_ask_the_owner_at_once" {
     var f: Fix = undefined;
     try f.init("");
     defer f.deinit();
     try withHelpers(&f);
-    f.ask_ms = 150;
+    // each question waits on its own: neither waits for the other
+    f.ask_ms = 600;
     try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"one\",\"tools\":[\"shell\"]},{\"task\":\"two\",\"tools\":[\"shell\"]}]}"));
     try f.e.script(2, model.toolReply("w1", "shell", "{\"command\":\"echo one\"}"));
     try f.e.script(3, model.toolReply("w2", "shell", "{\"command\":\"echo two\"}"));
@@ -3001,23 +3537,20 @@ test "helpers_ask_the_owner_one_at_a_time" {
     defer freeResult(&f.run, r);
     try t.expectEqualStrings("Both done.", r.text);
     try t.expectEqual(2, f.asked);
-    try t.expectEqual(1, f.max_in_flight.load(.acquire));
+    try t.expectEqual(2, f.max_in_flight.load(.acquire));
 }
 
-test "a_helpers_question_after_the_deadline_is_not_asked" {
+test "a_question_after_the_deadline_is_not_asked" {
     var f: Fix = undefined;
     try f.init("");
     defer f.deinit();
-    try withHelpers(&f);
     f.run.limits.turn_seconds = 2;
     // the first question is answered after the turn's end (a 2 s turn ends
-    // 2 to 3 s after it began: its end is a whole second); the second
-    // helper's question waits behind it and can't be answered in time
+    // 2 to 3 s after it began: its end is a whole second); the second call
+    // of the same reply comes after it and can't be answered in time
     f.ask_ms = 3500;
-    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"one\",\"tools\":[\"shell\"]},{\"task\":\"two\",\"tools\":[\"shell\"]}]}"));
-    try f.e.script(2, model.toolReply("w1", "shell", "{\"command\":\"echo one\"}"));
-    try f.e.script(3, model.toolReply("w2", "shell", "{\"command\":\"echo two\"}"));
-    for (4..8) |n| try f.e.script(@intCast(n), model.textReply("done"));
+    try f.e.script(1, "{\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"shell\",\"input\":{\"command\":\"echo one\"}},{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"shell\",\"input\":{\"command\":\"echo two\"}}],\"stop_reason\":\"tool_use\"}");
+    try f.e.script(2, model.textReply("done"));
     const r = try f.say("run two");
     freeResult(&f.run, r);
     try t.expectEqual(1, f.asked);
@@ -3947,7 +4480,7 @@ test "kinds_without_a_tool_yet_are_not_offered_or_run" {
     freeResult(&f.run, r);
     const a = f.e.arena.allocator();
     const req1 = try f.e.request(1);
-    for ([_][]const u8{ "send", "ask_owner", "mail", "trigger", "workflow", "agent_save", "app_read", "app_draft", "app_save", "env_save", "snapshot" }) |name|
+    for ([_][]const u8{ "send", "mail", "trigger", "workflow", "app_read", "app_draft", "app_save", "env_save", "snapshot" }) |name|
         try t.expect(std.mem.indexOf(u8, req1, try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{name})) == null);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "this tool is not available here") != null);
     try t.expectEqual(0, f.asked);
@@ -4273,4 +4806,671 @@ test "the_snapshot_tool_takes_one_with_its_label" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(4), "not taken: no environment nobox") != null);
     // no tool restores
     try t.expect(std.mem.indexOf(u8, try f.e.request(5), "no such tool") != null);
+}
+
+// ---- definitions ----
+
+/// The tools a run offers, as "a,b,c,".
+fn toolNames(r: *const Run, a: std.mem.Allocator) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (try toolDefs(r, a)) |d| try out.print(a, "{s},", .{d.name});
+    return out.items;
+}
+
+/// A definition read from `text` (in the test's arena).
+fn defOf(f: *Fix, name: []const u8, text: []const u8) !agents.Def {
+    var diag: agents.Diag = .{};
+    return agents.parse(f.e.arena.allocator(), name, text, &diag) catch |e| {
+        std.debug.print("{s}: line {d}: {s}\n", .{ name, diag.line, diag.why });
+        return e;
+    };
+}
+
+/// The definitions in the test's folder `agents/`, with these files.
+fn defsWith(f: *Fix, files: []const [2][]const u8) !agents.Set {
+    const a = f.e.arena.allocator();
+    try f.e.tmp.dir.createDirPath(t.io, "agents");
+    for (files) |x| try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = try std.fmt.allocPrint(a, "agents/{s}.md", .{x[0]}), .data = x[1], .flags = .{ .permissions = util.private_file } });
+    var set: agents.Set = .init(t.allocator, t.io, try std.fs.path.join(a, &.{ f.e.dir, "agents" }), try std.fs.path.join(a, &.{ f.e.dir, "state", "agents" }));
+    errdefer set.deinit();
+    var diag: agents.Diag = .{};
+    set.load(a, &diag) catch |e| {
+        std.debug.print("{s}\n", .{try diag.text(a)});
+        return e;
+    };
+    return set;
+}
+
+const researcher_md = "---\nname: researcher\ndescription: Research across sources.\nmodel: claude-r\nsteps: 1\ntools: search, recall\n---\nResearch with two sources.\n";
+
+test "no_agents_folder_means_0_3" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    // main offers 0.3's tools, and the inbox's ask_owner where the owner
+    // can answer (gap 5)
+    try t.expectEqualStrings("shell,read_file,write_file,fetch,search,recall,remember,ask_owner,delegate,", try toolNames(&f.run, a));
+    // a bare task gets the helper's six, a named one what it names
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"bare\"},{\"task\":\"with shell\",\"tools\":[\"shell\"]}]}"));
+    try f.e.script(2, "{\"delay_ms\":200,\"content\":[{\"type\":\"text\",\"text\":\"one\"}],\"stop_reason\":\"end_turn\"}");
+    try f.e.script(3, "{\"delay_ms\":200,\"content\":[{\"type\":\"text\",\"text\":\"two\"}],\"stop_reason\":\"end_turn\"}");
+    try f.e.script(4, model.textReply("done"));
+    const r = try f.say("split");
+    freeResult(&f.run, r);
+    var bare: u32 = 0;
+    var shell: u32 = 0;
+    for (2..4) |n| {
+        const req = try f.e.request(@intCast(n));
+        if (std.mem.indexOf(u8, req, "bare") != null) {
+            bare += 1;
+            for ([_][]const u8{ "search", "fetch", "read_file", "recall" }) |x| try t.expect(std.mem.indexOf(u8, req, try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{x})) != null);
+            try t.expect(std.mem.indexOf(u8, req, "\"name\":\"shell\"") == null);
+        } else {
+            shell += 1;
+            try t.expect(std.mem.indexOf(u8, req, "\"name\":\"shell\"") != null);
+            try t.expect(std.mem.indexOf(u8, req, "\"name\":\"fetch\"") == null);
+        }
+        // the helper's instructions, read from its definition
+        try t.expect(std.mem.indexOf(u8, req, "You are a helper doing one task") != null);
+    }
+    try t.expectEqual(1, bare);
+    try t.expectEqual(1, shell);
+}
+
+test "delegate_runs_the_named_definition" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    var set = try defsWith(&f, &.{.{ "researcher", researcher_md }});
+    defer set.deinit();
+    f.run.defs = &set;
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"find zig news\",\"agent\":\"researcher\"}]}"));
+    try f.e.script(2, model.toolReply("r1", "recall", "{\"query\":\"zig\"}"));
+    try f.e.script(3, model.textReply("parent done"));
+    const r = try f.say("research");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("parent done", r.text);
+    // the delegate tool lists the definitions
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "researcher: Research across sources.") != null);
+    // the helper: its body, its model, its tools
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "Research with two sources.") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "\"model\":\"claude-r\"") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "\"name\":\"search\"") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "\"name\":\"recall\"") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "\"name\":\"fetch\"") == null);
+    try t.expect(std.mem.indexOf(u8, req2, "\"name\":\"shell\"") == null);
+    // its steps: one, then its answer says the limit
+    try t.expectEqual(3, f.e.server.modelRequests());
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "Step limit reached") != null);
+    // the log names its definition; the gate saw the task's
+    const lt = try f.logText();
+    try t.expect(std.mem.indexOf(u8, lt, "\"run\":\"chat/h1\",\"by\":\"owner\",\"agent\":\"researcher\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "- [researcher] find zig news") != null);
+}
+
+/// An outbox that takes every post (for runs that need one to be offered `send`).
+const NullOutbox = struct {
+    fn find(_: *anyopaque, a: std.mem.Allocator, name: []const u8) ?Target {
+        return .{ .name = a.dupe(u8, name) catch return null };
+    }
+    fn names(_: *anyopaque, _: std.mem.Allocator) []const []const u8 {
+        return &.{"main"};
+    }
+    fn post(_: *anyopaque, _: std.mem.Allocator, _: *const Post) Delivery {
+        return .{ .status = .sent, .parts = 1 };
+    }
+    var dummy: u8 = 0;
+    fn outbox() Outbox {
+        return .{ .ctx = &dummy, .find = find, .names = names, .post = post };
+    }
+};
+
+test "a_delegated_run_gets_no_tool_its_starter_lacks" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    var set = try defsWith(&f, &.{});
+    defer set.deinit();
+    f.run.defs = &set;
+    f.run.outbox = NullOutbox.outbox();
+    f.run.conversation = "main";
+    const a = f.e.arena.allocator();
+    // the run itself offers send (the owner started it in a conversation)
+    const own = try toolNames(&f.run, a);
+    try t.expect(std.mem.indexOf(u8, own, "send,") != null);
+    // a starter that lacks shell: a task asking for it gets only what the starter has
+    f.run.narrow = &.{ "recall", "search", "delegate", "send", "remember", "agent_save" };
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"try all\",\"tools\":[\"shell\",\"recall\",\"delegate\",\"remember\",\"skill_save\",\"agent_save\",\"send\",\"web\",\"ask_owner\"]}]}"));
+    try f.e.script(2, model.textReply("helper done"));
+    try f.e.script(3, model.textReply("ok"));
+    const r = try f.say("go");
+    freeResult(&f.run, r);
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "\"name\":\"recall\"") != null);
+    for ([_][]const u8{ "shell", "delegate", "remember", "skill_save", "agent_save", "send", "web", "ask_owner", "search" }) |x|
+        try t.expect(std.mem.indexOf(u8, req2, try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{x})) == null);
+}
+
+test "a_pinned_definition_sees_only_pinned_items" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const now = util.nowSeconds(t.io);
+    const p = try f.mem.add("Always ask before deleting anything", null, now);
+    _ = try f.mem.setPinned(p.id, true);
+    _ = try f.mem.add("plays chess on weekends", null, now);
+    f.run.useDefinition(try defOf(&f, "quiet", "---\nname: quiet\ndescription: Quiet.\nmemory: pinned\n---\nQuiet one.\n"));
+    try f.e.script(1, model.textReply("ok"));
+    try f.e.script(2, model.textReply("ok"));
+    var r = try f.say("chess this weekend?");
+    freeResult(&f.run, r);
+    const req1 = try f.e.request(1);
+    try t.expect(std.mem.indexOf(u8, req1, "Always ask before deleting anything") != null);
+    try t.expect(std.mem.indexOf(u8, req1, "plays chess") == null);
+    try t.expect(std.mem.indexOf(u8, req1, "Quiet one.") != null);
+    // shared memory: the strongest and the recalled come in too
+    f.run.useDefinition(agents.builtin_main);
+    r = try f.say("chess this weekend?");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "plays chess") != null);
+}
+
+test "skills_follow_the_definitions_skills" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.run.skills_dir = try std.fs.path.join(a, &.{ f.e.dir, "skills" });
+    try skills.save(t.io, f.run.skills_dir, "zig-build", "How to build Zig projects", "zig build");
+    try skills.save(t.io, f.run.skills_dir, "deploy", "How to deploy the site", "make deploy");
+    f.run.useDefinition(try defOf(&f, "zigger", "---\nname: zigger\ndescription: Zig.\ntools: skill, recall\nskills: zig-*\n---\nZig work.\n"));
+    try f.e.script(1, model.toolReply("tu_1", "skill", "{\"name\":\"deploy\"}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("deploy it");
+    freeResult(&f.run, r);
+    const req1 = try f.e.request(1);
+    try t.expect(std.mem.indexOf(u8, req1, "- zig-build: How to build Zig projects") != null);
+    try t.expect(std.mem.indexOf(u8, req1, "- deploy:") == null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "make deploy") == null);
+}
+
+test "a_question_names_the_definition_that_asks" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    f.run.useDefinition(try defOf(&f, "researcher", "---\nname: researcher\ndescription: R.\ntools: shell\nsteps: 2\ntokens: 500\nseconds: 30\n---\nR.\n"));
+    // a run of its own: the definition's limits
+    try t.expectEqualStrings("researcher", f.run.who.agent);
+    try t.expectEqual(2, f.run.limits.steps_per_turn);
+    try t.expectEqual(500, f.run.token_cap);
+    try t.expectEqual(30, f.run.limits.turn_seconds);
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(2, model.textReply("ok"));
+    var r = try f.say("hi");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.startsWith(u8, f.last_what, "[researcher] shell: echo hi"));
+    // main asks as in 0.3, with its limits
+    f.run.useDefinition(agents.builtin_main);
+    try t.expectEqual(20, f.run.limits.steps_per_turn);
+    try t.expectEqual(0, f.run.token_cap);
+    try f.e.script(3, model.toolReply("tu_2", "shell", "{\"command\":\"echo again\"}"));
+    try f.e.script(4, model.textReply("ok"));
+    r = try f.say("again");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.startsWith(u8, f.last_what, "shell: echo again"));
+}
+
+test "an_unknown_definition_is_refused_before_the_gate" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    var set = try defsWith(&f, &.{.{ "researcher", researcher_md }});
+    defer set.deinit();
+    f.run.defs = &set;
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"x\",\"agent\":\"researchr\"}]}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("go");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "no definition called researchr; they are: helper, main, researcher") != null);
+    try t.expectEqual(2, f.e.server.modelRequests());
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"kind\":\"gate\"") == null);
+}
+
+// ---- agent_save ----
+
+/// A run the owner started from a conversation, with the definitions `set`.
+fn ownerRunWith(f: *Fix, set: *agents.Set) void {
+    f.run.defs = set;
+    f.run.outbox = NullOutbox.outbox();
+    f.run.conversation = "main";
+}
+
+/// The model calls `agent_save` with `name` and the whole `text`.
+fn saveCall(f: *Fix, id: []const u8, name: []const u8, text: []const u8) ![]const u8 {
+    const a = f.e.arena.allocator();
+    const input = try std.fmt.allocPrint(a, "{{\"name\":\"{s}\",\"text\":{f}}}", .{ name, std.json.fmt(text, .{}) });
+    return toolReplyOf(f, id, "agent_save", input);
+}
+
+fn researcherWith(a: std.mem.Allocator, body: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "---\nname: researcher\ndescription: Research across sources.\nmodel: claude-r\ntools: search, recall, agent_save\n---\n{s}\n", .{body});
+}
+
+test "agent_save_asks_every_time_with_the_whole_file" {
+    var f: Fix = undefined;
+    // an allow rule does not lift it
+    try f.init("allow agent_save *\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    var set = try defsWith(&f, &.{.{ "researcher", try researcherWith(a, "Research with two sources.") }});
+    defer set.deinit();
+    ownerRunWith(&f, &set);
+    f.run.useDefinition((try set.get(a, "researcher")).?);
+    // nor a grant, nor a day's answer
+    try f.grants.addFor(.agent_save, "host", "researcher", "", util.nowSeconds(t.io) + 3600);
+    f.answer = .day;
+    try f.e.script(1, try saveCall(&f, "tu_1", "researcher", try researcherWith(a, "Cite dates.")));
+    try f.e.script(2, try saveCall(&f, "tu_2", "researcher", try researcherWith(a, "Cite dates and places.")));
+    try f.e.script(3, model.textReply("saved twice"));
+    var r = try f.say("cite dates");
+    freeResult(&f.run, r);
+    try t.expectEqual(2, f.asked);
+    try t.expect(!f.last_allow_day);
+    try t.expectEqual(1, f.grants.items.items.len);
+    try t.expect(std.mem.startsWith(u8, f.last_what, "[researcher] agent_save: researcher, a change to its own definition, asked by researcher"));
+    try t.expect(std.mem.indexOf(u8, f.last_what, "The whole file, ") != null);
+    try t.expect(std.mem.indexOf(u8, f.last_what, "Cite dates and places.") != null);
+    try t.expect(std.mem.indexOf(u8, f.last_what, "saved: agent:researcher ") != null);
+    // a deny rule stops it, unasked
+    f.g.rules = try rules.parse(a, "deny agent_save *\n");
+    try f.e.script(4, try saveCall(&f, "tu_3", "researcher", try researcherWith(a, "Denied.")));
+    try f.e.script(5, model.textReply("refused"));
+    r = try f.say("once more");
+    freeResult(&f.run, r);
+    try t.expectEqual(2, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), "refused by the gate: rule on line 1") != null);
+}
+
+test "agent_save_refuses_another_definition_and_a_bad_file_unasked" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const first = try researcherWith(a, "Research with two sources.");
+    var set = try defsWith(&f, &.{.{ "researcher", first }});
+    defer set.deinit();
+    ownerRunWith(&f, &set);
+    try f.e.script(1, try saveCall(&f, "tu_1", "researcher", try researcherWith(a, "Taken over.")));
+    try f.e.script(2, try saveCall(&f, "tu_2", "writer", "---\nname: writer\ndescription: W.\ncolour: red\n---\n"));
+    try f.e.script(3, try saveCall(&f, "tu_3", "main", "---\nname: main\ndescription: M.\ntools: telnet\n---\n"));
+    try f.e.script(4, model.textReply("could not"));
+    const r = try f.say("change things");
+    freeResult(&f.run, r);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "researcher is another definition") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "agents/writer.md line 4 has an error: unknown key colour") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "unknown tool telnet") != null);
+    try t.expectEqualStrings(first, try f.e.tmp.dir.readFileAlloc(t.io, "agents/researcher.md", a, .unlimited));
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "agents/writer.md", .{}));
+}
+
+test "agent_save_is_offered_only_in_runs_the_owner_started_from_a_conversation" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    var set = try defsWith(&f, &.{});
+    defer set.deinit();
+    ownerRunWith(&f, &set);
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "agent_save,") != null);
+    // not where no one reads its question in a conversation
+    var no_conv = f.run;
+    no_conv.outbox = null;
+    try t.expect(!no_conv.allows(.agent_save));
+    // not in a run a schedule started
+    var task = f.run;
+    task.who.by = "schedule:x";
+    task.scheduled = true;
+    try t.expect(!task.allows(.agent_save));
+    // not in a delegated run
+    var helper = f.run;
+    helper.helper = true;
+    try t.expect(!helper.allows(.agent_save));
+    // not when its definition leaves it out
+    var plain = f.run;
+    plain.useDefinition(try defOf(&f, "plain", "---\nname: plain\ndescription: P.\ntools: recall\n---\n"));
+    try t.expect(!plain.allows(.agent_save));
+}
+
+test "an_allowed_change_keeps_the_old_file_and_applies_to_the_next_run" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    var set = try defsWith(&f, &.{.{ "researcher", try researcherWith(a, "Research with two sources.") }});
+    defer set.deinit();
+    ownerRunWith(&f, &set);
+    f.run.useDefinition((try set.get(a, "researcher")).?);
+    try f.e.script(1, try saveCall(&f, "tu_1", "researcher", try researcherWith(a, "Research with dates.")));
+    try f.e.script(2, model.textReply("saved"));
+    var r = try f.say("cite dates");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    const file = try f.e.tmp.dir.readFileAlloc(t.io, "agents/researcher.md", a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, file, "Research with dates.") != null);
+    try t.expect(std.mem.indexOf(u8, file, "\nsaved: agent:researcher 20") != null);
+    try t.expectEqual(1, set.versions("researcher"));
+    // the run that saved it keeps the version it started with
+    const sys2 = try systemOf(&f, 2);
+    try t.expect(std.mem.indexOf(u8, sys2, "Research with two sources.") != null);
+    try t.expect(std.mem.indexOf(u8, sys2, "Research with dates.") == null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "saved agents/researcher.md") != null);
+    const lt = try f.logText();
+    try t.expect(std.mem.indexOf(u8, lt, "\"kind\":\"agent\",\"event\":\"saved\",\"name\":\"researcher\",\"by\":\"owner\",\"agent\":\"researcher\",\"item\":null") != null);
+    // the next run takes the new one
+    f.run.useDefinition((try set.get(a, "researcher")).?);
+    try f.e.script(3, model.textReply("ok"));
+    r = try f.say("and now");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try systemOf(&f, 3), "Research with dates.") != null);
+}
+
+// ---- places ----
+
+test "parallel_holds_for_delegated_runs" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    var set = try defsWith(&f, &.{
+        .{ "one", "---\nname: one\ndescription: One at a time.\nparallel: 1\ntools: recall, delegate\n---\nOne.\n" },
+        .{ "many", "---\nname: many\ndescription: Many.\ntools: recall\n---\nMany.\n" },
+    });
+    defer set.deinit();
+    f.run.defs = &set;
+    const slow = "{\"delay_ms\":700,\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"stop_reason\":\"end_turn\"}";
+    // two tasks of a definition that runs one at a time: one after the other
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"a\",\"agent\":\"one\"},{\"task\":\"b\",\"agent\":\"one\"}]}"));
+    try f.e.script(2, slow);
+    try f.e.script(3, slow);
+    try f.e.script(4, model.textReply("parent"));
+    var started = Io.Clock.awake.now(t.io);
+    var r = try f.say("two of one");
+    freeResult(&f.run, r);
+    const serial_ms = started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
+    // without a parallel of its own: side by side
+    try f.e.script(5, model.toolReply("tu_2", "delegate", "{\"tasks\":[{\"task\":\"a\",\"agent\":\"many\"},{\"task\":\"b\",\"agent\":\"many\"}]}"));
+    try f.e.script(6, slow);
+    try f.e.script(7, slow);
+    try f.e.script(8, model.textReply("parent"));
+    started = Io.Clock.awake.now(t.io);
+    r = try f.say("two of many");
+    freeResult(&f.run, r);
+    const side_ms = started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
+    if (serial_ms < 1300 or side_ms >= 1300) std.debug.print("two 0.7 s tasks of one took {d} ms, of many {d} ms\n", .{ serial_ms, side_ms });
+    try t.expect(serial_ms >= 1300);
+    try t.expect(side_ms < 1300);
+    // a run of `one` holding its only place delegates to `one`: refused at
+    // once, not after waiting out the turn
+    f.run.useDefinition((try set.get(a, "one")).?);
+    f.run.holds_place = true;
+    try f.e.script(9, model.toolReply("tu_3", "delegate", "{\"tasks\":[{\"task\":\"c\",\"agent\":\"one\"}]}"));
+    try f.e.script(10, model.textReply("ok"));
+    started = Io.Clock.awake.now(t.io);
+    r = try f.say("one delegates to one");
+    freeResult(&f.run, r);
+    const ms = started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
+    if (ms >= 1500) std.debug.print("the refusal took {d} ms\n", .{ms});
+    try t.expect(ms < 1500);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(10), "the run that delegated it holds that place") != null);
+}
+
+test "a_replaced_skill_is_kept_like_a_definition" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.run.skills_dir = try std.fs.path.join(a, &.{ f.e.dir, "skills" });
+    f.run.skills_state = try std.fs.path.join(a, &.{ f.e.dir, "state", "skills" });
+    try skills.save(t.io, f.run.skills_dir, "deploy", "How to deploy", "make deploy");
+    try f.e.script(1, model.toolReply("tu_1", "skill_save", "{\"name\":\"deploy\",\"description\":\"How to deploy\",\"body\":\"make release\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "skill_save", "{\"name\":\"fresh\",\"description\":\"New one\",\"body\":\"new\"}"));
+    try f.e.script(3, model.textReply("saved"));
+    const r = try f.say("save how to deploy");
+    freeResult(&f.run, r);
+    try t.expectEqual(2, f.asked);
+    try t.expect(std.mem.indexOf(u8, try skills.load(a, t.io, f.run.skills_dir, "deploy"), "make release") != null);
+    // the file it replaced is kept; a new skill replaced nothing
+    var d = try f.e.tmp.dir.openDir(t.io, "state/skills/deploy/versions", .{ .iterate = true });
+    defer d.close(t.io);
+    var it = d.iterate();
+    const first = (try it.next(t.io)).?;
+    try t.expect(std.mem.indexOf(u8, try d.readFileAlloc(t.io, first.name, a, .unlimited), "make deploy") != null);
+    try t.expectEqual(null, try it.next(t.io));
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.access(t.io, "state/skills/fresh", .{}));
+}
+
+// ---- definitions and roles on files ----
+
+test "a_definitions_runs_and_helpers_are_held_to_folders_ini" {
+    var f: Fix = undefined;
+    try f.init("allow shell echo *\n");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    const st = try withSnapshots(&f, "[notes]\nwrite = agent:researcher\nsnapshots = on\n[private]\nread = agent:main\n");
+    defer st.deinit();
+    var written: Written = .init(t.allocator, t.io, "");
+    defer written.deinit();
+    f.run.written = &written;
+    var set = try defsWith(&f, &.{.{ "researcher", "---\nname: researcher\ndescription: Notes.\ntools: write_file, read_file\n---\nKeep the notes.\n" }});
+    defer set.deinit();
+    f.run.defs = &set;
+    try f.e.tmp.dir.createDirPath(t.io, "ws/notes");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/notes/old.md", .data = "old" });
+    try f.e.tmp.dir.createDirPath(t.io, "ws/private");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/private/k.txt", .data = "key" });
+    // a run of researcher: notes lets it write, private does not let it read
+    f.run.useDefinition((try set.get(a, "researcher")).?);
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/r.md\",\"content\":\"r\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "read_file", "{\"path\":\"private/k.txt\"}"));
+    try f.e.script(3, model.textReply("noted"));
+    var r = try f.say("note it");
+    freeResult(&f.run, r);
+    try t.expectEqualStrings("r", try f.e.tmp.dir.readFileAlloc(t.io, "ws/notes/r.md", a, .unlimited));
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "refused by the gate: folders.ini [private] read: agent:researcher is not listed") != null);
+    // its snapshots, before its write and at its end, name it
+    const snaps = try st.list(a, "notes");
+    try t.expectEqual(2, snaps.len);
+    for (snaps) |s| {
+        try t.expectEqualStrings("researcher", s.agent);
+        try t.expectEqualStrings("owner", s.by);
+    }
+    // main: its command is asked, naming what researcher wrote; notes
+    // refuses main's write, and the write of the researcher main delegates
+    f.run.useDefinition(agents.builtin_main);
+    try f.e.script(4, model.toolReply("tu_3", "shell", "{\"command\":\"echo x\"}"));
+    try f.e.script(5, model.toolReply("tu_4", "write_file", "{\"path\":\"notes/m.md\",\"content\":\"m\"}"));
+    try f.e.script(6, model.toolReply("tu_5", "delegate", "{\"tasks\":[{\"task\":\"write h\",\"agent\":\"researcher\"}]}"));
+    try f.e.script(7, model.toolReply("h1", "write_file", "{\"path\":\"notes/h.md\",\"content\":\"h\"}"));
+    try f.e.script(8, model.textReply("could not"));
+    try f.e.script(9, model.textReply("done"));
+    r = try f.say("go on");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    if (!std.mem.endsWith(u8, f.last_what, "since you last allowed a command: notes/r.md (agent:researcher, chat)")) std.debug.print("asked: {s}\n", .{f.last_what});
+    try t.expect(std.mem.endsWith(u8, f.last_what, "since you last allowed a command: notes/r.md (agent:researcher, chat)"));
+    try t.expect(std.mem.indexOf(u8, try f.e.request(6), "refused by the gate: folders.ini [notes] write: agent:main is not listed") != null);
+    // the helper is researcher, but main delegated it and is not listed
+    try t.expect(std.mem.indexOf(u8, try f.e.request(8), "refused by the gate: folders.ini [notes] write: agent:main is not listed") != null);
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "ws/notes/m.md", .{}));
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "ws/notes/h.md", .{}));
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"run\":\"chat/h1\",\"agent\":\"researcher\",\"tool\":\"write_file\",\"decision\":\"deny\"") != null);
+}
+
+// ---- providers ----
+
+/// The run's client: provider `name` at the fake server, in `api`'s format.
+fn useProvider(f: *Fix, name: []const u8, api: model.Api, auth: model.Auth, key: []const u8) !void {
+    const p = try f.e.provider(name, api, auth, key);
+    f.client.deinit();
+    f.client = try f.e.clientFor(p, "gpt-test");
+}
+
+test "a_turn_with_a_tool_call_works_through_an_openai_provider" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try useProvider(&f, "local", .openai, .bearer, "sk-local-test-1");
+    const a = f.e.arena.allocator();
+    try f.e.script(1, try model.oaToolReply(a, "call_1", "recall", "{\"query\":\"flats\"}"));
+    try f.e.script(2, model.oaTextReply("Nothing about flats yet."));
+    const r = try f.say("what do you know about flats?");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Nothing about flats yet.", r.text);
+    const v = jv.parse(a, try f.e.request(2)).?;
+    try t.expectEqualStrings("/v1/chat/completions", jv.str(jv.get(v, "target")).?);
+    const msgs = jv.arr(jv.at(v, &.{ "body", "messages" })).?;
+    // the instructions, the message, the call, its result
+    try t.expectEqual(4, msgs.len);
+    try t.expectEqualStrings("system", jv.str(jv.get(msgs[0], "role")).?);
+    try t.expectEqualStrings("user", jv.str(jv.get(msgs[1], "role")).?);
+    try t.expectEqualStrings("call_1", jv.str(jv.at(msgs[2], &.{ "tool_calls", "0", "id" })).?);
+    try t.expectEqualStrings("recall", jv.str(jv.at(msgs[2], &.{ "tool_calls", "0", "function", "name" })).?);
+    try t.expectEqualStrings("tool", jv.str(jv.get(msgs[3], "role")).?);
+    try t.expectEqualStrings("call_1", jv.str(jv.get(msgs[3], "tool_call_id")).?);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"tool\":\"recall\"") != null);
+}
+
+test "usage_and_cached_tokens_are_logged_per_provider" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try useProvider(&f, "local", .openai, .bearer, "sk-local-test-1");
+    try f.e.script(1, "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"cached\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":60}}}");
+    const r1 = try f.say("hello");
+    defer freeResult(&f.run, r1);
+    try t.expectEqualStrings("cached", r1.text);
+    // the next turn on 0.3's omnigate client
+    f.client.deinit();
+    f.client = try f.e.client();
+    try f.e.script(2, model.textReply("from omnigate"));
+    const r2 = try f.say("again");
+    defer freeResult(&f.run, r2);
+    const log = try f.logText();
+    try t.expect(std.mem.indexOf(u8, log, "\"result\":\"ok\",\"provider\":\"local\",\"stop_reason\":\"end_turn\",\"input_tokens\":40,\"output_tokens\":7,\"cache_read\":60") != null);
+    try t.expect(std.mem.indexOf(u8, log, "\"result\":\"ok\",\"provider\":\"omnigate\",\"stop_reason\":\"end_turn\",\"input_tokens\":10,\"output_tokens\":3") != null);
+}
+
+test "a_provider_without_its_key_refuses_calls_with_one_line" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try useProvider(&f, "openrouter", .openai, .bearer, "");
+    const r = try f.say("hello");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Model calls are refused: no openrouter key is stored (harness secret add openrouter).", r.text);
+    try t.expect(std.mem.indexOfScalar(u8, r.text, '\n') == null);
+    try t.expectEqual(0, f.e.server.modelRequests());
+}
+
+test "a_refused_key_is_named_and_kept_out_of_the_log" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try useProvider(&f, "local", .openai, .bearer, "sk-echoed-test-key-1");
+    try f.e.script(1, "{\"status\":401,\"echo_key\":true}");
+    const r = try f.say("hello");
+    defer freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, r.text, "local refused the key stored as local") != null);
+    try t.expect(std.mem.indexOf(u8, r.text, "harness secret add local") != null);
+    try t.expect(std.mem.indexOf(u8, r.text, "sk-echoed-test-key-1") == null);
+    const log = try f.logText();
+    try t.expect(std.mem.indexOf(u8, log, "\"result\":\"KeyRefused\",\"provider\":\"local\"") != null);
+    try t.expect(std.mem.indexOf(u8, log, "sk-echoed-test-key-1") == null);
+}
+
+fn helperKeys(_: ?*anyopaque, _: std.mem.Allocator, provider: []const u8, _: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, provider, "omnigate")) return "og-test-key";
+    if (std.mem.eql(u8, provider, "local")) return "sk-local-test-1";
+    return null;
+}
+
+test "a_helper_runs_on_the_provider_its_value_names" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    const local_url = try std.fmt.allocPrint(a, "{s}/v1", .{try f.e.url()});
+    const set = try model.Providers.resolve(a, .{
+        .omnigate_url = try f.e.url(),
+        .sections = &.{.{ .name = "local", .api = .openai, .url = local_url }},
+    }, .{ .get = helperKeys });
+    f.run.model_cfg.?.providers = &set;
+    f.run.model_cfg.?.worker = "local:gpt-worker";
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"find a\"}]}"));
+    try f.e.script(2, model.oaTextReply("helper answer"));
+    try f.e.script(3, model.textReply("Combined."));
+    const r = try f.say("research");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Combined.", r.text);
+    const helper = jv.parse(a, try f.e.request(2)).?;
+    try t.expectEqualStrings("/v1/chat/completions", jv.str(jv.get(helper, "target")).?);
+    try t.expectEqualStrings("gpt-worker", jv.str(jv.at(helper, &.{ "body", "model" })).?);
+    try t.expectEqualStrings("Bearer sk-local-test-1", jv.str(jv.at(helper, &.{ "headers", "Authorization" })).?);
+    const parent = try f.e.request(3);
+    try t.expectEqualStrings("/v1/messages", jv.str(jv.get(jv.parse(a, parent).?, "target")).?);
+    try t.expect(std.mem.indexOf(u8, parent, "helper answer") != null);
+}
+
+test "a_delegated_definition_uses_its_own_provider" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    const local_url = try std.fmt.allocPrint(a, "{s}/v1", .{try f.e.url()});
+    const set = try model.Providers.resolve(a, .{
+        .omnigate_url = try f.e.url(),
+        .sections = &.{.{ .name = "local", .api = .openai, .url = local_url }},
+    }, .{ .get = helperKeys });
+    f.run.model_cfg.?.providers = &set;
+    // the delegating run is on omnigate; researcher's model is at local
+    var defs = try defsWith(&f, &.{.{ "researcher", "---\nname: researcher\ndescription: Research across sources.\nmodel: local:gpt-r\ntools: recall\n---\nResearch with two sources.\n" }});
+    defer defs.deinit();
+    f.run.defs = &defs;
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"find zig news\",\"agent\":\"researcher\"}]}"));
+    try f.e.script(2, model.oaTextReply("Two sources agree."));
+    try f.e.script(3, model.textReply("Combined."));
+    const r = try f.say("research");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Combined.", r.text);
+    // the helper: its definition's model at that model's provider, with its key
+    const helper = jv.parse(a, try f.e.request(2)).?;
+    try t.expectEqualStrings("/v1/chat/completions", jv.str(jv.get(helper, "target")).?);
+    try t.expectEqualStrings("gpt-r", jv.str(jv.at(helper, &.{ "body", "model" })).?);
+    try t.expectEqualStrings("Bearer sk-local-test-1", jv.str(jv.at(helper, &.{ "headers", "Authorization" })).?);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "Research with two sources.") != null);
+    // the run that delegated it stays on its own provider
+    const parent = try f.e.request(3);
+    try t.expectEqualStrings("/v1/messages", jv.str(jv.get(jv.parse(a, parent).?, "target")).?);
+    try t.expect(std.mem.indexOf(u8, parent, "Two sources agree.") != null);
+    // strong: [model] model, whatever the definition names
+    try f.e.script(4, model.toolReply("tu_2", "delegate", "{\"tasks\":[{\"task\":\"check it\",\"agent\":\"researcher\",\"strong\":true}]}"));
+    try f.e.script(5, model.textReply("Checked."));
+    try f.e.script(6, model.textReply("Done."));
+    const r2 = try f.say("check it again");
+    defer freeResult(&f.run, r2);
+    try t.expectEqualStrings("Done.", r2.text);
+    const strong = jv.parse(a, try f.e.request(5)).?;
+    try t.expectEqualStrings("/v1/messages", jv.str(jv.get(strong, "target")).?);
+    try t.expectEqualStrings("claude-test", jv.str(jv.at(strong, &.{ "body", "model" })).?);
 }

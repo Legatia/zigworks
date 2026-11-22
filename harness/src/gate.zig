@@ -267,6 +267,14 @@ pub const Grants = struct {
         return false;
     }
 
+    /// Removes grant `i` (an index into `items`).
+    pub fn remove(g: *Grants, i: usize) void {
+        const it = g.items.orderedRemove(i);
+        g.gpa.free(it.key);
+        g.gpa.free(it.env);
+        g.gpa.free(it.who);
+    }
+
     pub fn load(g: *Grants, io: Io, path: []const u8, now_s: i64) !void {
         const text = Io.Dir.cwd().readFileAlloc(io, path, g.gpa, .limited(1 << 20)) catch |e| switch (e) {
             error.FileNotFound => return,
@@ -469,7 +477,7 @@ pub const Gate = struct {
         // key, for any run, the call's definition or what started its run;
         // a post others read is asked every time (an allow rule lifts that)
         const asked_every_time = tool == .send and ctx.shared;
-        if (!asked_every_time and g.grants.covers(tool, ctx.env, grantKey(tool, subject), w, now_s)) return .{ .action = .allow, .why = "granted for 24 hours", .subject = subject };
+        if (!asked_every_time and g.grants.covers(tool, ctx.env, grantKey(tool, subject), w, now_s)) return .{ .action = .allow, .why = "a grant covers it (/grants)", .subject = subject };
         var d: Decision = .{ .action = defaultFor(tool, arg, ctx), .why = "default for this tool", .subject = subject };
         // programs read these as their settings (.git/config, .npmrc, .env):
         // a file written there can make the next command run something else

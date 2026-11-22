@@ -1,10 +1,17 @@
 //! Stand-ins for the services harness talks to, driven by files in a script
 //! directory so tests can say exactly what each service answers:
 //!
-//! - omnigate: `POST /v1/messages` answers `model/001.json`, `002.json`, …
-//!   in order; a file `{"status":402}` or `{"status":429,"retry_after":1}`
-//!   answers that error instead, `{"delay_ms":N, ...}` waits first. Each
-//!   request is saved as `requests/001.json`, … with its headers.
+//! - models (omnigate and any other provider): `POST …/messages` (Anthropic
+//!   Messages) and `POST …/chat/completions` (OpenAI Chat Completions)
+//!   answer `model/001.json`, `002.json`, … in order, one count for both,
+//!   each file in the format its request was in; a file `{"status":402}` or
+//!   `{"status":429,"retry_after":1}` answers that error instead (in the
+//!   request's format; with `"echo_key":true` its message says the key the
+//!   request carried, as some gateways do), `{"delay_ms":N, ...}` waits
+//!   first. Each request is saved as `requests/001.json`, … with its
+//!   target, headers and body.
+//! - Every file the stand-ins record is written whole, a temporary file
+//!   renamed into place, so a test that finds one never reads half of it.
 //! - search: `GET /res/v1/web/search?q=…` answers `search.json`.
 //! - pages and feeds: `GET /page/NAME` answers the file `pages/NAME`
 //!   (POST too; `?delay_ms=N` answers after N ms), or, when there is a
@@ -135,18 +142,55 @@ pub const Server = struct {
         return Io.Dir.cwd().readFileAlloc(s.io, p, a, .limited(16 << 20)) catch null;
     }
 
+    /// Writes record file `p` whole: a temporary file, then renamed into
+    /// place, so a test that finds `p` never reads it half written.
+    fn writeRecord(s: *Server, a: std.mem.Allocator, p: []const u8, data: []const u8) !void {
+        const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{p});
+        const cwd = Io.Dir.cwd();
+        try cwd.writeFile(s.io, .{ .sub_path = tmp, .data = data });
+        // on Windows a reader that has the old file open can hold the
+        // rename up for a moment
+        var tries: u32 = 0;
+        while (true) : (tries += 1) {
+            if (cwd.rename(tmp, cwd, p, s.io)) |_| return else |e| if (tries >= 100) {
+                cwd.deleteFile(s.io, tmp) catch {};
+                return e;
+            }
+            s.io.sleep(.fromMilliseconds(10), .awake) catch {};
+        }
+    }
+
+    /// Adds `line` to the end of record file `p`, written whole again
+    /// (callers hold `mutex`: one writer at a time).
+    fn appendRecord(s: *Server, a: std.mem.Allocator, p: []const u8, line: []const u8) !void {
+        const old: []const u8 = Io.Dir.cwd().readFileAlloc(s.io, p, a, .limited(256 << 20)) catch |e| switch (e) {
+            error.FileNotFound => "",
+            else => return e,
+        };
+        try s.writeRecord(a, p, try std.mem.concat(a, u8, &.{ old, line }));
+    }
+
     fn handle(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request) !void {
         const target = try a.dupe(u8, req.head.target);
         const method = req.head.method;
         var headers: std.ArrayList(u8) = .empty;
+        // the key a model request carries, for `echo_key`
+        var key: []const u8 = "";
         var it = req.iterateHeaders();
-        while (it.next()) |h| try headers.print(a, "{f}:{f},", .{ std.json.fmt(h.name, .{}), std.json.fmt(h.value, .{}) });
+        while (it.next()) |h| {
+            try headers.print(a, "{f}:{f},", .{ std.json.fmt(h.name, .{}), std.json.fmt(h.value, .{}) });
+            if (std.ascii.eqlIgnoreCase(h.name, "x-api-key")) key = try a.dupe(u8, h.value);
+            if (std.ascii.eqlIgnoreCase(h.name, "authorization") and std.mem.startsWith(u8, h.value, "Bearer ")) key = try a.dupe(u8, h.value["Bearer ".len..]);
+        }
         var body_buf: [8192]u8 = undefined;
         const body_reader = try req.readerExpectContinue(&body_buf);
         const body = try body_reader.allocRemaining(a, .limited(32 << 20));
         const route = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
 
-        if (method == .POST and std.mem.eql(u8, route, "/v1/messages")) return s.model(a, req, body, headers.items);
+        if (method == .POST and !std.mem.startsWith(u8, route, "/page/") and !std.mem.startsWith(u8, route, "/bot")) {
+            if (std.mem.endsWith(u8, route, "/messages")) return s.model(a, req, .anthropic, target, body, headers.items, key);
+            if (std.mem.endsWith(u8, route, "/chat/completions")) return s.model(a, req, .openai, target, body, headers.items, key);
+        }
         if (method == .GET and std.mem.eql(u8, route, "/res/v1/web/search")) {
             const text = s.readScript(a, &.{"search.json"}) orelse "{\"web\":{\"results\":[]}}";
             return json(req, .ok, text);
@@ -158,11 +202,8 @@ pub const Server = struct {
                 s.mutex.lockUncancelable(s.io);
                 defer s.mutex.unlock(s.io);
                 const lp = try s.path(a, &.{"page-requests.jsonl"});
-                var f = try Io.Dir.cwd().createFile(s.io, lp, .{ .truncate = false });
-                defer f.close(s.io);
-                const len = try f.length(s.io);
                 const line = try std.fmt.allocPrint(a, "{{\"target\":{f},\"headers\":{{{s}\"\":\"\"}}}}\n", .{ std.json.fmt(target, .{}), headers.items });
-                try f.writePositionalAll(s.io, line, len);
+                try s.appendRecord(a, lp, line);
             }
             // `pages/NAME.redirect` holds "STATUS LOCATION"
             if (name.len > 0 and std.mem.indexOf(u8, name, "..") == null) {
@@ -191,15 +232,18 @@ pub const Server = struct {
         return json(req, .not_found, "{\"error\":\"no such route\"}");
     }
 
-    fn model(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, body: []const u8, headers: []const u8) !void {
+    /// The format a model request is in, and its errors are answered in.
+    const Format = enum { anthropic, openai };
+
+    fn model(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, format: Format, target: []const u8, body: []const u8, headers: []const u8, key: []const u8) !void {
         const n = s.model_n.fetchAdd(1, .acq_rel) + 1;
         var name_buf: [16]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "{d:0>3}.json", .{n});
-        const saved = try std.fmt.allocPrint(a, "{{\"headers\":{{{s}\"\":\"\"}},\"body\":{s}}}", .{ headers, if (body.len > 0) body else "null" });
+        const saved = try std.fmt.allocPrint(a, "{{\"target\":{f},\"headers\":{{{s}\"\":\"\"}},\"body\":{s}}}", .{ std.json.fmt(target, .{}), headers, if (body.len > 0) body else "null" });
         const rp = try s.path(a, &.{ "requests", name });
-        try Io.Dir.cwd().writeFile(s.io, .{ .sub_path = rp, .data = saved });
+        try s.writeRecord(a, rp, saved);
         const script = s.readScript(a, &.{ "model", name }) orelse
-            return json(req, .internal_server_error, "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"no script for this request\"}}");
+            return json(req, .internal_server_error, try errorBody(a, format, 500, "no script for this request"));
         const v = jv.parse(a, script);
         if (jv.int(jv.get(v, "delay_ms"))) |ms| {
             // By the clock, not by counting sleeps: on a busy machine each sleep runs long.
@@ -210,7 +254,9 @@ pub const Server = struct {
             const status: std.http.Status = @fromBackingInt(@as(u10, @intCast(st)));
             const retry = jv.int(jv.get(v, "retry_after"));
             var rb: [16]u8 = undefined;
-            const err_body = "{\"type\":\"error\",\"error\":{\"type\":\"scripted\",\"message\":\"scripted error\"}}";
+            const echo = jv.boolean(jv.get(v, "echo_key")) orelse false;
+            const msg = if (echo) try std.fmt.allocPrint(a, "scripted error for key {s}", .{key}) else "scripted error";
+            const err_body = try errorBody(a, format, st, msg);
             if (retry) |r| {
                 return req.respond(err_body, .{ .status = status, .extra_headers = &.{
                     .{ .name = "content-type", .value = "application/json" },
@@ -275,9 +321,6 @@ pub const Server = struct {
             defer s.mutex.unlock(s.io);
             const id = s.tg_n.fetchAdd(1, .acq_rel) + 1;
             const op = try s.path(a, &.{ "telegram", "out.jsonl" });
-            var f = try Io.Dir.cwd().createFile(s.io, op, .{ .truncate = false });
-            defer f.close(s.io);
-            const len = try f.length(s.io);
             // a body that is not JSON (a document's multipart) as a string
             const json_body = body.len > 0 and body[0] == '{';
             const line = if (body.len == 0)
@@ -286,7 +329,7 @@ pub const Server = struct {
                 try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"message_id\":{d},\"body\":{s}}}\n", .{ method, id, body })
             else
                 try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"message_id\":{d},\"body\":{f}}}\n", .{ method, id, std.json.fmt(body, .{}) });
-            try f.writePositionalAll(s.io, line, len);
+            try s.appendRecord(a, op, line);
             break :blk id;
         };
         // getMe: telegram/me.json, else a bot with topics in private chats
@@ -328,6 +371,15 @@ pub const Server = struct {
         return out.items;
     }
 };
+
+/// A model error's body: Anthropic's `{"type":"error","error":{...}}` or
+/// OpenAI's `{"error":{"message":...,"type":...,"code":N}}`.
+fn errorBody(a: std.mem.Allocator, format: Server.Format, status: i64, msg: []const u8) ![]u8 {
+    return switch (format) {
+        .anthropic => std.fmt.allocPrint(a, "{{\"type\":\"error\",\"error\":{{\"type\":\"scripted\",\"message\":{f}}}}}", .{std.json.fmt(msg, .{})}),
+        .openai => std.fmt.allocPrint(a, "{{\"error\":{{\"message\":{f},\"type\":\"scripted\",\"code\":{d}}}}}", .{ std.json.fmt(msg, .{}), status }),
+    };
+}
 
 fn json(req: *std.http.Server.Request, status: std.http.Status, body: []const u8) !void {
     try req.respond(body, .{ .status = status, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });

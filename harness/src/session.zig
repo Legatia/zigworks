@@ -201,10 +201,13 @@ pub fn render(a: std.mem.Allocator, text: []const u8, rid: u64, max: usize) !?[]
         }
         if (std.mem.eql(u8, l.kind, "model")) {
             const result = field(a, v, "result");
+            // omnigate's (and 0.3's, which name none) as before
+            const provider = field(a, v, "provider");
+            const label = if (provider.len == 0 or std.mem.eql(u8, provider, "omnigate")) "Model" else try std.fmt.allocPrint(a, "Model ({s})", .{provider});
             if (std.mem.eql(u8, result, "ok"))
-                try out.print(a, "Model: {d} in, {d} out\n", .{ jv.int(jv.get(v, "input_tokens")) orelse 0, jv.int(jv.get(v, "output_tokens")) orelse 0 })
+                try out.print(a, "{s}: {d} in, {d} out\n", .{ label, jv.int(jv.get(v, "input_tokens")) orelse 0, jv.int(jv.get(v, "output_tokens")) orelse 0 })
             else
-                try out.print(a, "Model: {s} {s}\n", .{ result, util.cut(field(a, v, "detail"), 80) });
+                try out.print(a, "{s}: {s} {s}\n", .{ label, result, util.cut(field(a, v, "detail"), 80) });
         } else if (std.mem.eql(u8, l.kind, "gate")) {
             if (std.mem.eql(u8, field(a, v, "decision"), "allow")) {
                 pending = v;
@@ -268,4 +271,23 @@ pub fn tail(io: Io, a: std.mem.Allocator, path: []const u8, max: usize) ![]const
     if (n == len) return text;
     const nl = std.mem.indexOfScalar(u8, text, '\n') orelse return text[0..0];
     return text[nl + 1 ..];
+}
+
+const t = std.testing;
+
+test "a_model_line_of_another_provider_names_it" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const text =
+        \\{"seq":1,"kind":"turn","rid":1,"run":"chat","by":"owner","agent":"main","conversation":"main","text":"hi"}
+        \\{"seq":2,"kind":"model","rid":1,"run":"chat","result":"ok","provider":"local","input_tokens":5,"output_tokens":2}
+        \\{"seq":3,"kind":"model","rid":1,"run":"chat","result":"ok","provider":"omnigate","input_tokens":6,"output_tokens":1}
+        \\{"seq":4,"kind":"model","rid":1,"run":"chat","result":"BudgetSpent","provider":"local","detail":"no credits"}
+        \\{"seq":5,"kind":"model","rid":1,"run":"chat","result":"ok","input_tokens":7,"output_tokens":3}
+    ;
+    const shown = (try render(arena.allocator(), text, 1, 0)).?;
+    for ([_][]const u8{ "Model (local): 5 in, 2 out\n", "Model: 6 in, 1 out\n", "Model (local): BudgetSpent no credits\n", "Model: 7 in, 3 out\n" }) |want| {
+        if (std.mem.indexOf(u8, shown, want) == null) std.debug.print("missing {s} in:\n{s}\n", .{ want, shown });
+        try t.expect(std.mem.indexOf(u8, shown, want) != null);
+    }
 }

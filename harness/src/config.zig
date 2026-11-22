@@ -1,11 +1,18 @@
-//! The instance's settings: config.ini (model, chat, limits, memory),
-//! briefs.ini (topics and their sources) and tasks.ini (scheduled
-//! instructions). All three are small INI files: `[section]`,
+//! The instance's settings: config.ini (models and providers, chat,
+//! limits, memory), briefs.ini (topics and their sources) and tasks.ini
+//! (scheduled instructions). All three are small INI files: `[section]`,
 //! `key = value`, comments after `;` or `#`.
 const std = @import("std");
 const conversations = @import("conversations.zig");
+const agents = @import("agents.zig");
+const model = @import("model.zig");
+const mcp = @import("mcp.zig");
 
 pub const Error = error{ BadConfig, OutOfMemory };
+
+/// What `parse` refuses besides a bad line: the `[provider NAME]`
+/// sections' problems, which `reason` says.
+pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider };
 
 pub const Config = struct {
     model: Model = .{},
@@ -17,8 +24,15 @@ pub const Config = struct {
     browser: Browser = .{},
     money: Money = .{},
     apps: Apps = .{},
+    inbox: Inbox = .{},
+    /// The `[provider NAME]` sections, in the order their names first
+    /// appear (not a section of its own: `parse` reads them apart).
+    providers: []const model.Section = &.{},
 
     pub const Model = struct {
+        /// The provider of a model value that names none: a preset or a
+        /// `[provider NAME]` section.
+        provider: []const u8 = "omnigate",
         /// omnigate's address; empty until the owner sets it (no default,
         /// so the key never goes to whatever happens to listen there).
         url: []const u8 = "",
@@ -88,6 +102,15 @@ pub const Config = struct {
         /// 0: a free one each start; a fixed one to reach it over ssh -L.
         port: u32 = 0,
     };
+    /// What waits for the owner (state/inbox).
+    pub const Inbox = struct {
+        /// Questions and approvals of runs open at once; one more waits
+        /// for a place until its turn ends.
+        questions: u32 = 20,
+        /// Minutes after midnight (owner's time) of the daily reminder of
+        /// items open over 12 hours; null: off.
+        remind: ?u16 = 9 * 60,
+    };
 };
 
 /// One `key = value` line, with the section it is in.
@@ -127,19 +150,130 @@ pub fn stripComment(raw: []const u8) []const u8 {
     return raw;
 }
 
-pub fn parse(arena: std.mem.Allocator, text: []const u8) Error!Config {
+pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
     var cfg: Config = .{};
+    var provs: std.ArrayList(ProviderLines) = .empty;
     for (try lines(arena, text)) |l| {
+        if (providerSection(l.section)) |name| {
+            try providerLine(arena, &provs, name, l);
+            continue;
+        }
         var found = false;
         inline for (@typeInfo(Config).@"struct".field_names) |sname| {
-            if (std.mem.eql(u8, l.section, sname)) {
-                found = true;
-                try setField(&@field(cfg, sname), l);
+            if (comptime !std.mem.eql(u8, sname, "providers")) {
+                if (std.mem.eql(u8, l.section, sname)) {
+                    found = true;
+                    try setField(&@field(cfg, sname), l);
+                }
             }
         }
         if (!found) return error.BadConfig;
     }
+    if (cfg.inbox.questions == 0) return error.BadConfig;
+    cfg.providers = try providerSections(arena, text, provs.items);
+    if (!model.isPreset(cfg.model.provider)) {
+        for (cfg.providers) |p| {
+            if (std.mem.eql(u8, p.name, cfg.model.provider)) break;
+        } else return error.UnknownProvider;
+    }
     return cfg;
+}
+
+/// What the providers are made from (`model.Providers.resolve`).
+pub fn providerSettings(cfg: Config) model.Settings {
+    return .{ .default = cfg.model.provider, .omnigate_url = cfg.model.url, .omnigate_key = cfg.model.key, .sections = cfg.providers };
+}
+
+/// What config.ini's errors beyond a bad line mean.
+pub fn reason(e: anyerror) ?[]const u8 {
+    return switch (e) {
+        error.BadProvider => "a [provider NAME] section takes api = anthropic or openai, url = http(s)://..., auth = x-api-key, bearer or none, key = a stored secret's name, cache = on or off, and header = Name: value; NAME uses a-z, 0-9, - and _",
+        error.BadHeader => "header = Name: value, at most 8 a provider; not Authorization or x-api-key (the key is the stored secret key = names), nor Host, Connection, Content-Length, Content-Type, Transfer-Encoding or anthropic-version",
+        error.ProviderNeedsApiAndUrl => "a provider that is not a preset needs api = (anthropic or openai) and url =",
+        error.UnknownProvider => "no provider has that name: use a preset (omnigate, anthropic, openrouter, opencode, openai) or a [provider NAME] section with api and url",
+        else => null,
+    };
+}
+
+/// One `[provider NAME]` section's lines so far.
+const ProviderLines = struct {
+    section: model.Section,
+    headers: std.ArrayList(model.Header) = .empty,
+};
+
+/// "provider NAME" → NAME as written (the caller checks it).
+fn providerSection(section: []const u8) ?[]const u8 {
+    const word = "provider";
+    if (section.len <= word.len or !std.mem.startsWith(u8, section, word)) return null;
+    if (section[word.len] != ' ' and section[word.len] != '\t') return null;
+    return std.mem.trim(u8, section[word.len..], " \t");
+}
+
+fn providerLine(arena: std.mem.Allocator, provs: *std.ArrayList(ProviderLines), name: []const u8, l: Line) ParseError!void {
+    if (!model.validName(name)) return error.BadProvider;
+    const p = for (provs.items) |*x| {
+        if (std.mem.eql(u8, x.section.name, name)) break x;
+    } else blk: {
+        try provs.append(arena, .{ .section = .{ .name = name } });
+        break :blk &provs.items[provs.items.len - 1];
+    };
+    const v = l.value;
+    if (std.mem.eql(u8, l.key, "api")) {
+        p.section.api = model.parseApi(v) orelse return error.BadProvider;
+    } else if (std.mem.eql(u8, l.key, "url")) {
+        if (!model.validUrl(v)) return error.BadProvider;
+        p.section.url = v;
+    } else if (std.mem.eql(u8, l.key, "auth")) {
+        p.section.auth = model.parseAuth(v) orelse return error.BadProvider;
+    } else if (std.mem.eql(u8, l.key, "key")) {
+        if (!mcp.validSecretName(v)) return error.BadProvider;
+        p.section.key = v;
+    } else if (std.mem.eql(u8, l.key, "cache")) {
+        p.section.cache = parseBool(v) orelse return error.BadProvider;
+    } else if (std.mem.eql(u8, l.key, "header")) {
+        if (p.headers.items.len >= model.max_headers) return error.BadHeader;
+        try p.headers.append(arena, try parseHeader(v));
+    } else return error.BadProvider;
+}
+
+/// "Name: value". Not a header harness sets itself, nor one that carries a
+/// key: keys are stored secrets (`key =`), masked, never config.ini text.
+fn parseHeader(v: []const u8) error{BadHeader}!model.Header {
+    const colon = std.mem.indexOfScalar(u8, v, ':') orelse return error.BadHeader;
+    const name = std.mem.trim(u8, v[0..colon], " \t");
+    const value = std.mem.trim(u8, v[colon + 1 ..], " \t");
+    if (name.len == 0 or value.len == 0) return error.BadHeader;
+    for (name) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_')) return error.BadHeader;
+    for (value) |ch| if ((ch < 0x20 and ch != '\t') or ch == 0x7f) return error.BadHeader;
+    const refused = [_][]const u8{ "authorization", "x-api-key", "host", "connection", "content-length", "content-type", "transfer-encoding", "anthropic-version" };
+    for (refused) |r| if (std.ascii.eqlIgnoreCase(name, r)) return error.BadHeader;
+    return .{ .name = name, .value = value };
+}
+
+/// The `[provider NAME]` sections in the order their headers first
+/// appear, a header with no keys under it too, so that a new provider
+/// missing api or url is named at its header.
+fn providerSections(arena: std.mem.Allocator, text: []const u8, provs: []const ProviderLines) ParseError![]const model.Section {
+    var out: std.ArrayList(model.Section) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, stripComment(raw), " \t\r");
+        if (line.len < 2 or line[0] != '[' or line[line.len - 1] != ']') continue;
+        const name = providerSection(std.mem.trim(u8, line[1 .. line.len - 1], " \t")) orelse continue;
+        if (!model.validName(name)) return error.BadProvider;
+        for (out.items) |o| {
+            if (std.mem.eql(u8, o.name, name)) break;
+        } else {
+            var sec: model.Section = .{ .name = name };
+            for (provs) |p| if (std.mem.eql(u8, p.section.name, name)) {
+                sec = p.section;
+                sec.headers = p.headers.items;
+            };
+            if (!model.isPreset(name) and (sec.api == null or sec.url == null)) return error.ProviderNeedsApiAndUrl;
+            try out.append(arena, sec);
+        }
+    }
+    return out.items;
 }
 
 fn setField(sec: anytype, l: Line) Error!void {
@@ -149,6 +283,8 @@ fn setField(sec: anytype, l: Line) Error!void {
         if (std.mem.eql(u8, l.key, fname)) {
             if (comptime std.mem.eql(u8, fname, "utc_offset")) {
                 @field(sec.*, fname) = parseOffset(l.value) catch return error.BadConfig;
+            } else if (comptime std.mem.eql(u8, fname, "remind")) {
+                @field(sec.*, fname) = if (std.ascii.eqlIgnoreCase(l.value, "off")) null else parseClock(l.value) catch return error.BadConfig;
             } else switch (ftype) {
                 []const u8 => {
                     // only omnigate's address may be left empty (not set yet)
@@ -276,6 +412,8 @@ pub const Task = struct {
     do: []const u8 = "",
     /// The conversation it posts to (`to =`).
     to: []const u8 = "main",
+    /// The definition that runs it (`agent =`).
+    agent: []const u8 = "main",
 };
 
 pub const day_names = [_][]const u8{ "mon", "tue", "wed", "thu", "fri", "sat", "sun" };
@@ -299,6 +437,9 @@ pub fn parseTasks(arena: std.mem.Allocator, text: []const u8) Error![]Task {
             tk.do = l.value;
         } else if (std.mem.eql(u8, l.key, "to")) {
             tk.to = try conversationName(l.value);
+        } else if (std.mem.eql(u8, l.key, "agent")) {
+            if (!agents.validName(l.value)) return error.BadConfig;
+            tk.agent = l.value;
         } else return error.BadConfig;
     }
     for (tasks.items) |tk| {
@@ -346,12 +487,15 @@ pub fn parseDays(v: []const u8) error{BadDays}!u7 {
 pub const defaults_ini =
     \\; harness settings. Lines starting with ; are comments.
     \\[model]
-    \\url =                               ; required: your omnigate's address, like https://omnigate.example.com
-    \\model = claude-sonnet               ; omnigate route for the agent
-    \\memory_model = claude-haiku         ; omnigate route for writing memories
-    \\worker_model = claude-haiku         ; omnigate route for helpers (delegate)
+    \\provider = omnigate                 ; the default provider: omnigate, anthropic, openrouter, opencode, openai or a [provider NAME] section
+    \\url =                               ; omnigate's address (required for omnigate), like https://omnigate.example.com
+    \\model = claude-sonnet               ; the agent's model (PROVIDER:MODEL picks another provider)
+    \\memory_model = claude-haiku         ; for writing memories
+    \\worker_model = claude-haiku         ; for helpers (delegate)
     \\key = omnigate                      ; secret holding the omnigate key
     \\max_tokens = 4096
+    \\; Other gateways: a [provider NAME] section each (README: Models and providers),
+    \\; their keys stored with harness secret add NAME.
     \\
     \\[search]
     \\url = https://api.search.brave.com
@@ -397,6 +541,10 @@ pub const defaults_ini =
     \\on = off
     \\port = 0                            ; 0 = a free one each start
     \\
+    \\[inbox]                             ; what waits for you (/inbox)
+    \\questions = 20                      ; questions and approvals waiting at once
+    \\remind = 09:00                      ; once a day, if something waited over 12 hours; off: never
+    \\
 ;
 
 pub const rules_example =
@@ -409,9 +557,11 @@ pub const rules_example =
     \\# every time, whatever the rules; the others are allowed.
     \\# send (a post) to a conversation others read is asked every time
     \\# unless an allow rule names it (allow send family).
+    \\# agent_save (a new agent definition, or a change to the agent's own)
+    \\# is asked every time, whatever the rules; a deny rule stops it.
     \\# Not used yet (their tools come later): mail, trigger rm and workflow
-    \\# start and stop ask; agent_save, app_save, env_save, trigger add and
-    \\# workflow save are asked every time.
+    \\# start and stop ask; app_save, env_save, trigger add and workflow save
+    \\# are asked every time.
     \\# A line [agent:NAME], [owner] or [schedule:NAME] starts rules for those
     \\# calls only; [all] goes back to rules for every call. shell@NAME is for
     \\# commands in environment NAME (host is the only one for now).
@@ -440,7 +590,8 @@ pub const tasks_example =
     \\; Scheduled tasks: the agent runs `do` at a time (`at`, optional `days`)
     \\; or every N minutes (`every = 15m`, at least 5m). Its answer is sent to
     \\; you unless it is NOTHING; to = NAME posts it to that conversation
-    \\; (default main, the private chat; a new name opens that topic).
+    \\; (default main, the private chat; a new name opens that topic);
+    \\; agent = NAME runs it as that definition (default main, agents/).
     \\;
     \\; [weekly-review]
     \\; at = 18:00
@@ -617,6 +768,18 @@ test "tasks_and_briefs_name_their_conversation" {
     try t.expectEqual(3, (try parse(a, "[limits]\nsends_per_hour = 3\n")).limits.sends_per_hour);
 }
 
+test "tasks_name_their_agent" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ts = try parseTasks(a, "[watch]\nevery = 5m\nagent = researcher\ndo = Look.\n[plain]\nevery = 5m\ndo = x\n");
+    try t.expectEqualStrings("researcher", ts[0].agent);
+    // no agent: main
+    try t.expectEqualStrings("main", ts[1].agent);
+    try t.expectError(error.BadConfig, parseTasks(a, "[x]\nevery = 5m\nagent = Research\ndo = y"));
+    try t.expectError(error.BadConfig, parseTasks(a, "[x]\nevery = 5m\nagent = rm\ndo = y"));
+}
+
 test "agents_browser_and_money_sections" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
@@ -636,6 +799,22 @@ test "agents_browser_and_money_sections" {
     try t.expectEqual(500, c.money.max_per_day);
     try t.expect(c.money.scheduled);
     _ = try parse(arena.allocator(), defaults_ini);
+}
+
+test "inbox_settings_read_questions_and_remind" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try parse(a, "");
+    try t.expectEqual(20, d.inbox.questions);
+    try t.expectEqual(9 * 60, d.inbox.remind.?);
+    const c = try parse(a, "[inbox]\nquestions = 3\nremind = 18:30\n");
+    try t.expectEqual(3, c.inbox.questions);
+    try t.expectEqual(18 * 60 + 30, c.inbox.remind.?);
+    try t.expectEqual(null, (try parse(a, "[inbox]\nremind = off\n")).inbox.remind);
+    try t.expectError(error.BadConfig, parse(a, "[inbox]\nremind = 25:00\n"));
+    try t.expectError(error.BadConfig, parse(a, "[inbox]\nquestions = 0\n"));
+    try t.expectEqualDeep(d.inbox, (try parse(a, defaults_ini)).inbox);
 }
 
 test "inits_rules_comment_names_each_tool_that_asks_by_default" {
@@ -676,4 +855,95 @@ fn hasWord(text: []const u8, word: []const u8) bool {
         from = i + 1;
     }
     return false;
+}
+
+test "a_provider_section_overrides_a_preset" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try parse(a,
+        \\[provider openrouter]
+        \\key = or-key
+        \\url = http://127.0.0.1:9/api/v1
+        \\header = HTTP-Referer: https://example.org
+        \\header = X-Title: harness
+        \\cache = off
+    );
+    const set = try model.Providers.resolve(a, providerSettings(c), model.no_keys);
+    const orp = set.find("openrouter").?;
+    // what the section says, and the preset's for the rest
+    try t.expectEqual(model.Api.openai, orp.api);
+    try t.expectEqual(model.Auth.bearer, orp.auth);
+    try t.expectEqualStrings("http://127.0.0.1:9/api/v1", orp.url);
+    try t.expectEqualStrings("or-key", orp.key_name);
+    try t.expect(!orp.cache);
+    try t.expectEqual(2, orp.headers.len);
+    try t.expectEqualStrings("HTTP-Referer", orp.headers[0].name);
+    try t.expectEqualStrings("https://example.org", orp.headers[0].value);
+    try t.expectEqualStrings("X-Title", orp.headers[1].name);
+    try t.expectEqualStrings("harness", orp.headers[1].value);
+    // the other presets as they are
+    const an = set.find("anthropic").?;
+    try t.expectEqual(model.Api.anthropic, an.api);
+    try t.expectEqualStrings("https://api.anthropic.com/v1", an.url);
+    try t.expectEqual(model.Auth.x_api_key, an.auth);
+    try t.expect(an.cache);
+    try t.expectEqualStrings("anthropic", an.key_name);
+    try t.expectEqual(0, an.headers.len);
+    // harness init's settings: no section, omnigate the default
+    const d = try parse(a, defaults_ini);
+    try t.expectEqual(0, d.providers.len);
+    try t.expectEqualStrings("omnigate", d.model.provider);
+}
+
+test "a_new_provider_needs_api_and_url" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectError(error.ProviderNeedsApiAndUrl, parse(a, "[provider local]\n"));
+    try t.expectError(error.ProviderNeedsApiAndUrl, parse(a, "[provider local]\nurl = http://127.0.0.1:11434/v1\n"));
+    try t.expectError(error.ProviderNeedsApiAndUrl, parse(a, "[provider local]\napi = openai\n"));
+    const c = try parse(a, "[provider local]\napi = openai\nurl = http://127.0.0.1:11434/v1\n[provider proxy]\napi = anthropic\nurl = https://proxy.example.com/v1\n");
+    const set = try model.Providers.resolve(a, providerSettings(c), model.no_keys);
+    // the defaults of a new provider follow its format
+    const local = set.find("local").?;
+    try t.expectEqual(model.Api.openai, local.api);
+    try t.expectEqual(model.Auth.bearer, local.auth);
+    try t.expect(!local.cache);
+    try t.expectEqualStrings("local", local.key_name);
+    try t.expectEqualStrings("http://127.0.0.1:11434/v1", local.url);
+    const proxy = set.find("proxy").?;
+    try t.expectEqual(model.Api.anthropic, proxy.api);
+    try t.expectEqual(model.Auth.x_api_key, proxy.auth);
+    try t.expect(proxy.cache);
+    // the default provider must be one
+    try t.expectError(error.UnknownProvider, parse(a, "[model]\nprovider = nowhere\n"));
+    const lc = try parse(a, "[model]\nprovider = local\n[provider local]\napi = openai\nurl = http://127.0.0.1:11434/v1\n");
+    const ls = try model.Providers.resolve(a, providerSettings(lc), model.no_keys);
+    try t.expectEqualStrings("local", ls.list[ls.default].name);
+    // a section missing a key is named at its header
+    const why = (try @import("core.zig").parseProblem(a, "config.ini", "[model]\nurl = http://127.0.0.1:1\n[provider local]\nurl = http://127.0.0.1:11434/v1\n", parse)).?;
+    if (!std.mem.startsWith(u8, why, "config.ini line 3 has an error: [provider local] (a provider that is not a preset needs api")) {
+        std.debug.print("got: {s}\n", .{why});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "provider_sections_refuse_bad_values" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "api = grpc", "auth = basic", "cache = maybe", "url = ftp://x", "url = http://h/a b", "key = Bad Key", "colour = red" }) |line| {
+        try t.expectError(error.BadProvider, parse(a, try std.fmt.allocPrint(a, "[provider openrouter]\n{s}\n", .{line})));
+    }
+    try t.expectError(error.BadProvider, parse(a, "[provider Bad:Name]\napi = openai\nurl = http://h\n"));
+    try t.expectError(error.BadProvider, parse(a, "[provider a/b]\napi = openai\nurl = http://h\n"));
+    for ([_][]const u8{ "NoColon", "Authorization: Bearer x", "x-api-key: y", "Host: h", ": v", "X-A:", "anthropic-version: 2024-01-01" }) |h| {
+        try t.expectError(error.BadHeader, parse(a, try std.fmt.allocPrint(a, "[provider openrouter]\nheader = {s}\n", .{h})));
+    }
+    var nine: std.ArrayList(u8) = .empty;
+    try nine.appendSlice(a, "[provider openrouter]\n");
+    for (0..9) |i| try nine.print(a, "header = X-H{d}: v\n", .{i});
+    try t.expectError(error.BadHeader, parse(a, nine.items));
+    for ([_]anyerror{ error.BadProvider, error.BadHeader, error.ProviderNeedsApiAndUrl, error.UnknownProvider }) |e| try t.expect(reason(e) != null);
 }

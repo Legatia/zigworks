@@ -1,6 +1,6 @@
 #!/bin/sh
-# End to end: the real harness binary against harness-fake (omnigate,
-# Telegram, feeds, search). No network, no real keys.
+# End to end: the real harness binary against harness-fake (omnigate and
+# other model providers, Telegram, feeds, search). No network, no real keys.
 # Usage: smoke.sh HARNESS HARNESS_FAKE
 set -u
 H=$1
@@ -62,6 +62,18 @@ press() {
 	b=$(button "$1")
 	[ -n "$b" ] || return 1
 	inbox "{\"callback_query\":{\"id\":\"cb$inbox_n\",\"from\":{\"id\":42},\"message\":{\"message_id\":${2:-${b%% *}},\"chat\":{\"id\":42}},\"data\":\"${b#* }\"}}"
+}
+# press_at N KEY: the owner presses that button of the Nth last question
+press_at() {
+	b=$(grep -F '"inline_keyboard":[[' "$OUT" 2>/dev/null | tail -n "$1" | head -n 1 |
+		sed -n 's/^{"method":"sendMessage","message_id":\([0-9]*\),.*"callback_data":"\([^"]*:'"$2"'\)".*/\1 \2/p')
+	[ -n "$b" ] || return 1
+	inbox "{\"callback_query\":{\"id\":\"cb$inbox_n\",\"from\":{\"id\":42},\"message\":{\"message_id\":${b%% *},\"chat\":{\"id\":42}},\"data\":\"${b#* }\"}}"
+}
+# open_items: how many items of state/inbox are open
+open_items() {
+	n=$(grep -c '"status":"open"' "$HARNESS_HOME/state/inbox" 2>/dev/null)
+	echo "${n:-0}"
 }
 model() { printf '%s' "$2" >"$S/model/$(printf %03d "$1").json"; }
 # the model's requests are answered in order: reply ANSWER is the answer to
@@ -140,6 +152,26 @@ printf '[check]\nevery = 5m\ndo = Check the price.\n' >"$HARNESS_HOME/tasks.ini"
 reply "$(text_reply 'Price is flat.')"
 check "task run prints the answer" '"$H" task run check 2>/dev/null | grep -qF "[check] Price is flat."'
 check "the model got the omnigate key" 'grep -qF "\"x-api-key\":\"og-smoke-key-123\"" "$(req)"'
+# another provider: an OpenAI-format gateway that takes a bearer key
+printf 'sk-local-smoke-key-1\n' | "$H" secret add local --stdin 2>/dev/null
+cp "$HARNESS_HOME/config.ini" "$T/config.ini.saved"
+cat >"$HARNESS_HOME/config.ini" <<EOF
+[model]
+url = $URL
+model = local:gpt-smoke
+[provider local]
+api = openai
+url = $URL/v1
+auth = bearer
+[search]
+url = $URL
+[chat]
+api = $URL
+EOF
+check "secret list names the key of a provider in use" '"$H" secret list | grep -qxF "local (local key): stored"'
+reply '{"choices":[{"message":{"role":"assistant","content":"Price is up."},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":3}}'
+check "a task runs through an OpenAI-format provider with its bearer key" '"$H" task run check 2>/dev/null | grep -qF "[check] Price is up." && grep -qF "\"target\":\"/v1/chat/completions\"" "$(req)" && grep -qF "\"Authorization\":\"Bearer sk-local-smoke-key-1\"" "$(req)" && grep -qF "\"provider\":\"local\"" "$HARNESS_HOME/log/actions.jsonl" && ! grep -qF "sk-local-smoke-key-1" "$HARNESS_HOME/log/actions.jsonl"'
+cp "$T/config.ini.saved" "$HARNESS_HOME/config.ini"
 : >"$HARNESS_HOME/tasks.ini"
 
 # a brief source with one item sent before
@@ -171,8 +203,8 @@ check "a stranger is dropped and logged" 'grep -qF "\"from\":7" "$HARNESS_HOME/l
 reply "$(tool_reply tu_1 'echo smoke-ran')"
 reply "$(text_reply 'done: smoke-ran')"
 say "run the echo"
-# the buttons carry the question's number and this start's nonce
-check "the shell call asks for approval" 'wait_for "$OUT" "\"inline_keyboard\":[[" && button day | grep -qE "^[0-9]+ a[0-9]+-[0-9a-f]{16}:day$"'
+# the buttons carry the item's number and its own token
+check "the shell call asks for approval" 'wait_for "$OUT" "\"inline_keyboard\":[[" && button day | grep -qE "^[0-9]+ i[0-9]+-[0-9a-f]{16}:day$"'
 b=$(button day)
 press day $((${b%% *} + 1))
 check "a press in another message answers nothing" 'wait_for "$OUT" "That button is out of date" && [ ! -f "$(req)" ]'
@@ -225,7 +257,6 @@ reply "$(text_reply 'helper said hi')"
 reply "$(text_reply 'delegated ok')"
 say "split this"
 check "helpers answer the agent" 'wait_for "$OUT" "delegated ok" && [ "$(grep -o "helper said hi" "$(req)" | wc -l | tr -d " ")" = 2 ]'
-
 # an MCP tool no rule allows asks by default: once it runs, denied it doesn't
 reply "$(call_reply tu_s1 fake__sleep '{"ms":1}')"
 reply "$(call_reply tu_s2 fake__sleep '{"ms":2}')"
@@ -290,6 +321,22 @@ check "changes says what the run added" 'wait_for "$OUT" "Since 1: added a.md."'
 say "/restore notes 1"
 check "restore puts notes back as before the run and says how to undo it" 'wait_for "$OUT" "Restored notes to 1: deleted a.md. /restore notes 3 undoes it." && [ ! -e "$HARNESS_HOME/workspace/notes/a.md" ]'
 
+# two helpers' questions wait at once, each its own item; the newer is
+# answered first, and the older still waits
+before=$(asked)
+reply '{"content":[{"type":"tool_use","id":"tu_q","name":"delegate","input":{"tasks":[{"task":"first","tools":["shell"]},{"task":"second","tools":["shell"]}]}}],"stop_reason":"tool_use"}'
+reply "$(tool_reply h_a 'echo helper-one')"
+reply "$(tool_reply h_b 'echo helper-two')"
+reply "$(text_reply 'helper finished')"
+reply "$(text_reply 'helper finished')"
+reply "$(text_reply 'both helpers answered')"
+say "ask twice at once"
+check "two helpers' questions wait at once" 'wait_asked $((before + 2)) && [ "$(open_items)" = 2 ]'
+press deny
+check "the newer is answered first while the older waits" 'sleep 1 && [ "$(open_items)" = 1 ] && ! grep -qF "both helpers answered" "$OUT"'
+press_at 2 once
+check "then the older, and the turn goes on" 'wait_for "$OUT" "both helpers answered" && [ "$(open_items)" = 0 ]'
+
 # a secret the owner types reaches the log masked (and below: not at all in clear)
 reply "$(text_reply 'noted, not repeated')"
 say "my omnigate key is og-smoke-key-123"
@@ -297,12 +344,14 @@ check "a secret the owner types is masked in the log" 'wait_for "$OUT" "noted, n
 
 # a task added from the chat runs at the scheduler's next tick; nobody can
 # answer there, so its shell call is refused, and it says so though its
-# answer is NOTHING
+# answer is NOTHING; the call is kept as an item, posted without a sound
 reply "$(tool_reply tu_t1 'df -h')"
 reply "$(text_reply 'NOTHING')"
 before=$(asked)
 say "/task add disk | every 5m | Check the disk."
-check "a scheduled run skips what needs asking and says so, even answering NOTHING" 'wait_for "$OUT" "[disk] Skipped (needs approval): shell: df -h" 30 && result $mn tu_t1 "refused by the gate: no one to ask in a scheduled run" && [ "$(asked)" = "$before" ] && ! grep -qF "[disk] NOTHING" "$OUT"'
+check "a scheduled run skips what needs asking and says so, even answering NOTHING" 'wait_for "$OUT" "[disk] Skipped (needs approval): shell: df -h (item " 30 && result $mn tu_t1 "refused by the gate: no one to ask in a scheduled run" && [ "$(asked)" = $((before + 1)) ] && last_question | grep -qF "could not make this call without you:" && last_question | grep -qF "\"disable_notification\":true" && ! grep -qF "[disk] NOTHING" "$OUT"'
+press allow
+check "Allow for this task writes a grant for that task alone" 'wait_for "$HARNESS_HOME/state/grants" "schedule:disk" 5 && grep -F "schedule:disk" "$HARNESS_HOME/state/grants" | grep -qF "df -h"'
 
 # a topic of the owner's chat with the bot is a conversation of its own
 reply "$(call_reply tu_h1 recall '{"query":"flats"}')"
@@ -317,14 +366,81 @@ reply "$(text_reply 'Two new flats.')"
 say "/reload"
 check "a task with to = posts to its topic" 'wait_for "$OUT" "\"message_thread_id\":5012,\"text\":\"[watch] Two new flats.\"" 30'
 
+# an agent definition written by hand: picked for a conversation it answers
+# there with its own instructions and model; it proposes a change to itself,
+# asked every time with the whole file, and the next run uses the change
+cat >"$HARNESS_HOME/agents/researcher.md" <<'EOF'
+---
+name: researcher
+description: Research across several sources; answers with links.
+model: claude-haiku
+tools: search, fetch, recall, agent_save
+memory: pinned
+---
+Research one question at a time.
+EOF
+chmod 600 "$HARNESS_HOME/agents/researcher.md"
+reloaded() { grep -c "Settings reloaded." "$OUT"; }
+tries=0
+while [ $tries -lt 5 ]; do
+	r0=$(reloaded)
+	say "/reload"
+	i=0
+	while [ $i -lt 30 ] && [ "$(reloaded)" -le "$r0" ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	[ "$(reloaded)" -gt "$r0" ] && break
+	tries=$((tries + 1))
+done
+say "/agent researcher"
+check "/agent picks a definition for the conversation" 'wait_for "$OUT" "researcher answers here from your next message."'
+reply "$(text_reply 'Found it in two sources.')"
+say "what changed in zig"
+check "the conversation's definition answers, with its instructions and model" 'wait_for "$OUT" "Found it in two sources." && grep -qF "Research one question at a time." "$(req)" && grep -qF "\"model\":\"claude-haiku\"" "$(req)"'
+say "/agents"
+check "/agents lists the definitions" 'wait_for "$OUT" "researcher: Research across several sources; answers with links."'
+before=$(asked)
+reply "$(call_reply tu_as agent_save '{"name":"researcher","text":"---\nname: researcher\ndescription: Research across several sources; answers with links.\nmodel: claude-haiku\ntools: search, fetch, recall, agent_save\nmemory: pinned\n---\nResearch one question at a time. Cite dates.\n"}')"
+reply "$(text_reply 'Saved my definition.')"
+say "always cite dates"
+check "agent_save asks with the whole file and no Allow 24 h" 'wait_asked $((before + 1)) && last_question | grep -qF "agent_save: researcher" && last_question | grep -qF "Cite dates." && [ -z "$(button day)" ]'
+press once
+check "an allowed change is written, marked, and its old file kept" 'wait_for "$OUT" "Saved my definition." && grep -qF "saved: agent:researcher " "$HARNESS_HOME/agents/researcher.md" && [ -n "$(ls "$HARNESS_HOME/state/agents/researcher/versions/")" ]'
+say "/new"
+wait_for "$OUT" "New conversation."
+reply "$(text_reply 'Dated answer.')"
+say "and now"
+check "the next run uses the change" 'wait_for "$OUT" "Dated answer." && grep -qF "Cite dates." "$(req)"'
+say "/agent main"
+
+# a question still open when harness stops: after a restart its button
+# answers nothing, and harness says why
+reply "$(tool_reply tu_r 'echo before-restart')"
+before=$(asked)
+say "one more command"
+wait_asked $((before + 1))
+kill "$RPID" 2>/dev/null
+wait "$RPID" 2>/dev/null
+"$H" run >"$T/run2.out" 2>&1 &
+RPID=$!
+wait_for "$T/run2.out" "running on" 5
+press once
+check "after a restart a question's button answers nothing" 'wait_for "$OUT" "Already closed: " 10 && [ "$(open_items)" = 0 ]'
+
 kill "$RPID" 2>/dev/null
 wait "$RPID" 2>/dev/null
 RPID=""
+# the call allowed from the disk task's item runs on its next run
+reply "$(tool_reply tu_t2 'df -h')"
+reply "$(text_reply 'Disk is fine.')"
+check "the call allowed for a task runs on its next run" '"$H" task run disk 2>/dev/null | grep -qF "[disk] Disk is fine." && grep -qF "\"tool_use_id\":\"tu_t2\"" "$(req)" && ! result $mn tu_t2 "refused"'
 check "the log chain verifies" '"$H" log verify | grep -qF "chain intact"'
 check "no secret value in the log, typed by the owner or not" '! grep -qE "og-smoke-key-123|telegram-smoke-token|brave-smoke-key|smoke-login-pass" "$HARNESS_HOME/log/actions.jsonl"'
 check "a login is removed with its secrets" '"$H" login rm bot >/dev/null && "$H" login list | grep -qF "No logins." && [ ! -e "$HARNESS_STORE/login-bot-password" ] && ! grep -qF "[bot]" "$HARNESS_HOME/logins.ini"'
 check "memory list works offline" '"$H" memory list 2>/dev/null | grep -qF "I prefer short briefs"'
 check "snapshot list works offline" '"$H" snapshot list notes 2>/dev/null | grep -qF "Snapshots of notes:"'
+check "agent list works offline" '"$H" agent list 2>/dev/null | grep -qF "researcher: Research across several sources"'
 
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	echo "smoke: FAILED"

@@ -15,6 +15,8 @@ const totp = @import("totp.zig");
 const session = @import("session.zig");
 const remote = @import("remote.zig");
 const folders = @import("folders.zig");
+const inbox_mod = @import("inbox.zig");
+const model = @import("model.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -44,6 +46,9 @@ const usage =
     \\                             where commands can run (environments.ini): list them,
     \\                             try one, remove one's home; a remote's own SSH key
     \\                             and its host key, kept once you confirm it
+    \\  agent list | show NAME | rm NAME
+    \\                             the agent definitions (agents/); rm keeps
+    \\                             the file in state/agents/NAME/versions/
     \\  log verify                 check the action log's chain
     \\  log tail [N]               print the last N log lines (default 20)
     \\  log runs [N]               a line per run, the last N (default 20)
@@ -51,6 +56,7 @@ const usage =
     \\  app list | approve NAME | rm NAME
     \\                             the apps in apps/: list them, serve one as its files
     \\                             are now, remove one with its data
+    \\  inbox [--json]             what waits for you (--json: every item kept, format v1)
     \\  health                     exit 0 if `harness run` is running and recent
     \\  version | help
     \\
@@ -126,18 +132,31 @@ const App = struct {
 
     fn secrets(app: *App, cfg: config.Config) core_mod.Secrets {
         const s = app.store();
+        // the providers' key names ([provider omnigate] may rename omnigate's)
+        const set = model.Providers.resolve(app.arena, config.providerSettings(cfg), model.no_keys) catch model.Providers{ .list = &.{} };
         return .{
-            .omnigate = s.get(app.io, app.arena, cfg.model.key) catch null,
+            .omnigate = s.get(app.io, app.arena, if (set.find("omnigate")) |p| p.key_name else cfg.model.key) catch null,
             .telegram = s.get(app.io, app.arena, cfg.chat.token) catch null,
             .search = s.get(app.io, app.arena, cfg.search.key) catch null,
-            .named = app.namedSecrets(s),
+            .named = app.namedSecrets(s, set),
         };
     }
 
-    /// The MCP servers' secrets, those folders.ini's vars name, and the
-    /// logins' passwords and TOTP seeds (masked in all tool output).
-    fn namedSecrets(app: *App, s: store_mod.Store) []const core_mod.Secrets.Named {
+    /// The MCP servers' secrets, those folders.ini's vars name, the
+    /// logins' passwords and TOTP seeds, and every provider's key but
+    /// omnigate's (masked in all tool output; an agent definition may name
+    /// any provider).
+    fn namedSecrets(app: *App, s: store_mod.Store, providers: model.Providers) []const core_mod.Secrets.Named {
         var out: std.ArrayList(core_mod.Secrets.Named) = .empty;
+        for (providers.list) |p| {
+            if (std.mem.eql(u8, p.name, "omnigate") or p.auth == .none) continue;
+            const known = for (out.items) |n| {
+                if (std.mem.eql(u8, n.name, p.key_name)) break true;
+            } else false;
+            if (known) continue;
+            const v = (s.get(app.io, app.arena, p.key_name) catch null) orelse continue;
+            out.append(app.arena, .{ .name = p.key_name, .value = v }) catch {};
+        }
         out.appendSlice(app.arena, app.mcpSecrets(s)) catch {};
         out.appendSlice(app.arena, app.folderSecrets(s)) catch {};
         for (app.loginList()) |l| for ([_]logins.Kind{ .password, .totp }) |k| {
@@ -195,15 +214,16 @@ const App = struct {
         snapshot,
         env,
         app,
+        agent,
 
         /// Whether it needs the MCP servers and the browser: a brief is
-        /// one model call without tools, memory, snapshot, env and app commands
-        /// make none, and starting servers for them costs up to 20 s and
-        /// runs their code.
+        /// one model call without tools, memory, snapshot, env, app and
+        /// agent commands make none, and starting servers for them costs
+        /// up to 20 s and runs their code.
         fn usesTools(r: Role) bool {
             return switch (r) {
                 .run, .chat, .task => true,
-                .brief, .memory, .snapshot, .env, .app => false,
+                .brief, .memory, .snapshot, .env, .app, .agent => false,
             };
         }
     };
@@ -212,8 +232,9 @@ const App = struct {
     fn open(app: *App, role: Role) !*Core {
         const cfg = try app.settings();
         const sec = app.secrets(cfg);
-        if (sec.omnigate == null) complain("note: no omnigate key stored under \"{s}\"; model calls will be refused. Run: harness secret add {s}", .{ cfg.model.key, cfg.model.key });
-        if (cfg.model.url.len == 0) complain("note: no omnigate url is set ([model] url in config.ini); model calls will be refused", .{});
+        // each provider in use without its key or url, said once
+        const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), .{ .ctx = @constCast(&sec), .get = startKey });
+        for (try startNotes(app.arena, &set, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model })) |n| complain("{s}", .{n});
         const c = Core.open(app.gpa, app.io, app.home, sec) catch |e| {
             switch (e) {
                 error.AlreadyRunning => complain("harness is already running on {s}; talk to it there (or stop it first)", .{app.home}),
@@ -249,6 +270,27 @@ const App = struct {
         return c;
     }
 };
+
+/// The key read at start for `provider` (omnigate's, or one of `named`).
+fn startKey(ctx: ?*anyopaque, _: std.mem.Allocator, provider: []const u8, secret: []const u8) ?[]const u8 {
+    const sec: *const core_mod.Secrets = @ptrCast(@alignCast(ctx.?));
+    if (std.mem.eql(u8, provider, "omnigate")) return sec.omnigate;
+    return sec.get(secret);
+}
+
+/// What a command says at start of the providers `values` pick: each one
+/// without its key or its url (omnigate's in 0.3's words).
+pub fn startNotes(a: std.mem.Allocator, set: *const model.Providers, values: []const []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (try set.used(a, values)) |p| {
+        if (!p.hasKey()) try out.append(a, try std.fmt.allocPrint(a, "note: no {s} key stored under \"{s}\"; model calls will be refused. Run: harness secret add {s}", .{ p.name, p.key_name, p.key_name }));
+        if (p.url.len == 0) {
+            const where = if (std.mem.eql(u8, p.name, "omnigate")) "[model] url" else try std.fmt.allocPrint(a, "[provider {s}] url", .{p.name});
+            try out.append(a, try std.fmt.allocPrint(a, "note: no {s} url is set ({s} in config.ini); model calls will be refused", .{ p.name, where }));
+        }
+    }
+    return out.items;
+}
 
 pub fn main(init: std.process.Init) u8 {
     const gpa = std.heap.smp_allocator;
@@ -287,7 +329,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "env", "app" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "env", "app", "agent" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -308,8 +350,10 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "memory")) return memoryCmd(app, rest);
     if (eql(cmd, "snapshot")) return snapshotCmd(app, rest);
     if (eql(cmd, "env")) return envCmd(app, rest);
+    if (eql(cmd, "agent")) return agentCmd(app, rest);
     if (eql(cmd, "log")) return logCmd(app, rest);
     if (eql(cmd, "app")) return appCmd(app, rest);
+    if (eql(cmd, "inbox")) return inboxCmd(app, rest);
     if (eql(cmd, "health")) return healthCmd(app);
     complain("unknown command {s}; see harness help", .{cmd});
     return .usage;
@@ -327,8 +371,9 @@ fn initCmd(app: *App) !Exit {
     try outPrint(app.io,
         \\Data folder: {s}
         \\Next:
-        \\  1. Set the omnigate url (there is none by default) and route names in config.ini.
-        \\  2. harness secret add omnigate     (your omnigate key)
+        \\  1. Set the omnigate url (there is none by default) and route names in config.ini,
+        \\     or another provider: [model] provider (README: Models and providers).
+        \\  2. harness secret add omnigate     (your omnigate key; another provider's under its name)
         \\  3. harness secret add telegram     (the bot token from @BotFather)
         \\  4. harness secret add search       (optional: Brave Search API key)
         \\  5. harness run, then harness pair, then send /pair CODE to the bot.
@@ -357,6 +402,18 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         for ([_][2][]const u8{ .{ "model key", cfg.model.key }, .{ "bot token", cfg.chat.token }, .{ "search key", cfg.search.key } }) |pair| {
             const v = s.get(app.io, app.arena, pair[1]) catch null;
             try outPrint(app.io, "{s} ({s}): {s}\n", .{ pair[1], pair[0], if (v != null) "stored" else "not stored" });
+        }
+        // the keys of the other providers in use or with a section
+        const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), model.no_keys);
+        const used = try set.used(app.arena, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model });
+        for (set.list) |*p| {
+            if (std.mem.eql(u8, p.name, "omnigate") or p.auth == .none) continue;
+            const has_section = for (cfg.providers) |sec| {
+                if (std.mem.eql(u8, sec.name, p.name)) break true;
+            } else false;
+            if (std.mem.indexOfScalar(*const model.Provider, used, p) == null and !has_section) continue;
+            const v = s.get(app.io, app.arena, p.key_name) catch null;
+            try outPrint(app.io, "{s} ({s} key): {s}\n", .{ p.key_name, p.name, if (v != null) "stored" else "not stored" });
         }
         const p = try std.fs.path.join(app.arena, &.{ app.home, "mcp.ini" });
         if (Io.Dir.cwd().readFileAlloc(app.io, p, app.arena, .limited(1 << 20))) |text| {
@@ -705,7 +762,7 @@ const TgChan = struct {
     }
 
     fn channel(tc: *TgChan) core_mod.Channel {
-        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .send_to = sendTo, .document = document, .open_topic = openTopic };
+        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic };
     }
 
     fn sendTo(ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void {
@@ -722,7 +779,7 @@ const TgChan = struct {
         if (place.chat == 0) return error.NotPaired;
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
-        const sent = tc.send_bot.sendTo(place.chat, place.thread, text) catch |e| {
+        const sent = tc.send_bot.sendTo(place.chat, place.thread, text, .{ .quiet = place.quiet }) catch |e| {
             complain("telegram: sending failed: {s}", .{@errorName(e)});
             return if (e == error.TelegramRefused and place.thread != 0) error.TopicRefused else e;
         };
@@ -734,7 +791,7 @@ const TgChan = struct {
         if (place.chat == 0) return null;
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
-        return tc.send_bot.sendButtonsTo(place.chat, place.thread, text, bs) catch null;
+        return tc.send_bot.sendButtonsTo(place.chat, place.thread, text, bs, .{ .quiet = place.quiet }) catch null;
     }
 
     fn clear(ctx: *anyopaque, place: core_mod.Place, id: i64) void {
@@ -743,6 +800,15 @@ const TgChan = struct {
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
         tc.send_bot.clearButtons(place.chat, id) catch {};
+    }
+
+    /// An item's message once it closed: its text and the outcome, no buttons.
+    fn edit(ctx: *anyopaque, place: core_mod.Place, id: i64, text: []const u8) void {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        tc.send_bot.editText(place.chat, id, text) catch {};
     }
 
     fn document(ctx: *anyopaque, place: core_mod.Place, name: []const u8, data: []const u8) anyerror!i64 {
@@ -840,6 +906,7 @@ fn runCmd(app: *App) !Exit {
                     .thread = m.thread,
                     .topic = m.topic,
                     .text = m.text,
+                    .reply_to = m.reply_to,
                 }) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
                 .callback => |cb| {
                     tc.answer(cb.id);
@@ -887,6 +954,11 @@ const TermChan = struct {
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
         var tb: [48]u8 = undefined;
+        // /inbox's Show buttons: the list says it all here
+        if (bs.len > 0 and bs[0][1].len > 0 and bs[0][1][0] == 's') {
+            outPrint(tc.io, "{s}{s}\n", .{ tc.tag(&tb, place), text }) catch {};
+            return 0;
+        }
         // quick replies: type one (a press is a message here)
         if (bs.len > 0 and bs[0][1].len > 0 and bs[0][1][0] == 'r') {
             outPrint(tc.io, "{s}{s}\n", .{ tc.tag(&tb, place), text }) catch {};
@@ -916,13 +988,15 @@ const TermChan = struct {
     }
 };
 
-/// The keys for the buttons a question has ("[o] allow once  [n] deny"),
-/// by what each button answers.
+/// The keys for an item's buttons ("[o] allow once  [n] deny"): an
+/// approval's by what each answers, another item's by their place
+/// ("[1] personal  [2] work").
 fn keysLine(buf: []u8, bs: []const [2][]const u8) []const u8 {
     var n: usize = 0;
-    for (bs) |b| {
+    const places = "1234";
+    for (bs, 0..) |b, i| {
         if (b[0].len == 0) continue;
-        const key: []const u8 = if (std.mem.endsWith(u8, b[1], ":once")) "o" else if (std.mem.endsWith(u8, b[1], ":day")) "d" else "n";
+        const key: []const u8 = if (std.mem.endsWith(u8, b[1], ":once")) "o" else if (std.mem.endsWith(u8, b[1], ":day")) "d" else if (std.mem.endsWith(u8, b[1], ":deny")) "n" else places[@min(i, 3) .. @min(i, 3) + 1];
         const part = std.fmt.bufPrint(buf[n..], "{s}[{s}] {c}{s}", .{ if (n > 0) "  " else "", key, std.ascii.toLower(b[0][0]), b[0][1..] }) catch break;
         n += part.len;
     }
@@ -955,12 +1029,12 @@ fn chatCmd(app: *App) !Exit {
         const line = try readLineEof(app, stdin, &ended);
         if (leaves(line)) break;
         if (line.len == 0) continue;
-        if (c.approvalWaiting()) {
-            const ans: ?agent.Answer = if (eql(line, "o")) .once else if (eql(line, "d")) .day else if (eql(line, "n")) .deny else null;
-            if (ans) |x| {
-                if (!c.answerPending(x) and c.approvalWaiting()) try errAll(app.io, "That answer is not offered for this question.\n");
-                continue;
-            }
+        // an item's answer: o, d, n or 1 to 4, with its id when several wait
+        var said_arena: std.heap.ArenaAllocator = .init(app.gpa);
+        defer said_arena.deinit();
+        if (c.terminalAnswer(said_arena.allocator(), line)) |said| {
+            if (said.len > 0) try errPrint(app.io, "{s}\n", .{said});
+            continue;
         }
         try c.handleTextIn("terminal", line);
     }
@@ -1149,6 +1223,28 @@ fn appCmd(app: *App, args: []const []const u8) !Exit {
     return .ok;
 }
 
+const agent_usage = "usage: harness agent list | agent show NAME | agent rm NAME";
+
+/// The chat command `harness agent ARGS` sends; null when the arguments
+/// are not one (in `a`).
+fn agentCommandText(a: std.mem.Allocator, args: []const []const u8) !?[]const u8 {
+    if (args.len == 1 and eql(args[0], "list")) return "/agents";
+    if (args.len != 2 or args[1].len == 0 or args[1][0] == '-') return null;
+    if (eql(args[0], "show") or eql(args[0], "rm")) return try std.fmt.allocPrint(a, "/agent {s} {s}", .{ args[0], args[1] });
+    return null;
+}
+
+fn agentCmd(app: *App, args: []const []const u8) !Exit {
+    const text = (try agentCommandText(app.arena, args)) orelse {
+        complain(agent_usage, .{});
+        return .usage;
+    };
+    const c = try app.open(.agent);
+    defer c.close();
+    try outPrint(app.io, "{s}\n", .{std.mem.trimEnd(u8, try c.command(app.arena, text), "\n")});
+    return .ok;
+}
+
 fn logCmd(app: *App, args: []const []const u8) !Exit {
     const p = try core_mod.Paths.init(app.arena, app.home);
     if (args.len >= 1 and eql(args[0], "verify")) {
@@ -1210,6 +1306,34 @@ fn logCmd(app: *App, args: []const []const u8) !Exit {
     }
     complain("usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]", .{});
     return .usage;
+}
+
+/// `harness inbox [--json]`: reads state/inbox only, so it works while
+/// harness runs.
+fn inboxCmd(app: *App, args: []const []const u8) !Exit {
+    const p = try core_mod.Paths.init(app.arena, app.home);
+    var box: inbox_mod.Box = .init(app.gpa, app.io, p.inbox);
+    defer box.deinit();
+    box.load("") catch |e| {
+        complain("can't read {s}: {s}", .{ p.inbox, @errorName(e) });
+        return .failed;
+    };
+    try outAll(app.io, try inboxText(app.arena, &box, args.len == 1, util.nowSeconds(app.io)));
+    return .ok;
+}
+
+/// What `harness inbox` prints: a line per open item (or that nothing
+/// waits); with `json`, every item kept in format v1, a line each.
+fn inboxText(a: std.mem.Allocator, box: *const inbox_mod.Box, json: bool, now_s: i64) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (box.items.items) |it| {
+        if (json) {
+            try inbox_mod.render(&out, a, it, false);
+            try out.append(a, '\n');
+        } else if (it.status == .open) try out.print(a, "{s}\n", .{try inbox_mod.listLine(a, it, now_s)});
+    }
+    if (!json and out.items.len == 0) return "Nothing is waiting for you.\n";
+    return out.items;
 }
 
 fn healthCmd(app: *App) !Exit {
@@ -1509,6 +1633,12 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
         return "usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]";
     }
     if (eql(cmd, "app")) return if (appArgsOk(rest)) null else app_usage;
+    if (eql(cmd, "agent")) {
+        var buf: [256]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        return if ((agentCommandText(fba.allocator(), rest) catch null) == null) agent_usage else null;
+    }
+    if (eql(cmd, "inbox")) return if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "--json"))) null else "usage: harness inbox [--json]";
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
     if (eql(cmd, "env")) return if (envArgsOk(rest)) null else env_usage;
@@ -1607,6 +1737,25 @@ test "extra_or_unknown_arguments_are_refused" {
     };
 }
 
+test "agent_takes_list_show_and_rm" {
+    for ([_][]const []const u8{ &.{"agent"}, &.{ "agent", "list", "x" }, &.{ "agent", "show" }, &.{ "agent", "rm" }, &.{ "agent", "rm", "a", "b" }, &.{ "agent", "drop", "a" }, &.{ "agent", "show", "-x" } }) |line| if (badArgs(line) == null) {
+        printLine("accepted:", line);
+        return error.TestUnexpectedResult;
+    };
+    for ([_][]const []const u8{ &.{ "agent", "list" }, &.{ "agent", "show", "researcher" }, &.{ "agent", "rm", "researcher" } }) |line| if (badArgs(line)) |why| {
+        printLine("refused:", line);
+        std.debug.print("  {s}\n", .{why});
+        return error.TestUnexpectedResult;
+    };
+    // the commands they send in chat
+    try t.expectEqualStrings("/agents", (try agentCommandText(t.allocator, &.{"list"})).?);
+    const show = (try agentCommandText(t.allocator, &.{ "show", "researcher" })).?;
+    defer t.allocator.free(show);
+    try t.expectEqualStrings("/agent show researcher", show);
+    try t.expect(!App.Role.agent.usesTools());
+    try t.expect(std.mem.indexOf(u8, usage, "agent list | show NAME | rm NAME") != null);
+}
+
 test "names_start_with_a_letter_or_digit" {
     try t.expect(validName("omnigate"));
     try t.expect(validName("login-bot-password"));
@@ -1699,8 +1848,6 @@ fn complain(comptime fmt: []const u8, args: anytype) void {
 }
 
 // ---- tests ----
-
-const model = @import("model.zig");
 
 /// Frees nothing until `deinit` and fills what is freed with 0xaa first: a
 /// pointer kept into freed memory reads garbage, every time.
@@ -1857,6 +2004,7 @@ test {
     _ = @import("jv.zig");
     _ = @import("who.zig");
     _ = @import("conversations.zig");
+    _ = @import("inbox.zig");
     _ = @import("session.zig");
     _ = @import("folders.zig");
     _ = @import("environments.zig");
@@ -1868,6 +2016,7 @@ test {
     _ = @import("scrub.zig");
     _ = @import("masks.zig");
     _ = @import("skills.zig");
+    _ = @import("agents.zig");
     _ = @import("mcp.zig");
     _ = @import("page.zig");
     _ = @import("totp.zig");
@@ -2014,4 +2163,95 @@ test "snapshot_arguments_are_checked" {
         std.debug.print("  {s}\n", .{why});
         return error.TestUnexpectedResult;
     };
+}
+
+test "the_terminal_answers_by_id_when_several_are_open" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const c = try Core.open(t.allocator, t.io, try testHome(&e), .{});
+    defer c.close();
+    const a = e.arena.allocator();
+    const two: inbox_mod.New = .{ .kind = "question", .title = "Which one?", .body = "Which one?", .choices = &.{ .{ .key = "1", .label = "Personal" }, .{ .key = "2", .label = "Work" } } };
+    _ = try c.addItem(two);
+    _ = try c.addItem(two);
+    // a key alone: several take it, so the id is needed
+    try t.expectEqualStrings("Several are waiting: 1, 2. Add the id, as in 1 1.", c.terminalAnswer(a, "1").?);
+    // with the id, that item
+    try t.expectEqualStrings("", c.terminalAnswer(a, "2 2").?);
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, c.paths.inbox, a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, text, "\"answer\":{\"key\":\"2\",\"text\":null,") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"via\":\"terminal\"") != null);
+    // one left: a key alone answers it
+    try t.expectEqualStrings("", c.terminalAnswer(a, "1").?);
+    try t.expectEqualStrings("No item 2 is waiting.", c.terminalAnswer(a, "1 2").?);
+    // with no approval waiting, o is a message for the agent
+    try t.expectEqual(null, c.terminalAnswer(a, "o"));
+    try t.expectEqual(null, c.terminalAnswer(a, "ok then"));
+    // the keys the terminal shows for a question
+    var buf: [128]u8 = undefined;
+    try t.expectEqualStrings("[1] personal  [2] work", keysLine(&buf, &.{ .{ "Personal", "i44-0123456789abcdef:1" }, .{ "Work", "i44-0123456789abcdef:2" } }));
+}
+
+test "harness_inbox_json_prints_v1_without_the_kept_fields" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(t.io, ".", a), "inbox" });
+    const at: i64 = 1795356180;
+    {
+        var box: inbox_mod.Box = .init(t.allocator, t.io, path);
+        defer box.deinit();
+        const it = try box.add(.{
+            .kind = "delivery",
+            .title = "Three flats match.",
+            .body = "Three flats match.",
+            .choices = &.{ .{ .key = "again", .label = "Send again" }, .{ .key = "drop", .label = "Drop" } },
+            .post = .{ .conversation = "main", .text = "Three flats match.", .next = at + 300 },
+            .grant = .{ .tool = "shell@host", .key = "ls", .who = "schedule:x" },
+            .skip = "schedule:x\tshell@host\tls",
+        }, at, "0123456789abcdef".*);
+        try it.shown.append(it.arena.allocator(), .{ .chat = 42, .thread = 0, .message = 7 });
+        const done = try box.add(.{ .kind = "approval", .title = "shell: ls", .body = "shell: ls" }, at, "fedcba9876543210".*);
+        box.close(done, .answered, .{ .key = "once", .at = at + 20, .via = .telegram });
+        try box.save(at + 120);
+    }
+    var read: inbox_mod.Box = .init(t.allocator, t.io, path);
+    defer read.deinit();
+    try read.load("");
+    const json = try inboxText(a, &read, true, at + 120);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, json, "\n"), '\n');
+    var n: usize = 0;
+    while (lines.next()) |l| {
+        n += 1;
+        try t.expect(std.mem.startsWith(u8, l, "{\"v\":1,"));
+        for ([_][]const u8{ "\"token\"", "\"shown\"", "\"post\"", "\"grant\"", "\"skip\"", "\"private\"", "0123456789abcdef" }) |k| try t.expect(std.mem.indexOf(u8, l, k) == null);
+    }
+    try t.expectEqual(2, n);
+    // without --json: what waits, a line each
+    try t.expectEqualStrings("[1] delivery, main, 2 min: Three flats match.\n", try inboxText(a, &read, false, at + 120));
+    try t.expect(badArgs(&.{"inbox"}) == null);
+    try t.expect(badArgs(&.{ "inbox", "--json" }) == null);
+    try t.expect(badArgs(&.{ "inbox", "x" }) != null);
+}
+
+test "start_notes_name_each_provider_in_use_without_its_key" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // harness init's settings, nothing stored: 0.3's two notes
+    const d = try config.parse(a, config.defaults_ini);
+    const ds = try model.Providers.resolve(a, config.providerSettings(d), model.no_keys);
+    const dn = try startNotes(a, &ds, &.{ d.model.model, d.model.worker_model, d.model.memory_model });
+    try t.expectEqual(2, dn.len);
+    try t.expectEqualStrings("note: no omnigate key stored under \"omnigate\"; model calls will be refused. Run: harness secret add omnigate", dn[0]);
+    try t.expectEqualStrings("note: no omnigate url is set ([model] url in config.ini); model calls will be refused", dn[1]);
+    // everything on openrouter: only its key is said
+    const o = try config.parse(a, "[model]\nprovider = openrouter\nmodel = openrouter:deepseek/deepseek-chat\n");
+    const os = try model.Providers.resolve(a, config.providerSettings(o), model.no_keys);
+    const on = try startNotes(a, &os, &.{ o.model.model, o.model.worker_model, o.model.memory_model });
+    try t.expectEqual(1, on.len);
+    try t.expectEqualStrings("note: no openrouter key stored under \"openrouter\"; model calls will be refused. Run: harness secret add openrouter", on[0]);
 }

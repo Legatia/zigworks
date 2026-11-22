@@ -33,6 +33,15 @@ pub const Message = struct {
     /// The topic's name, when the message opened it or replies to its
     /// opening (as a topic's messages do).
     topic: ?[]const u8 = null,
+    /// The message it replies to; 0: none (a topic's reply to its own
+    /// opening is no reply).
+    reply_to: i64 = 0,
+};
+
+/// How a message is sent.
+pub const Opts = struct {
+    /// Without a sound on the owner's devices (`disable_notification`).
+    quiet: bool = false,
 };
 
 pub const Callback = struct {
@@ -133,6 +142,7 @@ pub const Bot = struct {
                     .chat_type = jv.str(jv.at(m, &.{ "chat", "type" })) orelse "private",
                     .thread = threadOf(m),
                     .topic = jv.str(jv.at(m, &.{ "forum_topic_created", "name" })) orelse jv.str(jv.at(m, &.{ "reply_to_message", "forum_topic_created", "name" })),
+                    .reply_to = if (jv.get(m, "reply_to_message")) |r| (if (jv.get(r, "forum_topic_created") != null) 0 else jv.int(jv.get(r, "message_id")) orelse 0) else 0,
                 } });
             } else if (jv.get(u, "callback_query")) |c| {
                 try out.append(arena, .{ .callback = .{
@@ -154,11 +164,11 @@ pub const Bot = struct {
 
     /// Sends `text`, split into parts of at most 4,096 bytes at line breaks.
     pub fn send(b: *Bot, chat_id: i64, text: []const u8) !void {
-        _ = try b.sendTo(chat_id, 0, text);
+        _ = try b.sendTo(chat_id, 0, text, .{});
     }
 
     /// `send` to topic `thread` of the chat (0: the chat itself).
-    pub fn sendTo(b: *Bot, chat_id: i64, thread: i64, text: []const u8) !Sent {
+    pub fn sendTo(b: *Bot, chat_id: i64, thread: i64, text: []const u8, opts: Opts) !Sent {
         var arena: std.heap.ArenaAllocator = .init(b.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -168,7 +178,9 @@ pub const Bot = struct {
             try where(&body, a, chat_id, thread);
             try body.appendSlice(a, ",\"text\":");
             try util.jsonString(&body, a, part);
-            try body.appendSlice(a, ",\"link_preview_options\":{\"is_disabled\":true}}");
+            try body.appendSlice(a, ",\"link_preview_options\":{\"is_disabled\":true}");
+            if (opts.quiet) try body.appendSlice(a, ",\"disable_notification\":true");
+            try body.append(a, '}');
             const res = try b.call(a, "sendMessage", body.items, 30_000);
             const id = jv.int(jv.get(res, "message_id")) orelse 0;
             if (sent.count == 0) sent.first = id;
@@ -177,14 +189,15 @@ pub const Bot = struct {
         return sent;
     }
 
-    /// Sends `text` with one row of buttons (label, data); returns the
-    /// message id.
+    /// Sends `text` with buttons (label, data): up to three on one row,
+    /// four as two rows of two, more in rows of four; returns the message
+    /// id.
     pub fn sendButtons(b: *Bot, chat_id: i64, text: []const u8, buttons: []const [2][]const u8) !i64 {
-        return b.sendButtonsTo(chat_id, 0, text, buttons);
+        return b.sendButtonsTo(chat_id, 0, text, buttons, .{});
     }
 
     /// `sendButtons` to topic `thread` of the chat (0: the chat itself).
-    pub fn sendButtonsTo(b: *Bot, chat_id: i64, thread: i64, text: []const u8, buttons: []const [2][]const u8) !i64 {
+    pub fn sendButtonsTo(b: *Bot, chat_id: i64, thread: i64, text: []const u8, buttons: []const [2][]const u8, opts: Opts) !i64 {
         var arena: std.heap.ArenaAllocator = .init(b.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -192,9 +205,11 @@ pub const Bot = struct {
         try where(&body, a, chat_id, thread);
         try body.appendSlice(a, ",\"text\":");
         try util.jsonString(&body, a, util.cut(text, max_text));
+        if (opts.quiet) try body.appendSlice(a, ",\"disable_notification\":true");
         try body.appendSlice(a, ",\"reply_markup\":{\"inline_keyboard\":[[");
+        const row = rowLength(buttons.len);
         for (buttons, 0..) |btn, i| {
-            if (i > 0) try body.append(a, ',');
+            if (i > 0) try body.appendSlice(a, if (i % row == 0) "],[" else ",");
             try body.appendSlice(a, "{\"text\":");
             try util.jsonString(&body, a, btn[0]);
             try body.appendSlice(a, ",\"callback_data\":");
@@ -258,6 +273,18 @@ pub const Bot = struct {
         _ = try b.call(a, "answerCallbackQuery", body.items, 30_000);
     }
 
+    /// Replaces a message's text; its buttons go with the old text.
+    pub fn editText(b: *Bot, chat_id: i64, message_id: i64, text: []const u8) !void {
+        var arena: std.heap.ArenaAllocator = .init(b.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var body: std.ArrayList(u8) = .empty;
+        try body.print(a, "{{\"chat_id\":{d},\"message_id\":{d},\"text\":", .{ chat_id, message_id });
+        try util.jsonString(&body, a, util.cut(text, max_text));
+        try body.appendSlice(a, ",\"link_preview_options\":{\"is_disabled\":true}}");
+        _ = try b.call(a, "editMessageText", body.items, 30_000);
+    }
+
     /// Removes the buttons under a message once it has been answered.
     pub fn clearButtons(b: *Bot, chat_id: i64, message_id: i64) !void {
         var arena: std.heap.ArenaAllocator = .init(b.gpa);
@@ -267,6 +294,14 @@ pub const Bot = struct {
         _ = try b.call(a, "editMessageReplyMarkup", body, 30_000);
     }
 };
+
+/// Buttons on a row: up to three on one, four as two rows of two, more
+/// in rows of four.
+fn rowLength(n: usize) usize {
+    if (n <= 3) return @max(n, 1);
+    if (n == 4) return 2;
+    return 4;
+}
 
 /// `{"chat_id":N` and, for a topic, `,"message_thread_id":T`.
 fn where(body: *std.ArrayList(u8), a: std.mem.Allocator, chat_id: i64, thread: i64) !void {
@@ -360,14 +395,14 @@ test "updates_carry_the_topic_and_sends_go_to_it" {
     try t.expectEqual(0, ups[1].message.thread);
     try t.expectEqual(null, ups[1].message.topic);
     try t.expectEqual(5012, ups[2].callback.thread);
-    const sent = try b.sendTo(42, 5012, "three flats");
+    const sent = try b.sendTo(42, 5012, "three flats", .{});
     try t.expect(sent.first > 0);
     try t.expectEqual(1, sent.count);
     try b.send(42, "in the chat");
     const out = try outbox(&e);
     try t.expect(std.mem.indexOf(u8, out, "\"chat_id\":42,\"message_thread_id\":5012,\"text\":\"three flats\"") != null);
     try t.expect(std.mem.indexOf(u8, out, "\"chat_id\":42,\"text\":\"in the chat\"") != null);
-    _ = try b.sendButtonsTo(42, 5012, "pick one", &.{.{ "Yes", "r1-x:1" }});
+    _ = try b.sendButtonsTo(42, 5012, "pick one", &.{.{ "Yes", "r1-x:1" }}, .{});
     try t.expect(std.mem.indexOf(u8, try outbox(&e), "\"chat_id\":42,\"message_thread_id\":5012,\"text\":\"pick one\"") != null);
     const me = try b.getMe(a);
     try t.expectEqualStrings("harness_test_bot", me.username);
@@ -379,6 +414,34 @@ test "updates_carry_the_topic_and_sends_go_to_it" {
     // a chat without topics refuses
     try e.tmp.dir.writeFile(t.io, .{ .sub_path = "telegram/no-topics", .data = "" });
     try t.expectError(error.TelegramRefused, b.createForumTopic(42, "Other"));
+}
+
+test "replies_quiet_sends_edits_and_rows" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    // a reply to a message, and a topic's message, whose reply is its opening
+    try inbox(&e, 1, "{\"message\":{\"message_id\":80,\"from\":{\"id\":42},\"chat\":{\"id\":42,\"type\":\"private\"},\"reply_to_message\":{\"message_id\":77,\"text\":\"Allow this? [1]\"},\"text\":\"use staging\"}}");
+    try inbox(&e, 2, "{\"message\":{\"message_id\":81,\"from\":{\"id\":42},\"chat\":{\"id\":42,\"type\":\"private\"},\"message_thread_id\":5012,\"is_topic_message\":true,\"reply_to_message\":{\"message_id\":8,\"forum_topic_created\":{\"name\":\"House search\"}},\"text\":\"find flats\"}}");
+    var b = try Bot.init(t.allocator, t.io, try e.url(), "123:abc");
+    defer b.deinit();
+    const a = e.arena.allocator();
+    const ups = try b.getUpdates(a, 0, 0);
+    try t.expectEqual(77, ups[0].message.reply_to);
+    try t.expectEqual(0, ups[1].message.reply_to);
+    // quiet: no sound on the owner's phone
+    _ = try b.sendTo(42, 0, "a quiet note", .{ .quiet = true });
+    _ = try b.sendButtonsTo(42, 0, "four", &.{ .{ "A", "i1-x:1" }, .{ "B", "i1-x:2" }, .{ "C", "i1-x:3" }, .{ "D", "i1-x:4" } }, .{ .quiet = true });
+    _ = try b.sendButtonsTo(42, 0, "three", &.{ .{ "A", "i2-x:1" }, .{ "B", "i2-x:2" }, .{ "C", "i2-x:3" } }, .{});
+    _ = try b.sendButtonsTo(42, 0, "six", &.{ .{ "S1", "s1" }, .{ "S2", "s2" }, .{ "S3", "s3" }, .{ "S4", "s4" }, .{ "S5", "s5" }, .{ "S6", "s6" } }, .{});
+    try b.editText(42, 9, "done");
+    const out = try outbox(&e);
+    try t.expect(std.mem.indexOf(u8, out, "\"text\":\"a quiet note\",\"link_preview_options\":{\"is_disabled\":true},\"disable_notification\":true") != null);
+    try t.expect(std.mem.indexOf(u8, out, "\"text\":\"four\",\"disable_notification\":true,\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"A\",\"callback_data\":\"i1-x:1\"},{\"text\":\"B\",\"callback_data\":\"i1-x:2\"}],[{\"text\":\"C\",\"callback_data\":\"i1-x:3\"},{\"text\":\"D\",\"callback_data\":\"i1-x:4\"}]]}") != null);
+    try t.expect(std.mem.indexOf(u8, out, "\"text\":\"three\",\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"A\",\"callback_data\":\"i2-x:1\"},{\"text\":\"B\",\"callback_data\":\"i2-x:2\"},{\"text\":\"C\",\"callback_data\":\"i2-x:3\"}]]}") != null);
+    try t.expect(std.mem.indexOf(u8, out, "\"callback_data\":\"s4\"}],[{\"text\":\"S5\"") != null);
+    try t.expect(std.mem.indexOf(u8, out, "\"method\":\"editMessageText\",\"message_id\":") != null);
+    try t.expect(std.mem.indexOf(u8, out, "{\"chat_id\":42,\"message_id\":9,\"text\":\"done\",\"link_preview_options\":{\"is_disabled\":true}}") != null);
 }
 
 test "documents_are_sent_as_multipart" {
