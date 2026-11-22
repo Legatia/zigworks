@@ -30,9 +30,10 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 584 unit tests (2 skipped), among
+**State: 0.3.0, tested on macOS by its own tests: 645 unit tests (10 of them
+run on Windows only), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 69 checks that drives the real binary against
+and an end-to-end script of 73 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram, feeds,
 search and two MCP servers. An earlier build of 0.3.0 also passed its
 tests in CI on Linux and Windows. On Windows 11 the browser and login

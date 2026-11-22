@@ -4908,6 +4908,9 @@ pub const Core = struct {
         const a = arena.allocator();
         const tr = (try c.triggerCopy(a, name)) orelse return error.NoSuchTrigger;
         if (!tr.isEvent()) return error.NotPolled;
+        // a /reload restarting the MCP servers began meanwhile: not now
+        // (reload sets it under the settings lock triggerCopy just took)
+        if (c.restarting.load(.acquire)) return error.Restarting;
         const prev = blk: {
             c.trig_mutex.lockUncancelable(c.io);
             defer c.trig_mutex.unlock(c.io);
@@ -4999,7 +5002,8 @@ pub const Core = struct {
         if (out.failed) |why| {
             next.failures = prev.failures + 1;
             const every: i64 = tr.every_s orelse 3600;
-            const wait = if (out.retry_after_s) |ra| @as(i64, ra) else every * (@as(i64, 1) << @intCast(@min(next.failures, 20)));
+            // what the source asks (never under 30 s: no poll at once again)
+            const wait = if (out.retry_after_s) |ra| @max(@as(i64, ra), 30) else every * (@as(i64, 1) << @intCast(@min(next.failures, 20)));
             next.next = now_s + @min(wait, 6 * 3600);
             if (next.failures == 5 and !prev.told) {
                 next.told = true;
