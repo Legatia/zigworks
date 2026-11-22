@@ -2657,6 +2657,16 @@ const Fix = struct {
     }
 };
 
+test "a_bad_rules_line_names_its_section_or_environment" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const section = (try parseProblem(a, "rules", "allow shell ls\n[agnet:coder]\nallow shell make\n", rules.parse)).?;
+    try t.expect(std.mem.startsWith(u8, section, "rules line 2 has an error: [agnet:coder] (a section is [all] or a who"));
+    const env = (try parseProblem(a, "rules", "allow fetch@box https://a.com/*\n", rules.parse)).?;
+    try t.expect(std.mem.startsWith(u8, env, "rules line 1 has an error: allow fetch@box https://a.com/* (only shell takes an environment"));
+}
+
 test "a_folder_is_held_by_one_core_at_a_time" {
     var f: Fix = undefined;
     try f.init("", "", "");

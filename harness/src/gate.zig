@@ -199,6 +199,7 @@ pub const Gate = struct {
         }
         const name = @tagName(tool);
         for (g.rules) |r| {
+            if (!inert(r)) continue;
             // a deny on a server's MCP tools covers its money tools too
             const same = std.mem.eql(u8, r.tool, name) or (tool == .money and std.mem.eql(u8, r.tool, "mcp"));
             if (r.action == .deny and same and (g.matches(arena, tool, r.pattern, subject) or (given.len > 0 and g.matches(arena, tool, r.pattern, given))))
@@ -218,6 +219,7 @@ pub const Gate = struct {
         // a file written there can make the next command run something else
         if (tool == .write_file and dotPart(subject)) d = .{ .action = .ask, .why = "a name starting with \".\" asks: programs read those as settings", .subject = subject };
         for (g.rules) |r| {
+            if (!inert(r)) continue;
             if (r.action != .deny and std.mem.eql(u8, r.tool, name) and g.matches(arena, tool, r.pattern, subject)) {
                 d = .{ .action = r.action, .why = std.fmt.allocPrint(arena, "rule on line {d}", .{r.line}) catch "rule", .subject = subject };
                 break;
@@ -245,6 +247,12 @@ pub const Gate = struct {
         return rules.globCase(p, s, fold_paths);
     }
 };
+
+/// Until the gate reads sections and environments, a rule in a section or
+/// for another environment than host applies to nothing.
+fn inert(r: rules.Rule) bool {
+    return r.section == null and (r.env == null or std.mem.eql(u8, r.env.?, "host"));
+}
 
 /// Whether a part of `rel` (with `/` between the parts) starts with `.`.
 fn dotPart(rel: []const u8) bool {

@@ -1,5 +1,9 @@
-//! Gate rules: one per line, `allow|ask|deny TOOL PATTERN`, `#` comments.
-//! `*` in a pattern matches any run of characters (including none).
+//! Gate rules: one per line, `allow|ask|deny TOOL[@ENV] PATTERN`, `#`
+//! comments. `*` in a pattern matches any run of characters (including
+//! none). A line `[WHO]` (a who pattern, see who.zig) starts rules for the
+//! calls whose who it matches; lines before the first, or after `[all]`,
+//! are the shared part, for every call. `@ENV` is only for `shell`: the
+//! rule is for commands in that environment (`host` until gap 2).
 //!
 //! For `fetch` and `browse` a pattern is an address matched by parts (see
 //! `UrlPattern`), for `web` a host (see `HostPattern`), each against the
@@ -8,6 +12,7 @@
 //! over the whole address: they can only stop or ask about more.
 const std = @import("std");
 const url = @import("url.zig");
+const who = @import("who.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Action = enum { allow, ask, deny };
@@ -17,6 +22,11 @@ pub const Rule = struct {
     tool: []const u8,
     pattern: []const u8,
     line: usize,
+    /// `shell@box`: the environment the rule is for; null: every one.
+    env: ?[]const u8 = null,
+    /// The who pattern of the section the rule is in (`agent:coder`);
+    /// null: the shared part.
+    section: ?[]const u8 = null,
 };
 
 pub const Error = error{
@@ -25,6 +35,10 @@ pub const Error = error{
     BadUrlRule,
     /// An allow rule for web that is not a host pattern.
     BadHostRule,
+    /// A `[...]` line that is not `[all]` or a who pattern.
+    BadSection,
+    /// `TOOL@ENV` for a tool that runs in no environment, or a bad name.
+    BadEnv,
     OutOfMemory,
 };
 
@@ -34,6 +48,8 @@ pub fn reason(e: anyerror) ?[]const u8 {
     return switch (e) {
         error.BadUrlRule => "an allow rule for fetch or browse takes an address: scheme://host/path, the host a name, *.name or *, like https://*.example.com/*; a port, when given, is a number or *",
         error.BadHostRule => "an allow rule for web takes a host: a name, *.name or *, like *.example.com; a port, when given, is a number or *",
+        error.BadSection => "a section is [all] or a who: owner, schedule:NAME, trigger:NAME, workflow:NAME/STEP, app:NAME or agent:NAME; a kind alone covers all its names, and * works as in rules",
+        error.BadEnv => "only shell takes an environment: shell@NAME, the name in a-z, 0-9, - and _",
         else => null,
     };
 }
@@ -168,14 +184,34 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Error![]Rule {
     var out: std.ArrayList(Rule) = .empty;
     var it = std.mem.splitScalar(u8, text, '\n');
     var n: usize = 0;
+    // the who pattern of the section being read; null: the shared part
+    var section: ?[]const u8 = null;
     while (it.next()) |raw| {
         n += 1;
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] == '[') {
+            if (line.len < 2 or line[line.len - 1] != ']') return error.BadSection;
+            const inner = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
+            if (std.mem.eql(u8, inner, "all")) {
+                section = null;
+            } else if (who.isPattern(inner)) {
+                section = inner;
+            } else return error.BadSection;
+            continue;
+        }
         var words = std.mem.tokenizeAny(u8, line, " \t");
         const action_word = words.next() orelse return error.BadRule;
         const action = std.meta.stringToEnum(Action, action_word) orelse return error.BadRule;
-        const tool = words.next() orelse return error.BadRule;
+        const tool_word = words.next() orelse return error.BadRule;
+        // shell@box: a rule for commands in that environment only
+        var tool = tool_word;
+        var env: ?[]const u8 = null;
+        if (std.mem.indexOfScalar(u8, tool_word, '@')) |at| {
+            tool = tool_word[0..at];
+            env = tool_word[at + 1 ..];
+            if (!std.mem.eql(u8, tool, "shell") or !envName(env.?)) return error.BadEnv;
+        }
         // the pattern is the rest of the line, inner spaces kept
         const rest = std.mem.trim(u8, words.rest(), " \t");
         if (rest.len == 0) return error.BadRule;
@@ -184,9 +220,16 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Error![]Rule {
             if ((std.mem.eql(u8, tool, "fetch") or std.mem.eql(u8, tool, "browse")) and urlPattern(arena, rest) == null) return error.BadUrlRule;
             if (std.mem.eql(u8, tool, "web") and !std.mem.eql(u8, rest, "*") and hostPattern(arena, rest) == null) return error.BadHostRule;
         }
-        try out.append(arena, .{ .action = action, .tool = tool, .pattern = rest, .line = n });
+        try out.append(arena, .{ .action = action, .tool = tool, .pattern = rest, .line = n, .env = env, .section = section });
     }
     return out.items;
+}
+
+/// An environment's name (gap 2): 1 to 32 of a-z, 0-9, `-` and `_`.
+pub fn envName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 32) return false;
+    for (name) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '-' or c == '_')) return false;
+    return true;
 }
 
 /// `*` matches any run of characters; everything else matches itself.
@@ -273,6 +316,37 @@ test "an_allow_rule_for_an_address_tool_must_be_one_that_matches_by_parts" {
     );
     try t.expectEqual(11, ok.len);
     try t.expect(reason(error.BadUrlRule) != null and reason(error.BadHostRule) != null and reason(error.BadRule) == null);
+}
+
+test "sections_and_environments_parse" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rs = try parse(a,
+        \\deny  shell rm -rf *
+        \\[agent:coder]
+        \\allow shell@box zig build*
+        \\[schedule:btc-watch]
+        \\allow fetch https://api.coinbase.com/*
+        \\[all]
+        \\ask shell@host git push*
+    );
+    try t.expectEqual(4, rs.len);
+    try t.expectEqual(null, rs[0].section);
+    try t.expectEqual(null, rs[0].env);
+    try t.expectEqualStrings("agent:coder", rs[1].section.?);
+    try t.expectEqualStrings("shell", rs[1].tool);
+    try t.expectEqualStrings("box", rs[1].env.?);
+    try t.expectEqualStrings("zig build*", rs[1].pattern);
+    try t.expectEqual(3, rs[1].line);
+    try t.expectEqualStrings("schedule:btc-watch", rs[2].section.?);
+    try t.expectEqual(null, rs[3].section);
+    try t.expectEqualStrings("host", rs[3].env.?);
+    for ([_][]const u8{ "[nobody:x]", "[agent:coder", "[]", "[agent:coder] # note" }) |line|
+        try t.expectError(error.BadSection, parse(a, line));
+    for ([_][]const u8{ "allow fetch@box https://a.com/*", "allow shell@ *", "allow shell@Box *" }) |line|
+        try t.expectError(error.BadEnv, parse(a, line));
+    try t.expect(reason(error.BadSection) != null and reason(error.BadEnv) != null);
 }
 
 test "glob_matches_runs" {
