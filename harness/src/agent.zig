@@ -371,6 +371,22 @@ pub const Run = struct {
         if (first) r.rid = seq;
     }
 
+    /// A client for a model value ("PROVIDER:MODEL", or a model of the
+    /// default provider) through the instance's providers; without them
+    /// (tests), omnigate at `model_cfg.url`.
+    pub fn modelClient(r: *const Run, value: []const u8, max_tokens: u32) !model.Client {
+        const cfg = r.model_cfg orelse return error.NoModelSettings;
+        if (cfg.providers) |set| return set.client(r.gpa, r.io, value, max_tokens);
+        return model.Client.init(r.gpa, r.io, cfg.url, cfg.key, value, max_tokens);
+    }
+
+    /// The name of the provider a model value picks.
+    fn providerOf(r: *const Run, value: []const u8) []const u8 {
+        const cfg = r.model_cfg orelse return "";
+        const set = cfg.providers orelse return "omnigate";
+        return set.pick(value).provider.name;
+    }
+
     /// Who takes a snapshot in this run.
     fn snapBy(r: *const Run) snapshots_mod.By {
         return .{ .rid = r.rid, .run = r.label, .agent = r.who.agent, .by = r.who.by };
@@ -715,12 +731,16 @@ pub const MoneyLedger = struct {
 const Reservation = struct { day: i64 = 0, amount: f64 = 0 };
 
 pub const ModelCfg = struct {
+    /// omnigate's address and key, used only without `providers` (tests).
     url: []const u8,
     key: []const u8,
+    /// Model values: "PROVIDER:MODEL", or a model of the default provider.
     main: []const u8,
     worker: []const u8,
     memory: []const u8,
     max_tokens: u32,
+    /// The instance's providers; null: omnigate at `url` with `key`.
+    providers: ?*const model.Providers = null,
 };
 
 /// A counting limit on helpers running at once, across the process.
@@ -1027,27 +1047,22 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
                 result.ended_by = try r.gpa.dupe(u8, "Stopped.");
                 break;
             }
+            // the same words for every provider, naming it
             const why: []const u8 = switch (e) {
-                error.BudgetSpent => "Model budget used up.",
-                error.RateLimited => "The model is rate limited; try again later.",
-                error.NoKey => "Model calls are refused: no omnigate key is stored (harness secret add omnigate).",
-                error.NoUrl => "Model calls are refused: no omnigate url is set ([model] url in config.ini, then /reload).",
-                error.TimeUp => "Time limit reached for this turn.",
-                error.Timeout => try std.fmt.allocPrint(a, "Model call failed: Timeout {s}", .{r.client.lastError()}),
                 // kept, every later request would carry it and be refused too
-                error.Rejected => try std.fmt.allocPrint(a, "The model API refused the request: {s}. This turn is left out of the conversation, so the next message starts without it{s}.", .{
-                    r.client.lastError(),
+                error.Rejected => try std.fmt.allocPrint(a, "{s}. This turn is left out of the conversation, so the next message starts without it{s}.", .{
+                    try r.client.failure(a, e),
                     if (calls_made == 0) "" else try std.fmt.allocPrint(a, "; the agent will not remember the {d} tool call{s} it made in it", .{ calls_made, if (calls_made == 1) "" else "s" }),
                 }),
-                else => try std.fmt.allocPrint(a, "Model call failed: {s} {s}", .{ @errorName(e), r.client.lastError() }),
+                else => try r.client.failure(a, e),
             };
-            try r.logRun(.model, false, .{ .result = @errorName(e), .detail = r.client.lastError() });
+            try r.logRun(.model, false, .{ .result = @errorName(e), .provider = r.client.provider, .detail = r.client.lastError() });
             result.ended_by = try r.gpa.dupe(u8, why);
             rejected = e == error.Rejected;
             break;
         };
         used_tokens += reply.input_tokens + reply.cache_read_tokens + reply.cache_write_tokens;
-        try r.logRun(.model, false, .{ .result = "ok", .stop_reason = reply.stop_reason, .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens, .cache_read = reply.cache_read_tokens, .cache_write = reply.cache_write_tokens });
+        try r.logRun(.model, false, .{ .result = "ok", .provider = r.client.provider, .stop_reason = reply.stop_reason, .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens, .cache_read = reply.cache_read_tokens, .cache_write = reply.cache_write_tokens });
         // stopped while the model was answering: its answer is dropped
         if (r.env.stop.load(.acquire)) {
             result.stopped = true;
@@ -2257,7 +2272,7 @@ fn helperMain(h: *Helper) void {
 
 fn helperRun(h: *Helper) !void {
     const p = h.parent;
-    const cfg = p.model_cfg.?;
+    const cfg = p.model_cfg orelse return error.NoModelSettings;
     if (p.pool) |pool| {
         if (!pool.acquire(p.io, p.agents.parallel, p.env.stop)) {
             h.failed = "stopped before it started";
@@ -2270,7 +2285,7 @@ fn helperRun(h: *Helper) !void {
         return;
     }
     const left = @max(h.deadline_s - p.now(), 1);
-    var client = try model.Client.init(p.gpa, p.io, cfg.url, cfg.key, if (h.task.strong) cfg.main else cfg.worker, cfg.max_tokens);
+    var client = try p.modelClient(if (h.task.strong) cfg.main else cfg.worker, cfg.max_tokens);
     defer client.deinit();
     var label_buf: [64]u8 = undefined;
     var w = p.*;
@@ -2325,7 +2340,7 @@ fn compact(r: *Run, conv: *Conversation) !usize {
             try r.logRun(.turn, r.isPrivate(), .{ .event = "summarised", .turns = n - sum.left_out });
             if (sum.left_out > 0) try r.logRun(.turn, r.isPrivate(), .{ .event = "dropped unsummarised", .turns = sum.left_out, .summary = true });
         } else |e| {
-            try r.logRun(.model, false, .{ .event = "summary failed", .result = @errorName(e) });
+            try r.logRun(.model, false, .{ .event = "summary failed", .result = @errorName(e), .provider = r.providerOf(r.model_cfg.?.memory) });
         }
     }
     // still over (or no summary): the oldest go whole, and it is said
@@ -2383,11 +2398,11 @@ fn summarise(r: *Run, conv: *Conversation, n: usize) !Summary {
         // not even the newest fits: its start, rather than nothing
         try text.appendSlice(a, util.cut(parts[n - 1], summary_input_max -| text.items.len));
     } else for (parts[first..]) |part| try text.appendSlice(a, part);
-    const cfg = r.model_cfg.?;
-    var client = try model.Client.init(r.gpa, r.io, cfg.url, cfg.key, cfg.memory, 1024);
+    const cfg = r.model_cfg orelse return error.NoModelSettings;
+    var client = try r.modelClient(cfg.memory, 1024);
     defer client.deinit();
     const reply = try client.send(a, summary_prompt, &.{.{ .role = .user, .blocks = &.{.{ .text = text.items }} }}, &.{});
-    try r.logRun(.model, false, .{ .result = "ok", .purpose = "summary", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
+    try r.logRun(.model, false, .{ .result = "ok", .provider = client.provider, .purpose = "summary", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
     const out = try reply.text(a);
     if (out.len == 0) return error.EmptySummary;
     return .{ .text = try r.gpa.dupe(u8, out), .left_out = left_out };
@@ -4279,4 +4294,120 @@ test "the_snapshot_tool_takes_one_with_its_label" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(4), "not taken: no environment nobox") != null);
     // no tool restores
     try t.expect(std.mem.indexOf(u8, try f.e.request(5), "no such tool") != null);
+}
+
+// ---- providers ----
+
+/// The run's client: provider `name` at the fake server, in `api`'s format.
+fn useProvider(f: *Fix, name: []const u8, api: model.Api, auth: model.Auth, key: []const u8) !void {
+    const p = try f.e.provider(name, api, auth, key);
+    f.client.deinit();
+    f.client = try f.e.clientFor(p, "gpt-test");
+}
+
+test "a_turn_with_a_tool_call_works_through_an_openai_provider" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try useProvider(&f, "local", .openai, .bearer, "sk-local-test-1");
+    const a = f.e.arena.allocator();
+    try f.e.script(1, try model.oaToolReply(a, "call_1", "recall", "{\"query\":\"flats\"}"));
+    try f.e.script(2, model.oaTextReply("Nothing about flats yet."));
+    const r = try f.say("what do you know about flats?");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Nothing about flats yet.", r.text);
+    const v = jv.parse(a, try f.e.request(2)).?;
+    try t.expectEqualStrings("/v1/chat/completions", jv.str(jv.get(v, "target")).?);
+    const msgs = jv.arr(jv.at(v, &.{ "body", "messages" })).?;
+    // the instructions, the message, the call, its result
+    try t.expectEqual(4, msgs.len);
+    try t.expectEqualStrings("system", jv.str(jv.get(msgs[0], "role")).?);
+    try t.expectEqualStrings("user", jv.str(jv.get(msgs[1], "role")).?);
+    try t.expectEqualStrings("call_1", jv.str(jv.at(msgs[2], &.{ "tool_calls", "0", "id" })).?);
+    try t.expectEqualStrings("recall", jv.str(jv.at(msgs[2], &.{ "tool_calls", "0", "function", "name" })).?);
+    try t.expectEqualStrings("tool", jv.str(jv.get(msgs[3], "role")).?);
+    try t.expectEqualStrings("call_1", jv.str(jv.get(msgs[3], "tool_call_id")).?);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"tool\":\"recall\"") != null);
+}
+
+test "usage_and_cached_tokens_are_logged_per_provider" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try useProvider(&f, "local", .openai, .bearer, "sk-local-test-1");
+    try f.e.script(1, "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"cached\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":60}}}");
+    const r1 = try f.say("hello");
+    defer freeResult(&f.run, r1);
+    try t.expectEqualStrings("cached", r1.text);
+    // the next turn on 0.3's omnigate client
+    f.client.deinit();
+    f.client = try f.e.client();
+    try f.e.script(2, model.textReply("from omnigate"));
+    const r2 = try f.say("again");
+    defer freeResult(&f.run, r2);
+    const log = try f.logText();
+    try t.expect(std.mem.indexOf(u8, log, "\"result\":\"ok\",\"provider\":\"local\",\"stop_reason\":\"end_turn\",\"input_tokens\":40,\"output_tokens\":7,\"cache_read\":60") != null);
+    try t.expect(std.mem.indexOf(u8, log, "\"result\":\"ok\",\"provider\":\"omnigate\",\"stop_reason\":\"end_turn\",\"input_tokens\":10,\"output_tokens\":3") != null);
+}
+
+test "a_provider_without_its_key_refuses_calls_with_one_line" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try useProvider(&f, "openrouter", .openai, .bearer, "");
+    const r = try f.say("hello");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Model calls are refused: no openrouter key is stored (harness secret add openrouter).", r.text);
+    try t.expect(std.mem.indexOfScalar(u8, r.text, '\n') == null);
+    try t.expectEqual(0, f.e.server.modelRequests());
+}
+
+test "a_refused_key_is_named_and_kept_out_of_the_log" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try useProvider(&f, "local", .openai, .bearer, "sk-echoed-test-key-1");
+    try f.e.script(1, "{\"status\":401,\"echo_key\":true}");
+    const r = try f.say("hello");
+    defer freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, r.text, "local refused the key stored as local") != null);
+    try t.expect(std.mem.indexOf(u8, r.text, "harness secret add local") != null);
+    try t.expect(std.mem.indexOf(u8, r.text, "sk-echoed-test-key-1") == null);
+    const log = try f.logText();
+    try t.expect(std.mem.indexOf(u8, log, "\"result\":\"KeyRefused\",\"provider\":\"local\"") != null);
+    try t.expect(std.mem.indexOf(u8, log, "sk-echoed-test-key-1") == null);
+}
+
+fn helperKeys(_: ?*anyopaque, _: std.mem.Allocator, provider: []const u8, _: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, provider, "omnigate")) return "og-test-key";
+    if (std.mem.eql(u8, provider, "local")) return "sk-local-test-1";
+    return null;
+}
+
+test "a_helper_runs_on_the_provider_its_value_names" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    const local_url = try std.fmt.allocPrint(a, "{s}/v1", .{try f.e.url()});
+    const set = try model.Providers.resolve(a, .{
+        .omnigate_url = try f.e.url(),
+        .sections = &.{.{ .name = "local", .api = .openai, .url = local_url }},
+    }, .{ .get = helperKeys });
+    f.run.model_cfg.?.providers = &set;
+    f.run.model_cfg.?.worker = "local:gpt-worker";
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"find a\"}]}"));
+    try f.e.script(2, model.oaTextReply("helper answer"));
+    try f.e.script(3, model.textReply("Combined."));
+    const r = try f.say("research");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Combined.", r.text);
+    const helper = jv.parse(a, try f.e.request(2)).?;
+    try t.expectEqualStrings("/v1/chat/completions", jv.str(jv.get(helper, "target")).?);
+    try t.expectEqualStrings("gpt-worker", jv.str(jv.at(helper, &.{ "body", "model" })).?);
+    try t.expectEqualStrings("Bearer sk-local-test-1", jv.str(jv.at(helper, &.{ "headers", "Authorization" })).?);
+    const parent = try f.e.request(3);
+    try t.expectEqualStrings("/v1/messages", jv.str(jv.get(jv.parse(a, parent).?, "target")).?);
+    try t.expect(std.mem.indexOf(u8, parent, "helper answer") != null);
 }
