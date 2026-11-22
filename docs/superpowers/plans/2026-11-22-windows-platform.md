@@ -204,3 +204,14 @@ turns; the customer's filesystem with roles at its front; cloned VMs;
 apps over https with the Telegram Mini App; isolation and what the
 operator sees; failure and recovery; a build order; five questions for
 the owner, each with a proposal. No code.
+
+## Integration (branch `win/platform`)
+
+`win/hosted` merged with `harness-logins` at 7cb14ec (providers, agent
+definitions, the inbox): 6a3dff6, conflicts kept both sides. Then
+02f9c47 (state/inbox and agents/NAME.md written with util.writeReplace)
+and 28ff1d6 (a race in a test fixture: helpers asking at once lost a
+count now and then; 1 run in 30 failed, 100 in 100 pass after). At
+28ff1d6: Windows 11 594 pass, 41 skip, smoke ok; Linux (WSL) 621 pass,
+14 skip, smoke ok; macOS type-checks. `harness-logins` fast-forwards to
+it.
