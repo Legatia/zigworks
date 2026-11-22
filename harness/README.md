@@ -49,7 +49,8 @@ answered. To move the bot to another account, run `harness pair` again and
 send the new code from that account; the old one is told.
 
 `harness chat` does the same in the terminal, for trying it out. Ctrl-D
-leaves; a question waiting for an answer is answered Deny.
+leaves (in a Windows console, Ctrl-Z and Enter, or Ctrl-D and Enter); a
+question waiting for an answer is answered Deny.
 
 ## The data folder
 

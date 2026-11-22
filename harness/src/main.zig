@@ -205,6 +205,7 @@ const App = struct {
         // so a slow start of the MCP servers can be ended too)
         catchSignals();
         c.watcher = std.Thread.spawn(.{}, watchSignals, .{c}) catch null;
+        if (c.watcher != null) watching.store(true, .release);
         if (role.usesTools()) c.startExtras();
         var warns = std.mem.tokenizeScalar(u8, c.mcp_warn, '\n');
         while (warns.next()) |w| complain("note: mcp.ini: {s}", .{w});
@@ -821,6 +822,12 @@ fn keysLine(buf: []u8, bs: []const [2][]const u8) []const u8 {
     return buf[0..n];
 }
 
+/// Windows: a line that is only Ctrl-D (and Enter) leaves the chat too, as
+/// Ctrl-D does elsewhere; a console delivers it as a character.
+fn leaves(line: []const u8) bool {
+    return builtin.os.tag == .windows and std.mem.eql(u8, line, "\x04");
+}
+
 fn chatCmd(app: *App) !Exit {
     const c = try app.open(.chat);
     defer c.close();
@@ -830,11 +837,16 @@ fn chatCmd(app: *App) !Exit {
     const tick_thread = try std.Thread.spawn(.{}, ticker, .{c});
     defer tick_thread.join();
     defer c.quitting.store(true, .release);
-    try errAll(app.io, "harness chat. /help for commands, /stop to stop, Ctrl-D to leave.\n");
+    // a Windows console ends input with Ctrl-Z and Enter; Ctrl-D is a character there
+    try errAll(app.io, if (builtin.os.tag == .windows)
+        "harness chat. /help for commands, /stop to stop, Ctrl-Z and Enter to leave.\n"
+    else
+        "harness chat. /help for commands, /stop to stop, Ctrl-D to leave.\n");
     const stdin = Io.File.stdin();
     var ended = false;
     while (!ended) {
         const line = try readLineEof(app, stdin, &ended);
+        if (leaves(line)) break;
         if (line.len == 0) continue;
         if (c.approvalWaiting()) {
             const ans: ?agent.Answer = if (eql(line, "o")) .once else if (eql(line, "d")) .day else if (eql(line, "n")) .deny else null;
@@ -1023,9 +1035,26 @@ fn watchSignals(c: *Core) void {
             c.endBySignal(signalName(n));
             std.process.exit(0);
         }
-        if (c.quitting.load(.acquire)) return;
+        if (c.quitting.load(.acquire)) {
+            watching.store(false, .release);
+            return;
+        }
         c.io.sleep(.fromMilliseconds(50), .awake) catch {};
     }
+}
+
+/// watchSignals runs: a signal ends the process there.
+var watching: std.atomic.Value(bool) = .init(false);
+
+/// A signal has come, or comes within half a second (Windows can break a
+/// read off a moment before the handler's thread has run).
+fn signalComing(io: Io) bool {
+    var waited: u32 = 0;
+    while (waited <= 500) : (waited += 20) {
+        if (got_signal.load(.acquire) != 0) return true;
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    return false;
 }
 
 // ---- terminal input ----
@@ -1044,7 +1073,14 @@ fn readLineEof(app: *App, f: Io.File, ended: *bool) ![]u8 {
                 ended.* = true;
                 break;
             },
-            else => return e,
+            else => {
+                // Windows breaks a console read off when Ctrl-C comes or the
+                // console closes (STATUS_ALERTED, error.Unexpected to Zig).
+                // The signal's own path ends harness then (watchSignals):
+                // wait for it, rather than end in an error trace beside it.
+                if (watching.load(.acquire) and signalComing(app.io)) while (true) app.io.sleep(.fromMilliseconds(1000), .awake) catch {};
+                return e;
+            },
         };
         if (got == 0) {
             ended.* = true;
@@ -1568,6 +1604,13 @@ test {
     _ = @import("web.zig");
     _ = @import("url.zig");
     _ = @import("proc.zig");
+}
+
+test "a_line_of_ctrl_d_leaves_the_chat_in_a_windows_console" {
+    try std.testing.expectEqual(builtin.os.tag == .windows, leaves("\x04"));
+    try std.testing.expect(!leaves("hello"));
+    try std.testing.expect(!leaves(""));
+    try std.testing.expect(!leaves("\x04 more"));
 }
 
 test "msys_and_cygwin_terminals_are_known_by_their_pipe_names" {
