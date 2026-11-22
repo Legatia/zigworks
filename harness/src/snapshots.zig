@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 const folders = @import("folders.zig");
 const log_mod = @import("log.zig");
 const rules = @import("rules.zig");
+const gate = @import("gate.zig");
 const util = @import("util.zig");
 const jv = @import("jv.zig");
 const Io = std.Io;
@@ -140,6 +141,25 @@ const Header = struct {
 };
 const Snap = struct { header: Header, files: []const File, skipped: []const Skipped };
 
+/// What `folder` names: `env:NAME`, an environment's home (error.NoSuchEnv
+/// when the name can't be one); `/` the workspace; else a folder inside
+/// it, read like a file path (error.OutsideWorkspace). Its skip patterns
+/// come from `f`.
+pub fn sourceFor(arena: std.mem.Allocator, io: Io, s: *const Store, workspace: []const u8, f: ?*const folders.Folders, folder: []const u8) !Source {
+    if (std.mem.startsWith(u8, folder, "env:")) {
+        const name = folder["env:".len..];
+        if (s.env_root.len == 0 or !rules.envName(name)) return error.NoSuchEnv;
+        return .{ .name = folder, .path = try std.fs.path.join(arena, &.{ s.env_root, name, "home" }) };
+    }
+    const rel = if (std.mem.eql(u8, folder, "/")) "" else (gate.confined(arena, io, workspace, folder) catch return error.OutsideWorkspace).rel;
+    return .{
+        .name = if (rel.len == 0) "/" else rel,
+        .path = if (rel.len == 0) workspace else try std.fs.path.join(arena, &.{ workspace, try native(arena, rel) }),
+        .base = rel,
+        .skip = if (f) |fs| try skipsFor(fs.*, arena, rel) else &.{},
+    };
+}
+
 /// The store's folder name for `name`: the first 16 hex digits of its
 /// SHA-256, case folded where volumes ignore case.
 pub fn folderKey(name: []const u8) [16]u8 {
@@ -156,6 +176,9 @@ pub const Store = struct {
     io: Io,
     /// `snapshots/` in the data folder.
     dir: []const u8,
+    /// `state/env` in the data folder: `env:NAME` is `NAME/home` there (a
+    /// sandbox's home, gap 2). "": no environments.
+    env_root: []const u8 = "",
     log: ?*log_mod.Log = null,
     clone: ?CloneFn = platform_clone,
     /// `[limits] snapshot_mb`: the objects all snapshots name, at most.

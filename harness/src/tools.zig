@@ -75,10 +75,11 @@ pub fn mainArg(arena: std.mem.Allocator, tool: gate.Tool, input_json: []const u8
         .search, .recall => "query",
         .remember => "text",
         .skill, .skill_save => "name",
+        .snapshot => "folder",
         // the agent builds these arguments itself
         .delegate, .mcp, .money, .web, .login => return error.NotHere,
         // the platform's kinds: their tools are not here (yet)
-        .send, .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save, .snapshot => return error.NotHere,
+        .send, .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save => return error.NotHere,
     };
     return jv.str(jv.get(v, key)) orelse error.BadInput;
 }

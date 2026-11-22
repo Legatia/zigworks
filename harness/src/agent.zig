@@ -18,6 +18,7 @@ const store_mod = @import("store.zig");
 const masks_mod = @import("masks.zig");
 const who_mod = @import("who.zig");
 const folders_mod = @import("folders.zig");
+const snapshots_mod = @import("snapshots.zig");
 const Io = std.Io;
 
 /// `unsent`: the question did not get to the owner (a part or its buttons
@@ -242,6 +243,12 @@ pub const Run = struct {
     /// The instance's list of files the agent wrote since the owner last
     /// allowed a shell command (see `Written`); helpers share it.
     written: ?*Written = null,
+    /// The instance's snapshot store; null: no snapshots and no `snapshot`
+    /// tool.
+    snaps: ?*snapshots_mod.Store = null,
+    /// The folders this run snapshotted before changing them (shared with
+    /// its helpers); set by the top-level run's `turn`.
+    snap_run: ?*SnapRun = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -275,6 +282,11 @@ pub const Run = struct {
         if (first) r.rid = seq;
     }
 
+    /// Who takes a snapshot in this run.
+    fn snapBy(r: *const Run) snapshots_mod.By {
+        return .{ .rid = r.rid, .run = r.label, .agent = r.who.agent, .by = r.who.by };
+    }
+
     /// Whether this run may use `tool` at all (helpers get a subset).
     pub fn allows(r: *const Run, tool: gate.Tool) bool {
         if (r.helper) switch (tool) {
@@ -293,7 +305,9 @@ pub const Run = struct {
             // only through `web`
             .login => return false,
             // the platform's kinds: the gate decides them, their tools come later
-            .send, .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save, .snapshot => return false,
+            .send, .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save => return false,
+            // where there is a store and folders.ini has a section
+            .snapshot => if (r.snaps == null or r.gate.folders == null) return false,
             else => {},
         }
         const list = r.allowed orelse return true;
@@ -315,6 +329,11 @@ const shell_dir_def: model.ToolDef = .{
     .description = "Run a shell command in the workspace folder, or in `dir`, a folder inside it. Returns the exit code and output.",
     .schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"dir\":{\"type\":\"string\",\"description\":\"a folder in the workspace to start in; default the workspace\"}},\"required\":[\"command\"]}",
 };
+const snapshot_def: model.ToolDef = .{
+    .name = "snapshot",
+    .description = "Keep a snapshot of a workspace folder now (or of env:NAME, an environment's home), with a label, so that the owner can compare it and put it back later. Only the owner restores.",
+    .schema_json = "{\"type\":\"object\",\"properties\":{\"folder\":{\"type\":\"string\",\"description\":\"a folder in the workspace, / for all of it, or env:NAME\"},\"label\":{\"type\":\"string\",\"description\":\"what it is before or after\"}},\"required\":[\"folder\"]}",
+};
 const skill_defs = [_]model.ToolDef{
     .{ .name = "skill", .description = "Load one of your skills (saved instructions for a kind of task) by name; with `file`, read one of the skill's other files.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"file\":{\"type\":\"string\"}},\"required\":[\"name\"]}" },
     .{ .name = "skill_save", .description = "Save a skill: instructions for a kind of task you may meet again (steps, sources, pitfalls). Replaces a skill of the same name. The owner approves it.", .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"lowercase letters, digits and hyphens\"},\"description\":{\"type\":\"string\",\"description\":\"one line: when to use it\"},\"body\":{\"type\":\"string\"}},\"required\":[\"name\",\"description\",\"body\"]}" },
@@ -332,6 +351,7 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
     if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
     if (r.allows(.delegate)) try out.append(arena, delegate_def);
     for (skill_defs) |d| if (r.allows(gate.Tool.fromName(d.name).?)) try out.append(arena, d);
+    if (r.allows(.snapshot)) try out.append(arena, snapshot_def);
     for (r.mcp) |m| if (r.allows(if (m.money) .money else .mcp)) try out.append(arena, m.def);
     return out.items;
 }
@@ -804,6 +824,19 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
         }
     }
     try r.logRun(.turn, r.isPrivate(), .{ .text = user_text });
+    // the folders it changes are snapshotted before their first change and
+    // when it ends; its helpers share this
+    var snap_state: SnapRun = undefined;
+    const own_snaps = !r.helper and r.snap_run == null and r.snaps != null and r.gate.folders != null;
+    if (own_snaps) {
+        snap_state = .{ .gpa = r.gpa };
+        r.snap_run = &snap_state;
+    }
+    defer if (own_snaps) {
+        snapAfter(r, a);
+        snap_state.deinit();
+        r.snap_run = null;
+    };
 
     const tn = try conv.begin();
     // a turn that fails half way could leave a tool call without its result,
@@ -1083,6 +1116,8 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         const cf = gate.confined(a, r.io, r.env.workspace, arg) catch null;
         w.addBy(if (cf) |x| x.rel else arg, try std.fmt.allocPrint(a, "agent:{s}", .{r.who.agent}), r.label);
     };
+    // what it may change is kept first, once a run
+    if (tool == .write_file or tool == .shell) snapBefore(r, a, tool, arg);
 
     const out: tools.Output = switch (tool) {
         .recall => blk: {
@@ -1113,6 +1148,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
             break :blk .{ .text = said };
         },
         .delegate => try delegate(r, a, input_json),
+        .snapshot => try snapshotTool(r, a, arg, jv.str(jv.get(jv.parse(a, input_json), "label")) orelse ""),
         .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
         .skill => blk: {
             const v = jv.parse(a, input_json).?;
@@ -1143,6 +1179,108 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     else
         try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text });
     return out;
+}
+
+/// The folders a run snapshotted before its first change of each; when
+/// the run ends it takes their "after" snapshots. One for a top-level run
+/// and its helpers: helpers work at once on the same folders, so they
+/// share the run's pair (the plan's Ruling 5).
+pub const SnapRun = struct {
+    gpa: std.mem.Allocator,
+    /// Held while a "before" snapshot is taken: a helper's change waits.
+    mutex: Io.Mutex = .init,
+    taken: std.ArrayList(Taken) = .empty,
+
+    const Taken = struct { folder: []u8, ok: bool };
+
+    pub fn deinit(s: *SnapRun) void {
+        for (s.taken.items) |tk| s.gpa.free(tk.folder);
+        s.taken.deinit(s.gpa);
+    }
+
+    fn has(s: *const SnapRun, folder: []const u8) bool {
+        for (s.taken.items) |tk| if (std.mem.eql(u8, tk.folder, folder)) return true;
+        return false;
+    }
+};
+
+/// Before a run's first call that can change a folder that keeps
+/// snapshots (a write in it, or any shell command, since harness can't
+/// see what a command changes): that folder's "before" snapshot.
+fn snapBefore(r: *Run, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) void {
+    const store = r.snaps orelse return;
+    const sr = r.snap_run orelse return;
+    const f = r.gate.folders orelse return;
+    const rel: ?[]const u8 = if (tool != .write_file) null else if (gate.confined(a, r.io, r.env.workspace, arg)) |cf| cf.rel else |_| return;
+    const real = r.gate.realFolders(a, f);
+    sr.mutex.lockUncancelable(r.io);
+    defer sr.mutex.unlock(r.io);
+    for (f.sections, 0..) |s, i| {
+        const kept = s.snapshots orelse continue;
+        if (kept == 0) continue;
+        const folder = if (real) |x| x[i] else s.folder;
+        if (rel) |p| if (!folders_mod.inFolder(p, folder)) continue;
+        if (sr.has(folder)) continue;
+        const owned = r.gpa.dupe(u8, folder) catch continue;
+        sr.taken.append(r.gpa, .{ .folder = owned, .ok = false }) catch {
+            r.gpa.free(owned);
+            continue;
+        };
+        const got = takeSnapshot(r, a, store, f, folder, .before) orelse continue;
+        sr.taken.items[sr.taken.items.len - 1].ok = got.refused == null;
+    }
+}
+
+/// When the top-level run ends: the "after" snapshot of each folder it
+/// snapshotted before, then old snapshots and unnamed objects go.
+fn snapAfter(r: *Run, a: std.mem.Allocator) void {
+    const store = r.snaps orelse return;
+    const sr = r.snap_run orelse return;
+    const f = r.gate.folders orelse return;
+    if (sr.taken.items.len == 0) return;
+    for (sr.taken.items) |tk| if (tk.ok) {
+        _ = takeSnapshot(r, a, store, f, tk.folder, .after);
+    };
+    if (store.prune(a, f)) |_| {} else |e| r.log.write(.files, false, .{ .event = "prune failed", .why = @errorName(e) }) catch {};
+}
+
+/// A snapshot of the workspace folder `folder` (`/` between parts, "" the
+/// workspace) for this run; null when it failed (logged).
+fn takeSnapshot(r: *Run, a: std.mem.Allocator, store: *snapshots_mod.Store, f: *const folders_mod.Folders, folder: []const u8, when: snapshots_mod.When) ?snapshots_mod.Taken {
+    const name = if (folder.len == 0) "/" else folder;
+    const src: snapshots_mod.Source = .{
+        .name = name,
+        .path = if (folder.len == 0) r.env.workspace else std.fs.path.join(a, &.{ r.env.workspace, folder }) catch return null,
+        .base = folder,
+        .skip = snapshots_mod.skipsFor(f.*, a, folder) catch return null,
+    };
+    return store.take(a, src, .{ .when = when, .by = r.snapBy() }) catch |e| {
+        r.log.write(.files, false, .{ .event = "snapshot skipped", .folder = name, .why = @errorName(e) }) catch {};
+        return null;
+    };
+}
+
+/// The `snapshot` tool: one now, of a workspace folder or `env:NAME`.
+fn snapshotTool(r: *Run, a: std.mem.Allocator, folder: []const u8, label: []const u8) !tools.Output {
+    const store = r.snaps orelse return .{ .text = "this tool is not available here", .is_error = true };
+    const src = snapshots_mod.sourceFor(a, r.io, store, r.env.workspace, r.gate.folders, folder) catch |e| return .{
+        .text = switch (e) {
+            error.NoSuchEnv => try std.fmt.allocPrint(a, "not taken: no environment {s}", .{folder["env:".len..]}),
+            error.OutsideWorkspace => try std.fmt.allocPrint(a, "not taken: {s} is outside the workspace", .{folder}),
+            else => try std.fmt.allocPrint(a, "not taken: {s}", .{@errorName(e)}),
+        },
+        .is_error = true,
+    };
+    const got = store.take(a, src, .{ .when = .tool, .label = label, .by = r.snapBy(), .must_exist = true }) catch |e| return .{
+        .text = switch (e) {
+            error.NoSuchFolder => if (std.mem.startsWith(u8, src.name, "env:")) try std.fmt.allocPrint(a, "not taken: no environment {s}", .{src.name["env:".len..]}) else try std.fmt.allocPrint(a, "not taken: no folder {s} in the workspace", .{src.name}),
+            else => try std.fmt.allocPrint(a, "not taken: {s}", .{@errorName(e)}),
+        },
+        .is_error = true,
+    };
+    if (got.refused) |why| return .{ .text = try std.fmt.allocPrint(a, "not taken: {s} is {s}", .{ src.name, why }), .is_error = true };
+    _ = store.prune(a, r.gate.folders) catch {};
+    return .{ .text = try std.fmt.allocPrint(a, "Took snapshot {d} of {s}: {d} file{s}, {d} changed since the one before.", .{ got.id, src.name, got.files, if (got.files == 1) "" else "s", got.changed }) };
 }
 
 /// The variables of a command, with what to mask, or why it can't run.
@@ -3751,4 +3889,86 @@ test "a_helpers_write_is_named_in_the_next_question" {
     try t.expectEqual(1, f.asked);
     if (!std.mem.endsWith(u8, f.last_what, "since you last allowed a command: notes/h.md (agent:helper, chat/h1)")) std.debug.print("asked: {s}\n", .{f.last_what});
     try t.expect(std.mem.endsWith(u8, f.last_what, "since you last allowed a command: notes/h.md (agent:helper, chat/h1)"));
+}
+
+const snapshots_t = @import("snapshots.zig");
+
+/// folders.ini and a snapshot store for the Fix's runs.
+fn withSnapshots(f: *Fix, folders_text: []const u8) !*snapshots_t.Store {
+    const a = f.e.arena.allocator();
+    const fs = try a.create(folders_mod.Folders);
+    fs.* = try folders_mod.parse(a, folders_text);
+    f.g.folders = fs;
+    const st = try a.create(snapshots_t.Store);
+    st.* = .{ .gpa = t.allocator, .io = t.io, .dir = try std.fs.path.join(a, &.{ f.e.dir, "snapshots" }), .log = &f.log, .env_root = try std.fs.path.join(a, &.{ f.e.dir, "state", "env" }) };
+    f.run.snaps = st;
+    return st;
+}
+
+test "a_snapshot_is_taken_before_the_first_change_and_at_the_end" {
+    var f: Fix = undefined;
+    try f.init("allow shell echo *\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const st = try withSnapshots(&f, "[notes]\nsnapshots = on\n");
+    defer st.deinit();
+    try f.e.tmp.dir.createDirPath(t.io, "ws/notes");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/notes/old.txt", .data = "old" });
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/a.txt\",\"content\":\"a\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "write_file", "{\"path\":\"notes/b.txt\",\"content\":\"b\"}"));
+    try f.e.script(3, model.toolReply("tu_3", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(4, model.textReply("done"));
+    const r1 = try f.say("write two notes");
+    freeResult(&f.run, r1);
+    const infos = try st.list(a, "notes");
+    try t.expectEqual(2, infos.len);
+    try t.expectEqual(.before, infos[0].when);
+    try t.expectEqual(1, infos[0].files);
+    try t.expectEqual(.after, infos[1].when);
+    try t.expectEqual(3, infos[1].files);
+    try t.expectEqualStrings("chat", infos[1].run);
+    try t.expectEqualStrings("main", infos[1].agent);
+    try t.expectEqualStrings("owner", infos[1].by);
+    // the before was taken before the first write ran
+    const lt = try f.logText();
+    const snap_at = std.mem.indexOf(u8, lt, "\"event\":\"snapshot\",\"folder\":\"notes\",\"id\":1,\"when\":\"before\"").?;
+    const write_at = std.mem.indexOf(u8, lt, "\"tool\":\"write_file\",\"arg\":\"notes/a.txt\"").?;
+    try t.expect(snap_at < write_at);
+    // a turn that changes nothing takes none
+    try f.e.script(5, model.textReply("nothing to do"));
+    const r2 = try f.say("anything?");
+    freeResult(&f.run, r2);
+    try t.expectEqual(2, (try st.list(a, "notes")).len);
+}
+
+test "the_snapshot_tool_takes_one_with_its_label" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const st = try withSnapshots(&f, "[notes]\nread = owner\n");
+    defer st.deinit();
+    try f.e.tmp.dir.createDirPath(t.io, "ws/notes");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/notes/a.txt", .data = "a" });
+    try f.e.tmp.dir.createDirPath(t.io, "state/env/box/home");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "state/env/box/home/h.txt", .data = "h" });
+    try f.e.script(1, model.toolReply("tu_1", "snapshot", "{\"folder\":\"notes\",\"label\":\"before the edit\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "snapshot", "{\"folder\":\"env:box\"}"));
+    try f.e.script(3, model.toolReply("tu_3", "snapshot", "{\"folder\":\"env:nobox\"}"));
+    try f.e.script(4, model.toolReply("tu_4", "restore", "{\"folder\":\"notes\",\"id\":1}"));
+    try f.e.script(5, model.textReply("done"));
+    const r = try f.say("keep a copy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "\"name\":\"snapshot\"") != null);
+    const notes = try st.list(a, "notes");
+    try t.expectEqual(1, notes.len);
+    try t.expectEqual(.tool, notes[0].when);
+    try t.expectEqualStrings("before the edit", notes[0].label);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "Took snapshot 1 of notes") != null);
+    const home = try st.list(a, "env:box");
+    try t.expectEqual(1, home.len);
+    try t.expectEqual(1, home[0].files);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "not taken: no environment nobox") != null);
+    // no tool restores
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), "no such tool") != null);
 }
