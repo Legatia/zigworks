@@ -403,6 +403,10 @@ pub const Run = struct {
     /// Where a delegated run registers its own stop flag (so `/stop NAME`
     /// reaches it alone); null: helpers share their parent's flag.
     registry: ?Registry = null,
+    /// A file trigger's folder ("" the workspace's top): its run, and the
+    /// runs it delegates, do not write files there (no loop of its own
+    /// making). "": none.
+    watch: ?[]const u8 = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -1418,6 +1422,21 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     };
     // a skill outside the definition's skills is no skill of this run's
     if (tool == .skill and !r.def.allowsSkill(arg)) return .{ .text = "could not load the skill: NoSuchSkill", .is_error = true };
+    // a file trigger's run writes nowhere it watches (its own loop)
+    if (tool == .write_file) if (watchedFolder(r)) |folder| {
+        const cf = gate.confined(a, r.io, r.env.workspace, arg) catch null;
+        if (cf) |x| if (directlyIn(x.rel, folder)) {
+            const why = try std.fmt.allocPrint(a, "this trigger watches {s}: its run does not write there", .{if (folder.len == 0) "the workspace's top folder" else folder});
+            try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+            return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+        };
+    };
+    // runs a trigger starts move no money until the owner decides ([money] triggers)
+    if (tool == .money and std.mem.startsWith(u8, r.who.by, "trigger:") and !r.money.triggers) {
+        const why = "money is not moved in runs a trigger starts ([money] triggers = off)";
+        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+    }
     const now_s = r.now();
     // where a command starts, as the model gave it
     const dir: []const u8 = if (tool == .shell) jv.str(jv.get(jv.parse(a, input_json), "dir")) orelse "" else "";
@@ -2016,6 +2035,20 @@ fn redirectAllow(ctx: *anyopaque, a: std.mem.Allocator, url: []const u8, known_h
 // ---- tests ----
 
 
+
+/// The folder a file trigger watches, for this run or the run that
+/// delegated it; null when none does.
+fn watchedFolder(r: *const Run) ?[]const u8 {
+    if (r.watch) |w| return w;
+    return if (r.starter) |s| watchedFolder(s) else null;
+}
+
+/// Whether `rel` (a path inside the workspace) is a file right in
+/// `folder` ("" the workspace's top), as the gate compares paths.
+fn directlyIn(rel: []const u8, folder: []const u8) bool {
+    const parent = rel[0 .. std.mem.lastIndexOfScalar(u8, rel, '/') orelse 0];
+    return if (gate.fold_paths) std.ascii.eqlIgnoreCase(parent, folder) else std.mem.eql(u8, parent, folder);
+}
 
 /// The longest question the owner is asked: a few Telegram messages of
 /// 4096 bytes. A longer call is refused, never shown cut: padding could
@@ -5478,4 +5511,44 @@ test "a_delegated_definition_uses_its_own_provider" {
     const strong = jv.parse(a, try f.e.request(5)).?;
     try t.expectEqualStrings("/v1/messages", jv.str(jv.get(strong, "target")).?);
     try t.expectEqualStrings("claude-test", jv.str(jv.at(strong, &.{ "body", "model" })).?);
+}
+
+test "money_in_trigger_runs_is_refused_while_triggers_is_off" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.scheduled = true;
+    f.run.asker = null;
+    f.run.who = .{ .by = "trigger:btc" };
+    f.run.money = .{ .scheduled = true, .max_per_call = 10 };
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"one\",\"amount\":1}"));
+    try f.e.script(2, model.textReply("refused"));
+    var r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "money is not moved in runs a trigger starts ([money] triggers = off)") != null);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
+    // on: as in scheduled runs, within the caps
+    f.run.money.triggers = true;
+    try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"two\",\"amount\":2}"));
+    try f.e.script(4, model.textReply("bought"));
+    r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "two") != null);
+    try t.expectEqual(@as(f64, 2), f.ledger.sum());
+}
+
+test "a_file_triggers_run_may_not_write_where_it_watches" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    f.run.watch = "inbox";
+    try f.e.script(1, model.toolReply("w1", "write_file", "{\"path\":\"inbox/x.pdf\",\"content\":\"x\"}"));
+    try f.e.script(2, model.toolReply("w2", "write_file", "{\"path\":\"notes.md\",\"content\":\"x\"}"));
+    try f.e.script(3, model.textReply("done"));
+    const r = try f.say("write");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "trigger watches inbox: its run does not write there") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "\"tool_use_id\":\"w2\",\"content\":\"refused") == null);
 }
