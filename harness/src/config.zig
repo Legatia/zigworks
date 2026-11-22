@@ -4,6 +4,7 @@
 //! `key = value`, comments after `;` or `#`.
 const std = @import("std");
 const conversations = @import("conversations.zig");
+const agents = @import("agents.zig");
 
 pub const Error = error{ BadConfig, OutOfMemory };
 
@@ -266,6 +267,8 @@ pub const Task = struct {
     do: []const u8 = "",
     /// The conversation it posts to (`to =`).
     to: []const u8 = "main",
+    /// The definition that runs it (`agent =`).
+    agent: []const u8 = "main",
 };
 
 pub const day_names = [_][]const u8{ "mon", "tue", "wed", "thu", "fri", "sat", "sun" };
@@ -289,6 +292,9 @@ pub fn parseTasks(arena: std.mem.Allocator, text: []const u8) Error![]Task {
             tk.do = l.value;
         } else if (std.mem.eql(u8, l.key, "to")) {
             tk.to = try conversationName(l.value);
+        } else if (std.mem.eql(u8, l.key, "agent")) {
+            if (!agents.validName(l.value)) return error.BadConfig;
+            tk.agent = l.value;
         } else return error.BadConfig;
     }
     for (tasks.items) |tk| {
@@ -427,7 +433,8 @@ pub const tasks_example =
     \\; Scheduled tasks: the agent runs `do` at a time (`at`, optional `days`)
     \\; or every N minutes (`every = 15m`, at least 5m). Its answer is sent to
     \\; you unless it is NOTHING; to = NAME posts it to that conversation
-    \\; (default main, the private chat; a new name opens that topic).
+    \\; (default main, the private chat; a new name opens that topic);
+    \\; agent = NAME runs it as that definition (default main, agents/).
     \\;
     \\; [weekly-review]
     \\; at = 18:00
@@ -602,6 +609,18 @@ test "tasks_and_briefs_name_their_conversation" {
     try t.expectEqual(10, c.limits.sends_per_run);
     try t.expectEqual(60, c.limits.sends_per_hour);
     try t.expectEqual(3, (try parse(a, "[limits]\nsends_per_hour = 3\n")).limits.sends_per_hour);
+}
+
+test "tasks_name_their_agent" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ts = try parseTasks(a, "[watch]\nevery = 5m\nagent = researcher\ndo = Look.\n[plain]\nevery = 5m\ndo = x\n");
+    try t.expectEqualStrings("researcher", ts[0].agent);
+    // no agent: main
+    try t.expectEqualStrings("main", ts[1].agent);
+    try t.expectError(error.BadConfig, parseTasks(a, "[x]\nevery = 5m\nagent = Research\ndo = y"));
+    try t.expectError(error.BadConfig, parseTasks(a, "[x]\nevery = 5m\nagent = rm\ndo = y"));
 }
 
 test "agents_browser_and_money_sections" {
