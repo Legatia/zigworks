@@ -34,8 +34,11 @@ them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 69 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram, feeds,
 search and two MCP servers. An earlier build of 0.3.0 also passed its
-tests in CI on Linux and Windows. Nothing has run yet against a real
-omnigate or model provider, Telegram bot, MCP server or website.** See [Limits](#limits).
+tests in CI on Linux and Windows. On Windows 11 the browser and login
+tests also run, against Chrome 157, and the console, lock, Credential
+Manager and process-cleanup checks of HANDOFF-windows-audit.md were run by
+hand. Nothing has run yet against a real omnigate or model provider,
+Telegram bot, MCP server or website.** See [Limits](#limits).
 
 ## Quick start
 
@@ -58,7 +61,8 @@ answered. To move the bot to another account, run `harness pair` again and
 send the new code from that account; the old one is told.
 
 `harness chat` does the same in the terminal, for trying it out. Ctrl-D
-leaves; questions still waiting are withdrawn (not allowed).
+leaves (in a Windows console, Ctrl-Z and Enter, or Ctrl-D and Enter);
+questions still waiting are withdrawn (not allowed).
 
 ## Models and providers
 
@@ -303,7 +307,10 @@ tool or path, and who it covers. `/grants` lists them with who they cover
 and until when; `/grant rm N` removes one.
 
 `/stop` stops everything at once: the running turn, any shell command and
-everything it started, and background runs. `/new` starts a fresh
+everything it started, and background runs. (On Windows, which has no
+process groups, each shell command, MCP server and browser runs in a job
+object of its own, so what it started ends with it, harness's own end
+included.) `/new` starts a fresh
 conversation; memory stays. Ctrl-C or a kill (SIGINT, SIGTERM; on Windows
 Ctrl-C or closing the console) does what `/stop` does, logs it, and ends
 harness; another instance can start at once.
@@ -977,7 +984,6 @@ while `harness run` holds the folder and has ticked in the last 90 s.
   or task waits for its next scheduled time. A model call ends by the
   turn's time limit; one that timed out is not sent again. A request the
   API refuses as invalid drops that turn, and you are told.
-- **Windows.** `/stop` ends a shell command but not processes it started.
 - **Feeds** are read up to 4 MiB, fetched pages up to 1 MiB, rendered
   pages up to 4 MiB.
 - **MCP servers and the browser** run as you, like shell commands. An MCP
@@ -989,15 +995,19 @@ while `harness run` holds the folder and has ticked in the last 90 s.
   fields, one day total per server: keep each server's money tools in one
   unit (say USD). They trust the tool to mean what that field says.
 - **The Windows Credential Manager** keeps at most 2560 bytes of a value;
-  `secret add` refuses longer ones.
+  `secret add` refuses longer ones. A login's passkeys (about 300 bytes
+  each) are kept there in parts once they don't fit in one.
 - **One owner, one turn at a time.** Messages sent in any conversation,
   to any definition, while the agent works wait in one queue. Contexts do
   not survive a restart.
-- **`web` is macOS and Linux only** for now (Chrome is driven through
-  pipes on file descriptors 3 and 4); on Windows it is not offered.
+- **`web` drives Chrome through pipes**, never a network port: file
+  descriptors 3 and 4 on macOS and Linux; on Windows two pipe handles
+  Chrome inherits alone (`--remote-debugging-io-pipes`), with the browser
+  and its helpers in a job object.
 - **Login cookies are on disk** in `profiles/NAME`, readable by you (the
-  folder is 0700), like any browser profile. Anyone who can read the data
-  folder can use those sessions.
+  folder is 0700; on Windows the data folder's permissions protect it),
+  like any browser profile. Anyone who can read the data folder can use
+  those sessions.
 - **Site binding is by host name.** A login for `example.com` is typed on
   any name below it, and its passkeys are kept only for the site or a name
   below it; a site needs a dot (except `localhost`), but harness doesn't
@@ -1005,9 +1015,8 @@ while `harness run` holds the folder and has ticked in the last 90 s.
 
 Not in 0.3.0: the Agent Client Protocol server, desktop use (headdesk), a
 sandbox per command, email, WhatsApp, Slack and voice as conversations,
-helpers that report back later,
-cards and payments for the agent, the browser on Windows, screenshots,
-and the hosted service.
+helpers that report back later, cards and payments for the agent,
+screenshots, and the hosted service.
 
 ## Build
 

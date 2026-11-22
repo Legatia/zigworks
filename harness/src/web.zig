@@ -252,7 +252,6 @@ pub const Web = struct {
     }
 
     fn runRaw(w: *Web, a: Allocator, input_json: []const u8) !Output {
-        if (is_windows) return fail(a, "the web tool is not available on Windows yet", .{});
         const v = jv.parse(a, input_json) orelse return fail(a, "the input is not JSON", .{});
         const action = jv.str(jv.get(v, "action")) orelse return fail(a, "say which action: open, type, click, key, read or close", .{});
         const eql = std.mem.eql;
@@ -376,7 +375,8 @@ pub const Web = struct {
         w.auth_id = try w.arena.allocator().dupe(u8, jv.str(jv.get(res, "authenticatorId")) orelse return error.Cdp);
         const st = w.env.store orelse return;
         var nb: [96]u8 = undefined;
-        const raw = st.get(w.io, w.gpa, logins.secretName(&nb, l.name, .passkeys)) catch {
+        // in parts where the store keeps short values only (Store.putLong)
+        const raw = st.getLong(w.io, w.gpa, logins.secretName(&nb, l.name, .passkeys)) catch {
             w.passkeys_bad = true;
             try w.notes.appendSlice(w.arena.allocator(), "The stored passkeys of this login could not be read from the key store; none were loaded, and a new one would not be saved.\n");
             return;
@@ -456,7 +456,9 @@ pub const Web = struct {
             var nb: [96]u8 = undefined;
             const json = try logins.encode(a, merged.list);
             defer std.crypto.secureZero(u8, @constCast(json));
-            st.put(w.io, logins.secretName(&nb, l.name, .passkeys), json) catch {
+            // the Credential Manager keeps 2560 bytes of a value, about
+            // eight passkeys: a longer list goes into parts
+            st.putLong(w.io, w.gpa, logins.secretName(&nb, l.name, .passkeys), json) catch {
                 try w.notes.appendSlice(w.arena.allocator(), "A new passkey could not be saved to the key store.\n");
                 return;
             };
@@ -1006,6 +1008,7 @@ const Fix = struct {
         try f.e.tmp.dir.createDirPath(t.io, "tmp");
         f.web = Web.init(t.allocator, t.io, .{
             .browser = f.browser,
+            .chrome_env = .{ .system = try cdp.testSystemVars(a) },
             .profiles = try std.fs.path.join(a, &.{ f.e.dir, "profiles" }),
             .tmp_root = try std.fs.path.join(a, &.{ f.e.dir, "tmp" }),
             .timeout_ms = 20_000,

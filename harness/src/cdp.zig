@@ -1,12 +1,15 @@
 //! A headless Chrome driven over the DevTools protocol through a pipe
-//! (`--remote-debugging-pipe`: Chrome reads commands on fd 3 and writes
-//! replies on fd 4), never a network port. Each message is JSON followed
-//! by one NUL byte, both ways. POSIX only for now.
+//! (`--remote-debugging-pipe`), never a network port: Chrome reads commands
+//! on fd 3 and writes replies on fd 4 on POSIX; on Windows it is given two
+//! inherited pipe handles by value (`--remote-debugging-io-pipes=READ,WRITE`)
+//! and runs in a job object with its helpers (proc.zig). Each message is
+//! JSON followed by one NUL byte, both ways.
 const std = @import("std");
 const builtin = @import("builtin");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
 const page = @import("page.zig");
+const proc = @import("proc.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -282,6 +285,9 @@ pub const Session = struct {
     child: std.process.Child = undefined,
     /// `child` is set: there is a process to end.
     spawned: bool = false,
+    /// Windows: the browser and its helpers. Kept until `destroy`, so what
+    /// is left in it after `close` can be looked at (tests).
+    job: proc.Job = .{},
     /// The browser was reaped: its pid and group id may be another's now.
     reaped: std.atomic.Value(bool) = .init(false),
     /// Group signals sent after that (must stay 0).
@@ -336,10 +342,6 @@ pub const Session = struct {
 
     /// Starts `browser` with `profile_dir` and attaches to its page.
     pub fn open(gpa: Allocator, io: Io, browser: []const u8, profile_dir: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32, opts: Options) !*Session {
-        if (is_windows) return error.Unsupported else return openPosix(gpa, io, browser, profile_dir, stop, timeout_ms, opts);
-    }
-
-    fn openPosix(gpa: Allocator, io: Io, browser: []const u8, profile_dir: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32, opts: Options) !*Session {
         const s = try gpa.create(Session);
         s.* = .{ .gpa = gpa, .io = io, .stop = stop, .timeout_ms = timeout_ms, .inbox = .{ .gpa = gpa } };
         // whatever fails, the browser is ended and all of it freed
@@ -354,6 +356,12 @@ pub const Session = struct {
         var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
+        if (is_windows) try s.spawnWindows(a, browser, profile_dir, opts) else try s.spawnPosix(a, browser, profile_dir, opts);
+        s.reader = try std.Thread.spawn(.{}, readLoop, .{s});
+        try s.attach();
+    }
+
+    fn spawnPosix(s: *Session, a: Allocator, browser: []const u8, profile_dir: []const u8, opts: Options) !void {
         // our stdin pipe becomes Chrome's fd 3, our stdout pipe its fd 4
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(a, &.{ "/bin/sh", "-c", "exec \"$@\" 3<&0 4>&1 0</dev/null 1>/dev/null", "sh", browser });
@@ -367,7 +375,7 @@ pub const Session = struct {
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
-            .pgid = 0,
+            .pgid = if (is_windows) null else 0,
         });
         s.spawned = true;
         s.pid = s.child.id.?;
@@ -376,8 +384,49 @@ pub const Session = struct {
         s.from_chrome = s.child.stdout;
         s.child.stdin = null;
         s.child.stdout = null;
-        s.reader = try std.Thread.spawn(.{}, readLoop, .{s});
-        try s.attach();
+    }
+
+    /// Windows has no inherited file descriptors 3 and 4: Chrome is given
+    /// the handles of its two pipe ends by value, inherited by it alone
+    /// (`inherit_files`), and runs in a job before it can start a helper.
+    fn spawnWindows(s: *Session, a: Allocator, browser: []const u8, profile_dir: []const u8, opts: Options) !void {
+        const commands = try proc.Pipe.open();
+        const replies = proc.Pipe.open() catch |e| {
+            commands.read.close(s.io);
+            commands.write.close(s.io);
+            return e;
+        };
+        // Chrome's ends are closed here once it has them; ours are kept
+        defer commands.read.close(s.io);
+        defer replies.write.close(s.io);
+        errdefer commands.write.close(s.io);
+        errdefer replies.read.close(s.io);
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.append(a, browser);
+        try argv.appendSlice(a, &page.browser_flags);
+        if (opts.keep_session) try argv.append(a, "--restore-last-session");
+        try argv.appendSlice(a, &.{
+            "--remote-debugging-pipe",
+            try std.fmt.allocPrint(a, "--remote-debugging-io-pipes={d},{d}", .{ @intFromPtr(commands.read.handle), @intFromPtr(replies.write.handle) }),
+            try std.fmt.allocPrint(a, "--user-data-dir={s}", .{profile_dir}),
+            "about:blank",
+        });
+        var vars = try opts.env.map(a);
+        s.job = proc.Job.create();
+        s.child = try std.process.spawn(s.io, .{
+            .argv = argv.items,
+            .environ_map = &vars,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .inherit_files = &.{ commands.read, replies.write },
+            .start_suspended = true,
+            .create_no_window = true,
+        });
+        s.job.adopt(&s.child);
+        s.spawned = true;
+        s.to_chrome = commands.write;
+        s.from_chrome = replies.read;
     }
 
     fn attach(s: *Session) !void {
@@ -428,9 +477,7 @@ pub const Session = struct {
         while (!s.ended.load(.acquire)) {
             // a stop ends the browser at once, whatever is waiting on it
             if (s.stop.load(.acquire)) s.killGroup();
-            var fds = [_]std.posix.pollfd{.{ .fd = f.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-            const ready = std.posix.poll(&fds, 50) catch break;
-            if (ready == 0) continue;
+            if (!proc.readableWithin(s.io, f, 50)) continue;
             const got = f.readStreaming(s.io, &.{&buf}) catch break;
             if (got == 0) break;
             s.inbox.feed(s.io, buf[0..got]);
@@ -501,16 +548,21 @@ pub const Session = struct {
     }
 
     fn killGroup(s: *Session) void {
-        if (is_windows) return else {
+        if (is_windows) {
+            if (s.spawned) s.job.kill(s.child.id);
+        } else {
             if (s.pid == 0) return;
             s.signalGroup();
             std.posix.kill(s.pid, .KILL) catch {};
         }
     }
 
-    /// SIGKILL to the browser's process group.
+    /// SIGKILL to the browser's process group; on Windows, its job (a
+    /// handle of ours, so never another's processes).
     fn signalGroup(s: *Session) void {
-        if (is_windows) return else {
+        if (is_windows) {
+            s.job.kill(null);
+        } else {
             if (s.reaped.load(.acquire)) _ = s.late_signals.fetchAdd(1, .acq_rel);
             std.posix.kill(-s.pid, .KILL) catch {};
         }
@@ -681,7 +733,7 @@ pub const Session = struct {
         if (s.closed) return;
         // closing is not an action: its own short limits, even past the turn's end
         s.end_ns = null;
-        if (!is_windows and s.spawned) {
+        if (s.spawned) {
             if (s.page_session.len > 0 and !s.inbox.closed.load(.acquire) and !s.stop.load(.acquire)) {
                 var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
                 defer arena_state.deinit();
@@ -689,11 +741,14 @@ pub const Session = struct {
                 s.timeout_ms = 1000;
                 const asked = if (s.callIn(arena_state.allocator(), "Browser.close", "{}", null)) |_| true else |_| false;
                 s.timeout_ms = saved;
-                // a moment to write its cookies to the profile; the pipe
-                // closes when it has ended
+                // a moment to write its cookies to the profile: the pipe
+                // closes when it has ended, but on Windows before its other
+                // processes have, among them the one that writes cookies
+                // (killed then, the last ones set are lost)
                 if (asked) {
                     const until = deadline(s.io, 3000);
                     while (!s.inbox.closed.load(.acquire) and Io.Clock.awake.now(s.io).nanoseconds < until) s.io.sleep(.fromMilliseconds(20), .awake) catch {};
+                    if (is_windows and s.inbox.closed.load(.acquire)) _ = s.job.waitEmpty(s.io, 5000, s.stop);
                 }
             }
             s.closed = true;
@@ -703,10 +758,14 @@ pub const Session = struct {
             if (s.reader) |th| th.join();
             if (s.child.id != null) {
                 // ended, not reaped: the group id is still the browser's
-                page.waitExited(s.pid);
+                if (!is_windows) page.waitExited(s.pid);
                 // its helpers too, should one have outlived the first kill
                 s.signalGroup();
                 _ = s.child.wait(s.io) catch {};
+                // gone, not only told to go (Windows ends a job's processes
+                // after the call returns): one still ending keeps the
+                // profile's files open
+                if (is_windows) _ = s.job.waitEmpty(s.io, 2000, null);
             }
             s.reaped.store(true, .release);
             if (s.to_chrome) |f| f.close(s.io);
@@ -718,6 +777,7 @@ pub const Session = struct {
     /// Closes and frees.
     pub fn destroy(s: *Session) void {
         s.close();
+        s.job.close();
         s.inbox.deinit();
         if (s.page_session.len > 0) s.gpa.free(s.page_session);
         s.gpa.destroy(s);
@@ -766,10 +826,20 @@ test "messages_are_split_at_nul_and_events_skipped" {
 
 /// Chrome, for the tests that need one; null skips them.
 pub fn testBrowser(a: Allocator) !?[]const u8 {
-    if (is_windows) return null;
+    // Windows: where Chrome or Edge is installed (page.findBrowser)
+    if (is_windows) return page.findBrowser(a, t.io, "", "", "");
     const env_chrome: []const u8 = if (t.environ.getPosix("HARNESS_CHROME")) |v| v else "";
     const env_path: []const u8 = if (t.environ.getPosix("PATH")) |v| v else "";
     return page.findBrowser(a, t.io, "", env_chrome, env_path);
+}
+
+/// Windows: the system's own variables of the tests' environment, for a
+/// browser's: without them (SystemRoot) it reaches no site at all. Empty
+/// elsewhere.
+pub fn testSystemVars(a: Allocator) ![]const util.Var {
+    if (!is_windows) return &.{};
+    var m = try t.environ.createMap(a);
+    return util.pickVars(a, &m, util.system_var_names);
 }
 
 fn processGone(pid: Pid) bool {
@@ -797,6 +867,16 @@ test "chrome_over_a_pipe_evaluates_and_closes_without_leftovers" {
     try t.expectEqualStrings("\"ab\"", try s.evaluate(a, "Promise.resolve('a' + 'b')"));
     try t.expectError(error.Script, s.evaluate(a, "no_such_name.x"));
     try t.expectError(error.Cdp, s.call(a, "No.suchMethod", "{}"));
+    if (is_windows) {
+        // the browser had helpers in its job; after close the job is empty
+        try t.expect((s.job.active() orelse 0) > 1);
+        s.close();
+        var waited: u32 = 0;
+        while (waited < 3000 and (s.job.active() orelse 0) > 0) : (waited += 50) t.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        try t.expectEqual(@as(?u32, 0), s.job.active());
+        s.destroy();
+        return;
+    }
     s.destroy();
     try t.expect(processGone(pid));
     // nothing of its group is left either (helpers die a moment later)

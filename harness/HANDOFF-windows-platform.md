@@ -5,6 +5,21 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## Status (Windows session, 2026-11-22)
+
+Items 1 and 2 below are done, on branch `harness-windows`, merged into
+`harness-logins` (f14261e). What was found and done is in the "Done"
+sections at the top of `HANDOFF-windows-audit.md` and
+`HANDOFF-windows-web.md`. After the merge: Windows 464 pass, 33 skip,
+smoke all ok; Linux (WSL, an ordinary user) 488 pass, 9 skip, smoke all
+ok. The 33 that skip on Windows: POSIX shell commands in their setup (14:
+tools 7, mcp 4, agent 3, among them the new
+`shell_starts_in_its_dir_and_the_question_and_lines_name_it`; most have a
+Windows twin), the stand-in browser scripts and page.zig's render tests
+(14), symbolic links (4, two of them the snapshot store's: Windows makes
+them only with Developer Mode or as administrator; junctions are tested
+instead) and SIGTERM (1). Next: item 3.
+
 ## Get it
 
 ```

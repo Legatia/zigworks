@@ -10,6 +10,7 @@ const gate = @import("gate.zig");
 const model = @import("model.zig");
 const util = @import("util.zig");
 const page = @import("page.zig");
+const proc = @import("proc.zig");
 const url_mod = @import("url.zig");
 const Io = std.Io;
 
@@ -177,14 +178,11 @@ const Collector = struct {
     gpa: std.mem.Allocator,
     finished: std.atomic.Value(u32) = .init(0),
 
-    /// POSIX: reads until the pipe closes or `ended` is set, looking every
-    /// 100 ms, so a process that kept the pipe open can't hold us.
+    /// Reads until the pipe closes or `ended` is set, so a process that
+    /// kept the pipe open can't hold us (see proc.waitReadable).
     fn pumpUntil(c: *Collector, io: Io, from: Io.File, ended: *std.atomic.Value(bool)) void {
         var chunk: [8192]u8 = undefined;
-        while (!ended.load(.acquire)) {
-            var fds = [_]std.posix.pollfd{.{ .fd = from.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-            const ready = std.posix.poll(&fds, 100) catch break;
-            if (ready == 0) continue;
+        while (proc.waitReadable(io, from, ended)) {
             const got = from.readStreaming(io, &.{&chunk}) catch break;
             if (got == 0) break;
             c.mutex.lockUncancelable(io);
@@ -195,26 +193,13 @@ const Collector = struct {
         }
         _ = c.finished.fetchAdd(1, .acq_rel);
     }
-
-    fn pump(c: *Collector, io: Io, from: Io.File) void {
-        var chunk: [8192]u8 = undefined;
-        while (true) {
-            const got = from.readStreaming(io, &.{&chunk}) catch break;
-            if (got == 0) break;
-            c.mutex.lockUncancelable(io);
-            defer c.mutex.unlock(io);
-            c.total += got;
-            const room = c.cap -| c.buf.items.len;
-            c.buf.appendSlice(c.gpa, chunk[0..@min(room, got)]) catch {};
-        }
-    }
 };
-
-extern "kernel32" fn TerminateProcess(h: std.os.windows.HANDLE, code: u32) callconv(.winapi) std.os.windows.BOOL;
 
 const Watch = struct {
     io: Io,
     id: std.process.Child.Id,
+    /// Windows: the command's job (what it started is in it).
+    job: *const proc.Job,
     stop: *std.atomic.Value(bool),
     deadline_ns: i128,
     done: std.atomic.Value(bool) = .init(false),
@@ -236,11 +221,11 @@ const Watch = struct {
         if (w.reason != null) w.killAll();
     }
 
-    /// The whole process group on POSIX, so children started in the
-    /// background go too; the process itself on Windows.
+    /// The whole process group on POSIX, the job on Windows, so children
+    /// started in the background go too.
     fn killAll(w: *Watch) void {
         if (is_windows) {
-            _ = TerminateProcess(w.id, 1);
+            w.job.kill(w.id);
         } else {
             std.posix.kill(-w.id, .KILL) catch {};
             std.posix.kill(w.id, .KILL) catch {};
@@ -265,6 +250,9 @@ fn shell(env: Env, arena: std.mem.Allocator, command: []const u8, dir: []const u
     try vars.put("LANG", "C.UTF-8");
     try vars.put("TERM", "dumb");
     const argv: []const []const u8 = if (is_windows) &.{ "cmd.exe", "/c", command } else &.{ "/bin/sh", "-c", command };
+    // Windows: in a job before it can start anything (see proc.zig)
+    var job = proc.Job.create();
+    defer job.close();
     var child = try std.process.spawn(env.io, .{
         .argv = argv,
         .cwd = .{ .path = cwd },
@@ -273,26 +261,23 @@ fn shell(env: Env, arena: std.mem.Allocator, command: []const u8, dir: []const u
         .stdout = .pipe,
         .stderr = .pipe,
         .pgid = if (is_windows) null else 0,
+        .start_suspended = is_windows,
         .create_no_window = true,
     });
+    job.adopt(&child);
     // more than is shown: masking can shorten it, and a value cut at the
     // end is left out
     var col: Collector = .{ .cap = @as(usize, env.tool_output_bytes) * 2 + 4096, .gpa = arena };
     var watch: Watch = .{
         .io = env.io,
         .id = child.id.?,
+        .job = &job,
         .stop = env.stop,
         .deadline_ns = Io.Clock.awake.now(env.io).nanoseconds + @as(i128, env.shell_seconds) * std.time.ns_per_s,
     };
     const th_watch = try std.Thread.spawn(.{}, Watch.run, .{&watch});
     var term: ?std.process.Child.Term = null;
-    if (is_windows) {
-        const th_out = try std.Thread.spawn(.{}, Collector.pump, .{ &col, env.io, child.stdout.? });
-        const th_err = try std.Thread.spawn(.{}, Collector.pump, .{ &col, env.io, child.stderr.? });
-        th_out.join();
-        th_err.join();
-        term = child.wait(env.io) catch null;
-    } else {
+    {
         // the pipes are ours: `wait` must not close them under the readers
         const out_f = child.stdout.?;
         const err_f = child.stderr.?;
@@ -305,7 +290,7 @@ fn shell(env: Env, arena: std.mem.Allocator, command: []const u8, dir: []const u
         const th_err = try std.Thread.spawn(.{}, Collector.pumpUntil, .{ &col, env.io, err_f, &ended });
         term = child.wait(env.io) catch null;
         // nothing the command started may outlive it
-        std.posix.kill(-watch.id, .KILL) catch {};
+        if (is_windows) job.kill(null) else std.posix.kill(-watch.id, .KILL) catch {};
         // what is left in the pipes, for up to 2 s; a process that left the
         // group and kept them open is not waited for
         var waited: u32 = 0;
@@ -842,6 +827,42 @@ test "write_file_never_writes_through_a_symlink" {
     try t.expectEqualStrings("new", try f.e.tmp.dir.readFileAlloc(t.io, "ws/plain.txt", f.e.arena.allocator(), .unlimited));
 }
 
+/// Windows: a junction at `link` to the folder `target` (no administrator
+/// needed, unlike a symbolic link); the test is skipped if none can be made.
+fn junction(link: []const u8, target: []const u8) !void {
+    var child = try std.process.spawn(t.io, .{ .argv = &.{ "cmd.exe", "/c", "mklink", "/J", link, target }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true });
+    const term = try child.wait(t.io);
+    if (!(term == .exited and term.exited == 0)) return error.SkipZigTest;
+}
+
+/// The call was refused, by an error result or an error.
+fn refused(f: *Fix, tool: gate.Tool, input: []const u8) bool {
+    const o = f.call(tool, input) catch return true;
+    return o.is_error;
+}
+
+test "files_are_never_written_or_read_through_a_junction_out_of_the_workspace_windows" {
+    if (!is_windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.tmp.dir.createDirPath(t.io, "outside");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "outside/there.txt", .data = "before" });
+    try junction(try std.fs.path.join(a, &.{ f.env.workspace, "door" }), try f.e.tmp.dir.realPathFileAlloc(t.io, "outside", a));
+    // a new file through it, and one that is there, are not written
+    try t.expect(refused(&f, .write_file, "{\"path\":\"door/planted.txt\",\"content\":\"planted\"}"));
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.access(t.io, "outside/planted.txt", .{}));
+    try t.expect(refused(&f, .write_file, "{\"path\":\"door/there.txt\",\"content\":\"after\"}"));
+    try t.expectEqualStrings("before", try f.e.tmp.dir.readFileAlloc(t.io, "outside/there.txt", a, .unlimited));
+    // the junction itself is not a file to write
+    try t.expect(refused(&f, .write_file, "{\"path\":\"door\",\"content\":\"x\"}"));
+    // nor is what is behind it read
+    try t.expect(refused(&f, .read_file, "{\"path\":\"door/there.txt\"}"));
+    // a plain file in the workspace still is written
+    try t.expect(!(try f.call(.write_file, "{\"path\":\"plain.txt\",\"content\":\"new\"}")).is_error);
+}
+
 test "fetch_caps_body_and_refuses_binary" {
     var f: Fix = undefined;
     try f.init();
@@ -1041,6 +1062,44 @@ test "a_child_that_leaves_the_group_does_not_hang_the_command" {
     const start = Io.Clock.awake.now(t.io).nanoseconds;
     // a detached child that keeps the output pipe open, and a background job
     const o = try f.call(.shell, "{\"command\":\"perl -e 'use POSIX; POSIX::setsid(); sleep 8' & sleep 30 & echo started\"}");
+    const took_ms = @divFloor(Io.Clock.awake.now(t.io).nanoseconds - start, std.time.ns_per_ms);
+    try t.expect(took_ms < 5000);
+    try t.expect(std.mem.indexOf(u8, o.text, "started") != null);
+    try t.expect(std.mem.startsWith(u8, o.text, "exit code 0"));
+}
+
+test "shell_stop_ends_what_the_command_started_windows" {
+    if (!is_windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    f.env.path_var = try proc.systemDir(f.e.arena.allocator());
+    // started in the background, it leaves a mark if it lives two seconds
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/bg.cmd", .data = "@ping -n 3 127.0.0.1 >nul\r\n@echo alive> left.txt\r\n" });
+    const th = try std.Thread.spawn(.{}, stopLater, .{&f.stop});
+    defer th.join();
+    const start = Io.Clock.awake.now(t.io).nanoseconds;
+    const o = try f.call(.shell, "{\"command\":\"start /b cmd /c bg.cmd & ping -n 30 127.0.0.1 >nul\"}");
+    const took_ms = @divFloor(Io.Clock.awake.now(t.io).nanoseconds - start, std.time.ns_per_ms);
+    try t.expect(took_ms < 2300);
+    try t.expect(o.is_error);
+    try t.expect(std.mem.indexOf(u8, o.text, "stopped by the owner") != null);
+    // what it started went with it: no mark, even well after
+    t.io.sleep(.fromMilliseconds(3000), .awake) catch {};
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "ws/left.txt", .{}));
+}
+
+test "a_child_that_keeps_the_output_open_does_not_hang_the_command_windows" {
+    if (!is_windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    f.env.path_var = try proc.systemDir(f.e.arena.allocator());
+    f.env.shell_seconds = 20;
+    // started in the background, it holds the output pipe for 8 s
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/bg.cmd", .data = "@ping -n 9 127.0.0.1 >nul\r\n" });
+    const start = Io.Clock.awake.now(t.io).nanoseconds;
+    const o = try f.call(.shell, "{\"command\":\"start /b cmd /c bg.cmd & echo started\"}");
     const took_ms = @divFloor(Io.Clock.awake.now(t.io).nanoseconds - start, std.time.ns_per_ms);
     try t.expect(took_ms < 5000);
     try t.expect(std.mem.indexOf(u8, o.text, "started") != null);

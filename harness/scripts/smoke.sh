@@ -438,13 +438,9 @@ check "the call allowed for a task runs on its next run" '"$H" task run disk 2>/
 check "the log chain verifies" '"$H" log verify | grep -qF "chain intact"'
 check "no secret value in the log, typed by the owner or not" '! grep -qE "og-smoke-key-123|telegram-smoke-token|brave-smoke-key|smoke-login-pass" "$HARNESS_HOME/log/actions.jsonl"'
 check "a login is removed with its secrets" '"$H" login rm bot >/dev/null && "$H" login list | grep -qF "No logins." && [ ! -e "$HARNESS_STORE/login-bot-password" ] && ! grep -qF "[bot]" "$HARNESS_HOME/logins.ini"'
-# left out on Windows until it has been seen to pass there: the 90 s lock
-# it was skipped for is gone (HANDOFF-windows-audit.md, section 3)
-if [ $windows = 0 ]; then
-	check "memory list works offline" '"$H" memory list 2>/dev/null | grep -qF "I prefer short briefs"'
-	check "snapshot list works offline" '"$H" snapshot list notes 2>/dev/null | grep -qF "Snapshots of notes:"'
-	check "agent list works offline" '"$H" agent list 2>/dev/null | grep -qF "researcher: Research across several sources"'
-fi
+check "memory list works offline" '"$H" memory list 2>/dev/null | grep -qF "I prefer short briefs"'
+check "snapshot list works offline" '"$H" snapshot list notes 2>/dev/null | grep -qF "Snapshots of notes:"'
+check "agent list works offline" '"$H" agent list 2>/dev/null | grep -qF "researcher: Research across several sources"'
 
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	echo "smoke: FAILED"
