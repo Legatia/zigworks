@@ -717,6 +717,8 @@ pub fn outcome(a: std.mem.Allocator, it: *const Item, utc_offset: i32) ![]const 
             if (eql(u8, key, "dismiss")) break :blk std.fmt.allocPrint(a, "dismissed, {s}", .{hm});
             if (eql(u8, key, "allow")) break :blk std.fmt.allocPrint(a, "allowed for this {s} for 30 days, {s}", .{ whatRan(it), hm });
             if (eql(u8, key, "again")) break :blk std.fmt.allocPrint(a, "sent again, {s}", .{hm});
+            if (eql(u8, key, "resume")) break :blk std.fmt.allocPrint(a, "resumed, {s}", .{hm});
+            if (eql(u8, key, "remove")) break :blk std.fmt.allocPrint(a, "removed, {s}", .{hm});
             break :blk std.fmt.allocPrint(a, "answered: {s}, {s}", .{ it.choiceLabel(key) orelse key, hm });
         },
     };

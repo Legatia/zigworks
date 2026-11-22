@@ -860,6 +860,8 @@ fn runCmd(app: *App) !Exit {
             complain("telegram: getMe failed ({s}); topics are taken to be on", .{@errorName(e)});
     }
     try c.startWorker();
+    // triggers are polled where harness runs
+    c.poller_on = true;
     const tick_thread = try std.Thread.spawn(.{}, ticker, .{c});
     defer tick_thread.join();
     defer c.quitting.store(true, .release);
@@ -999,6 +1001,7 @@ fn chatCmd(app: *App) !Exit {
     var tc: TermChan = .{ .io = app.io };
     c.attach(tc.channel());
     try c.startWorker();
+    c.poller_on = true;
     const tick_thread = try std.Thread.spawn(.{}, ticker, .{c});
     defer tick_thread.join();
     defer c.quitting.store(true, .release);
