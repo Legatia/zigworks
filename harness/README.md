@@ -87,6 +87,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `memory/` | one file per memory item |
 | `workspace/` | where the agent's files and commands live |
 | `snapshots/` | snapshots of folders: each content once, a file per snapshot |
+| `apps/` | apps shown in your browser, a folder each with `app.ini` (see Apps); what was approved of each is in `state/apps/` |
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
 | `state/` | grants, seen feed items, owner, the conversations (`conversations`), status, lock, approval numbers, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `env/NAME` (each environment's own: a sandbox's home) |
@@ -474,6 +475,45 @@ For now the agent's commands still run on host: environments are read,
 checked and can be tried, and the gate already takes `shell@NAME` rules,
 but runs don't pick an environment yet.
 
+## Apps
+
+An app is a folder of web files in `apps/NAME/` with an `app.ini`, which
+harness serves to your browser:
+
+```ini
+[app]
+name = reading-list      ; its folder: a-z, 0-9 and -
+title = Reading list
+reads = files            ; any of memory, inbox, log, files
+files = reading/*        ; workspace paths it may read and act on
+acts = write_file, fetch ; what it may ask harness to do
+```
+
+With `[apps] on = on` in config.ini, `harness run` and `harness chat`
+start the app server on 127.0.0.1 and print its link, made new at each
+start (`port = 0` takes a free port; a fixed one lets you reach it over
+`ssh -L`). The page lists the apps; each opens in a frame of harness's
+page that keeps it away from that page, other apps, cookies and storage,
+and whose rules let it load nothing from anywhere but harness. Requests
+under another name for this machine (localhost) or from another site
+are refused. An app's files may be HTML, scripts, styles, JSON, images,
+fonts, text and Markdown, 200 files and 4 MiB at most; an app never names
+another host (copy a library into it instead).
+
+An app is served only as approved: `/app approve NAME` (or `harness app
+approve NAME`) checks its folder and approves it as its files are now,
+as a new version when they changed. A file changed afterwards, by a
+command or by hand, stops it being served until it is approved again.
+`/apps` lists the apps, whether each is served and why not, with links
+while the server runs; `/app rm NAME` removes one with its data. Inbox,
+log and files are built in.
+
+Not here yet: the API through which apps read memory, the inbox, the log
+and files and ask harness to act (each through the gate), the agent
+building apps, versions and forks, and the bar for questions above an
+app. Until then apps can show only their own files, and the built-ins
+say they have nothing to read; so `[apps]` is off by default.
+
 ## Helpers
 
 `delegate` hands up to 8 tasks to helpers that run at the same time:
@@ -757,13 +797,13 @@ paused until `/task resume NAME`. `/tasks`,
 [LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/envs`, `/env
 check|rm NAME`, `/dryrun on|off`,
 `/reload`, `/conversations`, `/conversation new|rename|rm|add`,
-`/session [N]`, `/help`. `/new` and `/private` act on the conversation
+`/session [N]`, `/apps`, `/app approve|rm NAME`, `/help`. `/new` and `/private` act on the conversation
 they are sent in; `/stop`, `/dryrun` and `/memory auto` on everything.
 
 CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `memory [list|pin|unpin|forget ID]`,
-`snapshot list|take|changes|restore`, `env list|check|rm`,
-`log verify|tail|runs|session`,
+`snapshot list|take|changes|restore`, `env list|check|rm|key`,
+`log verify|tail|runs|session`, `app list|approve|rm`,
 `health`, `version`. `--home DIR` may come anywhere on the line;
 arguments a command does not take are refused. `health` exits 0 only
 while `harness run` holds the folder and has ticked in the last 90 s.

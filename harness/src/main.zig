@@ -48,6 +48,9 @@ const usage =
     \\  log tail [N]               print the last N log lines (default 20)
     \\  log runs [N]               a line per run, the last N (default 20)
     \\  log session RID [--json]   a run and its helpers, step by step
+    \\  app list | approve NAME | rm NAME
+    \\                             the apps in apps/: list them, serve one as its files
+    \\                             are now, remove one with its data
     \\  health                     exit 0 if `harness run` is running and recent
     \\  version | help
     \\
@@ -191,15 +194,16 @@ const App = struct {
         memory,
         snapshot,
         env,
+        app,
 
         /// Whether it needs the MCP servers and the browser: a brief is
-        /// one model call without tools, memory, snapshot and env commands
+        /// one model call without tools, memory, snapshot, env and app commands
         /// make none, and starting servers for them costs up to 20 s and
         /// runs their code.
         fn usesTools(r: Role) bool {
             return switch (r) {
                 .run, .chat, .task => true,
-                .brief, .memory, .snapshot, .env => false,
+                .brief, .memory, .snapshot, .env, .app => false,
             };
         }
     };
@@ -235,6 +239,10 @@ const App = struct {
         c.watcher = std.Thread.spawn(.{}, watchSignals, .{c}) catch null;
         if (c.watcher != null) watching.store(true, .release);
         if (role.usesTools()) c.startExtras();
+        // apps in the browser, for as long as this start runs
+        if ((role == .run or role == .chat) and c.cfg.apps.on) {
+            if (c.startApps(app.arena)) |url| complain("Apps: {s}   (new each start)", .{url}) else |e| complain("note: the app server didn't start: {s}", .{@errorName(e)});
+        }
         var warns = std.mem.tokenizeScalar(u8, c.mcp_warn, '\n');
         while (warns.next()) |w| complain("note: mcp.ini: {s}", .{w});
         if (c.money_ledger.trouble()) |why| complain("note: {s}; money calls are refused until it is fixed", .{why});
@@ -279,7 +287,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "env" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "env", "app" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -301,6 +309,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "snapshot")) return snapshotCmd(app, rest);
     if (eql(cmd, "env")) return envCmd(app, rest);
     if (eql(cmd, "log")) return logCmd(app, rest);
+    if (eql(cmd, "app")) return appCmd(app, rest);
     if (eql(cmd, "health")) return healthCmd(app);
     complain("unknown command {s}; see harness help", .{cmd});
     return .usage;
@@ -1119,6 +1128,27 @@ fn envKeyCmd(app: *App, name: []const u8) !Exit {
     return .ok;
 }
 
+const app_usage = "usage: harness app list | app approve NAME | app rm NAME";
+
+fn appArgsOk(rest: []const []const u8) bool {
+    if (rest.len == 1) return eql(rest[0], "list");
+    if (rest.len == 2) return eql(rest[0], "approve") or eql(rest[0], "rm");
+    return false;
+}
+
+/// `harness app ...`: the chat's /apps and /app commands.
+fn appCmd(app: *App, args: []const []const u8) !Exit {
+    if (!appArgsOk(args)) {
+        complain(app_usage, .{});
+        return .usage;
+    }
+    const text = if (eql(args[0], "list")) "/apps" else try std.fmt.allocPrint(app.arena, "/app {s} {s}", .{ args[0], args[1] });
+    const c = try app.open(.app);
+    defer c.close();
+    try outPrint(app.io, "{s}\n", .{try c.command(app.arena, text)});
+    return .ok;
+}
+
 fn logCmd(app: *App, args: []const []const u8) !Exit {
     const p = try core_mod.Paths.init(app.arena, app.home);
     if (args.len >= 1 and eql(args[0], "verify")) {
@@ -1478,6 +1508,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
         }
         return "usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]";
     }
+    if (eql(cmd, "app")) return if (appArgsOk(rest)) null else app_usage;
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
     if (eql(cmd, "env")) return if (envArgsOk(rest)) null else env_usage;
@@ -1845,6 +1876,8 @@ test {
     _ = @import("web.zig");
     _ = @import("url.zig");
     _ = @import("proc.zig");
+    _ = @import("apps.zig");
+    _ = @import("appserver.zig");
 }
 
 test "a_line_of_ctrl_d_leaves_the_chat_in_a_windows_console" {

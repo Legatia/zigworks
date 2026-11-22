@@ -29,6 +29,8 @@ const folders_mod = @import("folders.zig");
 const environments_mod = @import("environments.zig");
 const sandbox = @import("sandbox.zig");
 const remote = @import("remote.zig");
+const apps_mod = @import("apps.zig");
+const appserver = @import("appserver.zig");
 const snapshots_mod = @import("snapshots.zig");
 const Io = std.Io;
 
@@ -379,6 +381,8 @@ pub const Core = struct {
     written: agent.Written,
     /// Snapshots of folders (snapshots/).
     snaps: snapshots_mod.Store,
+    /// The app server, when `harness run` or `chat` started it ([apps] on).
+    app_server: ?*appserver.Server = null,
 
     chan: ?Channel = null,
     owner: ?i64 = null,
@@ -546,6 +550,7 @@ pub const Core = struct {
         c.seen_mutex = .init;
         c.settings_mutex = .init;
         c.chan = null;
+        c.app_server = null;
         c.owner = readOwner(io, c.paths.owner);
         c.switches = .{};
         c.switches.auto_recall.store(c.cfg.memory.auto, .release);
@@ -624,6 +629,8 @@ pub const Core = struct {
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
+        if (c.app_server) |s| s.stop();
+        c.app_server = null;
         for (c.queue.items) |q| q.deinit(c.gpa);
         c.queue.deinit(c.gpa);
         c.run_flags.deinit(c.gpa);
@@ -1698,6 +1705,21 @@ pub const Core = struct {
         c.findBrowser();
         c.stopMcp();
         c.startMcp();
+    }
+
+    /// Starts the app server ([apps] on); returns the link to its page,
+    /// for this start only.
+    pub fn startApps(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        if (c.cfg.apps.port > std.math.maxInt(u16)) return error.BadPort;
+        const s = try appserver.Server.start(c.gpa, c.io, .{
+            .apps_dir = try std.fs.path.join(a, &.{ c.paths.home, "apps" }),
+            .state_dir = try std.fs.path.join(a, &.{ c.paths.state, "apps" }),
+            .port = @intCast(c.cfg.apps.port),
+            .log = &c.log,
+            .version = @import("build_options").version,
+        });
+        c.app_server = s;
+        return s.shellUrl(a);
     }
 
     fn findBrowser(c: *Core) void {
@@ -2927,6 +2949,9 @@ pub const Core = struct {
         \\/conversation rename OLD NEW, /conversation rm NAME
         \\/conversation add NAME: sent in a group, the agent may post there
         \\/session [N]: the steps behind the last answer here (N runs back)
+        \\/apps: the apps, with their links while the app server runs
+        \\/app approve NAME: serve an app as its files are now
+        \\/app rm NAME: remove an app, its data and its versions
     ;
 
     /// A command sent in `main` (or from the command line).
@@ -3059,6 +3084,8 @@ pub const Core = struct {
         if (eql(u8, cmd, "/conversations")) return c.conversationsText(a);
         if (eql(u8, cmd, "/session")) return c.sessionText(a, conv, rest);
         if (eql(u8, cmd, "/conversation")) return c.conversationCommand(a, conv, rest);
+        if (eql(u8, cmd, "/apps")) return c.appsText(a);
+        if (eql(u8, cmd, "/app")) return c.appCommand(a, rest);
         if (eql(u8, cmd, "/folders")) return folders_mod.render(c.folder_list, a);
         if (eql(u8, cmd, "/access")) return c.accessCommand(a, rest);
         if (eql(u8, cmd, "/snapshots")) return c.snapshotsCommand(a, rest);
@@ -3481,6 +3508,80 @@ pub const Core = struct {
         const still = if (c.env_list.find(name) != null) " It is still in environments.ini: take its section out, then /reload." else "";
         if (is_remote) return std.fmt.allocPrint(a, "Removed {s}: its key and its kept host key (take the key's line out of the remote's authorized_keys too).{s}", .{ name, still });
         return std.fmt.allocPrint(a, "Removed {s}: its home, {d} snapshot{s}{s}.{s}", .{ name, dropped, plural, access, still });
+    }
+
+    /// `/apps`: the built-ins and the apps in `apps/`, each with whether it
+    /// is served (and its link while the server runs) or why not.
+    fn appsText(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        const apps_dir = try std.fs.path.join(a, &.{ c.paths.home, "apps" });
+        const state_dir = try std.fs.path.join(a, &.{ c.paths.state, "apps" });
+        const base = if (c.app_server) |s| try s.shellUrl(a) else "";
+        var out: std.ArrayList(u8) = .empty;
+        for (appserver.builtins) |b| try out.print(a, "{s}: built in{s}{s}\n", .{ b.name, if (base.len > 0) " " else "", if (base.len > 0) try std.fmt.allocPrint(a, "{s}{s}", .{ base, b.name }) else "" });
+        var names: std.ArrayList([]const u8) = .empty;
+        if (Io.Dir.cwd().openDir(c.io, apps_dir, .{ .iterate = true })) |d_const| {
+            var d = d_const;
+            defer d.close(c.io);
+            var it = d.iterate();
+            while (try it.next(c.io)) |e| if (e.kind == .directory) try names.append(a, try a.dupe(u8, e.name));
+        } else |_| {}
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        for (names.items) |name| {
+            if (!apps_mod.validName(name)) {
+                try out.print(a, "{s}: not an app's name (a-z, 0-9 and -)\n", .{name});
+                continue;
+            }
+            const dir = try std.fs.path.join(a, &.{ apps_dir, name });
+            const f = apps_mod.checkFolder(c.io, a, dir, name) catch |e| {
+                try out.print(a, "{s}: not served: {s}\n", .{ name, apps_mod.folderReason(e) });
+                continue;
+            };
+            const ap = try apps_mod.readApproved(c.io, a, state_dir, name);
+            if (ap == null) {
+                try out.print(a, "{s}: not approved yet: /app approve {s}\n", .{ name, name });
+            } else if (!std.mem.eql(u8, &ap.?.digest, &f.digest)) {
+                try out.print(a, "{s}: v{d}, changed outside harness: /app approve {s} serves it as it is now\n", .{ name, ap.?.version, name });
+            } else {
+                try out.print(a, "{s}: v{d}{s}{s}\n", .{ name, ap.?.version, if (base.len > 0) " " else "", if (base.len > 0) try std.fmt.allocPrint(a, "{s}{s}", .{ base, name }) else "" });
+            }
+        }
+        if (c.app_server == null) try out.appendSlice(a, if (c.cfg.apps.on) "The app server runs with harness run and harness chat." else "The app server is off ([apps] on = on in config.ini, for harness run and harness chat).");
+        return std.mem.trimEnd(u8, out.items, "\n");
+    }
+
+    fn appCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        const use = "Use /app approve NAME or /app rm NAME.";
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const op = words.next() orelse return use;
+        const name = words.next() orelse return use;
+        if (words.next() != null) return use;
+        for (appserver.builtins) |b| if (std.mem.eql(u8, b.name, name)) return std.fmt.allocPrint(a, "{s} is built in: it changes with harness, and isn't yours to approve or remove.", .{name});
+        if (!apps_mod.validName(name)) return "An app's name is a-z, 0-9 and -.";
+        const apps_dir = try std.fs.path.join(a, &.{ c.paths.home, "apps" });
+        const state_dir = try std.fs.path.join(a, &.{ c.paths.state, "apps" });
+        if (std.mem.eql(u8, op, "approve")) {
+            const version = apps_mod.approve(c.io, a, apps_dir, state_dir, name, "owner", c.now()) catch |e| return switch (e) {
+                error.NoManifest, error.BadManifest, error.NameNotFolder, error.NoIndex, error.BadFileName, error.SymbolicLink, error.TooManyFiles, error.TooBig, error.FileTooBig, error.CaseClash => std.fmt.allocPrint(a, "Not approved: {s}.", .{apps_mod.folderReason(e)}),
+                else => std.fmt.allocPrint(a, "Not approved: {s}.", .{@errorName(e)}),
+            };
+            try c.log.write(.app, false, .{ .event = "approved", .name = name, .version = version, .by = "owner" });
+            return std.fmt.allocPrint(a, "Approved {s} as v{d}: it is served as its files are now.", .{ name, version });
+        }
+        if (std.mem.eql(u8, op, "rm")) {
+            const dir = try std.fs.path.join(a, &.{ apps_dir, name });
+            const sdir = try std.fs.path.join(a, &.{ state_dir, name });
+            const had = if (Io.Dir.cwd().statFile(c.io, dir, .{})) |_| true else |_| false;
+            Io.Dir.cwd().deleteTree(c.io, dir) catch |e| return std.fmt.allocPrint(a, "Not removed: {s}.", .{@errorName(e)});
+            Io.Dir.cwd().deleteTree(c.io, sdir) catch {};
+            if (!had) return std.fmt.allocPrint(a, "No app {s}.", .{name});
+            try c.log.write(.app, false, .{ .event = "removed", .name = name });
+            return std.fmt.allocPrint(a, "Removed {s}: its files, its data and its versions.", .{name});
+        }
+        return use;
     }
 
     /// One line per login: what is stored for it (never the values).
@@ -6639,4 +6740,33 @@ test "a_secret_typed_into_a_snapshots_label_is_masked" {
     const snap = try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ f.core.paths.snapshots, "folders", &key, "1" }), a, .unlimited);
     try t.expect(std.mem.indexOf(u8, snap, "og-key-for-tests") == null);
     try t.expect(std.mem.indexOf(u8, try logText(&f), "og-key-for-tests") == null);
+}
+
+test "apps_are_listed_approved_and_removed_from_the_chat" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const dir = try std.fs.path.join(a, &.{ f.core.paths.home, "apps", "notes" });
+    try Io.Dir.cwd().createDirPath(t.io, dir);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "app.ini" }), .data = "[app]\nname = notes\n" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "index.html" }), .data = "<p>notes</p>" });
+    // the built-ins, and one waiting for the owner's approval
+    const before = try f.core.command(a, "/apps");
+    try t.expect(std.mem.indexOf(u8, before, "inbox: built in") != null);
+    try t.expect(std.mem.indexOf(u8, before, "notes: not approved yet: /app approve notes") != null);
+    try t.expect(std.mem.indexOf(u8, before, "The app server is off") != null);
+    try t.expectEqualStrings("Approved notes as v1: it is served as its files are now.", try f.core.command(a, "/app approve notes"));
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/apps"), "notes: v1") != null);
+    // changed by hand or by a command: said, and served again only once approved
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "index.html" }), .data = "<p>changed</p>" });
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/apps"), "notes: v1, changed outside harness") != null);
+    try t.expectEqualStrings("Approved notes as v2: it is served as its files are now.", try f.core.command(a, "/app approve notes"));
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, "/app approve inbox"), "inbox is built in"));
+    try t.expectEqualStrings("Removed notes: its files, its data and its versions.", try f.core.command(a, "/app rm notes"));
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, dir, .{}));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"approved\"") != null);
+    // the server, when on: its links in /apps
+    _ = try f.core.startApps(a);
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/apps"), "inbox: built in http://127.0.0.1:") != null);
 }
