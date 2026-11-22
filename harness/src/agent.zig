@@ -1116,7 +1116,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         w.env.deadline_s = r.deadline_s;
         const out = try w.run(a, input_json);
         // the model's input, placeholders and all: never a value
-        try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text });
+        try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
         return out;
     }
     const arg = switch (tool) {
@@ -1231,7 +1231,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         },
         else => try tools.run(env, a, tool, input_json),
     };
-    try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text });
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
     return out;
 }
 

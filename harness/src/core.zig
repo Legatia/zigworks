@@ -24,6 +24,7 @@ const masks = @import("masks.zig");
 const who_mod = @import("who.zig");
 const conversations = @import("conversations.zig");
 const jv = @import("jv.zig");
+const session = @import("session.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -2858,6 +2859,7 @@ pub const Core = struct {
         \\/conversation new NAME: open a topic for a subject
         \\/conversation rename OLD NEW, /conversation rm NAME
         \\/conversation add NAME: sent in a group, the agent may post there
+        \\/session [N]: the steps behind the last answer here (N runs back)
     ;
 
     /// A command sent in `main` (or from the command line).
@@ -2983,6 +2985,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/task")) return c.taskCommand(a, rest);
         if (eql(u8, cmd, "/logins")) return c.loginsText(a);
         if (eql(u8, cmd, "/conversations")) return c.conversationsText(a);
+        if (eql(u8, cmd, "/session")) return c.sessionText(a, conv, rest);
         if (eql(u8, cmd, "/conversation")) return c.conversationCommand(a, conv, rest);
         if (eql(u8, cmd, "/skills")) {
             const list = try skills.list(a, c.io, c.paths.skills);
@@ -3003,6 +3006,16 @@ pub const Core = struct {
             return "Use /skills or /skill rm NAME.";
         }
         return "Unknown command. Send /help for the list.";
+    }
+
+    /// `/session [N]`: the steps behind the last answer in `conv` (N runs
+    /// back, up to 20), from the log's last 4 MB, in one message.
+    fn sessionText(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        const back = if (rest.len == 0) 1 else std.fmt.parseInt(usize, rest, 10) catch return "Use /session, or /session N for N runs back (up to 20).";
+        if (back == 0 or back > 20) return "Use /session N with N from 1 to 20.";
+        const text = session.tail(c.io, a, c.paths.log, 4 << 20) catch |e| return std.fmt.allocPrint(a, "The log can't be read: {s}", .{@errorName(e)});
+        const rid = (try session.lastRunIn(a, text, conv, back)) orelse return "No run here in the log's last 4 MB.";
+        return (try session.render(a, text, rid, 3500)) orelse "No run here in the log's last 4 MB.";
     }
 
     /// A line per conversation: its name, where it is, private, last used.
@@ -4401,6 +4414,66 @@ test "a_quick_reply_counts_once_and_not_after_a_restart" {
     try f.e.script(4, model.textReply("ok"));
     f.core.chatTurn("ask the family");
     try t.expect(std.mem.indexOf(u8, try f.e.request(4), "refused: quick replies are only for conversations only you read") != null);
+}
+
+test "session_shows_the_last_run_here_and_only_labels_for_a_private_one" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
+    _ = try f.core.reload();
+    try addTopic(&f, "house-search", 5012);
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo found-it\"}"));
+    try f.e.script(2, model.textReply("Three flats."));
+    f.core.chatTurnIn("house-search", "find flats");
+    try f.core.handleTextIn("house-search", "/session");
+    try f.rec.waitIn("house-search", "Owner: find flats");
+    const w = f.rec.whereOf("Owner: find flats").?;
+    try t.expectEqual(5012, w.thread);
+    for ([_][]const u8{
+        ", by owner, in house-search, ",
+        "Model: 10 in, 3 out",
+        "shell echo found-it: allow (rule on line 1), ok, ",
+        "Posted to house-search: Three flats. (the reply, posted by harness)",
+        "Ended: answered in 2 steps",
+    }) |want| try t.expectEqual(1, f.rec.countIn("house-search", want));
+    // another conversation's session is its own
+    try f.core.handleText("/session");
+    try f.rec.waitIn("main", "No run here");
+    try f.core.handleTextIn("house-search", "/session 2");
+    try f.rec.waitIn("house-search", "No run here");
+    // a private conversation: labels, not what was said
+    try addTopic(&f, "diary", 5014);
+    try f.core.handleTextIn("diary", "/private on");
+    try f.e.script(3, model.toolReply("tu_2", "shell", "{\"command\":\"echo secret-diary\"}"));
+    try f.e.script(4, model.textReply("kept quiet"));
+    f.core.chatTurnIn("diary", "my secret plans");
+    try f.core.handleTextIn("diary", "/session");
+    try f.rec.waitIn("diary", ", by owner, in diary, ");
+    {
+        f.rec.mutex.lockUncancelable(t.io);
+        defer f.rec.mutex.unlock(t.io);
+        const shown = for (f.rec.lines.items) |l| {
+            if (std.mem.indexOf(u8, l, ", by owner, in diary, ") != null) break l;
+        } else unreachable;
+        try t.expect(std.mem.indexOf(u8, shown, "allow (rule on line 1)") != null);
+        try t.expect(std.mem.indexOf(u8, shown, "Owner: (private, 15 bytes)") != null);
+        for ([_][]const u8{ "secret-diary", "my secret plans", "kept quiet" }) |said| try t.expect(std.mem.indexOf(u8, shown, said) == null);
+    }
+    try t.expectEqual(0, f.rec.count("secret-diary"));
+    // a long run: one message, then where the rest is
+    f.core.cfg.limits.steps_per_turn = 40;
+    for (0..30) |i| try f.e.script(@intCast(5 + i), model.toolReply("tu_x", "shell", "{\"command\":\"echo a fairly long line of output to make the session long enough\"}"));
+    try f.e.script(35, model.textReply("done at last"));
+    f.core.chatTurnIn("house-search", "go on for a while");
+    try f.core.handleTextIn("house-search", "/session");
+    try f.rec.waitIn("house-search", " shows all");
+    f.rec.mutex.lockUncancelable(t.io);
+    defer f.rec.mutex.unlock(t.io);
+    for (f.rec.lines.items) |l| if (std.mem.endsWith(u8, l, " shows all")) {
+        try t.expect(l.len <= 3500);
+        try t.expect(std.mem.indexOf(u8, l, "harness log session ") != null);
+    };
 }
 
 test "a_bad_rules_line_names_its_section_or_environment" {

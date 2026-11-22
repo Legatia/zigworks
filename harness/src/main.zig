@@ -12,6 +12,7 @@ const util = @import("util.zig");
 const agent = @import("agent.zig");
 const logins = @import("logins.zig");
 const totp = @import("totp.zig");
+const session = @import("session.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -37,6 +38,8 @@ const usage =
     \\  memory [list|pin|unpin|forget ID]
     \\  log verify                 check the action log's chain
     \\  log tail [N]               print the last N log lines (default 20)
+    \\  log runs [N]               a line per run, the last N (default 20)
+    \\  log session RID [--json]   a run and its helpers, step by step
     \\  health                     exit 0 if `harness run` is running and recent
     \\  version | help
     \\
@@ -999,7 +1002,41 @@ fn logCmd(app: *App, args: []const []const u8) !Exit {
         for (lines.items[lines.items.len -| n ..]) |l| try outPrint(app.io, "{s}\n", .{l});
         return .ok;
     }
-    complain("usage: harness log verify | harness log tail [N]", .{});
+    if (args.len >= 1 and eql(args[0], "runs")) {
+        const n = if (args.len > 1) std.fmt.parseInt(usize, args[1], 10) catch 20 else 20;
+        const text = Io.Dir.cwd().readFileAlloc(app.io, p.log, app.arena, .limited(256 << 20)) catch |e| {
+            complain("can't read {s}: {s}", .{ p.log, @errorName(e) });
+            return .failed;
+        };
+        try outAll(app.io, try session.runsText(app.arena, text, n));
+        return .ok;
+    }
+    if (args.len >= 2 and eql(args[0], "session")) {
+        const rid = std.fmt.parseInt(u64, args[1], 10) catch {
+            complain("usage: harness log session RID [--json] (RID: a run's id, as harness log runs lists it)", .{});
+            return .usage;
+        };
+        const text = Io.Dir.cwd().readFileAlloc(app.io, p.log, app.arena, .limited(256 << 20)) catch |e| {
+            complain("can't read {s}: {s}", .{ p.log, @errorName(e) });
+            return .failed;
+        };
+        if (args.len == 3) {
+            const lines = try session.raw(app.arena, text, rid);
+            if (lines.len == 0) {
+                complain("no run {d} in {s}", .{ rid, p.log });
+                return .failed;
+            }
+            try outAll(app.io, lines);
+            return .ok;
+        }
+        const shown = (try session.render(app.arena, text, rid, 0)) orelse {
+            complain("no run {d} in {s}", .{ rid, p.log });
+            return .failed;
+        };
+        try outAll(app.io, shown);
+        return .ok;
+    }
+    complain("usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]", .{});
     return .usage;
 }
 
@@ -1226,11 +1263,15 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     }
     if (eql(cmd, "log")) {
         if (rest.len == 1 and eql(rest[0], "verify")) return null;
-        if (rest.len >= 1 and eql(rest[0], "tail")) {
+        if (rest.len >= 1 and (eql(rest[0], "tail") or eql(rest[0], "runs"))) {
             if (rest.len == 1) return null;
             if (rest.len == 2 and (std.fmt.parseInt(usize, rest[1], 10) catch null) != null) return null;
         }
-        return "usage: harness log verify | harness log tail [N]";
+        if (rest.len >= 2 and eql(rest[0], "session") and (std.fmt.parseInt(u64, rest[1], 10) catch null) != null) {
+            if (rest.len == 2) return null;
+            if (rest.len == 3 and eql(rest[2], "--json")) return null;
+        }
+        return "usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]";
     }
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "login")) {
@@ -1578,6 +1619,7 @@ test {
     _ = @import("jv.zig");
     _ = @import("who.zig");
     _ = @import("conversations.zig");
+    _ = @import("session.zig");
     _ = @import("sock.zig");
     _ = @import("store.zig");
     _ = @import("scrub.zig");
@@ -1590,6 +1632,81 @@ test {
     _ = @import("cdp.zig");
     _ = @import("web.zig");
     _ = @import("url.zig");
+}
+
+test "log_runs_and_log_session_read_runs_back" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const path = try std.fs.path.join(a, &.{ dir, "actions.jsonl" });
+    var l = try log_mod.Log.open(t.allocator, t.io, path);
+    const hs = "house-search";
+    const rid = try l.writeRun(.turn, false, .{ .run = "chat", .by = "owner", .agent = "main", .conversation = hs }, .{ .text = "find flats" });
+    _ = try l.writeRun(.model, false, .{ .rid = rid, .run = "chat", .conversation = hs }, .{ .result = "ok", .input_tokens = 1520, .output_tokens = 85 });
+    _ = try l.writeRun(.gate, false, .{ .rid = rid, .run = "chat", .agent = "main", .conversation = hs }, .{ .tool = "shell", .decision = "allow", .why = "rule on line 1", .arg = "ls -l" });
+    _ = try l.writeRun(.tool, false, .{ .rid = rid, .run = "chat", .agent = "main", .conversation = hs }, .{ .tool = "shell", .arg = "ls -l", .is_error = false, .output = "a\nb", .bytes = 3 });
+    _ = try l.writeRun(.gate, false, .{ .rid = rid, .run = "chat", .agent = "main", .conversation = hs }, .{ .tool = "fetch", .decision = "deny", .why = "denied by the owner", .arg = "https://x.example/" });
+    const h = try l.writeRun(.turn, false, .{ .run = "chat/h1", .by = "owner", .agent = "helper", .parent = rid, .conversation = hs }, .{ .text = "look at site a" });
+    _ = try l.writeRun(.model, false, .{ .rid = h, .run = "chat/h1", .conversation = hs }, .{ .result = "ok", .input_tokens = 7, .output_tokens = 3 });
+    _ = try l.writeRun(.turn, false, .{ .rid = h, .run = "chat/h1", .conversation = hs }, .{ .answer = "site a: 2 flats", .steps = 1, .ended_by = @as(?[]const u8, null) });
+    _ = try l.writeRun(.send, false, .{ .rid = rid, .run = "chat", .conversation = hs }, .{ .to = hs, .event = "sent", .bytes = 18, .text = "Three flats match.", .final = true, .implicit = false, .delivered = true });
+    _ = try l.writeRun(.turn, false, .{ .rid = rid, .run = "chat", .conversation = hs }, .{ .answer = "", .steps = 2, .ended_by = @as(?[]const u8, null) });
+    try l.write(.config, false, .{ .event = "not a run's" });
+    const task = try l.writeRun(.turn, false, .{ .run = "task check", .by = "schedule:check", .agent = "main", .conversation = "main" }, .{ .text = "Check the price." });
+    _ = try l.writeRun(.turn, false, .{ .rid = task, .run = "task check", .conversation = "main" }, .{ .answer = "", .steps = 20, .ended_by = "Step limit reached for this turn." });
+    l.close();
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
+    // harness log runs: a line per run
+    const runs = try session.runsText(a, text, 20);
+    for ([_][]const u8{
+        try std.fmt.allocPrint(a, "{d}  ", .{rid}),
+        "  chat  by owner  in house-search  2 steps  answered\n",
+        "  chat/h1  by owner  in house-search  1 step  answered\n",
+        "  task check  by schedule:check  in main  20 steps  Step limit reached for this turn.\n",
+    }) |want| {
+        if (std.mem.indexOf(u8, runs, want) == null) std.debug.print("missing {s} in:\n{s}\n", .{ want, runs });
+        try t.expect(std.mem.indexOf(u8, runs, want) != null);
+    }
+    try t.expectEqual(1, std.mem.count(u8, try session.runsText(a, text, 1), "\n"));
+    // harness log session RID: the run and its helpers, readable
+    const shown = (try session.render(a, text, rid, 0)).?;
+    for ([_][]const u8{
+        "Owner: find flats\n",
+        "Model: 1520 in, 85 out\n",
+        "shell ls -l: allow (rule on line 1), ok, 3 bytes\n",
+        "fetch https://x.example/: deny (denied by the owner)\n",
+        "Helper chat/h1: look at site a (1 model calls, 0 tool calls; answered)\n",
+        "Posted to house-search: Three flats match. (final)\n",
+        "Ended: answered in 2 steps\n",
+    }) |want| {
+        if (std.mem.indexOf(u8, shown, want) == null) std.debug.print("missing {s} in:\n{s}\n", .{ want, shown });
+        try t.expect(std.mem.indexOf(u8, shown, want) != null);
+    }
+    try t.expect(std.mem.indexOf(u8, shown, "Check the price") == null);
+    // cut to a size: whole lines, then where the rest is
+    const short = (try session.render(a, text, rid, 120)).?;
+    try t.expect(short.len <= 120);
+    try t.expect(std.mem.endsWith(u8, short, try std.fmt.allocPrint(a, "harness log session {d} shows all", .{rid})));
+    // --json: the lines as they are, the helper's too
+    const raw = try session.raw(a, text, rid);
+    try t.expectEqual(10, std.mem.count(u8, raw, "\n"));
+    try t.expect(std.mem.indexOf(u8, raw, "not a run's") == null);
+    try t.expectEqual(null, try session.render(a, text, 9999, 0));
+    // the session view's choice of run
+    try t.expectEqual(rid, (try session.lastRunIn(a, text, "house-search", 1)).?);
+    try t.expectEqual(task, (try session.lastRunIn(a, text, "main", 1)).?);
+    try t.expectEqual(null, try session.lastRunIn(a, text, "house-search", 2));
+    // the arguments
+    try t.expect(badArgs(&.{ "log", "runs" }) == null);
+    try t.expect(badArgs(&.{ "log", "runs", "5" }) == null);
+    try t.expect(badArgs(&.{ "log", "session", "12" }) == null);
+    try t.expect(badArgs(&.{ "log", "session", "12", "--json" }) == null);
+    try t.expect(badArgs(&.{ "log", "session" }) != null);
+    try t.expect(badArgs(&.{ "log", "session", "x" }) != null);
+    try t.expect(badArgs(&.{ "log", "runs", "x" }) != null);
 }
 
 test "the_terminal_offers_only_the_answers_the_question_has" {
