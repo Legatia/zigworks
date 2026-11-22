@@ -1510,6 +1510,7 @@ test {
     _ = @import("jv.zig");
     _ = @import("who.zig");
     _ = @import("folders.zig");
+    _ = @import("snapshots.zig");
     _ = @import("sock.zig");
     _ = @import("store.zig");
     _ = @import("scrub.zig");
