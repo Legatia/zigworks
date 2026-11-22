@@ -47,19 +47,30 @@ fn unquote(arena: std.mem.Allocator, v: []const u8) ![]const u8 {
     return out.items;
 }
 
-/// Frontmatter between a first `---` line and the next `---` line. Unknown
-/// keys, lists and nested values are ignored.
-fn parse(arena: std.mem.Allocator, text: []const u8) !Parsed {
+/// One line of a header: `key: value` (a block value `>` or `|` joined
+/// with spaces, quotes taken off a one-line value), a nested (indented)
+/// line, or a line that is neither (`key` "").
+pub const Field = struct { key: []const u8, value: []const u8, line: usize, nested: bool = false };
+
+/// A file's header and the body after it.
+pub const Header = struct { fields: []const Field, body: []const u8 };
+
+/// The header between a first `---` line and the next `---` line, each
+/// line with its number; `#` lines are comments. error.NoFrontmatter when
+/// there is none, or it is not closed. Skills and agent definitions read
+/// their headers so.
+pub fn readHeader(arena: std.mem.Allocator, text: []const u8) !Header {
     var lines = std.mem.splitScalar(u8, text, '\n');
     const first = trimLine(lines.next() orelse return error.NoFrontmatter);
     // a UTF-8 BOM before the first fence is tolerated
     if (!std.mem.eql(u8, std.mem.trimStart(u8, first, "\xEF\xBB\xBF"), "---")) return error.NoFrontmatter;
-    var name: ?[]const u8 = null;
-    var desc: ?[]const u8 = null;
+    var fields: std.ArrayList(Field) = .empty;
+    var n: usize = 1;
     var closed = false;
-    var pending: ?[]const u8 = null; // key whose block value is being collected
+    var pending: ?usize = null; // the field whose block value is being collected
     var block: std.ArrayList(u8) = .empty;
     while (lines.next()) |raw| {
+        n += 1;
         const line = trimLine(raw);
         const indented = line.len > 0 and (line[0] == ' ' or line[0] == '\t');
         if (pending != null and (indented or line.len == 0)) {
@@ -70,9 +81,8 @@ fn parse(arena: std.mem.Allocator, text: []const u8) !Parsed {
             }
             continue;
         }
-        if (pending) |k| {
-            if (std.mem.eql(u8, k, "description")) desc = block.items;
-            if (std.mem.eql(u8, k, "name")) name = block.items;
+        if (pending) |i| {
+            fields.items[i].value = block.items;
             pending = null;
             block = .empty;
         }
@@ -80,24 +90,38 @@ fn parse(arena: std.mem.Allocator, text: []const u8) !Parsed {
             closed = true;
             break;
         }
-        if (indented) continue; // nested value of an ignored key
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (line.len == 0 or line[0] == '#') continue;
+        if (indented) {
+            try fields.append(arena, .{ .key = "", .value = std.mem.trim(u8, line, " \t"), .line = n, .nested = true });
+            continue;
+        }
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse {
+            try fields.append(arena, .{ .key = "", .value = line, .line = n });
+            continue;
+        };
         const key = std.mem.trim(u8, line[0..colon], " \t");
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        const is_name = std.mem.eql(u8, key, "name");
-        const is_desc = std.mem.eql(u8, key, "description");
-        if (!is_name and !is_desc) continue;
         if (value.len > 0 and (value[0] == '>' or value[0] == '|')) {
-            pending = key;
-        } else if (is_name) {
-            name = try unquote(arena, value);
-        } else {
-            desc = try unquote(arena, value);
-        }
+            try fields.append(arena, .{ .key = key, .value = "", .line = n });
+            pending = fields.items.len - 1;
+        } else try fields.append(arena, .{ .key = key, .value = try unquote(arena, value), .line = n });
     }
     if (!closed) return error.NoFrontmatter;
-    const body = lines.rest();
-    return .{ .name = name orelse return error.NoFrontmatter, .description = desc orelse return error.NoFrontmatter, .body = body };
+    return .{ .fields = fields.items, .body = lines.rest() };
+}
+
+/// Frontmatter between a first `---` line and the next `---` line. Unknown
+/// keys, lists and nested values are ignored.
+fn parse(arena: std.mem.Allocator, text: []const u8) !Parsed {
+    const h = try readHeader(arena, text);
+    var name: ?[]const u8 = null;
+    var desc: ?[]const u8 = null;
+    for (h.fields) |f| {
+        if (f.nested) continue;
+        if (std.mem.eql(u8, f.key, "name")) name = f.value;
+        if (std.mem.eql(u8, f.key, "description")) desc = f.value;
+    }
+    return .{ .name = name orelse return error.NoFrontmatter, .description = desc orelse return error.NoFrontmatter, .body = h.body };
 }
 
 fn inside(root: []const u8, p: []const u8) bool {

@@ -39,6 +39,9 @@ const usage =
     \\  memory [list|pin|unpin|forget ID]
     \\  snapshot list FOLDER | take FOLDER [LABEL] | changes FOLDER ID | restore FOLDER ID
     \\                             a folder's snapshots, one now, what changed, put it back
+    \\  agent list | show NAME | rm NAME
+    \\                             the agent definitions (agents/); rm keeps
+    \\                             the file in state/agents/NAME/versions/
     \\  log verify                 check the action log's chain
     \\  log tail [N]               print the last N log lines (default 20)
     \\  log runs [N]               a line per run, the last N (default 20)
@@ -185,15 +188,16 @@ const App = struct {
         task,
         memory,
         snapshot,
+        agent,
 
         /// Whether it needs the MCP servers and the browser: a brief is
-        /// one model call without tools, memory and snapshot commands make
-        /// none, and starting servers for them costs up to 20 s and runs
-        /// their code.
+        /// one model call without tools, memory, snapshot and agent
+        /// commands make none, and starting servers for them costs up to
+        /// 20 s and runs their code.
         fn usesTools(r: Role) bool {
             return switch (r) {
                 .run, .chat, .task => true,
-                .brief, .memory, .snapshot => false,
+                .brief, .memory, .snapshot, .agent => false,
             };
         }
     };
@@ -272,7 +276,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "agent" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -292,6 +296,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "task")) return taskCmd(app, rest);
     if (eql(cmd, "memory")) return memoryCmd(app, rest);
     if (eql(cmd, "snapshot")) return snapshotCmd(app, rest);
+    if (eql(cmd, "agent")) return agentCmd(app, rest);
     if (eql(cmd, "log")) return logCmd(app, rest);
     if (eql(cmd, "health")) return healthCmd(app);
     complain("unknown command {s}; see harness help", .{cmd});
@@ -1026,6 +1031,28 @@ fn snapshotCmd(app: *App, args: []const []const u8) !Exit {
     return .ok;
 }
 
+const agent_usage = "usage: harness agent list | agent show NAME | agent rm NAME";
+
+/// The chat command `harness agent ARGS` sends; null when the arguments
+/// are not one (in `a`).
+fn agentCommandText(a: std.mem.Allocator, args: []const []const u8) !?[]const u8 {
+    if (args.len == 1 and eql(args[0], "list")) return "/agents";
+    if (args.len != 2 or args[1].len == 0 or args[1][0] == '-') return null;
+    if (eql(args[0], "show") or eql(args[0], "rm")) return try std.fmt.allocPrint(a, "/agent {s} {s}", .{ args[0], args[1] });
+    return null;
+}
+
+fn agentCmd(app: *App, args: []const []const u8) !Exit {
+    const text = (try agentCommandText(app.arena, args)) orelse {
+        complain(agent_usage, .{});
+        return .usage;
+    };
+    const c = try app.open(.agent);
+    defer c.close();
+    try outPrint(app.io, "{s}\n", .{std.mem.trimEnd(u8, try c.command(app.arena, text), "\n")});
+    return .ok;
+}
+
 fn logCmd(app: *App, args: []const []const u8) !Exit {
     const p = try core_mod.Paths.init(app.arena, app.home);
     if (args.len >= 1 and eql(args[0], "verify")) {
@@ -1322,6 +1349,11 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
         }
         return "usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]";
     }
+    if (eql(cmd, "agent")) {
+        var buf: [256]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        return if ((agentCommandText(fba.allocator(), rest) catch null) == null) agent_usage else null;
+    }
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
     if (eql(cmd, "login")) {
@@ -1417,6 +1449,25 @@ test "extra_or_unknown_arguments_are_refused" {
         std.debug.print("  {s}\n", .{why});
         return error.TestUnexpectedResult;
     };
+}
+
+test "agent_takes_list_show_and_rm" {
+    for ([_][]const []const u8{ &.{"agent"}, &.{ "agent", "list", "x" }, &.{ "agent", "show" }, &.{ "agent", "rm" }, &.{ "agent", "rm", "a", "b" }, &.{ "agent", "drop", "a" }, &.{ "agent", "show", "-x" } }) |line| if (badArgs(line) == null) {
+        printLine("accepted:", line);
+        return error.TestUnexpectedResult;
+    };
+    for ([_][]const []const u8{ &.{ "agent", "list" }, &.{ "agent", "show", "researcher" }, &.{ "agent", "rm", "researcher" } }) |line| if (badArgs(line)) |why| {
+        printLine("refused:", line);
+        std.debug.print("  {s}\n", .{why});
+        return error.TestUnexpectedResult;
+    };
+    // the commands they send in chat
+    try t.expectEqualStrings("/agents", (try agentCommandText(t.allocator, &.{"list"})).?);
+    const show = (try agentCommandText(t.allocator, &.{ "show", "researcher" })).?;
+    defer t.allocator.free(show);
+    try t.expectEqualStrings("/agent show researcher", show);
+    try t.expect(!App.Role.agent.usesTools());
+    try t.expect(std.mem.indexOf(u8, usage, "agent list | show NAME | rm NAME") != null);
 }
 
 test "names_start_with_a_letter_or_digit" {
@@ -1677,6 +1728,7 @@ test {
     _ = @import("scrub.zig");
     _ = @import("masks.zig");
     _ = @import("skills.zig");
+    _ = @import("agents.zig");
     _ = @import("mcp.zig");
     _ = @import("page.zig");
     _ = @import("totp.zig");

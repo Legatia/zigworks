@@ -27,6 +27,7 @@ const jv = @import("jv.zig");
 const session = @import("session.zig");
 const folders_mod = @import("folders.zig");
 const snapshots_mod = @import("snapshots.zig");
+const agents = @import("agents.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -61,6 +62,12 @@ pub const Paths = struct {
     folders: []const u8,
     /// Snapshots of folders: the store.
     snapshots: []const u8,
+    /// The agent definitions, `agents/NAME.md`.
+    agents: []const u8,
+    /// Each definition's earlier versions, `state/agents/NAME/versions/`.
+    agents_state: []const u8,
+    /// Each skill's replaced files, `state/skills/NAME/versions/`.
+    skills_state: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -99,6 +106,9 @@ pub const Paths = struct {
             .conversations = try j(a, &.{ state, "conversations" }),
             .folders = try j(a, &.{ home, "folders.ini" }),
             .snapshots = try j(a, &.{ home, "snapshots" }),
+            .agents = try j(a, &.{ home, "agents" }),
+            .agents_state = try j(a, &.{ state, "agents" }),
+            .skills_state = try j(a, &.{ state, "skills" }),
         };
     }
 };
@@ -116,7 +126,17 @@ pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
             try d.setPermissions(io, .fromMode(0o700));
         }
     }
-    const files = [_][2][]const u8{ .{ p.config, config.defaults_ini }, .{ p.rules, config.rules_example }, .{ p.briefs, config.briefs_example }, .{ p.tasks, config.tasks_example }, .{ p.folders, folders_mod.example } };
+    // harness's own definitions, the owner's to edit; only they may change the folder
+    _ = try Io.Dir.cwd().createDirPathStatus(io, p.agents, agents.private_dir);
+    const files = [_][2][]const u8{
+        .{ p.config, config.defaults_ini },
+        .{ p.rules, config.rules_example },
+        .{ p.briefs, config.briefs_example },
+        .{ p.tasks, config.tasks_example },
+        .{ p.folders, folders_mod.example },
+        .{ try std.fs.path.join(a, &.{ p.agents, "main.md" }), agents.main_md },
+        .{ try std.fs.path.join(a, &.{ p.agents, "helper.md" }), agents.helper_md },
+    };
     for (files) |f| {
         var file = Io.Dir.cwd().createFile(io, f[0], .{ .exclusive = true, .permissions = util.private_file }) catch |e| switch (e) {
             error.PathAlreadyExists => continue,
@@ -171,9 +191,21 @@ pub const Incoming = struct {
     text: []const u8,
 };
 
-/// One conversation's context: its turns and where its memory writer is.
+/// A run's stop flag, its definition, and the flag of the run that
+/// delegated it.
+const RunFlag = struct {
+    flag: *std.atomic.Value(bool),
+    agent: []const u8,
+    parent: ?*std.atomic.Value(bool) = null,
+};
+
+/// One instance's context, a definition in a conversation: its turns
+/// and where its memory writer is.
 const Context = struct {
+    /// The conversation.
     name: []u8,
+    /// The definition.
+    agent: []u8,
     conv: agent.Conversation,
     /// The memory writer has read the turns before this one (counted from
     /// the start, dropped turns included).
@@ -187,19 +219,25 @@ const Context = struct {
     reset: std.atomic.Value(bool) = .init(false),
 };
 
-/// Contexts kept at once; a new one past these drops the least used.
+/// Contexts kept at once (instances: a definition in a conversation); a
+/// new one past these drops the least used.
 const max_contexts = 16;
 
+/// The longest definition name.
+const agents_name_max = 64;
+
 /// A message waiting for the chat worker, with the conversation it came
-/// from.
+/// from and the definition it is for (as it was when it came).
 const Queued = struct {
     conv: []u8,
+    agent: []u8,
     text: []u8,
     /// A quick reply: the post it answers, said in its turn's context.
     note: ?[]u8 = null,
 
     fn deinit(q: Queued, gpa: std.mem.Allocator) void {
         gpa.free(q.conv);
+        gpa.free(q.agent);
         gpa.free(q.text);
         if (q.note) |n| gpa.free(n);
     }
@@ -211,6 +249,8 @@ const Queued = struct {
 const Quick = struct {
     n: u32,
     conv: []u8,
+    /// The definition whose run posted it: a press is a message to it.
+    agent: []u8,
     labels: [][]u8,
     /// The post's start, said in the turn a press starts.
     excerpt: []u8,
@@ -222,6 +262,7 @@ const Quick = struct {
 
     fn deinit(q: Quick, gpa: std.mem.Allocator) void {
         gpa.free(q.conv);
+        gpa.free(q.agent);
         for (q.labels) |l| gpa.free(l);
         gpa.free(q.labels);
         gpa.free(q.excerpt);
@@ -354,10 +395,12 @@ pub const Core = struct {
     seen: brief.Seen,
     /// Set on close: nothing new starts.
     stop: std.atomic.Value(bool) = .init(false),
-    /// The stop flag of every run going on; /stop sets them all and nothing
-    /// clears them, so a stopped run stays stopped however long it takes.
+    /// The stop flag of every run going on, with its definition; /stop
+    /// sets them all (/stop NAME those of NAME and the runs they
+    /// delegated) and nothing clears them, so a stopped run stays stopped
+    /// however long it takes.
     runs_mutex: Io.Mutex = .init,
-    run_flags: std.ArrayList(*std.atomic.Value(bool)) = .empty,
+    run_flags: std.ArrayList(RunFlag) = .empty,
     /// Held while settings are read by the scheduler or replaced by /reload.
     settings_mutex: Io.Mutex = .init,
     /// Guards `seen` (briefs read a copy).
@@ -372,6 +415,8 @@ pub const Core = struct {
     owner: ?i64 = null,
     /// The conversations (state/conversations).
     convs: conversations.List,
+    /// The agent definitions (agents/), the built-ins under them.
+    defs: agents.Set,
     /// The bot's username: a command may end in `@` and it (`setBot`).
     bot_name_buf: [64]u8 = undefined,
     bot_name_len: usize = 0,
@@ -473,6 +518,8 @@ pub const Core = struct {
 
         try Io.Dir.cwd().createDirPath(io, c.paths.workspace);
         c.workspace = try Io.Dir.cwd().realPathFileAlloc(io, c.paths.workspace, c.paths_arena.allocator());
+        c.defs = .init(gpa, io, c.paths.agents, c.paths.agents_state);
+        errdefer c.defs.deinit();
         try c.loadSettings(sa);
         c.secrets = secrets;
         var sl: std.ArrayList(scrub.Secret) = .empty;
@@ -616,6 +663,7 @@ pub const Core = struct {
         c.queue.deinit(c.gpa);
         c.run_flags.deinit(c.gpa);
         c.convs.deinit();
+        c.defs.deinit();
         for (c.told_topics.items) |n| c.gpa.free(n);
         c.told_topics.deinit(c.gpa);
         for (c.quick.items) |q| q.deinit(c.gpa);
@@ -714,6 +762,14 @@ pub const Core = struct {
         c.tasks = config.parseTasks(a, texts[3]) catch return error.BadSettings;
         c.login_list = logins.parse(a, texts[4]) catch return error.BadSettings;
         c.folder_list = folders_mod.parse(a, texts[6]) catch return error.BadSettings;
+        // the definitions, read whole; every task's among them; then in place
+        var diag: agents.Diag = .{};
+        var loaded = c.defs.read(a, &diag) catch return error.BadSettings;
+        for (c.tasks) |tk| if (!loaded.has(tk.agent)) {
+            loaded.deinit();
+            return error.BadSettings;
+        };
+        c.defs.install(loaded);
         c.settings_hash = hashSettings(texts);
     }
 
@@ -798,7 +854,7 @@ pub const Core = struct {
     /// The answer to a /reload the settings files refused, naming the file
     /// and line (in `problem_buf`).
     fn settingsErrorReply(c: *Core) []const u8 {
-        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, logins.ini, mcp.ini and folders.ini.";
+        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, logins.ini, mcp.ini, folders.ini and agents/.";
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const why = (settingsProblem(c.io, arena.allocator(), c.paths) catch return generic) orelse return generic;
@@ -811,7 +867,7 @@ pub const Core = struct {
         defer arena.deinit();
         const texts = c.readSettingsFiles(arena.allocator()) catch return;
         const h = hashSettings(texts);
-        if (std.mem.eql(u8, &h, &c.settings_hash)) return;
+        if (std.mem.eql(u8, &h, &c.settings_hash) and !c.defs.changedOnDisk()) return;
         c.told_settings_changed = true;
         c.log.write(.config, false, .{ .event = "settings files changed" }) catch {};
         c.say("The settings files changed. The change is not applied until you send /reload.");
@@ -1191,14 +1247,24 @@ pub const Core = struct {
         return c.queueMessage(conv, text, null);
     }
 
-    /// Queues the owner's message `text` in `conv` for the chat worker
-    /// (`note`: the post a quick reply answers).
+    /// Queues the owner's message `text` in `conv` for the chat worker,
+    /// for the definition that answers there now (`note`: the post a
+    /// quick reply answers).
     fn queueMessage(c: *Core, conv: []const u8, text: []const u8, note: ?[]const u8) !void {
+        var buf: [agents_name_max]u8 = undefined;
+        return c.queueTo(conv, c.convAgent(&buf, conv), text, note);
+    }
+
+    /// Queues the owner's message `text` in `conv` for the instance of
+    /// definition `agent_name` there.
+    fn queueTo(c: *Core, conv: []const u8, agent_name: []const u8, text: []const u8, note: ?[]const u8) !void {
         const conv_owned = try c.gpa.dupe(u8, conv);
         errdefer c.gpa.free(conv_owned);
+        const agent_owned = try c.gpa.dupe(u8, agent_name);
+        errdefer c.gpa.free(agent_owned);
         const text_owned = try c.gpa.dupe(u8, text);
         errdefer c.gpa.free(text_owned);
-        const item: Queued = .{ .conv = conv_owned, .text = text_owned, .note = if (note) |n| try c.gpa.dupe(u8, n) else null };
+        const item: Queued = .{ .conv = conv_owned, .agent = agent_owned, .text = text_owned, .note = if (note) |n| try c.gpa.dupe(u8, n) else null };
         const queued_behind = blk: {
             c.queue_mutex.lockUncancelable(c.io);
             defer c.queue_mutex.unlock(c.io);
@@ -1272,6 +1338,7 @@ pub const Core = struct {
                 q.used = true;
                 break :blk .{
                     .conv = a.dupe(u8, q.conv) catch return false,
+                    .agent = a.dupe(u8, q.agent) catch return false,
                     .label = a.dupe(u8, q.labels[which - 1]) catch return false,
                     .excerpt = a.dupe(u8, q.excerpt) catch return false,
                     .place = Place{ .name = "", .chat = q.chat, .thread = q.thread },
@@ -1282,13 +1349,13 @@ pub const Core = struct {
         if (c.chan) |ch| ch.clear(ch.ctx, got.place, message_id);
         c.log.write(.chat, c.convPrivate(got.conv), .{ .event = "quick reply", .post = n, .text = got.label }) catch {};
         const note = std.fmt.allocPrint(a, "The owner pressed \"{s}\" under your post: \"{s}\"", .{ got.label, got.excerpt }) catch return true;
-        c.queueMessage(got.conv, got.label, note) catch {};
+        c.queueTo(got.conv, got.agent, got.label, note) catch {};
         return true;
     }
 
     /// Notes a post with quick replies; returns its number. The oldest
     /// goes past `max_quick`.
-    fn quickPost(c: *Core, conv: []const u8, labels: []const []const u8, text: []const u8) !u32 {
+    fn quickPost(c: *Core, conv: []const u8, agent_name: []const u8, labels: []const []const u8, text: []const u8) !u32 {
         const owned = try c.gpa.alloc([]u8, labels.len);
         var made: usize = 0;
         errdefer {
@@ -1301,13 +1368,15 @@ pub const Core = struct {
         }
         const conv_owned = try c.gpa.dupe(u8, conv);
         errdefer c.gpa.free(conv_owned);
+        const agent_owned = try c.gpa.dupe(u8, agent_name);
+        errdefer c.gpa.free(agent_owned);
         const excerpt = try c.gpa.dupe(u8, util.cut(text, 200));
         errdefer c.gpa.free(excerpt);
         c.quick_mutex.lockUncancelable(c.io);
         defer c.quick_mutex.unlock(c.io);
         if (c.quick.items.len >= max_quick) c.quick.orderedRemove(0).deinit(c.gpa);
         c.quick_seq += 1;
-        try c.quick.append(c.gpa, .{ .n = c.quick_seq, .conv = conv_owned, .labels = owned, .excerpt = excerpt });
+        try c.quick.append(c.gpa, .{ .n = c.quick_seq, .conv = conv_owned, .agent = agent_owned, .labels = owned, .excerpt = excerpt });
         return c.quick_seq;
     }
 
@@ -1325,11 +1394,11 @@ pub const Core = struct {
     /// Sends a post with quick replies to `conv`: the text in messages of
     /// 4096 bytes, the buttons on the last; the post is noted so a press of
     /// one counts.
-    fn sendWithButtons(c: *Core, a: std.mem.Allocator, conv: []const u8, text_in: []const u8, labels: []const []const u8) !Sent {
+    fn sendWithButtons(c: *Core, a: std.mem.Allocator, conv: []const u8, agent_name: []const u8, text_in: []const u8, labels: []const []const u8) !Sent {
         const ch = c.chan orelse return error.NoChannel;
         const r = try c.placeOf(a, conv);
         const text = if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text_in }) else text_in;
-        const n = try c.quickPost(conv, labels, text_in);
+        const n = try c.quickPost(conv, agent_name, labels, text_in);
         const bs = try a.alloc([2][]const u8, labels.len);
         for (labels, bs, 1..) |l, *b, i| b.* = .{ l, try std.fmt.allocPrint(a, "r{d}-{s}:{d}", .{ n, &c.approval_nonce, i }) };
         const parts = try questionParts(a, text);
@@ -1571,7 +1640,7 @@ pub const Core = struct {
         while (!c.quitting.load(.acquire)) {
             if (c.popQueue()) |item| {
                 defer item.deinit(c.gpa);
-                c.chatTurnNoted(item.conv, item.text, item.note);
+                c.chatTurnAs(item.conv, item.agent, item.text, item.note);
                 c.busy.store(false, .release);
                 continue;
             }
@@ -1585,17 +1654,24 @@ pub const Core = struct {
         }
     }
 
-    fn register(c: *Core, flag: *std.atomic.Value(bool)) void {
+    /// A run of definition `agent_name` is going (its name must outlive it).
+    fn register(c: *Core, flag: *std.atomic.Value(bool), agent_name: []const u8) void {
+        c.registerUnder(flag, agent_name, null);
+    }
+
+    /// A run delegated by the run whose flag is `parent`: stopped with it.
+    fn registerUnder(c: *Core, flag: *std.atomic.Value(bool), agent_name: []const u8, parent: ?*std.atomic.Value(bool)) void {
         c.runs_mutex.lockUncancelable(c.io);
         defer c.runs_mutex.unlock(c.io);
-        c.run_flags.append(c.gpa, flag) catch {};
+        c.run_flags.append(c.gpa, .{ .flag = flag, .agent = agent_name, .parent = parent }) catch {};
         if (c.stop.load(.acquire)) flag.store(true, .release);
+        if (parent) |pf| if (pf.load(.acquire)) flag.store(true, .release);
     }
 
     fn unregister(c: *Core, flag: *std.atomic.Value(bool)) void {
         c.runs_mutex.lockUncancelable(c.io);
         defer c.runs_mutex.unlock(c.io);
-        for (c.run_flags.items, 0..) |f, i| if (f == flag) {
+        for (c.run_flags.items, 0..) |f, i| if (f.flag == flag) {
             _ = c.run_flags.swapRemove(i);
             return;
         };
@@ -1604,7 +1680,30 @@ pub const Core = struct {
     fn stopRuns(c: *Core) void {
         c.runs_mutex.lockUncancelable(c.io);
         defer c.runs_mutex.unlock(c.io);
-        for (c.run_flags.items) |f| f.store(true, .release);
+        for (c.run_flags.items) |f| f.flag.store(true, .release);
+    }
+
+    /// Where delegated runs register their own stop flags.
+    fn registry(c: *Core) agent.Registry {
+        return .{ .ctx = c, .add = registryAdd, .remove = registryRemove };
+    }
+
+    fn registryAdd(ctx: *anyopaque, flag: *std.atomic.Value(bool), agent_name: []const u8, parent: *std.atomic.Value(bool)) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        c.registerUnder(flag, agent_name, parent);
+    }
+
+    fn registryRemove(ctx: *anyopaque, flag: *std.atomic.Value(bool)) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        c.unregister(flag);
+    }
+
+    /// Whether a run of definition `name` is registered.
+    fn agentRunning(c: *Core, name: []const u8) bool {
+        c.runs_mutex.lockUncancelable(c.io);
+        defer c.runs_mutex.unlock(c.io);
+        for (c.run_flags.items) |f| if (std.mem.eql(u8, f.agent, name)) return true;
+        return false;
     }
 
     fn baseRun(c: *Core, client: *model.Client, label: []const u8, scheduled: bool, flag: *std.atomic.Value(bool)) agent.Run {
@@ -1635,6 +1734,7 @@ pub const Core = struct {
                 .tmp_root = c.paths.state,
             },
             .limits = c.cfg.limits,
+            .base_limits = c.cfg.limits,
             .top_size = c.cfg.memory.top_size,
             .utc_offset = c.cfg.chat.utc_offset,
             .scheduled = scheduled,
@@ -1654,6 +1754,7 @@ pub const Core = struct {
             .pool = &c.helper_pool,
             .ask_lock = &c.ask_lock,
             .skills_dir = c.paths.skills,
+            .skills_state = c.paths.skills_state,
             .mcp = c.mcp_tools,
             .money = c.cfg.money,
             .money_ledger = &c.money_ledger,
@@ -1664,6 +1765,8 @@ pub const Core = struct {
             .masks = &c.masks,
             .written = &c.written,
             .snaps = &c.snaps,
+            .defs = &c.defs,
+            .registry = c.registry(),
         };
     }
 
@@ -1746,7 +1849,8 @@ pub const Core = struct {
             return;
         };
         var flag: std.atomic.Value(bool) = .init(false);
-        c.register(&flag);
+        // harness's own work: no definition's, so only /stop reaches it
+        c.register(&flag, "");
         defer c.unregister(&flag);
         const starts = a.alloc(McpStart, cfgs.len) catch return;
         const threads = a.alloc(?std.Thread, cfgs.len) catch return;
@@ -1883,16 +1987,28 @@ pub const Core = struct {
         c.chatTurnIn("main", text);
     }
 
-    /// The owner's message `text` in conversation `conv`: one turn, its
-    /// questions and its answer there.
+    /// The owner's message `text` in conversation `conv`, to the
+    /// definition that answers there: one turn, its questions and its
+    /// answer there.
     fn chatTurnIn(c: *Core, conv: []const u8, text: []const u8) void {
-        c.chatTurnNoted(conv, text, null);
+        var buf: [agents_name_max]u8 = undefined;
+        c.chatTurnAs(conv, c.convAgent(&buf, conv), text, null);
     }
 
-    /// `chatTurnIn`; `note` (the post a quick reply answers) goes in the
-    /// turn's context block.
-    fn chatTurnNoted(c: *Core, conv: []const u8, text: []const u8, note: ?[]const u8) void {
-        const x = c.contextFor(conv) catch |e| {
+    /// One turn of the instance of definition `agent_name` in `conv`;
+    /// `note` (the post a quick reply answers) goes in the turn's context
+    /// block. Its posts carry `[NAME]` when another definition answers in
+    /// that conversation (`/ask NAME`).
+    fn chatTurnAs(c: *Core, conv: []const u8, agent_name: []const u8, text: []const u8, note: ?[]const u8) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        // the definition as it is now: a change saved later applies to the next message
+        const def = c.definitionFor(arena.allocator(), conv, agent_name) catch |e| {
+            var buf: [128]u8 = undefined;
+            c.sayIn(conv, std.fmt.bufPrint(&buf, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
+            return;
+        };
+        const x = c.contextFor(conv, def.name) catch |e| {
             var buf: [128]u8 = undefined;
             c.sayIn(conv, std.fmt.bufPrint(&buf, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
             return;
@@ -1904,19 +2020,27 @@ pub const Core = struct {
             x.turns_since_memory = 0;
         }
         x.last_owner_s = c.now();
-        var arena: std.heap.ArenaAllocator = .init(c.gpa);
-        defer arena.deinit();
         var flag: std.atomic.Value(bool) = .init(false);
-        c.register(&flag);
+        c.register(&flag, def.name);
         defer c.unregister(&flag);
+        // the owner's place: counted toward its definition's, never waited for
+        c.helper_pool.takeAlways(c.io, def.name);
+        defer c.helper_pool.give(c.io, def.name);
         var ask: ChatAsk = .{ .core = c, .flag = &flag, .conv = conv };
-        var run = c.runIn(&c.chat_client, "chat", .{}, conv, &flag);
+        var run = c.runIn(&c.chat_client, "chat", .{ .agent = def.name }, conv, &flag);
+        run.useDefinition(def);
+        run.holds_place = true;
+        // its model for this turn (the chat worker is the client's only user)
+        c.chat_client.model = if (def.model.len > 0) def.model else c.cfg.model.model;
+        defer c.chat_client.model = c.cfg.model.model;
         run.context_note = c.contextNote(arena.allocator(), conv) catch "";
         if (note) |n| run.context_note = std.fmt.allocPrint(arena.allocator(), "{s}\n{s}", .{ run.context_note, n }) catch run.context_note;
         run.asker = .{ .ctx = &ask, .ask = askOwner };
         var notify: Notify = .{ .core = c, .conv = conv };
         run.notice = .{ .ctx = &notify, .say = Notify.say };
-        var out: RunOut = .{ .core = c };
+        var here: [agents_name_max]u8 = undefined;
+        const own = std.mem.eql(u8, def.name, c.convAgent(&here, conv));
+        var out: RunOut = .{ .core = c, .agent = def.name, .tag = if (own) "" else std.fmt.allocPrint(arena.allocator(), "[{s}] ", .{def.name}) catch "" };
         run.outbox = out.outbox();
         const res = agent.turn(&run, &x.conv, text, true) catch |e| {
             var buf: [128]u8 = undefined;
@@ -1956,8 +2080,11 @@ pub const Core = struct {
     /// owner.
     const RunOut = struct {
         core: *Core,
-        /// "[btc-watch] " for a run the owner did not start; "" otherwise.
+        /// "[btc-watch] " for a run the owner did not start, "[NAME] " for
+        /// one of a definition that does not answer there; "" otherwise.
         tag: []const u8 = "",
+        /// The run's definition (a quick reply's press goes back to it).
+        agent: []const u8 = "main",
         /// A task's or brief's: what its reply needs and how it went.
         sched: ?*Sched = null,
 
@@ -2080,7 +2207,7 @@ pub const Core = struct {
         else if (o.tag.len > 0) std.fmt.allocPrint(a, "{s}{s}", .{ o.tag, p.text }) catch p.text else p.text;
         c.ensureTopic(a, p.to);
         if (c.overHourly(a, p.to)) |why| return .{ .status = .held, .why = why };
-        const sending = if (p.buttons.len > 0) c.sendWithButtons(a, p.to, text, p.buttons) else c.sendText(p.to, text);
+        const sending = if (p.buttons.len > 0) c.sendWithButtons(a, p.to, o.agent, text, p.buttons) else c.sendText(p.to, text);
         const sent = sending catch |e| {
             // kept to be sent again as it is: nothing runs again for it
             if (sc) |x| if (worthRetry(e)) if (x.keep) |k| if (Undelivered.of(c.gpa, p.to, text, x.links)) |u| {
@@ -2148,25 +2275,29 @@ pub const Core = struct {
     /// new one past `max_contexts` drops the least used, after its memory
     /// writer has read it; when that conversation comes back, its model is
     /// told turns were dropped. The chat worker's.
-    fn contextFor(c: *Core, name: []const u8) !*Context {
+    fn contextFor(c: *Core, name: []const u8, agent_name: []const u8) !*Context {
         c.ctx_clock += 1;
-        if (c.contextOf(name)) |x| {
+        if (c.instanceOf(name, agent_name)) |x| {
             x.used = c.ctx_clock;
             return x;
         }
         if (c.contexts.items.len >= max_contexts) c.dropLeastUsed();
         const x = try c.gpa.create(Context);
         errdefer c.gpa.destroy(x);
-        x.* = .{ .name = try c.gpa.dupe(u8, name), .conv = .init(c.gpa), .used = c.ctx_clock };
-        errdefer c.gpa.free(x.name);
+        const n = try c.gpa.dupe(u8, name);
+        errdefer c.gpa.free(n);
+        const ag = try c.gpa.dupe(u8, agent_name);
+        errdefer c.gpa.free(ag);
+        x.* = .{ .name = n, .agent = ag, .conv = .init(c.gpa), .used = c.ctx_clock };
         {
             // the turns its context had before it made room for others
             c.convs.mutex.lockUncancelable(c.io);
             defer c.convs.mutex.unlock(c.io);
             if (c.convs.find(name)) |e| {
-                x.conv.dropped = e.dropped_turns;
-                x.conv.lost = e.dropped_turns;
-                x.memory_upto = e.dropped_turns;
+                const d = e.droppedOf(agent_name);
+                x.conv.dropped = d;
+                x.conv.lost = d;
+                x.memory_upto = d;
             }
         }
         c.ctx_mutex.lockUncancelable(c.io);
@@ -2175,17 +2306,52 @@ pub const Core = struct {
         return x;
     }
 
-    /// The context kept for conversation `name`, if any.
+    /// The context kept for conversation `name`'s own definition (the one
+    /// that answers there), if any.
     pub fn contextOf(c: *Core, name: []const u8) ?*Context {
+        var buf: [agents_name_max]u8 = undefined;
+        return c.instanceOf(name, c.convAgent(&buf, name));
+    }
+
+    /// The context kept for definition `agent_name` in conversation `name`.
+    pub fn instanceOf(c: *Core, name: []const u8, agent_name: []const u8) ?*Context {
         c.ctx_mutex.lockUncancelable(c.io);
         defer c.ctx_mutex.unlock(c.io);
-        for (c.contexts.items) |x| if (std.mem.eql(u8, x.name, name)) return x;
+        for (c.contexts.items) |x| if (std.mem.eql(u8, x.name, name) and std.mem.eql(u8, x.agent, agent_name)) return x;
         return null;
     }
 
-    /// /new: conversation `name` starts fresh at its next turn.
+    /// /new: every definition in conversation `name` starts fresh at its
+    /// next turn.
     fn resetContext(c: *Core, name: []const u8) void {
-        if (c.contextOf(name)) |x| x.reset.store(true, .release);
+        c.ctx_mutex.lockUncancelable(c.io);
+        defer c.ctx_mutex.unlock(c.io);
+        for (c.contexts.items) |x| if (std.mem.eql(u8, x.name, name)) x.reset.store(true, .release);
+    }
+
+    /// The definition that answers in conversation `conv` (in `buf`):
+    /// main unless the owner picked another.
+    fn convAgent(c: *Core, buf: *[agents_name_max]u8, conv: []const u8) []const u8 {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        const e = c.convs.find(conv) orelse return "main";
+        if (e.agent.len > buf.len) return "main";
+        @memcpy(buf[0..e.agent.len], e.agent);
+        return buf[0..e.agent.len];
+    }
+
+    /// A copy of definition `agent_name` (in `a`). One no longer defined
+    /// (removed, or a file taken out by hand and /reload): main, and the
+    /// conversation that had it goes back to main, the owner told.
+    fn definitionFor(c: *Core, a: std.mem.Allocator, conv: []const u8, agent_name: []const u8) !agents.Def {
+        if (try c.defs.get(a, agent_name)) |d| return d;
+        {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            if (c.convs.find(conv)) |e| if (std.mem.eql(u8, e.agent, agent_name)) c.convs.setAgent(conv, "main") catch {};
+        }
+        c.sayIn(conv, try std.fmt.allocPrint(a, "{s} is not defined any more; main answers here.", .{agent_name}));
+        return (try c.defs.get(a, "main")) orelse agents.builtin_main;
     }
 
     /// Drops the least used context, its new turns read by the memory
@@ -2202,9 +2368,9 @@ pub const Core = struct {
         {
             c.convs.mutex.lockUncancelable(c.io);
             defer c.convs.mutex.unlock(c.io);
-            if (c.convs.find(x.name)) |e| e.dropped_turns = turns;
+            if (c.convs.find(x.name)) |e| c.convs.setDropped(e, x.agent, turns) catch {};
         }
-        c.log.write(.chat, false, .{ .event = "context dropped", .name = x.name, .turns = turns }) catch {};
+        c.log.write(.chat, false, .{ .event = "context dropped", .name = x.name, .agent = x.agent, .turns = turns }) catch {};
         {
             c.ctx_mutex.lockUncancelable(c.io);
             defer c.ctx_mutex.unlock(c.io);
@@ -2216,6 +2382,7 @@ pub const Core = struct {
     fn freeContext(c: *Core, x: *Context) void {
         x.conv.deinit();
         c.gpa.free(x.name);
+        c.gpa.free(x.agent);
         c.gpa.destroy(x);
     }
 
@@ -2424,6 +2591,48 @@ pub const Core = struct {
         return "Stopped everything that was running.";
     }
 
+    /// `/stop NAME`: NAME's runs stop, and the runs they delegated; its
+    /// queued messages are dropped. Waits up to `stop_wait_ms` for them to end.
+    fn stopAgent(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        if (!c.defs.has(name)) return std.fmt.allocPrint(a, "No definition called {s}.", .{name});
+        var dropped: usize = 0;
+        {
+            c.queue_mutex.lockUncancelable(c.io);
+            defer c.queue_mutex.unlock(c.io);
+            var i: usize = 0;
+            while (i < c.queue.items.len) {
+                if (!std.mem.eql(u8, c.queue.items[i].agent, name)) {
+                    i += 1;
+                    continue;
+                }
+                c.queue.orderedRemove(i).deinit(c.gpa);
+                dropped += 1;
+            }
+        }
+        var stopped: usize = 0;
+        {
+            c.runs_mutex.lockUncancelable(c.io);
+            defer c.runs_mutex.unlock(c.io);
+            for (c.run_flags.items) |f| if (std.mem.eql(u8, f.agent, name) and !f.flag.load(.acquire)) {
+                f.flag.store(true, .release);
+                stopped += 1;
+            };
+            // and what they delegated
+            for (c.run_flags.items) |f| if (f.parent) |pf| if (pf.load(.acquire)) f.flag.store(true, .release);
+        }
+        const until = Io.Clock.awake.now(c.io).nanoseconds + @as(i96, c.stop_wait_ms) * std.time.ns_per_ms;
+        while (stopped > 0 and c.agentRunning(name) and Io.Clock.awake.now(c.io).nanoseconds < until) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        const still = stopped > 0 and c.agentRunning(name);
+        c.log.write(.chat, false, .{ .event = "stop", .agent = name, .runs = stopped, .queued_dropped = dropped, .still_ending = still }) catch {};
+        if (stopped == 0 and dropped == 0) return std.fmt.allocPrint(a, "Nothing of {s} was running.", .{name});
+        return std.fmt.allocPrint(a, "Stopped {s}'s runs ({d}){s}{s}", .{
+            name,
+            stopped,
+            if (dropped > 0) try std.fmt.allocPrint(a, " and dropped its {d} queued message{s}", .{ dropped, if (dropped == 1) "" else "s" }) else "",
+            if (still) ". A model call already under way ends on its own; its answer is dropped and nothing it asked for runs." else ".",
+        });
+    }
+
     /// SIGINT or SIGTERM (on Windows the console's Ctrl-C, Ctrl-Break or
     /// close): what /stop does, then what close does that matters outside
     /// this process — the log, the status, the MCP servers' processes and
@@ -2488,6 +2697,8 @@ pub const Core = struct {
                 if (last) |l| if (c.localDay(l) >= today) continue;
             }
             if (c.waitsToBeSent(key.slice())) continue;
+            // its definition runs at most `parallel` at once
+            if (!c.helper_pool.hasRoom(c.io, tk.agent, c.defs.parallelOf(tk.agent))) continue;
             _ = c.startBackground(.{ .task = tk }, key.slice(), now_s);
         }
     }
@@ -2621,6 +2832,8 @@ pub const Core = struct {
             .task => due_s,
             .resend => unreachable,
         };
+        // not run yet: due again at the next tick
+        if (outcome == .later) return;
         const now_s = c.now();
         c.state_mutex.lockUncancelable(c.io);
         defer c.state_mutex.unlock(c.io);
@@ -2688,6 +2901,9 @@ pub const Core = struct {
         done,
         /// Its message did not get through: it is sent again a little later.
         undelivered,
+        /// Not run: its definition had no place free (`parallel`); a later
+        /// tick runs it.
+        later,
     };
 
     /// A message that did not get through, kept to be sent again as it is,
@@ -2738,7 +2954,7 @@ pub const Core = struct {
         defer client.deinit();
         const label = try std.fmt.allocPrint(a, "brief {s}", .{b.name});
         var flag: std.atomic.Value(bool) = .init(false);
-        c.register(&flag);
+        c.register(&flag, "main");
         defer c.unregister(&flag);
         var run = c.runIn(&client, label, .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{b.name}) }, b.to, &flag);
         // a copy, so the fetches hold no lock
@@ -2790,13 +3006,25 @@ pub const Core = struct {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        var client = try model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens);
+        // its definition as it is now; the settings checked at start and on
+        // /reload that there is one
+        const def = (try c.defs.get(a, tk.agent)) orelse {
+            try c.log.write(.task, false, .{ .name = tk.name, .event = "not run", .why = "its agent is not defined", .agent = tk.agent });
+            c.say(try std.fmt.allocPrint(a, "Task {s} names agent {s}, which is not defined; it did not run.", .{ tk.name, tk.agent }));
+            return .done;
+        };
+        var client = try model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", if (def.model.len > 0) def.model else c.cfg.model.model, c.cfg.model.max_tokens);
         defer client.deinit();
+        // a place of its definition; with none free it runs at a later tick
+        if (!c.helper_pool.take(c.io, def.name, def.parallel)) return .later;
+        defer c.helper_pool.give(c.io, def.name);
         const label = try std.fmt.allocPrint(a, "task {s}", .{tk.name});
         var flag: std.atomic.Value(bool) = .init(false);
-        c.register(&flag);
+        c.register(&flag, def.name);
         defer c.unregister(&flag);
-        var run = c.runIn(&client, label, .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{tk.name}) }, tk.to, &flag);
+        var run = c.runIn(&client, label, .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{tk.name}), .agent = def.name }, tk.to, &flag);
+        run.useDefinition(def);
+        run.holds_place = true;
         run.extra_instructions = try std.fmt.allocPrint(a, "This is the scheduled task \"{s}\". If there is nothing worth telling the owner this time, answer exactly NOTHING.", .{tk.name});
         var skipped: agent.Skipped = .init(c.gpa);
         defer skipped.deinit();
@@ -2805,7 +3033,7 @@ pub const Core = struct {
         run.notice = .{ .ctx = &notify, .say = Notify.say };
         // it posts to its `to` with its name in front, like its reply
         var sched: Sched = .{ .skipped = &skipped, .keep = keep };
-        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{tk.name}), .sched = &sched };
+        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{tk.name}), .agent = def.name, .sched = &sched };
         run.outbox = out.outbox();
         run.context_note = c.contextNote(a, tk.to) catch "";
         var conv: agent.Conversation = .init(c.gpa);
@@ -2879,7 +3107,7 @@ pub const Core = struct {
 
     const help_text =
         \\Commands
-        \\/stop: stop everything running now
+        \\/stop [NAME]: stop everything running now, or NAME's runs
         \\/new: start fresh in this conversation (memory stays)
         \\/status: what is running and the switches
         \\/brief [NAME]: send a brief now
@@ -2908,6 +3136,10 @@ pub const Core = struct {
         \\/conversation rename OLD NEW, /conversation rm NAME
         \\/conversation add NAME: sent in a group, the agent may post there
         \\/session [N]: the steps behind the last answer here (N runs back)
+        \\/agents: the agent definitions
+        \\/agent [NAME]: which one answers here, or switch to NAME
+        \\/agent show NAME, /agent rm NAME
+        \\/ask NAME text: one message to NAME here, its answer marked [NAME]
     ;
 
     /// A command sent in `main` (or from the command line).
@@ -2924,7 +3156,7 @@ pub const Core = struct {
         const eql = std.mem.eql;
         if (eql(u8, cmd, "/help") or eql(u8, cmd, "/start")) return help_text;
         if (eql(u8, cmd, "/pair")) return "Already paired.";
-        if (eql(u8, cmd, "/stop")) return c.stopAll();
+        if (eql(u8, cmd, "/stop")) return if (rest.len == 0) c.stopAll() else c.stopAgent(a, rest);
         if (eql(u8, cmd, "/new")) {
             c.resetContext(conv);
             return "New conversation.";
@@ -3046,6 +3278,9 @@ pub const Core = struct {
         if (eql(u8, cmd, "/snapshot")) return c.snapshotCommand(a, rest);
         if (eql(u8, cmd, "/changes")) return c.changesCommand(a, rest);
         if (eql(u8, cmd, "/restore")) return c.restoreCommand(a, rest);
+        if (eql(u8, cmd, "/agents")) return c.agentsText(a);
+        if (eql(u8, cmd, "/agent")) return c.agentCommand(a, conv, rest);
+        if (eql(u8, cmd, "/ask")) return c.askCommand(a, conv, rest);
         if (eql(u8, cmd, "/skills")) {
             const list = try skills.list(a, c.io, c.paths.skills);
             if (list.len == 0) return "No skills yet. The agent saves one (with your approval) when it learns how to do a kind of task.";
@@ -3141,6 +3376,106 @@ pub const Core = struct {
             return std.fmt.allocPrint(a, "Forgot {s}: the agent no longer posts there. A topic stays in Telegram; a message in it makes it a conversation again.", .{x});
         }
         return conversation_usage;
+    }
+
+    /// A paragraph per definition: what it is, what it may use, where it
+    /// is used, who saved it, its earlier versions.
+    fn agentsText(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        for (try c.defs.list(a)) |d| {
+            try out.print(a, "{s}: {s}\n  model {s}, tools {s}, memory {s}, skills {s}", .{
+                d.name,                                          d.description,
+                if (d.model.len > 0) d.model else "default",      try std.mem.join(a, ", ", d.tools),
+                @tagName(d.memory),                              try std.mem.join(a, ", ", d.skills),
+            });
+            if (d.parallel > 0) try out.print(a, ", at most {d} at once", .{d.parallel});
+            if (builtin.os.tag == .windows and d.allowsTool("web")) try out.appendSlice(a, " (web is not available on Windows)");
+            try out.appendSlice(a, "\n  ");
+            var used: std.ArrayList([]const u8) = .empty;
+            {
+                c.convs.mutex.lockUncancelable(c.io);
+                defer c.convs.mutex.unlock(c.io);
+                for (c.convs.items.items) |e| if (std.mem.eql(u8, e.agent, d.name)) try used.append(a, try a.dupe(u8, e.name));
+            }
+            for (c.tasks) |tk| if (std.mem.eql(u8, tk.agent, d.name)) try used.append(a, try std.fmt.allocPrint(a, "task {s}", .{tk.name}));
+            if (used.items.len > 0) try out.print(a, "answers in {s}", .{try std.mem.join(a, ", ", used.items)}) else try out.appendSlice(a, "not picked anywhere");
+            if (d.saved.len > 0)
+                try out.print(a, "; saved by {s}", .{d.saved})
+            else
+                try out.appendSlice(a, if (d.builtin) "; built in" else "; written by hand");
+            const v = c.defs.versions(d.name);
+            if (v > 0) try out.print(a, "; {d} earlier version{s}", .{ v, if (v == 1) "" else "s" });
+            const going = c.helper_pool.going(c.io, d.name);
+            if (going > 0) try out.print(a, "; {d} running", .{going});
+            try out.appendSlice(a, "\n");
+        }
+        return out.items;
+    }
+
+    const agent_usage = "Use /agent to see which definition answers here, /agent NAME to switch, /agent show NAME or /agent rm NAME.";
+
+    /// `/agent [NAME]`, `/agent show NAME`, `/agent rm NAME`, sent in `conv`.
+    fn agentCommand(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const op = words.next() orelse {
+            var buf: [agents_name_max]u8 = undefined;
+            return std.fmt.allocPrint(a, "{s} answers here. /agent NAME switches; /agents lists them.", .{c.convAgent(&buf, conv)});
+        };
+        const eql = std.mem.eql;
+        if (eql(u8, op, "show") or eql(u8, op, "rm")) {
+            const name = words.next() orelse return agent_usage;
+            if (words.next() != null) return agent_usage;
+            if (eql(u8, op, "rm")) return c.removeDefinition(a, name);
+            const d = (try c.defs.get(a, name)) orelse return std.fmt.allocPrint(a, "No definition called {s}.", .{name});
+            if (d.builtin) return std.fmt.allocPrint(a, "{s} is built in (agents/{s}.md would replace it):\n{s}", .{ name, name, d.text });
+            return d.text;
+        }
+        if (words.next() != null) return agent_usage;
+        const name = op;
+        if (!c.defs.has(name)) return std.fmt.allocPrint(a, "No definition called {s}. /agents lists them.", .{name});
+        {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            c.convs.setAgent(conv, name) catch |e| return switch (e) {
+                error.NotFound => "There is no conversation here to switch (pair an account first).",
+                else => std.fmt.allocPrint(a, "Not switched: harness could not write state/conversations ({s}).", .{@errorName(e)}),
+            };
+        }
+        try c.log.write(.config, false, .{ .event = "conversation agent", .name = conv, .agent = name });
+        return std.fmt.allocPrint(a, "{s} answers here from your next message.{s}", .{ name, if (eql(u8, name, "main")) "" else " /agent main goes back." });
+    }
+
+    /// `/agent rm NAME`: its file to its versions; refused for main,
+    /// helper and one a task uses; conversations it answered in go back
+    /// to main.
+    fn removeDefinition(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        for (agents.builtins) |b| if (std.mem.eql(u8, b.name, name)) return "main and helper are harness's own: edit agents/main.md or agents/helper.md to change one.";
+        if (!c.defs.has(name)) return std.fmt.allocPrint(a, "No definition called {s}.", .{name});
+        for (c.tasks) |tk| if (std.mem.eql(u8, tk.agent, name))
+            return std.fmt.allocPrint(a, "Task {s} uses {s}; change its agent = line in tasks.ini first.", .{ tk.name, name });
+        c.defs.remove(name) catch |e| return std.fmt.allocPrint(a, "Not removed: {s}.", .{@errorName(e)});
+        try c.log.write(.agent, false, .{ .event = "removed", .name = name, .by = "owner" });
+        const back = blk: {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            break :blk c.convs.resetAgent(a, name) catch &.{};
+        };
+        return std.fmt.allocPrint(a, "Removed {s}: its file is kept in state/agents/{s}/versions/.{s}{s}{s}", .{
+            name,                                                     name,
+            if (back.len > 0) " main answers again in: " else "", try std.mem.join(a, ", ", back),
+            if (back.len > 0) "." else "",
+        });
+    }
+
+    /// `/ask NAME text`: one message to NAME's instance in `conv`.
+    fn askCommand(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const name = words.next() orelse "";
+        const text = std.mem.trim(u8, words.rest(), " \t");
+        if (name.len == 0 or text.len == 0) return "Use /ask NAME text: one message to NAME here, its answer marked [NAME].";
+        if (!c.defs.has(name)) return std.fmt.allocPrint(a, "No definition called {s}. /agents lists them.", .{name});
+        try c.queueTo(conv, name, text, null);
+        return "";
     }
 
     /// Opens topic `name` in the owner's chat with the bot and keeps it as
@@ -3519,6 +3854,15 @@ pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
         };
         if (try parseProblem(a, std.fs.path.basename(item[0]), text, item[1])) |why| return why;
     }
+    if (try agents.problem(io, a, p.agents)) |why| return why;
+    // every task's agent is a definition
+    var set: agents.Set = .init(a, io, p.agents, "");
+    var diag: agents.Diag = .{};
+    var loaded = set.read(a, &diag) catch return null;
+    defer loaded.deinit();
+    const tasks_text = Io.Dir.cwd().readFileAlloc(io, p.tasks, a, .limited(1 << 20)) catch "";
+    for (config.parseTasks(a, tasks_text) catch &.{}) |tk| if (!loaded.has(tk.agent))
+        return try std.fmt.allocPrint(a, "tasks.ini: task {s} names agent {s}, which is not defined (no agents/{s}.md)", .{ tk.name, tk.agent, tk.agent });
     return null;
 }
 
@@ -6410,4 +6754,294 @@ test "a_secret_typed_into_a_snapshots_label_is_masked" {
     const snap = try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ f.core.paths.snapshots, "folders", &key, "1" }), a, .unlimited);
     try t.expect(std.mem.indexOf(u8, snap, "og-key-for-tests") == null);
     try t.expect(std.mem.indexOf(u8, try logText(&f), "og-key-for-tests") == null);
+}
+
+// ---- agent definitions ----
+
+const researcher_md = "---\nname: researcher\ndescription: Research across sources.\nmodel: claude-r\ntools: search, recall\n---\nResearch with two sources.\n";
+
+/// Writes `agents/NAME.md` in the core's folder and reloads.
+fn addDefinition(f: *Fix, name: []const u8, text: []const u8) !void {
+    const a = f.e.arena.allocator();
+    const path = try std.fs.path.join(a, &.{ f.core.paths.agents, try std.fmt.allocPrint(a, "{s}.md", .{name}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = text, .flags = .{ .permissions = util.private_file } });
+    const said = try f.core.reload();
+    if (!std.mem.eql(u8, said, "Settings reloaded.")) std.debug.print("reload: {s}\n", .{said});
+    try t.expectEqualStrings("Settings reloaded.", said);
+}
+
+/// Writes tasks.ini and reloads; returns what /reload said.
+fn setTasks(f: *Fix, text: []const u8) ![]const u8 {
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.tasks, .data = text });
+    return f.core.reload();
+}
+
+test "agent_command_switches_and_keeps_contexts_apart" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addDefinition(&f, "researcher", researcher_md);
+    try f.e.script(1, model.textReply("main one"));
+    f.core.chatTurn("first for main");
+    try f.core.handleText("/agent researcher");
+    try f.rec.waitFor("researcher answers here from your next message.");
+    try f.e.script(2, model.textReply("researcher one"));
+    f.core.chatTurn("first for the researcher");
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "Research with two sources.") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "\"model\":\"claude-r\"") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "first for main") == null);
+    // its own reply is not marked: it answers here
+    try t.expectEqual(1, f.rec.count("researcher one"));
+    try t.expectEqual(0, f.rec.count("[researcher] researcher one"));
+    // kept with the conversation
+    try t.expect(std.mem.indexOf(u8, try conversationsText(&f), ",\"agent\":\"researcher\"}") != null);
+    try f.core.handleText("/agent");
+    try f.rec.waitFor("researcher answers here. /agent NAME switches");
+    try f.core.handleText("/agent main");
+    try f.e.script(3, model.textReply("main two"));
+    f.core.chatTurn("second for main");
+    const req3 = try f.e.request(3);
+    try t.expect(std.mem.indexOf(u8, req3, "first for main") != null);
+    try t.expect(std.mem.indexOf(u8, req3, "first for the researcher") == null);
+    try t.expect(std.mem.indexOf(u8, req3, "You are a personal agent") != null);
+    // /new: every definition here starts fresh
+    try f.core.handleText("/new");
+    try f.rec.waitFor("New conversation.");
+    try f.e.script(4, model.textReply("main fresh"));
+    f.core.chatTurn("third for main");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "first for main") == null);
+    try f.core.handleText("/agent researcher");
+    try f.e.script(5, model.textReply("researcher fresh"));
+    f.core.chatTurn("second for the researcher");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), "first for the researcher") == null);
+    try f.core.handleText("/agent nobody");
+    try f.rec.waitFor("No definition called nobody.");
+}
+
+test "ask_sends_one_message_to_a_definition_and_marks_its_answer" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addDefinition(&f, "researcher", researcher_md);
+    try f.core.startWorker();
+    try f.e.script(1, model.textReply("Three sources agree."));
+    try f.core.handleText("/ask researcher what is new in zig");
+    try f.rec.waitFor("[researcher] Three sources agree.");
+    const req1 = try f.e.request(1);
+    try t.expect(std.mem.indexOf(u8, req1, "Research with two sources.") != null);
+    try t.expect(std.mem.indexOf(u8, req1, "what is new in zig") != null);
+    // main still answers here, in its own context
+    try f.e.script(2, model.textReply("main again"));
+    try f.core.handleText("hello");
+    try f.rec.waitFor("main again");
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "You are a personal agent") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "what is new in zig") == null);
+    try f.core.handleText("/ask researcher");
+    try f.rec.waitFor("Use /ask NAME text");
+    try f.core.handleText("/ask nobody hi");
+    try f.rec.waitFor("No definition called nobody.");
+}
+
+test "one_instance_takes_one_input_at_a_time_in_order" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addDefinition(&f, "researcher", researcher_md);
+    try f.e.script(1, comptime "{\"delay_ms\":300," ++ model.textReply("answer one")[1..]);
+    try f.e.script(2, model.textReply("answer two"));
+    try f.e.script(3, model.textReply("answer three"));
+    try f.core.startWorker();
+    try f.core.handleText("message one");
+    try f.core.handleText("/ask researcher message two");
+    try f.core.handleText("message three");
+    try f.rec.waitFor("answer three");
+    const req1 = try f.e.request(1);
+    const req2 = try f.e.request(2);
+    const req3 = try f.e.request(3);
+    try t.expect(std.mem.indexOf(u8, req1, "message one") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "message two") != null and std.mem.indexOf(u8, req2, "message one") == null);
+    try t.expect(std.mem.indexOf(u8, req3, "message three") != null and std.mem.indexOf(u8, req3, "message one") != null);
+    try t.expect(std.mem.indexOf(u8, req3, "message two") == null);
+    // in the order they came
+    f.rec.mutex.lockUncancelable(t.io);
+    defer f.rec.mutex.unlock(t.io);
+    var order: [3]usize = .{ 0, 0, 0 };
+    for (f.rec.lines.items, 0..) |l, i| {
+        if (std.mem.eql(u8, l, "answer one")) order[0] = i;
+        if (std.mem.eql(u8, l, "[researcher] answer two")) order[1] = i;
+        if (std.mem.eql(u8, l, "answer three")) order[2] = i;
+    }
+    try t.expect(order[0] < order[1] and order[1] < order[2]);
+}
+
+test "a_task_runs_its_definition" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addDefinition(&f, "researcher", researcher_md);
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[watch]\nevery = 5m\nagent = researcher\ndo = Look for zig news.\n"));
+    try f.e.script(1, model.textReply("Zig 0.17.1 is out."));
+    f.core.tick();
+    try f.rec.waitFor("[watch] Zig 0.17.1 is out.");
+    waitIdle(f.core);
+    const req1 = try f.e.request(1);
+    try t.expect(std.mem.indexOf(u8, req1, "Research with two sources.") != null);
+    try t.expect(std.mem.indexOf(u8, req1, "\"model\":\"claude-r\"") != null);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"run\":\"task watch\",\"by\":\"schedule:watch\",\"agent\":\"researcher\"") != null);
+    // a task that names no definition: the settings are refused, saying which
+    const said = try setTasks(&f, "[watch]\nevery = 5m\nagent = nobody\ndo = Look.\n");
+    try t.expect(std.mem.indexOf(u8, said, "tasks.ini: task watch names agent nobody, which is not defined") != null);
+}
+
+test "agents_lists_and_rm_keeps_a_version" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // init wrote harness's own two
+    try t.expectEqualStrings(agents.main_md, try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ f.core.paths.agents, "main.md" }), a, .unlimited));
+    try t.expectEqualStrings(agents.helper_md, try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ f.core.paths.agents, "helper.md" }), a, .unlimited));
+    try addDefinition(&f, "researcher", researcher_md);
+    try f.core.handleText("/agents");
+    try f.rec.waitFor("researcher: Research across sources.\n  model claude-r, tools search, recall, memory shared, skills *");
+    try f.rec.waitFor("main: The agent:");
+    try f.rec.waitFor("helper: Does one task");
+    try f.core.handleText("/agent show researcher");
+    try f.rec.waitFor("Research with two sources.");
+    // refused for harness's own and for one a task uses
+    try f.core.handleText("/agent rm main");
+    try f.rec.waitFor("main and helper are harness's own");
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[watch]\nevery = 5m\nagent = researcher\ndo = Look.\n"));
+    try f.core.handleText("/agent rm researcher");
+    try f.rec.waitFor("Task watch uses researcher");
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, ""));
+    try f.core.handleText("/agent researcher");
+    try f.core.handleText("/agent rm researcher");
+    try f.rec.waitFor("Removed researcher: its file is kept in state/agents/researcher/versions/. main answers again in: main.");
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, try std.fs.path.join(a, &.{ f.core.paths.agents, "researcher.md" }), .{}));
+    try t.expectEqual(1, f.core.defs.versions("researcher"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"kind\":\"agent\",\"event\":\"removed\",\"name\":\"researcher\",\"by\":\"owner\"") != null);
+    try t.expect(std.mem.indexOf(u8, try conversationsText(&f), "\"agent\"") == null);
+}
+
+test "hand_edits_apply_after_reload_and_a_bad_file_is_named" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addDefinition(&f, "researcher", researcher_md);
+    try f.core.handleText("/agent researcher");
+    const path = try std.fs.path.join(a, &.{ f.core.paths.agents, "researcher.md" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = "---\nname: researcher\ndescription: Research.\n---\nResearch with three sources.\n" });
+    f.core.checkSettingsChanged();
+    try f.rec.waitFor("The settings files changed.");
+    try f.e.script(1, model.textReply("old"));
+    f.core.chatTurn("before the reload");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "Research with two sources.") != null);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(2, model.textReply("new"));
+    f.core.chatTurn("after the reload");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "Research with three sources.") != null);
+    // a file that does not read: nothing changes, its file and line are named
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.paths.agents, "bad.md" }), .data = "---\nname: bad\ncolour: red\n---\n", .flags = .{ .permissions = util.private_file } });
+    try t.expectEqualStrings("The settings files have an error; nothing changed: agents/bad.md line 3 has an error: unknown key colour", try f.core.reload());
+    try t.expect(f.core.defs.has("researcher") and !f.core.defs.has("bad"));
+}
+
+test "a_definitions_rules_section_applies_to_its_runs" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "[agent:coder]\nallow shell echo *\n[agent:main]\ndeny shell *\n" });
+    try addDefinition(&f, "coder", "---\nname: coder\ndescription: Code.\ntools: shell\n---\nCode.\n");
+    try f.core.handleText("/agent coder");
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(2, model.textReply("ran"));
+    f.core.chatTurn("run it");
+    try f.core.handleText("/agent main");
+    try f.e.script(3, model.toolReply("tu_2", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(4, model.textReply("refused"));
+    f.core.chatTurn("run it here");
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "\"agent\":\"coder\",\"tool\":\"shell\",\"decision\":\"allow\",\"why\":\"rule on line 2\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "\"agent\":\"main\",\"tool\":\"shell\",\"decision\":\"deny\",\"why\":\"rule on line 4\"") != null);
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+}
+
+// ---- places ----
+
+test "owner_runs_keep_a_place_when_tasks_fill_the_rest" {
+    var f: Fix = undefined;
+    // concurrent_runs = 2: one place for tasks, one kept for the owner
+    try f.init("", "", "[a]\nevery = 5m\ndo = Task a.\n[b]\nevery = 5m\ndo = Task b.\n");
+    defer f.deinit();
+    try f.e.script(1, comptime "{\"delay_ms\":1500," ++ model.textReply("task done")[1..]);
+    try f.e.script(2, model.textReply("chat answered"));
+    f.core.tick();
+    try waitFile(&f.e, "requests/001.json");
+    // the second task finds no place; the owner's message is answered all the same
+    try t.expectEqual(1, f.core.bg_active.load(.acquire));
+    try f.core.startWorker();
+    try f.core.handleText("hello");
+    try f.rec.waitFor("chat answered");
+    try t.expectEqual(0, f.rec.count("task done"));
+    try f.rec.waitFor("task done");
+    waitIdle(f.core);
+}
+
+test "a_scheduled_run_waits_for_its_definitions_place" {
+    var f: Fix = undefined;
+    // two places for tasks, but researcher runs one at a time
+    try f.init("[limits]\nconcurrent_runs = 3\n", "", "");
+    defer f.deinit();
+    try addDefinition(&f, "researcher", "---\nname: researcher\ndescription: R.\nparallel: 1\n---\nR.\n");
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[a]\nevery = 5m\nagent = researcher\ndo = Task a.\n[b]\nevery = 5m\nagent = researcher\ndo = Task b.\n"));
+    try f.e.script(1, comptime "{\"delay_ms\":800," ++ model.textReply("first done")[1..]);
+    try f.e.script(2, model.textReply("second done"));
+    f.core.tick();
+    try waitFile(&f.e, "requests/001.json");
+    for (0..5) |_| {
+        f.core.tick();
+        t.io.sleep(.fromMilliseconds(40), .awake) catch {};
+    }
+    // the other waits while the first runs
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.access(t.io, "requests/002.json", .{}));
+    try f.rec.waitFor("first done");
+    try t.expectEqual(0, f.rec.count("second done"));
+    waitIdle(f.core);
+    // and runs at a later tick
+    var waited: u32 = 0;
+    while (f.rec.count("second done") == 0 and waited < 5000) : (waited += 50) {
+        f.core.tick();
+        t.io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+    try f.rec.waitFor("second done");
+    waitIdle(f.core);
+}
+
+test "stop_name_stops_only_that_definitions_runs" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addDefinition(&f, "researcher", researcher_md);
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[watch]\nevery = 5m\nagent = researcher\ndo = Look.\n"));
+    try f.e.script(1, comptime "{\"delay_ms\":2500," ++ model.textReply("too late")[1..]);
+    f.core.tick();
+    try waitFile(&f.e, "requests/001.json");
+    try f.core.handleText("/stop main");
+    try f.rec.waitFor("Nothing of main was running.");
+    try f.core.handleText("/stop researcher");
+    try f.rec.waitFor("Stopped researcher's runs (1)");
+    waitIdle(f.core);
+    try t.expectEqual(0, f.rec.count("too late"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"stop\",\"agent\":\"researcher\"") != null);
+    // main goes on
+    try f.e.script(2, model.textReply("main still here"));
+    try f.core.startWorker();
+    try f.core.handleText("hello");
+    try f.rec.waitFor("main still here");
+    try f.core.handleText("/stop nobody");
+    try f.rec.waitFor("No definition called nobody.");
 }
