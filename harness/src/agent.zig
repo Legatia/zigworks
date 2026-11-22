@@ -39,6 +39,66 @@ pub const Notice = struct {
     say: *const fn (ctx: *anyopaque, text: []const u8) void,
 };
 
+/// What a conversation is, as a run's outbox knows it.
+pub const Target = struct {
+    name: []const u8,
+    /// Others read it (a group): a post there is asked every time.
+    shared: bool = false,
+    /// Its /private switch is on.
+    private: bool = false,
+    /// No such conversation yet: the run's own `to` opens its topic at the
+    /// first post.
+    exists: bool = true,
+};
+
+/// A workspace file a post carries.
+pub const Attachment = struct { name: []const u8, data: []const u8 };
+
+/// One post: the agent's `send`, or its reply posted by harness.
+pub const Post = struct {
+    to: []const u8,
+    text: []const u8,
+    files: []const Attachment = &.{},
+    buttons: []const []const u8 = &.{},
+    /// The reply: the turn ends with it.
+    final: bool = false,
+    /// The model's last text, posted by harness: it did not use `send`.
+    implicit: bool = false,
+};
+
+/// How a post went.
+pub const Delivery = struct {
+    status: Status,
+    /// The first message's id (for the log), and how many messages.
+    message: i64 = 0,
+    parts: u32 = 0,
+    files: u32 = 0,
+    /// Why it was not sent, in words.
+    why: []const u8 = "",
+
+    pub const Status = enum {
+        sent,
+        /// It did not get through and is kept to be sent again.
+        kept,
+        /// Over its conversation's hourly limit: logged, not sent.
+        held,
+        /// Nothing to post (a scheduled run's NOTHING).
+        silent,
+        failed,
+    };
+};
+
+/// Where a run's posts go: the instance's conversations.
+pub const Outbox = struct {
+    ctx: *anyopaque,
+    /// The conversation called `name`; null: none.
+    find: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) ?Target,
+    /// Every conversation's name.
+    names: *const fn (ctx: *anyopaque, a: std.mem.Allocator) []const []const u8,
+    /// Posts it (it passed the gate).
+    post: *const fn (ctx: *anyopaque, a: std.mem.Allocator, p: *const Post) Delivery,
+};
+
 /// Asks the owner whether a call may run; blocks until they answer, the
 /// approval time runs out or the question's deadline passes.
 pub const Asker = struct {
@@ -134,9 +194,19 @@ pub const Conversation = struct {
         c.dropped += n;
     }
 
+    /// The messages to send: a turn that ended with tool results (a final
+    /// `send`, a limit) has the next turn's message joined to them in one
+    /// user message, the results first.
     pub fn messages(c: *const Conversation, arena: std.mem.Allocator) ![]model.Message {
         var out: std.ArrayList(model.Message) = .empty;
-        for (c.turns.items) |tn| try out.appendSlice(arena, tn.messages.items);
+        for (c.turns.items) |tn| for (tn.messages.items) |m| {
+            if (out.items.len > 0 and out.items[out.items.len - 1].role == m.role) {
+                const last = &out.items[out.items.len - 1];
+                last.blocks = try std.mem.concat(arena, model.Block, &.{ last.blocks, m.blocks });
+                continue;
+            }
+            try out.append(arena, m);
+        };
         return out.items;
     }
 };
@@ -247,6 +317,12 @@ pub const Run = struct {
     /// Tells the owner, beside the answer, of each memory item `remember`
     /// saves.
     notice: ?Notice = null,
+    /// Where `send` posts; null: no `send` (helpers, tests).
+    outbox: ?Outbox = null,
+    /// Posts made with `send` in this run.
+    sends: u32 = 0,
+    /// The call just made was a final `send` that went out: the turn ends.
+    posted_final: bool = false,
     /// The instance's list of files the agent wrote since the owner last
     /// allowed a shell command (see `Written`); helpers share it.
     written: ?*Written = null,
@@ -304,8 +380,10 @@ pub const Run = struct {
             .web => if (r.helper or r.env.browser.len == 0 or r.profiles_dir.len == 0 or @import("builtin").os.tag == .windows) return false,
             // only through `web`
             .login => return false,
+            // a run that posts: helpers answer the run that started them
+            .send => if (r.helper or r.outbox == null) return false,
             // the platform's kinds: the gate decides them, their tools come later
-            .send, .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save, .snapshot => return false,
+            .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save, .snapshot => return false,
             else => {},
         }
         const list = r.allowed orelse return true;
@@ -318,6 +396,13 @@ const delegate_def: model.ToolDef = .{
     .description = "Hand independent tasks to helpers that work at the same time, each with a clean context and its own tools. Each task must include every detail the helper needs. Returns each helper's short answer.",
     .schema_json =
     \\{"type":"object","properties":{"tasks":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"task":{"type":"string","description":"The whole task, standing alone."},"tools":{"type":"array","items":{"type":"string"},"description":"Tools the helper may use; default: search, fetch, browse, read_file, recall, skill."},"strong":{"type":"boolean","description":"Use the stronger, costlier model for this task."}},"required":["task"]}}},"required":["tasks"]}
+    ,
+};
+const send_def: model.ToolDef = .{
+    .name = "send",
+    .description = "Post to a conversation the owner reads: your reply (final: true; your turn ends with it), or a note while you keep working.",
+    .schema_json =
+    \\{"type":"object","properties":{"to":{"type":"string","description":"a conversation's name; default: this one"},"text":{"type":"string"},"final":{"type":"boolean","description":"this is your reply: the turn ends with it"}},"required":["text"]}
     ,
 };
 const skill_defs = [_]model.ToolDef{
@@ -333,6 +418,7 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
         const tool = gate.Tool.fromName(d.name).?;
         if (r.allows(tool)) try out.append(arena, d);
     }
+    if (r.allows(.send)) try out.append(arena, send_def);
     if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
     if (r.allows(.delegate)) try out.append(arena, delegate_def);
     for (skill_defs) |d| if (r.allows(gate.Tool.fromName(d.name).?)) try out.append(arena, d);
@@ -686,6 +772,9 @@ pub const PageCache = struct {
 pub const TurnResult = struct {
     text: []const u8,
     stopped: bool = false,
+    /// A final `send` went out (or was kept, held or not delivered): the
+    /// reply is done.
+    replied: bool = false,
     /// Why the turn ended early, in words for the owner.
     ended_by: ?[]const u8 = null,
     steps: u32 = 0,
@@ -702,6 +791,11 @@ const helper_prompt =
     \\You are a helper doing one task for an agent that works for its owner. Do only this task, with the tools you have.
     \\When done, answer in at most about 300 words: the result first, then the links you used, then anything you could not do and why. Your answer goes to the agent, not to the owner.
     \\Every tool call passes a gate and may be refused. If a call is refused, say so instead of trying another way around it.
+;
+
+const send_guide =
+    \\The owner sees only what you post with send. Reply with send and final: true; send without final for a note while you keep working. Your other text goes to the log.
+    \\
 ;
 
 const delegate_guide =
@@ -738,6 +832,7 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, if (r.helper) helper_prompt else base_prompt);
     if (!r.helper and r.model_cfg != null) try out.appendSlice(arena, delegate_guide);
+    if (r.allows(.send)) try out.appendSlice(arena, send_guide);
     if (r.scheduled) try out.appendSlice(arena, "This is a scheduled run: the owner is not watching and cannot approve anything.\n");
     if (r.extra_instructions.len > 0) try out.print(arena, "{s}\n", .{r.extra_instructions});
     if (r.skills_dir.len > 0 and r.allows(.skill)) {
@@ -932,6 +1027,8 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
         // a reply cut at max_tokens may end in a call cut half way (a
         // command missing its end): none of its calls run, each answered
         const cut = std.mem.eql(u8, reply.stop_reason, "max_tokens");
+        // a final send ends the turn: the calls after it are answered, not run
+        var ended = false;
         for (reply.blocks) |b| {
             if (b != .tool_use) continue;
             const u = b.tool_use;
@@ -940,12 +1037,24 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
                 try results.append(a, .{ .tool_result = .{ .id = u.id, .content = cut_note, .is_error = true } });
                 continue;
             }
+            if (ended) {
+                try r.logRun(.tool, r.isPrivate(), .{ .tool = u.name, .event = "not run: the turn ended with the final send" });
+                try results.append(a, .{ .tool_result = .{ .id = u.id, .content = after_final_note, .is_error = true } });
+                continue;
+            }
+            r.posted_final = false;
             const out = try callTool(r, a, u.name, u.input_json);
             calls_made += 1;
             try results.append(a, .{ .tool_result = .{ .id = u.id, .content = out.text, .is_error = out.is_error } });
+            if (r.posted_final) ended = true;
         }
         if (results.items.len == 0) break;
         try keep(tn, .{ .role = .user, .blocks = results.items });
+        // no other model call: the next turn's message joins these results
+        if (ended) {
+            result.replied = true;
+            break;
+        }
     }
     if (rejected) {
         conv.dropLast();
@@ -963,6 +1072,8 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     try r.logRun(.turn, r.isPrivate(), .{ .answer = result.text, .steps = result.steps, .ended_by = result.ended_by, .dropped_turns = dropped });
     return result;
 }
+
+const after_final_note = "not run: the turn ended with your final send";
 
 const cut_note = "not run: your reply was cut off at the output limit (max_tokens) before it was complete, so this call may be cut too; make it again, in smaller parts if it was long";
 
@@ -996,6 +1107,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         return .{ .text = "no such tool", .is_error = true };
     };
     if (!r.allows(tool)) return .{ .text = "this tool is not available here", .is_error = true };
+    if (tool == .send) return sendTool(r, a, input_json);
     if (tool == .web) {
         // the tool asks the gate itself: for each host and login it uses
         const w = r.web orelse return .{ .text = "this tool is not available here", .is_error = true };
@@ -1123,6 +1235,89 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     return out;
 }
 
+/// The longest post: 16 KB, sent in messages of 4096 bytes.
+pub const max_post = 16 * 1024;
+
+/// `send`: a post to a conversation (default the run's); `final` makes it
+/// the reply, and the turn ends once it went out.
+fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
+    const ob = r.outbox orelse return .{ .text = "this tool is not available here", .is_error = true };
+    const v = jv.parse(a, input_json);
+    const text = jv.str(jv.get(v, "text")) orelse return .{ .text = "send needs its text", .is_error = true };
+    const to = jv.str(jv.get(v, "to")) orelse r.conversation;
+    const final = jv.boolean(jv.get(v, "final")) orelse false;
+    if (text.len > max_post) return .{ .text = try std.fmt.allocPrint(a, "refused: the text has {d} bytes; a post has at most {d}", .{ text.len, max_post }), .is_error = true };
+    // only the owner and the settings make conversations
+    const target = ob.find(ob.ctx, a, to) orelse if (std.mem.eql(u8, to, r.conversation)) Target{ .name = to, .exists = false } else {
+        const known = try std.mem.join(a, ", ", ob.names(ob.ctx, a));
+        return .{ .text = try std.fmt.allocPrint(a, "refused: there is no conversation called {s}; they are: {s}", .{ to, known }), .is_error = true };
+    };
+    if (r.sends >= r.limits.sends_per_run)
+        return .{ .text = try std.fmt.allocPrint(a, "refused: this run has posted {d} times, the most one run may (sends_per_run)", .{r.sends}), .is_error = true };
+    r.sends += 1;
+    const post: Post = .{ .to = target.name, .text = text, .final = final };
+    const got = try postThrough(r, a, &post, target);
+    if (got.refused) |why| return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+    const d = got.delivery;
+    // went out, or never will now: either way it was the reply (R1)
+    if (final) r.posted_final = true;
+    return switch (d.status) {
+        .sent => .{ .text = try std.fmt.allocPrint(a, "posted to {s} ({d} message{s}{s})", .{ target.name, d.parts, if (d.parts == 1) "" else "s", if (d.files == 0) "" else try std.fmt.allocPrint(a, ", {d} file{s}", .{ d.files, if (d.files == 1) "" else "s" }) }) },
+        .kept => .{ .text = try std.fmt.allocPrint(a, "not delivered now ({s}); kept to be sent again", .{d.why}) },
+        .held => .{ .text = try std.fmt.allocPrint(a, "not sent: {s}; it is in the log", .{d.why}), .is_error = true },
+        .silent => .{ .text = "nothing posted" },
+        .failed => .{ .text = try std.fmt.allocPrint(a, "not delivered: {s}", .{d.why}), .is_error = true },
+    };
+}
+
+/// How a post through the gate went: refused, or what the outbox did.
+pub const Posted = struct { refused: ?[]const u8 = null, delivery: Delivery = .{ .status = .failed } };
+
+/// A post through the gate (`send`, its argument the conversation; asked
+/// every time where others read it), then the outbox; logged as a `send`
+/// line, private when the run or the target is.
+fn postThrough(r: *Run, a: std.mem.Allocator, p: *const Post, target: Target) !Posted {
+    const ob = r.outbox.?;
+    const detail = try std.fmt.allocPrint(a, "{d} bytes:\n{s}", .{ p.text.len, p.text });
+    const refused = try decideAndAskWith(r, a, .send, "send", target.name, detail, r.now(), .{ .shared = target.shared });
+    const private = r.isPrivate() or target.private;
+    if (refused) |why| {
+        try r.logRun(.send, private, .{ .to = target.name, .event = "refused", .bytes = p.text.len, .text = p.text, .final = p.final, .implicit = p.implicit, .delivered = false, .why = why });
+        return .{ .refused = why };
+    }
+    const d = ob.post(ob.ctx, a, p);
+    try r.logRun(.send, private, .{
+        .to = target.name,
+        .event = @tagName(d.status),
+        .bytes = p.text.len,
+        .text = p.text,
+        .final = p.final,
+        .implicit = p.implicit,
+        .delivered = d.status == .sent,
+        .message = d.message,
+        .parts = d.parts,
+        .why = if (d.why.len > 0) d.why else null,
+    });
+    return .{ .delivery = d };
+}
+
+/// The run's reply posted by harness (the model's last text when it
+/// stopped on its own, a brief's text): through the gate as a `send` to
+/// the run's conversation, logged `implicit`.
+pub fn postReply(r: *Run, a: std.mem.Allocator, text: []const u8) !Posted {
+    const ob = r.outbox orelse return .{ .refused = "nowhere to post" };
+    const target = ob.find(ob.ctx, a, r.conversation) orelse Target{ .name = r.conversation, .exists = false };
+    const post: Post = .{ .to = target.name, .text = text, .final = true, .implicit = true };
+    return postThrough(r, a, &post, target);
+}
+
+/// The text of a `send` call (the agent's words, for memory and
+/// summaries); null for another call.
+pub fn sentText(a: std.mem.Allocator, name: []const u8, input_json: []const u8) ?[]const u8 {
+    if (!std.mem.eql(u8, name, "send")) return null;
+    return jv.str(jv.get(jv.parse(a, input_json), "text"));
+}
+
 /// The run's tool environment, with its gate for redirects and the turn's
 /// end (fetch, search and browse get no more than what is left of it).
 fn redirectEnv(r: *Run) tools.Env {
@@ -1163,7 +1358,17 @@ pub const max_question = 12 * 1024;
 /// logged. Null when the call may run, else why not. `detail`: what the
 /// owner sees besides the argument (a file's content).
 fn decideAndAsk(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, now_s: i64) !?[]const u8 {
-    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who };
+    return decideAndAskWith(r, a, tool, name, arg, detail, now_s, .{});
+}
+
+/// What a call adds to the gate's decision.
+const AskExtra = struct {
+    /// A post to a conversation others read: asked every time.
+    shared: bool = false,
+};
+
+fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, now_s: i64, extra: AskExtra) !?[]const u8 {
+    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who, .shared = extra.shared };
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
@@ -1698,6 +1903,8 @@ fn helperRun(h: *Helper) !void {
     w.extra_instructions = "";
     w.cache = h.cache;
     w.web = null;
+    // a helper's answer goes to the run that started it
+    w.outbox = null;
     w.token_cap = p.agents.tokens;
     w.limits.steps_per_turn = p.agents.steps;
     w.limits.turn_seconds = @intCast(@min(left, std.math.maxInt(u32)));
@@ -1771,7 +1978,11 @@ fn summarise(r: *Run, conv: *Conversation, n: usize) !Summary {
             }
             switch (b) {
                 .text => |x| if (!std.mem.startsWith(u8, x, context_mark)) try turn_text.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(x, 2000) }),
-                .tool_use => |u| try turn_text.print(a, "(tool {s}: {s})\n", .{ u.name, util.cut(u.input_json, 300) }),
+                // what it posted is the agent's words
+                .tool_use => |u| if (sentText(a, u.name, u.input_json)) |x|
+                    try turn_text.print(a, "Agent: {s}\n", .{util.cut(x, 2000)})
+                else
+                    try turn_text.print(a, "(tool {s}: {s})\n", .{ u.name, util.cut(u.input_json, 300) }),
                 .tool_result => |x| try turn_text.print(a, "(result: {s})\n", .{util.cut(x.content, 500)}),
             }
         };

@@ -1712,6 +1712,8 @@ pub const Core = struct {
         run.asker = .{ .ctx = &ask, .ask = askOwner };
         var notify: Notify = .{ .core = c, .conv = conv };
         run.notice = .{ .ctx = &notify, .say = Notify.say };
+        var out: RunOut = .{ .core = c };
+        run.outbox = out.outbox();
         const res = agent.turn(&run, &x.conv, text, true) catch |e| {
             var buf: [128]u8 = undefined;
             c.sayIn(conv, std.fmt.bufPrint(&buf, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
@@ -1724,8 +1726,69 @@ pub const Core = struct {
         if (private) if (x.conv.turns.getLastOrNull()) |tn| {
             tn.private = true;
         };
-        if (!res.stopped) c.sayIn(conv, res.text);
+        // the reply went out with a final send; a limit or an error is
+        // said in harness's words, never with working text; else the
+        // model's last text is the reply, through the same path as a send
+        if (!res.stopped and !res.replied) {
+            if (res.ended_by) |why| c.sayIn(conv, why) else c.implicitReply(&run, arena.allocator(), conv, res.text);
+        }
         if (!private) x.turns_since_memory += 1;
+    }
+
+    /// The model stopped on its own without a final `send`: its last text is
+    /// posted as the reply (the gate decides it like a send); one the gate
+    /// stops is said.
+    fn implicitReply(c: *Core, run: *agent.Run, a: std.mem.Allocator, conv: []const u8, text: []const u8) void {
+        if (text.len == 0) return c.sayIn(conv, "The model gave an empty answer.");
+        const got = agent.postReply(run, a, text) catch |e| {
+            c.sayIn(conv, std.fmt.allocPrint(a, "The answer was not posted: {s}.", .{@errorName(e)}) catch "The answer was not posted.");
+            return;
+        };
+        if (got.refused) |why| c.sayIn(conv, std.fmt.allocPrint(a, "The answer was not posted: {s}.", .{why}) catch "The answer was not posted.");
+    }
+
+    /// A run's way to post (its `agent.Outbox`): the conversations, and the
+    /// name of what started it in front of its posts when that was not the
+    /// owner.
+    const RunOut = struct {
+        core: *Core,
+        /// "[btc-watch] " for a run the owner did not start; "" otherwise.
+        tag: []const u8 = "",
+
+        fn outbox(o: *RunOut) agent.Outbox {
+            return .{ .ctx = o, .find = find, .names = names, .post = post };
+        }
+
+        fn find(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) ?agent.Target {
+            const o: *RunOut = @ptrCast(@alignCast(ctx));
+            const c = o.core;
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            const e = c.convs.find(name) orelse return null;
+            return .{ .name = a.dupe(u8, e.name) catch return null, .shared = e.audience == .shared, .private = e.isPrivate() };
+        }
+
+        fn names(ctx: *anyopaque, a: std.mem.Allocator) []const []const u8 {
+            const o: *RunOut = @ptrCast(@alignCast(ctx));
+            const c = o.core;
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            return c.convs.names(a) catch &.{};
+        }
+
+        fn post(ctx: *anyopaque, a: std.mem.Allocator, p: *const agent.Post) agent.Delivery {
+            const o: *RunOut = @ptrCast(@alignCast(ctx));
+            return o.core.postOut(a, o, p);
+        }
+    };
+
+    /// A run's post, past the gate: to its conversation's place, with the
+    /// run's tag in front.
+    fn postOut(c: *Core, a: std.mem.Allocator, o: *RunOut, p: *const agent.Post) agent.Delivery {
+        const text = if (o.tag.len > 0) std.fmt.allocPrint(a, "{s}{s}", .{ o.tag, p.text }) catch p.text else p.text;
+        const sent = c.sendText(p.to, text) catch |e| return .{ .status = .failed, .why = whyUndelivered(e) };
+        c.touch(p.to);
+        return .{ .status = .sent, .message = sent.first, .parts = sent.count };
     }
 
     /// The context of conversation `name`: the one kept, or a new one. A
@@ -1908,8 +1971,11 @@ pub const Core = struct {
             const tn = turns[i];
             if (tn.private) continue;
             var one: std.ArrayList(u8) = .empty;
-            for (tn.messages.items) |m| for (m.blocks) |b| if (b == .text and !std.mem.startsWith(u8, b.text, agent.context_mark)) {
-                try one.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(b.text, 2000) });
+            for (tn.messages.items) |m| for (m.blocks) |b| switch (b) {
+                .text => |said| if (!std.mem.startsWith(u8, said, agent.context_mark)) try one.print(a, "{s}: {s}\n", .{ if (m.role == .user) "Owner" else "Agent", util.cut(said, 2000) }),
+                // what it posted is the agent's words
+                .tool_use => |u| if (agent.sentText(a, u.name, u.input_json)) |said| try one.print(a, "Agent: {s}\n", .{util.cut(said, 2000)}),
+                .tool_result => {},
             };
             if (size + one.items.len > memory_transcript_max) break;
             size += one.items.len;
@@ -3575,6 +3641,133 @@ test "every_line_of_a_run_carries_its_rid_and_conversation" {
         try t.expectEqualStrings("house-search", jv.str(jv.get(v, "conversation")).?);
     }
     try t.expect(n >= 6);
+}
+
+/// The model's reply: `blocks` (JSON content blocks) and a stop reason.
+fn replyOf(f: *Fix, blocks: []const u8, stop: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(f.e.arena.allocator(), "{{\"content\":[{s}],\"stop_reason\":\"{s}\"}}", .{ blocks, stop });
+}
+
+/// The log lines of kind `send`, in order.
+fn sendLines(f: *Fix) ![]const []const u8 {
+    const a = f.e.arena.allocator();
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, try logText(f), '\n');
+    while (lines.next()) |l| if (std.mem.indexOf(u8, l, "\"kind\":\"send\"") != null) try out.append(a, l);
+    return out.items;
+}
+
+test "send_final_posts_once_and_ends_the_turn_without_another_model_call" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, try replyOf(&f,
+        \\{"type":"text","text":"Here you go."},{"type":"tool_use","id":"tu_1","name":"send","input":{"text":"Three flats match.","final":true}},{"type":"tool_use","id":"tu_2","name":"recall","input":{"query":"after"}}
+    , "tool_use"));
+    try f.e.script(2, model.textReply("You are welcome."));
+    f.core.chatTurn("find flats");
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expectEqual(1, f.rec.count("Three flats match."));
+    // working text is never posted, and the call after the final send never ran
+    try t.expectEqual(0, f.rec.count("Here you go."));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"tool\":\"recall\",\"event\":\"not run: the turn ended with the final send\"") != null);
+    const sends = try sendLines(&f);
+    try t.expectEqual(1, sends.len);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"to\":\"main\",\"event\":\"sent\"") != null);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"final\":true,\"implicit\":false,\"delivered\":true") != null);
+    // the next turn's message joins the results in one user message, results first
+    f.core.chatTurn("thanks");
+    const a = f.e.arena.allocator();
+    const msgs = jv.arr(jv.at(jv.parse(a, try f.e.request(2)), &.{ "body", "messages" })).?;
+    for (msgs[1..], msgs[0 .. msgs.len - 1]) |m, prev| try t.expect(!std.mem.eql(u8, jv.str(jv.get(m, "role")).?, jv.str(jv.get(prev, "role")).?));
+    const last = jv.arr(jv.get(msgs[msgs.len - 1], "content")).?;
+    try t.expectEqualStrings("tool_result", jv.str(jv.get(last[0], "type")).?);
+    try t.expectEqualStrings("tu_1", jv.str(jv.get(last[0], "tool_use_id")).?);
+    try t.expect(std.mem.startsWith(u8, jv.str(jv.get(last[0], "content")).?, "posted to main"));
+    try t.expectEqualStrings("tu_2", jv.str(jv.get(last[1], "tool_use_id")).?);
+    try t.expect(std.mem.startsWith(u8, jv.str(jv.get(last[1], "content")).?, "not run: the turn ended with your final send"));
+    try t.expectEqualStrings("thanks", jv.str(jv.get(last[last.len - 1], "text")).?);
+    try t.expectEqual(1, f.rec.count("You are welcome."));
+}
+
+test "a_turn_that_stops_without_send_posts_its_last_text_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.textReply("Plain answer."));
+    f.core.chatTurn("hello");
+    try t.expectEqual(1, f.rec.count("Plain answer."));
+    const sends = try sendLines(&f);
+    try t.expectEqual(1, sends.len);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"to\":\"main\",\"event\":\"sent\"") != null);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"text\":\"Plain answer.\"") != null);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"final\":true,\"implicit\":true,\"delivered\":true") != null);
+    // the model is told to use send; the fallback is not mentioned
+    const req = try f.e.request(1);
+    try t.expect(std.mem.indexOf(u8, req, "The owner sees only what you post with send.") != null);
+    try t.expect(std.mem.indexOf(u8, req, "\"name\":\"send\"") != null);
+}
+
+test "a_note_mid_turn_does_not_take_the_replys_place" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, try replyOf(&f,
+        \\{"type":"text","text":"working on it"},{"type":"tool_use","id":"tu_1","name":"send","input":{"text":"Looking at three sites now."}}
+    , "tool_use"));
+    try f.e.script(2, model.textReply("Found two flats."));
+    f.core.chatTurn("find flats");
+    try t.expectEqual(2, f.e.server.modelRequests());
+    try t.expectEqual(1, f.rec.count("Looking at three sites now."));
+    try t.expectEqual(1, f.rec.count("Found two flats."));
+    try t.expectEqual(0, f.rec.count("working on it"));
+    const sends = try sendLines(&f);
+    try t.expectEqual(2, sends.len);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"final\":false,\"implicit\":false") != null);
+    try t.expect(std.mem.indexOf(u8, sends[1], "\"final\":true,\"implicit\":true") != null);
+}
+
+test "working_text_is_never_posted" {
+    var f: Fix = undefined;
+    try f.init("[limits]\nsteps_per_turn = 1\n", "", "");
+    defer f.deinit();
+    // text and a tool call, then the step limit
+    try f.e.script(1, model.toolReply("tu_1", "recall", "{\"query\":\"flats\"}"));
+    f.core.chatTurn("look it up");
+    try t.expectEqual(0, f.rec.count("Let me check."));
+    try t.expectEqual(1, f.rec.count("Step limit reached for this turn."));
+    try t.expectEqual(0, (try sendLines(&f)).len);
+}
+
+test "helpers_never_get_send" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"post it\",\"tools\":[\"send\",\"recall\"]}]}"));
+    try f.e.script(2, model.toolReply("h1", "send", "{\"text\":\"from a helper\",\"final\":true}"));
+    try f.e.script(3, model.textReply("helper done"));
+    try f.e.script(4, model.textReply("All done."));
+    f.core.chatTurn("split it");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "\"name\":\"send\"") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "\"name\":\"send\"") == null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "this tool is not available here") != null);
+    try t.expectEqual(0, f.rec.count("from a helper"));
+    try t.expectEqual(1, f.rec.count("All done."));
+}
+
+test "a_rule_that_stops_the_reply_is_said_in_main" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "deny send main\n" });
+    _ = try f.core.reload();
+    try f.e.script(1, model.textReply("You will not see this."));
+    f.core.chatTurn("hello");
+    try t.expectEqual(0, f.rec.count("You will not see this."));
+    try f.rec.waitIn("main", "The answer was not posted: rule on line 1.");
+    const sends = try sendLines(&f);
+    try t.expectEqual(1, sends.len);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"event\":\"refused\"") != null);
 }
 
 test "a_bad_rules_line_names_its_section_or_environment" {
