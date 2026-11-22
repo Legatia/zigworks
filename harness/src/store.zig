@@ -20,6 +20,22 @@ pub const Error = error{
 /// (CRED_MAX_CREDENTIAL_BLOB_SIZE).
 pub const wincred_max_value = 5 * 512;
 
+/// Store.putLong's header, and how many parts a value may have.
+const parts_mark = "#parts ";
+const max_parts = 64;
+const part_name_len = 160;
+
+/// The number of parts a header names, or null when `raw` is no header.
+fn partsIn(raw: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, raw, parts_mark)) return null;
+    const n = std.fmt.parseInt(usize, raw[parts_mark.len..], 10) catch return null;
+    return if (n >= 1 and n <= max_parts) n else null;
+}
+
+fn partName(buf: []u8, name: []const u8, i: usize) Error![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}.{d}", .{ name, i }) catch error.BadName;
+}
+
 pub const Store = union(enum) {
     /// A directory; each secret is a file in it, readable by the user only.
     dir: []const u8,
@@ -53,6 +69,89 @@ pub const Store = union(enum) {
             .keychain => |ns| if (is_mac) try mac.put(ns, name, value) else unreachable,
             .wincred => |ns| if (is_windows) try win.put(ns, name, value) else unreachable,
         }
+    }
+
+    /// A value that may be longer than the store keeps in one secret (a
+    /// login's passkeys, in the Credential Manager): kept in NAME alone when
+    /// it fits, else cut into parts NAME.1 … NAME.N with NAME holding
+    /// "#parts N". The parts are written before the header and those of an
+    /// older value removed after, so a crash leaves the old value or the new
+    /// one. No name `secret add` takes has a ".": a part never meets a secret.
+    pub fn putLong(s: Store, io: Io, gpa: std.mem.Allocator, name: []const u8, value: []const u8) Error!void {
+        return s.putParts(io, gpa, name, value, s.maxValue());
+    }
+
+    fn putParts(s: Store, io: Io, gpa: std.mem.Allocator, name: []const u8, value: []const u8, max: ?usize) Error!void {
+        const old = try s.partCount(io, gpa, name);
+        const m = max orelse std.math.maxInt(usize);
+        var parts: usize = 0;
+        if (value.len <= m) {
+            try s.put(io, name, value);
+        } else {
+            parts = (value.len + m - 1) / m;
+            if (parts > max_parts) return error.ValueTooLong;
+            for (0..parts) |i| {
+                var nb: [part_name_len]u8 = undefined;
+                try s.put(io, try partName(&nb, name, i + 1), value[i * m .. @min((i + 1) * m, value.len)]);
+            }
+            var hb: [32]u8 = undefined;
+            try s.put(io, name, std.fmt.bufPrint(&hb, "{s}{d}", .{ parts_mark, parts }) catch unreachable);
+        }
+        // the parts of an older, longer value
+        var i = parts + 1;
+        while (i <= old) : (i += 1) {
+            var nb: [part_name_len]u8 = undefined;
+            _ = try s.remove(io, try partName(&nb, name, i));
+        }
+    }
+
+    /// The value putLong kept, whole, or null. Caller frees.
+    pub fn getLong(s: Store, io: Io, gpa: std.mem.Allocator, name: []const u8) Error!?[]u8 {
+        const raw = (try s.get(io, gpa, name)) orelse return null;
+        const n = partsIn(raw) orelse return raw;
+        gpa.free(raw);
+        var pieces: [max_parts][]u8 = undefined;
+        var got: usize = 0;
+        defer for (pieces[0..got]) |p| {
+            std.crypto.secureZero(u8, p);
+            gpa.free(p);
+        };
+        var total: usize = 0;
+        for (1..n + 1) |i| {
+            var nb: [part_name_len]u8 = undefined;
+            // a part that is not there: the value can't be put together
+            pieces[got] = (try s.get(io, gpa, try partName(&nb, name, i))) orelse return error.StoreFailed;
+            total += pieces[got].len;
+            got += 1;
+        }
+        // one buffer of the right size: no copy is left behind by growing it
+        const out = try gpa.alloc(u8, total);
+        var at: usize = 0;
+        for (pieces[0..got]) |p| {
+            @memcpy(out[at .. at + p.len], p);
+            at += p.len;
+        }
+        return out;
+    }
+
+    /// Removes what putLong kept, parts and all; false if nothing was there.
+    pub fn removeLong(s: Store, io: Io, gpa: std.mem.Allocator, name: []const u8) Error!bool {
+        const n = try s.partCount(io, gpa, name);
+        for (1..n + 1) |i| {
+            var nb: [part_name_len]u8 = undefined;
+            _ = try s.remove(io, try partName(&nb, name, i));
+        }
+        return s.remove(io, name);
+    }
+
+    /// How many parts the value under `name` has; 0: none, or one secret.
+    fn partCount(s: Store, io: Io, gpa: std.mem.Allocator, name: []const u8) Error!usize {
+        const raw = (try s.get(io, gpa, name)) orelse return 0;
+        defer {
+            std.crypto.secureZero(u8, raw);
+            gpa.free(raw);
+        }
+        return partsIn(raw) orelse 0;
     }
 
     /// The value, or null if none is stored. Caller frees.
@@ -397,6 +496,66 @@ test "the directory store keeps, replaces and removes values" {
     try t.expect(try s.remove(io, "gh"));
     try t.expect(!try s.remove(io, "gh"));
     try t.expectEqual(null, try s.get(io, t.allocator, "gh"));
+}
+
+test "a_value_longer_than_the_store_keeps_goes_into_parts_and_comes_back_whole" {
+    const io = t.io;
+    const a = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    const sub = try std.fs.path.join(a, &.{ path, "secrets" });
+    defer a.free(sub);
+    const s: Store = .{ .dir = sub };
+    const exists = struct {
+        fn f(st: Store, name: []const u8) !bool {
+            const v = (try st.get(t.io, t.allocator, name)) orelse return false;
+            t.allocator.free(v);
+            return true;
+        }
+    }.f;
+    // a value stored before, in one secret, reads as it was
+    try s.put(io, "rec", "[\"short\"]");
+    const old = (try s.getLong(io, a, "rec")).?;
+    defer a.free(old);
+    try t.expectEqualStrings("[\"short\"]", old);
+    // 25 bytes in parts of at most 10: three parts and a header
+    const long = "[\"aaaaaaaa\",\"bbbbbbbbbb\"]";
+    try s.putParts(io, a, "rec", long, 10);
+    const header = (try s.get(io, a, "rec")).?;
+    defer a.free(header);
+    try t.expectEqualStrings("#parts 3", header);
+    for ([_][]const u8{ "rec.1", "rec.2", "rec.3" }) |p| try t.expect(try exists(s, p));
+    const whole = (try s.getLong(io, a, "rec")).?;
+    defer a.free(whole);
+    try t.expectEqualStrings(long, whole);
+    // shorter: two parts, the third goes
+    try s.putParts(io, a, "rec", "[\"cccccccccccc\"]", 10);
+    try t.expect(!try exists(s, "rec.3"));
+    const two = (try s.getLong(io, a, "rec")).?;
+    defer a.free(two);
+    try t.expectEqualStrings("[\"cccccccccccc\"]", two);
+    // fits again: one secret, no parts left
+    try s.putParts(io, a, "rec", "[\"d\"]", 10);
+    try t.expect(!try exists(s, "rec.1"));
+    try t.expect(!try exists(s, "rec.2"));
+    const one = (try s.getLong(io, a, "rec")).?;
+    defer a.free(one);
+    try t.expectEqualStrings("[\"d\"]", one);
+    // a missing part is an error, not half a value
+    try s.putParts(io, a, "rec", long, 10);
+    _ = try s.remove(io, "rec.2");
+    try t.expectError(error.StoreFailed, s.getLong(io, a, "rec"));
+    // removed with its parts
+    try s.putParts(io, a, "rec", long, 10);
+    try t.expect(try s.removeLong(io, a, "rec"));
+    for ([_][]const u8{ "rec", "rec.1", "rec.2", "rec.3" }) |p| try t.expect(!try exists(s, p));
+    try t.expect(!try s.removeLong(io, a, "rec"));
+    // more parts than allowed is refused up front, nothing written
+    const seventy: [70]u8 = @splat('x');
+    try t.expectError(error.ValueTooLong, s.putParts(io, a, "big", &seventy, 1));
+    try t.expect(!try exists(s, "big.1"));
 }
 
 test "a_folder_from_before_namespaces_keeps_the_old_one_and_only_a_new_folder_gets_its_own" {

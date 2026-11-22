@@ -9,6 +9,67 @@ search for the function names given with them.
 Run everything with `HARNESS_HOME` and `HARNESS_STORE` set to scratch
 folders, except where a step says to use the Credential Manager.
 
+## Done on Windows (2026-11-22, branch `harness-windows`)
+
+Windows 11, Zig 0.17.1. The consoles were pseudo consoles (headterm, and a
+script that opens and closes one); the model was harness-fake.
+
+- **1 (I27), done.** `proc.zig`: each child of the shell tool, of an MCP
+  server and of browse is created suspended, put in a kill-on-close job,
+  then let run; reads wait with PeekNamedPipe, so drains are bounded. New
+  Windows tests (they failed before): a stopped command ends what it
+  started; a background child holding the pipe doesn't hold the command;
+  an MCP server's deinit ends what it started; the job itself. By hand: an
+  npx MCP server through five `/reload`s kept two node.exe and left none
+  after chat; browse of a page that never answers, then `/stop`: twelve
+  chrome.exe of harness's profile, none 0.8 s later. Limits line lifted.
+  Also on all systems: an MCP server's shutdown waits for stderr's end, so
+  a start error's text isn't lost (seen once on Linux).
+- **2 (mintty echo), done.** A secret is not read where typing it would
+  show: an MSYS or Cygwin terminal, known by its pipe's name, or a console
+  whose echo can't be switched off; with or without `--stdin`. Zig's
+  `isTty` didn't recognise such a pipe here, so before this harness said
+  "type the value at a terminal" there. Checked with a pipe named like
+  Git Bash's terminal as stdin; in a real console the value isn't shown
+  and is stored.
+- **3 (folder lock), checked.** A second chat is refused; `health` while
+  only chat runs says chat holds the folder, exit 1; with `run` it exits
+  0; after `taskkill /F` of `run`, `health` says "not running" at once and
+  a new `run` starts within 0.2 s. smoke.sh's "memory list works offline"
+  now runs on Windows and passes.
+- **4 (Ctrl-C, closing the console), checked.** With an approved
+  `ping -n 30` running: Ctrl-C ends harness in about 0.3 s, the log has
+  the signal and the stop, `log verify` holds, the folder is free at once,
+  no PING.EXE is left. Closing the console: the same, the signal logged as
+  "console closed". A hard kill: no PING.EXE left (the job's handle closes
+  with harness), the folder free. Fixed on the way: chat's console read,
+  broken off by the signal (STATUS_ALERTED), ended in an error beside the
+  signal's own path; it now waits for that path. And "Ctrl-D to leave"
+  doesn't work in a Windows console: the banner says Ctrl-Z and Enter
+  there, and a line of Ctrl-D leaves too.
+- **5 (Credential Manager), checked.** A folder other than the built-in
+  one got `harness-<16 hex>:NAME`; a 3000-byte value was refused with the
+  limit, a 2560-byte one stored and read back whole (CredReadW), then
+  removed. There were no secrets from before to check the built-in
+  folder's `harness:NAME` against (the unit tests cover the naming).
+- **6 (web), done** (see HANDOFF-windows-web.md for how). The 2560-byte
+  limit on the passkeys record is met by keeping a long record in parts
+  (`Store.putLong`): `login-NAME-passkeys` holds "#parts N" and
+  `login-NAME-passkeys.1` … `.N` the record; one that fits stays as before.
+- **7, partly.** New Windows test: files are never written or read
+  through a junction out of the workspace (junctions need no
+  administrator, unlike symlinks; harness already refused). The two
+  symlink tests still skip. A fetch of a page that never answers is cut by
+  `/stop` (stopped by the owner) and by the turn's end (`turn_seconds = 6`:
+  "not finished: the turn's time is up").
+- **The core.zig tests listed at the end now run on Windows too**, with
+  cmd versions of their commands (ping for sleep, `cmd /c "cd >&2 & exit
+  1"`, batch files for the slow servers, a caret for the masked value).
+  Still skipping there: main.zig's
+  `sigterm_is_caught_and_noted_not_the_end_of_the_process` (section 4 was
+  checked by hand), the stand-in-browser tests (shell scripts) and the
+  two symlink tests.
+
 ## 1. I27: what a command starts must end with it (job objects)
 
 Windows has no process groups. Today a stop or a time limit ends the one

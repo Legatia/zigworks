@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const util = @import("util.zig");
 const jv = @import("jv.zig");
 const url_mod = @import("url.zig");
+const proc = @import("proc.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -1097,24 +1098,11 @@ const Collector = struct {
         c.buf.appendSlice(c.gpa, part[0..@min(room, part.len)]) catch {};
     }
 
-    /// POSIX: reads until the pipe closes or `ended` is set, looking every
-    /// 100 ms, so a process that kept the pipe open can't hold us.
+    /// Reads until the pipe closes or `ended` is set, so a process that
+    /// kept the pipe open can't hold us (see proc.waitReadable).
     fn pumpUntil(c: *Collector, io: Io, from: Io.File, ended: *std.atomic.Value(bool)) void {
         var buf: [16384]u8 = undefined;
-        while (!ended.load(.acquire)) {
-            var fds = [_]std.posix.pollfd{.{ .fd = from.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-            const ready = std.posix.poll(&fds, 100) catch break;
-            if (ready == 0) continue;
-            const got = from.readStreaming(io, &.{&buf}) catch break;
-            if (got == 0) break;
-            c.add(io, buf[0..got]);
-        }
-        c.finished.store(true, .release);
-    }
-
-    fn pump(c: *Collector, io: Io, from: Io.File) void {
-        var buf: [16384]u8 = undefined;
-        while (true) {
+        while (proc.waitReadable(io, from, ended)) {
             const got = from.readStreaming(io, &.{&buf}) catch break;
             if (got == 0) break;
             c.add(io, buf[0..got]);
@@ -1128,6 +1116,8 @@ const Ended = enum { stopped, timeout, download };
 const Watch = struct {
     io: Io,
     id: std.process.Child.Id,
+    /// Windows: the browser's job (its helpers are in it too).
+    job: *const proc.Job,
     stop: *std.atomic.Value(bool),
     deadline_ns: i128,
     done: std.atomic.Value(bool) = .init(false),
@@ -1158,11 +1148,11 @@ const Watch = struct {
         if (w.reason != null) w.killAll();
     }
 
-    /// The whole process group on POSIX (the browser's helpers go too);
-    /// the process itself on Windows.
+    /// The whole process group on POSIX, the job on Windows (the
+    /// browser's helpers go too).
     fn killAll(w: *Watch) void {
         if (is_windows) {
-            _ = std.os.windows.ntdll.NtTerminateProcess(w.id, @fromBackingInt(@intCast(1)));
+            w.job.kill(w.id);
         } else {
             w.killGroup();
             std.posix.kill(w.id, .KILL) catch {};
@@ -1355,6 +1345,9 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
         u.href,
     });
     var vars = try benv.map(arena);
+    // Windows: in a job before it can start its helpers (see proc.zig)
+    var job = proc.Job.create();
+    defer job.close();
     var child = try std.process.spawn(io, .{
         .argv = argv.items,
         .environ_map = &vars,
@@ -1362,13 +1355,16 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
         .stdout = .pipe,
         .stderr = .ignore,
         .pgid = if (is_windows) null else 0,
+        .start_suspended = is_windows,
         .create_no_window = true,
     });
+    job.adopt(&child);
     var col: Collector = .{ .cap = max_bytes, .gpa = gpa };
     defer col.buf.deinit(gpa);
     var watch: Watch = .{
         .io = io,
         .id = child.id.?,
+        .job = &job,
         .stop = stop,
         .deadline_ns = Io.Clock.awake.now(io).nanoseconds + @as(i128, timeout_ms) * std.time.ns_per_ms,
         .download_dir = try std.fs.path.join(arena, &.{ profile, "Downloads" }),
@@ -1376,9 +1372,21 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
     const th_watch = try std.Thread.spawn(.{}, Watch.run, .{&watch});
     var term: ?std.process.Child.Term = null;
     if (is_windows) {
-        const th_out = try std.Thread.spawn(.{}, Collector.pump, .{ &col, io, child.stdout.? });
-        th_out.join();
+        // the pipe is ours: `wait` must not close it under the reader
+        const out_f = child.stdout.?;
+        child.stdout = null;
+        defer out_f.close(io);
+        var ended: std.atomic.Value(bool) = .init(false);
+        const th_out = try std.Thread.spawn(.{}, Collector.pumpUntil, .{ &col, io, out_f, &ended });
         term = child.wait(io) catch null;
+        watch.done.store(true, .release);
+        th_watch.join();
+        // nothing it started may outlive it: its helpers hold the pipe too
+        job.kill(null);
+        var waited: u32 = 0;
+        while (!col.finished.load(.acquire) and waited < 2000) : (waited += 20) io.sleep(.fromMilliseconds(20), .awake) catch {};
+        ended.store(true, .release);
+        th_out.join();
     } else {
         // the pipe is ours: `wait` must not close it under the reader
         const out_f = child.stdout.?;
@@ -1399,10 +1407,6 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
         while (!col.finished.load(.acquire) and waited < 2000) : (waited += 20) io.sleep(.fromMilliseconds(20), .awake) catch {};
         ended.store(true, .release);
         th_out.join();
-    }
-    if (is_windows) {
-        watch.done.store(true, .release);
-        th_watch.join();
     }
 
     if (watch.reason) |r| return switch (r) {
