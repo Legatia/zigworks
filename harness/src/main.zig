@@ -1619,6 +1619,7 @@ test {
     _ = @import("jv.zig");
     _ = @import("who.zig");
     _ = @import("conversations.zig");
+    _ = @import("inbox.zig");
     _ = @import("session.zig");
     _ = @import("sock.zig");
     _ = @import("store.zig");
