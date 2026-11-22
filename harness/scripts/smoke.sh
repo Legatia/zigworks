@@ -297,6 +297,54 @@ reply "$(text_reply 'Two new flats.')"
 say "/reload"
 check "a task with to = posts to its topic" 'wait_for "$OUT" "\"message_thread_id\":5012,\"text\":\"[watch] Two new flats.\"" 30'
 
+# an agent definition written by hand: picked for a conversation it answers
+# there with its own instructions and model; it proposes a change to itself,
+# asked every time with the whole file, and the next run uses the change
+cat >"$HARNESS_HOME/agents/researcher.md" <<'EOF'
+---
+name: researcher
+description: Research across several sources; answers with links.
+model: claude-haiku
+tools: search, fetch, recall, agent_save
+memory: pinned
+---
+Research one question at a time.
+EOF
+chmod 600 "$HARNESS_HOME/agents/researcher.md"
+reloaded() { grep -c "Settings reloaded." "$OUT"; }
+tries=0
+while [ $tries -lt 5 ]; do
+	r0=$(reloaded)
+	say "/reload"
+	i=0
+	while [ $i -lt 30 ] && [ "$(reloaded)" -le "$r0" ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	[ "$(reloaded)" -gt "$r0" ] && break
+	tries=$((tries + 1))
+done
+say "/agent researcher"
+check "/agent picks a definition for the conversation" 'wait_for "$OUT" "researcher answers here from your next message."'
+reply "$(text_reply 'Found it in two sources.')"
+say "what changed in zig"
+check "the conversation's definition answers, with its instructions and model" 'wait_for "$OUT" "Found it in two sources." && grep -qF "Research one question at a time." "$(req)" && grep -qF "\"model\":\"claude-haiku\"" "$(req)"'
+say "/agents"
+check "/agents lists the definitions" 'wait_for "$OUT" "researcher: Research across several sources; answers with links."'
+before=$(asked)
+reply "$(call_reply tu_as agent_save '{"name":"researcher","text":"---\nname: researcher\ndescription: Research across several sources; answers with links.\nmodel: claude-haiku\ntools: search, fetch, recall, agent_save\nmemory: pinned\n---\nResearch one question at a time. Cite dates.\n"}')"
+reply "$(text_reply 'Saved my definition.')"
+say "always cite dates"
+check "agent_save asks with the whole file and no Allow 24 h" 'wait_asked $((before + 1)) && last_question | grep -qF "agent_save: researcher" && last_question | grep -qF "Cite dates." && [ -z "$(button day)" ]'
+press once
+check "an allowed change is written, marked, and its old file kept" 'wait_for "$OUT" "Saved my definition." && grep -qF "saved: agent:researcher " "$HARNESS_HOME/agents/researcher.md" && [ -n "$(ls "$HARNESS_HOME/state/agents/researcher/versions/")" ]'
+say "/new"
+wait_for "$OUT" "New conversation."
+reply "$(text_reply 'Dated answer.')"
+say "and now"
+check "the next run uses the change" 'wait_for "$OUT" "Dated answer." && grep -qF "Cite dates." "$(req)"'
+say "/agent main"
+
 kill "$RPID" 2>/dev/null
 wait "$RPID" 2>/dev/null
 RPID=""
@@ -307,6 +355,7 @@ check "a login is removed with its secrets" '"$H" login rm bot >/dev/null && "$H
 # it was skipped for is gone (HANDOFF-windows-audit.md, section 3)
 if [ $windows = 0 ]; then
 	check "memory list works offline" '"$H" memory list 2>/dev/null | grep -qF "I prefer short briefs"'
+	check "agent list works offline" '"$H" agent list 2>/dev/null | grep -qF "researcher: Research across several sources"'
 fi
 
 if [ $fail = 0 ]; then echo "smoke: all ok"; else

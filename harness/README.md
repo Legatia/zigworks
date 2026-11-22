@@ -16,15 +16,19 @@ schedule ──┘    │  ▲  ▲   │           └─ delegate ─► helpe
           omnigate memory skills  action log
 ```
 
+What the agent is, and what each helper is, is a file you can read and
+change: `agents/main.md`, `agents/helper.md`, and any others you add
+(Agent definitions, below).
+
 One binary for macOS, Linux (x86_64, arm64) and Windows (x86_64), about
 1.9 MB on macOS and 2.3 MB on Linux stripped, nothing beyond the Zig
 standard library (and the system's Security framework on macOS). Models
 are reached only through [omnigate](https://github.com/Legatia/omnigate),
 which holds the provider keys and the budgets.
 
-**State: 0.3.0, tested on macOS by its own tests: 444 unit tests (2 skipped), among
+**State: 0.3.0, tested on macOS by its own tests: 480 unit tests (2 skipped), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 48 checks that drives the real binary against
+and an end-to-end script of 55 checks that drives the real binary against
 stand-ins for omnigate, Telegram, feeds, search and two MCP servers. An
 earlier build of 0.3.0 also passed its tests in CI on Linux and Windows.
 Nothing has run yet against a real omnigate, Telegram bot, MCP server or
@@ -77,14 +81,15 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `logins.ini` | the agent's own logins: name, site, username (no secrets) |
 | `profiles/` | each login's browser profile (its cookies) |
 | `skills/` | saved skills, one folder each (`NAME/SKILL.md`) |
+| `agents/` | agent definitions, one file each (`NAME.md`) |
 | `memory/` | one file per memory item |
 | `workspace/` | where the agent's files and commands live |
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
-| `state/` | grants, seen feed items, owner, the conversations (`conversations`), status, lock, approval numbers, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command (`written`), `mcp/NAME` (each MCP server's own folder) |
+| `state/` | grants, seen feed items, owner, the conversations (`conversations`), status, lock, approval numbers, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files) |
 
-On macOS and Linux, `config.ini`, `rules`, `logins.ini` and `mcp.ini` are
-refused if other users can write them. Harness names a settings file it
+On macOS and Linux, `config.ini`, `rules`, `logins.ini`, `mcp.ini`, the
+folder `agents/` and its files are refused if other users can write them. Harness names a settings file it
 refuses, and the line of one that does not read. Changes to the settings
 files apply after `/reload`; harness tells you when it notices one.
 
@@ -106,7 +111,7 @@ Every tool call is decided in one place, in this order:
    `skill_save` and MCP tools ask; so does `write_file` for a path with a
    part starting with "." (`.git/config`, `.npmrc`); files, search,
    memory, `skill` and `delegate` are allowed (each helper's own calls
-   pass the gate like any other).
+   pass the gate like any other). `agent_save` is asked every time.
 
 ```
 deny  shell rm -rf *
@@ -126,6 +131,7 @@ every call.
 | `[schedule:NAME]` | runs of the task or brief NAME, on schedule or by hand |
 | `[agent:main]` | the agent's own calls in the chat, tasks and briefs |
 | `[agent:helper]` | helpers' calls |
+| `[agent:NAME]` | the calls of definition NAME (`agents/NAME.md`), wherever it runs |
 
 A kind alone covers all its names (`[schedule]`), and `*` works as in
 rules (`[schedule:btc-*]`). A section for the call's own definition may
@@ -144,8 +150,8 @@ allow fetch https://api.coinbase.com/*
 deny  shell *
 ```
 
-Sections for `trigger:NAME`, `workflow:NAME/STEP`, `app:NAME` and other
-`agent:NAME` are read the same way; they apply once those parts exist. A
+Sections for `trigger:NAME`, `workflow:NAME/STEP` and `app:NAME` are
+read the same way; they apply once those parts exist. A
 task or brief whose name has a space, `:`, `/` or `*` can't be named
 exactly in a section; `[schedule]`, or a pattern with `*`, reaches it. A
 section harness can't read (`[agnet:main]`) is refused, naming its line.
@@ -200,7 +206,9 @@ the run says what it skipped.
 "Allow 24 h" covers that call for the definition that asked: given in
 the chat, it covers the agent's chat turns, tasks and briefs
 (`agent:main`), not helpers; given to a helper, it covers helpers
-(`agent:helper`). A grant kept without a who, as harness 0.3 kept them,
+(`agent:helper`); given to `researcher`, it covers `researcher`. A
+question names a definition other than `main` and `helper`
+(`[researcher] shell: …`, `[chat/h1 researcher] …`). A grant kept without a who, as harness 0.3 kept them,
 covers every run. `state/grants` holds one a line: the tool
 (`shell@host` for a command), the expiry, the exact command, host, MCP
 tool or path, and who it covers.
@@ -219,14 +227,16 @@ output as `[secret:NAME]` before anything is cut from it, and before the
 model or the log sees it. A tool call gets at most what is left of the
 turn's time.
 
-Money tools (below) are the exception: asked every time.
+Money tools (below) and `agent_save` (Agent definitions) are the
+exception: asked every time.
 
 ## Conversations
 
 You and the agent talk in conversations: `main`, your private chat with
 the bot; a topic of that chat per subject; groups you add; and `terminal`
-(`harness chat`). Each of yours has its own context, `/new` and
-`/private`. Messages wait in one queue, one turn at a time.
+(`harness chat`). Each of yours has its own context (one per definition
+that answers there), `/new` and `/private`. Messages wait in one queue,
+one turn at a time.
 
 - **Topics.** A topic you open in your chat with the bot is a conversation
   from its first message, named after it ("House search" is
@@ -264,9 +274,9 @@ the bot; a topic of that chat per subject; groups you add; and `terminal`
   notices and the log warning at start to `main`; questions and memory
   notices to the run's conversation. The agent is told its conversation
   and the others' names with each message.
-- **Contexts.** At most 16 are kept: for a 17th the least used is dropped
-  after the memory writer has read it, and the agent is told when that
-  conversation comes back.
+- **Contexts.** One per definition in a conversation, at most 16 kept:
+  for a 17th the least used is dropped after the memory writer has read
+  it, and that definition is told when it comes back there.
 - **Pairing** another account moves `main` to it and forgets the old
   account's topics, saying which.
 
@@ -276,6 +286,9 @@ the bot; a topic of that chat per subject; groups you add; and `terminal`
 ```json
 {"name":"house-search","channel":"telegram","chat":123456789,"thread":5012,"audience":"own","private":false,"created":"2026-11-22T09:30:00Z"}
 ```
+
+A conversation where another definition than `main` answers (`/agent
+NAME`) has `"agent":"NAME"` at the end of its line.
 
 `/conversations` lists them; `/conversation rename OLD NEW` and
 `/conversation rm NAME` (harness forgets it; a topic stays in Telegram)
@@ -292,11 +305,17 @@ printed, with `[NAME]` in front when it is for another conversation.
 
 `delegate` hands up to 8 tasks to helpers that run at the same time:
 research across several sources, comparisons, anything that splits into
-parts. Each helper starts with a clean context, gets only the tools it was
-given (never `delegate`, `remember`, `skill_save` or money tools), uses
-`worker_model` unless the task asks for the strong one, and returns a short
-answer, not its working. Limits per helper in `[agents]`: model calls,
-input tokens and answer size; at most `parallel` run at once in the whole
+parts. A task names the definition that does it (`agent`, default
+`helper`); a helper is a run of that definition. Each starts with a clean
+context, gets its definition's tools within those the task names and the
+delegating run has (never `delegate`, `remember`, `skill_save`, `send`,
+`agent_save`, `web` or money tools; a task that names none gets
+`helper`'s six: search, fetch, browse, read_file, recall, skill, or another
+definition's own tools), uses its definition's model, else
+`worker_model` (the strong one when the task asks), and returns a short
+answer, not its working. Limits per helper: its definition's, else
+`[agents]`'s model calls, input tokens and answer size, and never past the
+delegating turn's end; at most `parallel` run at once in the whole
 instance. Helpers of one call share fetched pages, so none is downloaded
 twice, and they ask you one question at a time; one that can't be answered
 before the turn ends is refused without asking. `/stop` stops them too.
@@ -307,6 +326,79 @@ turn reads the earlier steps from cache. When a conversation outgrows
 `conversation_bytes`, the oldest turns are replaced by a summary instead
 of being dropped; turns that still don't fit after the summary are
 dropped, logged, and the agent is told.
+
+## Agent definitions
+
+An agent is a file in `agents/`, a header like a skill's and then its
+instructions; a run is one execution of it. `harness init` writes
+`main.md` (the agent) and `helper.md` (what `delegate` starts) with the
+instructions harness has built in; without them the same built-ins
+apply.
+
+```markdown
+---
+name: researcher
+description: Research across several sources; answers with links.
+model: claude-haiku
+tools: search, fetch, browse, read_file, recall, skill, github/list_issues
+memory: pinned
+parallel: 4
+---
+Research one question at a time. Use at least two independent sources.
+```
+
+| Key | Means | Default |
+|---|---|---|
+| `name` | the file's name: a-z, 0-9 and `-` (up to 64), not `list`, `show` or `rm` | required |
+| `description` | one line: when to use it | required |
+| `model` | an omnigate route | `[model] model`; delegated: `worker_model` |
+| `tools` | tool names, `server/tool`, `server/*`, `*` for all, `none` | search, fetch, browse, read_file, recall, skill |
+| `skills` | skill names or patterns (`zig-*`), `*`, `none` | `*` |
+| `memory` | `shared` (pinned items, the strongest, what a message recalls) or `pinned` | `shared` |
+| `steps`, `tokens`, `seconds` | per run (tokens: input, summed) | `[limits]`; delegated: `[agents]` and the rest of the turn |
+| `answer_bytes` | a delegated run's answer | `[agents] answer_bytes` |
+| `parallel` | most runs of it at once (0: only the global limits) | 0 |
+| `environment` | where its commands run: `host` only for now | `host` |
+
+A file is at most 8 KB, and there are at most 32 definitions, the two
+built-ins counted. A file that does not read is named with its line, and
+nothing changes; hand edits apply after `/reload`, as for `rules`. `main`
+and `helper` have `tools: *`; a `delegate` task to `helper` that names no
+tools gets the six above, as before. `memory: pinned` shapes what goes
+into the prompt; a `recall` the definition lists still searches memory.
+
+- **In a conversation.** `/agent NAME` makes NAME answer in this
+  conversation from your next message on; `/agent` says which one does.
+  Each definition keeps its own context there, and `/new` starts every
+  one of them fresh. `/ask NAME text` sends one message to NAME here; its
+  answer comes marked `[NAME]`. Messages still take turns in one queue,
+  whatever their definition.
+- **Tasks.** `agent = NAME` in a task of tasks.ini runs it as NAME
+  (default `main`); a task naming no definition stops the settings from
+  loading, naming it.
+- **`agent_save`.** The agent may propose a new definition or a change to
+  its own (never another's) with the whole file. Harness reads it first:
+  one that does not read goes back to the agent unasked. Otherwise you are
+  asked every time, with no "Allow 24 h" (no grant or `allow` rule lifts
+  it; a `deny` rule stops it): who asks, new or change, each header field
+  that changes with those that widen first under "Widens:" (tools or
+  skills added, memory to `shared`, the model changed, a limit raised),
+  then the whole file. On Allow the old file goes to
+  `state/agents/NAME/versions/` (the last 10 kept), the new one is written
+  with `saved: agent:NAME TIME`, and runs that start after it use it; a
+  run already going keeps the version it started with. It is offered only
+  in runs you started from a conversation: never to helpers or tasks.
+- **Places.** A definition's `parallel` holds for its helpers (one waits
+  for a place until its turn ends) and its tasks (one finding no place
+  runs at a later tick); your own turn always runs and counts toward it.
+- **Commands.** `/agents` lists each definition: what it may use, where it
+  answers, who saved it, how many earlier versions are kept, how many runs
+  of it are going. `/agent show NAME` shows its file. `/agent rm NAME`
+  moves its file to its versions (refused for `main`, `helper` and one a
+  task uses); conversations it answered in go back to `main`. `/stop NAME`
+  stops NAME's runs and the runs they delegated, and drops its queued
+  messages. On the command line: `harness agent list | show NAME | rm
+  NAME`.
 
 ## Research
 
@@ -460,7 +552,8 @@ not have is not started.
 
 Skills are folders in the agentskills.io format (`skills/NAME/SKILL.md`
 with `name` and `description`). The agent sees their names and
-descriptions, loads one with `skill` when it fits, and can save one with
+descriptions (those its definition's `skills` take), loads one with
+`skill` when it fits, and can save one with
 `skill_save` (asked, showing its name, description and body). `/skills`
 lists them, `/skill rm NAME` removes one.
 
@@ -474,13 +567,15 @@ run's id (the `seq` of its first line), `conversation`, where it reports
 (a helper's is its parent's), and `run`, its label (`chat`, `task NAME`,
 `brief NAME`, `chat/h1`). Its first line also names who started it,
 `by` (`owner`, or `schedule:NAME` for a task or brief; a helper has its
-parent's), its definition, `agent` (`main` or `helper`), and for a
+parent's), its definition, `agent` (`main`, `helper` or another), and for a
 helper `parent`, the rid of the run that delegated it; gate and tool
 lines carry `agent` too, and tool lines the output's whole size, `bytes`.
 A post is a line of kind `send`: `to`, `event` (`sent`, `refused`,
 `held`, `kept`, `failed`), `bytes`, `text`, `files`, `buttons`, `final`,
 `implicit`, `delivered`, the first message's id and the number of
-messages. A private run's lines, and a post into a private conversation,
+messages. A definition saved or removed is a line of kind `agent`:
+`saved` (`name`, `by`, `agent`, `item`, `widens`, `sha256` of the new
+file) or `removed` (`name`, `by`). A private run's lines, and a post into a private conversation,
 keep sizes and keyed hashes of what was said, while their labels (`run`,
 `conversation`, `by`, `agent`, `to`, `event`, `tool`, `decision`, `why`)
 stay readable. Each line carries the
@@ -550,8 +645,8 @@ days = fri
 do = Summarise what you did for me this week.
 ```
 
-Each run is the same agent with a fresh short conversation and the same
-gate (with `ask` as Deny). Its answer is posted to its `to` (`main` unless
+Each run is the agent (or the definition `agent = NAME` names) with a
+fresh short conversation and the same gate (with `ask` as Deny). Its answer is posted to its `to` (`main` unless
 it names another conversation) unless it is `NOTHING`; calls skipped for
 want of approval are listed either way ("Skipped (needs approval): …"). A task whose omnigate budget is spent is
 paused until `/task resume NAME`. `/tasks`,
@@ -559,16 +654,17 @@ paused until `/task resume NAME`. `/tasks`,
 
 ## Commands
 
-`/stop`, `/new`, `/status`, `/brief [NAME]`, `/topics`, `/topic add|rm`, `/tasks`,
+`/stop [NAME]`, `/new`, `/status`, `/brief [NAME]`, `/topics`, `/topic add|rm`, `/tasks`,
 `/task add|rm|resume`, `/memory`, `/remember`, `/pin`, `/unpin`,
 `/forget`, `/private on|off`, `/skills`, `/skill rm`, `/logins`,
 `/dryrun on|off`, `/reload`, `/conversations`,
-`/conversation new|rename|rm|add`, `/session [N]`, `/help`. `/new` and
-`/private` act on the conversation they are sent in; `/stop`, `/dryrun`
-and `/memory auto` on everything.
+`/conversation new|rename|rm|add`, `/session [N]`, `/agents`,
+`/agent [NAME]`, `/agent show|rm NAME`, `/ask NAME text`, `/help`. `/new`,
+`/private` and `/agent` act on the conversation they are sent in; `/stop`,
+`/dryrun` and `/memory auto` on everything.
 
 CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
-`task run NAME`, `memory [list|pin|unpin|forget ID]`,
+`task run NAME`, `memory [list|pin|unpin|forget ID]`, `agent list|show|rm`,
 `log verify|tail|runs|session`,
 `health`, `version`. `--home DIR` may come anywhere on the line;
 arguments a command does not take are refused. `health` exits 0 only
@@ -603,9 +699,9 @@ while `harness run` holds the folder and has ticked in the last 90 s.
   unit (say USD). They trust the tool to mean what that field says.
 - **The Windows Credential Manager** keeps at most 2560 bytes of a value;
   `secret add` refuses longer ones.
-- **One owner, one turn at a time.** Messages sent in any conversation
-  while the agent works wait in one queue. Contexts do not survive a
-  restart.
+- **One owner, one turn at a time.** Messages sent in any conversation,
+  to any definition, while the agent works wait in one queue. Contexts do
+  not survive a restart.
 - **`web` is macOS and Linux only** for now (Chrome is driven through
   pipes on file descriptors 3 and 4); on Windows it is not offered.
 - **Login cookies are on disk** in `profiles/NAME`, readable by you (the
