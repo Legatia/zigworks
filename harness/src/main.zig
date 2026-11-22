@@ -658,7 +658,7 @@ const TgChan = struct {
     }
 
     fn channel(tc: *TgChan) core_mod.Channel {
-        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .send_to = sendTo, .document = document, .open_topic = openTopic };
+        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic };
     }
 
     fn sendTo(ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void {
@@ -675,7 +675,7 @@ const TgChan = struct {
         if (place.chat == 0) return error.NotPaired;
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
-        const sent = tc.send_bot.sendTo(place.chat, place.thread, text) catch |e| {
+        const sent = tc.send_bot.sendTo(place.chat, place.thread, text, .{ .quiet = place.quiet }) catch |e| {
             complain("telegram: sending failed: {s}", .{@errorName(e)});
             return if (e == error.TelegramRefused and place.thread != 0) error.TopicRefused else e;
         };
@@ -687,7 +687,7 @@ const TgChan = struct {
         if (place.chat == 0) return null;
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
-        return tc.send_bot.sendButtonsTo(place.chat, place.thread, text, bs) catch null;
+        return tc.send_bot.sendButtonsTo(place.chat, place.thread, text, bs, .{ .quiet = place.quiet }) catch null;
     }
 
     fn clear(ctx: *anyopaque, place: core_mod.Place, id: i64) void {
@@ -696,6 +696,15 @@ const TgChan = struct {
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
         tc.send_bot.clearButtons(place.chat, id) catch {};
+    }
+
+    /// An item's message once it closed: its text and the outcome, no buttons.
+    fn edit(ctx: *anyopaque, place: core_mod.Place, id: i64, text: []const u8) void {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        tc.send_bot.editText(place.chat, id, text) catch {};
     }
 
     fn document(ctx: *anyopaque, place: core_mod.Place, name: []const u8, data: []const u8) anyerror!i64 {
@@ -793,6 +802,7 @@ fn runCmd(app: *App) !Exit {
                     .thread = m.thread,
                     .topic = m.topic,
                     .text = m.text,
+                    .reply_to = m.reply_to,
                 }) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
                 .callback => |cb| {
                     tc.answer(cb.id);

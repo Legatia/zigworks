@@ -125,6 +125,8 @@ pub const Place = struct {
     name: []const u8 = "main",
     chat: i64 = 0,
     thread: i64 = 0,
+    /// Sent without a sound (Telegram's `disable_notification`).
+    quiet: bool = false,
 };
 
 /// The messages a text went out in: the first one's id and how many.
@@ -139,6 +141,9 @@ pub const Channel = struct {
     /// Returns an id for `clear`, or null when buttons can't be shown.
     buttons: *const fn (ctx: *anyopaque, place: Place, text: []const u8, buttons: []const [2][]const u8) ?i64,
     clear: *const fn (ctx: *anyopaque, place: Place, id: i64) void,
+    /// Replaces message `id`'s text; its buttons go. Null where messages
+    /// can't be changed (the terminal): `clear` is used instead.
+    edit: ?*const fn (ctx: *anyopaque, place: Place, id: i64, text: []const u8) void = null,
     /// Sends to someone other than the owner (an account trying to pair);
     /// null where there is no one else (the terminal).
     send_to: ?*const fn (ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void = null,
@@ -161,6 +166,8 @@ pub const Incoming = struct {
     /// The topic's name, when the message says it.
     topic: ?[]const u8 = null,
     text: []const u8,
+    /// The message it replies to; 0: none.
+    reply_to: i64 = 0,
 };
 
 /// One conversation's context: its turns and where its memory writer is.
@@ -3568,19 +3575,23 @@ const Recorder = struct {
     probe: ?*Io.Mutex = null,
     /// The last question's buttons and the message they are in.
     last: Buttons = .{},
+    /// Every message with buttons, in order.
+    asked: std.ArrayList(Buttons) = .empty,
     /// Called once buttons are recorded, before their message id is
     /// returned: an owner who presses before harness knows the message.
     early: ?Early = null,
 
     const Early = struct { ctx: *anyopaque, press: *const fn (ctx: *anyopaque, b: *const Buttons) void };
 
-    const Where = struct { name: []u8, chat: i64, thread: i64 };
+    const Where = struct { name: []u8, chat: i64, thread: i64, quiet: bool = false };
 
     const Buttons = struct {
         msg: i64 = 0,
         n: usize = 0,
         buf: [4][64]u8 = undefined,
         len: [4]usize = @splat(0),
+        /// The line in `lines` they were recorded with.
+        line: usize = 0,
 
         /// The data of the button that answers `which` ("once", "day", "deny").
         fn get(b: *const Buttons, which: []const u8) ?[]const u8 {
@@ -3599,16 +3610,48 @@ const Recorder = struct {
         for (r.where.items) |w| t.allocator.free(w.name);
         r.where.deinit(t.allocator);
         r.cleared.deinit(t.allocator);
+        r.asked.deinit(t.allocator);
     }
 
     fn channel(r: *Recorder) Channel {
-        return .{ .ctx = r, .send = send, .buttons = buttons, .clear = clear, .send_to = sendTo, .document = document, .open_topic = openTopic };
+        return .{ .ctx = r, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic };
     }
 
     /// Notes a line and where it went (under the mutex).
     fn note(r: *Recorder, place: Place, line: []u8) !void {
         try r.lines.append(t.allocator, line);
-        try r.where.append(t.allocator, .{ .name = try t.allocator.dupe(u8, place.name), .chat = place.chat, .thread = place.thread });
+        try r.where.append(t.allocator, .{ .name = try t.allocator.dupe(u8, place.name), .chat = place.chat, .thread = place.thread, .quiet = place.quiet });
+    }
+
+    /// A message's new text, as "EDIT <id>: <text>"; its buttons go.
+    fn edit(ctx: *anyopaque, place: Place, id: i64, text: []const u8) void {
+        const r: *Recorder = @ptrCast(@alignCast(ctx));
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        const line = std.fmt.allocPrint(t.allocator, "EDIT {d}: {s}", .{ id, text }) catch return;
+        r.note(place, line) catch {};
+        r.cleared.append(t.allocator, id) catch {};
+    }
+
+    /// The buttons of the message whose recorded line has `needle`.
+    fn buttonsWith(r: *Recorder, needle: []const u8) ?Buttons {
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        var i = r.asked.items.len;
+        while (i > 0) {
+            i -= 1;
+            const b = r.asked.items[i];
+            if (std.mem.indexOf(u8, r.lines.items[b.line], needle) != null) return b;
+        }
+        return null;
+    }
+
+    /// Whether the first line containing `needle` went without a sound.
+    fn quietOf(r: *Recorder, needle: []const u8) ?bool {
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        for (r.lines.items, r.where.items) |l, w| if (std.mem.indexOf(u8, l, needle) != null) return w.quiet;
+        return null;
     }
 
     fn document(ctx: *anyopaque, place: Place, name: []const u8, data: []const u8) anyerror!i64 {
@@ -3701,11 +3744,12 @@ const Recorder = struct {
             const line = std.fmt.allocPrint(t.allocator, "BUTTONS {s} [{s}]", .{ text, bs[0][1] }) catch return null;
             r.note(place, line) catch {};
             r.next_id += 1;
-            r.last = .{ .msg = r.next_id, .n = @min(bs.len, 4) };
+            r.last = .{ .msg = r.next_id, .n = @min(bs.len, 4), .line = r.lines.items.len - 1 };
             for (bs[0..r.last.n], 0..) |b, i| {
                 r.last.len[i] = @min(b[1].len, 64);
                 @memcpy(r.last.buf[i][0..r.last.len[i]], b[1][0..r.last.len[i]]);
             }
+            r.asked.append(t.allocator, r.last) catch {};
             break :blk r.last;
         };
         if (r.early) |e| e.press(e.ctx, &shown);
