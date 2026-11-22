@@ -26,7 +26,7 @@ standard library (and the system's Security framework on macOS). Models
 are reached only through [omnigate](https://github.com/Legatia/omnigate),
 which holds the provider keys and the budgets.
 
-**State: 0.3.0, tested on macOS by its own tests: 557 unit tests (2 skipped), among
+**State: 0.3.0, tested on macOS by its own tests: 560 unit tests (2 skipped), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 67 checks that drives the real binary against
 stand-ins for omnigate, Telegram, feeds, search and two MCP servers. An
@@ -578,13 +578,13 @@ into the prompt; a `recall` the definition lists still searches memory.
 - **`agent_save`.** The agent may propose a new definition or a change to
   its own (never another's) with the whole file. Harness reads it first:
   one that does not read goes back to the agent unasked. Otherwise you are
-  asked every time, with no "Allow 24 h" (no grant or `allow` rule lifts
-  it; a `deny` rule stops it): who asks, new or change, each header field
+  asked every time, an inbox item with no "Allow 24 h" (no grant or
+  `allow` rule lifts it; a `deny` rule stops it): who asks, new or change, each header field
   that changes with those that widen first under "Widens:" (tools or
   skills added, memory to `shared`, the model changed, a limit raised),
   then the whole file. On Allow the old file goes to
   `state/agents/NAME/versions/` (the last 10 kept), the new one is written
-  with `saved: agent:NAME TIME`, and runs that start after it use it; a
+  with `saved: agent:NAME TIME (item N)`, and runs that start after it use it; a
   run already going keeps the version it started with. It is offered only
   in runs you started from a conversation: never to helpers or tasks.
 - **Places.** A definition's `parallel` holds for its helpers (one waits

@@ -54,6 +54,9 @@ pub const Question = struct {
     rid: u64 = 0,
     label: []const u8 = "",
     private: bool = false,
+    /// The asking run's own stop flag (a delegated run has one of its own,
+    /// which `/stop NAME` sets alone): once set, its item is withdrawn.
+    stop: ?*const std.atomic.Value(bool) = null,
 
     pub const Kind = enum { approval, question, draft };
 };
@@ -1654,13 +1657,19 @@ fn agentSave(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Outpu
         shown.len,
         shown,
     });
-    if (try decideAndAsk(r, a, .agent_save, "agent_save", name, detail, r.now())) |why| {
+    // the inbox item it is asked in: its number goes in the saved line
+    var item: u64 = 0;
+    if (try decideAndAskWith(r, a, .agent_save, "agent_save", name, detail, r.now(), .{ .item = &item })) |why| {
         const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
         try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = true, .output = out.text, .bytes = out.text.len });
         return out;
     }
-    // as it was shown, stamped with the time it was allowed
-    const text = try agents.withSaved(a, text_in, try std.fmt.allocPrint(a, "agent:{s} {s}", .{ r.who.agent, util.isoTime(&tb, r.now()) }));
+    // as it was shown, stamped with the time it was allowed and its item
+    const stamp = if (item != 0)
+        try std.fmt.allocPrint(a, "agent:{s} {s} (item {d})", .{ r.who.agent, util.isoTime(&tb, r.now()), item })
+    else
+        try std.fmt.allocPrint(a, "agent:{s} {s}", .{ r.who.agent, util.isoTime(&tb, r.now()) });
+    const text = try agents.withSaved(a, text_in, stamp);
     set.save(name, text) catch |e| {
         const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "not saved: {s}", .{@errorName(e)}), .is_error = true };
         try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = true, .output = out.text, .bytes = out.text.len });
@@ -1668,13 +1677,12 @@ fn agentSave(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Outpu
     };
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
-    // the inbox's item number comes with gap 5
     try r.log.write(.agent, false, .{
         .event = "saved",
         .name = name,
         .by = r.who.by,
         .agent = r.who.agent,
-        .item = @as(?u32, null),
+        .item = if (item != 0) @as(?u64, item) else null,
         .widens = try std.mem.join(a, "; ", cmp.widens),
         .sha256 = &std.fmt.bytesToHex(digest, .lower),
     });
@@ -1711,7 +1719,9 @@ fn askOwnerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Ou
         if (label.len == 0 or label.len > max_choice_bytes) return .{ .text = "refused: a choice has 1 to 64 bytes", .is_error = true };
         ch.* = label;
     }
-    const size = question.len + if (draft) |d| d.len else 0;
+    // named like an approval when a definition other than main asks
+    const tag = try askerTag(r, a);
+    const size = tag.len + question.len + if (draft) |d| d.len else 0;
     if (size > max_question) return .{ .text = try std.fmt.allocPrint(a, "refused: too long to ask the owner ({d} bytes; a question and its draft are at most {d})", .{ size, max_question }), .is_error = true };
     if (try decideAndAsk(r, a, .ask_owner, "ask_owner", question, "", r.now())) |why|
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
@@ -1720,7 +1730,7 @@ fn askOwnerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Ou
         if (r.deadline_s > 0 and r.deadline_s * 1000 - util.nowMs(r.io) < 100) break :out .{ .text = "no time left in the turn to ask the owner", .is_error = true };
         const got = asker.ask(asker.ctx, a, .{
             .kind = if (draft != null) .draft else .question,
-            .text = question,
+            .text = try std.fmt.allocPrint(a, "{s}{s}", .{ tag, question }),
             .choices = choices,
             .takes_text = (jv.boolean(jv.get(v, "text")) orelse false) or choices.len == 0,
             .draft = draft,
@@ -1729,6 +1739,7 @@ fn askOwnerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Ou
             .rid = r.rid,
             .label = r.label,
             .private = r.isPrivate(),
+            .stop = r.env.stop,
         });
         const eql = std.mem.eql;
         break :out switch (got.answer) {
@@ -2016,6 +2027,9 @@ const AskExtra = struct {
     /// Where a shell command starts, as the model gave it ("" the
     /// workspace).
     dir: []const u8 = "",
+    /// Gets the number of the inbox item the owner was asked in (0: not
+    /// asked).
+    item: ?*u64 = null,
 };
 
 fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, now_s: i64, extra: AskExtra) !?[]const u8 {
@@ -2058,12 +2072,8 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             why = "no one to ask";
             break :ask;
         };
-        // who asks: a helper by its label, a definition other than main
-        // and helper by its name too (a day's grant goes to it)
-        const named = !std.mem.eql(u8, r.def.name, if (r.helper) "helper" else "main");
-        const who = if (r.helper)
-            (if (named) try std.fmt.allocPrint(a, "[{s} {s}] ", .{ r.label, r.def.name }) else try std.fmt.allocPrint(a, "[{s}] ", .{r.label}))
-        else if (named) try std.fmt.allocPrint(a, "[{s}] ", .{r.def.name}) else "";
+        // who asks (a day's grant goes to its definition)
+        const who = try askerTag(r, a);
         // the form the gate matched (for files, the path inside the
         // workspace), and what the model gave when that differs
         const given = if (std.mem.eql(u8, d.subject, arg)) "" else try std.fmt.allocPrint(a, " (given as {s})", .{arg});
@@ -2090,7 +2100,9 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             .rid = r.rid,
             .label = r.label,
             .private = r.isPrivate(),
+            .stop = r.env.stop,
         });
+        if (extra.item) |p| p.* = got.item;
         var ans = got.answer;
         // money, setup calls and posts others read are never granted for a
         // day, whatever came back
@@ -2126,6 +2138,15 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
     else
         try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
     return if (action == .allow) null else why;
+}
+
+/// Who asks, in front of a question: a helper by its label, a definition
+/// other than main and helper by its name too ("[chat/h1] ",
+/// "[chat/h1 researcher] ", "[researcher] "); "" for main.
+fn askerTag(r: *const Run, a: std.mem.Allocator) ![]const u8 {
+    const named = !std.mem.eql(u8, r.def.name, if (r.helper) "helper" else "main");
+    if (r.helper) return if (named) std.fmt.allocPrint(a, "[{s} {s}] ", .{ r.label, r.def.name }) else std.fmt.allocPrint(a, "[{s}] ", .{r.label});
+    return if (named) std.fmt.allocPrint(a, "[{s}] ", .{r.def.name}) else "";
 }
 
 /// What the owner did, their words and the item, as the gate's line and

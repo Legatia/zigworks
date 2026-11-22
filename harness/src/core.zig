@@ -1397,7 +1397,20 @@ pub const Core = struct {
     // ---- the inbox ----
 
     /// Who asks: the run's flag and its conversation (its items go there).
-    const ChatAsk = struct { core: *Core, flag: *std.atomic.Value(bool), conv: []const u8 = "main" };
+    /// A helper asks through its parent's, with its own flag in the
+    /// question (`/stop NAME` may set it alone).
+    const ChatAsk = struct {
+        core: *Core,
+        flag: *std.atomic.Value(bool),
+        conv: []const u8 = "main",
+
+        /// Whether the run that asks `q` was stopped: its own flag, or the
+        /// run's that asks through this.
+        fn stopped(ca: *const ChatAsk, q: agent.Question) bool {
+            if (ca.flag.load(.acquire)) return true;
+            return if (q.stop) |s| s.load(.acquire) else false;
+        }
+    };
 
     const not_sent_note = "The question could not be sent, so the call is not allowed.";
 
@@ -1439,7 +1452,7 @@ pub const Core = struct {
         var waited = false;
         var approval_end_ms: i64 = 0;
         const id = while (true) {
-            if (ca.flag.load(.acquire) or c.questions_closed.load(.acquire)) return .{ .answer = .withdrawn };
+            if (ca.stopped(q) or c.questions_closed.load(.acquire)) return .{ .answer = .withdrawn };
             const no_time = q.deadline_s > 0 and q.deadline_s * 1000 - util.nowMs(c.io) < 500;
             if (no_time) return .{ .answer = .full, .text = if (waited) c.fullWords(a) else "no time left in the turn to ask the owner" };
             approval_end_ms = util.nowMs(c.io) + @as(i64, c.cfg.limits.approval_seconds) * 1000;
@@ -1459,7 +1472,7 @@ pub const Core = struct {
         }
         while (true) {
             if (c.replyOf(a, id)) |got| return got;
-            if (ca.flag.load(.acquire)) {
+            if (ca.stopped(q)) {
                 _ = c.settle(id, .withdrawn, .{ .text = "its run stopped", .at = c.now(), .via = .harness });
                 continue;
             }
@@ -6771,6 +6784,19 @@ fn inboxFile(f: *Fix) ![]u8 {
     return Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.inbox, f.e.arena.allocator(), .unlimited);
 }
 
+/// The text of state/inbox once it has `needle` (it is written a moment
+/// after the message it records was sent).
+fn inboxFileWith(f: *Fix, needle: []const u8) ![]const u8 {
+    var waited: u32 = 0;
+    while (waited < 5000) : (waited += 20) {
+        const text: []const u8 = inboxFile(f) catch "";
+        if (std.mem.indexOf(u8, text, needle) != null) return text;
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    std.debug.print("state/inbox never had {s}:\n{s}\n", .{ needle, inboxFile(f) catch "" });
+    return error.TestTimedOut;
+}
+
 /// Closes the core and opens the folder again, as a restart does.
 fn restart(f: *Fix) !void {
     f.core.close();
@@ -8589,4 +8615,102 @@ test "a_definitions_chat_and_task_runs_are_held_to_folders_ini" {
     try t.expect(std.mem.indexOf(u8, written, "notes/r.md\tagent:researcher chat\n") != null);
     try t.expect(std.mem.indexOf(u8, written, "notes/t.md\tagent:researcher task watch\n") != null);
     try t.expect(std.mem.indexOf(u8, written, "notes/m.md") == null);
+}
+
+// ---- agent definitions and the inbox ----
+
+const scout_md = "---\nname: scout\ndescription: Looks around.\ntools: shell, ask_owner\n---\nLook around.\n";
+
+test "a_definitions_questions_are_inbox_items_named_for_it" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addDefinition(&f, "scout", scout_md);
+    try f.core.handleText("/agent scout");
+    try f.rec.waitFor("scout answers here from your next message.");
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo scout-look\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "ask_owner", "{\"question\":\"Which flat?\",\"choices\":[\"North\",\"South\"]}"));
+    try f.e.script(3, model.textReply("South it is."));
+    try f.core.startWorker();
+    try f.core.handleText("look around");
+    // an approval: an item, named for the definition that asks
+    try f.rec.waitFor("BUTTONS Allow this? [1]\n[scout] shell: echo scout-look\n(Reply with text to deny it and say why.) [i1-");
+    const open = try inboxFileWith(&f, "\"id\":1,");
+    try t.expect(std.mem.indexOf(u8, open, "\"agent\":\"scout\",\"rid\":") != null);
+    try t.expect(std.mem.indexOf(u8, open, "\"title\":\"[scout] shell: echo scout-look\"") != null);
+    // Allow 24 h from the item: a grant for that definition alone
+    try f.press("day");
+    // its ask_owner question is named the same way
+    try f.rec.waitFor("BUTTONS Question [2]\n[scout] Which flat? [i2-");
+    try f.press("2");
+    try f.rec.waitFor("South it is.");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "chose: South") != null);
+    const grants = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.grants, a, .unlimited);
+    if (std.mem.indexOf(u8, grants, "\techo scout-look\tagent:scout\n") == null) std.debug.print("{s}\n", .{grants});
+    try t.expect(std.mem.indexOf(u8, grants, "\techo scout-look\tagent:scout\n") != null);
+    const text = try inboxFile(&f);
+    try t.expect(std.mem.indexOf(u8, text, "\"kind\":\"question\",\"status\":\"answered\"") != null);
+    try t.expectEqual(2, std.mem.count(u8, text, "\"agent\":\"scout\""));
+}
+
+test "stop_name_withdraws_the_items_of_that_definitions_runs" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addDefinition(&f, "scout", scout_md);
+    // main delegates to scout; the helper's question waits in the inbox
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"look\",\"agent\":\"scout\",\"tools\":[\"shell\"]}]}"));
+    try f.e.script(2, model.toolReply("w1", "shell", "{\"command\":\"echo scout-wait\"}"));
+    try f.e.script(3, model.textReply("Main goes on."));
+    try f.core.startWorker();
+    try f.core.handleText("send the scout");
+    try f.rec.waitFor("BUTTONS Allow this? [1]\n[chat/h1 scout] shell: echo scout-wait");
+    // stopping another definition leaves it open
+    try f.core.handleText("/stop helper");
+    try f.rec.waitFor("Nothing of helper was running.");
+    try t.expectEqual(1, f.core.itemsWaiting());
+    // stopping scout withdraws it; main's turn goes on
+    try f.core.handleText("/stop scout");
+    try f.rec.waitFor("\nWithdrawn: its run stopped.");
+    try f.rec.waitFor("Stopped scout's runs (1).");
+    try f.rec.waitFor("Main goes on.");
+    const text = try inboxFile(&f);
+    try t.expect(std.mem.indexOf(u8, text, "\"status\":\"withdrawn\"") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"text\":\"its run stopped\"") != null);
+    try t.expectEqual(0, f.core.itemsWaiting());
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"decision\":\"deny\",\"why\":\"stopped by the owner (item 1)\",\"arg\":\"echo scout-wait\"") != null);
+    try t.expectEqual(3, f.e.server.modelRequests());
+}
+
+test "agent_save_is_asked_as_an_item_without_24h_and_saved_with_its_number" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addDefinition(&f, "scout", "---\nname: scout\ndescription: Looks around.\ntools: shell, agent_save\n---\nLook around.\n");
+    try f.core.handleText("/agent scout");
+    const changed = "---\nname: scout\ndescription: Looks around.\ntools: shell, agent_save\n---\nLook around. Cite dates.\n";
+    try f.e.script(1, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"agent_save\",\"input\":{{\"name\":\"scout\",\"text\":{f}}}}}],\"stop_reason\":\"tool_use\"}}", .{std.json.fmt(changed, .{})}));
+    try f.e.script(2, model.textReply("Saved my definition."));
+    try f.core.startWorker();
+    try f.core.handleText("always cite dates");
+    try f.rec.waitFor("BUTTONS Allow this? [1]\n[scout] agent_save: scout, a change to its own definition, asked by scout");
+    // Allow once and Deny: no Allow 24 h, on the message or in the item
+    const b = f.lastButtons();
+    try t.expectEqual(2, b.n);
+    try t.expect(b.get("once") != null and b.get("deny") != null and b.get("day") == null);
+    const open = try inboxFileWith(&f, "\"id\":1,");
+    try t.expect(std.mem.indexOf(u8, open, "\"choices\":[{\"key\":\"once\",\"label\":\"Allow once\"},{\"key\":\"deny\",\"label\":\"Deny\"}]") != null);
+    try f.press("once");
+    try f.rec.waitFor("Saved my definition.");
+    // the saved line and the log name the item it was allowed in
+    const saved = try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ f.core.paths.agents, "scout.md" }), a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, saved, "Look around. Cite dates.") != null);
+    const line_at = std.mem.indexOf(u8, saved, "saved: agent:scout ") orelse return error.TestUnexpectedResult;
+    const line = saved[line_at .. std.mem.indexOfScalarPos(u8, saved, line_at, '\n') orelse saved.len];
+    if (!std.mem.endsWith(u8, line, " (item 1)")) std.debug.print("{s}\n", .{line});
+    try t.expect(std.mem.endsWith(u8, line, " (item 1)"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"kind\":\"agent\",\"event\":\"saved\",\"name\":\"scout\",\"by\":\"owner\",\"agent\":\"scout\",\"item\":1,") != null);
+    try t.expect(std.mem.indexOf(u8, try inboxFile(&f), "\"status\":\"answered\"") != null);
 }
