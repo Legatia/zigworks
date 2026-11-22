@@ -13,7 +13,7 @@ Telegram ⇄ ┐                          ┌─ shell, files, fetch, browse, we
 terminal ⇄ ┼─► agent ─► gate ─► tools ┼─ MCP servers (money tools: asked every time)
 schedule ──┘    │  ▲  ▲   │           └─ delegate ─► helpers ─► gate ─► tools
                 ▼  │  │   ▼
-          omnigate memory skills  action log
+          models   memory skills  action log
 ```
 
 What the agent is, and what each helper is, is a file you can read and
@@ -23,22 +23,25 @@ change: `agents/main.md`, `agents/helper.md`, and any others you add
 One binary for macOS, Linux (x86_64, arm64) and Windows (x86_64), about
 1.9 MB on macOS and 2.3 MB on Linux stripped, nothing beyond the Zig
 standard library (and the system's Security framework on macOS). Models
-are reached only through [omnigate](https://github.com/Legatia/omnigate),
-which holds the provider keys and the budgets.
+are reached through [omnigate](https://github.com/Legatia/omnigate), which
+holds the provider keys and the budgets, or straight through Anthropic,
+OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
+Messages or OpenAI Chat Completions format (see
+[Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 563 unit tests (2 skipped), among
+**State: 0.3.0, tested on macOS by its own tests: 581 unit tests (2 skipped), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 67 checks that drives the real binary against
-stand-ins for omnigate, Telegram, feeds, search and two MCP servers. An
-earlier build of 0.3.0 also passed its tests in CI on Linux and Windows.
-Nothing has run yet against a real omnigate, Telegram bot, MCP server or
-website.** See [Limits](#limits).
+and an end-to-end script of 69 checks that drives the real binary against
+stand-ins for omnigate and the other model providers, Telegram, feeds,
+search and two MCP servers. An earlier build of 0.3.0 also passed its
+tests in CI on Linux and Windows. Nothing has run yet against a real
+omnigate or model provider, Telegram bot, MCP server or website.** See [Limits](#limits).
 
 ## Quick start
 
 ```
 harness init                      # writes ~/.local/share/harness
-harness secret add omnigate       # your omnigate key (typed, not shown)
+harness secret add omnigate       # your omnigate key (typed, not shown); another provider's: harness secret add NAME
 harness secret add telegram       # the bot token from @BotFather
 harness secret add search         # optional: a Brave Search API key
 harness run                       # keep this running
@@ -46,8 +49,9 @@ harness pair                      # then send the printed /pair CODE to your bot
 ```
 
 Set omnigate's address (there is none by default) and route names in
-`config.ini` first; until the address and the key are there, commands say
-so and model calls are refused. The first Telegram account to send a valid
+`config.ini` first, or pick another provider (see
+[Models and providers](#models-and-providers)); until the address and the
+key are there, commands say so and model calls are refused. The first Telegram account to send a valid
 pairing code (valid 10 minutes) becomes the owner; messages from anyone
 else are dropped and logged, and a pairing attempt from another account is
 answered. To move the bot to another account, run `harness pair` again and
@@ -55,6 +59,77 @@ send the new code from that account; the old one is told.
 
 `harness chat` does the same in the terminal, for trying it out. Ctrl-D
 leaves; questions still waiting are withdrawn (not allowed).
+
+## Models and providers
+
+Model calls go to a provider: omnigate unless `[model] provider` names
+another. Five are built in; any other gateway that speaks Anthropic
+Messages (`…/messages`) or OpenAI Chat Completions (`…/chat/completions`)
+is a `[provider NAME]` section in `config.ini`.
+
+| Provider | Format | Address | Key sent as | Cache marks | Key's secret |
+|---|---|---|---|---|---|
+| `omnigate` | Anthropic Messages | `[model] url` (`/v1` added unless it ends in it, as in 0.3) | `x-api-key` | yes | `[model] key` |
+| `anthropic` | Anthropic Messages | `https://api.anthropic.com/v1` | `x-api-key` | yes | `anthropic` |
+| `openrouter` | OpenAI Chat Completions | `https://openrouter.ai/api/v1` | `Authorization: Bearer` | yes (for Anthropic's models) | `openrouter` |
+| `opencode` (OpenCode Zen) | OpenAI Chat Completions | `https://opencode.ai/zen/v1` | `Authorization: Bearer` | no | `opencode` |
+| `openai` | OpenAI Chat Completions | `https://api.openai.com/v1` | `Authorization: Bearer` | no (OpenAI caches by itself) | `openai` |
+
+```ini
+[model]
+provider = omnigate              ; for models named without PROVIDER:
+url = https://omnigate.example.com
+model = claude-sonnet            ; an omnigate route
+worker_model = openrouter:deepseek/deepseek-chat
+memory_model = anthropic:claude-haiku-4-5
+
+[provider openrouter]            ; a preset needs no section; this one adds a header
+header = HTTP-Referer: https://example.org
+
+[provider local]                 ; any other gateway
+api = openai                     ; anthropic | openai
+url = http://127.0.0.1:11434/v1  ; what comes before /messages or /chat/completions
+auth = none                      ; x-api-key | bearer | none
+```
+
+A model value is `PROVIDER:MODEL`, or a model of `[model] provider`:
+`model`, `worker_model` and `memory_model`, and later agent definitions and
+workflow steps. The part before the first `:` names a provider only when
+one has that name, so `llama3.1:8b` is a model of the default provider and
+`local:llama3.1:8b` is model `llama3.1:8b` at `local`.
+
+A section with a preset's name changes only the fields it sets; any other
+name is a new provider and needs `api` and `url`. A section takes `api`,
+`url`, `auth` (default `x-api-key` for `anthropic`, `bearer` for
+`openai`), `key` (the secret's name; default the provider's name), `cache
+= on|off` (default on for `anthropic`, off for `openai`) and `header =
+Name: value` (up to 8; not `Authorization`, `x-api-key`, `Host`,
+`Connection`, `Content-Length`, `Content-Type`, `Transfer-Encoding` or
+`anthropic-version`). `auth = bearer` with `api = anthropic` is for
+Anthropic-compatible gateways that take a bearer token. The `openai`
+preset sends `max_completion_tokens`, the others `max_tokens`.
+
+Keys are stored like every secret: `harness secret add openrouter`. They
+are masked in all output and never logged. A provider whose key is not
+stored refuses its calls with one line naming the secret to add, and
+commands say so at start. `/status` lists each provider in use, its format
+and whether its key is stored; `harness secret list` lists their keys.
+
+Errors read the same for every provider and name it (omnigate's as
+before): 401 or 403, the provider refused the key (and which secret holds
+it); 402, its credits or budget are used up (a task pauses); 429, harness
+waits as told, once, within the turn's time; 400 or 413 drops the turn;
+other statuses are upstream errors. omnigate keeps its budgets; for the
+others the budget is their own (their dashboard and their 402s), and the
+token caps per helper and per turn apply as before. Model lines in the log
+carry `provider` with their token counts; for OpenAI-format providers
+`input_tokens` counts the input not read from the cache, as for Anthropic.
+
+Logging in with a Claude Free, Pro or Max subscription is not supported:
+Anthropic's terms reserve subscription (OAuth) credentials for its own
+apps and forbid third-party apps from using them. Use an API key, or a
+bearer token a gateway issues. Not yet: OpenAI's Responses API, AWS
+Bedrock and Google Vertex sign-in, streaming, images.
 
 ## The data folder
 
@@ -73,7 +148,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 
 | Path | What |
 |---|---|
-| `config.ini` | omnigate url and routes, search, Telegram, limits, memory switches, the inbox |
+| `config.ini` | models and providers, search, Telegram, limits, memory switches, the inbox |
 | `rules` | gate rules |
 | `briefs.ini` | briefs and their topics |
 | `tasks.ini` | scheduled tasks |
@@ -520,8 +595,9 @@ one that can't be answered before the turn ends is refused without
 asking. `/stop` stops them too.
 
 Every model call of a turn marks its unchanging start (tools, the stable
-part of the instructions) for omnigate's prompt cache, and each step of a
-turn reads the earlier steps from cache. When a conversation outgrows
+part of the instructions) for the prompt cache, and each step of a turn
+reads the earlier steps from cache (Anthropic-format providers; OpenRouter
+gets the instructions marked, OpenAI caches by itself). When a conversation outgrows
 `conversation_bytes`, the oldest turns are replaced by a summary instead
 of being dropped; turns that still don't fit after the summary are
 dropped, logged, and the agent is told.
@@ -859,8 +935,8 @@ Each run is the agent (or the definition `agent = NAME` names) with a
 fresh short conversation and the same gate (with `ask` as Deny). Its answer is posted to its `to` (`main` unless
 it names another conversation) unless it is `NOTHING`; calls skipped for
 want of approval are listed either way ("Skipped (needs approval): shell:
-df -h (item 45)"), each an item you can allow for that task (see Inbox). A task whose omnigate budget is spent is
-paused until `/task resume NAME`. `/tasks`,
+df -h (item 45)"), each an item you can allow for that task (see Inbox). A task whose model budget is spent (a 402
+from its provider) is paused until `/task resume NAME`. `/tasks`,
 `/task add NAME | every 15m | instruction`, `/task rm NAME`.
 
 ## Commands

@@ -15,6 +15,7 @@ const totp = @import("totp.zig");
 const session = @import("session.zig");
 const folders = @import("folders.zig");
 const inbox_mod = @import("inbox.zig");
+const model = @import("model.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -123,18 +124,31 @@ const App = struct {
 
     fn secrets(app: *App, cfg: config.Config) core_mod.Secrets {
         const s = app.store();
+        // the providers' key names ([provider omnigate] may rename omnigate's)
+        const set = model.Providers.resolve(app.arena, config.providerSettings(cfg), model.no_keys) catch model.Providers{ .list = &.{} };
         return .{
-            .omnigate = s.get(app.io, app.arena, cfg.model.key) catch null,
+            .omnigate = s.get(app.io, app.arena, if (set.find("omnigate")) |p| p.key_name else cfg.model.key) catch null,
             .telegram = s.get(app.io, app.arena, cfg.chat.token) catch null,
             .search = s.get(app.io, app.arena, cfg.search.key) catch null,
-            .named = app.namedSecrets(s),
+            .named = app.namedSecrets(s, set),
         };
     }
 
-    /// The MCP servers' secrets, those folders.ini's vars name, and the
-    /// logins' passwords and TOTP seeds (masked in all tool output).
-    fn namedSecrets(app: *App, s: store_mod.Store) []const core_mod.Secrets.Named {
+    /// The MCP servers' secrets, those folders.ini's vars name, the
+    /// logins' passwords and TOTP seeds, and every provider's key but
+    /// omnigate's (masked in all tool output; an agent definition may name
+    /// any provider).
+    fn namedSecrets(app: *App, s: store_mod.Store, providers: model.Providers) []const core_mod.Secrets.Named {
         var out: std.ArrayList(core_mod.Secrets.Named) = .empty;
+        for (providers.list) |p| {
+            if (std.mem.eql(u8, p.name, "omnigate") or p.auth == .none) continue;
+            const known = for (out.items) |n| {
+                if (std.mem.eql(u8, n.name, p.key_name)) break true;
+            } else false;
+            if (known) continue;
+            const v = (s.get(app.io, app.arena, p.key_name) catch null) orelse continue;
+            out.append(app.arena, .{ .name = p.key_name, .value = v }) catch {};
+        }
         out.appendSlice(app.arena, app.mcpSecrets(s)) catch {};
         out.appendSlice(app.arena, app.folderSecrets(s)) catch {};
         for (app.loginList()) |l| for ([_]logins.Kind{ .password, .totp }) |k| {
@@ -208,8 +222,9 @@ const App = struct {
     fn open(app: *App, role: Role) !*Core {
         const cfg = try app.settings();
         const sec = app.secrets(cfg);
-        if (sec.omnigate == null) complain("note: no omnigate key stored under \"{s}\"; model calls will be refused. Run: harness secret add {s}", .{ cfg.model.key, cfg.model.key });
-        if (cfg.model.url.len == 0) complain("note: no omnigate url is set ([model] url in config.ini); model calls will be refused", .{});
+        // each provider in use without its key or url, said once
+        const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), .{ .ctx = @constCast(&sec), .get = startKey });
+        for (try startNotes(app.arena, &set, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model })) |n| complain("{s}", .{n});
         const c = Core.open(app.gpa, app.io, app.home, sec) catch |e| {
             switch (e) {
                 error.AlreadyRunning => complain("harness is already running on {s}; talk to it there (or stop it first)", .{app.home}),
@@ -240,6 +255,27 @@ const App = struct {
         return c;
     }
 };
+
+/// The key read at start for `provider` (omnigate's, or one of `named`).
+fn startKey(ctx: ?*anyopaque, _: std.mem.Allocator, provider: []const u8, secret: []const u8) ?[]const u8 {
+    const sec: *const core_mod.Secrets = @ptrCast(@alignCast(ctx.?));
+    if (std.mem.eql(u8, provider, "omnigate")) return sec.omnigate;
+    return sec.get(secret);
+}
+
+/// What a command says at start of the providers `values` pick: each one
+/// without its key or its url (omnigate's in 0.3's words).
+pub fn startNotes(a: std.mem.Allocator, set: *const model.Providers, values: []const []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (try set.used(a, values)) |p| {
+        if (!p.hasKey()) try out.append(a, try std.fmt.allocPrint(a, "note: no {s} key stored under \"{s}\"; model calls will be refused. Run: harness secret add {s}", .{ p.name, p.key_name, p.key_name }));
+        if (p.url.len == 0) {
+            const where = if (std.mem.eql(u8, p.name, "omnigate")) "[model] url" else try std.fmt.allocPrint(a, "[provider {s}] url", .{p.name});
+            try out.append(a, try std.fmt.allocPrint(a, "note: no {s} url is set ({s} in config.ini); model calls will be refused", .{ p.name, where }));
+        }
+    }
+    return out.items;
+}
 
 pub fn main(init: std.process.Init) u8 {
     const gpa = std.heap.smp_allocator;
@@ -318,8 +354,9 @@ fn initCmd(app: *App) !Exit {
     try outPrint(app.io,
         \\Data folder: {s}
         \\Next:
-        \\  1. Set the omnigate url (there is none by default) and route names in config.ini.
-        \\  2. harness secret add omnigate     (your omnigate key)
+        \\  1. Set the omnigate url (there is none by default) and route names in config.ini,
+        \\     or another provider: [model] provider (README: Models and providers).
+        \\  2. harness secret add omnigate     (your omnigate key; another provider's under its name)
         \\  3. harness secret add telegram     (the bot token from @BotFather)
         \\  4. harness secret add search       (optional: Brave Search API key)
         \\  5. harness run, then harness pair, then send /pair CODE to the bot.
@@ -348,6 +385,18 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         for ([_][2][]const u8{ .{ "model key", cfg.model.key }, .{ "bot token", cfg.chat.token }, .{ "search key", cfg.search.key } }) |pair| {
             const v = s.get(app.io, app.arena, pair[1]) catch null;
             try outPrint(app.io, "{s} ({s}): {s}\n", .{ pair[1], pair[0], if (v != null) "stored" else "not stored" });
+        }
+        // the keys of the other providers in use or with a section
+        const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), model.no_keys);
+        const used = try set.used(app.arena, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model });
+        for (set.list) |*p| {
+            if (std.mem.eql(u8, p.name, "omnigate") or p.auth == .none) continue;
+            const has_section = for (cfg.providers) |sec| {
+                if (std.mem.eql(u8, sec.name, p.name)) break true;
+            } else false;
+            if (std.mem.indexOfScalar(*const model.Provider, used, p) == null and !has_section) continue;
+            const v = s.get(app.io, app.arena, p.key_name) catch null;
+            try outPrint(app.io, "{s} ({s} key): {s}\n", .{ p.key_name, p.name, if (v != null) "stored" else "not stored" });
         }
         const p = try std.fs.path.join(app.arena, &.{ app.home, "mcp.ini" });
         if (Io.Dir.cwd().readFileAlloc(app.io, p, app.arena, .limited(1 << 20))) |text| {
@@ -1612,8 +1661,6 @@ fn complain(comptime fmt: []const u8, args: anytype) void {
 
 // ---- tests ----
 
-const model = @import("model.zig");
-
 /// Frees nothing until `deinit` and fills what is freed with 0xaa first: a
 /// pointer kept into freed memory reads garbage, every time.
 const Quarantine = struct {
@@ -1958,4 +2005,23 @@ test "harness_inbox_json_prints_v1_without_the_kept_fields" {
     try t.expect(badArgs(&.{"inbox"}) == null);
     try t.expect(badArgs(&.{ "inbox", "--json" }) == null);
     try t.expect(badArgs(&.{ "inbox", "x" }) != null);
+}
+
+test "start_notes_name_each_provider_in_use_without_its_key" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // harness init's settings, nothing stored: 0.3's two notes
+    const d = try config.parse(a, config.defaults_ini);
+    const ds = try model.Providers.resolve(a, config.providerSettings(d), model.no_keys);
+    const dn = try startNotes(a, &ds, &.{ d.model.model, d.model.worker_model, d.model.memory_model });
+    try t.expectEqual(2, dn.len);
+    try t.expectEqualStrings("note: no omnigate key stored under \"omnigate\"; model calls will be refused. Run: harness secret add omnigate", dn[0]);
+    try t.expectEqualStrings("note: no omnigate url is set ([model] url in config.ini); model calls will be refused", dn[1]);
+    // everything on openrouter: only its key is said
+    const o = try config.parse(a, "[model]\nprovider = openrouter\nmodel = openrouter:deepseek/deepseek-chat\n");
+    const os = try model.Providers.resolve(a, config.providerSettings(o), model.no_keys);
+    const on = try startNotes(a, &os, &.{ o.model.model, o.model.worker_model, o.model.memory_model });
+    try t.expectEqual(1, on.len);
+    try t.expectEqualStrings("note: no openrouter key stored under \"openrouter\"; model calls will be refused. Run: harness secret add openrouter", on[0]);
 }

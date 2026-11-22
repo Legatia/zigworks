@@ -400,6 +400,10 @@ pub const Core = struct {
     /// /dryrun, /private, /memory auto: runs read them when they use them.
     switches: agent.Switches = .{},
 
+    /// The model providers: the presets, config.ini's [provider NAME]
+    /// sections and their keys, resolved at open and on /reload (in the
+    /// settings arena).
+    providers: model.Providers,
     // the chat
     chat_client: model.Client,
     /// A context per conversation the owner talks in (at most
@@ -564,7 +568,11 @@ pub const Core = struct {
         c.quick_mutex = .init;
         c.quick = .empty;
         c.quick_seq = 0;
-        c.chat_client = try model.Client.init(gpa, io, c.cfg.model.url, secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens);
+        // main sets the store after open; the providers' keys are the ones
+        // read at start until then
+        c.store = null;
+        c.providers = try model.Providers.resolve(sa, config.providerSettings(c.cfg), c.keyLookup());
+        c.chat_client = try c.modelClient(c.cfg.model.model, c.cfg.model.max_tokens);
         c.contexts = .empty;
         c.ctx_mutex = .init;
         c.ctx_clock = 0;
@@ -784,8 +792,11 @@ pub const Core = struct {
             c.settings_hash = saved_hash;
             return c.settingsErrorReply();
         };
-        // the chat's client points into the old settings: build it again
-        const client = model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens) catch {
+        // the providers and the chat's client point into the old settings:
+        // made again (a key stored since is read now)
+        const providers = model.Providers.resolve(fresh.allocator(), config.providerSettings(c.cfg), c.keyLookup()) catch null;
+        const client = if (providers) |*ps| ps.client(c.gpa, c.io, c.cfg.model.model, c.cfg.model.max_tokens) catch null else null;
+        if (client == null) {
             fresh.deinit();
             c.cfg = saved_cfg;
             c.rule_list = saved_rules;
@@ -795,9 +806,10 @@ pub const Core = struct {
             c.folder_list = saved_folders;
             c.settings_hash = saved_hash;
             return "The model url in config.ini is not valid; nothing changed.";
-        };
+        }
         c.chat_client.deinit();
-        c.chat_client = client;
+        c.chat_client = client.?;
+        c.providers = providers.?;
         c.settings_arena.deinit();
         c.settings_arena = fresh;
         c.gate.rules = c.rule_list;
@@ -2413,13 +2425,15 @@ pub const Core = struct {
             .private = c.switches.private.load(.acquire),
             .switches = &c.switches,
             .label = label,
-            .model_cfg = if (c.secrets.omnigate) |key| .{
+            // helpers and summaries where the chat's provider can be called
+            .model_cfg = if (c.providers.pick(c.cfg.model.model).provider.hasKey()) .{
                 .url = c.cfg.model.url,
-                .key = key,
+                .key = c.secrets.omnigate orelse "",
                 .main = c.cfg.model.model,
                 .worker = c.cfg.model.worker_model,
                 .memory = c.cfg.model.memory_model,
                 .max_tokens = c.cfg.model.max_tokens,
+                .providers = &c.providers,
             } else null,
             .agents = c.cfg.agents,
             .pool = &c.helper_pool,
@@ -2598,9 +2612,28 @@ pub const Core = struct {
         c.mcp_warn = warn.items;
     }
 
-    /// A stored secret for an MCP server: one read at start, else from the
-    /// store now (a secret added since, picked up by /reload), which is
-    /// then masked like the others. Null when none is stored.
+    /// A client for a model value: "PROVIDER:MODEL", or a model of
+    /// [model] provider (agent definitions and workflow steps too).
+    pub fn modelClient(c: *Core, value: []const u8, max_tokens: u32) !model.Client {
+        return c.providers.client(c.gpa, c.io, value, max_tokens);
+    }
+
+    /// Where the providers' keys come from: omnigate's read at start (as
+    /// in 0.3), the others read at start or, stored since, now.
+    fn keyLookup(c: *Core) model.KeyLookup {
+        return .{ .ctx = c, .get = providerKey };
+    }
+
+    fn providerKey(ctx: ?*anyopaque, a: std.mem.Allocator, provider: []const u8, secret: []const u8) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx.?));
+        if (std.mem.eql(u8, provider, "omnigate")) return c.secrets.omnigate;
+        return c.secretValue(a, secret);
+    }
+
+    /// A stored secret for an MCP server or a provider: one read at start,
+    /// else from the store now (a secret added since, picked up by
+    /// /reload), which is then masked like the others. Null when none is
+    /// stored.
     fn secretValue(c: *Core, a: std.mem.Allocator, name: []const u8) ?[]const u8 {
         if (c.secrets.get(name)) |v| return v;
         const st = c.store orelse return null;
@@ -2700,9 +2733,11 @@ pub const Core = struct {
         var run = c.runIn(&c.chat_client, "chat", .{ .agent = def.name }, conv, &flag);
         run.useDefinition(def);
         run.holds_place = true;
-        // its model for this turn (the chat worker is the client's only user)
-        c.chat_client.model = if (def.model.len > 0) def.model else c.cfg.model.model;
-        defer c.chat_client.model = c.cfg.model.model;
+        // its model for this turn (the chat worker is the client's only
+        // user); the client's own is the model its provider was opened for
+        const chat_model = c.chat_client.model;
+        if (def.model.len > 0) c.chat_client.model = def.model;
+        defer c.chat_client.model = chat_model;
         run.context_note = c.contextNote(arena.allocator(), conv) catch "";
         if (note) |n| run.context_note = std.fmt.allocPrint(arena.allocator(), "{s}\n{s}", .{ run.context_note, n }) catch run.context_note;
         run.asker = .{ .ctx = &ask, .ask = askOwner };
@@ -3207,15 +3242,15 @@ pub const Core = struct {
             j -= 1;
             try msg.appendSlice(a, parts.items[j]);
         }
-        var client = try model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", c.cfg.model.memory_model, 1024);
+        var client = try c.modelClient(c.cfg.model.memory_model, 1024);
         defer client.deinit();
         const reply = client.send(a, memory_prompt, &.{.{ .role = .user, .blocks = &.{.{ .text = msg.items }} }}, &.{}) catch |e| {
             // the same turns are read again next time
-            try c.log.write(.model, false, .{ .run = "memory writer", .result = @errorName(e) });
+            try c.log.write(.model, false, .{ .run = "memory writer", .result = @errorName(e), .provider = client.provider });
             return;
         };
         x.memory_upto = upto;
-        try c.log.write(.model, false, .{ .run = "memory writer", .result = "ok", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
+        try c.log.write(.model, false, .{ .run = "memory writer", .result = "ok", .provider = client.provider, .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
         const out = try reply.text(a);
         var it = std.mem.splitScalar(u8, out, '\n');
         var n: usize = 0;
@@ -3668,7 +3703,7 @@ pub const Core = struct {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        var client = try model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens);
+        var client = try c.modelClient(c.cfg.model.model, c.cfg.model.max_tokens);
         defer client.deinit();
         const label = try std.fmt.allocPrint(a, "brief {s}", .{b.name});
         var flag: std.atomic.Value(bool) = .init(false);
@@ -3731,7 +3766,10 @@ pub const Core = struct {
             c.say(try std.fmt.allocPrint(a, "Task {s} names agent {s}, which is not defined; it did not run.", .{ tk.name, tk.agent }));
             return .done;
         };
-        var client = try model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", if (def.model.len > 0) def.model else c.cfg.model.model, c.cfg.model.max_tokens);
+        var client = if (def.model.len > 0)
+            try model.Client.init(c.gpa, c.io, c.cfg.model.url, c.secrets.omnigate orelse "", def.model, c.cfg.model.max_tokens)
+        else
+            try c.modelClient(c.cfg.model.model, c.cfg.model.max_tokens);
         defer client.deinit();
         // a place of its definition; with none free it runs at a later tick
         if (!c.helper_pool.take(c.io, def.name, def.parallel)) return .later;
@@ -3762,7 +3800,8 @@ pub const Core = struct {
         const res = try agent.turn(&run, &conv, tk.do, false);
         defer agent.freeResult(&run, res);
         if (res.stopped) return .done;
-        if (res.ended_by) |why| if (std.mem.eql(u8, why, "Model budget used up.")) {
+        // any provider's 402 ("Model budget used up at openrouter.")
+        if (res.ended_by) |why| if (std.mem.startsWith(u8, why, "Model budget used up")) {
             {
                 c.state_mutex.lockUncancelable(c.io);
                 defer c.state_mutex.unlock(c.io);
@@ -3888,12 +3927,13 @@ pub const Core = struct {
             // folders that got no snapshot, and why
             var snap_note = std.mem.trimEnd(u8, try c.snaps.note(a), "\n");
             snap_note = try std.mem.replaceOwned(u8, a, snap_note, "\n", "; ");
-            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.{s}{s}{s}{s}", .{
+            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.\nProviders: {s}.{s}{s}{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
                 onOff(c.switches.auto_recall.load(.acquire)), onOff(c.convPrivate(conv)),
                 onOff(c.switches.dry_run.load(.acquire)),
                 if (c.browser.len == 0) "none found" else if (builtin.os.tag == .windows) "found (web not available on Windows yet)" else "found",
                 c.login_list.len,
+                try c.providers.describe(a, &.{ c.cfg.model.model, c.cfg.model.worker_model, c.cfg.model.memory_model }),
                 if (c.mcp_note.len > 0) "\nMCP: " else "",
                 std.mem.trimEnd(u8, c.mcp_note, "\n"),
                 if (snap_note.len > 0) "\nSnapshots: " else "",
@@ -4664,7 +4704,7 @@ pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, co
     for (0..n) |_| line = it.next() orelse "";
     // what the parser says of that line (the lines up to it are fine)
     _ = scratch.reset(.retain_capacity);
-    const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e) orelse folders_mod.reason(e);
+    const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e) orelse folders_mod.reason(e) orelse config.reason(e);
     return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
 }
 
@@ -8793,4 +8833,85 @@ test "a_definitions_reply_that_did_not_get_through_goes_to_its_conversation_late
     waitIdle(f.core);
     try t.expectEqual(0, f.rec.countIn("main", "Two flats near the park."));
     try t.expect(std.mem.indexOf(u8, try inboxFile(&f), "\"status\":\"done\"") != null);
+}
+
+test "a_model_value_can_name_a_provider_in_routes_definitions_and_steps" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const url = try f.e.url();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.fmt.allocPrint(a,
+        \\[model]
+        \\url = {s}
+        \\model = local:gpt-chat
+        \\worker_model = openrouter:deepseek/deepseek-chat
+        \\memory_model = anthropic:claude-haiku-4-5
+        \\[provider local]
+        \\api = openai
+        \\url = {s}/v1
+        \\auth = none
+        \\[provider openrouter]
+        \\url = {s}/api/v1
+        \\[provider anthropic]
+        \\url = {s}/v1
+        \\[search]
+        \\url = {s}
+        \\
+    , .{ url, url, url, url, url }) });
+    // keys stored after the start: read on /reload
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    f.core.store = st;
+    try st.put(t.io, "openrouter", "sk-or-test-key-1");
+    try st.put(t.io, "anthropic", "sk-ant-test-key-1");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.core.handleText("/status");
+    try f.rec.waitFor("Providers: local (OpenAI Chat Completions, no key needed); openrouter (OpenAI Chat Completions, key stored); anthropic (Anthropic Messages, key stored).");
+    // the chat on local, its helper on openrouter
+    try f.e.script(1, try model.oaToolReply(a, "call_1", "delegate", "{\"tasks\":[{\"task\":\"find a\"}]}"));
+    try f.e.script(2, model.oaTextReply("helper answer"));
+    try f.e.script(3, model.oaTextReply("Found it."));
+    f.core.chatTurn("research");
+    try f.rec.waitFor("Found it.");
+    const r1 = jv.parse(a, try f.e.request(1)).?;
+    try t.expectEqualStrings("/v1/chat/completions", jv.str(jv.get(r1, "target")).?);
+    try t.expectEqualStrings("gpt-chat", jv.str(jv.at(r1, &.{ "body", "model" })).?);
+    try t.expect(jv.at(r1, &.{ "headers", "Authorization" }) == null);
+    const r2 = jv.parse(a, try f.e.request(2)).?;
+    try t.expectEqualStrings("/api/v1/chat/completions", jv.str(jv.get(r2, "target")).?);
+    try t.expectEqualStrings("Bearer sk-or-test-key-1", jv.str(jv.at(r2, &.{ "headers", "Authorization" })).?);
+    try t.expectEqualStrings("deepseek/deepseek-chat", jv.str(jv.at(r2, &.{ "body", "model" })).?);
+    // memories written on anthropic
+    try f.e.script(4, model.textReply("- The owner researches things."));
+    try f.core.writeMemories();
+    const r4 = jv.parse(a, try f.e.request(4)).?;
+    try t.expectEqualStrings("/v1/messages", jv.str(jv.get(r4, "target")).?);
+    try t.expectEqualStrings("sk-ant-test-key-1", jv.str(jv.at(r4, &.{ "headers", "x-api-key" })).?);
+    try t.expectEqualStrings("claude-haiku-4-5", jv.str(jv.at(r4, &.{ "body", "model" })).?);
+    // an agent definition's or a workflow step's model value, read the same way
+    const ch = f.core.providers.pick("openrouter:x/y");
+    try t.expectEqualStrings("openrouter", ch.provider.name);
+    try t.expectEqualStrings("x/y", ch.model);
+    var cl = try f.core.modelClient("anthropic:claude-opus-4-1", 100);
+    defer cl.deinit();
+    try t.expectEqualStrings("anthropic", cl.provider);
+    try t.expectEqualStrings("claude-opus-4-1", cl.model);
+    // the log names each provider and holds neither key
+    const log_text = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, a, .unlimited);
+    for ([_][]const u8{ "\"provider\":\"local\"", "\"provider\":\"openrouter\"", "\"provider\":\"anthropic\"" }) |want| try t.expect(std.mem.indexOf(u8, log_text, want) != null);
+    try t.expect(std.mem.indexOf(u8, log_text, "sk-or-test-key-1") == null);
+    try t.expect(std.mem.indexOf(u8, log_text, "sk-ant-test-key-1") == null);
+}
+
+test "a_task_pauses_when_any_provider_says_its_budget_is_spent" {
+    var f: Fix = undefined;
+    try f.init("", "", "[watch]\nevery = 5m\ndo = Look.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const url = try f.e.url();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.fmt.allocPrint(a, "[model]\nurl = {s}\nmodel = local:gpt-test\n[provider local]\napi = openai\nurl = {s}/v1\nauth = none\n[search]\nurl = {s}\n", .{ url, url, url }) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(1, "{\"status\":402}");
+    _ = try f.core.runTask(f.core.tasks[0]);
+    try f.rec.waitFor("Task watch is paused: model budget used up.");
 }

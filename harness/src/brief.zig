@@ -267,12 +267,12 @@ pub fn compose(r: *agent.Run, arena: std.mem.Allocator, b: config.Brief, c: Coll
         const msg = try std.fmt.allocPrint(arena, "Brief \"{s}\".\n{s}", .{ b.name, items.items });
         const system = try std.fmt.allocPrint(arena, "{s}\n{s}", .{ brief_instructions, r.extra_instructions });
         if (r.client.send(arena, system, &.{.{ .role = .user, .blocks = &.{.{ .text = msg }} }}, &.{})) |reply| {
-            try r.logRun(.model, false, .{ .result = "ok", .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
+            try r.logRun(.model, false, .{ .result = "ok", .provider = r.client.provider, .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens });
             try out.appendSlice(arena, try reply.text(arena));
         } else |e| {
-            try r.logRun(.model, false, .{ .result = @errorName(e), .detail = r.client.lastError() });
+            try r.logRun(.model, false, .{ .result = @errorName(e), .provider = r.client.provider, .detail = r.client.lastError() });
             // the items themselves still reach the owner
-            try out.print(arena, "{s} The new items:\n", .{if (e == error.BudgetSpent) "Model budget used up." else "The model could not write the brief."});
+            try out.print(arena, "{s} The new items:\n", .{if (e == error.BudgetSpent) try r.client.failure(arena, e) else "The model could not write the brief."});
             for (c.topics) |tp| for (tp.new) |en| try out.print(arena, "- {s} ({s})\n", .{ en.title, en.link });
         }
     }
