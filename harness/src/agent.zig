@@ -2048,11 +2048,15 @@ test "a_fetch_and_a_web_action_get_only_what_is_left_of_the_turn" {
     try t.expect(started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2500);
     const log = try f.logText();
     try t.expect(std.mem.indexOf(u8, log, "the turn's time is up") != null);
-    // refused for want of time, before the browser or the owner: by the
-    // gate ("no time left in the turn to ask the owner") or before the
-    // tool ("no time left in this turn"), whichever comes first
-    if (std.mem.indexOf(u8, log, "no time left in t") == null) std.debug.print("log:\n{s}\n", .{util.cut(log, 6000)});
-    try t.expect(std.mem.indexOf(u8, log, "no time left in t") != null);
+    // the web call never runs: refused for want of time by the gate ("no
+    // time left in the turn to ask the owner") or before the tool ("no time
+    // left in this turn"), or never started (and on Windows not offered)
+    var lines = std.mem.splitScalar(u8, log, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"kind\":\"tool\"") == null or std.mem.indexOf(u8, line, "\"tool\":\"web\"") == null) continue;
+        if (std.mem.indexOf(u8, line, "no time left in t") == null) std.debug.print("web ran: {s}\n", .{line});
+        try t.expect(std.mem.indexOf(u8, line, "no time left in t") != null);
+    }
     // the web call asked nobody
     try t.expectEqual(0, f.asked);
 }
