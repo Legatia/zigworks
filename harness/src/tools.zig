@@ -811,6 +811,42 @@ test "write_file_never_writes_through_a_symlink" {
     try t.expectEqualStrings("new", try f.e.tmp.dir.readFileAlloc(t.io, "ws/plain.txt", f.e.arena.allocator(), .unlimited));
 }
 
+/// Windows: a junction at `link` to the folder `target` (no administrator
+/// needed, unlike a symbolic link); the test is skipped if none can be made.
+fn junction(link: []const u8, target: []const u8) !void {
+    var child = try std.process.spawn(t.io, .{ .argv = &.{ "cmd.exe", "/c", "mklink", "/J", link, target }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true });
+    const term = try child.wait(t.io);
+    if (!(term == .exited and term.exited == 0)) return error.SkipZigTest;
+}
+
+/// The call was refused, by an error result or an error.
+fn refused(f: *Fix, tool: gate.Tool, input: []const u8) bool {
+    const o = f.call(tool, input) catch return true;
+    return o.is_error;
+}
+
+test "files_are_never_written_or_read_through_a_junction_out_of_the_workspace_windows" {
+    if (!is_windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.tmp.dir.createDirPath(t.io, "outside");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "outside/there.txt", .data = "before" });
+    try junction(try std.fs.path.join(a, &.{ f.env.workspace, "door" }), try f.e.tmp.dir.realPathFileAlloc(t.io, "outside", a));
+    // a new file through it, and one that is there, are not written
+    try t.expect(refused(&f, .write_file, "{\"path\":\"door/planted.txt\",\"content\":\"planted\"}"));
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.access(t.io, "outside/planted.txt", .{}));
+    try t.expect(refused(&f, .write_file, "{\"path\":\"door/there.txt\",\"content\":\"after\"}"));
+    try t.expectEqualStrings("before", try f.e.tmp.dir.readFileAlloc(t.io, "outside/there.txt", a, .unlimited));
+    // the junction itself is not a file to write
+    try t.expect(refused(&f, .write_file, "{\"path\":\"door\",\"content\":\"x\"}"));
+    // nor is what is behind it read
+    try t.expect(refused(&f, .read_file, "{\"path\":\"door/there.txt\"}"));
+    // a plain file in the workspace still is written
+    try t.expect(!(try f.call(.write_file, "{\"path\":\"plain.txt\",\"content\":\"new\"}")).is_error);
+}
+
 test "fetch_caps_body_and_refuses_binary" {
     var f: Fix = undefined;
     try f.init();
