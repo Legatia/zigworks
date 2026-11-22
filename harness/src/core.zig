@@ -1057,13 +1057,15 @@ pub const Core = struct {
             return;
         }
         if (!private_chat) return c.groupMessage(m);
-        if (m.thread == 0) return c.handleTextIn("main", text);
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
-        const conv = c.topicConversation(arena.allocator(), m) catch |e| {
+        const conv = if (m.thread == 0) "main" else c.topicConversation(arena.allocator(), m) catch |e| {
             c.say(try std.fmt.allocPrint(arena.allocator(), "A message in a new topic was not taken: harness could not write state/conversations ({s}).", .{@errorName(e)}));
             return;
         };
+        // a reply to one of an item's messages is its text answer
+        const is_command = std.mem.startsWith(u8, std.mem.trim(u8, text, " \t\r\n"), "/");
+        if (m.reply_to != 0 and !is_command and c.replyAnswer(conv, m.chat, m.reply_to, text)) return;
         return c.handleTextIn(conv, text);
     }
 
@@ -1322,11 +1324,21 @@ pub const Core = struct {
         const ca: *ChatAsk = @ptrCast(@alignCast(ctx));
         const c = ca.core;
         if (c.chan == null) return .{ .answer = .unsent };
-        if (c.questions_closed.load(.acquire)) return .{ .answer = .withdrawn };
-        const approval_end_ms = util.nowMs(c.io) + @as(i64, c.cfg.limits.approval_seconds) * 1000;
-        var expires = @divFloor(approval_end_ms + 999, 1000);
-        if (q.deadline_s > 0) expires = @min(expires, q.deadline_s);
-        const id = c.openRunItem(a, ca.conv, q, expires) catch return .{ .answer = .unsent };
+        // a place among the run items open at once (`[inbox] questions`),
+        // waited for until the turn's end
+        var waited = false;
+        var approval_end_ms: i64 = 0;
+        const id = while (true) {
+            if (ca.flag.load(.acquire) or c.questions_closed.load(.acquire)) return .{ .answer = .withdrawn };
+            const no_time = q.deadline_s > 0 and q.deadline_s * 1000 - util.nowMs(c.io) < 500;
+            if (no_time) return .{ .answer = .full, .text = if (waited) c.fullWords(a) else "no time left in the turn to ask the owner" };
+            approval_end_ms = util.nowMs(c.io) + @as(i64, c.cfg.limits.approval_seconds) * 1000;
+            var expires = @divFloor(approval_end_ms + 999, 1000);
+            if (q.deadline_s > 0) expires = @min(expires, q.deadline_s);
+            if (c.openRunItem(a, ca.conv, q, expires) catch return .{ .answer = .unsent }) |made| break made;
+            waited = true;
+            c.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        };
         // a part or its buttons that did not get through: the owner would
         // answer what they did not see, so nothing is allowed
         if (!c.showItem(id, null)) {
@@ -1350,9 +1362,16 @@ pub const Core = struct {
         }
     }
 
+    /// Why a question was refused for want of a place.
+    fn fullWords(c: *Core, a: std.mem.Allocator) []const u8 {
+        const n = c.cfg.inbox.questions;
+        return std.fmt.allocPrint(a, "no place in the inbox until the turn's end: {d} question{s} {s} open (questions in config.ini)", .{ n, if (n == 1) "" else "s", if (n == 1) "was" else "were" }) catch "no place in the inbox until the turn's end";
+    }
+
     /// Makes the item a run waits on, its texts masked; written and logged
-    /// before it is shown.
-    fn openRunItem(c: *Core, a: std.mem.Allocator, conv: []const u8, q: agent.Question, expires: i64) !u64 {
+    /// before it is shown. Null when `[inbox] questions` run items are
+    /// open already.
+    fn openRunItem(c: *Core, a: std.mem.Allocator, conv: []const u8, q: agent.Question, expires: i64) !?u64 {
         const text = try c.masks.scrubAlloc(a, q.text);
         var choices: std.ArrayList(inbox_mod.Choice) = .empty;
         var kind: []const u8 = "approval";
@@ -1379,6 +1398,7 @@ pub const Core = struct {
         const draft = if (q.draft) |d| try c.masks.scrubAlloc(a, d) else null;
         c.inbox.mutex.lockUncancelable(c.io);
         defer c.inbox.mutex.unlock(c.io);
+        if (c.inbox.runOpen() >= c.cfg.inbox.questions) return null;
         const it = try c.inbox.add(.{
             .kind = kind,
             .by = q.who.by,
@@ -1698,6 +1718,47 @@ pub const Core = struct {
         const said: ?[]const u8 = if (words) |w| c.masks.scrubAlloc(a, w) catch return .not_offered else null;
         if (!c.settle(id, .answered, .{ .key = key, .text = said, .at = c.now(), .via = via })) return .closed;
         return .taken;
+    }
+
+    /// A reply to one of an item's messages: its text answer (the owner is
+    /// told what came of it unless it was taken). False when `reply_to` is
+    /// no item's message.
+    fn replyAnswer(c: *Core, conv: []const u8, chat: i64, reply_to: i64, text: []const u8) bool {
+        const id = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            for (c.inbox.items.items) |it| for (it.shown.items) |s| if (s.chat == chat and s.message == reply_to) break :blk it.id;
+            return false;
+        };
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const took = c.answerItem(id, "", text, .telegram);
+        if (took != .taken) c.sayIn(conv, c.tookText(arena.allocator(), id, took));
+        return true;
+    }
+
+    /// What came of an answer to item `id`, in words for the owner.
+    fn tookText(c: *Core, a: std.mem.Allocator, id: u64, took: Took) []const u8 {
+        c.inbox.mutex.lockUncancelable(c.io);
+        defer c.inbox.mutex.unlock(c.io);
+        const it = c.inbox.find(id) orelse return std.fmt.allocPrint(a, "No item {d} is waiting.", .{id}) catch "No such item is waiting.";
+        return switch (took) {
+            .taken => std.fmt.allocPrint(a, "Item {d}: {s}.", .{ id, inbox_mod.outcome(a, it, c.cfg.chat.utc_offset) catch "answered" }) catch "Answered.",
+            .unknown => std.fmt.allocPrint(a, "No item {d} is waiting.", .{id}) catch "No such item is waiting.",
+            .closed => inbox_mod.already(a, it, c.cfg.chat.utc_offset) catch "It is closed.",
+            .buttons_only => std.fmt.allocPrint(a, "Item {d} takes the buttons only.", .{id}) catch "It takes the buttons only.",
+            .not_offered => std.fmt.allocPrint(a, "Item {d} does not take that answer.", .{id}) catch "It does not take that answer.",
+        };
+    }
+
+    /// `/answer ID TEXT`: the text answer to item ID.
+    fn answerCommand(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        const usage = "Use /answer ID TEXT: the item's number, then your words.";
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const id = std.fmt.parseInt(u64, words.next() orelse return usage, 10) catch return usage;
+        const text = std.mem.trim(u8, words.rest(), " \t");
+        if (text.len == 0) return usage;
+        return c.tookText(a, id, c.answerItem(id, "", text, if (std.mem.eql(u8, conv, "terminal")) .terminal else .telegram));
     }
 
     /// The terminal's "o", "d" or "n": answers the oldest open run item
@@ -3106,6 +3167,7 @@ pub const Core = struct {
         \\/conversation rename OLD NEW, /conversation rm NAME
         \\/conversation add NAME: sent in a group, the agent may post there
         \\/session [N]: the steps behind the last answer here (N runs back)
+        \\/answer ID TEXT: answer an item in words (or reply to its message)
     ;
 
     /// A command sent in `main` (or from the command line).
@@ -3232,6 +3294,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/logins")) return c.loginsText(a);
         if (eql(u8, cmd, "/conversations")) return c.conversationsText(a);
         if (eql(u8, cmd, "/session")) return c.sessionText(a, conv, rest);
+        if (eql(u8, cmd, "/answer")) return c.answerCommand(a, conv, rest);
         if (eql(u8, cmd, "/conversation")) return c.conversationCommand(a, conv, rest);
         if (eql(u8, cmd, "/skills")) {
             const list = try skills.list(a, c.io, c.paths.skills);
@@ -5178,6 +5241,89 @@ test "stop_withdraws_the_items_of_the_runs_it_stops" {
     try t.expect(std.mem.indexOf(u8, text, "\"text\":\"its run stopped\"") != null);
     try t.expectEqual(0, f.core.itemsWaiting());
     try t.expectEqual(1, f.e.server.modelRequests());
+}
+
+test "a_text_reply_to_an_approval_denies_it_and_the_agent_gets_the_reason" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "house-search", 5012);
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo deploy-prod\"}"));
+    try f.e.script(2, model.textReply("not deployed"));
+    try f.e.script(3, model.textReply("a reply to a plain message"));
+    try f.e.script(4, model.textReply("a topic message"));
+    try f.core.startWorker();
+    try f.core.handleText("deploy");
+    try f.rec.waitFor("BUTTONS Allow this? [1]");
+    const b = f.lastButtons();
+    // the owner replies to the item's message with their reason
+    try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = "use staging", .reply_to = b.msg });
+    try f.rec.waitFor("not deployed");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "denied by the owner: use staging (item 1)") != null);
+    const text = try inboxFile(&f);
+    try t.expect(std.mem.indexOf(u8, text, "\"answer\":{\"key\":\"deny\",\"text\":\"use staging\",") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"via\":\"telegram\"") != null);
+    try f.rec.waitFor("\nDenied with your reason, ");
+    // a reply to another message is a message, as today
+    try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = "and this?", .reply_to = 100001 });
+    try f.rec.waitFor("a reply to a plain message");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "and this?") != null);
+    // so is a message in a topic replying to its opening
+    try f.core.handleIncoming(.{ .from = 42, .chat = 42, .thread = 5012, .text = "in the topic", .reply_to = 5012 });
+    try f.rec.waitIn("house-search", "a topic message");
+}
+
+test "answer_takes_text_and_says_when_an_item_takes_buttons_only" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo deploy-prod\"}"));
+    try f.e.script(2, model.textReply("staged instead"));
+    try f.core.startWorker();
+    try f.core.handleText("deploy");
+    try f.rec.waitFor("BUTTONS Allow this? [1]");
+    try f.core.handleText("/answer 1 staging please");
+    try f.rec.waitFor("staged instead");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "denied by the owner: staging please (item 1)") != null);
+    try f.rec.waitFor("Item 1: denied with your reason, ");
+    // an item that takes the buttons only, made here as other parts make theirs
+    {
+        f.core.inbox.mutex.lockUncancelable(t.io);
+        defer f.core.inbox.mutex.unlock(t.io);
+        _ = try f.core.inbox.add(.{ .kind = "paused", .title = "trigger feed paused", .body = "trigger feed paused", .choices = &.{ .{ .key = "resume", .label = "Resume" }, .{ .key = "remove", .label = "Remove" } } }, f.core.now(), "0123456789abcdef".*);
+    }
+    try f.core.handleText("/answer 2 resume it");
+    try f.rec.waitFor("Item 2 takes the buttons only.");
+    try f.core.handleText("/answer 9 hello");
+    try f.rec.waitFor("No item 9 is waiting.");
+    try f.core.handleText("/answer 1 too late");
+    try f.rec.waitFor("Already answered: denied with your reason, ");
+    try f.core.handleText("/answer x");
+    try f.rec.waitFor("Use /answer ID TEXT");
+}
+
+test "the_21st_question_waits_for_a_place_until_its_turn_ends" {
+    var f: Fix = undefined;
+    try f.init("[inbox]\nquestions = 1\n[limits]\nturn_seconds = 3\n", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"one\",\"tools\":[\"shell\"]},{\"task\":\"two\",\"tools\":[\"shell\"]},{\"task\":\"three\",\"tools\":[\"shell\"]}]}"));
+    for (2..5) |n| try f.e.script(@intCast(n), model.toolReply("w", "shell", "{\"command\":\"echo needs-a-place\"}"));
+    for (5..9) |n| try f.e.script(@intCast(n), model.textReply("helper done"));
+    try f.core.startWorker();
+    try f.core.handleText("three at once");
+    // one item; the other two wait for a place
+    try f.rec.waitFor("BUTTONS Allow this? [1]");
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    try t.expectEqual(1, f.rec.count("BUTTONS"));
+    try f.press("once");
+    // its place goes to the next question, which is never answered
+    try f.rec.waitFor("BUTTONS Allow this? [2]");
+    // the third waits for a place until the turn ends, then is refused
+    try f.rec.waitFor("Time limit reached for this turn.");
+    try t.expectEqual(2, f.rec.count("BUTTONS"));
+    const lt = try logText(&f);
+    if (std.mem.indexOf(u8, lt, "no place in the inbox") == null) std.debug.print("{s}\n", .{lt});
+    try t.expect(std.mem.indexOf(u8, lt, "\"why\":\"no place in the inbox until the turn's end: 1 question was open (questions in config.ini)\"") != null);
 }
 
 /// Waits until `needle` was said `n` times.
