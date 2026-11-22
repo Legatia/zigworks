@@ -7,6 +7,7 @@ const std = @import("std");
 const skills = @import("skills.zig");
 const gate = @import("gate.zig");
 const rules = @import("rules.zig");
+const util = @import("util.zig");
 const Io = std.Io;
 
 /// The most a definition's file may hold.
@@ -304,6 +305,395 @@ pub const builtin_helper: Def = .{
 /// The built-ins, in the order they are listed.
 pub const builtins = [_]*const Def{ &builtin_helper, &builtin_main };
 
+// ---- the folder ----
+
+/// The definitions of a data folder: the built-ins, then each
+/// `agents/NAME.md` over them. Shared by all runs (under its mutex); a run
+/// takes a copy of its definition when it starts, so a change saved
+/// meanwhile applies to the next run and frees nothing a run holds.
+pub const Set = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    /// `agents/`; "": the built-ins only, and nothing is saved.
+    dir: []const u8 = "",
+    /// `state/agents/`: each definition's earlier versions.
+    state: []const u8 = "",
+    mutex: Io.Mutex = .init,
+    items: std.ArrayList(*Item) = .empty,
+
+    pub const Item = struct {
+        arena: std.heap.ArenaAllocator,
+        def: Def,
+        /// The SHA-256 of its file as last read or written; null: a
+        /// built-in without a file.
+        file_hash: ?[32]u8 = null,
+    };
+
+    /// What `read` found, until `install` takes it.
+    pub const Loaded = struct {
+        gpa: std.mem.Allocator,
+        items: std.ArrayList(*Item) = .empty,
+
+        pub fn deinit(l: *Loaded) void {
+            freeItems(l.gpa, &l.items);
+        }
+
+        pub fn has(l: *const Loaded, name: []const u8) bool {
+            for (l.items.items) |it| if (std.mem.eql(u8, it.def.name, name)) return true;
+            return false;
+        }
+    };
+
+    pub fn init(gpa: std.mem.Allocator, io: Io, dir: []const u8, state: []const u8) Set {
+        return .{ .gpa = gpa, .io = io, .dir = dir, .state = state };
+    }
+
+    pub fn deinit(s: *Set) void {
+        freeItems(s.gpa, &s.items);
+    }
+
+    /// Reads the built-ins, then each `NAME.md` of the folder over them;
+    /// nothing in `s` changes. A folder or file other users can write, a
+    /// file that does not read, or more than `max_defs` definitions is
+    /// error.BadDefinition, said in `diag` (its strings in `scratch`).
+    pub fn read(s: *const Set, scratch: std.mem.Allocator, diag: *Diag) Error!Loaded {
+        var l: Loaded = .{ .gpa = s.gpa };
+        errdefer l.deinit();
+        for (builtins) |b| {
+            const it = try newItem(s.gpa);
+            it.def = b.*;
+            l.items.append(s.gpa, it) catch |e| {
+                freeItem(s.gpa, it);
+                return e;
+            };
+        }
+        if (s.dir.len == 0) return l;
+        var d = Io.Dir.cwd().openDir(s.io, s.dir, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound => return l,
+            else => return failIn(scratch, diag, "agents", 0, try std.fmt.allocPrint(scratch, "can't be read ({s})", .{@errorName(e)})),
+        };
+        defer d.close(s.io);
+        if (others_can_write) {
+            const st = d.stat(s.io) catch |e| return failIn(scratch, diag, "agents", 0, try std.fmt.allocPrint(scratch, "can't be read ({s})", .{@errorName(e)}));
+            if (st.permissions.toMode() & 0o022 != 0) return failIn(scratch, diag, "agents", 0, "can be changed by other users; run chmod go-w on it (it decides what runs)");
+        }
+        var files = d.iterate();
+        while (files.next(s.io) catch |e| return failIn(scratch, diag, "agents", 0, try std.fmt.allocPrint(scratch, "can't be read ({s})", .{@errorName(e)}))) |e| {
+            if (e.kind != .file and e.kind != .sym_link) continue;
+            if (!std.mem.endsWith(u8, e.name, ".md")) continue;
+            const file = try std.fmt.allocPrint(scratch, "agents/{s}", .{e.name});
+            const name = e.name[0 .. e.name.len - 3];
+            if (!validName(name)) return failIn(scratch, diag, file, 0, "is no definition's file: NAME.md, the name in a-z, 0-9 and - (up to 64), not list, show or rm");
+            if (others_can_write) {
+                const st = d.statFile(s.io, e.name, .{}) catch |err| return failIn(scratch, diag, file, 0, try std.fmt.allocPrint(scratch, "can't be read ({s})", .{@errorName(err)}));
+                if (st.permissions.toMode() & 0o022 != 0) return failIn(scratch, diag, file, 0, try std.fmt.allocPrint(scratch, "can be changed by other users; run chmod 600 on it", .{}));
+            }
+            const it = try newItem(s.gpa);
+            var kept = false;
+            defer if (!kept) freeItem(s.gpa, it);
+            const ia = it.arena.allocator();
+            const text = d.readFileAlloc(s.io, e.name, ia, .limited(max_file + 1)) catch |err| switch (err) {
+                error.StreamTooLong => return failIn(scratch, diag, file, 0, "is over 8 KB"),
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return failIn(scratch, diag, file, 0, try std.fmt.allocPrint(scratch, "can't be read ({s})", .{@errorName(err)})),
+            };
+            var pd: Diag = .{};
+            it.def = parse(ia, try ia.dupe(u8, name), text, &pd) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadDefinition => return failIn(scratch, diag, file, pd.line, try scratch.dupe(u8, pd.why)),
+            };
+            it.file_hash = sha(text);
+            // over a built-in of the same name
+            for (l.items.items, 0..) |old, i| {
+                if (!std.mem.eql(u8, old.def.name, it.def.name)) continue;
+                l.items.items[i] = it;
+                freeItem(s.gpa, old);
+                break;
+            } else try l.items.append(s.gpa, it);
+            kept = true;
+            if (l.items.items.len > max_defs) return failIn(scratch, diag, "agents", 0, "has more than 32 definitions, the built-ins counted");
+        }
+        std.mem.sort(*Item, l.items.items, {}, struct {
+            fn lt(_: void, x: *Item, y: *Item) bool {
+                return std.mem.order(u8, x.def.name, y.def.name) == .lt;
+            }
+        }.lt);
+        return l;
+    }
+
+    /// Puts what `read` found in place of what was there.
+    pub fn install(s: *Set, l: Loaded) void {
+        var old = blk: {
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            const o = s.items;
+            s.items = l.items;
+            break :blk o;
+        };
+        freeItems(s.gpa, &old);
+    }
+
+    pub fn load(s: *Set, scratch: std.mem.Allocator, diag: *Diag) Error!void {
+        s.install(try s.read(scratch, diag));
+    }
+
+    /// A copy of the definition `name` in `a`; null: none.
+    pub fn get(s: *Set, a: std.mem.Allocator, name: []const u8) !?Def {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        const it = s.find(name) orelse return null;
+        return try it.def.clone(a);
+    }
+
+    pub fn has(s: *Set, name: []const u8) bool {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        return s.find(name) != null;
+    }
+
+    /// Copies of all, by name.
+    pub fn list(s: *Set, a: std.mem.Allocator) ![]Def {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        const out = try a.alloc(Def, s.items.items.len);
+        for (s.items.items, out) |it, *o| o.* = try it.def.clone(a);
+        return out;
+    }
+
+    /// The definition's `parallel` (0 for none, or for no such definition).
+    pub fn parallelOf(s: *Set, name: []const u8) u32 {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        return if (s.find(name)) |it| it.def.parallel else 0;
+    }
+
+    /// Under the mutex.
+    fn find(s: *const Set, name: []const u8) ?*Item {
+        for (s.items.items) |it| if (std.mem.eql(u8, it.def.name, name)) return it;
+        return null;
+    }
+
+    /// Writes the definition `name` (its whole file, which `parse` takes):
+    /// the file there before goes to its versions (the last 10 kept), the
+    /// new one is written whole (a new file, then a rename), and runs that
+    /// start from now on get it.
+    pub fn save(s: *Set, name: []const u8, text: []const u8) !void {
+        if (s.dir.len == 0) return error.NoFolder;
+        const it = try newItem(s.gpa);
+        var kept = false;
+        defer if (!kept) freeItem(s.gpa, it);
+        const ia = it.arena.allocator();
+        var pd: Diag = .{};
+        it.def = try parse(ia, try ia.dupe(u8, name), try ia.dupe(u8, text), &pd);
+        it.file_hash = sha(text);
+        const cwd = Io.Dir.cwd();
+        _ = try cwd.createDirPathStatus(s.io, s.dir, private_dir);
+        var pbuf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "{s}{c}{s}.md", .{ s.dir, std.fs.path.sep, name });
+        if (cwd.readFileAlloc(s.io, path, s.gpa, .limited(1 << 20))) |old| {
+            defer s.gpa.free(old);
+            try s.keepVersion(name, old);
+        } else |e| if (e != error.FileNotFound) return e;
+        var tbuf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const tmp = try std.fmt.bufPrint(&tbuf, "{s}.tmp", .{path});
+        try cwd.writeFile(s.io, .{ .sub_path = tmp, .data = text, .flags = .{ .permissions = util.private_file } });
+        errdefer cwd.deleteFile(s.io, tmp) catch {};
+        try cwd.rename(tmp, cwd, path, s.io);
+        const old = blk: {
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            for (s.items.items, 0..) |o, i| if (std.mem.eql(u8, o.def.name, name)) {
+                s.items.items[i] = it;
+                break :blk o;
+            };
+            var at: usize = 0;
+            while (at < s.items.items.len and std.mem.order(u8, s.items.items[at].def.name, name) == .lt) at += 1;
+            try s.items.insert(s.gpa, at, it);
+            break :blk null;
+        };
+        kept = true;
+        if (old) |o| freeItem(s.gpa, o);
+    }
+
+    /// Moves the definition's file to its versions; refused for `main` and
+    /// `helper` (harness's own).
+    pub fn remove(s: *Set, name: []const u8) !void {
+        for (builtins) |b| if (std.mem.eql(u8, b.name, name)) return error.BuiltIn;
+        if (s.dir.len == 0 or !s.has(name)) return error.NotFound;
+        const cwd = Io.Dir.cwd();
+        var pbuf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "{s}{c}{s}.md", .{ s.dir, std.fs.path.sep, name });
+        const text = try cwd.readFileAlloc(s.io, path, s.gpa, .limited(1 << 20));
+        defer s.gpa.free(text);
+        try s.keepVersion(name, text);
+        try cwd.deleteFile(s.io, path);
+        const gone = blk: {
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            for (s.items.items, 0..) |o, i| if (std.mem.eql(u8, o.def.name, name)) break :blk s.items.orderedRemove(i);
+            break :blk null;
+        };
+        if (gone) |o| freeItem(s.gpa, o);
+    }
+
+    /// The folder of `name`'s earlier versions (in `buf`).
+    fn versionsDir(s: *const Set, buf: []u8, name: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}{c}{s}{c}versions", .{ s.state, std.fs.path.sep, name, std.fs.path.sep });
+    }
+
+    /// Keeps `text` as the newest of `name`'s versions
+    /// (`20261122T140211Z-001.md`), dropping all but the last 10.
+    fn keepVersion(s: *Set, name: []const u8, text: []const u8) !void {
+        var vbuf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const vdir = try s.versionsDir(&vbuf, name);
+        const cwd = Io.Dir.cwd();
+        try cwd.createDirPath(s.io, vdir);
+        var d = try cwd.openDir(s.io, vdir, .{ .iterate = true });
+        defer d.close(s.io);
+        var tb: [20]u8 = undefined;
+        const iso = util.isoTime(&tb, util.nowSeconds(s.io));
+        var stamp: [16]u8 = undefined;
+        var n: usize = 0;
+        for (iso) |c| if (c != '-' and c != ':') {
+            stamp[n] = c;
+            n += 1;
+        };
+        // after the last of this second, so the names sort in time order
+        var last: u32 = 0;
+        var scan = d.iterate();
+        while (try scan.next(s.io)) |e| {
+            if (!std.mem.startsWith(u8, e.name, stamp[0..n]) or !std.mem.endsWith(u8, e.name, ".md")) continue;
+            const num = e.name[@min(n + 1, e.name.len) .. e.name.len - 3];
+            last = @max(last, std.fmt.parseInt(u32, num, 10) catch 0);
+        }
+        var nb: [40]u8 = undefined;
+        const file = try std.fmt.bufPrint(&nb, "{s}-{d:0>3}.md", .{ stamp[0..n], last + 1 });
+        try d.writeFile(s.io, .{ .sub_path = file, .data = text, .flags = .{ .permissions = util.private_file } });
+        // the names sort in time order: all but the last 10 go
+        var names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (names.items) |x| s.gpa.free(x);
+            names.deinit(s.gpa);
+        }
+        var it = d.iterate();
+        while (try it.next(s.io)) |e| if (e.kind == .file and std.mem.endsWith(u8, e.name, ".md")) {
+            const x = try s.gpa.dupe(u8, e.name);
+            names.append(s.gpa, x) catch |err| {
+                s.gpa.free(x);
+                return err;
+            };
+        };
+        std.mem.sort([]u8, names.items, {}, struct {
+            fn lt(_: void, x: []u8, y: []u8) bool {
+                return std.mem.order(u8, x, y) == .lt;
+            }
+        }.lt);
+        if (names.items.len > keep_versions) for (names.items[0 .. names.items.len - keep_versions]) |x| d.deleteFile(s.io, x) catch {};
+    }
+
+    /// How many earlier versions of `name` are kept.
+    pub fn versions(s: *Set, name: []const u8) usize {
+        if (s.state.len == 0) return 0;
+        var vbuf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const vdir = s.versionsDir(&vbuf, name) catch return 0;
+        var d = Io.Dir.cwd().openDir(s.io, vdir, .{ .iterate = true }) catch return 0;
+        defer d.close(s.io);
+        var n: usize = 0;
+        var it = d.iterate();
+        while (it.next(s.io) catch null) |e| {
+            if (e.kind == .file and std.mem.endsWith(u8, e.name, ".md")) n += 1;
+        }
+        return n;
+    }
+
+    /// Whether the folder's files are no longer what was last read or
+    /// written (a hand edit, a file added or removed): they apply after
+    /// /reload. A save does not count.
+    pub fn changedOnDisk(s: *Set) bool {
+        if (s.dir.len == 0) return false;
+        const Known = struct { name: [64]u8, len: usize, hash: [32]u8 };
+        var known: [max_defs]Known = undefined;
+        var n_known: usize = 0;
+        {
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            for (s.items.items) |it| if (it.file_hash) |h| {
+                if (n_known == known.len or it.def.name.len > 64) return true;
+                known[n_known] = .{ .name = undefined, .len = it.def.name.len, .hash = h };
+                @memcpy(known[n_known].name[0..it.def.name.len], it.def.name);
+                n_known += 1;
+            };
+        }
+        var d = Io.Dir.cwd().openDir(s.io, s.dir, .{ .iterate = true }) catch return n_known > 0;
+        defer d.close(s.io);
+        var on_disk: usize = 0;
+        var buf: [max_file + 1]u8 = undefined;
+        var it = d.iterate();
+        while (it.next(s.io) catch return true) |e| {
+            if (e.kind != .file and e.kind != .sym_link) continue;
+            if (!std.mem.endsWith(u8, e.name, ".md")) continue;
+            on_disk += 1;
+            const name = e.name[0 .. e.name.len - 3];
+            const k = for (known[0..n_known]) |*x| {
+                if (std.mem.eql(u8, x.name[0..x.len], name)) break x;
+            } else return true;
+            const text = d.readFile(s.io, e.name, &buf) catch return true;
+            if (!std.mem.eql(u8, &sha(text), &k.hash)) return true;
+        }
+        return on_disk != n_known;
+    }
+};
+
+/// Versions kept of each definition.
+const keep_versions = 10;
+
+/// On macOS and Linux a folder or file other users can write is refused.
+const others_can_write = @import("builtin").os.tag != .windows;
+
+/// `agents/` is made readable only by its owner.
+pub const private_dir: Io.File.Permissions = if (@import("builtin").os.tag == .windows) .default_dir else .fromMode(0o700);
+
+fn sha(text: []const u8) [32]u8 {
+    var h: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &h, .{});
+    return h;
+}
+
+fn newItem(gpa: std.mem.Allocator) !*Set.Item {
+    const it = try gpa.create(Set.Item);
+    it.* = .{ .arena = .init(gpa), .def = undefined };
+    return it;
+}
+
+fn freeItem(gpa: std.mem.Allocator, it: *Set.Item) void {
+    it.arena.deinit();
+    gpa.destroy(it);
+}
+
+fn failIn(scratch: std.mem.Allocator, diag: *Diag, file: []const u8, line: usize, why: []const u8) Error {
+    _ = scratch;
+    diag.* = .{ .file = file, .line = line, .why = why };
+    return error.BadDefinition;
+}
+
+fn freeItems(gpa: std.mem.Allocator, items: *std.ArrayList(*Set.Item)) void {
+    for (items.items) |it| freeItem(gpa, it);
+    items.deinit(gpa);
+}
+
+/// What is wrong with the definitions in `dir`, said so the owner can fix
+/// it; null when nothing is.
+pub fn problem(io: Io, a: std.mem.Allocator, dir: []const u8) !?[]const u8 {
+    var s: Set = .init(a, io, dir, "");
+    var diag: Diag = .{};
+    var l = s.read(a, &diag) catch |e| switch (e) {
+        error.BadDefinition => return try diag.text(a),
+        else => |x| return x,
+    };
+    l.deinit();
+    return null;
+}
+
 // ---- tests ----
 
 const t = std.testing;
@@ -462,4 +852,201 @@ test "the_builtins_read_as_their_files" {
     try t.expect(std.mem.startsWith(u8, builtin_main.body, "You are a personal agent"));
     for ([_][]const u8{ "main", "researcher", "zig-2" }) |n| try t.expect(validName(n));
     for ([_][]const u8{ "rm", "show", "list", "Main", "a b", "a/b", "", "-a", "a:b" }) |n| try t.expect(!validName(n));
+}
+
+/// A folder for a set's files: `agents/` and `state/agents/` in a temp dir.
+const SetFix = struct {
+    tmp: t.TmpDir,
+    arena: std.heap.ArenaAllocator,
+    dir: []const u8,
+    state: []const u8,
+    set: Set,
+
+    fn init(f: *SetFix) !void {
+        f.tmp = t.tmpDir(.{});
+        f.arena = .init(t.allocator);
+        const a = f.arena.allocator();
+        const root = try f.tmp.dir.realPathFileAlloc(t.io, ".", a);
+        f.dir = try std.fs.path.join(a, &.{ root, "agents" });
+        f.state = try std.fs.path.join(a, &.{ root, "state", "agents" });
+        f.set = .init(t.allocator, t.io, f.dir, f.state);
+    }
+
+    fn deinit(f: *SetFix) void {
+        f.set.deinit();
+        f.arena.deinit();
+        f.tmp.cleanup();
+    }
+
+    fn put(f: *SetFix, name: []const u8, text: []const u8) !void {
+        try f.tmp.dir.createDirPath(t.io, "agents");
+        try f.tmp.dir.writeFile(t.io, .{ .sub_path = try std.fmt.allocPrint(f.arena.allocator(), "agents/{s}", .{name}), .data = text, .flags = .{ .permissions = @import("util.zig").private_file } });
+    }
+
+    fn load(f: *SetFix) !void {
+        var diag: Diag = .{};
+        f.set.load(f.arena.allocator(), &diag) catch |e| {
+            std.debug.print("load: {s}\n", .{try diag.text(f.arena.allocator())});
+            return e;
+        };
+    }
+
+    /// The text `load` refuses the folder with.
+    fn refused(f: *SetFix) ![]const u8 {
+        var diag: Diag = .{};
+        if (f.set.load(f.arena.allocator(), &diag)) |_| return error.TestUnexpectedResult else |e| try t.expectEqual(error.BadDefinition, e);
+        return diag.text(f.arena.allocator());
+    }
+};
+
+fn researcherText(a: std.mem.Allocator, body: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "---\nname: researcher\ndescription: Research.\nmodel: claude-r\n---\n{s}\n", .{body});
+}
+
+test "no_agents_folder_means_the_builtins" {
+    var f: SetFix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.load();
+    const all = try f.set.list(a);
+    try t.expectEqual(2, all.len);
+    try t.expectEqualStrings("helper", all[0].name);
+    try t.expectEqualStrings("main", all[1].name);
+    try t.expect(all[0].builtin and all[1].builtin);
+    try t.expect((try f.set.get(a, "main")).?.builtin);
+    try t.expectEqual(null, try f.set.get(a, "researcher"));
+    try t.expect(f.set.has("helper") and !f.set.has("researcher"));
+    try t.expect(!f.set.changedOnDisk());
+}
+
+test "a_file_replaces_its_builtin_and_adds_to_the_list" {
+    var f: SetFix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.put("main.md", "---\nname: main\ndescription: Mine.\ntools: *\n---\nMy own instructions.\n");
+    try f.put("researcher.md", try researcherText(a, "Research one thing."));
+    try f.put("parallel.md", "---\nname: parallel\ndescription: Two at once.\nparallel: 2\n---\n");
+    try f.put("notes.txt", "not a definition");
+    try f.load();
+    const all = try f.set.list(a);
+    try t.expectEqual(4, all.len);
+    try t.expectEqualStrings("helper", all[0].name);
+    try t.expect(all[0].builtin);
+    try t.expectEqualStrings("main", all[1].name);
+    try t.expect(!all[1].builtin);
+    try t.expectEqualStrings("My own instructions.\n", all[1].body);
+    try t.expectEqualStrings("researcher", all[3].name);
+    try t.expectEqualStrings("claude-r", (try f.set.get(a, "researcher")).?.model);
+    try t.expectEqual(2, f.set.parallelOf("parallel"));
+    try t.expectEqual(0, f.set.parallelOf("researcher"));
+    // a file that does not read: nothing changes, its file and line are named
+    try f.put("bad.md", "---\nname: bad\ncolour: red\n---\n");
+    try t.expectEqualStrings("agents/bad.md line 3 has an error: unknown key colour", try f.refused());
+    try t.expectEqualStrings("agents/bad.md line 3 has an error: unknown key colour", (try problem(t.io, a, f.dir)).?);
+    try t.expectEqual(4, (try f.set.list(a)).len);
+    try f.tmp.dir.deleteFile(t.io, "agents/bad.md");
+    try t.expectEqual(null, try problem(t.io, a, f.dir));
+    // a file whose name is no definition's
+    try f.put("Big.md", "---\nname: Big\ndescription: x\n---\n");
+    try t.expect(std.mem.startsWith(u8, try f.refused(), "agents/Big.md "));
+    try f.tmp.dir.deleteFile(t.io, "agents/Big.md");
+    // at most 32, the built-ins counted
+    for (0..29) |i| try f.put(try std.fmt.allocPrint(a, "d{d}.md", .{i}), try std.fmt.allocPrint(a, "---\nname: d{d}\ndescription: x\n---\n", .{i}));
+    try t.expectEqualStrings("agents has more than 32 definitions, the built-ins counted", try f.refused());
+}
+
+test "a_folder_or_file_others_can_write_is_refused" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var f: SetFix = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.put("researcher.md", try researcherText(f.arena.allocator(), "x"));
+    {
+        var d = try f.tmp.dir.openDir(t.io, "agents", .{ .iterate = true });
+        defer d.close(t.io);
+        try d.setPermissions(t.io, .fromMode(0o777));
+    }
+    try t.expect(std.mem.indexOf(u8, try f.refused(), "agents can be changed by other users") != null);
+    try t.expectEqual(0, (try f.set.list(f.arena.allocator())).len);
+    {
+        var d = try f.tmp.dir.openDir(t.io, "agents", .{ .iterate = true });
+        defer d.close(t.io);
+        try d.setPermissions(t.io, .fromMode(0o700));
+    }
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "agents/researcher.md", .data = try researcherText(f.arena.allocator(), "y"), .flags = .{ .permissions = .fromMode(0o666) } });
+    // writeFile keeps an existing file's mode: set it
+    {
+        var file = try f.tmp.dir.openFile(t.io, "agents/researcher.md", .{});
+        defer file.close(t.io);
+        try file.setPermissions(t.io, .fromMode(0o666));
+    }
+    try t.expect(std.mem.indexOf(u8, try f.refused(), "agents/researcher.md can be changed by other users") != null);
+}
+
+test "a_save_keeps_the_last_ten_versions" {
+    var f: SetFix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.load();
+    try f.set.save("researcher", try researcherText(a, "v0"));
+    try t.expectEqual(0, f.set.versions("researcher"));
+    try t.expectEqualStrings("v0\n", (try f.set.get(a, "researcher")).?.body);
+    for (1..13) |i| try f.set.save("researcher", try researcherText(a, try std.fmt.allocPrint(a, "v{d}", .{i})));
+    try t.expectEqual(10, f.set.versions("researcher"));
+    try t.expectEqualStrings("v12\n", (try f.set.get(a, "researcher")).?.body);
+    try t.expectEqualStrings(try researcherText(a, "v12"), try f.tmp.dir.readFileAlloc(t.io, "agents/researcher.md", a, .unlimited));
+    try t.expectError(error.FileNotFound, f.tmp.dir.statFile(t.io, "agents/researcher.md.tmp", .{}));
+    // the oldest went: v2 to v11 are kept
+    var d = try f.tmp.dir.openDir(t.io, "state/agents/researcher/versions", .{ .iterate = true });
+    defer d.close(t.io);
+    var kept: std.ArrayList([]const u8) = .empty;
+    var it = d.iterate();
+    while (try it.next(t.io)) |e| try kept.append(a, try d.readFileAlloc(t.io, e.name, a, .unlimited));
+    try t.expectEqual(10, kept.items.len);
+    for (kept.items) |x| try t.expect(std.mem.indexOf(u8, x, "\nv0\n") == null and std.mem.indexOf(u8, x, "\nv1\n") == null);
+    var has11 = false;
+    for (kept.items) |x| has11 = has11 or std.mem.indexOf(u8, x, "\nv11\n") != null;
+    try t.expect(has11);
+}
+
+test "rm_moves_the_file_to_its_versions_and_keeps_the_builtins" {
+    var f: SetFix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.put("main.md", "---\nname: main\ndescription: Mine.\n---\nMine.\n");
+    try f.load();
+    try f.set.save("researcher", try researcherText(a, "v0"));
+    try f.set.remove("researcher");
+    try t.expectEqual(null, try f.set.get(a, "researcher"));
+    try t.expectError(error.FileNotFound, f.tmp.dir.statFile(t.io, "agents/researcher.md", .{}));
+    try t.expectEqual(1, f.set.versions("researcher"));
+    try t.expectError(error.BuiltIn, f.set.remove("main"));
+    try t.expectError(error.BuiltIn, f.set.remove("helper"));
+    try t.expectError(error.NotFound, f.set.remove("nobody"));
+    try t.expect(f.set.has("main"));
+}
+
+test "a_change_on_disk_is_noticed_and_a_save_is_not" {
+    var f: SetFix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.load();
+    try t.expect(!f.set.changedOnDisk());
+    try f.set.save("researcher", try researcherText(a, "saved"));
+    try t.expect(!f.set.changedOnDisk());
+    try f.put("researcher.md", try researcherText(a, "edited by hand"));
+    try t.expect(f.set.changedOnDisk());
+    try f.load();
+    try t.expect(!f.set.changedOnDisk());
+    try f.put("other.md", "---\nname: other\ndescription: x\n---\n");
+    try t.expect(f.set.changedOnDisk());
+    try f.tmp.dir.deleteFile(t.io, "agents/other.md");
+    try t.expect(!f.set.changedOnDisk());
+    try f.tmp.dir.deleteFile(t.io, "agents/researcher.md");
+    try t.expect(f.set.changedOnDisk());
 }
