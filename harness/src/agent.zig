@@ -19,18 +19,53 @@ const masks_mod = @import("masks.zig");
 const who_mod = @import("who.zig");
 const Io = std.Io;
 
-/// `unsent`: the question did not get to the owner (a part or its buttons
-/// could not be sent), so nobody could answer it.
-pub const Answer = enum { once, day, deny, timeout, unsent };
+/// What came of asking the owner. `once`, `day`, `deny`: an approval's
+/// answer; `answered`: a question's or a draft's (`Reply.key` says which);
+/// `timeout`: no answer in time; `unsent`: the question did not get to the
+/// owner (a part or its buttons could not be sent); `withdrawn`: no one is
+/// left to answer (the run stopped, the terminal was left); `full`: no
+/// place in the inbox before the turn's end.
+pub const Answer = enum { once, day, deny, answered, timeout, unsent, withdrawn, full };
 
-/// One question for the owner: may this call run?
+/// One question for the owner: may this call run (`approval`), the agent's
+/// question (`question`), or a draft to review (`draft`). It becomes an
+/// inbox item.
 pub const Question = struct {
+    kind: Kind = .approval,
+    /// The call as the owner sees it, or the agent's question.
     text: []const u8,
     /// Whether "Allow 24 h" may be offered (never for money).
-    allow_day: bool,
+    allow_day: bool = true,
     /// When the run that asks must end (seconds): an answer after that is
     /// of no use, so it is not waited for. 0: no end.
     deadline_s: i64 = 0,
+    /// A question's choices (up to 4); none: it is answered in words.
+    choices: []const []const u8 = &.{},
+    /// The owner may answer in words.
+    takes_text: bool = false,
+    /// A draft to use, drop or replace with the owner's own version.
+    draft: ?[]const u8 = null,
+    /// The run that asks: who started it and its definition, its id and
+    /// label, and whether it is private.
+    who: who_mod.Who = .{},
+    rid: u64 = 0,
+    label: []const u8 = "",
+    private: bool = false,
+
+    pub const Kind = enum { approval, question, draft };
+};
+
+/// The owner's answer to a `Question`.
+pub const Reply = struct {
+    answer: Answer,
+    /// The choice's key: `once`, `day`, `deny`, `1`…`4`, `text`, `use`, `drop`.
+    key: []const u8 = "",
+    /// The owner's words (a reason that denies an approval, a written
+    /// answer, their own version of a draft), or the chosen choice's label;
+    /// for `full`, why there was no place.
+    text: []const u8 = "",
+    /// The inbox item it was asked in; 0: none was made.
+    item: u64 = 0,
 };
 
 /// Tells the owner something beside the answer, at once.
@@ -99,11 +134,12 @@ pub const Outbox = struct {
     post: *const fn (ctx: *anyopaque, a: std.mem.Allocator, p: *const Post) Delivery,
 };
 
-/// Asks the owner whether a call may run; blocks until they answer, the
-/// approval time runs out or the question's deadline passes.
+/// Asks the owner (an inbox item); blocks until they answer, the approval
+/// time runs out or the question's deadline passes. What the reply holds
+/// is in `a`.
 pub const Asker = struct {
     ctx: *anyopaque,
-    ask: *const fn (ctx: *anyopaque, q: Question) Answer,
+    ask: *const fn (ctx: *anyopaque, a: std.mem.Allocator, q: Question) Reply,
 };
 
 /// The owner's switches, shared by all runs and read when used, so that
@@ -279,8 +315,6 @@ pub const Run = struct {
     agents: config.Config.Agents = .{},
     /// Shared by all runs: how many helpers run at once.
     pool: ?*Pool = null,
-    /// Shared by all runs: the owner is asked one question at a time.
-    ask_lock: ?*Io.Mutex = null,
     /// Pages fetched in this run's helpers, shared between them.
     cache: ?*PageCache = null,
     /// A helper: a short task, a subset of tools, no memory writes.
@@ -1475,30 +1509,33 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             why = try std.fmt.allocPrint(a, "too long to ask the owner ({d} bytes; a question is at most {d}): make the call smaller", .{ what.len, max_question });
             break :ask;
         }
-        // helpers working at once still ask one question at a time; one
-        // that could only be answered after the turn's end is not asked
-        if (r.ask_lock) |l| if (!lockUntil(l, r.io, r.deadline_s, r.env.stop)) {
-            why = if (r.env.stop.load(.acquire)) "stopped by the owner" else "no time left in the turn to ask the owner";
-            break :ask;
-        };
+        // each question waits on its own item; one that could only be
+        // answered after the turn's end is not asked
         if (r.deadline_s > 0 and r.deadline_s * 1000 - util.nowMs(r.io) < 100) {
-            if (r.ask_lock) |l| l.unlock(r.io);
             why = "no time left in the turn to ask the owner";
             break :ask;
         }
-        var ans = if (r.env.stop.load(.acquire)) Answer.deny else asker.ask(asker.ctx, .{ .text = what, .allow_day = d.allow_day, .deadline_s = r.deadline_s });
+        const got: Reply = if (r.env.stop.load(.acquire)) .{ .answer = .withdrawn } else asker.ask(asker.ctx, a, .{
+            .text = what,
+            .allow_day = d.allow_day,
+            .deadline_s = r.deadline_s,
+            .who = r.who,
+            .rid = r.rid,
+            .label = r.label,
+            .private = r.isPrivate(),
+        });
+        var ans = got.answer;
         // money, setup calls and posts others read are never granted for a
         // day, whatever came back
         if (!d.allow_day and ans == .day) ans = .once;
-        if (r.ask_lock) |l| l.unlock(r.io);
         switch (ans) {
             .once => {
                 action = .allow;
-                why = "allowed once by the owner";
+                why = try named(a, "allowed once by the owner", "", got.item);
             },
             .day => {
                 action = .allow;
-                why = "allowed for 24 hours by the owner";
+                why = try named(a, "allowed for 24 hours by the owner", "", got.item);
                 r.lock.lockUncancelable(r.io);
                 defer r.lock.unlock(r.io);
                 // the form the gate matches (for files, the path inside the
@@ -1507,9 +1544,12 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
                 try r.gate.grants.addFor(tool, ctx.env, gate.grantKey(tool, d.subject), definition, now_s + 86400);
                 if (r.grants_path) |p| r.gate.grants.save(r.io, p, now_s) catch {};
             },
-            .deny => why = "denied by the owner",
-            .timeout => why = "no answer from the owner in time",
-            .unsent => why = "the question could not be sent to the owner",
+            .deny => why = try named(a, "denied by the owner", got.text, got.item),
+            .timeout => why = try named(a, "no answer from the owner in time", "", got.item),
+            .unsent => why = try named(a, "the question could not be sent to the owner", "", got.item),
+            .withdrawn => why = try named(a, if (r.env.stop.load(.acquire)) "stopped by the owner" else "withdrawn: no one is left to answer", "", got.item),
+            .full => why = if (got.text.len > 0) got.text else "no place in the inbox until the turn's end",
+            .answered => why = try named(a, "not an answer to this question", "", got.item),
         }
         // the owner saw those files and allowed a command all the same
         if (action == .allow) if (wrote) |wr| r.written.?.clear(wr.upto);
@@ -1518,15 +1558,12 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
     return if (action == .allow) null else why;
 }
 
-/// Takes `l`, waiting no later than `deadline_s` (0: no limit) and not
-/// past a stop; false if it was not taken.
-fn lockUntil(l: *Io.Mutex, io: Io, deadline_s: i64, stop: *std.atomic.Value(bool)) bool {
-    while (!l.tryLock()) {
-        if (stop.load(.acquire)) return false;
-        if (deadline_s > 0 and util.nowSeconds(io) >= deadline_s) return false;
-        io.sleep(.fromMilliseconds(20), .awake) catch {};
-    }
-    return true;
+/// What the owner did, their words and the item, as the gate's line and
+/// the agent say it: "denied by the owner: use staging (item 41)".
+fn named(a: std.mem.Allocator, what: []const u8, words: []const u8, item: u64) ![]const u8 {
+    const said = if (words.len > 0) try std.fmt.allocPrint(a, "{s}: {s}", .{ what, words }) else what;
+    if (item == 0) return said;
+    return std.fmt.allocPrint(a, "{s} (item {d})", .{ said, item });
 }
 
 /// What a run left out because nobody could approve it; shared by the
@@ -2097,7 +2134,6 @@ const Fix = struct {
     asked: u32 = 0,
     answer: Answer = .once,
     pool: Pool = .{},
-    ask_lock: Io.Mutex = .init,
     ask_ms: u32 = 0,
     last_allow_day: bool = false,
     /// The last question asked (in the arena), and its deadline.
@@ -2126,7 +2162,6 @@ const Fix = struct {
         f.asked = 0;
         f.answer = .once;
         f.pool = .{};
-        f.ask_lock = .init;
         f.ask_ms = 0;
         f.last_allow_day = false;
         f.last_what = "";
@@ -2152,7 +2187,8 @@ const Fix = struct {
         };
     }
 
-    fn askFn(ctx: *anyopaque, q: Question) Answer {
+    fn askFn(ctx: *anyopaque, a: std.mem.Allocator, q: Question) Reply {
+        _ = a;
         const f: *Fix = @ptrCast(@alignCast(ctx));
         f.last_what = f.e.arena.allocator().dupe(u8, q.text) catch "";
         f.last_deadline = q.deadline_s;
@@ -2164,7 +2200,7 @@ const Fix = struct {
         if (f.ask_ms > 0) t.io.sleep(.fromMilliseconds(f.ask_ms), .awake) catch {};
         f.asked += 1;
         _ = f.in_flight.fetchSub(1, .acq_rel);
-        return f.answer;
+        return .{ .answer = f.answer };
     }
 
     fn deinit(f: *Fix) void {
@@ -2621,7 +2657,6 @@ test "empty_answer_is_not_kept" {
 fn withHelpers(f: *Fix) !void {
     f.run.model_cfg = .{ .url = try f.e.url(), .key = "og-test-key", .main = "claude-test", .worker = "claude-worker", .memory = "claude-mem", .max_tokens = 100 };
     f.run.pool = &f.pool;
-    f.run.ask_lock = &f.ask_lock;
 }
 
 test "delegate_runs_helpers_in_parallel_and_returns_their_answers" {
@@ -2675,12 +2710,13 @@ test "helper_stops_at_its_token_limit" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(4), "Token limit") != null);
 }
 
-test "helpers_ask_the_owner_one_at_a_time" {
+test "helpers_ask_the_owner_at_once" {
     var f: Fix = undefined;
     try f.init("");
     defer f.deinit();
     try withHelpers(&f);
-    f.ask_ms = 150;
+    // each question waits on its own: neither waits for the other
+    f.ask_ms = 600;
     try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"one\",\"tools\":[\"shell\"]},{\"task\":\"two\",\"tools\":[\"shell\"]}]}"));
     try f.e.script(2, model.toolReply("w1", "shell", "{\"command\":\"echo one\"}"));
     try f.e.script(3, model.toolReply("w2", "shell", "{\"command\":\"echo two\"}"));
@@ -2691,23 +2727,20 @@ test "helpers_ask_the_owner_one_at_a_time" {
     defer freeResult(&f.run, r);
     try t.expectEqualStrings("Both done.", r.text);
     try t.expectEqual(2, f.asked);
-    try t.expectEqual(1, f.max_in_flight.load(.acquire));
+    try t.expectEqual(2, f.max_in_flight.load(.acquire));
 }
 
-test "a_helpers_question_after_the_deadline_is_not_asked" {
+test "a_question_after_the_deadline_is_not_asked" {
     var f: Fix = undefined;
     try f.init("");
     defer f.deinit();
-    try withHelpers(&f);
     f.run.limits.turn_seconds = 2;
     // the first question is answered after the turn's end (a 2 s turn ends
-    // 2 to 3 s after it began: its end is a whole second); the second
-    // helper's question waits behind it and can't be answered in time
+    // 2 to 3 s after it began: its end is a whole second); the second call
+    // of the same reply comes after it and can't be answered in time
     f.ask_ms = 3500;
-    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"one\",\"tools\":[\"shell\"]},{\"task\":\"two\",\"tools\":[\"shell\"]}]}"));
-    try f.e.script(2, model.toolReply("w1", "shell", "{\"command\":\"echo one\"}"));
-    try f.e.script(3, model.toolReply("w2", "shell", "{\"command\":\"echo two\"}"));
-    for (4..8) |n| try f.e.script(@intCast(n), model.textReply("done"));
+    try f.e.script(1, "{\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"shell\",\"input\":{\"command\":\"echo one\"}},{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"shell\",\"input\":{\"command\":\"echo two\"}}],\"stop_reason\":\"tool_use\"}");
+    try f.e.script(2, model.textReply("done"));
     const r = try f.say("run two");
     freeResult(&f.run, r);
     try t.expectEqual(1, f.asked);

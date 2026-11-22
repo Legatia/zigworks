@@ -171,8 +171,8 @@ check "a stranger is dropped and logged" 'grep -qF "\"from\":7" "$HARNESS_HOME/l
 reply "$(tool_reply tu_1 'echo smoke-ran')"
 reply "$(text_reply 'done: smoke-ran')"
 say "run the echo"
-# the buttons carry the question's number and this start's nonce
-check "the shell call asks for approval" 'wait_for "$OUT" "\"inline_keyboard\":[[" && button day | grep -qE "^[0-9]+ a[0-9]+-[0-9a-f]{16}:day$"'
+# the buttons carry the item's number and its own token
+check "the shell call asks for approval" 'wait_for "$OUT" "\"inline_keyboard\":[[" && button day | grep -qE "^[0-9]+ i[0-9]+-[0-9a-f]{16}:day$"'
 b=$(button day)
 press day $((${b%% *} + 1))
 check "a press in another message answers nothing" 'wait_for "$OUT" "That button is out of date" && [ ! -f "$(req)" ]'

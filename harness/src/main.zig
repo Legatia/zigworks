@@ -907,10 +907,10 @@ fn chatCmd(app: *App) !Exit {
     while (!ended) {
         const line = try readLineEof(app, stdin, &ended);
         if (line.len == 0) continue;
-        if (c.approvalWaiting()) {
-            const ans: ?agent.Answer = if (eql(line, "o")) .once else if (eql(line, "d")) .day else if (eql(line, "n")) .deny else null;
-            if (ans) |x| {
-                if (!c.answerPending(x) and c.approvalWaiting()) try errAll(app.io, "That answer is not offered for this question.\n");
+        if (c.itemsWaiting() > 0) {
+            const key: ?[]const u8 = if (eql(line, "o")) "once" else if (eql(line, "d")) "day" else if (eql(line, "n")) "deny" else null;
+            if (key) |k| {
+                if (!c.answerWaiting(k) and c.itemsWaiting() > 0) try errAll(app.io, "That answer is not offered for this question.\n");
                 continue;
             }
         }
