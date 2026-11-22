@@ -1546,14 +1546,15 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
         if (r.scheduled or r.asker == null) {
             action = .deny;
             why = "the agent wrote files in the workspace since the owner last allowed a command, and no one can be asked";
-            if (r.skipped) |s| s.add(r.io, name, arg);
+            // a grant can't lift that check
+            skip(r, a, tool, name, arg, d.subject, ctx.env, false);
         } else action = .ask;
     }
     if (extra.ask_why) |w| if (action == .allow) {
         if (r.scheduled or r.asker == null) {
             action = .deny;
             why = try std.fmt.allocPrint(a, "{s}, and no one can be asked", .{w});
-            if (r.skipped) |s| s.add(r.io, name, arg);
+            skip(r, a, tool, name, arg, d.subject, ctx.env, false);
         } else {
             action = .ask;
             why = w;
@@ -1634,6 +1635,33 @@ fn named(a: std.mem.Allocator, what: []const u8, words: []const u8, item: u64) !
     return std.fmt.allocPrint(a, "{s} (item {d})", .{ said, item });
 }
 
+/// A call an unattended run skipped for want of approval, as a `Keeper`
+/// gets it.
+pub const Skip = struct {
+    tool: gate.Tool,
+    /// Where a shell command would have run (`host`).
+    env: []const u8,
+    /// The tool's name and argument, as the run's post lists them.
+    name: []const u8,
+    arg: []const u8,
+    /// What a grant for it holds as its key (`gate.grantKey`).
+    key: []const u8,
+    /// A grant for the run's task could let it run: not money, a post
+    /// others read, files the agent wrote or a dot file a post carries.
+    grantable: bool,
+    who: who_mod.Who,
+    rid: u64,
+    label: []const u8,
+    conversation: []const u8,
+    private: bool,
+};
+
+/// Keeps a skipped call as an inbox item; returns its id (0: none).
+pub const Keeper = struct {
+    ctx: *anyopaque,
+    keep: *const fn (ctx: *anyopaque, a: std.mem.Allocator, s: Skip) u64,
+};
+
 /// What a run left out because nobody could approve it; shared by the
 /// run and its helpers.
 pub const Skipped = struct {
@@ -1642,6 +1670,9 @@ pub const Skipped = struct {
     items: std.ArrayList([]u8) = .empty,
     /// Calls past the first `max`, only counted.
     more: usize = 0,
+    /// Each skipped call becomes an inbox item (a task's run); null: only
+    /// listed.
+    keeper: ?Keeper = null,
     const max = 8;
 
     pub fn init(gpa: std.mem.Allocator) Skipped {
@@ -1653,11 +1684,14 @@ pub const Skipped = struct {
         s.items.deinit(s.gpa);
     }
 
-    fn add(s: *Skipped, io: Io, name: []const u8, arg: []const u8) void {
+    /// Lists a call (once), with the item it is kept as.
+    fn add(s: *Skipped, io: Io, name: []const u8, arg: []const u8, item: u64) void {
         s.mutex.lockUncancelable(io);
         defer s.mutex.unlock(io);
         const short = util.cut(arg, 100);
-        const line = std.fmt.allocPrint(s.gpa, "{s}: {s}{s}", .{ name, short, if (short.len < arg.len) "…" else "" }) catch return;
+        var ib: [32]u8 = undefined;
+        const kept = if (item == 0) "" else std.fmt.bufPrint(&ib, " (item {d})", .{item}) catch "";
+        const line = std.fmt.allocPrint(s.gpa, "{s}: {s}{s}{s}", .{ name, short, if (short.len < arg.len) "…" else "", kept }) catch return;
         for (s.items.items) |x| if (std.mem.eql(u8, x, line)) {
             s.gpa.free(line);
             return;
@@ -1828,7 +1862,7 @@ pub const Written = struct {
 /// Notes a call refused only because nobody could approve it: the gate
 /// said ask with no one to ask, or turned ask into deny in a scheduled run.
 fn noteSkipped(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, now_s: i64, d: gate.Decision, ctx: gate.Ctx) void {
-    const s = r.skipped orelse return;
+    if (r.skipped == null) return;
     const unattended = switch (d.action) {
         .ask => r.asker == null,
         .deny => r.scheduled and blk: {
@@ -1842,7 +1876,28 @@ fn noteSkipped(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8,
         },
         .allow => false,
     };
-    if (unattended) s.add(r.io, name, arg);
+    // money and posts others read stay asked every time: no grant lifts them
+    if (unattended) skip(r, a, tool, name, arg, d.subject, ctx.env, tool != .money and !(tool == .send and ctx.shared) and !tool.setup(arg));
+}
+
+/// A call the run skipped: listed in its post, and kept as an inbox item
+/// when the run has a keeper (a task's).
+fn skip(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, subject: []const u8, env: []const u8, grantable: bool) void {
+    const s = r.skipped orelse return;
+    const item = if (s.keeper) |k| k.keep(k.ctx, a, .{
+        .tool = tool,
+        .env = env,
+        .name = name,
+        .arg = arg,
+        .key = gate.grantKey(tool, subject),
+        .grantable = grantable,
+        .who = r.who,
+        .rid = r.rid,
+        .label = r.label,
+        .conversation = r.conversation,
+        .private = r.isPrivate(),
+    }) else 0;
+    s.add(r.io, name, arg, item);
 }
 
 fn webAllow(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) ?[]const u8 {

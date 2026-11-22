@@ -1708,6 +1708,8 @@ pub const Core = struct {
         const a = arena.allocator();
         const words: ?[]const u8 = if (text) |x| (if (std.mem.trim(u8, x, " \t\r\n").len > 0) x else null) else null;
         var key = key_in;
+        // what harness does for the answer before the item closes
+        var grant: ?inbox_mod.Grant = null;
         {
             c.inbox.mutex.lockUncancelable(c.io);
             defer c.inbox.mutex.unlock(c.io);
@@ -1718,12 +1720,169 @@ pub const Core = struct {
                 if (key.len > 0 and !std.mem.eql(u8, key, tk)) return .not_offered;
                 key = tk;
             } else if (!it.offers(key)) return .not_offered;
+            if (std.mem.eql(u8, it.kind, "skipped") and std.mem.eql(u8, key, "allow")) if (it.grant) |g| {
+                grant = .{ .tool = a.dupe(u8, g.tool) catch return .not_offered, .key = a.dupe(u8, g.key) catch return .not_offered, .who = a.dupe(u8, g.who) catch return .not_offered };
+                it.settling = true;
+            };
         }
+        if (grant) |g| c.writeTaskGrant(g, id) catch |e| {
+            c.unsettle(id);
+            c.say(std.fmt.allocPrint(a, "Item {d}: the grant could not be written ({s}); nothing changed.", .{ id, @errorName(e) }) catch "The grant could not be written; nothing changed.");
+            return .not_offered;
+        };
         // the owner's words hold no stored secret either
         const said: ?[]const u8 = if (words) |w| c.masks.scrubAlloc(a, w) catch return .not_offered else null;
+        c.unsettle(id);
         if (!c.settle(id, .answered, .{ .key = key, .text = said, .at = c.now(), .via = via })) return .closed;
         return .taken;
     }
+
+    /// Lets item `id` be answered again (its action is done or failed).
+    fn unsettle(c: *Core, id: u64) void {
+        c.inbox.mutex.lockUncancelable(c.io);
+        defer c.inbox.mutex.unlock(c.io);
+        if (c.inbox.find(id)) |it| it.settling = false;
+    }
+
+    /// "Allow for this task": the grant a skipped item holds, for its task,
+    /// trigger or workflow, for 30 days; written before the item closes.
+    fn writeTaskGrant(c: *Core, g: inbox_mod.Grant, item: u64) !void {
+        const at = std.mem.indexOfScalar(u8, g.tool, '@');
+        const tool = gate.Tool.fromName(g.tool[0 .. at orelse g.tool.len]) orelse return error.BadGrant;
+        const env = if (at) |i| g.tool[i + 1 ..] else "";
+        const until = c.now() + 30 * 86400;
+        {
+            c.lock.lockUncancelable(c.io);
+            defer c.lock.unlock(c.io);
+            try c.grants.addFor(tool, env, g.key, g.who, until);
+            try c.grants.save(c.io, c.paths.grants, util.nowSeconds(c.io));
+        }
+        c.log.write(.config, false, .{ .event = "grant added", .tool = g.tool, .key = g.key, .who = g.who, .until = until, .item = item }) catch {};
+    }
+
+    /// An item another part keeps (gap 6's paused trigger, gap 7's step):
+    /// its own kind, choices and waiter (`harness`, or a workflow step's
+    /// label), its texts masked; written, logged, and shown in its
+    /// conversation, quietly when harness waits on it. Returns its id.
+    pub fn addItem(c: *Core, n: inbox_mod.New) !u64 {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var m = n;
+        m.title = try c.masks.scrubAlloc(a, n.title);
+        m.body = try c.masks.scrubAlloc(a, n.body);
+        if (n.draft) |d| m.draft = try c.masks.scrubAlloc(a, d);
+        const id = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = try c.inbox.add(m, c.now(), c.newToken());
+            c.saveInbox();
+            c.logOpen(it);
+            break :blk it.id;
+        };
+        _ = c.showItem(id, null);
+        return id;
+    }
+
+    /// A task's run's `agent.Keeper`: see `keepSkip`.
+    fn keepSkipped(ctx: *anyopaque, a: std.mem.Allocator, s: agent.Skip) u64 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.keepSkip(a, s) catch 0;
+    }
+
+    /// A call a task (trigger, workflow) skipped: one `skipped` item per
+    /// `by` and call, as the gate keys it, posted once, quietly; a repeat
+    /// adds to its count, also while it is kept after a dismiss. "Allow for
+    /// this task" is offered where a grant could let the call run (R11: its
+    /// `by` a who value; and no stored secret in what it would cover).
+    fn keepSkip(c: *Core, a: std.mem.Allocator, s: agent.Skip) !u64 {
+        const tool = if (s.tool == .shell) try std.fmt.allocPrint(a, "shell@{s}", .{if (s.env.len > 0) s.env else "host"}) else @tagName(s.tool);
+        const key = try c.masks.scrubAlloc(a, s.key);
+        const skip = try std.fmt.allocPrint(a, "{s}\t{s}\t{s}", .{ s.who.by, tool, key });
+        const who = grantWho(s.who.by);
+        const offered = s.grantable and who != null and std.mem.eql(u8, key, s.key);
+        var choices: std.ArrayList(inbox_mod.Choice) = .empty;
+        if (offered) try choices.append(a, .{ .key = "allow", .label = try std.fmt.allocPrint(a, "Allow for this {s}", .{ranKind(s.who.by)}) });
+        try choices.append(a, .{ .key = "dismiss", .label = "Dismiss" });
+        const line = try c.masks.scrubAlloc(a, try std.fmt.allocPrint(a, "{s}: {s}", .{ s.name, s.arg }));
+        const id = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            if (c.inbox.findSkip(skip)) |it| {
+                it.count += 1;
+                c.saveInbox();
+                return it.id;
+            }
+            const it = try c.inbox.add(.{
+                .kind = "skipped",
+                .by = s.who.by,
+                .agent = s.who.agent,
+                .rid = if (s.rid != 0) s.rid else null,
+                .run = s.label,
+                .conversation = s.conversation,
+                .waiter = "harness",
+                .title = firstLine(line),
+                .body = line,
+                .choices = choices.items,
+                .expires = c.now() + inbox_mod.keep_s,
+                .grant = if (offered) .{ .tool = tool, .key = key, .who = who.? } else null,
+                .skip = skip,
+                .private = s.private,
+            }, c.now(), c.newToken());
+            c.saveInbox();
+            c.logOpen(it);
+            break :blk it.id;
+        };
+        _ = c.showItem(id, null);
+        return id;
+    }
+
+    /// `/grants`: a line per grant, with who it covers and until when.
+    fn grantsText(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        c.lock.lockUncancelable(c.io);
+        defer c.lock.unlock(c.io);
+        const now_s = util.nowSeconds(c.io);
+        var out: std.ArrayList(u8) = .empty;
+        var n: usize = 0;
+        for (c.grants.items.items) |g| {
+            if (g.expires_s <= now_s) continue;
+            n += 1;
+            var sb: [20]u8 = undefined;
+            try out.print(a, "{d}. {s}{s}{s}  {s}  for {s}  until {s}\n", .{ n, @tagName(g.tool), if (g.tool == .shell) "@" else "", if (g.tool == .shell) g.env else "", try shownKey(a, g.key), if (g.who.len > 0) g.who else "any run", localStamp(&sb, g.expires_s, c.cfg.chat.utc_offset) });
+        }
+        if (n == 0) return "No grants. \"Allow 24 h\" and \"Allow for this task\" make them.";
+        return out.items;
+    }
+
+    /// `/grant rm N`: removes the Nth grant `/grants` lists.
+    fn grantCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        const usage = "Use /grants, or /grant rm N (N as /grants numbers them).";
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        if (!std.mem.eql(u8, words.next() orelse "", "rm")) return usage;
+        const n = std.fmt.parseInt(usize, words.next() orelse return usage, 10) catch return usage;
+        if (words.next() != null) return usage;
+        const said = blk: {
+            c.lock.lockUncancelable(c.io);
+            defer c.lock.unlock(c.io);
+            const now_s = util.nowSeconds(c.io);
+            var k: usize = 0;
+            for (c.grants.items.items, 0..) |g, i| {
+                if (g.expires_s <= now_s) continue;
+                k += 1;
+                if (k != n) continue;
+                const what = try std.fmt.allocPrint(a, "{s}{s}{s} {s} for {s}", .{ @tagName(g.tool), if (g.tool == .shell) "@" else "", if (g.tool == .shell) g.env else "", try shownKey(a, g.key), if (g.who.len > 0) g.who else "any run" });
+                try c.log.write(.config, false, .{ .event = "grant removed", .tool = @tagName(g.tool), .key = g.key, .who = g.who });
+                c.grants.remove(i);
+                c.grants.save(c.io, c.paths.grants, now_s) catch |e| break :blk try std.fmt.allocPrint(a, "Removed grant {d} until harness stops: state/grants could not be written ({s}).", .{ n, @errorName(e) });
+                break :blk try std.fmt.allocPrint(a, "Removed grant {d}: {s}.", .{ n, what });
+            }
+            break :blk try std.fmt.allocPrint(a, "No grant {d}; /grants lists them.", .{n});
+        };
+        return said;
+    }
+
+    /// The terminal's "o", "d" or "n": answers the oldest open run item
+    /// that offers it; false when none does.
 
     /// A reply to one of an item's messages: its text answer (the owner is
     /// told what came of it unless it was taken). False when `reply_to` is
@@ -3070,6 +3229,8 @@ pub const Core = struct {
         run.extra_instructions = try std.fmt.allocPrint(a, "This is the scheduled task \"{s}\". If there is nothing worth telling the owner this time, answer exactly NOTHING.", .{tk.name});
         var skipped: agent.Skipped = .init(c.gpa);
         defer skipped.deinit();
+        // each skipped call an item, its grant offered for this task alone
+        skipped.keeper = .{ .ctx = c, .keep = keepSkipped };
         run.skipped = &skipped;
         var notify: Notify = .{ .core = c, .conv = tk.to };
         run.notice = .{ .ctx = &notify, .say = Notify.say };
@@ -3173,6 +3334,7 @@ pub const Core = struct {
         \\/conversation add NAME: sent in a group, the agent may post there
         \\/session [N]: the steps behind the last answer here (N runs back)
         \\/answer ID TEXT: answer an item in words (or reply to its message)
+        \\/grants: what you allowed for later, /grant rm N
     ;
 
     /// A command sent in `main` (or from the command line).
@@ -3300,6 +3462,8 @@ pub const Core = struct {
         if (eql(u8, cmd, "/conversations")) return c.conversationsText(a);
         if (eql(u8, cmd, "/session")) return c.sessionText(a, conv, rest);
         if (eql(u8, cmd, "/answer")) return c.answerCommand(a, conv, rest);
+        if (eql(u8, cmd, "/grants")) return c.grantsText(a);
+        if (eql(u8, cmd, "/grant")) return c.grantCommand(a, rest);
         if (eql(u8, cmd, "/conversation")) return c.conversationCommand(a, conv, rest);
         if (eql(u8, cmd, "/skills")) {
             const list = try skills.list(a, c.io, c.paths.skills);
@@ -3532,6 +3696,40 @@ pub const Core = struct {
         return "Use /task add, /task rm NAME or /task resume NAME.";
     }
 };
+
+/// Who a task grant covers: the `by` of a task, trigger or workflow run
+/// (a workflow's without its step); null for another kind, or a name that
+/// is no who value (R11).
+fn grantWho(by: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, by, "workflow:")) {
+        const w = by[0 .. std.mem.indexOfScalarPos(u8, by, "workflow:".len, '/') orelse by.len];
+        return if (who_mod.isValue(w)) w else null;
+    }
+    if (std.mem.startsWith(u8, by, "schedule:") or std.mem.startsWith(u8, by, "trigger:")) return if (who_mod.isValue(by)) by else null;
+    return null;
+}
+
+/// What a `by` is to the owner: a task, a trigger or a workflow.
+fn ranKind(by: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, by, "trigger:")) return "trigger";
+    if (std.mem.startsWith(u8, by, "workflow:")) return "workflow";
+    return "task";
+}
+
+/// A grant's key in one line: control bytes as `?`, cut to 120 bytes.
+fn shownKey(a: std.mem.Allocator, key: []const u8) ![]const u8 {
+    const cut = util.cut(key, 120);
+    const out = try a.alloc(u8, cut.len);
+    for (cut, out) |ch, *o| o.* = if (ch < 0x20 or ch == 0x7f) '?' else ch;
+    return if (cut.len < key.len) std.fmt.allocPrint(a, "{s}…", .{out}) else out;
+}
+
+/// "2026-12-22 14:03", the owner's time.
+fn localStamp(buf: *[20]u8, secs: i64, utc_offset: i32) []const u8 {
+    _ = util.isoTime(buf, secs + @as(i64, utc_offset) * 60);
+    buf[10] = ' ';
+    return buf[0..16];
+}
 
 /// A text's first line (an item's title).
 fn firstLine(s: []const u8) []const u8 {
@@ -5411,6 +5609,133 @@ test "ask_owner_is_not_offered_to_helpers_or_unattended_runs" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(6), "\"name\":\"ask_owner\"") == null);
     try t.expect(std.mem.indexOf(u8, try f.e.request(7), "this tool is not available here") != null);
     try t.expectEqual(0, f.rec.count("Question ["));
+}
+
+/// Two calls of the same command in one reply.
+const twice_disk = "{\"content\":[{\"type\":\"tool_use\",\"id\":\"d1\",\"name\":\"shell\",\"input\":{\"command\":\"echo disk-check\"}},{\"type\":\"tool_use\",\"id\":\"d2\",\"name\":\"shell\",\"input\":{\"command\":\"echo disk-check\"}}],\"stop_reason\":\"tool_use\"}";
+
+test "a_call_a_task_skips_is_one_item_however_often" {
+    var f: Fix = undefined;
+    try f.init("", "", "[disk]\nevery = 5m\ndo = Check the disk.\n");
+    defer f.deinit();
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    // the same call twice in one run, and again in the next run
+    try f.e.script(1, twice_disk);
+    try f.e.script(2, model.textReply("NOTHING"));
+    f.core.tick();
+    try f.rec.waitFor("[disk] Skipped (needs approval): shell: echo disk-check (item 1)");
+    waitIdle(f.core);
+    try t.expectEqual(1, f.rec.count("BUTTONS Skipped [1]: task disk could not make this call without you:\nshell: echo disk-check"));
+    // posted once, without a sound
+    try t.expect(f.rec.quietOf("BUTTONS Skipped [1]").?);
+    try f.e.script(3, model.toolReply("d3", "shell", "{\"command\":\"echo disk-check\"}"));
+    try f.e.script(4, model.textReply("NOTHING"));
+    f.core.fixed_now = t0 + 301;
+    f.core.tick();
+    try waitFile(&f.e, "requests/004.json");
+    waitIdle(f.core);
+    try t.expectEqual(1, f.rec.count("BUTTONS Skipped ["));
+    try t.expect(std.mem.indexOf(u8, try inboxFile(&f), "\"count\":3") != null);
+    // dismissed, a repeat is counted and not posted
+    const b = f.rec.buttonsWith("Skipped [1]").?;
+    try t.expect(b.get("allow") != null);
+    f.core.handleCallback(42, b.msg, b.get("dismiss").?);
+    try f.rec.waitFor("\nDismissed, ");
+    try f.e.script(5, model.toolReply("d4", "shell", "{\"command\":\"echo disk-check\"}"));
+    try f.e.script(6, model.textReply("NOTHING"));
+    f.core.fixed_now = t0 + 602;
+    f.core.tick();
+    try waitFile(&f.e, "requests/006.json");
+    waitIdle(f.core);
+    try t.expectEqual(1, f.rec.count("BUTTONS Skipped ["));
+    const text = try inboxFile(&f);
+    try t.expect(std.mem.indexOf(u8, text, "\"count\":4") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"key\":\"dismiss\"") != null);
+}
+
+test "allowing_it_lets_that_task_alone_make_the_call_for_30_days" {
+    var f: Fix = undefined;
+    try f.init("", "", "[disk]\nevery = 5m\ndo = Check the disk.\n[other]\nevery = 5m\ndo = Check it too.\n");
+    defer f.deinit();
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    // disk skips the call (one background slot: other waits its turn)
+    try f.e.script(1, model.toolReply("d1", "shell", "{\"command\":\"echo disk-check\"}"));
+    try f.e.script(2, model.textReply("NOTHING"));
+    f.core.tick();
+    try f.rec.waitFor("BUTTONS Skipped [1]: task disk could not make this call without you:");
+    waitIdle(f.core);
+    const b = f.rec.buttonsWith("Skipped [1]").?;
+    f.core.handleCallback(42, b.msg, b.get("allow").?);
+    try f.rec.waitFor("\nAllowed for this task for 30 days, ");
+    const grants = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.grants, f.e.arena.allocator(), .unlimited);
+    const line = try std.fmt.allocPrint(f.e.arena.allocator(), "shell@host\t{d}\techo disk-check\tschedule:disk\n", .{t0 + 30 * 86400});
+    if (std.mem.indexOf(u8, grants, line) == null) std.debug.print("{s}\n", .{grants});
+    try t.expect(std.mem.indexOf(u8, grants, line) != null);
+    // another task still can't make it: its own item
+    try f.e.script(3, model.toolReply("o1", "shell", "{\"command\":\"echo disk-check\"}"));
+    try f.e.script(4, model.textReply("NOTHING"));
+    f.core.tick();
+    try f.rec.waitFor("BUTTONS Skipped [2]: task other could not make this call without you:");
+    waitIdle(f.core);
+    // disk's next run makes the call
+    try f.e.script(5, model.toolReply("d2", "shell", "{\"command\":\"echo disk-check\"}"));
+    try f.e.script(6, model.textReply("NOTHING"));
+    f.core.fixed_now = t0 + 301;
+    f.core.tick();
+    try waitFile(&f.e, "requests/006.json");
+    waitIdle(f.core);
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "\"run\":\"task disk\",\"agent\":\"main\",\"tool\":\"shell\",\"decision\":\"allow\",\"why\":\"a grant covers it (/grants)\"") != null);
+    try t.expectEqual(1, std.mem.count(u8, lt, "\"tool\":\"shell\",\"arg\":\"echo disk-check\",\"is_error\":false"));
+    // the chat is unchanged: asked
+    try f.e.script(7, model.toolReply("c1", "shell", "{\"command\":\"echo disk-check\"}"));
+    try f.e.script(8, model.textReply("not run"));
+    try f.core.startWorker();
+    try f.core.handleText("check the disk");
+    try f.rec.waitFor("BUTTONS Allow this? [3]\nshell: echo disk-check");
+    try f.press("deny");
+    try f.rec.waitFor("not run");
+    // listed, and removable
+    try f.core.handleText("/grants");
+    try f.rec.waitFor("1. shell@host  echo disk-check  for schedule:disk  until ");
+    try f.core.handleText("/grant rm 1");
+    try f.rec.waitFor("Removed grant 1: shell@host echo disk-check for schedule:disk.");
+    try f.core.handleText("/grants");
+    try f.rec.waitFor("No grants.");
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"grant removed\"") != null);
+}
+
+test "money_shared_send_and_written_file_skips_offer_no_grant" {
+    var f: Fix = undefined;
+    try f.init("", "", "[mix]\nevery = 5m\ndo = Do the three things.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\nmoney = echo\namount = amount\n", .{fake}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try addGroup(&f, "family", -1001234567890);
+    try f.e.script(1, model.toolReply("m1", "fake__echo", "{\"text\":\"buy\",\"amount\":5}"));
+    try f.e.script(2, model.toolReply("s1", "send", "{\"to\":\"family\",\"text\":\"Dinner at 7.\"}"));
+    try f.e.script(3, model.toolReply("w1", "write_file", "{\"path\":\"run.sh\",\"content\":\"echo hi\"}"));
+    try f.e.script(4, model.toolReply("x1", "shell", "{\"command\":\"echo after-a-write\"}"));
+    try f.e.script(5, model.textReply("NOTHING"));
+    f.core.tick();
+    try waitFile(&f.e, "requests/005.json");
+    waitIdle(f.core);
+    // three items, none offers to allow the call for the task
+    for ([_][]const u8{ "\nfake__echo: fake/echo", "\nsend: family", "\nshell: echo after-a-write" }) |needle| {
+        const b = f.rec.buttonsWith(needle) orelse {
+            std.debug.print("no item for {s}\n", .{needle});
+            return error.TestUnexpectedResult;
+        };
+        try t.expect(b.get("allow") == null);
+        try t.expect(b.get("dismiss") != null);
+    }
+    try t.expectEqual(3, f.rec.count("BUTTONS Skipped ["));
+    try t.expect(std.mem.indexOf(u8, try inboxFile(&f), "\"key\":\"allow\"") == null);
 }
 
 /// Waits until `needle` was said `n` times.

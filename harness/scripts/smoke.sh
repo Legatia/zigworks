@@ -277,12 +277,12 @@ check "a secret the owner types is masked in the log" 'wait_for "$OUT" "noted, n
 
 # a task added from the chat runs at the scheduler's next tick; nobody can
 # answer there, so its shell call is refused, and it says so though its
-# answer is NOTHING
+# answer is NOTHING; the call is kept as an item, posted without a sound
 reply "$(tool_reply tu_t1 'df -h')"
 reply "$(text_reply 'NOTHING')"
 before=$(asked)
 say "/task add disk | every 5m | Check the disk."
-check "a scheduled run skips what needs asking and says so, even answering NOTHING" 'wait_for "$OUT" "[disk] Skipped (needs approval): shell: df -h" 30 && result $mn tu_t1 "refused by the gate: no one to ask in a scheduled run" && [ "$(asked)" = "$before" ] && ! grep -qF "[disk] NOTHING" "$OUT"'
+check "a scheduled run skips what needs asking and says so, even answering NOTHING" 'wait_for "$OUT" "[disk] Skipped (needs approval): shell: df -h (item " 30 && result $mn tu_t1 "refused by the gate: no one to ask in a scheduled run" && [ "$(asked)" = $((before + 1)) ] && last_question | grep -qF "could not make this call without you:" && last_question | grep -qF "\"disable_notification\":true" && ! grep -qF "[disk] NOTHING" "$OUT"'
 
 # a topic of the owner's chat with the bot is a conversation of its own
 reply "$(call_reply tu_h1 recall '{"query":"flats"}')"
