@@ -267,12 +267,9 @@ pub const Box = struct {
             try render(&out, b.gpa, it, true);
             try out.append(b.gpa, '\n');
         }
-        var tmp_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-        const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{b.path});
+        // whole or not at all, even while another program holds it open
+        try util.writeReplace(b.io, b.path, out.items);
         const cwd = Io.Dir.cwd();
-        try cwd.writeFile(b.io, .{ .sub_path = tmp, .data = out.items, .flags = .{ .permissions = util.private_file } });
-        errdefer cwd.deleteFile(b.io, tmp) catch {};
-        try cwd.rename(tmp, cwd, b.path, b.io);
         if (b.retire.len > 0) {
             cwd.deleteFile(b.io, b.retire) catch {};
             b.retire = "";

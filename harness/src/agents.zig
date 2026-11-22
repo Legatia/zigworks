@@ -674,11 +674,8 @@ pub const Set = struct {
             defer s.gpa.free(old);
             try s.keepVersion(name, old);
         } else |e| if (e != error.FileNotFound) return e;
-        var tbuf: [Io.Dir.max_path_bytes]u8 = undefined;
-        const tmp = try std.fmt.bufPrint(&tbuf, "{s}.tmp", .{path});
-        try cwd.writeFile(s.io, .{ .sub_path = tmp, .data = text, .flags = .{ .permissions = util.private_file } });
-        errdefer cwd.deleteFile(s.io, tmp) catch {};
-        try cwd.rename(tmp, cwd, path, s.io);
+        // whole or not at all, even with it open in an editor
+        try util.writeReplace(s.io, path, text);
         const old = blk: {
             s.mutex.lockUncancelable(s.io);
             defer s.mutex.unlock(s.io);
