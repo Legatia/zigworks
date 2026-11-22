@@ -741,11 +741,14 @@ pub const Session = struct {
                 s.timeout_ms = 1000;
                 const asked = if (s.callIn(arena_state.allocator(), "Browser.close", "{}", null)) |_| true else |_| false;
                 s.timeout_ms = saved;
-                // a moment to write its cookies to the profile; the pipe
-                // closes when it has ended
+                // a moment to write its cookies to the profile: the pipe
+                // closes when it has ended, but on Windows before its other
+                // processes have, among them the one that writes cookies
+                // (killed then, the last ones set are lost)
                 if (asked) {
                     const until = deadline(s.io, 3000);
                     while (!s.inbox.closed.load(.acquire) and Io.Clock.awake.now(s.io).nanoseconds < until) s.io.sleep(.fromMilliseconds(20), .awake) catch {};
+                    if (is_windows and s.inbox.closed.load(.acquire)) _ = s.job.waitEmpty(s.io, 5000, s.stop);
                 }
             }
             s.closed = true;
@@ -759,6 +762,10 @@ pub const Session = struct {
                 // its helpers too, should one have outlived the first kill
                 s.signalGroup();
                 _ = s.child.wait(s.io) catch {};
+                // gone, not only told to go (Windows ends a job's processes
+                // after the call returns): one still ending keeps the
+                // profile's files open
+                if (is_windows) _ = s.job.waitEmpty(s.io, 2000, null);
             }
             s.reaped.store(true, .release);
             if (s.to_chrome) |f| f.close(s.io);

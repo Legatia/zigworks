@@ -72,13 +72,27 @@ pub const Job = struct {
         j.handle = null;
     }
 
-    /// How many processes are in the job now; null without a job. (Tests.)
+    /// How many processes are in the job now; null without a job.
     pub fn active(j: *const Job) ?u32 {
         if (!is_windows) return null;
         const h = j.handle orelse return null;
         var info: win.BasicAccounting = .{};
         if (!win.QueryInformationJobObject(h, win.JobObjectBasicAccountingInformation, &info, @sizeOf(win.BasicAccounting), null).toBool()) return null;
         return info.active_processes;
+    }
+
+    /// Waits up to `ms` for every process in the job to have ended, unless
+    /// `stop` is set first; true once none is left (at once without a job).
+    /// Looks every 20 ms.
+    pub fn waitEmpty(j: *const Job, io: Io, ms: u32, stop: ?*const std.atomic.Value(bool)) bool {
+        const until = Io.Clock.awake.now(io).nanoseconds + @as(i96, ms) * std.time.ns_per_ms;
+        while (true) {
+            const left = j.active() orelse return true;
+            if (left == 0) return true;
+            if (stop) |x| if (x.load(.acquire)) return false;
+            if (Io.Clock.awake.now(io).nanoseconds >= until) return false;
+            io.sleep(.fromMilliseconds(20), .awake) catch return false;
+        }
     }
 };
 
@@ -228,6 +242,34 @@ test "a_job_ends_what_its_child_started_and_its_own_end_ends_it_too" {
     tries = 0;
     while ((job.active() orelse 0) > 0 and tries < 100) : (tries += 1) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
     try t.expectEqual(@as(?u32, 0), job.active());
+}
+
+test "waitEmpty_waits_for_every_process_of_the_job_to_end_by_itself" {
+    if (!is_windows) return error.SkipZigTest;
+    var job = Job.create();
+    defer job.close();
+    // cmd ends after about a second, the ping it started after about two
+    var child = try std.process.spawn(t.io, .{
+        .argv = &.{ "cmd.exe", "/c", "start /b ping -n 3 127.0.0.1 >nul & ping -n 2 127.0.0.1 >nul" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .start_suspended = true,
+        .create_no_window = true,
+    });
+    job.adopt(&child);
+    var stop: std.atomic.Value(bool) = .init(false);
+    try t.expect(!job.waitEmpty(t.io, 300, &stop));
+    try t.expect((job.active() orelse 0) > 0);
+    // a stop ends the wait at once
+    stop.store(true, .release);
+    const before = Io.Clock.awake.now(t.io).nanoseconds;
+    try t.expect(!job.waitEmpty(t.io, 10_000, &stop));
+    try t.expect(Io.Clock.awake.now(t.io).nanoseconds - before < 500 * std.time.ns_per_ms);
+    stop.store(false, .release);
+    try t.expect(job.waitEmpty(t.io, 10_000, &stop));
+    try t.expectEqual(@as(?u32, 0), job.active());
+    _ = try child.wait(t.io);
 }
 
 test "waitReadable_sees_bytes_the_end_of_a_pipe_and_being_told_to_stop" {

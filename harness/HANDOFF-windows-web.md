@@ -22,6 +22,13 @@
 - **Tests.** All the web, cdp and agent browser tests run on Windows and
   pass; the cdp one checks that the job is empty after `close`. The
   stand-in-browser tests (shell scripts) still skip there.
+- **Cookies at `close`.** On Windows the pipe closes before Chrome's other
+  processes have ended (4 to 11 were still running then), among them the
+  network one, which writes the cookies. Killing the job at that moment
+  lost the last ones set: the two cookie tests failed on GitHub's runner,
+  and here every time under load. `close` now gives the job up to 5 s more
+  to empty by itself (0.1 to 0.5 s when idle), then kills what is left and
+  waits for it to be gone. Linux passed the same load test without this.
 - **Passkeys.** See the audit handoff, section 6: a long record goes into
   parts in the Credential Manager.
 - By hand: harness chat, the model opens a page with `web`, the title and
