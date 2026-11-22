@@ -62,8 +62,13 @@ script that opens and closes one); the model was harness-fake.
   symlink tests still skip. A fetch of a page that never answers is cut by
   `/stop` (stopped by the owner) and by the turn's end (`turn_seconds = 6`:
   "not finished: the turn's time is up").
-- **Still skipping on Windows:** the core.zig tests listed at the end
-  (they use `/bin/sh`); their behaviour was checked by hand above.
+- **The core.zig tests listed at the end now run on Windows too**, with
+  cmd versions of their commands (ping for sleep, `cmd /c "cd >&2 & exit
+  1"`, batch files for the slow servers, a caret for the masked value).
+  Still skipping there: main.zig's
+  `sigterm_is_caught_and_noted_not_the_end_of_the_process` (section 4 was
+  checked by hand), the stand-in-browser tests (shell scripts) and the
+  two symlink tests.
 
 ## 1. I27: what a command starts must end with it (job objects)
 

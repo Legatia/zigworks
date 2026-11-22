@@ -3051,14 +3051,35 @@ test "closing_the_terminal_denies_the_question_and_any_after_it" {
     try t.expectEqual(2, std.mem.count(u8, try f.e.request(3), "denied by the owner"));
 }
 
+/// A command that waits 30 s, and the rule that allows it (cmd's ping on
+/// Windows, which has no sleep).
+const long_command = if (builtin.os.tag == .windows) "ping -n 31 127.0.0.1" else "sleep 30";
+const long_rule = if (builtin.os.tag == .windows) "allow shell ping *\n" else "allow shell sleep *\n";
+
+/// Windows: the system folder as PATH and the system's own variables, so
+/// that commands and servers of the tests find cmd and ping.
+fn windowsPath(f: *Fix) !void {
+    if (builtin.os.tag != .windows) return;
+    const a = f.e.arena.allocator();
+    f.core.path_var = try @import("proc.zig").systemDir(a);
+    f.core.system_vars = try @import("cdp.zig").testSystemVars(a);
+}
+
+/// `text` as it is written in the log (JSON): Windows paths have their
+/// backslashes doubled there.
+fn asLogged(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const q = try std.json.Stringify.valueAlloc(a, text, .{});
+    return q[1 .. q.len - 1];
+}
+
 test "stop_ends_running_turn_and_reports" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell sleep *\n" });
+    try windowsPath(&f);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = long_rule });
     _ = try f.core.reload();
-    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"sleep 30\"}"));
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"" ++ long_command ++ "\"}"));
     try f.e.script(2, model.textReply("never"));
     try f.core.startWorker();
     try f.core.handleText("sleep a while");
@@ -3930,13 +3951,13 @@ test "health_counts_only_harness_run_while_it_holds_the_folder" {
 }
 
 test "a_signal_stops_what_runs_logs_it_and_lets_go_of_the_folder" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell sleep *\n" });
+    try windowsPath(&f);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = long_rule });
     _ = try f.core.reload();
-    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"sleep 30\"}"));
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"" ++ long_command ++ "\"}"));
     try f.e.script(2, model.textReply("never"));
     try f.core.startWorker();
     try f.core.handleText("sleep a while");
@@ -3958,26 +3979,39 @@ test "a_signal_stops_what_runs_logs_it_and_lets_go_of_the_folder" {
 }
 
 test "mcp_servers_run_in_a_folder_of_their_own_not_the_workspace" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
+    try windowsPath(&f);
     const a = f.e.arena.allocator();
     // the server says where it runs, then fails (its stderr goes to the log)
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = "[where]\ncommand = /bin/sh -c \"pwd >&2; exit 1\"\n" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = if (builtin.os.tag == .windows)
+        "[where]\ncommand = cmd /c \"cd >&2 & exit 1\"\n"
+    else
+        "[where]\ncommand = /bin/sh -c \"pwd >&2; exit 1\"\n" });
     _ = try f.core.reload();
     const lt = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, a, .unlimited);
     const own = try std.fs.path.join(a, &.{ try Io.Dir.cwd().realPathFileAlloc(t.io, f.core.paths.state, a), "mcp", "where" });
-    if (std.mem.indexOf(u8, lt, own) == null) {
+    if (std.mem.indexOf(u8, lt, try asLogged(a, own)) == null) {
         std.debug.print("wanted {s} in:\n{s}\n", .{ own, lt });
         return error.TestUnexpectedResult;
     }
     // files the agent writes into the workspace are not the server's
-    try t.expect(std.mem.indexOf(u8, lt, f.core.workspace) == null);
-    for ([_][]const u8{ own, std.fs.path.dirname(own).? }) |d| {
+    try t.expect(std.mem.indexOf(u8, lt, try asLogged(a, f.core.workspace)) == null);
+    // (Windows: the data folder's permissions protect them)
+    if (builtin.os.tag != .windows) for ([_][]const u8{ own, std.fs.path.dirname(own).? }) |d| {
         const st = try Io.Dir.cwd().statFile(t.io, d, .{});
         try t.expectEqual(@as(u32, 0o700), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
-    }
+    };
+}
+
+/// A server command that waits `secs` seconds, then is the fake MCP
+/// server: `sh -c` on POSIX, a batch file in `dir` on Windows.
+fn slowServer(a: std.mem.Allocator, dir: []const u8, name: []const u8, secs: u32, fake: []const u8) ![]const u8 {
+    if (builtin.os.tag != .windows) return std.fmt.allocPrint(a, "/bin/sh -c \"sleep {d}; exec '{s}' --mcp\"", .{ secs, fake });
+    const path = try std.fs.path.join(a, &.{ dir, try std.fmt.allocPrint(a, "{s}.cmd", .{name}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = try std.fmt.allocPrint(a, "@ping -n {d} 127.0.0.1 >nul\r\n@\"{s}\" --mcp\r\n", .{ secs + 1, fake }) });
+    return std.fmt.allocPrint(a, "\"{s}\"", .{path});
 }
 
 fn reloadQuietly(c: *Core) void {
@@ -3985,15 +4019,16 @@ fn reloadQuietly(c: *Core) void {
 }
 
 test "mcp_servers_start_together_under_one_deadline" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
+    try windowsPath(&f);
     const a = f.e.arena.allocator();
     const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
     f.core.mcp_start_ms = 3000;
     // two that take two seconds to come up, one that never answers
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[one]\ncommand = /bin/sh -c \"sleep 2; exec '{s}' --mcp\"\n[two]\ncommand = /bin/sh -c \"sleep 2; exec '{s}' --mcp\"\n[mute]\ncommand = /bin/sh -c \"exec sleep 30\"\n", .{ fake, fake }) });
+    const mute = if (builtin.os.tag == .windows) "ping -n 31 127.0.0.1" else "/bin/sh -c \"exec sleep 30\"";
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[one]\ncommand = {s}\n[two]\ncommand = {s}\n[mute]\ncommand = {s}\n", .{ try slowServer(a, f.e.dir, "one", 2, fake), try slowServer(a, f.e.dir, "two", 2, fake), mute }) });
     const t0 = Io.Clock.awake.now(t.io).nanoseconds;
     try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
     const took_ms = @divFloor(Io.Clock.awake.now(t.io).nanoseconds - t0, std.time.ns_per_ms);
@@ -4012,13 +4047,13 @@ test "mcp_servers_start_together_under_one_deadline" {
 }
 
 test "reload_holds_no_lock_while_servers_start_and_stop_cuts_it_short" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
+    try windowsPath(&f);
     const a = f.e.arena.allocator();
     const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[slow]\ncommand = /bin/sh -c \"sleep 8; exec '{s}' --mcp\"\n", .{fake}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[slow]\ncommand = {s}\n", .{try slowServer(a, f.e.dir, "slow", 8, fake)}) });
     const t0 = Io.Clock.awake.now(t.io).nanoseconds;
     const th = try std.Thread.spawn(.{}, reloadQuietly, .{f.core});
     t.io.sleep(.fromMilliseconds(300), .awake) catch {};
@@ -4039,14 +4074,18 @@ test "reload_holds_no_lock_while_servers_start_and_stop_cuts_it_short" {
 }
 
 test "a_value_added_while_a_turn_runs_is_masked_in_every_tool_from_then_on" {
-    // the command makes the value without spelling it out ($((...)) is POSIX sh)
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
+    try windowsPath(&f);
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
     _ = try f.core.reload();
-    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo made-at-signup-Pass-$((9000+271))\"}"));
+    // the command makes the value without spelling it out: $((...)) in sh,
+    // a caret cmd drops on Windows
+    try f.e.script(1, model.toolReply("tu_1", "shell", if (builtin.os.tag == .windows)
+        "{\"command\":\"echo made-at-signup-Pass-92^71\"}"
+    else
+        "{\"command\":\"echo made-at-signup-Pass-$((9000+271))\"}"));
     try f.e.script(2, model.textReply("ok"));
     var flag: std.atomic.Value(bool) = .init(false);
     var run = f.core.baseRun(&f.core.chat_client, "chat", false, &flag);
