@@ -2103,9 +2103,11 @@ test "a_fetch_and_a_web_action_get_only_what_is_left_of_the_turn" {
     const took_ms = started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
     const log = try f.logText();
     // said in words too: an optimized build shows no trace of a failed check
-    if (took_ms >= 2500 or std.mem.indexOf(u8, log, "the turn's time is up") == null)
+    // a 1 s turn ends 1 to 2 s after it began (its end is a whole second);
+    // the fetch alone would take 4 s
+    if (took_ms >= 3000 or std.mem.indexOf(u8, log, "the turn's time is up") == null)
         std.debug.print("a 1 s turn took {d} ms; log:\n{s}\n", .{ took_ms, util.cut(log, 6000) });
-    try t.expect(took_ms < 2500);
+    try t.expect(took_ms < 3000);
     try t.expect(std.mem.indexOf(u8, log, "the turn's time is up") != null);
     // the web call never runs: refused for want of time by the gate ("no
     // time left in the turn to ask the owner") or before the tool ("no time
@@ -2402,9 +2404,10 @@ test "a_helpers_question_after_the_deadline_is_not_asked" {
     defer f.deinit();
     try withHelpers(&f);
     f.run.limits.turn_seconds = 2;
-    // the first question is answered after the turn's end; the second
+    // the first question is answered after the turn's end (a 2 s turn ends
+    // 2 to 3 s after it began: its end is a whole second); the second
     // helper's question waits behind it and can't be answered in time
-    f.ask_ms = 2500;
+    f.ask_ms = 3500;
     try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"one\",\"tools\":[\"shell\"]},{\"task\":\"two\",\"tools\":[\"shell\"]}]}"));
     try f.e.script(2, model.toolReply("w1", "shell", "{\"command\":\"echo one\"}"));
     try f.e.script(3, model.toolReply("w2", "shell", "{\"command\":\"echo two\"}"));
