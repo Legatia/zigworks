@@ -335,6 +335,11 @@ pub const Core = struct {
     bot_name_len: usize = 0,
     /// Whether Telegram topics in private chats are on for the bot.
     topics_on: bool = true,
+    /// One topic opened for a post at a time (two runs posting to the same
+    /// new name open it once).
+    topic_mutex: Io.Mutex = .init,
+    /// Names whose topic could not be opened, the owner told once each.
+    told_topics: std.ArrayList([]u8) = .empty,
     /// /dryrun, /private, /memory auto: runs read them when they use them.
     switches: agent.Switches = .{},
 
@@ -483,6 +488,8 @@ pub const Core = struct {
         c.upgradeConversations();
         c.bot_name_len = 0;
         c.topics_on = true;
+        c.topic_mutex = .init;
+        c.told_topics = .empty;
         c.chat_client = try model.Client.init(gpa, io, c.cfg.model.url, secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens);
         c.contexts = .empty;
         c.ctx_mutex = .init;
@@ -544,6 +551,8 @@ pub const Core = struct {
         c.queue.deinit(c.gpa);
         c.run_flags.deinit(c.gpa);
         c.convs.deinit();
+        for (c.told_topics.items) |n| c.gpa.free(n);
+        c.told_topics.deinit(c.gpa);
         for (c.contexts.items) |x| c.freeContext(x);
         c.contexts.deinit(c.gpa);
         c.chat_client.deinit();
@@ -1754,6 +1763,8 @@ pub const Core = struct {
         core: *Core,
         /// "[btc-watch] " for a run the owner did not start; "" otherwise.
         tag: []const u8 = "",
+        /// A task's or brief's: what its reply needs and how it went.
+        sched: ?*Sched = null,
 
         fn outbox(o: *RunOut) agent.Outbox {
             return .{ .ctx = o, .find = find, .names = names, .post = post };
@@ -1785,6 +1796,62 @@ pub const Core = struct {
         }
     };
 
+    /// A task's or brief's reply: what the run skipped is added to it,
+    /// NOTHING (with nothing skipped) posts nothing, and one that did not
+    /// get through is kept to be sent again as it was.
+    const Sched = struct {
+        skipped: ?*agent.Skipped = null,
+        keep: ?*?Undelivered = null,
+        /// A brief's links, seen once it is delivered.
+        links: []const []const u8 = &.{},
+        /// How the reply went, and why when it did not.
+        outcome: enum { none, sent, kept, failed, silent, held } = .none,
+        why: []const u8 = "",
+    };
+
+    /// A task's or brief's reply as it is posted: its tag in front, what it
+    /// skipped after it; null for NOTHING with nothing skipped.
+    fn shapeReply(c: *Core, a: std.mem.Allocator, o: *const RunOut, sc: *const Sched, text: []const u8) ?[]const u8 {
+        const note = if (sc.skipped) |s| s.text(c.io, a) catch "" else "";
+        const silent = std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n."), "NOTHING");
+        if (silent and note.len == 0) return null;
+        if (silent) return std.fmt.allocPrint(a, "{s}{s}", .{ o.tag, note }) catch null;
+        return std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ o.tag, text, if (note.len > 0) "\n\n" else "", note }) catch null;
+    }
+
+    /// A post to a name that is no conversation yet (a task's or brief's
+    /// `to`) opens that topic in the owner's chat first. One that can't be
+    /// opened goes to main with its name in front; the owner is told why,
+    /// once.
+    fn ensureTopic(c: *Core, a: std.mem.Allocator, name: []const u8) void {
+        if (conversations.isFixed(name)) return;
+        const ch = c.chan orelse return;
+        // the terminal: printed with the name
+        const open_fn = ch.open_topic orelse return;
+        c.topic_mutex.lockUncancelable(c.io);
+        defer c.topic_mutex.unlock(c.io);
+        {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            if (c.convs.find(name) != null) return;
+        }
+        const owner = c.owner orelse return;
+        const why: []const u8 = blk: {
+            if (!c.topics_on) break :blk "topics are off for the bot; switch on topics in private chats in @BotFather";
+            const thread = open_fn(ch.ctx, owner, name) catch |e| break :blk std.fmt.allocPrint(a, "Telegram said {s}", .{@errorName(e)}) catch "Telegram refused";
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            _ = c.convs.add(.{ .name = name, .chat = owner, .thread = thread, .created = util.nowSeconds(c.io) }) catch |e|
+                break :blk std.fmt.allocPrint(a, "state/conversations could not be written ({s})", .{@errorName(e)}) catch "it could not be kept";
+            c.log.write(.config, false, .{ .event = "conversation added", .name = name, .thread = thread, .why = "a post to it" }) catch {};
+            return;
+        };
+        for (c.told_topics.items) |n| if (std.mem.eql(u8, n, name)) return;
+        c.told_topics.append(c.gpa, c.gpa.dupe(u8, name) catch return) catch {};
+        c.log.write(.chat, false, .{ .event = "topic not opened", .name = name, .why = why }) catch {};
+        c.say(std.fmt.allocPrint(a, "The topic {s} could not be opened ({s}), so its posts come here with [{s}] in front.", .{ name, why, name }) catch "A topic could not be opened; its posts come here.");
+    }
+
     /// Whether a run can post to `e` through the attached channel (the
     /// terminal is not reached from Telegram). Under convs.mutex.
     fn reachable(c: *const Core, e: *const conversations.Entry) bool {
@@ -1796,9 +1863,37 @@ pub const Core = struct {
     /// run's tag in front, its files as documents, within the
     /// conversation's hourly limit.
     fn postOut(c: *Core, a: std.mem.Allocator, o: *RunOut, p: *const agent.Post) agent.Delivery {
+        // a task's or brief's reply: what it skipped added, NOTHING silent
+        const sc: ?*Sched = if (p.final) o.sched else null;
+        const d = c.postShaped(a, o, sc, p);
+        if (sc) |x| {
+            x.outcome = switch (d.status) {
+                .sent => .sent,
+                .kept => .kept,
+                .held => .held,
+                .silent => .silent,
+                .failed => .failed,
+            };
+            x.why = d.why;
+        }
+        return d;
+    }
+
+    fn postShaped(c: *Core, a: std.mem.Allocator, o: *RunOut, sc: ?*Sched, p: *const agent.Post) agent.Delivery {
+        const text = if (sc) |x|
+            c.shapeReply(a, o, x, p.text) orelse return .{ .status = .silent }
+        else if (o.tag.len > 0) std.fmt.allocPrint(a, "{s}{s}", .{ o.tag, p.text }) catch p.text else p.text;
+        c.ensureTopic(a, p.to);
         if (c.overHourly(a, p.to)) |why| return .{ .status = .held, .why = why };
-        const text = if (o.tag.len > 0) std.fmt.allocPrint(a, "{s}{s}", .{ o.tag, p.text }) catch p.text else p.text;
-        const sent = c.sendText(p.to, text) catch |e| return .{ .status = .failed, .why = whyUndelivered(e) };
+        const sent = c.sendText(p.to, text) catch |e| {
+            // kept to be sent again as it is: nothing runs again for it
+            if (sc) |x| if (worthRetry(e)) if (x.keep) |k| if (Undelivered.of(c.gpa, p.to, text, x.links)) |u| {
+                if (k.*) |old| old.deinit(c.gpa);
+                k.* = u;
+                return .{ .status = .kept, .why = whyUndelivered(e) };
+            } else |_| {};
+            return .{ .status = .failed, .why = whyUndelivered(e) };
+        };
         c.touch(p.to);
         var d: agent.Delivery = .{ .status = .sent, .message = sent.first, .parts = sent.count };
         for (p.files) |f| {
@@ -2355,7 +2450,7 @@ pub const Core = struct {
             break :blk c.retry.get(key) orelse return;
         };
         const kp = keyParts(key);
-        c.deliver(r.msg.text) catch |e| {
+        c.deliverIn(if (r.msg.conv.len > 0) r.msg.conv else "main", r.msg.text) catch |e| {
             c.log.write(kp.kind, false, .{ .name = kp.name, .event = "not delivered", .why = whyUndelivered(e), .tries = r.tries + 1 }) catch {};
             c.state_mutex.lockUncancelable(c.io);
             defer c.state_mutex.unlock(c.io);
@@ -2399,13 +2494,15 @@ pub const Core = struct {
         undelivered,
     };
 
-    /// A message that did not get through, kept to be sent again as it is.
+    /// A message that did not get through, kept to be sent again as it is,
+    /// to its conversation.
     pub const Undelivered = struct {
         text: []u8,
         /// A brief's links: seen once it is delivered.
         links: [][]u8 = &.{},
+        conv: []u8 = &.{},
 
-        fn of(gpa: std.mem.Allocator, text: []const u8, links: []const []const u8) !Undelivered {
+        fn of(gpa: std.mem.Allocator, conv: []const u8, text: []const u8, links: []const []const u8) !Undelivered {
             const out_links = try gpa.alloc([]u8, links.len);
             var n: usize = 0;
             errdefer {
@@ -2416,13 +2513,16 @@ pub const Core = struct {
                 out_links[n] = try gpa.dupe(u8, l);
                 n += 1;
             }
-            return .{ .text = try gpa.dupe(u8, text), .links = out_links };
+            const conv_owned = try gpa.dupe(u8, conv);
+            errdefer gpa.free(conv_owned);
+            return .{ .text = try gpa.dupe(u8, text), .links = out_links, .conv = conv_owned };
         }
 
         fn deinit(u: Undelivered, gpa: std.mem.Allocator) void {
             for (u.links) |l| gpa.free(l);
             gpa.free(u.links);
             gpa.free(u.text);
+            gpa.free(u.conv);
         }
     };
 
@@ -2456,14 +2556,31 @@ pub const Core = struct {
         if (flag.load(.acquire)) return .done;
         const w = try brief.compose(&run, a, b, collected);
         if (flag.load(.acquire)) return .done;
-        c.deliver(w.text) catch |e| {
-            try c.log.write(.brief, false, .{ .name = b.name, .event = "not delivered", .why = whyUndelivered(e) });
-            if (!worthRetry(e)) return .done;
-            if (keep) |k| k.* = try .of(c.gpa, w.text, w.links);
-            return .undelivered;
-        };
-        try c.markSeen(w.links);
-        return .done;
+        // posted to its `to` the way a reply is: through the gate, with its
+        // name in front; kept when it did not get through
+        var sched: Sched = .{ .keep = keep, .links = w.links };
+        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{b.name}), .sched = &sched };
+        run.outbox = out.outbox();
+        const got = try agent.postReply(&run, a, w.text);
+        if (got.refused) |why| {
+            try c.log.write(.brief, false, .{ .name = b.name, .event = "not posted", .why = why });
+            c.say(try std.fmt.allocPrint(a, "The brief {s} was not posted: {s}.", .{ b.name, why }));
+            return .done;
+        }
+        switch (sched.outcome) {
+            .sent => {
+                try c.markSeen(w.links);
+                return .done;
+            },
+            .kept => {
+                try c.log.write(.brief, false, .{ .name = b.name, .event = "not delivered", .why = sched.why });
+                return .undelivered;
+            },
+            else => {
+                try c.log.write(.brief, false, .{ .name = b.name, .event = "not delivered", .why = sched.why });
+                return .done;
+            },
+        }
     }
 
     /// Runs a scheduled task once.
@@ -2488,7 +2605,13 @@ pub const Core = struct {
         var skipped: agent.Skipped = .init(c.gpa);
         defer skipped.deinit();
         run.skipped = &skipped;
-        run.notice = .{ .ctx = c, .say = noticeSay };
+        var notify: Notify = .{ .core = c, .conv = tk.to };
+        run.notice = .{ .ctx = &notify, .say = Notify.say };
+        // it posts to its `to` with its name in front, like its reply
+        var sched: Sched = .{ .skipped = &skipped, .keep = keep };
+        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{tk.name}), .sched = &sched };
+        run.outbox = out.outbox();
+        run.context_note = c.contextNote(a, tk.to) catch "";
         var conv: agent.Conversation = .init(c.gpa);
         defer conv.deinit();
         try c.log.write(.task, false, .{ .name = tk.name, .event = "start" });
@@ -2506,26 +2629,54 @@ pub const Core = struct {
             c.say(try std.fmt.allocPrint(a, "Task {s} is paused: model budget used up. Send /task resume {s} to start it again.", .{ tk.name, tk.name }));
             return .done;
         };
-        const answer = std.mem.trim(u8, res.text, " \t\r\n.");
-        const silent = std.mem.eql(u8, answer, "NOTHING");
-        // what it could not do without the owner is said even then
-        const note = try skipped.text(c.io, a);
-        if (silent and note.len == 0) {
-            try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = "the answer was NOTHING" });
-            return .done;
+        if (!res.replied) {
+            if (res.ended_by) |why| {
+                // a limit or an error: harness's line, with what it skipped
+                const note = try skipped.text(c.io, a);
+                return c.taskMessage(tk, keep, try std.fmt.allocPrint(a, "[{s}] {s}{s}{s}", .{ tk.name, why, if (note.len > 0) "\n\n" else "", note }));
+            }
+            // NOTHING, with nothing skipped: no post at all
+            if (c.shapeReply(a, &out, &sched, res.text) == null) {
+                try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = "the answer was NOTHING" });
+                return .done;
+            }
+            const got = try agent.postReply(&run, a, res.text);
+            if (got.refused) |why| {
+                try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = why });
+                c.say(try std.fmt.allocPrint(a, "The answer of task {s} was not posted: {s}.", .{ tk.name, why }));
+                return .done;
+            }
         }
-        const msg = if (silent)
-            try std.fmt.allocPrint(a, "[{s}] {s}", .{ tk.name, note })
-        else
-            try std.fmt.allocPrint(a, "[{s}] {s}{s}{s}", .{ tk.name, res.text, if (note.len > 0) "\n\n" else "", note });
-        c.deliver(msg) catch |e| {
+        // how its reply went, a final send's or harness's post of its text
+        switch (sched.outcome) {
+            .sent => try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = true }),
+            .silent => try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = "the answer was NOTHING" }),
+            else => try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = sched.why }),
+        }
+        return if (sched.outcome == .kept) .undelivered else .done;
+    }
+
+    /// Harness's own line for a task (a limit, an error, with what it
+    /// skipped): to its conversation (main when others read that); kept to
+    /// be sent again when it did not get through.
+    fn taskMessage(c: *Core, tk: config.Task, keep: ?*?Undelivered, msg: []const u8) !Outcome {
+        const where = if (c.isShared(tk.to)) "main" else tk.to;
+        c.deliverIn(where, msg) catch |e| {
             try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = whyUndelivered(e) });
             if (!worthRetry(e)) return .done;
-            if (keep) |k| k.* = try .of(c.gpa, msg, &.{});
+            if (keep) |k| k.* = try .of(c.gpa, where, msg, &.{});
             return .undelivered;
         };
         try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = true });
         return .done;
+    }
+
+    /// Whether others read conversation `name` (a group).
+    fn isShared(c: *Core, name: []const u8) bool {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        const e = c.convs.find(name) orelse return false;
+        return e.audience == .shared;
     }
 
     // ---- commands ----
@@ -4018,6 +4169,47 @@ test "a_refused_topic_posts_to_main_with_its_name_in_front" {
     try t.expectEqual(1, f.rec.countIn("main", "[trading] BTC is up."));
     try t.expectEqual(1, f.rec.countIn("main", "[trading] ETH too."));
     try t.expectEqual(1, f.rec.count("Telegram refused the topic of trading"));
+}
+
+test "a_task_posts_to_its_conversation_with_its_name_in_front" {
+    var f: Fix = undefined;
+    try f.init("", "", "[check]\nevery = 5m\nto = house-search\ndo = Check the flats.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // house-search is no conversation yet: its topic opens at the first post
+    try f.e.script(1, model.textReply("Two new flats."));
+    f.core.tick();
+    try f.rec.waitIn("house-search", "[check] Two new flats.");
+    try t.expectEqual(5001, f.rec.whereOf("[check] Two new flats.").?.thread);
+    waitIdle(f.core);
+    try t.expect(std.mem.indexOf(u8, try conversationsText(&f), "\"name\":\"house-search\",\"channel\":\"telegram\",\"chat\":42,\"thread\":5001") != null);
+    try t.expectEqual(0, f.rec.countIn("main", "Two new flats."));
+    // the task could post with send too; its run is logged in its conversation
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "\"name\":\"send\"") != null);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"conversation\":\"house-search\",\"run\":\"task check\",\"by\":\"schedule:check\"") != null);
+    // a brief with `to` posts there the same way
+    try addTopic(&f, "news", 5020);
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/z.xml", .data = "<rss><channel><item><title>New thing</title><link>https://z.org/1</link></item></channel></rss>" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.briefs, .data = try std.fmt.allocPrint(a, "[morning]\nat = 00:00\nto = news\ntopic = Zig | {s}/page/z.xml\n", .{try f.e.url()}) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(2, model.textReply("Zig: New thing (https://z.org/1)"));
+    f.core.tick();
+    try f.rec.waitIn("news", "[morning] Zig: New thing (https://z.org/1)");
+    waitIdle(f.core);
+    try t.expect(f.core.seen.has("https://z.org/1"));
+    try t.expectEqual(0, f.rec.countIn("main", "New thing"));
+}
+
+test "a_task_whose_topic_can_not_open_posts_to_main_with_its_name" {
+    var f: Fix = undefined;
+    try f.init("", "", "[check]\nevery = 5m\nto = flats\ndo = Check the flats.\n");
+    defer f.deinit();
+    f.rec.topics_fail = true;
+    try f.e.script(1, model.textReply("Nothing new on the market."));
+    f.core.tick();
+    try f.rec.waitIn("main", "[flats] [check] Nothing new on the market.");
+    waitIdle(f.core);
+    try t.expectEqual(1, f.rec.count("could not be opened"));
 }
 
 test "a_bad_rules_line_names_its_section_or_environment" {
