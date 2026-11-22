@@ -326,9 +326,9 @@ pub const Grants = struct {
             try escape(&out, g.gpa, it.key);
             try out.print(g.gpa, "\t{s}\n", .{it.who});
         }
-        var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = util.private_file });
-        defer f.close(io);
-        try f.writeStreamingAll(io, out.items);
+        // whole or not at all: a grant cut in half, or a reader that finds
+        // the file empty, would lose or change what was granted
+        try util.writeReplace(io, path, out.items);
     }
 };
 

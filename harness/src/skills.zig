@@ -235,13 +235,11 @@ pub fn save(io: Io, dir: []const u8, name: []const u8, description: []const u8, 
     if (body.len > 0 and body[body.len - 1] != '\n') try w.writeByte('\n');
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const folder = std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{ dir, std.fs.path.sep, name }) catch return error.NameTooLong;
-    const cwd = Io.Dir.cwd();
-    try cwd.createDirPath(io, folder);
-    var d = try cwd.openDir(io, folder, .{});
-    defer d.close(io);
-    try d.writeFile(io, .{ .sub_path = "SKILL.md.tmp", .data = w.buffered(), .flags = .{ .permissions = util.private_file } });
-    errdefer d.deleteFile(io, "SKILL.md.tmp") catch {};
-    try d.rename("SKILL.md.tmp", d, "SKILL.md", io);
+    try Io.Dir.cwd().createDirPath(io, folder);
+    var file_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file = std.fmt.bufPrint(&file_buf, "{s}{c}SKILL.md", .{ folder, std.fs.path.sep }) catch return error.NameTooLong;
+    // whole or not at all, even with it open in an editor (util.writeReplace)
+    try util.writeReplace(io, file, w.buffered());
 }
 
 pub fn remove(io: Io, dir: []const u8, name: []const u8) !bool {

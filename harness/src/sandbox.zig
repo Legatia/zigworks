@@ -225,10 +225,7 @@ fn readGrants(io: Io, arena: std.mem.Allocator, dir: []const u8) ![]const Grant 
 fn writeGrants(io: Io, arena: std.mem.Allocator, dir: []const u8, grants: []const Grant) !void {
     var text: std.ArrayList(u8) = .empty;
     for (grants) |g| try text.print(arena, "{x} {s}\n", .{ g.access, g.path });
-    const path = try std.fs.path.join(arena, &.{ dir, "aces" });
-    const tmp = try std.fs.path.join(arena, &.{ dir, "aces.tmp" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = text.items });
-    try Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), path, io);
+    try util.writeReplace(io, try std.fs.path.join(arena, &.{ dir, "aces" }), text.items);
 }
 
 /// Gives the SID what `req` says, takes back what it no longer says.

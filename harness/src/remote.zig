@@ -241,10 +241,7 @@ pub fn scanHost(io: Io, arena: std.mem.Allocator, env: *const environments.Env, 
 
 /// Keeps the host keys the owner confirmed: only they are accepted.
 pub fn keepHostKeys(io: Io, arena: std.mem.Allocator, dir: []const u8, lines: []const u8) !void {
-    const path = try knownHostsPath(arena, dir);
-    const tmp = try std.fmt.allocPrint(arena, "{s}.tmp", .{path});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = lines });
-    try Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), path, io);
+    try util.writeReplace(io, try knownHostsPath(arena, dir), lines);
 }
 
 // ---- tests ----

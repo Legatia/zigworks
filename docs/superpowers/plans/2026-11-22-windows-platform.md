@@ -168,3 +168,27 @@ is never overwritten) and `clones_share_blocks_on_copy_on_write_file_systems`
 btrfs made on loop files in WSL. Not run: ReFS or a Dev Drive, which this
 machine doesn't have (making one needs an administrator and a new disk);
 set HARNESS_TEST_COW_DIRS to a folder on one to run it.
+
+## 5. State files replaced safely (branch `win/state-files`, on `win/clone`)
+
+Found: `state/grants` and `state/written` were rewritten in place
+(truncate, then write): a crash, or a reader at the wrong moment, got a
+cut file. The others (conversations, the money ledger, skills, the
+sandbox's ACE record, kept host keys, approved apps) wrote a `.tmp` and
+renamed it, but on Windows a program that holds the file open without
+sharing deletion (a virus scanner, an editor, a backup) makes that rename
+fail with a sharing violation, which std reports as error.Unexpected.
+
+Built: `util.writeReplace(io, path, data)`: a new file beside it (random
+name, owner-only, synced), renamed over it; on Windows, while another
+program holds it, tried again for up to 2 s, then the error with the old
+file kept and no temporary one left. Harness's own readers open files
+sharing deletion (std does), so they never hold a replace up. All the
+writers above use it now. For the Mac session: `state/inbox` (phase A)
+should be written with it too.
+
+Tests: `a_replaced_file_is_the_old_or_the_new_never_a_part` (a reader
+thread against 60 replaces of 200 to 256 KiB: every read is one version
+whole), `a_replace_waits_for_a_program_that_holds_the_file_windows` (a
+handle sharing reads only, let go after 0.4 s: the replace waits and
+succeeds; one never let go: an error, the old content, nothing left).

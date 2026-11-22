@@ -5,6 +5,45 @@ const Io = std.Io;
 /// Files only the owner can read (POSIX); the default on Windows.
 pub const private_file: Io.File.Permissions = if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600);
 
+/// Writes `data` as the file `path` (readable by the owner only), whole or
+/// not at all: into a new file beside it, synced to disk, then renamed over
+/// it. A reader, in this process or another, gets the old content or the
+/// new, never a part, and a crash leaves one of them. On Windows a program
+/// that holds the file open without letting it be deleted (a virus
+/// scanner, an editor, a backup) makes the rename fail while it does: it is
+/// tried again for up to 2 s, then the error, the old file kept and no
+/// temporary one left.
+pub fn writeReplace(io: Io, path: []const u8, data: []const u8) !void {
+    return writeReplaceWaiting(io, path, data, 2000);
+}
+
+pub fn writeReplaceWaiting(io: Io, path: []const u8, data: []const u8, wait_ms: u32) !void {
+    var rnd: [6]u8 = undefined;
+    io.random(&rnd);
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&buf, "{s}.tmp-{s}", .{ path, &std.fmt.bytesToHex(rnd, .lower) });
+    const cwd = Io.Dir.cwd();
+    {
+        var f = try cwd.createFile(io, tmp, .{ .exclusive = true, .permissions = private_file });
+        defer f.close(io);
+        errdefer cwd.deleteFile(io, tmp) catch {};
+        try f.writeStreamingAll(io, data);
+        try f.sync(io);
+    }
+    errdefer cwd.deleteFile(io, tmp) catch {};
+    var waited: u32 = 0;
+    while (true) {
+        if (cwd.rename(tmp, cwd, path, io)) |_| return else |e| {
+            // held open by a program that doesn't share deletion: Windows
+            // says access denied, or a sharing violation std doesn't name
+            const held = @import("builtin").os.tag == .windows and (e == error.AccessDenied or e == error.Unexpected);
+            if (!held or waited >= wait_ms) return e;
+        }
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+        waited += 50;
+    }
+}
+
 /// One environment variable.
 pub const Var = struct { name: []const u8, value: []const u8 };
 
@@ -297,4 +336,93 @@ test "cut_moves_on_through_bytes_that_are_not_utf8" {
     // a character is still never split
     try t.expectEqualStrings("a", cut("a\xf0\x9f\x98\x80", 4));
     try t.expectEqualStrings("a\xf0\x9f\x98\x80", cut("a\xf0\x9f\x98\x80b", 5));
+}
+
+test "a_replaced_file_is_the_old_or_the_new_never_a_part" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(t.io, ".", a), "state" });
+    // two whole versions, large enough that a write takes a while
+    const one = try a.alloc(u8, 256 * 1024);
+    @memset(one, 'a');
+    const two = try a.alloc(u8, 200 * 1024);
+    @memset(two, 'b');
+    try writeReplace(t.io, path, one);
+    const Reader = struct {
+        fn run(p: []const u8, x: []const u8, y: []const u8, done: *std.atomic.Value(bool), bad: *std.atomic.Value(u32), reads: *std.atomic.Value(u32)) void {
+            var buf: [300 * 1024]u8 = undefined;
+            while (!done.load(.acquire)) {
+                const got = Io.Dir.cwd().readFile(t.io, p, &buf) catch {
+                    _ = bad.fetchAdd(1, .acq_rel);
+                    continue;
+                };
+                _ = reads.fetchAdd(1, .acq_rel);
+                if (!std.mem.eql(u8, got, x) and !std.mem.eql(u8, got, y)) _ = bad.fetchAdd(1, .acq_rel);
+            }
+        }
+    };
+    var done: std.atomic.Value(bool) = .init(false);
+    var bad: std.atomic.Value(u32) = .init(0);
+    var reads: std.atomic.Value(u32) = .init(0);
+    const th = try std.Thread.spawn(.{}, Reader.run, .{ path, one, two, &done, &bad, &reads });
+    for (0..60) |i| try writeReplace(t.io, path, if (i % 2 == 0) two else one);
+    done.store(true, .release);
+    th.join();
+    try t.expect(reads.load(.acquire) > 0);
+    try t.expectEqual(0, bad.load(.acquire));
+    // nothing left beside it
+    var d = try tmp.dir.openDir(t.io, ".", .{ .iterate = true });
+    defer d.close(t.io);
+    var it = d.iterate();
+    var n: usize = 0;
+    while (try it.next(t.io)) |_| n += 1;
+    try t.expectEqual(1, n);
+}
+
+test "a_replace_waits_for_a_program_that_holds_the_file_windows" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const windows = std.os.windows;
+    const k = struct {
+        extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, disposition: u32, flags: u32, template: ?windows.HANDLE) callconv(.winapi) windows.HANDLE;
+    };
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(t.io, ".", a), "state" });
+    try writeReplace(t.io, path, "old");
+    // as many programs open a file: reading, sharing reads alone
+    const hold = struct {
+        fn open(p: []const u8, al: std.mem.Allocator) !windows.HANDLE {
+            const h = k.CreateFileW(try std.unicode.utf8ToUtf16LeAllocZ(al, p), 0x80000000, 0x1, null, 3, 0, null);
+            if (h == windows.INVALID_HANDLE_VALUE) return error.Unexpected;
+            return h;
+        }
+        fn closeLater(h: windows.HANDLE) void {
+            t.io.sleep(.fromMilliseconds(400), .awake) catch {};
+            windows.CloseHandle(h);
+        }
+    };
+    const h = try hold.open(path, a);
+    const th = try std.Thread.spawn(.{}, hold.closeLater, .{h});
+    const started = Io.Clock.awake.now(t.io);
+    try writeReplace(t.io, path, "new");
+    th.join();
+    try t.expect(started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() >= 300);
+    try t.expectEqualStrings("new", try tmp.dir.readFileAlloc(t.io, "state", a, .limited(16)));
+    // one that doesn't let go: an error, the old content, no temporary file
+    const h2 = try hold.open(path, a);
+    defer windows.CloseHandle(h2);
+    try t.expect(if (writeReplaceWaiting(t.io, path, "newer", 300)) |_| false else |_| true);
+    try t.expectEqualStrings("new", try tmp.dir.readFileAlloc(t.io, "state", a, .limited(16)));
+    var d = try tmp.dir.openDir(t.io, ".", .{ .iterate = true });
+    defer d.close(t.io);
+    var it = d.iterate();
+    var n: usize = 0;
+    while (try it.next(t.io)) |_| n += 1;
+    try t.expectEqual(1, n);
 }

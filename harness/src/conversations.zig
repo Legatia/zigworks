@@ -178,12 +178,7 @@ pub const List = struct {
                 @tagName(e.audience), if (e.isPrivate()) "true" else "false", util.isoTime(&tb, e.created),
             });
         }
-        var tmp_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-        const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{l.path});
-        const cwd = Io.Dir.cwd();
-        try cwd.writeFile(l.io, .{ .sub_path = tmp, .data = out.items, .flags = .{ .permissions = util.private_file } });
-        errdefer cwd.deleteFile(l.io, tmp) catch {};
-        try cwd.rename(tmp, cwd, l.path, l.io);
+        try util.writeReplace(l.io, l.path, out.items);
     }
 
     pub fn find(l: *const List, name: []const u8) ?*Entry {

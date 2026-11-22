@@ -695,12 +695,7 @@ pub const MoneyLedger = struct {
         var buf: [max_file]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
         for (l.entries[0..l.len]) |*e| if (e.day >= today) try w.print("{s} {d} {d}\n", .{ e.name(), e.day, e.total });
-        var tmp_buf: [4096]u8 = undefined;
-        const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{p});
-        const cwd = Io.Dir.cwd();
-        try cwd.writeFile(io, .{ .sub_path = tmp, .data = w.buffered(), .flags = .{ .permissions = util.private_file } });
-        errdefer cwd.deleteFile(io, tmp) catch {};
-        try cwd.rename(tmp, cwd, p, io);
+        try util.writeReplace(io, p, w.buffered());
     }
 
     /// Everything counted, whatever the server and day (for tests).
@@ -1999,7 +1994,7 @@ pub const Written = struct {
             out.append(w.gpa, '\n') catch return;
         }
         if (w.more > 0) out.print(w.gpa, "/more {d}\n", .{w.more}) catch return;
-        Io.Dir.cwd().writeFile(w.io, .{ .sub_path = w.path, .data = out.items, .flags = .{ .permissions = util.private_file } }) catch {};
+        util.writeReplace(w.io, w.path, out.items) catch {};
     }
 
     fn load(w: *Written) void {

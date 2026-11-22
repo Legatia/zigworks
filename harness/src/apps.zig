@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const config = @import("config.zig");
 const conversations = @import("conversations.zig");
+const util = @import("util.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const Read = enum { memory, inbox, log, files };
@@ -388,10 +389,7 @@ pub fn approve(io: Io, arena: std.mem.Allocator, apps_dir: []const u8, state_dir
     const sdir = try std.fs.path.join(arena, &.{ state_dir, name });
     try Io.Dir.cwd().createDirPath(io, sdir);
     const text = try std.fmt.allocPrint(arena, "version {d}\nsha256 {s}\nwhen {d}\nby {s}\n", .{ version, &f.digest, now_s, by });
-    const tmp = try std.fs.path.join(arena, &.{ sdir, "approved.tmp" });
-    const path = try std.fs.path.join(arena, &.{ sdir, "approved" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = text });
-    try Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), path, io);
+    try util.writeReplace(io, try std.fs.path.join(arena, &.{ sdir, "approved" }), text);
     return version;
 }
 
