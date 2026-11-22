@@ -110,6 +110,9 @@ pub const Delivery = struct {
     files: u32 = 0,
     /// Why it was not sent, in words.
     why: []const u8 = "",
+    /// The inbox item it is kept as (kept to be sent again, or failed and
+    /// kept for the owner); 0: none.
+    item: u64 = 0,
 
     pub const Status = enum {
         sent,
@@ -1345,10 +1348,13 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
     if (final) r.posted_final = true;
     return switch (d.status) {
         .sent => .{ .text = try std.fmt.allocPrint(a, "posted to {s} ({d} message{s}{s})", .{ target.name, d.parts, if (d.parts == 1) "" else "s", if (d.files == 0) "" else try std.fmt.allocPrint(a, ", {d} file{s}", .{ d.files, if (d.files == 1) "" else "s" }) }) },
-        .kept => .{ .text = try std.fmt.allocPrint(a, "not delivered now ({s}); kept to be sent again", .{d.why}) },
+        .kept => .{ .text = try std.fmt.allocPrint(a, "not delivered now ({s}); kept as item {d} and sent again later", .{ d.why, d.item }) },
         .held => .{ .text = try std.fmt.allocPrint(a, "not sent: {s}; it is in the log", .{d.why}), .is_error = true },
         .silent => .{ .text = "nothing posted" },
-        .failed => .{ .text = try std.fmt.allocPrint(a, "not delivered: {s}", .{d.why}), .is_error = true },
+        .failed => if (d.item != 0)
+            .{ .text = try std.fmt.allocPrint(a, "not delivered ({s}); kept as item {d}", .{ d.why, d.item }), .is_error = true }
+        else
+            .{ .text = try std.fmt.allocPrint(a, "not delivered: {s}", .{d.why}), .is_error = true },
     };
 }
 
@@ -1456,6 +1462,7 @@ fn postThrough(r: *Run, a: std.mem.Allocator, p: *const Post, target: Target, as
         .message = d.message,
         .parts = d.parts,
         .why = if (d.why.len > 0) d.why else null,
+        .item = if (d.item != 0) d.item else null,
     });
     return .{ .delivery = d };
 }
