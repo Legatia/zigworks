@@ -36,8 +36,9 @@ pub const ServerConfig = struct {
     money: []const []const u8,
     /// `amount =`: where the money tools' inputs hold their amounts.
     amount: Amount = .unset,
-    /// `max_per_call =`, `max_per_day =`: this server's money caps (0: no
-    /// cap); null: the ones in config.ini's [money].
+    /// `max_per_call =`, `max_per_day =`: this server's money caps; 0 for
+    /// `none` (no cap for this server, whatever config.ini says); null:
+    /// the ones in config.ini's [money].
     max_per_call: ?u32 = null,
     max_per_day: ?u32 = null,
 };
@@ -77,9 +78,27 @@ pub const Amount = union(enum) {
     }
 };
 
+/// What is wrong with an mcp.ini line, when more can be said than that it
+/// does not read.
+pub fn configReason(e: anyerror) ?[]const u8 {
+    return switch (e) {
+        error.ZeroCap => "0 is not a cap here: write none to lift config.ini's cap for this server, or remove the line to use config.ini's",
+        else => null,
+    };
+}
+
+/// A server's cap: a whole number above 0, or `none` (0 here: no cap).
+fn parseCap(value: []const u8) error{ BadConfig, ZeroCap }!u32 {
+    if (std.mem.eql(u8, value, "none")) return 0;
+    const n = std.fmt.parseInt(u32, value, 10) catch return error.BadConfig;
+    // "no cap" would lift config.ini's as quietly as a typo: said as none
+    if (n == 0) return error.ZeroCap;
+    return n;
+}
+
 /// Servers in the order they appear. Unknown keys, a missing `command`,
 /// bad names and the same server twice are errors.
-pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig, OutOfMemory }![]ServerConfig {
+pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig, ZeroCap, OutOfMemory }![]ServerConfig {
     const ls = try config.lines(arena, text);
     var out: std.ArrayList(ServerConfig) = .empty;
     var i: usize = 0;
@@ -122,8 +141,8 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig,
                     cfg.money = names;
                 },
                 3 => cfg.amount = try parseAmount(arena, l.value),
-                4 => cfg.max_per_call = std.fmt.parseInt(u32, l.value, 10) catch return error.BadConfig,
-                5 => cfg.max_per_day = std.fmt.parseInt(u32, l.value, 10) catch return error.BadConfig,
+                4 => cfg.max_per_call = try parseCap(l.value),
+                5 => cfg.max_per_day = try parseCap(l.value),
                 else => unreachable,
             }
         }
@@ -811,11 +830,20 @@ test "parse_config_takes_money_caps_per_server" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const servers = try parseConfig(a, "[b]\ncommand = x\nmoney = p\namount = usd\nmax_per_call = 100\nmax_per_day = 0   ; none for this one\n[c]\ncommand = y\nmoney = q\n");
+    const servers = try parseConfig(a, "[b]\ncommand = x\nmoney = p\namount = usd\nmax_per_call = 100\nmax_per_day = none   ; no cap for this one\n[c]\ncommand = y\nmoney = q\n");
     try t.expectEqual(100, servers[0].max_per_call.?);
+    // none: no cap here, whatever config.ini says
     try t.expectEqual(0, servers[0].max_per_day.?);
     try t.expectEqual(null, servers[1].max_per_call);
     try t.expectEqual(null, servers[1].max_per_day);
+    // 0 says nothing clear (no cap? none allowed?): write none, or leave the line out
+    for ([_][]const u8{
+        "[b]\ncommand = x\nmoney = p\nmax_per_day = 0\n",
+        "[b]\ncommand = x\nmoney = p\nmax_per_call = 0\n",
+        "[b]\ncommand = x\nmoney = p\nmax_per_call = 000\n",
+    }) |text| try t.expectError(error.ZeroCap, parseConfig(a, text));
+    try t.expect(std.mem.indexOf(u8, configReason(error.ZeroCap).?, "write none") != null);
+    try t.expectEqual(null, configReason(error.BadConfig));
     const bad = [_][]const u8{
         "[b]\ncommand = x\nmoney = p\nmax_per_call = -1\n",
         "[b]\ncommand = x\nmoney = p\nmax_per_call = 2.5\n",
@@ -823,6 +851,8 @@ test "parse_config_takes_money_caps_per_server" {
         "[b]\ncommand = x\nmoney = p\nmax_per_day =\n",
         "[b]\ncommand = x\nmax_per_day = 10\n", // a cap without money tools
         "[b]\ncommand = x\nmoney = p\nmax_per_day = 1\nmax_per_day = 2\n",
+        "[b]\ncommand = x\nmoney = p\nmax_per_day = None\n",
+        "[b]\ncommand = x\nmax_per_day = none\n", // none without money tools
     };
     for (bad) |text| {
         if (parseConfig(a, text)) |_| {

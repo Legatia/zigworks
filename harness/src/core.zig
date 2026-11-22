@@ -1217,6 +1217,8 @@ pub const Core = struct {
         const cfgs = mcp.parseConfig(a, text) catch {
             const why = (parseProblem(a, "mcp.ini", text, mcp.parseConfig) catch null) orelse "mcp.ini has an error";
             c.mcp_note = std.fmt.allocPrint(a, "{s}; no servers started.", .{why}) catch "mcp.ini has an error; no servers started.";
+            // said at start too (as "note: mcp.ini: line 5 has …"): the owner fixes the file
+            c.mcp_warn = if (std.mem.startsWith(u8, c.mcp_note, "mcp.ini ")) c.mcp_note["mcp.ini ".len..] else c.mcp_note;
             return;
         };
         var flag: std.atomic.Value(bool) = .init(false);
@@ -2234,7 +2236,10 @@ pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, co
     var it = std.mem.splitScalar(u8, text, '\n');
     var line: []const u8 = "";
     for (0..n) |_| line = it.next() orelse "";
-    return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80) });
+    // what the parser says of that line (the lines up to it are fine)
+    _ = scratch.reset(.retain_capacity);
+    const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e);
+    return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
 }
 
 /// The first line of `text` that does not read: the one after the longest
@@ -3748,6 +3753,31 @@ test "status_says_which_money_tools_have_no_amount_field" {
     try f.rec.waitFor("fake: echo has no amount field in mcp.ini");
 }
 
+test "a_cap_of_0_in_mcp_ini_is_an_error_and_none_lifts_the_cap" {
+    var f: Fix = undefined;
+    try f.init("[money]\nmax_per_day = 50\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    const head = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\nmoney = echo\namount = amount\n", .{fake});
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "{s}max_per_day = 0\n", .{head}) });
+    _ = try f.core.reload();
+    try t.expectEqual(0, f.core.mcp_servers.items.len);
+    // in the start notes and /status: the line, and what to write
+    try t.expect(std.mem.startsWith(u8, f.core.mcp_warn, "line 5 has an error: max_per_day = 0 ("));
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "mcp.ini line 5 has an error: max_per_day = 0 (") != null);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_warn, "write none") != null);
+    try f.core.handleText("/status");
+    try f.rec.waitFor("or remove the line");
+    // none: started, and said
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "{s}max_per_day = none\n", .{head}) });
+    _ = try f.core.reload();
+    try t.expectEqual(1, f.core.mcp_servers.items.len);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_warn, "fake: max_per_day = none: its money calls have no cap per day (config.ini's 50 does not apply)") != null);
+    try f.core.handleText("/status");
+    try f.rec.waitFor("config.ini's 50 does not apply");
+}
+
 test "a_server_whose_money_list_names_a_missing_tool_is_not_started" {
     var f: Fix = undefined;
     try f.init("", "", "");
@@ -3854,6 +3884,15 @@ test "settings_errors_name_the_file_and_line" {
     try t.expect(std.mem.indexOf(u8, perm, f.core.paths.config) != null);
     try t.expect(std.mem.indexOf(u8, perm, "chmod 600") != null);
     try t.expect(std.mem.indexOf(u8, perm, "config.ini, rules, logins.ini and mcp.ini") != null);
+}
+
+test "a_rule_refused_at_load_says_why_and_where" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell ls\nallow fetch *.good.com/*\n" });
+    const r = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, r, "nothing changed: rules line 2 has an error: allow fetch *.good.com/* (an allow rule for fetch or browse takes an address") != null);
 }
 
 test "health_counts_only_harness_run_while_it_holds_the_folder" {

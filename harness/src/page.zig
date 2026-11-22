@@ -9,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const util = @import("util.zig");
 const jv = @import("jv.zig");
+const url_mod = @import("url.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -1082,13 +1083,6 @@ fn findIn(arena: Allocator, io: Io, explicit: []const u8, env_chrome: []const u8
     return null;
 }
 
-fn validUrl(url: []const u8) bool {
-    const n: usize = if (std.ascii.startsWithIgnoreCase(url, "https://")) 8 else if (std.ascii.startsWithIgnoreCase(url, "http://")) 7 else return false;
-    if (url.len == n) return false;
-    for (url) |c| if (c <= ' ' or c == 0x7F) return false;
-    return true;
-}
-
 const Collector = struct {
     mutex: Io.Mutex = .init,
     buf: std.ArrayList(u8) = .empty,
@@ -1238,29 +1232,6 @@ pub const browser_flags = [_][]const u8{
     "--password-store=basic",
 };
 
-/// The host of an http or https `url` with its port if it has one, as
-/// written (no user info); null for any other address.
-pub fn urlHostPort(url: []const u8) ?struct { https: bool, host: []const u8 } {
-    const https = std.ascii.startsWithIgnoreCase(url, "https://");
-    const rest = if (https) url[8..] else if (std.ascii.startsWithIgnoreCase(url, "http://")) url[7..] else return null;
-    // a backslash ends the host as a slash does (the browser reads it so)
-    const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#\\") orelse rest.len];
-    const host = authority[if (std.mem.lastIndexOfScalar(u8, authority, '@')) |i| i + 1 else 0..];
-    if (host.len == 0) return null;
-    return .{ .https = https, .host = host };
-}
-
-/// The host name of an http(s) `url`, lowercase, without user info or
-/// port; null unless it is made of letters, digits, dots and dashes only
-/// (it goes into the browser's host rules).
-pub fn urlHostname(arena: Allocator, url: []const u8) !?[]const u8 {
-    var host = (urlHostPort(url) orelse return null).host;
-    if (std.mem.lastIndexOfScalar(u8, host, ':')) |i| host = host[0..i];
-    if (host.len == 0) return null;
-    for (host) |c| if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-')) return null;
-    return try std.ascii.allocLowerString(arena, host);
-}
-
 /// Settings harness needs in a browser `profile`, written to its
 /// Default/Preferences before the browser starts (whatever else is there
 /// stays): Chrome's own password manager off (typed passwords must not end
@@ -1353,8 +1324,11 @@ fn sweepProfiles(io: Io, root: []const u8) void {
 /// returns the DOM as HTML (at most max_bytes). Ends it on `stop`
 /// (error.Stopped) or after timeout_ms (error.Timeout).
 pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url: []const u8, tmp_root: []const u8, stop: *std.atomic.Value(bool), timeout_ms: u32, max_bytes: usize, benv: BrowserEnv) ![]const u8 {
-    if (!validUrl(url)) return error.BadUrl;
-    const host = try urlHostname(arena, url) orelse return error.BadUrl;
+    // as the gate read it (url.zig): the browser goes to that host, in
+    // that form; an IPv6 one has no host rule here
+    const u = url_mod.parse(arena, url) catch |e| return if (e == error.OutOfMemory) e else error.BadUrl;
+    if (u.host[0] == '[') return error.BadUrl;
+    const host = u.host;
 
     const profile = try newProfile(io, arena, tmp_root, "harness-browser-");
     defer removeProfile(io, profile);
@@ -1370,7 +1344,7 @@ pub fn render(gpa: Allocator, io: Io, arena: Allocator, browser: []const u8, url
         try std.fmt.allocPrint(arena, "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE {s}", .{host}),
         "--virtual-time-budget=8000",
         "--dump-dom",
-        url,
+        u.href,
     });
     var vars = try benv.map(arena);
     var child = try std.process.spawn(io, .{
@@ -1913,7 +1887,10 @@ test "render_gives_the_browser_a_small_environment_and_keeps_it_on_the_host" {
     f.close(t.io);
     const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     var stop: std.atomic.Value(bool) = .init(false);
-    const out = try render(t.allocator, t.io, a, try std.fs.path.join(a, &.{ root, "show" }), "https://user@Docs.Example.com:8443/a", root, &stop, 5000, 1 << 20, .{ .path = "/usr/bin:/bin", .home = "/no/such/home" });
+    const show = try std.fs.path.join(a, &.{ root, "show" });
+    // the host is what the gate reads: a name before @ is refused, not skipped
+    try t.expectError(error.BadUrl, render(t.allocator, t.io, a, show, "https://docs.example.com@evil.example/", root, &stop, 5000, 1 << 20, .{ .path = "/usr/bin:/bin" }));
+    const out = try render(t.allocator, t.io, a, show, "https://Docs.Example.com.:8443/a", root, &stop, 5000, 1 << 20, .{ .path = "/usr/bin:/bin", .home = "/no/such/home" });
     try t.expectEqualStrings("", try otherVars(a, out, &.{ "PATH", "HOME", "LANG" }));
     try expectHas(out, "PATH=/usr/bin:/bin\n");
     try expectHas(out, "HOME=/no/such/home\n");
@@ -1922,6 +1899,8 @@ test "render_gives_the_browser_a_small_environment_and_keeps_it_on_the_host" {
     try expectHas(out, "ARG --password-store=basic\n");
     // no other host than the one the gate allowed is even looked up
     try expectHas(out, "ARG --host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE docs.example.com\n");
+    // and the browser is given the address in the form the gate saw
+    try expectHas(out, "ARG https://docs.example.com:8443/a\n");
 }
 
 test "render_keeps_downloads_off_and_inside_the_profile" {

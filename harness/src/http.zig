@@ -72,8 +72,12 @@ pub const Limits = struct {
     /// Longest wait for the connection to open and for each read to bring
     /// something.
     idle_ms: u32 = 30_000,
-    /// Longest the whole exchange may take; null: no limit.
+    /// Longest the whole exchange may take, opening the connection too;
+    /// null: no limit.
     total_ms: ?u32 = null,
+    /// Set: the exchange ends soon after it is (it fails; the caller knows
+    /// why).
+    stop: ?*const std.atomic.Value(bool) = null,
 };
 
 pub const Request = struct {
@@ -154,7 +158,10 @@ pub const Client = struct {
 
     fn open(c: *Client, limits: Limits) Error!*Conn {
         const t = c.target;
-        const handle = sock.connect(c.io, t.host, t.port, limits.idle_ms) catch |e| {
+        // the total limit counts from here: the connection's opening too
+        const started = sock.nowNs(c.io);
+        const connect_ms = if (limits.total_ms) |total| @min(limits.idle_ms, total) else limits.idle_ms;
+        const handle = sock.connectUnless(c.io, t.host, t.port, connect_ms, limits.stop) catch |e| {
             c.detail = e;
             return if (e == error.OutOfMemory) error.OutOfMemory else if (e == error.ConnectionTimedOut) error.Timeout else error.ConnectFailed;
         };
@@ -170,7 +177,8 @@ pub const Client = struct {
         conn.keep = false;
         conn.tls_client = null;
         conn.s.init(c.io, handle, mem[0..read_buf_len], mem[read_buf_len..][0..write_buf_len], limits.idle_ms);
-        conn.s.setLimits(limits.idle_ms, limits.total_ms);
+        const spent_ms: u64 = @intCast(@max(0, @divFloor(sock.nowNs(c.io) - started, std.time.ns_per_ms)));
+        conn.s.setLimits(limits.idle_ms, if (limits.total_ms) |total| @intCast(@max(1, @as(u64, total) -| spent_ms)) else null, limits.stop);
         if (t.https) {
             const plain = mem[read_buf_len + write_buf_len ..];
             if (!c.insecure and c.ca == null) {
@@ -225,7 +233,7 @@ pub const Client = struct {
             const reused = c.conn != null;
             const conn = c.conn orelse try c.open(req.limits);
             c.conn = conn;
-            if (reused) conn.s.setLimits(req.limits.idle_ms, req.limits.total_ms);
+            if (reused) conn.s.setLimits(req.limits.idle_ms, req.limits.total_ms, req.limits.stop);
             if (c.exchange(conn, req)) |resp| {
                 return resp;
             } else |e| {

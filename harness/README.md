@@ -21,7 +21,7 @@ standard library (and the system's Security framework on macOS). Models
 are reached only through [omnigate](https://github.com/Legatia/omnigate),
 which holds the provider keys and the budgets.
 
-**State: 0.3.0, tested on macOS by its own tests: 348 unit tests, among
+**State: 0.3.0, tested on macOS by its own tests: 377 unit tests (2 skipped), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 45 checks that drives the real binary against
 stand-ins for omnigate, Telegram, feeds, search and two MCP servers. An
@@ -92,7 +92,8 @@ files apply after `/reload`; harness tells you when it notices one.
 Every tool call is decided in one place, in this order:
 
 1. Hard limits no rule lifts: files only inside `workspace/` and no write
-   to a symlink, fetch only http and https.
+   to a symlink; fetch, browse and web only http and https, and no
+   address with a name before `@`.
 2. A matching `deny` line in `rules`.
 3. A grant you gave with "Allow 24 h".
 4. The first matching `allow` or `ask` line.
@@ -119,6 +120,25 @@ File rules and grants see the path inside the workspace: `./notes/a`,
 and on macOS and Windows so does `Notes/A`. A grant covers the exact
 command, path or MCP tool, or a host in any letter case. A `deny` rule
 applies to briefs.ini sources too.
+
+Rules for `fetch` and `browse` match an address by its parts: the scheme,
+the host (`*.example.com` is every name below example.com, `*` any host),
+the port (none: the scheme's own; `:*` any) and the path with its query
+(none: any). `allow fetch https://*.example.com/*` covers
+`https://docs.example.com/a`, never `https://evil.com/.example.com/`.
+`web` rules name a host the same way (`*.example.com`, `localhost:8080`).
+An `allow` rule for these must be written so, and harness names the line
+that is not; a `deny` or `ask` rule may be any pattern, matched against
+the whole address.
+
+The gate, fetch, browse and web read an address the same way. One with a
+name before `@` (`good.com@evil.com`), a backslash or a space, or a host
+with `%` or letters outside ASCII, is refused (an international name is
+written in its `xn--` form). Otherwise every spelling of a host is the
+same host: any letter case, a trailing dot, the scheme's own port, an IPv4
+address written as `0x7f.1` or `2130706433`. `.` and `..` in a path are
+resolved before the rules see it, and a path that hides one from them
+(`..%2F`, `..;`) is refused.
 
 `ask` sends you the whole call (a file's content, a skill's description
 and body too) with three buttons:
@@ -178,9 +198,12 @@ nothing from any host but the page's own and saving no downloads. It is
 offered only when a browser is found (`[browser] path`, or the usual
 install places).
 
-`fetch` follows up to 5 redirects, never from https to http; each passes
-the gate as a fetch of its own (on a host the call already reached only a
-`deny` rule stops it), and the answer says where it ended.
+`fetch` follows up to 5 redirects, never from https to http or to an
+address with a name before `@`; each passes the gate as a fetch of its own
+(on a host the call already reached only a `deny` rule stops it), and the
+answer says where it ended. `fetch`, `search`, `browse` and each `web`
+action end when the turn's time is up, redirects and all; `/stop` ends
+one under way.
 
 ## Logins
 
@@ -293,7 +316,10 @@ on.
 
 `max_per_call` and `max_per_day` are hard caps checked before you are
 asked: the server's own lines in mcp.ini, else `[money]` in config.ini
-(0: no cap). Each server has its own day total in `state/money`. With a
+(there 0: no cap). In a server's section `none` lifts config.ini's cap
+for that server, and harness says so at start and in `/status`; `0` there
+is an error (write `none`, or remove the line to use config.ini's). Each
+server has its own day total in `state/money`. With a
 cap set, a money tool that `amount =` gives no field is refused, and so is
 a call without its amount (`tool:none` moves no amount). An amount counts
 toward the day from the moment you are asked, so two runs cannot both

@@ -1,6 +1,14 @@
 //! Gate rules: one per line, `allow|ask|deny TOOL PATTERN`, `#` comments.
 //! `*` in a pattern matches any run of characters (including none).
+//!
+//! For `fetch` and `browse` a pattern is an address matched by parts (see
+//! `UrlPattern`), for `web` a host (see `HostPattern`), each against the
+//! address as url.zig reads it. An `allow` rule for them must be one;
+//! `deny` and `ask` rules may also be any other pattern, matched as a glob
+//! over the whole address: they can only stop or ask about more.
 const std = @import("std");
+const url = @import("url.zig");
+const Allocator = std.mem.Allocator;
 
 pub const Action = enum { allow, ask, deny };
 
@@ -11,7 +19,150 @@ pub const Rule = struct {
     line: usize,
 };
 
-pub const Error = error{ BadRule, OutOfMemory };
+pub const Error = error{
+    BadRule,
+    /// An allow rule for fetch or browse that is not an address pattern.
+    BadUrlRule,
+    /// An allow rule for web that is not a host pattern.
+    BadHostRule,
+    OutOfMemory,
+};
+
+/// What is wrong with a rule's line, when more can be said than that it
+/// does not read.
+pub fn reason(e: anyerror) ?[]const u8 {
+    return switch (e) {
+        error.BadUrlRule => "an allow rule for fetch or browse takes an address: scheme://host/path, the host a name, *.name or *, like https://*.example.com/*; a port, when given, is a number or *",
+        error.BadHostRule => "an allow rule for web takes a host: a name, *.name or *, like *.example.com; a port, when given, is a number or *",
+        else => null,
+    };
+}
+
+/// The host part of an address pattern, or a web rule's pattern.
+pub const HostPattern = struct {
+    host: Host,
+    port: Port,
+
+    pub const Host = union(enum) {
+        any,
+        /// Every name below this one (`*.example.com`), not itself.
+        below: []const u8,
+        exact: []const u8,
+    };
+    /// `default`: none was written, so the scheme's own (for web: an
+    /// address without a port).
+    pub const Port = union(enum) { default, any, n: u16 };
+
+    fn hostMatches(p: HostPattern, host: []const u8) bool {
+        return switch (p.host) {
+            .any => true,
+            .exact => |h| std.mem.eql(u8, h, host),
+            .below => |h| host.len > h.len + 1 and std.mem.endsWith(u8, host, h) and host[host.len - h.len - 1] == '.',
+        };
+    }
+
+    /// A web host: "host" or "host:port".
+    pub fn matches(p: HostPattern, hp: url.HostPort) bool {
+        if (!p.hostMatches(hp.host)) return false;
+        return switch (p.port) {
+            .default => hp.port == null,
+            .any => true,
+            .n => |n| hp.port == n,
+        };
+    }
+};
+
+/// A fetch or browse pattern: the scheme (a glob), the host, the port, and
+/// a glob over the path with its query, where none written is any.
+pub const UrlPattern = struct {
+    scheme: []const u8,
+    host: HostPattern,
+    target: ?[]const u8,
+
+    pub fn matches(p: UrlPattern, u: url.Url) bool {
+        if (!glob(p.scheme, u.scheme())) return false;
+        if (!p.host.hostMatches(u.host)) return false;
+        switch (p.host.port) {
+            .default => if (u.port != url.defaultPort(u.https)) return false,
+            .any => {},
+            .n => |n| if (u.port != n) return false,
+        }
+        return if (p.target) |tg| glob(tg, u.target) else true;
+    }
+};
+
+/// `text` read as a host pattern, the host in url.zig's form; null if it
+/// is not one. `*` is the whole host or its first part (`*.example.com`):
+/// anywhere else it could match a name that is not below the one meant.
+pub fn hostPattern(arena: Allocator, text: []const u8) ?HostPattern {
+    if (text.len == 0 or std.mem.indexOfScalar(u8, text, '@') != null) return null;
+    var host_text = text;
+    var port_text: ?[]const u8 = null;
+    if (text[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, text, ']') orelse return null;
+        host_text = text[0 .. close + 1];
+        const after = text[close + 1 ..];
+        if (after.len > 0) {
+            if (after[0] != ':') return null;
+            port_text = after[1..];
+        }
+    } else if (std.mem.lastIndexOfScalar(u8, text, ':')) |colon| {
+        host_text = text[0..colon];
+        port_text = text[colon + 1 ..];
+    }
+    var port: HostPattern.Port = .default;
+    if (port_text) |p| {
+        if (std.mem.eql(u8, p, "*")) {
+            port = .any;
+        } else if (p.len > 0) port = .{ .n = url.parsePort(p) catch return null };
+    }
+    const host: HostPattern.Host = if (std.mem.eql(u8, host_text, "*"))
+        .any
+    else if (std.mem.startsWith(u8, host_text, "*.")) blk: {
+        const h = url.canonicalHost(arena, host_text[2..]) catch return null;
+        // below an IP address there are no names
+        if (url.isIp(h)) return null;
+        break :blk .{ .below = h };
+    } else .{ .exact = url.canonicalHost(arena, host_text) catch return null };
+    return .{ .host = host, .port = port };
+}
+
+/// `text` read as an address pattern; null if it is not one.
+pub fn urlPattern(arena: Allocator, text: []const u8) ?UrlPattern {
+    if (std.mem.eql(u8, text, "*")) return .{ .scheme = "*", .host = .{ .host = .any, .port = .any }, .target = null };
+    const sep = std.mem.indexOf(u8, text, "://") orelse return null;
+    const scheme = std.ascii.allocLowerString(arena, text[0..sep]) catch return null;
+    for (scheme) |c| if (!(std.ascii.isLower(c) or c == '*')) return null;
+    if (!glob(scheme, "http") and !glob(scheme, "https")) return null;
+    const rest = text[sep + 3 ..];
+    // a fragment is never sent, so it is never matched
+    for (rest) |c| if (c <= ' ' or c == 0x7f or c == '\\' or c == '#') return null;
+    const end = std.mem.indexOfAny(u8, rest, "/?") orelse rest.len;
+    const host = hostPattern(arena, rest[0..end]) orelse return null;
+    const tail = rest[end..];
+    if (tail.len == 0) return .{ .scheme = scheme, .host = host, .target = null };
+    // the path as url.zig writes an address's: "/" first, %XX as there
+    const t0 = if (tail[0] == '?') std.fmt.allocPrint(arena, "/{s}", .{tail}) catch return null else tail;
+    return .{ .scheme = scheme, .host = host, .target = url.escapes(arena, t0) catch return null };
+}
+
+/// Whether a fetch or browse rule's pattern matches `address` (as url.zig
+/// writes it): by parts for an address pattern, else as a glob.
+pub fn matchUrl(arena: Allocator, pattern: []const u8, address: []const u8) bool {
+    const p = urlPattern(arena, pattern) orelse return glob(pattern, address);
+    const u = url.parse(arena, address) catch return false;
+    return p.matches(u);
+}
+
+/// Whether a web rule's pattern matches `host` ("host" or "host:port"):
+/// by parts for a host pattern (`*` alone: any host and port), else as a
+/// glob.
+pub fn matchHost(arena: Allocator, pattern: []const u8, host: []const u8) bool {
+    if (std.mem.eql(u8, pattern, "*")) return true;
+    const p = hostPattern(arena, pattern) orelse return glob(pattern, host);
+    const hp = url.hostPort(arena, host) catch return false;
+    return p.matches(hp);
+}
 
 pub fn parse(arena: std.mem.Allocator, text: []const u8) Error![]Rule {
     var out: std.ArrayList(Rule) = .empty;
@@ -28,6 +179,11 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Error![]Rule {
         // the pattern is the rest of the line, inner spaces kept
         const rest = std.mem.trim(u8, words.rest(), " \t");
         if (rest.len == 0) return error.BadRule;
+        // as one glob over an address, an allow could let another host through
+        if (action == .allow) {
+            if ((std.mem.eql(u8, tool, "fetch") or std.mem.eql(u8, tool, "browse")) and urlPattern(arena, rest) == null) return error.BadUrlRule;
+            if (std.mem.eql(u8, tool, "web") and !std.mem.eql(u8, rest, "*") and hostPattern(arena, rest) == null) return error.BadHostRule;
+        }
         try out.append(arena, .{ .action = action, .tool = tool, .pattern = rest, .line = n });
     }
     return out.items;
@@ -78,6 +234,45 @@ test "rules_parse_and_keep_spaces_in_patterns" {
     try t.expectEqualStrings("rm -rf *", rs[0].pattern);
     try t.expectError(error.BadRule, parse(arena.allocator(), "permit shell *"));
     try t.expectError(error.BadRule, parse(arena.allocator(), "allow shell"));
+}
+
+test "an_allow_rule_for_an_address_tool_must_be_one_that_matches_by_parts" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // as one glob over the address these let other hosts through
+    for ([_][]const u8{
+        "allow fetch *.good.com/*",
+        "allow fetch *good.com*",
+        "allow fetch https://good.com*",
+        "allow fetch https://*good.com/*",
+        "allow browse https://www.google.*/*",
+        "allow fetch https://192.168.1.*/*",
+        "allow fetch https://good.com@*/*",
+        "allow fetch ftp://good.com/*",
+        "allow fetch https://*.127.0.0.1/*",
+        "allow fetch https://good.com/#x",
+        "allow fetch https://bücher.de/*",
+        "allow fetch https://good.com:http/*",
+    }) |line| try t.expectError(error.BadUrlRule, parse(a, line));
+    for ([_][]const u8{ "allow web *good.com", "allow web good.com*", "allow web https://good.com/*", "allow web good.com/x", "allow web *.1.2.3.4" }) |line|
+        try t.expectError(error.BadHostRule, parse(a, line));
+    // these match by parts; deny and ask may be any pattern
+    const ok = try parse(a,
+        \\allow fetch *
+        \\allow fetch https://*.good.com/*
+        \\allow fetch http://127.0.0.1:*
+        \\allow browse *://Good.COM.:8080/api/*?key=*
+        \\allow fetch https://[::1]:8443/*
+        \\allow web *
+        \\allow web *.good.com
+        \\allow web localhost:8080
+        \\deny fetch *evil*
+        \\ask browse *.good.com/*
+        \\deny web *bad*
+    );
+    try t.expectEqual(11, ok.len);
+    try t.expect(reason(error.BadUrlRule) != null and reason(error.BadHostRule) != null and reason(error.BadRule) == null);
 }
 
 test "glob_matches_runs" {

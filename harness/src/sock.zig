@@ -37,6 +37,8 @@ pub const Socket = struct {
     idle_ms: u32,
     /// Time (`nowNs`) after which every wait fails.
     until_ns: ?i128 = null,
+    /// Set: every wait ends soon after it is (error.Stopped).
+    stop: ?*const std.atomic.Value(bool) = null,
     timed_out: bool = false,
     /// Why the last read or write failed.
     err: ?anyerror = null,
@@ -57,26 +59,25 @@ pub const Socket = struct {
     }
 
     /// Sets the limits for the request about to start.
-    pub fn setLimits(s: *Socket, idle_ms: u32, total_ms: ?u32) void {
+    pub fn setLimits(s: *Socket, idle_ms: u32, total_ms: ?u32, stop: ?*const std.atomic.Value(bool)) void {
         s.idle_ms = idle_ms;
         s.until_ns = if (total_ms) |t| nowNs(s.io) + @as(i128, t) * std.time.ns_per_ms else null;
+        s.stop = stop;
         s.timed_out = false;
         s.err = null;
     }
 
     fn wait(s: *Socket, what: Ready) !void {
-        var ms: i64 = s.idle_ms;
-        if (s.until_ns) |u| {
-            const left: i64 = @intCast(@divFloor(u - nowNs(s.io), std.time.ns_per_ms));
+        var end = nowNs(s.io) + @as(i128, s.idle_ms) * std.time.ns_per_ms;
+        if (s.until_ns) |u| end = @min(end, u);
+        while (true) {
+            const left: i64 = @intCast(@divFloor(end - nowNs(s.io), std.time.ns_per_ms));
             if (left <= 0) {
                 s.timed_out = true;
                 return error.Timeout;
             }
-            ms = @min(ms, left);
-        }
-        if (!try sys.poll(s.handle, what, @intCast(@max(ms, 1)))) {
-            s.timed_out = true;
-            return error.Timeout;
+            if (try sys.poll(s.handle, what, @intCast(@max(stopSlice(s.stop, left), 1)))) return;
+            if (stopped(s.stop)) return error.Stopped;
         }
     }
 
@@ -138,6 +139,17 @@ pub fn nowNs(io: Io) i128 {
     return Io.Clock.awake.now(io).nanoseconds;
 }
 
+/// How long one poll waits of `left` ms: with a stop flag at most 100 ms,
+/// so that a stop is noticed.
+fn stopSlice(stop: ?*const std.atomic.Value(bool), left: i64) i64 {
+    return if (stop != null) @min(left, 100) else left;
+}
+
+fn stopped(stop: ?*const std.atomic.Value(bool)) bool {
+    const f = stop orelse return false;
+    return f.load(.acquire);
+}
+
 /// Measures time from when it was started.
 pub const Timer = struct {
     io: Io,
@@ -165,6 +177,11 @@ pub fn shutdown(h: Handle) void {
 /// Opens a TCP connection to `host`, trying each of its addresses for at most
 /// `timeout_ms`. The socket returned is non-blocking.
 pub fn connect(io: Io, host: []const u8, port: u16, timeout_ms: u32) !Handle {
+    return connectUnless(io, host, port, timeout_ms, null);
+}
+
+/// `connect`, given up soon after `stop` is set (error.Stopped).
+pub fn connectUnless(io: Io, host: []const u8, port: u16, timeout_ms: u32, stop: ?*const std.atomic.Value(bool)) !Handle {
     var addrs: [16]net.IpAddress = undefined;
     const n = try resolve(io, host, port, &addrs);
     var last: anyerror = error.UnknownHostName;
@@ -174,21 +191,28 @@ pub fn connect(io: Io, host: []const u8, port: u16, timeout_ms: u32) !Handle {
             last = e;
             continue;
         };
-        if (connectOne(h, &addr, timeout_ms)) {
+        if (connectOne(io, h, &addr, timeout_ms, stop)) {
             sys.setOption(h, sys.IPPROTO_TCP, sys.TCP_NODELAY, 1) catch {};
             return h;
         } else |e| {
             last = e;
             sys.close(h);
+            if (e == error.Stopped) return e;
         }
     }
     return last;
 }
 
-fn connectOne(h: Handle, addr: *const Addr, timeout_ms: u32) !void {
+fn connectOne(io: Io, h: Handle, addr: *const Addr, timeout_ms: u32, stop: ?*const std.atomic.Value(bool)) !void {
     sys.connect(h, addr) catch |e| switch (e) {
         error.WouldBlock => {
-            if (!try sys.poll(h, .out, @intCast(@max(timeout_ms, 1)))) return error.ConnectionTimedOut;
+            const end = nowNs(io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
+            while (true) {
+                const left: i64 = @intCast(@divFloor(end - nowNs(io), std.time.ns_per_ms));
+                if (left <= 0) return error.ConnectionTimedOut;
+                if (try sys.poll(h, .out, @intCast(@max(stopSlice(stop, left), 1)))) break;
+                if (stopped(stop)) return error.Stopped;
+            }
             try sys.pendingError(h);
         },
         else => return e,

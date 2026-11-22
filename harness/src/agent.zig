@@ -312,7 +312,8 @@ pub const McpTool = struct {
     /// `amount =`), `.none` for a tool that moves no amount, `.unset` when
     /// mcp.ini does not say (refused while a cap is set).
     amount: mcp.Field = .unset,
-    /// The server's own caps (mcp.ini); null: config.ini's [money].
+    /// The server's own caps (mcp.ini); 0: none (no cap there); null:
+    /// config.ini's [money].
     max_per_call: ?u32 = null,
     max_per_day: ?u32 = null,
 };
@@ -342,6 +343,15 @@ pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, cfg: mcp.ServerConfig,
     var out: std.ArrayList(McpTool) = .empty;
     var notes: std.ArrayList(u8) = .empty;
     const capped = (cfg.max_per_call orelse caps.max_per_call) > 0 or (cfg.max_per_day orelse caps.max_per_day) > 0;
+    // a cap lifted for this server (`none`) is said where caps are looked for
+    for ([_]struct { []const u8, ?u32, u32, []const u8 }{
+        .{ "max_per_call", cfg.max_per_call, caps.max_per_call, "per call" },
+        .{ "max_per_day", cfg.max_per_day, caps.max_per_day, "per day" },
+    }) |c| if (c[1]) |own| if (own == 0) {
+        try notes.print(arena, "{s}: {s} = none: its money calls have no cap {s}", .{ cfg.name, c[0], c[3] });
+        if (c[2] > 0) try notes.print(arena, " (config.ini's {d} does not apply)", .{c[2]});
+        try notes.append(arena, '\n');
+    };
     for (s.tools()) |tl| {
         var is_money = false;
         for (cfg.money) |m| if (std.mem.eql(u8, m, tl.name)) {
@@ -941,6 +951,8 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         // the tool asks the gate itself: for each host and login it uses
         const w = r.web orelse return .{ .text = "this tool is not available here", .is_error = true };
         w.env.secrets = r.env.secrets;
+        // each action gets what is left of the turn, no more
+        w.env.deadline_s = r.deadline_s;
         const out = try w.run(a, input_json);
         // the model's input, placeholders and all: never a value
         try r.log.write(.tool, r.isPrivate(), .{ .run = r.label, .tool = name, .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text });
@@ -1059,10 +1071,12 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     return out;
 }
 
-/// The run's tool environment, with its gate for redirects.
+/// The run's tool environment, with its gate for redirects and the turn's
+/// end (fetch, search and browse get no more than what is left of it).
 fn redirectEnv(r: *Run) tools.Env {
     var env = r.env;
     env.redirect = .{ .ctx = r, .allow = redirectAllow };
+    env.deadline_s = r.deadline_s;
     return env;
 }
 
@@ -2006,6 +2020,29 @@ test "a_tool_gets_only_what_is_left_of_the_turn" {
     try t.expect(std.mem.indexOf(u8, try f.logText(), "[time limit reached]") != null);
 }
 
+test "a_fetch_and_a_web_action_get_only_what_is_left_of_the_turn" {
+    var f: Fix = undefined;
+    try f.init("allow fetch http://127.0.0.1:*\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.run.limits.turn_seconds = 1;
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/slow.html", .data = "<p>late</p>" });
+    // web is offered (a browser is named; none is started in time)
+    f.run.env.browser = "/no/such/chrome";
+    f.run.profiles_dir = try std.fs.path.join(a, &.{ f.e.dir, "profiles" });
+    try f.e.script(1, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"fetch\",\"input\":{{\"url\":\"http://127.0.0.1:{d}/page/slow.html?delay_ms=4000\"}}}},{{\"type\":\"tool_use\",\"id\":\"tu_2\",\"name\":\"web\",\"input\":{{\"action\":\"open\",\"url\":\"http://127.0.0.1:{d}/page/slow.html\"}}}}],\"stop_reason\":\"tool_use\"}}", .{ f.e.server.port, f.e.server.port }));
+    try f.e.script(2, model.textReply("never asked for"));
+    const started = Io.Clock.awake.now(t.io);
+    const r = try f.say("read it");
+    freeResult(&f.run, r);
+    try t.expect(started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2500);
+    const log = try f.logText();
+    try t.expect(std.mem.indexOf(u8, log, "the turn's time is up") != null);
+    try t.expect(std.mem.indexOf(u8, log, "no time left in this turn") != null);
+    // the web call asked nobody
+    try t.expectEqual(0, f.asked);
+}
+
 test "the_owner_is_asked_with_the_turns_deadline" {
     var f: Fix = undefined;
     try f.init("");
@@ -2796,6 +2833,34 @@ test "a_server_can_have_its_own_money_caps" {
     freeResult(&f.run, r);
     try t.expectEqual(0, f.asked);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "over the cap of 10 per call") != null);
+}
+
+test "none_in_a_servers_section_lifts_config_inis_cap_and_says_so" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.money = .{ .max_per_call = 100, .max_per_day = 200 };
+    const offer = try fakeTools(&f, s, "money = echo\namount = amount\nmax_per_call = none\nmax_per_day = none\n");
+    // for the start notes and /status
+    try t.expect(std.mem.indexOf(u8, offer.notes, "fake: max_per_call = none: its money calls have no cap per call (config.ini's 100 does not apply)\n") != null);
+    try t.expect(std.mem.indexOf(u8, offer.notes, "fake: max_per_day = none: its money calls have no cap per day (config.ini's 200 does not apply)\n") != null);
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":500}"));
+    try f.e.script(2, model.textReply("ok"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    // over config.ini's caps, and asked, not refused
+    try t.expectEqual(1, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "over the cap") == null);
+    // with no cap left, a scheduled run still moves no money there
+    f.run.scheduled = true;
+    f.run.money.scheduled = true;
+    try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"x\",\"amount\":5}"));
+    try f.e.script(4, model.textReply("ok"));
+    const r2 = try f.say("buy");
+    freeResult(&f.run, r2);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "needs max_per_call or max_per_day") != null);
 }
 
 test "each_server_keeps_its_own_day_total" {
