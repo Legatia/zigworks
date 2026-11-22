@@ -39,6 +39,9 @@ const usage =
     \\  memory [list|pin|unpin|forget ID]
     \\  snapshot list FOLDER | take FOLDER [LABEL] | changes FOLDER ID | restore FOLDER ID
     \\                             a folder's snapshots, one now, what changed, put it back
+    \\  env list | check NAME | rm NAME
+    \\                             where commands can run (environments.ini): list them,
+    \\                             try what a sandbox can reach, remove one's home
     \\  log verify                 check the action log's chain
     \\  log tail [N]               print the last N log lines (default 20)
     \\  log runs [N]               a line per run, the last N (default 20)
@@ -185,15 +188,16 @@ const App = struct {
         task,
         memory,
         snapshot,
+        env,
 
         /// Whether it needs the MCP servers and the browser: a brief is
-        /// one model call without tools, memory and snapshot commands make
-        /// none, and starting servers for them costs up to 20 s and runs
-        /// their code.
+        /// one model call without tools, memory, snapshot and env commands
+        /// make none, and starting servers for them costs up to 20 s and
+        /// runs their code.
         fn usesTools(r: Role) bool {
             return switch (r) {
                 .run, .chat, .task => true,
-                .brief, .memory, .snapshot => false,
+                .brief, .memory, .snapshot, .env => false,
             };
         }
     };
@@ -210,7 +214,7 @@ const App = struct {
                 error.BadUrl => complain("the omnigate url in config.ini ([model] url) is {s}", .{if (cfg.model.url.len == 0) "not set yet" else "not valid"}),
                 error.BadSettings => {
                     const paths = core_mod.Paths.init(app.arena, app.home) catch return error.Reported;
-                    const why = (core_mod.settingsProblem(app.io, app.arena, paths) catch null) orelse "a settings file has an error, or one of config.ini, rules, logins.ini, mcp.ini and folders.ini can be changed by other users (chmod 600 them)";
+                    const why = (core_mod.settingsProblem(app.io, app.arena, paths) catch null) orelse "a settings file has an error, or one of config.ini, rules, logins.ini, mcp.ini, folders.ini and environments.ini can be changed by other users (chmod 600 them)";
                     complain("{s}", .{why});
                 },
                 else => complain("can't open {s}: {s}", .{ app.home, @errorName(e) }),
@@ -273,7 +277,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "env" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -293,6 +297,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "task")) return taskCmd(app, rest);
     if (eql(cmd, "memory")) return memoryCmd(app, rest);
     if (eql(cmd, "snapshot")) return snapshotCmd(app, rest);
+    if (eql(cmd, "env")) return envCmd(app, rest);
     if (eql(cmd, "log")) return logCmd(app, rest);
     if (eql(cmd, "health")) return healthCmd(app);
     complain("unknown command {s}; see harness help", .{cmd});
@@ -1048,6 +1053,27 @@ fn snapshotCmd(app: *App, args: []const []const u8) !Exit {
     return .ok;
 }
 
+const env_usage = "usage: harness env list | env check NAME | env rm NAME";
+
+fn envArgsOk(rest: []const []const u8) bool {
+    if (rest.len == 1) return eql(rest[0], "list");
+    if (rest.len == 2) return eql(rest[0], "check") or eql(rest[0], "rm");
+    return false;
+}
+
+/// `harness env ...`: the chat's /envs and /env commands, as `harness memory`.
+fn envCmd(app: *App, args: []const []const u8) !Exit {
+    if (!envArgsOk(args)) {
+        complain(env_usage, .{});
+        return .usage;
+    }
+    const text = if (eql(args[0], "list")) "/envs" else try std.fmt.allocPrint(app.arena, "/env {s} {s}", .{ args[0], args[1] });
+    const c = try app.open(.env);
+    defer c.close();
+    try outPrint(app.io, "{s}\n", .{try c.command(app.arena, text)});
+    return .ok;
+}
+
 fn logCmd(app: *App, args: []const []const u8) !Exit {
     const p = try core_mod.Paths.init(app.arena, app.home);
     if (args.len >= 1 and eql(args[0], "verify")) {
@@ -1409,6 +1435,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     }
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
+    if (eql(cmd, "env")) return if (envArgsOk(rest)) null else env_usage;
     if (eql(cmd, "login")) {
         if (rest.len == 0) return login_usage;
         if (eql(rest[0], "list") and rest.len != 1) return login_usage;
@@ -1756,6 +1783,8 @@ test {
     _ = @import("conversations.zig");
     _ = @import("session.zig");
     _ = @import("folders.zig");
+    _ = @import("environments.zig");
+    _ = @import("sandbox.zig");
     _ = @import("snapshots.zig");
     _ = @import("sock.zig");
     _ = @import("store.zig");

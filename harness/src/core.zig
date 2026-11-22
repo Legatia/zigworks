@@ -26,6 +26,8 @@ const conversations = @import("conversations.zig");
 const jv = @import("jv.zig");
 const session = @import("session.zig");
 const folders_mod = @import("folders.zig");
+const environments_mod = @import("environments.zig");
+const sandbox = @import("sandbox.zig");
 const snapshots_mod = @import("snapshots.zig");
 const Io = std.Io;
 
@@ -61,6 +63,10 @@ pub const Paths = struct {
     folders: []const u8,
     /// Snapshots of folders: the store.
     snapshots: []const u8,
+    /// Where commands run: sandboxes and remotes.
+    environments: []const u8,
+    /// Each environment's own folder (its home, key, Windows ACEs).
+    env_dir: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -99,6 +105,8 @@ pub const Paths = struct {
             .conversations = try j(a, &.{ state, "conversations" }),
             .folders = try j(a, &.{ home, "folders.ini" }),
             .snapshots = try j(a, &.{ home, "snapshots" }),
+            .environments = try j(a, &.{ home, "environments.ini" }),
+            .env_dir = try j(a, &.{ state, "env" }),
         };
     }
 };
@@ -116,7 +124,7 @@ pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
             try d.setPermissions(io, .fromMode(0o700));
         }
     }
-    const files = [_][2][]const u8{ .{ p.config, config.defaults_ini }, .{ p.rules, config.rules_example }, .{ p.briefs, config.briefs_example }, .{ p.tasks, config.tasks_example }, .{ p.folders, folders_mod.example } };
+    const files = [_][2][]const u8{ .{ p.config, config.defaults_ini }, .{ p.rules, config.rules_example }, .{ p.briefs, config.briefs_example }, .{ p.tasks, config.tasks_example }, .{ p.folders, folders_mod.example }, .{ p.environments, environments_mod.example } };
     for (files) |f| {
         var file = Io.Dir.cwd().createFile(io, f[0], .{ .exclusive = true, .permissions = util.private_file }) catch |e| switch (e) {
             error.PathAlreadyExists => continue,
@@ -303,6 +311,9 @@ pub const Core = struct {
     rule_list: []const rules.Rule,
     /// folders.ini; the gate gets it when it has a section.
     folder_list: folders_mod.Folders,
+    /// environments.ini: read and checked; runs use `host` until the gate
+    /// knows environments.
+    env_list: environments_mod.Environments = .{},
     briefs: []const config.Brief,
     tasks: []const config.Task,
     settings_hash: [32]u8,
@@ -676,12 +687,12 @@ pub const Core = struct {
     // ---- settings ----
 
     /// The settings files, in this order; a change to any of them is noticed.
-    fn settingsFiles(c: *const Core) [7][]const u8 {
-        return .{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins, c.paths.mcp, c.paths.folders };
+    fn settingsFiles(c: *const Core) [8][]const u8 {
+        return .{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins, c.paths.mcp, c.paths.folders, c.paths.environments };
     }
 
-    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![7][]const u8 {
-        var out: [7][]const u8 = undefined;
+    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![8][]const u8 {
+        var out: [8][]const u8 = undefined;
         for (c.settingsFiles(), 0..) |p, i| {
             out[i] = Io.Dir.cwd().readFileAlloc(c.io, p, a, .limited(1 << 20)) catch |e| switch (e) {
                 error.FileNotFound => "",
@@ -691,7 +702,7 @@ pub const Core = struct {
         return out;
     }
 
-    fn hashSettings(texts: [7][]const u8) [32]u8 {
+    fn hashSettings(texts: [8][]const u8) [32]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
         for (texts) |tx| {
             h.update(tx);
@@ -714,6 +725,7 @@ pub const Core = struct {
         c.tasks = config.parseTasks(a, texts[3]) catch return error.BadSettings;
         c.login_list = logins.parse(a, texts[4]) catch return error.BadSettings;
         c.folder_list = folders_mod.parse(a, texts[6]) catch return error.BadSettings;
+        c.env_list = environments_mod.parse(a, texts[7]) catch return error.BadSettings;
         c.settings_hash = hashSettings(texts);
     }
 
@@ -741,6 +753,7 @@ pub const Core = struct {
         const saved_tasks = c.tasks;
         const saved_logins = c.login_list;
         const saved_folders = c.folder_list;
+        const saved_envs = c.env_list;
         const saved_hash = c.settings_hash;
         c.loadSettings(fresh.allocator()) catch {
             fresh.deinit();
@@ -750,6 +763,7 @@ pub const Core = struct {
             c.tasks = saved_tasks;
             c.login_list = saved_logins;
             c.folder_list = saved_folders;
+            c.env_list = saved_envs;
             c.settings_hash = saved_hash;
             return c.settingsErrorReply();
         };
@@ -762,6 +776,7 @@ pub const Core = struct {
             c.tasks = saved_tasks;
             c.login_list = saved_logins;
             c.folder_list = saved_folders;
+            c.env_list = saved_envs;
             c.settings_hash = saved_hash;
             return "The model url in config.ini is not valid; nothing changed.";
         };
@@ -798,7 +813,7 @@ pub const Core = struct {
     /// The answer to a /reload the settings files refused, naming the file
     /// and line (in `problem_buf`).
     fn settingsErrorReply(c: *Core) []const u8 {
-        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, logins.ini, mcp.ini and folders.ini.";
+        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, logins.ini, mcp.ini, folders.ini and environments.ini.";
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const why = (settingsProblem(c.io, arena.allocator(), c.paths) catch return generic) orelse return generic;
@@ -2901,6 +2916,9 @@ pub const Core = struct {
         \\/snapshot FOLDER [LABEL]: one now
         \\/changes FOLDER ID: what changed since the one before
         \\/restore FOLDER ID: put the folder back as it was
+        \\/envs: where commands can run (environments.ini)
+        \\/env check NAME: what a sandbox can read, write and reach
+        \\/env rm NAME: remove an environment's home, snapshots and access
         \\/dryrun on|off: money tools are not called while on
         \\/reload: apply changed settings files
         \\/conversations: where you and the agent talk
@@ -3046,6 +3064,8 @@ pub const Core = struct {
         if (eql(u8, cmd, "/snapshot")) return c.snapshotCommand(a, rest);
         if (eql(u8, cmd, "/changes")) return c.changesCommand(a, rest);
         if (eql(u8, cmd, "/restore")) return c.restoreCommand(a, rest);
+        if (eql(u8, cmd, "/envs")) return c.envsText(a);
+        if (eql(u8, cmd, "/env")) return c.envCommand(a, rest);
         if (eql(u8, cmd, "/skills")) {
             const list = try skills.list(a, c.io, c.paths.skills);
             if (list.len == 0) return "No skills yet. The agent saves one (with your approval) when it learns how to do a kind of task.";
@@ -3342,6 +3362,109 @@ pub const Core = struct {
         return out.items;
     }
 
+    /// `/envs`: each environment, what it is, and whether it can run here.
+    fn envsText(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, "host: the workspace on this machine (built in)\n");
+        const missing = try sandbox.unavailable(c.io, a);
+        for (c.env_list.envs) |e| switch (e.kind) {
+            .sandbox => {
+                try out.print(a, "{s}: sandbox, workspace {s}, network {s}", .{ e.name, @tagName(e.workspace), if (e.network) "on" else "off" });
+                for (e.read, 0..) |r, i| try out.print(a, "{s}{s}", .{ if (i == 0) ", reads " else ", ", r });
+                try out.print(a, "; {s}\n", .{missing orelse "ready"});
+            },
+            .remote => try out.print(a, "{s}: remote {s}, port {d}{s}{s}; remotes are not built yet\n", .{ e.name, e.host, e.port, if (e.dir.len > 0) ", starts in " else "", e.dir }),
+        };
+        try out.print(a, "Default: {s}.", .{c.env_list.default});
+        for (c.env_list.pins, 0..) |p, i| try out.print(a, "{s}{s} runs in {s}", .{ if (i == 0) " Pinned: " else ", ", p.who, p.env });
+        if (c.env_list.pins.len > 0) try out.append(a, '.');
+        // said until the gate picks environments (gap 2, after phase 0)
+        if (c.env_list.envs.len > 0) try out.appendSlice(a, "\nThe agent's commands still run on host: environments are checked and can be tried with /env check, but runs don't use them yet.");
+        return out.items;
+    }
+
+    fn envCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        const use = "Use /env check NAME or /env rm NAME.";
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const op = words.next() orelse return use;
+        const name = words.next() orelse return use;
+        if (words.next() != null) return use;
+        if (std.mem.eql(u8, op, "check")) return c.envCheck(a, name);
+        if (std.mem.eql(u8, op, "rm")) return c.envRemove(a, name);
+        return use;
+    }
+
+    /// `/env check NAME`: probes inside the sandbox, each a command of its
+    /// own: what it can read and write, and whether it reaches outside.
+    fn envCheck(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        if (std.mem.eql(u8, name, "host")) return "host is this machine: commands there see what you see.";
+        const e = c.env_list.find(name) orelse return std.fmt.allocPrint(a, "No environment {s}; /envs lists them.", .{name});
+        if (e.kind != .sandbox) return std.fmt.allocPrint(a, "{s} is a remote: checking remotes is not built yet.", .{name});
+        if (try sandbox.unavailable(c.io, a)) |why| return std.fmt.allocPrint(a, "{s} can't run here: {s}.", .{ name, why });
+        var stop: std.atomic.Value(bool) = .init(false);
+        const tenv: tools.Env = .{ .gpa = c.gpa, .io = c.io, .workspace = c.workspace, .tool_output_bytes = 2048, .shell_seconds = 15, .stop = &stop, .path_var = c.path_var, .system_vars = c.system_vars };
+        const dir = try std.fs.path.join(a, &.{ c.paths.env_dir, name });
+        const req: sandbox.Request = .{
+            .env = e,
+            .command = "",
+            .workspace = c.workspace,
+            .dir = dir,
+            .path_var = c.path_var,
+            .system_vars = c.system_vars,
+            .owner_home = c.home_var,
+            .profile = try sandbox.profileName(a, c.paths.home, name),
+        };
+        const win = builtin.os.tag == .windows;
+        const probe = try std.fs.path.join(a, &.{ c.workspace, ".harness-env-check" });
+        const Probe = struct { what: []const u8, command: []const u8, want: bool };
+        const probes = [_]Probe{
+            .{ .what = "workspace: read", .command = if (win) try std.fmt.allocPrint(a, "dir /b \"{s}\" >nul", .{c.workspace}) else try std.fmt.allocPrint(a, "ls -A {s} >/dev/null", .{try shQuote(a, c.workspace)}), .want = e.workspace != .none },
+            .{ .what = "workspace: write", .command = if (win) try std.fmt.allocPrint(a, "echo probe> \"{s}\" && del \"{s}\"", .{ probe, probe }) else try std.fmt.allocPrint(a, ": > {s} && rm {s}", .{ try shQuote(a, probe), try shQuote(a, probe) }), .want = e.workspace == .rw },
+            .{ .what = "the data folder: read", .command = if (win) try std.fmt.allocPrint(a, "type \"{s}\" >nul", .{c.paths.config}) else try std.fmt.allocPrint(a, "cat {s} >/dev/null", .{try shQuote(a, c.paths.config)}), .want = false },
+            .{ .what = "your home: read", .command = if (win) try std.fmt.allocPrint(a, "dir /b \"{s}\" >nul", .{c.home_var}) else try std.fmt.allocPrint(a, "ls -A {s} >/dev/null", .{try shQuote(a, c.home_var)}), .want = false },
+            .{ .what = "outside (example.com)", .command = if (win) "curl.exe -s -m 8 -o NUL https://example.com" else "curl -s -m 8 -o /dev/null https://example.com", .want = e.network },
+        };
+        var out: std.ArrayList(u8) = .empty;
+        try out.print(a, "{s} ({s}):\n", .{ name, if (win) "AppContainer" else "bubblewrap" });
+        var odd: u32 = 0;
+        for (probes) |p| {
+            if (p.what[0] == 'y' and c.home_var.len == 0) continue;
+            var r = req;
+            r.command = p.command;
+            const o = sandbox.run(tenv, a, r) catch |err| {
+                try out.print(a, "{s}: not tried ({s})\n", .{ p.what, @errorName(err) });
+                continue;
+            };
+            const yes = !o.is_error;
+            if (yes != p.want) odd += 1;
+            try out.print(a, "{s}: {s}{s}\n", .{ p.what, if (yes) "yes" else "no", if (yes != p.want) " (not what environments.ini says)" else "" });
+        }
+        if (odd == 0) try out.appendSlice(a, "As environments.ini says.") else try out.print(a, "{d} not as environments.ini says (outside: is this machine online?).", .{odd});
+        return out.items;
+    }
+
+    /// `/env rm NAME`: its home, its snapshots and what it was given
+    /// (Windows: its AppContainer and ACEs). Refused while a run is going.
+    fn envRemove(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        if (std.mem.eql(u8, name, "host")) return "host is built in: there is nothing to remove.";
+        if (!rules.envName(name)) return "An environment's name is a-z, 0-9, - and _.";
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
+        c.queue_mutex.lockUncancelable(c.io);
+        defer c.queue_mutex.unlock(c.io);
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire))
+            return "Not now: a run is going. Send /env rm again when nothing is running.";
+        const dir = try std.fs.path.join(a, &.{ c.paths.env_dir, name });
+        sandbox.remove(c.io, a, dir, try sandbox.profileName(a, c.paths.home, name)) catch |e| return std.fmt.allocPrint(a, "Not removed: {s}.", .{@errorName(e)});
+        const dropped = c.snaps.drop(a, try std.fmt.allocPrint(a, "env:{s}", .{name})) catch 0;
+        if (dropped > 0) _ = c.snaps.prune(a, c.folderRoles()) catch {};
+        try c.log.write(.config, false, .{ .event = "env removed", .name = name, .snapshots = dropped });
+        const plural = if (dropped == 1) "" else "s";
+        const access = if (builtin.os.tag == .windows) " and its AppContainer with its access" else "";
+        const still = if (c.env_list.find(name) != null) " It is still in environments.ini: take its section out, then /reload." else "";
+        return std.fmt.allocPrint(a, "Removed {s}: its home, {d} snapshot{s}{s}.{s}", .{ name, dropped, plural, access, still });
+    }
+
     /// One line per login: what is stored for it (never the values).
     pub fn loginsText(c: *Core, a: std.mem.Allocator) ![]const u8 {
         if (c.login_list.len == 0) return "No logins. Add one with: harness login add NAME --site HOST --username U";
@@ -3487,11 +3610,20 @@ fn insertInSection(a: std.mem.Allocator, text: []const u8, name: []const u8, lin
     return out.items;
 }
 
+/// `s` as one word for a POSIX shell: in single quotes, a quote as '\''.
+fn shQuote(a: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '\'');
+    for (s) |ch| if (ch == '\'') try out.appendSlice(a, "'\\''") else try out.append(a, ch);
+    try out.append(a, '\'');
+    return out.items;
+}
+
 /// The settings files other users must not be able to change: they decide
 /// what runs (rules, MCP servers' commands, roles on folders) and where
 /// values are typed.
-pub fn guardedFiles(p: Paths) [5][]const u8 {
-    return .{ p.config, p.rules, p.logins, p.mcp, p.folders };
+pub fn guardedFiles(p: Paths) [6][]const u8 {
+    return .{ p.config, p.rules, p.logins, p.mcp, p.folders, p.environments };
 }
 
 /// What is wrong with the settings files, said so the owner can fix it:
@@ -3502,7 +3634,7 @@ pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
         for (guardedFiles(p)) |path| {
             const st = Io.Dir.cwd().statFile(io, path, .{}) catch continue;
             if (st.permissions.toMode() & 0o022 != 0)
-                return try std.fmt.allocPrint(a, "{s} can be changed by other users; run chmod 600 {s} (config.ini, rules, logins.ini and mcp.ini must be writable only by you, and folders.ini too)", .{ path, path });
+                return try std.fmt.allocPrint(a, "{s} can be changed by other users; run chmod 600 {s} (config.ini, rules, logins.ini and mcp.ini must be writable only by you, and folders.ini and environments.ini too)", .{ path, path });
         }
     }
     inline for (.{
@@ -3512,6 +3644,7 @@ pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
         .{ p.tasks, config.parseTasks },
         .{ p.logins, logins.parse },
         .{ p.folders, folders_mod.parse },
+        .{ p.environments, environments_mod.parse },
     }) |item| {
         const text = Io.Dir.cwd().readFileAlloc(io, item[0], a, .limited(1 << 20)) catch |e| switch (e) {
             error.FileNotFound => "",
@@ -3537,7 +3670,7 @@ pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, co
     for (0..n) |_| line = it.next() orelse "";
     // what the parser says of that line (the lines up to it are fine)
     _ = scratch.reset(.retain_capacity);
-    const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e) orelse folders_mod.reason(e);
+    const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e) orelse folders_mod.reason(e) orelse environments_mod.reason(e);
     return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
 }
 
@@ -6370,6 +6503,45 @@ test "folders_ini_is_guarded_watched_and_applied_on_reload" {
     try t.expect(std.mem.indexOf(u8, try f.core.reload(), "folders.ini line 2 has an error") != null);
     // the roles from before stay
     try t.expectEqualStrings("[notes] write = agent:coder\n", try f.core.command(a, "/folders"));
+}
+
+test "environments_ini_is_guarded_watched_and_applied_on_reload" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // init wrote one with comments only: host alone
+    try t.expect(std.mem.indexOf(u8, try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.environments, a, .unlimited), "; [box]") != null);
+    try t.expectEqualStrings("host: the workspace on this machine (built in)\nDefault: host.", try f.core.command(a, "/envs"));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[box]\nkind = sandbox\nworkspace = ro\n[use]\nschedule = box\n" });
+    // a change is noticed, and applies on /reload
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try f.rec.waitFor("not applied until you send /reload");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const listed = try f.core.command(a, "/envs");
+    try t.expect(std.mem.indexOf(u8, listed, "box: sandbox, workspace ro, network off") != null);
+    try t.expect(std.mem.indexOf(u8, listed, "Pinned: schedule runs in box.") != null);
+    if (builtin.os.tag != .windows) {
+        try Io.Dir.cwd().setFilePermissions(t.io, f.core.paths.environments, .fromMode(0o666), .{});
+        try t.expect(std.mem.indexOf(u8, try f.core.reload(), "environments.ini can be changed by other users") != null);
+        try Io.Dir.cwd().setFilePermissions(t.io, f.core.paths.environments, .fromMode(0o600), .{});
+    }
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[box]\nkind = sandbox\nnetwork = maybe\n" });
+    const bad = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, bad, "environments.ini line 3 has an error: network = maybe (network = off or on)") != null);
+    // what was there before stays
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/envs"), "workspace ro") != null);
+    // /env rm takes its home away
+    const home = try std.fs.path.join(a, &.{ f.core.paths.env_dir, "box", "home" });
+    try Io.Dir.cwd().createDirPath(t.io, home);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ home, "kept.txt" }), .data = "x" });
+    const removed = try f.core.command(a, "/env rm box");
+    try t.expect(std.mem.startsWith(u8, removed, "Removed box: its home, 0 snapshots"));
+    try t.expect(std.mem.indexOf(u8, removed, "still in environments.ini") != null);
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, home, .{}));
+    try t.expectEqualStrings("host is built in: there is nothing to remove.", try f.core.command(a, "/env rm host"));
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, "/env check nobox"), "No environment nobox"));
 }
 
 test "access_says_what_a_who_may_read_write_and_run" {

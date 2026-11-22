@@ -486,6 +486,19 @@ pub const Store = struct {
         return out;
     }
 
+    /// Deletes every snapshot of `name` (an environment that was removed);
+    /// prune then deletes the objects nothing names any more. How many went.
+    pub fn drop(s: *Store, arena: std.mem.Allocator, name: []const u8) !usize {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        const fdir = try s.folderDir(arena, name);
+        const known = try s.ids(arena, fdir);
+        for (known) |id| s.deleteSnapshot(arena, fdir, id);
+        Io.Dir.cwd().deleteTree(s.io, fdir) catch {};
+        if (known.len > 0) s.logLine(.{ .event = "drop", .folder = name, .snapshots = known.len });
+        return known.len;
+    }
+
     /// `name: none (why)` lines for the folders whose last snapshot was
     /// refused.
     pub fn note(s: *Store, arena: std.mem.Allocator) ![]const u8 {
