@@ -34,6 +34,9 @@ pub const Reach = struct { agent: bool = false, chain: bool = false, by: bool = 
 
 pub fn reach(pattern: []const u8, w: Who) Reach {
     if (!eql(kindOf(pattern), "agent")) return .{ .by = matchesBy(pattern, w.by) };
+    // a call with no definition (a trigger's poll, an app's own act) is
+    // no definition's: no agent: pattern reaches it
+    if (w.agent.len == 0) return .{};
     var r: Reach = .{ .agent = matchesAgent(pattern, w.agent) };
     var p = w.parent;
     while (p) |x| : (p = x.parent) if (matchesAgent(pattern, x.agent)) {
@@ -167,4 +170,13 @@ test "runs_nobody_watches" {
         try t.expect(!(Who{ .by = by }).unattended());
     // a task named as 0.3 allowed is still reached by the kind alone
     try t.expect(matchesBy("schedule", "schedule:weekly review"));
+}
+
+test "a_call_with_no_definition_matches_no_agent_pattern" {
+    // a trigger's poll, an app's own act: no definition's
+    const poll: Who = .{ .agent = "", .by = "trigger:btc" };
+    try t.expectEqual(Reach{}, reach("agent:*", poll));
+    try t.expectEqual(Reach{}, reach("agent", poll));
+    try t.expectEqual(Reach{ .by = true }, reach("trigger:btc", poll));
+    try t.expectEqual(Reach{ .by = true }, reach("trigger", poll));
 }

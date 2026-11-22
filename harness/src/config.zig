@@ -580,6 +580,29 @@ pub const briefs_example =
     \\
 ;
 
+pub const triggers_example =
+    \\; Triggers: an event source with a filter; a match starts a run (do),
+    \\; says a line without the model (say), or starts a workflow (start).
+    \\; A section's keys give its kind: feed = URL, search = WORDS,
+    \\; page = URL (json = PATH for a value), file = FOLDER/PATTERN,
+    \\; mcp = SERVER resource URI or SERVER/TOOL {"json": "input"} (key = FIELD);
+    \\; every or at alone is a schedule, topic lines a brief.
+    \\; Then: every (feed 1h, search 6h, page 1h, file 1m, mcp 15m) or at
+    \\; (+ days); match = FIELD OP VALUE (each must hold), skip = FIELD OP
+    \\; VALUE; check = a yes/no question for the model; one of do, say
+    \\; ({field} filled in) and start = workflow NAME; agent, tools, to,
+    \\; max_runs (6 an hour), max_events (20 a run), checks_per_day (50).
+    \\; A first poll only marks what is there. README: Triggers.
+    \\;
+    \\; [btc]
+    \\; page = https://api.coinbase.com/v2/prices/BTC-USD/spot
+    \\; json = data.amount
+    \\; every = 5m
+    \\; match = move > 3
+    \\; say = BTC {value} ({change}% since the last message)
+    \\
+;
+
 pub const tasks_example =
     \\; Scheduled tasks: the agent runs `do` at a time (`at`, optional `days`)
     \\; or every N minutes (`every = 15m`, at least 5m). Its answer is sent to

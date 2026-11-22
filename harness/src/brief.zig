@@ -170,7 +170,7 @@ fn fetchFeed(r: *agent.Run, arena: std.mem.Allocator, url: []const u8, why: *[]c
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        break :blk r.gate.decide(arena, .fetch, url, util.nowSeconds(r.io), .{ .scheduled = true, .brief_source = true, .who = r.who });
+        break :blk r.gate.decide(arena, .fetch, url, util.nowSeconds(r.io), .{ .scheduled = true, .listed = "briefs.ini", .who = r.who });
     };
     try r.logRun(.gate, false, .{ .tool = "fetch", .decision = @tagName(d.action), .why = d.why, .arg = url });
     if (d.action != .allow) return error.Refused;
@@ -191,7 +191,7 @@ fn searchEntries(r: *agent.Run, arena: std.mem.Allocator, q: []const u8, why: *[
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        break :blk r.gate.decide(arena, .search, q, util.nowSeconds(r.io), .{ .scheduled = true, .brief_source = true, .who = r.who });
+        break :blk r.gate.decide(arena, .search, q, util.nowSeconds(r.io), .{ .scheduled = true, .listed = "briefs.ini", .who = r.who });
     };
     try r.logRun(.gate, false, .{ .tool = "search", .decision = @tagName(d.action), .why = d.why, .arg = q });
     if (d.action != .allow) return error.Refused;

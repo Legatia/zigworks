@@ -29,6 +29,8 @@ const folders_mod = @import("folders.zig");
 const snapshots_mod = @import("snapshots.zig");
 const agents = @import("agents.zig");
 const inbox_mod = @import("inbox.zig");
+const triggers = @import("triggers.zig");
+const tstate = @import("tstate.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -72,6 +74,10 @@ pub const Paths = struct {
     inbox: []const u8,
     /// 0.3's approval numbers: the inbox's first id, then deleted.
     approvals: []const u8,
+    /// Event triggers and schedules of their own (gap 6).
+    triggers: []const u8,
+    /// Each trigger's state, `state/triggers/NAME/`.
+    triggers_state: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -115,6 +121,8 @@ pub const Paths = struct {
             .skills_state = try j(a, &.{ state, "skills" }),
             .inbox = try j(a, &.{ state, "inbox" }),
             .approvals = try j(a, &.{ state, "approvals" }),
+            .triggers = try j(a, &.{ home, "triggers.ini" }),
+            .triggers_state = try j(a, &.{ state, "triggers" }),
         };
     }
 };
@@ -139,6 +147,7 @@ pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
         .{ p.rules, config.rules_example },
         .{ p.briefs, config.briefs_example },
         .{ p.tasks, config.tasks_example },
+        .{ p.triggers, config.triggers_example },
         .{ p.folders, folders_mod.example },
         .{ try std.fs.path.join(a, &.{ p.agents, "main.md" }), agents.main_md },
         .{ try std.fs.path.join(a, &.{ p.agents, "helper.md" }), agents.helper_md },
@@ -232,6 +241,23 @@ const Context = struct {
     reset: std.atomic.Value(bool) = .init(false),
 };
 
+/// An event trigger's state as it is on disk (`state/triggers/NAME/state`),
+/// in its own arena, and what its queue holds.
+const TrigInfo = struct {
+    name: []u8,
+    arena: std.heap.ArenaAllocator,
+    state: tstate.State = .{},
+    /// Events queued and not done, and of them those not checked yet.
+    pending: u32 = 0,
+    unchecked: u32 = 0,
+};
+
+fn freeInfo(gpa: std.mem.Allocator, info: *TrigInfo) void {
+    info.arena.deinit();
+    gpa.free(info.name);
+    gpa.destroy(info);
+}
+
 /// Contexts kept at once (instances: a definition in a conversation); a
 /// new one past these drops the least used.
 const max_contexts = 16;
@@ -314,7 +340,28 @@ pub const Core = struct {
     folder_list: folders_mod.Folders,
     briefs: []const config.Brief,
     tasks: []const config.Task,
-    settings_hash: [32]u8,
+    /// Each settings file's hash as last applied (`settingsFiles` order):
+    /// a change to one is noticed.
+    settings_hashes: [8][32]u8,
+    /// triggers.ini: every section (`trig_list`), its schedules and briefs
+    /// as the task and brief code runs them. Replaced by /reload (in the
+    /// settings arena) and at once by /trigger add|rm (in `trig_arena`),
+    /// always under settings_mutex; whoever keeps one copies it.
+    trig_list: []const triggers.Trigger,
+    trig_tasks: []const config.Task,
+    trig_briefs: []const config.Brief,
+    trig_arena: std.heap.ArenaAllocator,
+    /// Guards `trig_info` and the files in state/triggers.
+    trig_mutex: Io.Mutex = .init,
+    /// Each event trigger's state as on disk, and what its queue holds.
+    trig_info: std.ArrayList(*TrigInfo) = .empty,
+    /// A poller is going (tick starts one; close waits for it).
+    polling: std.atomic.Value(bool) = .init(false),
+    /// Tests: a poll stops right after its events are queued, before its
+    /// cursor moves (a stop between the two).
+    trig_stop_after_queue: bool = false,
+    /// Schedules and triggers told that their workflow can't start yet.
+    told_workflows: std.ArrayList([]u8) = .empty,
     told_settings_changed: bool = false,
     secrets: Secrets,
     /// The stored secrets read at open. What every tool's output is
@@ -493,6 +540,15 @@ pub const Core = struct {
         c.workspace = try Io.Dir.cwd().realPathFileAlloc(io, c.paths.workspace, c.paths_arena.allocator());
         c.defs = .init(gpa, io, c.paths.agents, c.paths.agents_state);
         errdefer c.defs.deinit();
+        c.trig_arena = .init(gpa);
+        c.trig_list = &.{};
+        c.trig_tasks = &.{};
+        c.trig_briefs = &.{};
+        c.trig_mutex = .init;
+        c.trig_info = .empty;
+        c.polling = .init(false);
+        c.trig_stop_after_queue = false;
+        c.told_workflows = .empty;
         try c.loadSettings(sa);
         c.secrets = secrets;
         var sl: std.ArrayList(scrub.Secret) = .empty;
@@ -611,6 +667,7 @@ pub const Core = struct {
         c.inbox.load(c.paths.approvals) catch |e| c.log.write(.inbox, false, .{ .event = "not read", .why = @errorName(e) }) catch {};
         c.voidRunItems();
         c.loadRan();
+        c.syncTrigInfo();
         c.checkLogAgainstStatus();
         try c.log.write(.config, false, .{ .event = "start", .pid = pidNumber() });
         // the status says who holds the folder now, not who held it last
@@ -649,6 +706,11 @@ pub const Core = struct {
         c.defs.deinit();
         for (c.told_topics.items) |n| c.gpa.free(n);
         c.told_topics.deinit(c.gpa);
+        for (c.told_workflows.items) |n| c.gpa.free(n);
+        c.told_workflows.deinit(c.gpa);
+        for (c.trig_info.items) |info| freeInfo(c.gpa, info);
+        c.trig_info.deinit(c.gpa);
+        c.trig_arena.deinit();
         for (c.quick.items) |q| q.deinit(c.gpa);
         c.quick.deinit(c.gpa);
         for (c.start_edits.items) |e| c.gpa.free(e.text);
@@ -707,12 +769,12 @@ pub const Core = struct {
     // ---- settings ----
 
     /// The settings files, in this order; a change to any of them is noticed.
-    fn settingsFiles(c: *const Core) [7][]const u8 {
-        return .{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins, c.paths.mcp, c.paths.folders };
+    fn settingsFiles(c: *const Core) [8][]const u8 {
+        return .{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins, c.paths.mcp, c.paths.folders, c.paths.triggers };
     }
 
-    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![7][]const u8 {
-        var out: [7][]const u8 = undefined;
+    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![8][]const u8 {
+        var out: [8][]const u8 = undefined;
         for (c.settingsFiles(), 0..) |p, i| {
             out[i] = Io.Dir.cwd().readFileAlloc(c.io, p, a, .limited(1 << 20)) catch |e| switch (e) {
                 error.FileNotFound => "",
@@ -722,13 +784,11 @@ pub const Core = struct {
         return out;
     }
 
-    fn hashSettings(texts: [7][]const u8) [32]u8 {
-        var h = std.crypto.hash.sha2.Sha256.init(.{});
-        for (texts) |tx| {
-            h.update(tx);
-            h.update("\x00");
-        }
-        return h.finalResult();
+    /// Each settings file's hash.
+    fn hashSettings(texts: [8][]const u8) [8][32]u8 {
+        var out: [8][32]u8 = undefined;
+        for (texts, &out) |tx, *h| std.crypto.hash.sha2.Sha256.hash(tx, h, .{});
+        return out;
     }
 
     fn loadSettings(c: *Core, a: std.mem.Allocator) !void {
@@ -752,8 +812,25 @@ pub const Core = struct {
             loaded.deinit();
             return error.BadSettings;
         };
+        // triggers.ini: its names none of the others' (R1), its runs'
+        // definitions defined
+        var tdiag: triggers.Diag = .{};
+        const tlist = triggers.parse(a, texts[7], .triggers, &tdiag) catch |e| {
+            loaded.deinit();
+            return if (e == error.OutOfMemory) e else error.BadSettings;
+        };
+        const bad = (nameClash(a, tlist, c.tasks, c.briefs) catch null) != null or for (tlist) |tr| {
+            if (tr.action == .do and !loaded.has(tr.agent)) break true;
+        } else false;
+        if (bad) {
+            loaded.deinit();
+            return error.BadSettings;
+        }
+        c.trig_list = tlist;
+        c.trig_tasks = try triggers.tasksOf(a, tlist);
+        c.trig_briefs = try triggers.briefsOf(a, tlist);
         c.defs.install(loaded);
-        c.settings_hash = hashSettings(texts);
+        c.settings_hashes = hashSettings(texts);
     }
 
     /// folders.ini for the gate: none without a section, so the file
@@ -772,7 +849,7 @@ pub const Core = struct {
         c.queue_mutex.lockUncancelable(c.io);
         var queue_locked = true;
         defer if (queue_locked) c.queue_mutex.unlock(c.io);
-        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire)) return "Busy; send /reload again when nothing is running.";
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire)) return "Busy; send /reload again when nothing is running.";
         var fresh: std.heap.ArenaAllocator = .init(c.gpa);
         const saved_cfg = c.cfg;
         const saved_rules = c.rule_list;
@@ -780,7 +857,8 @@ pub const Core = struct {
         const saved_tasks = c.tasks;
         const saved_logins = c.login_list;
         const saved_folders = c.folder_list;
-        const saved_hash = c.settings_hash;
+        const saved_hashes = c.settings_hashes;
+        const saved_trig = .{ c.trig_list, c.trig_tasks, c.trig_briefs };
         c.loadSettings(fresh.allocator()) catch {
             fresh.deinit();
             c.cfg = saved_cfg;
@@ -789,7 +867,8 @@ pub const Core = struct {
             c.tasks = saved_tasks;
             c.login_list = saved_logins;
             c.folder_list = saved_folders;
-            c.settings_hash = saved_hash;
+            c.settings_hashes = saved_hashes;
+            c.trig_list, c.trig_tasks, c.trig_briefs = saved_trig;
             return c.settingsErrorReply();
         };
         // the providers and the chat's client point into the old settings:
@@ -804,7 +883,8 @@ pub const Core = struct {
             c.tasks = saved_tasks;
             c.login_list = saved_logins;
             c.folder_list = saved_folders;
-            c.settings_hash = saved_hash;
+            c.settings_hashes = saved_hashes;
+            c.trig_list, c.trig_tasks, c.trig_briefs = saved_trig;
             return "The model url in config.ini is not valid; nothing changed.";
         }
         c.chat_client.deinit();
@@ -812,6 +892,10 @@ pub const Core = struct {
         c.providers = providers.?;
         c.settings_arena.deinit();
         c.settings_arena = fresh;
+        // what an at-once change of triggers.ini held is read again above
+        c.trig_arena.deinit();
+        c.trig_arena = .init(c.gpa);
+        c.syncTrigInfo();
         c.gate.rules = c.rule_list;
         c.gate.folders = c.folderRoles();
         c.snaps.total_mb = c.cfg.limits.snapshot_mb;
@@ -841,7 +925,7 @@ pub const Core = struct {
     /// The answer to a /reload the settings files refused, naming the file
     /// and line (in `problem_buf`).
     fn settingsErrorReply(c: *Core) []const u8 {
-        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, logins.ini, mcp.ini, folders.ini and agents/.";
+        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, triggers.ini, logins.ini, mcp.ini, folders.ini and agents/.";
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const why = (settingsProblem(c.io, arena.allocator(), c.paths) catch return generic) orelse return generic;
@@ -854,7 +938,10 @@ pub const Core = struct {
         defer arena.deinit();
         const texts = c.readSettingsFiles(arena.allocator()) catch return;
         const h = hashSettings(texts);
-        if (std.mem.eql(u8, &h, &c.settings_hash) and !c.defs.changedOnDisk()) return;
+        const same = for (h, c.settings_hashes) |x, y| {
+            if (!std.mem.eql(u8, &x, &y)) break false;
+        } else true;
+        if (same and !c.defs.changedOnDisk()) return;
         c.told_settings_changed = true;
         c.log.write(.config, false, .{ .event = "settings files changed" }) catch {};
         c.say("The settings files changed. The change is not applied until you send /reload.");
@@ -3400,32 +3487,40 @@ pub const Core = struct {
         defer c.settings_mutex.unlock(c.io);
         // posts that did not get through go again when their wait is over
         c.resendDue(now_s);
+        for (c.briefs) |b| c.briefIfDue(b, now_s, false);
+        // a brief of triggers.ini can be paused (/trigger pause)
+        for (c.trig_briefs) |b| c.briefIfDue(b, now_s, true);
+        for (c.tasks) |tk| c.taskIfDue(tk, now_s);
+        for (c.trig_tasks) |tk| c.taskIfDue(tk, now_s);
+    }
+
+    /// Starts brief `b` if it is due at `now_s` and has not run today.
+    fn briefIfDue(c: *Core, b: config.Brief, now_s: i64, pausable: bool) void {
+        if (c.localMinutes(now_s) < b.at_minutes) return;
+        if (pausable and c.isPaused(b.name)) return;
+        const key = keyFor("brief", b.name);
+        if ((c.getRan(key.slice()) orelse -1) >= c.localDay(now_s)) return;
+        if (c.waitsToBeSent(key.slice())) return;
+        _ = c.startBackground(.{ .brief = b }, key.slice(), now_s);
+    }
+
+    /// Starts task `tk` (or a schedule of triggers.ini) if it is due at `now_s`.
+    fn taskIfDue(c: *Core, tk: config.Task, now_s: i64) void {
         const today = c.localDay(now_s);
-        const minutes = c.localMinutes(now_s);
-        for (c.briefs) |b| {
-            if (minutes < b.at_minutes) continue;
-            const key = keyFor("brief", b.name);
-            if ((c.getRan(key.slice()) orelse -1) >= today) continue;
-            if (c.waitsToBeSent(key.slice())) continue;
-            _ = c.startBackground(.{ .brief = b }, key.slice(), now_s);
+        const key = keyFor("task", tk.name);
+        if (c.isPaused(tk.name)) return;
+        const last = c.getRan(key.slice());
+        if (tk.every_minutes) |every| {
+            if (last) |l| if (now_s - l < @as(i64, every) * 60) return;
+        } else if (tk.at_minutes) |at| {
+            if (tk.days & (@as(u7, 1) << util.weekday(today)) == 0) return;
+            if (c.localMinutes(now_s) < at) return;
+            if (last) |l| if (c.localDay(l) >= today) return;
         }
-        const weekday = util.weekday(today);
-        for (c.tasks) |tk| {
-            const key = keyFor("task", tk.name);
-            if (c.isPaused(tk.name)) continue;
-            const last = c.getRan(key.slice());
-            if (tk.every_minutes) |every| {
-                if (last) |l| if (now_s - l < @as(i64, every) * 60) continue;
-            } else if (tk.at_minutes) |at| {
-                if (tk.days & (@as(u7, 1) << weekday) == 0) continue;
-                if (minutes < at) continue;
-                if (last) |l| if (c.localDay(l) >= today) continue;
-            }
-            if (c.waitsToBeSent(key.slice())) continue;
-            // its definition runs at most `parallel` at once
-            if (!c.helper_pool.hasRoom(c.io, tk.agent, c.defs.parallelOf(tk.agent))) continue;
-            _ = c.startBackground(.{ .task = tk }, key.slice(), now_s);
-        }
+        if (c.waitsToBeSent(key.slice())) return;
+        // its definition runs at most `parallel` at once
+        if (!c.helper_pool.hasRoom(c.io, tk.agent, c.defs.parallelOf(tk.agent))) return;
+        _ = c.startBackground(.{ .task = tk }, key.slice(), now_s);
     }
 
     /// Whether `key`'s last message did not get through: until it is
@@ -3565,8 +3660,40 @@ pub const Core = struct {
         return c.paused.contains(name);
     }
 
-    /// A brief or task to run, or a kept post to send again (its item).
-    const Job = union(enum) { brief: config.Brief, task: config.Task, resend: u64 };
+    /// A brief or task to run, a kept post to send again (its item), or a
+    /// trigger's queued events to act on (its name).
+    const Job = union(enum) { brief: config.Brief, task: config.Task, resend: u64, trigger: []const u8 };
+
+    /// A job and what it holds, copied for the thread that runs it: the
+    /// settings it came from may be replaced meanwhile (triggers.ini at once).
+    const JobBox = struct {
+        arena: std.heap.ArenaAllocator,
+        job: Job,
+
+        fn make(gpa: std.mem.Allocator, job: Job) !*JobBox {
+            const box = try gpa.create(JobBox);
+            box.arena = .init(gpa);
+            const a = box.arena.allocator();
+            box.job = switch (job) {
+                .brief => |b| .{ .brief = b.clone(a) catch |e| return box.fail(gpa, e) },
+                .task => |tk| .{ .task = tk.clone(a) catch |e| return box.fail(gpa, e) },
+                .resend => |id| .{ .resend = id },
+                .trigger => |n| .{ .trigger = a.dupe(u8, n) catch |e| return box.fail(gpa, e) },
+            };
+            return box;
+        }
+
+        fn fail(box: *JobBox, gpa: std.mem.Allocator, e: anyerror) anyerror {
+            box.arena.deinit();
+            gpa.destroy(box);
+            return e;
+        }
+
+        fn free(box: *JobBox, gpa: std.mem.Allocator) void {
+            box.arena.deinit();
+            gpa.destroy(box);
+        }
+    };
 
     const Start = enum { started, already_running, restarting, slots_taken, failed };
 
@@ -3581,38 +3708,46 @@ pub const Core = struct {
         // the chat keeps one of the slots
         const slots = @max(1, c.cfg.limits.concurrent_runs) - 1;
         if (c.bg_active.load(.acquire) >= @max(1, slots)) return .slots_taken;
-        putKey(c.gpa, &c.running, key, {}) catch return .failed;
+        const box = JobBox.make(c.gpa, job) catch return .failed;
+        putKey(c.gpa, &c.running, key, {}) catch {
+            box.free(c.gpa);
+            return .failed;
+        };
         _ = c.bg_active.fetchAdd(1, .acq_rel);
         const owned_key = c.running.getKey(key).?;
-        const th = std.Thread.spawn(.{}, background, .{ c, job, owned_key, due_s }) catch {
+        const th = std.Thread.spawn(.{}, background, .{ c, box, owned_key, due_s }) catch {
             _ = c.bg_active.fetchSub(1, .acq_rel);
             removeKey(c.gpa, &c.running, key);
+            box.free(c.gpa);
             return .failed;
         };
         th.detach();
         return .started;
     }
 
-    fn background(c: *Core, job: Job, key: []const u8, due_s: i64) void {
+    fn background(c: *Core, box: *JobBox, key: []const u8, due_s: i64) void {
         defer {
+            box.free(c.gpa);
             c.state_mutex.lockUncancelable(c.io);
             removeKey(c.gpa, &c.running, key);
             c.state_mutex.unlock(c.io);
             _ = c.bg_active.fetchSub(1, .acq_rel);
         }
+        const job = box.job;
         if (job == .resend) return c.resendItem(job.resend);
+        if (job == .trigger) return c.triggerJob(job.trigger, false);
         // the day it was due, though it may have ended after midnight
         const v: i64 = switch (job) {
             .brief => c.localDay(due_s),
             .task => due_s,
-            .resend => unreachable,
+            .resend, .trigger => unreachable,
         };
         // a run that failed or was stopped still counts for its slot, so
         // the scheduler does not start it again right away
         const outcome: Outcome = switch (job) {
             .brief => |b| c.runBriefKeeping(b, .{ .key = key, .ran = v }) catch .done,
             .task => |tk| c.runTaskKeeping(tk, .{ .key = key, .ran = v }) catch .done,
-            .resend => unreachable,
+            .resend, .trigger => unreachable,
         };
         // not run yet: due again at the next tick
         if (outcome == .later) return;
@@ -3760,6 +3895,9 @@ pub const Core = struct {
     /// runTask; an answer that did not get through is kept in `keep` (when
     /// given), to be sent again as it is: the task does not run again for it.
     fn runTaskKeeping(c: *Core, tk: config.Task, keep: ?Keep) !Outcome {
+        // a schedule of triggers.ini: a fixed line, or a workflow
+        if (tk.say.len > 0) return c.scheduleSay(tk, keep);
+        if (tk.start.len > 0) return c.scheduleStart(tk);
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -3839,6 +3977,179 @@ pub const Core = struct {
             else => try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = sched.why }),
         }
         return if (sched.outcome == .kept) .undelivered else .done;
+    }
+
+    /// A schedule's `say`: its line, `[NAME] ` in front, posted to its
+    /// `to` through the gate as a send by `schedule:NAME`, no model call;
+    /// kept as a delivery item when it did not get through.
+    fn scheduleSay(c: *Core, tk: config.Task, keep: ?Keep) !Outcome {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        // never called: a run needs a client
+        var client = try c.modelClient(c.cfg.model.model, c.cfg.model.max_tokens);
+        defer client.deinit();
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, tk.agent);
+        defer c.unregister(&flag);
+        var run = c.runIn(&client, try std.fmt.allocPrint(a, "task {s}", .{tk.name}), .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{tk.name}), .agent = tk.agent }, tk.to, &flag);
+        var sched: Sched = .{ .keep = keep };
+        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{tk.name}), .agent = tk.agent, .sched = &sched, .run = &run };
+        run.outbox = out.outbox();
+        try c.log.write(.task, false, .{ .name = tk.name, .event = "start" });
+        const got = try agent.postReply(&run, a, tk.say);
+        if (got.refused) |why| {
+            try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = why });
+            c.say(try std.fmt.allocPrint(a, "The line of {s} was not posted: {s}.", .{ tk.name, why }));
+            return .done;
+        }
+        switch (sched.outcome) {
+            .sent => try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = true }),
+            else => try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = sched.why }),
+        }
+        return if (sched.outcome == .kept) .undelivered else .done;
+    }
+
+    /// A schedule's `start = workflow NAME`: workflows aren't built yet
+    /// (gap 7), so nothing starts; the owner hears so once.
+    fn scheduleStart(c: *Core, tk: config.Task) !Outcome {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const why = "workflows aren't built yet";
+        try c.log.write(.task, false, .{ .name = tk.name, .event = "not run", .why = why, .workflow = tk.start });
+        if (c.tellOnce(&c.told_workflows, tk.name))
+            c.say(try std.fmt.allocPrint(arena.allocator(), "{s} starts workflow {s}, but workflows aren't built yet: nothing starts.", .{ tk.name, tk.start }));
+        return .done;
+    }
+
+    /// Whether `name` is new to `list` (then added): the owner is told a
+    /// thing once.
+    fn tellOnce(c: *Core, list: *std.ArrayList([]u8), name: []const u8) bool {
+        c.state_mutex.lockUncancelable(c.io);
+        defer c.state_mutex.unlock(c.io);
+        for (list.items) |n| if (std.mem.eql(u8, n, name)) return false;
+        const owned = c.gpa.dupe(u8, name) catch return false;
+        list.append(c.gpa, owned) catch {
+            c.gpa.free(owned);
+            return false;
+        };
+        return true;
+    }
+
+    // ---- triggers ----
+
+    /// `state/triggers/NAME`.
+    fn trigDir(c: *Core, a: std.mem.Allocator, name: []const u8) !tstate.Dir {
+        return .{ .io = c.io, .path = try std.fs.path.join(a, &.{ c.paths.triggers_state, name }) };
+    }
+
+    /// The state of event trigger `name`; under trig_mutex.
+    fn infoOf(c: *Core, name: []const u8) ?*TrigInfo {
+        for (c.trig_info.items) |info| if (std.mem.eql(u8, info.name, name)) return info;
+        return null;
+    }
+
+    /// Reads event trigger `name`'s state and counts its queue.
+    fn loadInfo(c: *Core, name: []const u8) !*TrigInfo {
+        const info = try c.gpa.create(TrigInfo);
+        errdefer c.gpa.destroy(info);
+        info.* = .{ .name = try c.gpa.dupe(u8, name), .arena = .init(c.gpa) };
+        errdefer {
+            info.arena.deinit();
+            c.gpa.free(info.name);
+        }
+        var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const d = try c.trigDir(sa, name);
+        info.state = try d.loadState(sa).clone(info.arena.allocator());
+        const q = d.loadQueue(sa) catch tstate.Queue{};
+        info.pending = @intCast(q.pending.len);
+        for (q.pending) |e| if (e.checked == null) {
+            info.unchecked += 1;
+        };
+        return info;
+    }
+
+    /// The event triggers' states: read for new ones, dropped for those
+    /// gone (their folders stay; /trigger rm deletes one). The caller holds
+    /// settings_mutex, or no other thread runs yet (open).
+    fn syncTrigInfo(c: *Core) void {
+        c.trig_mutex.lockUncancelable(c.io);
+        defer c.trig_mutex.unlock(c.io);
+        var i: usize = 0;
+        while (i < c.trig_info.items.len) {
+            const info = c.trig_info.items[i];
+            const still = for (c.trig_list) |tr| {
+                if (tr.isEvent() and std.mem.eql(u8, tr.name, info.name)) break true;
+            } else false;
+            if (still) {
+                i += 1;
+                continue;
+            }
+            _ = c.trig_info.orderedRemove(i);
+            freeInfo(c.gpa, info);
+        }
+        for (c.trig_list) |tr| {
+            if (!tr.isEvent() or c.infoOf(tr.name) != null) continue;
+            const info = c.loadInfo(tr.name) catch continue;
+            c.trig_info.append(c.gpa, info) catch freeInfo(c.gpa, info);
+        }
+    }
+
+    /// Writes `s` as trigger `info`'s state, then keeps it; under trig_mutex.
+    fn setState(c: *Core, info: *TrigInfo, s: tstate.State) !void {
+        var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+        defer scratch.deinit();
+        const d = try c.trigDir(scratch.allocator(), info.name);
+        try d.saveState(scratch.allocator(), s);
+        var fresh: std.heap.ArenaAllocator = .init(c.gpa);
+        const copy = s.clone(fresh.allocator()) catch |e| {
+            fresh.deinit();
+            return e;
+        };
+        info.arena.deinit();
+        info.arena = fresh;
+        info.state = copy;
+    }
+
+    /// Applies `text` as triggers.ini at once (the file was written with
+    /// it): read, checked beside tasks.ini, briefs.ini and the definitions,
+    /// then swapped in under settings_mutex (R5). Null when it applied;
+    /// else why not (in `a`), and nothing changed.
+    fn applyTriggers(c: *Core, a: std.mem.Allocator, text: []const u8) !?[]const u8 {
+        var fresh: std.heap.ArenaAllocator = .init(c.gpa);
+        var kept = false;
+        defer if (!kept) fresh.deinit();
+        const fa = fresh.allocator();
+        var d: triggers.Diag = .{};
+        const list = triggers.parse(fa, text, .triggers, &d) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.BadTrigger => return try triggers.lineProblem(a, "triggers.ini", text, d),
+        };
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
+        if (try nameClash(a, list, c.tasks, c.briefs)) |why| return why;
+        for (list) |tr| if (tr.action == .do and !c.defs.has(tr.agent)) return try undefinedAgent(a, tr);
+        const tasks = try triggers.tasksOf(fa, list);
+        const briefs = try triggers.briefsOf(fa, list);
+        c.trig_arena.deinit();
+        c.trig_arena = fresh;
+        kept = true;
+        c.trig_list = list;
+        c.trig_tasks = tasks;
+        c.trig_briefs = briefs;
+        // the watcher takes triggers.ini as it is now
+        std.crypto.hash.sha2.Sha256.hash(text, &c.settings_hashes[7], .{});
+        c.syncTrigInfo();
+        return null;
+    }
+
+    /// The action job of trigger `name` (Task 4).
+    fn triggerJob(c: *Core, name: []const u8, by_hand: bool) void {
+        _ = c;
+        _ = name;
+        _ = by_hand;
     }
 
     /// Harness's own line for a task (a limit, an error, with what it
@@ -4650,8 +4961,8 @@ fn insertInSection(a: std.mem.Allocator, text: []const u8, name: []const u8, lin
 /// The settings files other users must not be able to change: they decide
 /// what runs (rules, MCP servers' commands, roles on folders) and where
 /// values are typed.
-pub fn guardedFiles(p: Paths) [5][]const u8 {
-    return .{ p.config, p.rules, p.logins, p.mcp, p.folders };
+pub fn guardedFiles(p: Paths) [6][]const u8 {
+    return .{ p.config, p.rules, p.logins, p.mcp, p.folders, p.triggers };
 }
 
 /// What is wrong with the settings files, said so the owner can fix it:
@@ -4662,7 +4973,7 @@ pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
         for (guardedFiles(p)) |path| {
             const st = Io.Dir.cwd().statFile(io, path, .{}) catch continue;
             if (st.permissions.toMode() & 0o022 != 0)
-                return try std.fmt.allocPrint(a, "{s} can be changed by other users; run chmod 600 {s} (config.ini, rules, logins.ini and mcp.ini must be writable only by you, and folders.ini too)", .{ path, path });
+                return try std.fmt.allocPrint(a, "{s} can be changed by other users; run chmod 600 {s} (config.ini, rules, logins.ini and mcp.ini must be writable only by you, and folders.ini and triggers.ini too)", .{ path, path });
         }
     }
     inline for (.{
@@ -4686,9 +4997,33 @@ pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
     var loaded = set.read(a, &diag) catch return null;
     defer loaded.deinit();
     const tasks_text = Io.Dir.cwd().readFileAlloc(io, p.tasks, a, .limited(1 << 20)) catch "";
-    for (config.parseTasks(a, tasks_text) catch &.{}) |tk| if (!loaded.has(tk.agent))
+    const tasks = config.parseTasks(a, tasks_text) catch &.{};
+    for (tasks) |tk| if (!loaded.has(tk.agent))
         return try std.fmt.allocPrint(a, "tasks.ini: task {s} names agent {s}, which is not defined (no agents/{s}.md)", .{ tk.name, tk.agent, tk.agent });
+    // triggers.ini: a line that does not read, a name taken, a definition missing
+    const trig_text = Io.Dir.cwd().readFileAlloc(io, p.triggers, a, .limited(1 << 20)) catch "";
+    if (try triggers.problem(a, trig_text)) |why| return why;
+    var tdiag: triggers.Diag = .{};
+    const tlist = triggers.parse(a, trig_text, .triggers, &tdiag) catch return null;
+    const briefs_text = Io.Dir.cwd().readFileAlloc(io, p.briefs, a, .limited(1 << 20)) catch "";
+    if (try nameClash(a, tlist, tasks, config.parseBriefs(a, briefs_text) catch &.{})) |why| return why;
+    for (tlist) |tr| if (tr.action == .do and !loaded.has(tr.agent)) return try undefinedAgent(a, tr);
     return null;
+}
+
+/// Why triggers.ini's sections can't stand beside tasks.ini and
+/// briefs.ini: a name of theirs (R1); null when none is.
+fn nameClash(a: std.mem.Allocator, list: []const triggers.Trigger, tasks: []const config.Task, briefs: []const config.Brief) !?[]const u8 {
+    for (list) |tr| {
+        for (tasks) |tk| if (!tk.in_triggers and std.mem.eql(u8, tk.name, tr.name)) return try std.fmt.allocPrint(a, "triggers.ini: the name {s} is a task in tasks.ini", .{tr.name});
+        for (briefs) |b| if (std.mem.eql(u8, b.name, tr.name)) return try std.fmt.allocPrint(a, "triggers.ini: the name {s} is a brief in briefs.ini", .{tr.name});
+    }
+    return null;
+}
+
+/// "triggers.ini: trigger NAME names agent X, which is not defined".
+fn undefinedAgent(a: std.mem.Allocator, tr: triggers.Trigger) ![]const u8 {
+    return std.fmt.allocPrint(a, "triggers.ini: trigger {s} names agent {s}, which is not defined (no agents/{s}.md)", .{ tr.name, tr.agent, tr.agent });
 }
 
 /// "rules line 3 has an error: alow shell ls"; null when `text` reads.
@@ -9030,4 +9365,119 @@ test "a_definition_whose_provider_has_no_key_refuses_its_runs" {
     try f.rec.waitFor("The researcher could not run.");
     try t.expectEqual(2, f.e.server.modelRequests());
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), refused) != null);
+}
+
+// ---- triggers ----
+
+fn writeTriggers(f: *Fix, text: []const u8) !void {
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.triggers, .data = text, .flags = .{ .permissions = util.private_file } });
+}
+
+test "a_bad_triggers_ini_line_is_named_and_nothing_changes" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try writeTriggers(&f, "[zig]\nsearch = zig release\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expectEqual(1, f.core.trig_list.len);
+    try writeTriggers(&f, "[btc]\nevery = 1m\npage = https://api.example.com/btc\n");
+    const said = try f.core.reload();
+    if (std.mem.indexOf(u8, said, "triggers.ini line 2 has an error: every = 1m (every for a page trigger is at least 5 min)") == null) {
+        std.debug.print("got: {s}\n", .{said});
+        return error.TestUnexpectedResult;
+    }
+    // the triggers from before stay
+    try t.expectEqual(1, f.core.trig_list.len);
+    try t.expectEqualStrings("zig", f.core.trig_list[0].name);
+}
+
+test "names_are_unique_across_the_three_files" {
+    var f: Fix = undefined;
+    try f.init("", "[morning]\ntopic = Zig | https://z.org/f\n", "[check]\nevery = 5m\ndo = Check.\n[morning]\nat = 07:00\ndo = Wake up.\n");
+    defer f.deinit();
+    // a task and a brief of one name, as 0.3 allowed, still load
+    try t.expectEqual(2, f.core.tasks.len);
+    try t.expectEqual(1, f.core.briefs.len);
+    try writeTriggers(&f, "[check]\nsearch = zig\n");
+    const said = try f.core.reload();
+    if (std.mem.indexOf(u8, said, "triggers.ini: the name check is a task in tasks.ini") == null) {
+        std.debug.print("got: {s}\n", .{said});
+        return error.TestUnexpectedResult;
+    }
+    try t.expectEqual(0, f.core.trig_list.len);
+    try writeTriggers(&f, "[zig]\nsearch = zig\nagent = nobody\ndo = Look.\n");
+    try t.expect(std.mem.indexOf(u8, try f.core.reload(), "triggers.ini: trigger zig names agent nobody, which is not defined (no agents/nobody.md)") != null);
+    try t.expectEqual(0, f.core.trig_list.len);
+    // at once too
+    const a = f.e.arena.allocator();
+    try t.expect(std.mem.indexOf(u8, (try f.core.applyTriggers(a, "[morning]\nsearch = zig\n")).?, "the name morning is a task in tasks.ini") != null);
+    try t.expectEqual(0, f.core.trig_list.len);
+}
+
+test "triggers_ini_is_guarded_watched_and_applied_on_reload" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // init wrote it, with comments only
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.triggers, a, .unlimited);
+    try t.expect(std.mem.startsWith(u8, text, "; Triggers"));
+    try t.expectEqual(0, f.core.trig_list.len);
+    try writeTriggers(&f, "[zig]\nsearch = zig release\n");
+    // a change is noticed, and applies on /reload
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try f.rec.waitFor("not applied until you send /reload");
+    try t.expectEqual(0, f.core.trig_list.len);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expectEqual(1, f.core.trig_list.len);
+    // at once: the watcher takes triggers.ini as it is now, and still sees
+    // a change in another file
+    const two = "[zig]\nsearch = zig release\n[rust]\nsearch = rust release\n";
+    try writeTriggers(&f, two);
+    try t.expectEqual(null, try f.core.applyTriggers(a, two));
+    try t.expectEqual(2, f.core.trig_list.len);
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try t.expectEqual(1, f.rec.count("not applied until you send /reload"));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "deny shell rm *\n" });
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try t.expectEqual(2, f.rec.count("not applied until you send /reload"));
+    if (builtin.os.tag != .windows) {
+        try Io.Dir.cwd().setFilePermissions(t.io, f.core.paths.triggers, .fromMode(0o666), .{});
+        try t.expect(std.mem.indexOf(u8, try f.core.reload(), "triggers.ini can be changed by other users") != null);
+        try Io.Dir.cwd().setFilePermissions(t.io, f.core.paths.triggers, .fromMode(0o600), .{});
+    }
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+}
+
+test "old_task_and_brief_files_run_as_before_beside_triggers" {
+    var f: Fix = undefined;
+    try f.init("", "", "[check]\nevery = 5m\ndo = Check the price.\n");
+    defer f.deinit();
+    // a schedule of triggers.ini that says a fixed line: no model call
+    try writeTriggers(&f, "[water]\nevery = 5m\nsay = Drink water.\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expectEqual(1, f.core.tasks.len);
+    try t.expectEqual(1, f.core.trig_tasks.len);
+    try f.e.script(1, model.textReply("Price is flat."));
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    // one background slot: one at each tick
+    f.core.tick();
+    waitIdle(f.core);
+    f.core.tick();
+    waitIdle(f.core);
+    try f.rec.waitFor("[check] Price is flat.");
+    try f.rec.waitFor("[water] Drink water.");
+    try t.expectEqual(1, f.e.server.modelRequests());
+    // the scheduler's keys, as before
+    const ran = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.ran, f.e.arena.allocator(), .unlimited);
+    try t.expect(std.mem.indexOf(u8, ran, "task:check\t") != null);
+    try t.expect(std.mem.indexOf(u8, ran, "task:water\t") != null);
+    // not again within 5 minutes
+    f.core.tick();
+    waitIdle(f.core);
+    try t.expectEqual(1, f.rec.count("[water] Drink water."));
 }
