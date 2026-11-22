@@ -29,6 +29,9 @@ pub const Error = error{
     /// Letters outside ASCII in the host.
     NotAscii,
     BadPort,
+    /// A `.` or `..` in the path that some servers follow though it is
+    /// not one (`..%2F`, `..;x`).
+    HiddenDots,
     OutOfMemory,
 };
 
@@ -70,6 +73,7 @@ pub fn why(e: anyerror) []const u8 {
         error.BadHost => "its host is not a valid name or IP address",
         error.NotAscii => "its host has letters outside ASCII: write it in its xn-- form",
         error.BadPort => "its port is not a number from 1 to 65535",
+        error.HiddenDots => "its path has a .. behind an escaped slash or before a ; (like ..%2F or ..;), which some servers follow",
         else => @errorName(e),
     };
 }
@@ -275,6 +279,9 @@ fn cleanPath(arena: Allocator, raw: []const u8) Error![]const u8 {
         } else if (std.mem.eql(u8, p, "..")) {
             _ = parts.pop();
             if (last) try parts.append(arena, "");
+        } else if (hidesDots(p)) {
+            // a rule on the path would see one path and the server another
+            return error.HiddenDots;
         } else try parts.append(arena, p);
     }
     if (parts.items.len == 0) return "/";
@@ -284,6 +291,26 @@ fn cleanPath(arena: Allocator, raw: []const u8) Error![]const u8 {
         try out.appendSlice(arena, p);
     }
     return out.items;
+}
+
+/// Whether a path part (not itself `.` or `..`, escapes as `escapes` writes
+/// them) holds one that servers may read: between escaped slashes
+/// (`..%2Fadmin`, `a%5C..`), or before a path parameter (`..;x`).
+fn hidesDots(part: []const u8) bool {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (true) {
+        const end = i >= part.len;
+        const slash = !end and i + 3 <= part.len and (std.mem.eql(u8, part[i .. i + 3], "%2F") or std.mem.eql(u8, part[i .. i + 3], "%5C"));
+        if (end or slash) {
+            var piece = part[start..i];
+            if (std.mem.indexOfScalar(u8, piece, ';')) |c| piece = piece[0..c];
+            if (std.mem.eql(u8, piece, ".") or std.mem.eql(u8, piece, "..")) return true;
+            if (end) return false;
+            i += 3;
+            start = i;
+        } else i += 1;
+    }
 }
 
 // ---- tests ----
@@ -321,6 +348,9 @@ test "an_address_comes_out_in_one_form" {
         .{ "http://[2001:DB8::0:1]/", "http://[2001:db8::1]/" },
         .{ "https://XN--BCHER-KVA.de/", "https://xn--bcher-kva.de/" },
         .{ "https://my_host.example/", "https://my_host.example/" },
+        // an escaped slash or a ; without a hidden .. is kept as it is
+        .{ "https://gitlab.com/api/v4/projects/group%2fproject", "https://gitlab.com/api/v4/projects/group%2Fproject" },
+        .{ "https://a.com/x;v=1/...;y/a..b", "https://a.com/x;v=1/...;y/a..b" },
     }) |c| {
         const u = try parse(a, c[0]);
         try t.expectEqualStrings(c[1], u.href);
@@ -372,6 +402,11 @@ test "addresses_read_differently_by_different_programs_are_refused" {
         .{ "https://a.com:0/", error.BadPort },
         .{ "https://a.com:65536/", error.BadPort },
         .{ "https://a.com:-1/", error.BadPort },
+        .{ "https://a.com/p/..%2Fadmin", error.HiddenDots },
+        .{ "https://a.com/p/%2E%2E%2fadmin", error.HiddenDots },
+        .{ "https://a.com/p/a%5C..%5Cb", error.HiddenDots },
+        .{ "https://a.com/p/..;/admin", error.HiddenDots },
+        .{ "https://a.com/p/.;x/y", error.HiddenDots },
     }) |c| {
         if (parse(a, c[0])) |u| {
             std.debug.print("accepted {s} as {s}\n", .{ c[0], u.href });

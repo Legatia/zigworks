@@ -129,7 +129,8 @@ with `%` or letters outside ASCII, is refused (an international name is
 written in its `xn--` form). Otherwise every spelling of a host is the
 same host: any letter case, a trailing dot, the scheme's own port, an IPv4
 address written as `0x7f.1` or `2130706433`. `.` and `..` in a path are
-resolved before the rules see it.
+resolved before the rules see it, and a path that hides one from them
+(`..%2F`, `..;`) is refused.
 
 `ask` sends you the whole call (a file's content too) with three buttons:
 Allow once, Allow 24 h, Deny. A long one comes in several messages with

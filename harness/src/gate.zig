@@ -600,8 +600,12 @@ test "address_rules_match_by_parts_not_as_one_glob" {
     try t.expectEqual(.allow, f.act(.browse, "https://docs.example.com/guide/intro", .{}));
     for ([_][]const u8{ "https://docs.example.com/guide/../admin", "https://docs.example.com/guide/%2e%2e/admin", "https://docs.example.com/admin?/guide/" }) |u|
         try t.expectEqual(.ask, f.act(.browse, u, .{}));
+    // a .. that some servers still follow, behind an escaped slash or a ;
+    for ([_][]const u8{ "https://docs.example.com/guide/..%2Fadmin", "https://docs.example.com/guide/%2e%2e%2fadmin", "https://docs.example.com/guide/..;/admin" }) |u|
+        try t.expectEqual(.deny, f.act(.browse, u, .{}));
     // a port of * is any port; no path is any path
     try t.expectEqual(.allow, f.act(.fetch, "http://127.0.0.1:8080/page/a", .{}));
+    try t.expectEqual(.allow, f.act(.fetch, "http://127.0.0.1:8080/api/projects/group%2Fproject;v=2", .{}));
     try t.expectEqual(.ask, f.act(.fetch, "http://127.0.0.1.evil.com:8080/", .{}));
     // web: the host, and its port
     try t.expectEqual(.allow, f.act(.web, "a.good.com", .{}));
