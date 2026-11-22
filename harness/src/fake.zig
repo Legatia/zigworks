@@ -227,7 +227,11 @@ pub const Server = struct {
     /// is assigned here), at most one batch per call; sent messages and
     /// other calls are appended to `telegram/out.jsonl`, each line with the
     /// message id the call is answered with
-    /// (`{"method":"sendMessage","message_id":3,"body":{...}}`). With
+    /// (`{"method":"sendMessage","message_id":3,"body":{...}}`; a body that
+    /// is not JSON, a document's, as a string). `getMe` answers
+    /// `telegram/me.json` (default: a bot with topics on),
+    /// `createForumTopic` thread 5000 + its number (an error while
+    /// `telegram/no-topics` exists). With
     /// `telegram/fail.json` (`{"status":429,"retry_after":1,"count":N}`)
     /// the first N other calls of the server's life answer that error
     /// instead, and are not recorded.
@@ -262,6 +266,8 @@ pub const Server = struct {
                 return json(req, status, out);
             }
         }
+        if (std.mem.eql(u8, method, "createForumTopic") and s.readScript(a, &.{ "telegram", "no-topics" }) != null)
+            return json(req, .bad_request, "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: topics are not enabled in this chat\"}");
         // record everything else, with the message id it is answered with
         // (numbered under the lock, so the lines and the ids agree)
         const n = blk: {
@@ -272,10 +278,25 @@ pub const Server = struct {
             var f = try Io.Dir.cwd().createFile(s.io, op, .{ .truncate = false });
             defer f.close(s.io);
             const len = try f.length(s.io);
-            const line = try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"message_id\":{d},\"body\":{s}}}\n", .{ method, id, if (body.len > 0) body else "null" });
+            // a body that is not JSON (a document's multipart) as a string
+            const json_body = body.len > 0 and body[0] == '{';
+            const line = if (body.len == 0)
+                try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"message_id\":{d},\"body\":null}}\n", .{ method, id })
+            else if (json_body)
+                try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"message_id\":{d},\"body\":{s}}}\n", .{ method, id, body })
+            else
+                try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"message_id\":{d},\"body\":{f}}}\n", .{ method, id, std.json.fmt(body, .{}) });
             try f.writePositionalAll(s.io, line, len);
             break :blk id;
         };
+        // getMe: telegram/me.json, else a bot with topics in private chats
+        if (std.mem.eql(u8, method, "getMe")) {
+            const me = s.readScript(a, &.{ "telegram", "me.json" }) orelse "{\"id\":1,\"is_bot\":true,\"first_name\":\"harness\",\"username\":\"harness_test_bot\",\"has_topics_enabled\":true}";
+            return json(req, .ok, try std.fmt.allocPrint(a, "{{\"ok\":true,\"result\":{s}}}", .{std.mem.trim(u8, me, " \r\n")}));
+        }
+        // a new topic's thread: 5000 and its call's number
+        if (std.mem.eql(u8, method, "createForumTopic"))
+            return json(req, .ok, try std.fmt.allocPrint(a, "{{\"ok\":true,\"result\":{{\"message_thread_id\":{d},\"name\":\"topic\"}}}}", .{5000 + n}));
         const out = try std.fmt.allocPrint(a, "{{\"ok\":true,\"result\":{{\"message_id\":{d}}}}}", .{n});
         return json(req, .ok, out);
     }

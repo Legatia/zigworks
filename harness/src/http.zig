@@ -90,8 +90,34 @@ pub const Request = struct {
     key: ?[]const u8 = null,
     /// More headers, sent after the defaults.
     headers: []const std.http.Header = &.{},
+    /// What the body is.
+    content_type: []const u8 = "application/json",
     limits: Limits = .{},
 };
+
+/// One part of a multipart/form-data body: a field, or a file when it has
+/// a `filename`.
+pub const Part = struct { name: []const u8, value: []const u8, filename: ?[]const u8 = null };
+
+/// A multipart/form-data body with `boundary` between its parts (the
+/// request's content type names it). A file name loses `"`, `\` and
+/// line breaks, so it can't end its header or start another.
+pub fn multipart(a: std.mem.Allocator, boundary: []const u8, parts: []const Part) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (parts) |p| {
+        try out.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"", .{ boundary, p.name });
+        if (p.filename) |f| {
+            try out.appendSlice(a, "; filename=\"");
+            for (f) |ch| if (ch != '"' and ch != '\\' and ch != '\r' and ch != '\n') try out.append(a, ch);
+            try out.appendSlice(a, "\"\r\nContent-Type: application/octet-stream");
+        }
+        try out.appendSlice(a, "\r\n\r\n");
+        try out.appendSlice(a, p.value);
+        try out.appendSlice(a, "\r\n");
+    }
+    try out.print(a, "--{s}--\r\n", .{boundary});
+    return out.items;
+}
 
 const read_buf_len = 64 * 1024;
 const write_buf_len = 32 * 1024;
@@ -313,7 +339,7 @@ fn writeHead(w: *Io.Writer, t: Target, req: Request, user_agent: []const u8) !vo
     try w.print("\r\nUser-Agent: {s}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n", .{user_agent});
     if (req.key) |k| try w.print("Authorization: Bearer {s}\r\n", .{k});
     for (req.headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
-    if (req.body) |b| try w.print("Content-Type: application/json\r\nContent-Length: {d}\r\n", .{b.len});
+    if (req.body) |b| try w.print("Content-Type: {s}\r\nContent-Length: {d}\r\n", .{ req.content_type, b.len });
     try w.writeAll("\r\n");
 }
 
