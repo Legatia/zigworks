@@ -45,6 +45,8 @@ pub const Config = struct {
         conversation_bytes: u32 = 200000,
         concurrent_runs: u32 = 2,
         approval_seconds: u32 = 600,
+        /// Snapshots of folders, all together, at most (MiB).
+        snapshot_mb: u32 = 5120,
     };
     pub const Memory = struct {
         auto: bool = true,
@@ -339,6 +341,7 @@ pub const defaults_ini =
     \\conversation_bytes = 200000
     \\concurrent_runs = 2
     \\approval_seconds = 600
+    \\snapshot_mb = 5120                 ; snapshots of folders, all together, at most (MiB)
     \\
     \\[memory]
     \\auto = on

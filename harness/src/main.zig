@@ -36,6 +36,8 @@ const usage =
     \\  brief [NAME]               collect and print a brief now
     \\  task run NAME              run a scheduled task now and print its answer
     \\  memory [list|pin|unpin|forget ID]
+    \\  snapshot list FOLDER | take FOLDER [LABEL] | changes FOLDER ID | restore FOLDER ID
+    \\                             a folder's snapshots, one now, what changed, put it back
     \\  log verify                 check the action log's chain
     \\  log tail [N]               print the last N log lines (default 20)
     \\  health                     exit 0 if `harness run` is running and recent
@@ -179,14 +181,16 @@ const App = struct {
         brief,
         task,
         memory,
+        snapshot,
 
         /// Whether it needs the MCP servers and the browser: a brief is
-        /// one model call without tools, memory commands make none, and
-        /// starting servers for them costs up to 20 s and runs their code.
+        /// one model call without tools, memory and snapshot commands make
+        /// none, and starting servers for them costs up to 20 s and runs
+        /// their code.
         fn usesTools(r: Role) bool {
             return switch (r) {
                 .run, .chat, .task => true,
-                .brief, .memory => false,
+                .brief, .memory, .snapshot => false,
             };
         }
     };
@@ -265,7 +269,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -284,6 +288,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "brief")) return briefCmd(app, rest);
     if (eql(cmd, "task")) return taskCmd(app, rest);
     if (eql(cmd, "memory")) return memoryCmd(app, rest);
+    if (eql(cmd, "snapshot")) return snapshotCmd(app, rest);
     if (eql(cmd, "log")) return logCmd(app, rest);
     if (eql(cmd, "health")) return healthCmd(app);
     complain("unknown command {s}; see harness help", .{cmd});
@@ -921,6 +926,35 @@ fn memoryCmd(app: *App, args: []const []const u8) !Exit {
     return .ok;
 }
 
+const snapshot_usage = "usage: harness snapshot list FOLDER | take FOLDER [LABEL] | changes FOLDER ID | restore FOLDER ID";
+
+/// Whether a `harness snapshot` line has what its action takes.
+fn snapshotArgsOk(rest: []const []const u8) bool {
+    if (rest.len == 0) return false;
+    const op = rest[0];
+    if (eql(op, "list")) return rest.len == 2;
+    if (eql(op, "take")) return rest.len >= 2;
+    if (eql(op, "changes") or eql(op, "restore")) return rest.len == 3;
+    return false;
+}
+
+/// `harness snapshot ...`: the chat's snapshot commands, as `harness memory`.
+fn snapshotCmd(app: *App, args: []const []const u8) !Exit {
+    if (!snapshotArgsOk(args)) {
+        complain(snapshot_usage, .{});
+        return .usage;
+    }
+    const op = args[0];
+    const command = if (eql(op, "list")) "/snapshots" else if (eql(op, "take")) "/snapshot" else if (eql(op, "changes")) "/changes" else "/restore";
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(app.arena, command);
+    for (args[1..]) |w| try text.print(app.arena, " {s}", .{w});
+    const c = try app.open(.snapshot);
+    defer c.close();
+    try outPrint(app.io, "{s}\n", .{try c.command(app.arena, text.items)});
+    return .ok;
+}
+
 fn logCmd(app: *App, args: []const []const u8) !Exit {
     const p = try core_mod.Paths.init(app.arena, app.home);
     if (args.len >= 1 and eql(args[0], "verify")) {
@@ -1180,6 +1214,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
         return "usage: harness log verify | harness log tail [N]";
     }
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
+    if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
     if (eql(cmd, "login")) {
         if (rest.len == 0) return login_usage;
         if (eql(rest[0], "list") and rest.len != 1) return login_usage;
@@ -1544,4 +1579,23 @@ test "the_terminal_offers_only_the_answers_the_question_has" {
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("[o] allow once  [n] deny", keysLine(&buf, &.{ .{ "Allow once", "a3:once" }, .{ "Deny", "a3:deny" } }));
     try std.testing.expectEqualStrings("[o] allow once  [d] allow 24 h  [n] deny", keysLine(&buf, &.{ .{ "Allow once", "a4:once" }, .{ "Allow 24 h", "a4:day" }, .{ "Deny", "a4:deny" } }));
+}
+
+test "snapshot_arguments_are_checked" {
+    for ([_][]const []const u8{
+        &.{"snapshot"},                          &.{ "snapshot", "list" },              &.{ "snapshot", "take" },
+        &.{ "snapshot", "changes", "n" },        &.{ "snapshot", "restore", "n", "1", "x" }, &.{ "snapshot", "drop", "n" },
+        &.{ "snapshot", "list", "n", "m" },
+    }) |line| if (badArgs(line) == null) {
+        printLine("accepted:", line);
+        return error.TestUnexpectedResult;
+    };
+    for ([_][]const []const u8{
+        &.{ "snapshot", "list", "n" },       &.{ "snapshot", "take", "n" }, &.{ "snapshot", "take", "n", "a", "label" },
+        &.{ "snapshot", "changes", "n", "2" }, &.{ "snapshot", "restore", "n", "1" },
+    }) |line| if (badArgs(line)) |why| {
+        printLine("refused:", line);
+        std.debug.print("  {s}\n", .{why});
+        return error.TestUnexpectedResult;
+    };
 }

@@ -22,6 +22,7 @@ const store_mod = @import("store.zig");
 const masks = @import("masks.zig");
 const who_mod = @import("who.zig");
 const folders_mod = @import("folders.zig");
+const snapshots_mod = @import("snapshots.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -267,6 +268,8 @@ pub const Core = struct {
     /// The files the agent wrote since the owner last allowed a shell
     /// command (state/written): a command a rule or grant allows asks first.
     written: agent.Written,
+    /// Snapshots of folders (snapshots/).
+    snaps: snapshots_mod.Store,
 
     chan: ?Channel = null,
     owner: ?i64 = null,
@@ -393,6 +396,15 @@ pub const Core = struct {
         c.seen.load(io, c.paths.seen) catch {};
         c.written = .init(gpa, io, c.paths.written);
         errdefer c.written.deinit();
+        c.snaps = .{
+            .gpa = gpa,
+            .io = io,
+            .dir = c.paths.snapshots,
+            .env_root = try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "env" }),
+            .log = &c.log,
+            .total_mb = c.cfg.limits.snapshot_mb,
+        };
+        errdefer c.snaps.deinit();
         c.lock = .init;
         c.helper_pool = .{};
         c.ask_lock = .init;
@@ -451,6 +463,12 @@ pub const Core = struct {
         try c.log.write(.config, false, .{ .event = "start", .pid = pidNumber() });
         // the status says who holds the folder now, not who held it last
         c.writeStatus() catch {};
+        // objects no snapshot names, and snapshots past their folder's count
+        if (Io.Dir.cwd().statFile(io, c.paths.snapshots, .{})) |_| {
+            var scratch: std.heap.ArenaAllocator = .init(gpa);
+            defer scratch.deinit();
+            if (c.snaps.prune(scratch.allocator(), c.folderRoles())) |_| {} else |e| c.log.write(.files, false, .{ .event = "prune failed", .why = @errorName(e) }) catch {};
+        } else |_| {}
         c.mcp_arena = .init(gpa);
         c.mcp_tools = &.{};
         c.mcp_note = "";
@@ -479,6 +497,7 @@ pub const Core = struct {
         c.chat_client.deinit();
         c.seen.deinit();
         c.written.deinit();
+        c.snaps.deinit();
         c.mem.deinit();
         c.log.close();
         c.grants.deinit();
@@ -624,6 +643,7 @@ pub const Core = struct {
         c.settings_arena = fresh;
         c.gate.rules = c.rule_list;
         c.gate.folders = c.folderRoles();
+        c.snaps.total_mb = c.cfg.limits.snapshot_mb;
         c.findBrowser();
         c.told_settings_changed = false;
         // nothing runs now (reload waits for that), so servers can restart;
@@ -1174,6 +1194,7 @@ pub const Core = struct {
             .profiles_dir = c.paths.profiles,
             .masks = &c.masks,
             .written = &c.written,
+            .snaps = &c.snaps,
         };
     }
 
@@ -1959,6 +1980,10 @@ pub const Core = struct {
         \\/logins: the agent's own logins
         \\/folders: roles on workspace folders (folders.ini)
         \\/access WHO: where WHO may read, write and start commands
+        \\/snapshots [FOLDER]: a folder's snapshots
+        \\/snapshot FOLDER [LABEL]: one now
+        \\/changes FOLDER ID: what changed since the one before
+        \\/restore FOLDER ID: put the folder back as it was
         \\/dryrun on|off: money tools are not called while on
         \\/reload: apply changed settings files
     ;
@@ -1978,7 +2003,10 @@ pub const Core = struct {
         }
         if (eql(u8, cmd, "/reload")) return c.reload();
         if (eql(u8, cmd, "/status")) {
-            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.{s}{s}", .{
+            // folders that got no snapshot, and why
+            var snap_note = std.mem.trimEnd(u8, try c.snaps.note(a), "\n");
+            snap_note = try std.mem.replaceOwned(u8, a, snap_note, "\n", "; ");
+            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.{s}{s}{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
                 onOff(c.switches.auto_recall.load(.acquire)), onOff(c.switches.private.load(.acquire)),
                 onOff(c.switches.dry_run.load(.acquire)),
@@ -1986,6 +2014,8 @@ pub const Core = struct {
                 c.login_list.len,
                 if (c.mcp_note.len > 0) "\nMCP: " else "",
                 std.mem.trimEnd(u8, c.mcp_note, "\n"),
+                if (snap_note.len > 0) "\nSnapshots: " else "",
+                snap_note,
             });
         }
         if (eql(u8, cmd, "/dryrun")) {
@@ -2070,6 +2100,10 @@ pub const Core = struct {
         if (eql(u8, cmd, "/logins")) return c.loginsText(a);
         if (eql(u8, cmd, "/folders")) return folders_mod.render(c.folder_list, a);
         if (eql(u8, cmd, "/access")) return c.accessCommand(a, rest);
+        if (eql(u8, cmd, "/snapshots")) return c.snapshotsCommand(a, rest);
+        if (eql(u8, cmd, "/snapshot")) return c.snapshotCommand(a, rest);
+        if (eql(u8, cmd, "/changes")) return c.changesCommand(a, rest);
+        if (eql(u8, cmd, "/restore")) return c.restoreCommand(a, rest);
         if (eql(u8, cmd, "/skills")) {
             const list = try skills.list(a, c.io, c.paths.skills);
             if (list.len == 0) return "No skills yet. The agent saves one (with your approval) when it learns how to do a kind of task.";
@@ -2120,6 +2154,148 @@ pub const Core = struct {
         }
         const real = if (c.gate.folders) |fs| c.gate.realFolders(a, fs) else null;
         return folders_mod.accessText(c.folder_list, a, real, w, heading);
+    }
+
+    const SnapSource = union(enum) { src: snapshots_mod.Source, say: []const u8 };
+
+    /// What FOLDER names for the snapshot commands, or what to say when it
+    /// names nothing they can take.
+    fn snapSource(c: *Core, a: std.mem.Allocator, folder: []const u8) !SnapSource {
+        const src = snapshots_mod.sourceFor(a, c.io, &c.snaps, c.workspace, c.folderRoles(), folder) catch |e| return .{ .say = switch (e) {
+            error.NoSuchEnv => try std.fmt.allocPrint(a, "No environment {s}.", .{folder["env:".len..]}),
+            error.OutsideWorkspace => try std.fmt.allocPrint(a, "{s} is outside the workspace.", .{folder}),
+            else => try std.fmt.allocPrint(a, "Can't read {s}: {s}.", .{ folder, @errorName(e) }),
+        } };
+        return .{ .src = src };
+    }
+
+    /// `/snapshots [FOLDER]`: a folder's snapshots, or the folders that
+    /// have some.
+    fn snapshotsCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        if (rest.len == 0) {
+            const names = try c.snaps.names(a);
+            if (names.len == 0) return "No snapshots yet. /snapshot FOLDER takes one; a folder with snapshots = on in folders.ini gets them around the runs that change it.";
+            var out: std.ArrayList(u8) = .empty;
+            try out.appendSlice(a, "Folders with snapshots: ");
+            for (names, 0..) |n, i| try out.print(a, "{s}{s}", .{ if (i > 0) ", " else "", n });
+            try out.appendSlice(a, ". /snapshots FOLDER lists one's.");
+            return out.items;
+        }
+        const src = switch (try c.snapSource(a, rest)) {
+            .src => |x| x,
+            .say => |m| return m,
+        };
+        const infos = try c.snaps.list(a, src.name);
+        if (infos.len == 0) return std.fmt.allocPrint(a, "No snapshots of {s}.", .{src.name});
+        var out: std.ArrayList(u8) = .empty;
+        try out.print(a, "Snapshots of {s}:\n", .{src.name});
+        for (infos) |i| {
+            var tb: [20]u8 = undefined;
+            try out.print(a, "{d}  {s}  {s}", .{ i.id, util.isoTime(&tb, i.time), @tagName(i.when) });
+            if (i.run.len > 0) try out.print(a, "  {s} ({s}, {s})", .{ i.run, i.agent, i.by });
+            try out.print(a, "  {d} file{s}, {d} changed", .{ i.files, if (i.files == 1) "" else "s", i.changed });
+            if (i.label.len > 0) try out.print(a, "  \"{s}\"", .{i.label});
+            try out.append(a, '\n');
+        }
+        return out.items;
+    }
+
+    /// `/snapshot FOLDER [LABEL]`: one now.
+    fn snapshotCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const folder = words.next() orelse return "Use /snapshot FOLDER [LABEL]: a workspace folder, / for all of it, or env:NAME.";
+        const label = std.mem.trim(u8, words.rest(), " \t");
+        const src = switch (try c.snapSource(a, folder)) {
+            .src => |x| x,
+            .say => |m| return m,
+        };
+        const got = c.snaps.take(a, src, .{ .when = .hand, .label = label, .must_exist = true }) catch |e| return switch (e) {
+            error.NoSuchFolder => if (std.mem.startsWith(u8, src.name, "env:")) std.fmt.allocPrint(a, "No environment {s}.", .{src.name["env:".len..]}) else std.fmt.allocPrint(a, "No folder {s} in the workspace.", .{folder}),
+            else => std.fmt.allocPrint(a, "No snapshot of {s}: {s}.", .{ src.name, @errorName(e) }),
+        };
+        if (got.refused) |why| return std.fmt.allocPrint(a, "No snapshot of {s}: {s}.", .{ src.name, why });
+        _ = c.snaps.prune(a, c.folderRoles()) catch {};
+        return std.fmt.allocPrint(a, "Snapshot {d} of {s}: {d} file{s}, {d} changed.", .{ got.id, src.name, got.files, if (got.files == 1) "" else "s", got.changed });
+    }
+
+    /// FOLDER and ID of `/changes` and `/restore`.
+    fn folderAndId(rest: []const u8) ?struct { folder: []const u8, id: u64 } {
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const folder = words.next() orelse return null;
+        const id = std.fmt.parseInt(u64, words.next() orelse return null, 10) catch return null;
+        if (words.next() != null) return null;
+        return .{ .folder = folder, .id = id };
+    }
+
+    /// `/changes FOLDER ID`: files added, changed and removed since the
+    /// snapshot before.
+    fn changesCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        const fi = folderAndId(rest) orelse return "Use /changes FOLDER ID, an id as /snapshots FOLDER lists it.";
+        const src = switch (try c.snapSource(a, fi.folder)) {
+            .src => |x| x,
+            .say => |m| return m,
+        };
+        const ch = c.snaps.changes(a, src.name, fi.id) catch |e| return switch (e) {
+            error.NoSuchSnapshot => std.fmt.allocPrint(a, "No snapshot {d} of {s}.", .{ fi.id, src.name }),
+            else => std.fmt.allocPrint(a, "Can't read snapshot {d} of {s}: {s}.", .{ fi.id, src.name, @errorName(e) }),
+        };
+        if (ch.added.len + ch.changed.len + ch.removed.len == 0)
+            return if (ch.before) |b| std.fmt.allocPrint(a, "No changes since {d}.", .{b}) else std.fmt.allocPrint(a, "Snapshot {d} is the first of {s}, and it has no files.", .{ fi.id, src.name });
+        var out: std.ArrayList(u8) = .empty;
+        if (ch.before) |b| try out.print(a, "Since {d}: ", .{b}) else try out.appendSlice(a, "The first snapshot: ");
+        var n: usize = 0;
+        for ([_]struct { word: []const u8, names: []const []const u8 }{ .{ .word = "added", .names = ch.added }, .{ .word = "changed", .names = ch.changed }, .{ .word = "removed", .names = ch.removed } }) |part| {
+            if (part.names.len == 0) continue;
+            try out.print(a, "{s}{s} ", .{ if (n > 0) "; " else "", part.word });
+            try namesList(&out, a, part.names);
+            n += 1;
+        }
+        try out.append(a, '.');
+        return out.items;
+    }
+
+    /// `/restore FOLDER ID`: refused while a run is going; it snapshots
+    /// first, so the reply names the id that undoes it.
+    fn restoreCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        const fi = folderAndId(rest) orelse return "Use /restore FOLDER ID, an id as /snapshots FOLDER lists it.";
+        // no run may start meanwhile: the scheduler waits on
+        // settings_mutex, the chat worker on queue_mutex (as for /reload)
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
+        c.queue_mutex.lockUncancelable(c.io);
+        defer c.queue_mutex.unlock(c.io);
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire))
+            return "Not now: a run is going. Send /restore again when nothing is running.";
+        const src = switch (try c.snapSource(a, fi.folder)) {
+            .src => |x| x,
+            .say => |m| return m,
+        };
+        const r = c.snaps.restore(a, src, fi.id, .{}) catch |e| return switch (e) {
+            error.NoSuchSnapshot => std.fmt.allocPrint(a, "No snapshot {d} of {s}.", .{ fi.id, src.name }),
+            error.CannotUndo => std.fmt.allocPrint(a, "Not restored: {s} is too big to snapshot first, so a restore could not be undone.", .{src.name}),
+            else => std.fmt.allocPrint(a, "Not restored: {s}.", .{@errorName(e)}),
+        };
+        _ = c.snaps.prune(a, c.folderRoles()) catch {};
+        var out: std.ArrayList(u8) = .empty;
+        try out.print(a, "Restored {s} to {d}: ", .{ src.name, fi.id });
+        if (r.written.len + r.deleted.len == 0) try out.appendSlice(a, "nothing differed");
+        if (r.written.len > 0) {
+            try out.appendSlice(a, "wrote ");
+            try namesList(&out, a, r.written);
+        }
+        if (r.deleted.len > 0) {
+            try out.appendSlice(a, if (r.written.len > 0) "; deleted " else "deleted ");
+            try namesList(&out, a, r.deleted);
+        }
+        try out.append(a, '.');
+        if (r.failed.len > 0) {
+            try out.appendSlice(a, " Not put back: ");
+            for (r.failed[0..@min(r.failed.len, 20)], 0..) |fl, i| try out.print(a, "{s}{s} ({s})", .{ if (i > 0) ", " else "", fl.path, fl.why });
+            if (r.failed.len > 20) try out.print(a, " and {d} more", .{r.failed.len - 20});
+            try out.append(a, '.');
+        }
+        try out.print(a, " /restore {s} {d} undoes it.", .{ src.name, r.before_id });
+        return out.items;
     }
 
     /// One line per login: what is stored for it (never the values).
@@ -2232,6 +2408,12 @@ pub const Core = struct {
         return "Use /task add, /task rm NAME or /task resume NAME.";
     }
 };
+
+/// "a, b and 3 more": the first 20 names.
+fn namesList(out: *std.ArrayList(u8), a: std.mem.Allocator, names: []const []const u8) !void {
+    for (names[0..@min(names.len, 20)], 0..) |n, i| try out.print(a, "{s}{s}", .{ if (i > 0) ", " else "", n });
+    if (names.len > 20) try out.print(a, " and {d} more", .{names.len - 20});
+}
 
 /// Adds `line` at the end of section `name` in INI `text`.
 fn insertInSection(a: std.mem.Allocator, text: []const u8, name: []const u8, line: []const u8) ![]u8 {
@@ -4326,4 +4508,48 @@ test "access_says_what_a_who_may_read_write_and_run" {
     try t.expect(std.mem.indexOf(u8, trig, "private: run\n") != null);
     try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/access agent:main"), "/: read, write, run\n") != null);
     try t.expect(std.mem.startsWith(u8, try f.core.command(a, "/access agent:x:y"), "Use /access WHO"));
+}
+
+test "snapshots_by_hand_changes_and_restore_from_the_chat" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const notes = try std.fs.path.join(a, &.{ f.core.workspace, "notes" });
+    try Io.Dir.cwd().createDirPath(t.io, notes);
+    const a_md = try std.fs.path.join(a, &.{ notes, "a.md" });
+    const b_md = try std.fs.path.join(a, &.{ notes, "b.md" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = a_md, .data = "one" });
+    try t.expectEqualStrings("Snapshot 1 of notes: 1 file, 1 changed.", try f.core.command(a, "/snapshot notes first"));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = a_md, .data = "two" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = b_md, .data = "new" });
+    try t.expectEqualStrings("Snapshot 2 of notes: 2 files, 2 changed.", try f.core.command(a, "/snapshot notes"));
+    const list = try f.core.command(a, "/snapshots notes");
+    try t.expect(std.mem.startsWith(u8, list, "Snapshots of notes:\n1  "));
+    try t.expect(std.mem.indexOf(u8, list, "hand  1 file, 1 changed  \"first\"\n2  ") != null);
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/snapshots"), "notes") != null);
+    try t.expectEqualStrings("Since 1: added b.md; changed a.md.", try f.core.command(a, "/changes notes 2"));
+    // not while a run is going
+    f.core.busy.store(true, .release);
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/restore notes 1"), "a run is going") != null);
+    f.core.busy.store(false, .release);
+    try t.expectEqualStrings("Restored notes to 1: wrote a.md; deleted b.md. /restore notes 3 undoes it.", try f.core.command(a, "/restore notes 1"));
+    try t.expectEqualStrings("one", try Io.Dir.cwd().readFileAlloc(t.io, a_md, a, .unlimited));
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, b_md, .{}));
+    try t.expectEqualStrings("No folder nosuch in the workspace.", try f.core.command(a, "/snapshot nosuch"));
+    try t.expectEqualStrings("No snapshot 99 of notes.", try f.core.command(a, "/restore notes 99"));
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, "/changes notes x"), "Use /changes FOLDER ID"));
+}
+
+test "a_folder_too_big_for_snapshots_is_said_in_status" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const notes = try std.fs.path.join(a, &.{ f.core.workspace, "notes" });
+    try Io.Dir.cwd().createDirPath(t.io, notes);
+    for ([_][]const u8{ "a.md", "b.md" }) |name| try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ notes, name }), .data = "x" });
+    f.core.snaps.max_files = 1;
+    try t.expectEqualStrings("No snapshot of notes: over 1 files.", try f.core.command(a, "/snapshot notes"));
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/status"), "\nSnapshots: notes: none (over 1 files)") != null);
 }
