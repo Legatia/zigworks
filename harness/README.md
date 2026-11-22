@@ -22,7 +22,7 @@ standard library (and the system's Security framework on macOS). Models
 are reached only through [omnigate](https://github.com/Legatia/omnigate),
 which holds the provider keys and the budgets.
 
-**State: 0.3.0, tested on macOS by its own tests: 484 unit tests (2 skipped), among
+**State: 0.3.0, tested on macOS by its own tests: 485 unit tests (2 skipped), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 54 checks that drives the real binary against
 stand-ins for omnigate, Telegram, feeds, search and two MCP servers. An
@@ -331,7 +331,8 @@ started passes when `owner` or its schedule is listed; otherwise its
 definition and every definition that delegated it must be listed (so
 `write = agent:main` keeps its helpers out), and so must what started a
 trigger's, workflow's or app's run. `read_file` needs `read` on the path,
-`write_file` needs `write`, and `shell` needs `run` where it starts.
+and so does each file a `send` posts; `write_file` needs `write`, and
+`shell` needs `run` where it starts.
 
 The gate checks roles right after the hard limits. A refusal is final: no
 rule, grant or answer lifts it, nothing is asked, and a scheduled run

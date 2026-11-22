@@ -1341,6 +1341,9 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
         const path = jv.str(pv) orelse return refusePost(r, a, to, text, "files are workspace paths");
         const cf = gate.confined(a, r.io, r.env.workspace, path) catch
             return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "{s} is outside the workspace", .{path}));
+        // folders.ini's read role, as for read_file: final, nothing asked
+        if (r.gate.folders) |fl| if (folders_mod.allows(fl.*, a, r.gate.realFolders(a, fl), cf.rel, .read, r.who)) |why|
+            return refusePost(r, a, to, text, why);
         const data = Io.Dir.cwd().readFileAlloc(r.io, cf.path, a, .limited(max_file_bytes)) catch |e| return refusePost(r, a, to, text, switch (e) {
             error.StreamTooLong => try std.fmt.allocPrint(a, "{s} is over 20 MB", .{path}),
             else => try std.fmt.allocPrint(a, "{s} can't be read: {s}", .{ path, @errorName(e) }),

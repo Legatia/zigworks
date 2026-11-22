@@ -4564,6 +4564,35 @@ test "an_attachment_outside_the_workspace_or_holding_a_stored_secret_is_refused"
     try t.expect(std.mem.indexOf(u8, sends[sends.len - 1], "\"files\":\"flats.csv\"") != null);
 }
 
+test "a_file_in_a_folder_the_run_may_not_read_is_not_posted" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const ws = f.core.workspace;
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(a, &.{ ws, "private" }));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ ws, "private", "k.txt" }), .data = "private words\n" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ ws, "flats.csv" }), .data = "street,rooms\n" });
+    // read_file may not read private/: a post may not carry a file from it
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.folders, .data = "[private]\nread = agent:coder\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"text\":\"the notes\",\"files\":[\"private/k.txt\"]}"));
+    try f.e.script(2, model.toolReply("tu_2", "send", "{\"text\":\"Here is the list.\",\"files\":[\"flats.csv\"],\"final\":true}"));
+    try f.core.startWorker();
+    try f.core.handleText("send me the files");
+    try f.rec.waitFor("DOC flats.csv (13 bytes)");
+    try f.rec.waitIn("main", "Here is the list.");
+    // refused as read_file is: final, nothing asked, saying what to change
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused: folders.ini [private] read: agent:main is not listed") != null);
+    try t.expectEqual(0, f.rec.count("the notes"));
+    try t.expectEqual(0, f.rec.count("k.txt"));
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "private words") == null);
+    const sends = try sendLines(&f);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"event\":\"refused\"") != null);
+    try t.expect(std.mem.indexOf(u8, sends[0], "\"why\":\"folders.ini [private] read: agent:main is not listed\"") != null);
+}
+
 test "a_refused_topic_posts_to_main_with_its_name_in_front" {
     var f: Fix = undefined;
     try f.init("", "", "");
