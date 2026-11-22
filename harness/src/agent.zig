@@ -1087,6 +1087,9 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         if (tool == .money) releaseMoney(r, mt.?, reserved);
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{refused}), .is_error = true };
     }
+    // what it may change is kept first, once a run (before the time left
+    // is measured: a snapshot takes from the turn's time, not past it)
+    if (tool == .write_file or tool == .shell) snapBefore(r, a, tool, arg);
     // a tool gets what is left of the turn, no more; fetch and search
     // send each redirect through the gate
     var env = redirectEnv(r);
@@ -1116,8 +1119,6 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         const cf = gate.confined(a, r.io, r.env.workspace, arg) catch null;
         w.addBy(if (cf) |x| x.rel else arg, try std.fmt.allocPrint(a, "agent:{s}", .{r.who.agent}), r.label);
     };
-    // what it may change is kept first, once a run
-    if (tool == .write_file or tool == .shell) snapBefore(r, a, tool, arg);
 
     const out: tools.Output = switch (tool) {
         .recall => blk: {
@@ -1274,6 +1275,7 @@ fn snapshotTool(r: *Run, a: std.mem.Allocator, folder: []const u8, label: []cons
     const got = store.take(a, src, .{ .when = .tool, .label = label, .by = r.snapBy(), .must_exist = true }) catch |e| return .{
         .text = switch (e) {
             error.NoSuchFolder => if (std.mem.startsWith(u8, src.name, "env:")) try std.fmt.allocPrint(a, "not taken: no environment {s}", .{src.name["env:".len..]}) else try std.fmt.allocPrint(a, "not taken: no folder {s} in the workspace", .{src.name}),
+            error.LinkOnTheWay => try std.fmt.allocPrint(a, "not taken: {s} is a symbolic link", .{src.name}),
             else => try std.fmt.allocPrint(a, "not taken: {s}", .{@errorName(e)}),
         },
         .is_error = true,

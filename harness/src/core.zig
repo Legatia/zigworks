@@ -402,6 +402,7 @@ pub const Core = struct {
             .dir = c.paths.snapshots,
             .env_root = try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "env" }),
             .log = &c.log,
+            .masks = &c.masks,
             .total_mb = c.cfg.limits.snapshot_mb,
         };
         errdefer c.snaps.deinit();
@@ -2211,6 +2212,7 @@ pub const Core = struct {
         };
         const got = c.snaps.take(a, src, .{ .when = .hand, .label = label, .must_exist = true }) catch |e| return switch (e) {
             error.NoSuchFolder => if (std.mem.startsWith(u8, src.name, "env:")) std.fmt.allocPrint(a, "No environment {s}.", .{src.name["env:".len..]}) else std.fmt.allocPrint(a, "No folder {s} in the workspace.", .{folder}),
+            error.LinkOnTheWay => std.fmt.allocPrint(a, "No snapshot of {s}: it is a symbolic link.", .{src.name}),
             else => std.fmt.allocPrint(a, "No snapshot of {s}: {s}.", .{ src.name, @errorName(e) }),
         };
         if (got.refused) |why| return std.fmt.allocPrint(a, "No snapshot of {s}: {s}.", .{ src.name, why });
@@ -2273,6 +2275,7 @@ pub const Core = struct {
         const r = c.snaps.restore(a, src, fi.id, .{}) catch |e| return switch (e) {
             error.NoSuchSnapshot => std.fmt.allocPrint(a, "No snapshot {d} of {s}.", .{ fi.id, src.name }),
             error.CannotUndo => std.fmt.allocPrint(a, "Not restored: {s} is too big to snapshot first, so a restore could not be undone.", .{src.name}),
+            error.LinkOnTheWay => std.fmt.allocPrint(a, "Not restored: {s} is a symbolic link.", .{src.name}),
             else => std.fmt.allocPrint(a, "Not restored: {s}.", .{@errorName(e)}),
         };
         _ = c.snaps.prune(a, c.folderRoles()) catch {};
@@ -4552,4 +4555,20 @@ test "a_folder_too_big_for_snapshots_is_said_in_status" {
     f.core.snaps.max_files = 1;
     try t.expectEqualStrings("No snapshot of notes: over 1 files.", try f.core.command(a, "/snapshot notes"));
     try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/status"), "\nSnapshots: notes: none (over 1 files)") != null);
+}
+
+test "a_secret_typed_into_a_snapshots_label_is_masked" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const notes = try std.fs.path.join(a, &.{ f.core.workspace, "notes" });
+    try Io.Dir.cwd().createDirPath(t.io, notes);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ notes, "a.md" }), .data = "x" });
+    _ = try f.core.command(a, "/snapshot notes key og-key-for-tests");
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/snapshots notes"), "\"key [secret:omnigate]\"") != null);
+    const key = snapshots_mod.folderKey("notes");
+    const snap = try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ f.core.paths.snapshots, "folders", &key, "1" }), a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, snap, "og-key-for-tests") == null);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "og-key-for-tests") == null);
 }

@@ -17,6 +17,7 @@ const rules = @import("rules.zig");
 const gate = @import("gate.zig");
 const util = @import("util.zig");
 const jv = @import("jv.zig");
+const masks_mod = @import("masks.zig");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -180,6 +181,8 @@ pub const Store = struct {
     /// sandbox's home, gap 2). "": no environments.
     env_root: []const u8 = "",
     log: ?*log_mod.Log = null,
+    /// Stored secrets, masked in labels before they are written.
+    masks: ?*masks_mod.List = null,
     clone: ?CloneFn = platform_clone,
     /// `[limits] snapshot_mb`: the objects all snapshots name, at most.
     total_mb: u32 = 5120,
@@ -210,6 +213,8 @@ pub const Store = struct {
 
     fn takeLocked(s: *Store, arena: std.mem.Allocator, src: Source, opts: Take) !Taken {
         const time = util.nowSeconds(s.io);
+        // the folder itself as it is, never what a link there points to
+        if (isLink(s.io, src.path)) return error.LinkOnTheWay;
         const fdir = try s.folderDir(arena, src.name);
         const known = try s.ids(arena, fdir);
         const prev: ?Snap = if (known.len > 0) s.load(arena, fdir, known[known.len - 1]) catch null else null;
@@ -269,7 +274,9 @@ pub const Store = struct {
             }
         }.lt);
         const id = if (known.len > 0) known[known.len - 1] + 1 else 1;
-        const label = util.cut(opts.label, 200);
+        // a label is typed by the owner or the model: no secret value in it
+        const short = util.cut(opts.label, 200);
+        const label = if (s.masks) |m| m.scrubAlloc(arena, short) catch short else short;
         var out: std.ArrayList(u8) = .empty;
         try writeHeader(&out, arena, .{ .folder = src.name, .time = time, .label = label, .rid = opts.by.rid, .run = opts.by.run, .agent = opts.by.agent, .by = opts.by.by, .when = opts.when, .files = files.items.len, .changed = changed, .bytes = bytes });
         for (files.items) |nf| {
@@ -373,6 +380,7 @@ pub const Store = struct {
         defer s.mutex.unlock(s.io);
         const fdir = try s.folderDir(arena, src.name);
         const target = try s.load(arena, fdir, id);
+        // (takeLocked refuses a folder that is a symbolic link)
         const first = try s.takeLocked(arena, src, .{ .when = .hand, .label = try std.fmt.allocPrint(arena, "before restoring {d}", .{id}), .by = by });
         if (first.refused != null) return error.CannotUndo;
         const now = try s.load(arena, fdir, first.id);
@@ -861,6 +869,11 @@ fn native(arena: std.mem.Allocator, rel: []const u8) ![]const u8 {
     return out;
 }
 
+fn isLink(io: Io, p: []const u8) bool {
+    const st = Io.Dir.cwd().statFile(io, p, .{ .follow_symlinks = false }) catch return false;
+    return st.kind == .sym_link;
+}
+
 /// Why a file could not be put back, in words for the owner.
 fn whyNot(e: anyerror) []const u8 {
     return switch (e) {
@@ -1197,6 +1210,22 @@ test "restore_never_writes_through_a_symbolic_link" {
     // the link where the snapshot had a file is replaced by the file
     try t.expectEqual(.file, (try f.tmp.dir.statFile(t.io, "src/g", .{ .follow_symlinks = false })).kind);
     try t.expectEqualStrings("file", try f.get("g"));
+}
+
+test "a_folder_that_is_a_symbolic_link_is_neither_snapshotted_nor_restored" {
+    if (!posix) return error.SkipZigTest;
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.put("a", "1");
+    _ = try f.take("");
+    try f.tmp.dir.createDirPath(t.io, "elsewhere");
+    try f.tmp.dir.deleteTree(t.io, "src");
+    try f.tmp.dir.symLink(t.io, "elsewhere", "src", .{ .is_directory = true });
+    try t.expectError(error.LinkOnTheWay, f.take(""));
+    try t.expectError(error.LinkOnTheWay, f.store.restore(a, f.source(), 1, .{}));
+    try t.expect(f.gone("elsewhere/a"));
 }
 
 var clones: std.atomic.Value(u32) = .init(0);
