@@ -836,9 +836,15 @@ const TermChan = struct {
         const tc: *TermChan = @ptrCast(@alignCast(ctx));
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
+        var tb: [48]u8 = undefined;
+        // quick replies: type one (a press is a message here)
+        if (bs.len > 0 and bs[0][1].len > 0 and bs[0][1][0] == 'r') {
+            outPrint(tc.io, "{s}{s}\n", .{ tc.tag(&tb, place), text }) catch {};
+            for (bs) |b| outPrint(tc.io, "  > {s}\n", .{b[0]}) catch {};
+            return 0;
+        }
         // only the answers this question has: money has no 24 h
         var buf: [128]u8 = undefined;
-        var tb: [48]u8 = undefined;
         outPrint(tc.io, "{s}{s}\n{s}\n", .{ tc.tag(&tb, place), text, keysLine(&buf, bs) }) catch {};
         return 0;
     }

@@ -186,12 +186,41 @@ const max_contexts = 16;
 const Queued = struct {
     conv: []u8,
     text: []u8,
+    /// A quick reply: the post it answers, said in its turn's context.
+    note: ?[]u8 = null,
 
     fn deinit(q: Queued, gpa: std.mem.Allocator) void {
         gpa.free(q.conv);
         gpa.free(q.text);
+        if (q.note) |n| gpa.free(n);
     }
 };
+
+/// A post with quick replies: a press of one of its buttons, in the
+/// message they are in, is the owner's message in its conversation, once.
+/// Kept in memory only: its token is the start's nonce.
+const Quick = struct {
+    n: u32,
+    conv: []u8,
+    labels: [][]u8,
+    /// The post's start, said in the turn a press starts.
+    excerpt: []u8,
+    /// Where its buttons are (null: not yet sent).
+    msg: ?i64 = null,
+    chat: i64 = 0,
+    thread: i64 = 0,
+    used: bool = false,
+
+    fn deinit(q: Quick, gpa: std.mem.Allocator) void {
+        gpa.free(q.conv);
+        for (q.labels) |l| gpa.free(l);
+        gpa.free(q.labels);
+        gpa.free(q.excerpt);
+    }
+};
+
+/// Posts with quick replies kept at once; the oldest goes first.
+const max_quick = 32;
 
 pub const Secrets = struct {
     omnigate: ?[]const u8 = null,
@@ -340,6 +369,10 @@ pub const Core = struct {
     topic_mutex: Io.Mutex = .init,
     /// Names whose topic could not be opened, the owner told once each.
     told_topics: std.ArrayList([]u8) = .empty,
+    /// The posts with quick replies, and the last post's number.
+    quick_mutex: Io.Mutex = .init,
+    quick: std.ArrayList(Quick) = .empty,
+    quick_seq: u32 = 0,
     /// /dryrun, /private, /memory auto: runs read them when they use them.
     switches: agent.Switches = .{},
 
@@ -490,6 +523,9 @@ pub const Core = struct {
         c.topics_on = true;
         c.topic_mutex = .init;
         c.told_topics = .empty;
+        c.quick_mutex = .init;
+        c.quick = .empty;
+        c.quick_seq = 0;
         c.chat_client = try model.Client.init(gpa, io, c.cfg.model.url, secrets.omnigate orelse "", c.cfg.model.model, c.cfg.model.max_tokens);
         c.contexts = .empty;
         c.ctx_mutex = .init;
@@ -553,6 +589,8 @@ pub const Core = struct {
         c.convs.deinit();
         for (c.told_topics.items) |n| c.gpa.free(n);
         c.told_topics.deinit(c.gpa);
+        for (c.quick.items) |q| q.deinit(c.gpa);
+        c.quick.deinit(c.gpa);
         for (c.contexts.items) |x| c.freeContext(x);
         c.contexts.deinit(c.gpa);
         c.chat_client.deinit();
@@ -1108,14 +1146,22 @@ pub const Core = struct {
             if (reply.len > 0) c.sayIn(conv, reply);
             return;
         }
+        return c.queueMessage(conv, text, null);
+    }
+
+    /// Queues the owner's message `text` in `conv` for the chat worker
+    /// (`note`: the post a quick reply answers).
+    fn queueMessage(c: *Core, conv: []const u8, text: []const u8, note: ?[]const u8) !void {
         const conv_owned = try c.gpa.dupe(u8, conv);
         errdefer c.gpa.free(conv_owned);
-        const item: Queued = .{ .conv = conv_owned, .text = try c.gpa.dupe(u8, text) };
+        const text_owned = try c.gpa.dupe(u8, text);
+        errdefer c.gpa.free(text_owned);
+        const item: Queued = .{ .conv = conv_owned, .text = text_owned, .note = if (note) |n| try c.gpa.dupe(u8, n) else null };
         const queued_behind = blk: {
             c.queue_mutex.lockUncancelable(c.io);
             defer c.queue_mutex.unlock(c.io);
             c.queue.append(c.gpa, item) catch |e| {
-                c.gpa.free(item.text);
+                if (item.note) |n| c.gpa.free(n);
                 return e;
             };
             break :blk c.busy.load(.acquire) or c.queue.items.len > 1;
@@ -1139,6 +1185,10 @@ pub const Core = struct {
             c.log.write(.chat, false, .{ .event = "dropped", .from = from_id, .why = "button from someone else" }) catch {};
             return;
         }
+        if (data.len > 0 and data[0] == 'r') {
+            if (!c.quickPress(message_id, data)) c.tellOutOfDate(chat, thread, message_id);
+            return;
+        }
         const current = blk: {
             const p = Press.parse(data) orelse break :blk false;
             c.approval.mutex.lockUncancelable(c.io);
@@ -1157,6 +1207,101 @@ pub const Core = struct {
             break :blk true;
         };
         if (!current) c.tellOutOfDate(chat, thread, message_id);
+    }
+
+    /// A press of a quick reply (`r<post>-<token>:<n>`): once, from the
+    /// message its buttons are in, with this start's token; the label is
+    /// the owner's message in the post's conversation, and the buttons go.
+    /// False when it answers nothing.
+    fn quickPress(c: *Core, message_id: i64, data: []const u8) bool {
+        const colon = std.mem.lastIndexOfScalar(u8, data, ':') orelse return false;
+        const dash = std.mem.indexOfScalar(u8, data[0..colon], '-') orelse return false;
+        const n = std.fmt.parseInt(u32, data[1..dash], 10) catch return false;
+        const which = std.fmt.parseInt(usize, data[colon + 1 ..], 10) catch return false;
+        if (!std.mem.eql(u8, data[dash + 1 .. colon], &c.approval_nonce)) return false;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const got = blk: {
+            c.quick_mutex.lockUncancelable(c.io);
+            defer c.quick_mutex.unlock(c.io);
+            for (c.quick.items) |*q| if (q.n == n) {
+                if (q.used or q.msg == null or q.msg.? != message_id or which == 0 or which > q.labels.len) return false;
+                q.used = true;
+                break :blk .{
+                    .conv = a.dupe(u8, q.conv) catch return false,
+                    .label = a.dupe(u8, q.labels[which - 1]) catch return false,
+                    .excerpt = a.dupe(u8, q.excerpt) catch return false,
+                    .place = Place{ .name = "", .chat = q.chat, .thread = q.thread },
+                };
+            };
+            return false;
+        };
+        if (c.chan) |ch| ch.clear(ch.ctx, got.place, message_id);
+        c.log.write(.chat, c.convPrivate(got.conv), .{ .event = "quick reply", .post = n, .text = got.label }) catch {};
+        const note = std.fmt.allocPrint(a, "The owner pressed \"{s}\" under your post: \"{s}\"", .{ got.label, got.excerpt }) catch return true;
+        c.queueMessage(got.conv, got.label, note) catch {};
+        return true;
+    }
+
+    /// Notes a post with quick replies; returns its number. The oldest
+    /// goes past `max_quick`.
+    fn quickPost(c: *Core, conv: []const u8, labels: []const []const u8, text: []const u8) !u32 {
+        const owned = try c.gpa.alloc([]u8, labels.len);
+        var made: usize = 0;
+        errdefer {
+            for (owned[0..made]) |l| c.gpa.free(l);
+            c.gpa.free(owned);
+        }
+        for (labels) |l| {
+            owned[made] = try c.gpa.dupe(u8, l);
+            made += 1;
+        }
+        const conv_owned = try c.gpa.dupe(u8, conv);
+        errdefer c.gpa.free(conv_owned);
+        const excerpt = try c.gpa.dupe(u8, util.cut(text, 200));
+        errdefer c.gpa.free(excerpt);
+        c.quick_mutex.lockUncancelable(c.io);
+        defer c.quick_mutex.unlock(c.io);
+        if (c.quick.items.len >= max_quick) c.quick.orderedRemove(0).deinit(c.gpa);
+        c.quick_seq += 1;
+        try c.quick.append(c.gpa, .{ .n = c.quick_seq, .conv = conv_owned, .labels = owned, .excerpt = excerpt });
+        return c.quick_seq;
+    }
+
+    /// The post `n`'s buttons are in message `msg` at `place`.
+    fn quickShown(c: *Core, n: u32, msg: i64, place: Place) void {
+        c.quick_mutex.lockUncancelable(c.io);
+        defer c.quick_mutex.unlock(c.io);
+        for (c.quick.items) |*q| if (q.n == n) {
+            q.msg = msg;
+            q.chat = place.chat;
+            q.thread = place.thread;
+        };
+    }
+
+    /// Sends a post with quick replies to `conv`: the text in messages of
+    /// 4096 bytes, the buttons on the last; the post is noted so a press of
+    /// one counts.
+    fn sendWithButtons(c: *Core, a: std.mem.Allocator, conv: []const u8, text_in: []const u8, labels: []const []const u8) !Sent {
+        const ch = c.chan orelse return error.NoChannel;
+        const r = try c.placeOf(a, conv);
+        const text = if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text_in }) else text_in;
+        const n = try c.quickPost(conv, labels, text_in);
+        const bs = try a.alloc([2][]const u8, labels.len);
+        for (labels, bs, 1..) |l, *b, i| b.* = .{ l, try std.fmt.allocPrint(a, "r{d}-{s}:{d}", .{ n, &c.approval_nonce, i }) };
+        const parts = try questionParts(a, text);
+        var sent: Sent = .{};
+        for (parts[0 .. parts.len - 1]) |part| {
+            const s = try ch.send(ch.ctx, r.place, part);
+            if (sent.count == 0) sent.first = s.first;
+            sent.count += s.count;
+        }
+        const id = ch.buttons(ch.ctx, r.place, parts[parts.len - 1], bs) orelse return error.ButtonsNotSent;
+        c.quickShown(n, id, r.place);
+        if (sent.count == 0) sent.first = id;
+        sent.count += 1;
+        return sent;
     }
 
     /// Says where the press came from that it answers nothing.
@@ -1384,7 +1529,7 @@ pub const Core = struct {
         while (!c.quitting.load(.acquire)) {
             if (c.popQueue()) |item| {
                 defer item.deinit(c.gpa);
-                c.chatTurnIn(item.conv, item.text);
+                c.chatTurnNoted(item.conv, item.text, item.note);
                 c.busy.store(false, .release);
                 continue;
             }
@@ -1698,6 +1843,12 @@ pub const Core = struct {
     /// The owner's message `text` in conversation `conv`: one turn, its
     /// questions and its answer there.
     fn chatTurnIn(c: *Core, conv: []const u8, text: []const u8) void {
+        c.chatTurnNoted(conv, text, null);
+    }
+
+    /// `chatTurnIn`; `note` (the post a quick reply answers) goes in the
+    /// turn's context block.
+    fn chatTurnNoted(c: *Core, conv: []const u8, text: []const u8, note: ?[]const u8) void {
         const x = c.contextFor(conv) catch |e| {
             var buf: [128]u8 = undefined;
             c.sayIn(conv, std.fmt.bufPrint(&buf, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
@@ -1718,6 +1869,7 @@ pub const Core = struct {
         var ask: ChatAsk = .{ .core = c, .flag = &flag, .conv = conv };
         var run = c.runIn(&c.chat_client, "chat", .{}, conv, &flag);
         run.context_note = c.contextNote(arena.allocator(), conv) catch "";
+        if (note) |n| run.context_note = std.fmt.allocPrint(arena.allocator(), "{s}\n{s}", .{ run.context_note, n }) catch run.context_note;
         run.asker = .{ .ctx = &ask, .ask = askOwner };
         var notify: Notify = .{ .core = c, .conv = conv };
         run.notice = .{ .ctx = &notify, .say = Notify.say };
@@ -1885,7 +2037,8 @@ pub const Core = struct {
         else if (o.tag.len > 0) std.fmt.allocPrint(a, "{s}{s}", .{ o.tag, p.text }) catch p.text else p.text;
         c.ensureTopic(a, p.to);
         if (c.overHourly(a, p.to)) |why| return .{ .status = .held, .why = why };
-        const sent = c.sendText(p.to, text) catch |e| {
+        const sending = if (p.buttons.len > 0) c.sendWithButtons(a, p.to, text, p.buttons) else c.sendText(p.to, text);
+        const sent = sending catch |e| {
             // kept to be sent again as it is: nothing runs again for it
             if (sc) |x| if (worthRetry(e)) if (x.keep) |k| if (Undelivered.of(c.gpa, p.to, text, x.links)) |u| {
                 if (k.*) |old| old.deinit(c.gpa);
@@ -3413,8 +3566,8 @@ const Recorder = struct {
     const Buttons = struct {
         msg: i64 = 0,
         n: usize = 0,
-        buf: [3][64]u8 = undefined,
-        len: [3]usize = @splat(0),
+        buf: [4][64]u8 = undefined,
+        len: [4]usize = @splat(0),
 
         /// The data of the button that answers `which` ("once", "day", "deny").
         fn get(b: *const Buttons, which: []const u8) ?[]const u8 {
@@ -3535,7 +3688,7 @@ const Recorder = struct {
             const line = std.fmt.allocPrint(t.allocator, "BUTTONS {s} [{s}]", .{ text, bs[0][1] }) catch return null;
             r.note(place, line) catch {};
             r.next_id += 1;
-            r.last = .{ .msg = r.next_id, .n = @min(bs.len, 3) };
+            r.last = .{ .msg = r.next_id, .n = @min(bs.len, 4) };
             for (bs[0..r.last.n], 0..) |b, i| {
                 r.last.len[i] = @min(b[1].len, 64);
                 @memcpy(r.last.buf[i][0..r.last.len[i]], b[1][0..r.last.len[i]]);
@@ -4210,6 +4363,44 @@ test "a_task_whose_topic_can_not_open_posts_to_main_with_its_name" {
     try f.rec.waitIn("main", "[flats] [check] Nothing new on the market.");
     waitIdle(f.core);
     try t.expectEqual(1, f.rec.count("could not be opened"));
+}
+
+test "a_quick_reply_counts_once_and_not_after_a_restart" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"text\":\"Three flats match.\",\"buttons\":[\"Book viewings\",\"Not now\"],\"final\":true}"));
+    try f.e.script(2, model.textReply("Booking them."));
+    try f.core.startWorker();
+    try f.core.handleText("find flats");
+    try f.rec.waitFor("BUTTONS Three flats match. [r");
+    const b = f.lastButtons();
+    try t.expectEqual(2, b.n);
+    // the label is the owner's message there, in a turn that names the post
+    f.core.handleCallback(42, b.msg, b.get("1").?);
+    try f.rec.waitFor("Booking them.");
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "{\"type\":\"text\",\"text\":\"Book viewings\"") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "The owner pressed \\\"Book viewings\\\" under your post: \\\"Three flats match.\\\"") != null);
+    {
+        f.rec.mutex.lockUncancelable(t.io);
+        defer f.rec.mutex.unlock(t.io);
+        try t.expect(std.mem.indexOfScalar(i64, f.rec.cleared.items, b.msg) != null);
+    }
+    // counted once: the other button answers nothing now
+    f.core.handleCallback(42, b.msg, b.get("2").?);
+    try f.rec.waitFor(out_of_date);
+    // from another message, nothing either
+    try restart(&f);
+    f.core.handleCallback(42, b.msg, b.get("1").?);
+    try t.expectEqual(2, f.rec.count(out_of_date));
+    try t.expectEqual(2, f.e.server.modelRequests());
+    // quick replies only where only the owner reads
+    try addGroup(&f, "family", -1001234567890);
+    try f.e.script(3, model.toolReply("tu_2", "send", "{\"to\":\"family\",\"text\":\"Pick one\",\"buttons\":[\"A\"]}"));
+    try f.e.script(4, model.textReply("ok"));
+    f.core.chatTurn("ask the family");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "refused: quick replies are only for conversations only you read") != null);
 }
 
 test "a_bad_rules_line_names_its_section_or_environment" {

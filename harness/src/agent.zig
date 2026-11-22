@@ -402,7 +402,7 @@ const send_def: model.ToolDef = .{
     .name = "send",
     .description = "Post to a conversation the owner reads: your reply (final: true; your turn ends with it), or a note while you keep working.",
     .schema_json =
-    \\{"type":"object","properties":{"to":{"type":"string","description":"a conversation's name; default: this one"},"text":{"type":"string"},"files":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"workspace files, sent as documents (up to 20 MB each)"},"final":{"type":"boolean","description":"this is your reply: the turn ends with it"}},"required":["text"]}
+    \\{"type":"object","properties":{"to":{"type":"string","description":"a conversation's name; default: this one"},"text":{"type":"string"},"files":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"workspace files, sent as documents (up to 20 MB each)"},"buttons":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"quick replies the owner can press, up to 32 bytes each (not where others read)"},"final":{"type":"boolean","description":"this is your reply: the turn ends with it"}},"required":["text"]}
     ,
 };
 const skill_defs = [_]model.ToolDef{
@@ -1240,6 +1240,9 @@ pub const max_post = 16 * 1024;
 /// Files a post may carry, and the largest (read whole).
 pub const max_files = 4;
 pub const max_file_bytes = 20 << 20;
+/// Quick replies a post may carry, and the longest label.
+pub const max_buttons = 4;
+pub const max_button_bytes = 32;
 
 /// `send`: a post to a conversation (default the run's); `final` makes it
 /// the reply, and the turn ends once it went out.
@@ -1275,10 +1278,20 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
         if (dot == null and dotPart(cf.rel)) dot = cf.rel;
         att.* = .{ .name = std.fs.path.basename(cf.rel), .data = data };
     }
+    // quick replies: a press is the owner's message there
+    const labels = jv.arr(jv.get(v, "buttons")) orelse &.{};
+    if (labels.len > max_buttons) return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "a post has at most {d} quick replies", .{max_buttons}));
+    if (labels.len > 0 and target.shared) return refusePost(r, a, to, text, "quick replies are only for conversations only you read");
+    const buttons = try a.alloc([]const u8, labels.len);
+    for (labels, buttons) |lv, *b| {
+        const l = jv.str(lv) orelse return refusePost(r, a, to, text, "buttons are labels");
+        if (l.len == 0 or l.len > max_button_bytes) return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "a quick reply's label has 1 to {d} bytes", .{max_button_bytes}));
+        b.* = l;
+    }
     if (r.sends >= r.limits.sends_per_run)
         return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "this run has posted {d} times, the most one run may (sends_per_run)", .{r.sends}));
     r.sends += 1;
-    const post: Post = .{ .to = target.name, .text = text, .files = files, .final = final };
+    const post: Post = .{ .to = target.name, .text = text, .files = files, .buttons = buttons, .final = final };
     const got = try postThrough(r, a, &post, target, if (dot) |d| try std.fmt.allocPrint(a, "a file name with a part starting with \".\" asks: {s}", .{d}) else null);
     if (got.refused) |why| return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
     const d = got.delivery;
@@ -1316,13 +1329,15 @@ fn postThrough(r: *Run, a: std.mem.Allocator, p: *const Post, target: Target, as
     const ob = r.outbox.?;
     var names: std.ArrayList(u8) = .empty;
     for (p.files, 0..) |f, i| try names.print(a, "{s}{s}", .{ if (i > 0) ", " else "", f.name });
-    // the whole post and the files' names
-    const detail = try std.fmt.allocPrint(a, "{d} bytes:\n{s}{s}{s}", .{ p.text.len, p.text, if (names.items.len > 0) "\nfiles: " else "", names.items });
+    const labels = try std.mem.join(a, " | ", p.buttons);
+    // the whole post, the files' names and the quick replies
+    const detail = try std.fmt.allocPrint(a, "{d} bytes:\n{s}{s}{s}{s}{s}", .{ p.text.len, p.text, if (names.items.len > 0) "\nfiles: " else "", names.items, if (labels.len > 0) "\nbuttons: " else "", labels });
     const refused = try decideAndAskWith(r, a, .send, "send", target.name, detail, r.now(), .{ .shared = target.shared, .ask_why = ask_why });
     const private = r.isPrivate() or target.private;
     const files: ?[]const u8 = if (names.items.len > 0) names.items else null;
+    const buttons: ?[]const u8 = if (labels.len > 0) labels else null;
     if (refused) |why| {
-        try r.logRun(.send, private, .{ .to = target.name, .event = "refused", .bytes = p.text.len, .text = p.text, .files = files, .final = p.final, .implicit = p.implicit, .delivered = false, .why = why });
+        try r.logRun(.send, private, .{ .to = target.name, .event = "refused", .bytes = p.text.len, .text = p.text, .files = files, .buttons = buttons, .final = p.final, .implicit = p.implicit, .delivered = false, .why = why });
         return .{ .refused = why };
     }
     const d = ob.post(ob.ctx, a, p);
@@ -1332,6 +1347,7 @@ fn postThrough(r: *Run, a: std.mem.Allocator, p: *const Post, target: Target, as
         .bytes = p.text.len,
         .text = p.text,
         .files = files,
+        .buttons = buttons,
         .final = p.final,
         .implicit = p.implicit,
         .delivered = d.status == .sent,
