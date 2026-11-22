@@ -290,6 +290,25 @@ pub const Providers = struct {
         return Client.open(gpa, io, ch.provider.*, ch.model, max_tokens);
     }
 
+    /// The providers `values` pick, as /status says them: "omnigate
+    /// (Anthropic Messages, key stored); local (OpenAI Chat Completions,
+    /// no key needed)".
+    pub fn describe(p: *const Providers, arena: std.mem.Allocator, values: []const []const u8) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        for (try p.used(arena, values), 0..) |prov, i| {
+            if (i > 0) try out.appendSlice(arena, "; ");
+            try out.print(arena, "{s} ({s}, ", .{ prov.name, prov.apiName() });
+            if (prov.auth == .none) {
+                try out.appendSlice(arena, "no key needed");
+            } else if (prov.key.len > 0) {
+                try out.appendSlice(arena, "key stored");
+            } else try out.print(arena, "key not stored: harness secret add {s}", .{prov.key_name});
+            if (prov.url.len == 0) try out.appendSlice(arena, ", no url set");
+            try out.append(arena, ')');
+        }
+        return out.items;
+    }
+
     /// The providers `values` pick, each once, in the order first picked.
     pub fn used(p: *const Providers, arena: std.mem.Allocator, values: []const []const u8) ![]const *const Provider {
         var out: std.ArrayList(*const Provider) = .empty;
