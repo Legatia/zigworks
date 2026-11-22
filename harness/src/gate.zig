@@ -1,8 +1,14 @@
-//! The one place every tool call is decided: hard limits no rule can lift,
-//! then the owner's rules, grants with an expiry, and each tool's default.
+//! The one place every tool call is decided, in this order: hard limits no
+//! rule can lift; roles on folders (gap 3; none yet); a deny rule; listed
+//! sources and money; a grant with an expiry; the first allow or ask rule;
+//! the kind's default. Rules and grants are matched with the call's who:
+//! its definition, the definitions that delegated it and what started its
+//! run.
 const std = @import("std");
 const builtin = @import("builtin");
 const rules = @import("rules.zig");
+const who_mod = @import("who.zig");
+pub const Who = who_mod.Who;
 const util = @import("util.zig");
 const url = @import("url.zig");
 const Io = std.Io;
@@ -55,13 +61,18 @@ pub const Decision = struct {
 pub const fold_paths = builtin.os.tag == .macos or builtin.os.tag == .windows;
 
 pub const Ctx = struct {
-    /// No one is there to answer: `ask` becomes `deny`.
+    /// No one is there to answer: `ask` becomes `deny`. Set for runs a
+    /// schedule, a trigger or a workflow started (`Who.unattended`).
     scheduled: bool = false,
     /// A feed or search the owner listed in briefs.ini.
     brief_source: bool = false,
     /// The owner switched on money calls in scheduled runs ([money]
     /// scheduled = on); the caps were checked before the gate.
     money_unattended: bool = false,
+    /// Who makes the call; null: main, in a run the owner started.
+    who: ?Who = null,
+    /// Where a shell command runs; `host` is the only one until gap 2.
+    env: []const u8 = "host",
 };
 
 /// What a grant covers: the exact argument, or for `fetch` and `browse`
@@ -197,13 +208,18 @@ pub const Gate = struct {
             .web => subject = (url.hostPort(arena, arg) catch return .{ .action = .deny, .why = "not a host name" }).text,
             else => {},
         }
+        // roles on folders come here (gap 3): a refusal there is final
+        const w = ctx.who orelse Who{};
         const name = @tagName(tool);
+        // a deny in the shared part, or in a section for the call's
+        // definition, one that delegated it, or what started its run
         for (g.rules) |r| {
-            if (!inert(r)) continue;
+            if (r.action != .deny or !envFits(r, tool, ctx.env)) continue;
             // a deny on a server's MCP tools covers its money tools too
             const same = std.mem.eql(u8, r.tool, name) or (tool == .money and std.mem.eql(u8, r.tool, "mcp"));
-            if (r.action == .deny and same and (g.matches(arena, tool, r.pattern, subject) or (given.len > 0 and g.matches(arena, tool, r.pattern, given))))
-                return .{ .action = .deny, .why = std.fmt.allocPrint(arena, "rule on line {d}", .{r.line}) catch "rule", .subject = subject };
+            if (!same or !scope(r, w).any()) continue;
+            if (g.matches(arena, tool, r.pattern, subject) or (given.len > 0 and g.matches(arena, tool, r.pattern, given)))
+                return .{ .action = .deny, .why = ruleWhy(arena, r), .subject = subject };
         }
         // listing a source in briefs.ini allows it, as an allow rule would
         if (ctx.brief_source) return .{ .action = .allow, .why = "listed in briefs.ini", .subject = subject };
@@ -218,13 +234,28 @@ pub const Gate = struct {
         // programs read these as their settings (.git/config, .npmrc, .env):
         // a file written there can make the next command run something else
         if (tool == .write_file and dotPart(subject)) d = .{ .action = .ask, .why = "a name starting with \".\" asks: programs read those as settings", .subject = subject };
-        for (g.rules) |r| {
-            if (!inert(r)) continue;
-            if (r.action != .deny and std.mem.eql(u8, r.tool, name) and g.matches(arena, tool, r.pattern, subject)) {
-                d = .{ .action = r.action, .why = std.fmt.allocPrint(arena, "rule on line {d}", .{r.line}) catch "rule", .subject = subject };
-                break;
+        // the first allow or ask in the sections for the call's definition,
+        // then in those for what started its run, then in the shared part
+        var from: ?rules.Rule = null;
+        pick: for ([_]Level{ .agent, .by, .shared }) |level| {
+            for (g.rules) |r| {
+                if (r.action == .deny or !std.mem.eql(u8, r.tool, name) or !envFits(r, tool, ctx.env)) continue;
+                if (!scope(r, w).at(level) or !g.matches(arena, tool, r.pattern, subject)) continue;
+                from = r;
+                d = .{ .action = r.action, .why = ruleWhy(arena, r), .subject = subject };
+                break :pick;
             }
         }
+        // the definitions that delegated the call, and what started its
+        // run, only narrow: an ask in their sections makes an allow from
+        // anywhere else (another section, the default) ask
+        if (d.action == .allow) for (g.rules) |r| {
+            if (r.action != .ask or !std.mem.eql(u8, r.tool, name) or !envFits(r, tool, ctx.env)) continue;
+            const sc = scope(r, w);
+            if (!(sc.chain or sc.by) or sameSection(from, r) or !g.matches(arena, tool, r.pattern, subject)) continue;
+            d = .{ .action = .ask, .why = ruleWhy(arena, r), .subject = subject };
+            break;
+        };
         if (d.action == .ask and ctx.scheduled) return .{ .action = .deny, .why = "no one to ask in a scheduled run", .subject = subject };
         return d;
     }
@@ -248,10 +279,54 @@ pub const Gate = struct {
     }
 };
 
-/// Until the gate reads sections and environments, a rule in a section or
-/// for another environment than host applies to nothing.
-fn inert(r: rules.Rule) bool {
-    return r.section == null and (r.env == null or std.mem.eql(u8, r.env.?, "host"));
+/// Where a rule applies to a call: the shared part, or a section whose who
+/// pattern matches the call's definition, a definition that delegated it,
+/// or what started its run.
+const Scope = struct {
+    shared: bool = false,
+    agent: bool = false,
+    chain: bool = false,
+    by: bool = false,
+
+    fn any(s: Scope) bool {
+        return s.shared or s.agent or s.chain or s.by;
+    }
+
+    fn at(s: Scope, level: Level) bool {
+        return switch (level) {
+            .agent => s.agent,
+            .by => s.by,
+            .shared => s.shared,
+        };
+    }
+};
+
+/// The order allow and ask rules are looked at in.
+const Level = enum { agent, by, shared };
+
+fn scope(r: rules.Rule, w: Who) Scope {
+    const section = r.section orelse return .{ .shared = true };
+    const re = who_mod.reach(section, w);
+    return .{ .agent = re.agent, .chain = re.chain, .by = re.by };
+}
+
+/// Whether `r` is in the section the rule `from` decided in: headers with
+/// the same pattern are one section.
+fn sameSection(from: ?rules.Rule, r: rules.Rule) bool {
+    const f = from orelse return false;
+    const a = f.section orelse return false;
+    const b = r.section orelse return false;
+    return std.mem.eql(u8, a, b);
+}
+
+/// A rule for an environment (`shell@box`) is only for calls there.
+fn envFits(r: rules.Rule, tool: Tool, env: []const u8) bool {
+    const e = r.env orelse return true;
+    return tool == .shell and std.mem.eql(u8, e, env);
+}
+
+fn ruleWhy(arena: std.mem.Allocator, r: rules.Rule) []const u8 {
+    return std.fmt.allocPrint(arena, "rule on line {d}", .{r.line}) catch "rule";
 }
 
 /// Whether a part of `rel` (with `/` between the parts) starts with `.`.
@@ -694,6 +769,96 @@ test "money_deny_rule_still_applies" {
     defer f.deinit();
     try t.expectEqual(.deny, f.act(.money, "broker/withdraw {}", .{}));
     try t.expectEqual(.deny, f.act(.money, "broker/withdraw {}", .{ .scheduled = true, .money_unattended = true }));
+}
+
+test "a_definitions_section_allows_for_it_only" {
+    var f: Fixture = undefined;
+    try f.init("[agent:coder]\nallow shell zig build*\n");
+    defer f.deinit();
+    const coder: Who = .{ .agent = "coder" };
+    const helper: Who = .{ .agent = "helper", .parent = &coder };
+    try t.expectEqual(.allow, f.act(.shell, "zig build test", .{ .who = coder }));
+    try t.expectEqual(.ask, f.act(.shell, "zig build test", .{}));
+    // a delegating definition's section widens nothing for its helpers
+    try t.expectEqual(.ask, f.act(.shell, "zig build test", .{ .who = helper }));
+}
+
+test "a_delegating_definitions_section_denies_and_asks_for_its_helpers_but_allows_nothing" {
+    var f: Fixture = undefined;
+    try f.init("allow shell ls*\n[agent:main]\ndeny shell rm *\nask read_file secret/*\nallow shell make*\n");
+    defer f.deinit();
+    const main: Who = .{};
+    const helper: Who = .{ .agent = "helper", .parent = &main };
+    try t.expectEqual(.deny, f.act(.shell, "rm -rf x", .{ .who = helper }));
+    try t.expectEqual(.ask, f.act(.read_file, "secret/k", .{ .who = helper }));
+    try t.expectEqual(.ask, f.act(.shell, "make all", .{ .who = helper }));
+    try t.expectEqual(.allow, f.act(.shell, "ls -l", .{ .who = helper }));
+    try t.expectEqual(.allow, f.act(.shell, "make all", .{ .who = main }));
+    try t.expectEqual(.ask, f.act(.read_file, "secret/k", .{ .who = main }));
+}
+
+test "a_by_section_allows_for_that_origins_runs" {
+    var f: Fixture = undefined;
+    try f.init("[schedule:btc-watch]\nallow fetch https://api.coinbase.com/*\n");
+    defer f.deinit();
+    const task: Who = .{ .by = "schedule:btc-watch" };
+    const helper: Who = .{ .agent = "helper", .by = task.by, .parent = &task };
+    const u = "https://api.coinbase.com/v2/prices";
+    try t.expectEqual(.allow, f.act(.fetch, u, .{ .who = task, .scheduled = true }));
+    try t.expectEqual(.allow, f.act(.fetch, u, .{ .who = helper, .scheduled = true }));
+    try t.expectEqual(.deny, f.act(.fetch, u, .{ .who = .{ .by = "schedule:other" }, .scheduled = true }));
+    try t.expectEqual(.ask, f.act(.fetch, u, .{}));
+}
+
+test "an_ask_in_a_by_or_delegator_section_turns_an_allow_from_another_section_into_ask" {
+    var f: Fixture = undefined;
+    try f.init("[agent:main]\nallow shell make*\n[schedule]\nask shell *\n");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try t.expectEqual(.allow, f.act(.shell, "make", .{}));
+    try t.expectEqual(.ask, f.act(.shell, "make", .{ .who = .{ .by = "schedule:nightly" } }));
+    // the definition that delegated narrows the shared part's allow
+    f.gate.rules = try rules.parse(a, "allow shell make*\n[agent:main]\nask shell *\n");
+    const main: Who = .{};
+    try t.expectEqual(.ask, f.act(.shell, "make", .{ .who = .{ .agent = "helper", .parent = &main } }));
+    try t.expectEqual(.ask, f.act(.shell, "make", .{}));
+    // inside one section its first matching line decides
+    f.gate.rules = try rules.parse(a, "[schedule]\nallow shell make*\nask shell *\n");
+    try t.expectEqual(.allow, f.act(.shell, "make", .{ .who = .{ .by = "schedule:x" } }));
+}
+
+test "all_returns_to_rules_for_every_call_and_no_who_is_main_started_by_the_owner" {
+    var f: Fixture = undefined;
+    try f.init("[agent:coder]\nallow shell a\n[all]\nallow shell b\n[owner]\nallow shell c\n[agent:main]\nallow shell d\n");
+    defer f.deinit();
+    try t.expectEqual(.ask, f.act(.shell, "a", .{}));
+    for ([_][]const u8{ "b", "c", "d" }) |cmd| try t.expectEqual(.allow, f.act(.shell, cmd, .{}));
+    const coder: Who = .{ .agent = "coder" };
+    for ([_][]const u8{ "a", "b", "c" }) |cmd| try t.expectEqual(.allow, f.act(.shell, cmd, .{ .who = coder }));
+    try t.expectEqual(.ask, f.act(.shell, "d", .{ .who = coder }));
+}
+
+test "a_deny_in_any_section_that_reaches_the_call_wins" {
+    var f: Fixture = undefined;
+    try f.init("allow shell *\n[schedule:x]\ndeny shell curl *\n[agent:helper]\ndeny fetch *\n");
+    defer f.deinit();
+    try t.expectEqual(.deny, f.act(.shell, "curl a", .{ .who = .{ .by = "schedule:x" } }));
+    try t.expectEqual(.allow, f.act(.shell, "curl a", .{}));
+    const main: Who = .{};
+    try f.grants.add(.fetch, "a.com", 5000);
+    try t.expectEqual(.deny, f.act(.fetch, "https://a.com/", .{ .who = .{ .agent = "helper", .parent = &main } }));
+    try t.expectEqual(.allow, f.act(.fetch, "https://a.com/", .{}));
+}
+
+test "a_shell_rule_for_an_environment_matches_only_there" {
+    var f: Fixture = undefined;
+    try f.init("allow shell@box *\ndeny shell rm *\nallow shell@host ls\n");
+    defer f.deinit();
+    try t.expectEqual(.ask, f.act(.shell, "make", .{}));
+    try t.expectEqual(.deny, f.act(.shell, "rm x", .{}));
+    try t.expectEqual(.allow, f.act(.shell, "ls", .{}));
+    try t.expectEqual(.allow, f.act(.shell, "make", .{ .env = "box" }));
+    try t.expectEqual(.deny, f.act(.shell, "rm x", .{ .env = "box" }));
 }
 
 test "deny_mcp_rule_covers_money_tools_of_that_server" {
