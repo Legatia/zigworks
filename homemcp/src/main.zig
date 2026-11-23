@@ -71,6 +71,12 @@ fn checkHome(a: std.mem.Allocator, io: Io, cfg: *const config.Config, hub: hub_m
         if (known == states.len) break;
         io.sleep(.fromMilliseconds(200), .awake) catch {};
     }
+    // changes: give the WebSocket a moment to say whether it is up
+    var waited: u32 = 0;
+    while (cfg.hub == .homeassistant and !hub.eventsUp() and waited < 5000) : (waited += 100) {
+        if (!std.mem.startsWith(u8, try hub.eventsStatus(a), "Changes are not coming in yet")) break;
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
     // the rooms, in the order the file names them
     var rooms: std.ArrayList([]const u8) = .empty;
     var roomless = false;
@@ -87,6 +93,7 @@ fn checkHome(a: std.mem.Allocator, io: Io, cfg: *const config.Config, hub: hub_m
     if (rooms.items.len > 0) {
         try o.print(a, "{s}: {d} devices in {d} room{s}. {s}.\n", .{ cfg.name, cfg.devices.len, rooms.items.len, if (rooms.items.len == 1) "" else "s", try hub.status(a) });
     } else try o.print(a, "{s}: {d} devices. {s}.\n", .{ cfg.name, cfg.devices.len, try hub.status(a) });
+    try o.print(a, "{s}\n", .{try hub.eventsStatus(a)});
     for (rooms.items) |r| {
         try o.print(a, "{s}\n", .{r});
         for (cfg.devices, 0..) |dv, i| if (eql(dv.room, r)) try checkLine(a, &o, "  ", &dv, if (i < states.len) states[i].props else null);
@@ -151,4 +158,5 @@ test {
     _ = @import("color.zig");
     _ = @import("when.zig");
     _ = @import("ws.zig");
+    _ = @import("events.zig");
 }

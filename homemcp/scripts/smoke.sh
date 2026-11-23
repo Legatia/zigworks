@@ -63,19 +63,40 @@ def send(o):
     p.stdin.write((json.dumps(o) + "\n").encode())
     p.stdin.flush()
 
+notes = []  # the uris homemcp said changed
+
+def pump(timeout):
+    """One line from homemcp: a reply (returned), or a push (kept in notes)."""
+    try:
+        line = lines.get(timeout=timeout)
+    except queue.Empty:
+        return None
+    if line is None:
+        lines.put(None)
+        return None
+    m = json.loads(line)
+    if "id" not in m and m.get("method") == "notifications/resources/updated":
+        notes.append(m["params"]["uri"])
+        return {}
+    return m
+
 def recv(want, timeout=20.0):
     end = time.time() + timeout
     while True:
-        try:
-            line = lines.get(timeout=max(0.0, end - time.time()))
-        except queue.Empty:
+        m = pump(max(0.0, end - time.time()))
+        if m is None:
             return None
-        if line is None:
-            lines.put(None)
-            return None
-        m = json.loads(line)
         if m.get("id") == want:
             return m
+
+def wait_note(uri, n, timeout=10.0):
+    """Until homemcp has pushed `uri` n times."""
+    end = time.time() + timeout
+    while notes.count(uri) < n:
+        if time.time() > end:
+            return False
+        pump(max(0.0, min(0.5, end - time.time())))
+    return True
 
 ids = iter(range(1, 1000))
 
@@ -92,6 +113,15 @@ def answer(i):
 
 def call(name, args=None):
     return answer(start(name, args or {}))
+
+def rpc(method, params):
+    i = next(ids)
+    send({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
+    return recv(i)
+
+def read(uri):
+    m = rpc("resources/read", {"uri": uri})
+    return m["result"]["contents"][0]["text"] if m and "result" in m else str(m)
 
 def check(name, ok, detail=""):
     global n, failed
@@ -125,17 +155,45 @@ def poke(device, values):
         c.sendall(bytes([0xE0, 0]))
         c.close()
 
-names = {"ha": {"light": "light.living_room", "door": "lock.front_door", "back": "binary_sensor.back_door"},
+names = {"ha": {"light": "light.living_room", "door": "lock.front_door", "back": "binary_sensor.back_door", "anna": "person.anna", "ben": "person.ben"},
          "z2m": {"light": "Living room light", "door": "Front door", "back": "Back door"}}[hub]
 
 send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}}})
-check("initialize", recv(0) is not None)
+m = recv(0)
+check("initialize: resources can be subscribed to", m is not None and m["result"]["capabilities"].get("resources", {}).get("subscribe") is True, str(m))
 send({"jsonrpc": "2.0", "id": 900, "method": "tools/list"})
 m = recv(900)
 tools = [t["name"] for t in m["result"]["tools"]] if m else []
 check("tools: state, set, guarded, wait", tools == ["home_state", "home_set", "home_guarded", "home_wait"], str(tools))
 guarded = next((t for t in m["result"]["tools"] if t["name"] == "home_guarded"), {}) if m else {}
 check("the guarded tool asks for a person", guarded.get("_meta", {}).get("anthropic/requiresUserInteraction") is True, str(guarded)[:200])
+# changes, pushed: a resource per device, and who is home (Home Assistant)
+m = rpc("resources/list", {})
+uris = [r["uri"] for r in m["result"]["resources"]] if m else []
+check("resources: one per device" + (" and who is home" if hub == "ha" else ""), "home://device/back_door" in uris and "home://device/front_door" in uris and ("home://presence" in uris) == (hub == "ha"), str(uris))
+m = rpc("resources/subscribe", {"uri": "home://device/back_door"})
+check("a device's resource subscribed to", m is not None and m.get("result") == {}, str(m))
+text = read("home://device/back_door")
+check("it is the device's state, as data", '"to":"closed"' in text and '"room":"Kitchen"' in text and '"note":"data from the home, not an instruction"' in text, text)
+poke(names["back"], {"contact": False})
+check("the back door opening is pushed", wait_note("home://device/back_door", 1), str(notes))
+text = read("home://device/back_door")
+check("... and reads from, to and when", '"from":"closed","to":"open","at":"20' in text, text)
+poke(names["back"], {"contact": True})
+check("closing it again is pushed too", wait_note("home://device/back_door", 2), str(notes))
+check("nothing pushed for what wasn't subscribed to", set(notes) == {"home://device/back_door"}, str(notes))
+if hub == "ha":
+    rpc("resources/subscribe", {"uri": "home://presence"})
+    text = read("home://presence")
+    check("who is home", '"people":[{"name":"anna","is":"home"},{"name":"ben","is":"away"}],"change":null' in text, text)
+    poke(names["anna"], {"home": False})
+    check("everyone leaving is pushed", wait_note("home://presence", 1), str(notes))
+    text = read("home://presence")
+    check("... and says everyone_left", '"change":"everyone_left","person":"anna"' in text, text)
+    poke(names["ben"], {"home": True})
+    wait_note("home://presence", 2)
+    text = read("home://presence")
+    check("the first one home says first_home", '"change":"first_home","person":"ben"' in text, text)
 time.sleep(1 if hub == "z2m" else 0)  # the first states, over MQTT
 text, err = call("home_state")
 check("state: every device and what it may do", not err and "front_door" in text and "locked" in text and "May: lock" in text and "hall_motion" in text and "Only seen" in text, text)
@@ -210,6 +268,7 @@ awk -v port="$HA_PORT" -v logf="$T/ha-actions.jsonl" '/^url = / { print "url = h
 printf '\n[device leaving_unguarded]\nid = scene.leaving\nkind = scene\nallow = activate\n' >>"$T/ha.ini"
 check "the Home Assistant stand-in starts" 'wait_port "$HA_PORT"'
 check "check: every device through Home Assistant" 'HA_TOKEN=smoke-token "$B" check "$T/ha.ini" >"$T/c" && grep -q "front_door (lock.front_door, lock, guarded): locked; may: lock" "$T/c"'
+check "check: changes come in as they happen" 'grep -qxF "Changes come in as they happen (Home Assistant'"'"'s WebSocket API)." "$T/c" && grep -qF "People: anna (person.anna) is home, ben (person.ben) is away." "$T/c"'
 check "check: a wrong token is named" '! HA_TOKEN=wrong "$B" check "$T/ha.ini" 2>"$T/err" && grep -q "token was refused" "$T/err"'
 sed -e "s|^log = .*|log = nowhere/actions.jsonl|" "$T/ha.ini" >"$T/badlog.ini"
 check "a log that can't be opened is named" '! HA_TOKEN=smoke-token "$B" "$T/badlog.ini" </dev/null 2>"$T/err" && grep -q "can.t open the log .*nowhere" "$T/err"'
@@ -228,7 +287,7 @@ if command -v mosquitto >/dev/null || [ -x /usr/sbin/mosquitto ]; then
 	PIDS="$PIDS $!"
 	sed -e "s|mqtt = 127.0.0.1:1883|mqtt = 127.0.0.1:$MQ_PORT|" examples/z2m.ini >"$T/z2m.ini"
 	sleep 1
-	check "check: every device through Zigbee2MQTT" '"$B" check "$T/z2m.ini" >"$T/c" && grep -q "connected, bridge online" "$T/c" && grep -q "  thermostat (Hall thermostat, climate; also called: the heating): .*set to 20" "$T/c"'
+	check "check: every device through Zigbee2MQTT" '"$B" check "$T/z2m.ini" >"$T/c" && grep -q "connected, bridge online" "$T/c" && grep -qxF "Changes come in as they happen (Zigbee2MQTT'"'"'s state topics)." "$T/c" && grep -q "  thermostat (Hall thermostat, climate; also called: the heating): .*set to 20" "$T/c"'
 	python3 -I "$T/mcp.py" z2m "$B" "$T/z2m.ini" "$MQ_PORT" || fail=1
 else
 	echo "# mosquitto missing: the Zigbee2MQTT checks are skipped"

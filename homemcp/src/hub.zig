@@ -1,6 +1,8 @@
 //! The hub the devices are reached through: Zigbee2MQTT (over MQTT, kept
 //! connected by a thread of its own that holds every device's latest
-//! state) or Home Assistant (its REST API, asked when needed).
+//! state) or Home Assistant (its REST API, asked when needed, and its
+//! WebSocket API, followed by a thread of its own for changes). Either
+//! thread tells `Events` the main state of each device the home file lists.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -12,6 +14,12 @@ const jv = @import("jv.zig");
 const sock = @import("sock.zig");
 const color = @import("color.zig");
 const when = @import("when.zig");
+const ws = @import("ws.zig");
+const events_mod = @import("events.zig");
+
+/// After a connection, how long first states fill in silently (and reads
+/// wait for them).
+const settle_ns = 3 * std.time.ns_per_s;
 
 pub const State = struct {
     props: model.Props,
@@ -39,8 +47,10 @@ pub const Hub = union(enum) {
             },
             .homeassistant => {
                 const h = try gpa.create(Ha);
-                h.* = .{ .gpa = gpa, .io = io, .cfg = cfg, .token = secrets.ha_token, .client = .init(gpa, io, try http.Target.parse(cfg.url)) };
+                errdefer gpa.destroy(h);
+                h.* = .{ .gpa = gpa, .io = io, .cfg = cfg, .token = secrets.ha_token, .client = .init(gpa, io, try http.Target.parse(cfg.url)), .events = try .init(gpa, io, cfg) };
                 h.client.user_agent = "homemcp";
+                h.thread = try std.Thread.spawn(.{}, Ha.follow, .{h});
                 return .{ .ha = h };
             },
         }
@@ -49,9 +59,59 @@ pub const Hub = union(enum) {
     pub fn stop(h: Hub) void {
         switch (h) {
             .z2m => |z| z.stop(),
+            .ha => |x| x.stop(),
+        }
+    }
+
+    /// Where changes are kept and told from.
+    pub fn events(h: Hub) *events_mod.Events {
+        return switch (h) {
+            .z2m => |z| &z.events,
+            .ha => |x| &x.events,
+        };
+    }
+
+    /// Whether changes come in as they happen now.
+    pub fn eventsUp(h: Hub) bool {
+        return switch (h) {
+            .z2m => |z| z.connected(),
+            .ha => |x| x.ws_up.load(.acquire),
+        };
+    }
+
+    /// One plain line on whether changes come in.
+    pub fn eventsStatus(h: Hub, a: Allocator) ![]const u8 {
+        return switch (h) {
+            .z2m => |z| if (z.connected()) "Changes come in as they happen (Zigbee2MQTT's state topics)." else "Changes are not coming in: not connected to the broker; trying again.",
+            .ha => |x| blk: {
+                if (x.ws_up.load(.acquire)) break :blk "Changes come in as they happen (Home Assistant's WebSocket API).";
+                x.ws_lock.lockUncancelable(x.io);
+                defer x.ws_lock.unlock(x.io);
+                if (x.ws_problem_len == 0) break :blk "Changes are not coming in yet: connecting to Home Assistant's WebSocket API.";
+                break :blk try std.fmt.allocPrint(a, "Changes are not coming in: {s}; trying again.", .{x.ws_problem[0..x.ws_problem_len]});
+            },
+        };
+    }
+
+    /// Before resource `uri` is read: as current as the hub can make it
+    /// (Home Assistant: asked, when its state isn't known or changes aren't
+    /// coming in; Zigbee2MQTT: the first states, just after connecting).
+    pub fn settle(h: Hub, a: Allocator, uri: []const u8) void {
+        const ev = h.events();
+        if (!ev.has(uri)) return;
+        // a device's index; null: presence
+        const which: ?usize = blk: {
+            const prefix = "home://device/";
+            if (!std.mem.startsWith(u8, uri, prefix)) break :blk null;
+            for (ev.cfg.devices, 0..) |d, i| if (std.mem.eql(u8, d.name, uri[prefix.len..])) break :blk i;
+            return;
+        };
+        switch (h) {
+            .z2m => |z| z.settle(which),
             .ha => |x| {
-                x.client.deinit();
-                x.gpa.destroy(x);
+                const known = if (which) |i| ev.known(i) else ev.peopleKnown();
+                if (known and x.ws_up.load(.acquire)) return;
+                if (which != null) _ = x.states(a) catch {} else _ = x.people(a) catch {};
             },
         }
     }
@@ -115,6 +175,10 @@ pub const Z2m = struct {
     problem: []u8 = &.{},
     stopping: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    events: events_mod.Events,
+    started_ns: i128,
+    /// When the session last subscribed (nowNs); 0 when it never did.
+    connected_ns: i128 = 0,
 
     fn init(gpa: Allocator, io: Io, cfg: *const config.Config, secrets: Secrets) !Z2m {
         const n = cfg.devices.len;
@@ -124,7 +188,7 @@ pub const Z2m = struct {
         @memset(at, 0);
         const av = try gpa.alloc(?bool, n);
         @memset(av, null);
-        return .{ .gpa = gpa, .io = io, .cfg = cfg, .secrets = secrets, .json = json, .at_ns = at, .available = av };
+        return .{ .gpa = gpa, .io = io, .cfg = cfg, .secrets = secrets, .json = json, .at_ns = at, .available = av, .events = try .init(gpa, io, cfg), .started_ns = sock.nowNs(io) };
     }
 
     fn stop(z: *Z2m) void {
@@ -135,7 +199,28 @@ pub const Z2m = struct {
         z.gpa.free(z.at_ns);
         z.gpa.free(z.available);
         z.gpa.free(z.problem);
+        z.events.deinit();
         z.gpa.destroy(z);
+    }
+
+    fn connected(z: *Z2m) bool {
+        z.lock.lockUncancelable(z.io);
+        defer z.lock.unlock(z.io);
+        return z.client != null;
+    }
+
+    /// Waits for device `which`'s first state while it may still come: in
+    /// the first moments after the start or a connection.
+    fn settle(z: *Z2m, which: ?usize) void {
+        const i = which orelse return;
+        var waited: u32 = 0;
+        while (waited < 3500 and !z.events.known(i)) : (waited += 100) {
+            const now = sock.nowNs(z.io);
+            const starting = now - z.started_ns < settle_ns + std.time.ns_per_s / 2;
+            const just = z.connected_ns != 0 and now - z.connected_ns < settle_ns;
+            if (!starting and !just) return;
+            z.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        }
     }
 
     fn setProblem(z: *Z2m, what: []const u8) void {
@@ -182,6 +267,7 @@ pub const Z2m = struct {
         }
         var topic_buf: [512]u8 = undefined;
         try c.subscribe(try std.fmt.bufPrint(&topic_buf, "{s}/#", .{z.cfg.base}));
+        z.connected_ns = sock.nowNs(z.io);
         // Zigbee2MQTT does not keep device states on the broker: ask
         for (z.cfg.devices) |d| {
             c.publish(try std.fmt.bufPrint(&topic_buf, "{s}/{s}/get", .{ z.cfg.base, d.id }), "{\"state\":\"\"}", false) catch {};
@@ -193,28 +279,62 @@ pub const Z2m = struct {
         c.bye();
     }
 
-    fn handle(z: *Z2m, m: mqtt.Message) void {
+    /// One message from the broker: a device's state or availability, or
+    /// the bridge's. What changed a listed device's main state goes to
+    /// `events`; anything else is dropped.
+    pub fn handle(z: *Z2m, m: mqtt.Message) void {
         if (m.topic.len <= z.cfg.base.len + 1 or !std.mem.startsWith(u8, m.topic, z.cfg.base) or m.topic[z.cfg.base.len] != '/') return;
         const rel = m.topic[z.cfg.base.len + 1 ..];
-        z.lock.lockUncancelable(z.io);
-        defer z.lock.unlock(z.io);
-        if (std.mem.eql(u8, rel, "bridge/state")) {
-            z.bridge = online(m.payload);
-            return;
-        }
-        for (z.cfg.devices, 0..) |d, i| {
-            if (std.mem.eql(u8, rel, d.id)) {
-                const copy = z.gpa.dupe(u8, m.payload) catch return;
-                z.gpa.free(z.json[i]);
-                z.json[i] = copy;
-                z.at_ns[i] = sock.nowNs(z.io);
-                return;
+        var arena_state = std.heap.ArenaAllocator.init(z.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const lines = a.alloc(?[]const u8, z.cfg.devices.len) catch return;
+        @memset(lines, null);
+        var any = false;
+        {
+            z.lock.lockUncancelable(z.io);
+            defer z.lock.unlock(z.io);
+            var touched: ?usize = null;
+            if (std.mem.eql(u8, rel, "bridge/state")) {
+                z.bridge = online(m.payload);
+            } else for (z.cfg.devices, 0..) |d, i| {
+                if (std.mem.eql(u8, rel, d.id)) {
+                    const copy = z.gpa.dupe(u8, m.payload) catch return;
+                    z.gpa.free(z.json[i]);
+                    z.json[i] = copy;
+                    z.at_ns[i] = sock.nowNs(z.io);
+                    touched = i;
+                    break;
+                }
+                if (rel.len == d.id.len + "/availability".len and std.mem.startsWith(u8, rel, d.id) and std.mem.endsWith(u8, rel, "/availability")) {
+                    z.available[i] = online(m.payload);
+                    touched = i;
+                    break;
+                }
+            } else return;
+            // the main state of each device it may have changed, as it stands now
+            for (z.cfg.devices, 0..) |d, i| {
+                if (touched) |x| if (x != i) continue;
+                lines[i] = model.headline(a, d.kind, z.propsOf(a, i)) catch null;
+                any = true;
             }
-            if (rel.len == d.id.len + "/availability".len and std.mem.startsWith(u8, rel, d.id) and std.mem.endsWith(u8, rel, "/availability")) {
-                z.available[i] = online(m.payload);
-                return;
-            }
         }
+        if (!any) return;
+        const now = sock.nowNs(z.io);
+        const mode: events_mod.Mode = if (z.connected_ns != 0 and now - z.connected_ns < settle_ns) .fill else .change;
+        const at_ms: i64 = @intCast(@divFloor(Io.Clock.real.now(z.io).nanoseconds, std.time.ns_per_ms));
+        for (lines, 0..) |l, i| z.events.device(i, l, at_ms, mode);
+    }
+
+    /// Device `i`'s state from what was heard; under z.lock.
+    fn propsOf(z: *Z2m, a: Allocator, i: usize) model.Props {
+        var p: model.Props = .{};
+        if (z.json[i].len > 0) if (jv.parse(a, a.dupe(u8, z.json[i]) catch return p)) |v| {
+            p = model.fromZ2m(z.cfg.devices[i].kind, v);
+        };
+        p.available = z.available[i];
+        if (z.bridge == false) p.available = false;
+        return p;
     }
 
     /// `{"state":"online"}` or plain `online`.
@@ -232,14 +352,8 @@ pub const Z2m = struct {
         const now = sock.nowNs(z.io);
         z.lock.lockUncancelable(z.io);
         defer z.lock.unlock(z.io);
-        for (z.cfg.devices, 0..) |d, i| {
-            var p: model.Props = .{};
-            if (z.json[i].len > 0) if (jv.parse(a, try a.dupe(u8, z.json[i]))) |v| {
-                p = model.fromZ2m(d.kind, v);
-            };
-            p.available = z.available[i];
-            if (z.bridge == false) p.available = false;
-            out[i] = .{ .props = p, .age_s = if (z.at_ns[i] > 0) @as(f64, @floatFromInt(now - z.at_ns[i])) / std.time.ns_per_s else null };
+        for (0..z.cfg.devices.len) |i| {
+            out[i] = .{ .props = z.propsOf(a, i), .age_s = if (z.at_ns[i] > 0) @as(f64, @floatFromInt(now - z.at_ns[i])) / std.time.ns_per_s else null };
         }
         return out;
     }
@@ -298,6 +412,145 @@ pub const Ha = struct {
     token: []const u8,
     client: http.Client,
     problem: []const u8 = "",
+    events: events_mod.Events,
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+    /// The WebSocket is connected, signed in and subscribed.
+    ws_up: std.atomic.Value(bool) = .init(false),
+    ws_lock: Io.Mutex = .init,
+    ws_problem: [160]u8 = undefined,
+    ws_problem_len: usize = 0,
+    /// The WebSocket's socket while one is open (under ws_lock): a stop
+    /// wakes whatever waits on it.
+    ws_handle: ?sock.Handle = null,
+
+    fn stop(h: *Ha) void {
+        h.stopping.store(true, .release);
+        {
+            h.ws_lock.lockUncancelable(h.io);
+            defer h.ws_lock.unlock(h.io);
+            if (h.ws_handle) |x| sock.shutdown(x);
+        }
+        if (h.thread) |th| th.join();
+        h.client.deinit();
+        h.events.deinit();
+        h.gpa.destroy(h);
+    }
+
+    fn setWsProblem(h: *Ha, what: []const u8) void {
+        h.ws_lock.lockUncancelable(h.io);
+        defer h.ws_lock.unlock(h.io);
+        const n = @min(what.len, h.ws_problem.len);
+        @memcpy(h.ws_problem[0..n], what[0..n]);
+        h.ws_problem_len = n;
+    }
+
+    /// The thread that follows Home Assistant's changes over its WebSocket
+    /// API, connecting again after 1 s, 2 s, 4 s ... up to a minute.
+    fn follow(h: *Ha) void {
+        var backoff_ms: u32 = 1000;
+        while (!h.stopping.load(.acquire)) {
+            const began = sock.nowNs(h.io);
+            h.session() catch |e| h.setWsProblem(wsProblem(e));
+            h.ws_up.store(false, .release);
+            // a session that held a while starts the waits over
+            if (sock.nowNs(h.io) - began > 60 * std.time.ns_per_s) backoff_ms = 1000;
+            var waited: u32 = 0;
+            while (waited < backoff_ms and !h.stopping.load(.acquire)) : (waited += 50) h.io.sleep(.fromMilliseconds(50), .awake) catch {};
+            backoff_ms = @min(backoff_ms * 2, 60_000);
+        }
+    }
+
+    fn session(h: *Ha) !void {
+        const c = try ws.Conn.open(h.gpa, h.io, h.cfg.url, "/api/websocket", 5000);
+        {
+            h.ws_lock.lockUncancelable(h.io);
+            defer h.ws_lock.unlock(h.io);
+            h.ws_handle = c.raw.s.handle;
+        }
+        defer {
+            h.ws_lock.lockUncancelable(h.io);
+            h.ws_handle = null;
+            h.ws_lock.unlock(h.io);
+            c.close();
+        }
+        if (h.stopping.load(.acquire)) return;
+        var arena_state = std.heap.ArenaAllocator.init(h.gpa);
+        defer arena_state.deinit();
+        {
+            const a = arena_state.allocator();
+            const hello = jv.parse(a, (try c.next(10_000)) orelse return error.NoAnswer) orelse return error.NotHomeAssistant;
+            if (!std.mem.eql(u8, jv.str(jv.get(hello, "type")) orelse "", "auth_required")) return error.NotHomeAssistant;
+            try c.send(try std.fmt.allocPrint(a, "{{\"type\":\"auth\",\"access_token\":{f}}}", .{std.json.fmt(h.token, .{})}));
+            const ok = jv.parse(a, (try c.next(10_000)) orelse return error.NoAnswer) orelse return error.NotHomeAssistant;
+            const ty = jv.str(jv.get(ok, "type")) orelse "";
+            if (std.mem.eql(u8, ty, "auth_invalid")) return error.Unauthorized;
+            if (!std.mem.eql(u8, ty, "auth_ok")) return error.NotHomeAssistant;
+        }
+        // subscribed first, then every state: nothing falls between
+        try c.send("{\"id\":1,\"type\":\"subscribe_events\",\"event_type\":\"state_changed\"}");
+        try c.send("{\"id\":2,\"type\":\"get_states\"}");
+        var next_id: i64 = 3;
+        var heard = sock.nowNs(h.io);
+        var pinged = heard;
+        while (!h.stopping.load(.acquire)) {
+            const now = sock.nowNs(h.io);
+            if (try c.next(250)) |msg| {
+                heard = sock.nowNs(h.io);
+                _ = arena_state.reset(.retain_capacity);
+                const a = arena_state.allocator();
+                const v = jv.parse(a, msg) orelse continue;
+                // a list, when Home Assistant sends several at once
+                if (v == .array) {
+                    for (v.array.items) |item| try h.onMessage(a, item);
+                } else try h.onMessage(a, v);
+                continue;
+            }
+            if (now - pinged >= 30 * std.time.ns_per_s) {
+                var buf: [48]u8 = undefined;
+                try c.send(try std.fmt.bufPrint(&buf, "{{\"id\":{d},\"type\":\"ping\"}}", .{next_id}));
+                next_id += 1;
+                pinged = now;
+            }
+            // pinged and no answer: the connection is gone
+            if (now - heard >= 75 * std.time.ns_per_s) return error.NoAnswer;
+        }
+    }
+
+    fn onMessage(h: *Ha, a: Allocator, v: jv.Value) !void {
+        const ty = jv.str(jv.get(v, "type")) orelse return;
+        const id = jv.int(jv.get(v, "id")) orelse 0;
+        if (std.mem.eql(u8, ty, "result")) {
+            const ok = jv.boolean(jv.get(v, "success")) orelse false;
+            if (id == 1) {
+                if (!ok) return error.Refused;
+                h.setWsProblem("");
+                h.ws_up.store(true, .release);
+            } else if (id == 2 and ok) {
+                for (jv.arr(jv.get(v, "result")) orelse &.{}) |st| h.note(a, st, .fill);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, ty, "event")) {
+            const data = jv.at(v, &.{ "event", "data" });
+            // removed entities have no new state
+            const st = jv.get(data, "new_state") orelse return;
+            h.note(a, st, .change);
+        }
+    }
+
+    /// One entity's state, kept only when the home file lists it.
+    fn note(h: *Ha, a: Allocator, st: jv.Value, mode: events_mod.Mode) void {
+        const id = jv.str(jv.get(st, "entity_id")) orelse return;
+        const at_ms = when.parseMs(jv.str(jv.get(st, "last_updated")) orelse "") orelse
+            @as(i64, @intCast(@divFloor(Io.Clock.real.now(h.io).nanoseconds, std.time.ns_per_ms)));
+        for (h.cfg.devices, 0..) |d, i| if (std.mem.eql(u8, d.id, id)) {
+            h.events.device(i, model.headline(a, d.kind, model.fromHa(d.kind, st)) catch null, at_ms, mode);
+        };
+        for (h.cfg.people, 0..) |p, i| if (std.mem.eql(u8, p.id, id)) {
+            h.events.person(i, .of(jv.str(jv.get(st, "state")) orelse ""), at_ms, mode);
+        };
+    }
 
     /// Every entity's state object (GET /api/states).
     fn allStates(h: *Ha, a: Allocator) ![]jv.Value {
@@ -329,6 +582,7 @@ pub const Ha = struct {
             o.* = .unknown;
             for (list) |x| if (std.mem.eql(u8, jv.str(jv.get(x, "entity_id")) orelse "", p.id)) {
                 o.* = .of(jv.str(jv.get(x, "state")) orelse "");
+                h.note(a, x, .fill);
                 break;
             };
         }
@@ -354,6 +608,9 @@ pub const Ha = struct {
             out[i] = .{ .props = .{ .available = false } };
             for (list) |s| if (std.mem.eql(u8, jv.str(jv.get(s, "entity_id")) orelse "", d.id)) {
                 out[i] = .{ .props = model.fromHa(d.kind, s), .age_s = ageOf(h.io, jv.str(jv.get(s, "last_changed"))) };
+                // what is asked for is current too: a change the WebSocket
+                // hasn't brought yet counts (an older answer never does)
+                h.note(a, s, .fill);
                 break;
             };
         }
@@ -417,6 +674,21 @@ pub fn guardedEntity(cfg: *const config.Config, states: []const jv.Value, id: []
     };
     for (cfg.devices) |d| if (d.guarded and std.mem.eql(u8, d.id, id)) return true;
     return false;
+}
+
+/// A WebSocket problem in plain words.
+fn wsProblem(e: anyerror) []const u8 {
+    return switch (e) {
+        error.Unauthorized => "the token was refused (HA_TOKEN)",
+        error.ConnectFailed => "can't connect to Home Assistant",
+        error.Timeout, error.NoAnswer => "Home Assistant stopped answering",
+        error.NotWebSocket => "no WebSocket API at /api/websocket",
+        error.NotHomeAssistant => "what answered isn't Home Assistant's WebSocket API",
+        error.Refused => "Home Assistant refused to send state changes",
+        error.Closed => "the connection ended",
+        error.CertificateRejected => "its https certificate was not accepted",
+        else => @errorName(e),
+    };
 }
 
 /// Zigbee2MQTT's fan modes for a speed in %.
