@@ -76,7 +76,8 @@ Times are written in your time zone (`2026-11-23 10:30`), or with an offset
 keeps the time of day.
 
 The resource `cal://upcoming` is today's and tomorrow's events as JSON (when,
-busy or free, place, people, links), for programs such as harness. Like the
+busy or free, place, links, the organizer, `attendees` with you marked
+`self`, and `people`, the others), for programs such as harness. Like the
 tool texts, it is marked as data, not instructions.
 
 ## The calendar file

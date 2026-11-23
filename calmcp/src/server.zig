@@ -741,6 +741,7 @@ pub const Server = struct {
     // ---- the resource ----
 
     const JPerson = struct { name: []const u8, email: []const u8, answer: []const u8 };
+    const JAttendee = struct { name: []const u8, email: []const u8, answer: []const u8, self: bool };
     const JEvent = struct {
         id: []const u8,
         calendar: []const u8,
@@ -755,7 +756,10 @@ pub const Server = struct {
         place: []const u8,
         when: []const u8,
         day: []const u8,
+        /// The attendees but the owner.
         people: []const JPerson,
+        /// Every attendee, the owner marked `self`.
+        attendees: []const JAttendee,
         organizer: ?JPerson,
         yours: bool,
         answer: []const u8,
@@ -773,7 +777,12 @@ pub const Server = struct {
         for (entries) |e| {
             const ev = e.inst.ev;
             var people: std.ArrayList(JPerson) = .empty;
-            for (ev.attendees) |p| if (!s.isOwner(p.email)) try people.append(a, .{ .name = p.name, .email = p.email, .answer = p.partstat });
+            var attendees: std.ArrayList(JAttendee) = .empty;
+            for (ev.attendees) |p| {
+                const self = s.isOwner(p.email);
+                try attendees.append(a, .{ .name = p.name, .email = p.email, .answer = p.partstat, .self = self });
+                if (!self) try people.append(a, .{ .name = p.name, .email = p.email, .answer = p.partstat });
+            }
             try list.append(a, .{
                 .id = try idOf(a, e),
                 .calendar = e.cal.key,
@@ -788,6 +797,7 @@ pub const Server = struct {
                 .when = if (e.inst.all_day) "all day" else try s.span(a, e.inst),
                 .day = try s.dayText(a, e.inst.start, false),
                 .people = people.items,
+                .attendees = attendees.items,
                 .organizer = if (s.inviter(ev)) |o| JPerson{ .name = o.name, .email = o.email, .answer = "" } else null,
                 .yours = s.inviter(ev) == null,
                 .answer = s.answerOf(ev),
@@ -1306,6 +1316,13 @@ test "upcoming_is_data_for_harness" {
     try tt.expect(!jv.boolean(jv.get(focus.?, "busy")).?);
     try tt.expectEqualStrings("Piotr Nowak", jv.str(jv.at(team.?, &.{ "people", "0", "name" })).?);
     try tt.expectEqual(@as(usize, 2), jv.arr(jv.get(team.?, "people")).?.len);
+    // every attendee, the owner marked self
+    const att = jv.arr(jv.get(team.?, "attendees")).?;
+    try tt.expectEqual(@as(usize, 3), att.len);
+    try tt.expect(!jv.boolean(jv.get(att[0], "self")).?);
+    try tt.expectEqualStrings("owner@example.com", jv.str(jv.get(att[2], "email")).?);
+    try tt.expect(jv.boolean(jv.get(att[2], "self")).?);
+    try tt.expectEqualStrings("ACCEPTED", jv.str(jv.get(att[2], "answer")).?);
     try tt.expectEqualStrings("https://meet.example.com/team", jv.str(jv.at(team.?, &.{ "links", "0" })).?);
     // tomorrow's lunch is in it; the day after's isn't
     var lunch = false;
