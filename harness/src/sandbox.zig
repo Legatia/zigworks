@@ -981,11 +981,17 @@ test "sandbox_network_off" {
     if (is_macos) {
         // an outside address: refused when off, let out when on. 192.0.2.1
         // (TEST-NET-1) reaches no one, so this needs no internet: online
-        // the connection times out, offline it is unreachable, and only
-        // the sandbox says "not permitted"
+        // the connection times out, offline it is unreachable, and only a
+        // sandbox (or a filter of the machine's own) says "not permitted"
         const outside = "nc -v -z -G 2 -w 2 192.0.2.1 9 2>&1; true";
         f.env.network = false;
         try expectHas((try f.run(outside)).text, "not permitted");
+        // a network filter of this Mac's own refuses it outside any sandbox
+        const here = try std.process.run(f.a, t.io, .{ .argv = &.{ "/bin/sh", "-c", outside } });
+        if (has(here.stdout, "not permitted")) {
+            std.debug.print("sandbox_network_off: this Mac refuses 192.0.2.1 outside the sandbox too (a network filter); the half with the network on is not checked\n", .{});
+            return;
+        }
         f.env.network = true;
         try expectNot((try f.run(outside)).text, "not permitted");
     }
