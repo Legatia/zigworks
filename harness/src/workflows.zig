@@ -84,6 +84,13 @@ pub const Step = struct {
     env: []const u8 = "",
     goto: []const u8 = "",
     end: bool = false,
+    /// `yes LABEL` on an approve step: its text is shown alone with two
+    /// buttons, and the yes tap is the next tool step's Allow once (that
+    /// step's first question, once); "": a plain approve.
+    yes: []const u8 = "",
+    /// `no LABEL`: the other button ("No" unless it says).
+    no: []const u8 = "",
+    yes_line: usize = 0,
 
     pub fn timeout(s: Step) u32 {
         return s.timeout_s orelse default_timeout_s;
@@ -105,6 +112,11 @@ pub const Workflow = struct {
     agent_line: usize = 0,
     /// `urgent yes`: its posts and questions go through quiet hours.
     urgent: bool = false,
+    /// `phrases goodnight, good night`: the owner's message that reads as
+    /// one of them (`phraseOf`) starts it, as `/workflow start` does.
+    phrases: []const []const u8 = &.{},
+    /// `tag no`: its posts go without `[NAME#N]` in front.
+    tag: bool = true,
     steps: []const Step,
     /// "saved by agent:main 2026-11-22 (item 57)": its first line, when
     /// the agent's save wrote it.
@@ -258,8 +270,45 @@ fn readLines(a: Allocator, text: []const u8, diag: *Diag, saved: *[]const u8) Er
     return out.items;
 }
 
-const head_keys = [_][]const u8{ "workflow", "about", "start", "limits", "to", "urgent" };
-const step_keys = [_][]const u8{ "tool", "do", "wait", "approve", "review", "say", "answer", "tools", "match", "if", "retry", "on", "timeout", "env", "goto", "end" };
+const head_keys = [_][]const u8{ "workflow", "about", "start", "limits", "to", "urgent", "phrases", "tag" };
+const step_keys = [_][]const u8{ "tool", "do", "wait", "approve", "review", "say", "answer", "tools", "match", "if", "retry", "on", "timeout", "env", "goto", "end", "yes", "no" };
+
+/// The longest phrase, as `phraseOf` reads it.
+pub const phrase_max = 64;
+/// The most phrases a workflow has.
+const max_phrases = 10;
+/// A button's words, at most (Telegram shows about this much).
+const label_max = 32;
+
+/// What the owner wrote, read as a phrase: letters and digits (ASCII ones
+/// in lower case), the rest a single space between them; emoji,
+/// punctuation and symbols left out. Null when nothing is left, it is not
+/// UTF-8, or it is longer than `phrase_max`.
+pub fn phraseOf(buf: *[phrase_max]u8, text: []const u8) ?[]const u8 {
+    const view = std.unicode.Utf8View.init(text) catch return null;
+    var it = view.iterator();
+    var n: usize = 0;
+    var gap = false;
+    while (it.nextCodepointSlice()) |cs| {
+        const cp = std.unicode.utf8Decode(cs) catch return null;
+        const keep = if (cp < 0x80) std.ascii.isAlphanumeric(@intCast(cp)) else cp >= 0xc0 and cp < 0x2000 and cp != 0xd7 and cp != 0xf7;
+        if (!keep) {
+            gap = n > 0;
+            continue;
+        }
+        if (gap) {
+            if (n + 1 > buf.len) return null;
+            buf[n] = ' ';
+            n += 1;
+            gap = false;
+        }
+        if (n + cs.len > buf.len) return null;
+        if (cp < 0x80) buf[n] = std.ascii.toLower(@intCast(cp)) else @memcpy(buf[n..][0..cs.len], cs);
+        n += cs.len;
+    }
+    if (n == 0) return null;
+    return buf[0..n];
+}
 
 fn oneOf(word: []const u8, words: []const []const u8) bool {
     for (words) |w| if (std.mem.eql(u8, w, word)) return true;
@@ -306,6 +355,18 @@ pub fn parse(a: Allocator, name: []const u8, text: []const u8, diag: *Diag) Erro
     if (steps.items.len == 0) return bad(diag, lines[lines.len - 1].n, "a workflow has at least one step");
     w.steps = steps.items;
     for (steps.items, step_lines.items) |*s, sl| try stepLines(a, s, sl.items, w, diag);
+    // a yes tap makes the next step's call: that step is a tool step, and
+    // nothing leads elsewhere from the approve
+    for (steps.items, 0..) |s, i| if (s.yes.len > 0) {
+        if (s.ifs.len > 0 or s.goto.len > 0 or s.end) return bad(diag, s.yes_line, "a step with yes goes on to the step right after it: no if, goto or end in it");
+        if (i + 1 >= steps.items.len or steps.items[i + 1].action != .tool) return bad(diag, s.yes_line, "yes needs a tool step right after it: its button makes that step's call");
+    };
+    if (w.phrases.len > 0 and !w.allows("owner", false)) {
+        const n = for (lines) |l| {
+            if (std.mem.eql(u8, l.key, "phrases")) break l.n;
+        } else 0;
+        return bad(diag, n, "phrases start it as you: start names owner");
+    }
     // where steps go, and what their texts name
     for (steps.items) |s| {
         for (s.ifs) |f| try target(a, w, f.goto, f.line, diag);
@@ -372,6 +433,18 @@ fn headLine(a: Allocator, w: *Workflow, l: Line, file_name: []const u8, diag: *D
         if (!agents.validName(v)) return bad(diag, l.n, "agent names a definition: a-z, 0-9 and -");
         w.agent = v;
         w.agent_line = l.n;
+    } else if (eql(u8, l.key, "phrases")) {
+        var list: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, v, ',');
+        while (it.next()) |raw| {
+            var buf: [phrase_max]u8 = undefined;
+            const p = phraseOf(&buf, raw) orelse return bad(diag, l.n, "a phrase has letters or digits, up to 64 bytes; phrases are separated by commas");
+            if (!oneOf(p, list.items)) try list.append(a, try a.dupe(u8, p));
+        }
+        if (list.items.len > max_phrases) return bad(diag, l.n, "a workflow has at most 10 phrases");
+        w.phrases = list.items;
+    } else if (eql(u8, l.key, "tag")) {
+        w.tag = config.parseBool(v) orelse return bad(diag, l.n, "tag yes or no: no posts without [NAME#N] in front");
     }
 }
 
@@ -430,6 +503,7 @@ fn stepLines(a: Allocator, s: *Step, lines: []const Line, w: Workflow, diag: *Di
     var retry_line: usize = 0;
     var env_line: usize = 0;
     var on_timeout_line: usize = 0;
+    var no_line: usize = 0;
     for (lines) |l| {
         const v = l.value;
         const action = oneOf(l.key, &.{ "tool", "do", "wait", "approve", "review", "say" });
@@ -533,8 +607,21 @@ fn stepLines(a: Allocator, s: *Step, lines: []const Line, w: Workflow, diag: *Di
         } else if (eql(u8, l.key, "end")) {
             if (v.len > 0) return bad(diag, l.n, "end takes nothing after it");
             s.end = true;
+        } else if (eql(u8, l.key, "yes") or eql(u8, l.key, "no")) {
+            if (v.len == 0 or v.len > label_max or std.mem.indexOfAny(u8, v, "\r\n") != null) return badf(a, diag, l.n, "{s}: a button's words are 1 to 32 bytes on one line", .{l.key});
+            if (std.mem.indexOfScalar(u8, v, '{') != null) return badf(a, diag, l.n, "{s}: a button's words are shown as they are (no {{values}})", .{l.key});
+            if (eql(u8, l.key, "yes")) {
+                s.yes = v;
+                s.yes_line = l.n;
+            } else {
+                s.no = v;
+                no_line = l.n;
+            }
         }
     }
+    if (s.yes_line != 0 and s.action != .approve) return bad(diag, s.yes_line, "yes goes with approve");
+    if (no_line != 0 and s.yes_line == 0) return bad(diag, no_line, "no goes with yes");
+    if (s.yes_line != 0 and no_line == 0) s.no = "No";
     s.ifs = ifs.items;
     s.match = match.items;
     const is_do = s.action == .do;
@@ -962,13 +1049,16 @@ pub fn reading(a: Allocator, w: Workflow, money: ?*const fn (ctx: ?*anyopaque, t
             try out.print(a, "trigger {s} (an instance per event)", .{s["trigger:".len..]});
         } else try out.print(a, "schedule {s}", .{s["schedule:".len..]});
     }
-    try out.print(a, ".\nAt most {d} steps and {d} day{s} an instance, {d} at once (more wait in line); it posts to {s}", .{ w.limits.steps, w.limits.days, if (w.limits.days == 1) "" else "s", w.limits.at_once, w.to });
+    try out.appendSlice(a, ".");
+    if (w.phrases.len > 0) try out.print(a, "\nStarts when you write: {s}.", .{try std.mem.join(a, ", ", w.phrases)});
+    try out.print(a, "\nAt most {d} steps and {d} day{s} an instance, {d} at once (more wait in line); it posts to {s}", .{ w.limits.steps, w.limits.days, if (w.limits.days == 1) "" else "s", w.limits.at_once, w.to });
     var has_do = false;
     for (w.steps) |s| if (s.action == .do) {
         has_do = true;
     };
     if (has_do) try out.print(a, "; agent steps run {s}", .{w.agent});
     if (w.urgent) try out.appendSlice(a, "; urgent: its posts and questions go through quiet hours");
+    if (!w.tag) try out.print(a, "; its posts go without [{s}#N] in front", .{w.name});
     try out.appendSlice(a, ".");
     var moving: std.ArrayList(u8) = .empty;
     for (w.steps, 1..) |s, n| {
@@ -994,7 +1084,10 @@ pub fn reading(a: Allocator, w: Workflow, money: ?*const fn (ctx: ?*anyopaque, t
                     try out.print(a, " (up to {s})", .{try triggers.fmtDuration(a, s.timeout())});
                 },
             },
-            .approve => |text| try out.print(a, "asks you to approve: {s} (no answer in {s}: denied)", .{ util.cut(oneLine(a, text), 200), try triggers.fmtDuration(a, s.timeout()) }),
+            .approve => |text| if (s.yes.len > 0) {
+                const next_step = w.steps[@min(n, w.steps.len - 1)].name;
+                try out.print(a, "asks you: {s} [{s}] [{s}]; {s} makes step {s}'s call, once (no answer in {s}: {s})", .{ util.cut(oneLine(a, text), 200), s.yes, s.no, s.yes, next_step, try triggers.fmtDuration(a, s.timeout()), s.no });
+            } else try out.print(a, "asks you to approve: {s} (no answer in {s}: denied)", .{ util.cut(oneLine(a, text), 200), try triggers.fmtDuration(a, s.timeout()) }),
             .review => |text| try out.print(a, "shows you a draft to use, drop or replace: {s} (no answer in {s}: dropped)", .{ util.cut(oneLine(a, text), 200), try triggers.fmtDuration(a, s.timeout()) }),
             .say => |text| try out.print(a, "says: {s}", .{util.cut(oneLine(a, text), 200)}),
         }
@@ -1287,4 +1380,79 @@ test "urgent_is_read_in_the_head" {
     try t.expect(std.mem.indexOf(u8, try reading(a, w, null, null), "; urgent: its posts and questions go through quiet hours.") != null);
     try refused(a, "leak", "workflow leak\nurgent sometimes\nstep s\nsay hi\n", 2, "urgent yes or no");
     try refused(a, "leak", "workflow leak\nstep s\nurgent yes\nsay hi\n", 3, "urgent goes in the head");
+}
+
+test "yes_and_no_go_on_an_approve_before_a_tool_step" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    const leak =
+        \\workflow leak
+        \\step ask
+        \\approve Water under the kitchen sink.
+        \\yes Close the water main
+        \\no Ignore
+        \\on deny goto left
+        \\step close
+        \\tool home/home_guarded {"device": "water_main", "action": "close"}
+        \\step left
+        \\say Left as it is.
+    ;
+    const w = try parse(a, "leak", leak, &d);
+    try t.expectEqualStrings("Close the water main", w.steps[0].yes);
+    try t.expectEqualStrings("Ignore", w.steps[0].no);
+    try t.expectEqualStrings("", w.steps[1].yes);
+    // no is "No" unless it says
+    const lock = try parse(a, "x", "workflow x\nstep ask\napprove The front door is unlocked.\nyes Lock it\nstep lock\ntool home/home_guarded {\"device\": \"front_door\", \"action\": \"lock\"}\n", &d);
+    try t.expectEqualStrings("No", lock.steps[0].no);
+    // harness's reading says the tap makes the call
+    const r = try reading(a, w, null, null);
+    const want = "\n1. ask: asks you: Water under the kitchen sink. [Close the water main] [Ignore]; Close the water main makes step close's call, once (no answer in 7 days: Ignore); denied, on to left";
+    if (std.mem.indexOf(u8, r, want) == null) {
+        std.debug.print("no {s} in:\n{s}\n", .{ want, r });
+        return error.TestUnexpectedResult;
+    }
+    try refused(a, "x", "workflow x\nstep a\nsay hi\nyes Do it\n", 4, "yes goes with approve");
+    try refused(a, "x", "workflow x\nstep a\napprove Go?\nno Stop\nstep b\ntool shell {\"command\": \"ls\"}\n", 4, "no goes with yes");
+    try refused(a, "x", "workflow x\nstep a\napprove Go?\nyes Go\nstep b\nsay hi\n", 4, "yes needs a tool step right after it");
+    try refused(a, "x", "workflow x\nstep a\napprove Go?\nyes Go\n", 4, "yes needs a tool step right after it");
+    try refused(a, "x", "workflow x\nstep a\napprove Go?\nyes Go\ngoto c\nstep b\ntool shell {\"command\": \"ls\"}\nstep c\nsay hi\n", 4, "a step with yes goes on to the step right after it");
+    try refused(a, "x", "workflow x\nstep a\napprove Go?\nyes Go\nif input is x goto c\nstep b\ntool shell {\"command\": \"ls\"}\nstep c\nsay hi\n", 4, "a step with yes goes on to the step right after it");
+    try refused(a, "x", "workflow x\nstep a\napprove Go?\nyes Close the water main and the garden tap too\nstep b\ntool shell {\"command\": \"ls\"}\n", 4, "1 to 32 bytes");
+    try refused(a, "x", "workflow x\nstep a\napprove Go?\nyes Go {input}\nstep b\ntool shell {\"command\": \"ls\"}\n", 4, "shown as they are");
+}
+
+test "phrases_start_by_the_owners_words" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    const w = try parse(a, "goodnight", "workflow goodnight\nphrases goodnight, Good night!, dobranoc\nstep a\nsay Night.\n", &d);
+    try t.expectEqual(3, w.phrases.len);
+    try t.expectEqualStrings("goodnight", w.phrases[0]);
+    try t.expectEqualStrings("good night", w.phrases[1]);
+    try t.expectEqualStrings("dobranoc", w.phrases[2]);
+    // what the owner writes, read the same way: case, spaces, punctuation and emoji aside
+    var buf: [phrase_max]u8 = undefined;
+    try t.expectEqualStrings("good night", phraseOf(&buf, "  Good   NIGHT \xf0\x9f\x8c\x99!! ").?);
+    try t.expectEqualStrings("zażółć", phraseOf(&buf, "zażółć.").?);
+    try t.expectEqual(null, phraseOf(&buf, "!!! \xf0\x9f\x8c\x99"));
+    const long: [100]u8 = @splat('a');
+    try t.expectEqual(null, phraseOf(&buf, &long));
+    try t.expect(std.mem.indexOf(u8, try reading(a, w, null, null), "Starts when you write: goodnight, good night, dobranoc.") != null);
+    try refused(a, "x", "workflow x\nstart trigger:t\nphrases hi\nstep a\nsay hi\n", 3, "phrases start it as you: start names owner");
+    try refused(a, "x", "workflow x\nphrases !!!\nstep a\nsay hi\n", 2, "a phrase has letters or digits");
+}
+
+test "tag_no_posts_without_the_instance_in_front" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    try t.expect((try parse(a, "x", "workflow x\nstep a\nsay hi\n", &d)).tag);
+    const w = try parse(a, "x", "workflow x\ntag no\nstep a\nsay hi\n", &d);
+    try t.expect(!w.tag);
+    try t.expect(std.mem.indexOf(u8, try reading(a, w, null, null), "; its posts go without [x#N] in front") != null);
+    try refused(a, "x", "workflow x\ntag maybe\nstep a\nsay hi\n", 2, "tag yes or no");
 }

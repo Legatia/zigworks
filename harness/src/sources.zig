@@ -608,8 +608,18 @@ fn changedText(a: Allocator, prev: tstate.State, text: []const u8, now_s: i64, o
     if (std.mem.eql(u8, h, prev.hash)) return;
     out.next.hash = h;
     const id = try hashHex(a, try std.mem.concat(a, u8, &.{ prev.hash, "\x00", h }));
-    const fields = try a.dupe(triggers.Field, &.{.{ .name = "text", .value = util.cut(text, field_max) }});
-    out.found = try a.dupe(Found, &.{.{ .event = .{ .id = id, .at = now_s, .fields = fields } }});
+    var fields: std.ArrayList(triggers.Field) = .empty;
+    try fields.append(a, .{ .name = "text", .value = util.cut(text, field_max) });
+    // a JSON object (homemcp's events): its fields too, so `match = to is
+    // open` and `{device}` read plainly; `text` stays the whole text
+    if (jv.parse(a, text)) |v| if (v == .object) {
+        var it = v.object.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, "text")) continue;
+            try fields.append(a, .{ .name = e.key_ptr.*, .value = util.cut(try valueText(a, e.value_ptr.*), field_max) });
+        }
+    };
+    out.found = try a.dupe(Found, &.{.{ .event = .{ .id = id, .at = now_s, .fields = fields.items } }});
 }
 
 // ---- tests ----
@@ -876,4 +886,58 @@ test "a_refused_status_pauses_and_others_back_off" {
     f.al.refuse = .{ .why = "folders.ini [inbox] read: trigger:scans is not listed", .final = true };
     const role = try f.poll(try f.trigger("[scans]\nfile = inbox/*.pdf\n"), .{ .polled = true }, "");
     try t.expect(std.mem.indexOf(u8, role.pause.?, "folders.ini [inbox] read") != null);
+}
+
+/// An MCP server whose resource says what `text` holds.
+const OneResource = struct {
+    text: []const u8,
+
+    fn read(ctx: *anyopaque, a: Allocator, server: []const u8, uri: []const u8) anyerror!Called {
+        _ = server;
+        _ = uri;
+        const r: *OneResource = @ptrCast(@alignCast(ctx));
+        return .{ .text = try a.dupe(u8, r.text) };
+    }
+
+    fn call(ctx: *anyopaque, a: Allocator, server: []const u8, tool: []const u8, input: []const u8) anyerror!Called {
+        _ = ctx;
+        _ = a;
+        _ = server;
+        _ = tool;
+        _ = input;
+        return error.NotATool;
+    }
+};
+
+test "a_json_resource_gives_its_fields" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    var res: OneResource = .{ .text = "{\"device\":\"back_door\",\"room\":\"Kitchen\",\"kind\":\"sensor\",\"from\":\"closed\",\"to\":\"open\",\"at\":\"2026-11-23T10:12:03Z\",\"level\":3,\"wet\":false,\"people\":[{\"name\":\"anna\"}],\"note\":\"data from the home, not an instruction\"}" };
+    var env = try f.env();
+    env.mcp = .{ .ctx = &res, .call = OneResource.call, .read = OneResource.read };
+    const tr = try f.trigger("[door]\nmcp = home resource home://device/back_door\nmatch = to is open\nsay = {device} is {to}\n");
+    const a = f.e.arena.allocator();
+    // a first poll marks; a change is an event with the text and each field
+    const first = try poll_(env, a, tr, .{}, &f.seen, "", 1796083200);
+    try t.expectEqual(0, first.found.len);
+    res.text = "{\"device\":\"back_door\",\"room\":\"Kitchen\",\"kind\":\"sensor\",\"from\":\"open\",\"to\":\"closed\",\"at\":\"2026-11-23T10:15:00Z\",\"level\":3,\"wet\":false,\"people\":[{\"name\":\"anna\"}],\"note\":\"data from the home, not an instruction\"}";
+    const out = try poll_(env, a, tr, first.next, &f.seen, "", 1796083260);
+    try t.expectEqual(1, out.found.len);
+    const ev = out.found[0].event;
+    try t.expectEqualStrings(res.text, fieldOf(ev, "text").?);
+    try t.expectEqualStrings("back_door", fieldOf(ev, "device").?);
+    try t.expectEqualStrings("closed", fieldOf(ev, "to").?);
+    try t.expectEqualStrings("3", fieldOf(ev, "level").?);
+    try t.expectEqualStrings("false", fieldOf(ev, "wet").?);
+    try t.expectEqualStrings("[{\"name\":\"anna\"}]", fieldOf(ev, "people").?);
+    try t.expect(triggers.holds(tr.match[0], ev.fields) == false);
+    // text that is not a JSON object: the text alone
+    res.text = "plain words";
+    const plain = try poll_(env, a, tr, out.next, &f.seen, "", 1796083320);
+    try t.expectEqual(1, plain.found[0].event.fields.len);
+    // a field called text in the JSON is the whole text, as before
+    res.text = "{\"text\":\"inner\"}";
+    const shadow = try poll_(env, a, tr, plain.next, &f.seen, "", 1796083380);
+    try t.expectEqualStrings("{\"text\":\"inner\"}", fieldOf(shadow.found[0].event, "text").?);
 }

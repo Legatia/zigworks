@@ -516,13 +516,15 @@ pub const Task = struct {
     /// (no model call), or start a workflow (its name).
     say: []const u8 = "",
     start: []const u8 = "",
+    /// The text a schedule's workflow starts with (`start = workflow NAME TEXT`).
+    start_input: []const u8 = "",
     /// It is a schedule of triggers.ini, not a task of tasks.ini.
     in_triggers: bool = false,
 
     /// A copy whose every slice is in `a` (a background run's own).
     pub fn clone(tk: Task, a: std.mem.Allocator) !Task {
         var o = tk;
-        inline for (.{ "name", "do", "to", "agent", "say", "start" }) |f| @field(o, f) = try a.dupe(u8, @field(tk, f));
+        inline for (.{ "name", "do", "to", "agent", "say", "start", "start_input" }) |f| @field(o, f) = try a.dupe(u8, @field(tk, f));
         return o;
     }
 };

@@ -2205,7 +2205,37 @@ pub const Core = struct {
             if (reply.len > 0) c.sayIn(conv, reply);
             return;
         }
+        // a workflow's phrase ("goodnight") starts it, no model call (Ruling 2)
+        if (c.phraseStart(conv, text)) return;
         return c.queueMessage(conv, text, null);
+    }
+
+    /// The owner's message reads as a workflow's phrase: that workflow is
+    /// started by the owner, the message its input; what came of it is said
+    /// only when it did not start. False: no workflow has the phrase.
+    fn phraseStart(c: *Core, conv: []const u8, text: []const u8) bool {
+        var buf: [workflows.phrase_max]u8 = undefined;
+        const said = workflows.phraseOf(&buf, text) orelse return false;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const name = blk: {
+            c.settings_mutex.lockUncancelable(c.io);
+            defer c.settings_mutex.unlock(c.io);
+            for (c.wf_defs) |w| for (w.phrases) |p| if (std.mem.eql(u8, p, said)) break :blk a.dupe(u8, w.name) catch return false;
+            return false;
+        };
+        c.log.write(.chat, c.convPrivate(conv), .{ .event = "phrase", .conversation = conv, .text = text, .workflow = name }) catch {};
+        const begun = c.startInstance(a, name, .{ .at = c.now(), .by = "owner", .input = text }) catch |e| {
+            c.sayIn(conv, std.fmt.allocPrint(a, "{s} did not start: {s}", .{ name, @errorName(e) }) catch "It did not start.");
+            return true;
+        };
+        switch (begun) {
+            .started => {},
+            .queued => |n| c.sayIn(conv, std.fmt.allocPrint(a, "{s} is already going: this one waits in line ({d} waiting).", .{ name, n }) catch "It waits in line."),
+            .refused => |why| c.sayIn(conv, std.fmt.allocPrint(a, "{s} did not start: {s}", .{ name, why }) catch "It did not start."),
+        }
+        return true;
     }
 
     /// Queues the owner's message `text` in `conv` for the chat worker,
@@ -2301,6 +2331,8 @@ pub const Core = struct {
         c.unregister(&flag);
         const text = heard orelse return;
         if (flag.load(.acquire)) return;
+        // a phrase said aloud starts its workflow, as typed (Ruling 2)
+        if (c.phraseStart(conv, text)) return;
         c.chatTurnAs(conv, agent_name, text, voice_context);
     }
 
@@ -5512,7 +5544,7 @@ pub const Core = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const by = try std.fmt.allocPrint(a, "schedule:{s}", .{tk.name});
-        switch (try c.startInstance(a, tk.start, .{ .at = c.now(), .by = by })) {
+        switch (try c.startInstance(a, tk.start, .{ .at = c.now(), .by = by, .input = tk.start_input })) {
             .started => |n| try c.log.write(.task, false, .{ .name = tk.name, .event = "start", .workflow = tk.start, .instance = n }),
             .queued => |n| try c.log.write(.task, false, .{ .name = tk.name, .event = "start", .workflow = tk.start, .waiting = n }),
             .refused => |why| {
@@ -6982,10 +7014,15 @@ pub const Core = struct {
     /// fields; null when it started or waits in line, else why not.
     fn startWorkflow(c: *Core, a: std.mem.Allocator, wf: []const u8, tr: *const triggers.Trigger, ev: tstate.Event) ?[]const u8 {
         const by = std.fmt.allocPrint(a, "trigger:{s}", .{tr.name}) catch return "out of memory";
+        // its start text, filled from the event (Ruling 3), else the event
+        const input = if (tr.start_input.len > 0)
+            triggers.fill(a, tr.start_input, ev.fields) catch return "out of memory"
+        else
+            eventText(a, ev) catch return "out of memory";
         const begun = c.startInstance(a, wf, .{
             .at = c.now(),
             .by = by,
-            .input = eventText(a, ev) catch return "out of memory",
+            .input = input,
             .event = eventJson(a, ev) catch return "out of memory",
         }) catch |e| return @errorName(e);
         return switch (begun) {
@@ -8981,10 +9018,16 @@ const StepEnd = union(enum) {
 /// there (`Answer.deferred`); when the call is decided again with the
 /// owner's answer, the same question (by its hash) takes that answer,
 /// once. A tool step is not a run: nothing blocks meanwhile.
+/// What an answer kept for a step's call says when it is the owner's yes
+/// tap on the approve right before it: "yes:STEP" (STEP the call's).
+const yes_tap = "yes:";
+
 const WfAsker = struct {
     core: *Core,
     /// "workflow NAME#N/STEP": the item's waiter and run.
     label: []const u8,
+    /// The step whose call this asks for.
+    step: []const u8 = "",
     /// "[NAME#N STEP] " in front of the question.
     tag: []const u8,
     to: []const u8,
@@ -9000,6 +9043,12 @@ const WfAsker = struct {
 
     fn ask(ctx: *anyopaque, a: std.mem.Allocator, q: agent.Question) agent.Reply {
         const w: *WfAsker = @ptrCast(@alignCast(ctx));
+        // the owner's yes on the approve right before this step: its first
+        // question, once (Ruling 1)
+        for (w.answers, 0..) |p, i| if (!w.used[i] and std.mem.startsWith(u8, p.ask, yes_tap) and std.mem.eql(u8, p.ask[yes_tap.len..], w.step)) {
+            w.used[i] = true;
+            return .{ .answer = .once, .key = "once", .item = p.item };
+        };
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(q.text, &digest, .{});
         const h = std.fmt.bytesToHex(digest, .lower);
@@ -9067,6 +9116,9 @@ const InstRun = struct {
     missing: []const u8 = "",
     /// The last step run's id in the log (its step line carries it).
     rid: u64 = 0,
+    /// An approve step with yes was answered yes in this item: the next
+    /// step's call is allowed once by that tap (Ruling 1).
+    yes_item: u64 = 0,
 
     /// "workflow NAME#N/STEP": its lines' label, its items' waiter.
     fn label(r: *const InstRun, step: []const u8) []const u8 {
@@ -9370,7 +9422,16 @@ const InstRun = struct {
                 r.journal(.{ .step = s.name, .try_n = try_n, .event = "end", .ok = true, .text = text });
                 r.logStep(s, try_n, true, text);
                 switch (workflows.next(r.a, r.w, i, try r.current())) {
-                    .step => |k| r.st.step = r.w.steps[k].name,
+                    .step => |k| {
+                        r.st.step = r.w.steps[k].name;
+                        // a yes tap: the next step's call is allowed once
+                        // by it, kept on disk with the step (Ruling 1)
+                        if (r.yes_item != 0 and s.yes.len > 0 and k == i + 1) {
+                            r.st.answers = try r.a.dupe(wstate.Answer, &.{.{ .ask = try std.fmt.allocPrint(r.a, "{s}{s}", .{ yes_tap, r.w.steps[k].name }), .key = "once", .item = r.yes_item }});
+                            r.journal(.{ .step = r.w.steps[k].name, .event = "allowed", .text = try std.fmt.allocPrint(r.a, "its call, once, by the yes in item {d}", .{r.yes_item}) });
+                        }
+                        r.yes_item = 0;
+                    },
                     .end => {
                         try r.end(.done, "done");
                         return false;
@@ -9530,7 +9591,10 @@ const InstRun = struct {
             return if (s.action == .say) r.sayStep(s) else r.toolStep(s);
         }
         if (eql(u8, phase, "approve")) {
-            if (eql(u8, key, "approve")) return .{ .ok = .{ .string = "approve" } };
+            if (eql(u8, key, "approve")) {
+                if (s.yes.len > 0) r.yes_item = item;
+                return .{ .ok = .{ .string = "approve" } };
+            }
             return .{ .denied = try r.ownerWords(got, item) };
         }
         if (eql(u8, phase, "review")) {
@@ -9624,7 +9688,7 @@ const InstRun = struct {
                 const eql = std.mem.eql;
                 r.st.under_way = false;
                 r.st.status = if (eql(u8, open.kind, "interrupted")) .paused else if (eql(u8, open.kind, "failed")) .failed else .waiting;
-                const phase: []const u8 = if (eql(u8, open.kind, "interrupted")) "interrupted" else if (eql(u8, open.kind, "failed")) "failed" else if (eql(u8, open.kind, "question")) "approve" else if (eql(u8, open.kind, "draft")) "review" else "approval";
+                const phase: []const u8 = if (eql(u8, open.kind, "interrupted")) "interrupted" else if (eql(u8, open.kind, "failed")) "failed" else if (eql(u8, open.kind, "question") or eql(u8, open.kind, "confirm")) "approve" else if (eql(u8, open.kind, "draft")) "review" else "approval";
                 // an approval answers the question it shows: its hash from its text
                 const ask: []const u8 = if (eql(u8, phase, "approval")) try askHash(r.a, open.body, r.askTag(s.name)) else "";
                 r.st.wait = .{ .kind = .item, .item = open.id, .phase = phase, .ask = ask, .since = r.c.now() };
@@ -9694,6 +9758,7 @@ const InstRun = struct {
         return .{
             .core = r.c,
             .label = r.label(s.name),
+            .step = s.name,
             .tag = r.askTag(s.name),
             .to = r.w.to,
             .timeout_s = s.timeout(),
@@ -9726,7 +9791,7 @@ const InstRun = struct {
         defer client.deinit();
         var ask = try r.asker(s);
         var run = r.stepRun(&client, s, &ask);
-        var out: Core.RunOut = .{ .core = r.c, .tag = r.tag(), .agent = "", .run = &run };
+        var out: Core.RunOut = .{ .core = r.c, .tag = if (r.w.tag) r.tag() else "", .agent = "", .run = &run };
         run.outbox = out.outbox();
         try run.logRun(.workflow, false, .{ .instance = r.id, .event = "step", .step = s.name, .@"try" = r.st.try_n });
         r.rid = run.rid;
@@ -9849,7 +9914,20 @@ const InstRun = struct {
         r.c.log.write(.gate, private, .{ .run = lbl, .by = who.by, .conversation = r.w.to, .tool = "ask_owner", .decision = @tagName(d.action), .why = d.why, .arg = util.cut(r.st.call, 500) }) catch {};
         if (d.action == .deny) return .{ .failed = .{ .why = try std.fmt.allocPrint(r.a, "refused by the gate: {s}", .{d.why}), .retry = false } };
         const now_s = r.c.now();
-        const made = if (approve) blk: {
+        const made = if (approve and s.yes.len > 0) r.newItem(.{
+            // its text alone and the two buttons: the yes makes the next
+            // step's call (Ruling 1)
+            .kind = "confirm",
+            .by = r.by(s.name),
+            .run = lbl,
+            .conversation = r.w.to,
+            .waiter = lbl,
+            .title = firstLine(r.st.call),
+            .body = r.st.call,
+            .choices = &.{ .{ .key = "approve", .label = s.yes }, .{ .key = "deny", .label = s.no } },
+            .expires = now_s + s.timeout(),
+            .private = private,
+        }) else if (approve) blk: {
             const body = try std.fmt.allocPrint(r.a, "{s}{s}", .{ r.tag(), r.st.call });
             break :blk r.newItem(.{
                 .kind = "question",
@@ -10144,6 +10222,9 @@ pub fn readWorkflows(io: Io, a: std.mem.Allocator, dir: []const u8, ctx: workflo
             error.OutOfMemory => return e,
             error.BadWorkflow => return .{ .why = try workflows.lineProblem(a, file, text, diag) },
         };
+        // a phrase starts one workflow (Ruling 2)
+        for (w.phrases) |p| for (list.items) |o| for (o.phrases) |q| if (std.mem.eql(u8, p, q))
+            return .{ .why = try std.fmt.allocPrint(a, "{s}: the phrase \"{s}\" starts workflow {s} already", .{ file, p, o.name }) };
         h.update(file_name);
         h.update("\x00");
         h.update(text);
@@ -16477,6 +16558,115 @@ test "an_approve_answer_grants_nothing" {
     try t.expect(std.mem.indexOf(u8, grants, "fake/echo") == null);
     try t.expectEqualStrings("approve", jv.str(jv.get(jv.parse(a, (try instState(&f, "gated#1")).values), "ok")).?);
 }
+
+// ---- routines: the one-tap approve, phrases, a trigger's start text ----
+
+test "a_yes_tap_makes_the_next_call_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    _ = try withFake(&f, false);
+    try setWorkflow(&f, "gated", "workflow gated\nstep ok\napprove Echo it?\nyes Echo it\nno Leave it\nstep call\ntool fake/echo {\"text\": \"x\"}\nstep again\ntool fake/echo {\"text\": \"y\"}\n");
+    _ = try f.core.command(a, "/workflow start gated");
+    runWorkflows(&f);
+    // one message: the text alone, with the two buttons
+    try f.rec.waitFor("BUTTONS Echo it? [");
+    try t.expectEqual(0, f.rec.count("Question ["));
+    try t.expectEqual(0, f.rec.count("[gated#1 ok]"));
+    try expectHas(try inboxFile(&f), "\"choices\":[{\"key\":\"approve\",\"label\":\"Echo it\"},{\"key\":\"deny\",\"label\":\"Leave it\"}]");
+    try f.press("approve");
+    runWorkflows(&f);
+    // the tap made the next step's call: its value is the call's output
+    try t.expectEqualStrings("x", jv.str(jv.get(jv.parse(a, (try instState(&f, "gated#1")).values), "call")).?);
+    try expectHas(try logText(&f), "\"decision\":\"allow\",\"why\":\"allowed once by the owner (item 1)\"");
+    // the step after it is asked as any call is
+    try f.rec.waitFor("BUTTONS Allow this? [2]\n[gated#1 again] fake__echo: fake/echo {\"text\":\"y\"}");
+    // nothing kept for later
+    const grants = Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.grants, a, .unlimited) catch "";
+    try t.expect(std.mem.indexOf(u8, grants, "fake/echo") == null);
+    // the message shows what came of the tap
+    try f.rec.waitFor("Echo it?\nEcho it, ");
+}
+
+test "a_no_tap_or_no_answer_makes_no_call" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    _ = try withFake(&f, false);
+    try setWorkflow(&f, "gated", "workflow gated\ntag no\nstep ok\napprove Echo it?\nyes Echo it\nno Leave it\ntimeout 1h\non deny goto left\nstep call\ntool fake/echo {\"text\": \"x\"}\nend\nstep left\nsay Left as it is.\n");
+    _ = try f.core.command(a, "/workflow start gated");
+    runWorkflows(&f);
+    try f.rec.waitFor("BUTTONS Echo it? [");
+    try f.press("deny");
+    runWorkflows(&f);
+    try f.rec.waitFor("Left as it is.");
+    try t.expect(jv.get(jv.parse(a, (try instState(&f, "gated#1")).values), "call") == null);
+    // no answer in time: as no
+    const t0 = util.nowSeconds(t.io);
+    _ = try f.core.command(a, "/workflow start gated");
+    runWorkflows(&f);
+    f.core.fixed_now = t0 + 3600 + 5;
+    f.core.tick();
+    runWorkflows(&f);
+    try t.expectEqual(2, f.rec.count("Left as it is."));
+    try t.expect(jv.get(jv.parse(a, (try instState(&f, "gated#2")).values), "call") == null);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"tool\":\"fake__echo\"") == null);
+    // its posts go without [gated#N] in front
+    try t.expectEqual(0, f.rec.count("[gated#"));
+}
+
+test "a_phrase_starts_its_workflow_without_the_model" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try setWorkflow(&f, "goodnight", "workflow goodnight\nphrases goodnight, good night\ntag no\nstep a\nsay Night night. ({input})\n");
+    try f.core.handleTextIn("main", "Good night! \xf0\x9f\x8c\x99");
+    runWorkflows(&f);
+    try f.rec.waitFor("Night night. (Good night! \xf0\x9f\x8c\x99)");
+    try t.expectEqual(0, f.e.server.modelRequests());
+    try t.expectEqual(0, f.core.queue.items.len);
+    try expectHas(try logText(&f), "\"instance\":\"goodnight#1\",\"event\":\"start\",\"by\":\"owner\"");
+    // a phrase starts one workflow
+    try writeWorkflow(&f, "sleep", "workflow sleep\nphrases Goodnight\nstep a\nsay zz\n");
+    try expectHas(try f.core.reload(), "workflows/sleep.wf: the phrase \"goodnight\" starts workflow goodnight already");
+    // other words are a message for the agent, as before
+    try f.core.handleTextIn("main", "good night everyone");
+    try t.expectEqual(1, f.core.queue.items.len);
+}
+
+test "a_phrase_said_in_a_voice_note_starts_it_too" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try voiceSetup(&f, "");
+    try setWorkflow(&f, "goodnight", "workflow goodnight\nphrases goodnight, good night\ntag no\nstep a\nsay Night night.\n");
+    try sttScript(&f, 1, "{\"text\":\" Good night.\"}");
+    try f.core.startWorker();
+    try f.core.handleIncoming(voiceNote(2));
+    try f.rec.waitFor("\"Good night.\"");
+    runWorkflows(&f);
+    try f.rec.waitFor("Night night.");
+    try t.expectEqual(0, f.e.server.modelRequests());
+}
+
+test "a_trigger_start_text_is_the_input" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try writePage(&f, "z.xml", try rssOf(&f, &.{"a"}));
+    try writeTriggers(&f, try std.mem.replaceOwned(u8, f.e.arena.allocator(), "[news]\nfeed = URL/page/z.xml\nstart = workflow tell About {title}\n", "URL", try f.e.url()));
+    try setWorkflow(&f, "tell", "workflow tell\nstart trigger:news\ntag no\nstep a\nsay {input}: {event.link}\n");
+    _ = try f.core.pollNow("news");
+    try writePage(&f, "z.xml", try rssOf(&f, &.{ "a", "b" }));
+    _ = try f.core.pollNow("news");
+    f.core.tick();
+    waitIdle(f.core);
+    runWorkflows(&f);
+    try f.rec.waitFor("About b: https://z.org/b");
+}
+
 
 
 test "agent_steps_are_started_by_workflow_name_step_with_ask_as_deny" {
