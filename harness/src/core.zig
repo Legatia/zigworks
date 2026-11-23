@@ -22824,7 +22824,8 @@ test "the_owner_mails_the_butler_and_the_answer_comes_in_the_thread" {
     // nothing of it in Telegram, and the reply was never asked about
     try t.expectEqual(0, f.rec.count("I'll remind you"));
     try t.expectEqual(0, f.rec.count("BUTTONS"));
-    try expectHas(try logText(&f), "\"event\":\"mail reply\",\"conversation\":\"email\"");
+    // logged once mail_send has answered, after the stand-in wrote sent.jsonl
+    try waitLog(&f, "\"event\":\"mail reply\",\"conversation\":\"email\"");
     // the same mail again: no second turn
     try f.core.mailCheck();
     try t.expectEqual(0, f.core.queue.items.len);
