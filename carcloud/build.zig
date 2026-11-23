@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{ .name = "carcloud", .root_module = mod });
     b.installArtifact(exe);
 
-    // A stand-in for Smartcar, to try it without an account.
+    // A stand-in for Smartcar and for Tesla, to try it without an account.
     const sim_mod = module(b, "src/sim_main.zig", target, optimize, strip);
     sim_mod.addOptions("build_options", options);
     const sim = b.addExecutable(.{ .name = "carcloud-sim", .root_module = sim_mod });
@@ -21,6 +21,10 @@ pub fn build(b: *std.Build) void {
 
     const unit = b.addTest(.{ .root_module = mod });
     const run_unit = b.addRunArtifact(unit);
+    // the stand-ins' own tests (the proxy's certificate checked)
+    const sim_unit = b.addTest(.{ .root_module = sim_mod });
+    const run_sim_unit = b.addRunArtifact(sim_unit);
+    run_unit.step.dependOn(&run_sim_unit.step);
 
     const sh = if (@import("builtin").os.tag == .windows) "sh" else "/bin/sh";
     const smoke = b.addSystemCommand(&.{ sh, "scripts/smoke.sh" });
