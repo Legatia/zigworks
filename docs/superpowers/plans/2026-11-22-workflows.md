@@ -177,7 +177,8 @@ Made while building:
   refused, and on the answer the call is decided again, its same question
   (by its SHA-256 in `state`) taking the answer once; a new question then
   waits as a new item. – An answer must never cover a question the owner
-  did not see. – A redirect asks twice.
+  did not see. – A redirect asks twice. (Its "takes the answer once" is
+  R28 now: one answer kept per question.)
 - R23. `/stop` with an instance's job between two steps pauses it too, an
   `interrupted` item saying the step had not begun (Run again goes on). –
   "/stop stops everything"; a job left running would go on at the next
@@ -190,6 +191,47 @@ Made while building:
   secrets). – Keeps the existing tests untouched. – None.
 - R26. A step's `{now}` is the owner's local time (`2026-11-22 14:03`), not
   kept in the values on disk. – Readable in a message. – None.
+
+Made after the review (an independent read of the branch):
+
+- R27. An instance waits on one item at a time: making one withdraws any
+  other open item of the instance, and a step's start withdraws items
+  left open (made before a crash, its state not yet saying so); a
+  cut-off step takes up only an item made since it began. – A stray item's
+  buttons do nothing, and an old "had not begun" item taken for a later
+  cut-off would run a step that may have been done. – An item made in the
+  instant before a crash is withdrawn, not shown again.
+- R28. A call's answers are kept in `state` (`answers`: each question's
+  SHA-256, once or day, the item) and the call is decided again with them
+  all, each answer for its own question, once per decision; they go when
+  the step ends or is cut off (Run again asks again). An approval taken up
+  after a crash gets its question's hash from the item's text. – With one
+  answer kept, a redirect to another host asked the first question again
+  forever; with no hash, an answer covered a question since changed. –
+  None.
+- R29. A gate question or an `approve` text that the `[NAME#N STEP]` tag
+  takes past the 12 KB an item holds is not asked: the step fails (refused
+  by the gate, no retry). – An item cuts its body silently, so the owner
+  would allow what they did not see. – A call just under 12 KB fails in a
+  workflow that chat would have asked.
+- R30. `days` is checked each time the job turns, and the tick wakes an
+  instance at its end (`ends` in `state`), so a waiting or paused one
+  fails then and its items close. – The spec's "fails; its inbox items
+  close". – None.
+- R31. A start waiting in line is kept masked and checked against `start`
+  again when its place comes; one no longer named is dropped (log
+  `dropped`). – No secret kept on disk; the owner narrowed who may start
+  it. – None.
+- R32. The lines of a workflow whose `to` is private are private (its
+  input, results and approve text as sizes and keyed hashes; a failure's
+  `why` in its `end` line is only "step S failed"); `instance` and `step`
+  join the log's readable labels. – Rule: a private conversation keeps
+  sizes and hashes. – The change to log.zig's label list touches a shared
+  file (one line).
+- R33. `/workflow stop` that comes while a step goes on to wait ends the
+  instance when its job returns (not while harness quits). Values read
+  from `state` are kept in bounds (a try from 1, times from 0). – The stop
+  was lost; a hand-edited file crashed harness at every start. – None.
 
 ## File map
 
@@ -555,10 +597,14 @@ unasked), main `harness_workflow_takes_list_check_start_stop`, agent
   the job's loop in Task 4, which needs it; its three tests were added in
   Task 8 and passed at once. Run with the decision switched off, all three
   failed, so they test it.
-- Results: Debug 670/680 and ReleaseSafe 670/680 (10 skipped: Windows
-  only), smoke all ok (75); `zig build` and `zig build unit-build` for
-  x86_64-windows, x86_64-linux-musl and aarch64-linux-musl. No flake seen
-  in the full runs.
+- After Task 10 an independent review of the branch found two crash
+  windows (fixed in c225010: items made before the state that waits on
+  them, approve and review through the gate as ask_owner) and ten more
+  (R27 to R33, each with a test that failed first). Existing test changed
+  on purpose there: wstate `state_is_written_whole_and_read_back` also
+  round-trips `answers` and `ends`.
+- Results: see the final run in the report (Debug, ReleaseSafe, smoke,
+  cross builds). No flake seen in the full runs.
 - Left out: snapshots around a tool step (a step is not a run; an agent
   step's run takes them as any run); `say` carries no files or quick
   replies; an instance started by `harness workflow start` whose step asks

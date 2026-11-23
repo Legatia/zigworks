@@ -270,7 +270,7 @@ const TrigInfo = struct {
 };
 
 /// Tests: where an instance's job stops, as if harness stopped there.
-const WfStop = enum { none, after_mark, after_result };
+const WfStop = enum { none, after_mark, after_result, stop_in_step };
 
 /// An instance going, as its state on disk says (a copy, in its own
 /// arena); under wf_mutex.
@@ -5786,7 +5786,11 @@ pub const Core = struct {
         if (all >= c.cfg.workflows.instances) return .{ .refused = try std.fmt.allocPrint(a, "{d} instances are going, the most at once ([workflows] instances)", .{all}) };
         if (c.liveCount(name) >= w.limits.at_once) {
             const d = try c.wfDir(a, name);
-            const n = (try d.pushLine(a, s, max_line)) orelse return .{ .refused = try std.fmt.allocPrint(a, "{s} has {d} instances going and {d} starts waiting in line", .{ name, w.limits.at_once, max_line }) };
+            // kept in line masked: no stored secret is kept
+            var q = s;
+            q.input = try c.masks.scrubAlloc(a, s.input);
+            q.event = try c.masks.scrubAlloc(a, s.event);
+            const n = (try d.pushLine(a, q, max_line)) orelse return .{ .refused = try std.fmt.allocPrint(a, "{s} has {d} instances going and {d} starts waiting in line", .{ name, w.limits.at_once, max_line }) };
             c.log.write(.workflow, false, .{ .name = name, .event = "queued", .by = s.by, .waiting = n }) catch {};
             return .{ .queued = n };
         }
@@ -5803,10 +5807,11 @@ pub const Core = struct {
         const now_s = c.now();
         // what the owner or a source said: no stored secret is kept
         const input = try c.masks.scrubAlloc(a, s.input);
+        const event = try c.masks.scrubAlloc(a, s.event);
         var values: std.json.ObjectMap = .empty;
         try values.put(a, "input", .{ .string = input });
         try values.put(a, "instance", .{ .string = id });
-        if (s.event.len > 0) if (jv.parse(a, s.event)) |ev| if (ev == .object) try values.put(a, "event", ev);
+        if (event.len > 0) if (jv.parse(a, event)) |ev| if (ev == .object) try values.put(a, "event", ev);
         const st: wstate.State = .{
             .name = w.name,
             .n = n,
@@ -5817,12 +5822,13 @@ pub const Core = struct {
             .input = input,
             .started = now_s,
             .updated = now_s,
+            .ends = now_s + @as(i64, w.limits.days) * 86400,
             .values = try std.json.Stringify.valueAlloc(a, jv.Value{ .object = values }, .{}),
         };
         const inst = try d.instance(a, n);
         try inst.create(a, w.text, st);
         inst.journal(a, .{ .at = now_s, .event = "start", .text = s.by }) catch {};
-        c.log.write(.workflow, false, .{ .instance = id, .event = "start", .by = s.by, .agent = if (s.agent.len > 0) @as(?[]const u8, s.agent) else null, .input = util.cut(input, 200) }) catch {};
+        c.log.write(.workflow, c.convPrivate(w.to), .{ .instance = id, .event = "start", .by = s.by, .agent = if (s.agent.len > 0) @as(?[]const u8, s.agent) else null, .input = util.cut(input, 200) }) catch {};
         const info = try c.keepInfo(id, st);
         info.due = true;
         return n;
@@ -5845,7 +5851,8 @@ pub const Core = struct {
             for (c.wf_list.items) |info| {
                 if (info.busy) continue;
                 const s = info.state;
-                const go = info.due or s.status == .running or (s.status == .waiting and switch (s.wait.kind) {
+                // past its days: it fails, waiting or not
+                const go = info.due or s.status == .running or (s.live() and s.ends > 0 and now_s >= s.ends) or (s.status == .waiting and switch (s.wait.kind) {
                     .timer, .retry, .day => now_s >= s.wait.until,
                     .event => s.wait.got or (s.wait.until > 0 and now_s >= s.wait.until),
                     .item, .none => false,
@@ -5868,14 +5875,21 @@ pub const Core = struct {
         return it.status != .open and !it.settling;
     }
 
-    /// The oldest start waiting in line for `w`, when it has a place.
+    /// The oldest start waiting in line for `w`, when it has a place: one
+    /// its start line no longer names is dropped (logged), the next tried.
     fn startFromLine(c: *Core, a: std.mem.Allocator, w: workflows.Workflow) void {
         c.wf_mutex.lockUncancelable(c.io);
         defer c.wf_mutex.unlock(c.io);
         if (c.liveCount(w.name) >= w.limits.at_once or c.liveCount(null) >= c.cfg.workflows.instances) return;
         const d = c.wfDir(a, w.name) catch return;
-        const s = (d.popLine(a) catch return) orelse return;
-        if (c.createInstance(a, w, s)) |_| {} else |e| c.log.write(.workflow, false, .{ .name = w.name, .event = "failed", .why = @errorName(e) }) catch {};
+        while (d.popLine(a) catch null) |s| {
+            if (!w.allows(s.by, s.tool)) {
+                c.log.write(.workflow, false, .{ .name = w.name, .event = "dropped", .by = s.by, .why = "its start line no longer names it" }) catch {};
+                continue;
+            }
+            if (c.createInstance(a, w, s)) |_| {} else |e| c.log.write(.workflow, false, .{ .name = w.name, .event = "failed", .why = @errorName(e) }) catch {};
+            return;
+        }
     }
 
     /// Runs instance `id`'s job in a background slot (one at a time); with
@@ -5959,6 +5973,8 @@ pub const Core = struct {
             return;
         };
         try r.go();
+        // `/workflow stop` came while its step went on to wait: it ends now
+        if ((r.st.live() or (r.st.status == .failed and r.st.wait.item != 0)) and !c.quitting.load(.acquire) and r.stopAsked()) try r.stopByOwner();
     }
 
     /// Counts an agent step toward today's (`[workflows]
@@ -6039,13 +6055,13 @@ pub const Core = struct {
 
     /// An open item a step's label waits on (made before a crash let the
     /// instance's state say so): its id and kind; null when none.
-    const OpenItem = struct { id: u64, kind: []const u8 };
+    const OpenItem = struct { id: u64, kind: []const u8, body: []const u8 };
 
     fn openItemFor(c: *Core, a: std.mem.Allocator, label: []const u8) ?OpenItem {
         c.inbox.mutex.lockUncancelable(c.io);
         defer c.inbox.mutex.unlock(c.io);
         for (c.inbox.items.items) |it| if (it.status == .open and std.mem.eql(u8, it.waiter, label))
-            return .{ .id = it.id, .kind = a.dupe(u8, it.kind) catch return null };
+            return .{ .id = it.id, .kind = a.dupe(u8, it.kind) catch return null, .body = a.dupe(u8, it.body) catch return null };
         return null;
     }
 
@@ -7335,12 +7351,10 @@ const WfAsker = struct {
     tag: []const u8,
     to: []const u8,
     timeout_s: u32,
-    /// The owner's answer to the question whose hash is `asked` ("": the
-    /// first question takes it, as when an item was taken up after a
-    /// restart).
-    answer: ?agent.Reply = null,
-    asked: []const u8 = "",
-    used: bool = false,
+    /// The owner's answers to the call's questions so far, each for the
+    /// question whose hash it holds, and used once each (R28).
+    answers: []const wstate.Answer = &.{},
+    used: []bool = &.{},
     /// A question went to the inbox: its item and hash.
     deferred: bool = false,
     item: u64 = 0,
@@ -7351,14 +7365,21 @@ const WfAsker = struct {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(q.text, &digest, .{});
         const h = std.fmt.bytesToHex(digest, .lower);
-        if (w.answer) |ans| if (!w.used and (w.asked.len == 0 or std.mem.eql(u8, w.asked, &h))) {
-            w.used = true;
-            return ans;
+        for (w.answers, 0..) |p, i| if (!w.used[i] and std.mem.eql(u8, p.ask, &h)) {
+            w.used[i] = true;
+            return .{ .answer = if (std.mem.eql(u8, p.key, "day")) .day else .once, .key = p.key, .item = p.item };
         };
         // one question at a time: the call stopped at the first
         if (w.deferred) return .{ .answer = .full, .text = "the step's first question waits in the inbox" };
         const c = w.core;
         const body = std.fmt.allocPrint(a, "{s}{s}", .{ w.tag, q.text }) catch return .{ .answer = .unsent };
+        // all of it is shown, or nothing is asked (R29)
+        if (body.len > inbox_mod.max_body) return .{ .answer = .full, .text = std.fmt.allocPrint(a, "too long to ask the owner with the step's tag ({d} bytes; an inbox item holds {d}): make the call smaller", .{ body.len, inbox_mod.max_body }) catch "too long to ask the owner" };
+        // an instance waits on one item at a time (R27)
+        if (std.mem.startsWith(u8, w.label, "workflow ")) {
+            const rest = w.label["workflow ".len..];
+            c.withdrawWorkflowItems(rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len], "a later item took its place");
+        }
         var choices: [3]inbox_mod.Choice = undefined;
         var n: usize = 0;
         choices[n] = .{ .key = "once", .label = "Allow once" };
@@ -7390,9 +7411,6 @@ const WfAsker = struct {
         return .{ .answer = .deferred, .item = id };
     }
 };
-
-/// An answer to a step's question, for the call decided again.
-const Answered = struct { reply: agent.Reply, asked: []const u8 };
 
 /// One instance as its job runs it: its folder, its own workflow file,
 /// its state and values. Every change is on disk (`save`) before what
@@ -7445,15 +7463,17 @@ const InstRun = struct {
     }
 
     fn logStep(r: *InstRun, s: workflows.Step, try_n: u32, ok: bool, text: []const u8) void {
-        r.c.log.write(.workflow, false, .{ .instance = r.id, .event = "step", .step = s.name, .@"try" = try_n, .ok = ok, .result = util.cut(text, 200), .rid = if (r.rid != 0) @as(?u64, r.rid) else null, .by = r.by(s.name), .conversation = r.w.to }) catch {};
+        r.c.log.write(.workflow, r.c.convPrivate(r.w.to), .{ .instance = r.id, .event = "step", .step = s.name, .@"try" = try_n, .ok = ok, .result = util.cut(text, 200), .rid = if (r.rid != 0) @as(?u64, r.rid) else null, .by = r.by(s.name), .conversation = r.w.to }) catch {};
     }
 
     fn go(r: *InstRun) !void {
+        if (try r.outOfDays()) return;
         // a step under way at the job's start: harness stopped while it ran (R12)
         if (r.st.under_way and r.st.status == .running) try r.cutOff("when harness stopped");
         var rounds: usize = 0;
         while (rounds < 100_000) : (rounds += 1) {
             if (r.flag.load(.acquire)) return r.stopped();
+            if (try r.outOfDays()) return;
             const more = switch (r.st.status) {
                 .running => try r.runStep(),
                 .waiting => try r.resolveWait(),
@@ -7470,18 +7490,41 @@ const InstRun = struct {
     /// stop`), it ends; by /stop, it pauses with an `interrupted` item.
     fn stopped(r: *InstRun) !void {
         if (r.c.quitting.load(.acquire)) return;
-        const asked = blk: {
-            r.c.wf_mutex.lockUncancelable(r.c.io);
-            defer r.c.wf_mutex.unlock(r.c.io);
-            const info = r.c.wfInfo(r.id) orelse break :blk false;
-            break :blk info.stop;
-        };
-        if (asked) {
-            try r.end(.stopped, "stopped by the owner");
-            r.c.log.write(.workflow, false, .{ .instance = r.id, .event = "stopped", .by = "owner" }) catch {};
-            return;
-        }
+        if (r.stopAsked()) return r.stopByOwner();
         if (r.st.status == .running) try r.cutOff("when you sent /stop");
+    }
+
+    /// Whether `/workflow stop` (or rm) asked for it to end.
+    fn stopAsked(r: *InstRun) bool {
+        r.c.wf_mutex.lockUncancelable(r.c.io);
+        defer r.c.wf_mutex.unlock(r.c.io);
+        const info = r.c.wfInfo(r.id) orelse return false;
+        return info.stop;
+    }
+
+    fn stopByOwner(r: *InstRun) !void {
+        try r.end(.stopped, "stopped by the owner");
+        r.c.log.write(.workflow, false, .{ .instance = r.id, .event = "stopped", .by = "owner" }) catch {};
+    }
+
+    /// When it runs out of days.
+    fn deadline(r: *const InstRun) i64 {
+        return if (r.st.ends > 0) r.st.ends else r.st.started +| @as(i64, r.w.limits.days) * 86400;
+    }
+
+    /// Past its days (`limits days`), going: it fails, its items close (R30).
+    fn outOfDays(r: *InstRun) !bool {
+        if (!r.st.live() or r.c.now() < r.deadline()) return false;
+        try r.failNoItem(try std.fmt.allocPrint(r.a, "it ran out of days (at most {d})", .{r.w.limits.days}));
+        return true;
+    }
+
+    /// Makes an item the instance waits on; any other open item of the
+    /// instance (made before harness stopped, its state not yet saying
+    /// so) is withdrawn first: it waits on one item at a time (R27).
+    fn newItem(r: *InstRun, n: inbox_mod.New) !u64 {
+        r.c.withdrawWorkflowItems(r.id, "a later item took its place");
+        return r.c.addItem(n);
     }
 
     /// It ends (`done`, `failed` with no item, `stopped`): written,
@@ -7515,7 +7558,7 @@ const InstRun = struct {
         // the item first, then the state that waits on it: a crash between
         // leaves the step under way, and the next start takes the item up
         const lbl = r.label(s.name);
-        const item = r.c.addItem(.{
+        const item = r.newItem(.{
             .kind = "failed",
             .by = r.by(s.name),
             .run = lbl,
@@ -7534,7 +7577,9 @@ const InstRun = struct {
         r.st.wait = if (item != 0) .{ .kind = .item, .item = item, .phase = "failed", .since = r.c.now() } else .{};
         try r.save();
         r.journal(.{ .step = s.name, .event = "failed", .text = why });
-        r.c.log.write(.workflow, false, .{ .instance = r.id, .event = "end", .status = "failed", .why = r.st.why, .item = item }) catch {};
+        // a private conversation's line keeps the step's name, not its words
+        const logged = if (r.c.convPrivate(r.w.to)) try std.fmt.allocPrint(r.a, "step {s} failed", .{s.name}) else r.st.why;
+        r.c.log.write(.workflow, false, .{ .instance = r.id, .event = "end", .status = "failed", .why = logged, .item = item }) catch {};
     }
 
     /// The values as a step reads them: the instance's, and `now`.
@@ -7567,12 +7612,11 @@ const InstRun = struct {
             return false;
         };
         const s = r.w.steps[i];
+        // a step begins: an item still open from before (made as harness
+        // stopped, its state not saying so) is no longer waited on (R27)
+        r.c.withdrawWorkflowItems(r.id, "its instance went on");
         if (r.st.steps >= r.w.limits.steps) {
             try r.failNoItem(try std.fmt.allocPrint(r.a, "step limit: {d} steps", .{r.w.limits.steps}));
-            return false;
-        }
-        if (r.c.now() - r.st.started >= @as(i64, r.w.limits.days) * 86400) {
-            try r.failNoItem(try std.fmt.allocPrint(r.a, "it ran out of days (at most {d})", .{r.w.limits.days}));
             return false;
         }
         // an agent step: a place of its definition, and today's count
@@ -7599,6 +7643,13 @@ const InstRun = struct {
         r.journal(.{ .step = s.name, .try_n = r.st.try_n, .event = "start" });
         // tests: harness stops here
         if (r.c.wf_test_stop == .after_mark) return false;
+        // tests: `/workflow stop` comes while the step runs
+        if (r.c.wf_test_stop == .stop_in_step) {
+            r.c.wf_mutex.lockUncancelable(r.c.io);
+            defer r.c.wf_mutex.unlock(r.c.io);
+            if (r.c.wfInfo(r.id)) |info| info.stop = true;
+            r.flag.store(true, .release);
+        }
         // its step line names its own run, if it has one
         r.rid = 0;
         const out = try r.act(s, place);
@@ -7608,9 +7659,9 @@ const InstRun = struct {
     fn act(r: *InstRun, s: workflows.Step, def: ?agents.Def) !StepEnd {
         return switch (s.action) {
             .none => .{ .ok = null },
-            .say => r.sayStep(s, null),
+            .say => r.sayStep(s),
             .wait => |wt| r.waitStep(s, wt),
-            .tool => r.toolStep(s, null),
+            .tool => r.toolStep(s),
             .do => r.agentStep(s, def.?),
             .approve => r.askStep(s, true),
             .review => r.askStep(s, false),
@@ -7677,6 +7728,7 @@ const InstRun = struct {
                 r.st.try_n = 1;
                 r.st.wait = .{};
                 r.st.call = "";
+                r.st.answers = &.{};
                 r.journal(.{ .step = s.name, .try_n = try_n, .event = "end", .ok = true, .text = text });
                 r.logStep(s, try_n, true, text);
                 switch (workflows.next(r.a, r.w, i, try r.current())) {
@@ -7697,6 +7749,7 @@ const InstRun = struct {
                 r.st.status = .running;
                 r.st.under_way = false;
                 r.st.call = "";
+                r.st.answers = &.{};
                 r.journal(.{ .step = s.name, .try_n = try_n, .event = "end", .ok = false, .text = f.why });
                 r.logStep(s, try_n, false, f.why);
                 if (f.retry and try_n <= s.retry) {
@@ -7725,6 +7778,7 @@ const InstRun = struct {
                 r.st.status = .running;
                 r.st.under_way = false;
                 r.st.call = "";
+                r.st.answers = &.{};
                 r.st.try_n = 1;
                 r.st.wait = .{};
                 r.journal(.{ .step = s.name, .try_n = try_n, .event = "end", .ok = false, .text = why });
@@ -7827,13 +7881,15 @@ const InstRun = struct {
         const phase = r.st.wait.phase;
         if (eql(u8, phase, "approval")) {
             if (!(eql(u8, key, "once") or eql(u8, key, "day"))) return .{ .denied = try r.ownerWords(got, item) };
-            const answered: Answered = .{ .reply = .{ .answer = if (eql(u8, key, "day")) .day else .once, .key = key, .item = item }, .asked = r.st.wait.ask };
+            // decided again with every answer so far, each for its own
+            // question (R28)
+            r.st.answers = try std.mem.concat(r.a, wstate.Answer, &.{ r.st.answers, &[_]wstate.Answer{.{ .ask = r.st.wait.ask, .key = key, .item = item }} });
             r.st.status = .running;
             r.st.wait = .{};
             r.st.under_way = true;
             try r.save();
             r.journal(.{ .step = s.name, .try_n = r.st.try_n, .event = "start", .text = try std.fmt.allocPrint(r.a, "allowed (item {d})", .{item}) });
-            return if (s.action == .say) r.sayStep(s, answered) else r.toolStep(s, answered);
+            return if (s.action == .say) r.sayStep(s) else r.toolStep(s);
         }
         if (eql(u8, phase, "approve")) {
             if (eql(u8, key, "approve")) return .{ .ok = .{ .string = "approve" } };
@@ -7931,7 +7987,9 @@ const InstRun = struct {
                 r.st.under_way = false;
                 r.st.status = if (eql(u8, open.kind, "interrupted")) .paused else if (eql(u8, open.kind, "failed")) .failed else .waiting;
                 const phase: []const u8 = if (eql(u8, open.kind, "interrupted")) "interrupted" else if (eql(u8, open.kind, "failed")) "failed" else if (eql(u8, open.kind, "question")) "approve" else if (eql(u8, open.kind, "draft")) "review" else "approval";
-                r.st.wait = .{ .kind = .item, .item = open.id, .phase = phase, .since = r.c.now() };
+                // an approval answers the question it shows: its hash from its text
+                const ask: []const u8 = if (eql(u8, phase, "approval")) try askHash(r.a, open.body, r.askTag(s.name)) else "";
+                r.st.wait = .{ .kind = .item, .item = open.id, .phase = phase, .ask = ask, .since = r.c.now() };
                 if (r.st.status == .failed and r.st.ended == 0) r.st.ended = r.c.now();
                 try r.save();
                 r.journal(.{ .step = s.name, .try_n = r.st.try_n, .event = "resume", .text = try std.fmt.allocPrint(r.a, "cut off {s}; its item {d} waits", .{ when, open.id }) });
@@ -7951,7 +8009,7 @@ const InstRun = struct {
             try std.fmt.allocPrint(r.a, "{s}Step {s} had not begun {s}.\nRun again goes on with it; Skip goes on as if it failed; Stop ends the instance.", .{ r.tag(), s.name, when });
         // the item first, then the state that waits on it: a crash between
         // leaves the step under way, and the next start takes the item up
-        const item = r.c.addItem(.{
+        const item = r.newItem(.{
             .kind = "interrupted",
             .by = r.by(s.name),
             .run = lbl,
@@ -7966,6 +8024,8 @@ const InstRun = struct {
         if (item == 0) return r.failNoItem("it was cut off, and how it should go on could not be asked");
         r.st.status = .paused;
         r.st.under_way = false;
+        // Run again asks each question again
+        r.st.answers = &.{};
         r.st.wait = .{ .kind = .item, .item = item, .phase = "interrupted", .since = r.c.now() };
         try r.save();
         r.journal(.{ .step = s.name, .try_n = r.st.try_n, .event = "paused", .text = try std.fmt.allocPrint(r.a, "cut off {s} (item {d})", .{ when, item }) });
@@ -7984,16 +8044,23 @@ const InstRun = struct {
         return .waits;
     }
 
-    /// The asker of step `s`'s gate questions.
-    fn asker(r: *InstRun, s: workflows.Step, answered: ?Answered) WfAsker {
+    /// "[NAME#N STEP] ", in front of a step's gate questions.
+    fn askTag(r: *const InstRun, step: []const u8) []const u8 {
+        return std.fmt.allocPrint(r.a, "[{s} {s}] ", .{ r.id, step }) catch "";
+    }
+
+    /// The asker of step `s`'s gate questions, with the owner's answers so far.
+    fn asker(r: *InstRun, s: workflows.Step) !WfAsker {
+        const used = try r.a.alloc(bool, r.st.answers.len);
+        @memset(used, false);
         return .{
             .core = r.c,
             .label = r.label(s.name),
-            .tag = std.fmt.allocPrint(r.a, "[{s} {s}] ", .{ r.id, s.name }) catch "",
+            .tag = r.askTag(s.name),
             .to = r.w.to,
             .timeout_s = s.timeout(),
-            .answer = if (answered) |x| x.reply else null,
-            .asked = if (answered) |x| x.asked else "",
+            .answers = r.st.answers,
+            .used = used,
         };
     }
 
@@ -8016,10 +8083,10 @@ const InstRun = struct {
 
     /// `say`: the text to `to`, `[NAME#N] ` in front, through the gate as a
     /// `send` by `workflow:NAME/STEP` (R3): a question waits in the inbox.
-    fn sayStep(r: *InstRun, s: workflows.Step, answered: ?Answered) !StepEnd {
+    fn sayStep(r: *InstRun, s: workflows.Step) !StepEnd {
         var client = try r.c.modelClient(r.c.cfg.model.model, r.c.cfg.model.max_tokens);
         defer client.deinit();
-        var ask = r.asker(s, answered);
+        var ask = try r.asker(s);
         var run = r.stepRun(&client, s, &ask);
         var out: Core.RunOut = .{ .core = r.c, .tag = r.tag(), .agent = "", .run = &run };
         run.outbox = out.outbox();
@@ -8039,7 +8106,7 @@ const InstRun = struct {
     /// the gate as `workflow:NAME/STEP`: allowed it runs, a deny fails it
     /// with no retry, an ask waits in the inbox (R2). Its output is its
     /// value: JSON when it reads as JSON (masked before it is kept).
-    fn toolStep(r: *InstRun, s: workflows.Step, answered: ?Answered) !StepEnd {
+    fn toolStep(r: *InstRun, s: workflows.Step) !StepEnd {
         const tl = s.action.tool;
         // the name a run's calls give it: a built-in's, or an MCP tool's
         // SERVER__TOOL while its server runs
@@ -8054,7 +8121,7 @@ const InstRun = struct {
         // never called: a run needs a client
         var client = try r.c.modelClient(r.c.cfg.model.model, r.c.cfg.model.max_tokens);
         defer client.deinit();
-        var ask = r.asker(s, answered);
+        var ask = try r.asker(s);
         var run = r.stepRun(&client, s, &ask);
         try run.logRun(.workflow, false, .{ .instance = r.id, .event = "step", .step = s.name, .@"try" = r.st.try_n });
         r.rid = run.rid;
@@ -8130,6 +8197,9 @@ const InstRun = struct {
     /// waiter is the step; no answer by `timeout` is Deny.
     fn askStep(r: *InstRun, s: workflows.Step, approve: bool) !StepEnd {
         const lbl = r.label(s.name);
+        // all of an approve's text is shown, or it is not asked (R29)
+        if (approve and r.tag().len + r.st.call.len > inbox_mod.max_body) return .{ .failed = .{ .why = "its text is over 12 KB, more than an inbox item holds", .retry = false } };
+        const private = r.c.convPrivate(r.w.to);
         // decided as the agent's own questions are (ask_owner, allowed
         // unless a deny rule says otherwise), and logged
         const who: who_mod.Who = .{ .by = r.by(s.name), .agent = "" };
@@ -8138,13 +8208,12 @@ const InstRun = struct {
             defer r.c.lock.unlock(r.c.io);
             break :blk r.c.gate.decide(r.a, .ask_owner, r.st.call, r.c.now(), .{ .who = who });
         };
-        r.c.log.write(.gate, false, .{ .run = lbl, .by = who.by, .conversation = r.w.to, .tool = "ask_owner", .decision = @tagName(d.action), .why = d.why, .arg = util.cut(r.st.call, 500) }) catch {};
+        r.c.log.write(.gate, private, .{ .run = lbl, .by = who.by, .conversation = r.w.to, .tool = "ask_owner", .decision = @tagName(d.action), .why = d.why, .arg = util.cut(r.st.call, 500) }) catch {};
         if (d.action == .deny) return .{ .failed = .{ .why = try std.fmt.allocPrint(r.a, "refused by the gate: {s}", .{d.why}), .retry = false } };
         const now_s = r.c.now();
-        const private = r.c.convPrivate(r.w.to);
         const made = if (approve) blk: {
             const body = try std.fmt.allocPrint(r.a, "{s}{s}", .{ r.tag(), r.st.call });
-            break :blk r.c.addItem(.{
+            break :blk r.newItem(.{
                 .kind = "question",
                 .by = r.by(s.name),
                 .run = lbl,
@@ -8158,7 +8227,7 @@ const InstRun = struct {
             });
         } else blk: {
             const body = try std.fmt.allocPrint(r.a, "{s}Step {s}: use this, drop it, or reply with your own version.", .{ r.tag(), s.name });
-            break :blk r.c.addItem(.{
+            break :blk r.newItem(.{
                 .kind = "draft",
                 .by = r.by(s.name),
                 .run = lbl,
@@ -8237,6 +8306,16 @@ fn localStamp(buf: *[20]u8, secs: i64, utc_offset: i32) []const u8 {
 }
 
 /// A text's first line (an item's title).
+/// The SHA-256 (hex) of the question an approval item shows: its body
+/// without the step's tag in front (as `WfAsker.ask` hashes it).
+fn askHash(a: std.mem.Allocator, body: []const u8, tag: []const u8) ![]const u8 {
+    const q = if (std.mem.startsWith(u8, body, tag)) body[tag.len..] else body;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(q, &digest, .{});
+    const h = std.fmt.bytesToHex(digest, .lower);
+    return a.dupe(u8, &h);
+}
+
 fn firstLine(s: []const u8) []const u8 {
     return s[0 .. std.mem.indexOfScalar(u8, s, '\n') orelse s.len];
 }
@@ -14424,4 +14503,234 @@ test "approve_and_review_pass_the_gate_as_questions" {
     runWorkflows(&f);
     try f.rec.waitFor("[ok#2] Step ask failed: refused by the gate: rule on line 2");
     try t.expectEqual(1, f.rec.count("BUTTONS Question ["));
+}
+
+
+/// Writes `st` as instance `id`'s state (as if harness had stopped before
+/// writing what came next).
+fn putState(f: *Fix, id: []const u8, st: wstate.State) !void {
+    const a = f.e.arena.allocator();
+    const pid = wstate.parseId(id).?;
+    const inst = try (try f.core.wfDir(a, pid.name)).instance(a, pid.n);
+    try inst.saveState(a, st);
+}
+
+/// Item `id`'s status in the inbox (void when it is gone).
+fn itemStatus(f: *Fix, id: u64) inbox_mod.Status {
+    f.core.inbox.mutex.lockUncancelable(t.io);
+    defer f.core.inbox.mutex.unlock(t.io);
+    const it = f.core.inbox.find(id) orelse return .void;
+    return it.status;
+}
+
+test "a_stop_while_its_step_goes_on_to_wait_ends_it" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try setWorkflow(&f, "ok", "workflow ok\nstep ask\napprove Fine?\nstep tell\nsay {ask}\n");
+    // /workflow stop comes while the step makes its item
+    f.core.wf_test_stop = .stop_in_step;
+    _ = try f.core.command(a, "/workflow start ok");
+    runWorkflows(&f);
+    const st = try instState(&f, "ok#1");
+    try t.expectEqual(wstate.Status.stopped, st.status);
+    try t.expectEqualStrings("stopped by the owner", st.why);
+    // its question is withdrawn: nothing is left to answer
+    try t.expectEqual(inbox_mod.Status.withdrawn, itemStatus(&f, 1));
+    try expectHas(try logText(&f), "\"instance\":\"ok#1\",\"event\":\"stopped\",\"by\":\"owner\"");
+}
+
+test "a_text_too_long_for_an_inbox_item_fails_its_step" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try setWorkflow(&f, "ok", "workflow ok\nstep ask\napprove {input}\n");
+    const long = try a.alloc(u8, 13 * 1024);
+    @memset(long, 'x');
+    _ = try f.core.startInstance(a, "ok", .{ .at = f.core.now(), .by = "owner", .input = long });
+    runWorkflows(&f);
+    try f.rec.waitFor("[ok#1] Step ask failed: its text is over 12 KB, more than an inbox item holds");
+    try t.expectEqual(0, f.rec.count("BUTTONS Question ["));
+    // a gate question that its tag takes past what an item holds is not asked
+    var ask: WfAsker = .{ .core = f.core, .label = "workflow ok#2/call", .tag = "[ok#2 call] ", .to = "main", .timeout_s = 60 };
+    const q = try a.alloc(u8, inbox_mod.max_body - 4);
+    @memset(q, 'q');
+    const got = WfAsker.ask(&ask, a, .{ .text = q, .who = .{ .by = "workflow:ok/call", .agent = "" } });
+    try t.expectEqual(agent.Answer.full, got.answer);
+    try expectHas(got.text, "too long to ask the owner");
+    try t.expect(!ask.deferred);
+}
+
+test "each_question_of_a_call_keeps_its_own_answer" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try writePage(&f, "far.html", "<p>Far away</p>");
+    try writePage(&f, "a.redirect", try std.fmt.allocPrint(a, "302 http://localhost:{d}/page/far.html", .{f.e.server.port}));
+    try setWorkflow(&f, "look", "workflow look\nstep read\ntool fetch {\"url\": \"URL/page/a\"}\nstep tell\nsay got: {read}\n");
+    _ = try f.core.command(a, "/workflow start look");
+    runWorkflows(&f);
+    // the address asked for, then where it led: each answered once
+    try f.rec.waitFor("BUTTONS Allow this? [1]");
+    try f.press("once");
+    runWorkflows(&f);
+    try f.rec.waitFor("BUTTONS Allow this? [2]");
+    try f.press("once");
+    runWorkflows(&f);
+    try f.rec.waitFor("Far away");
+    try t.expectEqual(2, f.rec.count("BUTTONS Allow this? ["));
+    try t.expectEqual(wstate.Status.done, (try instState(&f, "look#1")).status);
+}
+
+test "the_days_limit_ends_an_instance_while_it_waits" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try setWorkflow(&f, "slow", "workflow slow\nlimits days 1\nstep ask\napprove Fine?\n");
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    _ = try f.core.command(a, "/workflow start slow");
+    runWorkflows(&f);
+    try t.expectEqual(wstate.Status.waiting, (try instState(&f, "slow#1")).status);
+    // its day is over while it waits: it fails, its item closes
+    f.core.fixed_now = t0 + 86400;
+    runWorkflows(&f);
+    const st = try instState(&f, "slow#1");
+    try t.expectEqual(wstate.Status.failed, st.status);
+    try expectHas(st.why, "it ran out of days (at most 1)");
+    try t.expectEqual(inbox_mod.Status.withdrawn, itemStatus(&f, 1));
+    try f.rec.waitFor("[slow#1] Failed at step ask: it ran out of days (at most 1).");
+}
+
+test "a_private_conversations_workflow_lines_keep_labels_not_text" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addTopic(&f, "diary", 5014);
+    try f.core.handleTextIn("diary", "/private on");
+    try writeRules(&f, "allow shell echo *\n");
+    try setWorkflow(&f, "note", "workflow note\nto diary\nstep keep\ntool shell {\"command\": \"echo {input}\"}\nstep ask\napprove Keep {input}?\n");
+    // started as a trigger would (what main's chat says is main's own)
+    _ = try f.core.startInstance(a, "note", .{ .at = f.core.now(), .by = "owner", .input = "my secret plans" });
+    runWorkflows(&f);
+    try waitInbox(&f, "\"waiter\":\"workflow note#1/ask\"");
+    const text = try logText(&f);
+    if (std.mem.indexOf(u8, text, "secret plans") != null) {
+        std.debug.print("the log holds the private text:\n{s}\n", .{text});
+        return error.TestUnexpectedResult;
+    }
+    // the labels stay
+    try expectHas(text, "\"instance\":\"note#1\",\"event\":\"start\"");
+    try expectHas(text, "\"instance\":\"note#1\",\"event\":\"step\",\"step\":\"keep\"");
+}
+
+test "an_item_from_before_a_crash_is_not_taken_for_a_later_one" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try writeRules(&f, "allow shell echo *\n");
+    try setWorkflow(&f, "ship", "workflow ship\nstep push\ntool shell {\"command\": \"echo pushed\"}\nstep tell\nsay {push}\n");
+    f.core.wf_test_stop = .after_mark;
+    _ = try f.core.command(a, "/workflow start ship");
+    waitIdle(f.core);
+    try restart(&f);
+    try f.core.setOwner(42);
+    runWorkflows(&f);
+    try f.rec.waitFor("BUTTONS Interrupted [1]");
+    // harness stopped before its state said it waits on item 1; the step
+    // runs and is cut off again: item 1 is not taken for that
+    var st = try instState(&f, "ship#1");
+    st.status = .running;
+    st.wait = .{};
+    try putState(&f, "ship#1", st);
+    try restart(&f);
+    try f.core.setOwner(42);
+    f.core.wf_test_stop = .after_mark;
+    f.core.tick();
+    waitIdle(f.core);
+    try t.expect((try instState(&f, "ship#1")).under_way);
+    try restart(&f);
+    try f.core.setOwner(42);
+    runWorkflows(&f);
+    st = try instState(&f, "ship#1");
+    try t.expectEqual(wstate.Status.paused, st.status);
+    try t.expectEqual(@as(u64, 2), st.wait.item);
+    try t.expect(itemStatus(&f, 1) != .open);
+    // Skip: it fails, a failed item; made again after a restart (its
+    // state not yet written), the first one is withdrawn
+    try f.press("skip");
+    runWorkflows(&f);
+    st = try instState(&f, "ship#1");
+    try t.expectEqual(wstate.Status.failed, st.status);
+    try t.expectEqual(@as(u64, 3), st.wait.item);
+    st.status = .paused;
+    st.ended = 0;
+    st.wait = .{ .kind = .item, .item = 2, .phase = "interrupted" };
+    try putState(&f, "ship#1", st);
+    try restart(&f);
+    try f.core.setOwner(42);
+    runWorkflows(&f);
+    st = try instState(&f, "ship#1");
+    try t.expectEqual(wstate.Status.failed, st.status);
+    try t.expectEqual(@as(u64, 4), st.wait.item);
+    try t.expect(itemStatus(&f, 3) != .open);
+    try t.expectEqual(inbox_mod.Status.open, itemStatus(&f, 4));
+}
+
+test "an_approval_taken_up_after_a_crash_answers_its_own_question" {
+    var f: Fix = undefined;
+    try f.init("[money]\nmax_per_call = 10\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    _ = try withFake(&f, true);
+    try setWorkflow(&f, "buy", "workflow buy\nstep order\ntool fake/echo {\"text\": \"order {input}\", \"amount\": \"{input}\"}\n");
+    _ = try f.core.command(a, "/dryrun on");
+    _ = try f.core.command(a, "/workflow start buy 5");
+    runWorkflows(&f);
+    try f.rec.waitFor("Dry run is on: this call is not made.");
+    // harness stopped before the state said it waits on that question
+    try cutBeforeItsWait(&f, "buy#1");
+    try restart(&f);
+    try f.core.setOwner(42);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    _ = try f.core.command(a, "/dryrun off");
+    runWorkflows(&f);
+    try t.expectEqual(@as(u64, 1), (try instState(&f, "buy#1")).wait.item);
+    // Allow once answers the question shown (dry run on), not the call as
+    // it is now: that is asked again
+    try f.press("once");
+    runWorkflows(&f);
+    try f.rec.waitFor("Dry run is off: this call is made.");
+    try t.expectEqual(2, f.rec.count("BUTTONS Allow this? ["));
+    const money = Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.money, a, .unlimited) catch "";
+    try t.expect(std.mem.indexOf(u8, money, " 5\n") == null);
+}
+
+test "a_start_in_line_is_masked_and_checked_again" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try setWorkflow(&f, "one", "workflow one\nstart owner, agent\nlimits at-once 1\nstep nap\nwait 1h\n");
+    _ = try f.core.command(a, "/workflow start one first");
+    runWorkflows(&f);
+    // the second waits in line, the stored secret masked
+    const b = try f.core.startInstance(a, "one", .{ .at = f.core.now(), .by = "agent:main", .agent = "main", .input = "use search-key-123", .tool = true });
+    try t.expect(b == .queued);
+    const d = try f.core.wfDir(a, "one");
+    const line = try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ d.path, "line" }), a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, line, "search-key-123") == null);
+    try expectHas(line, "[secret:search]");
+    // its start line no longer names agent: given its place, it does not start
+    try setWorkflow(&f, "one", "workflow one\nstart owner\nlimits at-once 1\nstep nap\nwait 1h\n");
+    _ = try f.core.command(a, "/workflow stop one#1");
+    runWorkflows(&f);
+    try t.expectEqual(1, (try d.numbers(a)).len);
+    try expectHas(try logText(&f), "\"name\":\"one\",\"event\":\"dropped\",\"by\":\"agent:main\"");
 }

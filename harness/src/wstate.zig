@@ -44,6 +44,10 @@ pub const Wait = struct {
     ask: []const u8 = "",
 };
 
+/// The owner's answer to one question of a step's call: the question's
+/// SHA-256 (hex), `once` or `day`, the item it was asked in.
+pub const Answer = struct { ask: []const u8, key: []const u8, item: u64 = 0 };
+
 pub const State = struct {
     name: []const u8,
     n: u32,
@@ -60,6 +64,9 @@ pub const State = struct {
     wait: Wait = .{},
     /// A tool step's (or a say's) input as the owner was asked about it.
     call: []const u8 = "",
+    /// The owner's answers to that call's questions so far, each for its
+    /// own question: the call is decided again with them all.
+    answers: []const Answer = &.{},
     /// Who started it, and the definition when the workflow tool did.
     by: []const u8 = "owner",
     agent: []const u8 = "",
@@ -68,6 +75,8 @@ pub const State = struct {
     started: i64 = 0,
     updated: i64 = 0,
     ended: i64 = 0,
+    /// When it runs out of days (its `days`): it fails then, waiting or not.
+    ends: i64 = 0,
     /// How it ended, or why it waits.
     why: []const u8 = "",
     /// The values its steps left, a JSON object (with `input`, `event`,
@@ -79,6 +88,9 @@ pub const State = struct {
         var o = s;
         inline for (.{ "name", "step", "call", "by", "agent", "input", "why", "values" }) |f| @field(o, f) = try a.dupe(u8, @field(s, f));
         inline for (.{ "phase", "trigger", "event", "ask" }) |f| @field(o.wait, f) = try a.dupe(u8, @field(s.wait, f));
+        const answers = try a.alloc(Answer, s.answers.len);
+        for (s.answers, answers) |x, *y| y.* = .{ .ask = try a.dupe(u8, x.ask), .key = try a.dupe(u8, x.key), .item = x.item };
+        o.answers = answers;
         return o;
     }
 
@@ -123,11 +135,20 @@ pub fn stateJson(a: Allocator, s: State) ![]const u8 {
     try util.jsonString(&out, a, s.wait.ask);
     try out.appendSlice(a, "},\"call\":");
     try util.jsonString(&out, a, s.call);
+    try out.appendSlice(a, ",\"answers\":[");
+    for (s.answers, 0..) |x, i| {
+        try out.appendSlice(a, if (i > 0) ",{\"ask\":" else "{\"ask\":");
+        try util.jsonString(&out, a, x.ask);
+        try out.appendSlice(a, ",\"key\":");
+        try util.jsonString(&out, a, x.key);
+        try out.print(a, ",\"item\":{d}}}", .{x.item});
+    }
+    try out.appendSlice(a, "]");
     inline for (.{ "by", "agent", "input" }) |f| {
         try out.print(a, ",\"{s}\":", .{f});
         try util.jsonString(&out, a, @field(s, f));
     }
-    try out.print(a, ",\"started\":{d},\"updated\":{d},\"ended\":{d},\"why\":", .{ s.started, s.updated, s.ended });
+    try out.print(a, ",\"started\":{d},\"updated\":{d},\"ended\":{d},\"ends\":{d},\"why\":", .{ s.started, s.updated, s.ended, s.ends });
     try util.jsonString(&out, a, s.why);
     try out.appendSlice(a, ",\"values\":");
     try out.appendSlice(a, if (s.values.len > 0) s.values else "{}");
@@ -145,32 +166,47 @@ pub fn parseState(a: Allocator, text: []const u8) ?State {
     var s: State = .{ .name = name, .n = @intCast(n) };
     s.status = std.meta.stringToEnum(Status, jv.str(jv.get(v, "status")) orelse "") orelse return null;
     s.step = jv.str(jv.get(v, "step")) orelse "";
-    s.try_n = count(jv.get(v, "try"), 1);
+    // a file changed by hand reads in bounds: tries from 1, times from 0
+    s.try_n = @max(1, count(jv.get(v, "try"), 1));
     s.steps = count(jv.get(v, "steps"), 0);
     s.under_way = jv.boolean(jv.get(v, "under_way")) orelse false;
     if (jv.get(v, "wait")) |w| {
         s.wait.kind = std.meta.stringToEnum(WaitKind, jv.str(jv.get(w, "kind")) orelse "") orelse .none;
-        s.wait.until = jv.int(jv.get(w, "until")) orelse 0;
+        s.wait.until = time(jv.get(w, "until"));
         s.wait.item = @intCast(@max(0, jv.int(jv.get(w, "item")) orelse 0));
         s.wait.phase = jv.str(jv.get(w, "phase")) orelse "";
         s.wait.trigger = jv.str(jv.get(w, "trigger")) orelse "";
-        s.wait.since = jv.int(jv.get(w, "since")) orelse 0;
+        s.wait.since = time(jv.get(w, "since"));
         s.wait.got = jv.boolean(jv.get(w, "got")) orelse false;
         if (jv.get(w, "event")) |e| s.wait.event = std.json.Stringify.valueAlloc(a, e, .{}) catch return null;
         s.wait.ask = jv.str(jv.get(w, "ask")) orelse "";
     }
     s.call = jv.str(jv.get(v, "call")) orelse "";
+    if (jv.get(v, "answers")) |arr| if (arr == .array) {
+        var list: std.ArrayList(Answer) = .empty;
+        for (arr.array.items) |x| list.append(a, .{
+            .ask = jv.str(jv.get(x, "ask")) orelse continue,
+            .key = jv.str(jv.get(x, "key")) orelse continue,
+            .item = @intCast(@max(0, jv.int(jv.get(x, "item")) orelse 0)),
+        }) catch return null;
+        s.answers = list.items;
+    };
     s.by = jv.str(jv.get(v, "by")) orelse "owner";
     s.agent = jv.str(jv.get(v, "agent")) orelse "";
     s.input = jv.str(jv.get(v, "input")) orelse "";
-    s.started = jv.int(jv.get(v, "started")) orelse 0;
-    s.updated = jv.int(jv.get(v, "updated")) orelse 0;
-    s.ended = jv.int(jv.get(v, "ended")) orelse 0;
+    s.started = time(jv.get(v, "started"));
+    s.updated = time(jv.get(v, "updated"));
+    s.ended = time(jv.get(v, "ended"));
+    s.ends = time(jv.get(v, "ends"));
     s.why = jv.str(jv.get(v, "why")) orelse "";
     const values = jv.get(v, "values") orelse jv.Value{ .object = .empty };
     if (values != .object) return null;
     s.values = std.json.Stringify.valueAlloc(a, values, .{}) catch return null;
     return s;
+}
+
+fn time(v: ?jv.Value) i64 {
+    return @max(0, jv.int(v) orelse 0);
 }
 
 fn count(v: ?jv.Value, default: u32) u32 {
@@ -454,6 +490,8 @@ test "state_is_written_whole_and_read_back" {
         .started = 1_700_000_000,
         .updated = 1_700_000_100,
         .ended = 0,
+        .ends = 1_700_604_800,
+        .answers = &.{ .{ .ask = "ab12", .key = "once", .item = 40 }, .{ .ask = "cd34", .key = "day", .item = 41 } },
         .why = "waits for item 41",
         .values = "{\"draft\":{\"reply\":\"thanks\"},\"draft.ok\":true}",
     };
@@ -511,4 +549,18 @@ test "numbers_go_on_and_the_journal_appends" {
     const p = try std.fs.path.join(a, &.{ f.root, "day.json" });
     try saveDay(t.io, a, p, .{ .day = 20_000, .agent_steps = 3, .told = true });
     try t.expectEqual(Day{ .day = 20_000, .agent_steps = 3, .told = true }, loadDay(t.io, a, p));
+}
+
+
+test "a_state_read_back_is_kept_in_bounds" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const st = parseState(a, "{\"name\":\"w\",\"n\":1,\"status\":\"running\",\"try\":0,\"started\":-9223372036854775808,\"updated\":-1,\"ended\":-5,\"wait\":{\"kind\":\"timer\",\"until\":-1,\"since\":-7}}").?;
+    try t.expectEqual(1, st.try_n);
+    try t.expectEqual(0, st.started);
+    try t.expectEqual(0, st.updated);
+    try t.expectEqual(0, st.ended);
+    try t.expectEqual(0, st.wait.until);
+    try t.expectEqual(0, st.wait.since);
 }

@@ -31,7 +31,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 680 unit tests (10 of them
+**State: 0.3.0, tested on macOS by its own tests: 691 unit tests (10 of them
 run on Windows only), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 75 checks that drives the real binary against
@@ -894,13 +894,15 @@ are lines of kind `workflow` (`instance` NAME#N, `event`): `start` (by,
 agent, input), `step` (step, try, ok, 200 bytes of result, the step run's
 `rid`, `by`, `conversation`), `wait`, `event`, `inbox` (item, answer),
 `retry`, `resume` (why), `paused`, `end` (status, why), `stopped`, and
-by `name`: `queued` (a start waits in line), `saved` (`by`, `agent`,
-`item`, `sha256`) and `removed` (`by`); a step's calls are lines of a run
-labelled `workflow NAME#N/STEP`, by `workflow:NAME/STEP`, with no
-definition (an agent step's: its definition's). A private run's lines, and a post into a private conversation,
-keep sizes and keyed hashes of what was said, while their labels (`run`,
-`conversation`, `by`, `agent`, `to`, `event`, `tool`, `decision`, `why`)
-stay readable. Snapshots are `files` lines: `snapshot` (folder, id, why
+by `name`: `queued` (a start waits in line), `dropped` (a start in line
+its `start` no longer names), `saved` (`by`, `agent`, `item`, `sha256`)
+and `removed` (`by`); a step's calls are lines of a run labelled
+`workflow NAME#N/STEP`, by `workflow:NAME/STEP`, with no definition (an
+agent step's: its definition's). The lines of a workflow whose `to` is
+private are private too. A private run's lines, and a post into a private
+conversation, keep sizes and keyed hashes of what was said, while their
+labels (`run`, `conversation`, `by`, `agent`, `to`, `event`, `tool`,
+`decision`, `why`, `instance`, `step`) stay readable. Snapshots are `files` lines: `snapshot` (folder, id, why
 it was taken, label, files, changed, bytes stored, and the run's rid,
 definition and who started it), `snapshot skipped` (folder, why),
 `restore` (folder, id, the id that undoes it, files written and
@@ -1231,15 +1233,18 @@ and an answer in the inbox wakes the instance it is for.
   a question still open); any other asks first, an `interrupted` item:
   "Step post of issue-reply#7 was under way when harness stopped and may
   have been done: …", with Run again, Skip (as if it failed) and Stop.
-  `/stop` pauses a running instance the same way.
+  `/stop` pauses a running instance the same way. An instance waits on one
+  item at a time: one left open by a crash is withdrawn when it goes on.
 - **Failures.** A step that fails after its tries, with no `on fail`,
   fails the instance: a `failed` item in `to`, Run again or Stop, kept 7
-  days. The step and day limits fail it with a message.
+  days. The step limit fails it with a message; so do its days, waiting
+  or not, and its open items close.
 - **Starts** happen only as `start` says: `/workflow start NAME [text]`,
   the `workflow` tool, a trigger (an instance per event) or a schedule.
   Past `at-once` going, a start waits in line (20, in
-  `state/workflows/NAME/line`); past that, or past `[workflows] instances`
-  (50) in all, it is refused and you are told once.
+  `state/workflows/NAME/line`, masked); past that, or past `[workflows]
+  instances` (50) in all, it is refused and you are told once. A start in
+  line is checked against `start` again when its place comes.
 
 ### The gate
 
@@ -1253,8 +1258,11 @@ sections `[workflow:NAME]`), labelled `workflow NAME#N/STEP`.
   Deny. Allow once; Allow 24 h, a grant for `workflow:NAME` (that
   workflow's steps and instances, nothing else); Deny, `on deny`. The call
   is decided again when the answer comes, so a deny rule added meanwhile
-  still stops it. A shell step after files were written is asked, naming
-  them.
+  still stops it; each answer goes to the question it was given for (a
+  redirect to another host is a question of its own). A question, or an
+  `approve` text, that with its `[NAME#N STEP]` tag would pass the 12 KB
+  an item holds is not asked: the step fails. A shell step after files
+  were written is asked, naming them.
 - **Money** in a tool step is asked every time in the inbox, never for 24
   h, whatever `[money] scheduled` says; caps are checked when the item is
   made and again on Allow, when the amount counts and the call follows at
