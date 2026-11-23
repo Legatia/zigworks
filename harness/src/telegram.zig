@@ -1,10 +1,12 @@
-//! The Telegram Bot API: long polling for messages and button presses,
-//! sending text (split at Telegram's 4,096 characters), buttons and
-//! documents, to a chat or one of its topics, and opening topics.
+//! The Telegram Bot API: long polling for messages (voice notes too) and
+//! button presses, sending text (split at Telegram's 4,096 characters),
+//! buttons and documents, to a chat or one of its topics, opening topics,
+//! and fetching a file a message carries.
 const std = @import("std");
 const http = @import("http.zig");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
+const voice = @import("voice.zig");
 const Io = std.Io;
 
 pub const max_text = 4096;
@@ -36,7 +38,13 @@ pub const Message = struct {
     /// The message it replies to; 0: none (a topic's reply to its own
     /// opening is no reply).
     reply_to: i64 = 0,
+    /// A voice note or an audio file it carries (its text is then "").
+    voice: ?voice.Note = null,
 };
+
+/// Where a file is (`getFile`): its path for `download`, and its size (0:
+/// not said).
+pub const File = struct { path: []const u8, size: u64 = 0 };
 
 /// How a message is sent.
 pub const Opts = struct {
@@ -71,6 +79,20 @@ pub const Me = struct {
 /// The topic a message is in: `message_thread_id` in a private chat (only
 /// topics have one there), in a group only with `is_topic_message` (there
 /// it also marks reply threads).
+/// The voice note (`voice`) or audio file (`audio`) a message carries.
+fn noteOf(m: jv.Value) ?voice.Note {
+    const kind: voice.Note.Kind = if (jv.get(m, "voice") != null) .voice else if (jv.get(m, "audio") != null) .audio else return null;
+    const v = jv.get(m, @tagName(kind)).?;
+    return .{
+        .kind = kind,
+        .file_id = jv.str(jv.get(v, "file_id")) orelse return null,
+        .seconds = @intCast(std.math.clamp(jv.int(jv.get(v, "duration")) orelse 0, 0, std.math.maxInt(u32))),
+        .size = @intCast(@max(0, jv.int(jv.get(v, "file_size")) orelse 0)),
+        .mime = jv.str(jv.get(v, "mime_type")) orelse "",
+        .name = jv.str(jv.get(v, "file_name")) orelse "",
+    };
+}
+
 fn threadOf(m: jv.Value) i64 {
     const raw = jv.int(jv.get(m, "message_thread_id")) orelse return 0;
     const private = std.mem.eql(u8, jv.str(jv.at(m, &.{ "chat", "type" })) orelse "private", "private");
@@ -146,6 +168,7 @@ pub const Bot = struct {
                     .thread = threadOf(m),
                     .topic = jv.str(jv.at(m, &.{ "forum_topic_created", "name" })) orelse jv.str(jv.at(m, &.{ "reply_to_message", "forum_topic_created", "name" })),
                     .reply_to = if (jv.get(m, "reply_to_message")) |r| (if (jv.get(r, "forum_topic_created") != null) 0 else jv.int(jv.get(r, "message_id")) orelse 0) else 0,
+                    .voice = noteOf(m),
                 } });
             } else if (jv.get(u, "callback_query")) |c| {
                 try out.append(arena, .{ .callback = .{
@@ -289,6 +312,36 @@ pub const Bot = struct {
         _ = try b.call(a, "editMessageText", body.items, 30_000);
     }
 
+    /// Where file `file_id` is: its path for `download`, and its size.
+    pub fn getFile(b: *Bot, arena: std.mem.Allocator, file_id: []const u8) !File {
+        var body: std.ArrayList(u8) = .empty;
+        try body.appendSlice(arena, "{\"file_id\":");
+        try util.jsonString(&body, arena, file_id);
+        try body.append(arena, '}');
+        const res = try b.call(arena, "getFile", body.items, 30_000);
+        const path = jv.str(jv.get(res, "file_path")) orelse return error.BadReply;
+        if (!filePath(path)) return error.BadReply;
+        return .{ .path = try arena.dupe(u8, path), .size = @intCast(@max(0, jv.int(jv.get(res, "file_size")) orelse 0)) };
+    }
+
+    /// The file at `path` (as getFile gave it), in `arena`; error.TooLarge
+    /// past `max` bytes (nothing more is read).
+    pub fn download(b: *Bot, arena: std.mem.Allocator, path: []const u8, max: usize) ![]u8 {
+        if (!filePath(path)) return error.BadPath;
+        b.mutex.lockUncancelable(b.io);
+        defer b.mutex.unlock(b.io);
+        const target = try std.fmt.allocPrint(arena, "/file/bot{s}/{s}", .{ b.token, path });
+        var resp = try b.http.send(.{ .method = .GET, .path = target, .limits = .{ .idle_ms = 30_000, .total_ms = 120_000 } });
+        defer resp.deinit();
+        if (resp.status != 200) return error.TelegramRefused;
+        var out: std.ArrayList(u8) = .empty;
+        while (try resp.next()) |part| {
+            if (out.items.len + part.len > max) return error.TooLarge;
+            try out.appendSlice(arena, part);
+        }
+        return out.items;
+    }
+
     /// Removes the buttons under a message once it has been answered.
     pub fn clearButtons(b: *Bot, chat_id: i64, message_id: i64) !void {
         var arena: std.heap.ArenaAllocator = .init(b.gpa);
@@ -298,6 +351,14 @@ pub const Bot = struct {
         _ = try b.call(a, "editMessageReplyMarkup", body, 30_000);
     }
 };
+
+/// A file's path as getFile gives it ("voice/file_3.oga"): nothing that
+/// could reach past the bot's files.
+fn filePath(path: []const u8) bool {
+    if (path.len == 0 or path.len > 256 or path[0] == '/' or std.mem.indexOf(u8, path, "..") != null) return false;
+    for (path) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '/' or ch == '_' or ch == '-' or ch == '.')) return false;
+    return true;
+}
 
 /// Buttons on a row: up to three on one, four as two rows of two, more
 /// in rows of four.
@@ -388,6 +449,62 @@ test "a_callbacks_message_text_is_kept" {
     const ups = try b.getUpdates(e.arena.allocator(), 0, 0);
     try t.expectEqualStrings("Wrote a.\n\nChanged 1 file in notes/.", ups[0].callback.text);
     try t.expectEqualStrings("", ups[1].callback.text);
+}
+
+test "a_voice_note_and_an_audio_file_are_read" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try inbox(&e, 1, "{\"message\":{\"message_id\":5,\"from\":{\"id\":42},\"chat\":{\"id\":42,\"type\":\"private\"},\"voice\":{\"file_id\":\"AwACAgIAAxk\",\"file_unique_id\":\"AgAD\",\"duration\":4,\"mime_type\":\"audio/ogg\",\"file_size\":7316}}}");
+    try inbox(&e, 2, "{\"message\":{\"message_id\":6,\"from\":{\"id\":42},\"chat\":{\"id\":42},\"audio\":{\"file_id\":\"CQACAgIAAxk\",\"duration\":95,\"mime_type\":\"audio/mpeg\",\"file_name\":\"memo.mp3\",\"file_size\":1520000},\"reply_to_message\":{\"message_id\":3,\"text\":\"Which room?\"}}}");
+    try inbox(&e, 3, "{\"message\":{\"message_id\":7,\"from\":{\"id\":42},\"chat\":{\"id\":42},\"text\":\"plain\"}}");
+    // a voice note Telegram says nothing more of
+    try inbox(&e, 4, "{\"message\":{\"message_id\":8,\"from\":{\"id\":42},\"chat\":{\"id\":42},\"voice\":{\"file_id\":\"bare\"}}}");
+    var b = try Bot.init(t.allocator, t.io, try e.url(), "123:abc");
+    defer b.deinit();
+    const ups = try b.getUpdates(e.arena.allocator(), 0, 0);
+    try t.expectEqual(4, ups.len);
+    const v = ups[0].message.voice.?;
+    try t.expectEqual(voice.Note.Kind.voice, v.kind);
+    try t.expectEqualStrings("AwACAgIAAxk", v.file_id);
+    try t.expectEqual(4, v.seconds);
+    try t.expectEqual(7316, v.size);
+    try t.expectEqualStrings("audio/ogg", v.mime);
+    try t.expectEqualStrings("", ups[0].message.text);
+    const au = ups[1].message.voice.?;
+    try t.expectEqual(voice.Note.Kind.audio, au.kind);
+    try t.expectEqualStrings("memo.mp3", au.name);
+    try t.expectEqualStrings("audio/mpeg", au.mime);
+    try t.expectEqual(95, au.seconds);
+    try t.expectEqual(3, ups[1].message.reply_to);
+    try t.expect(ups[2].message.voice == null);
+    const bare = ups[3].message.voice.?;
+    try t.expectEqual(0, bare.seconds);
+    try t.expectEqual(0, bare.size);
+}
+
+test "a_voice_file_is_fetched_by_its_path" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "telegram/files/AwACAgIAAxk", .data = "OggS-voice-bytes" });
+    var b = try Bot.init(t.allocator, t.io, try e.url(), "123:abc");
+    defer b.deinit();
+    const a = e.arena.allocator();
+    const f = try b.getFile(a, "AwACAgIAAxk");
+    try t.expectEqualStrings("voice/AwACAgIAAxk.oga", f.path);
+    try t.expectEqual(16, f.size);
+    try t.expectEqualStrings("OggS-voice-bytes", try b.download(a, f.path, 1 << 20));
+    // more than a note may be: refused, not cut
+    try t.expectError(error.TooLarge, b.download(a, f.path, 8));
+    // an id Telegram doesn't know, and a path that could leave its files
+    try t.expectError(error.TelegramRefused, b.getFile(a, "nope"));
+    try t.expectError(error.BadPath, b.download(a, "../bot123:abc/getMe", 1 << 20));
+    const out = try outbox(&e);
+    try t.expect(std.mem.indexOf(u8, out, "\"method\":\"getFile\",\"message_id\":") != null);
+    try t.expect(std.mem.indexOf(u8, out, "{\"method\":\"download\",\"path\":\"voice/AwACAgIAAxk.oga\"}") != null);
+    // the token is in the request's path only, never in what was recorded
+    try t.expect(std.mem.indexOf(u8, out, "123:abc") == null);
 }
 
 test "updates_carry_the_topic_and_sends_go_to_it" {

@@ -2456,6 +2456,7 @@ test {
     _ = @import("clone.zig");
     _ = @import("workflows.zig");
     _ = @import("wstate.zig");
+    _ = @import("voice.zig");
 }
 
 test "a_line_of_ctrl_d_leaves_the_chat_in_a_windows_console" {
