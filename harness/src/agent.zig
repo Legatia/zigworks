@@ -1502,7 +1502,7 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
     return .{ .text = try util.validUtf8(a, out.text), .is_error = out.is_error };
 }
 
-fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const u8) !tools.Output {
+fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []const u8) !tools.Output {
     if (r.env.stop.load(.acquire)) return .{ .text = "stopped by the owner", .is_error = true };
     // what to mask: as the list is now (a password made a moment ago too)
     if (r.masks) |m| r.env.secrets = try m.snapshot(a);
@@ -1520,6 +1520,11 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     };
     const offered = if (mt) |m| r.allowsMcp(m) else r.allows(tool);
     if (!offered) return .{ .text = "this tool is not available here", .is_error = true };
+    // an MCP tool's input in one form (keys sorted, no spaces), the one
+    // the rules, the owner's question, the money check and the server all
+    // get: rules can't be passed by writing the same call another way
+    const input_json = if (mt != null) jv.canonical(a, raw_input) orelse
+        return .{ .text = "the tool's input must be JSON with each field once", .is_error = true } else raw_input;
     if (tool == .send) return sendTool(r, a, input_json);
     if (tool == .agent_save) return agentSave(r, a, input_json);
     if (tool == .trigger) return triggerTool(r, a, input_json);
@@ -4167,6 +4172,23 @@ test "rules_see_the_whole_input_of_an_mcp_call" {
     const r = try f.say("echo");
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: rule on line 1") != null);
+}
+
+test "mcp_rules_read_one_form_of_the_input_whatever_its_order" {
+    var f: Fix = undefined;
+    // an ask on how the input starts, with an allow for the rest of the tool
+    try f.init("ask mcp fake/echo {\"text\":\"lock\"*\nallow mcp fake/echo *\n");
+    defer f.deinit();
+    const s = try withMcp(&f, false);
+    defer s.deinit();
+    // the field second, or spaced: still asked, never let through
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"zone\":1,\"text\":\"lock\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "fake__echo", "{ \"text\" : \"lock\" }"));
+    try f.e.script(3, model.textReply("done"));
+    f.answer = .deny;
+    const r = try f.say("lock it");
+    freeResult(&f.run, r);
+    try t.expectEqual(2, f.asked);
 }
 
 test "rules_see_every_task_of_a_delegate_call" {

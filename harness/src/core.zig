@@ -16287,7 +16287,7 @@ test "money_is_asked_every_time_and_counted_when_allowed" {
     _ = try f.core.command(a, "/workflow start buy 5");
     runWorkflows(&f);
     // asked, never for 24 h, whatever [money] scheduled says; nothing counted while asked
-    try f.rec.waitFor("BUTTONS Allow this? [1]\n[buy#1 order] fake__echo: fake/echo {\"text\":\"order 5\",\"amount\":\"5\"}\nDry run is off: this call is made.");
+    try f.rec.waitFor("BUTTONS Allow this? [1]\n[buy#1 order] fake__echo: fake/echo {\"amount\":\"5\",\"text\":\"order 5\"}\nDry run is off: this call is made.");
     try t.expect(f.rec.buttonsWith("Allow this? [1]").?.get("day") == null);
     const money = struct {
         fn total(fx: *Fix) ![]const u8 {

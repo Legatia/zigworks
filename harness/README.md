@@ -38,7 +38,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 879 unit tests (19 of them
+**State: 0.3.0, tested on macOS by its own tests: 881 unit tests (19 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 91 checks that drives the real binary against
@@ -1136,7 +1136,13 @@ and its named secrets (`harness secret add github`; `/reload` picks up
 one added meanwhile). Their tools appear as `github__list_issues` and ask
 by default; a 24 h grant covers that tool with any input; rules match
 `mcp github/list_issues *` (the server, the tool, then the whole input as
-JSON). Server names use a-z, 0-9, - and _, up to 32 (no `__`); secret
+JSON). The input is matched, shown to you and sent to the server in one
+form, however the model wrote it: keys sorted, no spaces
+(`{"command":"lock","percent":95}`). So a rule about one field is written
+`ask mcp car/car_command *"command":"lock"*`, which holds wherever the
+field sits; a rule on how the input starts (`{"command":"lock"*`) misses a
+call with a field sorted before it. An input that names a field twice is
+refused. Server names use a-z, 0-9, - and _, up to 32 (no `__`); secret
 names follow `harness secret add`. A tool whose `server__tool` name is
 over 64 characters, or that another tool already has, is left out;
 `/status` says which, and what started.
