@@ -150,4 +150,5 @@ test {
     _ = @import("http.zig");
     _ = @import("color.zig");
     _ = @import("when.zig");
+    _ = @import("ws.zig");
 }
