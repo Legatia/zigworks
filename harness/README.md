@@ -12,7 +12,10 @@ saved skills, remembers what you bring up, keeps summaries of each
 conversation by day, week and month, and can search every earlier turn.
 During quiet hours it holds what is not urgent for a digest at their end.
 People of your household you add can ask it too, in their own chat with
-the bot or a group, within what you allow (Household, below).
+the bot or a group, within what you allow (Household, below). With Home
+Assistant (through homemcp) and a car on Smartcar (through carcloud) it
+runs a home: set up in the chat, with routines that ask with one tap
+before a lock or a valve (Home butler, below).
 Every action it takes, and every
 action of its helpers, passes one gate and is written to one log you can
 check.
@@ -38,14 +41,17 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 879 unit tests (19 of them
+**State: 0.3.0, tested on macOS by its own tests: 912 unit tests (19 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 91 checks that drives the real binary against
+and an end-to-end script of 99 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram (voice
 notes and their files too), a transcription service, feeds, search, two
 MCP servers run as programs, and MCP servers at a url with a token or a
-sign-in (with a stand-in authorization server and browser).
+sign-in (with a stand-in authorization server and browser); with homemcp
+and carcloud built (HOMEMCP_BIN, CARCLOUD_BIN), 21 more: an event pushed
+by homemcp, and the butler's setup in the chat and each routine, against
+homemcp-sim and carcloud-sim (stand-ins for Home Assistant and Smartcar).
 An earlier build of 0.3.0 also passed its tests in CI on Linux and
 Windows. On Windows 11 the browser and login
 tests also run, against Chrome 157, and the console, lock, Credential
@@ -55,7 +61,7 @@ Windows 11 and Linux (WSL, bubblewrap 0.9, OpenSSH 9.6) pass their unit
 tests and the end-to-end script; on macOS 15.7 the sandbox (sandbox-exec)
 and APFS clone tests run with the rest. Nothing has run yet against a real
 omnigate or model provider, Telegram bot, transcription service, MCP
-server, authorization server or website.** See
+server, authorization server, website, Home Assistant or Smartcar.** See
 [Limits](#limits).
 
 ## Quick start
@@ -577,6 +583,94 @@ harness acts on a change; a waiting code only as its SHA-256:
 ```json
 {"name":"anna","user":123456789,"added":"2026-11-23T10:00:00Z","joined":"2026-11-23T10:02:00Z"}
 ```
+
+## Home butler
+
+harness can look after a home run by Home Assistant (or Zigbee2MQTT),
+through [homemcp](../homemcp/), and a car on Smartcar, through
+[carcloud](../carcloud/). Setting it up takes a few commands in a terminal
+and the rest in the chat; [TESTERS.md](TESTERS.md) walks a tester through
+it and their first week.
+
+```
+harness init --butler      # or answer y to init's question: quiet hours on, 22:00-07:00
+harness secret add ha      # Home Assistant's long-lived access token
+harness run                # then, in the chat: /setup home
+```
+
+**`/setup home URL`** runs `homemcp discover URL` with the token (never
+in the chat: a `/setup` message that looks like a token is refused and
+logged as withheld) and shows home.ini as it would be written. Then one
+message, a line each: the devices and rooms it found; what it will switch
+when you ask (lights, plugs, heating, fans, speakers, scenes); what it
+will ask you about every time (locks, valves, the garage, alarms, the
+scenes that touch them); what it won't touch (cameras, smoke and CO
+alarms); what it only watches (sensors); and the switches it
+couldn't place, asked about every time until you sort them.
+[Looks right] [Change it]. **Looks right** writes home.ini, mcp.ini's
+`[home]` section (homemcp with the token as `HA_TOKEN`, `home_guarded` a
+money tool: asked every time) and the home's lines
+of `rules` (reading needs no question; your own requests switch what
+home.ini allows), each shown in the chat first, then `/reload`. **Change
+it** takes `/setup home leave NAME` (left out of home.ini), `/setup home
+ask NAME` (asked every time) and `/setup home allow NAME` (a switch it
+couldn't place, now a light or a plug; a lock, valve, alarm or opener
+stays asked), then shows the message again. A sensor is never switched.
+
+**`/setup car CLIENT_ID VEHICLE_ID USER_ID`**, after `harness secret add
+smartcar` (the Smartcar application's client secret), shows car.ini: start
+and stop charging and the charge limit (60–90 %), 10 commands a day, a
+minute apart, no location, every command a line in
+`state/car-actions.jsonl`; locking, unlocking and the rest are not in it.
+`carcloud check` reads the car, and one message says what it answered and
+what harness may do. [Looks right] writes car.ini, mcp.ini's `[car]` and
+the car's lines of `rules` (reading it needs no question; your own
+requests do what car.ini allows).
+
+**`/setup routines`** (and right after Looks right) offers the butler's
+routines one at a time, a sentence each with your devices, times and
+temperatures in it, [Turn on] [Not now]. Turn on shows the workflow file,
+its `triggers.ini` section and its `rules` lines, then writes them, marked
+`added by /setup routines DATE`; a routine your home has nothing for
+(no lock, no leak sensor, no car) is not offered. They are workflows like
+any other (Workflows, above): `/workflows` lists them, `/workflow rm NAME`
+turns one off, and the files can be edited and `/reload`ed.
+
+| Routine | Starts | What it does |
+|---|---|---|
+| Goodnight | you write or say "goodnight", or 15 minutes before quiet hours | the lights off, the heating to 18 °C, then one tap before the door is locked |
+| Leaving | the last of you went out | one tap before locking; what is still open or on; one tap before the heating goes to 17 °C |
+| Arriving | the first of you is back | the heating back to 21 °C, and a line |
+| Morning summary | as quiet hours end | the house (the car, a calendar and the weather when there are servers for them) in a few lines, after the night's digest |
+| Leak | a leak sensor reads water | at once, through quiet hours: [Close the water main] [Ignore] |
+| Doors left open | a door or window opens | after 10 minutes, if it still is open, a line |
+| Car for tomorrow | 90 minutes before quiet hours | a line when the car is low and not plugged in; one tap to start charging when it is |
+
+Nothing guarded runs without your tap: locks are only locked, valves and
+garage doors only closed, alarms only armed (homemcp's home file allows
+nothing else), each after an `approve` step's `yes` (The gate, under
+Workflows), and no answer means nothing happens. The files are in
+[examples/butler](examples/butler/), built into harness; where the setup
+is, `/setup`. Where homemcp and carcloud are: `[butler] homemcp =` and
+`carcloud =` in config.ini, else next to harness, else on PATH.
+
+**`harness doctor`** says, a line each, whether `harness run` runs, the
+settings files read, the bot answers and you are paired, the model answers
+(one short request), the home and the car answer (homemcp's and carcloud's
+own `check`), a trigger is paused or failing, voice notes have their key,
+and the quiet hours; each that doesn't work says what to do, like "Bot: no
+bot token stored. Store the one @BotFather gave you: harness secret add
+telegram". It takes no lock, so it works while harness runs.
+
+**`harness report`** writes one file for a bug report,
+`harness-report-YYYYMMDD-HHMMSS.txt` in the folder you run it from (else
+the data folder): the version, doctor's lines, the settings files
+(home.ini, car.ini and the workflows too), `state/status` and the log's
+last 200 lines. Every stored secret the settings name (and, with the file
+store, every one stored) is masked as `[secret:NAME]`; what looks like a
+bot token or a password in an address is taken out. The log holds what
+you and harness said in conversations that are not private: read it
+before you send it.
 
 ## Folders
 
@@ -1532,6 +1626,10 @@ only after a 3% move. A section's keys give its kind:
   (`{change}` signed, one decimal), in one message, with no model call.
   `start = workflow NAME` starts an instance of that workflow per event,
   when the workflow's `start` line names `trigger:NAME` (see Workflows);
+  `start = workflow NAME TEXT` gives it TEXT as its `{input}` instead of
+  the event (`{field}`s filled in), like `start = workflow leak Sink leak,
+  Kitchen`. An MCP resource that reads as a JSON object gives its
+  top-level fields as the event's too (`match = change is everyone_left`);
   one it refuses is dropped and you are told once. With no action, events
   are only for workflows that wait on them; with one, a waiting workflow
   gets an event too. `urgent = yes` (any kind but a brief) lets its posts
@@ -1629,7 +1727,12 @@ say #{event.number} is an idea; I left it for you.
 ```
 
 A head line `urgent yes` lets a workflow's posts and questions through
-quiet hours (see Quiet hours and the digest).
+quiet hours (see Quiet hours and the digest). `phrases goodnight, good
+night` starts it when your whole message (or voice note) is one of them,
+without a model call; case, spaces and punctuation don't count, a phrase
+starts one workflow only, and `start` must name `owner`. `tag no` sends
+its posts and questions without `[NAME#N]` in front (the butler's
+routines use it).
 
 A line is a key and its value; `#` starts a comment line; a line ending in
 `:` takes the lines indented below it. The head: `workflow NAME` (the
@@ -1648,7 +1751,7 @@ unless `if`, `goto` or `end` say otherwise; each takes one action:
 | `do TEXT` (+ `agent`, `tools`, `answer json`) | a run of the definition | its answer (`answer json`: JSON, its fields) |
 | `wait 2h`, `wait until 09:00` | a timer, your time | none |
 | `wait event TRIGGER` (+ `match` lines) | the next matching event of that trigger | the event's fields |
-| `approve TEXT` | an inbox question: Approve, Deny | `approve` or `deny` |
+| `approve TEXT` | an inbox question: Approve, Deny (with `yes LABEL` and `no LABEL`: those two buttons, see The gate) | `approve` or `deny` |
 | `review TEXT` | an inbox draft: Use it, Drop; a reply is your version | the text to use |
 | `say TEXT` | a message to `to`, `[NAME#N]` in front | none |
 
@@ -1742,7 +1845,14 @@ sections `[workflow:NAME]`), labelled `workflow NAME#N/STEP`.
   decide: `[money] workflows = off`, the default; `on` makes them money in
   scheduled runs, within the caps.
 - An `approve` answer is data, not a grant: a later call the gate asks
-  about is asked too.
+  about is asked too. The one exception is `yes`: an `approve` step with
+  `yes Lock it` (and `no Leave it`; No by default), right before a tool
+  step, asks once with those two buttons, and a tap on the first is that
+  tool step's Allow once, for its first question, a money call's too. The
+  gate still decides the call (a deny rule, a cap, `/dryrun`); No, or no
+  answer in `timeout`, is `on deny`. A step with `yes` goes on to the step
+  right after it (no `if`, `goto` or `end` in it), and that step is a tool
+  step: harness's reading says "YES makes step NEXT's call, once".
 
 ### Commands and the tool
 
@@ -1848,20 +1958,21 @@ check|rm NAME`, `/quiet [on|off|HH:MM-HH:MM]`, `/dryrun on|off`,
 `/triggers`, `/trigger NAME`, `/trigger add|rm|pause|resume|run|test`,
 `/apps`, `/app approve|rm NAME`, `/workflows`, `/workflow NAME|NAME#N`,
 `/workflow start|stop|resume|rm`, `/members`, `/member add|rm NAME`,
-`/help`. `/new`, `/private` and `/agent`
+`/setup [home|car|routines]`, `/help`. `/new`, `/private` and `/agent`
 act on the conversation they are sent in; `/stop`, `/dryrun` and
 `/memory auto` on everything. Household members have `/help` and
 `/join CODE`; any other command of theirs is answered with a no.
 
-CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
+CLI: `init [--butler]`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `trigger list|test|run`, `workflow list|check|start|stop`,
 `memory [list|pin|unpin|forget ID]`,
 `snapshot list|take|changes|restore`, `undo RUN`, `env list|check|rm|key`,
 `agent list|show|rm`, `mcp list|login|logout`, `log verify|tail|runs|session|search`, `inbox [--json]`,
 `app list|approve|rm`,
-`health`, `version`. `--home DIR` may come anywhere on the line;
-arguments a command does not take are refused. `health` exits 0 only
-while `harness run` holds the folder and has ticked in the last 90 s.
+`health`, `doctor`, `report`, `version`. `--home DIR` may come anywhere on
+the line; arguments a command does not take are refused. `health` exits 0
+only while `harness run` holds the folder and has ticked in the last 90 s;
+`doctor` exits 0 when every piece works (Home butler).
 
 ## Limits
 
@@ -1925,5 +2036,11 @@ screenshots, and the hosted service.
 zig build                     # zig-out/bin/harness
 zig build test --summary all  # unit tests, then scripts/smoke.sh end to end
 ```
+
+The end-to-end script's home and butler checks run when homemcp and
+carcloud are built next to harness (`zig build` in `../homemcp` and
+`../carcloud`), or `HOMEMCP_BIN` and `CARCLOUD_BIN` name the folders
+holding `homemcp`, `homemcp-sim`, `carcloud` and `carcloud-sim`; without
+them they are skipped, and the script says so.
 
 Zig 0.17.1.
