@@ -9,6 +9,12 @@ const server = @import("server.zig");
 const imap = @import("imap.zig");
 const smtp = @import("smtp.zig");
 
+/// An OS call's unexpected error is returned, never traced: std's Debug
+/// trace prints a Windows error code's name and panics on a code it has
+/// none for, as crypt32's when it can't check a server's certificate
+/// (Debug builds crashed where release builds say "not accepted").
+pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
+
 const usage =
     \\usage: mailmcp MAIL.ini          serve MCP on stdin and stdout (what an agent starts)
     \\       mailmcp check MAIL.ini    read the mail file, then log in to each mailbox (and its
@@ -105,6 +111,16 @@ fn checkAll(gpa: std.mem.Allocator, a: std.mem.Allocator, io: Io, cfg: *const co
 fn fail(io: Io, msg: []const u8, code: u8) u8 {
     Io.File.stderr().writeStreamingAll(io, msg) catch {};
     return code;
+}
+
+test "an_os_error_std_has_no_name_for_is_a_refusal_not_a_crash" {
+    // On Windows, when no root mailmcp trusts verifies a server, std's TLS
+    // client asks the system; crypt32 fails the sim's Ed25519 CA with
+    // NTE_BAD_ALGID, a code std has no name for, and std's Debug trace of
+    // an unexpected error prints the code's name: a panic. Without the
+    // trace the error is TlsCertificateNotVerified: "was not accepted".
+    try std.testing.expect(std.enums.tagName(std.os.windows.Win32Error, @fromBackingInt(0x80090008)) == null);
+    try std.testing.expect(!std_options.unexpected_error_tracing);
 }
 
 test {
