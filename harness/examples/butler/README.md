@@ -47,9 +47,15 @@ offers them again.
 - `triggers.ini`: a section per routine; `[leak-<leak>]` and `[door-<door>]`
   are written once for each leak sensor, door and window.
 - `rules`: what `/setup home` and `/setup car` add (reading needs no
-  question; your own requests switch what home.ini allows), and what three
+  question; your own requests switch what home.ini and car.ini allow, and
+  nothing else: those files are what bound the allow lines), and what three
   routines need (goodnight's agent step may use `home_set`; arriving's one
-  call; the morning summary may read a calendar, never change it).
+  exact call; the morning summary may read a calendar, never change it).
+  None of them pairs an `ask` or `deny` for part of a tool with an `allow`
+  for all of it: the gate matches a call's JSON as written, so another key
+  order or a space would slip past the narrower line. To keep a device or a
+  command asked, leave it out of home.ini's or car.ini's `allow`, or mark it
+  `guarded = yes` (`/setup home ask NAME`).
 - `mcp.ini`: the `[home]` and `[car]` sections `/setup home` and `/setup car`
   write. `home_guarded` is a money tool: asked every time, never given to
   helpers, never run unattended.

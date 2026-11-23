@@ -260,6 +260,348 @@ pub fn readCheck(h: *Home, check_out: []const u8) void {
     }
 }
 
+// ---- setup's summary and the owner's changes ----
+
+/// A kind's word in the summary's "I'll switch …" line.
+fn kindWord(k: Kind) []const u8 {
+    return switch (k) {
+        .light => "lights",
+        .plug => "plugs",
+        .@"switch" => "switches",
+        .climate => "the heating",
+        .cover => "blinds",
+        .fan => "fans",
+        .media => "speakers",
+        .scene => "scenes",
+        else => "other devices",
+    };
+}
+
+/// "the front door", "the leaving scene".
+fn theName(a: Allocator, d: Device) ![]const u8 {
+    return std.fmt.allocPrint(a, "the {s}{s}", .{ try spoken(a, d.name), if (d.kind == .scene) " scene" else "" });
+}
+
+/// "a, b and c" of at most `max` names, else "N things".
+fn someNames(a: Allocator, names: []const []const u8, max: usize, joiner: enum { @"and", @"or" }) ![]const u8 {
+    if (names.len > max) return std.fmt.allocPrint(a, "{d} of them (/setup home shows the file)", .{names.len});
+    return if (joiner == .@"and") andList(a, names) else orList(a, names);
+}
+
+/// What setup says of a home before it writes the file: what harness will
+/// switch when asked, what it asks about every time, what it won't touch,
+/// what it watches, and what the owner should sort (switches it couldn't
+/// identify, plugs that may power a heater).
+pub fn homeSummary(a: Allocator, h: Home) ![]const u8 {
+    var o: std.ArrayList(u8) = .empty;
+    const n = h.devices.len;
+    try o.print(a, "I found {d} device{s}", .{ n, if (n == 1) "" else "s" });
+    const r = h.rooms();
+    if (r > 0) try o.print(a, " in {d} room{s}", .{ r, if (r == 1) "" else "s" });
+    if (h.people.len > 0) try o.print(a, ", and {d} {s}", .{ h.people.len, if (h.people.len == 1) "person" else "people" });
+    try o.appendSlice(a, ".");
+    // what acts when asked, by kind, in this order
+    var kinds: std.ArrayList([]const u8) = .empty;
+    for ([_]Kind{ .light, .plug, .@"switch", .climate, .cover, .fan, .media, .scene }) |k| {
+        for (h.devices) |d| if (d.kind == k and d.acts()) {
+            try kinds.append(a, kindWord(k));
+            break;
+        };
+    }
+    if (kinds.items.len > 0) try o.print(a, "\nI'll switch {s} when you ask.", .{try andList(a, kinds.items)});
+    // guarded, with something allowed: asked every time
+    var guarded: std.ArrayList([]const u8) = .empty;
+    var unknown: std.ArrayList([]const u8) = .empty;
+    var unknown_names: std.ArrayList([]const u8) = .empty;
+    var idle: std.ArrayList([]const u8) = .empty;
+    var seen: std.ArrayList([]const u8) = .empty;
+    var plugs: std.ArrayList(Device) = .empty;
+    for (h.devices) |d| {
+        if (d.unidentified()) {
+            try unknown.append(a, try theName(a, d));
+            try unknown_names.append(a, d.name);
+        } else if (d.isGuarded() and d.allow.len > 0) {
+            try guarded.append(a, try theName(a, d));
+        } else if (d.isGuarded()) {
+            try idle.append(a, try std.fmt.allocPrint(a, "{s} (it may do nothing yet)", .{try theName(a, d)}));
+        } else if (d.allow.len == 0) {
+            try seen.append(a, try theName(a, d));
+        }
+        if (d.kind == .plug and d.acts()) try plugs.append(a, d);
+    }
+    if (guarded.items.len > 0) try o.print(a, "\nI'll ask you every time before {s}.", .{try someNames(a, guarded.items, 6, .@"and")});
+    // never touched: cameras, smoke and CO alarms discover left out, and
+    // guarded devices that may do nothing
+    var never: std.ArrayList([]const u8) = .empty;
+    for (h.left) |l| if (l.why == .camera or l.why == .safety) try never.append(a, try std.fmt.allocPrint(a, "the {s}", .{try lowerFirst(a, l.label)}));
+    try never.appendSlice(a, idle.items);
+    if (never.items.len > 0) try o.print(a, "\nI won't touch {s}.", .{try someNames(a, never.items, 6, .@"or")});
+    if (seen.items.len > 0) try o.print(a, "\nI'll watch {s}.", .{try someNames(a, seen.items, 6, .@"and")});
+    if (unknown.items.len == 1) {
+        try o.print(a, "\nI couldn't tell what {s} controls: I'll ask you before switching it until you sort it. If it's a light or a plug, send /setup home allow {s}.", .{ unknown.items[0], unknown_names.items[0] });
+    } else if (unknown.items.len > 1) {
+        try o.print(a, "\nI couldn't tell what {d} switches control ({s}): I'll ask you before switching them until you sort them. For a light or a plug, send /setup home allow NAME.", .{ unknown.items.len, try andList(a, unknown.items) });
+    }
+    if (plugs.items.len == 1) {
+        try o.print(a, "\nIf {s} powers a kettle or a heater, send /setup home ask {s} and I'll ask you first.", .{ try theName(a, plugs.items[0]), plugs.items[0].name });
+    } else if (plugs.items.len > 1) try o.appendSlice(a, "\nIf a plug powers a kettle or a heater, send /setup home ask NAME and I'll ask you first.");
+    return o.items;
+}
+
+fn lowerFirst(a: Allocator, s: []const u8) ![]const u8 {
+    const out = try a.dupe(u8, s);
+    if (out.len > 0) out[0] = std.ascii.toLower(out[0]);
+    return out;
+}
+
+/// What setup says of the car, from `carcloud check`'s lines.
+pub fn carSummary(a: Allocator, check_out: []const u8) ![]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    var age: []const u8 = "";
+    var it = std.mem.splitScalar(u8, check_out, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        const colon = std.mem.indexOf(u8, line, ": ") orelse continue;
+        const key = line[0..colon];
+        const v = line[colon + 2 ..];
+        const eql = std.mem.eql;
+        if (eql(u8, key, "battery")) try parts.append(a, try std.fmt.allocPrint(a, "battery {s} %", .{std.mem.trimEnd(u8, v, "%")}));
+        if (eql(u8, key, "range")) {
+            const km = std.fmt.parseFloat(f64, std.mem.trimEnd(u8, v, " km")) catch null;
+            try parts.append(a, if (km) |x| try std.fmt.allocPrint(a, "range {d} km", .{@as(i64, @intFromFloat(@round(x)))}) else try std.fmt.allocPrint(a, "range {s}", .{v}));
+        }
+        if (eql(u8, key, "plugged in")) try parts.append(a, if (eql(u8, v, "yes")) "plugged in" else "not plugged in");
+        if (eql(u8, key, "charging")) try parts.append(a, if (eql(u8, v, "yes")) "charging" else "not charging");
+        if (eql(u8, key, "charge limit")) try parts.append(a, try std.fmt.allocPrint(a, "charge limit {s} %", .{std.mem.trimEnd(u8, v, "%")}));
+        if (eql(u8, key, "data")) age = v;
+    }
+    // the order a person says it in: battery, range, plug, charging, limit
+    var ordered: std.ArrayList([]const u8) = .empty;
+    for ([_][]const u8{ "battery", "range", "plugged", "not plugged", "charging", "not charging", "charge limit" }) |w| for (parts.items) |p| if (std.mem.startsWith(u8, p, w) and !(std.mem.eql(u8, w, "charging") and std.mem.startsWith(u8, p, "charge"))) {
+        var dup = false;
+        for (ordered.items) |q| if (std.mem.eql(u8, q, p)) {
+            dup = true;
+        };
+        if (!dup) try ordered.append(a, p);
+    };
+    var o: std.ArrayList(u8) = .empty;
+    try o.print(a, "The car answers: {s}", .{try std.mem.join(a, ", ", ordered.items)});
+    if (age.len > 0) try o.print(a, " (data {s})", .{age});
+    try o.appendSlice(a, ".\nI'll read it, and start or stop charging and set the charge limit (60–90 %) when you ask. I won't lock or unlock it: car.ini doesn't list them.");
+    return o.items;
+}
+
+/// A home file's lines, split for editing.
+fn linesOf(a: Allocator, text: []const u8) !std.ArrayList([]const u8) {
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |l| try out.append(a, l);
+    return out;
+}
+
+/// Where device `name`'s section is: its header's line, and the line
+/// after its last key line.
+const Span = struct { head: usize, end: usize };
+
+fn spanOf(lines: []const []const u8, name: []const u8) ?Span {
+    for (lines, 0..) |l, i| {
+        const tl = std.mem.trim(u8, stripComment(l), " \t\r");
+        if (!std.mem.startsWith(u8, tl, "[device ") or !std.mem.endsWith(u8, tl, "]")) continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, tl["[device ".len .. tl.len - 1], " \t"), name)) continue;
+        var end = i + 1;
+        var last = i + 1;
+        while (end < lines.len) : (end += 1) {
+            const x = std.mem.trim(u8, lines[end], " \t\r");
+            if (x.len > 0 and x[0] == '[') break;
+            if (x.len > 0 and x[0] != ';' and x[0] != '#') last = end + 1;
+        }
+        return .{ .head = i, .end = last };
+    }
+    return null;
+}
+
+/// The section's lines without `key = …`.
+fn dropKey(a: Allocator, lines: *std.ArrayList([]const u8), span: *Span, key: []const u8) void {
+    _ = a;
+    var i = span.head + 1;
+    while (i < span.end) {
+        const tl = std.mem.trim(u8, lines.items[i], " \t\r");
+        const eq = std.mem.indexOfScalar(u8, tl, '=');
+        if (eq != null and std.mem.eql(u8, std.mem.trim(u8, tl[0..eq.?], " \t"), key)) {
+            _ = lines.orderedRemove(i);
+            span.end -= 1;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Switches discover gave on and off but could not identify (a plain
+/// switch, no valve or opener in its name): guarded until the owner sorts
+/// them, with a note saying so (the follow-up of homemcp's discover: a
+/// misnamed valve on a plain switch would otherwise act like a plug).
+pub fn markUnidentified(a: Allocator, text: []const u8) ![]const u8 {
+    const h = try parseHome(a, text);
+    var lines = try linesOf(a, text);
+    for (h.devices) |d| {
+        if (d.kind != .@"switch" or d.guarded or d.note.len > 0 or d.allow.len == 0) continue;
+        var span = spanOf(lines.items, d.name) orelse continue;
+        dropKey(a, &lines, &span, "guarded");
+        try lines.insertSlice(a, span.end, &.{ "guarded = yes", "note = " ++ unidentified_note });
+    }
+    return std.mem.join(a, "\n", lines.items);
+}
+
+/// What the owner sorted at setup before, kept over a new discover: a
+/// device left out stays out; a switch let act, or one asked every time,
+/// stays so.
+pub fn carryOver(a: Allocator, fresh: []const u8, live: []const u8) ![]const u8 {
+    var text = fresh;
+    // left out at setup: "; left out at /setup: NAME (ID)"
+    var it = std.mem.splitScalar(u8, live, '\n');
+    while (it.next()) |l| {
+        const mark = "; left out at /setup: ";
+        if (!std.mem.startsWith(u8, l, mark)) continue;
+        const rest = l[mark.len..];
+        const name = rest[0 .. std.mem.indexOf(u8, rest, " (") orelse rest.len];
+        const e = try editHome(a, text, .leave, name);
+        if (!e.refused) text = e.text;
+    }
+    const old = try parseHome(a, live);
+    const now = try parseHome(a, text);
+    for (now.devices) |d| {
+        const was = old.find(d.name) orelse continue;
+        if (std.mem.eql(u8, was.name, d.name) and was.kind == d.kind) {
+            // let act at setup, or asked every time at setup
+            if (d.unidentified() and !was.isGuarded() and !was.unidentified()) {
+                const e = try editHome(a, text, .allow, d.name);
+                if (!e.refused) text = e.text;
+            } else if (!d.isGuarded() and was.guarded and !was.unidentified()) {
+                const e = try editHome(a, text, .ask, d.name);
+                if (!e.refused) text = e.text;
+            }
+        }
+    }
+    return text;
+}
+
+pub const Op = enum { leave, ask, allow };
+
+/// What came of a change: the file (as it was, when refused) and what to
+/// say.
+pub const Edited = struct { text: []const u8, said: []const u8, refused: bool = false };
+
+/// `/setup home leave|ask|allow NAME` on the pending home file: leave it
+/// out; ask every time (`guarded = yes`); or let it act when asked (not a
+/// lock, an alarm, a valve, a garage door, a gate or a scene that sets one:
+/// those are asked every time).
+pub fn editHome(a: Allocator, text: []const u8, op: Op, name: []const u8) !Edited {
+    const h = try parseHome(a, text);
+    const d = (h.find(name) orelse return .{ .text = text, .said = try std.fmt.allocPrint(a, "No device called {s} in the home file.", .{name}), .refused = true }).*;
+    const the = try capital(a, try theName(a, d));
+    var lines = try linesOf(a, text);
+    var span = spanOf(lines.items, d.name) orelse return .{ .text = text, .said = "That device's section can't be found.", .refused = true };
+    switch (op) {
+        .leave => {
+            // its lines, and the blank line after them
+            var end = span.end;
+            if (end < lines.items.len and std.mem.trim(u8, lines.items[end], " \t\r").len == 0) end += 1;
+            try lines.replaceRange(a, span.head, end - span.head, &.{});
+            if (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) _ = lines.pop();
+            try lines.append(a, try std.fmt.allocPrint(a, "; left out at /setup: {s} ({s})", .{ d.name, d.id }));
+            try lines.append(a, "");
+            return .{ .text = try std.mem.join(a, "\n", lines.items), .said = try std.fmt.allocPrint(a, "Left out: {s}.", .{try theName(a, d)}) };
+        },
+        .ask => {
+            if (d.kind == .sensor or d.allow.len == 0) return .{ .text = text, .said = try std.fmt.allocPrint(a, "{s} is a sensor: it is only seen, never switched.", .{the}), .refused = true };
+            dropKey(a, &lines, &span, "guarded");
+            try lines.insert(a, span.end, "guarded = yes");
+            return .{ .text = try std.mem.join(a, "\n", lines.items), .said = try std.fmt.allocPrint(a, "{s}: I'll ask you every time.", .{the}) };
+        },
+        .allow => {
+            const opener = std.mem.startsWith(u8, d.note, "by its name it opens");
+            const always = d.kind == .lock or d.kind == .alarm or d.kind == .valve or d.valveSwitch() or opener or (d.kind == .cover and d.guarded) or (d.kind == .scene and d.guarded);
+            if (always) return .{ .text = text, .said = try std.fmt.allocPrint(a, "{s} stays asked every time: locks, alarms, valves, garage doors, gates and scenes that set them always are.", .{the}), .refused = true };
+            if (d.allow.len == 0) return .{ .text = text, .said = try std.fmt.allocPrint(a, "{s} may do nothing: it is only seen.", .{the}), .refused = true };
+            dropKey(a, &lines, &span, "guarded");
+            if (d.unidentified()) dropKey(a, &lines, &span, "note");
+            return .{ .text = try std.mem.join(a, "\n", lines.items), .said = try std.fmt.allocPrint(a, "{s}: I'll switch it when you ask.", .{the}) };
+        },
+    }
+}
+
+/// Whether `s` reads as a token pasted where an address or a name was
+/// asked for: one long word of letters, digits and `._-` (a JWT, an API
+/// key), or a masked secret.
+pub fn looksLikeToken(s_in: []const u8) bool {
+    const s = std.mem.trim(u8, s_in, " \t\r\n");
+    if (std.mem.indexOf(u8, s, "[secret:") != null) return true;
+    if (s.len < 24 or std.mem.indexOf(u8, s, "://") != null) return false;
+    var letters: usize = 0;
+    var digits: usize = 0;
+    for (s) |ch| {
+        if (std.ascii.isAlphabetic(ch)) letters += 1 else if (std.ascii.isDigit(ch)) digits += 1 else if (ch != '.' and ch != '_' and ch != '-') return false;
+    }
+    return letters > 0 and digits > 0;
+}
+
+/// Whether any word of `text` reads as a token (`looksLikeToken`).
+pub fn anyTokenLike(text: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    while (it.next()) |w| if (looksLikeToken(w)) return true;
+    return false;
+}
+
+/// Whether one of `/setup car`'s ids reads as one: letters, digits, `-`
+/// and `_`, up to 80.
+pub fn plainId(s: []const u8) bool {
+    if (s.len == 0 or s.len > 80) return false;
+    for (s) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_')) return false;
+    return true;
+}
+
+/// The car file `/setup car` writes for carcloud: charging and the charge
+/// limit only (no lock, no unlock: rules lets the owner's requests act on
+/// what this lists, see examples/butler/rules); `api`: another Smartcar
+/// address (carcloud-sim's), "" for Smartcar's own.
+pub fn carFile(a: Allocator, client: []const u8, vehicle: []const u8, user: []const u8, api: []const u8, date: []const u8) ![]const u8 {
+    var o: std.ArrayList(u8) = .empty;
+    try o.print(a, "; Written by /setup car {s}: the car, for carcloud (its README: The car file).\n; Its secret is the stored secret smartcar (mcp.ini passes it as\n; SMARTCAR_CLIENT_SECRET). allow lists what harness may ask the car to do:\n; nothing else is sent, and unlock never is.\n\n[car]\nname = The car\nvehicle_id = {s}\nuser_id = {s}\nclient_id = {s}\nallow = charge_start, charge_stop, charge_limit\ncharge_limit = 60 90\ncommands_per_day = 10\nmin_seconds_between = 60\nlocation = no\nlog = state/car-actions.jsonl\n", .{ date, vehicle, user, client });
+    if (api.len > 0) {
+        const base = std.mem.trimEnd(u8, api, "/");
+        try o.print(a, "; another Smartcar (carcloud-sim's, for trying without a car)\napi = {s}/v3\ntoken_url = {s}/oauth2/token\n", .{ base, base });
+    }
+    return o.items;
+}
+
+/// Section `name` of an INI text gone: its header, its lines, and the
+/// comment lines just above it (its mark).
+pub fn dropSection(a: Allocator, text: []const u8, name: []const u8) ![]const u8 {
+    var lines = try linesOf(a, text);
+    const header = try std.fmt.allocPrint(a, "[{s}]", .{name});
+    for (lines.items, 0..) |l, i| {
+        if (!std.mem.eql(u8, std.mem.trim(u8, stripComment(l), " \t\r"), header)) continue;
+        var start = i;
+        while (start > 0 and std.mem.startsWith(u8, std.mem.trimStart(u8, lines.items[start - 1], " \t"), ";")) start -= 1;
+        var end = i + 1;
+        while (end < lines.items.len) : (end += 1) {
+            const x = std.mem.trim(u8, lines.items[end], " \t\r");
+            if (x.len > 0 and x[0] == '[') break;
+            if (x.len > 0 and x[0] == ';') {
+                // a comment that belongs to the next section
+                var k = end;
+                while (k < lines.items.len and std.mem.trim(u8, lines.items[k], " \t\r").len > 0 and std.mem.trim(u8, lines.items[k], " \t\r")[0] == ';') k += 1;
+                if (k < lines.items.len and std.mem.trim(u8, lines.items[k], " \t\r").len > 0 and std.mem.trim(u8, lines.items[k], " \t\r")[0] == '[') break;
+            }
+        }
+        // the blank lines it leaves
+        while (end < lines.items.len and std.mem.trim(u8, lines.items[end], " \t\r").len == 0) end += 1;
+        try lines.replaceRange(a, start, end - start, &.{});
+        return std.mem.join(a, "\n", lines.items);
+    }
+    return error.NotFound;
+}
+
 // ---- the routines ----
 
 /// What the routines can use, picked from the home and the settings.
@@ -428,6 +770,19 @@ pub const Routine = enum {
         return o.items;
     }
 };
+
+/// What is said once routine `r` is on: how to try it, or when it runs.
+pub fn onText(a: Allocator, r: Routine, p: Picks) ![]const u8 {
+    return switch (r) {
+        .goodnight => "Goodnight is on: write goodnight to try it.",
+        .leaving => "Leaving is on: it runs when the last of you goes out.",
+        .arriving => "Arriving is on: it runs when the first of you comes home.",
+        .@"morning-home" => std.fmt.allocPrint(a, "The morning summary is on, at {s}. /workflow start morning-home tries it now.", .{try clock(a, morningAt(p))}),
+        .leak => "Leak is on: it comes through quiet hours.",
+        .@"door-open" => "Doors left open is on.",
+        .@"car-tomorrow" => std.fmt.allocPrint(a, "Car for tomorrow is on, at {s}. /workflow start car-tomorrow tries it now.", .{try clock(a, carAt(p))}),
+    };
+}
 
 /// The routines in the order setup offers them.
 pub const all = [_]Routine{ .goodnight, .leaving, .arriving, .@"morning-home", .leak, .@"door-open", .@"car-tomorrow" };
@@ -1023,7 +1378,18 @@ test "routines_fill_from_the_sims_home" {
     }
     // the rules lines read as rules
     _ = try @import("rules.zig").parse(a, rules_all.items);
-    try t.expect(std.mem.indexOf(u8, rules_all.items, "[workflow:arriving/heat]\nallow mcp home/home_set {\"device\":\"hall_thermostat\",\"action\":\"temperature\",\"value\":\"21\"}") != null);
+    try t.expect(std.mem.indexOf(u8, rules_all.items, "[workflow:arriving/heat]\nallow mcp home/home_set {\"action\":\"temperature\",\"device\":\"hall_thermostat\",\"value\":\"21\"}") != null);
+    // no ask or deny for part of a tool beside an allow for all of it (the
+    // gate matches a call's JSON as written: a space or another key order
+    // would slip past the narrower line)
+    for ([_][]const u8{ try setupRules(a, .home), try setupRules(a, .car), rules_all.items }) |text| {
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |l| {
+            if (!(std.mem.startsWith(u8, l, "ask ") or std.mem.startsWith(u8, l, "deny "))) continue;
+            std.debug.print("a narrowing line in the butler's rules: {s}\n", .{l});
+            return error.TestUnexpectedResult;
+        }
+    }
     // what the files say, filled
     const gn = try routineFiles(a, .goodnight, p, "2026-11-23");
     try t.expect(std.mem.indexOf(u8, gn.workflow, "about When you say goodnight (or at 21:45): the lights off, the heating to 18 °C, and one tap before the front door is locked.") != null);
@@ -1074,4 +1440,108 @@ test "a_routine_whose_devices_are_missing_is_not_offered" {
     try t.expectError(error.UnbalancedIf, fill(a, "#if lock\nsay x", &.{}, &.{}, &missing));
     // a comparison is no placeholder
     try t.expectEqualStrings("if x < 3 goto y", try fill(a, "if x < 3 goto y", &.{}, &.{}, &missing));
+}
+
+/// homemcp-sim's home with three switches discover can't tell apart from
+/// lights or plugs, or knows by name: a plain one, a valve, an opener.
+const switches_home = sim_home ++
+    \\
+    \\[device garden_switch]
+    \\id = switch.garden
+    \\kind = switch
+    \\room = Garden
+    \\allow = on, off
+    \\
+    \\[device boiler_valve]
+    \\id = switch.boiler_valve
+    \\kind = switch
+    \\room = Garden
+    \\allow = off
+    \\guarded = yes
+    \\note = a valve, by its name: it may only be switched off (closed)
+    \\
+    \\[device gate_opener]
+    \\id = switch.gate_opener
+    \\kind = switch
+    \\room = Garden
+    \\guarded = yes
+    \\note = by its name it opens or locks something: nothing is allowed until you add it
+    \\
+;
+
+test "the_summary_says_what_it_switches_asks_and_leaves" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h = try parseHome(a, sim_home);
+    readCheck(&h, sim_check);
+    const s = try homeSummary(a, h);
+    try t.expectEqualStrings(
+        \\I found 15 devices in 5 rooms, and 2 people.
+        \\I'll switch lights, plugs, the heating, fans, speakers and scenes when you ask.
+        \\I'll ask you every time before the water main, the front door, the garage door and the leaving scene.
+        \\I won't touch the front door camera or the kitchen smoke alarm.
+        \\I'll watch the living room temperature, the back door, the sink leak and the hall motion.
+        \\If the kettle plug powers a kettle or a heater, send /setup home ask kettle_plug and I'll ask you first.
+    , s);
+    // the car's, from carcloud check's lines
+    try t.expectEqualStrings("The car answers: battery 64 %, range 294 km, plugged in, not charging, charge limit 80 % (data from 30 minutes ago).\nI'll read it, and start or stop charging and set the charge limit (60–90 %) when you ask. I won't lock or unlock it: car.ini doesn't list them.", try carSummary(a, "The made-up car:\nbattery: 64%\nrange: 294.4 km\ncharging: no\nplugged in: yes\ncharge limit: 80%\nlocked: yes\nodometer: 18234.6 km\ninside: 14.5 °C\ndata: from 30 minutes ago\ncommands the owner allowed: charge_start, charge_stop, charge_limit\n"));
+}
+
+test "unidentified_switches_stay_guarded_until_sorted" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // as discover wrote it, the plain switch may act; setup guards it
+    try t.expect((try parseHome(a, switches_home)).find("garden_switch").?.acts());
+    const marked = try markUnidentified(a, switches_home);
+    var h = try parseHome(a, marked);
+    const g = h.find("garden switch").?;
+    try t.expect(g.isGuarded() and !g.acts() and g.unidentified());
+    // the valve and the opener discover knew by name stay as they were
+    try t.expectEqualStrings("a valve, by its name: it may only be switched off (closed)", h.find("boiler_valve").?.note);
+    try t.expect(!h.find("gate_opener").?.unidentified());
+    // the summary lists it, and how to sort it
+    const s = try homeSummary(a, h);
+    try t.expect(std.mem.indexOf(u8, s, "I couldn't tell what the garden switch controls: I'll ask you before switching it until you sort it. If it's a light or a plug, send /setup home allow garden_switch.") != null);
+    try t.expect(std.mem.indexOf(u8, s, "I won't touch the front door camera, the kitchen smoke alarm or the gate opener (it may do nothing yet).") != null);
+    // sorted: it acts
+    const sorted = try editHome(a, marked, .allow, "garden_switch");
+    try t.expectEqualStrings("The garden switch: I'll switch it when you ask.", sorted.said);
+    const h2 = try parseHome(a, sorted.text);
+    try t.expect(h2.find("garden_switch").?.acts() and !h2.find("garden_switch").?.unidentified());
+    // discover run again: what the owner sorted stays sorted; left out stays out
+    const left = try editHome(a, sorted.text, .leave, "kitchen speaker");
+    const again = try carryOver(a, try markUnidentified(a, switches_home), left.text);
+    const h3 = try parseHome(a, again);
+    try t.expect(h3.find("garden_switch").?.acts());
+    try t.expect(h3.find("kitchen_speaker") == null);
+}
+
+test "edits_leave_ask_allow" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const left = try editHome(a, sim_home, .leave, "Kitchen Speaker");
+    try t.expectEqualStrings("Left out: the kitchen speaker.", left.said);
+    try t.expect((try parseHome(a, left.text)).find("kitchen_speaker") == null);
+    try t.expect(std.mem.indexOf(u8, left.text, "; left out at /setup: kitchen_speaker (media_player.kitchen_speaker)") != null);
+    const asked = try editHome(a, left.text, .ask, "ceiling fan");
+    try t.expectEqualStrings("The ceiling fan: I'll ask you every time.", asked.said);
+    try t.expect((try parseHome(a, asked.text)).find("ceiling_fan").?.isGuarded());
+    const allowed = try editHome(a, asked.text, .allow, "ceiling_fan");
+    try t.expect((try parseHome(a, allowed.text)).find("ceiling_fan").?.acts());
+    // what is never let act alone, and what is only seen
+    for ([_][]const u8{ "front_door", "garage_door", "water_main", "leaving" }) |n| {
+        const r = try editHome(a, sim_home, .allow, n);
+        try t.expect(r.refused);
+        try t.expectEqualStrings(sim_home, r.text);
+        try t.expect(std.mem.indexOf(u8, r.said, "asked every time") != null);
+    }
+    const sensor = try editHome(a, sim_home, .ask, "back_door");
+    try t.expect(sensor.refused);
+    try t.expectEqualStrings("The back door is a sensor: it is only seen, never switched.", sensor.said);
+    const none = try editHome(a, sim_home, .ask, "the moon");
+    try t.expect(none.refused);
+    try t.expectEqualStrings("No device called the moon in the home file.", none.said);
 }

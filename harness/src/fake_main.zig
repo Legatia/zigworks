@@ -2,7 +2,9 @@
 //! search, for the end-to-end tests. `harness-fake --dir DIR [--port N]`
 //! prints `port N` and serves until killed. `harness-fake --mcp` is an MCP
 //! server on stdio instead (see fake_mcp.zig; `--mcp --home` is homemcp's
-//! stand-in, `--mcp --car` carcloud's). `harness-fake --browse URL` is the owner's browser for a
+//! stand-in, `--mcp --car` carcloud's, `--mcp --slack|--jira|--github`
+//! the work morning's). `harness-fake discover URL`, `check FILE` and
+//! `FILE.ini` answer as homemcp and carcloud do, for /setup. `harness-fake --browse URL` is the owner's browser for a
 //! sign-in: it opens URL, follows its redirect to 127.0.0.1, and prints the
 //! page's status and text.
 const std = @import("std");
@@ -17,6 +19,15 @@ pub fn main(init: std.process.Init) u8 {
     if (args.len == 2 and std.mem.eql(u8, args[1], "--mcp")) return fake_mcp.run(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--home")) return fake_mcp.runHome(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--car")) return fake_mcp.runCar(io, init.gpa, init.environ_map);
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp")) return fake_mcp.runWork(io, init.gpa, init.environ_map, args[2]);
+    // homemcp's and carcloud's commands, for /setup: discover URL, check FILE
+    if (args.len == 3 and (std.mem.eql(u8, args[1], "discover") or std.mem.eql(u8, args[1], "check"))) return fake_mcp.programStandIn(io, init.arena.allocator(), init.environ_map, args[1..]);
+    // as mcp.ini starts them: homemcp HOME.ini or carcloud CAR.ini
+    if (args.len == 2 and std.mem.endsWith(u8, args[1], ".ini")) {
+        const text = std.Io.Dir.cwd().readFileAlloc(io, args[1], init.arena.allocator(), .limited(1 << 20)) catch "";
+        if (std.mem.indexOf(u8, text, "[car]") != null) return fake_mcp.runCar(io, init.gpa, init.environ_map);
+        return fake_mcp.runHome(io, init.gpa, init.environ_map);
+    }
     if (args.len == 3 and std.mem.eql(u8, args[1], "--browse")) {
         const page = fake.browse(io, init.arena.allocator(), args[2], .{}) catch |e| {
             std.debug.print("harness-fake: {s}\n", .{@errorName(e)});

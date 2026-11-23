@@ -1,0 +1,66 @@
+# The work morning: yesterday's Slack mentions, Jira issues and GitHub
+# notifications, triaged into a digest you review; the suggested replies
+# posted only once you approve them. The tool names are those of the
+# stand-ins harness's tests use: put your servers' own (harness mcp list).
+workflow morning
+about Weekday mornings: what came in from Slack, Jira and GitHub, triaged into a digest you review; the suggested replies posted once you approve them.
+start owner, schedule:morning-at
+limits steps 20, days 1
+
+step slack
+tool slack/search_messages {"query": "to:me after:yesterday"}
+retry 2 wait 5m
+
+step jira
+tool jira/search_issues {"jql": "assignee = currentUser() AND updated >= -1d ORDER BY priority DESC"}
+retry 2 wait 5m
+
+step github
+tool github/list_notifications {"participating": true}
+retry 2 wait 5m
+
+step triage
+answer json
+tools none
+do:
+  Triage what came in since yesterday (the data below) into the owner's
+  morning digest: first what needs them today, with who asked and where;
+  then the rest, a line each. Suggest a reply only where a short one moves
+  things on, in the owner's voice, and never promise a time they didn't give.
+  Answer only JSON:
+  {"digest": "...",
+   "replies": [{"where": "slack", "channel": "#...", "thread_ts": "...", "text": "..."},
+               {"where": "github", "owner": "...", "repo": "...", "issue": 1, "text": "..."}],
+   "replies_text": "one line a reply: where, then the text"}
+  Slack mentions: {slack}
+  Jira issues: {jira}
+  GitHub notifications: {github}
+
+step review
+review {triage.digest}
+
+step tell
+say {review}
+
+step ask
+approve:
+  Post these replies?
+  {triage.replies_text}
+on deny goto done
+
+step post
+tools slack/post_message, github/add_issue_comment
+do:
+  Post each of these replies once, exactly as written, where it says:
+  Slack replies with slack/post_message (channel, thread_ts, text);
+  GitHub replies with github/add_issue_comment (owner, repo, issue_number,
+  body). Post nothing else. Answer with one line a reply: where it went.
+  The replies: {triage.replies}
+
+step posted
+say:
+  Replies posted:
+  {post}
+
+step done
+end

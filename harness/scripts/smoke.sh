@@ -585,6 +585,40 @@ check "mcp login prints a link and keeps the tokens in the store" 'grep -qF "No 
 check "the tokens are in no file of the data folder and never said" '! grep -rqF "fake-access-" "$HARNESS_HOME" && ! grep -qE "fake-(access|refresh)-" "$T/login.out"'
 check "mcp list says the server is signed in, with its tools" '"$H" mcp list 2>&1 | grep -qxF "cloud (sign-in, signed in): 3 tools"'
 check "mcp logout forgets the tokens" '"$H" mcp logout cloud | grep -qxF "Signed out of cloud." && [ ! -e "$HARNESS_STORE/mcp-cloud" ] && "$H" mcp logout cloud | grep -qxF "cloud was not signed in."'
+# the work morning (examples/morning) against the stand-in MCP server
+# playing Slack, Jira and GitHub: the reads, a digest to review, the
+# replies posted once approved
+EX=$(cd "$(dirname "$0")/../examples/morning" && pwd)
+printf '[fake]\ncommand = "%s" --mcp\n[slack]\ncommand = "%s" --mcp --slack\n[jira]\ncommand = "%s" --mcp --jira\n[github]\ncommand = "%s" --mcp --github\n' "$F" "$F" "$F" "$F" >"$HARNESS_HOME/mcp.ini"
+cp "$EX/workflows/morning.wf" "$HARNESS_HOME/workflows/morning.wf"
+chmod 600 "$HARNESS_HOME/workflows/morning.wf"
+cat "$EX/rules" >>"$HARNESS_HOME/rules"
+# its schedule on another weekday than today: this check starts it by hand
+tomorrow=$(echo "mon tue wed thu fri sat sun" | cut -d' ' -f$(($(date +%u) % 7 + 1)))
+sed "s/^days = .*/days = $tomorrow/" "$EX/triggers.ini" >>"$HARNESS_HOME/triggers.ini"
+check "the work morning's file reads" '"$H" workflow check "$HARNESS_HOME/workflows/morning.wf" >"$T/morning-check.out" 2>&1 && grep -qF "Workflow morning: Weekday mornings" "$T/morning-check.out"'
+mn=$((mn + 1))
+m_triage=$mn
+cat >"$S/model/$(printf %03d $mn).json" <<'EOF'
+{"content":[{"type":"text","text":"{\"digest\": \"Today: Maria needs the release notes reviewed before 11 (#release). APP-142, checkout fails on Safari, is yours and High. The Windows CI pull request on zigworks (#31) waits for your review.\", \"replies\": [{\"where\": \"slack\", \"channel\": \"#release\", \"thread_ts\": \"1732350000.000100\", \"text\": \"On it, before 11.\"}, {\"where\": \"github\", \"owner\": \"legatia\", \"repo\": \"zigworks\", \"issue\": 31, \"text\": \"Looking at it this morning.\"}], \"replies_text\": \"#release (Maria): On it, before 11.\\nzigworks #31: Looking at it this morning.\"}"}],"stop_reason":"end_turn"}
+EOF
+reply "$(call_reply tu_p1 slack__post_message '{"channel":"#release","thread_ts":"1732350000.000100","text":"On it, before 11."}')"
+reply "$(call_reply tu_p2 github__add_issue_comment '{"owner":"legatia","repo":"zigworks","issue_number":31,"body":"Looking at it this morning."}')"
+reply "$(text_reply '#release: in the thread of Maria. zigworks #31: commented.')"
+"$H" run >"$T/run5.out" 2>&1 &
+RPID=$!
+wait_for "$T/run5.out" "running on" 15
+before=$(asked)
+say "/workflow start morning"
+check "the work morning reads Slack, Jira and GitHub, and its digest comes to review" 'wait_asked $((before + 1)) && last_question | grep -qF "Draft to review" && last_question | grep -qF "Maria needs the release notes reviewed before 11" && grep -qF "review the release notes before 11" "$(req $m_triage)" && grep -qF "APP-142" "$(req $m_triage)" && grep -qF "Add Windows CI" "$(req $m_triage)" && grep -qF "Data (from outside" "$(req $m_triage)"'
+press use
+check "the digest kept is posted; the replies are asked about in plain lines" 'wait_asked $((before + 2)) && last_question | grep -qF "Post these replies?" && last_question | grep -qF "#release (Maria): On it, before 11." && grep -qF "Today: Maria needs" "$OUT"'
+press approve
+check "approved, the replies are posted where they belong" 'wait_for "$OUT" "Replies posted:" 15 && grep -qF "On it, before 11." "$HARNESS_HOME/state/mcp/slack/posted.jsonl" && grep -qF "Looking at it this morning." "$HARNESS_HOME/state/mcp/github/posted.jsonl"'
+check "its reads asked nothing; its posts came after the approval alone" '[ "$(asked)" = $((before + 2)) ] && ! grep -qF "\"tool\":\"slack__post_message\"" "$(req $m_triage)"'
+kill "$RPID" 2>/dev/null
+wait "$RPID" 2>/dev/null
+RPID=""
 cp "$T/mcp.ini.saved" "$HARNESS_HOME/mcp.ini"
 
 # a change in the home, pushed by homemcp, fires a trigger: homemcp and

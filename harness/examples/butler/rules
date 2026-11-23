@@ -11,10 +11,14 @@ allow mcp home/home_set *
 [all]
 
 # the car: reading it needs no question; charging and the charge limit
-# when you ask; locking is asked; unlocking is not on the car file at all
+# when you ask. car.ini (as /setup car writes it) allows car_command only
+# charge_start, charge_stop and charge_limit (60-90 %): carcloud refuses the
+# rest, locking and unlocking among them. That list is what bounds the
+# allow line below; never pair it with an ask or deny for part of the same
+# tool (the gate matches the call's JSON as written, so a space or another
+# key order would slip past the ask): add lock to car.ini and it is unasked.
 allow mcp car/car_status *
 [owner]
-ask mcp car/car_command {"command":"lock"*
 allow mcp car/car_command *
 [all]
 
@@ -23,9 +27,10 @@ allow mcp car/car_command *
 allow mcp home/home_set *
 [all]
 
-# arriving: the heating back up, this call alone
+# arriving: the heating back up, this call alone (exact, its keys in
+# order, so it matches however the gate reads JSON; any other call is asked)
 [workflow:arriving/heat]
-allow mcp home/home_set {"device":"<thermostat>","action":"temperature","value":"<home temp>"}
+allow mcp home/home_set {"action":"temperature","device":"<thermostat>","value":"<home temp>"}
 [all]
 
 # the morning summary: a calendar is read, never changed

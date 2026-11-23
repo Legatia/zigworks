@@ -1,0 +1,10 @@
+# The work morning (add these to rules). Its reads run without a question;
+# the posts only in its post step, which comes after your approval.
+[workflow:morning]
+allow mcp slack/search_messages *
+allow mcp jira/search_issues *
+allow mcp github/list_notifications *
+[workflow:morning/post]
+allow mcp slack/post_message *
+allow mcp github/add_issue_comment *
+[all]

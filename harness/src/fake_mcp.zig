@@ -14,6 +14,10 @@
 //! the files `device-NAME.json` and `presence.json` of its folder.
 //! `harness-fake --mcp --car` is carcloud's: `car_status` (34 %, plugged
 //! in, not charging) and `car_command` (charge_start, charge_stop).
+//! `--mcp --slack`, `--jira` and `--github` play the work morning's
+//! servers: a read each (mentions, issues, notifications, as JSON lists),
+//! and Slack's and GitHub's posts, written as lines to `posted.jsonl` in
+//! its folder.
 //!
 //! `Http` below is the same server over HTTP (Streamable HTTP), part of
 //! fake.zig's stand-in, for the tests of mcp_http.zig.
@@ -165,8 +169,183 @@ pub fn runCar(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Ma
     return serveAs(io, gpa, env, .{ .car = &car });
 }
 
+/// What `harness-fake discover URL` prints: the home stand-in's devices as
+/// homemcp discover writes a home file (and a plain switch it could not
+/// identify).
+pub const discovered_home =
+    \\; Written by homemcp discover from Home Assistant at http://127.0.0.1:8123.
+    \\; Read it through, then: homemcp check FILE
+    \\
+    \\[home]
+    \\name = Test flat
+    \\hub = homeassistant
+    \\url = http://127.0.0.1:8123
+    \\
+    \\[limits]
+    \\temperature = 16 24
+    \\
+    \\; Living room
+    \\
+    \\[device living_room_light]
+    \\id = light.living_room
+    \\kind = light
+    \\room = Living room
+    \\allow = on, off
+    \\
+    \\; Hall
+    \\
+    \\[device hall_thermostat]
+    \\id = climate.hall
+    \\kind = climate
+    \\room = Hall
+    \\allow = temperature
+    \\
+    \\[device front_door]
+    \\id = lock.front_door
+    \\kind = lock
+    \\room = Hall
+    \\allow = lock
+    \\
+    \\; Kitchen
+    \\
+    \\[device water_main]
+    \\id = valve.water_main
+    \\kind = valve
+    \\room = Kitchen
+    \\allow = close
+    \\
+    \\[device back_door]
+    \\id = binary_sensor.back_door
+    \\kind = sensor
+    \\room = Kitchen
+    \\
+    \\[device sink_leak]
+    \\id = binary_sensor.sink_leak
+    \\kind = sensor
+    \\room = Kitchen
+    \\
+    \\; Garden
+    \\
+    \\[device garden_switch]
+    \\id = switch.garden
+    \\kind = switch
+    \\room = Garden
+    \\allow = on, off
+    \\
+    \\[people]
+    \\anna = person.anna
+    \\
+    \\; Left out, and why:
+    \\; cameras: never offered (homemcp has no camera support; what they see is personal)
+    \\;   camera.front_door (Front door camera)
+    \\
+;
+
+/// The token the discover and check stand-ins take, and the car's secret.
+pub const ha_test_token = "ha-test-token-1234";
+pub const smartcar_test_secret = "smartcar-test-secret-1";
+
+/// `harness-fake discover URL` and `harness-fake check FILE`, as homemcp
+/// and carcloud answer them; 1 with their error line when the token (or
+/// secret) is not the tests'.
+pub fn programStandIn(io: Io, a: std.mem.Allocator, env: *const std.process.Environ.Map, args: []const []const u8) u8 {
+    const out = Io.File.stdout();
+    const err = Io.File.stderr();
+    if (std.mem.eql(u8, args[0], "discover")) {
+        if (!std.mem.eql(u8, env.get("HA_TOKEN") orelse "", ha_test_token)) {
+            err.writeStreamingAll(io, "homemcp: discover: the token was refused (HA_TOKEN)\n") catch {};
+            return 1;
+        }
+        out.writeStreamingAll(io, discovered_home) catch return 1;
+        err.writeStreamingAll(io, "Found 7 devices in 4 rooms, and 1 person.\n") catch {};
+        return 0;
+    }
+    const text = Io.Dir.cwd().readFileAlloc(io, args[1], a, .limited(1 << 20)) catch {
+        err.writeStreamingAll(io, "homemcp: can't read the file\n") catch {};
+        return 1;
+    };
+    if (std.mem.indexOf(u8, text, "[car]") != null) {
+        if (!std.mem.eql(u8, env.get("SMARTCAR_CLIENT_SECRET") orelse "", smartcar_test_secret)) {
+            err.writeStreamingAll(io, "carcloud: Smartcar refused the credentials (HTTP 401, AUTHENTICATION invalid_client)\n") catch {};
+            return 1;
+        }
+        out.writeStreamingAll(io, "The car:\nbattery: 34%\nrange: 150.2 km\ncharging: no\nplugged in: yes\ncharge limit: 80%\ndata: from 5 minutes ago\ncommands the owner allowed: charge_start, charge_stop, charge_limit\n") catch return 1;
+        return 0;
+    }
+    if (!std.mem.eql(u8, env.get("HA_TOKEN") orelse "", ha_test_token)) {
+        err.writeStreamingAll(io, "homemcp: hub = homeassistant needs HA_TOKEN in the environment\n") catch {};
+        return 1;
+    }
+    // a line per device of the file, as check says them
+    var o: std.ArrayList(u8) = .empty;
+    o.appendSlice(a, "Test flat: devices. Home Assistant at http://127.0.0.1:8123.\n") catch return 1;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |l| {
+        const tl = std.mem.trim(u8, l, " \t\r");
+        if (!std.mem.startsWith(u8, tl, "[device ")) continue;
+        const name = tl["[device ".len .. tl.len - 1];
+        const state: []const u8 = if (std.mem.eql(u8, name, "back_door")) "closed" else if (std.mem.eql(u8, name, "sink_leak")) "dry" else if (std.mem.eql(u8, name, "front_door")) "locked" else "off";
+        o.print(a, "  {s} (x.{s}, device): {s}; may: something\n", .{ name, name, state }) catch return 1;
+    }
+    out.writeStreamingAll(io, o.items) catch return 1;
+    return 0;
+}
+
 /// Who it plays: the plain test server, or a stand-in.
-const Role = union(enum) { plain, home: *Home, car: *Car };
+const Role = union(enum) { plain, home: *Home, car: *Car, slack, jira, github };
+
+/// The work morning's servers (`--mcp --slack|--jira|--github`) on stdio.
+pub fn runWork(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, which: []const u8) u8 {
+    const role: Role = if (std.mem.eql(u8, which, "--slack")) .slack else if (std.mem.eql(u8, which, "--jira")) .jira else if (std.mem.eql(u8, which, "--github")) .github else return 2;
+    return serveAs(io, gpa, env, role);
+}
+
+const slack_tools_json =
+    \\{"tools":[{"name":"search_messages","description":"Search messages.","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},{"name":"post_message","description":"Post a message, in a thread when thread_ts says.","inputSchema":{"type":"object","properties":{"channel":{"type":"string"},"thread_ts":{"type":"string"},"text":{"type":"string"}},"required":["channel","text"]}}]}
+;
+const jira_tools_json =
+    \\{"tools":[{"name":"search_issues","description":"Issues for a JQL query.","inputSchema":{"type":"object","properties":{"jql":{"type":"string"}},"required":["jql"]}}]}
+;
+const github_tools_json =
+    \\{"tools":[{"name":"list_notifications","description":"Your notifications.","inputSchema":{"type":"object","properties":{"participating":{"type":"boolean"}}}},{"name":"add_issue_comment","description":"Comment on an issue or pull request.","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"issue_number":{"type":"integer"},"body":{"type":"string"}},"required":["owner","repo","issue_number","body"]}}]}
+;
+
+/// A work server's call: its read's list, or a post written to posted.jsonl.
+fn workCall(io: Io, a: std.mem.Allocator, role: Role, v: std.json.Value) ![]const u8 {
+    const params = v.object.get("params") orelse return textResult(a, "no params", true);
+    if (params != .object) return textResult(a, "bad params", true);
+    const name_v = params.object.get("name") orelse return textResult(a, "no name", true);
+    const name = if (name_v == .string) name_v.string else "";
+    const args = params.object.get("arguments") orelse std.json.Value{ .object = .empty };
+    const eql = std.mem.eql;
+    switch (role) {
+        .slack => {
+            if (eql(u8, name, "search_messages")) return textResult(a, "[{\"channel\":\"#release\",\"ts\":\"1732350000.000100\",\"user\":\"maria\",\"text\":\"@you can you review the release notes before 11?\"},{\"channel\":\"#random\",\"ts\":\"1732351111.000200\",\"user\":\"tom\",\"text\":\"@you lunch Thursday?\"}]", false);
+            if (eql(u8, name, "post_message")) {
+                try post(io, a, args);
+                const ch = if (args == .object) args.object.get("channel") else null;
+                return textResult(a, try std.fmt.allocPrint(a, "ok: posted to {s}", .{if (ch) |c| (if (c == .string) c.string else "?") else "?"}), false);
+            }
+        },
+        .jira => if (eql(u8, name, "search_issues")) return textResult(a, "[{\"key\":\"APP-142\",\"summary\":\"Checkout fails on Safari\",\"status\":\"In Progress\",\"priority\":\"High\"},{\"key\":\"APP-139\",\"summary\":\"Update the privacy page\",\"status\":\"To Do\",\"priority\":\"Low\"}]", false),
+        .github => {
+            if (eql(u8, name, "list_notifications")) return textResult(a, "[{\"repo\":\"legatia/zigworks\",\"type\":\"PullRequest\",\"number\":31,\"title\":\"Add Windows CI\",\"reason\":\"review_requested\"}]", false);
+            if (eql(u8, name, "add_issue_comment")) {
+                try post(io, a, args);
+                return textResult(a, "ok: commented", false);
+            }
+        },
+        else => {},
+    }
+    return textResult(a, "unknown tool", true);
+}
+
+/// A post, as a line of posted.jsonl in its folder.
+fn post(io: Io, a: std.mem.Allocator, args: std.json.Value) !void {
+    const line = try std.json.Stringify.valueAlloc(a, args, .{});
+    const old = fileOf(io, a, "posted.jsonl") orelse "";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = "posted.jsonl", .data = try std.fmt.allocPrint(a, "{s}{s}\n", .{ old, line }) });
+}
 
 fn serve(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, home: ?*Home) u8 {
     return serveAs(io, gpa, env, if (home) |h| .{ .home = h } else .plain);
@@ -228,12 +407,16 @@ fn serveAs(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, 
                 .plain => tools_json,
                 .home => home_tools_json,
                 .car => car_tools_json,
+                .slack => slack_tools_json,
+                .jira => jira_tools_json,
+                .github => github_tools_json,
             };
         } else if (std.mem.eql(u8, method, "tools/call")) {
             result = switch (role) {
                 .plain => call(io, a, v, env, pinged) catch return 1,
                 .home => |h| homeCall(a, h, v) catch return 1,
                 .car => |c| carCall(a, c, v) catch return 1,
+                .slack, .jira, .github => workCall(io, a, role, v) catch return 1,
             };
         } else if (std.mem.eql(u8, method, "resources/read")) {
             result = (if (role == .home) homeResource(io, a, v) else resource(io, a, v)) orelse {
