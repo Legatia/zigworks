@@ -155,6 +155,29 @@ notes):
   them (`/person`), and when they last came up. Ask "move it to
   tomorrow": one question shows the exact change before anything is
   written. During a busy event, the routines' posts wait for its end.
+- **Day 11, away.** Turn on the Away routine (`/setup routines`), then
+  `/away until tomorrow`: one message says away mode is on and, if the
+  heating is above 17 °C, asks once to turn it down. Open a door or walk
+  past a motion sensor: the line comes at once, even at night. In the
+  evening the lights it picked go on and off (a different minute each
+  day; `/away lights NAME` picks others); at 20:00 one line says how the
+  day was. `/away off` when you're back, or it goes off by itself when
+  the first of you comes home.
+- **Day 12, the door.** With a doorbell in Home Assistant (or a
+  Zigbee2MQTT button named "doorbell"), ring it: "Someone's at the front
+  door." (with "probably the DHL parcel" when your mailbox has one due
+  today). If you added `unlock` to the front door's `allow` line in
+  home.ini yourself, the line has **Unlock the door**: tap it only if you
+  mean it; with no tap nothing happens. While you're away the ring comes
+  at once, with no button to unlock.
+- **Day 13, a trip.** Turn on Trips, then forward yourself (or have in
+  your mailbox) a flight confirmation, or put "Flight LO 3921 Kraków –
+  Lisbon" in your calendar at its airport. `/trips` lists it, each time in
+  its place's own time. A day before the flight: the check-in line; on
+  the day, when to leave for the airport (2 hours before, plus the way);
+  the evening before: the weather there (with search set) and what to
+  pack. When the trip begins and nobody is home, away mode comes on, and
+  the heating goes back up two hours before you're back.
 - **Any day.** `/session` shows the steps behind the last answer; `/quiet`
   what quiet hours hold; `/workflows` the routines that are on.
 
@@ -183,6 +206,12 @@ Tell us about anything like this, with the time it happened:
 - A calendar line at the wrong time (your time zone, summer time), a
   repeating event on the wrong day, or a change made that you didn't ask
   for.
+- Away mode on while someone was home, or still on after you came back;
+  a light switched while you were home; the heating raised when you had
+  set it yourself; a 20:00 line with something wrong in it.
+- A ring that came twice, late, or not at all; a parcel named wrongly; a
+  trip with the wrong time or zone, a check-in link that isn't the
+  airline's, a flight status claimed without a source.
 
 ## Sending a report
 
@@ -200,13 +229,19 @@ on what you did, what happened, and what you expected.
 
 ## What harness will never do in your home
 
-- **Never unlock a door, open the garage or disarm an alarm.** The home
-  file `/setup home` writes doesn't allow those at all: locks can only be
-  locked, valves and garage doors only closed, alarms only armed, and each
-  of those only after your tap, never from a schedule, a routine or
-  something a sensor reports. The one exception is yours to turn on: the
-  leak's fallback closes the water main, once, when nobody is on the leak
-  in 5 minutes. Nothing ever opens, unlocks or disarms by itself.
+- **Never unlock a door, open the garage or disarm an alarm by itself.**
+  The home file `/setup home` writes doesn't allow those at all: locks can
+  only be locked, valves and garage doors only closed, alarms only armed,
+  and each of those only after your tap, never from a schedule, a routine
+  or something a sensor reports. The one exception is yours to turn on:
+  the leak's fallback closes the water main, once, when nobody is on the
+  leak in 5 minutes. Nothing ever opens, unlocks or disarms by itself.
+  The doorbell's **Unlock the door** appears only if you add `unlock` to
+  your lock's line in home.ini yourself; it is your own tap, asked every
+  time, never offered while you're away, and never made when nobody taps.
+- **Away mode switches only lights.** While you're away it turns lights
+  on and off and the heating down and back up, each call one that `rules`
+  lets it make; never a lock, a valve, the garage or an alarm.
 - **Never act on cameras or smoke and CO alarms.** Cameras are left out of
   the home file; it can't see through them at all. Smoke and CO alarms are
   only watched: their alarm is said at once and to your household, and no
