@@ -16,6 +16,7 @@ on. Update it when something lands.
 | Default environment for unattended runs | Q3: host or sandbox | host |
 | Apps opened from the phone | Q4: a TLS front (tailscale serve) or loopback only | loopback only |
 | Hosted version | five questions in the hosted design (VMs, EU, one balance, support access, home connector) | design only |
+| Messages to other people (WhatsApp, Signal, SMS) | Q5: which channel (WhatsApp has no personal API; Signal through signal-cli; SMS through a provider) | email only |
 | Releases | tag one | release.yml for harness, homemcp, carcloud; nothing tagged |
 
 ## The butler, against a real one (Alfred)
@@ -26,13 +27,13 @@ on. Update it when something lands.
 | Diary | **built 2026-11-23** | — (calmcp; agenda, leave-by, meeting preparation with what harness knows of the people, busy means quiet, changes asked) |
 | People and occasions | **built 2026-11-23** | — (state/people, the people tool, occasions, keeping in touch, vCard import, calendar attendees) |
 | Post and messages | email built (A and C) | messages to others on the owner's behalf through other channels (asked every time) |
-| The door | not specced | doorbell: who is there, announced, one tap to answer; deliveries |
-| Away and travel | not specced | away mode (lived-in lights, stricter watch, daily summary); itinerary, flight status, check-in, packing list |
-| Errands | not specced | shopping list and pantry, reorders within caps, delivery tracking; pay-per-call services (pay.sh, x402) |
-| Habits | not specced | suggesting a routine from a seen pattern (never turned on unasked) |
-| House upkeep | not specced | service dates (boiler, filters, car), manuals and warranties remembered |
-| Health | not specced | medication reminders, sleep nudges, wearable data (optional) |
-| Manner | not specced | a butler persona preset, an evening wrap-up |
+| The door | **specced 2026-11-23 (household spec)** | doorbell: who is there, announced, one tap to answer; deliveries |
+| Away and travel | **specced 2026-11-23 (household spec)** | away mode (lived-in lights, stricter watch, daily summary); itinerary, flight status, check-in, packing list |
+| Errands | **specced 2026-11-23 (household spec)** | shopping list and pantry, reorders within caps, delivery tracking; pay-per-call services (pay.sh, x402) |
+| Habits | **specced 2026-11-23 (household spec)** | suggesting a routine from a seen pattern (never turned on unasked) |
+| House upkeep | **specced 2026-11-23 (household spec)** | service dates (boiler, filters, car), manuals and warranties remembered |
+| Health | **specced 2026-11-23 (household spec)** | medication reminders, sleep nudges, wearable data (optional) |
+| Manner | **specced 2026-11-23 (household spec)** | a butler persona preset, an evening wrap-up |
 | The car | partly | warming it (Tesla Fleet API or BMW CarData; Smartcar has no climate); an in-car box (research only) |
 | Phone calls | not specced | calling on the owner's behalf |
 
