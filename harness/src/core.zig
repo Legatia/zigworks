@@ -20917,7 +20917,7 @@ test "a_leave_by_line_comes_at_its_minute" {
     try t.expectEqual(1, f.rec.count("Time to leave"));
 }
 
-test "a_longer_way_and_the_maps_server_move_the_line" {
+test "a_longer_way_moves_the_line" {
     var f: Fix = undefined;
     try f.init("[butler]\ntravel = 45m\n", "", "");
     defer f.deinit();
@@ -20931,6 +20931,26 @@ test "a_longer_way_and_the_maps_server_move_the_line" {
     f.core.fixed_now = t0 - 45 * 60;
     f.core.diaryPost(f.core.now());
     try f.rec.waitFor("(about 45 min away).");
+}
+
+test "the_maps_servers_travel_time_sets_the_minute" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nmaps = calendar/travel_time\n", "", "");
+    defer f.deinit();
+    const dir = try withCalendar(&f);
+    const t0 = diaryAt();
+    try writeUpcoming(&f, dir, &.{dentistAt(t0)});
+    // asked at the read, for the place and the time to be there
+    f.core.fixed_now = t0 - 2 * 3600;
+    try f.core.diaryReadNow();
+    try expectHas(try logText(&f), "\"event\":\"diary way\",\"tool\":\"calendar/travel_time\",\"id\":\"personal/dentist-1@calmcp-sim\",\"minutes\":34");
+    try expectHas(fileText(&f, try std.fs.path.join(f.e.arena.allocator(), &.{ dir, "travel.jsonl" })), "\"destination\":\"Dental clinic, ul. Długa 5, Kraków\"");
+    f.core.fixed_now = t0 - 35 * 60;
+    f.core.diaryPost(f.core.now());
+    try t.expectEqual(0, f.rec.count("Time to leave"));
+    f.core.fixed_now = t0 - 34 * 60;
+    f.core.diaryPost(f.core.now());
+    try f.rec.waitFor("Time to leave for Dentist at 10:30: Dental clinic, ul. Długa 5, Kraków (about 34 min away, by the maps).");
 }
 
 test "meeting_preparation_says_who_where_and_what_was_said" {
