@@ -7047,6 +7047,14 @@ fn nextAt(now_s: i64, minutes: u16, utc_offset: i32) i64 {
     return due;
 }
 
+/// Whether a step's call was refused before it ran (the gate, a tool not
+/// offered, its input): another try would not help.
+fn gateRefused(text: []const u8) bool {
+    for ([_][]const u8{ "refused by the gate: ", "no such tool", "this tool is not available here", "the tool's input is missing its main field" }) |p|
+        if (std.mem.startsWith(u8, text, p)) return true;
+    return false;
+}
+
 /// What a step's action came to.
 const StepEnd = union(enum) {
     /// Done, with its value (null: none, as a wait's or a say's).
@@ -7253,8 +7261,8 @@ const InstRun = struct {
     /// A step failed after its tries, with no `on fail`: the instance
     /// fails; a `failed` item, the message to `to` (R20), offers to run the
     /// step again or stop, for 7 days.
-    fn failWithItem(r: *InstRun, s: workflows.Step, why: []const u8) !void {
-        const tries = if (s.retry > 0) try std.fmt.allocPrint(r.a, " after {d} tries", .{s.retry + 1}) else "";
+    fn failWithItem(r: *InstRun, s: workflows.Step, why: []const u8, tries_made: u32) !void {
+        const tries = if (tries_made > 1) try std.fmt.allocPrint(r.a, " after {d} tries", .{tries_made}) else "";
         const body = try std.fmt.allocPrint(r.a, "{s}Step {s} failed{s}: {s}\nRun again runs the step again; Stop ends the instance.", .{ r.tag(), s.name, tries, util.cut(why, 2000) });
         r.st.status = .failed;
         r.st.ended = r.c.now();
@@ -7459,7 +7467,7 @@ const InstRun = struct {
                     try r.save();
                     return true;
                 }
-                try r.failWithItem(s, f.why);
+                try r.failWithItem(s, f.why, try_n);
                 return false;
             },
             .denied => |why| {
@@ -7772,12 +7780,34 @@ const InstRun = struct {
         };
     }
 
-    /// A tool step: one call with its input, through the gate.
+    /// A tool step: one call of its tool with its input (filled), through
+    /// the gate as `workflow:NAME/STEP`: allowed it runs, a deny fails it
+    /// with no retry, an ask waits in the inbox (R2). Its output is its
+    /// value: JSON when it reads as JSON (masked before it is kept).
     fn toolStep(r: *InstRun, s: workflows.Step, answered: ?Answered) !StepEnd {
-        _ = s;
-        _ = answered;
-        _ = r;
-        return .{ .failed = .{ .why = "tool steps are not built yet", .retry = false } };
+        const tl = s.action.tool;
+        // the name a run's calls give it: a built-in's, or an MCP tool's
+        // SERVER__TOOL while its server runs
+        var name: []const u8 = tl.name;
+        if (std.mem.indexOfScalar(u8, tl.name, '/')) |slash| {
+            const server = tl.name[0..slash];
+            const tool = tl.name[slash + 1 ..];
+            name = for (r.c.mcp_tools) |m| {
+                if (std.mem.eql(u8, m.server.name, server) and std.mem.eql(u8, m.tool, tool)) break m.def.name;
+            } else return .{ .failed = .{ .why = try std.fmt.allocPrint(r.a, "{s} is not running, or has no tool {s}", .{ server, tool }) } };
+        }
+        // never called: a run needs a client
+        var client = try r.c.modelClient(r.c.cfg.model.model, r.c.cfg.model.max_tokens);
+        defer client.deinit();
+        var ask = r.asker(s, answered);
+        var run = r.stepRun(&client, s, &ask);
+        try run.logRun(.workflow, false, .{ .instance = r.id, .event = "step", .step = s.name, .@"try" = r.st.try_n });
+        r.rid = run.rid;
+        const out = try agent.stepCall(&run, r.a, name, r.st.call);
+        if (ask.deferred) return r.deferred(&ask);
+        if (r.flag.load(.acquire)) return .stopped;
+        if (out.is_error) return .{ .failed = .{ .why = out.text, .retry = !gateRefused(out.text) } };
+        return .{ .ok = jv.parse(r.a, out.text) orelse jv.Value{ .string = out.text } };
     }
 
     /// An agent step's gate: its definition, a place, today's count.
@@ -13503,4 +13533,150 @@ test "workflow_commands_list_show_start_stop_resume_rm" {
     f.core.fixed_now = t0 + 3601;
     runWorkflows(&f);
     try t.expectEqual(0, f.rec.count("rested"));
+}
+
+
+fn writeRules(f: *Fix, text: []const u8) !void {
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = text, .flags = .{ .permissions = util.private_file } });
+}
+
+test "a_tool_step_the_gate_asks_waits_in_the_inbox" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    _ = try withFake(&f, false);
+    try setWorkflow(&f, "w", "workflow w\nstep call\ntool fake/echo {\"text\": \"hi {input}\"}\nretry 2 wait 1m\nstep tell\nsay echo said {call}\n");
+    _ = try f.core.command(a, "/workflow start w there");
+    runWorkflows(&f);
+    // asked in the inbox: the instance waits on the item, no job runs
+    try f.rec.waitFor("BUTTONS Allow this? [1]\n[w#1 call] fake__echo: fake/echo {\"text\":\"hi there\"}");
+    try waitInbox(&f, "\"waiter\":\"workflow w#1/call\"");
+    const st = try instState(&f, "w#1");
+    try t.expectEqual(wstate.Status.waiting, st.status);
+    try t.expectEqual(@as(u64, 1), st.wait.item);
+    try t.expectEqualStrings("approval", st.wait.phase);
+    try t.expect(!wfPending(f.core));
+    try expectHas(try logText(&f), "\"run\":\"workflow w#1/call\",\"agent\":\"\",\"tool\":\"fake__echo\",\"decision\":\"ask\",\"why\":\"waits for the owner in the inbox (item 1)\"");
+    // Allow 24 h: it runs, and the grant covers this workflow's steps alone
+    try f.press("day");
+    runWorkflows(&f);
+    try f.rec.waitFor("[w#1] echo said hi there");
+    try expectHas(try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.grants, a, .unlimited), "\tfake/echo\tworkflow:w\n");
+    _ = try f.core.command(a, "/workflow start w again");
+    runWorkflows(&f);
+    try f.rec.waitFor("[w#2] echo said hi again");
+    try t.expectEqual(1, f.rec.count("BUTTONS Allow this? ["));
+    // a deny rule fails the step at once: no retry, a failed item
+    try writeRules(&f, "deny mcp fake/echo *\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    _ = try f.core.command(a, "/workflow start w more");
+    runWorkflows(&f);
+    try f.rec.waitFor("BUTTONS Failed [");
+    try f.rec.waitFor("[w#3] Step call failed: refused by the gate: rule on line 1");
+    const st3 = try instState(&f, "w#3");
+    try t.expectEqual(wstate.Status.failed, st3.status);
+    try t.expectEqual(1, st3.steps);
+    try t.expect(st3.wait.item != 0);
+}
+
+test "money_is_asked_every_time_and_counted_when_allowed" {
+    var f: Fix = undefined;
+    try f.init("[money]\nmax_per_call = 10\nscheduled = on\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    _ = try withFake(&f, true);
+    try setWorkflow(&f, "buy", "workflow buy\nstep order\ntool fake/echo {\"text\": \"order {input}\", \"amount\": \"{input}\"}\nstep tell\nsay {order}\n");
+    _ = try f.core.command(a, "/workflow start buy 5");
+    runWorkflows(&f);
+    // asked, never for 24 h, whatever [money] scheduled says; nothing counted while asked
+    try f.rec.waitFor("BUTTONS Allow this? [1]\n[buy#1 order] fake__echo: fake/echo {\"text\":\"order 5\",\"amount\":\"5\"}\nDry run is off: this call is made.");
+    try t.expect(f.rec.buttonsWith("Allow this? [1]").?.get("day") == null);
+    const money = struct {
+        fn total(fx: *Fix) ![]const u8 {
+            return Io.Dir.cwd().readFileAlloc(t.io, fx.core.paths.money, fx.e.arena.allocator(), .unlimited) catch "";
+        }
+    };
+    try t.expect(std.mem.indexOf(u8, try money.total(&f), " 5\n") == null);
+    try f.press("once");
+    runWorkflows(&f);
+    try f.rec.waitFor("[buy#1] order 5");
+    try expectHas(try money.total(&f), " 5\n");
+    // asked again for the next one
+    _ = try f.core.command(a, "/workflow start buy 4");
+    runWorkflows(&f);
+    try t.expectEqual(2, f.rec.count("BUTTONS Allow this? ["));
+    try f.press("once");
+    runWorkflows(&f);
+    try f.rec.waitFor("[buy#2] order 4");
+    try expectHas(try money.total(&f), " 9\n");
+    // over the cap: refused before anyone is asked; the step fails
+    _ = try f.core.command(a, "/workflow start buy 50");
+    runWorkflows(&f);
+    try f.rec.waitFor("[buy#3] Step order failed: refused by the gate: 50 is over the cap of 10 per call");
+    try t.expectEqual(2, f.rec.count("BUTTONS Allow this? ["));
+    try expectHas(try money.total(&f), " 9\n");
+}
+
+test "retry_waits_double_and_survive_a_restart" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try writeRules(&f, "allow shell exit 3\n");
+    try setWorkflow(&f, "flaky", "workflow flaky\nstep call\ntool shell {\"command\": \"exit 3\"}\nretry 2 wait 1m\n");
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    _ = try f.core.command(a, "/workflow start flaky");
+    runWorkflows(&f);
+    var st = try instState(&f, "flaky#1");
+    try t.expectEqual(wstate.Status.waiting, st.status);
+    try t.expectEqual(wstate.WaitKind.retry, st.wait.kind);
+    try t.expectEqual(t0 + 60, st.wait.until);
+    try t.expectEqual(2, st.try_n);
+    // the wait survives a restart
+    try restart(&f);
+    try f.core.setOwner(42);
+    f.core.fixed_now = t0 + 30;
+    runWorkflows(&f);
+    st = try instState(&f, "flaky#1");
+    try t.expectEqual(2, st.try_n);
+    try t.expectEqual(1, st.steps);
+    // past it: the second try, then a wait twice as long
+    f.core.fixed_now = t0 + 61;
+    runWorkflows(&f);
+    st = try instState(&f, "flaky#1");
+    try t.expectEqual(t0 + 61 + 120, st.wait.until);
+    try t.expectEqual(3, st.try_n);
+    // the third fails too: a failed item, Run again or Stop
+    f.core.fixed_now = t0 + 61 + 121;
+    runWorkflows(&f);
+    try f.rec.waitFor("[flaky#1] Step call failed after 3 tries: exit code 3");
+    st = try instState(&f, "flaky#1");
+    try t.expectEqual(wstate.Status.failed, st.status);
+    try t.expectEqual(3, st.steps);
+    try f.press("rerun");
+    runWorkflows(&f);
+    st = try instState(&f, "flaky#1");
+    try t.expectEqual(wstate.Status.waiting, st.status);
+    try t.expectEqual(4, st.steps);
+    try t.expectEqual(2, st.try_n);
+    // Stop ends it
+    _ = try f.core.command(a, "/workflow stop flaky#1");
+    try t.expectEqual(wstate.Status.stopped, (try instState(&f, "flaky#1")).status);
+}
+
+test "a_shell_step_after_files_were_written_is_asked_naming_them" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try writeRules(&f, "allow shell echo *\n");
+    try setWorkflow(&f, "build", "workflow build\nstep write\ntool write_file {\"path\": \"Makefile\", \"content\": \"all:\"}\nstep run\ntool shell {\"command\": \"echo built\"}\nstep tell\nsay {run}\n");
+    _ = try f.core.command(a, "/workflow start build");
+    runWorkflows(&f);
+    try f.rec.waitFor("[build#1 run] shell: echo built\nFiles the agent wrote in the workspace since you last allowed a command: Makefile (workflow:build/write, workflow build#1/write)");
+    try f.press("once");
+    runWorkflows(&f);
+    try f.rec.waitFor("[build#1] exit code 0\nbuilt");
 }

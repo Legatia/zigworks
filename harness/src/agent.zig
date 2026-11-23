@@ -1970,6 +1970,16 @@ pub fn postReply(r: *Run, a: std.mem.Allocator, text: []const u8) !Posted {
     return postThrough(r, a, &post, target, null);
 }
 
+/// A workflow's tool step: one call of `name` (a built-in tool, or an MCP
+/// tool by the name the model sees) with `input_json`, through the gate as
+/// this run's own call, as a turn's call is made: masks, roles, money caps,
+/// written files, the tool's own limits; it gets `turn_seconds`. Its
+/// questions go to the run's asker (a workflow's waits in the inbox).
+pub fn stepCall(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const u8) !tools.Output {
+    r.deadline_s = @divFloor(util.nowMs(r.io) + @as(i64, r.limits.turn_seconds) * 1000 + 999, 1000);
+    return callTool(r, a, name, input_json);
+}
+
 /// A workflow's `say`: `text` posted to the run's conversation through the
 /// gate as a `send` (not the reply, not implicit).
 pub fn postText(r: *Run, a: std.mem.Allocator, text: []const u8) !Posted {
