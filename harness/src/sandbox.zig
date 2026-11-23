@@ -223,16 +223,24 @@ pub fn bwrapArgv(io: Io, arena: std.mem.Allocator, req: Request, bwrap: []const 
         } else |_| {}
     }
     try a.appendSlice(arena, &.{ "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp" });
+    // `read =` folders first: the workspace and the data folder's cover go
+    // over them (a later mount covers an earlier one)
+    const data = dataFolder(req.dir);
+    var covers_data = false;
+    for (req.env.read) |r| {
+        const p = try expandHome(arena, r, req.owner_home);
+        try a.appendSlice(arena, &.{ "--ro-bind-try", p, p });
+        if (data.len > 0 and within(realOr(io, arena, p), realOr(io, arena, data))) covers_data = true;
+    }
+    // never the data folder, inside a `read =` folder too: an empty folder
+    // in its place
+    if (covers_data) try a.appendSlice(arena, &.{ "--tmpfs", data });
     switch (req.env.workspace) {
         .rw => try a.appendSlice(arena, &.{ "--bind", req.workspace, req.workspace }),
         .ro => try a.appendSlice(arena, &.{ "--ro-bind", req.workspace, req.workspace }),
         .none => {},
     }
     try a.appendSlice(arena, &.{ "--bind", home, linux_home });
-    for (req.env.read) |r| {
-        const p = try expandHome(arena, r, req.owner_home);
-        try a.appendSlice(arena, &.{ "--ro-bind-try", p, p });
-    }
     const cwd = if (req.env.workspace == .none) linux_home else if (req.cwd.len > 0) req.cwd else req.workspace;
     try a.appendSlice(arena, &.{ "--chdir", cwd, "--", "/bin/sh", "-c", req.command });
     return a.items;
@@ -405,6 +413,16 @@ fn realOr(io: Io, arena: std.mem.Allocator, path: []const u8) []const u8 {
     return Io.Dir.cwd().realPathFileAlloc(io, path, arena) catch path;
 }
 
+/// Whether `child` is `parent` or inside it (both real paths); letters'
+/// case aside on Windows.
+fn within(parent: []const u8, child: []const u8) bool {
+    const p = std.mem.trimEnd(u8, parent, "/\\");
+    if (child.len < p.len) return false;
+    const head = child[0..p.len];
+    if (!(if (is_windows) std.ascii.eqlIgnoreCase(head, p) else std.mem.eql(u8, head, p))) return false;
+    return child.len == p.len or child[p.len] == '/' or child[p.len] == '\\';
+}
+
 /// The data folder, from the environment's folder (DATA/state/env/NAME);
 /// "" when it is not laid out so.
 fn dataFolder(env_dir: []const u8) []const u8 {
@@ -413,7 +431,7 @@ fn dataFolder(env_dir: []const u8) []const u8 {
     const state = std.fs.path.dirname(envs) orelse return "";
     if (!std.mem.eql(u8, std.fs.path.basename(state), "state")) return "";
     const data = std.fs.path.dirname(state) orelse return "";
-    return if (std.mem.eql(u8, data, "/")) "" else data;
+    return if (std.fs.path.dirname(data) == null) "" else data;
 }
 
 /// The developer folder xcode-select names (git, make, cc and python3 in
@@ -492,6 +510,9 @@ fn spawnSandboxExec(io: Io, arena: std.mem.Allocator, req: Request, home: []cons
 const read_access: u32 = 0x1200A9; // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
 const modify_access: u32 = 0x1301BF; // and FILE_GENERIC_WRITE and DELETE
 
+/// A grant's access that means: refused, whatever a folder above gives.
+const deny_all: u32 = 0;
+
 const Grant = struct { path: []const u8, access: u32 };
 
 /// The folders the sandbox may use, with what it may do there.
@@ -503,7 +524,17 @@ fn wantedGrants(arena: std.mem.Allocator, req: Request, home: []const u8) ![]con
         .none => {},
     }
     try out.append(arena, .{ .path = home, .access = modify_access });
-    for (req.env.read) |r| try out.append(arena, .{ .path = try expandHome(arena, r, req.owner_home), .access = read_access });
+    const data = dataFolder(req.dir);
+    var covers_data = false;
+    for (req.env.read) |r| {
+        const p = try expandHome(arena, r, req.owner_home);
+        try out.append(arena, .{ .path = p, .access = read_access });
+        if (data.len > 0 and within(p, data)) covers_data = true;
+    }
+    // never the data folder, inside a `read =` folder too: cut off there
+    // (access 0), but for the workspace and its home, which have entries
+    // of their own
+    if (covers_data) try out.append(arena, .{ .path = data, .access = deny_all });
     return out.items;
 }
 
@@ -567,6 +598,7 @@ fn applyGrants(io: Io, arena: std.mem.Allocator, req: Request, home: []const u8,
 /// by all below it; Windows walks the folder's tree for it.
 fn setAce(arena: std.mem.Allocator, path: []const u8, sid: win.PSID, access: u32, mode: c_int) !void {
     if (!is_windows) return;
+    if (mode == win.SET_ACCESS and access == deny_all) return cutOff(arena, path, sid);
     const p16 = try std.unicode.utf8ToUtf16LeAllocZ(arena, path);
     var old: ?*anyopaque = null;
     var sd: ?*anyopaque = null;
@@ -582,6 +614,39 @@ fn setAce(arena: std.mem.Allocator, path: []const u8, sid: win.PSID, access: u32
     if (win.SetEntriesInAclW(1, &ea, old, &new) != 0) return error.Unexpected;
     defer _ = win.LocalFree(new);
     if (win.SetNamedSecurityInfoW(p16, win.SE_FILE_OBJECT, win.DACL_SECURITY_INFORMATION, null, null, new, null) != 0) return error.AccessDenied;
+}
+
+/// Refuses `path` and all in it to the SID, whatever a folder above gives:
+/// Windows ignores a deny entry for an AppContainer, so the folder stops
+/// inheriting (its inherited entries become its own, as `icacls
+/// /inheritance:d` does) and the SID's entries are taken out. Folders in it
+/// with entries of their own for the SID (the workspace, its home) keep
+/// them. It stays so after `env rm`: who may use the folder is unchanged.
+fn cutOff(arena: std.mem.Allocator, path: []const u8, sid: win.PSID) !void {
+    if (!is_windows) return;
+    const p16 = try std.unicode.utf8ToUtf16LeAllocZ(arena, path);
+    var dacl: ?*anyopaque = null;
+    var sd: ?*anyopaque = null;
+    if (win.GetNamedSecurityInfoW(p16, win.SE_FILE_OBJECT, win.DACL_SECURITY_INFORMATION, null, null, &dacl, null, &sd) != 0) return error.AccessDenied;
+    defer _ = win.LocalFree(sd);
+    const acl = dacl orelse return;
+    // ACL: revision u8, pad u8, size u16, count u16, pad u16
+    const count: *align(1) u16 = @ptrCast(@as([*]u8, @ptrCast(acl)) + 4);
+    var i: u32 = 0;
+    while (i < count.*) {
+        var ace: ?*anyopaque = null;
+        if (!win.GetAce(acl, i, &ace).toBool()) return error.Unexpected;
+        // ACE: type u8, flags u8, size u16, mask u32, the SID (the kinds
+        // files carry: allowed 0, denied 1)
+        const b: [*]u8 = @ptrCast(ace.?);
+        if (b[0] <= 1 and win.EqualSid(@ptrCast(b + 8), sid).toBool()) {
+            if (!win.DeleteAce(acl, i).toBool()) return error.Unexpected;
+            continue;
+        }
+        b[1] &= ~@as(u8, win.INHERITED_ACE);
+        i += 1;
+    }
+    if (win.SetNamedSecurityInfoW(p16, win.SE_FILE_OBJECT, win.DACL_SECURITY_INFORMATION | win.PROTECTED_DACL_SECURITY_INFORMATION, null, null, acl, null) != 0) return error.AccessDenied;
 }
 
 /// The SID of AppContainer `profile`, made the first time; FreeSid it.
@@ -662,6 +727,8 @@ const win = struct {
 
     const SE_FILE_OBJECT: c_int = 1;
     const DACL_SECURITY_INFORMATION: u32 = 0x4;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x80000000;
+    const INHERITED_ACE: u8 = 0x10;
     const SET_ACCESS: c_int = 2;
     const REVOKE_ACCESS: c_int = 4;
     const OBJECT_INHERIT_ACE: u32 = 0x1;
@@ -700,6 +767,9 @@ const win = struct {
     extern "advapi32" fn GetNamedSecurityInfoW(name: [*:0]const u16, kind: c_int, info: u32, owner: ?*?PSID, group: ?*?PSID, dacl: *?*anyopaque, sacl: ?*?*anyopaque, sd: *?*anyopaque) callconv(.winapi) u32;
     extern "advapi32" fn SetEntriesInAclW(count: u32, entries: [*]EXPLICIT_ACCESS_W, old: ?*anyopaque, new: *?*anyopaque) callconv(.winapi) u32;
     extern "advapi32" fn SetNamedSecurityInfoW(name: [*:0]u16, kind: c_int, info: u32, owner: ?PSID, group: ?PSID, dacl: ?*anyopaque, sacl: ?*anyopaque) callconv(.winapi) u32;
+    extern "advapi32" fn GetAce(acl: *anyopaque, index: u32, ace: *?*anyopaque) callconv(.winapi) windows.BOOL;
+    extern "advapi32" fn DeleteAce(acl: *anyopaque, index: u32) callconv(.winapi) windows.BOOL;
+    extern "advapi32" fn EqualSid(a: PSID, b: PSID) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn LocalFree(mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 };
 
@@ -843,6 +913,32 @@ test "sandbox_cannot_read_data_folder_or_home" {
         try expectNot(o.text, "\"log\":1");
         try expectNot(o.text, "the owner's own");
     }
+}
+
+test "sandbox_cannot_read_the_data_folder_inside_a_read_folder" {
+    var f: Fix = undefined;
+    try f.init(.{ .name = "box", .line = 1, .kind = .sandbox });
+    defer f.deinit();
+    try need(&f);
+    const a = f.a;
+    // a `read =` folder that holds the data folder (as `read = ~` does)
+    f.env.read = &.{f.root};
+    const own = try f.run(try readCmd(a, try std.fs.path.join(a, &.{ f.owner, "private.txt" })));
+    try expectOk(own);
+    try expectHas(own.text, "the owner's own");
+    for ([_][]const []const u8{ &.{ f.data, "rules" }, &.{ f.data, "state", "grants" }, &.{ f.data, "log", "actions.jsonl" } }) |parts| {
+        const o = try f.run(try readCmd(a, try std.fs.path.join(a, parts)));
+        if (!o.is_error and is_windows) std.debug.print("XDEBUG {s}\n{s}\n{s}\n", .{ o.text, try icacls(a, f.data), try icacls(a, try std.fs.path.join(a, parts)) });
+        try t.expect(o.is_error);
+        try expectNot(o.text, "allow shell");
+        try expectNot(o.text, "secret-grant-line");
+        try expectNot(o.text, "\"log\":1");
+    }
+    // the workspace in it, and its home, as before
+    const ws = try f.run(try readCmd(a, try std.fs.path.join(a, &.{ f.ws, "a.txt" })));
+    try expectOk(ws);
+    try expectHas(ws.text, "in the workspace");
+    try expectOk(try f.run(if (is_windows) "echo kept> \"%USERPROFILE%\\k.txt\" && echo new> new.txt" else "echo kept > ~/k.txt && echo new > new.txt"));
 }
 
 test "sandbox_workspace_modes" {
