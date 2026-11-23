@@ -8,7 +8,7 @@ const scrub = @import("scrub.zig");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const Kind = enum { turn, model, tool, gate, memory, brief, task, chat, config, recovered, send, files, agent, inbox, trigger, app, workflow };
+pub const Kind = enum { turn, model, tool, gate, memory, brief, task, chat, config, recovered, send, files, agent, inbox, trigger, app, workflow, env };
 
 /// Longest string stored in a field.
 pub const max_field = 2048;

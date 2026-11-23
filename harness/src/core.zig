@@ -415,6 +415,11 @@ pub const Core = struct {
     /// One change of triggers.ini at a time (/trigger add|rm, the tool,
     /// a paused item's Remove): read, written, applied.
     trig_write_mutex: Io.Mutex = .init,
+    /// What an at-once change of environments.ini (`env_save`) reads into:
+    /// kept until the next reload, since runs going hold the list before it.
+    env_arena: std.heap.ArenaAllocator,
+    /// Held while environments.ini is rewritten and applied.
+    env_write_mutex: Io.Mutex = .init,
     /// Each event trigger's state as on disk, and what its queue holds.
     trig_info: std.ArrayList(*TrigInfo) = .empty,
     /// A poller is going (tick starts one; close waits for it).
@@ -631,6 +636,8 @@ pub const Core = struct {
         c.trig_briefs = &.{};
         c.trig_mutex = .init;
         c.trig_write_mutex = .init;
+        c.env_arena = .init(gpa);
+        c.env_write_mutex = .init;
         c.trig_info = .empty;
         c.polling = .init(false);
         c.poller_on = false;
@@ -809,6 +816,7 @@ pub const Core = struct {
         for (c.trig_info.items) |info| freeInfo(c.gpa, info);
         c.trig_info.deinit(c.gpa);
         c.trig_arena.deinit();
+        c.env_arena.deinit();
         for (c.wf_list.items) |info| info.destroy(c.gpa);
         c.wf_list.deinit(c.gpa);
         c.wf_arena.deinit();
@@ -1017,6 +1025,9 @@ pub const Core = struct {
         // what an at-once change of triggers.ini held is read again above
         c.trig_arena.deinit();
         c.trig_arena = .init(c.gpa);
+        // and of environments.ini (nothing runs now)
+        c.env_arena.deinit();
+        c.env_arena = .init(c.gpa);
         // and what an at-once change of workflows/ held
         c.wf_arena.deinit();
         c.wf_arena = .init(c.gpa);
@@ -2688,6 +2699,7 @@ pub const Core = struct {
             .snaps = &c.snaps,
             .defs = &c.defs,
             .registry = c.registry(),
+            .envs = .{ .list = c.env_list, .root = c.paths.env_dir, .data_home = c.paths.home, .owner_home = c.home_var },
         };
     }
 
@@ -3010,6 +3022,7 @@ pub const Core = struct {
         // from a conversation
         run.desk = c.desk();
         run.wdesk = c.wfDesk();
+        run.edesk = c.envDesk();
         var notify: Notify = .{ .core = c, .conv = conv };
         run.notice = .{ .ctx = &notify, .say = Notify.say };
         var here: [agents_name_max]u8 = undefined;
@@ -7204,9 +7217,93 @@ pub const Core = struct {
         try out.print(a, "Default: {s}.", .{c.env_list.default});
         for (c.env_list.pins, 0..) |p, i| try out.print(a, "{s}{s} runs in {s}", .{ if (i == 0) " Pinned: " else ", ", p.who, p.env });
         if (c.env_list.pins.len > 0) try out.append(a, '.');
-        // said until the gate picks environments (gap 2, after phase 0)
-        if (c.env_list.envs.len > 0) try out.appendSlice(a, "\nThe agent's commands still run on host: environments are checked and can be tried with /env check, but runs don't use them yet.");
         return out.items;
+    }
+
+    // ---- environments: the env_save tool's desk ----
+
+    fn envDesk(c: *Core) agent.EnvDesk {
+        return .{ .ctx = c, .check = envDeskCheck, .save = envDeskSave };
+    }
+
+    fn envDeskCheck(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, text: []const u8) agent.Checked {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.checkEnv(a, name, text) catch .{ .why = "out of memory" };
+    }
+
+    fn envDeskSave(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, section: []const u8, saved: agent.Saved) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.saveEnv(a, name, section, saved) catch |e| @errorName(e);
+    }
+
+    /// Reads a section the agent proposes for environment `name` (its
+    /// lines, without the header): harness's reading of it and of the one
+    /// it replaces, or why it can't be saved. Never `host`, `[default]` or
+    /// `[use]`; one section, of this name.
+    fn checkEnv(c: *Core, a: std.mem.Allocator, name: []const u8, text: []const u8) !agent.Checked {
+        if (!rules.envName(name)) return .{ .why = "an environment's name is a-z, 0-9, - and _, up to 32" };
+        for ([_][]const u8{ "host", "default", "use" }) |n| if (std.mem.eql(u8, name, n))
+            return .{ .why = try std.fmt.allocPrint(a, "{s} is not the agent's to save: host is built in, and the default and the pins are the owner's", .{n}) };
+        var body: std.ArrayList(u8) = .empty;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            if (line[0] == '[') return .{ .why = "give the section's lines alone, kind first: no [NAME] line, one environment" };
+            try body.print(a, "{s}\n", .{line});
+        }
+        const section = try std.fmt.allocPrint(a, "[{s}]\n{s}", .{ name, std.mem.trimEnd(u8, body.items, "\n") });
+        const one = environments_mod.parse(a, section) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return .{ .why = environments_mod.reason(e) orelse @errorName(e) },
+        };
+        if (one.envs.len != 1) return .{ .why = "the section has no kind" };
+        // the whole file with it must read too
+        const old_file = Io.Dir.cwd().readFileAlloc(c.io, c.paths.environments, a, .limited(1 << 20)) catch "";
+        const swapped = try environments_mod.swapSection(a, old_file, name, section);
+        _ = environments_mod.parse(a, swapped.text) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return .{ .why = try std.fmt.allocPrint(a, "environments.ini would not read with it: {s}", .{environments_mod.reason(e) orelse @errorName(e)}) },
+        };
+        var reading: std.ArrayList(u8) = .empty;
+        try reading.print(a, "{s}: {s}", .{ name, try environments_mod.describe(a, one.envs[0]) });
+        for (one.envs[0].read, 0..) |r, i| try reading.print(a, "{s}{s}", .{ if (i == 0) "; reads " else ", ", r });
+        if (swapped.old.len > 0) try reading.print(a, ". It replaces:\n{s}", .{swapped.old});
+        return .{ .name = name, .reading = reading.items, .section = section, .replaces = swapped.old.len > 0 };
+    }
+
+    /// Writes `section` into environments.ini (in its old place, or at the
+    /// end), under `saved.mark`, and applies it at once; logged `saved`.
+    /// Null when done; else why not, and the file is as it was.
+    fn saveEnv(c: *Core, a: std.mem.Allocator, name: []const u8, section: []const u8, saved: agent.Saved) !?[]const u8 {
+        c.env_write_mutex.lockUncancelable(c.io);
+        defer c.env_write_mutex.unlock(c.io);
+        const old = Io.Dir.cwd().readFileAlloc(c.io, c.paths.environments, a, .limited(1 << 20)) catch "";
+        const marked = if (saved.mark.len > 0) try std.fmt.allocPrint(a, "; {s}\n{s}", .{ saved.mark, section }) else section;
+        const new = (try environments_mod.swapSection(a, old, name, marked)).text;
+        const ea = c.env_arena.allocator();
+        const list = environments_mod.parse(ea, try ea.dupe(u8, new)) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return environments_mod.reason(e) orelse @errorName(e),
+        };
+        try util.writeReplace(c.io, c.paths.environments, new);
+        {
+            c.settings_mutex.lockUncancelable(c.io);
+            defer c.settings_mutex.unlock(c.io);
+            c.env_list = list;
+            // the watcher takes environments.ini as it is now
+            std.crypto.hash.sha2.Sha256.hash(new, &c.settings_hashes[8], .{});
+        }
+        const e = list.find(name).?;
+        try c.log.write(.env, false, .{
+            .event = "saved",
+            .name = name,
+            .settings = try environments_mod.describe(a, e.*),
+            .by = saved.by,
+            .agent = if (saved.agent.len > 0) @as(?[]const u8, saved.agent) else null,
+            .item = if (saved.item != 0) @as(?u64, saved.item) else null,
+        });
+        return null;
     }
 
     fn envCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
@@ -8312,6 +8409,8 @@ const InstRun = struct {
     /// `to`; the gate's questions go through `asker` to the inbox.
     fn stepRun(r: *InstRun, client: *model.Client, s: workflows.Step, ask: *WfAsker) agent.Run {
         var run = r.c.runIn(client, r.label(s.name), .{ .by = r.by(s.name), .agent = "" }, r.w.to, r.flag);
+        // where its commands run, unless a pin says
+        if (s.env.len > 0) run.step_env = s.env;
         // a tool step is not a run nobody watches: it can wait
         run.scheduled = false;
         run.asker = .{ .ctx = ask, .ask = WfAsker.ask };
@@ -8410,6 +8509,7 @@ const InstRun = struct {
         defer r.c.unregister(r.flag);
         var run = r.c.runIn(&client, r.label(s.name), .{ .by = r.by(s.name), .agent = def.name }, r.w.to, r.flag);
         run.useDefinition(def);
+        if (s.env.len > 0) run.step_env = s.env;
         run.holds_place = true;
         run.narrow = s.tools;
         run.extra_instructions = try std.fmt.allocPrint(r.a, "This is step {s} of workflow {s} (instance {s}). Your answer is the step's result, for the workflow's next steps; it is not posted to the owner.{s}", .{ s.name, r.w.name, r.id, if (s.answer_json) " Answer only with JSON, nothing else." else "" });
@@ -14683,7 +14783,8 @@ test "another_step_cut_by_a_restart_asks_in_the_inbox" {
     try f.press("skip");
     runWorkflows(&f);
     try f.rec.waitFor("[ship#2] Step push failed: skipped by the owner after it was cut off");
-    try t.expectEqual(1, f.rec.count("pushed\n"));
+    // (cmd ends its lines with \r\n)
+    try t.expectEqual(1, f.rec.count(if (builtin.os.tag == .windows) "pushed\r\n" else "pushed\n"));
 }
 
 test "stop_pauses_a_step_under_way_until_it_is_answered" {
@@ -15084,4 +15185,73 @@ test "a_start_in_line_is_masked_and_checked_again" {
     runWorkflows(&f);
     try t.expectEqual(1, (try d.numbers(a)).len);
     try expectHas(try logText(&f), "\"name\":\"one\",\"event\":\"dropped\",\"by\":\"agent:main\"");
+}
+
+test "env_save_writes_the_section_and_applies_it_at_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "; mine\n[box]\nkind = sandbox\nworkspace = ro\n[use]\nschedule = box\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    // never host, the default, the pins or another section's lines
+    try t.expect(std.mem.indexOf(u8, (try f.core.checkEnv(a, "host", "kind = sandbox")).why.?, "host is not the agent's to save") != null);
+    try t.expect((try f.core.checkEnv(a, "default", "env = box")).why != null);
+    try t.expect((try f.core.checkEnv(a, "use", "owner = box")).why != null);
+    try t.expect((try f.core.checkEnv(a, "Box", "kind = sandbox")).why != null);
+    try t.expect((try f.core.checkEnv(a, "new", "kind = host")).why != null);
+    try t.expect((try f.core.checkEnv(a, "new", "kind = sandbox\n[use]\nowner = new")).why != null);
+    try t.expectEqualStrings("network = off or on", (try f.core.checkEnv(a, "new", "kind = sandbox\nnetwork = maybe")).why.?);
+    // a change is read against the one it replaces
+    const ch = try f.core.checkEnv(a, "box", "kind = sandbox\nnetwork = on\n");
+    try t.expectEqual(null, ch.why);
+    try t.expect(ch.replaces);
+    try t.expectEqualStrings("box: sandbox; workspace rw, network. It replaces:\n[box]\nkind = sandbox\nworkspace = ro", ch.reading);
+    try t.expectEqualStrings("[box]\nkind = sandbox\nnetwork = on", ch.section);
+    try t.expectEqual(null, try f.core.saveEnv(a, "box", ch.section, .{ .mark = "saved by agent:main 2026-11-23 (item 7)", .by = "owner", .agent = "main", .item = 7 }));
+    try t.expectEqualStrings("; mine\n\n; saved by agent:main 2026-11-23 (item 7)\n[box]\nkind = sandbox\nnetwork = on\n\n[use]\nschedule = box\n", try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.environments, a, .unlimited));
+    // at once, without /reload, and the watcher doesn't take it for a change
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/envs"), "box: sandbox, workspace rw, network on") != null);
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/envs"), "network on") != null);
+    // a new one goes at the end
+    const nw = try f.core.checkEnv(a, "far", "kind = remote\nhost = agent@192.0.2.1");
+    try t.expect(!nw.replaces);
+    try t.expectEqual(null, try f.core.saveEnv(a, "far", nw.section, .{ .mark = "", .by = "owner", .agent = "main", .item = 0 }));
+    try t.expect(std.mem.endsWith(u8, try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.environments, a, .unlimited), "schedule = box\n\n[far]\nkind = remote\nhost = agent@192.0.2.1\n"));
+    const lt = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, lt, "\"kind\":\"env\",\"event\":\"saved\",\"name\":\"box\",\"settings\":\"sandbox; workspace rw, network\",\"by\":\"owner\",\"agent\":\"main\",\"item\":7") != null);
+}
+
+test "a_workflow_steps_env_line_runs_its_command_there" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    if (try sandbox.unavailable(t.io, a)) |_| return error.SkipZigTest;
+    defer sandbox.remove(t.io, a, std.fs.path.join(a, &.{ f.core.paths.env_dir, "box" }) catch "", sandbox.profileName(a, f.core.paths.home, "box") catch "") catch {};
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[box]\nkind = sandbox\n" });
+    if (builtin.os.tag == .windows) {
+        // what a Windows sandbox needs to start cmd and find its home
+        const sys = try @import("proc.zig").systemDir(a);
+        f.core.path_var = try std.fmt.allocPrint(a, "{s};{s}", .{ sys, std.fs.path.dirname(sys).? });
+        f.core.system_vars = try @import("cdp.zig").testSystemVars(a);
+    }
+    // the rule is for box alone: on the host the step would wait in the inbox
+    try writeRules(&f, "allow shell@box *\n");
+    const mark = if (builtin.os.tag == .windows) "echo in-the-box> \\\"%USERPROFILE%/mark.txt\\\"" else "echo in-the-box > ~/mark.txt";
+    try setWorkflow(&f, "boxed", try std.fmt.allocPrint(a, "workflow boxed\nstep mark\ntool shell {{\"command\": \"{s}\"}}\nenv box\nstep tell\nsay marked {{mark.ok}}\n", .{mark}));
+    _ = try f.core.command(a, "/workflow start boxed");
+    runWorkflows(&f);
+    try f.rec.waitFor("[boxed#1] marked true");
+    // in its home, not the owner's
+    _ = try Io.Dir.cwd().statFile(t.io, try std.fs.path.join(a, &.{ f.core.paths.env_dir, "box", "home", "mark.txt" }), .{});
+    // an environment that isn't there fails the step: never the host instead
+    try setWorkflow(&f, "lost", "workflow lost\nstep s\ntool shell {\"command\": \"echo on-the-host\"}\nenv nobox\n");
+    _ = try f.core.command(a, "/workflow start lost");
+    runWorkflows(&f);
+    try f.rec.waitFor("there is no environment nobox (environments.ini)");
+    try t.expectEqual(0, f.rec.count("on-the-host\n"));
 }

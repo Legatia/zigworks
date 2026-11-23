@@ -101,6 +101,86 @@ pub const Environments = struct {
     }
 };
 
+/// environments.ini's `text` with section `[name]` replaced by `section`
+/// (a header and its lines, a comment line above them or not), or with it
+/// added at the end; and the lines it replaced ("" when new). A comment
+/// line right above the old header (who saved it) goes with it.
+pub fn swapSection(arena: std.mem.Allocator, text: []const u8, name: []const u8, section: []const u8) !struct { text: []const u8, old: []const u8 } {
+    var before: std.ArrayList(u8) = .empty;
+    var old: std.ArrayList(u8) = .empty;
+    var after: std.ArrayList(u8) = .empty;
+    var state: enum { before, in, after } = .before;
+    var held: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        const tl = std.mem.trim(u8, line, " \t");
+        const header: ?[]const u8 = if (tl.len > 2 and tl[0] == '[' and tl[tl.len - 1] == ']') std.mem.trim(u8, tl[1 .. tl.len - 1], " \t") else null;
+        switch (state) {
+            .before => {
+                if (header) |h| if (std.mem.eql(u8, h, name)) {
+                    // the mark above it goes; any other held line stays
+                    if (held) |x| if (!std.mem.startsWith(u8, std.mem.trim(u8, x, " \t"), "; saved by ")) try before.print(arena, "{s}\n", .{x});
+                    held = null;
+                    try old.print(arena, "{s}\n", .{tl});
+                    state = .in;
+                    continue;
+                };
+                if (held) |x| try before.print(arena, "{s}\n", .{x});
+                held = line;
+            },
+            .in => {
+                if (header != null) {
+                    state = .after;
+                    try after.print(arena, "{s}\n", .{line});
+                } else if (tl.len > 0) try old.print(arena, "{s}\n", .{tl});
+            },
+            .after => try after.print(arena, "{s}\n", .{line}),
+        }
+    }
+    if (held) |x| try before.print(arena, "{s}\n", .{x});
+    var out: std.ArrayList(u8) = .empty;
+    const head = std.mem.trimEnd(u8, before.items, " \t\r\n");
+    try out.appendSlice(arena, head);
+    if (head.len > 0) try out.appendSlice(arena, "\n\n");
+    try out.print(arena, "{s}\n", .{std.mem.trim(u8, section, " \t\r\n")});
+    const tail = std.mem.trim(u8, after.items, " \t\r\n");
+    if (tail.len > 0) try out.print(arena, "\n{s}\n", .{tail});
+    return .{ .text = out.items, .old = std.mem.trimEnd(u8, old.items, "\n") };
+}
+
+test "a_section_is_swapped_in_place_or_added_at_the_end" {
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const file = "; mine\n[default]\nenv = host\n\n; saved by agent:main 2026-11-23\n[box]\nkind = sandbox\nnetwork = on\n\n[use]\nschedule = box\n";
+    const sw = try swapSection(a, file, "box", "; saved by agent:main 2026-11-24\n[box]\nkind = sandbox");
+    try t.expectEqualStrings("; mine\n[default]\nenv = host\n\n; saved by agent:main 2026-11-24\n[box]\nkind = sandbox\n\n[use]\nschedule = box\n", sw.text);
+    try t.expectEqualStrings("[box]\nkind = sandbox\nnetwork = on", sw.old);
+    _ = try parse(a, sw.text);
+    const added = try swapSection(a, file, "far", "[far]\nkind = remote\nhost = a@b");
+    try t.expect(std.mem.endsWith(u8, added.text, "schedule = box\n\n[far]\nkind = remote\nhost = a@b\n"));
+    try t.expectEqualStrings("", added.old);
+    const first = try swapSection(a, "", "box", "[box]\nkind = sandbox");
+    try t.expectEqualStrings("[box]\nkind = sandbox\n", first.text);
+}
+
+/// What an environment is, as a question and the shell tool say it:
+/// "sandbox; workspace rw, no network", "remote agent@10.0.0.5".
+pub fn describe(arena: std.mem.Allocator, e: Env) ![]const u8 {
+    return switch (e.kind) {
+        .sandbox => std.fmt.allocPrint(arena, "sandbox; {s}, {s}", .{
+            switch (e.workspace) {
+                .rw => "workspace rw",
+                .ro => "workspace ro",
+                .none => "no workspace",
+            },
+            if (e.network) "network" else "no network",
+        }),
+        .remote => std.fmt.allocPrint(arena, "remote {s}", .{e.host}),
+    };
+}
+
 pub const default_parallel = 2;
 pub const max_parallel = 16;
 pub const max_name = 32;
