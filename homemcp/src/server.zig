@@ -351,9 +351,9 @@ pub const Server = struct {
             try chosen.append(a, di);
         } else if (jv.str(jv.get(args, "room"))) |room_in| {
             const room = std.mem.trim(u8, room_in, " \t");
-            for (all) |i| if (std.ascii.eqlIgnoreCase(s.cfg.devices[i].room, room)) try chosen.append(a, i);
+            for (all) |i| if (sameRoom(s.cfg.devices[i].room, room)) try chosen.append(a, i);
             if (chosen.items.len == 0) {
-                lead = try std.fmt.allocPrint(a, "no speaker in {s}, so every one: ", .{model.word(room)});
+                lead = try std.fmt.allocPrint(a, "no speaker in {s}, so every one: ", .{roomWord(room)});
                 try chosen.appendSlice(a, all);
             }
         } else try chosen.appendSlice(a, all);
@@ -362,9 +362,7 @@ pub const Server = struct {
             "say what to announce: message"
         else if (message.len > max_message)
             try std.fmt.allocPrint(a, "a message is at most {d} bytes: say it shorter", .{max_message})
-        else if (!std.unicode.utf8ValidateSlice(message) or for (message) |ch| {
-            if (ch < 0x20 or ch == 0x7f) break true;
-        } else false)
+        else if (!plainLine(message))
             "text only: one line, no control characters"
         else if (std.mem.indexOfAny(u8, message, "<>") != null)
             "text only: no < or > (no markup, no sound files)"
@@ -399,8 +397,13 @@ pub const Server = struct {
             said += 1;
             const where = try s.speakerName(a, i);
             // Home Assistant answers a satellite's announcement once it was
-            // played; a media player shows it playing
-            if (d.kind == .media) {
+            // played; a media player shows it playing, unless it already was
+            const was_playing = if (states) |st| eql(st[i].props.media orelse "", "playing") else false;
+            if (d.kind == .media and was_playing) {
+                const line = try std.fmt.allocPrint(a, "sent to {s}, but it was playing already: whether it was said can't be read back", .{where});
+                try parts.appendSlice(a, line);
+                s.writeLog(a, "announce", d, "announce", null, message, "unconfirmed", line) catch {};
+            } else if (d.kind == .media) {
                 var waited: u32 = 0;
                 var last: []const u8 = "unknown";
                 const took = while (waited <= confirm_ms) : (waited += 250) {
@@ -423,8 +426,10 @@ pub const Server = struct {
         return s.text(a, id, try std.fmt.allocPrint(a, "{s}{s}", .{ lead, parts.items }), false);
     }
 
+    /// announce's clock: the machine's own, which a time setting never
+    /// moves (a speaker's limits count from it).
     fn nowMs(s: *const Server) i64 {
-        return s.clock_ms orelse @intCast(@divFloor(Io.Clock.real.now(s.io).nanoseconds, std.time.ns_per_ms));
+        return s.clock_ms orelse @intCast(Io.Clock.awake.now(s.io).toMilliseconds());
     }
 
     /// Why speaker `i` says nothing now: its last message too recent, or
@@ -582,6 +587,59 @@ fn toolsJson(gpa: Allocator, cfg: *const config.Config) ![]u8 {
     try o.print(a, ",{{\"name\":\"home_wait\",\"description\":\"Wait until a device's property changes or meets a condition (such as open == yes, temperature > 21, lock == unlocked), for at most timeout_s seconds (default 60, at most {d}). Only reads.\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"device\":{{\"type\":\"string\",\"enum\":[{s}]}},\"property\":{{\"type\":\"string\",\"enum\":[{s}]}},\"condition\":{{\"type\":\"string\",\"enum\":[\"changes\",\"==\",\"!=\",\">\",\"<\",\">=\",\"<=\"]}},\"value\":{{\"type\":\"string\"}},\"timeout_s\":{{\"type\":\"number\"}}}},\"required\":[\"device\",\"property\"]}},\"annotations\":{{\"readOnlyHint\":true}}}}", .{ max_wait_s, all.items, try quotedList(a, &model.Props.fields) });
     try o.appendSlice(a, "]}");
     return gpa.dupe(u8, o.items);
+}
+
+/// One line of text: valid UTF-8 without control characters, line or
+/// paragraph separators, direction marks or invisible ones (a message
+/// can't hide what it says or carry markup in them).
+fn plainLine(s: []const u8) bool {
+    const view = std.unicode.Utf8View.init(s) catch return false;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| switch (cp) {
+        0...0x1f, 0x7f...0x9f, 0x200b...0x200f, 0x2028...0x202e, 0x2060...0x2069, 0xfeff => return false,
+        else => {},
+    };
+    return true;
+}
+
+/// A room's name as said back: letters (Latin ones with their marks too),
+/// digits, spaces, `-`, `_` and `'`, at most 48 bytes; else "unknown".
+fn roomWord(s: []const u8) []const u8 {
+    if (s.len == 0 or s.len > 48) return "unknown";
+    const view = std.unicode.Utf8View.init(s) catch return "unknown";
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        const ok = if (cp < 0x80) std.ascii.isAlphanumeric(@intCast(cp)) or cp == ' ' or cp == '-' or cp == '_' or cp == '\'' else cp >= 0xc0 and cp <= 0x24f and cp != 0xd7 and cp != 0xf7;
+        if (!ok) return "unknown";
+    }
+    return s;
+}
+
+/// Whether two rooms' names are the same in any case, Polish and other
+/// Latin letters too.
+fn sameRoom(x: []const u8, y: []const u8) bool {
+    const vx = std.unicode.Utf8View.init(x) catch return false;
+    const vy = std.unicode.Utf8View.init(y) catch return false;
+    var ix = vx.iterator();
+    var iy = vy.iterator();
+    while (true) {
+        const cx = ix.nextCodepoint();
+        const cy = iy.nextCodepoint();
+        if (cx == null or cy == null) return cx == null and cy == null;
+        if (lowerLatin(cx.?) != lowerLatin(cy.?)) return false;
+    }
+}
+
+/// A Latin letter's lower case (ASCII, Latin-1, Latin Extended-A).
+fn lowerLatin(cp: u21) u21 {
+    if (cp < 0x80) return std.ascii.toLower(@intCast(cp));
+    if (cp >= 0xc0 and cp <= 0xde and cp != 0xd7) return cp + 0x20;
+    if (cp >= 0x100 and cp <= 0x137) return if (cp % 2 == 0) cp + 1 else cp;
+    if (cp >= 0x139 and cp <= 0x148) return if (cp % 2 == 1) cp + 1 else cp;
+    if (cp >= 0x14a and cp <= 0x177) return if (cp % 2 == 0) cp + 1 else cp;
+    if (cp == 0x178) return 0xff;
+    if (cp >= 0x179 and cp <= 0x17e) return if (cp % 2 == 1) cp + 1 else cp;
+    return cp;
 }
 
 fn actionList(a: Allocator, d: *const config.Device, cfg: *const config.Config) ![]u8 {
@@ -948,7 +1006,8 @@ test "announce_says_it_on_allowed_speakers_and_reads_back" {
     try std.testing.expectEqualStrings("nothing was said: hall_voice spoke less than 10 s ago; kitchen_speaker spoke less than 10 s ago", try answerOf(&s, a, 4));
     s.clock_ms.? += 11_000;
     try s.handleLine(try callLine(a, 5, "announce", "{\"room\":\"Garage\",\"message\":\"The garage door is open.\"}"));
-    try std.testing.expectEqualStrings("no speaker in Garage, so every one: done: said on hall_voice (Hall); done: said on kitchen_speaker (Kitchen); it is playing", try answerOf(&s, a, 5));
+    // (the kitchen speaker plays still, from the message before: it can't show this one)
+    try std.testing.expectEqualStrings("no speaker in Garage, so every one: done: said on hall_voice (Hall); sent to kitchen_speaker (Kitchen), but it was playing already: whether it was said can't be read back", try answerOf(&s, a, 5));
     // what may not be said, or not there
     const Refused = struct { []const u8, []const u8 };
     for ([_]Refused{
@@ -989,4 +1048,55 @@ test "announce_says_it_on_allowed_speakers_and_reads_back" {
     const log = try tmp.dir.readFileAlloc(io, "actions.jsonl", a, .unlimited);
     try std.testing.expect(std.mem.indexOf(u8, log, "\"tool\":\"announce\",\"device\":\"hall_voice\",\"id\":\"assist_satellite.hall_voice\",\"action\":\"announce\",\"value\":\"Water under the kitchen sink.\",\"result\":\"done\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, log, "\"tool\":\"announce\",\"device\":\"living_room_light\"") != null);
+}
+
+test "announce_folds_rooms_and_says_what_it_cannot_confirm" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const sim = try @import("sim.zig").HaSim.start(std.heap.page_allocator, io, 0, "sim-token");
+    defer sim.stop();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: config.Diag = .{};
+    const cfg = try config.parse(a, try std.fmt.allocPrint(a,
+        \\[home]
+        \\hub = homeassistant
+        \\url = http://127.0.0.1:{d}
+        \\tts = tts.piper
+        \\[device hall_voice]
+        \\id = assist_satellite.hall_voice
+        \\kind = satellite
+        \\room = Łazienka
+        \\allow = announce
+        \\[device kitchen_speaker]
+        \\id = media_player.kitchen_speaker
+        \\kind = media
+        \\room = Kitchen
+        \\allow = play, pause, announce
+    , .{sim.port}), &d);
+    const hub = try hub_mod.Hub.start(gpa, io, &cfg, .{ .ha_token = "sim-token" });
+    defer hub.stop();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var s = try Server.init(gpa, io, &cfg, hub);
+    defer s.deinit();
+    s.captured = &out;
+    s.clock_ms = 1_000_000;
+    // a room named in another case is the same room, Polish letters too:
+    // not the whole house
+    try s.handleLine(try callLine(a, 1, "announce", "{\"room\":\"łazienka\",\"message\":\"Pranie skończone.\"}"));
+    try std.testing.expectEqualStrings("done: said on hall_voice (Łazienka)", try answerOf(&s, a, 1));
+    try std.testing.expect(std.mem.indexOf(u8, try sim.announced(a), "media_player.kitchen_speaker") == null);
+    // a player playing music already can't show it said the message
+    try s.handleLine(try callLine(a, 2, "home_set", "{\"device\":\"kitchen_speaker\",\"action\":\"play\"}"));
+    try s.handleLine(try callLine(a, 3, "announce", "{\"speaker\":\"kitchen_speaker\",\"message\":\"Dinner is ready.\"}"));
+    try std.testing.expectEqualStrings("sent to kitchen_speaker (Kitchen), but it was playing already: whether it was said can't be read back", try answerOf(&s, a, 3));
+    // control characters past ASCII: line breaks, a direction mark, C1
+    for ([_][]const u8{ "one\u{2028}two", "a\u{202e}b", "a\u{85}b", "a\u{200f}b" }, 0..) |msg, i| {
+        const id: u32 = @intCast(10 + i);
+        s.clock_ms.? += 11_000;
+        try s.handleLine(try callLine(a, id, "announce", try std.fmt.allocPrint(a, "{{\"speaker\":\"hall_voice\",\"message\":{f}}}", .{std.json.fmt(msg, .{})})));
+        try std.testing.expectEqualStrings("text only: one line, no control characters", try answerOf(&s, a, id));
+    }
 }
