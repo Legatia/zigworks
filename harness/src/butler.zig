@@ -625,6 +625,10 @@ pub const Picks = struct {
     people: bool = false,
     /// mcp.ini has carcloud as `car`.
     car: bool = false,
+    /// The car server has car_climate (a Tesla through carcloud).
+    car_warms: bool = false,
+    /// `[butler] warm_below`, °C.
+    warm_below: f64 = 5,
     /// Search is set up: the morning summary can say the weather.
     search: bool = false,
     /// An MCP server whose name has "calendar"; "": none.
@@ -650,14 +654,14 @@ pub const Picks = struct {
     escalate: []const alerts.Step = &.{},
 };
 
-pub const Settings = struct { car: bool = false, search: bool = false, calendar: []const u8 = "", quiet: ?config.Quiet = null, town: []const u8 = "", fallback: bool = false, escalate: []const alerts.Step = &.{}, mail: bool = false };
+pub const Settings = struct { car: bool = false, search: bool = false, calendar: []const u8 = "", quiet: ?config.Quiet = null, town: []const u8 = "", fallback: bool = false, escalate: []const alerts.Step = &.{}, mail: bool = false, car_warms: bool = false, warm_below: f64 = 5 };
 
 /// The devices and settings the routines use: every light; the first
 /// thermostat; the first lock (a front one first); the water main (a
 /// valve, else a switch named one); every leak sensor; every door and
 /// window sensor.
 pub fn pick(a: Allocator, h: Home, s: Settings) !Picks {
-    var p: Picks = .{ .people = h.people.len > 0, .car = s.car, .search = s.search, .calendar = s.calendar, .quiet = s.quiet, .town = s.town, .fallback = s.fallback, .escalate = s.escalate, .mail = s.mail };
+    var p: Picks = .{ .people = h.people.len > 0, .car = s.car, .search = s.search, .calendar = s.calendar, .quiet = s.quiet, .town = s.town, .fallback = s.fallback, .escalate = s.escalate, .mail = s.mail, .car_warms = s.car and s.car_warms, .warm_below = s.warm_below };
     var leaks: std.ArrayList(Device) = .empty;
     var doors: std.ArrayList(Device) = .empty;
     var smokes: std.ArrayList(Device) = .empty;
@@ -689,6 +693,12 @@ pub fn pick(a: Allocator, h: Home, s: Settings) !Picks {
     p.leaks = leaks.items;
     p.doors = doors.items;
     return p;
+}
+
+/// "5", "-2.5": degrees as said.
+fn degrees(a: Allocator, x: f64) ![]const u8 {
+    if (@abs(x - @round(x)) < 1e-9) return std.fmt.allocPrint(a, "{d}", .{@as(i64, @intFromFloat(@round(x)))});
+    return std.fmt.allocPrint(a, "{d:.1}", .{x});
 }
 
 /// "HH:MM".
@@ -725,6 +735,7 @@ pub const Routine = enum {
     smoke,
     @"door-open",
     @"car-tomorrow",
+    @"warm-car",
     bill,
     delivery,
     flight,
@@ -746,6 +757,7 @@ pub const Routine = enum {
             .smoke => "Smoke alarm",
             .@"door-open" => "Doors left open",
             .@"car-tomorrow" => "Car for tomorrow",
+            .@"warm-car" => "Warm the car",
             .bill => "Bills",
             .delivery => "Deliveries",
             .flight => "Flights",
@@ -764,6 +776,8 @@ pub const Routine = enum {
             .smoke => p.smokes.len > 0,
             .@"door-open" => p.doors.len > 0,
             .@"car-tomorrow" => p.car,
+            // the leave-by is the diary's: a calendar, and a car that warms
+            .@"warm-car" => p.car_warms and p.calendar.len > 0,
             .bill, .delivery => p.mail,
             // the calendar's own tools add the entry: only with one set
             .flight, .invitation => p.mail and p.calendar.len > 0,
@@ -814,6 +828,7 @@ pub const Routine = enum {
             },
             .@"door-open" => try o.print(a, "Doors left open: when {s} stays open for 10 minutes, I tell you.", .{try sensorList(a, p.doors, "a door or window")}),
             .@"car-tomorrow" => try o.print(a, "Car for tomorrow: at {s}, when the car is under half, I tell you, and ask with one tap to start charging when it's plugged in.", .{try clock(a, carAt(p))}),
+            .@"warm-car" => try o.print(a, "Warm the car: 30 minutes before you leave for a morning event in your calendar, when it's below {s} °C at the car, I ask \"Warm the car for 8:10?\" and one tap warms it.", .{try degrees(a, p.warm_below)}),
             .bill => try o.appendSlice(a, "Bills: 3 days before a bill in your mail is due, I tell you who, how much and when."),
             .delivery => try o.appendSlice(a, "Deliveries: on the day a parcel comes, one line with what and from whom."),
             .flight => {
@@ -838,6 +853,7 @@ pub fn onText(a: Allocator, r: Routine, p: Picks) ![]const u8 {
         .smoke => "Smoke alarm is on: it comes through quiet hours.",
         .@"door-open" => "Doors left open is on.",
         .@"car-tomorrow" => std.fmt.allocPrint(a, "Car for tomorrow is on, at {s}. /workflow start car-tomorrow tries it now.", .{try clock(a, carAt(p))}),
+        .@"warm-car" => std.fmt.allocPrint(a, "Warm the car is on: before a morning leave-by when it's below {s} °C at the car; it wakes the car once to read it.", .{try degrees(a, p.warm_below)}),
         .bill => "Bill reminders are on.",
         .delivery => "Delivery lines are on.",
         .flight => "Flights are on.",
@@ -846,7 +862,7 @@ pub fn onText(a: Allocator, r: Routine, p: Picks) ![]const u8 {
 }
 
 /// The routines in the order setup offers them.
-pub const all = [_]Routine{ .goodnight, .leaving, .arriving, .@"morning-home", .leak, .smoke, .@"door-open", .@"car-tomorrow", .bill, .delivery, .flight, .invitation };
+pub const all = [_]Routine{ .goodnight, .leaving, .arriving, .@"morning-home", .leak, .smoke, .@"door-open", .@"car-tomorrow", .@"warm-car", .bill, .delivery, .flight, .invitation };
 
 fn andList(a: Allocator, parts: []const []const u8) ![]const u8 {
     if (parts.len == 0) return "";
@@ -998,6 +1014,8 @@ fn triggerSections(r: Routine) []const []const u8 {
         .smoke => &.{"smoke-<smoke>"},
         .@"door-open" => &.{"door-<door>"},
         .@"car-tomorrow" => &.{"car-evening"},
+        // harness starts it itself, before the diary's leave-by
+        .@"warm-car" => &.{},
         .bill => &.{"bill-due"},
         .delivery => &.{"delivery-today"},
         .flight => &.{"flight-mail"},
@@ -1070,6 +1088,7 @@ fn commonValues(a: Allocator, p: Picks) ![]Value {
     try v.append(a, .{ .key = "goodnight at", .value = try clock(a, goodnightAt(p)) });
     try v.append(a, .{ .key = "morning at", .value = try clock(a, morningAt(p)) });
     try v.append(a, .{ .key = "car at", .value = try clock(a, carAt(p)) });
+    try v.append(a, .{ .key = "warm below", .value = try degrees(a, p.warm_below) });
     try v.append(a, .{ .key = "night temp", .value = try std.fmt.allocPrint(a, "{d}", .{p.night_temp}) });
     try v.append(a, .{ .key = "away temp", .value = try std.fmt.allocPrint(a, "{d}", .{p.away_temp}) });
     try v.append(a, .{ .key = "home temp", .value = try std.fmt.allocPrint(a, "{d}", .{p.home_temp}) });
@@ -1441,7 +1460,7 @@ test "routines_fill_from_the_sims_home" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const p = try simPicks(a, .{ .car = true, .search = true, .calendar = "calendar", .quiet = .{ .start = 22 * 60, .end = 7 * 60 }, .town = "Kraków" });
+    const p = try simPicks(a, .{ .car = true, .car_warms = true, .search = true, .calendar = "calendar", .quiet = .{ .start = 22 * 60, .end = 7 * 60 }, .town = "Kraków" });
     // with the owner's mailbox on, the mail routines too
     var pm = p;
     pm.mail = true;
@@ -1594,6 +1613,38 @@ test "a_template_with_windows_line_ends_fills_as_with_plain_ones" {
     const want = try fill(a, plain, &values, &.{"lock"}, &missing);
     try t.expectEqualStrings("step ask\napprove Lock front_door\nyes Lock it\nsay Good night, Anna\n", want);
     try t.expectEqualStrings(want, try fill(a, windows, &values, &.{"lock"}, &missing));
+}
+
+test "warm_car_is_offered_when_the_car_can_warm_and_the_diary_is_on" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h = try parseHome(a, sim_home);
+    readCheck(&h, sim_check);
+    // a car without climate (Smartcar), or no calendar for the leave-by: not offered
+    try t.expect(!Routine.@"warm-car".offered(try pick(a, h, .{ .car = true, .calendar = "calendar" })));
+    try t.expect(!Routine.@"warm-car".offered(try pick(a, h, .{ .car = true, .car_warms = true })));
+    const p = try pick(a, h, .{ .car = true, .car_warms = true, .calendar = "calendar", .warm_below = 3 });
+    try t.expect(Routine.@"warm-car".offered(p));
+    try t.expectEqualStrings("Warm the car: 30 minutes before you leave for a morning event in your calendar, when it's below 3 °C at the car, I ask \"Warm the car for 8:10?\" and one tap warms it.", try Routine.@"warm-car".sentence(a, p));
+    try t.expectEqualStrings("Warm the car is on: before a morning leave-by when it's below 3 °C at the car; it wakes the car once to read it.", try onText(a, .@"warm-car", p));
+    const f = try routineFiles(a, .@"warm-car", p, "2026-11-23");
+    // harness starts it itself: no trigger, no rules
+    try t.expectEqualStrings("", f.triggers);
+    try t.expectEqualStrings("", f.rules);
+    try t.expect(std.mem.indexOf(u8, f.workflow, "# added by /setup routines 2026-11-23: the butler's Warm the car routine (harness/examples/butler)\nworkflow warm-car\n") != null);
+    try t.expect(std.mem.indexOf(u8, f.workflow, "about Before a morning leave-by when it is below 3 °C at the car: asks with one tap to warm the car.\n") != null);
+    try t.expect(std.mem.indexOf(u8, f.workflow, "approve Warm the car for {event.leave}? It's {event.outside} °C at the car.\nyes Warm it\n") != null);
+    try t.expect(std.mem.indexOf(u8, f.workflow, "tool car/car_climate {\"state\": \"on\"}\n") != null);
+    // it reads as harness reads it, and its start needs no section
+    var d: workflows.Diag = .{};
+    const w = try workflows.parse(a, "warm-car", f.workflow, &d);
+    _ = try workflows.check(a, w, .{}, &d);
+    try t.expectEqualStrings("schedule:warm-car", w.start[0]);
+    // with \r\n line ends (a Windows checkout) it fills the same
+    var missing: []const u8 = "";
+    const crlf = try std.mem.replaceOwned(u8, a, workflowTemplate(.@"warm-car"), "\n", "\r\n");
+    try t.expectEqualStrings(try fill(a, workflowTemplate(.@"warm-car"), try commonValues(a, p), &.{}, &missing), try fill(a, crlf, try commonValues(a, p), &.{}, &missing));
 }
 
 test "a_routine_whose_devices_are_missing_is_not_offered" {

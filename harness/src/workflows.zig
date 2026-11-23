@@ -852,6 +852,11 @@ pub const Context = struct {
     mcp: ?[]const McpServer = null,
 };
 
+/// The schedule harness keeps for itself: the warm-car routine, started
+/// before a morning leave-by of the diary (warmcar.zig), needs no
+/// triggers.ini section.
+pub const builtin_schedule = "warm-car";
+
 /// Checks what `w` names outside itself: a `start` trigger or schedule
 /// whose `start = workflow NAME` names it, `wait event` triggers (and the
 /// fields `match` reads), definitions, MCP tools of servers that run.
@@ -862,6 +867,8 @@ pub fn check(a: Allocator, w: Workflow, ctx: Context, diag: *Diag) Error![]const
         const trigger = std.mem.startsWith(u8, s, "trigger:");
         if (!trigger and !std.mem.startsWith(u8, s, "schedule:")) continue;
         const name = s[std.mem.indexOfScalar(u8, s, ':').? + 1 ..];
+        // harness's own schedule: the diary's leave-by starts warm-car, and only it
+        if (!trigger and std.mem.eql(u8, name, builtin_schedule) and std.mem.eql(u8, w.name, builtin_schedule)) continue;
         const tr = findTrigger(ctx.triggers, name);
         const ok = if (tr) |x| x.isEvent() == trigger and x.action == .start and std.mem.eql(u8, x.action.start, w.name) else false;
         if (!ok) return badf(a, diag, w.start_line, "{s} has no start = workflow {s} in triggers.ini ({s})", .{ name, w.name, if (trigger) "an event trigger" else "a schedule" });
@@ -1628,4 +1635,21 @@ test "tag_no_posts_without_the_instance_in_front" {
     try t.expect(!w.tag);
     try t.expect(std.mem.indexOf(u8, try reading(a, w, null, null), "; its posts go without [x#N] in front") != null);
     try refused(a, "x", "workflow x\ntag maybe\nstep a\nsay hi\n", 2, "tag yes or no");
+}
+
+test "harness_starts_warm_car_itself_without_a_triggers_section" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    // the diary's leave-by starts it (schedule:warm-car): no section needed
+    const w = try parse(a, "warm-car", "workflow warm-car\nstart schedule:warm-car\nstep a\nsay hi\n", &d);
+    _ = try check(a, w, .{}, &d);
+    // any other schedule still needs its section
+    const x = try parse(a, "other", "workflow other\nstart schedule:other\nstep a\nsay hi\n", &d);
+    try t.expectError(error.BadWorkflow, check(a, x, .{}, &d));
+    // and harness starts only warm-car so: another workflow can't borrow its name
+    const y = try parse(a, "mine", "workflow mine\nstart schedule:warm-car\nstep a\nsay hi\n", &d);
+    try t.expectError(error.BadWorkflow, check(a, y, .{}, &d));
+    try t.expectEqualStrings("warm-car has no start = workflow mine in triggers.ini (a schedule)", d.why);
 }

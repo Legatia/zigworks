@@ -53,6 +53,7 @@ const butler = @import("butler.zig");
 const alerts_mod = @import("alerts.zig");
 const mail_mod = @import("mail.zig");
 const diary_mod = @import("diary.zig");
+const warmcar = @import("warmcar.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -5652,6 +5653,8 @@ pub const Core = struct {
         // the diary: the calendar read when due, its lines at their minute
         if (c.poller_on) c.diaryDue(now_s);
         c.diaryPost(now_s);
+        // warm the car: before a cold morning's leave-by, one question
+        c.warmCarDue(now_s);
         // quiet hours over: what they held, a digest per conversation
         c.quietDue(now_s);
         // urgent alerts nobody is on: the household in turn, a fallback
@@ -9555,6 +9558,106 @@ pub const Core = struct {
         return b.end;
     }
 
+    // ---- warm the car (the household spec, section 7) ----
+    //
+    // With the warm-car routine on (workflows/warm-car.wf), 30 minutes
+    // before a morning leave-by of the diary the car is read on a thread
+    // of its own (car_status, woken once: carcloud's wakes_per_day bounds
+    // it); below [butler] warm_below outside, the routine's instance
+    // starts as harness's own schedule:warm-car: its one question, and only
+    // the owner's tap makes the call. Each leave-by once (state/diary).
+
+    /// The car server lists car_climate: a car that warms (a Tesla).
+    fn carCanWarm(c: *Core) bool {
+        for (c.mcp_tools) |m| if (std.mem.eql(u8, m.server.name, "car") and std.mem.eql(u8, m.tool, "car_climate")) return true;
+        return false;
+    }
+
+    /// From the tick: the leave-bys whose question is due, each read on a
+    /// thread of its own.
+    fn warmCarDue(c: *Core, now_s: i64) void {
+        if (c.restarting.load(.acquire)) return;
+        const on = for (c.wf_defs) |w| {
+            if (std.mem.eql(u8, w.name, warmcar.workflow)) break true;
+        } else false;
+        if (!on) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const evs = c.diary.events(a);
+        if (evs.len == 0) return;
+        const said = c.diary.saidKeys(a, now_s) catch return;
+        const travel = c.diary.travelFor(a) catch &.{};
+        const list = warmcar.due(a, evs, now_s, .{ .minutes = c.cfg.butler.travel, .each = travel }, said) catch return;
+        for (list) |d| {
+            // once, whatever comes of it
+            c.diary.markSaid(d.key, now_s) catch |e| {
+                c.log.write(.chat, false, .{ .event = "diary not written", .why = @errorName(e) }) catch {};
+                continue;
+            };
+            const box = c.gpa.create(WarmRead) catch continue;
+            box.* = .{ .arena = .init(c.gpa), .due = undefined };
+            // what the job uses, in its own memory (this arena ends here)
+            const ba = box.arena.allocator();
+            box.due = .{ .key = "", .leave = d.leave, .event = .{
+                .id = ba.dupe(u8, d.event.id) catch "",
+                .title = ba.dupe(u8, d.event.title) catch "",
+                .start = d.event.start,
+                .end = d.event.end,
+                .offset = d.event.offset,
+            } };
+            _ = c.bg_active.fetchAdd(1, .acq_rel);
+            const th = std.Thread.spawn(.{}, warmCarJob, .{ c, box }) catch {
+                _ = c.bg_active.fetchSub(1, .acq_rel);
+                box.arena.deinit();
+                c.gpa.destroy(box);
+                continue;
+            };
+            th.detach();
+        }
+    }
+
+    const WarmRead = struct { arena: std.heap.ArenaAllocator, due: warmcar.Due };
+
+    fn warmCarJob(c: *Core, box: *WarmRead) void {
+        defer {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+        }
+        const a = box.arena.allocator();
+        const d = box.due;
+        const mt = for (c.mcp_tools) |*x| {
+            if (std.mem.eql(u8, x.server.name, "car") and std.mem.eql(u8, x.tool, "car_status")) break x;
+        } else {
+            c.log.write(.chat, false, .{ .event = "warm car", .id = d.event.id, .outside = @as(?[]const u8, null), .asked = false, .why = "no car server" }) catch {};
+            return;
+        };
+        // a read: never a tool that moves money
+        if (mt.money) return;
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "");
+        defer c.unregister(&flag);
+        const res = mt.server.call(a, "car_status", "{\"wake\":true}", &flag, 120_000, 64 * 1024) catch |e| {
+            c.log.write(.chat, false, .{ .event = "warm car", .id = d.event.id, .outside = @as(?[]const u8, null), .asked = false, .why = @errorName(e) }) catch {};
+            return;
+        };
+        const outside = if (res.is_error) null else warmcar.outsideOf(res.text);
+        const cold = if (outside) |x| x < c.cfg.butler.warm_below else false;
+        const st = warmcar.start(a, d, outside orelse 0) catch return;
+        const deg: ?[]const u8 = if (outside != null) (jv.str(jv.get(jv.parse(a, st.event), "outside")) orelse null) else null;
+        c.log.write(.chat, false, .{ .event = "warm car", .id = d.event.id, .outside = deg, .asked = cold, .why = if (outside == null) @as(?[]const u8, util.cut(res.text, 200)) else null }) catch {};
+        if (!cold) return;
+        const begun = c.startInstance(a, warmcar.workflow, .{ .at = c.now(), .by = warmcar.by, .input = st.input, .event = st.event }) catch |e| {
+            c.log.write(.chat, false, .{ .event = "warm car not asked", .id = d.event.id, .why = @errorName(e) }) catch {};
+            return;
+        };
+        switch (begun) {
+            .started, .queued => {},
+            .refused => |why| c.log.write(.chat, false, .{ .event = "warm car not asked", .id = d.event.id, .why = why }) catch {},
+        }
+    }
+
     // ---- /setup calendar ----
 
     const calendar_help =
@@ -10147,6 +10250,8 @@ pub const Core = struct {
             .town = std.mem.trim(u8, c.readOr(a, try c.setupPath(a, "town")), " \t\r\n"),
             .escalate = c.cfg.butler.escalate,
             .mail = c.mailMineOn(a),
+            .car_warms = c.carCanWarm(),
+            .warm_below = c.cfg.butler.warm_below,
         });
     }
 
@@ -10203,7 +10308,8 @@ pub const Core = struct {
         {
             const files = try butler.routineFiles(a, r, p, try c.setupDate(a));
             var shown: std.ArrayList(u8) = .empty;
-            try shown.print(a, "{s}: Turn on writes workflows/{s}.wf:\n\n{s}\nand adds to triggers.ini:\n\n{s}", .{ r.title(), r.name(), files.workflow, files.triggers });
+            try shown.print(a, "{s}: Turn on writes workflows/{s}.wf:\n\n{s}", .{ r.title(), r.name(), files.workflow });
+            if (files.triggers.len > 0) try shown.print(a, "\nand adds to triggers.ini:\n\n{s}", .{files.triggers});
             if (files.rules.len > 0) try shown.print(a, "\nand to rules:\n\n{s}", .{files.rules});
             c.sayIn(conv, shown.items);
             const asks_town = r == .@"morning-home" and p.search and p.town.len == 0;
@@ -23328,4 +23434,142 @@ test "a_flight_in_the_mail_goes_to_the_calendar_through_calmcps_cal_create_asked
     butler.readCheck(&h, stand_in_check);
     const inv = try butler.routineFiles(a, .invitation, try butler.pick(a, h, .{ .mail = true, .calendar = "calendar" }), "2026-11-23");
     try expectHas(inv.workflow, "tool calendar/cal_create {\"title\": \"{read.title}\", \"start\": \"{read.start}\", \"end\": \"{read.end}\", \"place\": \"{read.place}\"}");
+}
+
+// ---- warm the car (the household spec, section 7) ----
+
+/// The diary (calmcp's stand-in) and carcloud's with a Tesla, the
+/// warm-car routine on when `routine`: the stand-ins' folders.
+fn withWarmCar(f: *Fix, routine: bool) !struct { cal: []const u8, car: []const u8 } {
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    const cal_file = try dataFile(f, "calendar.ini");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = cal_file, .data = fake_cal_t.discovered });
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    f.core.store = st;
+    try st.put(t.io, "caldav", fake_cal_t.test_secret);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[calendar]\ncommand = \"{s}\" \"{s}\"\nsecret = CALDAV_PASSWORD:caldav\nmoney = cal_create, cal_move, cal_cancel, cal_reply\namount = cal_create:none, cal_move:none, cal_cancel:none, cal_reply:none\n\n[car]\ncommand = \"{s}\" --mcp --tesla\n", .{ fake, cal_file, fake }) });
+    try writeRules(f, try butler.setupRules(a, .car));
+    const cal = try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "calendar" });
+    const car = try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "car" });
+    try Io.Dir.cwd().createDirPath(t.io, cal);
+    try Io.Dir.cwd().createDirPath(t.io, car);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    if (routine) try withRoutine(f, .@"warm-car", .{ .car = true, .car_warms = true, .calendar = "calendar" });
+    return .{ .cal = cal, .car = car };
+}
+
+/// What the car stand-in was asked, a line a call.
+fn carCalls(f: *Fix, dir: []const u8) []const u8 {
+    const a = f.e.arena.allocator();
+    return Io.Dir.cwd().readFileAlloc(t.io, std.fs.path.join(a, &.{ dir, "calls" }) catch return "", a, .unlimited) catch "";
+}
+
+/// An event with a place at `start` (the owner at +01:00).
+fn officeAt(id: []const u8, start: i64) diary_mod.Event {
+    return .{ .id = id, .calendar = "work", .title = "Office", .start = start, .end = start + 8 * 3600, .offset = 60, .busy = true, .place = "Office, ul. Długa 5, Kraków", .when = "09:00–17:00", .day = "Tue 24 Nov" };
+}
+
+/// The warm-car hook at `now`, its read waited for, the instances run.
+fn warmAt(f: *Fix, now: i64) void {
+    f.core.fixed_now = now;
+    f.core.warmCarDue(now);
+    waitIdle(f.core);
+    runWorkflows(f);
+}
+
+test "warm_car_asks_before_a_cold_morning_leave_by_and_one_tap_warms" {
+    var f: Fix = undefined;
+    try f.init("[butler]\ntravel = 50m\n", "", "");
+    defer f.deinit();
+    const d = try withWarmCar(&f, true);
+    // 09:00 tomorrow, 50 minutes away: leave at 8:10
+    const t0 = quietDay() + 8 * 3600;
+    const leave = t0 - 50 * 60;
+    try writeUpcoming(&f, d.cal, &.{officeAt("work/office-1@calmcp-sim", t0)});
+    f.core.fixed_now = leave - 31 * 60;
+    try f.core.diaryReadNow();
+    warmAt(&f, leave - 31 * 60);
+    try t.expectEqualStrings("", carCalls(&f, d.car));
+    // 30 minutes before: the car read (woken once), then the question
+    warmAt(&f, leave - 30 * 60);
+    try f.rec.waitFor("BUTTONS Warm the car for 8:10? It's -3 °C at the car. [");
+    try expectHas(try inboxFile(&f), "\"choices\":[{\"key\":\"approve\",\"label\":\"Warm it\"},{\"key\":\"deny\",\"label\":\"Not today\"}]");
+    try t.expectEqualStrings("car_status {\"wake\":true}\n", carCalls(&f, d.car));
+    // the tap makes the call, and what the car reads back is said
+    try f.press("approve");
+    runWorkflows(&f);
+    try f.rec.waitFor("Climate on, set to 21 °C; inside 4 °C, outside -3 °C.");
+    try t.expectEqualStrings("car_status {\"wake\":true}\ncar_climate {\"state\":\"on\"}\n", carCalls(&f, d.car));
+    const lt = try logText(&f);
+    try expectHas(lt, "\"decision\":\"allow\",\"why\":\"allowed once by the owner (item 1)\"");
+    try expectHas(lt, "\"event\":\"warm car\",\"id\":\"work/office-1@calmcp-sim\",\"outside\":\"-3\",\"asked\":true");
+    // once for this leave-by
+    warmAt(&f, leave - 29 * 60);
+    try t.expectEqual(1, f.rec.count("BUTTONS"));
+    try t.expectEqual(1, std.mem.count(u8, carCalls(&f, d.car), "car_status"));
+}
+
+test "warm_car_stays_quiet_when_warm_in_the_afternoon_untapped_or_off" {
+    var f: Fix = undefined;
+    try f.init("[butler]\ntravel = 50m\n", "", "");
+    defer f.deinit();
+    const d = try withWarmCar(&f, true);
+    const a = f.e.arena.allocator();
+    const day = quietDay();
+    // 8 °C at the car: read once, nothing asked
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ d.car, "outside" }), .data = "8" });
+    const warm = day + 7 * 3600;
+    // an afternoon's leave-by (15:00, leave at 14:10): not even read
+    const afternoon = day + 14 * 3600;
+    try writeUpcoming(&f, d.cal, &.{ officeAt("work/warm@x", warm), officeAt("work/afternoon@x", afternoon) });
+    f.core.fixed_now = warm - 80 * 60;
+    try f.core.diaryReadNow();
+    warmAt(&f, warm - 80 * 60);
+    try t.expectEqualStrings("car_status {\"wake\":true}\n", carCalls(&f, d.car));
+    try expectHas(try logText(&f), "\"event\":\"warm car\",\"id\":\"work/warm@x\",\"outside\":\"8\",\"asked\":false");
+    warmAt(&f, afternoon - 80 * 60);
+    try t.expectEqual(1, std.mem.count(u8, carCalls(&f, d.car), "car_status"));
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    // cold, and Not today: nothing sent
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ d.car, "outside" }), .data = "-1.5" });
+    const cold = day + 86400 + 7 * 3600;
+    const colder = day + 86400 + 8 * 3600;
+    try writeUpcoming(&f, d.cal, &.{ officeAt("work/cold@x", cold), officeAt("work/colder@x", colder) });
+    f.core.fixed_now = cold - 80 * 60;
+    try f.core.diaryReadNow();
+    warmAt(&f, cold - 80 * 60);
+    try f.rec.waitFor("BUTTONS Warm the car for 7:10? It's -1.5 °C at the car. [");
+    try f.press("deny");
+    runWorkflows(&f);
+    // no answer by the leave-by: the question lapses, nothing sent
+    warmAt(&f, colder - 80 * 60);
+    try f.rec.waitFor("BUTTONS Warm the car for 8:10? It's -1.5 °C at the car. [");
+    f.core.fixed_now = colder - 49 * 60;
+    f.core.tick();
+    waitIdle(f.core);
+    runWorkflows(&f);
+    try t.expect(std.mem.indexOf(u8, carCalls(&f, d.car), "car_climate") == null);
+    // the routine off: the car isn't even read
+    try Io.Dir.cwd().deleteFile(t.io, try std.fs.path.join(a, &.{ f.core.paths.workflows, "warm-car.wf" }));
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const later = day + 86400 + 10 * 3600;
+    try writeUpcoming(&f, d.cal, &.{officeAt("work/later@x", later)});
+    f.core.fixed_now = later - 80 * 60;
+    try f.core.diaryReadNow();
+    const before = std.mem.count(u8, carCalls(&f, d.car), "car_status");
+    warmAt(&f, later - 80 * 60);
+    try t.expectEqual(before, std.mem.count(u8, carCalls(&f, d.car), "car_status"));
+    try t.expectEqual(2, f.rec.count("BUTTONS"));
+}
+
+test "setup_offers_warm_car_when_the_car_can_warm" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    _ = try withWarmCar(&f, false);
+    const p = try f.core.setupPicks(a);
+    try t.expect(p.car_warms);
+    try t.expect(butler.Routine.@"warm-car".offered(p));
 }

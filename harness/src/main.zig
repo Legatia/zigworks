@@ -2716,6 +2716,7 @@ test {
     _ = @import("voice.zig");
     _ = @import("quiet.zig");
     _ = @import("diary.zig");
+    _ = @import("warmcar.zig");
     _ = @import("household.zig");
     _ = @import("butler.zig");
     _ = @import("mail.zig");

@@ -14,6 +14,7 @@ pub const workflows = [_]struct { name: []const u8, text: []const u8 }{
     .{ .name = "smoke", .text = @embedFile("workflows/smoke.wf") },
     .{ .name = "door-open", .text = @embedFile("workflows/door-open.wf") },
     .{ .name = "car-tomorrow", .text = @embedFile("workflows/car-tomorrow.wf") },
+    .{ .name = "warm-car", .text = @embedFile("workflows/warm-car.wf") },
     .{ .name = "bill", .text = @embedFile("workflows/bill.wf") },
     .{ .name = "delivery", .text = @embedFile("workflows/delivery.wf") },
     .{ .name = "flight", .text = @embedFile("workflows/flight.wf") },
