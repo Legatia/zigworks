@@ -24280,3 +24280,9 @@ test "the_habits_routine_runs_its_one_call" {
     try t.expectEqual(said, f.rec.lines.items.len);
     try expectHas(try logText(&f), "\"by\":\"workflow:habit-living-room-light-on/act\"");
 }
+
+// ---- the evening and the butler preset (the household spec's §8) ----
+
+test {
+    _ = @import("evening.zig");
+}
