@@ -465,6 +465,40 @@ wait_for "$T/run2.out" "running on" 5
 press once
 check "after a restart a question's button answers nothing" 'wait_for "$OUT" "Already closed: " 10 && [ "$(open_items)" = 0 ]'
 
+# a workflow instance waits for an approval while harness is killed and
+# started again; the press arrives and the instance ends done
+cat >"$HARNESS_HOME/workflows/hello.wf" <<'EOF'
+workflow hello
+step ask
+approve:
+  Go ahead with {input}?
+step tell
+say went ahead with {input}
+EOF
+chmod 600 "$HARNESS_HOME/workflows/hello.wf"
+tries=0
+while [ $tries -lt 5 ]; do
+	r0=$(reloaded)
+	say "/reload"
+	i=0
+	while [ $i -lt 30 ] && [ "$(reloaded)" -le "$r0" ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	[ "$(reloaded)" -gt "$r0" ] && break
+	tries=$((tries + 1))
+done
+before=$(asked)
+say "/workflow start hello the plan"
+check "a workflow's approve waits in the inbox, its state on disk" 'wait_asked $((before + 1)) && last_question | grep -qF "[hello#1] Go ahead with the plan?" && wait_for "$HARNESS_HOME/state/workflows/hello/1/state" "\"status\":\"waiting\"" 5'
+kill "$RPID" 2>/dev/null
+wait "$RPID" 2>/dev/null
+"$H" run >"$T/run3.out" 2>&1 &
+RPID=$!
+wait_for "$T/run3.out" "running on" 5
+press approve
+check "after a restart the press arrives and the instance ends done" 'wait_for "$OUT" "[hello#1] went ahead with the plan" 15 && wait_for "$HARNESS_HOME/state/workflows/hello/1/state" "\"status\":\"done\"" 5'
+
 kill "$RPID" 2>/dev/null
 wait "$RPID" 2>/dev/null
 RPID=""

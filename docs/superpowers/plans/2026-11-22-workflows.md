@@ -165,6 +165,32 @@ What – why – cost if wrong:
   inbox kind `failed`"): one message, its buttons Run again and Stop. – Two
   messages for one failure is noise. – None.
 
+Made while building:
+
+- R21. In a step's text a brace that no value's name follows is text: the
+  spec's own `do` says `Answer only with JSON: {"reply": "…", …}`. Only
+  `{name}` (letters, digits, `_`, `-`, `.`) is a value; `{{` is a brace. –
+  The example must read. – A typo like `{draft reply}` is text, not a bad
+  line.
+- R22. A step's call takes one question at a time: a second question in
+  the same call (a redirect to another host while the first waits) is
+  refused, and on the answer the call is decided again, its same question
+  (by its SHA-256 in `state`) taking the answer once; a new question then
+  waits as a new item. – An answer must never cover a question the owner
+  did not see. – A redirect asks twice.
+- R23. `/stop` with an instance's job between two steps pauses it too, an
+  `interrupted` item saying the step had not begun (Run again goes on). –
+  "/stop stops everything"; a job left running would go on at the next
+  tick. – One more item.
+- R24. An approve's Deny and a review's Drop leave `{STEP}` = `deny`. – The
+  spec's approve value is `approve` or `deny`; a review has no text to
+  use. – None.
+- R25. `settingsProblem` stays as it was; `settingsProblemWith` also names
+  a workflow file holding a stored secret (the CLI and `/reload` pass the
+  secrets). – Keeps the existing tests untouched. – None.
+- R26. A step's `{now}` is the owner's local time (`2026-11-22 14:03`), not
+  kept in the values on disk. – Readable in a message. – None.
+
 ## File map
 
 | File | Change |
@@ -513,4 +539,29 @@ unasked), main `harness_workflow_takes_list_check_start_stop`, agent
 
 ## Notes
 
-(filled in while building)
+- Existing tests changed on purpose: core
+  `a_workflow_start_is_refused_until_workflows_exist` is replaced by
+  `a_trigger_starts_one_instance_per_event` (a trigger's `start = workflow`
+  now starts an instance per event; the refusal is its case without the
+  file, "there is no workflow digest"). No other existing test changed;
+  readings in triggers.zig and core.zig no longer say "(workflows aren't
+  built yet)" (no test asserted those strings).
+- The Windows session's `util.writeReplace` (temp file, fsync, rename,
+  retries on Windows) is not in this base: every workflow file rewritten
+  whole goes through `wstate.writeReplace`, whose body the merge swaps.
+- Two smoke checks added (the restart with an approval waiting): 75
+  checks.
+- Task 8's decision (a step cut off by a restart or /stop) was built with
+  the job's loop in Task 4, which needs it; its three tests were added in
+  Task 8 and passed at once. Run with the decision switched off, all three
+  failed, so they test it.
+- Results: Debug 670/680 and ReleaseSafe 670/680 (10 skipped: Windows
+  only), smoke all ok (75); `zig build` and `zig build unit-build` for
+  x86_64-windows, x86_64-linux-musl and aarch64-linux-musl. No flake seen
+  in the full runs.
+- Left out: snapshots around a tool step (a step is not a run; an agent
+  step's run takes them as any run); `say` carries no files or quick
+  replies; an instance started by `harness workflow start` whose step asks
+  waits for `harness run` (the CLI does not take answers); ended instances
+  past 30 days are deleted at start only; Windows rename-while-reading of
+  instance files is the Windows session's `writeReplace`.
