@@ -97,3 +97,5 @@ for the people who will.
 GitHub cancels macOS jobs that wait about 15 minutes for a runner (most
 pushes lose one or two); they pass when rerun. A paid plan or fewer macOS
 jobs would end it.
+
+- calmcp ignores tool fields it doesn't know (a routine sending `location` for `place` lost the place silently until the stand-in refused it); calmcp itself should refuse unknown fields, as homemcp does.
