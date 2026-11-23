@@ -109,6 +109,12 @@ pub const Server = struct {
             const name = jv.str(jv.at(v, &.{ "params", "name" })) orelse return s.answerText(a, id, .{ .text = "no tool name", .is_error = true });
             const args = jv.at(v, &.{ "params", "arguments" });
             const writes = s.cfg.anyChange();
+            // a field the tool doesn't take is refused, never ignored (a
+            // place sent as `location` would be lost without a word)
+            if (fieldsOf(name)) |known| if (writes or !isWrite(name)) if (try fieldProblem(a, name, args, known)) |why| {
+                if (!isWrite(name)) return s.answerText(a, id, .{ .text = why, .is_error = true });
+                return s.answerText(a, id, try s.refuse(a, .{ .tool = name, .title = std.mem.trim(u8, jv.str(jv.get(args, "title")) orelse "", " \t\r\n") }, why));
+            };
             const r: Result = if (eql(name, "cal_agenda"))
                 try s.agendaTool(a, args)
             else if (eql(name, "cal_free"))
@@ -839,6 +845,40 @@ pub fn run(gpa: Allocator, io: Io, cfg: *const config.Config, dav: *caldav.Clien
     while (r.interface.takeDelimiter('\n') catch return) |l| try s.handleLine(l);
 }
 
+/// Each tool's fields, as its inputSchema lists them.
+const tool_fields = [_]struct { name: []const u8, fields: []const []const u8 }{
+    .{ .name = "cal_agenda", .fields = &.{ "from", "to", "calendar" } },
+    .{ .name = "cal_free", .fields = &.{ "from", "to", "minutes", "calendar" } },
+    .{ .name = "cal_event", .fields = &.{"id"} },
+    .{ .name = "cal_create", .fields = &.{ "calendar", "title", "start", "end", "minutes", "all_day", "place", "notes" } },
+    .{ .name = "cal_move", .fields = &.{ "id", "title", "from", "to", "minutes" } },
+    .{ .name = "cal_cancel", .fields = &.{ "id", "title", "start" } },
+    .{ .name = "cal_reply", .fields = &.{ "id", "title", "answer" } },
+};
+
+fn fieldsOf(name: []const u8) ?[]const []const u8 {
+    for (tool_fields) |x| if (eql(x.name, name)) return x.fields;
+    return null;
+}
+
+fn isWrite(name: []const u8) bool {
+    return !(eql(name, "cal_agenda") or eql(name, "cal_free") or eql(name, "cal_event"));
+}
+
+/// Why `args` don't fit tool `name`'s fields; null when they do (or there
+/// are none).
+fn fieldProblem(a: Allocator, name: []const u8, args: ?jv.Value, known: []const []const u8) !?[]const u8 {
+    const v = args orelse return null;
+    if (v != .object) return try std.fmt.allocPrint(a, "{s} takes an object of fields: {s}.", .{ name, try std.mem.join(a, ", ", known) });
+    var it = v.object.iterator();
+    while (it.next()) |e| {
+        for (known) |k| {
+            if (eql(k, e.key_ptr.*)) break;
+        } else return try std.fmt.allocPrint(a, "{s} has no field {s}; it takes {s}.", .{ name, e.key_ptr.*, try std.mem.join(a, ", ", known) });
+    }
+    return null;
+}
+
 fn toolsJson(gpa: Allocator, cfg: *const config.Config) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1268,6 +1308,37 @@ test "writes_refused_where_the_file_says_and_over_the_cap" {
     const third = try fx.call("cal_create", "{\"title\":\"Three\",\"start\":\"2026-11-28 20:00\"}");
     try tt.expectEqualStrings("Not changed: 2 changes in 24 hours is the limit (writes_per_day in the calendar file).", third.text);
     try expectIn(fx.logText(), "\"title\":\"Three\",\"result\":\"refused\"");
+}
+
+test "a_field_a_tool_does_not_take_is_refused" {
+    var fx: Fx = .{ .arena = undefined };
+    try fx.init("");
+    defer fx.deinit();
+    // location for place: nothing made, the place not silently lost
+    const before = try fx.call("cal_agenda", "{\"from\":\"2026-11-28\",\"to\":\"2026-11-29\"}");
+    const got = try fx.call("cal_create", "{\"title\":\"Party\",\"start\":\"2026-11-28 18:00\",\"location\":\"Kraków\"}");
+    try tt.expect(got.err);
+    try tt.expectEqualStrings("Not changed: cal_create has no field location; it takes calendar, title, start, end, minutes, all_day, place, notes.", got.text);
+    try tt.expectEqualStrings(before.text, (try fx.call("cal_agenda", "{\"from\":\"2026-11-28\",\"to\":\"2026-11-29\"}")).text);
+    try expectIn(fx.logText(), "\"tool\":\"cal_create\",\"calendar\":\"\",\"id\":\"\",\"title\":\"Party\",\"result\":\"refused\"");
+    // a read too, and arguments that aren't an object
+    const day = try fx.call("cal_agenda", "{\"day\":\"today\"}");
+    try tt.expect(day.err);
+    try tt.expectEqualStrings("cal_agenda has no field day; it takes from, to, calendar.", day.text);
+    const arr = try fx.call("cal_event", "[\"personal/dentist-1@calmcp-sim\"]");
+    try tt.expect(arr.err);
+    try tt.expectEqualStrings("cal_event takes an object of fields: id.", arr.text);
+    // the table is what tools/list says
+    const v = try fx.rpc("tools/list", "{}");
+    for (jv.arr(jv.at(v, &.{ "result", "tools" })).?) |t| {
+        var props: std.ArrayList([]const u8) = .empty;
+        var it = jv.at(t, &.{ "inputSchema", "properties" }).?.object.iterator();
+        while (it.next()) |e| try props.append(fx.arena.allocator(), e.key_ptr.*);
+        try tt.expectEqualDeep(fieldsOf(jv.str(jv.get(t, "name")).?).?, props.items);
+    }
+    // the fields it knows still work, and none at all where none is needed
+    try tt.expect(!(try fx.call("cal_agenda", "{}")).err);
+    try tt.expect(!(try fx.call("cal_create", "{\"title\":\"Party\",\"start\":\"2026-11-28 18:00\",\"place\":\"Kraków\",\"notes\":\"bring cake\"}")).err);
 }
 
 fn touchDentist(ctx: *anyopaque) void {
