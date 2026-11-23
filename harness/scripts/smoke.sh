@@ -754,9 +754,15 @@ EOF
 	for r in goodnight leaving arriving morning-home leak leak-fallback smoke door-open; do
 		n0=$(asked)
 		press on
-		[ "$r" = door-open ] || wait_asked_long $((n0 + 1))
+		wait_asked_long $((n0 + 1))
 	done
-	check "every routine the home has what for is on" 'wait_for "$OUT" "That'"'"'s all the routines: 7 on." 30 && [ -f "$BH/workflows/leak.wf" ] && grep -qF "fallback 5m" "$BH/workflows/leak.wf" && grep -qF "[leak-sink_leak]" "$BH/triggers.ini" && grep -qF "[smoke-kitchen_smoke_alarm]" "$BH/triggers.ini" && grep -qF "speakers = all" "$BH/triggers.ini" && grep -qF "[door-back_door]" "$BH/triggers.ini" && grep -qF "[workflow:arriving/heat]" "$BH/rules"'
+	# then the evening message and the butler's manner: Not now writes nothing
+	for r in evening manner; do
+		n0=$(asked)
+		press later
+		[ "$r" = manner ] || wait_asked_long $((n0 + 1))
+	done
+	check "every routine the home has what for is on" 'wait_for "$OUT" "That'"'"'s all the routines: 7 on." 30 && ! grep -q "^evening" "$BH/config.ini" && [ ! -e "$BH/agents/butler.md" ] && [ -f "$BH/workflows/leak.wf" ] && grep -qF "fallback 5m" "$BH/workflows/leak.wf" && grep -qF "[leak-sink_leak]" "$BH/triggers.ini" && grep -qF "[smoke-kitchen_smoke_alarm]" "$BH/triggers.ini" && grep -qF "speakers = all" "$BH/triggers.ini" && grep -qF "[door-back_door]" "$BH/triggers.ini" && grep -qF "[workflow:arriving/heat]" "$BH/rules"'
 	# the triggers' first polls only mark what is there
 	for tr in leak-sink_leak smoke-kitchen_smoke_alarm door-back_door everyone-left first-home; do
 		wait_for "$BH/state/triggers/$tr/state" "\"polled\":true" 20
