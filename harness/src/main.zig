@@ -265,6 +265,7 @@ const App = struct {
         // each provider in use without its key or url, said once
         const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), .{ .ctx = @constCast(&sec), .get = startKey });
         for (try startNotes(app.arena, &set, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model })) |n| complain("{s}", .{n});
+        if (try voiceStartNote(app.arena, &set, cfg.voice.provider)) |n| complain("{s}", .{n});
         const c = Core.open(app.gpa, app.io, app.home, sec) catch |e| {
             switch (e) {
                 error.AlreadyRunning => complain("harness is already running on {s}; talk to it there (or stop it first)", .{app.home}),
@@ -321,6 +322,14 @@ pub fn startNotes(a: std.mem.Allocator, set: *const model.Providers, values: []c
         }
     }
     return out.items;
+}
+
+/// The voice notes' service without its key, said at start; null when
+/// none is set or its key is there (or it needs none).
+pub fn voiceStartNote(a: std.mem.Allocator, set: *const model.Providers, provider: []const u8) !?[]const u8 {
+    const p = set.find(provider) orelse return null;
+    if (p.hasKey()) return null;
+    return try std.fmt.allocPrint(a, "note: no {s} key stored under \"{s}\"; voice notes will be refused. Run: harness secret add {s}", .{ p.name, p.key_name, p.key_name });
 }
 
 pub fn main(init: std.process.Init) u8 {
@@ -441,12 +450,13 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         // the keys of the other providers in use or with a section
         const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), model.no_keys);
         const used = try set.used(app.arena, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model });
+        const voice_service = set.find(cfg.voice.provider);
         for (set.list) |*p| {
             if (std.mem.eql(u8, p.name, "omnigate") or p.auth == .none) continue;
             const has_section = for (cfg.providers) |sec| {
                 if (std.mem.eql(u8, sec.name, p.name)) break true;
             } else false;
-            if (std.mem.indexOfScalar(*const model.Provider, used, p) == null and !has_section) continue;
+            if (std.mem.indexOfScalar(*const model.Provider, used, p) == null and !has_section and voice_service != p) continue;
             const v = s.get(app.io, app.arena, p.key_name) catch null;
             try outPrint(app.io, "{s} ({s} key): {s}\n", .{ p.key_name, p.name, if (v != null) "stored" else "not stored" });
         }
@@ -882,7 +892,7 @@ const TgChan = struct {
         if (place.chat == 0) return error.NotPaired;
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
-        return tc.send_bot.sendDocument(place.chat, place.thread, name, data) catch |e| {
+        return tc.send_bot.sendDocumentAs(place.chat, place.thread, name, data, .{ .quiet = place.quiet }) catch |e| {
             complain("telegram: sending a file failed: {s}", .{@errorName(e)});
             return if (e == error.TelegramRefused and place.thread != 0) error.TopicRefused else e;
         };
@@ -2529,6 +2539,7 @@ test {
     _ = @import("workflows.zig");
     _ = @import("wstate.zig");
     _ = @import("voice.zig");
+    _ = @import("quiet.zig");
 }
 
 test "a_line_of_ctrl_d_leaves_the_chat_in_a_windows_console" {
@@ -2777,6 +2788,22 @@ test "start_notes_name_each_provider_in_use_without_its_key" {
     const on = try startNotes(a, &os, &.{ o.model.model, o.model.worker_model, o.model.memory_model });
     try t.expectEqual(1, on.len);
     try t.expectEqualStrings("note: no openrouter key stored under \"openrouter\"; model calls will be refused. Run: harness secret add openrouter", on[0]);
+}
+
+test "a_voice_service_without_its_key_is_named_at_start" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g = try config.parse(a, "[voice]\nprovider = groq\nmodel = whisper-large-v3-turbo\n[provider groq]\napi = openai\nurl = https://api.groq.com/openai/v1\n");
+    const gs = try model.Providers.resolve(a, config.providerSettings(g), model.no_keys);
+    try t.expectEqualStrings("note: no groq key stored under \"groq\"; voice notes will be refused. Run: harness secret add groq", (try voiceStartNote(a, &gs, g.voice.provider)).?);
+    // a local server needs none; no [voice], nothing to say
+    const l = try config.parse(a, "[voice]\nprovider = whisper\nmodel = m\n[provider whisper]\napi = openai\nurl = http://127.0.0.1:8090/v1\nauth = none\n");
+    const ls = try model.Providers.resolve(a, config.providerSettings(l), model.no_keys);
+    try t.expect((try voiceStartNote(a, &ls, l.voice.provider)) == null);
+    const d = try config.parse(a, "");
+    const ds = try model.Providers.resolve(a, config.providerSettings(d), model.no_keys);
+    try t.expect((try voiceStartNote(a, &ds, d.voice.provider)) == null);
 }
 
 test "mcp_commands_take_their_arguments" {

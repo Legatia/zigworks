@@ -251,6 +251,11 @@ pub const Bot = struct {
     /// Sends `data` as a document called `name` (multipart); returns the
     /// message id.
     pub fn sendDocument(b: *Bot, chat_id: i64, thread: i64, name: []const u8, data: []const u8) !i64 {
+        return b.sendDocumentAs(chat_id, thread, name, data, .{});
+    }
+
+    /// `sendDocument`, without a sound when `opts.quiet`.
+    pub fn sendDocumentAs(b: *Bot, chat_id: i64, thread: i64, name: []const u8, data: []const u8, opts: Opts) !i64 {
         var arena: std.heap.ArenaAllocator = .init(b.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -260,6 +265,7 @@ pub const Bot = struct {
         var parts: std.ArrayList(http.Part) = .empty;
         try parts.append(a, .{ .name = "chat_id", .value = try std.fmt.allocPrint(a, "{d}", .{chat_id}) });
         if (thread != 0) try parts.append(a, .{ .name = "message_thread_id", .value = try std.fmt.allocPrint(a, "{d}", .{thread}) });
+        if (opts.quiet) try parts.append(a, .{ .name = "disable_notification", .value = "true" });
         try parts.append(a, .{ .name = "document", .value = data, .filename = name });
         const body = try http.multipart(a, boundary, parts.items);
         const ct = try std.fmt.allocPrint(a, "multipart/form-data; boundary={s}", .{boundary});
@@ -606,6 +612,26 @@ test "documents_are_sent_as_multipart" {
     try t.expect(std.mem.indexOf(u8, mp, "filename=\"abc.txt\"") != null);
     try t.expect(std.mem.startsWith(u8, mp, "--BOUNDARY\r\n"));
     try t.expect(std.mem.endsWith(u8, mp, "--BOUNDARY--\r\n"));
+}
+
+test "a_document_can_go_without_a_sound" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    var b = try Bot.init(t.allocator, t.io, try e.url(), "123:abc");
+    defer b.deinit();
+    _ = try b.sendDocumentAs(42, 0, "report.csv", "a,b\n", .{ .quiet = true });
+    _ = try b.sendDocument(42, 0, "loud.csv", "c,d\n");
+    const out = try outbox(&e);
+    const quiet_at = std.mem.indexOf(u8, out, "report.csv").?;
+    const loud_at = std.mem.indexOf(u8, out, "loud.csv").?;
+    const mark = "name=\\\"disable_notification\\\"\\r\\n\\r\\ntrue";
+    const found = std.mem.indexOf(u8, out, mark) orelse {
+        std.debug.print("no {s} in:\n{s}\n", .{ mark, out });
+        return error.TestUnexpectedResult;
+    };
+    try t.expect(found < loud_at and quiet_at < loud_at);
+    try t.expectEqual(1, std.mem.count(u8, out, "disable_notification"));
 }
 
 test "long_text_split_at_4096_on_line_breaks" {

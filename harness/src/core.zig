@@ -43,6 +43,7 @@ const sources = @import("sources.zig");
 const workflows = @import("workflows.zig");
 const wstate = @import("wstate.zig");
 const voice_mod = @import("voice.zig");
+const quiet_mod = @import("quiet.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -567,6 +568,9 @@ pub const Core = struct {
     busy: std.atomic.Value(bool) = .init(false),
     /// What waits for the owner (state/inbox).
     inbox: inbox_mod.Box,
+    /// Quiet hours: what is held for the digest, /quiet's switch, the
+    /// urgent triggers and workflows (state/quiet).
+    quiet: quiet_mod.Store,
     /// No one is left to answer (the terminal's input ended): nothing more
     /// is asked.
     questions_closed: std.atomic.Value(bool) = .init(false),
@@ -776,6 +780,11 @@ pub const Core = struct {
         c.questions_closed = .init(false);
         c.start_edits = .empty;
         c.inbox.load(c.paths.approvals) catch |e| c.log.write(.inbox, false, .{ .event = "not read", .why = @errorName(e) }) catch {};
+        // what quiet hours held, kept across a restart
+        c.quiet = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "quiet" }));
+        errdefer c.quiet.deinit();
+        c.quiet.load() catch |e| c.log.write(.chat, false, .{ .event = "quiet not read", .why = @errorName(e) }) catch {};
+        c.noteUrgent();
         c.voidRunItems();
         c.loadRan();
         c.syncTrigInfo();
@@ -836,6 +845,7 @@ pub const Core = struct {
         for (c.start_edits.items) |e| c.gpa.free(e.text);
         c.start_edits.deinit(c.gpa);
         c.inbox.deinit();
+        c.quiet.deinit();
         c.summary_job.deinit(c.gpa);
         for (c.contexts.items) |x| c.freeContext(x);
         c.contexts.deinit(c.gpa);
@@ -1041,6 +1051,7 @@ pub const Core = struct {
         c.wf_arena.deinit();
         c.wf_arena = .init(c.gpa);
         c.syncTrigInfo();
+        c.noteUrgent();
         c.gate.rules = c.rule_list;
         c.gate.folders = c.folderRoles();
         c.snaps.total_mb = c.cfg.limits.snapshot_mb;
@@ -1662,6 +1673,239 @@ pub const Core = struct {
         if (!c.replyAnswer(job.conv, job.chat, job.reply_to, text)) c.queueMessage(job.conv, text, voice_context) catch {};
     }
 
+    // ---- quiet hours ----
+
+    /// The urgent triggers and workflows the holds decide by, made again
+    /// from the lists as they are now (at open, /reload, a change made at
+    /// once, and each tick: under settings_mutex, or before anything runs).
+    fn noteUrgent(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var names: std.ArrayList([]const u8) = .empty;
+        for (c.trig_list) |tr| if (tr.urgent) names.append(a, std.fmt.allocPrint(a, "trigger:{s}", .{tr.name}) catch return) catch return;
+        for (c.wf_defs) |w| if (w.urgent) names.append(a, std.fmt.allocPrint(a, "workflow:{s}", .{w.name}) catch return) catch return;
+        c.quiet.setUrgent(names.items) catch {};
+    }
+
+    /// When quiet hours end, when what `by` started is held now: a run
+    /// nobody waits on (a schedule, a trigger, a workflow), not urgent, in
+    /// quiet hours, and not a one-off command run by hand; null: it goes.
+    fn quietEnd(c: *Core, by: []const u8) ?i64 {
+        if (!(who_mod.Who{ .by = by }).unattended()) return null;
+        if (c.byHand()) return null;
+        const hours = c.quiet.effective(c.cfg.butler.quiet) orelse return null;
+        const now_s = c.now();
+        if (!hours.inside(quiet_mod.minuteOf(now_s, c.cfg.chat.utc_offset))) return null;
+        if (c.quiet.isUrgent(by)) return null;
+        return quiet_mod.endAfter(hours, now_s, c.cfg.chat.utc_offset);
+    }
+
+    /// `harness task run`, `brief`, `trigger run`, `workflow start`: the
+    /// owner ran it by hand and reads it in the terminal now.
+    fn byHand(c: *const Core) bool {
+        for ([_][]const u8{ "brief", "task", "trigger", "workflow" }) |r| if (std.mem.eql(u8, c.role, r)) return true;
+        return false;
+    }
+
+    /// Holds run `o`'s post `p` (as it would have gone: `text`, its quick
+    /// replies, its Undo) for the digest, written first; the run is told
+    /// it waits until `end`. Null when it could not be kept: it goes now.
+    fn holdPost(c: *Core, a: std.mem.Allocator, o: *const RunOut, p: *const agent.Post, text: []const u8, undo: ?[2][]const u8, end: i64) ?agent.Delivery {
+        const r = o.run orelse return null;
+        const masked = c.masks.scrubAlloc(a, text) catch return null;
+        const id = c.quiet.hold(.{
+            .at = c.now(),
+            .conv = p.to,
+            .by = r.who.by,
+            .agent = o.agent,
+            .rid = r.rid,
+            .text = masked,
+            .buttons = p.buttons,
+            .undo = if (undo) |u| u[1] else "",
+            .private = r.isPrivate() or c.convPrivate(p.to),
+        }) catch |e| {
+            c.log.write(.chat, false, .{ .event = "not held", .conversation = p.to, .by = r.who.by, .why = @errorName(e) }) catch {};
+            return null;
+        };
+        c.log.write(.chat, false, .{ .event = "held", .id = id, .conversation = p.to, .by = r.who.by }) catch {};
+        var buf: [8]u8 = undefined;
+        return .{ .status = .digest, .why = std.fmt.allocPrint(a, "quiet hours, in the digest at {s}", .{quiet_mod.clock(&buf, end, c.cfg.chat.utc_offset)}) catch "quiet hours, in the digest at their end" };
+    }
+
+    /// Holds item `id` for the digest when a run nobody waits on made it
+    /// in quiet hours: not shown now, its expiry moved on by the time to
+    /// their end (Ruling 14). False: it is shown now.
+    fn holdItem(c: *Core, id: u64) bool {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const Got = struct { by: []const u8, conv: []const u8, title: []const u8, agent: []const u8, rid: u64, private: bool };
+        const got: Got = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = c.inbox.find(id) orelse return false;
+            if (it.status != .open) return false;
+            break :blk .{
+                .by = a.dupe(u8, it.by) catch return false,
+                .conv = a.dupe(u8, it.conversation) catch return false,
+                .title = a.dupe(u8, it.title) catch return false,
+                .agent = a.dupe(u8, it.agent orelse "") catch return false,
+                .rid = it.rid orelse 0,
+                .private = it.private,
+            };
+        };
+        const end = c.quietEnd(got.by) orelse return false;
+        const now_s = c.now();
+        const hid = c.quiet.hold(.{ .at = now_s, .conv = got.conv, .by = got.by, .agent = got.agent, .rid = got.rid, .text = got.title, .item = id, .private = got.private }) catch return false;
+        {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            if (c.inbox.find(id)) |it| if (it.expires != 0) {
+                it.expires += end - now_s;
+                c.saveInbox();
+            };
+        }
+        c.log.write(.chat, false, .{ .event = "held", .id = hid, .conversation = got.conv, .by = got.by, .item = id }) catch {};
+        return true;
+    }
+
+    /// Where held item `id` is now.
+    const ItemNow = enum { waiting, shown, closed };
+
+    fn itemNow(c: *Core, id: u64) ItemNow {
+        c.inbox.mutex.lockUncancelable(c.io);
+        defer c.inbox.mutex.unlock(c.io);
+        const it = c.inbox.find(id) orelse return .closed;
+        if (it.status != .open) return .closed;
+        return if (it.shown.items.len > 0) .shown else .waiting;
+    }
+
+    /// Out of quiet hours with something held (Ruling 13): a digest per
+    /// conversation, a line each, oldest first; then what follows it
+    /// whole, without a sound. A digest that did not go is tried again a
+    /// minute later.
+    fn quietDue(c: *Core, now_s: i64) void {
+        if (c.quiet.count() == 0 or c.chan == null) return;
+        if (c.quiet.effective(c.cfg.butler.quiet)) |h| if (h.inside(quiet_mod.minuteOf(now_s, c.cfg.chat.utc_offset))) return;
+        if (util.nowMs(c.io) < c.quiet.retry_ms) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const held = c.quiet.list(a) catch return;
+        // the conversations, in the order of their oldest
+        var convs: std.ArrayList([]const u8) = .empty;
+        for (held) |h| {
+            for (convs.items) |cv| {
+                if (std.mem.eql(u8, cv, h.conv)) break;
+            } else convs.append(a, h.conv) catch return;
+        }
+        const hours = c.quiet.hoursSet(c.cfg.butler.quiet);
+        for (convs.items) |conv| {
+            var said: std.ArrayList(quiet_mod.Held) = .empty;
+            var ids: std.ArrayList(u64) = .empty;
+            var follow: std.ArrayList(quiet_mod.Held) = .empty;
+            for (held) |h_in| {
+                if (!std.mem.eql(u8, h_in.conv, conv)) continue;
+                var h = h_in;
+                if (h.item != 0) switch (c.itemNow(h.item)) {
+                    // answered meanwhile (/inbox, /answer): nothing to say
+                    .closed => {
+                        c.quiet.remove(h.id) catch {};
+                        continue;
+                    },
+                    // shown with Show meanwhile: said, not shown again
+                    .shown => {
+                        c.quiet.remove(h.id) catch {};
+                        if (h.listed) continue;
+                        h.item = 0;
+                        said.append(a, h) catch return;
+                        continue;
+                    },
+                    .waiting => {},
+                };
+                if (!h.listed) {
+                    said.append(a, h) catch return;
+                    ids.append(a, h.id) catch return;
+                }
+                if (h.follows()) follow.append(a, h) catch return;
+            }
+            if (said.items.len > 0) {
+                c.ensureTopic(a, conv);
+                const text = quiet_mod.digestText(a, said.items, hours, c.cfg.chat.utc_offset) catch return;
+                const sent = c.sendText(conv, text) catch |e| {
+                    c.quiet.retry_ms = util.nowMs(c.io) + 60_000;
+                    c.log.write(.chat, false, .{ .event = "digest not delivered", .conversation = conv, .why = whyUndelivered(e) }) catch {};
+                    return;
+                };
+                c.touch(conv);
+                c.quiet.listed(ids.items) catch |e| c.log.write(.chat, false, .{ .event = "quiet not written", .why = @errorName(e) }) catch {};
+                c.log.write(.chat, false, .{ .event = "digest", .conversation = conv, .lines = said.items.len, .message = sent.first }) catch {};
+            }
+            for (follow.items) |h| {
+                c.release(a, h);
+                c.quiet.remove(h.id) catch |e| c.log.write(.chat, false, .{ .event = "quiet not written", .why = @errorName(e) }) catch {};
+            }
+        }
+    }
+
+    /// What follows a digest: a held question shown, a held post sent as
+    /// it would have gone; without a sound. A post that does not get
+    /// through is kept as a delivery item.
+    fn release(c: *Core, a: std.mem.Allocator, h: quiet_mod.Held) void {
+        if (h.item != 0) {
+            const shown = c.showItemHow(h.item, null, true);
+            c.log.write(.chat, false, .{ .event = "released", .id = h.id, .item = h.item, .shown = shown }) catch {};
+            return;
+        }
+        const undo: ?[2][]const u8 = if (h.undo.len > 0) .{ undo_mod.label, h.undo } else null;
+        const sending = if (h.buttons.len > 0 or undo != null) c.sendWithButtons(a, h.conv, h.agent, h.text, h.buttons, undo, true) else c.sendTextAs(h.conv, h.text, true);
+        if (sending) |sent| {
+            c.touch(h.conv);
+            c.log.write(.chat, false, .{ .event = "released", .id = h.id, .message = sent.first }) catch {};
+        } else |e| {
+            const item = c.keepDelivery(.{ .to = h.conv, .text = h.text, .retry = worthRetry(e), .who = .{ .by = h.by, .agent = h.agent }, .rid = h.rid, .private = h.private });
+            c.log.write(.chat, false, .{ .event = "released", .id = h.id, .delivered = false, .why = whyUndelivered(e), .item = item }) catch {};
+        }
+    }
+
+    /// `/quiet`: the hours and what is held; `/quiet on|off`; `/quiet
+    /// HH:MM-HH:MM`: other hours, on.
+    fn quietCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        if (rest.len == 0) return c.quietText(a);
+        const usage = "Use /quiet, /quiet on, /quiet off, or /quiet 22:00-07:00 for other hours.";
+        const on = !std.mem.eql(u8, rest, "off");
+        const hours: ?config.Quiet = if (!on or std.mem.eql(u8, rest, "on")) null else config.parseQuiet(rest) catch return usage;
+        c.quiet.setSwitch(on, hours) catch |e| return std.fmt.allocPrint(a, "Not changed: state/quiet could not be written ({s}).", .{@errorName(e)});
+        var hb: [24]u8 = undefined;
+        const now_hours = c.quiet.effective(c.cfg.butler.quiet);
+        try c.log.write(.config, false, .{ .event = "quiet", .on = on, .hours = if (now_hours) |h| quiet_mod.hoursText(&hb, h) else null });
+        if (!on) return if (c.quiet.count() > 0) "Quiet hours off; what was held comes now." else "Quiet hours off.";
+        return std.fmt.allocPrint(a, "Quiet hours on: {s}.", .{quiet_mod.hoursText(&hb, now_hours.?)});
+    }
+
+    /// The hours, whether it is quiet now, and what is held.
+    fn quietText(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        const now_s = c.now();
+        const off = c.cfg.chat.utc_offset;
+        var out: std.ArrayList(u8) = .empty;
+        const held = try c.quiet.list(a);
+        const hours = c.quiet.effective(c.cfg.butler.quiet) orelse {
+            try out.appendSlice(a, "Quiet hours are off. /quiet on holds the posts of schedules, triggers and workflows from 22:00 to 07:00 for a digest at the end; /quiet 23:00-06:30 sets other hours.");
+            if (held.len > 0) try out.print(a, "\nHeld, going now ({d}):\n{s}", .{ held.len, try quiet_mod.lines(a, held, off, false) });
+            return out.items;
+        };
+        var hb: [24]u8 = undefined;
+        if (hours.inside(quiet_mod.minuteOf(now_s, off))) {
+            var cb: [8]u8 = undefined;
+            try out.print(a, "Quiet hours: {s}, quiet now until {s}.", .{ quiet_mod.hoursText(&hb, hours), quiet_mod.clock(&cb, quiet_mod.endAfter(hours, now_s, off), off) });
+        } else try out.print(a, "Quiet hours: {s}, not quiet now.", .{quiet_mod.hoursText(&hb, hours)});
+        if (held.len == 0) {
+            try out.appendSlice(a, "\nNothing is held.");
+        } else try out.print(a, "\nHeld for the digest ({d}):\n{s}", .{ held.len, try quiet_mod.lines(a, held, off, false) });
+        return out.items;
+    }
+
     /// A button press (`data`) in message `message_id` of the owner's
     /// private chat.
     pub fn handleCallback(c: *Core, from_id: i64, message_id: i64, data: []const u8) void {
@@ -1771,9 +2015,10 @@ pub const Core = struct {
     /// Sends a post with quick replies (and `extra`, a run's Undo) to
     /// `conv`: the text in messages of 4096 bytes, the buttons on the last;
     /// the post is noted so a press of a quick reply counts.
-    fn sendWithButtons(c: *Core, a: std.mem.Allocator, conv: []const u8, agent_name: []const u8, text_in: []const u8, labels: []const []const u8, extra: ?[2][]const u8) !Sent {
+    fn sendWithButtons(c: *Core, a: std.mem.Allocator, conv: []const u8, agent_name: []const u8, text_in: []const u8, labels: []const []const u8, extra: ?[2][]const u8, quiet: bool) !Sent {
         const ch = c.chan orelse return error.NoChannel;
-        const r = try c.placeOf(a, conv);
+        var r = try c.placeOf(a, conv);
+        r.place.quiet = quiet;
         const text = if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text_in }) else text_in;
         const n = if (labels.len > 0) try c.quickPost(conv, agent_name, labels, text_in) else 0;
         const bs = try a.alloc([2][]const u8, labels.len + @intFromBool(extra != null));
@@ -1817,13 +2062,24 @@ pub const Core = struct {
     /// an error) to `conv`: with what the run changed and Undo, as its
     /// reply would have been.
     fn sendRunEnd(c: *Core, run: *const agent.Run, conv: []const u8, text: []const u8) !void {
-        if (run.changed.files == 0) return c.deliverIn(conv, text);
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
+        // quiet hours: held for the digest, as the run's post would be (one
+        // that can't be kept goes now)
+        if (c.quietEnd(run.who.by)) |_| held: {
+            const u: UndoParts = if (run.changed.files > 0) try c.undoParts(a, text, &run.changed) else .{ .text = text };
+            const id = c.quiet.hold(.{ .at = c.now(), .conv = conv, .by = run.who.by, .agent = run.who.agent, .rid = run.rid, .text = try c.masks.scrubAlloc(a, u.text), .undo = if (u.button) |b| b[1] else "", .private = run.isPrivate() or c.convPrivate(conv) }) catch |e| {
+                c.log.write(.chat, false, .{ .event = "not held", .conversation = conv, .by = run.who.by, .why = @errorName(e) }) catch {};
+                break :held;
+            };
+            c.log.write(.chat, false, .{ .event = "held", .id = id, .conversation = conv, .by = run.who.by }) catch {};
+            return;
+        }
+        if (run.changed.files == 0) return c.deliverIn(conv, text);
         const u = try c.undoParts(a, text, &run.changed);
         if (u.button) |b| {
-            _ = try c.sendWithButtons(a, conv, "", u.text, &.{}, b);
+            _ = try c.sendWithButtons(a, conv, "", u.text, &.{}, b, false);
         } else try c.deliverIn(conv, u.text);
     }
 
@@ -2167,6 +2423,13 @@ pub const Core = struct {
     /// quietly unless a run or a workflow waits on it; the message is added
     /// to its `shown`. False when it could not be shown.
     fn showItem(c: *Core, id: u64, at: ?[]const u8) bool {
+        // quiet hours: a question of a run nobody waits on waits for the digest
+        if (at == null and c.holdItem(id)) return true;
+        return c.showItemHow(id, at, false);
+    }
+
+    /// `showItem`, without a sound when `hush` (after the digest).
+    fn showItemHow(c: *Core, id: u64, at: ?[]const u8, hush: bool) bool {
         const ch = c.chan orelse return false;
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
@@ -2188,7 +2451,7 @@ pub const Core = struct {
             }
             bs = list;
             conv = a.dupe(u8, at orelse it.conversation) catch return false;
-            quiet = std.mem.eql(u8, it.waiter, "harness");
+            quiet = hush or std.mem.eql(u8, it.waiter, "harness");
             it.showing = true;
         }
         const where = c.placeOf(a, if (c.isShared(conv)) "main" else conv) catch return c.notShown(id);
@@ -3361,6 +3624,9 @@ pub const Core = struct {
         /// The run that posts (a post that did not get through is kept as
         /// its item).
         run: ?*const agent.Run = null,
+        /// The owner asked for it now (/brief, /trigger run): its posts
+        /// go in quiet hours too.
+        asked: bool = false,
 
         fn outbox(o: *RunOut) agent.Outbox {
             return .{ .ctx = o, .find = find, .names = names, .post = post };
@@ -3402,8 +3668,11 @@ pub const Core = struct {
         /// A brief's links, seen once it is delivered.
         links: []const []const u8 = &.{},
         /// How the reply went, and why when it did not.
-        outcome: enum { none, sent, kept, failed, silent, held } = .none,
+        outcome: enum { none, sent, kept, failed, silent, held, digest } = .none,
         why: []const u8 = "",
+        /// `why`'s own bytes: a final `send` is posted in its turn's arena,
+        /// gone by the time the task reads how its reply went.
+        why_buf: [200]u8 = undefined,
     };
 
     /// A task's or brief's reply as it is posted: its tag in front, what it
@@ -3468,10 +3737,13 @@ pub const Core = struct {
                 .sent => .sent,
                 .kept => .kept,
                 .held => .held,
+                .digest => .digest,
                 .silent => .silent,
                 .failed => .failed,
             };
-            x.why = d.why;
+            const w = util.cut(d.why, x.why_buf.len);
+            @memcpy(x.why_buf[0..w.len], w);
+            x.why = x.why_buf[0..w.len];
         }
         return d;
     }
@@ -3483,9 +3755,13 @@ pub const Core = struct {
         // a run that changed files: what it changed at the end, and Undo
         const undo = if (p.changed) |ch| c.undoParts(a, shaped, ch) catch UndoParts{ .text = shaped } else UndoParts{ .text = shaped };
         const text = undo.text;
+        // quiet hours: held for the digest; one with files goes, without a sound
+        const end = if (o.asked) null else if (o.run) |r| c.quietEnd(r.who.by) else null;
+        if (end) |e| if (p.files.len == 0) if (c.holdPost(a, o, p, text, undo.button, e)) |d| return d;
+        const hush = end != null;
         c.ensureTopic(a, p.to);
         if (c.overHourly(a, p.to)) |why| return .{ .status = .held, .why = why };
-        const sending = if (p.buttons.len > 0 or undo.button != null) c.sendWithButtons(a, p.to, o.agent, text, p.buttons, undo.button) else c.sendText(p.to, text);
+        const sending = if (p.buttons.len > 0 or undo.button != null) c.sendWithButtons(a, p.to, o.agent, text, p.buttons, undo.button, hush) else c.sendTextAs(p.to, text, hush);
         const sent = sending catch |e| {
             // kept as an item, to be sent again as it is: nothing runs again for it
             const r = o.run;
@@ -3506,7 +3782,7 @@ pub const Core = struct {
         c.touch(p.to);
         var d: agent.Delivery = .{ .status = .sent, .message = sent.first, .parts = sent.count };
         for (p.files) |f| {
-            c.sendFile(a, p.to, f) catch |e| {
+            c.sendFile(a, p.to, f, hush) catch |e| {
                 d.status = .failed;
                 d.why = std.fmt.allocPrint(a, "{s} was not delivered ({s})", .{ f.name, whyUndelivered(e) }) catch "a file was not delivered";
                 return d;
@@ -3517,11 +3793,13 @@ pub const Core = struct {
     }
 
     /// Sends a file of a post to conversation `conv`'s place, as a document.
-    fn sendFile(c: *Core, a: std.mem.Allocator, conv: []const u8, f: agent.Attachment) !void {
+    fn sendFile(c: *Core, a: std.mem.Allocator, conv: []const u8, f: agent.Attachment, quiet: bool) !void {
         const ch = c.chan orelse return error.NoChannel;
         const doc = ch.document orelse return error.NoFiles;
         const r = try c.placeOf(a, conv);
-        _ = try doc(ch.ctx, r.place, f.name, f.data);
+        var place = r.place;
+        place.quiet = quiet;
+        _ = try doc(ch.ctx, place, f.name, f.data);
     }
 
     /// Why a post to `conv` is not sent now: it would be over
@@ -3961,12 +4239,15 @@ pub const Core = struct {
         // the network: outside the settings lock)
         c.expireDue(now_s);
         c.remindDue(now_s);
+        // quiet hours over: what they held, a digest per conversation
+        c.quietDue(now_s);
         // due triggers are polled, one at a time, on a thread of their own
         if (c.poller_on) c.startPoller(now_s);
         // the daily summaries, where triggers are polled, on a thread of their own
         if (c.poller_on) c.summariesDue(now_s);
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
+        c.noteUrgent();
         // posts that did not get through go again when their wait is over
         c.resendDue(now_s);
         for (c.briefs) |b| c.briefIfDue(b, now_s, false);
@@ -4357,7 +4638,9 @@ pub const Core = struct {
         // posted to its `to` the way a reply is: through the gate, with its
         // name in front; kept when it did not get through
         var sched: Sched = .{ .keep = keep, .links = w.links };
-        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{b.name}), .sched = &sched, .run = &run };
+        // /brief: the owner asked for it now
+        const asked = if (keep) |k| std.mem.startsWith(u8, k.key, "brief-now:") else false;
+        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{b.name}), .sched = &sched, .run = &run, .asked = asked };
         run.outbox = out.outbox();
         const got = try agent.postReply(&run, a, w.text);
         if (got.refused) |why| {
@@ -4366,7 +4649,8 @@ pub const Core = struct {
             return .done;
         }
         switch (sched.outcome) {
-            .sent => {
+            // held for the digest: it will be posted as it is
+            .sent, .digest => {
                 try c.markSeen(w.links);
                 return .done;
             },
@@ -4658,6 +4942,7 @@ pub const Core = struct {
         // the watcher takes triggers.ini as it is now
         std.crypto.hash.sha2.Sha256.hash(text, &c.settings_hashes[7], .{});
         c.syncTrigInfo();
+        c.noteUrgent();
         return null;
     }
 
@@ -5718,7 +6003,7 @@ pub const Core = struct {
         }
         if (take.items.len == 0) return;
         switch (tr.action) {
-            .say => |template| try c.triggerSay(a, tr, template, take.items),
+            .say => |template| try c.triggerSay(a, tr, template, take.items, by_hand),
             .do => |instruction| try c.triggerDo(a, tr, instruction, take.items, by_hand),
             .start => |wf| try c.triggerStart(a, tr, wf, take.items),
             // what it found is for workflows that wait on it (none yet)
@@ -5828,7 +6113,6 @@ pub const Core = struct {
     /// and keeps them; stopped because harness stops, they wait for the
     /// run after the restart, which is told so.
     fn triggerDo(c: *Core, a: std.mem.Allocator, tr: triggers.Trigger, instruction: []const u8, events: []const tstate.Event, by_hand: bool) !void {
-        _ = by_hand;
         // its definition as it is now; the settings checked that there is one
         const def = (try c.defs.get(a, tr.agent)) orelse {
             try c.log.write(.trigger, false, .{ .name = tr.name, .event = "failed", .why = "its agent is not defined", .agent = tr.agent });
@@ -5878,7 +6162,7 @@ pub const Core = struct {
         var notify: Notify = .{ .core = c, .conv = tr.to };
         run.notice = .{ .ctx = &notify, .say = Notify.say };
         var sched: Sched = .{ .skipped = &skipped };
-        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{tr.name}), .agent = def.name, .sched = &sched, .run = &run };
+        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{tr.name}), .agent = def.name, .sched = &sched, .run = &run, .asked = by_hand };
         run.outbox = out.outbox();
         run.context_note = c.contextNote(a, tr.to) catch "";
         var conv: agent.Conversation = .init(c.gpa);
@@ -5936,7 +6220,7 @@ pub const Core = struct {
     /// message with `[NAME] ` in front, posted to `to` through the gate as
     /// a send by `trigger:NAME`; no model call. Its events are done once
     /// it was posted or kept as a delivery item (R9).
-    fn triggerSay(c: *Core, a: std.mem.Allocator, tr: triggers.Trigger, template: []const u8, events: []const tstate.Event) !void {
+    fn triggerSay(c: *Core, a: std.mem.Allocator, tr: triggers.Trigger, template: []const u8, events: []const tstate.Event, by_hand: bool) !void {
         var text: std.ArrayList(u8) = .empty;
         for (events) |ev| {
             if (text.items.len > 0) try text.append(a, '\n');
@@ -5950,12 +6234,12 @@ pub const Core = struct {
         defer c.unregister(&flag);
         var run = c.runIn(&client, try std.fmt.allocPrint(a, "trigger {s}", .{tr.name}), .{ .by = try std.fmt.allocPrint(a, "trigger:{s}", .{tr.name}), .agent = tr.agent }, tr.to, &flag);
         var sched: Sched = .{};
-        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{tr.name}), .agent = tr.agent, .sched = &sched, .run = &run };
+        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{tr.name}), .agent = tr.agent, .sched = &sched, .run = &run, .asked = by_hand };
         run.outbox = out.outbox();
         try run.logRun(.trigger, false, .{ .name = tr.name, .event = "start", .events = try idsOf(a, events) });
         const got = try agent.postReply(&run, a, text.items);
         const why: ?[]const u8 = if (got.refused) |w| w else switch (sched.outcome) {
-            .sent, .kept => null,
+            .sent, .kept, .digest => null,
             else => if (sched.why.len > 0) sched.why else null,
         };
         if (got.refused) |w| c.say(try std.fmt.allocPrint(a, "The message of trigger {s} was not posted: {s}.", .{ tr.name, w }));
@@ -6634,6 +6918,7 @@ pub const Core = struct {
         kept = true;
         c.wf_defs = wr.list;
         c.wf_hash = wr.hash;
+        c.noteUrgent();
         return null;
     }
 
@@ -6972,6 +7257,7 @@ pub const Core = struct {
         \\/envs: where commands can run (environments.ini)
         \\/env check NAME: what a sandbox can read, write and reach
         \\/env rm NAME: remove an environment's home, snapshots and access
+        \\/quiet [on|off|22:00-07:00]: quiet hours, and what they hold for the digest
         \\/dryrun on|off: money tools are not called while on
         \\/reload: apply changed settings files
         \\/conversations: where you and the agent talk
@@ -7150,6 +7436,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/changes")) return c.changesCommand(a, rest);
         if (eql(u8, cmd, "/restore")) return c.restoreCommand(a, rest);
         if (eql(u8, cmd, "/undo")) return c.undoCommand(a, conv, rest);
+        if (eql(u8, cmd, "/quiet")) return c.quietCommand(a, rest);
         if (eql(u8, cmd, "/envs")) return c.envsText(a);
         if (eql(u8, cmd, "/env")) return c.envCommand(a, rest);
         if (eql(u8, cmd, "/agents")) return c.agentsText(a);
@@ -8722,7 +9009,7 @@ const InstRun = struct {
         if (r.flag.load(.acquire)) return .stopped;
         if (got.refused) |why| return .{ .failed = .{ .why = why, .retry = false } };
         return switch (got.delivery.status) {
-            .sent, .kept => .{ .ok = null },
+            .sent, .kept, .digest => .{ .ok = null },
             else => .{ .failed = .{ .why = if (got.delivery.why.len > 0) got.delivery.why else "it was not sent" } },
         };
     }
@@ -16172,4 +16459,244 @@ test "a_private_conversations_voice_note_logs_no_words" {
     const lt = try logText(&f);
     try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"voice note\"") != null);
     try t.expect(std.mem.indexOf(u8, lt, "secret plan") == null);
+}
+
+// ---- quiet hours and the digest ----
+
+/// 00:00 of a day to come (UTC, the tests' owner time), so a time of it
+/// is in the future.
+fn quietDay() i64 {
+    return (@divFloor(util.nowSeconds(t.io), 86400) + 1) * 86400;
+}
+
+/// The schedule of triggers.ini or task called `name`.
+fn taskNamed(c: *Core, name: []const u8) !config.Task {
+    for (c.tasks) |tk| if (std.mem.eql(u8, tk.name, name)) return tk;
+    for (c.trig_tasks) |tk| if (std.mem.eql(u8, tk.name, name)) return tk;
+    return error.TestUnexpectedResult;
+}
+
+const quiet_tasks = "[nightly]\nat = 23:59\ndo = Check the backups.\n[broken]\nat = 23:59\ndo = Check the router.\n";
+
+test "a_non_urgent_post_in_quiet_hours_waits_for_the_digest" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", quiet_tasks);
+    defer f.deinit();
+    const day0 = quietDay();
+    f.core.fixed_now = day0 + 3 * 3600;
+    try f.e.script(1, model.textReply("Backups: all 3 done."));
+    _ = try f.core.runTask(try taskNamed(f.core, "nightly"));
+    // a run that ends on an error: harness's line for it waits too
+    try f.e.script(2, "{\"status\":500}");
+    f.core.fixed_now = day0 + 3 * 3600 + 60;
+    _ = try f.core.runTask(try taskNamed(f.core, "broken"));
+    try t.expectEqual(0, f.rec.count("Backups: all 3 done."));
+    try t.expectEqual(0, f.rec.count("[broken]"));
+    // /quiet says the hours and what is held
+    try f.core.handleText("/quiet");
+    try f.rec.waitFor("Quiet hours: 22:00–07:00, quiet now until 07:00.\nHeld for the digest (2):\n03:00 [nightly] Backups: all 3 done.\n03:01 [broken] Model call failed: Upstream scripted error");
+    // still quiet at 06:59: nothing goes
+    f.core.fixed_now = day0 + 6 * 3600 + 59 * 60;
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("During quiet hours"));
+    // 07:00: one digest, a line each, oldest first, with a sound
+    f.core.fixed_now = day0 + 7 * 3600;
+    f.core.tick();
+    try f.rec.waitFor("During quiet hours (22:00–07:00):\n03:00 [nightly] Backups: all 3 done.\n03:01 [broken] Model call failed: Upstream scripted error");
+    try t.expectEqual(false, f.rec.quietOf("During quiet hours").?);
+    f.core.tick();
+    try t.expectEqual(1, f.rec.count("During quiet hours"));
+    try t.expectEqual(0, f.core.quiet.count());
+    // the log: each post held, the run told; then the digest
+    const lt = try logText(&f);
+    for ([_][]const u8{ "\"event\":\"held\",\"id\":1,\"conversation\":\"main\",\"by\":\"schedule:nightly\"", "\"event\":\"held\",\"id\":2", "\"kind\":\"send\"", "\"event\":\"digest\",\"conversation\":\"main\",\"lines\":2" }) |want| {
+        if (std.mem.indexOf(u8, lt, want) == null) std.debug.print("no {s} in the log\n", .{want});
+        try t.expect(std.mem.indexOf(u8, lt, want) != null);
+    }
+    try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"digest\",\"bytes\"") != null or std.mem.indexOf(u8, lt, "\"to\":\"main\",\"event\":\"digest\"") != null);
+}
+
+test "an_urgent_trigger_goes_at_once_in_quiet_hours" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", "");
+    defer f.deinit();
+    try setTriggers(&f, "[leak]\nat = 23:59\nurgent = yes\nsay = Water under the kitchen sink.\n\n[door]\nat = 23:59\nsay = The front door is unlocked.\n");
+    f.core.fixed_now = quietDay() + 3 * 3600 + 12 * 60;
+    _ = try f.core.runTask(try taskNamed(f.core, "leak"));
+    _ = try f.core.runTask(try taskNamed(f.core, "door"));
+    try f.rec.waitFor("[leak] Water under the kitchen sink.");
+    try t.expectEqual(false, f.rec.quietOf("[leak] Water under the kitchen sink.").?);
+    try t.expectEqual(0, f.rec.count("The front door is unlocked."));
+    try t.expectEqual(1, f.core.quiet.count());
+}
+
+test "a_reply_to_the_owner_goes_at_once_in_quiet_hours" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", "");
+    defer f.deinit();
+    f.core.fixed_now = quietDay() + 2 * 3600;
+    try f.e.script(1, model.textReply("It is 2 in the morning."));
+    f.core.chatTurn("what time is it");
+    try f.rec.waitFor("It is 2 in the morning.");
+    // a brief asked for with /brief is a reply too
+    try dueBrief(&f, "<item><title>New thing</title><link>https://z.org/1</link></item>");
+    try f.e.script(2, model.textReply("Zig: New thing (https://z.org/1)"));
+    try f.core.handleText("/brief");
+    waitIdle(f.core);
+    try f.rec.waitFor("[morning] Zig: New thing");
+    try t.expectEqual(0, f.core.quiet.count());
+}
+
+test "held_posts_survive_a_restart" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", quiet_tasks);
+    defer f.deinit();
+    const day0 = quietDay();
+    f.core.fixed_now = day0 + 23 * 3600;
+    try f.e.script(1, model.textReply("Backups: all 3 done."));
+    _ = try f.core.runTask(try taskNamed(f.core, "nightly"));
+    try restart(&f);
+    try f.core.setOwner(42);
+    try t.expectEqual(1, f.core.quiet.count());
+    f.core.fixed_now = day0 + 86400 + 7 * 3600 + 300;
+    f.core.tick();
+    try f.rec.waitFor("During quiet hours (22:00–07:00):\n23:00 [nightly] Backups: all 3 done.");
+    // what went is gone from the file too
+    try restart(&f);
+    try t.expectEqual(0, f.core.quiet.count());
+}
+
+test "a_long_post_or_one_with_buttons_follows_the_digest_whole" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", "[garage]\nat = 23:59\ndo = Watch the garage.\n[report]\nat = 23:59\ndo = Report the backups.\n");
+    defer f.deinit();
+    const day0 = quietDay();
+    f.core.fixed_now = day0 + 72 * 60;
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"text\":\"The garage door opened at 01:12.\",\"buttons\":[\"That was us\",\"Tell me more\"],\"final\":true}"));
+    _ = try f.core.runTask(try taskNamed(f.core, "garage"));
+    f.core.fixed_now = day0 + 2 * 3600;
+    try f.e.script(2, model.textReply("Backups:\\n- photos failed\\n- docs ok"));
+    _ = try f.core.runTask(try taskNamed(f.core, "report"));
+    try t.expectEqual(0, f.rec.count("garage door"));
+    f.core.fixed_now = day0 + 7 * 3600;
+    f.core.tick();
+    try f.rec.waitFor("During quiet hours (22:00–07:00):\n01:12 [garage] The garage door opened at 01:12. (below)\n02:00 [report] Backups:… (below)");
+    // then each whole, as it would have gone, without a sound, oldest first
+    try f.rec.waitFor("BUTTONS [garage] The garage door opened at 01:12. [r");
+    try f.rec.waitFor("[report] Backups:\n- photos failed\n- docs ok");
+    try t.expectEqual(true, f.rec.quietOf("BUTTONS [garage]").?);
+    try t.expectEqual(true, f.rec.quietOf("[report] Backups:\n").?);
+    try t.expect(f.rec.indexOf("During quiet hours") < f.rec.indexOf("BUTTONS [garage]"));
+    try t.expect(f.rec.indexOf("BUTTONS [garage]") < f.rec.indexOf("[report] Backups:\n"));
+    // the task says why its answer was not sent now (in the run's words,
+    // kept past its turn)
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"name\":\"garage\",\"event\":\"done\",\"sent\":false,\"why\":\"quiet hours, in the digest at 07:00\"") != null);
+    // its quick replies answer as they would have: the owner's message
+    try f.press("1");
+    try t.expectEqual(1, f.core.queue.items.len);
+    try t.expectEqualStrings("That was us", f.core.queue.items[0].text);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"released\"") != null);
+}
+
+test "a_held_question_waits_and_follows_the_digest_with_its_buttons" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const day0 = quietDay();
+    f.core.fixed_now = day0 + 3 * 3600 + 5 * 60;
+    try setWorkflow(&f, "water", "workflow water\nstep ask\napprove Close the water main?\ntimeout 1h\nstep tell\nsay Closing it.\n");
+    _ = try f.core.command(a, "/workflow start water");
+    runWorkflows(&f);
+    // asked, but not shown: it waits in the inbox, its hour from 07:00
+    try t.expectEqual(0, f.rec.count("Close the water main?"));
+    {
+        f.core.inbox.mutex.lockUncancelable(t.io);
+        defer f.core.inbox.mutex.unlock(t.io);
+        const it = f.core.inbox.find(1).?;
+        try t.expectEqual(inbox_mod.Status.open, it.status);
+        try t.expectEqual(day0 + 8 * 3600, it.expires);
+        try t.expectEqual(0, it.shown.items.len);
+    }
+    f.core.fixed_now = day0 + 7 * 3600;
+    runWorkflows(&f);
+    try f.rec.waitFor("During quiet hours (22:00–07:00):\n03:05 [water#1] Close the water main? (below)");
+    try f.rec.waitFor("BUTTONS Question [1]\n[water#1] Close the water main? [");
+    try t.expectEqual(true, f.rec.quietOf("BUTTONS Question [1]").?);
+    try f.press("approve");
+    runWorkflows(&f);
+    try f.rec.waitFor("[water#1] Closing it.");
+    // an urgent workflow asks at once, at night too
+    f.core.fixed_now = day0 + 86400 + 3 * 3600;
+    try setWorkflow(&f, "leak", "workflow leak\nurgent yes\nstep ask\napprove Close the water main now?\n");
+    _ = try f.core.command(a, "/workflow start leak");
+    runWorkflows(&f);
+    try f.rec.waitFor("BUTTONS Question [2]\n[leak#1] Close the water main now? [");
+    try t.expectEqual(0, f.core.quiet.count());
+}
+
+test "quiet_off_sends_what_is_held_and_quiet_on_holds_again" {
+    var f: Fix = undefined;
+    try f.init("", "", quiet_tasks);
+    defer f.deinit();
+    const day0 = quietDay();
+    f.core.fixed_now = day0 + 23 * 3600;
+    // off until set
+    try f.core.handleText("/quiet");
+    try f.rec.waitFor("Quiet hours are off.");
+    try f.e.script(1, model.textReply("Backups: all 3 done."));
+    _ = try f.core.runTask(try taskNamed(f.core, "nightly"));
+    try f.rec.waitFor("[nightly] Backups: all 3 done.");
+    // on: 22:00-07:00 when none are set
+    try f.core.handleText("/quiet on");
+    try f.rec.waitFor("Quiet hours on: 22:00–07:00.");
+    try f.e.script(2, model.textReply("Backups: 2 done."));
+    _ = try f.core.runTask(try taskNamed(f.core, "nightly"));
+    try t.expectEqual(0, f.rec.count("[nightly] Backups: 2 done."));
+    // off: what was held comes at the next tick
+    try f.core.handleText("/quiet off");
+    try f.rec.waitFor("Quiet hours off; what was held comes now.");
+    f.core.tick();
+    try f.rec.waitFor("During quiet hours (22:00–07:00):\n23:00 [nightly] Backups: 2 done.");
+    // other hours, kept across a restart
+    try f.core.handleText("/quiet 23:30-06:30");
+    try f.rec.waitFor("Quiet hours on: 23:30–06:30.");
+    try restart(&f);
+    try f.core.setOwner(42);
+    try f.core.handleText("/quiet");
+    try f.rec.waitFor("Quiet hours: 23:30–06:30, not quiet now.\nNothing is held.");
+    try f.core.handleText("/quiet sometimes");
+    try f.rec.waitFor("Use /quiet, /quiet on, /quiet off, or /quiet 22:00-07:00 for other hours.");
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"quiet\"") != null);
+}
+
+test "a_brief_held_for_the_digest_counts_its_links_as_seen" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", "");
+    defer f.deinit();
+    try dueBrief(&f, "<item><title>New thing</title><link>https://z.org/1</link></item>");
+    const day0 = quietDay();
+    f.core.fixed_now = day0 + 5 * 3600;
+    try f.e.script(1, model.textReply("Zig: New thing (https://z.org/1)"));
+    _ = try f.core.runBrief(f.core.briefs[0]);
+    try t.expectEqual(0, f.rec.count("New thing"));
+    try t.expect(f.core.seen.has("https://z.org/1"));
+    f.core.fixed_now = day0 + 7 * 3600;
+    f.core.tick();
+    try f.rec.waitFor("During quiet hours (22:00–07:00):\n05:00 [morning] Zig: New thing (https://z.org/1)");
+}
+
+test "a_post_with_files_goes_at_once_without_a_sound_in_quiet_hours" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", "[report]\nat = 23:59\ndo = Send the report.\n");
+    defer f.deinit();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(f.e.arena.allocator(), &.{ f.core.workspace, "report.csv" }), .data = "a,b\n1,2\n" });
+    f.core.fixed_now = quietDay() + 4 * 3600;
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"text\":\"The report.\",\"files\":[\"report.csv\"],\"final\":true}"));
+    _ = try f.core.runTask(try taskNamed(f.core, "report"));
+    try f.rec.waitFor("DOC report.csv");
+    // files are not kept for the digest: it goes now, but wakes no one
+    try t.expectEqual(true, f.rec.quietOf("[report] The report.").?);
+    try t.expectEqual(true, f.rec.quietOf("DOC report.csv").?);
+    try t.expectEqual(0, f.core.quiet.count());
 }
