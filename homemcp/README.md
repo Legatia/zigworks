@@ -176,19 +176,23 @@ nothing was said: kitchen_speaker spoke less than 10 s ago; hall_voice spoke les
 text only: no < or > (no markup, no sound files)
 ```
 
-- **Where:** `speaker` (a name or alias), or `room` (that room's speakers;
-  every speaker when it has none, said so in the answer), or neither
-  (every speaker that may).
+- **Where:** `speaker` (a name or alias), or `room` (that room's speakers,
+  its name in any case, Polish and other Latin letters too; every speaker
+  when it has none, said so in the answer), or neither (every speaker
+  that may).
 - **What:** text only, one line, at most 300 bytes: no control
-  characters, no `<` or `>` (no markup a text-to-speech engine would
-  read, no sound files or streams).
+  characters (line and paragraph separators, direction and invisible
+  marks among them), no `<` or `>` (no markup a text-to-speech engine
+  would read, no sound files or streams).
 - **How often:** a speaker says at most one message every 10 s and 20 an
   hour; past it the answer says which speaker waits and why (counted in
   memory: a restart starts them again).
 - **Read back:** Home Assistant answers a satellite's call once the
   message was played (its REST call waits up to 10 s); a media player
-  must show `playing` within 5 s, else "sent, but … has not confirmed".
-  An offline speaker gets nothing.
+  must show `playing` within 5 s, else "sent, but … has not confirmed";
+  one that was playing already can't show it, and says so. An offline
+  speaker gets nothing. The limits count on the machine's own clock,
+  which setting the time never moves.
 - **On record:** each message is a line of the log (`"tool":"announce"`,
   the speaker, the message, done, unconfirmed, refused or failed).
 - **Listed:** the resource `home://speakers` (each speaker, its room and

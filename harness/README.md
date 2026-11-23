@@ -644,14 +644,16 @@ sections:
 
 | | |
 |---|---|
-| Alone | web search; homemcp's `home_state`, `home_wait` and `home_set` (reading the home, and lights, plugs, heating and blinds within the home file's limits) |
+| Alone | web search; homemcp's `home_state` and `home_set` (reading the home, and lights, plugs, heating and blinds within the home file's limits) |
 | Asked of you, every time | money tools, homemcp's `home_guarded` among them (locks, alarms, valves, the garage), and every other MCP tool, `announce` too |
-| Not at all | reading web pages (`fetch`, `browse`) |
+| Not at all | reading web pages (`fetch`, `browse`); waiting on a device (`home_wait`: an answer is spoken within seconds, and homemcp serves one call at a time) |
 | Never, whatever the rules | commands, files, memory, `history`, `web` with your logins, `skill`, `delegate`, `ask_owner`, setting up triggers, workflows or definitions, posting anywhere |
 
 A `[member]` line never reaches speech, nor a `[room]` line a member;
 for speech, the shared part of `rules` and `[agent:…]` sections only
-deny or ask; no grant covers it.
+deny or ask; no grant covers it. A room's section is written as its who
+is (`[room:Kitchen]` or `[room:kid's_room]` would never match, so
+`rules` refuses them).
 
 ```
 [room]
@@ -699,9 +701,10 @@ logged and is masked like every secret.
 
 homemcp's `announce` tool says a short message on the speakers the home
 file allows (see homemcp's README). A trigger says a line aloud for each
-event with `announce` (three at most at once), filled like `say`, in the
-event's room when it names one (homemcp's changes do: the room's
-speakers, else every one), before its action:
+event with `announce` (three at most at once, each event once however
+often it is retried), filled like `say`, in the event's room when it
+names one (homemcp's changes do: the room's speakers, else every one),
+beside its action: the post never waits for the speakers.
 
 ```ini
 [leak]
@@ -1685,7 +1688,8 @@ only after a 3% move. A section's keys give its kind:
   gets an event too. `urgent = yes` (any kind but a brief) lets its posts
   through quiet hours (see Quiet hours and the digest). `announce = TEXT`
   (beside any action, not on schedules) says a line aloud on the house's
-  speakers for each event, filled like `say` (see Home Assistant's voice).
+  speakers for each event, filled like `say` (see Home Assistant's voice);
+  a trigger never polls `announce` itself.
 - **State.** `state/triggers/NAME/` keeps `state` (where its polls are,
   what it counted), `seen`, `queue` and a page's `last` text. A poll
   writes its events to `queue` before its cursor moves, and an event is
