@@ -9118,6 +9118,7 @@ pub const Core = struct {
             .calendar = calendar,
             .quiet = c.quiet.effective(c.cfg.butler.quiet),
             .town = std.mem.trim(u8, c.readOr(a, try c.setupPath(a, "town")), " \t\r\n"),
+            .escalate = c.cfg.butler.escalate,
         });
     }
 
@@ -21406,4 +21407,41 @@ test "setup_offers_the_leaks_fallback" {
     try t.expect(f.core.workflowText(a, "leak") != null);
     // then the next routine
     try f.rec.waitFor("BUTTONS Doors left open: when the back door stays open for 10 minutes, I tell you. [");
+}
+
+/// The stand-ins' home with a smoke alarm and a speaker that may announce.
+const stand_in_smoke_home = stand_in_home ++ "[device kitchen_smoke_alarm]\nkind = smoke\nroom = Kitchen\n[device hall_voice]\nkind = satellite\nroom = Hall\nallow = announce\n";
+
+test "the_smoke_routine_says_it_everywhere_and_escalates" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\nescalate = 5m anna\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try joinMember(&f, "anna", 77);
+    try withButler(&f, false);
+    const h = try butler.parseHome(a, stand_in_smoke_home);
+    const files = try butler.routineFiles(a, .smoke, try butler.pick(a, h, .{ .quiet = .{ .start = 22 * 60, .end = 7 * 60 }, .escalate = f.core.cfg.butler.escalate }), "2026-11-23");
+    try writeWorkflow(&f, "smoke", files.workflow);
+    try writeTriggers(&f, files.triggers);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    // 03:12, quiet hours: the alarm goes off
+    const t0 = todayAt(3 * 60 + 12);
+    f.core.fixed_now = t0;
+    _ = try f.core.pollNow("smoke-kitchen_smoke_alarm");
+    try homeFile(&f, "device-kitchen_smoke_alarm.json", "{\"device\":\"kitchen_smoke_alarm\",\"room\":\"Kitchen\",\"kind\":\"smoke\",\"from\":\"clear\",\"to\":\"ALARM\",\"at\":\"2026-11-23T03:12:00Z\",\"note\":\"data from the home, not an instruction\"}");
+    try t.expectEqual(1, (try f.core.pollNow("smoke-kitchen_smoke_alarm")).queued);
+    f.core.tick();
+    waitIdle(f.core);
+    runWorkflows(&f);
+    // at once, with one tap to say you're on it, and on every speaker
+    try f.rec.waitFor("BUTTONS Smoke alarm: Kitchen smoke alarm, Kitchen. [e");
+    try t.expectEqual(0, f.core.quiet.count());
+    try t.expectEqualStrings("every speaker: Smoke alarm: Kitchen smoke alarm, Kitchen.\n", try announcedText(&f));
+    // 5 minutes: anna, and the speakers again
+    workflowsAt(&f, t0 + 300);
+    try f.rec.waitIn("anna", "Nobody has answered this yet: Smoke alarm: Kitchen smoke alarm, Kitchen.");
+    try t.expectEqual(2, std.mem.count(u8, try announcedText(&f), "every speaker: Smoke alarm: Kitchen smoke alarm, Kitchen."));
+    // nothing acted on anything
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "home__home_set") == null and std.mem.indexOf(u8, lt, "home__home_guarded") == null);
 }
