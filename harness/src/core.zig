@@ -32,6 +32,8 @@ const inbox_mod = @import("inbox.zig");
 const triggers = @import("triggers.zig");
 const tstate = @import("tstate.zig");
 const sources = @import("sources.zig");
+const workflows = @import("workflows.zig");
+const wstate = @import("wstate.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -79,6 +81,10 @@ pub const Paths = struct {
     triggers: []const u8,
     /// Each trigger's state, `state/triggers/NAME/`.
     triggers_state: []const u8,
+    /// The workflows, `workflows/NAME.wf` (gap 7).
+    workflows: []const u8,
+    /// Their instances, `state/workflows/NAME/N/`.
+    workflows_state: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -124,6 +130,8 @@ pub const Paths = struct {
             .approvals = try j(a, &.{ state, "approvals" }),
             .triggers = try j(a, &.{ home, "triggers.ini" }),
             .triggers_state = try j(a, &.{ state, "triggers" }),
+            .workflows = try j(a, &.{ home, "workflows" }),
+            .workflows_state = try j(a, &.{ state, "workflows" }),
         };
     }
 };
@@ -143,6 +151,8 @@ pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
     }
     // harness's own definitions, the owner's to edit; only they may change the folder
     _ = try Io.Dir.cwd().createDirPathStatus(io, p.agents, agents.private_dir);
+    // the workflows, the owner's to write (or the agent's, asked)
+    _ = try Io.Dir.cwd().createDirPathStatus(io, p.workflows, agents.private_dir);
     const files = [_][2][]const u8{
         .{ p.config, config.defaults_ini },
         .{ p.rules, config.rules_example },
@@ -257,6 +267,32 @@ const TrigInfo = struct {
     /// After a check that failed (the model did not answer), none is
     /// asked before this (in memory: a restart asks at once).
     check_after: i64 = 0,
+};
+
+/// Tests: where an instance's job stops, as if harness stopped there.
+const WfStop = enum { none, after_mark, after_result };
+
+/// An instance going, as its state on disk says (a copy, in its own
+/// arena); under wf_mutex.
+const WfInfo = struct {
+    /// "NAME#N".
+    id: []u8,
+    arena: std.heap.ArenaAllocator,
+    state: wstate.State,
+    /// A job runs it: only that job writes its state.
+    busy: bool = false,
+    /// Its job runs at the next tick (an answer, an event, a resume).
+    due: bool = false,
+    /// /workflow stop while its job ran: the job ends it stopped.
+    stop: bool = false,
+    /// Its job's stop flag while it runs.
+    flag: ?*std.atomic.Value(bool) = null,
+
+    fn destroy(info: *WfInfo, gpa: std.mem.Allocator) void {
+        info.arena.deinit();
+        gpa.free(info.id);
+        gpa.destroy(info);
+    }
 };
 
 fn freeInfo(gpa: std.mem.Allocator, info: *TrigInfo) void {
@@ -379,6 +415,21 @@ pub const Core = struct {
     /// The MCP resources subscribed to since the servers started
     /// ("SERVER\x00URI"); under mcp_mutex.
     subscribed: std.ArrayList([]u8) = .empty,
+    /// workflows/*.wf as read (in the settings arena, or `wf_arena` after
+    /// a change at once: /workflow rm, the tool's save); swapped under
+    /// settings_mutex, so whoever keeps one copies it.
+    wf_defs: []const workflows.Workflow,
+    wf_arena: std.heap.ArenaAllocator,
+    /// The workflows folder as last applied (its names and texts): a
+    /// change is noticed.
+    wf_hash: [32]u8,
+    /// Guards `wf_list`, and the state of an instance no job runs.
+    wf_mutex: Io.Mutex = .init,
+    /// The instances going (and failed ones whose item may run their step
+    /// again), each a copy of its state on disk.
+    wf_list: std.ArrayList(*WfInfo) = .empty,
+    /// Tests: an instance's job stops there, as if harness stopped.
+    wf_test_stop: WfStop = .none,
     told_settings_changed: bool = false,
     secrets: Secrets,
     /// The stored secrets read at open. What every tool's output is
@@ -569,17 +620,20 @@ pub const Core = struct {
         c.trig_stop_after_queue = false;
         c.told_workflows = .empty;
         c.subscribed = .empty;
-        try c.loadSettings(sa);
+        c.wf_arena = .init(gpa);
+        errdefer c.wf_arena.deinit();
+        c.wf_defs = &.{};
+        c.wf_hash = @splat(0);
+        c.wf_mutex = .init;
+        c.wf_list = .empty;
+        c.wf_test_stop = .none;
+        // the stored secrets first: a workflow file holding one is refused
         c.secrets = secrets;
-        var sl: std.ArrayList(scrub.Secret) = .empty;
-        if (secrets.omnigate) |v| try sl.append(c.paths_arena.allocator(), .{ .name = "omnigate", .value = v });
-        if (secrets.telegram) |v| try sl.append(c.paths_arena.allocator(), .{ .name = "telegram", .value = v });
-        if (secrets.search) |v| try sl.append(c.paths_arena.allocator(), .{ .name = "search", .value = v });
-        for (secrets.named) |n| try sl.append(c.paths_arena.allocator(), .{ .name = n.name, .value = n.value });
-        c.secret_list = sl.items;
+        c.secret_list = try secretList(c.paths_arena.allocator(), secrets);
+        try c.loadSettings(sa, c.secret_list);
         c.masks = .init(gpa, io);
         errdefer c.masks.deinit();
-        for (sl.items) |x| try c.masks.add(x.name, x.value);
+        for (c.secret_list) |x| try c.masks.add(x.name, x.value);
 
         c.grants = .init(gpa);
         errdefer c.grants.deinit();
@@ -733,6 +787,9 @@ pub const Core = struct {
         for (c.trig_info.items) |info| freeInfo(c.gpa, info);
         c.trig_info.deinit(c.gpa);
         c.trig_arena.deinit();
+        for (c.wf_list.items) |info| info.destroy(c.gpa);
+        c.wf_list.deinit(c.gpa);
+        c.wf_arena.deinit();
         for (c.quick.items) |q| q.deinit(c.gpa);
         c.quick.deinit(c.gpa);
         for (c.start_edits.items) |e| c.gpa.free(e.text);
@@ -813,7 +870,7 @@ pub const Core = struct {
         return out;
     }
 
-    fn loadSettings(c: *Core, a: std.mem.Allocator) !void {
+    fn loadSettings(c: *Core, a: std.mem.Allocator, secrets: []const scrub.Secret) !void {
         if (builtin.os.tag != .windows) {
             for (guardedFiles(c.paths)) |p| {
                 const st = Io.Dir.cwd().statFile(c.io, p, .{}) catch continue;
@@ -848,9 +905,21 @@ pub const Core = struct {
             loaded.deinit();
             return error.BadSettings;
         }
+        // workflows/: each read and checked beside triggers.ini and the
+        // definitions, none holding a stored secret (R10)
+        const wr = readWorkflows(c.io, a, c.paths.workflows, .{ .triggers = tlist, .agent = loadedHas, .agent_ctx = &loaded }, secrets) catch |e| {
+            loaded.deinit();
+            return if (e == error.OutOfMemory) e else error.BadSettings;
+        };
+        if (wr.why != null) {
+            loaded.deinit();
+            return error.BadSettings;
+        }
         c.trig_list = tlist;
         c.trig_tasks = try triggers.tasksOf(a, tlist);
         c.trig_briefs = try triggers.briefsOf(a, tlist);
+        c.wf_defs = wr.list;
+        c.wf_hash = wr.hash;
         c.defs.install(loaded);
         c.settings_hashes = hashSettings(texts);
     }
@@ -881,7 +950,10 @@ pub const Core = struct {
         const saved_folders = c.folder_list;
         const saved_hashes = c.settings_hashes;
         const saved_trig = .{ c.trig_list, c.trig_tasks, c.trig_briefs };
-        c.loadSettings(fresh.allocator()) catch {
+        const saved_wf = .{ c.wf_defs, c.wf_hash };
+        // the values masked now, a secret stored since start too
+        const secrets = c.masks.snapshot(fresh.allocator()) catch c.secret_list;
+        c.loadSettings(fresh.allocator(), secrets) catch {
             fresh.deinit();
             c.cfg = saved_cfg;
             c.rule_list = saved_rules;
@@ -891,6 +963,7 @@ pub const Core = struct {
             c.folder_list = saved_folders;
             c.settings_hashes = saved_hashes;
             c.trig_list, c.trig_tasks, c.trig_briefs = saved_trig;
+            c.wf_defs, c.wf_hash = saved_wf;
             return c.settingsErrorReply();
         };
         // the providers and the chat's client point into the old settings:
@@ -907,6 +980,7 @@ pub const Core = struct {
             c.folder_list = saved_folders;
             c.settings_hashes = saved_hashes;
             c.trig_list, c.trig_tasks, c.trig_briefs = saved_trig;
+            c.wf_defs, c.wf_hash = saved_wf;
             return "The model url in config.ini is not valid; nothing changed.";
         }
         c.chat_client.deinit();
@@ -917,6 +991,9 @@ pub const Core = struct {
         // what an at-once change of triggers.ini held is read again above
         c.trig_arena.deinit();
         c.trig_arena = .init(c.gpa);
+        // and what an at-once change of workflows/ held
+        c.wf_arena.deinit();
+        c.wf_arena = .init(c.gpa);
         c.syncTrigInfo();
         c.gate.rules = c.rule_list;
         c.gate.folders = c.folderRoles();
@@ -947,10 +1024,11 @@ pub const Core = struct {
     /// The answer to a /reload the settings files refused, naming the file
     /// and line (in `problem_buf`).
     fn settingsErrorReply(c: *Core) []const u8 {
-        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, triggers.ini, logins.ini, mcp.ini, folders.ini and agents/.";
+        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, triggers.ini, logins.ini, mcp.ini, folders.ini, agents/ and workflows/.";
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
-        const why = (settingsProblem(c.io, arena.allocator(), c.paths) catch return generic) orelse return generic;
+        const secrets = c.masks.snapshot(arena.allocator()) catch c.secret_list;
+        const why = (settingsProblemWith(c.io, arena.allocator(), c.paths, secrets) catch return generic) orelse return generic;
         return std.fmt.bufPrint(&c.problem_buf, "The settings files have an error; nothing changed: {s}", .{why}) catch generic;
     }
 
@@ -963,7 +1041,8 @@ pub const Core = struct {
         const same = for (h, c.settings_hashes) |x, y| {
             if (!std.mem.eql(u8, &x, &y)) break false;
         } else true;
-        if (same and !c.defs.changedOnDisk()) return;
+        const wf_same = std.mem.eql(u8, &hashWorkflows(c.io, arena.allocator(), c.paths.workflows), &c.wf_hash);
+        if (same and wf_same and !c.defs.changedOnDisk()) return;
         c.told_settings_changed = true;
         c.log.write(.config, false, .{ .event = "settings files changed" }) catch {};
         c.say("The settings files changed. The change is not applied until you send /reload.");
@@ -6366,6 +6445,11 @@ pub fn guardedFiles(p: Paths) [6][]const u8 {
 /// the file other users can change, or the file and line that does not
 /// read. Null when nothing is.
 pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
+    return settingsProblemWith(io, a, p, &.{});
+}
+
+/// `settingsProblem`, a workflow file holding one of `secrets` too.
+pub fn settingsProblemWith(io: Io, a: std.mem.Allocator, p: Paths, secrets: []const scrub.Secret) !?[]const u8 {
     if (builtin.os.tag != .windows) {
         for (guardedFiles(p)) |path| {
             const st = Io.Dir.cwd().statFile(io, path, .{}) catch continue;
@@ -6405,7 +6489,118 @@ pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
     const briefs_text = Io.Dir.cwd().readFileAlloc(io, p.briefs, a, .limited(1 << 20)) catch "";
     if (try nameClash(a, tlist, tasks, config.parseBriefs(a, briefs_text) catch &.{})) |why| return why;
     for (tlist) |tr| if (tr.action == .do and !loaded.has(tr.agent)) return try undefinedAgent(a, tr);
+    const wr = try readWorkflows(io, a, p.workflows, .{ .triggers = tlist, .agent = loadedHas, .agent_ctx = &loaded }, secrets);
+    if (wr.why) |why| return why;
     return null;
+}
+
+/// The stored secrets as the masks take them.
+pub fn secretList(a: std.mem.Allocator, secrets: Secrets) ![]const scrub.Secret {
+    var sl: std.ArrayList(scrub.Secret) = .empty;
+    if (secrets.omnigate) |v| try sl.append(a, .{ .name = "omnigate", .value = v });
+    if (secrets.telegram) |v| try sl.append(a, .{ .name = "telegram", .value = v });
+    if (secrets.search) |v| try sl.append(a, .{ .name = "search", .value = v });
+    for (secrets.named) |n| try sl.append(a, .{ .name = n.name, .value = n.value });
+    return sl.items;
+}
+
+/// Whether the definitions read (`agents.Set.Loaded`) have `name`.
+fn loadedHas(ctx: ?*anyopaque, name: []const u8) bool {
+    const l: *agents.Set.Loaded = @ptrCast(@alignCast(ctx.?));
+    return l.has(name);
+}
+
+/// workflows/ as read: the files, the folder's hash, or the first problem
+/// (its file and line).
+pub const WfRead = struct { list: []const workflows.Workflow = &.{}, hash: [32]u8 = @splat(0), why: ?[]const u8 = null };
+
+/// The workflow files of `dir`, by name.
+fn workflowFiles(io: Io, a: std.mem.Allocator, d: Io.Dir) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = d.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind != .file and e.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, e.name, ".wf")) continue;
+        try names.append(a, try a.dupe(u8, e.name));
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return names.items;
+}
+
+/// Reads workflows/*.wf: each parsed and checked against what `ctx`
+/// names (triggers.ini, the definitions), none holding a value of
+/// `secrets`, the folder and its files refused if others can write them
+/// (R10). A problem is in `why`, with its file and line.
+pub fn readWorkflows(io: Io, a: std.mem.Allocator, dir: []const u8, ctx: workflows.Context, secrets: []const scrub.Secret) !WfRead {
+    var d = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return .{},
+        else => return .{ .why = try std.fmt.allocPrint(a, "workflows can't be read ({s})", .{@errorName(e)}) },
+    };
+    defer d.close(io);
+    const guarded = builtin.os.tag != .windows;
+    if (guarded) {
+        const st = try d.stat(io);
+        if (st.permissions.toMode() & 0o022 != 0) return .{ .why = "workflows can be changed by other users; run chmod go-w on it (it decides what runs)" };
+    }
+    var list: std.ArrayList(workflows.Workflow) = .empty;
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    const names = workflowFiles(io, a, d) catch |e| return .{ .why = try std.fmt.allocPrint(a, "workflows can't be read ({s})", .{@errorName(e)}) };
+    // no file: the hash the watcher takes for none
+    if (names.len == 0) return .{};
+    for (names) |file_name| {
+        const file = try std.fmt.allocPrint(a, "workflows/{s}", .{file_name});
+        const name = file_name[0 .. file_name.len - 3];
+        if (!workflows.validName(name)) return .{ .why = try std.fmt.allocPrint(a, "{s} is no workflow's file: NAME.wf, the name in a-z, 0-9, - and _ (up to 64), not start, stop, resume, rm, list, check, show or save", .{file}) };
+        if (guarded) {
+            const st = d.statFile(io, file_name, .{}) catch |e| return .{ .why = try std.fmt.allocPrint(a, "{s} can't be read ({s})", .{ file, @errorName(e) }) };
+            if (st.permissions.toMode() & 0o022 != 0) return .{ .why = try std.fmt.allocPrint(a, "{s} can be changed by other users; run chmod 600 on it", .{file}) };
+        }
+        const text = d.readFileAlloc(io, file_name, a, .limited(workflows.max_file + 1)) catch |e| switch (e) {
+            error.StreamTooLong => return .{ .why = try std.fmt.allocPrint(a, "{s} is over 64 KB", .{file}) },
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .why = try std.fmt.allocPrint(a, "{s} can't be read ({s})", .{ file, @errorName(e) }) },
+        };
+        // a step names no secret: one written into the file is refused
+        for (secrets) |sec| if (sec.value.len > 0 and std.mem.indexOf(u8, text, sec.value) != null)
+            return .{ .why = try std.fmt.allocPrint(a, "{s} holds a stored secret ({s}); a workflow names none (MCP servers hold their own)", .{ file, sec.name }) };
+        var diag: workflows.Diag = .{};
+        const w = workflows.parse(a, try a.dupe(u8, name), text, &diag) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.BadWorkflow => return .{ .why = try workflows.lineProblem(a, file, text, diag) },
+        };
+        _ = workflows.check(a, w, ctx, &diag) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.BadWorkflow => return .{ .why = try workflows.lineProblem(a, file, text, diag) },
+        };
+        h.update(file_name);
+        h.update("\x00");
+        h.update(text);
+        h.update("\x00");
+        try list.append(a, w);
+    }
+    return .{ .list = list.items, .hash = h.finalResult() };
+}
+
+/// The workflows folder's hash, as `readWorkflows` makes it: names and
+/// texts (all zeros when there is none).
+fn hashWorkflows(io: Io, a: std.mem.Allocator, dir: []const u8) [32]u8 {
+    var d = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return @splat(0);
+    defer d.close(io);
+    const names = workflowFiles(io, a, d) catch return @splat(0);
+    if (names.len == 0) return @splat(0);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (names) |file_name| {
+        const text = d.readFileAlloc(io, file_name, a, .limited(workflows.max_file + 1)) catch "";
+        h.update(file_name);
+        h.update("\x00");
+        h.update(text);
+        h.update("\x00");
+    }
+    return h.finalResult();
 }
 
 /// Why triggers.ini's sections can't stand beside tasks.ini and
@@ -11546,4 +11741,103 @@ test "a_failed_check_waits_before_it_asks_again" {
     f.core.tick();
     waitIdle(f.core);
     try f.rec.waitFor("[news] new");
+}
+
+
+// ---- workflows ----
+
+/// workflows/NAME.wf with `text` (URL: the stand-in's address).
+fn writeWorkflow(f: *Fix, name: []const u8, text: []const u8) !void {
+    const a = f.e.arena.allocator();
+    const path = try std.fs.path.join(a, &.{ f.core.paths.workflows, try std.fmt.allocPrint(a, "{s}.wf", .{name}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = try std.mem.replaceOwned(u8, a, text, "URL", try f.e.url()), .flags = .{ .permissions = util.private_file } });
+}
+
+/// writeWorkflow, then /reload.
+fn setWorkflow(f: *Fix, name: []const u8, text: []const u8) !void {
+    try writeWorkflow(f, name, text);
+    const said = try f.core.reload();
+    if (!std.mem.eql(u8, said, "Settings reloaded.")) {
+        std.debug.print("reload said: {s}\n", .{said});
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn expectHas(text: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, text, needle) == null) {
+        std.debug.print("no {s} in:\n{s}\n", .{ needle, text });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "a_bad_workflow_file_is_named_and_nothing_changes" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try setWorkflow(&f, "hello", "workflow hello\nstep a\nsay hi\n");
+    try t.expectEqual(1, f.core.wf_defs.len);
+    try writeWorkflow(&f, "hello", "workflow hello\nstep a\nsay hi\ngoto nowhere\n");
+    try expectHas(try f.core.reload(), "workflows/hello.wf line 4 has an error: goto nowhere (there is no step nowhere (steps: a))");
+    // the workflows from before stay
+    try t.expectEqual(1, f.core.wf_defs.len);
+    try t.expectEqualStrings("", f.core.wf_defs[0].steps[0].goto);
+    // a trigger start needs its trigger's start = line
+    try writeWorkflow(&f, "hello", "workflow hello\nstart trigger:news\nstep a\nsay hi\n");
+    try expectHas(try f.core.reload(), "workflows/hello.wf line 2 has an error: start trigger:news (news has no start = workflow hello in triggers.ini (an event trigger))");
+    try writeTriggers(&f, "[news]\nfeed = https://z.org/f\nstart = workflow hello\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    // an agent step's definition must be there
+    try writeWorkflow(&f, "hello", "workflow hello\nstep a\ndo Think.\nagent nobody\n");
+    try expectHas(try f.core.reload(), "workflows/hello.wf line 4 has an error: agent nobody (agent nobody is not defined (no agents/nobody.md))");
+    // a file that is no workflow's
+    try writeWorkflow(&f, "hello", "workflow hello\nstep a\nsay hi\n");
+    try writeWorkflow(&f, "Bad", "workflow Bad\nstep a\nsay hi\n");
+    try expectHas(try f.core.reload(), "workflows/Bad.wf is no workflow's file");
+}
+
+test "a_file_with_a_stored_secret_is_refused" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try writeWorkflow(&f, "leak", "workflow leak\nstep a\nsay the key is search-key-123\n");
+    const said = try f.core.reload();
+    try expectHas(said, "workflows/leak.wf holds a stored secret (search); a workflow names none");
+    try t.expect(std.mem.indexOf(u8, said, "search-key-123") == null);
+    try t.expectEqual(0, f.core.wf_defs.len);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "search-key-123") == null);
+    // at start too: harness names the file
+    const a = f.e.arena.allocator();
+    try expectHas((try settingsProblemWith(t.io, a, f.core.paths, f.core.secret_list)).?, "workflows/leak.wf holds a stored secret (search)");
+}
+
+test "workflows_are_guarded_watched_and_applied_on_reload" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    // init made the folder, the owner's alone
+    const st = try Io.Dir.cwd().statFile(t.io, f.core.paths.workflows, .{});
+    try t.expect(st.kind == .directory);
+    try writeWorkflow(&f, "hello", "workflow hello\nstep a\nsay hi\n");
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try f.rec.waitFor("not applied until you send /reload");
+    try t.expectEqual(0, f.core.wf_defs.len);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expectEqual(1, f.core.wf_defs.len);
+    // applied: the watcher is quiet again
+    f.core.told_settings_changed = false;
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try t.expectEqual(1, f.rec.count("not applied until you send /reload"));
+    if (builtin.os.tag != .windows) {
+        const a = f.e.arena.allocator();
+        const path = try std.fs.path.join(a, &.{ f.core.paths.workflows, "hello.wf" });
+        try Io.Dir.cwd().setFilePermissions(t.io, path, .fromMode(0o666), .{});
+        try expectHas(try f.core.reload(), "workflows/hello.wf can be changed by other users");
+        try Io.Dir.cwd().setFilePermissions(t.io, path, .fromMode(0o600), .{});
+        try Io.Dir.cwd().setFilePermissions(t.io, f.core.paths.workflows, .fromMode(0o777), .{});
+        try expectHas(try f.core.reload(), "workflows can be changed by other users");
+        try Io.Dir.cwd().setFilePermissions(t.io, f.core.paths.workflows, .fromMode(0o700), .{});
+    }
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
 }

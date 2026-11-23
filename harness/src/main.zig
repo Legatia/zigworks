@@ -235,7 +235,8 @@ const App = struct {
                 error.BadUrl => complain("the omnigate url in config.ini ([model] url) is {s}", .{if (cfg.model.url.len == 0) "not set yet" else "not valid"}),
                 error.BadSettings => {
                     const paths = core_mod.Paths.init(app.arena, app.home) catch return error.Reported;
-                    const why = (core_mod.settingsProblem(app.io, app.arena, paths) catch null) orelse "a settings file has an error, or one of config.ini, rules, logins.ini, mcp.ini and folders.ini can be changed by other users (chmod 600 them)";
+                    const stored = core_mod.secretList(app.arena, sec) catch &.{};
+                    const why = (core_mod.settingsProblemWith(app.io, app.arena, paths, stored) catch null) orelse "a settings file has an error, or one of config.ini, rules, logins.ini, mcp.ini and folders.ini can be changed by other users (chmod 600 them)";
                     complain("{s}", .{why});
                 },
                 else => complain("can't open {s}: {s}", .{ app.home, @errorName(e) }),

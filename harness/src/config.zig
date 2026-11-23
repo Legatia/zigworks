@@ -26,6 +26,7 @@ pub const Config = struct {
     money: Money = .{},
     inbox: Inbox = .{},
     triggers: Triggers = .{},
+    workflows: Workflows = .{},
     /// The `[provider NAME]` sections, in the order their names first
     /// appear (not a section of its own: `parse` reads them apart).
     providers: []const model.Section = &.{},
@@ -98,6 +99,10 @@ pub const Config = struct {
         /// Runs a trigger starts follow `scheduled` (on) or never move
         /// money (off: the owner has not decided yet).
         triggers: bool = false,
+        /// Agent steps of workflows follow `scheduled` (on) or never move
+        /// money (off: the owner has not decided yet); a tool step's money
+        /// call is asked every time either way.
+        workflows: bool = false,
     };
     /// What waits for the owner (state/inbox).
     pub const Inbox = struct {
@@ -119,6 +124,15 @@ pub const Config = struct {
         runs_per_day: u32 = 100,
         /// Events waiting per trigger; past it the trigger pauses.
         queue: u32 = 200,
+    };
+    /// Workflows (workflows/NAME.wf).
+    pub const Workflows = struct {
+        /// Instances going at once, all workflows together; past it a
+        /// start is refused.
+        instances: u32 = 50,
+        /// Agent steps a day, all workflows together; past it they wait
+        /// for the next day.
+        agent_steps_per_day: u32 = 100,
     };
 };
 
@@ -178,7 +192,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
         }
         if (!found) return error.BadConfig;
     }
-    if (cfg.inbox.questions == 0 or cfg.triggers.queue == 0) return error.BadConfig;
+    if (cfg.inbox.questions == 0 or cfg.triggers.queue == 0 or cfg.workflows.instances == 0) return error.BadConfig;
     cfg.providers = try providerSections(arena, text, provs.items);
     if (!model.isPreset(cfg.model.provider)) {
         for (cfg.providers) |p| {
@@ -527,6 +541,7 @@ pub const defaults_ini =
     \\max_per_day = 0
     \\scheduled = off                     ; on: scheduled runs may move money, within the caps
     \\triggers = off                      ; on: runs a trigger starts move money as scheduled = says; off: never
+    \\workflows = off                     ; on: agent steps of workflows move money as scheduled = says; off: never (tool steps are asked every time)
     \\
     \\[inbox]                             ; what waits for you (/inbox)
     \\questions = 20                      ; questions and approvals waiting at once
@@ -538,6 +553,10 @@ pub const defaults_ini =
     \\runs_per_hour = 20                  ; runs triggers start, all together
     \\runs_per_day = 100
     \\queue = 200                         ; events waiting per trigger; past it the trigger pauses
+    \\
+    \\[workflows]                         ; workflows (workflows/NAME.wf)
+    \\instances = 50                      ; instances going at once, all workflows; past it a start is refused
+    \\agent_steps_per_day = 100           ; agent steps a day, all workflows; past it they wait for the next day
     \\
 ;
 
@@ -551,13 +570,16 @@ pub const rules_example =
     \\# every time, whatever the rules; the others are allowed.
     \\# send (a post) to a conversation others read is asked every time
     \\# unless an allow rule names it (allow send family).
-    \\# agent_save (a new agent definition, or a change to the agent's own)
-    \\# and trigger add (a trigger the agent proposes) are asked every time,
-    \\# whatever the rules; a deny rule stops them; trigger rm asks.
-    \\# Not used yet (their tools come later): mail and workflow start and
-    \\# stop ask; app_save, env_save and workflow save are asked every time.
-    \\# A line [agent:NAME], [owner], [schedule:NAME] or [trigger:NAME] starts
-    \\# rules for those calls only; [all] goes back to rules for every call. shell@NAME is for
+    \\# agent_save (a new agent definition, or a change to the agent's own),
+    \\# trigger add (a trigger the agent proposes) and workflow save (a
+    \\# workflow it proposes) are asked every time, whatever the rules; a deny
+    \\# rule stops them; trigger rm, workflow start and workflow stop ask.
+    \\# Not used yet (their tools come later): mail asks; app_save and
+    \\# env_save are asked every time.
+    \\# A line [agent:NAME], [owner], [schedule:NAME], [trigger:NAME] or
+    \\# [workflow:NAME] starts rules for those calls only (a workflow's tool
+    \\# steps are [workflow:NAME]'s, not a definition's); [all] goes back to
+    \\# rules for every call. shell@NAME is for
     \\# commands in environment NAME (host is the only one for now).
     \\# After the agent writes a file in the workspace, a shell command that
     \\# a rule or a 24 h grant allows is asked first, naming the files, until
@@ -1027,5 +1049,23 @@ test "trigger_and_money_settings_read" {
     try t.expect(c.money.triggers);
     try t.expectError(error.BadConfig, parse(a, "[triggers]\nqueue = 0\n"));
     try t.expectEqualDeep(d.triggers, (try parse(a, defaults_ini)).triggers);
+    try t.expectEqualDeep(d.money, (try parse(a, defaults_ini)).money);
+}
+
+
+test "workflow_settings_read" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try parse(a, "");
+    try t.expectEqual(50, d.workflows.instances);
+    try t.expectEqual(100, d.workflows.agent_steps_per_day);
+    try t.expect(!d.money.workflows);
+    const c = try parse(a, "[workflows]\ninstances = 5\nagent_steps_per_day = 7\n[money]\nworkflows = on\n");
+    try t.expectEqual(5, c.workflows.instances);
+    try t.expectEqual(7, c.workflows.agent_steps_per_day);
+    try t.expect(c.money.workflows);
+    try t.expectError(error.BadConfig, parse(a, "[workflows]\ninstances = 0\n"));
+    try t.expectEqualDeep(d.workflows, (try parse(a, defaults_ini)).workflows);
     try t.expectEqualDeep(d.money, (try parse(a, defaults_ini)).money);
 }
