@@ -189,6 +189,14 @@ pub const Asker = struct {
     ask: *const fn (ctx: *anyopaque, a: std.mem.Allocator, q: Question) Reply,
 };
 
+/// Says why a call that speaks aloud in the house (an MCP tool named
+/// `announce`) is not made now, for a run started by `by`; null: it is.
+/// (Quiet hours: only urgent triggers and workflows speak at night.)
+pub const Hush = struct {
+    ctx: *anyopaque,
+    why: *const fn (ctx: *anyopaque, by: []const u8) ?[]const u8,
+};
+
 /// The owner's switches, shared by all runs and read when used, so that
 /// /dryrun, /private and /memory auto apply to a run already going.
 pub const Switches = struct {
@@ -448,6 +456,9 @@ pub const Run = struct {
     /// Where the `workflow` tool reaches harness; null: no `workflow` tool
     /// (only runs the owner started from a conversation get one).
     wdesk: ?WfDesk = null,
+    /// Whether a call that speaks aloud in the house may be made now (its
+    /// delegated runs ask their starter's); null: always.
+    hush: ?Hush = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -1566,6 +1577,17 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
     }
+    // the house's speakers: at night only urgent triggers and workflows
+    if (mt) |m| if (std.mem.eql(u8, m.tool, "announce")) {
+        var from: ?*const Run = r;
+        const h: ?Hush = while (from) |x| : (from = x.starter) {
+            if (x.hush) |y| break y;
+        } else null;
+        if (h) |x| if (x.why(x.ctx, r.who.by)) |why| {
+            try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+            return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+        };
+    };
     // nor a workflow's agent steps ([money] workflows); its tool steps (no
     // definition) are asked every time
     if (tool == .money and std.mem.startsWith(u8, r.who.by, "workflow:") and r.who.agent.len > 0 and !r.money.workflows) {

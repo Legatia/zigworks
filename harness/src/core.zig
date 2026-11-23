@@ -775,7 +775,9 @@ pub const Core = struct {
         errdefer c.member_asks.deinit();
         c.member_asks.load() catch |e| c.log.write(.config, false, .{ .event = "member asks not read", .why = @errorName(e) }) catch {};
         c.voice_agent = null;
+        @memset(&c.voice_note_buf, 0);
         c.voice_note_len = 0;
+        @memset(&c.voice_warn_buf, 0);
         c.voice_key = @splat(0);
         c.speech_contexts = .init(gpa);
         errdefer c.speech_contexts.deinit();
@@ -4348,8 +4350,20 @@ pub const Core = struct {
             .snaps = &c.snaps,
             .defs = &c.defs,
             .registry = c.registry(),
+            .hush = .{ .ctx = c, .why = hushWhy },
         };
     }
+
+    /// Why a run started by `by` says nothing on the house's speakers now
+    /// (Ruling 11 of the voice plan): in quiet hours, a run nobody watches
+    /// whose trigger or workflow is not urgent; null: it may.
+    fn hushWhy(ctx: *anyopaque, by: []const u8) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        if (c.quietEnd(by) == null) return null;
+        return quiet_speakers;
+    }
+
+    const quiet_speakers = "quiet hours: only urgent triggers and workflows speak on the house's speakers";
 
     /// A run started by `who`: a chat turn by the owner, a task or brief
     /// by its schedule (`schedule:NAME`), both of the definition main.
@@ -7138,6 +7152,10 @@ pub const Core = struct {
             try take.append(a, ev);
         }
         if (take.items.len == 0) return;
+        // said aloud first: a leak is heard before it is read
+        if (tr.announce.len > 0) c.triggerAnnounce(a, tr, take.items, by_hand) catch |e| {
+            c.log.write(.trigger, false, .{ .name = tr.name, .event = "announce failed", .why = @errorName(e) }) catch {};
+        };
         switch (tr.action) {
             .say => |template| try c.triggerSay(a, tr, template, take.items, by_hand),
             .do => |instruction| try c.triggerDo(a, tr, instruction, take.items, by_hand),
@@ -7380,6 +7398,70 @@ pub const Core = struct {
         };
         if (got.refused) |w| c.say(try std.fmt.allocPrint(a, "The message of trigger {s} was not posted: {s}.", .{ tr.name, w }));
         try c.markDone(a, tr, events, &run, why);
+    }
+
+    /// A trigger's `announce` line said aloud on the house's speakers, a
+    /// line per event (at most 3), in the event's room when it says one
+    /// (homemcp says it on that room's speakers, else on every one),
+    /// through the MCP tool `announce` (the trigger's own server's first).
+    /// The owner wrote it in triggers.ini: allowed as a listed source is (a
+    /// deny rule stops it). In quiet hours only an urgent trigger speaks;
+    /// one run by hand speaks whenever.
+    fn triggerAnnounce(c: *Core, a: std.mem.Allocator, tr: triggers.Trigger, events: []const tstate.Event, by_hand: bool) !void {
+        const by = try std.fmt.allocPrint(a, "trigger:{s}", .{tr.name});
+        const own = if (tr.mcp) |m| m.server else "";
+        var mt: ?*const agent.McpTool = null;
+        for (c.mcp_tools) |*m| if (std.mem.eql(u8, m.tool, "announce") and !m.money) {
+            if (mt == null or std.mem.eql(u8, m.server.name, own)) mt = m;
+        };
+        // a run needs a client; this one makes no model call
+        var client = try c.modelClient(c.cfg.model.model, c.cfg.model.max_tokens);
+        defer client.deinit();
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, tr.agent);
+        defer c.unregister(&flag);
+        var run = c.runIn(&client, try std.fmt.allocPrint(a, "trigger {s}", .{tr.name}), .{ .by = by, .agent = "" }, tr.to, &flag);
+        const m = mt orelse {
+            try run.logRun(.trigger, false, .{ .name = tr.name, .event = "not announced", .why = "no MCP server offers announce" });
+            return;
+        };
+        if (!by_hand and c.quietEnd(by) != null) {
+            try run.logRun(.gate, false, .{ .tool = "announce", .decision = "deny", .why = quiet_speakers });
+            return;
+        }
+        for (events[0..@min(events.len, 3)]) |ev| {
+            const text = std.mem.trim(u8, try triggers.fill(a, tr.announce, ev.fields), " \t\r\n");
+            if (text.len == 0) continue;
+            var input: std.ArrayList(u8) = .empty;
+            try input.print(a, "{{\"message\":{f}", .{std.json.fmt(util.cut(text, 300), .{})});
+            if (eventRoom(a, ev.fields)) |room| try input.print(a, ",\"room\":{f}", .{std.json.fmt(room, .{})});
+            try input.append(a, '}');
+            const arg = try std.fmt.allocPrint(a, "{s}/announce {s}", .{ m.server.name, input.items });
+            const d = blk: {
+                c.lock.lockUncancelable(c.io);
+                defer c.lock.unlock(c.io);
+                break :blk c.gate.decide(a, .mcp, arg, c.now(), .{ .scheduled = true, .listed = "triggers.ini", .who = run.who });
+            };
+            try run.logRun(.gate, false, .{ .tool = "mcp", .decision = @tagName(d.action), .why = d.why, .arg = arg });
+            if (d.action != .allow) continue;
+            const res = m.server.call(a, "announce", input.items, &flag, 30_000, 64 * 1024) catch |e| {
+                try run.logRun(.tool, false, .{ .tool = m.def.name, .arg = arg, .is_error = true, .output = @errorName(e) });
+                continue;
+            };
+            try run.logRun(.tool, false, .{ .tool = m.def.name, .arg = arg, .is_error = res.is_error, .output = res.text, .bytes = res.text.len });
+        }
+    }
+
+    /// The room an event says: its `room` field, or the one in its `text`
+    /// when that is homemcp's change (a JSON object); null when none.
+    fn eventRoom(a: std.mem.Allocator, fields: []const triggers.Field) ?[]const u8 {
+        for (fields) |f| if (std.mem.eql(u8, f.name, "room") and f.value.len > 0) return f.value;
+        for (fields) |f| if (std.mem.eql(u8, f.name, "text")) {
+            const v = jv.parse(a, f.value) orelse return null;
+            const room = jv.str(jv.get(v, "room")) orelse return null;
+            return if (room.len > 0) room else null;
+        };
+        return null;
     }
 
     /// A trigger's `start = workflow NAME`: an instance per event; one the
@@ -18508,3 +18590,80 @@ test "the_voice_agent_says_what_it_is_in_status" {
     try t.expectEqual(0, f.e.server.modelRequests());
 }
 
+/// What homemcp's stand-in was asked to say, a line each ("ROOM: TEXT",
+/// "every speaker: TEXT").
+fn announcedText(f: *Fix) ![]const u8 {
+    const a = f.e.arena.allocator();
+    return Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "home", "announced" }), a, .unlimited) catch "";
+}
+
+test "a_trigger_announces_in_the_events_room" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withHome(&f);
+    const dir = try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "home" });
+    try Io.Dir.cwd().createDirPath(t.io, dir);
+    const leak_path = try std.fs.path.join(a, &.{ dir, "leak" });
+    const door_path = try std.fs.path.join(a, &.{ dir, "door" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = leak_path, .data = "{\"device\":\"sink_leak\",\"room\":\"Kitchen\",\"from\":null,\"to\":\"dry\"}" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = door_path, .data = "{\"device\":\"back_door\",\"room\":\"Hall\",\"from\":null,\"to\":\"closed\"}" });
+    try setTriggers(&f, "[leak]\nmcp = home resource fake://leak\nmatch = text has \"to\":\"wet\"\nurgent = yes\nsay = Water under the kitchen sink.\nannounce = Water under the kitchen sink.\n\n[door]\nmcp = home resource fake://door\nmatch = text has \"to\":\"open\"\nsay = The back door is open.\nannounce = The back door is open.\n");
+    _ = try f.core.pollNow("leak");
+    _ = try f.core.pollNow("door");
+    // 03:12, quiet hours: the urgent leak is said in its room, the door is not
+    f.core.fixed_now = quietDay() + 3 * 3600 + 12 * 60;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = leak_path, .data = "{\"device\":\"sink_leak\",\"room\":\"Kitchen\",\"from\":\"dry\",\"to\":\"wet\"}" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = door_path, .data = "{\"device\":\"back_door\",\"room\":\"Hall\",\"from\":\"closed\",\"to\":\"open\"}" });
+    try t.expectEqual(1, (try f.core.pollNow("leak")).queued);
+    try t.expectEqual(1, (try f.core.pollNow("door")).queued);
+    f.core.tick();
+    waitIdle(f.core);
+    try f.rec.waitFor("[leak] Water under the kitchen sink.");
+    // the door's turn comes at the next tick (one background slot)
+    f.core.tick();
+    waitIdle(f.core);
+    try t.expectEqualStrings("Kitchen: Water under the kitchen sink.\n", try announcedText(&f));
+    const lt = try logText(&f);
+    try expectHas(lt, "\"decision\":\"allow\",\"why\":\"listed in triggers.ini\",\"arg\":\"home/announce {\\\"message\\\":\\\"Water under the kitchen sink.\\\",\\\"room\\\":\\\"Kitchen\\\"}\"");
+    try expectHas(lt, "\"tool\":\"announce\",\"decision\":\"deny\",\"why\":\"quiet hours: only urgent triggers and workflows speak on the house's speakers\"");
+    // by day the door is said too, in its room
+    f.core.fixed_now = quietDay() + 12 * 3600;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = door_path, .data = "{\"device\":\"back_door\",\"room\":\"Hall\",\"from\":\"open\",\"to\":\"closed\"}" });
+    _ = try f.core.pollNow("door");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = door_path, .data = "{\"device\":\"back_door\",\"room\":\"Hall\",\"from\":\"closed\",\"to\":\"open\"}" });
+    try t.expectEqual(1, (try f.core.pollNow("door")).queued);
+    f.core.tick();
+    waitIdle(f.core);
+    try f.rec.waitFor("[door] The back door is open.");
+    try expectHas(try announcedText(&f), "Hall: The back door is open.\n");
+}
+
+test "announce_is_quiet_at_night_unless_urgent" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", "");
+    defer f.deinit();
+    // a schedule of triggers.ini runs as schedule:NAME
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "[schedule]\nallow mcp home/announce *\n" });
+    try withHome(&f);
+    try setTriggers(&f, "[night]\nat = 23:59\ndo = Tell the house the back door is open.\n\n[loud]\nat = 23:59\nurgent = yes\ndo = Tell the house there is water under the sink.\n");
+    f.core.fixed_now = quietDay() + 3 * 3600;
+    // a run nobody watches, not urgent, at night: its call to the speakers refused
+    try f.e.script(1, model.toolReply("n1", "home__announce", "{\"message\":\"The back door is open.\"}"));
+    try f.e.script(2, model.textReply("NOTHING"));
+    _ = try f.core.runTask(try taskNamed(f.core, "night"));
+    try expectHas(try f.e.request(2), "refused by the gate: quiet hours: only urgent triggers and workflows speak on the house's speakers");
+    // an urgent one speaks
+    try f.e.script(3, model.toolReply("l1", "home__announce", "{\"message\":\"Water under the sink.\"}"));
+    try f.e.script(4, model.textReply("NOTHING"));
+    _ = try f.core.runTask(try taskNamed(f.core, "loud"));
+    try expectHas(try f.e.request(4), "done: said on every speaker");
+    try t.expectEqualStrings("every speaker: Water under the sink.\n", try announcedText(&f));
+    // by day the first speaks too
+    f.core.fixed_now = quietDay() + 12 * 3600;
+    try f.e.script(5, model.toolReply("n2", "home__announce", "{\"message\":\"The back door is open.\"}"));
+    try f.e.script(6, model.textReply("NOTHING"));
+    _ = try f.core.runTask(try taskNamed(f.core, "night"));
+    try expectHas(try f.e.request(6), "done: said on every speaker");
+}

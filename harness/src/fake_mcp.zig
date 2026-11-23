@@ -7,8 +7,10 @@
 //! Before the tools/list reply it sends a notification and a `ping`
 //! request, to prove the client skips the one and answers the other.
 //! `harness-fake --mcp --home` is homemcp's stand-in instead: `home_state`,
-//! `home_set` (the living room light) and `home_guarded` (the front door),
-//! each device's state kept while it runs.
+//! `home_set` (the living room light), `home_guarded` (the front door) and
+//! `announce` (what it is asked to say is kept in the file `announced` of
+//! its folder, "ROOM: TEXT" or "every speaker: TEXT" a line), each
+//! device's state kept while it runs; its resources as `--mcp`'s.
 //!
 //! `Http` below is the same server over HTTP (Streamable HTTP), part of
 //! fake.zig's stand-in, for the tests of mcp_http.zig.
@@ -21,7 +23,7 @@ const tools_json =
 ;
 
 const home_tools_json =
-    \\{"tools":[{"name":"home_state","description":"Every device in the home: its state now. Only reads.","inputSchema":{"type":"object","properties":{"device":{"type":"string"}}}},{"name":"home_set","description":"One action on an ordinary device.","inputSchema":{"type":"object","properties":{"device":{"type":"string"},"action":{"type":"string"},"value":{"type":"string"}},"required":["device","action"]}},{"name":"home_guarded","description":"One action on a guarded device: locks.","inputSchema":{"type":"object","properties":{"device":{"type":"string"},"action":{"type":"string"}},"required":["device","action"]}}]}
+    \\{"tools":[{"name":"home_state","description":"Every device in the home: its state now. Only reads.","inputSchema":{"type":"object","properties":{"device":{"type":"string"}}}},{"name":"home_set","description":"One action on an ordinary device.","inputSchema":{"type":"object","properties":{"device":{"type":"string"},"action":{"type":"string"},"value":{"type":"string"}},"required":["device","action"]}},{"name":"home_guarded","description":"One action on a guarded device: locks.","inputSchema":{"type":"object","properties":{"device":{"type":"string"},"action":{"type":"string"}},"required":["device","action"]}},{"name":"announce","description":"Say a short message on the house's speakers.","inputSchema":{"type":"object","properties":{"message":{"type":"string"},"speaker":{"type":"string"},"room":{"type":"string"}},"required":["message"]}}]}
 ;
 
 /// homemcp's stand-in: what its devices are now.
@@ -29,7 +31,7 @@ const Home = struct {
     light_on: bool = false,
     door_locked: bool = true,
 
-    fn call(h: *Home, a: std.mem.Allocator, name: []const u8, args: ?std.json.ObjectMap) ![]const u8 {
+    fn call(h: *Home, io: Io, a: std.mem.Allocator, name: []const u8, args: ?std.json.ObjectMap) ![]const u8 {
         const eql = std.mem.eql;
         const field = struct {
             fn f(m: ?std.json.ObjectMap, key: []const u8) []const u8 {
@@ -40,6 +42,15 @@ const Home = struct {
         const device = field(args, "device");
         const action = field(args, "action");
         if (eql(u8, name, "home_state")) return textResult(a, try std.fmt.allocPrint(a, "living_room_light (light): {s}\nfront_door (lock, guarded): {s}", .{ if (h.light_on) "on" else "off", if (h.door_locked) "locked" else "unlocked" }), false);
+        if (eql(u8, name, "announce")) {
+            const message = field(args, "message");
+            if (message.len == 0) return textResult(a, "say what to announce: message", true);
+            const room = field(args, "room");
+            const where = if (room.len > 0) room else "every speaker";
+            const old = Io.Dir.cwd().readFileAlloc(io, "announced", a, .limited(1 << 20)) catch "";
+            Io.Dir.cwd().writeFile(io, .{ .sub_path = "announced", .data = try std.fmt.allocPrint(a, "{s}{s}: {s}\n", .{ old, where, message }) }) catch {};
+            return textResult(a, if (room.len > 0) try std.fmt.allocPrint(a, "done: said in {s}", .{room}) else "done: said on every speaker", false);
+        }
         const guarded = eql(u8, name, "home_guarded");
         if (!guarded and !eql(u8, name, "home_set")) return textResult(a, "unknown tool", true);
         if (eql(u8, device, "living_room_light")) {
@@ -100,7 +111,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, ho
             send(io, "{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"tools\":[]}}");
             result = if (home != null) home_tools_json else tools_json;
         } else if (std.mem.eql(u8, method, "tools/call")) {
-            result = if (home) |h| homeCall(a, h, v) catch return 1 else call(io, a, v, env, pinged) catch return 1;
+            result = if (home) |h| homeCall(io, a, h, v) catch return 1 else call(io, a, v, env, pinged) catch return 1;
         } else if (std.mem.eql(u8, method, "resources/read")) {
             result = resource(io, a, v) orelse {
                 send(io, std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"error\":{{\"code\":-32002,\"message\":\"no such resource\"}}}}", .{id_json}) catch return 1);
@@ -147,12 +158,12 @@ fn textResult(a: std.mem.Allocator, text: []const u8, is_error: bool) ![]const u
     return std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"isError\":{}}}", .{ s, is_error });
 }
 
-fn homeCall(a: std.mem.Allocator, h: *Home, v: std.json.Value) ![]const u8 {
+fn homeCall(io: Io, a: std.mem.Allocator, h: *Home, v: std.json.Value) ![]const u8 {
     const params = v.object.get("params") orelse return textResult(a, "no params", true);
     if (params != .object) return textResult(a, "bad params", true);
     const name_v = params.object.get("name") orelse return textResult(a, "no name", true);
     const args: ?std.json.ObjectMap = if (params.object.get("arguments")) |x| (if (x == .object) x.object else null) else null;
-    return h.call(a, if (name_v == .string) name_v.string else "", args);
+    return h.call(io, a, if (name_v == .string) name_v.string else "", args);
 }
 
 fn call(io: Io, a: std.mem.Allocator, v: std.json.Value, env: *const std.process.Environ.Map, pinged: bool) ![]const u8 {
