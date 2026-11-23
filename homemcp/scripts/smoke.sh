@@ -164,7 +164,8 @@ check("initialize: resources can be subscribed to", m is not None and m["result"
 send({"jsonrpc": "2.0", "id": 900, "method": "tools/list"})
 m = recv(900)
 tools = [t["name"] for t in m["result"]["tools"]] if m else []
-check("tools: state, set, guarded, wait", tools == ["home_state", "home_set", "home_guarded", "home_wait"], str(tools))
+# the Home Assistant example has speakers that may announce
+check("tools: state, set, guarded, wait (and announce with speakers)", tools == ["home_state", "home_set", "home_guarded"] + (["announce"] if hub == "ha" else []) + ["home_wait"], str(tools))
 guarded = next((t for t in m["result"]["tools"] if t["name"] == "home_guarded"), {}) if m else {}
 check("the guarded tool asks for a person", guarded.get("_meta", {}).get("anthropic/requiresUserInteraction") is True, str(guarded)[:200])
 # changes, pushed: a resource per device, and who is home (Home Assistant)
@@ -249,6 +250,16 @@ if hub == "ha":
     check("a scene that sets the front door is refused through home_set", err and "also sets lock.front_door" in text, text)
     text, err = call("home_guarded", {"device": "leaving", "action": "activate"})
     check("... and runs through home_guarded when the file guards it", not err and text.startswith("done: leaving is last run "), text)
+    text, err = call("announce", {"speaker": "hall_voice", "message": "Water under the kitchen sink."})
+    check("announce says a message on a voice satellite", not err and text == "done: said on hall_voice (Hall)", text)
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/homesim/announcements", headers={"Authorization": "Bearer " + os.environ["HA_TOKEN"]})
+    heard = urllib.request.urlopen(req, timeout=5).read().decode()
+    check("... Home Assistant was asked to say it there", "assist_satellite.hall_voice: Water under the kitchen sink." in heard, heard)
+    text, err = call("announce", {"speaker": "hall_voice", "message": "<speak>x</speak>"})
+    check("announce takes text only", err and text.startswith("text only"), text)
+    text, err = call("announce", {"speaker": "living_room_light", "message": "hi"})
+    check("... and only on a speaker that may", err and text.startswith("living_room_light may not announce"), text)
+    check("the speakers are a resource", '"name": "hall_voice"' in json.dumps(json.loads(read("home://speakers"))), read("home://speakers"))
 poke(names["light"], {"available": False})
 time.sleep(1.0)
 text, err = call("home_set", {"device": "living_room_light", "action": "off"})
@@ -269,15 +280,16 @@ printf '\n[device leaving_unguarded]\nid = scene.leaving\nkind = scene\nallow = 
 check "the Home Assistant stand-in starts" 'wait_port "$HA_PORT"'
 check "check: every device through Home Assistant" 'HA_TOKEN=smoke-token "$B" check "$T/ha.ini" >"$T/c" && grep -q "front_door (lock.front_door, lock, guarded): locked; may: lock" "$T/c"'
 check "check: changes come in as they happen" 'grep -qxF "Changes come in as they happen (Home Assistant'"'"'s WebSocket API)." "$T/c" && grep -qF "People: anna (person.anna) is home, ben (person.ben) is away." "$T/c"'
+check "check: the speakers that may announce" 'grep -qxF "Speakers that may announce: kitchen_speaker (Kitchen, through tts.piper), hall_voice (Hall)." "$T/c"'
 check "discover writes a home file that check reads" 'HA_TOKEN=smoke-token "$B" discover "http://127.0.0.1:$HA_PORT" >"$T/found.ini" 2>"$T/found.txt" && HA_TOKEN=smoke-token "$B" check "$T/found.ini" >"$T/c2" && grep -q "front_door (lock.front_door, lock, guarded): locked; may: lock" "$T/c2"'
-check "... with safe defaults, and a summary in plain words" 'grep -qxF "Found 15 devices in 5 rooms, and 2 people." "$T/found.txt" && grep -qF "Left out: Front door camera (a camera), Kitchen smoke alarm (a smoke or CO alarm)" "$T/found.txt" && ! grep -q "^id = camera" "$T/found.ini" && grep -qF ";   camera.front_door (Front door camera)" "$T/found.ini"'
+check "... with safe defaults, and a summary in plain words" 'grep -qxF "Found 16 devices in 5 rooms, and 2 people." "$T/found.txt" && grep -qxF "May announce: Hall voice." "$T/found.txt" && grep -qF "Left out: Front door camera (a camera), Kitchen smoke alarm (a smoke or CO alarm)" "$T/found.txt" && ! grep -q "^id = camera" "$T/found.ini" && grep -qF ";   camera.front_door (Front door camera)" "$T/found.ini"'
 check "discover without HA_TOKEN says so" '! env -u HA_TOKEN "$B" discover "http://127.0.0.1:$HA_PORT" >/dev/null 2>"$T/err" && grep -q HA_TOKEN "$T/err"'
 check "discover with a wrong token says so" '! HA_TOKEN=wrong "$B" discover "http://127.0.0.1:$HA_PORT" >/dev/null 2>"$T/err" && grep -qF "the token was refused (HA_TOKEN)" "$T/err"'
 check "check: a wrong token is named" '! HA_TOKEN=wrong "$B" check "$T/ha.ini" 2>"$T/err" && grep -q "token was refused" "$T/err"'
 sed -e "s|^log = .*|log = nowhere/actions.jsonl|" "$T/ha.ini" >"$T/badlog.ini"
 check "a log that can't be opened is named" '! HA_TOKEN=smoke-token "$B" "$T/badlog.ini" </dev/null 2>"$T/err" && grep -q "can.t open the log .*nowhere" "$T/err"'
 HA_TOKEN=smoke-token python3 -I "$T/mcp.py" ha "$B" "$T/ha.ini" "$HA_PORT" || fail=1
-check "the log has one line per action" '[ "$(grep -c "\"result\":\"done\"" "$T/ha-actions.jsonl")" = 13 ] && grep -q "is offline: nothing was sent" "$T/ha-actions.jsonl"'
+check "the log has one line per action" '[ "$(grep -c "\"result\":\"done\"" "$T/ha-actions.jsonl")" = 14 ] && grep -q "is offline: nothing was sent" "$T/ha-actions.jsonl"'
 check "... refused ones too: what the agent tried is on record" 'grep -q "\"device\":\"kettle\".*\"action\":\"on\".*\"result\":\"refused\"" "$T/ha-actions.jsonl" && grep -q "\"device\":\"front_door\".*\"action\":\"unlock\".*\"result\":\"refused\"" "$T/ha-actions.jsonl" && grep -q "\"tool\":\"home_set\",\"device\":\"front_door\".*\"result\":\"refused\",\"message\":\"front_door is guarded" "$T/ha-actions.jsonl" && grep -q "\"device\":\"thermostat\".*\"value\":30,\"result\":\"refused\"" "$T/ha-actions.jsonl"'
 
 # --- as Zigbee2MQTT, through mosquitto ---

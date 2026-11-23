@@ -11,7 +11,8 @@ pub const Who = struct {
     agent: []const u8 = "main",
     /// What started the run, the same down a delegation chain: `owner`,
     /// `schedule:NAME`, `trigger:NAME`, `workflow:NAME/STEP`, `app:NAME`,
-    /// `member:NAME` (a household member's message).
+    /// `member:NAME` (a household member's message), `room:NAME` (speech
+    /// in a room of the house, through Home Assistant's voice satellites).
     by: []const u8 = "owner",
     /// The run that delegated this one: its definition is the first that
     /// delegated, its parent's the next.
@@ -27,7 +28,7 @@ pub const Who = struct {
 };
 
 /// The kinds of a who: what started a run, and `agent` for definitions.
-const kinds = [_][]const u8{ "owner", "schedule", "trigger", "workflow", "app", "agent", "member" };
+const kinds = [_][]const u8{ "owner", "schedule", "trigger", "workflow", "app", "agent", "member", "room" };
 
 /// A household member's (`member:NAME`), or a pattern of members' (`member`,
 /// `member:a*`).
@@ -39,6 +40,54 @@ pub fn isMember(text: []const u8) bool {
 pub fn memberName(by: []const u8) ?[]const u8 {
     if (!isMember(by)) return null;
     return nameOf(by);
+}
+
+/// Speech in a room of the house (`room:NAME`), or a pattern of rooms'
+/// (`room`, `room:k*`): anyone there may be speaking, so it is a place,
+/// never a person.
+pub fn isRoom(text: []const u8) bool {
+    return eql(kindOf(text), "room");
+}
+
+/// The room's name in `room:NAME`; null for any other who.
+pub fn roomName(by: []const u8) ?[]const u8 {
+    if (!isRoom(by)) return null;
+    return nameOf(by);
+}
+
+/// A letter's lower case: ASCII, Latin-1 and Latin Extended-A (Polish
+/// among them), Greek and Cyrillic capitals; others as they are. A room's
+/// name in its who is written so (speech.zig).
+pub fn lowerLetter(cp: u21) u21 {
+    if (cp < 0x80) return std.ascii.toLower(@intCast(cp));
+    if (cp >= 0xC0 and cp <= 0xDE and cp != 0xD7) return cp + 0x20;
+    if (cp >= 0x100 and cp <= 0x137) return if (cp % 2 == 0) cp + 1 else cp;
+    if (cp >= 0x139 and cp <= 0x148) return if (cp % 2 == 1) cp + 1 else cp;
+    if (cp >= 0x14A and cp <= 0x177) return if (cp % 2 == 0) cp + 1 else cp;
+    if (cp == 0x178) return 0xFF;
+    if (cp >= 0x179 and cp <= 0x17E) return if (cp % 2 == 1) cp + 1 else cp;
+    if (cp >= 0x391 and cp <= 0x3A9 and cp != 0x3A2) return cp + 0x20;
+    if (cp >= 0x410 and cp <= 0x42F) return cp + 0x20;
+    if (cp >= 0x400 and cp <= 0x40F) return cp + 0x50;
+    return cp;
+}
+
+/// Whether a room's name (a section's, `*` allowed) is written as speech's
+/// who holds it: no capital, space or apostrophe; else it never matches.
+pub fn roomNameOk(name: []const u8) bool {
+    const view = std.unicode.Utf8View.init(name) catch return false;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp == ' ' or cp == '\'' or cp == 0x2019) return false;
+        if (lowerLetter(cp) != cp) return false;
+    }
+    return true;
+}
+
+/// What runs with the household's scope (gate.zig's member order): a
+/// member's message or speech in a room, or a pattern of either.
+pub fn isHousehold(text: []const u8) bool {
+    return isMember(text) or isRoom(text);
 }
 
 /// What of a call's who a pattern matches: its definition, one of the
@@ -209,4 +258,26 @@ test "member_is_a_who_kind" {
     try t.expectEqual(null, memberName("owner"));
     // someone is there to answer: the owner, for a member
     try t.expect(!(Who{ .by = "member:anna" }).unattended());
+}
+
+test "room_is_a_who_kind" {
+    // speech in the house: a room, never a person
+    try t.expect(isValue("room:kitchen"));
+    try t.expect(isValue("room:łazienka"));
+    try t.expect(!isValue("room"));
+    for ([_][]const u8{ "room", "room:kitchen", "room:k*" }) |p| try t.expect(isPattern(p));
+    try t.expect(matchesBy("room", "room:kitchen"));
+    try t.expect(matchesBy("room:k*", "room:kitchen"));
+    try t.expect(!matchesBy("room:hall", "room:kitchen"));
+    // a member's section never reaches a room, nor a room's a member
+    try t.expect(!matchesBy("member", "room:kitchen"));
+    try t.expect(!matchesBy("room", "member:anna"));
+    try t.expect(isRoom("room:kitchen") and !isRoom("member:anna") and !isRoom("owner"));
+    try t.expectEqualStrings("kitchen", roomName("room:kitchen").?);
+    try t.expectEqual(null, roomName("member:anna"));
+    // the household's scope: members and rooms, nothing else
+    for ([_][]const u8{ "member:anna", "room:kitchen", "room", "member" }) |w| try t.expect(isHousehold(w));
+    for ([_][]const u8{ "owner", "schedule:x", "trigger:room", "workflow:member/x", "agent:main" }) |w| try t.expect(!isHousehold(w));
+    // the owner answers what a room asks, later: not a run nobody watches
+    try t.expect(!(Who{ .by = "room:kitchen" }).unattended());
 }

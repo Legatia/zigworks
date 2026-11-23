@@ -4,7 +4,9 @@
 //! server on stdio instead (see fake_mcp.zig; `--mcp --home` is homemcp's
 //! stand-in). `harness-fake --browse URL` is the owner's browser for a
 //! sign-in: it opens URL, follows its redirect to 127.0.0.1, and prints the
-//! page's status and text.
+//! page's status and text. `harness-fake --ha URL TOKEN BODY` is Home
+//! Assistant's llama.cpp integration: it POSTs BODY to URL with TOKEN as
+//! its API key and prints the answer's status and body.
 const std = @import("std");
 const fake = @import("fake.zig");
 const fake_mcp = @import("fake_mcp.zig");
@@ -24,6 +26,15 @@ pub fn main(init: std.process.Init) u8 {
         const out = std.fmt.allocPrint(init.arena.allocator(), "{d}\n{s}\n", .{ page.status, page.body }) catch return 1;
         std.Io.File.stdout().writeStreamingAll(io, out) catch return 1;
         return if (page.status == 200) 0 else 1;
+    }
+    if (args.len == 5 and std.mem.eql(u8, args[1], "--ha")) {
+        const page = fake.sayAsHomeAssistant(io, init.arena.allocator(), args[2], args[3], args[4]) catch |e| {
+            std.debug.print("harness-fake: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        const out = std.fmt.allocPrint(init.arena.allocator(), "{d}\n{s}\n", .{ page.status, page.body }) catch return 1;
+        std.Io.File.stdout().writeStreamingAll(io, out) catch return 1;
+        return 0;
     }
     var i: usize = 1;
     while (i < args.len) : (i += 1) {

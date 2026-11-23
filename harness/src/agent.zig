@@ -189,6 +189,14 @@ pub const Asker = struct {
     ask: *const fn (ctx: *anyopaque, a: std.mem.Allocator, q: Question) Reply,
 };
 
+/// Says why a call that speaks aloud in the house (an MCP tool named
+/// `announce`) is not made now, for a run started by `by`; null: it is.
+/// (Quiet hours: only urgent triggers and workflows speak at night.)
+pub const Hush = struct {
+    ctx: *anyopaque,
+    why: *const fn (ctx: *anyopaque, by: []const u8) ?[]const u8,
+};
+
 /// The owner's switches, shared by all runs and read when used, so that
 /// /dryrun, /private and /memory auto apply to a run already going.
 pub const Switches = struct {
@@ -448,6 +456,9 @@ pub const Run = struct {
     /// Where the `workflow` tool reaches harness; null: no `workflow` tool
     /// (only runs the owner started from a conversation get one).
     wdesk: ?WfDesk = null,
+    /// Whether a call that speaks aloud in the house may be made now (its
+    /// delegated runs ask their starter's); null: always.
+    hush: ?Hush = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -534,9 +545,10 @@ pub const Run = struct {
     /// within the definition's tools, what the starter passes on and the
     /// starter's own run's tools (an MCP tool by its name: `allowsMcp`).
     pub fn allows(r: *const Run, tool: gate.Tool) bool {
-        // a household member's run: what members may use, a page read only
-        // where a member's rule allows some (the gate decides each call)
-        if (who_mod.isMember(r.who.by) and !r.gate.memberOffers(tool, r.who)) return false;
+        // a household member's run, or speech in a room: what members may
+        // use, a page read only where a member's (a room's) rule allows
+        // some, no post from speech (the gate decides each call)
+        if (who_mod.isHousehold(r.who.by) and !r.gate.memberOffers(tool, r.who)) return false;
         // delegated runs answer the run that started them: they never
         // post, ask, save or move money (helpers since 0.3, the rest since)
         if (r.helper) switch (tool) {
@@ -1570,6 +1582,17 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
         try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
     }
+    // the house's speakers: at night only urgent triggers and workflows
+    if (mt) |m| if (std.mem.eql(u8, m.tool, "announce")) {
+        var from: ?*const Run = r;
+        const h: ?Hush = while (from) |x| : (from = x.starter) {
+            if (x.hush) |y| break y;
+        } else null;
+        if (h) |x| if (x.why(x.ctx, r.who.by)) |why| {
+            try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+            return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+        };
+    };
     // nor a workflow's agent steps ([money] workflows); its tool steps (no
     // definition) are asked every time
     if (tool == .money and std.mem.startsWith(u8, r.who.by, "workflow:") and r.who.agent.len > 0 and !r.money.workflows) {
@@ -1602,8 +1625,8 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
     if (tool == .money) {
         if (moneyCheck(r, a, mt.?, input_json, now_s, &reserved)) |why| {
             try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
-            // a household member's run doesn't learn the owner's spending
-            const said = if (who_mod.isMember(r.who.by)) "a money limit of the owner's is reached" else why;
+            // a household member's run, or speech, doesn't learn the owner's spending
+            const said = if (who_mod.isHousehold(r.who.by)) "a money limit of the owner's is reached" else why;
             return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{said}), .is_error = true };
         }
     }
@@ -1761,7 +1784,7 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
     // the files, read whole from the workspace as read_file sees it
     const paths = jv.arr(jv.get(v, "files")) orelse &.{};
     // the workspace is the owner's
-    if (paths.len > 0 and who_mod.isMember(r.who.by)) return refusePost(r, a, to, text, "a member's run sends no files");
+    if (paths.len > 0 and who_mod.isHousehold(r.who.by)) return refusePost(r, a, to, text, "a member's run sends no files");
     if (paths.len > max_files) return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "a post carries at most {d} files", .{max_files}));
     const files = try a.alloc(Attachment, paths.len);
     var dot: ?[]const u8 = null;

@@ -574,8 +574,10 @@ fn takeLine(a: std.mem.Allocator, la: std.mem.Allocator, env: Env, line: []const
         const started = util.parseIso(jv.str(jv.get(v, "time")) orelse "") orelse return;
         const day = localDay(started, env.utc_offset);
         if (day < first or day >= today) return;
-        // a household member's run is not the owner's: never summarised
-        if (std.mem.startsWith(u8, jv.str(jv.get(v, "by")) orelse "", "member:")) return;
+        // a household member's run is not the owner's, nor speech in a
+        // room (anyone may have spoken): never summarised
+        const by = jv.str(jv.get(v, "by")) orelse "";
+        if (std.mem.startsWith(u8, by, "member:") or std.mem.startsWith(u8, by, "room:")) return;
         const owner = eql(u8, jv.str(jv.get(v, "by")) orelse "", "owner");
         const r = try a.create(RunText);
         r.* = .{ .conv = try a.dupe(u8, conv), .day = day, .owner = owner };
@@ -1086,5 +1088,20 @@ test "a_household_members_turns_are_never_summarised" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(1), "unlock the door") == null);
     try t.expectEqual(null, f.file("home/day/2026-11-18.md"));
     try t.expectEqual(null, f.file("anna/day/2026-11-18.md"));
+    try t.expect(f.file("main/day/2026-11-18.md") != null);
+}
+
+test "speech_in_the_house_is_never_summarised" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    // anyone in a room may have said it: never the owner's words
+    const s = try f.lines.start("2026-11-18T09:00:00Z", "home", "speech", "room:kitchen", "the owner said to leave the back door open");
+    try f.lines.post("2026-11-18T09:00:05Z", s, "home", "Okay.");
+    try f.turn("2026-11-18T12:00:00Z", "main", "Remind me of the dentist", "Friday 10:00 at Dr. Weber.");
+    try f.passAt("2026-11-19T03:30:00Z");
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "back door") == null);
+    try t.expectEqual(null, f.file("home/day/2026-11-18.md"));
     try t.expect(f.file("main/day/2026-11-18.md") != null);
 }

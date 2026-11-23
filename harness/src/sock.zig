@@ -279,7 +279,12 @@ pub const Listener = struct {
     /// SO_REUSEADDR would let another program bind the same port; elsewhere
     /// no SO_REUSEPORT. `port` 0 takes a free one.
     pub fn openExclusive(port: u16) !Listener {
-        const ip: net.IpAddress = .{ .ip4 = .loopback(port) };
+        return openOn(.{ .ip4 = .loopback(port) });
+    }
+
+    /// `openExclusive` on exactly `ip` (an address of this machine; its
+    /// port 0 takes a free one): nothing but that address is listened on.
+    pub fn openOn(ip: net.IpAddress) !Listener {
         var addr: Addr = .from(&ip);
         const h = try sys.socket(addr.family(), false);
         errdefer sys.close(h);
@@ -287,6 +292,7 @@ pub const Listener = struct {
         try sys.bind(h, &addr);
         try sys.listen(h, 128);
         try sys.localAddress(h, &addr);
+        // sockaddr_in and sockaddr_in6 keep the port at the same place
         return .{ .handle = h, .port = std.mem.bigToNative(u16, addr.in.port) };
     }
 

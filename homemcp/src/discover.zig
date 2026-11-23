@@ -136,6 +136,8 @@ pub fn classifyHa(a: Allocator, id: []const u8, name: []const u8, dclass: []cons
     if (eq(u8, domain, "valve")) return .{ .act = .{ .kind = .valve, .allow = &.{.close}, .guarded = true } };
     if (eq(u8, domain, "scene")) return .{ .act = .{ .kind = .scene, .allow = &.{.activate} } };
     if (eq(u8, domain, "media_player")) return .{ .act = .{ .kind = .media, .allow = &.{ .play, .pause, .volume } } };
+    // a voice satellite is there to speak: it may say a message, nothing else
+    if (eq(u8, domain, "assist_satellite")) return .{ .act = .{ .kind = .satellite, .allow = &.{.announce} } };
     if (eq(u8, domain, "binary_sensor") and has(&binary_classes, dclass)) return .{ .act = .{ .kind = .sensor } };
     if (eq(u8, domain, "sensor") and has(&number_classes, dclass)) return .{ .act = .{ .kind = .sensor } };
     return .{ .left = .unknown };
@@ -426,6 +428,8 @@ fn render(a: Allocator, r: *const Read) !Found {
         \\; scenes that set them answer only to home_guarded, which is asked about
         \\; every time, and only the safe way: lock, close, arm. Sensors are only
         \\; seen. A plug may power a heater or a kettle: for those, make it allow = off.
+        \\; Voice satellites may announce (the announce tool); a media player may too
+        \\; with allow = announce and [home] tts = your text-to-speech entity.
         \\
     );
     if (r.hub == .zigbee2mqtt) try o.appendSlice(a, "; Zigbee2MQTT has no rooms: add room = lines.\n");
@@ -481,6 +485,7 @@ fn render(a: Allocator, r: *const Read) !Found {
     if (people > 0) try sm.print(a, ", and {d} {s}", .{ people, if (people == 1) "person" else "people" });
     try sm.appendSlice(a, ".\n");
     try listLine(a, &sm, r.items, "May act when asked: ", .acts);
+    try listLine(a, &sm, r.items, "May announce: ", .speaks);
     try listLine(a, &sm, r.items, "Guarded, asked every time: ", .guarded);
     try listLine(a, &sm, r.items, "Only seen: ", .seen);
     try listLine(a, &sm, r.items, "Left out: ", .left);
@@ -490,13 +495,14 @@ fn render(a: Allocator, r: *const Read) !Found {
     return .{ .text = o.items, .summary = sm.items };
 }
 
-const Group = enum { acts, guarded, seen, left };
+const Group = enum { acts, speaks, guarded, seen, left };
 
 fn listLine(a: Allocator, o: *std.ArrayList(u8), items: []const Item, label: []const u8, g: Group) !void {
     var n: usize = 0;
     for (items) |it| {
         const in = switch (g) {
-            .acts => it.verdict == .act and !it.verdict.act.guarded and it.verdict.act.allow.len > 0,
+            .acts => it.verdict == .act and !it.verdict.act.guarded and it.verdict.act.allow.len > 0 and it.verdict.act.kind != .satellite,
+            .speaks => it.verdict == .act and it.verdict.act.kind == .satellite,
             .guarded => it.verdict == .act and it.verdict.act.guarded,
             .seen => it.verdict == .act and !it.verdict.act.guarded and it.verdict.act.allow.len == 0,
             .left => it.verdict == .left,
@@ -682,6 +688,12 @@ test "discover_writes_safe_defaults" {
     try t.expectEqual(3, th.modes.len);
     try t.expect(allows(deviceIn(&c, "fan.ceiling_fan").?, &.{ .on, .off, .speed }));
     try t.expect(allows(deviceIn(&c, "media_player.kitchen_speaker").?, &.{ .play, .pause, .volume }));
+    try t.expect(!deviceIn(&c, "media_player.kitchen_speaker").?.allows(.announce));
+    // a voice satellite may announce; nothing else
+    const voice = deviceIn(&c, "assist_satellite.hall_voice").?;
+    try t.expectEqual(.satellite, voice.kind);
+    try t.expectEqualStrings("Hall", voice.room);
+    try t.expect(allows(voice, &.{.announce}) and voice.allow.len == 1 and !voice.guarded);
     // locks, garage doors and valves: guarded, and only the safe way
     const lock = deviceIn(&c, "lock.front_door").?;
     try t.expect(lock.guarded and allows(lock, &.{.lock}));
@@ -709,7 +721,9 @@ test "discover_writes_safe_defaults" {
     try t.expectEqual(2, c.people.len);
     try t.expectEqualStrings("person.anna", c.people[0].id);
     // a summary in plain words
-    try t.expect(std.mem.startsWith(u8, found.summary, "Found 15 devices in 5 rooms, and 2 people.\n"));
+    try t.expect(std.mem.startsWith(u8, found.summary, "Found 16 devices in 5 rooms, and 2 people.\n"));
+    try t.expect(std.mem.indexOf(u8, found.summary, "May announce: Hall voice.\n") != null);
+    try t.expect(std.mem.indexOf(u8, found.summary, "May act when asked: ") != null and std.mem.indexOf(u8, found.summary, "Hall voice, ") == null);
     try t.expect(std.mem.indexOf(u8, found.summary, "Left out: Front door camera (a camera), Kitchen smoke alarm (a smoke or CO alarm)") != null);
 }
 

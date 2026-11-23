@@ -45,6 +45,8 @@ const wstate = @import("wstate.zig");
 const voice_mod = @import("voice.zig");
 const quiet_mod = @import("quiet.zig");
 const household = @import("household.zig");
+const speech = @import("speech.zig");
+const voiceagent = @import("voiceagent.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -545,6 +547,26 @@ pub const Core = struct {
     /// for the owner (state/member-asks).
     members: household.Members,
     member_asks: household.Asks,
+    /// Home Assistant's conversation agent (speech in the house), while
+    /// `harness run` serves it.
+    voice_agent: ?*voiceagent.Server,
+    /// What /status says of it when it doesn't run ("": nothing to say).
+    voice_note_buf: [240]u8,
+    voice_note_len: usize,
+    /// Said to the owner when it can't start (`pending_warning`).
+    voice_warn_buf: [300]u8,
+    /// The address and token it runs with (SHA-256), for /reload.
+    voice_key: [32]u8,
+    /// Speech's contexts, one per Home Assistant conversation.
+    speech_contexts: speech.Contexts,
+    /// A speech turn is going: one at a time.
+    speech_busy: std.atomic.Value(bool),
+    /// Speech's calls waiting for the owner (state/room-asks).
+    room_asks: household.Asks,
+    /// The events triggers' `announce` said lately ("TRIGGER\x00ID", the
+    /// last 256): a retry over the same events says nothing again.
+    announced: std.ArrayList([]u8),
+    announced_mutex: Io.Mutex,
     /// Harness's recent messages in groups for members (in memory): a
     /// member's reply to one is addressed to the bot.
     group_posts: std.ArrayList(GroupPost) = .empty,
@@ -756,6 +778,19 @@ pub const Core = struct {
         c.member_asks = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "member-asks" }));
         errdefer c.member_asks.deinit();
         c.member_asks.load() catch |e| c.log.write(.config, false, .{ .event = "member asks not read", .why = @errorName(e) }) catch {};
+        c.voice_agent = null;
+        @memset(&c.voice_note_buf, 0);
+        c.voice_note_len = 0;
+        @memset(&c.voice_warn_buf, 0);
+        c.voice_key = @splat(0);
+        c.speech_contexts = .init(gpa);
+        errdefer c.speech_contexts.deinit();
+        c.speech_busy = .init(false);
+        c.room_asks = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "room-asks" }));
+        errdefer c.room_asks.deinit();
+        c.room_asks.load() catch |e| c.log.write(.config, false, .{ .event = "room asks not read", .why = @errorName(e) }) catch {};
+        c.announced = .empty;
+        c.announced_mutex = .init;
         c.group_posts = .empty;
         c.group_posts_mutex = .init;
         c.bot_name_len = 0;
@@ -813,6 +848,7 @@ pub const Core = struct {
         c.noteUrgent();
         c.voidRunItems();
         c.pruneMemberAsks();
+        c.pruneRoomAsks();
         c.loadRan();
         c.syncTrigInfo();
         // the workflow instances going, and items of none void
@@ -844,6 +880,8 @@ pub const Core = struct {
         c.watcher = null;
         c.stopRuns();
         if (c.worker) |w| w.join();
+        // no speech from now on; its requests going end (their runs stopped)
+        c.stopVoiceAgent();
         while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
@@ -856,6 +894,10 @@ pub const Core = struct {
         c.convs.deinit();
         c.members.deinit();
         c.member_asks.deinit();
+        c.room_asks.deinit();
+        c.speech_contexts.deinit();
+        for (c.announced.items) |x| c.gpa.free(x);
+        c.announced.deinit(c.gpa);
         c.group_posts.deinit(c.gpa);
         c.defs.deinit();
         for (c.told_topics.items) |n| c.gpa.free(n);
@@ -1096,7 +1138,10 @@ pub const Core = struct {
         c.queue_mutex.unlock(c.io);
         settings_locked = false;
         c.settings_mutex.unlock(c.io);
-        return c.restartMcp();
+        const said = try c.restartMcp();
+        // the voice agent's address or token changed: it starts again
+        if (std.mem.eql(u8, c.role, "run")) c.startVoiceAgent();
+        return said;
     }
 
     /// The second half of reload, outside its locks.
@@ -2187,6 +2232,387 @@ pub const Core = struct {
         _ = c.removeMember(a, name) catch {};
     }
 
+    // ---- speech in the house: harness as Home Assistant's conversation agent ----
+
+    /// Starts Home Assistant's conversation agent for `harness run`, on
+    /// `[voice_agent] listen` with the token stored as `[voice_agent]
+    /// token`; again on /reload when either changed. Not set up (no token
+    /// stored): nothing runs and nothing is said. A token that can't be
+    /// served is said to the owner; /status says why.
+    fn startVoiceAgent(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const va = c.cfg.voice_agent;
+        if (std.mem.eql(u8, va.listen, "off")) {
+            c.stopVoiceAgent();
+            return c.setVoiceNote("off ([voice_agent] listen = off)");
+        }
+        const store = c.store orelse return;
+        const token = (store.get(c.io, a, va.token) catch null) orelse {
+            c.stopVoiceAgent();
+            return c.setVoiceNote("");
+        };
+        if (c.voice_agent != null and std.mem.eql(u8, &c.voice_key, &voiceKey(va.listen, token))) return;
+        _ = c.startVoiceAgentWith(token, va.listen) catch |e| {
+            const why: []const u8 = switch (e) {
+                error.ShortToken => std.fmt.allocPrint(a, "its token ({s}) is shorter than {d} characters: store a longer one with harness secret add {s}", .{ va.token, voiceagent.min_token, va.token }) catch "its token is too short",
+                error.AddressInUse => std.fmt.allocPrint(a, "another program listens on {s}", .{va.listen}) catch "its port is taken",
+                else => std.fmt.allocPrint(a, "it can't listen on {s} ({s}): is it an address of this machine?", .{ va.listen, @errorName(e) }) catch "it can't listen there",
+            };
+            c.setVoiceNote(why);
+            c.log.write(.chat, false, .{ .event = "voice agent not started", .address = va.listen, .why = @errorName(e) }) catch {};
+            const warn = std.fmt.bufPrint(&c.voice_warn_buf, "The voice agent for Home Assistant didn't start: {s}.", .{util.cut(why, 220)}) catch return;
+            if (c.chan != null) c.say(warn) else if (c.pending_warning == null) {
+                c.pending_warning = warn;
+            }
+        };
+    }
+
+    /// Starts the voice agent with `token` on `listen` (config.parseListen's
+    /// rules; port 0: a free one): `harness run`'s way, and the tests'. The
+    /// token is masked from now on; only its digest is kept. Its port.
+    pub fn startVoiceAgentWith(c: *Core, token: []const u8, listen: []const u8) !u16 {
+        c.stopVoiceAgent();
+        c.masks.add(c.cfg.voice_agent.token, token) catch {};
+        const s = try voiceagent.Server.start(c.gpa, c.io, .{ .listen = listen, .token = token, .log = &c.log, .answerer = .{ .ctx = c, .answer = speechAnswer } });
+        c.voice_agent = s;
+        c.voice_key = voiceKey(listen, token);
+        c.setVoiceNote("");
+        return s.port;
+    }
+
+    fn stopVoiceAgent(c: *Core) void {
+        const s = c.voice_agent orelse return;
+        c.voice_agent = null;
+        c.voice_key = @splat(0);
+        s.stop();
+    }
+
+    fn voiceKey(listen: []const u8, token: []const u8) [32]u8 {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(listen);
+        h.update("\x00");
+        h.update(token);
+        return h.finalResult();
+    }
+
+    fn setVoiceNote(c: *Core, text: []const u8) void {
+        const n = @min(text.len, c.voice_note_buf.len);
+        @memcpy(c.voice_note_buf[0..n], text[0..n]);
+        c.voice_note_len = n;
+    }
+
+    /// /status's line: where the voice agent answers, or why it doesn't
+    /// (nothing when it isn't set up).
+    fn voiceStatus(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        if (c.voice_agent) |s| return std.fmt.allocPrint(a, "\nVoice agent: Home Assistant's requests on {s}.", .{s.address()});
+        if (c.voice_note_len == 0) return "";
+        return std.fmt.allocPrint(a, "\nVoice agent: {s}.", .{c.voice_note_buf[0..c.voice_note_len]});
+    }
+
+    /// The voice agent's answerer: what was said in a room, answered as a
+    /// turn of `room:NAME` in the conversation `home`; never fails (its
+    /// own line in the language spoken). Logged like other runs, with a
+    /// `speech` line of its own.
+    fn speechAnswer(ctx: *anyopaque, a: std.mem.Allocator, said: speech.Said) []const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        const lang = speech.langOf(said.language, said.text);
+        const started = util.nowMs(c.io);
+        var buf: [speech.max_who]u8 = undefined;
+        const by = speech.roomWho(&buf, said.room);
+        const words = c.speak(a, said, by, lang) catch |e| blk: {
+            c.log.write(.chat, false, .{ .event = "speech failed", .by = by, .why = @errorName(e) }) catch {};
+            break :blk speech.own(lang, .failed);
+        };
+        c.log.write(.chat, false, .{ .event = "speech", .by = by, .room = said.room, .language = said.language, .stream = said.stream, .ms = util.nowMs(c.io) - started, .bytes = words.len }) catch {};
+        return words;
+    }
+
+    /// One speech turn at a time, beside the chat queue (a speaker can't
+    /// wait behind the owner's long turn); a second waits within its own
+    /// time. Counted as a background run: /reload waits for it, and none
+    /// starts while settings are replaced or harness stops.
+    fn speak(c: *Core, a: std.mem.Allocator, said: speech.Said, by: []const u8, lang: speech.Lang) ![]const u8 {
+        const until = util.nowMs(c.io) + @as(i64, c.cfg.voice_agent.seconds) * 1000;
+        while (c.speech_busy.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+            if (util.nowMs(c.io) >= until or c.quitting.load(.acquire)) return speech.own(lang, .busy);
+            c.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        }
+        defer c.speech_busy.store(false, .release);
+        while (true) {
+            {
+                c.settings_mutex.lockUncancelable(c.io);
+                defer c.settings_mutex.unlock(c.io);
+                if (c.quitting.load(.acquire)) return speech.own(lang, .restarting);
+                if (!c.restarting.load(.acquire)) {
+                    _ = c.bg_active.fetchAdd(1, .acq_rel);
+                    break;
+                }
+            }
+            // /reload restarts the MCP servers: a moment
+            if (util.nowMs(c.io) >= until - 3000) return speech.own(lang, .restarting);
+            c.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        }
+        defer _ = c.bg_active.fetchSub(1, .acq_rel);
+        return c.speechTurn(a, said, by, lang);
+    }
+
+    /// The turn: the main definition's tools and model with harness's
+    /// instructions for speech (Ruling 2), its own model client, an empty
+    /// memory, no history or summaries, no outbox (the answer is spoken),
+    /// `[voice_agent] seconds` and at most 8 steps; its context Home
+    /// Assistant's conversation's (Ruling 8). A guarded call becomes the
+    /// owner's question (`RoomAsk`).
+    fn speechTurn(c: *Core, a: std.mem.Allocator, said: speech.Said, by: []const u8, lang: speech.Lang) ![]const u8 {
+        var def = (try c.defs.get(a, "main")) orelse agents.builtin_main;
+        def.body = speech.instructions;
+        const va = c.cfg.voice_agent;
+        var client = try c.modelClient(if (va.model.len > 0) va.model else if (def.model.len > 0) def.model else c.cfg.model.model, c.cfg.model.max_tokens);
+        defer client.deinit();
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, def.name);
+        defer c.unregister(&flag);
+        // harness began to stop after the check above: this one stops too
+        if (c.quitting.load(.acquire)) flag.store(true, .release);
+        c.helper_pool.takeAlways(c.io, def.name);
+        defer c.helper_pool.give(c.io, def.name);
+        var run = c.runAs(&client, "speech", .{ .agent = def.name, .by = by }, &flag);
+        run.conversation = speech.conversation;
+        run.useDefinition(def);
+        run.holds_place = true;
+        run.limits.turn_seconds = va.seconds;
+        run.limits.steps_per_turn = @min(run.limits.steps_per_turn, 8);
+        var none: memory.Store = .{ .gpa = c.gpa, .io = c.io, .dir = &.{} };
+        run.mem = &none;
+        run.history = null;
+        run.context_note = try speech.contextNote(a, said.room, said.language);
+        var ask: RoomAsk = .{ .core = c, .room = by["room:".len..], .shown = said.room };
+        run.asker = .{ .ctx = &ask, .ask = RoomAsk.ask };
+        var fresh: agent.Conversation = .init(c.gpa);
+        defer fresh.deinit();
+        const conv: *agent.Conversation = if (said.conversation.len > 0) try c.speech_contexts.get(said.conversation, c.now()) else &fresh;
+        _ = conv.trim(24 * 1024);
+        const res = try agent.turn(&run, conv, said.text, false);
+        defer agent.freeResult(&run, res);
+        if (res.ended_by) |why| {
+            if (c.quitting.load(.acquire)) return speech.own(lang, .restarting);
+            if (std.mem.startsWith(u8, why, "Time limit")) return speech.own(lang, .too_long);
+            c.log.write(.chat, false, .{ .event = "speech ended", .by = by, .why = why }) catch {};
+            return speech.own(lang, .failed);
+        }
+        // only the model's last message is the answer: its working text
+        // before a call ("Let me check.") is never spoken
+        const words = try speech.forTheEar(a, try finalText(a, conv));
+        if (words.len > 0) return words;
+        return speech.own(lang, if (ask.asked) .asked else .nothing);
+    }
+
+    /// The text of a turn's last message when it is the model's (its
+    /// answer); "" when the turn ended on tool results.
+    fn finalText(a: std.mem.Allocator, conv: *const agent.Conversation) ![]const u8 {
+        const tn = conv.turns.getLastOrNull() orelse return "";
+        const m = tn.messages.getLastOrNull() orelse return "";
+        if (m.role != .assistant) return "";
+        var out: std.ArrayList(u8) = .empty;
+        for (m.blocks) |b| switch (b) {
+            .text => |x| {
+                if (out.items.len > 0) try out.append(a, '\n');
+                try out.appendSlice(a, x);
+            },
+            else => {},
+        };
+        return out.items;
+    }
+
+    /// Speech's asker (Ruling 6): the gate's ask becomes the owner's
+    /// one-tap item at once and the call stops there; the model is told to
+    /// say so. Only an MCP call is asked (the gate refuses the rest).
+    const RoomAsk = struct {
+        core: *Core,
+        /// The room's name in its who (`kitchen`, `unknown`).
+        room: []const u8,
+        /// As Home Assistant names it ("Kitchen"); "": not known.
+        shown: []const u8,
+        /// The owner was asked in this turn.
+        asked: bool = false,
+
+        fn ask(ctx: *anyopaque, a: std.mem.Allocator, q: agent.Question) agent.Reply {
+            const ra: *RoomAsk = @ptrCast(@alignCast(ctx));
+            return ra.core.roomAsk(a, ra, q) catch .{ .answer = .unsent };
+        }
+    };
+
+    /// What speech's model is told of a call that went to the owner.
+    const room_told = "the owner got a question on their phone; say so in one short sentence, and don't try another way";
+
+    /// Makes speech's call the owner's item, shown in main: "Someone in
+    /// Hall asked by voice to unlock the front door." [Unlock] [No], no
+    /// "Allow 24 h". Kept (state/room-asks) before it is shown, so a tap at
+    /// once finds it.
+    fn roomAsk(c: *Core, a: std.mem.Allocator, ra: *RoomAsk, q: agent.Question) !agent.Reply {
+        const tool = q.tool orelse return .{ .answer = .unsent };
+        if (q.kind != .approval or (tool != .mcp and tool != .money)) return .{ .answer = .unsent };
+        if (c.chan == null or c.questions_closed.load(.acquire)) return .{ .answer = .unsent };
+        // the same call asked again (a "yes" in the room, a retry): its item
+        if (c.room_asks.waiting(ra.room, q.arg)) |id| {
+            ra.asked = true;
+            return .{ .answer = .deferred, .item = id, .text = room_told };
+        }
+        if (c.room_asks.countOf(ra.room) >= household.max_asks)
+            return .{ .answer = .full, .text = try std.fmt.allocPrint(a, "{d} requests from this room already wait for the owner", .{household.max_asks}) };
+        const what = try household.plainCall(a, q.arg);
+        const title = try c.masks.scrubAlloc(a, try speech.question(a, ra.shown, what));
+        const dry: []const u8 = if (tool == .money and c.switches.dry_run.load(.acquire)) "\nDry run is on: this call is not made." else "";
+        const body = try std.fmt.allocPrint(a, "{s}{s}\nAnyone in a room can speak: harness can't tell who it was. Nothing is said in the room afterwards.", .{ title, dry });
+        if (body.len > inbox_mod.max_body) return .{ .answer = .full, .text = "too long to ask the owner: make the call smaller" };
+        const choices = [_]inbox_mod.Choice{ .{ .key = "once", .label = try household.yesLabel(a, q.arg) }, .{ .key = "deny", .label = "No" } };
+        c.makeRoom();
+        const id = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = try c.inbox.add(.{
+                .kind = "approval",
+                .by = q.who.by,
+                .agent = q.who.agent,
+                .rid = if (q.rid != 0) q.rid else null,
+                .run = if (q.label.len > 0) q.label else null,
+                .conversation = "main",
+                .waiter = try std.fmt.allocPrint(a, "room {s}", .{ra.room}),
+                .title = firstLine(title),
+                .body = body,
+                .choices = &choices,
+                .text = .reason,
+                .expires = c.now() + @as(i64, c.cfg.limits.approval_seconds),
+            }, c.now(), c.newToken());
+            c.saveInbox();
+            c.logOpen(it);
+            break :blk it.id;
+        };
+        c.room_asks.add(.{ .item = id, .member = ra.room, .agent = q.who.agent, .conversation = speech.conversation, .tool = @tagName(tool), .arg = q.arg, .what = what }) catch {
+            _ = c.settle(id, .void, .{ .text = "it could not be kept", .at = c.now(), .via = .harness });
+            return .{ .answer = .unsent, .item = id };
+        };
+        if (!c.showItem(id, null)) {
+            _ = c.settle(id, .void, .{ .text = "it could not be shown", .at = c.now(), .via = .harness });
+            return .{ .answer = .unsent, .item = id };
+        }
+        ra.asked = true;
+        return .{ .answer = .deferred, .item = id, .text = room_told };
+    }
+
+    /// At start: speech's call whose item is no longer open is dropped; an
+    /// open item whose call was not kept is void.
+    fn pruneRoomAsks(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const ids = c.room_asks.itemsOf(a, "") catch return;
+        for (ids) |id| {
+            const waits = blk: {
+                c.inbox.mutex.lockUncancelable(c.io);
+                defer c.inbox.mutex.unlock(c.io);
+                const it = c.inbox.find(id) orelse break :blk false;
+                break :blk it.status == .open;
+            };
+            if (!waits) _ = c.room_asks.take(a, id);
+        }
+        var orphans: std.ArrayList(u64) = .empty;
+        {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            for (c.inbox.items.items) |it| if (it.status == .open and std.mem.startsWith(u8, it.waiter, "room ")) orphans.append(a, it.id) catch {};
+        }
+        for (orphans.items) |id| if (!c.room_asks.has(id)) {
+            _ = c.settle(id, .void, .{ .text = "its call was not kept", .at = c.now(), .via = .harness });
+        };
+    }
+
+    /// The owner answered speech's call item `id`, or it expired: Yes
+    /// makes the call on a thread of its own; nothing is said in the room
+    /// (its answer was given). Off state/room-asks first: never made twice.
+    fn roomAnswered(c: *Core, id: u64) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const yes = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = c.inbox.find(id) orelse return;
+            const ans = it.answer orelse break :blk false;
+            break :blk it.status == .answered and std.mem.eql(u8, ans.key orelse "", "once");
+        };
+        const k = c.room_asks.take(a, id) orelse {
+            if (yes) c.say(std.fmt.allocPrint(a, "Item {d}: nothing was done: harness no longer has that call.", .{id}) catch "Nothing was done: harness no longer has that call.");
+            return;
+        };
+        if (yes) c.startRoomCall(k);
+    }
+
+    const RoomCall = struct { arena: std.heap.ArenaAllocator, ask: household.Ask };
+
+    /// Makes an allowed speech call on a thread of its own (the press came
+    /// on the thread that reads Telegram), counted as a background run.
+    fn startRoomCall(c: *Core, k: household.Ask) void {
+        const failed = "Result: nothing was done: harness could not make the call.";
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const box = c.gpa.create(RoomCall) catch return c.noteOnItem(arena.allocator(), k.item, failed);
+        box.arena = .init(c.gpa);
+        box.ask = household.copyAsk(box.arena.allocator(), k) catch {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return c.noteOnItem(arena.allocator(), k.item, failed);
+        };
+        _ = c.bg_active.fetchAdd(1, .acq_rel);
+        const th = std.Thread.spawn(.{}, roomCallJob, .{ c, box }) catch {
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return c.noteOnItem(arena.allocator(), k.item, failed);
+        };
+        th.detach();
+    }
+
+    fn roomCallJob(c: *Core, box: *RoomCall) void {
+        defer {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+        }
+        c.makeRoomCall(box.arena.allocator(), box.ask);
+    }
+
+    /// Makes speech call `k` the owner allowed: as `room:NAME`, through the
+    /// gate again (a deny added since stops it), which takes the owner's
+    /// yes for this exact call only; what the device said goes on the
+    /// owner's message.
+    fn makeRoomCall(c: *Core, a: std.mem.Allocator, k: household.Ask) void {
+        while (c.restarting.load(.acquire) and !c.quitting.load(.acquire)) c.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        const call = household.splitCall(k.arg) orelse return;
+        const name: ?[]const u8 = for (c.mcp_tools) |m| {
+            if (std.mem.eql(u8, m.server.name, call.server) and std.mem.eql(u8, m.tool, call.tool)) break m.def.name;
+        } else null;
+        const out: tools.Output = if (name) |n| blk: {
+            var flag: std.atomic.Value(bool) = .init(false);
+            c.register(&flag, k.agent);
+            defer c.unregister(&flag);
+            const by = std.fmt.allocPrint(a, "room:{s}", .{k.member}) catch return;
+            var def = (c.defs.get(a, k.agent) catch null) orelse agents.builtin_main;
+            def.body = speech.instructions;
+            var run = c.runAs(&c.chat_client, "speech call", .{ .agent = def.name, .by = by }, &flag);
+            run.conversation = speech.conversation;
+            run.useDefinition(def);
+            var none: memory.Store = .{ .gpa = c.gpa, .io = c.io, .dir = &.{} };
+            run.mem = &none;
+            run.history = null;
+            var go: MemberGo = .{ .arg = k.arg, .item = k.item };
+            run.asker = .{ .ctx = &go, .ask = MemberGo.ask };
+            break :blk agent.stepCall(&run, a, n, call.input) catch |e| .{ .text = @errorName(e), .is_error = true };
+        } else .{ .text = std.fmt.allocPrint(a, "{s} is not running", .{call.server}) catch "its server is not running", .is_error = true };
+        c.noteOnItem(a, k.item, std.fmt.allocPrint(a, "Result: {s}", .{util.cut(std.mem.trim(u8, out.text, " \t\r\n"), 600)}) catch return);
+    }
+
     /// The owner's text in `main`.
     pub fn handleText(c: *Core, text: []const u8) !void {
         return c.handleTextIn("main", text);
@@ -3080,6 +3506,8 @@ pub const Core = struct {
         if (std.mem.startsWith(u8, waiter, "workflow ")) c.wakeWorkflow(waiter);
         // a household member's call: made on the owner's yes, the member told
         if (std.mem.startsWith(u8, waiter, "member ")) c.memberAnswered(id);
+        // speech's call: made on the owner's yes (nothing is said in the room)
+        if (std.mem.startsWith(u8, waiter, "room ")) c.roomAnswered(id);
         return true;
     }
 
@@ -3930,8 +4358,20 @@ pub const Core = struct {
             .snaps = &c.snaps,
             .defs = &c.defs,
             .registry = c.registry(),
+            .hush = .{ .ctx = c, .why = hushWhy },
         };
     }
+
+    /// Why a run started by `by` says nothing on the house's speakers now
+    /// (Ruling 11 of the voice plan): in quiet hours, a run nobody watches
+    /// whose trigger or workflow is not urgent; null: it may.
+    fn hushWhy(ctx: *anyopaque, by: []const u8) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        if (c.quietEnd(by) == null) return null;
+        return quiet_speakers;
+    }
+
+    const quiet_speakers = "quiet hours: only urgent triggers and workflows speak on the house's speakers";
 
     /// A run started by `who`: a chat turn by the owner, a task or brief
     /// by its schedule (`schedule:NAME`), both of the definition main.
@@ -3948,6 +4388,8 @@ pub const Core = struct {
         c.findBrowser();
         c.stopMcp();
         c.startMcp();
+        // Home Assistant's conversation agent: with `harness run` only
+        if (std.mem.eql(u8, c.role, "run")) c.startVoiceAgent();
     }
 
     /// Starts the app server ([apps] on); returns the link to its page,
@@ -6718,6 +7160,8 @@ pub const Core = struct {
             try take.append(a, ev);
         }
         if (take.items.len == 0) return;
+        // said aloud beside its action: the post never waits for the speakers
+        if (tr.announce.len > 0) c.startAnnounce(tr, take.items, by_hand);
         switch (tr.action) {
             .say => |template| try c.triggerSay(a, tr, template, take.items, by_hand),
             .do => |instruction| try c.triggerDo(a, tr, instruction, take.items, by_hand),
@@ -6960,6 +7404,138 @@ pub const Core = struct {
         };
         if (got.refused) |w| c.say(try std.fmt.allocPrint(a, "The message of trigger {s} was not posted: {s}.", .{ tr.name, w }));
         try c.markDone(a, tr, events, &run, why);
+    }
+
+    /// A trigger's `announce` line said aloud on the house's speakers, a
+    /// line per event (at most 3), in the event's room when it says one
+    /// (homemcp says it on that room's speakers, else on every one),
+    /// through the MCP tool `announce` (the trigger's own server's first).
+    /// The owner wrote it in triggers.ini: allowed as a listed source is (a
+    /// deny rule stops it). In quiet hours only an urgent trigger speaks;
+    /// one run by hand speaks whenever.
+    fn triggerAnnounce(c: *Core, a: std.mem.Allocator, tr: triggers.Trigger, events: []const tstate.Event, by_hand: bool) !void {
+        const by = try std.fmt.allocPrint(a, "trigger:{s}", .{tr.name});
+        const own = if (tr.mcp) |m| m.server else "";
+        var mt: ?*const agent.McpTool = null;
+        for (c.mcp_tools) |*m| if (std.mem.eql(u8, m.tool, "announce") and !m.money) {
+            if (mt == null or std.mem.eql(u8, m.server.name, own)) mt = m;
+        };
+        // a run needs a client; this one makes no model call
+        var client = try c.modelClient(c.cfg.model.model, c.cfg.model.max_tokens);
+        defer client.deinit();
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, tr.agent);
+        defer c.unregister(&flag);
+        var run = c.runIn(&client, try std.fmt.allocPrint(a, "trigger {s}", .{tr.name}), .{ .by = by, .agent = "" }, tr.to, &flag);
+        const m = mt orelse {
+            try run.logRun(.trigger, false, .{ .name = tr.name, .event = "not announced", .why = "no MCP server offers announce" });
+            return;
+        };
+        if (!by_hand and c.quietEnd(by) != null) {
+            try run.logRun(.gate, false, .{ .tool = "announce", .decision = "deny", .why = quiet_speakers });
+            return;
+        }
+        for (events[0..@min(events.len, 3)]) |ev| {
+            // said once, whatever retries the events see
+            if (!c.firstAnnounce(tr.name, ev.id)) continue;
+            const text = std.mem.trim(u8, try triggers.fill(a, tr.announce, ev.fields), " \t\r\n");
+            if (text.len == 0) continue;
+            var input: std.ArrayList(u8) = .empty;
+            try input.print(a, "{{\"message\":{f}", .{std.json.fmt(util.cut(text, 300), .{})});
+            if (eventRoom(a, ev.fields)) |room| try input.print(a, ",\"room\":{f}", .{std.json.fmt(room, .{})});
+            try input.append(a, '}');
+            const arg = try std.fmt.allocPrint(a, "{s}/announce {s}", .{ m.server.name, input.items });
+            const d = blk: {
+                c.lock.lockUncancelable(c.io);
+                defer c.lock.unlock(c.io);
+                break :blk c.gate.decide(a, .mcp, arg, c.now(), .{ .scheduled = true, .listed = "triggers.ini", .who = run.who });
+            };
+            try run.logRun(.gate, false, .{ .tool = "mcp", .decision = @tagName(d.action), .why = d.why, .arg = arg });
+            if (d.action != .allow) continue;
+            const res = m.server.call(a, "announce", input.items, &flag, 30_000, 64 * 1024) catch |e| {
+                try run.logRun(.tool, false, .{ .tool = m.def.name, .arg = arg, .is_error = true, .output = @errorName(e) });
+                continue;
+            };
+            try run.logRun(.tool, false, .{ .tool = m.def.name, .arg = arg, .is_error = res.is_error, .output = res.text, .bytes = res.text.len });
+        }
+    }
+
+    /// Whether trigger `name`'s event `id` is said for the first time (and
+    /// it is noted): the last 256 are kept, in memory.
+    fn firstAnnounce(c: *Core, name: []const u8, id: []const u8) bool {
+        var buf: [160]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}\x00{s}", .{ name, id }) catch return true;
+        c.announced_mutex.lockUncancelable(c.io);
+        defer c.announced_mutex.unlock(c.io);
+        for (c.announced.items) |x| if (std.mem.eql(u8, x, key)) return false;
+        const owned = c.gpa.dupe(u8, key) catch return true;
+        if (c.announced.items.len >= 256) c.gpa.free(c.announced.orderedRemove(0));
+        c.announced.append(c.gpa, owned) catch {
+            c.gpa.free(owned);
+            return true;
+        };
+        return true;
+    }
+
+    /// A trigger's `announce` on a thread of its own, with copies of what
+    /// it says: the action goes on at once (a house of satellites takes
+    /// seconds a line). Counted as a background run.
+    const Announce = struct { arena: std.heap.ArenaAllocator, tr: triggers.Trigger, events: []tstate.Event, by_hand: bool };
+
+    fn startAnnounce(c: *Core, tr: triggers.Trigger, events: []const tstate.Event, by_hand: bool) void {
+        const box = c.gpa.create(Announce) catch return;
+        box.arena = .init(c.gpa);
+        const a = box.arena.allocator();
+        const copied = blk: {
+            const list = a.alloc(tstate.Event, @min(events.len, 3)) catch break :blk null;
+            for (list, events[0..list.len]) |*o, ev| {
+                const fields = a.alloc(triggers.Field, ev.fields.len) catch break :blk null;
+                for (fields, ev.fields) |*f, x| f.* = .{ .name = a.dupe(u8, x.name) catch break :blk null, .value = a.dupe(u8, x.value) catch break :blk null };
+                o.* = .{ .id = a.dupe(u8, ev.id) catch break :blk null, .at = ev.at, .fields = fields };
+            }
+            break :blk list;
+        };
+        const trc = tr.clone(a) catch null;
+        if (copied == null or trc == null) {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return;
+        }
+        box.tr = trc.?;
+        box.events = copied.?;
+        box.by_hand = by_hand;
+        _ = c.bg_active.fetchAdd(1, .acq_rel);
+        const th = std.Thread.spawn(.{}, announceJob, .{ c, box }) catch {
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return;
+        };
+        th.detach();
+    }
+
+    fn announceJob(c: *Core, box: *Announce) void {
+        defer {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+        }
+        if (c.quitting.load(.acquire)) return;
+        c.triggerAnnounce(box.arena.allocator(), box.tr, box.events, box.by_hand) catch |e| {
+            c.log.write(.trigger, false, .{ .name = box.tr.name, .event = "announce failed", .why = @errorName(e) }) catch {};
+        };
+    }
+
+    /// The room an event says: its `room` field, or the one in its `text`
+    /// when that is homemcp's change (a JSON object); null when none.
+    fn eventRoom(a: std.mem.Allocator, fields: []const triggers.Field) ?[]const u8 {
+        for (fields) |f| if (std.mem.eql(u8, f.name, "room") and f.value.len > 0) return f.value;
+        for (fields) |f| if (std.mem.eql(u8, f.name, "text")) {
+            const v = jv.parse(a, f.value) orelse return null;
+            const room = jv.str(jv.get(v, "room")) orelse return null;
+            return if (room.len > 0) room else null;
+        };
+        return null;
     }
 
     /// A trigger's `start = workflow NAME`: an instance per event; one the
@@ -8032,7 +8608,7 @@ pub const Core = struct {
             var snap_note = std.mem.trimEnd(u8, try c.snaps.note(a), "\n");
             snap_note = try std.mem.replaceOwned(u8, a, snap_note, "\n", "; ");
             const mcp_text = try c.mcpStatus(a);
-            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.\nProviders: {s}.{s}{s}{s}{s}", .{
+            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.\nProviders: {s}.{s}{s}{s}{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
                 onOff(c.switches.auto_recall.load(.acquire)), onOff(c.convPrivate(conv)),
                 onOff(c.switches.dry_run.load(.acquire)),
@@ -8043,6 +8619,7 @@ pub const Core = struct {
                 mcp_text,
                 if (snap_note.len > 0) "\nSnapshots: " else "",
                 snap_note,
+                try c.voiceStatus(a),
             });
         }
         if (eql(u8, cmd, "/dryrun")) {
@@ -10495,6 +11072,12 @@ fn checkPairCode(io: Io, path: []const u8, code: []const u8, now_s: i64) bool {
 // ---- tests ----
 
 const t = std.testing;
+
+// speech in the house (Home Assistant's voice agent): their own tests
+test {
+    _ = @import("speech.zig");
+    _ = @import("voiceagent.zig");
+}
 
 const Recorder = struct {
     mutex: Io.Mutex = .init,
@@ -17885,4 +18468,315 @@ test "telegrams_shared_sender_accounts_never_join_or_ask" {
         try f.core.handleIncoming(.{ .from = id, .chat = -100777, .chat_type = "supergroup", .text = try std.fmt.allocPrint(a, "/join {s}", .{code}) });
     try t.expect(std.mem.indexOf(u8, try membersFile(&f), "\"user\":0,") != null);
     try t.expectEqual(0, f.rec.countIn("home", "Hi Anna"));
+}
+
+// ---- speech in the house: harness as Home Assistant's conversation agent ----
+
+const speech_token = "ha-agent-token-for-tests-1";
+
+/// The voice agent started for a test on a free port of 127.0.0.1 (as
+/// `harness run` starts it with the stored token); its port.
+fn startSpeech(f: *Fix) !u16 {
+    return f.core.startVoiceAgentWith(speech_token, "127.0.0.1:0");
+}
+
+/// What Home Assistant's llama.cpp integration sends when someone speaks
+/// in `room` (its Instructions with the Room and Language lines), in its
+/// conversation `conv` ("": none).
+fn speakIn(f: *Fix, port: u16, room: []const u8, lang: []const u8, conv: []const u8, words: []const u8, stream: bool) !voiceagent.Reply {
+    const a = f.e.arena.allocator();
+    const system = try std.fmt.allocPrint(a, "You are a voice assistant for Home Assistant.\nAnswer in plain text.\nRoom: {s}\nLanguage: {s}\nCurrent time is 21:04:00.", .{ room, lang });
+    var body: std.ArrayList(u8) = .empty;
+    try body.print(a, "{{\"model\":\"harness\",\"stream\":{},\"max_tokens\":150,\"temperature\":1.0,", .{stream});
+    if (conv.len > 0) try body.print(a, "\"user\":{f},", .{std.json.fmt(conv, .{})});
+    try body.print(a, "\"messages\":[{{\"role\":\"system\",\"content\":{f}}},{{\"role\":\"user\",\"content\":{f}}}]}}", .{ std.json.fmt(system, .{}), std.json.fmt(words, .{}) });
+    return voiceagent.request(t.io, a, "127.0.0.1", port, .{ .auth = "Bearer " ++ speech_token, .body = body.items });
+}
+
+/// The words of a JSON answer.
+fn spokenOf(f: *Fix, r: voiceagent.Reply) ![]const u8 {
+    if (r.status != 200) {
+        std.debug.print("status {d}: {s}\n", .{ r.status, r.body });
+        return error.NotAnswered;
+    }
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, f.e.arena.allocator(), r.body, .{});
+    return v.object.get("choices").?.array.items[0].object.get("message").?.object.get("content").?.string;
+}
+
+test "speech_turns_a_light_on_and_answers_for_the_ear" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try withHome(&f);
+    const port = try startSpeech(&f);
+    try f.e.script(1, model.toolReply("h1", "home__home_set", "{\"device\":\"living_room_light\",\"action\":\"on\"}"));
+    try f.e.script(2, model.textReply("**Światło** w salonie jest włączone."));
+    const words = try spokenOf(&f, try speakIn(&f, port, "Salon", "pl", "", "włącz światło w salonie", false));
+    // what was answered, for the ear
+    try t.expectEqualStrings("Światło w salonie jest włączone.", words);
+    // the run knew the room and the language, with harness's instructions
+    const req = try f.e.request(1);
+    for ([_][]const u8{ "You are the home's voice assistant", "Room: Salon.", "Answer in the language with the code pl.", "włącz światło w salonie", "\"name\":\"search\"", "home__home_set" }) |needle| try expectHas(req, needle);
+    try expectHas(try f.e.request(2), "done: living_room_light is on");
+    // logged like other runs: room:salon, in the conversation home
+    const lt = try logText(&f);
+    try expectHas(lt, "\"conversation\":\"home\",\"run\":\"speech\",\"by\":\"room:salon\"");
+    try expectHas(lt, "\"decision\":\"allow\",\"why\":\"household default: the home's reads and ordinary devices\"");
+    try expectHas(lt, "\"event\":\"speech\",\"by\":\"room:salon\"");
+    // nothing went to Telegram, and the token is nowhere in the log
+    try t.expectEqual(0, f.rec.count("Światło"));
+    try t.expect(std.mem.indexOf(u8, lt, speech_token) == null);
+}
+
+test "speech_sees_nothing_of_the_owners" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    {
+        f.core.lock.lockUncancelable(t.io);
+        defer f.core.lock.unlock(t.io);
+        const res = try f.core.mem.add("The spare key is under the blue pot", null, f.core.now());
+        _ = try f.core.mem.setPinned(res.id, true);
+    }
+    try addTopic(&f, "house-search", 5012);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.paths.agents, "main.md" }), .data = "---\nname: main\ndescription: Mine.\ntools: *\n---\nI am Tobias; my bank is Example Bank.\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const port = try startSpeech(&f);
+    try f.e.script(1, model.textReply("It's 21 degrees."));
+    try t.expectEqualStrings("It's 21 degrees.", try spokenOf(&f, try speakIn(&f, port, "Kitchen", "en", "", "how warm is it?", false)));
+    const req = try f.e.request(1);
+    for ([_][]const u8{ "blue pot", "house-search", "Example Bank", "\"name\":\"send\"", "\"name\":\"shell\"", "\"name\":\"read_file\"", "\"name\":\"write_file\"", "\"name\":\"recall\"", "\"name\":\"remember\"", "\"name\":\"history\"", "\"name\":\"delegate\"", "\"name\":\"ask_owner\"", "\"name\":\"fetch\"", "\"name\":\"skill_save\"", "\"name\":\"web\"" }) |needle| {
+        if (std.mem.indexOf(u8, req, needle) != null) {
+            std.debug.print("speech's request has {s}\n", .{needle});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // never read for the owner's memory
+    f.core.memory_quiet_s = 0;
+    f.core.tick();
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    try t.expectEqual(1, f.e.server.modelRequests());
+}
+
+test "a_spoken_unlock_becomes_the_owners_question" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try withHome(&f);
+    const port = try startSpeech(&f);
+    try f.e.script(1, model.toolReply("g1", "home__home_guarded", "{\"device\":\"front_door\",\"action\":\"unlock\"}"));
+    try f.e.script(2, model.textReply("I asked the owner on their phone."));
+    const words = try spokenOf(&f, try speakIn(&f, port, "Hall", "en", "", "unlock the front door", false));
+    try t.expectEqualStrings("I asked the owner on their phone.", words);
+    // the owner's one-tap question, in the owner's chat: where, and that
+    // nobody knows who spoke; no Allow 24 h
+    try f.rec.waitIn("main", "Someone in Hall asked by voice to unlock the front door.");
+    try f.rec.waitIn("main", "Anyone in a room can speak: harness can't tell who it was.");
+    const b = f.rec.buttonsWith("Someone in Hall asked by voice") orelse return error.NoQuestion;
+    try t.expect(b.get("day") == null);
+    try expectHas(try inboxFileWith(&f, "\"label\":\"Unlock\""), "\"choices\":[{\"key\":\"once\",\"label\":\"Unlock\"},{\"key\":\"deny\",\"label\":\"No\"}]");
+    // the model was told it waits, and to say so in a sentence
+    try expectHas(try f.e.request(2), "waits for the owner in the inbox: the owner got a question on their phone; say so in one short sentence");
+    // the owner taps Unlock: that exact call, as room:hall; the outcome on their message
+    f.core.handleCallback(42, b.msg, b.get("once").?);
+    try f.rec.waitFor("Result: done: front_door is unlocked");
+    const lt = try logText(&f);
+    try expectHas(lt, "\"decision\":\"allow\",\"why\":\"allowed once by the owner (item 1)\"");
+    try expectHas(lt, "\"run\":\"speech call\",\"by\":\"room:hall\"");
+    try t.expectEqual(2, f.e.server.modelRequests());
+}
+
+test "a_spoken_yes_approves_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try withHome(&f);
+    const port = try startSpeech(&f);
+    try f.e.script(1, model.toolReply("g1", "home__home_guarded", "{\"device\":\"front_door\",\"action\":\"unlock\"}"));
+    try f.e.script(2, model.textReply(""));
+    // the model says nothing of it: harness's own sentence, in Polish
+    try t.expectEqualStrings("Właściciel dostał pytanie na telefon.", try spokenOf(&f, try speakIn(&f, port, "Przedpokój", "pl", "c1", "otwórz drzwi wejściowe", false)));
+    try f.rec.waitIn("main", "Someone in Przedpokój asked by voice to unlock the front door.");
+    // "yes" said in the room: words to the model, the same call the same item
+    try f.e.script(3, model.toolReply("g2", "home__home_guarded", "{\"device\":\"front_door\",\"action\":\"unlock\"}"));
+    try f.e.script(4, model.textReply("Właściciel jeszcze nie odpowiedział."));
+    _ = try spokenOf(&f, try speakIn(&f, port, "Przedpokój", "pl", "c1", "tak, zatwierdzam", false));
+    try expectHas(try f.e.request(4), "waits for the owner in the inbox: the owner got a question on their phone; say so in one short sentence, and don't try another way (item 1)");
+    try t.expectEqual(1, f.rec.count("asked by voice to unlock the front door"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "allowed once by the owner") == null);
+}
+
+test "a_follow_up_keeps_its_conversation" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const port = try startSpeech(&f);
+    try f.e.script(1, model.textReply("The hall light is on."));
+    try f.e.script(2, model.textReply("It is at 30 %."));
+    try f.e.script(3, model.textReply("Which light?"));
+    _ = try spokenOf(&f, try speakIn(&f, port, "Hall", "en", "01JDQ8ZK3T", "is the hall light on?", false));
+    _ = try spokenOf(&f, try speakIn(&f, port, "Hall", "en", "01JDQ8ZK3T", "how bright?", false));
+    // the follow-up has the turn before it; another conversation doesn't
+    try expectHas(try f.e.request(2), "is the hall light on?");
+    try expectHas(try f.e.request(2), "The hall light is on.");
+    _ = try spokenOf(&f, try speakIn(&f, port, "Kitchen", "en", "01JDQ8ZOTHER", "how bright?", false));
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "is the hall light on?") == null);
+}
+
+test "speech_past_its_time_says_so" {
+    var f: Fix = undefined;
+    try f.init("[voice_agent]\nseconds = 5\n", "", "");
+    defer f.deinit();
+    const port = try startSpeech(&f);
+    try f.e.script(1, comptime "{\"delay_ms\":8000," ++ model.textReply("too late")[1..]);
+    const started = util.nowMs(t.io);
+    const words = try spokenOf(&f, try speakIn(&f, port, "Kuchnia", "pl", "", "jaka będzie pogoda?", false));
+    const took = util.nowMs(t.io) - started;
+    std.debug.print("a 5 s spoken answer, the model 8 s late: answered after {d} ms\n", .{took});
+    try t.expectEqualStrings("Przepraszam, to trwało za długo. Spróbuj jeszcze raz.", words);
+    try t.expect(took >= 4000 and took < 7500);
+}
+
+test "speech_streams_for_home_assistant" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const port = try startSpeech(&f);
+    try f.e.script(1, model.textReply("Tomorrow: 3 degrees and rain."));
+    const r = try speakIn(&f, port, "Kitchen", "en", "", "what's the weather tomorrow?", true);
+    try t.expectEqual(200, r.status);
+    try expectHas(r.head, "content-type: text/event-stream");
+    try expectHas(r.body, "\"delta\":{\"role\":\"assistant\",\"content\":\"Tomorrow: 3 degrees and rain.\"}");
+    try expectHas(r.body, "data: [DONE]");
+}
+
+test "the_voice_agent_says_what_it_is_in_status" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const port = try startSpeech(&f);
+    try expectHas(try f.core.command(a, "/status"), try std.fmt.allocPrint(a, "Voice agent: Home Assistant's requests on 127.0.0.1:{d}.", .{port}));
+    // a request with another token is no speech
+    const wrong = try voiceagent.request(t.io, a, "127.0.0.1", port, .{ .auth = "Bearer another-token-0123456789", .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" });
+    try t.expectEqual(401, wrong.status);
+    try t.expectEqual(0, f.e.server.modelRequests());
+}
+
+/// What homemcp's stand-in was asked to say, a line each ("ROOM: TEXT",
+/// "every speaker: TEXT").
+fn announcedText(f: *Fix) ![]const u8 {
+    const a = f.e.arena.allocator();
+    return Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "home", "announced" }), a, .unlimited) catch "";
+}
+
+test "a_trigger_announces_in_the_events_room" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withHome(&f);
+    const dir = try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "home" });
+    try Io.Dir.cwd().createDirPath(t.io, dir);
+    const leak_path = try std.fs.path.join(a, &.{ dir, "leak" });
+    const door_path = try std.fs.path.join(a, &.{ dir, "door" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = leak_path, .data = "{\"device\":\"sink_leak\",\"room\":\"Kitchen\",\"from\":null,\"to\":\"dry\"}" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = door_path, .data = "{\"device\":\"back_door\",\"room\":\"Hall\",\"from\":null,\"to\":\"closed\"}" });
+    try setTriggers(&f, "[leak]\nmcp = home resource fake://leak\nmatch = text has \"to\":\"wet\"\nurgent = yes\nsay = Water under the kitchen sink.\nannounce = Water under the kitchen sink.\n\n[door]\nmcp = home resource fake://door\nmatch = text has \"to\":\"open\"\nsay = The back door is open.\nannounce = The back door is open.\n");
+    _ = try f.core.pollNow("leak");
+    _ = try f.core.pollNow("door");
+    // 03:12, quiet hours: the urgent leak is said in its room, the door is not
+    f.core.fixed_now = quietDay() + 3 * 3600 + 12 * 60;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = leak_path, .data = "{\"device\":\"sink_leak\",\"room\":\"Kitchen\",\"from\":\"dry\",\"to\":\"wet\"}" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = door_path, .data = "{\"device\":\"back_door\",\"room\":\"Hall\",\"from\":\"closed\",\"to\":\"open\"}" });
+    try t.expectEqual(1, (try f.core.pollNow("leak")).queued);
+    try t.expectEqual(1, (try f.core.pollNow("door")).queued);
+    f.core.tick();
+    waitIdle(f.core);
+    try f.rec.waitFor("[leak] Water under the kitchen sink.");
+    // the door's turn comes at the next tick (one background slot)
+    f.core.tick();
+    waitIdle(f.core);
+    try t.expectEqualStrings("Kitchen: Water under the kitchen sink.\n", try announcedText(&f));
+    const lt = try logText(&f);
+    try expectHas(lt, "\"decision\":\"allow\",\"why\":\"listed in triggers.ini\",\"arg\":\"home/announce {\\\"message\\\":\\\"Water under the kitchen sink.\\\",\\\"room\\\":\\\"Kitchen\\\"}\"");
+    try expectHas(lt, "\"tool\":\"announce\",\"decision\":\"deny\",\"why\":\"quiet hours: only urgent triggers and workflows speak on the house's speakers\"");
+    // by day the door is said too, in its room
+    f.core.fixed_now = quietDay() + 12 * 3600;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = door_path, .data = "{\"device\":\"back_door\",\"room\":\"Hall\",\"from\":\"open\",\"to\":\"closed\"}" });
+    _ = try f.core.pollNow("door");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = door_path, .data = "{\"device\":\"back_door\",\"room\":\"Hall\",\"from\":\"closed\",\"to\":\"open\"}" });
+    try t.expectEqual(1, (try f.core.pollNow("door")).queued);
+    f.core.tick();
+    waitIdle(f.core);
+    try f.rec.waitFor("[door] The back door is open.");
+    try expectHas(try announcedText(&f), "Hall: The back door is open.\n");
+}
+
+test "announce_is_quiet_at_night_unless_urgent" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", "");
+    defer f.deinit();
+    // a schedule of triggers.ini runs as schedule:NAME
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "[schedule]\nallow mcp home/announce *\n" });
+    try withHome(&f);
+    try setTriggers(&f, "[night]\nat = 23:59\ndo = Tell the house the back door is open.\n\n[loud]\nat = 23:59\nurgent = yes\ndo = Tell the house there is water under the sink.\n");
+    f.core.fixed_now = quietDay() + 3 * 3600;
+    // a run nobody watches, not urgent, at night: its call to the speakers refused
+    try f.e.script(1, model.toolReply("n1", "home__announce", "{\"message\":\"The back door is open.\"}"));
+    try f.e.script(2, model.textReply("NOTHING"));
+    _ = try f.core.runTask(try taskNamed(f.core, "night"));
+    try expectHas(try f.e.request(2), "refused by the gate: quiet hours: only urgent triggers and workflows speak on the house's speakers");
+    // an urgent one speaks
+    try f.e.script(3, model.toolReply("l1", "home__announce", "{\"message\":\"Water under the sink.\"}"));
+    try f.e.script(4, model.textReply("NOTHING"));
+    _ = try f.core.runTask(try taskNamed(f.core, "loud"));
+    try expectHas(try f.e.request(4), "done: said on every speaker");
+    try t.expectEqualStrings("every speaker: Water under the sink.\n", try announcedText(&f));
+    // by day the first speaks too
+    f.core.fixed_now = quietDay() + 12 * 3600;
+    try f.e.script(5, model.toolReply("n2", "home__announce", "{\"message\":\"The back door is open.\"}"));
+    try f.e.script(6, model.textReply("NOTHING"));
+    _ = try f.core.runTask(try taskNamed(f.core, "night"));
+    try expectHas(try f.e.request(6), "done: said on every speaker");
+}
+
+test "a_triggers_post_never_waits_for_the_speakers" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withHome(&f);
+    const dir = try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "home" });
+    try Io.Dir.cwd().createDirPath(t.io, dir);
+    const leak_path = try std.fs.path.join(a, &.{ dir, "leak" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = leak_path, .data = "{\"device\":\"sink_leak\",\"room\":\"Kitchen\",\"to\":\"dry\"}" });
+    // the stand-in takes 2.5 s to say a line with "(slow)" in it, as a
+    // house of satellites does
+    try setTriggers(&f, "[leak]\nmcp = home resource fake://leak\nmatch = text has \"to\":\"wet\"\nurgent = yes\nsay = Water under the kitchen sink.\nannounce = Water under the kitchen sink (slow).\n");
+    _ = try f.core.pollNow("leak");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = leak_path, .data = "{\"device\":\"sink_leak\",\"room\":\"Kitchen\",\"to\":\"wet\"}" });
+    try t.expectEqual(1, (try f.core.pollNow("leak")).queued);
+    const started = util.nowMs(t.io);
+    f.core.tick();
+    try f.rec.waitFor("[leak] Water under the kitchen sink.");
+    const posted = util.nowMs(t.io) - started;
+    waitIdle(f.core);
+    const said = util.nowMs(t.io) - started;
+    std.debug.print("the leak was posted after {d} ms, said after {d} ms\n", .{ posted, said });
+    try t.expect(posted < 2000);
+    try t.expectEqualStrings("Kitchen: Water under the kitchen sink (slow).\n", try announcedText(&f));
+}
+
+test "an_event_is_said_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    // a retry (a restart in a run, a budget pause, Resume) takes the same
+    // pending events again: they were said already
+    try t.expect(f.core.firstAnnounce("leak", "341bb1f1c630816f0cfd049739c6456a"));
+    try t.expect(!f.core.firstAnnounce("leak", "341bb1f1c630816f0cfd049739c6456a"));
+    try t.expect(f.core.firstAnnounce("door", "341bb1f1c630816f0cfd049739c6456a"));
+    try t.expect(f.core.firstAnnounce("leak", "8b02f6ae15b4b0f3e2a1dc7e4c3d9a10"));
 }

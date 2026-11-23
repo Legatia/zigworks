@@ -158,6 +158,17 @@ pub const Hub = union(enum) {
         };
     }
 
+    /// Says `message` on speaker `dev`: an Assist satellite's
+    /// `assist_satellite.announce`, a media player's `tts.speak` through
+    /// `[home] tts`. Home Assistant only; it returns once Home Assistant
+    /// has played it (its REST call waits up to 10 s).
+    pub fn announce(h: Hub, a: Allocator, dev: *const config.Device, message: []const u8) !void {
+        return switch (h) {
+            .z2m => error.NotSupportedByHub,
+            .ha => |x| x.announce(a, dev, message),
+        };
+    }
+
     /// Sends an action to a device. `number` and `text` as the action needs.
     pub fn command(h: Hub, a: Allocator, dev: *const config.Device, action: model.Action, number: ?f64, text: ?[]const u8) !void {
         return switch (h) {
@@ -406,7 +417,7 @@ pub const Z2m = struct {
             .position => try std.fmt.allocPrint(a, "{{\"position\":{d}}}", .{@as(i64, @intFromFloat(@round(number.?)))}),
             .lock => "{\"state\":\"LOCK\"}",
             .unlock => "{\"state\":\"UNLOCK\"}",
-            .arm_home, .arm_away, .disarm, .activate, .play, .pause, .volume => return error.NotSupportedByHub,
+            .arm_home, .arm_away, .disarm, .activate, .play, .pause, .volume, .announce => return error.NotSupportedByHub,
         };
         const topic = try std.fmt.allocPrint(a, "{s}/{s}/set", .{ z.cfg.base, dev.id });
         z.lock.lockUncancelable(z.io);
@@ -648,6 +659,8 @@ pub const Ha = struct {
             .play => .{ .service = "media_play" },
             .pause => .{ .service = "media_pause" },
             .volume => .{ .service = "volume_set", .extra = try std.fmt.allocPrint(a, ",\"volume_level\":{s}", .{model.num(@round(number.?) / 100)}) },
+            // said only through `announce`
+            .announce => return error.NotSupportedByHub,
             .temperature => .{ .service = "set_temperature", .extra = try std.fmt.allocPrint(a, ",\"temperature\":{s}", .{model.num(number.?)}) },
             .mode => .{ .service = "set_hvac_mode", .extra = try std.fmt.allocPrint(a, ",\"hvac_mode\":{f}", .{std.json.fmt(text.?, .{})}) },
             .open => .{ .service = if (dev.kind == .valve) "open_valve" else "open_cover" },
@@ -665,6 +678,28 @@ pub const Ha = struct {
             .body = try std.fmt.allocPrint(a, "{{\"entity_id\":{s}{s}}}", .{ id, call.extra }),
             .key = h.token,
             .limits = .{ .idle_ms = 15_000, .total_ms = 30_000 },
+        }) catch |e| {
+            h.problem = @errorName(e);
+            return e;
+        };
+        if (ans.status == 401) return error.Unauthorized;
+        if (ans.status != 200) return error.Refused;
+    }
+
+    fn announce(h: *Ha, a: Allocator, dev: *const config.Device, message: []const u8) !void {
+        const id = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(dev.id, .{})});
+        const msg = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(message, .{})});
+        const path, const body = switch (dev.kind) {
+            .satellite => .{ "/api/services/assist_satellite/announce", try std.fmt.allocPrint(a, "{{\"entity_id\":{s},\"message\":{s},\"preannounce\":true}}", .{ id, msg }) },
+            .media => .{ "/api/services/tts/speak", try std.fmt.allocPrint(a, "{{\"entity_id\":{f},\"media_player_entity_id\":{s},\"message\":{s}}}", .{ std.json.fmt(h.cfg.tts, .{}), id, msg }) },
+            else => return error.NotASpeaker,
+        };
+        const ans = http.fetch(&h.client, a, .{
+            .path = path,
+            .body = body,
+            .key = h.token,
+            // Home Assistant answers once it has played it, or after 10 s
+            .limits = .{ .idle_ms = 20_000, .total_ms = 30_000 },
         }) catch |e| {
             h.problem = @errorName(e);
             return e;

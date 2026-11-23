@@ -5,7 +5,9 @@
 //! (Zigbee2MQTT), or POST it to `/homesim/<entity id>` (Home Assistant),
 //! with any of occupancy, contact, available, temperature, locked, leak,
 //! smoke, home, zone. `POST /homesim/drop_websockets` cuts every
-//! WebSocket, as a restart of Home Assistant would.
+//! WebSocket, as a restart of Home Assistant would. What it was asked to
+//! say (`assist_satellite.announce`, `tts.speak`) is kept, and listed by
+//! `GET /homesim/announcements`.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -15,7 +17,7 @@ const jv = @import("jv.zig");
 const color = @import("color.zig");
 const when = @import("when.zig");
 
-const Kind = enum { light, plug, climate, lock, cover, motion, contact, valve, lamp, fan, speaker, scene, person, camera, smoke, setting, temp, leak, other };
+const Kind = enum { light, plug, climate, lock, cover, motion, contact, valve, lamp, fan, speaker, scene, person, camera, smoke, setting, temp, leak, satellite, other };
 
 const Dev = struct {
     name: []const u8,
@@ -65,7 +67,7 @@ const areas = [_][2][]const u8{
     .{ "garage", "Garage" },
 };
 
-pub const n_devs = 21;
+pub const n_devs = 22;
 
 pub const Home = struct {
     io: Io,
@@ -92,7 +94,10 @@ pub const Home = struct {
         .{ .name = "Sun", .entity = "sun.sun", .kind = .other, .device = "-", .ha_only = true },
         .{ .name = "Living room temperature", .entity = "sensor.living_room_temperature", .kind = .temp, .area = "living_room", .temperature = 21.5 },
         .{ .name = "Sink leak", .entity = "binary_sensor.sink_leak", .kind = .leak, .area = "kitchen" },
+        .{ .name = "Hall voice", .entity = "assist_satellite.hall_voice", .kind = .satellite, .area = "hall", .ha_only = true },
     },
+    /// What it was asked to say, oldest first.
+    announced: std.ArrayList(u8) = .empty,
 
     fn init(io: Io) Home {
         var h: Home = .{ .io = io };
@@ -375,6 +380,7 @@ fn haState(a: Allocator, d: *const Dev) ![]u8 {
         .person => if (d.home) "home" else if (d.zone.len > 0) d.zone else "not_home",
         .camera => "idle",
         .temp => try std.fmt.allocPrint(a, "{d:.1}", .{d.temperature}),
+        .satellite => "idle",
         .other => "above_horizon",
     };
     try o.print(a, "{{\"entity_id\":\"{s}\",\"state\":{f},\"last_changed\":\"{s}\",\"last_updated\":\"{s}\",\"attributes\":{{", .{ d.entity, std.json.fmt(state, .{}), t, t });
@@ -408,7 +414,7 @@ fn haState(a: Allocator, d: *const Dev) ![]u8 {
         },
         .person => try o.print(a, "\"user_id\":null,\"source\":\"device_tracker.{s}_phone\",", .{d.entity["person.".len..]}),
         .camera => try o.appendSlice(a, "\"brand\":\"homemcp-sim\","),
-        .valve, .setting, .other => {},
+        .valve, .setting, .satellite, .other => {},
     };
     try o.print(a, "\"friendly_name\":{f}}}}}", .{std.json.fmt(d.name, .{})});
     return o.items;
@@ -504,6 +510,12 @@ fn haService(h: *Home, d: *Dev, domain: []const u8, service: []const u8, v: jv.V
                 const x = jv.num(jv.get(v, "volume_level")) orelse break :blk false;
                 d.volume = @intFromFloat(@round(std.math.clamp(x, 0, 1) * 100));
             } else break :blk false;
+            break :blk true;
+        },
+        .satellite => blk: {
+            if (!eq(u8, domain, "assist_satellite") or !eq(u8, service, "announce")) break :blk false;
+            const msg = jv.str(jv.get(v, "message")) orelse break :blk false;
+            h.announced.print(std.heap.page_allocator, "{s}: {s}\n", .{ d.entity, msg }) catch {};
             break :blk true;
         },
         .scene => blk: {
@@ -603,6 +615,14 @@ pub const HaSim = struct {
         sim.home.lock.lockUncancelable(sim.io);
         defer sim.home.lock.unlock(sim.io);
         for (sim.clients.items) |c| sock.shutdown(c.handle);
+    }
+
+    /// What it was asked to say, a line each ("ENTITY: MESSAGE", or
+    /// "ENTITY (TTS): MESSAGE" for a media player), in `a`.
+    pub fn announced(sim: *HaSim, a: Allocator) ![]const u8 {
+        sim.home.lock.lockUncancelable(sim.io);
+        defer sim.home.lock.unlock(sim.io);
+        return a.dupe(u8, sim.home.announced.items);
     }
 
     /// Changes an entity as a sensor or a hand would (see Home.poke).
@@ -725,10 +745,26 @@ pub const HaSim = struct {
             _ = try json(req, .ok, try haState(a, d));
             return false;
         }
+        if (method == .GET and std.mem.eql(u8, route, "/homesim/announcements")) {
+            _ = try json(req, .ok, try announcedJson(a, home));
+            return false;
+        }
         if (method == .POST and std.mem.startsWith(u8, route, "/api/services/")) {
             const rest = route["/api/services/".len..];
             const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return json(req, .bad_request, "{\"message\":\"Invalid service\"}");
             const v = jv.parse(a, body) orelse return json(req, .bad_request, "{\"message\":\"Data should be valid JSON.\"}");
+            // text-to-speech on a media player: its tts entity is the engine
+            if (std.mem.eql(u8, rest, "tts/speak")) {
+                const tts = jv.str(jv.get(v, "entity_id")) orelse "";
+                const d = home.find(true, jv.str(jv.get(v, "media_player_entity_id")) orelse "") orelse return json(req, .bad_request, "{\"message\":\"Entity not found.\"}");
+                const msg = jv.str(jv.get(v, "message")) orelse return json(req, .bad_request, "{\"message\":\"message is required\"}");
+                if (!std.mem.startsWith(u8, tts, "tts.") or d.kind != .speaker) return json(req, .bad_request, "{\"message\":\"Service not found.\"}");
+                home.announced.print(std.heap.page_allocator, "{s} ({s}): {s}\n", .{ d.entity, tts, msg }) catch {};
+                d.playing = "playing";
+                d.changed_ms = nowMs(sim.io);
+                _ = try json(req, .ok, "[]");
+                return true;
+            }
             const d = home.find(true, jv.str(jv.get(v, "entity_id")) orelse "") orelse return json(req, .bad_request, "{\"message\":\"Entity not found.\"}");
             if (!d.available) {
                 _ = try json(req, .ok, "[]");
@@ -863,6 +899,22 @@ fn entityEntry(a: Allocator, o: *std.ArrayList(u8), d: *const Dev, with_aliases:
         if (d.alias.len > 0) try o.print(a, ",\"aliases\":[{f}]", .{std.json.fmt(d.alias, .{})}) else try o.appendSlice(a, ",\"aliases\":[]");
     }
     try o.append(a, '}');
+}
+
+/// What it was asked to say, as JSON lines in a list.
+fn announcedJson(a: Allocator, home: *Home) ![]u8 {
+    var o: std.ArrayList(u8) = .empty;
+    try o.append(a, '[');
+    var it = std.mem.splitScalar(u8, home.announced.items, '\n');
+    var first = true;
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        if (!first) try o.append(a, ',');
+        first = false;
+        try o.print(a, "{f}", .{std.json.fmt(line, .{})});
+    }
+    try o.append(a, ']');
+    return o.items;
 }
 
 fn allStates(a: Allocator, home: *Home) ![]u8 {

@@ -531,6 +531,18 @@ pub fn browse(io: Io, a: std.mem.Allocator, link: []const u8, o: BrowseOptions) 
     return page;
 }
 
+/// Home Assistant's llama.cpp integration, as harness's voice agent sees
+/// it: `body` POSTed to `link` with `token` as its API key; the answer's
+/// status and body.
+pub fn sayAsHomeAssistant(io: Io, a: std.mem.Allocator, link: []const u8, token: []const u8, body: []const u8) !Page {
+    const u = try url_mod.parse(a, link);
+    var c = http.Client.init(a, io, .{ .https = u.https, .host = u.connectHost(), .port = u.port, .prefix = "" });
+    defer c.deinit();
+    var resp = try c.send(.{ .path = u.target, .body = body, .key = token, .resend = false, .limits = .{ .idle_ms = 60_000, .total_ms = 60_000 } });
+    defer resp.deinit();
+    return .{ .status = resp.status, .body = resp.readAll(a, 1 << 20) catch "" };
+}
+
 const Got = struct { status: u16, body: []const u8, location: []const u8 };
 
 fn get(io: Io, a: std.mem.Allocator, link: []const u8) !Got {

@@ -12,7 +12,9 @@ saved skills, remembers what you bring up, keeps summaries of each
 conversation by day, week and month, and can search every earlier turn.
 During quiet hours it holds what is not urgent for a digest at their end.
 People of your household you add can ask it too, in their own chat with
-the bot or a group, within what you allow (Household, below).
+the bot or a group, within what you allow (Household, below), and anyone
+at home can speak to Home Assistant's voice satellites and hear it
+answer (Home Assistant's voice, below).
 Every action it takes, and every
 action of its helpers, passes one gate and is written to one log you can
 check.
@@ -38,14 +40,16 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 881 unit tests (19 of them
+**State: 0.3.0, tested on macOS by its own tests: 917 unit tests (19 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 91 checks that drives the real binary against
+and an end-to-end script of 93 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram (voice
 notes and their files too), a transcription service, feeds, search, two
-MCP servers run as programs, and MCP servers at a url with a token or a
-sign-in (with a stand-in authorization server and browser).
+MCP servers run as programs, MCP servers at a url with a token or a
+sign-in (with a stand-in authorization server and browser), and Home
+Assistant asking the voice agent (a test client sending what its
+llama.cpp integration sends).
 An earlier build of 0.3.0 also passed its tests in CI on Linux and
 Windows. On Windows 11 the browser and login
 tests also run, against Chrome 157, and the console, lock, Credential
@@ -55,7 +59,7 @@ Windows 11 and Linux (WSL, bubblewrap 0.9, OpenSSH 9.6) pass their unit
 tests and the end-to-end script; on macOS 15.7 the sandbox (sandbox-exec)
 and APFS clone tests run with the rest. Nothing has run yet against a real
 omnigate or model provider, Telegram bot, transcription service, MCP
-server, authorization server or website.** See
+server, authorization server, website or Home Assistant.** See
 [Limits](#limits).
 
 ## Quick start
@@ -233,7 +237,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 
 | Path | What |
 |---|---|
-| `config.ini` | models and providers, search, Telegram, limits, memory switches, the inbox, triggers |
+| `config.ini` | models and providers, search, Telegram, limits, memory switches, the inbox, triggers, Home Assistant's voice agent |
 | `rules` | gate rules |
 | `briefs.ini` | briefs and their topics |
 | `tasks.ini` | scheduled tasks |
@@ -253,7 +257,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
 | `state/summaries/` | each conversation's summaries (see Long memory): `CONV/day/YYYY-MM-DD.md` (kept 60 days), `CONV/week/YYYY-Www.md` (ISO weeks, kept 400 days), `CONV/month/YYYY-MM.md` (kept); `PERIOD.given-up` where a call failed all day |
-| `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), what quiet hours hold (`quiet`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home and, on macOS, its temp; a remote's key), `workflows/NAME/` (each workflow's instances, `N/`, its starts waiting in line, earlier files in `versions/`, a removed file as `removed.wf`), `workflows/day.json` (today's agent steps) |
+| `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), speech's calls waiting for you (`room-asks`), what quiet hours hold (`quiet`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home and, on macOS, its temp; a remote's key), `workflows/NAME/` (each workflow's instances, `N/`, its starts waiting in line, earlier files in `versions/`, a removed file as `removed.wf`), `workflows/day.json` (today's agent steps) |
 
 On macOS and Linux, `config.ini`, `rules`, `logins.ini`, `mcp.ini`,
 `folders.ini`, `triggers.ini`, `environments.ini`, the folders `agents/` and `workflows/` and
@@ -305,6 +309,7 @@ every call.
 | `[agent:main]` | the agent's own calls in the chat, tasks and briefs |
 | `[agent:helper]` | helpers' calls |
 | `[agent:NAME]` | the calls of definition NAME (`agents/NAME.md`), wherever it runs |
+| `[room]`, `[room:NAME]` | speech in the house, through Home Assistant's voice satellites (see Home Assistant's voice) |
 
 A kind alone covers all its names (`[schedule]`), and `*` works as in
 rules (`[schedule:btc-*]`). A section for the call's own definition may
@@ -577,6 +582,147 @@ harness acts on a change; a waiting code only as its SHA-256:
 ```json
 {"name":"anna","user":123456789,"added":"2026-11-23T10:00:00Z","joined":"2026-11-23T10:02:00Z"}
 ```
+
+## Home Assistant's voice
+
+People at home can speak to Home Assistant's voice satellites (Voice
+PE, ESPHome and Wyoming satellites, Home Assistant's phone and watch
+apps) and harness answers: Home Assistant hears the wake word, turns
+speech into text and reads the answer aloud; harness is the agent in
+between. Polish works, as every language your speech-to-text and
+text-to-speech speak.
+
+```
+Kitchen:  "Okay Nabu, is the back door closed?"
+Speaker:  "Yes, the back door is closed."
+Hall:     "Okay Nabu, unlock the front door."
+Speaker:  "I've asked the owner on their phone."
+You:      Someone in Hall asked by voice to unlock the front door.
+          Anyone in a room can speak: harness can't tell who it was.
+                                             [Unlock] [No]
+```
+
+**Setting it up** (Home Assistant 2026.8 or later):
+
+1. Make a token of at least 16 characters (`openssl rand -hex 24` makes
+   one) and store it: `harness secret add ha-agent` (typed, not shown).
+2. Home Assistant on another machine: set this machine's address on your
+   network in `config.ini`, then `/reload`:
+
+   ```ini
+   [voice_agent]
+   listen = 192.168.1.20:8765        ; default 127.0.0.1:8765: this machine only
+   ```
+
+   `/status` says `Voice agent: Home Assistant's requests on
+   192.168.1.20:8765.` It runs with `harness run`.
+3. In Home Assistant: Settings, Devices & services, Add integration,
+   **llama.cpp**. URL `http://192.168.1.20:8765/v1`, API key the token,
+   model `harness`.
+4. Its options (the cogwheel): paste these two lines into
+   **Instructions**, so harness hears the room and the language:
+
+   ```
+   Room: {% if llm_context.device_id %}{{ area_name(llm_context.device_id) }}{% endif %}
+   Language: {{ llm_context.language }}
+   ```
+
+   **AI tools**: none (harness reaches the home through homemcp; Home
+   Assistant's tools only make each request bigger and slower).
+5. Settings, Voice assistants, your assistant: the conversation agent
+   is the llama.cpp one; keep **Prefer handling commands locally** on, so
+   "turn on the kitchen light" stays Home Assistant's own and instant,
+   and what it doesn't know comes to harness. Put each satellite in its
+   area: that is the room harness hears.
+
+**What speech may do.** Anyone in a room can speak (a guest, a child,
+the TV), so speech is a room, `room:NAME`, never a person: NAME is the
+area's name in lower case with spaces as `_` (`room:living_room`,
+`room:łazienka`), `room:unknown` without one. It has the household's
+rights (as members, above), decided by `[room]` and `[room:NAME]`
+sections:
+
+| | |
+|---|---|
+| Alone | web search; homemcp's `home_state` and `home_set` (reading the home, and lights, plugs, heating and blinds within the home file's limits) |
+| Asked of you, every time | money tools, homemcp's `home_guarded` among them (locks, alarms, valves, the garage), and every other MCP tool, `announce` too |
+| Not at all | reading web pages (`fetch`, `browse`); waiting on a device (`home_wait`: an answer is spoken within seconds, and homemcp serves one call at a time) |
+| Never, whatever the rules | commands, files, memory, `history`, `web` with your logins, `skill`, `delegate`, `ask_owner`, setting up triggers, workflows or definitions, posting anywhere |
+
+A `[member]` line never reaches speech, nor a `[room]` line a member;
+for speech, the shared part of `rules` and `[agent:…]` sections only
+deny or ask; no grant covers it. A room's section is written as its who
+is (`[room:Kitchen]` or `[room:kid's_room]` would never match, so
+`rules` refuses them).
+
+```
+[room]
+allow mcp home/announce *
+
+[room:kids_room]
+ask mcp */home_set *
+```
+
+**When you are asked.** Nothing guarded is approved by voice: a "yes"
+said in the room is only words. You get one message in your chat:
+where it was said, that harness can't tell who spoke, and [Unlock]
+[No] (no "Allow 24 h"; a reply in words says no). The speaker says in
+one sentence that you were asked, and the run doesn't wait. Your tap
+makes that exact call (the gate decides it again) and adds what the
+device said to your message; nothing more is said in the room. The
+calls waiting for you are kept in `state/room-asks`, five a room at
+most; the same call asked again is the same message.
+
+**How it answers.** In a sentence or two, in the language spoken, made
+for the ear: no lists, marks or links, at most 400 bytes. It runs
+beside your chat (your long turn doesn't hold a speaker up), one room at
+a time, with harness's own instructions for speech (not
+`agents/main.md`'s), the main definition's tools and model
+(`[voice_agent] model` picks another), no memory, history or summaries,
+and at most `[voice_agent] seconds` (20; Home Assistant itself waits
+much longer). A follow-up within five minutes ("and dimmer") keeps its
+conversation. Past its time it says so; harness's few own lines are in
+Polish or English. Speech is logged as runs `speech` in the conversation
+`home`, by `room:NAME`, with a `speech` line each (room, language,
+milliseconds); never written to memory or summaries.
+
+**The endpoint**, for those who look: `POST /v1/chat/completions` and
+`GET /v1/models` (one model, `harness`) only, anything else 404 or 405;
+`Authorization: Bearer TOKEN` compared as SHA-256 digests in constant
+time before a body is read, else 401; a request over 256 KB 413; JSON,
+or server-sent events when the request streams. Home Assistant's tools,
+`max_tokens`, `temperature` and model are ignored. The listener binds
+only the address `listen` names: an IP address and port, never a name,
+`0.0.0.0`, `::` or an IPv4 address written as IPv6; `listen = off`
+switches it off. The token is never
+logged and is masked like every secret.
+
+### Saying things on the house's speakers
+
+homemcp's `announce` tool says a short message on the speakers the home
+file allows (see homemcp's README). A trigger says a line aloud for each
+event with `announce` (three at most at once, each event once however
+often it is retried), filled like `say`, in the event's room when it
+names one (homemcp's changes do: the room's speakers, else every one),
+beside its action: the post never waits for the speakers.
+
+```ini
+[leak]
+mcp = home resource home://device/sink_leak
+match = text has "to":"wet"
+urgent = yes
+say = Water under the kitchen sink.
+announce = Water under the kitchen sink.
+```
+
+The line is yours (written in `triggers.ini`), so it needs no rule; a
+`deny mcp home/announce *` stops it. A run, or a workflow's tool step,
+calls `announce` like any MCP tool (`allow mcp home/announce *` under
+`[trigger:NAME]`, `[schedule:NAME]` or `[workflow:NAME]` lets it).
+During quiet hours only urgent triggers and workflows speak: the rest
+of what runs nobody watches says nothing aloud (a call refused, a line
+not said, both logged); your own runs, speech in a room and commands
+you run by hand speak whenever.
 
 ## Folders
 
@@ -1295,7 +1441,12 @@ saved or removed is a line of kind `agent`: `saved` (`name`, `by`,
 `poll` (status, bytes, new, queued, why), `check` (events, yes, tokens),
 `start` (the run, event ids), `done`, `dropped`, `paused`, `resumed`,
 `failed`, `saved` (`by`, `agent`, `item`, `sha256` of the section) and
-`removed` (`by`); no event content but ids. Summaries are lines of kind
+`removed` (`by`); no event content but ids. Speech in the house is runs
+labelled `speech` in the conversation `home`, by `room:NAME`, and lines
+of kind `chat`: `speech` (`by`, `room`, `language`, `stream`, `ms`,
+`bytes`), `voice agent listening`, `voice agent refused` (`why`,
+`status`; once a minute), `voice agent stopped`; a call you allowed is a
+run labelled `speech call`. Summaries are lines of kind
 `memory`: `summary` (`conversation`, `period`, `words`, `tokens`,
 `provider`), `summary failed` (`why`), `summary given up` (`tries`,
 `why`); a `history` call is a tool line like any other (its argument the
@@ -1541,7 +1692,10 @@ only after a 3% move. A section's keys give its kind:
   one it refuses is dropped and you are told once. With no action, events
   are only for workflows that wait on them; with one, a waiting workflow
   gets an event too. `urgent = yes` (any kind but a brief) lets its posts
-  through quiet hours (see Quiet hours and the digest).
+  through quiet hours (see Quiet hours and the digest). `announce = TEXT`
+  (beside any action, not on schedules) says a line aloud on the house's
+  speakers for each event, filled like `say` (see Home Assistant's voice);
+  a trigger never polls `announce` itself.
 - **State.** `state/triggers/NAME/` keeps `state` (where its polls are,
   what it counted), `seen`, `queue` and a page's `last` text. A poll
   writes its events to `queue` before its cursor moves, and an event is
@@ -1823,6 +1977,10 @@ it goes at once, without a sound.
   urgent; a workflow an urgent trigger starts is urgent only if it says
   so. Harness's reading of a proposed trigger or workflow says when it is
   urgent.
+- **The house's speakers.** During quiet hours only urgent triggers and
+  workflows speak aloud (homemcp's `announce`, a trigger's `announce`
+  line); the rest of what runs nobody watches says nothing aloud, and
+  the call is refused or the line left unsaid, logged.
 - **`/quiet`** says the hours, whether it is quiet now and what is held;
   `/quiet on` (22:00–07:00 when no hours are set), `/quiet off` (what is
   held comes at once), `/quiet 23:00-06:30` for other hours. What `/quiet`
@@ -1901,6 +2059,14 @@ while `harness run` holds the folder and has ticked in the last 90 s.
 - **One owner, one turn at a time.** Messages sent in any conversation,
   to any definition, while the agent works wait in one queue, household
   members' too. Contexts do not survive a restart.
+- **Speech in the house is anyone in the room.** Home Assistant has no
+  speaker ID: a guest, a child, the TV or someone at an open window speak
+  alike, so speech gets the household's rights and never more, and
+  nothing guarded is approved by voice. Its room is what Home Assistant
+  says (the Instructions' `Room:` line); the token keeps out anything
+  but your Home Assistant, not what its microphones hear. Home Assistant
+  waits up to 10 minutes for an answer; harness answers within
+  `[voice_agent] seconds`.
 - **Household members** are Telegram accounts: whoever holds a member's
   phone is that member. What a member asks you for is said to them as the
   device or service answered ("done: front_door is unlocked"), without a
@@ -1921,7 +2087,9 @@ while `harness run` holds the folder and has ticked in the last 90 s.
 
 Not in 0.3.0: the Agent Client Protocol server, desktop use (headdesk), a
 sandbox per command, email, WhatsApp, Slack and voice as conversations
-(voice notes in Telegram are in; spoken replies are not),
+(voice notes in Telegram and Home Assistant's voice satellites are in;
+spoken replies in Telegram are not), a reply in the room after you allow
+what speech asked for,
 helpers that report back later, cards and payments for the agent,
 screenshots, and the hosted service.
 

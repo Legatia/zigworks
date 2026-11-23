@@ -85,6 +85,9 @@ pub const Trigger = struct {
     checks_per_day: u32 = 50,
     /// `urgent = yes`: its posts and questions go through quiet hours.
     urgent: bool = false,
+    /// `announce = TEXT`: a line said aloud on the house's speakers for
+    /// each event (filled like `say`), beside its action; "": none.
+    announce: []const u8 = "",
     /// "added by agent:main 2026-11-22 (item 41)": the comment right above its header.
     added: []const u8 = "",
     /// Its lines in the file (the mark above its header included), 1-based.
@@ -94,7 +97,7 @@ pub const Trigger = struct {
     /// A copy whose every slice is in `a`.
     pub fn clone(tr: Trigger, a: Allocator) !Trigger {
         var o = tr;
-        inline for (.{ "name", "json", "key", "check", "agent", "to", "added" }) |f| @field(o, f) = try a.dupe(u8, @field(tr, f));
+        inline for (.{ "name", "json", "key", "check", "agent", "to", "added", "announce" }) |f| @field(o, f) = try a.dupe(u8, @field(tr, f));
         o.sources = try dupeList(a, tr.sources);
         if (tr.mcp) |m| o.mcp = .{ .server = try a.dupe(u8, m.server), .uri = try a.dupe(u8, m.uri), .tool = try a.dupe(u8, m.tool), .input = try a.dupe(u8, m.input) };
         const topics = try a.alloc(config.Topic, tr.topics.len);
@@ -334,7 +337,7 @@ fn briefSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
 }
 
 const source_keys = [_][]const u8{ "topic", "feed", "search", "page", "file", "mcp" };
-const other_keys = [_][]const u8{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "json", "key", "urgent" };
+const other_keys = [_][]const u8{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "json", "key", "urgent", "announce" };
 
 fn kindOfKey(key: []const u8) ?Kind {
     if (std.mem.eql(u8, key, "topic")) return .brief;
@@ -357,7 +360,7 @@ fn keyFits(kind: Kind, key: []const u8) bool {
         .schedule => oneOf(key, &.{ "every", "at", "days", "do", "say", "start", "to", "agent", "urgent" }),
         .brief => oneOf(key, &.{ "topic", "at", "to" }),
         else => blk: {
-            if (oneOf(key, &.{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "urgent" })) break :blk true;
+            if (oneOf(key, &.{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "urgent", "announce" })) break :blk true;
             if (kindOfKey(key)) |k| break :blk k == kind;
             if (std.mem.eql(u8, key, "json")) break :blk kind == .page;
             if (std.mem.eql(u8, key, "key")) break :blk kind == .mcp;
@@ -453,6 +456,10 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
             if (std.mem.eql(u8, l.key, "max_runs")) tr.max_runs = x else if (std.mem.eql(u8, l.key, "max_events")) tr.max_events = x else tr.checks_per_day = x;
         } else if (std.mem.eql(u8, l.key, "urgent")) {
             tr.urgent = config.parseBool(v) orelse return bad(diag, l.n, "urgent = yes or no: yes goes through quiet hours");
+        } else if (std.mem.eql(u8, l.key, "announce")) {
+            if (v.len == 0) return bad(diag, l.n, "announce needs its text: what the house's speakers say");
+            if (try unknownPlaceholder(a, v, k)) |why| return bad(diag, l.n, why);
+            tr.announce = v;
         } else if (std.mem.eql(u8, l.key, "json")) {
             if (!jsonPath(v)) return bad(diag, l.n, "json is a path of names and [N], like data.amount or items[0].price");
             tr.json = v;
@@ -623,6 +630,11 @@ fn mcpSource(a: Allocator, v: []const u8, why: *[]const u8) Bad!Mcp {
             why.* = shape;
             return error.BadValue;
         };
+        // a poll would say it again and again, at night too
+        if (std.mem.eql(u8, tool, "announce")) {
+            why.* = "announce speaks aloud: a trigger doesn't poll it (announce = TEXT says a line per event)";
+            return error.BadValue;
+        }
         const input = if (rest.len == 0) "{}" else rest;
         const parsed = jv.parse(a, input);
         if (parsed == null or parsed.? != .object) {
@@ -919,6 +931,7 @@ pub fn reading(a: Allocator, tr: Trigger, check_model: []const u8) ![]const u8 {
         .start => |x| try out.print(a, " starts workflow {s}, an instance each", .{x}),
         .none => try out.appendSlice(a, " is kept for workflows that wait on it"),
     }
+    if (tr.announce.len > 0) try out.print(a, "; says it on the house's speakers: {s}", .{tr.announce});
     if (!std.mem.eql(u8, tr.to, "main")) try out.print(a, "; posts to {s}", .{tr.to});
     if (tr.urgent) try out.appendSlice(a, urgent_words);
     try out.append(a, '.');
@@ -1235,4 +1248,32 @@ test "urgent_is_read_for_triggers_and_schedules" {
     // the reading says it goes through quiet hours
     try t.expect(std.mem.endsWith(u8, try reading(a, leak, "claude-haiku"), "; urgent: it goes through quiet hours."));
     try t.expect(std.mem.endsWith(u8, try reading(a, door, "claude-haiku"), "; urgent: it goes through quiet hours."));
+}
+
+test "announce_is_said_on_the_house_speakers" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // with any action, or none; its fields filled like say's
+    const leak = try parseOne(a, "[leak]\nmcp = home resource home://device/sink_leak\nmatch = text has \"to\":\"wet\"\nurgent = yes\nsay = Water under the kitchen sink.\nannounce = Water under the kitchen sink. Close the water main.\n");
+    try t.expectEqualStrings("Water under the kitchen sink. Close the water main.", leak.announce);
+    try t.expectEqualStrings("Water under the kitchen sink. Close the water main.", (try leak.clone(a)).announce);
+    const door = try parseOne(a, "[door]\nfeed = https://home.example.com/door.xml\nannounce = {title}\n");
+    try t.expectEqual(Action.none, door.action);
+    try t.expectEqualStrings("{title}", door.announce);
+    // a field the kind has not, an empty one, a schedule's or a brief's: refused
+    try refused(a, "[door]\nfeed = https://home.example.com/door.xml\nannounce = {price}\n", 3, "{price} is no field");
+    try refused(a, "[door]\nfeed = https://home.example.com/door.xml\nannounce =\n", 3, "announce needs its text");
+    try refused(a, "[bed]\nat = 21:00\nannounce = Time for bed.\n", 3, "not a key of a schedule trigger");
+    try refused(a, "[m]\ntopic = Zig | https://z.org/f\nannounce = x\n", 3, "not a key of a brief trigger");
+    // the reading says it
+    try t.expect(std.mem.indexOf(u8, try reading(a, leak, "claude-haiku"), "; says it on the house's speakers: Water under the kitchen sink. Close the water main.") != null);
+}
+
+test "a_trigger_never_polls_what_speaks" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // a poll would say it every time, at night too: announce = TEXT says a line per event
+    try refused(a, "[x]\nmcp = home/announce {\"message\":\"hi\"}\nsay = x\n", 2, "announce speaks aloud: a trigger doesn't poll it");
 }
