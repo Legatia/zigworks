@@ -54,6 +54,7 @@ const alerts_mod = @import("alerts.zig");
 const mail_mod = @import("mail.zig");
 const diary_mod = @import("diary.zig");
 const lists_mod = @import("lists.zig");
+const deliveries_mod = @import("deliveries.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -2729,6 +2730,8 @@ pub const Core = struct {
         if (c.phraseStart(conv, text)) return;
         // the lists' words ("add milk"): harness's own, no model call
         if (Errands.words(c, conv, "", text)) return;
+        // a parcel named ("track DPD 1000…"): tracked
+        if (Errands.parcelWords(c, conv, text)) return;
         return c.queueMessage(conv, text, null);
     }
 
@@ -2856,6 +2859,7 @@ pub const Core = struct {
         // a phrase said aloud starts its workflow, as typed (Ruling 2)
         if (c.phraseStart(conv, text)) return;
         if (Errands.words(c, conv, "", text)) return;
+        if (Errands.parcelWords(c, conv, text)) return;
         c.chatTurnAs(conv, agent_name, text, voice_context);
     }
 
@@ -8942,6 +8946,13 @@ pub const Core = struct {
         return c.isShared(name);
     }
 
+    /// The doorbell's hint, for the door's routine: "probably the DPD
+    /// parcel" when a parcel is out for delivery or due today, else null
+    /// (deliveries, the household spec's §3).
+    pub fn deliveryHint(c: *Core, a: std.mem.Allocator) ?[]const u8 {
+        return Errands.hint(c, a);
+    }
+
     // ---- mail (the email spec): the butler's address is conversation email ----
 
     /// The [mail] settings, copied under the settings lock.
@@ -10320,6 +10331,7 @@ pub const Core = struct {
         \\/history WORDS: earlier turns with every word, newest first
         \\/people: the people you deal with; /person NAME: what is known of one
         \\/list [NAME]: the shopping list (or another); /list clear, /list add ITEM; or write "add milk"
+        \\/deliveries: the parcels tracked; write "track DPD 1000123456789U" to add one
         \\/apps: the apps, with their links while the app server runs
         \\/app approve NAME: serve an app as its files are now
         \\/app rm NAME: remove an app, its data and its versions
@@ -10363,6 +10375,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/members")) return c.membersText(a);
         if (eql(u8, cmd, "/people")) return c.people.listing(a, 100);
         if (eql(u8, cmd, "/list") or eql(u8, cmd, "/lists")) return Errands.listCommand(c, a, conv, rest);
+        if (eql(u8, cmd, "/deliveries")) return Errands.deliveriesCommand(c, a, rest);
         if (eql(u8, cmd, "/person")) return if (rest.len == 0) "Use /person NAME." else c.people.cardText(a, rest);
         if (eql(u8, cmd, "/setup")) return c.setupCommand(a, conv, rest);
         if (eql(u8, cmd, "/member")) return c.memberCommand(a, rest);
@@ -23368,6 +23381,10 @@ const Errands = struct {
     pending: std.ArrayList([]u8),
     /// The errands' job is going (the tick starts it; close waits).
     running: std.atomic.Value(bool),
+    /// When the tick next looks whether deliveries or upkeep wait.
+    next_look: std.atomic.Value(i64),
+    /// Tests: the carriers' pages at this address ("": their own).
+    track_url: []const u8,
 
     fn init(gpa: std.mem.Allocator, io: Io, state: []const u8, a: std.mem.Allocator) !Errands {
         return .{
@@ -23377,6 +23394,8 @@ const Errands = struct {
             .mutex = .init,
             .pending = .empty,
             .running = .init(false),
+            .next_look = .init(0),
+            .track_url = "",
         };
     }
 
@@ -24055,6 +24074,246 @@ const Errands = struct {
         if (std.mem.eql(u8, got.waiter, order_waiter)) return orderAnswered(c, a, id, got.status, got.key);
     }
 
+    // ---- deliveries ----
+
+    fn parcelsPath(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(a, &.{ c.paths.state, "deliveries" });
+    }
+
+    /// `state/deliveries` as read (under `c.errands.mutex`).
+    fn parcels(c: *Core, a: std.mem.Allocator) deliveries_mod.File {
+        const text = Io.Dir.cwd().readFileAlloc(c.io, parcelsPath(c, a) catch return .{}, a, .limited(4 << 20)) catch return .{};
+        return deliveries_mod.parseFile(a, text) catch .{};
+    }
+
+    fn saveParcels(c: *Core, a: std.mem.Allocator, f: deliveries_mod.File) !void {
+        try Io.Dir.cwd().createDirPath(c.io, c.paths.state);
+        try util.writeReplace(c.io, try parcelsPath(c, a), try deliveries_mod.fileText(a, f));
+    }
+
+    /// The owner's message naming a parcel ("track 1Z…", "my DPD parcel
+    /// 1000…"): tracked, and said; false when it names none.
+    fn parcelWords(c: *Core, conv: []const u8, text: []const u8) bool {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const found = (deliveries_mod.fromMessage(a, text) catch return false) orelse return false;
+        if (found.carrier.len == 0) {
+            c.sayIn(conv, std.fmt.allocPrint(a, "Which carrier is {s} with? Send it again with the carrier's name, like: DPD {s}.", .{ found.number, found.number }) catch return true);
+            return true;
+        }
+        const name = deliveries_mod.carrierName(found.carrier);
+        const added = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            const got = deliveries_mod.add(a, parcels(c, a), .{ .number = found.number, .carrier = found.carrier, .added = c.now() }) catch return false;
+            saveParcels(c, a, got.file) catch |err| {
+                c.sayIn(conv, std.fmt.allocPrint(a, "Not tracked: harness could not write state/deliveries ({s}).", .{@errorName(err)}) catch return true);
+                return true;
+            };
+            break :blk got.added;
+        };
+        c.log.write(.chat, c.convPrivate(conv), .{ .event = "delivery", .op = if (added) "track" else "again", .carrier = found.carrier }) catch {};
+        if (!added) {
+            c.sayIn(conv, std.fmt.allocPrint(a, "I'm tracking your {s} parcel {s} already. /deliveries says where it is.", .{ name, found.number }) catch return true);
+            return true;
+        }
+        c.sayIn(conv, std.fmt.allocPrint(a, "Tracking your {s} parcel {s}: I'll say when it's out for delivery and when it's delivered.", .{ name, found.number }) catch return true);
+        return true;
+    }
+
+    /// `/deliveries`, `/deliveries rm NUMBER`.
+    fn deliveriesCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        var f = parcels(c, a);
+        if (std.mem.startsWith(u8, rest, "rm ")) {
+            const number = std.mem.trim(u8, rest[3..], " \t");
+            var kept: std.ArrayList(deliveries_mod.Parcel) = .empty;
+            for (f.parcels) |p| if (!std.ascii.eqlIgnoreCase(p.number, number)) try kept.append(a, p);
+            if (kept.items.len == f.parcels.len) return std.fmt.allocPrint(a, "No parcel {s} is tracked.", .{number});
+            f.parcels = kept.items;
+            try saveParcels(c, a, f);
+            return std.fmt.allocPrint(a, "Stopped tracking {s}.", .{number});
+        }
+        if (rest.len > 0) return "Use /deliveries, or /deliveries rm NUMBER.";
+        if (f.parcels.len == 0) return "No parcels tracked. Write \"track\" and the number with its carrier, like: track DPD 1000123456789U; with your mailbox on, I find them in your mail.";
+        var lines: std.ArrayList([]const u8) = .empty;
+        for (f.parcels) |p| try lines.append(a, try deliveries_mod.listLine(a, p));
+        return std.mem.join(a, "\n", lines.items);
+    }
+
+    /// The doorbell's hint (the door's routine): "probably the DPD parcel"
+    /// when one is out for delivery or due today, null when none is.
+    pub fn hint(c: *Core, a: std.mem.Allocator) ?[]const u8 {
+        const f = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            break :blk parcels(c, a);
+        };
+        return deliveries_mod.hint(a, f.parcels, c.localDay(c.now())) catch null;
+    }
+
+    /// The owner's mail, every 30 minutes with their mailbox on: the
+    /// delivery mails of the last 14 days not read before, their parcels
+    /// tracked (quietly first: Ruling 12).
+    fn readMail(c: *Core, a: std.mem.Allocator, flag: *std.atomic.Value(bool)) void {
+        if (!c.mailMineOn(a)) return;
+        const now_s = c.now();
+        {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            const f = parcels(c, a);
+            if (now_s < f.mail_next) return;
+            var g = f;
+            g.mail_next = now_s + 30 * 60;
+            saveParcels(c, a, g) catch return;
+        }
+        const ms = c.mailSet(a) catch return;
+        const srv = c.serverNamed(ms.server) orelse return;
+        const input = std.fmt.allocPrint(a, "{{\"mailbox\":{f},\"kind\":\"delivery\",\"since\":\"14d\"}}", .{std.json.fmt(ms.mine, .{})}) catch return;
+        const got = srv.call(a, "mail_list", input, flag, 60_000, 1 << 20) catch |err| {
+            c.log.write(.chat, false, .{ .event = "delivery mail not read", .why = @errorName(err) }) catch {};
+            return;
+        };
+        if (got.is_error) return;
+        const seen = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            break :blk parcels(c, a).mail_seen;
+        };
+        for (deliveries_mod.mailItems(a, got.text)) |it| {
+            if (it.id.len == 0 or it.uid <= 0) continue;
+            const known = for (seen) |s| {
+                if (std.mem.eql(u8, s, it.id)) break true;
+            } else false;
+            if (known) continue;
+            const read_in = std.fmt.allocPrint(a, "{{\"mailbox\":{f},\"uid\":{d},\"format\":\"json\"}}", .{ std.json.fmt(ms.mine, .{}), it.uid }) catch continue;
+            const r = srv.call(a, "mail_read", read_in, flag, 60_000, 256 * 1024) catch continue;
+            if (r.is_error) continue;
+            const m = deliveries_mod.mailRead(a, r.text) orelse continue;
+            const text = std.fmt.allocPrint(a, "{s}\n{s}", .{ m.subject, m.text }) catch continue;
+            const found = deliveries_mod.find(a, text, if (m.from_addr.len > 0) m.from_addr else m.from) catch continue;
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var f = parcels(c, a);
+            var n: usize = 0;
+            for (found) |x| {
+                const res = deliveries_mod.add(a, f, .{ .number = x.number, .carrier = x.carrier, .from = util.cut(deliveries_mod.senderName(it.from), 60), .day = deliveries_mod.dayOf(it.day), .added = now_s, .quiet = true }) catch continue;
+                f = res.file;
+                if (res.added) n += 1;
+            }
+            var ids: std.ArrayList([]const u8) = .empty;
+            ids.appendSlice(a, f.mail_seen) catch continue;
+            if (ids.items.len >= deliveries_mod.max_seen) _ = ids.orderedRemove(0);
+            ids.append(a, it.id) catch continue;
+            f.mail_seen = ids.items;
+            saveParcels(c, a, f) catch continue;
+            // the mail's text is not kept or logged: only that it was read
+            c.log.write(.chat, false, .{ .event = "delivery mail", .uid = it.uid, .parcels = n }) catch {};
+        }
+    }
+
+    /// The carriers' pages of the parcels due (08:00–20:00, the owner's
+    /// time), each read by harness itself; a change of status said once
+    /// (Rulings 13 and 14).
+    fn readPages(c: *Core, a: std.mem.Allocator, flag: *std.atomic.Value(bool)) void {
+        const now_s = c.now();
+        const minute = c.localMinutes(now_s);
+        if (minute < 8 * 60 or minute >= 20 * 60) return;
+        const to_read = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            const f = deliveries_mod.prune(a, parcels(c, a), now_s) catch return;
+            var list: std.ArrayList(deliveries_mod.Parcel) = .empty;
+            for (f.parcels) |p| if (p.carrier.len > 0 and now_s >= p.next_read) list.append(a, p) catch return;
+            break :blk list.items;
+        };
+        for (to_read) |p| {
+            if (flag.load(.acquire) or c.stop.load(.acquire)) return;
+            const url = (deliveries_mod.pageUrl(a, p.carrier, p.number, c.errands.track_url) catch null) orelse continue;
+            const status = readPage(c, a, url, flag);
+            var said: ?[]const u8 = null;
+            {
+                c.errands.mutex.lockUncancelable(c.io);
+                defer c.errands.mutex.unlock(c.io);
+                var f = deliveries_mod.prune(a, parcels(c, a), now_s) catch continue;
+                const list = a.dupe(deliveries_mod.Parcel, f.parcels) catch continue;
+                for (list) |*x| {
+                    if (!std.mem.eql(u8, x.number, p.number)) continue;
+                    const s = status orelse x.status;
+                    x.next_read = if (status == null) now_s + 2 * 3600 else deliveries_mod.nextRead(s, now_s);
+                    const first = x.quiet;
+                    x.quiet = false;
+                    if (status == null or s == x.status) break;
+                    x.status = s;
+                    if (s == .delivered or s == .ready) x.done_at = now_s;
+                    const flagged: *bool = switch (s) {
+                        .out => &x.said_out,
+                        .ready => &x.said_ready,
+                        .delivered => &x.said_delivered,
+                        else => break,
+                    };
+                    if (flagged.*) break;
+                    flagged.* = true;
+                    // a parcel from mail: its first read only notes it
+                    if (first) break;
+                    said = deliveries_mod.lineFor(a, x.*, s) catch null;
+                    break;
+                }
+                f.parcels = list;
+                saveParcels(c, a, f) catch |err| {
+                    c.log.write(.chat, false, .{ .event = "deliveries not written", .why = @errorName(err) }) catch {};
+                    continue;
+                };
+            }
+            if (said) |text| {
+                c.log.write(.chat, false, .{ .event = "delivery", .op = "line", .carrier = p.carrier, .status = @tagName(status.?) }) catch {};
+                post(c, a, "schedule:deliveries", "deliveries", text);
+            }
+        }
+    }
+
+    /// A carrier's page: its status, null when it couldn't be read. A
+    /// `deny fetch` rule on its address stops it.
+    fn readPage(c: *Core, a: std.mem.Allocator, url: []const u8, flag: *std.atomic.Value(bool)) ?deliveries_mod.Status {
+        const by = "schedule:deliveries";
+        const d = blk: {
+            c.lock.lockUncancelable(c.io);
+            defer c.lock.unlock(c.io);
+            // as if someone could be asked: only a deny rule stops it (an
+            // ask, fetch's default, would be "no one to ask" here)
+            break :blk c.gate.decide(a, .fetch, url, c.now(), .{ .who = .{ .by = by, .agent = "" } });
+        };
+        if (d.action == .deny) {
+            c.log.write(.gate, false, .{ .run = "deliveries", .by = by, .tool = "fetch", .decision = "deny", .why = d.why, .arg = url }) catch {};
+            return null;
+        }
+        const g = tools.getUntil(c.gpa, c.io, a, url, &.{}, 1 << 20, null, .{ .deadline_s = util.nowSeconds(c.io) + 60, .stop = flag }) catch |err| {
+            c.log.write(.tool, false, .{ .run = "deliveries", .by = by, .tool = "fetch", .arg = url, .is_error = true, .output = @errorName(err) }) catch {};
+            return null;
+        };
+        c.log.write(.tool, false, .{ .run = "deliveries", .by = by, .tool = "fetch", .arg = url, .status = g.status, .bytes = g.body.len }) catch {};
+        if (g.status != 200) return null;
+        // a carrier's API answers JSON; a page, its readable text
+        const body = std.mem.trim(u8, g.body, " \t\r\n");
+        const json_body = body.len > 0 and (body[0] == '{' or body[0] == '[');
+        const text = if (!json_body and std.ascii.findIgnoreCase(g.content_type, "html") != null) (page.extract(a, g.body, url) catch return null).text else g.body;
+        // read, and nothing said of it yet: on its way
+        const s = deliveries_mod.statusOf(a, text);
+        return if (s == .unknown) .transit else s;
+    }
+
+    /// Whether deliveries wait on a server: the mail's time, or a page.
+    fn deliveriesDue(c: *Core, a: std.mem.Allocator, now_s: i64) bool {
+        const f = parcels(c, a);
+        if (now_s >= f.mail_next and c.mailMineOn(a)) return true;
+        const minute = c.localMinutes(now_s);
+        if (minute < 8 * 60 or minute >= 20 * 60) return false;
+        for (f.parcels) |p| if (p.carrier.len > 0 and p.done_at == 0 and now_s >= p.next_read) return true;
+        return false;
+    }
+
     // ---- the errands' job: what waits on a server, on a thread of its own ----
 
     /// Starts the job when something waits for it (Ruling 21); where
@@ -24071,9 +24330,21 @@ const Errands = struct {
     }
 
     fn jobDue(c: *Core) bool {
+        {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            if (c.errands.pending.items.len > 0) return true;
+        }
+        // deliveries and upkeep: looked at once a minute
+        const now_s = c.now();
+        if (now_s < c.errands.next_look.load(.acquire)) return false;
+        c.errands.next_look.store(now_s + 60, .release);
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
         c.errands.mutex.lockUncancelable(c.io);
         defer c.errands.mutex.unlock(c.io);
-        return c.errands.pending.items.len > 0;
+        return deliveriesDue(c, a, now_s);
     }
 
     fn jobThread(c: *Core) void {
@@ -24081,19 +24352,29 @@ const Errands = struct {
         work(c);
     }
 
-    /// What waits: the shops wanted.
+    /// What waits: the shops wanted, the delivery mails and the
+    /// carriers' pages due.
     fn work(c: *Core) void {
         while (true) {
             const shop = blk: {
                 c.errands.mutex.lockUncancelable(c.io);
                 defer c.errands.mutex.unlock(c.io);
-                if (c.errands.pending.items.len == 0) return;
+                if (c.errands.pending.items.len == 0) break;
                 break :blk c.errands.pending.orderedRemove(0);
             };
             defer c.gpa.free(shop);
             if (c.stop.load(.acquire)) continue;
             propose(c, shop);
         }
+        if (c.stop.load(.acquire)) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "");
+        defer c.unregister(&flag);
+        readMail(c, a, &flag);
+        readPages(c, a, &flag);
     }
 
     /// The shops' names (state/errands).
@@ -24450,4 +24731,135 @@ test "a_members_add_proposes_to_the_owner_only" {
     // her /setup is the owner's
     try f.core.handleIncoming(fromAccount(77, "/setup reorder frisco off"));
     try f.rec.waitIn("anna", "Commands are for the owner.");
+}
+
+// ---- errands: deliveries ----
+
+/// The carriers' pages at the stand-in: `/page/track-CARRIER-NUMBER`.
+fn trackAt(f: *Fix) !void {
+    f.core.errands.track_url = try std.fmt.allocPrint(f.e.arena.allocator(), "{s}/page/track-", .{try f.e.url()});
+}
+
+/// 10:00 (UTC, the tests' owner time) of a day to come.
+fn deliveryDay() i64 {
+    return quietDay() + 10 * 3600;
+}
+
+test "a_parcel_from_a_message_is_tracked_and_said" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try trackAt(&f);
+    const t0 = deliveryDay();
+    f.core.fixed_now = t0;
+    try writePage(&f, "track-dpd-1000123456789U", "<html><body><p>Parcel data received</p></body></html>");
+    try f.core.handleText("track my DPD parcel 1000123456789U");
+    try f.rec.waitFor("Tracking your DPD parcel 1000123456789U: I'll say when it's out for delivery and when it's delivered.");
+    try t.expectEqual(0, f.e.server.modelRequests());
+    try t.expect(f.core.deliveryHint(a) == null);
+    Errands.work(f.core);
+    try t.expectEqualStrings("DPD 1000123456789U: on its way.", try f.core.command(a, "/deliveries"));
+    // read again two hours on: out for delivery
+    try writePage(&f, "track-dpd-1000123456789U", "<html><body><p>23.11 09:12 Out for delivery</p><p>Your parcel will be delivered today</p><p>22.11 18:00 Parcel data received</p></body></html>");
+    f.core.fixed_now = t0 + 2 * 3600 - 60;
+    Errands.work(f.core);
+    try t.expectEqual(0, f.rec.count("out for delivery."));
+    f.core.fixed_now = t0 + 2 * 3600;
+    Errands.work(f.core);
+    try f.rec.waitFor("Your DPD parcel 1000123456789U is out for delivery.");
+    try t.expectEqualStrings("probably the DPD parcel", f.core.deliveryHint(a).?);
+    // then every 30 minutes: delivered, once
+    try writePage(&f, "track-dpd-1000123456789U", "<html><body><p>23.11 11:40 Przesyłka doręczona do odbiorcy</p><p>23.11 09:12 Out for delivery</p></body></html>");
+    f.core.fixed_now = t0 + 2 * 3600 + 30 * 60;
+    Errands.work(f.core);
+    try f.rec.waitFor("Your DPD parcel 1000123456789U was delivered.");
+    f.core.fixed_now = t0 + 4 * 3600;
+    Errands.work(f.core);
+    try t.expectEqual(1, f.rec.count("was delivered."));
+    try t.expectEqual(1, f.rec.count("is out for delivery."));
+    try t.expect(f.core.deliveryHint(a) == null);
+    try t.expectEqualStrings("DPD 1000123456789U: delivered.", try f.core.command(a, "/deliveries"));
+    // the same number again; one with no carrier
+    try f.core.handleText("track my DPD parcel 1000123456789U");
+    try f.rec.waitFor("I'm tracking your DPD parcel 1000123456789U already.");
+    try f.core.handleText("track my package 1234567890");
+    try f.rec.waitFor("Which carrier is 1234567890 with? Send it again with the carrier's name, like: DPD 1234567890.");
+    try t.expectEqual(0, f.e.server.modelRequests());
+    const lt = try logText(&f);
+    try expectHas(lt, "\"event\":\"delivery\",\"op\":\"line\",\"carrier\":\"dpd\",\"status\":\"out\"");
+    try expectHas(lt, "\"run\":\"deliveries\",\"by\":\"schedule:deliveries\",\"tool\":\"fetch\"");
+    try t.expectEqualStrings("Stopped tracking 1000123456789U.", try f.core.command(a, "/deliveries rm 1000123456789U"));
+    try expectHas(try f.core.command(a, "/deliveries"), "No parcels tracked.");
+}
+
+test "a_parcel_from_the_mail_is_tracked_quietly_first" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withMail(&f);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try dataFile(&f, "mail.ini"), .data = "[mine]\naddress = me@example.com\n" });
+    try trackAt(&f);
+    const t0 = deliveryDay();
+    f.core.fixed_now = t0;
+    const c = util.civil(@divFloor(t0, 86400));
+    const today = try std.fmt.allocPrint(a, "{d}-{d:0>2}-{d:0>2}", .{ c.y, c.m, c.d });
+    try mailFile(&f, "list-mine.json", try std.fmt.allocPrint(a, "[{{\"id\":\"mine/INBOX/7/5\",\"uid\":5,\"from\":\"Allegro <powiadomienia@allegro.pl>\",\"subject\":\"Twoja paczka jest w drodze\",\"kind\":\"delivery\",\"day\":\"{s}\"}}]", .{today}));
+    try mailFile(&f, "read-mine-5.json", "{\"uid\":5,\"from\":\"Allegro <powiadomienia@allegro.pl>\",\"from_addr\":\"powiadomienia@allegro.pl\",\"subject\":\"Twoja paczka jest w drodze\",\"text\":\"Paczka InPost nr 602677439331630337653846 jest w drodze do Paczkomatu KRA01M.\"}");
+    try writePage(&f, "track-inpost-602677439331630337653846", "{\"tracking_number\":\"602677439331630337653846\",\"status\":\"out_for_delivery\"}");
+    Errands.work(f.core);
+    // its first read only notes it
+    try t.expectEqualStrings("InPost 602677439331630337653846 from Allegro: out for delivery.", try f.core.command(a, "/deliveries"));
+    try t.expectEqual(0, f.rec.count("out for delivery."));
+    try t.expectEqualStrings("probably the InPost parcel", f.core.deliveryHint(a).?);
+    // at the locker, half an hour on
+    try writePage(&f, "track-inpost-602677439331630337653846", "{\"status\":\"ready_to_pickup\"}");
+    f.core.fixed_now = t0 + 30 * 60;
+    Errands.work(f.core);
+    try f.rec.waitFor("Your InPost parcel from Allegro is waiting at the parcel locker.");
+    try t.expect(f.core.deliveryHint(a) == null);
+    // the mail was read once, and its text is in no log line
+    const lt = try logText(&f);
+    try t.expectEqual(1, std.mem.count(u8, lt, "\"event\":\"delivery mail\""));
+    try t.expect(std.mem.indexOf(u8, lt, "KRA01M") == null);
+}
+
+test "delivery_lines_wait_for_quiet_hours" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 09:00-11:00\n", "", "");
+    defer f.deinit();
+    try trackAt(&f);
+    const t0 = deliveryDay();
+    f.core.fixed_now = t0 - 3 * 3600;
+    try writePage(&f, "track-ups-1Z999AA10123456784", "<html><body><p>In transit</p></body></html>");
+    try f.core.handleText("track 1Z999AA10123456784");
+    try f.rec.waitFor("Tracking your UPS parcel 1Z999AA10123456784");
+    // 07:00: nothing is read before 08:00
+    Errands.work(f.core);
+    try t.expectEqual(0, std.mem.count(u8, fileText(&f, try std.fs.path.join(f.e.arena.allocator(), &.{ f.e.dir, "page-requests.jsonl" })), "track-ups"));
+    // 10:00, in quiet hours: read, said in the digest
+    try writePage(&f, "track-ups-1Z999AA10123456784", "<html><body><p>Out for delivery</p></body></html>");
+    f.core.fixed_now = t0;
+    Errands.work(f.core);
+    try t.expectEqual(0, f.rec.count("is out for delivery."));
+    f.core.fixed_now = t0 + 3600;
+    f.core.tick();
+    try f.rec.waitFor("Your UPS parcel 1Z999AA10123456784 is out for delivery.");
+}
+
+test "a_deny_rule_stops_a_carriers_page" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try trackAt(&f);
+    f.core.fixed_now = deliveryDay();
+    try writeRules(&f, "deny fetch http://127.0.0.1*\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try writePage(&f, "track-dpd-1000123456789U", "<html><body><p>Out for delivery</p></body></html>");
+    try f.core.handleText("track DPD 1000123456789U");
+    Errands.work(f.core);
+    try t.expectEqual(0, std.mem.count(u8, fileText(&f, try std.fs.path.join(f.e.arena.allocator(), &.{ f.e.dir, "page-requests.jsonl" })), "track-dpd"));
+    try t.expectEqual(0, f.rec.count("is out for delivery."));
+    try expectHas(try logText(&f), "\"run\":\"deliveries\",\"by\":\"schedule:deliveries\",\"tool\":\"fetch\",\"decision\":\"deny\"");
 }
