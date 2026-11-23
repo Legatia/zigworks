@@ -13,14 +13,22 @@
 //!   temperature = 16 24            ; °C
 //!   brightness = 1 100             ; %
 //!   position = 0 100               ; %
+//!   color_temp = 2200 6500         ; K
+//!   volume = 0 60                  ; %
+//!   speed = 1 100                  ; %
 //!
 //!   [device hall_light]
 //!   id = Hall light                ; zigbee2mqtt friendly name, or Home Assistant entity id
-//!   kind = light                   ; light switch plug climate cover lock alarm valve sensor
+//!   kind = light                   ; light switch plug climate cover lock alarm valve sensor fan scene media
+//!   room = Hall
+//!   alias = the stairs light       ; what people call it (more lines, or commas, for more)
 //!   allow = on, off, brightness    ; what the agent may do (seeing it is always allowed)
 //!   guarded = no                   ; yes: only through home_guarded, asked every time
 //!   modes = off, heat              ; climate: the modes it may choose
 //!   note = the one by the stairs
+//!
+//!   [people]                       ; homeassistant: who is home, from its person entities
+//!   anna = person.anna
 //!
 //! Secrets come from the environment, never from this file: HA_TOKEN for
 //! Home Assistant, MQTT_USER and MQTT_PASSWORD for the broker.
@@ -42,12 +50,19 @@ pub const Device = struct {
     guarded: bool,
     modes: []const []const u8,
     note: []const u8,
+    room: []const u8 = "",
+    /// What people call it, as written in the file.
+    aliases: []const []const u8 = &.{},
 
     pub fn allows(d: *const Device, a: model.Action) bool {
         for (d.allow) |x| if (x == a) return true;
         return false;
     }
 };
+
+/// Someone whose being home or away homemcp follows (a Home Assistant
+/// person entity).
+pub const Person = struct { name: []const u8, id: []const u8 };
 
 pub const Config = struct {
     name: []const u8 = "the home",
@@ -60,10 +75,24 @@ pub const Config = struct {
     temperature: Range = .{ .min = 16, .max = 24 },
     brightness: Range = .{ .min = 1, .max = 100 },
     position: Range = .{ .min = 0, .max = 100 },
+    color_temp: Range = .{ .min = 2200, .max = 6500 },
+    volume: Range = .{ .min = 0, .max = 60 },
+    speed: Range = .{ .min = 1, .max = 100 },
     devices: []Device = &.{},
+    people: []Person = &.{},
 
+    /// The device called `name`: its name in the file or one of its
+    /// aliases. Case, spaces, `_` and `-`, and a leading "the" or "my"
+    /// don't matter ("The big light", "living room light").
     pub fn device(c: *const Config, name: []const u8) ?usize {
         for (c.devices, 0..) |d, i| if (std.mem.eql(u8, d.name, name)) return i;
+        var want_buf: [norm_max]u8 = undefined;
+        const want = normalize(&want_buf, name) orelse return null;
+        var buf: [norm_max]u8 = undefined;
+        for (c.devices, 0..) |d, i| {
+            if (eqlOpt(normalize(&buf, d.name), want)) return i;
+            for (d.aliases) |al| if (eqlOpt(normalize(&buf, al), want)) return i;
+        }
         return null;
     }
 
@@ -79,6 +108,40 @@ pub const Config = struct {
     }
 };
 
+const norm_max = 128;
+
+/// A name as it is matched: lowercase, `_` and `-` as spaces, one space
+/// between words, without a leading "the " or "my ". Null when too long.
+pub fn normalize(buf: *[norm_max]u8, s: []const u8) ?[]const u8 {
+    var n: usize = 0;
+    var space = true; // no leading space
+    for (std.mem.trim(u8, s, " \t")) |ch0| {
+        const ch = std.ascii.toLower(ch0);
+        if (ch == ' ' or ch == '_' or ch == '-' or ch == '\t') {
+            if (space) continue;
+            space = true;
+            if (n == buf.len) return null;
+            buf[n] = ' ';
+            n += 1;
+            continue;
+        }
+        space = false;
+        if (n == buf.len) return null;
+        buf[n] = ch;
+        n += 1;
+    }
+    while (n > 0 and buf[n - 1] == ' ') n -= 1;
+    var out: []const u8 = buf[0..n];
+    for ([_][]const u8{ "the ", "my " }) |lead| {
+        if (out.len > lead.len and std.mem.startsWith(u8, out, lead)) out = out[lead.len..];
+    }
+    return out;
+}
+
+fn eqlOpt(a: ?[]const u8, b: []const u8) bool {
+    return if (a) |x| std.mem.eql(u8, x, b) else false;
+}
+
 pub const Diag = struct { line: usize = 0, what: []const u8 = "" };
 
 pub fn load(a: Allocator, io: Io, path: []const u8, diag: *Diag) !Config {
@@ -92,14 +155,27 @@ pub fn load(a: Allocator, io: Io, path: []const u8, diag: *Diag) !Config {
     return c;
 }
 
-const Pending = struct { name: []const u8, line: usize, id: []const u8 = "", kind: []const u8 = "", allow: []const u8 = "", guarded: ?bool = null, modes: []const u8 = "", note: []const u8 = "" };
+const Pending = struct {
+    name: []const u8,
+    line: usize,
+    id: []const u8 = "",
+    kind: []const u8 = "",
+    allow: []const u8 = "",
+    guarded: ?bool = null,
+    modes: []const u8 = "",
+    note: []const u8 = "",
+    room: []const u8 = "",
+    aliases: std.ArrayList([]const u8) = .empty,
+};
 
 pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
     var bad: usize = 0;
     const entries = ini.parse(a, text, &bad) catch return fail(diag, bad, "not a key = value line or [section]");
     var c: Config = .{};
     var pend: std.ArrayList(Pending) = .empty;
+    var people: std.ArrayList(Person) = .empty;
     var hub_line: usize = 0;
+    var people_line: usize = 0;
     for (entries) |e| {
         const k = e.key;
         const v = e.value;
@@ -128,10 +204,24 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
                 c.brightness = r;
             } else if (eql(k, "position")) {
                 c.position = r;
+            } else if (eql(k, "color_temp") or eql(k, "colour_temp")) {
+                c.color_temp = r;
+            } else if (eql(k, "volume")) {
+                c.volume = r;
+            } else if (eql(k, "speed")) {
+                c.speed = r;
             } else return unknown(a, diag, e);
+        } else if (eql(e.section, "people")) {
+            if (e.name.len > 0) return fail(diag, e.line, "[people] has no name of its own: [people]");
+            if (!isName(k)) return fail(diag, e.line, "[people]: a name is letters, digits and _");
+            if (!std.mem.startsWith(u8, v, "person.") or v.len == "person.".len)
+                return fail(diag, e.line, try std.fmt.allocPrint(a, "[people] {s}: a person entity, such as person.{s}", .{ k, k }));
+            for (people.items) |p| if (eql(p.name, k)) return fail(diag, e.line, try std.fmt.allocPrint(a, "[people]: {s} is there twice", .{k}));
+            try people.append(a, .{ .name = k, .id = v });
+            if (people_line == 0) people_line = e.line;
         } else if (eql(e.section, "device")) {
             if (e.name.len == 0) return fail(diag, e.line, "[device] needs a name: [device hall_light]");
-            for (e.name) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return fail(diag, e.line, "a device name is letters, digits and _");
+            if (!isName(e.name)) return fail(diag, e.line, "a device name is letters, digits and _");
             const d = blk: {
                 for (pend.items) |*x| if (eql(x.name, e.name)) break :blk x;
                 try pend.append(a, .{ .name = e.name, .line = e.line });
@@ -149,18 +239,30 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
                 d.modes = v;
             } else if (eql(k, "note")) {
                 d.note = v;
+            } else if (eql(k, "room")) {
+                d.room = v;
+            } else if (eql(k, "alias")) {
+                var it = std.mem.splitScalar(u8, v, ',');
+                while (it.next()) |raw| {
+                    const al = std.mem.trim(u8, raw, " \t");
+                    if (al.len == 0) continue;
+                    var nb: [norm_max]u8 = undefined;
+                    if (normalize(&nb, al) == null) return fail(diag, e.line, "an alias is at most 128 characters");
+                    try d.aliases.append(a, al);
+                }
             } else return unknown(a, diag, e);
         } else return fail(diag, e.line, try std.fmt.allocPrint(a, "unknown section [{s}]", .{e.section}));
     }
     if (c.hub == .homeassistant and c.url.len == 0) return fail(diag, hub_line, "hub = homeassistant needs url = http://...");
+    if (people.items.len > 0 and c.hub != .homeassistant) return fail(diag, people_line, "[people] needs hub = homeassistant: people come from its person entities");
     var devs: std.ArrayList(Device) = .empty;
-    for (pend.items) |d| {
+    for (pend.items) |*d| {
         if (d.id.len == 0) return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}] has no id", .{d.name}));
-        const kind = model.Kind.parse(d.kind) orelse return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: kind is one of light, switch, plug, climate, cover, lock, alarm, valve, sensor", .{d.name}));
+        const kind = model.Kind.parse(d.kind) orelse return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: kind is one of light, switch, plug, climate, cover, lock, alarm, valve, sensor, fan, scene, media", .{d.name}));
         if (c.hub == .homeassistant and std.mem.indexOfScalar(u8, d.id, '.') == null)
             return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: a Home Assistant id is an entity id, such as light.hall", .{d.name}));
-        if (c.hub == .zigbee2mqtt and kind == .alarm)
-            return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: alarms need hub = homeassistant", .{d.name}));
+        if (c.hub == .zigbee2mqtt) if (kind.haOnly()) |what|
+            return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: {s} need hub = homeassistant", .{ d.name, what }));
         var allow: std.ArrayList(model.Action) = .empty;
         var it = std.mem.tokenizeAny(u8, d.allow, ", \t");
         while (it.next()) |w| {
@@ -183,11 +285,36 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
             .guarded = kind.alwaysGuarded() or (d.guarded orelse false),
             .modes = modes.items,
             .note = d.note,
+            .room = d.room,
+            .aliases = d.aliases.items,
         });
     }
     if (devs.items.len == 0) return fail(diag, 0, "no [device NAME] section");
+    // an alias names one device: not another's name, nor an alias before it
+    for (devs.items, pend.items, 0..) |d, p, j| {
+        var ab: [norm_max]u8 = undefined;
+        var ob: [norm_max]u8 = undefined;
+        for (d.aliases) |al| {
+            const mine = normalize(&ab, al).?;
+            for (devs.items, 0..) |other, i| {
+                if (i == j) continue;
+                var clash = eqlOpt(normalize(&ob, other.name), mine);
+                if (i < j) for (other.aliases) |oal| {
+                    if (eqlOpt(normalize(&ob, oal), mine)) clash = true;
+                };
+                if (clash) return fail(diag, p.line, try std.fmt.allocPrint(a, "[device {s}]: the alias \"{s}\" is also {s}'s", .{ d.name, al, other.name }));
+            }
+        }
+    }
     c.devices = devs.items;
+    c.people = people.items;
     return c;
+}
+
+fn isName(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return false;
+    return true;
 }
 
 fn range(v: []const u8) ?Range {
@@ -249,6 +376,76 @@ test "devices, their actions, guarded ones" {
     try t.expect(c.devices[2].guarded);
     try t.expectEqual(0, c.devices[3].allow.len);
     try t.expect(c.hasGuarded() and c.hasOrdinary());
+}
+
+test "rooms, aliases, people and the wider kinds" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var d: Diag = .{};
+    const c = try parse(arena.allocator(),
+        \\[home]
+        \\hub = homeassistant
+        \\url = http://127.0.0.1:8123
+        \\[limits]
+        \\volume = 0 40
+        \\color_temp = 2700 5000
+        \\[device living_room_light]
+        \\id = light.living_room
+        \\kind = light
+        \\room = Living room
+        \\alias = the big light
+        \\alias = Lounge lamp, ceiling light
+        \\allow = on, off, colour, color_temp
+        \\[device ceiling_fan]
+        \\id = fan.ceiling
+        \\kind = fan
+        \\allow = on, off, speed
+        \\[device evening]
+        \\id = scene.evening
+        \\kind = scene
+        \\allow = activate
+        \\[device speaker]
+        \\id = media_player.kitchen
+        \\kind = media
+        \\allow = play, pause, volume
+        \\[people]
+        \\anna = person.anna
+        \\ben = person.ben
+    , &d);
+    try t.expectEqualStrings("Living room", c.devices[0].room);
+    try t.expectEqual(3, c.devices[0].aliases.len);
+    try t.expect(c.devices[0].allows(.color) and c.devices[0].allows(.color_temp));
+    try t.expectEqual(40, c.volume.max);
+    try t.expectEqual(2700, c.color_temp.min);
+    // the names people use: case, spaces, underscores and a leading "the" don't matter
+    try t.expectEqual(0, c.device("The Big Light").?);
+    try t.expectEqual(0, c.device("ceiling light").?);
+    try t.expectEqual(0, c.device("Living room light").?);
+    try t.expectEqual(0, c.device("living_room_light").?);
+    try t.expectEqual(1, c.device("Ceiling fan").?);
+    try t.expect(c.device("kitchen light") == null);
+    try t.expect(c.devices[1].allows(.speed) and c.devices[2].allows(.activate) and c.devices[3].allows(.volume));
+    try t.expectEqual(2, c.people.len);
+    try t.expectEqualStrings("anna", c.people[0].name);
+    try t.expectEqualStrings("person.ben", c.people[1].id);
+}
+
+test "an alias used twice, and kinds only Home Assistant has, are named" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var d: Diag = .{};
+    try t.expectError(error.BadConfig, parse(arena.allocator(), "[device a]\nid = A\nkind = light\nalias = lamp\n[device b]\nid = B\nkind = light\nalias = The lamp\n", &d));
+    try t.expectEqualStrings("[device b]: the alias \"The lamp\" is also a\'s", d.what);
+    try t.expectError(error.BadConfig, parse(arena.allocator(), "[device a]\nid = A\nkind = light\n[device b]\nid = B\nkind = light\nalias = a\n", &d));
+    try t.expectEqualStrings("[device b]: the alias \"a\" is also a\'s", d.what);
+    try t.expectError(error.BadConfig, parse(arena.allocator(), "[device s]\nid = Evening\nkind = scene\nallow = activate\n", &d));
+    try t.expectEqualStrings("[device s]: scenes need hub = homeassistant", d.what);
+    try t.expectError(error.BadConfig, parse(arena.allocator(), "[device x]\nid = X\nkind = light\n[people]\nanna = person.anna\n", &d));
+    try t.expectEqualStrings("[people] needs hub = homeassistant: people come from its person entities", d.what);
+    try t.expectError(error.BadConfig, parse(arena.allocator(), "[home]\nhub = homeassistant\nurl = http://h\n[device x]\nid = light.x\nkind = light\n[people]\nanna = device_tracker.anna\n", &d));
+    try t.expectEqualStrings("[people] anna: a person entity, such as person.anna", d.what);
+    try t.expectError(error.BadConfig, parse(arena.allocator(), "[device x]\nid = X\nkind = light\nallow = speed\n", &d));
+    try t.expectEqualStrings("[device x]: a light can't speed", d.what);
 }
 
 test "mistakes are named" {

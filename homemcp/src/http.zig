@@ -93,7 +93,7 @@ const read_buf_len = 64 * 1024;
 const write_buf_len = 32 * 1024;
 const body_buf_len = 32 * 1024;
 
-const Conn = struct {
+pub const Conn = struct {
     s: sock.Socket,
     tls_client: ?tls.Client,
     reader: std.http.Reader,
@@ -101,17 +101,26 @@ const Conn = struct {
     /// The answer said the connection stays open.
     keep: bool = false,
 
-    fn in(c: *Conn) *Io.Reader {
+    /// What arrives, decrypted for https.
+    pub fn in(c: *Conn) *Io.Reader {
         return if (c.tls_client) |*t| &t.reader else &c.s.reader;
     }
 
-    fn out(c: *Conn) *Io.Writer {
+    /// What is sent, encrypted for https once flushed.
+    pub fn out(c: *Conn) *Io.Writer {
         return if (c.tls_client) |*t| &t.writer else &c.s.writer;
     }
 
-    fn flush(c: *Conn) !void {
+    pub fn flush(c: *Conn) !void {
         if (c.tls_client) |*t| try t.writer.flush();
         try c.s.writer.flush();
+    }
+
+    /// Whether something can be read within `timeout_ms` (or already has
+    /// arrived).
+    pub fn readable(c: *Conn, timeout_ms: u32) !bool {
+        if (c.in().bufferedLen() > 0) return true;
+        return c.s.readable(timeout_ms);
     }
 };
 
@@ -210,6 +219,18 @@ pub const Client = struct {
         return conn;
     }
 
+    /// A connection of its own, not kept by the client, for a request
+    /// that changes protocols (a WebSocket). Close it with `closeRaw`.
+    pub fn openRaw(c: *Client, limits: Limits) Error!*Conn {
+        return c.open(limits);
+    }
+
+    pub fn closeRaw(c: *Client, conn: *Conn) void {
+        conn.s.close();
+        c.gpa.free(conn.mem);
+        c.gpa.destroy(conn);
+    }
+
     fn failure(c: *Client, conn: *Conn, fallback: Error) Error {
         if (conn.s.timed_out) return error.Timeout;
         if (conn.s.err) |e| c.detail = e;
@@ -291,12 +312,17 @@ pub const Client = struct {
     }
 };
 
-fn writeHead(w: *Io.Writer, t: Target, req: Request, user_agent: []const u8) !void {
-    try w.print("{s} {s}{s} HTTP/1.1\r\n", .{ @tagName(req.method), t.prefix, req.path });
+/// "Host: name:port" without its line end.
+pub fn writeHost(w: *Io.Writer, t: Target) !void {
     const default_port: u16 = if (t.https) 443 else 80;
     const v6 = std.mem.indexOfScalar(u8, t.host, ':') != null;
     try w.print("Host: {s}{s}{s}", .{ if (v6) "[" else "", t.host, if (v6) "]" else "" });
     if (t.port != default_port) try w.print(":{d}", .{t.port});
+}
+
+fn writeHead(w: *Io.Writer, t: Target, req: Request, user_agent: []const u8) !void {
+    try w.print("{s} {s}{s} HTTP/1.1\r\n", .{ @tagName(req.method), t.prefix, req.path });
+    try writeHost(w, t);
     try w.print("\r\nUser-Agent: {s}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n", .{user_agent});
     if (req.key) |k| try w.print("Authorization: Bearer {s}\r\n", .{k});
     for (req.headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
