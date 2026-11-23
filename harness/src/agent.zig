@@ -21,6 +21,7 @@ const folders_mod = @import("folders.zig");
 const environments = @import("environments.zig");
 const sandbox = @import("sandbox.zig");
 const remote = @import("remote.zig");
+const copies = @import("copies.zig");
 const snapshots_mod = @import("snapshots.zig");
 const agents = @import("agents.zig");
 const Io = std.Io;
@@ -426,6 +427,15 @@ pub const Run = struct {
     /// Where the `env_save` tool reaches harness; null: no `env_save` (only
     /// runs the owner started from a conversation get one).
     edesk: ?EnvDesk = null,
+    /// The run's own copy of the workspace (its environment has
+    /// `workspace = copy`), shared with its helpers; set by the top-level
+    /// run while it goes.
+    copy_run: ?*CopyRun = null,
+    /// What takes a copy's changes when the run ends (asks the owner, or
+    /// applies them); null: the copy is dropped.
+    copy_keeper: ?CopyKeeper = null,
+    /// Names and paths a copy leaves out (folders.ini's `skip`).
+    copy_skip: []const []const u8 = &.{},
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -635,6 +645,153 @@ pub const EnvSetup = struct {
     owner_home: []const u8 = "",
 };
 
+/// A run's own copy of the workspace, made before its first call that
+/// reads or changes files: its file tools and commands act on it, never on
+/// the workspace.
+pub const CopyRun = struct {
+    gpa: std.mem.Allocator,
+    env: *const environments.Env,
+    /// The workspace's real path.
+    real: []const u8,
+    /// Held while the copy is made: a helper's first call waits.
+    mutex: Io.Mutex = .init,
+    /// The copy's real path once made.
+    path: []u8 = &.{},
+    /// Why no copy could be made: every such call is refused with it.
+    why: ?[]u8 = null,
+
+    fn deinit(c: *CopyRun) void {
+        if (c.path.len > 0) c.gpa.free(c.path);
+        if (c.why) |w| c.gpa.free(w);
+    }
+};
+
+/// What a copy's check said.
+pub const CopyCheck = struct { passed: bool, text: []const u8 };
+
+/// A run's copy with changes in it, as a `CopyKeeper` gets it when the run
+/// ends.
+pub const CopyDone = struct {
+    env: *const environments.Env,
+    /// The copy's folder, and the workspace it was made of.
+    path: []const u8,
+    workspace: []const u8,
+    changes: []const copies.Change,
+    check: ?CopyCheck,
+    who: who_mod.Who,
+    rid: u64,
+    label: []const u8,
+    conversation: []const u8,
+    private: bool,
+};
+
+pub const CopyKeeper = struct {
+    ctx: *anyopaque,
+    keep: *const fn (ctx: *anyopaque, a: std.mem.Allocator, done: CopyDone) void,
+};
+
+/// The environment whose `workspace = copy` gives this run a copy; null:
+/// it works on the workspace.
+fn copyEnvOf(r: *const Run) ?*const environments.Env {
+    const e = r.envs.list.find(r.picked().name) orelse return null;
+    return if (e.kind == .sandbox and e.workspace == .copy) e else null;
+}
+
+/// A top-level run in a copy environment gets `state` as its copy (made
+/// at its first call that needs it); true when it did.
+fn beginCopy(r: *Run, state: *CopyRun) bool {
+    if (r.helper or r.copy_run != null) return false;
+    const e = copyEnvOf(r) orelse return false;
+    state.* = .{ .gpa = r.gpa, .env = e, .real = r.env.workspace };
+    r.copy_run = state;
+    return true;
+}
+
+/// The run ended: its copy's changes go to the keeper (after the check, if
+/// the environment has one); a copy without changes goes.
+fn endCopy(r: *Run, a: std.mem.Allocator, state: *CopyRun) void {
+    defer {
+        r.env.workspace = state.real;
+        r.copy_run = null;
+        state.deinit();
+    }
+    if (state.path.len == 0) return;
+    const list = copies.changes(r.io, a, state.path) catch &.{};
+    const keeper = r.copy_keeper;
+    if (list.len == 0 or keeper == null) {
+        copies.drop(r.io, a, state.path);
+        return;
+    }
+    var check: ?CopyCheck = null;
+    if (state.env.check.len > 0) {
+        var tenv = r.env;
+        tenv.workspace = state.path;
+        // within the run's time: what is left of it, at least a second
+        if (r.deadline_s > 0) tenv.shell_seconds = @intCast(std.math.clamp(r.deadline_s - r.now(), 1, tenv.shell_seconds));
+        const out = runElsewhere(r, a, tenv, state.env, state.env.check, "") catch |e| tools.Output{ .text = @errorName(e), .is_error = true };
+        check = .{ .passed = !out.is_error, .text = lastLines(out.text, 20) };
+        r.logRun(.env, false, .{ .event = "check", .name = state.env.name, .passed = !out.is_error }) catch {};
+    }
+    keeper.?.keep(keeper.?.ctx, a, .{
+        .env = state.env,
+        .path = state.path,
+        .workspace = state.real,
+        .changes = list,
+        .check = check,
+        .who = r.who,
+        .rid = r.rid,
+        .label = r.label,
+        .conversation = r.conversation,
+        .private = r.isPrivate(),
+    });
+}
+
+/// The last `n` lines of `text`.
+fn lastLines(text: []const u8, n: usize) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, text, "\r\n");
+    var i = trimmed.len;
+    var seen: usize = 0;
+    while (i > 0) : (i -= 1) if (trimmed[i - 1] == '\n') {
+        seen += 1;
+        if (seen == n) return trimmed[i..];
+    };
+    return trimmed;
+}
+
+/// Before a call that reads or changes files in a run with a copy: the
+/// copy is made if it wasn't (the workspace as it is now), and this run's
+/// file tools and commands act on it from here. Null, or why there is no
+/// copy (the workspace is over `copy_mb`): the call is refused.
+fn useCopy(r: *Run, a: std.mem.Allocator, cr: *CopyRun) !?[]const u8 {
+    cr.mutex.lockUncancelable(r.io);
+    defer cr.mutex.unlock(r.io);
+    if (cr.why) |w| return w;
+    if (cr.path.len == 0) {
+        var top: *const Run = r;
+        while (top.starter) |s| top = s;
+        var rnd: [4]u8 = undefined;
+        r.io.random(&rnd);
+        // by the run's number; a run not logged yet gets a name of its own
+        const name = if (top.rid != 0) try std.fmt.allocPrint(a, "{d}", .{top.rid}) else try std.fmt.allocPrint(a, "r{s}", .{&std.fmt.bytesToHex(rnd, .lower)});
+        const path = try std.fs.path.join(a, &.{ r.envs.root, cr.env.name, "copies", name });
+        copies.drop(r.io, a, path);
+        const made = copies.make(r.io, a, cr.real, path, .{ .max_bytes = @as(u64, cr.env.copy_mb) << 20, .skip = r.copy_skip }) catch |e| {
+            const why = switch (e) {
+                error.TooLarge => try std.fmt.allocPrint(a, "the workspace is over {d} MiB ({s}'s copy_mb): no copy was made, so nothing reads or changes files in this run", .{ cr.env.copy_mb, cr.env.name }),
+                else => try std.fmt.allocPrint(a, "the workspace could not be copied for {s} ({s})", .{ cr.env.name, @errorName(e) }),
+            };
+            cr.why = try cr.gpa.dupe(u8, why);
+            r.logRun(.env, false, .{ .event = "copy", .name = cr.env.name, .why = why }) catch {};
+            return cr.why;
+        };
+        const real = Io.Dir.cwd().realPathFileAlloc(r.io, path, a) catch path;
+        cr.path = try cr.gpa.dupe(u8, real);
+        r.logRun(.env, false, .{ .event = "copy", .name = cr.env.name, .files = made.files, .mb = made.bytes >> 20, .how = if (made.cloned) "cloned" else "copied" }) catch {};
+    }
+    r.env.workspace = cr.path;
+    return null;
+}
+
 /// Where a run's commands run, and whether a `[use]` pin says so (then it
 /// can't name another).
 pub const Picked = struct { name: []const u8, pinned: bool = false };
@@ -665,6 +822,7 @@ fn shellDef(r: *const Run, a: std.mem.Allocator) !model.ToolDef {
     const pk = r.picked();
     var d: std.ArrayList(u8) = .empty;
     try d.appendSlice(a, if (with_dir) "Run a shell command in the workspace folder, or in `dir`, a folder inside it. Returns the exit code and output." else "Run a shell command in the workspace folder. Returns the exit code and output.");
+    if (copyEnvOf(r) != null) try d.appendSlice(a, " This run works in its own copy of the workspace: the files it reads and writes are the copy's (give paths inside the workspace, not absolute ones), and the owner applies or drops its changes when it ends.");
     try d.print(a, " Commands run in {s}", .{try envLine(a, list, pk.name)});
     var s: std.ArrayList(u8) = .empty;
     try s.appendSlice(a, "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}");
@@ -1348,6 +1506,11 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     try r.logRun(.turn, r.isPrivate(), .{ .text = user_text });
     // the folders it changes are snapshotted before their first change and
     // when it ends; its helpers share this
+    // a run in a `workspace = copy` environment works in its own copy,
+    // made at its first call that needs it; its changes are kept when it ends
+    var copy_state: CopyRun = undefined;
+    const own_copy = beginCopy(r, &copy_state);
+    defer if (own_copy) endCopy(r, a, &copy_state);
     var snap_state: SnapRun = undefined;
     const own_snaps = !r.helper and r.snap_run == null and r.snaps != null and r.gate.folders != null;
     if (own_snaps) {
@@ -1560,6 +1723,13 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     };
     const offered = if (mt) |m| r.allowsMcp(m) else r.allows(tool);
     if (!offered) return .{ .text = "this tool is not available here", .is_error = true };
+    // a run with its own copy of the workspace: files are the copy's
+    if (r.copy_run) |cr| if (tool == .read_file or tool == .write_file or tool == .shell or tool == .send) {
+        if (try useCopy(r, a, cr)) |why| {
+            try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why });
+            return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+        }
+    };
     if (tool == .send) return sendTool(r, a, input_json);
     if (tool == .agent_save) return agentSave(r, a, input_json);
     if (tool == .trigger) return triggerTool(r, a, input_json);
@@ -1667,7 +1837,8 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     }
     // what it may change is kept first, once a run (before the time left
     // is measured: a snapshot takes from the turn's time, not past it)
-    if (tool == .write_file or (tool == .shell and where.changesWorkspace())) snapBefore(r, a, tool, arg);
+    // (a copy's changes leave the workspace as it is)
+    if (r.copy_run == null and (tool == .write_file or (tool == .shell and where.changesWorkspace()))) snapBefore(r, a, tool, arg);
     // a tool gets what is left of the turn, no more; fetch and search
     // send each redirect through the gate
     var env = redirectEnv(r);
@@ -1693,7 +1864,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     }
     // noted before it is written, so a command a helper runs meanwhile is
     // asked too; by its path inside the workspace, as the gate sees it
-    if (tool == .write_file) if (r.written) |w| {
+    if (tool == .write_file and r.copy_run == null) if (r.written) |w| {
         const cf = gate.confined(a, r.io, r.env.workspace, arg) catch null;
         w.addBy(if (cf) |x| x.rel else arg, try writerOf(r, a), r.label);
     };
@@ -1840,15 +2011,23 @@ fn runElsewhere(r: *Run, a: std.mem.Allocator, tenv: tools.Env, e: *const enviro
     defer if (r.pool) |pool| pool.give(r.io, place);
     if (e.kind == .remote)
         return remote.run(tenv, a, .{ .env = e, .command = command, .dir = edir, .path_var = tenv.path_var, .system_vars = tenv.system_vars });
-    const cwd = if (dir.len == 0) "" else gate.confine(a, r.io, tenv.workspace, dir) catch return .{ .text = "dir is outside the workspace", .is_error = true };
+    const cf: ?gate.Confined = if (dir.len == 0) null else gate.confined(a, r.io, tenv.workspace, dir) catch return .{ .text = "dir is outside the workspace", .is_error = true };
+    var cwd: []const u8 = if (cf) |x| x.path else "";
     if (cwd.len > 0) {
         const st = Io.Dir.cwd().statFile(r.io, cwd, .{}) catch null;
         if (st == null or st.?.kind != .directory) return .{ .text = try std.fmt.allocPrint(a, "not a folder in the workspace: {s}", .{dir}), .is_error = true };
     }
+    // Linux: a run's copy is seen at the workspace's own path
+    var mount_at: []const u8 = "";
+    if (r.copy_run) |cr| if (@import("builtin").os.tag == .linux and std.mem.eql(u8, tenv.workspace, cr.path)) {
+        mount_at = cr.real;
+        if (cf) |x| cwd = try std.fs.path.join(a, &.{ cr.real, x.rel });
+    };
     return sandbox.run(tenv, a, .{
         .env = e,
         .command = command,
         .workspace = tenv.workspace,
+        .mount_at = mount_at,
         .dir = edir,
         .cwd = cwd,
         .path_var = tenv.path_var,
@@ -2321,6 +2500,10 @@ pub fn postReply(r: *Run, a: std.mem.Allocator, text: []const u8) !Posted {
 /// questions go to the run's asker (a workflow's waits in the inbox).
 pub fn stepCall(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const u8) !tools.Output {
     r.deadline_s = @divFloor(util.nowMs(r.io) + @as(i64, r.limits.turn_seconds) * 1000 + 999, 1000);
+    // a step in a `workspace = copy` environment is a run with its own copy
+    var copy_state: CopyRun = undefined;
+    const own_copy = beginCopy(r, &copy_state);
+    defer if (own_copy) endCopy(r, a, &copy_state);
     return callTool(r, a, name, input_json);
 }
 

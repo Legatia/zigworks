@@ -37,6 +37,9 @@ pub const Request = struct {
     /// Where the command starts: a real path in the workspace; "" the
     /// workspace, or the home when the sandbox doesn't see the workspace.
     cwd: []const u8 = "",
+    /// Linux, `workspace = copy`: where the sandbox sees `workspace` (the
+    /// copy): at the workspace's own path; "": at its own.
+    mount_at: []const u8 = "",
     /// PATH inside.
     path_var: []const u8,
     /// Windows: the system's own variables (util.system_var_names); the
@@ -235,13 +238,14 @@ pub fn bwrapArgv(io: Io, arena: std.mem.Allocator, req: Request, bwrap: []const 
     // never the data folder, inside a `read =` folder too: an empty folder
     // in its place
     if (covers_data) try a.appendSlice(arena, &.{ "--tmpfs", data });
+    const at = if (req.mount_at.len > 0) req.mount_at else req.workspace;
     switch (req.env.workspace) {
-        .rw => try a.appendSlice(arena, &.{ "--bind", req.workspace, req.workspace }),
-        .ro => try a.appendSlice(arena, &.{ "--ro-bind", req.workspace, req.workspace }),
+        .rw, .copy => try a.appendSlice(arena, &.{ "--bind", req.workspace, at }),
+        .ro => try a.appendSlice(arena, &.{ "--ro-bind", req.workspace, at }),
         .none => {},
     }
     try a.appendSlice(arena, &.{ "--bind", home, linux_home });
-    const cwd = if (req.env.workspace == .none) linux_home else if (req.cwd.len > 0) req.cwd else req.workspace;
+    const cwd = if (req.env.workspace == .none) linux_home else if (req.cwd.len > 0) req.cwd else at;
     try a.appendSlice(arena, &.{ "--chdir", cwd, "--", "/bin/sh", "-c", req.command });
     return a.items;
 }
@@ -338,7 +342,7 @@ pub fn macProfile(arena: std.mem.Allocator, p: MacPaths) ![]const u8 {
         try o.appendSlice(arena, ")\n");
     }
     try o.appendSlice(arena, switch (p.mode) {
-        .rw => "(allow file-read* file-write* process-exec file-map-executable",
+        .rw, .copy => "(allow file-read* file-write* process-exec file-map-executable",
         .ro => "(allow file-read* process-exec file-map-executable",
         .none => "(deny file-read* file-write* process-exec",
     });
@@ -520,6 +524,11 @@ fn wantedGrants(arena: std.mem.Allocator, req: Request, home: []const u8) ![]con
     var out: std.ArrayList(Grant) = .empty;
     switch (req.env.workspace) {
         .rw => try out.append(arena, .{ .path = req.workspace, .access = modify_access }),
+        // the folder its runs' copies are in, once for all of them (each
+        // copy made later inherits it)
+        // (only a copy in the environment's own folder: never the folder
+        // above some other workspace)
+        .copy => try out.append(arena, .{ .path = if (within(req.dir, req.workspace)) std.fs.path.dirname(req.workspace) orelse req.workspace else req.workspace, .access = modify_access }),
         .ro => try out.append(arena, .{ .path = req.workspace, .access = read_access }),
         .none => {},
     }
@@ -1457,4 +1466,26 @@ test "macos_where_sandbox_exec_cannot_make_a_sandbox_it_says_why" {
     try t.expect(o.is_error);
     try expectHas(o.text, "sandbox-exec can't make a sandbox here");
     try expectNot(o.text, "should-not-run");
+}
+
+test "sandbox_changes_files_the_owner_made" {
+    var f: Fix = undefined;
+    try f.init(.{ .name = "box", .line = 1, .kind = .sandbox });
+    defer f.deinit();
+    try need(&f);
+    // a.txt was made outside the sandbox
+    try expectOk(try f.run(if (is_windows) "echo changed> a.txt" else "echo changed > a.txt"));
+    try expectHas((try f.run(if (is_windows) "type a.txt" else "cat a.txt")).text, "changed");
+    if (is_windows) {
+        // cmd's own dir, del, ren, copy and move first ask the drive what
+        // file system it has, and an AppContainer may not open a drive's
+        // root: they say "Access is denied" (README: Environments). The
+        // file is still there.
+        const del = try f.run("del a.txt");
+        try expectHas(del.text, "Access is denied");
+        _ = try f.tmp.dir.statFile(t.io, "data/workspace/a.txt", .{});
+        return;
+    }
+    try expectOk(try f.run("rm a.txt"));
+    try t.expectError(error.FileNotFound, f.tmp.dir.statFile(t.io, "data/workspace/a.txt", .{}));
 }

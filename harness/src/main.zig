@@ -2131,6 +2131,7 @@ test {
     _ = @import("apps.zig");
     _ = @import("appserver.zig");
     _ = @import("clone.zig");
+    _ = @import("copies.zig");
     _ = @import("workflows.zig");
     _ = @import("wstate.zig");
 }

@@ -28,8 +28,14 @@ const who = @import("who.zig");
 
 pub const Kind = enum { sandbox, remote };
 
-/// How a sandbox sees the workspace.
-pub const Mode = enum { rw, ro, none };
+/// How a sandbox sees the workspace: read-write, read-only, not at all,
+/// or each run its own copy of it (its changes come back to be applied or
+/// dropped).
+pub const Mode = enum { rw, ro, none, copy };
+
+/// What happens to a copy's changes: the owner is asked, or they are
+/// applied at once when the check passes (and asked otherwise).
+pub const Apply = enum { ask, check };
 
 pub const Env = struct {
     name: []const u8,
@@ -42,6 +48,13 @@ pub const Env = struct {
     network: bool = false,
     /// Sandbox: more folders it may read, as written (absolute, or `~/...`).
     read: []const []const u8 = &.{},
+    /// `workspace = copy`: a command run in the copy after the run, in the
+    /// sandbox; "": none.
+    check: []const u8 = "",
+    apply: Apply = .ask,
+    /// `workspace = copy`: the most the workspace may hold, in MiB; a
+    /// larger one is not copied.
+    copy_mb: u32 = default_copy_mb,
     /// Remote: `USER@HOST` or `HOST`.
     host: []const u8 = "",
     port: u16 = 22,
@@ -49,6 +62,8 @@ pub const Env = struct {
     dir: []const u8 = "",
     /// Commands it runs at once.
     parallel: u8 = default_parallel,
+    /// The section has apply or copy_mb (they go with `workspace = copy`).
+    copy_keys: bool = false,
 };
 
 /// A `[use]` line: runs whose `by` matches `who` run in `env`.
@@ -174,6 +189,7 @@ pub fn describe(arena: std.mem.Allocator, e: Env) ![]const u8 {
                 .rw => "workspace rw",
                 .ro => "workspace ro",
                 .none => "no workspace",
+                .copy => "a copy of the workspace",
             },
             if (e.network) "network" else "no network",
         }),
@@ -182,6 +198,8 @@ pub fn describe(arena: std.mem.Allocator, e: Env) ![]const u8 {
 }
 
 pub const default_parallel = 2;
+pub const default_copy_mb = 2048;
+pub const max_copy_mb = 1 << 20;
 pub const max_parallel = 16;
 pub const max_name = 32;
 
@@ -202,6 +220,13 @@ pub const Error = error{
     BadNetwork,
     BadReadList,
     BadParallel,
+    BadCheck,
+    BadApply,
+    BadCopyMb,
+    /// check, apply or copy_mb without `workspace = copy`.
+    CopyKeyWithoutCopy,
+    /// `apply = check` without a check.
+    ApplyNeedsCheck,
     BadRemoteHost,
     MissingRemoteHost,
     BadRemotePort,
@@ -219,10 +244,15 @@ pub fn reason(e: anyerror) ?[]const u8 {
         error.BadEnvName => "a section is [default], [use] or an environment's name: a-z, 0-9, - and _, up to 32; keys come after one",
         error.HostIsBuiltIn => "host is built in: it is the workspace on this machine, as without environments.ini",
         error.DuplicateEnv => "this section is there already",
-        error.BadEnvKey => "a sandbox takes kind, workspace, network, read and parallel; a remote kind, host, port, dir and parallel; [default] env; [use] WHO = NAME; each once, as key = value",
+        error.BadEnvKey => "a sandbox takes kind, workspace, network, read and parallel (and with workspace = copy: check, apply, copy_mb); a remote kind, host, port, dir and parallel; [default] env; [use] WHO = NAME; each once, as key = value",
+        error.BadCheck => "check = a command to run in the copy after the run",
+        error.BadApply => "apply = ask or check",
+        error.BadCopyMb => "copy_mb = the most the workspace may hold, in MiB, 1 to 1048576",
+        error.CopyKeyWithoutCopy => "check, apply and copy_mb go with workspace = copy",
+        error.ApplyNeedsCheck => "apply = check needs a check = COMMAND",
         error.EnvKindFirst => "an environment's first line is kind = sandbox or kind = remote",
         error.BadEnvKind => "kind = sandbox or kind = remote",
-        error.BadWorkspaceMode => "workspace = rw, ro or none",
+        error.BadWorkspaceMode => "workspace = rw, ro, none or copy",
         error.BadNetwork => "network = off or on",
         error.BadReadList => "read = folders it may read, comma-separated, each absolute or starting with ~/",
         error.BadParallel => "parallel = how many commands it runs at once, 1 to 16",
@@ -251,7 +281,9 @@ pub const example =
     \\;
     \\; [box]
     \\; kind = sandbox
-    \\; workspace = rw           ; rw | ro | none
+    \\; workspace = rw           ; rw | ro | none | copy (each run works in
+    \\;                          ; its own copy; you apply or drop its changes;
+    \\;                          ; check = COMMAND, apply = ask | check, copy_mb)
     \\; network = off            ; off | on
     \\; read = /opt/tools        ; more folders it may read
     \\;
@@ -362,6 +394,18 @@ fn setKey(arena: std.mem.Allocator, e: *Env, key: []const u8, value: []const u8)
             e.network = if (std.ascii.eqlIgnoreCase(value, "on")) true else if (std.ascii.eqlIgnoreCase(value, "off")) false else return error.BadNetwork;
         } else if (eql(u8, key, "read")) {
             e.read = try readList(arena, value);
+        } else if (eql(u8, key, "check")) {
+            if (value.len == 0) return error.BadCheck;
+            for (value) |c| if (c < 0x20 or c == 0x7f) return error.BadCheck;
+            e.check = value;
+        } else if (eql(u8, key, "apply")) {
+            e.apply = std.meta.stringToEnum(Apply, value) orelse return error.BadApply;
+            e.copy_keys = true;
+        } else if (eql(u8, key, "copy_mb")) {
+            const mb = std.fmt.parseInt(u32, value, 10) catch return error.BadCopyMb;
+            if (mb == 0 or mb > max_copy_mb) return error.BadCopyMb;
+            e.copy_mb = mb;
+            e.copy_keys = true;
         } else return error.BadEnvKey,
         .remote => if (eql(u8, key, "host")) {
             if (!validHost(value)) return error.BadRemoteHost;
@@ -380,6 +424,8 @@ fn setKey(arena: std.mem.Allocator, e: *Env, key: []const u8, value: []const u8)
 /// What a section must have once it ends.
 fn finish(e: Env) Error!void {
     if (e.kind == .remote and e.host.len == 0) return error.MissingRemoteHost;
+    if ((e.copy_keys or e.check.len > 0) and e.workspace != .copy) return error.CopyKeyWithoutCopy;
+    if (e.apply == .check and e.check.len == 0) return error.ApplyNeedsCheck;
 }
 
 fn readList(arena: std.mem.Allocator, value: []const u8) Error![]const []const u8 {
