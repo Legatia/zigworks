@@ -193,7 +193,7 @@ pub const Remote = struct {
             const a = arena.allocator();
             r.side_mutex.lockUncancelable(r.io);
             defer r.side_mutex.unlock(r.io);
-            const bearer = r.bearerNow(a) catch null;
+            const bearer = r.bearerHeld(a) catch null;
             var hs: [2]std.http.Header = undefined;
             const n = sessionHeaders(&hs, st);
             if (r.side.send(.{ .method = .DELETE, .path = r.path, .key = bearer, .headers = hs[0..n], .limits = .{ .idle_ms = 1000, .total_ms = 1000 } })) |resp| {
@@ -345,6 +345,16 @@ pub const Remote = struct {
             .none => null,
             .token => |tk| tk.value,
             .signin => if (r.keeper) |k| try k.bearer(a) else null,
+        };
+    }
+
+    /// The token held now, never renewed first (the DELETE, answers to the
+    /// server, cancellations: bounded, they don't wait on a renewal).
+    fn bearerHeld(r: *Remote, a: Allocator) error{OutOfMemory}!?[]const u8 {
+        return switch (r.auth) {
+            .none => null,
+            .token => |tk| tk.value,
+            .signin => if (r.keeper) |k| try k.held(a) else null,
         };
     }
 
@@ -617,7 +627,7 @@ pub const Remote = struct {
     fn sideSend(r: *Remote, arena: Allocator, json: []const u8, stop: ?*const std.atomic.Value(bool), ms: u32) void {
         r.side_mutex.lockUncancelable(r.io);
         defer r.side_mutex.unlock(r.io);
-        const bearer = r.bearerNow(arena) catch return;
+        const bearer = r.bearerHeld(arena) catch return;
         var sbuf: [max_session]u8 = undefined;
         const st = r.state(&sbuf);
         var hs: [2 + 8]std.http.Header = undefined;

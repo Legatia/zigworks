@@ -179,6 +179,14 @@ pub const Keeper = struct {
         return a.dupe(u8, k.tokens.access_token);
     }
 
+    /// The access token held now (a copy in `a`), never renewed first: for
+    /// what must not wait on the authorization server (a stop's DELETE).
+    pub fn held(k: *Keeper, a: Allocator) error{OutOfMemory}![]const u8 {
+        k.mutex.lockUncancelable(k.io);
+        defer k.mutex.unlock(k.io);
+        return a.dupe(u8, k.tokens.access_token);
+    }
+
     /// After a 401 to a request that carried `used`: a sign-in made since
     /// (the store's), or a renewal. False when there is neither: the
     /// sign-in was refused.
@@ -1081,4 +1089,36 @@ test "a_sign_in_forgotten_by_logout_is_not_renewed" {
     try t.expect(k.refused());
     try t.expectEqual(0, h.refreshes.load(.acquire));
     try t.expectEqual(null, try load(t.io, a, st, "mcp-web"));
+}
+
+test "stopping_a_server_does_not_wait_for_a_renewal" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const h = &e.server.mcp;
+    const server = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/mcp/signin", .{e.server.port});
+    // every token expires within the minute renewals come early by
+    h.setExpiresIn(30);
+    var b: fake.Browser = .{ .io = t.io };
+    var said: []const u8 = "";
+    const tokens = try login(t.allocator, t.io, a, .{ .name = "web", .url = server, .link = .{ .ctx = &b, .f = fake.Browser.opened } }, &said);
+    b.join();
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ e.dir, "secrets" }) };
+    try save(t.io, t.allocator, st, "mcp-web", tokens);
+    const srv = try mcp.Server.start(t.allocator, t.io, .{ .name = "web", .command = "", .url = server, .login = true, .secrets = &.{}, .money = &.{} }, .{
+        .cwd = "",
+        .path_var = "",
+        .home = "",
+        .secret_values = &.{},
+        .start_timeout_ms = 10000,
+        .auth = .{ .signin = .{ .store = st } },
+    });
+    // the requests renewed the token as they went; the session's DELETE
+    // goes with the token held
+    const before = h.refreshes.load(.acquire);
+    try t.expect(before > 0);
+    srv.deinit();
+    try t.expectEqual(1, h.deleted.load(.acquire));
+    try t.expectEqual(before, h.refreshes.load(.acquire));
 }

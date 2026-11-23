@@ -1478,6 +1478,8 @@ fn mcpListText(gpa: std.mem.Allocator, a: std.mem.Allocator, io: Io, cfgs: []con
                     p.skipped = try std.fmt.allocPrint(a, "secret {s} is not stored: harness secret add {s}", .{ es.secret, es.secret });
                     break;
                 };
+                // one missing: the values after it were never read
+                if (p.skipped != null) continue;
                 for (sc.secrets, values) |es, v| try shown.append(a, .{ .name = es.secret, .value = v });
                 p.values = values;
                 p.dir = mcpServerDir(io, a, env.home, sc.name) catch |e| {
@@ -2597,6 +2599,9 @@ test "mcp_list_says_each_servers_kind_sign_in_and_tools" {
     const text = try std.fmt.allocPrint(a,
         \\[prog]
         \\command = "{s}" --mcp
+        \\[needs]
+        \\command = "{s}" --mcp
+        \\secret = KEY_ONE:webtok, KEY_TWO:nothere, KEY_THREE:webtok
         \\[web]
         \\url = {s}/mcp/token
         \\token = webtok
@@ -2609,7 +2614,7 @@ test "mcp_list_says_each_servers_kind_sign_in_and_tools" {
         \\[gone]
         \\url = http://127.0.0.1:1/mcp
         \\
-    , .{ fake, try e.url(), try e.url(), try e.url() });
+    , .{ fake, fake, try e.url(), try e.url(), try e.url() });
     const out = try mcpListText(t.allocator, a, t.io, try mcp.parseConfig(a, text), .{
         .store = st,
         .home = home,
@@ -2621,6 +2626,7 @@ test "mcp_list_says_each_servers_kind_sign_in_and_tools" {
         "prog (program): 3 tools\n  prog/echo  Echo text back.\n  prog/fail  Always fails.\n  prog/sleep  Wait ms milliseconds.\n",
         "web (token webtok, stored): 3 tools\n  web/echo  Echo text back.\n",
         "nokey (token missing, not stored): harness secret add missing\n",
+        "needs (program): secret nothere is not stored: harness secret add nothere\n",
         "cloud (sign-in, not signed in): harness mcp login cloud\n",
         "gone (url): not reached: gone could not be reached (ConnectFailed)\n",
     }) |want| {
