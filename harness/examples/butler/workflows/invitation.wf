@@ -23,7 +23,7 @@ do:
 if read.event is false goto done
 
 step diary
-tool <calendar>/cal_create {"title": "{read.title}", "start": "{read.start}", "end": "{read.end}", "location": "{read.place}"}
+tool <calendar>/cal_create {"title": "{read.title}", "start": "{read.start}", "end": "{read.end}", "place": "{read.place}"}
 on deny goto left
 on fail goto failed
 

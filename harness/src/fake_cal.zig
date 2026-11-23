@@ -6,7 +6,8 @@
 //! folder (else a day with the dentist); `travel_time` plays a maps server
 //! (34 min, its inputs kept in `travel.jsonl`); the changes (when the file
 //! lets one calendar change) are written to `changes.jsonl` and answered
-//! as calmcp does; `cal://upcoming` is `upcoming.json` of its folder.
+//! as calmcp does (cal_create with calmcp's own fields, a call naming
+//! another refused); `cal://upcoming` is `upcoming.json` of its folder.
 //! The secret is CALDAV_PASSWORD (or CALDAV_TOKEN) = `test_secret`.
 const std = @import("std");
 const Io = std.Io;
@@ -103,8 +104,30 @@ const read_tools =
     \\{"name":"cal_agenda","description":"The owner's events from from to to (default: today). Only reads.","inputSchema":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"},"calendar":{"type":"string"}}},"annotations":{"readOnlyHint":true}},{"name":"cal_free","description":"Free time. Only reads.","inputSchema":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"},"minutes":{"type":"integer"}},"required":["from","to","minutes"]},"annotations":{"readOnlyHint":true}},{"name":"cal_event","description":"One event in full. Only reads.","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]},"annotations":{"readOnlyHint":true}},{"name":"travel_time","description":"A maps server's travel time (the tests' [butler] maps).","inputSchema":{"type":"object","properties":{"destination":{"type":"string"},"arrival":{"type":"string"}},"required":["destination"]},"annotations":{"readOnlyHint":true}}
 ;
 const write_tools =
-    \\,{"name":"cal_create","description":"Create an event. Ask the owner first.","inputSchema":{"type":"object","properties":{"title":{"type":"string"},"start":{"type":"string"}},"required":["title","start"]},"_meta":{"anthropic/requiresUserInteraction":true}},{"name":"cal_move","description":"Move one of the owner's own events. Ask the owner first.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"from":{"type":"string"},"to":{"type":"string"}},"required":["id","title","from","to"]},"_meta":{"anthropic/requiresUserInteraction":true}},{"name":"cal_cancel","description":"Cancel one of the owner's own events. Ask the owner first.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"start":{"type":"string"}},"required":["id","title","start"]},"_meta":{"anthropic/requiresUserInteraction":true}},{"name":"cal_reply","description":"Answer an invitation. Ask the owner first.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"answer":{"type":"string"}},"required":["id","title","answer"]},"_meta":{"anthropic/requiresUserInteraction":true}}
+    \\,{"name":"cal_create","description":"Create an event. Ask the owner first.","inputSchema":{"type":"object","properties":{"calendar":{"type":"string"},"title":{"type":"string"},"start":{"type":"string"},"end":{"type":"string"},"minutes":{"type":"integer"},"all_day":{"type":"boolean"},"place":{"type":"string"},"notes":{"type":"string"}},"required":["title","start"]},"_meta":{"anthropic/requiresUserInteraction":true}},{"name":"cal_move","description":"Move one of the owner's own events. Ask the owner first.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"from":{"type":"string"},"to":{"type":"string"}},"required":["id","title","from","to"]},"_meta":{"anthropic/requiresUserInteraction":true}},{"name":"cal_cancel","description":"Cancel one of the owner's own events. Ask the owner first.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"start":{"type":"string"}},"required":["id","title","start"]},"_meta":{"anthropic/requiresUserInteraction":true}},{"name":"cal_reply","description":"Answer an invitation. Ask the owner first.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"answer":{"type":"string"}},"required":["id","title","answer"]},"_meta":{"anthropic/requiresUserInteraction":true}}
 ;
+
+/// cal_create's fields as calmcp's schema has them (calmcp/src/server.zig):
+/// calmcp passes over a field it doesn't have, so the stand-in refuses one,
+/// for a test to see a call whose place or time calmcp would drop.
+const create_fields = [_][]const u8{ "calendar", "title", "start", "end", "minutes", "all_day", "place", "notes" };
+
+/// Why calmcp would not take `args_json` as cal_create's input; null: it would.
+fn createProblem(a: std.mem.Allocator, args_json: []const u8) !?[]const u8 {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, a, args_json, .{}) catch return "its input is not a JSON object";
+    if (v != .object) return "its input is not a JSON object";
+    var it = v.object.iterator();
+    while (it.next()) |e| {
+        for (create_fields) |f| {
+            if (std.mem.eql(u8, f, e.key_ptr.*)) break;
+        } else return try std.fmt.allocPrint(a, "cal_create has no field {s} (calmcp's are calendar, title, start, end, minutes, all_day, place, notes)", .{e.key_ptr.*});
+    }
+    for ([_][]const u8{ "title", "start" }) |f| {
+        const x = v.object.get(f) orelse return try std.fmt.allocPrint(a, "cal_create needs {s}", .{f});
+        if (x != .string or x.string.len == 0) return try std.fmt.allocPrint(a, "cal_create needs {s}", .{f});
+    }
+    return null;
+}
 
 const default_agenda = "Mon 23 Nov 2026 (Europe/Warsaw):\n10:30–11:30 Dentist; Dental clinic, ul. Długa 5, Kraków [personal/dentist-1@calmcp-sim]";
 
@@ -181,6 +204,7 @@ fn call(io: Io, a: std.mem.Allocator, name: []const u8, args_json: []const u8, w
     if (eql(u8, name, "cal_event")) return textResult(a, fileOf(io, a, "event.txt") orelse "Dentist\nWhen: Mon 23 Nov 2026 10:30–11:30 (Europe/Warsaw)\nWhere: Dental clinic, ul. Długa 5, Kraków\nCalendar: Personal (calmcp may change it)\nid: personal/dentist-1@calmcp-sim", false);
     const known = eql(u8, name, "cal_create") or eql(u8, name, "cal_move") or eql(u8, name, "cal_cancel") or eql(u8, name, "cal_reply");
     if (!known or !writes) return textResult(a, try std.fmt.allocPrint(a, "no tool called {s}", .{name}), true);
+    if (eql(u8, name, "cal_create")) if (try createProblem(a, args_json)) |why| return textResult(a, try std.fmt.allocPrint(a, "Not created: {s}.", .{why}), true);
     // what was asked, a line each
     const f = Io.Dir.cwd().createFile(io, "changes.jsonl", .{ .truncate = false }) catch return textResult(a, "can't write changes.jsonl", true);
     defer f.close(io);

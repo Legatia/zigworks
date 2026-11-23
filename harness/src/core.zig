@@ -23292,3 +23292,40 @@ test "a_busy_window_that_held_nothing_leaves_the_nights_digest_as_it_was" {
     try f.rec.waitFor("During quiet hours (22:00–07:00):\n");
     try t.expectEqual(0, f.rec.count("While you were at"));
 }
+
+test "a_flight_in_the_mail_goes_to_the_calendar_through_calmcps_cal_create_asked_first" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // the owner's mailbox (mailmcp's stand-in) and the calendar (calmcp's), both in mcp.ini
+    try withMail(&f);
+    const mail_ini = fileText(&f, f.core.paths.mcp);
+    const dir = try withCalendar(&f);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "{s}\n{s}", .{ fileText(&f, f.core.paths.mcp), mail_ini }) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const changes = try std.fs.path.join(a, &.{ dir, "changes.jsonl" });
+    try withRoutine(&f, .flight, .{ .mail = true, .calendar = "calendar" });
+    // the first look only marks what is there
+    try mailFile(&f, "mine-new.json", "[]");
+    _ = try f.core.pollNow("flight-mail");
+    try mailFile(&f, "mine-new.json", "[{\"id\":\"mine/INBOX/7/2\",\"uid\":2,\"from\":\"LOT <noreply@lot.example>\",\"subject\":\"Potwierdzenie rezerwacji LO 3921\",\"kind\":\"travel\"}]");
+    try mailFile(&f, "read-mine-2.json", "{\"uid\":2,\"from\":\"LOT <noreply@lot.example>\",\"subject\":\"Potwierdzenie rezerwacji LO 3921\",\"text\":\"LO 3921 Kraków (KRK) 07:15 – Warszawa (WAW) 08:10, 4 grudnia 2026.\"}");
+    try f.e.script(1, model.toolReply("r1", "mail__mail_read", "{\"mailbox\":\"mine\",\"uid\":2}"));
+    try f.e.script(2, model.textReply("{\\\"flight\\\": true, \\\"title\\\": \\\"Flight LO 3921 Kraków – Warszawa\\\", \\\"start\\\": \\\"2026-12-04 07:15\\\", \\\"end\\\": \\\"2026-12-04 08:10\\\", \\\"place\\\": \\\"Kraków Airport (KRK)\\\", \\\"line\\\": \\\"Flight LO 3921 Kraków – Warszawa leaves Fri 4 Dec at 07:15.\\\"}"));
+    _ = try f.core.pollNow("flight-mail");
+    runWorkflows(&f);
+    // calmcp's cal_create, with its own field names, asked first (a money tool)
+    try f.rec.waitFor("BUTTONS Allow this? [1]\n[flight#1 diary] calendar__cal_create: calendar/cal_create {\"end\":\"2026-12-04 08:10\",\"place\":\"Kraków Airport (KRK)\",\"start\":\"2026-12-04 07:15\",\"title\":\"Flight LO 3921 Kraków – Warszawa\"}");
+    try t.expect(f.rec.buttonsWith("Allow this? [1]").?.get("day") == null);
+    try t.expect(!exists(changes));
+    try f.press("once");
+    runWorkflows(&f);
+    try f.rec.waitFor("Flight LO 3921 Kraków – Warszawa leaves Fri 4 Dec at 07:15. It's in the calendar.");
+    try expectHas(fileText(&f, changes), "{\"tool\":\"cal_create\",\"arguments\":{\"end\":\"2026-12-04 08:10\",\"place\":\"Kraków Airport (KRK)\",\"start\":\"2026-12-04 07:15\",\"title\":\"Flight LO 3921 Kraków – Warszawa\"}}");
+    // the invitation routine's entry takes the same fields
+    var h = try butler.parseHome(a, stand_in_home);
+    butler.readCheck(&h, stand_in_check);
+    const inv = try butler.routineFiles(a, .invitation, try butler.pick(a, h, .{ .mail = true, .calendar = "calendar" }), "2026-11-23");
+    try expectHas(inv.workflow, "tool calendar/cal_create {\"title\": \"{read.title}\", \"start\": \"{read.start}\", \"end\": \"{read.end}\", \"place\": \"{read.place}\"}");
+}
