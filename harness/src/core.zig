@@ -19901,9 +19901,11 @@ test "speech_past_its_time_says_so" {
     const started = util.nowMs(t.io);
     const words = try spokenOf(&f, try speakIn(&f, port, "Kuchnia", "pl", "", "jaka będzie pogoda?", false));
     const took = util.nowMs(t.io) - started;
-    std.debug.print("a 5 s spoken answer, the model 8 s late: answered after {d} ms\n", .{took});
     try t.expectEqualStrings("Przepraszam, to trwało za długo. Spróbuj jeszcze raz.", words);
-    try t.expect(took >= 4000 and took < 7500);
+    if (took < 4000 or took >= 7500) {
+        std.debug.print("a 5 s spoken answer, the model 8 s late: answered after {d} ms (4000 to 7500 wanted)\n", .{took});
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "speech_streams_for_home_assistant" {
@@ -20032,8 +20034,10 @@ test "a_triggers_post_never_waits_for_the_speakers" {
     const posted = util.nowMs(t.io) - started;
     waitIdle(f.core);
     const said = util.nowMs(t.io) - started;
-    std.debug.print("the leak was posted after {d} ms, said after {d} ms\n", .{ posted, said });
-    try t.expect(posted < 2000);
+    if (posted >= 2000) {
+        std.debug.print("the leak was posted after {d} ms (under 2000 wanted), said after {d} ms\n", .{ posted, said });
+        return error.TestUnexpectedResult;
+    }
     try t.expectEqualStrings("Kitchen: Water under the kitchen sink (slow).\n", try announcedText(&f));
 }
 
