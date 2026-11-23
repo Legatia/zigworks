@@ -30,7 +30,9 @@ const outcome_room = 160;
 pub const Status = enum { open, answered, expired, void, withdrawn, done };
 /// What a text answer is (`text` in v1).
 pub const TextKind = enum { none, answer, draft, reason };
-pub const Via = enum { telegram, terminal, bar, harness };
+/// `fallback`: an urgent routine's question nobody was on, answered by
+/// harness with its yes (its safe call).
+pub const Via = enum { telegram, terminal, bar, harness, fallback };
 
 pub const Choice = struct { key: []const u8, label: []const u8 };
 
@@ -727,6 +729,12 @@ pub fn outcome(a: std.mem.Allocator, it: *const Item, utc_offset: i32) ![]const 
                 break :blk std.fmt.allocPrint(a, "denied{s}, {s}", .{ if (has_text) " with your reason" else "", hm });
             }
             if (eql(u8, key, "text")) break :blk std.fmt.allocPrint(a, "answered in words, {s}", .{hm});
+            // nobody on it in time: harness tapped its yes itself
+            if (ans.via == .fallback) if (it.choiceLabel(key)) |label| {
+                const said = try a.dupe(u8, label);
+                if (said.len > 0) said[0] = std.ascii.toLower(said[0]);
+                break :blk std.fmt.allocPrint(a, "{s} (no one answered: harness did it), {s}", .{ said, hm });
+            };
             // a plain kind's outcome is its button's own words
             if (plain(it.kind)) if (it.choiceLabel(key)) |label| {
                 const said = try a.dupe(u8, label);

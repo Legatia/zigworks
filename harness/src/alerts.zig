@@ -108,7 +108,7 @@ pub const Told = struct { member: []const u8, conv: []const u8 = "", chat: i64 =
 /// An urgent routine's question that makes its safe call itself when
 /// nobody is on it `after_s` seconds after it was asked: `item` answered
 /// as the yes would be; `call` the call, for the log; `done` when.
-pub const Fallback = struct { after_s: u32, item: u64, call: []const u8 = "", done: i64 = 0 };
+pub const Fallback = struct { after_s: u32, item: u64, call: []const u8 = "", at: i64 = 0, done: i64 = 0 };
 
 /// A line the house's speakers say (a trigger's `announce`, filled):
 /// `by` that trigger (`trigger:NAME`), `server` its MCP server, `room`
@@ -180,7 +180,7 @@ pub fn copy(a: Allocator, x: Alert) !Alert {
     const un = try a.alloc([]const u8, x.unreached.len);
     for (x.unreached, un) |y, *z| z.* = try a.dupe(u8, y);
     o.unreached = un;
-    if (x.fallback) |f| o.fallback = .{ .after_s = f.after_s, .item = f.item, .call = try a.dupe(u8, f.call), .done = f.done };
+    if (x.fallback) |f| o.fallback = .{ .after_s = f.after_s, .item = f.item, .call = try a.dupe(u8, f.call), .at = f.at, .done = f.done };
     if (x.speak) |sp| o.speak = .{ .by = try a.dupe(u8, sp.by), .server = try a.dupe(u8, sp.server), .text = try a.dupe(u8, sp.text), .room = try a.dupe(u8, sp.room) };
     if (x.acked) |k| o.acked = .{ .by = try a.dupe(u8, k.by), .at = k.at, .via = try a.dupe(u8, k.via) };
     return o;
@@ -378,7 +378,7 @@ pub const Store = struct {
         s.mutex.lockUncancelable(s.io);
         defer s.mutex.unlock(s.io);
         const x = s.find(id) orelse return;
-        x.fallback = .{ .after_s = f.after_s, .item = f.item, .call = try s.arena.allocator().dupe(u8, f.call), .done = f.done };
+        x.fallback = .{ .after_s = f.after_s, .item = f.item, .call = try s.arena.allocator().dupe(u8, f.call), .at = if (f.at != 0) f.at else x.at, .done = f.done };
         try s.save();
     }
 
@@ -450,7 +450,7 @@ pub const Store = struct {
             if (x.ended.len > 0) continue;
             var k = x.next;
             while (k < x.steps.len and now >= x.at + x.steps[k].after_s) : (k += 1) try out.append(a, .{ .step = .{ .id = x.id, .index = k } });
-            if (x.fallback) |f| if (f.done == 0 and now >= x.at + f.after_s) try out.append(a, .{ .fallback = .{ .id = x.id, .item = f.item } });
+            if (x.fallback) |f| if (f.done == 0 and now >= (if (f.at != 0) f.at else x.at) + f.after_s) try out.append(a, .{ .fallback = .{ .id = x.id, .item = f.item } });
         }
         if (dropped) {
             if (s.list.items.len == 0) {

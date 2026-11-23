@@ -745,13 +745,13 @@ EOF
 	n0=$(asked)
 	press yes
 	check "Looks right writes the home, starts homemcp and offers the routines" 'wait_for "$OUT" "The home is connected: 16 devices." 30 && [ -f "$BH/home.ini" ] && grep -qF "secret = HA_TOKEN:ha" "$BH/mcp.ini" && wait_asked_long $((n0 + 1)) && last_question | grep -qF "Goodnight: when you say goodnight"'
-	# every routine turned on, as each is offered
-	for r in goodnight leaving arriving morning-home leak door-open; do
+	# every routine turned on, as each is offered (the leak's fallback too)
+	for r in goodnight leaving arriving morning-home leak leak-fallback door-open; do
 		n0=$(asked)
 		press on
 		[ "$r" = door-open ] || wait_asked_long $((n0 + 1))
 	done
-	check "every routine the home has what for is on" 'wait_for "$OUT" "That'"'"'s all the routines: 6 on." 30 && [ -f "$BH/workflows/leak.wf" ] && grep -qF "[leak-sink_leak]" "$BH/triggers.ini" && grep -qF "[door-back_door]" "$BH/triggers.ini" && grep -qF "[workflow:arriving/heat]" "$BH/rules"'
+	check "every routine the home has what for is on" 'wait_for "$OUT" "That'"'"'s all the routines: 6 on." 30 && [ -f "$BH/workflows/leak.wf" ] && grep -qF "fallback 5m" "$BH/workflows/leak.wf" && grep -qF "[leak-sink_leak]" "$BH/triggers.ini" && grep -qF "[door-back_door]" "$BH/triggers.ini" && grep -qF "[workflow:arriving/heat]" "$BH/rules"'
 	# the triggers' first polls only mark what is there
 	for tr in leak-sink_leak door-back_door everyone-left first-home; do
 		wait_for "$BH/state/triggers/$tr/state" "\"polled\":true" 20

@@ -629,16 +629,19 @@ pub const Picks = struct {
     night_temp: u16 = 18,
     away_temp: u16 = 17,
     home_temp: u16 = 21,
+    /// The leak's question closes the water main itself when nobody is on
+    /// it in 5 minutes (the owner turned it on).
+    fallback: bool = false,
 };
 
-pub const Settings = struct { car: bool = false, search: bool = false, calendar: []const u8 = "", quiet: ?config.Quiet = null, town: []const u8 = "" };
+pub const Settings = struct { car: bool = false, search: bool = false, calendar: []const u8 = "", quiet: ?config.Quiet = null, town: []const u8 = "", fallback: bool = false };
 
 /// The devices and settings the routines use: every light; the first
 /// thermostat; the first lock (a front one first); the water main (a
 /// valve, else a switch named one); every leak sensor; every door and
 /// window sensor.
 pub fn pick(a: Allocator, h: Home, s: Settings) !Picks {
-    var p: Picks = .{ .people = h.people.len > 0, .car = s.car, .search = s.search, .calendar = s.calendar, .quiet = s.quiet, .town = s.town };
+    var p: Picks = .{ .people = h.people.len > 0, .car = s.car, .search = s.search, .calendar = s.calendar, .quiet = s.quiet, .town = s.town, .fallback = s.fallback };
     var leaks: std.ArrayList(Device) = .empty;
     var doors: std.ArrayList(Device) = .empty;
     for (h.devices) |d| {
@@ -1054,11 +1057,32 @@ fn perSensorName(a: Allocator, prefix: []const u8, device: []const u8) ![]const 
     return n[0..@min(n.len, 64)];
 }
 
+/// Whether the leak's question may close the water main itself (its
+/// fallback): a valve that closes, not a switch whose safe way is off.
+pub fn fallbackOffered(p: Picks) bool {
+    const v = p.valve orelse return false;
+    return v.kind == .valve and v.allows("close");
+}
+
+/// The leak's fallback, offered after the leak is on.
+pub fn fallbackSentence(a: Allocator, p: Picks) ![]const u8 {
+    return std.fmt.allocPrint(a, "If nobody answers the leak's question in 5 minutes, I close the {s} myself, once, and tell you.", .{try spoken(a, p.valve.?.name)});
+}
+
+/// Said once the leak's fallback is on.
+pub fn fallbackOnText(a: Allocator, p: Picks) ![]const u8 {
+    return std.fmt.allocPrint(a, "If nobody answers, I close the {s} after 5 minutes.", .{try spoken(a, p.valve.?.name)});
+}
+
+/// The line the fallback adds to the leak's step ask.
+pub const fallback_line = "fallback 5m";
+
 /// The flags the templates' `#if` lines read.
 fn flagsOf(a: Allocator, p: Picks) ![]const []const u8 {
     var f: std.ArrayList([]const u8) = .empty;
     if (p.lock != null) try f.append(a, "lock");
     if (p.valve != null) try f.append(a, "valve");
+    if (p.fallback and fallbackOffered(p)) try f.append(a, "fallback");
     if (p.thermostat != null) try f.append(a, "thermostat");
     if (p.car) try f.append(a, "car");
     return f.items;
