@@ -151,6 +151,12 @@ the server won't let you write, are read only. Task lists are left out.
 - **Cancel a whole series.** A change to a recurring event touches one time
   of it: a move adds an exception (`RECURRENCE-ID`), a cancel an `EXDATE`.
 - **Make more than `writes_per_day` changes in 24 hours.**
+- **Send a field a tool doesn't take.** A call with a field its schema
+  doesn't list is refused, not half done: `cal_create` with `location`
+  (its field is `place`) answers "Not changed: cal_create has no field
+  location; it takes calendar, title, start, end, minutes, all_day, place,
+  notes." and writes nothing (the refusal is logged); a read the same,
+  without "Not changed".
 - **Act off the record.** With `log =`, every change is one JSON line, the
   refused ones too:
 

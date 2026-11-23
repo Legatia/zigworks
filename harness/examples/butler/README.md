@@ -2,7 +2,8 @@
 
 Eight routines for a home run by Home Assistant (through
 [homemcp](../../../homemcp/)) and, for the last one, a car (through
-[carcloud](../../../carcloud/)); four more for your mail (through
+[carcloud](../../../carcloud/)); one to warm a car that can (a Tesla
+through carcloud, with a calendar); four more for your mail (through
 [mailmcp](../../../mailmcp/), once `/setup mail mine` is on; the last two
 with a calendar, through [calmcp](../../../calmcp/)). Each is a workflow
 (`workflows/NAME.wf`), the section of `triggers.ini` that starts it, and
@@ -21,6 +22,7 @@ your devices and times, shows each file, and writes it only when you tap
 | Smoke alarm | a smoke or CO alarm reads `ALARM` | urgent, through quiet hours: "Smoke alarm: Kitchen smoke alarm, Kitchen.", said on every speaker (`speakers = all`); nothing to close, nothing acted on |
 | Doors left open | a door or window sensor reads open | 10 minutes later, if it still is: "Back door has been open for 10 minutes." |
 | Car for tomorrow | in the evening (90 minutes before quiet hours) | a line when the car is under half and not plugged in; one tap to start charging when it is plugged in but not charging |
+| Warm the car | harness itself (`schedule:warm-car`), 30 minutes before a morning leave-by in the diary when the car reads below `[butler] warm_below` outside | "Warm the car for 8:10?" [Warm it]: the tap turns the climate on (carcloud's `car_climate`, a Tesla), read back; no trigger of its own |
 | Bills | `mail_list` of your mailbox every 6 hours: bills due in 3 days | a line with who, how much and when it is due, once a bill |
 | Deliveries | `mail_list` every hour: parcels coming today | a line on the day, once a parcel |
 | Flights | a travel mail pushed by mailmcp (`mail://mine/new`) | an agent step reads it; a flight's time offered for the calendar with calmcp's `cal_create` (`title`, `start`, `end`, `place`), asked every time |
