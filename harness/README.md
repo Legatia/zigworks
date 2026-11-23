@@ -31,10 +31,10 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 737 unit tests (19 of them
+**State: 0.3.0, tested on macOS by its own tests: 756 unit tests (19 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 75 checks that drives the real binary against
+and an end-to-end script of 79 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram, feeds,
 search and two MCP servers. An earlier build of 0.3.0 also passed its
 tests in CI on Linux and Windows. On Windows 11 the browser and login
@@ -520,6 +520,42 @@ and after each run. Where the file system can share blocks (APFS on
 macOS, btrfs, XFS made with reflink, ReFS and Dev Drives on Windows) an
 object is a clone that takes no space until the file changes; elsewhere,
 and for a file made unchangeable (`chflags uchg`), it is a copy.
+
+### Undo
+
+A run that changed files in folders that keep snapshots ends its message
+with a line like "Changed 3 files in notes/ and site/." and an **Undo**
+button: the chat reply, a task's or trigger's post, or harness's own line
+when the run ended on a limit or an error. In the terminal `/undo RUN` is
+printed under it instead (RUN is the run's number in the log). A run that
+posts nothing (a task's NOTHING, a workflow's agent step, a stopped run)
+gets no button; `/undo RUN` still takes it back.
+
+Undo takes back that run's changes file by file, from its "before" and
+"after" snapshots (a helper's changes are its run's): a file as the run
+left it gets its old content and executable bit back, one the run made is
+removed, one it removed is made again. A file changed since the run (by
+you, a program or a later run) is left as it is and named ("notes/a.md
+changed since; left as it is"). A database file goes with its `-wal`,
+`-shm` and `-journal` files: they are put back together, or all left when
+any of them changed since. Before it writes, Undo takes a snapshot of each
+folder it writes in, so `/restore FOLDER ID` takes the undo back; the
+reply names it. Files snapshots don't keep (`skip` matches, `.git`,
+symbolic links, files over 100 MiB) are not taken back, and nothing is
+written through a symbolic link. Only files in the workspace are covered:
+databases reached through an MCP server or over the network keep what the
+run did to them.
+
+Undo is refused while a run is going, as `/restore` is, and once the run's
+snapshots were pruned ("Too old to undo: its snapshots were pruned.").
+Only your press counts, in a group too. The button carries the run's
+number and an HMAC of it with the log's key (`state/log-key`), so nothing
+is kept for it; a press whose HMAC doesn't match is out of date. Pressed,
+the message is edited with the outcome; while a run is going, it says so
+and the button stays. `/undo` takes back the newest run with changes in
+the conversation you send it in, `/undo RUN` that run, and `harness undo
+RUN` does the same from the command line (refused while `harness run`
+holds the folder, like `harness snapshot restore`).
 
 ## Environments
 
@@ -1030,7 +1066,8 @@ labels (`run`, `conversation`, `by`, `agent`, `to`, `event`, `tool`,
 it was taken, label, files, changed, bytes stored, and the run's rid,
 definition and who started it), `snapshot skipped` (folder, why),
 `restore` (folder, id, the id that undoes it, files written and
-deleted) and `prune` (snapshots and objects deleted). Each line carries the
+deleted), `undo` (run, folders, files put back, files left) and `prune`
+(snapshots and objects deleted). Each line carries the
 SHA-256 of the line before it; `harness log verify` finds the first line
 that was changed, removed or reordered, and also lines cut from the end,
 by the last line named in `state/status`. Harness warns at start if the
@@ -1443,7 +1480,7 @@ lists, workflows starting workflows (an agent step may `delegate`).
 `/task add|rm|resume`, `/memory`, `/remember`, `/pin`, `/unpin`,
 `/forget`, `/private on|off`, `/skills`, `/skill rm`, `/logins`,
 `/folders`, `/access WHO`, `/snapshots [FOLDER]`, `/snapshot FOLDER
-[LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/envs`, `/env
+[LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/undo [RUN]`, `/envs`, `/env
 check|rm NAME`, `/dryrun on|off`,
 `/reload`, `/conversations`, `/conversation new|rename|rm|add`,
 `/session [N]`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
@@ -1457,7 +1494,7 @@ act on the conversation they are sent in; `/stop`, `/dryrun` and
 CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `trigger list|test|run`, `workflow list|check|start|stop`,
 `memory [list|pin|unpin|forget ID]`,
-`snapshot list|take|changes|restore`, `env list|check|rm|key`,
+`snapshot list|take|changes|restore`, `undo RUN`, `env list|check|rm|key`,
 `agent list|show|rm`, `log verify|tail|runs|session`, `inbox [--json]`,
 `app list|approve|rm`,
 `health`, `version`. `--home DIR` may come anywhere on the line;
