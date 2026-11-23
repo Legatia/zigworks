@@ -13,6 +13,7 @@ RPID=""
 cleanup() {
 	[ -n "$RPID" ] && kill "$RPID" 2>/dev/null
 	[ -n "$FPID" ] && kill "$FPID" 2>/dev/null && wait "$FPID" 2>/dev/null
+	[ -n "${SPID:-}" ] && kill "$SPID" 2>/dev/null
 	rm -rf "$T"
 }
 trap cleanup EXIT
@@ -556,6 +557,37 @@ check "the tokens are in no file of the data folder and never said" '! grep -rqF
 check "mcp list says the server is signed in, with its tools" '"$H" mcp list 2>&1 | grep -qxF "cloud (sign-in, signed in): 3 tools"'
 check "mcp logout forgets the tokens" '"$H" mcp logout cloud | grep -qxF "Signed out of cloud." && [ ! -e "$HARNESS_STORE/mcp-cloud" ] && "$H" mcp logout cloud | grep -qxF "cloud was not signed in."'
 cp "$T/mcp.ini.saved" "$HARNESS_HOME/mcp.ini"
+
+# a change in the home, pushed by homemcp, fires a trigger: homemcp and
+# homemcp-sim from HOMEMCP_BIN, or built next to harness (zig build in
+# ../homemcp); skipped without them
+HM=${HOMEMCP_BIN:-$(cd "$(dirname "$0")/../../homemcp/zig-out/bin" 2>/dev/null && pwd)}
+if [ -n "$HM" ] && [ -x "$HM/homemcp" ] && [ -x "$HM/homemcp-sim" ]; then
+	"$HM/homemcp-sim" ha 0 smoke-ha-token >"$T/hasim.out" 2>&1 &
+	SPID=$!
+	wait_for "$T/hasim.out" "127.0.0.1:" 5
+	HAPORT=$(sed -n 's/.*127[.]0[.]0[.]1:\([0-9]*\).*/\1/p' "$T/hasim.out")
+	printf '[home]\nhub = homeassistant\nurl = http://127.0.0.1:%s\n[device back_door]\nid = binary_sensor.back_door\nkind = sensor\nroom = Kitchen\n' "$HAPORT" >"$T/home.ini"
+	printf 'smoke-ha-token\n' | "$H" secret add homeassistant --stdin 2>/dev/null
+	printf '[home]\ncommand = "%s" "%s"\nsecret = HA_TOKEN:homeassistant\n' "$HM/homemcp" "$T/home.ini" >>"$HARNESS_HOME/mcp.ini"
+	printf '\n[door]\nmcp = home resource home://device/back_door\nmatch = text has "to":"open"\nsay = The back door: {text}\n' >>"$HARNESS_HOME/triggers.ini"
+	"$H" run >"$T/run4.out" 2>&1 &
+	RPID=$!
+	wait_for "$T/run4.out" "running on" 15
+	check "harness subscribes to homemcp's back door" 'wait_for "$HARNESS_HOME/log/actions.jsonl" "\"event\":\"subscribed\",\"server\":\"home\",\"uri\":\"home://device/back_door\"" 10'
+	# its first poll only marks what is there
+	wait_for "$HARNESS_HOME/state/triggers/door/state" "\"polled\":true" 15
+	"$HM/homemcp-sim" poke ha "$HAPORT" smoke-ha-token binary_sensor.back_door '{"contact":false}'
+	# an MCP resource is polled every 15 minutes: a line within seconds was pushed
+	check "the back door opening, pushed by homemcp, fires the trigger" 'wait_for "$OUT" "[door] The back door: " 15 && grep -qF "\\\"from\\\":\\\"closed\\\",\\\"to\\\":\\\"open\\\"" "$OUT"'
+	kill "$RPID" 2>/dev/null
+	wait "$RPID" 2>/dev/null
+	RPID=""
+	kill "$SPID" 2>/dev/null
+	SPID=""
+else
+	echo "# homemcp isn't built next to harness (or HOMEMCP_BIN): the home event check is skipped"
+fi
 
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	echo "smoke: FAILED"
