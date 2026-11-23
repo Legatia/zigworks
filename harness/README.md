@@ -874,8 +874,9 @@ The diary reads calmcp's `cal://upcoming` (today and tomorrow, as data)
 every 10 minutes and after `/reload`. Its lines go to main at their
 minute, through quiet hours (without a sound) and busy events, once each:
 `state/diary` keeps the ones said for two days, and each is a `diary` line
-(kind `chat`) in the log. Where calmcp is: `[butler] calmcp =`, else next
-to harness, else on PATH.
+(kind `chat`) in the log. The events' attendees who are new go to People
+(below). Where calmcp is: `[butler] calmcp =`, else next to harness, else
+on PATH.
 
 **`harness doctor`** says, a line each, whether `harness run` runs, the
 settings files read, the bot answers and you are paired, the model answers
@@ -1964,11 +1965,12 @@ year`), `added`.
   items, and you get one line: "Noted about Ola: birthday 28 November.
   (/person Ola)". Saying you called, met or wrote to someone sets `in
   touch`, without a line.
-- Your calendar: when a calendar server's `cal_event` or `cal_agenda`
-  (calmcp's reads, on any server name) answers in one of your own
-  conversations, attendees who are new are added with their email, and
-  you get one line. Not you (an attendee marked `self`), not someone
-  with an email alone, not events of more than 10 people.
+- Your calendar: the diary's read of calmcp's `cal://upcoming` (The
+  diary, above; every 10 minutes) adds the events' attendees who are new,
+  with their email, and you get one line ("From your calendar, now in
+  people: …", held in quiet hours). Not you (an attendee marked `self`),
+  not someone with an email alone, not events of more than 10 people, and
+  no one while main is private.
 - A contacts file: `harness people import FILE.vcf` (vCard 3 or 4, as
   Apple Contacts, Google Contacts and Outlook export them; `FN`, `N`,
   `NICKNAME`, `BDAY`, `ANNIVERSARY`, `EMAIL`, `TEL`). A card is someone

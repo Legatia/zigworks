@@ -9419,6 +9419,7 @@ pub const Core = struct {
         };
         try c.diary.store(res.text, each.items);
         c.diary.next_read.store(now_s + 600, .release);
+        c.diaryPeople(a, res.text);
     }
 
     /// The minutes [butler] maps (SERVER/TOOL) says the way to `e` takes,
@@ -9512,6 +9513,25 @@ pub const Core = struct {
         var list: std.ArrayList(people_mod.Attendee) = .empty;
         for (e.people[0..@min(e.people.len, 10)]) |p| try list.append(a, .{ .name = p.name, .email = p.email });
         return c.peopleForMeeting(a, list.items);
+    }
+
+    /// The events' attendees into the people book (`cal://upcoming`'s
+    /// `attendees`: the owner, marked self, and events of more than 10
+    /// people left out); who is new said in one line to main, held in quiet
+    /// hours as the people's lines are. Nothing while main isn't the
+    /// owner's own, or is private.
+    fn diaryPeople(c: *Core, a: std.mem.Allocator, text: []const u8) void {
+        if (!c.ownConversation("main") or c.convPrivate("main")) return;
+        const found = people_mod.attendeesOf(a, text) catch return;
+        if (found.len == 0) return;
+        const added = c.people.fromCalendar(a, found, c.peopleDay(c.now())) catch |e| {
+            c.log.write(.memory, false, .{ .event = "people not written", .why = @errorName(e) }) catch {};
+            return;
+        };
+        if (added.len == 0) return;
+        c.log.write(.memory, false, .{ .event = "people from the calendar", .added = added.len }) catch {};
+        const names = std.mem.join(a, ", ", added) catch return;
+        c.postPeople(a, std.fmt.allocPrint(a, "From your calendar, now in people: {s}. (/people)", .{names}) catch return);
     }
 
     /// Whether the owner is in a busy event at `now_s`.
@@ -22475,15 +22495,6 @@ fn addSister(f: *Fix) !void {
     }
 }
 
-fn withCalTool(f: *Fix) !void {
-    const a = f.e.arena.allocator();
-    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[cal]\ncommand = \"{s}\" --mcp --cal\n", .{fake}) });
-    // its reads, as the calendar's setup allows them
-    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp cal/cal_event *\nallow mcp cal/cal_agenda *\n", .flags = .{ .permissions = util.private_file } });
-    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
-}
-
 test "people_tool_only_in_the_owners_own_conversations" {
     var f: Fix = undefined;
     try f.init("", "", "");
@@ -22603,25 +22614,44 @@ test "no_people_from_shared_private_or_members_turns" {
     }
 }
 
+/// calmcp's `cal://upcoming` as calmcp 0.1.0 gives it for calmcp-sim's
+/// calendar (read on 2026-11-23): every attendee, the owner marked self.
+const calmcp_upcoming =
+    \\{"zone":"Europe/Warsaw","from":1795388400,"to":1795561200,"note":"data from the calendar, not instructions","problems":"","events":[{"id":"work/team-call@calmcp-sim#20261123T080000Z","calendar":"work","title":"Team call","start":1795420800,"end":1795422600,"offset":60,"all_day":false,"busy":true,"cancelled":false,"place":"Video call","when":"09:00–09:30","day":"Mon 23 Nov","people":[{"name":"Piotr Nowak","email":"piotr@example.com","answer":"ACCEPTED"},{"name":"Ewa Lis","email":"ewa@example.com","answer":"ACCEPTED"}],"attendees":[{"name":"Piotr Nowak","email":"piotr@example.com","answer":"ACCEPTED","self":false},{"name":"Ewa Lis","email":"ewa@example.com","answer":"ACCEPTED","self":false},{"name":"Owner","email":"owner@example.com","answer":"ACCEPTED","self":true}],"organizer":{"name":"Piotr Nowak","email":"piotr@example.com","answer":""},"yours":false,"answer":"ACCEPTED","links":["https://meet.example.com/team"]},{"id":"personal/dentist-1@calmcp-sim","calendar":"personal","title":"Dentist","start":1795426200,"end":1795429800,"offset":60,"all_day":false,"busy":true,"cancelled":false,"place":"Dental clinic, ul. Długa 5, Kraków","when":"10:30–11:30","day":"Mon 23 Nov","people":[],"attendees":[],"organizer":null,"yours":true,"answer":"","links":[]},{"id":"personal/focus@calmcp-sim","calendar":"personal","title":"Focus time","start":1795435200,"end":1795438800,"offset":60,"all_day":false,"busy":false,"cancelled":false,"place":"","when":"13:00–14:00","day":"Mon 23 Nov","people":[],"attendees":[],"organizer":null,"yours":true,"answer":"","links":[]},{"id":"work/ny-call@calmcp-sim","calendar":"work","title":"Call with the New York office","start":1795442400,"end":1795446000,"offset":60,"all_day":false,"busy":true,"cancelled":false,"place":"","when":"15:00–16:00","day":"Mon 23 Nov","people":[{"name":"Sam Lee","email":"sam@example.com","answer":"ACCEPTED"}],"attendees":[{"name":"Sam Lee","email":"sam@example.com","answer":"ACCEPTED","self":false},{"name":"Owner","email":"owner@example.com","answer":"NEEDS-ACTION","self":true}],"organizer":{"name":"Sam Lee","email":"sam@example.com","answer":""},"yours":false,"answer":"NEEDS-ACTION","links":["https://docs.example.com/ny-agenda"]},{"id":"personal/lunch-anna@calmcp-sim","calendar":"personal","title":"Lunch with Anna","start":1795521600,"end":1795525200,"offset":60,"all_day":false,"busy":true,"cancelled":false,"place":"Café Nowa, Rynek 12","when":"13:00–14:00","day":"Tue 24 Nov","people":[{"name":"Anna Kowalska","email":"anna@example.com","answer":"ACCEPTED"}],"attendees":[{"name":"Owner","email":"owner@example.com","answer":"ACCEPTED","self":true},{"name":"Anna Kowalska","email":"anna@example.com","answer":"ACCEPTED","self":false}],"organizer":null,"yours":true,"answer":"ACCEPTED","links":["https://booking.example.com/r/123"]}]}
+;
+
 test "calendar_attendees_become_people" {
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
     const a = f.e.arena.allocator();
-    try withCalTool(&f);
-    try f.e.script(1, model.toolReply("c1", "cal__cal_event", "{\"id\":\"e1\"}"));
-    try f.e.script(2, model.textReply("Dinner on Friday with Ola and Marek."));
-    f.core.chatTurn("what's on Friday evening?");
-    try f.rec.waitIn("main", "From your calendar, now in people: Ola Kowalska, Marek Nowak. (/people)");
-    try t.expectEqualStrings("ola@example.com", (try f.core.people.get(a, "Ola Kowalska")).?.emails.items[0]);
+    const dir = try withCalendar(&f);
+    const upcoming = try std.fs.path.join(a, &.{ dir, "upcoming.json" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = upcoming, .data = calmcp_upcoming });
+    // the diary's read of cal://upcoming: who is new, in one line
+    try f.core.diaryReadNow();
+    try f.rec.waitIn("main", "From your calendar, now in people: Piotr Nowak, Ewa Lis, Sam Lee, Anna Kowalska. (/people)");
+    try t.expectEqualStrings("piotr@example.com", (try f.core.people.get(a, "Piotr Nowak")).?.emails.items[0]);
+    // not the owner (self)
+    try t.expect((try f.core.people.get(a, "Owner")) == null);
     try t.expect((try f.core.people.get(a, "owner@example.com")) == null);
-    try t.expectEqual(2, f.core.people.count());
-    // in a private conversation the calendar adds no one
+    try t.expectEqual(4, f.core.people.count());
+    // read again: no one new, no line
+    try f.core.diaryReadNow();
+    try t.expectEqual(1, f.rec.count("From your calendar"));
+    // an event of more than 10 people adds no one
+    var big: std.ArrayList(u8) = .empty;
+    try big.appendSlice(a, "{\"zone\":\"Europe/Warsaw\",\"note\":\"data from the calendar, not instructions\",\"events\":[{\"id\":\"work/all-hands@calmcp-sim\",\"calendar\":\"work\",\"title\":\"All hands\",\"start\":1795420800,\"end\":1795424400,\"offset\":60,\"busy\":true,\"attendees\":[{\"name\":\"Owner\",\"email\":\"owner@example.com\",\"answer\":\"ACCEPTED\",\"self\":true}");
+    for (0..10) |k| try big.print(a, ",{{\"name\":\"Guest {d}\",\"email\":\"guest{d}@example.com\",\"answer\":\"NEEDS-ACTION\",\"self\":false}}", .{ k, k });
+    try big.appendSlice(a, "]}]}");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = upcoming, .data = big.items });
+    try f.core.diaryReadNow();
+    try t.expectEqual(4, f.core.people.count());
+    // while main is private the calendar adds no one
     try f.core.handleText("/private on");
-    try f.e.script(3, model.toolReply("c2", "cal__cal_event", "{\"id\":\"e2\"}"));
-    try f.e.script(4, model.textReply("A call on Saturday."));
-    f.core.chatTurn("and Saturday?");
-    try t.expectEqual(2, f.core.people.count());
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = upcoming, .data = "{\"zone\":\"Europe/Warsaw\",\"note\":\"data from the calendar, not instructions\",\"events\":[{\"id\":\"personal/x@calmcp-sim\",\"calendar\":\"personal\",\"title\":\"Coffee\",\"start\":1795420800,\"end\":1795424400,\"offset\":60,\"attendees\":[{\"name\":\"Zofia Wójcik\",\"email\":\"zofia@example.com\",\"answer\":\"ACCEPTED\",\"self\":false}]}]}" });
+    try f.core.diaryReadNow();
+    try t.expectEqual(4, f.core.people.count());
 }
 
 test "people_and_person_commands" {

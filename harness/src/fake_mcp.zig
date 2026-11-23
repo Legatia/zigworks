@@ -18,9 +18,6 @@
 //! servers: a read each (mentions, issues, notifications, as JSON lists),
 //! and Slack's and GitHub's posts, written as lines to `posted.jsonl` in
 //! its folder.
-//! `--mcp --cal` plays calmcp's reads for the people tests: `cal_event`
-//! (`e1`: a dinner with Ola Kowalska, Marek Nowak and the owner; `e2`: a
-//! call with Zofia Wójcik) and `cal_agenda` (both).
 //! `--mcp --mail` plays mailmcp: `mail_list` and the resources
 //! `mail://butler/new` and `mail://mine/new` read the files
 //! `list-NAME.json` and `NAME-new.json` of its folder ("[]" without them),
@@ -341,11 +338,11 @@ pub fn programStandIn(io: Io, a: std.mem.Allocator, env: *const std.process.Envi
 }
 
 /// Who it plays: the plain test server, or a stand-in.
-const Role = union(enum) { plain, home: *Home, car: *Car, slack, jira, github, cal, mail };
+const Role = union(enum) { plain, home: *Home, car: *Car, slack, jira, github, mail };
 
 /// The work morning's servers (`--mcp --slack|--jira|--github`) on stdio.
 pub fn runWork(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, which: []const u8) u8 {
-    const role: Role = if (std.mem.eql(u8, which, "--slack")) .slack else if (std.mem.eql(u8, which, "--jira")) .jira else if (std.mem.eql(u8, which, "--github")) .github else if (std.mem.eql(u8, which, "--cal")) .cal else if (std.mem.eql(u8, which, "--mail")) .mail else return 2;
+    const role: Role = if (std.mem.eql(u8, which, "--slack")) .slack else if (std.mem.eql(u8, which, "--jira")) .jira else if (std.mem.eql(u8, which, "--github")) .github else if (std.mem.eql(u8, which, "--mail")) .mail else return 2;
     return serveAs(io, gpa, env, role);
 }
 
@@ -412,16 +409,6 @@ const github_tools_json =
     \\{"tools":[{"name":"list_notifications","description":"Your notifications.","inputSchema":{"type":"object","properties":{"participating":{"type":"boolean"}}}},{"name":"add_issue_comment","description":"Comment on an issue or pull request.","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"issue_number":{"type":"integer"},"body":{"type":"string"}},"required":["owner","repo","issue_number","body"]}}]}
 ;
 
-const cal_tools_json =
-    \\{"tools":[{"name":"cal_event","description":"One event, with its attendees and place.","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},{"name":"cal_agenda","description":"Events between two times.","inputSchema":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"}}}}]}
-;
-const cal_e1 =
-    \\{"id":"e1","title":"Dinner","start":"2026-11-27T19:00:00+01:00","end":"2026-11-27T21:00:00+01:00","place":"Bistro","attendees":[{"name":"Ola Kowalska","email":"ola@example.com"},{"name":"Marek Nowak","email":"marek@example.com"},{"name":"Me","email":"owner@example.com","self":true}]}
-;
-const cal_e2 =
-    \\{"id":"e2","title":"Call","start":"2026-11-28T10:00:00+01:00","end":"2026-11-28T10:30:00+01:00","attendees":[{"name":"Zofia Wójcik","email":"zofia@example.com"},{"name":"Me","email":"owner@example.com","self":true}]}
-;
-
 /// A work server's call: its read's list, or a post written to posted.jsonl.
 fn workCall(io: Io, a: std.mem.Allocator, role: Role, v: std.json.Value) ![]const u8 {
     const params = v.object.get("params") orelse return textResult(a, "no params", true);
@@ -438,11 +425,6 @@ fn workCall(io: Io, a: std.mem.Allocator, role: Role, v: std.json.Value) ![]cons
                 const ch = if (args == .object) args.object.get("channel") else null;
                 return textResult(a, try std.fmt.allocPrint(a, "ok: posted to {s}", .{if (ch) |c| (if (c == .string) c.string else "?") else "?"}), false);
             }
-        },
-        .cal => {
-            const id = if (args == .object) (if (args.object.get("id")) |x| (if (x == .string) x.string else "") else "") else "";
-            if (eql(u8, name, "cal_event")) return textResult(a, if (eql(u8, id, "e2")) cal_e2 else cal_e1, false);
-            if (eql(u8, name, "cal_agenda")) return textResult(a, "{\"events\":[" ++ cal_e1 ++ "," ++ cal_e2 ++ "]}", false);
         },
         .jira => if (eql(u8, name, "search_issues")) return textResult(a, "[{\"key\":\"APP-142\",\"summary\":\"Checkout fails on Safari\",\"status\":\"In Progress\",\"priority\":\"High\"},{\"key\":\"APP-139\",\"summary\":\"Update the privacy page\",\"status\":\"To Do\",\"priority\":\"Low\"}]", false),
         .github => {
@@ -527,7 +509,6 @@ fn serveAs(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, 
                 .slack => slack_tools_json,
                 .jira => jira_tools_json,
                 .github => github_tools_json,
-                .cal => cal_tools_json,
                 .mail => mail_tools_json,
             };
         } else if (std.mem.eql(u8, method, "tools/call")) {
@@ -535,7 +516,7 @@ fn serveAs(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, 
                 .plain => call(io, a, v, env, pinged) catch return 1,
                 .home => |h| homeCall(io, a, h, v) catch return 1,
                 .car => |c| carCall(a, c, v) catch return 1,
-                .slack, .jira, .github, .cal => workCall(io, a, role, v) catch return 1,
+                .slack, .jira, .github => workCall(io, a, role, v) catch return 1,
                 .mail => mailCall(io, a, v) catch return 1,
             };
         } else if (std.mem.eql(u8, method, "resources/read")) {

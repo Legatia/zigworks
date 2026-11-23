@@ -2016,11 +2016,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
             if (got.notice) |text| if (r.notice) |n| n.say(n.ctx, text);
             break :blk .{ .text = got.text, .is_error = got.is_error };
         },
-        .mcp, .money => blk: {
-            const o = try callMcp(r, a, mt.?, arg, input_json, reserved);
-            if (tool == .mcp and !o.is_error) calendarPeople(r, a, mt.?.tool, o.text);
-            break :blk o;
-        },
+        .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
         .skill => blk: {
             const v = jv.parse(a, input_json).?;
             const text = if (jv.str(jv.get(v, "file"))) |file|
@@ -2064,21 +2060,6 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
     else
         try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
     return out;
-}
-
-/// A calendar's read in a run with the people (the owner's own, in a
-/// conversation only they read): its attendees noted, someone new said to
-/// the owner; nothing while the conversation is private.
-fn calendarPeople(r: *Run, a: std.mem.Allocator, tool: []const u8, text: []const u8) void {
-    const book = r.people orelse return;
-    if (!people_mod.calendarTool(tool) or !r.allows(.people) or r.isPrivate()) return;
-    const found = people_mod.attendeesOf(a, text) catch return;
-    if (found.len == 0) return;
-    const added = book.fromCalendar(a, found, @divFloor(r.now() + @as(i64, r.utc_offset) * 60, 86400)) catch return;
-    if (added.len == 0) return;
-    r.log.write(.memory, false, .{ .event = "people from the calendar", .added = added.len }) catch {};
-    const n = r.notice orelse return;
-    n.say(n.ctx, std.fmt.allocPrint(a, "From your calendar, now in people: {s}. (/people)", .{std.mem.join(a, ", ", added) catch return}) catch return);
 }
 
 /// Where one shell command runs.

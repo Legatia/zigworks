@@ -1625,12 +1625,13 @@ pub fn writerFact(line_in: []const u8) ?Fact {
     return .{ .name = name, .field = field, .value = value };
 }
 
-/// An event's attendee, as a calendar tool gives them.
+/// An event's attendee, as a calendar gives them.
 pub const Attendee = struct { name: []const u8 = "", email: []const u8 = "" };
 
-/// The attendees in a calendar tool's answer (JSON, alone or after some
-/// words), from every `attendees` list in it; the owner's own (`"self":
-/// true`) left out, and lists of more than 10 (a large meeting adds no one).
+/// The attendees in a calendar's JSON (calmcp's `cal://upcoming`, which
+/// the diary reads; alone or after some words), from every `attendees`
+/// list in it; the owner's own (`"self": true`) left out, and lists of
+/// more than 10 (a large meeting adds no one).
 pub fn attendeesOf(a: std.mem.Allocator, text: []const u8) ![]const Attendee {
     var out: std.ArrayList(Attendee) = .empty;
     const v = jv.parse(a, text) orelse blk: {
@@ -1689,12 +1690,6 @@ fn attendeeOf(x: jv.Value) ?Attendee {
     if (at.email.len > 0 and !validEmail(at.email)) at.email = "";
     if (at.name.len == 0 and at.email.len == 0) return null;
     return at;
-}
-
-/// Whether an MCP tool's answers may hold calendar attendees: calmcp's
-/// reads (`cal_event`, `cal_agenda`), on any server name.
-pub fn calendarTool(tool: []const u8) bool {
-    return std.mem.eql(u8, tool, "cal_event") or std.mem.eql(u8, tool, "cal_agenda");
 }
 
 /// What the gift idea's model call is told (no name, no relation, no date).
@@ -2164,8 +2159,6 @@ test "writer_lines_and_calendar_attendees_read" {
     // an agenda: each event's attendees; not JSON: none
     try t.expectEqual(2, (try attendeesOf(a, "{\"events\":[{\"attendees\":[{\"name\":\"A B\"}]},{\"attendees\":[{\"name\":\"C D\"}]}]}")).len);
     try t.expectEqual(0, (try attendeesOf(a, "Dinner with Ola at 19:00")).len);
-    try t.expect(calendarTool("cal_event") and calendarTool("cal_agenda"));
-    try t.expect(!calendarTool("cal_create") and !calendarTool("home_state"));
 }
 
 test "people_from_the_writer_and_the_calendar" {
