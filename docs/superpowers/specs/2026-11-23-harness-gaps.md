@@ -2,14 +2,16 @@
 
 Everything specced through 2026-11-23 is built and green in CI on Linux,
 macOS and Windows (dcc2742): the platform gaps, the "close ones", the
-butler's Parts 1–9. This file lists what is not, in one place, with what
-each waits on. Update it when something lands.
+butler's Parts 1–9. The butler's duties (emergencies, the diary, people)
+and email are built and merged on harness-logins (2026-11-23), not yet
+pushed. This file lists what is not, in one place, with what each waits
+on. Update it when something lands.
 
 ## Waiting on the owner's answers
 
 | Gap | Question | Built meanwhile |
 |---|---|---|
-| Email | **answered 2026-11-23: A (its own address) and C (your mailbox read-only + drafts, opt-in); specced, being built** | — |
+| Email | answered 2026-11-23: A (its own address) and C (your mailbox read-only + drafts, opt-in) | **built**: mailmcp, conversation `email`, `/setup mail`, `/setup mail mine` |
 | Money from automation | Q2: may runs started by triggers, workflows, apps move money | built off: `[money] triggers/workflows/apps = off`; tool steps asked every time |
 | Default environment for unattended runs | Q3: host or sandbox | host |
 | Apps opened from the phone | Q4: a TLS front (tailscale serve) or loopback only | loopback only |
@@ -20,10 +22,10 @@ each waits on. Update it when something lands.
 
 | Duty | Status | Gap |
 |---|---|---|
-| Acting when the owner can't be reached | **specced 2026-11-23** | escalation to a household member; safe-direction fallback (close, lock, arm) after no answer, opt-in per routine; smoke and CO alerts (read only) |
-| Diary | **specced 2026-11-23** | calendar (agenda, conflicts, changes asked), leave-by alerts, preparing for a meeting, no interruptions in meetings |
-| People and occasions | **specced 2026-11-23** | who's who, birthdays, preferences, keeping in touch, gift ideas |
-| Post and messages | email specced and being built (A and C) | messages to others on the owner's behalf through other channels (asked every time) |
+| Acting when the owner can't be reached | **built 2026-11-23** | — (escalation, the opt-in safe-direction fallback, smoke and CO watched) |
+| Diary | **built 2026-11-23** | — (calmcp; agenda, leave-by, meeting preparation with what harness knows of the people, busy means quiet, changes asked) |
+| People and occasions | **built 2026-11-23** | — (state/people, the people tool, occasions, keeping in touch, vCard import, calendar attendees) |
+| Post and messages | email built (A and C) | messages to others on the owner's behalf through other channels (asked every time) |
 | The door | not specced | doorbell: who is there, announced, one tap to answer; deliveries |
 | Away and travel | not specced | away mode (lived-in lights, stricter watch, daily summary); itinerary, flight status, check-in, packing list |
 | Errands | not specced | shopping list and pantry, reorders within caps, delivery tracking; pay-per-call services (pay.sh, x402) |
@@ -58,12 +60,37 @@ steps; `say` with files; Smartcar Connect in chat; routine times following
 a later `/quiet`; listing the Keychain for `harness report`; a custom
 Home Assistant integration; MCP sessions resumed after a dropped stream.
 
+Emergencies: `/setup` offering escalation (`[butler] escalate` is written
+by hand); a member reached in a group; members told what the fallback
+did; a typed message without a reply as an acknowledgement; [I'm on it]
+beside Undo; the fallback for a valve on a plain switch; `/alerts`.
+
+Mail: `email` in `/conversations` and its own `/private`; files in the
+email answer; OAuth sign-in and token refresh for Gmail and Outlook (a
+token from the environment); a doctor line and report entry for mail.ini;
+a harness smoke check against the real mailmcp; away mode beyond the
+Leaving routine; a flight's times go to the calendar as the owner's (an
+arrival in another zone is off by the difference); real servers' quirks
+(Gmail labels as folders, no SPECIAL-USE or IDLE) untested.
+
+Calendar: Microsoft 365 (no CalDAV); a Google refresh token through
+setup (by hand); new recurring events, moving a whole series, adding
+attendees; past years' zone rules; the gate's question as a sentence; a
+real maps server (a stand-in's travel time only).
+
+People: the day's pass at the owner's own time (09:00 fixed); removing a
+fact by the tool; importing while `harness run` runs; reminders for other
+dates (name days kept, not reminded); a birthday missed while harness was
+down; an [In touch] button; vCard 2.1's quoted-printable and `NOTE`,
+`ADR`, `ORG`; people in the morning summary.
+
 ## Not tested in the world
 
 Nothing has run against a real model provider (omnigate included),
 Telegram bot, Home Assistant, Zigbee2MQTT, Smartcar, transcription
-service, speaker, MCP server, authorization server or website: stand-ins
-only. `harness/TESTERS.md` is for the people who will.
+service, speaker, MCP server, authorization server, mail server (IMAP,
+SMTP), CalDAV server or website: stand-ins only. `harness/TESTERS.md` is
+for the people who will.
 
 ## Infrastructure
 

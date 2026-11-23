@@ -32,7 +32,7 @@ Zig 0.17.1:
 cd trigrep && zig build -Doptimize=ReleaseFast && zig build test
 ```
 
-Binaries go to `zig-out/bin/` in each project. CI runs `zig build test` for every project on Linux and macOS (headdesk on Linux x86_64 and arm64 only, canmcp on Linux x86_64 only), and for all but headsight, headdesk and canmcp on Windows too (on Linux, headsight's camera path is tested against virtual cameras with `headsight/scripts/live-linux.sh`, not in CI).
+Binaries go to `zig-out/bin/` in each project. CI runs `zig build test` for every project on Linux and macOS (headdesk on Linux x86_64 and arm64 only, canmcp on Linux x86_64 only; homemcp, carcloud, mailmcp and calmcp on Linux and Windows, checked on a Mac by hand), and for all but headsight, headdesk and canmcp on Windows too (on Linux, headsight's camera path is tested against virtual cameras with `headsight/scripts/live-linux.sh`, not in CI).
 
 ## License
 

@@ -47,7 +47,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 1050 unit tests (20 of them
+**State: 0.3.0, tested on macOS by its own tests: 1052 unit tests (20 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 103 checks that drives the real binary against
@@ -63,7 +63,8 @@ homemcp-sim and carcloud-sim (stand-ins for Home Assistant and Smartcar),
 and Home Assistant asking the voice agent (a test client sending what its
 llama.cpp integration sends); with calmcp built (CALMCP_BIN), 5 more:
 `/setup calendar` and a change asked and made, against calmcp-sim (a
-stand-in CalDAV server). The diary has not met a real calendar yet.
+stand-in CalDAV server). The diary has not met a real calendar yet, nor
+mail a real mail server (mailmcp's own tests run it against its stand-in).
 An earlier build of 0.3.0 also passed its tests in CI on Linux and
 Windows. Emergencies (escalation to the household, the leak's fallback,
 the smoke routine) are tested against stand-ins only: no real household,
