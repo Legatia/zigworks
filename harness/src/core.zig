@@ -17051,7 +17051,7 @@ test "apps_are_listed_approved_and_removed_from_the_chat" {
     const before = try f.core.command(a, "/apps");
     try t.expect(std.mem.indexOf(u8, before, "inbox: built in") != null);
     try t.expect(std.mem.indexOf(u8, before, "notes: not approved yet: /app approve notes") != null);
-    try t.expect(std.mem.indexOf(u8, before, "The app server is off") != null);
+    try t.expect(std.mem.indexOf(u8, before, "The app server runs with harness run and harness chat.") != null);
     try t.expectEqualStrings("Approved notes as v1: it is served as its files are now.", try f.core.command(a, "/app approve notes"));
     try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/apps"), "notes: v1") != null);
     // changed by hand or by a command: said, and served again only once approved

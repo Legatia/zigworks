@@ -738,8 +738,11 @@ pub const rules_example =
     \\# trigger add (a trigger the agent proposes) and workflow save (a
     \\# workflow it proposes) are asked every time, whatever the rules; a deny
     \\# rule stops them; trigger rm, workflow start and workflow stop ask.
-    \\# Not used yet (their tools come later): mail asks; app_save and
-    \\# env_save are asked every time.
+    \\# app_save (an app the agent built) and env_save (an environment it
+    \\# proposes) are asked every time, whatever the rules; a deny rule stops
+    \\# them. app_read NAME memory|inbox|log is an app reading that (allowed;
+    \\# deny app_read * log stops every app reading the log); app_draft is
+    \\# allowed. Not used yet (its tool comes later): mail asks.
     \\# A line [agent:NAME], [owner], [schedule:NAME], [trigger:NAME] or
     \\# [workflow:NAME] starts rules for those calls only (a workflow's tool
     \\# steps are [workflow:NAME]'s, not a definition's); [all] goes back to
