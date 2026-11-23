@@ -13,7 +13,7 @@ pub const Error = error{ BadConfig, OutOfMemory };
 
 /// What `parse` refuses besides a bad line: the `[provider NAME]`
 /// sections' problems, which `reason` says.
-pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider, BadVoice };
+pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider, BadVoice, BadVoiceAgent };
 
 pub const Config = struct {
     model: Model = .{},
@@ -30,6 +30,7 @@ pub const Config = struct {
     workflows: Workflows = .{},
     voice: Voice = .{},
     butler: Butler = .{},
+    voice_agent: VoiceAgent = .{},
     /// The `[provider NAME]` sections, in the order their names first
     /// appear (not a section of its own: `parse` reads them apart).
     providers: []const model.Section = &.{},
@@ -160,6 +161,19 @@ pub const Config = struct {
         /// finds it.
         language: []const u8 = "",
     };
+    /// Home Assistant's conversation agent: speech in the house, answered
+    /// by harness (README: Home Assistant's voice).
+    pub const VoiceAgent = struct {
+        /// An IP address of this machine and a port (`parseListen`); `off`:
+        /// no listener. It runs with `harness run` while the token is stored.
+        listen: []const u8 = "127.0.0.1:8765",
+        /// The stored secret Home Assistant's API key must be.
+        token: []const u8 = "ha-agent",
+        /// A spoken answer's time, 5 to 60 s.
+        seconds: u32 = 20,
+        /// Its model (PROVIDER:MODEL as anywhere); "": the chat's.
+        model: []const u8 = "",
+    };
     /// The butler's manners.
     pub const Butler = struct {
         /// Quiet hours, the owner's time: posts of runs nobody waits on
@@ -259,6 +273,9 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
             if (std.mem.eql(u8, p.name, cfg.model.provider)) break;
         } else return error.UnknownProvider;
     }
+    const va = cfg.voice_agent;
+    if (!std.mem.eql(u8, va.listen, "off") and parseListen(va.listen) == null) return error.BadVoiceAgent;
+    if (va.seconds < 5 or va.seconds > 60 or !secretName(va.token)) return error.BadVoiceAgent;
     if (cfg.voice.provider.len > 0) {
         if (voiceApi(cfg, cfg.voice.provider) != .openai) return error.BadVoice;
         if (cfg.voice.model.len == 0) return error.BadVoice;
@@ -269,6 +286,32 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
         }
     }
     return cfg;
+}
+
+/// `[voice_agent] listen`: an IP address of this machine and its port
+/// (`192.168.1.20:8765`, `[::1]:8765` for IPv6); null for a name, a
+/// missing port, or every address at once (`0.0.0.0`, `::`): the voice
+/// agent listens on the house's network, never on every network the
+/// machine is on.
+pub fn parseListen(text: []const u8) ?std.Io.net.IpAddress {
+    // the port is always written
+    const port_at = if (text.len > 0 and text[0] == '[') std.mem.indexOf(u8, text, "]:") else std.mem.indexOfScalar(u8, text, ':');
+    if (port_at == null) return null;
+    const ip = std.Io.net.IpAddress.parseLiteral(text) catch return null;
+    switch (ip) {
+        .ip4 => |x| if (std.mem.allEqual(u8, &x.bytes, 0)) return null,
+        .ip6 => |x| if (std.mem.allEqual(u8, &x.bytes, 0)) return null,
+    }
+    return ip;
+}
+
+/// A stored secret's name: a-z, 0-9, `-` and `_`, starting with a letter
+/// or digit, at most 64 (as `harness secret add` takes it).
+fn secretName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    if (!(std.ascii.isLower(name[0]) or std.ascii.isDigit(name[0]))) return false;
+    for (name) |ch| if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-' or ch == '_')) return false;
+    return true;
 }
 
 /// The format provider `name` speaks: its section's api, else its
@@ -292,6 +335,7 @@ pub fn reason(e: anyerror) ?[]const u8 {
         error.ProviderNeedsApiAndUrl => "a provider that is not a preset needs api = (anthropic or openai) and url =",
         error.UnknownProvider => "no provider has that name: use a preset (omnigate, anthropic, openrouter, opencode, openai) or a [provider NAME] section with api and url",
         error.BadVoice => "[voice] provider = openai or a [provider NAME] section with api = openai (Groq, a whisper.cpp server), model = its transcription model (whisper-large-v3-turbo at Groq, gpt-4o-mini-transcribe at OpenAI), language = a two-letter code (pl) or nothing",
+        error.BadVoiceAgent => "[voice_agent] listen = an IP address of this machine and a port, like 127.0.0.1:8765 or 192.168.1.20:8765 (not a name, not 0.0.0.0 or ::), or off; seconds = 5 to 60; token = a stored secret's name (a-z, 0-9, - and _)",
         else => null,
     };
 }
@@ -652,6 +696,11 @@ pub const defaults_ini =
     \\[butler]
     \\; quiet = 22:00-07:00                ; quiet hours, your time: posts of schedules, triggers and workflows wait for a digest
     \\
+    \\[voice_agent]                       ; Home Assistant's voice assistant answered by harness (README: Home Assistant's voice)
+    \\; listen = 192.168.1.20:8765         ; for Home Assistant on another machine: this one's LAN address (default: this machine only)
+    \\; token = ha-agent                   ; the secret Home Assistant's API key must be: harness secret add ha-agent
+    \\; seconds = 20                       ; a spoken answer's time
+    \\
 ;
 
 pub const rules_example =
@@ -677,6 +726,9 @@ pub const rules_example =
     \\# commands in environment NAME (host is the only one for now).
     \\# [member] and [member:NAME] are for household members (README:
     \\# Household); for a member, lines outside them only deny or ask.
+    \\# [room] and [room:NAME] are for speech in the house through Home
+    \\# Assistant's voice assistant (README: Home Assistant's voice), the
+    \\# same way: [room:living_room] for one room.
     \\# After the agent writes a file in the workspace, a shell command that
     \\# a rule or a 24 h grant allows is asked first, naming the files, until
     \\# you allow one; a scheduled run skips it.
@@ -1235,4 +1287,37 @@ test "butler_quiet_reads_hours_or_off" {
     for ([_][]const u8{ "22:00", "22:00-22:00", "25:00-07:00", "22-07", "22:00-07:00-08:00", "" }) |v| {
         try t.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "[butler]\nquiet = {s}\n", .{v})));
     }
+}
+
+test "voice_agent_settings_read_and_checked" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // on this machine alone until the owner names a LAN address
+    const d = try parse(a, "");
+    try t.expectEqualStrings("127.0.0.1:8765", d.voice_agent.listen);
+    try t.expectEqualStrings("ha-agent", d.voice_agent.token);
+    try t.expectEqual(20, d.voice_agent.seconds);
+    try t.expectEqualStrings("", d.voice_agent.model);
+    try t.expectEqualDeep(d.voice_agent, (try parse(a, defaults_ini)).voice_agent);
+    const lan = try parse(a, "[voice_agent]\nlisten = 192.168.1.20:8765\nseconds = 30\nmodel = anthropic:claude-haiku-4-5\n");
+    try t.expectEqualStrings("192.168.1.20:8765", lan.voice_agent.listen);
+    try t.expectEqual(30, lan.voice_agent.seconds);
+    try t.expectEqual(8765, parseListen(lan.voice_agent.listen).?.ip4.port);
+    try t.expectEqual(8765, parseListen("[::1]:8765").?.ip6.port);
+    try t.expectEqualStrings("off", (try parse(a, "[voice_agent]\nlisten = off\n")).voice_agent.listen);
+    // a name, every address, no port, a time out of range: refused
+    for ([_][]const u8{
+        "listen = homeassistant.local:8765", "listen = 0.0.0.0:8765", "listen = [::]:8765",
+        "listen = 192.168.1.20",             "listen = ::1:8765",     "listen = 192.168.1.20:99999",
+        "seconds = 3",                       "seconds = 90",          "token = Bad Name",
+    }) |line| {
+        const text = try std.fmt.allocPrint(a, "[voice_agent]\n{s}\n", .{line});
+        if (parse(a, text)) |_| {
+            std.debug.print("read: {s}\n", .{line});
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+    const why = (try @import("core.zig").parseProblem(a, "config.ini", "[voice_agent]\nlisten = 0.0.0.0:8765\n", parse)).?;
+    try t.expect(std.mem.indexOf(u8, why, "an IP address of this machine and a port") != null);
 }
