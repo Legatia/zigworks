@@ -655,6 +655,96 @@ pub fn shopEvent(a: Allocator, title_text: []const u8, known: []const []const u8
     return if (shop) default_list else null;
 }
 
+// ---- a shop's quote and order ----
+
+/// What a shop's quote tool answers (JSON): each item's product and price,
+/// the total, what it hasn't got, the delivery.
+pub const Quote = struct {
+    total: f64 = 0,
+    currency: []const u8 = "",
+    lines: []const Line = &.{},
+    missing: []const []const u8 = &.{},
+    delivery: []const u8 = "",
+
+    pub const Line = struct { item: []const u8 = "", product: []const u8 = "", price: ?f64 = null };
+};
+
+/// The quote tool's answer: its JSON object (text around it ignored).
+pub fn parseQuote(a: Allocator, text: []const u8) !Quote {
+    const from = std.mem.indexOfScalar(u8, text, '{') orelse return error.NotAQuote;
+    const to = std.mem.lastIndexOfScalar(u8, text, '}') orelse return error.NotAQuote;
+    if (to < from) return error.NotAQuote;
+    const q = std.json.parseFromSliceLeaky(Quote, a, text[from .. to + 1], .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return error.NotAQuote;
+    if (!(q.total >= 0) or std.math.isInf(q.total)) return error.NotAQuote;
+    return q;
+}
+
+/// "64.20 PLN" ("64.20" with no currency).
+pub fn amountText(a: Allocator, x: f64, currency: []const u8) ![]const u8 {
+    if (currency.len == 0) return std.fmt.allocPrint(a, "{d:.2}", .{x});
+    return std.fmt.allocPrint(a, "{d:.2} {s}", .{ x, currency });
+}
+
+/// What an order takes from `list`: the items the quote priced (as the
+/// list has them), and those it didn't.
+pub const Plan = struct { order: []const []const u8, lines: []const Quote.Line, missing: []const []const u8 };
+
+pub fn planOrder(a: Allocator, q: Quote, list: []const []const u8) !Plan {
+    var order: std.ArrayList([]const u8) = .empty;
+    var lines: std.ArrayList(Quote.Line) = .empty;
+    var missing: std.ArrayList([]const u8) = .empty;
+    for (list) |item| {
+        const line = for (q.lines) |l| {
+            if (std.ascii.eqlIgnoreCase(l.item, item)) break l;
+        } else null;
+        if (line) |l| {
+            try order.append(a, item);
+            try lines.append(a, l);
+        } else try missing.append(a, item);
+    }
+    return .{ .order = order.items, .lines = lines.items, .missing = missing.items };
+}
+
+/// The quote tool's input: `{"items":[…]}`.
+pub fn quoteInput(a: Allocator, items: []const []const u8) ![]const u8 {
+    return std.json.Stringify.valueAlloc(a, .{ .items = items }, .{});
+}
+
+/// The order tool's input: the items and, in `field`, the total (a
+/// ceiling the shop holds to, and what the money caps check).
+pub fn orderInput(a: Allocator, items: []const []const u8, field: []const u8, total: f64) ![]const u8 {
+    var o: std.ArrayList(u8) = .empty;
+    try o.appendSlice(a, "{\"items\":");
+    try o.appendSlice(a, try std.json.Stringify.valueAlloc(a, items, .{}));
+    try o.append(a, ',');
+    try util.jsonString(&o, a, field);
+    try o.print(a, ":{d:.2}}}", .{total});
+    return o.items;
+}
+
+/// The whole order, as the owner is asked: the shop, the total and the
+/// delivery, a line per item, and what wasn't found.
+pub fn proposal(a: Allocator, shop: []const u8, q: Quote, plan: Plan) ![]const u8 {
+    var o: std.ArrayList(u8) = .empty;
+    try o.print(a, "Order from {s}: {s}", .{ try title(a, shop), try amountText(a, q.total, q.currency) });
+    if (q.delivery.len > 0) try o.print(a, ", delivery {s}", .{util.cut(q.delivery, 80)});
+    try o.append(a, '.');
+    for (plan.order, plan.lines) |item, l| {
+        try o.print(a, "\n- {s}", .{item});
+        const product = util.cut(std.mem.trim(u8, l.product, " \t\r\n"), 80);
+        if (product.len > 0 and !std.ascii.eqlIgnoreCase(product, item)) try o.print(a, ": {s}", .{product});
+        if (l.price) |p| try o.print(a, ", {d:.2}", .{p});
+    }
+    if (plan.missing.len > 0) try o.print(a, "\nNot found: {s} (stays on the list).", .{try andList(a, plan.missing)});
+    return o.items;
+}
+
+/// Whether a tool's name says it prices a basket.
+pub fn quoteName(tool: []const u8) bool {
+    for ([_][]const u8{ "quote", "price", "basket", "cart" }) |w| if (std.ascii.findIgnoreCase(tool, w) != null) return true;
+    return false;
+}
+
 // ---- tests ----
 
 const t = std.testing;
@@ -853,4 +943,28 @@ test "the_errands_file_round_trips" {
     try t.expectEqual(12, back.orders[0].item);
     try t.expectEqualStrings("milk", back.orders[0].items[0]);
     try t.expectError(error.SyntaxError, parseState(a, "{not json"));
+}
+
+test "a_quote_reads_and_is_proposed_in_full" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const q = try parseQuote(a, "Priced:\n{\"total\": 64.2, \"currency\": \"PLN\", \"lines\": [{\"item\": \"Milk\", \"product\": \"Mleko 2% 1 l\", \"price\": 4.2}, {\"item\": \"coffee beans\", \"product\": \"Lavazza Oro 1 kg\", \"price\": 52}, {\"item\": \"eggs\", \"product\": \"eggs\", \"price\": 8}], \"missing\": [\"oat milk\"], \"delivery\": \"Sat 28 Nov, 10:00–12:00\", \"extra\": 1}");
+    const plan = try planOrder(a, q, &.{ "milk", "oat milk", "coffee beans", "eggs" });
+    try t.expectEqual(3, plan.order.len);
+    try t.expectEqualStrings("oat milk", plan.missing[0]);
+    try t.expectEqualStrings(
+        \\Order from Frisco: 64.20 PLN, delivery Sat 28 Nov, 10:00–12:00.
+        \\- milk: Mleko 2% 1 l, 4.20
+        \\- coffee beans: Lavazza Oro 1 kg, 52.00
+        \\- eggs, 8.00
+        \\Not found: oat milk (stays on the list).
+    , try proposal(a, "frisco", q, plan));
+    try t.expectEqualStrings("{\"items\":[\"milk\",\"coffee beans\",\"eggs\"],\"total\":64.20}", try orderInput(a, plan.order, "total", q.total));
+    try t.expectEqualStrings("{\"items\":[\"milk\",\"eggs\"]}", try quoteInput(a, &.{ "milk", "eggs" }));
+    try t.expectEqualStrings("64.20", try amountText(a, 64.2, ""));
+    try t.expectError(error.NotAQuote, parseQuote(a, "sorry, no"));
+    try t.expectError(error.NotAQuote, parseQuote(a, "{\"total\": -1}"));
+    try t.expect(quoteName("shop_quote") and quoteName("price_basket") and quoteName("CartTotal"));
+    try t.expect(!quoteName("shop_order"));
 }

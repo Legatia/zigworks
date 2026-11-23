@@ -947,7 +947,7 @@ pub const Core = struct {
         if (c.worker) |w| w.join();
         // no speech from now on; its requests going end (their runs stopped)
         c.stopVoiceAgent();
-        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire) or c.mail_job.running.load(.acquire) or c.diary.reading.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire) or c.mail_job.running.load(.acquire) or c.diary.reading.load(.acquire) or c.errands.running.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
@@ -3664,6 +3664,8 @@ pub const Core = struct {
         if (std.mem.startsWith(u8, waiter, "member ")) c.memberAnswered(id);
         // speech's call: made on the owner's yes (nothing is said in the room)
         if (std.mem.startsWith(u8, waiter, "room ")) c.roomAnswered(id);
+        // an order or an upkeep line: made on the owner's tap
+        if (std.mem.startsWith(u8, waiter, "errand ")) Errands.answered(c, id);
         return true;
     }
 
@@ -9811,6 +9813,7 @@ pub const Core = struct {
         }
         if (eql(u8, what, "mail")) return c.setupMail(a, conv, words.rest());
         if (eql(u8, what, "calendar")) return c.setupCalendar(a, conv, std.mem.trim(u8, words.rest(), " \t"));
+        if (eql(u8, what, "reorder")) return Errands.setupReorder(c, a, words.rest());
         return "Use /setup home, /setup car, /setup calendar, /setup mail or /setup routines; /setup alone says where setup is.";
     }
 
@@ -23355,21 +23358,31 @@ test "a_flight_in_the_mail_goes_to_the_calendar_through_calmcps_cal_create_asked
 /// does with them. One field of Core (`errands`); the functions take the
 /// core. Members reach the lists only (Ruling 3 of the plan).
 const Errands = struct {
+    gpa: std.mem.Allocator,
     lists: lists_mod.Store,
     /// `state/errands`: shops, weekly posts, what was said, open orders.
     path: []const u8,
-    /// Held while `state/errands` is read and written.
-    mutex: Io.Mutex = .init,
+    /// Held while `state/errands` is read and written, and `pending`.
+    mutex: Io.Mutex,
+    /// Shops to propose from (names, owned), for the errands' job.
+    pending: std.ArrayList([]u8),
+    /// The errands' job is going (the tick starts it; close waits).
+    running: std.atomic.Value(bool),
 
     fn init(gpa: std.mem.Allocator, io: Io, state: []const u8, a: std.mem.Allocator) !Errands {
         return .{
+            .gpa = gpa,
             .lists = .init(gpa, io, try std.fs.path.join(a, &.{ state, "lists" })),
             .path = try std.fs.path.join(a, &.{ state, "errands" }),
+            .mutex = .init,
+            .pending = .empty,
+            .running = .init(false),
         };
     }
 
     fn deinit(e: *Errands) void {
-        _ = e;
+        for (e.pending.items) |x| e.gpa.free(x);
+        e.pending.deinit(e.gpa);
     }
 
     // ---- state/errands ----
@@ -23481,6 +23494,8 @@ const Errands = struct {
     fn addTo(c: *Core, a: std.mem.Allocator, conv: []const u8, member: []const u8, name: []const u8, items: []const []const u8) []const u8 {
         const got = c.errands.lists.add(a, name, items) catch |err| return errText(a, err);
         c.log.write(.chat, c.convPrivate(conv), .{ .event = "list", .op = "add", .list = name, .count = got.added.len, .member = if (member.len > 0) member else null }) catch {};
+        // a shop's size reached: its order proposed to the owner
+        noteCount(c, a, name, got.before, got.count);
         return lists_mod.addedText(a, name, got) catch "Added.";
     }
 
@@ -23502,6 +23517,7 @@ const Errands = struct {
         } else if (!lists_mod.validName(name)) return errText(a, error.BadName);
         const got = c.errands.lists.remove(a, name, items) catch |err| return errText(a, err);
         if (!said and got.removed.len == 0) return null;
+        noteCount(c, a, name, got.count + got.removed.len, got.count);
         c.log.write(.chat, c.convPrivate(conv), .{ .event = "list", .op = "remove", .list = name, .count = got.removed.len, .member = if (member.len > 0) member else null }) catch {};
         return lists_mod.removedText(a, name, got) catch "Taken off.";
     }
@@ -23526,6 +23542,7 @@ const Errands = struct {
         const eql = std.mem.eql;
         if (eql(u8, op, "clear")) {
             const n = c.errands.lists.clear(a, list) catch |err| return errText(a, err);
+            noteCount(c, a, list, n, 0);
             c.log.write(.chat, c.convPrivate(conv), .{ .event = "list", .op = "clear", .list = list, .count = n }) catch {};
             if (n == 0) return std.fmt.allocPrint(a, "{s} is empty already.", .{try lists_mod.title(a, list)});
             return std.fmt.allocPrint(a, "Cleared {s} ({d} item{s}).", .{ list, n, if (n == 1) "" else "s" });
@@ -23635,6 +23652,447 @@ const Errands = struct {
             if (once(c, a, key) or list.len == 0) continue;
             c.log.write(.chat, false, .{ .event = "list", .op = "post", .list = p.list, .count = list.len, .why = "weekly" }) catch {};
             post(c, a, "schedule:lists", "lists", lists_mod.showText(a, p.list, list) catch continue);
+        }
+        // reorders at their weekly time, when their list has something
+        for (st.shops) |s| {
+            if (!lists_mod.weeklyDue(.{ .day = s.day, .at = s.at }, day, minute)) continue;
+            const key = std.fmt.allocPrint(a, "reorder {s} {d}", .{ s.shop, day }) catch continue;
+            if (once(c, a, key)) continue;
+            want(c, s.shop);
+        }
+        // what waits on a server, on its own thread
+        if (c.poller_on) startJob(c);
+    }
+
+    // ---- reorders ----
+
+    /// `/setup reorder SHOP [LIST] [at N items] [every DAY HH:MM]`, or
+    /// `/setup reorder SHOP off`: the owner's.
+    fn setupReorder(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        var it = std.mem.tokenizeAny(u8, rest, " \t");
+        const shop = it.next() orelse return reorder_help;
+        if (!shopName(shop)) return reorder_help;
+        var shop_cfg: lists_mod.Shop = .{ .shop = shop };
+        var by_size = false;
+        var by_date = false;
+        while (it.next()) |w| {
+            const eql = std.mem.eql;
+            if (eql(u8, w, "off")) return reorderOff(c, a, shop);
+            if (eql(u8, w, "at")) {
+                const n = std.fmt.parseInt(u32, it.next() orelse return reorder_help, 10) catch return reorder_help;
+                const unit = it.next() orelse return reorder_help;
+                if (!eql(u8, unit, "items") and !eql(u8, unit, "item")) return reorder_help;
+                if (n == 0 or n > lists_mod.max_items) return reorder_help;
+                shop_cfg.size = n;
+                by_size = true;
+            } else if (eql(u8, w, "every")) {
+                const d = it.next() orelse return reorder_help;
+                const tm = it.next() orelse return reorder_help;
+                const wk = lists_mod.parseWeekly(try std.fmt.allocPrint(a, "{s} {s}", .{ d, tm })) orelse return reorder_help;
+                shop_cfg.day = wk.day;
+                shop_cfg.at = wk.at;
+                by_date = true;
+            } else if (lists_mod.validName(w)) {
+                shop_cfg.list = w;
+            } else return reorder_help;
+        }
+        // only a date said: not by size too
+        if (by_date and !by_size) shop_cfg.size = 0;
+        const tl = shopTools(c, a, shop);
+        if (tl.why) |why| return why;
+        shop_cfg.quote = tl.quote.?.tool;
+        shop_cfg.order = tl.order.?.tool;
+        {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var st = load(c, a);
+            var shops: std.ArrayList(lists_mod.Shop) = .empty;
+            for (st.shops) |s| if (!std.mem.eql(u8, s.shop, shop)) try shops.append(a, s);
+            try shops.append(a, shop_cfg);
+            st.shops = shops.items;
+            try save(c, a, st);
+        }
+        c.log.write(.config, false, .{ .event = "reorder", .shop = shop, .list = shop_cfg.list, .size = shop_cfg.size, .on = true }) catch {};
+        var when: std.ArrayList([]const u8) = .empty;
+        if (shop_cfg.size > 0) try when.append(a, try std.fmt.allocPrint(a, "when {s} reaches {d} items", .{ shop_cfg.list, shop_cfg.size }));
+        if (shop_cfg.day >= 0) try when.append(a, try std.fmt.allocPrint(a, "{s} when {s} has something on it", .{ try lists_mod.weeklyText(a, .{ .day = shop_cfg.day, .at = shop_cfg.at }), shop_cfg.list }));
+        const per_call = tl.order.?.max_per_call orelse c.cfg.money.max_per_call;
+        const cap = if (per_call > 0) try std.fmt.allocPrint(a, " An order over {d} a call is not proposed (your cap).", .{per_call}) else "";
+        return std.fmt.allocPrint(a, "Reorders from {s} are on: {s}, I price the list with {s} and send you the whole order, each item and the total. Nothing is bought until you tap Order it.{s} /setup reorder {s} off stops them.", .{ try lists_mod.title(a, shop), try std.mem.join(a, ", and ", when.items), try lists_mod.title(a, shop), cap, shop });
+    }
+
+    /// An MCP server's name as `/setup reorder` takes it.
+    fn shopName(s: []const u8) bool {
+        if (s.len == 0 or s.len > 64) return false;
+        for (s) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_')) return false;
+        return true;
+    }
+
+    const reorder_help =
+        \\Use /setup reorder SHOP [LIST] [at 10 items] [every sat 09:00]: SHOP the shop's MCP server in mcp.ini, LIST shopping unless you name another.
+        \\The shop's server needs a tool that prices a basket (its name has quote, price, basket or cart) and its order tool listed as money in mcp.ini with amount =, so every order is asked and your caps apply.
+        \\/setup reorder SHOP off stops it.
+    ;
+
+    fn reorderOff(c: *Core, a: std.mem.Allocator, shop: []const u8) ![]const u8 {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        var st = load(c, a);
+        var shops: std.ArrayList(lists_mod.Shop) = .empty;
+        for (st.shops) |s| if (!std.mem.eql(u8, s.shop, shop)) try shops.append(a, s);
+        if (shops.items.len == st.shops.len) return std.fmt.allocPrint(a, "No reorders from {s} were on.", .{shop});
+        st.shops = shops.items;
+        try save(c, a, st);
+        c.log.write(.config, false, .{ .event = "reorder", .shop = shop, .on = false }) catch {};
+        return std.fmt.allocPrint(a, "Reorders from {s} are off.", .{try lists_mod.title(a, shop)});
+    }
+
+    /// A shop's two tools, or why it can't be one (Ruling 6 of the plan).
+    const ShopTools = struct { quote: ?agent.McpTool = null, order: ?agent.McpTool = null, why: ?[]const u8 = null };
+
+    fn shopTools(c: *Core, a: std.mem.Allocator, shop: []const u8) ShopTools {
+        var any = false;
+        var quote: ?agent.McpTool = null;
+        var order: ?agent.McpTool = null;
+        var orders: usize = 0;
+        for (c.mcp_tools) |m| {
+            if (!std.mem.eql(u8, m.server.name, shop)) continue;
+            any = true;
+            if (m.money) {
+                orders += 1;
+                if (order == null or std.ascii.findIgnoreCase(m.tool, "order") != null) order = m;
+            } else if (quote == null and lists_mod.quoteName(m.tool)) quote = m;
+        }
+        const title_s = lists_mod.title(a, shop) catch shop;
+        if (!any) return .{ .why = std.fmt.allocPrint(a, "No MCP server called {s} is running. Add the shop's server to mcp.ini (its order tool under money =, with amount =), then /reload.", .{shop}) catch "No such shop." };
+        if (order == null) return .{ .why = std.fmt.allocPrint(a, "{s} has no tool mcp.ini lists as money: I only order through a tool that is asked every time. Add its order tool to money = (with amount =) in its section, then /reload.", .{title_s}) catch "No order tool." };
+        if (orders > 1 and std.ascii.findIgnoreCase(order.?.tool, "order") == null) return .{ .why = std.fmt.allocPrint(a, "{s} has several money tools and none is called order: I can't tell which one orders.", .{title_s}) catch "Several money tools." };
+        if (order.?.amount != .name) return .{ .why = std.fmt.allocPrint(a, "{s}'s order tool has no amount field in mcp.ini (amount = {s}:FIELD): without it your money caps can't check an order.", .{ title_s, order.?.tool }) catch "No amount field." };
+        if (quote == null) return .{ .why = std.fmt.allocPrint(a, "{s} has no tool that prices a basket (a name with quote, price, basket or cart), so I can't propose an order in full.", .{title_s}) catch "No quote tool." };
+        return .{ .quote = quote, .order = order };
+    }
+
+    /// A shop to propose from, for the errands' job (once in the list).
+    fn want(c: *Core, shop: []const u8) void {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        for (c.errands.pending.items) |x| if (std.mem.eql(u8, x, shop)) return;
+        const owned = c.gpa.dupe(u8, shop) catch return;
+        c.errands.pending.append(c.gpa, owned) catch c.gpa.free(owned);
+    }
+
+    /// List `name` now holds `count` (`before` before): a shop whose size
+    /// it reached from under is wanted; one it fell under may propose
+    /// again (Ruling 7).
+    fn noteCount(c: *Core, a: std.mem.Allocator, name: []const u8, before: usize, count: usize) void {
+        var wanted: std.ArrayList([]const u8) = .empty;
+        {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var st = load(c, a);
+            const shops = a.dupe(lists_mod.Shop, st.shops) catch return;
+            var changed = false;
+            for (shops) |*s| {
+                if (!std.mem.eql(u8, s.list, name) or s.size == 0) continue;
+                if (count < s.size and !s.low) {
+                    s.low = true;
+                    changed = true;
+                } else if (count >= s.size and before < s.size and s.low) {
+                    s.low = false;
+                    changed = true;
+                    wanted.append(a, s.shop) catch {};
+                }
+            }
+            if (changed) {
+                st.shops = shops;
+                save(c, a, st) catch |err| c.log.write(.chat, false, .{ .event = "errands not written", .why = @errorName(err) }) catch {};
+            }
+        }
+        for (wanted.items) |s| want(c, s);
+    }
+
+    /// Whether shop `shop` has an order waiting for the owner.
+    fn orderOpen(c: *Core, a: std.mem.Allocator, shop: []const u8) bool {
+        const st = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            break :blk load(c, a);
+        };
+        for (st.orders) |o| if (std.mem.eql(u8, o.shop, shop)) {
+            if (c.itemNow(o.item) != .closed) return true;
+        };
+        return false;
+    }
+
+    /// Proposes an order from shop `shop_name`: its list priced by its
+    /// quote tool, then the whole order as the owner's one-tap item; the
+    /// call it would make kept first (`state/errands`). What goes wrong is
+    /// said in a line.
+    fn propose(c: *Core, shop_name: []const u8) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const by = "schedule:reorder";
+        const shop = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            for (load(c, a).shops) |s| if (std.mem.eql(u8, s.shop, shop_name)) break :blk s;
+            return;
+        };
+        if (orderOpen(c, a, shop.shop)) return;
+        const items = c.errands.lists.items(a, shop.list) catch return;
+        if (items.len == 0) return;
+        const shop_title = lists_mod.title(a, shop.shop) catch shop.shop;
+        const tl = shopTools(c, a, shop.shop);
+        if (tl.why) |why| {
+            c.log.write(.chat, false, .{ .event = "order not proposed", .shop = shop.shop, .why = why }) catch {};
+            return post(c, a, by, "reorder", std.fmt.allocPrint(a, "No order from {s} this time: {s}", .{ shop_title, why }) catch return);
+        }
+        const quote = tl.quote.?;
+        const order = tl.order.?;
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "");
+        defer c.unregister(&flag);
+        const got = quote.server.call(a, quote.tool, lists_mod.quoteInput(a, items) catch return, &flag, 60_000, 256 * 1024) catch |err| {
+            c.log.write(.chat, false, .{ .event = "order not proposed", .shop = shop.shop, .why = @errorName(err) }) catch {};
+            return post(c, a, by, "reorder", std.fmt.allocPrint(a, "{s} couldn't price {s} ({s}): no order proposed.", .{ shop_title, shop.list, @errorName(err) }) catch return);
+        };
+        if (got.is_error) {
+            c.log.write(.chat, false, .{ .event = "order not proposed", .shop = shop.shop, .why = "the quote failed" }) catch {};
+            return post(c, a, by, "reorder", std.fmt.allocPrint(a, "{s} couldn't price {s}: {s}", .{ shop_title, shop.list, util.cut(std.mem.trim(u8, got.text, " \t\r\n"), 300) }) catch return);
+        }
+        const q = lists_mod.parseQuote(a, got.text) catch {
+            c.log.write(.chat, false, .{ .event = "order not proposed", .shop = shop.shop, .why = "the quote didn't read" }) catch {};
+            return post(c, a, by, "reorder", std.fmt.allocPrint(a, "{s}'s price for {s} didn't read as one: no order proposed.", .{ shop_title, shop.list }) catch return);
+        };
+        const plan = lists_mod.planOrder(a, q, items) catch return;
+        if (plan.order.len == 0) return post(c, a, by, "reorder", std.fmt.allocPrint(a, "{s} has none of {s}'s items: no order proposed.", .{ shop_title, shop.list }) catch return);
+        const total = lists_mod.amountText(a, q.total, q.currency) catch return;
+        // a cap the gate would hold it to: said, not asked (Ruling 10)
+        const per_call = order.max_per_call orelse c.cfg.money.max_per_call;
+        if (per_call > 0 and q.total > @as(f64, @floatFromInt(per_call))) {
+            c.log.write(.chat, false, .{ .event = "order not proposed", .shop = shop.shop, .why = "over the cap per call" }) catch {};
+            return post(c, a, by, "reorder", std.fmt.allocPrint(a, "The order from {s} would be {s}, over your cap of {d} a call: nothing is proposed. Take something off {s}, or raise max_per_call.", .{ shop_title, total, per_call, shop.list }) catch return);
+        }
+        const input = jv.canonical(a, lists_mod.orderInput(a, plan.order, order.amount.name, q.total) catch return) orelse return;
+        const arg = std.fmt.allocPrint(a, "{s}/{s} {s}", .{ order.server.name, order.tool, input }) catch return;
+        const body = c.masks.scrubAlloc(a, lists_mod.proposal(a, shop.shop, q, plan) catch return) catch return;
+        const title_line = std.fmt.allocPrint(a, "Order from {s}: {s}", .{ shop_title, total }) catch return;
+        const choices = [_]inbox_mod.Choice{ .{ .key = "order", .label = "Order it" }, .{ .key = "later", .label = "Not now" } };
+        c.makeRoom();
+        const id = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = c.inbox.add(.{
+                .kind = "confirm",
+                .by = by,
+                .run = std.fmt.allocPrint(a, "reorder {s}", .{shop.shop}) catch return,
+                .conversation = "main",
+                .waiter = order_waiter,
+                .title = title_line,
+                .body = body,
+                .choices = &choices,
+                .expires = c.now() + @as(i64, c.cfg.limits.approval_seconds),
+            }, c.now(), c.newToken()) catch return;
+            c.saveInbox();
+            c.logOpen(it);
+            break :blk it.id;
+        };
+        // the call kept before the item is shown: a tap at once finds it
+        {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var st = load(c, a);
+            var orders: std.ArrayList(lists_mod.Order) = .empty;
+            orders.appendSlice(a, st.orders) catch return;
+            orders.append(a, .{ .item = id, .shop = shop.shop, .list = shop.list, .arg = arg, .items = plan.order, .total = total }) catch return;
+            st.orders = orders.items;
+            save(c, a, st) catch {
+                _ = c.settle(id, .void, .{ .text = "it could not be kept", .at = c.now(), .via = .harness });
+                return;
+            };
+        }
+        c.log.write(.chat, false, .{ .event = "order proposed", .shop = shop.shop, .item = id, .items = plan.order.len, .missing = plan.missing.len }) catch {};
+        if (!c.showItem(id, null)) _ = c.settle(id, .void, .{ .text = "it could not be shown", .at = c.now(), .via = .harness });
+    }
+
+    const order_waiter = "errand order";
+
+    /// The order item `id` closed: its call taken off `state/errands` first
+    /// (a crash never orders twice), then made on the owner's Order it,
+    /// on a thread of its own; anything else orders nothing.
+    fn orderAnswered(c: *Core, a: std.mem.Allocator, id: u64, status: inbox_mod.Status, key: []const u8) void {
+        const yes = status == .answered and std.mem.eql(u8, key, "order");
+        const o = takeOrder(c, a, id) orelse {
+            if (yes) c.say(std.fmt.allocPrint(a, "Item {d}: nothing was ordered: harness no longer has that order. It's proposed again at the next time.", .{id}) catch "Nothing was ordered.");
+            return;
+        };
+        if (!yes) {
+            c.log.write(.chat, false, .{ .event = "order not made", .shop = o.shop, .item = id, .why = @tagName(status) }) catch {};
+            return;
+        }
+        const box = c.gpa.create(OrderJob) catch return c.say("Nothing was ordered: harness could not start the order.");
+        box.arena = .init(c.gpa);
+        box.order = copyOrder(box.arena.allocator(), o) catch {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return c.say("Nothing was ordered: harness could not start the order.");
+        };
+        _ = c.bg_active.fetchAdd(1, .acq_rel);
+        const th = std.Thread.spawn(.{}, orderJob, .{ c, box }) catch {
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return c.say("Nothing was ordered: harness could not start the order.");
+        };
+        th.detach();
+    }
+
+    const OrderJob = struct { arena: std.heap.ArenaAllocator, order: lists_mod.Order };
+
+    fn copyOrder(a: std.mem.Allocator, o: lists_mod.Order) !lists_mod.Order {
+        var items = try a.alloc([]const u8, o.items.len);
+        for (o.items, 0..) |x, i| items[i] = try a.dupe(u8, x);
+        return .{ .item = o.item, .shop = try a.dupe(u8, o.shop), .list = try a.dupe(u8, o.list), .arg = try a.dupe(u8, o.arg), .items = items, .total = try a.dupe(u8, o.total) };
+    }
+
+    fn orderJob(c: *Core, box: *OrderJob) void {
+        defer {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+        }
+        makeOrder(c, box.arena.allocator(), box.order);
+    }
+
+    /// Takes the order of item `id` off `state/errands`; null: none.
+    fn takeOrder(c: *Core, a: std.mem.Allocator, id: u64) ?lists_mod.Order {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        var st = load(c, a);
+        var kept: std.ArrayList(lists_mod.Order) = .empty;
+        var found: ?lists_mod.Order = null;
+        for (st.orders) |o| {
+            if (o.item == id) found = o else kept.append(a, o) catch return null;
+        }
+        const o = found orelse return null;
+        st.orders = kept.items;
+        save(c, a, st) catch |err| {
+            // not taken off: not made either
+            c.log.write(.chat, false, .{ .event = "errands not written", .why = @errorName(err) }) catch {};
+            return null;
+        };
+        return o;
+    }
+
+    /// The asker of an order the owner tapped: yes to that exact call,
+    /// once; no to anything else.
+    const OrderGo = struct {
+        arg: []const u8,
+        item: u64,
+        used: bool = false,
+
+        fn ask(ctx: *anyopaque, a: std.mem.Allocator, q: agent.Question) agent.Reply {
+            _ = a;
+            const g: *OrderGo = @ptrCast(@alignCast(ctx));
+            if (g.used or q.kind != .approval or !std.mem.eql(u8, q.arg, g.arg)) return .{ .answer = .deny, .text = "not the order the owner tapped", .item = g.item };
+            g.used = true;
+            return .{ .answer = .once, .item = g.item };
+        }
+    };
+
+    /// Makes order `o` the owner tapped: as the owner's (who `owner`, the
+    /// built-in main definition), through the gate again (a deny, the
+    /// caps, dry run), whose asker allows that exact call once. The shop's
+    /// words read back; what was ordered taken off the list.
+    fn makeOrder(c: *Core, a: std.mem.Allocator, o: lists_mod.Order) void {
+        while (c.restarting.load(.acquire) and !c.quitting.load(.acquire)) c.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        const shop_title = lists_mod.title(a, o.shop) catch o.shop;
+        const call = household.splitCall(o.arg) orelse return;
+        const mt: ?agent.McpTool = for (c.mcp_tools) |m| {
+            if (std.mem.eql(u8, m.server.name, call.server) and std.mem.eql(u8, m.tool, call.tool)) break m;
+        } else null;
+        const m = mt orelse return c.say(std.fmt.allocPrint(a, "The order from {s} wasn't made: its server isn't running. Nothing was taken off {s}.", .{ shop_title, o.list }) catch "The order wasn't made.");
+        if (!m.money) return c.say(std.fmt.allocPrint(a, "The order from {s} wasn't made: its order tool is no longer a money tool in mcp.ini.", .{shop_title}) catch "The order wasn't made.");
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "main");
+        defer c.unregister(&flag);
+        var run = c.runIn(&c.chat_client, "reorder", .{ .agent = "main", .by = "owner" }, "main", &flag);
+        run.useDefinition(agents.builtin_main);
+        var go: OrderGo = .{ .arg = o.arg, .item = o.item };
+        run.asker = .{ .ctx = &go, .ask = OrderGo.ask };
+        const out: tools.Output = agent.stepCall(&run, a, m.def.name, call.input) catch |e| .{ .text = @errorName(e), .is_error = true };
+        const words_said = util.cut(std.mem.trim(u8, out.text, " \t\r\n"), 600);
+        if (out.is_error or !go.used) {
+            c.log.write(.chat, false, .{ .event = "order failed", .shop = o.shop, .item = o.item }) catch {};
+            return c.say(std.fmt.allocPrint(a, "The order from {s} wasn't made: {s}. Nothing was taken off {s}.", .{ shop_title, std.mem.trimEnd(u8, words_said, "."), o.list }) catch "The order wasn't made.");
+        }
+        if (std.mem.startsWith(u8, words_said, "dry run:")) {
+            c.log.write(.chat, false, .{ .event = "order dry run", .shop = o.shop, .item = o.item }) catch {};
+            return c.say(std.fmt.allocPrint(a, "Dry run is on: nothing was ordered from {s}.", .{shop_title}) catch "Dry run is on: nothing was ordered.");
+        }
+        const got = c.errands.lists.remove(a, o.list, o.items) catch Store.Removed{};
+        noteCount(c, a, o.list, got.count + got.removed.len, got.count);
+        c.log.write(.chat, false, .{ .event = "order made", .shop = o.shop, .item = o.item, .items = o.items.len }) catch {};
+        c.say(std.fmt.allocPrint(a, "Ordered from {s}: {d} item{s}, {s}; off {s}. The shop says: {s}", .{ shop_title, o.items.len, if (o.items.len == 1) "" else "s", o.total, o.list, words_said }) catch "Ordered.");
+    }
+
+    const Store = lists_mod.Store;
+
+    /// An item of the errands (waiter `errand …`) closed.
+    fn answered(c: *Core, id: u64) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const Got = struct { status: inbox_mod.Status, key: []const u8 = "", waiter: []const u8 = "" };
+        const got: Got = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = c.inbox.find(id) orelse return;
+            const key = if (it.answer) |ans| a.dupe(u8, ans.key orelse "") catch "" else "";
+            break :blk .{ .status = it.status, .key = key, .waiter = a.dupe(u8, it.waiter) catch return };
+        };
+        if (std.mem.eql(u8, got.waiter, order_waiter)) return orderAnswered(c, a, id, got.status, got.key);
+    }
+
+    // ---- the errands' job: what waits on a server, on a thread of its own ----
+
+    /// Starts the job when something waits for it (Ruling 21); where
+    /// harness runs (`poller_on`).
+    fn startJob(c: *Core) void {
+        if (c.restarting.load(.acquire) or c.stop.load(.acquire)) return;
+        if (!jobDue(c)) return;
+        if (c.errands.running.swap(true, .acq_rel)) return;
+        const th = std.Thread.spawn(.{}, jobThread, .{c}) catch {
+            c.errands.running.store(false, .release);
+            return;
+        };
+        th.detach();
+    }
+
+    fn jobDue(c: *Core) bool {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        return c.errands.pending.items.len > 0;
+    }
+
+    fn jobThread(c: *Core) void {
+        defer c.errands.running.store(false, .release);
+        work(c);
+    }
+
+    /// What waits: the shops wanted.
+    fn work(c: *Core) void {
+        while (true) {
+            const shop = blk: {
+                c.errands.mutex.lockUncancelable(c.io);
+                defer c.errands.mutex.unlock(c.io);
+                if (c.errands.pending.items.len == 0) return;
+                break :blk c.errands.pending.orderedRemove(0);
+            };
+            defer c.gpa.free(shop);
+            if (c.stop.load(.acquire)) continue;
+            propose(c, shop);
         }
     }
 
@@ -23795,4 +24253,201 @@ test "add_milk_in_a_voice_note" {
     try f.rec.waitFor("\"Add milk.\"");
     try f.rec.waitFor("Added milk to shopping (1 item).");
     try t.expectEqual(0, f.e.server.modelRequests());
+}
+
+// ---- errands: reorders ----
+
+/// mcp.ini with the shop's stand-in as `frisco` (its order a money tool,
+/// `total` its amount), `extra` lines after; applied.
+fn withShop(f: *Fix, extra: []const u8) !void {
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[frisco]\ncommand = \"{s}\" --mcp --shop\n{s}", .{ fake, extra }) });
+    try Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "frisco" }));
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+}
+
+const shop_money = "money = shop_order\namount = shop_order:total\n";
+
+fn shopOrders(f: *Fix) []const u8 {
+    const a = f.e.arena.allocator();
+    return fileText(f, std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "frisco", "orders.jsonl" }) catch return "");
+}
+
+/// Waits up to 5 s for `needle` in the shop's orders.
+fn waitOrders(f: *Fix, needle: []const u8) !void {
+    var waited: u32 = 0;
+    while (waited < 5000) : (waited += 50) {
+        if (std.mem.indexOf(u8, shopOrders(f), needle) != null) return;
+        t.io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+    std.debug.print("orders: {s}\n", .{shopOrders(f)});
+    return error.TestTimedOut;
+}
+
+test "a_reorder_is_bought_only_on_the_owners_tap" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    try t.expectEqualStrings("Reorders from Frisco are on: when shopping reaches 3 items, I price the list with Frisco and send you the whole order, each item and the total. Nothing is bought until you tap Order it. /setup reorder frisco off stops them.", try f.core.command(a, "/setup reorder frisco at 3 items"));
+    try f.core.handleText("add milk and eggs");
+    Errands.work(f.core);
+    try t.expectEqual(0, f.rec.count("Order from"));
+    try f.core.handleText("add oat milk, coffee");
+    try f.rec.waitFor("Added oat milk and coffee to shopping (4 items).");
+    Errands.work(f.core);
+    // the whole order, each line, the total, what wasn't found
+    try f.rec.waitFor("BUTTONS Order from Frisco: 15.00 PLN, delivery Sat 28 Nov, 10:00–12:00.\n- milk: milk (Shop's own), 5.00\n- eggs: eggs (Shop's own), 5.00\n- coffee: coffee (Shop's own), 5.00\nNot found: oat milk (stays on the list).");
+    try t.expectEqualStrings("", shopOrders(&f));
+    // nothing more is proposed while it waits
+    try f.core.handleText("add bread");
+    Errands.work(f.core);
+    try t.expectEqual(1, f.rec.count("BUTTONS Order from"));
+    // a member's press is not the owner's
+    const b = f.lastButtons();
+    f.core.handleCallback(77, b.msg, b.get("order").?);
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expectEqualStrings("", shopOrders(&f));
+    // the owner's tap: that exact order, once
+    try f.press("order");
+    try f.rec.waitFor("Ordered from Frisco: 3 items, 15.00 PLN; off shopping. The shop says: Order 4471 placed: 15.00 PLN, delivery Sat 28 Nov, 10:00–12:00.");
+    try waitOrders(&f, "{\"items\":[\"milk\",\"eggs\",\"coffee\"],\"total\":15}");
+    try t.expectEqualStrings("Shopping (2): oat milk, bread.", try f.core.command(a, "/list"));
+    // a second press orders nothing
+    f.core.handleCallback(42, b.msg, b.get("order").?);
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expectEqual(1, std.mem.count(u8, shopOrders(&f), "\n"));
+    // the call went through the gate as the owner's, asked by the tap
+    const lt = try logText(&f);
+    try expectHas(lt, "\"by\":\"owner\"");
+    try expectHas(lt, "\"tool\":\"frisco__shop_order\"");
+    try expectHas(lt, "\"event\":\"order made\",\"shop\":\"frisco\"");
+}
+
+test "not_now_and_expiry_order_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    _ = try f.core.command(a, "/setup reorder frisco at 2 items");
+    try f.core.handleText("add milk, eggs");
+    Errands.work(f.core);
+    try f.rec.waitFor("BUTTONS Order from Frisco: 10.00 PLN");
+    try f.press("later");
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expectEqualStrings("", shopOrders(&f));
+    // more items: not again until the list was under its size
+    try f.core.handleText("add bread");
+    Errands.work(f.core);
+    try t.expectEqual(1, f.rec.count("BUTTONS Order from"));
+    try f.core.handleText("got the milk, eggs");
+    try f.core.handleText("add jam");
+    Errands.work(f.core);
+    try f.rec.waitFor("BUTTONS Order from Frisco: 10.00 PLN");
+    try t.expectEqual(2, f.rec.count("BUTTONS Order from"));
+    // no answer in time: nothing
+    f.core.fixed_now = f.core.now() + f.core.cfg.limits.approval_seconds + 60;
+    f.core.tick();
+    try f.rec.waitFor("No answer in time.");
+    try t.expectEqualStrings("", shopOrders(&f));
+    try expectHas(try logText(&f), "\"event\":\"order not made\",\"shop\":\"frisco\"");
+}
+
+test "the_order_goes_through_the_gates_caps_and_dry_run" {
+    var f: Fix = undefined;
+    try f.init("[money]\nmax_per_call = 8\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    _ = try f.core.command(a, "/setup reorder frisco at 2 items");
+    try f.core.handleText("add milk, eggs");
+    Errands.work(f.core);
+    // over the cap a call: said, nothing asked
+    try f.rec.waitFor("The order from Frisco would be 10.00 PLN, over your cap of 8 a call: nothing is proposed.");
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    // the shop's own cap lifts it; dry run is on
+    try withShop(&f, shop_money ++ "max_per_call = 50\n");
+    try f.core.handleText("got the milk");
+    try f.core.handleText("add milk");
+    Errands.work(f.core);
+    try f.rec.waitFor("BUTTONS Order from Frisco: 10.00 PLN");
+    _ = try f.core.command(a, "/dryrun on");
+    try f.press("order");
+    try f.rec.waitFor("Dry run is on: nothing was ordered from Frisco.");
+    try t.expectEqualStrings("", shopOrders(&f));
+    try t.expectEqualStrings("Shopping (2): eggs, milk.", try f.core.command(a, "/list"));
+    // a deny rule stops it at the tap
+    _ = try f.core.command(a, "/dryrun off");
+    try writeRules(&f, "deny mcp frisco/shop_order *\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.core.handleText("got the milk");
+    try f.core.handleText("add milk");
+    Errands.work(f.core);
+    try t.expectEqual(2, f.rec.count("BUTTONS Order from"));
+    try f.press("order");
+    try f.rec.waitFor("The order from Frisco wasn't made: ");
+    try t.expectEqualStrings("", shopOrders(&f));
+}
+
+test "a_shop_whose_order_tool_is_not_money_is_refused" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, "");
+    try t.expectEqualStrings("Frisco has no tool mcp.ini lists as money: I only order through a tool that is asked every time. Add its order tool to money = (with amount =) in its section, then /reload.", try f.core.command(a, "/setup reorder frisco"));
+    try withShop(&f, "money = shop_order\n");
+    try expectHas(try f.core.command(a, "/setup reorder frisco"), "Frisco's order tool has no amount field in mcp.ini (amount = shop_order:FIELD)");
+    try expectHas(try f.core.command(a, "/setup reorder nosuch"), "No MCP server called nosuch is running.");
+    // set up, then mcp.ini changed: nothing proposed, said why
+    try withShop(&f, shop_money);
+    _ = try f.core.command(a, "/setup reorder frisco at 1 items");
+    try withShop(&f, "");
+    try f.core.handleText("add milk");
+    Errands.work(f.core);
+    try f.rec.waitFor("No order from Frisco this time: Frisco has no tool mcp.ini lists as money");
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+}
+
+test "a_tap_after_a_restart_still_orders_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    _ = try f.core.command(a, "/setup reorder frisco at 1 items");
+    try f.core.handleText("add milk");
+    Errands.work(f.core);
+    try f.rec.waitFor("BUTTONS Order from Frisco: 5.00 PLN");
+    const b = f.lastButtons();
+    try restart(&f);
+    try f.core.setOwner(42);
+    f.core.startExtras();
+    f.core.handleCallback(42, b.msg, b.get("order").?);
+    try f.rec.waitFor("Ordered from Frisco: 1 item, 5.00 PLN; off shopping.");
+    try waitOrders(&f, "\"milk\"");
+    f.core.handleCallback(42, b.msg, b.get("order").?);
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expectEqual(1, std.mem.count(u8, shopOrders(&f), "\n"));
+}
+
+test "a_members_add_proposes_to_the_owner_only" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    _ = try f.core.command(a, "/setup reorder frisco at 1 items");
+    try joinMember(&f, "anna", 77);
+    try f.core.handleIncoming(fromAccount(77, "add milk"));
+    try f.rec.waitIn("anna", "Added milk to shopping (1 item).");
+    Errands.work(f.core);
+    try f.rec.waitIn("main", "Order from Frisco: 5.00 PLN");
+    try t.expectEqual(0, f.rec.countIn("anna", "Order"));
+    // her /setup is the owner's
+    try f.core.handleIncoming(fromAccount(77, "/setup reorder frisco off"));
+    try f.rec.waitIn("anna", "Commands are for the owner.");
 }
