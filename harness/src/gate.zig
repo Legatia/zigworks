@@ -66,6 +66,11 @@ pub const Tool = enum {
     env_save,
     /// A snapshot of a workspace folder (gap 3); the argument is the folder.
     snapshot,
+    /// The people the owner deals with (`state/people/`): `find WORDS`,
+    /// `show NAME`, `note NAME FIELD`. Offered only in runs the owner
+    /// started in a conversation only they read; never a member's or a
+    /// room's.
+    people,
 
     /// The kind's default, as the rules file's comment names it: a send
     /// asks where others read it, trigger and workflow for some actions
@@ -1517,6 +1522,25 @@ test "a_members_defaults" {
     // the owner's runs keep their defaults
     try t.expectEqual(.ask, f.act(.mcp, "home/home_set {}", .{}));
     try t.expect(f.gate.decide(a, .shell, "ls", 1000, .{}).allow_day);
+}
+
+test "people_is_never_for_members_or_rooms" {
+    var f: Fixture = undefined;
+    try f.init("[member]\nallow people *\n[room]\nallow people *\n");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    for ([_]Who{ anna, .{ .by = "room:kitchen" } }) |w| {
+        const d = f.gate.decide(a, .people, "show Ola", 1000, .{ .who = w });
+        try t.expectEqual(.deny, d.action);
+        try t.expect(!f.gate.memberOffers(.people, w));
+    }
+    // the owner's: allowed by default, and rules decide it as any kind
+    try t.expectEqual(.allow, f.act(.people, "find ola", .{}));
+    var g: Fixture = undefined;
+    try g.init("deny people note*\n");
+    defer g.deinit();
+    try t.expectEqual(.deny, g.act(.people, "note Ola birthday", .{}));
+    try t.expectEqual(.allow, g.act(.people, "show Ola", .{}));
 }
 
 test "what_members_never_get" {

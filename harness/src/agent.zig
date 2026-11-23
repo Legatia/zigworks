@@ -26,6 +26,7 @@ const snapshots_mod = @import("snapshots.zig");
 const undo_mod = @import("undo.zig");
 const agents = @import("agents.zig");
 const history_mod = @import("history.zig");
+const people_mod = @import("people.zig");
 const summaries_mod = @import("summaries.zig");
 const Io = std.Io;
 
@@ -336,6 +337,10 @@ pub const Run = struct {
     /// Where `history` reads the log, and the prompt the conversation's
     /// summaries (long memory); null: neither.
     history: ?*const history_mod.Source = null,
+    /// The people the owner deals with: the `people` tool, and calendar
+    /// attendees noted; null: neither. Set only for the owner's own runs
+    /// in a conversation only they read (core.zig).
+    people: ?*people_mod.Book = null,
     /// Held while memory or grants change; shared by all runs.
     lock: *Io.Mutex,
     env: tools.Env,
@@ -594,6 +599,9 @@ pub const Run = struct {
             .skill, .skill_save => if (r.skills_dir.len == 0) return false,
             // where there is a log to read, in every run, as recall
             .history => if (r.history == null) return false,
+            // the owner's own runs in their own conversations (core.zig sets
+            // the book only there); never a helper's
+            .people => if (r.people == null or r.helper or !std.mem.eql(u8, r.who.by, "owner")) return false,
             .browse => if (r.env.browser.len == 0) return false,
             // the browser with the logins (helpers never: above); on
             // Windows too since Chrome's pipes there are inherited handles
@@ -993,6 +1001,7 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
         try out.append(arena, if (tool == .shell) try shellDef(r, arena) else d);
     }
     if (r.allows(.history)) try out.append(arena, history_mod.tool_def);
+    if (r.allows(.people)) try out.append(arena, people_mod.tool_def);
     if (r.allows(.send)) try out.append(arena, send_def);
     if (r.allows(.ask_owner)) try out.append(arena, ask_owner_def);
     if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
@@ -1833,6 +1842,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
         // the whole input: rules and the owner see all of it
         .mcp, .money => try std.fmt.allocPrint(a, "{s}/{s} {s}", .{ mt.?.server.name, mt.?.tool, input_json }),
         .history => history_mod.gateArg(a, input_json) catch return .{ .text = "history needs words, or a run's number", .is_error = true },
+        .people => people_mod.gateArg(a, input_json) catch return .{ .text = "people needs an action (find, show or note), a name, and for note a field", .is_error = true },
         else => tools.mainArg(a, tool, input_json) catch return .{ .text = "the tool's input is missing its main field", .is_error = true },
     };
     // a skill outside the definition's skills is no skill of this run's
@@ -1995,7 +2005,17 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
             break :blk .{ .text = got.text, .is_error = got.is_error };
         },
         .snapshot => try snapshotTool(r, a, arg, jv.str(jv.get(jv.parse(a, input_json), "label")) orelse ""),
-        .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
+        // the owner's day: "today" is theirs
+        .people => blk: {
+            const got = try people_mod.call(r.people.?, a, input_json, @divFloor(now_s + @as(i64, r.utc_offset) * 60, 86400), r.isPrivate());
+            if (got.notice) |text| if (r.notice) |n| n.say(n.ctx, text);
+            break :blk .{ .text = got.text, .is_error = got.is_error };
+        },
+        .mcp, .money => blk: {
+            const o = try callMcp(r, a, mt.?, arg, input_json, reserved);
+            if (tool == .mcp and !o.is_error) calendarPeople(r, a, mt.?.tool, o.text);
+            break :blk o;
+        },
         .skill => blk: {
             const v = jv.parse(a, input_json).?;
             const text = if (jv.str(jv.get(v, "file"))) |file|
@@ -2039,6 +2059,21 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
     else
         try r.logRun(.tool, r.isPrivate(), .{ .tool = name, .arg = arg, .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
     return out;
+}
+
+/// A calendar's read in a run with the people (the owner's own, in a
+/// conversation only they read): its attendees noted, someone new said to
+/// the owner; nothing while the conversation is private.
+fn calendarPeople(r: *Run, a: std.mem.Allocator, tool: []const u8, text: []const u8) void {
+    const book = r.people orelse return;
+    if (!people_mod.calendarTool(tool) or !r.allows(.people) or r.isPrivate()) return;
+    const found = people_mod.attendeesOf(a, text) catch return;
+    if (found.len == 0) return;
+    const added = book.fromCalendar(a, found, @divFloor(r.now() + @as(i64, r.utc_offset) * 60, 86400)) catch return;
+    if (added.len == 0) return;
+    r.log.write(.memory, false, .{ .event = "people from the calendar", .added = added.len }) catch {};
+    const n = r.notice orelse return;
+    n.say(n.ctx, std.fmt.allocPrint(a, "From your calendar, now in people: {s}. (/people)", .{std.mem.join(a, ", ", added) catch return}) catch return);
 }
 
 /// Where one shell command runs.
@@ -5443,6 +5478,87 @@ test "kinds_without_a_tool_yet_are_not_offered_or_run" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "this tool is not available here") != null);
     try t.expectEqual(0, f.asked);
     try t.expect(std.mem.indexOf(u8, try f.logText(), "\"kind\":\"gate\"") == null);
+}
+
+/// Notices a run gives the owner, kept.
+const Notices = struct {
+    list: std.ArrayList(u8) = .empty,
+    a: std.mem.Allocator,
+
+    fn say(ctx: *anyopaque, text: []const u8) void {
+        const n: *Notices = @ptrCast(@alignCast(ctx));
+        n.list.print(n.a, "{s}\n", .{text}) catch {};
+    }
+};
+
+fn peopleBook(f: *Fix) !*people_mod.Book {
+    const a = f.e.arena.allocator();
+    const b = try a.create(people_mod.Book);
+    b.* = .init(t.allocator, t.io, try std.fs.path.join(a, &.{ f.e.dir, "state", "people" }), try std.fs.path.join(a, &.{ f.e.dir, "state", "people-told" }));
+    try b.load();
+    return b;
+}
+
+test "people_tool_needs_the_owners_run" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const book = try peopleBook(&f);
+    defer book.deinit();
+    // no book: no tool
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "people") == null);
+    f.run.people = book;
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "people,") != null);
+    // never a helper, a member, speech in a room, a schedule, a trigger or a workflow
+    f.run.helper = true;
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "people") == null);
+    f.run.helper = false;
+    for ([_][]const u8{ "member:anna", "room:hall", "schedule:morning", "trigger:door", "workflow:leak/close" }) |by| {
+        f.run.who.by = by;
+        if (std.mem.indexOf(u8, try toolNames(&f.run, a), "people") != null) {
+            std.debug.print("offered to {s}\n", .{by});
+            return error.Offered;
+        }
+    }
+    f.run.who.by = "owner";
+    // a definition's tools list decides it as any tool's
+    f.run.useDefinition(try defOf(&f, "reader", "---\nname: reader\ndescription: R.\ntools: recall\n---\n"));
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "people") == null);
+    f.run.useDefinition(try defOf(&f, "friend", "---\nname: friend\ndescription: F.\ntools: recall, people\n---\n"));
+    try t.expectEqualStrings("recall,people,", try toolNames(&f.run, a));
+    f.run.useDefinition(agents.builtin_main);
+    // a fact noted, the owner told; then shown
+    var notices: Notices = .{ .a = a };
+    f.run.notice = .{ .ctx = &notices, .say = Notices.say };
+    try f.e.script(1, model.toolReply("tu_1", "people", "{\"action\":\"note\",\"name\":\"Ola\",\"field\":\"birthday\",\"value\":\"1989-11-28\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "people", "{\"action\":\"show\",\"name\":\"ola\"}"));
+    try f.e.script(3, model.textReply("Noted."));
+    const r = try f.say("my sister Ola was born on 28 November 1989");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "Noted for Ola: birthday 28 November 1989.") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "Birthday: 28 November 1989") != null);
+    try t.expectEqualStrings("Noted for Ola: birthday 28 November 1989. (/person Ola)\n", notices.list.items);
+    const log = try f.logText();
+    try t.expect(std.mem.indexOf(u8, log, "\"tool\":\"people\",\"decision\":\"allow\",\"why\":\"default for this tool\",\"arg\":\"note Ola birthday\"") != null);
+}
+
+test "people_note_in_a_private_conversation_is_not_saved" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const book = try peopleBook(&f);
+    defer book.deinit();
+    f.run.people = book;
+    f.run.private = true;
+    try f.e.script(1, model.toolReply("tu_1", "people", "{\"action\":\"note\",\"name\":\"Ola\",\"field\":\"preference\",\"value\":\"likes Polish poetry\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "people", "{\"action\":\"find\",\"name\":\"\"}"));
+    try f.e.script(3, model.textReply("ok"));
+    const r = try f.say("Ola likes Polish poetry");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "not saved: this conversation is private") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "No people yet.") != null);
+    try t.expectEqual(0, book.count());
 }
 
 test "history_is_offered_like_recall" {

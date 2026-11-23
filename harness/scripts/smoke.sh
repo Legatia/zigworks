@@ -579,6 +579,10 @@ check "the log chain verifies" '"$H" log verify | grep -qF "chain intact"'
 check "no secret value in the log, typed by the owner or not" '! grep -qE "og-smoke-key-123|telegram-smoke-token|brave-smoke-key|smoke-login-pass" "$HARNESS_HOME/log/actions.jsonl"'
 check "a login is removed with its secrets" '"$H" login rm bot >/dev/null && "$H" login list | grep -qF "No logins." && [ ! -e "$HARNESS_STORE/login-bot-password" ] && ! grep -qF "[bot]" "$HARNESS_HOME/logins.ini"'
 check "memory list works offline" '"$H" memory list 2>/dev/null | grep -qF "I prefer short briefs"'
+# people: a contacts file with Windows line ends and a folded line
+printf 'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ola Kowalska\r\nNICKNAME:Ola\r\nBDAY:1989-11-28\r\nTEL;TYPE=CELL:+48 600 100 200\r\nEND:VCARD\r\nBEGIN:VCARD\r\nVERSION:4.0\r\nN:Nowak;Marek;;;\r\nEMAIL:marek@exam\r\n ple.com\r\nEND:VCARD\r\n' >"$T/contacts.vcf"
+check "people import reads a vCard file with Windows line ends" '"$H" people import "$T/contacts.vcf" 2>/dev/null | grep -qF "From contacts.vcf: 2 new, 0 updated, 0 already known." && [ -f "$HARNESS_HOME/state/people/ola-kowalska.txt" ]'
+check "people list and show work offline" '"$H" people list 2>/dev/null | grep -qF "Ola Kowalska: birthday 28 November" && "$H" people show Marek Nowak 2>/dev/null | grep -qF "Email: marek@example.com"'
 check "snapshot list works offline" '"$H" snapshot list notes 2>/dev/null | grep -qF "Snapshots of notes:"'
 check "agent list works offline" '"$H" agent list 2>/dev/null | grep -qF "researcher: Research across several sources"'
 check "log search finds an earlier turn, offline" '"$H" log search "disk is FINE" 2>/dev/null | grep -qF "(task disk)" && "$H" log search "disk is FINE" 2>/dev/null | grep -qF "Agent: Disk is fine."'

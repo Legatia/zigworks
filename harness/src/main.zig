@@ -53,6 +53,9 @@ const usage =
     \\                             reading of a file; an instance started and run
     \\                             here until it waits; one stopped
     \\  memory [list|pin|unpin|forget ID]
+    \\  people list | show NAME | import FILE.vcf
+    \\                             the people you deal with (state/people/): a line
+    \\                             each, one in full, a contacts file (vCard 3 or 4)
     \\  snapshot list FOLDER | take FOLDER [LABEL] | changes FOLDER ID | restore FOLDER ID
     \\                             a folder's snapshots, one now, what changed, put it back
     \\  undo RUN                   take back the files run RUN changed
@@ -245,6 +248,7 @@ const App = struct {
         brief,
         task,
         memory,
+        people,
         snapshot,
         undo,
         env,
@@ -260,7 +264,7 @@ const App = struct {
         fn usesTools(r: Role) bool {
             return switch (r) {
                 .run, .chat, .task, .trigger, .workflow => true,
-                .brief, .memory, .snapshot, .undo, .env, .app, .agent => false,
+                .brief, .memory, .people, .snapshot, .undo, .env, .app, .agent => false,
             };
         }
     };
@@ -380,7 +384,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "undo", "env", "app", "agent", "trigger", "workflow", "mcp", "doctor", "report" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "people", "snapshot", "undo", "env", "app", "agent", "trigger", "workflow", "mcp", "doctor", "report" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -399,6 +403,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "brief")) return briefCmd(app, rest);
     if (eql(cmd, "task")) return taskCmd(app, rest);
     if (eql(cmd, "memory")) return memoryCmd(app, rest);
+    if (eql(cmd, "people")) return peopleCmd(app, rest);
     if (eql(cmd, "snapshot")) return snapshotCmd(app, rest);
     if (eql(cmd, "undo")) return undoCmd(app, rest);
     if (eql(cmd, "env")) return envCmd(app, rest);
@@ -1267,6 +1272,44 @@ fn memoryCmd(app: *App, args: []const []const u8) !Exit {
     const c = try app.open(.memory);
     defer c.close();
     try outPrint(app.io, "{s}\n", .{try c.command(app.arena, text)});
+    return .ok;
+}
+
+const people_usage = "usage: harness people list | people show NAME | people import FILE.vcf";
+
+/// Whether a `harness people` line has what its action takes.
+fn peopleArgsOk(rest: []const []const u8) bool {
+    if (rest.len == 0) return false;
+    if (eql(rest[0], "list")) return rest.len == 1;
+    if (eql(rest[0], "show")) return rest.len >= 2;
+    if (eql(rest[0], "import")) return rest.len == 2;
+    return false;
+}
+
+/// `harness people list | show NAME | import FILE.vcf`: the chat's
+/// /people (every line) and /person; an import reads the file here
+/// (`\r\n` or `\n` line ends) into the book.
+fn peopleCmd(app: *App, args: []const []const u8) !Exit {
+    if (!peopleArgsOk(args)) {
+        complain(people_usage, .{});
+        return .usage;
+    }
+    var text: []const u8 = "";
+    if (eql(args[0], "import")) {
+        text = Io.Dir.cwd().readFileAlloc(app.io, args[1], app.arena, .limited(32 << 20)) catch |e| {
+            complain("can't read {s}: {s}", .{ args[1], @errorName(e) });
+            return .failed;
+        };
+    }
+    const c = try app.open(.people);
+    defer c.close();
+    const out = if (eql(args[0], "list"))
+        try c.people.listing(app.arena, std.math.maxInt(usize))
+    else if (eql(args[0], "show"))
+        try c.people.cardText(app.arena, try std.mem.join(app.arena, " ", args[1..]))
+    else
+        try c.peopleImport(app.arena, std.fs.path.basename(args[1]), text);
+    try outPrint(app.io, "{s}\n", .{out});
     return .ok;
 }
 
@@ -2199,6 +2242,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     if (eql(cmd, "mcp")) return if (mcpArgsOk(rest)) null else mcp_usage;
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
+    if (eql(cmd, "people")) return if (peopleArgsOk(rest)) null else people_usage;
     if (eql(cmd, "undo")) return if (rest.len == 1 and (std.fmt.parseInt(u64, rest[0], 10) catch null) != null) null else undo_usage;
     if (eql(cmd, "env")) return if (envArgsOk(rest)) null else env_usage;
     if (eql(cmd, "login")) {
@@ -2674,6 +2718,12 @@ test {
     _ = @import("household.zig");
     _ = @import("butler.zig");
     _ = @import("doctor.zig");
+    _ = @import("people.zig");
+}
+
+test "harness_people_takes_list_show_and_import" {
+    for ([_][]const []const u8{ &.{ "people", "list" }, &.{ "people", "show", "Ola" }, &.{ "people", "show", "Ola", "Kowalska" }, &.{ "people", "import", "contacts.vcf" } }) |ok| try std.testing.expect(badArgs(ok) == null);
+    for ([_][]const []const u8{ &.{"people"}, &.{ "people", "list", "x" }, &.{ "people", "show" }, &.{ "people", "import" }, &.{ "people", "import", "a.vcf", "b.vcf" }, &.{ "people", "rm", "Ola" } }) |bad| try std.testing.expectEqualStrings(people_usage, badArgs(bad).?);
 }
 
 test "a_line_of_ctrl_d_leaves_the_chat_in_a_windows_console" {

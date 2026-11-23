@@ -46,6 +46,7 @@ const wstate = @import("wstate.zig");
 const voice_mod = @import("voice.zig");
 const quiet_mod = @import("quiet.zig");
 const household = @import("household.zig");
+const people_mod = @import("people.zig");
 const speech = @import("speech.zig");
 const voiceagent = @import("voiceagent.zig");
 const butler = @import("butler.zig");
@@ -574,6 +575,11 @@ pub const Core = struct {
     speech_busy: std.atomic.Value(bool),
     /// Speech's calls waiting for the owner (state/room-asks).
     room_asks: household.Asks,
+    /// The people the owner deals with (`state/people/`, what of them was
+    /// said in `state/people-told`).
+    people: people_mod.Book,
+    /// The day's pass over them is going, on a thread of its own.
+    people_running: std.atomic.Value(bool),
     /// The events triggers' `announce` said lately ("TRIGGER\x00ID", the
     /// last 256): a retry over the same events says nothing again.
     announced: std.ArrayList([]u8),
@@ -800,6 +806,10 @@ pub const Core = struct {
         c.member_asks = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "member-asks" }));
         errdefer c.member_asks.deinit();
         c.member_asks.load() catch |e| c.log.write(.config, false, .{ .event = "member asks not read", .why = @errorName(e) }) catch {};
+        c.people = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "people" }), try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "people-told" }));
+        errdefer c.people.deinit();
+        c.people.load() catch |e| c.log.write(.config, false, .{ .event = "people not read", .why = @errorName(e) }) catch {};
+        c.people_running = .init(false);
         c.voice_agent = null;
         @memset(&c.voice_note_buf, 0);
         c.voice_note_len = 0;
@@ -910,7 +920,7 @@ pub const Core = struct {
         if (c.worker) |w| w.join();
         // no speech from now on; its requests going end (their runs stopped)
         c.stopVoiceAgent();
-        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
@@ -923,6 +933,7 @@ pub const Core = struct {
         c.members.deinit();
         c.member_asks.deinit();
         c.room_asks.deinit();
+        c.people.deinit();
         c.speech_contexts.deinit();
         for (c.announced.items) |x| c.gpa.free(x);
         c.announced.deinit(c.gpa);
@@ -4865,6 +4876,8 @@ pub const Core = struct {
         run.desk = c.desk();
         run.wdesk = c.wfDesk();
         run.edesk = c.envDesk();
+        // the people the owner deals with: only where only the owner reads
+        if (c.ownConversation(conv)) run.people = &c.people;
         var notify: Notify = .{ .core = c, .conv = conv };
         run.notice = .{ .ctx = &notify, .say = Notify.say };
         var here: [agents_name_max]u8 = undefined;
@@ -5319,6 +5332,11 @@ pub const Core = struct {
     const memory_prompt =
         \\From the conversation below, list at most 5 lasting facts about the owner or their wishes that would help in later conversations: preferences, standing instructions, projects, people. One per line, each starting with "- ". Leave out passing details, anything already obvious, and anything already in memory. If there is nothing worth keeping, answer NONE.
     ;
+    /// In the owner's own conversations: the people they deal with too,
+    /// in lines of their own (people.zig).
+    const memory_people_prompt =
+        \\From the conversation below, list at most 5 lasting facts about the owner or their wishes that would help in later conversations: preferences, standing instructions, projects. One per line, each starting with "- ". Leave out passing details, anything already obvious, and anything already in memory. If there is nothing worth keeping, answer NONE.
+    ++ people_mod.writer_prompt;
     /// Most of the conversation one writer call reads; the newest turns are
     /// kept.
     const memory_transcript_max = 60_000;
@@ -5381,6 +5399,13 @@ pub const Core = struct {
                 try msg.print(a, "- {s}\n", .{line});
             }
         }
+        // the people the owner deals with: from their own words where only
+        // they read, never a member's (not private: those are not read)
+        const with_people = c.peopleFrom(x);
+        if (with_people) {
+            const names = c.people.knownNames(a, 4000) catch "";
+            if (names.len > 0) try msg.print(a, "{s}{s}", .{ if (msg.items.len > 0) "\n" else "", names });
+        }
         if (msg.items.len > 0) try msg.append(a, '\n');
         try msg.appendSlice(a, "The conversation:\n");
         var j = parts.items.len;
@@ -5390,7 +5415,7 @@ pub const Core = struct {
         }
         var client = try c.modelClient(c.cfg.model.memory_model, 1024);
         defer client.deinit();
-        const reply = client.send(a, memory_prompt, &.{.{ .role = .user, .blocks = &.{.{ .text = msg.items }} }}, &.{}) catch |e| {
+        const reply = client.send(a, if (with_people) memory_people_prompt else memory_prompt, &.{.{ .role = .user, .blocks = &.{.{ .text = msg.items }} }}, &.{}) catch |e| {
             // the same turns are read again next time
             try c.log.write(.model, false, .{ .run = "memory writer", .result = @errorName(e), .provider = client.provider });
             return;
@@ -5400,8 +5425,13 @@ pub const Core = struct {
         const out = try reply.text(a);
         var it = std.mem.splitScalar(u8, out, '\n');
         var n: usize = 0;
+        var facts: std.ArrayList(people_mod.Fact) = .empty;
         while (it.next()) |line| {
             const l = std.mem.trim(u8, line, " \t\r");
+            if (with_people) if (people_mod.writerFact(l)) |fact| {
+                try facts.append(a, fact);
+                continue;
+            };
             if (!std.mem.startsWith(u8, l, "- ") or n >= 5) continue;
             // switched on while the writer's call ran
             if (c.convPrivate(x.name)) break;
@@ -5420,6 +5450,34 @@ pub const Core = struct {
             };
             if (note) |text| c.sayIn(x.name, text);
         }
+        // switched on while the writer's call ran: nothing of it is kept
+        if (facts.items.len > 0 and c.peopleFrom(x)) {
+            const said_on = if (x.last_owner_s > 0) x.last_owner_s else c.now();
+            const notes = c.people.fromWriter(a, facts.items, c.peopleDay(said_on)) catch |e| blk: {
+                c.log.write(.memory, false, .{ .event = "people not written", .why = @errorName(e) }) catch {};
+                break :blk &.{};
+            };
+            try c.log.write(.memory, false, .{ .event = "people", .facts = facts.items.len, .lines = notes.len, .by = "memory writer" });
+            for (notes) |text| c.sayIn(x.name, text);
+        }
+    }
+
+    /// Whether the memory writer may note people from context `x`: the
+    /// owner's own (not a member's), in a conversation only they read, not
+    /// private.
+    fn peopleFrom(c: *Core, x: *const Context) bool {
+        if (std.mem.startsWith(u8, x.agent, "member:")) return false;
+        if (c.convPrivate(x.name)) return false;
+        return c.ownConversation(x.name);
+    }
+
+    /// Whether only the owner reads conversation `conv` (main before an
+    /// owner is paired, and the terminal, too).
+    fn ownConversation(c: *Core, conv: []const u8) bool {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        if (c.convs.find(conv)) |e| return e.audience == .own;
+        return std.mem.eql(u8, conv, "main") or std.mem.eql(u8, conv, "terminal");
     }
 
     fn noticeSay(ctx: *anyopaque, text: []const u8) void {
@@ -5546,6 +5604,8 @@ pub const Core = struct {
         if (c.poller_on) c.startPoller(now_s);
         // the daily summaries, where triggers are polled, on a thread of their own
         if (c.poller_on) c.summariesDue(now_s);
+        // birthdays, anniversaries, keeping in touch: once a day from 09:00
+        if (c.poller_on) c.peopleDue(now_s);
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
         c.noteUrgent();
@@ -6787,6 +6847,142 @@ pub const Core = struct {
     fn conversationIsPrivate(ctx: *anyopaque, name: []const u8) bool {
         const c: *Core = @ptrCast(@alignCast(ctx));
         return c.convPrivate(name);
+    }
+
+    // ---- people (the butler's duties, section 3) ----
+
+    /// For the diary's meeting preparation: what is known of the
+    /// attendees harness knows (by email, or their whole name), a line
+    /// each; "" for none. Only for posts to the owner's own conversations.
+    pub fn peopleForMeeting(c: *Core, a: std.mem.Allocator, attendees: []const people_mod.Attendee) ![]const u8 {
+        return c.people.meetingNote(a, attendees, c.peopleDay(c.now()));
+    }
+
+    /// `harness people import FILE.vcf`: the cards into the book, said in a line.
+    pub fn peopleImport(c: *Core, a: std.mem.Allocator, file: []const u8, text: []const u8) ![]const u8 {
+        const got = try c.people.importVcf(a, text, c.peopleDay(c.now()));
+        try c.log.write(.config, false, .{ .event = "people imported", .new = got.new, .updated = got.updated, .same = got.same, .skipped = got.skipped });
+        return got.text(a, file);
+    }
+
+    /// The owner's day number at `now_s`.
+    fn peopleDay(c: *const Core, now_s: i64) i64 {
+        return @divFloor(now_s + @as(i64, c.cfg.chat.utc_offset) * 60, 86400);
+    }
+
+    /// From 09:00 the owner's time, once a day.
+    fn peopleIsDue(c: *Core, now_s: i64) bool {
+        if (c.localMinutes(now_s) < people_mod.day_minute) return false;
+        return c.people.plannedThrough() < c.peopleDay(now_s);
+    }
+
+    /// The day's pass, on a thread of its own (a gift idea waits on a
+    /// search and a model).
+    fn peopleDue(c: *Core, now_s: i64) void {
+        if (c.restarting.load(.acquire) or !c.peopleIsDue(now_s)) return;
+        if (c.people_running.swap(true, .acq_rel)) return;
+        const th = std.Thread.spawn(.{}, peopleThread, .{c}) catch {
+            c.people_running.store(false, .release);
+            return;
+        };
+        th.detach();
+    }
+
+    fn peopleThread(c: *Core) void {
+        defer c.people_running.store(false, .release);
+        c.peopleNow();
+    }
+
+    /// What the day brings of the people (people.Plan): a line each, a
+    /// week line with a gift idea; said once (`state/people-told`), then
+    /// posted to main as a schedule's post (quiet hours hold it).
+    fn peopleNow(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const plan = (c.people.planDay(a, c.peopleDay(c.now())) catch |e| {
+            c.log.write(.chat, false, .{ .event = "people not read", .why = @errorName(e) }) catch {};
+            return;
+        }) orelse return;
+        var lines: std.ArrayList([]const u8) = .empty;
+        for (plan.lines) |l| {
+            const idea = if (l.kind == .week) c.giftIdea(a, l) else null;
+            lines.append(a, people_mod.lineText(a, l, idea) catch continue) catch return;
+        }
+        // kept before it is said: a crash never says it twice
+        c.people.markTold(plan) catch |e| {
+            c.log.write(.chat, false, .{ .event = "people not written", .why = @errorName(e) }) catch {};
+            return;
+        };
+        if (lines.items.len == 0) return;
+        c.log.write(.chat, false, .{ .event = "people", .lines = lines.items.len }) catch {};
+        c.postPeople(a, std.mem.join(a, "\n", lines.items) catch return);
+    }
+
+    /// A people post to main, as a schedule's (`schedule:people`): held in
+    /// quiet hours; one that does not get through is kept to send again.
+    fn postPeople(c: *Core, a: std.mem.Allocator, text: []const u8) void {
+        const by = "schedule:people";
+        const private = c.convPrivate("main");
+        if (c.quietEnd(by)) |_| held: {
+            const masked = c.masks.scrubAlloc(a, text) catch break :held;
+            const id = c.quiet.hold(.{ .at = c.now(), .conv = "main", .by = by, .text = masked, .private = private }) catch |e| {
+                c.log.write(.chat, false, .{ .event = "not held", .conversation = "main", .by = by, .why = @errorName(e) }) catch {};
+                break :held;
+            };
+            c.log.write(.chat, false, .{ .event = "held", .id = id, .conversation = "main", .by = by }) catch {};
+            return;
+        }
+        _ = c.sendText("main", text) catch |e| {
+            c.log.write(.chat, false, .{ .event = "people not delivered", .why = whyUndelivered(e) }) catch {};
+            _ = c.keepDelivery(.{ .to = "main", .text = text, .retry = e != error.NoChannel, .who = .{ .by = by, .agent = "" }, .label = "people", .private = private });
+            return;
+        };
+        c.touch("main");
+    }
+
+    /// A gift idea for week line `l`: a search for its one interest (as a
+    /// call of `schedule:people`, the gate deciding it), then one model
+    /// call over the preferences and what was found, never told the name,
+    /// the relation or the date. Null: no interest, the search refused or
+    /// failed, or no idea.
+    fn giftIdea(c: *Core, a: std.mem.Allocator, l: people_mod.Line) ?[]const u8 {
+        const interest = l.interest orelse return null;
+        const by = "schedule:people";
+        const private = c.convPrivate("main");
+        const query = people_mod.giftQuery(a, interest) catch return null;
+        const d = blk: {
+            c.lock.lockUncancelable(c.io);
+            defer c.lock.unlock(c.io);
+            break :blk c.gate.decide(a, .search, query, c.now(), .{ .scheduled = true, .who = .{ .by = by, .agent = "" } });
+        };
+        c.log.write(.gate, private, .{ .run = "people", .by = by, .tool = "search", .decision = @tagName(d.action), .why = d.why, .arg = query }) catch {};
+        if (d.action != .allow) return null;
+        var input: std.ArrayList(u8) = .empty;
+        input.appendSlice(a, "{\"query\":") catch return null;
+        util.jsonString(&input, a, query) catch return null;
+        input.append(a, '}') catch return null;
+        const out = tools.run(.{
+            .gpa = c.gpa,
+            .io = c.io,
+            .workspace = c.workspace,
+            .secrets = c.masks.snapshot(a) catch c.secret_list,
+            .search_url = c.cfg.search.url,
+            .search_key = c.secrets.search,
+            .stop = &c.stop,
+            .deadline_s = util.nowSeconds(c.io) + 30,
+        }, a, .search, input.items) catch return null;
+        c.log.write(.tool, private, .{ .run = "people", .by = by, .tool = "search", .arg = query, .is_error = out.is_error, .output = out.text, .bytes = out.text.len }) catch {};
+        if (out.is_error) return null;
+        var client = c.modelClient(c.cfg.model.memory_model, 400) catch return null;
+        defer client.deinit();
+        const ask = people_mod.giftAsk(a, l, out.text) catch return null;
+        const reply = client.send(a, people_mod.gift_prompt, &.{.{ .role = .user, .blocks = &.{.{ .text = ask }} }}, &.{}) catch |e| {
+            c.log.write(.model, false, .{ .run = "people gift idea", .result = @errorName(e), .provider = client.provider }) catch {};
+            return null;
+        };
+        c.log.write(.model, false, .{ .run = "people gift idea", .result = "ok", .provider = client.provider, .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens }) catch {};
+        return people_mod.ideaOf(reply.text(a) catch return null);
     }
 
     /// The name (in `buf`) of an event trigger due at `now_s`, not paused.
@@ -9270,6 +9466,7 @@ pub const Core = struct {
         \\/conversation add NAME: sent in a group, the agent may post there
         \\/session [N]: the steps behind the last answer here (N runs back)
         \\/history WORDS: earlier turns with every word, newest first
+        \\/people: the people you deal with; /person NAME: what is known of one
         \\/apps: the apps, with their links while the app server runs
         \\/app approve NAME: serve an app as its files are now
         \\/app rm NAME: remove an app, its data and its versions
@@ -9311,6 +9508,8 @@ pub const Core = struct {
         if (eql(u8, cmd, "/help") or eql(u8, cmd, "/start")) return help_text;
         if (eql(u8, cmd, "/pair")) return "Already paired.";
         if (eql(u8, cmd, "/members")) return c.membersText(a);
+        if (eql(u8, cmd, "/people")) return c.people.listing(a, 100);
+        if (eql(u8, cmd, "/person")) return if (rest.len == 0) "Use /person NAME." else c.people.cardText(a, rest);
         if (eql(u8, cmd, "/setup")) return c.setupCommand(a, conv, rest);
         if (eql(u8, cmd, "/member")) return c.memberCommand(a, rest);
         if (eql(u8, cmd, "/join")) return "That code is for the person joining: they send /join CODE to the bot from their own account.";
@@ -21444,4 +21643,256 @@ test "the_smoke_routine_says_it_everywhere_and_escalates" {
     // nothing acted on anything
     const lt = try logText(&f);
     try t.expect(std.mem.indexOf(u8, lt, "home__home_set") == null and std.mem.indexOf(u8, lt, "home__home_guarded") == null);
+}
+
+// ---- people (the butler's duties, section 3) ----
+
+/// A day number's 09:30 (UTC, the tests' owner time).
+fn peopleMorning(y: i64, m: u8, d: u8) i64 {
+    return util.daysFromCivil(y, m, d) * 86400 + 9 * 3600 + 1800;
+}
+
+/// The owner's sister, as the book holds her.
+fn addSister(f: *Fix) !void {
+    const a = f.e.arena.allocator();
+    const day = util.daysFromCivil(2027, 1, 10);
+    for ([_][2][]const u8{ .{ "called", "Ola" }, .{ "relation", "sister" }, .{ "birthday", "1989-11-28" }, .{ "preference", "allergic to nuts" }, .{ "preference", "likes Polish poetry" }, .{ "phone", "+48 600 100 200" } }) |x| {
+        const n = try f.core.people.note(a, "Ola Kowalska", x[0], x[1], day);
+        try t.expect(n.ok);
+    }
+}
+
+fn withCalendar(f: *Fix) !void {
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[cal]\ncommand = \"{s}\" --mcp --cal\n", .{fake}) });
+    // its reads, as the calendar's setup allows them
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp cal/cal_event *\nallow mcp cal/cal_agenda *\n", .flags = .{ .permissions = util.private_file } });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+}
+
+test "people_tool_only_in_the_owners_own_conversations" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "family-plans", 5020);
+    try addGroup(&f, "family", -100555);
+    try f.e.script(1, model.textReply("hi"));
+    f.core.chatTurn("hello");
+    try expectHas(try f.e.request(1), "\"name\":\"people\"");
+    // a topic of the owner's chat is theirs too
+    try f.e.script(2, model.textReply("hi"));
+    f.core.chatTurnIn("family-plans", "hello");
+    try expectHas(try f.e.request(2), "\"name\":\"people\"");
+    // where others read, never (a test's turn there: its reply, a post
+    // others read, is asked; nobody answers here)
+    f.core.questions_closed.store(true, .release);
+    try f.e.script(3, model.textReply("hi"));
+    f.core.chatTurnIn("family", "hello");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "\"name\":\"people\"") == null);
+}
+
+test "members_and_speech_never_see_people" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addSister(&f);
+    try joinMember(&f, "anna", 77);
+    try f.e.script(1, model.textReply("I don't know."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(fromAccount(77, "when is Ola's birthday?"));
+    try f.rec.waitIn("anna", "I don't know.");
+    const req = try f.e.request(1);
+    for ([_][]const u8{ "\"name\":\"people\"", "Kowalska", "1989", "Polish poetry" }) |never| try t.expect(std.mem.indexOf(u8, req, never) == null);
+    // a member's /people and /person are refused like any command of theirs
+    try f.core.handleIncoming(fromAccount(77, "/people"));
+    try f.core.handleIncoming(fromAccount(77, "/person Ola"));
+    try f.rec.waitIn("anna", "Commands are for the owner");
+    try t.expectEqual(0, f.rec.countIn("anna", "Kowalska"));
+    // speech in a room: not offered, nothing of hers in the request
+    const port = try startSpeech(&f);
+    try f.e.script(2, model.textReply("I can't say."));
+    _ = try spokenOf(&f, try speakIn(&f, port, "Kitchen", "en", "", "when is Ola's birthday?", false));
+    const sreq = try f.e.request(2);
+    for ([_][]const u8{ "\"name\":\"people\"", "Kowalska", "1989", "Polish poetry" }) |never| try t.expect(std.mem.indexOf(u8, sreq, never) == null);
+}
+
+test "the_writer_recognises_people_in_the_owners_own_conversations" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.core.fixed_now = peopleMorning(2027, 3, 2);
+    try f.e.script(1, model.textReply("Nice."));
+    f.core.chatTurn("my sister Ola's birthday is on 28 November and she loves Polish poetry; I called her yesterday");
+    try f.e.script(2, model.textReply("- The owner plays chess on Sundays\\nperson: Ola | relation | sister\\nperson: Ola | called | my sister\\nperson: Ola | birthday | 11-28\\nperson: Ola | preference | loves Polish poetry\\nperson: Ola | in touch | yes"));
+    try f.core.writeMemories();
+    // the writer is asked for people's lines
+    try expectHas(try f.e.request(2), "person: NAME | FIELD | VALUE");
+    const p = (try f.core.people.get(a, "my sister")).?;
+    try t.expectEqualStrings("Ola", p.name);
+    try t.expectEqualStrings("sister", p.relation);
+    try t.expectEqual(people_mod.Date{ .m = 11, .d = 28 }, p.birthday.?);
+    try t.expectEqual(util.daysFromCivil(2027, 3, 2), p.in_touch.?);
+    try f.rec.waitIn("main", "Noted about Ola: relation sister; called my sister; birthday 28 November; loves Polish poetry. (/person Ola)");
+    // the owner's own facts still go to memory; hers don't
+    try f.rec.waitIn("main", "Saved to memory: The owner plays chess on Sundays");
+    try t.expectEqual(1, f.core.mem.items.items.len);
+    // the next time, the writer knows her name
+    try f.e.script(3, model.textReply("ok"));
+    f.core.chatTurn("Ola is coming on Friday");
+    try f.e.script(4, model.textReply("NONE"));
+    try f.core.writeMemories();
+    try expectHas(try f.e.request(4), "People known:\\n- Ola (sister), called my sister");
+}
+
+test "no_people_from_shared_private_or_members_turns" {
+    const lines = "- The owner likes tea\\nperson: Ola | relation | sister";
+    {
+        // a conversation others read
+        var f: Fix = undefined;
+        try f.init("", "", "");
+        defer f.deinit();
+        try addGroup(&f, "family", -100555);
+        f.core.questions_closed.store(true, .release);
+        try f.e.script(1, model.textReply("hi"));
+        f.core.chatTurnIn("family", "my sister Ola is visiting");
+        try f.e.script(2, model.textReply(lines));
+        try f.core.writeMemories();
+        try t.expect(std.mem.indexOf(u8, try f.e.request(2), "person: NAME") == null);
+        try t.expectEqual(0, f.core.people.count());
+    }
+    {
+        // private switched on before the writer read it
+        var f: Fix = undefined;
+        try f.init("", "", "");
+        defer f.deinit();
+        try f.e.script(1, model.textReply("hi"));
+        f.core.chatTurn("my sister Ola is visiting");
+        try f.core.handleText("/private on");
+        try f.e.script(2, model.textReply(lines));
+        try f.core.writeMemories();
+        try t.expectEqual(0, f.core.people.count());
+    }
+    {
+        // a household member's words
+        var f: Fix = undefined;
+        try f.init("", "", "");
+        defer f.deinit();
+        try joinMember(&f, "anna", 77);
+        try f.e.script(1, model.textReply("hi"));
+        try f.core.startWorker();
+        try f.core.handleIncoming(fromAccount(77, "my sister Ola is visiting"));
+        try f.rec.waitIn("anna", "hi");
+        try f.e.script(2, model.textReply(lines));
+        try f.core.writeMemories();
+        try t.expectEqual(0, f.core.people.count());
+    }
+}
+
+test "calendar_attendees_become_people" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withCalendar(&f);
+    try f.e.script(1, model.toolReply("c1", "cal__cal_event", "{\"id\":\"e1\"}"));
+    try f.e.script(2, model.textReply("Dinner on Friday with Ola and Marek."));
+    f.core.chatTurn("what's on Friday evening?");
+    try f.rec.waitIn("main", "From your calendar, now in people: Ola Kowalska, Marek Nowak. (/people)");
+    try t.expectEqualStrings("ola@example.com", (try f.core.people.get(a, "Ola Kowalska")).?.emails.items[0]);
+    try t.expect((try f.core.people.get(a, "owner@example.com")) == null);
+    try t.expectEqual(2, f.core.people.count());
+    // in a private conversation the calendar adds no one
+    try f.core.handleText("/private on");
+    try f.e.script(3, model.toolReply("c2", "cal__cal_event", "{\"id\":\"e2\"}"));
+    try f.e.script(4, model.textReply("A call on Saturday."));
+    f.core.chatTurn("and Saturday?");
+    try t.expectEqual(2, f.core.people.count());
+}
+
+test "people_and_person_commands" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, "/people"), "No people yet."));
+    try addSister(&f);
+    try t.expectEqualStrings("1 person:\nOla Kowalska (sister): birthday 28 November\n", try f.core.command(a, "/people"));
+    const card = try f.core.command(a, "/person ola");
+    for ([_][]const u8{ "Ola Kowalska (sister)", "Birthday: 28 November 1989", "Preferences: allergic to nuts; likes Polish poetry", "Phone: +48 600 100 200", "File: state/people/ola-kowalska.txt" }) |want| try expectHas(card, want);
+    try t.expectEqualStrings("No one called Basia. /people lists everyone.", try f.core.command(a, "/person Basia"));
+    try t.expectEqualStrings("Use /person NAME.", try f.core.command(a, "/person"));
+    try expectHas(try f.core.command(a, "/help"), "/people: the people you deal with");
+}
+
+test "a_birthday_week_line_has_a_gift_idea_from_a_search" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addSister(&f);
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "search.json", .data = "{\"web\":{\"results\":[{\"title\":\"Map: Collected and Last Poems\",\"url\":\"https://example.com/map\",\"description\":\"Wisława Szymborska's poems.\"}]}}" });
+    try f.e.script(1, model.textReply("Map: Collected and Last Poems by Szymborska, https://example.com/map"));
+    f.core.fixed_now = peopleMorning(2027, 11, 21);
+    f.core.peopleNow();
+    try f.rec.waitIn("main", "Ola's birthday is in a week, on Sunday 28 November (turns 38). Gift idea: Map: Collected and Last Poems by Szymborska, https://example.com/map");
+    // the model was asked without her name; the search carried one interest
+    const req = try f.e.request(1);
+    for ([_][]const u8{ "likes Polish poetry", "allergic to nuts", "Map: Collected and Last Poems", "Nothing is bought" }) |want| try expectHas(req, want);
+    for ([_][]const u8{ "Ola", "Kowalska", "sister", "1989", "+48" }) |never| try t.expect(std.mem.indexOf(u8, req, never) == null);
+    const lt = try logText(&f);
+    try expectHas(lt, "\"by\":\"schedule:people\",\"tool\":\"search\",\"decision\":\"allow\"");
+    try expectHas(lt, "\"arg\":\"gift ideas for someone who likes Polish poetry\"");
+    // once a day: nothing more today, and no model call
+    f.core.peopleNow();
+    try t.expectEqual(1, f.rec.count("Ola's birthday"));
+    try t.expectEqual(1, f.e.server.modelRequests());
+}
+
+test "the_birthday_reminder_and_keep_in_touch_on_the_tick" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addSister(&f);
+    // not before 09:00 the owner's time
+    try t.expect(!f.core.peopleIsDue(util.daysFromCivil(2027, 11, 28) * 86400 + 8 * 3600 + 59 * 60));
+    f.core.fixed_now = util.daysFromCivil(2027, 11, 28) * 86400 + 9 * 3600;
+    try t.expect(f.core.peopleIsDue(f.core.fixed_now.?));
+    f.core.peopleDue(f.core.fixed_now.?);
+    try f.rec.waitIn("main", "Today is Ola's birthday (38). Phone +48 600 100 200.");
+    var waited: u32 = 0;
+    while (f.core.people_running.load(.acquire) and waited < 5000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    try t.expect(!f.core.peopleIsDue(f.core.fixed_now.?));
+    // keeping in touch: told after the time asked
+    _ = try f.core.people.note(a, "Marek", "keep in touch", "2 weeks", util.daysFromCivil(2027, 11, 28));
+    f.core.fixed_now = peopleMorning(2027, 12, 12);
+    f.core.peopleNow();
+    try f.rec.waitIn("main", "It's been 2 weeks since you asked to keep in touch with Marek (28 November).");
+    try t.expectEqual(0, f.e.server.modelRequests());
+}
+
+test "people_lines_wait_in_quiet_hours" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 06:00-12:00\n", "", "");
+    defer f.deinit();
+    try addSister(&f);
+    f.core.fixed_now = peopleMorning(2027, 11, 28);
+    f.core.peopleNow();
+    try t.expectEqual(0, f.rec.count("Ola's birthday"));
+    try t.expectEqual(1, f.core.quiet.count());
+    f.core.fixed_now = util.daysFromCivil(2027, 11, 28) * 86400 + 12 * 3600;
+    f.core.quietDue(f.core.fixed_now.?);
+    try f.rec.waitIn("main", "During quiet hours (06:00–12:00):\n09:30 Today is Ola's birthday (38). Phone +48 600 100 200.");
+}
+
+test "meeting_note_for_the_diary" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addSister(&f);
+    f.core.fixed_now = peopleMorning(2027, 11, 20);
+    try t.expectEqualStrings("Ola Kowalska (sister): allergic to nuts; likes Polish poetry; birthday 28 November, in 8 days.", try f.core.peopleForMeeting(a, &.{ .{ .name = "Ola Kowalska", .email = "" }, .{ .name = "Someone Else", .email = "someone@example.com" } }));
+    try t.expectEqualStrings("", try f.core.peopleForMeeting(a, &.{.{ .name = "Someone Else" }}));
 }
