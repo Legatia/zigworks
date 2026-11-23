@@ -20,6 +20,9 @@ pub const Kind = enum {
     fan,
     scene,
     media,
+    /// A Home Assistant Assist satellite (a voice speaker): it may only be
+    /// given a message to say (the announce tool).
+    satellite,
 
     pub fn parse(s: []const u8) ?Kind {
         return std.meta.stringToEnum(Kind, s);
@@ -38,7 +41,8 @@ pub const Kind = enum {
             .sensor => &.{},
             .fan => &.{ .on, .off, .speed },
             .scene => &.{.activate},
-            .media => &.{ .play, .pause, .volume },
+            .media => &.{ .play, .pause, .volume, .announce },
+            .satellite => &.{.announce},
         };
     }
 
@@ -53,6 +57,7 @@ pub const Kind = enum {
             .alarm => "alarms",
             .scene => "scenes",
             .media => "media players",
+            .satellite => "voice satellites",
             else => null,
         };
     }
@@ -80,6 +85,8 @@ pub const Action = enum {
     play,
     pause,
     volume,
+    /// A message said on a speaker: only through the announce tool.
+    announce,
 
     pub fn parse(s: []const u8) ?Action {
         if (eql(s, "colour")) return .color;
@@ -276,6 +283,8 @@ pub fn fromHa(kind: Kind, v: jv.Value) Props {
             p.media = word(st);
             if (jv.num(jv.get(attrs, "volume_level"))) |x| p.volume = round1(x * 100);
         },
+        // idle, listening, processing, responding
+        .satellite => p.media = word(st),
         .sensor => {
             if (std.mem.eql(u8, domain, "binary_sensor")) {
                 const on = eql(st, "on");
@@ -363,6 +372,7 @@ fn body(a: Allocator, kind: Kind, p: Props, with_battery: bool) ![]u8 {
             if (p.media) |m| try o.appendSlice(a, m);
             if (p.volume) |v| try o.print(a, "{s}volume {s}%", .{ sep(&o), num(v) });
         },
+        .satellite => if (p.media) |m| try o.appendSlice(a, m),
         .climate => {
             if (p.temperature) |x| try o.print(a, "{s} °C", .{num(x)});
             if (p.setpoint) |x| try o.print(a, "{s}set to {s} °C", .{ sep(&o), num(x) });
@@ -403,7 +413,7 @@ pub fn headline(a: Allocator, kind: Kind, p: Props) !?[]const u8 {
         .cover => p.cover orelse if (p.position) |pos| (if (pos <= 0) "closed" else "open") else null,
         .lock => p.lock,
         .alarm => p.alarm,
-        .media => p.media,
+        .media, .satellite => p.media,
         .scene => if (p.activated) |ms| blk: {
             var tb: [20]u8 = undefined;
             break :blk try std.fmt.allocPrint(a, "ran {s}", .{when.isoTime(&tb, @divFloor(ms, 1000))});
@@ -441,6 +451,8 @@ pub fn took(action: Action, number: ?f64, text: ?[]const u8, p: Props, before: P
         .play => if (p.media) |m| eql(m, "playing") else null,
         .pause => if (p.media) |m| (eql(m, "paused") or eql(m, "idle")) else null,
         .volume => if (p.volume) |v| @abs(v - number.?) <= 2 else null,
+        // the announce tool reads a message back its own way
+        .announce => null,
     };
 }
 

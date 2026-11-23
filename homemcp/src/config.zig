@@ -7,6 +7,7 @@
 //!   mqtt = 127.0.0.1:1883          ; zigbee2mqtt: the broker
 //!   base = zigbee2mqtt             ; zigbee2mqtt: its base topic
 //!   url = http://127.0.0.1:8123    ; homeassistant: its address
+//!   tts = tts.piper                ; homeassistant: the text-to-speech a media player announces with
 //!   log = actions.jsonl            ; optional: one line per action (relative: to this file)
 //!
 //!   [limits]                       ; what the agent may choose
@@ -19,7 +20,7 @@
 //!
 //!   [device hall_light]
 //!   id = Hall light                ; zigbee2mqtt friendly name, or Home Assistant entity id
-//!   kind = light                   ; light switch plug climate cover lock alarm valve sensor fan scene media
+//!   kind = light                   ; light switch plug climate cover lock alarm valve sensor fan scene media satellite
 //!   room = Hall
 //!   alias = the stairs light       ; what people call it (more lines, or commas, for more)
 //!   allow = on, off, brightness    ; what the agent may do (seeing it is always allowed)
@@ -71,6 +72,9 @@ pub const Config = struct {
     mqtt_port: u16 = 1883,
     base: []const u8 = "zigbee2mqtt",
     url: []const u8 = "",
+    /// Home Assistant's text-to-speech entity a media player announces
+    /// with (`tts.speak`); "": media players don't announce.
+    tts: []const u8 = "",
     log_path: []const u8 = "",
     temperature: Range = .{ .min = 16, .max = 24 },
     brightness: Range = .{ .min = 1, .max = 100 },
@@ -105,6 +109,17 @@ pub const Config = struct {
     pub fn hasOrdinary(c: *const Config) bool {
         for (c.devices) |d| if (!d.guarded and d.allow.len > 0) return true;
         return false;
+    }
+
+    /// The devices that may be given a message to say (`allow` has
+    /// announce), by index, in the file's order, at most `buf.len`.
+    pub fn speakers(c: *const Config, buf: []usize) []usize {
+        var n: usize = 0;
+        for (c.devices, 0..) |d, i| if (d.allows(.announce) and n < buf.len) {
+            buf[n] = i;
+            n += 1;
+        };
+        return buf[0..n];
     }
 };
 
@@ -193,6 +208,9 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
                 c.base = std.mem.trimEnd(u8, v, "/");
             } else if (eql(k, "url")) {
                 c.url = v;
+            } else if (eql(k, "tts")) {
+                if (!std.mem.startsWith(u8, v, "tts.") or v.len == "tts.".len) return fail(diag, e.line, "tts: a text-to-speech entity, such as tts.piper");
+                c.tts = v;
             } else if (eql(k, "log")) {
                 c.log_path = v;
             } else return unknown(a, diag, e);
@@ -258,11 +276,13 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
     var devs: std.ArrayList(Device) = .empty;
     for (pend.items) |*d| {
         if (d.id.len == 0) return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}] has no id", .{d.name}));
-        const kind = model.Kind.parse(d.kind) orelse return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: kind is one of light, switch, plug, climate, cover, lock, alarm, valve, sensor, fan, scene, media", .{d.name}));
+        const kind = model.Kind.parse(d.kind) orelse return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: kind is one of light, switch, plug, climate, cover, lock, alarm, valve, sensor, fan, scene, media, satellite", .{d.name}));
         if (c.hub == .homeassistant and std.mem.indexOfScalar(u8, d.id, '.') == null)
             return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: a Home Assistant id is an entity id, such as light.hall", .{d.name}));
         if (c.hub == .zigbee2mqtt) if (kind.haOnly()) |what|
             return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: {s} need hub = homeassistant", .{ d.name, what }));
+        if (kind == .satellite and !std.mem.startsWith(u8, d.id, "assist_satellite."))
+            return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: a satellite is an assist_satellite entity, such as assist_satellite.hall", .{d.name}));
         var allow: std.ArrayList(model.Action) = .empty;
         var it = std.mem.tokenizeAny(u8, d.allow, ", \t");
         while (it.next()) |w| {
@@ -273,6 +293,9 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
             if (!ok) return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: a {s} can't {s}", .{ d.name, @tagName(kind), w }));
             try allow.append(a, act);
         }
+        // a media player says a message through Home Assistant's text-to-speech
+        if (kind == .media and c.tts.len == 0) for (allow.items) |act| if (act == .announce)
+            return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: a media player announces through Home Assistant's text-to-speech: [home] tts = tts.NAME (yours, such as tts.piper)", .{d.name}));
         var modes: std.ArrayList([]const u8) = .empty;
         var mi = std.mem.tokenizeAny(u8, d.modes, ", \t");
         while (mi.next()) |w| try modes.append(a, w);
@@ -457,4 +480,51 @@ test "mistakes are named" {
     try t.expectError(error.BadConfig, parse(arena.allocator(), "[home]\nhub = homeassistant\nurl = http://h:8123\n[device x]\nid = Hall light\nkind = light\n", &d));
     try t.expectEqualStrings("[device x]: a Home Assistant id is an entity id, such as light.hall", d.what);
     try t.expectError(error.BadConfig, parse(arena.allocator(), "[device x]\nid = X\nkind = toaster\n", &d));
+}
+
+test "speakers that may announce" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    const c = try parse(a,
+        \\[home]
+        \\hub = homeassistant
+        \\url = http://127.0.0.1:8123
+        \\tts = tts.piper
+        \\[device hall_voice]
+        \\id = assist_satellite.hall_voice
+        \\kind = satellite
+        \\room = Hall
+        \\allow = announce
+        \\[device kitchen_speaker]
+        \\id = media_player.kitchen_speaker
+        \\kind = media
+        \\room = Kitchen
+        \\allow = play, pause, announce
+        \\[device bedroom_speaker]
+        \\id = media_player.bedroom
+        \\kind = media
+        \\allow = play
+    , &d);
+    try t.expectEqualStrings("tts.piper", c.tts);
+    try t.expect(c.devices[0].allows(.announce) and c.devices[1].allows(.announce) and !c.devices[2].allows(.announce));
+    // the speakers that may announce, in the file's order
+    var buf: [8]usize = undefined;
+    const sp = c.speakers(&buf);
+    try t.expectEqual(2, sp.len);
+    try t.expectEqualStrings("hall_voice", c.devices[sp[0]].name);
+    try t.expectEqualStrings("kitchen_speaker", c.devices[sp[1]].name);
+    // a satellite is Home Assistant's, an assist_satellite, and only speaks;
+    // a media player speaks through a text-to-speech entity
+    try t.expectError(error.BadConfig, parse(a, "[device v]\nid = Hall voice\nkind = satellite\nallow = announce\n", &d));
+    try t.expectEqualStrings("[device v]: voice satellites need hub = homeassistant", d.what);
+    try t.expectError(error.BadConfig, parse(a, "[home]\nhub = homeassistant\nurl = http://h\n[device v]\nid = media_player.hall\nkind = satellite\nallow = announce\n", &d));
+    try t.expectEqualStrings("[device v]: a satellite is an assist_satellite entity, such as assist_satellite.hall", d.what);
+    try t.expectError(error.BadConfig, parse(a, "[home]\nhub = homeassistant\nurl = http://h\n[device v]\nid = assist_satellite.hall\nkind = satellite\nallow = play\n", &d));
+    try t.expectEqualStrings("[device v]: a satellite can't play", d.what);
+    try t.expectError(error.BadConfig, parse(a, "[home]\nhub = homeassistant\nurl = http://h\n[device s]\nid = media_player.hall\nkind = media\nallow = announce\n", &d));
+    try t.expectEqualStrings("[device s]: a media player announces through Home Assistant's text-to-speech: [home] tts = tts.NAME (yours, such as tts.piper)", d.what);
+    try t.expectError(error.BadConfig, parse(a, "[home]\nhub = homeassistant\nurl = http://h\ntts = piper\n[device x]\nid = light.x\nkind = light\n", &d));
+    try t.expectEqualStrings("tts: a text-to-speech entity, such as tts.piper", d.what);
 }

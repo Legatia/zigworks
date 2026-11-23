@@ -110,6 +110,22 @@ fn checkHome(a: std.mem.Allocator, io: Io, cfg: *const config.Config, hub: hub_m
         if (rooms.items.len > 0) try o.appendSlice(a, "No room\n");
         for (cfg.devices, 0..) |dv, i| if (dv.room.len == 0) try checkLine(a, &o, if (rooms.items.len > 0) "  " else "", &dv, if (i < states.len) states[i].props else null);
     }
+    var sbuf: [64]usize = undefined;
+    const speakers = cfg.speakers(&sbuf);
+    if (speakers.len > 0) {
+        try o.appendSlice(a, "Speakers that may announce: ");
+        for (speakers, 0..) |i, j| {
+            const dv = &cfg.devices[i];
+            try o.print(a, "{s}{s}", .{ if (j > 0) ", " else "", dv.name });
+            if (dv.room.len > 0 or dv.kind == .media) {
+                try o.appendSlice(a, " (");
+                if (dv.room.len > 0) try o.appendSlice(a, dv.room);
+                if (dv.kind == .media) try o.print(a, "{s}through {s}", .{ if (dv.room.len > 0) ", " else "", cfg.tts });
+                try o.appendSlice(a, ")");
+            }
+        }
+        try o.appendSlice(a, ".\n");
+    }
     if (cfg.people.len > 0) {
         try o.appendSlice(a, "People: ");
         const where = hub.people(a) catch null;
