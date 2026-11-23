@@ -62,6 +62,10 @@ pub const Question = struct {
     /// The asking run's own stop flag (a delegated run has one of its own,
     /// which `/stop NAME` sets alone): once set, its item is withdrawn.
     stop: ?*const std.atomic.Value(bool) = null,
+    /// An approval's call: its gate kind and argument (a household
+    /// member's asker keeps them to make the call on the owner's yes).
+    tool: ?gate.Tool = null,
+    arg: []const u8 = "",
 
     pub const Kind = enum { approval, question, draft };
 };
@@ -2515,6 +2519,8 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             .label = r.label,
             .private = r.isPrivate(),
             .stop = r.env.stop,
+            .tool = tool,
+            .arg = arg,
         });
         if (extra.item) |p| p.* = got.item;
         var ans = got.answer;
@@ -2544,7 +2550,7 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             .full => why = if (got.text.len > 0) got.text else "no place in the inbox until the turn's end",
             .answered => why = try ownerSaid(a, "not an answer to this question", "", got.item),
             .deferred => {
-                why = try ownerSaid(a, "waits for the owner in the inbox", "", got.item);
+                why = try ownerSaid(a, "waits for the owner in the inbox", got.text, got.item);
                 logged = .ask;
             },
         }

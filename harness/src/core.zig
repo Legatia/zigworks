@@ -781,6 +781,7 @@ pub const Core = struct {
         c.start_edits = .empty;
         c.inbox.load(c.paths.approvals) catch |e| c.log.write(.inbox, false, .{ .event = "not read", .why = @errorName(e) }) catch {};
         c.voidRunItems();
+        c.pruneMemberAsks();
         c.loadRan();
         c.syncTrigInfo();
         // the workflow instances going, and items of none void
@@ -1666,6 +1667,9 @@ pub const Core = struct {
         run.mem = &none;
         run.history = null;
         run.context_note = household.contextNote(a, conv, c.isGroup(conv), name) catch "";
+        // a call that needs the owner becomes their item; the run goes on
+        var ask: MemberAsk = .{ .core = c, .member = name, .conv = conv };
+        run.asker = .{ .ctx = &ask, .ask = MemberAsk.ask };
         var out: RunOut = .{ .core = c, .agent = def.name, .run = &run };
         var mo: MemberOut = .{ .out = &out, .conv = conv };
         run.outbox = mo.outbox();
@@ -1673,9 +1677,232 @@ pub const Core = struct {
         defer agent.freeResult(&run, res);
         if (res.stopped or res.replied) return;
         if (res.ended_by) |why| return c.sayIn(conv, why);
-        if (res.text.len == 0) return c.sayIn(conv, "Sorry, I have no answer to that.");
+        if (res.text.len == 0) {
+            if (!ask.told) c.sayIn(conv, "Sorry, I have no answer to that.");
+            return;
+        }
         const got = agent.postReply(&run, a, res.text) catch |e| return c.sayIn(conv, std.fmt.allocPrint(a, "The answer was not posted: {s}.", .{@errorName(e)}) catch "The answer was not posted.");
         if (got.refused) |why| c.sayIn(conv, std.fmt.allocPrint(a, "The answer was not posted: {s}.", .{why}) catch "The answer was not posted.");
+    }
+
+    /// A member's run's asker (Ruling 1): the gate's ask becomes the
+    /// owner's one-tap item at once and the call stops there; the member is
+    /// told. Only an MCP call is asked (the gate refuses the rest).
+    const MemberAsk = struct {
+        core: *Core,
+        member: []const u8,
+        conv: []const u8,
+        /// The member was told the owner was asked, in this turn.
+        told: bool = false,
+
+        fn ask(ctx: *anyopaque, a: std.mem.Allocator, q: agent.Question) agent.Reply {
+            const ma: *MemberAsk = @ptrCast(@alignCast(ctx));
+            return ma.core.memberAsk(a, ma, q) catch .{ .answer = .unsent };
+        }
+    };
+
+    /// What the run's model is told of a call that went to the owner.
+    const member_told = "the member was told the owner was asked; don't say it again";
+
+    /// Makes a member's call the owner's item, shown in main (the member's
+    /// conversation is shared): "Anna asks to unlock the front door."
+    /// [Unlock] [No], no "Allow 24 h", a text reply says no and why. The
+    /// call is kept (state/member-asks) before the item is shown, so a tap
+    /// at once finds it; the member is told once it is shown.
+    fn memberAsk(c: *Core, a: std.mem.Allocator, ma: *MemberAsk, q: agent.Question) !agent.Reply {
+        const tool = q.tool orelse return .{ .answer = .unsent };
+        if (q.kind != .approval or (tool != .mcp and tool != .money)) return .{ .answer = .unsent };
+        if (c.chan == null or c.questions_closed.load(.acquire)) return .{ .answer = .unsent };
+        // the same call asked already: its item
+        if (c.member_asks.waiting(ma.member, q.arg)) |id| return .{ .answer = .deferred, .item = id, .text = member_told };
+        if (c.member_asks.countOf(ma.member) >= household.max_asks)
+            return .{ .answer = .full, .text = try std.fmt.allocPrint(a, "{d} requests of this member already wait for the owner", .{household.max_asks}) };
+        const what = try household.plainCall(a, q.arg);
+        const title = try c.masks.scrubAlloc(a, try household.question(a, ma.member, what));
+        const dry: []const u8 = if (tool == .money and c.switches.dry_run.load(.acquire)) "\nDry run is on: this call is not made." else "";
+        const body = try std.fmt.allocPrint(a, "{s}{s}", .{ title, dry });
+        // all of it is shown, or nothing is asked
+        if (body.len > inbox_mod.max_body) return .{ .answer = .full, .text = "too long to ask the owner: make the call smaller" };
+        const choices = [_]inbox_mod.Choice{ .{ .key = "once", .label = try household.yesLabel(a, q.arg) }, .{ .key = "deny", .label = "No" } };
+        c.makeRoom();
+        const id = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = try c.inbox.add(.{
+                .kind = "approval",
+                .by = q.who.by,
+                .agent = q.who.agent,
+                .rid = if (q.rid != 0) q.rid else null,
+                .run = if (q.label.len > 0) q.label else null,
+                .conversation = ma.conv,
+                .waiter = try std.fmt.allocPrint(a, "member {s}", .{ma.member}),
+                .title = firstLine(title),
+                .body = body,
+                .choices = &choices,
+                .text = .reason,
+                .expires = c.now() + @as(i64, c.cfg.limits.approval_seconds),
+            }, c.now(), c.newToken());
+            c.saveInbox();
+            c.logOpen(it);
+            break :blk it.id;
+        };
+        c.member_asks.add(.{ .item = id, .member = ma.member, .agent = q.who.agent, .conversation = ma.conv, .tool = @tagName(tool), .arg = q.arg, .what = what }) catch {
+            _ = c.settle(id, .void, .{ .text = "it could not be kept", .at = c.now(), .via = .harness });
+            return .{ .answer = .unsent, .item = id };
+        };
+        if (!c.showItem(id, null)) {
+            _ = c.settle(id, .void, .{ .text = "it could not be shown", .at = c.now(), .via = .harness });
+            return .{ .answer = .unsent, .item = id };
+        }
+        c.sayIn(ma.conv, try household.askedText(a, what));
+        ma.told = true;
+        return .{ .answer = .deferred, .item = id, .text = member_told };
+    }
+
+    /// At start: a member's call whose item is no longer open (harness
+    /// stopped between closing it and taking the call) is dropped.
+    fn pruneMemberAsks(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const ids = c.member_asks.itemsOf(a, "") catch return;
+        for (ids) |id| {
+            const waits = blk: {
+                c.inbox.mutex.lockUncancelable(c.io);
+                defer c.inbox.mutex.unlock(c.io);
+                const it = c.inbox.find(id) orelse break :blk false;
+                break :blk it.status == .open;
+            };
+            if (!waits) _ = c.member_asks.take(a, id);
+        }
+    }
+
+    /// The owner answered member call item `id`, or it expired: Yes makes
+    /// the call on a thread of its own; No and no answer are said to the
+    /// member; a void or withdrawn item says nothing (its run, or /member
+    /// rm, took it back). The call is off state/member-asks first: a crash
+    /// never makes it twice.
+    fn memberAnswered(c: *Core, id: u64) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const k = c.member_asks.take(a, id) orelse return;
+        const Got = struct { status: inbox_mod.Status, key: []const u8 = "", words: ?[]const u8 = null };
+        const got: Got = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = c.inbox.find(id) orelse return;
+            const ans = it.answer orelse break :blk .{ .status = it.status };
+            break :blk .{ .status = it.status, .key = a.dupe(u8, ans.key orelse "") catch "", .words = if (ans.text) |x| a.dupe(u8, x) catch null else null };
+        };
+        switch (got.status) {
+            .answered => if (std.mem.eql(u8, got.key, "once")) c.startMemberCall(k) else c.sayIn(k.conversation, household.noText(a, k.what, got.words) catch "The owner said no."),
+            .expired => c.sayIn(k.conversation, household.noAnswerText(a, k.what) catch "No answer from the owner in time."),
+            else => {},
+        }
+    }
+
+    /// A member's call the owner allowed, with its own arena.
+    const MemberCall = struct { arena: std.heap.ArenaAllocator, ask: household.Ask };
+
+    /// Makes an allowed member's call on a thread of its own: an MCP call
+    /// can take seconds, and the press that allowed it came on the thread
+    /// that reads Telegram. Counted as a background run (/reload, /undo and
+    /// the end wait for it).
+    fn startMemberCall(c: *Core, k: household.Ask) void {
+        const box = c.gpa.create(MemberCall) catch return c.sayIn(k.conversation, "The owner said yes, but harness could not make the call.");
+        box.arena = .init(c.gpa);
+        box.ask = household.copyAsk(box.arena.allocator(), k) catch {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return c.sayIn(k.conversation, "The owner said yes, but harness could not make the call.");
+        };
+        _ = c.bg_active.fetchAdd(1, .acq_rel);
+        const th = std.Thread.spawn(.{}, memberCallJob, .{ c, box }) catch {
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return c.sayIn(k.conversation, "The owner said yes, but harness could not make the call.");
+        };
+        th.detach();
+    }
+
+    fn memberCallJob(c: *Core, box: *MemberCall) void {
+        defer {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+        }
+        c.makeMemberCall(box.arena.allocator(), box.ask);
+    }
+
+    /// The asker of a member's call the owner allowed: the owner's yes
+    /// holds for that exact call, once; anything else is refused.
+    const MemberGo = struct {
+        arg: []const u8,
+        item: u64,
+        used: bool = false,
+
+        fn ask(ctx: *anyopaque, a: std.mem.Allocator, q: agent.Question) agent.Reply {
+            _ = a;
+            const g: *MemberGo = @ptrCast(@alignCast(ctx));
+            if (g.used or q.kind != .approval or !std.mem.eql(u8, q.arg, g.arg)) return .{ .answer = .deny, .text = "not the call the owner allowed", .item = g.item };
+            g.used = true;
+            return .{ .answer = .once, .item = g.item };
+        }
+    };
+
+    /// Makes member call `k` the owner allowed: as the member's (who
+    /// `member:NAME`), through the gate again (a deny added since stops it;
+    /// money caps and dry run apply), which takes the owner's yes for this
+    /// exact call only. What came of it is said to the member, read back
+    /// as the device or service gave it, and added to the owner's message.
+    fn makeMemberCall(c: *Core, a: std.mem.Allocator, k: household.Ask) void {
+        // /reload restarts the servers: the call waits for them
+        while (c.restarting.load(.acquire) and !c.quitting.load(.acquire)) c.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        const call = household.splitCall(k.arg) orelse return;
+        const name: ?[]const u8 = for (c.mcp_tools) |m| {
+            if (std.mem.eql(u8, m.server.name, call.server) and std.mem.eql(u8, m.tool, call.tool)) break m.def.name;
+        } else null;
+        const out: tools.Output = if (name) |n| blk: {
+            var flag: std.atomic.Value(bool) = .init(false);
+            c.register(&flag, k.agent);
+            defer c.unregister(&flag);
+            const by = std.fmt.allocPrint(a, "member:{s}", .{k.member}) catch return;
+            var def = (c.defs.get(a, k.agent) catch null) orelse agents.builtin_main;
+            def.body = household.instructions;
+            var run = c.runIn(&c.chat_client, "member call", .{ .agent = def.name, .by = by }, k.conversation, &flag);
+            run.useDefinition(def);
+            var none: memory.Store = .{ .gpa = c.gpa, .io = c.io, .dir = &.{} };
+            run.mem = &none;
+            run.history = null;
+            var go: MemberGo = .{ .arg = k.arg, .item = k.item };
+            run.asker = .{ .ctx = &go, .ask = MemberGo.ask };
+            break :blk agent.stepCall(&run, a, n, call.input) catch |e| .{ .text = @errorName(e), .is_error = true };
+        } else .{ .text = std.fmt.allocPrint(a, "{s} is not running", .{call.server}) catch "its server is not running", .is_error = true };
+        c.sayIn(k.conversation, household.yesText(a, k.what, out.text, !out.is_error) catch "The owner said yes.");
+        c.noteOnItem(a, k.item, std.fmt.allocPrint(a, "Result: {s}", .{util.cut(std.mem.trim(u8, out.text, " \t\r\n"), 600)}) catch return);
+    }
+
+    /// Adds `line` to closed item `id`'s messages, after its outcome; said
+    /// in main where messages can't be changed (the terminal).
+    fn noteOnItem(c: *Core, a: std.mem.Allocator, id: u64, line: []const u8) void {
+        const ch = c.chan orelse return;
+        if (ch.edit == null) return c.say(line);
+        var edits: std.ArrayList(Edit) = .empty;
+        {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = c.inbox.find(id) orelse return;
+            const parts = inbox_mod.messageParts(a, it) catch return;
+            const said = inbox_mod.outcome(a, it, c.cfg.chat.utc_offset) catch return;
+            const out = a.dupe(u8, said) catch return;
+            if (out.len > 0) out[0] = std.ascii.toUpper(out[0]);
+            const head = std.fmt.allocPrint(a, "{s}\n{s}\n", .{ if (parts.len > 0) parts[parts.len - 1] else "", out }) catch return;
+            const text = std.fmt.allocPrint(a, "{s}{s}", .{ head, util.cut(line, message_max -| head.len) }) catch return;
+            for (it.shown.items) |sh| edits.append(a, .{ .chat = sh.chat, .thread = sh.thread, .message = sh.message, .text = text }) catch {};
+        }
+        c.applyEdits(edits.items, null);
     }
 
     /// A member's run's outbox: its own conversation, no other; the
@@ -2296,6 +2523,8 @@ pub const Core = struct {
         c.applyEdits(closed.edits, if (status == .expired) .{ .conv = conv, .text = closed.outcome } else null);
         // the answer is on disk: a workflow's instance goes on with it
         if (std.mem.startsWith(u8, waiter, "workflow ")) c.wakeWorkflow(waiter);
+        // a household member's call: made on the owner's yes, the member told
+        if (std.mem.startsWith(u8, waiter, "member ")) c.memberAnswered(id);
         return true;
     }
 
@@ -16334,4 +16563,139 @@ test "member_rm_ends_their_access" {
     try expectHas(try logText(&f), "\"event\":\"dropped\",\"from\":77,\"why\":\"not the owner\"");
     try t.expectEqualStrings("No members. /member add NAME gives someone a code to join.", try f.core.command(a, "/members"));
     try t.expectEqualStrings("No member called anna.", try f.core.command(a, "/member rm anna"));
+}
+
+/// mcp.ini with homemcp's stand-in as server `home`, its guarded tool a
+/// money tool as homemcp's README says; applied.
+fn withHome(f: *Fix) !void {
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[home]\ncommand = \"{s}\" --mcp --home\nmoney = home_guarded\namount = home_guarded:none\n", .{fake}) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+}
+
+test "a_member_turns_a_light_on" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try withHome(&f);
+    try joinMember(&f, "anna", 77);
+    try f.e.script(1, model.toolReply("h1", "home__home_set", "{\"device\":\"living_room_light\",\"action\":\"on\"}"));
+    try f.e.script(2, model.textReply("The living room light is on."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(fromAccount(77, "turn on the living room light"));
+    try f.rec.waitIn("anna", "The living room light is on.");
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    try expectHas(try f.e.request(2), "done: living_room_light is on");
+    try expectHas(try logText(&f), "\"decision\":\"allow\",\"why\":\"household default: the home's reads and ordinary devices\"");
+}
+
+test "a_members_unlock_becomes_the_owners_question" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try withHome(&f);
+    try joinMember(&f, "anna", 77);
+    try f.e.script(1, model.toolReply("g1", "home__home_guarded", "{\"device\":\"front_door\",\"action\":\"unlock\"}"));
+    try f.e.script(2, model.textReply("Anything else?"));
+    try f.core.startWorker();
+    try f.core.handleIncoming(fromAccount(77, "unlock the front door"));
+    // the owner's one-tap question, in the owner's chat
+    try f.rec.waitIn("main", "Anna asks to unlock the front door.");
+    const b = f.rec.buttonsWith("Anna asks to unlock the front door.") orelse return error.NoQuestion;
+    try t.expect(b.get("day") == null);
+    try expectHas(try inboxFileWith(&f, "\"label\":\"Unlock\""), "\"choices\":[{\"key\":\"once\",\"label\":\"Unlock\"},{\"key\":\"deny\",\"label\":\"No\"}]");
+    // anna is told at once, and her run does not wait for the owner
+    try f.rec.waitIn("anna", "I asked the owner: unlock the front door. You'll hear here when they answer.");
+    try f.rec.waitIn("anna", "Anything else?");
+    try expectHas(try f.e.request(2), "waits for the owner in the inbox: the member was told the owner was asked; don't say it again (item 1)");
+    // the owner taps Unlock: that exact call is made; both hear what happened
+    f.core.handleCallback(42, b.msg, b.get("once").?);
+    try f.rec.waitIn("anna", "The owner said yes: done: front_door is unlocked");
+    try f.rec.waitFor("Result: done: front_door is unlocked");
+    try t.expectEqual(2, f.e.server.modelRequests());
+    const lt = try logText(&f);
+    try expectHas(lt, "\"decision\":\"allow\",\"why\":\"allowed once by the owner (item 1)\"");
+    try expectHas(lt, "\"by\":\"member:anna\"");
+}
+
+test "the_owner_says_no_or_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try withHome(&f);
+    try joinMember(&f, "anna", 77);
+    try f.e.script(1, model.toolReply("g1", "home__home_guarded", "{\"device\":\"front_door\",\"action\":\"unlock\"}"));
+    try f.e.script(2, model.textReply("Waiting."));
+    try f.e.script(3, model.toolReply("g2", "home__home_guarded", "{\"device\":\"front_door\",\"action\":\"lock\"}"));
+    try f.e.script(4, model.textReply("Waiting too."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(fromAccount(77, "unlock the front door"));
+    try f.rec.waitIn("anna", "Waiting.");
+    const b = f.rec.buttonsWith("Anna asks to unlock the front door.") orelse return error.NoQuestion;
+    // a reply in words says no, and why
+    try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = "not now, I'm on my way", .reply_to = b.msg });
+    try f.rec.waitIn("anna", "The owner said no: unlock the front door. They said: not now, I'm on my way");
+    // nobody answers: it expires
+    try f.core.handleIncoming(fromAccount(77, "lock the front door"));
+    try f.rec.waitIn("anna", "Waiting too.");
+    try f.rec.waitIn("main", "Anna asks to lock the front door.");
+    f.core.fixed_now = util.nowSeconds(t.io) + 601;
+    f.core.tick();
+    try f.rec.waitIn("anna", "No answer from the owner in time: lock the front door.");
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "allowed once by the owner") == null);
+}
+
+test "members_never_answer_items" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try withHome(&f);
+    try joinMember(&f, "anna", 77);
+    try f.e.script(1, model.toolReply("g1", "home__home_guarded", "{\"device\":\"front_door\",\"action\":\"unlock\"}"));
+    try f.e.script(2, model.textReply("Waiting."));
+    try f.e.script(3, model.textReply("You can't answer that."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(fromAccount(77, "unlock the front door"));
+    try f.rec.waitIn("anna", "Waiting.");
+    const b = f.rec.buttonsWith("Anna asks to unlock the front door.") orelse return error.NoQuestion;
+    // her press and her reply to the question's message answer nothing
+    f.core.handleCallback(77, b.msg, b.get("once").?);
+    try f.core.handleIncoming(.{ .from = 77, .chat = 77, .text = "yes", .reply_to = b.msg });
+    try f.rec.waitIn("anna", "You can't answer that.");
+    try expectHas(try logText(&f), "\"event\":\"dropped\",\"from\":77,\"why\":\"button from someone else\"");
+    try expectHas(try inboxFile(&f), "\"status\":\"open\"");
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "allowed once by the owner") == null);
+}
+
+test "an_ask_waits_across_a_restart" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try withHome(&f);
+    try joinMember(&f, "anna", 77);
+    try f.e.script(1, model.toolReply("g1", "home__home_guarded", "{\"device\":\"front_door\",\"action\":\"unlock\"}"));
+    try f.e.script(2, model.textReply("Waiting."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(fromAccount(77, "unlock the front door"));
+    try f.rec.waitIn("anna", "Waiting.");
+    const b = f.rec.buttonsWith("Anna asks to unlock the front door.") orelse return error.NoQuestion;
+    try restart(&f);
+    // the servers start again, as at a start
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    f.core.handleCallback(42, b.msg, b.get("once").?);
+    try f.rec.waitIn("anna", "The owner said yes: done: front_door is unlocked");
+}
+
+test "a_member_ask_whose_item_is_closed_is_dropped_at_start" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // harness stopped between closing item 9 and taking its call
+    const path = try std.fs.path.join(a, &.{ f.core.paths.state, "member-asks" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = "{\"item\":9,\"member\":\"anna\",\"agent\":\"main\",\"conversation\":\"anna\",\"tool\":\"money\",\"arg\":\"home/home_guarded {}\",\"what\":\"use home/home_guarded\"}\n" });
+    try restart(&f);
+    try t.expectEqual(0, f.core.member_asks.countOf("anna"));
+    try t.expectEqualStrings("", try Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited));
 }

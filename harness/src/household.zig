@@ -255,22 +255,22 @@ pub const Ask = struct {
     what: []const u8,
 };
 
-/// The calls waiting for the owner, `state/member-asks`.
+/// The calls waiting for the owner, `state/member-asks`. Each call's texts
+/// are its own allocations, freed when it is taken.
 pub const Asks = struct {
     gpa: std.mem.Allocator,
     io: Io,
     path: []const u8,
     mutex: Io.Mutex = .init,
-    arena: std.heap.ArenaAllocator,
     items: std.ArrayList(Ask) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, path: []const u8) Asks {
-        return .{ .gpa = gpa, .io = io, .path = path, .arena = .init(gpa) };
+        return .{ .gpa = gpa, .io = io, .path = path };
     }
 
     pub fn deinit(s: *Asks) void {
+        for (s.items.items) |k| freeAsk(s.gpa, k);
         s.items.deinit(s.gpa);
-        s.arena.deinit();
     }
 
     pub fn load(s: *Asks) !void {
@@ -279,7 +279,9 @@ pub const Asks = struct {
             else => return e,
         };
         defer s.gpa.free(text);
-        const a = s.arena.allocator();
+        var arena: std.heap.ArenaAllocator = .init(s.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
         var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |raw| {
             const line = std.mem.trim(u8, raw, " \t\r");
@@ -287,7 +289,7 @@ pub const Asks = struct {
             const v = jv.parse(a, line) orelse continue;
             const item = jv.int(jv.get(v, "item")) orelse continue;
             if (item <= 0) continue;
-            const ask: Ask = .{
+            const k = try copyAsk(s.gpa, .{
                 .item = @intCast(item),
                 .member = jv.str(jv.get(v, "member")) orelse continue,
                 .agent = jv.str(jv.get(v, "agent")) orelse "main",
@@ -295,8 +297,11 @@ pub const Asks = struct {
                 .tool = jv.str(jv.get(v, "tool")) orelse continue,
                 .arg = jv.str(jv.get(v, "arg")) orelse continue,
                 .what = jv.str(jv.get(v, "what")) orelse "",
+            });
+            s.items.append(s.gpa, k) catch |e| {
+                freeAsk(s.gpa, k);
+                return e;
             };
-            try s.items.append(s.gpa, ask);
         }
     }
 
@@ -326,18 +331,13 @@ pub const Asks = struct {
     pub fn add(s: *Asks, k: Ask) !void {
         s.mutex.lockUncancelable(s.io);
         defer s.mutex.unlock(s.io);
-        const a = s.arena.allocator();
-        try s.items.append(s.gpa, .{
-            .item = k.item,
-            .member = try a.dupe(u8, k.member),
-            .agent = try a.dupe(u8, k.agent),
-            .conversation = try a.dupe(u8, k.conversation),
-            .tool = try a.dupe(u8, k.tool),
-            .arg = try a.dupe(u8, k.arg),
-            .what = try a.dupe(u8, k.what),
-        });
+        const owned = try copyAsk(s.gpa, k);
+        s.items.append(s.gpa, owned) catch |e| {
+            freeAsk(s.gpa, owned);
+            return e;
+        };
         s.save() catch |e| {
-            _ = s.items.pop();
+            freeAsk(s.gpa, s.items.pop().?);
             return e;
         };
     }
@@ -350,6 +350,7 @@ pub const Asks = struct {
         for (s.items.items, 0..) |k, i| if (k.item == item) {
             const copy = copyAsk(a, k) catch return null;
             _ = s.items.orderedRemove(i);
+            freeAsk(s.gpa, k);
             s.save() catch {};
             return copy;
         };
@@ -375,27 +376,31 @@ pub const Asks = struct {
         return n;
     }
 
-    /// The items `member`'s calls wait on (in `a`).
+    /// The items `member`'s calls wait on, or every call's for "" (in `a`).
     pub fn itemsOf(s: *Asks, a: std.mem.Allocator, member: []const u8) ![]const u64 {
         s.mutex.lockUncancelable(s.io);
         defer s.mutex.unlock(s.io);
         var out: std.ArrayList(u64) = .empty;
-        for (s.items.items) |k| if (std.mem.eql(u8, k.member, member)) try out.append(a, k.item);
+        for (s.items.items) |k| if (member.len == 0 or std.mem.eql(u8, k.member, member)) try out.append(a, k.item);
         return out.items;
     }
 };
 
 /// `k` with its texts copied into `a`.
 pub fn copyAsk(a: std.mem.Allocator, k: Ask) !Ask {
-    return .{
-        .item = k.item,
-        .member = try a.dupe(u8, k.member),
-        .agent = try a.dupe(u8, k.agent),
-        .conversation = try a.dupe(u8, k.conversation),
-        .tool = try a.dupe(u8, k.tool),
-        .arg = try a.dupe(u8, k.arg),
-        .what = try a.dupe(u8, k.what),
-    };
+    var out: Ask = .{ .item = k.item, .member = "", .agent = "", .conversation = "", .tool = "", .arg = "", .what = "" };
+    errdefer freeAsk(a, out);
+    out.member = try a.dupe(u8, k.member);
+    out.agent = try a.dupe(u8, k.agent);
+    out.conversation = try a.dupe(u8, k.conversation);
+    out.tool = try a.dupe(u8, k.tool);
+    out.arg = try a.dupe(u8, k.arg);
+    out.what = try a.dupe(u8, k.what);
+    return out;
+}
+
+fn freeAsk(a: std.mem.Allocator, k: Ask) void {
+    for ([_][]const u8{ k.member, k.agent, k.conversation, k.tool, k.arg, k.what }) |x| a.free(x);
 }
 
 // ---- a call in plain words ----
