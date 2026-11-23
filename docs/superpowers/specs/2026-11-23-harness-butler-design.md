@@ -134,8 +134,32 @@ Butler:  I found 34 devices in 6 rooms. I'll switch lights, plugs and
    and Raspberry Pi) and Windows, and `harness/TESTERS.md`: what to try in
    the first week, what to look for, how to send a report, what harness
    will never do in your home.
-9. **The house's own voice assistants:** decided after the product check
-   (in progress).
+9. **The house's own voice assistants: complement and integrate.** The
+   product check (2026-11-23, notes in
+   `harness/research/smart-home-voice.md`): Alexa+, Gemini for Home and Apple's
+   new Siri are not offered in Poland and none speaks Polish; Alexa+ and
+   Google's premium tiers cost $10–23 a month; only Home Assistant lets an
+   outside agent be the brain behind its speakers (a conversation agent,
+   or any OpenAI-compatible endpoint since 2026.8) and speak or ask on a
+   speaker unprompted (`assist_satellite.announce`, `ask_question`).
+   Alexa+ and Apple allow tools only; Google, Sonos, Homey and SmartThings
+   control devices, not voice. So:
+   - **harness as Home Assistant's conversation agent**: an
+     OpenAI-compatible chat endpoint that Home Assistant's Assist calls
+     with the speaker's words and its room; harness answers in the
+     owner's language (Polish included) as in a conversation `home`;
+     simple commands stay Home Assistant's own; anything guarded becomes
+     the owner's one-tap question in Telegram (never approved by voice in
+     a room, where anyone can speak).
+   - **Speaking first**: urgent things at home (a leak, someone at the door
+     while everyone is away) are also said on the nearest Home Assistant
+     speaker through an allowlisted `announce` tool in homemcp, within
+     quiet hours' rules.
+   - **Other speakers are remotes**: Echo and Nest stay for timers, music
+     and quick commands; no Alexa, Google or Apple integration now.
+   - Voice notes (Part 4): Groq's Whisper (under a second, about $0.04 an
+     hour) or OpenAI's transcription, or a local whisper.cpp; picked on
+     Polish accuracy; the transcript is shown before anything is done.
 
 ## Red lines (from the research; binding)
 
@@ -170,4 +194,4 @@ Butler:  I found 34 devices in 6 rooms. I'll switch lights, plugs and
 
 Part 1 and 3 now (homemcp only). Parts 4, 5 and 6 after the Undo merge
 (they touch the run's posts and the gate). Parts 2, 7 and 8 after those.
-Part 9 when the product check is in.
+Part 9 (the conversation-agent endpoint, `announce`) after Part 4.
