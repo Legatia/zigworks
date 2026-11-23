@@ -41,6 +41,10 @@ const usage =
     \\  trigger list | test NAME | run NAME
     \\                             the triggers (triggers.ini, tasks, briefs); a poll
     \\                             now that keeps nothing; a poll now and its action
+    \\  workflow list | check FILE | start NAME [TEXT] | stop NAME#N|NAME
+    \\                             the workflows and their instances; harness's
+    \\                             reading of a file; an instance started and run
+    \\                             here until it waits; one stopped
     \\  memory [list|pin|unpin|forget ID]
     \\  snapshot list FOLDER | take FOLDER [LABEL] | changes FOLDER ID | restore FOLDER ID
     \\                             a folder's snapshots, one now, what changed, put it back
@@ -209,6 +213,7 @@ const App = struct {
         snapshot,
         agent,
         trigger,
+        workflow,
 
         /// Whether it needs the MCP servers and the browser: a brief is
         /// one model call without tools, memory, snapshot and agent
@@ -216,7 +221,7 @@ const App = struct {
         /// 20 s and runs their code.
         fn usesTools(r: Role) bool {
             return switch (r) {
-                .run, .chat, .task, .trigger => true,
+                .run, .chat, .task, .trigger, .workflow => true,
                 .brief, .memory, .snapshot, .agent => false,
             };
         }
@@ -320,7 +325,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "agent", "trigger" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "agent", "trigger", "workflow" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -342,6 +347,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "snapshot")) return snapshotCmd(app, rest);
     if (eql(cmd, "agent")) return agentCmd(app, rest);
     if (eql(cmd, "trigger")) return triggerCmd(app, rest);
+    if (eql(cmd, "workflow")) return workflowCmd(app, rest);
     if (eql(cmd, "log")) return logCmd(app, rest);
     if (eql(cmd, "inbox")) return inboxCmd(app, rest);
     if (eql(cmd, "health")) return healthCmd(app);
@@ -1187,6 +1193,55 @@ fn triggerCmd(app: *App, args: []const []const u8) !Exit {
     return .ok;
 }
 
+const workflow_usage = "usage: harness workflow list | workflow check FILE | workflow start NAME [TEXT] | workflow stop NAME#N|NAME";
+
+/// Whether a `harness workflow` line has what its action takes.
+fn workflowArgsOk(rest: []const []const u8) bool {
+    if (rest.len == 0) return false;
+    if (rest.len > 1 and (rest[1].len == 0 or rest[1][0] == '-')) return false;
+    if (eql(rest[0], "list")) return rest.len == 1;
+    if (eql(rest[0], "check") or eql(rest[0], "stop")) return rest.len == 2;
+    if (eql(rest[0], "start")) return rest.len >= 2;
+    return false;
+}
+
+/// `harness workflow list | check FILE | start NAME [TEXT] | stop ID`: the
+/// chat's commands; `check` reads the file without opening the folder; a
+/// start runs its instance here until it waits or ends (R18), its posts
+/// printed.
+fn workflowCmd(app: *App, args: []const []const u8) !Exit {
+    if (!workflowArgsOk(args)) {
+        complain(workflow_usage, .{});
+        return .usage;
+    }
+    if (eql(args[0], "check")) {
+        const text = Io.Dir.cwd().readFileAlloc(app.io, args[1], app.arena, .limited(1 << 20)) catch |e| {
+            complain("can't read {s}: {s}", .{ args[1], @errorName(e) });
+            return .failed;
+        };
+        const p = try core_mod.Paths.init(app.arena, app.home);
+        const got = try core_mod.checkWorkflowFile(app.io, app.arena, p, args[1], text);
+        try outPrint(app.io, "{s}\n", .{got.text});
+        return if (got.ok) .ok else .failed;
+    }
+    const c = try app.open(.workflow);
+    defer c.close();
+    if (eql(args[0], "list")) {
+        try outPrint(app.io, "{s}\n", .{std.mem.trimEnd(u8, try c.command(app.arena, "/workflows"), "\n")});
+        return .ok;
+    }
+    if (eql(args[0], "stop")) {
+        try outPrint(app.io, "{s}\n", .{try c.command(app.arena, try std.fmt.allocPrint(app.arena, "/workflow stop {s}", .{args[1]}))});
+        return .ok;
+    }
+    var tc: TermChan = .{ .io = app.io, .home = "main" };
+    c.attach(tc.channel());
+    const said = try c.command(app.arena, try std.fmt.allocPrint(app.arena, "/workflow start {s}", .{try std.mem.join(app.arena, " ", args[1..])}));
+    try errPrint(app.io, "{s}\n", .{said});
+    c.driveWorkflows();
+    return if (std.mem.startsWith(u8, said, "Not started")) .failed else .ok;
+}
+
 fn logCmd(app: *App, args: []const []const u8) !Exit {
     const p = try core_mod.Paths.init(app.arena, app.home);
     if (args.len >= 1 and eql(args[0], "verify")) {
@@ -1581,6 +1636,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     }
     if (eql(cmd, "inbox")) return if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "--json"))) null else "usage: harness inbox [--json]";
     if (eql(cmd, "trigger")) return if (triggerArgsOk(rest)) null else trigger_usage;
+    if (eql(cmd, "workflow")) return if (workflowArgsOk(rest)) null else workflow_usage;
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
     if (eql(cmd, "login")) {
@@ -2202,5 +2258,15 @@ test "harness_trigger_takes_list_test_and_run" {
         return error.TestUnexpectedResult;
     };
     for ([_][]const []const u8{ &.{"trigger"}, &.{ "trigger", "list", "x" }, &.{ "trigger", "go", "x" }, &.{ "trigger", "test" }, &.{ "trigger", "run", "-x" }, &.{ "trigger", "run", "a", "b" } }) |line|
+        try std.testing.expect(badArgs(line) != null);
+}
+
+
+test "harness_workflow_takes_list_check_start_stop" {
+    for ([_][]const []const u8{ &.{ "workflow", "list" }, &.{ "workflow", "check", "x.wf" }, &.{ "workflow", "start", "hello" }, &.{ "workflow", "start", "hello", "some", "text" }, &.{ "workflow", "stop", "hello#1" }, &.{ "workflow", "stop", "hello" } }) |line| if (badArgs(line)) |why| {
+        std.debug.print("{s}: {s}\n", .{ line[1], why });
+        return error.TestUnexpectedResult;
+    };
+    for ([_][]const []const u8{ &.{"workflow"}, &.{ "workflow", "list", "x" }, &.{ "workflow", "go" }, &.{ "workflow", "check" }, &.{ "workflow", "start" }, &.{ "workflow", "stop" }, &.{ "workflow", "stop", "a", "b" }, &.{ "workflow", "start", "-x" } }) |line|
         try std.testing.expect(badArgs(line) != null);
 }

@@ -412,6 +412,9 @@ pub const Run = struct {
     /// Where the `trigger` tool reaches harness; null: no `trigger` tool
     /// (only runs the owner started from a conversation get one).
     desk: ?Desk = null,
+    /// Where the `workflow` tool reaches harness; null: no `workflow` tool
+    /// (only runs the owner started from a conversation get one).
+    wdesk: ?WfDesk = null,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -522,8 +525,10 @@ pub const Run = struct {
             // a setup call among its actions: only in runs the owner started
             // from a conversation (helpers never: above)
             .trigger => if (r.desk == null or r.outbox == null or !std.mem.eql(u8, r.who.by, "owner")) return false,
+            // the same for the workflow tool (its save is a setup call)
+            .workflow => if (r.wdesk == null or r.outbox == null or !std.mem.eql(u8, r.who.by, "owner")) return false,
             // the platform's kinds: the gate decides them, their tools come later
-            .mail, .workflow, .app_read, .app_draft, .app_save, .env_save => return false,
+            .mail, .app_read, .app_draft, .app_save, .env_save => return false,
             // where there is a store and folders.ini has a section
             .snapshot => if (r.snaps == null or r.gate.folders == null) return false,
             else => {},
@@ -612,7 +617,14 @@ const trigger_def: model.ToolDef = .{
 /// What harness reads in a trigger section the agent proposes: its name,
 /// harness's own reading (never the model's) and the section as it will be
 /// written; or why it can't be added, with the line.
-pub const Checked = struct { name: []const u8 = "", reading: []const u8 = "", section: []const u8 = "", why: ?[]const u8 = null };
+pub const Checked = struct {
+    name: []const u8 = "",
+    reading: []const u8 = "",
+    section: []const u8 = "",
+    why: ?[]const u8 = null,
+    /// A workflow's file: it replaces one of the same name.
+    replaces: bool = false,
+};
 
 /// Who saved a trigger: its mark in the file ("added by agent:main
 /// 2026-11-22 (item 41)") and the log's fields.
@@ -629,6 +641,27 @@ pub const Desk = struct {
     /// Polls a trigger (by name, or a section's text) now, its reads
     /// decided by `r`'s gate (asked like any fetch), and keeps nothing.
     probe: *const fn (ctx: *anyopaque, a: std.mem.Allocator, r: *Run, text: []const u8, by_name: bool) []const u8,
+};
+
+const workflow_def: model.ToolDef = .{
+    .name = "workflow",
+    .description = "Workflows are step files harness runs with their state on disk: tool calls with fixed input, agent runs, waits for a time or an event, the owner's approval, branches, retries, messages. check reads a file and returns harness's reading or the line that is wrong. save proposes a new workflow or a change: the owner sees the whole file and harness's reading and approves it every time; it applies at once, and instances already going keep their file. start starts an instance (asked), stop stops one (asked), list and show see them. A file: workflow NAME, about, start (owner, agent, trigger:NAME, schedule:NAME), limits steps N, days N, at-once N, to, agent; then step NAME blocks, each with one action: tool TOOL {json} (a built-in tool or SERVER/TOOL), do TEXT (answer json, agent, tools), wait 2h, wait until 09:00, wait event TRIGGER (match FIELD OP VALUE), approve TEXT, review TEXT, say TEXT; and if FIELD OP VALUE goto STEP, retry N wait D, on fail|deny|timeout goto STEP, timeout D, goto STEP, end. A line ending in : takes the lines indented below it. Values: {STEP}, {STEP.field}, {STEP.ok}, {STEP.error}, {input}, {event.FIELD}, {instance}, {now}.",
+    .schema_json = "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"check\",\"save\",\"start\",\"list\",\"show\",\"stop\"]},\"name\":{\"type\":\"string\",\"description\":\"save, start, show: the workflow's name; stop and show: NAME or NAME#N\"},\"text\":{\"type\":\"string\",\"description\":\"check, save: the whole file; start: the instance's input\"}},\"required\":[\"action\"]}",
+};
+
+/// How the `workflow` tool reaches harness.
+pub const WfDesk = struct {
+    ctx: *anyopaque,
+    /// Harness's reading of a file (its name given, or its first line's),
+    /// or why it can't be saved, with the line.
+    check: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, text: []const u8) Checked,
+    /// Writes workflows/NAME.wf under its mark and applies it; null, or why not.
+    save: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, text: []const u8, saved: Saved) ?[]const u8,
+    /// Starts an instance by the workflow tool (the start line's `agent`).
+    start: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, input: []const u8, by: []const u8, agent: []const u8) []const u8,
+    list: *const fn (ctx: *anyopaque, a: std.mem.Allocator) []const u8,
+    show: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) []const u8,
+    stop: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, by: []const u8) []const u8,
 };
 
 const ask_owner_def: model.ToolDef = .{
@@ -660,6 +693,7 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
     if (r.allows(.snapshot)) try out.append(arena, snapshot_def);
     if (r.allows(.agent_save)) try out.append(arena, agent_save_def);
     if (r.allows(.trigger)) try out.append(arena, trigger_def);
+    if (r.allows(.workflow)) try out.append(arena, workflow_def);
     for (r.mcp) |*m| if (r.allowsMcp(m)) try out.append(arena, m.def);
     return out.items;
 }
@@ -1435,6 +1469,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     if (tool == .send) return sendTool(r, a, input_json);
     if (tool == .agent_save) return agentSave(r, a, input_json);
     if (tool == .trigger) return triggerTool(r, a, input_json);
+    if (tool == .workflow) return workflowTool(r, a, input_json);
     if (tool == .ask_owner) return askOwnerTool(r, a, input_json);
     if (tool == .web) {
         // the tool asks the gate itself: for each host and login it uses
@@ -1823,6 +1858,72 @@ fn triggerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Out
         break :out .{ .text = "trigger takes action add, test, list or rm", .is_error = true };
     };
     try r.logRun(.tool, r.isPrivate(), .{ .tool = "trigger", .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
+    return out;
+}
+
+/// `workflow`: check (harness's reading or the wrong line, unasked), save
+/// (checked first; refused unasked when its question would pass an item's
+/// 12 KB; then asked every time with harness's reading; written under its
+/// mark and applied at once), start and stop (asked), list and show.
+fn workflowTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
+    const desk = r.wdesk orelse return .{ .text = "this tool is not available here", .is_error = true };
+    const v = jv.parse(a, input_json);
+    const action = jv.str(jv.get(v, "action")) orelse "";
+    const text = jv.str(jv.get(v, "text")) orelse "";
+    const name = jv.str(jv.get(v, "name")) orelse "";
+    const eql = std.mem.eql;
+    const out: tools.Output = out: {
+        if (eql(u8, action, "check")) {
+            if (try decideAndAsk(r, a, .workflow, "workflow", "check", "", r.now())) |why|
+                break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            const checked = desk.check(desk.ctx, a, name, text);
+            if (checked.why) |why| break :out .{ .text = try std.fmt.allocPrint(a, "does not read: {s}", .{why}), .is_error = true };
+            break :out .{ .text = checked.reading };
+        }
+        if (eql(u8, action, "save")) {
+            const checked = desk.check(desk.ctx, a, name, text);
+            if (checked.why) |why| break :out .{ .text = try std.fmt.allocPrint(a, "not saved: {s}", .{why}), .is_error = true };
+            const detail = try std.fmt.allocPrint(a, "{s}, asked by {s}\nHarness reads it as:\n{s}\nSaving it replaces the current file; instances already going keep theirs.\nThe file, {d} bytes:\n{s}", .{ if (checked.replaces) try std.fmt.allocPrint(a, "a change to workflow {s}", .{checked.name}) else "a new workflow", r.def.name, checked.reading, checked.section.len, checked.section });
+            // the question must fit an inbox item: else the agent shortens it
+            const size = detail.len + checked.name.len + 32;
+            if (size > max_question) break :out .{ .text = try std.fmt.allocPrint(a, "not saved: its question would be {d} bytes, over the {d} an inbox item holds; shorten the file (the owner can still write it by hand, up to 64 KB)", .{ size, max_question }), .is_error = true };
+            var item: u64 = 0;
+            if (try decideAndAskWith(r, a, .workflow, "workflow", try std.fmt.allocPrint(a, "save {s}", .{checked.name}), detail, r.now(), .{ .item = &item })) |why|
+                break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            var tb: [20]u8 = undefined;
+            const date = util.isoTime(&tb, r.now())[0..10];
+            const mark = if (item != 0)
+                try std.fmt.allocPrint(a, "saved by agent:{s} {s} (item {d})", .{ r.who.agent, date, item })
+            else
+                try std.fmt.allocPrint(a, "saved by agent:{s} {s}", .{ r.who.agent, date });
+            if (desk.save(desk.ctx, a, checked.name, checked.section, .{ .mark = mark, .by = r.who.by, .agent = r.who.agent, .item = item })) |why|
+                break :out .{ .text = try std.fmt.allocPrint(a, "not saved: {s}", .{why}), .is_error = true };
+            break :out .{ .text = try std.fmt.allocPrint(a, "saved workflows/{s}.wf; it applies now. {s}", .{ checked.name, checked.reading }) };
+        }
+        if (eql(u8, action, "list")) {
+            if (try decideAndAsk(r, a, .workflow, "workflow", "list", "", r.now())) |why|
+                break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            break :out .{ .text = desk.list(desk.ctx, a) };
+        }
+        if (name.len == 0) break :out .{ .text = "workflow takes action check, save, start, list, show or stop; start, show and stop need the name", .is_error = true };
+        if (eql(u8, action, "start")) {
+            if (try decideAndAsk(r, a, .workflow, "workflow", try std.fmt.allocPrint(a, "start {s}", .{name}), if (text.len > 0) try std.fmt.allocPrint(a, "input: {s}", .{text}) else "", r.now())) |why|
+                break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            break :out .{ .text = desk.start(desk.ctx, a, name, text, r.who.by, r.who.agent) };
+        }
+        if (eql(u8, action, "show")) {
+            if (try decideAndAsk(r, a, .workflow, "workflow", try std.fmt.allocPrint(a, "show {s}", .{name}), "", r.now())) |why|
+                break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            break :out .{ .text = desk.show(desk.ctx, a, name) };
+        }
+        if (eql(u8, action, "stop")) {
+            if (try decideAndAsk(r, a, .workflow, "workflow", try std.fmt.allocPrint(a, "stop {s}", .{name}), "", r.now())) |why|
+                break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            break :out .{ .text = desk.stop(desk.ctx, a, name, r.who.by) };
+        }
+        break :out .{ .text = "workflow takes action check, save, start, list, show or stop", .is_error = true };
+    };
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = "workflow", .arg = util.cut(input_json, 1500), .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
     return out;
 }
 

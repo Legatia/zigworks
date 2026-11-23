@@ -2967,8 +2967,10 @@ pub const Core = struct {
         run.context_note = c.contextNote(arena.allocator(), conv) catch "";
         if (note) |n| run.context_note = std.fmt.allocPrint(arena.allocator(), "{s}\n{s}", .{ run.context_note, n }) catch run.context_note;
         run.asker = .{ .ctx = &ask, .ask = askOwner };
-        // the trigger tool: only in runs the owner started from a conversation
+        // the trigger and workflow tools: only in runs the owner started
+        // from a conversation
         run.desk = c.desk();
+        run.wdesk = c.wfDesk();
         var notify: Notify = .{ .core = c, .conv = conv };
         run.notice = .{ .ctx = &notify, .say = Notify.say };
         var here: [agents_name_max]u8 = undefined;
@@ -6288,7 +6290,7 @@ pub const Core = struct {
         }
         var out: std.ArrayList(u8) = .empty;
         for (heads.items) |h| {
-            try out.print(a, "{s}{s}{s}; started by {s}", .{ h.name, if (h.about.len > 0) ": " else "", util.cut(h.about, 200), h.start });
+            try out.print(a, "{s} (started by {s}){s}{s}", .{ h.name, h.start, if (h.about.len > 0) ": " else "", util.cut(h.about, 200) });
             if (h.saved.len > 0) try out.print(a, "; {s}", .{h.saved});
             try out.append(a, '\n');
             for (going.items) |g| if (std.mem.eql(u8, g.name, h.name)) try out.print(a, "  #{d} {s}\n", .{ g.n, g.line });
@@ -6372,6 +6374,127 @@ pub const Core = struct {
         if (arg.len > 0) return usage;
         if (std.mem.indexOfScalar(u8, word, '#') != null) return c.instanceShow(a, word);
         return c.workflowShow(a, word);
+    }
+
+    // ---- workflows: the tool's desk ----
+
+    fn wfDesk(c: *Core) agent.WfDesk {
+        return .{ .ctx = c, .check = wfDeskCheck, .save = wfDeskSave, .start = wfDeskStart, .list = wfDeskList, .show = wfDeskShow, .stop = wfDeskStop };
+    }
+
+    fn wfDeskCheck(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, text: []const u8) agent.Checked {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.checkWorkflow(a, name, text) catch .{ .why = "out of memory" };
+    }
+
+    fn wfDeskSave(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, text: []const u8, saved: agent.Saved) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.saveWorkflow(a, name, text, saved) catch |e| @errorName(e);
+    }
+
+    fn wfDeskStart(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, input: []const u8, by: []const u8, agent_name: []const u8) []const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        const begun = c.startInstance(a, name, .{ .at = c.now(), .by = by, .agent = agent_name, .input = input, .tool = true }) catch |e| return @errorName(e);
+        return c.startText(a, name, begun) catch "out of memory";
+    }
+
+    fn wfDeskList(ctx: *anyopaque, a: std.mem.Allocator) []const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.workflowsText(a) catch "out of memory";
+    }
+
+    fn wfDeskShow(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) []const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return (if (std.mem.indexOfScalar(u8, name, '#') != null) c.instanceShow(a, name) else c.workflowShow(a, name)) catch "out of memory";
+    }
+
+    fn wfDeskStop(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, by: []const u8) []const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.stopInstances(a, name, by) catch |e| @errorName(e);
+    }
+
+    /// Harness's reading of a workflow file the agent proposes, or why it
+    /// can't be saved: a name, a line that does not read, what it names
+    /// elsewhere (MCP tools against the servers that run), a stored
+    /// secret in it.
+    fn checkWorkflow(c: *Core, a: std.mem.Allocator, name_in: []const u8, text: []const u8) !agent.Checked {
+        const name = if (name_in.len > 0) name_in else fileName(text);
+        if (!workflows.validName(name)) return .{ .why = "a workflow's name: a-z, 0-9, - and _ (up to 64), starting with a letter or digit, not start, stop, resume, rm, list, check, show or save" };
+        if (text.len > workflows.max_file) return .{ .why = "a workflow file is at most 64 KB" };
+        const secrets = c.masks.snapshot(a) catch c.secret_list;
+        for (secrets) |sec| if (sec.value.len > 0 and std.mem.indexOf(u8, text, sec.value) != null)
+            return .{ .why = try std.fmt.allocPrint(a, "it holds a stored secret ({s}); a workflow names none (MCP servers hold their own)", .{sec.name}) };
+        var diag: workflows.Diag = .{};
+        const w = workflows.parse(a, name, text, &diag) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.BadWorkflow => return .{ .why = try workflows.lineProblem(a, "the file's", text, diag) },
+        };
+        var warns: []const []const u8 = &.{};
+        {
+            c.settings_mutex.lockUncancelable(c.io);
+            defer c.settings_mutex.unlock(c.io);
+            warns = workflows.check(a, w, .{ .triggers = c.trig_list, .agent = defsHas, .agent_ctx = &c.defs, .mcp = try c.mcpNames(a) }, &diag) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                error.BadWorkflow => return .{ .why = try workflows.lineProblem(a, "the file's", text, diag) },
+            };
+        }
+        var money: MoneyCheck = .{ .core = c };
+        var reading = try workflows.reading(a, w, MoneyCheck.isMoney, &money);
+        for (warns) |wn| reading = try std.fmt.allocPrint(a, "{s}\nNote: {s}.", .{ reading, wn });
+        return .{ .name = name, .reading = reading, .section = std.mem.trim(u8, text, "\n"), .replaces = c.workflowText(a, name) != null };
+    }
+
+    /// Writes workflows/NAME.wf under `saved.mark` (the file it replaces
+    /// kept in state/workflows/NAME/versions/, the last 10) and applies it
+    /// at once; logged `saved` with the file's sha256. Null when done.
+    fn saveWorkflow(c: *Core, a: std.mem.Allocator, name: []const u8, text: []const u8, saved: agent.Saved) !?[]const u8 {
+        const path = try std.fs.path.join(a, &.{ c.paths.workflows, try std.fmt.allocPrint(a, "{s}.wf", .{name}) });
+        // a mark the text brought along goes: harness writes its own
+        var body = std.mem.trim(u8, text, "\n");
+        if (std.mem.startsWith(u8, body, "# saved by ")) body = std.mem.trimStart(u8, body[std.mem.indexOfScalar(u8, body, '\n') orelse body.len ..], "\n");
+        const file = try std.fmt.allocPrint(a, "# {s}\n{s}\n", .{ saved.mark, body });
+        const old: ?[]const u8 = Io.Dir.cwd().readFileAlloc(c.io, path, a, .limited(workflows.max_file + 1)) catch null;
+        if (old) |o| agents.keepVersionIn(c.io, c.gpa, try std.fs.path.join(a, &.{ c.paths.workflows_state, name, "versions" }), o) catch |e|
+            return try std.fmt.allocPrint(a, "the file it replaces could not be kept ({s})", .{@errorName(e)});
+        _ = try Io.Dir.cwd().createDirPathStatus(c.io, c.paths.workflows, agents.private_dir);
+        try wstate.writeReplace(c.io, a, path, file);
+        if (try c.applyWorkflows(a)) |why| {
+            // put back as it was
+            if (old) |o| wstate.writeReplace(c.io, a, path, o) catch {} else Io.Dir.cwd().deleteFile(c.io, path) catch {};
+            return why;
+        }
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(file, &digest, .{});
+        try c.log.write(.workflow, false, .{
+            .name = name,
+            .event = "saved",
+            .by = saved.by,
+            .agent = if (saved.agent.len > 0) @as(?[]const u8, saved.agent) else null,
+            .item = if (saved.item != 0) @as(?u64, saved.item) else null,
+            .sha256 = &std.fmt.bytesToHex(digest, .lower),
+        });
+        return null;
+    }
+
+    /// `harness workflow start`: the instances due run here, until each
+    /// waits or ends.
+    pub fn driveWorkflows(c: *Core) void {
+        var rounds: usize = 0;
+        while (rounds < 1000) : (rounds += 1) {
+            {
+                c.settings_mutex.lockUncancelable(c.io);
+                defer c.settings_mutex.unlock(c.io);
+                c.workflowsDue(c.now());
+            }
+            while (c.bg_active.load(.acquire) > 0) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+            const pending = blk: {
+                c.wf_mutex.lockUncancelable(c.io);
+                defer c.wf_mutex.unlock(c.io);
+                for (c.wf_list.items) |info| if (info.busy or info.due or info.state.status == .running) break :blk true;
+                break :blk false;
+            };
+            if (!pending) return;
+        }
     }
 
     /// What a start says, and its instance's job begun now.
@@ -7094,6 +7217,45 @@ pub const Core = struct {
 
 /// "a, b and 3 more": the first 20 names.
 // ---- workflows: an instance's job ----
+
+/// The name a workflow file gives itself: its first line's `workflow NAME`.
+fn fileName(text: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const l = std.mem.trim(u8, raw, " \t\r");
+        if (l.len == 0 or l[0] == '#') continue;
+        if (!std.mem.startsWith(u8, l, "workflow ")) return "";
+        return std.mem.trim(u8, l["workflow ".len..], " \t");
+    }
+    return "";
+}
+
+/// `harness workflow check FILE`: harness's reading of the file, or its
+/// bad line; checked against this data folder's triggers.ini and
+/// definitions (MCP tools once their servers run: R9).
+pub fn checkWorkflowFile(io: Io, a: std.mem.Allocator, p: Paths, label: []const u8, text: []const u8) !struct { ok: bool, text: []const u8 } {
+    var name = std.fs.path.basename(label);
+    if (std.mem.endsWith(u8, name, ".wf")) name = name[0 .. name.len - 3];
+    var diag: workflows.Diag = .{};
+    const w = workflows.parse(a, name, text, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.BadWorkflow => return .{ .ok = false, .text = try workflows.lineProblem(a, label, text, diag) },
+    };
+    const trig_text = Io.Dir.cwd().readFileAlloc(io, p.triggers, a, .limited(1 << 20)) catch "";
+    var tdiag: triggers.Diag = .{};
+    const tlist = triggers.parse(a, trig_text, .triggers, &tdiag) catch &.{};
+    var set: agents.Set = .init(a, io, p.agents, "");
+    var adiag: agents.Diag = .{};
+    var loaded = set.read(a, &adiag) catch return .{ .ok = false, .text = "agents/ does not read" };
+    defer loaded.deinit();
+    const warns = workflows.check(a, w, .{ .triggers = tlist, .agent = loadedHas, .agent_ctx = &loaded }, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.BadWorkflow => return .{ .ok = false, .text = try workflows.lineProblem(a, label, text, diag) },
+    };
+    var reading = try workflows.reading(a, w, null, null);
+    for (warns) |wn| reading = try std.fmt.allocPrint(a, "{s}\nNote: {s}.", .{ reading, wn });
+    return .{ .ok = true, .text = reading };
+}
 
 /// The next time the owner's clock shows `minutes` after midnight, after
 /// `now_s` (`utc_offset` minutes east).
@@ -13662,7 +13824,7 @@ test "workflow_commands_list_show_start_stop_resume_rm" {
     try t.expectEqualStrings("Started nap#2.", try f.core.command(a, "/workflow start nap"));
     runWorkflows(&f);
     const list = try f.core.command(a, "/workflows");
-    try expectHas(list, "nap: Waits, then says so.; started by owner");
+    try expectHas(list, "nap (started by owner): Waits, then says so.");
     try expectHas(list, "  #1 at rest, waits until ");
     try expectHas(try f.core.command(a, "/workflow nap"), "Harness reads it as:\nWorkflow nap: Waits, then says so.");
     const shown = try f.core.command(a, "/workflow nap#1");
@@ -14092,4 +14254,60 @@ test "stop_pauses_a_step_under_way_until_it_is_answered" {
     runWorkflows(&f);
     try t.expectEqual(wstate.Status.stopped, (try instState(&f, "slow#1")).status);
     try t.expectEqual(0, f.rec.count("woke"));
+}
+
+
+test "workflow_save_asks_every_time_with_its_reading" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.core.startWorker();
+    try f.e.script(1, model.toolReply("w1", "workflow", "{\"action\":\"save\",\"name\":\"hello\",\"text\":\"workflow hello\\nstart owner, agent\\nstep greet\\nsay hello {input}\\n\"}"));
+    try f.e.script(2, model.textReply("Saved."));
+    try f.core.handleText("make me a greeting workflow");
+    try f.rec.waitFor("BUTTONS Allow this? [1]\nworkflow: save hello, a new workflow, asked by main\nHarness reads it as:\nWorkflow hello\nWho may start it: you (/workflow start), the agent (the workflow tool, asked).");
+    // asked every time: no Allow 24 h; harness's reading and the whole file
+    try t.expect(f.rec.buttonsWith("workflow: save hello").?.get("day") == null);
+    try f.rec.waitFor("Saving it replaces the current file; instances already going keep theirs.\nThe file, ");
+    try f.rec.waitFor(" bytes:\nworkflow hello\nstart owner, agent\nstep greet\nsay hello {input}");
+    try f.press("once");
+    try f.rec.waitFor("Saved.");
+    const path = try std.fs.path.join(a, &.{ f.core.paths.workflows, "hello.wf" });
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
+    try t.expect(std.mem.startsWith(u8, text, "# saved by agent:main "));
+    try expectHas(text, " (item 1)\nworkflow hello\nstart owner, agent\nstep greet\n");
+    // applied at once and listed, marked
+    try t.expectEqual(1, f.core.wf_defs.len);
+    try expectHas(try f.core.command(a, "/workflows"), "hello (started by owner, agent); saved by agent:main ");
+    try expectHas(try logText(&f), "\"kind\":\"workflow\",\"name\":\"hello\",\"event\":\"saved\",\"by\":\"owner\",\"agent\":\"main\",\"item\":1,\"sha256\":\"");
+    // a bad line comes back unasked, named
+    try f.e.script(3, model.toolReply("w2", "workflow", "{\"action\":\"save\",\"name\":\"bad\",\"text\":\"workflow bad\\nstep a\\nsay {nope}\\n\"}"));
+    try f.e.script(4, model.textReply("Fixed."));
+    try f.core.handleText("one more");
+    try f.rec.waitFor("Fixed.");
+    try expectHas(try f.e.request(4), "not saved: the file's line 3 has an error: say {nope} ({nope} names no step (steps: a)");
+    // a file holding a stored secret comes back unasked
+    try f.e.script(5, model.toolReply("w3", "workflow", "{\"action\":\"save\",\"name\":\"leak\",\"text\":\"workflow leak\\nstep a\\nsay search-key-123\\n\"}"));
+    try f.e.script(6, model.textReply("Kept out."));
+    try f.core.handleText("put the key in");
+    try f.rec.waitFor("Kept out.");
+    try expectHas(try f.e.request(6), "not saved: it holds a stored secret (search)");
+    // one whose question would not fit an item comes back unasked
+    const big = try a.alloc(u8, 12_500);
+    @memset(big, 'x');
+    try f.e.script(7, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"w4\",\"name\":\"workflow\",\"input\":{{\"action\":\"save\",\"name\":\"big\",\"text\":\"workflow big\\nstep a\\nsay {s}\\n\"}}}}],\"stop_reason\":\"tool_use\"}}", .{big}));
+    try f.e.script(8, model.textReply("Too long."));
+    try f.core.handleText("a long one");
+    try f.rec.waitFor("Too long.");
+    try expectHas(try f.e.request(8), "over the 12288 an inbox item holds; shorten the file");
+    try t.expectEqual(1, f.rec.count("BUTTONS Allow this? ["));
+    // offered where the owner started the run; check reads unasked
+    try expectHas(try f.e.request(1), "\"name\":\"workflow\"");
+    try f.e.script(9, model.toolReply("w5", "workflow", "{\"action\":\"check\",\"text\":\"workflow quick\\nstep a\\nwait 2h\\n\"}"));
+    try f.e.script(10, model.textReply("Checked."));
+    try f.core.handleText("check this");
+    try f.rec.waitFor("Checked.");
+    try expectHas(try f.e.request(10), "1. a: waits 2 h");
+    try t.expectEqual(1, f.rec.count("BUTTONS Allow this? ["));
 }
