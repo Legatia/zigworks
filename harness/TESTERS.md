@@ -55,8 +55,10 @@ Then in Telegram:
    switching that one until you sort it: `/setup home allow NAME` for a
    light or a plug.
 3. The routines come one at a time, a sentence each: goodnight, leaving,
-   arriving, the morning summary, a leak, doors left open. Tap **Turn on**
-   or **Not now**; `/setup routines` offers them again later.
+   arriving, the morning summary, a leak (and, with a water valve, whether
+   harness may close it itself when nobody answers in 5 minutes), a smoke
+   alarm, doors left open. Tap **Turn on** or **Not now**; `/setup
+   routines` offers them again later.
 4. A car on Smartcar: connect it once through Smartcar Connect (carcloud's
    README: With a real car), `harness secret add smartcar` in the terminal
    (your Smartcar application's client secret), then `/setup car CLIENT_ID
@@ -109,6 +111,13 @@ notes):
 - **Day 6.** Add someone of your household: `/member add anna` gives a code,
   and they send `/join CODE` to the bot from their own Telegram. When they
   ask it to lock the front door, you get the one-tap question.
+- **Day 7.** With Anna in, add `escalate = 5m anna` under `[butler]` in
+  `config.ini` and `/reload`. Wet the leak sensor and don't answer: after
+  5 minutes Anna gets "Nobody has answered this yet: …" with **I'm on it**;
+  when she taps it you hear "Anna is on it". Tap a button or reply to the
+  alert yourself next time, and she isn't told. With the leak's fallback
+  on, the water main closes after 5 minutes if nobody is on it, and you
+  read "No one answered in 5 minutes: …".
 - **Any day.** `/session` shows the steps behind the last answer; `/quiet`
   what quiet hours hold; `/workflows` the routines that are on.
 
@@ -125,6 +134,8 @@ Tell us about anything like this, with the time it happened:
 - A routine that didn't start, started twice, or said the wrong device.
 - A reply that took more than a few seconds.
 - Anything at all about locks, the garage, the alarm or the water valve.
+- An alert someone of your household got though you had answered it, or
+  one they should have got and didn't.
 
 ## Sending a report
 
@@ -146,10 +157,14 @@ on what you did, what happened, and what you expected.
   file `/setup home` writes doesn't allow those at all: locks can only be
   locked, valves and garage doors only closed, alarms only armed, and each
   of those only after your tap, never from a schedule, a routine or
-  something a sensor reports.
-- **Never act on cameras or smoke and CO alarms.** They are left out of the
-  home file; it can't see through cameras at all. Keep your smoke alarms'
-  own alarms: harness is not a safety system.
+  something a sensor reports. The one exception is yours to turn on: the
+  leak's fallback closes the water main, once, when nobody is on the leak
+  in 5 minutes. Nothing ever opens, unlocks or disarms by itself.
+- **Never act on cameras or smoke and CO alarms.** Cameras are left out of
+  the home file; it can't see through them at all. Smoke and CO alarms are
+  only watched: their alarm is said at once and to your household, and no
+  line of the home file can make anything act on them. Keep their own
+  sirens: harness is not a safety system.
 - **Only what home.ini allows, the way it allows it.** There is no "do
   anything in Home Assistant" switch: each device has its list, and a plug
   that powers a kettle or a heater can be asked about every time
@@ -160,7 +175,8 @@ on what you did, what happened, and what you expected.
   stopping charging and the charge limit (60–90 %). It can't lock or
   unlock the car, and nothing is plugged into it.
 - **Only you approve.** Your family can ask it things; a lock, the garage, a
-  valve or money becomes your one-tap question.
+  valve or money becomes your one-tap question. When they get an alert
+  you didn't answer, their only button is **I'm on it**.
 - **Everything is written down.** Every action is a line in a log on your
   computer (`harness log runs` lists them), and your tokens stay in your
   system's key store: never in a chat, a log or a report.

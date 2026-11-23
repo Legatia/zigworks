@@ -386,7 +386,9 @@ allow mcp home/home_wait *
 A trigger in `triggers.ini` reads a resource; harness subscribes to it, so
 the trigger runs when homemcp pushes the change, not on its next poll.
 `announce` says a line aloud for each event, in the room homemcp's change
-names (only urgent triggers speak during quiet hours):
+names, or on every speaker with `speakers = all` (only urgent triggers
+speak during quiet hours; an urgent alert nobody answers goes to the
+household with harness's `[butler] escalate`):
 
 ```ini
 [back-door]
@@ -400,6 +402,14 @@ match = text has "to":"wet"
 urgent = yes
 say = Water under the kitchen sink.
 announce = Water under the kitchen sink.
+
+[smoke]
+mcp = home resource home://device/kitchen_smoke_alarm
+match = to is ALARM
+urgent = yes
+say = Smoke alarm in the kitchen.
+announce = Smoke alarm in the kitchen.
+speakers = all
 
 [everyone-out]
 mcp = home resource home://presence

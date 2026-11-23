@@ -46,7 +46,7 @@
 6. **What a member gets.** What: "Nobody has answered this yet: TEXT" [I'm on it] in their own chat with the bot (made as a conversation if it isn't one), TEXT the alert's first line; never its buttons. One who can't be reached (not joined, never wrote to the bot) is logged, the owner told once per alert, and the next step still goes. Cost if wrong: none found.
 7. **A member's [I'm on it] acknowledges for everyone.** What: escalation stops, no fallback; the owner hears "Anna is on it: TEXT"; the other members' messages are edited "Anna is on it, HH:MM"; the owner's question stays open (members approve nothing). The owner acknowledging after members were told edits theirs "The owner answered, HH:MM". A member's reply in words is not an acknowledgement (it is their message to the bot). Cost if wrong: Anna replying "coming" doesn't stop Piotr being told.
 8. **Speakers.** What: where the alert's trigger (or the trigger that started its workflow) has `announce`, each escalation step says that line again, through the gate as the trigger's own announce (urgent: at night too); the line is noted when the trigger acts. Why: the spec; the line the owner wrote. Cost if wrong: a workflow started by hand (no trigger) has nothing said.
-9. **`state/alerts`.** What: `{"v":1,"next":N,"alerts":[…]}`, written whole before what follows acts on it, texts masked; an alert closes when acknowledged, when its question closes otherwise (expired, withdrawn, void), or 24 hours after it began; closed alerts are dropped. Cost if wrong: none found.
+9. **`state/alerts`.** What: `{"v":1,"next":N,"alerts":[…]}`, written whole at each change, texts masked; an alert is made (and written) before its post is sent, so a post that doesn't get through still escalates; a step is written once its member was told, and a fallback once its answer is on disk (answerItem takes an item only while it is open, so it is never made twice); an alert ends when acknowledged or its question closes otherwise (expired, withdrawn, void), and is dropped a day after it began (kept that long so the instance's later posts make no second alert). Why: a member told twice is better than never. Cost if wrong: a crash right after a member's message tells them again.
 10. **The fallback.** What: at D after the question, nobody acknowledging and the question open, harness answers it as the yes tap would (via `fallback`), once; the call is the gate's (logged "made by harness: no one answered in time"); the instance's next `say` begins "No one answered in N minutes: "; the question's message says "Close the water main (no one answered: harness did it), 03:17"; an `alert` log line `absence` holds the alert, its time, the fallback's time and the call. Escalation goes on (the fallback is no acknowledgement). Why: the spec; the instance's own say reads back what the device reported. Cost if wrong: a routine without a say after the call tells the owner only by the edited question.
 11. **The fallback's limits.** What: `fallback D` goes with `yes`, in a workflow that says `urgent yes`, before a `SERVER/home_guarded` step whose `action` is lock, close, arm_home or arm_away; D from 1 minute to less than the step's timeout. Why: the red lines; homemcp's own allow list is the second wall. Cost if wrong: a valve on a plain switch (safe way `off`) gets no fallback.
 12. **The leak's fallback offered after Turn on.** What: when the leak routine is turned on with a valve (kind valve, close), a second item: the line it adds shown first, "If nobody answers in 5 minutes, I close the water main myself, once, and tell you." [Turn on] [Not now]; Turn on writes leak.wf again from its template only while it is as setup wrote it, else says to add the line by hand; `/setup routines` offers it again while leak is on without it. Cost if wrong: an owner who edited leak.wf adds a line by hand.
@@ -54,43 +54,45 @@
 14. **The smoke routine.** What: a workflow `smoke` (urgent, one say) and a trigger section per detector (`to is ALARM`, urgent, `announce` with `speakers = all` when the home has a speaker that may announce); escalation from `[butler]`; no fallback (nothing to close). Cost if wrong: none found.
 15. **`speakers = all`** on a trigger with `announce`: said on every speaker, not only in the event's room. Why: smoke concerns the whole house. Cost if wrong: none found.
 16. **Log kind `alert`**: open, escalated, announced, acknowledged, absence, closed. Cost if wrong: none.
+17. **A post with an Undo button gets no [I'm on it].** What: a run's post carries one extra button; Undo keeps its place, and a tap on Undo or a reply acknowledges. Why: `sendWithButtons` takes one extra; urgent posts are trigger and workflow lines, which change no files. Cost if wrong: an urgent `do` run that wrote files has no [I'm on it].
+18. **The fallback's say.** What: the instance keeps `absent` (minutes) in its state after the fallback's call; its next `say` begins "No one answered in N minutes: " and clears it. Why: the routine's own line reads back what the device reported; one message says both. Cost if wrong: a routine whose next step after the call isn't a say tells it at the next say (or only by the edited question).
 
 ## Files
 
 - Create `harness/src/alerts.zig`; `harness/examples/butler/workflows/smoke.wf`.
-- Modify `harness/src/config.zig`, `triggers.zig`, `workflows.zig`, `wstate.zig` (`absent`), `inbox.zig` (`Via.fallback`), `agent.zig` (one line), `log.zig` (kind), `butler.zig`, `core.zig` (section + hooks), `fake_mcp.zig` (a smoke alarm), `examples/butler/*`, `scripts/smoke.sh`, `README.md`, `TESTERS.md`.
-- homemcp: `src/model.zig`, `config.zig`, `discover.zig`, `server.zig`, `sim.zig`, `main.zig` (check's line), `scripts/smoke.sh`, `README.md`.
+- Modify `harness/src/config.zig`, `triggers.zig`, `workflows.zig`, `wstate.zig` (`absent`), `inbox.zig` (`Via.fallback`), `agent.zig` (one line), `log.zig` (kind), `butler.zig`, `core.zig` (section + hooks), `examples/butler/*`, `scripts/smoke.sh`, `README.md`, `TESTERS.md`. (fake_mcp.zig needed no change: its home serves any device's file.)
+- homemcp: `src/model.zig`, `config.zig`, `discover.zig`, `server.zig`, `main.zig` (check's line), `examples/ha.ini`, `scripts/smoke.sh`, `README.md`. (sim.zig already had the kitchen smoke alarm.)
 
 ---
 
 ### Task 1: Reading escalate, speakers and fallback
 
-- [ ] **Step 1: Write the failing tests:** alerts.zig `escalate_reads_steps_or_no`; config.zig `butler_escalate_reads`; triggers.zig `escalate_and_speakers_are_read`; workflows.zig `escalate_is_read_in_the_head`, `fallback_takes_only_a_safe_call_of_an_urgent_routine`, `a_fallback_on_unlock_is_refused_when_read`.
-- [ ] **Step 2:** run; expect failures (no such keys).
-- [ ] **Step 3:** implement; readings say them.
-- [ ] **Step 4:** whole suite green.
-- [ ] **Step 5:** commit.
+- [x] **Step 1: Write the failing tests:** alerts.zig `escalate_reads_steps_or_no`; config.zig `butler_escalate_reads`; triggers.zig `escalate_and_speakers_are_read`; workflows.zig `escalate_is_read_in_the_head`, `fallback_takes_only_a_safe_call_of_an_urgent_routine`, `a_fallback_on_unlock_is_refused_when_read`.
+- [x] **Step 2:** run; expect failures (no such keys).
+- [x] **Step 3:** implement; readings say them.
+- [x] **Step 4:** whole suite green.
+- [x] **Step 5:** commit.
 
 ### Task 2: Alerts, acknowledging and escalation
 
-- [ ] **Step 1: Write the failing tests:** alerts.zig `the_store_keeps_alerts_across_a_load`; core.zig `escalation_in_order_until_acknowledged` (owner's [I'm on it], a reply, item answers), `a_members_on_it_acknowledges_for_everyone`, `nothing_escalates_for_non_urgent_alerts`, `escalation_survives_a_restart`, `escalation_goes_on_when_a_member_cant_be_reached`, `speakers_say_it_again_at_each_step`.
-- [ ] **Step 2–4:** fail, implement, green.
-- [ ] **Step 5:** commit.
+- [x] **Step 1: Write the failing tests:** alerts.zig `the_store_keeps_alerts_across_a_load`; core.zig `escalation_in_order_until_acknowledged` (owner's [I'm on it], a reply, item answers), `a_members_on_it_acknowledges_for_everyone`, `nothing_escalates_for_non_urgent_alerts`, `escalation_survives_a_restart`, `escalation_goes_on_when_a_member_cant_be_reached`, `speakers_say_it_again_at_each_step`.
+- [x] **Step 2–4:** fail, implement, green.
+- [x] **Step 5:** commit.
 
 ### Task 3: The fallback
 
-- [ ] **Step 1: Write the failing tests:** core.zig `the_fallback_makes_the_safe_call_once_and_says_so`, `no_fallback_once_someone_is_on_it`; butler/core `setup_offers_the_leaks_fallback`.
-- [ ] **Step 2–5:** fail, implement, green, commit.
+- [x] **Step 1: Write the failing tests:** core.zig `the_fallback_makes_the_safe_call_once_and_says_so`, `no_fallback_once_someone_is_on_it`; butler/core `setup_offers_the_leaks_fallback`.
+- [x] **Step 2–5:** fail, implement, green, commit.
 
 ### Task 4: homemcp: smoke and CO watched
 
-- [ ] **Step 1: Write the failing tests:** `smoke_and_co_are_watched_only` (config refusals, server refusals, state), discover's test (listed, watched), events (pushed); smoke script.
-- [ ] **Step 2–5:** fail, implement, green (Debug and ReleaseSafe), commit.
+- [x] **Step 1: Write the failing tests:** `smoke_and_co_are_watched_only` (config refusals, server refusals, state), discover's test (listed, watched), events (pushed); smoke script.
+- [x] **Step 2–5:** fail, implement, green (Debug and ReleaseSafe), commit.
 
 ### Task 5: The smoke routine
 
-- [ ] **Step 1: Write the failing tests:** butler.zig `the_smoke_routine_fills_for_a_home_with_one`; core.zig `the_smoke_routine_says_it_everywhere_and_escalates`; smoke script with the stand-ins.
-- [ ] **Step 2–5:** fail, implement, green, commit.
+- [x] **Step 1: Write the failing tests:** butler.zig `the_smoke_routine_fills_for_a_home_with_one`; core.zig `the_smoke_routine_says_it_everywhere_and_escalates`; smoke script with the stand-ins.
+- [x] **Step 2–5:** fail, implement, green, commit.
 
 ### Task 6: READMEs, TESTERS.md, the full runs
 
@@ -98,4 +100,10 @@
 
 ## Done
 
-(Filled at the end.)
+Branch `platform/emergencies` from 6aeb887: 318ed3f (Task 1 and this plan), 97be032 (Tasks 2–3), 4c144d7 (Task 4, homemcp), 316371f (Task 5), then the READMEs, TESTERS.md and this section.
+
+- **Runs.** harness: Debug and ReleaseSafe 971/991 (20 skipped: Windows or Linux only), smoke 101 ok, and with HOMEMCP_BIN and CARCLOUD_BIN 124 ok (23 with the stand-ins, 2 new: the smoke alarm answered with I'm on it, the leak's fallback turned on). homemcp: Debug and ReleaseSafe 41/41, smoke 64 ok (the Zigbee2MQTT checks skipped without Mosquitto). Cross builds (x86_64-windows, x86_64-linux-musl, aarch64-linux-musl): harness `zig build` and `unit-build`, homemcp `zig build`, all ok. No test was flaky.
+- **Seen failing first, for the reason they name:** Task 1's against missing keys (compile errors: no parseEscalate, Speakers, escalate, fallback); Task 2's core tests waited for [I'm on it] and the members' messages that never came; Task 3's with the fallback's tick and the setup offer switched off (no "No one answered" line, no offer); homemcp's against no kind `smoke`; Task 5's against no smoke routine (no Kind.smoke, Picks.smokes). `nothing_escalates_for_non_urgent_alerts` and `no_fallback_once_someone_is_on_it` guard what must not happen and passed before too.
+- **Tests changed on purpose:** harness `a_routine_is_shown_then_written_on_turn_on` (the leak's fallback offered after the leak, Not now); butler.zig's sim home and its tests (the smoke alarm a device of kind smoke: 16 devices, 3 left out, 8 trigger sections, "smoke" only in its own routine's files); the smoke script's butler run (17 devices, the fallback and the smoke routine turned on, 7 routines on). homemcp `discover_writes_safe_defaults` and the Zigbee2MQTT discover test (the alarm listed and watched, 17 devices, CO and gas kind smoke), its smoke script's discover summary.
+- **Where core.zig changed:** one `Emergency` struct at the end of the file, with its tests; one-line hooks in `open`/`close` (the field), `noteUrgent`, `postShaped` (the alert and its button), `addItem`, `settle`, `handleCallbackText` (two), `handleIncoming` (a reply), `tick`, `actTrigger`, `triggerAnnounce` (`speakers = all`), `askStep` (the fallback), `sayStep` (its line), `setupAnswer`/`startOffers`/`offerNext`/`setupFollow`/`setupPicks` (the leak's fallback offer, escalation in sentences), `ItemAnswer.via`, `WfAsker` (the fallback's key), `InstRun.yes_fallback`.
+- **Left out:** `/setup` offering escalation (`[butler] escalate` is written by hand); a member reached in a group (only their own chat with the bot); members told what the fallback did; a typed message without replying as an acknowledgement (Ruling 1); [I'm on it] beside Undo (Ruling 17); the fallback for a valve on a plain switch (Ruling 11); `/alerts`; anything against a real Telegram account, household, alarm, valve or speaker.
