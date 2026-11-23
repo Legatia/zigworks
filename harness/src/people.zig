@@ -131,6 +131,12 @@ pub fn dayWords(a: std.mem.Allocator, day: i64) ![]const u8 {
     return dateOfDay(day).words(a);
 }
 
+/// "2026-11-28".
+fn dayText(a: std.mem.Allocator, day: i64) ![]const u8 {
+    var db: [10]u8 = undefined;
+    return a.dupe(u8, dateOfDay(day).text(&db));
+}
+
 /// "Saturday 28 November".
 fn weekdayWords(a: std.mem.Allocator, day: i64) ![]const u8 {
     const c = util.civil(day);
@@ -764,6 +770,13 @@ pub const Book = struct {
         }.lt);
     }
 
+    /// The last day planned.
+    pub fn plannedThrough(b: *Book) i64 {
+        b.mutex.lockUncancelable(b.io);
+        defer b.mutex.unlock(b.io);
+        return b.told_day;
+    }
+
     pub fn count(b: *Book) usize {
         b.mutex.lockUncancelable(b.io);
         defer b.mutex.unlock(b.io);
@@ -964,7 +977,23 @@ pub const Book = struct {
         try util.writeReplace(b.io, path, try p.render(a));
     }
 
-    pub const Imported = struct { new: usize = 0, updated: usize = 0, same: usize = 0, skipped: usize = 0, full: bool = false };
+    pub const Imported = struct {
+        new: usize = 0,
+        updated: usize = 0,
+        same: usize = 0,
+        skipped: usize = 0,
+        full: bool = false,
+
+        /// "From contacts.vcf: 2 new, 1 updated, 3 already known; 1 card without a name left out."
+        pub fn text(g: Imported, a: std.mem.Allocator, file: []const u8) ![]const u8 {
+            var out: std.ArrayList(u8) = .empty;
+            try out.print(a, "From {s}: {d} new, {d} updated, {d} already known", .{ file, g.new, g.updated, g.same });
+            if (g.skipped > 0) try out.print(a, "; {d} card{s} without a name left out", .{ g.skipped, if (g.skipped == 1) "" else "s" });
+            if (g.full) try out.appendSlice(a, "; the book is full (5,000 people), the rest left out");
+            try out.append(a, '.');
+            return out.items;
+        }
+    };
 
     /// A contacts file (vCard 3 or 4) into the book: a card is the person
     /// with one of its emails, or its whole name, or (someone known by a
@@ -1101,6 +1130,143 @@ pub const Book = struct {
         try out.print(b.gpa, "day {d}\n", .{b.told_day});
         for (b.told.keys(), b.told.values()) |k, v| try out.print(b.gpa, "{d} {s}\n", .{ v, k });
         try util.writeReplace(b.io, b.told_path, out.items);
+    }
+
+    /// The people known, for the memory writer: names, what the owner
+    /// calls them, relations; at most `max` bytes.
+    pub fn knownNames(b: *Book, a: std.mem.Allocator, max: usize) ![]const u8 {
+        b.mutex.lockUncancelable(b.io);
+        defer b.mutex.unlock(b.io);
+        var out: std.ArrayList(u8) = .empty;
+        for (b.entries.items) |e| {
+            var line: std.ArrayList(u8) = .empty;
+            try line.print(a, "- {s}", .{try e.p.title(a)});
+            if (e.p.called.items.len > 0) try line.print(a, ", called {s}", .{try std.mem.join(a, ", ", e.p.called.items)});
+            try line.append(a, '\n');
+            if (out.items.len + line.items.len > max) break;
+            try out.appendSlice(a, line.items);
+        }
+        if (out.items.len == 0) return "";
+        return std.fmt.allocPrint(a, "People known:\n{s}", .{out.items});
+    }
+
+    /// The memory writer's facts (an owner's own conversation's), on day
+    /// `day`: someone new for a name no one has, nothing for a name
+    /// several share; a line for the owner per person given something new
+    /// (being in touch alone is noted without one).
+    pub fn fromWriter(b: *Book, a: std.mem.Allocator, facts: []const Fact, day: i64) ![]const []const u8 {
+        b.mutex.lockUncancelable(b.io);
+        defer b.mutex.unlock(b.io);
+        const Said = struct { e: *Entry, words: std.ArrayList([]const u8) = .empty, saved: bool = false };
+        var said: std.ArrayList(Said) = .empty;
+        for (facts[0..@min(facts.len, 40)]) |x| {
+            const field = Field.of(x.field) orelse continue;
+            const v = if (field == .in_touch) try dayText(a, day) else try clean(a, x.value);
+            const name = try clean(a, x.name);
+            if (v.len == 0 or name.len == 0) continue;
+            const e = switch (try b.resolve(a, name)) {
+                .one => |e| e,
+                .several => continue,
+                .none => blk: {
+                    if (b.entries.items.len >= max_people) continue;
+                    break :blk try b.newEntry(name, day);
+                },
+            };
+            const slot = for (said.items) |*w| {
+                if (w.e == e) break w;
+            } else blk: {
+                try said.append(a, .{ .e = e });
+                break :blk &said.items[said.items.len - 1];
+            };
+            switch (try apply(&e.p, e.arena.allocator(), a, field, v, day)) {
+                .added => |words| {
+                    slot.saved = true;
+                    if (field != .in_touch) try slot.words.append(a, words);
+                },
+                else => {},
+            }
+        }
+        var notes: std.ArrayList([]const u8) = .empty;
+        for (said.items) |w| {
+            if (!w.saved) {
+                // someone named with nothing that took: not kept
+                if (!b.onDisk(a, w.e)) b.dropEntry(w.e);
+                continue;
+            }
+            try b.save(a, &w.e.p);
+            if (w.words.items.len > 0) try notes.append(a, try std.fmt.allocPrint(a, "Noted about {s}: {s}. (/person {s})", .{ w.e.p.name, try std.mem.join(a, "; ", w.words.items), w.e.p.name }));
+        }
+        return notes.items;
+    }
+
+    /// Whether a person's file is written (someone just made is not).
+    fn onDisk(b: *Book, a: std.mem.Allocator, e: *const Entry) bool {
+        const path = std.fs.path.join(a, &.{ b.dir, std.fmt.allocPrint(a, "{s}.txt", .{e.p.id}) catch return true }) catch return true;
+        Io.Dir.cwd().access(b.io, path, .{}) catch return false;
+        return true;
+    }
+
+    /// The one person `name` names whole (score 3), or the one with `email`.
+    fn exact(b: *Book, a: std.mem.Allocator, at: Attendee) !?*Entry {
+        if (at.email.len > 0) for (b.entries.items) |e| for (e.p.emails.items) |m| if (std.ascii.eqlIgnoreCase(m, at.email)) return e;
+        if (at.name.len == 0) return null;
+        const q = try norm(a, at.name);
+        var found: ?*Entry = null;
+        for (b.entries.items) |e| if (try score(a, e, q) == 3) {
+            if (found != null) return null;
+            found = e;
+        };
+        return found;
+    }
+
+    /// Attendees of a calendar's events: the new ones added (by name and
+    /// email; one with an email alone is not), an email added to someone
+    /// known by name; the new names.
+    pub fn fromCalendar(b: *Book, a: std.mem.Allocator, attendees: []const Attendee, today: i64) ![]const []const u8 {
+        b.mutex.lockUncancelable(b.io);
+        defer b.mutex.unlock(b.io);
+        var added: std.ArrayList([]const u8) = .empty;
+        for (attendees[0..@min(attendees.len, 40)]) |at| {
+            if (try b.exact(a, at)) |e| {
+                if (at.email.len > 0 and (try apply(&e.p, e.arena.allocator(), a, .email, at.email, today)) == .added) try b.save(a, &e.p);
+                continue;
+            }
+            const name = try clean(a, at.name);
+            if (name.len == 0 or b.entries.items.len >= max_people) continue;
+            const e = try b.newEntry(name, today);
+            if (at.email.len > 0) _ = try apply(&e.p, e.arena.allocator(), a, .email, at.email, today);
+            try b.save(a, &e.p);
+            try added.append(a, try a.dupe(u8, e.p.name));
+        }
+        return added.items;
+    }
+
+    /// For meeting preparation (the diary): a line for each attendee
+    /// known (by email, or their whole name), with their relation,
+    /// preferences, notes and a birthday within two weeks of `today`; ""
+    /// when none is known. Only for posts to the owner's own conversations.
+    pub fn meetingNote(b: *Book, a: std.mem.Allocator, attendees: []const Attendee, today: i64) ![]const u8 {
+        b.mutex.lockUncancelable(b.io);
+        defer b.mutex.unlock(b.io);
+        var out: std.ArrayList(u8) = .empty;
+        for (attendees) |at| {
+            const e = (try b.exact(a, at)) orelse continue;
+            const p = &e.p;
+            var facts: std.ArrayList([]const u8) = .empty;
+            for (p.preferences.items) |x| try facts.append(a, x);
+            for (p.notes.items) |x| try facts.append(a, x);
+            if (p.birthday) |d| {
+                const in_days = nextOn(d, today) - today;
+                const md = try (Date{ .m = d.m, .d = d.d }).words(a);
+                if (in_days == 0) try facts.append(a, "birthday today") else if (in_days == 1) try facts.append(a, try std.fmt.allocPrint(a, "birthday tomorrow, {s}", .{md})) else if (in_days <= 14) try facts.append(a, try std.fmt.allocPrint(a, "birthday {s}, in {d} days", .{ md, in_days }));
+            }
+            if (facts.items.len == 0 and p.relation.len == 0) continue;
+            if (out.items.len > 0) try out.append(a, '\n');
+            try out.appendSlice(a, try p.title(a));
+            if (facts.items.len > 0) try out.print(a, ": {s}", .{try std.mem.join(a, "; ", facts.items)});
+            try out.append(a, '.');
+        }
+        return out.items;
     }
 
     /// The person a card is: by email, by the whole name, or someone
@@ -1381,6 +1547,180 @@ pub fn lineText(a: std.mem.Allocator, l: Line, idea: ?[]const u8) ![]const u8 {
     }
     if (l.reach.len > 0) try out.print(a, " {s}.", .{l.reach});
     return out.items;
+}
+
+// ---- the tool ----
+
+pub const tool_def: model.ToolDef = .{
+    .name = "people",
+    .description = "The people the owner deals with (family, friends, colleagues). find: who matches a name, what the owner calls them (\"my sister\") or a relation; empty name lists everyone. show: all that is known of one person: what they are called, relation, birthday and other dates, preferences, notes, how to reach them, when the owner was last in touch, how often they want to be. note: one fact the owner told you about a person (someone new when no one has the name).",
+    .schema_json =
+    \\{"type":"object","properties":{"action":{"type":"string","enum":["find","show","note"]},"name":{"type":"string","description":"the person (find: words to look for)"},"field":{"type":"string","enum":["called","relation","birthday","anniversary","date","preference","note","email","phone","in touch","keep in touch"],"description":"note: which fact"},"value":{"type":"string","description":"note: the fact. Dates YYYY-MM-DD, or MM-DD without the year; date: a label and a date (name day 06-24); in touch: a date or today; keep in touch: 3 months, 2 weeks, a year, or off"}},"required":["action"]}
+    ,
+};
+
+/// What the gate decides on: `find WORDS`, `show NAME`, `note NAME FIELD`.
+pub fn gateArg(a: std.mem.Allocator, input_json: []const u8) ![]const u8 {
+    const v = jv.parse(a, input_json) orelse return error.BadInput;
+    const action = jv.str(jv.get(v, "action")) orelse return error.BadInput;
+    const name = std.mem.trim(u8, jv.str(jv.get(v, "name")) orelse "", " \t\r\n");
+    if (std.mem.eql(u8, action, "find")) return if (name.len == 0) "find" else std.fmt.allocPrint(a, "find {s}", .{name});
+    if (name.len == 0) return error.BadInput;
+    if (std.mem.eql(u8, action, "show")) return std.fmt.allocPrint(a, "show {s}", .{name});
+    if (std.mem.eql(u8, action, "note")) {
+        const field = jv.str(jv.get(v, "field")) orelse return error.BadInput;
+        return std.fmt.allocPrint(a, "note {s} {s}", .{ name, field });
+    }
+    return error.BadInput;
+}
+
+pub const Called = struct {
+    text: []const u8,
+    is_error: bool = false,
+    /// What the owner is told beside the answer (a fact noted).
+    notice: ?[]const u8 = null,
+};
+
+/// A `people` call; `private`: the run's conversation is private (nothing
+/// is noted).
+pub fn call(b: *Book, a: std.mem.Allocator, input_json: []const u8, today: i64, private: bool) !Called {
+    const v = jv.parse(a, input_json) orelse return .{ .text = "the input must be JSON", .is_error = true };
+    const action = jv.str(jv.get(v, "action")) orelse "";
+    const name = jv.str(jv.get(v, "name")) orelse "";
+    if (std.mem.eql(u8, action, "find")) return .{ .text = try b.findText(a, name) };
+    if (std.mem.eql(u8, action, "show")) return .{ .text = try b.cardText(a, name) };
+    if (!std.mem.eql(u8, action, "note")) return .{ .text = "action is one of find, show, note", .is_error = true };
+    if (private) return .{ .text = "not saved: this conversation is private" };
+    const n = try b.note(a, name, jv.str(jv.get(v, "field")) orelse "", jv.str(jv.get(v, "value")) orelse "", today);
+    if (!n.ok) return .{ .text = n.text, .is_error = true };
+    const got = (try b.get(a, name)) orelse return .{ .text = n.text };
+    return .{ .text = n.text, .notice = if (n.saved) try std.fmt.allocPrint(a, "{s} (/person {s})", .{ n.text, got.name }) else null };
+}
+
+// ---- the memory writer, the calendar, the diary ----
+
+/// What the memory writer's prompt adds in the owner's own conversations.
+pub const writer_prompt =
+    \\
+    \\
+    \\Then, for each person the owner deals with who comes up (family, friends, colleagues, others they know; never the owner), one line per fact in the form
+    \\person: NAME | FIELD | VALUE
+    \\NAME as the owner names them (when the person is among the people known below, their name as written there; with no name, how the owner calls them, like "my sister"). FIELD is one of: called (what the owner calls them), relation (to the owner), birthday, anniversary, date (a label and a date: name day 06-24), preference (what they like or must avoid: "likes Polish poetry", "allergic to nuts"), note (another lasting fact), email, phone, in touch (the owner says they met, called or wrote to them; VALUE yes), keep in touch (the owner wants to be in touch that often: 3 months). Dates as YYYY-MM-DD, or MM-DD without the year. Facts about these people go only in person lines, not in "- " lines. Nothing guessed.
+;
+
+/// A fact the memory writer recognised: `person: NAME | FIELD | VALUE`.
+pub const Fact = struct { name: []const u8, field: []const u8, value: []const u8 };
+
+pub fn writerFact(line_in: []const u8) ?Fact {
+    const line = std.mem.trim(u8, line_in, " \t\r");
+    if (!std.ascii.startsWithIgnoreCase(line, "person:")) return null;
+    const rest = line["person:".len..];
+    const bar1 = std.mem.indexOfScalar(u8, rest, '|') orelse return null;
+    const bar2 = std.mem.indexOfScalarPos(u8, rest, bar1 + 1, '|') orelse return null;
+    const name = std.mem.trim(u8, rest[0..bar1], " \t");
+    const field = std.mem.trim(u8, rest[bar1 + 1 .. bar2], " \t");
+    const value = std.mem.trim(u8, rest[bar2 + 1 ..], " \t");
+    if (name.len == 0 or field.len == 0 or value.len == 0) return null;
+    for ([_][]const u8{ "me", "i", "myself", "owner", "the owner", "user", "the user" }) |w| if (std.ascii.eqlIgnoreCase(name, w)) return null;
+    return .{ .name = name, .field = field, .value = value };
+}
+
+/// An event's attendee, as a calendar tool gives them.
+pub const Attendee = struct { name: []const u8 = "", email: []const u8 = "" };
+
+/// The attendees in a calendar tool's answer (JSON, alone or after some
+/// words), from every `attendees` list in it; the owner's own (`"self":
+/// true`) left out, and lists of more than 10 (a large meeting adds no one).
+pub fn attendeesOf(a: std.mem.Allocator, text: []const u8) ![]const Attendee {
+    var out: std.ArrayList(Attendee) = .empty;
+    const v = jv.parse(a, text) orelse blk: {
+        const from = std.mem.indexOfAny(u8, text, "{[") orelse return out.items;
+        const to = std.mem.lastIndexOfAny(u8, text, "}]") orelse return out.items;
+        if (to <= from) return out.items;
+        break :blk jv.parse(a, text[from .. to + 1]) orelse return out.items;
+    };
+    try walkAttendees(a, v, &out, 0);
+    return out.items;
+}
+
+fn walkAttendees(a: std.mem.Allocator, v: jv.Value, out: *std.ArrayList(Attendee), depth: u8) !void {
+    if (depth > 8) return;
+    switch (v) {
+        .array => |l| for (l.items) |x| try walkAttendees(a, x, out, depth + 1),
+        .object => |o| {
+            var it = o.iterator();
+            while (it.next()) |e| {
+                if (std.ascii.eqlIgnoreCase(e.key_ptr.*, "attendees") and e.value_ptr.* == .array) {
+                    const items = e.value_ptr.array.items;
+                    if (items.len > 10) continue;
+                    for (items) |x| if (attendeeOf(x)) |at| try out.append(a, at);
+                } else try walkAttendees(a, e.value_ptr.*, out, depth + 1);
+            }
+        },
+        else => {},
+    }
+}
+
+fn attendeeOf(x: jv.Value) ?Attendee {
+    var at: Attendee = .{};
+    switch (x) {
+        .object => {
+            if (jv.boolean(jv.get(x, "self")) orelse jv.boolean(jv.get(x, "is_self")) orelse false) return null;
+            for ([_][]const u8{ "name", "cn", "displayName", "display_name" }) |k| if (jv.str(jv.get(x, k))) |n| {
+                at.name = n;
+                break;
+            };
+            for ([_][]const u8{ "email", "mail", "address" }) |k| if (jv.str(jv.get(x, k))) |m| {
+                at.email = m;
+                break;
+            };
+        },
+        .string => |s| {
+            if (std.mem.indexOfScalar(u8, s, '<')) |lt| {
+                at.name = std.mem.trim(u8, s[0..lt], " \t\"");
+                at.email = std.mem.trim(u8, s[lt + 1 ..], " \t>");
+            } else if (std.mem.indexOfScalar(u8, s, '@') != null) at.email = s else at.name = s;
+        },
+        else => return null,
+    }
+    if (std.ascii.startsWithIgnoreCase(at.email, "mailto:")) at.email = at.email[7..];
+    at.name = std.mem.trim(u8, at.name, " \t");
+    at.email = std.mem.trim(u8, at.email, " \t");
+    if (at.email.len > 0 and !validEmail(at.email)) at.email = "";
+    if (at.name.len == 0 and at.email.len == 0) return null;
+    return at;
+}
+
+/// Whether an MCP tool's answers may hold calendar attendees: calmcp's
+/// reads (`cal_event`, `cal_agenda`), on any server name.
+pub fn calendarTool(tool: []const u8) bool {
+    return std.mem.eql(u8, tool, "cal_event") or std.mem.eql(u8, tool, "cal_agenda");
+}
+
+/// What the gift idea's model call is told (no name, no relation, no date).
+pub const gift_prompt = "Suggest one gift for the occasion below, for someone with the preferences listed, from the search results when one fits (with its link). Keep every preference in mind: an allergy rules out food with it. Answer in one line of at most 25 words: the gift, then its link. Nothing is bought: it is only an idea for the owner. If nothing fits, answer NONE.";
+
+/// The gift idea's request: the occasion, the preferences, the search's results.
+pub fn giftAsk(a: std.mem.Allocator, l: Line, results: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(a, "Occasion: {s}.\nTheir preferences:\n", .{if (l.occasion == .birthday) "a birthday" else "an anniversary"});
+    for (l.preferences) |p| try out.print(a, "- {s}\n", .{p});
+    try out.print(a, "Search results:\n{s}\n", .{util.cut(results, 6000)});
+    return out.items;
+}
+
+/// The idea in the model's answer: its first line, cut; null for NONE.
+pub fn ideaOf(text: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        var l = std.mem.trim(u8, raw, " \t\r");
+        if (l.len == 0) continue;
+        if (std.mem.startsWith(u8, l, "- ")) l = std.mem.trim(u8, l[2..], " ");
+        if (std.ascii.startsWithIgnoreCase(l, "gift idea:")) l = std.mem.trim(u8, l["gift idea:".len..], " ");
+        if (l.len == 0 or std.ascii.eqlIgnoreCase(std.mem.trimEnd(u8, l, "."), "NONE")) return null;
+        return util.cut(l, 240);
+    }
+    return null;
 }
 
 const t = std.testing;
@@ -1797,4 +2137,85 @@ test "the_gift_search_carries_one_interest_only" {
     try t.expect(interestOf(&.{ "allergic to nuts", "vegetarian", "doesn't drink" }) == null);
     try t.expectEqualStrings("gift ideas for someone who likes Polish poetry", try giftQuery(a, "Likes Polish poetry"));
     try t.expectEqualStrings("gift ideas for a fan of jazz", try giftQuery(a, "fan of jazz"));
+}
+
+test "writer_lines_and_calendar_attendees_read" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const x = writerFact("person: Ola | birthday | 11-28").?;
+    try t.expectEqualStrings("Ola", x.name);
+    try t.expectEqualStrings("birthday", x.field);
+    try t.expectEqualStrings("11-28", x.value);
+    try t.expectEqualStrings("likes Polish poetry | and jazz", writerFact("person: Ola | preference | likes Polish poetry | and jazz").?.value);
+    for ([_][]const u8{ "- The owner likes tea", "person: Ola", "person:  | relation | sister", "person: me | relation | owner", "person: the owner | note | x" }) |bad| try t.expect(writerFact(bad) == null);
+    try t.expect(std.mem.indexOf(u8, writer_prompt, "person: NAME | FIELD | VALUE") != null);
+    const ev =
+        \\{"title":"Dinner","attendees":[{"name":"Ola Kowalska","email":"ola@example.com"},{"email":"marek@example.com"},{"name":"Me","email":"owner@example.com","self":true},{"cn":"Zofia Wójcik","mail":"mailto:zofia@example.com"},"Piotr Nowak <piotr@example.com>"]}
+    ;
+    const got = try attendeesOf(a, ev);
+    try t.expectEqual(4, got.len);
+    try t.expectEqualStrings("Ola Kowalska", got[0].name);
+    try t.expectEqualStrings("marek@example.com", got[1].email);
+    try t.expectEqualStrings("", got[1].name);
+    try t.expectEqualStrings("zofia@example.com", got[2].email);
+    try t.expectEqualStrings("Piotr Nowak", got[3].name);
+    try t.expectEqualStrings("piotr@example.com", got[3].email);
+    // an agenda: each event's attendees; not JSON: none
+    try t.expectEqual(2, (try attendeesOf(a, "{\"events\":[{\"attendees\":[{\"name\":\"A B\"}]},{\"attendees\":[{\"name\":\"C D\"}]}]}")).len);
+    try t.expectEqual(0, (try attendeesOf(a, "Dinner with Ola at 19:00")).len);
+    try t.expect(calendarTool("cal_event") and calendarTool("cal_agenda"));
+    try t.expect(!calendarTool("cal_create") and !calendarTool("home_state"));
+}
+
+test "people_from_the_writer_and_the_calendar" {
+    var f: BookFix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const day = dayOf(2026, 11, 23);
+    _ = try f.book.note(a, "Ola Kowalska", "email", "ola@example.com", day);
+    const notes = try f.book.fromWriter(a, &.{
+        .{ .name = "Ola", .field = "relation", .value = "sister" },
+        .{ .name = "Ola", .field = "birthday", .value = "1989-11-28" },
+        .{ .name = "Ola", .field = "in touch", .value = "yes" },
+        .{ .name = "Marek", .field = "note", .value = "plays the cello" },
+        .{ .name = "Marek", .field = "in touch", .value = "yes" },
+        .{ .name = "Basia", .field = "in touch", .value = "yes" },
+        .{ .name = "Ola", .field = "shoe size", .value = "38" },
+    }, day);
+    try t.expectEqual(2, notes.len);
+    try t.expectEqualStrings("Noted about Ola Kowalska: relation sister; birthday 28 November 1989. (/person Ola Kowalska)", notes[0]);
+    try t.expectEqualStrings("Noted about Marek: plays the cello. (/person Marek)", notes[1]);
+    try t.expectEqual(day, (try f.book.get(a, "Ola Kowalska")).?.in_touch.?);
+    // in touch alone is noted without a line
+    try t.expectEqual(day, (try f.book.get(a, "Basia")).?.in_touch.?);
+    const known = try f.book.knownNames(a, 4000);
+    try t.expect(std.mem.indexOf(u8, known, "- Ola Kowalska (sister)") != null);
+    try t.expect(std.mem.indexOf(u8, known, "1989") == null);
+    // the calendar: someone new by name and email; an email to someone known
+    const added = try f.book.fromCalendar(a, &.{ .{ .name = "Ola Kowalska", .email = "ola@example.com" }, .{ .name = "Marek", .email = "marek@example.com" }, .{ .name = "Zofia Wójcik", .email = "zofia@example.com" }, .{ .email = "x@example.com" } }, day);
+    try t.expectEqual(1, added.len);
+    try t.expectEqualStrings("Zofia Wójcik", added[0]);
+    try t.expectEqualStrings("marek@example.com", (try f.book.get(a, "Marek")).?.emails.items[0]);
+    try t.expect((try f.book.get(a, "x@example.com")) == null);
+    // a meeting: who is known, said in a line each
+    _ = try f.book.note(a, "Ola Kowalska", "preference", "likes Polish poetry", day);
+    const m = try f.book.meetingNote(a, &.{ .{ .name = "Ola Kowalska", .email = "ola@example.com" }, .{ .name = "Someone Else" } }, dayOf(2026, 11, 20));
+    try t.expectEqualStrings("Ola Kowalska (sister): likes Polish poetry; birthday 28 November, in 8 days.", m);
+    try t.expectEqualStrings("", try f.book.meetingNote(a, &.{.{ .name = "Someone Else" }}, day));
+}
+
+test "the_gift_idea_is_asked_without_the_name" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const l: Line = .{ .kind = .week, .key = "", .id = "ola-kowalska", .who = "Ola", .on = dayOf(2026, 11, 28), .in_days = 7, .years = 37, .preferences = &.{ "likes Polish poetry", "allergic to nuts" }, .interest = "likes Polish poetry" };
+    const ask = try giftAsk(a, l, "1. Map: Collected and Last Poems https://example.com/map");
+    for ([_][]const u8{ "birthday", "likes Polish poetry", "allergic to nuts", "Map: Collected and Last Poems" }) |want| try t.expect(std.mem.indexOf(u8, ask, want) != null);
+    for ([_][]const u8{ "Ola", "ola-kowalska", "37", "28" }) |never| try t.expect(std.mem.indexOf(u8, ask, never) == null);
+    try t.expect(std.mem.indexOf(u8, gift_prompt, "Nothing is bought") != null);
+    try t.expectEqualStrings("A Szymborska collection, https://example.com/map", ideaOf("A Szymborska collection, https://example.com/map\nIt suits her.").?);
+    try t.expect(ideaOf("NONE") == null);
+    try t.expect(ideaOf("  ") == null);
 }
