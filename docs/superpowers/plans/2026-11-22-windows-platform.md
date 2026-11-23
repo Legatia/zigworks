@@ -358,3 +358,123 @@ At 370f96e: Windows 11 708 pass, 47 skip; Linux (WSL, user tester) 736
 pass, 19 skip, smoke ok. One Linux run failed the Mac session's
 `an_item_expires_at_approval_seconds_or_its_turns_end` while the Windows
 suite ran beside it; alone it passed 5 of 5.
+
+## 8. Apps: the API, the bar, app_save, versions and forks (2026-11-23, branch `win/apps`, on `harness-logins` 1bd8dbe)
+
+Item 3 of the handoff's "Next" section: the rest of gap 8
+(`docs/superpowers/specs/2026-11-22-harness-apps-design.md`).
+
+Built:
+
+- `apps.zig`: built-in manifests; `fileListed`/`fileAbove`/`actListed`;
+  an app's data (`dataGet`/`dataPut`/`dataDelete`/`dataKeys`); `stage`
+  (the folder checked and copied to `state/apps/pending/ID/`, the version
+  it would get written, what changes), `describe` (what the owner is
+  asked), `install` (`approved` first, then renames; `installing` marks
+  it), `finishInstalls` (at a start), `versions`, `revert`, `fork`,
+  `draft`, `hasInline`.
+- `appserver.zig`: POST, PUT, DELETE and OPTIONS on a token's `api/` paths
+  (bodies up to 1 MiB, the preflight a frame's JSON call needs), a `Host`
+  the core implements (`api`, `shell`, `opened`), the bar on every page of
+  harness's own (`apps/common/shell.js`), `/s/SHELL/review/ID` (every file
+  in full, the draft in a frame under its own token, its API answering
+  403), `appUrl`/`reviewUrl`.
+- `core.zig`: `appApi` (info, memory, inbox, log, log/runs,
+  log/session/RID, log/verify, files, data, act, run), `appShellApi`
+  (`GET inbox`, `POST answer` through `answerItem(.bar)`), acts and runs
+  as jobs on threads of their own (`AppJob`, `AppAsk`), `appDesk` for the
+  agent's tools, `fillLinks`, `/app fork|versions|revert`,
+  `noteChangedApps` at a start.
+- `agent.zig`: `app_draft`, `app_save` (`AppDesk`, a setup call), `ask_owner`
+  takes `app`; no money from `app:` (`[money] apps`).
+- The built-in inbox, log and files read through the API.
+
+Rulings:
+
+- R15. `[apps] on` is on by default now, as the spec has it (it was off
+  until the API was in).
+- R16. A read the gate would ask about is refused: reads are never asked
+  (the spec gives reads allow or deny). Files pass `read_file` for
+  `app:NAME`; a folder on the way to a listed path can be listed and
+  shows only the entries that lead on.
+- R17. `api/log` reads the log's last 4 MiB (a viewer wants its newest
+  lines); `log/runs` and `log/session` read all of it, as the CLI does.
+- R18. `api/data` values come back as they were put, unmasked (they are
+  the app's own bytes); every other answer is masked. A built-in keeps no
+  data (its name has no folder in `apps/`).
+- R19. An act's `who` is `app:NAME` with no definition (as a workflow's
+  tool step): rules written for a definition don't apply to it. Its
+  question's deadline is `act_seconds`; a shell act's time is capped by
+  it too. A job is kept 10 minutes after it ended; only the app that
+  started it reads it.
+- R20. A run an app starts has no outbox (it can't `send`), takes a place
+  among `concurrent_runs` like a task, and holds its definition's place.
+- R21. Money: an app's act never (also refused before the gate when the
+  MCP tool is a money tool); a run it starts under `[money] apps`
+  (default off), as triggers and workflows.
+- R22. `app_draft` is offered where `app_save` is (runs the owner started
+  from a conversation). A draft under another name gets that name and
+  `forked_from`.
+- R23. The question is `describe` within 9 KB: files that changed first,
+  the rest counted ("and N more files, on the review page").
+- R24. Install: the app's `data/` moves into the new folder; the folder
+  replaced goes to `versions/N` by its own app.ini's version; saves that
+  were being asked are dropped at a start (their questions are void).
+- R25. `{app:NAME}`, `{app:NAME/VIEW}` and `{app-review:ID}` are filled
+  where text leaves for the owner (`sendTextAs`, `sendWithButtons`,
+  `showItemHow`); with no app server running the text says so. The log,
+  the inbox file and the model hold the placeholder.
+- R26. An item with `app` is shown with "In the NAME app: LINK" (view
+  `item-ID`) under it.
+- R27. The bar asks `api/inbox` every 2 s and ignores a click within 0.5 s
+  of drawing its buttons.
+- R28. `/app fork` approves the copy as the owner's at once: the owner
+  ran the command.
+- R29. Fixed on the way: `apps.approve` wrote a second `version` line
+  into an app.ini that had one after `[app]`, and the app then no longer
+  read (`/app approve` twice in a row failed). Test added.
+
+Tests (spec names where it has them): `app_save_installs_what_was_shown`,
+`a_long_file_list_is_cut_to_the_question`,
+`an_install_cut_by_a_crash_ends_at_the_next_start`,
+`app_versions_fork_revert`, `an_apps_data_is_its_own_keys`,
+`an_apps_files_and_acts_follow_its_manifest` (apps.zig);
+`app_api_calls_reach_the_host_from_the_apps_own_paths`,
+`the_bars_calls_need_the_shell_token_and_no_app_path_reaches_them`,
+`the_review_page_shows_a_save_in_full_and_its_draft_reads_nothing`
+(appserver.zig); `app_reads_follow_the_manifest`,
+`app_log_waits_for_a_new_line`, `app_answers_are_masked`,
+`app_files_follow_the_manifest_and_the_file_rules`,
+`an_apps_data_through_its_api`, `app_act_passes_the_gate_as_the_app`,
+`app_grants_cover_one_app_only`, `stop_ends_app_acts_and_runs`,
+`app_run_within_limits`,
+`bar_shows_every_open_item_and_answers_each_once`,
+`app_save_asks_every_time_and_installs_what_was_shown`,
+`app_save_denied_or_unreadable_installs_nothing`,
+`app_placeholder_filled_only_when_sent`,
+`the_app_commands_fork_list_versions_and_revert`,
+`an_item_with_an_app_carries_its_link`,
+`an_app_reads_and_acts_over_http_and_the_bar_answers` (core.zig);
+`app_save_is_offered_only_in_runs_the_owner_started_from_a_conversation`,
+`app_save_asked_every_time`, `an_apps_acts_and_runs_move_no_money`
+(agent.zig).
+
+By hand, in Chrome (headless, from the command line) against a running
+harness: an app in its frame could not reach the parent page, storage,
+cookies, a popup, another host or harness's own paths; a script written
+into its page did not run; an unlisted read and a file outside its
+`files` got 403; its listed file, its inbox read (no token) and a PUT to
+its data worked. In the desktop app's browser pane: the bar showed the
+waiting question and "Allow once" answered it (`via bar`, the command
+ran). That pane does not load frames from a local server, so apps
+themselves can't be looked at there.
+
+Left:
+
+- The two headless-Chrome tests of the spec (`app_frame_cannot_get_out`,
+  `builtin_apps_show_their_data`) are not unit tests: what they cover was
+  checked by hand as above.
+- `/reload` does not look for apps changed outside harness; a start,
+  `/apps` and the serving of an app's page do.
+- The end-to-end script (`scripts/smoke.sh`) has no step for apps.
+- macOS: nothing here is per-system, but none of it ran on a Mac.
