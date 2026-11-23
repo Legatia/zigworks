@@ -691,7 +691,8 @@ time before a body is read, else 401; a request over 256 KB 413; JSON,
 or server-sent events when the request streams. Home Assistant's tools,
 `max_tokens`, `temperature` and model are ignored. The listener binds
 only the address `listen` names: an IP address and port, never a name,
-`0.0.0.0` or `::`; `listen = off` switches it off. The token is never
+`0.0.0.0`, `::` or an IPv4 address written as IPv6; `listen = off`
+switches it off. The token is never
 logged and is masked like every secret.
 
 ### Saying things on the house's speakers

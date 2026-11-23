@@ -290,9 +290,10 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
 
 /// `[voice_agent] listen`: an IP address of this machine and its port
 /// (`192.168.1.20:8765`, `[::1]:8765` for IPv6); null for a name, a
-/// missing port, or every address at once (`0.0.0.0`, `::`): the voice
-/// agent listens on the house's network, never on every network the
-/// machine is on.
+/// missing port, every address at once (`0.0.0.0`, `::`), or an IPv4
+/// address written as IPv6 (`[::ffff:0.0.0.0]` could be every IPv4
+/// address): the voice agent listens on the house's network, never on
+/// every network the machine is on.
 pub fn parseListen(text: []const u8) ?std.Io.net.IpAddress {
     // the port is always written
     const port_at = if (text.len > 0 and text[0] == '[') std.mem.indexOf(u8, text, "]:") else std.mem.indexOfScalar(u8, text, ':');
@@ -300,7 +301,10 @@ pub fn parseListen(text: []const u8) ?std.Io.net.IpAddress {
     const ip = std.Io.net.IpAddress.parseLiteral(text) catch return null;
     switch (ip) {
         .ip4 => |x| if (std.mem.allEqual(u8, &x.bytes, 0)) return null,
-        .ip6 => |x| if (std.mem.allEqual(u8, &x.bytes, 0)) return null,
+        .ip6 => |x| {
+            if (std.mem.allEqual(u8, &x.bytes, 0)) return null;
+            if (std.mem.allEqual(u8, x.bytes[0..10], 0) and x.bytes[10] == 0xff and x.bytes[11] == 0xff) return null;
+        },
     }
     return ip;
 }
@@ -1311,6 +1315,8 @@ test "voice_agent_settings_read_and_checked" {
         "listen = homeassistant.local:8765", "listen = 0.0.0.0:8765", "listen = [::]:8765",
         "listen = 192.168.1.20",             "listen = ::1:8765",     "listen = 192.168.1.20:99999",
         "seconds = 3",                       "seconds = 90",          "token = Bad Name",
+        // an IPv4 address in IPv6's clothes: every IPv4 address, maybe
+        "listen = [::ffff:0.0.0.0]:8765",    "listen = [::ffff:192.168.1.20]:8765",
     }) |line| {
         const text = try std.fmt.allocPrint(a, "[voice_agent]\n{s}\n", .{line});
         if (parse(a, text)) |_| {
