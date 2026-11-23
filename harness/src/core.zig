@@ -7423,6 +7423,8 @@ const InstRun = struct {
         r.journal(.{ .step = s.name, .try_n = r.st.try_n, .event = "start" });
         // tests: harness stops here
         if (r.c.wf_test_stop == .after_mark) return false;
+        // its step line names its own run, if it has one
+        r.rid = 0;
         const out = try r.act(s, place);
         return r.apply(i, s, out);
     }
@@ -13998,4 +14000,96 @@ test "agent_steps_past_the_day_cap_wait" {
     f.core.fixed_now = st.wait.until + 1;
     runWorkflows(&f);
     try f.rec.waitFor("[think#2] Two.");
+}
+
+
+test "a_read_only_step_cut_by_a_restart_runs_again" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try writePage(&f, "n.txt", "the value");
+    try writeRules(&f, "allow fetch http://127.0.0.1:*/*\n");
+    try setWorkflow(&f, "look", "workflow look\nstep read\ntool fetch {\"url\": \"URL/page/n.txt\"}\nstep tell\nsay got: {read}\n");
+    // harness stops with the read under way
+    f.core.wf_test_stop = .after_mark;
+    _ = try f.core.command(a, "/workflow start look");
+    waitIdle(f.core);
+    const cut = try instState(&f, "look#1");
+    try t.expect(cut.under_way);
+    try t.expectEqualStrings("read", cut.step);
+    try restart(&f);
+    try f.core.setOwner(42);
+    runWorkflows(&f);
+    // it only reads: it runs again, nothing asked
+    try f.rec.waitFor("[look#1] got: ");
+    try t.expect(f.rec.count("the value") >= 1);
+    try t.expectEqual(0, f.rec.count("BUTTONS Interrupted ["));
+    try expectHas(try f.core.command(a, "/workflow look#1"), "cut off when harness stopped; it only reads, so it runs again");
+    try t.expectEqual(wstate.Status.done, (try instState(&f, "look#1")).status);
+}
+
+test "another_step_cut_by_a_restart_asks_in_the_inbox" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try writeRules(&f, "allow shell echo *\n");
+    try setWorkflow(&f, "ship", "workflow ship\nstep push\ntool shell {\"command\": \"echo pushed\"}\nstep tell\nsay {push}\n");
+    f.core.wf_test_stop = .after_mark;
+    _ = try f.core.command(a, "/workflow start ship");
+    waitIdle(f.core);
+    try restart(&f);
+    try f.core.setOwner(42);
+    runWorkflows(&f);
+    // it may have been done: asked, Run again, Skip or Stop
+    try f.rec.waitFor("BUTTONS Interrupted [1]\n[ship#1] Step push was under way when harness stopped and may have been done: shell {\"command\":\"echo pushed\"}");
+    const st = try instState(&f, "ship#1");
+    try t.expectEqual(wstate.Status.paused, st.status);
+    try t.expectEqualStrings("interrupted", st.wait.phase);
+    try f.press("rerun");
+    runWorkflows(&f);
+    try f.rec.waitFor("[ship#1] exit code 0\npushed");
+    // Skip goes on as if it failed
+    f.core.wf_test_stop = .after_mark;
+    _ = try f.core.command(a, "/workflow start ship");
+    waitIdle(f.core);
+    try restart(&f);
+    try f.core.setOwner(42);
+    runWorkflows(&f);
+    try f.rec.waitFor("BUTTONS Interrupted [");
+    try f.press("skip");
+    runWorkflows(&f);
+    try f.rec.waitFor("[ship#2] Step push failed: skipped by the owner after it was cut off");
+    try t.expectEqual(1, f.rec.count("pushed\n"));
+}
+
+test "stop_pauses_a_step_under_way_until_it_is_answered" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    _ = try withFake(&f, false);
+    try writeRules(&f, "allow mcp fake/sleep *\n");
+    try setWorkflow(&f, "slow", "workflow slow\nstep nap\ntool fake/sleep {\"ms\": 30000}\nstep tell\nsay woke\n");
+    _ = try f.core.command(a, "/workflow start slow");
+    var waited: u32 = 0;
+    while (waited < 8000) : (waited += 20) {
+        const st = instState(&f, "slow#1") catch {
+            t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+            continue;
+        };
+        if (st.under_way) break;
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    _ = try f.core.command(a, "/stop");
+    waitIdle(f.core);
+    try f.rec.waitFor("BUTTONS Interrupted [1]\n[slow#1] Step nap was under way when you sent /stop and may have been done: fake/sleep {\"ms\":30000}");
+    try t.expectEqual(wstate.Status.paused, (try instState(&f, "slow#1")).status);
+    try t.expectEqual(0, f.rec.count("woke"));
+    // Stop ends it
+    try f.press("stop");
+    runWorkflows(&f);
+    try t.expectEqual(wstate.Status.stopped, (try instState(&f, "slow#1")).status);
+    try t.expectEqual(0, f.rec.count("woke"));
 }
