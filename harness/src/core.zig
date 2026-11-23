@@ -10193,9 +10193,9 @@ pub const Core = struct {
         const p = try butler.pick(a, h, .{});
         const calls = try butler.awayCalls(a, names.items, if (p.thermostat) |th| th.name else null, c.cfg.butler.home_temp);
         const old = c.readOr(a, c.paths.rules);
-        const head = away_mod.rules_section ++ "\n";
-        const at = std.mem.indexOf(u8, old, head) orelse return "The Away routine's lines aren't in rules: /setup routines offers it.";
-        const from = at + head.len;
+        // its header's line (a file saved with \r\n too)
+        const at = std.mem.indexOf(u8, old, away_mod.rules_section) orelse return "The Away routine's lines aren't in rules: /setup routines offers it.";
+        const from = (std.mem.indexOfScalarPos(u8, old, at, '\n') orelse return "The Away routine's lines aren't in rules: /setup routines offers it.") + 1;
         const end = std.mem.indexOfPos(u8, old, from, "[all]") orelse return "The Away routine's lines in rules don't end with [all]: fix them by hand, or turn the routine on again.";
         const text = try std.fmt.allocPrint(a, "{s}{s}\n{s}", .{ old[0..from], calls, old[end..] });
         _ = rules.parse(a, text) catch return "Those lines didn't read as rules (a bug: please send harness report).";
@@ -24539,8 +24539,11 @@ test "away_lights_are_only_unguarded_lights" {
     try t.expectEqualStrings("home.ini has no device called kitchen_light.", try f.core.command(a, "/away lights kitchen_light"));
     try t.expectEqualStrings("While you're away, nothing goes on in the evening.", try f.core.command(a, "/away lights none"));
     try t.expect(std.mem.indexOf(u8, fileText(&f, f.core.paths.rules), "\"device\":\"living_room_light\"") == null);
+    // a rules file saved with Windows line ends reads the same
+    try writeRules(&f, try std.mem.replaceOwned(u8, a, fileText(&f, f.core.paths.rules), "\n", "\r\n"));
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
     try t.expectEqualStrings("While you're away, the living room light goes on and off in the evening.", try f.core.command(a, "/away lights living_room_light"));
-    try expectHas(fileText(&f, f.core.paths.rules), "[schedule:away]\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"temperature\",\"device\":\"hall_thermostat\",\"value\":\"21\"}\n[all]");
+    try expectHas(fileText(&f, f.core.paths.rules), "[schedule:away]\r\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"temperature\",\"device\":\"hall_thermostat\",\"value\":\"21\"}\n[all]");
     // a line written by hand for the lock is never used: away switches
     // home.ini's lights that aren't guarded, and nothing else
     try writeRules(&f, try std.fmt.allocPrint(a, "{s}\n[schedule:away]\nallow mcp home/home_set {{\"action\":\"on\",\"device\":\"front_door\"}}\n[all]\n", .{fileText(&f, f.core.paths.rules)}));
