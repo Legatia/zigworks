@@ -2674,6 +2674,7 @@ test {
     _ = @import("household.zig");
     _ = @import("butler.zig");
     _ = @import("doctor.zig");
+    _ = @import("people.zig");
 }
 
 test "a_line_of_ctrl_d_leaves_the_chat_in_a_windows_console" {
