@@ -6,9 +6,12 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<h1>Log</h1>
+<h1>Runs</h1>
+<ul class="list short" id="runs"></ul>
+<h1><span id="title">Lines, newest first</span> <button type="button" id="back" hidden>All lines</button></h1>
+<p class="tools"><input type="search" id="filter" placeholder="Filter: a run, by, kind, tool, decision…" aria-label="Filter the lines"> <button type="button" id="verify">Verify the log</button></p>
 <p class="state" id="state">Loading…</p>
-<ul class="list" id="runs"></ul>
+<ul class="list" id="lines"></ul>
 <script src="app.js"></script>
 </body>
 </html>

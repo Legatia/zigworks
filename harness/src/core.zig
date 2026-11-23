@@ -22137,3 +22137,78 @@ test "an_item_with_an_app_carries_its_link" {
     try f.rec.waitFor("Sent.");
     try t.expect(std.mem.indexOf(u8, try inboxFile(&f), &s.shell_token) == null);
 }
+
+/// One HTTP request to the app server, as a browser's frame sends it.
+fn appHttp(a: std.mem.Allocator, port: u16, method: []const u8, path: []const u8, body: []const u8) !struct { status: u16, body: []const u8 } {
+    const sock = @import("sock.zig");
+    const h = try sock.connect(t.io, "127.0.0.1", port, 2000);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var sk: sock.Socket = undefined;
+    sk.init(t.io, h, &rbuf, &wbuf, 15000);
+    defer sk.close();
+    try sk.writer.print("{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nOrigin: null\r\nSec-Fetch-Dest: iframe\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ method, path, port, body.len });
+    try sk.writer.writeAll(body);
+    try sk.writer.flush();
+    const all = try sk.reader.allocRemaining(a, .limited(8 << 20));
+    const split = std.mem.indexOf(u8, all, "\r\n\r\n") orelse return error.BadResponse;
+    return .{ .status = try std.fmt.parseInt(u16, all[9..12], 10), .body = all[split + 4 ..] };
+}
+
+test "an_app_reads_and_acts_over_http_and_the_bar_answers" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try installApp(&f, "notes", "[app]\nname = notes\ntitle = Notes\nreads = inbox, log\nacts = shell\n", &.{ .{ "index.html", "<p>notes</p><script src=\"app.js\"></script>" }, .{ "app.js", "fetch('api/info')" } });
+    _ = try f.core.startApps(a);
+    const s = f.core.app_server.?;
+    const app = try std.fmt.allocPrint(a, "/a/{s}/", .{&s.appToken("notes", "1")});
+    const shell = try std.fmt.allocPrint(a, "/s/{s}/", .{&s.shell_token});
+    // its page into a frame (logged as opened), its API from the frame
+    try t.expectEqual(200, (try appHttp(a, s.port, "GET", app, "")).status);
+    const info = try appHttp(a, s.port, "GET", try std.fmt.allocPrint(a, "{s}api/info", .{app}), "");
+    try t.expectEqual(200, info.status);
+    try expectHas(info.body, "\"name\":\"notes\",\"version\":\"1\",\"title\":\"Notes\"");
+    try t.expectEqual(403, (try appHttp(a, s.port, "GET", try std.fmt.allocPrint(a, "{s}api/memory", .{app}), "")).status);
+    // an act that asks: the bar shows the question and answers it
+    const started = try appHttp(a, s.port, "POST", try std.fmt.allocPrint(a, "{s}api/act", .{app}), "{\"tool\":\"shell\",\"input\":{\"command\":\"echo over-http\"}}");
+    try t.expectEqual(200, started.status);
+    const id = jv.int(jv.get(jv.parse(a, started.body), "id")).?;
+    _ = try waitJob(&f, "notes", "act", @intCast(id), "asked");
+    // (the bar is harness's own page: its Origin is the server's, not a frame's)
+    const sock = @import("sock.zig");
+    const bar = struct {
+        fn call(al: std.mem.Allocator, port: u16, method: []const u8, path: []const u8, body: []const u8) ![]const u8 {
+            const h = try sock.connect(t.io, "127.0.0.1", port, 2000);
+            var rbuf: [16 * 1024]u8 = undefined;
+            var wbuf: [4096]u8 = undefined;
+            var sk: sock.Socket = undefined;
+            sk.init(t.io, h, &rbuf, &wbuf, 15000);
+            defer sk.close();
+            try sk.writer.print("{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nOrigin: http://127.0.0.1:{d}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ method, path, port, port, body.len });
+            try sk.writer.writeAll(body);
+            try sk.writer.flush();
+            const all = try sk.reader.allocRemaining(al, .limited(8 << 20));
+            return all[(std.mem.indexOf(u8, all, "\r\n\r\n") orelse return error.BadResponse) + 4 ..];
+        }
+    }.call;
+    const waiting = try bar(a, s.port, "GET", try std.fmt.allocPrint(a, "{s}api/inbox", .{shell}), "");
+    try expectHas(waiting, "[app:notes] shell: echo over-http");
+    const item = jv.int(jv.get(jv.arr(jv.get(jv.parse(a, waiting), "items")).?[0], "id")).?;
+    // the app can't press it: its own token reaches no answer call
+    try t.expectEqual(404, (try appHttp(a, s.port, "POST", try std.fmt.allocPrint(a, "{s}api/answer", .{app}), try std.fmt.allocPrint(a, "{{\"id\":{d},\"key\":\"once\"}}", .{item}))).status);
+    // (nor the bar's: a frame's Origin is refused there before any token)
+    try t.expectEqual(403, (try appHttp(a, s.port, "POST", try std.fmt.allocPrint(a, "{s}api/answer", .{shell}), "{}")).status);
+    try t.expectEqual(itemStatus(&f, @intCast(item)), .open);
+    try expectHas(try bar(a, s.port, "POST", try std.fmt.allocPrint(a, "{s}api/answer", .{shell}), try std.fmt.allocPrint(a, "{{\"id\":{d},\"key\":\"once\"}}", .{item})), "\"took\":\"taken\"");
+    // the act's answer, waited for over HTTP
+    const done = try appHttp(a, s.port, "GET", try std.fmt.allocPrint(a, "{s}api/act/{d}?wait=10", .{ app, id }), "");
+    try expectHas(done.body, "\"state\":\"done\"");
+    try expectHas(done.body, "over-http");
+    const lt = try logText(&f);
+    try expectHas(lt, "\"event\":\"opened\",\"name\":\"notes\",\"version\":\"1\",\"reads\":\"inbox,log\"");
+    try expectHas(lt, "\"event\":\"answered\",\"item\":1,\"key\":\"once\",\"via\":\"bar\"");
+    try t.expect(std.mem.indexOf(u8, lt, &s.shell_token) == null);
+    try t.expect(std.mem.indexOf(u8, lt, &s.appToken("notes", "1")) == null);
+}
