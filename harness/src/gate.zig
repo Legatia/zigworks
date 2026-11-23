@@ -1679,7 +1679,7 @@ test "room_and_member_sections_stay_apart" {
     var f: Fixture = undefined;
     try f.init(
         \\allow mcp cloud/car_lock *
-        \\deny mcp */home_set {"device":"oven"*
+        \\deny mcp */home_set *"device":"oven"*
         \\[member]
         \\allow mcp cloud/car_status *
         \\[room]
@@ -1687,7 +1687,7 @@ test "room_and_member_sections_stay_apart" {
         \\allow fetch https://*.wikipedia.org/*
         \\[room:kitchen]
         \\ask mcp cloud/weather *
-        \\deny mcp */home_set {"device":"kettle"*
+        \\deny mcp */home_set *"device":"kettle"*
         \\[room:hall]
         \\allow mcp cloud/car_status *
         \\

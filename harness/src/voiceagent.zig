@@ -139,11 +139,14 @@ pub const Server = struct {
     }
 
     fn acceptLoop(s: *Server) void {
-        while (true) {
-            const conn = s.listener.accept() catch {
-                if (s.stopping.load(.acquire)) return;
+        while (!s.stopping.load(.acquire)) {
+            // a poll, so a stop is seen even when no connection wakes it
+            // (the address left this machine)
+            const got = s.listener.acceptWithin(s.io, 500, &s.stopping) catch {
+                s.io.sleep(.fromMilliseconds(50), .awake) catch {};
                 continue;
             };
+            const conn = got orelse continue;
             if (s.stopping.load(.acquire)) {
                 sock.closeHandle(conn);
                 return;
