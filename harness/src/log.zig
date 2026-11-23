@@ -8,7 +8,7 @@ const scrub = @import("scrub.zig");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const Kind = enum { turn, model, tool, gate, memory, brief, task, chat, config, recovered, send, files, agent, inbox, trigger, app };
+pub const Kind = enum { turn, model, tool, gate, memory, brief, task, chat, config, recovered, send, files, agent, inbox, trigger, app, workflow };
 
 /// Longest string stored in a field.
 pub const max_field = 2048;
@@ -137,7 +137,8 @@ pub const Log = struct {
     /// Appends one line. `fields` is a struct of strings, integers, bools
     /// and optionals. When `private`, string fields other than the labels
     /// (`tool`, `decision`, `why`, `run`, `conversation`, `by`, `agent`,
-    /// `to`, `event`) are stored as their size and keyed hash only.
+    /// `to`, `event`, `instance`, `step`) are stored as their size and
+    /// keyed hash only.
     pub fn write(l: *Log, kind: Kind, private: bool, fields: anytype) !void {
         _ = try l.writeLine(kind, private, null, fields);
     }
@@ -230,7 +231,7 @@ fn value(line: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime name: []cons
     defer if (masked) |m| gpa.free(m);
     const s: []const u8 = masked orelse raw;
     // the labels stay readable when private, so the session view works
-    const kept = comptime for ([_][]const u8{ "tool", "decision", "why", "run", "conversation", "by", "agent", "to", "event" }) |k| {
+    const kept = comptime for ([_][]const u8{ "tool", "decision", "why", "run", "conversation", "by", "agent", "to", "event", "instance", "step" }) |k| {
         if (std.mem.eql(u8, name, k)) break true;
     } else false;
     if (ctx.private and !kept) {

@@ -501,7 +501,7 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
 }
 
 /// "30s", "5m", "1h", "2d" in seconds.
-fn parseDuration(v: []const u8) ?u32 {
+pub fn parseDuration(v: []const u8) ?u32 {
     if (v.len < 2) return null;
     const n = std.fmt.parseInt(u32, v[0 .. v.len - 1], 10) catch return null;
     if (n == 0) return null;
@@ -856,7 +856,7 @@ pub fn reading(a: Allocator, tr: Trigger, check_model: []const u8) ![]const u8 {
             switch (tr.action) {
                 .do => |x| try out.print(a, ", a run of {s}: {s}", .{ tr.agent, util.cut(x, 200) }),
                 .say => |x| try out.print(a, ", no model call, says: {s}", .{x}),
-                .start => |x| try out.print(a, ", starts workflow {s} (workflows aren't built yet)", .{x}),
+                .start => |x| try out.print(a, ", starts workflow {s}", .{x}),
                 .none => {},
             }
             if (!std.mem.eql(u8, tr.to, "main")) try out.print(a, "; posts to {s}", .{tr.to});
@@ -911,8 +911,8 @@ pub fn reading(a: Allocator, tr: Trigger, check_model: []const u8) ![]const u8 {
             if (tr.max_events != 20) try out.print(a, ", {d} events a run", .{tr.max_events});
         },
         .say => |x| try out.print(a, " says: {s}", .{x}),
-        .start => |x| try out.print(a, " starts workflow {s} (workflows aren't built yet)", .{x}),
-        .none => try out.appendSlice(a, " is kept for workflows that wait on it (none yet)"),
+        .start => |x| try out.print(a, " starts workflow {s}, an instance each", .{x}),
+        .none => try out.appendSlice(a, " is kept for workflows that wait on it"),
     }
     if (!std.mem.eql(u8, tr.to, "main")) try out.print(a, "; posts to {s}", .{tr.to});
     try out.append(a, '.');
@@ -939,7 +939,7 @@ fn when(a: Allocator, tr: Trigger, capital: bool) ![]const u8 {
 }
 
 /// `title has "release" or "rc"`, `move > 3`.
-fn condText(a: Allocator, c: Cond) ![]const u8 {
+pub fn condText(a: Allocator, c: Cond) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     const op: []const u8 = switch (c.op) {
         .has => "has",
