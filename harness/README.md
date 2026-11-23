@@ -9,6 +9,8 @@ disk, waiting for a time, an event or your approval), uses MCP servers
 (programs it starts, or servers at a url with a token or a sign-in) and
 saved skills, remembers what you bring up, keeps summaries of each
 conversation by day, week and month, and can search every earlier turn.
+People of your household you add can ask it too, in their own chat with
+the bot or a group, within what you allow (Household, below).
 Every action it takes, and every
 action of its helpers, passes one gate and is written to one log you can
 check.
@@ -34,10 +36,10 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 817 unit tests (19 of them
+**State: 0.3.0, tested on macOS by its own tests: 846 unit tests (19 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 85 checks that drives the real binary against
+and an end-to-end script of 88 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram, feeds,
 search, two MCP servers run as programs, and MCP servers at a url with a
 token or a sign-in (with a stand-in authorization server and browser).
@@ -442,11 +444,16 @@ you pair with `/pair` stops being a member.
 
 **Where members ask.** In their own chat with the bot (a conversation
 named after them, `anna`, or `anna-2` when that name is taken) and in
-groups you added. The bot sees a group's messages only when its privacy
-mode is off (@BotFather, `/setprivacy`, Disable, then add the bot to the
-group again) or when it is an admin of the group. Anyone else's messages
-are dropped and logged, as before. Your own messages in a group are still
-read only for `/conversation add`.
+groups you added. In a group harness takes a member's message only when
+it is addressed to the bot: it starts with `@BOT`, or it replies to one
+of harness's messages there (since harness started); the rest of the
+group's talk is left alone. With the bot's privacy mode on (Telegram's
+default) the bot gets only commands and replies to its own messages; for
+`@BOT` to reach it, turn privacy mode off (@BotFather, `/setprivacy`,
+Disable, then add the bot to the group again). Anyone else's messages are
+dropped and logged, as before; an anonymous admin, a post sent as a
+channel and Telegram's own service account are never members. Your own
+messages in a group are still read only for `/conversation add`.
 
 **What a member's request may do.** It runs as `member:NAME`, in the one
 queue with yours, under harness's own instructions for members (not
@@ -462,14 +469,17 @@ its own conversation to post to (no files). With no rules for members:
 
 **When you are asked.** The member's request doesn't wait for you. You
 get one message in your chat, "Anna asks to unlock the front door." with
-[Unlock] [No] (no "Allow 24 h"; a reply in words says no and why), and the
-member is told at once that you were asked. Your tap makes that exact
+[Unlock] [No] (no "Allow 24 h"; a reply in words says no, and the member,
+or the whole group when they asked there, reads it), and the member is
+told at once that you were asked. Your tap makes that exact
 call (the gate decides it again, so a `deny` added since stops it) and
 both of you get what the device said back: "The owner said yes: done:
 front_door is unlocked". A no, or no answer in time (`approval_seconds`),
 is said to the member. Members can't answer these: only your buttons and
 replies count. The calls waiting for you are kept in `state/member-asks`,
-so they survive a restart.
+so they survive a restart. Removing a member drops their messages that
+wait and withdraws their questions; a Yes that comes after does nothing,
+and you are told.
 
 **Rules for members.** `[member]` sections apply to every member,
 `[member:NAME]` to one (`*` works: `[member:k*]`). A section naming
@@ -491,7 +501,10 @@ deny mcp */home_set {"device":"oven"*
 
 **What members should know.** You can read what they ask in the log
 (`harness log runs`), as everything harness does. Their chats are never
-written to your memory.
+written to your memory or its daily summaries, and their runs never
+share a context with yours (a conversation's name used again starts
+fresh). A money limit that stops a member's call is not described to
+them.
 
 `state/members` keeps them, a JSON line each, rewritten whole before
 harness acts on a change; a waiting code only as its SHA-256:

@@ -374,6 +374,12 @@ const Quick = struct {
 /// Posts with quick replies kept at once; the oldest goes first.
 const max_quick = 32;
 
+/// One of harness's messages in a group (see `Core.group_posts`).
+const GroupPost = struct { chat: i64, id: i64 };
+
+/// Harness's messages in groups noted at once; the oldest goes first.
+const max_group_posts = 256;
+
 pub const Secrets = struct {
     omnigate: ?[]const u8 = null,
     telegram: ?[]const u8 = null,
@@ -528,6 +534,10 @@ pub const Core = struct {
     /// for the owner (state/member-asks).
     members: household.Members,
     member_asks: household.Asks,
+    /// Harness's recent messages in groups for members (in memory): a
+    /// member's reply to one is addressed to the bot.
+    group_posts: std.ArrayList(GroupPost) = .empty,
+    group_posts_mutex: Io.Mutex = .init,
     /// The agent definitions (agents/), the built-ins under them.
     defs: agents.Set,
     /// The bot's username: a command may end in `@` and it (`setBot`).
@@ -732,6 +742,8 @@ pub const Core = struct {
         c.member_asks = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "member-asks" }));
         errdefer c.member_asks.deinit();
         c.member_asks.load() catch |e| c.log.write(.config, false, .{ .event = "member asks not read", .why = @errorName(e) }) catch {};
+        c.group_posts = .empty;
+        c.group_posts_mutex = .init;
         c.bot_name_len = 0;
         c.topics_on = true;
         c.topic_mutex = .init;
@@ -825,6 +837,7 @@ pub const Core = struct {
         c.convs.deinit();
         c.members.deinit();
         c.member_asks.deinit();
+        c.group_posts.deinit(c.gpa);
         c.defs.deinit();
         for (c.told_topics.items) |n| c.gpa.free(n);
         c.told_topics.deinit(c.gpa);
@@ -1449,6 +1462,7 @@ pub const Core = struct {
             try c.log.write(.chat, false, .{ .event = "dropped", .from = m.from, .chat = m.chat, .why = "a group: only /conversation add is read there" });
             return;
         }
+        var added = false;
         const reply = blk: {
             if (!conversations.validName(name)) break :blk "Use /conversation add NAME, the name in a-z, 0-9, - and _ (up to 32).";
             c.convs.mutex.lockUncancelable(c.io);
@@ -1458,8 +1472,11 @@ pub const Core = struct {
             _ = c.convs.add(.{ .name = name, .chat = m.chat, .thread = m.thread, .audience = .shared, .created = util.nowSeconds(c.io) }) catch |e|
                 break :blk try std.fmt.allocPrint(a, "Not added: harness could not write state/conversations ({s}).", .{@errorName(e)});
             try c.log.write(.config, false, .{ .event = "conversation added", .name = name, .chat = m.chat, .audience = "shared" });
+            added = true;
             break :blk try std.fmt.allocPrint(a, "Added: the agent may post here as {s}. Each post here is asked first; /conversation rm {s} in your chat with the bot ends it.", .{ name, name });
         };
+        // a name used before: nothing of the conversation that had it
+        if (added) c.resetContext(name);
         const ch = c.chan orelse return;
         _ = ch.send(ch.ctx, .{ .name = name, .chat = m.chat, .thread = m.thread }, reply) catch {};
     }
@@ -1479,6 +1496,8 @@ pub const Core = struct {
     /// the owner added, starts a run of theirs, and their commands get their
     /// help or a plain no. False: none of those (it is dropped).
     fn othersMessage(c: *Core, m: Incoming) !bool {
+        // anyone can write as these: never a member (Ruling 19)
+        if (household.sharedSender(m.from)) return false;
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1486,7 +1505,9 @@ pub const Core = struct {
         // in a group, only one the owner added is read
         var gbuf: [conversations.max_name]u8 = undefined;
         const group: ?[]const u8 = if (private_chat) null else c.groupAt(&gbuf, m.chat, m.thread) orelse return false;
-        const text = c.withoutMention(std.mem.trim(u8, m.text, " \t\r\n"));
+        const raw = std.mem.trim(u8, m.text, " \t\r\n");
+        const text = c.withoutMention(raw);
+        const mentioned = text.len != raw.len;
         var words = std.mem.tokenizeAny(u8, text, " \t\r\n");
         const cmd = c.commandWord(words.next() orelse return false);
         const arg = std.mem.trim(u8, words.rest(), " \t\r\n");
@@ -1501,14 +1522,67 @@ pub const Core = struct {
             return true;
         }
         const who = name orelse return false;
+        // in a group, only what is addressed to the bot: a command, @BOT
+        // first, or a reply to one of harness's messages there (Ruling 18)
+        if (group != null and cmd[0] != '/' and !mentioned and !(m.reply_to != 0 and c.toBot(m.chat, m.reply_to))) {
+            try c.log.write(.chat, false, .{ .event = "dropped", .member = who, .chat = m.chat, .why = "not addressed to the bot" });
+            return true;
+        }
         const conv = group orelse try c.memberChat(a, who, m.from);
         if (cmd[0] == '/') {
             try c.log.write(.chat, false, .{ .event = "member command", .name = who, .command = cmd });
-            c.sayIn(conv, if (std.mem.eql(u8, cmd, "/help") or std.mem.eql(u8, cmd, "/start")) household.help else household.owner_only);
+            c.memberSay(conv, if (std.mem.eql(u8, cmd, "/help") or std.mem.eql(u8, cmd, "/start")) household.help else household.owner_only);
             return true;
         }
         try c.queueMember(conv, who, text);
         return true;
+    }
+
+    /// Whether conversation `name` exists.
+    fn convExists(c: *Core, name: []const u8) bool {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        return c.convs.find(name) != null;
+    }
+
+    /// Harness's own line in a member's conversation. One that is gone (the
+    /// member removed meanwhile) gets nothing: its name would land in the
+    /// owner's chat. In a group the message is noted (`toBot`).
+    fn memberSay(c: *Core, conv: []const u8, text: []const u8) void {
+        if (!c.convExists(conv)) {
+            c.log.write(.chat, false, .{ .event = "not said", .name = conv, .why = "the member's conversation is gone" }) catch {};
+            return;
+        }
+        const sent = c.sendText(conv, text) catch return;
+        c.notePosted(conv, sent.first, sent.count);
+    }
+
+    /// Notes harness's messages `first`… (`count` of them) when `conv` is a
+    /// group, so a member's reply to one is addressed to the bot.
+    fn notePosted(c: *Core, conv: []const u8, first: i64, count: u32) void {
+        if (first == 0 or count == 0) return;
+        const chat = blk: {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            const e = c.convs.find(conv) orelse return;
+            if (e.audience != .shared or e.chat >= 0) return;
+            break :blk e.chat;
+        };
+        c.group_posts_mutex.lockUncancelable(c.io);
+        defer c.group_posts_mutex.unlock(c.io);
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            if (c.group_posts.items.len >= max_group_posts) _ = c.group_posts.orderedRemove(0);
+            c.group_posts.append(c.gpa, .{ .chat = chat, .id = first + i }) catch return;
+        }
+    }
+
+    /// Whether message `id` in group `chat` is one of harness's noted ones.
+    fn toBot(c: *Core, chat: i64, id: i64) bool {
+        c.group_posts_mutex.lockUncancelable(c.io);
+        defer c.group_posts_mutex.unlock(c.io);
+        for (c.group_posts.items) |p| if (p.chat == chat and p.id == id) return true;
+        return false;
     }
 
     /// The conversation of a group the owner added, at `chat` and topic
@@ -1553,7 +1627,7 @@ pub const Core = struct {
             .joined => |name| {
                 try c.log.write(.config, false, .{ .event = "member joined", .name = name, .from = m.from, .where = group orelse "direct chat" });
                 const conv = group orelse try c.memberChat(a, name, m.from);
-                c.sayIn(conv, try household.welcome(a, name));
+                c.memberSay(conv, try household.welcome(a, name));
                 c.say(if (group) |g| try std.fmt.allocPrint(a, "{s} joined, in {s}.", .{ name, g }) else try std.fmt.allocPrint(a, "{s} joined, from a direct chat with the bot.", .{name}));
             },
         }
@@ -1562,7 +1636,7 @@ pub const Core = struct {
     /// Says `text` where someone other than the owner wrote: the group, or
     /// their own chat with the bot.
     fn replyTo(c: *Core, m: Incoming, group: ?[]const u8, text: []const u8) void {
-        if (group) |g| return c.sayIn(g, text);
+        if (group) |g| return c.memberSay(g, text);
         c.sayTo(m.from, text);
     }
 
@@ -1577,16 +1651,21 @@ pub const Core = struct {
     /// conversation, named after them (`NAME-2`… when that is taken), made
     /// the first time (Ruling 9).
     fn memberChat(c: *Core, a: std.mem.Allocator, name: []const u8, user: i64) ![]const u8 {
-        c.convs.mutex.lockUncancelable(c.io);
-        defer c.convs.mutex.unlock(c.io);
-        if (c.memberConv(user)) |e| return a.dupe(u8, e.name);
-        var n: u32 = 1;
-        const chosen = while (n < 100) : (n += 1) {
-            const cand = if (n == 1) name else try std.fmt.allocPrint(a, "{s}-{d}", .{ name, n });
-            if (conversations.validName(cand) and c.convs.find(cand) == null) break cand;
-        } else return error.NoName;
-        _ = try c.convs.add(.{ .name = chosen, .chat = user, .audience = .shared, .created = util.nowSeconds(c.io) });
-        try c.log.write(.config, false, .{ .event = "conversation added", .name = chosen, .chat = user, .audience = "shared", .member = name });
+        const chosen = blk: {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            if (c.memberConv(user)) |e| return a.dupe(u8, e.name);
+            var n: u32 = 1;
+            const chosen = while (n < 100) : (n += 1) {
+                const cand = if (n == 1) name else try std.fmt.allocPrint(a, "{s}-{d}", .{ name, n });
+                if (conversations.validName(cand) and c.convs.find(cand) == null) break cand;
+            } else return error.NoName;
+            _ = try c.convs.add(.{ .name = chosen, .chat = user, .audience = .shared, .created = util.nowSeconds(c.io) });
+            try c.log.write(.config, false, .{ .event = "conversation added", .name = chosen, .chat = user, .audience = "shared", .member = name });
+            break :blk chosen;
+        };
+        // a name used before: nothing of the conversation that had it
+        c.resetContext(chosen);
         return a.dupe(u8, chosen);
     }
 
@@ -1623,7 +1702,7 @@ pub const Core = struct {
             break :blk c.busy.load(.acquire) or c.queue.items.len > 1;
         };
         c.touch(conv);
-        if (behind) c.sayIn(conv, "One moment: I'm finishing another request first.");
+        if (behind) c.memberSay(conv, "One moment: I'm finishing another request first.");
     }
 
     /// One turn of member `name`'s message in `conv`: the conversation's
@@ -1640,9 +1719,11 @@ pub const Core = struct {
             return;
         }
         var buf: [agents_name_max]u8 = undefined;
-        var def = c.definitionFor(a, conv, c.convAgent(&buf, conv)) catch |e| return c.sayIn(conv, std.fmt.allocPrint(a, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
+        var def = c.definitionFor(a, conv, c.convAgent(&buf, conv)) catch |e| return c.memberSay(conv, std.fmt.allocPrint(a, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
         def.body = household.instructions;
-        const x = c.contextFor(conv, def.name) catch |e| return c.sayIn(conv, std.fmt.allocPrint(a, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
+        // members' contexts are their own: never one an owner's run had or has
+        const key = std.fmt.allocPrint(a, "member:{s}", .{def.name}) catch return;
+        const x = c.contextFor(conv, key) catch |e| return c.memberSay(conv, std.fmt.allocPrint(a, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
         if (x.reset.swap(false, .acq_rel)) {
             x.conv.deinit();
             x.conv = .init(c.gpa);
@@ -1656,7 +1737,7 @@ pub const Core = struct {
         c.helper_pool.takeAlways(c.io, def.name);
         defer c.helper_pool.give(c.io, def.name);
         var def_client: ?model.Client = null;
-        if (def.model.len > 0) def_client = c.modelClient(def.model, c.cfg.model.max_tokens) catch |e| return c.sayIn(conv, std.fmt.allocPrint(a, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
+        if (def.model.len > 0) def_client = c.modelClient(def.model, c.cfg.model.max_tokens) catch |e| return c.memberSay(conv, std.fmt.allocPrint(a, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
         defer if (def_client) |*dc| dc.deinit();
         const by = std.fmt.allocPrint(a, "member:{s}", .{name}) catch return;
         var run = c.runIn(if (def_client) |*dc| dc else &c.chat_client, "chat", .{ .agent = def.name, .by = by }, conv, &flag);
@@ -1673,16 +1754,16 @@ pub const Core = struct {
         var out: RunOut = .{ .core = c, .agent = def.name, .run = &run };
         var mo: MemberOut = .{ .out = &out, .conv = conv };
         run.outbox = mo.outbox();
-        const res = agent.turn(&run, &x.conv, text, false) catch |e| return c.sayIn(conv, std.fmt.allocPrint(a, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
+        const res = agent.turn(&run, &x.conv, text, false) catch |e| return c.memberSay(conv, std.fmt.allocPrint(a, "Something went wrong: {s}", .{@errorName(e)}) catch "Something went wrong.");
         defer agent.freeResult(&run, res);
         if (res.stopped or res.replied) return;
-        if (res.ended_by) |why| return c.sayIn(conv, why);
+        if (res.ended_by) |why| return c.memberSay(conv, why);
         if (res.text.len == 0) {
-            if (!ask.told) c.sayIn(conv, "Sorry, I have no answer to that.");
+            if (!ask.told) c.memberSay(conv, "Sorry, I have no answer to that.");
             return;
         }
-        const got = agent.postReply(&run, a, res.text) catch |e| return c.sayIn(conv, std.fmt.allocPrint(a, "The answer was not posted: {s}.", .{@errorName(e)}) catch "The answer was not posted.");
-        if (got.refused) |why| c.sayIn(conv, std.fmt.allocPrint(a, "The answer was not posted: {s}.", .{why}) catch "The answer was not posted.");
+        const got = agent.postReply(&run, a, res.text) catch |e| return c.memberSay(conv, std.fmt.allocPrint(a, "The answer was not posted: {s}.", .{@errorName(e)}) catch "The answer was not posted.");
+        if (got.refused) |why| c.memberSay(conv, std.fmt.allocPrint(a, "The answer was not posted: {s}.", .{why}) catch "The answer was not posted.");
     }
 
     /// A member's run's asker (Ruling 1): the gate's ask becomes the
@@ -1712,6 +1793,8 @@ pub const Core = struct {
     fn memberAsk(c: *Core, a: std.mem.Allocator, ma: *MemberAsk, q: agent.Question) !agent.Reply {
         const tool = q.tool orelse return .{ .answer = .unsent };
         if (q.kind != .approval or (tool != .mcp and tool != .money)) return .{ .answer = .unsent };
+        // removed while the turn ran: nothing more is asked for them
+        if (!c.isMember(ma.member)) return .{ .answer = .unsent };
         if (c.chan == null or c.questions_closed.load(.acquire)) return .{ .answer = .unsent };
         // the same call asked already: its item
         if (c.member_asks.waiting(ma.member, q.arg)) |id| return .{ .answer = .deferred, .item = id, .text = member_told };
@@ -1720,7 +1803,10 @@ pub const Core = struct {
         const what = try household.plainCall(a, q.arg);
         const title = try c.masks.scrubAlloc(a, try household.question(a, ma.member, what));
         const dry: []const u8 = if (tool == .money and c.switches.dry_run.load(.acquire)) "\nDry run is on: this call is not made." else "";
-        const body = try std.fmt.allocPrint(a, "{s}{s}", .{ title, dry });
+        // the owner's words go to the member, or to the whole group
+        var nb: [household.max_name]u8 = undefined;
+        const reader = if (c.isGroup(ma.conv)) try std.fmt.allocPrint(a, "the group {s}", .{ma.conv}) else household.display(&nb, ma.member);
+        const body = try std.fmt.allocPrint(a, "{s}{s}\nA reply in words says no, and {s} reads it.", .{ title, dry, reader });
         // all of it is shown, or nothing is asked
         if (body.len > inbox_mod.max_body) return .{ .answer = .full, .text = "too long to ask the owner: make the call smaller" };
         const choices = [_]inbox_mod.Choice{ .{ .key = "once", .label = try household.yesLabel(a, q.arg) }, .{ .key = "deny", .label = "No" } };
@@ -1754,7 +1840,7 @@ pub const Core = struct {
             _ = c.settle(id, .void, .{ .text = "it could not be shown", .at = c.now(), .via = .harness });
             return .{ .answer = .unsent, .item = id };
         }
-        c.sayIn(ma.conv, try household.askedText(a, what));
+        c.memberSay(ma.conv, try household.askedText(a, what));
         ma.told = true;
         return .{ .answer = .deferred, .item = id, .text = member_told };
     }
@@ -1775,6 +1861,17 @@ pub const Core = struct {
             };
             if (!waits) _ = c.member_asks.take(a, id);
         }
+        // an open item whose call was not kept (harness stopped between
+        // the two): void, so no Yes looks as if it did something
+        var orphans: std.ArrayList(u64) = .empty;
+        {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            for (c.inbox.items.items) |it| if (it.status == .open and std.mem.startsWith(u8, it.waiter, "member ")) orphans.append(a, it.id) catch {};
+        }
+        for (orphans.items) |id| if (!c.member_asks.has(id)) {
+            _ = c.settle(id, .void, .{ .text = "its call was not kept", .at = c.now(), .via = .harness });
+        };
     }
 
     /// The owner answered member call item `id`, or it expired: Yes makes
@@ -1786,18 +1883,29 @@ pub const Core = struct {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const k = c.member_asks.take(a, id) orelse return;
-        const Got = struct { status: inbox_mod.Status, key: []const u8 = "", words: ?[]const u8 = null };
+        const Got = struct { status: inbox_mod.Status, key: []const u8 = "", words: ?[]const u8 = null, member: []const u8 = "" };
         const got: Got = blk: {
             c.inbox.mutex.lockUncancelable(c.io);
             defer c.inbox.mutex.unlock(c.io);
             const it = c.inbox.find(id) orelse return;
-            const ans = it.answer orelse break :blk .{ .status = it.status };
-            break :blk .{ .status = it.status, .key = a.dupe(u8, ans.key orelse "") catch "", .words = if (ans.text) |x| a.dupe(u8, x) catch null else null };
+            const member = a.dupe(u8, if (std.mem.startsWith(u8, it.waiter, "member ")) it.waiter["member ".len..] else "") catch "";
+            const ans = it.answer orelse break :blk .{ .status = it.status, .member = member };
+            break :blk .{ .status = it.status, .key = a.dupe(u8, ans.key orelse "") catch "", .words = if (ans.text) |x| a.dupe(u8, x) catch null else null, .member = member };
         };
+        const yes = got.status == .answered and std.mem.eql(u8, got.key, "once");
+        const k = c.member_asks.take(a, id) orelse {
+            // its call was not kept (harness stopped between the two)
+            if (yes) c.say(std.fmt.allocPrint(a, "Item {d}: nothing was done: harness no longer has that call. Ask {s} to ask again.", .{ id, got.member }) catch "Nothing was done: harness no longer has that call.");
+            return;
+        };
+        // removed meanwhile: nothing is made, and their chat is gone
+        if (!c.isMember(k.member)) {
+            if (yes) c.say(std.fmt.allocPrint(a, "{s} is no longer a member: nothing was done.", .{k.member}) catch "They are no longer a member: nothing was done.");
+            return;
+        }
         switch (got.status) {
-            .answered => if (std.mem.eql(u8, got.key, "once")) c.startMemberCall(k) else c.sayIn(k.conversation, household.noText(a, k.what, got.words) catch "The owner said no."),
-            .expired => c.sayIn(k.conversation, household.noAnswerText(a, k.what) catch "No answer from the owner in time."),
+            .answered => if (yes) c.startMemberCall(k) else c.memberSay(k.conversation, household.noText(a, k.what, got.words) catch "The owner said no."),
+            .expired => c.memberSay(k.conversation, household.noAnswerText(a, k.what) catch "No answer from the owner in time."),
             else => {},
         }
     }
@@ -1810,19 +1918,19 @@ pub const Core = struct {
     /// that reads Telegram. Counted as a background run (/reload, /undo and
     /// the end wait for it).
     fn startMemberCall(c: *Core, k: household.Ask) void {
-        const box = c.gpa.create(MemberCall) catch return c.sayIn(k.conversation, "The owner said yes, but harness could not make the call.");
+        const box = c.gpa.create(MemberCall) catch return c.memberSay(k.conversation, "The owner said yes, but harness could not make the call.");
         box.arena = .init(c.gpa);
         box.ask = household.copyAsk(box.arena.allocator(), k) catch {
             box.arena.deinit();
             c.gpa.destroy(box);
-            return c.sayIn(k.conversation, "The owner said yes, but harness could not make the call.");
+            return c.memberSay(k.conversation, "The owner said yes, but harness could not make the call.");
         };
         _ = c.bg_active.fetchAdd(1, .acq_rel);
         const th = std.Thread.spawn(.{}, memberCallJob, .{ c, box }) catch {
             _ = c.bg_active.fetchSub(1, .acq_rel);
             box.arena.deinit();
             c.gpa.destroy(box);
-            return c.sayIn(k.conversation, "The owner said yes, but harness could not make the call.");
+            return c.memberSay(k.conversation, "The owner said yes, but harness could not make the call.");
         };
         th.detach();
     }
@@ -1880,7 +1988,7 @@ pub const Core = struct {
             run.asker = .{ .ctx = &go, .ask = MemberGo.ask };
             break :blk agent.stepCall(&run, a, n, call.input) catch |e| .{ .text = @errorName(e), .is_error = true };
         } else .{ .text = std.fmt.allocPrint(a, "{s} is not running", .{call.server}) catch "its server is not running", .is_error = true };
-        c.sayIn(k.conversation, household.yesText(a, k.what, out.text, !out.is_error) catch "The owner said yes.");
+        c.memberSay(k.conversation, household.yesText(a, k.what, out.text, !out.is_error) catch "The owner said yes.");
         c.noteOnItem(a, k.item, std.fmt.allocPrint(a, "Result: {s}", .{util.cut(std.mem.trim(u8, out.text, " \t\r\n"), 600)}) catch return);
     }
 
@@ -1930,7 +2038,13 @@ pub const Core = struct {
 
         fn post(ctx: *anyopaque, a: std.mem.Allocator, p: *const agent.Post) agent.Delivery {
             const o: *MemberOut = @ptrCast(@alignCast(ctx));
-            return RunOut.post(o.out, a, p);
+            const c = o.out.core;
+            // gone (the member removed meanwhile): a post would open a topic
+            // of that name in the owner's chat
+            if (!c.convExists(o.conv)) return .{ .status = .failed, .why = "the member's conversation is gone" };
+            const d = RunOut.post(o.out, a, p);
+            if (d.status == .sent) c.notePosted(o.conv, d.message, d.parts);
+            return d;
         }
     };
 
@@ -2009,6 +2123,16 @@ pub const Core = struct {
                 break :blk n;
             };
             if (conv) |n| c.resetContext(n);
+        }
+        // their messages still waiting go
+        {
+            c.queue_mutex.lockUncancelable(c.io);
+            defer c.queue_mutex.unlock(c.io);
+            var i: usize = 0;
+            while (i < c.queue.items.len) {
+                const q = c.queue.items[i];
+                if (q.member != null and std.mem.eql(u8, q.member.?, name)) c.queue.orderedRemove(i).deinit(c.gpa) else i += 1;
+            }
         }
         for (try c.member_asks.itemsOf(a, name)) |id| _ = c.settle(id, .withdrawn, .{ .text = "the member was removed", .at = c.now(), .via = .harness });
         try c.log.write(.config, false, .{ .event = "member removed", .name = name });
@@ -7669,6 +7793,9 @@ pub const Core = struct {
                     else => std.fmt.allocPrint(a, "Not renamed: harness could not write state/conversations ({s}).", .{@errorName(e)}),
                 };
             }
+            // neither name keeps a context (a member's or an owner's)
+            c.resetContext(x);
+            c.resetContext(y);
             try c.log.write(.config, false, .{ .event = "conversation renamed", .name = x, .to = y });
             return std.fmt.allocPrint(a, "Renamed {s} to {s}.", .{ x, y });
         }
@@ -7683,6 +7810,8 @@ pub const Core = struct {
                     else => std.fmt.allocPrint(a, "Not removed: harness could not write state/conversations ({s}).", .{@errorName(e)}),
                 };
             }
+            // the name may be used again: its contexts go with it
+            c.resetContext(x);
             try c.log.write(.config, false, .{ .event = "conversation removed", .name = x });
             return std.fmt.allocPrint(a, "Forgot {s}: the agent no longer posts there. A topic stays in Telegram; a message in it makes it a conversation again.", .{x});
         }
@@ -16605,6 +16734,8 @@ test "a_members_unlock_becomes_the_owners_question" {
     const b = f.rec.buttonsWith("Anna asks to unlock the front door.") orelse return error.NoQuestion;
     try t.expect(b.get("day") == null);
     try expectHas(try inboxFileWith(&f, "\"label\":\"Unlock\""), "\"choices\":[{\"key\":\"once\",\"label\":\"Unlock\"},{\"key\":\"deny\",\"label\":\"No\"}]");
+    // a reply in words goes to her: the question says so
+    try f.rec.waitIn("main", "Anna asks to unlock the front door.\nA reply in words says no, and Anna reads it.");
     // anna is told at once, and her run does not wait for the owner
     try f.rec.waitIn("anna", "I asked the owner: unlock the front door. You'll hear here when they answer.");
     try f.rec.waitIn("anna", "Anything else?");
@@ -16698,4 +16829,145 @@ test "a_member_ask_whose_item_is_closed_is_dropped_at_start" {
     try restart(&f);
     try t.expectEqual(0, f.core.member_asks.countOf("anna"));
     try t.expectEqualStrings("", try Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited));
+}
+
+test "a_conversation_name_used_again_starts_a_fresh_context" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.core.setBot("harness_test_bot", true);
+    try addTopic(&f, "home", 5012);
+    try f.e.script(1, model.textReply("Noted."));
+    try f.e.script(2, model.textReply("Hi Anna."));
+    try f.e.script(3, model.textReply("Hi Ben."));
+    try f.core.startWorker();
+    // the owner's topic home, then the family group takes its name
+    try f.core.handleIncoming(inTopic(5012, null, "my secret plan is the blue door"));
+    try f.rec.waitIn("home", "Noted.");
+    _ = try f.core.command(a, "/conversation rm home");
+    try f.core.handleIncoming(.{ .from = 42, .chat = -100777, .chat_type = "supergroup", .text = "/conversation add home" });
+    try f.rec.waitFor("Added: the agent may post here as home.");
+    try joinMember(&f, "anna", 77);
+    try f.core.handleIncoming(.{ .from = 77, .chat = -100777, .chat_type = "supergroup", .text = "@harness_test_bot the safe code is 4711" });
+    try f.rec.waitIn("home", "Hi Anna.");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "blue door") == null);
+    // that group goes; another group takes the name
+    _ = try f.core.command(a, "/conversation rm home");
+    try f.core.handleIncoming(.{ .from = 42, .chat = -100888, .chat_type = "supergroup", .text = "/conversation add home" });
+    try f.rec.waitFor("Added: the agent may post here as home.");
+    try joinMember(&f, "ben", 78);
+    try f.core.handleIncoming(.{ .from = 78, .chat = -100888, .chat_type = "supergroup", .text = "@harness_test_bot hello" });
+    try f.rec.waitIn("home", "Hi Ben.");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "4711") == null);
+}
+
+test "in_a_group_only_what_is_addressed_to_the_bot_is_taken" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.setBot("harness_test_bot", true);
+    try addGroup(&f, "home", -100777);
+    try joinMember(&f, "anna", 77);
+    try f.e.script(1, model.textReply("The heating is off."));
+    try f.e.script(2, model.textReply("It is 19 degrees."));
+    try f.core.startWorker();
+    // said to someone else in the group: left alone
+    try f.core.handleIncoming(.{ .from = 77, .chat = -100777, .chat_type = "supergroup", .text = "turn off the heating?" });
+    try f.core.handleIncoming(.{ .from = 77, .chat = -100777, .chat_type = "supergroup", .text = "yes, do it", .reply_to = 5 });
+    // to the bot by name, then a reply to its answer
+    try f.core.handleIncoming(.{ .from = 77, .chat = -100777, .chat_type = "supergroup", .text = "@harness_test_bot turn off the heating" });
+    try f.rec.waitIn("home", "The heating is off.");
+    const answer = blk: {
+        f.rec.mutex.lockUncancelable(t.io);
+        defer f.rec.mutex.unlock(t.io);
+        break :blk f.rec.next_text;
+    };
+    try f.core.handleIncoming(.{ .from = 77, .chat = -100777, .chat_type = "supergroup", .text = "and how warm is it?", .reply_to = answer });
+    try f.rec.waitIn("home", "It is 19 degrees.");
+    try t.expectEqual(2, f.e.server.modelRequests());
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "turn off the heating?") == null);
+    try expectHas(try logText(&f), "\"why\":\"not addressed to the bot\"");
+}
+
+test "removing_a_member_drops_their_queued_messages_and_a_yes_after_does_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withHome(&f);
+    try joinMember(&f, "anna", 77);
+    // no worker yet: her message waits
+    try f.core.handleIncoming(fromAccount(77, "turn on the light"));
+    try t.expectEqual(1, f.core.queue.items.len);
+    _ = try f.core.command(a, "/member rm anna");
+    try t.expectEqual(0, f.core.queue.items.len);
+    // ben asks; he is gone before the owner's Yes (as if removed meanwhile)
+    try joinMember(&f, "ben", 78);
+    try f.e.script(1, model.toolReply("g1", "home__home_guarded", "{\"device\":\"front_door\",\"action\":\"unlock\"}"));
+    try f.e.script(2, model.textReply("Waiting."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(fromAccount(78, "unlock the front door"));
+    try f.rec.waitIn("ben", "Waiting.");
+    const b = f.rec.buttonsWith("Ben asks to unlock the front door.") orelse return error.NoQuestion;
+    {
+        f.core.members.mutex.lockUncancelable(t.io);
+        defer f.core.members.mutex.unlock(t.io);
+        _ = try f.core.members.remove("ben");
+    }
+    f.core.handleCallback(42, b.msg, b.get("once").?);
+    try f.rec.waitIn("main", "ben is no longer a member: nothing was done.");
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "allowed once by the owner") == null);
+}
+
+test "a_members_item_without_its_call_does_nothing_and_says_so" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const choices = [_]inbox_mod.Choice{ .{ .key = "once", .label = "Unlock" }, .{ .key = "deny", .label = "No" } };
+    // harness stopped between keeping the item and keeping its call
+    const one = try f.core.addItem(.{ .kind = "approval", .by = "member:anna", .conversation = "main", .waiter = "member anna", .title = "Anna asks to unlock the front door.", .body = "Anna asks to unlock the front door.", .choices = &choices, .text = .reason, .expires = f.core.now() + 600 });
+    const b = f.rec.buttonsWith("Anna asks to unlock the front door.") orelse return error.NoQuestion;
+    f.core.handleCallback(42, b.msg, b.get("once").?);
+    try f.rec.waitIn("main", try std.fmt.allocPrint(f.e.arena.allocator(), "Item {d}: nothing was done: harness no longer has that call. Ask anna to ask again.", .{one}));
+    // another, at a start: void
+    const two = try f.core.addItem(.{ .kind = "approval", .by = "member:anna", .conversation = "main", .waiter = "member anna", .title = "Anna asks to lock the front door.", .body = "Anna asks to lock the front door.", .choices = &choices, .text = .reason, .expires = f.core.now() + 600 });
+    try restart(&f);
+    f.core.inbox.mutex.lockUncancelable(t.io);
+    defer f.core.inbox.mutex.unlock(t.io);
+    try t.expectEqual(.void, f.core.inbox.find(two).?.status);
+}
+
+test "a_members_money_call_never_shows_the_owners_spending" {
+    var f: Fix = undefined;
+    try f.init("[money]\nmax_per_call = 1\n", "", "");
+    defer f.deinit();
+    _ = try withFake(&f, true);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try joinMember(&f, "anna", 77);
+    try f.e.script(1, model.toolReply("m1", "fake__echo", "{\"text\":\"buy\",\"amount\":5}"));
+    try f.e.script(2, model.textReply("Not possible."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(fromAccount(77, "buy it"));
+    try f.rec.waitIn("anna", "Not possible.");
+    const req = try f.e.request(2);
+    try expectHas(req, "refused by the gate: a money limit of the owner's is reached");
+    try t.expect(std.mem.indexOf(u8, req, "cap of 1") == null);
+    // the log keeps why
+    try expectHas(try logText(&f), "5 is over the cap of 1 per call");
+}
+
+test "telegrams_shared_sender_accounts_never_join_or_ask" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addGroup(&f, "home", -100777);
+    const code = try memberCode(&f, "anna");
+    // an anonymous admin, a channel, Telegram's service account
+    for ([_]i64{ 1087968824, 136817688, 777000 }) |id|
+        try f.core.handleIncoming(.{ .from = id, .chat = -100777, .chat_type = "supergroup", .text = try std.fmt.allocPrint(a, "/join {s}", .{code}) });
+    try t.expect(std.mem.indexOf(u8, try membersFile(&f), "\"user\":0,") != null);
+    try t.expectEqual(0, f.rec.countIn("home", "Hi Anna"));
 }

@@ -35,6 +35,13 @@ pub fn validName(name: []const u8) bool {
     return true;
 }
 
+/// Telegram's accounts that stand in for others in groups: an anonymous
+/// admin's messages, posts sent as a channel, a linked channel's posts.
+/// Anyone can write as them, so they never join and are never a member.
+pub fn sharedSender(id: i64) bool {
+    return id == 1087968824 or id == 136817688 or id == 777000;
+}
+
 /// "anna" as members and the owner read it: "Anna".
 pub fn display(buf: *[max_name]u8, name: []const u8) []const u8 {
     const n = @min(name.len, buf.len);
@@ -363,6 +370,14 @@ pub const Asks = struct {
         defer s.mutex.unlock(s.io);
         for (s.items.items) |k| if (std.mem.eql(u8, k.member, member) and std.mem.eql(u8, k.arg, arg)) return k.item;
         return null;
+    }
+
+    /// Whether a call waits on item `item`.
+    pub fn has(s: *Asks, item: u64) bool {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        for (s.items.items) |k| if (k.item == item) return true;
+        return false;
     }
 
     /// How many of `member`'s calls wait.

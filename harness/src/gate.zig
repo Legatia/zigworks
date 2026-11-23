@@ -1511,11 +1511,11 @@ test "what_members_never_get" {
     const a = f.arena.allocator();
     const Call = struct { Tool, []const u8 };
     const calls = [_]Call{
-        .{ .shell, "ls" },           .{ .read_file, "notes.md" }, .{ .write_file, "notes.md" }, .{ .web, "example.com" },
-        .{ .login, "bot example.com" }, .{ .recall, "x" },          .{ .remember, "x" },           .{ .history, "x" },
-        .{ .skill, "x" },            .{ .skill_save, "x" },       .{ .delegate, "1 task" },      .{ .agent_save, "x" },
-        .{ .trigger, "add x" },      .{ .trigger, "list" },       .{ .workflow, "save x" },      .{ .workflow, "list" },
-        .{ .ask_owner, "x?" },       .{ .snapshot, "notes" },     .{ .app_read, "x log" },       .{ .env_save, "box" },
+        .{ .shell, "ls" },              .{ .read_file, "notes.md" }, .{ .write_file, "notes.md" }, .{ .web, "example.com" },
+        .{ .login, "bot example.com" }, .{ .recall, "x" },           .{ .remember, "x" },          .{ .history, "x" },
+        .{ .skill, "x" },               .{ .skill_save, "x" },       .{ .delegate, "1 task" },     .{ .agent_save, "x" },
+        .{ .trigger, "add x" },         .{ .trigger, "list" },       .{ .workflow, "save x" },     .{ .workflow, "list" },
+        .{ .ask_owner, "x?" },          .{ .snapshot, "notes" },     .{ .app_read, "x log" },      .{ .env_save, "box" },
         .{ .mail, "home" },
     };
     for (calls) |c| {

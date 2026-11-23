@@ -1595,7 +1595,9 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     if (tool == .money) {
         if (moneyCheck(r, a, mt.?, input_json, now_s, &reserved)) |why| {
             try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
-            return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            // a household member's run doesn't learn the owner's spending
+            const said = if (who_mod.isMember(r.who.by)) "a money limit of the owner's is reached" else why;
+            return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{said}), .is_error = true };
         }
     }
     // what the owner sees besides the argument
