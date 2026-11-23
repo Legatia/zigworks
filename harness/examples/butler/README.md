@@ -1,10 +1,11 @@
 # The butler's routines
 
-Eight routines for a home run by Home Assistant (through
+Ten routines for a home run by Home Assistant (through
 [homemcp](../../../homemcp/)) and, for the last one, a car (through
 [carcloud](../../../carcloud/)); four more for your mail (through
 [mailmcp](../../../mailmcp/), once `/setup mail mine` is on; the last two
-with a calendar, through [calmcp](../../../calmcp/)). Each is a workflow
+with a calendar, through [calmcp](../../../calmcp/)); and Trips, with a
+calendar or your mailbox. Each is a workflow
 (`workflows/NAME.wf`), the section of `triggers.ini` that starts it, and
 sometimes a few lines of `rules`. harness carries these files inside its
 binary: after `/setup home` in chat, it offers them one at a time, fills in
@@ -20,11 +21,14 @@ your devices and times, shows each file, and writes it only when you tap
 | Leak | a leak sensor reads water (`home://device/NAME`) | urgent, through quiet hours: "Water leak: Sink leak, Kitchen." [Close the water main] [Ignore]; with `fallback 5m` (setup offers it when the valve closes), harness closes it when nobody is on it in 5 minutes |
 | Smoke alarm | a smoke or CO alarm reads `ALARM` | urgent, through quiet hours: "Smoke alarm: Kitchen smoke alarm, Kitchen.", said on every speaker (`speakers = all`); nothing to close, nothing acted on |
 | Doors left open | a door or window sensor reads open | 10 minutes later, if it still is: "Back door has been open for 10 minutes." |
+| Doorbell | a doorbell rings (`to is ring`): one trigger while someone is home (`while = home`), one while away (`while = away`) | at home: "Someone's at the front door, probably the DHL parcel." (said on every speaker); with a lock home.ini lets unlock (only by your hand), [Unlock the door] [Leave it], that one call on your tap, nothing in 10 minutes without it; while away: urgent and plain, never an unlock |
+| Away | harness itself (`schedule:away`) as away mode comes on: everyone out `[butler] away_after`, a trip, `/away` | one line, and [Heating to 17 °C] [Leave it] when it is set higher; while away a trigger per door, window and motion sensor (`while = away`, urgent, `tag = no`); the lights in `[schedule:away]` of rules on and off in the evening; the 20:00 line; the heating back before you return (harness's own calls, exactly those lines) |
 | Car for tomorrow | in the evening (90 minutes before quiet hours) | a line when the car is under half and not plugged in; one tap to start charging when it is plugged in but not charging |
 | Bills | `mail_list` of your mailbox every 6 hours: bills due in 3 days | a line with who, how much and when it is due, once a bill |
 | Deliveries | `mail_list` every hour: parcels coming today | a line on the day, once a parcel |
 | Flights | a travel mail pushed by mailmcp (`mail://mine/new`) | an agent step reads it; a flight's time offered for the calendar with calmcp's `cal_create` (`title`, `start`, `end`, `place`), asked every time |
 | Invitations | an invitation mail pushed by mailmcp | the same, for the event it invites you to |
+| Trips | harness itself (`schedule:trips`), the evening before a trip | when to leave, the weather there (an agent step with search, when it is set) and what to pack; trips themselves (`state/trips/`, /trips, check-in, the airport's leave-by) are harness's own |
 
 ## What they never do
 
@@ -39,9 +43,12 @@ your devices and times, shows each file, and writes it only when you tap
   itself, once, and says so ("No one answered in 5 minutes: Water main
   closed (it reports closed)."). harness reads a `fallback` only before
   homemcp's guarded tool locking, closing or arming, in an urgent routine.
-- **Nothing is unlocked, opened or disarmed.** homemcp's home file allows
-  locks only `lock` and valves only `close`, and these files never ask for
-  the other way.
+- **Nothing is unlocked, opened or disarmed by itself.** homemcp's home
+  file as setup writes it allows locks only `lock` and valves only
+  `close`. The one file that names `unlock` is the doorbell's, inside `#if
+  unlock`: it is written only for a lock you let unlock yourself, as an
+  `approve` with `yes` right before that one call, never urgent (so never a
+  fallback), and the away trigger never offers it.
 - **Cameras and smoke or CO alarms are not touched.** homemcp leaves cameras
   out of the home file and keeps smoke and CO alarms watched only (kind
   `smoke`: no line may let anything act on one); the smoke routine only

@@ -792,6 +792,7 @@ pub const Routine = enum {
     delivery,
     flight,
     invitation,
+    trips,
 
     /// The workflow's name (and its file's).
     pub fn name(r: Routine) []const u8 {
@@ -815,6 +816,7 @@ pub const Routine = enum {
             .delivery => "Deliveries",
             .flight => "Flights",
             .invitation => "Invitations",
+            .trips => "Trips",
         };
     }
 
@@ -835,6 +837,8 @@ pub const Routine = enum {
             .bill, .delivery => p.mail,
             // the calendar's own tools add the entry: only with one set
             .flight, .invitation => p.mail and p.calendar.len > 0,
+            // trips come from the calendar or the mail
+            .trips => p.mail or p.calendar.len > 0,
         };
     }
 
@@ -906,11 +910,15 @@ pub const Routine = enum {
             .bill => try o.appendSlice(a, "Bills: 3 days before a bill in your mail is due, I tell you who, how much and when."),
             .delivery => try o.appendSlice(a, "Deliveries: on the day a parcel comes, one line with what and from whom."),
             .flight => {
-                try o.appendSlice(a, "Flights: when a flight confirmation comes, I offer its time for the calendar (you're asked first)");
-                if (p.people) try o.appendSlice(a, ", and the house goes to away when you've all left for it");
-                try o.append(a, '.');
+                // away mode for a trip is the Away and Trips routines'
+                try o.appendSlice(a, "Flights: when a flight confirmation comes, I offer its time for the calendar (you're asked first).");
             },
             .invitation => try o.appendSlice(a, "Invitations: when an invitation comes, I offer it for the calendar (you're asked first)."),
+            .trips => {
+                try o.appendSlice(a, "Trips: flights, trains and hotels from your ");
+                try o.appendSlice(a, if (p.calendar.len > 0 and p.mail) "calendar and your travel mail" else if (p.mail) "travel mail" else "calendar");
+                try o.print(a, " become trips (/trips): a line a day before a flight to check in, when to leave for the airport, and the evening before, {s}what to pack.", .{if (p.search) "the weather there and " else ""});
+            },
         }
         return o.items;
     }
@@ -933,11 +941,12 @@ pub fn onText(a: Allocator, r: Routine, p: Picks) ![]const u8 {
         .delivery => "Delivery lines are on.",
         .flight => "Flights are on.",
         .invitation => "Invitations are on.",
+        .trips => "Trips are on: /trips lists them.",
     };
 }
 
 /// The routines in the order setup offers them.
-pub const all = [_]Routine{ .goodnight, .leaving, .arriving, .@"morning-home", .leak, .smoke, .@"door-open", .doorbell, .away, .@"car-tomorrow", .bill, .delivery, .flight, .invitation };
+pub const all = [_]Routine{ .goodnight, .leaving, .arriving, .@"morning-home", .leak, .smoke, .@"door-open", .doorbell, .away, .@"car-tomorrow", .bill, .delivery, .flight, .invitation, .trips };
 
 /// Where a doorbell rings, from its name: "the front door" for
 /// front_door_bell, "the door" for a plain doorbell.
@@ -1112,6 +1121,7 @@ fn triggerSections(r: Routine) []const []const u8 {
         .delivery => &.{"delivery-today"},
         .flight => &.{"flight-mail"},
         .invitation => &.{"invitation-mail"},
+        .trips => &.{},
     };
 }
 
@@ -1230,6 +1240,8 @@ fn commonValues(a: Allocator, p: Picks) ![]Value {
     for (p.smokes) |d| try smoke_starts.append(a, try std.fmt.allocPrint(a, "trigger:{s}", .{try perSensorName(a, "smoke-", d.name)}));
     try v.append(a, .{ .key = "smoke starts", .value = try std.mem.join(a, ", ", smoke_starts.items) });
     try v.append(a, .{ .key = "smoke speaker words", .value = if (p.speakers) ", and on every speaker" else "" });
+    // trips'
+    try v.append(a, .{ .key = "trips weather words", .value = if (p.search) "the weather there and " else "" });
     // the doorbell's
     var bell_starts: std.ArrayList([]const u8) = .empty;
     for (p.doorbells) |d| try bell_starts.append(a, try std.fmt.allocPrint(a, "trigger:{s}", .{try perSensorName(a, "doorbell-", d.name)}));
@@ -1286,6 +1298,7 @@ fn flagsOf(a: Allocator, p: Picks) ![]const []const u8 {
     if (p.mail) try f.append(a, "mail");
     if (p.people) try f.append(a, "people");
     if (p.unlock != null) try f.append(a, "unlock");
+    if (p.search) try f.append(a, "search");
     return f.items;
 }
 
@@ -1959,4 +1972,28 @@ test "the_doorbell_routine_fills" {
     try t.expect(std.ascii.findIgnoreCase(fu.triggers, "unlock") == null);
     for ([_][2][]const u8{ .{ "front_door_bell", "the front door" }, .{ "front_doorbell", "the front door" }, .{ "doorbell", "the door" }, .{ "garden_gate_bell", "the garden gate" } }) |x| try t.expectEqualStrings(x[1], try bellWhere(a, x[0]));
     try t.expectEqualStrings("Doorbell: when someone rings at the front door, I tell you at once, and which parcel it probably is when one is due today; while you're away, even at night. One tap on Unlock the door lets them in: you're asked every time, it never unlocks by itself, and never while you're away.", try Routine.doorbell.sentence(a, pu));
+}
+
+test "the_trips_routine_fills" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // offered with a calendar or the owner's mailbox; nothing without
+    try t.expect(!Routine.trips.offered(try simPicks(a, .{})));
+    const p = try simPicks(a, .{ .calendar = "calendar", .mail = true, .search = true });
+    try t.expect(Routine.trips.offered(p));
+    const f = try routineFiles(a, .trips, p, "2026-11-23");
+    // harness starts it the evening before; no trigger of its own
+    try t.expectEqualStrings("", f.triggers);
+    try expectIn(f.workflow, "\nstart schedule:trips\n");
+    try expectIn(f.workflow, "tools search\n");
+    try expectIn(f.workflow, "say {input} {weather.line} Pack: {event.pack}{weather.more}.");
+    try expectIn(f.workflow, "\nstep plain\nsay {input} Pack: {event.pack}.");
+    var d: workflows.Diag = .{};
+    const w = try workflows.parse(a, "trips", f.workflow, &d);
+    _ = try workflows.check(a, w, .{}, &d);
+    // without search: no weather, the list alone
+    const ns = try routineFiles(a, .trips, try simPicks(a, .{ .calendar = "calendar" }), "2026-11-23");
+    try t.expect(std.mem.indexOf(u8, ns.workflow, "weather") == null);
+    try t.expectEqualStrings("Trips: flights, trains and hotels from your calendar and your travel mail become trips (/trips): a line a day before a flight to check in, when to leave for the airport, and the evening before, the weather there and what to pack.", try Routine.trips.sentence(a, p));
 }

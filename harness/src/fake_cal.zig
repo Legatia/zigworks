@@ -4,7 +4,8 @@
 //! what the file says; `FILE.ini` (a calendar file) serves MCP on stdio:
 //! cal_agenda and cal_event read `agenda.txt` and `event.txt` of its
 //! folder (else a day with the dentist); `travel_time` plays a maps server
-//! (34 min, its inputs kept in `travel.jsonl`); the changes (when the file
+//! (34 min, its inputs kept in `travel.jsonl`), `flight_status` a
+//! flight-status server (`flight.txt`, its inputs in `flights.jsonl`); the changes (when the file
 //! lets one calendar change) are written to `changes.jsonl` and answered
 //! as calmcp does (cal_create with calmcp's own fields, a call naming
 //! another refused); `cal://upcoming` is `upcoming.json` of its folder.
@@ -101,7 +102,7 @@ pub fn check(io: Io, a: std.mem.Allocator, env: *const std.process.Environ.Map, 
 }
 
 const read_tools =
-    \\{"name":"cal_agenda","description":"The owner's events from from to to (default: today). Only reads.","inputSchema":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"},"calendar":{"type":"string"}}},"annotations":{"readOnlyHint":true}},{"name":"cal_free","description":"Free time. Only reads.","inputSchema":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"},"minutes":{"type":"integer"}},"required":["from","to","minutes"]},"annotations":{"readOnlyHint":true}},{"name":"cal_event","description":"One event in full. Only reads.","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]},"annotations":{"readOnlyHint":true}},{"name":"travel_time","description":"A maps server's travel time (the tests' [butler] maps).","inputSchema":{"type":"object","properties":{"destination":{"type":"string"},"arrival":{"type":"string"}},"required":["destination"]},"annotations":{"readOnlyHint":true}}
+    \\{"name":"cal_agenda","description":"The owner's events from from to to (default: today). Only reads.","inputSchema":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"},"calendar":{"type":"string"}}},"annotations":{"readOnlyHint":true}},{"name":"cal_free","description":"Free time. Only reads.","inputSchema":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"},"minutes":{"type":"integer"}},"required":["from","to","minutes"]},"annotations":{"readOnlyHint":true}},{"name":"cal_event","description":"One event in full. Only reads.","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]},"annotations":{"readOnlyHint":true}},{"name":"travel_time","description":"A maps server's travel time (the tests' [butler] maps).","inputSchema":{"type":"object","properties":{"destination":{"type":"string"},"arrival":{"type":"string"}},"required":["destination"]},"annotations":{"readOnlyHint":true}},{"name":"flight_status","description":"A flight-status server's answer (the tests' [butler] flight_status).","inputSchema":{"type":"object","properties":{"flight":{"type":"string"},"date":{"type":"string"}},"required":["flight"]},"annotations":{"readOnlyHint":true}}
 ;
 const write_tools =
     \\,{"name":"cal_create","description":"Create an event. Ask the owner first.","inputSchema":{"type":"object","properties":{"calendar":{"type":"string"},"title":{"type":"string"},"start":{"type":"string"},"end":{"type":"string"},"minutes":{"type":"integer"},"all_day":{"type":"boolean"},"place":{"type":"string"},"notes":{"type":"string"}},"required":["title","start"]},"_meta":{"anthropic/requiresUserInteraction":true}},{"name":"cal_move","description":"Move one of the owner's own events. Ask the owner first.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"from":{"type":"string"},"to":{"type":"string"}},"required":["id","title","from","to"]},"_meta":{"anthropic/requiresUserInteraction":true}},{"name":"cal_cancel","description":"Cancel one of the owner's own events. Ask the owner first.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"start":{"type":"string"}},"required":["id","title","start"]},"_meta":{"anthropic/requiresUserInteraction":true}},{"name":"cal_reply","description":"Answer an invitation. Ask the owner first.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"answer":{"type":"string"}},"required":["id","title","answer"]},"_meta":{"anthropic/requiresUserInteraction":true}}
@@ -200,6 +201,13 @@ fn call(io: Io, a: std.mem.Allocator, name: []const u8, args_json: []const u8, w
         defer f.close(io);
         f.writePositionalAll(io, try std.fmt.allocPrint(a, "{s}\n", .{args_json}), f.length(io) catch 0) catch {};
         return textResult(a, "34 min by car, light traffic", false);
+    }
+    if (eql(u8, name, "flight_status")) {
+        // what it was asked, a line each, in `flights.jsonl`; the answer `flight.txt`
+        const f = Io.Dir.cwd().createFile(io, "flights.jsonl", .{ .truncate = false }) catch return textResult(a, "can't write flights.jsonl", true);
+        defer f.close(io);
+        f.writePositionalAll(io, try std.fmt.allocPrint(a, "{s}\n", .{args_json}), f.length(io) catch 0) catch {};
+        return textResult(a, fileOf(io, a, "flight.txt") orelse "no such flight", false);
     }
     if (eql(u8, name, "cal_event")) return textResult(a, fileOf(io, a, "event.txt") orelse "Dentist\nWhen: Mon 23 Nov 2026 10:30–11:30 (Europe/Warsaw)\nWhere: Dental clinic, ul. Długa 5, Kraków\nCalendar: Personal (calmcp may change it)\nid: personal/dentist-1@calmcp-sim", false);
     const known = eql(u8, name, "cal_create") or eql(u8, name, "cal_move") or eql(u8, name, "cal_cancel") or eql(u8, name, "cal_reply");
