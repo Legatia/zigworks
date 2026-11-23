@@ -135,6 +135,14 @@ url = $URL
 api = $URL
 [limits]
 approval_seconds = 30
+[provider whisper]
+api = openai
+url = $URL/v1
+auth = none
+[voice]
+provider = whisper
+model = large-v3-turbo
+language = pl
 EOF
 printf 'allow shell sleep *\nallow mcp fake/echo *\n' >"$HARNESS_HOME/rules"
 # shop: the same server, its echo a money tool capped at 10 a call
@@ -231,6 +239,16 @@ say "/pair $CODE"
 check "pairing answers the owner" 'wait_for "$OUT" "Paired."'
 check "a stranger is dropped and logged" 'grep -qF "\"from\":7" "$HARNESS_HOME/log/actions.jsonl"'
 
+# a household member: the owner's code, the person's /join, their own chat
+say "/member add anna"
+check "the owner gets a member's code" 'wait_for "$OUT" "Code for anna: "'
+MCODE=$(grep -o 'Code for anna: [A-Z0-9]*' "$OUT" | tail -n 1 | sed 's/^Code for anna: //')
+inbox "{\"message\":{\"from\":{\"id\":77},\"chat\":{\"id\":77,\"type\":\"private\"},\"text\":\"/join $MCODE\"}}"
+check "the member joins with it from their own chat" 'wait_for "$OUT" "Hi Anna, you" && wait_for "$OUT" "anna joined" && ! grep -qF "$MCODE" "$HARNESS_HOME/log/actions.jsonl"'
+reply "$(text_reply 'The hall light is off.')"
+inbox "{\"message\":{\"from\":{\"id\":77},\"chat\":{\"id\":77,\"type\":\"private\"},\"text\":\"is the hall light on?\"}}"
+check "a member is answered in their own chat, as member:anna" 'wait_for "$OUT" "The hall light is off." && grep -F "The hall light is off." "$OUT" | grep -qF "\"chat_id\":77" && grep -qF "\"by\":\"member:anna\"" "$HARNESS_HOME/log/actions.jsonl" && grep -qF "From: Anna (member:anna)" "$(req)"'
+
 reply "$(tool_reply tu_1 'echo smoke-ran')"
 reply "$(text_reply 'done: smoke-ran')"
 say "run the echo"
@@ -272,6 +290,17 @@ fi
 say "/remember I prefer short briefs"
 say "/memory"
 check "a remembered item is listed" 'wait_for "$OUT" "I prefer short briefs"'
+
+# a voice note: fetched from Telegram, transcribed by a local whisper
+# server (the stand-in), shown quoted, then answered as typed
+printf 'OggS-smoke-audio' >"$S/telegram/files/smokevoice"
+printf '{"text":"what is the weather"}' >"$S/transcribe/001.json"
+reply "$(text_reply 'It is sunny.')"
+inbox '{"message":{"from":{"id":42},"chat":{"id":42,"type":"private"},"voice":{"file_id":"smokevoice","duration":2,"mime_type":"audio/ogg","file_size":16}}}'
+check "a voice note is shown quoted, then answered" 'wait_for "$OUT" "It is sunny." && grep -qF "\"text\":\"\\\"what is the weather\\\"\"" "$OUT" && grep -qF "what is the weather" "$(req)" && grep -qF "OggS-smoke-audio" "$S/transcribe-requests/001.json"'
+check "the audio is in no log; the voice note line is" '! grep -qF "OggS-smoke-audio" "$HARNESS_HOME/log/actions.jsonl" && grep -qF "\"event\":\"voice note\"" "$HARNESS_HOME/log/actions.jsonl"'
+say "/quiet"
+check "quiet hours are off until set" 'wait_for "$OUT" "Quiet hours are off."'
 
 say "/status"
 check "the MCP server started" 'wait_for "$OUT" "MCP: fake (3 tools)"'

@@ -66,6 +66,10 @@ pub const Question = struct {
     /// The asking run's own stop flag (a delegated run has one of its own,
     /// which `/stop NAME` sets alone): once set, its item is withdrawn.
     stop: ?*const std.atomic.Value(bool) = null,
+    /// An approval's call: its gate kind and argument (a household
+    /// member's asker keeps them to make the call on the owner's yes).
+    tool: ?gate.Tool = null,
+    arg: []const u8 = "",
 
     pub const Kind = enum { approval, question, draft };
 };
@@ -162,6 +166,8 @@ pub const Delivery = struct {
         kept,
         /// Over its conversation's hourly limit: logged, not sent.
         held,
+        /// Quiet hours: kept for the digest at their end (`why` says when).
+        digest,
         /// Nothing to post (a scheduled run's NOTHING).
         silent,
         failed,
@@ -561,6 +567,9 @@ pub const Run = struct {
     /// within the definition's tools, what the starter passes on and the
     /// starter's own run's tools (an MCP tool by its name: `allowsMcp`).
     pub fn allows(r: *const Run, tool: gate.Tool) bool {
+        // a household member's run: what members may use, a page read only
+        // where a member's rule allows some (the gate decides each call)
+        if (who_mod.isMember(r.who.by) and !r.gate.memberOffers(tool, r.who)) return false;
         // delegated runs answer the run that started them: they never
         // post, ask, save or move money (helpers since 0.3, the rest since)
         if (r.helper) switch (tool) {
@@ -1421,6 +1430,12 @@ const send_guide =
     \\
 ;
 
+/// The same for a household member's run.
+const member_send_guide =
+    \\The member sees only what you post with send. Reply with send and final: true. Your other text goes to the log.
+    \\
+;
+
 const delegate_guide =
     \\Use `delegate` to hand independent pieces of work to helpers that run at the same time, each with a clean context: research across several sources, comparisons, anything that splits into parts. Each task must stand alone and include every detail the helper needs; you get back each helper's short answer, not its working.
     \\
@@ -1459,7 +1474,7 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
     if (out.items.len > 0) try out.append(arena, '\n');
     try out.appendSlice(arena, if (r.helper) delegated_gate_line else gate_line);
     if (r.allows(.delegate)) try out.appendSlice(arena, delegate_guide);
-    if (r.allows(.send)) try out.appendSlice(arena, send_guide);
+    if (r.allows(.send)) try out.appendSlice(arena, if (who_mod.isMember(r.who.by)) member_send_guide else send_guide);
     if (r.scheduled) try out.appendSlice(arena, "This is a scheduled run: the owner is not watching and cannot approve anything.\n");
     if (r.extra_instructions.len > 0) try out.print(arena, "{s}\n", .{r.extra_instructions});
     if (r.skills_dir.len > 0 and r.allows(.skill)) {
@@ -1749,7 +1764,7 @@ fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const
     return .{ .text = try util.validUtf8(a, out.text), .is_error = out.is_error };
 }
 
-fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const u8) !tools.Output {
+fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []const u8) !tools.Output {
     if (r.env.stop.load(.acquire)) return .{ .text = "stopped by the owner", .is_error = true };
     // what to mask: as the list is now (a password made a moment ago too)
     if (r.masks) |m| r.env.secrets = try m.snapshot(a);
@@ -1774,6 +1789,11 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
             return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
         }
     };
+    // an MCP tool's input in one form (keys sorted, no spaces), the one
+    // the rules, the owner's question, the money check and the server all
+    // get: rules can't be passed by writing the same call another way
+    const input_json = if (mt != null) jv.canonical(a, raw_input) orelse
+        return .{ .text = "the tool's input must be JSON with each field once", .is_error = true } else raw_input;
     if (tool == .send) return sendTool(r, a, input_json);
     if (tool == .agent_save) return agentSave(r, a, input_json);
     if (tool == .trigger) return triggerTool(r, a, input_json);
@@ -1858,7 +1878,9 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     if (tool == .money) {
         if (moneyCheck(r, a, mt.?, input_json, now_s, &reserved)) |why| {
             try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
-            return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            // a household member's run doesn't learn the owner's spending
+            const said = if (who_mod.isMember(r.who.by)) "a money limit of the owner's is reached" else why;
+            return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{said}), .is_error = true };
         }
     }
     // what the owner sees besides the argument
@@ -2158,6 +2180,8 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
     };
     // the files, read whole from the workspace as read_file sees it
     const paths = jv.arr(jv.get(v, "files")) orelse &.{};
+    // the workspace is the owner's
+    if (paths.len > 0 and who_mod.isMember(r.who.by)) return refusePost(r, a, to, text, "a member's run sends no files");
     if (paths.len > max_files) return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "a post carries at most {d} files", .{max_files}));
     const files = try a.alloc(Attachment, paths.len);
     var dot: ?[]const u8 = null;
@@ -2202,6 +2226,7 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
         .sent => .{ .text = try std.fmt.allocPrint(a, "posted to {s} ({d} message{s}{s})", .{ target.name, d.parts, if (d.parts == 1) "" else "s", if (d.files == 0) "" else try std.fmt.allocPrint(a, ", {d} file{s}", .{ d.files, if (d.files == 1) "" else "s" }) }) },
         .kept => .{ .text = try std.fmt.allocPrint(a, "not delivered now ({s}); kept as item {d} and sent again later", .{ d.why, d.item }) },
         .held => .{ .text = try std.fmt.allocPrint(a, "not sent: {s}; it is in the log", .{d.why}), .is_error = true },
+        .digest => .{ .text = try std.fmt.allocPrint(a, "held for the digest: {s}", .{d.why}) },
         .silent => .{ .text = "nothing posted" },
         .failed => if (d.item != 0)
             .{ .text = try std.fmt.allocPrint(a, "not delivered ({s}); kept as item {d}", .{ d.why, d.item }), .is_error = true }
@@ -2866,7 +2891,7 @@ const AskExtra = struct {
 
 fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, now_s: i64, extra: AskExtra) !?[]const u8 {
     const dir = extra.dir;
-    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who, .shared = extra.shared, .dir = dir, .env = extra.env };
+    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who, .shared = extra.shared, .dir = dir, .env = extra.env, .here = tool == .send and std.mem.eql(u8, arg, r.conversation) };
     const env_logged: []const u8 = if (extra.env_note.len > 0) extra.env else "";
     const d = blk: {
         r.lock.lockUncancelable(r.io);
@@ -2938,6 +2963,8 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             .label = r.label,
             .private = r.isPrivate(),
             .stop = r.env.stop,
+            .tool = tool,
+            .arg = arg,
         });
         if (extra.item) |p| p.* = got.item;
         var ans = got.answer;
@@ -2967,7 +2994,7 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             .full => why = if (got.text.len > 0) got.text else "no place in the inbox until the turn's end",
             .answered => why = try ownerSaid(a, "not an answer to this question", "", got.item),
             .deferred => {
-                why = try ownerSaid(a, "waits for the owner in the inbox", "", got.item);
+                why = try ownerSaid(a, "waits for the owner in the inbox", got.text, got.item);
                 logged = .ask;
             },
         }
@@ -4575,6 +4602,23 @@ test "rules_see_the_whole_input_of_an_mcp_call" {
     const r = try f.say("echo");
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: rule on line 1") != null);
+}
+
+test "mcp_rules_read_one_form_of_the_input_whatever_its_order" {
+    var f: Fix = undefined;
+    // an ask on how the input starts, with an allow for the rest of the tool
+    try f.init("ask mcp fake/echo {\"text\":\"lock\"*\nallow mcp fake/echo *\n");
+    defer f.deinit();
+    const s = try withMcp(&f, false);
+    defer s.deinit();
+    // the field second, or spaced: still asked, never let through
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"zone\":1,\"text\":\"lock\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "fake__echo", "{ \"text\" : \"lock\" }"));
+    try f.e.script(3, model.textReply("done"));
+    f.answer = .deny;
+    const r = try f.say("lock it");
+    freeResult(&f.run, r);
+    try t.expectEqual(2, f.asked);
 }
 
 test "rules_see_every_task_of_a_delegate_call" {

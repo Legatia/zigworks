@@ -103,6 +103,8 @@ pub const Workflow = struct {
     /// The definition its agent steps run.
     agent: []const u8 = "main",
     agent_line: usize = 0,
+    /// `urgent yes`: its posts and questions go through quiet hours.
+    urgent: bool = false,
     steps: []const Step,
     /// "saved by agent:main 2026-11-22 (item 57)": its first line, when
     /// the agent's save wrote it.
@@ -257,7 +259,7 @@ fn readLines(a: Allocator, text: []const u8, diag: *Diag, saved: *[]const u8) Er
     return out.items;
 }
 
-const head_keys = [_][]const u8{ "workflow", "about", "start", "limits", "to" };
+const head_keys = [_][]const u8{ "workflow", "about", "start", "limits", "to", "urgent" };
 const step_keys = [_][]const u8{ "tool", "do", "wait", "approve", "review", "say", "answer", "tools", "match", "if", "retry", "on", "timeout", "env", "goto", "end" };
 
 fn oneOf(word: []const u8, words: []const []const u8) bool {
@@ -363,6 +365,10 @@ fn headLine(a: Allocator, w: *Workflow, l: Line, file_name: []const u8, diag: *D
     } else if (eql(u8, l.key, "to")) {
         if (!conversations.validName(v)) return bad(diag, l.n, "to names a conversation: a-z, 0-9, - and _");
         w.to = v;
+    } else if (eql(u8, l.key, "urgent")) {
+        // `urgent yes`, or as triggers.ini writes it, `urgent = yes`
+        const word = std.mem.trim(u8, if (std.mem.startsWith(u8, v, "=")) v[1..] else v, " \t");
+        w.urgent = config.parseBool(word) orelse return bad(diag, l.n, "urgent yes or no: yes goes through quiet hours");
     } else if (eql(u8, l.key, "agent")) {
         if (!agents.validName(v)) return bad(diag, l.n, "agent names a definition: a-z, 0-9 and -");
         w.agent = v;
@@ -963,6 +969,7 @@ pub fn reading(a: Allocator, w: Workflow, money: ?*const fn (ctx: ?*anyopaque, t
         has_do = true;
     };
     if (has_do) try out.print(a, "; agent steps run {s}", .{w.agent});
+    if (w.urgent) try out.appendSlice(a, "; urgent: its posts and questions go through quiet hours");
     try out.appendSlice(a, ".");
     var moving: std.ArrayList(u8) = .empty;
     for (w.steps, 1..) |s, n| {
@@ -1265,4 +1272,20 @@ test "a_reading_says_what_each_step_does" {
     try t.expectError(error.BadWorkflow, check(a, w, .{ .triggers = ok, .mcp = &.{.{ .name = "github", .tools = &.{"list_issues"} }} }, &d));
     try t.expectEqualStrings("github has no tool add_issue_comment", d.why);
     try t.expect(readOnly(w.steps[1]) and !readOnly(w.steps[2]) and !readOnly(w.steps[3]));
+}
+
+test "urgent_is_read_in_the_head" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    const w = try parse(a, "leak", "workflow leak\nurgent yes\nstep ask\napprove Close the water main?\n", &d);
+    try t.expect(w.urgent);
+    // as triggers.ini writes it, too
+    try t.expect((try parse(a, "leak", "workflow leak\nurgent = yes\nstep s\nsay hi\n", &d)).urgent);
+    try t.expect(!(try parse(a, "leak", "workflow leak\nurgent no\nstep s\nsay hi\n", &d)).urgent);
+    try t.expect(!(try parse(a, "plain", "workflow plain\nstep s\nsay hi\n", &d)).urgent);
+    try t.expect(std.mem.indexOf(u8, try reading(a, w, null, null), "; urgent: its posts and questions go through quiet hours.") != null);
+    try refused(a, "leak", "workflow leak\nurgent sometimes\nstep s\nsay hi\n", 2, "urgent yes or no");
+    try refused(a, "leak", "workflow leak\nstep s\nurgent yes\nsay hi\n", 3, "urgent goes in the head");
 }

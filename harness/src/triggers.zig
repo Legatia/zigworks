@@ -83,6 +83,8 @@ pub const Trigger = struct {
     max_runs: u32 = 6,
     max_events: u32 = 20,
     checks_per_day: u32 = 50,
+    /// `urgent = yes`: its posts and questions go through quiet hours.
+    urgent: bool = false,
     /// "added by agent:main 2026-11-22 (item 41)": the comment right above its header.
     added: []const u8 = "",
     /// Its lines in the file (the mark above its header included), 1-based.
@@ -332,7 +334,7 @@ fn briefSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
 }
 
 const source_keys = [_][]const u8{ "topic", "feed", "search", "page", "file", "mcp" };
-const other_keys = [_][]const u8{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "json", "key" };
+const other_keys = [_][]const u8{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "json", "key", "urgent" };
 
 fn kindOfKey(key: []const u8) ?Kind {
     if (std.mem.eql(u8, key, "topic")) return .brief;
@@ -352,10 +354,10 @@ fn oneOf(word: []const u8, words: []const []const u8) bool {
 /// Whether a key goes with a trigger of `kind`.
 fn keyFits(kind: Kind, key: []const u8) bool {
     return switch (kind) {
-        .schedule => oneOf(key, &.{ "every", "at", "days", "do", "say", "start", "to", "agent" }),
+        .schedule => oneOf(key, &.{ "every", "at", "days", "do", "say", "start", "to", "agent", "urgent" }),
         .brief => oneOf(key, &.{ "topic", "at", "to" }),
         else => blk: {
-            if (oneOf(key, &.{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day" })) break :blk true;
+            if (oneOf(key, &.{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "urgent" })) break :blk true;
             if (kindOfKey(key)) |k| break :blk k == kind;
             if (std.mem.eql(u8, key, "json")) break :blk kind == .page;
             if (std.mem.eql(u8, key, "key")) break :blk kind == .mcp;
@@ -449,6 +451,8 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
             const x = std.fmt.parseInt(u32, v, 10) catch 0;
             if (x == 0 or (std.mem.eql(u8, l.key, "max_events") and x > 200)) return badf(a, diag, l.n, "{s} is a whole number from 1{s}", .{ l.key, if (std.mem.eql(u8, l.key, "max_events")) " to 200" else "" });
             if (std.mem.eql(u8, l.key, "max_runs")) tr.max_runs = x else if (std.mem.eql(u8, l.key, "max_events")) tr.max_events = x else tr.checks_per_day = x;
+        } else if (std.mem.eql(u8, l.key, "urgent")) {
+            tr.urgent = config.parseBool(v) orelse return bad(diag, l.n, "urgent = yes or no: yes goes through quiet hours");
         } else if (std.mem.eql(u8, l.key, "json")) {
             if (!jsonPath(v)) return bad(diag, l.n, "json is a path of names and [N], like data.amount or items[0].price");
             tr.json = v;
@@ -860,6 +864,7 @@ pub fn reading(a: Allocator, tr: Trigger, check_model: []const u8) ![]const u8 {
                 .none => {},
             }
             if (!std.mem.eql(u8, tr.to, "main")) try out.print(a, "; posts to {s}", .{tr.to});
+            if (tr.urgent) try out.appendSlice(a, urgent_words);
             try out.append(a, '.');
             return out.items;
         },
@@ -915,9 +920,12 @@ pub fn reading(a: Allocator, tr: Trigger, check_model: []const u8) ![]const u8 {
         .none => try out.appendSlice(a, " is kept for workflows that wait on it"),
     }
     if (!std.mem.eql(u8, tr.to, "main")) try out.print(a, "; posts to {s}", .{tr.to});
+    if (tr.urgent) try out.appendSlice(a, urgent_words);
     try out.append(a, '.');
     return out.items;
 }
+
+const urgent_words = "; urgent: it goes through quiet hours";
 
 /// " every 1 h", " at 07:00 on mon, fri" (capitalized: "Every 15 min").
 fn when(a: Allocator, tr: Trigger, capital: bool) ![]const u8 {
@@ -1206,4 +1214,25 @@ test "in_triggers_ini_only_whole_lines_are_comments" {
     var d: Diag = .{};
     const ts = try parse(a, "[x]\nevery = 5m ; five minutes\ndo = Look #now\n", .tasks, &d);
     try t.expectEqualStrings("Look", ts[0].action.do);
+}
+
+test "urgent_is_read_for_triggers_and_schedules" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const leak = try parseOne(a, "[leak]\nfeed = https://home.example.com/leak.xml\nurgent = yes\ndo = Say where the water is.\n");
+    try t.expect(leak.urgent);
+    try t.expect(!(try parseOne(a, "[news]\nfeed = https://ziglang.org/news/index.xml\ndo = Tell me.\n")).urgent);
+    const door = try parseOne(a, "[door]\nat = 23:00\nurgent = on\nsay = The front door is unlocked.\n");
+    try t.expectEqual(Kind.schedule, door.kind);
+    try t.expect(door.urgent);
+    try t.expect((try door.clone(a)).urgent);
+    try refused(a, "[leak]\nfeed = https://home.example.com/leak.xml\nurgent = maybe\ndo = x\n", 3, "urgent = yes or no");
+    // a brief has none, nor has tasks.ini
+    try refused(a, "[m]\ntopic = Zig | https://z.org/f\nurgent = yes\n", 3, "not a key of a brief trigger");
+    var d: Diag = .{};
+    try t.expectError(error.BadTrigger, parse(a, "[x]\nevery = 5m\ndo = y\nurgent = yes\n", .tasks, &d));
+    // the reading says it goes through quiet hours
+    try t.expect(std.mem.endsWith(u8, try reading(a, leak, "claude-haiku"), "; urgent: it goes through quiet hours."));
+    try t.expect(std.mem.endsWith(u8, try reading(a, door, "claude-haiku"), "; urgent: it goes through quiet hours."));
 }

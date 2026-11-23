@@ -12,6 +12,12 @@
 //!   target, headers and body.
 //! - Every file the stand-ins record is written whole, a temporary file
 //!   renamed into place, so a test that finds one never reads half of it.
+//! - transcription (OpenAI-compatible): `POST …/audio/transcriptions`
+//!   answers `transcribe/001.json`, `002.json`, … in order (`{"text":…}`
+//!   as it is; `{"status":N}` that error in OpenAI's format, with
+//!   `"echo_key":true` its message saying the key; `{"delay_ms":N,…}`
+//!   waits first). Each request is saved as `transcribe-requests/001.json`,
+//!   … with its target, headers and body (a string).
 //! - search: `GET /res/v1/web/search?q=…` answers `search.json`.
 //! - pages and feeds: `GET /page/NAME` answers the file `pages/NAME`
 //!   (POST too; `?delay_ms=N` answers after N ms), or, when there is a
@@ -44,6 +50,8 @@ pub const Server = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     active: std.atomic.Value(u32) = .init(0),
     model_n: std.atomic.Value(u32) = .init(0),
+    /// Transcription requests seen so far.
+    stt_n: std.atomic.Value(u32) = .init(0),
     tg_n: std.atomic.Value(u32) = .init(0),
     /// Telegram calls answered with `telegram/fail.json`'s error so far.
     tg_failed: std.atomic.Value(i64) = .init(0),
@@ -61,7 +69,7 @@ pub const Server = struct {
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
         s.* = .{ .io = io, .dir = try gpa.dupe(u8, dir), .listener = listener, .port = listener.port, .mcp = .{ .io = io } };
-        inline for (.{ "requests", "model", "pages", "telegram/in" }) |sub| {
+        inline for (.{ "requests", "model", "pages", "telegram/in", "telegram/files", "transcribe", "transcribe-requests" }) |sub| {
             const p = try std.fs.path.join(gpa, &.{ dir, sub });
             defer gpa.free(p);
             try Io.Dir.cwd().createDirPath(io, p);
@@ -222,6 +230,7 @@ pub const Server = struct {
         if (method == .POST and !std.mem.startsWith(u8, route, "/page/") and !std.mem.startsWith(u8, route, "/bot")) {
             if (std.mem.endsWith(u8, route, "/messages")) return s.model(a, req, .anthropic, target, body, headers.items, key);
             if (std.mem.endsWith(u8, route, "/chat/completions")) return s.model(a, req, .openai, target, body, headers.items, key);
+            if (std.mem.endsWith(u8, route, "/audio/transcriptions")) return s.transcribe(a, req, target, body, headers.items, key);
         }
         if (method == .GET and std.mem.eql(u8, route, "/res/v1/web/search")) {
             const text = s.readScript(a, &.{"search.json"}) orelse "{\"web\":{\"results\":[]}}";
@@ -287,6 +296,7 @@ pub const Server = struct {
             n += 1;
             return req.respond(text, .{ .extra_headers = extra[0..n] });
         }
+        if (method == .GET and std.mem.startsWith(u8, route, "/file/bot")) return s.telegramFile(a, req, route);
         if (std.mem.startsWith(u8, route, "/bot")) return s.telegram(a, req, route, body);
         return json(req, .not_found, "{\"error\":\"no such route\"}");
     }
@@ -327,13 +337,57 @@ pub const Server = struct {
         return json(req, .ok, script);
     }
 
+    /// `…/audio/transcriptions`: the next `transcribe/NNN.json` (see the
+    /// top of the file); the request kept as `transcribe-requests/NNN.json`.
+    fn transcribe(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, target: []const u8, body: []const u8, headers: []const u8, key: []const u8) !void {
+        const n = s.stt_n.fetchAdd(1, .acq_rel) + 1;
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "{d:0>3}.json", .{n});
+        const saved = try std.fmt.allocPrint(a, "{{\"target\":{f},\"headers\":{{{s}\"\":\"\"}},\"body\":{f}}}", .{ std.json.fmt(target, .{}), headers, std.json.fmt(body, .{}) });
+        try s.writeRecord(a, try s.path(a, &.{ "transcribe-requests", name }), saved);
+        const script = s.readScript(a, &.{ "transcribe", name }) orelse
+            return json(req, .internal_server_error, try errorBody(a, .openai, 500, "no script for this request"));
+        const v = jv.parse(a, script);
+        if (jv.int(jv.get(v, "delay_ms"))) |ms| {
+            const until = Io.Clock.awake.now(s.io).nanoseconds + @as(i96, ms) * std.time.ns_per_ms;
+            while (Io.Clock.awake.now(s.io).nanoseconds < until and !s.stopping.load(.acquire)) s.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        }
+        if (jv.int(jv.get(v, "status"))) |st| {
+            const echo = jv.boolean(jv.get(v, "echo_key")) orelse false;
+            const msg = if (echo) try std.fmt.allocPrint(a, "scripted error for key {s}", .{key}) else "scripted error";
+            return json(req, @fromBackingInt(@as(u10, @intCast(st))), try errorBody(a, .openai, st, msg));
+        }
+        return json(req, .ok, script);
+    }
+
+    /// A file of Telegram's (`GET /file/bot<token>/<path>`, a path getFile
+    /// gave: `voice/ID.oga`): `telegram/files/ID`. Recorded in out.jsonl as
+    /// `{"method":"download","path":…}`, without the token.
+    fn telegramFile(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, route: []const u8) !void {
+        const rest = route["/file/bot".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return json(req, .not_found, "{\"ok\":false}");
+        const file_path = rest[slash + 1 ..];
+        {
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            const line = try std.fmt.allocPrint(a, "{{\"method\":\"download\",\"path\":{f}}}\n", .{std.json.fmt(file_path, .{})});
+            try s.appendRecord(a, try s.path(a, &.{ "telegram", "out.jsonl" }), line);
+        }
+        const base = std.fs.path.basename(file_path);
+        const id = base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+        const data = if (id.len > 0 and std.mem.indexOf(u8, file_path, "..") == null) s.readScript(a, &.{ "telegram", "files", id }) else null;
+        const d = data orelse return json(req, .not_found, "{\"ok\":false,\"error_code\":404,\"description\":\"Not Found\"}");
+        return req.respond(d, .{ .extra_headers = &.{.{ .name = "content-type", .value = "application/octet-stream" }} });
+    }
+
     /// Telegram Bot API: `getUpdates` hands out the files in
     /// `telegram/in/` in name order (each one update object, the update_id
     /// is assigned here), at most one batch per call; sent messages and
     /// other calls are appended to `telegram/out.jsonl`, each line with the
     /// message id the call is answered with
     /// (`{"method":"sendMessage","message_id":3,"body":{...}}`; a body that
-    /// is not JSON, a document's, as a string). `getMe` answers
+    /// is not JSON, a document's, as a string). `getFile` answers the file
+    /// `telegram/files/ID` as `voice/ID.oga` (400 when there is none). `getMe` answers
     /// `telegram/me.json` (default: a bot with topics on),
     /// `createForumTopic` thread 5000 + its number (an error while
     /// `telegram/no-topics` exists). With
@@ -395,6 +449,14 @@ pub const Server = struct {
         if (std.mem.eql(u8, method, "getMe")) {
             const me = s.readScript(a, &.{ "telegram", "me.json" }) orelse "{\"id\":1,\"is_bot\":true,\"first_name\":\"harness\",\"username\":\"harness_test_bot\",\"has_topics_enabled\":true}";
             return json(req, .ok, try std.fmt.allocPrint(a, "{{\"ok\":true,\"result\":{s}}}", .{std.mem.trim(u8, me, " \r\n")}));
+        }
+        // getFile: telegram/files/ID, as voice/ID.oga; none: a 400
+        if (std.mem.eql(u8, method, "getFile")) {
+            const id = jv.str(jv.get(jv.parse(a, body), "file_id")) orelse "";
+            const usable = id.len > 0 and std.mem.indexOfAny(u8, id, "/\\.") == null;
+            const data = if (usable) s.readScript(a, &.{ "telegram", "files", id }) else null;
+            const d = data orelse return json(req, .bad_request, "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: invalid file_id\"}");
+            return json(req, .ok, try std.fmt.allocPrint(a, "{{\"ok\":true,\"result\":{{\"file_id\":{f},\"file_unique_id\":\"u{d}\",\"file_size\":{d},\"file_path\":\"voice/{s}.oga\"}}}}", .{ std.json.fmt(id, .{}), n, d.len, id }));
         }
         // a new topic's thread: 5000 and its call's number
         if (std.mem.eql(u8, method, "createForumTopic"))
