@@ -593,9 +593,9 @@ between. Polish works, as every language your speech-to-text and
 text-to-speech speak.
 
 ```
-Kitchen:  "Hey Jarvis, is the back door closed?"
+Kitchen:  "Okay Nabu, is the back door closed?"
 Speaker:  "Yes, the back door is closed."
-Hall:     "Hey Jarvis, unlock the front door."
+Hall:     "Okay Nabu, unlock the front door."
 Speaker:  "I've asked the owner on their phone."
 You:      Someone in Hall asked by voice to unlock the front door.
           Anyone in a room can speak: harness can't tell who it was.

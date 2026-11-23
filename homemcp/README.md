@@ -166,10 +166,12 @@ through `tts.speak` and the text-to-speech entity `[home] tts` names
 (`tts.piper`, `tts.home_assistant_cloud`). Home Assistant only.
 
 ```
+> announce {"speaker":"hall_voice","message":"Dinner is ready."}
+done: said on hall_voice (Hall)
 > announce {"room":"Kitchen","message":"Water under the kitchen sink."}
 done: said on kitchen_speaker (Kitchen); it is playing
 > announce {"message":"The back door is open."}
-done: said on kitchen_speaker (Kitchen); it is playing; done: said on hall_voice (Hall)
+nothing was said: kitchen_speaker spoke less than 10 s ago; hall_voice spoke less than 10 s ago
 > announce {"speaker":"hall_voice","message":"<speak>hi</speak>"}
 text only: no < or > (no markup, no sound files)
 ```
