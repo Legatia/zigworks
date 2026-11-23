@@ -215,3 +215,146 @@ count now and then; 1 run in 30 failed, 100 in 100 pass after). At
 28ff1d6: Windows 11 594 pass, 41 skip, smoke ok; Linux (WSL) 621 pass,
 14 skip, smoke ok; macOS type-checks. `harness-logins` fast-forwards to
 it.
+
+## 7. The held-back batch (2026-11-23, branch `win/envs`, on `harness-logins` 0980012)
+
+From the handoff's "Next" section. Three commits; item 3 of that section
+(apps' API, app_draft, app_save, the bar) is not started.
+
+### 7.1 The data folder inside a `read =` folder (1e355f3)
+
+The handoff's decision: Linux and Windows refuse it as macOS does.
+bubblewrap: `read =` folders are bound first, then an empty folder
+(`--tmpfs`) over the data folder, then the workspace and the home (bound
+before, a `read =` folder above the workspace also covered the workspace's
+own bind with a read-only one). AppContainer: **Windows ignores a deny
+entry for an AppContainer's SID** (tried: the entry was there, the file
+was read), so the data folder's access list stops inheriting (its
+inherited entries become its own, as `icacls /inheritance:d` does) and the
+SID's entries are taken out; the workspace and the home keep their own.
+Ruling: it stays so after `env rm` (who may use the folder is unchanged;
+undoing it would leave doubled entries). Test
+`sandbox_cannot_read_the_data_folder_inside_a_read_folder`.
+
+### 7.2 Runs pick an environment (c0dde2e)
+
+As the environments spec's "Picking an environment" and "The gate and the
+log". `agent.Run.picked()`: a `[use]` pin over `by`, the step's `env`, the
+definition's `environment`, `[default] env`; a delegated run takes its
+starter's. `shell` takes `env`; the tool's description says where the run's
+commands run and which others it may name. Refused before the gate: a
+pinned run naming another, a name environments.ini lacks, a sandbox or
+remote that can't run here, `dir` where the workspace isn't seen. The gate
+gets the environment (`ctx.env`), so rules, grants and skipped items are
+per environment. `env_save` (tool, `EnvDesk`, `Core.checkEnv`/`saveEnv`):
+checked, asked in full with the section it replaces, written in place
+under `; saved by agent:NAME DATE (item N)`, applied at once.
+`workflows.envProblem` and agents' `environment` take any environment's
+name.
+
+Rulings:
+
+- R1. Lines of commands on the host carry no `env` field; lines of
+  commands elsewhere carry `"env":"NAME"` (the spec says shell's lines
+  carry it; the host is its absence, and the lines every earlier test and
+  log reader knows stay as they are).
+- R2. A definition's `environment` counts only when its file has the line
+  (`environment_given`): a definition without it follows `[default] env`.
+- R3. Whether a step's or a definition's environment exists is seen when
+  its command runs (refused, never the host), not when the file loads: an
+  `env_save` can add it later without a reload of the others.
+- R4. `parallel` is held per environment through the helper pool
+  (`env:NAME` places); a command waits for a place until the turn's end.
+- R5. `env_save` changes one section and never touches the others; an
+  at-once change is read into its own arena, kept until the next /reload,
+  since runs going hold the list before it.
+- R6. A remote and a sandbox without the workspace take no `dir`.
+
+Tests: `run_picks_pin_step_definition_default`,
+`pinned_run_cannot_name_another`,
+`shell_rules_and_grants_per_environment_and_questions_and_log_lines_name_it`,
+`written_files_rule_by_environment`, `env_save_asked_in_full`,
+`env_save_writes_the_section_and_applies_it_at_once`,
+`a_workflow_steps_env_line_runs_its_command_there`,
+`a_section_is_swapped_in_place_or_added_at_the_end`.
+
+Also fixed there: the Mac session's
+`another_step_cut_by_a_restart_asks_in_the_inbox` counted `pushed\n`,
+which cmd prints as `pushed\r\n`: Windows CI was red from 763d052 on.
+
+### 7.3 Try in a copy (370f96e)
+
+Part 3 of `2026-11-23-harness-routines-undo-copies-memory-design.md`.
+`copies.zig` (make, changes, listText, diffText, apply, drop),
+`environments.zig` (`workspace = copy`, `check`, `apply`, `copy_mb`),
+`agent.zig` (`CopyRun`, made at the first call that reads or changes
+files; `endCopy` runs the check and hands the changes to the keeper),
+`core.zig` (the `copy` inbox item with Show, Apply, Drop; `applyCopy`).
+
+Rulings:
+
+- R7. The copy is made at the run's first `read_file`, `write_file`,
+  `shell` or `send` (a run that touches no file makes none). A workspace
+  over `copy_mb` refuses those calls, each with the reason, where the spec
+  says the run is refused before it starts: nothing has run by then.
+- R8. A file is the same when its size and time are. Windows' clock ticks
+  (up to 16 ms): a file rewritten in the tick it was copied in keeps both,
+  so a file written within 2 s before the copy is told by its SHA-256 too
+  (kept in `COPY.base`), in the copy and when applying.
+- R9. Paths: the gate keeps deciding on the workspace's own paths; the
+  file tools take paths inside the workspace, and an absolute path is
+  refused in a copy run (the tool says so in its description).
+- R10. Everything a copy run does acts on the copy: a command it sends to
+  `host` or another sandbox starts in the copy too.
+- R11. Linux sees the copy at the workspace's path (`Request.mount_at`);
+  Windows and macOS at the copy's own. Windows grants the SID the
+  `copies` folder once, not each copy (a run's sandbox can read another
+  run's copy of the same environment).
+- R12. Apply snapshots `/` when folders.ini keeps snapshots there, and is
+  done in harness, not in the sandbox. Links the run made are never
+  applied, and nothing is written through a link in the workspace
+  (`gate.confine`).
+- R13. Show leaves the item open (the terminal then says it is still
+  open). Copies older than 8 days go when a newer one is kept.
+- R14. The item carries its copy in `skip` (`copy<TAB>ENV<TAB>RUN`): the
+  inbox format has no other free field.
+
+Tests: `a_runs_writes_stay_in_its_copy`,
+`apply_writes_only_files_unchanged_since`, `copy_mb_refuses_before_the_run`,
+`a_link_the_run_made_is_never_followed_into_the_workspace`,
+`copy_is_a_clone_where_it_can_be` (XFS and btrfs in WSL: cloned),
+`a_runs_writes_stay_in_its_copy_until_the_owner_applies_them` (two runs,
+two copies; Show, Apply, Drop; a file changed since is left),
+`apply_check_applies_when_the_check_passes`,
+`env_check_probes_a_sandbox_and_a_copy_environment`.
+
+### 7.4 Found: cmd's built-ins in a Windows sandbox
+
+Inside an AppContainer, cmd's `dir`, `del`, `ren`, `copy`, `move` and
+`cd /d` fail with "Access is denied": they call GetVolumeInformation on
+the drive's root (robocopy says "Getting File System Type"), which the
+sandbox may not open, and a drive root's access list can't be changed
+without an administrator. Creating, reading and overwriting files work,
+as do programs that don't ask the drive. Tried: with the workspace as a
+drive's root (`subst Q:`), all of them work in the sandbox. A fix is a
+drive letter of the process's own (its device map), not built: README
+says the limit, `/env check` no longer uses those commands, and
+`sandbox_changes_files_the_owner_made` holds it down. For the owner to
+decide whether it is worth building.
+
+### 7.5 Left
+
+- Apps' API, `app_draft`, `app_save` and the review page, versions and
+  forks, the bar: not started.
+- macOS: the copy at its own path and `mount_at` unused there are written
+  but not run on a Mac; the Mac session tests that branch.
+- `scheduled_task_runs_in_the_sandbox` of the spec has no test by that
+  name: its parts are tested (a pin over `schedule`, `allow shell@box`,
+  the sandbox run), not one task end to end.
+- folders.ini's `skip` in a copy is every section's patterns, matched by
+  name or by path from the workspace, not per section.
+
+At 370f96e: Windows 11 708 pass, 47 skip; Linux (WSL, user tester) 736
+pass, 19 skip, smoke ok. One Linux run failed the Mac session's
+`an_item_expires_at_approval_seconds_or_its_turns_end` while the Windows
+suite ran beside it; alone it passed 5 of 5.
