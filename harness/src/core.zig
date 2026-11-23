@@ -23923,3 +23923,9 @@ test "bedtime_command_sets_and_clears" {
     try t.expect(f.core.cfg.butler.bedtime == null);
     try t.expectEqualStrings("Use /bedtime 23:30, or /bedtime off.", try f.core.command(a, "/bedtime 25:00"));
 }
+
+// ---- habits (the household spec's §6) ----
+
+test {
+    _ = @import("habits.zig");
+}
