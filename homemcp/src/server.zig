@@ -193,6 +193,8 @@ pub const Server = struct {
             if (d.allow.len > 0) {
                 try o.print(a, ". May: {s}", .{try actionList(a, &d, s.cfg)});
                 if (d.guarded) try o.appendSlice(a, " (guarded: home_guarded)");
+            } else if (d.kind == .smoke) {
+                try o.appendSlice(a, ". Only watched, never acted on: a smoke or CO alarm");
             } else try o.appendSlice(a, ". Only seen, never acted on");
             if (d.note.len > 0) try o.print(a, ". {s}", .{d.note});
             try o.appendSlice(a, ".\n");
@@ -222,6 +224,7 @@ pub const Server = struct {
         // From here on every answer goes into the log, refusals too: what
         // the agent tried matters as much as what was done.
         const act_s = jv.str(jv.get(args, "action")) orelse "";
+        if (d.kind == .smoke) return s.finish(a, id, tool, d, act_s, null, null, "refused", try std.fmt.allocPrint(a, "{s} is a smoke or CO alarm: homemcp only watches it, and nothing acts on it", .{name}), true);
         if (d.allow.len == 0) return s.finish(a, id, tool, d, act_s, null, null, "refused", try std.fmt.allocPrint(a, "{s} may only be seen, never acted on", .{name}), true);
         if (d.guarded != guarded) return s.finish(a, id, tool, d, act_s, null, null, "refused", try std.fmt.allocPrint(a, "{s} is {s}: use {s}", .{ name, if (d.guarded) "guarded" else "not guarded", if (d.guarded) "home_guarded" else "home_set" }), true);
         if (act_s.len == 0) return s.finish(a, id, tool, d, act_s, null, null, "refused", "say which action", true);
@@ -1099,4 +1102,67 @@ test "announce_folds_rooms_and_says_what_it_cannot_confirm" {
         try s.handleLine(try callLine(a, id, "announce", try std.fmt.allocPrint(a, "{{\"speaker\":\"hall_voice\",\"message\":{f}}}", .{std.json.fmt(msg, .{})})));
         try std.testing.expectEqualStrings("text only: one line, no control characters", try answerOf(&s, a, id));
     }
+}
+
+test "smoke_and_co_are_watched_only" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const sim = try @import("sim.zig").HaSim.start(std.heap.page_allocator, io, 0, "sim-token");
+    defer sim.stop();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log_path = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "actions.jsonl" });
+    var d: config.Diag = .{};
+    const cfg = try config.parse(a, try std.fmt.allocPrint(a,
+        \\[home]
+        \\hub = homeassistant
+        \\url = http://127.0.0.1:{d}
+        \\log = {s}
+        \\[device kitchen_smoke_alarm]
+        \\id = binary_sensor.kitchen_smoke
+        \\kind = smoke
+        \\room = Kitchen
+        \\[device living_room_light]
+        \\id = light.living_room
+        \\kind = light
+        \\allow = on, off
+        \\[device front_door]
+        \\id = lock.front_door
+        \\kind = lock
+        \\allow = lock
+    , .{ sim.port, log_path }), &d);
+    const hub = try hub_mod.Hub.start(gpa, io, &cfg, .{ .ha_token = "sim-token" });
+    defer hub.stop();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var s = try Server.init(gpa, io, &cfg, hub);
+    defer s.deinit();
+    s.captured = &out;
+    s.listen();
+    try s.handleLine("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}");
+    // seen: its state, and that nothing acts on it
+    try s.handleLine("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"home_state\",\"arguments\":{\"device\":\"kitchen_smoke_alarm\"}}}");
+    try std.testing.expect(std.mem.indexOf(u8, try answerOf(&s, a, 2), "kitchen_smoke_alarm (binary_sensor.kitchen_smoke, smoke; room: Kitchen): clear. Only watched, never acted on: a smoke or CO alarm.") != null);
+    // nothing acts on it, through either tool
+    try s.handleLine("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"home_set\",\"arguments\":{\"device\":\"kitchen_smoke_alarm\",\"action\":\"off\"}}}");
+    try std.testing.expectEqualStrings("kitchen_smoke_alarm is a smoke or CO alarm: homemcp only watches it, and nothing acts on it", try answerOf(&s, a, 3));
+    try s.handleLine("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"home_guarded\",\"arguments\":{\"device\":\"kitchen_smoke_alarm\",\"action\":\"disarm\"}}}");
+    try std.testing.expectEqualStrings("kitchen_smoke_alarm is a smoke or CO alarm: homemcp only watches it, and nothing acts on it", try answerOf(&s, a, 4));
+    // the refusals are on record
+    const logged = try std.Io.Dir.cwd().readFileAlloc(io, log_path, a, .unlimited);
+    try std.testing.expectEqual(2, std.mem.count(u8, logged, "\"device\":\"kitchen_smoke_alarm\",\"id\":\"binary_sensor.kitchen_smoke\""));
+    try std.testing.expectEqual(2, std.mem.count(u8, logged, "\"result\":\"refused\""));
+    // its state is pushed: smoke
+    try s.handleLine("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"home://device/kitchen_smoke_alarm\"}}");
+    try waitWrote(&s, "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}", 1, 1000);
+    var waited: u32 = 0;
+    while (!hub.eventsUp() and waited < 5000) : (waited += 20) io.sleep(.fromMilliseconds(20), .awake) catch {};
+    try std.testing.expect(hub.eventsUp());
+    try sim.poke("binary_sensor.kitchen_smoke", "{\"smoke\":true}");
+    try waitWrote(&s, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{\"uri\":\"home://device/kitchen_smoke_alarm\"}}", 1, 5000);
+    try s.handleLine("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/read\",\"params\":{\"uri\":\"home://device/kitchen_smoke_alarm\"}}");
+    try waitWrote(&s, "\\\"kind\\\":\\\"smoke\\\",\\\"from\\\":\\\"clear\\\",\\\"to\\\":\\\"ALARM\\\"", 1, 1000);
 }

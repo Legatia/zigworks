@@ -20,7 +20,7 @@
 //!
 //!   [device hall_light]
 //!   id = Hall light                ; zigbee2mqtt friendly name, or Home Assistant entity id
-//!   kind = light                   ; light switch plug climate cover lock alarm valve sensor fan scene media satellite
+//!   kind = light                   ; light switch plug climate cover lock alarm valve sensor fan scene media satellite smoke
 //!   room = Hall
 //!   alias = the stairs light       ; what people call it (more lines, or commas, for more)
 //!   allow = on, off, brightness    ; what the agent may do (seeing it is always allowed)
@@ -276,7 +276,12 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
     var devs: std.ArrayList(Device) = .empty;
     for (pend.items) |*d| {
         if (d.id.len == 0) return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}] has no id", .{d.name}));
-        const kind = model.Kind.parse(d.kind) orelse return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: kind is one of light, switch, plug, climate, cover, lock, alarm, valve, sensor, fan, scene, media, satellite", .{d.name}));
+        const kind = model.Kind.parse(d.kind) orelse return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: kind is one of light, switch, plug, climate, cover, lock, alarm, valve, sensor, fan, scene, media, satellite, smoke", .{d.name}));
+        // a smoke or CO alarm is only watched: no line may let anything act on it
+        if (kind == .smoke and std.mem.trim(u8, d.allow, " \t").len > 0)
+            return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: a smoke or CO alarm is only watched: nothing may act on it (no allow line)", .{d.name}));
+        if (kind == .smoke and (d.guarded orelse false))
+            return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: a smoke or CO alarm is only watched: nothing may act on it (no guarded line)", .{d.name}));
         if (c.hub == .homeassistant and std.mem.indexOfScalar(u8, d.id, '.') == null)
             return fail(diag, d.line, try std.fmt.allocPrint(a, "[device {s}]: a Home Assistant id is an entity id, such as light.hall", .{d.name}));
         if (c.hub == .zigbee2mqtt) if (kind.haOnly()) |what|
@@ -527,4 +532,21 @@ test "speakers that may announce" {
     try t.expectEqualStrings("[device s]: a media player announces through Home Assistant's text-to-speech: [home] tts = tts.NAME (yours, such as tts.piper)", d.what);
     try t.expectError(error.BadConfig, parse(a, "[home]\nhub = homeassistant\nurl = http://h\ntts = piper\n[device x]\nid = light.x\nkind = light\n", &d));
     try t.expectEqualStrings("tts: a text-to-speech entity, such as tts.piper", d.what);
+}
+
+test "smoke_and_co_alarms_take_no_action" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    const head = "[home]\nhub = homeassistant\nurl = http://h\n";
+    const c = try parse(a, try std.fmt.allocPrint(a, "{s}[device kitchen_smoke_alarm]\nid = binary_sensor.kitchen_smoke\nkind = smoke\nroom = Kitchen\n", .{head}), &d);
+    try std.testing.expectEqual(model.Kind.smoke, c.devices[0].kind);
+    try std.testing.expectEqual(0, c.devices[0].allow.len);
+    try std.testing.expect(!c.devices[0].guarded);
+    // a line that would let anything act on one is refused
+    try std.testing.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "{s}[device s]\nid = binary_sensor.s\nkind = smoke\nallow = off\n", .{head}), &d));
+    try std.testing.expectEqualStrings("[device s]: a smoke or CO alarm is only watched: nothing may act on it (no allow line)", d.what);
+    try std.testing.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "{s}[device s]\nid = binary_sensor.s\nkind = smoke\nguarded = yes\n", .{head}), &d));
+    try std.testing.expectEqualStrings("[device s]: a smoke or CO alarm is only watched: nothing may act on it (no guarded line)", d.what);
 }

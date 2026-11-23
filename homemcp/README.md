@@ -7,6 +7,8 @@ valves go through a separate tool that the client asks a person about every
 time. After every action homemcp reads the device back and says whether it
 took. Changes in the home are pushed to the client as MCP resource updates.
 `announce` says a short message aloud on the speakers the home file allows.
+Smoke and CO alarms are watched only: their state is read and pushed, and
+nothing acts on them.
 
 ```
 agent ◀─MCP, stdio─▶ homemcp ──MQTT──────────▶ Zigbee2MQTT ──▶ devices
@@ -18,8 +20,10 @@ macOS, Linux and Windows. One binary, nothing beyond the Zig standard
 library (and libc on macOS). Secrets come from the environment, never from
 the home file.
 
-**State: 0.2.0 and `announce`, tested against its own stand-in,
-`homemcp-sim`, and never with a real hub, device or speaker.** The tests
+**State: 0.2.0, `announce` and smoke and CO alarms watched (kind `smoke`),
+tested against its own stand-in, `homemcp-sim`, and never with a real hub,
+device or speaker: 41 unit tests and a smoke script of 64 checks on macOS
+(the Zigbee2MQTT ones skipped without Mosquitto).** The tests
 cover Home Assistant's REST and WebSocket APIs (`announce` against the
 stand-in's voice satellite and media player), and Zigbee2MQTT over MQTT. 0.2.0 ran on macOS, where the
 Zigbee2MQTT checks ran against a small stand-in broker, not Mosquitto; it is
@@ -39,7 +43,7 @@ WebSocket):
 $ zig build -Doptimize=ReleaseSafe
 $ ./zig-out/bin/homemcp-sim ha 8123 not-a-real-token &
 $ HA_TOKEN=not-a-real-token ./zig-out/bin/homemcp check examples/ha.ini
-The flat (made up by homemcp-sim): 15 devices in 5 rooms. Home Assistant at http://127.0.0.1:8123.
+The flat (made up by homemcp-sim): 16 devices in 5 rooms. Home Assistant at http://127.0.0.1:8123.
 Changes come in as they happen (Home Assistant's WebSocket API).
 Living room
   living_room_light (light.living_room, light; also called: the big light): off; may: on, off, brightness
@@ -52,6 +56,7 @@ Kitchen
   water_main (valve.water_main, valve, guarded): open; may: close
   back_door (binary_sensor.back_door, sensor): closed; may: nothing (only seen)
   sink_leak (binary_sensor.sink_leak, sensor): dry; may: nothing (only seen)
+  kitchen_smoke_alarm (binary_sensor.kitchen_smoke, smoke): clear; may: nothing (only watched)
 Hall
   thermostat (climate.hall, climate; also called: the heating): 19.5 °C, set to 20 °C, mode heat, heating; may: temperature, mode
   hall_voice (assist_satellite.hall_voice, satellite): idle; may: announce
@@ -133,7 +138,8 @@ one changes, then reads it (`resources/read`):
 ```
 
 - **The main state** is what a change is about: on or off, open or closed,
-  locked, a thermostat's mode and setpoint, a sensor's reading, offline. A
+  locked, a thermostat's mode and setpoint, a sensor's reading, a smoke or
+  CO alarm's `ALARM` or `clear`, offline. A
   plug's power reading or the room temperature under a thermostat changes
   `home_state`, not the resource, so a push means something happened.
 - **Presence** comes from Home Assistant's `person` entities listed under
@@ -216,11 +222,13 @@ the friendly names, the friendly names and voice aliases as `alias` lines,
 and `[people]`, and says what it found on stderr:
 
 ```
-Found 15 devices in 5 rooms, and 2 people.
+Found 17 devices in 5 rooms, and 2 people.
 May act when asked: Living room light, Kettle plug, Hall thermostat, Bedroom lamp, Ceiling fan, Kitchen speaker, Evening.
+May announce: Hall voice.
 Guarded, asked every time: Front door (lock), Garage door (close), Water main (close), Leaving (activate).
 Only seen: Hall motion, Back door, Living room temperature, Sink leak.
-Left out: Front door camera (a camera), Kitchen smoke alarm (a smoke or CO alarm), Kettle child lock (a setting), Sun (not a kind homemcp knows).
+Watched, never acted on: Kitchen smoke alarm.
+Left out: Front door camera (a camera), Kettle child lock (a setting), Sun (not a kind homemcp knows).
 A plug may power a heater or a kettle: for those, make it allow = off. Then: homemcp check FILE
 ```
 
@@ -234,7 +242,8 @@ The defaults:
 | A scene that sets any of those | guarded |
 | A switch whose name says valve | guarded, `off` only; one whose name says garage, gate, door, lock or alarm: guarded, nothing allowed until you add it |
 | Motion, door, window, leak, temperature, humidity and other sensors | only seen |
-| Cameras, smoke, CO and gas detectors, a device's settings and diagnostics (child lock, LED, firmware), hidden entities, anything else | left out, each listed in a comment at the end that says why |
+| Smoke, CO and gas alarms | `kind = smoke`: watched, never acted on |
+| Cameras, a device's settings and diagnostics (child lock, LED, firmware), hidden entities, anything else | left out, each listed in a comment at the end that says why |
 
 Read the file through before using it: unlocking, opening a garage door and
 disarming are never written in, and a plug that powers a heater should be
@@ -293,6 +302,7 @@ anna = person.anna
 | `alarm` (always guarded, Home Assistant) | `arm_home`, `arm_away`, `disarm` |
 | `valve` (always guarded) | `open`, `close` |
 | `sensor` | none: only seen |
+| `smoke` (smoke, CO and gas alarms) | none: only watched; an `allow` or `guarded = yes` line on one is refused |
 
 Each is read back after it is sent: a colour by its hue (a bulb never shows
 exactly the colour it was sent), colour temperature within 3 %, a fan
@@ -311,6 +321,12 @@ Security), and `MQTT_USER` and `MQTT_PASSWORD` for the broker.
   to a topic" or "call a service" tool. The examples allow the kettle `off`
   and never `on`, the front door `lock` and never `unlock`, the water main
   `close` only.
+- **Act on a smoke or CO alarm.** Kind `smoke` has no action at all: a home
+  file that gives one an `allow` or `guarded = yes` line is refused when it
+  is read ("a smoke or CO alarm is only watched: nothing may act on it"),
+  and `home_set` or `home_guarded` naming one is refused (and logged). Its
+  state, `ALARM` or `clear`, is read and pushed like any device's; homemcp
+  is not a safety system, so keep the alarms' own sirens and apps.
 - **Reach a guarded device through `home_set`.** Locks, alarms and valves are
   always guarded, and `guarded = yes` adds any other device (the examples'
   garage door and the scene that locks the front door). They answer only to

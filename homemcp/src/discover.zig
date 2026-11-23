@@ -4,9 +4,9 @@
 //! device list. Lights, plugs, switches, heating, fans, blinds, scenes and
 //! speakers may act within [limits]; locks, alarms, garage doors, valves
 //! and scenes that set them are guarded and allowed only the safe way
-//! (lock, close, arm); sensors are only seen; cameras, smoke, CO and gas
-//! detectors, devices' settings and anything unknown are left out, each
-//! named in a comment that says why.
+//! (lock, close, arm); sensors are only seen; smoke, CO and gas alarms are
+//! only watched (nothing may act on them); cameras, devices' settings and
+//! anything unknown are left out, each named in a comment that says why.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -89,7 +89,9 @@ pub fn classifyHa(a: Allocator, id: []const u8, name: []const u8, dclass: []cons
     const eq = std.mem.eql;
     if (eq(u8, domain, "camera")) return .{ .left = .camera };
     if (eq(u8, domain, "person")) return .person;
-    if ((eq(u8, domain, "binary_sensor") or eq(u8, domain, "sensor")) and has(&safety_classes, dclass)) return .{ .left = .safety };
+    // smoke, CO and gas alarms: watched only; a CO or gas level (a number) only seen
+    if (eq(u8, domain, "binary_sensor") and has(&safety_classes, dclass)) return .{ .act = .{ .kind = .smoke } };
+    if (eq(u8, domain, "sensor") and has(&safety_classes, dclass)) return .{ .act = .{ .kind = .sensor } };
     if (eq(u8, domain, "light")) {
         var allow: std.ArrayList(model.Action) = .empty;
         allow.appendSlice(a, &.{ .on, .off }) catch return .{ .left = .unknown };
@@ -409,7 +411,7 @@ fn classifyZ2m(a: Allocator, name: []const u8, description: []const u8, exposes:
         }
         if (eq(u8, ty, "lock")) return .{ .act = .{ .kind = .lock, .allow = &.{.lock}, .guarded = true } };
     }
-    for (safety_classes) |x| if (has(names.items, x)) return .{ .left = .safety };
+    for (safety_classes) |x| if (has(names.items, x)) return .{ .act = .{ .kind = .smoke } };
     for ([_][]const u8{ "occupancy", "presence", "contact", "water_leak", "temperature", "humidity", "illuminance", "pressure", "vibration" }) |x| if (has(names.items, x)) return .{ .act = .{ .kind = .sensor } };
     return .{ .left = .unknown };
 }
@@ -427,7 +429,8 @@ fn render(a: Allocator, r: *const Read) !Found {
         \\; act when asked, within [limits]. Locks, alarms, garage doors, valves and
         \\; scenes that set them answer only to home_guarded, which is asked about
         \\; every time, and only the safe way: lock, close, arm. Sensors are only
-        \\; seen. A plug may power a heater or a kettle: for those, make it allow = off.
+        \\; seen; smoke and CO alarms only watched: nothing may act on them. A plug
+        \\; may power a heater or a kettle: for those, make it allow = off.
         \\; Voice satellites may announce (the announce tool); a media player may too
         \\; with allow = announce and [home] tts = your text-to-speech entity.
         \\
@@ -488,6 +491,7 @@ fn render(a: Allocator, r: *const Read) !Found {
     try listLine(a, &sm, r.items, "May announce: ", .speaks);
     try listLine(a, &sm, r.items, "Guarded, asked every time: ", .guarded);
     try listLine(a, &sm, r.items, "Only seen: ", .seen);
+    try listLine(a, &sm, r.items, "Watched, never acted on: ", .watched);
     try listLine(a, &sm, r.items, "Left out: ", .left);
     if (r.hub == .zigbee2mqtt) try sm.appendSlice(a, "Zigbee2MQTT has no rooms: add room = lines.\n");
     if (r.no_areas) try sm.appendSlice(a, "Home Assistant didn't share its areas with this token: no rooms.\n");
@@ -495,7 +499,7 @@ fn render(a: Allocator, r: *const Read) !Found {
     return .{ .text = o.items, .summary = sm.items };
 }
 
-const Group = enum { acts, speaks, guarded, seen, left };
+const Group = enum { acts, speaks, guarded, seen, watched, left };
 
 fn listLine(a: Allocator, o: *std.ArrayList(u8), items: []const Item, label: []const u8, g: Group) !void {
     var n: usize = 0;
@@ -504,7 +508,8 @@ fn listLine(a: Allocator, o: *std.ArrayList(u8), items: []const Item, label: []c
             .acts => it.verdict == .act and !it.verdict.act.guarded and it.verdict.act.allow.len > 0 and it.verdict.act.kind != .satellite,
             .speaks => it.verdict == .act and it.verdict.act.kind == .satellite,
             .guarded => it.verdict == .act and it.verdict.act.guarded,
-            .seen => it.verdict == .act and !it.verdict.act.guarded and it.verdict.act.allow.len == 0,
+            .seen => it.verdict == .act and !it.verdict.act.guarded and it.verdict.act.allow.len == 0 and it.verdict.act.kind != .smoke,
+            .watched => it.verdict == .act and it.verdict.act.kind == .smoke,
             .left => it.verdict == .left,
         };
         if (!in) continue;
@@ -708,23 +713,30 @@ test "discover_writes_safe_defaults" {
     try t.expectEqual(0, deviceIn(&c, "binary_sensor.back_door").?.allow.len);
     try t.expectEqual(0, deviceIn(&c, "sensor.living_room_temperature").?.allow.len);
     try t.expectEqual(0, deviceIn(&c, "binary_sensor.sink_leak").?.allow.len);
-    // never offered: cameras, smoke alarms; nor a device's settings, nor what homemcp doesn't know
-    for ([_][]const u8{ "camera.front_door", "binary_sensor.kitchen_smoke", "switch.kettle_child_lock", "sun.sun" }) |id|
+    // smoke and CO alarms: watched only, nothing may act on them
+    const smoke = deviceIn(&c, "binary_sensor.kitchen_smoke").?;
+    try t.expectEqual(.smoke, smoke.kind);
+    try t.expect(smoke.allow.len == 0 and !smoke.guarded);
+    try t.expectEqualStrings("Kitchen", smoke.room);
+    try t.expect(std.mem.indexOf(u8, found.text, "[device kitchen_smoke_alarm]\nid = binary_sensor.kitchen_smoke\nkind = smoke\nroom = Kitchen\n\n") != null);
+    // never offered: cameras; nor a device's settings, nor what homemcp doesn't know
+    for ([_][]const u8{ "camera.front_door", "switch.kettle_child_lock", "sun.sun" }) |id|
         try t.expect(deviceIn(&c, id) == null);
     // ... each named in a comment that says why
     try t.expect(std.mem.indexOf(u8, found.text, "; cameras: never offered") != null);
     try t.expect(std.mem.indexOf(u8, found.text, ";   camera.front_door (Front door camera)") != null);
-    try t.expect(std.mem.indexOf(u8, found.text, ";   binary_sensor.kitchen_smoke (Kitchen smoke alarm)") != null);
+    try t.expect(std.mem.indexOf(u8, found.text, ";   binary_sensor.kitchen_smoke") == null);
     try t.expect(std.mem.indexOf(u8, found.text, ";   switch.kettle_child_lock (Kettle child lock)") != null);
     try t.expect(std.mem.indexOf(u8, found.text, ";   sun.sun (Sun)") != null);
     // people
     try t.expectEqual(2, c.people.len);
     try t.expectEqualStrings("person.anna", c.people[0].id);
     // a summary in plain words
-    try t.expect(std.mem.startsWith(u8, found.summary, "Found 16 devices in 5 rooms, and 2 people.\n"));
+    try t.expect(std.mem.startsWith(u8, found.summary, "Found 17 devices in 5 rooms, and 2 people.\n"));
+    try t.expect(std.mem.indexOf(u8, found.summary, "Watched, never acted on: Kitchen smoke alarm.\n") != null);
     try t.expect(std.mem.indexOf(u8, found.summary, "May announce: Hall voice.\n") != null);
     try t.expect(std.mem.indexOf(u8, found.summary, "May act when asked: ") != null and std.mem.indexOf(u8, found.summary, "Hall voice, ") == null);
-    try t.expect(std.mem.indexOf(u8, found.summary, "Left out: Front door camera (a camera), Kitchen smoke alarm (a smoke or CO alarm)") != null);
+    try t.expect(std.mem.indexOf(u8, found.summary, "Left out: Front door camera (a camera), Kettle child lock (a setting)") != null);
 }
 
 test "names say what a device's kind doesn't: valves and garage doors on a plain switch" {
@@ -739,8 +751,10 @@ test "names say what a device's kind doesn't: valves and garage doors on a plain
     try t.expect(gate == .act and gate.act.guarded and gate.act.allow[0] == .close);
     const blind = classifyHa(a, "cover.blind", "Blind", "blind", null);
     try t.expect(blind == .act and !blind.act.guarded and blind.act.allow.len >= 3);
-    try t.expectEqual(Reason.safety, classifyHa(a, "sensor.co", "Hall CO", "carbon_monoxide", null).left);
-    try t.expectEqual(Reason.safety, classifyHa(a, "binary_sensor.gas", "Gas", "gas", null).left);
+    // smoke, CO and gas: watched only
+    try t.expectEqual(.smoke, classifyHa(a, "binary_sensor.co", "Hall CO", "carbon_monoxide", null).act.kind);
+    try t.expectEqual(.smoke, classifyHa(a, "binary_sensor.gas", "Gas", "gas", null).act.kind);
+    try t.expectEqual(0, classifyHa(a, "binary_sensor.smoke", "Smoke", "smoke", null).act.allow.len);
     try t.expectEqual(Reason.unknown, classifyHa(a, "automation.morning", "Morning", "", null).left);
     try t.expectEqual(Reason.unknown, classifyHa(a, "sensor.status", "Washer status", "", null).left);
     // names as files want them: ASCII, letters, digits and _
@@ -778,9 +792,10 @@ test "Zigbee2MQTT's device list, with the same defaults" {
     const valve = deviceIn(&c, "Water main").?;
     try t.expect(valve.kind == .valve and valve.guarded and allows(valve, &.{.close}));
     try t.expectEqual(0, deviceIn(&c, "Back door").?.allow.len);
-    try t.expect(deviceIn(&c, "Kitchen smoke alarm") == null);
+    try t.expectEqual(.smoke, deviceIn(&c, "Kitchen smoke alarm").?.kind);
+    try t.expectEqual(0, deviceIn(&c, "Kitchen smoke alarm").?.allow.len);
     try t.expect(deviceIn(&c, "Coordinator") == null);
-    try t.expect(std.mem.indexOf(u8, found.text, ";   Kitchen smoke alarm") != null);
+    try t.expect(std.mem.indexOf(u8, found.text, ";   Kitchen smoke alarm") == null);
     try t.expect(std.mem.indexOf(u8, found.text, "; not supported by Zigbee2MQTT\n;   0x00124b0000000099\n") != null);
     try t.expect(std.mem.indexOf(u8, found.summary, "Zigbee2MQTT has no rooms") != null);
 }

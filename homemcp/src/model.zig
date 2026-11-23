@@ -23,6 +23,8 @@ pub const Kind = enum {
     /// A Home Assistant Assist satellite (a voice speaker): it may only be
     /// given a message to say (the announce tool).
     satellite,
+    /// A smoke, CO or gas alarm: only watched; nothing ever acts on it.
+    smoke,
 
     pub fn parse(s: []const u8) ?Kind {
         return std.meta.stringToEnum(Kind, s);
@@ -43,6 +45,7 @@ pub const Kind = enum {
             .scene => &.{.activate},
             .media => &.{ .play, .pause, .volume, .announce },
             .satellite => &.{.announce},
+            .smoke => &.{},
         };
     }
 
@@ -205,6 +208,10 @@ pub fn fromZ2m(kind: Kind, v: jv.Value) Props {
     if (jv.boolean(jv.get(v, "contact"))) |x| p.open = !x; // Zigbee2MQTT: contact true = closed
     if (jv.boolean(jv.get(v, "water_leak"))) |x| p.leak = x;
     if (jv.boolean(jv.get(v, "smoke"))) |x| p.smoke = x;
+    // a CO or gas alarm: any of them alarming is an alarm
+    for ([_][]const u8{ "carbon_monoxide", "gas" }) |k| if (jv.boolean(jv.get(v, k))) |x| {
+        p.smoke = (p.smoke orelse false) or x;
+    };
     if (jv.num(jv.get(v, "battery"))) |x| p.battery = x;
     if (jv.num(jv.get(v, "power"))) |x| p.power = x;
     if (kind == .fan) {
@@ -285,6 +292,8 @@ pub fn fromHa(kind: Kind, v: jv.Value) Props {
         },
         // idle, listening, processing, responding
         .satellite => p.media = word(st),
+        // a smoke, CO or gas binary sensor: on is an alarm
+        .smoke => p.smoke = eql(st, "on"),
         .sensor => {
             if (std.mem.eql(u8, domain, "binary_sensor")) {
                 const on = eql(st, "on");
@@ -373,6 +382,7 @@ fn body(a: Allocator, kind: Kind, p: Props, with_battery: bool) ![]u8 {
             if (p.volume) |v| try o.print(a, "{s}volume {s}%", .{ sep(&o), num(v) });
         },
         .satellite => if (p.media) |m| try o.appendSlice(a, m),
+        .smoke => if (p.smoke) |x| try o.appendSlice(a, if (x) "ALARM" else "clear"),
         .climate => {
             if (p.temperature) |x| try o.print(a, "{s} °C", .{num(x)});
             if (p.setpoint) |x| try o.print(a, "{s}set to {s} °C", .{ sep(&o), num(x) });
@@ -414,6 +424,7 @@ pub fn headline(a: Allocator, kind: Kind, p: Props) !?[]const u8 {
         .lock => p.lock,
         .alarm => p.alarm,
         .media, .satellite => p.media,
+        .smoke => if (p.smoke) |x| (if (x) "ALARM" else "clear") else null,
         .scene => if (p.activated) |ms| blk: {
             var tb: [20]u8 = undefined;
             break :blk try std.fmt.allocPrint(a, "ran {s}", .{when.isoTime(&tb, @divFloor(ms, 1000))});
@@ -619,4 +630,25 @@ test "Home Assistant states" {
     const clim = fromHa(.climate, jv.parse(a, "{\"entity_id\":\"climate.hall\",\"state\":\"heat\",\"attributes\":{\"current_temperature\":19.5,\"temperature\":21,\"hvac_action\":\"heating\"}}").?);
     try t.expectEqual(true, took(.temperature, 21, null, clim, .{}).?);
     try t.expectEqualStrings("19.5 °C, set to 21 °C, mode heat, heating", try describe(a, .climate, clim));
+}
+
+test "smoke_and_co_alarms_read_as_alarm_or_clear" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // watched only: no action at all
+    try t.expectEqual(0, Kind.smoke.actions().len);
+    try t.expect(!Kind.smoke.alwaysGuarded());
+    // Home Assistant: smoke, CO and gas binary sensors
+    const smoke = fromHa(.smoke, jv.parse(a, "{\"entity_id\":\"binary_sensor.kitchen_smoke\",\"state\":\"on\",\"attributes\":{\"device_class\":\"smoke\"}}").?);
+    try t.expectEqualStrings("ALARM", try describe(a, .smoke, smoke));
+    try t.expectEqualStrings("ALARM", (try headline(a, .smoke, smoke)).?);
+    const co = fromHa(.smoke, jv.parse(a, "{\"entity_id\":\"binary_sensor.hall_co\",\"state\":\"off\",\"attributes\":{\"device_class\":\"carbon_monoxide\"}}").?);
+    try t.expectEqualStrings("clear", (try headline(a, .smoke, co)).?);
+    try t.expectEqualStrings("offline", (try headline(a, .smoke, fromHa(.smoke, jv.parse(a, "{\"entity_id\":\"binary_sensor.x\",\"state\":\"unavailable\",\"attributes\":{}}").?))).?);
+    // Zigbee2MQTT: smoke, carbon_monoxide or gas
+    try t.expectEqualStrings("ALARM", try describe(a, .smoke, fromZ2m(.smoke, jv.parse(a, "{\"smoke\":true,\"battery\":90}").?)));
+    try t.expectEqualStrings("ALARM", try describe(a, .smoke, fromZ2m(.smoke, jv.parse(a, "{\"carbon_monoxide\":true}").?)));
+    try t.expectEqualStrings("clear, battery low (10%)", try describe(a, .smoke, fromZ2m(.smoke, jv.parse(a, "{\"gas\":false,\"battery\":10}").?)));
+    try t.expectEqualStrings("yes", (try field(a, smoke, "smoke")).?);
 }
