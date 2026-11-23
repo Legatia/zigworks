@@ -7,9 +7,9 @@
 //!
 //! Linux: bubblewrap (namespaces, a PID namespace that ends with the
 //! command). Windows: an AppContainer, with ACEs for its SID on the folders
-//! it may use, in a job object. macOS: sandbox-exec, the Mac session's;
-//! refused until it is here. A missing backend refuses the command; it
-//! never runs on the host instead.
+//! it may use, in a job object. macOS: sandbox-exec, with a profile written
+//! per command, in a process group of its own. A missing backend refuses
+//! the command; it never runs on the host instead.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -21,6 +21,7 @@ const util = @import("util.zig");
 
 const is_windows = builtin.os.tag == .windows;
 const is_linux = builtin.os.tag == .linux;
+const is_macos = builtin.os.tag == .macos;
 
 /// Where a sandbox's home is on Linux, inside.
 pub const linux_home = "/home/agent";
@@ -52,6 +53,16 @@ pub const Request = struct {
 /// Tests: where bwrap is, instead of looking for it.
 pub var bwrap_override: ?[]const u8 = null;
 
+/// Tests: where sandbox-exec is, instead of /usr/bin/sandbox-exec.
+pub var sandbox_exec_override: ?[]const u8 = null;
+
+/// What runs sandboxes here, as `/env check` names it.
+pub const backend = switch (builtin.os.tag) {
+    .windows => "AppContainer",
+    .macos => "sandbox-exec",
+    else => "bubblewrap",
+};
+
 /// Why sandboxes can't run here; null when they can.
 pub fn unavailable(io: Io, arena: std.mem.Allocator) !?[]const u8 {
     return switch (builtin.os.tag) {
@@ -60,7 +71,12 @@ pub fn unavailable(io: Io, arena: std.mem.Allocator) !?[]const u8 {
             break :blk try canSandbox(io, arena, bwrap);
         },
         .windows => null,
-        .macos => "sandboxes on macOS (sandbox-exec) are not built yet",
+        .macos => blk: {
+            const exe = sandboxExec();
+            const st = Io.Dir.cwd().statFile(io, exe, .{}) catch break :blk try std.fmt.allocPrint(arena, "sandbox-exec ({s}) is not on this Mac", .{exe});
+            if (st.kind != .file) break :blk try std.fmt.allocPrint(arena, "sandbox-exec ({s}) is not a program", .{exe});
+            break :blk try canSandboxMac(io, arena, exe);
+        },
         else => "sandboxes are not built for this system",
     };
 }
@@ -69,24 +85,34 @@ pub fn unavailable(io: Io, arena: std.mem.Allocator) !?[]const u8 {
 /// with its AppArmor rule for user namespaces, a container) it is there
 /// and can't. Tried once per bwrap.
 fn canSandbox(io: Io, arena: std.mem.Allocator, bwrap: []const u8) !?[]const u8 {
+    return tryOnce(io, arena, bwrap, "bubblewrap", &.{ bwrap, "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "true" }, "bubblewrap can't make a sandbox here ({s}); on Ubuntu, user namespaces may be restricted (kernel.apparmor_restrict_unprivileged_userns)");
+}
+
+/// Runs `argv` once per `exe` (until another is tried): null when it
+/// exits 0, else `why` with the first line it said (or its exit code).
+fn tryOnce(io: Io, arena: std.mem.Allocator, exe: []const u8, name: []const u8, argv: []const []const u8, comptime why: []const u8) !?[]const u8 {
     probe_mutex.lockUncancelable(io);
     defer probe_mutex.unlock(io);
-    if (probed) |p| if (std.mem.eql(u8, p.bwrap[0..p.len], bwrap)) return if (p.why_len == 0) null else try arena.dupe(u8, p.why[0..p.why_len]);
-    const r = std.process.run(arena, io, .{ .argv = &.{ bwrap, "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "true" } }) catch |e| return try std.fmt.allocPrint(arena, "bubblewrap didn't start: {s}", .{@errorName(e)});
+    if (probed) |p| if (std.mem.eql(u8, p.exe[0..p.len], exe)) return if (p.why_len == 0) null else try arena.dupe(u8, p.why[0..p.why_len]);
+    const r = std.process.run(arena, io, .{ .argv = argv }) catch |e| return try std.fmt.allocPrint(arena, "{s} didn't start: {s}", .{ name, @errorName(e) });
     var p: Probed = .{};
     if (!r.term.success()) {
-        const first = std.mem.trim(u8, r.stderr[0 .. std.mem.indexOfScalar(u8, r.stderr, '\n') orelse r.stderr.len], " \r");
-        const why = try std.fmt.allocPrint(arena, "bubblewrap can't make a sandbox here ({s}); on Ubuntu, user namespaces may be restricted (kernel.apparmor_restrict_unprivileged_userns)", .{util.cut(first, 200)});
-        p.why_len = @min(why.len, p.why.len);
-        @memcpy(p.why[0..p.why_len], why[0..p.why_len]);
+        var first = std.mem.trim(u8, r.stderr[0 .. std.mem.indexOfScalar(u8, r.stderr, '\n') orelse r.stderr.len], " \r");
+        if (first.len == 0) first = switch (r.term) {
+            .exited => |code| try std.fmt.allocPrint(arena, "exit code {d}", .{code}),
+            else => @tagName(r.term),
+        };
+        const text = try std.fmt.allocPrint(arena, why, .{util.cut(first, 200)});
+        p.why_len = @min(text.len, p.why.len);
+        @memcpy(p.why[0..p.why_len], text[0..p.why_len]);
     }
-    p.len = @min(bwrap.len, p.bwrap.len);
-    @memcpy(p.bwrap[0..p.len], bwrap[0..p.len]);
+    p.len = @min(exe.len, p.exe.len);
+    @memcpy(p.exe[0..p.len], exe[0..p.len]);
     probed = p;
     return if (p.why_len == 0) null else try arena.dupe(u8, p.why[0..p.why_len]);
 }
 
-const Probed = struct { bwrap: [256]u8 = undefined, len: usize = 0, why: [512]u8 = undefined, why_len: usize = 0 };
+const Probed = struct { exe: [256]u8 = undefined, len: usize = 0, why: [512]u8 = undefined, why_len: usize = 0 };
 var probed: ?Probed = null;
 var probe_mutex: Io.Mutex = .init;
 
@@ -111,6 +137,7 @@ pub fn run(tenv: tools.Env, arena: std.mem.Allocator, req: Request) !tools.Outpu
     var child = switch (builtin.os.tag) {
         .linux => try spawnBwrap(tenv.io, arena, req, home),
         .windows => try spawnAppContainer(tenv.io, arena, req, home),
+        .macos => try spawnSandboxExec(tenv.io, arena, req, home),
         else => unreachable,
     };
     // Windows: in the job before it runs (it was started suspended)
@@ -209,6 +236,254 @@ pub fn bwrapArgv(io: Io, arena: std.mem.Allocator, req: Request, bwrap: []const 
     const cwd = if (req.env.workspace == .none) linux_home else if (req.cwd.len > 0) req.cwd else req.workspace;
     try a.appendSlice(arena, &.{ "--chdir", cwd, "--", "/bin/sh", "-c", req.command });
     return a.items;
+}
+
+// ---- macOS: sandbox-exec ----
+
+fn sandboxExec() []const u8 {
+    return sandbox_exec_override orelse "/usr/bin/sandbox-exec";
+}
+
+/// What a macOS sandbox's profile is made of, each path as the system
+/// resolves it: the sandbox matches real paths (/private/tmp, not /tmp).
+pub const MacPaths = struct {
+    workspace: []const u8,
+    mode: environments.Mode = .rw,
+    network: bool = false,
+    /// Its home and its temp: read and written.
+    home: []const u8,
+    tmp: []const u8,
+    /// `read =` folders, read-only.
+    read: []const []const u8 = &.{},
+    /// The data folder: refused even inside a `read =` folder, but for the
+    /// workspace and the environment's own folders in it; "": none.
+    data: []const u8 = "",
+    /// The owner's home: its Keychains are refused; "": none.
+    owner_home: []const u8 = "",
+    /// The developer folder xcode-select names, when /Library doesn't hold
+    /// it (Xcode's .app); "": none.
+    developer: []const u8 = "",
+};
+
+/// The system's folders a sandbox reads and runs programs from: what
+/// /bin/sh, the usual tools and their libraries need (/private/var/select
+/// is where /bin/sh and xcode-select look), Homebrew's on Apple silicon
+/// as /usr/local is on Intel Macs; but what Homebrew's services keep in
+/// its `var` (databases, logs), unless a `read =` folder names it.
+const mac_system = [_][]const u8{ "/usr", "/bin", "/sbin", "/System", "/Library", "/opt/homebrew", "/private/etc", "/private/var/select", "/private/var/db/timezone" };
+
+/// The profile for one command (SBPL): nothing but what it lists, later
+/// rules winning over earlier ones. Read: the system's folders, `read =`
+/// folders, the workspace (rw, ro or none), its home and temp, and only
+/// the metadata of the folders above those. Written: the workspace when
+/// rw, its home and temp. Never: the data folder (even inside a `read =`
+/// folder), the Keychain's files and services, the terminal, this
+/// machine's network; outside hosts only when the network is on.
+pub fn macProfile(arena: std.mem.Allocator, p: MacPaths) ![]const u8 {
+    var o: std.ArrayList(u8) = .empty;
+    // its own processes alone; set-id programs never run (the sandbox
+    // refuses them: ps, sudo)
+    try o.appendSlice(arena,
+        \\(version 1)
+        \\(deny default)
+        \\(allow process-fork)
+        \\(allow signal (target same-sandbox))
+        \\(allow process-info* (target same-sandbox))
+        \\(allow sysctl-read)
+        \\
+    );
+    try o.appendSlice(arena, "(allow file-read* process-exec file-map-executable");
+    for (mac_system) |sp| try filter(&o, arena, "subpath", sp);
+    try o.appendSlice(arena, " (literal \"/private/var/db/xcode_select_link\")");
+    if (p.developer.len > 0) try filter(&o, arena, "subpath", p.developer);
+    try o.appendSlice(arena, ")\n");
+    try o.appendSlice(arena,
+        \\(allow file-read* (literal "/"))
+        \\(allow file-read-metadata (literal "/etc") (literal "/tmp") (literal "/var") (literal "/private") (literal "/private/var") (literal "/private/var/db") (literal "/Applications") (literal "/opt"))
+        \\(allow file-read* file-write-data (literal "/dev/null") (literal "/dev/zero") (literal "/dev/stdin") (literal "/dev/stdout") (literal "/dev/stderr") (subpath "/dev/fd"))
+        \\(allow file-read* (literal "/dev/random") (literal "/dev/urandom") (literal "/dev/autofs_nowait"))
+        \\(allow file-read* file-write-data file-ioctl (literal "/dev/dtracehelper"))
+        \\(allow ipc-posix-shm-read-data (ipc-posix-name "apple.shm.notification_center"))
+        \\(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.system.notification_center"))
+        \\(deny file-read* file-write* process-exec (subpath "/opt/homebrew/var") (subpath "/usr/local/var"))
+        \\
+    );
+    // refused without a report in the system log: the owner's per-user
+    // temp (without these the system's tools fall back to TMPDIR), logging,
+    // the terminal (a command could type into it), the owner's encoding file
+    try o.appendSlice(arena,
+        \\(deny mach-lookup (with no-log) (global-name "com.apple.bsd.dirhelper") (global-name "com.apple.system.opendirectoryd.membership") (global-name "com.apple.logd"))
+        \\(deny file-read* file-write* (with no-log) (literal "/dev/tty")
+    );
+    if (p.owner_home.len > 0) try filter(&o, arena, "literal", try under(arena, p.owner_home, ".CFUserTextEncoding"));
+    try o.appendSlice(arena, ")\n");
+    if (p.read.len > 0) {
+        try o.appendSlice(arena, "(allow file-read* process-exec file-map-executable");
+        for (p.read) |r| try filter(&o, arena, "subpath", r);
+        try o.appendSlice(arena, ")\n");
+        try ancestors(&o, arena, p.read);
+    }
+    // never, even inside a `read =` folder: the data folder
+    if (p.data.len > 0) {
+        try o.appendSlice(arena, "(deny file-read* file-write* process-exec");
+        try filter(&o, arena, "subpath", p.data);
+        try o.appendSlice(arena, ")\n");
+    }
+    try o.appendSlice(arena, switch (p.mode) {
+        .rw => "(allow file-read* file-write* process-exec file-map-executable",
+        .ro => "(allow file-read* process-exec file-map-executable",
+        .none => "(deny file-read* file-write* process-exec",
+    });
+    try filter(&o, arena, "subpath", p.workspace);
+    try o.appendSlice(arena, ")\n");
+    if (p.mode != .none) try ancestors(&o, arena, &.{p.workspace});
+    // a workspace that holds the data folder (a link to the owner's home)
+    // doesn't give it back
+    if (p.mode != .none and p.data.len > 0 and std.mem.startsWith(u8, p.data, p.workspace) and
+        p.data.len > p.workspace.len and (p.data[p.workspace.len] == '/' or std.mem.eql(u8, p.workspace, "/")))
+    {
+        try o.appendSlice(arena, "(deny file-read* file-write* process-exec");
+        try filter(&o, arena, "subpath", p.data);
+        try o.appendSlice(arena, ")\n");
+    }
+    try o.appendSlice(arena, "(allow file-read* file-write* process-exec file-map-executable");
+    try filter(&o, arena, "subpath", p.home);
+    try filter(&o, arena, "subpath", p.tmp);
+    try o.appendSlice(arena, ")\n");
+    try ancestors(&o, arena, &.{ p.home, p.tmp });
+    if (p.network) {
+        // outside hosts; never this machine ("localhost" is every address
+        // of it); names through the system's resolver; certificates
+        // checked by trustd; proxy and DNS settings
+        try o.appendSlice(arena,
+            \\(allow network-outbound (remote ip "*:*"))
+            \\(deny network-outbound (remote ip "localhost:*"))
+            \\(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+            \\(allow file-read* (literal "/private/var/run/resolv.conf"))
+            \\(allow mach-lookup (global-name "com.apple.trustd") (global-name "com.apple.trustd.agent") (global-name "com.apple.SystemConfiguration.configd") (global-name "com.apple.SystemConfiguration.DNSConfiguration"))
+            \\
+        );
+    } else try o.appendSlice(arena, "(deny network*)\n");
+    // the Keychain: its services and its files, whatever came before
+    try o.appendSlice(arena,
+        \\(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.secd") (global-name-prefix "com.apple.securityd") (global-name-prefix "com.apple.security.") (global-name-prefix "com.apple.ctkd"))
+        \\(deny file-read* file-write* (subpath "/Library/Keychains")
+    );
+    if (p.owner_home.len > 0) try filter(&o, arena, "subpath", try under(arena, p.owner_home, "Library/Keychains"));
+    try o.appendSlice(arena, ")\n");
+    return o.items;
+}
+
+/// `rest` in the folder `dir`, with `/` whatever system the text is made on
+/// (the profile is checked on every system).
+fn under(arena: std.mem.Allocator, dir: []const u8, rest: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}/{s}", .{ std.mem.trimEnd(u8, dir, "/"), rest });
+}
+
+/// ` (KIND "PATH")`, the path quoted: `\` and `"` escaped, so no path can
+/// end its string and add rules of its own.
+fn filter(o: *std.ArrayList(u8), arena: std.mem.Allocator, kind: []const u8, path: []const u8) !void {
+    try o.print(arena, " ({s} \"", .{kind});
+    for (path) |c| {
+        if (c == '\\' or c == '"') try o.append(arena, '\\');
+        try o.append(arena, c);
+    }
+    try o.appendSlice(arena, "\")");
+}
+
+/// The metadata (never a listing) of the folders above `paths`: git and
+/// realpath look at each folder on the way.
+fn ancestors(o: *std.ArrayList(u8), arena: std.mem.Allocator, paths: []const []const u8) !void {
+    try o.appendSlice(arena, "(allow file-read-metadata");
+    for (paths) |p| try filter(o, arena, "path-ancestors", p);
+    try o.appendSlice(arena, ")\n");
+}
+
+/// The real path of `path`, or `path` as it is when it can't be resolved
+/// (not there yet).
+fn realOr(io: Io, arena: std.mem.Allocator, path: []const u8) []const u8 {
+    return Io.Dir.cwd().realPathFileAlloc(io, path, arena) catch path;
+}
+
+/// The data folder, from the environment's folder (DATA/state/env/NAME);
+/// "" when it is not laid out so.
+fn dataFolder(env_dir: []const u8) []const u8 {
+    const envs = std.fs.path.dirname(env_dir) orelse return "";
+    if (!std.mem.eql(u8, std.fs.path.basename(envs), "env")) return "";
+    const state = std.fs.path.dirname(envs) orelse return "";
+    if (!std.mem.eql(u8, std.fs.path.basename(state), "state")) return "";
+    const data = std.fs.path.dirname(state) orelse return "";
+    return if (std.mem.eql(u8, data, "/")) "" else data;
+}
+
+/// The developer folder xcode-select names (git, make, cc and python3 in
+/// /usr/bin start what is there): the whole .app when it is in one
+/// (xcodebuild reads beside it); "" when /Library holds it or none is set.
+fn developerFolder(io: Io, arena: std.mem.Allocator) []const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = for ([_][]const u8{ "/private/var/select/developer_dir", "/private/var/db/xcode_select_link" }) |link| {
+        if (Io.Dir.cwd().readLink(io, link, &buf)) |n| break buf[0..n] else |_| {}
+    } else return "";
+    if (target.len == 0 or target[0] != '/') return "";
+    const dir = if (std.mem.indexOf(u8, target, ".app/")) |i| target[0 .. i + ".app".len] else target;
+    const real = realOr(io, arena, arena.dupe(u8, dir) catch return "");
+    return if (std.mem.startsWith(u8, real, "/Library/")) "" else real;
+}
+
+/// The profile's paths for `req`, resolved; `home` and `tmp` exist.
+fn macPaths(io: Io, arena: std.mem.Allocator, req: Request, home: []const u8, tmp: []const u8) !MacPaths {
+    var read: std.ArrayList([]const u8) = .empty;
+    for (req.env.read) |r| {
+        const p = try expandHome(arena, r, req.owner_home);
+        // `~/x` without an owner's home is no folder
+        if (std.fs.path.isAbsolute(p)) try read.append(arena, realOr(io, arena, p));
+    }
+    const env_dir = realOr(io, arena, req.dir);
+    return .{
+        .workspace = realOr(io, arena, req.workspace),
+        .mode = req.env.workspace,
+        .network = req.env.network,
+        .home = realOr(io, arena, home),
+        .tmp = realOr(io, arena, tmp),
+        .read = read.items,
+        .data = dataFolder(env_dir),
+        .owner_home = if (req.owner_home.len > 0) realOr(io, arena, req.owner_home) else "",
+        .developer = developerFolder(io, arena),
+    };
+}
+
+/// Whether sandbox-exec applies harness's profile here (inside another
+/// sandbox it can't). Tried once per path, with the profile's every kind
+/// of rule.
+fn canSandboxMac(io: Io, arena: std.mem.Allocator, exe: []const u8) !?[]const u8 {
+    const empty = "/private/var/empty";
+    const profile = try macProfile(arena, .{ .workspace = empty, .network = true, .home = empty, .tmp = empty, .read = &.{empty}, .data = empty, .owner_home = empty });
+    return tryOnce(io, arena, exe, "sandbox-exec", &.{ exe, "-p", profile, "/usr/bin/true" }, "sandbox-exec can't make a sandbox here ({s})");
+}
+
+fn spawnSandboxExec(io: Io, arena: std.mem.Allocator, req: Request, home: []const u8) !std.process.Child {
+    const tmp = try std.fs.path.join(arena, &.{ req.dir, "tmp" });
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    const p = try macPaths(io, arena, req, home, tmp);
+    const profile = try macProfile(arena, p);
+    var vars = std.process.Environ.Map.init(arena);
+    try vars.put("PATH", req.path_var);
+    try vars.put("HOME", p.home);
+    try vars.put("TMPDIR", p.tmp);
+    try vars.put("LANG", "C.UTF-8");
+    try vars.put("TERM", "dumb");
+    return std.process.spawn(io, .{
+        .argv = &.{ sandboxExec(), "-p", profile, "/bin/sh", "-c", req.command },
+        .cwd = .{ .path = if (req.env.workspace == .none) p.home else if (req.cwd.len > 0) req.cwd else p.workspace },
+        .environ_map = &vars,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        // its own group: a stop, the time limit and its end end it and
+        // what it started (tools.runChild); one that leaves the group
+        // survives, inside the profile, as on the host
+        .pgid = 0,
+    });
 }
 
 // ---- Windows: an AppContainer in a job ----
@@ -512,8 +787,8 @@ fn sandboxRun(f: *Fix, req: Request) !tools.Output {
     return run(f.tenv(), f.a, req);
 }
 
-/// Skips where the backend isn't here (macOS until the Mac session's
-/// runner; Linux without bwrap).
+/// Skips where the backend isn't here (Linux without bwrap, a Mac where
+/// sandbox-exec can't make a sandbox).
 fn need(f: *Fix) !void {
     if (try unavailable(t.io, f.a)) |_| return error.SkipZigTest;
 }
@@ -594,7 +869,8 @@ test "sandbox_workspace_modes" {
     try t.expect(none.is_error);
     try expectNot(none.text, "in the workspace");
     const where = try f.run(if (is_windows) "cd" else "pwd");
-    try expectHas(where.text, if (is_windows) "home" else linux_home);
+    // Linux shows the home at linux_home; Windows and macOS where it is
+    try expectHas(where.text, if (is_linux) linux_home else "home");
 }
 
 test "sandbox_home_persists" {
@@ -617,8 +893,9 @@ test "sandbox_env_has_no_secrets" {
     try need(&f);
     const o = try f.run(if (is_windows) "set" else "env");
     try expectOk(o);
-    // every name it sees is one harness gives it (and what the shell adds)
-    const allowed = [_][]const u8{ "PATH", "HOME", "LANG", "TERM", "PWD", "OLDPWD", "SHLVL", "_", "PROMPT" };
+    // every name it sees is one harness gives it (and what the shell adds);
+    // macOS: its own temp too
+    const allowed = [_][]const u8{ "PATH", "HOME", "LANG", "TERM", "PWD", "OLDPWD", "SHLVL", "_", "PROMPT" } ++ if (is_macos) [_][]const u8{"TMPDIR"} else [_][]const u8{};
     var lines = std.mem.splitScalar(u8, o.text, '\n');
     _ = lines.next(); // "exit code 0"
     while (lines.next()) |raw| {
@@ -693,12 +970,24 @@ test "sandbox_network_off" {
             std.debug.print("the sandbox did not reach the stand-in with the network on:\n{s}\n", .{on.text});
             return error.TestUnexpectedResult;
         }
-    } else if (is_windows) {
-        // on (internetClient): outside hosts only, never this machine
+    } else {
+        // on: outside hosts only, never this machine (Windows:
+        // internetClient; macOS: no address of this machine)
         f.env.network = true;
         const on = try f.run(probe);
         try expectHas(on.text, "BLOCKED");
         try t.expectEqual(before, stub.hits.load(.acquire));
+    }
+    if (is_macos) {
+        // an outside address: refused when off, let out when on. 192.0.2.1
+        // (TEST-NET-1) reaches no one, so this needs no internet: online
+        // the connection times out, offline it is unreachable, and only
+        // the sandbox says "not permitted"
+        const outside = "nc -v -z -G 2 -w 2 192.0.2.1 9 2>&1; true";
+        f.env.network = false;
+        try expectHas((try f.run(outside)).text, "not permitted");
+        f.env.network = true;
+        try expectNot((try f.run(outside)).text, "not permitted");
     }
 }
 
@@ -707,12 +996,15 @@ test "sandbox_stop_and_limit_end_every_process" {
     try f.init(.{ .name = "box", .line = 1, .kind = .sandbox });
     defer f.deinit();
     try need(&f);
-    // a sleeper in the background (Linux: one in a session of its own too),
-    // and the command waiting in front
+    // a sleeper in the background (Linux: one in a session of its own too;
+    // macOS has no setsid, and one that leaves the group survives there as
+    // on the host), and the command waiting in front
     const command = if (is_windows)
         "start /b cmd /c \"for /l %i in (1,1,2000000000) do @rem\" & for /l %i in (1,1,2000000000) do @rem"
+    else if (is_linux)
+        "sleep 31.7 & setsid sleep 31.7 & sleep 31.7"
     else
-        "sleep 31.7 & setsid sleep 31.7 & sleep 31.7";
+        "sleep 31.7 & sleep 31.7";
     var job = proc.Job.create();
     defer job.close();
     var req = f.request(command);
@@ -729,7 +1021,10 @@ test "sandbox_stop_and_limit_end_every_process" {
     th.join();
     const ms = started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
     try expectHas(o.text, "stopped by the owner");
-    try t.expect(ms < 800 + 2300);
+    if (ms >= 800 + 2300) {
+        std.debug.print("the stop took {d} ms (stopped at 800 ms)\n", .{ms});
+        return error.TestUnexpectedResult;
+    }
     try expectNoneLeft(&job, "31.7");
     // the time limit the same way
     f.stop.store(false, .release);
@@ -743,7 +1038,7 @@ test "sandbox_stop_and_limit_end_every_process" {
 }
 
 /// Nothing of the command is left: on Windows its job is empty; on Linux
-/// no process has `marker` in its command line.
+/// and macOS no process has `marker` in its command line.
 fn expectNoneLeft(job: *proc.Job, marker: []const u8) !void {
     if (is_windows) {
         try t.expect(job.waitEmpty(t.io, 2000, null));
@@ -754,10 +1049,18 @@ fn expectNoneLeft(job: *proc.Job, marker: []const u8) !void {
         if (!(try anyProcessWith(marker))) return;
         t.io.sleep(.fromMilliseconds(50), .awake) catch {};
     }
+    std.debug.print("a process with {s} in its command line was still there 2 s after the command ended\n", .{marker});
     return error.TestUnexpectedResult;
 }
 
 fn anyProcessWith(marker: []const u8) !bool {
+    if (is_macos) {
+        // no /proc: ps (run here, outside any sandbox) lists every process
+        var arena: std.heap.ArenaAllocator = .init(t.allocator);
+        defer arena.deinit();
+        const r = try std.process.run(arena.allocator(), t.io, .{ .argv = &.{ "/bin/ps", "-axww", "-o", "command=" } });
+        return std.mem.indexOf(u8, r.stdout, marker) != null;
+    }
     var d = try Io.Dir.cwd().openDir(t.io, "/proc", .{ .iterate = true });
     defer d.close(t.io);
     var it = d.iterate();
@@ -854,4 +1157,202 @@ test "the_bwrap_command_shows_only_what_the_environment_says" {
     try t.expectEqualStrings("make test", argv[argv.len - 1]);
     // the data folder around the workspace is not shown
     try expectNot(line, try std.fmt.allocPrint(f.a, "bind {s} ", .{f.data}));
+}
+
+test "the_macos_profile_shows_only_what_the_environment_says" {
+    // the profile is text: checked on every system
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base: MacPaths = .{
+        .workspace = "/data/workspace",
+        .mode = .ro,
+        .home = "/data/state/env/box/home",
+        .tmp = "/data/state/env/box/tmp",
+        .read = &.{ "/opt/tools", "/Users/me/go" },
+        .data = "/data",
+        .owner_home = "/Users/me",
+        .developer = "/Applications/Xcode.app",
+    };
+    const p = try macProfile(a, base);
+    try t.expect(std.mem.startsWith(u8, p, "(version 1)\n(deny default)\n"));
+    // the system's folders and programs, read-only
+    try expectHas(p, "(subpath \"/usr\")");
+    try expectHas(p, "(subpath \"/System\")");
+    try expectHas(p, "(subpath \"/Applications/Xcode.app\")");
+    // the workspace read-only: read and run, never write
+    const ws_line = "(allow file-read* process-exec file-map-executable (subpath \"/data/workspace\"))";
+    try expectHas(p, ws_line);
+    try expectNot(p, "file-write* (subpath \"/data/workspace\")");
+    // its home and its temp: read and write
+    const own_line = "(allow file-read* file-write* process-exec file-map-executable (subpath \"/data/state/env/box/home\") (subpath \"/data/state/env/box/tmp\"))";
+    try expectHas(p, own_line);
+    // read = folders, read-only
+    const read_line = "(allow file-read* process-exec file-map-executable (subpath \"/opt/tools\") (subpath \"/Users/me/go\"))";
+    try expectHas(p, read_line);
+    // the data folder never, even inside a read = folder: refused after
+    // them, and the workspace and the home given back after that
+    const data_line = "(deny file-read* file-write* process-exec (subpath \"/data\"))";
+    try expectHas(p, data_line);
+    const i_read = std.mem.indexOf(u8, p, read_line).?;
+    const i_data = std.mem.indexOf(u8, p, data_line).?;
+    try t.expect(i_read < i_data);
+    try t.expect(i_data < std.mem.indexOf(u8, p, ws_line).?);
+    try t.expect(i_data < std.mem.indexOf(u8, p, own_line).?);
+    // the Keychain never: its services and its files, last
+    try expectHas(p, "(global-name \"com.apple.SecurityServer\")");
+    const kc = "(subpath \"/Users/me/Library/Keychains\")";
+    try expectHas(p, kc);
+    try t.expect(std.mem.indexOf(u8, p, kc).? > std.mem.indexOf(u8, p, own_line).?);
+    // never the terminal
+    try expectNot(p, "(allow file-read* (literal \"/dev/tty\"))");
+    // Homebrew's services' data: refused before read = folders, which may
+    // name it
+    const brew = "(deny file-read* file-write* process-exec (subpath \"/opt/homebrew/var\") (subpath \"/usr/local/var\"))";
+    try expectHas(p, brew);
+    try t.expect(std.mem.indexOf(u8, p, brew).? < i_read);
+    // network off: none, this machine included
+    try expectHas(p, "(deny network*)");
+    try expectNot(p, "(allow network-outbound");
+    // on: outside hosts, never this machine (the deny after the allow)
+    var with_net = base;
+    with_net.network = true;
+    const on = try macProfile(a, with_net);
+    const out_any = "(allow network-outbound (remote ip \"*:*\"))";
+    const not_here = "(deny network-outbound (remote ip \"localhost:*\"))";
+    try expectHas(on, out_any);
+    try expectHas(on, not_here);
+    try t.expect(std.mem.indexOf(u8, on, out_any).? < std.mem.indexOf(u8, on, not_here).?);
+    try expectNot(on, "(deny network*)");
+    // read-write: the workspace written too
+    var rw = base;
+    rw.mode = .rw;
+    try expectHas(try macProfile(a, rw), "(allow file-read* file-write* process-exec file-map-executable (subpath \"/data/workspace\"))");
+    // none: not given, and refused even inside a read = folder
+    var none = base;
+    none.mode = .none;
+    const n = try macProfile(a, none);
+    try expectNot(n, "file-map-executable (subpath \"/data/workspace\")");
+    try expectHas(n, "(deny file-read* file-write* process-exec (subpath \"/data/workspace\"))");
+    // a workspace that holds the data folder doesn't give it back; its
+    // home and temp, inside it, are given after that
+    var wide = rw;
+    wide.workspace = "/Users/me";
+    wide.data = "/Users/me/.local/share/harness";
+    wide.home = "/Users/me/.local/share/harness/state/env/box/home";
+    const w = try macProfile(a, wide);
+    const again = "(deny file-read* file-write* process-exec (subpath \"/Users/me/.local/share/harness\"))";
+    const i_ws = std.mem.indexOf(u8, w, "(allow file-read* file-write* process-exec file-map-executable (subpath \"/Users/me\"))").?;
+    // refused after the read = folders, and again after the workspace
+    if (std.mem.count(u8, w, again) != 2) {
+        std.debug.print("expected {s} twice in:\n{s}\n", .{ again, w });
+        return error.TestExpectedEqual;
+    }
+    const i_again = std.mem.lastIndexOf(u8, w, again).?;
+    try t.expect(i_ws < i_again);
+    try t.expect(i_again < std.mem.indexOf(u8, w, "(subpath \"/Users/me/.local/share/harness/state/env/box/home\")").?);
+    // the usual layout (the workspace in the data folder) has it once
+    try t.expectEqual(1, std.mem.count(u8, try macProfile(a, rw), "(subpath \"/data\")"));
+}
+
+test "a_path_cannot_break_out_of_the_profile" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    // quoted: a " or \ inside is escaped, a ) is just a character
+    const q = try macProfile(arena.allocator(), .{ .workspace = "/w/a\"b\\c)d", .home = "/h", .tmp = "/t" });
+    try expectHas(q, "(subpath \"/w/a\\\"b\\\\c)d\")");
+    if (!is_macos) return;
+    // a workspace whose name tries to give the sandbox the whole disk
+    var f: Fix = undefined;
+    try f.init(.{ .name = "box", .line = 1, .kind = .sandbox });
+    defer f.deinit();
+    try need(&f);
+    const a = f.a;
+    const odd = "data/ws\") (allow file-read* (subpath \"/\")) (\\ \"x)";
+    try f.tmp.dir.createDirPath(t.io, odd);
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = odd ++ "/a.txt", .data = "in the odd workspace\n" });
+    var req = f.request("");
+    req.workspace = try std.fs.path.join(a, &.{ f.root, odd });
+    req.command = try readCmd(a, try std.fs.path.join(a, &.{ req.workspace, "a.txt" }));
+    const inside = try sandboxRun(&f, req);
+    try expectOk(inside);
+    try expectHas(inside.text, "in the odd workspace");
+    // and the rest of the disk is still refused
+    req.command = try readCmd(a, try std.fs.path.join(a, &.{ f.data, "rules" }));
+    const rules = try sandboxRun(&f, req);
+    try t.expect(rules.is_error);
+    try expectNot(rules.text, "allow shell");
+}
+
+test "macos_sandbox_cannot_reach_the_keychain" {
+    if (!is_macos) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init(.{ .name = "box", .line = 1, .kind = .sandbox });
+    defer f.deinit();
+    try need(&f);
+    const a = f.a;
+    // a keychain of the test's own, never the owner's: in the workspace,
+    // so the sandbox may read its file; what it may not is the Keychain's
+    // services, which alone open it
+    const kc = try std.fs.path.join(a, &.{ f.ws, "probe.keychain" });
+    var rnd: [12]u8 = undefined;
+    t.io.random(&rnd);
+    const pass = try std.fmt.allocPrint(a, "{s}", .{&std.fmt.bytesToHex(rnd, .lower)});
+    t.io.random(&rnd);
+    const value = try std.fmt.allocPrint(a, "{s}", .{&std.fmt.bytesToHex(rnd, .lower)});
+    const service = "harness-sandbox-probe";
+    try security(a, &.{ "create-keychain", "-p", pass, kc });
+    defer security(a, &.{ "delete-keychain", kc }) catch {};
+    try security(a, &.{ "add-generic-password", "-s", service, "-a", "probe", "-w", value, kc });
+    // outside the sandbox the item is there (its attributes; never its value)
+    try security(a, &.{ "find-generic-password", "-s", service, kc });
+    // inside, not
+    const o = try f.run(try std.fmt.allocPrint(a, "security find-generic-password -s {s} '{s}'", .{ service, kc }));
+    try t.expect(o.is_error);
+    try expectNot(o.text, "\"acct\"");
+    try expectNot(o.text, value);
+    // nor the owner's keychains
+    const list = try f.run("security list-keychains");
+    try t.expect(list.is_error);
+    try expectNot(list.text, "login.keychain");
+}
+
+/// Runs `security ARGS` outside any sandbox; an error unless it exits 0.
+/// What it prints is not shown: it may name the owner's keychains.
+fn security(a: std.mem.Allocator, args: []const []const u8) !void {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(a, "/usr/bin/security");
+    try argv.appendSlice(a, args);
+    const r = try std.process.run(a, t.io, .{ .argv = argv.items });
+    if (!(r.term == .exited and r.term.exited == 0)) {
+        std.debug.print("security {s} failed\n", .{args[0]});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "macos_without_sandbox_exec_refuses_plainly" {
+    if (!is_macos) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init(.{ .name = "box", .line = 1, .kind = .sandbox });
+    defer f.deinit();
+    sandbox_exec_override = "/nonexistent/sandbox-exec";
+    defer sandbox_exec_override = null;
+    const o = try f.run("echo should-not-run");
+    try t.expect(o.is_error);
+    try expectHas(o.text, "sandbox-exec");
+    try expectNot(o.text, "should-not-run");
+}
+
+test "macos_where_sandbox_exec_cannot_make_a_sandbox_it_says_why" {
+    if (!is_macos) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init(.{ .name = "box", .line = 1, .kind = .sandbox });
+    defer f.deinit();
+    // one that fails, as sandbox-exec does inside another sandbox
+    sandbox_exec_override = "/usr/bin/false";
+    defer sandbox_exec_override = null;
+    const o = try f.run("echo should-not-run");
+    try t.expect(o.is_error);
+    try expectHas(o.text, "sandbox-exec can't make a sandbox here");
+    try expectNot(o.text, "should-not-run");
 }
