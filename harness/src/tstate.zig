@@ -254,15 +254,10 @@ pub const Dir = struct {
         Io.Dir.cwd().deleteTree(d.io, d.path) catch {};
     }
 
-    /// Writes `name` in the folder whole: a temporary file, then a rename.
+    /// Writes `name` in the folder whole (util.writeReplace).
     fn writeWhole(d: Dir, a: Allocator, name: []const u8, data: []const u8) !void {
         try Io.Dir.cwd().createDirPath(d.io, d.path);
-        const p = try d.file(a, name);
-        const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{p});
-        const cwd = Io.Dir.cwd();
-        try cwd.writeFile(d.io, .{ .sub_path = tmp, .data = data, .flags = .{ .permissions = util.private_file } });
-        errdefer cwd.deleteFile(d.io, tmp) catch {};
-        try cwd.rename(tmp, cwd, p, d.io);
+        try util.writeReplace(d.io, try d.file(a, name), data);
     }
 };
 

@@ -13,6 +13,7 @@ const agent = @import("agent.zig");
 const logins = @import("logins.zig");
 const totp = @import("totp.zig");
 const session = @import("session.zig");
+const remote = @import("remote.zig");
 const folders = @import("folders.zig");
 const inbox_mod = @import("inbox.zig");
 const model = @import("model.zig");
@@ -44,6 +45,10 @@ const usage =
     \\  memory [list|pin|unpin|forget ID]
     \\  snapshot list FOLDER | take FOLDER [LABEL] | changes FOLDER ID | restore FOLDER ID
     \\                             a folder's snapshots, one now, what changed, put it back
+    \\  env list | check NAME | rm NAME | key NAME
+    \\                             where commands can run (environments.ini): list them,
+    \\                             try one, remove one's home; a remote's own SSH key
+    \\                             and its host key, kept once you confirm it
     \\  agent list | show NAME | rm NAME
     \\                             the agent definitions (agents/); rm keeps
     \\                             the file in state/agents/NAME/versions/
@@ -51,6 +56,9 @@ const usage =
     \\  log tail [N]               print the last N log lines (default 20)
     \\  log runs [N]               a line per run, the last N (default 20)
     \\  log session RID [--json]   a run and its helpers, step by step
+    \\  app list | approve NAME | rm NAME
+    \\                             the apps in apps/: list them, serve one as its files
+    \\                             are now, remove one with its data
     \\  inbox [--json]             what waits for you (--json: every item kept, format v1)
     \\  health                     exit 0 if `harness run` is running and recent
     \\  version | help
@@ -207,17 +215,19 @@ const App = struct {
         task,
         memory,
         snapshot,
+        env,
+        app,
         agent,
         trigger,
 
         /// Whether it needs the MCP servers and the browser: a brief is
-        /// one model call without tools, memory, snapshot and agent
-        /// commands make none, and starting servers for them costs up to
-        /// 20 s and runs their code.
+        /// one model call without tools, memory, snapshot, env, app and
+        /// agent commands make none, and starting servers for them costs
+        /// up to 20 s and runs their code.
         fn usesTools(r: Role) bool {
             return switch (r) {
                 .run, .chat, .task, .trigger => true,
-                .brief, .memory, .snapshot, .agent => false,
+                .brief, .memory, .snapshot, .env, .app, .agent => false,
             };
         }
     };
@@ -235,7 +245,7 @@ const App = struct {
                 error.BadUrl => complain("the omnigate url in config.ini ([model] url) is {s}", .{if (cfg.model.url.len == 0) "not set yet" else "not valid"}),
                 error.BadSettings => {
                     const paths = core_mod.Paths.init(app.arena, app.home) catch return error.Reported;
-                    const why = (core_mod.settingsProblem(app.io, app.arena, paths) catch null) orelse "a settings file has an error, or one of config.ini, rules, logins.ini, mcp.ini and folders.ini can be changed by other users (chmod 600 them)";
+                    const why = (core_mod.settingsProblem(app.io, app.arena, paths) catch null) orelse "a settings file has an error, or one of config.ini, rules, logins.ini, mcp.ini, folders.ini, triggers.ini and environments.ini can be changed by other users (chmod 600 them)";
                     complain("{s}", .{why});
                 },
                 else => complain("can't open {s}: {s}", .{ app.home, @errorName(e) }),
@@ -254,6 +264,10 @@ const App = struct {
         c.watcher = std.Thread.spawn(.{}, watchSignals, .{c}) catch null;
         if (c.watcher != null) watching.store(true, .release);
         if (role.usesTools()) c.startExtras();
+        // apps in the browser, for as long as this start runs
+        if ((role == .run or role == .chat) and c.cfg.apps.on) {
+            if (c.startApps(app.arena)) |url| complain("Apps: {s}   (new each start)", .{url}) else |e| complain("note: the app server didn't start: {s}", .{@errorName(e)});
+        }
         var warns = std.mem.tokenizeScalar(u8, c.mcp_warn, '\n');
         while (warns.next()) |w| complain("note: mcp.ini: {s}", .{w});
         if (c.money_ledger.trouble()) |why| complain("note: {s}; money calls are refused until it is fixed", .{why});
@@ -319,7 +333,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "agent", "trigger" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "env", "app", "agent", "trigger" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -339,9 +353,11 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "task")) return taskCmd(app, rest);
     if (eql(cmd, "memory")) return memoryCmd(app, rest);
     if (eql(cmd, "snapshot")) return snapshotCmd(app, rest);
+    if (eql(cmd, "env")) return envCmd(app, rest);
     if (eql(cmd, "agent")) return agentCmd(app, rest);
     if (eql(cmd, "trigger")) return triggerCmd(app, rest);
     if (eql(cmd, "log")) return logCmd(app, rest);
+    if (eql(cmd, "app")) return appCmd(app, rest);
     if (eql(cmd, "inbox")) return inboxCmd(app, rest);
     if (eql(cmd, "health")) return healthCmd(app);
     complain("unknown command {s}; see harness help", .{cmd});
@@ -1130,6 +1146,91 @@ fn snapshotCmd(app: *App, args: []const []const u8) !Exit {
     return .ok;
 }
 
+const env_usage = "usage: harness env list | env check NAME | env rm NAME | env key NAME";
+
+fn envArgsOk(rest: []const []const u8) bool {
+    if (rest.len == 1) return eql(rest[0], "list");
+    if (rest.len == 2) return eql(rest[0], "check") or eql(rest[0], "rm") or eql(rest[0], "key");
+    return false;
+}
+
+/// `harness env ...`: the chat's /envs and /env commands, as `harness
+/// memory`; `env key` is here alone, since it asks you in the terminal.
+fn envCmd(app: *App, args: []const []const u8) !Exit {
+    if (!envArgsOk(args)) {
+        complain(env_usage, .{});
+        return .usage;
+    }
+    if (eql(args[0], "key")) return envKeyCmd(app, args[1]);
+    const text = if (eql(args[0], "list")) "/envs" else try std.fmt.allocPrint(app.arena, "/env {s} {s}", .{ args[0], args[1] });
+    const c = try app.open(.env);
+    defer c.close();
+    try outPrint(app.io, "{s}\n", .{try c.command(app.arena, text)});
+    return .ok;
+}
+
+/// `harness env key NAME`: a remote's own key (made once, in its folder),
+/// the line that authorizes it there, and its host key, kept once you
+/// have compared its fingerprint with the machine's own.
+fn envKeyCmd(app: *App, name: []const u8) !Exit {
+    const c = try app.open(.env);
+    defer c.close();
+    const e = c.env_list.find(name) orelse {
+        complain("no environment {s} in environments.ini (harness env list)", .{name});
+        return .failed;
+    };
+    if (e.kind != .remote) {
+        complain("{s} is a sandbox; keys are for remotes", .{name});
+        return .failed;
+    }
+    const dir = try std.fs.path.join(app.arena, &.{ c.paths.env_dir, name });
+    const key = remote.makeKey(app.io, app.arena, name, dir) catch |err| {
+        complain("can't make its key: {s} (OpenSSH's ssh-keygen is needed)", .{@errorName(err)});
+        return .failed;
+    };
+    if (key.made) try c.log.write(.config, false, .{ .event = "env key made", .name = name, .fingerprint = key.fingerprint });
+    try outPrint(app.io, "{s}'s key{s}: {s}\nPut this line in ~/.ssh/authorized_keys of {s}:\n{s}\n\n", .{ name, if (key.made) " (made now)" else "", key.fingerprint, e.host, key.authorized });
+    const hk = remote.scanHost(app.io, app.arena, e, dir, c.path_var, c.system_vars) catch |err| {
+        complain("can't ask {s} for its host key: {s}", .{ e.host, @errorName(err) });
+        return .failed;
+    };
+    if (hk.lines.len == 0) {
+        complain("{s} (port {d}) gave no host key{s}{s}; run harness env key {s} again when it answers", .{ e.host, e.port, if (hk.why.len > 0) ": " else "", hk.why, name });
+        return .failed;
+    }
+    try outPrint(app.io, "{s} answers with these host keys:\n{s}\nCompare them with the machine's own (there: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub). Keep them? Type yes: ", .{ e.host, hk.fingerprints });
+    const answer = readLine(app, Io.File.stdin()) catch "";
+    if (!eql(std.mem.trim(u8, answer, " \t\r\n"), "yes")) {
+        try outPrint(app.io, "Not kept: commands in {s} are refused until its host key is.\n", .{name});
+        return .failed;
+    }
+    try remote.keepHostKeys(app.io, app.arena, dir, hk.lines);
+    try c.log.write(.config, false, .{ .event = "env host key kept", .name = name, .fingerprints = hk.fingerprints });
+    try outPrint(app.io, "Kept: {s} accepts only these keys. harness env check {s} tries it.\n", .{ name, name });
+    return .ok;
+}
+
+const app_usage = "usage: harness app list | app approve NAME | app rm NAME";
+
+fn appArgsOk(rest: []const []const u8) bool {
+    if (rest.len == 1) return eql(rest[0], "list");
+    if (rest.len == 2) return eql(rest[0], "approve") or eql(rest[0], "rm");
+    return false;
+}
+
+/// `harness app ...`: the chat's /apps and /app commands.
+fn appCmd(app: *App, args: []const []const u8) !Exit {
+    if (!appArgsOk(args)) {
+        complain(app_usage, .{});
+        return .usage;
+    }
+    const text = if (eql(args[0], "list")) "/apps" else try std.fmt.allocPrint(app.arena, "/app {s} {s}", .{ args[0], args[1] });
+    const c = try app.open(.app);
+    defer c.close();
+    try outPrint(app.io, "{s}\n", .{try c.command(app.arena, text)});
+    return .ok;
+}
+
 const agent_usage = "usage: harness agent list | agent show NAME | agent rm NAME";
 
 /// The chat command `harness agent ARGS` sends; null when the arguments
@@ -1573,6 +1674,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
         }
         return "usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]";
     }
+    if (eql(cmd, "app")) return if (appArgsOk(rest)) null else app_usage;
     if (eql(cmd, "agent")) {
         var buf: [256]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&buf);
@@ -1582,6 +1684,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     if (eql(cmd, "trigger")) return if (triggerArgsOk(rest)) null else trigger_usage;
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
+    if (eql(cmd, "env")) return if (envArgsOk(rest)) null else env_usage;
     if (eql(cmd, "login")) {
         if (rest.len == 0) return login_usage;
         if (eql(rest[0], "list") and rest.len != 1) return login_usage;
@@ -1947,6 +2050,9 @@ test {
     _ = @import("inbox.zig");
     _ = @import("session.zig");
     _ = @import("folders.zig");
+    _ = @import("environments.zig");
+    _ = @import("sandbox.zig");
+    _ = @import("remote.zig");
     _ = @import("snapshots.zig");
     _ = @import("sock.zig");
     _ = @import("store.zig");
@@ -1965,6 +2071,9 @@ test {
     _ = @import("triggers.zig");
     _ = @import("tstate.zig");
     _ = @import("sources.zig");
+    _ = @import("apps.zig");
+    _ = @import("appserver.zig");
+    _ = @import("clone.zig");
 }
 
 test "a_line_of_ctrl_d_leaves_the_chat_in_a_windows_console" {

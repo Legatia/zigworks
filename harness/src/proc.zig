@@ -141,6 +141,109 @@ pub const Pipe = struct {
     }
 };
 
+/// Windows: what spawnRaw starts.
+pub const RawSpawn = struct {
+    /// The program's full path.
+    app: []const u8,
+    /// The command line as the program gets it, word for word.
+    command_line: []const u8,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+    /// An AppContainer's SECURITY_CAPABILITIES (sandbox.zig); null: it
+    /// runs as harness does.
+    security_capabilities: ?*const anyopaque = null,
+};
+
+/// Windows: `command` for cmd.exe, read as typed: /s takes away the outer
+/// quotes alone (std.process.spawn's quoting, \" for a quote, is not cmd's,
+/// so a command with quotes in it failed), /d runs no AutoRun command.
+pub fn cmdLine(arena: std.mem.Allocator, command: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "cmd.exe /d /s /c \"{s}\"", .{command});
+}
+
+/// Windows: starts a program suspended (for Job.adopt), stdout and stderr
+/// pipes, stdin NUL, those three its only inherited handles, its command
+/// line as given (see cmdLine).
+pub fn spawnRaw(io: Io, arena: std.mem.Allocator, o: RawSpawn) !std.process.Child {
+    if (!is_windows) return error.Unsupported;
+    const app = try std.unicode.utf8ToUtf16LeAllocZ(arena, o.app);
+    const cmd = try std.unicode.utf8ToUtf16LeAllocZ(arena, o.command_line);
+    const block = try envBlock(arena, o.env);
+    const cwd = try std.unicode.utf8ToUtf16LeAllocZ(arena, o.cwd);
+
+    const out = try Pipe.open();
+    errdefer out.read.close(io);
+    defer out.write.close(io);
+    const err = try Pipe.open();
+    errdefer err.read.close(io);
+    defer err.write.close(io);
+    var sa: win.SECURITY_ATTRIBUTES = .{ .length = @sizeOf(win.SECURITY_ATTRIBUTES), .descriptor = null, .inherit = .TRUE };
+    const nul = win.CreateFileW(std.unicode.utf8ToUtf16LeStringLiteral("NUL"), win.GENERIC_READ, 3, &sa, win.OPEN_EXISTING, 0, null);
+    if (nul == windows.INVALID_HANDLE_VALUE) return error.Unexpected;
+    defer windows.CloseHandle(nul);
+    for ([_]windows.HANDLE{ out.write.handle, err.write.handle }) |h| {
+        if (!win.SetHandleInformation(h, win.HANDLE_FLAG_INHERIT, win.HANDLE_FLAG_INHERIT).toBool()) return error.Unexpected;
+    }
+    var handles = [3]windows.HANDLE{ nul, out.write.handle, err.write.handle };
+
+    const count: u32 = if (o.security_capabilities != null) 2 else 1;
+    var size: usize = 0;
+    _ = win.InitializeProcThreadAttributeList(null, count, 0, &size);
+    const list = try arena.alignedAlloc(u8, .of(usize), size);
+    if (!win.InitializeProcThreadAttributeList(list.ptr, count, 0, &size).toBool()) return error.Unexpected;
+    defer win.DeleteProcThreadAttributeList(list.ptr);
+    if (!win.UpdateProcThreadAttribute(list.ptr, 0, win.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &handles, @sizeOf(@TypeOf(handles)), null, null).toBool()) return error.Unexpected;
+    if (o.security_capabilities) |sc| {
+        if (!win.UpdateProcThreadAttribute(list.ptr, 0, win.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, sc, win.security_capabilities_size, null, null).toBool()) return error.Unexpected;
+    }
+
+    var si: win.STARTUPINFOEXW = std.mem.zeroes(win.STARTUPINFOEXW);
+    si.si.cb = @sizeOf(win.STARTUPINFOEXW);
+    si.si.dwFlags = win.STARTF_USESTDHANDLES;
+    si.si.hStdInput = nul;
+    si.si.hStdOutput = out.write.handle;
+    si.si.hStdError = err.write.handle;
+    si.attribute_list = list.ptr;
+    var pi: win.PROCESS_INFORMATION = undefined;
+    const flags = win.EXTENDED_STARTUPINFO_PRESENT | win.CREATE_SUSPENDED | win.CREATE_NO_WINDOW | win.CREATE_UNICODE_ENVIRONMENT;
+    if (!win.CreateProcessW(app, cmd, null, null, .TRUE, flags, block.ptr, cwd, &si, &pi).toBool()) {
+        return switch (win.GetLastError()) {
+            5 => error.AccessDenied,
+            2, 3, 267 => error.FileNotFound,
+            else => error.Unexpected,
+        };
+    }
+    return .{
+        .id = pi.process,
+        .thread_handle = pi.thread,
+        .stdin = null,
+        .stdout = out.read,
+        .stderr = err.read,
+        .request_resource_usage_statistics = false,
+    };
+}
+
+/// Windows: KEY=VALUE\0...\0\0 in UTF-16, sorted by name as Windows keeps
+/// an environment.
+pub fn envBlock(arena: std.mem.Allocator, m: *const std.process.Environ.Map) ![]u16 {
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = m.iterator();
+    while (it.next()) |e| try names.append(arena, e.key_ptr.*);
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.ascii.lessThanIgnoreCase(a, b);
+        }
+    }.lt);
+    var out: std.ArrayList(u16) = .empty;
+    for (names.items) |n| {
+        const line = try std.fmt.allocPrint(arena, "{s}={s}", .{ n, m.get(n).? });
+        try out.appendSlice(arena, try std.unicode.utf8ToUtf16LeAlloc(arena, line));
+        try out.append(arena, 0);
+    }
+    try out.append(arena, 0);
+    return out.items;
+}
+
 /// Windows: the system folder (C:\Windows\System32), where cmd, ping and
 /// the like are; a PATH for children in tests.
 pub fn systemDir(gpa: std.mem.Allocator) ![]u8 {
@@ -207,6 +310,51 @@ const win = struct {
     extern "kernel32" fn PeekNamedPipe(pipe: windows.HANDLE, buf: ?*anyopaque, buf_len: u32, read: ?*u32, avail: ?*u32, left: ?*u32) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn GetSystemDirectoryW(buf: [*]u16, size: u32) callconv(.winapi) u32;
     extern "kernel32" fn CreatePipe(read: *windows.HANDLE, write: *windows.HANDLE, attributes: ?*anyopaque, size: u32) callconv(.winapi) windows.BOOL;
+
+    const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x20002;
+    const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: usize = 0x20009;
+    /// SECURITY_CAPABILITIES: a SID, a capabilities pointer, two u32s.
+    const security_capabilities_size: usize = 2 * @sizeOf(usize) + 8;
+    const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x00080000;
+    const CREATE_SUSPENDED: u32 = 0x4;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x400;
+    const STARTF_USESTDHANDLES: u32 = 0x100;
+    const HANDLE_FLAG_INHERIT: u32 = 0x1;
+    const GENERIC_READ: u32 = 0x80000000;
+    const OPEN_EXISTING: u32 = 3;
+
+    const SECURITY_ATTRIBUTES = extern struct { length: u32, descriptor: ?*anyopaque, inherit: windows.BOOL };
+    const STARTUPINFOW = extern struct {
+        cb: u32,
+        lpReserved: ?[*:0]u16,
+        lpDesktop: ?[*:0]u16,
+        lpTitle: ?[*:0]u16,
+        dwX: u32,
+        dwY: u32,
+        dwXSize: u32,
+        dwYSize: u32,
+        dwXCountChars: u32,
+        dwYCountChars: u32,
+        dwFillAttribute: u32,
+        dwFlags: u32,
+        wShowWindow: u16,
+        cbReserved2: u16,
+        lpReserved2: ?*u8,
+        hStdInput: ?windows.HANDLE,
+        hStdOutput: ?windows.HANDLE,
+        hStdError: ?windows.HANDLE,
+    };
+    const STARTUPINFOEXW = extern struct { si: STARTUPINFOW, attribute_list: ?*anyopaque };
+    const PROCESS_INFORMATION = extern struct { process: windows.HANDLE, thread: windows.HANDLE, pid: u32, tid: u32 };
+
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+    extern "kernel32" fn InitializeProcThreadAttributeList(list: ?*anyopaque, count: u32, flags: u32, size: *usize) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn UpdateProcThreadAttribute(list: *anyopaque, flags: u32, attribute: usize, value: *const anyopaque, size: usize, prev: ?*anyopaque, ret: ?*usize) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn DeleteProcThreadAttributeList(list: *anyopaque) callconv(.winapi) void;
+    extern "kernel32" fn CreateProcessW(app: ?[*:0]const u16, cmd: ?[*:0]u16, pa: ?*anyopaque, ta: ?*anyopaque, inherit: windows.BOOL, flags: u32, env: ?*anyopaque, cwd: ?[*:0]const u16, si: *STARTUPINFOEXW, pi: *PROCESS_INFORMATION) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn SetHandleInformation(h: windows.HANDLE, mask: u32, flags: u32) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, sa: ?*SECURITY_ATTRIBUTES, disposition: u32, flags: u32, template: ?windows.HANDLE) callconv(.winapi) windows.HANDLE;
 };
 
 const t = std.testing;

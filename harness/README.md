@@ -30,8 +30,9 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 645 unit tests (10 of them
-run on Windows only), among
+**State: 0.3.0, tested on macOS by its own tests: 685 unit tests (27 of them
+don't run on macOS: Windows or Linux only, or the macOS sandbox and clones,
+not built yet), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 73 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram, feeds,
@@ -39,8 +40,11 @@ search and two MCP servers. An earlier build of 0.3.0 also passed its
 tests in CI on Linux and Windows. On Windows 11 the browser and login
 tests also run, against Chrome 157, and the console, lock, Credential
 Manager and process-cleanup checks of HANDOFF-windows-audit.md were run by
-hand. Nothing has run yet against a real omnigate or model provider,
-Telegram bot, MCP server or website.** See [Limits](#limits).
+hand. With environments, apps, clones and safe state files added,
+Windows 11 and Linux (WSL, bubblewrap 0.9, OpenSSH 9.6) pass their unit
+tests and the end-to-end script. Nothing has run yet against a real
+omnigate or model provider, Telegram bot, MCP server or website.** See
+[Limits](#limits).
 
 ## Quick start
 
@@ -162,6 +166,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `triggers.ini` | triggers: feeds, searches, pages, folders, MCP sources, schedules of their own (see Triggers) |
 | `mcp.ini` | MCP servers (optional) |
 | `folders.ini` | roles on workspace folders: who may read, write and start commands there, their variables, snapshots (see Folders) |
+| `environments.ini` | where commands can run: sandboxes on this machine, remote machines (see Environments) |
 | `logins.ini` | the agent's own logins: name, site, username (no secrets) |
 | `profiles/` | each login's browser profile (its cookies) |
 | `skills/` | saved skills, one folder each (`NAME/SKILL.md`) |
@@ -169,12 +174,13 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `memory/` | one file per memory item |
 | `workspace/` | where the agent's files and commands live |
 | `snapshots/` | snapshots of folders: each content once, a file per snapshot |
+| `apps/` | apps shown in your browser, a folder each with `app.ini` (see Apps); what was approved of each is in `state/apps/` |
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
-| `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue) |
+| `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home, a remote's key) |
 
 On macOS and Linux, `config.ini`, `rules`, `logins.ini`, `mcp.ini`,
-`folders.ini`, `triggers.ini`, the folder `agents/` and its files are
+`folders.ini`, `triggers.ini`, `environments.ini`, the folder `agents/` and its files are
 refused if other users can write them. Harness names a settings file it
 refuses, and the line of one that does not read. Changes to the settings
 files apply after `/reload`; harness tells you when it notices one.
@@ -505,9 +511,110 @@ reach: each content once in `objects/`, a file a snapshot in
 `folders/KEY/ID`. Snapshots past a folder's count go, and the oldest while
 all of them hold more than `[limits] snapshot_mb` (default 5120; each
 folder keeps its newest); content no snapshot names is deleted at start
-and after each run. Objects are copied for now; cloning, on the file
-systems that can share blocks (APFS, btrfs, XFS, ReFS and Dev Drives),
-comes with their helpers.
+and after each run. Where the file system can share blocks (btrfs, XFS
+made with reflink, ReFS and Dev Drives on Windows; APFS to come) an object
+is a clone that takes no space until the file changes; elsewhere it is a
+copy.
+
+## Environments
+
+`environments.ini` (optional) names where commands can run besides the
+workspace on this machine (`host`, built in):
+
+```ini
+[box]
+kind = sandbox
+workspace = rw           ; rw | ro | none
+network = off            ; off | on
+read = /opt/tools, ~/go  ; more folders it may read
+
+[default]
+env = host               ; a run's environment unless named below
+
+[use]                    ; runs started by these always run there
+schedule = box
+```
+
+A sandbox runs a command on this machine with the workspace (read-write,
+read-only or not at all), a home of its own kept between commands
+(`state/env/NAME/home`) and the system's programs, and without the rest
+of the data folder, your home, any secret or the network unless `network
+= on` (outside hosts; on Windows never this machine or the local
+network). A stop, the time limit and the command's end end everything it
+started. On Linux it is bubblewrap (`bwrap`, which you install); on
+Windows an AppContainer, with access to its folders given to it on first
+use, in a job object; on macOS it is not built yet. A sandbox that can't
+run here refuses the command; it never runs on the host instead.
+
+`/envs` lists them and whether each can run here; `/env check NAME` runs
+a few probes inside a sandbox and says what it can read and write and
+whether it reaches outside; `/env rm NAME` removes an environment's
+home, its snapshots (`env:NAME`) and, on Windows, its AppContainer and
+the access it was given. CLI: `harness env list`, `env check NAME`, `env
+rm NAME`. Names: a-z, 0-9, `-` and `_`, up to 32.
+
+A remote runs commands on another machine with a POSIX shell (Linux,
+macOS, BSD) through this machine's OpenSSH:
+
+```ini
+[buildbox]
+kind = remote
+host = agent@10.0.0.5    ; port = 22
+dir = /home/agent/work   ; where its commands start
+```
+
+`harness env key NAME` makes its own key (in `state/env/NAME`, never
+yours), prints the line to put in the remote's `~/.ssh/authorized_keys`
+(`restrict`: no forwarding, no terminal), then asks the remote for its
+host key: compare the fingerprint with the machine's own and type yes,
+and only that key is accepted from then on. Harness's ssh reads no
+config file and uses no agent or password. A stop or the time limit ends
+ssh here, and the command and what it started end there. `/env check
+NAME` runs one command on it; `/env rm NAME` removes its key and the kept
+host key.
+
+For now the agent's commands still run on host: environments are read,
+checked and can be tried, and the gate already takes `shell@NAME` rules,
+but runs don't pick an environment yet.
+
+## Apps
+
+An app is a folder of web files in `apps/NAME/` with an `app.ini`, which
+harness serves to your browser:
+
+```ini
+[app]
+name = reading-list      ; its folder: a-z, 0-9 and -
+title = Reading list
+reads = files            ; any of memory, inbox, log, files
+files = reading/*        ; workspace paths it may read and act on
+acts = write_file, fetch ; what it may ask harness to do
+```
+
+With `[apps] on = on` in config.ini, `harness run` and `harness chat`
+start the app server on 127.0.0.1 and print its link, made new at each
+start (`port = 0` takes a free port; a fixed one lets you reach it over
+`ssh -L`). The page lists the apps; each opens in a frame of harness's
+page that keeps it away from that page, other apps, cookies and storage,
+and whose rules let it load nothing from anywhere but harness. Requests
+under another name for this machine (localhost) or from another site
+are refused. An app's files may be HTML, scripts, styles, JSON, images,
+fonts, text and Markdown, 200 files and 4 MiB at most; an app never names
+another host (copy a library into it instead).
+
+An app is served only as approved: `/app approve NAME` (or `harness app
+approve NAME`) checks its folder and approves it as its files are now,
+as a new version when they changed. A file changed afterwards, by a
+command or by hand, stops it being served until it is approved again.
+`/apps` lists the apps, whether each is served and why not, with links
+while the server runs; `/app rm NAME` removes one with its data. Inbox,
+log and files are built in.
+
+Not here yet: the API through which apps read memory, the inbox, the log
+and files and ask harness to act (each through the gate), the agent
+building apps, versions and forks, and the bar for questions above an
+app. Until then apps can show only their own files, and the built-ins
+say they have nothing to read; so `[apps]` is off by default.
 
 ## Inbox
 
@@ -1108,18 +1215,21 @@ triggers = off`, see Money), workflows, webhooks and websockets.
 `/task add|rm|resume`, `/memory`, `/remember`, `/pin`, `/unpin`,
 `/forget`, `/private on|off`, `/skills`, `/skill rm`, `/logins`,
 `/folders`, `/access WHO`, `/snapshots [FOLDER]`, `/snapshot FOLDER
-[LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/dryrun on|off`,
+[LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/envs`, `/env
+check|rm NAME`, `/dryrun on|off`,
 `/reload`, `/conversations`, `/conversation new|rename|rm|add`,
 `/session [N]`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
 `/agents`, `/agent [NAME]`, `/agent show|rm NAME`, `/ask NAME text`,
 `/triggers`, `/trigger NAME`, `/trigger add|rm|pause|resume|run|test`,
-`/help`. `/new`, `/private` and `/agent` act on the conversation they are
-sent in; `/stop`, `/dryrun` and `/memory auto` on everything.
+`/apps`, `/app approve|rm NAME`, `/help`. `/new`, `/private` and `/agent`
+act on the conversation they are sent in; `/stop`, `/dryrun` and
+`/memory auto` on everything.
 
 CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `trigger list|test|run`, `memory [list|pin|unpin|forget ID]`,
-`snapshot list|take|changes|restore`, `agent list|show|rm`,
-`log verify|tail|runs|session`, `inbox [--json]`,
+`snapshot list|take|changes|restore`, `env list|check|rm|key`,
+`agent list|show|rm`, `log verify|tail|runs|session`, `inbox [--json]`,
+`app list|approve|rm`,
 `health`, `version`. `--home DIR` may come anywhere on the line;
 arguments a command does not take are refused. `health` exits 0 only
 while `harness run` holds the folder and has ticked in the last 90 s.

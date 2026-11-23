@@ -76,6 +76,8 @@ fn linkSystem(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
         .windows => {
             mod.linkSystemLibrary("ws2_32", .{});
             mod.linkSystemLibrary("advapi32", .{});
+            // AppContainer profiles, for sandboxes
+            mod.linkSystemLibrary("userenv", .{});
         },
         .macos => {
             mod.linkFramework("Security", .{});

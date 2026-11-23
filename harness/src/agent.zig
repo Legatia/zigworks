@@ -902,12 +902,7 @@ pub const MoneyLedger = struct {
         var buf: [max_file]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
         for (l.entries[0..l.len]) |*e| if (e.day >= today) try w.print("{s} {d} {d}\n", .{ e.name(), e.day, e.total });
-        var tmp_buf: [4096]u8 = undefined;
-        const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{p});
-        const cwd = Io.Dir.cwd();
-        try cwd.writeFile(io, .{ .sub_path = tmp, .data = w.buffered(), .flags = .{ .permissions = util.private_file } });
-        errdefer cwd.deleteFile(io, tmp) catch {};
-        try cwd.rename(tmp, cwd, p, io);
+        try util.writeReplace(io, p, w.buffered());
     }
 
     /// Everything counted, whatever the server and day (for tests).
@@ -2585,7 +2580,7 @@ pub const Written = struct {
             out.append(w.gpa, '\n') catch return;
         }
         if (w.more > 0) out.print(w.gpa, "/more {d}\n", .{w.more}) catch return;
-        Io.Dir.cwd().writeFile(w.io, .{ .sub_path = w.path, .data = out.items, .flags = .{ .permissions = util.private_file } }) catch {};
+        util.writeReplace(w.io, w.path, out.items) catch {};
     }
 
     fn load(w: *Written) void {
@@ -3104,6 +3099,8 @@ const Fix = struct {
     ledger_at_ask: f64 = -1,
     in_flight: std.atomic.Value(u32) = .init(0),
     max_in_flight: std.atomic.Value(u32) = .init(0),
+    /// Questions come from helpers at once: what askFn keeps is kept under it.
+    ask_mutex: Io.Mutex = .init,
 
     fn init(f: *Fix, rules_text: []const u8) !void {
         try f.e.init();
@@ -3130,6 +3127,7 @@ const Fix = struct {
         f.ledger_at_ask = -1;
         f.in_flight = .init(0);
         f.max_in_flight = .init(0);
+        f.ask_mutex = .init;
         f.conv = .init(t.allocator);
         f.run = .{
             .gpa = t.allocator,
@@ -3148,15 +3146,25 @@ const Fix = struct {
     fn askFn(ctx: *anyopaque, a: std.mem.Allocator, q: Question) Reply {
         _ = a;
         const f: *Fix = @ptrCast(@alignCast(ctx));
-        f.last_what = f.e.arena.allocator().dupe(u8, q.text) catch "";
-        f.last_deadline = q.deadline_s;
-        f.last_allow_day = q.allow_day;
+        {
+            // helpers ask at once: the arena and the counts are shared
+            f.ask_mutex.lockUncancelable(t.io);
+            defer f.ask_mutex.unlock(t.io);
+            f.last_what = f.e.arena.allocator().dupe(u8, q.text) catch "";
+            f.last_deadline = q.deadline_s;
+            f.last_allow_day = q.allow_day;
+            f.ledger_at_ask = f.ledger.sum();
+        }
         if (f.on_ask) |flag| flag.store(true, .release);
-        f.ledger_at_ask = f.ledger.sum();
         const now_in = f.in_flight.fetchAdd(1, .acq_rel) + 1;
         _ = f.max_in_flight.fetchMax(now_in, .acq_rel);
+        // the owner's time to answer, for each question at once
         if (f.ask_ms > 0) t.io.sleep(.fromMilliseconds(f.ask_ms), .awake) catch {};
-        f.asked += 1;
+        {
+            f.ask_mutex.lockUncancelable(t.io);
+            defer f.ask_mutex.unlock(t.io);
+            f.asked += 1;
+        }
         _ = f.in_flight.fetchSub(1, .acq_rel);
         return .{ .answer = f.answer };
     }

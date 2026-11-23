@@ -18,7 +18,26 @@ tools 7, mcp 4, agent 3, among them the new
 Windows twin), the stand-in browser scripts and page.zig's render tests
 (14), symbolic links (4, two of them the snapshot store's: Windows makes
 them only with Developer Mode or as administrator; junctions are tested
-instead) and SIGTERM (1). Next: item 3.
+instead) and SIGTERM (1).
+
+Items 3 to 8 are done too, each on a branch of its own, stacked in one
+line on `harness-logins` (none pushed; the owner decides):
+`win/sandbox` (3: environments.ini and the sandbox runners; also a fix:
+Windows shell commands with quotes in them failed), `win/remote` (4),
+`win/app-server` (5), `win/clone` (6), `win/state-files` (7: also found
+grants and the written list rewritten in place), `win/hosted` (8, and
+this status). What was built, the tests and the rulings are in
+`docs/superpowers/plans/2026-11-22-windows-platform.md`. At the tip:
+Windows 11 and Linux (WSL) pass in full, smoke included.
+
+Left on purpose, for after the Mac session's phases A and B have landed
+in the run and approval code (changing it now would clash with them):
+runs picking an environment (pins, a step's `env`, `shell@NAME` in the
+gate's choice, `env_save`), apps' API (reads, acts, runs), `app_draft`,
+`app_save` and the review page, versions and forks, and the bar. Not
+verified: block cloning on ReFS or a Dev Drive (no such volume here).
+Yours: the macOS sandbox (sandbox-exec, a third branch of
+`sandbox.run`) and APFS clones (`clone.platform`).
 
 ## Get it
 

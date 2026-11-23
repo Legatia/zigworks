@@ -24,6 +24,7 @@ pub const Config = struct {
     agents: Agents = .{},
     browser: Browser = .{},
     money: Money = .{},
+    apps: Apps = .{},
     inbox: Inbox = .{},
     triggers: Triggers = .{},
     /// The `[provider NAME]` sections, in the order their names first
@@ -98,6 +99,13 @@ pub const Config = struct {
         /// Runs a trigger starts follow `scheduled` (on) or never move
         /// money (off: the owner has not decided yet).
         triggers: bool = false,
+    };
+    /// The app server (gap 8): apps shown in your browser.
+    pub const Apps = struct {
+        /// Off until the apps' API is in: before it, apps read nothing.
+        on: bool = false,
+        /// 0: a free one each start; a fixed one to reach it over ssh -L.
+        port: u32 = 0,
     };
     /// What waits for the owner (state/inbox).
     pub const Inbox = struct {
@@ -527,6 +535,10 @@ pub const defaults_ini =
     \\max_per_day = 0
     \\scheduled = off                     ; on: scheduled runs may move money, within the caps
     \\triggers = off                      ; on: runs a trigger starts move money as scheduled = says; off: never
+    \\
+    \\[apps]                              ; apps in your browser, on this machine only
+    \\on = off
+    \\port = 0                            ; 0 = a free one each start
     \\
     \\[inbox]                             ; what waits for you (/inbox)
     \\questions = 20                      ; questions and approvals waiting at once

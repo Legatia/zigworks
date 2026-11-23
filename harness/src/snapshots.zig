@@ -31,9 +31,10 @@ const has_exec = Io.File.Permissions.has_executable_bit;
 /// never hashes.
 pub const CloneFn = *const fn (io: Io, src: []const u8, dst: []const u8) anyerror!bool;
 
-/// This platform's clone helper, where one is built (the per-file-system
-/// helpers plug in here); null: every object is copied.
-pub const platform_clone: ?CloneFn = null;
+/// This platform's clone helper, where one is built (clone.zig: FICLONE on
+/// Linux, block cloning on Windows; macOS's clonefile to come); null: every
+/// object is copied.
+pub const platform_clone: ?CloneFn = @import("clone.zig").platform;
 
 /// A `skip` pattern of the section for `folder` (inside the workspace):
 /// it matches an entry in that folder by its name or by its path from it.
@@ -484,6 +485,19 @@ pub const Store = struct {
         out.objects = try s.deleteUnnamed(arena, &refs);
         if (out.snapshots + out.objects > 0) s.logLine(.{ .event = "prune", .snapshots = out.snapshots, .objects = out.objects });
         return out;
+    }
+
+    /// Deletes every snapshot of `name` (an environment that was removed);
+    /// prune then deletes the objects nothing names any more. How many went.
+    pub fn drop(s: *Store, arena: std.mem.Allocator, name: []const u8) !usize {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        const fdir = try s.folderDir(arena, name);
+        const known = try s.ids(arena, fdir);
+        for (known) |id| s.deleteSnapshot(arena, fdir, id);
+        Io.Dir.cwd().deleteTree(s.io, fdir) catch {};
+        if (known.len > 0) s.logLine(.{ .event = "drop", .folder = name, .snapshots = known.len });
+        return known.len;
     }
 
     /// `name: none (why)` lines for the folders whose last snapshot was

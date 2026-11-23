@@ -268,6 +268,22 @@ pub const Listener = struct {
         return .{ .handle = h, .port = std.mem.bigToNative(u16, addr.in.port) };
     }
 
+    /// A listener whose port no other program can take while it is open
+    /// (the app server's): on Windows SO_EXCLUSIVEADDRUSE, where
+    /// SO_REUSEADDR would let another program bind the same port; elsewhere
+    /// no SO_REUSEPORT. `port` 0 takes a free one.
+    pub fn openExclusive(port: u16) !Listener {
+        const ip: net.IpAddress = .{ .ip4 = .loopback(port) };
+        var addr: Addr = .from(&ip);
+        const h = try sys.socket(addr.family(), false);
+        errdefer sys.close(h);
+        if (is_windows) try sys.setOption(h, sys.SOL_SOCKET, sys.SO_EXCLUSIVEADDRUSE, 1) else try sys.setOption(h, sys.SOL_SOCKET, sys.SO_REUSEADDR, 1);
+        try sys.bind(h, &addr);
+        try sys.listen(h, 128);
+        try sys.localAddress(h, &addr);
+        return .{ .handle = h, .port = std.mem.bigToNative(u16, addr.in.port) };
+    }
+
     /// Waits for the next connection. Its socket is a blocking one, and
     /// sends each write at once, as model servers do for a stream of tokens.
     pub fn accept(l: Listener) !Handle {
@@ -517,6 +533,8 @@ const winsock = struct {
     const SOL_SOCKET: i32 = 0xffff;
     const SO_REUSEADDR: u32 = 4;
     const SO_REUSEPORT: ?u32 = null;
+    /// ~SO_REUSEADDR
+    const SO_EXCLUSIVEADDRUSE: u32 = 0xfffffffb;
     const SO_ERROR = 0x1007;
     const SD_BOTH = 2;
     const FIONBIO: i32 = @bitCast(@as(u32, 0x8004667E));
@@ -633,7 +651,8 @@ const winsock = struct {
     }
 
     fn setOption(s: Handle, level: i32, name: u32, value: c_int) Error!void {
-        try check(ws.setsockopt(s, level, @intCast(name), @ptrCast(&value), @sizeOf(c_int)));
+        // bits as they are: SO_EXCLUSIVEADDRUSE is a negative int
+        try check(ws.setsockopt(s, level, @bitCast(name), @ptrCast(&value), @sizeOf(c_int)));
     }
 
     fn getOption(s: Handle, level: i32, name: u32) Error!c_int {

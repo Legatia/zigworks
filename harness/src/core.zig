@@ -26,6 +26,11 @@ const conversations = @import("conversations.zig");
 const jv = @import("jv.zig");
 const session = @import("session.zig");
 const folders_mod = @import("folders.zig");
+const environments_mod = @import("environments.zig");
+const sandbox = @import("sandbox.zig");
+const remote = @import("remote.zig");
+const apps_mod = @import("apps.zig");
+const appserver = @import("appserver.zig");
 const snapshots_mod = @import("snapshots.zig");
 const agents = @import("agents.zig");
 const inbox_mod = @import("inbox.zig");
@@ -66,6 +71,10 @@ pub const Paths = struct {
     folders: []const u8,
     /// Snapshots of folders: the store.
     snapshots: []const u8,
+    /// Where commands run: sandboxes and remotes.
+    environments: []const u8,
+    /// Each environment's own folder (its home, key, Windows ACEs).
+    env_dir: []const u8,
     /// The agent definitions, `agents/NAME.md`.
     agents: []const u8,
     /// Each definition's earlier versions, `state/agents/NAME/versions/`.
@@ -117,6 +126,8 @@ pub const Paths = struct {
             .conversations = try j(a, &.{ state, "conversations" }),
             .folders = try j(a, &.{ home, "folders.ini" }),
             .snapshots = try j(a, &.{ home, "snapshots" }),
+            .environments = try j(a, &.{ home, "environments.ini" }),
+            .env_dir = try j(a, &.{ state, "env" }),
             .agents = try j(a, &.{ home, "agents" }),
             .agents_state = try j(a, &.{ state, "agents" }),
             .skills_state = try j(a, &.{ state, "skills" }),
@@ -150,6 +161,7 @@ pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
         .{ p.tasks, config.tasks_example },
         .{ p.triggers, config.triggers_example },
         .{ p.folders, folders_mod.example },
+        .{ p.environments, environments_mod.example },
         .{ try std.fs.path.join(a, &.{ p.agents, "main.md" }), agents.main_md },
         .{ try std.fs.path.join(a, &.{ p.agents, "helper.md" }), agents.helper_md },
     };
@@ -346,11 +358,14 @@ pub const Core = struct {
     rule_list: []const rules.Rule,
     /// folders.ini; the gate gets it when it has a section.
     folder_list: folders_mod.Folders,
+    /// environments.ini: read and checked; runs use `host` until the gate
+    /// knows environments.
+    env_list: environments_mod.Environments = .{},
     briefs: []const config.Brief,
     tasks: []const config.Task,
     /// Each settings file's hash as last applied (`settingsFiles` order):
     /// a change to one is noticed.
-    settings_hashes: [8][32]u8,
+    settings_hashes: [9][32]u8,
     /// triggers.ini: every section (`trig_list`), its schedules and briefs
     /// as the task and brief code runs them. Replaced by /reload (in the
     /// settings arena) and at once by /trigger add|rm (in `trig_arena`),
@@ -440,6 +455,8 @@ pub const Core = struct {
     written: agent.Written,
     /// Snapshots of folders (snapshots/).
     snaps: snapshots_mod.Store,
+    /// The app server, when `harness run` or `chat` started it ([apps] on).
+    app_server: ?*appserver.Server = null,
 
     chan: ?Channel = null,
     owner: ?i64 = null,
@@ -629,6 +646,7 @@ pub const Core = struct {
         c.seen_mutex = .init;
         c.settings_mutex = .init;
         c.chan = null;
+        c.app_server = null;
         c.owner = readOwner(io, c.paths.owner);
         c.switches = .{};
         c.switches.auto_recall.store(c.cfg.memory.auto, .release);
@@ -719,6 +737,8 @@ pub const Core = struct {
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
+        if (c.app_server) |s| s.stop();
+        c.app_server = null;
         for (c.queue.items) |q| q.deinit(c.gpa);
         c.queue.deinit(c.gpa);
         c.run_flags.deinit(c.gpa);
@@ -791,12 +811,12 @@ pub const Core = struct {
     // ---- settings ----
 
     /// The settings files, in this order; a change to any of them is noticed.
-    fn settingsFiles(c: *const Core) [8][]const u8 {
-        return .{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins, c.paths.mcp, c.paths.folders, c.paths.triggers };
+    fn settingsFiles(c: *const Core) [9][]const u8 {
+        return .{ c.paths.config, c.paths.rules, c.paths.briefs, c.paths.tasks, c.paths.logins, c.paths.mcp, c.paths.folders, c.paths.triggers, c.paths.environments };
     }
 
-    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![8][]const u8 {
-        var out: [8][]const u8 = undefined;
+    fn readSettingsFiles(c: *Core, a: std.mem.Allocator) ![9][]const u8 {
+        var out: [9][]const u8 = undefined;
         for (c.settingsFiles(), 0..) |p, i| {
             out[i] = Io.Dir.cwd().readFileAlloc(c.io, p, a, .limited(1 << 20)) catch |e| switch (e) {
                 error.FileNotFound => "",
@@ -807,8 +827,8 @@ pub const Core = struct {
     }
 
     /// Each settings file's hash.
-    fn hashSettings(texts: [8][]const u8) [8][32]u8 {
-        var out: [8][32]u8 = undefined;
+    fn hashSettings(texts: [9][]const u8) [9][32]u8 {
+        var out: [9][32]u8 = undefined;
         for (texts, &out) |tx, *h| std.crypto.hash.sha2.Sha256.hash(tx, h, .{});
         return out;
     }
@@ -827,6 +847,7 @@ pub const Core = struct {
         c.tasks = config.parseTasks(a, texts[3]) catch return error.BadSettings;
         c.login_list = logins.parse(a, texts[4]) catch return error.BadSettings;
         c.folder_list = folders_mod.parse(a, texts[6]) catch return error.BadSettings;
+        c.env_list = environments_mod.parse(a, texts[8]) catch return error.BadSettings;
         // the definitions, read whole; every task's among them; then in place
         var diag: agents.Diag = .{};
         var loaded = c.defs.read(a, &diag) catch return error.BadSettings;
@@ -879,6 +900,7 @@ pub const Core = struct {
         const saved_tasks = c.tasks;
         const saved_logins = c.login_list;
         const saved_folders = c.folder_list;
+        const saved_envs = c.env_list;
         const saved_hashes = c.settings_hashes;
         const saved_trig = .{ c.trig_list, c.trig_tasks, c.trig_briefs };
         c.loadSettings(fresh.allocator()) catch {
@@ -889,6 +911,7 @@ pub const Core = struct {
             c.tasks = saved_tasks;
             c.login_list = saved_logins;
             c.folder_list = saved_folders;
+            c.env_list = saved_envs;
             c.settings_hashes = saved_hashes;
             c.trig_list, c.trig_tasks, c.trig_briefs = saved_trig;
             return c.settingsErrorReply();
@@ -905,6 +928,7 @@ pub const Core = struct {
             c.tasks = saved_tasks;
             c.login_list = saved_logins;
             c.folder_list = saved_folders;
+            c.env_list = saved_envs;
             c.settings_hashes = saved_hashes;
             c.trig_list, c.trig_tasks, c.trig_briefs = saved_trig;
             return "The model url in config.ini is not valid; nothing changed.";
@@ -947,7 +971,7 @@ pub const Core = struct {
     /// The answer to a /reload the settings files refused, naming the file
     /// and line (in `problem_buf`).
     fn settingsErrorReply(c: *Core) []const u8 {
-        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, triggers.ini, logins.ini, mcp.ini, folders.ini and agents/.";
+        const generic = "The settings files have an error; nothing changed. Check config.ini, rules, briefs.ini, tasks.ini, triggers.ini, logins.ini, mcp.ini, folders.ini, environments.ini and agents/.";
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const why = (settingsProblem(c.io, arena.allocator(), c.paths) catch return generic) orelse return generic;
@@ -2597,6 +2621,21 @@ pub const Core = struct {
         c.findBrowser();
         c.stopMcp();
         c.startMcp();
+    }
+
+    /// Starts the app server ([apps] on); returns the link to its page,
+    /// for this start only.
+    pub fn startApps(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        if (c.cfg.apps.port > std.math.maxInt(u16)) return error.BadPort;
+        const s = try appserver.Server.start(c.gpa, c.io, .{
+            .apps_dir = try std.fs.path.join(a, &.{ c.paths.home, "apps" }),
+            .state_dir = try std.fs.path.join(a, &.{ c.paths.state, "apps" }),
+            .port = @intCast(c.cfg.apps.port),
+            .log = &c.log,
+            .version = @import("build_options").version,
+        });
+        c.app_server = s;
+        return s.shellUrl(a);
     }
 
     fn findBrowser(c: *Core) void {
@@ -4351,9 +4390,9 @@ pub const Core = struct {
             if (new.items.len > 0) try new.appendSlice(a, "\n\n");
             if (saved.mark.len > 0) try new.print(a, "; {s}\n", .{saved.mark});
             try new.print(a, "{s}\n", .{section});
-            try Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.triggers, .data = new.items, .flags = .{ .permissions = util.private_file } });
+            try util.writeReplace(c.io, c.paths.triggers, new.items);
             if (try c.applyTriggers(a, new.items)) |why| {
-                Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.triggers, .data = old, .flags = .{ .permissions = util.private_file } }) catch {};
+                util.writeReplace(c.io, c.paths.triggers, old) catch {};
                 return why;
             }
         }
@@ -5129,10 +5168,10 @@ pub const Core = struct {
             return try std.fmt.allocPrint(a, "No trigger called {s} in triggers.ini.", .{name});
         };
         const new = try withoutLines(a, text, tr.first, tr.last);
-        try Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.triggers, .data = new, .flags = .{ .permissions = util.private_file } });
+        try util.writeReplace(c.io, c.paths.triggers, new);
         if (try c.applyTriggers(a, new)) |why| {
             // put back as it was
-            Io.Dir.cwd().writeFile(c.io, .{ .sub_path = c.paths.triggers, .data = text, .flags = .{ .permissions = util.private_file } }) catch {};
+            util.writeReplace(c.io, c.paths.triggers, text) catch {};
             return why;
         }
         {
@@ -5591,6 +5630,9 @@ pub const Core = struct {
         \\/snapshot FOLDER [LABEL]: one now
         \\/changes FOLDER ID: what changed since the one before
         \\/restore FOLDER ID: put the folder back as it was
+        \\/envs: where commands can run (environments.ini)
+        \\/env check NAME: what a sandbox can read, write and reach
+        \\/env rm NAME: remove an environment's home, snapshots and access
         \\/dryrun on|off: money tools are not called while on
         \\/reload: apply changed settings files
         \\/conversations: where you and the agent talk
@@ -5598,6 +5640,9 @@ pub const Core = struct {
         \\/conversation rename OLD NEW, /conversation rm NAME
         \\/conversation add NAME: sent in a group, the agent may post there
         \\/session [N]: the steps behind the last answer here (N runs back)
+        \\/apps: the apps, with their links while the app server runs
+        \\/app approve NAME: serve an app as its files are now
+        \\/app rm NAME: remove an app, its data and its versions
         \\/agents: the agent definitions
         \\/agent [NAME]: which one answers here, or switch to NAME
         \\/agent show NAME, /agent rm NAME
@@ -5748,12 +5793,16 @@ pub const Core = struct {
         if (eql(u8, cmd, "/grants")) return c.grantsText(a);
         if (eql(u8, cmd, "/grant")) return c.grantCommand(a, rest);
         if (eql(u8, cmd, "/conversation")) return c.conversationCommand(a, conv, rest);
+        if (eql(u8, cmd, "/apps")) return c.appsText(a);
+        if (eql(u8, cmd, "/app")) return c.appCommand(a, rest);
         if (eql(u8, cmd, "/folders")) return folders_mod.render(c.folder_list, a);
         if (eql(u8, cmd, "/access")) return c.accessCommand(a, rest);
         if (eql(u8, cmd, "/snapshots")) return c.snapshotsCommand(a, rest);
         if (eql(u8, cmd, "/snapshot")) return c.snapshotCommand(a, rest);
         if (eql(u8, cmd, "/changes")) return c.changesCommand(a, rest);
         if (eql(u8, cmd, "/restore")) return c.restoreCommand(a, rest);
+        if (eql(u8, cmd, "/envs")) return c.envsText(a);
+        if (eql(u8, cmd, "/env")) return c.envCommand(a, rest);
         if (eql(u8, cmd, "/agents")) return c.agentsText(a);
         if (eql(u8, cmd, "/agent")) return c.agentCommand(a, conv, rest);
         if (eql(u8, cmd, "/ask")) return c.askCommand(a, conv, rest);
@@ -6153,6 +6202,200 @@ pub const Core = struct {
         return out.items;
     }
 
+    /// `/envs`: each environment, what it is, and whether it can run here.
+    fn envsText(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, "host: the workspace on this machine (built in)\n");
+        const missing = try sandbox.unavailable(c.io, a);
+        for (c.env_list.envs) |e| switch (e.kind) {
+            .sandbox => {
+                try out.print(a, "{s}: sandbox, workspace {s}, network {s}", .{ e.name, @tagName(e.workspace), if (e.network) "on" else "off" });
+                for (e.read, 0..) |r, i| try out.print(a, "{s}{s}", .{ if (i == 0) ", reads " else ", ", r });
+                try out.print(a, "; {s}\n", .{missing orelse "ready"});
+            },
+            .remote => {
+                const dir = try std.fs.path.join(a, &.{ c.paths.env_dir, e.name });
+                const why = try remote.notReady(c.io, a, e.name, dir);
+                try out.print(a, "{s}: remote {s}, port {d}{s}{s}; {s}\n", .{ e.name, e.host, e.port, if (e.dir.len > 0) ", starts in " else "", e.dir, why orelse "ready" });
+            },
+        };
+        try out.print(a, "Default: {s}.", .{c.env_list.default});
+        for (c.env_list.pins, 0..) |p, i| try out.print(a, "{s}{s} runs in {s}", .{ if (i == 0) " Pinned: " else ", ", p.who, p.env });
+        if (c.env_list.pins.len > 0) try out.append(a, '.');
+        // said until the gate picks environments (gap 2, after phase 0)
+        if (c.env_list.envs.len > 0) try out.appendSlice(a, "\nThe agent's commands still run on host: environments are checked and can be tried with /env check, but runs don't use them yet.");
+        return out.items;
+    }
+
+    fn envCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        const use = "Use /env check NAME or /env rm NAME.";
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const op = words.next() orelse return use;
+        const name = words.next() orelse return use;
+        if (words.next() != null) return use;
+        if (std.mem.eql(u8, op, "check")) return c.envCheck(a, name);
+        if (std.mem.eql(u8, op, "rm")) return c.envRemove(a, name);
+        return use;
+    }
+
+    /// `/env check NAME`: probes inside the sandbox, each a command of its
+    /// own: what it can read and write, and whether it reaches outside.
+    fn envCheck(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        if (std.mem.eql(u8, name, "host")) return "host is this machine: commands there see what you see.";
+        const e = c.env_list.find(name) orelse return std.fmt.allocPrint(a, "No environment {s}; /envs lists them.", .{name});
+        var stop: std.atomic.Value(bool) = .init(false);
+        const tenv: tools.Env = .{ .gpa = c.gpa, .io = c.io, .workspace = c.workspace, .tool_output_bytes = 2048, .shell_seconds = 30, .stop = &stop, .path_var = c.path_var, .system_vars = c.system_vars };
+        const dir = try std.fs.path.join(a, &.{ c.paths.env_dir, name });
+        if (e.kind == .remote) {
+            // one command there: what answers, and from where
+            const o = try remote.run(tenv, a, .{ .env = e, .command = "echo reached; uname -snm; pwd", .dir = dir, .path_var = c.path_var, .system_vars = c.system_vars });
+            const said = std.mem.trim(u8, o.text, " \r\n");
+            return if (o.is_error)
+                std.fmt.allocPrint(a, "{s} (remote over ssh): not reached.\n{s}", .{ name, said })
+            else
+                std.fmt.allocPrint(a, "{s} (remote over ssh): {s}", .{ name, said });
+        }
+        if (try sandbox.unavailable(c.io, a)) |why| return std.fmt.allocPrint(a, "{s} can't run here: {s}.", .{ name, why });
+        const req: sandbox.Request = .{
+            .env = e,
+            .command = "",
+            .workspace = c.workspace,
+            .dir = dir,
+            .path_var = c.path_var,
+            .system_vars = c.system_vars,
+            .owner_home = c.home_var,
+            .profile = try sandbox.profileName(a, c.paths.home, name),
+        };
+        const win = builtin.os.tag == .windows;
+        const check_file = try std.fs.path.join(a, &.{ c.workspace, ".harness-env-check" });
+        const Probe = struct { what: []const u8, command: []const u8, want: bool };
+        const probes = [_]Probe{
+            .{ .what = "workspace: read", .command = if (win) try std.fmt.allocPrint(a, "dir /b \"{s}\" >nul", .{c.workspace}) else try std.fmt.allocPrint(a, "ls -A {s} >/dev/null", .{try shQuote(a, c.workspace)}), .want = e.workspace != .none },
+            .{ .what = "workspace: write", .command = if (win) try std.fmt.allocPrint(a, "echo probe> \"{s}\" && del \"{s}\"", .{ check_file, check_file }) else try std.fmt.allocPrint(a, ": > {s} && rm {s}", .{ try shQuote(a, check_file), try shQuote(a, check_file) }), .want = e.workspace == .rw },
+            .{ .what = "the data folder: read", .command = if (win) try std.fmt.allocPrint(a, "type \"{s}\" >nul", .{c.paths.config}) else try std.fmt.allocPrint(a, "cat {s} >/dev/null", .{try shQuote(a, c.paths.config)}), .want = false },
+            .{ .what = "your home: read", .command = if (win) try std.fmt.allocPrint(a, "dir /b \"{s}\" >nul", .{c.home_var}) else try std.fmt.allocPrint(a, "ls -A {s} >/dev/null", .{try shQuote(a, c.home_var)}), .want = false },
+            .{ .what = "outside (example.com)", .command = if (win) "curl.exe -s -m 8 -o NUL https://example.com" else "curl -s -m 8 -o /dev/null https://example.com", .want = e.network },
+        };
+        var out: std.ArrayList(u8) = .empty;
+        try out.print(a, "{s} ({s}):\n", .{ name, if (win) "AppContainer" else "bubblewrap" });
+        var odd: u32 = 0;
+        for (probes) |p| {
+            if (p.what[0] == 'y' and c.home_var.len == 0) continue;
+            var r = req;
+            r.command = p.command;
+            const o = sandbox.run(tenv, a, r) catch |err| {
+                try out.print(a, "{s}: not tried ({s})\n", .{ p.what, @errorName(err) });
+                continue;
+            };
+            const yes = !o.is_error;
+            if (yes != p.want) odd += 1;
+            try out.print(a, "{s}: {s}{s}\n", .{ p.what, if (yes) "yes" else "no", if (yes != p.want) " (not what environments.ini says)" else "" });
+        }
+        if (odd == 0) try out.appendSlice(a, "As environments.ini says.") else try out.print(a, "{d} not as environments.ini says (outside: is this machine online?).", .{odd});
+        return out.items;
+    }
+
+    /// `/env rm NAME`: its home, its snapshots and what it was given
+    /// (Windows: its AppContainer and ACEs). Refused while a run is going.
+    fn envRemove(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        if (std.mem.eql(u8, name, "host")) return "host is built in: there is nothing to remove.";
+        if (!rules.envName(name)) return "An environment's name is a-z, 0-9, - and _.";
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
+        c.queue_mutex.lockUncancelable(c.io);
+        defer c.queue_mutex.unlock(c.io);
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire))
+            return "Not now: a run is going. Send /env rm again when nothing is running.";
+        const dir = try std.fs.path.join(a, &.{ c.paths.env_dir, name });
+        // a remote's folder holds its key and kept host key; a sandbox's
+        // its home (and on Windows it has an AppContainer)
+        const is_remote = if (c.env_list.find(name)) |e| e.kind == .remote else false;
+        const profile = if (is_remote) "" else try sandbox.profileName(a, c.paths.home, name);
+        sandbox.remove(c.io, a, dir, profile) catch |e| return std.fmt.allocPrint(a, "Not removed: {s}.", .{@errorName(e)});
+        const dropped = c.snaps.drop(a, try std.fmt.allocPrint(a, "env:{s}", .{name})) catch 0;
+        if (dropped > 0) _ = c.snaps.prune(a, c.folderRoles()) catch {};
+        try c.log.write(.config, false, .{ .event = "env removed", .name = name, .snapshots = dropped });
+        const plural = if (dropped == 1) "" else "s";
+        const access = if (is_remote) "" else if (builtin.os.tag == .windows) " and its AppContainer with its access" else "";
+        const still = if (c.env_list.find(name) != null) " It is still in environments.ini: take its section out, then /reload." else "";
+        if (is_remote) return std.fmt.allocPrint(a, "Removed {s}: its key and its kept host key (take the key's line out of the remote's authorized_keys too).{s}", .{ name, still });
+        return std.fmt.allocPrint(a, "Removed {s}: its home, {d} snapshot{s}{s}.{s}", .{ name, dropped, plural, access, still });
+    }
+
+    /// `/apps`: the built-ins and the apps in `apps/`, each with whether it
+    /// is served (and its link while the server runs) or why not.
+    fn appsText(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        const apps_dir = try std.fs.path.join(a, &.{ c.paths.home, "apps" });
+        const state_dir = try std.fs.path.join(a, &.{ c.paths.state, "apps" });
+        const base = if (c.app_server) |s| try s.shellUrl(a) else "";
+        var out: std.ArrayList(u8) = .empty;
+        for (appserver.builtins) |b| try out.print(a, "{s}: built in{s}{s}\n", .{ b.name, if (base.len > 0) " " else "", if (base.len > 0) try std.fmt.allocPrint(a, "{s}{s}", .{ base, b.name }) else "" });
+        var names: std.ArrayList([]const u8) = .empty;
+        if (Io.Dir.cwd().openDir(c.io, apps_dir, .{ .iterate = true })) |d_const| {
+            var d = d_const;
+            defer d.close(c.io);
+            var it = d.iterate();
+            while (try it.next(c.io)) |e| if (e.kind == .directory) try names.append(a, try a.dupe(u8, e.name));
+        } else |_| {}
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        for (names.items) |name| {
+            if (!apps_mod.validName(name)) {
+                try out.print(a, "{s}: not an app's name (a-z, 0-9 and -)\n", .{name});
+                continue;
+            }
+            const dir = try std.fs.path.join(a, &.{ apps_dir, name });
+            const f = apps_mod.checkFolder(c.io, a, dir, name) catch |e| {
+                try out.print(a, "{s}: not served: {s}\n", .{ name, apps_mod.folderReason(e) });
+                continue;
+            };
+            const ap = try apps_mod.readApproved(c.io, a, state_dir, name);
+            if (ap == null) {
+                try out.print(a, "{s}: not approved yet: /app approve {s}\n", .{ name, name });
+            } else if (!std.mem.eql(u8, &ap.?.digest, &f.digest)) {
+                try out.print(a, "{s}: v{d}, changed outside harness: /app approve {s} serves it as it is now\n", .{ name, ap.?.version, name });
+            } else {
+                try out.print(a, "{s}: v{d}{s}{s}\n", .{ name, ap.?.version, if (base.len > 0) " " else "", if (base.len > 0) try std.fmt.allocPrint(a, "{s}{s}", .{ base, name }) else "" });
+            }
+        }
+        if (c.app_server == null) try out.appendSlice(a, if (c.cfg.apps.on) "The app server runs with harness run and harness chat." else "The app server is off ([apps] on = on in config.ini, for harness run and harness chat).");
+        return std.mem.trimEnd(u8, out.items, "\n");
+    }
+
+    fn appCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        const use = "Use /app approve NAME or /app rm NAME.";
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const op = words.next() orelse return use;
+        const name = words.next() orelse return use;
+        if (words.next() != null) return use;
+        for (appserver.builtins) |b| if (std.mem.eql(u8, b.name, name)) return std.fmt.allocPrint(a, "{s} is built in: it changes with harness, and isn't yours to approve or remove.", .{name});
+        if (!apps_mod.validName(name)) return "An app's name is a-z, 0-9 and -.";
+        const apps_dir = try std.fs.path.join(a, &.{ c.paths.home, "apps" });
+        const state_dir = try std.fs.path.join(a, &.{ c.paths.state, "apps" });
+        if (std.mem.eql(u8, op, "approve")) {
+            const version = apps_mod.approve(c.io, a, apps_dir, state_dir, name, "owner", c.now()) catch |e| return switch (e) {
+                error.NoManifest, error.BadManifest, error.NameNotFolder, error.NoIndex, error.BadFileName, error.SymbolicLink, error.TooManyFiles, error.TooBig, error.FileTooBig, error.CaseClash => std.fmt.allocPrint(a, "Not approved: {s}.", .{apps_mod.folderReason(e)}),
+                else => std.fmt.allocPrint(a, "Not approved: {s}.", .{@errorName(e)}),
+            };
+            try c.log.write(.app, false, .{ .event = "approved", .name = name, .version = version, .by = "owner" });
+            return std.fmt.allocPrint(a, "Approved {s} as v{d}: it is served as its files are now.", .{ name, version });
+        }
+        if (std.mem.eql(u8, op, "rm")) {
+            const dir = try std.fs.path.join(a, &.{ apps_dir, name });
+            const sdir = try std.fs.path.join(a, &.{ state_dir, name });
+            const had = if (Io.Dir.cwd().statFile(c.io, dir, .{})) |_| true else |_| false;
+            Io.Dir.cwd().deleteTree(c.io, dir) catch |e| return std.fmt.allocPrint(a, "Not removed: {s}.", .{@errorName(e)});
+            Io.Dir.cwd().deleteTree(c.io, sdir) catch {};
+            if (!had) return std.fmt.allocPrint(a, "No app {s}.", .{name});
+            try c.log.write(.app, false, .{ .event = "removed", .name = name });
+            return std.fmt.allocPrint(a, "Removed {s}: its files, its data and its versions.", .{name});
+        }
+        return use;
+    }
+
     /// One line per login: what is stored for it (never the values).
     pub fn loginsText(c: *Core, a: std.mem.Allocator) ![]const u8 {
         if (c.login_list.len == 0) return "No logins. Add one with: harness login add NAME --site HOST --username U";
@@ -6355,11 +6598,20 @@ fn insertInSection(a: std.mem.Allocator, text: []const u8, name: []const u8, lin
     return out.items;
 }
 
+/// `s` as one word for a POSIX shell: in single quotes, a quote as '\''.
+fn shQuote(a: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '\'');
+    for (s) |ch| if (ch == '\'') try out.appendSlice(a, "'\\''") else try out.append(a, ch);
+    try out.append(a, '\'');
+    return out.items;
+}
+
 /// The settings files other users must not be able to change: they decide
 /// what runs (rules, MCP servers' commands, roles on folders) and where
 /// values are typed.
-pub fn guardedFiles(p: Paths) [6][]const u8 {
-    return .{ p.config, p.rules, p.logins, p.mcp, p.folders, p.triggers };
+pub fn guardedFiles(p: Paths) [7][]const u8 {
+    return .{ p.config, p.rules, p.logins, p.mcp, p.folders, p.triggers, p.environments };
 }
 
 /// What is wrong with the settings files, said so the owner can fix it:
@@ -6370,7 +6622,7 @@ pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
         for (guardedFiles(p)) |path| {
             const st = Io.Dir.cwd().statFile(io, path, .{}) catch continue;
             if (st.permissions.toMode() & 0o022 != 0)
-                return try std.fmt.allocPrint(a, "{s} can be changed by other users; run chmod 600 {s} (config.ini, rules, logins.ini and mcp.ini must be writable only by you, and folders.ini and triggers.ini too)", .{ path, path });
+                return try std.fmt.allocPrint(a, "{s} can be changed by other users; run chmod 600 {s} (config.ini, rules, logins.ini and mcp.ini must be writable only by you, and folders.ini, triggers.ini and environments.ini too)", .{ path, path });
         }
     }
     inline for (.{
@@ -6380,6 +6632,7 @@ pub fn settingsProblem(io: Io, a: std.mem.Allocator, p: Paths) !?[]const u8 {
         .{ p.tasks, config.parseTasks },
         .{ p.logins, logins.parse },
         .{ p.folders, folders_mod.parse },
+        .{ p.environments, environments_mod.parse },
     }) |item| {
         const text = Io.Dir.cwd().readFileAlloc(io, item[0], a, .limited(1 << 20)) catch |e| switch (e) {
             error.FileNotFound => "",
@@ -6438,7 +6691,7 @@ pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, co
     for (0..n) |_| line = it.next() orelse "";
     // what the parser says of that line (the lines up to it are fine)
     _ = scratch.reset(.retain_capacity);
-    const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e) orelse folders_mod.reason(e) orelse config.reason(e);
+    const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e) orelse folders_mod.reason(e) orelse environments_mod.reason(e) orelse config.reason(e);
     return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
 }
 
@@ -10063,6 +10316,45 @@ test "folders_ini_is_guarded_watched_and_applied_on_reload" {
     try t.expectEqualStrings("[notes] write = agent:coder\n", try f.core.command(a, "/folders"));
 }
 
+test "environments_ini_is_guarded_watched_and_applied_on_reload" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // init wrote one with comments only: host alone
+    try t.expect(std.mem.indexOf(u8, try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.environments, a, .unlimited), "; [box]") != null);
+    try t.expectEqualStrings("host: the workspace on this machine (built in)\nDefault: host.", try f.core.command(a, "/envs"));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[box]\nkind = sandbox\nworkspace = ro\n[use]\nschedule = box\n" });
+    // a change is noticed, and applies on /reload
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try f.rec.waitFor("not applied until you send /reload");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const listed = try f.core.command(a, "/envs");
+    try t.expect(std.mem.indexOf(u8, listed, "box: sandbox, workspace ro, network off") != null);
+    try t.expect(std.mem.indexOf(u8, listed, "Pinned: schedule runs in box.") != null);
+    if (builtin.os.tag != .windows) {
+        try Io.Dir.cwd().setFilePermissions(t.io, f.core.paths.environments, .fromMode(0o666), .{});
+        try t.expect(std.mem.indexOf(u8, try f.core.reload(), "environments.ini can be changed by other users") != null);
+        try Io.Dir.cwd().setFilePermissions(t.io, f.core.paths.environments, .fromMode(0o600), .{});
+    }
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[box]\nkind = sandbox\nnetwork = maybe\n" });
+    const bad = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, bad, "environments.ini line 3 has an error: network = maybe (network = off or on)") != null);
+    // what was there before stays
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/envs"), "workspace ro") != null);
+    // /env rm takes its home away
+    const home = try std.fs.path.join(a, &.{ f.core.paths.env_dir, "box", "home" });
+    try Io.Dir.cwd().createDirPath(t.io, home);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ home, "kept.txt" }), .data = "x" });
+    const removed = try f.core.command(a, "/env rm box");
+    try t.expect(std.mem.startsWith(u8, removed, "Removed box: its home, 0 snapshots"));
+    try t.expect(std.mem.indexOf(u8, removed, "still in environments.ini") != null);
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, home, .{}));
+    try t.expectEqualStrings("host is built in: there is nothing to remove.", try f.core.command(a, "/env rm host"));
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, "/env check nobox"), "No environment nobox"));
+}
+
 test "access_says_what_a_who_may_read_write_and_run" {
     var f: Fix = undefined;
     try f.init("", "", "");
@@ -10140,6 +10432,35 @@ test "a_secret_typed_into_a_snapshots_label_is_masked" {
     const snap = try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ f.core.paths.snapshots, "folders", &key, "1" }), a, .unlimited);
     try t.expect(std.mem.indexOf(u8, snap, "og-key-for-tests") == null);
     try t.expect(std.mem.indexOf(u8, try logText(&f), "og-key-for-tests") == null);
+}
+
+test "apps_are_listed_approved_and_removed_from_the_chat" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const dir = try std.fs.path.join(a, &.{ f.core.paths.home, "apps", "notes" });
+    try Io.Dir.cwd().createDirPath(t.io, dir);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "app.ini" }), .data = "[app]\nname = notes\n" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "index.html" }), .data = "<p>notes</p>" });
+    // the built-ins, and one waiting for the owner's approval
+    const before = try f.core.command(a, "/apps");
+    try t.expect(std.mem.indexOf(u8, before, "inbox: built in") != null);
+    try t.expect(std.mem.indexOf(u8, before, "notes: not approved yet: /app approve notes") != null);
+    try t.expect(std.mem.indexOf(u8, before, "The app server is off") != null);
+    try t.expectEqualStrings("Approved notes as v1: it is served as its files are now.", try f.core.command(a, "/app approve notes"));
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/apps"), "notes: v1") != null);
+    // changed by hand or by a command: said, and served again only once approved
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "index.html" }), .data = "<p>changed</p>" });
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/apps"), "notes: v1, changed outside harness") != null);
+    try t.expectEqualStrings("Approved notes as v2: it is served as its files are now.", try f.core.command(a, "/app approve notes"));
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, "/app approve inbox"), "inbox is built in"));
+    try t.expectEqualStrings("Removed notes: its files, its data and its versions.", try f.core.command(a, "/app rm notes"));
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, dir, .{}));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"approved\"") != null);
+    // the server, when on: its links in /apps
+    _ = try f.core.startApps(a);
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/apps"), "inbox: built in http://127.0.0.1:") != null);
 }
 
 // ---- agent definitions ----
@@ -10892,6 +11213,36 @@ test "triggers_ini_is_guarded_watched_and_applied_on_reload" {
         try Io.Dir.cwd().setFilePermissions(t.io, f.core.paths.triggers, .fromMode(0o600), .{});
     }
     try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+}
+
+test "triggers_ini_and_environments_ini_are_read_and_watched_side_by_side" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try writeTriggers(&f, "[zig]\nsearch = zig release\n");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[box]\nkind = sandbox\nworkspace = ro\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    // each from its own file
+    try t.expectEqual(1, f.core.trig_list.len);
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/envs"), "box: sandbox, workspace ro, network off") != null);
+    // triggers.ini changed at once still leaves a change of
+    // environments.ini noticed
+    const two = "[zig]\nsearch = zig release\n[rust]\nsearch = rust release\n";
+    try writeTriggers(&f, two);
+    try t.expectEqual(null, try f.core.applyTriggers(a, two));
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("not applied until you send /reload"));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[box]\nkind = sandbox\nnetwork = maybe\n" });
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try f.rec.waitFor("not applied until you send /reload");
+    // a bad environments.ini changes neither file's settings
+    const bad = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, bad, "environments.ini line 3 has an error") != null);
+    try t.expectEqual(2, f.core.trig_list.len);
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/envs"), "workspace ro") != null);
 }
 
 test "old_task_and_brief_files_run_as_before_beside_triggers" {
