@@ -53,6 +53,7 @@ const butler = @import("butler.zig");
 const alerts_mod = @import("alerts.zig");
 const mail_mod = @import("mail.zig");
 const diary_mod = @import("diary.zig");
+const meds_mod = @import("meds.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -696,6 +697,9 @@ pub const Core = struct {
     /// The diary: the calendar's events read last, the lines said
     /// (state/diary), the busy window that held posts.
     diary: diary_mod.State,
+    /// Medication reminders: the schedule and today's reminders
+    /// (state/meds; see Meds).
+    meds: meds_mod.Store,
     /// What /reload says when the settings files have an error.
     problem_buf: [800]u8 = undefined,
 
@@ -888,6 +892,9 @@ pub const Core = struct {
         c.diary = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "diary" }));
         errdefer c.diary.deinit();
         c.diary.load() catch |e| c.log.write(.config, false, .{ .event = "diary not read", .why = @errorName(e) }) catch {};
+        c.meds = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "meds" }));
+        errdefer c.meds.deinit();
+        c.meds.load() catch |e| c.log.write(.config, false, .{ .event = "meds not read", .why = @errorName(e) }) catch {};
         c.role = "open";
         // problem_buf: written before it is read
         // the inbox: read, its first id from 0.3's approval numbers; items
@@ -962,6 +969,7 @@ pub const Core = struct {
         c.announced.deinit(c.gpa);
         c.group_posts.deinit(c.gpa);
         c.diary.deinit();
+        c.meds.deinit();
         c.defs.deinit();
         for (c.told_topics.items) |n| c.gpa.free(n);
         c.told_topics.deinit(c.gpa);
@@ -1582,6 +1590,8 @@ pub const Core = struct {
         const is_command = std.mem.startsWith(u8, std.mem.trim(u8, text, " \t\r\n"), "/");
         // a reply to an urgent alert: the owner is on it
         if (m.reply_to != 0) Emergency.touched(c, m.chat, m.reply_to, "reply");
+        // a reply to a medication reminder saying it was taken
+        if (m.reply_to != 0 and !is_command and Meds.reply(c, m.chat, m.reply_to, text)) return;
         if (m.reply_to != 0 and !is_command and c.replyAnswer(conv, m.chat, m.reply_to, text)) return;
         return c.handleTextIn(conv, text);
     }
@@ -3208,6 +3218,8 @@ pub const Core = struct {
             return;
         }
         Emergency.touched(c, chat, message_id, "button");
+        // a medication reminder's [Taken]
+        if (data.len > 0 and data[0] == 'm') return Meds.press(c, chat, thread, message_id, data);
         if (data.len > 0 and data[0] == 'r') {
             if (!c.quickPress(message_id, data)) c.tellOutOfDate(chat, thread, message_id);
             return;
@@ -5652,6 +5664,8 @@ pub const Core = struct {
         // the diary: the calendar read when due, its lines at their minute
         if (c.poller_on) c.diaryDue(now_s);
         c.diaryPost(now_s);
+        // medication reminders at their minute (Meds)
+        Meds.due(c, now_s);
         // quiet hours over: what they held, a digest per conversation
         c.quietDue(now_s);
         // urgent alerts nobody is on: the household in turn, a fallback
@@ -10322,6 +10336,7 @@ pub const Core = struct {
         \\/member add NAME: a code for someone to join; /member rm NAME
         \\/setup: where setup is; /setup home, /setup car, /setup calendar, /setup mail: connect them in chat
         \\/setup routines: the butler's routines, offered one at a time
+        \\/med add NAME at 08:00, 20:00: a reminder with Taken; /meds, /med rm NAME, /med tell NAME MEMBER
     ;
 
     /// A command sent in `main` (or from the command line).
@@ -10335,7 +10350,8 @@ pub const Core = struct {
         const cmd = c.commandWord(words.next() orelse return "");
         const rest = std.mem.trim(u8, words.rest(), " \t");
         // a token pasted into /setup is not kept, in the log either
-        const logged = if (std.mem.eql(u8, cmd, "/setup") and butler.anyTokenLike(rest)) "(withheld: it looks like a token)" else rest;
+        // nor a medication's name (Meds)
+        const logged = if (std.mem.eql(u8, cmd, "/setup") and butler.anyTokenLike(rest)) "(withheld: it looks like a token)" else if (std.mem.eql(u8, cmd, "/med")) meds_mod.loggedArgs(rest) else rest;
         try c.log.write(.chat, c.convPrivate(conv), .{ .event = "command", .command = cmd, .args = logged });
         const eql = std.mem.eql;
         if (eql(u8, cmd, "/help") or eql(u8, cmd, "/start")) return help_text;
@@ -10344,6 +10360,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/people")) return c.people.listing(a, 100);
         if (eql(u8, cmd, "/person")) return if (rest.len == 0) "Use /person NAME." else c.people.cardText(a, rest);
         if (eql(u8, cmd, "/setup")) return c.setupCommand(a, conv, rest);
+        if (eql(u8, cmd, "/med") or eql(u8, cmd, "/meds")) return Meds.command(c, a, cmd, rest);
         if (eql(u8, cmd, "/member")) return c.memberCommand(a, rest);
         if (eql(u8, cmd, "/join")) return "That code is for the person joining: they send /join CODE to the bot from their own account.";
         if (eql(u8, cmd, "/stop")) return if (rest.len == 0) c.stopAll() else c.stopAgent(a, rest);
@@ -23334,4 +23351,448 @@ test "a_flight_in_the_mail_goes_to_the_calendar_through_calmcps_cal_create_asked
 
 test {
     _ = @import("meds.zig");
+}
+
+/// Medication reminders (Rulings 1–6 in
+/// docs/superpowers/plans/2026-11-23-habits.md): at each minute a
+/// reminder with [Taken] to main, ringing even in quiet hours; once more
+/// after 30 minutes; the member asked for told after an hour, by the time
+/// alone. The owner's tap or reply marks it taken. `state/meds` changes
+/// before anything is sent (a crash never says one twice); the log's
+/// `med` lines carry the time, never the name.
+const Meds = struct {
+    const label = "Taken";
+
+    /// `/med …` and `/meds`.
+    fn command(c: *Core, a: std.mem.Allocator, cmd: []const u8, rest: []const u8) ![]const u8 {
+        const got = try meds_mod.parseCommand(a, cmd, rest);
+        const now_s = c.now();
+        const today = meds_mod.dayOf(now_s, c.cfg.chat.utc_offset);
+        switch (got) {
+            .usage => |u| return u,
+            .list => {
+                c.meds.mutex.lockUncancelable(c.io);
+                defer c.meds.mutex.unlock(c.io);
+                return meds_mod.listText(a, try c.meds.data.clone(a), today);
+            },
+            else => {},
+        }
+        // a member named must be one (checked before the lock)
+        if (got == .tell and got.tell.member.len > 0 and !c.isMember(got.tell.member))
+            return std.fmt.allocPrint(a, "{s} isn't a member of your household (/members).", .{got.tell.member});
+        c.meds.mutex.lockUncancelable(c.io);
+        defer c.meds.mutex.unlock(c.io);
+        var d = try c.meds.data.clone(a);
+        var list: std.ArrayList(meds_mod.Med) = .empty;
+        try list.appendSlice(a, d.meds);
+        var said: []const u8 = "";
+        var what: []const u8 = "";
+        switch (got) {
+            .add => |x| {
+                const set: meds_mod.Med = .{ .name = x.name, .times = x.times, .from = now_s };
+                if (d.find(x.name)) |i| {
+                    list.items[i] = set;
+                    list.items[i].tell = d.meds[i].tell;
+                } else {
+                    if (list.items.len >= meds_mod.max_meds) return "At most 20 medications: /med rm NAME one first.";
+                    try list.append(a, set);
+                }
+                said = try std.fmt.allocPrint(a, "{s}: a reminder at {s}, each with {s}.", .{ x.name, try meds_mod.timesText(a, x.times), label });
+                what = "set";
+            },
+            .rm => |name| {
+                const i = d.find(name) orelse return std.fmt.allocPrint(a, "No medication called {s}. /meds lists them.", .{name});
+                said = try std.fmt.allocPrint(a, "{s}: no more reminders.", .{d.meds[i].name});
+                _ = list.orderedRemove(i);
+                what = "removed";
+            },
+            .tell => |x| {
+                const i = d.find(x.name) orelse return std.fmt.allocPrint(a, "No medication called {s}. /meds lists them.", .{x.name});
+                list.items[i].tell = x.member;
+                said = if (x.member.len == 0)
+                    try std.fmt.allocPrint(a, "{s}: no one else hears of it.", .{d.meds[i].name})
+                else
+                    try std.fmt.allocPrint(a, "If {s} isn't taken an hour after its reminder, {s} hears of it: the time, not the medicine's name.", .{ d.meds[i].name, Emergency.display(a, x.member) });
+                what = if (x.member.len == 0) "nobody told" else "member told";
+            },
+            else => unreachable,
+        }
+        d.meds = list.items;
+        d = try meds_mod.pruned(a, d, today);
+        c.meds.put(d) catch |e| return std.fmt.allocPrint(a, "Not changed: state/meds could not be written ({s}).", .{@errorName(e)});
+        c.log.write(.config, false, .{ .event = "med", .what = what, .medications = d.meds.len }) catch {};
+        return said;
+    }
+
+    /// From the tick: what is due now, each written before it is sent.
+    fn due(c: *Core, now_s: i64) void {
+        if (c.chan == null) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const list = blk: {
+            c.meds.mutex.lockUncancelable(c.io);
+            defer c.meds.mutex.unlock(c.io);
+            if (c.meds.data.meds.len == 0) return;
+            break :blk meds_mod.due(a, c.meds.data.clone(a) catch return, now_s, c.cfg.chat.utc_offset) catch return;
+        };
+        for (list) |x| switch (x.kind) {
+            .remind, .again => remind(c, a, x, now_s),
+            .tell => tell(c, a, x, now_s),
+        };
+    }
+
+    /// The reminder (or its second), with [Taken].
+    fn remind(c: *Core, a: std.mem.Allocator, x: meds_mod.Due, now_s: i64) void {
+        const first = x.kind == .remind;
+        // marked first: a crash never sends it twice
+        const token = blk: {
+            c.meds.mutex.lockUncancelable(c.io);
+            defer c.meds.mutex.unlock(c.io);
+            var d = c.meds.data.clone(a) catch return;
+            var tok: []const u8 = "";
+            if (first) {
+                if (d.slot(x.med, x.day, x.at) != null) return;
+                tok = a.dupe(u8, &c.newToken()) catch return;
+                var slots: std.ArrayList(meds_mod.Slot) = .empty;
+                slots.appendSlice(a, d.slots) catch return;
+                slots.append(a, .{ .med = x.med, .day = x.day, .at = x.at, .token = tok, .reminded = now_s }) catch return;
+                d.slots = slots.items;
+            } else {
+                const s = d.slot(x.med, x.day, x.at) orelse return;
+                if (s.again or s.taken) return;
+                s.again = true;
+                tok = s.token;
+            }
+            d = meds_mod.pruned(a, d, meds_mod.dayOf(now_s, c.cfg.chat.utc_offset)) catch return;
+            c.meds.put(d) catch |e| {
+                c.log.write(.chat, false, .{ .event = "med not written", .why = @errorName(e) }) catch {};
+                return;
+            };
+            break :blk tok;
+        };
+        var cb: [5]u8 = undefined;
+        const at = meds_mod.clock(&cb, x.at);
+        const text = (if (first) meds_mod.remindText(a, x.med, x.at) else meds_mod.againText(a, x.med, x.at)) catch return;
+        const sent = send(c, a, text, token);
+        c.log.write(.chat, false, .{ .event = "med", .what = if (first) "reminded" else "again", .at = at, .delivered = sent != null }) catch {};
+        const where = sent orelse return;
+        c.meds.mutex.lockUncancelable(c.io);
+        defer c.meds.mutex.unlock(c.io);
+        var d = c.meds.data.clone(a) catch return;
+        const s = d.byToken(token) orelse return;
+        s.chat = where.chat;
+        s.thread = where.thread;
+        if (first) s.msg = where.msg else s.msg2 = where.msg;
+        c.meds.put(d) catch {};
+    }
+
+    const Where = struct { chat: i64, thread: i64, msg: i64 };
+
+    /// `text` to main with [Taken]: where it went, or null.
+    fn send(c: *Core, a: std.mem.Allocator, text: []const u8, token: []const u8) ?Where {
+        const ch = c.chan orelse return null;
+        const r = c.placeOf(a, "main") catch return null;
+        const data = std.fmt.allocPrint(a, "m{s}:taken", .{token}) catch return null;
+        const msg = ch.buttons(ch.ctx, r.place, text, &.{.{ label, data }}) orelse return null;
+        c.touch("main");
+        return .{ .chat = r.place.chat, .thread = r.place.thread, .msg = msg };
+    }
+
+    /// Whether `now_s` is in quiet hours.
+    fn quietNow(c: *Core, now_s: i64) bool {
+        const hours = c.quiet.effective(c.cfg.butler.quiet) orelse return false;
+        return hours.inside(quiet_mod.minuteOf(now_s, c.cfg.chat.utc_offset));
+    }
+
+    /// The member asked for, an hour after a reminder not taken: the time
+    /// alone, in their own chat (without a sound in quiet hours); the
+    /// owner hears who was told.
+    fn tell(c: *Core, a: std.mem.Allocator, x: meds_mod.Due, now_s: i64) void {
+        {
+            c.meds.mutex.lockUncancelable(c.io);
+            defer c.meds.mutex.unlock(c.io);
+            var d = c.meds.data.clone(a) catch return;
+            const s = d.slot(x.med, x.day, x.at) orelse return;
+            if (s.told.len > 0 or s.taken) return;
+            s.told = x.tell;
+            c.meds.put(d) catch |e| {
+                c.log.write(.chat, false, .{ .event = "med not written", .why = @errorName(e) }) catch {};
+                return;
+            };
+        }
+        var cb: [5]u8 = undefined;
+        const at = meds_mod.clock(&cb, x.at);
+        const silent = quietNow(c, now_s);
+        const why = toMember(c, a, x.tell, meds_mod.memberText(a, x.at) catch return, silent);
+        c.log.write(.chat, false, .{ .event = "med", .what = "told", .at = at, .member = x.tell, .delivered = why == null, .why = why }) catch {};
+        const owner_line = if (why) |w|
+            std.fmt.allocPrint(a, "I couldn't tell {s} that {s} ({s}) isn't marked as taken: {s}.", .{ Emergency.display(a, x.tell), x.med, at, w }) catch return
+        else
+            meds_mod.ownerToldText(a, x.tell, x.med, x.at) catch return;
+        _ = c.sendTextAs("main", owner_line, silent) catch {};
+    }
+
+    /// `text` in member `name`'s own chat with the bot; null when it went,
+    /// else why not.
+    fn toMember(c: *Core, a: std.mem.Allocator, name: []const u8, text: []const u8, silent: bool) ?[]const u8 {
+        const user = blk: {
+            c.members.mutex.lockUncancelable(c.io);
+            defer c.members.mutex.unlock(c.io);
+            const m = c.members.find(name) orelse break :blk 0;
+            break :blk m.user;
+        };
+        if (user == 0) return std.fmt.allocPrint(a, "{s} isn't a member who has joined (/members)", .{name}) catch "not a member";
+        const conv = c.memberChat(a, name, user) catch return "harness could not write state/conversations";
+        const sent = c.sendTextAs(conv, text, silent) catch |e| return whyUndelivered(e);
+        c.notePosted(conv, sent.first, sent.count);
+        return null;
+    }
+
+    /// A press of [Taken] (`m<token>:taken`) in message `message`.
+    fn press(c: *Core, chat: i64, thread: i64, message: i64, data: []const u8) void {
+        const colon = std.mem.lastIndexOfScalar(u8, data, ':') orelse return c.tellOutOfDate(chat, thread, message);
+        if (!taken(c, data[1..colon], chat, message)) c.tellOutOfDate(chat, thread, message);
+    }
+
+    /// A reply to a reminder (`reply_to` in `chat`) saying it was taken:
+    /// marked. False: no such reminder, or other words.
+    fn reply(c: *Core, chat: i64, reply_to: i64, text: []const u8) bool {
+        if (!meds_mod.saysTaken(text)) return false;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const tok = blk: {
+            c.meds.mutex.lockUncancelable(c.io);
+            defer c.meds.mutex.unlock(c.io);
+            const s = c.meds.data.byMessage(chat, reply_to) orelse return false;
+            break :blk arena.allocator().dupe(u8, s.token) catch return false;
+        };
+        return taken(c, tok, chat, reply_to);
+    }
+
+    /// Reminder `token` taken, told from message `message` in `chat` (one
+    /// of its own): written, its messages say so, the member told hears.
+    /// False: it answers nothing.
+    fn taken(c: *Core, token: []const u8, chat: i64, message: i64) bool {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const now_s = c.now();
+        const s = blk: {
+            c.meds.mutex.lockUncancelable(c.io);
+            defer c.meds.mutex.unlock(c.io);
+            var d = c.meds.data.clone(a) catch return false;
+            const s = d.byToken(token) orelse return false;
+            if (s.chat != chat or (message != s.msg and message != s.msg2)) return false;
+            if (s.taken) return true;
+            s.taken = true;
+            c.meds.put(d) catch |e| {
+                c.log.write(.chat, false, .{ .event = "med not written", .why = @errorName(e) }) catch {};
+                return true;
+            };
+            break :blk s.*;
+        };
+        var cb: [5]u8 = undefined;
+        const at = meds_mod.clock(&cb, s.at);
+        c.log.write(.chat, false, .{ .event = "med", .what = "taken", .at = at }) catch {};
+        const text = meds_mod.takenText(a, s.med, s.at, quiet_mod.minuteOf(now_s, c.cfg.chat.utc_offset)) catch return true;
+        const ch = c.chan orelse return true;
+        if (ch.edit == null) c.sayIn("main", text);
+        for ([_]i64{ s.msg, s.msg2 }) |m| if (m != 0) Emergency.edit(c, s.chat, s.thread, m, text);
+        if (s.told.len > 0) _ = toMember(c, a, s.told, meds_mod.memberTakenText(a, s.at) catch return true, quietNow(c, now_s));
+        return true;
+    }
+};
+
+/// Minute `m` (the owner's, at +01:00) of a day to come, as Unix seconds.
+fn medAt(m: u16) i64 {
+    return meds_mod.slotTime(@divFloor(quietDay(), 86400), m, 60);
+}
+
+test "a_medication_reminder_with_taken" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const t0 = medAt(8 * 60);
+    f.core.fixed_now = t0 - 3600;
+    try t.expectEqualStrings("Metformin: a reminder at 08:00 and 20:00, each with Taken.", try f.core.command(a, "/med add Metformin at 08:00, 20:00"));
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("Time for"));
+    // at its minute, once, with one button
+    f.core.fixed_now = t0;
+    f.core.tick();
+    try f.rec.waitFor("BUTTONS Time for Metformin (08:00). [m");
+    f.core.tick();
+    try t.expectEqual(1, f.rec.count("Time for"));
+    try t.expect(f.lastButtons().n == 1);
+    const msg = f.lastButtons().msg;
+    // the owner's tap: the message says so, its button gone
+    f.core.fixed_now = t0 + 5 * 60;
+    try f.press("taken");
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "EDIT {d}: Metformin (08:00): taken at 08:05.", .{msg}));
+    // nothing more for it
+    f.core.fixed_now = t0 + 2 * 3600;
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("Still to take"));
+    try t.expectEqualStrings("Metformin: 08:00 (taken), 20:00.", try f.core.command(a, "/meds"));
+    // a restart keeps it: nothing is said again
+    try restart(&f);
+    try f.core.setOwner(42);
+    f.core.fixed_now = t0 + 2 * 3600 + 60;
+    f.core.tick();
+    try t.expectEqual(1, f.rec.count("Time for"));
+    try t.expectEqualStrings("Metformin: 08:00 (taken), 20:00.", try f.core.command(a, "/meds"));
+    try t.expectEqualStrings("Metformin: no more reminders.", try f.core.command(a, "/med rm metformin"));
+    try t.expectEqualStrings("No medication reminders. /med add NAME at 08:00, 20:00 sets one, with Taken each time.", try f.core.command(a, "/meds"));
+}
+
+test "not_taken_once_more_after_30_minutes_then_nothing" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const t0 = medAt(8 * 60);
+    f.core.fixed_now = t0 - 60;
+    _ = try f.core.command(a, "/med add Metformin at 08:00");
+    f.core.fixed_now = t0;
+    f.core.tick();
+    try f.rec.waitFor("BUTTONS Time for Metformin (08:00).");
+    const first = f.lastButtons().msg;
+    f.core.fixed_now = t0 + 29 * 60;
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("Still to take"));
+    f.core.fixed_now = t0 + 30 * 60;
+    f.core.tick();
+    try f.rec.waitFor("BUTTONS Still to take: Metformin (08:00). [m");
+    const second = f.lastButtons().msg;
+    for ([_]i64{ 2 * 3600, 3 * 3600 + 30 * 60, 6 * 3600 }) |later| {
+        f.core.fixed_now = t0 + later;
+        f.core.tick();
+    }
+    try t.expectEqual(1, f.rec.count("Still to take"));
+    try t.expectEqual(1, f.rec.count("Time for"));
+    try t.expectEqualStrings("Metformin: 08:00 (not taken).", try f.core.command(a, "/meds"));
+    // the second's button answers it, and both messages say so
+    f.core.fixed_now = t0 + 6 * 3600 + 60;
+    try f.press("taken");
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "EDIT {d}: Metformin (08:00): taken at 14:01.", .{first}));
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "EDIT {d}: Metformin (08:00): taken at 14:01.", .{second}));
+    // a press of another message's button with its data answers nothing
+    f.core.handleCallback(42, second + 99, f.lastButtons().get("taken").?);
+    try f.rec.waitFor(out_of_date);
+}
+
+test "a_member_is_told_after_an_hour_when_asked" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try joinMember(&f, "anna", 77);
+    const t0 = medAt(8 * 60);
+    f.core.fixed_now = t0 - 60;
+    _ = try f.core.command(a, "/med add Metformin at 08:00");
+    try t.expectEqualStrings("bob isn't a member of your household (/members).", try f.core.command(a, "/med tell Metformin bob"));
+    try t.expectEqualStrings("No medication called Aspirin. /meds lists them.", try f.core.command(a, "/med tell Aspirin anna"));
+    try t.expectEqualStrings("If Metformin isn't taken an hour after its reminder, Anna hears of it: the time, not the medicine's name.", try f.core.command(a, "/med tell Metformin anna"));
+    try t.expectEqualStrings("Metformin: 08:00. Anna hears if one isn't taken in an hour.", try f.core.command(a, "/meds"));
+    for ([_]i64{ 0, 30 * 60, 59 * 60 }) |at| {
+        f.core.fixed_now = t0 + at;
+        f.core.tick();
+    }
+    try f.rec.waitFor("Still to take");
+    try t.expectEqual(0, f.rec.countIn("anna", "medicine"));
+    f.core.fixed_now = t0 + 60 * 60;
+    f.core.tick();
+    try f.rec.waitIn("anna", "The owner hasn't marked the 08:00 medicine as taken; the reminder went an hour ago.");
+    try f.rec.waitIn("main", "I told Anna that Metformin (08:00) isn't marked as taken.");
+    f.core.fixed_now = t0 + 3 * 3600;
+    f.core.tick();
+    try t.expectEqual(1, f.rec.countIn("anna", "medicine"));
+    // a tap afterwards: Anna hears it was taken; she never reads its name
+    try f.press("taken");
+    try f.rec.waitIn("anna", "The owner has taken the 08:00 medicine now.");
+    try t.expectEqual(0, f.rec.countIn("anna", "Metformin"));
+    // off again
+    try t.expectEqualStrings("Metformin: no one else hears of it.", try f.core.command(a, "/med tell Metformin off"));
+}
+
+test "a_reply_saying_taken_marks_it" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const t0 = medAt(8 * 60);
+    f.core.fixed_now = t0 - 60;
+    _ = try f.core.command(a, "/med add Vitamin D at 08:00");
+    f.core.fixed_now = t0;
+    f.core.tick();
+    try f.rec.waitFor("BUTTONS Time for Vitamin D (08:00).");
+    const msg = f.lastButtons().msg;
+    // other words in reply are a message like any
+    f.core.fixed_now = t0 + 10 * 60;
+    try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = "later, after breakfast", .reply_to = msg });
+    try t.expectEqualStrings("Vitamin D: 08:00 (not taken).", try f.core.command(a, "/meds"));
+    try t.expectEqual(1, f.core.queue.items.len);
+    try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = "Taken.", .reply_to = msg });
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "EDIT {d}: Vitamin D (08:00): taken at 08:10.", .{msg}));
+    try t.expectEqualStrings("Vitamin D: 08:00 (taken).", try f.core.command(a, "/meds"));
+    try t.expectEqual(1, f.core.queue.items.len);
+}
+
+test "the_log_never_names_a_medication" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try joinMember(&f, "anna", 77);
+    const t0 = medAt(8 * 60);
+    f.core.fixed_now = t0 - 60;
+    _ = try f.core.command(a, "/med add Metformin at 08:00");
+    _ = try f.core.command(a, "/med tell Metformin anna");
+    _ = try f.core.command(a, "/meds");
+    for ([_]i64{ 0, 30 * 60, 60 * 60 }) |at| {
+        f.core.fixed_now = t0 + at;
+        f.core.tick();
+    }
+    try f.rec.waitIn("anna", "medicine");
+    try f.press("taken");
+    try f.rec.waitIn("anna", "has taken");
+    _ = try f.core.command(a, "/med rm Metformin");
+    const log = try logText(&f);
+    try t.expect(std.ascii.findIgnoreCase(log, "metformin") == null);
+    try expectHas(log, "\"command\":\"/med\",\"args\":\"add (withheld)\"");
+    try expectHas(log, "\"event\":\"med\",\"what\":\"reminded\",\"at\":\"08:00\"");
+    try expectHas(log, "\"event\":\"med\",\"what\":\"again\",\"at\":\"08:00\"");
+    try expectHas(log, "\"event\":\"med\",\"what\":\"told\",\"at\":\"08:00\",\"member\":\"anna\"");
+    try expectHas(log, "\"event\":\"med\",\"what\":\"taken\",\"at\":\"08:00\"");
+}
+
+test "a_reminder_rings_in_quiet_hours" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n[butler]\nquiet = 22:00-07:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const t0 = medAt(23 * 60);
+    f.core.fixed_now = t0 - 3600;
+    _ = try f.core.command(a, "/med add Melatonin at 23:00");
+    f.core.fixed_now = t0;
+    f.core.tick();
+    try f.rec.waitFor("BUTTONS Time for Melatonin (23:00).");
+    try t.expectEqual(false, f.rec.quietOf("Time for Melatonin").?);
+    try t.expectEqual(0, f.core.quiet.count());
+}
+
+test "members_cant_use_med" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try joinMember(&f, "anna", 77);
+    try f.core.handleIncoming(fromAccount(77, "/med add Sleeping pills at 22:00"));
+    try f.rec.waitIn("anna", household.owner_only);
+    try f.core.handleIncoming(fromAccount(77, "/meds"));
+    try t.expectEqual(2, f.rec.countIn("anna", household.owner_only));
+    try t.expectEqualStrings("No medication reminders. /med add NAME at 08:00, 20:00 sets one, with Taken each time.", try f.core.command(a, "/meds"));
+    try t.expect(std.ascii.findIgnoreCase(try logText(&f), "sleeping") == null);
 }

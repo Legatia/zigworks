@@ -32,6 +32,9 @@ pub const Med = struct {
     name: []const u8,
     times: []const u16,
     tell: []const u8 = "",
+    /// When its times were set: a minute already past then is reminded
+    /// from the next day.
+    from: i64 = 0,
 };
 
 /// One reminder: medication `med` at minute `at` of the owner's day `day`.
@@ -85,7 +88,7 @@ pub const Data = struct {
 
     pub fn clone(d: Data, a: Allocator) !Data {
         const meds = try a.alloc(Med, d.meds.len);
-        for (d.meds, meds) |m, *o| o.* = .{ .name = try a.dupe(u8, m.name), .times = try a.dupe(u16, m.times), .tell = try a.dupe(u8, m.tell) };
+        for (d.meds, meds) |m, *o| o.* = .{ .name = try a.dupe(u8, m.name), .times = try a.dupe(u16, m.times), .tell = try a.dupe(u8, m.tell), .from = m.from };
         const slots = try a.alloc(Slot, d.slots.len);
         for (d.slots, slots) |s, *o| {
             o.* = s;
@@ -129,7 +132,7 @@ pub fn due(a: Allocator, d: Data, now_s: i64, offset: i32) ![]Due {
         var day = today - 1;
         while (day <= today) : (day += 1) {
             const start = slotTime(day, at, offset);
-            if (now_s < start) continue;
+            if (now_s < start or start < m.from) continue;
             const s = d.slot(m.name, day, at) orelse {
                 if (now_s - start < late_s) try out.append(a, .{ .kind = .remind, .med = m.name, .day = day, .at = at });
                 continue;
@@ -403,7 +406,7 @@ pub fn render(a: Allocator, d: Data) ![]const u8 {
         }
         try o.appendSlice(a, "],\"tell\":");
         try util.jsonString(&o, a, m.tell);
-        try o.appendSlice(a, "}\n");
+        try o.print(a, ",\"from\":{d}}}\n", .{m.from});
     }
     for (d.slots) |x| {
         var b: [5]u8 = undefined;
@@ -436,7 +439,7 @@ pub fn parse(a: Allocator, text: []const u8) !Data {
                 try times.append(a, m);
             };
             if (times.items.len == 0 or nameProblem(name) != null) continue;
-            try meds.append(a, .{ .name = name, .times = times.items, .tell = str(o, "tell") orelse "" });
+            try meds.append(a, .{ .name = name, .times = times.items, .tell = str(o, "tell") orelse "", .from = int(o, "from") orelse 0 });
         } else if (str(o, "slot")) |name| {
             const at = config.parseClock(str(o, "at") orelse continue) catch continue;
             try slots.append(a, .{
@@ -565,7 +568,7 @@ test "meds_round_trip_with_windows_line_ends" {
     d.slots = slots;
     const text = try render(a, d);
     try t.expectEqualStrings(
-        \\{"med":"Metformin","times":["08:00","20:00"],"tell":"anna"}
+        \\{"med":"Metformin","times":["08:00","20:00"],"tell":"anna","from":0}
         \\{"slot":"Metformin","day":20415,"at":"08:00","token":"0123456789abcdef","reminded":1763884800,"again":true,"told":"","taken":true,"chat":42,"thread":0,"msg":101,"msg2":102}
         \\
     , text);
@@ -622,6 +625,21 @@ test "a_reminder_once_more_after_30_minutes_and_the_member_after_an_hour" {
     try t.expectEqual(1, next.len);
     try t.expectEqual(Kind.again, next[0].kind);
     try t.expectEqual(day, next[0].day);
+}
+
+test "a_time_already_past_when_set_waits_for_the_next_day" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d = try sample(a);
+    const t0 = slotTime(20415, 8 * 60, 0);
+    // set at 09:00: not reminded of 08:00 now, but the next day
+    d.meds[0].from = t0 + 3600;
+    try t.expectEqual(0, (try due(a, d, t0 + 3600, 0)).len);
+    try t.expectEqual(1, (try due(a, d, t0 + 86400, 0)).len);
+    const text = try render(a, d);
+    try t.expect(std.mem.indexOf(u8, text, "\"from\":") != null);
+    try t.expectEqual(t0 + 3600, (try parse(a, text)).meds[0].from);
 }
 
 test "a_late_reminder_is_skipped_after_3_hours" {
