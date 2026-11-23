@@ -22,6 +22,9 @@ pub const Tool = enum {
     search,
     recall,
     remember,
+    /// Every earlier turn in the log, searched (long memory); the argument
+    /// is the words, or `run N` for a run's steps.
+    history,
     /// A page rendered by a headless browser; the same limits as fetch.
     browse,
     /// Work handed to helpers; each helper's own calls pass the gate.

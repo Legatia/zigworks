@@ -13,6 +13,7 @@ const agent = @import("agent.zig");
 const logins = @import("logins.zig");
 const totp = @import("totp.zig");
 const session = @import("session.zig");
+const history_mod = @import("history.zig");
 const remote = @import("remote.zig");
 const folders = @import("folders.zig");
 const inbox_mod = @import("inbox.zig");
@@ -62,6 +63,8 @@ const usage =
     \\  log tail [N]               print the last N log lines (default 20)
     \\  log runs [N]               a line per run, the last N (default 20)
     \\  log session RID [--json]   a run and its helpers, step by step
+    \\  log search WORDS           earlier turns with every word, newest first
+    \\                             (an argument with spaces is a phrase)
     \\  app list | approve NAME | rm NAME
     \\                             the apps in apps/: list them, serve one as its files
     \\                             are now, remove one with its data
@@ -1674,7 +1677,23 @@ fn logCmd(app: *App, args: []const []const u8) !Exit {
         try outAll(app.io, shown);
         return .ok;
     }
-    complain("usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]", .{});
+    if (args.len >= 2 and eql(args[0], "search")) {
+        // dates in the owner's time, as config.ini says (UTC without it)
+        const offset: i32 = blk: {
+            const text = Io.Dir.cwd().readFileAlloc(app.io, p.config, app.arena, .limited(1 << 20)) catch break :blk 0;
+            break :blk (config.parse(app.arena, text) catch break :blk 0).chat.utc_offset;
+        };
+        const shown = history_mod.searchText(app.arena, app.io, p.log, args[1..], offset) catch |e| {
+            complain("can't read {s}: {s}", .{ p.log, @errorName(e) });
+            return .failed;
+        } orelse {
+            complain("usage: harness log search WORDS (a phrase in double quotes, or an argument with spaces)", .{});
+            return .usage;
+        };
+        try outPrint(app.io, "{s}\n", .{shown});
+        return .ok;
+    }
+    complain("usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json] | log search WORDS", .{});
     return .usage;
 }
 
@@ -2000,7 +2019,8 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
             if (rest.len == 2) return null;
             if (rest.len == 3 and eql(rest[2], "--json")) return null;
         }
-        return "usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]";
+        if (rest.len >= 2 and eql(rest[0], "search")) return null;
+        return "usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json] | log search WORDS";
     }
     if (eql(cmd, "app")) return if (appArgsOk(rest)) null else app_usage;
     if (eql(cmd, "agent")) {
@@ -2518,6 +2538,12 @@ test "log_runs_and_log_session_read_runs_back" {
     try t.expect(badArgs(&.{ "log", "session" }) != null);
     try t.expect(badArgs(&.{ "log", "session", "x" }) != null);
     try t.expect(badArgs(&.{ "log", "runs", "x" }) != null);
+}
+
+test "log_search_takes_words" {
+    try t.expect(badArgs(&.{ "log", "search", "flats" }) == null);
+    try t.expect(badArgs(&.{ "log", "search", "flight to oslo", "2026" }) == null);
+    try t.expect(badArgs(&.{ "log", "search" }) != null);
 }
 
 test "the_terminal_offers_only_the_answers_the_question_has" {

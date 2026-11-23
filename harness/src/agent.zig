@@ -20,6 +20,8 @@ const who_mod = @import("who.zig");
 const folders_mod = @import("folders.zig");
 const snapshots_mod = @import("snapshots.zig");
 const agents = @import("agents.zig");
+const history_mod = @import("history.zig");
+const summaries_mod = @import("summaries.zig");
 const Io = std.Io;
 
 /// What came of asking the owner. `once`, `day`, `deny`: an approval's
@@ -294,6 +296,9 @@ pub const Run = struct {
     grants_path: ?[]const u8 = null,
     log: *log_mod.Log,
     mem: *memory.Store,
+    /// Where `history` reads the log, and the prompt the conversation's
+    /// summaries (long memory); null: neither.
+    history: ?*const history_mod.Source = null,
     /// Held while memory or grants change; shared by all runs.
     lock: *Io.Mutex,
     env: tools.Env,
@@ -510,6 +515,8 @@ pub const Run = struct {
             .delegate => if (r.model_cfg == null) return false,
             .mcp, .money => if (r.mcp.len == 0) return false,
             .skill, .skill_save => if (r.skills_dir.len == 0) return false,
+            // where there is a log to read, in every run, as recall
+            .history => if (r.history == null) return false,
             .browse => if (r.env.browser.len == 0) return false,
             // the browser with the logins (helpers never: above); on
             // Windows too since Chrome's pipes there are inherited handles
@@ -685,6 +692,7 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
         if (!r.allows(tool)) continue;
         try out.append(arena, if (tool == .shell and r.gate.folders != null) shell_dir_def else d);
     }
+    if (r.allows(.history)) try out.append(arena, history_mod.tool_def);
     if (r.allows(.send)) try out.append(arena, send_def);
     if (r.allows(.ask_owner)) try out.append(arena, ask_owner_def);
     if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
@@ -1202,6 +1210,9 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
         top_header = true;
         try out.print(arena, "- {s}\n", .{it.body});
     };
+    // the conversation's summaries by day, week and month (long memory):
+    // their files change once a day, so the cached part holds until then
+    if (try earlierBlock(arena, r)) |block| try out.appendSlice(arena, block);
     if (past.summary) |sm| {
         try out.print(arena, "\nSummary of the earlier conversation:\n{s}\n", .{sm});
         if (past.lost > 0) try out.print(arena, "{d} turns of this conversation were dropped without being summarised, to keep it short.\n", .{past.lost});
@@ -1220,6 +1231,15 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
         for (recalled.found) |it| try out.print(arena, "- {s}\n", .{it.body});
     }
     return .{ .stable = stable, .changing = out.items };
+}
+
+/// The summaries of the run's conversation for its prompt: not for a
+/// helper, nor for a definition that reads only pinned memory.
+fn earlierBlock(arena: std.mem.Allocator, r: *const Run) !?[]const u8 {
+    const src = r.history orelse return null;
+    if (src.summaries_on) |on| if (!on.*) return null;
+    if (r.helper or r.def.memory != .shared) return null;
+    return summaries_mod.promptBlock(arena, r.io, src.summaries_dir, r.conversation, r.allows(.history));
 }
 
 /// One turn. `from_owner`: the text is the owner's own words (mentions
@@ -1486,6 +1506,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         },
         // the whole input: rules and the owner see all of it
         .mcp, .money => try std.fmt.allocPrint(a, "{s}/{s} {s}", .{ mt.?.server.name, mt.?.tool, input_json }),
+        .history => history_mod.gateArg(a, input_json) catch return .{ .text = "history needs words, or a run's number", .is_error = true },
         else => tools.mainArg(a, tool, input_json) catch return .{ .text = "the tool's input is missing its main field", .is_error = true },
     };
     // a skill outside the definition's skills is no skill of this run's
@@ -1621,6 +1642,12 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
             break :blk .{ .text = said };
         },
         .delegate => try delegate(r, a, input_json),
+        // as far as this run may see; masked again with today's values
+        .history => blk: {
+            const src = r.history.?;
+            const got = try history_mod.call(a, r.io, src, .{ .scope = src.scopeOf(r.who.by, r.conversation), .utc_offset = r.utc_offset, .secrets = r.env.secrets }, input_json);
+            break :blk .{ .text = got.text, .is_error = got.is_error };
+        },
         .snapshot => try snapshotTool(r, a, arg, jv.str(jv.get(jv.parse(a, input_json), "label")) orelse ""),
         .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
         .skill => blk: {
@@ -4615,6 +4642,58 @@ test "the_stable_instructions_stay_the_same_through_a_turn" {
     try t.expectEqualStrings(try systemOf(&f, 1), try systemOf(&f, 2));
 }
 
+test "the_prompt_carries_the_latest_summaries_within_1500_words" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const dir = try std.fs.path.join(a, &.{ f.e.dir, "summaries" });
+    for ([_][2][]const u8{
+        .{ "main/day/2026-11-21.md", "Saturday: the dentist moved to 11.\n" },
+        .{ "main/week/2026-W46.md", "Week 46: flats in Basel.\n" },
+        .{ "main/month/2026-10.md", "October: the move.\n" },
+        .{ "family/day/2026-11-21.md", "The family's Saturday.\n" },
+    }) |x| {
+        const p = try std.fs.path.join(a, &.{ dir, x[0] });
+        try Io.Dir.cwd().createDirPath(t.io, std.fs.path.dirname(p).?);
+        try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p, .data = x[1] });
+    }
+    var src: history_mod.Source = .{ .log_path = try std.fs.path.join(a, &.{ f.e.dir, "actions.jsonl" }), .summaries_dir = dir };
+    f.run.history = &src;
+    f.run.conversation = "main";
+    const pin = try f.mem.add("ask before deleting files", null, util.nowSeconds(t.io));
+    _ = try f.mem.setPinned(pin.id, true);
+    f.conv.summary = try t.allocator.dupe(u8, "The owner asked about flats.");
+    try f.e.script(1, model.textReply("one"));
+    try f.e.script(2, model.textReply("two"));
+    var r = try f.say("hello");
+    freeResult(&f.run, r);
+    r = try f.say("and again");
+    freeResult(&f.run, r);
+    // after pinned memory, before the rolling summary, in the cached part:
+    // the same bytes in every turn until the daily pass writes a file
+    const s1 = try systemOf(&f, 1);
+    try t.expectEqualStrings(s1, try systemOf(&f, 2));
+    const pinned = std.mem.indexOf(u8, s1, "Standing instructions from the owner").?;
+    const earlier = std.mem.indexOf(u8, s1, "Earlier in this conversation:").?;
+    const rolling = std.mem.indexOf(u8, s1, "Summary of the earlier conversation:").?;
+    try t.expect(pinned < earlier and earlier < rolling);
+    for ([_][]const u8{ "Month 2026-10: October: the move.", "Week 2026-W46 (2026-11-09 to 2026-11-15): Week 46: flats in Basel.", "2026-11-21 (Saturday): Saturday: the dentist moved to 11.", "history finds anything older than these, or the exact words." }) |want| {
+        if (std.mem.indexOf(u8, s1, want) == null) std.debug.print("missing {s} in {s}\n", .{ want, s1 });
+        try t.expect(std.mem.indexOf(u8, s1, want) != null);
+    }
+    // only this conversation's
+    try t.expect(std.mem.indexOf(u8, s1, "family") == null);
+    // a definition that reads pinned memory only, and a helper, get none
+    const recalled: memory.Recall = .{ .always = &.{}, .found = &.{} };
+    f.run.useDefinition(try defOf(&f, "quiet", "---\nname: quiet\ndescription: Q.\nmemory: pinned\n---\nQuiet.\n"));
+    try t.expect(std.mem.indexOf(u8, (try systemParts(a, &f.run, recalled, .{}, util.nowSeconds(t.io))).stable, "Earlier in this conversation") == null);
+    f.run.useDefinition(agents.builtin_main);
+    try t.expect(std.mem.indexOf(u8, (try systemParts(a, &f.run, recalled, .{}, util.nowSeconds(t.io))).stable, "Earlier in this conversation") != null);
+    f.run.helper = true;
+    try t.expect(std.mem.indexOf(u8, (try systemParts(a, &f.run, recalled, .{}, util.nowSeconds(t.io))).stable, "Earlier in this conversation") == null);
+}
+
 test "helpers_get_the_rest_of_the_turn_not_a_new_one" {
     var f: Fix = undefined;
     try f.init("");
@@ -4795,6 +4874,43 @@ test "kinds_without_a_tool_yet_are_not_offered_or_run" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "this tool is not available here") != null);
     try t.expectEqual(0, f.asked);
     try t.expect(std.mem.indexOf(u8, try f.logText(), "\"kind\":\"gate\"") == null);
+}
+
+test "history_is_offered_like_recall" {
+    var f: Fix = undefined;
+    try f.init("deny history password*\n");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    // no log to read: no history
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "history") == null);
+    var src: history_mod.Source = .{ .log_path = try std.fs.path.join(a, &.{ f.e.dir, "actions.jsonl" }) };
+    f.run.history = &src;
+    try t.expectEqualStrings("shell,read_file,write_file,fetch,search,recall,remember,history,ask_owner,delegate,", try toolNames(&f.run, a));
+    // runs nobody watches have it too
+    f.run.scheduled = true;
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "history,") != null);
+    f.run.scheduled = false;
+    // a definition names it; a delegate task that names no tools keeps 0.3's six
+    f.run.useDefinition(try defOf(&f, "reader", "---\nname: reader\ndescription: R.\ntools: recall, history\n---\n"));
+    try t.expectEqualStrings("recall,history,", try toolNames(&f.run, a));
+    f.run.useDefinition(try defOf(&f, "plain", "---\nname: plain\ndescription: P.\ntools: recall\n---\n"));
+    try t.expectEqualStrings("recall,", try toolNames(&f.run, a));
+    f.run.useDefinition(agents.builtin_main);
+    f.run.narrow = &agents.default_tools;
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "history") == null);
+    f.run.narrow = null;
+    // a call reads the log, without asking; a rule can stop it
+    try f.e.script(1, model.toolReply("tu_1", "history", "{\"words\":\"kayak\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "history", "{\"words\":\"password reset\"}"));
+    try f.e.script(3, model.textReply("found it"));
+    const r = try f.say("plan the kayak trip");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "Owner: plan the kayak trip") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "refused by the gate") != null);
+    try t.expectEqual(0, f.asked);
+    const log = try f.logText();
+    try t.expect(std.mem.indexOf(u8, log, "\"tool\":\"history\",\"decision\":\"allow\",\"why\":\"default for this tool\",\"arg\":\"kayak\"") != null);
 }
 
 test "web_is_offered_only_with_a_browser_and_never_to_helpers" {

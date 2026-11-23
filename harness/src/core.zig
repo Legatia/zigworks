@@ -25,6 +25,8 @@ const who_mod = @import("who.zig");
 const conversations = @import("conversations.zig");
 const jv = @import("jv.zig");
 const session = @import("session.zig");
+const history_mod = @import("history.zig");
+const summaries_mod = @import("summaries.zig");
 const folders_mod = @import("folders.zig");
 const environments_mod = @import("environments.zig");
 const sandbox = @import("sandbox.zig");
@@ -464,6 +466,10 @@ pub const Core = struct {
     grants: gate.Grants,
     gate: gate.Gate,
     log: log_mod.Log,
+    /// Where runs' `history` reads the log, and the summaries' folder.
+    history_src: history_mod.Source,
+    /// The daily summaries by day, week and month: when a pass is due.
+    summary_job: summaries_mod.Job,
     mem: memory.Store,
     lock: Io.Mutex = .init,
     /// How many helpers run at once, across all runs.
@@ -662,6 +668,8 @@ pub const Core = struct {
         try c.log.setSecrets(c.secret_list);
         // without it private lines keep only sizes
         c.log.useKey(io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "log-key" })) catch {};
+        c.history_src = .{ .log_path = c.paths.log, .summaries_dir = try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "summaries" }), .summaries_on = &c.cfg.memory.summaries, .ctx = c, .shared = sharedConversation };
+        c.summary_job = .{};
         c.mem = try memory.Store.load(gpa, io, c.paths.memory);
         errdefer c.mem.deinit();
         c.mem.secrets = c.secret_list;
@@ -789,7 +797,7 @@ pub const Core = struct {
         c.watcher = null;
         c.stopRuns();
         if (c.worker) |w| w.join();
-        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
@@ -817,6 +825,7 @@ pub const Core = struct {
         for (c.start_edits.items) |e| c.gpa.free(e.text);
         c.start_edits.deinit(c.gpa);
         c.inbox.deinit();
+        c.summary_job.deinit(c.gpa);
         for (c.contexts.items) |x| c.freeContext(x);
         c.contexts.deinit(c.gpa);
         c.chat_client.deinit();
@@ -963,7 +972,7 @@ pub const Core = struct {
         c.queue_mutex.lockUncancelable(c.io);
         var queue_locked = true;
         defer if (queue_locked) c.queue_mutex.unlock(c.io);
-        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire)) return "Busy; send /reload again when nothing is running.";
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire) or c.summary_job.running.load(.acquire)) return "Busy; send /reload again when nothing is running.";
         var fresh: std.heap.ArenaAllocator = .init(c.gpa);
         const saved_cfg = c.cfg;
         const saved_rules = c.rule_list;
@@ -2635,6 +2644,7 @@ pub const Core = struct {
             .grants_path = c.paths.grants,
             .log = &c.log,
             .mem = &c.mem,
+            .history = &c.history_src,
             .lock = &c.lock,
             .env = .{
                 .gpa = c.gpa,
@@ -3697,6 +3707,8 @@ pub const Core = struct {
         c.remindDue(now_s);
         // due triggers are polled, one at a time, on a thread of their own
         if (c.poller_on) c.startPoller(now_s);
+        // the daily summaries, where triggers are polled, on a thread of their own
+        if (c.poller_on) c.summariesDue(now_s);
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
         // posts that did not get through go again when their wait is over
@@ -4879,6 +4891,60 @@ pub const Core = struct {
                 }
             };
         }
+    }
+
+    /// The daily summaries ([memory] summaries): a pass at 03:00 the
+    /// owner's time or the first tick after, and again when a failed
+    /// call's wait is over; on a thread of its own, so chat never waits.
+    fn summariesDue(c: *Core, now_s: i64) void {
+        if (!c.cfg.memory.summaries or c.restarting.load(.acquire)) return;
+        if (!c.summary_job.due(now_s, c.cfg.chat.utc_offset)) return;
+        if (c.summary_job.running.swap(true, .acq_rel)) return;
+        const th = std.Thread.spawn(.{}, summaryThread, .{c}) catch {
+            c.summary_job.running.store(false, .release);
+            return;
+        };
+        th.detach();
+    }
+
+    fn summaryThread(c: *Core) void {
+        defer c.summary_job.running.store(false, .release);
+        c.summarizeNow();
+    }
+
+    /// One pass of the daily summaries, on this thread.
+    fn summarizeNow(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        // what it needs of the settings, under their lock (a /reload
+        // waits for the pass to end)
+        c.settings_mutex.lockUncancelable(c.io);
+        const utc_offset = c.cfg.chat.utc_offset;
+        var client = c.modelClient(if (c.cfg.memory.summary_model.len > 0) c.cfg.memory.summary_model else c.cfg.model.memory_model, 1024) catch |e| {
+            c.settings_mutex.unlock(c.io);
+            c.log.write(.memory, false, .{ .event = "summaries failed", .why = @errorName(e) }) catch {};
+            return;
+        };
+        c.settings_mutex.unlock(c.io);
+        defer client.deinit();
+        c.summary_job.pass(.{
+            .gpa = c.gpa,
+            .io = c.io,
+            .log_path = c.paths.log,
+            .dir = c.history_src.summaries_dir,
+            .now_s = c.now(),
+            .utc_offset = utc_offset,
+            .client = &client,
+            .log = &c.log,
+            .secrets = c.masks.snapshot(arena.allocator()) catch c.secret_list,
+            .private = .{ .ctx = c, .is = conversationIsPrivate },
+            .stop = &c.stop,
+        });
+    }
+
+    fn conversationIsPrivate(ctx: *anyopaque, name: []const u8) bool {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.convPrivate(name);
     }
 
     /// The name (in `buf`) of an event trigger due at `now_s`, not paused.
@@ -6614,6 +6680,12 @@ pub const Core = struct {
         }
     }
 
+    /// `history`'s question: do others read conversation `name`?
+    fn sharedConversation(ctx: ?*anyopaque, name: []const u8) bool {
+        const c: *Core = @ptrCast(@alignCast(ctx.?));
+        return c.isShared(name);
+    }
+
     // ---- commands ----
 
     const help_text =
@@ -6650,6 +6722,7 @@ pub const Core = struct {
         \\/conversation rename OLD NEW, /conversation rm NAME
         \\/conversation add NAME: sent in a group, the agent may post there
         \\/session [N]: the steps behind the last answer here (N runs back)
+        \\/history WORDS: earlier turns with every word, newest first
         \\/apps: the apps, with their links while the app server runs
         \\/app approve NAME: serve an app as its files are now
         \\/app rm NAME: remove an app, its data and its versions
@@ -6805,6 +6878,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/logins")) return c.loginsText(a);
         if (eql(u8, cmd, "/conversations")) return c.conversationsText(a);
         if (eql(u8, cmd, "/session")) return c.sessionText(a, conv, rest);
+        if (eql(u8, cmd, "/history")) return c.historyText(a, conv, rest);
         if (eql(u8, cmd, "/inbox")) return c.inboxCommand(a, conv);
         if (eql(u8, cmd, "/answer")) return c.answerCommand(a, conv, rest);
         if (eql(u8, cmd, "/grants")) return c.grantsText(a);
@@ -6852,6 +6926,21 @@ pub const Core = struct {
         const text = session.tail(c.io, a, c.paths.log, 4 << 20) catch |e| return std.fmt.allocPrint(a, "The log can't be read: {s}", .{@errorName(e)});
         const rid = (try session.lastRunIn(a, text, conv, back)) orelse return "No run here in the log's last 4 MB.";
         return (try session.render(a, text, rid, 3500)) orelse "No run here in the log's last 4 MB.";
+    }
+
+    /// `/history WORDS`: the turns that have every word (or a phrase in
+    /// double quotes), newest first, as the owner's runs here may see
+    /// them, in one message.
+    fn historyText(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        const terms = try history_mod.parseTerms(a, rest);
+        if (terms.len == 0) return "Use /history WORDS: the turns that have every word, newest first; a phrase goes in double quotes.";
+        const scope = c.history_src.scopeOf("owner", conv);
+        const found = history_mod.search(a, c.io, c.paths.log, scope, .{ .terms = terms }) catch |e| switch (e) {
+            error.FileNotFound => history_mod.Found{ .hits = &.{} },
+            else => return std.fmt.allocPrint(a, "The log can't be read: {s}", .{@errorName(e)}),
+        };
+        // the log was masked with the values of its time; these are today's
+        return c.masks.scrubAlloc(a, try history_mod.render(a, c.io, c.paths.log, found, terms, c.cfg.chat.utc_offset, 3500, scope));
     }
 
     /// A line per conversation: its name, where it is, private, last used.
@@ -9948,8 +10037,14 @@ test "an_attachment_outside_the_workspace_or_holding_a_stored_secret_is_refused"
     try t.expectEqual(0, f.rec.count("a leak"));
     try t.expectEqual(0, f.rec.count("the settings"));
     try t.expect(std.mem.indexOf(u8, try logText(&f), "og-key-for-tests") == null);
-    const sends = try sendLines(&f);
-    try t.expect(std.mem.indexOf(u8, sends[sends.len - 1], "\"files\":\"flats.csv\"") != null);
+    // the post arrives a moment before its send line is written
+    var waited: u32 = 0;
+    const last = while (waited < 5000) : (waited += 20) {
+        const sends = try sendLines(&f);
+        if (sends.len > 0 and std.mem.indexOf(u8, sends[sends.len - 1], "\"files\":\"flats.csv\"") != null) break sends[sends.len - 1];
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    } else "";
+    try t.expect(std.mem.indexOf(u8, last, "\"files\":\"flats.csv\"") != null);
 }
 
 test "a_file_in_a_folder_the_run_may_not_read_is_not_posted" {
@@ -10133,6 +10228,139 @@ test "session_shows_the_last_run_here_and_only_labels_for_a_private_one" {
         try t.expect(l.len <= 3500);
         try t.expect(std.mem.indexOf(u8, l, "harness log session ") != null);
     };
+}
+
+test "history_keeps_to_what_the_run_may_see" {
+    var f: Fix = undefined;
+    try f.init("", "", "[digest]\nat = 23:59\nto = family\ndo = Post the flats digest.\n[watch]\nat = 23:59\nto = house-search\ndo = Look for news on the flats.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow send family\n" });
+    _ = try f.core.reload();
+    try addTopic(&f, "house-search", 5012);
+    try addGroup(&f, "family", -100);
+    // a turn in main, one in a topic, a scheduled post where others read
+    try f.e.script(1, model.textReply("Seefeld has two flats."));
+    f.core.chatTurnIn("main", "flats in Seefeld?");
+    try f.e.script(2, model.textReply("Basel flats cost more."));
+    f.core.chatTurnIn("house-search", "flats in Basel?");
+    try f.e.script(3, model.textReply("Digest: the flats of the week."));
+    _ = try f.core.runTask(f.core.tasks[0]);
+    try f.rec.waitIn("family", "Digest: the flats of the week.");
+    const main_rid = (try session.lastRunIn(a, try logText(&f), "main", 1)).?;
+    // the owner's run in main searches every conversation
+    try f.e.script(4, model.toolReply("tu_h", "history", "{\"words\":\"flats\"}"));
+    try f.e.script(5, model.textReply("Found them."));
+    f.core.chatTurnIn("main", "what did we find on flats?");
+    const all = try f.e.request(5);
+    for ([_][]const u8{ "flats in Seefeld?", "flats in Basel?", "Post the flats digest." }) |said| {
+        if (std.mem.indexOf(u8, all, said) == null) std.debug.print("missing {s} in {s}\n", .{ said, all });
+        try t.expect(std.mem.indexOf(u8, all, said) != null);
+    }
+    // a scheduled run searches its own conversation (its to), and sees no other run
+    try f.e.script(6, model.toolReply("tu_w", "history", "{\"words\":\"flats\"}"));
+    try f.e.script(7, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_r\",\"name\":\"history\",\"input\":{{\"words\":\"flats\",\"run\":{d}}}}}],\"stop_reason\":\"tool_use\"}}", .{main_rid}));
+    try f.e.script(8, model.textReply("NOTHING"));
+    _ = try f.core.runTask(f.core.tasks[1]);
+    const own = try f.e.request(7);
+    try t.expect(std.mem.indexOf(u8, own, "flats in Basel?") != null);
+    for ([_][]const u8{ "flats in Seefeld?", "Post the flats digest." }) |said| try t.expect(std.mem.indexOf(u8, own, said) == null);
+    try t.expect(std.mem.indexOf(u8, own, "Only house-search is searched from here.") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(8), try std.fmt.allocPrint(a, "No run {d} in house-search.", .{main_rid})) != null);
+}
+
+test "a_private_conversations_words_are_never_found" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addTopic(&f, "diary", 5014);
+    try f.core.handleTextIn("diary", "/private on");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.workspace, "plans.txt" }), .data = "a garden party at the lake" });
+    try f.e.script(1, model.toolReply("tu_1", "read_file", "{\"path\":\"plans.txt\"}"));
+    try f.e.script(2, model.textReply("Kept between us: the party by the lake."));
+    f.core.chatTurnIn("diary", "my secret plans for the summer");
+    const diary_rid = (try session.lastRunIn(a, try logText(&f), "diary", 1)).?;
+    // from main every conversation is searched: the diary's words are not in the log
+    try f.e.script(3, model.toolReply("tu_h", "history", "{\"words\":\"lake\"}"));
+    try f.e.script(4, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_r\",\"name\":\"history\",\"input\":{{\"words\":\"plans\",\"run\":{d}}}}}],\"stop_reason\":\"tool_use\"}}", .{diary_rid}));
+    try f.e.script(5, model.textReply("Nothing."));
+    f.core.chatTurnIn("main", "what did I plan?");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "No turn has all of: lake.") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), try std.fmt.allocPrint(a, "Run {d} is private: what was said in it is not in the log.", .{diary_rid})) != null);
+    const log = try logText(&f);
+    for ([_][]const u8{ "my secret plans", "garden party", "at the lake", "Kept between us" }) |said| try t.expect(std.mem.indexOf(u8, log, said) == null);
+}
+
+test "the_history_command_finds_old_turns" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "house-search", 5012);
+    try f.e.script(1, model.textReply("Seefeld has two flats."));
+    f.core.chatTurnIn("house-search", "flats in Seefeld?");
+    const rid = (try session.lastRunIn(f.e.arena.allocator(), try logText(&f), "house-search", 1)).?;
+    // the owner's command: every conversation, newest first, in one message
+    try f.core.handleTextIn("main", "/history seefeld FLATS");
+    try f.rec.waitIn("main", "1 turn, newest first (the owner's time):");
+    try t.expectEqual(1, f.rec.countIn("main", try std.fmt.allocPrint(f.e.arena.allocator(), ", house-search, run {d} (chat)\nOwner: flats in Seefeld?\nAgent: Seefeld has two flats.\n", .{rid})));
+    try f.core.handleTextIn("main", "/history \"two flats in\"");
+    try f.rec.waitIn("main", "No turn has all of: two flats in.");
+    try f.core.handleTextIn("main", "/history");
+    try f.rec.waitIn("main", "Use /history WORDS");
+}
+
+/// Waits until no summaries pass is going.
+fn waitSummaries(c: *Core) void {
+    var waited: u32 = 0;
+    while (c.summary_job.running.load(.acquire) and waited < 8000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+}
+
+test "summaries_off_makes_no_calls" {
+    var f: Fix = undefined;
+    try f.init("[memory]\nsummaries = off\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.script(1, model.textReply("Seefeld has two flats."));
+    f.core.chatTurnIn("main", "flats in Seefeld?");
+    // the day after tomorrow, 03:30 the owner's time, where harness runs
+    f.core.fixed_now = (@divFloor(util.nowSeconds(t.io), 86400) + 2) * 86400 + 3 * 3600 + 1800;
+    f.core.poller_on = true;
+    f.core.tick();
+    waitSummaries(f.core);
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().access(t.io, f.core.history_src.summaries_dir, .{}));
+    // on: one call for the day, with the memory model, and its file
+    f.core.cfg.memory.summaries = true;
+    try f.e.script(2, model.textReply("The owner looked for flats in Seefeld."));
+    f.core.tick();
+    waitSummaries(f.core);
+    try t.expectEqual(2, f.e.server.modelRequests());
+    const req = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req, "\"model\":\"claude-haiku\"") != null);
+    try t.expect(std.mem.indexOf(u8, req, "] Owner: flats in Seefeld?\\nAgent: Seefeld has two flats.") != null);
+    var d = try Io.Dir.cwd().openDir(t.io, try std.fs.path.join(a, &.{ f.core.history_src.summaries_dir, "main", "day" }), .{ .iterate = true });
+    defer d.close(t.io);
+    var it = d.iterate();
+    const e = (try it.next(t.io)).?;
+    try t.expectEqualStrings("The owner looked for flats in Seefeld.\n", try d.readFileAlloc(t.io, e.name, a, .unlimited));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"kind\":\"memory\",\"event\":\"summary\",\"conversation\":\"main\",\"period\":\"") != null);
+    // the prompt carries it; with summaries off, not (the file stays)
+    try f.e.script(3, model.textReply("Yes."));
+    f.core.chatTurnIn("main", "and the flats?");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "Earlier in this conversation:") != null);
+    f.core.cfg.memory.summaries = false;
+    try f.e.script(4, model.textReply("Yes."));
+    f.core.chatTurnIn("main", "and now?");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "Earlier in this conversation:") == null);
+    f.core.cfg.memory.summaries = true;
+    // not again that day; and /reload waits while a pass goes
+    f.core.tick();
+    waitSummaries(f.core);
+    try t.expectEqual(4, f.e.server.modelRequests());
+    f.core.summary_job.running.store(true, .release);
+    try t.expectEqualStrings("Busy; send /reload again when nothing is running.", try f.core.reload());
+    f.core.summary_job.running.store(false, .release);
 }
 
 test "a_bad_rules_line_names_its_section_or_environment" {

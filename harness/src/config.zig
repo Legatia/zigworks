@@ -75,6 +75,11 @@ pub const Config = struct {
     pub const Memory = struct {
         auto: bool = true,
         top_size: u32 = 20,
+        /// Summaries by day, week and month (long memory): one small model
+        /// call per active conversation a day.
+        summaries: bool = true,
+        /// Their model; "": `[model] memory_model`.
+        summary_model: []const u8 = "",
     };
     /// Helpers started with `delegate`.
     pub const Agents = struct {
@@ -533,6 +538,8 @@ pub const defaults_ini =
     \\[memory]
     \\auto = on
     \\top_size = 20
+    \\summaries = on                      ; by day, week and month, in the prompt: a small model call per active conversation a day
+    \\; summary_model = claude-haiku       ; their model; default memory_model
     \\
     \\[agents]                            ; helpers started with delegate
     \\parallel = 4                        ; most running at once
@@ -724,6 +731,21 @@ test "config_reads_every_section" {
     try t.expectEqual(5, c.limits.approval_seconds);
     try t.expect(!c.memory.auto);
     try t.expectEqual(4, c.memory.top_size);
+}
+
+test "memory_reads_summaries_and_their_model" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // on, with the memory model, unless config.ini says otherwise
+    const d = try parse(a, "");
+    try t.expect(d.memory.summaries);
+    try t.expectEqualStrings("", d.memory.summary_model);
+    const c = try parse(a, "[memory]\nsummaries = off\nsummary_model = anthropic:claude-haiku-4-5\n");
+    try t.expect(!c.memory.summaries);
+    try t.expectEqualStrings("anthropic:claude-haiku-4-5", c.memory.summary_model);
+    try t.expectError(error.BadConfig, parse(a, "[memory]\nsummaries = sometimes\n"));
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "summaries = on") != null);
 }
 
 test "config_rejects_unknown_section_and_bad_numbers" {

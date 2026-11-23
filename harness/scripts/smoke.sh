@@ -512,6 +512,7 @@ check "a login is removed with its secrets" '"$H" login rm bot >/dev/null && "$H
 check "memory list works offline" '"$H" memory list 2>/dev/null | grep -qF "I prefer short briefs"'
 check "snapshot list works offline" '"$H" snapshot list notes 2>/dev/null | grep -qF "Snapshots of notes:"'
 check "agent list works offline" '"$H" agent list 2>/dev/null | grep -qF "researcher: Research across several sources"'
+check "log search finds an earlier turn, offline" '"$H" log search "disk is FINE" 2>/dev/null | grep -qF "(task disk)" && "$H" log search "disk is FINE" 2>/dev/null | grep -qF "Agent: Disk is fine."'
 
 # servers at a url (the stand-in's): one with a token, one with a sign-in
 printf 'mcp-smoke-token-1\n' >"$S/mcp-token"
