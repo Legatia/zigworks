@@ -118,6 +118,18 @@ pub fn save(io: Io, gpa: Allocator, st: store_mod.Store, secret: []const u8, tk:
 
 /// A server's sign-in while harness runs: shared by its requests and its
 /// stream.
+/// What a renewal came to.
+pub const Renewal = enum {
+    /// A new token is held: renewed, or a sign-in made since taken.
+    renewed,
+    /// The authorization server refused it, or the sign-in was forgotten:
+    /// only a new sign-in mends it.
+    refused,
+    /// Not now: the authorization server was not reached in time, or the
+    /// request was stopped.
+    failed,
+};
+
 pub const Keeper = struct {
     gpa: Allocator,
     io: Io,
@@ -128,12 +140,16 @@ pub const Keeper = struct {
     secret: []const u8,
     masks: ?*masks_mod.List,
     mutex: Io.Mutex = .init,
-    /// Holds `tokens` (replaced whole on a renewal) and the names.
+    /// Holds `tokens`, `stored` and the names (replaced whole on a
+    /// renewal).
     arena_state: std.heap.ArenaAllocator,
     tokens: Tokens,
+    /// The access token the store had when last read or written: a
+    /// different one there is a sign-in made since. (A renewal the store
+    /// could not take is held in memory only, and the store's older one is
+    /// not taken for a newer.)
+    stored: []const u8,
     refused_flag: std.atomic.Value(bool) = .init(false),
-    /// Each token request's limit.
-    request_ms: u32 = 30_000,
 
     /// error.NotSignedIn when nothing is kept under `secret`.
     pub fn open(gpa: Allocator, io: Io, st: store_mod.Store, name: []const u8, secret: []const u8, masks: ?*masks_mod.List) !*Keeper {
@@ -151,6 +167,7 @@ pub const Keeper = struct {
             .masks = masks,
             .arena_state = arena_state,
             .tokens = tokens,
+            .stored = tokens.access_token,
         };
         k.maskNow();
         return k;
@@ -163,17 +180,17 @@ pub const Keeper = struct {
 
     /// The access token to send (a copy in `a`), renewed first when it
     /// expires within a minute (a sign-in made since is taken instead; one
-    /// forgotten since is not renewed); a renewal that fails keeps the old
-    /// one.
-    pub fn bearer(k: *Keeper, a: Allocator) error{OutOfMemory}![]const u8 {
+    /// forgotten since is not renewed). The renewal ends by `ms` or `stop`;
+    /// one that fails keeps the token held.
+    pub fn bearer(k: *Keeper, a: Allocator, stop: ?*const std.atomic.Value(bool), ms: u32) error{OutOfMemory}![]const u8 {
         k.mutex.lockUncancelable(k.io);
         defer k.mutex.unlock(k.io);
         const tk = k.tokens;
-        if (tk.expires_at > 0 and tk.refresh_token.len > 0 and !k.refused() and util.nowSeconds(k.io) >= tk.expires_at - renew_margin_s) {
+        if (tk.expires_at > 0 and tk.refresh_token.len > 0 and !k.refused() and util.nowSeconds(k.io) >= tk.expires_at -| renew_margin_s) {
             switch (k.fromStore()) {
                 .gone => k.markRefused(),
                 .newer => {},
-                .same => k.refresh() catch {},
+                .same => k.refresh(stop, ms) catch |e| if (e == error.Refused) k.markRefused(),
             }
         }
         return a.dupe(u8, k.tokens.access_token);
@@ -188,37 +205,38 @@ pub const Keeper = struct {
     }
 
     /// After a 401 to a request that carried `used`: a sign-in made since
-    /// (the store's), or a renewal. False when there is neither: the
-    /// sign-in was refused.
-    pub fn renew(k: *Keeper, a: Allocator, used: []const u8) bool {
+    /// (the store's), or a renewal ending by `ms` or `stop`.
+    pub fn renew(k: *Keeper, a: Allocator, used: []const u8, stop: ?*const std.atomic.Value(bool), ms: u32) Renewal {
         _ = a;
         k.mutex.lockUncancelable(k.io);
         defer k.mutex.unlock(k.io);
         // renewed by another request meanwhile
-        if (!std.mem.eql(u8, k.tokens.access_token, used)) return true;
+        if (!std.mem.eql(u8, k.tokens.access_token, used)) return .renewed;
         switch (k.fromStore()) {
             // `harness mcp logout NAME` meanwhile: renewing would keep it again
             .gone => {
                 k.markRefused();
-                return false;
+                return .refused;
             },
             // `harness mcp login NAME` from the terminal while harness runs
-            .newer => return true,
+            .newer => return .renewed,
             .same => {},
         }
         if (k.tokens.refresh_token.len == 0) {
             k.markRefused();
-            return false;
+            return .refused;
         }
-        k.refresh() catch {
+        k.refresh(stop, ms) catch |e| {
+            // only the authorization server's own no is a refusal
+            if (e != error.Refused) return .failed;
             k.markRefused();
-            return false;
+            return .refused;
         };
-        return true;
+        return .renewed;
     }
 
     /// Whether the server or its authorization server refused the sign-in
-    /// since it was read.
+    /// since it was read (a renewal or a new sign-in mends it).
     pub fn refused(k: *const Keeper) bool {
         return k.refused_flag.load(.acquire);
     }
@@ -227,12 +245,17 @@ pub const Keeper = struct {
         k.refused_flag.store(true, .release);
     }
 
-    /// The values to mask now.
+    /// The values to mask now (names and values copied: a renewal replaces
+    /// what the keeper holds).
     pub fn secrets(k: *Keeper, a: Allocator) ![]scrub.Secret {
         k.mutex.lockUncancelable(k.io);
         defer k.mutex.unlock(k.io);
         const list = try k.tokens.secrets(a, k.secret);
-        for (list) |*x| x.value = try a.dupe(u8, x.value);
+        const name = try a.dupe(u8, k.secret);
+        for (list) |*x| {
+            x.name = name;
+            x.value = try a.dupe(u8, x.value);
+        }
         return list;
     }
 
@@ -246,7 +269,7 @@ pub const Keeper = struct {
     const Stored = enum {
         /// Nothing kept: signed out.
         gone,
-        /// The sign-in held.
+        /// Nothing new there.
         same,
         /// Another sign-in, now held.
         newer,
@@ -264,30 +287,34 @@ pub const Keeper = struct {
             next.deinit();
             return .gone;
         };
-        if (std.mem.eql(u8, tk.access_token, k.tokens.access_token)) {
+        if (std.mem.eql(u8, tk.access_token, k.stored)) {
             next.deinit();
             return .same;
         }
-        k.swap(&next, tk);
+        k.swap(&next, tk, tk.access_token);
         k.refused_flag.store(false, .release);
         return .newer;
     }
 
-    fn swap(k: *Keeper, next: *std.heap.ArenaAllocator, tk: Tokens) void {
+    /// Holds `tk` (in `next`), with `stored` as the store's token.
+    fn swap(k: *Keeper, next: *std.heap.ArenaAllocator, tk: Tokens, stored: []const u8) void {
         const a = next.allocator();
         const name = a.dupe(u8, k.name) catch k.name;
         const secret = a.dupe(u8, k.secret) catch k.secret;
+        const kept = a.dupe(u8, stored) catch "";
         var old = k.arena_state;
         k.arena_state = next.*;
         k.tokens = tk;
         k.name = name;
         k.secret = secret;
+        k.stored = kept;
         old.deinit();
         k.maskNow();
     }
 
-    /// A refresh_token grant; the new tokens are kept and masked.
-    fn refresh(k: *Keeper) !void {
+    /// A refresh_token grant ending by `ms` or `stop`; the new tokens are
+    /// kept (in the store when it takes them) and masked.
+    fn refresh(k: *Keeper, stop: ?*const std.atomic.Value(bool), ms: u32) !void {
         var tmp: std.heap.ArenaAllocator = .init(k.gpa);
         defer tmp.deinit();
         const tk = k.tokens;
@@ -297,12 +324,12 @@ pub const Keeper = struct {
         if (tk.resource.len > 0) try form.add("resource", tk.resource);
         var next: std.heap.ArenaAllocator = .init(k.gpa);
         errdefer next.deinit();
-        const got = try tokenRequest(k.gpa, k.io, next.allocator(), tk.token_endpoint, &form, tk.client_id, tk.client_secret, tk.auth_method, k.request_ms, null);
+        const got = try tokenRequest(k.gpa, k.io, next.allocator(), tk.token_endpoint, &form, tk.client_id, tk.client_secret, tk.auth_method, ms, stop, null);
         const a = next.allocator();
         const fresh: Tokens = .{
             .access_token = got.access_token,
             .refresh_token = if (got.refresh_token.len > 0) got.refresh_token else try a.dupe(u8, tk.refresh_token),
-            .expires_at = if (got.expires_in > 0) util.nowSeconds(k.io) + got.expires_in else 0,
+            .expires_at = if (got.expires_in > 0) util.nowSeconds(k.io) +| got.expires_in else 0,
             .scope = if (got.scope.len > 0) got.scope else try a.dupe(u8, tk.scope),
             .client_id = try a.dupe(u8, tk.client_id),
             .client_secret = try a.dupe(u8, tk.client_secret),
@@ -312,8 +339,9 @@ pub const Keeper = struct {
             .resource = try a.dupe(u8, tk.resource),
         };
         // kept before it is used: a renewed refresh token may be the only one left
-        save(k.io, k.gpa, k.store, k.secret, fresh) catch {};
-        k.swap(&next, fresh);
+        const saved = if (save(k.io, k.gpa, k.store, k.secret, fresh)) |_| true else |_| false;
+        k.swap(&next, fresh, if (saved) fresh.access_token else k.stored);
+        k.refused_flag.store(false, .release);
     }
 };
 
@@ -491,7 +519,7 @@ const Login = struct {
                 try form.add("code_verifier", v);
                 try form.add("resource", res);
                 var said_buf: []const u8 = "";
-                return tokenRequest(l.gpa, l.io, l.a, ep, &form, id, secret, method, l.o.request_ms, &said_buf) catch |e| {
+                return tokenRequest(l.gpa, l.io, l.a, ep, &form, id, secret, method, l.o.request_ms, l.o.stop, &said_buf) catch |e| {
                     l.said.* = if (said_buf.len > 0) said_buf else std.fmt.allocPrint(l.a, "the code was not exchanged for tokens ({s})", .{@errorName(e)}) catch "the code was not exchanged for tokens";
                     return if (e == error.OutOfMemory) error.OutOfMemory else error.Refused;
                 };
@@ -500,7 +528,7 @@ const Login = struct {
         return .{
             .access_token = back.access_token,
             .refresh_token = back.refresh_token,
-            .expires_at = if (back.expires_in > 0) util.nowSeconds(s.io) + back.expires_in else 0,
+            .expires_at = if (back.expires_in > 0) util.nowSeconds(s.io) +| back.expires_in else 0,
             .scope = if (back.scope.len > 0) back.scope else scope,
             .client_id = client_id,
             .client_secret = client_secret,
@@ -675,7 +703,7 @@ pub const Answer = struct {
 /// A form posted to a token endpoint, with the client proving itself as
 /// `method` says; the answer's strings are in `a`. `said` (optional) gets
 /// why it failed.
-fn tokenRequest(gpa: Allocator, io: Io, a: Allocator, endpoint_url: []const u8, form: *Form, client_id: []const u8, client_secret: []const u8, method: []const u8, ms: u32, said: ?*[]const u8) !Answer {
+fn tokenRequest(gpa: Allocator, io: Io, a: Allocator, endpoint_url: []const u8, form: *Form, client_id: []const u8, client_secret: []const u8, method: []const u8, ms: u32, stop: ?*const std.atomic.Value(bool), said: ?*[]const u8) !Answer {
     var hs: [1]std.http.Header = undefined;
     var n: usize = 0;
     if (std.mem.eql(u8, method, "client_secret_basic")) {
@@ -704,8 +732,11 @@ fn tokenRequest(gpa: Allocator, io: Io, a: Allocator, endpoint_url: []const u8, 
         .content_type = "application/x-www-form-urlencoded",
         .headers = hs[0..n],
         .accept = "application/json",
-        .limits = .{ .idle_ms = ms, .total_ms = ms },
+        // a code or a refresh token is used once: never sent twice
+        .resend = false,
+        .limits = .{ .idle_ms = @max(ms, 1), .total_ms = @max(ms, 1), .stop = stop },
     }) catch |e| {
+        if (stop) |f| if (f.load(.acquire)) return error.Stopped;
         if (said) |p| p.* = std.fmt.allocPrint(a, "the token endpoint could not be reached ({s})", .{@errorName(e)}) catch "";
         return error.Unreachable;
     };
@@ -937,10 +968,10 @@ test "oauth_login_registers_exchanges_and_refreshes" {
     try t.expectEqual(2, ml.count());
     // renewed before it is sent, once
     h.setExpiresIn(3600);
-    const first = try k.bearer(a);
+    const first = try k.bearer(a, null, 5000);
     try t.expect(!std.mem.eql(u8, first, tokens.access_token));
     try t.expectEqual(1, h.refreshes.load(.acquire));
-    try t.expectEqualStrings(first, try k.bearer(a));
+    try t.expectEqualStrings(first, try k.bearer(a, null, 5000));
     try t.expectEqual(1, h.refreshes.load(.acquire));
     // the renewed tokens are kept and masked
     try t.expectEqualStrings(first, (try load(t.io, a, st, "mcp-web")).?.access_token);
@@ -1082,10 +1113,10 @@ test "a_sign_in_forgotten_by_logout_is_not_renewed" {
     // harness mcp logout, while harness runs
     try t.expect(try st.removeLong(t.io, t.allocator, "mcp-web"));
     // about to expire: not renewed (that would keep it again)
-    try t.expectEqualStrings(tokens.access_token, try k.bearer(a));
+    try t.expectEqualStrings(tokens.access_token, try k.bearer(a, null, 5000));
     try t.expectEqual(0, h.refreshes.load(.acquire));
     // refused: not renewed either, and said as refused
-    try t.expect(!k.renew(a, tokens.access_token));
+    try t.expectEqual(Renewal.refused, k.renew(a, tokens.access_token, null, 5000));
     try t.expect(k.refused());
     try t.expectEqual(0, h.refreshes.load(.acquire));
     try t.expectEqual(null, try load(t.io, a, st, "mcp-web"));
@@ -1121,4 +1152,142 @@ test "stopping_a_server_does_not_wait_for_a_renewal" {
     srv.deinit();
     try t.expectEqual(1, h.deleted.load(.acquire));
     try t.expectEqual(before, h.refreshes.load(.acquire));
+}
+
+/// A login to the stand-in's /mcp/signin, kept in a folder store.
+const Signed = struct {
+    st: store_mod.Store,
+    tokens: Tokens,
+    server: []const u8,
+};
+
+fn signIn(e: *model.TestEnv) !Signed {
+    const a = e.arena.allocator();
+    const server = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/mcp/signin", .{e.server.port});
+    var b: fake.Browser = .{ .io = t.io };
+    var said: []const u8 = "";
+    const tokens = login(t.allocator, t.io, a, .{ .name = "web", .url = server, .link = .{ .ctx = &b, .f = fake.Browser.opened } }, &said) catch |err| {
+        std.debug.print("said: {s}\n", .{said});
+        return err;
+    };
+    b.join();
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ e.dir, "secrets" }) };
+    try save(t.io, t.allocator, st, "mcp-web", tokens);
+    return .{ .st = st, .tokens = tokens, .server = server };
+}
+
+test "a_renewal_ends_with_the_call" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const h = &e.server.mcp;
+    h.setExpiresIn(30);
+    const sg = try signIn(&e);
+    var stop: std.atomic.Value(bool) = .init(false);
+    const srv = try mcp.Server.start(t.allocator, t.io, .{ .name = "web", .command = "", .url = sg.server, .login = true, .secrets = &.{}, .money = &.{} }, .{
+        .cwd = "",
+        .path_var = "",
+        .home = "",
+        .secret_values = &.{},
+        .start_timeout_ms = 10000,
+        .auth = .{ .signin = .{ .store = sg.st } },
+    });
+    defer srv.deinit();
+    // the authorization server is slow: the renewal ends when the call's time does
+    h.setTokenDelay(5000);
+    const t0 = nowMs();
+    try t.expectError(error.Timeout, srv.call(a, "echo", "{\"text\":\"x\"}", &stop, 500, 4096));
+    const took = nowMs() - t0;
+    if (took >= 2500) std.debug.print("a call of 500 ms took {d} ms\n", .{took});
+    try t.expect(took < 2500);
+    // and when it is stopped
+    const th = try std.Thread.spawn(.{}, struct {
+        fn later(f: *std.atomic.Value(bool)) void {
+            t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+            f.store(true, .release);
+        }
+    }.later, .{&stop});
+    const t1 = nowMs();
+    try t.expectError(error.Stopped, srv.call(a, "echo", "{\"text\":\"x\"}", &stop, 30000, 4096));
+    th.join();
+    const stopped = nowMs() - t1;
+    if (stopped >= 2500) std.debug.print("a call stopped after 300 ms took {d} ms\n", .{stopped});
+    try t.expect(stopped < 2500);
+    // neither is a refusal
+    try t.expect(!srv.signInRefused());
+}
+
+test "a_renewal_that_could_not_reach_the_server_is_not_a_refusal" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const sg = try signIn(&e);
+    // a token endpoint nobody listens on
+    var away = sg.tokens;
+    away.token_endpoint = "http://127.0.0.1:1/auth/token";
+    try save(t.io, t.allocator, sg.st, "mcp-web", away);
+    const k = try Keeper.open(t.allocator, t.io, sg.st, "web", "mcp-web", null);
+    defer k.destroy();
+    try t.expectEqual(Renewal.failed, k.renew(a, away.access_token, null, 2000));
+    try t.expect(!k.refused());
+    // refused once, then renewed: no longer refused
+    try save(t.io, t.allocator, sg.st, "mcp-web", sg.tokens);
+    const k2 = try Keeper.open(t.allocator, t.io, sg.st, "web", "mcp-web", null);
+    defer k2.destroy();
+    k2.markRefused();
+    try t.expectEqual(Renewal.renewed, k2.renew(a, sg.tokens.access_token, null, 5000));
+    try t.expect(!k2.refused());
+}
+
+test "secret_names_outlive_a_renewal" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const sg = try signIn(&e);
+    const k = try Keeper.open(t.allocator, t.io, sg.st, "web", "mcp-web", null);
+    defer k.destroy();
+    const before = try k.secrets(a);
+    // a renewal replaces what the keeper holds
+    try t.expectEqual(Renewal.renewed, k.renew(a, sg.tokens.access_token, null, 5000));
+    for (before) |x| try t.expectEqualStrings("mcp-web", x.name);
+}
+
+test "a_huge_expiry_is_kept_not_overflowed" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    e.server.mcp.setExpiresIn(std.math.maxInt(i64));
+    const sg = try signIn(&e);
+    try t.expectEqual(std.math.maxInt(i64), sg.tokens.expires_at);
+}
+
+test "a_renewal_kept_only_in_memory_is_not_undone" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const h = &e.server.mcp;
+    // every token expires within the minute renewals come early by
+    h.setExpiresIn(30);
+    const sg = try signIn(&e);
+    const k = try Keeper.open(t.allocator, t.io, sg.st, "web", "mcp-web", null);
+    defer k.destroy();
+    // the store can't be written: renewals are held in memory only
+    var dir = try Io.Dir.cwd().openDir(t.io, sg.st.dir, .{ .iterate = true });
+    defer dir.close(t.io);
+    try dir.setPermissions(t.io, .fromMode(0o500));
+    defer dir.setPermissions(t.io, .fromMode(0o700)) catch {};
+    const first = try k.bearer(a, null, 5000);
+    try t.expect(!std.mem.eql(u8, first, sg.tokens.access_token));
+    // the store's older sign-in is not taken for a newer one: the next
+    // renewal uses the refresh token held (the stand-in ended the old one)
+    const second = try k.bearer(a, null, 5000);
+    try t.expect(!std.mem.eql(u8, second, sg.tokens.access_token));
+    try t.expect(!std.mem.eql(u8, second, first));
+    try t.expectEqual(2, h.refreshes.load(.acquire));
+    try t.expect(!k.refused());
 }

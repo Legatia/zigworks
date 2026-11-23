@@ -97,6 +97,10 @@ pub const Request = struct {
     /// Headers of the answer to keep (any case): their values are in
     /// `Response.kept`, in this order (at most `max_kept`).
     keep: []const []const u8 = &.{},
+    /// Whether the request may be sent again on a new connection when a
+    /// kept one turns out closed after it was written (false: a request
+    /// that must not run twice).
+    resend: bool = true,
     limits: Limits = .{},
 };
 
@@ -264,6 +268,8 @@ pub const Client = struct {
         c.detail = null;
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
+            // a kept connection the server closed (or wrote to) meanwhile is not used
+            if (c.conn) |kept| if (sock.readableNow(kept.s.handle)) c.drop();
             const reused = c.conn != null;
             const conn = c.conn orelse try c.open(req.limits);
             c.conn = conn;
@@ -274,8 +280,10 @@ pub const Client = struct {
                 const timed_out = conn.s.timed_out;
                 c.drop();
                 // A kept connection the server closed meanwhile: once more
-                // on a new one.
-                if (reused and attempt == 0 and !timed_out and e == error.ConnectionClosed) continue;
+                // on a new one, unless the request must not run twice or
+                // the exchange was stopped.
+                const stopped = if (req.limits.stop) |f| f.load(.acquire) else false;
+                if (reused and attempt == 0 and !timed_out and !stopped and req.resend and e == error.ConnectionClosed) continue;
                 return e;
             }
         }

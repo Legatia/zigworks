@@ -147,7 +147,8 @@ pub const Header = struct { name: []const u8, value: []const u8 };
 /// (answers are event streams with a notification and a `ping` first),
 /// `old` (MCP 2025-03-26), `future` (a version harness doesn't speak),
 /// `token` (wants `Authorization: Bearer` with the token; a wrong one is
-/// refused and said back), `nostream` (no GET stream: 405), `signin`
+/// refused and said back), `nostream` (no GET stream: 405), `getless`
+/// (GET answered 404, as by a server with a POST route only), `signin`
 /// (wants a token of the authorization server below; its 401 names its
 /// metadata) and `signin-hidden` (the same, its 401 names nothing); others
 /// 404. The authorization server (issuer `/auth`) serves its protected
@@ -174,6 +175,16 @@ pub const Http = struct {
     refused_gets: std.atomic.Value(u32) = .init(0),
     /// Every request with a session is answered 404.
     end_always: std.atomic.Value(bool) = .init(false),
+    /// GETs answered 404 (`getless`).
+    missed_gets: std.atomic.Value(u32) = .init(0),
+    /// The next POST is read, then its connection ended with no answer.
+    drop_next: std.atomic.Value(bool) = .init(false),
+    /// The next POST is answered, then its connection ended.
+    close_after_next: std.atomic.Value(bool) = .init(false),
+    /// New sessions get ids of 1500 characters.
+    long_sessions: std.atomic.Value(bool) = .init(false),
+    /// The token endpoint answers after this long (ms).
+    token_delay_ms: i64 = 0,
     /// Bumped: every open GET stream ends.
     drop_epoch: std.atomic.Value(u32) = .init(0),
     /// The next POSTs' failure (under `mutex`).
@@ -201,6 +212,8 @@ pub const Http = struct {
     pub const Fail = struct {
         status: u16 = 0,
         count: u32 = 1,
+        /// Only requests of this method ("": any).
+        method: []const u8 = "",
         retry_after: ?u32 = null,
         location: []const u8 = "",
         /// The message says the Authorization the request carried.
@@ -208,7 +221,7 @@ pub const Http = struct {
     };
 
     const Session = struct {
-        id_buf: [32]u8 = undefined,
+        id_buf: [1600]u8 = undefined,
         id_len: usize = 0,
         version: []const u8,
         ended: bool = false,
@@ -256,7 +269,24 @@ pub const Http = struct {
         _ = h.drop_epoch.fetchAdd(1, .acq_rel);
     }
 
-    /// The next `f.count` POSTs answer `f.status`.
+    /// The next POST's connection ends once it is read, with no answer.
+    pub fn dropNext(h: *Http) void {
+        h.drop_next.store(true, .release);
+    }
+
+    /// The next POST's connection ends once it is answered.
+    pub fn closeAfterNext(h: *Http) void {
+        h.close_after_next.store(true, .release);
+    }
+
+    /// The token endpoint answers after `ms`.
+    pub fn setTokenDelay(h: *Http, ms: i64) void {
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        h.token_delay_ms = ms;
+    }
+
+    /// The next `f.count` POSTs (of `f.method`) answer `f.status`.
     pub fn failNext(h: *Http, f: Fail) void {
         h.mutex.lockUncancelable(h.io);
         defer h.mutex.unlock(h.io);
@@ -322,7 +352,7 @@ pub const Http = struct {
         if (std.mem.startsWith(u8, route, "/.well-known/") or std.mem.startsWith(u8, route, "/auth/")) return h.authServer(c, a, req, method, target, route, body);
         if (!std.mem.startsWith(u8, route, "/mcp/")) return json(req, .not_found, "{}");
         const flavor = route["/mcp/".len..];
-        const known = [_][]const u8{ "json", "sse", "old", "future", "token", "nostream", "signin", "signin-hidden" };
+        const known = [_][]const u8{ "json", "sse", "old", "future", "token", "nostream", "getless", "signin", "signin-hidden" };
         for (known) |k| {
             if (std.mem.eql(u8, k, flavor)) break;
         } else return json(req, .not_found, "{\"error\":\"no such server\"}");
@@ -349,7 +379,13 @@ pub const Http = struct {
             }
         }
         return switch (method) {
-            .POST => h.post(c, a, req, flavor, hs, body),
+            .POST => {
+                // read, then ended with no answer
+                if (h.drop_next.swap(false, .acq_rel)) return error.Dropped;
+                try h.post(c, a, req, flavor, hs, body);
+                // answered, then ended
+                if (h.close_after_next.swap(false, .acq_rel)) return error.Closing;
+            },
             .GET => h.stream(c, a, req, flavor, hs),
             .DELETE => h.delete(c, req, hs),
             else => json(req, .method_not_allowed, "{}"),
@@ -364,10 +400,11 @@ pub const Http = struct {
         return issueImpl(h, c, a, req, scope, expires);
     }
 
-    fn takeFail(h: *Http, io: Io) ?Fail {
+    fn takeFail(h: *Http, io: Io, method: []const u8) ?Fail {
         h.mutex.lockUncancelable(io);
         defer h.mutex.unlock(io);
         if (h.fail.status == 0 or h.fail.count == 0) return null;
+        if (h.fail.method.len > 0 and !std.mem.eql(u8, h.fail.method, method)) return null;
         const f = h.fail;
         h.fail.count -= 1;
         if (h.fail.count == 0) h.fail = .{};
@@ -385,7 +422,7 @@ pub const Http = struct {
     }
 
     fn post(h: *Http, c: Ctx, a: std.mem.Allocator, req: *std.http.Server.Request, flavor: []const u8, hs: []const Header, body: []const u8) !void {
-        if (h.takeFail(c.io)) |f| {
+        if (h.takeFail(c.io, jv.str(jv.get(jv.parse(a, body), "method")) orelse "")) |f| {
             const msg = if (f.echo_auth) try std.fmt.allocPrint(a, "forbidden for {s}", .{header(hs, "authorization") orelse ""}) else "scripted failure";
             const out = try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":-32000,\"message\":{f}}}}}", .{std.json.fmt(msg, .{})});
             var extra: [3]std.http.Header = undefined;
@@ -414,6 +451,10 @@ pub const Http = struct {
             c.io.random(&raw);
             const sid = try std.fmt.bufPrint(&s.id_buf, "s-{x}", .{raw});
             s.id_len = sid.len;
+            if (h.long_sessions.load(.acquire)) {
+                @memset(s.id_buf[s.id_len..1500], 'j');
+                s.id_len = 1500;
+            }
             {
                 h.mutex.lockUncancelable(c.io);
                 defer h.mutex.unlock(c.io);
@@ -470,6 +511,8 @@ pub const Http = struct {
                 return answer(req, a, flavor, try reply(a, idv, try textResult(a, "notified", false)), null);
             }
             if (std.mem.eql(u8, name, "echo") and std.mem.eql(u8, text, "auth")) return answer(req, a, flavor, try reply(a, idv, try textResult(a, header(hs, "authorization") orelse "none", false)), null);
+            // an error that says back the Authorization it got
+            if (std.mem.eql(u8, name, "echo") and std.mem.eql(u8, text, "error-auth")) return answer(req, a, flavor, try errorReply(a, idv, -32000, try std.fmt.allocPrint(a, "bad token: {s}", .{header(hs, "authorization") orelse "none"})), null);
             if (std.mem.eql(u8, name, "sleep")) {
                 // by the clock, and ended by the stand-in's stop
                 const ms = jv.int(jv.at(v, &.{ "params", "arguments", "ms" })) orelse 0;
@@ -495,6 +538,10 @@ pub const Http = struct {
         if (std.mem.eql(u8, flavor, "nostream")) {
             _ = h.refused_gets.fetchAdd(1, .acq_rel);
             return json(req, .method_not_allowed, "{}");
+        }
+        if (std.mem.eql(u8, flavor, "getless")) {
+            _ = h.missed_gets.fetchAdd(1, .acq_rel);
+            return json(req, .not_found, "{\"error\":\"Cannot GET /mcp/getless\"}");
         }
         const s = h.find(c.io, hs) orelse return json(req, .not_found, "{\"error\":\"no such session\"}");
         if (std.mem.indexOf(u8, header(hs, "accept") orelse "", "text/event-stream") == null) return json(req, .not_acceptable, "{}");
@@ -612,6 +659,13 @@ fn authServerImpl(h: *Http, c: Ctx, a: std.mem.Allocator, req: *std.http.Server.
         return req.respond("", .{ .status = .found, .extra_headers = &.{.{ .name = "location", .value = location }} });
     }
     if (method == .POST and std.mem.eql(u8, route, "/auth/token")) {
+        const delay = blk: {
+            h.mutex.lockUncancelable(c.io);
+            defer h.mutex.unlock(c.io);
+            break :blk h.token_delay_ms;
+        };
+        const until = Io.Clock.awake.now(c.io).nanoseconds + @as(i96, delay) * std.time.ns_per_ms;
+        while (Io.Clock.awake.now(c.io).nanoseconds < until and !c.stopping.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         const grant = try param(a, body, "grant_type") orelse "";
         const expires = blk: {
             h.mutex.lockUncancelable(c.io);

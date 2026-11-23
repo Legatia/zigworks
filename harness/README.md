@@ -31,7 +31,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 707 unit tests (27 of them
+**State: 0.3.0, tested on macOS by its own tests: 720 unit tests (27 of them
 don't run on macOS: Windows or Linux only, or the macOS sandbox and clones,
 not built yet), among
 them the browser and login tests against headless Chrome and local pages,
@@ -946,7 +946,9 @@ are for a sign-in. A bad line is named with its number at start and in
 Its tools are a program's for the gate, rules, grants, money and the log
 (`mcp github/list_issues *`), and what it answers is masked the same way,
 a token it says back too. A server that ends its session gets a new one
-once and the call is sent again (a call answered 404 did not run). With
+once and the call is sent again (a call answered 404 did not run); a call
+whose connection was lost is said as failed, never sent twice (it may
+have run). With
 subscriptions, its resource updates come on an event stream kept open
 and opened again with backoff; its session is deleted when harness stops
 or reloads. Redirects are not followed. What goes wrong is said with what

@@ -725,7 +725,7 @@ pub const Server = struct {
         if (jv.get(v, "error")) |e| {
             const msg = jv.str(jv.get(e, "message")) orelse "";
             const code = jv.int(jv.get(e, "code")) orelse 0;
-            return .{ .text = cap(arena, try std.fmt.allocPrint(arena, "error {d}: {s}", .{ code, msg }), max_bytes), .is_error = true };
+            return .{ .text = cap(arena, try s.masked(arena, try std.fmt.allocPrint(arena, "error {d}: {s}", .{ code, msg })), max_bytes), .is_error = true };
         }
         const result = jv.get(v, "result") orelse return error.BadResponse;
         var out: std.ArrayList(u8) = .empty;
@@ -778,7 +778,7 @@ pub const Server = struct {
         if (jv.get(v, "error")) |e| {
             const msg = jv.str(jv.get(e, "message")) orelse "";
             const code = jv.int(jv.get(e, "code")) orelse 0;
-            return .{ .text = cap(arena, try std.fmt.allocPrint(arena, "error {d}: {s}", .{ code, msg }), max_bytes), .is_error = true };
+            return .{ .text = cap(arena, try s.masked(arena, try std.fmt.allocPrint(arena, "error {d}: {s}", .{ code, msg })), max_bytes), .is_error = true };
         }
         const result = jv.get(v, "result") orelse return error.BadResponse;
         var out: std.ArrayList(u8) = .empty;
@@ -1396,11 +1396,13 @@ test "bad_mcp_ini_sections_name_their_line" {
         // http to a host that is not this machine
         .{ "[ok]\nurl = http://127.0.0.1:9/mcp\n[a]\nurl = http://mcp.example.com/mcp\n", "mcp.ini line 4 has an error: url = http://mcp.example.com/mcp (url is https, or http only to this machine" },
         // a header harness sets itself
-        .{ "[a]\nurl = https://mcp.example.com/mcp\nheader = X-Toolsets: issues\nheader = Authorization: Bearer x\n", "mcp.ini line 4 has an error: header = Authorization: Bearer x (harness sets this header itself" },
+        .{ "[a]\nurl = https://mcp.example.com/mcp\nheader = X-Toolsets: issues\nheader = Authorization: Bearer sk-live-4417aa\n", "mcp.ini line 4 has an error: header = Authorization: … (harness sets this header itself" },
     }) |c| {
         const why = (try parseProblem(a, "mcp.ini", c[0], parseConfig)) orelse return error.TestUnexpectedResult;
         if (!std.mem.startsWith(u8, why, c[1])) std.debug.print("said: {s}\n", .{why});
         try t.expect(std.mem.startsWith(u8, why, c[1]));
+        // a header's value is never said back (it may be a token)
+        try t.expect(std.mem.indexOf(u8, why, "sk-live-4417aa") == null);
     }
     // the header line says what to use instead
     const auth = (try parseProblem(a, "mcp.ini", "[a]\nurl = https://mcp.example.com/mcp\nheader = Authorization: Bearer x\n", parseConfig)).?;

@@ -36,8 +36,10 @@ const Allocator = std.mem.Allocator;
 pub const versions = [_][]const u8{ "2025-06-18", "2025-03-26" };
 /// The longest answer or event taken.
 pub const max_message = 16 << 20;
-/// The longest session id kept.
-const max_session = 256;
+/// The longest session id kept (a JWT, say).
+const max_session = 2048;
+/// A token renewal's longest time when no call's deadline is nearer.
+const renew_ms = 30_000;
 /// How long the GET stream may bring nothing before it is opened again.
 const stream_idle_ms = 10 * 60 * 1000;
 /// Longest wait after a 429 (s).
@@ -121,9 +123,9 @@ pub const Remote = struct {
     session_len: usize = 0,
     /// One of `versions` once initialized; "" before.
     version: []const u8 = "",
-    /// The GET stream was told the session ended: the next request starts
-    /// one again.
-    session_gone: std.atomic.Value(bool) = .init(false),
+    /// A new session could not be started: the next request starts one
+    /// first (under `post_mutex`).
+    need_init: bool = false,
 
     stream_thread: ?std.Thread = null,
     stream_stop: std.atomic.Value(bool) = .init(false),
@@ -194,8 +196,12 @@ pub const Remote = struct {
             r.side_mutex.lockUncancelable(r.io);
             defer r.side_mutex.unlock(r.io);
             const bearer = r.bearerHeld(a) catch null;
-            var hs: [2]std.http.Header = undefined;
-            const n = sessionHeaders(&hs, st);
+            var hs: [2 + 8]std.http.Header = undefined;
+            var n = sessionHeaders(hs[0..2], st);
+            for (r.headers[0..@min(r.headers.len, 8)]) |h| {
+                hs[n] = h;
+                n += 1;
+            }
             if (r.side.send(.{ .method = .DELETE, .path = r.path, .key = bearer, .headers = hs[0..n], .limits = .{ .idle_ms = 1000, .total_ms = 1000 } })) |resp| {
                 var x = resp;
                 x.deinit();
@@ -270,11 +276,10 @@ pub const Remote = struct {
         if (std.mem.eql(u8, method, "initialize")) {
             r.init_params = try r.arena_state.allocator().dupe(u8, params_json);
             r.setState("", "");
-            r.session_gone.store(false, .release);
             return r.requestLocked(arena, method, params_json, stop, deadline_ns, false);
         }
-        // the stream saw the session end: a new one before this request
-        if (r.session_gone.load(.acquire) and r.hasSession()) {
+        // the last new session could not be started: one first
+        if (r.need_init) {
             try r.restart(arena, stop, deadline_ns);
             return r.requestLocked(arena, method, params_json, stop, deadline_ns, false);
         }
@@ -339,12 +344,25 @@ pub const Remote = struct {
     }
 
     /// The token to send now: the stored one, or the sign-in's (renewed
-    /// first when it is about to expire).
-    fn bearerNow(r: *Remote, a: Allocator) error{OutOfMemory}!?[]const u8 {
+    /// first when it is about to expire, by the deadline or `stop`).
+    fn bearerNow(r: *Remote, a: Allocator, stop: ?*const std.atomic.Value(bool), deadline_ns: i128) error{OutOfMemory}!?[]const u8 {
         return switch (r.auth) {
             .none => null,
             .token => |tk| tk.value,
-            .signin => if (r.keeper) |k| try k.bearer(a) else null,
+            .signin => if (r.keeper) |k| try k.bearer(a, stop, renewLimit(r.io, deadline_ns)) else null,
+        };
+    }
+
+    /// After a 401: renewed (true), refused (false), or the failure said.
+    fn renewed401(r: *Remote, arena: Allocator, k: *oauth.Keeper, used: ?[]const u8, stop: *const std.atomic.Value(bool), deadline_ns: i128) Error!bool {
+        return switch (k.renew(arena, used orelse "", stop, renewLimit(r.io, deadline_ns))) {
+            .renewed => true,
+            .refused => false,
+            .failed => {
+                if (stop.load(.acquire)) return error.Stopped;
+                if (msLeft(r.io, deadline_ns) == null) return error.Timeout;
+                return r.say(error.Unreachable, "{s}'s sign-in could not be renewed: its authorization server did not answer; try again later", .{r.name});
+            },
         };
     }
 
@@ -382,7 +400,7 @@ pub const Remote = struct {
         var limited = false;
         var connect_retry = false;
         while (true) {
-            const bearer = try r.bearerNow(arena);
+            const bearer = try r.bearerNow(arena, stop, deadline_ns);
             const out = r.exchange(arena, &r.post, .POST, body, id, bearer, stop, deadline_ns, initializing) catch |e| {
                 if (e == error.Timeout or e == error.Stopped) r.cancel(id, if (e == error.Timeout) "timed out" else "stopped");
                 return e;
@@ -412,7 +430,7 @@ pub const Remote = struct {
                         // a sign-in: renewed once (or one made since taken)
                         if (!renewed) if (r.keeper) |k| {
                             renewed = true;
-                            if (k.renew(arena, bearer orelse "")) continue;
+                            if (try r.renewed401(arena, k, bearer, stop, deadline_ns)) continue;
                         };
                         return r.refused();
                     },
@@ -433,7 +451,7 @@ pub const Remote = struct {
         var renewed = false;
         var connect_retry = false;
         while (true) {
-            const bearer = try r.bearerNow(arena);
+            const bearer = try r.bearerNow(arena, stop, deadline_ns);
             const out = try r.exchange(arena, &r.post, .POST, json, null, bearer, stop, deadline_ns, false);
             switch (out) {
                 .answer, .accepted => return,
@@ -448,7 +466,7 @@ pub const Remote = struct {
                     401 => {
                         if (!renewed) if (r.keeper) |k| {
                             renewed = true;
-                            if (k.renew(arena, bearer orelse "")) continue;
+                            if (try r.renewed401(arena, k, bearer, stop, deadline_ns)) continue;
                         };
                         return r.refused();
                     },
@@ -459,9 +477,10 @@ pub const Remote = struct {
     }
 
     /// A new session: initialize, initialized, and what was subscribed.
+    /// Until it is done, the next request starts one first.
     fn restart(r: *Remote, arena: Allocator, stop: *const std.atomic.Value(bool), deadline_ns: i128) Error!void {
         r.setState("", "");
-        r.session_gone.store(false, .release);
+        r.need_init = true;
         const raw = try r.requestLocked(arena, "initialize", r.init_params, stop, deadline_ns, false);
         const v = jv.parse(arena, raw);
         if (jv.get(v, "result") == null) return r.say(error.BadAnswer, "{s} ended the session and did not start another", .{r.name});
@@ -476,6 +495,7 @@ pub const Remote = struct {
                 else => return e,
             };
         }
+        r.need_init = false;
     }
 
     /// The session and version `initialize` gave.
@@ -515,6 +535,8 @@ pub const Remote = struct {
 
     /// One HTTP exchange. `want` is the request's id (null: a notification).
     fn exchange(r: *Remote, arena: Allocator, client: *http.Client, method: @FieldType(http.Request, "method"), body: ?[]const u8, want: ?u64, bearer: ?[]const u8, stop: *const std.atomic.Value(bool), deadline_ns: i128, initializing: bool) Error!Outcome {
+        // stopped: not sent at all
+        if (stop.load(.acquire)) return error.Stopped;
         const left = msLeft(r.io, deadline_ns) orelse return error.Timeout;
         var sbuf: [max_session]u8 = undefined;
         var st = r.state(&sbuf);
@@ -534,6 +556,8 @@ pub const Remote = struct {
             .headers = hs[0..n],
             .accept = "application/json, text/event-stream",
             .keep = &.{"mcp-session-id"},
+            // a call the connection lost may have run: never sent twice
+            .resend = false,
             .limits = .{ .idle_ms = left, .total_ms = left, .stop = stop },
         }) catch |e| {
             if (stop.load(.acquire)) return error.Stopped;
@@ -643,6 +667,7 @@ pub const Remote = struct {
             .key = bearer,
             .headers = hs[0..n],
             .accept = "application/json, text/event-stream",
+            .resend = false,
             .limits = .{ .idle_ms = ms, .total_ms = ms, .stop = stop },
         }) catch return;
         resp.deinit();
@@ -707,20 +732,50 @@ pub const Remote = struct {
     fn streamLoop(r: *Remote) void {
         var client = http.Client.init(r.gpa, r.io, r.target);
         defer client.deinit();
+        // the last event id, and the session it is of
         var last_id: std.ArrayList(u8) = .empty;
         defer last_id.deinit(r.gpa);
+        var id_of: std.ArrayList(u8) = .empty;
+        defer id_of.deinit(r.gpa);
+        // 404s in a row for one session (a server with no GET route)
+        var misses: u32 = 0;
+        var missed: std.ArrayList(u8) = .empty;
+        defer missed.deinit(r.gpa);
         var wait_ms: u32 = r.backoff_ms;
         while (!r.stream_stop.load(.acquire)) {
+            var sbuf: [max_session]u8 = undefined;
+            const st = r.state(&sbuf);
+            // given up for this session: until there is another
+            if (misses >= 3 and std.mem.eql(u8, st.session, missed.items)) {
+                r.io.sleep(.fromMilliseconds(100), .awake) catch {};
+                continue;
+            }
+            if (!std.mem.eql(u8, st.session, id_of.items)) {
+                last_id.clearRetainingCapacity();
+                id_of.clearRetainingCapacity();
+                id_of.appendSlice(r.gpa, st.session) catch {};
+            }
             const opened = nowNs(r.io);
-            const how = r.streamOnce(&client, &last_id);
+            const how = r.streamOnce(&client, &last_id, st);
             if (r.stream_stop.load(.acquire)) return;
             switch (how) {
                 // this server keeps no stream
                 .not_offered => return,
                 // a stream that stayed open a while starts the waits afresh
                 .ended => |retry| {
+                    misses = 0;
                     if (nowNs(r.io) - opened > 30 * std.time.ns_per_s) wait_ms = r.backoff_ms;
                     if (retry) |ms| wait_ms = @max(ms, 10);
+                },
+                // not taken for the session's end: the next request's own
+                // 404 starts a new one
+                .not_found => {
+                    if (!std.mem.eql(u8, st.session, missed.items)) {
+                        misses = 0;
+                        missed.clearRetainingCapacity();
+                        missed.appendSlice(r.gpa, st.session) catch {};
+                    }
+                    misses += 1;
                 },
                 .failed => {},
             }
@@ -730,16 +785,14 @@ pub const Remote = struct {
         }
     }
 
-    const StreamEnd = union(enum) { not_offered, failed, ended: ?u32 };
+    const StreamEnd = union(enum) { not_offered, not_found, failed, ended: ?u32 };
 
-    fn streamOnce(r: *Remote, client: *http.Client, last_id: *std.ArrayList(u8)) StreamEnd {
+    fn streamOnce(r: *Remote, client: *http.Client, last_id: *std.ArrayList(u8), st: State) StreamEnd {
         var arena: std.heap.ArenaAllocator = .init(r.gpa);
         defer arena.deinit();
         const a = arena.allocator();
         const stop = &r.stream_stop;
-        const bearer = r.bearerNow(a) catch return .failed;
-        var sbuf: [max_session]u8 = undefined;
-        const st = r.state(&sbuf);
+        const bearer = r.bearerNow(a, stop, nowNs(r.io) + @as(i128, renew_ms) * std.time.ns_per_ms) catch return .failed;
         var hs: [3 + 8]std.http.Header = undefined;
         var n = sessionHeaders(hs[0..2], st);
         if (last_id.items.len > 0) {
@@ -762,13 +815,9 @@ pub const Remote = struct {
         switch (resp.status) {
             200 => {},
             405 => return .not_offered,
-            404 => {
-                // the session ended: the next request starts another
-                if (st.session.len > 0) r.session_gone.store(true, .release);
-                return .failed;
-            },
+            404 => return .not_found,
             401 => {
-                if (r.keeper) |k| _ = k.renew(a, bearer orelse "");
+                if (r.keeper) |k| _ = k.renew(a, bearer orelse "", stop, renew_ms);
                 return .failed;
             },
             else => return .failed,
@@ -834,6 +883,12 @@ fn detail(arena: Allocator, body: []const u8) []const u8 {
     return util.cut(line, 200);
 }
 
+/// How long a renewal may take: up to `renew_ms`, and only until the
+/// deadline.
+fn renewLimit(io: Io, deadline_ns: i128) u32 {
+    return @min(msLeft(io, deadline_ns) orelse 1, renew_ms);
+}
+
 /// Milliseconds until `deadline_ns` (awake clock), at least 1; null once
 /// it has passed.
 fn msLeft(io: Io, deadline_ns: i128) ?u32 {
@@ -871,6 +926,8 @@ pub const Sse = struct {
     retry_ms: ?u32 = null,
     /// The event `next` returned (its data, until the next call).
     out: std.ArrayList(u8) = .empty,
+    /// A line longer than any message is being dropped, to its end.
+    discarding: bool = false,
 
     pub const Event = struct {
         kind: []const u8,
@@ -896,7 +953,21 @@ pub const Sse = struct {
             s.buf.shrinkRetainingCapacity(rest);
             s.pos = 0;
         }
-        try s.buf.appendSlice(s.gpa, bytes);
+        var more = bytes;
+        if (s.discarding) {
+            // the line being dropped ends here, or later
+            const e = std.mem.indexOfAny(u8, more, "\r\n") orelse return;
+            s.discarding = false;
+            s.skip_lf = more[e] == '\r';
+            more = more[e + 1 ..];
+        }
+        try s.buf.appendSlice(s.gpa, more);
+        // a line longer than any message is dropped, not kept (its event too)
+        if (s.buf.items.len > max_message + 1024 and std.mem.indexOfAny(u8, s.buf.items, "\r\n") == null) {
+            s.buf.clearRetainingCapacity();
+            s.discarding = true;
+            s.too_big = true;
+        }
     }
 
     pub fn lastId(s: *const Sse) []const u8 {
@@ -1145,6 +1216,15 @@ test "resource_updates_arrive_over_the_event_stream" {
     try t.expect(std.mem.indexOf(u8, try f.requests(), "\"Last-Event-ID\":\"") != null);
     _ = try f.call(s, "echo", "{\"text\":\"notify:fake://res.txt\"}");
     try ups.waitFor(2);
+    // a new session's stream does not carry the old one's last event id
+    f.e.server.mcp.endSessions();
+    _ = try f.call(s, "echo", "{\"text\":\"new session\"}");
+    try waitCount(&f.e.server.mcp.streams, 3, "streams opened");
+    const log = try f.requests();
+    const last_get = std.mem.lastIndexOf(u8, log, "{\"method\":\"GET\"").?;
+    const line = log[last_get .. std.mem.indexOfScalarPos(u8, log, last_get, '\n') orelse log.len];
+    if (std.mem.indexOf(u8, line, "Last-Event-ID") != null) std.debug.print("{s}\n", .{line});
+    try t.expect(std.mem.indexOf(u8, line, "Last-Event-ID") == null);
     // a server that keeps no stream (405) is not asked again
     const quiet = try f.start("nostream", .{ .updated = .{ .ctx = &ups, .f = Updates.note } });
     defer quiet.deinit();
@@ -1249,10 +1329,13 @@ test "the_session_is_deleted_on_stop" {
     var f: Fx = undefined;
     try f.init();
     defer f.deinit();
-    const one = try f.start("json", .{});
+    const one = try f.start("json", .{ .headers = &.{.{ .name = "X-Team", .value = "tools" }} });
     one.deinit();
     try t.expectEqual(1, f.e.server.mcp.deleted.load(.acquire));
-    try t.expect(std.mem.indexOf(u8, try f.requests(), "\"method\":\"DELETE\"") != null);
+    // with the header lines, as every request
+    const log = try f.requests();
+    const del = std.mem.indexOf(u8, log, "{\"method\":\"DELETE\"").?;
+    try t.expect(std.mem.indexOf(u8, log[del .. std.mem.indexOfScalarPos(u8, log, del, '\n') orelse log.len], "\"X-Team\":\"tools\"") != null);
     // stopped together with programs
     const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, f.a());
     var list: [3]*mcp.Server = undefined;
@@ -1294,4 +1377,125 @@ test "an_event_stream_is_read_whatever_its_line_ends" {
     try t.expectEqualStrings("other|x", got.items[3]);
     try t.expectEqualStrings("7", s.lastId());
     try t.expectEqual(250, s.retry_ms.?);
+}
+
+/// How often `needle` is in `hay`.
+fn countIn(hay: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, at, needle)) |i| {
+        n += 1;
+        at = i + needle.len;
+    }
+    return n;
+}
+
+test "a_stopped_call_is_not_sent_again" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const s = try f.start("json", .{});
+    defer s.deinit();
+    // a kept connection carries the next call
+    try t.expectEqualStrings("kept", (try f.call(s, "echo", "{\"text\":\"kept\"}")).text);
+    const th = try std.Thread.spawn(.{}, stopLater, .{&f.stop});
+    try t.expectError(error.Stopped, s.call(f.a(), "sleep", "{\"ms\":2500}", &f.stop, 30000, 4096));
+    th.join();
+    // what reached the server meanwhile is in the stand-in's record
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    try t.expectEqual(1, countIn(try f.requests(), "\\\"name\\\":\\\"sleep\\\""));
+}
+
+test "a_call_is_never_sent_twice_on_a_new_connection" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const s = try f.start("json", .{});
+    defer s.deinit();
+    _ = try f.call(s, "echo", "{\"text\":\"kept\"}");
+    // read, then the connection ended with no answer: it may have run
+    f.e.server.mcp.dropNext();
+    const r = try f.call(s, "echo", "{\"text\":\"once\"}");
+    try t.expect(r.is_error);
+    try t.expectEqualStrings("web ended the connection before its answer", r.text);
+    try t.expectEqual(1, countIn(try f.requests(), "\\\"text\\\":\\\"once\\\""));
+    // a connection the server ended while it was kept is not used again
+    f.e.server.mcp.closeAfterNext();
+    try t.expectEqualStrings("answered", (try f.call(s, "echo", "{\"text\":\"answered\"}")).text);
+    t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    try t.expectEqualStrings("next", (try f.call(s, "echo", "{\"text\":\"next\"}")).text);
+}
+
+test "a_session_that_could_not_start_again_is_started_at_the_next_call" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const s = try f.start("json", .{});
+    defer s.deinit();
+    _ = try f.call(s, "echo", "{\"text\":\"one\"}");
+    // the session ends, and the server can't start one just then
+    f.e.server.mcp.endSessions();
+    f.e.server.mcp.failNext(.{ .status = 503, .method = "initialize" });
+    const r = try f.call(s, "echo", "{\"text\":\"two\"}");
+    try t.expect(r.is_error);
+    try t.expectEqualStrings("web had an upstream error (503): scripted failure", r.text);
+    // the next call starts one first
+    try t.expectEqualStrings("three", (try f.call(s, "echo", "{\"text\":\"three\"}")).text);
+    try t.expectEqual(2, f.e.server.mcp.initializes.load(.acquire));
+}
+
+test "a_server_without_a_get_route_is_not_restarted_per_call" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    var ups: Updates = .{};
+    // it takes subscriptions, but answers a GET 404 (a POST route only)
+    const s = try f.start("getless", .{ .updated = .{ .ctx = &ups, .f = Updates.note } });
+    defer s.deinit();
+    try waitCount(&f.e.server.mcp.missed_gets, 3, "GETs answered 404");
+    for (0..3) |_| _ = try f.call(s, "echo", "{\"text\":\"x\"}");
+    t.io.sleep(.fromMilliseconds(1000), .awake) catch {};
+    // its session lives on, and the stream is given up for it
+    try t.expectEqual(1, f.e.server.mcp.initializes.load(.acquire));
+    try t.expectEqual(3, f.e.server.mcp.missed_gets.load(.acquire));
+}
+
+test "a_long_session_id_is_kept" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    // a JWT, say
+    f.e.server.mcp.long_sessions.store(true, .release);
+    const s = try f.start("json", .{});
+    defer s.deinit();
+    try t.expectEqualStrings("long", (try f.call(s, "echo", "{\"text\":\"long\"}")).text);
+}
+
+test "an_error_the_server_says_is_masked" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const s = try f.start("token", .{ .auth = .{ .token = .{ .name = "web-token", .value = "mcp-test-token-1" } } });
+    defer s.deinit();
+    const r = try f.call(s, "echo", "{\"text\":\"error-auth\"}");
+    try t.expect(r.is_error);
+    try t.expectEqualStrings("error -32000: bad token: Bearer [secret:web-token]", r.text);
+}
+
+test "an_endless_line_is_dropped_not_kept" {
+    var s: Sse = .{ .gpa = t.allocator };
+    defer s.deinit();
+    const chunk: [64 * 1024]u8 = @splat('x');
+    try s.push("data: ");
+    var pushed: usize = 0;
+    while (pushed < max_message + 2 * chunk.len) : (pushed += chunk.len) {
+        try s.push(&chunk);
+        try t.expectEqual(null, s.next());
+        // never much more than one message is held
+        try t.expect(s.buf.items.len <= max_message + 2 * chunk.len);
+    }
+    // the line ends; the next event is read as usual
+    try s.push("\n\ndata: {\"ok\":1}\n\n");
+    const ev = s.next() orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("{\"ok\":1}", ev.data);
 }

@@ -169,6 +169,12 @@ pub fn closeHandle(h: Handle) void {
     sys.close(h);
 }
 
+/// Whether a connection has something to read right now (data, or its
+/// end): a kept connection that does was closed or written to meanwhile.
+pub fn readableNow(h: Handle) bool {
+    return sys.poll(h, .in, 0) catch true;
+}
+
 /// Stops both directions of a connection: whoever waits on it wakes up.
 pub fn shutdown(h: Handle) void {
     sys.shutdown(h);

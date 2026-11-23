@@ -6727,7 +6727,13 @@ pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, co
     // what the parser says of that line (the lines up to it are fine)
     _ = scratch.reset(.retain_capacity);
     const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e) orelse folders_mod.reason(e) orelse environments_mod.reason(e) orelse config.reason(e);
-    return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
+    var shown = std.mem.trim(u8, line, " \t\r");
+    // a header's value is never said back: it may be a token
+    if (std.mem.startsWith(u8, shown, "header")) if (std.mem.indexOfScalar(u8, shown, '=')) |eq| if (std.mem.trim(u8, shown["header".len..eq], " \t").len == 0) {
+        const colon = std.mem.indexOfScalarPos(u8, shown, eq, ':') orelse eq;
+        shown = try std.fmt.allocPrint(a, "{s} …", .{shown[0 .. colon + 1]});
+    };
+    return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(shown, 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
 }
 
 /// The first line of `text` that does not read: the one after the longest
