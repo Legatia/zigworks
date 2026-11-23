@@ -3504,6 +3504,7 @@ pub const Core = struct {
             .run = if (q.label.len > 0) q.label else null,
             .conversation = conv,
             .waiter = "run",
+            .app = if (q.app.len > 0) q.app else null,
             .title = firstLine(text),
             .body = text,
             .choices = choices.items,
@@ -3678,6 +3679,12 @@ pub const Core = struct {
             const it = c.inbox.find(id) orelse return false;
             if (it.status != .open) return false;
             parts = inbox_mod.messageParts(a, it) catch return false;
+            // the app that shows it: its link, with the item as its view
+            if (it.app) |app_name| if (parts.len > 0) {
+                const with = a.dupe([]const u8, parts) catch return false;
+                with[with.len - 1] = std.fmt.allocPrint(a, "{s}\nIn the {s} app: {{app:{s}/item-{d}}}", .{ parts[parts.len - 1], app_name, app_name, it.id }) catch return false;
+                parts = with;
+            };
             const list = a.alloc([2][]const u8, it.choices.len) catch return false;
             for (it.choices, list) |choice, *b| {
                 var data: [64]u8 = undefined;
@@ -22106,4 +22113,27 @@ test "the_app_commands_fork_list_versions_and_revert" {
     const lt = try logText(&f);
     for ([_][]const u8{ "\"event\":\"forked\",\"name\":\"my-log\",\"from\":\"log\"", "\"event\":\"reverted\",\"name\":\"my-log\",\"version\":4,\"to\":2", "\"event\":\"removed\",\"name\":\"my-log\"" }) |want| try expectHas(lt, want);
     _ = first;
+}
+
+test "an_item_with_an_app_carries_its_link" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try installApp(&f, "replies", "[app]\nname = replies\nreads = inbox\n", &.{.{ "index.html", "x" }});
+    _ = try f.core.startApps(a);
+    const s = f.core.app_server.?;
+    try f.e.script(1, model.toolReply("tu_1", "ask_owner", "{\"question\":\"Send this reply?\",\"draft\":\"Dear Anna, yes.\",\"app\":\"replies\"}"));
+    try f.e.script(2, model.textReply("Sent."));
+    try f.core.startWorker();
+    try f.core.handleText("answer anna");
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "In the replies app: http://127.0.0.1:{d}/s/{s}/replies?view=item-1", .{ s.port, &s.shell_token }));
+    // the item names its app; the app reads it, with its draft
+    const open = appCall(&f, "replies", .GET, "inbox", "state=open", "").body;
+    try expectHas(open, "\"app\":\"replies\"");
+    try expectHas(open, "\"draft\":\"Dear Anna, yes.\"");
+    // and the bar answers it
+    try expectHas(barCall(&f, .POST, "answer", "{\"id\":1,\"key\":\"use\"}").body, "taken");
+    try f.rec.waitFor("Sent.");
+    try t.expect(std.mem.indexOf(u8, try inboxFile(&f), &s.shell_token) == null);
 }

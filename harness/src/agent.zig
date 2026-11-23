@@ -70,6 +70,8 @@ pub const Question = struct {
     /// member's asker keeps them to make the call on the owner's yes).
     tool: ?gate.Tool = null,
     arg: []const u8 = "",
+    /// The app that shows this item (`ask_owner` with `app`); "": none.
+    app: []const u8 = "",
 
     pub const Kind = enum { approval, question, draft };
 };
@@ -1021,7 +1023,7 @@ const ask_owner_def: model.ToolDef = .{
     .name = "ask_owner",
     .description = "Ask the owner a question, or show them a draft to review, and wait for the answer. With choices the owner picks one; with text: true they may also answer in words; without choices they answer in words. With a draft they use it, drop it, or reply with their own version.",
     .schema_json =
-    \\{"type":"object","properties":{"question":{"type":"string"},"choices":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"up to 4 answers to pick from, 1 to 64 bytes each"},"text":{"type":"boolean","description":"the owner may also answer in words"},"draft":{"type":"string","description":"a draft for the owner to use, drop or replace (then no choices)"}},"required":["question"]}
+    \\{"type":"object","properties":{"question":{"type":"string"},"choices":{"type":"array","maxItems":4,"items":{"type":"string"},"description":"up to 4 answers to pick from, 1 to 64 bytes each"},"text":{"type":"boolean","description":"the owner may also answer in words"},"draft":{"type":"string","description":"a draft for the owner to use, drop or replace (then no choices)"},"app":{"type":"string","description":"an app of the owner's that shows this item (it reads the inbox): its link goes with the question"}},"required":["question"]}
     ,
 };
 const skill_defs = [_]model.ToolDef{
@@ -2592,6 +2594,10 @@ fn askOwnerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Ou
         if (label.len == 0 or label.len > max_choice_bytes) return .{ .text = "refused: a choice has 1 to 64 bytes", .is_error = true };
         ch.* = label;
     }
+    // an app that shows the item: its name as apps are named
+    const app = jv.str(jv.get(v, "app")) orelse "";
+    if (app.len > 32) return .{ .text = "refused: app is an app's name", .is_error = true };
+    for (app) |ch| if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-')) return .{ .text = "refused: app is an app's name (a-z, 0-9 and -)", .is_error = true };
     // named like an approval when a definition other than main asks
     const tag = try askerTag(r, a);
     const size = tag.len + question.len + if (draft) |d| d.len else 0;
@@ -2613,6 +2619,7 @@ fn askOwnerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Ou
             .label = r.label,
             .private = r.isPrivate(),
             .stop = r.env.stop,
+            .app = app,
         });
         const eql = std.mem.eql;
         break :out switch (got.answer) {
@@ -7006,4 +7013,131 @@ test "a_helpers_changes_count_for_its_run" {
     try t.expectEqual(1, u.folders.len);
     try t.expectEqual(1, u.folders[0].undone.len);
     try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "ws/notes/h.md", .{}));
+}
+
+test "app_save_is_offered_only_in_runs_the_owner_started_from_a_conversation" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    var set = try defsWith(&f, &.{});
+    defer set.deinit();
+    ownerRunWith(&f, &set);
+    // no desk (a harness without apps): neither tool
+    try t.expect(!f.run.allows(.app_save) and !f.run.allows(.app_draft));
+    var desk: FakeAppDesk = .{};
+    f.run.adesk = desk.desk();
+    const names = try toolNames(&f.run, a);
+    try t.expect(std.mem.indexOf(u8, names, "app_draft,") != null and std.mem.indexOf(u8, names, "app_save") != null);
+    var no_conv = f.run;
+    no_conv.outbox = null;
+    try t.expect(!no_conv.allows(.app_save) and !no_conv.allows(.app_draft));
+    // not in a run a schedule, a trigger, a workflow or an app started
+    for ([_][]const u8{ "schedule:x", "trigger:mail", "workflow:w/s", "app:notes" }) |by| {
+        var other = f.run;
+        other.who.by = by;
+        try t.expect(!other.allows(.app_save) and !other.allows(.app_draft));
+    }
+    var helper = f.run;
+    helper.helper = true;
+    try t.expect(!helper.allows(.app_save) and !helper.allows(.app_draft));
+}
+
+/// An app desk that takes every folder and notes what it was asked.
+const FakeAppDesk = struct {
+    staged: u32 = 0,
+    installed: u32 = 0,
+    dropped: u32 = 0,
+    item: u64 = 0,
+
+    fn desk(d: *FakeAppDesk) AppDesk {
+        return .{ .ctx = d, .draft = draft, .stage = stage, .install = install, .drop = drop };
+    }
+
+    fn draft(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) ?[]const u8 {
+        return null;
+    }
+
+    fn stage(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, from: []const u8, asked_by: []const u8) AppStaged {
+        const d: *FakeAppDesk = @ptrCast(@alignCast(ctx));
+        d.staged += 1;
+        if (std.mem.eql(u8, name, "bad")) return .{ .why = "app-drafts/bad: it has no index.html" };
+        return .{ .id = "00000000000000aa", .version = 2, .detail = std.fmt.allocPrint(a, "{s} v2 (was v1), asked by {s}\nfrom {s}\nEvery file in full: {{app-review:00000000000000aa}}", .{ name, asked_by, from }) catch "", .inline_in = &.{"index.html"} };
+    }
+
+    fn install(ctx: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, saved: Saved) ?[]const u8 {
+        const d: *FakeAppDesk = @ptrCast(@alignCast(ctx));
+        d.installed += 1;
+        d.item = saved.item;
+        return null;
+    }
+
+    fn drop(ctx: *anyopaque, _: std.mem.Allocator, _: []const u8) void {
+        const d: *FakeAppDesk = @ptrCast(@alignCast(ctx));
+        d.dropped += 1;
+    }
+};
+
+test "app_save_asked_every_time" {
+    var f: Fix = undefined;
+    try f.init("allow app_save *\n");
+    defer f.deinit();
+    var desk: FakeAppDesk = .{};
+    f.run.adesk = desk.desk();
+    f.run.outbox = NullOutbox.outbox();
+    f.run.who.by = "owner";
+    // an allow rule lifts nothing and "24 h" is not offered: asked each time
+    f.answer = .day;
+    try f.e.script(1, model.toolReply("tu_1", "app_save", "{\"name\":\"notes\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "app_save", "{\"name\":\"notes\",\"from\":\"work/notes\"}"));
+    try f.e.script(3, model.toolReply("tu_3", "app_save", "{\"name\":\"bad\"}"));
+    try f.e.script(4, model.textReply("saved"));
+    var r = try f.say("make the notes app");
+    freeResult(&f.run, r);
+    try t.expectEqual(2, f.asked);
+    try t.expect(!f.last_allow_day);
+    try t.expectEqual(0, f.grants.items.items.len);
+    try t.expect(std.mem.startsWith(u8, f.last_what, "app_save: notes, notes v2 (was v1), asked by main\nfrom work/notes\nEvery file in full: {app-review:00000000000000aa}"));
+    try t.expectEqual(2, desk.installed);
+    const req4 = try f.e.request(4);
+    try t.expect(std.mem.indexOf(u8, req4, "saved app notes as v2; it is served now. Write {app:notes} in a message to the owner for its link. Scripts or on...= handlers written into index.html never run in an app: move them to a .js file.") != null);
+    // a folder that doesn't check goes back unasked
+    try t.expect(std.mem.indexOf(u8, req4, "not saved: app-drafts/bad: it has no index.html") != null);
+    // denied: the copy is dropped, nothing installed
+    f.answer = .deny;
+    try f.e.script(5, model.toolReply("tu_5", "app_save", "{\"name\":\"notes\"}"));
+    try f.e.script(6, model.textReply("not saved"));
+    r = try f.say("again");
+    freeResult(&f.run, r);
+    try t.expectEqual(3, f.asked);
+    try t.expectEqual(2, desk.installed);
+    try t.expectEqual(1, desk.dropped);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(6), "refused by the gate") != null);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"tool\":\"app_save\"") != null);
+}
+
+test "an_apps_acts_and_runs_move_no_money" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    // an app's own act: never, whatever [money] apps says
+    f.run.who = .{ .by = "app:shop", .agent = "" };
+    f.run.money = .{ .max_per_call = 10, .apps = true };
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"one\",\"amount\":1}"));
+    try f.e.script(2, model.textReply("refused"));
+    var r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: an app's acts move no money") != null);
+    // a run an app started: not until the owner switches it on
+    f.run.who = .{ .by = "app:shop", .agent = "main" };
+    f.run.money.apps = false;
+    try f.e.script(3, model.toolReply("tu_3", "fake__echo", "{\"text\":\"two\",\"amount\":1}"));
+    try f.e.script(4, model.textReply("refused"));
+    r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "money is not moved in runs an app starts ([money] apps = off)") != null);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
+    try t.expectEqual(0, f.asked);
 }
