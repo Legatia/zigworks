@@ -43,10 +43,10 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 971 unit tests (20 of them
+**State: 0.3.0, tested on macOS by its own tests: 999 unit tests (20 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 101 checks that drives the real binary against
+and an end-to-end script of 103 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram (voice
 notes and their files too), a transcription service, feeds, search, two
 MCP servers run as programs, and MCP servers at a url with a token or a
@@ -262,6 +262,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `apps/` | apps shown in your browser, a folder each with `app.ini` (see Apps); what was approved of each is in `state/apps/` |
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
+| `state/people/` | the people you deal with, a file each (`NAME.txt`, see People); what of them was said, in `state/people-told` |
 | `state/summaries/` | each conversation's summaries (see Long memory): `CONV/day/YYYY-MM-DD.md` (kept 60 days), `CONV/week/YYYY-Www.md` (ISO weeks, kept 400 days), `CONV/month/YYYY-MM.md` (kept); `PERIOD.given-up` where a call failed all day |
 | `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), speech's calls waiting for you (`room-asks`), what quiet hours hold (`quiet`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home and, on macOS, its temp; a remote's key), `workflows/NAME/` (each workflow's instances, `N/`, its starts waiting in line, earlier files in `versions/`, a removed file as `removed.wf`), `workflows/day.json` (today's agent steps) |
 
@@ -1717,6 +1718,91 @@ Not built: embeddings or a vector index, and an index of the log: a
 search reads the log from its end (all of a 50 MB log in about 0.1 s here,
 0.6 s in a debug build).
 
+## People
+
+A small file for each person you deal with, in `state/people/`
+(`NAME.txt`, a fact a line; edit them as you like, harness keeps the
+lines it doesn't read):
+
+```
+name = Ola Kowalska
+called = Ola
+called = my sister
+relation = sister
+birthday = 1989-11-28
+preference = likes Polish poetry
+preference = allergic to nuts
+email = ola@example.com
+phone = +48 600 100 200
+in touch = 2026-08-02
+keep in touch = 3 months
+```
+
+The facts: `name`, `called` (what you call them, several), `relation`,
+`birthday` and `anniversary` (`YYYY-MM-DD`, or `MM-DD` without the
+year), `date` (a label and a date: `date = name day 06-24`),
+`preference`, `note`, `email`, `phone`, `in touch` (the last day you
+mentioned being in touch), `keep in touch` (`3 months`, `2 weeks`, `a
+year`), `added`.
+
+**Where they come from.**
+- What you say in your own conversations: the memory writer (Memory,
+  above) notes people's facts too, in their files instead of memory
+  items, and you get one line: "Noted about Ola: birthday 28 November.
+  (/person Ola)". Saying you called, met or wrote to someone sets `in
+  touch`, without a line.
+- Your calendar: when a calendar server's `cal_event` or `cal_agenda`
+  (calmcp's reads, on any server name) answers in one of your own
+  conversations, attendees who are new are added with their email, and
+  you get one line. Not you (an attendee marked `self`), not someone
+  with an email alone, not events of more than 10 people.
+- A contacts file: `harness people import FILE.vcf` (vCard 3 or 4, as
+  Apple Contacts, Google Contacts and Outlook export them; `FN`, `N`,
+  `NICKNAME`, `BDAY`, `ANNIVERSARY`, `EMAIL`, `TEL`). A card is someone
+  known with one of its emails, its whole name, or (someone known by a
+  first name alone) its first name; else someone new. What is known
+  stays; a card adds what is missing. Nothing reads your mail or phone.
+
+**Who sees them.** The `people` tool (find, show, note) is offered only
+in runs you start in a conversation only you read (main, the terminal,
+your topics). Household members, speech in the house, schedules,
+triggers, workflows and helpers never get it, and nothing of a group, a
+member's chat or speech is read for it. In a private conversation the
+tool reads but notes nothing, and neither the memory writer nor the
+calendar adds anyone. `deny people note*` in `rules` stops notes;
+`deny people *` the tool.
+
+**Birthdays and keeping in touch.** Once a day, from 09:00 your time
+(where `harness run` or `harness chat` runs):
+
+- a week before a birthday or an anniversary, one line; with a gift idea
+  when one of the person's preferences says what they like (`likes …`,
+  `loves …`, `fan of …`): harness searches the web for that preference
+  alone (never the name, an allergy or anything else), and the memory
+  model picks one idea from the results, told the preferences but not
+  who it is for. Nothing is bought.
+- on the day, a reminder, with their phone or email;
+- with `keep in touch`, a line once that long has passed since you were
+  last in touch (or since you asked), and again after each further
+  stretch.
+
+At most one such post a day: the day's own birthdays and anniversaries
+first, then the nearest week line, then the longest wait; the rest come
+on the following days (a week line not said by the day before is left
+for the day's reminder). They go to main as `schedule:people`, so quiet
+hours hold them for the digest. What was said is kept in
+`state/people-told`.
+
+```
+09:00
+Butler:  Ola's birthday is in a week, on Saturday 28 November (turns 37).
+         Gift idea: Szymborska's "Map: Collected and Last Poems",
+         https://…
+```
+
+Commands: `/people`, `/person NAME`; `harness people list | show NAME |
+import FILE.vcf` (with `harness run` stopped, as `harness memory`).
+
 ## Briefs
 
 ```ini
@@ -2181,7 +2267,7 @@ memory notices held at night.
 [LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/undo [RUN]`, `/envs`, `/env
 check|rm NAME`, `/quiet [on|off|HH:MM-HH:MM]`, `/dryrun on|off`,
 `/reload`, `/conversations`, `/conversation new|rename|rm|add`,
-`/session [N]`, `/history WORDS`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
+`/session [N]`, `/history WORDS`, `/people`, `/person NAME`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
 `/agents`, `/agent [NAME]`, `/agent show|rm NAME`, `/ask NAME text`,
 `/triggers`, `/trigger NAME`, `/trigger add|rm|pause|resume|run|test`,
 `/apps`, `/app approve|rm NAME`, `/workflows`, `/workflow NAME|NAME#N`,
@@ -2193,7 +2279,7 @@ act on the conversation they are sent in; `/stop`, `/dryrun` and
 
 CLI: `init [--butler]`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `trigger list|test|run`, `workflow list|check|start|stop`,
-`memory [list|pin|unpin|forget ID]`,
+`memory [list|pin|unpin|forget ID]`, `people list|show|import`,
 `snapshot list|take|changes|restore`, `undo RUN`, `env list|check|rm|key`,
 `agent list|show|rm`, `mcp list|login|logout`, `log verify|tail|runs|session|search`, `inbox [--json]`,
 `app list|approve|rm`,

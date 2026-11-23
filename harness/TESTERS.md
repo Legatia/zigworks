@@ -109,6 +109,15 @@ notes):
 - **Day 6.** Add someone of your household: `/member add anna` gives a code,
   and they send `/join CODE` to the bot from their own Telegram. When they
   ask it to lock the front door, you get the one-tap question.
+- **Day 7.** Tell it about someone: "my sister Ola's birthday is on 28
+  November, she loves Polish poetry". Half an hour after you stop
+  writing you get one line, "Noted about Ola: …"; `/person Ola` shows
+  what it keeps, `/people` everyone. For your address book: export it as
+  a vCard file, stop `harness run`, `harness people import
+  contacts.vcf`, start it again. A week before a birthday you get one
+  line with a gift idea (nothing is bought); on the day, a reminder. Say
+  "keep in touch with Marek every month" to get a line when a month
+  passes without you mentioning him.
 - **Any day.** `/session` shows the steps behind the last answer; `/quiet`
   what quiet hours hold; `/workflows` the routines that are on.
 
@@ -125,6 +134,10 @@ Tell us about anything like this, with the time it happened:
 - A routine that didn't start, started twice, or said the wrong device.
 - A reply that took more than a few seconds.
 - Anything at all about locks, the garage, the alarm or the water valve.
+- Someone noted wrongly or twice, or from something a family member or
+  the house's speaker heard (only your own chats with the bot count).
+- A birthday line on the wrong day, more than one such line a day, or
+  one during quiet hours.
 
 ## Sending a report
 
@@ -161,6 +174,9 @@ on what you did, what happened, and what you expected.
   unlock the car, and nothing is plugged into it.
 - **Only you approve.** Your family can ask it things; a lock, the garage, a
   valve or money becomes your one-tap question.
+- **The people you know stay yours.** Your family, the house's speakers
+  and family groups never see the people harness keeps for you, and
+  nothing they say is noted about anyone.
 - **Everything is written down.** Every action is a line in a log on your
   computer (`harness log runs` lists them), and your tokens stay in your
   system's key store: never in a chat, a log or a report.
