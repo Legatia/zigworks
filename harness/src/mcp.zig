@@ -717,9 +717,10 @@ pub const Server = struct {
         try params.appendSlice(arena, try std.json.Stringify.valueAlloc(arena, args, .{}));
         try params.appendSlice(arena, "}");
 
-        s.call_mutex.lockUncancelable(s.io);
-        defer s.call_mutex.unlock(s.io);
+        // the time counts from now, a wait for another call included
         const deadline = nowNs(s.io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
+        try s.lockCall(stop, deadline);
+        defer s.call_mutex.unlock(s.io);
         const raw = s.request(arena, "tools/call", params.items, stop, deadline) catch |e| return s.said(arena, e, max_bytes);
         const v = jv.parse(arena, raw) orelse return error.BadResponse;
         if (jv.get(v, "error")) |e| {
@@ -748,6 +749,17 @@ pub const Server = struct {
         return .{ .text = cap(arena, try s.masked(arena, out.items), max_bytes), .is_error = jv.boolean(jv.get(result, "isError")) orelse false };
     }
 
+    /// Takes `call_mutex` by `deadline`: a call waiting for another to end
+    /// gets no more time than its own (error.Timeout), and a stop ends the
+    /// wait at once (error.Stopped).
+    fn lockCall(s: *Server, stop: *std.atomic.Value(bool), deadline: i128) !void {
+        while (!s.call_mutex.tryLock()) {
+            if (stop.load(.acquire)) return error.Stopped;
+            if (nowNs(s.io) >= deadline) return error.Timeout;
+            s.io.sleep(.fromMilliseconds(10), .awake) catch {};
+        }
+    }
+
     /// A failure a server at a url said, as the call's error; other
     /// errors as they are.
     fn said(s: *Server, arena: std.mem.Allocator, e: anyerror, max_bytes: usize) !Result {
@@ -770,9 +782,10 @@ pub const Server = struct {
         try params.appendSlice(arena, "{\"uri\":");
         try util.jsonString(&params, arena, uri);
         try params.append(arena, '}');
-        s.call_mutex.lockUncancelable(s.io);
-        defer s.call_mutex.unlock(s.io);
+        // the time counts from now, a wait for another call included
         const deadline = nowNs(s.io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
+        try s.lockCall(stop, deadline);
+        defer s.call_mutex.unlock(s.io);
         const raw = s.request(arena, "resources/read", params.items, stop, deadline) catch |e| return s.said(arena, e, max_bytes);
         const v = jv.parse(arena, raw) orelse return error.BadResponse;
         if (jv.get(v, "error")) |e| {
@@ -795,9 +808,10 @@ pub const Server = struct {
         try params.appendSlice(arena, "{\"uri\":");
         try util.jsonString(&params, arena, uri);
         try params.append(arena, '}');
-        s.call_mutex.lockUncancelable(s.io);
-        defer s.call_mutex.unlock(s.io);
+        // the time counts from now, a wait for another call included
         const deadline = nowNs(s.io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
+        try s.lockCall(stop, deadline);
+        defer s.call_mutex.unlock(s.io);
         const raw = s.request(arena, "resources/subscribe", params.items, stop, deadline) catch |e| return if (e == error.Said) error.Refused else e;
         const v = jv.parse(arena, raw) orelse return error.BadResponse;
         if (jv.get(v, "error") != null) return error.Refused;
@@ -1543,6 +1557,42 @@ test "stop_ends_a_call_quickly" {
     const t0 = nowMs();
     try t.expectError(error.Stopped, f.call(s, "sleep", "{\"ms\":10000}", 30000));
     try t.expect(nowMs() - t0 < 1000);
+}
+
+/// Holds the server with a 2 s call, on its own arena.
+fn holdServer(s: *Server, stop: *std.atomic.Value(bool)) void {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    _ = s.call(arena.allocator(), "sleep", "{\"ms\":2000}", stop, 10000, 4096) catch {};
+}
+
+test "a_call_waiting_for_another_gets_no_more_than_its_own_time" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const s = try f.start();
+    defer s.deinit();
+    var hold_stop: std.atomic.Value(bool) = .init(false);
+    const th = try std.Thread.spawn(.{}, holdServer, .{ s, &hold_stop });
+    defer th.join();
+    t.io.sleep(.fromMilliseconds(150), .awake) catch {};
+    // the sleep holds the server: this call has 300 ms in all, waiting included
+    var t0 = nowMs();
+    try t.expectError(error.Timeout, f.call(s, "echo", "{\"text\":\"x\"}", 300));
+    var took = nowMs() - t0;
+    if (took >= 1200) {
+        std.debug.print("the waiting call took {d} ms (300 ms allowed)\n", .{took});
+        return error.TestUnexpectedResult;
+    }
+    // and a stop ends the wait at once
+    f.stop.store(true, .release);
+    t0 = nowMs();
+    try t.expectError(error.Stopped, f.call(s, "echo", "{\"text\":\"x\"}", 5000));
+    took = nowMs() - t0;
+    if (took >= 500) {
+        std.debug.print("the stopped call took {d} ms\n", .{took});
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "after_a_timeout_the_next_call_gets_its_own_answer" {
