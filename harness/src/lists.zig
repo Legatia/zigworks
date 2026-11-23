@@ -528,6 +528,133 @@ pub fn showText(a: Allocator, name: []const u8, list: []const []const u8) ![]con
     return std.fmt.allocPrint(a, "{s} ({d}): {s}.", .{ try title(a, name), list.len, try std.mem.join(a, ", ", list) });
 }
 
+// ---- state/errands: shops, weekly posts, what was said, open orders ----
+
+/// A shop the owner set up (`/setup reorder`): its MCP server, its quote
+/// and order tools, the list it orders from, when.
+pub const Shop = struct {
+    shop: []const u8 = "",
+    quote: []const u8 = "",
+    order: []const u8 = "",
+    list: []const u8 = default_list,
+    /// Proposed when the list reaches this many items (0: not by size).
+    size: u32 = 10,
+    /// And at this weekly time (`day` -1: none).
+    day: i8 = -1,
+    at: i32 = 0,
+    /// The list was under `size` since the last proposal: reaching it
+    /// proposes again.
+    low: bool = true,
+};
+
+/// A list posted each week.
+pub const Post = struct { list: []const u8 = "", day: i8 = 0, at: i32 = 0 };
+
+/// Something said once (a key), and when.
+pub const Said = struct { key: []const u8 = "", at: i64 = 0 };
+
+/// An order proposed, waiting for the owner's tap on item `item`: the
+/// exact call it makes (`arg`, "SERVER/TOOL {input}" as the gate reads it).
+pub const Order = struct {
+    item: u64 = 0,
+    shop: []const u8 = "",
+    list: []const u8 = default_list,
+    arg: []const u8 = "",
+    /// The items it orders (taken off the list once it went through).
+    items: []const []const u8 = &.{},
+    /// "64.20 PLN", for the lines after.
+    total: []const u8 = "",
+};
+
+pub const State = struct {
+    shops: []const Shop = &.{},
+    posts: []const Post = &.{},
+    said: []const Said = &.{},
+    orders: []const Order = &.{},
+};
+
+/// `state/errands` as written; damaged: an error (the caller starts empty).
+pub fn parseState(a: Allocator, text: []const u8) !State {
+    const t0 = if (std.mem.indexOf(u8, text, "\r\n") == null) text else try std.mem.replaceOwned(u8, a, text, "\r\n", "\n");
+    return std.json.parseFromSliceLeaky(State, a, t0, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}
+
+/// `st` as written, what was said over 14 days before `now_s` left out.
+pub fn stateText(a: Allocator, st: State, now_s: i64) ![]const u8 {
+    var said: std.ArrayList(Said) = .empty;
+    for (st.said) |x| if (now_s - x.at < 14 * 86400) try said.append(a, x);
+    var kept = st;
+    kept.said = said.items;
+    return std.json.Stringify.valueAlloc(a, kept, .{});
+}
+
+// ---- weekly times ----
+
+/// A weekly time: `day` 0 Monday … 6 Sunday, 7 every day; `at` minutes.
+pub const Weekly = struct { day: i8, at: i32 };
+
+const day_words = [_][]const u8{ "mon", "tue", "wed", "thu", "fri", "sat", "sun" };
+const day_names = [_][]const u8{ "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" };
+
+/// "sat 09:00", "saturday 9:00", "day 18:30" (every day).
+pub fn parseWeekly(text: []const u8) ?Weekly {
+    var it = std.mem.tokenizeAny(u8, text, " \t");
+    const d = it.next() orelse return null;
+    const tm = it.next() orelse return null;
+    if (it.next() != null) return null;
+    var low_buf: [16]u8 = undefined;
+    if (d.len < 3 or d.len > low_buf.len) return null;
+    const low = std.ascii.lowerString(&low_buf, d);
+    const day: i8 = if (std.mem.eql(u8, low, "day") or std.mem.eql(u8, low, "daily")) 7 else blk: {
+        for (day_words, 0..) |w, i| if (std.mem.startsWith(u8, low, w) and std.ascii.startsWithIgnoreCase(day_names[i], low)) break :blk @intCast(i);
+        return null;
+    };
+    const colon = std.mem.indexOfScalar(u8, tm, ':') orelse return null;
+    const h = std.fmt.parseInt(i32, tm[0..colon], 10) catch return null;
+    const m = std.fmt.parseInt(i32, tm[colon + 1 ..], 10) catch return null;
+    if (h < 0 or h > 23 or m < 0 or m > 59 or tm.len - colon != 3) return null;
+    return .{ .day = day, .at = h * 60 + m };
+}
+
+/// "every Saturday at 09:00", "every day at 18:30".
+pub fn weeklyText(a: Allocator, w: Weekly) ![]const u8 {
+    const h: u32 = @intCast(@divFloor(w.at, 60));
+    const m: u32 = @intCast(@mod(w.at, 60));
+    if (w.day == 7) return std.fmt.allocPrint(a, "every day at {d:0>2}:{d:0>2}", .{ h, m });
+    return std.fmt.allocPrint(a, "every {s} at {d:0>2}:{d:0>2}", .{ day_names[@intCast(w.day)], h, m });
+}
+
+/// Whether `w` is due on local day `day` (since 1970-01-01) at `minute`.
+pub fn weeklyDue(w: Weekly, day: i64, minute: i64) bool {
+    if (w.day < 0) return false;
+    if (w.day != 7 and util.weekday(day) != @as(u3, @intCast(w.day))) return false;
+    return minute >= w.at;
+}
+
+// ---- a planned shop in the calendar ----
+
+const shop_words = [_][]const u8{ "shop", "shopping", "groceries", "grocery", "supermarket", "market", "zakupy", "sklep", "biedronka", "lidl", "auchan", "carrefour", "kaufland" };
+
+/// The list an event titled `title` is a shop for: the one its title
+/// names (a list's or a shop's name; a shop's list is its own), else the
+/// default when the title has a shop word; null: not a shop.
+pub fn shopEvent(a: Allocator, title_text: []const u8, known: []const []const u8, shops: []const []const u8) ?[]const u8 {
+    const low = a.dupe(u8, title_text) catch return null;
+    for (low) |*ch| ch.* = std.ascii.toLower(ch.*);
+    var it = std.mem.tokenizeAny(u8, low, " \t,.:;!?()-/");
+    var shop = false;
+    while (it.next()) |w| {
+        for (known) |k| if (!std.mem.eql(u8, k, default_list) and std.mem.eql(u8, w, k)) return k;
+        for (shops) |s| if (std.mem.eql(u8, w, s)) {
+            shop = true;
+        };
+        for (shop_words) |s| if (std.mem.eql(u8, w, s)) {
+            shop = true;
+        };
+    }
+    return if (shop) default_list else null;
+}
+
 // ---- tests ----
 
 const t = std.testing;
@@ -668,4 +795,62 @@ test "items_are_kept_once" {
     const list = try s.items(a, "shopping");
     try t.expectEqualStrings("jam butter", list[2]);
     try t.expectEqual(max_item, list[3].len);
+}
+
+test "weekly_times_read_and_fall_due" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sat = parseWeekly("sat 09:00").?;
+    try t.expectEqual(5, sat.day);
+    try t.expectEqual(540, sat.at);
+    try t.expectEqual(5, parseWeekly("Saturday 9:00").?.day);
+    try t.expectEqual(7, parseWeekly("day 18:30").?.day);
+    for ([_][]const u8{ "", "sat", "sat 25:00", "sat 9", "sa 09:00", "satx 09:00", "sat 09:00 x", "sat 09:5" }) |x| try t.expect(parseWeekly(x) == null);
+    try t.expectEqualStrings("every Saturday at 09:00", try weeklyText(a, sat));
+    try t.expectEqualStrings("every day at 18:30", try weeklyText(a, parseWeekly("daily 18:30").?));
+    // 2026-11-28 is a Saturday
+    const d = util.daysFromCivil(2026, 11, 28);
+    try t.expect(!weeklyDue(sat, d, 539));
+    try t.expect(weeklyDue(sat, d, 540));
+    try t.expect(!weeklyDue(sat, d - 1, 600));
+    try t.expect(weeklyDue(.{ .day = 7, .at = 60 }, d - 1, 61));
+}
+
+test "a_shop_in_the_calendar" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const known = [_][]const u8{ "shopping", "hardware" };
+    try t.expectEqualStrings("shopping", shopEvent(a, "Groceries", &known, &.{}).?);
+    try t.expectEqualStrings("shopping", shopEvent(a, "Zakupy w Lidl", &known, &.{}).?);
+    try t.expectEqualStrings("shopping", shopEvent(a, "Frisco delivery", &known, &.{"frisco"}).?);
+    try t.expectEqualStrings("hardware", shopEvent(a, "Hardware store run", &known, &.{}).?);
+    try t.expect(shopEvent(a, "Dentist", &known, &.{}) == null);
+    try t.expect(shopEvent(a, "Workshop on Zig", &known, &.{}) == null);
+}
+
+test "the_errands_file_round_trips" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const now: i64 = 1_800_000_000;
+    const st: State = .{
+        .shops = &.{.{ .shop = "frisco", .quote = "shop_quote", .order = "shop_order", .size = 8, .day = 5, .at = 540 }},
+        .posts = &.{.{ .list = "shopping", .day = 5, .at = 540 }},
+        .said = &.{ .{ .key = "post shopping 1", .at = now - 86400 }, .{ .key = "old", .at = now - 15 * 86400 } },
+        .orders = &.{.{ .item = 12, .shop = "frisco", .arg = "frisco/shop_order {\"items\":[\"milk\"],\"total\":5}", .items = &.{"milk"}, .total = "5.00 PLN" }},
+    };
+    const text = try stateText(a, st, now);
+    const back = try parseState(a, try std.mem.replaceOwned(u8, a, text, "\n", "\r\n"));
+    try t.expectEqual(1, back.shops.len);
+    try t.expectEqualStrings("frisco", back.shops[0].shop);
+    try t.expectEqual(8, back.shops[0].size);
+    try t.expectEqual(1, back.posts.len);
+    // what was said over 14 days ago goes
+    try t.expectEqual(1, back.said.len);
+    try t.expectEqualStrings("post shopping 1", back.said[0].key);
+    try t.expectEqual(12, back.orders[0].item);
+    try t.expectEqualStrings("milk", back.orders[0].items[0]);
+    try t.expectError(error.SyntaxError, parseState(a, "{not json"));
 }

@@ -53,6 +53,7 @@ const butler = @import("butler.zig");
 const alerts_mod = @import("alerts.zig");
 const mail_mod = @import("mail.zig");
 const diary_mod = @import("diary.zig");
+const lists_mod = @import("lists.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -696,6 +697,8 @@ pub const Core = struct {
     /// The diary: the calendar's events read last, the lines said
     /// (state/diary), the busy window that held posts.
     diary: diary_mod.State,
+    /// Lists, reorders, deliveries, upkeep (the Errands block).
+    errands: Errands,
     /// What /reload says when the settings files have an error.
     problem_buf: [800]u8 = undefined,
 
@@ -888,6 +891,7 @@ pub const Core = struct {
         c.diary = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "diary" }));
         errdefer c.diary.deinit();
         c.diary.load() catch |e| c.log.write(.config, false, .{ .event = "diary not read", .why = @errorName(e) }) catch {};
+        c.errands = try Errands.init(gpa, io, c.paths.state, c.paths_arena.allocator());
         c.role = "open";
         // problem_buf: written before it is read
         // the inbox: read, its first id from 0.3's approval numbers; items
@@ -962,6 +966,7 @@ pub const Core = struct {
         c.announced.deinit(c.gpa);
         c.group_posts.deinit(c.gpa);
         c.diary.deinit();
+        c.errands.deinit();
         c.defs.deinit();
         for (c.told_topics.items) |n| c.gpa.free(n);
         c.told_topics.deinit(c.gpa);
@@ -1696,9 +1701,15 @@ pub const Core = struct {
         const conv = group orelse try c.memberChat(a, who, m.from);
         if (cmd[0] == '/') {
             try c.log.write(.chat, false, .{ .event = "member command", .name = who, .command = cmd });
-            c.memberSay(conv, if (std.mem.eql(u8, cmd, "/help") or std.mem.eql(u8, cmd, "/start")) household.help else household.owner_only);
+            if (std.mem.eql(u8, cmd, "/list")) {
+                c.memberSay(conv, Errands.memberList(c, a, conv, who, arg));
+                return true;
+            }
+            c.memberSay(conv, if (std.mem.eql(u8, cmd, "/help") or std.mem.eql(u8, cmd, "/start")) household.help ++ "\n" ++ Errands.member_help else household.owner_only);
             return true;
         }
+        // the lists' words: members add, take off and read (no model run)
+        if (Errands.words(c, conv, who, text)) return true;
         try c.queueMember(conv, who, text);
         return true;
     }
@@ -2716,6 +2727,8 @@ pub const Core = struct {
         }
         // a workflow's phrase ("goodnight") starts it, no model call (Ruling 2)
         if (c.phraseStart(conv, text)) return;
+        // the lists' words ("add milk"): harness's own, no model call
+        if (Errands.words(c, conv, "", text)) return;
         return c.queueMessage(conv, text, null);
     }
 
@@ -2842,6 +2855,7 @@ pub const Core = struct {
         if (flag.load(.acquire)) return;
         // a phrase said aloud starts its workflow, as typed (Ruling 2)
         if (c.phraseStart(conv, text)) return;
+        if (Errands.words(c, conv, "", text)) return;
         c.chatTurnAs(conv, agent_name, text, voice_context);
     }
 
@@ -5652,6 +5666,8 @@ pub const Core = struct {
         // the diary: the calendar read when due, its lines at their minute
         if (c.poller_on) c.diaryDue(now_s);
         c.diaryPost(now_s);
+        // lists before a planned shop
+        Errands.due(c, now_s);
         // quiet hours over: what they held, a digest per conversation
         c.quietDue(now_s);
         // urgent alerts nobody is on: the household in turn, a fallback
@@ -10300,6 +10316,7 @@ pub const Core = struct {
         \\/session [N]: the steps behind the last answer here (N runs back)
         \\/history WORDS: earlier turns with every word, newest first
         \\/people: the people you deal with; /person NAME: what is known of one
+        \\/list [NAME]: the shopping list (or another); /list clear, /list add ITEM; or write "add milk"
         \\/apps: the apps, with their links while the app server runs
         \\/app approve NAME: serve an app as its files are now
         \\/app rm NAME: remove an app, its data and its versions
@@ -10342,6 +10359,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/pair")) return "Already paired.";
         if (eql(u8, cmd, "/members")) return c.membersText(a);
         if (eql(u8, cmd, "/people")) return c.people.listing(a, 100);
+        if (eql(u8, cmd, "/list") or eql(u8, cmd, "/lists")) return Errands.listCommand(c, a, conv, rest);
         if (eql(u8, cmd, "/person")) return if (rest.len == 0) "Use /person NAME." else c.people.cardText(a, rest);
         if (eql(u8, cmd, "/setup")) return c.setupCommand(a, conv, rest);
         if (eql(u8, cmd, "/member")) return c.memberCommand(a, rest);
@@ -23328,4 +23346,453 @@ test "a_flight_in_the_mail_goes_to_the_calendar_through_calmcps_cal_create_asked
     butler.readCheck(&h, stand_in_check);
     const inv = try butler.routineFiles(a, .invitation, try butler.pick(a, h, .{ .mail = true, .calendar = "calendar" }), "2026-11-23");
     try expectHas(inv.workflow, "tool calendar/cal_create {\"title\": \"{read.title}\", \"start\": \"{read.start}\", \"end\": \"{read.end}\", \"place\": \"{read.place}\"}");
+}
+
+// ---- errands and upkeep (the household spec's §3 and §4) ----
+
+/// Lists, reorders, deliveries and upkeep: their state (`state/lists/`,
+/// `state/errands`, `state/deliveries`, `state/upkeep`), and what harness
+/// does with them. One field of Core (`errands`); the functions take the
+/// core. Members reach the lists only (Ruling 3 of the plan).
+const Errands = struct {
+    lists: lists_mod.Store,
+    /// `state/errands`: shops, weekly posts, what was said, open orders.
+    path: []const u8,
+    /// Held while `state/errands` is read and written.
+    mutex: Io.Mutex = .init,
+
+    fn init(gpa: std.mem.Allocator, io: Io, state: []const u8, a: std.mem.Allocator) !Errands {
+        return .{
+            .lists = .init(gpa, io, try std.fs.path.join(a, &.{ state, "lists" })),
+            .path = try std.fs.path.join(a, &.{ state, "errands" }),
+        };
+    }
+
+    fn deinit(e: *Errands) void {
+        _ = e;
+    }
+
+    // ---- state/errands ----
+
+    fn load(c: *Core, a: std.mem.Allocator) lists_mod.State {
+        const text = Io.Dir.cwd().readFileAlloc(c.io, c.errands.path, a, .limited(4 << 20)) catch return .{};
+        return lists_mod.parseState(a, text) catch .{};
+    }
+
+    fn save(c: *Core, a: std.mem.Allocator, st: lists_mod.State) !void {
+        try Io.Dir.cwd().createDirPath(c.io, c.paths.state);
+        try util.writeReplace(c.io, c.errands.path, try lists_mod.stateText(a, st, c.now()));
+    }
+
+    /// Whether `key` was said, and notes it (under the mutex); false: say it.
+    fn once(c: *Core, a: std.mem.Allocator, key: []const u8) bool {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        var st = load(c, a);
+        for (st.said) |x| if (std.mem.eql(u8, x.key, key)) return true;
+        var said: std.ArrayList(lists_mod.Said) = .empty;
+        said.appendSlice(a, st.said) catch return true;
+        said.append(a, .{ .key = key, .at = c.now() }) catch return true;
+        st.said = said.items;
+        save(c, a, st) catch |err| {
+            c.log.write(.chat, false, .{ .event = "errands not written", .why = @errorName(err) }) catch {};
+            return true;
+        };
+        return false;
+    }
+
+    // ---- what harness says ----
+
+    /// A line of `by` (`schedule:lists`, …) to main, as a schedule's: held
+    /// in quiet hours and busy events; one that does not get through is
+    /// kept to send again.
+    fn post(c: *Core, a: std.mem.Allocator, by: []const u8, label: []const u8, text: []const u8) void {
+        const private = c.convPrivate("main");
+        if (c.quietEnd(by)) |_| held: {
+            const masked = c.masks.scrubAlloc(a, text) catch break :held;
+            const id = c.quiet.hold(.{ .at = c.now(), .conv = "main", .by = by, .text = masked, .private = private }) catch |err| {
+                c.log.write(.chat, false, .{ .event = "not held", .conversation = "main", .by = by, .why = @errorName(err) }) catch {};
+                break :held;
+            };
+            c.log.write(.chat, false, .{ .event = "held", .id = id, .conversation = "main", .by = by }) catch {};
+            return;
+        }
+        _ = c.sendText("main", text) catch |err| {
+            c.log.write(.chat, false, .{ .event = "not delivered", .by = by, .why = whyUndelivered(err) }) catch {};
+            _ = c.keepDelivery(.{ .to = "main", .text = text, .retry = err != error.NoChannel, .who = .{ .by = by, .agent = "" }, .label = label, .private = private });
+            return;
+        };
+        c.touch("main");
+    }
+
+    /// Said in `conv` to the owner, or to member `member` there.
+    fn answer(c: *Core, conv: []const u8, member: []const u8, text: []const u8) void {
+        if (member.len > 0) c.memberSay(conv, text) else c.sayIn(conv, text);
+    }
+
+    // ---- lists ----
+
+    /// The owner's (`member` "") or member `member`'s words about the lists
+    /// in `conv`, acted on and answered there; false when `text` isn't
+    /// about lists (it goes to the model as before).
+    fn words(c: *Core, conv: []const u8, member: []const u8, text: []const u8) bool {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const known = c.errands.lists.names(a) catch &.{};
+        const w = (lists_mod.read(a, text, known) catch return false) orelse return false;
+        const said: []const u8 = switch (w) {
+            .show => |name| showLists(c, a, name) catch |err| errText(a, err),
+            .add => |ch| addTo(c, a, conv, member, if (ch.list.len > 0) ch.list else lists_mod.default_list, ch.items),
+            .remove => |ch| takeOff(c, a, conv, member, ch.list, ch.items, true) orelse return false,
+            .got => |ch| takeOff(c, a, conv, member, ch.list, ch.items, false) orelse return false,
+        };
+        answer(c, conv, member, said);
+        return true;
+    }
+
+    fn errText(a: std.mem.Allocator, err: anyerror) []const u8 {
+        return switch (err) {
+            error.TooManyLists => std.fmt.allocPrint(a, "There are {d} lists already: clear one first (/list clear NAME).", .{lists_mod.max_lists}) catch "Too many lists.",
+            error.BadName => "A list's name is a-z, 0-9, - and _ (up to 32).",
+            else => std.fmt.allocPrint(a, "The list couldn't be written: {s}.", .{@errorName(err)}) catch "The list couldn't be written.",
+        };
+    }
+
+    /// `name`'s items as read; "" all of them ("Shopping is empty." when
+    /// there are none).
+    fn showLists(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        if (name.len > 0) {
+            if (!lists_mod.validName(name)) return error.BadName;
+            return lists_mod.showText(a, name, try c.errands.lists.items(a, name));
+        }
+        const all = try c.errands.lists.names(a);
+        if (all.len == 0) return lists_mod.showText(a, lists_mod.default_list, &.{});
+        var parts: std.ArrayList([]const u8) = .empty;
+        for (all) |n| {
+            const list = try c.errands.lists.items(a, n);
+            // other lists only when they hold something
+            if (list.len == 0 and !std.mem.eql(u8, n, lists_mod.default_list) and all.len > 1) continue;
+            try parts.append(a, try lists_mod.showText(a, n, list));
+        }
+        return std.mem.join(a, "\n", parts.items);
+    }
+
+    fn addTo(c: *Core, a: std.mem.Allocator, conv: []const u8, member: []const u8, name: []const u8, items: []const []const u8) []const u8 {
+        const got = c.errands.lists.add(a, name, items) catch |err| return errText(a, err);
+        c.log.write(.chat, c.convPrivate(conv), .{ .event = "list", .op = "add", .list = name, .count = got.added.len, .member = if (member.len > 0) member else null }) catch {};
+        return lists_mod.addedText(a, name, got) catch "Added.";
+    }
+
+    /// Takes `items` off list `name` ("" the first that has one of them);
+    /// null when `said` is false and no list has any of them.
+    fn takeOff(c: *Core, a: std.mem.Allocator, conv: []const u8, member: []const u8, name_in: []const u8, items: []const []const u8, said: bool) ?[]const u8 {
+        var name = name_in;
+        if (name.len == 0) {
+            const all = c.errands.lists.names(a) catch &.{};
+            name = for (all) |n| {
+                const has = for (items) |x| {
+                    if (c.errands.lists.has(a, n, x) catch false) break true;
+                } else false;
+                if (has) break n;
+            } else blk: {
+                if (!said) return null;
+                break :blk lists_mod.default_list;
+            };
+        } else if (!lists_mod.validName(name)) return errText(a, error.BadName);
+        const got = c.errands.lists.remove(a, name, items) catch |err| return errText(a, err);
+        if (!said and got.removed.len == 0) return null;
+        c.log.write(.chat, c.convPrivate(conv), .{ .event = "list", .op = "remove", .list = name, .count = got.removed.len, .member = if (member.len > 0) member else null }) catch {};
+        return lists_mod.removedText(a, name, got) catch "Taken off.";
+    }
+
+    /// `/list`, `/list NAME`, `/list [NAME] clear|add ITEMS|rm ITEMS|every
+    /// DAY HH:MM|every off`: the owner's.
+    fn listCommand(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        var it = std.mem.tokenizeAny(u8, rest, " \t");
+        var name: []const u8 = "";
+        var op = it.next() orelse return showLists(c, a, "");
+        const ops = [_][]const u8{ "clear", "add", "rm", "every" };
+        const is_op = for (ops) |o| {
+            if (std.mem.eql(u8, o, op)) break true;
+        } else false;
+        if (!is_op) {
+            if (!lists_mod.validName(op)) return list_help;
+            name = op;
+            op = it.next() orelse return showLists(c, a, name);
+        }
+        const list = if (name.len > 0) name else lists_mod.default_list;
+        const tail = std.mem.trim(u8, it.rest(), " \t");
+        const eql = std.mem.eql;
+        if (eql(u8, op, "clear")) {
+            const n = c.errands.lists.clear(a, list) catch |err| return errText(a, err);
+            c.log.write(.chat, c.convPrivate(conv), .{ .event = "list", .op = "clear", .list = list, .count = n }) catch {};
+            if (n == 0) return std.fmt.allocPrint(a, "{s} is empty already.", .{try lists_mod.title(a, list)});
+            return std.fmt.allocPrint(a, "Cleared {s} ({d} item{s}).", .{ list, n, if (n == 1) "" else "s" });
+        }
+        if (eql(u8, op, "add") or eql(u8, op, "rm")) {
+            if (tail.len == 0) return list_help;
+            var items: std.ArrayList([]const u8) = .empty;
+            var parts = std.mem.splitScalar(u8, tail, ',');
+            while (parts.next()) |p| {
+                const x = std.mem.trim(u8, p, " \t");
+                if (x.len > 0) try items.append(a, x);
+            }
+            if (eql(u8, op, "add")) return addTo(c, a, conv, "", list, items.items);
+            return takeOff(c, a, conv, "", list, items.items, true).?;
+        }
+        if (eql(u8, op, "every")) return everyCommand(c, a, list, tail);
+        return list_help;
+    }
+
+    /// What a member's /help adds.
+    const member_help = "For the shopping list, write \"add milk\" or \"we're out of coffee\", \"got the milk\" to take it off, and \"list\" (or /list) to read it.";
+
+    /// A member's `/list [NAME] [add|rm ITEMS]`: reading, adding and taking
+    /// off; clearing and posting are the owner's.
+    fn memberList(c: *Core, a: std.mem.Allocator, conv: []const u8, member: []const u8, rest: []const u8) []const u8 {
+        var it = std.mem.tokenizeAny(u8, rest, " \t");
+        var name: []const u8 = "";
+        var op = it.next() orelse return showLists(c, a, "") catch |err| errText(a, err);
+        if (!std.mem.eql(u8, op, "clear") and !std.mem.eql(u8, op, "every") and !std.mem.eql(u8, op, "add") and !std.mem.eql(u8, op, "rm")) {
+            if (!lists_mod.validName(op)) return "Use /list, or /list NAME for another list.";
+            name = op;
+            op = it.next() orelse return showLists(c, a, name) catch |err| errText(a, err);
+        }
+        if (std.mem.eql(u8, op, "clear")) return "Only the owner clears a list. Take things off by writing, like \"remove milk\".";
+        if (std.mem.eql(u8, op, "every")) return "Only the owner sets when a list is posted.";
+        const list = if (name.len > 0) name else lists_mod.default_list;
+        var items: std.ArrayList([]const u8) = .empty;
+        var parts = std.mem.splitScalar(u8, std.mem.trim(u8, it.rest(), " \t"), ',');
+        while (parts.next()) |p| {
+            const x = std.mem.trim(u8, p, " \t");
+            if (x.len > 0) items.append(a, x) catch {};
+        }
+        if (items.items.len == 0) return "Use /list add ITEM, or just write \"add milk\".";
+        if (std.mem.eql(u8, op, "add")) return addTo(c, a, conv, member, list, items.items);
+        return takeOff(c, a, conv, member, list, items.items, true).?;
+    }
+
+    const list_help =
+        \\/list: the lists; /list NAME: one
+        \\/list [NAME] add ITEM, ITEM: add; /list [NAME] rm ITEM: take off
+        \\/list [NAME] clear: empty it
+        \\/list [NAME] every sat 09:00: posted then each week; /list [NAME] every off
+        \\Or write it: "add milk", "we're out of coffee", "got the milk", "what's on the list?"
+    ;
+
+    /// `/list [NAME] every DAY HH:MM` or `every off`.
+    fn everyCommand(c: *Core, a: std.mem.Allocator, list: []const u8, tail: []const u8) ![]const u8 {
+        const when = lists_mod.parseWeekly(tail);
+        const off = std.mem.eql(u8, tail, "off");
+        if (when == null and !off) return "Say when: /list every sat 09:00 (a day, or \"day\" for every day, then the time), or /list every off.";
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        var st = load(c, a);
+        var posts: std.ArrayList(lists_mod.Post) = .empty;
+        for (st.posts) |p| if (!std.mem.eql(u8, p.list, list)) try posts.append(a, p);
+        if (when) |w| try posts.append(a, .{ .list = list, .day = w.day, .at = w.at });
+        st.posts = posts.items;
+        try save(c, a, st);
+        c.log.write(.config, false, .{ .event = "list post", .list = list, .on = !off }) catch {};
+        if (off) return std.fmt.allocPrint(a, "{s} is no longer posted each week.", .{try lists_mod.title(a, list)});
+        return std.fmt.allocPrint(a, "{s} is posted {s}, when it has something on it.", .{ try lists_mod.title(a, list), try lists_mod.weeklyText(a, when.?) });
+    }
+
+    /// From the tick: lists before a planned shop (a calendar event within
+    /// the hour, a weekly post), once each.
+    fn due(c: *Core, now_s: i64) void {
+        if (c.chan == null) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const known = c.errands.lists.names(a) catch return;
+        // an event of the calendar that is a shop, within the hour
+        for (c.diary.events(a)) |ev| {
+            if (ev.cancelled or ev.all_day or ev.start <= now_s or ev.start - now_s > 3600) continue;
+            const name = lists_mod.shopEvent(a, ev.title, known, shopNames(c, a)) orelse continue;
+            const list = c.errands.lists.items(a, name) catch continue;
+            if (list.len == 0) continue;
+            const key = std.fmt.allocPrint(a, "event {s} {d}", .{ ev.id, ev.start }) catch continue;
+            if (once(c, a, key)) continue;
+            var cb: [8]u8 = undefined;
+            const text = std.fmt.allocPrint(a, "{s} at {s}. {s}", .{ ev.title, diary_mod.clock(&cb, ev.start, ev.offset), lists_mod.showText(a, name, list) catch continue }) catch continue;
+            c.log.write(.chat, false, .{ .event = "list", .op = "post", .list = name, .count = list.len, .why = "calendar" }) catch {};
+            post(c, a, "schedule:lists", "lists", text);
+        }
+        // the weekly posts
+        const st = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            break :blk load(c, a);
+        };
+        const day = c.localDay(now_s);
+        const minute = c.localMinutes(now_s);
+        for (st.posts) |p| {
+            if (!lists_mod.weeklyDue(.{ .day = p.day, .at = p.at }, day, minute)) continue;
+            const key = std.fmt.allocPrint(a, "post {s} {d}", .{ p.list, day }) catch continue;
+            const list = c.errands.lists.items(a, p.list) catch continue;
+            if (once(c, a, key) or list.len == 0) continue;
+            c.log.write(.chat, false, .{ .event = "list", .op = "post", .list = p.list, .count = list.len, .why = "weekly" }) catch {};
+            post(c, a, "schedule:lists", "lists", lists_mod.showText(a, p.list, list) catch continue);
+        }
+    }
+
+    /// The shops' names (state/errands).
+    fn shopNames(c: *Core, a: std.mem.Allocator) []const []const u8 {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        const st = load(c, a);
+        var out: std.ArrayList([]const u8) = .empty;
+        for (st.shops) |s| out.append(a, s.shop) catch {};
+        return out.items;
+    }
+};
+
+// ---- errands: lists ----
+
+fn listFile(f: *Fix, name: []const u8) []const u8 {
+    const a = f.e.arena.allocator();
+    return fileText(f, std.fs.path.join(a, &.{ f.core.paths.state, "lists", name }) catch return "");
+}
+
+test "the_owner_adds_and_reads_the_list" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.core.handleText("add milk and eggs");
+    try f.rec.waitFor("Added milk and eggs to shopping (2 items).");
+    try f.core.handleText("We're out of coffee");
+    try f.rec.waitFor("Added coffee to shopping (3 items).");
+    try f.core.handleText("what's on the list?");
+    try f.rec.waitFor("Shopping (3): milk, eggs, coffee.");
+    try f.core.handleText("got the milk");
+    try f.rec.waitFor("Took milk off shopping (2 left).");
+    // no model was asked, nothing queued
+    try t.expectEqual(0, f.e.server.modelRequests());
+    try t.expectEqual(0, f.core.queue.items.len);
+    // "got" what no list has is not about lists: the model's
+    try f.core.handleText("got your message");
+    try t.expectEqual(1, f.core.queue.items.len);
+    // the commands
+    try t.expectEqualStrings("Shopping (2): eggs, coffee.", try f.core.command(a, "/list"));
+    try t.expectEqualStrings("Added nails to hardware (1 item).", try f.core.command(a, "/list hardware add nails"));
+    try t.expectEqualStrings("Shopping (2): eggs, coffee.\nHardware (1): nails.", try f.core.command(a, "/list"));
+    try expectHas(listFile(&f, "hardware"), "\nnails\n");
+    try t.expectEqualStrings("Cleared shopping (2 items).", try f.core.command(a, "/list clear"));
+    try t.expectEqualStrings("Shopping is empty.", try f.core.command(a, "/list shopping"));
+    try t.expectEqualStrings("Shopping is empty already.", try f.core.command(a, "/list clear"));
+    // logged, the items not
+    const lt = try logText(&f);
+    try expectHas(lt, "\"event\":\"list\",\"op\":\"add\",\"list\":\"shopping\",\"count\":2");
+    try t.expect(std.mem.indexOf(u8, lt, "coffee") == null);
+}
+
+test "a_member_adds_milk_in_the_group" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.setBot("harness_test_bot", true);
+    try addGroup(&f, "home", -100777);
+    try joinMember(&f, "anna", 77);
+    try f.core.handleIncoming(.{ .from = 77, .chat = -100777, .chat_type = "supergroup", .text = "@harness_test_bot add milk" });
+    try f.rec.waitIn("home", "Added milk to shopping (1 item).");
+    // in her own chat: read it, in words and with /list
+    try f.core.handleIncoming(fromAccount(77, "what's on the list"));
+    try f.rec.waitIn("anna", "Shopping (1): milk.");
+    try f.core.handleIncoming(fromAccount(77, "/list"));
+    try t.expectEqual(2, f.rec.countIn("anna", "Shopping (1): milk."));
+    // no model run, and the owner isn't told
+    try t.expectEqual(0, f.e.server.modelRequests());
+    try t.expectEqual(0, f.core.queue.items.len);
+    try t.expectEqual(0, f.rec.countIn("main", "milk"));
+    try expectHas(try logText(&f), "\"event\":\"list\",\"op\":\"add\",\"list\":\"shopping\",\"count\":1,\"member\":\"anna\"");
+    // the owner sees it
+    try t.expectEqualStrings("Shopping (1): milk.", try f.core.command(f.e.arena.allocator(), "/list"));
+}
+
+test "members_cannot_clear_a_list" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try joinMember(&f, "anna", 77);
+    try f.core.handleText("add milk");
+    try f.core.handleIncoming(fromAccount(77, "/list clear"));
+    try f.rec.waitIn("anna", "Only the owner clears a list. Take things off by writing, like \"remove milk\".");
+    try f.core.handleIncoming(fromAccount(77, "/list every sat 09:00"));
+    try t.expectEqual(2, f.rec.countIn("anna", "Only the owner"));
+    try expectHas(listFile(&f, "shopping"), "\nmilk\n");
+    try f.core.handleIncoming(fromAccount(77, "remove milk"));
+    try f.rec.waitIn("anna", "Took milk off shopping; it's empty now.");
+    // her help says how
+    try f.core.handleIncoming(fromAccount(77, "/help"));
+    try f.rec.waitIn("anna", "\"add milk\"");
+}
+
+test "the_list_is_posted_before_a_shop_in_the_calendar" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const dir = try withCalendar(&f);
+    const t0 = diaryAt();
+    try writeUpcoming(&f, dir, &.{.{ .id = "personal/shop-1@calmcp-sim", .calendar = "personal", .title = "Groceries", .start = t0, .end = t0 + 3600, .offset = 60, .busy = true }});
+    try f.core.handleText("add milk, eggs");
+    f.core.fixed_now = t0 - 61 * 60;
+    try f.core.diaryReadNow();
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("Groceries at"));
+    f.core.fixed_now = t0 - 60 * 60;
+    f.core.tick();
+    try f.rec.waitFor("Groceries at 10:30. Shopping (2): milk, eggs.");
+    f.core.fixed_now = t0 - 30 * 60;
+    f.core.tick();
+    try t.expectEqual(1, f.rec.count("Groceries at"));
+    // another event is no shop
+    try writeUpcoming(&f, dir, &.{.{ .id = "personal/dentist-2@calmcp-sim", .calendar = "personal", .title = "Dentist", .start = t0 + 7200, .end = t0 + 9000, .offset = 60, .busy = true }});
+    try f.core.diaryReadNow();
+    f.core.fixed_now = t0 + 3600 + 60;
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("Dentist at"));
+}
+
+test "a_weekly_list_post" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try t.expectEqualStrings("Shopping is posted every Saturday at 09:00, when it has something on it.", try f.core.command(a, "/list every sat 09:00"));
+    // the next Saturday, 08:59 then 09:00 (the tests' owner time is UTC)
+    var day = @divFloor(util.nowSeconds(t.io), 86400) + 1;
+    while (util.weekday(day) != 5) day += 1;
+    f.core.fixed_now = day * 86400 + 9 * 3600 - 60;
+    f.core.tick();
+    // empty: nothing said that day
+    f.core.fixed_now = day * 86400 + 9 * 3600;
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("Shopping ("));
+    try f.core.handleText("add bread");
+    f.core.fixed_now = (day + 7) * 86400 + 9 * 3600 - 60;
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("Shopping (1): bread."));
+    f.core.fixed_now = (day + 7) * 86400 + 9 * 3600;
+    f.core.tick();
+    try f.rec.waitFor("Shopping (1): bread.");
+    f.core.fixed_now = (day + 7) * 86400 + 10 * 3600;
+    f.core.tick();
+    try t.expectEqual(1, f.rec.count("Shopping (1): bread."));
+    try t.expectEqualStrings("Shopping is no longer posted each week.", try f.core.command(a, "/list every off"));
+}
+
+test "add_milk_in_a_voice_note" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try voiceSetup(&f, "");
+    try sttScript(&f, 1, "{\"text\":\" Add milk.\"}");
+    try f.core.startWorker();
+    try f.core.handleIncoming(voiceNote(2));
+    try f.rec.waitFor("\"Add milk.\"");
+    try f.rec.waitFor("Added milk to shopping (1 item).");
+    try t.expectEqual(0, f.e.server.modelRequests());
 }
