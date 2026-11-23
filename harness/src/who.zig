@@ -10,7 +10,8 @@ pub const Who = struct {
     /// The definition doing the call: `main` or `helper` until gap 1.
     agent: []const u8 = "main",
     /// What started the run, the same down a delegation chain: `owner`,
-    /// `schedule:NAME`, `trigger:NAME`, `workflow:NAME/STEP`, `app:NAME`.
+    /// `schedule:NAME`, `trigger:NAME`, `workflow:NAME/STEP`, `app:NAME`,
+    /// `member:NAME` (a household member's message).
     by: []const u8 = "owner",
     /// The run that delegated this one: its definition is the first that
     /// delegated, its parent's the next.
@@ -26,7 +27,19 @@ pub const Who = struct {
 };
 
 /// The kinds of a who: what started a run, and `agent` for definitions.
-const kinds = [_][]const u8{ "owner", "schedule", "trigger", "workflow", "app", "agent" };
+const kinds = [_][]const u8{ "owner", "schedule", "trigger", "workflow", "app", "agent", "member" };
+
+/// A household member's (`member:NAME`), or a pattern of members' (`member`,
+/// `member:a*`).
+pub fn isMember(text: []const u8) bool {
+    return eql(kindOf(text), "member");
+}
+
+/// The member's name in `member:NAME`; null for any other who.
+pub fn memberName(by: []const u8) ?[]const u8 {
+    if (!isMember(by)) return null;
+    return nameOf(by);
+}
 
 /// What of a call's who a pattern matches: its definition, one of the
 /// definitions that delegated it, or what started its run.
@@ -179,4 +192,21 @@ test "a_call_with_no_definition_matches_no_agent_pattern" {
     try t.expectEqual(Reach{}, reach("agent", poll));
     try t.expectEqual(Reach{ .by = true }, reach("trigger:btc", poll));
     try t.expectEqual(Reach{ .by = true }, reach("trigger", poll));
+}
+
+test "member_is_a_who_kind" {
+    try t.expect(isValue("member:anna"));
+    try t.expect(!isValue("member"));
+    for ([_][]const u8{ "member", "member:anna", "member:a*" }) |p| try t.expect(isPattern(p));
+    try t.expect(matchesBy("member", "member:anna"));
+    try t.expect(matchesBy("member:a*", "member:anna"));
+    try t.expect(!matchesBy("member:ben", "member:anna"));
+    try t.expect(!matchesBy("owner", "member:anna"));
+    try t.expect(!matchesBy("member", "owner"));
+    try t.expect(isMember("member:anna"));
+    try t.expect(!isMember("owner") and !isMember("schedule:member"));
+    try t.expectEqualStrings("anna", memberName("member:anna").?);
+    try t.expectEqual(null, memberName("owner"));
+    // someone is there to answer: the owner, for a member
+    try t.expect(!(Who{ .by = "member:anna" }).unattended());
 }

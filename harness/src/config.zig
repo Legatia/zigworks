@@ -675,6 +675,8 @@ pub const rules_example =
     \\# steps are [workflow:NAME]'s, not a definition's); [all] goes back to
     \\# rules for every call. shell@NAME is for
     \\# commands in environment NAME (host is the only one for now).
+    \\# [member] and [member:NAME] are for household members (README:
+    \\# Household); for a member, lines outside them only deny or ask.
     \\# After the agent writes a file in the workspace, a shell command that
     \\# a rule or a 24 h grant allows is asked first, naming the files, until
     \\# you allow one; a scheduled run skips it.

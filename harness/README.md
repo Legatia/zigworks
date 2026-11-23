@@ -11,6 +11,8 @@ disk, waiting for a time, an event or your approval), uses MCP servers
 saved skills, remembers what you bring up, keeps summaries of each
 conversation by day, week and month, and can search every earlier turn.
 During quiet hours it holds what is not urgent for a digest at their end.
+People of your household you add can ask it too, in their own chat with
+the bot or a group, within what you allow (Household, below).
 Every action it takes, and every
 action of its helpers, passes one gate and is written to one log you can
 check.
@@ -36,10 +38,10 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 849 unit tests (19 of them
+**State: 0.3.0, tested on macOS by its own tests: 879 unit tests (19 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 88 checks that drives the real binary against
+and an end-to-end script of 91 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram (voice
 notes and their files too), a transcription service, feeds, search, two
 MCP servers run as programs, and MCP servers at a url with a token or a
@@ -430,7 +432,8 @@ one turn at a time.
   to `main` with `[NAME]` in front, and you are told once.
 - **Groups.** In a group harness reads only your `/conversation add NAME`
   (`/conversation@BOT add NAME` too); from then on the agent may post
-  there, each post asked. Nothing else said in a group reaches the agent.
+  there, each post asked. Nothing else said in a group reaches the agent,
+  except what household members write there (see Household).
 - **`send`.** The agent posts with `send`: text up to 16 KB; up to 4
   workspace files up to 20 MB each, as documents (a file holding a stored
   secret is refused, one with a part starting with "." is asked); up to 4
@@ -484,6 +487,96 @@ to 3,500 bytes, read from the log's last 4 MB. `harness log runs [N]` lists
 the last runs; `harness log session RID [--json]` shows one with its
 helpers, whole or as its log lines. In the terminal every post is
 printed, with `[NAME]` in front when it is for another conversation.
+
+## Household
+
+The family can use harness too, in a group you added with `/conversation
+add` or in their own chat with the bot. Only you approve guarded actions
+and money, and members never see your files, memory or other
+conversations.
+
+**Adding someone.** `/member add NAME` (a-z, 0-9, `-` and `_`, up to 32)
+answers with a code of 8 letters that works once, for 10 minutes. Give it
+to the person: they send `/join CODE` to the bot from their own Telegram
+account, in a direct chat or in a group you added, or open the
+`https://t.me/BOT?start=CODE` link in the answer and press Start. They are
+welcomed, and you hear "anna joined". `/members` lists who joined and
+whose code waits. `/member add NAME` again gives a new code (the member's
+account changes to the one that uses it). `/member rm NAME` removes
+someone: their messages are ignored from then on, their own chat is no
+longer a conversation, and what they asked of you is withdrawn. An account
+you pair with `/pair` stops being a member.
+
+**Where members ask.** In their own chat with the bot (a conversation
+named after them, `anna`, or `anna-2` when that name is taken) and in
+groups you added. In a group harness takes a member's message only when
+it is addressed to the bot: it starts with `@BOT`, or it replies to one
+of harness's messages there (since harness started); the rest of the
+group's talk is left alone. With the bot's privacy mode on (Telegram's
+default) the bot gets only commands and replies to its own messages; for
+`@BOT` to reach it, turn privacy mode off (@BotFather, `/setprivacy`,
+Disable, then add the bot to the group again). Anyone else's messages are
+dropped and logged, as before; an anonymous admin, a post sent as a
+channel and Telegram's own service account are never members. Your own
+messages in a group are still read only for `/conversation add`.
+
+**What a member's request may do.** It runs as `member:NAME`, in the one
+queue with yours, under harness's own instructions for members (not
+`agents/main.md`'s), with no memory, no history or summaries, and only
+its own conversation to post to (no files). With no rules for members:
+
+| | |
+|---|---|
+| Alone | web search; homemcp's `home_state`, `home_wait` and `home_set` (reading the home, and lights, plugs, heating and blinds within the home file's limits) |
+| Asked of you, every time | money tools, homemcp's `home_guarded` among them (locks, alarms, valves, the garage), and every other MCP tool (the car's too) |
+| Not at all | reading web pages (`fetch`, `browse`), posting anywhere else |
+| Never, whatever the rules | commands, files, memory, `history`, `web` with your logins, `skill`, `delegate`, `ask_owner`, setting up triggers, workflows or definitions, and every slash command but `/help` |
+
+**When you are asked.** The member's request doesn't wait for you. You
+get one message in your chat, "Anna asks to unlock the front door." with
+[Unlock] [No] (no "Allow 24 h"; a reply in words says no, and the member,
+or the whole group when they asked there, reads it), and the member is
+told at once that you were asked. Your tap makes that exact
+call (the gate decides it again, so a `deny` added since stops it) and
+both of you get what the device said back: "The owner said yes: done:
+front_door is unlocked". A no, or no answer in time (`approval_seconds`),
+is said to the member. Members can't answer these: only your buttons and
+replies count. The calls waiting for you are kept in `state/member-asks`,
+so they survive a restart. Removing a member drops their messages that
+wait and withdraws their questions; a Yes that comes after does nothing,
+and you are told.
+
+**Rules for members.** `[member]` sections apply to every member,
+`[member:NAME]` to one (`*` works: `[member:k*]`). A section naming
+members decides before `[member]`, then the defaults above. For members,
+the shared part of `rules` and `[agent:…]` sections only deny or ask:
+their `allow` lines were written for your runs. No grant covers a member.
+Only an MCP call can wait for you; an `ask` for `fetch` or `browse` in a
+member's section refuses it.
+
+```
+[member]
+allow mcp cloud/car_status *
+allow fetch https://*.wikipedia.org/*
+
+[member:kid]
+ask mcp */home_set *
+deny mcp */home_set {"device":"oven"*
+```
+
+**What members should know.** You can read what they ask in the log
+(`harness log runs`), as everything harness does. Their chats are never
+written to your memory or its daily summaries, and their runs never
+share a context with yours (a conversation's name used again starts
+fresh). A money limit that stops a member's call is not described to
+them.
+
+`state/members` keeps them, a JSON line each, rewritten whole before
+harness acts on a change; a waiting code only as its SHA-256:
+
+```json
+{"name":"anna","user":123456789,"added":"2026-11-23T10:00:00Z","joined":"2026-11-23T10:02:00Z"}
+```
 
 ## Folders
 
@@ -819,7 +912,8 @@ object a line, as apps will get them (format v1):
 ```
 
 `status` is `open`, `answered`, `expired`, `void`, `withdrawn` or `done`
-(a kept post went out); `answer` is `{"key","text","at","via"}` with `via`
+(a kept post went out); `waiter` is `run`, `harness`, a workflow step's
+label, or `member NAME` (a household member's call, see Household); `answer` is `{"key","text","at","via"}` with `via`
 `telegram`, `terminal` or `harness`. Texts are masked as in the log (a
 stored secret shows as `[secret:NAME]`, in the message too); a private
 conversation's item keeps its texts while open, then only their sizes and
@@ -1753,9 +1847,11 @@ check|rm NAME`, `/quiet [on|off|HH:MM-HH:MM]`, `/dryrun on|off`,
 `/agents`, `/agent [NAME]`, `/agent show|rm NAME`, `/ask NAME text`,
 `/triggers`, `/trigger NAME`, `/trigger add|rm|pause|resume|run|test`,
 `/apps`, `/app approve|rm NAME`, `/workflows`, `/workflow NAME|NAME#N`,
-`/workflow start|stop|resume|rm`, `/help`. `/new`, `/private` and `/agent`
+`/workflow start|stop|resume|rm`, `/members`, `/member add|rm NAME`,
+`/help`. `/new`, `/private` and `/agent`
 act on the conversation they are sent in; `/stop`, `/dryrun` and
-`/memory auto` on everything.
+`/memory auto` on everything. Household members have `/help` and
+`/join CODE`; any other command of theirs is answered with a no.
 
 CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `trigger list|test|run`, `workflow list|check|start|stop`,
@@ -1797,8 +1893,13 @@ while `harness run` holds the folder and has ticked in the last 90 s.
   `secret add` refuses longer ones. A login's passkeys (about 300 bytes
   each) are kept there in parts once they don't fit in one.
 - **One owner, one turn at a time.** Messages sent in any conversation,
-  to any definition, while the agent works wait in one queue. Contexts do
-  not survive a restart.
+  to any definition, while the agent works wait in one queue, household
+  members' too. Contexts do not survive a restart.
+- **Household members** are Telegram accounts: whoever holds a member's
+  phone is that member. What a member asks you for is said to them as the
+  device or service answered ("done: front_door is unlocked"), without a
+  model call. A member's message has no limit of its own beyond the
+  queue's; each is a model call you pay for.
 - **`web` drives Chrome through pipes**, never a network port: file
   descriptors 3 and 4 on macOS and Linux; on Windows two pipe handles
   Chrome inherits alone (`--remote-debugging-io-pipes`), with the browser

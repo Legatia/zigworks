@@ -62,6 +62,10 @@ pub const Question = struct {
     /// The asking run's own stop flag (a delegated run has one of its own,
     /// which `/stop NAME` sets alone): once set, its item is withdrawn.
     stop: ?*const std.atomic.Value(bool) = null,
+    /// An approval's call: its gate kind and argument (a household
+    /// member's asker keeps them to make the call on the owner's yes).
+    tool: ?gate.Tool = null,
+    arg: []const u8 = "",
 
     pub const Kind = enum { approval, question, draft };
 };
@@ -530,6 +534,9 @@ pub const Run = struct {
     /// within the definition's tools, what the starter passes on and the
     /// starter's own run's tools (an MCP tool by its name: `allowsMcp`).
     pub fn allows(r: *const Run, tool: gate.Tool) bool {
+        // a household member's run: what members may use, a page read only
+        // where a member's rule allows some (the gate decides each call)
+        if (who_mod.isMember(r.who.by) and !r.gate.memberOffers(tool, r.who)) return false;
         // delegated runs answer the run that started them: they never
         // post, ask, save or move money (helpers since 0.3, the rest since)
         if (r.helper) switch (tool) {
@@ -1166,6 +1173,12 @@ const send_guide =
     \\
 ;
 
+/// The same for a household member's run.
+const member_send_guide =
+    \\The member sees only what you post with send. Reply with send and final: true. Your other text goes to the log.
+    \\
+;
+
 const delegate_guide =
     \\Use `delegate` to hand independent pieces of work to helpers that run at the same time, each with a clean context: research across several sources, comparisons, anything that splits into parts. Each task must stand alone and include every detail the helper needs; you get back each helper's short answer, not its working.
     \\
@@ -1204,7 +1217,7 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
     if (out.items.len > 0) try out.append(arena, '\n');
     try out.appendSlice(arena, if (r.helper) delegated_gate_line else gate_line);
     if (r.allows(.delegate)) try out.appendSlice(arena, delegate_guide);
-    if (r.allows(.send)) try out.appendSlice(arena, send_guide);
+    if (r.allows(.send)) try out.appendSlice(arena, if (who_mod.isMember(r.who.by)) member_send_guide else send_guide);
     if (r.scheduled) try out.appendSlice(arena, "This is a scheduled run: the owner is not watching and cannot approve anything.\n");
     if (r.extra_instructions.len > 0) try out.print(arena, "{s}\n", .{r.extra_instructions});
     if (r.skills_dir.len > 0 and r.allows(.skill)) {
@@ -1584,7 +1597,9 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     if (tool == .money) {
         if (moneyCheck(r, a, mt.?, input_json, now_s, &reserved)) |why| {
             try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
-            return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+            // a household member's run doesn't learn the owner's spending
+            const said = if (who_mod.isMember(r.who.by)) "a money limit of the owner's is reached" else why;
+            return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{said}), .is_error = true };
         }
     }
     // what the owner sees besides the argument
@@ -1740,6 +1755,8 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
     };
     // the files, read whole from the workspace as read_file sees it
     const paths = jv.arr(jv.get(v, "files")) orelse &.{};
+    // the workspace is the owner's
+    if (paths.len > 0 and who_mod.isMember(r.who.by)) return refusePost(r, a, to, text, "a member's run sends no files");
     if (paths.len > max_files) return refusePost(r, a, to, text, try std.fmt.allocPrint(a, "a post carries at most {d} files", .{max_files}));
     const files = try a.alloc(Attachment, paths.len);
     var dot: ?[]const u8 = null;
@@ -2438,7 +2455,7 @@ const AskExtra = struct {
 
 fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, now_s: i64, extra: AskExtra) !?[]const u8 {
     const dir = extra.dir;
-    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who, .shared = extra.shared, .dir = dir };
+    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who, .shared = extra.shared, .dir = dir, .here = tool == .send and std.mem.eql(u8, arg, r.conversation) };
     const d = blk: {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
@@ -2507,6 +2524,8 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             .label = r.label,
             .private = r.isPrivate(),
             .stop = r.env.stop,
+            .tool = tool,
+            .arg = arg,
         });
         if (extra.item) |p| p.* = got.item;
         var ans = got.answer;
@@ -2536,7 +2555,7 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             .full => why = if (got.text.len > 0) got.text else "no place in the inbox until the turn's end",
             .answered => why = try ownerSaid(a, "not an answer to this question", "", got.item),
             .deferred => {
-                why = try ownerSaid(a, "waits for the owner in the inbox", "", got.item);
+                why = try ownerSaid(a, "waits for the owner in the inbox", got.text, got.item);
                 logged = .ask;
             },
         }

@@ -6,6 +6,9 @@
 //! the file NAME of its folder; it takes subscriptions.
 //! Before the tools/list reply it sends a notification and a `ping`
 //! request, to prove the client skips the one and answers the other.
+//! `harness-fake --mcp --home` is homemcp's stand-in instead: `home_state`,
+//! `home_set` (the living room light) and `home_guarded` (the front door),
+//! each device's state kept while it runs.
 //!
 //! `Http` below is the same server over HTTP (Streamable HTTP), part of
 //! fake.zig's stand-in, for the tests of mcp_http.zig.
@@ -17,7 +20,55 @@ const tools_json =
     \\{"tools":[{"name":"echo","description":"Echo text back.","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},{"name":"fail","description":"Always fails.","inputSchema":{"type":"object","properties":{}}},{"name":"sleep","description":"Wait ms milliseconds.","inputSchema":{"type":"object","properties":{"ms":{"type":"integer"}},"required":["ms"]}}]}
 ;
 
+const home_tools_json =
+    \\{"tools":[{"name":"home_state","description":"Every device in the home: its state now. Only reads.","inputSchema":{"type":"object","properties":{"device":{"type":"string"}}}},{"name":"home_set","description":"One action on an ordinary device.","inputSchema":{"type":"object","properties":{"device":{"type":"string"},"action":{"type":"string"},"value":{"type":"string"}},"required":["device","action"]}},{"name":"home_guarded","description":"One action on a guarded device: locks.","inputSchema":{"type":"object","properties":{"device":{"type":"string"},"action":{"type":"string"}},"required":["device","action"]}}]}
+;
+
+/// homemcp's stand-in: what its devices are now.
+const Home = struct {
+    light_on: bool = false,
+    door_locked: bool = true,
+
+    fn call(h: *Home, a: std.mem.Allocator, name: []const u8, args: ?std.json.ObjectMap) ![]const u8 {
+        const eql = std.mem.eql;
+        const field = struct {
+            fn f(m: ?std.json.ObjectMap, key: []const u8) []const u8 {
+                const x = (m orelse return "").get(key) orelse return "";
+                return if (x == .string) x.string else "";
+            }
+        }.f;
+        const device = field(args, "device");
+        const action = field(args, "action");
+        if (eql(u8, name, "home_state")) return textResult(a, try std.fmt.allocPrint(a, "living_room_light (light): {s}\nfront_door (lock, guarded): {s}", .{ if (h.light_on) "on" else "off", if (h.door_locked) "locked" else "unlocked" }), false);
+        const guarded = eql(u8, name, "home_guarded");
+        if (!guarded and !eql(u8, name, "home_set")) return textResult(a, "unknown tool", true);
+        if (eql(u8, device, "living_room_light")) {
+            if (guarded) return textResult(a, "living_room_light is not guarded: use home_set", true);
+            if (!eql(u8, action, "on") and !eql(u8, action, "off")) return textResult(a, "living_room_light may: on, off", true);
+            h.light_on = eql(u8, action, "on");
+            return textResult(a, try std.fmt.allocPrint(a, "done: living_room_light is {s}", .{action}), false);
+        }
+        if (eql(u8, device, "front_door")) {
+            if (!guarded) return textResult(a, "front_door is guarded: use home_guarded", true);
+            if (!eql(u8, action, "lock") and !eql(u8, action, "unlock")) return textResult(a, "front_door may: lock, unlock", true);
+            h.door_locked = eql(u8, action, "lock");
+            return textResult(a, try std.fmt.allocPrint(a, "done: front_door is {s}ed", .{action}), false);
+        }
+        return textResult(a, "no such device", true);
+    }
+};
+
 pub fn run(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) u8 {
+    return serve(io, gpa, env, null);
+}
+
+/// homemcp's stand-in on stdio.
+pub fn runHome(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) u8 {
+    var home: Home = .{};
+    return serve(io, gpa, env, &home);
+}
+
+fn serve(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, home: ?*Home) u8 {
     var buf: [1 << 16]u8 = undefined;
     var r = Io.File.stdin().reader(io, &buf);
     var pinged = false;
@@ -47,9 +98,9 @@ pub fn run(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) 
             send(io, "{\"jsonrpc\":\"2.0\",\"id\":\"p1\",\"method\":\"ping\"}");
             // a stray response with an id nobody asked for
             send(io, "{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"tools\":[]}}");
-            result = tools_json;
+            result = if (home != null) home_tools_json else tools_json;
         } else if (std.mem.eql(u8, method, "tools/call")) {
-            result = call(io, a, v, env, pinged) catch return 1;
+            result = if (home) |h| homeCall(a, h, v) catch return 1 else call(io, a, v, env, pinged) catch return 1;
         } else if (std.mem.eql(u8, method, "resources/read")) {
             result = resource(io, a, v) orelse {
                 send(io, std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"error\":{{\"code\":-32002,\"message\":\"no such resource\"}}}}", .{id_json}) catch return 1);
@@ -94,6 +145,14 @@ fn send(io: Io, line: []const u8) void {
 fn textResult(a: std.mem.Allocator, text: []const u8, is_error: bool) ![]const u8 {
     const s = try std.json.Stringify.valueAlloc(a, text, .{});
     return std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"isError\":{}}}", .{ s, is_error });
+}
+
+fn homeCall(a: std.mem.Allocator, h: *Home, v: std.json.Value) ![]const u8 {
+    const params = v.object.get("params") orelse return textResult(a, "no params", true);
+    if (params != .object) return textResult(a, "bad params", true);
+    const name_v = params.object.get("name") orelse return textResult(a, "no name", true);
+    const args: ?std.json.ObjectMap = if (params.object.get("arguments")) |x| (if (x == .object) x.object else null) else null;
+    return h.call(a, if (name_v == .string) name_v.string else "", args);
 }
 
 fn call(io: Io, a: std.mem.Allocator, v: std.json.Value, env: *const std.process.Environ.Map, pinged: bool) ![]const u8 {

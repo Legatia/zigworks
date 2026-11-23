@@ -3,7 +3,8 @@
 //! sources, money and setup calls; a grant with an expiry; the first allow
 //! or ask rule; the kind's default. Rules and grants are matched with the call's who:
 //! its definition, the definitions that delegated it and what started its
-//! run.
+//! run. A household member's call (`member:NAME`) has an order of its own
+//! (`decideMember`).
 const std = @import("std");
 const builtin = @import("builtin");
 const rules = @import("rules.zig");
@@ -154,6 +155,9 @@ pub const Ctx = struct {
     /// Where a shell command starts, as the model gave it ("" the
     /// workspace): confined like a file path, and `run` is checked there.
     dir: []const u8 = "",
+    /// A `send` to the run's own conversation (where its message came
+    /// from): a household member's run may post there.
+    here: bool = false,
 };
 
 /// What a grant covers: the exact argument, or for `fetch` and `browse`
@@ -399,7 +403,9 @@ pub const Gate = struct {
         var dir: []const u8 = "";
         var d = g.decideRaw(arena, tool, arg, now_s, ctx, &dir);
         if (d.subject.len == 0) d.subject = arg;
-        d.allow_day = !(tool == .money or tool.setup(arg) or (tool == .send and ctx.shared));
+        // a member is never given a day: the owner decides each time
+        const member = if (ctx.who) |w| who_mod.isMember(w.by) else false;
+        d.allow_day = !(tool == .money or tool.setup(arg) or (tool == .send and ctx.shared) or member);
         d.dir = dir;
         return d;
     }
@@ -453,6 +459,7 @@ pub const Gate = struct {
             if (need) |n| if (folders_mod.allows(f.*, arena, g.realFolders(arena, f), n.rel, n.access, w)) |why|
                 return .{ .action = .deny, .why = why, .subject = subject, .role = true };
         }
+        if (who_mod.isMember(w.by)) return g.decideMember(arena, tool, subject, given, ctx, w);
         const name = @tagName(tool);
         // a deny in the shared part, or in a section for the call's
         // definition, one that delegated it, or what started its run
@@ -513,6 +520,68 @@ pub const Gate = struct {
         return d;
     }
 
+    /// A household member's call: what members may use at all; a deny in
+    /// any section that reaches it; money asked of the owner every time; a
+    /// post where the member asked; the first allow or ask in a section
+    /// naming members (`[member:anna]`), then in `[member]`, then the
+    /// household defaults. The shared part and the definitions' sections
+    /// only narrow (their allows were written for the owner's runs), no
+    /// grant covers a member, and only an MCP call can wait for the owner.
+    fn decideMember(g: *const Gate, arena: std.mem.Allocator, tool: Tool, subject: []const u8, given: []const u8, ctx: Ctx, w: Who) Decision {
+        if (!memberTool(tool)) return .{ .action = .deny, .why = "not for household members", .subject = subject };
+        const name = @tagName(tool);
+        for (g.rules) |r| {
+            if (r.action != .deny or !envFits(r, tool, ctx.env)) continue;
+            const same = std.mem.eql(u8, r.tool, name) or (tool == .money and std.mem.eql(u8, r.tool, "mcp"));
+            if (!same or !scope(r, w).any()) continue;
+            if (g.matches(arena, tool, r.pattern, subject) or (given.len > 0 and g.matches(arena, tool, r.pattern, given)))
+                return .{ .action = .deny, .why = ruleWhy(arena, r), .subject = subject };
+        }
+        if (tool == .money) return .{ .action = .ask, .why = "money and guarded actions are asked of the owner every time", .subject = subject };
+        if (tool == .send and ctx.here) return .{ .action = .allow, .why = "where the member asked", .subject = subject };
+        var d = g.memberRule(arena, tool, subject, w) orelse memberDefault(tool, subject);
+        // the owner's own lines narrow: an ask in the shared part or in a
+        // section for the run's definition makes a member's allow ask
+        if (d.action == .allow) for (g.rules) |r| {
+            if (r.action != .ask or !std.mem.eql(u8, r.tool, name) or !envFits(r, tool, ctx.env)) continue;
+            const sc = scope(r, w);
+            if (!(sc.shared or sc.agent or sc.chain) or !g.matches(arena, tool, r.pattern, subject)) continue;
+            d = .{ .action = .ask, .why = ruleWhy(arena, r), .subject = subject };
+            break;
+        };
+        // only an action on a device or service can wait for the owner
+        if (d.action == .ask and tool != .mcp)
+            return .{ .action = .deny, .why = std.fmt.allocPrint(arena, "{s} can't wait for the owner in a member's run: an allow line under [member] lets members use it", .{name}) catch "it can't wait for the owner in a member's run", .subject = subject };
+        return d;
+    }
+
+    /// The first allow or ask for a member's call in a section naming
+    /// members (`[member:anna]`, `[member:a*]`), then in `[member]`.
+    fn memberRule(g: *const Gate, arena: std.mem.Allocator, tool: Tool, subject: []const u8, w: Who) ?Decision {
+        const name = @tagName(tool);
+        for ([_]bool{ true, false }) |named| for (g.rules) |r| {
+            if (r.action == .deny or !std.mem.eql(u8, r.tool, name)) continue;
+            const section = r.section orelse continue;
+            if (!who_mod.isMember(section) or (std.mem.indexOfScalar(u8, section, ':') != null) != named) continue;
+            if (!who_mod.matchesBy(section, w.by) or !g.matches(arena, tool, r.pattern, subject)) continue;
+            return .{ .action = r.action, .why = ruleWhy(arena, r), .subject = subject };
+        };
+        return null;
+    }
+
+    /// Whether a member's run is offered `tool`: what members may use, and
+    /// a page read only when a member's section allows some.
+    pub fn memberOffers(g: *const Gate, tool: Tool, w: Who) bool {
+        if (!memberTool(tool)) return false;
+        if (tool != .fetch and tool != .browse) return true;
+        for (g.rules) |r| {
+            if (r.action != .allow or !std.mem.eql(u8, r.tool, @tagName(tool))) continue;
+            const section = r.section orelse continue;
+            if (who_mod.isMember(section) and who_mod.matchesBy(section, w.by)) return true;
+        }
+        return false;
+    }
+
     /// Whether a rule's pattern matches; file patterns are read like file
     /// arguments: a leading `./` or the workspace's own path is dropped,
     /// `\` is a separator on Windows, case is ignored where volumes ignore it.
@@ -531,6 +600,37 @@ pub const Gate = struct {
         return rules.globCase(p, s, fold_paths);
     }
 };
+
+/// What a household member's run may use at all; the rest reaches the
+/// owner's files, machine, accounts, memory or settings.
+pub fn memberTool(tool: Tool) bool {
+    return switch (tool) {
+        .send, .search, .fetch, .browse, .mcp, .money => true,
+        else => false,
+    };
+}
+
+/// homemcp's tools a member uses alone: its reads and its ordinary devices
+/// (lights, plugs, climate, covers, within the home file's limits), on
+/// whatever server name the owner gave it. Never `home_guarded`.
+const home_tools = [_][]const u8{ "home_state", "home_wait", "home_set" };
+
+/// What a member's call gets when no member line decides it.
+fn memberDefault(tool: Tool, subject: []const u8) Decision {
+    return switch (tool) {
+        .search => .{ .action = .allow, .why = "household default: search", .subject = subject },
+        .mcp => blk: {
+            // "SERVER/TOOL INPUT"
+            const head = subject[0 .. std.mem.indexOfScalar(u8, subject, ' ') orelse subject.len];
+            const slash = std.mem.indexOfScalar(u8, head, '/') orelse break :blk .{ .action = .ask, .why = "household default: the owner decides", .subject = subject };
+            if (oneOf(head[slash + 1 ..], &home_tools)) break :blk .{ .action = .allow, .why = "household default: the home's reads and ordinary devices", .subject = subject };
+            break :blk .{ .action = .ask, .why = "household default: the owner decides", .subject = subject };
+        },
+        .fetch, .browse => .{ .action = .deny, .why = "household default: members' runs read no pages (search instead); an allow line under [member] lets them read some", .subject = subject },
+        .send => .{ .action = .deny, .why = "a member's run posts only where the member asked", .subject = subject },
+        else => .{ .action = .deny, .why = "not for household members", .subject = subject },
+    };
+}
 
 /// Where a rule applies to a call: the shared part, or a section whose who
 /// pattern matches the call's definition, a definition that delegated it,
@@ -1365,4 +1465,156 @@ test "shell_dir_is_confined_and_needs_run" {
     const plain = f.gate.decide(a, .shell, "make", 1000, .{});
     try t.expectEqual(.ask, plain.action);
     try t.expectEqualStrings("", plain.dir);
+}
+
+// ---- household members ----
+
+const anna: Who = .{ .by = "member:anna" };
+const ben: Who = .{ .by = "member:ben" };
+
+test "a_members_defaults" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const m: Ctx = .{ .who = anna };
+    // homemcp's reads and ordinary devices, on any server's name, and search
+    for ([_][]const u8{ "home/home_state {}", "house/home_wait {\"device\":\"hall_motion\"}", "home/home_set {\"device\":\"hall_light\",\"action\":\"on\"}" }) |arg|
+        try t.expectEqual(.allow, f.act(.mcp, arg, m));
+    try t.expectEqual(.allow, f.act(.search, "weather tomorrow", m));
+    // another MCP tool is the owner's to decide; money every time; never for a day
+    const car = f.gate.decide(a, .mcp, "cloud/car_status {}", 1000, m);
+    try t.expectEqual(.ask, car.action);
+    try t.expect(!car.allow_day);
+    try t.expectEqual(.ask, f.act(.mcp, "home/home_settings {}", m));
+    const lock = f.gate.decide(a, .money, "home/home_guarded {\"device\":\"front_door\",\"action\":\"unlock\"}", 1000, m);
+    try t.expectEqual(.ask, lock.action);
+    try t.expect(!lock.allow_day);
+    // a home tool not listed as money is no guarded device's way round
+    try t.expectEqual(.ask, f.act(.mcp, "home/home_guarded {\"device\":\"front_door\",\"action\":\"unlock\"}", m));
+    // pages are not read for members
+    try t.expectEqual(.deny, f.act(.fetch, "https://example.com/", m));
+    try t.expectEqual(.deny, f.act(.browse, "https://example.com/", m));
+    // a post where the member asked, nowhere else
+    try t.expectEqual(.allow, f.act(.send, "home", .{ .who = anna, .shared = true, .here = true }));
+    try t.expectEqual(.deny, f.act(.send, "main", .{ .who = anna }));
+    try t.expectEqual(.deny, f.act(.send, "family", .{ .who = anna, .shared = true }));
+    // the owner's runs keep their defaults
+    try t.expectEqual(.ask, f.act(.mcp, "home/home_set {}", .{}));
+    try t.expect(f.gate.decide(a, .shell, "ls", 1000, .{}).allow_day);
+}
+
+test "what_members_never_get" {
+    var f: Fixture = undefined;
+    try f.init("allow shell *\n[member]\nallow shell *\nallow read_file *\nallow write_file *\nallow web *\nallow login *\nallow recall *\nallow remember *\nallow history *\nallow skill *\nallow skill_save *\nallow delegate *\nallow agent_save *\nallow trigger *\nallow workflow *\nallow ask_owner *\nallow snapshot *\nallow app_read *\nallow env_save *\nallow mail *\n");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const Call = struct { Tool, []const u8 };
+    const calls = [_]Call{
+        .{ .shell, "ls" },              .{ .read_file, "notes.md" }, .{ .write_file, "notes.md" }, .{ .web, "example.com" },
+        .{ .login, "bot example.com" }, .{ .recall, "x" },           .{ .remember, "x" },          .{ .history, "x" },
+        .{ .skill, "x" },               .{ .skill_save, "x" },       .{ .delegate, "1 task" },     .{ .agent_save, "x" },
+        .{ .trigger, "add x" },         .{ .trigger, "list" },       .{ .workflow, "save x" },     .{ .workflow, "list" },
+        .{ .ask_owner, "x?" },          .{ .snapshot, "notes" },     .{ .app_read, "x log" },      .{ .env_save, "box" },
+        .{ .mail, "home" },
+    };
+    for (calls) |c| {
+        const d = f.gate.decide(a, c[0], c[1], 1000, .{ .who = anna });
+        if (d.action != .deny) std.debug.print("{s} {s}: {s}\n", .{ @tagName(c[0]), c[1], @tagName(d.action) });
+        try t.expectEqual(.deny, d.action);
+        try t.expectEqualStrings("not for household members", d.why);
+        try t.expect(!f.gate.memberOffers(c[0], anna));
+    }
+    // the owner's are decided as before
+    try t.expectEqual(.allow, f.act(.shell, "ls", .{}));
+}
+
+test "member_sections_decide_for_members_only" {
+    var f: Fixture = undefined;
+    try f.init(
+        \\allow mcp cloud/car_lock *
+        \\allow fetch https://news.example.com/*
+        \\[agent:main]
+        \\allow mcp cloud/car_climate *
+        \\[owner]
+        \\allow mcp cloud/car_status *
+        \\[member]
+        \\allow mcp cloud/car_status *
+        \\allow fetch https://*.wikipedia.org/*
+        \\ask fetch https://maps.example.com/*
+        \\[member:anna]
+        \\ask mcp cloud/car_status *
+        \\[member:b*]
+        \\allow mcp cloud/car_command *
+        \\
+    );
+    defer f.deinit();
+    const a = f.arena.allocator();
+    // a section naming members first, whatever comes first in the file
+    try t.expectEqual(.ask, f.act(.mcp, "cloud/car_status {}", .{ .who = anna }));
+    try t.expectEqual(.allow, f.act(.mcp, "cloud/car_status {}", .{ .who = ben }));
+    try t.expectEqual(.ask, f.act(.mcp, "cloud/car_command {}", .{ .who = anna }));
+    try t.expectEqual(.allow, f.act(.mcp, "cloud/car_command {}", .{ .who = ben }));
+    // the owner's allows are not a member's: the shared part, a definition's, [owner]
+    try t.expectEqual(.ask, f.act(.mcp, "cloud/car_lock {}", .{ .who = anna }));
+    try t.expectEqual(.ask, f.act(.mcp, "cloud/car_climate {}", .{ .who = anna }));
+    try t.expectEqual(.deny, f.act(.fetch, "https://news.example.com/a", .{ .who = anna }));
+    // a member line lets members read a page; an ask for one is no question
+    try t.expectEqual(.allow, f.act(.fetch, "https://en.wikipedia.org/wiki/Zig", .{ .who = anna }));
+    const maps = f.gate.decide(a, .fetch, "https://maps.example.com/x", 1000, .{ .who = anna });
+    try t.expectEqual(.deny, maps.action);
+    try t.expect(std.mem.indexOf(u8, maps.why, "[member]") != null);
+    // the owner's runs as before
+    try t.expectEqual(.allow, f.act(.mcp, "cloud/car_status {}", .{}));
+    try t.expectEqual(.allow, f.act(.mcp, "cloud/car_lock {}", .{}));
+    try t.expectEqual(.allow, f.act(.mcp, "cloud/car_climate {}", .{}));
+    try t.expect(f.gate.memberOffers(.fetch, anna));
+}
+
+test "the_owners_deny_and_ask_reach_members" {
+    var f: Fixture = undefined;
+    try f.init(
+        \\deny mcp */home_set {"device":"oven"*
+        \\ask mcp */home_set {"device":"heater"*
+        \\[agent:main]
+        \\deny mcp cloud/*
+        \\[member]
+        \\allow mcp cloud/car_status *
+        \\deny mcp */home_set {"device":"tv"*
+        \\
+    );
+    defer f.deinit();
+    const m: Ctx = .{ .who = anna };
+    try t.expectEqual(.deny, f.act(.mcp, "home/home_set {\"device\":\"oven\",\"action\":\"on\"}", m));
+    try t.expectEqual(.ask, f.act(.mcp, "home/home_set {\"device\":\"heater\",\"action\":\"on\"}", m));
+    try t.expectEqual(.deny, f.act(.mcp, "cloud/car_status {}", m));
+    try t.expectEqual(.deny, f.act(.mcp, "home/home_set {\"device\":\"tv\",\"action\":\"on\"}", m));
+    try t.expectEqual(.allow, f.act(.mcp, "home/home_set {\"device\":\"hall_light\",\"action\":\"on\"}", m));
+    // a deny stops a post where the member asked too
+    f.gate.rules = try rules.parse(f.arena.allocator(), "[member:anna]\ndeny send home\n");
+    try t.expectEqual(.deny, f.act(.send, "home", .{ .who = anna, .shared = true, .here = true }));
+    try t.expectEqual(.allow, f.act(.send, "home", .{ .who = ben, .shared = true, .here = true }));
+}
+
+test "no_grant_covers_a_member" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.grants.add(.mcp, "cloud/car_status", 5000);
+    try f.grants.addFor(.mcp, "", "cloud/car_command", "agent:main", 5000);
+    try f.grants.addFor(.mcp, "", "cloud/car_climate", "member:anna", 5000);
+    for ([_][]const u8{ "cloud/car_status {}", "cloud/car_command {}", "cloud/car_climate {}" }) |arg|
+        try t.expectEqual(.ask, f.act(.mcp, arg, .{ .who = anna }));
+    try t.expectEqual(.allow, f.act(.mcp, "cloud/car_status {}", .{}));
+    try t.expectEqual(.allow, f.act(.mcp, "cloud/car_command {}", .{}));
+}
+
+test "member_offers_pages_only_when_a_member_rule_allows_them" {
+    var f: Fixture = undefined;
+    try f.init("allow fetch https://a.com/*\n[member:ben]\nallow fetch https://b.com/*\nask browse https://b.com/*\n");
+    defer f.deinit();
+    try t.expect(!f.gate.memberOffers(.fetch, anna));
+    try t.expect(f.gate.memberOffers(.fetch, ben));
+    try t.expect(!f.gate.memberOffers(.browse, ben));
+    for ([_]Tool{ .send, .search, .mcp, .money }) |tool| try t.expect(f.gate.memberOffers(tool, anna));
 }

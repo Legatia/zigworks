@@ -239,6 +239,16 @@ say "/pair $CODE"
 check "pairing answers the owner" 'wait_for "$OUT" "Paired."'
 check "a stranger is dropped and logged" 'grep -qF "\"from\":7" "$HARNESS_HOME/log/actions.jsonl"'
 
+# a household member: the owner's code, the person's /join, their own chat
+say "/member add anna"
+check "the owner gets a member's code" 'wait_for "$OUT" "Code for anna: "'
+MCODE=$(grep -o 'Code for anna: [A-Z0-9]*' "$OUT" | tail -n 1 | sed 's/^Code for anna: //')
+inbox "{\"message\":{\"from\":{\"id\":77},\"chat\":{\"id\":77,\"type\":\"private\"},\"text\":\"/join $MCODE\"}}"
+check "the member joins with it from their own chat" 'wait_for "$OUT" "Hi Anna, you" && wait_for "$OUT" "anna joined" && ! grep -qF "$MCODE" "$HARNESS_HOME/log/actions.jsonl"'
+reply "$(text_reply 'The hall light is off.')"
+inbox "{\"message\":{\"from\":{\"id\":77},\"chat\":{\"id\":77,\"type\":\"private\"},\"text\":\"is the hall light on?\"}}"
+check "a member is answered in their own chat, as member:anna" 'wait_for "$OUT" "The hall light is off." && grep -F "The hall light is off." "$OUT" | grep -qF "\"chat_id\":77" && grep -qF "\"by\":\"member:anna\"" "$HARNESS_HOME/log/actions.jsonl" && grep -qF "From: Anna (member:anna)" "$(req)"'
+
 reply "$(tool_reply tu_1 'echo smoke-ran')"
 reply "$(text_reply 'done: smoke-ran')"
 say "run the echo"
