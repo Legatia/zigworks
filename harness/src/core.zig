@@ -633,6 +633,11 @@ pub const Core = struct {
     watcher: ?std.Thread = null,
     /// Said to the owner when a channel is attached.
     pending_warning: ?[]const u8 = null,
+    /// Where harness's binary is (main sets it): homemcp and carcloud are
+    /// looked for there first.
+    exe_dir: []const u8 = "",
+    /// One step of the butler's setup at a time.
+    setup_mutex: Io.Mutex = .init,
     /// What /reload says when the settings files have an error.
     problem_buf: [800]u8 = undefined,
 
@@ -797,6 +802,8 @@ pub const Core = struct {
         c.system_vars = &.{};
         c.told_settings_changed = false;
         c.pending_warning = null;
+        c.exe_dir = "";
+        c.setup_mutex = .init;
         c.role = "open";
         // problem_buf: written before it is read
         // the inbox: read, its first id from 0.3's approval numbers; items
@@ -1423,7 +1430,8 @@ pub const Core = struct {
                     for (dropped) |name| c.resetContext(name);
                 }
                 try c.log.write(.chat, false, .{ .event = "paired", .from = from_id, .before = before, .topics_dropped = dropped.len });
-                const hello = "Paired. I answer only you from now on. Send /help for commands.";
+                // a home butler (quiet hours on) with no home yet: what next
+                const hello = if (c.cfg.butler.quiet != null and !c.homeOn(a)) "Paired. I answer only you from now on. Next: /setup home connects your home. /help lists the commands." else "Paired. I answer only you from now on. Send /help for commands.";
                 if (dropped.len == 0) c.say(hello) else c.say(try std.fmt.allocPrint(a, "{s}\nThe topics of the account paired before are no longer conversations: {s}.", .{ hello, try std.mem.join(a, ", ", dropped) }));
                 return;
             }
@@ -3345,6 +3353,8 @@ pub const Core = struct {
         var post: ?inbox_mod.Post = null;
         // a paused trigger's name: Resume or Remove acts on it
         var paused: ?[]const u8 = null;
+        // the butler's setup: what it writes before the item closes
+        var setup: ?struct { run: []const u8, conv: []const u8 } = null;
         {
             c.inbox.mutex.lockUncancelable(c.io);
             defer c.inbox.mutex.unlock(c.io);
@@ -3365,6 +3375,10 @@ pub const Core = struct {
             };
             if (std.mem.eql(u8, it.kind, "paused") and std.mem.startsWith(u8, it.by, "trigger:")) {
                 paused = a.dupe(u8, it.by["trigger:".len..]) catch return .not_offered;
+                it.settling = true;
+            }
+            if ((std.mem.eql(u8, it.kind, "setup") or std.mem.eql(u8, it.kind, "routine")) and it.run != null) {
+                setup = .{ .run = a.dupe(u8, it.run.?) catch return .not_offered, .conv = a.dupe(u8, it.conversation) catch return .not_offered };
                 it.settling = true;
             }
         }
@@ -3410,8 +3424,19 @@ pub const Core = struct {
             c.say(std.fmt.allocPrint(a, "Item {d}: the grant could not be written ({s}); nothing changed.", .{ id, @errorName(e) }) catch "The grant could not be written; nothing changed.");
             return .not_offered;
         };
+        // setup's answer: written and applied first (the words not kept: an
+        // address is in state/setup, a token never)
+        var setup_done: ?SetupDone = null;
+        if (setup) |s| setup_done = c.setupAnswer(a, s.run, s.conv, key, said) catch |e| {
+            c.unsettle(id);
+            // (a file may be written when a later one fails: tapping again
+            // writes them all again, the same)
+            c.sayIn(s.conv, std.fmt.allocPrint(a, "Not done: {s}.", .{setupWhy(e)}) catch "Not done.");
+            return .failed;
+        };
         // closing it ends `settling`: no other answer slips in before
-        if (!c.settle(id, .answered, .{ .key = key, .text = said, .at = c.now(), .via = via })) return .closed;
+        if (!c.settle(id, .answered, .{ .key = key, .text = if (setup != null) null else said, .at = c.now(), .via = via })) return .closed;
+        if (setup_done) |d| c.setupFollow(a, setup.?.conv, d);
         return .taken;
     }
 
@@ -7981,6 +8006,553 @@ pub const Core = struct {
         return c.isShared(name);
     }
 
+    // ---- the butler's setup (Part 7): /setup home, /setup car, the routines ----
+
+    /// What setup keeps between messages: `state/setup/`.
+    fn setupPath(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        const dir = try std.fs.path.join(a, &.{ c.paths.state, "setup" });
+        try Io.Dir.cwd().createDirPath(c.io, dir);
+        return std.fs.path.join(a, &.{ dir, name });
+    }
+
+    fn readOr(c: *Core, a: std.mem.Allocator, path: []const u8) []const u8 {
+        return Io.Dir.cwd().readFileAlloc(c.io, path, a, .limited(1 << 20)) catch "";
+    }
+
+    fn dataPath(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        return std.fs.path.join(a, &.{ c.paths.home, name });
+    }
+
+    /// homemcp or carcloud: `[butler] homemcp =` (or `carcloud =`), else
+    /// next to harness, else on PATH; null: not found.
+    fn findProgram(c: *Core, a: std.mem.Allocator, name: []const u8, set: []const u8) ?[]const u8 {
+        if (set.len > 0) return if (Io.Dir.cwd().statFile(c.io, set, .{})) |_| set else |_| null;
+        const exe = if (builtin.os.tag == .windows) std.fmt.allocPrint(a, "{s}.exe", .{name}) catch return null else name;
+        if (c.exe_dir.len > 0) {
+            const p = std.fs.path.join(a, &.{ c.exe_dir, exe }) catch return null;
+            if (Io.Dir.cwd().statFile(c.io, p, .{})) |_| return p else |_| {}
+        }
+        var it = std.mem.tokenizeScalar(u8, c.path_var, if (builtin.os.tag == .windows) ';' else ':');
+        while (it.next()) |dir| {
+            const p = std.fs.path.join(a, &.{ dir, exe }) catch continue;
+            if (Io.Dir.cwd().statFile(c.io, p, .{})) |_| return p else |_| {}
+        }
+        return null;
+    }
+
+    /// Runs `argv` with PATH, HOME, the system's variables and `secret`
+    /// (an environment variable from a stored secret): its output, or why
+    /// not; at most `secs` seconds.
+    const Ran = struct { ok: bool, out: []const u8, err: []const u8 };
+
+    fn runProgram(c: *Core, a: std.mem.Allocator, argv: []const []const u8, secret: ?[2][]const u8, secs: i64) Ran {
+        var env = std.process.Environ.Map.init(a);
+        for (c.system_vars) |v| env.put(v.name, v.value) catch {};
+        env.put("PATH", c.path_var) catch {};
+        if (c.home_var.len > 0) env.put("HOME", c.home_var) catch {};
+        env.put("LANG", "C.UTF-8") catch {};
+        if (secret) |s| env.put(s[0], s[1]) catch {};
+        const r = std.process.run(a, c.io, .{
+            .argv = argv,
+            .environ_map = &env,
+            .stdout_limit = .limited(1 << 20),
+            .stderr_limit = .limited(1 << 16),
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(secs), .clock = .awake } },
+        }) catch |e| return .{ .ok = false, .out = "", .err = if (e == error.Timeout) "it did not answer in time" else @errorName(e) };
+        // what a program says is masked like any tool's output
+        const out = c.masks.scrubAlloc(a, r.stdout) catch r.stdout;
+        const err = c.masks.scrubAlloc(a, r.stderr) catch r.stderr;
+        const ok = switch (r.term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        return .{ .ok = ok, .out = out, .err = std.mem.trim(u8, err, " \t\r\n") };
+    }
+
+    /// homemcp's or carcloud's error line, without its program's name.
+    fn programWords(text: []const u8) []const u8 {
+        var t0 = text;
+        for ([_][]const u8{ "homemcp: discover: ", "homemcp: ", "carcloud: " }) |p| if (std.mem.startsWith(u8, t0, p)) {
+            t0 = t0[p.len..];
+            break;
+        };
+        return std.mem.trim(u8, t0[0 .. std.mem.indexOfScalar(u8, t0, '\n') orelse t0.len], " .");
+    }
+
+    /// `/setup [home [URL] | home leave|ask|allow NAME | car [CLIENT
+    /// VEHICLE USER [API]] | routines]`. One step of setup at a time.
+    fn setupCommand(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        c.setup_mutex.lockUncancelable(c.io);
+        defer c.setup_mutex.unlock(c.io);
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const what = words.next() orelse return c.setupStatus(a);
+        const eql = std.mem.eql;
+        if (eql(u8, what, "home")) {
+            const next = words.next() orelse return c.setupHome(a, conv, "");
+            inline for (.{ "leave", "ask", "allow" }) |op| if (eql(u8, next, op)) {
+                const name = std.mem.trim(u8, words.rest(), " \t");
+                if (name.len == 0) return "Name the device: /setup home " ++ op ++ " NAME (as the summary or home.ini names it).";
+                return c.setupEdit(a, conv, @field(butler.Op, op), name);
+            };
+            if (words.next() != null) return "Use /setup home ADDRESS, like /setup home http://homeassistant.local:8123.";
+            return c.setupHome(a, conv, next);
+        }
+        if (eql(u8, what, "car")) {
+            var ids: [4][]const u8 = .{ "", "", "", "" };
+            var n: usize = 0;
+            while (words.next()) |w| : (n += 1) {
+                if (n == 4) return car_help;
+                ids[n] = w;
+            }
+            if (n == 0) return car_help;
+            if (n < 3) return "Send all three: /setup car CLIENT_ID VEHICLE_ID USER_ID (Smartcar's Dashboard shows them).";
+            return c.setupCar(a, conv, ids[0], ids[1], ids[2], ids[3]);
+        }
+        if (eql(u8, what, "routines")) {
+            if (!c.homeOn(a)) return "The routines need the home first: /setup home.";
+            return c.startOffers(a, conv, null);
+        }
+        return "Use /setup home, /setup car or /setup routines; /setup alone says where setup is.";
+    }
+
+    const car_help =
+        \\To reach your car I use Smartcar, through carcloud: your Smartcar application and the car connected to it.
+        \\1. In a terminal where harness runs: harness secret add smartcar (the application's client secret, from Smartcar's Dashboard).
+        \\2. Here: /setup car CLIENT_ID VEHICLE_ID USER_ID (the application's client id; the vehicle and user ids Smartcar's Dashboard shows once the car is connected).
+        \\Never send the secret here.
+    ;
+
+    const home_token_help = "In a terminal where harness runs: harness secret add ha (in Home Assistant: your profile, Security, Long-lived access tokens, Create token). Never send the token here.";
+
+    /// Where setup is: the home, the car, the routines.
+    fn setupStatus(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        var o: std.ArrayList(u8) = .empty;
+        if (c.homeOn(a)) {
+            const h = try butler.parseHome(a, c.readOr(a, try c.dataPath(a, "home.ini")));
+            try o.print(a, "Home: connected, {d} devices (home.ini). /setup home reads it again.", .{h.devices.len});
+        } else try o.appendSlice(a, "Home: not connected. /setup home connects Home Assistant.");
+        if (c.carOn(a)) try o.appendSlice(a, "\nCar: connected (car.ini). /setup car again for other ids.") else try o.appendSlice(a, "\nCar: not connected. /setup car connects one on Smartcar.");
+        var on: std.ArrayList([]const u8) = .empty;
+        for (butler.all) |r| if (c.workflowText(a, r.name()) != null) try on.append(a, r.title());
+        if (on.items.len > 0) try o.print(a, "\nRoutines on: {s}. /setup routines offers the others.", .{try std.mem.join(a, ", ", on.items)}) else try o.appendSlice(a, "\nRoutines: none on yet. /setup routines offers them, once the home is connected.");
+        return o.items;
+    }
+
+    /// Whether mcp.ini has the section `[NAME]`.
+    fn mcpHas(c: *Core, a: std.mem.Allocator, name: []const u8) bool {
+        const cfgs = mcp.parseConfig(a, c.readOr(a, c.paths.mcp)) catch return false;
+        for (cfgs) |sc| if (std.mem.eql(u8, sc.name, name)) return true;
+        return false;
+    }
+
+    fn homeOn(c: *Core, a: std.mem.Allocator) bool {
+        const p = c.dataPath(a, "home.ini") catch return false;
+        _ = Io.Dir.cwd().statFile(c.io, p, .{}) catch return false;
+        return c.mcpHas(a, "home");
+    }
+
+    fn carOn(c: *Core, a: std.mem.Allocator) bool {
+        return c.mcpHas(a, "car");
+    }
+
+    /// `/setup home [URL]`: Home Assistant (or Zigbee2MQTT) read through
+    /// `homemcp discover`, the file shown, then one summary with [Looks
+    /// right] [Change it]; nothing is written before that answer.
+    fn setupHome(c: *Core, a: std.mem.Allocator, conv: []const u8, url_in: []const u8) ![]const u8 {
+        const url_path = try c.setupPath(a, "url");
+        var url = std.mem.trim(u8, url_in, " \t<>");
+        if (url.len > 0 and butler.looksLikeToken(url)) return token_pasted;
+        if (url.len == 0) url = std.mem.trim(u8, c.readOr(a, url_path), " \t\r\n");
+        if (url.len == 0) url = (try butler.parseHome(a, c.readOr(a, try c.dataPath(a, "home.ini")))).url;
+        if (url.len == 0) {
+            // asked: the address comes as a reply
+            _ = try c.addItem(.{ .kind = "setup", .run = "setup address", .conversation = conv, .title = "What is your Home Assistant's address?", .body = "What is your Home Assistant's address? Reply with it, like http://homeassistant.local:8123 (or mqtt://HOST:1883 for Zigbee2MQTT).\nIts token goes in a terminal where harness runs: harness secret add ha. Never send the token here.", .text = .answer, .expires = c.now() + 86400 });
+            return "";
+        }
+        const mqtt = std.mem.startsWith(u8, url, "mqtt://");
+        if (!mqtt and !std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://"))
+            return std.fmt.allocPrint(a, "{s} is not an address: Home Assistant's is like http://homeassistant.local:8123, Zigbee2MQTT's broker like mqtt://192.168.1.5:1883.", .{util.cut(url, 80)});
+        try util.writeReplace(c.io, url_path, url);
+        const token: ?[]const u8 = if (mqtt) null else c.secretValue(a, "ha") orelse
+            return std.fmt.allocPrint(a, "Home Assistant's token isn't stored yet. {s} Then send /setup home again.", .{home_token_help});
+        const prog = c.findProgram(a, "homemcp", c.cfg.butler.homemcp) orelse
+            return std.fmt.allocPrint(a, "homemcp isn't {s}: put it there (it comes with harness), or set [butler] homemcp = its path in config.ini and /reload; then /setup home again.", .{if (c.cfg.butler.homemcp.len > 0) "where [butler] homemcp says" else "next to harness or on PATH"});
+        const secret: ?[2][]const u8 = if (token) |tk| .{ "HA_TOKEN", tk } else null;
+        c.sayIn(conv, try std.fmt.allocPrint(a, "Reading {s} …", .{url}));
+        const found = c.runProgram(a, &.{ prog, "discover", url }, secret, 60);
+        if (!found.ok) {
+            const why = programWords(found.err);
+            const refused = std.mem.indexOf(u8, why, "HA_TOKEN") != null;
+            if (refused) return std.fmt.allocPrint(a, "Home Assistant at {s} refused the token stored as ha. Store the right one: harness secret add ha (in a terminal), then /setup home again.", .{url});
+            return std.fmt.allocPrint(a, "{s}: {s}. Check the address, then /setup home again (/setup home ADDRESS for another).", .{ url, if (why.len > 0) why else "homemcp discover failed" });
+        }
+        // the switches discover can't identify stay guarded until sorted;
+        // what was sorted before stays sorted
+        var text = try butler.markUnidentified(a, found.out);
+        const live = c.readOr(a, try c.dataPath(a, "home.ini"));
+        if (live.len > 0) text = try butler.carryOver(a, text, live);
+        if (!std.mem.endsWith(u8, text, "\n")) text = try std.fmt.allocPrint(a, "{s}\n", .{text});
+        return c.showHome(a, conv, text, prog, secret);
+    }
+
+    const token_pasted = "That looks like a token, not an address: I kept nothing of it. Delete that message, and store the token in a terminal where harness runs: harness secret add ha.";
+
+    /// The pending home file `text`: written to state/setup/, checked with
+    /// `homemcp check`, shown with what mcp.ini and rules get, then the
+    /// summary item.
+    fn showHome(c: *Core, a: std.mem.Allocator, conv: []const u8, text: []const u8, prog: []const u8, secret: ?[2][]const u8) ![]const u8 {
+        const pending = try c.setupPath(a, "home.ini");
+        try util.writeReplace(c.io, pending, text);
+        const checked = c.runProgram(a, &.{ prog, "check", pending }, secret, 60);
+        if (!checked.ok) return std.fmt.allocPrint(a, "The home file doesn't work yet: {s}.", .{programWords(checked.err)});
+        try util.writeReplace(c.io, try c.setupPath(a, "home-check.txt"), checked.out);
+        var h = try butler.parseHome(a, text);
+        butler.readCheck(&h, checked.out);
+        // shown before it is written
+        c.sayIn(conv, try std.fmt.allocPrint(a, "home.ini, as Looks right writes it:\n\n{s}", .{text}));
+        const adds = try c.homeAdditions(a, prog);
+        if (adds.len > 0) c.sayIn(conv, adds);
+        c.withdrawSetupItems(a, "setup home");
+        _ = try c.addItem(.{ .kind = "setup", .run = "setup home", .conversation = conv, .title = try std.fmt.allocPrint(a, "I found {d} devices", .{h.devices.len}), .body = try butler.homeSummary(a, h), .choices = &.{ .{ .key = "yes", .label = "Looks right" }, .{ .key = "change", .label = "Change it" } }, .expires = c.now() + 7 * 86400 });
+        return "";
+    }
+
+    /// What Looks right adds to mcp.ini and rules (what they have already
+    /// is not said again).
+    fn homeAdditions(c: *Core, a: std.mem.Allocator, prog: []const u8) ![]const u8 {
+        var o: std.ArrayList(u8) = .empty;
+        const section = try butler.mcpSection(a, .home, prog, try c.dataPath(a, "home.ini"));
+        if (!std.mem.eql(u8, std.mem.trim(u8, (try butler.sectionOf(a, c.readOr(a, c.paths.mcp), "home")) orelse "", " \n"), std.mem.trim(u8, section, " \n")))
+            try o.print(a, "mcp.ini gets:\n{s}\n", .{section});
+        const lines = try butler.setupRules(a, .home);
+        if (!c.rulesHave(a, lines)) try o.print(a, "{s}rules gets:\n{s}\n", .{ if (o.items.len > 0) "\n" else "", lines });
+        return o.items;
+    }
+
+    /// Whether rules has `lines` already: their rule and section lines (the
+    /// comments aside), together and in order, so a line under another
+    /// section does not count.
+    fn rulesHave(c: *Core, a: std.mem.Allocator, lines: []const u8) bool {
+        const have = c.readOr(a, c.paths.rules);
+        var block: std.ArrayList(u8) = .empty;
+        var it = std.mem.splitScalar(u8, lines, '\n');
+        while (it.next()) |l| {
+            const tl = std.mem.trim(u8, l, " \t\r");
+            if (tl.len == 0 or tl[0] == '#') continue;
+            if (block.items.len > 0) block.append(a, '\n') catch return false;
+            block.appendSlice(a, tl) catch return false;
+        }
+        if (block.items.len == 0) return true;
+        return std.mem.indexOf(u8, have, block.items) != null;
+    }
+
+    /// Closes the open setup items of `run` (a newer one takes their place).
+    fn withdrawSetupItems(c: *Core, a: std.mem.Allocator, run: []const u8) void {
+        var ids: std.ArrayList(u64) = .empty;
+        {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            for (c.inbox.items.items) |it| if (it.status == .open and it.run != null and std.mem.eql(u8, it.run.?, run)) ids.append(a, it.id) catch {};
+        }
+        for (ids.items) |id| _ = c.settle(id, .withdrawn, .{ .text = "a newer one took its place", .at = c.now(), .via = .harness });
+    }
+
+    /// `/setup home leave|ask|allow NAME`: the pending file changed, the
+    /// change said, the summary again.
+    fn setupEdit(c: *Core, a: std.mem.Allocator, conv: []const u8, op: butler.Op, name: []const u8) ![]const u8 {
+        const pending_path = try c.setupPath(a, "home.ini");
+        var text = c.readOr(a, pending_path);
+        if (text.len == 0) text = c.readOr(a, try c.dataPath(a, "home.ini"));
+        if (text.len == 0) return "There is no home file yet: /setup home first.";
+        const e = try butler.editHome(a, text, op, name);
+        if (e.refused) return e.said;
+        c.sayIn(conv, e.said);
+        const prog = c.findProgram(a, "homemcp", c.cfg.butler.homemcp) orelse return "homemcp isn't next to harness or on PATH any more.";
+        const token: ?[]const u8 = c.secretValue(a, "ha");
+        return c.showHome(a, conv, e.text, prog, if (token) |tk| .{ "HA_TOKEN", tk } else null);
+    }
+
+    /// `/setup car CLIENT VEHICLE USER [API]`: the car file carcloud reads,
+    /// checked with `carcloud check`, shown, then the summary.
+    fn setupCar(c: *Core, a: std.mem.Allocator, conv: []const u8, client: []const u8, vehicle: []const u8, user: []const u8, api: []const u8) ![]const u8 {
+        for ([_][]const u8{ client, vehicle, user }) |id| if (!butler.plainId(id)) return "Those ids don't read as Smartcar's: letters, digits, - and _ only. /setup car CLIENT_ID VEHICLE_ID USER_ID.";
+        if (api.len > 0 and !(std.mem.startsWith(u8, api, "http://") or std.mem.startsWith(u8, api, "https://"))) return "The fourth word is another Smartcar address (carcloud-sim's, for trying): http://127.0.0.1:PORT.";
+        const secret = c.secretValue(a, "smartcar") orelse return "Smartcar's client secret isn't stored yet. In a terminal where harness runs: harness secret add smartcar. Then send /setup car again. Never send the secret here.";
+        const prog = c.findProgram(a, "carcloud", c.cfg.butler.carcloud) orelse
+            return std.fmt.allocPrint(a, "carcloud isn't {s}: put it there (it comes with harness), or set [butler] carcloud = its path in config.ini and /reload; then /setup car again.", .{if (c.cfg.butler.carcloud.len > 0) "where [butler] carcloud says" else "next to harness or on PATH"});
+        const text = try butler.carFile(a, client, vehicle, user, api, try c.setupDate(a), try std.fs.path.join(a, &.{ c.paths.state, "car-actions.jsonl" }));
+        const pending = try c.setupPath(a, "car.ini");
+        try util.writeReplace(c.io, pending, text);
+        const checked = c.runProgram(a, &.{ prog, "check", pending }, .{ "SMARTCAR_CLIENT_SECRET", secret }, 120);
+        if (!checked.ok) return std.fmt.allocPrint(a, "Smartcar didn't give the car's state: {s}. Check the ids and the secret (harness secret add smartcar), then /setup car again.", .{programWords(checked.err)});
+        c.sayIn(conv, try std.fmt.allocPrint(a, "car.ini, as Looks right writes it:\n\n{s}", .{text}));
+        var o: std.ArrayList(u8) = .empty;
+        try o.print(a, "mcp.ini gets:\n{s}\n", .{try butler.mcpSection(a, .car, prog, try c.dataPath(a, "car.ini"))});
+        const lines = try butler.setupRules(a, .car);
+        if (!c.rulesHave(a, lines)) try o.print(a, "\nrules gets:\n{s}\n", .{lines});
+        c.sayIn(conv, o.items);
+        c.withdrawSetupItems(a, "setup car");
+        _ = try c.addItem(.{ .kind = "setup", .run = "setup car", .conversation = conv, .title = "The car answers", .body = try butler.carSummary(a, checked.out), .choices = &.{ .{ .key = "yes", .label = "Looks right" }, .{ .key = "change", .label = "Change it" } }, .expires = c.now() + 7 * 86400 });
+        return "";
+    }
+
+    /// "2026-11-23", the owner's day.
+    fn setupDate(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        var buf: [20]u8 = undefined;
+        return a.dupe(u8, localStamp(&buf, c.now(), c.cfg.chat.utc_offset)[0..10]);
+    }
+
+    /// `text` as settings file `path`: written whole, before what follows
+    /// acts on it.
+    fn writeSetting(c: *Core, path: []const u8, text: []const u8) !void {
+        try util.writeReplace(c.io, path, text);
+    }
+
+    /// mcp.ini with section `name` as `section` (in place of one it had).
+    fn withMcpSection(c: *Core, a: std.mem.Allocator, name: []const u8, section: []const u8) ![]const u8 {
+        const old = c.readOr(a, c.paths.mcp);
+        const kept = butler.dropSection(a, old, name) catch old;
+        const base = std.mem.trimEnd(u8, kept, "\n");
+        return std.fmt.allocPrint(a, "{s}{s}{s}\n", .{ base, if (base.len > 0) "\n\n" else "", std.mem.trimEnd(u8, section, "\n") });
+    }
+
+    /// rules with `lines` added at the end, unless it has them all.
+    fn withRules(c: *Core, a: std.mem.Allocator, lines: []const u8) ![]const u8 {
+        const old = c.readOr(a, c.paths.rules);
+        if (lines.len == 0 or c.rulesHave(a, lines)) return old;
+        const base = std.mem.trimEnd(u8, old, "\n");
+        return std.fmt.allocPrint(a, "{s}{s}{s}\n", .{ base, if (base.len > 0) "\n\n" else "", std.mem.trimEnd(u8, lines, "\n") });
+    }
+
+    /// Applies what setup wrote: /reload, tried again while something runs
+    /// (up to 20 s). Null: applied; else what to say.
+    fn applySetup(c: *Core) ?[]const u8 {
+        var tries: u32 = 0;
+        while (true) : (tries += 1) {
+            const r = c.reload() catch |e| return @errorName(e);
+            if (std.mem.eql(u8, r, "Settings reloaded.")) return null;
+            if (!std.mem.startsWith(u8, r, "Busy") or tries >= 80) return if (std.mem.startsWith(u8, r, "Busy")) "Written; it applies after /reload, when nothing is running." else r;
+            c.io.sleep(.fromMilliseconds(250), .awake) catch {};
+        }
+    }
+
+    /// What came of a setup answer: said after the item closes, and the
+    /// offer that follows.
+    const SetupDone = struct { said: []const u8 = "", offer: Offer = .none, routine: ?butler.Routine = null };
+
+    /// What follows: the routines from the first, the next one, the one
+    /// just offered again (with a town), or the car's.
+    const Offer = enum { none, start, next, again, car };
+
+    /// An answer to a setup or routine item (`run` says which); written
+    /// and applied before the item closes. error: nothing written.
+    fn setupAnswer(c: *Core, a: std.mem.Allocator, run: []const u8, conv: []const u8, key: []const u8, words: ?[]const u8) !SetupDone {
+        c.setup_mutex.lockUncancelable(c.io);
+        defer c.setup_mutex.unlock(c.io);
+        const eql = std.mem.eql;
+        if (eql(u8, run, "setup address")) {
+            const w = std.mem.trim(u8, words orelse "", " \t\r\n<>");
+            if (butler.looksLikeToken(w)) return .{ .said = token_pasted };
+            return .{ .said = try c.setupHome(a, conv, w) };
+        }
+        if (eql(u8, run, "setup home")) {
+            if (eql(u8, key, "change")) return .{ .said = change_help };
+            const text = c.readOr(a, try c.setupPath(a, "home.ini"));
+            if (text.len == 0) return error.NothingPending;
+            const prog = c.findProgram(a, "homemcp", c.cfg.butler.homemcp) orelse return error.NoHomemcp;
+            const mcp_text = try c.withMcpSection(a, "home", try butler.mcpSection(a, .home, prog, try c.dataPath(a, "home.ini")));
+            const rules_text = try c.withRules(a, try butler.setupRules(a, .home));
+            try c.writeSetting(try c.dataPath(a, "home.ini"), text);
+            try c.writeSetting(c.paths.mcp, mcp_text);
+            try c.writeSetting(c.paths.rules, rules_text);
+            Io.Dir.cwd().deleteFile(c.io, try c.setupPath(a, "home.ini")) catch {};
+            c.log.write(.config, false, .{ .event = "setup home", .devices = (try butler.parseHome(a, text)).devices.len }) catch {};
+            if (c.applySetup()) |why| return .{ .said = try std.fmt.allocPrint(a, "home.ini, mcp.ini and rules are written. {s}", .{why}) };
+            const h = try butler.parseHome(a, text);
+            const running = for (c.mcp_tools) |m| {
+                if (eql(u8, m.server.name, "home")) break true;
+            } else false;
+            if (!running) return .{ .said = try std.fmt.allocPrint(a, "home.ini is written, but homemcp didn't start: {s}", .{if (c.mcp_warn.len > 0) c.mcp_warn else "see /status"}) };
+            return .{ .said = try std.fmt.allocPrint(a, "The home is connected: {d} devices. Now the routines, one at a time.", .{h.devices.len}), .offer = .start };
+        }
+        if (eql(u8, run, "setup car")) {
+            if (eql(u8, key, "change")) return .{ .said = "Send /setup car again with the right ids: CLIENT_ID VEHICLE_ID USER_ID." };
+            const text = c.readOr(a, try c.setupPath(a, "car.ini"));
+            if (text.len == 0) return error.NothingPending;
+            const prog = c.findProgram(a, "carcloud", c.cfg.butler.carcloud) orelse return error.NoCarcloud;
+            const mcp_text = try c.withMcpSection(a, "car", try butler.mcpSection(a, .car, prog, try c.dataPath(a, "car.ini")));
+            const rules_text = try c.withRules(a, try butler.setupRules(a, .car));
+            try c.writeSetting(try c.dataPath(a, "car.ini"), text);
+            try c.writeSetting(c.paths.mcp, mcp_text);
+            try c.writeSetting(c.paths.rules, rules_text);
+            Io.Dir.cwd().deleteFile(c.io, try c.setupPath(a, "car.ini")) catch {};
+            c.log.write(.config, false, .{ .event = "setup car" }) catch {};
+            if (c.applySetup()) |why| return .{ .said = try std.fmt.allocPrint(a, "car.ini, mcp.ini and rules are written. {s}", .{why}) };
+            if (!c.homeOn(a)) return .{ .said = "The car is connected. /setup home connects the home; its routines come then." };
+            return .{ .said = "The car is connected.", .offer = .car };
+        }
+        if (std.mem.startsWith(u8, run, "routine ")) {
+            const r = std.meta.stringToEnum(butler.Routine, run["routine ".len..]) orelse return error.NoSuchRoutine;
+            // a town for the morning summary's weather: shown again with it
+            if (eql(u8, key, "text")) {
+                const town = std.mem.trim(u8, words orelse "", " \t\r\n.");
+                if (town.len == 0 or town.len > 60 or butler.looksLikeToken(town)) return .{ .said = "That isn't a town's name; tap Turn on or Not now." };
+                try util.writeReplace(c.io, try c.setupPath(a, "town"), town);
+                return .{ .said = try std.fmt.allocPrint(a, "The weather in {s}, then.", .{town}), .offer = .again, .routine = r };
+            }
+            if (eql(u8, key, "later")) return .{ .offer = .next };
+            const files = try butler.routineFiles(a, r, try c.setupPicks(a), try c.setupDate(a));
+            // read as harness will read them, before anything is written
+            var d: workflows.Diag = .{};
+            _ = workflows.parse(a, r.name(), files.workflow, &d) catch return error.RoutineDoesNotRead;
+            var trig_text = c.readOr(a, c.paths.triggers);
+            var tn = std.mem.splitScalar(u8, files.triggers, '\n');
+            while (tn.next()) |l| if (std.mem.startsWith(u8, l, "[")) {
+                trig_text = butler.dropSection(a, trig_text, std.mem.trim(u8, l, "[] \t\r")) catch trig_text;
+            };
+            trig_text = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ std.mem.trimEnd(u8, trig_text, "\n"), if (trig_text.len > 0) "\n\n" else "", files.triggers });
+            var td: triggers.Diag = .{};
+            _ = triggers.parse(a, trig_text, .triggers, &td) catch return error.RoutineDoesNotRead;
+            const rules_text = try c.withRules(a, files.rules);
+            _ = rules.parse(a, rules_text) catch return error.RoutineDoesNotRead;
+            const wf_path = try std.fs.path.join(a, &.{ c.paths.workflows, try std.fmt.allocPrint(a, "{s}.wf", .{r.name()}) });
+            try c.writeSetting(wf_path, files.workflow);
+            try c.writeSetting(c.paths.triggers, trig_text);
+            try c.writeSetting(c.paths.rules, rules_text);
+            c.log.write(.config, false, .{ .event = "routine on", .name = r.name() }) catch {};
+            if (c.applySetup()) |why| return .{ .said = try std.fmt.allocPrint(a, "{s} is written. {s}", .{ r.title(), why }), .offer = .next };
+            return .{ .said = try butler.onText(a, r, try c.setupPicks(a)), .offer = .next };
+        }
+        return error.NoSuchSetup;
+    }
+
+    const change_help =
+        \\Tell me what to change, one at a time:
+        \\/setup home leave NAME: leave a device out
+        \\/setup home ask NAME: ask you every time before switching it
+        \\/setup home allow NAME: switch it when you ask (never a lock, an alarm, a valve or a garage door)
+        \\NAME as home.ini names it, or as you call it. The summary comes again after each.
+    ;
+
+    /// What the routines can use now: the home file and what check read
+    /// of it, the car, search, a calendar server, quiet hours, the town.
+    fn setupPicks(c: *Core, a: std.mem.Allocator) !butler.Picks {
+        var h = try butler.parseHome(a, c.readOr(a, try c.dataPath(a, "home.ini")));
+        butler.readCheck(&h, c.readOr(a, try c.setupPath(a, "home-check.txt")));
+        var calendar: []const u8 = "";
+        const cfgs = mcp.parseConfig(a, c.readOr(a, c.paths.mcp)) catch &.{};
+        for (cfgs) |sc| if (std.mem.indexOf(u8, sc.name, "calendar") != null) {
+            calendar = sc.name;
+            break;
+        };
+        return butler.pick(a, h, .{
+            .car = c.carOn(a),
+            .search = c.secrets.search != null,
+            .calendar = calendar,
+            .quiet = c.quiet.effective(c.cfg.butler.quiet),
+            .town = std.mem.trim(u8, c.readOr(a, try c.setupPath(a, "town")), " \t\r\n"),
+        });
+    }
+
+    /// The routines to offer from now, one at a time: those the home has
+    /// what for and that are not on (`only`: that one alone).
+    fn startOffers(c: *Core, a: std.mem.Allocator, conv: []const u8, only: ?butler.Routine) ![]const u8 {
+        const p = try c.setupPicks(a);
+        var names: std.ArrayList(u8) = .empty;
+        for (butler.all) |r| {
+            if (only) |o| if (o != r) continue;
+            if (!r.offered(p) or c.workflowText(a, r.name()) != null) continue;
+            try names.print(a, "{s}\n", .{r.name()});
+        }
+        try util.writeReplace(c.io, try c.setupPath(a, "offers"), names.items);
+        if (names.items.len == 0) return "Every routine your home has what for is on. /workflows lists them.";
+        try c.offerNext(a, conv);
+        return "";
+    }
+
+    /// Offers the next routine of state/setup/offers (one not on).
+    fn offerNext(c: *Core, a: std.mem.Allocator, conv: []const u8) !void {
+        const path = try c.setupPath(a, "offers");
+        var list = c.readOr(a, path);
+        const p = try c.setupPicks(a);
+        while (true) {
+            const nl = std.mem.indexOfScalar(u8, list, '\n') orelse {
+                try util.writeReplace(c.io, path, "");
+                var on: usize = 0;
+                for (butler.all) |r| if (c.workflowText(a, r.name()) != null) {
+                    on += 1;
+                };
+                c.sayIn(conv, try std.fmt.allocPrint(a, "That's all the routines: {d} on. /workflows lists them; /setup routines offers the others again.", .{on}));
+                return;
+            };
+            const name = list[0..nl];
+            list = list[nl + 1 ..];
+            try util.writeReplace(c.io, path, list);
+            const r = std.meta.stringToEnum(butler.Routine, name) orelse continue;
+            if (c.workflowText(a, r.name()) != null) continue;
+            return c.offerOne(a, conv, r, p);
+        }
+    }
+
+    /// Routine `r` offered: its files as Turn on writes them, then its
+    /// sentence with [Turn on] [Not now] (the morning summary asks for a
+    /// town too, when search is set and none was given).
+    fn offerOne(c: *Core, a: std.mem.Allocator, conv: []const u8, r: butler.Routine, p: butler.Picks) !void {
+        {
+            const files = try butler.routineFiles(a, r, p, try c.setupDate(a));
+            var shown: std.ArrayList(u8) = .empty;
+            try shown.print(a, "{s}: Turn on writes workflows/{s}.wf:\n\n{s}\nand adds to triggers.ini:\n\n{s}", .{ r.title(), r.name(), files.workflow, files.triggers });
+            if (files.rules.len > 0) try shown.print(a, "\nand to rules:\n\n{s}", .{files.rules});
+            c.sayIn(conv, shown.items);
+            const asks_town = r == .@"morning-home" and p.search and p.town.len == 0;
+            c.withdrawSetupItems(a, try std.fmt.allocPrint(a, "routine {s}", .{r.name()}));
+            _ = try c.addItem(.{
+                .kind = "routine",
+                .run = try std.fmt.allocPrint(a, "routine {s}", .{r.name()}),
+                .conversation = conv,
+                .title = r.title(),
+                .body = try r.sentence(a, p),
+                .choices = &.{ .{ .key = "on", .label = "Turn on" }, .{ .key = "later", .label = "Not now" } },
+                .text = if (asks_town) .answer else .none,
+                .expires = c.now() + 7 * 86400,
+            });
+        }
+    }
+
+    /// After a setup answer closed its item: what it said, then the offer.
+    fn setupFollow(c: *Core, a: std.mem.Allocator, conv: []const u8, done: SetupDone) void {
+        if (done.said.len > 0) c.sayIn(conv, done.said);
+        const said: []const u8 = switch (done.offer) {
+            .none => "",
+            .start => c.startOffers(a, conv, null) catch |e| @errorName(e),
+            .car => c.startOffers(a, conv, .@"car-tomorrow") catch |e| @errorName(e),
+            .next => blk: {
+                c.offerNext(a, conv) catch |e| break :blk @errorName(e);
+                break :blk "";
+            },
+            .again => blk: {
+                const r = done.routine orelse break :blk "";
+                const p = c.setupPicks(a) catch |e| break :blk @errorName(e);
+                c.offerOne(a, conv, r, p) catch |e| break :blk @errorName(e);
+                break :blk "";
+            },
+        };
+        if (said.len > 0 and !std.mem.startsWith(u8, said, "Every routine")) c.sayIn(conv, said);
+    }
+
+    /// Why a setup answer wrote nothing.
+    fn setupWhy(e: anyerror) []const u8 {
+        return switch (e) {
+            error.NothingPending => "what it would write is gone: send /setup home or /setup car again",
+            error.NoHomemcp => "homemcp isn't next to harness or on PATH any more: put it back, then tap again",
+            error.NoCarcloud => "carcloud isn't next to harness or on PATH any more: put it back, then tap again",
+            error.RoutineDoesNotRead => "the routine's files didn't read as harness reads them (a bug: please send harness report)",
+            error.NoSpaceLeft, error.DiskQuota => "the disk is full: make room, then tap again",
+            error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => "harness may not write in its data folder: fix that, then tap again",
+            else => @errorName(e),
+        };
+    }
+
     // ---- commands ----
 
     const help_text =
@@ -8040,6 +8612,8 @@ pub const Core = struct {
         \\/workflow resume NAME#N, /workflow rm NAME
         \\/members: the household's members
         \\/member add NAME: a code for someone to join; /member rm NAME
+        \\/setup: where setup is; /setup home, /setup car: connect them in chat
+        \\/setup routines: the butler's routines, offered one at a time
     ;
 
     /// A command sent in `main` (or from the command line).
@@ -8052,11 +8626,14 @@ pub const Core = struct {
         var words = std.mem.tokenizeAny(u8, text, " \t");
         const cmd = c.commandWord(words.next() orelse return "");
         const rest = std.mem.trim(u8, words.rest(), " \t");
-        try c.log.write(.chat, c.convPrivate(conv), .{ .event = "command", .command = cmd, .args = rest });
+        // a token pasted into /setup is not kept, in the log either
+        const logged = if (std.mem.eql(u8, cmd, "/setup") and butler.anyTokenLike(rest)) "(withheld: it looks like a token)" else rest;
+        try c.log.write(.chat, c.convPrivate(conv), .{ .event = "command", .command = cmd, .args = logged });
         const eql = std.mem.eql;
         if (eql(u8, cmd, "/help") or eql(u8, cmd, "/start")) return help_text;
         if (eql(u8, cmd, "/pair")) return "Already paired.";
         if (eql(u8, cmd, "/members")) return c.membersText(a);
+        if (eql(u8, cmd, "/setup")) return c.setupCommand(a, conv, rest);
         if (eql(u8, cmd, "/member")) return c.memberCommand(a, rest);
         if (eql(u8, cmd, "/join")) return "That code is for the person joining: they send /join CODE to the bot from their own account.";
         if (eql(u8, cmd, "/stop")) return if (rest.len == 0) c.stopAll() else c.stopAgent(a, rest);
@@ -16959,6 +17536,213 @@ test "the_morning_summary_reads_car_and_house" {
     try t.expect(std.mem.indexOf(u8, req, "home__home_set") == null);
     try t.expect(std.mem.indexOf(u8, req, "car__car_command") == null);
 }
+
+// ---- the butler's setup: /setup home, /setup car, the routines offered ----
+
+const fake_mcp_t = @import("fake_mcp.zig");
+
+/// config.ini whose [butler] names harness-fake as homemcp and carcloud
+/// (`homemcp`: another path for it), the store with the home's token
+/// (`ha`) and the car's secret (`car`); applied.
+fn withSetup(f: *Fix, ha: bool, car: bool, homemcp: ?[]const u8) !void {
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    const url = try f.e.url();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.fmt.allocPrint(a, "[model]\nurl = {s}\n[search]\nurl = {s}\n[butler]\nhomemcp = {s}\ncarcloud = {s}\n", .{ url, url, homemcp orelse fake, fake }) });
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    f.core.store = st;
+    if (ha) try st.put(t.io, "ha", fake_mcp_t.ha_test_token);
+    if (car) try st.put(t.io, "smartcar", fake_mcp_t.smartcar_test_secret);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+}
+
+fn exists(path: []const u8) bool {
+    _ = Io.Dir.cwd().statFile(t.io, path, .{}) catch return false;
+    return true;
+}
+
+fn fileText(f: *Fix, path: []const u8) []const u8 {
+    return Io.Dir.cwd().readFileAlloc(t.io, path, f.e.arena.allocator(), .unlimited) catch "";
+}
+
+fn dataFile(f: *Fix, name: []const u8) ![]const u8 {
+    return std.fs.path.join(f.e.arena.allocator(), &.{ f.core.paths.home, name });
+}
+
+test "setup_home_says_what_is_missing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withSetup(&f, false, false, null);
+    // no address known: asked; the answer comes as a reply
+    try t.expectEqualStrings("", try f.core.command(a, "/setup home"));
+    try f.rec.waitFor("What is your Home Assistant's address? Reply with it, like http://homeassistant.local:8123");
+    // a token pasted as the answer: nothing of it kept, the owner told
+    const tok = "eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJhYmMxMjMifQ.c2lnbmF0dXJlMTIz";
+    _ = f.core.answerItem(1, "", tok, .telegram);
+    try f.rec.waitFor("That looks like a token, not an address: I kept nothing of it.");
+    // given with /setup home, too; never in the log or the inbox
+    try expectHas(try f.core.command(a, try std.fmt.allocPrint(a, "/setup home {s}", .{tok})), "That looks like a token");
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "eyJhbGci") == null);
+    try t.expect(std.mem.indexOf(u8, try inboxFile(&f), "eyJhbGci") == null);
+    // an address without the token stored: what to type in a terminal
+    try expectHas(try f.core.command(a, "/setup home http://127.0.0.1:8123"), "Home Assistant's token isn't stored yet. In a terminal where harness runs: harness secret add ha");
+    // the address is kept for next time; homemcp nowhere
+    try withSetup(&f, true, false, "/no/such/homemcp");
+    try expectHas(try f.core.command(a, "/setup home"), "homemcp isn't where [butler] homemcp says");
+    // a token Home Assistant refuses
+    try withSetup(&f, false, false, null);
+    try f.core.store.?.put(t.io, "ha", "a-wrong-token-12345");
+    try expectHas(try f.core.command(a, "/setup home"), "Home Assistant at http://127.0.0.1:8123 refused the token stored as ha. Store the right one: harness secret add ha");
+    try t.expect(!exists(try dataFile(&f, "home.ini")));
+}
+
+test "setup_home_from_discover_to_looks_right" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withSetup(&f, true, false, null);
+    try t.expectEqualStrings("", try f.core.command(a, "/setup home http://127.0.0.1:8123"));
+    // what Looks right writes, shown first
+    try f.rec.waitFor("home.ini, as Looks right writes it:\n\n; Written by homemcp discover from Home Assistant at http://127.0.0.1:8123.");
+    try f.rec.waitFor("mcp.ini gets:\n; Home Assistant's token is stored with: harness secret add ha\n[home]\ncommand = \"");
+    try f.rec.waitFor("secret = HA_TOKEN:ha\nmoney = home_guarded\namount = home_guarded:none");
+    try f.rec.waitFor("rules gets:\n# the home: reading it needs no question");
+    // one summary: what it switches, asks about, won't touch, watches
+    try f.rec.waitFor("BUTTONS I found 7 devices in 4 rooms, and 1 person.\nI'll switch lights and the heating when you ask.\nI'll ask you every time before the front door and the water main.\nI won't touch the front door camera.\nI'll watch the back door and the sink leak.\nI couldn't tell what the garden switch controls: I'll ask you before switching it until you sort it. If it's a light or a plug, send /setup home allow garden_switch. [");
+    try expectHas(try inboxFile(&f), "\"choices\":[{\"key\":\"yes\",\"label\":\"Looks right\"},{\"key\":\"change\",\"label\":\"Change it\"}]");
+    // nothing written before the answer
+    try t.expect(!exists(try dataFile(&f, "home.ini")));
+    try t.expect(std.mem.indexOf(u8, fileText(&f, f.core.paths.mcp), "[home]") == null);
+    try t.expect(std.mem.indexOf(u8, fileText(&f, f.core.paths.rules), "home/home_state") == null);
+    try f.press("yes");
+    try f.rec.waitFor("The home is connected: 7 devices. Now the routines, one at a time.");
+    // written: the switch it couldn't identify guarded, the server started
+    const home = fileText(&f, try dataFile(&f, "home.ini"));
+    try expectHas(home, "[device garden_switch]\nid = switch.garden\nkind = switch\nroom = Garden\nallow = on, off\nguarded = yes\nnote = not identified at setup");
+    try expectHas(fileText(&f, f.core.paths.mcp), "secret = HA_TOKEN:ha");
+    try expectHas(fileText(&f, f.core.paths.rules), "allow mcp home/home_state *");
+    var running = false;
+    for (f.core.mcp_tools) |m| {
+        if (std.mem.eql(u8, m.def.name, "home__home_state")) running = true;
+    }
+    try t.expect(running);
+    try expectHas(try logText(&f), "\"event\":\"setup home\",\"devices\":7");
+    // then the first routine: its files, then one sentence and two buttons
+    try f.rec.waitFor("Goodnight: Turn on writes workflows/goodnight.wf:\n\n# added by /setup routines");
+    try f.rec.waitFor("BUTTONS Goodnight: when you say goodnight, or at 22:00, I switch off the lights, set the heating to 18 °C and ask with one tap before locking the front door. [");
+}
+
+test "change_it_takes_edits_and_shows_the_summary_again" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withSetup(&f, true, false, null);
+    _ = try f.core.command(a, "/setup home http://127.0.0.1:8123");
+    try f.rec.waitFor("BUTTONS I found 7 devices");
+    try f.press("change");
+    try f.rec.waitFor("Tell me what to change, one at a time:\n/setup home leave NAME");
+    // the switch sorted: it may act; the summary comes again
+    try t.expectEqualStrings("", try f.core.command(a, "/setup home allow garden switch"));
+    try f.rec.waitFor("The garden switch: I'll switch it when you ask.");
+    try f.rec.waitFor("BUTTONS I found 7 devices in 4 rooms, and 1 person.\nI'll switch lights, switches and the heating when you ask.");
+    try t.expectEqual(2, f.rec.count("BUTTONS I found 7 devices"));
+    // a lock never acts alone; nothing is written yet
+    try expectHas(try f.core.command(a, "/setup home allow front door"), "stays asked every time");
+    try t.expect(!exists(try dataFile(&f, "home.ini")));
+    try f.press("yes");
+    try f.rec.waitFor("The home is connected: 7 devices.");
+    try t.expect(std.mem.indexOf(u8, fileText(&f, try dataFile(&f, "home.ini")), "not identified at setup") == null);
+}
+
+test "a_routine_is_shown_then_written_on_turn_on" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // 06:00: no routine's time has come
+    f.core.fixed_now = todayAt(6 * 60);
+    try withSetup(&f, true, false, null);
+    _ = try f.core.command(a, "/setup home http://127.0.0.1:8123");
+    try f.rec.waitFor("BUTTONS I found 7 devices");
+    try f.press("yes");
+    try f.rec.waitFor("BUTTONS Goodnight: when you say goodnight");
+    const wf = try std.fs.path.join(a, &.{ f.core.paths.workflows, "goodnight.wf" });
+    try t.expect(!exists(wf));
+    try f.press("on");
+    try f.rec.waitFor("Goodnight is on: write goodnight to try it.");
+    try expectHas(fileText(&f, wf), "phrases goodnight, good night, night night");
+    try expectHas(fileText(&f, f.core.paths.triggers), "; added by /setup routines ");
+    try expectHas(fileText(&f, f.core.paths.triggers), "[goodnight-at]\nat = 22:00\nstart = workflow goodnight");
+    try expectHas(fileText(&f, f.core.paths.rules), "[workflow:goodnight/night]\nallow mcp home/home_set *");
+    try t.expect(f.core.workflowText(a, "goodnight") != null);
+    // the next one; Not now writes nothing and offers the one after
+    try f.rec.waitFor("BUTTONS Leaving: when everyone has gone out, I say what is still open or on, and ask with one tap before locking the front door and turning the heating down to 17 °C. [");
+    try f.press("later");
+    try f.rec.waitFor("BUTTONS Arriving: when the first of you comes home");
+    try t.expect(f.core.workflowText(a, "leaving") == null);
+    try f.press("later");
+    // the morning summary asks for the town, for the weather (search is set)
+    try f.rec.waitFor("BUTTONS Morning summary: at 07:00, as quiet hours end, the house in a few lines, after what the night held. For the weather, reply with your town.");
+    const offer = blk: {
+        f.core.inbox.mutex.lockUncancelable(t.io);
+        defer f.core.inbox.mutex.unlock(t.io);
+        var last: u64 = 0;
+        for (f.core.inbox.items.items) |it| if (it.status == .open) {
+            last = it.id;
+        };
+        break :blk last;
+    };
+    try t.expectEqual(Core.Took.taken, f.core.answerItem(offer, "", "Kraków", .telegram));
+    try f.rec.waitFor("The weather in Kraków, then.");
+    try f.rec.waitFor("BUTTONS Morning summary: at 07:00, as quiet hours end, the weather in Kraków and the house in a few lines, after what the night held. [");
+    try f.press("on");
+    try f.rec.waitFor("The morning summary is on, at 07:00.");
+    try expectHas(fileText(&f, try std.fs.path.join(a, &.{ f.core.paths.workflows, "morning-home.wf" })), "tools home/home_state, search");
+    // the rest, then the end
+    try f.rec.waitFor("BUTTONS Leak: when the sink leak finds water");
+    try f.press("on");
+    try f.rec.waitFor("BUTTONS Doors left open: when the back door stays open for 10 minutes, I tell you. [");
+    try f.press("later");
+    try f.rec.waitFor("That's all the routines: 3 on.");
+    try expectHas(try f.core.command(a, "/setup"), "Routines on: Goodnight, Morning summary, Leak.");
+}
+
+test "setup_car_writes_the_car_file_after_looks_right" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withSetup(&f, false, false, null);
+    try expectHas(try f.core.command(a, "/setup car"), "harness secret add smartcar");
+    try expectHas(try f.core.command(a, "/setup car client-1 vehicle-1 user-1"), "Smartcar's client secret isn't stored yet");
+    try f.core.store.?.put(t.io, "smartcar", fake_mcp_t.smartcar_test_secret);
+    try t.expectEqualStrings("", try f.core.command(a, "/setup car client-1 vehicle-1 user-1"));
+    try f.rec.waitFor("car.ini, as Looks right writes it:\n\n; Written by /setup car");
+    try f.rec.waitFor("mcp.ini gets:\n; Smartcar's application secret is stored with: harness secret add smartcar\n[car]\ncommand = \"");
+    try f.rec.waitFor("BUTTONS The car answers: battery 34 %, range 150 km, plugged in, not charging, charge limit 80 % (data from 5 minutes ago).\nI'll read it, and start or stop charging and set the charge limit (60–90 %) when you ask. I won't lock or unlock it: car.ini doesn't list them. [");
+    try t.expect(!exists(try dataFile(&f, "car.ini")));
+    try f.press("yes");
+    try f.rec.waitFor("The car is connected. /setup home connects the home; its routines come then.");
+    const car = fileText(&f, try dataFile(&f, "car.ini"));
+    try expectHas(car, "vehicle_id = vehicle-1\nuser_id = user-1\nclient_id = client-1\nallow = charge_start, charge_stop, charge_limit\n");
+    // nothing to lock or unlock on its list
+    try t.expect(std.mem.indexOf(u8, car, "allow = charge_start, charge_stop, charge_limit\n") != null);
+    try t.expect(std.mem.indexOf(u8, car, ", lock") == null);
+    try expectHas(fileText(&f, f.core.paths.mcp), "secret = SMARTCAR_CLIENT_SECRET:smartcar");
+    try expectHas(fileText(&f, f.core.paths.rules), "allow mcp car/car_status *");
+    var running = false;
+    for (f.core.mcp_tools) |m| {
+        if (std.mem.eql(u8, m.def.name, "car__car_status")) running = true;
+    }
+    try t.expect(running);
+    // the secret never in what was said or kept
+    try t.expect(std.mem.indexOf(u8, try logText(&f), fake_mcp_t.smartcar_test_secret) == null);
+}
+
 
 
 

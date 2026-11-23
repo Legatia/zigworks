@@ -564,9 +564,9 @@ pub fn plainId(s: []const u8) bool {
 /// limit only (no lock, no unlock: rules lets the owner's requests act on
 /// what this lists, see examples/butler/rules); `api`: another Smartcar
 /// address (carcloud-sim's), "" for Smartcar's own.
-pub fn carFile(a: Allocator, client: []const u8, vehicle: []const u8, user: []const u8, api: []const u8, date: []const u8) ![]const u8 {
+pub fn carFile(a: Allocator, client: []const u8, vehicle: []const u8, user: []const u8, api: []const u8, date: []const u8, log_path: []const u8) ![]const u8 {
     var o: std.ArrayList(u8) = .empty;
-    try o.print(a, "; Written by /setup car {s}: the car, for carcloud (its README: The car file).\n; Its secret is the stored secret smartcar (mcp.ini passes it as\n; SMARTCAR_CLIENT_SECRET). allow lists what harness may ask the car to do:\n; nothing else is sent, and unlock never is.\n\n[car]\nname = The car\nvehicle_id = {s}\nuser_id = {s}\nclient_id = {s}\nallow = charge_start, charge_stop, charge_limit\ncharge_limit = 60 90\ncommands_per_day = 10\nmin_seconds_between = 60\nlocation = no\nlog = state/car-actions.jsonl\n", .{ date, vehicle, user, client });
+    try o.print(a, "; Written by /setup car {s}: the car, for carcloud (its README: The car file).\n; Its secret is the stored secret smartcar (mcp.ini passes it as\n; SMARTCAR_CLIENT_SECRET). allow lists what harness may ask the car to do:\n; nothing else is sent, and unlock never is.\n\n[car]\nname = The car\nvehicle_id = {s}\nuser_id = {s}\nclient_id = {s}\nallow = charge_start, charge_stop, charge_limit\ncharge_limit = 60 90\ncommands_per_day = 10\nmin_seconds_between = 60\nlocation = no\nlog = {s}\n", .{ date, vehicle, user, client, log_path });
     if (api.len > 0) {
         const base = std.mem.trimEnd(u8, api, "/");
         try o.print(a, "; another Smartcar (carcloud-sim's, for trying without a car)\napi = {s}/v3\ntoken_url = {s}/oauth2/token\n", .{ base, base });
@@ -1102,7 +1102,9 @@ pub fn routineFiles(a: Allocator, r: Routine, p: Picks, date: []const u8) !Files
     var rules: []const u8 = "";
     if (rulesGroup(r, p)) |g| {
         const tmpl = (try groupOf(a, files.rules, g)) orelse return error.NoSuchSection;
-        const body = tmpl[(std.mem.indexOfScalar(u8, tmpl, '\n') orelse 0) + 1 ..];
+        // its own comment lines go; setup's mark comes instead
+        var body = tmpl;
+        while (std.mem.startsWith(u8, body, "#")) body = body[(std.mem.indexOfScalar(u8, body, '\n') orelse body.len - 1) + 1 ..];
         rules = try std.fmt.allocPrint(a, "# added by /setup routines {s}: {s}\n{s}\n", .{ date, r.title(), try fill(a, body, values, flags, &missing) });
         if (r == .@"morning-home" and p.calendar.len > 0 and !std.mem.eql(u8, p.calendar, "calendar"))
             rules = try std.mem.replaceOwned(u8, a, rules, "mcp calendar/", try std.fmt.allocPrint(a, "mcp {s}/", .{p.calendar}));

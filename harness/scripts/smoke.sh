@@ -14,6 +14,7 @@ cleanup() {
 	[ -n "$RPID" ] && kill "$RPID" 2>/dev/null
 	[ -n "$FPID" ] && kill "$FPID" 2>/dev/null && wait "$FPID" 2>/dev/null
 	[ -n "${SPID:-}" ] && kill "$SPID" 2>/dev/null
+	[ -n "${CPID:-}" ] && kill "$CPID" 2>/dev/null
 	rm -rf "$T"
 }
 trap cleanup EXIT
@@ -652,9 +653,148 @@ else
 	echo "# homemcp isn't built next to harness (or HOMEMCP_BIN): the home event check is skipped"
 fi
 
+# a home butler: init asks (here --butler says yes) and turns quiet hours on
+BH="$T/butler"
+check "init --butler turns quiet hours on and names /setup" 'HARNESS_HOME="$BH" "$H" init --butler >"$T/binit.out" 2>&1 && grep -qE "^quiet = 22:00-07:00 " "$BH/config.ini" && grep -qF "In the chat: /setup home" "$T/binit.out" && grep -qF "harness secret add ha " "$T/binit.out"'
+
+# the butler, set up in chat against homemcp-sim and carcloud-sim: /setup
+# home through homemcp discover, every routine turned on and run against
+# the stand-ins' devices, /setup car and its routine. homemcp and carcloud
+# from HOMEMCP_BIN and CARCLOUD_BIN, or built next to harness; skipped
+# without them
+CC=${CARCLOUD_BIN:-$(cd "$(dirname "$0")/../../carcloud/zig-out/bin" 2>/dev/null && pwd)}
+# wait_asked_long N: as wait_asked, for up to 30 s
+wait_asked_long() {
+	i=0
+	while [ $i -lt 300 ]; do
+		[ "$(asked)" -ge "$1" ] && return 0
+		sleep 0.1
+		i=$((i + 1))
+	done
+	return 1
+}
+if [ -n "$HM" ] && [ -x "$HM/homemcp" ] && [ -x "$HM/homemcp-sim" ] && [ -n "$CC" ] && [ -x "$CC/carcloud" ] && [ -x "$CC/carcloud-sim" ]; then
+	"$HM/homemcp-sim" ha 0 smoke-ha-token-1 >"$T/bhsim.out" 2>&1 &
+	SPID=$!
+	wait_for "$T/bhsim.out" "127.0.0.1:" 5
+	BPORT=$(sed -n 's/.*127[.]0[.]0[.]1:\([0-9]*\).*/\1/p' "$T/bhsim.out")
+	"$CC/carcloud-sim" 0 smoke-car-secret-1 >"$T/ccsim.out" 2>&1 &
+	CPID=$!
+	wait_for "$T/ccsim.out" "127.0.0.1:" 5
+	CPORT=$(sed -n 's/.*127[.]0[.]0[.]1:\([0-9]*\).*/\1/p' "$T/ccsim.out")
+	# its clock 03:00 and quiet hours 05:00-06:00: no routine's time
+	# comes while this runs (goodnight 04:45, the car 03:30, the morning
+	# 06:00), and nothing a trigger starts is held
+	hh=$(date -u +%H)
+	mm=$(date -u +%M)
+	now_min=$((${hh#0} * 60 + ${mm#0}))
+	off=$(((180 - now_min + 1440) % 1440))
+	[ $off -gt 840 ] && off=$((off - 1440))
+	sign=+
+	[ $off -lt 0 ] && sign=- && off=$((-off))
+	UTC_OFF=$(printf '%s%02d:%02d' "$sign" $((off / 60)) $((off % 60)))
+	cat >"$BH/config.ini" <<EOF
+[model]
+url = $URL
+[search]
+url = $URL
+[chat]
+api = $URL
+utc_offset = $UTC_OFF
+[butler]
+quiet = 05:00-06:00
+homemcp = $HM/homemcp
+carcloud = $CC/carcloud
+EOF
+	chmod 600 "$BH/config.ini"
+	printf 'smoke-ha-token-1\n' | "$H" secret add ha --stdin 2>/dev/null
+	printf 'smoke-car-secret-1\n' | "$H" secret add smartcar --stdin 2>/dev/null
+	HARNESS_HOME="$BH" "$H" run >"$T/brun.out" 2>&1 &
+	RPID=$!
+	wait_for "$T/brun.out" "running on" 15
+	BCODE=$(HARNESS_HOME="$BH" "$H" pair | sed -n 's|^/pair ||p')
+	say "/pair $BCODE"
+	check "a butler, paired, hears what comes next" 'wait_for "$OUT" "Next: /setup home connects your home."'
+	say "/setup home http://127.0.0.1:$BPORT"
+	check "/setup home reads the home through homemcp discover and shows the file first" 'wait_for "$OUT" "home.ini, as Looks right writes it:" 20 && wait_for "$OUT" "I found 15 devices in 5 rooms, and 2 people." 20 && wait_for "$OUT" "I won'"'"'t touch the front door camera or the kitchen smoke alarm." 5 && [ ! -e "$BH/home.ini" ]'
+	n0=$(asked)
+	press yes
+	check "Looks right writes the home, starts homemcp and offers the routines" 'wait_for "$OUT" "The home is connected: 15 devices." 30 && [ -f "$BH/home.ini" ] && grep -qF "secret = HA_TOKEN:ha" "$BH/mcp.ini" && wait_asked_long $((n0 + 1)) && last_question | grep -qF "Goodnight: when you say goodnight"'
+	# every routine turned on, as each is offered
+	for r in goodnight leaving arriving morning-home leak door-open; do
+		n0=$(asked)
+		press on
+		[ "$r" = door-open ] || wait_asked_long $((n0 + 1))
+	done
+	check "every routine the home has what for is on" 'wait_for "$OUT" "That'"'"'s all the routines: 6 on." 30 && [ -f "$BH/workflows/leak.wf" ] && grep -qF "[leak-sink_leak]" "$BH/triggers.ini" && grep -qF "[door-back_door]" "$BH/triggers.ini" && grep -qF "[workflow:arriving/heat]" "$BH/rules"'
+	# the triggers' first polls only mark what is there
+	for tr in leak-sink_leak door-back_door everyone-left first-home; do
+		wait_for "$BH/state/triggers/$tr/state" "\"polled\":true" 20
+	done
+	# goodnight: the lights and the heating as asked, then one tap to lock
+	"$HM/homemcp-sim" poke ha "$BPORT" smoke-ha-token-1 lock.front_door '{"locked": false}'
+	reply "$(call_reply tu_g1 home__home_set '{"device":"living_room_light","action":"off"}')"
+	reply "$(call_reply tu_g2 home__home_set '{"device":"hall_thermostat","action":"temperature","value":"18"}')"
+	reply "$(text_reply 'Lights are off and the heating is at 18 C.')"
+	n0=$(asked)
+	say "goodnight"
+	check "goodnight switches what it may, then asks once before the lock" 'wait_asked_long $((n0 + 1)) && last_question | grep -qF "The front door is unlocked." && grep -qF "Lights are off and the heating is at 18 C." "$OUT" && grep -qF "set to 18" "$(req)"'
+	press approve
+	check "one tap locks the front door, read back from the hub" 'wait_for "$OUT" "\"text\":\"Front door locked. Good night.\"" 20 && HA_TOKEN=smoke-ha-token-1 "$HM/homemcp" check "$BH/home.ini" >"$T/bcheck1.out" 2>&1; grep -F "front_door (" "$T/bcheck1.out" | grep -qF "): locked;"'
+	# a leak, pushed by homemcp: one question with the valve's own button
+	n0=$(asked)
+	"$HM/homemcp-sim" poke ha "$BPORT" smoke-ha-token-1 binary_sensor.sink_leak '{"leak": true}'
+	check "a leak asks with one tap to close the water main" 'wait_asked_long $((n0 + 1)) && last_question | grep -qF "Water leak: Sink leak, Kitchen." && last_question | grep -qF "\"text\":\"Close the water main\""'
+	press approve
+	check "one tap closes the water main, as it reports" 'wait_for "$OUT" "\"text\":\"Water main closed (it reports closed).\"" 20 && HA_TOKEN=smoke-ha-token-1 "$HM/homemcp" check "$BH/home.ini" >"$T/bcheck2.out" 2>&1; grep -F "water_main (" "$T/bcheck2.out" | grep -qF "): closed;"'
+	# a door opened: its routine waits 10 minutes before it looks again
+	"$HM/homemcp-sim" poke ha "$BPORT" smoke-ha-token-1 binary_sensor.back_door '{"contact": false}'
+	check "a door left open starts its routine, waiting 10 minutes" 'wait_for "$BH/state/workflows/door-open/1/state" "\"kind\":\"timer\"" 20'
+	# everyone out: what is open or on, and one tap to turn the heating down
+	reply "$(text_reply '{\"line\": \"The back door is open and the heating is at 18 C.\", \"warm\": true}')"
+	n0=$(asked)
+	"$HM/homemcp-sim" poke ha "$BPORT" smoke-ha-token-1 person.anna '{"home": false}'
+	check "the last one out: one question for the heating" 'wait_asked_long $((n0 + 1)) && last_question | grep -qF "out. The back door is open and the heating is at 18 C." && last_question | grep -qF "Heating to 17"'
+	press approve
+	check "one tap turns the heating down" 'wait_for "$OUT" "\"text\":\"Heating is set to 17 °C.\"" 20 && HA_TOKEN=smoke-ha-token-1 "$HM/homemcp" check "$BH/home.ini" >"$T/bcheck3.out" 2>&1; grep -F "hall_thermostat (" "$T/bcheck3.out" | grep -qF "set to 17 °C"'
+	"$HM/homemcp-sim" poke ha "$BPORT" smoke-ha-token-1 person.anna '{"home": true}'
+	check "the first one back: the heating back up, in a line" 'wait_for "$OUT" "anna is home. The heating is set to 21 °C." 20'
+	# the morning summary reads the house
+	reply "$(call_reply tu_m1 home__home_state '{}')"
+	reply "$(text_reply 'The back door is open; the heating is at 21 C.')"
+	say "/workflow start morning-home"
+	check "the morning summary reads the house and says it in a line" 'wait_for "$OUT" "The back door is open; the heating is at 21 C." 20 && grep -qF "living_room_light" "$(req)"'
+	# the car: /setup car against Smartcar's stand-in, then its routine
+	n0=$(asked)
+	say "/setup car sim-client 0c5f52b4-6a39-4a66-b2bd-6fdc1a5c8b11 5a2b7c1e-sim-user http://127.0.0.1:$CPORT"
+	check "/setup car shows car.ini, then the car in a line" 'wait_for "$OUT" "car.ini, as Looks right writes it:" 30 && wait_asked_long $((n0 + 1)) && last_question | grep -qF "The car answers: battery 64 %, range 294 km, plugged in, not charging, charge limit 80 %" && [ ! -e "$BH/car.ini" ]'
+	n0=$(asked)
+	press yes
+	check "Looks right connects the car and offers its routine" 'wait_for "$OUT" "The car is connected." 30 && wait_asked_long $((n0 + 1)) && last_question | grep -qF "Car for tomorrow: at 03:30" && grep -qF "allow = charge_start, charge_stop, charge_limit" "$BH/car.ini"'
+	press on
+	check "the car's routine is on" 'wait_for "$OUT" "Car for tomorrow is on, at 03:30." 20'
+	reply "$(text_reply '{\"line\": \"Car 64 %, 294 km, plugged in.\", \"low\": true, \"plugged\": true, \"charging\": false}')"
+	n0=$(asked)
+	say "/workflow start car-tomorrow"
+	check "the car for tomorrow reads the car and asks to start charging" 'wait_asked_long $((n0 + 1)) && last_question | grep -qF "Car 64 %, 294 km, plugged in." && last_question | grep -qF "Start charging" && grep -qF "battery: 64%" "$(req)"'
+	press approve
+	check "one tap starts charging, confirmed by the car" 'wait_for "$OUT" "\"text\":\"Charging started.\"" 30 && SMARTCAR_CLIENT_SECRET=smoke-car-secret-1 "$CC/carcloud" check "$BH/car.ini" >"$T/bcheck4.out" 2>&1; grep -qx "charging: yes" "$T/bcheck4.out"'
+	check "no stored secret of the butler's in its log" '! grep -qE "smoke-ha-token-1|smoke-car-secret-1" "$BH/log/actions.jsonl"'
+	kill "$RPID" 2>/dev/null
+	wait "$RPID" 2>/dev/null
+	RPID=""
+	kill "$SPID" "$CPID" 2>/dev/null
+	SPID=""
+	CPID=""
+else
+	echo "# homemcp or carcloud isn't built next to harness (or HOMEMCP_BIN, CARCLOUD_BIN): the butler's setup and routines against their stand-ins are skipped"
+fi
+
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	echo "smoke: FAILED"
 	echo "--- run output"; cat "$T/run.out"
+	[ -f "$T/brun.out" ] && { echo "--- the butler's run output"; cat "$T/brun.out"; }
+	for x in bcheck1 bcheck2 bcheck3 bcheck4; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
 	echo "--- outbox"; cat "$OUT" 2>/dev/null
 	exit 1
 fi

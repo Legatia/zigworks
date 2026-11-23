@@ -29,7 +29,8 @@ const usage =
     \\
     \\Usage: harness [--home DIR] COMMAND
     \\
-    \\  init                       write the data folder with commented defaults
+    \\  init [--butler]            write the data folder with commented defaults; asks
+    \\                             (--butler: says yes) whether it is a home butler
     \\  secret add NAME [--stdin]  store a secret (typed, not shown)
     \\  secret rm NAME             remove a stored secret
     \\  secret list                which of the configured secrets are stored
@@ -285,6 +286,10 @@ const App = struct {
         c.system_vars = util.pickVars(app.arena, app.env, util.system_var_names) catch &.{};
         c.store = app.store();
         c.role = @tagName(role);
+        // homemcp and carcloud come with harness: /setup looks beside it
+        if (std.process.executableDirPathAlloc(app.io, app.arena)) |d| {
+            c.exe_dir = d;
+        } else |_| {}
         c.writeStatus() catch {};
         // Ctrl-C and kill end it the way /stop and close do (from here on,
         // so a slow start of the MCP servers can be ended too)
@@ -379,7 +384,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
         try outAll(app.io, "harness " ++ build_options.version ++ "\n");
         return .ok;
     }
-    if (eql(cmd, "init")) return initCmd(app);
+    if (eql(cmd, "init")) return initCmd(app, rest);
     if (eql(cmd, "secret")) return secretCmd(app, rest);
     if (eql(cmd, "login")) return loginCmd(app, rest);
     if (eql(cmd, "pair")) return pairCmd(app);
@@ -403,7 +408,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     return .usage;
 }
 
-fn initCmd(app: *App) !Exit {
+fn initCmd(app: *App, args: []const []const u8) !Exit {
     // a folder made now gets a namespace of its own in the system's key
     // store before it has files: one with files and no state/store-id is
     // taken for a folder an earlier harness used (store.namespace)
@@ -412,7 +417,59 @@ fn initCmd(app: *App) !Exit {
         return .failed;
     };
     try core_mod.initHome(app.io, app.arena, app.home);
-    try outPrint(app.io,
+    // a home butler? `--butler` says yes; at a terminal it is asked
+    var butler_on = args.len == 1;
+    var asked = false;
+    if (!butler_on) {
+        const stdin = Io.File.stdin();
+        if (stdin.isTty(app.io) catch false) {
+            asked = true;
+            try errAll(app.io, "Is this a home butler (Home Assistant, the household, maybe a car on Smartcar)? [y/N] ");
+            butler_on = isYes(readLine(app, stdin) catch "");
+        }
+    }
+    if (butler_on) {
+        const p = try core_mod.Paths.init(app.arena, app.home);
+        const text = Io.Dir.cwd().readFileAlloc(app.io, p.config, app.arena, .limited(1 << 20)) catch "";
+        const on = try butlerConfig(app.arena, text);
+        if (!std.mem.eql(u8, on, text)) try util.writeReplace(app.io, p.config, on);
+    }
+    try outAll(app.io, try initText(app.arena, app.home, butler_on, asked));
+    return .ok;
+}
+
+/// "y", "yes" (any case, spaces around it).
+fn isYes(answer: []const u8) bool {
+    const w = std.mem.trim(u8, answer, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(w, "y") or std.ascii.eqlIgnoreCase(w, "yes");
+}
+
+/// config.ini with quiet hours on (22:00-07:00), as a home butler's are:
+/// init's commented line turned on; a file that says otherwise is left.
+fn butlerConfig(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const commented = "; quiet = 22:00-07:00";
+    const at = std.mem.indexOf(u8, text, commented) orelse return text;
+    return std.mem.concat(a, u8, &.{ text[0..at], commented[2..], text[at + commented.len ..] });
+}
+
+/// What `harness init` says: the folder, and the steps that come next
+/// (a home butler's have the token and /setup).
+fn initText(a: std.mem.Allocator, home: []const u8, butler_on: bool, asked: bool) ![]const u8 {
+    if (butler_on) return std.fmt.allocPrint(a,
+        \\Data folder: {s}
+        \\A home butler: quiet hours are on, 22:00-07:00 (config.ini, [butler]).
+        \\Next:
+        \\  1. The model: set the omnigate url (there is none by default) and route names in config.ini,
+        \\     or another provider: [model] provider (README: Models and providers).
+        \\  2. harness secret add omnigate     (your omnigate key; another provider's under its name)
+        \\  3. harness secret add telegram     (the bot token from @BotFather)
+        \\  4. harness secret add ha           (a long-lived access token: in Home Assistant, your profile, Security)
+        \\  5. harness run, then harness pair, then send /pair CODE to the bot.
+        \\  6. In the chat: /setup home, then /setup car if your car is on Smartcar.
+        \\harness doctor says what is still missing.
+        \\
+    , .{home});
+    return std.fmt.allocPrint(a,
         \\Data folder: {s}
         \\Next:
         \\  1. Set the omnigate url (there is none by default) and route names in config.ini,
@@ -421,9 +478,9 @@ fn initCmd(app: *App) !Exit {
         \\  3. harness secret add telegram     (the bot token from @BotFather)
         \\  4. harness secret add search       (optional: Brave Search API key)
         \\  5. harness run, then harness pair, then send /pair CODE to the bot.
+        \\harness doctor says what is still missing.{s}
         \\
-    , .{app.home});
-    return .ok;
+    , .{ home, if (asked) "" else "\n(A home butler, with Home Assistant? harness init --butler)" });
 }
 
 /// a-z, 0-9, - and _, starting with a letter or digit (so an option like
@@ -2057,7 +2114,8 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     if (args.len == 0) return null;
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "help", "--help", "-h", "version", "init", "pair", "run", "chat", "health" }) |c| {
+    if (eql(cmd, "init")) return if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "--butler"))) null else "usage: harness init [--butler]";
+    inline for (.{ "help", "--help", "-h", "version", "pair", "run", "chat", "health" }) |c| {
         if (eql(cmd, c)) return if (rest.len == 0) null else "usage: harness " ++ c ++ " (it takes no arguments)";
     }
     if (eql(cmd, "brief")) return if (rest.len <= 1) null else "usage: harness brief [NAME]";
@@ -2206,6 +2264,29 @@ test "agent_takes_list_show_and_rm" {
     try t.expectEqualStrings("/agent show researcher", show);
     try t.expect(!App.Role.agent.usesTools());
     try t.expect(std.mem.indexOf(u8, usage, "agent list | show NAME | rm NAME") != null);
+}
+
+test "init_asks_whether_this_is_a_home_butler" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // the answer
+    try t.expect(isYes("y") and isYes("Yes") and isYes(" yes ") and !isYes("") and !isYes("n") and !isYes("no"));
+    // a butler: quiet hours on in config.ini; the token and /setup in the steps
+    const on = try butlerConfig(a, config.defaults_ini);
+    try t.expectEqual(22 * 60, (try config.parse(a, on)).butler.quiet.?.start);
+    try t.expectEqualStrings(on, try butlerConfig(a, on));
+    const said = try initText(a, "/data", true, true);
+    for ([_][]const u8{ "A home butler: quiet hours are on, 22:00-07:00 (config.ini, [butler]).", "harness secret add ha ", "In the chat: /setup home, then /setup car", "harness doctor says what is still missing." }) |w| try t.expect(std.mem.indexOf(u8, said, w) != null);
+    // not a butler: as before, and how to say yes later
+    const plain = try initText(a, "/data", false, false);
+    try t.expect(std.mem.indexOf(u8, plain, "secret add ha") == null);
+    try t.expect(std.mem.indexOf(u8, plain, "harness init --butler") != null);
+    try t.expect(std.mem.indexOf(u8, try initText(a, "/data", false, true), "harness init --butler") == null);
+    // --butler, and nothing else
+    try t.expect(badArgs(&.{ "init", "--butler" }) == null);
+    try t.expect(badArgs(&.{ "init", "x" }) != null);
+    try t.expect(badArgs(&.{ "init", "--butler", "x" }) != null);
 }
 
 test "names_start_with_a_letter_or_digit" {

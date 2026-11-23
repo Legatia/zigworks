@@ -165,6 +165,10 @@ pub const Config = struct {
         /// Quiet hours, the owner's time: posts of runs nobody waits on
         /// are held for a digest at their end; null: off until set.
         quiet: ?Quiet = null,
+        /// homemcp's and carcloud's programs for /setup; "": next to
+        /// harness, else on PATH.
+        homemcp: []const u8 = "",
+        carcloud: []const u8 = "",
     };
 };
 
@@ -653,6 +657,8 @@ pub const defaults_ini =
     \\
     \\[butler]
     \\; quiet = 22:00-07:00                ; quiet hours, your time: posts of schedules, triggers and workflows wait for a digest
+    \\; homemcp = /usr/local/bin/homemcp   ; /setup home runs it; default: next to harness, else on PATH
+    \\; carcloud = /usr/local/bin/carcloud ; /setup car runs it; the same
     \\
 ;
 
