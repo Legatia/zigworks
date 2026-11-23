@@ -5944,6 +5944,12 @@ pub const Core = struct {
                 if (info.stop) flag.store(true, .release);
             }
         }
+        // the flag lives in this frame: no one may reach it once it is gone
+        defer {
+            c.wf_mutex.lockUncancelable(c.io);
+            defer c.wf_mutex.unlock(c.io);
+            if (c.wfInfo(id)) |info| info.flag = null;
+        }
         var r: InstRun = .{ .c = c, .a = a, .id = id, .inst = inst, .st = try inst.loadState(a), .flag = &flag, .w = undefined, .values = undefined };
         r.values = jv.parse(a, r.st.values) orelse jv.Value{ .object = .empty };
         if (r.values != .object) r.values = .{ .object = .empty };
