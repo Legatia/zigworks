@@ -17,7 +17,8 @@ at home can speak to Home Assistant's voice satellites and hear it
 answer (Home Assistant's voice, below), and with Home Assistant (through
 homemcp) and a car on Smartcar (through carcloud) it runs a home: set up
 in the chat, with routines that ask with one tap before a lock or a valve
-(Home butler, below).
+(Home butler, below); an urgent alert you don't answer goes to your
+household in turn (Emergencies, below).
 Every action it takes, and every
 action of its helpers, passes one gate and is written to one log you can
 check.
@@ -43,7 +44,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 971 unit tests (20 of them
+**State: 0.3.0, tested on macOS by its own tests: 991 unit tests (20 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 101 checks that drives the real binary against
@@ -51,13 +52,17 @@ stand-ins for omnigate and the other model providers, Telegram (voice
 notes and their files too), a transcription service, feeds, search, two
 MCP servers run as programs, and MCP servers at a url with a token or a
 sign-in (with a stand-in authorization server and browser); with homemcp
-and carcloud built (HOMEMCP_BIN, CARCLOUD_BIN), 21 more: an event pushed
-by homemcp, and the butler's setup in the chat and each routine, against
+and carcloud built (HOMEMCP_BIN, CARCLOUD_BIN), 23 more: an event pushed
+by homemcp, and the butler's setup in the chat and each routine (the
+leak's fallback turned on, a smoke alarm going off and answered with I'm
+on it), against
 homemcp-sim and carcloud-sim (stand-ins for Home Assistant and Smartcar),
 and Home Assistant asking the voice agent (a test client sending what its
 llama.cpp integration sends).
 An earlier build of 0.3.0 also passed its tests in CI on Linux and
-Windows. On Windows 11 the browser and login
+Windows. Emergencies (escalation to the household, the leak's fallback,
+the smoke routine) are tested against stand-ins only: no real household,
+alarm or valve yet. On Windows 11 the browser and login
 tests also run, against Chrome 157, and the console, lock, Credential
 Manager and process-cleanup checks of HANDOFF-windows-audit.md were run by
 hand. With environments, apps, clones and safe state files added,
@@ -788,14 +793,20 @@ turns one off, and the files can be edited and `/reload`ed.
 | Leaving | the last of you went out | one tap before locking; what is still open or on; one tap before the heating goes to 17 °C |
 | Arriving | the first of you is back | the heating back to 21 °C, and a line |
 | Morning summary | as quiet hours end | the house (the car, a calendar and the weather when there are servers for them) in a few lines, after the night's digest |
-| Leak | a leak sensor reads water | at once, through quiet hours: [Close the water main] [Ignore] |
+| Leak | a leak sensor reads water | at once, through quiet hours: [Close the water main] [Ignore]; with its fallback on, closed by harness when nobody answers in 5 minutes |
+| Smoke alarm | a smoke or CO alarm goes off | at once, through quiet hours, on every speaker; nothing is acted on |
 | Doors left open | a door or window opens | after 10 minutes, if it still is open, a line |
 | Car for tomorrow | 90 minutes before quiet hours | a line when the car is low and not plugged in; one tap to start charging when it is |
 
 Nothing guarded runs without your tap: locks are only locked, valves and
 garage doors only closed, alarms only armed (homemcp's home file allows
 nothing else), each after an `approve` step's `yes` (The gate, under
-Workflows), and no answer means nothing happens. The files are in
+Workflows), and no answer means nothing happens, but for one opt-in: the
+leak's fallback (Emergencies, below), which closes the water main once
+when nobody is on the alert in 5 minutes. After the leak is turned on
+with a valve, setup offers it: "If nobody answers the leak's question in
+5 minutes, I close the water main myself, once, and tell you." [Turn on]
+[Not now], the line it adds shown first. The files are in
 [examples/butler](examples/butler/), built into harness; where the setup
 is, `/setup`. Where homemcp and carcloud are: `[butler] homemcp =` and
 `carcloud =` in config.ini, else next to harness, else on PATH.
@@ -817,6 +828,61 @@ store, every one stored) is masked as `[secret:NAME]`; what looks like a
 bot token or a password in an address is taken out. The log holds what
 you and harness said in conversations that are not private: read it
 before you send it.
+
+## Emergencies
+
+An urgent alert, the first message of an urgent trigger or workflow (the
+leak's question, the smoke alarm's line), is answered when you tap any of
+its buttons or reply to it. A post that would otherwise have none gets
+one: [I'm on it]. Until then it goes to the people of your household you
+name, in turn:
+
+```ini
+[butler]
+escalate = 5m anna, 15m piotr      ; members (Household, above), each told when nobody is on it yet
+```
+
+```
+03:12  Butler, to you:   Water leak: Sink leak, Kitchen.   [Close the water main] [Ignore]
+03:17  Butler, to Anna:  Nobody has answered this yet: Water leak: Sink leak, Kitchen.   [I'm on it]
+03:19  Anna:             (taps I'm on it)
+       Butler, to you:   Anna is on it: Water leak: Sink leak, Kitchen.
+```
+
+- **Who.** `[butler] escalate` is for every urgent trigger and workflow; a
+  trigger's `escalate = …` or a workflow's head line `escalate …` replaces
+  it, and `escalate = no` keeps that one to you. Only urgent ones escalate
+  (`escalate` without `urgent` is a bad line), so an urgent alert that
+  isn't about the home (a server down) says `escalate = no` if your
+  household shouldn't read it. Up to 5 steps, from 1 minute to 24 hours
+  after the alert, each later than the one before.
+- **What they get.** The alert's first line in their own chat with the bot,
+  and [I'm on it]: never its buttons. Members approve nothing; their "I'm
+  on it" answers it for everyone (no one else is told, nothing is made by
+  harness), the others' messages say who has it, and you are told. A
+  member who can't be reached (not joined, or never wrote to the bot) is
+  said to you, and the next one is told all the same.
+- **The speakers.** When the alert's trigger has `announce` (or the trigger
+  that started its workflow does), the house says it again at each step.
+  `speakers = all` on a trigger says its `announce` on every speaker, not
+  only in the event's room.
+- **The fallback.** An urgent workflow's `approve` step with `yes` may say
+  `fallback 5m`: nobody on it by then, harness taps its yes itself, once.
+  The next step must be homemcp's `home_guarded` locking, closing or
+  arming (`lock`, `close`, `arm_home`, `arm_away`), fixed in the file as
+  `yes` asks; anything else is a bad line when the file is read, and it
+  can't come later than the question's `timeout`. The call is the gate's
+  like any (a deny rule or `/dryrun` stops it), logged "made by harness: no
+  one answered in time"; the question says "Close the water main (no one
+  answered: harness did it), 03:17"; the routine's next line begins "No
+  one answered in 5 minutes:" ("No one answered in 5 minutes: Water main
+  closed (it reports closed)."). It doesn't stop the escalation.
+- **State.** `state/alerts` keeps each alert (masked), who was told and
+  how it ended, written whole as it changes, so escalation goes on after a
+  restart and [I'm on it] still works; an alert is dropped a day after it
+  began. The log's kind `alert`: `open`, `escalated`, `announced`,
+  `acknowledged`, `closed` and `absence` (the fallback: the alert, its
+  time, when harness acted, and the call).
 
 ## Folders
 
@@ -1283,7 +1349,8 @@ object a line, as apps will get them (format v1):
 `status` is `open`, `answered`, `expired`, `void`, `withdrawn` or `done`
 (a kept post went out); `waiter` is `run`, `harness`, a workflow step's
 label, or `member NAME` (a household member's call, see Household); `answer` is `{"key","text","at","via"}` with `via`
-`telegram`, `terminal` or `harness`. Texts are masked as in the log (a
+`telegram`, `terminal`, `harness` or `fallback` (an urgent routine's
+question nobody was on, answered by harness: see Emergencies). Texts are masked as in the log (a
 stored secret shows as `[secret:NAME]`, in the message too); a private
 conversation's item keeps its texts while open, then only their sizes and
 keyed hashes (`{"bytes":N,"hmac":"…"}`). `state/inbox` is rewritten whole
@@ -1923,8 +1990,10 @@ only after a 3% move. A section's keys give its kind:
   gets an event too. `urgent = yes` (any kind but a brief) lets its posts
   through quiet hours (see Quiet hours and the digest). `announce = TEXT`
   (beside any action, not on schedules) says a line aloud on the house's
-  speakers for each event, filled like `say` (see Home Assistant's voice);
-  a trigger never polls `announce` itself.
+  speakers for each event, filled like `say` (see Home Assistant's voice),
+  in the event's room, or on every speaker with `speakers = all`; a
+  trigger never polls `announce` itself. `escalate = 5m anna` (urgent
+  only) says who is told when you don't answer (see Emergencies).
 - **State.** `state/triggers/NAME/` keeps `state` (where its polls are,
   what it counted), `seen`, `queue` and a page's `last` text. A poll
   writes its events to `queue` before its cursor moves, and an event is
@@ -2023,7 +2092,9 @@ night` starts it when your whole message (or voice note) is one of them,
 without a model call; case, spaces and punctuation don't count, a phrase
 starts one workflow only, and `start` must name `owner`. `tag no` sends
 its posts and questions without `[NAME#N]` in front (the butler's
-routines use it).
+routines use it). `escalate 5m anna, 15m piotr` (urgent only) says who is
+told when you don't answer its alert, `escalate no` no one (see
+Emergencies).
 
 A line is a key and its value; `#` starts a comment line; a line ending in
 `:` takes the lines indented below it. The head: `workflow NAME` (the
@@ -2143,7 +2214,10 @@ sections `[workflow:NAME]`), labelled `workflow NAME#N/STEP`.
   gate still decides the call (a deny rule, a cap, `/dryrun`); No, or no
   answer in `timeout`, is `on deny`. A step with `yes` goes on to the step
   right after it (no `if`, `goto` or `end` in it), and that step is a tool
-  step: harness's reading says "YES makes step NEXT's call, once".
+  step: harness's reading says "YES makes step NEXT's call, once". In an
+  urgent workflow, `fallback 5m` on it lets harness tap the yes itself when
+  nobody is on it in time, for homemcp's `home_guarded` locking, closing or
+  arming only (see Emergencies).
 
 ### Commands and the tool
 

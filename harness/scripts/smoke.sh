@@ -730,6 +730,7 @@ utc_offset = $UTC_OFF
 quiet = 05:00-06:00
 homemcp = $HM/homemcp
 carcloud = $CC/carcloud
+escalate = 10m anna
 EOF
 	chmod 600 "$BH/config.ini"
 	printf 'smoke-ha-token-1\n' | "$H" secret add ha --stdin 2>/dev/null
@@ -741,19 +742,19 @@ EOF
 	say "/pair $BCODE"
 	check "a butler, paired, hears what comes next" 'wait_for "$OUT" "Next: /setup home connects your home."'
 	say "/setup home http://127.0.0.1:$BPORT"
-	check "/setup home reads the home through homemcp discover and shows the file first" 'wait_for "$OUT" "home.ini, as Looks right writes it:" 20 && wait_for "$OUT" "I found 16 devices in 5 rooms, and 2 people." 20 && wait_for "$OUT" "I won'"'"'t touch the front door camera or the kitchen smoke alarm." 5 && [ ! -e "$BH/home.ini" ]'
+	check "/setup home reads the home through homemcp discover and shows the file first" 'wait_for "$OUT" "home.ini, as Looks right writes it:" 20 && wait_for "$OUT" "I found 17 devices in 5 rooms, and 2 people." 20 && wait_for "$OUT" "I won'"'"'t touch the front door camera or the kitchen smoke alarm." 5 && [ ! -e "$BH/home.ini" ]'
 	n0=$(asked)
 	press yes
-	check "Looks right writes the home, starts homemcp and offers the routines" 'wait_for "$OUT" "The home is connected: 16 devices." 30 && [ -f "$BH/home.ini" ] && grep -qF "secret = HA_TOKEN:ha" "$BH/mcp.ini" && wait_asked_long $((n0 + 1)) && last_question | grep -qF "Goodnight: when you say goodnight"'
-	# every routine turned on, as each is offered
-	for r in goodnight leaving arriving morning-home leak door-open; do
+	check "Looks right writes the home, starts homemcp and offers the routines" 'wait_for "$OUT" "The home is connected: 17 devices." 30 && [ -f "$BH/home.ini" ] && grep -qF "secret = HA_TOKEN:ha" "$BH/mcp.ini" && wait_asked_long $((n0 + 1)) && last_question | grep -qF "Goodnight: when you say goodnight"'
+	# every routine turned on, as each is offered (the leak's fallback too)
+	for r in goodnight leaving arriving morning-home leak leak-fallback smoke door-open; do
 		n0=$(asked)
 		press on
 		[ "$r" = door-open ] || wait_asked_long $((n0 + 1))
 	done
-	check "every routine the home has what for is on" 'wait_for "$OUT" "That'"'"'s all the routines: 6 on." 30 && [ -f "$BH/workflows/leak.wf" ] && grep -qF "[leak-sink_leak]" "$BH/triggers.ini" && grep -qF "[door-back_door]" "$BH/triggers.ini" && grep -qF "[workflow:arriving/heat]" "$BH/rules"'
+	check "every routine the home has what for is on" 'wait_for "$OUT" "That'"'"'s all the routines: 7 on." 30 && [ -f "$BH/workflows/leak.wf" ] && grep -qF "fallback 5m" "$BH/workflows/leak.wf" && grep -qF "[leak-sink_leak]" "$BH/triggers.ini" && grep -qF "[smoke-kitchen_smoke_alarm]" "$BH/triggers.ini" && grep -qF "speakers = all" "$BH/triggers.ini" && grep -qF "[door-back_door]" "$BH/triggers.ini" && grep -qF "[workflow:arriving/heat]" "$BH/rules"'
 	# the triggers' first polls only mark what is there
-	for tr in leak-sink_leak door-back_door everyone-left first-home; do
+	for tr in leak-sink_leak smoke-kitchen_smoke_alarm door-back_door everyone-left first-home; do
 		wait_for "$BH/state/triggers/$tr/state" "\"polled\":true" 20
 	done
 	# goodnight: the lights and the heating as asked, then one tap to lock
@@ -772,6 +773,12 @@ EOF
 	check "a leak asks with one tap to close the water main" 'wait_asked_long $((n0 + 1)) && last_question | grep -qF "Water leak: Sink leak, Kitchen." && last_question | grep -qF "\"text\":\"Close the water main\""'
 	press approve
 	check "one tap closes the water main, as it reports" 'wait_for "$OUT" "\"text\":\"Water main closed (it reports closed).\"" 20 && HA_TOKEN=smoke-ha-token-1 "$HM/homemcp" check "$BH/home.ini" >"$T/bcheck2.out" 2>&1; grep -F "water_main (" "$T/bcheck2.out" | grep -qF "): closed;"'
+	# the smoke alarm goes off: said at once, with one tap to say you're on it
+	n0=$(asked)
+	"$HM/homemcp-sim" poke ha "$BPORT" smoke-ha-token-1 binary_sensor.kitchen_smoke '{"smoke": true}'
+	check "a smoke alarm going off is said at once, with I'm on it" 'wait_asked_long $((n0 + 1)) && last_question | grep -qF "Smoke alarm: Kitchen smoke alarm, Kitchen." && last_question | grep -qF "\"text\":\"I'"'"'m on it\""'
+	press onit
+	check "I'm on it: nothing is due for it any more, and nothing acted on the alarm" 'wait_for "$BH/log/actions.jsonl" "\"by\":\"owner\",\"via\":\"button\"" 20 && ! grep -F "kitchen_smoke_alarm" "$BH/log/actions.jsonl" | grep -qF "\"tool\":\"home__home_"'
 	# a door opened: its routine waits 10 minutes before it looks again
 	"$HM/homemcp-sim" poke ha "$BPORT" smoke-ha-token-1 binary_sensor.back_door '{"contact": false}'
 	check "a door left open starts its routine, waiting 10 minutes" 'wait_for "$BH/state/workflows/door-open/1/state" "\"kind\":\"timer\"" 20'

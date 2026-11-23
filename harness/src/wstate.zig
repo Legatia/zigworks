@@ -82,6 +82,9 @@ pub const State = struct {
     /// The values its steps left, a JSON object (with `input`, `event`,
     /// `instance`).
     values: []const u8 = "{}",
+    /// Minutes nobody answered before a fallback made a call: its next
+    /// say begins "No one answered in N minutes: "; 0: none.
+    absent: u32 = 0,
 
     /// A copy whose every slice is in `a`.
     pub fn clone(s: State, a: Allocator) !State {
@@ -152,6 +155,7 @@ pub fn stateJson(a: Allocator, s: State) ![]const u8 {
     try util.jsonString(&out, a, s.why);
     try out.appendSlice(a, ",\"values\":");
     try out.appendSlice(a, if (s.values.len > 0) s.values else "{}");
+    if (s.absent > 0) try out.print(a, ",\"absent\":{d}", .{s.absent});
     try out.appendSlice(a, "}\n");
     return out.items;
 }
@@ -198,6 +202,7 @@ pub fn parseState(a: Allocator, text: []const u8) ?State {
     s.updated = time(jv.get(v, "updated"));
     s.ended = time(jv.get(v, "ended"));
     s.ends = time(jv.get(v, "ends"));
+    s.absent = count(jv.get(v, "absent"), 0);
     s.why = jv.str(jv.get(v, "why")) orelse "";
     const values = jv.get(v, "values") orelse jv.Value{ .object = .empty };
     if (values != .object) return null;

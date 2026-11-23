@@ -49,6 +49,7 @@ const household = @import("household.zig");
 const speech = @import("speech.zig");
 const voiceagent = @import("voiceagent.zig");
 const butler = @import("butler.zig");
+const alerts_mod = @import("alerts.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -630,6 +631,9 @@ pub const Core = struct {
     /// Quiet hours: what is held for the digest, /quiet's switch, the
     /// urgent triggers and workflows (state/quiet).
     quiet: quiet_mod.Store,
+    /// Urgent alerts nobody has acknowledged yet, and whom they go to
+    /// (state/alerts; see Emergency).
+    alerts: alerts_mod.Store,
     /// No one is left to answer (the terminal's input ended): nothing more
     /// is asked.
     questions_closed: std.atomic.Value(bool) = .init(false),
@@ -880,6 +884,10 @@ pub const Core = struct {
         c.quiet = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "quiet" }));
         errdefer c.quiet.deinit();
         c.quiet.load() catch |e| c.log.write(.chat, false, .{ .event = "quiet not read", .why = @errorName(e) }) catch {};
+        // urgent alerts and their escalation, kept across a restart
+        c.alerts = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "alerts" }));
+        errdefer c.alerts.deinit();
+        c.alerts.load() catch |e| c.log.write(.alert, false, .{ .event = "not read", .why = @errorName(e) }) catch {};
         c.noteUrgent();
         c.voidRunItems();
         c.pruneMemberAsks();
@@ -964,6 +972,7 @@ pub const Core = struct {
         c.start_edits.deinit(c.gpa);
         c.inbox.deinit();
         c.quiet.deinit();
+        c.alerts.deinit();
         c.summary_job.deinit(c.gpa);
         for (c.contexts.items) |x| c.freeContext(x);
         c.contexts.deinit(c.gpa);
@@ -1557,6 +1566,8 @@ pub const Core = struct {
         if (m.voice) |note| return c.voiceIn(conv, m, note);
         // a reply to one of an item's messages is its text answer
         const is_command = std.mem.startsWith(u8, std.mem.trim(u8, text, " \t\r\n"), "/");
+        // a reply to an urgent alert: the owner is on it
+        if (m.reply_to != 0) Emergency.touched(c, m.chat, m.reply_to, "reply");
         if (m.reply_to != 0 and !is_command and c.replyAnswer(conv, m.chat, m.reply_to, text)) return;
         return c.handleTextIn(conv, text);
     }
@@ -2916,6 +2927,7 @@ pub const Core = struct {
         for (c.trig_list) |tr| if (tr.urgent) names.append(a, std.fmt.allocPrint(a, "trigger:{s}", .{tr.name}) catch return) catch return;
         for (c.wf_defs) |w| if (w.urgent) names.append(a, std.fmt.allocPrint(a, "workflow:{s}", .{w.name}) catch return) catch return;
         c.quiet.setUrgent(names.items) catch {};
+        Emergency.notePlans(c);
     }
 
     /// When quiet hours end, when what `by` started is held now: a run
@@ -3154,10 +3166,13 @@ pub const Core = struct {
     /// as Telegram sends it ("": not known): an Undo press edits it with
     /// the outcome.
     pub fn handleCallbackText(c: *Core, from_id: i64, chat: i64, thread: i64, message_id: i64, data: []const u8, text: []const u8) void {
+        // [I'm on it]: the owner's, or a household member's
+        if (data.len > 0 and data[0] == 'e') return Emergency.press(c, from_id, chat, thread, message_id, data);
         if (c.owner == null or from_id != c.owner.?) {
             c.log.write(.chat, false, .{ .event = "dropped", .from = from_id, .why = "button from someone else" }) catch {};
             return;
         }
+        Emergency.touched(c, chat, message_id, "button");
         if (data.len > 0 and data[0] == 'r') {
             if (!c.quickPress(message_id, data)) c.tellOutOfDate(chat, thread, message_id);
             return;
@@ -3593,6 +3608,8 @@ pub const Core = struct {
         }
         // where messages can't be changed (the terminal), an expiry is said
         c.applyEdits(closed.edits, if (status == .expired) .{ .conv = conv, .text = closed.outcome } else null);
+        // an urgent alert's question: answered, someone is on it
+        Emergency.settled(c, id, status, ans.via);
         // the answer is on disk: a workflow's instance goes on with it
         if (std.mem.startsWith(u8, waiter, "workflow ")) c.wakeWorkflow(waiter);
         // a household member's call: made on the owner's yes, the member told
@@ -4002,6 +4019,7 @@ pub const Core = struct {
             break :blk it.id;
         };
         _ = c.showItem(id, null);
+        Emergency.item(c, n, id);
         return id;
     }
 
@@ -5092,8 +5110,11 @@ pub const Core = struct {
         if (end) |e| if (p.files.len == 0) if (c.holdPost(a, o, p, text, undo.button, e)) |d| return d;
         const hush = end != null;
         c.ensureTopic(a, p.to);
+        // an urgent alert's first post: its escalation, and [I'm on it]
+        const alert = Emergency.post(c, a, o, p, text);
+        const extra = undo.button orelse if (alert) |al| al.button else null;
         if (c.overHourly(a, p.to)) |why| return .{ .status = .held, .why = why };
-        const sending = if (p.buttons.len > 0 or undo.button != null) c.sendWithButtons(a, p.to, o.agent, text, p.buttons, undo.button, hush) else c.sendTextAs(p.to, text, hush);
+        const sending = if (p.buttons.len > 0 or extra != null) c.sendWithButtons(a, p.to, o.agent, text, p.buttons, extra, hush) else c.sendTextAs(p.to, text, hush);
         const sent = sending catch |e| {
             // kept as an item, to be sent again as it is: nothing runs again for it
             const r = o.run;
@@ -5112,6 +5133,7 @@ pub const Core = struct {
             return .{ .status = if (worthRetry(e)) .kept else .failed, .why = whyUndelivered(e), .item = id };
         };
         c.touch(p.to);
+        if (alert) |al| Emergency.sent(c, a, al.id, p.to, sent);
         var d: agent.Delivery = .{ .status = .sent, .message = sent.first, .parts = sent.count };
         for (p.files) |f| {
             c.sendFile(a, p.to, f, hush) catch |e| {
@@ -5573,6 +5595,8 @@ pub const Core = struct {
         c.remindDue(now_s);
         // quiet hours over: what they held, a digest per conversation
         c.quietDue(now_s);
+        // urgent alerts nobody is on: the household in turn, a fallback
+        Emergency.due(c, now_s);
         // due triggers are polled, one at a time, on a thread of their own
         if (c.poller_on) c.startPoller(now_s);
         // the daily summaries, where triggers are polled, on a thread of their own
@@ -7335,6 +7359,7 @@ pub const Core = struct {
         }
         if (take.items.len == 0) return;
         // said aloud beside its action: the post never waits for the speakers
+        if (tr.announce.len > 0 and tr.urgent) Emergency.noteSpeak(c, a, tr, take.items[0]);
         if (tr.announce.len > 0) c.startAnnounce(tr, take.items, by_hand);
         switch (tr.action) {
             .say => |template| try c.triggerSay(a, tr, template, take.items, by_hand),
@@ -7616,7 +7641,7 @@ pub const Core = struct {
             if (text.len == 0) continue;
             var input: std.ArrayList(u8) = .empty;
             try input.print(a, "{{\"message\":{f}", .{std.json.fmt(util.cut(text, 300), .{})});
-            if (eventRoom(a, ev.fields)) |room| try input.print(a, ",\"room\":{f}", .{std.json.fmt(room, .{})});
+            if (tr.speakers != .all) if (eventRoom(a, ev.fields)) |room| try input.print(a, ",\"room\":{f}", .{std.json.fmt(room, .{})});
             try input.append(a, '}');
             const arg = try std.fmt.allocPrint(a, "{s}/announce {s}", .{ m.server.name, input.items });
             const d = blk: {
@@ -8176,7 +8201,7 @@ pub const Core = struct {
 
     /// An item's answer, once closed (null while open): its status, key
     /// and words, and a draft's text (a private item's go with `hideItem`).
-    const ItemAnswer = struct { status: inbox_mod.Status, key: []const u8 = "", text: []const u8 = "", draft: []const u8 = "" };
+    const ItemAnswer = struct { status: inbox_mod.Status, key: []const u8 = "", text: []const u8 = "", draft: []const u8 = "", via: inbox_mod.Via = .harness };
 
     fn itemAnswer(c: *Core, a: std.mem.Allocator, id: u64) ?ItemAnswer {
         c.inbox.mutex.lockUncancelable(c.io);
@@ -8189,6 +8214,7 @@ pub const Core = struct {
             .key = a.dupe(u8, ans.key orelse "") catch "",
             .text = a.dupe(u8, ans.text orelse "") catch "",
             .draft = a.dupe(u8, it.draft orelse "") catch "",
+            .via = ans.via,
         };
     }
 
@@ -9033,8 +9059,9 @@ pub const Core = struct {
     const SetupDone = struct { said: []const u8 = "", offer: Offer = .none, routine: ?butler.Routine = null };
 
     /// What follows: the routines from the first, the next one, the one
-    /// just offered again (with a town), or the car's.
-    const Offer = enum { none, start, next, again, car };
+    /// just offered again (with a town), the car's, or the leak's
+    /// fallback.
+    const Offer = enum { none, start, next, again, car, fallback };
 
     /// An answer to a setup or routine item (`run` says which); written
     /// and applied before the item closes. error: nothing written.
@@ -9083,6 +9110,7 @@ pub const Core = struct {
             if (!c.homeOn(a)) return .{ .said = "The car is connected. /setup home connects the home; its routines come then." };
             return .{ .said = "The car is connected.", .offer = .car };
         }
+        if (eql(u8, run, "routine leak-fallback")) return Emergency.fallbackAnswer(c, a, key);
         if (std.mem.startsWith(u8, run, "routine ")) {
             const r = std.meta.stringToEnum(butler.Routine, run["routine ".len..]) orelse return error.NoSuchRoutine;
             // a town for the morning summary's weather: shown again with it
@@ -9112,8 +9140,10 @@ pub const Core = struct {
             try c.writeSetting(c.paths.triggers, trig_text);
             try c.writeSetting(c.paths.rules, rules_text);
             c.log.write(.config, false, .{ .event = "routine on", .name = r.name() }) catch {};
-            if (c.applySetup()) |why| return .{ .said = try std.fmt.allocPrint(a, "{s} is written. {s}", .{ r.title(), why }), .offer = .next };
-            return .{ .said = try butler.onText(a, r, try c.setupPicks(a)), .offer = .next };
+            // the leak with a valve: its fallback offered next
+            const then: Offer = if (r == .leak and butler.fallbackOffered(try c.setupPicks(a))) .fallback else .next;
+            if (c.applySetup()) |why| return .{ .said = try std.fmt.allocPrint(a, "{s} is written. {s}", .{ r.title(), why }), .offer = then };
+            return .{ .said = try butler.onText(a, r, try c.setupPicks(a)), .offer = then };
         }
         return error.NoSuchSetup;
     }
@@ -9143,6 +9173,7 @@ pub const Core = struct {
             .calendar = calendar,
             .quiet = c.quiet.effective(c.cfg.butler.quiet),
             .town = std.mem.trim(u8, c.readOr(a, try c.setupPath(a, "town")), " \t\r\n"),
+            .escalate = c.cfg.butler.escalate,
         });
     }
 
@@ -9156,6 +9187,8 @@ pub const Core = struct {
             if (!r.offered(p) or c.workflowText(a, r.name()) != null) continue;
             try names.print(a, "{s}\n", .{r.name()});
         }
+        // the leak on without its fallback: offered too
+        if (only == null and Emergency.fallbackOpen(c, a, p)) try names.appendSlice(a, "leak-fallback\n");
         try util.writeReplace(c.io, try c.setupPath(a, "offers"), names.items);
         if (names.items.len == 0) return "Every routine your home has what for is on. /workflows lists them.";
         try c.offerNext(a, conv);
@@ -9180,6 +9213,10 @@ pub const Core = struct {
             const name = list[0..nl];
             list = list[nl + 1 ..];
             try util.writeReplace(c.io, path, list);
+            if (std.mem.eql(u8, name, "leak-fallback")) {
+                if (Emergency.fallbackOpen(c, a, p)) return Emergency.offerFallback(c, a, conv);
+                continue;
+            }
             const r = std.meta.stringToEnum(butler.Routine, name) orelse continue;
             if (c.workflowText(a, r.name()) != null) continue;
             return c.offerOne(a, conv, r, p);
@@ -9218,6 +9255,10 @@ pub const Core = struct {
             .none => "",
             .start => c.startOffers(a, conv, null) catch |e| @errorName(e),
             .car => c.startOffers(a, conv, .@"car-tomorrow") catch |e| @errorName(e),
+            .fallback => blk: {
+                Emergency.offerFallback(c, a, conv) catch |e| break :blk @errorName(e);
+                break :blk "";
+            },
             .next => blk: {
                 c.offerNext(a, conv) catch |e| break :blk @errorName(e);
                 break :blk "";
@@ -11521,7 +11562,8 @@ const WfAsker = struct {
         // question, once (Ruling 1)
         for (w.answers, 0..) |p, i| if (!w.used[i] and std.mem.startsWith(u8, p.ask, yes_tap) and std.mem.eql(u8, p.ask[yes_tap.len..], w.step)) {
             w.used[i] = true;
-            return .{ .answer = .once, .key = "once", .item = p.item };
+            // "fallback": harness's own yes, nobody on it in time
+            return .{ .answer = .once, .key = if (std.mem.eql(u8, p.key, "fallback")) "fallback" else "once", .item = p.item };
         };
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(q.text, &digest, .{});
@@ -11593,6 +11635,9 @@ const InstRun = struct {
     /// An approve step with yes was answered yes in this item: the next
     /// step's call is allowed once by that tap (Ruling 1).
     yes_item: u64 = 0,
+    /// That yes was harness's own: nobody was on the urgent question in
+    /// time (its `fallback`).
+    yes_fallback: bool = false,
 
     /// "workflow NAME#N/STEP": its lines' label, its items' waiter.
     fn label(r: *const InstRun, step: []const u8) []const u8 {
@@ -11901,10 +11946,13 @@ const InstRun = struct {
                         // a yes tap: the next step's call is allowed once
                         // by it, kept on disk with the step (Ruling 1)
                         if (r.yes_item != 0 and s.yes.len > 0 and k == i + 1) {
-                            r.st.answers = try r.a.dupe(wstate.Answer, &.{.{ .ask = try std.fmt.allocPrint(r.a, "{s}{s}", .{ yes_tap, r.w.steps[k].name }), .key = "once", .item = r.yes_item }});
-                            r.journal(.{ .step = r.w.steps[k].name, .event = "allowed", .text = try std.fmt.allocPrint(r.a, "its call, once, by the yes in item {d}", .{r.yes_item}) });
+                            r.st.answers = try r.a.dupe(wstate.Answer, &.{.{ .ask = try std.fmt.allocPrint(r.a, "{s}{s}", .{ yes_tap, r.w.steps[k].name }), .key = if (r.yes_fallback) "fallback" else "once", .item = r.yes_item }});
+                            // nobody on it: its next say says so first
+                            if (r.yes_fallback) r.st.absent = @max(1, s.fallback_s / 60);
+                            r.journal(.{ .step = r.w.steps[k].name, .event = "allowed", .text = if (r.yes_fallback) try std.fmt.allocPrint(r.a, "its call, once, by harness: no one answered item {d} in time", .{r.yes_item}) else try std.fmt.allocPrint(r.a, "its call, once, by the yes in item {d}", .{r.yes_item}) });
                         }
                         r.yes_item = 0;
+                        r.yes_fallback = false;
                     },
                     .end => {
                         try r.end(.done, "done");
@@ -12066,7 +12114,10 @@ const InstRun = struct {
         }
         if (eql(u8, phase, "approve")) {
             if (eql(u8, key, "approve")) {
-                if (s.yes.len > 0) r.yes_item = item;
+                if (s.yes.len > 0) {
+                    r.yes_item = item;
+                    r.yes_fallback = got.via == .fallback;
+                }
                 return .{ .ok = .{ .string = "approve" } };
             }
             return .{ .denied = try r.ownerWords(got, item) };
@@ -12220,6 +12271,16 @@ const InstRun = struct {
         return .waits;
     }
 
+    /// The call of the step after `s`, as the file has it ("": none).
+    fn nextCall(r: *const InstRun, s: workflows.Step) []const u8 {
+        const i = r.w.find(s.name) orelse return "";
+        if (i + 1 >= r.w.steps.len) return "";
+        return switch (r.w.steps[i + 1].action) {
+            .tool => |tl| std.fmt.allocPrint(r.a, "{s} {s}", .{ tl.name, tl.json }) catch "",
+            else => "",
+        };
+    }
+
     /// "[NAME#N STEP] ", in front of a step's gate questions.
     fn askTag(r: *const InstRun, step: []const u8) []const u8 {
         return std.fmt.allocPrint(r.a, "[{s} {s}] ", .{ r.id, step }) catch "";
@@ -12271,7 +12332,10 @@ const InstRun = struct {
         run.outbox = out.outbox();
         try run.logRun(.workflow, false, .{ .instance = r.id, .event = "step", .step = s.name, .@"try" = r.st.try_n });
         r.rid = run.rid;
-        const got = try agent.postText(&run, r.a, r.st.call);
+        // a fallback made the call before it: said first, plainly
+        const text = if (r.st.absent > 0) try std.fmt.allocPrint(r.a, "No one answered in {s}: {s}", .{ try Emergency.minutesWords(r.a, r.st.absent), r.st.call }) else r.st.call;
+        const got = try agent.postText(&run, r.a, text);
+        r.st.absent = 0;
         if (ask.deferred) return r.deferred(&ask);
         if (r.flag.load(.acquire)) return .stopped;
         if (got.refused) |why| return .{ .failed = .{ .why = why, .retry = false } };
@@ -12436,6 +12500,8 @@ const InstRun = struct {
             });
         };
         const item = made catch |e| return .{ .failed = .{ .why = @errorName(e) } };
+        // an urgent routine's question that makes its safe call itself
+        if (approve and s.fallback_s > 0) Emergency.fallbackFor(r.c, r.by(s.name), lbl, r.w.to, r.st.call, private, item, s.fallback_s, r.nextCall(s));
         r.st.wait = .{ .kind = .item, .item = item, .phase = if (approve) "approve" else "review", .since = now_s };
         return .waits;
     }
@@ -19610,6 +19676,9 @@ test "a_routine_is_shown_then_written_on_turn_on" {
     // the rest, then the end
     try f.rec.waitFor("BUTTONS Leak: when the sink leak finds water");
     try f.press("on");
+    // the leak's fallback is offered next (Not now: none)
+    try f.rec.waitFor("BUTTONS If nobody answers the leak's question in 5 minutes, I close the water main myself, once, and tell you. [");
+    try f.press("later");
     try f.rec.waitFor("BUTTONS Doors left open: when the back door stays open for 10 minutes, I tell you. [");
     try f.press("later");
     try f.rec.waitFor("That's all the routines: 3 on.");
@@ -22211,4 +22280,870 @@ test "an_app_reads_and_acts_over_http_and_the_bar_answers" {
     try expectHas(lt, "\"event\":\"answered\",\"item\":1,\"key\":\"once\",\"via\":\"bar\"");
     try t.expect(std.mem.indexOf(u8, lt, &s.shell_token) == null);
     try t.expect(std.mem.indexOf(u8, lt, &s.appToken("notes", "1")) == null);
+}
+
+// ---- emergencies: acknowledging, escalation, the fallback ----
+
+test {
+    _ = @import("alerts.zig");
+}
+
+/// Urgent alerts the owner hasn't acknowledged (Rulings in
+/// docs/superpowers/plans/2026-11-23-emergencies.md): the first message of
+/// an urgent trigger's run or workflow's instance; a tap on it or a reply
+/// acknowledges it; else the household is told in turn, the speakers say
+/// it again, and a routine's question may make its safe call itself.
+const Emergency = struct {
+    const on_it = "I'm on it";
+
+    /// The plans: every urgent trigger and workflow, its own `escalate`
+    /// or `[butler]`'s (beside the urgent list, under settings_mutex).
+    fn notePlans(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var list: std.ArrayList(alerts_mod.Plan) = .empty;
+        for (c.trig_list) |tr| if (tr.urgent) list.append(a, .{ .key = std.fmt.allocPrint(a, "trigger:{s}", .{tr.name}) catch return, .steps = tr.escalate orelse c.cfg.butler.escalate }) catch return;
+        for (c.wf_defs) |w| if (w.urgent) list.append(a, .{ .key = std.fmt.allocPrint(a, "workflow:{s}", .{w.name}) catch return, .steps = w.escalate orelse c.cfg.butler.escalate }) catch return;
+        c.alerts.setPlans(list.items) catch {};
+    }
+
+    /// One alert each: a workflow's instance (`workflow NAME#N`, from its
+    /// label `workflow NAME#N/STEP`), else the run (`BY#RID`).
+    fn keyOf(a: std.mem.Allocator, by: []const u8, label: []const u8, rid: u64) []const u8 {
+        if (std.mem.startsWith(u8, label, "workflow ")) {
+            const rest = label["workflow ".len..];
+            return std.fmt.allocPrint(a, "workflow {s}", .{rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len]}) catch "";
+        }
+        return std.fmt.allocPrint(a, "{s}#{d}", .{ by, rid }) catch "";
+    }
+
+    /// The speakers' line of what made an alert: its trigger's, or for a
+    /// workflow's instance, the trigger that started it.
+    fn speakFor(c: *Core, a: std.mem.Allocator, by: []const u8, key: []const u8) ?alerts_mod.Speak {
+        var started_by = by;
+        if (std.mem.startsWith(u8, key, "workflow ")) {
+            c.wf_mutex.lockUncancelable(c.io);
+            defer c.wf_mutex.unlock(c.io);
+            const info = c.wfInfo(key["workflow ".len..]) orelse return null;
+            started_by = a.dupe(u8, info.state.by) catch return null;
+        }
+        if (!std.mem.startsWith(u8, started_by, "trigger:")) return null;
+        return c.alerts.speakOf(a, started_by, c.now());
+    }
+
+    /// A trigger's `announce` line as said now (urgent): kept for the
+    /// steps that say it again.
+    fn noteSpeak(c: *Core, a: std.mem.Allocator, tr: triggers.Trigger, ev: tstate.Event) void {
+        const text = std.mem.trim(u8, triggers.fill(a, tr.announce, ev.fields) catch return, " \t\r\n");
+        if (text.len == 0) return;
+        const room = if (tr.speakers == .all) "" else Core.eventRoom(a, ev.fields) orelse "";
+        c.alerts.noteSpeak(.{ .by = std.fmt.allocPrint(a, "trigger:{s}", .{tr.name}) catch return, .server = if (tr.mcp) |m| m.server else "", .text = util.cut(text, 300), .room = room }, c.now());
+    }
+
+    fn logOpen(c: *Core, id: u64, x: alerts_mod.Alert) void {
+        c.log.write(.alert, x.private, .{ .event = "open", .alert = id, .by = x.by, .conversation = x.conv, .item = if (x.item != 0) @as(?u64, x.item) else null, .steps = x.steps.len, .text = x.text }) catch {};
+    }
+
+    const PostAlert = struct { id: u64, button: [2][]const u8 };
+
+    /// Run `o`'s post `p` (sent as `text`): when it is an urgent alert's
+    /// first, with someone to tell, the alert is made (before it is sent:
+    /// a post that doesn't get through still escalates) and its
+    /// [I'm on it] button returned.
+    fn post(c: *Core, a: std.mem.Allocator, o: *const Core.RunOut, p: *const agent.Post, text: []const u8) ?PostAlert {
+        if (o.asked or c.byHand()) return null;
+        const r = o.run orelse return null;
+        // a group the household reads has them told already
+        if (c.isShared(p.to)) return null;
+        const steps = c.alerts.planFor(a, r.who.by) orelse return null;
+        if (steps.len == 0) return null;
+        const key = keyOf(a, r.who.by, r.label, r.rid);
+        if (c.alerts.byKey(key) != null) return null;
+        const first = c.masks.scrubAlloc(a, util.cut(firstLine(p.text), 300)) catch return null;
+        const x: alerts_mod.Alert = .{
+            .at = c.now(),
+            .by = r.who.by,
+            .key = key,
+            .conv = p.to,
+            .text = first,
+            .body = c.masks.scrubAlloc(a, util.cut(text, 3500)) catch return null,
+            .private = r.isPrivate() or c.convPrivate(p.to),
+            .steps = steps,
+            .speak = speakFor(c, a, r.who.by, key),
+        };
+        const id = c.alerts.add(x) catch |e| {
+            c.log.write(.alert, false, .{ .event = "not kept", .by = r.who.by, .why = @errorName(e) }) catch {};
+            return null;
+        };
+        logOpen(c, id, x);
+        const got = c.alerts.get(a, id) orelse return null;
+        return .{ .id = id, .button = .{ on_it, std.fmt.allocPrint(a, "e{d}-{s}:onit", .{ id, got.token }) catch return null } };
+    }
+
+    /// Alert `id`'s post went out as `sent` in `conv`: a reply to it, or a
+    /// press on it, acknowledges it.
+    fn sent(c: *Core, a: std.mem.Allocator, id: u64, conv: []const u8, s: Sent) void {
+        const where = c.placeOf(a, conv) catch return;
+        c.alerts.setMsg(id, .{ .chat = where.place.chat, .thread = where.place.thread, .message = s.first, .count = s.count }) catch {};
+    }
+
+    /// Item `id` (`n`): an urgent run's question is an alert when it is
+    /// its instance's (or run's) first.
+    fn item(c: *Core, n: inbox_mod.New, id: u64) void {
+        if (c.byHand()) return;
+        const asks = for ([_][]const u8{ "confirm", "question", "approval" }) |k| {
+            if (std.mem.eql(u8, n.kind, k)) break true;
+        } else false;
+        if (!asks) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const steps = c.alerts.planFor(a, n.by) orelse return;
+        if (steps.len == 0) return;
+        const key = keyOf(a, n.by, n.run orelse "", n.rid orelse 0);
+        if (c.alerts.byKey(key) != null) return;
+        const x: alerts_mod.Alert = .{
+            .at = c.now(),
+            .by = n.by,
+            .key = key,
+            .conv = if (c.isShared(n.conversation)) "main" else n.conversation,
+            .text = c.masks.scrubAlloc(a, util.cut(firstLine(n.title), 300)) catch return,
+            .private = n.private,
+            .item = id,
+            .steps = steps,
+            .speak = speakFor(c, a, n.by, key),
+        };
+        const aid = c.alerts.add(x) catch |e| {
+            c.log.write(.alert, false, .{ .event = "not kept", .by = n.by, .item = id, .why = @errorName(e) }) catch {};
+            return;
+        };
+        logOpen(c, aid, x);
+    }
+
+    /// Item `id` closed: answered by the owner, someone is on its alert;
+    /// expired, withdrawn or void, its alert ends.
+    fn settled(c: *Core, id: u64, status: inbox_mod.Status, via: inbox_mod.Via) void {
+        const aid = c.alerts.byItem(id) orelse return;
+        if (status == .answered) {
+            // harness's own answer (the fallback) is no one being on it
+            if (via == .harness or via == .fallback) return;
+            return ack(c, aid, "owner", "answer");
+        }
+        if (c.alerts.end(aid, "its question closed") catch false)
+            c.log.write(.alert, false, .{ .event = "closed", .alert = aid, .why = @tagName(status) }) catch {};
+    }
+
+    /// The owner pressed a button of message `message` in `chat`, or
+    /// replied to it: an alert's post is acknowledged.
+    fn touched(c: *Core, chat: i64, message: i64, via: []const u8) void {
+        const aid = c.alerts.byMessage(chat, message) orelse return;
+        ack(c, aid, "owner", via);
+    }
+
+    /// "Anna", as members and the owner read a member's name.
+    fn display(a: std.mem.Allocator, name: []const u8) []const u8 {
+        var nb: [household.max_name]u8 = undefined;
+        return a.dupe(u8, household.display(&nb, name)) catch name;
+    }
+
+    /// A message's new text; its buttons go.
+    fn edit(c: *Core, chat: i64, thread: i64, message: i64, text: []const u8) void {
+        const ch = c.chan orelse return;
+        var buf: [conversations.max_name]u8 = undefined;
+        const place: Place = .{ .name = c.convAt(&buf, chat, thread), .chat = chat, .thread = thread };
+        if (ch.edit) |f| f(ch.ctx, place, message, text) else ch.clear(ch.ctx, place, message);
+    }
+
+    /// Someone is on alert `id` (`by`: owner or member:NAME; `via`: a
+    /// button, a reply, an answer): nothing more is due; the members told
+    /// read who has it; the owner hears when a member does.
+    fn ack(c: *Core, id: u64, by: []const u8, via: []const u8) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const now_s = c.now();
+        const was = (c.alerts.ack(a, id, .{ .by = by, .at = now_s, .via = via }) catch |e| {
+            c.log.write(.alert, false, .{ .event = "not written", .alert = id, .why = @errorName(e) }) catch {};
+            return;
+        }) orelse return;
+        c.log.write(.alert, false, .{ .event = "acknowledged", .alert = id, .by = by, .via = via, .after = now_s - was.at }) catch {};
+        var cb: [8]u8 = undefined;
+        const hm = quiet_mod.clock(&cb, now_s, c.cfg.chat.utc_offset);
+        const member: ?[]const u8 = if (std.mem.startsWith(u8, by, "member:")) by["member:".len..] else null;
+        for (was.told) |tw| {
+            const who = if (member) |m| (if (std.mem.eql(u8, m, tw.member)) "You're on it" else std.fmt.allocPrint(a, "{s} is on it", .{display(a, m)}) catch continue) else "The owner answered";
+            edit(c, tw.chat, tw.thread, tw.message, std.fmt.allocPrint(a, "Nobody has answered this yet: {s}\n{s}, {s}.", .{ was.text, who, hm }) catch continue);
+        }
+        // the owner's post: its [I'm on it] goes
+        if (was.msg) |m| if (was.body.len > 0 and m.count == 1) {
+            const who = if (member) |name| std.fmt.allocPrint(a, "{s} is on it", .{display(a, name)}) catch "Someone is on it" else "You're on it";
+            edit(c, m.chat, m.thread, m.message, std.fmt.allocPrint(a, "{s}\n{s}, {s}.", .{ was.body, who, hm }) catch return);
+        };
+        if (member) |name| c.sayIn(was.conv, std.fmt.allocPrint(a, "{s} is on it: {s}", .{ display(a, name), was.text }) catch return);
+    }
+
+    /// A press of [I'm on it] (`e<alert>-<token>:onit`): the owner's on
+    /// their post, or a member's on the message they were sent; anyone
+    /// else's is dropped.
+    fn press(c: *Core, from: i64, chat: i64, thread: i64, message: i64, data: []const u8) void {
+        _ = thread;
+        const dash = std.mem.indexOfScalar(u8, data, '-') orelse return dropped(c, from, "not an alert's button");
+        const colon = std.mem.lastIndexOfScalar(u8, data, ':') orelse return dropped(c, from, "not an alert's button");
+        if (colon < dash) return dropped(c, from, "not an alert's button");
+        const id = std.fmt.parseInt(u64, data[1..dash], 10) catch return dropped(c, from, "not an alert's button");
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const x = c.alerts.get(a, id) orelse return dropped(c, from, "an alert that is gone");
+        if (!std.mem.eql(u8, data[dash + 1 .. colon], x.token)) return dropped(c, from, "an alert's button with another token");
+        const is_owner = if (c.owner) |o| o == from else false;
+        const by: []const u8 = blk: {
+            if (is_owner) {
+                if (x.msg) |m| if (m.chat == chat and message >= m.message and message < m.message + m.count) break :blk "owner";
+                return dropped(c, from, "the owner's press on a message that is not the alert's");
+            }
+            // a member's own chat with the bot: its id is their account's
+            for (x.told) |tw| if (tw.chat == chat and tw.chat == from and tw.message == message and c.isMember(tw.member))
+                break :blk std.fmt.allocPrint(a, "member:{s}", .{tw.member}) catch return;
+            return dropped(c, from, "a press on an alert's button by someone it was not sent to");
+        };
+        if (x.ended.len > 0) {
+            // on it already: said where it was pressed
+            const who = if (x.acked) |k| (if (std.mem.eql(u8, k.by, "owner")) "The owner answered already." else std.fmt.allocPrint(a, "{s} is on it already.", .{display(a, k.by["member:".len..])}) catch "Someone is on it already.") else "It is closed already.";
+            const conv = if (is_owner) x.conv else blk: {
+                for (x.told) |tw| if (tw.message == message) break :blk tw.conv;
+                break :blk "";
+            };
+            if (conv.len > 0) c.sayIn(conv, who);
+            return;
+        }
+        ack(c, id, by, "button");
+    }
+
+    fn dropped(c: *Core, from: i64, why: []const u8) void {
+        c.log.write(.chat, false, .{ .event = "dropped", .from = from, .why = why }) catch {};
+    }
+
+    /// What is due now: the household told in turn (and the speakers),
+    /// then a fallback.
+    fn due(c: *Core, now_s: i64) void {
+        if (c.chan == null) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const list = c.alerts.due(a, now_s) catch return;
+        for (list) |d| switch (d) {
+            .step => |st| step(c, a, st.id, st.index),
+            .fallback => |fb| fallback(c, a, fb.id, fb.item),
+        };
+    }
+
+    /// "5 minutes", "1 minute", "2 hours".
+    fn minutesWords(a: std.mem.Allocator, m: u32) ![]const u8 {
+        if (m >= 60 and m % 60 == 0) return std.fmt.allocPrint(a, "{d} hour{s}", .{ m / 60, if (m == 60) "" else "s" });
+        return std.fmt.allocPrint(a, "{d} minute{s}", .{ m, if (m == 1) "" else "s" });
+    }
+
+    /// An urgent routine's question `item` (by `by`, of run `label`, in
+    /// `conv`, saying `text`) makes `call` itself `after_s` after now when
+    /// nobody is on it: kept with its alert (one made when there is none).
+    fn fallbackFor(c: *Core, by: []const u8, label: []const u8, conv: []const u8, text: []const u8, private: bool, item_id: u64, after_s: u32, call: []const u8) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const key = keyOf(a, by, label, 0);
+        const aid = c.alerts.byKey(key) orelse blk: {
+            const x: alerts_mod.Alert = .{
+                .at = c.now(),
+                .by = by,
+                .key = key,
+                .conv = if (c.isShared(conv)) "main" else conv,
+                .text = c.masks.scrubAlloc(a, util.cut(firstLine(text), 300)) catch return,
+                .private = private,
+                .item = item_id,
+                .speak = speakFor(c, a, by, key),
+            };
+            const id = c.alerts.add(x) catch |e| {
+                c.log.write(.alert, false, .{ .event = "not kept", .by = by, .item = item_id, .why = @errorName(e) }) catch {};
+                return;
+            };
+            logOpen(c, id, x);
+            break :blk id;
+        };
+        c.alerts.setFallback(aid, .{ .after_s = after_s, .item = item_id, .call = call, .at = c.now() }) catch |e| {
+            c.log.write(.alert, false, .{ .event = "not written", .alert = aid, .why = @errorName(e) }) catch {};
+        };
+    }
+
+    /// Nobody is on alert `id` in its fallback's time: harness answers its
+    /// question with its yes, once (the step's call decided by the gate
+    /// as any call is), and logs the owner's absence.
+    fn fallback(c: *Core, a: std.mem.Allocator, id: u64, item_id: u64) void {
+        const x = c.alerts.get(a, id) orelse return;
+        if (x.ended.len > 0) return;
+        const f = x.fallback orelse return;
+        if (f.done != 0) return;
+        const took = c.answerItem(item_id, "approve", null, .fallback);
+        // marked once the answer is on disk: a crash before it answers
+        // again, and answerItem takes an item only while it is open
+        c.alerts.fallbackMade(id, c.now()) catch |e| c.log.write(.alert, false, .{ .event = "not written", .alert = id, .why = @errorName(e) }) catch {};
+        if (took != .taken) {
+            c.log.write(.alert, false, .{ .event = "no fallback", .alert = id, .item = item_id, .why = @tagName(took) }) catch {};
+            return;
+        }
+        var tb: [20]u8 = undefined;
+        var fb: [20]u8 = undefined;
+        c.log.write(.alert, x.private, .{ .event = "absence", .alert = id, .text = x.text, .at = util.isoTime(&tb, f.at), .fallback_at = util.isoTime(&fb, c.now()), .after = f.after_s, .call = f.call, .item = item_id }) catch {};
+    }
+
+    /// Step `index` of alert `id`: its member told (the speakers too); one
+    /// who can't be is said to the owner, and the next step still comes.
+    fn step(c: *Core, a: std.mem.Allocator, id: u64, index: u32) void {
+        const x = c.alerts.get(a, id) orelse return;
+        // on it meanwhile, or made already
+        if (x.ended.len > 0 or index < x.next or index >= x.steps.len) return;
+        const member = x.steps[index].member;
+        const got = tell(c, a, x, member);
+        const told: ?alerts_mod.Told = switch (got) {
+            .told => |tw| tw,
+            .not => null,
+        };
+        c.alerts.stepMade(id, index, member, told) catch |e| c.log.write(.alert, false, .{ .event = "not written", .alert = id, .why = @errorName(e) }) catch {};
+        c.log.write(.alert, x.private, .{ .event = "escalated", .alert = id, .member = member, .delivered = told != null, .step = index + 1, .why = switch (got) {
+            .told => null,
+            .not => |w| w,
+        } }) catch {};
+        switch (got) {
+            .told => {},
+            .not => |why| c.sayIn(x.conv, std.fmt.allocPrint(a, "I couldn't tell {s} about it: {s}.", .{ member, why }) catch return),
+        }
+        if (x.speak) |sp| startSpeak(c, id, index + 1, sp);
+    }
+
+    const Tell = union(enum) { told: alerts_mod.Told, not: []const u8 };
+
+    /// Member `name` gets alert `x` in their own chat with the bot, with
+    /// [I'm on it]; never its question's buttons.
+    fn tell(c: *Core, a: std.mem.Allocator, x: alerts_mod.Alert, name: []const u8) Tell {
+        const user = blk: {
+            c.members.mutex.lockUncancelable(c.io);
+            defer c.members.mutex.unlock(c.io);
+            const m = c.members.find(name) orelse break :blk 0;
+            break :blk m.user;
+        };
+        if (user == 0) return .{ .not = std.fmt.allocPrint(a, "{s} isn't a member who has joined (/members)", .{name}) catch "not a member" };
+        const ch = c.chan orelse return .{ .not = "harness has no chat to send it in" };
+        const conv = c.memberChat(a, name, user) catch return .{ .not = "harness could not write state/conversations" };
+        const where = c.placeOf(a, conv) catch return .{ .not = "harness could not find their chat" };
+        const text = std.fmt.allocPrint(a, "Nobody has answered this yet: {s}", .{x.text}) catch return .{ .not = "out of memory" };
+        const data = std.fmt.allocPrint(a, "e{d}-{s}:onit", .{ x.id, x.token }) catch return .{ .not = "out of memory" };
+        const msg = ch.buttons(ch.ctx, where.place, text, &.{.{ on_it, data }}) orelse return .{ .not = "Telegram didn't take the message" };
+        return .{ .told = .{ .member = name, .conv = conv, .chat = where.place.chat, .thread = where.place.thread, .message = msg, .at = c.now() } };
+    }
+
+    /// The speakers say an alert's line again (step `n`), on a thread of
+    /// its own: a house of satellites takes seconds a line.
+    const SpeakJob = struct { arena: std.heap.ArenaAllocator, id: u64, n: u32, sp: alerts_mod.Speak };
+
+    fn startSpeak(c: *Core, id: u64, n: u32, sp: alerts_mod.Speak) void {
+        const box = c.gpa.create(SpeakJob) catch return;
+        box.arena = .init(c.gpa);
+        const a = box.arena.allocator();
+        box.id = id;
+        box.n = n;
+        box.sp = .{ .by = a.dupe(u8, sp.by) catch "", .server = a.dupe(u8, sp.server) catch "", .text = a.dupe(u8, sp.text) catch "", .room = a.dupe(u8, sp.room) catch "" };
+        _ = c.bg_active.fetchAdd(1, .acq_rel);
+        const th = std.Thread.spawn(.{}, speakJob, .{ c, box }) catch {
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return;
+        };
+        th.detach();
+    }
+
+    fn speakJob(c: *Core, box: *SpeakJob) void {
+        defer {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+        }
+        if (c.quitting.load(.acquire)) return;
+        speak(c, box.arena.allocator(), box.id, box.n, box.sp) catch |e| {
+            c.log.write(.alert, false, .{ .event = "not announced", .alert = box.id, .step = box.n, .why = @errorName(e) }) catch {};
+        };
+    }
+
+    /// The trigger's `announce` line again, as the trigger says it: through
+    /// the gate as `trigger:NAME`, listed in triggers.ini (a deny rule
+    /// stops it), its server's announce first.
+    fn speak(c: *Core, a: std.mem.Allocator, id: u64, n: u32, sp: alerts_mod.Speak) !void {
+        var mt: ?*const agent.McpTool = null;
+        for (c.mcp_tools) |*m| if (std.mem.eql(u8, m.tool, "announce") and !m.money) {
+            if (mt == null or std.mem.eql(u8, m.server.name, sp.server)) mt = m;
+        };
+        const m = mt orelse return error.NoAnnounce;
+        var input: std.ArrayList(u8) = .empty;
+        try input.print(a, "{{\"message\":{f}", .{std.json.fmt(sp.text, .{})});
+        if (sp.room.len > 0) try input.print(a, ",\"room\":{f}", .{std.json.fmt(sp.room, .{})});
+        try input.append(a, '}');
+        const arg = try std.fmt.allocPrint(a, "{s}/announce {s}", .{ m.server.name, input.items });
+        const d = blk: {
+            c.lock.lockUncancelable(c.io);
+            defer c.lock.unlock(c.io);
+            break :blk c.gate.decide(a, .mcp, arg, c.now(), .{ .scheduled = true, .listed = "triggers.ini", .who = .{ .by = sp.by } });
+        };
+        if (d.action != .allow) {
+            c.log.write(.alert, false, .{ .event = "not announced", .alert = id, .step = n, .decision = @tagName(d.action), .why = d.why }) catch {};
+            return;
+        }
+        var flag: std.atomic.Value(bool) = .init(false);
+        const res = try m.server.call(a, "announce", input.items, &flag, 30_000, 64 * 1024);
+        c.log.write(.alert, false, .{ .event = "announced", .alert = id, .step = n, .is_error = res.is_error, .output = util.cut(res.text, 300) }) catch {};
+    }
+
+    // ---- the leak's fallback, offered by /setup routines ----
+
+    /// Whether the leak is on, with a valve that closes, and without its fallback.
+    fn fallbackOpen(c: *Core, a: std.mem.Allocator, p: butler.Picks) bool {
+        if (!butler.fallbackOffered(p)) return false;
+        const w = c.workflowText(a, "leak") orelse return false;
+        return std.mem.indexOf(u8, w, "\nfallback ") == null;
+    }
+
+    /// The leak's fallback offered: the line it adds shown first, then
+    /// one tap.
+    fn offerFallback(c: *Core, a: std.mem.Allocator, conv: []const u8) anyerror!void {
+        const p = try c.setupPicks(a);
+        if (!butler.fallbackOffered(p)) return c.offerNext(a, conv);
+        c.sayIn(conv, try std.fmt.allocPrint(a, "Leak: Turn on adds to workflows/leak.wf, in step ask:\n\n{s}", .{butler.fallback_line}));
+        c.withdrawSetupItems(a, "routine leak-fallback");
+        _ = try c.addItem(.{
+            .kind = "routine",
+            .run = "routine leak-fallback",
+            .conversation = conv,
+            .title = "Leak: if nobody answers",
+            .body = try butler.fallbackSentence(a, p),
+            .choices = &.{ .{ .key = "on", .label = "Turn on" }, .{ .key = "later", .label = "Not now" } },
+            .expires = c.now() + 7 * 86400,
+        });
+    }
+
+    /// The answer to the fallback's offer: leak.wf written again with it,
+    /// only while it is as setup wrote it (else the line is the owner's to add).
+    fn fallbackAnswer(c: *Core, a: std.mem.Allocator, key: []const u8) !Core.SetupDone {
+        if (std.mem.eql(u8, key, "later")) return .{ .offer = .next };
+        var p = try c.setupPicks(a);
+        if (!butler.fallbackOffered(p)) return .{ .said = "The home has no water valve that closes: nothing to turn on.", .offer = .next };
+        const path = try std.fs.path.join(a, &.{ c.paths.workflows, "leak.wf" });
+        const live = c.readOr(a, path);
+        if (live.len == 0) return .{ .said = "Leak isn't on: /setup routines offers it.", .offer = .next };
+        const date = try c.setupDate(a);
+        p.fallback = false;
+        const without = try butler.routineFiles(a, .leak, p, date);
+        if (!sameBody(a, live, without.workflow)) return .{ .said = "workflows/leak.wf was changed since setup wrote it: add the line fallback 5m under timeout 2h in its step ask, then /reload.", .offer = .next };
+        p.fallback = true;
+        const with = try butler.routineFiles(a, .leak, p, date);
+        // read as harness will read it, before it is written
+        var d: workflows.Diag = .{};
+        _ = workflows.parse(a, "leak", with.workflow, &d) catch return error.RoutineDoesNotRead;
+        try c.writeSetting(path, with.workflow);
+        c.log.write(.config, false, .{ .event = "routine on", .name = "leak-fallback" }) catch {};
+        if (c.applySetup()) |why| return .{ .said = try std.fmt.allocPrint(a, "The leak's fallback is written. {s}", .{why}), .offer = .next };
+        return .{ .said = try butler.fallbackOnText(a, p), .offer = .next };
+    }
+
+    /// Whether two of setup's files are the same but for setup's mark on
+    /// the first line (and \r\n line ends).
+    fn sameBody(a: std.mem.Allocator, x: []const u8, y: []const u8) bool {
+        const nx = std.mem.replaceOwned(u8, a, x, "\r\n", "\n") catch return false;
+        const ny = std.mem.replaceOwned(u8, a, y, "\r\n", "\n") catch return false;
+        const bx = nx[(std.mem.indexOfScalar(u8, nx, '\n') orelse nx.len)..];
+        const by = ny[(std.mem.indexOfScalar(u8, ny, '\n') orelse ny.len)..];
+        return std.mem.eql(u8, std.mem.trimEnd(u8, bx, "\n"), std.mem.trimEnd(u8, by, "\n"));
+    }
+};
+
+/// A leak the home stand-in pushes (fake://leak): trigger `leak` says it,
+/// urgent, with `extra` lines; the sensor's first reading taken, and the
+/// clock at `t0`. Returns t0.
+fn leakAlert(f: *Fix, extra: []const u8) !i64 {
+    const a = f.e.arena.allocator();
+    try withHome(f);
+    const dir = try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "home" });
+    try Io.Dir.cwd().createDirPath(t.io, dir);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "leak" }), .data = "{\"device\":\"sink_leak\",\"room\":\"Kitchen\",\"from\":null,\"to\":\"dry\"}" });
+    try setTriggers(f, try std.fmt.allocPrint(a, "[leak]\nmcp = home resource fake://leak\nmatch = text has \"to\":\"wet\"\nsay = Water under the kitchen sink.\n{s}", .{extra}));
+    _ = try f.core.pollNow("leak");
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    return t0;
+}
+
+/// The sensor reads wet (or dry again): one event queued and acted on.
+fn leakReads(f: *Fix, to: []const u8) !void {
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "home", "leak" }), .data = try std.fmt.allocPrint(a, "{{\"device\":\"sink_leak\",\"room\":\"Kitchen\",\"from\":\"dry\",\"to\":\"{s}\"}}", .{to}) });
+    _ = try f.core.pollNow("leak");
+    f.core.tick();
+    waitIdle(f.core);
+}
+
+/// The clock moved to `at`, and a tick.
+fn tickAt(f: *Fix, at: i64) void {
+    f.core.fixed_now = at;
+    f.core.tick();
+    waitIdle(f.core);
+}
+
+fn alertsFile(f: *Fix) ![]const u8 {
+    const a = f.e.arena.allocator();
+    return Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ f.core.paths.state, "alerts" }), a, .unlimited) catch "";
+}
+
+test "escalation_in_order_until_acknowledged" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nescalate = 5m anna, 15m piotr\n", "", "");
+    defer f.deinit();
+    try joinMember(&f, "anna", 77);
+    try joinMember(&f, "piotr", 78);
+    const t0 = try leakAlert(&f, "urgent = yes\n");
+    try leakReads(&f, "wet");
+    // the owner's post: one tap says they are on it
+    try f.rec.waitFor("BUTTONS [leak] Water under the kitchen sink. [e");
+    const b = f.rec.buttonsWith("[leak] Water under the kitchen sink.") orelse return error.NoButton;
+    try t.expect(b.get("onit") != null);
+    try expectHas(try alertsFile(&f), "\"text\":\"Water under the kitchen sink.\"");
+    // nobody is told before 5 minutes
+    tickAt(&f, t0 + 299);
+    try t.expectEqual(0, f.rec.countIn("anna", "Nobody has answered"));
+    // 5 minutes: anna, with one button of her own; piotr not yet
+    tickAt(&f, t0 + 300);
+    try f.rec.waitIn("anna", "BUTTONS Nobody has answered this yet: Water under the kitchen sink. [e");
+    const ab = f.rec.buttonsWith("Nobody has answered this yet") orelse return error.NoButton;
+    try t.expectEqual(1, ab.n);
+    try t.expect(ab.get("onit") != null);
+    try t.expectEqual(0, f.rec.countIn("piotr", "Nobody has answered"));
+    // a tick later nothing again
+    tickAt(&f, t0 + 310);
+    try t.expectEqual(1, f.rec.countIn("anna", "Nobody has answered"));
+    // 15 minutes: piotr
+    tickAt(&f, t0 + 900);
+    try f.rec.waitIn("piotr", "Nobody has answered this yet: Water under the kitchen sink.");
+    // the owner taps I'm on it: the buttons go, the members read who has it
+    f.core.handleCallback(42, b.msg, b.get("onit").?);
+    try f.rec.waitFor(try std.fmt.allocPrint(f.e.arena.allocator(), "EDIT {d}: [leak] Water under the kitchen sink.\nYou're on it, ", .{b.msg}));
+    try f.rec.waitIn("anna", try std.fmt.allocPrint(f.e.arena.allocator(), "EDIT {d}: Nobody has answered this yet: Water under the kitchen sink.\nThe owner answered, ", .{ab.msg}));
+    try f.rec.waitIn("piotr", "\nThe owner answered, ");
+    const lt = try logText(&f);
+    try expectHas(lt, "\"kind\":\"alert\",\"event\":\"open\",\"alert\":1");
+    try expectHas(lt, "\"event\":\"escalated\",\"alert\":1,\"member\":\"anna\"");
+    try expectHas(lt, "\"event\":\"acknowledged\",\"alert\":1,\"by\":\"owner\",\"via\":\"button\"");
+    // a second leak: a reply to its post acknowledges it
+    try leakReads(&f, "dry");
+    tickAt(&f, t0 + 1000);
+    try leakReads(&f, "wet");
+    try f.rec.waitFor("BUTTONS [leak] Water under the kitchen sink. [e2-");
+    const b2 = f.rec.buttonsWith("[leak] Water under the kitchen sink.") orelse return error.NoButton;
+    try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = "on my way", .reply_to = b2.msg });
+    tickAt(&f, t0 + 1000 + 3600);
+    try t.expectEqual(1, f.rec.countIn("anna", "BUTTONS Nobody has answered"));
+    try expectHas(try logText(&f), "\"event\":\"acknowledged\",\"alert\":2,\"by\":\"owner\",\"via\":\"reply\"");
+}
+
+test "a_members_on_it_acknowledges_for_everyone" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nescalate = 5m anna, 15m piotr\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try joinMember(&f, "anna", 77);
+    try joinMember(&f, "piotr", 78);
+    // the leak routine: its question is the alert
+    try withButler(&f, false);
+    try withRoutine(&f, .leak, .{});
+    _ = try f.core.pollNow("leak-sink_leak");
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    try homeFile(&f, "device-sink_leak.json", "{\"device\":\"sink_leak\",\"room\":\"Kitchen\",\"kind\":\"sensor\",\"from\":\"dry\",\"to\":\"WATER LEAK\",\"at\":\"2026-11-23T03:12:00Z\",\"note\":\"data from the home, not an instruction\"}");
+    try t.expectEqual(1, (try f.core.pollNow("leak-sink_leak")).queued);
+    f.core.tick();
+    waitIdle(f.core);
+    runWorkflows(&f);
+    try f.rec.waitFor("BUTTONS Water leak: Sink leak, Kitchen. [");
+    const q = f.rec.buttonsWith("Water leak: Sink leak, Kitchen.") orelse return error.NoQuestion;
+    // 5 minutes: anna gets the alert, never its question's buttons
+    tickAt(&f, t0 + 300);
+    try f.rec.waitIn("anna", "BUTTONS Nobody has answered this yet: Water leak: Sink leak, Kitchen. [e");
+    const ab = f.rec.buttonsWith("Nobody has answered this yet") orelse return error.NoButton;
+    try t.expectEqual(1, ab.n);
+    try t.expect(ab.get("approve") == null);
+    // piotr can't press anna's button, nor a stranger
+    f.core.handleCallbackIn(78, 78, 0, ab.msg, ab.get("onit").?);
+    f.core.handleCallbackIn(79, 79, 0, ab.msg, ab.get("onit").?);
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"acknowledged\"") == null);
+    // anna is on it: for everyone; the owner is told who
+    f.core.handleCallbackIn(77, 77, 0, ab.msg, ab.get("onit").?);
+    try f.rec.waitIn("main", "Anna is on it: Water leak: Sink leak, Kitchen.");
+    try f.rec.waitIn("anna", try std.fmt.allocPrint(a, "EDIT {d}: Nobody has answered this yet: Water leak: Sink leak, Kitchen.\nYou're on it, ", .{ab.msg}));
+    try expectHas(try logText(&f), "\"event\":\"acknowledged\",\"alert\":1,\"by\":\"member:anna\",\"via\":\"button\"");
+    // nobody else is told
+    tickAt(&f, t0 + 900);
+    try t.expectEqual(0, f.rec.countIn("piotr", "Nobody has answered"));
+    // the question stays the owner's: members approve nothing
+    try expectHas(try homeCall(&f, "home_state", "{\"device\":\"water_main\"}"), "open");
+    f.core.handleCallback(42, q.msg, q.get("approve").?);
+    runWorkflows(&f);
+    try f.rec.waitFor("Water main closed (it reports closed).");
+}
+
+test "nothing_escalates_for_non_urgent_alerts" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nescalate = 5m anna\n", "", "");
+    defer f.deinit();
+    try joinMember(&f, "anna", 77);
+    // not urgent: a plain post, no alert
+    const t0 = try leakAlert(&f, "");
+    try leakReads(&f, "wet");
+    try f.rec.waitFor("[leak] Water under the kitchen sink.");
+    try t.expect(f.rec.buttonsWith("[leak] Water under the kitchen sink.") == null);
+    tickAt(&f, t0 + 3600);
+    try t.expectEqual(0, f.rec.countIn("anna", "Nobody has answered"));
+    // urgent, but escalate = no: nothing either
+    try setTriggers(&f, "[leak]\nmcp = home resource fake://leak\nmatch = text has \"to\":\"wet\"\nsay = Water under the kitchen sink.\nurgent = yes\nescalate = no\n");
+    try leakReads(&f, "dry");
+    try leakReads(&f, "wet");
+    try t.expectEqual(2, f.rec.count("[leak] Water under the kitchen sink."));
+    try t.expect(f.rec.buttonsWith("[leak] Water under the kitchen sink.") == null);
+    tickAt(&f, t0 + 7200);
+    try t.expectEqual(0, f.rec.countIn("anna", "Nobody has answered"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"kind\":\"alert\"") == null);
+}
+
+test "escalation_survives_a_restart" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nescalate = 5m anna, 15m piotr\n", "", "");
+    defer f.deinit();
+    try joinMember(&f, "anna", 77);
+    try joinMember(&f, "piotr", 78);
+    const t0 = try leakAlert(&f, "urgent = yes\n");
+    try leakReads(&f, "wet");
+    tickAt(&f, t0 + 300);
+    try f.rec.waitIn("anna", "Nobody has answered this yet: Water under the kitchen sink.");
+    const ab = f.rec.buttonsWith("Nobody has answered this yet") orelse return error.NoButton;
+    // harness stops and starts again past piotr's time: he is told at once
+    try restart(&f);
+    f.core.fixed_now = t0 + 1200;
+    f.core.tick();
+    waitIdle(f.core);
+    try f.rec.waitIn("piotr", "Nobody has answered this yet: Water under the kitchen sink.");
+    try t.expectEqual(1, f.rec.countIn("anna", "BUTTONS Nobody has answered"));
+    // anna's button from before the restart still counts
+    f.core.handleCallbackIn(77, 77, 0, ab.msg, ab.get("onit").?);
+    try f.rec.waitIn("main", "Anna is on it: Water under the kitchen sink.");
+}
+
+test "escalation_goes_on_when_a_member_cant_be_reached" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nescalate = 5m ben, 10m anna, 15m piotr\n", "", "");
+    defer f.deinit();
+    try joinMember(&f, "anna", 77);
+    try joinMember(&f, "piotr", 78);
+    const t0 = try leakAlert(&f, "urgent = yes\n");
+    try leakReads(&f, "wet");
+    // ben is no member: said, and the next one still goes
+    tickAt(&f, t0 + 300);
+    try f.rec.waitIn("main", "I couldn't tell ben about it: ben isn't a member who has joined (/members).");
+    // Telegram refuses anna's message: said too
+    f.rec.mutex.lockUncancelable(t.io);
+    f.rec.buttons_fail = true;
+    f.rec.mutex.unlock(t.io);
+    tickAt(&f, t0 + 600);
+    try f.rec.waitIn("main", "I couldn't tell anna about it: Telegram didn't take the message.");
+    f.rec.mutex.lockUncancelable(t.io);
+    f.rec.buttons_fail = false;
+    f.rec.mutex.unlock(t.io);
+    tickAt(&f, t0 + 900);
+    try f.rec.waitIn("piotr", "Nobody has answered this yet: Water under the kitchen sink.");
+    const lt = try logText(&f);
+    try expectHas(lt, "\"event\":\"escalated\",\"alert\":1,\"member\":\"ben\",\"delivered\":false");
+    try expectHas(lt, "\"event\":\"escalated\",\"alert\":1,\"member\":\"piotr\",\"delivered\":true");
+}
+
+test "speakers_say_it_again_at_each_step" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nescalate = 5m anna, 15m piotr\n", "", "");
+    defer f.deinit();
+    try joinMember(&f, "anna", 77);
+    try joinMember(&f, "piotr", 78);
+    const t0 = try leakAlert(&f, "urgent = yes\nannounce = Water under the kitchen sink.\n");
+    try leakReads(&f, "wet");
+    try f.rec.waitFor("[leak] Water under the kitchen sink.");
+    try t.expectEqualStrings("Kitchen: Water under the kitchen sink.\n", try announcedText(&f));
+    tickAt(&f, t0 + 300);
+    try f.rec.waitIn("anna", "Nobody has answered this yet");
+    try t.expectEqualStrings("Kitchen: Water under the kitchen sink.\nKitchen: Water under the kitchen sink.\n", try announcedText(&f));
+    tickAt(&f, t0 + 900);
+    try f.rec.waitIn("piotr", "Nobody has answered this yet");
+    try t.expectEqual(3, std.mem.count(u8, try announcedText(&f), "Water under the kitchen sink."));
+    try expectHas(try logText(&f), "\"event\":\"announced\",\"alert\":1,\"step\":1");
+}
+
+/// The leak routine with its fallback, the stand-ins' home, quiet hours
+/// 22:00-07:00, and water at 03:12: the question asked. Returns when.
+fn leakAtNight(f: *Fix, fallback: bool) !i64 {
+    try withButler(f, false);
+    try withRoutine(f, .leak, .{ .quiet = .{ .start = 22 * 60, .end = 7 * 60 }, .fallback = fallback });
+    const t0 = todayAt(3 * 60 + 12);
+    f.core.fixed_now = t0;
+    _ = try f.core.pollNow("leak-sink_leak");
+    try homeFile(f, "device-sink_leak.json", "{\"device\":\"sink_leak\",\"room\":\"Kitchen\",\"kind\":\"sensor\",\"from\":\"dry\",\"to\":\"WATER LEAK\",\"at\":\"2026-11-23T03:12:00Z\",\"note\":\"data from the home, not an instruction\"}");
+    try t.expectEqual(1, (try f.core.pollNow("leak-sink_leak")).queued);
+    f.core.tick();
+    waitIdle(f.core);
+    runWorkflows(f);
+    try f.rec.waitFor("BUTTONS Water leak: Sink leak, Kitchen. [");
+    return t0;
+}
+
+/// The clock at `at`, and the workflows' turns.
+fn workflowsAt(f: *Fix, at: i64) void {
+    f.core.fixed_now = at;
+    runWorkflows(f);
+}
+
+test "the_fallback_makes_the_safe_call_once_and_says_so" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\nescalate = 10m anna\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try joinMember(&f, "anna", 77);
+    const t0 = try leakAtNight(&f, true);
+    try expectHas(fileText(&f, try std.fs.path.join(a, &.{ f.core.paths.workflows, "leak.wf" })), "\nfallback 5m\n");
+    const q = f.rec.buttonsWith("Water leak: Sink leak, Kitchen.") orelse return error.NoQuestion;
+    // nothing before its time
+    workflowsAt(&f, t0 + 299);
+    try expectHas(try homeCall(&f, "home_state", "{\"device\":\"water_main\"}"), "open");
+    // 5 minutes and nobody on it: harness closes it, once, and says so
+    workflowsAt(&f, t0 + 300);
+    try f.rec.waitFor("No one answered in 5 minutes: Water main closed (it reports closed).");
+    try expectHas(try homeCall(&f, "home_state", "{\"device\":\"water_main\"}"), "closed");
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "EDIT {d}: Water leak: Sink leak, Kitchen.\nClose the water main (no one answered: harness did it), 03:17", .{q.msg}));
+    const lt = try logText(&f);
+    try expectHas(lt, "\"decision\":\"allow\",\"why\":\"made by harness: no one answered in time (item 1)\"");
+    try expectHas(lt, "\"event\":\"absence\",\"alert\":1,\"text\":\"Water leak: Sink leak, Kitchen.\",\"at\":\"");
+    try expectHas(lt, "\"call\":\"home/home_guarded {\\\"device\\\": \\\"water_main\\\", \\\"action\\\": \\\"close\\\"}\"");
+    try t.expect(std.mem.indexOf(u8, lt, "allowed once by the owner") == null);
+    // once: later turns make no other call, and a tap on the old question says how it closed
+    workflowsAt(&f, t0 + 400);
+    f.core.handleCallback(42, q.msg, q.get("approve").?);
+    workflowsAt(&f, t0 + 450);
+    try t.expectEqual(1, std.mem.count(u8, try logText(&f), "\"decision\":\"allow\",\"why\":\"made by harness"));
+    try t.expectEqual(1, f.rec.count("No one answered in 5 minutes"));
+    // the fallback is no acknowledgement: anna is still told at 10 minutes
+    workflowsAt(&f, t0 + 600);
+    try f.rec.waitIn("anna", "Nobody has answered this yet: Water leak: Sink leak, Kitchen.");
+}
+
+test "no_fallback_once_someone_is_on_it" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\nescalate = 3m anna\n", "", "");
+    defer f.deinit();
+    try joinMember(&f, "anna", 77);
+    const t0 = try leakAtNight(&f, true);
+    workflowsAt(&f, t0 + 180);
+    try f.rec.waitIn("anna", "Nobody has answered this yet: Water leak: Sink leak, Kitchen.");
+    const ab = f.rec.buttonsWith("Nobody has answered this yet") orelse return error.NoButton;
+    f.core.handleCallbackIn(77, 77, 0, ab.msg, ab.get("onit").?);
+    try f.rec.waitIn("main", "Anna is on it: Water leak: Sink leak, Kitchen.");
+    // past its time: nothing is made, the question stays the owner's
+    workflowsAt(&f, t0 + 600);
+    try expectHas(try homeCall(&f, "home_state", "{\"device\":\"water_main\"}"), "open");
+    try t.expectEqual(0, f.rec.count("No one answered"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"absence\"") == null);
+}
+
+test "a_fallback_is_decided_by_the_gate_like_any_call" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", "");
+    defer f.deinit();
+    const t0 = try leakAtNight(&f, true);
+    // a deny the owner wrote meanwhile holds
+    const old = fileText(&f, f.core.paths.rules);
+    try writeRules(&f, try std.fmt.allocPrint(f.e.arena.allocator(), "deny mcp home/home_guarded *\n{s}", .{old}));
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    workflowsAt(&f, t0 + 300);
+    try f.rec.waitFor("No one answered in 5 minutes: The water main didn't close: ");
+    try expectHas(try homeCall(&f, "home_state", "{\"device\":\"water_main\"}"), "open");
+    try expectHas(try logText(&f), "\"event\":\"absence\",\"alert\":1");
+}
+
+test "setup_offers_the_leaks_fallback" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.core.fixed_now = todayAt(6 * 60);
+    try withSetup(&f, true, false, null);
+    _ = try f.core.command(a, "/setup home http://127.0.0.1:8123");
+    try f.rec.waitFor("BUTTONS I found 7 devices");
+    try f.press("yes");
+    try f.rec.waitFor("BUTTONS Goodnight: when you say goodnight");
+    for ([_][]const u8{ "Goodnight", "Leaving", "Arriving", "Morning summary" }) |_| {
+        const n = f.rec.count("BUTTONS ");
+        try f.press("later");
+        var waited: u32 = 0;
+        while (f.rec.count("BUTTONS ") == n and waited < 5000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    try f.rec.waitFor("BUTTONS Leak: when the sink leak finds water");
+    try f.press("on");
+    try f.rec.waitFor("Leak is on: it comes through quiet hours.");
+    const wf = try std.fs.path.join(a, &.{ f.core.paths.workflows, "leak.wf" });
+    try t.expect(std.mem.indexOf(u8, fileText(&f, wf), "fallback") == null);
+    // the fallback: what it adds shown first, then one tap
+    try f.rec.waitFor("Turn on adds to workflows/leak.wf, in step ask:\n\nfallback 5m");
+    try f.rec.waitFor("BUTTONS If nobody answers the leak's question in 5 minutes, I close the water main myself, once, and tell you. [");
+    try f.press("on");
+    try f.rec.waitFor("If nobody answers, I close the water main after 5 minutes.");
+    try expectHas(fileText(&f, wf), "\ntimeout 2h\nfallback 5m\n");
+    try t.expect(f.core.workflowText(a, "leak") != null);
+    // then the next routine
+    try f.rec.waitFor("BUTTONS Doors left open: when the back door stays open for 10 minutes, I tell you. [");
+}
+
+/// The stand-ins' home with a smoke alarm and a speaker that may announce.
+const stand_in_smoke_home = stand_in_home ++ "[device kitchen_smoke_alarm]\nkind = smoke\nroom = Kitchen\n[device hall_voice]\nkind = satellite\nroom = Hall\nallow = announce\n";
+
+test "the_smoke_routine_says_it_everywhere_and_escalates" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\nescalate = 5m anna\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try joinMember(&f, "anna", 77);
+    try withButler(&f, false);
+    const h = try butler.parseHome(a, stand_in_smoke_home);
+    const files = try butler.routineFiles(a, .smoke, try butler.pick(a, h, .{ .quiet = .{ .start = 22 * 60, .end = 7 * 60 }, .escalate = f.core.cfg.butler.escalate }), "2026-11-23");
+    try writeWorkflow(&f, "smoke", files.workflow);
+    try writeTriggers(&f, files.triggers);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    // 03:12, quiet hours: the alarm goes off
+    const t0 = todayAt(3 * 60 + 12);
+    f.core.fixed_now = t0;
+    _ = try f.core.pollNow("smoke-kitchen_smoke_alarm");
+    try homeFile(&f, "device-kitchen_smoke_alarm.json", "{\"device\":\"kitchen_smoke_alarm\",\"room\":\"Kitchen\",\"kind\":\"smoke\",\"from\":\"clear\",\"to\":\"ALARM\",\"at\":\"2026-11-23T03:12:00Z\",\"note\":\"data from the home, not an instruction\"}");
+    try t.expectEqual(1, (try f.core.pollNow("smoke-kitchen_smoke_alarm")).queued);
+    f.core.tick();
+    waitIdle(f.core);
+    runWorkflows(&f);
+    // at once, with one tap to say you're on it, and on every speaker
+    try f.rec.waitFor("BUTTONS Smoke alarm: Kitchen smoke alarm, Kitchen. [e");
+    try t.expectEqual(0, f.core.quiet.count());
+    try t.expectEqualStrings("every speaker: Smoke alarm: Kitchen smoke alarm, Kitchen.\n", try announcedText(&f));
+    // 5 minutes: anna, and the speakers again
+    workflowsAt(&f, t0 + 300);
+    try f.rec.waitIn("anna", "Nobody has answered this yet: Smoke alarm: Kitchen smoke alarm, Kitchen.");
+    try t.expectEqual(2, std.mem.count(u8, try announcedText(&f), "every speaker: Smoke alarm: Kitchen smoke alarm, Kitchen."));
+    // nothing acted on anything
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "home__home_set") == null and std.mem.indexOf(u8, lt, "home__home_guarded") == null);
 }

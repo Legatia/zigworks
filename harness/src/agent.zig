@@ -3106,7 +3106,8 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
         switch (ans) {
             .once => {
                 action = .allow;
-                why = try ownerSaid(a, "allowed once by the owner", "", got.item);
+                // an urgent routine's safe call nobody was on in time
+                why = try ownerSaid(a, if (std.mem.eql(u8, got.key, "fallback")) "made by harness: no one answered in time" else "allowed once by the owner", "", got.item);
             },
             .day => {
                 action = .allow;

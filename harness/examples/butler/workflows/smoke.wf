@@ -1,0 +1,13 @@
+# Smoke or CO: an alarm goes off. Urgent, so it comes through quiet hours,
+# goes to the household when you don't answer ([butler] escalate), and the
+# speakers say it in every room. Nothing to close: harness never acts on
+# the alarm.
+workflow smoke
+about When a smoke or CO alarm goes off: says which at once, even at night<smoke speaker words>.
+start <smoke starts>
+urgent yes
+tag no
+limits steps 5, days 1
+
+step tell
+say Smoke alarm: {input}.
