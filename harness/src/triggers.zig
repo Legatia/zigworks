@@ -102,6 +102,9 @@ pub const Trigger = struct {
     /// doesn't acknowledge; empty: no one (`escalate = no`); null:
     /// `[butler] escalate`.
     escalate: ?[]const alerts.Step = null,
+    /// `while = away` (or `home`): its events count only while away mode
+    /// is on (or off); the others are dropped as they come.
+    while_: While = .any,
     /// "added by agent:main 2026-11-22 (item 41)": the comment right above its header.
     added: []const u8 = "",
     /// Its lines in the file (the mark above its header included), 1-based.
@@ -135,6 +138,10 @@ pub const Trigger = struct {
         return tr.kind != .schedule and tr.kind != .brief;
     }
 };
+
+/// When an event trigger's events count: always, only while away mode is
+/// on, or only while it is off.
+pub const While = enum { any, away, home };
 
 fn dupeList(a: Allocator, list: []const []const u8) ![]const []const u8 {
     const out = try a.alloc([]const u8, list.len);
@@ -352,7 +359,7 @@ fn briefSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
 }
 
 const source_keys = [_][]const u8{ "topic", "feed", "search", "page", "file", "mcp" };
-const other_keys = [_][]const u8{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "json", "key", "urgent", "announce", "speakers", "escalate" };
+const other_keys = [_][]const u8{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "json", "key", "urgent", "announce", "speakers", "escalate", "while" };
 
 fn kindOfKey(key: []const u8) ?Kind {
     if (std.mem.eql(u8, key, "topic")) return .brief;
@@ -375,7 +382,7 @@ fn keyFits(kind: Kind, key: []const u8) bool {
         .schedule => oneOf(key, &.{ "every", "at", "days", "do", "say", "start", "to", "agent", "urgent", "escalate" }),
         .brief => oneOf(key, &.{ "topic", "at", "to" }),
         else => blk: {
-            if (oneOf(key, &.{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "urgent", "announce", "speakers", "escalate" })) break :blk true;
+            if (oneOf(key, &.{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "urgent", "announce", "speakers", "escalate", "while" })) break :blk true;
             if (kindOfKey(key)) |k| break :blk k == kind;
             if (std.mem.eql(u8, key, "json")) break :blk kind == .page;
             if (std.mem.eql(u8, key, "key")) break :blk kind == .mcp;
@@ -492,6 +499,9 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.BadEscalate => return bad(diag, l.n, why),
             };
+        } else if (std.mem.eql(u8, l.key, "while")) {
+            tr.while_ = std.meta.stringToEnum(While, v) orelse .any;
+            if (tr.while_ == .any) return bad(diag, l.n, "while = away (only while away mode is on) or home (only while it is off)");
         } else if (std.mem.eql(u8, l.key, "json")) {
             if (!jsonPath(v)) return bad(diag, l.n, "json is a path of names and [N], like data.amount or items[0].price");
             tr.json = v;
@@ -951,6 +961,11 @@ pub fn reading(a: Allocator, tr: Trigger, check_model: []const u8) ![]const u8 {
         .mcp => if (tr.mcp.?.tool.len > 0) try std.fmt.allocPrint(a, "a new item (by {s})", .{tr.key}) else "a change",
         else => "a new item",
     };
+    switch (tr.while_) {
+        .any => {},
+        .away => try out.appendSlice(a, "; only while you're away"),
+        .home => try out.appendSlice(a, "; only while away mode is off"),
+    }
     try out.print(a, "; {s}", .{what});
     if (tr.match.len > 0) {
         try out.appendSlice(a, " whose ");
@@ -1371,4 +1386,21 @@ test "start_takes_text_for_the_input" {
     try refused(a, "[x]\nsearch = z\nstart = workflow w about {nope}\n", 3, "{nope} is no field of a search event");
     // the reading says it
     try t.expect(std.mem.indexOf(u8, try reading(a, door, "claude-haiku"), "starts workflow door-open with \"Back door ({room})\"") != null);
+}
+
+test "while_is_read" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // only while away mode is on (or off); any time by default
+    const door = try parseOne(a, "[away-back_door]\nmcp = home resource home://device/back_door\nmatch = to is open\nwhile = away\nurgent = yes\nsay = The back door opened while you're away.\n");
+    try t.expectEqual(While.away, door.while_);
+    try t.expectEqual(While.away, (try door.clone(a)).while_);
+    try t.expect(std.mem.indexOf(u8, try reading(a, door, "claude-haiku"), "; only while you're away; ") != null);
+    const bell = try parseOne(a, "[doorbell-x]\nmcp = home resource home://device/x\nmatch = to is ring\nwhile = home\nstart = workflow doorbell\n");
+    try t.expectEqual(While.home, bell.while_);
+    try t.expect(std.mem.indexOf(u8, try reading(a, bell, "claude-haiku"), "; only while away mode is off; ") != null);
+    try t.expectEqual(While.any, (try parseOne(a, "[x]\nmcp = home resource home://device/x\nsay = x\n")).while_);
+    try refused(a, "[x]\nmcp = home resource home://device/x\nsay = x\nwhile = asleep\n", 4, "while = away (only while away mode is on) or home (only while it is off)");
+    try refused(a, "[x]\nat = 20:00\nsay = x\nwhile = away\n", 4, "while is not a key of a schedule trigger");
 }
