@@ -100,3 +100,4 @@ pushes lose one or two); they pass when rerun. A paid plan or fewer macOS
 jobs would end it.
 
 - calmcp ignores tool fields it doesn't know (a routine sending `location` for `place` lost the place silently until the stand-in refused it); calmcp itself should refuse unknown fields, as homemcp does.
+- **Security (from a review, 2026-11-23): harness's own jobs share the `schedule:NAME` principal with user tasks, briefs and schedules.** `schedule:people` (people's daily pass, merged), `schedule:away`/`schedule:trips` (away), `schedule:warm-car` (car heating) and any other internal job: a user task named the same gets the rules written for harness's job. Fix after the household merges: a who kind `harness:NAME` no settings file can produce, used by every internal job and the shipped rules.
