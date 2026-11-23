@@ -9506,10 +9506,12 @@ pub const Core = struct {
     /// the one place the people's notes join it. `e.people` are the
     /// attendees but the owner (`e.attendees` has them all, the owner `self`).
     fn diaryWho(c: *Core, a: std.mem.Allocator, e: diary_mod.Event) ![]const u8 {
-        _ = c;
-        _ = a;
-        _ = e;
-        return "";
+        // people's notes only in a post to a conversation only the owner reads
+        if (!c.ownConversation("main")) return "";
+        // a line each for at most the first ten
+        var list: std.ArrayList(people_mod.Attendee) = .empty;
+        for (e.people[0..@min(e.people.len, 10)]) |p| try list.append(a, .{ .name = p.name, .email = p.email });
+        return c.peopleForMeeting(a, list.items);
     }
 
     /// Whether the owner is in a busy event at `now_s`.
@@ -23076,6 +23078,28 @@ test "meeting_preparation_says_who_where_and_what_was_said" {
     try f.rec.waitFor(": \"Remind me to send Piotr the Q4 numbers\"\nLinks: https://meet.example.com/team");
     // a video call: nothing to leave for
     try t.expectEqual(0, f.rec.count("Time to leave"));
+}
+
+test "meeting_preparation_says_what_harness_knows_of_the_people" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const dir = try withCalendar(&f);
+    const t0 = diaryAt();
+    // what the owner told harness of Piotr; nothing of Ewa
+    const day = @divFloor(t0 + 3600, 86400);
+    for ([_][2][]const u8{ .{ "email", "piotr@example.com" }, .{ "relation", "colleague" }, .{ "preference", "prefers short meetings" } }) |x| {
+        const n = try f.core.people.note(a, "Piotr Nowak", x[0], x[1], day);
+        try t.expect(n.ok);
+    }
+    try writeUpcoming(&f, dir, &.{.{ .id = "work/team-call@calmcp-sim#x", .calendar = "work", .title = "Team call", .start = t0, .end = t0 + 1800, .offset = 60, .busy = true, .place = "Video call", .when = "10:30–11:00", .day = "Tue 24 Nov", .people = &.{ .{ .name = "Piotr Nowak", .email = "piotr@example.com", .answer = "ACCEPTED" }, .{ .name = "Ewa Lis", .email = "ewa@example.com", .answer = "ACCEPTED" } }, .organizer = .{ .name = "Piotr Nowak", .email = "piotr@example.com" }, .yours = false, .answer = "ACCEPTED" }});
+    f.core.fixed_now = t0 - 30 * 60;
+    try f.core.diaryReadNow();
+    f.core.diaryPost(f.core.now());
+    // after who: what harness knows of them (people), a line each it knows
+    try f.rec.waitFor("In 30 minutes: Team call, 10:30–11:00, Video call.\nWith Piotr Nowak and Ewa Lis.\nPiotr Nowak (colleague): prefers short meetings.");
+    try t.expectEqual(0, f.rec.count("Ewa Lis ("));
 }
 
 test "a_busy_event_holds_a_post_until_it_ends" {

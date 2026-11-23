@@ -151,10 +151,10 @@ notes):
   your Drafts for you to send.
 - **Day 10, calendar.** With your calendar: put in an event with a place
   an hour from now; a line comes when it is time to leave. Add one with a
-  person: half an hour before it, a short note on who and when they last
-  came up. Ask "move it to tomorrow": one question shows the exact change
-  before anything is written. During a busy event, the routines' posts
-  wait for its end.
+  person: half an hour before it, a short note on who, what it knows of
+  them (`/person`), and when they last came up. Ask "move it to
+  tomorrow": one question shows the exact change before anything is
+  written. During a busy event, the routines' posts wait for its end.
 - **Any day.** `/session` shows the steps behind the last answer; `/quiet`
   what quiet hours hold; `/workflows` the routines that are on.
 

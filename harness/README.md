@@ -855,9 +855,10 @@ offered again, to list today's events.
   `[butler] maps = SERVER/TOOL`, a maps MCP server's travel time to that
   place, asked with `{"destination", "arrival"}`, instead.
 - **Before a meeting.** 30 minutes before an event with people: when and
-  where, who, the last time each came up in your own conversations (long
-  memory's search of the log; never members', schedules' or private
-  turns), and the event's links.
+  where, who, what harness knows of each (People, below: "Piotr Nowak
+  (colleague): prefers short meetings."), the last time each came up in
+  your own conversations (long memory's search of the log; never
+  members', schedules' or private turns), and the event's links.
 - **Busy means quiet.** While you are in an event the calendar shows as
   busy, the posts of runs nobody waits on wait as in quiet hours and come
   in one digest when it ends ("While you were at Dentist (10:30–11:30):");
