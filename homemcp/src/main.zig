@@ -7,10 +7,14 @@ const config = @import("config.zig");
 const hub_mod = @import("hub.zig");
 const server = @import("server.zig");
 const model = @import("model.zig");
+const discover = @import("discover.zig");
 
 const usage =
     \\usage: homemcp HOME.ini          serve MCP on stdin and stdout (what an agent starts)
     \\       homemcp check HOME.ini    read the home file, then ask the hub for every device's state
+    \\       homemcp discover URL      print a home file for what the hub has, with safe defaults:
+    \\                                 URL is http://HOST:8123 for Home Assistant (with HA_TOKEN),
+    \\                                 or mqtt://HOST:1883 for Zigbee2MQTT (mqtt://HOST:1883/BASE)
     \\       homemcp version
     \\
     \\Secrets come from the environment, never from the file: HA_TOKEN for Home
@@ -27,6 +31,10 @@ pub fn main(init: std.process.Init) !u8 {
     if (eql(cmd, "version") or eql(cmd, "--version")) {
         try out(io, "homemcp " ++ build_options.version ++ "\n");
         return 0;
+    }
+    if (eql(cmd, "discover")) {
+        if (args.len != 3) return fail(io, usage, 2);
+        return discoverCmd(a, io, args[2], init.environ_map);
     }
     const check = eql(cmd, "check") and args.len == 3;
     if (!check and !(args.len == 2 and cmd.len > 0 and cmd[0] != '-')) return fail(io, usage, 2);
@@ -133,6 +141,43 @@ fn checkLine(a: std.mem.Allocator, o: *std.ArrayList(u8), indent: []const u8, dv
     try o.append(a, '\n');
 }
 
+fn discoverCmd(a: std.mem.Allocator, io: Io, where: []const u8, env: *const std.process.Environ.Map) !u8 {
+    const found = if (std.mem.startsWith(u8, where, "mqtt://")) blk: {
+        const rest = where["mqtt://".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/');
+        const hostport = rest[0 .. slash orelse rest.len];
+        const base = if (slash) |i| std.mem.trim(u8, rest[i + 1 ..], "/") else "zigbee2mqtt";
+        const colon = std.mem.lastIndexOfScalar(u8, hostport, ':');
+        const host = if (colon) |i| hostport[0..i] else hostport;
+        const port = if (colon) |i| std.fmt.parseInt(u16, hostport[i + 1 ..], 10) catch return fail(io, "homemcp: discover: mqtt://HOST:PORT\n", 2) else 1883;
+        if (host.len == 0 or base.len == 0) return fail(io, "homemcp: discover: mqtt://HOST:PORT or mqtt://HOST:PORT/BASE\n", 2);
+        break :blk discover.fromBroker(a, io, host, port, base, env.get("MQTT_USER"), env.get("MQTT_PASSWORD")) catch |e| return fail(io, try std.fmt.allocPrint(a, "homemcp: discover: {s}\n", .{switch (e) {
+            error.ConnectFailed => try std.fmt.allocPrint(a, "can't connect to the broker at {s}:{d}", .{ host, port }),
+            error.NotAuthorized => "the broker refused MQTT_USER and MQTT_PASSWORD",
+            error.NoDeviceList => try std.fmt.allocPrint(a, "Zigbee2MQTT's device list didn't come on {s}/bridge/devices (is the base topic right?)", .{base}),
+            error.NotADeviceList => try std.fmt.allocPrint(a, "{s}/bridge/devices isn't a device list", .{base}),
+            else => @errorName(e),
+        }}), 1);
+    } else blk: {
+        if (!std.mem.startsWith(u8, where, "http://") and !std.mem.startsWith(u8, where, "https://"))
+            return fail(io, "homemcp: discover needs http://HOST:8123 (Home Assistant) or mqtt://HOST:1883 (Zigbee2MQTT)\n", 2);
+        const token = env.get("HA_TOKEN") orelse "";
+        if (token.len == 0) return fail(io, "homemcp: discover from Home Assistant needs HA_TOKEN in the environment (a long-lived access token: Profile, Security)\n", 1);
+        break :blk discover.fromHomeAssistant(a, io, where, token) catch |e| return fail(io, try std.fmt.allocPrint(a, "homemcp: discover: {s}\n", .{switch (e) {
+            error.Unauthorized => "the token was refused (HA_TOKEN)",
+            error.ConnectFailed => try std.fmt.allocPrint(a, "can't connect to {s}", .{where}),
+            error.BadUrl => try std.fmt.allocPrint(a, "{s} is not an address like http://homeassistant.local:8123", .{where}),
+            error.NotWebSocket, error.NotHomeAssistant => try std.fmt.allocPrint(a, "{s} doesn't answer as Home Assistant (no WebSocket API at /api/websocket)", .{where}),
+            error.Timeout, error.NoAnswer => try std.fmt.allocPrint(a, "{s} stopped answering", .{where}),
+            error.CertificateRejected => "its https certificate was not accepted",
+            else => @errorName(e),
+        }}), 1);
+    };
+    try out(io, found.text);
+    Io.File.stderr().writeStreamingAll(io, found.summary) catch {};
+    return 0;
+}
+
 fn eql(x: []const u8, y: []const u8) bool {
     return std.mem.eql(u8, x, y);
 }
@@ -159,4 +204,5 @@ test {
     _ = @import("when.zig");
     _ = @import("ws.zig");
     _ = @import("events.zig");
+    _ = @import("discover.zig");
 }

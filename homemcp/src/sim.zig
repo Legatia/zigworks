@@ -343,7 +343,8 @@ fn topic(a: Allocator, base: []const u8, name: []const u8, suffix: []const u8) !
     return std.fmt.allocPrint(a, "{s}/{s}{s}", .{ base, name, suffix });
 }
 
-fn bridgeDevices(a: Allocator, home: *Home) ![]u8 {
+/// Zigbee2MQTT's bridge/devices for the devices it plays.
+pub fn bridgeDevices(a: Allocator, home: *Home) ![]u8 {
     var o: std.ArrayList(u8) = .empty;
     try o.appendSlice(a, "[{\"friendly_name\":\"Coordinator\",\"ieee_address\":\"0x00124b0000000000\",\"type\":\"Coordinator\",\"supported\":false,\"definition\":null}");
     for (home.devs, 0..) |d, i| {
@@ -389,7 +390,7 @@ fn haState(a: Allocator, d: *const Dev) ![]u8 {
                 } else try o.print(a, "\"color_mode\":\"hs\",\"hs_color\":[{d},{d}],\"rgb_color\":[{d},{d},{d}],", .{ hs[0], hs[1], d.rgb.r, d.rgb.g, d.rgb.b });
             }
         },
-        .plug => try o.print(a, "\"current_power_w\":{d},", .{@as(u32, if (d.on) 2000 else 0)}),
+        .plug => try o.print(a, "\"current_power_w\":{d},\"device_class\":\"outlet\",", .{@as(u32, if (d.on) 2000 else 0)}),
         .fan => try o.print(a, "\"percentage\":{d},\"percentage_step\":33.333333333333336,", .{if (d.on) d.speed else 0}),
         .climate => try o.print(a, "\"current_temperature\":{d:.1},\"temperature\":{d},\"hvac_action\":\"{s}\",\"hvac_modes\":[\"off\",\"heat\",\"auto\"],", .{ d.temperature, d.setpoint, if (std.mem.eql(u8, d.mode, "off")) "off" else if (heating(d)) "heating" else "idle" }),
         .lock => try o.print(a, "\"battery_level\":{d},", .{d.battery}),

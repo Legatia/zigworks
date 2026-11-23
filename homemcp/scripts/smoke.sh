@@ -269,6 +269,10 @@ printf '\n[device leaving_unguarded]\nid = scene.leaving\nkind = scene\nallow = 
 check "the Home Assistant stand-in starts" 'wait_port "$HA_PORT"'
 check "check: every device through Home Assistant" 'HA_TOKEN=smoke-token "$B" check "$T/ha.ini" >"$T/c" && grep -q "front_door (lock.front_door, lock, guarded): locked; may: lock" "$T/c"'
 check "check: changes come in as they happen" 'grep -qxF "Changes come in as they happen (Home Assistant'"'"'s WebSocket API)." "$T/c" && grep -qF "People: anna (person.anna) is home, ben (person.ben) is away." "$T/c"'
+check "discover writes a home file that check reads" 'HA_TOKEN=smoke-token "$B" discover "http://127.0.0.1:$HA_PORT" >"$T/found.ini" 2>"$T/found.txt" && HA_TOKEN=smoke-token "$B" check "$T/found.ini" >"$T/c2" && grep -q "front_door (lock.front_door, lock, guarded): locked; may: lock" "$T/c2"'
+check "... with safe defaults, and a summary in plain words" 'grep -qxF "Found 15 devices in 5 rooms, and 2 people." "$T/found.txt" && grep -qF "Left out: Front door camera (a camera), Kitchen smoke alarm (a smoke or CO alarm)" "$T/found.txt" && ! grep -q "^id = camera" "$T/found.ini" && grep -qF ";   camera.front_door (Front door camera)" "$T/found.ini"'
+check "discover without HA_TOKEN says so" '! env -u HA_TOKEN "$B" discover "http://127.0.0.1:$HA_PORT" >/dev/null 2>"$T/err" && grep -q HA_TOKEN "$T/err"'
+check "discover with a wrong token says so" '! HA_TOKEN=wrong "$B" discover "http://127.0.0.1:$HA_PORT" >/dev/null 2>"$T/err" && grep -qF "the token was refused (HA_TOKEN)" "$T/err"'
 check "check: a wrong token is named" '! HA_TOKEN=wrong "$B" check "$T/ha.ini" 2>"$T/err" && grep -q "token was refused" "$T/err"'
 sed -e "s|^log = .*|log = nowhere/actions.jsonl|" "$T/ha.ini" >"$T/badlog.ini"
 check "a log that can't be opened is named" '! HA_TOKEN=smoke-token "$B" "$T/badlog.ini" </dev/null 2>"$T/err" && grep -q "can.t open the log .*nowhere" "$T/err"'
@@ -289,6 +293,7 @@ if command -v mosquitto >/dev/null || [ -x /usr/sbin/mosquitto ]; then
 	sleep 1
 	check "check: every device through Zigbee2MQTT" '"$B" check "$T/z2m.ini" >"$T/c" && grep -q "connected, bridge online" "$T/c" && grep -qxF "Changes come in as they happen (Zigbee2MQTT'"'"'s state topics)." "$T/c" && grep -q "  thermostat (Hall thermostat, climate; also called: the heating): .*set to 20" "$T/c"'
 	python3 -I "$T/mcp.py" z2m "$B" "$T/z2m.ini" "$MQ_PORT" || fail=1
+	check "discover reads Zigbee2MQTT's device list" '"$B" discover "mqtt://127.0.0.1:$MQ_PORT" >"$T/found-z2m.ini" 2>"$T/found-z2m.txt" && "$B" check "$T/found-z2m.ini" >"$T/c3" && grep -q "front_door (Front door, lock, guarded" "$T/c3" && grep -q "water_main (Water main, valve, guarded" "$T/c3" && grep -qF "Zigbee2MQTT has no rooms" "$T/found-z2m.txt"'
 else
 	echo "# mosquitto missing: the Zigbee2MQTT checks are skipped"
 fi
