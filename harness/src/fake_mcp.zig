@@ -272,13 +272,18 @@ pub fn programStandIn(io: Io, a: std.mem.Allocator, env: *const std.process.Envi
         out.writeStreamingAll(io, "The car:\nbattery: 34%\nrange: 150.2 km\ncharging: no\nplugged in: yes\ncharge limit: 80%\ndata: from 5 minutes ago\ncommands the owner allowed: charge_start, charge_stop, charge_limit\n") catch return 1;
         return 0;
     }
-    if (!std.mem.eql(u8, env.get("HA_TOKEN") orelse "", ha_test_token)) {
+    const token = env.get("HA_TOKEN") orelse "";
+    if (token.len == 0) {
         err.writeStreamingAll(io, "homemcp: hub = homeassistant needs HA_TOKEN in the environment\n") catch {};
+        return 1;
+    }
+    if (!std.mem.eql(u8, token, ha_test_token)) {
+        err.writeStreamingAll(io, "homemcp: Home Assistant at http://127.0.0.1:8123 refused the token (HA_TOKEN)\n") catch {};
         return 1;
     }
     // a line per device of the file, as check says them
     var o: std.ArrayList(u8) = .empty;
-    o.appendSlice(a, "Test flat: devices. Home Assistant at http://127.0.0.1:8123.\n") catch return 1;
+    o.appendSlice(a, "Test flat: 7 devices in 4 rooms. Home Assistant at http://127.0.0.1:8123.\nChanges come in as they happen (Home Assistant's WebSocket API).\n") catch return 1;
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |l| {
         const tl = std.mem.trim(u8, l, " \t\r");

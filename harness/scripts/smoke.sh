@@ -566,6 +566,11 @@ check "memory list works offline" '"$H" memory list 2>/dev/null | grep -qF "I pr
 check "snapshot list works offline" '"$H" snapshot list notes 2>/dev/null | grep -qF "Snapshots of notes:"'
 check "agent list works offline" '"$H" agent list 2>/dev/null | grep -qF "researcher: Research across several sources"'
 check "log search finds an earlier turn, offline" '"$H" log search "disk is FINE" 2>/dev/null | grep -qF "(task disk)" && "$H" log search "disk is FINE" 2>/dev/null | grep -qF "Agent: Disk is fine."'
+# the tester kit: doctor's lines and the report (each makes one short model request)
+reply "$(text_reply 'ok')"
+check "doctor says each piece in a line, and what to do where one doesn't work" '"$H" doctor >"$T/doctor.out" 2>&1; grep -qF "Bot: @harness_test_bot answers; you are paired" "$T/doctor.out" && grep -qF "Model: claude-sonnet at omnigate answers" "$T/doctor.out" && grep -qF "harness run: not running. Start it: harness run" "$T/doctor.out" && grep -qF "Home: not connected. In the chat: /setup home" "$T/doctor.out"'
+reply "$(text_reply 'ok')"
+check "report writes one file, every stored secret masked" '(cd "$T" && "$H" report >"$T/report.out" 2>&1) && R=$(sed -n "s/^Wrote \(.*[.]txt\) (.*/\1/p" "$T/report.out") && [ -f "$R" ] && grep -qF "== harness doctor ==" "$R" && grep -qF "== the log" "$R" && ! grep -qE "og-smoke-key-123|telegram-smoke-token|brave-smoke-key|smoke-login-pass" "$R"'
 
 # servers at a url (the stand-in's): one with a token, one with a sign-in
 printf 'mcp-smoke-token-1\n' >"$S/mcp-token"

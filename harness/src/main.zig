@@ -21,6 +21,7 @@ const model = @import("model.zig");
 const oauth = @import("oauth.zig");
 const scrub = @import("scrub.zig");
 const undo_mod = @import("undo.zig");
+const doctor = @import("doctor.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -76,6 +77,11 @@ const usage =
     \\  mcp logout NAME            forget a server's sign-in
     \\  inbox [--json]             what waits for you (--json: every item kept, format v1)
     \\  health                     exit 0 if `harness run` is running and recent
+    \\  doctor                     a line per piece (harness run, the bot, the model, the
+    \\                             home, the car, triggers, voice, quiet hours): what to do
+    \\                             for each that doesn't work; one short model request
+    \\  report                     one file for a bug report, secrets masked: the version,
+    \\                             the settings, the log's last 200 lines, doctor's lines
     \\  version | help
     \\
     \\The data folder is --home (anywhere on the line), else HARNESS_HOME, else
@@ -374,7 +380,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "undo", "env", "app", "agent", "trigger", "workflow", "mcp" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "undo", "env", "app", "agent", "trigger", "workflow", "mcp", "doctor", "report" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -404,6 +410,8 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "app")) return appCmd(app, rest);
     if (eql(cmd, "inbox")) return inboxCmd(app, rest);
     if (eql(cmd, "health")) return healthCmd(app);
+    if (eql(cmd, "doctor")) return doctorCmd(app);
+    if (eql(cmd, "report")) return reportCmd(app);
     complain("unknown command {s}; see harness help", .{cmd});
     return .usage;
 }
@@ -1840,6 +1848,47 @@ fn inboxText(a: std.mem.Allocator, box: *const inbox_mod.Box, json: bool, now_s:
     return out.items;
 }
 
+/// What doctor and report read the folder with.
+fn doctorEnv(app: *App) doctor.Env {
+    return .{
+        .gpa = app.gpa,
+        .io = app.io,
+        .home = app.home,
+        .store = app.store(),
+        .path_var = app.env.get("PATH") orelse "/usr/local/bin:/usr/bin:/bin",
+        .home_var = app.env.get(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME") orelse "",
+        .system_vars = util.pickVars(app.arena, app.env, util.system_var_names) catch &.{},
+        .now_s = util.nowSeconds(app.io),
+    };
+}
+
+/// `harness doctor`: a line per piece, what to do for each that doesn't
+/// work; 0 when all work. It holds no lock: it works while harness runs.
+fn doctorCmd(app: *App) !Exit {
+    const lines = try doctor.check(app.arena, doctorEnv(app));
+    try outAll(app.io, try doctor.text(app.arena, lines));
+    return if (doctor.allOk(lines)) .ok else .failed;
+}
+
+/// `harness report`: one masked file for a bug report, in the folder it is
+/// run from (else the data folder), its path said.
+fn reportCmd(app: *App) !Exit {
+    const env = doctorEnv(app);
+    const lines = try doctor.check(app.arena, env);
+    const text = try doctor.report(app.arena, env, build_options.version, try doctor.text(app.arena, lines));
+    var tb: [20]u8 = undefined;
+    const stamp = util.isoTime(&tb, env.now_s);
+    const name = try std.fmt.allocPrint(app.arena, "harness-report-{s}{s}{s}-{s}{s}{s}.txt", .{ stamp[0..4], stamp[5..7], stamp[8..10], stamp[11..13], stamp[14..16], stamp[17..19] });
+    const here = Io.Dir.cwd().realPathFileAlloc(app.io, ".", app.arena) catch ".";
+    var path = try std.fs.path.join(app.arena, &.{ here, name });
+    util.writeReplace(app.io, path, text) catch {
+        path = try std.fs.path.join(app.arena, &.{ app.home, name });
+        try util.writeReplace(app.io, path, text);
+    };
+    try outPrint(app.io, "Wrote {s} ({d} KB): the version, the settings files and the log's last 200 lines, every stored secret masked, and harness doctor's lines.\nRead it before you send it: the log has what you and harness said in conversations that are not private. Send it as TESTERS.md says.\n", .{ path, (text.len + 1023) / 1024 });
+    return .ok;
+}
+
 fn healthCmd(app: *App) !Exit {
     const p = try core_mod.Paths.init(app.arena, app.home);
     var buf: [256]u8 = undefined;
@@ -2115,7 +2164,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     const cmd = args[0];
     const rest = args[1..];
     if (eql(cmd, "init")) return if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "--butler"))) null else "usage: harness init [--butler]";
-    inline for (.{ "help", "--help", "-h", "version", "pair", "run", "chat", "health" }) |c| {
+    inline for (.{ "help", "--help", "-h", "version", "pair", "run", "chat", "health", "doctor", "report" }) |c| {
         if (eql(cmd, c)) return if (rest.len == 0) null else "usage: harness " ++ c ++ " (it takes no arguments)";
     }
     if (eql(cmd, "brief")) return if (rest.len <= 1) null else "usage: harness brief [NAME]";
@@ -2623,6 +2672,7 @@ test {
     _ = @import("quiet.zig");
     _ = @import("household.zig");
     _ = @import("butler.zig");
+    _ = @import("doctor.zig");
 }
 
 test "a_line_of_ctrl_d_leaves_the_chat_in_a_windows_console" {
