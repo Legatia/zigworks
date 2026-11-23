@@ -1311,7 +1311,7 @@ test "web_makes_a_password_on_sign_up" {
     _ = try f.act(try f.openJson("login.html", "new"));
     try t.expectEqual(null, try f.stored("login-new-password"));
     const r = try f.act("{\"action\":\"type\",\"ref\":2,\"text\":\"{login:new.password}\"}");
-    try t.expect(!r.is_error);
+    try expectNoError(r);
     try expectHas(r.text, "A new password was made and stored");
     const pw = (try f.stored("login-new-password")).?;
     try t.expectEqual(24, pw.len);
@@ -1332,7 +1332,7 @@ test "web_totp_code_is_current" {
     );
     _ = try f.act(try f.openJson("code.html", "t"));
     const r = try f.act("{\"action\":\"type\",\"ref\":1,\"text\":\"{login:t.code}\"}");
-    try t.expect(!r.is_error);
+    try expectNoError(r);
     // the page shows the code, the result masks it
     try expectHas(r.text, "code [secret:login-t-code]");
     const got = try f.eval("document.getElementById('c').value");
@@ -1601,7 +1601,7 @@ test "web_login_values_go_only_into_matching_fields" {
     }) |j| {
         const r = try f.act(j);
         if (r.is_error) std.debug.print("\nrefused: {s}\n{s}\n", .{ j, r.text });
-        try t.expect(!r.is_error);
+        try expectNoError(r);
     }
 }
 
@@ -1885,7 +1885,7 @@ test "web_page_scripts_cannot_stall_the_waits" {
     try f.page("to.html", "<html><body><a href=\"/page/stall.html\">go</a></body></html>");
     const r = try f.act(try f.openJson("stall.html", null));
     if (r.is_error) std.debug.print("\n{s}\n", .{r.text});
-    try t.expect(!r.is_error);
+    try expectNoError(r);
     try expectHas(r.text, "stalling page");
     _ = try f.act(try f.openJson("to.html", null));
     const r2 = try f.act("{\"action\":\"click\",\"ref\":1}");
@@ -1928,4 +1928,13 @@ test "web_passkey_filter_keeps_the_site_and_drops_others" {
     try t.expect(!m.changed);
     const m2 = try mergePasskeys(arena.allocator(), &.{.{ .id = "a", .rp_id = "localhost", .key = "k", .count = 1 }}, &.{.{ .id = "a", .rp_id = "localhost", .key = "k", .count = 2 }});
     try t.expect(m2.changed and m2.added.len == 0 and m2.list[0].count == 2);
+}
+
+/// A test's check that the web tool did not fail, printing what it said
+/// when it did (headless Chrome under load fails now and then; the text
+/// says why).
+fn expectNoError(r: anytype) !void {
+    if (!r.is_error) return;
+    std.debug.print("the web tool said: {s}\n", .{r.text});
+    return error.TestUnexpectedResult;
 }
