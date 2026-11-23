@@ -9,6 +9,7 @@ const conversations = @import("conversations.zig");
 const agents = @import("agents.zig");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
+const alerts = @import("alerts.zig");
 const Allocator = std.mem.Allocator;
 
 pub const max_file = 64 * 1024;
@@ -91,6 +92,11 @@ pub const Step = struct {
     /// `no LABEL`: the other button ("No" unless it says).
     no: []const u8 = "",
     yes_line: usize = 0,
+    /// `fallback 5m` on an urgent workflow's approve with yes: nobody on it
+    /// by then, harness makes the next step's call itself, once (only
+    /// homemcp's guarded tool locking, closing or arming); 0: never.
+    fallback_s: u32 = 0,
+    fallback_line: usize = 0,
 
     pub fn timeout(s: Step) u32 {
         return s.timeout_s orelse default_timeout_s;
@@ -117,6 +123,9 @@ pub const Workflow = struct {
     phrases: []const []const u8 = &.{},
     /// `tag no`: its posts go without `[NAME#N]` in front.
     tag: bool = true,
+    /// `escalate 5m anna, …` (urgent only): who is told when the owner
+    /// doesn't acknowledge; empty: no one; null: `[butler] escalate`.
+    escalate: ?[]const alerts.Step = null,
     steps: []const Step,
     /// "saved by agent:main 2026-11-22 (item 57)": its first line, when
     /// the agent's save wrote it.
@@ -271,8 +280,11 @@ fn readLines(a: Allocator, text: []const u8, diag: *Diag, saved: *[]const u8) Er
     return out.items;
 }
 
-const head_keys = [_][]const u8{ "workflow", "about", "start", "limits", "to", "urgent", "phrases", "tag" };
-const step_keys = [_][]const u8{ "tool", "do", "wait", "approve", "review", "say", "answer", "tools", "match", "if", "retry", "on", "timeout", "env", "goto", "end", "yes", "no" };
+const head_keys = [_][]const u8{ "workflow", "about", "start", "limits", "to", "urgent", "phrases", "tag", "escalate" };
+const step_keys = [_][]const u8{ "tool", "do", "wait", "approve", "review", "say", "answer", "tools", "match", "if", "retry", "on", "timeout", "env", "goto", "end", "yes", "no", "fallback" };
+
+/// What a fallback may do: homemcp's guarded tool, the safe way only.
+const safe_actions = [_][]const u8{ "lock", "close", "arm_home", "arm_away" };
 
 /// The longest phrase, as `phraseOf` reads it.
 pub const phrase_max = 64;
@@ -366,6 +378,24 @@ pub fn parse(a: Allocator, name: []const u8, text: []const u8, diag: *Diag) Erro
         const v = jv.parse(a, steps.items[i + 1].action.tool.json) orelse return bad(diag, s.yes_line, "the tool's input is a JSON object");
         if (jsonHasPlaceholder(v)) return bad(diag, s.yes_line, "yes makes the next step's call as the file has it: its input takes no {value}, so the tap makes exactly the call you saw");
     };
+    // only urgent alerts go to the household
+    if (w.escalate != null and !w.urgent) {
+        const n = for (lines) |l| {
+            if (std.mem.eql(u8, l.key, "escalate")) break l.n;
+        } else 0;
+        return bad(diag, n, "escalate goes with urgent yes: only urgent alerts go to the household");
+    }
+    // a fallback makes the next step's call with nobody there: an urgent
+    // routine's, and only homemcp's guarded tool the safe way
+    for (steps.items, 0..) |s, i| if (s.fallback_s > 0) {
+        if (!w.urgent) return bad(diag, s.fallback_line, "fallback is for urgent workflows: urgent yes in the head");
+        if (s.fallback_s >= s.timeout()) return badf(a, diag, s.fallback_line, "fallback comes before the question's timeout ({s})", .{try triggers.fmtDuration(a, s.timeout())});
+        const tl = steps.items[i + 1].action.tool;
+        const tool = tl.name[(std.mem.indexOfScalar(u8, tl.name, '/') orelse 0) + 1 ..];
+        const action = jv.str(jv.get(jv.parse(a, tl.json), "action")) orelse "";
+        if (!std.mem.eql(u8, tool, "home_guarded") or !oneOf(action, &safe_actions))
+            return bad(diag, s.fallback_line, "fallback makes only a safe call: home_guarded with lock, close, arm_home or arm_away");
+    };
     if (w.phrases.len > 0 and !w.allows("owner", false)) {
         const n = for (lines) |l| {
             if (std.mem.eql(u8, l.key, "phrases")) break l.n;
@@ -450,6 +480,14 @@ fn headLine(a: Allocator, w: *Workflow, l: Line, file_name: []const u8, diag: *D
         w.phrases = list.items;
     } else if (eql(u8, l.key, "tag")) {
         w.tag = config.parseBool(v) orelse return bad(diag, l.n, "tag yes or no: no posts without [NAME#N] in front");
+    } else if (eql(u8, l.key, "escalate")) {
+        // `escalate 5m anna`, or as triggers.ini writes it, `escalate = …`
+        const steps = std.mem.trim(u8, if (std.mem.startsWith(u8, v, "=")) v[1..] else v, " \t");
+        var why: []const u8 = "";
+        w.escalate = alerts.parseEscalate(a, steps, &why) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadEscalate => return bad(diag, l.n, why),
+        };
     }
 }
 
@@ -612,6 +650,11 @@ fn stepLines(a: Allocator, s: *Step, lines: []const Line, w: Workflow, diag: *Di
         } else if (eql(u8, l.key, "end")) {
             if (v.len > 0) return bad(diag, l.n, "end takes nothing after it");
             s.end = true;
+        } else if (eql(u8, l.key, "fallback")) {
+            const secs = triggers.parseDuration(v) orelse 0;
+            if (secs < 60) return bad(diag, l.n, "fallback D: at least 1 minute, like 5m");
+            s.fallback_s = secs;
+            s.fallback_line = l.n;
         } else if (eql(u8, l.key, "yes") or eql(u8, l.key, "no")) {
             if (v.len == 0 or v.len > label_max or std.mem.indexOfAny(u8, v, "\r\n") != null) return badf(a, diag, l.n, "{s}: a button's words are 1 to 32 bytes on one line", .{l.key});
             if (std.mem.indexOfScalar(u8, v, '{') != null) return badf(a, diag, l.n, "{s}: a button's words are shown as they are (no {{values}})", .{l.key});
@@ -627,6 +670,8 @@ fn stepLines(a: Allocator, s: *Step, lines: []const Line, w: Workflow, diag: *Di
     if (s.yes_line != 0 and s.action != .approve) return bad(diag, s.yes_line, "yes goes with approve");
     if (no_line != 0 and s.yes_line == 0) return bad(diag, no_line, "no goes with yes");
     if (s.yes_line != 0 and no_line == 0) s.no = "No";
+    if (s.fallback_line != 0 and s.action != .approve) return bad(diag, s.fallback_line, "fallback goes with approve and yes: the call it makes is the next step's");
+    if (s.fallback_line != 0 and s.yes_line == 0) return bad(diag, s.fallback_line, "fallback goes with yes: the call it makes is the next step's");
     s.ifs = ifs.items;
     s.match = match.items;
     const is_do = s.action == .do;
@@ -1098,6 +1143,7 @@ pub fn reading(a: Allocator, w: Workflow, money: ?*const fn (ctx: ?*anyopaque, t
     };
     if (has_do) try out.print(a, "; agent steps run {s}", .{w.agent});
     if (w.urgent) try out.appendSlice(a, "; urgent: its posts and questions go through quiet hours");
+    try out.appendSlice(a, try alerts.readingWords(a, w.escalate));
     if (!w.tag) try out.print(a, "; its posts go without [{s}#N] in front", .{w.name});
     try out.appendSlice(a, ".");
     var moving: std.ArrayList(u8) = .empty;
@@ -1127,6 +1173,7 @@ pub fn reading(a: Allocator, w: Workflow, money: ?*const fn (ctx: ?*anyopaque, t
             .approve => |text| if (s.yes.len > 0) {
                 const next_step = w.steps[@min(n, w.steps.len - 1)].name;
                 try out.print(a, "asks you: {s} [{s}] [{s}]; {s} makes step {s}'s call, once (no answer in {s}: {s})", .{ util.cut(oneLine(a, text), 200), s.yes, s.no, s.yes, next_step, try triggers.fmtDuration(a, s.timeout()), s.no });
+                if (s.fallback_s > 0) try out.print(a, "; if nobody is on it in {s}, harness makes that call itself, once", .{try alerts.minutesText(a, s.fallback_s)});
             } else try out.print(a, "asks you to approve: {s} (no answer in {s}: denied)", .{ util.cut(oneLine(a, text), 200), try triggers.fmtDuration(a, s.timeout()) }),
             .review => |text| try out.print(a, "shows you a draft to use, drop or replace: {s} (no answer in {s}: dropped)", .{ util.cut(oneLine(a, text), 200), try triggers.fmtDuration(a, s.timeout()) }),
             .say => |text| try out.print(a, "says: {s}", .{util.cut(oneLine(a, text), 200)}),
@@ -1474,6 +1521,79 @@ test "a_yes_tap_makes_only_a_call_fixed_in_the_file" {
     // fixed, or a {{ that is only a brace: read
     var d: Diag = .{};
     _ = try parse(a, "x", "workflow x\nstep a\napprove Lock it?\nyes Lock it\nstep b\ntool home/home_guarded {\"device\": \"front_door\", \"action\": \"lock\"}\n", &d);
+}
+
+test "escalate_is_read_in_the_head" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    const w = try parse(a, "leak", "workflow leak\nurgent yes\nescalate 5m anna, 15m piotr\nstep s\nsay hi\n", &d);
+    try t.expectEqual(2, w.escalate.?.len);
+    try t.expectEqualStrings("anna", w.escalate.?[0].member);
+    try t.expect(std.mem.indexOf(u8, try reading(a, w, null, null), "; if you don't answer: anna after 5 min, then piotr after 15 min") != null);
+    // as triggers.ini writes it; off; none: [butler]'s
+    try t.expectEqual(1, (try parse(a, "leak", "workflow leak\nurgent = yes\nescalate = 10m anna\nstep s\nsay hi\n", &d)).escalate.?.len);
+    try t.expectEqual(0, (try parse(a, "leak", "workflow leak\nescalate no\nurgent yes\nstep s\nsay hi\n", &d)).escalate.?.len);
+    try t.expect((try parse(a, "leak", "workflow leak\nurgent yes\nstep s\nsay hi\n", &d)).escalate == null);
+    try refused(a, "leak", "workflow leak\nescalate 5m anna\nstep s\nsay hi\n", 2, "escalate goes with urgent yes");
+    try refused(a, "leak", "workflow leak\nurgent yes\nescalate anna\nstep s\nsay hi\n", 3, "DURATION MEMBER");
+    try refused(a, "leak", "workflow leak\nurgent yes\nstep s\nescalate 5m anna\nsay hi\n", 4, "escalate goes in the head");
+}
+
+/// The leak routine as setup writes it, `fallback` on its question.
+const leak_with_fallback =
+    \\workflow leak
+    \\urgent yes
+    \\step ask
+    \\approve Water leak: Sink leak, Kitchen.
+    \\yes Close the water main
+    \\no Ignore
+    \\timeout 2h
+    \\fallback 5m
+    \\on deny goto ignored
+    \\step close
+    \\tool home/home_guarded {"device": "water_main", "action": "close"}
+    \\step ignored
+    \\say Water main left open.
+;
+
+test "fallback_takes_only_a_safe_call_of_an_urgent_routine" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    const w = try parse(a, "leak", leak_with_fallback, &d);
+    try t.expectEqual(300, w.steps[0].fallback_s);
+    try t.expectEqual(0, w.steps[1].fallback_s);
+    const r = try reading(a, w, null, null);
+    if (std.mem.indexOf(u8, r, "; if nobody is on it in 5 min, harness makes that call itself, once") == null) {
+        std.debug.print("{s}\n", .{r});
+        return error.TestUnexpectedResult;
+    }
+    // lock and arm are safe directions too
+    _ = try parse(a, "x", "workflow x\nurgent yes\nstep a\napprove Door open.\nyes Lock it\nfallback 10m\nstep b\ntool home/home_guarded {\"device\": \"front_door\", \"action\": \"lock\"}\n", &d);
+    _ = try parse(a, "x", "workflow x\nurgent yes\nstep a\napprove Everyone out.\nyes Arm it\nfallback 10m\nstep b\ntool home/home_guarded {\"device\": \"alarm\", \"action\": \"arm_away\"}\n", &d);
+    // only an urgent routine, only with yes, only an approve, in time
+    const not_urgent = try std.mem.replaceOwned(u8, a, leak_with_fallback, "urgent yes\n", "");
+    try refused(a, "leak", not_urgent, 7, "fallback is for urgent workflows");
+    try refused(a, "x", "workflow x\nurgent yes\nstep a\napprove Go?\nfallback 5m\nstep b\ntool home/home_guarded {\"device\": \"water_main\", \"action\": \"close\"}\n", 5, "fallback goes with yes");
+    try refused(a, "x", "workflow x\nurgent yes\nstep a\nsay hi\nfallback 5m\n", 5, "fallback goes with approve and yes");
+    try refused(a, "leak", try std.mem.replaceOwned(u8, a, leak_with_fallback, "fallback 5m", "fallback 30s"), 8, "fallback D: at least 1 minute");
+    try refused(a, "leak", try std.mem.replaceOwned(u8, a, leak_with_fallback, "timeout 2h", "timeout 5m"), 8, "fallback comes before the question's timeout");
+    // the call: homemcp's guarded tool, and only the safe way
+    try refused(a, "leak", try std.mem.replaceOwned(u8, a, leak_with_fallback, "home/home_guarded", "home/home_set"), 8, "fallback makes only a safe call");
+    try refused(a, "leak", try std.mem.replaceOwned(u8, a, leak_with_fallback, "\"action\": \"close\"", "\"action\": \"off\""), 8, "home_guarded with lock, close, arm_home or arm_away");
+}
+
+test "a_fallback_on_unlock_is_refused_when_read" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "unlock", "open", "disarm" }) |act| {
+        const text = try std.fmt.allocPrint(a, "workflow x\nurgent yes\nstep a\napprove Someone at the door.\nyes Let them in\nfallback 5m\nstep b\ntool home/home_guarded {{\"device\": \"front_door\", \"action\": \"{s}\"}}\n", .{act});
+        try refused(a, "x", text, 6, "fallback makes only a safe call");
+    }
 }
 
 test "phrases_start_by_the_owners_words" {

@@ -6,10 +6,12 @@ const std = @import("std");
 const files = @import("butler_files");
 const config = @import("config.zig");
 const util = @import("util.zig");
+const alerts = @import("alerts.zig");
 const Allocator = std.mem.Allocator;
 
-/// What a device is, as the home file says it (`kind =`).
-pub const Kind = enum { light, @"switch", plug, climate, cover, fan, scene, media, lock, alarm, valve, sensor, other };
+/// What a device is, as the home file says it (`kind =`); `smoke`: a
+/// smoke, CO or gas alarm, only watched.
+pub const Kind = enum { light, @"switch", plug, climate, cover, fan, scene, media, lock, alarm, valve, sensor, smoke, other };
 
 pub const Device = struct {
     /// Its name in the home file: `[device NAME]`.
@@ -315,6 +317,7 @@ pub fn homeSummary(a: Allocator, h: Home) ![]const u8 {
     var unknown_names: std.ArrayList([]const u8) = .empty;
     var idle: std.ArrayList([]const u8) = .empty;
     var seen: std.ArrayList([]const u8) = .empty;
+    var smokes: std.ArrayList([]const u8) = .empty;
     var plugs: std.ArrayList(Device) = .empty;
     for (h.devices) |d| {
         if (d.unidentified()) {
@@ -324,6 +327,9 @@ pub fn homeSummary(a: Allocator, h: Home) ![]const u8 {
             try guarded.append(a, try theName(a, d));
         } else if (d.isGuarded()) {
             try idle.append(a, try std.fmt.allocPrint(a, "{s} (it may do nothing yet)", .{try theName(a, d)}));
+        } else if (d.kind == .smoke) {
+            // watched for its routine, and never touched
+            try smokes.append(a, try theName(a, d));
         } else if (d.allow.len == 0) {
             try seen.append(a, try theName(a, d));
         }
@@ -334,6 +340,7 @@ pub fn homeSummary(a: Allocator, h: Home) ![]const u8 {
     // guarded devices that may do nothing
     var never: std.ArrayList([]const u8) = .empty;
     for (h.left) |l| if (l.why == .camera or l.why == .safety) try never.append(a, try std.fmt.allocPrint(a, "the {s}", .{try lowerFirst(a, l.label)}));
+    try never.appendSlice(a, smokes.items);
     try never.appendSlice(a, idle.items);
     if (never.items.len > 0) try o.print(a, "\nI won't touch {s}.", .{try someNames(a, never.items, 6, .@"or")});
     if (seen.items.len > 0) try o.print(a, "\nI'll watch {s}.", .{try someNames(a, seen.items, 6, .@"and")});
@@ -629,19 +636,30 @@ pub const Picks = struct {
     night_temp: u16 = 18,
     away_temp: u16 = 17,
     home_temp: u16 = 21,
+    /// The leak's question closes the water main itself when nobody is on
+    /// it in 5 minutes (the owner turned it on).
+    fallback: bool = false,
+    /// Smoke, CO and gas alarms (only watched).
+    smokes: []const Device = &.{},
+    /// A speaker may announce: urgent routines are said aloud.
+    speakers: bool = false,
+    /// `[butler] escalate`: who is told when the owner doesn't answer.
+    escalate: []const alerts.Step = &.{},
 };
 
-pub const Settings = struct { car: bool = false, search: bool = false, calendar: []const u8 = "", quiet: ?config.Quiet = null, town: []const u8 = "" };
+pub const Settings = struct { car: bool = false, search: bool = false, calendar: []const u8 = "", quiet: ?config.Quiet = null, town: []const u8 = "", fallback: bool = false, escalate: []const alerts.Step = &.{} };
 
 /// The devices and settings the routines use: every light; the first
 /// thermostat; the first lock (a front one first); the water main (a
 /// valve, else a switch named one); every leak sensor; every door and
 /// window sensor.
 pub fn pick(a: Allocator, h: Home, s: Settings) !Picks {
-    var p: Picks = .{ .people = h.people.len > 0, .car = s.car, .search = s.search, .calendar = s.calendar, .quiet = s.quiet, .town = s.town };
+    var p: Picks = .{ .people = h.people.len > 0, .car = s.car, .search = s.search, .calendar = s.calendar, .quiet = s.quiet, .town = s.town, .fallback = s.fallback, .escalate = s.escalate };
     var leaks: std.ArrayList(Device) = .empty;
     var doors: std.ArrayList(Device) = .empty;
+    var smokes: std.ArrayList(Device) = .empty;
     for (h.devices) |d| {
+        if (d.allows("announce")) p.speakers = true;
         switch (d.kind) {
             .light => p.lights += 1,
             .climate => if (p.thermostat == null and d.allows("temperature")) {
@@ -656,9 +674,11 @@ pub fn pick(a: Allocator, h: Home, s: Settings) !Picks {
             .sensor => {
                 if (d.leakSensor()) try leaks.append(a, d) else if (d.openingSensor()) try doors.append(a, d);
             },
+            .smoke => try smokes.append(a, d),
             else => {},
         }
     }
+    p.smokes = smokes.items;
     if (p.valve == null) for (h.devices) |d| if (d.valveSwitch() and d.allows("off")) {
         p.valve = d;
         break;
@@ -699,6 +719,7 @@ pub const Routine = enum {
     arriving,
     @"morning-home",
     leak,
+    smoke,
     @"door-open",
     @"car-tomorrow",
 
@@ -715,6 +736,7 @@ pub const Routine = enum {
             .arriving => "Arriving",
             .@"morning-home" => "Morning summary",
             .leak => "Leak",
+            .smoke => "Smoke alarm",
             .@"door-open" => "Doors left open",
             .@"car-tomorrow" => "Car for tomorrow",
         };
@@ -728,6 +750,7 @@ pub const Routine = enum {
             .arriving => p.people and p.thermostat != null,
             .@"morning-home" => true,
             .leak => p.leaks.len > 0,
+            .smoke => p.smokes.len > 0,
             .@"door-open" => p.doors.len > 0,
             .@"car-tomorrow" => p.car,
         };
@@ -764,6 +787,17 @@ pub const Routine = enum {
                 if (p.valve) |v| try o.print(a, ", and one tap closes the {s}", .{try spoken(a, v.name)});
                 try o.append(a, '.');
             },
+            .smoke => {
+                try o.print(a, "Smoke alarm: when {s} goes off, I tell you at once, even at night", .{try sensorList(a, p.smokes, "a smoke or CO alarm")});
+                if (p.speakers) try o.appendSlice(a, ", and say it on every speaker");
+                try o.append(a, '.');
+                if (p.escalate.len > 0) {
+                    const m = p.escalate[0].after_s / 60;
+                    try o.print(a, " If you don't answer in {d} minute{s}, I tell ", .{ m, if (m == 1) "" else "s" });
+                    for (p.escalate, 0..) |st, i| try o.print(a, "{s}{s}", .{ if (i > 0) ", then " else "", try capital(a, st.member) });
+                    try o.append(a, '.');
+                }
+            },
             .@"door-open" => try o.print(a, "Doors left open: when {s} stays open for 10 minutes, I tell you.", .{try sensorList(a, p.doors, "a door or window")}),
             .@"car-tomorrow" => try o.print(a, "Car for tomorrow: at {s}, when the car is under half, I tell you, and ask with one tap to start charging when it's plugged in.", .{try clock(a, carAt(p))}),
         }
@@ -779,13 +813,14 @@ pub fn onText(a: Allocator, r: Routine, p: Picks) ![]const u8 {
         .arriving => "Arriving is on: it runs when the first of you comes home.",
         .@"morning-home" => std.fmt.allocPrint(a, "The morning summary is on, at {s}. /workflow start morning-home tries it now.", .{try clock(a, morningAt(p))}),
         .leak => "Leak is on: it comes through quiet hours.",
+        .smoke => "Smoke alarm is on: it comes through quiet hours.",
         .@"door-open" => "Doors left open is on.",
         .@"car-tomorrow" => std.fmt.allocPrint(a, "Car for tomorrow is on, at {s}. /workflow start car-tomorrow tries it now.", .{try clock(a, carAt(p))}),
     };
 }
 
 /// The routines in the order setup offers them.
-pub const all = [_]Routine{ .goodnight, .leaving, .arriving, .@"morning-home", .leak, .@"door-open", .@"car-tomorrow" };
+pub const all = [_]Routine{ .goodnight, .leaving, .arriving, .@"morning-home", .leak, .smoke, .@"door-open", .@"car-tomorrow" };
 
 fn andList(a: Allocator, parts: []const []const u8) ![]const u8 {
     if (parts.len == 0) return "";
@@ -933,6 +968,7 @@ fn triggerSections(r: Routine) []const []const u8 {
         .arriving => &.{"first-home"},
         .@"morning-home" => &.{"morning-home-at"},
         .leak => &.{"leak-<leak>"},
+        .smoke => &.{"smoke-<smoke>"},
         .@"door-open" => &.{"door-<door>"},
         .@"car-tomorrow" => &.{"car-evening"},
     };
@@ -1044,6 +1080,10 @@ fn commonValues(a: Allocator, p: Picks) ![]Value {
     var door_starts: std.ArrayList([]const u8) = .empty;
     for (p.doors) |d| try door_starts.append(a, try std.fmt.allocPrint(a, "trigger:{s}", .{try perSensorName(a, "door-", d.name)}));
     try v.append(a, .{ .key = "door starts", .value = try std.mem.join(a, ", ", door_starts.items) });
+    var smoke_starts: std.ArrayList([]const u8) = .empty;
+    for (p.smokes) |d| try smoke_starts.append(a, try std.fmt.allocPrint(a, "trigger:{s}", .{try perSensorName(a, "smoke-", d.name)}));
+    try v.append(a, .{ .key = "smoke starts", .value = try std.mem.join(a, ", ", smoke_starts.items) });
+    try v.append(a, .{ .key = "smoke speaker words", .value = if (p.speakers) ", and on every speaker" else "" });
     return v.items;
 }
 
@@ -1054,13 +1094,35 @@ fn perSensorName(a: Allocator, prefix: []const u8, device: []const u8) ![]const 
     return n[0..@min(n.len, 64)];
 }
 
+/// Whether the leak's question may close the water main itself (its
+/// fallback): a valve that closes, not a switch whose safe way is off.
+pub fn fallbackOffered(p: Picks) bool {
+    const v = p.valve orelse return false;
+    return v.kind == .valve and v.allows("close");
+}
+
+/// The leak's fallback, offered after the leak is on.
+pub fn fallbackSentence(a: Allocator, p: Picks) ![]const u8 {
+    return std.fmt.allocPrint(a, "If nobody answers the leak's question in 5 minutes, I close the {s} myself, once, and tell you.", .{try spoken(a, p.valve.?.name)});
+}
+
+/// Said once the leak's fallback is on.
+pub fn fallbackOnText(a: Allocator, p: Picks) ![]const u8 {
+    return std.fmt.allocPrint(a, "If nobody answers, I close the {s} after 5 minutes.", .{try spoken(a, p.valve.?.name)});
+}
+
+/// The line the fallback adds to the leak's step ask.
+pub const fallback_line = "fallback 5m";
+
 /// The flags the templates' `#if` lines read.
 fn flagsOf(a: Allocator, p: Picks) ![]const []const u8 {
     var f: std.ArrayList([]const u8) = .empty;
     if (p.lock != null) try f.append(a, "lock");
     if (p.valve != null) try f.append(a, "valve");
+    if (p.fallback and fallbackOffered(p)) try f.append(a, "fallback");
     if (p.thermostat != null) try f.append(a, "thermostat");
     if (p.car) try f.append(a, "car");
+    if (p.speakers) try f.append(a, "speakers");
     return f.items;
 }
 
@@ -1080,7 +1142,7 @@ pub fn routineFiles(a: Allocator, r: Routine, p: Picks, date: []const u8) !Files
         const tmpl = (try sectionOf(a, files.triggers_ini, sname)) orelse return error.NoSuchSection;
         // the template's own comment goes; setup's mark comes instead
         const body = tmpl[(std.mem.indexOf(u8, tmpl, "[") orelse 0)..];
-        const each: []const Device = if (std.mem.indexOf(u8, sname, "<leak>") != null) p.leaks else if (std.mem.indexOf(u8, sname, "<door>") != null) p.doors else &.{};
+        const each: []const Device = if (std.mem.indexOf(u8, sname, "<leak>") != null) p.leaks else if (std.mem.indexOf(u8, sname, "<door>") != null) p.doors else if (std.mem.indexOf(u8, sname, "<smoke>") != null) p.smokes else &.{};
         if (each.len == 0) {
             try trig.print(a, "; added by /setup routines {s}: {s}\n{s}\n", .{ date, r.title(), try fill(a, body, values, flags, &missing) });
             continue;
@@ -1094,9 +1156,11 @@ pub fn routineFiles(a: Allocator, r: Routine, p: Picks, date: []const u8) !Files
             try vs.append(a, .{ .key = "door", .value = d.name });
             try vs.append(a, .{ .key = "door label", .value = label });
             try vs.append(a, .{ .key = "leak words", .value = if (room.len > 0) try std.fmt.allocPrint(a, "{s}, {s}", .{ label, room }) else label });
+            try vs.append(a, .{ .key = "smoke", .value = d.name });
+            try vs.append(a, .{ .key = "smoke words", .value = if (room.len > 0) try std.fmt.allocPrint(a, "{s}, {s}", .{ label, room }) else label });
             var text = try fill(a, body, vs.items, flags, &missing);
             // the name at most 64 bytes, as the start line says it
-            const prefix: []const u8 = if (std.mem.indexOf(u8, sname, "<leak>") != null) "leak-" else "door-";
+            const prefix: []const u8 = if (std.mem.indexOf(u8, sname, "<leak>") != null) "leak-" else if (std.mem.indexOf(u8, sname, "<smoke>") != null) "smoke-" else "door-";
             text = try std.mem.replaceOwned(u8, a, text, try std.fmt.allocPrint(a, "[{s}{s}]", .{ prefix, d.name }), try std.fmt.allocPrint(a, "[{s}]", .{try perSensorName(a, prefix, d.name)}));
             try trig.print(a, "; added by /setup routines {s}: {s}\n{s}\n", .{ date, r.title(), text });
         }
@@ -1179,6 +1243,11 @@ pub const sim_home =
     \\kind = sensor
     \\room = Kitchen
     \\
+    \\[device kitchen_smoke_alarm]
+    \\id = binary_sensor.kitchen_smoke
+    \\kind = smoke
+    \\room = Kitchen
+    \\
     \\; Hall
     \\
     \\[device hall_thermostat]
@@ -1243,8 +1312,6 @@ pub const sim_home =
     \\; Left out, and why:
     \\; cameras: never offered (homemcp has no camera support; what they see is personal)
     \\;   camera.front_door (Front door camera)
-    \\; smoke, CO and gas detectors: left out; homemcp is not a safety system, so keep their own alarms
-    \\;   binary_sensor.kitchen_smoke (Kitchen smoke alarm)
     \\; settings and diagnostics of devices (a child lock, a LED, a firmware update): not things to switch
     \\;   switch.kettle_child_lock (Kettle child lock)
     \\; kinds homemcp doesn't know (a light, switch or sensor among them can be added by hand)
@@ -1254,7 +1321,7 @@ pub const sim_home =
 
 /// homemcp check's lines for it.
 pub const sim_check =
-    \\The flat (made up by homemcp-sim): 15 devices in 5 rooms. Home Assistant at http://127.0.0.1:8123.
+    \\The flat (made up by homemcp-sim): 16 devices in 5 rooms. Home Assistant at http://127.0.0.1:8123.
     \\Changes come in as they happen (Home Assistant's WebSocket API).
     \\Living room
     \\  living_room_light (light.living_room, light; also called: the big light): off; may: on, off, brightness
@@ -1265,6 +1332,7 @@ pub const sim_check =
     \\  water_main (valve.water_main, valve, guarded): open; may: close
     \\  kitchen_speaker (media_player.kitchen_speaker, media): idle, volume 20%; may: play, pause, volume
     \\  sink_leak (binary_sensor.sink_leak, sensor): dry; may: nothing (only seen)
+    \\  kitchen_smoke_alarm (binary_sensor.kitchen_smoke, smoke): clear; may: nothing (only watched)
     \\Hall
     \\  hall_thermostat (climate.hall, climate): 19.9 °C, set to 20 °C, mode heat, heating; may: temperature, mode
     \\  front_door (lock.front_door, lock, guarded): locked; may: lock
@@ -1289,7 +1357,7 @@ test "the_sims_home_reads" {
     try t.expectEqualStrings("The flat (made up by homemcp-sim)", h.name);
     try t.expectEqualStrings("homeassistant", h.hub);
     try t.expectEqualStrings("http://127.0.0.1:8123", h.url);
-    try t.expectEqual(15, h.devices.len);
+    try t.expectEqual(16, h.devices.len);
     try t.expectEqual(5, h.rooms());
     try t.expectEqual(2, h.people.len);
     try t.expectEqualStrings("ben", h.people[1]);
@@ -1303,17 +1371,20 @@ test "the_sims_home_reads" {
     try t.expect(h.find("leaving").?.isGuarded());
     try t.expect(!h.find("back_door").?.acts() and !h.find("back_door").?.isGuarded());
     try t.expectEqualStrings("it also sets lock.front_door, so it is asked about every time", h.find("leaving").?.note);
+    // a smoke alarm: only watched
+    const smoke = h.find("kitchen_smoke_alarm").?;
+    try t.expectEqual(Kind.smoke, smoke.kind);
+    try t.expect(!smoke.acts() and !smoke.isGuarded());
     // left out, with why
-    try t.expectEqual(4, h.left.len);
+    try t.expectEqual(3, h.left.len);
     try t.expectEqualStrings("Front door camera", h.left[0].label);
     try t.expectEqual(Why.camera, h.left[0].why);
-    try t.expectEqual(Why.safety, h.left[1].why);
-    try t.expectEqualStrings("binary_sensor.kitchen_smoke", h.left[1].id);
-    try t.expectEqual(Why.setting, h.left[2].why);
-    try t.expectEqual(Why.unknown, h.left[3].why);
+    try t.expectEqual(Why.setting, h.left[1].why);
+    try t.expectEqual(Why.unknown, h.left[2].why);
     // what check read of each
     readCheck(&h, sim_check);
     try t.expectEqualStrings("dry", h.find("sink_leak").?.state);
+    try t.expectEqualStrings("clear", h.find("kitchen_smoke_alarm").?.state);
     try t.expectEqualStrings("closed", h.find("back_door").?.state);
     try t.expectEqualStrings("19.9 °C, set to 20 °C, mode heat, heating", h.find("hall_thermostat").?.state);
     try t.expect(h.find("sink_leak").?.leakSensor() and h.find("back_door").?.openingSensor());
@@ -1340,6 +1411,7 @@ test "routines_fill_from_the_sims_home" {
     try t.expectEqualStrings("hall_thermostat", p.thermostat.?.name);
     try t.expectEqual(1, p.leaks.len);
     try t.expectEqual(1, p.doors.len);
+    try t.expectEqual(1, p.smokes.len);
     // every routine's files, together, read as harness reads them
     var trig_all: std.ArrayList(u8) = .empty;
     var wfs: std.ArrayList(workflows.Workflow) = .empty;
@@ -1347,9 +1419,10 @@ test "routines_fill_from_the_sims_home" {
     for (all) |r| {
         try t.expect(r.offered(p));
         const f = try routineFiles(a, r, p, "2026-11-23");
-        // no <…> left, no unlock, open or disarm, no camera or smoke
+        // no <…> left, no unlock, open or disarm, no camera; a smoke alarm
+        // only in its own routine (which acts on nothing)
         for ([_][]const u8{ f.workflow, f.triggers, f.rules }) |text| {
-            for ([_][]const u8{ "\"action\": \"unlock\"", "\"action\": \"open\"", "disarm", "camera", "smoke", "#if", "#end" }) |bad| if (std.mem.indexOf(u8, text, bad) != null) {
+            for ([_][]const u8{ "\"action\": \"unlock\"", "\"action\": \"open\"", "disarm", "camera", if (r == .smoke) "\ntool " else "smoke", "#if", "#end" }) |bad| if (std.mem.indexOf(u8, text, bad) != null) {
                 std.debug.print("{s} in {s}:\n{s}\n", .{ bad, r.name(), text });
                 return error.TestUnexpectedResult;
             };
@@ -1372,7 +1445,7 @@ test "routines_fill_from_the_sims_home" {
         std.debug.print("line {d}: {s}\n{s}\n", .{ td.line, td.why, trig_all.items });
         return e;
     };
-    try t.expectEqual(7, tlist.len);
+    try t.expectEqual(8, tlist.len);
     for (wfs.items) |w| {
         var d: workflows.Diag = .{};
         _ = workflows.check(a, w, .{ .triggers = tlist }, &d) catch |e| {
@@ -1410,6 +1483,60 @@ test "routines_fill_from_the_sims_home" {
     try t.expectEqualStrings("Goodnight: when you say goodnight, or at 21:45, I switch off the lights, set the heating to 18 °C and ask with one tap before locking the front door.", try Routine.goodnight.sentence(a, p));
     try t.expectEqualStrings("Leak: when the sink leak finds water, I tell you at once, even at night, and one tap closes the water main.", try Routine.leak.sentence(a, p));
     try t.expectEqualStrings("Doors left open: when the back door stays open for 10 minutes, I tell you.", try Routine.@"door-open".sentence(a, p));
+    // smoke: said at once, nothing acted on
+    const sm = try routineFiles(a, .smoke, p, "2026-11-23");
+    try t.expect(std.mem.indexOf(u8, sm.triggers, "[smoke-kitchen_smoke_alarm]\nmcp = home resource home://device/kitchen_smoke_alarm\nmatch = to is ALARM\nstart = workflow smoke Kitchen smoke alarm, Kitchen\nurgent = yes\n") != null);
+    try t.expect(std.mem.indexOf(u8, sm.workflow, "step tell\nsay Smoke alarm: {input}.") != null);
+    try t.expectEqualStrings("Smoke alarm: when the kitchen smoke alarm goes off, I tell you at once, even at night.", try Routine.smoke.sentence(a, p));
+}
+
+test "the_smoke_routine_fills_for_a_home_with_one" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const home =
+        \\[home]
+        \\name = Flat
+        \\hub = homeassistant
+        \\url = http://127.0.0.1:8123
+        \\[device hall_co_alarm]
+        \\id = binary_sensor.hall_co
+        \\kind = smoke
+        \\room = Hall
+        \\[device hall_voice]
+        \\id = assist_satellite.hall_voice
+        \\kind = satellite
+        \\room = Hall
+        \\allow = announce
+        \\
+    ;
+    const h = try parseHome(a, home);
+    // the household is told when the owner doesn't answer
+    const p = try pick(a, h, .{ .escalate = &.{ .{ .after_s = 300, .member = "anna" }, .{ .after_s = 900, .member = "piotr" } } });
+    try t.expectEqual(1, p.smokes.len);
+    try t.expect(p.speakers);
+    try t.expect(Routine.smoke.offered(p));
+    try t.expectEqualStrings("Smoke alarm: when the hall co alarm goes off, I tell you at once, even at night, and say it on every speaker. If you don't answer in 5 minutes, I tell Anna, then Piotr.", try Routine.smoke.sentence(a, p));
+    const f = try routineFiles(a, .smoke, p, "2026-11-23");
+    var d: workflows.Diag = .{};
+    const w = try workflows.parse(a, "smoke", f.workflow, &d);
+    try t.expect(w.urgent);
+    // nothing to close: no tool step, no question, no fallback
+    for (w.steps) |s| try t.expect(s.action != .tool and s.action != .approve and s.fallback_s == 0);
+    var td: triggers.Diag = .{};
+    const tl = try triggers.parse(a, f.triggers, .triggers, &td);
+    try t.expectEqual(1, tl.len);
+    try t.expect(tl[0].urgent);
+    try t.expectEqualStrings("Smoke alarm: Hall co alarm, Hall.", tl[0].announce);
+    try t.expectEqual(triggers.Speakers.all, tl[0].speakers);
+    // no speakers: nothing to announce with
+    const quiet = try pick(a, try parseHome(a, home[0 .. std.mem.indexOf(u8, home, "[device hall_voice]").?]), .{});
+    try t.expect(!quiet.speakers);
+    const fq = try routineFiles(a, .smoke, quiet, "2026-11-23");
+    try t.expect(std.mem.indexOf(u8, fq.triggers, "announce") == null);
+    try t.expectEqualStrings("Smoke alarm: when the hall co alarm goes off, I tell you at once, even at night.", try Routine.smoke.sentence(a, quiet));
+    // no smoke alarm: not offered
+    try t.expect(!Routine.smoke.offered(try pick(a, try parseHome(a, "[home]\nname = F\n[device lamp]\nid = light.l\nkind = light\nallow = on\n"), .{})));
 }
 
 test "a_template_with_windows_line_ends_fills_as_with_plain_ones" {
@@ -1495,7 +1622,7 @@ test "the_summary_says_what_it_switches_asks_and_leaves" {
     readCheck(&h, sim_check);
     const s = try homeSummary(a, h);
     try t.expectEqualStrings(
-        \\I found 15 devices in 5 rooms, and 2 people.
+        \\I found 16 devices in 5 rooms, and 2 people.
         \\I'll switch lights, plugs, the heating, fans, speakers and scenes when you ask.
         \\I'll ask you every time before the water main, the front door, the garage door and the leaving scene.
         \\I won't touch the front door camera or the kitchen smoke alarm.

@@ -8,6 +8,7 @@ const agents = @import("agents.zig");
 const model = @import("model.zig");
 const mcp = @import("mcp.zig");
 const triggers = @import("triggers.zig");
+const alerts = @import("alerts.zig");
 
 pub const Error = error{ BadConfig, OutOfMemory };
 
@@ -183,6 +184,10 @@ pub const Config = struct {
         /// harness, else on PATH.
         homemcp: []const u8 = "",
         carcloud: []const u8 = "",
+        /// `escalate = 5m anna, 15m piotr`: an urgent alert nobody
+        /// acknowledged goes to these members in turn (a trigger's or a
+        /// workflow's own `escalate` replaces it); none: to no one.
+        escalate: []const alerts.Step = &.{},
     };
 };
 
@@ -257,6 +262,15 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
     for (try lines(arena, text)) |l| {
         if (providerSection(l.section)) |name| {
             try providerLine(arena, &provs, name, l);
+            continue;
+        }
+        // the household's order for urgent alerts: read whole here
+        if (std.mem.eql(u8, l.section, "butler") and std.mem.eql(u8, l.key, "escalate")) {
+            var why: []const u8 = "";
+            cfg.butler.escalate = alerts.parseEscalate(arena, l.value, &why) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.BadEscalate => error.BadConfig,
+            };
             continue;
         }
         var found = false;
@@ -440,6 +454,9 @@ fn setField(sec: anytype, l: Line) Error!void {
                 @field(sec.*, fname) = if (std.ascii.eqlIgnoreCase(l.value, "off")) null else parseClock(l.value) catch return error.BadConfig;
             } else if (comptime std.mem.eql(u8, fname, "quiet")) {
                 @field(sec.*, fname) = if (std.ascii.eqlIgnoreCase(l.value, "off")) null else parseQuiet(l.value) catch return error.BadConfig;
+            } else if (comptime std.mem.eql(u8, fname, "escalate")) {
+                // `parse` reads it (it needs the arena)
+                return error.BadConfig;
             } else switch (ftype) {
                 []const u8 => {
                     // only omnigate's address may be left empty (not set yet)
@@ -707,6 +724,7 @@ pub const defaults_ini =
     \\; quiet = 22:00-07:00                ; quiet hours, your time: posts of schedules, triggers and workflows wait for a digest
     \\; homemcp = /usr/local/bin/homemcp   ; /setup home runs it; default: next to harness, else on PATH
     \\; carcloud = /usr/local/bin/carcloud ; /setup car runs it; the same
+    \\; escalate = 5m anna, 15m piotr      ; an urgent alert you don't answer goes to these members in turn
     \\
     \\[voice_agent]                       ; Home Assistant's voice assistant answered by harness (README: Home Assistant's voice)
     \\; listen = 192.168.1.20:8765         ; for Home Assistant on another machine: this one's LAN address (default: this machine only)
@@ -1278,6 +1296,23 @@ test "voice_settings_read_and_checked" {
     if (!std.mem.startsWith(u8, why, "config.ini line 2 has an error: provider = anthropic ([voice] provider = ")) {
         std.debug.print("got: {s}\n", .{why});
         return error.TestUnexpectedResult;
+    }
+}
+
+test "butler_escalate_reads" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // none until set; harness init's file has the line as a comment
+    try t.expectEqual(0, (try parse(a, "")).butler.escalate.len);
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "; escalate = 5m anna, 15m piotr") != null);
+    const c = try parse(a, "[butler]\nescalate = 5m anna, 15m piotr\n");
+    try t.expectEqual(2, c.butler.escalate.len);
+    try t.expectEqual(900, c.butler.escalate[1].after_s);
+    try t.expectEqualStrings("piotr", c.butler.escalate[1].member);
+    try t.expectEqual(0, (try parse(a, "[butler]\nescalate = no\n")).butler.escalate.len);
+    for ([_][]const u8{ "5m", "anna", "15m piotr, 5m anna", "" }) |v| {
+        try t.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "[butler]\nescalate = {s}\n", .{v})));
     }
 }
 

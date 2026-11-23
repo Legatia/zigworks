@@ -208,6 +208,10 @@ text, err = call("home_set", {"device": "front_door", "action": "lock"})
 check("a guarded device is not reached through home_set", err and "front_door is guarded: use home_guarded" in text, text)
 text, err = call("home_guarded", {"device": "front_door", "action": "unlock"})
 check("unlocking, not on the list, is refused", err and "may not unlock" in text, text)
+if hub == "ha":
+    for tool in ("home_set", "home_guarded"):
+        text, err = call(tool, {"device": "kitchen_smoke_alarm", "action": "off"})
+        check("a smoke alarm is never acted on (" + tool + ")", err and "kitchen_smoke_alarm is a smoke or CO alarm: homemcp only watches it" in text, text)
 poke(names["door"], {"locked": False})
 time.sleep(0.5)
 text, err = call("home_guarded", {"device": "front_door", "action": "lock"})
@@ -282,7 +286,10 @@ check "check: every device through Home Assistant" 'HA_TOKEN=smoke-token "$B" ch
 check "check: changes come in as they happen" 'grep -qxF "Changes come in as they happen (Home Assistant'"'"'s WebSocket API)." "$T/c" && grep -qF "People: anna (person.anna) is home, ben (person.ben) is away." "$T/c"'
 check "check: the speakers that may announce" 'grep -qxF "Speakers that may announce: kitchen_speaker (Kitchen, through tts.piper), hall_voice (Hall)." "$T/c"'
 check "discover writes a home file that check reads" 'HA_TOKEN=smoke-token "$B" discover "http://127.0.0.1:$HA_PORT" >"$T/found.ini" 2>"$T/found.txt" && HA_TOKEN=smoke-token "$B" check "$T/found.ini" >"$T/c2" && grep -q "front_door (lock.front_door, lock, guarded): locked; may: lock" "$T/c2"'
-check "... with safe defaults, and a summary in plain words" 'grep -qxF "Found 16 devices in 5 rooms, and 2 people." "$T/found.txt" && grep -qxF "May announce: Hall voice." "$T/found.txt" && grep -qF "Left out: Front door camera (a camera), Kitchen smoke alarm (a smoke or CO alarm)" "$T/found.txt" && ! grep -q "^id = camera" "$T/found.ini" && grep -qF ";   camera.front_door (Front door camera)" "$T/found.ini"'
+check "... with safe defaults, and a summary in plain words" 'grep -qxF "Found 17 devices in 5 rooms, and 2 people." "$T/found.txt" && grep -qxF "May announce: Hall voice." "$T/found.txt" && grep -qxF "Watched, never acted on: Kitchen smoke alarm." "$T/found.txt" && grep -qF "Left out: Front door camera (a camera), Kettle child lock (a setting)" "$T/found.txt" && ! grep -q "^id = camera" "$T/found.ini" && grep -qF ";   camera.front_door (Front door camera)" "$T/found.ini"'
+check "a smoke alarm is watched: its state read, nothing allowed" 'grep -qF "kitchen_smoke_alarm (binary_sensor.kitchen_smoke, smoke): clear; may: nothing (only watched)" "$T/c2" && grep -qF "kitchen_smoke_alarm (binary_sensor.kitchen_smoke, smoke): clear; may: nothing (only watched)" "$T/c"'
+printf '[home]\nhub = homeassistant\nurl = http://127.0.0.1:%s\n[device smoke]\nid = binary_sensor.kitchen_smoke\nkind = smoke\nallow = off\n' "$HA_PORT" >"$T/smoke-allow.ini"
+check "a home file line that would act on a smoke alarm is refused" '! HA_TOKEN=smoke-token "$B" check "$T/smoke-allow.ini" 2>"$T/err" && grep -qF "a smoke or CO alarm is only watched: nothing may act on it (no allow line)" "$T/err"'
 check "discover without HA_TOKEN says so" '! env -u HA_TOKEN "$B" discover "http://127.0.0.1:$HA_PORT" >/dev/null 2>"$T/err" && grep -q HA_TOKEN "$T/err"'
 check "discover with a wrong token says so" '! HA_TOKEN=wrong "$B" discover "http://127.0.0.1:$HA_PORT" >/dev/null 2>"$T/err" && grep -qF "the token was refused (HA_TOKEN)" "$T/err"'
 check "check: a wrong token is named" '! HA_TOKEN=wrong "$B" check "$T/ha.ini" 2>"$T/err" && grep -q "token was refused" "$T/err"'

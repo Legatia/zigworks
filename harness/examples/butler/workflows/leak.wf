@@ -1,5 +1,6 @@
 # A leak: water where it shouldn't be. Urgent, so it comes through quiet
-# hours; one tap closes the water main. It never opens it.
+# hours; one tap closes the water main. It never opens it. With fallback
+# (setup offers it), nobody on it in 5 minutes closes it all the same.
 workflow leak
 about Water where it shouldn't be: says where at once, even at night<valve words>.
 start <leak starts>
@@ -13,6 +14,9 @@ approve Water leak: {input}.
 yes Close the <valve label>
 no Ignore
 timeout 2h
+#if fallback
+fallback 5m
+#end
 on deny goto ignored
 
 step close
