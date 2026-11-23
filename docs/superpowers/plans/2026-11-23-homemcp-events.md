@@ -80,3 +80,18 @@ Branch `platform/homemcp-events`. Tests first in each step; the whole suite
   cost: a valve named otherwise is offered as a plug; the summary says to
   check plugs.
 - **Version 0.2.0** – new tools surface and file keys – cost: none.
+
+Taken while building:
+
+- **REST answers count too, but never undo a newer state**: what
+  `home_state`, a read-back or a read asks Home Assistant feeds the
+  resources; an answer older than what is known is ignored – a change the
+  WebSocket hasn't brought yet isn't lost, and a slow answer can't roll one
+  back – cost: none seen.
+- **A Home Assistant switch named like a valve** is guarded and may only be
+  switched off; **one named like a garage, gate, door, lock, alarm or
+  siren** is guarded with nothing allowed – a relay can be any of these –
+  cost: such a switch does nothing until the owner adds what to ask for.
+- **The harness check lives in harness's smoke** and runs when homemcp is
+  built next to it (or `HOMEMCP_BIN`) – it needs harness-fake's Telegram –
+  cost: harness's CI job skips it until it builds homemcp first.
