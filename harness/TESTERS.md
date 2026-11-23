@@ -155,6 +155,21 @@ notes):
   them (`/person`), and when they last came up. Ask "move it to
   tomorrow": one question shows the exact change before anything is
   written. During a busy event, the routines' posts wait for its end.
+- **Day 11, errands.** Write "add milk and eggs", and have Anna write
+  "we're out of coffee" in her chat or your group; "what's on the list?"
+  reads it back, "got the milk" takes it off. With a calendar, put in
+  "Groceries" an hour from now: the list comes before it. Write "track"
+  and a parcel's number with its carrier ("track DPD 1000123456789U"): a
+  line when it's out for delivery and when it's delivered; with your
+  mailbox on, the parcels in your delivery mails are found by themselves.
+  If you have a shop's MCP server, `/setup reorder SHOP at 5 items`: the
+  whole order comes to you with its total, and nothing is bought until
+  you tap **Order it**.
+- **Day 12, upkeep.** `/setup upkeep` offers the usual ones (the boiler,
+  filters, the smoke alarms' test; with a car its service, insurance and
+  inspection): tap **Add it**, or reply with when it was last done. A
+  week before something is due, and on the day, one line with **Done**.
+  Write "the boiler was serviced today" when it was. `/upkeep` lists them.
 - **Any day.** `/session` shows the steps behind the last answer; `/quiet`
   what quiet hours hold; `/workflows` the routines that are on.
 
@@ -183,6 +198,11 @@ Tell us about anything like this, with the time it happened:
 - A calendar line at the wrong time (your time zone, summer time), a
   repeating event on the wrong day, or a change made that you didn't ask
   for.
+- Something put on the list that you didn't mean as a list item (or a
+  list item it missed); an order proposal that wasn't the whole order or
+  its real total; anything ordered without your tap.
+- A parcel line twice, late, or for a parcel that isn't yours; an upkeep
+  line on the wrong day, or one that came back after you said it was done.
 
 ## Sending a report
 
@@ -231,6 +251,10 @@ on what you did, what happened, and what you expected.
   cancelling events and answering invitations are asked every time, never
   from a schedule, and only in the calendars you let it change; it never
   accepts or declines an invitation on its own.
+- **Never buys without your tap.** A shop's order is proposed in full
+  (each item, the total, the delivery) and made only when you tap
+  **Order it**, once, within your money caps; your family can add to the
+  shopping list but never order.
 - **Only you approve.** Your family can ask it things; a lock, the garage, a
   valve or money becomes your one-tap question. When they get an alert
   you didn't answer, their only button is **I'm on it**.

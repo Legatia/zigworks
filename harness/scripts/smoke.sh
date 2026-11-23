@@ -880,11 +880,59 @@ else
 	echo "# calmcp isn't built next to harness (or CALMCP_BIN): the calendar's setup and an asked change are skipped"
 fi
 
+# errands: a member adds to the shopping list, an order proposed in full and
+# bought on the owner's tap (harness-fake's shop), a parcel named in a
+# message, upkeep and "serviced today"
+EH="$T/errands"
+HARNESS_HOME="$EH" "$H" init >/dev/null 2>&1
+cat >"$EH/config.ini" <<EOF
+[model]
+url = $URL
+[search]
+url = $URL
+[chat]
+api = $URL
+EOF
+chmod 600 "$EH/config.ini"
+printf '[frisco]\ncommand = "%s" --mcp --shop\nmoney = shop_order\namount = shop_order:total\n' "$F" >"$EH/mcp.ini"
+HARNESS_HOME="$EH" "$H" run >"$T/erun.out" 2>&1 &
+RPID=$!
+wait_for "$T/erun.out" "running on" 15
+ECODE=$(HARNESS_HOME="$EH" "$H" pair | sed -n 's|^/pair ||p')
+say "/pair $ECODE"
+wait_for "$OUT" "I answer only you from now on." 10
+# a member's message, from account 78 in its own chat with the bot
+member() { inbox "{\"message\":{\"from\":{\"id\":78},\"chat\":{\"id\":78,\"type\":\"private\"},\"text\":\"$1\"}}"; }
+say "/member add ola"
+wait_for "$OUT" "Code for ola: " 10
+MCODE=$(grep -o 'Code for ola: [A-Z0-9]*' "$OUT" | tail -n 1 | sed 's/.*: //')
+member "/join $MCODE"
+wait_for "$OUT" "ola joined" 10
+member "add milk, eggs"
+check "a member adds to the shopping list by message" 'wait_for "$OUT" "Added milk and eggs to shopping (2 items)." 10'
+say "/setup reorder frisco at 3 items"
+check "/setup reorder takes the shop's quote and money tools" 'wait_for "$OUT" "Reorders from Frisco are on: when shopping reaches 3 items" 10'
+n0=$(asked)
+member "we're out of coffee"
+check "the list at its size: the whole order proposed to the owner" 'wait_asked_long $((n0 + 1)) && last_question | grep -qF "Order from Frisco: 15.00 PLN, delivery Sat 28 Nov" && last_question | grep -qF "\\n- coffee: coffee (Shop" && [ ! -e "$EH/state/mcp/frisco/orders.jsonl" ]'
+press order
+check "the owner's tap orders it, once, and the list empties" 'wait_for "$OUT" "Ordered from Frisco: 3 items, 15.00 PLN; off shopping." 20 && grep -qF "\"items\":[\"milk\",\"eggs\",\"coffee\"]" "$EH/state/mcp/frisco/orders.jsonl" && [ "$(wc -l <"$EH/state/mcp/frisco/orders.jsonl" | tr -d " ")" = 1 ]'
+say "track my DPD parcel 1000123456789U"
+check "a parcel named in a message is tracked" 'wait_for "$OUT" "Tracking your DPD parcel 1000123456789U" 10 && grep -qF "\"number\":\"1000123456789U\",\"carrier\":\"dpd\"" "$EH/state/deliveries"'
+say "/upkeep add Boiler service every year"
+wait_for "$OUT" "Kept: Boiler service: yearly" 10
+say "the boiler was serviced today"
+check "upkeep: \"serviced today\" in chat counts it done" 'wait_for "$OUT" "Boiler service done today; next due " 10'
+kill "$RPID" 2>/dev/null
+wait "$RPID" 2>/dev/null
+RPID=""
+
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	echo "smoke: FAILED"
 	echo "--- run output"; cat "$T/run.out"
 	[ -f "$T/brun.out" ] && { echo "--- the butler's run output"; cat "$T/brun.out"; }
 	[ -f "$T/crun.out" ] && { echo "--- the calendar's run output"; cat "$T/crun.out"; }
+	[ -f "$T/erun.out" ] && { echo "--- the errands' run output"; cat "$T/erun.out"; }
 	for x in bcheck1 bcheck2 bcheck3 bcheck4; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
 	echo "--- outbox"; cat "$OUT" 2>/dev/null
 	exit 1

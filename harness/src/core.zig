@@ -1142,7 +1142,7 @@ pub const Core = struct {
         c.queue_mutex.lockUncancelable(c.io);
         var queue_locked = true;
         defer if (queue_locked) c.queue_mutex.unlock(c.io);
-        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.diary.reading.load(.acquire)) return "Busy; send /reload again when nothing is running.";
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.diary.reading.load(.acquire) or c.errands.running.load(.acquire)) return "Busy; send /reload again when nothing is running.";
         var fresh: std.heap.ArenaAllocator = .init(c.gpa);
         const saved_cfg = c.cfg;
         const saved_rules = c.rule_list;
@@ -23396,6 +23396,14 @@ const Errands = struct {
     /// Tests: the carriers' pages at this address ("": their own).
     track_url: []const u8,
 
+    /// What starts the errands' own jobs (their who `by`, which rules
+    /// sections and quiet hours read), one constant each, all here. No
+    /// rules are shipped for them.
+    const by_lists = "schedule:lists";
+    const by_reorder = "schedule:reorder";
+    const by_deliveries = "schedule:deliveries";
+    const by_upkeep = "schedule:upkeep";
+
     fn init(gpa: std.mem.Allocator, io: Io, state: []const u8, a: std.mem.Allocator) !Errands {
         return .{
             .gpa = gpa,
@@ -23671,7 +23679,7 @@ const Errands = struct {
             var cb: [8]u8 = undefined;
             const text = std.fmt.allocPrint(a, "{s} at {s}. {s}", .{ ev.title, diary_mod.clock(&cb, ev.start, ev.offset), lists_mod.showText(a, name, list) catch continue }) catch continue;
             c.log.write(.chat, false, .{ .event = "list", .op = "post", .list = name, .count = list.len, .why = "calendar" }) catch {};
-            post(c, a, "schedule:lists", "lists", text);
+            post(c, a, by_lists, "lists", text);
         }
         // the weekly posts
         const st = blk: {
@@ -23687,7 +23695,7 @@ const Errands = struct {
             const list = c.errands.lists.items(a, p.list) catch continue;
             if (once(c, a, key) or list.len == 0) continue;
             c.log.write(.chat, false, .{ .event = "list", .op = "post", .list = p.list, .count = list.len, .why = "weekly" }) catch {};
-            post(c, a, "schedule:lists", "lists", lists_mod.showText(a, p.list, list) catch continue);
+            post(c, a, by_lists, "lists", lists_mod.showText(a, p.list, list) catch continue);
         }
         // reorders at their weekly time, when their list has something
         for (st.shops) |s| {
@@ -23878,7 +23886,7 @@ const Errands = struct {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const by = "schedule:reorder";
+        const by = by_reorder;
         const shop = blk: {
             c.errands.mutex.lockUncancelable(c.io);
             defer c.errands.mutex.unlock(c.io);
@@ -24299,7 +24307,7 @@ const Errands = struct {
             }
             if (said) |text| {
                 c.log.write(.chat, false, .{ .event = "delivery", .op = "line", .carrier = p.carrier, .status = @tagName(status.?) }) catch {};
-                post(c, a, "schedule:deliveries", "deliveries", text);
+                post(c, a, by_deliveries, "deliveries", text);
             }
         }
     }
@@ -24307,7 +24315,7 @@ const Errands = struct {
     /// A carrier's page: its status, null when it couldn't be read. A
     /// `deny fetch` rule on its address stops it.
     fn readPage(c: *Core, a: std.mem.Allocator, url: []const u8, flag: *std.atomic.Value(bool)) ?deliveries_mod.Status {
-        const by = "schedule:deliveries";
+        const by = by_deliveries;
         const d = blk: {
             c.lock.lockUncancelable(c.io);
             defer c.lock.unlock(c.io);
@@ -24503,7 +24511,7 @@ const Errands = struct {
         const now_s = c.now();
         if (c.localMinutes(now_s) < 9 * 60) return;
         const today = c.localDay(now_s);
-        const by = "schedule:upkeep";
+        const by = by_upkeep;
         var st = blk: {
             c.errands.mutex.lockUncancelable(c.io);
             defer c.errands.mutex.unlock(c.io);
@@ -24679,8 +24687,11 @@ const Errands = struct {
     /// Starts the job when something waits for it (Ruling 21); where
     /// harness runs (`poller_on`).
     fn startJob(c: *Core) void {
+        if (c.errands.running.load(.acquire) or !jobDue(c)) return;
+        // under the settings lock: /reload sees it running, or this sees /reload
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
         if (c.restarting.load(.acquire) or c.stop.load(.acquire)) return;
-        if (!jobDue(c)) return;
         if (c.errands.running.swap(true, .acq_rel)) return;
         const th = std.Thread.spawn(.{}, jobThread, .{c}) catch {
             c.errands.running.store(false, .release);
