@@ -48,7 +48,7 @@ pub fn reason(e: anyerror) ?[]const u8 {
     return switch (e) {
         error.BadUrlRule => "an allow rule for fetch or browse takes an address: scheme://host/path, the host a name, *.name or *, like https://*.example.com/*; a port, when given, is a number or *",
         error.BadHostRule => "an allow rule for web takes a host: a name, *.name or *, like *.example.com; a port, when given, is a number or *",
-        error.BadSection => "a section is [all] or a who: owner, schedule:NAME, trigger:NAME, workflow:NAME/STEP, app:NAME, agent:NAME or member:NAME; a kind alone covers all its names, and * works as in rules",
+        error.BadSection => "a section is [all] or a who: owner, schedule:NAME, trigger:NAME, workflow:NAME/STEP, app:NAME, agent:NAME, member:NAME or room:NAME; a kind alone covers all its names, and * works as in rules",
         error.BadEnv => "only shell takes an environment: shell@NAME, the name in a-z, 0-9, - and _",
         else => null,
     };
