@@ -9745,7 +9745,7 @@ pub const Core = struct {
         const spans = c.tripSpans(a, now_s);
         switch (away_mod.decide(st, .{ .now = now_s, .presence = pres, .after_s = @as(i64, c.cfg.butler.away_after) * 60, .trips = spans })) {
             .on => |on| {
-                _ = try c.awayTurnOn(a, st, on, "schedule:away", pres, now_s);
+                _ = try c.awayTurnOn(a, st, on, away_mod.who, pres, now_s);
                 return;
             },
             .off => |why| {
@@ -9897,7 +9897,7 @@ pub const Core = struct {
     fn awayDecide(c: *Core, a: std.mem.Allocator, arg: []const u8) gate.Decision {
         c.lock.lockUncancelable(c.io);
         defer c.lock.unlock(c.io);
-        return c.gate.decide(a, .mcp, arg, c.now(), .{ .scheduled = true, .who = .{ .by = "schedule:away", .agent = "" } });
+        return c.gate.decide(a, .mcp, arg, c.now(), .{ .scheduled = true, .who = .{ .by = away_mod.who, .agent = "" } });
     }
 
     /// One call of homemcp's (`tool`, `input` canonical JSON) by away mode
@@ -9911,16 +9911,16 @@ pub const Core = struct {
         if (mt.money or std.mem.eql(u8, tool, "home_guarded")) return null;
         const arg = std.fmt.allocPrint(a, "home/{s} {s}", .{ tool, input }) catch return null;
         const d = c.awayDecide(a, arg);
-        c.log.write(.gate, false, .{ .run = "away", .by = "schedule:away", .tool = "mcp", .decision = @tagName(d.action), .why = d.why, .arg = arg }) catch {};
+        c.log.write(.gate, false, .{ .run = "away", .by = away_mod.who, .tool = "mcp", .decision = @tagName(d.action), .why = d.why, .arg = arg }) catch {};
         if (d.action != .allow) return null;
         var flag: std.atomic.Value(bool) = .init(false);
         c.register(&flag, "");
         defer c.unregister(&flag);
         const res = mt.server.call(a, tool, input, &flag, 30_000, 64 * 1024) catch |e| {
-            c.log.write(.tool, false, .{ .run = "away", .by = "schedule:away", .tool = tool, .arg = input, .is_error = true, .output = @errorName(e) }) catch {};
+            c.log.write(.tool, false, .{ .run = "away", .by = away_mod.who, .tool = tool, .arg = input, .is_error = true, .output = @errorName(e) }) catch {};
             return null;
         };
-        c.log.write(.tool, false, .{ .run = "away", .by = "schedule:away", .tool = tool, .arg = input, .is_error = res.is_error, .output = util.cut(res.text, 300) }) catch {};
+        c.log.write(.tool, false, .{ .run = "away", .by = away_mod.who, .tool = tool, .arg = input, .is_error = res.is_error, .output = util.cut(res.text, 300) }) catch {};
         return res;
     }
 
@@ -10052,7 +10052,7 @@ pub const Core = struct {
     /// A line of away mode's to main: held in quiet hours like any
     /// schedule's.
     fn postAway(c: *Core, a: std.mem.Allocator, text: []const u8) void {
-        const by = "schedule:away";
+        const by = away_mod.who;
         const private = c.convPrivate("main");
         if (c.quietEnd(by)) |_| held: {
             const masked = c.masks.scrubAlloc(a, text) catch break :held;
@@ -10177,7 +10177,7 @@ pub const Core = struct {
         const p = try butler.pick(a, h, .{});
         const calls = try butler.awayCalls(a, names.items, if (p.thermostat) |th| th.name else null, c.cfg.butler.home_temp);
         const old = c.readOr(a, c.paths.rules);
-        const head = "[schedule:away]\n";
+        const head = away_mod.rules_section ++ "\n";
         const at = std.mem.indexOf(u8, old, head) orelse return "The Away routine's lines aren't in rules: /setup routines offers it.";
         const from = at + head.len;
         const end = std.mem.indexOfPos(u8, old, from, "[all]") orelse return "The Away routine's lines in rules don't end with [all]: fix them by hand, or turn the routine on again.";
@@ -24277,4 +24277,134 @@ test "the_heating_goes_back_before_the_return" {
     try expectHas(try deviceState(&f, "hall_thermostat"), "set to 21 °C");
     tickAt(&f, back - 3600);
     try t.expectEqual(1, f.rec.count("going back"));
+}
+
+/// The stand-ins' home with a doorbell (its lock only locks; the tests
+/// that unlock give it `unlock` as the owner would, by hand).
+const bell_home = stand_in_home ++
+    \\[device front_door_bell]
+    \\kind = doorbell
+    \\room = Hall
+    \\
+;
+
+/// Routine `r` filled for `home` and written as /setup routines writes
+/// it; applied.
+fn withRoutineIn(f: *Fix, home: []const u8, r: butler.Routine, s: butler.Settings) !void {
+    const a = f.e.arena.allocator();
+    var h = try butler.parseHome(a, home);
+    butler.readCheck(&h, stand_in_check);
+    const files = try butler.routineFiles(a, r, try butler.pick(a, h, s), "2026-11-23");
+    try writeWorkflow(f, r.name(), files.workflow);
+    const old_t = Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.triggers, a, .unlimited) catch "";
+    try writeTriggers(f, try std.fmt.allocPrint(a, "{s}\n{s}", .{ old_t, files.triggers }));
+    const old_r = Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.rules, a, .unlimited) catch "";
+    try writeRules(f, try std.fmt.allocPrint(a, "{s}\n{s}", .{ old_r, files.rules }));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try dataFile(f, "home.ini"), .data = home });
+    const said = try f.core.reload();
+    if (!std.mem.eql(u8, said, "Settings reloaded.")) {
+        std.debug.print("reload: {s}\n{s}\n", .{ said, files.workflow });
+        return error.TestUnexpectedResult;
+    }
+}
+
+/// The front door bell rings at `at` ("2026-11-23T14:10:00Z"): both its
+/// triggers read it.
+fn ringAt(f: *Fix, at: []const u8) !void {
+    const a = f.e.arena.allocator();
+    try homeFile(f, "device-front_door_bell.json", try deviceJson(a, "front_door_bell", "Hall", "doorbell", "idle", "ring", at));
+    _ = try f.core.pollNow("doorbell-front_door_bell");
+    _ = try f.core.pollNow("doorbell-away-front_door_bell");
+}
+
+test "the_doorbell_says_who_and_hints_the_parcel" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.core.fixed_now = away_day + 9 * 3600;
+    try withHomeAndMail(&f);
+    try withRoutineIn(&f, bell_home, .doorbell, .{});
+    try homeFile(&f, "device-front_door_bell.json", try deviceJson(a, "front_door_bell", "Hall", "doorbell", "ring", "idle", "2026-11-23T09:00:00Z"));
+    _ = try f.core.pollNow("doorbell-front_door_bell");
+    _ = try f.core.pollNow("doorbell-away-front_door_bell");
+    try mailFile(&f, "list-mine.json", "[{\"id\":\"mine/INBOX/7/1\",\"uid\":1,\"from\":\"DHL Parcel <noreply@dhl.com>\",\"subject\":\"Your parcel arrives today\",\"kind\":\"delivery\"}]");
+    f.core.fixed_now = away_day + 14 * 3600 + 10 * 60;
+    try ringAt(&f, "2026-11-23T14:10:00Z");
+    runWorkflows(&f);
+    try f.rec.waitFor("Someone's at the front door, probably the DHL parcel.");
+    // the stand-ins' lock only locks: no question, nothing to unlock with
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    try t.expectEqual(0, f.rec.count("while you're away"));
+}
+
+test "the_doorbell_unlocks_only_on_the_owners_tap" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.core.fixed_now = away_day + 9 * 3600;
+    try withButler(&f, false);
+    const home = try std.mem.replaceOwned(u8, a, bell_home, "kind = lock\nroom = Hall\nallow = lock\n", "kind = lock\nroom = Hall\nallow = lock, unlock\n");
+    try withRoutineIn(&f, home, .doorbell, .{});
+    try homeFile(&f, "device-front_door_bell.json", try deviceJson(a, "front_door_bell", "Hall", "doorbell", "ring", "idle", "2026-11-23T09:00:00Z"));
+    _ = try f.core.pollNow("doorbell-front_door_bell");
+    try ringAt(&f, "2026-11-23T09:10:00Z");
+    runWorkflows(&f);
+    // one message, its two buttons; nothing unlocked before the tap
+    try f.rec.waitFor("BUTTONS Someone's at the front door. [");
+    try expectHas(try inboxFile(&f), "\"choices\":[{\"key\":\"approve\",\"label\":\"Unlock the door\"},{\"key\":\"deny\",\"label\":\"Leave it\"}]");
+    try expectHas(try deviceState(&f, "front_door"), ": locked");
+    try f.press("approve");
+    runWorkflows(&f);
+    try f.rec.waitFor("Front door unlocked.");
+    try expectHas(try deviceState(&f, "front_door"), ": unlocked");
+    try expectHas(try logText(&f), "\"decision\":\"allow\",\"why\":\"allowed once by the owner (item 1)\"");
+    // the next ring, nobody answers: in 10 minutes it is gone, nothing unlocked
+    _ = try homeCall(&f, "home_guarded", "{\"device\":\"front_door\",\"action\":\"lock\"}");
+    f.core.fixed_now = away_day + 9 * 3600 + 30 * 60;
+    try ringAt(&f, "2026-11-23T09:30:00Z");
+    runWorkflows(&f);
+    try waitCount(&f.rec, "BUTTONS Someone's at the front door. [", 2);
+    tickAt(&f, away_day + 9 * 3600 + 41 * 60);
+    runWorkflows(&f);
+    try expectHas(try deviceState(&f, "front_door"), ": locked");
+    var unlocks: usize = 0;
+    var lines = std.mem.splitScalar(u8, try logText(&f), '\n');
+    while (lines.next()) |l| if (std.mem.indexOf(u8, l, "\"kind\":\"tool\"") != null and std.mem.indexOf(u8, l, "home__home_guarded") != null and std.mem.indexOf(u8, l, "unlock") != null) {
+        unlocks += 1;
+    };
+    try t.expectEqual(1, unlocks);
+}
+
+test "while_away_the_doorbell_is_urgent_without_unlock" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.core.fixed_now = away_day + 9 * 3600;
+    try withButler(&f, false);
+    const home = try std.mem.replaceOwned(u8, a, bell_home, "kind = lock\nroom = Hall\nallow = lock\n", "kind = lock\nroom = Hall\nallow = lock, unlock\n");
+    try withRoutineIn(&f, home, .doorbell, .{});
+    try withRoutineIn(&f, home, .away, .{});
+    try homeFile(&f, "device-front_door_bell.json", try deviceJson(a, "front_door_bell", "Hall", "doorbell", "ring", "idle", "2026-11-23T09:00:00Z"));
+    _ = try f.core.pollNow("doorbell-front_door_bell");
+    _ = try f.core.pollNow("doorbell-away-front_door_bell");
+    _ = try f.core.command(a, "/away on");
+    runWorkflows(&f);
+    try f.press("deny");
+    runWorkflows(&f);
+    // 02:10, in quiet hours, while away
+    f.core.fixed_now = away_day + 26 * 3600 + 10 * 60;
+    try ringAt(&f, "2026-11-24T02:10:00Z");
+    tickAt(&f, away_day + 26 * 3600 + 10 * 60);
+    runWorkflows(&f);
+    // through quiet hours, plainly; no button to unlock: nobody is home to
+    // see who it is
+    try f.rec.waitFor("Someone's at the front door while you're away.");
+    try t.expectEqual(0, f.core.quiet.count());
+    try t.expectEqual(0, f.rec.count("Unlock"));
+    try t.expectEqual(0, f.rec.count("BUTTONS Someone's"));
+    try expectHas(try deviceState(&f, "front_door"), ": locked");
+    try expectHas(fileText(&f, try std.fs.path.join(a, &.{ f.core.paths.state, "away" })), "the front door bell rang");
 }

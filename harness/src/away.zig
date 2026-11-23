@@ -8,6 +8,13 @@ const util = @import("util.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
+/// Who away mode's own work is, to the gate, the log and rules (its
+/// workflow's start line and the routine's rules section name it too, in
+/// examples/butler: away.wf, rules). One place, to be renamed together.
+pub const who = "schedule:away";
+/// The rules section the Away routine writes for it.
+pub const rules_section = "[" ++ who ++ "]";
+
 /// Why away mode is on.
 pub const Why = enum { presence, trip, owner };
 
