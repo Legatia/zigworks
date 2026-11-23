@@ -12,6 +12,10 @@ const config = @import("config.zig");
 const butler = @import("butler.zig");
 const Allocator = std.mem.Allocator;
 
+/// Who the evening's reads are, to the gate and the log (rules sections
+/// `[schedule:evening]` apply to them): the one place this value is.
+pub const who = "schedule:evening";
+
 /// The evening, when quiet hours don't start before 21:30.
 pub const default_at: u16 = 21 * 60;
 /// A message this late is not sent that evening.

@@ -23937,9 +23937,10 @@ test "bedtime_says_one_gentle_line_a_night" {
     try f.core.handleIncoming(inTopic(5001, "Trips", "book the train for Friday"));
     try f.rec.waitIn("trips", "It's past half eleven.");
     try t.expectEqual(2, f.rec.count("It's past"));
-    // a restart keeps the night said
+    // a restart keeps the night said (the clock set again: a core opens on the real one)
     try restart(&f);
     try f.core.setOwner(42);
+    f.core.fixed_now = night + 86400 + 20 * 60;
     try ownerSays(&f, "one more thing");
     try t.expectEqual(2, f.rec.count("It's past"));
     // morning: the night is over
@@ -23988,7 +23989,7 @@ test {
 const Habits = struct {
     const yes_label = "Yes";
     const no_label = "No, and don't ask again";
-    const by = "schedule:habits";
+    const by = habits_mod.who;
 
     /// From the tick where harness runs: the pass on a thread of its own.
     fn due(c: *Core, now_s: i64) void {
@@ -24333,7 +24334,7 @@ test {
 /// and logged; nothing is asked or changed. To main: without a sound in
 /// quiet hours, held while a busy event lasts.
 const Evening = struct {
-    const by = "schedule:evening";
+    const by = evening_mod.who;
 
     /// From the tick where harness runs: the message, when due.
     fn due(c: *Core, now_s: i64) void {
@@ -24640,6 +24641,7 @@ test "the_evening_message_at_its_minute_once" {
     try restart(&f);
     try f.core.setOwner(42);
     try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    f.core.fixed_now = t0 + 10 * 60;
     Evening.due(f.core, f.core.now());
     eveningDone(f.core);
     try t.expectEqual(1, f.rec.count("Tomorrow: Dentist"));

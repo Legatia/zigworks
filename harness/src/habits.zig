@@ -31,6 +31,20 @@ pub const pass_every_days = 7;
 /// A suggestion's item waits this long.
 pub const expires_s = 7 * 86400;
 
+/// Who the week's look is, as its item says (quiet hours hold it as a
+/// schedule's): the one place this value is.
+pub const who = "schedule:habits";
+/// The routine's names: `habit-…` for its workflow and its trigger, and
+/// its one step; its rules section is `[workflow:NAME/act]`
+/// (`rulesSection`).
+pub const name_prefix = "habit";
+pub const step = "act";
+
+/// The rules section of routine `name`'s one step.
+pub fn rulesSection(a: Allocator, name: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "[workflow:{s}/{s}]", .{ name, step });
+}
+
 /// One `home_set` call of the owner's that worked.
 pub const Call = struct {
     /// The owner's day number and minute.
@@ -188,7 +202,7 @@ pub const Pattern = struct {
     /// device, action and value in a-z, 0-9 and `-`, at most 64.
     pub fn name(p: Pattern, a: Allocator) ![]const u8 {
         var o: std.ArrayList(u8) = .empty;
-        try o.appendSlice(a, "habit");
+        try o.appendSlice(a, name_prefix);
         for ([_][]const u8{ p.device, p.action, p.value }) |part| {
             if (part.len == 0) continue;
             try o.append(a, '-');
@@ -396,27 +410,27 @@ pub fn routineFiles(a: Allocator, p: Pattern, date: []const u8) !Files {
         \\tag no
         \\limits steps 5, days 1
         \\
-        \\step act
+        \\step {s}
         \\tool {s}/home_set {s}
         \\on fail goto failed
-        \\if act starts done goto done
+        \\if {s} starts done goto done
         \\
         \\step unsure
-        \\say At {s} I asked to {s}; it hasn't confirmed: {{act}}
+        \\say At {s} I asked to {s}; it hasn't confirmed: {{{s}}}
         \\end
         \\
         \\step done
         \\end
         \\
         \\step failed
-        \\say At {s} I couldn't {s}: {{act.error}}
+        \\say At {s} I couldn't {s}: {{{s}.error}}
         \\
-    , .{ date, ph, at, p.days.words(), name, at, p.days.words(), ph, name, p.server, input.items, at, ph, at, ph });
+    , .{ date, ph, at, p.days.words(), name, at, p.days.words(), ph, name, step, p.server, input.items, step, at, ph, step, at, ph, step });
     var trig: std.ArrayList(u8) = .empty;
     try trig.print(a, "; added by habits {s}: {s} at {s} {s}\n[{s}]\nat = {s}\n", .{ date, ph, at, p.days.words(), name, at });
     if (p.days.line().len > 0) try trig.print(a, "days = {s}\n", .{p.days.line()});
     try trig.print(a, "start = workflow {s}\n", .{name});
-    const rules = try std.fmt.allocPrint(a, "# added by habits {s}: {s} at {s}, this call alone\n[workflow:{s}/act]\nallow mcp {s}/home_set {s}\n[all]\n", .{ date, ph, at, name, p.server, input.items });
+    const rules = try std.fmt.allocPrint(a, "# added by habits {s}: {s} at {s}, this call alone\n{s}\nallow mcp {s}/home_set {s}\n[all]\n", .{ date, ph, at, try rulesSection(a, name), p.server, input.items });
     return .{ .workflow = workflow, .triggers = trig.items, .rules = rules };
 }
 
