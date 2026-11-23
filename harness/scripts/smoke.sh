@@ -513,6 +513,27 @@ check "memory list works offline" '"$H" memory list 2>/dev/null | grep -qF "I pr
 check "snapshot list works offline" '"$H" snapshot list notes 2>/dev/null | grep -qF "Snapshots of notes:"'
 check "agent list works offline" '"$H" agent list 2>/dev/null | grep -qF "researcher: Research across several sources"'
 
+# servers at a url (the stand-in's): one with a token, one with a sign-in
+printf 'mcp-smoke-token-1\n' >"$S/mcp-token"
+printf 'mcp-smoke-token-1\n' | "$H" secret add webtok --stdin 2>/dev/null
+cp "$HARNESS_HOME/mcp.ini" "$T/mcp.ini.saved"
+printf '[fake]\ncommand = "%s" --mcp\n[web]\nurl = %s/mcp/token\ntoken = webtok\n[cloud]\nurl = %s/mcp/signin\nlogin = oauth\n' "$F" "$URL" "$URL" >"$HARNESS_HOME/mcp.ini"
+check "mcp list names each server's kind and its tools" '"$H" mcp list >"$T/mcp-list.out" 2>&1 && grep -qxF "fake (program): 3 tools" "$T/mcp-list.out" && grep -qxF "web (token webtok, stored): 3 tools" "$T/mcp-list.out" && grep -qxF "  web/echo  Echo text back." "$T/mcp-list.out" && grep -qxF "cloud (sign-in, not signed in): harness mcp login cloud" "$T/mcp-list.out"'
+# the owner opens the printed link (harness-fake plays the browser)
+"$H" mcp login cloud >"$T/login.out" 2>&1 &
+LPID=$!
+wait_for "$T/login.out" "/auth/authorize?" 10
+LINK=$(grep -o 'http://127\.0\.0\.1:[0-9]*/auth/authorize?[^ ]*' "$T/login.out" | head -n 1)
+"$F" --browse "$LINK" >"$T/browse.out" 2>&1
+wait_for "$T/login.out" "Signed in to cloud." 10
+kill "$LPID" 2>/dev/null
+wait "$LPID" 2>/dev/null
+check "mcp login prints a link and keeps the tokens in the store" 'grep -qF "No browser here? Forward the port first" "$T/login.out" && grep -qF "Signed in to cloud." "$T/login.out" && grep -qF "Signed in to cloud." "$T/browse.out" && grep -qF "fake-access-" "$HARNESS_STORE/mcp-cloud"'
+check "the tokens are in no file of the data folder and never said" '! grep -rqF "fake-access-" "$HARNESS_HOME" && ! grep -qE "fake-(access|refresh)-" "$T/login.out"'
+check "mcp list says the server is signed in, with its tools" '"$H" mcp list 2>&1 | grep -qxF "cloud (sign-in, signed in): 3 tools"'
+check "mcp logout forgets the tokens" '"$H" mcp logout cloud | grep -qxF "Signed out of cloud." && [ ! -e "$HARNESS_STORE/mcp-cloud" ] && "$H" mcp logout cloud | grep -qxF "cloud was not signed in."'
+cp "$T/mcp.ini.saved" "$HARNESS_HOME/mcp.ini"
+
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	echo "smoke: FAILED"
 	echo "--- run output"; cat "$T/run.out"

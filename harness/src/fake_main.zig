@@ -1,7 +1,9 @@
 //! harness-fake: stand-ins for omnigate, the Telegram Bot API, feeds and
 //! search, for the end-to-end tests. `harness-fake --dir DIR [--port N]`
 //! prints `port N` and serves until killed. `harness-fake --mcp` is an MCP
-//! server on stdio instead (see fake_mcp.zig).
+//! server on stdio instead (see fake_mcp.zig). `harness-fake --browse URL`
+//! is the owner's browser for a sign-in: it opens URL, follows its
+//! redirect to 127.0.0.1, and prints the page's status and text.
 const std = @import("std");
 const fake = @import("fake.zig");
 const fake_mcp = @import("fake_mcp.zig");
@@ -12,6 +14,15 @@ pub fn main(init: std.process.Init) u8 {
     var dir: ?[]const u8 = null;
     var port: u16 = 0;
     if (args.len == 2 and std.mem.eql(u8, args[1], "--mcp")) return fake_mcp.run(io, init.gpa, init.environ_map);
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--browse")) {
+        const page = fake.browse(io, init.arena.allocator(), args[2], .{}) catch |e| {
+            std.debug.print("harness-fake: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        const out = std.fmt.allocPrint(init.arena.allocator(), "{d}\n{s}\n", .{ page.status, page.body }) catch return 1;
+        std.Io.File.stdout().writeStreamingAll(io, out) catch return 1;
+        return if (page.status == 200) 0 else 1;
+    }
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--dir") and i + 1 < args.len) {

@@ -11,6 +11,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const url_mod = @import("url.zig");
+const mcp_http = @import("mcp_http.zig");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
 const proc = @import("proc.zig");
@@ -30,8 +32,23 @@ pub const ServerConfig = struct {
     /// Section name, [a-z0-9_-]{1,32} without "__" (the model sees its
     /// tools as "server__tool").
     name: []const u8,
-    /// Whole command line, split on spaces; "double quotes" group.
+    /// Whole command line, split on spaces; "double quotes" group. ""
+    /// for a server at a url.
     command: []const u8,
+    /// `url =`: a server reached over HTTP (in url.zig's one form), https
+    /// or http to this machine; "" for a program.
+    url: []const u8 = "",
+    /// `token =`: a stored secret sent as `Authorization: Bearer`.
+    token: []const u8 = "",
+    /// `header = Name: value` lines, in order.
+    headers: []const std.http.Header = &.{},
+    /// `login = oauth`: signed in with `harness mcp login NAME`; the
+    /// tokens are the stored secret `mcp-NAME`.
+    login: bool = false,
+    /// `client_id =`: a client registered beforehand (no registration).
+    client_id: []const u8 = "",
+    /// `scope =`: the scopes asked for; "": the server's metadata's.
+    scope: []const u8 = "",
     /// `secret = ENV:storedname, ENV2:name2`
     secrets: []const EnvSecret,
     /// `money = a, b`: tools that move money.
@@ -81,12 +98,115 @@ pub const Amount = union(enum) {
 };
 
 /// What is wrong with an mcp.ini line, when more can be said than that it
-/// does not read.
+/// does not read. (The names are mcp.ini's own: other files' reasons share
+/// `parseProblem`'s chain.)
 pub fn configReason(e: anyerror) ?[]const u8 {
     return switch (e) {
         error.ZeroCap => "0 is not a cap here: write none to lift config.ini's cap for this server, or remove the line to use config.ini's",
+        error.CommandAndUrl => "command and url exclude each other: a server is a program to start or an address to reach",
+        error.TokenAndLogin => "token and login = oauth exclude each other: a server takes a stored token or a sign-in",
+        error.PlainHttpUrl => "url is https, or http only to this machine (localhost, 127.0.0.1 or [::1])",
+        error.BadMcpUrl => "url is the server's address, like https://mcp.example.com/mcp (no name before @, no #)",
+        error.BadMcpHeader => "header = Name: value, at most 8 a server",
+        error.ReservedMcpHeader => "harness sets this header itself: not Authorization (use token = or login = oauth), Host, Content-*, Mcp-*, MCP-Protocol-Version, Accept, Accept-Encoding, Connection, Transfer-Encoding, User-Agent or Last-Event-ID",
+        error.SecretWithUrl => "secret = gives a program its variables; a server at a url takes token = (a stored secret) or login = oauth",
+        error.UrlOnlyKey => "token, header, login, client_id and scope are for a server at a url (url =), not a program",
+        error.SignInOnlyKey => "client_id and scope are for a sign-in (login = oauth)",
+        error.BadLoginValue => "login takes oauth (then: harness mcp login NAME)",
+        error.BadTokenName => "token = the name of a stored secret (harness secret add NAME): a-z, 0-9, - and _",
         else => null,
     };
+}
+
+pub const ConfigError = error{
+    BadConfig,
+    ZeroCap,
+    CommandAndUrl,
+    TokenAndLogin,
+    PlainHttpUrl,
+    BadMcpUrl,
+    BadMcpHeader,
+    ReservedMcpHeader,
+    SecretWithUrl,
+    UrlOnlyKey,
+    SignInOnlyKey,
+    BadLoginValue,
+    BadTokenName,
+    OutOfMemory,
+};
+
+/// How a server is reached and signed in to.
+pub const Kind = enum {
+    /// A program on stdio (`command =`).
+    program,
+    /// At a url with a stored token (`token =`).
+    token,
+    /// At a url with a sign-in (`login = oauth`).
+    signin,
+    /// At a url with neither.
+    url,
+
+    pub fn label(k: Kind) []const u8 {
+        return switch (k) {
+            .program => "program",
+            .token => "token",
+            .signin => "sign-in",
+            .url => "url",
+        };
+    }
+};
+
+pub fn kindOf(cfg: ServerConfig) Kind {
+    if (cfg.url.len == 0) return .program;
+    if (cfg.login) return .signin;
+    if (cfg.token.len > 0) return .token;
+    return .url;
+}
+
+/// The stored secret that holds a server's sign-in: `mcp-NAME` (a server
+/// name is at most 32 characters, so `buf` needs 36).
+pub fn signinSecret(buf: []u8, name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "mcp-{s}", .{name}) catch "mcp-";
+}
+
+/// Most `header =` lines a server takes.
+pub const max_headers = 8;
+
+/// `Name: value`: a header harness doesn't write itself.
+fn parseHeader(value: []const u8) ConfigError!std.http.Header {
+    const colon = std.mem.indexOfScalar(u8, value, ':') orelse return error.BadMcpHeader;
+    const name = std.mem.trim(u8, value[0..colon], " \t");
+    const v = std.mem.trim(u8, value[colon + 1 ..], " \t");
+    if (name.len == 0 or v.len == 0) return error.BadMcpHeader;
+    // a token's characters (RFC 9110)
+    for (name) |c| if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) != null)) return error.BadMcpHeader;
+    for (v) |c| if ((c < 0x20 and c != '\t') or c == 0x7f) return error.BadMcpHeader;
+    if (reservedHeader(name)) return error.ReservedMcpHeader;
+    return .{ .name = name, .value = v };
+}
+
+/// The headers harness writes itself on a request to a server.
+fn reservedHeader(name: []const u8) bool {
+    for ([_][]const u8{ "authorization", "host", "accept", "accept-encoding", "connection", "transfer-encoding", "user-agent", "last-event-id" }) |r| {
+        if (std.ascii.eqlIgnoreCase(name, r)) return true;
+    }
+    // Mcp-Session-Id and MCP-Protocol-Version among them
+    return std.ascii.startsWithIgnoreCase(name, "content-") or std.ascii.startsWithIgnoreCase(name, "mcp-");
+}
+
+/// A server's address: http or https in url.zig's one form, https unless
+/// the host is this machine, no fragment.
+fn parseUrl(arena: std.mem.Allocator, value: []const u8) ConfigError![]const u8 {
+    const u = url_mod.parse(arena, value) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.BadMcpUrl;
+    if (u.fragment.len > 0 or std.mem.indexOfScalar(u8, value, '#') != null) return error.BadMcpUrl;
+    if (!u.https and !isLoopback(u.host)) return error.PlainHttpUrl;
+    return u.href;
+}
+
+/// localhost, 127.0.0.0/8 or [::1] (a host in url.zig's form).
+pub fn isLoopback(host: []const u8) bool {
+    if (std.mem.eql(u8, host, "localhost") or std.mem.eql(u8, host, "[::1]")) return true;
+    return url_mod.isIp(host) and std.mem.startsWith(u8, host, "127.");
 }
 
 /// A server's cap: a whole number above 0, or `none` (0 here: no cap).
@@ -98,9 +218,11 @@ fn parseCap(value: []const u8) error{ BadConfig, ZeroCap }!u32 {
     return n;
 }
 
-/// Servers in the order they appear. Unknown keys, a missing `command`,
-/// bad names and the same server twice are errors.
-pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig, ZeroCap, OutOfMemory }![]ServerConfig {
+/// Servers in the order they appear. Unknown keys, a server with neither
+/// `command` nor `url`, bad names and the same server twice are errors;
+/// a line that clashes with one before it in its section is the error
+/// (so `parseProblem` names it).
+pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) ConfigError![]ServerConfig {
     const ls = try config.lines(arena, text);
     var out: std.ArrayList(ServerConfig) = .empty;
     var i: usize = 0;
@@ -109,24 +231,60 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig,
         if (!validName(name)) return error.BadConfig;
         for (out.items) |o| if (std.mem.eql(u8, o.name, name)) return error.BadConfig;
         var cfg: ServerConfig = .{ .name = name, .command = "", .secrets = &.{}, .money = &.{} };
-        var seen: [6]bool = @splat(false);
+        var headers: std.ArrayList(std.http.Header) = .empty;
+        const keys = [_][]const u8{ "command", "secret", "money", "amount", "max_per_call", "max_per_day", "url", "token", "header", "login", "client_id", "scope" };
+        var seen: [keys.len]bool = @splat(false);
         while (i < ls.len and std.mem.eql(u8, ls[i].section, name)) : (i += 1) {
             const l = ls[i];
-            const keys = [_][]const u8{ "command", "secret", "money", "amount", "max_per_call", "max_per_day" };
             const k = for (keys, 0..) |key, n| {
                 if (std.mem.eql(u8, l.key, key)) break n;
             } else return error.BadConfig;
-            if (seen[k]) return error.BadConfig;
+            // header is said once a line
+            if (seen[k] and k != 8) return error.BadConfig;
             seen[k] = true;
+            // keys of a server at a url, in a program's section (either way round)
+            const url_keys = seen[7] or seen[8] or seen[9] or seen[10] or seen[11];
             switch (k) {
                 0 => {
+                    if (seen[6]) return error.CommandAndUrl;
+                    if (url_keys) return error.UrlOnlyKey;
                     _ = splitCommand(arena, l.value) catch |e| switch (e) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.BadConfig,
                     };
                     cfg.command = l.value;
                 },
+                6 => {
+                    if (seen[0]) return error.CommandAndUrl;
+                    if (seen[1]) return error.SecretWithUrl;
+                    cfg.url = try parseUrl(arena, l.value);
+                },
+                7 => {
+                    if (seen[0]) return error.UrlOnlyKey;
+                    if (seen[9]) return error.TokenAndLogin;
+                    if (!validSecretName(l.value)) return error.BadTokenName;
+                    cfg.token = l.value;
+                },
+                8 => {
+                    if (seen[0]) return error.UrlOnlyKey;
+                    if (headers.items.len >= max_headers) return error.BadMcpHeader;
+                    try headers.append(arena, try parseHeader(l.value));
+                },
+                9 => {
+                    if (seen[0]) return error.UrlOnlyKey;
+                    if (!std.mem.eql(u8, l.value, "oauth")) return error.BadLoginValue;
+                    if (seen[7]) return error.TokenAndLogin;
+                    cfg.login = true;
+                },
+                10, 11 => {
+                    if (seen[0]) return error.UrlOnlyKey;
+                    // client ids and scopes: printable, a client id one word
+                    if (l.value.len == 0 or l.value.len > 512) return error.BadConfig;
+                    for (l.value) |c| if (c < 0x20 or c >= 0x7f or (k == 10 and c == ' ')) return error.BadConfig;
+                    if (k == 10) cfg.client_id = l.value else cfg.scope = l.value;
+                },
                 1 => {
+                    if (seen[6]) return error.SecretWithUrl;
                     var list: std.ArrayList(EnvSecret) = .empty;
                     for (try items(arena, l.value)) |item| {
                         const colon = std.mem.indexOfScalar(u8, item, ':') orelse return error.BadConfig;
@@ -148,7 +306,10 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig,
                 else => unreachable,
             }
         }
-        if (cfg.command.len == 0) return error.BadConfig;
+        if (cfg.command.len == 0 and cfg.url.len == 0) return error.BadConfig;
+        // a client and scopes are a sign-in's
+        if ((cfg.client_id.len > 0 or cfg.scope.len > 0) and !cfg.login) return error.SignInOnlyKey;
+        cfg.headers = headers.items;
         // caps are for money tools: without them they are a mistake
         if ((cfg.max_per_call != null or cfg.max_per_day != null) and cfg.money.len == 0) return error.BadConfig;
         // an amount names money tools: without them it is a mistake
@@ -202,7 +363,8 @@ fn items(arena: std.mem.Allocator, value: []const u8) error{ BadConfig, OutOfMem
     return out.items;
 }
 
-fn validName(name: []const u8) bool {
+/// A server's name: a-z, 0-9, - and _, up to 32, no "__".
+pub fn validName(name: []const u8) bool {
     if (name.len == 0 or name.len > 32 or std.mem.indexOf(u8, name, "__") != null) return false;
     for (name) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_' or c == '-')) return false;
     return true;
@@ -295,14 +457,21 @@ pub const StartOptions = struct {
     /// Where `notifications/resources/updated` goes (a trigger reads the
     /// resource again).
     updated: ?Updated = null,
+    /// A server at a url: how its requests are signed (its token, or its
+    /// sign-in). The process options above are not used for it.
+    auth: Auth = .none,
+    /// A server at a url: the first wait before its GET stream is opened
+    /// again (it doubles up to a minute).
+    stream_backoff_ms: u32 = 1000,
 };
 
+/// How a server at a url signs its requests.
+pub const Auth = mcp_http.Auth;
+
 /// Told a resource the server was asked to watch changed: the server's
-/// name and the resource's uri. Called on the server's reader thread.
-pub const Updated = struct {
-    ctx: *anyopaque,
-    f: *const fn (ctx: *anyopaque, server: []const u8, uri: []const u8) void,
-};
+/// name and the resource's uri. Called on the server's reader thread (a
+/// server at a url: its stream's).
+pub const Updated = mcp_http.Updated;
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
@@ -347,11 +516,16 @@ pub const Server = struct {
     th_out: ?std.Thread = null,
     th_err: ?std.Thread = null,
 
+    /// A server at a url: reached over HTTP; then there is no process and
+    /// the fields above for one are unused.
+    remote: ?*mcp_http.Remote = null,
+
     /// Starts `cfg.command` in its own process group in `opts.cwd`, with
     /// only PATH, HOME, LANG, TERM and the named secrets in its
-    /// environment; then initialize, notifications/initialized and
-    /// tools/list.
+    /// environment (a server at a url: reaches it); then initialize,
+    /// notifications/initialized and tools/list.
     pub fn start(gpa: std.mem.Allocator, io: std.Io, cfg: ServerConfig, opts: StartOptions) !*Server {
+        if (cfg.url.len > 0) return startRemote(gpa, io, cfg, opts);
         if (opts.secret_values.len != cfg.secrets.len) return error.BadSecrets;
         var tmp_state = std.heap.ArenaAllocator.init(gpa);
         defer tmp_state.deinit();
@@ -415,17 +589,77 @@ pub const Server = struct {
         }
         s.th_out = try std.Thread.spawn(.{}, readOut, .{s});
         s.th_err = try std.Thread.spawn(.{}, readErr, .{s});
-        const a = s.arena_state.allocator();
-        s.name = try a.dupe(u8, cfg.name);
-
+        s.name = try s.arena_state.allocator().dupe(u8, cfg.name);
         var never: std.atomic.Value(bool) = .init(false);
-        const stop = opts.stop orelse &never;
-        const deadline = if (opts.deadline_ns > 0) opts.deadline_ns else nowNs(io) + @as(i128, opts.start_timeout_ms) * std.time.ns_per_ms;
+        try s.handshake(tmp, opts.stop orelse &never, startDeadline(io, opts));
+        return s;
+    }
+
+    /// A server at a url: its session, then the same requests as a
+    /// program's; with subscriptions, its GET stream.
+    fn startRemote(gpa: std.mem.Allocator, io: std.Io, cfg: ServerConfig, opts: StartOptions) !*Server {
+        var tmp_state = std.heap.ArenaAllocator.init(gpa);
+        defer tmp_state.deinit();
+        const tmp = tmp_state.allocator();
+        const deadline = startDeadline(io, opts);
+        const s = try gpa.create(Server);
+        s.* = .{
+            .gpa = gpa,
+            .io = io,
+            .arena_state = .init(gpa),
+            .child = undefined,
+            .pid = undefined,
+            .stdin = null,
+            .stdout = undefined,
+            .stderr = undefined,
+            .updated = opts.updated,
+        };
+        errdefer {
+            if (s.remote) |r| {
+                if (opts.diag) |d| {
+                    const w = r.why();
+                    const n = @min(w.len, d.buf.len);
+                    @memcpy(d.buf[0..n], w[0..n]);
+                    d.len = n;
+                }
+                r.end();
+                r.destroy();
+            }
+            s.arena_state.deinit();
+            gpa.destroy(s);
+        }
+        s.name = try s.arena_state.allocator().dupe(u8, cfg.name);
+        s.remote = try mcp_http.Remote.open(gpa, io, .{
+            .name = cfg.name,
+            .url = cfg.url,
+            .headers = cfg.headers,
+            .auth = opts.auth,
+            .updated = opts.updated,
+            .backoff_ms = opts.stream_backoff_ms,
+        });
+        var never: std.atomic.Value(bool) = .init(false);
+        // a failure said: of its kind (the start's note says the rest)
+        s.handshake(tmp, opts.stop orelse &never, deadline) catch |e| return if (e == error.Said) s.remote.?.failure() else e;
+        if (s.subscribes and s.updated != null) s.remote.?.startStream();
+        return s;
+    }
+
+    /// When a start must be over (awake clock, ns).
+    fn startDeadline(io: Io, opts: StartOptions) i128 {
+        return if (opts.deadline_ns > 0) opts.deadline_ns else nowNs(io) + @as(i128, opts.start_timeout_ms) * std.time.ns_per_ms;
+    }
+
+    /// initialize, notifications/initialized and tools/list.
+    fn handshake(s: *Server, tmp: std.mem.Allocator, stop: *std.atomic.Value(bool), deadline: i128) !void {
+        const a = s.arena_state.allocator();
         const init_raw = try s.request(tmp, "initialize", "{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"harness\",\"version\":\"" ++ @import("build_options").version ++ "\"}}", stop, deadline);
         const init_v = jv.parse(tmp, init_raw) orelse return error.BadResponse;
         if (jv.get(init_v, "result") == null) return error.InitFailed;
         s.subscribes = jv.boolean(jv.at(init_v, &.{ "result", "capabilities", "resources", "subscribe" })) orelse false;
-        try s.send(tmp, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+        if (s.remote) |r|
+            try r.notify(tmp, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}", stop, deadline)
+        else
+            try s.send(tmp, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
 
         var list: std.ArrayList(Tool) = .empty;
         var cursor: ?[]const u8 = null;
@@ -461,7 +695,6 @@ pub const Server = struct {
             cursor = next;
         }
         s.tool_list = list.items;
-        return s;
     }
 
     pub fn tools(s: *const Server) []const Tool {
@@ -487,12 +720,12 @@ pub const Server = struct {
         s.call_mutex.lockUncancelable(s.io);
         defer s.call_mutex.unlock(s.io);
         const deadline = nowNs(s.io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
-        const raw = try s.request(arena, "tools/call", params.items, stop, deadline);
+        const raw = s.request(arena, "tools/call", params.items, stop, deadline) catch |e| return s.said(arena, e, max_bytes);
         const v = jv.parse(arena, raw) orelse return error.BadResponse;
         if (jv.get(v, "error")) |e| {
             const msg = jv.str(jv.get(e, "message")) orelse "";
             const code = jv.int(jv.get(e, "code")) orelse 0;
-            return .{ .text = cap(arena, try std.fmt.allocPrint(arena, "error {d}: {s}", .{ code, msg }), max_bytes), .is_error = true };
+            return .{ .text = cap(arena, try s.masked(arena, try std.fmt.allocPrint(arena, "error {d}: {s}", .{ code, msg })), max_bytes), .is_error = true };
         }
         const result = jv.get(v, "result") orelse return error.BadResponse;
         var out: std.ArrayList(u8) = .empty;
@@ -512,7 +745,22 @@ pub const Server = struct {
         if (out.items.len == 0) {
             if (jv.get(result, "structuredContent")) |sc| try out.appendSlice(arena, try std.json.Stringify.valueAlloc(arena, sc, .{}));
         }
-        return .{ .text = cap(arena, out.items, max_bytes), .is_error = jv.boolean(jv.get(result, "isError")) orelse false };
+        return .{ .text = cap(arena, try s.masked(arena, out.items), max_bytes), .is_error = jv.boolean(jv.get(result, "isError")) orelse false };
+    }
+
+    /// A failure a server at a url said, as the call's error; other
+    /// errors as they are.
+    fn said(s: *Server, arena: std.mem.Allocator, e: anyerror, max_bytes: usize) !Result {
+        if (e != error.Said) return e;
+        const r = s.remote orelse return e;
+        return .{ .text = cap(arena, try arena.dupe(u8, r.why()), max_bytes), .is_error = true };
+    }
+
+    /// What a server at a url answered, with its token or sign-in masked
+    /// (one renewed during the call too); a program's as it is.
+    fn masked(s: *Server, arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+        const r = s.remote orelse return text;
+        return r.mask(arena, text);
     }
 
     /// resources/read: the text of its contents joined by "\n" (a blob as
@@ -525,12 +773,12 @@ pub const Server = struct {
         s.call_mutex.lockUncancelable(s.io);
         defer s.call_mutex.unlock(s.io);
         const deadline = nowNs(s.io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
-        const raw = try s.request(arena, "resources/read", params.items, stop, deadline);
+        const raw = s.request(arena, "resources/read", params.items, stop, deadline) catch |e| return s.said(arena, e, max_bytes);
         const v = jv.parse(arena, raw) orelse return error.BadResponse;
         if (jv.get(v, "error")) |e| {
             const msg = jv.str(jv.get(e, "message")) orelse "";
             const code = jv.int(jv.get(e, "code")) orelse 0;
-            return .{ .text = cap(arena, try std.fmt.allocPrint(arena, "error {d}: {s}", .{ code, msg }), max_bytes), .is_error = true };
+            return .{ .text = cap(arena, try s.masked(arena, try std.fmt.allocPrint(arena, "error {d}: {s}", .{ code, msg })), max_bytes), .is_error = true };
         }
         const result = jv.get(v, "result") orelse return error.BadResponse;
         var out: std.ArrayList(u8) = .empty;
@@ -538,7 +786,7 @@ pub const Server = struct {
             if (out.items.len > 0) try out.append(arena, '\n');
             try out.appendSlice(arena, jv.str(jv.get(item, "text")) orelse "[blob]");
         }
-        return .{ .text = cap(arena, out.items, max_bytes), .is_error = false };
+        return .{ .text = cap(arena, try s.masked(arena, out.items), max_bytes), .is_error = false };
     }
 
     /// resources/subscribe: the server says when `uri` changes (`updated`).
@@ -550,18 +798,31 @@ pub const Server = struct {
         s.call_mutex.lockUncancelable(s.io);
         defer s.call_mutex.unlock(s.io);
         const deadline = nowNs(s.io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
-        const raw = try s.request(arena, "resources/subscribe", params.items, stop, deadline);
+        const raw = s.request(arena, "resources/subscribe", params.items, stop, deadline) catch |e| return if (e == error.Said) error.Refused else e;
         const v = jv.parse(arena, raw) orelse return error.BadResponse;
         if (jv.get(v, "error") != null) return error.Refused;
+        // a new session subscribes again
+        if (s.remote) |r| r.remember(uri);
     }
 
-    /// False once the server closed its output (it exited or crashed).
+    /// False once the server closed its output (it exited or crashed);
+    /// a server at a url is there until it is stopped.
     pub fn alive(s: *const Server) bool {
+        if (s.remote != null) return true;
         return !s.eof.load(.acquire);
     }
 
-    /// The end of what the server wrote to stderr.
+    /// A server at a url whose sign-in was refused since it started
+    /// (`harness mcp login NAME` mends it).
+    pub fn signInRefused(s: *const Server) bool {
+        const r = s.remote orelse return false;
+        return r.signInRefused();
+    }
+
+    /// The end of what the server wrote to stderr ("" for a server at a
+    /// url).
     pub fn stderrTail(s: *Server, buf: *[2048]u8) []const u8 {
+        if (s.remote != null) return buf[0..0];
         s.state_mutex.lockUncancelable(s.io);
         defer s.state_mutex.unlock(s.io);
         @memcpy(buf[0..s.err_len], s.err_tail[0..s.err_len]);
@@ -572,13 +833,16 @@ pub const Server = struct {
     /// once; frees nothing (`deinit` still has to follow, unless the
     /// process is ending).
     pub fn kill(s: *Server) void {
+        // a server at a url: its stream ends, nothing else runs here
+        if (s.remote) |r| return r.stopStream();
         killTree(s.pid, &s.job);
     }
 
     /// Closes stdin, gives the server a moment to exit, kills its process
-    /// group, waits for it and frees everything.
+    /// group, waits for it and frees everything (a server at a url: ends
+    /// its stream and deletes its session).
     pub fn deinit(s: *Server) void {
-        s.shutdown();
+        if (s.remote) |r| r.end() else s.shutdown();
         s.free();
     }
 
@@ -624,6 +888,7 @@ pub const Server = struct {
     }
 
     fn free(s: *Server) void {
+        if (s.remote) |r| r.destroy();
         s.job.close();
         if (s.got) |g| s.gpa.free(g);
         s.arena_state.deinit();
@@ -634,6 +899,7 @@ pub const Server = struct {
 
     /// Sends a request and waits for its response line (copied to `arena`).
     fn request(s: *Server, arena: std.mem.Allocator, method: []const u8, params_json: []const u8, stop: *std.atomic.Value(bool), deadline_ns: i128) ![]const u8 {
+        if (s.remote) |r| return r.request(arena, method, params_json, stop, deadline_ns);
         s.state_mutex.lockUncancelable(s.io);
         const id = s.next_id;
         s.next_id += 1;
@@ -782,10 +1048,16 @@ fn validToolName(name: []const u8) bool {
 
 /// Stops servers, each with its group (Windows: its job), and frees them: all are told
 /// together (their stdin closed) and share one grace, so stopping many
-/// takes no longer than stopping one.
+/// takes no longer than stopping one. Servers at a url end their streams
+/// and sessions meanwhile, each on a thread of its own.
 pub fn stopAll(servers: []const *Server) void {
     if (servers.len == 0) return;
     const io = servers[0].io;
+    var ends: [64]?std.Thread = @splat(null);
+    for (servers, 0..) |srv, i| if (srv.remote) |r| {
+        if (i < ends.len) ends[i] = std.Thread.spawn(.{}, mcp_http.Remote.end, .{r}) catch null;
+        if (i >= ends.len or ends[i] == null) r.end();
+    };
     for (servers) |srv| srv.closeInput();
     const until = nowNs(io) + 500 * std.time.ns_per_ms;
     while (nowNs(io) < until) {
@@ -797,10 +1069,9 @@ pub fn stopAll(servers: []const *Server) void {
         if (!open) break;
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    for (servers) |srv| {
-        srv.shutdownWith(0);
-        srv.free();
-    }
+    for (servers) |srv| if (srv.remote == null) srv.shutdownWith(0);
+    for (ends) |th| if (th) |x| x.join();
+    for (servers) |srv| srv.free();
 }
 
 /// The process group on POSIX; the job on Windows (the process alone
@@ -996,6 +1267,146 @@ test "parse_config_takes_only_secret_names_the_store_can_hold" {
             return error.TestUnexpectedResult;
         } else |e| try t.expectEqual(error.BadConfig, e);
     }
+}
+
+test "parse_config_reads_servers_at_a_url" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // the spec's two examples, as written there, and two more
+    const servers = try parseConfig(a,
+        \\[github]
+        \\url = https://api.githubcopilot.com/mcp/
+        \\token = github                 ; a stored secret, sent as Authorization: Bearer
+        \\header = X-MCP-Toolsets: issues,pull_requests   ; repeatable
+        \\
+        \\[atlassian]
+        \\url = https://mcp.atlassian.com/v1/mcp
+        \\login = oauth                  ; sign in once: harness mcp login atlassian
+        \\
+        \\[local]
+        \\url = http://127.0.0.1:8931/mcp
+        \\money = pay
+        \\amount = usd
+        \\max_per_call = 20
+        \\
+        \\[corp]
+        \\url = https://mcp.corp.example/mcp
+        \\login = oauth
+        \\client_id = harness-desktop
+        \\scope = read write
+        \\header = X-Team: tools
+        \\header = X-Region: eu
+    );
+    try t.expectEqual(4, servers.len);
+    const gh = servers[0];
+    try t.expectEqualStrings("https://api.githubcopilot.com/mcp/", gh.url);
+    try t.expectEqualStrings("", gh.command);
+    try t.expectEqualStrings("github", gh.token);
+    try t.expectEqual(1, gh.headers.len);
+    try t.expectEqualStrings("X-MCP-Toolsets", gh.headers[0].name);
+    try t.expectEqualStrings("issues,pull_requests", gh.headers[0].value);
+    try t.expectEqual(Kind.token, kindOf(gh));
+    try t.expect(servers[1].login);
+    try t.expectEqual(Kind.signin, kindOf(servers[1]));
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("mcp-atlassian", signinSecret(&buf, "atlassian"));
+    // http to this machine; the money keys as for a program
+    const local = servers[2];
+    try t.expectEqual(Kind.url, kindOf(local));
+    try t.expectEqualStrings("pay", local.money[0]);
+    try t.expectEqualStrings("usd", local.amount.of("pay").name);
+    try t.expectEqual(20, local.max_per_call.?);
+    const corp = servers[3];
+    try t.expectEqualStrings("harness-desktop", corp.client_id);
+    try t.expectEqualStrings("read write", corp.scope);
+    try t.expectEqual(2, corp.headers.len);
+    try t.expectEqualStrings("X-Region", corp.headers[1].name);
+    try t.expectEqualStrings("eu", corp.headers[1].value);
+    // a program is still a program
+    try t.expectEqual(Kind.program, kindOf((try parseConfig(a, "[p]\ncommand = x\n"))[0]));
+    for ([_][]const u8{ "http://localhost:3000/mcp", "http://[::1]:3000/mcp", "http://127.0.0.2/mcp", "HTTPS://MCP.Example.com/x?team=1" }) |u| {
+        const one = try parseConfig(a, try std.fmt.allocPrint(a, "[s]\nurl = {s}\n", .{u}));
+        try t.expectEqual(Kind.url, kindOf(one[0]));
+    }
+}
+
+test "parse_config_refuses_bad_remote_lines" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const nine = "header = A: 1\nheader = B: 2\nheader = C: 3\nheader = D: 4\nheader = E: 5\nheader = F: 6\nheader = G: 7\nheader = H: 8\nheader = I: 9\n";
+    for ([_]struct { []const u8, anyerror }{
+        .{ "[a]\nurl = ftp://h.example/mcp\n", error.BadMcpUrl },
+        .{ "[a]\nurl = https://h.example/mcp#part\n", error.BadMcpUrl },
+        .{ "[a]\nurl = https://user@h.example/mcp\n", error.BadMcpUrl },
+        .{ "[a]\nurl = http://10.0.0.5/mcp\n", error.PlainHttpUrl },
+        .{ "[a]\nurl = http://localhost.example.com/mcp\n", error.PlainHttpUrl },
+        .{ "[a]\nurl = https://h.example/mcp\nsecret = K:gh\n", error.SecretWithUrl },
+        .{ "[a]\nsecret = K:gh\nurl = https://h.example/mcp\n", error.SecretWithUrl },
+        .{ "[a]\ncommand = x\ntoken = gh\n", error.UrlOnlyKey },
+        .{ "[a]\ntoken = gh\ncommand = x\n", error.UrlOnlyKey },
+        .{ "[a]\ncommand = x\nheader = X-A: b\n", error.UrlOnlyKey },
+        .{ "[a]\ncommand = x\nlogin = oauth\n", error.UrlOnlyKey },
+        .{ "[a]\nurl = https://h.example/mcp\nlogin = yes\n", error.BadLoginValue },
+        .{ "[a]\nurl = https://h.example/mcp\nclient_id = c1\n", error.SignInOnlyKey },
+        .{ "[a]\nurl = https://h.example/mcp\nscope = read\n", error.SignInOnlyKey },
+        .{ "[a]\nurl = https://h.example/mcp\ntoken = Bad Name\n", error.BadTokenName },
+        .{ "[a]\nurl = https://h.example/mcp\ntoken = ../config.ini\n", error.BadTokenName },
+        .{ "[a]\nurl = https://h.example/mcp\nlogin = oauth\ntoken = gh\n", error.TokenAndLogin },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = NoColon\n", error.BadMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = : v\n", error.BadMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = Bad Name: v\n", error.BadMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = X-Empty:\n", error.BadMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\n" ++ nine, error.BadMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = host: evil.example\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = Content-Type: text/plain\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = Mcp-Session-Id: s1\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = MCP-Protocol-Version: 2024-11-05\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = Accept: */*\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = User-Agent: x\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = Connection: close\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nurl = https://h.example/x\n", error.BadConfig },
+        .{ "[a]\nurl = https://h.example/mcp\ntoken = a1\ntoken = b2\n", error.BadConfig },
+        .{ "[a]\nurl = https://h.example/mcp\nlogin = oauth\nclient_id = has space\n", error.BadConfig },
+        .{ "[a]\nurl = https://h.example/mcp\nlogin = oauth\nscope = \n", error.BadConfig },
+    }) |c| {
+        if (parseConfig(a, c[0])) |_| {
+            std.debug.print("accepted: {s}\n", .{c[0]});
+            return error.TestUnexpectedResult;
+        } else |e| {
+            if (e != c[1]) std.debug.print("{s}: {s}, not {s}\n", .{ c[0], @errorName(e), @errorName(c[1]) });
+            try t.expectEqual(c[1], e);
+        }
+        // each says what is wrong
+        if (c[1] != error.BadConfig) try t.expect(configReason(c[1]) != null);
+    }
+}
+
+test "bad_mcp_ini_sections_name_their_line" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const parseProblem = @import("core.zig").parseProblem;
+    for ([_][2][]const u8{
+        // command and url
+        .{ "[a]\ncommand = x\nurl = https://mcp.example.com/mcp\n", "mcp.ini line 3 has an error: url = https://mcp.example.com/mcp (command and url exclude each other" },
+        // token and login
+        .{ "; remote\n[a]\nurl = https://mcp.example.com/mcp\ntoken = gh\nlogin = oauth\n", "mcp.ini line 5 has an error: login = oauth (token and login = oauth exclude each other" },
+        // http to a host that is not this machine
+        .{ "[ok]\nurl = http://127.0.0.1:9/mcp\n[a]\nurl = http://mcp.example.com/mcp\n", "mcp.ini line 4 has an error: url = http://mcp.example.com/mcp (url is https, or http only to this machine" },
+        // a header harness sets itself
+        .{ "[a]\nurl = https://mcp.example.com/mcp\nheader = X-Toolsets: issues\nheader = Authorization: Bearer sk-live-4417aa\n", "mcp.ini line 4 has an error: header = Authorization: … (harness sets this header itself" },
+    }) |c| {
+        const why = (try parseProblem(a, "mcp.ini", c[0], parseConfig)) orelse return error.TestUnexpectedResult;
+        if (!std.mem.startsWith(u8, why, c[1])) std.debug.print("said: {s}\n", .{why});
+        try t.expect(std.mem.startsWith(u8, why, c[1]));
+        // a header's value is never said back (it may be a token)
+        try t.expect(std.mem.indexOf(u8, why, "sk-live-4417aa") == null);
+    }
+    // the header line says what to use instead
+    const auth = (try parseProblem(a, "mcp.ini", "[a]\nurl = https://mcp.example.com/mcp\nheader = Authorization: Bearer x\n", parseConfig)).?;
+    try t.expect(std.mem.indexOf(u8, auth, "token =") != null);
 }
 
 const fake_path = if (@import("builtin").is_test) @import("build_options").fake_path else "";

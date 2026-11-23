@@ -2745,6 +2745,8 @@ pub const Core = struct {
         srv: ?*mcp.Server = null,
         err: anyerror = error.NotStarted,
         diag: mcp.Diag = .{},
+        /// A server at a url: its token or its sign-in.
+        auth: mcp.Auth = .none,
 
         fn run(st: *McpStart) void {
             const c = st.core;
@@ -2759,6 +2761,7 @@ pub const Core = struct {
                 .diag = &st.diag,
                 .stop = st.stop,
                 .updated = .{ .ctx = c, .f = resourceUpdated },
+                .auth = st.auth,
             }) catch |e| {
                 st.err = e;
                 return;
@@ -2812,6 +2815,23 @@ pub const Core = struct {
                 break;
             };
             if (st.skipped != null) continue;
+            // a server at a url: its stored token, or its sign-in
+            switch (mcp.kindOf(sc)) {
+                .token => st.auth = .{ .token = .{ .name = sc.token, .value = c.secretValue(a, sc.token) orelse {
+                    st.skipped = std.fmt.allocPrint(a, "token \"{s}\" is not stored (harness secret add {s})", .{ sc.token, sc.token }) catch "its token is not stored";
+                    continue;
+                } } },
+                .signin => {
+                    var nb: [40]u8 = undefined;
+                    const signed = if (c.store) |store| (store.get(c.io, a, mcp.signinSecret(&nb, sc.name)) catch null) != null else false;
+                    if (!signed) {
+                        st.skipped = std.fmt.allocPrint(a, "not signed in (harness mcp login {s})", .{sc.name}) catch "not signed in";
+                        continue;
+                    }
+                    st.auth = .{ .signin = .{ .store = c.store.?, .masks = &c.masks } };
+                },
+                else => {},
+            }
             st.values = values;
             st.dir = c.mcpDir(a, sc.name) catch |e| {
                 st.skipped = std.fmt.allocPrint(a, "did not start (its folder: {s})", .{@errorName(e)}) catch "did not start";
@@ -2871,6 +2891,20 @@ pub const Core = struct {
         c.mcp_tools = all.items;
         c.mcp_note = note.items;
         c.mcp_warn = warn.items;
+    }
+
+    /// What /status says of the MCP servers: what started, and the
+    /// servers at a url whose sign-in was refused since.
+    fn mcpStatus(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, std.mem.trimEnd(u8, c.mcp_note, "\n"));
+        c.mcp_mutex.lockUncancelable(c.io);
+        defer c.mcp_mutex.unlock(c.io);
+        for (c.mcp_servers.items) |srv| if (srv.signInRefused()) {
+            if (out.items.len > 0) try out.append(a, '\n');
+            try out.print(a, "{s}: the sign-in was refused (harness mcp login {s})", .{ srv.name, srv.name });
+        };
+        return out.items;
     }
 
     /// A client for a model value: "PROVIDER:MODEL", or a model of
@@ -6660,6 +6694,7 @@ pub const Core = struct {
             // folders that got no snapshot, and why
             var snap_note = std.mem.trimEnd(u8, try c.snaps.note(a), "\n");
             snap_note = try std.mem.replaceOwned(u8, a, snap_note, "\n", "; ");
+            const mcp_text = try c.mcpStatus(a);
             return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.\nProviders: {s}.{s}{s}{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
                 onOff(c.switches.auto_recall.load(.acquire)), onOff(c.convPrivate(conv)),
@@ -6667,8 +6702,8 @@ pub const Core = struct {
                 if (c.browser.len == 0) "none found" else "found",
                 c.login_list.len,
                 try c.providers.describe(a, &.{ c.cfg.model.model, c.cfg.model.worker_model, c.cfg.model.memory_model }),
-                if (c.mcp_note.len > 0) "\nMCP: " else "",
-                std.mem.trimEnd(u8, c.mcp_note, "\n"),
+                if (mcp_text.len > 0) "\nMCP: " else "",
+                mcp_text,
                 if (snap_note.len > 0) "\nSnapshots: " else "",
                 snap_note,
             });
@@ -8807,7 +8842,13 @@ pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, co
     // what the parser says of that line (the lines up to it are fine)
     _ = scratch.reset(.retain_capacity);
     const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e) orelse folders_mod.reason(e) orelse environments_mod.reason(e) orelse config.reason(e);
-    return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
+    var shown = std.mem.trim(u8, line, " \t\r");
+    // a header's value is never said back: it may be a token
+    if (std.mem.startsWith(u8, shown, "header")) if (std.mem.indexOfScalar(u8, shown, '=')) |eq| if (std.mem.trim(u8, shown["header".len..eq], " \t").len == 0) {
+        const colon = std.mem.indexOfScalarPos(u8, shown, eq, ':') orelse eq;
+        shown = try std.fmt.allocPrint(a, "{s} …", .{shown[0 .. colon + 1]});
+    };
+    return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(shown, 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
 }
 
 /// The first line of `text` that does not read: the one after the longest
@@ -12254,6 +12295,120 @@ test "mcp_servers_start_together_under_one_deadline" {
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "mute: did not start (Timeout)") != null);
     // in mcp.ini's order
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "one").? < std.mem.indexOf(u8, f.core.mcp_note, "two").?);
+}
+
+test "http_mcp_tools_list_and_call_through_the_gate" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // the stand-in's servers: one answering JSON, one event streams
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[web]\nurl = {s}/mcp/json\n[live]\nurl = {s}/mcp/sse\n", .{ try f.e.url(), try f.e.url() }) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp web/echo *\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.core.handleText("/status");
+    try f.rec.waitFor("MCP: web (3 tools)");
+    try f.rec.waitFor("live (3 tools)");
+    // allowed by a rule: runs; with no rule: asked, as a program's tool
+    try f.e.script(1, model.toolReply("tu_1", "web__echo", "{\"text\":\"from the web\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "live__echo", "{\"text\":\"from the stream\"}"));
+    try f.e.script(3, model.textReply("both done"));
+    try f.core.startWorker();
+    try f.core.handleText("use both");
+    try f.rec.waitFor("BUTTONS Allow this?");
+    try f.rec.waitFor("live__echo: live/echo");
+    try f.press("once");
+    try f.rec.waitFor("both done");
+    const first = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, first, "\"name\":\"web__echo\"") != null);
+    try t.expect(std.mem.indexOf(u8, first, "\"content\":\"from the web\"") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "\"content\":\"from the stream\"") != null);
+    // the log names them as it names a program's
+    const log = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, log, "\"tool\":\"web__echo\"") != null);
+    try t.expect(std.mem.indexOf(u8, log, "\"event\":\"mcp started\",\"server\":\"live\"") != null);
+}
+
+test "token_and_headers_are_sent_and_never_logged" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const token = "mcp-test-token-1";
+    // stored after the start: read on /reload, and masked from then on
+    const secrets_dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" });
+    f.core.store = .{ .dir = secrets_dir };
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[web]\nurl = {s}/mcp/token\ntoken = web-token\nheader = X-Team: tools\n", .{try f.e.url()}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp web/echo *\n" });
+    // not stored yet: not started, and said so
+    _ = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "web: token \"web-token\" is not stored (harness secret add web-token)") != null);
+    try f.core.store.?.put(t.io, "web-token", token);
+    _ = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "web (3 tools)") != null);
+    // the server says back the Authorization it got: masked in the model's request
+    try f.e.script(1, model.toolReply("tu_1", "web__echo", "{\"text\":\"auth\"}"));
+    try f.e.script(2, model.textReply("checked"));
+    try f.core.startWorker();
+    try f.core.handleText("what does it see");
+    try f.rec.waitFor("checked");
+    const req = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req, "Bearer [secret:web-token]") != null);
+    try t.expect(std.mem.indexOf(u8, req, token) == null);
+    // sent with the header lines, as written
+    const sent = try f.e.tmp.dir.readFileAlloc(t.io, "mcp-requests.jsonl", a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, sent, "\"Authorization\":\"Bearer " ++ token ++ "\"") != null);
+    try t.expect(std.mem.indexOf(u8, sent, "\"X-Team\":\"tools\"") != null);
+    // in no log line, no item, no message
+    try t.expect(std.mem.indexOf(u8, try logText(&f), token) == null);
+    try t.expectEqual(0, f.rec.count(token));
+}
+
+test "a_sign_in_server_starts_signed_in_and_status_says_when_not" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const oauth = @import("oauth.zig");
+    const fake = @import("fake.zig");
+    f.core.store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    const server = try std.fmt.allocPrint(a, "{s}/mcp/signin", .{try f.e.url()});
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[cloud]\nurl = {s}\nlogin = oauth\n", .{server}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp cloud/echo *\n" });
+    // not signed in: not started, and /status says what to do
+    _ = try f.core.reload();
+    try f.core.handleText("/status");
+    try f.rec.waitFor("cloud: not signed in (harness mcp login cloud)");
+    // signed in from the terminal, then /reload
+    var b: fake.Browser = .{ .io = t.io };
+    var said: []const u8 = "";
+    const tokens = try oauth.login(t.allocator, t.io, a, .{ .name = "cloud", .url = server, .link = .{ .ctx = &b, .f = fake.Browser.opened } }, &said);
+    b.join();
+    try oauth.save(t.io, t.allocator, f.core.store.?, "mcp-cloud", tokens);
+    _ = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "cloud (3 tools)") != null);
+    // the token it says back is masked in what the model sees
+    try f.e.script(1, model.toolReply("tu_1", "cloud__echo", "{\"text\":\"auth\"}"));
+    try f.e.script(2, model.textReply("seen"));
+    try f.core.startWorker();
+    try f.core.handleText("what does it get");
+    try f.rec.waitFor("seen");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "Bearer [secret:mcp-cloud]") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), tokens.access_token) == null);
+    // refused (the refresh token too): said in the call, and in /status
+    f.e.server.mcp.revokeRefresh();
+    f.e.server.mcp.expireTokens();
+    try f.e.script(3, model.toolReply("tu_2", "cloud__echo", "{\"text\":\"again\"}"));
+    try f.e.script(4, model.textReply("refused"));
+    try f.core.handleText("once more");
+    try f.rec.waitFor("refused");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "cloud refused the sign-in: harness mcp login cloud") != null);
+    try f.core.handleText("/status");
+    try f.rec.waitFor("cloud: the sign-in was refused (harness mcp login cloud)");
+    // no token in the log
+    const log = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, log, tokens.access_token) == null);
+    try t.expect(std.mem.indexOf(u8, log, tokens.refresh_token) == null);
 }
 
 test "reload_holds_no_lock_while_servers_start_and_stop_cuts_it_short" {
