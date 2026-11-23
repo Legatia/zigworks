@@ -550,27 +550,25 @@ pub const Store = struct {
         s.mutex.lockUncancelable(s.io);
         defer s.mutex.unlock(s.io);
         if (conversation.len == 0) return null;
+        const table = try s.headsLocked(arena);
         var runs: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
-        const root = try std.fs.path.join(arena, &.{ s.dir, "folders" });
-        var d = Io.Dir.cwd().openDir(s.io, root, .{ .iterate = true }) catch return null;
-        defer d.close(s.io);
-        var it = d.iterate();
-        while (try it.next(s.io)) |e| {
-            if (e.kind != .directory) continue;
-            const fdir = try std.fs.path.join(arena, &.{ root, e.name });
-            for (try s.ids(arena, fdir)) |id| {
-                const h = s.header(arena, fdir, id) catch continue;
-                if (h.when == .after and h.rid > 0 and std.mem.eql(u8, h.conversation, conversation)) try runs.put(arena, h.rid, {});
-            }
-        }
+        for (table) |fo| for (fo.heads) |hd| {
+            if (hd.h.when == .after and hd.h.rid > 0 and std.mem.eql(u8, hd.h.conversation, conversation)) try runs.put(arena, hd.h.rid, {});
+        };
         const rids = try arena.dupe(u64, runs.keys());
         std.mem.sort(u64, rids, {}, std.sort.desc(u64));
-        for (rids) |rid| for (try s.pairsLocked(arena, rid)) |p| {
+        for (rids) |rid| for (try pairsIn(arena, table, rid)) |p| {
             const after = p.after orelse continue;
+            // its "after" counted what changed since the snapshot just
+            // before it: the run's own "before", or one gone or between
             const before = p.before orelse {
                 if (p.changed > 0) return rid;
                 continue;
             };
+            if (before + 1 == after) {
+                if (p.changed > 0) return rid;
+                continue;
+            }
             const fdir = try s.folderDir(arena, p.name);
             const b = s.load(arena, fdir, before) catch continue;
             const af = s.load(arena, fdir, after) catch continue;
@@ -584,8 +582,17 @@ pub const Store = struct {
     /// or one a helper of it took) and its "after" in each, null where
     /// gone. A helper's own number finds nothing.
     fn pairsLocked(s: *Store, arena: std.mem.Allocator, rid: u64) ![]const Pair {
-        var out: std.ArrayList(Pair) = .empty;
-        if (rid == 0) return out.items;
+        return pairsIn(arena, try s.headsLocked(arena), rid);
+    }
+
+    /// A snapshot's header and id.
+    const Head = struct { id: u64, h: Header };
+    /// A folder's snapshot headers, oldest first.
+    const Heads = struct { heads: []const Head };
+
+    /// Every folder's snapshot headers, read once.
+    fn headsLocked(s: *Store, arena: std.mem.Allocator) ![]const Heads {
+        var out: std.ArrayList(Heads) = .empty;
         const root = try std.fs.path.join(arena, &.{ s.dir, "folders" });
         var d = Io.Dir.cwd().openDir(s.io, root, .{ .iterate = true }) catch return out.items;
         defer d.close(s.io);
@@ -593,28 +600,10 @@ pub const Store = struct {
         while (try it.next(s.io)) |e| {
             if (e.kind != .directory) continue;
             const fdir = try std.fs.path.join(arena, &.{ root, e.name });
-            var p: Pair = .{ .name = "" };
-            for (try s.ids(arena, fdir)) |id| {
-                const h = s.header(arena, fdir, id) catch continue;
-                const mine = switch (h.when) {
-                    .after => h.rid == rid,
-                    .before => (h.rid == rid and h.parent == 0) or h.parent == rid,
-                    .hand, .tool => false,
-                };
-                if (!mine) continue;
-                p.name = h.folder;
-                if (h.when == .after) {
-                    p.after = id;
-                    p.changed = h.changed;
-                } else if (p.after == null) p.before = id;
-            }
-            if (p.name.len > 0) try out.append(arena, p);
+            var heads: std.ArrayList(Head) = .empty;
+            for (try s.ids(arena, fdir)) |id| try heads.append(arena, .{ .id = id, .h = s.header(arena, fdir, id) catch continue });
+            if (heads.items.len > 0) try out.append(arena, .{ .heads = heads.items });
         }
-        std.mem.sort(Pair, out.items, {}, struct {
-            fn lt(_: void, x: Pair, y: Pair) bool {
-                return std.mem.lessThan(u8, x.name, y.name);
-            }
-        }.lt);
         return out.items;
     }
 
@@ -1126,6 +1115,37 @@ fn sorted(arena: std.mem.Allocator, names: []const []const u8) ![]const []const 
         }
     }.lt);
     return out;
+}
+
+/// Run `rid`'s pair in each folder of `table` (see `Store.pairsLocked`),
+/// by folder name.
+fn pairsIn(arena: std.mem.Allocator, table: []const Store.Heads, rid: u64) ![]const Store.Pair {
+    var out: std.ArrayList(Store.Pair) = .empty;
+    if (rid == 0) return out.items;
+    for (table) |fo| {
+        var p: Store.Pair = .{ .name = "" };
+        for (fo.heads) |hd| {
+            const h = hd.h;
+            const mine = switch (h.when) {
+                .after => h.rid == rid,
+                .before => (h.rid == rid and h.parent == 0) or h.parent == rid,
+                .hand, .tool => false,
+            };
+            if (!mine) continue;
+            p.name = h.folder;
+            if (h.when == .after) {
+                p.after = hd.id;
+                p.changed = h.changed;
+            } else if (p.after == null) p.before = hd.id;
+        }
+        if (p.name.len > 0) try out.append(arena, p);
+    }
+    std.mem.sort(Store.Pair, out.items, {}, struct {
+        fn lt(_: void, x: Store.Pair, y: Store.Pair) bool {
+            return std.mem.lessThan(u8, x.name, y.name);
+        }
+    }.lt);
+    return out.items;
 }
 
 /// What changed from `old` to `now` (`before`: `old`'s id).
@@ -1884,11 +1904,19 @@ test "the_newest_run_with_changes_of_a_conversation" {
     try t.expectEqual(41, (try f.store.newestRun(a, "main")).?);
     try t.expectEqual(43, (try f.store.newestRun(a, "house-search")).?);
     try t.expectEqual(null, try f.store.newestRun(a, "elsewhere"));
+    // runs that overlap: run 51's pair falls between run 50's halves, so
+    // 50's "after" counts nothing new, yet 50's pair holds a change
+    try in.snap(&f, .before, 50, "main");
+    try in.snap(&f, .before, 51, "house-search");
+    try f.put("b.md", "b");
+    try in.snap(&f, .after, 51, "house-search");
+    try in.snap(&f, .after, 50, "main");
+    try t.expectEqual(50, (try f.store.newestRun(a, "main")).?);
     // a run whose "before" is gone still counts by its "after"
-    try in.snap(&f, .before, 47, "main");
+    try in.snap(&f, .before, 60, "main");
     try f.put("a.md", "3");
-    try in.snap(&f, .after, 47, "main");
+    try in.snap(&f, .after, 60, "main");
     const fs = try folders.parse(a, "[src]\nsnapshots = 1\n");
     _ = try f.store.prune(a, &fs);
-    try t.expectEqual(47, (try f.store.newestRun(a, "main")).?);
+    try t.expectEqual(60, (try f.store.newestRun(a, "main")).?);
 }
