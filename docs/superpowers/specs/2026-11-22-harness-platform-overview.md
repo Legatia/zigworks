@@ -367,7 +367,10 @@ After phase 0 lands: environments in the gate (`shell@ENV`, pins,
 Merged from the eight specs. The others are settled as calls in their
 specs, marked "settled".
 
-1. Email (conversations, triggers): the agent's own address you forward
+1. **Answered 2026-11-23: "A and C opt-in"** — the butler's own address,
+   and the owner's mailbox read-only with drafts, off until turned on
+   (`2026-11-23-harness-email-design.md`). The question was: Email
+   (conversations, triggers): the agent's own address you forward
    to, or your mailbox? Own: your threads are conversations; harness sees
    only what you forward. Yours: mail triggers read your whole INBOX,
    read-only; no email conversations.

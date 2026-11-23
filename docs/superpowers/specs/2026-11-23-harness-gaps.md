@@ -9,7 +9,7 @@ each waits on. Update it when something lands.
 
 | Gap | Question | Built meanwhile |
 |---|---|---|
-| Email: a conversation channel, mail triggers, triage, drafts, bills and deliveries from mail | Q1: whose mailbox, and may harness send | nothing |
+| Email | **answered 2026-11-23: A (its own address) and C (your mailbox read-only + drafts, opt-in); specced, being built** | — |
 | Money from automation | Q2: may runs started by triggers, workflows, apps move money | built off: `[money] triggers/workflows/apps = off`; tool steps asked every time |
 | Default environment for unattended runs | Q3: host or sandbox | host |
 | Apps opened from the phone | Q4: a TLS front (tailscale serve) or loopback only | loopback only |
@@ -23,7 +23,7 @@ each waits on. Update it when something lands.
 | Acting when the owner can't be reached | **specced 2026-11-23** | escalation to a household member; safe-direction fallback (close, lock, arm) after no answer, opt-in per routine; smoke and CO alerts (read only) |
 | Diary | **specced 2026-11-23** | calendar (agenda, conflicts, changes asked), leave-by alerts, preparing for a meeting, no interruptions in meetings |
 | People and occasions | **specced 2026-11-23** | who's who, birthdays, preferences, keeping in touch, gift ideas |
-| Post and messages | Q1 | email; messages to others on the owner's behalf (asked every time) |
+| Post and messages | email specced and being built (A and C) | messages to others on the owner's behalf through other channels (asked every time) |
 | The door | not specced | doorbell: who is there, announced, one tap to answer; deliveries |
 | Away and travel | not specced | away mode (lived-in lights, stricter watch, daily summary); itinerary, flight status, check-in, packing list |
 | Errands | not specced | shopping list and pantry, reorders within caps, delivery tracking; pay-per-call services (pay.sh, x402) |
