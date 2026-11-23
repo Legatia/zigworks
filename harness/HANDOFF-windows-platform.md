@@ -39,6 +39,42 @@ adds a button to the end of runs (core.zig/agent.zig), so expect small
 conflicts there. As before: your own branches, test-driven, full suite
 and cross builds green, and the owner decides every push.
 
+### Decisions since your last fetch
+
+- **The data folder inside a `read =` folder: fix on Linux and Windows.**
+  The macOS sandbox refuses the data folder even when a `read =` folder
+  holds it (say `read = ~`); bubblewrap and AppContainer show it there.
+  The spec says never the data folder, so make Linux and Windows refuse
+  it too (bwrap: mask it inside the read bind; AppContainer: a deny ACE
+  for the profile's SID on it), and extend
+  `sandbox_cannot_read_data_folder_or_home` with a `read =` folder that
+  holds the data folder.
+- **macOS sandbox, as built** (docs/superpowers/plans/2026-11-23-macos-sandbox.md):
+  network on reaches outside hosts and the local network but never this
+  Mac (sandbox-exec can't tell the two apart; README says so); no
+  `/dev/tty`; TMPDIR is its own temp (`state/env/NAME/tmp`) and `/tmp`
+  is refused; `/Library` readable except its Keychains; Keychain
+  services denied. Network on differs per system (Linux reaches the
+  host's loopback, Windows and macOS don't); keep the README's account
+  of it current.
+- **Settings files are nine**: triggers.ini took slot 7 and
+  environments.ini slot 8 of `settingsFiles` (the auto-merge had both
+  parsers read slot 7; fixed in e261465 with a test). A new settings
+  file gets a new slot. `guardedFiles` has seven; the `workflows/` folder
+  is guarded on its own (chmod go-w).
+- **Money from runs an app starts**: refused behind `[money] apps = off`
+  (default off), as `[money] triggers` and `[money] workflows` do, until
+  the owner answers question 2. App acts never call money tools (the
+  apps spec).
+- **State files**: every file replaced whole goes through
+  `util.writeReplace`, now including triggers' state, triggers.ini
+  writes and workflow instances (`wstate.writeReplace` calls it).
+- **Still waiting on the owner**: question 1 (email), 2 (money from
+  automation; built off), 3 (the default environment for unattended runs:
+  keep `host` behind one setting) and 4 (apps on the phone: loopback
+  only), and the hosted design's five questions. Build around them as
+  before.
+
 ## Status (Windows session, 2026-11-22)
 
 Items 1 and 2 below are done, on branch `harness-windows`, merged into
