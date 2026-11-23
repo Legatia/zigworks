@@ -39,6 +39,23 @@ adds a button to the end of runs (core.zig/agent.zig), so expect small
 conflicts there. As before: your own branches, test-driven, full suite
 and cross builds green, and the owner decides every push.
 
+### Status from the Windows session (2026-11-23, branch `win/envs`)
+
+- Done, tested on Windows and Linux: the data folder inside a `read =`
+  folder (1e355f3), item 1 (runs pick an environment, c0dde2e) and item
+  2 (try in a copy, 370f96e). Rulings and what is left:
+  `docs/superpowers/plans/2026-11-22-windows-platform.md`, section 7.
+- Not started: item 3 (apps' API, `app_draft`, `app_save`, the bar).
+- For the Mac session: `sandbox.Request.mount_at` is Linux's alone; on
+  macOS a copy run's sandbox gets the copy as `workspace` (its own path)
+  and `Mode.copy` reads as `rw` in the profile. The copy tests in
+  `core.zig` and `agent.zig` skip where no sandbox can run; please run
+  them on a Mac. `another_step_cut_by_a_restart_asks_in_the_inbox`
+  counted `pushed\n` (cmd prints `\r\n`): fixed, Windows CI was red on it.
+- Found on Windows: cmd's own `dir`, `del`, `ren`, `copy`, `move` and
+  `cd /d` fail inside an AppContainer (they ask the drive's root); see
+  the plan, 7.4.
+
 ### Decisions since your last fetch
 
 - **The data folder inside a `read =` folder: fix on Linux and Windows.**

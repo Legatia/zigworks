@@ -28,8 +28,14 @@ const who = @import("who.zig");
 
 pub const Kind = enum { sandbox, remote };
 
-/// How a sandbox sees the workspace.
-pub const Mode = enum { rw, ro, none };
+/// How a sandbox sees the workspace: read-write, read-only, not at all,
+/// or each run its own copy of it (its changes come back to be applied or
+/// dropped).
+pub const Mode = enum { rw, ro, none, copy };
+
+/// What happens to a copy's changes: the owner is asked, or they are
+/// applied at once when the check passes (and asked otherwise).
+pub const Apply = enum { ask, check };
 
 pub const Env = struct {
     name: []const u8,
@@ -42,6 +48,13 @@ pub const Env = struct {
     network: bool = false,
     /// Sandbox: more folders it may read, as written (absolute, or `~/...`).
     read: []const []const u8 = &.{},
+    /// `workspace = copy`: a command run in the copy after the run, in the
+    /// sandbox; "": none.
+    check: []const u8 = "",
+    apply: Apply = .ask,
+    /// `workspace = copy`: the most the workspace may hold, in MiB; a
+    /// larger one is not copied.
+    copy_mb: u32 = default_copy_mb,
     /// Remote: `USER@HOST` or `HOST`.
     host: []const u8 = "",
     port: u16 = 22,
@@ -49,6 +62,8 @@ pub const Env = struct {
     dir: []const u8 = "",
     /// Commands it runs at once.
     parallel: u8 = default_parallel,
+    /// The section has apply or copy_mb (they go with `workspace = copy`).
+    copy_keys: bool = false,
 };
 
 /// A `[use]` line: runs whose `by` matches `who` run in `env`.
@@ -101,7 +116,90 @@ pub const Environments = struct {
     }
 };
 
+/// environments.ini's `text` with section `[name]` replaced by `section`
+/// (a header and its lines, a comment line above them or not), or with it
+/// added at the end; and the lines it replaced ("" when new). A comment
+/// line right above the old header (who saved it) goes with it.
+pub fn swapSection(arena: std.mem.Allocator, text: []const u8, name: []const u8, section: []const u8) !struct { text: []const u8, old: []const u8 } {
+    var before: std.ArrayList(u8) = .empty;
+    var old: std.ArrayList(u8) = .empty;
+    var after: std.ArrayList(u8) = .empty;
+    var state: enum { before, in, after } = .before;
+    var held: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        const tl = std.mem.trim(u8, line, " \t");
+        const header: ?[]const u8 = if (tl.len > 2 and tl[0] == '[' and tl[tl.len - 1] == ']') std.mem.trim(u8, tl[1 .. tl.len - 1], " \t") else null;
+        switch (state) {
+            .before => {
+                if (header) |h| if (std.mem.eql(u8, h, name)) {
+                    // the mark above it goes; any other held line stays
+                    if (held) |x| if (!std.mem.startsWith(u8, std.mem.trim(u8, x, " \t"), "; saved by ")) try before.print(arena, "{s}\n", .{x});
+                    held = null;
+                    try old.print(arena, "{s}\n", .{tl});
+                    state = .in;
+                    continue;
+                };
+                if (held) |x| try before.print(arena, "{s}\n", .{x});
+                held = line;
+            },
+            .in => {
+                if (header != null) {
+                    state = .after;
+                    try after.print(arena, "{s}\n", .{line});
+                } else if (tl.len > 0) try old.print(arena, "{s}\n", .{tl});
+            },
+            .after => try after.print(arena, "{s}\n", .{line}),
+        }
+    }
+    if (held) |x| try before.print(arena, "{s}\n", .{x});
+    var out: std.ArrayList(u8) = .empty;
+    const head = std.mem.trimEnd(u8, before.items, " \t\r\n");
+    try out.appendSlice(arena, head);
+    if (head.len > 0) try out.appendSlice(arena, "\n\n");
+    try out.print(arena, "{s}\n", .{std.mem.trim(u8, section, " \t\r\n")});
+    const tail = std.mem.trim(u8, after.items, " \t\r\n");
+    if (tail.len > 0) try out.print(arena, "\n{s}\n", .{tail});
+    return .{ .text = out.items, .old = std.mem.trimEnd(u8, old.items, "\n") };
+}
+
+test "a_section_is_swapped_in_place_or_added_at_the_end" {
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const file = "; mine\n[default]\nenv = host\n\n; saved by agent:main 2026-11-23\n[box]\nkind = sandbox\nnetwork = on\n\n[use]\nschedule = box\n";
+    const sw = try swapSection(a, file, "box", "; saved by agent:main 2026-11-24\n[box]\nkind = sandbox");
+    try t.expectEqualStrings("; mine\n[default]\nenv = host\n\n; saved by agent:main 2026-11-24\n[box]\nkind = sandbox\n\n[use]\nschedule = box\n", sw.text);
+    try t.expectEqualStrings("[box]\nkind = sandbox\nnetwork = on", sw.old);
+    _ = try parse(a, sw.text);
+    const added = try swapSection(a, file, "far", "[far]\nkind = remote\nhost = a@b");
+    try t.expect(std.mem.endsWith(u8, added.text, "schedule = box\n\n[far]\nkind = remote\nhost = a@b\n"));
+    try t.expectEqualStrings("", added.old);
+    const first = try swapSection(a, "", "box", "[box]\nkind = sandbox");
+    try t.expectEqualStrings("[box]\nkind = sandbox\n", first.text);
+}
+
+/// What an environment is, as a question and the shell tool say it:
+/// "sandbox; workspace rw, no network", "remote agent@10.0.0.5".
+pub fn describe(arena: std.mem.Allocator, e: Env) ![]const u8 {
+    return switch (e.kind) {
+        .sandbox => std.fmt.allocPrint(arena, "sandbox; {s}, {s}", .{
+            switch (e.workspace) {
+                .rw => "workspace rw",
+                .ro => "workspace ro",
+                .none => "no workspace",
+                .copy => "a copy of the workspace",
+            },
+            if (e.network) "network" else "no network",
+        }),
+        .remote => std.fmt.allocPrint(arena, "remote {s}", .{e.host}),
+    };
+}
+
 pub const default_parallel = 2;
+pub const default_copy_mb = 2048;
+pub const max_copy_mb = 1 << 20;
 pub const max_parallel = 16;
 pub const max_name = 32;
 
@@ -122,6 +220,13 @@ pub const Error = error{
     BadNetwork,
     BadReadList,
     BadParallel,
+    BadCheck,
+    BadApply,
+    BadCopyMb,
+    /// check, apply or copy_mb without `workspace = copy`.
+    CopyKeyWithoutCopy,
+    /// `apply = check` without a check.
+    ApplyNeedsCheck,
     BadRemoteHost,
     MissingRemoteHost,
     BadRemotePort,
@@ -139,10 +244,15 @@ pub fn reason(e: anyerror) ?[]const u8 {
         error.BadEnvName => "a section is [default], [use] or an environment's name: a-z, 0-9, - and _, up to 32; keys come after one",
         error.HostIsBuiltIn => "host is built in: it is the workspace on this machine, as without environments.ini",
         error.DuplicateEnv => "this section is there already",
-        error.BadEnvKey => "a sandbox takes kind, workspace, network, read and parallel; a remote kind, host, port, dir and parallel; [default] env; [use] WHO = NAME; each once, as key = value",
+        error.BadEnvKey => "a sandbox takes kind, workspace, network, read and parallel (and with workspace = copy: check, apply, copy_mb); a remote kind, host, port, dir and parallel; [default] env; [use] WHO = NAME; each once, as key = value",
+        error.BadCheck => "check = a command to run in the copy after the run",
+        error.BadApply => "apply = ask or check",
+        error.BadCopyMb => "copy_mb = the most the workspace may hold, in MiB, 1 to 1048576",
+        error.CopyKeyWithoutCopy => "check, apply and copy_mb go with workspace = copy",
+        error.ApplyNeedsCheck => "apply = check needs a check = COMMAND",
         error.EnvKindFirst => "an environment's first line is kind = sandbox or kind = remote",
         error.BadEnvKind => "kind = sandbox or kind = remote",
-        error.BadWorkspaceMode => "workspace = rw, ro or none",
+        error.BadWorkspaceMode => "workspace = rw, ro, none or copy",
         error.BadNetwork => "network = off or on",
         error.BadReadList => "read = folders it may read, comma-separated, each absolute or starting with ~/",
         error.BadParallel => "parallel = how many commands it runs at once, 1 to 16",
@@ -171,7 +281,9 @@ pub const example =
     \\;
     \\; [box]
     \\; kind = sandbox
-    \\; workspace = rw           ; rw | ro | none
+    \\; workspace = rw           ; rw | ro | none | copy (each run works in
+    \\;                          ; its own copy; you apply or drop its changes;
+    \\;                          ; check = COMMAND, apply = ask | check, copy_mb)
     \\; network = off            ; off | on
     \\; read = /opt/tools        ; more folders it may read
     \\;
@@ -282,6 +394,18 @@ fn setKey(arena: std.mem.Allocator, e: *Env, key: []const u8, value: []const u8)
             e.network = if (std.ascii.eqlIgnoreCase(value, "on")) true else if (std.ascii.eqlIgnoreCase(value, "off")) false else return error.BadNetwork;
         } else if (eql(u8, key, "read")) {
             e.read = try readList(arena, value);
+        } else if (eql(u8, key, "check")) {
+            if (value.len == 0) return error.BadCheck;
+            for (value) |c| if (c < 0x20 or c == 0x7f) return error.BadCheck;
+            e.check = value;
+        } else if (eql(u8, key, "apply")) {
+            e.apply = std.meta.stringToEnum(Apply, value) orelse return error.BadApply;
+            e.copy_keys = true;
+        } else if (eql(u8, key, "copy_mb")) {
+            const mb = std.fmt.parseInt(u32, value, 10) catch return error.BadCopyMb;
+            if (mb == 0 or mb > max_copy_mb) return error.BadCopyMb;
+            e.copy_mb = mb;
+            e.copy_keys = true;
         } else return error.BadEnvKey,
         .remote => if (eql(u8, key, "host")) {
             if (!validHost(value)) return error.BadRemoteHost;
@@ -300,6 +424,8 @@ fn setKey(arena: std.mem.Allocator, e: *Env, key: []const u8, value: []const u8)
 /// What a section must have once it ends.
 fn finish(e: Env) Error!void {
     if (e.kind == .remote and e.host.len == 0) return error.MissingRemoteHost;
+    if ((e.copy_keys or e.check.len > 0) and e.workspace != .copy) return error.CopyKeyWithoutCopy;
+    if (e.apply == .check and e.check.len == 0) return error.ApplyNeedsCheck;
 }
 
 fn readList(arena: std.mem.Allocator, value: []const u8) Error![]const []const u8 {

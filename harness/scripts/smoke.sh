@@ -646,7 +646,9 @@ cp "$T/mcp.ini.saved" "$HARNESS_HOME/mcp.ini"
 # a change in the home, pushed by homemcp, fires a trigger: homemcp and
 # homemcp-sim from HOMEMCP_BIN, or built next to harness (zig build in
 # ../homemcp); skipped without them
-HM=${HOMEMCP_BIN:-$(cd "$(dirname "$0")/../../homemcp/zig-out/bin" 2>/dev/null && pwd)}
+# (pwd -W as above: paths homemcp, a Windows program there, can open)
+HM=${HOMEMCP_BIN:-$(cd "$(dirname "$0")/../../homemcp/zig-out/bin" 2>/dev/null && { pwd -W 2>/dev/null || pwd; })}
+TW=$(cd "$T" && { pwd -W 2>/dev/null || pwd; })
 if [ -n "$HM" ] && [ -x "$HM/homemcp" ] && [ -x "$HM/homemcp-sim" ]; then
 	"$HM/homemcp-sim" ha 0 smoke-ha-token >"$T/hasim.out" 2>&1 &
 	SPID=$!
@@ -654,7 +656,7 @@ if [ -n "$HM" ] && [ -x "$HM/homemcp" ] && [ -x "$HM/homemcp-sim" ]; then
 	HAPORT=$(sed -n 's/.*127[.]0[.]0[.]1:\([0-9]*\).*/\1/p' "$T/hasim.out")
 	printf '[home]\nhub = homeassistant\nurl = http://127.0.0.1:%s\n[device back_door]\nid = binary_sensor.back_door\nkind = sensor\nroom = Kitchen\n' "$HAPORT" >"$T/home.ini"
 	printf 'smoke-ha-token\n' | "$H" secret add homeassistant --stdin 2>/dev/null
-	printf '[home]\ncommand = "%s" "%s"\nsecret = HA_TOKEN:homeassistant\n' "$HM/homemcp" "$T/home.ini" >>"$HARNESS_HOME/mcp.ini"
+	printf '[home]\ncommand = "%s" "%s"\nsecret = HA_TOKEN:homeassistant\n' "$HM/homemcp" "$TW/home.ini" >>"$HARNESS_HOME/mcp.ini"
 	printf '\n[door]\nmcp = home resource home://device/back_door\nmatch = text has "to":"open"\nsay = The back door: {text}\n' >>"$HARNESS_HOME/triggers.ini"
 	"$H" run >"$T/run4.out" 2>&1 &
 	RPID=$!

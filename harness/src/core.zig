@@ -29,6 +29,7 @@ const history_mod = @import("history.zig");
 const summaries_mod = @import("summaries.zig");
 const folders_mod = @import("folders.zig");
 const environments_mod = @import("environments.zig");
+const copies = @import("copies.zig");
 const sandbox = @import("sandbox.zig");
 const remote = @import("remote.zig");
 const apps_mod = @import("apps.zig");
@@ -442,6 +443,14 @@ pub const Core = struct {
     /// One change of triggers.ini at a time (/trigger add|rm, the tool,
     /// a paused item's Remove): read, written, applied.
     trig_write_mutex: Io.Mutex = .init,
+    /// What a run's copy of the workspace leaves out: every folders.ini
+    /// section's `skip` patterns.
+    copy_skip: []const []const u8,
+    /// What an at-once change of environments.ini (`env_save`) reads into:
+    /// kept until the next reload, since runs going hold the list before it.
+    env_arena: std.heap.ArenaAllocator,
+    /// Held while environments.ini is rewritten and applied.
+    env_write_mutex: Io.Mutex = .init,
     /// Each event trigger's state as on disk, and what its queue holds.
     trig_info: std.ArrayList(*TrigInfo) = .empty,
     /// A poller is going (tick starts one; close waits for it).
@@ -698,6 +707,9 @@ pub const Core = struct {
         c.trig_briefs = &.{};
         c.trig_mutex = .init;
         c.trig_write_mutex = .init;
+        c.env_arena = .init(gpa);
+        c.env_write_mutex = .init;
+        c.copy_skip = &.{};
         c.trig_info = .empty;
         c.polling = .init(false);
         c.poller_on = false;
@@ -917,6 +929,7 @@ pub const Core = struct {
         for (c.trig_info.items) |info| freeInfo(c.gpa, info);
         c.trig_info.deinit(c.gpa);
         c.trig_arena.deinit();
+        c.env_arena.deinit();
         for (c.wf_list.items) |info| info.destroy(c.gpa);
         c.wf_list.deinit(c.gpa);
         c.wf_arena.deinit();
@@ -1017,6 +1030,11 @@ pub const Core = struct {
         c.login_list = logins.parse(a, texts[4]) catch return error.BadSettings;
         c.folder_list = folders_mod.parse(a, texts[6]) catch return error.BadSettings;
         c.env_list = environments_mod.parse(a, texts[8]) catch return error.BadSettings;
+        c.copy_skip = blk: {
+            var list: std.ArrayList([]const u8) = .empty;
+            for (c.folder_list.sections) |sec| for (sec.skip) |pat| list.append(a, pat) catch {};
+            break :blk list.items;
+        };
         // the definitions, read whole; every task's among them; then in place
         var diag: agents.Diag = .{};
         var loaded = c.defs.read(a, &diag) catch return error.BadSettings;
@@ -1082,6 +1100,7 @@ pub const Core = struct {
         const saved_logins = c.login_list;
         const saved_folders = c.folder_list;
         const saved_envs = c.env_list;
+        const saved_skip = c.copy_skip;
         const saved_hashes = c.settings_hashes;
         const saved_trig = .{ c.trig_list, c.trig_tasks, c.trig_briefs };
         const saved_wf = .{ c.wf_defs, c.wf_hash };
@@ -1096,6 +1115,7 @@ pub const Core = struct {
             c.login_list = saved_logins;
             c.folder_list = saved_folders;
             c.env_list = saved_envs;
+            c.copy_skip = saved_skip;
             c.settings_hashes = saved_hashes;
             c.trig_list, c.trig_tasks, c.trig_briefs = saved_trig;
             c.wf_defs, c.wf_hash = saved_wf;
@@ -1114,6 +1134,7 @@ pub const Core = struct {
             c.login_list = saved_logins;
             c.folder_list = saved_folders;
             c.env_list = saved_envs;
+            c.copy_skip = saved_skip;
             c.settings_hashes = saved_hashes;
             c.trig_list, c.trig_tasks, c.trig_briefs = saved_trig;
             c.wf_defs, c.wf_hash = saved_wf;
@@ -1127,6 +1148,9 @@ pub const Core = struct {
         // what an at-once change of triggers.ini held is read again above
         c.trig_arena.deinit();
         c.trig_arena = .init(c.gpa);
+        // and of environments.ini (nothing runs now)
+        c.env_arena.deinit();
+        c.env_arena = .init(c.gpa);
         // and what an at-once change of workflows/ held
         c.wf_arena.deinit();
         c.wf_arena = .init(c.gpa);
@@ -3783,6 +3807,9 @@ pub const Core = struct {
         var paused: ?[]const u8 = null;
         // the butler's setup: what it writes before the item closes
         var setup: ?struct { run: []const u8, conv: []const u8 } = null;
+        // a run's copy (environment, copy) and where its item is shown:
+        // Show, Apply or Drop acts on it
+        var copy: ?struct { env: []const u8, name: []const u8, conv: []const u8 } = null;
         {
             c.inbox.mutex.lockUncancelable(c.io);
             defer c.inbox.mutex.unlock(c.io);
@@ -3808,6 +3835,36 @@ pub const Core = struct {
             if ((std.mem.eql(u8, it.kind, "setup") or std.mem.eql(u8, it.kind, "routine")) and it.run != null) {
                 setup = .{ .run = a.dupe(u8, it.run.?) catch return .not_offered, .conv = a.dupe(u8, it.conversation) catch return .not_offered };
                 it.settling = true;
+            }
+            if (std.mem.eql(u8, it.kind, "copy")) if (it.skip) |ref| {
+                // "copy\tENV\tCOPY"
+                var parts = std.mem.splitScalar(u8, ref, '\t');
+                _ = parts.next();
+                const env = parts.next() orelse return .not_offered;
+                const name = parts.next() orelse return .not_offered;
+                if (!rules.envName(env) or name.len == 0 or std.mem.indexOfAny(u8, name, "/\\.") != null) return .not_offered;
+                copy = .{ .env = a.dupe(u8, env) catch return .not_offered, .name = a.dupe(u8, name) catch return .not_offered, .conv = a.dupe(u8, it.conversation) catch return .not_offered };
+                it.settling = true;
+            };
+        }
+        if (copy) |cp| {
+            const path = std.fs.path.join(a, &.{ c.paths.env_dir, cp.env, "copies", cp.name }) catch return .not_offered;
+            if (std.mem.eql(u8, key, "show")) {
+                // shown, and the item stays open
+                const diff = c.copyDiff(a, path) catch |e| std.fmt.allocPrint(a, "The copy can't be read: {s}.", .{@errorName(e)}) catch "The copy can't be read.";
+                c.unsettle(id);
+                c.sayIn(cp.conv, diff);
+                return .failed;
+            } else if (std.mem.eql(u8, key, "apply")) {
+                const said = c.applyCopy(a, cp.env, cp.name, id) catch |e| {
+                    c.unsettle(id);
+                    c.sayIn(cp.conv, std.fmt.allocPrint(a, "Item {d}: not applied ({s}); nothing changed.", .{ id, @errorName(e) }) catch "Not applied; nothing changed.");
+                    return .failed;
+                };
+                c.sayIn(cp.conv, said);
+            } else if (std.mem.eql(u8, key, "drop")) {
+                copies.drop(c.io, a, path);
+                c.log.write(.env, false, .{ .event = "dropped", .name = cp.env, .copy = cp.name, .item = id }) catch {};
             }
         }
         // the owner's words hold no stored secret either
@@ -4417,6 +4474,9 @@ pub const Core = struct {
             .defs = &c.defs,
             .registry = c.registry(),
             .hush = .{ .ctx = c, .why = hushWhy },
+            .envs = .{ .list = c.env_list, .root = c.paths.env_dir, .data_home = c.paths.home, .owner_home = c.home_var },
+            .copy_keeper = .{ .ctx = c, .keep = copyKeep },
+            .copy_skip = c.copy_skip,
         };
     }
 
@@ -4786,6 +4846,7 @@ pub const Core = struct {
         // from a conversation
         run.desk = c.desk();
         run.wdesk = c.wfDesk();
+        run.edesk = c.envDesk();
         var notify: Notify = .{ .core = c, .conv = conv };
         run.notice = .{ .ctx = &notify, .say = Notify.say };
         var here: [agents_name_max]u8 = undefined;
@@ -9791,9 +9852,192 @@ pub const Core = struct {
         try out.print(a, "Default: {s}.", .{c.env_list.default});
         for (c.env_list.pins, 0..) |p, i| try out.print(a, "{s}{s} runs in {s}", .{ if (i == 0) " Pinned: " else ", ", p.who, p.env });
         if (c.env_list.pins.len > 0) try out.append(a, '.');
-        // said until the gate picks environments (gap 2, after phase 0)
-        if (c.env_list.envs.len > 0) try out.appendSlice(a, "\nThe agent's commands still run on host: environments are checked and can be tried with /env check, but runs don't use them yet.");
         return out.items;
+    }
+
+    // ---- environments: a run's copy of the workspace ----
+
+    /// A run's `agent.CopyKeeper`: see `keepCopy`.
+    fn copyKeep(ctx: *anyopaque, a: std.mem.Allocator, done: agent.CopyDone) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        c.keepCopy(a, done) catch |e| c.log.write(.env, false, .{ .event = "copy", .name = done.env.name, .why = @errorName(e) }) catch {};
+    }
+
+    /// A run ended with changes in its copy: applied at once where its
+    /// environment says `apply = check` and the check passed; else an inbox
+    /// item, kind `copy`, with the list, the check's result and Show, Apply,
+    /// Drop. Copies kept past their items (8 days) go.
+    fn keepCopy(c: *Core, a: std.mem.Allocator, d: agent.CopyDone) !void {
+        const name = std.fs.path.basename(d.path);
+        c.pruneCopies(a, std.fs.path.dirname(d.path) orelse return, name);
+        const conv = if (d.conversation.len > 0) d.conversation else "main";
+        if (d.env.apply == .check) if (d.check) |ck| if (ck.passed) {
+            c.sayIn(conv, try c.applyCopy(a, d.env.name, name, 0));
+            return;
+        };
+        const n = d.changes.len;
+        var body: std.ArrayList(u8) = .empty;
+        try body.print(a, "Run {d} ({s}) changed {d} file{s} in its copy\n{s}", .{ d.rid, d.env.name, n, if (n == 1) "" else "s", try copies.listText(a, d.changes, 40) });
+        if (d.check) |ck| try body.print(a, "\nCheck {s}: {s}\n{s}", .{ if (ck.passed) "passed" else "failed", d.env.check, util.cut(ck.text, 2048) });
+        const text = util.cut(body.items, inbox_mod.max_body);
+        _ = try c.addItem(.{
+            .kind = "copy",
+            .by = d.who.by,
+            .agent = if (d.who.agent.len > 0) d.who.agent else null,
+            .rid = if (d.rid != 0) d.rid else null,
+            .run = d.label,
+            .conversation = conv,
+            .waiter = "harness",
+            .title = firstLine(text),
+            .body = text,
+            .choices = &.{ .{ .key = "show", .label = "Show" }, .{ .key = "apply", .label = "Apply" }, .{ .key = "drop", .label = "Drop" } },
+            .expires = c.now() + inbox_mod.keep_s,
+            .skip = try std.fmt.allocPrint(a, "copy\t{s}\t{s}", .{ d.env.name, name }),
+            .private = d.private,
+        });
+    }
+
+    /// Removes the copies in `dir` made over 8 days ago (an item is kept 7
+    /// days), but `keep`.
+    fn pruneCopies(c: *Core, a: std.mem.Allocator, dir_path: []const u8, keep: []const u8) void {
+        var dir = Io.Dir.cwd().openDir(c.io, dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(c.io);
+        const old = (c.now() - 8 * 86400) * std.time.ns_per_s;
+        var old_names: std.ArrayList([]const u8) = .empty;
+        var it = dir.iterate();
+        while (it.next(c.io) catch null) |e| {
+            if (e.kind != .directory or std.mem.eql(u8, e.name, keep)) continue;
+            const st = dir.statFile(c.io, e.name, .{ .follow_symlinks = false }) catch continue;
+            if (st.mtime.nanoseconds < old) old_names.append(a, a.dupe(u8, e.name) catch continue) catch {};
+        }
+        for (old_names.items) |n| copies.drop(c.io, a, std.fs.path.join(a, &.{ dir_path, n }) catch continue);
+    }
+
+    /// What a copy changed, for Show: 2 KB a file, 12 KB in all.
+    fn copyDiff(c: *Core, a: std.mem.Allocator, path: []const u8) ![]const u8 {
+        const list = try copies.changes(c.io, a, path);
+        if (list.len == 0) return "The copy has no changes.";
+        return c.masks.scrubAlloc(a, try copies.diffText(c.io, a, c.workspace, path, list, 2048, 12 << 10));
+    }
+
+    /// Writes a copy's changes into the workspace: a snapshot of the
+    /// workspace first (where folders.ini keeps them), then each changed
+    /// file whose workspace file is still as it was when copied. Files
+    /// changed since are left and named, and the copy is kept (its path
+    /// said) for 7 days; otherwise the copy goes. What the owner is told.
+    fn applyCopy(c: *Core, a: std.mem.Allocator, env: []const u8, name: []const u8, item: u64) ![]const u8 {
+        const path = try std.fs.path.join(a, &.{ c.paths.env_dir, env, "copies", name });
+        const list = try copies.changes(c.io, a, path);
+        switch (try c.snapSource(a, "/")) {
+            .src => |src| {
+                _ = c.snaps.take(a, src, .{ .when = .hand, .label = try std.fmt.allocPrint(a, "before run {s}'s copy is applied", .{name}) }) catch {};
+            },
+            .say => {},
+        }
+        const done = try copies.apply(c.io, a, c.workspace, path, list);
+        c.log.write(.env, false, .{ .event = "applied", .name = env, .copy = name, .written = done.written, .removed = done.removed, .left = done.left.len, .item = if (item != 0) @as(?u64, item) else null }) catch {};
+        var out: std.ArrayList(u8) = .empty;
+        try out.print(a, "Applied run {s}'s copy ({s}): {d} written, {d} removed.", .{ name, env, done.written, done.removed });
+        if (done.left.len == 0) {
+            copies.drop(c.io, a, path);
+            return out.items;
+        }
+        try out.appendSlice(a, " Changed in the workspace since, left as they are: ");
+        for (done.left, 0..) |l, i| {
+            if (i == 12) {
+                try out.print(a, " and {d} more", .{done.left.len - i});
+                break;
+            }
+            try out.print(a, "{s}{s}", .{ if (i > 0) ", " else "", l });
+        }
+        try out.print(a, ". The copy is kept 7 days: {s}", .{path});
+        return out.items;
+    }
+
+    // ---- environments: the env_save tool's desk ----
+
+    fn envDesk(c: *Core) agent.EnvDesk {
+        return .{ .ctx = c, .check = envDeskCheck, .save = envDeskSave };
+    }
+
+    fn envDeskCheck(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, text: []const u8) agent.Checked {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.checkEnv(a, name, text) catch .{ .why = "out of memory" };
+    }
+
+    fn envDeskSave(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, section: []const u8, saved: agent.Saved) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.saveEnv(a, name, section, saved) catch |e| @errorName(e);
+    }
+
+    /// Reads a section the agent proposes for environment `name` (its
+    /// lines, without the header): harness's reading of it and of the one
+    /// it replaces, or why it can't be saved. Never `host`, `[default]` or
+    /// `[use]`; one section, of this name.
+    fn checkEnv(c: *Core, a: std.mem.Allocator, name: []const u8, text: []const u8) !agent.Checked {
+        if (!rules.envName(name)) return .{ .why = "an environment's name is a-z, 0-9, - and _, up to 32" };
+        for ([_][]const u8{ "host", "default", "use" }) |n| if (std.mem.eql(u8, name, n))
+            return .{ .why = try std.fmt.allocPrint(a, "{s} is not the agent's to save: host is built in, and the default and the pins are the owner's", .{n}) };
+        var body: std.ArrayList(u8) = .empty;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            if (line[0] == '[') return .{ .why = "give the section's lines alone, kind first: no [NAME] line, one environment" };
+            try body.print(a, "{s}\n", .{line});
+        }
+        const section = try std.fmt.allocPrint(a, "[{s}]\n{s}", .{ name, std.mem.trimEnd(u8, body.items, "\n") });
+        const one = environments_mod.parse(a, section) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return .{ .why = environments_mod.reason(e) orelse @errorName(e) },
+        };
+        if (one.envs.len != 1) return .{ .why = "the section has no kind" };
+        // the whole file with it must read too
+        const old_file = Io.Dir.cwd().readFileAlloc(c.io, c.paths.environments, a, .limited(1 << 20)) catch "";
+        const swapped = try environments_mod.swapSection(a, old_file, name, section);
+        _ = environments_mod.parse(a, swapped.text) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return .{ .why = try std.fmt.allocPrint(a, "environments.ini would not read with it: {s}", .{environments_mod.reason(e) orelse @errorName(e)}) },
+        };
+        var reading: std.ArrayList(u8) = .empty;
+        try reading.print(a, "{s}: {s}", .{ name, try environments_mod.describe(a, one.envs[0]) });
+        for (one.envs[0].read, 0..) |r, i| try reading.print(a, "{s}{s}", .{ if (i == 0) "; reads " else ", ", r });
+        if (swapped.old.len > 0) try reading.print(a, ". It replaces:\n{s}", .{swapped.old});
+        return .{ .name = name, .reading = reading.items, .section = section, .replaces = swapped.old.len > 0 };
+    }
+
+    /// Writes `section` into environments.ini (in its old place, or at the
+    /// end), under `saved.mark`, and applies it at once; logged `saved`.
+    /// Null when done; else why not, and the file is as it was.
+    fn saveEnv(c: *Core, a: std.mem.Allocator, name: []const u8, section: []const u8, saved: agent.Saved) !?[]const u8 {
+        c.env_write_mutex.lockUncancelable(c.io);
+        defer c.env_write_mutex.unlock(c.io);
+        const old = Io.Dir.cwd().readFileAlloc(c.io, c.paths.environments, a, .limited(1 << 20)) catch "";
+        const marked = if (saved.mark.len > 0) try std.fmt.allocPrint(a, "; {s}\n{s}", .{ saved.mark, section }) else section;
+        const new = (try environments_mod.swapSection(a, old, name, marked)).text;
+        const ea = c.env_arena.allocator();
+        const list = environments_mod.parse(ea, try ea.dupe(u8, new)) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return environments_mod.reason(e) orelse @errorName(e),
+        };
+        try util.writeReplace(c.io, c.paths.environments, new);
+        {
+            c.settings_mutex.lockUncancelable(c.io);
+            defer c.settings_mutex.unlock(c.io);
+            c.env_list = list;
+            // the watcher takes environments.ini as it is now
+            std.crypto.hash.sha2.Sha256.hash(new, &c.settings_hashes[8], .{});
+        }
+        const e = list.find(name).?;
+        try c.log.write(.env, false, .{
+            .event = "saved",
+            .name = name,
+            .settings = try environments_mod.describe(a, e.*),
+            .by = saved.by,
+            .agent = if (saved.agent.len > 0) @as(?[]const u8, saved.agent) else null,
+            .item = if (saved.item != 0) @as(?u64, saved.item) else null,
+        });
+        return null;
     }
 
     fn envCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
@@ -9825,10 +10069,18 @@ pub const Core = struct {
                 std.fmt.allocPrint(a, "{s} (remote over ssh): {s}", .{ name, said });
         }
         if (try sandbox.unavailable(c.io, a)) |why| return std.fmt.allocPrint(a, "{s} can't run here: {s}.", .{ name, why });
+        // `workspace = copy`: probed in an empty copy of its own, as a run's
+        // is (Linux: seen at the workspace's path), never the workspace
+        const copy_mode = e.workspace == .copy;
+        const probe_ws = if (copy_mode) try std.fs.path.join(a, &.{ dir, "copies", "check" }) else c.workspace;
+        if (copy_mode) try Io.Dir.cwd().createDirPath(c.io, probe_ws);
+        defer if (copy_mode) Io.Dir.cwd().deleteTree(c.io, probe_ws) catch {};
+        const seen = if (copy_mode and builtin.os.tag != .linux) probe_ws else c.workspace;
         const req: sandbox.Request = .{
             .env = e,
             .command = "",
-            .workspace = c.workspace,
+            .workspace = probe_ws,
+            .mount_at = if (copy_mode and builtin.os.tag == .linux) c.workspace else "",
             .dir = dir,
             .path_var = c.path_var,
             .system_vars = c.system_vars,
@@ -9836,13 +10088,15 @@ pub const Core = struct {
             .profile = try sandbox.profileName(a, c.paths.home, name),
         };
         const win = builtin.os.tag == .windows;
-        const check_file = try std.fs.path.join(a, &.{ c.workspace, ".harness-env-check" });
+        const check_file = try std.fs.path.join(a, &.{ seen, ".harness-env-check" });
         const Probe = struct { what: []const u8, command: []const u8, want: bool };
         const probes = [_]Probe{
-            .{ .what = "workspace: read", .command = if (win) try std.fmt.allocPrint(a, "dir /b \"{s}\" >nul", .{c.workspace}) else try std.fmt.allocPrint(a, "ls -A {s} >/dev/null", .{try shQuote(a, c.workspace)}), .want = e.workspace != .none },
-            .{ .what = "workspace: write", .command = if (win) try std.fmt.allocPrint(a, "echo probe> \"{s}\" && del \"{s}\"", .{ check_file, check_file }) else try std.fmt.allocPrint(a, ": > {s} && rm {s}", .{ try shQuote(a, check_file), try shQuote(a, check_file) }), .want = e.workspace == .rw },
+            // (Windows: cmd's own dir and del can't be used in a sandbox:
+            // they ask the drive, which it may not open)
+            .{ .what = if (copy_mode) "its copy of the workspace: read" else "workspace: read", .command = if (win) try std.fmt.allocPrint(a, "if not exist \"{s}/*\" exit 1", .{seen}) else try std.fmt.allocPrint(a, "ls -A {s} >/dev/null", .{try shQuote(a, seen)}), .want = e.workspace != .none },
+            .{ .what = if (copy_mode) "its copy of the workspace: write" else "workspace: write", .command = if (win) try std.fmt.allocPrint(a, "echo probe> \"{s}\"", .{check_file}) else try std.fmt.allocPrint(a, ": > {s} && rm {s}", .{ try shQuote(a, check_file), try shQuote(a, check_file) }), .want = e.workspace == .rw or copy_mode },
             .{ .what = "the data folder: read", .command = if (win) try std.fmt.allocPrint(a, "type \"{s}\" >nul", .{c.paths.config}) else try std.fmt.allocPrint(a, "cat {s} >/dev/null", .{try shQuote(a, c.paths.config)}), .want = false },
-            .{ .what = "your home: read", .command = if (win) try std.fmt.allocPrint(a, "dir /b \"{s}\" >nul", .{c.home_var}) else try std.fmt.allocPrint(a, "ls -A {s} >/dev/null", .{try shQuote(a, c.home_var)}), .want = false },
+            .{ .what = "your home: read", .command = if (win) try std.fmt.allocPrint(a, "if not exist \"{s}/*\" exit 1", .{c.home_var}) else try std.fmt.allocPrint(a, "ls -A {s} >/dev/null", .{try shQuote(a, c.home_var)}), .want = false },
             .{ .what = "outside (example.com)", .command = if (win) "curl.exe -s -m 8 -o NUL https://example.com" else "curl -s -m 8 -o /dev/null https://example.com", .want = e.network },
         };
         var out: std.ArrayList(u8) = .empty;
@@ -9860,6 +10114,8 @@ pub const Core = struct {
             if (yes != p.want) odd += 1;
             try out.print(a, "{s}: {s}{s}\n", .{ p.what, if (yes) "yes" else "no", if (yes != p.want) " (not what environments.ini says)" else "" });
         }
+        // (Windows: what the write probe left; the sandbox's cmd can't del)
+        Io.Dir.cwd().deleteFile(c.io, check_file) catch {};
         if (odd == 0) try out.appendSlice(a, "As environments.ini says.") else try out.print(a, "{d} not as environments.ini says (outside: is this machine online?).", .{odd});
         return out.items;
     }
@@ -10927,6 +11183,8 @@ const InstRun = struct {
     /// `to`; the gate's questions go through `asker` to the inbox.
     fn stepRun(r: *InstRun, client: *model.Client, s: workflows.Step, ask: *WfAsker) agent.Run {
         var run = r.c.runIn(client, r.label(s.name), .{ .by = r.by(s.name), .agent = "" }, r.w.to, r.flag);
+        // where its commands run, unless a pin says
+        if (s.env.len > 0) run.step_env = s.env;
         // a tool step is not a run nobody watches: it can wait
         run.scheduled = false;
         run.asker = .{ .ctx = ask, .ask = WfAsker.ask };
@@ -11025,6 +11283,7 @@ const InstRun = struct {
         defer r.c.unregister(r.flag);
         var run = r.c.runIn(&client, r.label(s.name), .{ .by = r.by(s.name), .agent = def.name }, r.w.to, r.flag);
         run.useDefinition(def);
+        if (s.env.len > 0) run.step_env = s.env;
         run.holds_place = true;
         run.narrow = s.tools;
         run.extra_instructions = try std.fmt.allocPrint(r.a, "This is step {s} of workflow {s} (instance {s}). Your answer is the step's result, for the workflow's next steps; it is not posted to the owner.{s}", .{ s.name, r.w.name, r.id, if (s.answer_json) " Answer only with JSON, nothing else." else "" });
@@ -18861,6 +19120,205 @@ test "a_start_in_line_is_masked_and_checked_again" {
     runWorkflows(&f);
     try t.expectEqual(1, (try d.numbers(a)).len);
     try expectHas(try logText(&f), "\"name\":\"one\",\"event\":\"dropped\",\"by\":\"agent:main\"");
+}
+
+test "env_save_writes_the_section_and_applies_it_at_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "; mine\n[box]\nkind = sandbox\nworkspace = ro\n[use]\nschedule = box\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    // never host, the default, the pins or another section's lines
+    try t.expect(std.mem.indexOf(u8, (try f.core.checkEnv(a, "host", "kind = sandbox")).why.?, "host is not the agent's to save") != null);
+    try t.expect((try f.core.checkEnv(a, "default", "env = box")).why != null);
+    try t.expect((try f.core.checkEnv(a, "use", "owner = box")).why != null);
+    try t.expect((try f.core.checkEnv(a, "Box", "kind = sandbox")).why != null);
+    try t.expect((try f.core.checkEnv(a, "new", "kind = host")).why != null);
+    try t.expect((try f.core.checkEnv(a, "new", "kind = sandbox\n[use]\nowner = new")).why != null);
+    try t.expectEqualStrings("network = off or on", (try f.core.checkEnv(a, "new", "kind = sandbox\nnetwork = maybe")).why.?);
+    // a change is read against the one it replaces
+    const ch = try f.core.checkEnv(a, "box", "kind = sandbox\nnetwork = on\n");
+    try t.expectEqual(null, ch.why);
+    try t.expect(ch.replaces);
+    try t.expectEqualStrings("box: sandbox; workspace rw, network. It replaces:\n[box]\nkind = sandbox\nworkspace = ro", ch.reading);
+    try t.expectEqualStrings("[box]\nkind = sandbox\nnetwork = on", ch.section);
+    try t.expectEqual(null, try f.core.saveEnv(a, "box", ch.section, .{ .mark = "saved by agent:main 2026-11-23 (item 7)", .by = "owner", .agent = "main", .item = 7 }));
+    try t.expectEqualStrings("; mine\n\n; saved by agent:main 2026-11-23 (item 7)\n[box]\nkind = sandbox\nnetwork = on\n\n[use]\nschedule = box\n", try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.environments, a, .unlimited));
+    // at once, without /reload, and the watcher doesn't take it for a change
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/envs"), "box: sandbox, workspace rw, network on") != null);
+    f.core.last_status_s = 0;
+    f.core.tick();
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/envs"), "network on") != null);
+    // a new one goes at the end
+    const nw = try f.core.checkEnv(a, "far", "kind = remote\nhost = agent@192.0.2.1");
+    try t.expect(!nw.replaces);
+    try t.expectEqual(null, try f.core.saveEnv(a, "far", nw.section, .{ .mark = "", .by = "owner", .agent = "main", .item = 0 }));
+    try t.expect(std.mem.endsWith(u8, try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.environments, a, .unlimited), "schedule = box\n\n[far]\nkind = remote\nhost = agent@192.0.2.1\n"));
+    const lt = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, lt, "\"kind\":\"env\",\"event\":\"saved\",\"name\":\"box\",\"settings\":\"sandbox; workspace rw, network\",\"by\":\"owner\",\"agent\":\"main\",\"item\":7") != null);
+}
+
+test "a_workflow_steps_env_line_runs_its_command_there" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    if (try sandbox.unavailable(t.io, a)) |_| return error.SkipZigTest;
+    defer sandbox.remove(t.io, a, std.fs.path.join(a, &.{ f.core.paths.env_dir, "box" }) catch "", sandbox.profileName(a, f.core.paths.home, "box") catch "") catch {};
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[box]\nkind = sandbox\n" });
+    if (builtin.os.tag == .windows) {
+        // what a Windows sandbox needs to start cmd and find its home
+        const sys = try @import("proc.zig").systemDir(a);
+        f.core.path_var = try std.fmt.allocPrint(a, "{s};{s}", .{ sys, std.fs.path.dirname(sys).? });
+        f.core.system_vars = try @import("cdp.zig").testSystemVars(a);
+    }
+    // the rule is for box alone: on the host the step would wait in the inbox
+    try writeRules(&f, "allow shell@box *\n");
+    const mark = if (builtin.os.tag == .windows) "echo in-the-box> \\\"%USERPROFILE%/mark.txt\\\"" else "echo in-the-box > ~/mark.txt";
+    try setWorkflow(&f, "boxed", try std.fmt.allocPrint(a, "workflow boxed\nstep mark\ntool shell {{\"command\": \"{s}\"}}\nenv box\nstep tell\nsay marked {{mark.ok}}\n", .{mark}));
+    _ = try f.core.command(a, "/workflow start boxed");
+    runWorkflows(&f);
+    try f.rec.waitFor("[boxed#1] marked true");
+    // in its home, not the owner's
+    _ = try Io.Dir.cwd().statFile(t.io, try std.fs.path.join(a, &.{ f.core.paths.env_dir, "box", "home", "mark.txt" }), .{});
+    // an environment that isn't there fails the step: never the host instead
+    try setWorkflow(&f, "lost", "workflow lost\nstep s\ntool shell {\"command\": \"echo on-the-host\"}\nenv nobox\n");
+    _ = try f.core.command(a, "/workflow start lost");
+    runWorkflows(&f);
+    try f.rec.waitFor("there is no environment nobox (environments.ini)");
+    try t.expectEqual(0, f.rec.count("on-the-host\n"));
+}
+
+test "a_runs_writes_stay_in_its_copy_until_the_owner_applies_them" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[default]\nenv = box\n[box]\nkind = sandbox\nworkspace = copy\n" });
+    try writeRules(&f, "allow write_file *\nallow read_file *\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const ws = f.core.workspace;
+    const a_txt = try std.fs.path.join(a, &.{ ws, "a.txt" });
+    const b_txt = try std.fs.path.join(a, &.{ ws, "b.txt" });
+    const made = try std.fs.path.join(a, &.{ ws, "new", "made.txt" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = a_txt, .data = "old\n" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = b_txt, .data = "b\n" });
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"a.txt\",\"content\":\"new\\n\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "write_file", "{\"path\":\"new/made.txt\",\"content\":\"made\\n\"}"));
+    try f.e.script(3, model.toolReply("tu_3", "read_file", "{\"path\":\"a.txt\"}"));
+    try f.e.script(4, model.textReply("changed them"));
+    f.core.chatTurn("change a.txt and make a file");
+    // the run read its own change, and the workspace is as it was
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "\"content\":\"new\\n\"") != null);
+    try t.expectEqualStrings("old\n", try Io.Dir.cwd().readFileAlloc(t.io, a_txt, a, .unlimited));
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, made, .{}));
+    // its changes wait in the inbox
+    try f.rec.waitFor("BUTTONS Copy [1]\nRun ");
+    try f.rec.waitFor("(box) changed 2 files in its copy\n~ a.txt (4 bytes, was 4)\n+ new/made.txt (5 bytes)");
+    try f.press("show");
+    try f.rec.waitFor("a.txt (changed)\n- old\n+ new\nnew/made.txt (new)\n+ made");
+    try t.expectEqualStrings("old\n", try Io.Dir.cwd().readFileAlloc(t.io, a_txt, a, .unlimited));
+    try f.press("apply");
+    try f.rec.waitFor("copy (box): 2 written, 0 removed.");
+    try t.expectEqualStrings("new\n", try Io.Dir.cwd().readFileAlloc(t.io, a_txt, a, .unlimited));
+    try t.expectEqualStrings("made\n", try Io.Dir.cwd().readFileAlloc(t.io, made, a, .unlimited));
+    // the copy is gone with it
+    var copies_dir = try Io.Dir.cwd().openDir(t.io, try std.fs.path.join(a, &.{ f.core.paths.env_dir, "box", "copies" }), .{ .iterate = true });
+    defer copies_dir.close(t.io);
+    var it = copies_dir.iterate();
+    try t.expectEqual(null, try it.next(t.io));
+
+    // two runs, two copies; a file the owner changed meanwhile is left, and Drop drops
+    try f.e.script(5, model.toolReply("tu_4", "write_file", "{\"path\":\"a.txt\",\"content\":\"second\\n\"}"));
+    try f.e.script(6, model.toolReply("tu_5", "write_file", "{\"path\":\"b.txt\",\"content\":\"second b\\n\"}"));
+    try f.e.script(7, model.textReply("second done"));
+    try f.e.script(8, model.toolReply("tu_6", "write_file", "{\"path\":\"b.txt\",\"content\":\"third b\\n\"}"));
+    try f.e.script(9, model.textReply("third done"));
+    f.core.chatTurn("again");
+    try f.rec.waitFor("BUTTONS Copy [2]\nRun ");
+    f.core.chatTurn("and once more");
+    try f.rec.waitFor("BUTTONS Copy [3]\nRun ");
+    // the third run's: dropped
+    try f.press("drop");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = a_txt, .data = "the owner's own change\n" });
+    _ = f.core.answerItem(2, "apply", null, .terminal);
+    try f.rec.waitFor("1 written, 0 removed. Changed in the workspace since, left as they are: a.txt. The copy is kept 7 days: ");
+    try t.expectEqualStrings("the owner's own change\n", try Io.Dir.cwd().readFileAlloc(t.io, a_txt, a, .unlimited));
+    try t.expectEqualStrings("second b\n", try Io.Dir.cwd().readFileAlloc(t.io, b_txt, a, .unlimited));
+    const lt = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, a, .unlimited);
+    for ([_][]const u8{ "\"kind\":\"env\",\"rid\":", "\"event\":\"copy\",\"name\":\"box\",\"files\":2", "\"event\":\"applied\",\"name\":\"box\"", "\"event\":\"dropped\",\"name\":\"box\"" }) |want|
+        try t.expect(std.mem.indexOf(u8, lt, want) != null);
+}
+
+test "apply_check_applies_when_the_check_passes" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    if (try sandbox.unavailable(t.io, a)) |_| return error.SkipZigTest;
+    defer sandbox.remove(t.io, a, std.fs.path.join(a, &.{ f.core.paths.env_dir, "box" }) catch "", sandbox.profileName(a, f.core.paths.home, "box") catch "") catch {};
+    if (builtin.os.tag == .windows) {
+        const sys = try @import("proc.zig").systemDir(a);
+        f.core.path_var = try std.fmt.allocPrint(a, "{s};{s}", .{ sys, std.fs.path.dirname(sys).? });
+        f.core.system_vars = try @import("cdp.zig").testSystemVars(a);
+    }
+    // the check passes while ok.txt says fine
+    const check = if (builtin.os.tag == .windows) "findstr fine ok.txt" else "grep fine ok.txt";
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = try std.fmt.allocPrint(a, "[default]\nenv = box\n[box]\nkind = sandbox\nworkspace = copy\ncheck = {s}\napply = check\n", .{check}) });
+    try writeRules(&f, "allow write_file *\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const ws = f.core.workspace;
+    const ok_txt = try std.fs.path.join(a, &.{ ws, "ok.txt" });
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"ok.txt\",\"content\":\"fine\\n\"}"));
+    try f.e.script(2, model.textReply("made ok.txt"));
+    f.core.chatTurn("make ok.txt");
+    // passed: applied at once, nothing asked
+    try f.rec.waitFor("copy (box): 1 written, 0 removed.");
+    try t.expectEqualStrings("fine\n", try Io.Dir.cwd().readFileAlloc(t.io, ok_txt, a, .unlimited));
+    try t.expectEqual(0, f.rec.count("BUTTONS Copy ["));
+    // failed: asked, with what the check said, and nothing written
+    try f.e.script(3, model.toolReply("tu_2", "write_file", "{\"path\":\"ok.txt\",\"content\":\"broken\\n\"}"));
+    try f.e.script(4, model.textReply("broke ok.txt"));
+    f.core.chatTurn("now break the check");
+    try f.rec.waitFor("BUTTONS Copy [");
+    try f.rec.waitFor("Check failed: ");
+    try t.expectEqualStrings("fine\n", try Io.Dir.cwd().readFileAlloc(t.io, ok_txt, a, .unlimited));
+    const lt = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"check\",\"name\":\"box\",\"passed\":true") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"check\",\"name\":\"box\",\"passed\":false") != null);
+}
+
+test "env_check_probes_a_sandbox_and_a_copy_environment" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    if (try sandbox.unavailable(t.io, a)) |_| return error.SkipZigTest;
+    defer for ([_][]const u8{ "box", "cbox" }) |n| sandbox.remove(t.io, a, std.fs.path.join(a, &.{ f.core.paths.env_dir, n }) catch "", sandbox.profileName(a, f.core.paths.home, n) catch "") catch {};
+    if (builtin.os.tag == .windows) {
+        const sys = try @import("proc.zig").systemDir(a);
+        f.core.path_var = try std.fmt.allocPrint(a, "{s};{s}", .{ sys, std.fs.path.dirname(sys).? });
+        f.core.system_vars = try @import("cdp.zig").testSystemVars(a);
+    }
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[box]\nkind = sandbox\n[cbox]\nkind = sandbox\nworkspace = copy\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const box = try f.core.command(a, "/env check box");
+    for ([_][]const u8{ "workspace: read: yes\n", "workspace: write: yes\n", "the data folder: read: no\n", "outside (example.com): no\n", "As environments.ini says." }) |want| {
+        if (std.mem.indexOf(u8, box, want) == null) std.debug.print("/env check box said:\n{s}\n", .{box});
+        try t.expect(std.mem.indexOf(u8, box, want) != null);
+    }
+    const cbox = try f.core.command(a, "/env check cbox");
+    for ([_][]const u8{ "its copy of the workspace: read: yes\n", "its copy of the workspace: write: yes\n", "the data folder: read: no\n", "As environments.ini says." }) |want| {
+        if (std.mem.indexOf(u8, cbox, want) == null) std.debug.print("/env check cbox said:\n{s}\n", .{cbox});
+        try t.expect(std.mem.indexOf(u8, cbox, want) != null);
+    }
+    // nothing of the probes is left in the workspace
+    var ws = try Io.Dir.cwd().openDir(t.io, f.core.workspace, .{ .iterate = true });
+    defer ws.close(t.io);
+    var it = ws.iterate();
+    try t.expectEqual(null, try it.next(t.io));
 }
 
 // ---- voice notes ----

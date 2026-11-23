@@ -55,8 +55,11 @@ pub const Def = struct {
     answer_bytes: ?u32 = null,
     /// Most runs of it at once; 0: the global limits only.
     parallel: u32 = 0,
-    /// Where its commands run: `host` until environments (gap 2).
+    /// Where its commands run (an environment of environments.ini, or
+    /// `host`), when the file says (`environment_given`); else where
+    /// `[default] env` says.
     environment: []const u8 = "host",
+    environment_given: bool = false,
     /// Who saved it with `agent_save`, and when (harness writes it).
     saved: []const u8 = "",
     /// The instructions.
@@ -167,8 +170,9 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, text: []const u8, diag: *Di
             },
             .parallel => d.parallel = std.fmt.parseInt(u32, v, 10) catch return fail(diag, f.line, "parallel is a whole number (0: the global limits only)"),
             .environment => {
-                if (!std.mem.eql(u8, v, "host")) return fail(diag, f.line, try std.fmt.allocPrint(a, "environment {s}: only host for now; other environments come later", .{v}));
+                if (!@import("rules.zig").envName(v)) return fail(diag, f.line, try std.fmt.allocPrint(a, "environment {s}: host, or an environment's name (a-z, 0-9, - and _)", .{v}));
                 d.environment = v;
+                d.environment_given = true;
             },
             .saved => d.saved = v,
         }
@@ -340,7 +344,7 @@ pub fn compare(a: std.mem.Allocator, old_def: ?Def, new: Def, d: Defaults) !Comp
         try widens.append(a, try std.fmt.allocPrint(a, "memory: {s}", .{@tagName(new.memory)}));
         inline for (limit_fields) |lf| if (@field(new, lf)) |v| try widens.append(a, try std.fmt.allocPrint(a, "{s}: {d}", .{ lf, v }));
         if (new.parallel > 0) try widens.append(a, try std.fmt.allocPrint(a, "parallel: {d}", .{new.parallel}));
-        try widens.append(a, try std.fmt.allocPrint(a, "environment: {s}", .{new.environment}));
+        try widens.append(a, try std.fmt.allocPrint(a, "environment: {s}", .{if (new.environment_given) new.environment else "the default ([default] env)"}));
         return .{ .widens = widens.items, .other = other.items };
     };
     if (!std.mem.eql(u8, old.description, new.description)) try other.append(a, try std.fmt.allocPrint(a, "description: {s} → {s}", .{ old.description, new.description }));
@@ -907,8 +911,8 @@ test "bad_definitions_are_named_with_their_line" {
     d = try diagOf(a, "researcher", head ++ "tools: search, telnet\n---\n");
     try t.expectEqual(4, d.line);
     try t.expectEqualStrings("unknown tool telnet", d.why);
-    d = try diagOf(a, "researcher", head ++ "environment: box\n---\n");
-    try t.expect(std.mem.indexOf(u8, d.why, "only host") != null);
+    d = try diagOf(a, "researcher", head ++ "environment: Box!\n---\n");
+    try t.expect(std.mem.indexOf(u8, d.why, "host, or an environment's name") != null);
     // a key twice, a nested line, a line that is no key, a bad number
     d = try diagOf(a, "researcher", head ++ "model: a\nmodel: b\n---\n");
     try t.expectEqual(5, d.line);

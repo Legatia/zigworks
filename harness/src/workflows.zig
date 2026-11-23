@@ -171,11 +171,12 @@ fn stepName(name: []const u8) bool {
     return true;
 }
 
-/// Why a step can't run its commands in environment `name`; null: it can.
-/// Runs don't pick an environment yet (gap 2's gate part): only `host`, this machine.
+/// Why a step's `env NAME` doesn't read; null: it does. Whether
+/// environments.ini has it is seen when the step runs (a command in one
+/// that isn't there is refused, never run on the host).
 pub fn envProblem(name: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, name, "host")) return null;
-    return "runs don't pick an environment yet: only env host";
+    if (@import("rules.zig").envName(name)) return null;
+    return "env takes host or an environment's name (a-z, 0-9, - and _, up to 32)";
 }
 
 /// "workflows/x.wf line N has an error: LINE (why)".
@@ -1280,7 +1281,7 @@ test "every_step_kind_reads_and_a_bad_line_is_named" {
     try refused(a, "x", "workflow x\nstep a\ntool web {}\n", 3, "web is no step tool");
     try refused(a, "x", "workflow x\nstep a\ntool trigger {}\n", 3, "it is never a step");
     try refused(a, "x", "workflow x\nstep a\ntool shell [1]\n", 3, "the tool's input is a JSON object");
-    try refused(a, "x", "workflow x\nstep a\ntool shell {\"command\":\"ls\"}\nenv box\n", 4, "runs don't pick an environment yet: only env host");
+    try refused(a, "x", "workflow x\nstep a\ntool shell {\"command\":\"ls\"}\nenv Box!\n", 4, "env takes host or an environment's name (a-z, 0-9, - and _, up to 32)");
     try refused(a, "x", "workflow x\nstep a\nsay hi\nmatch title has x\n", 4, "match goes with wait event");
     try refused(a, "x", "workflow x\nstep a\nsay hi\ndo more\n", 4, "a step takes one action");
     try refused(a, "x", "workflow x\nstep a\nsay hi\nretry two wait 1m\n", 4, "retry N wait D");

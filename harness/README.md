@@ -43,7 +43,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 952 unit tests (19 of them
+**State: 0.3.0, tested on macOS by its own tests: 970 unit tests (20 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 101 checks that drives the real binary against
@@ -970,7 +970,7 @@ workspace on this machine (`host`, built in):
 ```ini
 [box]
 kind = sandbox
-workspace = rw           ; rw | ro | none
+workspace = rw           ; rw | ro | none | copy (see Try in a copy)
 network = off            ; off | on
 read = /opt/tools, ~/go  ; more folders it may read
 
@@ -1036,9 +1036,73 @@ ssh here, and the command and what it started end there. `/env check
 NAME` runs one command on it; `/env rm NAME` removes its key and the kept
 host key.
 
-For now the agent's commands still run on host: environments are read,
-checked and can be tried, and the gate already takes `shell@NAME` rules,
-but runs don't pick an environment yet.
+**Where a run's commands run.** The first that applies: a `[use]` pin
+over what started the run (`owner`, `schedule`, `trigger:NAME`,
+`workflow:NAME/STEP`, `app:NAME`; a kind alone covers every name), a
+workflow step's `env NAME` line, the definition's `environment`, then
+`[default] env`. Helpers run where the run that delegated them does. The
+shell tool tells the agent where its commands run; a run that is not
+pinned may name another environment for one command (`env`), and the
+gate decides that as `shell@THAT`; a pinned run that names another is
+refused before the gate. A command in an environment that isn't in
+environments.ini, or whose sandbox or remote can't run here, is refused:
+it never runs on the host instead.
+
+Rules and grants are per environment: `allow shell@box *` allows in box
+only, a plain `shell` rule applies everywhere, and "Allow 24 h" covers
+the command in the environment it was asked in. A question says where:
+`shell in box (sandbox; workspace rw, no network): make test`. Log lines
+of commands outside the host carry `"env":"box"`. With `schedule = box`
+and `allow shell@box *`, a scheduled task runs its commands unattended in
+the sandbox. Files the agent wrote make the next command ask on the host
+and in a sandbox with the network on; not in a sandbox without it (what
+it wrote reaches neither the data folder nor the network), nor on a
+remote. An environment runs `parallel` commands at once (2 unless set).
+
+The agent can propose an environment, or a change to one, with
+`env_save` (in runs you started from a conversation): you see the whole
+section and the one it replaces and are asked every time; it is written
+into environments.ini under a line saying who saved it and applies at
+once. Never `host`, `[default]` or `[use]`.
+
+**Try in a copy.** `workspace = copy` gives each run in that sandbox its
+own copy of the workspace, so it can change anything and run its tests
+without touching your files:
+
+```ini
+[try]
+kind = sandbox
+workspace = copy
+check = zig build test   ; optional: run in the copy after the run
+apply = ask              ; ask | check (apply at once when the check passes)
+copy_mb = 2048           ; a larger workspace is not copied
+```
+
+The copy is made at the run's first call that reads or changes files
+(`state/env/NAME/copies/RUN`), cloned where the file system can (APFS,
+btrfs, XFS, ReFS and Dev Drives) and copied otherwise; what folders.ini's
+`skip` names is left out, `.git` is copied. The run's file tools and its
+commands act on the copy; it never writes the workspace. When it ends,
+the files that differ from the workspace as it was when copied are its
+changes. With none the copy goes. Otherwise you get an inbox item, "Run
+41 (try) changed 4 files in its copy", with the list, the check's result
+and its last lines, and Show (what changed, 2 KB a file), Apply and
+Drop. Apply takes a snapshot of the workspace first (where folders.ini
+keeps them), then writes each changed file whose workspace file is still
+as it was when copied; a file you changed meanwhile is left and named,
+and the copy is then kept 7 days (its path is said). Nothing is written
+through a symbolic link. Each run has its own copy, so several can work
+at once.
+
+**Windows sandboxes and cmd.** Inside an AppContainer, cmd's own `dir`,
+`del`, `ren`, `copy`, `move` and `cd /d` say "Access is denied": they
+first ask the drive what file system it has, and a sandbox may not open
+a drive's root. Programs (git, python, node, a compiler) and `type`,
+`echo >` and `if exist` work, and so do the agent's file tools. The data
+folder inside a `read =` folder (`read = ~`) is refused on every system;
+on Windows that makes the data folder stop inheriting access from the
+folder above it (who may use it stays the same), and it stays so after
+`/env rm`.
 
 ## Apps
 
@@ -1920,8 +1984,8 @@ name as the field; the first that holds wins), `retry N wait D` (N more
 tries after a failure, the waits doubling from D up to 6 h; not after a
 refusal), `on fail goto`, `on deny goto` (without it a Deny ends the
 instance), `on timeout goto` (for `wait event`; without it the step
-fails), `timeout D` (waits and inbox items, default 7 days), `env host`
-(other environments are not built yet), `goto STEP` and `end`.
+fails), `timeout D` (waits and inbox items, default 7 days), `env NAME`
+(where a step's commands run, unless a `[use]` pin says otherwise), `goto STEP` and `end`.
 
 - **Values.** Each step leaves `{STEP}`, `{STEP.ok}`, after a failure
   `{STEP.error}`, and an agent step `{STEP.skipped}`; every instance has
