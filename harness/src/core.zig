@@ -5597,15 +5597,45 @@ pub const Core = struct {
         };
     }
 
-    /// Gap 7 replaces this: gives event `ev` of trigger `tr` (it passed the
-    /// trigger's rules) to the oldest instance waiting on that trigger
-    /// whose `match` holds; whether one took it. The trigger's own action
-    /// gets it too.
+    /// Gives event `ev` of trigger `tr` (it passed the trigger's rules) to
+    /// the instance that has waited longest on that trigger whose `match`
+    /// holds (its values filled in as text); whether one took it. The event
+    /// is in that instance's state before it is told (due at the next
+    /// tick); the trigger's own action gets it too.
     fn offerWaiting(c: *Core, a: std.mem.Allocator, tr: *const triggers.Trigger, ev: tstate.Event) bool {
-        _ = c;
-        _ = a;
-        _ = tr;
-        _ = ev;
+        c.wf_mutex.lockUncancelable(c.io);
+        defer c.wf_mutex.unlock(c.io);
+        var waiting: std.ArrayList(*WfInfo) = .empty;
+        for (c.wf_list.items) |info| {
+            const s = info.state;
+            if (info.busy or s.status != .waiting or s.wait.kind != .event or s.wait.got or !std.mem.eql(u8, s.wait.trigger, tr.name)) continue;
+            waiting.append(a, info) catch return false;
+        }
+        std.mem.sort(*WfInfo, waiting.items, {}, struct {
+            fn lt(_: void, x: *WfInfo, y: *WfInfo) bool {
+                if (x.state.wait.since != y.state.wait.since) return x.state.wait.since < y.state.wait.since;
+                return x.state.n < y.state.n;
+            }
+        }.lt);
+        for (waiting.items) |info| {
+            const pid = wstate.parseId(info.id) orelse continue;
+            const inst = (c.wfDir(a, pid.name) catch continue).instance(a, pid.n) catch continue;
+            var st = inst.loadState(a) catch continue;
+            var diag: workflows.Diag = .{};
+            const w = workflows.parse(a, pid.name, inst.workflowText(a) catch continue, &diag) catch continue;
+            const i = w.find(st.step) orelse continue;
+            const values = jv.parse(a, st.values) orelse continue;
+            if (!workflows.matchHolds(a, w.steps[i].match, values, ev.fields)) continue;
+            st.wait.got = true;
+            st.wait.event = eventJson(a, ev) catch continue;
+            st.updated = c.now();
+            inst.saveState(a, st) catch continue;
+            const kept = c.keepInfo(info.id, st) catch info;
+            kept.due = true;
+            inst.journal(a, .{ .at = c.now(), .step = st.step, .event = "event", .text = ev.id }) catch {};
+            c.log.write(.workflow, false, .{ .instance = info.id, .event = "event", .trigger = tr.name, .id = ev.id }) catch {};
+            return true;
+        }
         return false;
     }
 
@@ -7830,10 +7860,43 @@ const InstRun = struct {
     /// it, Drop; a text reply is the owner's version): an item whose
     /// waiter is the step; no answer by `timeout` is Deny.
     fn askStep(r: *InstRun, s: workflows.Step, approve: bool) !StepEnd {
-        _ = s;
-        _ = approve;
-        _ = r;
-        return .{ .failed = .{ .why = "approve and review are not built yet", .retry = false } };
+        const lbl = r.label(s.name);
+        const now_s = r.c.now();
+        const private = r.c.convPrivate(r.w.to);
+        const made = if (approve) blk: {
+            const body = try std.fmt.allocPrint(r.a, "{s}{s}", .{ r.tag(), r.st.call });
+            break :blk r.c.addItem(.{
+                .kind = "question",
+                .by = r.by(s.name),
+                .run = lbl,
+                .conversation = r.w.to,
+                .waiter = lbl,
+                .title = firstLine(body),
+                .body = body,
+                .choices = &.{ .{ .key = "approve", .label = "Approve" }, .{ .key = "deny", .label = "Deny" } },
+                .expires = now_s + s.timeout(),
+                .private = private,
+            });
+        } else blk: {
+            const body = try std.fmt.allocPrint(r.a, "{s}Step {s}: use this, drop it, or reply with your own version.", .{ r.tag(), s.name });
+            break :blk r.c.addItem(.{
+                .kind = "draft",
+                .by = r.by(s.name),
+                .run = lbl,
+                .conversation = r.w.to,
+                .waiter = lbl,
+                .title = firstLine(body),
+                .body = body,
+                .choices = &.{ .{ .key = "use", .label = "Use it" }, .{ .key = "drop", .label = "Drop" } },
+                .text = .draft,
+                .draft = r.st.call,
+                .expires = now_s + s.timeout(),
+                .private = private,
+            });
+        };
+        const item = made catch |e| return .{ .failed = .{ .why = @errorName(e) } };
+        r.st.wait = .{ .kind = .item, .item = item, .phase = if (approve) "approve" else "review", .since = now_s };
+        return .waits;
     }
 };
 
@@ -13679,4 +13742,104 @@ test "a_shell_step_after_files_were_written_is_asked_naming_them" {
     try f.press("once");
     runWorkflows(&f);
     try f.rec.waitFor("[build#1] exit code 0\nbuilt");
+}
+
+
+test "wait_event_takes_the_next_matching_event" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try writePage(&f, "z.xml", try rssOf(&f, &.{"old"}));
+    try setTriggers(&f, "[news]\nfeed = URL/page/z.xml\nsay = new: {title}\n");
+    try setWorkflow(&f, "watch", "workflow watch\nstep next\nwait event news\nmatch title has {input}\ntimeout 1d\nstep tell\nsay {input}: {next.title}\n");
+    _ = try f.core.pollNow("news");
+    _ = try f.core.command(a, "/workflow start watch zig");
+    _ = try f.core.command(a, "/workflow start watch rust");
+    runWorkflows(&f);
+    try t.expectEqual(wstate.Status.waiting, (try instState(&f, "watch#1")).status);
+    try t.expectEqual(wstate.WaitKind.event, (try instState(&f, "watch#1")).wait.kind);
+    // an event goes to the one whose match holds; one matching none to none
+    try writePage(&f, "z.xml", try rssOf(&f, &.{ "old", "rust-1.90", "go-1.30" }));
+    _ = try f.core.pollNow("news");
+    runWorkflows(&f);
+    try f.rec.waitFor("[watch#2] rust: rust-1.90");
+    try t.expectEqual(wstate.Status.waiting, (try instState(&f, "watch#1")).status);
+    // the trigger's own say gets them too
+    try f.rec.waitFor("[news] new: rust-1.90\nnew: go-1.30");
+    // the next matching event, one each: the second waits for no one
+    try writePage(&f, "z.xml", try rssOf(&f, &.{ "old", "rust-1.90", "go-1.30", "zig-0.18", "zig-0.19" }));
+    _ = try f.core.pollNow("news");
+    runWorkflows(&f);
+    try f.rec.waitFor("[watch#1] zig: zig-0.18");
+    try t.expectEqual(0, f.rec.count("[watch#1] zig: zig-0.19"));
+    try expectHas(try logText(&f), "\"instance\":\"watch#1\",\"event\":\"event\",\"trigger\":\"news\"");
+}
+
+test "approve_times_out_as_deny" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    try setWorkflow(&f, "ask", "workflow ask\nstep ok\napprove Go ahead with {input}?\ntimeout 1h\non deny goto told\nstep go\nsay going\nend\nstep told\nsay not going: {ok}\n");
+    _ = try f.core.command(a, "/workflow start ask the plan");
+    runWorkflows(&f);
+    try f.rec.waitFor("BUTTONS Question [1]\n[ask#1] Go ahead with the plan? [");
+    try t.expectEqualStrings("approve", (try instState(&f, "ask#1")).wait.phase);
+    // no answer in its hour: Deny, on to its on deny step
+    f.core.fixed_now = t0 + 3601;
+    runWorkflows(&f);
+    try f.rec.waitFor("[ask#1] not going: deny");
+    try t.expectEqual(0, f.rec.count("[ask#1] going"));
+    // with no on deny, a Deny ends it: done, denied
+    try setWorkflow(&f, "sure", "workflow sure\nstep ok\napprove Sure?\nstep go\nsay going\n");
+    _ = try f.core.command(a, "/workflow start sure");
+    runWorkflows(&f);
+    try f.press("deny");
+    runWorkflows(&f);
+    const st = try instState(&f, "sure#1");
+    try t.expectEqual(wstate.Status.done, st.status);
+    try expectHas(st.why, "denied at step ok: denied by the owner (item 2)");
+    try t.expectEqual(0, f.rec.count("[sure#1] going"));
+}
+
+test "a_review_reply_is_the_text_used" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try setWorkflow(&f, "post", "workflow post\nstep draft\nreview Thanks for the report, {input}!\nstep send\nsay {draft}\n");
+    _ = try f.core.command(a, "/workflow start post Ana");
+    runWorkflows(&f);
+    try f.rec.waitFor("BUTTONS Draft to review [1]\n[post#1] Step draft: use this, drop it, or reply with your own version.\n\nThanks for the report, Ana!");
+    // a text reply is the owner's version: the text used
+    try expectHas(try f.core.command(a, "/answer 1 Thanks, Ana: fixed in 0.4."), "Item 1: replaced with your version");
+    runWorkflows(&f);
+    try f.rec.waitFor("[post#1] Thanks, Ana: fixed in 0.4.");
+    // Use it keeps the draft
+    _ = try f.core.command(a, "/workflow start post Bo");
+    runWorkflows(&f);
+    try f.press("use");
+    runWorkflows(&f);
+    try f.rec.waitFor("[post#2] Thanks for the report, Bo!");
+}
+
+test "an_approve_answer_grants_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    _ = try withFake(&f, false);
+    try setWorkflow(&f, "gated", "workflow gated\nstep ok\napprove Echo it?\nstep call\ntool fake/echo {\"text\": \"x\"}\n");
+    _ = try f.core.command(a, "/workflow start gated");
+    runWorkflows(&f);
+    try f.press("approve");
+    runWorkflows(&f);
+    // the call the gate asks about is asked too: the approval was data
+    try f.rec.waitFor("BUTTONS Allow this? [2]\n[gated#1 call] fake__echo: fake/echo {\"text\":\"x\"}");
+    const grants = Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.grants, a, .unlimited) catch "";
+    try t.expect(std.mem.indexOf(u8, grants, "fake/echo") == null);
+    try t.expectEqualStrings("approve", jv.str(jv.get(jv.parse(a, (try instState(&f, "gated#1")).values), "ok")).?);
 }
