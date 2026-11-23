@@ -152,7 +152,7 @@ fn checkLine(a: std.mem.Allocator, o: *std.ArrayList(u8), indent: []const u8, dv
         for (dv.aliases, 0..) |al, j| try o.print(a, "{s}{s}", .{ if (j > 0) ", " else "", al });
     }
     try o.print(a, "): {s}; may: ", .{what});
-    if (dv.allow.len == 0) try o.appendSlice(a, if (dv.kind == .smoke) "nothing (only watched)" else "nothing (only seen)");
+    if (dv.allow.len == 0) try o.appendSlice(a, if (dv.kind == .smoke) "nothing (only watched)" else if (dv.kind == .doorbell) "nothing (it rings)" else "nothing (only seen)");
     for (dv.allow, 0..) |x, j| try o.print(a, "{s}{s}", .{ if (j > 0) ", " else "", @tagName(x) });
     try o.append(a, '\n');
 }

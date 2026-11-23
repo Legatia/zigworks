@@ -155,8 +155,8 @@ def poke(device, values):
         c.sendall(bytes([0xE0, 0]))
         c.close()
 
-names = {"ha": {"light": "light.living_room", "door": "lock.front_door", "back": "binary_sensor.back_door", "anna": "person.anna", "ben": "person.ben"},
-         "z2m": {"light": "Living room light", "door": "Front door", "back": "Back door"}}[hub]
+names = {"ha": {"light": "light.living_room", "door": "lock.front_door", "back": "binary_sensor.back_door", "anna": "person.anna", "ben": "person.ben", "bell": "event.front_door_bell"},
+         "z2m": {"light": "Living room light", "door": "Front door", "back": "Back door", "bell": "Front door bell"}}[hub]
 
 send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}}})
 m = recv(0)
@@ -183,6 +183,18 @@ check("... and reads from, to and when", '"from":"closed","to":"open","at":"20' 
 poke(names["back"], {"contact": True})
 check("closing it again is pushed too", wait_note("home://device/back_door", 2), str(notes))
 check("nothing pushed for what wasn't subscribed to", set(notes) == {"home://device/back_door"}, str(notes))
+# the doorbell: every press is pushed, though each reads "ring"
+rpc("resources/subscribe", {"uri": "home://device/front_door_bell"})
+time.sleep(0.5 if hub == "z2m" else 0)
+poke(names["bell"], {"ring": True})
+check("a doorbell's ring is pushed", wait_note("home://device/front_door_bell", 1), str(notes))
+text = read("home://device/front_door_bell")
+check("... and reads as a ring, from the hall", '"room":"Hall","kind":"doorbell"' in text and '"to":"ring"' in text, text)
+time.sleep(1.1)
+poke(names["bell"], {"ring": True})
+check("the next press is pushed too", wait_note("home://device/front_door_bell", 2), str(notes))
+text, err = call("home_set", {"device": "front_door_bell", "action": "on"})
+check("nothing acts on a doorbell", err and "front_door_bell may only be seen, never acted on" in text, text)
 if hub == "ha":
     rpc("resources/subscribe", {"uri": "home://presence"})
     text = read("home://presence")
@@ -286,7 +298,8 @@ check "check: every device through Home Assistant" 'HA_TOKEN=smoke-token "$B" ch
 check "check: changes come in as they happen" 'grep -qxF "Changes come in as they happen (Home Assistant'"'"'s WebSocket API)." "$T/c" && grep -qF "People: anna (person.anna) is home, ben (person.ben) is away." "$T/c"'
 check "check: the speakers that may announce" 'grep -qxF "Speakers that may announce: kitchen_speaker (Kitchen, through tts.piper), hall_voice (Hall)." "$T/c"'
 check "discover writes a home file that check reads" 'HA_TOKEN=smoke-token "$B" discover "http://127.0.0.1:$HA_PORT" >"$T/found.ini" 2>"$T/found.txt" && HA_TOKEN=smoke-token "$B" check "$T/found.ini" >"$T/c2" && grep -q "front_door (lock.front_door, lock, guarded): locked; may: lock" "$T/c2"'
-check "... with safe defaults, and a summary in plain words" 'grep -qxF "Found 17 devices in 5 rooms, and 2 people." "$T/found.txt" && grep -qxF "May announce: Hall voice." "$T/found.txt" && grep -qxF "Watched, never acted on: Kitchen smoke alarm." "$T/found.txt" && grep -qF "Left out: Front door camera (a camera), Kettle child lock (a setting)" "$T/found.txt" && ! grep -q "^id = camera" "$T/found.ini" && grep -qF ";   camera.front_door (Front door camera)" "$T/found.ini"'
+check "... with safe defaults, and a summary in plain words" 'grep -qxF "Found 18 devices in 5 rooms, and 2 people." "$T/found.txt" && grep -qxF "May announce: Hall voice." "$T/found.txt" && grep -qxF "Watched, never acted on: Kitchen smoke alarm." "$T/found.txt" && grep -qF "Left out: Front door camera (a camera), Kettle child lock (a setting)" "$T/found.txt" && ! grep -q "^id = camera" "$T/found.ini" && grep -qF ";   camera.front_door (Front door camera)" "$T/found.ini"'
+check "a doorbell is found and rings, nothing allowed" 'grep -qxF "Doorbells (they ring, nothing acts on them): Front door bell." "$T/found.txt" && grep -qF "front_door_bell (event.front_door_bell, doorbell): idle; may: nothing (it rings)" "$T/c2"'
 check "a smoke alarm is watched: its state read, nothing allowed" 'grep -qF "kitchen_smoke_alarm (binary_sensor.kitchen_smoke, smoke): clear; may: nothing (only watched)" "$T/c2" && grep -qF "kitchen_smoke_alarm (binary_sensor.kitchen_smoke, smoke): clear; may: nothing (only watched)" "$T/c"'
 printf '[home]\nhub = homeassistant\nurl = http://127.0.0.1:%s\n[device smoke]\nid = binary_sensor.kitchen_smoke\nkind = smoke\nallow = off\n' "$HA_PORT" >"$T/smoke-allow.ini"
 check "a home file line that would act on a smoke alarm is refused" '! HA_TOKEN=smoke-token "$B" check "$T/smoke-allow.ini" 2>"$T/err" && grep -qF "a smoke or CO alarm is only watched: nothing may act on it (no allow line)" "$T/err"'

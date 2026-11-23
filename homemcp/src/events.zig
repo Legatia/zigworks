@@ -118,14 +118,23 @@ pub const Events = struct {
     }
 
     /// Device `i`'s main state (model.headline) as its hub reported it at
-    /// `at_ms`; null says nothing.
+    /// `at_ms`; null says nothing. A doorbell's ring is a press, not a
+    /// state: each one heard as it happens is told, though it reads as the
+    /// last; one heard while connecting (fill) is old news, kept untold.
     pub fn device(e: *Events, i: usize, state: ?[]const u8, at_ms: i64, mode: Mode) void {
         const now = state orelse return;
+        const press = e.cfg.devices[i].kind == .doorbell and std.mem.eql(u8, now, "ring");
         const changed = blk: {
             e.lock.lockUncancelable(e.io);
             defer e.lock.unlock(e.io);
             const d = &e.devices[i];
-            if (d.to) |old| if (std.mem.eql(u8, old, now)) break :blk false;
+            if (press) {
+                const again = if (d.at_ms) |last| at_ms == last else false;
+                if (d.to != null and (mode == .fill or again)) {
+                    if (mode == .fill and !again) d.at_ms = at_ms;
+                    break :blk false;
+                }
+            } else if (d.to) |old| if (std.mem.eql(u8, old, now)) break :blk false;
             // an answer older than what is known never undoes it
             if (mode == .fill) if (d.at_ms) |known_at| if (at_ms < known_at) break :blk false;
             const copy = e.gpa.dupe(u8, now) catch break :blk false;
@@ -397,4 +406,43 @@ test "the resources: one per listed device, and presence when people are listed"
     try t.expectEqualStrings("application/json", items[0].object.get("mimeType").?.string);
     try t.expect(std.mem.indexOf(u8, items[0].object.get("description").?.string, "not instructions") != null);
     try t.expectEqualStrings("home://presence", items[2].object.get("uri").?.string);
+}
+
+test "a_doorbell_pushes_every_ring" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: config.Diag = .{};
+    const cfg = try config.parse(a,
+        \\[home]
+        \\hub = homeassistant
+        \\url = http://127.0.0.1:8123
+        \\[device front_door_bell]
+        \\id = event.front_door_bell
+        \\kind = doorbell
+        \\room = Hall
+    , &d);
+    var ev = try Events.init(t.allocator, t.io, &cfg);
+    defer ev.deinit();
+    var told: Told = .{};
+    ev.setSink(.{ .ctx = &told, .f = Told.note });
+    // the last ring heard while connecting is old news: kept, not pushed
+    ev.device(0, "ring", 1795305600_000, .fill);
+    try t.expectEqual(0, told.n);
+    // a press is told, and so is the next one, though it reads the same
+    ev.device(0, "ring", 1795305660_000, .change);
+    try t.expectEqual(1, told.n);
+    try t.expectEqualStrings("home://device/front_door_bell", told.last());
+    ev.device(0, "ring", 1795305720_000, .change);
+    try t.expectEqual(2, told.n);
+    try t.expect(std.mem.indexOf(u8, (try ev.read(a, "home://device/front_door_bell")).?, "\"kind\":\"doorbell\",\"from\":\"ring\",\"to\":\"ring\",\"at\":\"2026-11-22T00:02:00Z\"") != null);
+    // the same ring heard again (the same time) is not another
+    ev.device(0, "ring", 1795305720_000, .change);
+    try t.expectEqual(2, told.n);
+    // nor is a ring a reconnect finds
+    ev.device(0, "ring", 1795305780_000, .fill);
+    try t.expectEqual(2, told.n);
+    // idle after a press is a change like any
+    ev.device(0, "idle", 1795305790_000, .change);
+    try t.expectEqual(3, told.n);
 }

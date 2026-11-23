@@ -8,7 +8,7 @@ time. After every action homemcp reads the device back and says whether it
 took. Changes in the home are pushed to the client as MCP resource updates.
 `announce` says a short message aloud on the speakers the home file allows.
 Smoke and CO alarms are watched only: their state is read and pushed, and
-nothing acts on them.
+nothing acts on them. A doorbell pushes `ring` at each press.
 
 ```
 agent ◀─MCP, stdio─▶ homemcp ──MQTT──────────▶ Zigbee2MQTT ──▶ devices
@@ -20,10 +20,12 @@ macOS, Linux and Windows. One binary, nothing beyond the Zig standard
 library (and libc on macOS). Secrets come from the environment, never from
 the home file.
 
-**State: 0.2.0, `announce` and smoke and CO alarms watched (kind `smoke`),
-tested against its own stand-in, `homemcp-sim`, and never with a real hub,
-device or speaker: 41 unit tests and a smoke script of 64 checks on macOS
-(the Zigbee2MQTT ones skipped without Mosquitto).** The tests
+**State: 0.2.0, `announce`, smoke and CO alarms watched (kind `smoke`) and
+doorbells (kind `doorbell`), tested against its own stand-in,
+`homemcp-sim`, and never with a real hub, device, speaker or doorbell: 44
+unit tests and a smoke script of 69 checks on macOS (the Zigbee2MQTT ones
+skipped without Mosquitto; a Zigbee2MQTT doorbell is covered by the unit
+tests only).** The tests
 cover Home Assistant's REST and WebSocket APIs (`announce` against the
 stand-in's voice satellite and media player), and Zigbee2MQTT over MQTT. 0.2.0 ran on macOS, where the
 Zigbee2MQTT checks ran against a small stand-in broker, not Mosquitto; it is
@@ -43,7 +45,7 @@ WebSocket):
 $ zig build -Doptimize=ReleaseSafe
 $ ./zig-out/bin/homemcp-sim ha 8123 not-a-real-token &
 $ HA_TOKEN=not-a-real-token ./zig-out/bin/homemcp check examples/ha.ini
-The flat (made up by homemcp-sim): 16 devices in 5 rooms. Home Assistant at http://127.0.0.1:8123.
+The flat (made up by homemcp-sim): 17 devices in 5 rooms. Home Assistant at http://127.0.0.1:8123.
 Changes come in as they happen (Home Assistant's WebSocket API).
 Living room
   living_room_light (light.living_room, light; also called: the big light): off; may: on, off, brightness
@@ -62,6 +64,7 @@ Hall
   hall_voice (assist_satellite.hall_voice, satellite): idle; may: announce
   front_door (lock.front_door, lock, guarded): locked; may: lock
   hall_motion (binary_sensor.hall_motion, sensor): nobody there; may: nothing (only seen)
+  front_door_bell (event.front_door_bell, doorbell): idle; may: nothing (it rings)
 Garage
   garage_door (cover.garage_door, cover, guarded): closed; may: close
 No room
@@ -84,7 +87,8 @@ agent starts it. The simulator's sensors and people change when told to:
 `homemcp-sim poke ha 8123 not-a-real-token binary_sensor.back_door
 '{"contact": false}'` (or `poke z2m 127.0.0.1:1883 "Back door" ...`), with
 any of `occupancy`, `contact`, `available`, `temperature`, `locked`,
-`leak`, `smoke`, and for a person `home`.
+`leak`, `smoke`, `ring` (the doorbell, `event.front_door_bell`), and for a
+person `home`.
 
 ## Tools
 
@@ -139,7 +143,7 @@ one changes, then reads it (`resources/read`):
 
 - **The main state** is what a change is about: on or off, open or closed,
   locked, a thermostat's mode and setpoint, a sensor's reading, a smoke or
-  CO alarm's `ALARM` or `clear`, offline. A
+  CO alarm's `ALARM` or `clear`, a doorbell's `ring` or `idle`, offline. A
   plug's power reading or the room temperature under a thermostat changes
   `home_state`, not the resource, so a push means something happened.
 - **Presence** comes from Home Assistant's `person` entities listed under
@@ -157,6 +161,12 @@ one changes, then reads it (`resources/read`):
   connects again after 1 s, 2 s, 4 s, up to a minute. Actions and
   `home_state` still use REST. **Zigbee2MQTT:** the state and availability
   topics homemcp follows anyway.
+- **A doorbell's ring is a press, not a state.** Each press is pushed as
+  `ring`, the next one too though it reads the same (its `at` differs):
+  Home Assistant's doorbell `event` entities (each press a new time),
+  binary sensors (on while pressed, then `idle`), and Zigbee2MQTT buttons
+  (each message with an `action`; a hold's `release` is none). A ring heard
+  while connecting is old news: kept, not pushed.
 - States heard in the first 3 seconds after connecting fill the resources
   without a push, so a restart doesn't look like a burst of changes.
   `check` says whether changes come in.
@@ -222,12 +232,13 @@ the friendly names, the friendly names and voice aliases as `alias` lines,
 and `[people]`, and says what it found on stderr:
 
 ```
-Found 17 devices in 5 rooms, and 2 people.
+Found 18 devices in 5 rooms, and 2 people.
 May act when asked: Living room light, Kettle plug, Hall thermostat, Bedroom lamp, Ceiling fan, Kitchen speaker, Evening.
 May announce: Hall voice.
 Guarded, asked every time: Front door (lock), Garage door (close), Water main (close), Leaving (activate).
 Only seen: Hall motion, Back door, Living room temperature, Sink leak.
 Watched, never acted on: Kitchen smoke alarm.
+Doorbells (they ring, nothing acts on them): Front door bell.
 Left out: Front door camera (a camera), Kettle child lock (a setting), Sun (not a kind homemcp knows).
 A plug may power a heater or a kettle: for those, make it allow = off. Then: homemcp check FILE
 ```
@@ -243,6 +254,7 @@ The defaults:
 | A switch whose name says valve | guarded, `off` only; one whose name says garage, gate, door, lock or alarm: guarded, nothing allowed until you add it |
 | Motion, door, window, leak, temperature, humidity and other sensors | only seen |
 | Smoke, CO and gas alarms | `kind = smoke`: watched, never acted on |
+| Doorbells: a Home Assistant doorbell `event`, a binary sensor or event named doorbell or ding (or dzwonek), a Zigbee2MQTT button named so | `kind = doorbell`: each press pushed as `ring`, nothing acted on (a doorbell's camera is a camera: left out) |
 | Cameras, a device's settings and diagnostics (child lock, LED, firmware), hidden entities, anything else | left out, each listed in a comment at the end that says why |
 
 Read the file through before using it: unlocking, opening a garage door and
@@ -303,6 +315,7 @@ anna = person.anna
 | `valve` (always guarded) | `open`, `close` |
 | `sensor` | none: only seen |
 | `smoke` (smoke, CO and gas alarms) | none: only watched; an `allow` or `guarded = yes` line on one is refused |
+| `doorbell` (a Home Assistant doorbell event or binary sensor, a Zigbee2MQTT button) | none: it rings (`ring`, pushed at each press); an `allow` or `guarded = yes` line on one is refused |
 
 Each is read back after it is sent: a colour by its hue (a bulb never shows
 exactly the colour it was sent), colour temperature within 3 %, a fan
