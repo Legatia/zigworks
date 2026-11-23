@@ -41,8 +41,12 @@ pub const Hub = union(enum) {
         switch (cfg.hub) {
             .zigbee2mqtt => {
                 const z = try gpa.create(Z2m);
+                errdefer gpa.destroy(z);
                 z.* = try .init(gpa, io, cfg, secrets);
-                z.thread = try std.Thread.spawn(.{}, Z2m.loop, .{z});
+                z.thread = std.Thread.spawn(.{}, Z2m.loop, .{z}) catch |e| {
+                    z.free();
+                    return e;
+                };
                 return .{ .z2m = z };
             },
             .homeassistant => {
@@ -50,7 +54,11 @@ pub const Hub = union(enum) {
                 errdefer gpa.destroy(h);
                 h.* = .{ .gpa = gpa, .io = io, .cfg = cfg, .token = secrets.ha_token, .client = .init(gpa, io, try http.Target.parse(cfg.url)), .events = try .init(gpa, io, cfg) };
                 h.client.user_agent = "homemcp";
-                h.thread = try std.Thread.spawn(.{}, Ha.follow, .{h});
+                h.thread = std.Thread.spawn(.{}, Ha.follow, .{h}) catch |e| {
+                    h.client.deinit();
+                    h.events.deinit();
+                    return e;
+                };
                 return .{ .ha = h };
             },
         }
@@ -194,13 +202,18 @@ pub const Z2m = struct {
     fn stop(z: *Z2m) void {
         z.stopping.store(true, .release);
         if (z.thread) |th| th.join();
+        z.free();
+        z.gpa.destroy(z);
+    }
+
+    /// What it holds (not itself).
+    fn free(z: *Z2m) void {
         for (z.json) |j| z.gpa.free(j);
         z.gpa.free(z.json);
         z.gpa.free(z.at_ns);
         z.gpa.free(z.available);
         z.gpa.free(z.problem);
         z.events.deinit();
-        z.gpa.destroy(z);
     }
 
     fn connected(z: *Z2m) bool {

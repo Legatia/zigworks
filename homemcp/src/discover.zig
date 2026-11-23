@@ -429,7 +429,7 @@ fn render(a: Allocator, r: *const Read) !Found {
         \\
     );
     if (r.hub == .zigbee2mqtt) try o.appendSlice(a, "; Zigbee2MQTT has no rooms: add room = lines.\n");
-    if (r.no_areas) try o.appendSlice(a, "; Home Assistant didn't share its areas with this token (an administrator's can): no rooms.\n");
+    if (r.no_areas) try o.appendSlice(a, "; Home Assistant didn't share its areas with this token: no rooms.\n");
     try o.print(a, "\n[home]\nname = {s}\n", .{r.home_name});
     if (r.hub == .homeassistant) {
         try o.print(a, "hub = homeassistant\nurl = {s}\n", .{r.where});
@@ -485,7 +485,7 @@ fn render(a: Allocator, r: *const Read) !Found {
     try listLine(a, &sm, r.items, "Only seen: ", .seen);
     try listLine(a, &sm, r.items, "Left out: ", .left);
     if (r.hub == .zigbee2mqtt) try sm.appendSlice(a, "Zigbee2MQTT has no rooms: add room = lines.\n");
-    if (r.no_areas) try sm.appendSlice(a, "Home Assistant didn't share its areas with this token (an administrator's can): no rooms.\n");
+    if (r.no_areas) try sm.appendSlice(a, "Home Assistant didn't share its areas with this token: no rooms.\n");
     try sm.appendSlice(a, "A plug may power a heater or a kettle: for those, make it allow = off. Then: homemcp check FILE\n");
     return .{ .text = o.items, .summary = sm.items };
 }
