@@ -1005,12 +1005,19 @@ test "sandbox_stop_and_limit_end_every_process" {
     // a sleeper in the background (Linux: one in a session of its own too;
     // macOS has no setsid, and one that leaves the group survives there as
     // on the host), and the command waiting in front
+    // a marker made here, at run time: no other process's command line
+    // (the shell that started the tests included) can hold it
+    var rnd: [4]u8 = undefined;
+    t.io.random(&rnd);
+    var mb: [16]u8 = undefined;
+    const marker = try std.fmt.bufPrint(&mb, "31.{d:0>6}", .{std.mem.readInt(u32, &rnd, .little) % 1000000});
+    var cb: [128]u8 = undefined;
     const command = if (is_windows)
         "start /b cmd /c \"for /l %i in (1,1,2000000000) do @rem\" & for /l %i in (1,1,2000000000) do @rem"
     else if (is_linux)
-        "sleep 31.7 & setsid sleep 31.7 & sleep 31.7"
+        try std.fmt.bufPrint(&cb, "sleep {s} & setsid sleep {s} & sleep {s}", .{ marker, marker, marker })
     else
-        "sleep 31.7 & sleep 31.7";
+        try std.fmt.bufPrint(&cb, "sleep {s} & sleep {s}", .{ marker, marker });
     var job = proc.Job.create();
     defer job.close();
     var req = f.request(command);
@@ -1031,7 +1038,7 @@ test "sandbox_stop_and_limit_end_every_process" {
         std.debug.print("the stop took {d} ms (stopped at 800 ms)\n", .{ms});
         return error.TestUnexpectedResult;
     }
-    try expectNoneLeft(&job, "31.7");
+    try expectNoneLeft(&job, marker);
     // the time limit the same way
     f.stop.store(false, .release);
     f.seconds = 1;
@@ -1040,7 +1047,7 @@ test "sandbox_stop_and_limit_end_every_process" {
     req.job = &job2;
     const o2 = try sandboxRun(&f, req);
     try expectHas(o2.text, "time limit reached");
-    try expectNoneLeft(&job2, "31.7");
+    try expectNoneLeft(&job2, marker);
 }
 
 /// Nothing of the command is left: on Windows its job is empty; on Linux
@@ -1055,8 +1062,20 @@ fn expectNoneLeft(job: *proc.Job, marker: []const u8) !void {
         if (!(try anyProcessWith(marker))) return;
         t.io.sleep(.fromMilliseconds(50), .awake) catch {};
     }
-    std.debug.print("a process with {s} in its command line was still there 2 s after the command ended\n", .{marker});
+    std.debug.print("a process with {s} in its command line was still there 2 s after the command ended:\n", .{marker});
+    printProcessesWith(marker);
     return error.TestUnexpectedResult;
+}
+
+/// What a test failure shows: each process with `marker` in its command
+/// line, with its parent, group and state.
+fn printProcessesWith(marker: []const u8) void {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    if (is_windows) return;
+    const r = std.process.run(arena.allocator(), t.io, .{ .argv = &.{ "/bin/ps", "-axww", "-o", "pid=,ppid=,pgid=,stat=,command=" } }) catch return;
+    var it = std.mem.splitScalar(u8, r.stdout, '\n');
+    while (it.next()) |l| if (std.mem.indexOf(u8, l, marker) != null) std.debug.print("  {s}\n", .{l});
 }
 
 fn anyProcessWith(marker: []const u8) !bool {

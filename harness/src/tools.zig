@@ -237,6 +237,18 @@ const Watch = struct {
     }
 };
 
+/// Kills process group `pgid` until it is empty, for up to 1 s: a child
+/// forked while the first kill landed can miss that kill, and one kill
+/// would leave it running.
+fn sweepGroup(io: Io, pgid: std.posix.pid_t) void {
+    var waited: u32 = 0;
+    while (waited < 1000) : (waited += 20) {
+        // no process left in the group (or none we may signal): done
+        std.posix.kill(-pgid, .KILL) catch return;
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+}
+
 /// Runs `command` in `dir` (a folder in the workspace; "" the workspace).
 fn shell(env: Env, arena: std.mem.Allocator, command: []const u8, dir: []const u8) !Output {
     const cwd = if (dir.len == 0) env.workspace else blk: {
@@ -309,7 +321,7 @@ pub fn runChild(env: Env, arena: std.mem.Allocator, child: *std.process.Child, j
         const th_err = try std.Thread.spawn(.{}, Collector.pumpUntil, .{ &col, env.io, err_f, &ended });
         term = child.wait(env.io) catch null;
         // nothing the command started may outlive it
-        if (is_windows) job.kill(null) else std.posix.kill(-watch.id, .KILL) catch {};
+        if (is_windows) job.kill(null) else sweepGroup(env.io, watch.id);
         // what is left in the pipes, for up to 2 s; a process that left the
         // group and kept them open is not waited for
         var waited: u32 = 0;
