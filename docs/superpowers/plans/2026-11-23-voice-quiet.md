@@ -44,6 +44,14 @@ Quiet hours and the digest:
 17. **A held post's delivery status is `digest`** (agent.Delivery.Status): the send line's event; the model is told "held for the digest at 07:00 (quiet hours)", not an error; a brief's links count as seen, a page trigger's value moves on, a workflow's `say` goes on, a task logs `done` with why. Cost if wrong: none.
 18. **Log lines:** the send line (event `digest`); `chat` `held` (id, conversation, by, item) for every hold; `chat` `digest` (conversation, lines, message) per digest; `chat` `released` (id, item or message) per follower; `config` `quiet` for `/quiet`. No texts in them.
 
+Made while building:
+
+19. **What the owner asked for now is never held:** `/brief` (its job's key `brief-now:`), `/trigger run` (a by-hand poll), and one-off commands run by hand (`harness task run`, `brief`, `trigger run`, `workflow start`: the core's role). Why: "replies to the owner's own messages always go at once", and the terminal prints them now. Cost if wrong: a by-hand run at night wakes the owner, who asked for it.
+20. **A workflow's head takes `urgent yes`** (its lines are `KEY VALUE`) and also `urgent = yes`, as triggers.ini writes it. Cost if wrong: none.
+21. **A held post that can't be written to `state/quiet` goes at once** (logged `not held`): better a sound at night than a lost post. Cost if wrong: a rare sound at night.
+22. **A task's reply outcome keeps its own copy of `why`** (`Sched.why_buf`): a final `send` is posted in its turn's arena, freed before the task reads how it went (a use-after-free the digest's `why` showed in a full run; the hourly limit's `why` had it before). Cost if wrong: none.
+23. **The voice service's key shows in `harness secret list`, and a missing one is said at start** (`note: no groq key stored …; voice notes will be refused`), as a model provider's is. Cost if wrong: none.
+
 ## Files
 
 - Create `harness/src/voice.zig`, `harness/src/quiet.zig`.
@@ -55,46 +63,53 @@ Quiet hours and the digest:
 
 **Produces:** `voice.Note{kind, file_id, seconds, size, mime, name}`; `telegram.Message.voice: ?voice.Note`; `Bot.getFile(arena, file_id) !File{path, size}`, `Bot.download(arena, path, max) ![]u8` (error.TooLarge past `max`). fake.zig: `getFile` answers `telegram/files/ID` as `voice/ID.oga` (400 when missing), `GET /file/bot<token>/<path>` the file (recorded as `{"method":"download",…}` in out.jsonl), `POST …/audio/transcriptions` answers `transcribe/NNN.json` (`{"text":…}`, `{"status":N}`, `delay_ms`), each request kept in `transcribe-requests/NNN.json` with its headers and body.
 
-- [ ] **Step 1: failing tests** (telegram.zig): `a_voice_note_and_an_audio_file_are_read` (voice: file_id, duration, file_size, mime; audio: file_name, mime; a text message has none); `a_voice_file_is_fetched_by_its_path` (getFile then download: the bytes; a missing id: TelegramRefused; over `max`: TooLarge; the token is in no recorded line but the request path).
-- [ ] **Step 2:** run: compile errors.
-- [ ] **Step 3:** implement.
-- [ ] **Step 4:** whole suite.
-- [ ] **Step 5:** commit.
+- [x] **Step 1: failing tests** (telegram.zig): `a_voice_note_and_an_audio_file_are_read` (voice: file_id, duration, file_size, mime; audio: file_name, mime; a text message has none); `a_voice_file_is_fetched_by_its_path` (getFile then download: the bytes; a missing id: TelegramRefused; over `max`: TooLarge; the token is in no recorded line but the request path).
+- [x] **Step 2:** run: compile errors.
+- [x] **Step 3:** implement.
+- [x] **Step 4:** whole suite.
+- [x] **Step 5:** commit.
 
 ### Task 2: The transcription call and `[voice]`
 
 **Produces:** `voice.Transcriber{gpa, io, provider: model.Provider, model, language}`, `transcribe(arena, audio, name, stop) Error![]const u8`, `failure(arena, e) []const u8`, `fileName(note)`, `quoted(arena, text)`, `max_seconds`, `max_bytes`. `config.Config.voice{provider, model, language}`; `parse` refuses a voice provider that is unknown, not api openai, or without a model (`error.BadVoice`, `reason`).
 
-- [ ] **Step 1: failing tests:** voice.zig `a_note_goes_as_multipart_with_model_and_language` (the fake gets `file` named `voice.ogg` with the bytes, `model`, `language`, `response_format=json`, Bearer key; the text back); `each_status_is_said_in_the_providers_words` (401 echoing the key: masked, names the secret; 402, 429 once, 400, 500; no key: NoKey without a request; auth none sends no header); `a_note_name_follows_its_kind_and_mime`; `the_quoted_line_is_one_line`. config.zig `voice_settings_read_and_checked`.
-- [ ] **Step 2–5:** as above; commit.
+- [x] **Step 1: failing tests:** voice.zig `a_note_goes_as_multipart_with_model_and_language` (the fake gets `file` named `voice.ogg` with the bytes, `model`, `language`, `response_format=json`, Bearer key; the text back); `each_status_is_said_in_the_providers_words` (401 echoing the key: masked, names the secret; 402, 429 once, 400, 500; no key: NoKey without a request; auth none sends no header); `a_note_name_follows_its_kind_and_mime`; `the_quoted_line_is_one_line`. config.zig `voice_settings_read_and_checked`.
+- [x] **Step 2–5:** as above; commit.
 
 ### Task 3: Voice notes in core and main
 
 **Produces:** `core.Incoming.voice`, `core.Channel.file`, `Queued.voice`; `handleIncoming` → `voiceIn`; the worker's `voiceTurn`; `voiceAnswer` thread; main's poll loop and `TgChan.file`.
 
-- [ ] **Step 1: failing tests** (core.zig, Recorder gets `file`): `a_voice_note_is_shown_quoted_then_answered` (the quiet quoted line, then the reply; the model got the transcript and the context note; the log has `voice note` with seconds and bytes, no audio, and the turn's text; the transcription request had the key, the log hasn't); `a_voice_note_over_two_minutes_or_without_voice_set_is_refused_plainly` (no download, no request); `a_failed_transcription_is_said_and_runs_nothing` (401: the provider's words); `a_voice_reply_to_a_question_answers_it` (a turn asks ask_owner; the owner's voice reply to its message answers it while the turn waits); `a_voice_note_and_a_message_typed_after_it_keep_their_order`; `a_private_conversations_voice_note_logs_no_words`. main.zig: `a_voice_note_from_telegram_is_transcribed_end_to_end` (TgChan against the fake: getFile, download, transcription, the quoted line and the reply in out.jsonl).
-- [ ] **Step 2–5:** as above; commit.
+- [x] **Step 1: failing tests** (core.zig, Recorder gets `file`): `a_voice_note_is_shown_quoted_then_answered` (the quiet quoted line, then the reply; the model got the transcript and the context note; the log has `voice note` with seconds and bytes, no audio, and the turn's text; the transcription request had the key, the log hasn't); `a_voice_note_over_two_minutes_or_without_voice_set_is_refused_plainly` (no download, no request); `a_failed_transcription_is_said_and_runs_nothing` (401: the provider's words); `a_voice_reply_to_a_question_answers_it` (a turn asks ask_owner; the owner's voice reply to its message answers it while the turn waits); `a_voice_note_and_a_message_typed_after_it_keep_their_order`; `a_private_conversations_voice_note_logs_no_words`. main.zig: `a_voice_note_from_telegram_is_transcribed_end_to_end` (TgChan against the fake: getFile, download, transcription, the quoted line and the reply in out.jsonl).
+- [x] **Step 2–5:** as above; commit.
 
 ### Task 4: Quiet hours: hours, the held list, urgent
 
 **Produces:** quiet.zig: `Hours{start,end}`, `parseHours`, `Hours.inside(minute)`, `endAfter(hours, now_s, utc_offset)`, `Store` (load/save `state/quiet`, `hold`, `listed`, `remove`, `switch`, `hours`, `urgent` list), `digestText`. config: `[butler] quiet`. triggers.zig: `Trigger.urgent`; workflows.zig: `Workflow.urgent`.
 
-- [ ] **Step 1: failing tests:** quiet.zig `hours_read_and_wrap_midnight`, `the_held_list_survives_a_restart`, `the_digest_has_a_line_each_oldest_first`; config `butler_quiet_reads_hours_or_off`; triggers `urgent_is_read_for_triggers_and_schedules`; workflows `urgent_is_read_in_the_head`.
-- [ ] **Step 2–5:** as above; commit.
+- [x] **Step 1: failing tests:** quiet.zig `hours_read_and_wrap_midnight`, `the_held_list_survives_a_restart`, `the_digest_has_a_line_each_oldest_first`; config `butler_quiet_reads_hours_or_off`; triggers `urgent_is_read_for_triggers_and_schedules`; workflows `urgent_is_read_in_the_head`.
+- [x] **Step 2–5:** as above; commit.
 
 ### Task 5: Holding and the digest in core
 
 **Produces:** `Delivery.Status.digest`; holds in `postShaped`, `sendRunEnd`, `showItem`; `quietDue` in `tick`; `/quiet`; help line.
 
-- [ ] **Step 1: failing tests** (core.zig, a fixed clock): `a_non_urgent_post_in_quiet_hours_waits_for_the_digest` (a task's reply at 03:00: nothing sent; `/quiet` lists it; 07:00 tick: one digest line; log held and digest); `an_urgent_trigger_goes_at_once_in_quiet_hours`; `a_reply_to_the_owner_goes_at_once_in_quiet_hours`; `held_posts_survive_a_restart`; `a_long_post_or_one_with_buttons_follows_the_digest_whole`; `a_held_question_waits_and_follows_the_digest_with_its_buttons` (workflow approve step: no message at night, expiry moved; after: digest line then the item, a press answers it); `quiet_off_sends_what_is_held_and_quiet_on_holds_again`; `a_brief_held_for_the_digest_counts_its_links_as_seen`.
-- [ ] **Step 2–5:** as above; commit.
+- [x] **Step 1: failing tests** (core.zig, a fixed clock): `a_non_urgent_post_in_quiet_hours_waits_for_the_digest` (a task's reply at 03:00: nothing sent; `/quiet` lists it; 07:00 tick: one digest line; log held and digest); `an_urgent_trigger_goes_at_once_in_quiet_hours`; `a_reply_to_the_owner_goes_at_once_in_quiet_hours`; `held_posts_survive_a_restart`; `a_long_post_or_one_with_buttons_follows_the_digest_whole`; `a_held_question_waits_and_follows_the_digest_with_its_buttons` (workflow approve step: no message at night, expiry moved; after: digest line then the item, a press answers it); `quiet_off_sends_what_is_held_and_quiet_on_holds_again`; `a_brief_held_for_the_digest_counts_its_links_as_seen`.
+- [x] **Step 2–5:** as above; commit.
 
 ### Task 6: README, smoke, final checks
 
-- [ ] README: Voice notes (setup for Groq, OpenAI, whisper.cpp; cost an hour; Polish), Quiet hours and the digest, `urgent`, `/quiet`, `state/quiet`, the State line.
-- [ ] smoke.sh: a voice note end to end against harness-fake (the quoted line, the reply, the audio in no log); `/quiet` says off.
-- [ ] Debug and ReleaseSafe suites, cross builds; commit.
+- [x] README: Voice notes (setup for Groq, OpenAI, whisper.cpp; cost an hour; Polish), Quiet hours and the digest, `urgent`, `/quiet`, `state/quiet`, the State line.
+- [x] smoke.sh: a voice note end to end against harness-fake (the quoted line, the reply, the audio in no log); `/quiet` says off.
+- [x] Debug and ReleaseSafe suites, cross builds; commit.
 
 ## Done
 
-(filled in at the end)
+Branch `platform/voice-quiet` (on f193599): 7e0472f plan, 4f8d45d Telegram voice notes and the transcription call, b014214 `[voice]` and `[butler]`, 3a64e34 voice notes in core and main, 05e6ee6 quiet.zig and `urgent`, 8264643 holding and the digest in core, then README and smoke.
+
+- Debug and ReleaseSafe: 830/849 (19 skipped: Windows or Linux only), smoke all ok (88 checks; baseline 798/817 and 85). Cross builds (`zig build`, `unit-build`) for x86_64-windows, x86_64-linux-musl, aarch64-linux-musl compile.
+- New tests (32): telegram 3 (voice and audio read, a file fetched by its path, a quiet document), voice 4, config 2, quiet 4, triggers 1, workflows 1, core 15 (6 voice notes, 9 quiet hours), main 2 (a voice note end to end through TgChan, the voice service's start note); smoke 3.
+- Tests changed on purpose: none. Test helpers grew: core's Recorder fetches a voice note's file (`audio`, `fetched`, `file_fail`) and finds a line's place (`indexOf`).
+- core.zig edits: `Incoming.voice`, `Channel.file`, `Queued.voice`; handleIncoming's voice branch (one line); `queueTo` → `queueItem`; the worker's voice turn (one line); the voice and quiet sections (new functions); `Core.quiet` (open, close); `noteUrgent` at /reload, a change at once and tick; `quietDue` in tick; `RunOut.asked`; `Sched` (`digest`, `why_buf`) and `postOut`; `postShaped`'s hold and hush; `sendFile`'s and `sendWithButtons`' quiet; `sendRunEnd`'s hold; `showItem` → hold, then `showItemHow`; briefs, `triggerDo`/`triggerSay` and `sayStep` with `digest`; `/quiet` and its help line.
+- A full run found a use-after-free (Ruling 22): the digest's `why` of a task's final `send` was read after its turn's arena was freed; fixed, the test now checks the task's logged why.
+- Left out: spoken replies; the day's informational posts gathered into the morning digest; harness's own lines, memory notices and a workflow's "Failed at step" line held at night; files kept for the digest (they go at once, quietly); voice notes in a group or from members (Part 6); `/status` lines for voice and quiet; `/quiet` going back to config.ini's hours (set them again); a real transcription service, Telegram bot and Polish accuracy checked by hand.

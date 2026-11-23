@@ -1,7 +1,8 @@
 # harness
 
 A personal agent you talk to in Telegram (or the terminal), in your chat
-with the bot or in a topic of it per subject. It does research, hands
+with the bot or in a topic of it per subject, in writing or with voice
+notes. It does research, hands
 parts of a job to helpers that work in parallel, sends a morning brief on
 the topics you follow, runs scheduled tasks, watches feeds, pages, folders
 and MCP servers with triggers, runs workflows (steps with their state on
@@ -9,6 +10,7 @@ disk, waiting for a time, an event or your approval), uses MCP servers
 (programs it starts, or servers at a url with a token or a sign-in) and
 saved skills, remembers what you bring up, keeps summaries of each
 conversation by day, week and month, and can search every earlier turn.
+During quiet hours it holds what is not urgent for a digest at their end.
 Every action it takes, and every
 action of its helpers, passes one gate and is written to one log you can
 check.
@@ -34,13 +36,14 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 817 unit tests (19 of them
+**State: 0.3.0, tested on macOS by its own tests: 849 unit tests (19 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 85 checks that drives the real binary against
-stand-ins for omnigate and the other model providers, Telegram, feeds,
-search, two MCP servers run as programs, and MCP servers at a url with a
-token or a sign-in (with a stand-in authorization server and browser).
+and an end-to-end script of 88 checks that drives the real binary against
+stand-ins for omnigate and the other model providers, Telegram (voice
+notes and their files too), a transcription service, feeds, search, two
+MCP servers run as programs, and MCP servers at a url with a token or a
+sign-in (with a stand-in authorization server and browser).
 An earlier build of 0.3.0 also passed its tests in CI on Linux and
 Windows. On Windows 11 the browser and login
 tests also run, against Chrome 157, and the console, lock, Credential
@@ -49,8 +52,8 @@ hand. With environments, apps, clones and safe state files added,
 Windows 11 and Linux (WSL, bubblewrap 0.9, OpenSSH 9.6) pass their unit
 tests and the end-to-end script; on macOS 15.7 the sandbox (sandbox-exec)
 and APFS clone tests run with the rest. Nothing has run yet against a real
-omnigate or model provider, Telegram bot, MCP server, authorization
-server or website.** See
+omnigate or model provider, Telegram bot, transcription service, MCP
+server, authorization server or website.** See
 [Limits](#limits).
 
 ## Quick start
@@ -149,6 +152,68 @@ apps and forbid third-party apps from using them. Use an API key, or a
 bearer token a gateway issues. Not yet: OpenAI's Responses API, AWS
 Bedrock and Google Vertex sign-in, streaming, images.
 
+## Voice notes
+
+Send a voice note (or an audio file) in your chat with the bot or one of
+its topics: harness fetches it from Telegram, has it transcribed, shows
+what it heard in one quoted line, then answers as if you had typed it.
+
+```
+You:     🎤 0:04
+Butler:  "turn the heating up a bit in the living room"
+         Living room heating is at 21.5 °C (was 20.5).
+```
+
+Transcription goes to a service that speaks OpenAI's `POST
+/audio/transcriptions` (multipart: the audio, `model`, `language`), set
+in `config.ini`, its key stored like a model provider's:
+
+```ini
+[voice]
+provider = groq                  ; openai, or a [provider NAME] with api = openai
+model = whisper-large-v3-turbo   ; the service's transcription model
+language = pl                    ; the language you speak; leave it out to have it found
+
+[provider groq]
+api = openai
+url = https://api.groq.com/openai/v1
+```
+
+Then `harness secret add groq` and `/reload`.
+
+| Service | Settings | Cost (2026-11) | Notes |
+|---|---|---|---|
+| Groq | as above | about $0.04 an hour of audio; at least 10 s billed a note | about half a second for a short note; Whisper large-v3 turbo |
+| OpenAI | `provider = openai`, `model = gpt-4o-mini-transcribe` (or `gpt-4o-transcribe`); no section; `harness secret add openai` | $0.18 an hour (mini), $0.36 (gpt-4o-transcribe) | 1–2 s for a short note |
+| whisper.cpp on your machine | `[provider whisper]` with `api = openai`, `url = http://127.0.0.1:8090/v1`, `auth = none`; `provider = whisper`, any `model` | free | the audio never leaves the machine; run `whisper-server -m ggml-large-v3-turbo.bin --port 8090 --convert --inference-path /v1/audio/transcriptions` (`--convert` needs ffmpeg: Telegram's notes are OGG/Opus); 1–3 s a note on Apple Silicon, too slow on a Raspberry Pi |
+
+At 30 notes of 20 s a day (about 10 minutes) Groq costs about $0.20 a
+month and OpenAI's mini about $0.90. All three understand Polish; set
+`language = pl` (it helps short notes), and try a few of your own notes
+on each before you pick: how well they hear you matters more than the
+price.
+
+- **What is taken.** Notes of up to 2 minutes and 20 MB (the most
+  Telegram lets a bot download); a longer one gets one line saying so,
+  and nothing is downloaded. Without `[voice]` a note gets a line saying
+  how to set it up. `config.ini` refuses a provider that doesn't speak
+  OpenAI's format and a `[voice]` without a model.
+- **What you see.** The quoted line comes first, without a sound, then
+  the answer. A note is a message: it waits its turn like typed text (a
+  message you type after it comes after it), it never runs a command, and
+  the agent is told it was spoken, so a misheard word may be asked about.
+  A voice note in reply to a question's message answers it, as a typed
+  reply does.
+- **Privacy.** The audio is held in memory while it is transcribed, never
+  written to disk or to the log. The words are logged as typed messages
+  are (in a private conversation, sizes and hashes only), after a `voice
+  note` line with its length, bytes, service, model and time.
+- **Errors** read like the model's: a missing key names the secret to
+  add, a refused key (401, 403) names the secret it was stored as, a rate
+  limit (429) says to try again later, nothing is sent twice.
+
+Spoken replies come later.
+
 ## The data folder
 
 Everything for one instance is in one folder (`--home DIR`,
@@ -186,7 +251,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
 | `state/summaries/` | each conversation's summaries (see Long memory): `CONV/day/YYYY-MM-DD.md` (kept 60 days), `CONV/week/YYYY-Www.md` (ISO weeks, kept 400 days), `CONV/month/YYYY-MM.md` (kept); `PERIOD.given-up` where a call failed all day |
-| `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home and, on macOS, its temp; a remote's key), `workflows/NAME/` (each workflow's instances, `N/`, its starts waiting in line, earlier files in `versions/`, a removed file as `removed.wf`), `workflows/day.json` (today's agent steps) |
+| `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), what quiet hours hold (`quiet`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home and, on macOS, its temp; a remote's key), `workflows/NAME/` (each workflow's instances, `N/`, its starts waiting in line, earlier files in `versions/`, a removed file as `removed.wf`), `workflows/day.json` (today's agent steps) |
 
 On macOS and Linux, `config.ini`, `rules`, `logins.ini`, `mcp.ini`,
 `folders.ini`, `triggers.ini`, `environments.ini`, the folders `agents/` and `workflows/` and
@@ -1375,7 +1440,8 @@ only after a 3% move. A section's keys give its kind:
   when the workflow's `start` line names `trigger:NAME` (see Workflows);
   one it refuses is dropped and you are told once. With no action, events
   are only for workflows that wait on them; with one, a waiting workflow
-  gets an event too.
+  gets an event too. `urgent = yes` (any kind but a brief) lets its posts
+  through quiet hours (see Quiet hours and the digest).
 - **State.** `state/triggers/NAME/` keeps `state` (where its polls are,
   what it counted), `seen`, `queue` and a page's `last` text. A poll
   writes its events to `queue` before its cursor moves, and an event is
@@ -1467,6 +1533,9 @@ end
 step note
 say #{event.number} is an idea; I left it for you.
 ```
+
+A head line `urgent yes` lets a workflow's posts and questions through
+quiet hours (see Quiet hours and the digest).
 
 A line is a key and its value; `#` starts a comment line; a line ending in
 `:` takes the lines indented below it. The head: `workflow NAME` (the
@@ -1619,6 +1688,58 @@ time. Not yet: environments other than host (`env NAME`), money in agent
 steps (`[money] workflows`, your call), parallel branches, loops over
 lists, workflows starting workflows (an agent step may `delegate`).
 
+## Quiet hours and the digest
+
+```ini
+[butler]
+quiet = 22:00-07:00              ; your time ([chat] utc_offset); off until set
+```
+
+During quiet hours the posts of runs nobody is waiting on (scheduled
+tasks and briefs, triggers, workflows) are held, and so are the questions
+they ask: a workflow's approve or review step, a tool step's approval, a
+skipped call, a failed step. Replies to your messages and commands always
+go at once, `/brief` and `/trigger run` too. When quiet hours end (or you
+switch them off), each conversation with something held gets one digest,
+a line each, oldest first:
+
+```
+During quiet hours (22:00–07:00):
+23:40 [btc] BTC 64,200 (+3.1% since the last message)
+01:12 [garage] The garage door opened and closed a minute later. (below)
+03:05 [water#1] Close the water main? (below)
+```
+
+A post that doesn't fit its line (more lines, or over 160 bytes), one with
+buttons (quick replies, Undo) and each held question follow the digest
+whole, as they would have been sent, without a sound, so one tap still
+decides. A held question stays in `/inbox` meanwhile, and its time to
+answer counts from the end of quiet hours. A post with files is not held:
+it goes at once, without a sound.
+
+- **Urgent.** A trigger with `urgent = yes` in its section (a schedule of
+  `triggers.ini` too) or a workflow with `urgent yes` in its head goes
+  through: a leak, an alarm. Tasks of `tasks.ini` and briefs are never
+  urgent; a workflow an urgent trigger starts is urgent only if it says
+  so. Harness's reading of a proposed trigger or workflow says when it is
+  urgent.
+- **`/quiet`** says the hours, whether it is quiet now and what is held;
+  `/quiet on` (22:00–07:00 when no hours are set), `/quiet off` (what is
+  held comes at once), `/quiet 23:00-06:30` for other hours. What `/quiet`
+  sets is kept in `state/quiet` and goes before `config.ini`'s line.
+- **State.** `state/quiet` keeps what is held (masked) and the switch,
+  written whole before a run is told its post waits, so it survives a
+  restart; a digest that did not go is tried again a minute later. In the
+  log a held post's `send` line has the event `digest`; `held`,
+  `released` and `digest` lines (kind `chat`) follow what was held and
+  when it went.
+- One-off commands you run by hand (`harness task run`, `harness brief`,
+  `harness trigger run`, `harness workflow start`) print at once.
+
+Not yet: the day's informational posts gathered into the morning digest,
+harness's own lines (a task paused for its budget, settings changed) and
+memory notices held at night.
+
 ## Commands
 
 `/stop [NAME]`, `/new`, `/status`, `/brief [NAME]`, `/topics`, `/topic add|rm`, `/tasks`,
@@ -1626,7 +1747,7 @@ lists, workflows starting workflows (an agent step may `delegate`).
 `/forget`, `/private on|off`, `/skills`, `/skill rm`, `/logins`,
 `/folders`, `/access WHO`, `/snapshots [FOLDER]`, `/snapshot FOLDER
 [LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/undo [RUN]`, `/envs`, `/env
-check|rm NAME`, `/dryrun on|off`,
+check|rm NAME`, `/quiet [on|off|HH:MM-HH:MM]`, `/dryrun on|off`,
 `/reload`, `/conversations`, `/conversation new|rename|rm|add`,
 `/session [N]`, `/history WORDS`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
 `/agents`, `/agent [NAME]`, `/agent show|rm NAME`, `/ask NAME text`,
@@ -1692,7 +1813,8 @@ while `harness run` holds the folder and has ticked in the last 90 s.
   know the public suffix list, so set the site no wider than needed.
 
 Not in 0.3.0: the Agent Client Protocol server, desktop use (headdesk), a
-sandbox per command, email, WhatsApp, Slack and voice as conversations,
+sandbox per command, email, WhatsApp, Slack and voice as conversations
+(voice notes in Telegram are in; spoken replies are not),
 helpers that report back later, cards and payments for the agent,
 screenshots, and the hosted service.
 
