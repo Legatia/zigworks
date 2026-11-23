@@ -1475,6 +1475,13 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
     }
+    // nor a workflow's agent steps ([money] workflows); its tool steps (no
+    // definition) are asked every time
+    if (tool == .money and std.mem.startsWith(u8, r.who.by, "workflow:") and r.who.agent.len > 0 and !r.money.workflows) {
+        const why = "money is not moved in a workflow's agent steps ([money] workflows = off)";
+        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+    }
     const now_s = r.now();
     // where a command starts, as the model gave it
     const dir: []const u8 = if (tool == .shell) jv.str(jv.get(jv.parse(a, input_json), "dir")) orelse "" else "";
@@ -5707,4 +5714,31 @@ test "a_file_triggers_run_may_not_write_where_it_watches" {
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "trigger watches inbox: its run does not write there") != null);
     try t.expect(std.mem.indexOf(u8, try f.e.request(3), "\"tool_use_id\":\"w2\",\"content\":\"refused") == null);
+}
+
+
+test "money_in_agent_steps_is_refused_while_workflows_is_off" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.scheduled = true;
+    f.run.asker = null;
+    f.run.who = .{ .by = "workflow:shop/buy" };
+    f.run.money = .{ .scheduled = true, .max_per_call = 10 };
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"one\",\"amount\":1}"));
+    try f.e.script(2, model.textReply("refused"));
+    var r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "money is not moved in a workflow's agent steps ([money] workflows = off)") != null);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
+    // on: as in scheduled runs, within the caps
+    f.run.money.workflows = true;
+    try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"two\",\"amount\":2}"));
+    try f.e.script(4, model.textReply("bought"));
+    r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "two") != null);
+    try t.expectEqual(@as(f64, 2), f.ledger.sum());
 }
