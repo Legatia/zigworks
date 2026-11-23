@@ -40,7 +40,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 908 unit tests (19 of them
+**State: 0.3.0, tested on macOS by its own tests: 915 unit tests (19 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 93 checks that drives the real binary against
