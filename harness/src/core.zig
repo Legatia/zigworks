@@ -14838,7 +14838,8 @@ test "another_step_cut_by_a_restart_asks_in_the_inbox" {
     try f.press("skip");
     runWorkflows(&f);
     try f.rec.waitFor("[ship#2] Step push failed: skipped by the owner after it was cut off");
-    try t.expectEqual(1, f.rec.count("pushed\n"));
+    // cmd's echo ends its line with \r\n on Windows
+    try t.expectEqual(1, f.rec.count("pushed\n") + f.rec.count("pushed\r\n"));
 }
 
 test "stop_pauses_a_step_under_way_until_it_is_answered" {
