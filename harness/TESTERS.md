@@ -185,6 +185,23 @@ notes):
   inspection): tap **Add it**, or reply with when it was last done. A
   week before something is due, and on the day, one line with **Done**.
   Write "the boiler was serviced today" when it was. `/upkeep` lists them.
+- **Day 11, health.** `/med add Vitamin D at` a time a minute from now:
+  the reminder comes with **Taken**; leave it, and half an hour later it
+  comes once more. Tap Taken (or reply "taken"): both say when. With Anna
+  in, `/med tell Vitamin D anna`: an hour after a reminder nobody tapped,
+  she reads the time, never the medicine. `/bedtime 23:30`: your first
+  message after it gets one gentle line, once a night.
+- **Day 12, the evening.** Turn on the evening (`/setup routines` offers
+  it, or `/evening 21:00`); `/evening now` tries it: tomorrow's first
+  event and when to leave, the weather, the car, a bill due tomorrow, what
+  waits in `/inbox`, each only when there is something. `/setup butler`
+  asks how to address you, once, and the bot answers as a butler from
+  then on.
+- **After two weeks, habits.** Ask for the same thing at about the same
+  time on four days or more (the coffee machine at 6:45): once a week at
+  most, one question comes, "You switch the coffee machine on at about
+  6:45 on weekdays. Shall I do that?" **Yes** shows what it writes, then
+  writes it; **No, and don't ask again** is for good.
 - **Any day.** `/session` shows the steps behind the last answer; `/quiet`
   what quiet hours hold; `/workflows` the routines that are on.
 
@@ -218,6 +235,14 @@ Tell us about anything like this, with the time it happened:
   its real total; anything ordered without your tap.
 - A parcel line twice, late, or for a parcel that isn't yours; an upkeep
   line on the wrong day, or one that came back after you said it was done.
+- A medication reminder at the wrong minute, twice, or not at all; a
+  medicine's name anywhere but your own chat (a family member's message,
+  the log, a report).
+- A habit suggestion about a lock, the garage, a valve or something you'd
+  never want done by itself; two in one week; one you declined coming
+  back; anything set up without your Yes.
+- An evening line that is wrong or out of date, or an evening message
+  with nothing worth reading in it.
 
 ## Sending a report
 
@@ -276,6 +301,12 @@ on what you did, what happened, and what you expected.
 - **Only you approve.** Your family can ask it things; a lock, the garage, a
   valve or money becomes your one-tap question. When they get an alert
   you didn't answer, their only button is **I'm on it**.
+- **Never sets up a habit by itself.** It suggests at most once a week,
+  never for locks, the garage, valves or alarms, and writes nothing until
+  you tap **Yes**.
+- **Health: reminders only.** No advice; nothing kept beyond your
+  schedule and today's "taken"; your household hears the time, never the
+  medicine, and only when you asked.
 - **The people you know stay yours.** Your family, the house's speakers
   and family groups never see the people harness keeps for you, and
   nothing they say is noted about anyone.

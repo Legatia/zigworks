@@ -24,7 +24,11 @@ leave, a note before a meeting, posts held while you're busy, and changes
 only when you say (The diary, below). It keeps the household's shopping
 lists, proposes an order from a shop you set up and buys it only when you
 tap, follows your parcels, and reminds you of the boiler's service and the
-car's insurance (Errands and upkeep, below).
+car's insurance (Errands and upkeep, below). It reminds you of your
+medication with one tap to mark it taken, suggests at most once a week to
+do by itself what you ask the home for every day at the same time (and
+does it only after your Yes), and in the evening says what tomorrow holds
+(Health, habits and the evening, below).
 Every action it takes, and every
 action of its helpers, passes one gate and is written to one log you can
 check.
@@ -50,7 +54,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 1100 unit tests (20 of them
+**State: 0.3.0, tested on macOS by its own tests: 1143 unit tests (20 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 109 checks that drives the real binary against
@@ -70,7 +74,10 @@ llama.cpp integration sends); with calmcp built (CALMCP_BIN), 5 more:
 stand-in CalDAV server). The diary has not met a real calendar yet, nor
 mail a real mail server (mailmcp's own tests run it against its stand-in);
 errands and upkeep (lists, reorders, parcels, the car's odometer) have met
-only stand-ins: no real shop, carrier's page or car.
+only stand-ins: no real shop, carrier's page or car. Medication
+reminders, bedtime, habits, the evening message and the butler's manner
+are tested by unit tests with a fake clock, a written log and the
+stand-ins only: no real household or week of habits yet.
 An earlier build of 0.3.0 also passed its tests in CI on Linux and
 Windows. Emergencies (escalation to the household, the leak's fallback,
 the smoke routine) are tested against stand-ins only: no real household,
@@ -285,6 +292,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
 | `state/people/` | the people you deal with, a file each (`NAME.txt`, see People); what of them was said, in `state/people-told` |
+| `state/meds`, `state/bedtime`, `state/habits`, `state/evening` | medication reminders (the schedule, today's and yesterday's reminders), the night bedtime's line was said, the week's look at your habits and its suggestions, the evening last said (see Health, habits and the evening) |
 | `state/summaries/` | each conversation's summaries (see Long memory): `CONV/day/YYYY-MM-DD.md` (kept 60 days), `CONV/week/YYYY-Www.md` (ISO weeks, kept 400 days), `CONV/month/YYYY-MM.md` (kept); `PERIOD.given-up` where a call failed all day |
 | `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), speech's calls waiting for you (`room-asks`), what quiet hours hold (`quiet`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home and, on macOS, its temp; a remote's key), `workflows/NAME/` (each workflow's instances, `N/`, its starts waiting in line, earlier files in `versions/`, a removed file as `removed.wf`), `workflows/day.json` (today's agent steps), `mail/` (the butler's mail already handled, others' mail for the day's line) |
 
@@ -823,6 +831,7 @@ turns one off, and the files can be edited and `/reload`ed.
 | Bills | your mailbox is on (Mail) | a line 3 days before a bill is due: who, how much, when |
 | Deliveries | your mailbox is on | a line on the day a parcel comes |
 | Flights, Invitations | your mailbox and a calendar are on | the time offered for the calendar, asked first |
+| Evening | at 21:00, or before quiet hours (`[butler] evening`) | one message about tomorrow: the first event and when to leave, the weather, the car, bills due, what waits in /inbox (Health, habits and the evening, below) |
 
 Nothing guarded runs without your tap: locks are only locked, valves and
 garage doors only closed, alarms only armed (homemcp's home file allows
@@ -835,7 +844,9 @@ with a valve, setup offers it: "If nobody answers the leak's question in
 [Not now], the line it adds shown first. The files are in
 [examples/butler](examples/butler/), built into harness; where the setup
 is, `/setup`. Where homemcp and carcloud are: `[butler] homemcp =` and
-`carcloud =` in config.ini, else next to harness, else on PATH.
+`carcloud =` in config.ini, else next to harness, else on PATH. After the
+routines setup offers the evening message and the butler's manner (how
+to address you, asked once; Health, habits and the evening, below).
 
 ### The diary
 
@@ -1232,6 +1243,110 @@ Butler:  Boiler service done today; next due 23 Nov 2027.
   takes that km.
 - Members can't reach upkeep or deliveries (their words go to their own
   run, which has neither). `state/upkeep` keeps it all.
+
+## Health, habits and the evening
+
+**Medication reminders** (reminders only: no advice).
+
+```
+/med add Metformin at 08:00, 20:00
+```
+
+At each time a line in your chat with the bot, "Time for Metformin
+(08:00)." with [Taken]; not taken 30 minutes later, once more, "Still to
+take: Metformin (08:00)."; tap **Taken** (or reply "taken" to either) and
+both say "Metformin (08:00): taken at 08:05." They ring at their minute,
+in quiet hours and busy events too: you set that minute. A time already
+past when you set it starts the next day; one harness couldn't send
+within 3 hours (it wasn't running) is skipped.
+
+- `/med tell Metformin anna` (asked for per medication): not taken an hour
+  after its reminder, Anna (Household, above) reads in her own chat "The
+  owner hasn't marked the 08:00 medicine as taken; the reminder went an
+  hour ago." (the time, never the medicine's name), and you read "I told
+  Anna that Metformin (08:00) isn't marked as taken."; a tap afterwards
+  tells her it was taken. `/med tell Metformin off` stops it.
+- `/meds` lists them with today's taken or not; `/med rm NAME`; `/med add`
+  again with the same name sets other times. Members can't use them.
+- **What is kept:** `state/meds`, the schedule (names, times, who hears)
+  and the reminders of today and yesterday (their time, whether taken, the
+  messages they went in); older ones are dropped. The log never names a
+  medication: `/med`'s line keeps its first word ("add (withheld)"), and the
+  reminders are `med` lines (kind `chat`: `reminded`, `again`, `told`,
+  `taken`, with the time). No health data from devices is read.
+
+**Bedtime** (off until set): `/bedtime 23:30` (or `[butler] bedtime =
+23:30`; `/bedtime off`). From then until quiet hours end (06:00 without
+them), your first message of the night, in any of your chats, gets one
+line: "It's past half eleven." Once a night (`state/bedtime`); commands
+and taps don't count.
+
+**Habits.** Once a week (from 10:00, a week after the last look) harness
+reads the log for what you asked the home to do: homemcp's `home_set`
+calls of your own runs that worked, in the last 14 days. Your household's,
+the house's speakers', schedules', routines' and private conversations'
+(the log keeps only their sizes) never count. The same call (device,
+action, value) within 20 minutes on at least 4 of those days is one
+suggestion:
+
+```
+Butler:  You switch the coffee machine on at about 6:45 on weekdays. Shall I do that?
+                                            [Yes] [No, and don't ask again]
+```
+
+- Never a guarded device: only lights, plugs, switches, heating, blinds,
+  fans, scenes and speakers home.ini lets act, with that action (never a
+  lock, an alarm, a valve, the garage, or a switch setup couldn't place),
+  and checked again when you tap Yes.
+- At most one a week. It is a schedule's question: quiet hours and a busy
+  event hold it, and it waits 7 days. No is for good; unanswered, it may
+  come again after 4 weeks; nothing is set up without your Yes.
+- **Yes** shows the routine's three parts, then writes them:
+  `workflows/habit-coffee-machine-on.wf` (that one call; a line only when
+  the device doesn't confirm), its schedule in `triggers.ini` (`at =
+  06:45`, `days = mon, tue, wed, thu, fri`; weekends, or every day, as you
+  did it) and the rules line allowing exactly that call for that step
+  (`[workflow:habit-coffee-machine-on/act]`). `/workflow rm
+  habit-coffee-machine-on` stops it.
+- `state/habits`: the last look's day, and each suggestion (device,
+  action, value, time, days) with your answer.
+
+**The evening** (off until set; `/setup routines` offers it after the
+routines, at 21:00, or 30 minutes before quiet hours that start earlier;
+`/evening 21:00`, `/evening off`, `/evening now` tries it): one message
+about tomorrow, each line only when it has something, none at all when
+nothing has:
+
+```
+21:00
+Butler:  Tomorrow: Dentist at 10:30 (Dental clinic, ul. Długa 5, Kraków); leave by 10:00.
+         Weather in Kraków tomorrow: 3 °C, rain after 14:00.
+         Car 34 %, 150 km, plugged in.
+         Bill due tomorrow: Energa Obrót, 249.99 PLN.
+         2 things wait in /inbox.
+```
+
+- Tomorrow's first event with a time (The diary, above), with when to
+  leave (`[butler] travel`) for one with a place; the weather in the
+  morning summary's town (a search, then one short call of `[model]
+  memory_model` over the results, as data); the car from carcloud's
+  `car_status`; bills due tomorrow from your mailbox, when it is on
+  (Mail); the items open in `/inbox`.
+- Each read is the gate's, as `schedule:evening`, and in the log; nothing
+  is asked or changed, and a read the rules don't allow leaves its line
+  out.
+- Once an evening (`state/evening`); at its time in quiet hours without a
+  sound; during a busy event it waits for the event's end; more than 2
+  hours late (harness wasn't running) it is skipped.
+
+**The butler's manner.** After the routines (and on `/setup butler`),
+setup asks once: "I can answer you here as a butler: courteous, brief and
+discreet. How shall I address you? Reply with the name or title you like
+(Tobias, Mr Nowak), or tap Plainly." [Plainly] [Not now]. Your answer
+shows `agents/butler.md` (Agent definitions, below), then writes it, and
+it answers in your chat with the bot from your next message (`/agent
+main` goes back; topics keep theirs, `/agent butler` there). It gives no
+medical advice.
 
 ## Folders
 
@@ -2700,7 +2815,8 @@ check|rm NAME`, `/quiet [on|off|HH:MM-HH:MM]`, `/dryrun on|off`,
 `/triggers`, `/trigger NAME`, `/trigger add|rm|pause|resume|run|test`,
 `/apps`, `/app approve|rm NAME`, `/workflows`, `/workflow NAME|NAME#N`,
 `/workflow start|stop|resume|rm`, `/members`, `/member add|rm NAME`,
-`/setup [home|car|calendar|mail|routines|upkeep|reorder]`, `/help`. `/new`, `/private` and `/agent`
+`/setup [home|car|calendar|mail|routines|upkeep|reorder|butler]`, `/med add|rm|tell`, `/meds`,
+`/bedtime [HH:MM|off]`, `/evening [HH:MM|off|now]`, `/help`. `/new`, `/private` and `/agent`
 act on the conversation they are sent in; `/stop`, `/dryrun` and
 `/memory auto` on everything. Household members have `/help`, `/list`
 and `/join CODE`; any other command of theirs is answered with a no.
