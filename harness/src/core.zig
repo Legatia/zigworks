@@ -949,7 +949,7 @@ pub const Core = struct {
         if (c.worker) |w| w.join();
         // no speech from now on; its requests going end (their runs stopped)
         c.stopVoiceAgent();
-        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire) or c.mail_job.running.load(.acquire) or c.diary.reading.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire) or c.mail_job.running.load(.acquire) or c.diary.reading.load(.acquire) or c.away.job.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
@@ -5659,6 +5659,8 @@ pub const Core = struct {
         // the diary: the calendar read when due, its lines at their minute
         if (c.poller_on) c.diaryDue(now_s);
         c.diaryPost(now_s);
+        // away mode: on and off, the evening's lights, the 20:00 line
+        c.awayDue(now_s);
         // quiet hours over: what they held, a digest per conversation
         c.quietDue(now_s);
         // urgent alerts nobody is on: the household in turn, a fallback
@@ -7191,6 +7193,7 @@ pub const Core = struct {
     fn resourceUpdated(ctx: *anyopaque, server: []const u8, uri: []const u8) void {
         const c: *Core = @ptrCast(@alignCast(ctx));
         c.mailUpdated(server, uri);
+        c.awayUpdated(server, uri);
         c.trig_mutex.lockUncancelable(c.io);
         defer c.trig_mutex.unlock(c.io);
         for (c.trig_info.items) |info| {
@@ -7809,7 +7812,7 @@ pub const Core = struct {
         defer c.unregister(&flag);
         var run = c.runIn(&client, try std.fmt.allocPrint(a, "trigger {s}", .{tr.name}), .{ .by = try std.fmt.allocPrint(a, "trigger:{s}", .{tr.name}), .agent = tr.agent }, tr.to, &flag);
         var sched: Sched = .{};
-        var out: RunOut = .{ .core = c, .tag = try std.fmt.allocPrint(a, "[{s}] ", .{tr.name}), .agent = tr.agent, .sched = &sched, .run = &run, .asked = by_hand };
+        var out: RunOut = .{ .core = c, .tag = if (tr.tag) try std.fmt.allocPrint(a, "[{s}] ", .{tr.name}) else "", .agent = tr.agent, .sched = &sched, .run = &run, .asked = by_hand };
         run.outbox = out.outbox();
         try run.logRun(.trigger, false, .{ .name = tr.name, .event = "start", .events = try idsOf(a, events) });
         const got = try agent.postReply(&run, a, text.items);
@@ -9643,6 +9646,556 @@ pub const Core = struct {
         return hint;
     }
 
+    /// Whether the Away routine is on (workflows/away.wf): away mode is
+    /// part of it.
+    fn awayRoutineOn(c: *Core) bool {
+        return c.workflowOn("away");
+    }
+
+    /// Whether workflow `name` is read (its routine is on).
+    fn workflowOn(c: *Core, name: []const u8) bool {
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
+        for (c.wf_defs) |w| if (std.mem.eql(u8, w.name, name)) return true;
+        return false;
+    }
+
+    /// A server says a resource changed: `home://presence` is read again
+    /// at the next tick. On the server's reader thread.
+    fn awayUpdated(c: *Core, server: []const u8, uri: []const u8) void {
+        if (std.mem.eql(u8, server, "home") and std.mem.eql(u8, uri, "home://presence")) c.away.presence_next.store(0, .release);
+    }
+
+    /// Reads `home://presence` now, on this thread (subscribing to it
+    /// once per server start); the next read in 10 minutes, or as homemcp
+    /// says it changed.
+    pub fn awayReadNow(c: *Core) !void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        c.away.presence_next.store(c.now() + 600, .release);
+        const srv = c.serverNamed("home") orelse return;
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "");
+        defer c.unregister(&flag);
+        const sub_key = "home\x00home://presence";
+        const subscribed = blk: {
+            c.mcp_mutex.lockUncancelable(c.io);
+            defer c.mcp_mutex.unlock(c.io);
+            for (c.subscribed.items) |x| if (std.mem.eql(u8, x, sub_key)) break :blk true;
+            break :blk false;
+        };
+        if (!subscribed and srv.subscribes) {
+            if (srv.subscribe(a, "home://presence", &flag, 5000)) |_| {
+                c.mcp_mutex.lockUncancelable(c.io);
+                defer c.mcp_mutex.unlock(c.io);
+                const owned = try c.gpa.dupe(u8, sub_key);
+                c.subscribed.append(c.gpa, owned) catch c.gpa.free(owned);
+            } else |_| {}
+        }
+        const res = try srv.readResource(a, "home://presence", &flag, 30_000, 1 << 16);
+        if (res.is_error) return error.NotRead;
+        try c.away.setPresence(res.text);
+    }
+
+    /// From the tick: away's work on a thread of its own (it waits on the
+    /// home), when the Away routine is on; every 20 seconds at most, or at
+    /// once when homemcp says who is home changed. It takes none of the
+    /// background slots runs take (close waits for it apart).
+    fn awayDue(c: *Core, now_s: i64) void {
+        if (c.chan == null or c.restarting.load(.acquire)) return;
+        const pushed = c.away.presence_next.load(.acquire) == 0;
+        if (now_s < c.away.last_job.load(.acquire) + 20 and !pushed) return;
+        if (!c.awayRoutineOn()) return;
+        if (c.away.job.swap(true, .acq_rel)) return;
+        c.away.last_job.store(now_s, .release);
+        const th = std.Thread.spawn(.{}, awayJob, .{ c, now_s }) catch {
+            c.away.job.store(false, .release);
+            return;
+        };
+        th.detach();
+    }
+
+    fn awayJob(c: *Core, now_s: i64) void {
+        defer c.away.job.store(false, .release);
+        if (c.quitting.load(.acquire)) return;
+        c.awayStep(now_s) catch |e| c.log.write(.config, false, .{ .event = "away failed", .why = @errorName(e) }) catch {};
+    }
+
+    /// Away at `now_s`: who is home read when due; on or off as
+    /// away.decide says; while on, the lights, the 20:00 line, the heating
+    /// before the return.
+    fn awayStep(c: *Core, now_s: i64) !void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (c.poller_on and now_s >= c.away.presence_next.load(.acquire)) c.awayReadNow() catch |e| {
+            c.log.write(.config, false, .{ .event = "presence not read", .why = @errorName(e) }) catch {};
+        };
+        var st = try c.away.get(a);
+        const pres = c.away.presenceOf(a);
+        // since when everyone has been out (as homemcp said, else since first seen)
+        if (pres.known) {
+            const left: i64 = if (pres.anyone_home) 0 else if (st.left_at != 0) st.left_at else if (std.mem.eql(u8, pres.change, "everyone_left") and pres.change_at > 0) pres.change_at else now_s;
+            if (left != st.left_at) {
+                st.left_at = left;
+                try c.away.put(st);
+            }
+        }
+        const spans = c.tripSpans(a, now_s);
+        switch (away_mod.decide(st, .{ .now = now_s, .presence = pres, .after_s = @as(i64, c.cfg.butler.away_after) * 60, .trips = spans })) {
+            .on => |on| {
+                _ = try c.awayTurnOn(a, st, on, "schedule:away", pres, now_s);
+                return;
+            },
+            .off => |why| {
+                const said = try c.awayTurnOff(a, st, if (why == .first_home) .first_home else .back, pres, now_s);
+                c.postAway(a, said);
+                return;
+            },
+            .none => {},
+        }
+        if (!st.on) return;
+        // a trip found after it came on gives it its return
+        if (st.until == 0) if (away_mod.tripAt(spans, now_s)) |x| {
+            st.until = x.back;
+            try c.away.put(st);
+        };
+        try c.awayLights(a, now_s);
+        try c.awaySummaryDue(a, now_s);
+        try c.awayHeatBackDue(a, now_s);
+    }
+
+    /// Away mode on, for `on`: written first, then away.wf says it (with
+    /// its one question for the heating), started as `by`.
+    fn awayTurnOn(c: *Core, a: std.mem.Allocator, st: away_mod.State, on: away_mod.On, by: []const u8, pres: away_mod.Presence, now_s: i64) !void {
+        var ns = st;
+        ns.on = true;
+        ns.since = now_s;
+        ns.why = on.why;
+        ns.until = on.until;
+        ns.trip = on.trip;
+        var seed: [8]u8 = undefined;
+        c.io.random(&seed);
+        ns.seed = std.mem.readInt(u64, &seed, .little);
+        ns.notes = &.{};
+        ns.lit = &.{};
+        ns.unlit = &.{};
+        ns.lights_day = 0;
+        ns.heat_back = 0;
+        ns.summary_day = 0;
+        try c.away.put(ns);
+        var tb: [20]u8 = undefined;
+        c.log.write(.config, false, .{ .event = "away on", .why = @tagName(on.why), .until = if (on.until > 0) @as(?[]const u8, util.isoTime(&tb, on.until)) else null, .by = by }) catch {};
+        const line = try c.awayOnLine(a, ns, on.title, pres, now_s);
+        switch (try c.startInstance(a, "away", .{ .at = now_s, .by = by, .input = line })) {
+            .refused => |why| {
+                c.log.write(.workflow, false, .{ .name = "away", .event = "not started", .why = why }) catch {};
+                c.postAway(a, line);
+            },
+            else => {},
+        }
+    }
+
+    const AwayOff = enum { first_home, back, owner };
+
+    /// Away mode off: written first; its question goes; the heating back
+    /// up unless the Arriving routine does it; what to say.
+    fn awayTurnOff(c: *Core, a: std.mem.Allocator, st: away_mod.State, why: AwayOff, pres: away_mod.Presence, now_s: i64) ![]const u8 {
+        var ns = st;
+        ns.on = false;
+        ns.since = now_s;
+        ns.until = 0;
+        ns.trip = "";
+        ns.notes = &.{};
+        ns.lit = &.{};
+        ns.unlit = &.{};
+        if (why == .owner) ns.off_at = now_s;
+        try c.away.put(ns);
+        c.log.write(.config, false, .{ .event = "away off", .why = @tagName(why) }) catch {};
+        _ = c.stopInstances(a, "away", "harness") catch {};
+        var o: std.ArrayList(u8) = .empty;
+        switch (why) {
+            .first_home => if (pres.person.len > 0) try o.print(a, "Away mode is off: {s} is home.", .{pres.person}) else try o.appendSlice(a, "Away mode is off: someone is home."),
+            .back => if (st.trip.len > 0) try o.appendSlice(a, "Away mode is off: your trip has ended.") else try o.print(a, "Away mode is off, as planned for {s}.", .{try away_mod.whenText(a, st.until, now_s, c.cfg.chat.utc_offset)}),
+            .owner => try o.appendSlice(a, "Away mode is off."),
+        }
+        // the Arriving routine warms the house for the first one home
+        if (why != .first_home or !c.workflowOn("arriving")) switch (c.awayHeatBack(a)) {
+            .none => {},
+            .done => try o.print(a, " The heating is back to {d} °C.", .{c.cfg.butler.home_temp}),
+            .failed => |w| try o.print(a, " The heating didn't go back up: {s}.", .{w}),
+        };
+        return o.items;
+    }
+
+    /// "Away mode is on: everyone has been out since 08:41. Doors, windows
+    /// and movement come to you at once, and the living room light goes on
+    /// and off in the evening."
+    fn awayOnLine(c: *Core, a: std.mem.Allocator, st: away_mod.State, title: []const u8, pres: away_mod.Presence, now_s: i64) ![]const u8 {
+        _ = pres;
+        const off = c.cfg.chat.utc_offset;
+        var o: std.ArrayList(u8) = .empty;
+        switch (st.why) {
+            .presence => try o.print(a, "Away mode is on: everyone has been out since {s}.", .{try away_mod.whenText(a, st.left_at, now_s, off)}),
+            .trip => {
+                try o.print(a, "Away mode is on for your trip{s}{s}", .{ if (title.len > 0) " to " else "", title });
+                if (st.until > 0) try o.print(a, ", back {s}", .{try away_mod.dayText(a, st.until, off)});
+                try o.append(a, '.');
+            },
+            .owner => if (st.until > 0) try o.print(a, "Away mode is on until {s}.", .{try away_mod.dayText(a, st.until, off)}) else try o.appendSlice(a, "Away mode is on."),
+        }
+        var parts: std.ArrayList([]const u8) = .empty;
+        if (c.awayWatches()) try parts.append(a, "doors, windows and movement come to you at once");
+        const lights = try c.awayLightNames(a);
+        if (lights.len > 0) try parts.append(a, try std.fmt.allocPrint(a, "{s} {s} on and off in the evening", .{ try c.lightsText(a, lights), if (lights.len == 1) "goes" else "go" }));
+        if (parts.items.len > 0) {
+            const text = if (parts.items.len == 1) parts.items[0] else try std.fmt.allocPrint(a, "{s}, and {s}", .{ try std.mem.join(a, ", ", parts.items[0 .. parts.items.len - 1]), parts.items[parts.items.len - 1] });
+            try o.print(a, " {c}{s}.", .{ std.ascii.toUpper(text[0]), text[1..] });
+        }
+        return o.items;
+    }
+
+    /// "the living room light and the hall light".
+    fn lightsText(c: *Core, a: std.mem.Allocator, names: []const []const u8) ![]const u8 {
+        _ = c;
+        var list: std.ArrayList([]const u8) = .empty;
+        for (names) |n| try list.append(a, try std.fmt.allocPrint(a, "the {s}", .{try butler.spoken(a, n)}));
+        if (list.items.len == 1) return list.items[0];
+        return std.fmt.allocPrint(a, "{s} and {s}", .{ try std.mem.join(a, ", ", list.items[0 .. list.items.len - 1]), list.items[list.items.len - 1] });
+    }
+
+    /// Whether a trigger watches the house while you're away.
+    fn awayWatches(c: *Core) bool {
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
+        for (c.trig_list) |tr| if (tr.while_ == .away) return true;
+        return false;
+    }
+
+    /// The home file as it is.
+    fn homeNow(c: *Core, a: std.mem.Allocator) ?butler.Home {
+        const text = c.readOr(a, c.dataPath(a, "home.ini") catch return null);
+        if (text.len == 0) return null;
+        return butler.parseHome(a, text) catch null;
+    }
+
+    /// The lights away mode switches: home.ini's lights that aren't
+    /// guarded and go on and off, of them those rules lets
+    /// `schedule:away` switch on. Nothing else, whatever rules says.
+    fn awayLightNames(c: *Core, a: std.mem.Allocator) ![]const []const u8 {
+        const h = c.homeNow(a) orelse return &.{};
+        var out: std.ArrayList([]const u8) = .empty;
+        for (h.devices) |d| {
+            if (!butler.awayLight(d)) continue;
+            const arg = try std.fmt.allocPrint(a, "home/home_set {{\"action\":\"on\",\"device\":{f}}}", .{std.json.fmt(d.name, .{})});
+            if (c.awayDecide(a, arg).action == .allow) try out.append(a, d.name);
+        }
+        return out.items;
+    }
+
+    fn awayDecide(c: *Core, a: std.mem.Allocator, arg: []const u8) gate.Decision {
+        c.lock.lockUncancelable(c.io);
+        defer c.lock.unlock(c.io);
+        return c.gate.decide(a, .mcp, arg, c.now(), .{ .scheduled = true, .who = .{ .by = "schedule:away", .agent = "" } });
+    }
+
+    /// One call of homemcp's (`tool`, `input` canonical JSON) by away mode
+    /// itself, as `schedule:away`: the gate decides it (a rule must allow
+    /// it: nobody is asked), and both are logged. Null: not made.
+    fn awayCall(c: *Core, a: std.mem.Allocator, tool: []const u8, input: []const u8) ?mcp.Result {
+        const mt = for (c.mcp_tools) |*m| {
+            if (std.mem.eql(u8, m.server.name, "home") and std.mem.eql(u8, m.tool, tool)) break m;
+        } else return null;
+        // never a guarded call: the guarded tool is a money tool
+        if (mt.money or std.mem.eql(u8, tool, "home_guarded")) return null;
+        const arg = std.fmt.allocPrint(a, "home/{s} {s}", .{ tool, input }) catch return null;
+        const d = c.awayDecide(a, arg);
+        c.log.write(.gate, false, .{ .run = "away", .by = "schedule:away", .tool = "mcp", .decision = @tagName(d.action), .why = d.why, .arg = arg }) catch {};
+        if (d.action != .allow) return null;
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "");
+        defer c.unregister(&flag);
+        const res = mt.server.call(a, tool, input, &flag, 30_000, 64 * 1024) catch |e| {
+            c.log.write(.tool, false, .{ .run = "away", .by = "schedule:away", .tool = tool, .arg = input, .is_error = true, .output = @errorName(e) }) catch {};
+            return null;
+        };
+        c.log.write(.tool, false, .{ .run = "away", .by = "schedule:away", .tool = tool, .arg = input, .is_error = res.is_error, .output = util.cut(res.text, 300) }) catch {};
+        return res;
+    }
+
+    /// Light `name` on or off: whether homemcp said it was done.
+    fn awaySwitch(c: *Core, a: std.mem.Allocator, name: []const u8, action: []const u8) bool {
+        const input = std.fmt.allocPrint(a, "{{\"action\":\"{s}\",\"device\":{f}}}", .{ action, std.json.fmt(name, .{}) }) catch return false;
+        const res = c.awayCall(a, "home_set", input) orelse return false;
+        return !res.is_error;
+    }
+
+    /// The evening's lights: each on at its minute and off at its own,
+    /// once a day; only those it switched on are switched off. Nothing is
+    /// said of them.
+    fn awayLights(c: *Core, a: std.mem.Allocator, now_s: i64) !void {
+        var st = try c.away.get(a);
+        const day = c.localDay(now_s);
+        const minute = c.localMinutes(now_s);
+        var lit: std.ArrayList([]const u8) = .empty;
+        var unlit: std.ArrayList([]const u8) = .empty;
+        try lit.appendSlice(a, st.lit);
+        try unlit.appendSlice(a, st.unlit);
+        var changed = false;
+        if (st.lights_day != day) {
+            // a light still on from an evening before (harness was down)
+            for (lit.items) |l| _ = c.awaySwitch(a, l, "off");
+            lit.clearRetainingCapacity();
+            unlit.clearRetainingCapacity();
+            st.lights_day = day;
+            changed = true;
+        }
+        for (try c.awayLightNames(a)) |n| {
+            const m = away_mod.lightMinutes(st.seed, day, n);
+            if (!away_mod.has(lit.items, n) and !away_mod.has(unlit.items, n) and minute >= m.on and minute < m.off) {
+                // tried once a day: an offline light isn't asked again and again
+                if (c.awaySwitch(a, n, "on")) try lit.append(a, n) else try unlit.append(a, n);
+                changed = true;
+            } else if (away_mod.has(lit.items, n) and minute >= m.off) {
+                _ = c.awaySwitch(a, n, "off");
+                for (lit.items, 0..) |x, i| if (std.mem.eql(u8, x, n)) {
+                    _ = lit.orderedRemove(i);
+                    break;
+                };
+                try unlit.append(a, n);
+                changed = true;
+            }
+        }
+        if (!changed) return;
+        st.lit = lit.items;
+        st.unlit = unlit.items;
+        // what happened meanwhile stays as it is on disk
+        const now_st = try c.away.get(a);
+        st.notes = now_st.notes;
+        try c.away.put(st);
+    }
+
+    /// The 20:00 line, once a day while away: what came since the last
+    /// one ("All quiet at home." when no door, window or movement did).
+    fn awaySummaryDue(c: *Core, a: std.mem.Allocator, now_s: i64) !void {
+        if (c.localMinutes(now_s) < 20 * 60) return;
+        const day = c.localDay(now_s);
+        var st = try c.away.get(a);
+        if (st.summary_day >= day) return;
+        st.summary_day = day;
+        const eight = day * 86400 + 20 * 3600 - @as(i64, c.cfg.chat.utc_offset) * 60;
+        // on since after 20:00: from tomorrow, what came meanwhile kept
+        if (st.since > eight) return c.away.put(st);
+        const notes = st.notes;
+        st.notes = &.{};
+        try c.away.put(st);
+        const text = try away_mod.summary(a, notes, c.cfg.chat.utc_offset);
+        const hours = c.quiet.effective(c.cfg.butler.quiet);
+        const silent = if (hours) |h| h.inside(quiet_mod.minuteOf(now_s, c.cfg.chat.utc_offset)) else false;
+        const sent = c.sendTextAs("main", text, silent) catch |e| {
+            const item = c.keepDelivery(.{ .to = "main", .text = text, .retry = worthRetry(e) });
+            c.log.write(.chat, false, .{ .event = "away summary", .delivered = false, .why = whyUndelivered(e), .item = item }) catch {};
+            return;
+        };
+        c.touch("main");
+        c.log.write(.chat, false, .{ .event = "away summary", .notes = notes.len, .message = sent.first }) catch {};
+    }
+
+    /// Two hours before you're back (a trip's return and the way home, or
+    /// /away until), the heating back up, once, and a line.
+    fn awayHeatBackDue(c: *Core, a: std.mem.Allocator, now_s: i64) !void {
+        var st = try c.away.get(a);
+        if (st.until == 0 or st.heat_back == st.until or now_s < st.until - 2 * 3600) return;
+        st.heat_back = st.until;
+        try c.away.put(st);
+        const line = switch (c.awayHeatBack(a)) {
+            .none => return,
+            .done => try std.fmt.allocPrint(a, "The heating is going back to {d} °C for your return at about {s}.", .{ c.cfg.butler.home_temp, try away_mod.clockText(a, st.until, c.cfg.chat.utc_offset) }),
+            .failed => |w| try std.fmt.allocPrint(a, "The heating didn't go back up for your return: {s}.", .{w}),
+        };
+        c.postAway(a, line);
+    }
+
+    const HeatBack = union(enum) { none, done, failed: []const u8 };
+
+    /// The thermostat back to `[butler] home_temp` when it is set lower
+    /// (away mode's own call, as rules allows it); none: no thermostat,
+    /// or it is warm enough already.
+    fn awayHeatBack(c: *Core, a: std.mem.Allocator) HeatBack {
+        const h = c.homeNow(a) orelse return .none;
+        const p = butler.pick(a, h, .{}) catch return .none;
+        const th = p.thermostat orelse return .none;
+        const want = c.cfg.butler.home_temp;
+        const state_input = std.fmt.allocPrint(a, "{{\"device\":{f}}}", .{std.json.fmt(th.name, .{})}) catch return .none;
+        // only when it is at the away temperature or below (it was turned
+        // down for being away); one you left higher, or can't be read, stays
+        const r = c.awayCall(a, "home_state", state_input) orelse return .none;
+        if (r.is_error) return .none;
+        const sp = setpointOf(r.text) orelse return .none;
+        if (sp > @as(f64, @floatFromInt(c.cfg.butler.away_temp)) or sp >= @as(f64, @floatFromInt(want))) return .none;
+        const input = std.fmt.allocPrint(a, "{{\"action\":\"temperature\",\"device\":{f},\"value\":\"{d}\"}}", .{ std.json.fmt(th.name, .{}), want }) catch return .none;
+        const res = c.awayCall(a, "home_set", input) orelse return .{ .failed = "the rules don't let harness do it by itself (the Away routine's lines)" };
+        if (res.is_error) return .{ .failed = util.cut(res.text, 200) };
+        return .done;
+    }
+
+    /// The number after "set to " in homemcp's words for a thermostat.
+    fn setpointOf(text: []const u8) ?f64 {
+        const at = std.mem.indexOf(u8, text, "set to ") orelse return null;
+        const rest = text[at + "set to ".len ..];
+        var end: usize = 0;
+        while (end < rest.len and (std.ascii.isDigit(rest[end]) or rest[end] == '.')) end += 1;
+        return std.fmt.parseFloat(f64, rest[0..end]) catch null;
+    }
+
+    /// A line of away mode's to main: held in quiet hours like any
+    /// schedule's.
+    fn postAway(c: *Core, a: std.mem.Allocator, text: []const u8) void {
+        const by = "schedule:away";
+        const private = c.convPrivate("main");
+        if (c.quietEnd(by)) |_| held: {
+            const masked = c.masks.scrubAlloc(a, text) catch break :held;
+            const id = c.quiet.hold(.{ .at = c.now(), .conv = "main", .by = by, .text = masked, .private = private }) catch break :held;
+            c.log.write(.chat, false, .{ .event = "held", .id = id, .conversation = "main", .by = by }) catch {};
+            return;
+        }
+        _ = c.sendText("main", text) catch |e| {
+            _ = c.keepDelivery(.{ .to = "main", .text = text, .retry = e != error.NoChannel, .who = .{ .by = by, .agent = "" }, .label = "away", .private = private });
+            return;
+        };
+        c.touch("main");
+    }
+
+    /// A parcel left while you're away (the deliveries' "delivered"), for
+    /// the 20:00 line.
+    pub fn awayParcelLeft(c: *Core, at: i64) void {
+        _ = c.away.note(.{ .at = at, .kind = .parcel, .what = "a parcel was left" }) catch {};
+    }
+
+    /// The trips under way or coming, as away mode needs them (trips.zig
+    /// gives them; none without it).
+    fn tripSpans(c: *Core, a: std.mem.Allocator, now_s: i64) []const away_mod.Span {
+        _ = c;
+        _ = a;
+        _ = now_s;
+        return &.{};
+    }
+
+    const away_help = "/away on, /away until DAY [HH:MM] (back then: tomorrow, sun, 29 nov), /away off, /away lights NAME, NAME (or none).";
+
+    /// `/away`, `/away on`, `/away until DAY [HH:MM]`, `/away off`, `/away
+    /// lights NAME, …|none`.
+    fn awayCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const what = words.next() orelse return c.awayStatus(a);
+        const eql = std.mem.eql;
+        if (!c.awayRoutineOn()) return "Away mode comes with the Away routine: /setup routines offers it.";
+        const now_s = c.now();
+        const st = try c.away.get(a);
+        const pres = c.away.presenceOf(a);
+        if (eql(u8, what, "on") or eql(u8, what, "until")) {
+            var until: i64 = 0;
+            if (eql(u8, what, "until")) until = away_mod.parseUntil(words.rest(), now_s, c.cfg.chat.utc_offset) orelse
+                return "That isn't a day: /away until tomorrow, /away until sun, /away until 29 nov 14:00, or /away on.";
+            if (st.on) {
+                if (until == 0) return std.fmt.allocPrint(a, "Away mode is on already, since {s}.", .{try away_mod.whenText(a, st.since, now_s, c.cfg.chat.utc_offset)});
+                var ns = st;
+                ns.until = until;
+                ns.heat_back = 0;
+                try c.away.put(ns);
+                return std.fmt.allocPrint(a, "Away mode is on until {s}.", .{try away_mod.dayText(a, until, c.cfg.chat.utc_offset)});
+            }
+            try c.awayTurnOn(a, st, .{ .why = .owner, .until = until }, "owner", pres, now_s);
+            return "";
+        }
+        if (eql(u8, what, "off")) {
+            if (!st.on) return "Away mode is off.";
+            return c.awayTurnOff(a, st, .owner, pres, now_s);
+        }
+        if (eql(u8, what, "lights")) return c.awayLightsCommand(a, std.mem.trim(u8, words.rest(), " \t"));
+        return away_help;
+    }
+
+    fn awayStatus(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        const st = try c.away.get(a);
+        const off = c.cfg.chat.utc_offset;
+        const now_s = c.now();
+        if (!st.on) return std.fmt.allocPrint(a, "Away mode is off. /away until DAY turns it on; it comes on by itself when everyone has been out {s}, or for a trip.", .{try hoursWords(a, c.cfg.butler.away_after)});
+        var o: std.ArrayList(u8) = .empty;
+        try o.print(a, "Away mode is on since {s}", .{try away_mod.whenText(a, st.since, now_s, off)});
+        if (st.until > 0) try o.print(a, ", until {s} {s}", .{ try away_mod.dayText(a, st.until, off), try away_mod.clockText(a, st.until, off) });
+        if (st.why == .presence and st.left_at > 0) try o.print(a, " (everyone out since {s})", .{try away_mod.whenText(a, st.left_at, now_s, off)});
+        try o.append(a, '.');
+        const lights = try c.awayLightNames(a);
+        if (lights.len > 0) {
+            var spoken: std.ArrayList([]const u8) = .empty;
+            for (lights) |n| try spoken.append(a, try std.fmt.allocPrint(a, "the {s}", .{try butler.spoken(a, n)}));
+            try o.print(a, " In the evening: {s}.", .{try std.mem.join(a, ", ", spoken.items)});
+        }
+        try o.appendSlice(a, " /away off ends it.");
+        return o.items;
+    }
+
+    /// "12 hours", "90 minutes".
+    fn hoursWords(a: std.mem.Allocator, minutes: u32) ![]const u8 {
+        if (minutes % 60 == 0) return std.fmt.allocPrint(a, "{d} hour{s}", .{ minutes / 60, if (minutes == 60) "" else "s" });
+        return std.fmt.allocPrint(a, "{d} minutes", .{minutes});
+    }
+
+    /// `/away lights NAME, …|none`: the rules lines of what away mode
+    /// switches, written again; only home.ini's lights that aren't guarded.
+    fn awayLightsCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        c.setup_mutex.lockUncancelable(c.io);
+        defer c.setup_mutex.unlock(c.io);
+        const h = c.homeNow(a) orelse return "There is no home file yet: /setup home first.";
+        var names: std.ArrayList([]const u8) = .empty;
+        if (!std.ascii.eqlIgnoreCase(rest, "none")) {
+            if (rest.len == 0) return "Name the lights: /away lights NAME, NAME (as home.ini names them), or /away lights none.";
+            var it = std.mem.splitScalar(u8, rest, ',');
+            while (it.next()) |raw| {
+                const n = std.mem.trim(u8, raw, " \t");
+                if (n.len == 0) continue;
+                const d = h.find(n) orelse return std.fmt.allocPrint(a, "home.ini has no device called {s}.", .{n});
+                if (!butler.awayLight(d.*)) {
+                    const label = try butler.capital(a, try butler.spoken(a, d.name));
+                    if (d.isGuarded()) {
+                        const kind: []const u8 = switch (d.kind) {
+                            .lock => "a lock",
+                            .valve => "a valve",
+                            .alarm => "an alarm",
+                            else => "guarded",
+                        };
+                        return std.fmt.allocPrint(a, "The {s} is {s}: only lights that aren't guarded go on and off while you're away.", .{ try lowerFirstWord(a, label), kind });
+                    }
+                    if (d.kind != .light) return std.fmt.allocPrint(a, "The {s} isn't a light: only lights that aren't guarded go on and off while you're away.", .{try lowerFirstWord(a, label)});
+                    return std.fmt.allocPrint(a, "The {s} doesn't go on and off (home.ini's allow line).", .{try lowerFirstWord(a, label)});
+                }
+                if (!away_mod.has(names.items, d.name)) try names.append(a, d.name);
+            }
+        }
+        const p = try butler.pick(a, h, .{});
+        const calls = try butler.awayCalls(a, names.items, if (p.thermostat) |th| th.name else null, c.cfg.butler.home_temp);
+        const old = c.readOr(a, c.paths.rules);
+        const head = "[schedule:away]\n";
+        const at = std.mem.indexOf(u8, old, head) orelse return "The Away routine's lines aren't in rules: /setup routines offers it.";
+        const from = at + head.len;
+        const end = std.mem.indexOfPos(u8, old, from, "[all]") orelse return "The Away routine's lines in rules don't end with [all]: fix them by hand, or turn the routine on again.";
+        const text = try std.fmt.allocPrint(a, "{s}{s}\n{s}", .{ old[0..from], calls, old[end..] });
+        _ = rules.parse(a, text) catch return "Those lines didn't read as rules (a bug: please send harness report).";
+        try c.writeSetting(c.paths.rules, text);
+        c.log.write(.config, false, .{ .event = "away lights", .lights = names.items.len }) catch {};
+        if (c.applySetup()) |why| return std.fmt.allocPrint(a, "rules is written. {s}", .{why});
+        if (names.items.len == 0) return "While you're away, nothing goes on in the evening.";
+        return std.fmt.allocPrint(a, "While you're away, {s} {s} on and off in the evening.", .{ try c.lightsText(a, names.items), if (names.items.len == 1) "goes" else "go" });
+    }
+
+    fn lowerFirstWord(a: std.mem.Allocator, s: []const u8) ![]const u8 {
+        const o = try a.dupe(u8, s);
+        if (o.len > 0) o[0] = std.ascii.toLower(o[0]);
+        return o;
+    }
+
     // ---- /setup calendar ----
 
     const calendar_help =
@@ -10235,6 +10788,9 @@ pub const Core = struct {
             .town = std.mem.trim(u8, c.readOr(a, try c.setupPath(a, "town")), " \t\r\n"),
             .escalate = c.cfg.butler.escalate,
             .mail = c.mailMineOn(a),
+            .away_after = c.cfg.butler.away_after,
+            .away_temp = c.cfg.butler.away_temp,
+            .home_temp = c.cfg.butler.home_temp,
         });
     }
 
@@ -10432,6 +10988,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/people")) return c.people.listing(a, 100);
         if (eql(u8, cmd, "/person")) return if (rest.len == 0) "Use /person NAME." else c.people.cardText(a, rest);
         if (eql(u8, cmd, "/setup")) return c.setupCommand(a, conv, rest);
+        if (eql(u8, cmd, "/away")) return c.awayCommand(a, rest);
         if (eql(u8, cmd, "/member")) return c.memberCommand(a, rest);
         if (eql(u8, cmd, "/join")) return "That code is for the person joining: they send /join CODE to the bot from their own account.";
         if (eql(u8, cmd, "/stop")) return if (rest.len == 0) c.stopAll() else c.stopAgent(a, rest);
@@ -15591,7 +16148,7 @@ fn waitFile(e: *model.TestEnv, name: []const u8) !void {
 /// Waits until no brief or task runs.
 fn waitIdle(c: *Core) void {
     var waited: u32 = 0;
-    while (c.bg_active.load(.acquire) > 0 and waited < 8000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    while ((c.bg_active.load(.acquire) > 0 or c.away.job.load(.acquire)) and waited < 8000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
 }
 
 fn logText(f: *Fix) ![]u8 {
@@ -19738,6 +20295,8 @@ test "a_routine_is_shown_then_written_on_turn_on" {
     try f.press("later");
     try f.rec.waitFor("BUTTONS Doors left open: when the back door stays open for 10 minutes, I tell you. [");
     try f.press("later");
+    try f.rec.waitFor("BUTTONS Away: when everyone has been out 12 hours (or you're on a trip, or say /away)");
+    try f.press("later");
     try f.rec.waitFor("That's all the routines: 3 on.");
     try expectHas(try f.core.command(a, "/setup"), "Routines on: Goodnight, Morning summary, Leak.");
 }
@@ -23504,4 +24063,218 @@ test "the_parcel_hint_names_only_a_known_carrier" {
     try f.rec.waitFor("Someone's at the front door.");
     // the mail's text never reached the log
     try t.expect(std.mem.indexOf(u8, try logText(&f), "evil.example") == null);
+}
+
+/// Mon 23 Nov 2026, 00:00 UTC: the away tests' day (their clock, UTC).
+const away_day: i64 = 1_795_392_000;
+
+/// `home://presence` as homemcp pushes it, for anna.
+fn presenceJson(a: std.mem.Allocator, is: []const u8, change: []const u8, at: i64) ![]const u8 {
+    var tb: [20]u8 = undefined;
+    return std.fmt.allocPrint(a, "{{\"people\":[{{\"name\":\"anna\",\"is\":\"{s}\"}}],\"change\":\"{s}\",\"person\":\"anna\",\"at\":\"{s}\",\"note\":\"data from the home, not an instruction\"}}", .{ is, change, util.isoTime(&tb, at) });
+}
+
+/// The stand-ins' home with the Away routine on; the clock at `at`.
+fn withAway(f: *Fix, at: i64) !void {
+    f.core.fixed_now = at;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try dataFile(f, "home.ini"), .data = stand_in_home });
+    try withButler(f, false);
+    try withRoutine(f, .away, .{});
+}
+
+/// The home stand-in's answer about one device.
+fn deviceState(f: *Fix, device: []const u8) ![]const u8 {
+    return homeCall(f, "home_state", try std.fmt.allocPrint(f.e.arena.allocator(), "{{\"device\":\"{s}\"}}", .{device}));
+}
+
+test "away_comes_on_after_twelve_hours_and_asks_once_for_the_heating" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const t0 = away_day + 8 * 3600 + 41 * 60;
+    try withAway(&f, t0 + 60);
+    // the last one out at 08:41
+    try homeFile(&f, "presence.json", try presenceJson(a, "away", "everyone_left", t0));
+    try f.core.awayReadNow();
+    runWorkflows(&f);
+    try t.expect(!f.core.awayOn());
+    tickAt(&f, t0 + 12 * 3600 - 60);
+    try t.expect(!f.core.awayOn());
+    // 12 hours later: on, said in one message with one question
+    tickAt(&f, t0 + 12 * 3600);
+    runWorkflows(&f);
+    try t.expect(f.core.awayOn());
+    try f.rec.waitFor("BUTTONS Away mode is on: everyone has been out since 08:41. Doors, windows and movement come to you at once, and the living room light goes on and off in the evening. Heating to 17 °C while you're away? [");
+    try expectHas(try inboxFile(&f), "{\"key\":\"approve\",\"label\":\"Heating to 17 °C\"},{\"key\":\"deny\",\"label\":\"Leave it\"}");
+    try f.press("approve");
+    runWorkflows(&f);
+    try f.rec.waitFor("Heating is set to 17 °C.");
+    try expectHas(try deviceState(&f, "hall_thermostat"), "set to 17 °C");
+    // asked once: an hour later, nothing more
+    tickAt(&f, t0 + 13 * 3600);
+    runWorkflows(&f);
+    try t.expectEqual(1, f.rec.count("BUTTONS"));
+    try t.expectEqual(1, f.rec.count("BUTTONS Away mode is on"));
+    // the first one back: off, and the heating back up (no Arriving routine)
+    try homeFile(&f, "presence.json", try presenceJson(a, "home", "first_home", t0 + 20 * 3600));
+    f.core.fixed_now = t0 + 20 * 3600 + 30;
+    try f.core.awayReadNow();
+    tickAt(&f, t0 + 20 * 3600 + 30);
+    try t.expect(!f.core.awayOn());
+    try f.rec.waitFor("Away mode is off: anna is home. The heating is back to 21 °C.");
+    try expectHas(try deviceState(&f, "hall_thermostat"), "set to 21 °C");
+}
+
+test "away_until_a_date_and_off" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withAway(&f, away_day + 9 * 3600);
+    try t.expectEqualStrings("Away mode is off. /away until DAY turns it on; it comes on by itself when everyone has been out 12 hours, or for a trip.", try f.core.command(a, "/away"));
+    try t.expectEqualStrings("That isn't a day: /away until tomorrow, /away until sun, /away until 29 nov 14:00, or /away on.", try f.core.command(a, "/away until whenever"));
+    _ = try f.core.command(a, "/away until tomorrow");
+    runWorkflows(&f);
+    try t.expect(f.core.awayOn());
+    try f.rec.waitFor("BUTTONS Away mode is on until Tue 24 Nov. Doors, windows and movement come to you at once, and the living room light goes on and off in the evening. Heating to 17 °C while you're away? [");
+    try expectHas(try f.core.command(a, "/away"), "Away mode is on since 09:00, until Tue 24 Nov 18:00. In the evening: the living room light. /away off ends it.");
+    // /away off: off at once, its question gone with it
+    try t.expectEqualStrings("Away mode is off.", try f.core.command(a, "/away off"));
+    try t.expect(!f.core.awayOn());
+    try expectHas(try inboxFile(&f), "\"status\":\"withdrawn\"");
+    // nobody is known to be out: it doesn't come back on by itself
+    tickAt(&f, away_day + 30 * 3600);
+    try t.expect(!f.core.awayOn());
+}
+
+test "lived_in_lights_go_on_and_off_at_varied_minutes" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withAway(&f, away_day + 9 * 3600);
+    _ = try f.core.command(a, "/away on");
+    runWorkflows(&f);
+    try f.press("deny");
+    runWorkflows(&f);
+    const st = try f.core.away.get(a);
+    const day = @divFloor(away_day, 86400);
+    const m = away_mod.lightMinutes(st.seed, day, "living_room_light");
+    const said = f.rec.count("living room light");
+    tickAt(&f, away_day + (@as(i64, m.on) - 1) * 60);
+    try expectHas(try deviceState(&f, "living_room_light"), ": off");
+    tickAt(&f, away_day + @as(i64, m.on) * 60);
+    try expectHas(try deviceState(&f, "living_room_light"), ": on");
+    try expectHas(try logText(&f), "\"by\":\"schedule:away\",\"tool\":\"mcp\",\"decision\":\"allow\"");
+    tickAt(&f, away_day + (@as(i64, m.off) - 1) * 60);
+    try expectHas(try deviceState(&f, "living_room_light"), ": on");
+    tickAt(&f, away_day + @as(i64, m.off) * 60);
+    try expectHas(try deviceState(&f, "living_room_light"), ": off");
+    // the next evening, at its own minute; nothing is said of the lights
+    const m2 = away_mod.lightMinutes(st.seed, day + 1, "living_room_light");
+    tickAt(&f, away_day + 86400 + @as(i64, m2.on) * 60);
+    try expectHas(try deviceState(&f, "living_room_light"), ": on");
+    try t.expectEqual(said, f.rec.count("living room light"));
+}
+
+test "away_lights_are_only_unguarded_lights" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withAway(&f, away_day + 9 * 3600);
+    try t.expectEqualStrings("The front door is a lock: only lights that aren't guarded go on and off while you're away.", try f.core.command(a, "/away lights front_door"));
+    try t.expectEqualStrings("The water main is a valve: only lights that aren't guarded go on and off while you're away.", try f.core.command(a, "/away lights water_main"));
+    try t.expectEqualStrings("home.ini has no device called kitchen_light.", try f.core.command(a, "/away lights kitchen_light"));
+    try t.expectEqualStrings("While you're away, nothing goes on in the evening.", try f.core.command(a, "/away lights none"));
+    try t.expect(std.mem.indexOf(u8, fileText(&f, f.core.paths.rules), "\"device\":\"living_room_light\"") == null);
+    try t.expectEqualStrings("While you're away, the living room light goes on and off in the evening.", try f.core.command(a, "/away lights living_room_light"));
+    try expectHas(fileText(&f, f.core.paths.rules), "[schedule:away]\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"temperature\",\"device\":\"hall_thermostat\",\"value\":\"21\"}\n[all]");
+    // a line written by hand for the lock is never used: away switches
+    // home.ini's lights that aren't guarded, and nothing else
+    try writeRules(&f, try std.fmt.allocPrint(a, "{s}\n[schedule:away]\nallow mcp home/home_set {{\"action\":\"on\",\"device\":\"front_door\"}}\n[all]\n", .{fileText(&f, f.core.paths.rules)}));
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    _ = try f.core.command(a, "/away on");
+    runWorkflows(&f);
+    tickAt(&f, away_day + 19 * 3600 + 31 * 60);
+    try expectHas(try deviceState(&f, "living_room_light"), ": on");
+    var lines = std.mem.splitScalar(u8, try logText(&f), '\n');
+    while (lines.next()) |l| if (std.mem.indexOf(u8, l, "schedule:away") != null and std.mem.indexOf(u8, l, "front_door") != null) {
+        std.debug.print("away touched the lock: {s}\n", .{l});
+        return error.TestUnexpectedResult;
+    };
+}
+
+test "a_door_while_away_is_urgent_and_escalates" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\nescalate = 5m anna\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try joinMember(&f, "anna", 77);
+    try withAway(&f, away_day + 9 * 3600);
+    _ = try f.core.pollNow("away-back_door");
+    _ = try f.core.command(a, "/away on");
+    runWorkflows(&f);
+    try f.press("deny");
+    runWorkflows(&f);
+    // 02:10, in quiet hours: the back door opens
+    f.core.fixed_now = away_day + 26 * 3600 + 10 * 60;
+    try homeFile(&f, "device-back_door.json", try deviceJson(a, "back_door", "Kitchen", "sensor", "closed", "open", "2026-11-24T02:10:00Z"));
+    try t.expectEqual(1, (try f.core.pollNow("away-back_door")).queued);
+    tickAt(&f, away_day + 26 * 3600 + 10 * 60);
+    try f.rec.waitFor("BUTTONS The back door opened while you're away. [");
+    try t.expectEqual(0, f.core.quiet.count());
+    // nobody on it in 5 minutes: Anna is told
+    tickAt(&f, away_day + 26 * 3600 + 15 * 60);
+    try f.rec.waitIn("anna", "Nobody has answered this yet: The back door opened while you're away.");
+}
+
+test "the_away_summary_comes_at_eight" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withAway(&f, away_day + 9 * 3600);
+    _ = try f.core.pollNow("away-back_door");
+    _ = try f.core.command(a, "/away on");
+    runWorkflows(&f);
+    try f.press("deny");
+    runWorkflows(&f);
+    f.core.fixed_now = away_day + 11 * 3600 + 2 * 60;
+    try homeFile(&f, "device-back_door.json", try deviceJson(a, "back_door", "Kitchen", "sensor", "closed", "open", "2026-11-23T11:02:00Z"));
+    _ = try f.core.pollNow("away-back_door");
+    tickAt(&f, away_day + 11 * 3600 + 2 * 60);
+    // a parcel left, as the deliveries say it
+    f.core.awayParcelLeft(away_day + 14 * 3600 + 10 * 60);
+    tickAt(&f, away_day + 19 * 3600 + 59 * 60);
+    try t.expectEqual(0, f.rec.count("At home today"));
+    tickAt(&f, away_day + 20 * 3600);
+    try f.rec.waitFor("At home today: the back door opened at 11:02. A parcel was left at 14:10.");
+    tickAt(&f, away_day + 20 * 3600 + 30 * 60);
+    try t.expectEqual(1, f.rec.count("At home today"));
+    // the next day: nothing happened
+    tickAt(&f, away_day + 86400 + 20 * 3600);
+    try f.rec.waitFor("All quiet at home.");
+}
+
+test "the_heating_goes_back_before_the_return" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withAway(&f, away_day + 9 * 3600);
+    _ = try f.core.command(a, "/away until tomorrow 18:00");
+    runWorkflows(&f);
+    try f.press("approve");
+    runWorkflows(&f);
+    try expectHas(try deviceState(&f, "hall_thermostat"), "set to 17 °C");
+    const back = away_day + 86400 + 18 * 3600;
+    tickAt(&f, back - 2 * 3600 - 60);
+    try t.expectEqual(0, f.rec.count("going back"));
+    tickAt(&f, back - 2 * 3600);
+    try f.rec.waitFor("The heating is going back to 21 °C for your return at about 18:00.");
+    try expectHas(try deviceState(&f, "hall_thermostat"), "set to 21 °C");
+    tickAt(&f, back - 3600);
+    try t.expectEqual(1, f.rec.count("going back"));
 }

@@ -10,8 +10,8 @@ const alerts = @import("alerts.zig");
 const Allocator = std.mem.Allocator;
 
 /// What a device is, as the home file says it (`kind =`); `smoke`: a
-/// smoke, CO or gas alarm, only watched.
-pub const Kind = enum { light, @"switch", plug, climate, cover, fan, scene, media, lock, alarm, valve, sensor, smoke, other };
+/// smoke, CO or gas alarm, only watched; `doorbell`: it rings.
+pub const Kind = enum { light, @"switch", plug, climate, cover, fan, scene, media, lock, alarm, valve, sensor, smoke, doorbell, other };
 
 pub const Device = struct {
     /// Its name in the home file: `[device NAME]`.
@@ -67,6 +67,14 @@ pub const Device = struct {
         if (d.kind != .sensor) return false;
         if (d.state.len > 0) return std.ascii.eqlIgnoreCase(d.state, "open") or std.ascii.eqlIgnoreCase(d.state, "closed");
         return nameHas(d.name, &.{ "door", "window", "contact" });
+    }
+
+    /// A motion or presence sensor: it reads someone or nobody there, or
+    /// its name says so.
+    pub fn motionSensor(d: Device) bool {
+        if (d.kind != .sensor) return false;
+        if (d.state.len > 0) return std.ascii.eqlIgnoreCase(d.state, "someone there") or std.ascii.eqlIgnoreCase(d.state, "nobody there");
+        return nameHas(d.name, &.{ "motion", "occupancy", "presence", "pir", "ruch" });
     }
 };
 
@@ -648,19 +656,27 @@ pub const Picks = struct {
     speakers: bool = false,
     /// `[butler] escalate`: who is told when the owner doesn't answer.
     escalate: []const alerts.Step = &.{},
+    /// Motion and presence sensors.
+    motions: []const Device = &.{},
+    /// The lights away mode switches on and off in the evening (two at
+    /// most, a living room's first; /away lights changes them).
+    away_lights: []const Device = &.{},
+    /// `[butler] away_after`, minutes.
+    away_after: u32 = 12 * 60,
 };
 
-pub const Settings = struct { car: bool = false, search: bool = false, calendar: []const u8 = "", quiet: ?config.Quiet = null, town: []const u8 = "", fallback: bool = false, escalate: []const alerts.Step = &.{}, mail: bool = false };
+pub const Settings = struct { car: bool = false, search: bool = false, calendar: []const u8 = "", quiet: ?config.Quiet = null, town: []const u8 = "", fallback: bool = false, escalate: []const alerts.Step = &.{}, mail: bool = false, away_after: u32 = 12 * 60, away_temp: u32 = 17, home_temp: u32 = 21 };
 
 /// The devices and settings the routines use: every light; the first
 /// thermostat; the first lock (a front one first); the water main (a
 /// valve, else a switch named one); every leak sensor; every door and
 /// window sensor.
 pub fn pick(a: Allocator, h: Home, s: Settings) !Picks {
-    var p: Picks = .{ .people = h.people.len > 0, .car = s.car, .search = s.search, .calendar = s.calendar, .quiet = s.quiet, .town = s.town, .fallback = s.fallback, .escalate = s.escalate, .mail = s.mail };
+    var p: Picks = .{ .people = h.people.len > 0, .car = s.car, .search = s.search, .calendar = s.calendar, .quiet = s.quiet, .town = s.town, .fallback = s.fallback, .escalate = s.escalate, .mail = s.mail, .away_after = s.away_after, .away_temp = @intCast(s.away_temp), .home_temp = @intCast(s.home_temp) };
     var leaks: std.ArrayList(Device) = .empty;
     var doors: std.ArrayList(Device) = .empty;
     var smokes: std.ArrayList(Device) = .empty;
+    var motions: std.ArrayList(Device) = .empty;
     for (h.devices) |d| {
         if (d.allows("announce")) p.speakers = true;
         switch (d.kind) {
@@ -675,7 +691,7 @@ pub fn pick(a: Allocator, h: Home, s: Settings) !Picks {
                 p.valve = d;
             },
             .sensor => {
-                if (d.leakSensor()) try leaks.append(a, d) else if (d.openingSensor()) try doors.append(a, d);
+                if (d.leakSensor()) try leaks.append(a, d) else if (d.openingSensor()) try doors.append(a, d) else if (d.motionSensor()) try motions.append(a, d);
             },
             .smoke => try smokes.append(a, d),
             else => {},
@@ -688,7 +704,41 @@ pub fn pick(a: Allocator, h: Home, s: Settings) !Picks {
     };
     p.leaks = leaks.items;
     p.doors = doors.items;
+    p.motions = motions.items;
+    p.away_lights = try awayLightsOf(a, h);
     return p;
+}
+
+/// The lights away mode switches by default: those that switch on and off
+/// and aren't guarded, a living room's (or lounge's) first, two at most.
+pub fn awayLightsOf(a: Allocator, h: Home) ![]const Device {
+    var out: std.ArrayList(Device) = .empty;
+    for ([_]bool{ true, false }) |living| for (h.devices) |d| {
+        if (out.items.len == 2) break;
+        if (!awayLight(d)) continue;
+        if (nameHas(d.room, &.{ "living", "lounge", "salon", "pokój dzienny" }) != living) continue;
+        try out.append(a, d);
+    };
+    return out.items;
+}
+
+/// A device away mode may switch: a light that isn't guarded and may go
+/// on and off.
+pub fn awayLight(d: Device) bool {
+    return d.kind == .light and !d.isGuarded() and d.allows("on") and d.allows("off");
+}
+
+/// The rules lines of what away mode does by itself (`schedule:away`):
+/// each light on and off, and the heating back to `home_temp` (keys in
+/// order, as the gate reads a call).
+pub fn awayCalls(a: Allocator, lights: []const []const u8, thermostat: ?[]const u8, home_temp: u32) ![]const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    for (lights) |l| for ([_][]const u8{ "on", "off" }) |act| {
+        try lines.append(a, try std.fmt.allocPrint(a, "allow mcp home/home_set {{\"action\":\"{s}\",\"device\":\"{s}\"}}", .{ act, l }));
+    };
+    if (thermostat) |th| try lines.append(a, try std.fmt.allocPrint(a, "allow mcp home/home_set {{\"action\":\"temperature\",\"device\":\"{s}\",\"value\":\"{d}\"}}", .{ th, home_temp }));
+    if (lines.items.len == 0) return "# no lights, no heating";
+    return std.mem.join(a, "\n", lines.items);
 }
 
 /// "HH:MM".
@@ -724,6 +774,7 @@ pub const Routine = enum {
     leak,
     smoke,
     @"door-open",
+    away,
     @"car-tomorrow",
     bill,
     delivery,
@@ -745,6 +796,7 @@ pub const Routine = enum {
             .leak => "Leak",
             .smoke => "Smoke alarm",
             .@"door-open" => "Doors left open",
+            .away => "Away",
             .@"car-tomorrow" => "Car for tomorrow",
             .bill => "Bills",
             .delivery => "Deliveries",
@@ -763,6 +815,8 @@ pub const Routine = enum {
             .leak => p.leaks.len > 0,
             .smoke => p.smokes.len > 0,
             .@"door-open" => p.doors.len > 0,
+            // something to watch, switch or turn down while you're away
+            .away => p.doors.len + p.motions.len > 0 or p.away_lights.len > 0 or p.thermostat != null,
             .@"car-tomorrow" => p.car,
             .bill, .delivery => p.mail,
             // the calendar's own tools add the entry: only with one set
@@ -813,6 +867,19 @@ pub const Routine = enum {
                 }
             },
             .@"door-open" => try o.print(a, "Doors left open: when {s} stays open for 10 minutes, I tell you.", .{try sensorList(a, p.doors, "a door or window")}),
+            .away => {
+                try o.print(a, "Away: when everyone has been out {s} (or you're on a trip, or say /away)", .{try hoursText(a, p.away_after)});
+                var parts: std.ArrayList([]const u8) = .empty;
+                if (p.doors.len + p.motions.len > 0) try parts.append(a, "any door, window or movement comes to you at once");
+                if (p.away_lights.len > 0) {
+                    var names: std.ArrayList([]const u8) = .empty;
+                    for (p.away_lights) |d| try names.append(a, try std.fmt.allocPrint(a, "the {s}", .{try spoken(a, d.name)}));
+                    try parts.append(a, try std.fmt.allocPrint(a, "{s} {s} on and off in the evening", .{ try andList(a, names.items), if (names.items.len == 1) "goes" else "go" }));
+                }
+                if (p.thermostat != null) try parts.append(a, try std.fmt.allocPrint(a, "one tap sets the heating to {d} °C", .{p.away_temp}));
+                try parts.append(a, "at 20:00 one line says how it was");
+                try o.print(a, ", {s}.", .{try andList(a, parts.items)});
+            },
             .@"car-tomorrow" => try o.print(a, "Car for tomorrow: at {s}, when the car is under half, I tell you, and ask with one tap to start charging when it's plugged in.", .{try clock(a, carAt(p))}),
             .bill => try o.appendSlice(a, "Bills: 3 days before a bill in your mail is due, I tell you who, how much and when."),
             .delivery => try o.appendSlice(a, "Deliveries: on the day a parcel comes, one line with what and from whom."),
@@ -837,6 +904,7 @@ pub fn onText(a: Allocator, r: Routine, p: Picks) ![]const u8 {
         .leak => "Leak is on: it comes through quiet hours.",
         .smoke => "Smoke alarm is on: it comes through quiet hours.",
         .@"door-open" => "Doors left open is on.",
+        .away => "Away is on: /away until a day tries it (/away off ends it).",
         .@"car-tomorrow" => std.fmt.allocPrint(a, "Car for tomorrow is on, at {s}. /workflow start car-tomorrow tries it now.", .{try clock(a, carAt(p))}),
         .bill => "Bill reminders are on.",
         .delivery => "Delivery lines are on.",
@@ -846,7 +914,13 @@ pub fn onText(a: Allocator, r: Routine, p: Picks) ![]const u8 {
 }
 
 /// The routines in the order setup offers them.
-pub const all = [_]Routine{ .goodnight, .leaving, .arriving, .@"morning-home", .leak, .smoke, .@"door-open", .@"car-tomorrow", .bill, .delivery, .flight, .invitation };
+pub const all = [_]Routine{ .goodnight, .leaving, .arriving, .@"morning-home", .leak, .smoke, .@"door-open", .away, .@"car-tomorrow", .bill, .delivery, .flight, .invitation };
+
+/// "12 hours", "1 hour", "90 minutes".
+fn hoursText(a: Allocator, minutes: u32) ![]const u8 {
+    if (minutes % 60 == 0) return std.fmt.allocPrint(a, "{d} hour{s}", .{ minutes / 60, if (minutes == 60) "" else "s" });
+    return std.fmt.allocPrint(a, "{d} minutes", .{minutes});
+}
 
 fn andList(a: Allocator, parts: []const []const u8) ![]const u8 {
     if (parts.len == 0) return "";
@@ -997,6 +1071,7 @@ fn triggerSections(r: Routine) []const []const u8 {
         .leak => &.{"leak-<leak>"},
         .smoke => &.{"smoke-<smoke>"},
         .@"door-open" => &.{"door-<door>"},
+        .away => &.{"away-<watch>"},
         .@"car-tomorrow" => &.{"car-evening"},
         .bill => &.{"bill-due"},
         .delivery => &.{"delivery-today"},
@@ -1011,6 +1086,7 @@ fn rulesGroup(r: Routine, p: Picks) ?[]const u8 {
         .goodnight => if (p.lights > 0 or p.thermostat != null) "goodnight:" else null,
         .arriving => "arriving:",
         .@"morning-home" => if (p.calendar.len > 0) "the morning summary:" else null,
+        .away => "away:",
         else => null,
     };
 }
@@ -1119,6 +1195,11 @@ fn commonValues(a: Allocator, p: Picks) ![]Value {
     for (p.smokes) |d| try smoke_starts.append(a, try std.fmt.allocPrint(a, "trigger:{s}", .{try perSensorName(a, "smoke-", d.name)}));
     try v.append(a, .{ .key = "smoke starts", .value = try std.mem.join(a, ", ", smoke_starts.items) });
     try v.append(a, .{ .key = "smoke speaker words", .value = if (p.speakers) ", and on every speaker" else "" });
+    // away's
+    var away_names: std.ArrayList([]const u8) = .empty;
+    for (p.away_lights) |d| try away_names.append(a, d.name);
+    try v.append(a, .{ .key = "away calls", .value = try awayCalls(a, away_names.items, if (p.thermostat) |th| th.name else null, p.home_temp) });
+    try v.append(a, .{ .key = "away after", .value = try hoursText(a, p.away_after) });
     return v.items;
 }
 
@@ -1179,7 +1260,7 @@ pub fn routineFiles(a: Allocator, r: Routine, p: Picks, date: []const u8) !Files
         const tmpl = (try sectionOf(a, files.triggers_ini, sname)) orelse return error.NoSuchSection;
         // the template's own comment goes; setup's mark comes instead
         const body = tmpl[(std.mem.indexOf(u8, tmpl, "[") orelse 0)..];
-        const each: []const Device = if (std.mem.indexOf(u8, sname, "<leak>") != null) p.leaks else if (std.mem.indexOf(u8, sname, "<door>") != null) p.doors else if (std.mem.indexOf(u8, sname, "<smoke>") != null) p.smokes else &.{};
+        const each: []const Device = if (std.mem.indexOf(u8, sname, "<leak>") != null) p.leaks else if (std.mem.indexOf(u8, sname, "<door>") != null) p.doors else if (std.mem.indexOf(u8, sname, "<smoke>") != null) p.smokes else if (std.mem.indexOf(u8, sname, "<watch>") != null) try std.mem.concat(a, Device, &.{ p.doors, p.motions }) else &.{};
         if (each.len == 0) {
             try trig.print(a, "; added by /setup routines {s}: {s}\n{s}\n", .{ date, r.title(), try fill(a, body, values, flags, &missing) });
             continue;
@@ -1195,9 +1276,21 @@ pub fn routineFiles(a: Allocator, r: Routine, p: Picks, date: []const u8) !Files
             try vs.append(a, .{ .key = "leak words", .value = if (room.len > 0) try std.fmt.allocPrint(a, "{s}, {s}", .{ label, room }) else label });
             try vs.append(a, .{ .key = "smoke", .value = d.name });
             try vs.append(a, .{ .key = "smoke words", .value = if (room.len > 0) try std.fmt.allocPrint(a, "{s}, {s}", .{ label, room }) else label });
+            // away's: a door or window opening, or movement
+            const motion = d.motionSensor();
+            try vs.append(a, .{ .key = "watch", .value = d.name });
+            try vs.append(a, .{ .key = "watch to", .value = if (motion) "someone there" else "open" });
+            const what = if (!motion)
+                try std.fmt.allocPrint(a, "The {s} opened", .{try lowerFirst(a, label)})
+            else if (room.len > 0)
+                try std.fmt.allocPrint(a, "Movement in the {s}", .{try std.ascii.allocLowerString(a, room)})
+            else
+                try std.fmt.allocPrint(a, "Movement by the {s}", .{try lowerFirst(a, label)});
+            try vs.append(a, .{ .key = "watch line", .value = try std.fmt.allocPrint(a, "{s} while you're away.", .{what}) });
+            try vs.append(a, .{ .key = "watch announce", .value = try std.fmt.allocPrint(a, "{s}. The owner has been told.", .{what}) });
             var text = try fill(a, body, vs.items, flags, &missing);
             // the name at most 64 bytes, as the start line says it
-            const prefix: []const u8 = if (std.mem.indexOf(u8, sname, "<leak>") != null) "leak-" else if (std.mem.indexOf(u8, sname, "<smoke>") != null) "smoke-" else "door-";
+            const prefix: []const u8 = if (std.mem.indexOf(u8, sname, "<leak>") != null) "leak-" else if (std.mem.indexOf(u8, sname, "<smoke>") != null) "smoke-" else if (std.mem.indexOf(u8, sname, "<watch>") != null) "away-" else "door-";
             text = try std.mem.replaceOwned(u8, a, text, try std.fmt.allocPrint(a, "[{s}{s}]", .{ prefix, d.name }), try std.fmt.allocPrint(a, "[{s}]", .{try perSensorName(a, prefix, d.name)}));
             try trig.print(a, "; added by /setup routines {s}: {s}\n{s}\n", .{ date, r.title(), text });
         }
@@ -1305,6 +1398,11 @@ pub const sim_home =
     \\kind = sensor
     \\room = Hall
     \\
+    \\[device front_door_bell]
+    \\id = event.front_door_bell
+    \\kind = doorbell
+    \\room = Hall
+    \\
     \\; Garage
     \\
     \\[device garage_door]
@@ -1358,7 +1456,7 @@ pub const sim_home =
 
 /// homemcp check's lines for it.
 pub const sim_check =
-    \\The flat (made up by homemcp-sim): 16 devices in 5 rooms. Home Assistant at http://127.0.0.1:8123.
+    \\The flat (made up by homemcp-sim): 17 devices in 5 rooms. Home Assistant at http://127.0.0.1:8123.
     \\Changes come in as they happen (Home Assistant's WebSocket API).
     \\Living room
     \\  living_room_light (light.living_room, light; also called: the big light): off; may: on, off, brightness
@@ -1374,6 +1472,7 @@ pub const sim_check =
     \\  hall_thermostat (climate.hall, climate): 19.9 °C, set to 20 °C, mode heat, heating; may: temperature, mode
     \\  front_door (lock.front_door, lock, guarded): locked; may: lock
     \\  hall_motion (binary_sensor.hall_motion, sensor): nobody there; may: nothing (only seen)
+    \\  front_door_bell (event.front_door_bell, doorbell): idle; may: nothing (it rings)
     \\Garage
     \\  garage_door (cover.garage_door, cover, guarded): closed; may: close
     \\Bedroom
@@ -1394,7 +1493,7 @@ test "the_sims_home_reads" {
     try t.expectEqualStrings("The flat (made up by homemcp-sim)", h.name);
     try t.expectEqualStrings("homeassistant", h.hub);
     try t.expectEqualStrings("http://127.0.0.1:8123", h.url);
-    try t.expectEqual(16, h.devices.len);
+    try t.expectEqual(17, h.devices.len);
     try t.expectEqual(5, h.rooms());
     try t.expectEqual(2, h.people.len);
     try t.expectEqualStrings("ben", h.people[1]);
@@ -1485,7 +1584,7 @@ test "routines_fill_from_the_sims_home" {
         std.debug.print("line {d}: {s}\n{s}\n", .{ td.line, td.why, trig_all.items });
         return e;
     };
-    try t.expectEqual(12, tlist.len);
+    try t.expectEqual(14, tlist.len);
     for (wfs.items) |w| {
         var d: workflows.Diag = .{};
         _ = workflows.check(a, w, .{ .triggers = tlist }, &d) catch |e| {
@@ -1665,11 +1764,11 @@ test "the_summary_says_what_it_switches_asks_and_leaves" {
     readCheck(&h, sim_check);
     const s = try homeSummary(a, h);
     try t.expectEqualStrings(
-        \\I found 16 devices in 5 rooms, and 2 people.
+        \\I found 17 devices in 5 rooms, and 2 people.
         \\I'll switch lights, plugs, the heating, fans, speakers and scenes when you ask.
         \\I'll ask you every time before the water main, the front door, the garage door and the leaving scene.
         \\I won't touch the front door camera or the kitchen smoke alarm.
-        \\I'll watch the living room temperature, the back door, the sink leak and the hall motion.
+        \\I'll watch the living room temperature, the back door, the sink leak, the hall motion and the front door bell.
         \\If the kettle plug powers a kettle or a heater, send /setup home ask kettle_plug and I'll ask you first.
     , s);
     // the car's, from carcloud check's lines
@@ -1732,4 +1831,44 @@ test "edits_leave_ask_allow" {
     const none = try editHome(a, sim_home, .ask, "the moon");
     try t.expect(none.refused);
     try t.expectEqualStrings("No device called the moon in the home file.", none.said);
+}
+
+// ---- away and travel, the door ----
+
+fn expectIn(text: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, text, needle) != null) return;
+    std.debug.print("no\n{s}\nin\n{s}\n", .{ needle, text });
+    return error.TestUnexpectedResult;
+}
+
+test "the_away_routine_fills" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try simPicks(a, .{ .quiet = .{ .start = 22 * 60, .end = 7 * 60 } });
+    try t.expect(Routine.away.offered(p));
+    try t.expectEqual(1, p.motions.len);
+    try t.expectEqualStrings("hall_motion", p.motions[0].name);
+    // the lights that make it look lived in: the living room's first, two at most
+    try t.expectEqual(2, p.away_lights.len);
+    try t.expectEqualStrings("living_room_light", p.away_lights[0].name);
+    try t.expectEqualStrings("bedroom_lamp", p.away_lights[1].name);
+    const f = try routineFiles(a, .away, p, "2026-11-23");
+    // a door and movement: urgent while you're away, a trigger each
+    try expectIn(f.triggers, "[away-back_door]\nmcp = home resource home://device/back_door\nmatch = to is open\nwhile = away\nurgent = yes\nsay = The back door opened while you're away.\ntag = no\n");
+    try expectIn(f.triggers, "[away-hall_motion]\nmcp = home resource home://device/hall_motion\nmatch = to is someone there\nwhile = away\nurgent = yes\nsay = Movement in the hall while you're away.\ntag = no\n");
+    // started by harness as away mode comes on (or by you): one tap for the
+    // heating, only when it is set above the away temperature
+    try expectIn(f.workflow, "\nstart owner, schedule:away\n");
+    try expectIn(f.workflow, "tool home/home_wait {\"device\": \"hall_thermostat\", \"property\": \"setpoint\", \"condition\": \">\", \"value\": \"17\", \"timeout_s\": 0}");
+    try expectIn(f.workflow, "approve {input} Heating to 17 °C while you're away?\nyes Heating to 17 °C\nno Leave it\ntimeout 12h");
+    try expectIn(f.workflow, "tool home/home_set {\"device\": \"hall_thermostat\", \"action\": \"temperature\", \"value\": \"17\"}");
+    // what harness may do by itself while you're away: these calls alone
+    try expectIn(f.rules, "[schedule:away]\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"bedroom_lamp\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"bedroom_lamp\"}\nallow mcp home/home_set {\"action\":\"temperature\",\"device\":\"hall_thermostat\",\"value\":\"21\"}\n[all]");
+    // nothing guarded, ever
+    for ([_][]const u8{ f.workflow, f.triggers, f.rules }) |text| try t.expect(std.mem.indexOf(u8, text, "home_guarded") == null);
+    try t.expectEqualStrings("Away: when everyone has been out 12 hours (or you're on a trip, or say /away), any door, window or movement comes to you at once, the living room light and the bedroom lamp go on and off in the evening, one tap sets the heating to 17 °C and at 20:00 one line says how it was.", try Routine.away.sentence(a, p));
+    // other lights, other lines; none: no light line
+    try t.expectEqualStrings("allow mcp home/home_set {\"action\":\"on\",\"device\":\"hall_light\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"hall_light\"}", try awayCalls(a, &.{"hall_light"}, null, 21));
+    try t.expectEqualStrings("# no lights, no heating", try awayCalls(a, &.{}, null, 21));
 }
