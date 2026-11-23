@@ -1,0 +1,22 @@
+# Arriving: when the first of you comes home, the heating goes back up.
+workflow arriving
+about When the first of you comes home: the heating back to <home temp> °C, and a line saying so.
+start trigger:first-home
+tag no
+limits steps 10, days 1
+
+step heat
+tool home/home_set {"device": "<thermostat>", "action": "temperature", "value": "<home temp>"}
+on fail goto failed
+if heat starts done goto warm
+
+step unsure
+say {event.person} is home. I set the heating to <home temp> °C, but the <thermostat label> hasn't confirmed: {heat}
+end
+
+step warm
+say {event.person} is home. The heating is set to <home temp> °C.
+end
+
+step failed
+say {event.person} is home. The heating didn't change: {heat.error}

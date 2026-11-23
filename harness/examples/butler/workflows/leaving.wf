@@ -1,0 +1,90 @@
+# Leaving: when the last of you goes out. One tap to lock, one to turn
+# the heating down; nothing is done without your tap.
+workflow leaving
+about When everyone has left: says what is still open or on<leaving words>.
+start trigger:everyone-left
+tag no
+limits steps 20, days 1
+#if lock
+
+step door
+tool home/home_wait {"device": "<lock>", "property": "lock", "condition": "==", "value": "unlocked", "timeout_s": 0}
+on fail goto look
+if door has not within goto look
+
+step ask_lock
+approve Everyone's out and the <lock label> is unlocked.
+yes Lock it
+no Leave it
+timeout 1h
+on deny goto look
+
+step lock
+tool home/home_guarded {"device": "<lock>", "action": "lock"}
+on fail goto lock_failed
+if lock starts done goto locked
+
+step lock_unsure
+say I sent it, but the <lock label> hasn't said it is locked: {lock}
+goto look
+
+step lock_failed
+say The <lock label> didn't lock: {lock.error}
+goto look
+
+step locked
+say <Lock label> locked.
+#end
+
+step look
+tool home/home_state {}
+
+step what
+answer json
+tools none
+do:
+  Everyone has left the home. From the home's state (the data below), answer
+  only JSON: {"line": "...", "warm": true or false}
+  "line": one short sentence on what is still open or on (doors, windows,
+  lights) and what the heating is set to, with units, like "The bedroom
+  window is open and the heating is at 21 °C."; nothing else.
+  "warm": true when the heating is set above <away temp> °C.
+  The home's state: {look}
+#if thermostat
+if what.warm is false goto tell
+#end
+#if !thermostat
+goto tell
+#end
+#if thermostat
+
+step ask_heat
+approve Everyone's out. {what.line}
+yes Heating to <away temp> °C
+no Leave it
+timeout 1h
+on deny goto quiet
+
+step heat
+tool home/home_set {"device": "<thermostat>", "action": "temperature", "value": "<away temp>"}
+on fail goto heat_failed
+if heat starts done goto heat_done
+
+step heat_unsure
+say I set the heating to <away temp> °C, but the <thermostat label> hasn't confirmed: {heat}
+end
+
+step heat_done
+say Heating is set to <away temp> °C.
+end
+
+step heat_failed
+say The heating didn't change: {heat.error}
+end
+
+step quiet
+end
+#end
+
+step tell
+say Everyone's out. {what.line}

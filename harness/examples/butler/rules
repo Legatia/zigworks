@@ -1,0 +1,36 @@
+# The butler's lines in rules. /setup home adds the first part, /setup car
+# the second, and /setup routines the lines of the routines you turn on.
+
+# the home: reading it needs no question; what you ask for switches what
+# home.ini allows (locks, the garage and valves stay asked every time:
+# home_guarded is a money tool in mcp.ini)
+allow mcp home/home_state *
+allow mcp home/home_wait *
+[owner]
+allow mcp home/home_set *
+[all]
+
+# the car: reading it needs no question; charging and the charge limit
+# when you ask; locking is asked; unlocking is not on the car file at all
+allow mcp car/car_status *
+[owner]
+ask mcp car/car_command {"command":"lock"*
+allow mcp car/car_command *
+[all]
+
+# goodnight: its run switches the lights and the heating
+[workflow:goodnight/night]
+allow mcp home/home_set *
+[all]
+
+# arriving: the heating back up, this call alone
+[workflow:arriving/heat]
+allow mcp home/home_set {"device":"<thermostat>","action":"temperature","value":"<home temp>"}
+[all]
+
+# the morning summary: a calendar is read, never changed
+[workflow:morning-home/read]
+allow mcp calendar/list*
+allow mcp calendar/get*
+allow mcp calendar/search*
+[all]

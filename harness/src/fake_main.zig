@@ -2,7 +2,7 @@
 //! search, for the end-to-end tests. `harness-fake --dir DIR [--port N]`
 //! prints `port N` and serves until killed. `harness-fake --mcp` is an MCP
 //! server on stdio instead (see fake_mcp.zig; `--mcp --home` is homemcp's
-//! stand-in). `harness-fake --browse URL` is the owner's browser for a
+//! stand-in, `--mcp --car` carcloud's). `harness-fake --browse URL` is the owner's browser for a
 //! sign-in: it opens URL, follows its redirect to 127.0.0.1, and prints the
 //! page's status and text.
 const std = @import("std");
@@ -16,6 +16,7 @@ pub fn main(init: std.process.Init) u8 {
     var port: u16 = 0;
     if (args.len == 2 and std.mem.eql(u8, args[1], "--mcp")) return fake_mcp.run(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--home")) return fake_mcp.runHome(io, init.gpa, init.environ_map);
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--car")) return fake_mcp.runCar(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--browse")) {
         const page = fake.browse(io, init.arena.allocator(), args[2], .{}) catch |e| {
             std.debug.print("harness-fake: {s}\n", .{@errorName(e)});

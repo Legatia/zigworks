@@ -2541,6 +2541,7 @@ test {
     _ = @import("voice.zig");
     _ = @import("quiet.zig");
     _ = @import("household.zig");
+    _ = @import("butler.zig");
 }
 
 test "a_line_of_ctrl_d_leaves_the_chat_in_a_windows_console" {
