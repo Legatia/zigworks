@@ -4,9 +4,9 @@
 //! people change when told to: publish JSON to `homesim/<friendly name>`
 //! (Zigbee2MQTT), or POST it to `/homesim/<entity id>` (Home Assistant),
 //! with any of occupancy, contact, available, temperature, locked, leak,
-//! smoke, home, zone. `POST /homesim/drop_websockets` cuts every
-//! WebSocket, as a restart of Home Assistant would. What it was asked to
-//! say (`assist_satellite.announce`, `tts.speak`) is kept, and listed by
+//! smoke, ring (the doorbell is pressed), home, zone. `POST
+//! /homesim/drop_websockets` cuts every WebSocket, as a restart of Home
+//! Assistant would. What it was asked to say (`assist_satellite.announce`, `tts.speak`) is kept, and listed by
 //! `GET /homesim/announcements`.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -17,7 +17,7 @@ const jv = @import("jv.zig");
 const color = @import("color.zig");
 const when = @import("when.zig");
 
-const Kind = enum { light, plug, climate, lock, cover, motion, contact, valve, lamp, fan, speaker, scene, person, camera, smoke, setting, temp, leak, satellite, other };
+const Kind = enum { light, plug, climate, lock, cover, motion, contact, valve, lamp, fan, speaker, scene, person, camera, smoke, setting, temp, leak, satellite, doorbell, other };
 
 const Dev = struct {
     name: []const u8,
@@ -47,6 +47,10 @@ const Dev = struct {
     closed: bool = true,
     wet: bool = false,
     smoke: bool = false,
+    /// A doorbell: when it last rang (0: never), and a press not yet
+    /// published (Zigbee2MQTT's action).
+    rang_ms: i64 = 0,
+    pressed: bool = false,
     battery: u8 = 90,
     available: bool = true,
     speed: u8 = 0,
@@ -67,7 +71,7 @@ const areas = [_][2][]const u8{
     .{ "garage", "Garage" },
 };
 
-pub const n_devs = 22;
+pub const n_devs = 23;
 
 pub const Home = struct {
     io: Io,
@@ -95,6 +99,7 @@ pub const Home = struct {
         .{ .name = "Living room temperature", .entity = "sensor.living_room_temperature", .kind = .temp, .area = "living_room", .temperature = 21.5 },
         .{ .name = "Sink leak", .entity = "binary_sensor.sink_leak", .kind = .leak, .area = "kitchen" },
         .{ .name = "Hall voice", .entity = "assist_satellite.hall_voice", .kind = .satellite, .area = "hall", .ha_only = true },
+        .{ .name = "Front door bell", .entity = "event.front_door_bell", .kind = .doorbell, .area = "hall" },
     },
     /// What it was asked to say, oldest first.
     announced: std.ArrayList(u8) = .empty,
@@ -125,7 +130,7 @@ pub const Home = struct {
     }
 
     /// The test triggers: occupancy, contact, available, temperature,
-    /// locked, leak, smoke; a person's home or zone.
+    /// locked, leak, smoke, ring; a person's home or zone.
     fn poke(h: *Home, d: *Dev, v: jv.Value) void {
         if (jv.boolean(jv.get(v, "occupancy"))) |x| d.occupancy = x;
         if (jv.boolean(jv.get(v, "contact"))) |x| d.closed = x;
@@ -134,6 +139,10 @@ pub const Home = struct {
         if (jv.boolean(jv.get(v, "locked"))) |x| d.locked = x;
         if (jv.boolean(jv.get(v, "leak"))) |x| d.wet = x;
         if (jv.boolean(jv.get(v, "smoke"))) |x| d.smoke = x;
+        if (jv.boolean(jv.get(v, "ring"))) |x| if (x) {
+            d.rang_ms = nowMs(h.io);
+            d.pressed = true;
+        };
         if (jv.boolean(jv.get(v, "home"))) |x| {
             d.home = x;
             d.zone = "";
@@ -183,6 +192,8 @@ fn z2mState(a: Allocator, d: *const Dev) ![]u8 {
         .motion => std.fmt.allocPrint(a, "{{\"occupancy\":{},\"battery\":{d}}}", .{ d.occupancy, d.battery }),
         .contact => std.fmt.allocPrint(a, "{{\"contact\":{},\"battery\":{d}}}", .{ d.closed, d.battery }),
         .smoke => std.fmt.allocPrint(a, "{{\"smoke\":{},\"battery\":{d}}}", .{ d.smoke, d.battery }),
+        // a button says its action once, as it is pressed
+        .doorbell => if (d.pressed) std.fmt.allocPrint(a, "{{\"action\":\"single\",\"battery\":{d}}}", .{d.battery}) else std.fmt.allocPrint(a, "{{\"battery\":{d}}}", .{d.battery}),
         .temp => std.fmt.allocPrint(a, "{{\"temperature\":{d:.1},\"humidity\":45,\"battery\":{d}}}", .{ d.temperature, d.battery }),
         .leak => std.fmt.allocPrint(a, "{{\"water_leak\":{},\"battery\":{d}}}", .{ d.wet, d.battery }),
         else => a.dupe(u8, "{}"),
@@ -207,6 +218,7 @@ fn z2mExposes(k: Kind) []const u8 {
         .motion => "[{\"name\":\"occupancy\",\"property\":\"occupancy\",\"type\":\"binary\",\"access\":1}," ++ battery ++ "]",
         .contact => "[{\"name\":\"contact\",\"property\":\"contact\",\"type\":\"binary\",\"access\":1}," ++ battery ++ "]",
         .smoke => "[{\"name\":\"smoke\",\"property\":\"smoke\",\"type\":\"binary\",\"access\":1}," ++ battery ++ "]",
+        .doorbell => "[{\"name\":\"action\",\"property\":\"action\",\"type\":\"enum\",\"access\":1,\"values\":[\"single\",\"double\",\"hold\",\"release\"]}," ++ battery ++ "]",
         .temp => "[{\"name\":\"temperature\",\"property\":\"temperature\",\"type\":\"numeric\",\"access\":1,\"unit\":\"°C\"},{\"name\":\"humidity\",\"property\":\"humidity\",\"type\":\"numeric\",\"access\":1,\"unit\":\"%\"}," ++ battery ++ "]",
         .leak => "[{\"name\":\"water_leak\",\"property\":\"water_leak\",\"type\":\"binary\",\"access\":1}," ++ battery ++ "]",
         else => "[]",
@@ -314,7 +326,11 @@ fn z2mSession(gpa: Allocator, io: Io, home: *Home, host: []const u8, port: u16, 
                 home.lock.unlock(io);
                 if (d) |x| if (!x.ha_only) {
                     try c.publish(try topic(a, base, x.name, "/availability"), if (x.available) "{\"state\":\"online\"}" else "{\"state\":\"offline\"}", true);
-                    if (x.available) try c.publish(try topic(a, base, x.name, ""), try z2mState(a, x), false);
+                    home.lock.lockUncancelable(io);
+                    const st = z2mState(a, x);
+                    x.pressed = false;
+                    home.lock.unlock(io);
+                    if (x.available) try c.publish(try topic(a, base, x.name, ""), try st, false);
                 };
             } else if (tp.len > base.len + 1) {
                 const rel = tp[base.len + 1 ..];
@@ -354,7 +370,7 @@ pub fn bridgeDevices(a: Allocator, home: *Home) ![]u8 {
     try o.appendSlice(a, "[{\"friendly_name\":\"Coordinator\",\"ieee_address\":\"0x00124b0000000000\",\"type\":\"Coordinator\",\"supported\":false,\"definition\":null}");
     for (home.devs, 0..) |d, i| {
         if (d.ha_only) continue;
-        try o.print(a, ",{{\"friendly_name\":{f},\"ieee_address\":\"0x00124b00000000{x:0>2}\",\"type\":\"EndDevice\",\"supported\":true,\"definition\":{{\"model\":\"SIM-{s}\",\"vendor\":\"homemcp-sim\",\"description\":\"{s}\",\"exposes\":{s}}}}}", .{ std.json.fmt(d.name, .{}), i + 1, @tagName(d.kind), if (d.kind == .valve) "Water valve" else "A made-up device", z2mExposes(d.kind) });
+        try o.print(a, ",{{\"friendly_name\":{f},\"ieee_address\":\"0x00124b00000000{x:0>2}\",\"type\":\"EndDevice\",\"supported\":true,\"definition\":{{\"model\":\"SIM-{s}\",\"vendor\":\"homemcp-sim\",\"description\":\"{s}\",\"exposes\":{s}}}}}", .{ std.json.fmt(d.name, .{}), i + 1, @tagName(d.kind), if (d.kind == .valve) "Water valve" else if (d.kind == .doorbell) "Wireless button, as a doorbell" else "A made-up device", z2mExposes(d.kind) });
     }
     try o.appendSlice(a, ",{\"friendly_name\":\"0x00124b0000000099\",\"ieee_address\":\"0x00124b0000000099\",\"type\":\"EndDevice\",\"supported\":false,\"definition\":null}]");
     return o.items;
@@ -374,6 +390,7 @@ fn haState(a: Allocator, d: *const Dev) ![]u8 {
         .motion => if (d.occupancy) "on" else "off",
         .contact => if (d.closed) "off" else "on",
         .smoke => if (d.smoke) "on" else "off",
+        .doorbell => if (d.rang_ms == 0) "unknown" else try isoMs(a, d.rang_ms),
         .leak => if (d.wet) "on" else "off",
         .speaker => d.playing,
         .scene => if (d.activated_ms == 0) "unknown" else try isoMs(a, d.activated_ms),
@@ -404,6 +421,7 @@ fn haState(a: Allocator, d: *const Dev) ![]u8 {
         .motion => try o.appendSlice(a, "\"device_class\":\"motion\","),
         .contact => try o.appendSlice(a, "\"device_class\":\"door\","),
         .smoke => try o.appendSlice(a, "\"device_class\":\"smoke\","),
+        .doorbell => try o.appendSlice(a, "\"device_class\":\"doorbell\",\"event_type\":\"ring\",\"event_types\":[\"ring\"],"),
         .leak => try o.appendSlice(a, "\"device_class\":\"moisture\","),
         .temp => try o.appendSlice(a, "\"device_class\":\"temperature\",\"unit_of_measurement\":\"°C\",\"state_class\":\"measurement\","),
         .speaker => try o.print(a, "\"volume_level\":{d},\"is_volume_muted\":false,\"device_class\":\"speaker\",", .{@as(f64, @floatFromInt(d.volume)) / 100}),

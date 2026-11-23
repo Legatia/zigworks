@@ -1,0 +1,47 @@
+# The doorbell: someone rang while you're home. One line at once (with the
+# parcel due today, when there is one). With a lock home.ini lets unlock
+# (setup never writes that: you add unlock to its allow line by hand), the
+# line asks [Unlock the door] [Leave it]: your tap is your own request,
+# that one call fixed below, asked as every guarded call is; no answer in
+# 10 minutes, nothing happens. Nothing unlocks by itself, and no camera is
+# used. While you're away, triggers.ini's doorbell-away-... says it at
+# once instead, through quiet hours, with no unlock.
+workflow doorbell
+about When someone rings while you're home: says so at once<doorbell words>.
+start <bell starts>
+tag no
+limits steps 10, days 1
+#if unlock
+
+step ask
+approve Someone's at {input}{event.hint}.
+yes Unlock the door
+no Leave it
+timeout 10m
+on deny goto left
+
+step unlock
+tool home/home_guarded {"device": "<unlock>", "action": "unlock"}
+on fail goto failed
+if unlock starts done goto unlocked
+
+step unsure
+say I sent it, but the <unlock label> hasn't said it is unlocked: {unlock}
+end
+
+step unlocked
+say <Unlock label> unlocked.
+end
+
+step failed
+say The <unlock label> didn't unlock: {unlock.error}
+end
+
+step left
+end
+#end
+#if !unlock
+
+step tell
+say Someone's at {input}{event.hint}.
+#end

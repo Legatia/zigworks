@@ -25,6 +25,9 @@ pub const Kind = enum {
     satellite,
     /// A smoke, CO or gas alarm: only watched; nothing ever acts on it.
     smoke,
+    /// A doorbell (Home Assistant's doorbell event or binary sensor, a
+    /// Zigbee2MQTT button): it rings, nothing acts on it.
+    doorbell,
 
     pub fn parse(s: []const u8) ?Kind {
         return std.meta.stringToEnum(Kind, s);
@@ -45,7 +48,7 @@ pub const Kind = enum {
             .scene => &.{.activate},
             .media => &.{ .play, .pause, .volume, .announce },
             .satellite => &.{.announce},
-            .smoke => &.{},
+            .smoke, .doorbell => &.{},
         };
     }
 
@@ -127,6 +130,9 @@ pub const Props = struct {
     open: ?bool = null, // a door or window contact: true = open
     leak: ?bool = null,
     smoke: ?bool = null,
+    /// A doorbell: it is ringing (pressed), or rang last at `rang`.
+    ring: ?bool = null,
+    rang: ?i64 = null, // ms since 1970
     alarm: ?[]const u8 = null, // disarmed, armed_home, armed_away, triggered, ...
     speed: ?f64 = null, // a fan, %
     speed_step: ?f64 = null, // the fan's own step, %
@@ -138,7 +144,7 @@ pub const Props = struct {
     value: ?f64 = null, // another sensor's number
     unit: ?[]const u8 = null,
 
-    pub const fields = [_][]const u8{ "on", "brightness", "color", "color_temp", "position", "cover", "lock", "temperature", "setpoint", "mode", "heating", "humidity", "occupancy", "open", "leak", "smoke", "alarm", "speed", "media", "volume", "activated", "battery", "power", "value", "available" };
+    pub const fields = [_][]const u8{ "on", "brightness", "color", "color_temp", "position", "cover", "lock", "temperature", "setpoint", "mode", "heating", "humidity", "occupancy", "open", "leak", "smoke", "ring", "alarm", "speed", "media", "volume", "activated", "battery", "power", "value", "available" };
 };
 
 /// Where a person is, from a Home Assistant person entity's state.
@@ -214,6 +220,11 @@ pub fn fromZ2m(kind: Kind, v: jv.Value) Props {
     };
     if (jv.num(jv.get(v, "battery"))) |x| p.battery = x;
     if (jv.num(jv.get(v, "power"))) |x| p.power = x;
+    // a button: each message with an action is a press (a hold's release is not)
+    if (kind == .doorbell) {
+        const act = jv.str(jv.get(v, "action")) orelse "";
+        p.ring = act.len > 0 and !eqlI(act, "release");
+    }
     if (kind == .fan) {
         if (jv.str(jv.get(v, "fan_state"))) |st| p.on = eqlI(st, "ON");
         if (jv.str(jv.get(v, "fan_mode"))) |m| {
@@ -294,6 +305,14 @@ pub fn fromHa(kind: Kind, v: jv.Value) Props {
         .satellite => p.media = word(st),
         // a smoke, CO or gas binary sensor: on is an alarm
         .smoke => p.smoke = eql(st, "on"),
+        // a doorbell event: its state is when it last rang ("unknown"
+        // before it ever did); a binary sensor: on while pressed
+        .doorbell => if (std.mem.eql(u8, domain, "event")) {
+            p.rang = when.parseMs(st);
+            p.ring = p.rang != null;
+        } else {
+            p.ring = eql(st, "on");
+        },
         .sensor => {
             if (std.mem.eql(u8, domain, "binary_sensor")) {
                 const on = eql(st, "on");
@@ -383,6 +402,10 @@ fn body(a: Allocator, kind: Kind, p: Props, with_battery: bool) ![]u8 {
         },
         .satellite => if (p.media) |m| try o.appendSlice(a, m),
         .smoke => if (p.smoke) |x| try o.appendSlice(a, if (x) "ALARM" else "clear"),
+        .doorbell => if (p.rang) |ms| {
+            var tb: [20]u8 = undefined;
+            try o.print(a, "last rang {s}", .{when.isoTime(&tb, @divFloor(ms, 1000))});
+        } else if (p.ring) |x| try o.appendSlice(a, if (x) "ringing" else "idle"),
         .climate => {
             if (p.temperature) |x| try o.print(a, "{s} °C", .{num(x)});
             if (p.setpoint) |x| try o.print(a, "{s}set to {s} °C", .{ sep(&o), num(x) });
@@ -425,6 +448,7 @@ pub fn headline(a: Allocator, kind: Kind, p: Props) !?[]const u8 {
         .alarm => p.alarm,
         .media, .satellite => p.media,
         .smoke => if (p.smoke) |x| (if (x) "ALARM" else "clear") else null,
+        .doorbell => if (p.ring) |x| (if (x) "ring" else "idle") else null,
         .scene => if (p.activated) |ms| blk: {
             var tb: [20]u8 = undefined;
             break :blk try std.fmt.allocPrint(a, "ran {s}", .{when.isoTime(&tb, @divFloor(ms, 1000))});
@@ -651,4 +675,31 @@ test "smoke_and_co_alarms_read_as_alarm_or_clear" {
     try t.expectEqualStrings("ALARM", try describe(a, .smoke, fromZ2m(.smoke, jv.parse(a, "{\"carbon_monoxide\":true}").?)));
     try t.expectEqualStrings("clear, battery low (10%)", try describe(a, .smoke, fromZ2m(.smoke, jv.parse(a, "{\"gas\":false,\"battery\":10}").?)));
     try t.expectEqualStrings("yes", (try field(a, smoke, "smoke")).?);
+}
+
+test "doorbells_ring_from_ha_events_binary_sensors_and_z2m_actions" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // seen only: nothing acts on a doorbell
+    try t.expectEqual(0, Kind.doorbell.actions().len);
+    try t.expect(!Kind.doorbell.alwaysGuarded());
+    // Home Assistant's event entity: its state is when it last rang
+    const ev = fromHa(.doorbell, jv.parse(a, "{\"entity_id\":\"event.front_door_bell\",\"state\":\"2026-11-23T14:10:03.000+00:00\",\"attributes\":{\"device_class\":\"doorbell\",\"event_type\":\"ring\"}}").?);
+    try t.expectEqualStrings("ring", (try headline(a, .doorbell, ev)).?);
+    try t.expectEqualStrings("last rang 2026-11-23T14:10:03Z", try describe(a, .doorbell, ev));
+    const never = fromHa(.doorbell, jv.parse(a, "{\"entity_id\":\"event.front_door_bell\",\"state\":\"unknown\",\"attributes\":{\"device_class\":\"doorbell\"}}").?);
+    try t.expectEqualStrings("idle", (try headline(a, .doorbell, never)).?);
+    try t.expectEqualStrings("idle", try describe(a, .doorbell, never));
+    // a binary sensor: on while pressed
+    try t.expectEqualStrings("ring", (try headline(a, .doorbell, fromHa(.doorbell, jv.parse(a, "{\"entity_id\":\"binary_sensor.doorbell\",\"state\":\"on\",\"attributes\":{}}").?))).?);
+    try t.expectEqualStrings("idle", (try headline(a, .doorbell, fromHa(.doorbell, jv.parse(a, "{\"entity_id\":\"binary_sensor.doorbell\",\"state\":\"off\",\"attributes\":{}}").?))).?);
+    try t.expectEqualStrings("offline", (try headline(a, .doorbell, fromHa(.doorbell, jv.parse(a, "{\"entity_id\":\"event.x\",\"state\":\"unavailable\",\"attributes\":{}}").?))).?);
+    // Zigbee2MQTT: a button's action; its release, or no action, is no ring
+    try t.expectEqualStrings("ring", (try headline(a, .doorbell, fromZ2m(.doorbell, jv.parse(a, "{\"action\":\"single\",\"battery\":90}").?))).?);
+    try t.expectEqualStrings("idle", (try headline(a, .doorbell, fromZ2m(.doorbell, jv.parse(a, "{\"action\":\"release\"}").?))).?);
+    try t.expectEqualStrings("idle", (try headline(a, .doorbell, fromZ2m(.doorbell, jv.parse(a, "{\"battery\":89}").?))).?);
+    try t.expectEqualStrings("idle", (try headline(a, .doorbell, fromZ2m(.doorbell, jv.parse(a, "{\"action\":\"\"}").?))).?);
+    try t.expectEqualStrings("ringing", try describe(a, .doorbell, fromZ2m(.doorbell, jv.parse(a, "{\"action\":\"single\"}").?)));
+    try t.expectEqualStrings("yes", (try field(a, ev, "ring")).?);
 }

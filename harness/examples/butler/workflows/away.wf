@@ -1,0 +1,49 @@
+# Away: harness starts it as away mode comes on (everyone out for
+# [butler] away_after, a trip under way, or /away): one line saying so,
+# and one tap before the heating goes down. While you're away, doors,
+# windows and movement come at once (triggers.ini's away-... sections),
+# the lights rules lets schedule:away switch go on and off in the
+# evening, and one line comes at 20:00; before you're back the heating
+# goes up again. Nothing guarded is ever touched.
+workflow away
+about When the house is empty (everyone out <away after>, a trip, or /away): a line, and one tap before the heating goes down.
+start owner, schedule:away
+tag no
+limits steps 10, days 1
+#if thermostat
+
+step warm
+tool home/home_wait {"device": "<thermostat>", "property": "setpoint", "condition": ">", "value": "<away temp>", "timeout_s": 0}
+on fail goto tell
+if warm has not within goto tell
+
+step ask
+approve {input} Heating to <away temp> °C while you're away?
+yes Heating to <away temp> °C
+no Leave it
+timeout 12h
+on deny goto quiet
+
+step heat
+tool home/home_set {"device": "<thermostat>", "action": "temperature", "value": "<away temp>"}
+on fail goto heat_failed
+if heat starts done goto heat_done
+
+step heat_unsure
+say I set the heating to <away temp> °C, but the <thermostat label> hasn't confirmed: {heat}
+end
+
+step heat_done
+say Heating is set to <away temp> °C.
+end
+
+step heat_failed
+say The heating didn't change: {heat.error}
+end
+
+step quiet
+end
+#end
+
+step tell
+say {input}

@@ -29,12 +29,7 @@ on deny goto left
 on fail goto failed
 
 step added
-#if people
-say {read.line} It's in the calendar. When you've all left for it, the Leaving routine sets the house to away.
-#end
-#if !people
 say {read.line} It's in the calendar.
-#end
 end
 
 step left

@@ -141,9 +141,16 @@ const Home = struct {
 
     const devices = [_][]const u8{ "living_room_light", "front_door", "hall_thermostat", "water_main", "back_door", "sink_leak" };
 
-    /// home_wait with timeout 0: whether `device`'s `property` is `value` now.
-    fn wait(h: *Home, a: std.mem.Allocator, device: []const u8, property: []const u8, value: []const u8) ![]const u8 {
+    /// home_wait with timeout 0: whether `device`'s `property` is `value` now
+    /// (the thermostat's setpoint compared as `condition` says).
+    fn wait(h: *Home, a: std.mem.Allocator, device: []const u8, property: []const u8, condition: []const u8, value: []const u8) ![]const u8 {
         const eql = std.mem.eql;
+        if (eql(u8, device, "hall_thermostat") and eql(u8, property, "setpoint")) {
+            const want = std.fmt.parseInt(u32, value, 10) catch return textResult(a, "a number, please", true);
+            const ok = if (eql(u8, condition, ">")) h.setpoint > want else if (eql(u8, condition, "<")) h.setpoint < want else h.setpoint == want;
+            if (ok) return textResult(a, try std.fmt.allocPrint(a, "{s} {s} {s} {s}: yes, after 0.0 s", .{ device, property, condition, value }), false);
+            return textResult(a, try std.fmt.allocPrint(a, "{s} {s} {s} {s}: not within 0 s (it is {d})", .{ device, property, condition, value, h.setpoint }), false);
+        }
         const is: []const u8 = if (eql(u8, device, "front_door") and eql(u8, property, "lock"))
             (if (h.door_locked) "locked" else "unlocked")
         else if (eql(u8, property, "open"))
@@ -170,7 +177,7 @@ const Home = struct {
             for (devices, 0..) |d, i| try out.print(a, "{s}{s}", .{ if (i > 0) "\n" else "", (try h.line(a, d)).? });
             return textResult(a, out.items, false);
         }
-        if (eql(u8, name, "home_wait")) return h.wait(a, device, field(args, "property"), field(args, "value"));
+        if (eql(u8, name, "home_wait")) return h.wait(a, device, field(args, "property"), field(args, "condition"), field(args, "value"));
         if (eql(u8, name, "announce")) {
             const message = field(args, "message");
             if (message.len == 0) return textResult(a, "say what to announce: message", true);

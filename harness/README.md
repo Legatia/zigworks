@@ -21,7 +21,11 @@ in the chat, with routines that ask with one tap before a lock or a valve
 household in turn (Emergencies, below). With your calendar (through
 calmcp) it keeps the day: today's events in the morning summary, when to
 leave, a note before a meeting, posts held while you're busy, and changes
-only when you say (The diary, below). It keeps the household's shopping
+only when you say (The diary, below). While you're away it watches the
+doors, makes the house look lived in and says one line at 20:00, and your
+trips get their check-in, the time to leave for the airport and the
+evening before (Away and travel, below); a ring at the door says who it
+probably is (The door, below). It keeps the household's shopping
 lists, proposes an order from a shop you set up and buys it only when you
 tap, follows your parcels, and reminds you of the boiler's service and the
 car's insurance (Errands and upkeep, below). It reminds you of your
@@ -54,7 +58,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 1143 unit tests (20 of them
+**State: 0.3.0, tested on macOS by its own tests: 1183 unit tests (20 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 109 checks that drives the real binary against
@@ -63,10 +67,11 @@ notes and their files too), a transcription service, feeds, search, three
 MCP servers run as programs (one a shop, ordered from on a tap), and MCP
 servers at a url with a token or a sign-in (with a stand-in authorization
 server and browser); with homemcp
-and carcloud built (HOMEMCP_BIN, CARCLOUD_BIN), 23 more: an event pushed
+and carcloud built (HOMEMCP_BIN, CARCLOUD_BIN), 28 more: an event pushed
 by homemcp, and the butler's setup in the chat and each routine (the
 leak's fallback turned on, a smoke alarm going off and answered with I'm
-on it), against
+on it, a ring at the door, away mode with a door and a ring while
+away), against
 homemcp-sim and carcloud-sim (stand-ins for Home Assistant and Smartcar),
 and Home Assistant asking the voice agent (a test client sending what its
 llama.cpp integration sends); with calmcp built (CALMCP_BIN), 5 more:
@@ -77,7 +82,9 @@ errands and upkeep (lists, reorders, parcels, the car's odometer) have met
 only stand-ins: no real shop, carrier's page or car. Medication
 reminders, bedtime, habits, the evening message and the butler's manner
 are tested by unit tests with a fake clock, a written log and the
-stand-ins only: no real household or week of habits yet.
+stand-ins only: no real household or week of habits yet. Away mode,
+trips and the doorbell are tested against stand-ins only (no real
+doorbell, trip, airline or flight-status server yet).
 An earlier build of 0.3.0 also passed its tests in CI on Linux and
 Windows. Emergencies (escalation to the household, the leak's fallback,
 the smoke routine) are tested against stand-ins only: no real household,
@@ -826,11 +833,14 @@ turns one off, and the files can be edited and `/reload`ed.
 | Leak | a leak sensor reads water | at once, through quiet hours: [Close the water main] [Ignore]; with its fallback on, closed by harness when nobody answers in 5 minutes |
 | Smoke alarm | a smoke or CO alarm goes off | at once, through quiet hours, on every speaker; nothing is acted on |
 | Doors left open | a door or window opens | after 10 minutes, if it still is open, a line |
+| Doorbell | a doorbell rings | at home "Someone's at the front door." (the parcel due today, when there is one); while away urgent; [Unlock the door] only for a lock you let unlock (The door, below) |
+| Away | away mode coming on | one line and one tap for the heating; then doors urgent, the evening's lights, the 20:00 line, the heating back before you return (Away and travel, below) |
 | Car for tomorrow | 90 minutes before quiet hours | a line when the car is low and not plugged in; one tap to start charging when it is |
 | Warm the car | 30 minutes before a morning leave-by in your calendar, when the car reads below `[butler] warm_below` (5 °C) outside | "Warm the car for 8:10? It's -3 °C at the car." [Warm it] [Not today]; the tap turns the car's climate on, read back; offered for a car that warms (below) |
 | Bills | your mailbox is on (Mail) | a line 3 days before a bill is due: who, how much, when |
 | Deliveries | your mailbox is on | a line on the day a parcel comes |
 | Flights, Invitations | your mailbox and a calendar are on | the time offered for the calendar, asked first |
+| Trips | a calendar or your mailbox is on | trips from both (/trips), check-in, the airport's leave-by, the evening before (Away and travel, below) |
 | Evening | at 21:00, or before quiet hours (`[butler] evening`) | one message about tomorrow: the first event and when to leave, the weather, the car, bills due, what waits in /inbox (Health, habits and the evening, below) |
 
 Nothing guarded runs without your tap: locks are only locked, valves and
@@ -838,7 +848,10 @@ garage doors only closed, alarms only armed (homemcp's home file allows
 nothing else), each after an `approve` step's `yes` (The gate, under
 Workflows), and no answer means nothing happens, but for one opt-in: the
 leak's fallback (Emergencies, below), which closes the water main once
-when nobody is on the alert in 5 minutes. After the leak is turned on
+when nobody is on the alert in 5 minutes. The one way a door is ever
+unlocked is the doorbell's [Unlock the door] (The door, below): your own
+tap, for a lock you let unlock in home.ini yourself, never while you're
+away. After the leak is turned on
 with a valve, setup offers it: "If nobody answers the leak's question in
 5 minutes, I close the water main myself, once, and tell you." [Turn on]
 [Not now], the line it adds shown first. The files are in
@@ -935,6 +948,111 @@ store, every one stored) is masked as `[secret:NAME]`; what looks like a
 bot token or a password in an address is taken out. The log holds what
 you and harness said in conversations that are not private: read it
 before you send it.
+
+### Away and travel
+
+With the **Away** routine on (`/setup routines` offers it), harness knows
+when the house is empty and acts like it:
+
+```
+20:41  Butler:  Away mode is on: everyone has been out since 08:41. Doors, windows
+                and movement come to you at once, and the living room light goes on
+                and off in the evening. Heating to 17 °C while you're away?
+                                                   [Heating to 17 °C] [Leave it]
+02:10  Butler:  The back door opened while you're away.          [I'm on it]
+20:00  Butler:  All quiet at home. The front door bell rang at 14:10, probably the DHL parcel.
+16:15  Butler:  The heating is going back to 21 °C for your return at about 18:15.
+```
+
+- **On** when everyone has been out `[butler] away_after` (12h; from
+  homemcp's `home://presence`, so the home file's `[people]` should list
+  everyone who lives there), when a trip is under way and nobody is home
+  (Trips, below), or by **`/away on`** or **`/away until DAY [HH:MM]`**
+  (tomorrow, sun, 29 nov; back at 18:00 unless you say). **Off** when the
+  first of you is back, by `/away off`, or, with no `[people]`, when the
+  return you gave (or the trip's) has come. After `/away off` (a house
+  sitter staying) it comes on by itself only for a later leaving or trip.
+  `/away` says how it stands.
+- **The heating**, asked once as it comes on, only when it is set above
+  `[butler] away_temp` (17 °C); two hours before you're back (a trip's last
+  arrival plus `[butler] travel`, or `/away until`'s time), and when it
+  goes off unless the Arriving routine does it, back to `[butler]
+  home_temp` (21 °C), but only when it is at the away temperature or below.
+- **Lights that make it look lived in**: those `rules` lets
+  `schedule:away` switch (the routine writes two, a living room's first;
+  `/away lights NAME, NAME` or `/away lights none` changes them, and takes
+  only home.ini's lights that aren't guarded). On from 19:00 and off from
+  22:30, each up to 30 minutes later, at a minute of their own every
+  evening; nothing is said of them.
+- **Any door, window or movement is urgent**: a trigger per sensor
+  (`while = away`), through quiet hours, to the household as `[butler]
+  escalate` says, and said on the speakers ("The back door opened. The
+  owner has been told.").
+- **One line at 20:00**: "All quiet at home." when no door, window or
+  movement came since the last one, else what did and when; then each
+  ring at the door and each parcel left.
+- **What it may do by itself**: `home_set` alone, through the gate as
+  `schedule:away` with nobody to ask (a rule must allow each call:
+  `[schedule:away]` in rules, these calls exactly); never `home_guarded`,
+  never a lock, a valve, the garage or an alarm.
+- **State.** `state/away` (on or off, why, since, until, the lights'
+  seed and evening, what happened since the last 20:00 line), written
+  whole; log lines `away on`, `away off`, `away summary`, and each call's
+  gate and tool lines.
+
+With the **Trips** routine on (offered with a calendar or your mailbox),
+flights, trains and hotel stays become trips in `state/trips/` (a file
+each), from the calendar (the diary's today and tomorrow: a trip only in
+the calendar is known a day ahead) and from travel mail (each mail
+mailmcp marks travel is read once, by the model, as data; its text is
+never logged). **`/trips`** lists them, times in each place's own time
+where the mail gave it:
+
+```
+Lisbon, Fri 4 Dec – Mon 7 Dec:
+Fri 4 Dec 07:15 LO 3921 Kraków → Lisbon, arrives 10:40 Lisbon time
+Mon 7 Dec 11:30 Lisbon time LO 3922 Lisbon → Kraków, arrives 17:45
+```
+
+- **Check-in**, 24 hours before a flight, once: "Check-in for LO 3921
+  Kraków → Lisbon (tomorrow 07:15) is open: https://www.lot.com/…"; the
+  mail's link only when it is the airline's own (https, its domain), else
+  "on LOT's site or app".
+- **Time to leave for the airport**: the diary's line, for a flight
+  `[butler] airport` (2h) earlier still: "Time to leave for the airport:
+  Flight LO 3921 Kraków – Lisbon at 07:15, from Kraków (KRK); be there by
+  05:15 (about 30 min away)."
+- **The evening before** (19:00, or 15 minutes before quiet hours when
+  they start earlier): one line from `trips.wf`: when to leave, the
+  weather there (with search set: an agent step, the trip's values as
+  data) and what to pack for its length (and its weather).
+- **Flight status** only when `[butler] flight_status = SERVER/TOOL` names
+  a flight-status MCP server's tool (asked `{"date", "flight"}`; a tool
+  that moves money is never called): every 15 minutes from 6 hours before
+  until an hour after landing; its first answer is kept, a change that
+  matters (a delay, a gate, a cancellation) is said at once, through
+  quiet hours. Without it nothing is claimed. A page as a source is not
+  supported yet.
+
+### The door
+
+homemcp's doorbells (Home Assistant's doorbell events and binary sensors,
+a Zigbee2MQTT button named a doorbell) push `ring`. The **Doorbell**
+routine:
+
+- while someone is home: "Someone's at the front door, probably the DHL
+  parcel." (the parcel when your mailbox has one due today: only a
+  carrier's name from a fixed list, never a mail's words), said on every
+  speaker when the home has one; quiet hours hold it as any routine's line;
+- while you're away: "Someone's at the front door while you're away.",
+  urgent, through quiet hours and to the household, noted for the 20:00
+  line, and never with a button that unlocks;
+- **[Unlock the door]** only when home.ini lets the lock unlock (setup
+  never writes that: add `unlock` to its `allow` line by hand), and only
+  on the line while someone is home: the tap is your own request, that one
+  call, asked as every guarded call is; no answer in 10 minutes, nothing
+  happens. Nothing unlocks by itself, members get no such button, and no
+  camera is ever used.
 
 ## Emergencies
 
@@ -2477,6 +2595,13 @@ only after a 3% move. A section's keys give its kind:
   in the event's room, or on every speaker with `speakers = all`; a
   trigger never polls `announce` itself. `escalate = 5m anna` (urgent
   only) says who is told when you don't answer (see Emergencies).
+  `while = away` (an event kind) counts its events only while away mode
+  is on, `while = home` only while it is off; in the other state an event
+  is dropped as it comes (see Away and travel). `tag = no` posts a `say`
+  without `[NAME]` in front, as the butler's routines speak. A doorbell's
+  event (homemcp's kind `doorbell`) has a field `hint` too: ", probably
+  the DHL parcel" when your mailbox has a delivery due today (see The
+  door).
 - **State.** `state/triggers/NAME/` keeps `state` (where its polls are,
   what it counted), `seen`, `queue` and a page's `last` text. A poll
   writes its events to `queue` before its cursor moves, and an event is
@@ -2810,7 +2935,8 @@ memory notices held at night.
 check|rm NAME`, `/quiet [on|off|HH:MM-HH:MM]`, `/dryrun on|off`,
 `/reload`, `/conversations`, `/conversation new|rename|rm|add`,
 `/session [N]`, `/history WORDS`, `/people`, `/person NAME`, `/list [NAME]
-[add|rm|clear|every]`, `/deliveries [rm NUMBER]`, `/upkeep [add|done|rm]`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
+[add|rm|clear|every]`, `/deliveries [rm NUMBER]`, `/upkeep [add|done|rm]`,
+`/away [on|until DAY|off|lights NAME…]`, `/trips`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
 `/agents`, `/agent [NAME]`, `/agent show|rm NAME`, `/ask NAME text`,
 `/triggers`, `/trigger NAME`, `/trigger add|rm|pause|resume|run|test`,
 `/apps`, `/app approve|rm NAME`, `/workflows`, `/workflow NAME|NAME#N`,

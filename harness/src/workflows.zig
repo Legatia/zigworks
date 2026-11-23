@@ -840,6 +840,11 @@ fn placeholderName(n: []const u8) bool {
 /// A running MCP server and its tools.
 pub const McpServer = struct { name: []const u8, tools: []const []const u8 };
 
+/// The schedules harness runs itself, which a workflow's start line may
+/// name without a triggers.ini section: away mode coming on, a trip's
+/// evening before.
+pub const harness_schedules = [_][]const u8{ "away", "trips" };
+
 /// What a workflow may name besides its own steps.
 pub const Context = struct {
     /// triggers.ini's sections.
@@ -869,6 +874,8 @@ pub fn check(a: Allocator, w: Workflow, ctx: Context, diag: *Diag) Error![]const
         const name = s[std.mem.indexOfScalar(u8, s, ':').? + 1 ..];
         // harness's own schedule: the diary's leave-by starts warm-car, and only it
         if (!trigger and std.mem.eql(u8, name, builtin_schedule) and std.mem.eql(u8, w.name, builtin_schedule)) continue;
+        // harness's own schedules (away mode, trips) need no section
+        if (!trigger and oneOf(name, &harness_schedules)) continue;
         const tr = findTrigger(ctx.triggers, name);
         const ok = if (tr) |x| x.isEvent() == trigger and x.action == .start and std.mem.eql(u8, x.action.start, w.name) else false;
         if (!ok) return badf(a, diag, w.start_line, "{s} has no start = workflow {s} in triggers.ini ({s})", .{ name, w.name, if (trigger) "an event trigger" else "a schedule" });
@@ -1652,4 +1659,17 @@ test "harness_starts_warm_car_itself_without_a_triggers_section" {
     const y = try parse(a, "mine", "workflow mine\nstart schedule:warm-car\nstep a\nsay hi\n", &d);
     try t.expectError(error.BadWorkflow, check(a, y, .{}, &d));
     try t.expectEqualStrings("warm-car has no start = workflow mine in triggers.ini (a schedule)", d.why);
+}
+
+test "harness_schedules_start_without_a_section" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    // away mode and trips start their routines themselves
+    const w = try parse(a, "away", "workflow away\nstart owner, schedule:away\nstep s\nsay {input}\n", &d);
+    _ = try check(a, w, .{}, &d);
+    // any other schedule needs its section
+    const x = try parse(a, "x", "workflow x\nstart schedule:nightly\nstep s\nsay hi\n", &d);
+    try t.expectError(error.BadWorkflow, check(a, x, .{}, &d));
 }

@@ -746,12 +746,12 @@ EOF
 	say "/pair $BCODE"
 	check "a butler, paired, hears what comes next" 'wait_for "$OUT" "Next: /setup home connects your home."'
 	say "/setup home http://127.0.0.1:$BPORT"
-	check "/setup home reads the home through homemcp discover and shows the file first" 'wait_for "$OUT" "home.ini, as Looks right writes it:" 20 && wait_for "$OUT" "I found 17 devices in 5 rooms, and 2 people." 20 && wait_for "$OUT" "I won'"'"'t touch the front door camera or the kitchen smoke alarm." 5 && [ ! -e "$BH/home.ini" ]'
+	check "/setup home reads the home through homemcp discover and shows the file first" 'wait_for "$OUT" "home.ini, as Looks right writes it:" 20 && wait_for "$OUT" "I found 18 devices in 5 rooms, and 2 people." 20 && wait_for "$OUT" "I won'"'"'t touch the front door camera or the kitchen smoke alarm." 5 && [ ! -e "$BH/home.ini" ]'
 	n0=$(asked)
 	press yes
-	check "Looks right writes the home, starts homemcp and offers the routines" 'wait_for "$OUT" "The home is connected: 17 devices." 30 && [ -f "$BH/home.ini" ] && grep -qF "secret = HA_TOKEN:ha" "$BH/mcp.ini" && wait_asked_long $((n0 + 1)) && last_question | grep -qF "Goodnight: when you say goodnight"'
+	check "Looks right writes the home, starts homemcp and offers the routines" 'wait_for "$OUT" "The home is connected: 18 devices." 30 && [ -f "$BH/home.ini" ] && grep -qF "secret = HA_TOKEN:ha" "$BH/mcp.ini" && wait_asked_long $((n0 + 1)) && last_question | grep -qF "Goodnight: when you say goodnight"'
 	# every routine turned on, as each is offered (the leak's fallback too)
-	for r in goodnight leaving arriving morning-home leak leak-fallback smoke door-open; do
+	for r in goodnight leaving arriving morning-home leak leak-fallback smoke door-open doorbell away; do
 		n0=$(asked)
 		press on
 		wait_asked_long $((n0 + 1))
@@ -762,9 +762,9 @@ EOF
 		press later
 		[ "$r" = manner ] || wait_asked_long $((n0 + 1))
 	done
-	check "every routine the home has what for is on" 'wait_for "$OUT" "That'"'"'s all the routines: 7 on." 30 && ! grep -q "^evening" "$BH/config.ini" && [ ! -e "$BH/agents/butler.md" ] && [ -f "$BH/workflows/leak.wf" ] && grep -qF "fallback 5m" "$BH/workflows/leak.wf" && grep -qF "[leak-sink_leak]" "$BH/triggers.ini" && grep -qF "[smoke-kitchen_smoke_alarm]" "$BH/triggers.ini" && grep -qF "speakers = all" "$BH/triggers.ini" && grep -qF "[door-back_door]" "$BH/triggers.ini" && grep -qF "[workflow:arriving/heat]" "$BH/rules"'
+	check "every routine the home has what for is on" 'wait_for "$OUT" "That'"'"'s all the routines: 9 on." 30 && ! grep -q "^evening" "$BH/config.ini" && [ ! -e "$BH/agents/butler.md" ] && [ -f "$BH/workflows/leak.wf" ] && grep -qF "[doorbell-front_door_bell]" "$BH/triggers.ini" && grep -qF "[away-back_door]" "$BH/triggers.ini" && grep -qF "[schedule:away]" "$BH/rules" && grep -qF "fallback 5m" "$BH/workflows/leak.wf" && grep -qF "[leak-sink_leak]" "$BH/triggers.ini" && grep -qF "[smoke-kitchen_smoke_alarm]" "$BH/triggers.ini" && grep -qF "speakers = all" "$BH/triggers.ini" && grep -qF "[door-back_door]" "$BH/triggers.ini" && grep -qF "[workflow:arriving/heat]" "$BH/rules"'
 	# the triggers' first polls only mark what is there
-	for tr in leak-sink_leak smoke-kitchen_smoke_alarm door-back_door everyone-left first-home; do
+	for tr in leak-sink_leak smoke-kitchen_smoke_alarm door-back_door everyone-left first-home doorbell-front_door_bell doorbell-away-front_door_bell away-back_door away-hall_motion; do
 		wait_for "$BH/state/triggers/$tr/state" "\"polled\":true" 20
 	done
 	# goodnight: the lights and the heating as asked, then one tap to lock
@@ -801,6 +801,22 @@ EOF
 	check "one tap turns the heating down" 'wait_for "$OUT" "\"text\":\"Heating is set to 17 °C.\"" 20 && HA_TOKEN=smoke-ha-token-1 "$HM/homemcp" check "$BH/home.ini" >"$T/bcheck3.out" 2>&1; grep -F "hall_thermostat (" "$T/bcheck3.out" | grep -qF "set to 17 °C"'
 	"$HM/homemcp-sim" poke ha "$BPORT" smoke-ha-token-1 person.anna '{"home": true}'
 	check "the first one back: the heating back up, in a line" 'wait_for "$OUT" "anna is home. The heating is set to 21 °C." 20'
+	# the doorbell, someone home: a line at once (no lock that unlocks: no question)
+	"$HM/homemcp-sim" poke ha "$BPORT" smoke-ha-token-1 event.front_door_bell '{"ring": true}'
+	check "a ring at the door, pushed by homemcp, is said at once" 'wait_for "$OUT" "\"text\":\"Someone'"'"'s at the front door.\"" 20'
+	# away mode by hand: one line and one question for the heating
+	n0=$(asked)
+	say "/away on"
+	check "/away on says so in one message, asking once for the heating" 'wait_asked_long $((n0 + 1)) && last_question | grep -qF "Away mode is on. Doors, windows and movement come to you at once, and the living room light and the bedroom lamp go on and off in the evening. Heating to 17 °C while you" && grep -qF "\"on\":true" "$BH/state/away"'
+	press deny
+	# away: the back door and the doorbell are urgent and plain
+	"$HM/homemcp-sim" poke ha "$BPORT" smoke-ha-token-1 binary_sensor.back_door '{"contact": true}'
+	"$HM/homemcp-sim" poke ha "$BPORT" smoke-ha-token-1 binary_sensor.back_door '{"contact": false}'
+	check "while away, the back door opening comes at once" 'wait_for "$OUT" "\"text\":\"The back door opened while you" 20'
+	"$HM/homemcp-sim" poke ha "$BPORT" smoke-ha-token-1 event.front_door_bell '{"ring": true}'
+	check "while away, a ring comes at once, with no unlock" 'wait_for "$OUT" "\"text\":\"Someone'"'"'s at the front door while you" 20 && ! grep -qF "Unlock" "$OUT" && grep -qF "the front door bell rang" "$BH/state/away"'
+	say "/away off"
+	check "/away off ends it" 'wait_for "$OUT" "\"text\":\"Away mode is off.\"" 20 && grep -qF "\"on\":false" "$BH/state/away"'
 	# the morning summary reads the house
 	reply "$(call_reply tu_m1 home__home_state '{}')"
 	reply "$(text_reply 'The back door is open; the heating is at 21 C.')"

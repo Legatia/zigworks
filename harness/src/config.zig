@@ -222,6 +222,17 @@ pub const Config = struct {
         bedtime: ?u16 = null,
         /// The evening message's time (the owner's); null: off.
         evening: ?u16 = null,
+        /// Away mode: everyone out this many minutes and it comes on.
+        away_after: u32 = 12 * 60,
+        /// The heating while away, and to come home to, °C (10 to 28).
+        away_temp: u32 = 17,
+        home_temp: u32 = 21,
+        /// Minutes before a flight to be at the airport (the leave-by
+        /// comes this much earlier, and the way there before it).
+        airport: u32 = 120,
+        /// A flight-status MCP server's tool, SERVER/TOOL; "": none (no
+        /// status is ever claimed).
+        flight_status: []const u8 = "",
     };
 };
 
@@ -491,7 +502,7 @@ fn setField(sec: anytype, l: Line) Error!void {
             } else if (comptime std.mem.eql(u8, fname, "escalate")) {
                 // `parse` reads it (it needs the arena)
                 return error.BadConfig;
-            } else if (comptime T == Config.Butler and std.mem.eql(u8, fname, "travel")) {
+            } else if (comptime T == Config.Butler and (std.mem.eql(u8, fname, "travel") or std.mem.eql(u8, fname, "away_after") or std.mem.eql(u8, fname, "airport"))) {
                 @field(sec.*, fname) = parseMinutes(l.value) orelse return error.BadConfig;
             } else if (comptime T == Config.Butler and std.mem.eql(u8, fname, "warm_below")) {
                 // °C, from -40 to 25: "3", "-2.5", "3 °C"
@@ -500,7 +511,11 @@ fn setField(sec: anytype, l: Line) Error!void {
                 const x = std.fmt.parseFloat(f64, v) catch return error.BadConfig;
                 if (!(x >= -40 and x <= 25)) return error.BadConfig;
                 @field(sec.*, fname) = x;
-            } else if (comptime T == Config.Butler and std.mem.eql(u8, fname, "maps")) {
+            } else if (comptime T == Config.Butler and (std.mem.eql(u8, fname, "away_temp") or std.mem.eql(u8, fname, "home_temp"))) {
+                const x = std.fmt.parseInt(u32, l.value, 10) catch return error.BadConfig;
+                if (x < 10 or x > 28) return error.BadConfig;
+                @field(sec.*, fname) = x;
+            } else if (comptime T == Config.Butler and (std.mem.eql(u8, fname, "maps") or std.mem.eql(u8, fname, "flight_status"))) {
                 // SERVER/TOOL
                 const slash = std.mem.indexOfScalar(u8, l.value, '/') orelse return error.BadConfig;
                 if (slash == 0 or slash + 1 == l.value.len or std.mem.indexOfAny(u8, l.value, " \t") != null) return error.BadConfig;
@@ -824,6 +839,11 @@ pub const defaults_ini =
     \\; warm_below = 5                    ; °C at the car: below it, the warm-car routine asks to warm it before a morning leave-by
     \\; bedtime = 23:30                   ; after it, your first message of the night gets one gentle line (/bedtime)
     \\; evening = 21:00                   ; one message about tomorrow (/evening): the first event, the weather, the car, bills, the inbox
+    \\; away_after = 12h                  ; everyone out this long and away mode comes on (README: Away and travel)
+    \\; away_temp = 17                    ; the heating while you're away (asked once), °C
+    \\; home_temp = 21                    ; the heating to come home to, °C
+    \\; airport = 2h                      ; how long before a flight to be at the airport
+    \\; flight_status = flights/flight_status ; a flight-status MCP server's tool; none: no status is claimed
     \\
     \\[voice_agent]                       ; Home Assistant's voice assistant answered by harness (README: Home Assistant's voice)
     \\; listen = 192.168.1.20:8765         ; for Home Assistant on another machine: this one's LAN address (default: this machine only)
@@ -1529,4 +1549,28 @@ test "voice_agent_settings_read_and_checked" {
     }
     const why = (try @import("core.zig").parseProblem(a, "config.ini", "[voice_agent]\nlisten = 0.0.0.0:8765\n", parse)).?;
     try t.expect(std.mem.indexOf(u8, why, "an IP address of this machine and a port") != null);
+}
+
+test "butler_away_and_travel_read" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // away after 12 hours out, 17 °C while away, 21 °C to come home to, at
+    // the airport 2 hours before a flight; no flight status unless set
+    const d = (try parse(a, "")).butler;
+    try t.expectEqual(@as(u32, 12 * 60), d.away_after);
+    try t.expectEqual(@as(u32, 17), d.away_temp);
+    try t.expectEqual(@as(u32, 21), d.home_temp);
+    try t.expectEqual(@as(u32, 120), d.airport);
+    try t.expectEqualStrings("", d.flight_status);
+    for ([_][]const u8{ "; away_after = 12h", "; away_temp = 17", "; home_temp = 21", "; airport = 2h", "; flight_status = flights/flight_status" }) |line| try t.expect(std.mem.indexOf(u8, defaults_ini, line) != null);
+    const c = (try parse(a, "[butler]\naway_after = 8h\naway_temp = 16\nhome_temp = 22\nairport = 1h30m\nflight_status = flights/status\n")).butler;
+    try t.expectEqual(@as(u32, 8 * 60), c.away_after);
+    try t.expectEqual(@as(u32, 16), c.away_temp);
+    try t.expectEqual(@as(u32, 22), c.home_temp);
+    try t.expectEqual(@as(u32, 90), c.airport);
+    try t.expectEqualStrings("flights/status", c.flight_status);
+    for ([_][]const u8{ "away_after = soon", "away_temp = 40", "home_temp = 3", "airport = 0m", "flight_status = status" }) |v| {
+        try t.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "[butler]\n{s}\n", .{v})));
+    }
 }

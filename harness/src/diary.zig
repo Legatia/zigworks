@@ -13,6 +13,7 @@ const history = @import("history.zig");
 const jv = @import("jv.zig");
 const butler = @import("butler.zig");
 const files = @import("butler_files");
+const trips = @import("trips.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -79,7 +80,13 @@ pub const Kind = enum { leave, prep };
 
 /// How long the way takes: `[butler] travel`, or the maps server's
 /// minutes for an event.
-pub const Travel = struct { minutes: u32 = 30, each: []const Each = &.{} };
+pub const Travel = struct {
+    minutes: u32 = 30,
+    each: []const Each = &.{},
+    /// `[butler] airport`: a flight's line comes this much earlier still
+    /// (to be at the airport); 0: as any event.
+    airport: u32 = 0,
+};
 pub const Each = struct { id: []const u8, start: i64, minutes: u32 };
 
 /// What the owner said last naming someone.
@@ -111,9 +118,13 @@ pub fn due(a: Allocator, evs: []const Event, now: i64, travel: Travel, said: []c
         if (e.all_day or e.cancelled or isDeclined(e) or now >= e.start) continue;
         if (goesTo(e.place)) {
             const m = minutesFor(e, travel);
-            if (now >= e.start - @as(i64, m.minutes) * 60) {
+            // a flight: to the airport, there `airport` before it leaves
+            const flight = travel.airport > 0 and trips.isFlight(e.title, e.place);
+            const lead = m.minutes + if (flight) travel.airport else 0;
+            if (now >= e.start - @as(i64, lead) * 60) {
                 const key = try keyOf(a, .leave, e);
-                if (!has(said, key)) try out.append(a, .{ .key = key, .text = try leaveText(a, e, m.minutes, m.maps), .kind = .leave, .event = e });
+                const text = if (flight) try airportText(a, e, m.minutes, travel.airport, m.maps) else try leaveText(a, e, m.minutes, m.maps);
+                if (!has(said, key)) try out.append(a, .{ .key = key, .text = text, .kind = .leave, .event = e });
             }
         }
         if (e.people.len > 0 and now >= e.start - prep_minutes * 60) {
@@ -133,6 +144,14 @@ fn has(list: []const []const u8, x: []const u8) bool {
 pub fn leaveText(a: Allocator, e: Event, minutes: u32, maps: bool) ![]const u8 {
     var b: [8]u8 = undefined;
     return std.fmt.allocPrint(a, "Time to leave for {s} at {s}: {s} (about {d} min away{s}).", .{ e.title, clock(&b, e.start, e.offset), oneLine(e.place), minutes, if (maps) ", by the maps" else "" });
+}
+
+/// "Time to leave for the airport: Flight LO 3921 … at 07:15, from Kraków
+/// Airport (KRK); be there by 05:15 (about 30 min away)."
+pub fn airportText(a: Allocator, e: Event, minutes: u32, airport: u32, maps: bool) ![]const u8 {
+    var b: [8]u8 = undefined;
+    var c: [8]u8 = undefined;
+    return std.fmt.allocPrint(a, "Time to leave for the airport: {s} at {s}, from {s}; be there by {s} (about {d} min away{s}).", .{ e.title, clock(&b, e.start, e.offset), oneLine(e.place), clock(&c, e.start - @as(i64, airport) * 60, e.offset), minutes, if (maps) ", by the maps" else "" });
 }
 
 /// The people's names (else their addresses): "Piotr Nowak and Ewa Lis".
@@ -819,4 +838,19 @@ test "state_keeps_what_was_said_across_a_restart" {
     // older than two days: let go of
     try tt.expectEqual(@as(usize, 1), keys.len);
     try tt.expectEqualStrings("leave:personal/dentist-1@x@1795426200", keys[0]);
+}
+
+test "a_flight_leaves_for_the_airport_earlier" {
+    var arena: std.heap.ArenaAllocator = .init(tt.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 07:15 at +01:00; at the airport 2 hours before ([butler] airport), 30 min away
+    const dep: i64 = 1_796_364_900;
+    const flight: Event = .{ .id = "personal/f1", .title = "Flight LO 3921 Kraków – Lisbon", .start = dep, .end = dep + 4 * 3600, .offset = 60, .place = "Kraków Airport (KRK)" };
+    try tt.expectEqual(@as(usize, 0), (try due(a, &.{flight}, dep - 151 * 60, .{ .airport = 120 }, &.{})).len);
+    const lines = try due(a, &.{flight}, dep - 150 * 60, .{ .airport = 120 }, &.{});
+    try tt.expectEqual(@as(usize, 1), lines.len);
+    try tt.expectEqualStrings("Time to leave for the airport: Flight LO 3921 Kraków – Lisbon at 07:15, from Kraków Airport (KRK); be there by 05:15 (about 30 min away).", lines[0].text);
+    // after its line, one before the flight's own start is not said again
+    try tt.expectEqual(@as(usize, 0), (try due(a, &.{flight}, dep - 30 * 60, .{ .airport = 120 }, &.{lines[0].key})).len);
 }
