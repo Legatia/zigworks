@@ -53,6 +53,9 @@ pub const Callback = struct {
     data: []const u8,
     /// The topic its message is in; 0: the chat itself.
     thread: i64 = 0,
+    /// The text of the message its button is in ("" when Telegram leaves
+    /// it out): an Undo press edits it with the outcome.
+    text: []const u8 = "",
 };
 
 /// The messages a text was sent in: the first one's id and how many.
@@ -153,6 +156,7 @@ pub const Bot = struct {
                     .message_id = jv.int(jv.at(c, &.{ "message", "message_id" })) orelse 0,
                     .data = jv.str(jv.get(c, "data")) orelse "",
                     .thread = if (jv.get(c, "message")) |m| threadOf(m) else 0,
+                    .text = jv.str(jv.at(c, &.{ "message", "text" })) orelse "",
                 } });
             } else {
                 // something else: still advance past it
@@ -371,6 +375,19 @@ test "updates_parsed_messages_and_callbacks" {
     try t.expectEqualStrings("a:once", ups[1].callback.data);
     try t.expectEqual(7, ups[1].callback.message_id);
     try t.expectEqual(2, ups[1].updateId());
+}
+
+test "a_callbacks_message_text_is_kept" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try inbox(&e, 1, "{\"callback_query\":{\"id\":\"cb1\",\"from\":{\"id\":42},\"message\":{\"message_id\":7,\"chat\":{\"id\":42},\"text\":\"Wrote a.\\n\\nChanged 1 file in notes/.\"},\"data\":\"u41-0123456789abcdef\"}}");
+    try inbox(&e, 2, "{\"callback_query\":{\"id\":\"cb2\",\"from\":{\"id\":42},\"message\":{\"message_id\":8,\"chat\":{\"id\":42}},\"data\":\"a:once\"}}");
+    var b = try Bot.init(t.allocator, t.io, try e.url(), "123:abc");
+    defer b.deinit();
+    const ups = try b.getUpdates(e.arena.allocator(), 0, 0);
+    try t.expectEqualStrings("Wrote a.\n\nChanged 1 file in notes/.", ups[0].callback.text);
+    try t.expectEqualStrings("", ups[1].callback.text);
 }
 
 test "updates_carry_the_topic_and_sends_go_to_it" {
