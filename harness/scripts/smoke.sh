@@ -647,7 +647,9 @@ cp "$T/mcp.ini.saved" "$HARNESS_HOME/mcp.ini"
 # homemcp-sim from HOMEMCP_BIN, or built next to harness (zig build in
 # ../homemcp); skipped without them
 # (pwd -W as above: paths homemcp, a Windows program there, can open)
-HM=${HOMEMCP_BIN:-$(cd "$(dirname "$0")/../../homemcp/zig-out/bin" 2>/dev/null && { pwd -W 2>/dev/null || pwd; })}
+# (two steps: macOS's sh, bash 3.2, ends ${...:-...} at a } inside $(...))
+HM=${HOMEMCP_BIN:-}
+[ -n "$HM" ] || HM=$(cd "$(dirname "$0")/../../homemcp/zig-out/bin" 2>/dev/null && { pwd -W 2>/dev/null || pwd; })
 TW=$(cd "$T" && { pwd -W 2>/dev/null || pwd; })
 if [ -n "$HM" ] && [ -x "$HM/homemcp" ] && [ -x "$HM/homemcp-sim" ]; then
 	"$HM/homemcp-sim" ha 0 smoke-ha-token >"$T/hasim.out" 2>&1 &
