@@ -435,6 +435,11 @@ const Scan = struct {
 /// The newest runs (at most `q.max`) in `scope` that have every term of
 /// `q`, read from the log at `path`; `more` when there are older ones.
 pub fn search(a: std.mem.Allocator, io: Io, path: []const u8, scope: Scope, q: Query) !Found {
+    return searchIn(a, io, path, scope, q, block_size);
+}
+
+/// `search`, reading `block` bytes at a time.
+fn searchIn(a: std.mem.Allocator, io: Io, path: []const u8, scope: Scope, q: Query, block: usize) !Found {
     if (q.terms.len == 0 or q.terms.len > max_terms) return .{ .hits = &.{} };
     const finders = try a.alloc(Finder, q.terms.len);
     for (q.terms, finders) |tm, *fd| fd.* = .init(tm.scan);
@@ -451,30 +456,35 @@ pub fn search(a: std.mem.Allocator, io: Io, path: []const u8, scope: Scope, q: Q
     var f = try Io.Dir.cwd().openFile(io, path, .{});
     defer f.close(io);
     const len = try f.length(io);
-    const buf = try a.alloc(u8, block_size);
+    const buf = try a.alloc(u8, block);
     var end: u64 = len;
-    // inside a line longer than a block (not one harness writes): skipped
-    var long_line = false;
+    // inside a line longer than a block (not one harness writes): passed over
+    var skipping = false;
     scan: while (end > 0) {
-        const start = end -| block_size;
+        const start = end -| block;
         const n: usize = @intCast(end - start);
         const got = try f.readPositionalAll(io, buf[0..n], start);
-        const block = buf[0..got];
-        // where this block's whole lines begin: the first one may have begun before it
+        const chunk = buf[0..got];
+        // after the last newline: the start of the line passed over
+        var to: usize = chunk.len;
+        if (skipping) {
+            to = if (std.mem.lastIndexOfScalar(u8, chunk, '\n')) |k| k + 1 else 0;
+            skipping = to == 0;
+        }
+        // where whole lines begin: the first may have begun before the block
         var from: usize = 0;
         if (start > 0) {
-            from = (std.mem.indexOfScalar(u8, block, '\n') orelse {
+            const nl = std.mem.indexOfScalar(u8, chunk[0..to], '\n');
+            // none, or only the block's last byte: a line longer than a
+            // block ends here; every turn of this loop reads further back
+            if (nl == null or nl.? + 1 == chunk.len) {
                 end = start;
-                long_line = true;
+                skipping = true;
                 continue;
-            }) + 1;
+            }
+            from = nl.? + 1;
         }
-        var to: usize = block.len;
-        if (long_line) {
-            to = std.mem.lastIndexOfScalar(u8, block, '\n').? + 1;
-            long_line = false;
-        }
-        const lines = block[from..to];
+        const lines = chunk[from..to];
         for (lines) |*c| c.* = std.ascii.toLower(c.*);
         // its lines, last first
         var stop = lines.len;
@@ -1044,4 +1054,34 @@ test "a_search_over_a_50_mb_log_stays_fast" {
     const bound: i64 = if (@import("builtin").mode == .debug) 20_000 else 5_000;
     if (ms > bound) std.debug.print("a search over {d} MB took {d} ms (bound {d} ms)\n", .{ size >> 20, ms, bound });
     try t.expect(ms <= bound);
+}
+
+test "a_line_longer_than_a_block_is_passed_over" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var long: std.ArrayList(u8) = .empty;
+    for (0..10_000) |_| try long.append(a, 'x');
+    var l: Lines = .{ .a = a };
+    // lines no harness writes, longer than the blocks it reads: the first
+    // line of the log, and lines between runs
+    l.seq += 1;
+    try l.out.print(a, "{{\"seq\":{d},\"time\":\"2026-11-01T08:00:00Z\",\"kind\":\"config\",\"event\":\"{s}\"", .{ l.seq, long.items });
+    try l.close();
+    var rids: [3]u64 = undefined;
+    for (&rids, 0..) |*r, i| {
+        r.* = try l.start("2026-11-02T09:00:00Z", "main", "chat", "owner", try std.fmt.allocPrint(a, "kayak day {d}", .{i}));
+        l.seq += 1;
+        try l.out.print(a, "{{\"seq\":{d},\"time\":\"2026-11-02T09:00:01Z\",\"kind\":\"config\",\"event\":\"{s}\"", .{ l.seq, long.items });
+        try l.close();
+    }
+    const path = try l.save(&tmp);
+    for ([_]usize{ 512, 4096, 9000, 16384 }) |block| {
+        const found = try searchIn(a, t.io, path, .{ .all = true }, .{ .terms = try parseTerms(a, "kayak") }, block);
+        var got: std.ArrayList(u64) = .empty;
+        for (found.hits) |h| try got.append(a, h.rid);
+        try t.expectEqualSlices(u64, &.{ rids[2], rids[1], rids[0] }, got.items);
+    }
 }

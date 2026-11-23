@@ -481,20 +481,33 @@ fn readDays(a: std.mem.Allocator, env: Env, first: i64, today: i64) ![]DayText {
     var line_arena: std.heap.ArenaAllocator = .init(env.gpa);
     defer line_arena.deinit();
     const buf = try a.alloc(u8, 1 << 20);
+    // inside a line longer than the block (not one harness writes): passed over
+    var skipping = false;
     while (off < len) {
         const got = try f.readPositionalAll(env.io, buf, off);
         if (got == 0) break;
         const block = buf[0..got];
         var i: usize = 0;
+        if (skipping) {
+            i = (std.mem.indexOfScalar(u8, block, '\n') orelse {
+                off += got;
+                continue;
+            }) + 1;
+            skipping = false;
+        }
         while (std.mem.indexOfScalarPos(u8, block, i, '\n')) |nl| {
             _ = line_arena.reset(.retain_capacity);
             try takeLine(a, line_arena.allocator(), env, block[i..nl], first, today, &runs, &order);
             i = nl + 1;
         }
-        // a line longer than the block: not one harness writes
-        if (i == 0) break;
-        off += i;
+        // the end: a last line without its newline is left
         if (got < buf.len) break;
+        if (i == 0) {
+            off += got;
+            skipping = true;
+            continue;
+        }
+        off += i;
     }
     // each conversation's day: its runs in order, the newest kept within input_max
     var days: std.ArrayList(DayText) = .empty;
@@ -550,6 +563,7 @@ fn takeLine(a: std.mem.Allocator, la: std.mem.Allocator, env: Env, line: []const
     const v = jv.parse(la, line) orelse return;
     const rid = jv.int(jv.get(v, "rid")) orelse return;
     const seq = jv.int(jv.get(v, "seq")) orelse return;
+    if (rid < 1 or seq < 1) return;
     const kind = jv.str(jv.get(v, "kind")) orelse "";
     const eql = std.mem.eql;
     if (seq == rid) {
@@ -1029,4 +1043,28 @@ test "the_latest_summaries_are_picked_within_1500_words" {
     try t.expectEqual(1500, std.mem.count(u8, one, "long"));
     // a name that is no conversation's reads nothing
     try t.expectEqual(null, try promptBlock(a, t.io, dir, "../main", true));
+}
+
+test "a_line_no_harness_writes_does_not_stop_the_pass" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.turn("2026-11-21T09:00:00Z", "main", "saturday plans", "Hike at 10.");
+    // a run id below zero, and a line longer than a block
+    f.lines.seq += 1;
+    try f.lines.out.print(a, "{{\"seq\":{d},\"time\":\"2026-11-21T10:00:00Z\",\"kind\":\"turn\",\"rid\":-3,\"conversation\":\"main\",\"run\":\"chat\",\"by\":\"owner\",\"text\":\"odd\"", .{f.lines.seq});
+    try f.lines.close();
+    var long: std.ArrayList(u8) = .empty;
+    for (0..(1 << 20) + 4096) |_| try long.append(a, 'x');
+    f.lines.seq += 1;
+    try f.lines.out.print(a, "{{\"seq\":{d},\"time\":\"2026-11-21T11:00:00Z\",\"kind\":\"config\",\"event\":\"{s}\"", .{ f.lines.seq, long.items });
+    try f.lines.close();
+    try f.turn("2026-11-22T09:00:00Z", "main", "sunday plans", "Brunch at 11.");
+    try f.passAt("2026-11-23T03:30:00Z");
+    // both days, then their week
+    try t.expectEqual(3, f.e.server.modelRequests());
+    try t.expect(f.file("main/day/2026-11-21.md") != null);
+    try t.expect(f.file("main/day/2026-11-22.md") != null);
+    try t.expect(f.file("main/week/2026-W47.md") != null);
 }
