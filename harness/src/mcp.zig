@@ -11,6 +11,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const url_mod = @import("url.zig");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
 const proc = @import("proc.zig");
@@ -30,8 +31,23 @@ pub const ServerConfig = struct {
     /// Section name, [a-z0-9_-]{1,32} without "__" (the model sees its
     /// tools as "server__tool").
     name: []const u8,
-    /// Whole command line, split on spaces; "double quotes" group.
+    /// Whole command line, split on spaces; "double quotes" group. ""
+    /// for a server at a url.
     command: []const u8,
+    /// `url =`: a server reached over HTTP (in url.zig's one form), https
+    /// or http to this machine; "" for a program.
+    url: []const u8 = "",
+    /// `token =`: a stored secret sent as `Authorization: Bearer`.
+    token: []const u8 = "",
+    /// `header = Name: value` lines, in order.
+    headers: []const std.http.Header = &.{},
+    /// `login = oauth`: signed in with `harness mcp login NAME`; the
+    /// tokens are the stored secret `mcp-NAME`.
+    login: bool = false,
+    /// `client_id =`: a client registered beforehand (no registration).
+    client_id: []const u8 = "",
+    /// `scope =`: the scopes asked for; "": the server's metadata's.
+    scope: []const u8 = "",
     /// `secret = ENV:storedname, ENV2:name2`
     secrets: []const EnvSecret,
     /// `money = a, b`: tools that move money.
@@ -81,12 +97,115 @@ pub const Amount = union(enum) {
 };
 
 /// What is wrong with an mcp.ini line, when more can be said than that it
-/// does not read.
+/// does not read. (The names are mcp.ini's own: other files' reasons share
+/// `parseProblem`'s chain.)
 pub fn configReason(e: anyerror) ?[]const u8 {
     return switch (e) {
         error.ZeroCap => "0 is not a cap here: write none to lift config.ini's cap for this server, or remove the line to use config.ini's",
+        error.CommandAndUrl => "command and url exclude each other: a server is a program to start or an address to reach",
+        error.TokenAndLogin => "token and login = oauth exclude each other: a server takes a stored token or a sign-in",
+        error.PlainHttpUrl => "url is https, or http only to this machine (localhost, 127.0.0.1 or [::1])",
+        error.BadMcpUrl => "url is the server's address, like https://mcp.example.com/mcp (no name before @, no #)",
+        error.BadMcpHeader => "header = Name: value, at most 8 a server",
+        error.ReservedMcpHeader => "harness sets this header itself: not Authorization (use token = or login = oauth), Host, Content-*, Mcp-*, MCP-Protocol-Version, Accept, Accept-Encoding, Connection, Transfer-Encoding, User-Agent or Last-Event-ID",
+        error.SecretWithUrl => "secret = gives a program its variables; a server at a url takes token = (a stored secret) or login = oauth",
+        error.UrlOnlyKey => "token, header, login, client_id and scope are for a server at a url (url =), not a program",
+        error.SignInOnlyKey => "client_id and scope are for a sign-in (login = oauth)",
+        error.BadLoginValue => "login takes oauth (then: harness mcp login NAME)",
+        error.BadTokenName => "token = the name of a stored secret (harness secret add NAME): a-z, 0-9, - and _",
         else => null,
     };
+}
+
+pub const ConfigError = error{
+    BadConfig,
+    ZeroCap,
+    CommandAndUrl,
+    TokenAndLogin,
+    PlainHttpUrl,
+    BadMcpUrl,
+    BadMcpHeader,
+    ReservedMcpHeader,
+    SecretWithUrl,
+    UrlOnlyKey,
+    SignInOnlyKey,
+    BadLoginValue,
+    BadTokenName,
+    OutOfMemory,
+};
+
+/// How a server is reached and signed in to.
+pub const Kind = enum {
+    /// A program on stdio (`command =`).
+    program,
+    /// At a url with a stored token (`token =`).
+    token,
+    /// At a url with a sign-in (`login = oauth`).
+    signin,
+    /// At a url with neither.
+    url,
+
+    pub fn label(k: Kind) []const u8 {
+        return switch (k) {
+            .program => "program",
+            .token => "token",
+            .signin => "sign-in",
+            .url => "url",
+        };
+    }
+};
+
+pub fn kindOf(cfg: ServerConfig) Kind {
+    if (cfg.url.len == 0) return .program;
+    if (cfg.login) return .signin;
+    if (cfg.token.len > 0) return .token;
+    return .url;
+}
+
+/// The stored secret that holds a server's sign-in: `mcp-NAME` (a server
+/// name is at most 32 characters, so `buf` needs 36).
+pub fn signinSecret(buf: []u8, name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "mcp-{s}", .{name}) catch "mcp-";
+}
+
+/// Most `header =` lines a server takes.
+pub const max_headers = 8;
+
+/// `Name: value`: a header harness doesn't write itself.
+fn parseHeader(value: []const u8) ConfigError!std.http.Header {
+    const colon = std.mem.indexOfScalar(u8, value, ':') orelse return error.BadMcpHeader;
+    const name = std.mem.trim(u8, value[0..colon], " \t");
+    const v = std.mem.trim(u8, value[colon + 1 ..], " \t");
+    if (name.len == 0 or v.len == 0) return error.BadMcpHeader;
+    // a token's characters (RFC 9110)
+    for (name) |c| if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) != null)) return error.BadMcpHeader;
+    for (v) |c| if ((c < 0x20 and c != '\t') or c == 0x7f) return error.BadMcpHeader;
+    if (reservedHeader(name)) return error.ReservedMcpHeader;
+    return .{ .name = name, .value = v };
+}
+
+/// The headers harness writes itself on a request to a server.
+fn reservedHeader(name: []const u8) bool {
+    for ([_][]const u8{ "authorization", "host", "accept", "accept-encoding", "connection", "transfer-encoding", "user-agent", "last-event-id" }) |r| {
+        if (std.ascii.eqlIgnoreCase(name, r)) return true;
+    }
+    // Mcp-Session-Id and MCP-Protocol-Version among them
+    return std.ascii.startsWithIgnoreCase(name, "content-") or std.ascii.startsWithIgnoreCase(name, "mcp-");
+}
+
+/// A server's address: http or https in url.zig's one form, https unless
+/// the host is this machine, no fragment.
+fn parseUrl(arena: std.mem.Allocator, value: []const u8) ConfigError![]const u8 {
+    const u = url_mod.parse(arena, value) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.BadMcpUrl;
+    if (u.fragment.len > 0 or std.mem.indexOfScalar(u8, value, '#') != null) return error.BadMcpUrl;
+    if (!u.https and !isLoopback(u.host)) return error.PlainHttpUrl;
+    return u.href;
+}
+
+/// localhost, 127.0.0.0/8 or [::1] (a host in url.zig's form).
+pub fn isLoopback(host: []const u8) bool {
+    if (std.mem.eql(u8, host, "localhost") or std.mem.eql(u8, host, "[::1]")) return true;
+    return url_mod.isIp(host) and std.mem.startsWith(u8, host, "127.");
 }
 
 /// A server's cap: a whole number above 0, or `none` (0 here: no cap).
@@ -98,9 +217,11 @@ fn parseCap(value: []const u8) error{ BadConfig, ZeroCap }!u32 {
     return n;
 }
 
-/// Servers in the order they appear. Unknown keys, a missing `command`,
-/// bad names and the same server twice are errors.
-pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig, ZeroCap, OutOfMemory }![]ServerConfig {
+/// Servers in the order they appear. Unknown keys, a server with neither
+/// `command` nor `url`, bad names and the same server twice are errors;
+/// a line that clashes with one before it in its section is the error
+/// (so `parseProblem` names it).
+pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) ConfigError![]ServerConfig {
     const ls = try config.lines(arena, text);
     var out: std.ArrayList(ServerConfig) = .empty;
     var i: usize = 0;
@@ -109,24 +230,60 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig,
         if (!validName(name)) return error.BadConfig;
         for (out.items) |o| if (std.mem.eql(u8, o.name, name)) return error.BadConfig;
         var cfg: ServerConfig = .{ .name = name, .command = "", .secrets = &.{}, .money = &.{} };
-        var seen: [6]bool = @splat(false);
+        var headers: std.ArrayList(std.http.Header) = .empty;
+        const keys = [_][]const u8{ "command", "secret", "money", "amount", "max_per_call", "max_per_day", "url", "token", "header", "login", "client_id", "scope" };
+        var seen: [keys.len]bool = @splat(false);
         while (i < ls.len and std.mem.eql(u8, ls[i].section, name)) : (i += 1) {
             const l = ls[i];
-            const keys = [_][]const u8{ "command", "secret", "money", "amount", "max_per_call", "max_per_day" };
             const k = for (keys, 0..) |key, n| {
                 if (std.mem.eql(u8, l.key, key)) break n;
             } else return error.BadConfig;
-            if (seen[k]) return error.BadConfig;
+            // header is said once a line
+            if (seen[k] and k != 8) return error.BadConfig;
             seen[k] = true;
+            // keys of a server at a url, in a program's section (either way round)
+            const url_keys = seen[7] or seen[8] or seen[9] or seen[10] or seen[11];
             switch (k) {
                 0 => {
+                    if (seen[6]) return error.CommandAndUrl;
+                    if (url_keys) return error.UrlOnlyKey;
                     _ = splitCommand(arena, l.value) catch |e| switch (e) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.BadConfig,
                     };
                     cfg.command = l.value;
                 },
+                6 => {
+                    if (seen[0]) return error.CommandAndUrl;
+                    if (seen[1]) return error.SecretWithUrl;
+                    cfg.url = try parseUrl(arena, l.value);
+                },
+                7 => {
+                    if (seen[0]) return error.UrlOnlyKey;
+                    if (seen[9]) return error.TokenAndLogin;
+                    if (!validSecretName(l.value)) return error.BadTokenName;
+                    cfg.token = l.value;
+                },
+                8 => {
+                    if (seen[0]) return error.UrlOnlyKey;
+                    if (headers.items.len >= max_headers) return error.BadMcpHeader;
+                    try headers.append(arena, try parseHeader(l.value));
+                },
+                9 => {
+                    if (seen[0]) return error.UrlOnlyKey;
+                    if (!std.mem.eql(u8, l.value, "oauth")) return error.BadLoginValue;
+                    if (seen[7]) return error.TokenAndLogin;
+                    cfg.login = true;
+                },
+                10, 11 => {
+                    if (seen[0]) return error.UrlOnlyKey;
+                    // client ids and scopes: printable, a client id one word
+                    if (l.value.len == 0 or l.value.len > 512) return error.BadConfig;
+                    for (l.value) |c| if (c < 0x20 or c >= 0x7f or (k == 10 and c == ' ')) return error.BadConfig;
+                    if (k == 10) cfg.client_id = l.value else cfg.scope = l.value;
+                },
                 1 => {
+                    if (seen[6]) return error.SecretWithUrl;
                     var list: std.ArrayList(EnvSecret) = .empty;
                     for (try items(arena, l.value)) |item| {
                         const colon = std.mem.indexOfScalar(u8, item, ':') orelse return error.BadConfig;
@@ -148,7 +305,10 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) error{ BadConfig,
                 else => unreachable,
             }
         }
-        if (cfg.command.len == 0) return error.BadConfig;
+        if (cfg.command.len == 0 and cfg.url.len == 0) return error.BadConfig;
+        // a client and scopes are a sign-in's
+        if ((cfg.client_id.len > 0 or cfg.scope.len > 0) and !cfg.login) return error.SignInOnlyKey;
+        cfg.headers = headers.items;
         // caps are for money tools: without them they are a mistake
         if ((cfg.max_per_call != null or cfg.max_per_day != null) and cfg.money.len == 0) return error.BadConfig;
         // an amount names money tools: without them it is a mistake
@@ -996,6 +1156,144 @@ test "parse_config_takes_only_secret_names_the_store_can_hold" {
             return error.TestUnexpectedResult;
         } else |e| try t.expectEqual(error.BadConfig, e);
     }
+}
+
+test "parse_config_reads_servers_at_a_url" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // the spec's two examples, as written there, and two more
+    const servers = try parseConfig(a,
+        \\[github]
+        \\url = https://api.githubcopilot.com/mcp/
+        \\token = github                 ; a stored secret, sent as Authorization: Bearer
+        \\header = X-MCP-Toolsets: issues,pull_requests   ; repeatable
+        \\
+        \\[atlassian]
+        \\url = https://mcp.atlassian.com/v1/mcp
+        \\login = oauth                  ; sign in once: harness mcp login atlassian
+        \\
+        \\[local]
+        \\url = http://127.0.0.1:8931/mcp
+        \\money = pay
+        \\amount = usd
+        \\max_per_call = 20
+        \\
+        \\[corp]
+        \\url = https://mcp.corp.example/mcp
+        \\login = oauth
+        \\client_id = harness-desktop
+        \\scope = read write
+        \\header = X-Team: tools
+        \\header = X-Region: eu
+    );
+    try t.expectEqual(4, servers.len);
+    const gh = servers[0];
+    try t.expectEqualStrings("https://api.githubcopilot.com/mcp/", gh.url);
+    try t.expectEqualStrings("", gh.command);
+    try t.expectEqualStrings("github", gh.token);
+    try t.expectEqual(1, gh.headers.len);
+    try t.expectEqualStrings("X-MCP-Toolsets", gh.headers[0].name);
+    try t.expectEqualStrings("issues,pull_requests", gh.headers[0].value);
+    try t.expectEqual(Kind.token, kindOf(gh));
+    try t.expect(servers[1].login);
+    try t.expectEqual(Kind.signin, kindOf(servers[1]));
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("mcp-atlassian", signinSecret(&buf, "atlassian"));
+    // http to this machine; the money keys as for a program
+    const local = servers[2];
+    try t.expectEqual(Kind.url, kindOf(local));
+    try t.expectEqualStrings("pay", local.money[0]);
+    try t.expectEqualStrings("usd", local.amount.of("pay").name);
+    try t.expectEqual(20, local.max_per_call.?);
+    const corp = servers[3];
+    try t.expectEqualStrings("harness-desktop", corp.client_id);
+    try t.expectEqualStrings("read write", corp.scope);
+    try t.expectEqual(2, corp.headers.len);
+    try t.expectEqualStrings("X-Region", corp.headers[1].name);
+    try t.expectEqualStrings("eu", corp.headers[1].value);
+    // a program is still a program
+    try t.expectEqual(Kind.program, kindOf((try parseConfig(a, "[p]\ncommand = x\n"))[0]));
+    for ([_][]const u8{ "http://localhost:3000/mcp", "http://[::1]:3000/mcp", "http://127.0.0.2/mcp", "HTTPS://MCP.Example.com/x?team=1" }) |u| {
+        const one = try parseConfig(a, try std.fmt.allocPrint(a, "[s]\nurl = {s}\n", .{u}));
+        try t.expectEqual(Kind.url, kindOf(one[0]));
+    }
+}
+
+test "parse_config_refuses_bad_remote_lines" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const nine = "header = A: 1\nheader = B: 2\nheader = C: 3\nheader = D: 4\nheader = E: 5\nheader = F: 6\nheader = G: 7\nheader = H: 8\nheader = I: 9\n";
+    for ([_]struct { []const u8, anyerror }{
+        .{ "[a]\nurl = ftp://h.example/mcp\n", error.BadMcpUrl },
+        .{ "[a]\nurl = https://h.example/mcp#part\n", error.BadMcpUrl },
+        .{ "[a]\nurl = https://user@h.example/mcp\n", error.BadMcpUrl },
+        .{ "[a]\nurl = http://10.0.0.5/mcp\n", error.PlainHttpUrl },
+        .{ "[a]\nurl = http://localhost.example.com/mcp\n", error.PlainHttpUrl },
+        .{ "[a]\nurl = https://h.example/mcp\nsecret = K:gh\n", error.SecretWithUrl },
+        .{ "[a]\nsecret = K:gh\nurl = https://h.example/mcp\n", error.SecretWithUrl },
+        .{ "[a]\ncommand = x\ntoken = gh\n", error.UrlOnlyKey },
+        .{ "[a]\ntoken = gh\ncommand = x\n", error.UrlOnlyKey },
+        .{ "[a]\ncommand = x\nheader = X-A: b\n", error.UrlOnlyKey },
+        .{ "[a]\ncommand = x\nlogin = oauth\n", error.UrlOnlyKey },
+        .{ "[a]\nurl = https://h.example/mcp\nlogin = yes\n", error.BadLoginValue },
+        .{ "[a]\nurl = https://h.example/mcp\nclient_id = c1\n", error.SignInOnlyKey },
+        .{ "[a]\nurl = https://h.example/mcp\nscope = read\n", error.SignInOnlyKey },
+        .{ "[a]\nurl = https://h.example/mcp\ntoken = Bad Name\n", error.BadTokenName },
+        .{ "[a]\nurl = https://h.example/mcp\ntoken = ../config.ini\n", error.BadTokenName },
+        .{ "[a]\nurl = https://h.example/mcp\nlogin = oauth\ntoken = gh\n", error.TokenAndLogin },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = NoColon\n", error.BadMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = : v\n", error.BadMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = Bad Name: v\n", error.BadMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = X-Empty:\n", error.BadMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\n" ++ nine, error.BadMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = host: evil.example\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = Content-Type: text/plain\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = Mcp-Session-Id: s1\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = MCP-Protocol-Version: 2024-11-05\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = Accept: */*\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = User-Agent: x\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nheader = Connection: close\n", error.ReservedMcpHeader },
+        .{ "[a]\nurl = https://h.example/mcp\nurl = https://h.example/x\n", error.BadConfig },
+        .{ "[a]\nurl = https://h.example/mcp\ntoken = a1\ntoken = b2\n", error.BadConfig },
+        .{ "[a]\nurl = https://h.example/mcp\nlogin = oauth\nclient_id = has space\n", error.BadConfig },
+        .{ "[a]\nurl = https://h.example/mcp\nlogin = oauth\nscope = \n", error.BadConfig },
+    }) |c| {
+        if (parseConfig(a, c[0])) |_| {
+            std.debug.print("accepted: {s}\n", .{c[0]});
+            return error.TestUnexpectedResult;
+        } else |e| {
+            if (e != c[1]) std.debug.print("{s}: {s}, not {s}\n", .{ c[0], @errorName(e), @errorName(c[1]) });
+            try t.expectEqual(c[1], e);
+        }
+        // each says what is wrong
+        if (c[1] != error.BadConfig) try t.expect(configReason(c[1]) != null);
+    }
+}
+
+test "bad_mcp_ini_sections_name_their_line" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const parseProblem = @import("core.zig").parseProblem;
+    for ([_][2][]const u8{
+        // command and url
+        .{ "[a]\ncommand = x\nurl = https://mcp.example.com/mcp\n", "mcp.ini line 3 has an error: url = https://mcp.example.com/mcp (command and url exclude each other" },
+        // token and login
+        .{ "; remote\n[a]\nurl = https://mcp.example.com/mcp\ntoken = gh\nlogin = oauth\n", "mcp.ini line 5 has an error: login = oauth (token and login = oauth exclude each other" },
+        // http to a host that is not this machine
+        .{ "[ok]\nurl = http://127.0.0.1:9/mcp\n[a]\nurl = http://mcp.example.com/mcp\n", "mcp.ini line 4 has an error: url = http://mcp.example.com/mcp (url is https, or http only to this machine" },
+        // a header harness sets itself
+        .{ "[a]\nurl = https://mcp.example.com/mcp\nheader = X-Toolsets: issues\nheader = Authorization: Bearer x\n", "mcp.ini line 4 has an error: header = Authorization: Bearer x (harness sets this header itself" },
+    }) |c| {
+        const why = (try parseProblem(a, "mcp.ini", c[0], parseConfig)) orelse return error.TestUnexpectedResult;
+        if (!std.mem.startsWith(u8, why, c[1])) std.debug.print("said: {s}\n", .{why});
+        try t.expect(std.mem.startsWith(u8, why, c[1]));
+    }
+    // the header line says what to use instead
+    const auth = (try parseProblem(a, "mcp.ini", "[a]\nurl = https://mcp.example.com/mcp\nheader = Authorization: Bearer x\n", parseConfig)).?;
+    try t.expect(std.mem.indexOf(u8, auth, "token =") != null);
 }
 
 const fake_path = if (@import("builtin").is_test) @import("build_options").fake_path else "";
