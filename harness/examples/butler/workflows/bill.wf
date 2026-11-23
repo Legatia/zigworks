@@ -1,0 +1,11 @@
+# A bill in the owner's mail: a line 3 days before it is due. Its trigger
+# (bill-due) lists the bills due in 3 days; each is said once.
+workflow bill
+about A bill in your mail: a line 3 days before it is due, with who, how much and when.
+start trigger:bill-due
+tag no
+limits steps 3, days 1
+
+step tell
+say Bill due {event.due} (in 3 days): {event.from}. {event.amount}
+end

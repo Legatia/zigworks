@@ -633,6 +633,9 @@ pub const Picks = struct {
     quiet: ?config.Quiet = null,
     /// Where the weather is read for; "": none said.
     town: []const u8 = "",
+    /// The owner's mailbox is on (/setup mail mine): the Post, bills,
+    /// deliveries, flights and invitations.
+    mail: bool = false,
     night_temp: u16 = 18,
     away_temp: u16 = 17,
     home_temp: u16 = 21,
@@ -647,14 +650,14 @@ pub const Picks = struct {
     escalate: []const alerts.Step = &.{},
 };
 
-pub const Settings = struct { car: bool = false, search: bool = false, calendar: []const u8 = "", quiet: ?config.Quiet = null, town: []const u8 = "", fallback: bool = false, escalate: []const alerts.Step = &.{} };
+pub const Settings = struct { car: bool = false, search: bool = false, calendar: []const u8 = "", quiet: ?config.Quiet = null, town: []const u8 = "", fallback: bool = false, escalate: []const alerts.Step = &.{}, mail: bool = false };
 
 /// The devices and settings the routines use: every light; the first
 /// thermostat; the first lock (a front one first); the water main (a
 /// valve, else a switch named one); every leak sensor; every door and
 /// window sensor.
 pub fn pick(a: Allocator, h: Home, s: Settings) !Picks {
-    var p: Picks = .{ .people = h.people.len > 0, .car = s.car, .search = s.search, .calendar = s.calendar, .quiet = s.quiet, .town = s.town, .fallback = s.fallback, .escalate = s.escalate };
+    var p: Picks = .{ .people = h.people.len > 0, .car = s.car, .search = s.search, .calendar = s.calendar, .quiet = s.quiet, .town = s.town, .fallback = s.fallback, .escalate = s.escalate, .mail = s.mail };
     var leaks: std.ArrayList(Device) = .empty;
     var doors: std.ArrayList(Device) = .empty;
     var smokes: std.ArrayList(Device) = .empty;
@@ -722,6 +725,10 @@ pub const Routine = enum {
     smoke,
     @"door-open",
     @"car-tomorrow",
+    bill,
+    delivery,
+    flight,
+    invitation,
 
     /// The workflow's name (and its file's).
     pub fn name(r: Routine) []const u8 {
@@ -739,6 +746,10 @@ pub const Routine = enum {
             .smoke => "Smoke alarm",
             .@"door-open" => "Doors left open",
             .@"car-tomorrow" => "Car for tomorrow",
+            .bill => "Bills",
+            .delivery => "Deliveries",
+            .flight => "Flights",
+            .invitation => "Invitations",
         };
     }
 
@@ -753,6 +764,9 @@ pub const Routine = enum {
             .smoke => p.smokes.len > 0,
             .@"door-open" => p.doors.len > 0,
             .@"car-tomorrow" => p.car,
+            .bill, .delivery => p.mail,
+            // the calendar's own tools add the entry: only with one set
+            .flight, .invitation => p.mail and p.calendar.len > 0,
         };
     }
 
@@ -800,6 +814,14 @@ pub const Routine = enum {
             },
             .@"door-open" => try o.print(a, "Doors left open: when {s} stays open for 10 minutes, I tell you.", .{try sensorList(a, p.doors, "a door or window")}),
             .@"car-tomorrow" => try o.print(a, "Car for tomorrow: at {s}, when the car is under half, I tell you, and ask with one tap to start charging when it's plugged in.", .{try clock(a, carAt(p))}),
+            .bill => try o.appendSlice(a, "Bills: 3 days before a bill in your mail is due, I tell you who, how much and when."),
+            .delivery => try o.appendSlice(a, "Deliveries: on the day a parcel comes, one line with what and from whom."),
+            .flight => {
+                try o.appendSlice(a, "Flights: when a flight confirmation comes, I offer its time for the calendar (you're asked first)");
+                if (p.people) try o.appendSlice(a, ", and the house goes to away when you've all left for it");
+                try o.append(a, '.');
+            },
+            .invitation => try o.appendSlice(a, "Invitations: when an invitation comes, I offer it for the calendar (you're asked first)."),
         }
         return o.items;
     }
@@ -816,11 +838,15 @@ pub fn onText(a: Allocator, r: Routine, p: Picks) ![]const u8 {
         .smoke => "Smoke alarm is on: it comes through quiet hours.",
         .@"door-open" => "Doors left open is on.",
         .@"car-tomorrow" => std.fmt.allocPrint(a, "Car for tomorrow is on, at {s}. /workflow start car-tomorrow tries it now.", .{try clock(a, carAt(p))}),
+        .bill => "Bill reminders are on.",
+        .delivery => "Delivery lines are on.",
+        .flight => "Flights are on.",
+        .invitation => "Invitations are on.",
     };
 }
 
 /// The routines in the order setup offers them.
-pub const all = [_]Routine{ .goodnight, .leaving, .arriving, .@"morning-home", .leak, .smoke, .@"door-open", .@"car-tomorrow" };
+pub const all = [_]Routine{ .goodnight, .leaving, .arriving, .@"morning-home", .leak, .smoke, .@"door-open", .@"car-tomorrow", .bill, .delivery, .flight, .invitation };
 
 fn andList(a: Allocator, parts: []const []const u8) ![]const u8 {
     if (parts.len == 0) return "";
@@ -848,9 +874,10 @@ fn sensorList(a: Allocator, list: []const Device, one_of: []const u8) ![]const u
 fn morningParts(a: Allocator, p: Picks, tools: bool) ![]const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
     if (p.car) try parts.append(a, if (tools) "the car (car/car_status)" else "the car");
-    if (p.calendar.len > 0) try parts.append(a, if (tools) try std.fmt.allocPrint(a, "today's calendar ({s}/*)", .{p.calendar}) else "today's calendar");
+    if (p.calendar.len > 0) try parts.append(a, if (tools) try std.fmt.allocPrint(a, "today's calendar ({s}/cal_agenda)", .{p.calendar}) else "today's calendar");
     if (p.search and p.town.len > 0) try parts.append(a, if (tools) try std.fmt.allocPrint(a, "today's weather in {s} (search)", .{p.town}) else try std.fmt.allocPrint(a, "the weather in {s}", .{p.town}));
     try parts.append(a, if (tools) "the house (home/home_state)" else "the house");
+    if (p.mail) try parts.append(a, if (tools) "the post (mail/mail_list)" else "the post");
     return andList(a, parts.items);
 }
 
@@ -971,6 +998,10 @@ fn triggerSections(r: Routine) []const []const u8 {
         .smoke => &.{"smoke-<smoke>"},
         .@"door-open" => &.{"door-<door>"},
         .@"car-tomorrow" => &.{"car-evening"},
+        .bill => &.{"bill-due"},
+        .delivery => &.{"delivery-today"},
+        .flight => &.{"flight-mail"},
+        .invitation => &.{"invitation-mail"},
     };
 }
 
@@ -1071,8 +1102,12 @@ fn commonValues(a: Allocator, p: Picks) ![]Value {
     try tools.append(a, "home/home_state");
     if (p.car) try tools.append(a, "car/car_status");
     if (p.search and p.town.len > 0) try tools.append(a, "search");
-    if (p.calendar.len > 0) try tools.append(a, try std.fmt.allocPrint(a, "{s}/*", .{p.calendar}));
+    // the calendar is read, never changed: its changes are not offered to a scheduled step
+    if (p.calendar.len > 0) try tools.append(a, try std.fmt.allocPrint(a, "{s}/cal_agenda", .{p.calendar}));
+    if (p.mail) try tools.append(a, "mail/mail_list, mail/mail_read");
     try v.append(a, .{ .key = "morning tools", .value = try std.mem.join(a, ", ", tools.items) });
+    // the calendar the flight and invitation routines add to
+    try v.append(a, .{ .key = "calendar", .value = if (p.calendar.len > 0) p.calendar else "calendar" });
     // the start lines of the routines a trigger per sensor starts
     var leak_starts: std.ArrayList([]const u8) = .empty;
     for (p.leaks) |d| try leak_starts.append(a, try std.fmt.allocPrint(a, "trigger:{s}", .{try perSensorName(a, "leak-", d.name)}));
@@ -1123,6 +1158,8 @@ fn flagsOf(a: Allocator, p: Picks) ![]const []const u8 {
     if (p.thermostat != null) try f.append(a, "thermostat");
     if (p.car) try f.append(a, "car");
     if (p.speakers) try f.append(a, "speakers");
+    if (p.mail) try f.append(a, "mail");
+    if (p.people) try f.append(a, "people");
     return f.items;
 }
 
@@ -1405,6 +1442,9 @@ test "routines_fill_from_the_sims_home" {
     defer arena.deinit();
     const a = arena.allocator();
     const p = try simPicks(a, .{ .car = true, .search = true, .calendar = "calendar", .quiet = .{ .start = 22 * 60, .end = 7 * 60 }, .town = "Kraków" });
+    // with the owner's mailbox on, the mail routines too
+    var pm = p;
+    pm.mail = true;
     try t.expectEqual(2, p.lights);
     try t.expectEqualStrings("front_door", p.lock.?.name);
     try t.expectEqualStrings("water_main", p.valve.?.name);
@@ -1417,8 +1457,8 @@ test "routines_fill_from_the_sims_home" {
     var wfs: std.ArrayList(workflows.Workflow) = .empty;
     var rules_all: std.ArrayList(u8) = .empty;
     for (all) |r| {
-        try t.expect(r.offered(p));
-        const f = try routineFiles(a, r, p, "2026-11-23");
+        try t.expect(r.offered(pm));
+        const f = try routineFiles(a, r, pm, "2026-11-23");
         // no <…> left, no unlock, open or disarm, no camera; a smoke alarm
         // only in its own routine (which acts on nothing)
         for ([_][]const u8{ f.workflow, f.triggers, f.rules }) |text| {
@@ -1445,7 +1485,7 @@ test "routines_fill_from_the_sims_home" {
         std.debug.print("line {d}: {s}\n{s}\n", .{ td.line, td.why, trig_all.items });
         return e;
     };
-    try t.expectEqual(8, tlist.len);
+    try t.expectEqual(12, tlist.len);
     for (wfs.items) |w| {
         var d: workflows.Diag = .{};
         _ = workflows.check(a, w, .{ .triggers = tlist }, &d) catch |e| {
@@ -1477,7 +1517,10 @@ test "routines_fill_from_the_sims_home" {
     try t.expect(std.mem.indexOf(u8, lk.workflow, "yes Close the water main") != null);
     try t.expect(std.mem.indexOf(u8, lk.workflow, "tool home/home_guarded {\"device\": \"water_main\", \"action\": \"close\"}") != null);
     const mh = try routineFiles(a, .@"morning-home", p, "2026-11-23");
-    try t.expect(std.mem.indexOf(u8, mh.workflow, "tools home/home_state, car/car_status, search, calendar/*") != null);
+    // a scheduled step reads the calendar and is given no tool that changes it
+    try t.expect(std.mem.indexOf(u8, mh.workflow, "tools home/home_state, car/car_status, search, calendar/cal_agenda\n") != null);
+    try t.expect(std.mem.indexOf(u8, mh.rules, "[workflow:morning-home/read]\nallow mcp calendar/cal_agenda *\n[all]") != null);
+    try t.expect(std.mem.indexOf(u8, mh.workflow, "every event of today with its time") != null);
     try t.expect(std.mem.indexOf(u8, mh.workflow, "Read the car, today's calendar, the weather in Kraków and the house") != null);
     // the sentences setup offers them with
     try t.expectEqualStrings("Goodnight: when you say goodnight, or at 21:45, I switch off the lights, set the heating to 18 °C and ask with one tap before locking the front door.", try Routine.goodnight.sentence(a, p));

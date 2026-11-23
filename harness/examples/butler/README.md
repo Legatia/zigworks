@@ -2,12 +2,14 @@
 
 Eight routines for a home run by Home Assistant (through
 [homemcp](../../../homemcp/)) and, for the last one, a car (through
-[carcloud](../../../carcloud/)). Each is a workflow (`workflows/NAME.wf`),
-the section of `triggers.ini` that starts it, and sometimes a few lines of
-`rules`. harness carries these files inside its binary: after `/setup home`
-in chat, it offers them one at a time, fills in your devices and times, shows
-each file, and writes it only when you tap **Turn on**. `/setup routines`
-offers them again.
+[carcloud](../../../carcloud/)); four more for your mail (through
+[mailmcp](../../../mailmcp/), once `/setup mail mine` is on; the last two
+with a calendar, through [calmcp](../../../calmcp/)). Each is a workflow
+(`workflows/NAME.wf`), the section of `triggers.ini` that starts it, and
+sometimes a few lines of `rules`. harness carries these files inside its
+binary: after `/setup home` in chat, it offers them one at a time, fills in
+your devices and times, shows each file, and writes it only when you tap
+**Turn on**. `/setup routines` offers them again.
 
 | Routine | Starts | What it does |
 |---|---|---|
@@ -19,6 +21,10 @@ offers them again.
 | Smoke alarm | a smoke or CO alarm reads `ALARM` | urgent, through quiet hours: "Smoke alarm: Kitchen smoke alarm, Kitchen.", said on every speaker (`speakers = all`); nothing to close, nothing acted on |
 | Doors left open | a door or window sensor reads open | 10 minutes later, if it still is: "Back door has been open for 10 minutes." |
 | Car for tomorrow | in the evening (90 minutes before quiet hours) | a line when the car is under half and not plugged in; one tap to start charging when it is plugged in but not charging |
+| Bills | `mail_list` of your mailbox every 6 hours: bills due in 3 days | a line with who, how much and when it is due, once a bill |
+| Deliveries | `mail_list` every hour: parcels coming today | a line on the day, once a parcel |
+| Flights | a travel mail pushed by mailmcp (`mail://mine/new`) | an agent step reads it; a flight's time offered for the calendar with calmcp's `cal_create` (`title`, `start`, `end`, `place`), asked every time |
+| Invitations | an invitation mail pushed by mailmcp | the same, for the event it invites you to |
 
 ## What they never do
 
@@ -59,15 +65,18 @@ offers them again.
   question; your own requests switch what home.ini and car.ini allow, and
   nothing else: those files are what bound the allow lines), and what three
   routines need (goodnight's agent step may use `home_set`; arriving's one
-  exact call; the morning summary may read a calendar, never change it).
+  exact call; the morning summary may read the calendar with calmcp's
+  `cal_agenda`, never change it), and what `/setup calendar` adds (its
+  reads need no question).
   None of them pairs an `ask` or `deny` for part of a tool with an `allow`
   for all of it: the gate matches a call's JSON as written, so another key
   order or a space would slip past the narrower line. To keep a device or a
   command asked, leave it out of home.ini's or car.ini's `allow`, or mark it
   `guarded = yes` (`/setup home ask NAME`).
-- `mcp.ini`: the `[home]` and `[car]` sections `/setup home` and `/setup car`
-  write. `home_guarded` is a money tool: asked every time, never given to
-  helpers, never run unattended.
+- `mcp.ini`: the `[home]`, `[car]` and `[calendar]` sections `/setup home`,
+  `/setup car` and `/setup calendar` write. `home_guarded` and calmcp's
+  changes (`cal_create`, `cal_move`, `cal_cancel`, `cal_reply`) are money
+  tools: asked every time, never given to helpers, never run unattended.
 - `files.zig`: how harness carries them (built in).
 
 ## By hand

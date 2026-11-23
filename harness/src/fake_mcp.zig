@@ -18,6 +18,11 @@
 //! servers: a read each (mentions, issues, notifications, as JSON lists),
 //! and Slack's and GitHub's posts, written as lines to `posted.jsonl` in
 //! its folder.
+//! `--mcp --mail` plays mailmcp: `mail_list` and the resources
+//! `mail://butler/new` and `mail://mine/new` read the files
+//! `list-NAME.json` and `NAME-new.json` of its folder ("[]" without them),
+//! `mail_read` the file `read-NAME-UID.json`; `mail_draft` and `mail_send`
+//! write their input as a line of `drafts.jsonl` and `sent.jsonl`.
 //! `announce` (the voice agent's): what it is asked to say is kept in the
 //! file `announced` of its folder, "ROOM: TEXT" or "every speaker: TEXT" a
 //! line.
@@ -258,6 +263,8 @@ pub const discovered_home =
 /// The token the discover and check stand-ins take, and the car's secret.
 pub const ha_test_token = "ha-test-token-1234";
 pub const smartcar_test_secret = "smartcar-test-secret-1";
+/// The app password mailmcp's check stand-in takes, for both mailboxes.
+pub const mail_test_pass = "mail-test-pass-1";
 
 /// `harness-fake discover URL` and `harness-fake check FILE`, as homemcp
 /// and carcloud answer them; 1 with their error line when the token (or
@@ -278,6 +285,26 @@ pub fn programStandIn(io: Io, a: std.mem.Allocator, env: *const std.process.Envi
         err.writeStreamingAll(io, "homemcp: can't read the file\n") catch {};
         return 1;
     };
+    if (std.mem.indexOf(u8, text, "imap =") != null) {
+        // mailmcp check: each mailbox's secret must be the tests'
+        var o: std.ArrayList(u8) = .empty;
+        var bad = false;
+        for ([_][2][]const u8{ .{ "[butler]", "MAIL_BUTLER" }, .{ "[mine]", "MAIL_MINE" } }) |b| {
+            if (std.mem.indexOf(u8, text, b[0]) == null) continue;
+            const v = env.get(b[1]) orelse "";
+            if (v.len == 0) {
+                o.print(a, "{s}: {s} is not set.\n", .{ b[0][1 .. b[0].len - 1], b[1] }) catch return 1;
+                bad = true;
+            } else if (!std.mem.eql(u8, v, mail_test_pass)) {
+                o.print(a, "{s}: imap.example.com refused the login of x.\n", .{b[0][1 .. b[0].len - 1]}) catch return 1;
+                bad = true;
+            } else if (b[0][1] == 'b') {
+                o.appendSlice(a, "butler (butler@example.com, the butler's own: reads, drafts, sends): IMAP ok; INBOX: 1 mails, 1 unread; drafts go in Drafts; new mail pushed (IDLE); SMTP ok (smtp.example.com:465, TLS; nothing sent).\n") catch return 1;
+            } else o.appendSlice(a, "mine (me@example.com, yours: read without marking, drafts only): IMAP ok; INBOX: 1204 mails, 12 unread; drafts go in Drafts; new mail pushed (IDLE).\n") catch return 1;
+        }
+        out.writeStreamingAll(io, o.items) catch return 1;
+        return if (bad) 1 else 0;
+    }
     if (std.mem.indexOf(u8, text, "[car]") != null) {
         if (!std.mem.eql(u8, env.get("SMARTCAR_CLIENT_SECRET") orelse "", smartcar_test_secret)) {
             err.writeStreamingAll(io, "carcloud: Smartcar refused the credentials (HTTP 401, AUTHENTICATION invalid_client)\n") catch {};
@@ -311,17 +338,70 @@ pub fn programStandIn(io: Io, a: std.mem.Allocator, env: *const std.process.Envi
 }
 
 /// Who it plays: the plain test server, or a stand-in.
-const Role = union(enum) { plain, home: *Home, car: *Car, slack, jira, github };
+const Role = union(enum) { plain, home: *Home, car: *Car, slack, jira, github, mail };
 
 /// The work morning's servers (`--mcp --slack|--jira|--github`) on stdio.
 pub fn runWork(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, which: []const u8) u8 {
-    const role: Role = if (std.mem.eql(u8, which, "--slack")) .slack else if (std.mem.eql(u8, which, "--jira")) .jira else if (std.mem.eql(u8, which, "--github")) .github else return 2;
+    const role: Role = if (std.mem.eql(u8, which, "--slack")) .slack else if (std.mem.eql(u8, which, "--jira")) .jira else if (std.mem.eql(u8, which, "--github")) .github else if (std.mem.eql(u8, which, "--mail")) .mail else return 2;
     return serveAs(io, gpa, env, role);
 }
 
 const slack_tools_json =
     \\{"tools":[{"name":"search_messages","description":"Search messages.","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},{"name":"post_message","description":"Post a message, in a thread when thread_ts says.","inputSchema":{"type":"object","properties":{"channel":{"type":"string"},"thread_ts":{"type":"string"},"text":{"type":"string"}},"required":["channel","text"]}}]}
 ;
+const mail_tools_json =
+    \\{"tools":[{"name":"mail_list","description":"Mail in a mailbox, newest last, as a JSON list. Only reads.","inputSchema":{"type":"object","properties":{"mailbox":{"type":"string"},"since":{"type":"string"},"unread":{"type":"boolean"},"kind":{"type":"string"},"due_in_days":{"type":"integer"},"day":{"type":"string"}}},"annotations":{"readOnlyHint":true}},{"name":"mail_read","description":"One mail. Only reads.","inputSchema":{"type":"object","properties":{"mailbox":{"type":"string"},"uid":{"type":"integer"},"format":{"type":"string"}},"required":["mailbox","uid"]},"annotations":{"readOnlyHint":true}},{"name":"mail_draft","description":"Write a mail into the mailbox's Drafts. Sends nothing.","inputSchema":{"type":"object","properties":{"mailbox":{"type":"string"},"to":{"type":"string"},"subject":{"type":"string"},"text":{"type":"string"},"in_reply_to":{"type":"string"}},"required":["mailbox","to","subject","text"]}},{"name":"mail_send","description":"Send a mail from the butler's own address.","inputSchema":{"type":"object","properties":{"mailbox":{"type":"string"},"to":{"type":"string"},"subject":{"type":"string"},"text":{"type":"string"},"in_reply_to":{"type":"string"},"references":{"type":"string"}},"required":["mailbox","to","subject","text"]}}]}
+;
+
+/// mailmcp's stand-in: its files, and what was drafted or sent.
+fn mailCall(io: Io, a: std.mem.Allocator, v: std.json.Value) ![]const u8 {
+    const params = v.object.get("params") orelse return textResult(a, "no params", true);
+    if (params != .object) return textResult(a, "bad params", true);
+    const name_v = params.object.get("name") orelse return textResult(a, "no name", true);
+    const name = if (name_v == .string) name_v.string else "";
+    const args = params.object.get("arguments") orelse std.json.Value{ .object = .empty };
+    const field = struct {
+        fn f(x: std.json.Value, key: []const u8) []const u8 {
+            if (x != .object) return "";
+            const y = x.object.get(key) orelse return "";
+            return if (y == .string) y.string else "";
+        }
+    }.f;
+    const box = field(args, "mailbox");
+    const eql = std.mem.eql;
+    if (eql(u8, name, "mail_list")) {
+        const list = fileOf(io, a, try std.fmt.allocPrint(a, "list-{s}.json", .{box})) orelse fileOf(io, a, try std.fmt.allocPrint(a, "{s}-new.json", .{box})) orelse "[]";
+        return textResult(a, list, false);
+    }
+    if (eql(u8, name, "mail_read")) {
+        const uid: i64 = if (args == .object) (if (args.object.get("uid")) |u| (if (u == .integer) u.integer else 0) else 0) else 0;
+        const text = fileOf(io, a, try std.fmt.allocPrint(a, "read-{s}-{d}.json", .{ box, uid })) orelse return textResult(a, "no such mail", true);
+        return textResult(a, text, false);
+    }
+    if (eql(u8, name, "mail_draft") or eql(u8, name, "mail_send")) {
+        const file = if (eql(u8, name, "mail_draft")) "drafts.jsonl" else "sent.jsonl";
+        const line = try std.json.Stringify.valueAlloc(a, args, .{});
+        const old = fileOf(io, a, file) orelse "";
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = try std.fmt.allocPrint(a, "{s}{s}\n", .{ old, line }) });
+        if (eql(u8, name, "mail_draft")) return textResult(a, try std.fmt.allocPrint(a, "Draft saved in Drafts of {s}: to {s}. Nothing was sent; it waits there to be sent by hand.", .{ box, field(args, "to") }), false);
+        return textResult(a, try std.fmt.allocPrint(a, "Sent from {s} to {s}.", .{ box, field(args, "to") }), false);
+    }
+    return textResult(a, "unknown tool", true);
+}
+
+/// `resources/read` of `mail://NAME/new`: the file NAME-new.json.
+fn mailResource(io: Io, a: std.mem.Allocator, v: std.json.Value) ?[]const u8 {
+    const params = v.object.get("params") orelse return null;
+    if (params != .object) return null;
+    const uv = params.object.get("uri") orelse return null;
+    if (uv != .string or !std.mem.startsWith(u8, uv.string, "mail://") or !std.mem.endsWith(u8, uv.string, "/new")) return null;
+    const box = uv.string["mail://".len .. uv.string.len - "/new".len];
+    const text = fileOf(io, a, std.fmt.allocPrint(a, "{s}-new.json", .{box}) catch return null) orelse "[]";
+    const uri = std.json.Stringify.valueAlloc(a, uv.string, .{}) catch return null;
+    const body = std.json.Stringify.valueAlloc(a, text, .{}) catch return null;
+    return std.fmt.allocPrint(a, "{{\"contents\":[{{\"uri\":{s},\"mimeType\":\"application/json\",\"text\":{s}}}]}}", .{ uri, body }) catch null;
+}
+
 const jira_tools_json =
     \\{"tools":[{"name":"search_issues","description":"Issues for a JQL query.","inputSchema":{"type":"object","properties":{"jql":{"type":"string"}},"required":["jql"]}}]}
 ;
@@ -429,6 +509,7 @@ fn serveAs(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, 
                 .slack => slack_tools_json,
                 .jira => jira_tools_json,
                 .github => github_tools_json,
+                .mail => mail_tools_json,
             };
         } else if (std.mem.eql(u8, method, "tools/call")) {
             result = switch (role) {
@@ -436,10 +517,11 @@ fn serveAs(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, 
                 .home => |h| homeCall(io, a, h, v) catch return 1,
                 .car => |c| carCall(a, c, v) catch return 1,
                 .slack, .jira, .github => workCall(io, a, role, v) catch return 1,
+                .mail => mailCall(io, a, v) catch return 1,
             };
         } else if (std.mem.eql(u8, method, "resources/read")) {
             // the home serves its home:// resources, and fake://NAME as --mcp does
-            result = (if (role == .home) (homeResource(io, a, v) orelse resource(io, a, v)) else resource(io, a, v)) orelse {
+            result = (if (role == .home) (homeResource(io, a, v) orelse resource(io, a, v)) else if (role == .mail) mailResource(io, a, v) else resource(io, a, v)) orelse {
                 send(io, std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"error\":{{\"code\":-32002,\"message\":\"no such resource\"}}}}", .{id_json}) catch return 1);
                 continue;
             };

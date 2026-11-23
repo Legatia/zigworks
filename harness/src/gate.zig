@@ -9,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rules = @import("rules.zig");
 const who_mod = @import("who.zig");
+const mail_mod = @import("mail.zig");
 pub const Who = who_mod.Who;
 const folders_mod = @import("folders.zig");
 const util = @import("util.zig");
@@ -66,6 +67,11 @@ pub const Tool = enum {
     env_save,
     /// A snapshot of a workspace folder (gap 3); the argument is the folder.
     snapshot,
+    /// The people the owner deals with (`state/people/`): `find WORDS`,
+    /// `show NAME`, `note NAME FIELD`. Offered only in runs the owner
+    /// started in a conversation only they read; never a member's or a
+    /// room's.
+    people,
 
     /// The kind's default, as the rules file's comment names it: a send
     /// asks where others read it, trigger and workflow for some actions
@@ -475,6 +481,8 @@ pub const Gate = struct {
         // listing a source in briefs.ini or triggers.ini allows it, as an
         // allow rule would
         if (ctx.listed) |file| return .{ .action = .allow, .why = std.fmt.allocPrint(arena, "listed in {s}", .{file}) catch "listed by the owner", .subject = subject };
+        // mail is never sent from a run nobody watches, whatever [money] says
+        if (tool == .money and ctx.scheduled and mail_mod.isSendCall(subject)) return .{ .action = .deny, .why = "mail is never sent from a run nobody watches", .subject = subject };
         if (tool == .money) {
             // no grant or allow rule lifts this: the owner is asked every time
             if (!ctx.scheduled) return .{ .action = .ask, .why = "money is asked every time", .subject = subject };
@@ -534,6 +542,8 @@ pub const Gate = struct {
     fn decideMember(g: *const Gate, arena: std.mem.Allocator, tool: Tool, subject: []const u8, given: []const u8, ctx: Ctx, w: Who) Decision {
         const room = who_mod.isRoom(w.by);
         if (!memberTool(tool)) return .{ .action = .deny, .why = if (room) "not for speech in the house" else "not for household members", .subject = subject };
+        // the owner's mail: never read, drafted or sent for anyone else
+        if ((tool == .mcp or tool == .money) and mail_mod.isMailCall(subject)) return .{ .action = .deny, .why = "mail is the owner's alone", .subject = subject };
         if (room and tool == .send) return .{ .action = .deny, .why = "speech in the house is answered aloud: it posts nowhere", .subject = subject };
         const name = @tagName(tool);
         for (g.rules) |r| {
@@ -1517,6 +1527,25 @@ test "a_members_defaults" {
     // the owner's runs keep their defaults
     try t.expectEqual(.ask, f.act(.mcp, "home/home_set {}", .{}));
     try t.expect(f.gate.decide(a, .shell, "ls", 1000, .{}).allow_day);
+}
+
+test "people_is_never_for_members_or_rooms" {
+    var f: Fixture = undefined;
+    try f.init("[member]\nallow people *\n[room]\nallow people *\n");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    for ([_]Who{ anna, .{ .by = "room:kitchen" } }) |w| {
+        const d = f.gate.decide(a, .people, "show Ola", 1000, .{ .who = w });
+        try t.expectEqual(.deny, d.action);
+        try t.expect(!f.gate.memberOffers(.people, w));
+    }
+    // the owner's: allowed by default, and rules decide it as any kind
+    try t.expectEqual(.allow, f.act(.people, "find ola", .{}));
+    var g: Fixture = undefined;
+    try g.init("deny people note*\n");
+    defer g.deinit();
+    try t.expectEqual(.deny, g.act(.people, "note Ola birthday", .{}));
+    try t.expectEqual(.allow, g.act(.people, "show Ola", .{}));
 }
 
 test "what_members_never_get" {

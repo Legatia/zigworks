@@ -32,6 +32,7 @@ pub const Config = struct {
     voice: Voice = .{},
     butler: Butler = .{},
     voice_agent: VoiceAgent = .{},
+    mail: Mail = .{},
     /// The `[provider NAME]` sections, in the order their names first
     /// appear (not a section of its own: `parse` reads them apart).
     providers: []const model.Section = &.{},
@@ -181,6 +182,23 @@ pub const Config = struct {
         /// Its model (PROVIDER:MODEL as anywhere); "": the chat's.
         model: []const u8 = "",
     };
+    /// Mail (the email spec): the butler's own address is conversation
+    /// `email`; `owner` says whose mail there is a message.
+    pub const Mail = struct {
+        /// The owner's addresses, comma-separated: only their mail to the
+        /// butler's address starts a turn. "": the email conversation is off.
+        owner: []const u8 = "",
+        /// mailmcp's section in mcp.ini.
+        server: []const u8 = "mail",
+        /// The mail file's sections: the butler's own mailbox, the owner's.
+        butler: []const u8 = "butler",
+        mine: []const u8 = "mine",
+        /// mailmcp's program for /setup mail; "": next to harness, else on PATH.
+        mailmcp: []const u8 = "",
+        /// When the day's line about others' mail to the butler comes
+        /// (HH:MM, the owner's time).
+        others_at: []const u8 = "18:00",
+    };
     /// The butler's manners.
     pub const Butler = struct {
         /// Quiet hours, the owner's time: posts of runs nobody waits on
@@ -194,6 +212,14 @@ pub const Config = struct {
         /// acknowledged goes to these members in turn (a trigger's or a
         /// workflow's own `escalate` replaces it); none: to no one.
         escalate: []const alerts.Step = &.{},
+        /// calmcp's, for /setup calendar; the same.
+        calmcp: []const u8 = "",
+        /// Minutes before an event with a place that the diary says it
+        /// is time to leave ("30m", "1h", "1h30m").
+        travel: u32 = 30,
+        /// A maps MCP server's travel-time tool, SERVER/TOOL; "": none
+        /// (`travel` for every event).
+        maps: []const u8 = "",
     };
 };
 
@@ -463,6 +489,13 @@ fn setField(sec: anytype, l: Line) Error!void {
             } else if (comptime std.mem.eql(u8, fname, "escalate")) {
                 // `parse` reads it (it needs the arena)
                 return error.BadConfig;
+            } else if (comptime T == Config.Butler and std.mem.eql(u8, fname, "travel")) {
+                @field(sec.*, fname) = parseMinutes(l.value) orelse return error.BadConfig;
+            } else if (comptime T == Config.Butler and std.mem.eql(u8, fname, "maps")) {
+                // SERVER/TOOL
+                const slash = std.mem.indexOfScalar(u8, l.value, '/') orelse return error.BadConfig;
+                if (slash == 0 or slash + 1 == l.value.len or std.mem.indexOfAny(u8, l.value, " \t") != null) return error.BadConfig;
+                @field(sec.*, fname) = l.value;
             } else switch (ftype) {
                 []const u8 => {
                     // only omnigate's address may be left empty (not set yet)
@@ -496,6 +529,51 @@ pub fn parseOffset(v: []const u8) error{BadOffset}!i32 {
     if (h > 14 or m > 59) return error.BadOffset;
     const total: i32 = @as(i32, h) * 60 + m;
     return if (v[0] == '-') -total else total;
+}
+
+/// "30m", "45 min", "1h", "1h30m", "1 h 30 min", "20" → minutes (1 to
+/// 24 hours); null for anything else.
+pub fn parseMinutes(v: []const u8) ?u32 {
+    var total: u32 = 0;
+    var num: ?u32 = null;
+    var any = false;
+    var i: usize = 0;
+    while (i < v.len) {
+        const ch = v[i];
+        if (ch == ' ' or ch == '\t') {
+            i += 1;
+            continue;
+        }
+        if (std.ascii.isDigit(ch)) {
+            if (num != null) return null;
+            var j = i;
+            while (j < v.len and std.ascii.isDigit(v[j])) j += 1;
+            num = std.fmt.parseInt(u32, v[i..j], 10) catch return null;
+            i = j;
+            continue;
+        }
+        if (!std.ascii.isAlphabetic(ch)) return null;
+        var j = i;
+        while (j < v.len and std.ascii.isAlphabetic(v[j])) j += 1;
+        const w = v[i..j];
+        i = j;
+        const n = num orelse return null;
+        num = null;
+        if (std.ascii.eqlIgnoreCase(w, "h") or std.ascii.eqlIgnoreCase(w, "hour") or std.ascii.eqlIgnoreCase(w, "hours")) {
+            total += n * 60;
+        } else if (std.ascii.eqlIgnoreCase(w, "m") or std.ascii.eqlIgnoreCase(w, "min") or std.ascii.eqlIgnoreCase(w, "minutes")) {
+            total += n;
+        } else return null;
+        any = true;
+    }
+    if (num) |n| {
+        // a number alone is minutes
+        if (any) return null;
+        total = n;
+        any = true;
+    }
+    if (!any or total == 0 or total > 24 * 60) return null;
+    return total;
 }
 
 /// "07:00" → minutes after midnight.
@@ -734,11 +812,19 @@ pub const defaults_ini =
     \\; homemcp = /usr/local/bin/homemcp   ; /setup home runs it; default: next to harness, else on PATH
     \\; carcloud = /usr/local/bin/carcloud ; /setup car runs it; the same
     \\; escalate = 5m anna, 15m piotr      ; an urgent alert you don't answer goes to these members in turn
+    \\; calmcp = /usr/local/bin/calmcp     ; /setup calendar runs it; the same
+    \\; travel = 30m                      ; how long before an event with a place the diary says it's time to leave
+    \\; maps = maps/travel_time           ; a maps MCP server's tool that gives the travel time instead
     \\
     \\[voice_agent]                       ; Home Assistant's voice assistant answered by harness (README: Home Assistant's voice)
     \\; listen = 192.168.1.20:8765         ; for Home Assistant on another machine: this one's LAN address (default: this machine only)
     \\; token = ha-agent                   ; the secret Home Assistant's API key must be: harness secret add ha-agent
     \\; seconds = 20                       ; a spoken answer's time
+    \\
+    \\[mail]                              ; mail (README: Mail); /setup mail writes it
+    \\; owner = me@example.com             ; your addresses: only your mail to the butler's address is a message
+    \\; mailmcp = /usr/local/bin/mailmcp   ; /setup mail runs it; default: next to harness, else on PATH
+    \\; others_at = 18:00                  ; when the day's line about others' mail to the butler comes
     \\
 ;
 
@@ -1344,6 +1430,25 @@ test "butler_quiet_reads_hours_or_off" {
     for ([_][]const u8{ "22:00", "22:00-22:00", "25:00-07:00", "22-07", "22:00-07:00-08:00", "" }) |v| {
         try t.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "[butler]\nquiet = {s}\n", .{v})));
     }
+}
+
+test "butler_travel_maps_and_calmcp_read" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 30 minutes unless set; the lines are comments in harness init's file
+    try t.expectEqual(@as(u32, 30), (try parse(a, "")).butler.travel);
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "; travel = 30m") != null);
+    for ([_]struct { []const u8, u32 }{ .{ "45m", 45 }, .{ "45 min", 45 }, .{ "1h", 60 }, .{ "1h30m", 90 }, .{ "1 h 30 min", 90 }, .{ "20", 20 } }) |c| {
+        try t.expectEqual(c[1], (try parse(a, try std.fmt.allocPrint(a, "[butler]\ntravel = {s}\n", .{c[0]}))).butler.travel);
+    }
+    for ([_][]const u8{ "fast", "0m", "25h", "-5m" }) |v| {
+        try t.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "[butler]\ntravel = {s}\n", .{v})));
+    }
+    const c = try parse(a, "[butler]\nmaps = maps/travel_time\ncalmcp = /opt/calmcp\n");
+    try t.expectEqualStrings("maps/travel_time", c.butler.maps);
+    try t.expectEqualStrings("/opt/calmcp", c.butler.calmcp);
+    try t.expectError(error.BadConfig, parse(a, "[butler]\nmaps = travel_time\n"));
 }
 
 test "voice_agent_settings_read_and_checked" {

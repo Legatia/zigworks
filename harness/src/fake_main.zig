@@ -4,7 +4,8 @@
 //! server on stdio instead (see fake_mcp.zig; `--mcp --home` is homemcp's
 //! stand-in, `--mcp --car` carcloud's, `--mcp --slack|--jira|--github`
 //! the work morning's). `harness-fake discover URL`, `check FILE` and
-//! `FILE.ini` answer as homemcp and carcloud do, for /setup. `harness-fake --browse URL` is the owner's browser for a
+//! `FILE.ini` answer as homemcp and carcloud do, for /setup (and as calmcp
+//! does for a calendar file: fake_cal.zig). `harness-fake --browse URL` is the owner's browser for a
 //! sign-in: it opens URL, follows its redirect to 127.0.0.1, and prints the
 //! page's status and text. `harness-fake --ha URL TOKEN BODY` is Home
 //! Assistant's llama.cpp integration: it POSTs BODY to URL with TOKEN as
@@ -12,6 +13,7 @@
 const std = @import("std");
 const fake = @import("fake.zig");
 const fake_mcp = @import("fake_mcp.zig");
+const fake_cal = @import("fake_cal.zig");
 
 pub fn main(init: std.process.Init) u8 {
     const io = init.io;
@@ -22,12 +24,20 @@ pub fn main(init: std.process.Init) u8 {
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--home")) return fake_mcp.runHome(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--car")) return fake_mcp.runCar(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp")) return fake_mcp.runWork(io, init.gpa, init.environ_map, args[2]);
+    // calmcp's, for /setup calendar: discover URL USER, check FILE (a calendar file)
+    if (args.len == 4 and std.mem.eql(u8, args[1], "discover")) return fake_cal.discover(io, init.environ_map);
+    if (args.len == 3 and std.mem.eql(u8, args[1], "check")) {
+        const text = std.Io.Dir.cwd().readFileAlloc(io, args[2], init.arena.allocator(), .limited(1 << 20)) catch "";
+        if (fake_cal.isCalendarFile(text)) return fake_cal.check(io, init.arena.allocator(), init.environ_map, text);
+    }
     // homemcp's and carcloud's commands, for /setup: discover URL, check FILE
     if (args.len == 3 and (std.mem.eql(u8, args[1], "discover") or std.mem.eql(u8, args[1], "check"))) return fake_mcp.programStandIn(io, init.arena.allocator(), init.environ_map, args[1..]);
     // as mcp.ini starts them: homemcp HOME.ini or carcloud CAR.ini
     if (args.len == 2 and std.mem.endsWith(u8, args[1], ".ini")) {
         const text = std.Io.Dir.cwd().readFileAlloc(io, args[1], init.arena.allocator(), .limited(1 << 20)) catch "";
         if (std.mem.indexOf(u8, text, "[car]") != null) return fake_mcp.runCar(io, init.gpa, init.environ_map);
+        if (std.mem.indexOf(u8, text, "imap =") != null) return fake_mcp.runWork(io, init.gpa, init.environ_map, "--mail");
+        if (fake_cal.isCalendarFile(text)) return fake_cal.run(io, init.gpa, init.environ_map, text);
         return fake_mcp.runHome(io, init.gpa, init.environ_map);
     }
     if (args.len == 3 and std.mem.eql(u8, args[1], "--browse")) {
