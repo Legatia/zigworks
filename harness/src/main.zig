@@ -452,7 +452,10 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
                     var nb: [40]u8 = undefined;
                     const name = mcp.signinSecret(&nb, sc.name);
                     const v = s.get(app.io, app.arena, name) catch null;
-                    try outPrint(app.io, "{s} (MCP {s} sign-in): {s}\n", .{ name, sc.name, if (v != null) "stored" else "not stored: harness mcp login" });
+                    if (v != null)
+                        try outPrint(app.io, "{s} (MCP {s} sign-in): stored\n", .{ name, sc.name })
+                    else
+                        try outPrint(app.io, "{s} (MCP {s} sign-in): not stored (harness mcp login {s})\n", .{ name, sc.name, sc.name });
                 }
             }
         } else |_| {}

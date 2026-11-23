@@ -162,13 +162,20 @@ pub const Keeper = struct {
     }
 
     /// The access token to send (a copy in `a`), renewed first when it
-    /// expires within a minute; a renewal that fails keeps the old one.
+    /// expires within a minute (a sign-in made since is taken instead; one
+    /// forgotten since is not renewed); a renewal that fails keeps the old
+    /// one.
     pub fn bearer(k: *Keeper, a: Allocator) error{OutOfMemory}![]const u8 {
         k.mutex.lockUncancelable(k.io);
         defer k.mutex.unlock(k.io);
         const tk = k.tokens;
-        if (tk.expires_at > 0 and tk.refresh_token.len > 0 and !k.refused() and util.nowSeconds(k.io) >= tk.expires_at - renew_margin_s)
-            k.refresh() catch {};
+        if (tk.expires_at > 0 and tk.refresh_token.len > 0 and !k.refused() and util.nowSeconds(k.io) >= tk.expires_at - renew_margin_s) {
+            switch (k.fromStore()) {
+                .gone => k.markRefused(),
+                .newer => {},
+                .same => k.refresh() catch {},
+            }
+        }
         return a.dupe(u8, k.tokens.access_token);
     }
 
@@ -181,8 +188,16 @@ pub const Keeper = struct {
         defer k.mutex.unlock(k.io);
         // renewed by another request meanwhile
         if (!std.mem.eql(u8, k.tokens.access_token, used)) return true;
-        // `harness mcp login NAME` from the terminal while harness runs
-        if (k.reload()) return true;
+        switch (k.fromStore()) {
+            // `harness mcp logout NAME` meanwhile: renewing would keep it again
+            .gone => {
+                k.markRefused();
+                return false;
+            },
+            // `harness mcp login NAME` from the terminal while harness runs
+            .newer => return true,
+            .same => {},
+        }
         if (k.tokens.refresh_token.len == 0) {
             k.markRefused();
             return false;
@@ -220,20 +235,34 @@ pub const Keeper = struct {
         for ([_][]const u8{ k.tokens.access_token, k.tokens.refresh_token, k.tokens.client_secret }) |v| if (v.len > 0) m.add(k.secret, v) catch {};
     }
 
-    /// Takes the store's sign-in when it is not the one held; true then.
-    fn reload(k: *Keeper) bool {
+    const Stored = enum {
+        /// Nothing kept: signed out.
+        gone,
+        /// The sign-in held.
+        same,
+        /// Another sign-in, now held.
+        newer,
+    };
+
+    /// What the store keeps now; another sign-in is taken. A store that
+    /// can't be read counts as the same.
+    fn fromStore(k: *Keeper) Stored {
         var next: std.heap.ArenaAllocator = .init(k.gpa);
-        const tk = (load(k.io, next.allocator(), k.store, k.secret) catch null) orelse {
+        const got = load(k.io, next.allocator(), k.store, k.secret) catch {
             next.deinit();
-            return false;
+            return .same;
+        };
+        const tk = got orelse {
+            next.deinit();
+            return .gone;
         };
         if (std.mem.eql(u8, tk.access_token, k.tokens.access_token)) {
             next.deinit();
-            return false;
+            return .same;
         }
         k.swap(&next, tk);
         k.refused_flag.store(false, .release);
-        return true;
+        return .newer;
     }
 
     fn swap(k: *Keeper, next: *std.heap.ArenaAllocator, tk: Tokens) void {
@@ -1024,4 +1053,32 @@ test "a_www_authenticate_header_gives_its_parameters" {
     try f.add("redirect_uri", "http://127.0.0.1:8/callback");
     try f.add("scope", "a b");
     try t.expectEqualStrings("redirect_uri=http%3A%2F%2F127.0.0.1%3A8%2Fcallback&scope=a%20b", f.text());
+}
+
+test "a_sign_in_forgotten_by_logout_is_not_renewed" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const h = &e.server.mcp;
+    const server = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/mcp/signin", .{e.server.port});
+    h.setExpiresIn(30);
+    var b: fake.Browser = .{ .io = t.io };
+    var said: []const u8 = "";
+    const tokens = try login(t.allocator, t.io, a, .{ .name = "web", .url = server, .link = .{ .ctx = &b, .f = fake.Browser.opened } }, &said);
+    b.join();
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ e.dir, "secrets" }) };
+    try save(t.io, t.allocator, st, "mcp-web", tokens);
+    const k = try Keeper.open(t.allocator, t.io, st, "web", "mcp-web", null);
+    defer k.destroy();
+    // harness mcp logout, while harness runs
+    try t.expect(try st.removeLong(t.io, t.allocator, "mcp-web"));
+    // about to expire: not renewed (that would keep it again)
+    try t.expectEqualStrings(tokens.access_token, try k.bearer(a));
+    try t.expectEqual(0, h.refreshes.load(.acquire));
+    // refused: not renewed either, and said as refused
+    try t.expect(!k.renew(a, tokens.access_token));
+    try t.expect(k.refused());
+    try t.expectEqual(0, h.refreshes.load(.acquire));
+    try t.expectEqual(null, try load(t.io, a, st, "mcp-web"));
 }

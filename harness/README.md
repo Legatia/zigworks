@@ -4,7 +4,8 @@ A personal agent you talk to in Telegram (or the terminal), in your chat
 with the bot or in a topic of it per subject. It does research, hands
 parts of a job to helpers that work in parallel, sends a morning brief on
 the topics you follow, runs scheduled tasks, watches feeds, pages, folders
-and MCP servers with triggers, uses MCP servers and saved skills, and
+and MCP servers with triggers, uses MCP servers (programs it starts, or
+servers at a url with a token or a sign-in) and saved skills, and
 remembers what you bring up. Every action it takes, and every
 action of its helpers, passes one gate and is written to one log you can
 check.
@@ -30,20 +31,23 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 685 unit tests (27 of them
+**State: 0.3.0, tested on macOS by its own tests: 707 unit tests (27 of them
 don't run on macOS: Windows or Linux only, or the macOS sandbox and clones,
 not built yet), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 73 checks that drives the real binary against
+and an end-to-end script of 78 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram, feeds,
-search and two MCP servers. An earlier build of 0.3.0 also passed its
-tests in CI on Linux and Windows. On Windows 11 the browser and login
+search, two MCP servers run as programs, and MCP servers at a url with a
+token or a sign-in (with a stand-in authorization server and browser).
+An earlier build of 0.3.0 also passed its tests in CI on Linux and
+Windows. On Windows 11 the browser and login
 tests also run, against Chrome 157, and the console, lock, Credential
 Manager and process-cleanup checks of HANDOFF-windows-audit.md were run by
 hand. With environments, apps, clones and safe state files added,
 Windows 11 and Linux (WSL, bubblewrap 0.9, OpenSSH 9.6) pass their unit
 tests and the end-to-end script. Nothing has run yet against a real
-omnigate or model provider, Telegram bot, MCP server or website.** See
+omnigate or model provider, Telegram bot, MCP server, authorization
+server or website.** See
 [Limits](#limits).
 
 ## Quick start
@@ -902,16 +906,89 @@ max_per_day = 2000
 ```
 
 Servers start together (20 s in all) with `harness run`, `chat` and
-`task run` and on `/reload`, each in a folder of its own (`state/mcp/NAME`,
-never the workspace), with only PATH, HOME, LANG, TERM and their named
-secrets (`harness secret add github`; `/reload` picks up one added
-meanwhile). Their tools appear as `github__list_issues` and ask by
-default; a 24 h grant covers that tool with any input; rules match
+`task run` and on `/reload`, each program in a folder of its own
+(`state/mcp/NAME`, never the workspace), with only PATH, HOME, LANG, TERM
+and its named secrets (`harness secret add github`; `/reload` picks up
+one added meanwhile). Their tools appear as `github__list_issues` and ask
+by default; a 24 h grant covers that tool with any input; rules match
 `mcp github/list_issues *` (the server, the tool, then the whole input as
 JSON). Server names use a-z, 0-9, - and _, up to 32 (no `__`); secret
 names follow `harness secret add`. A tool whose `server__tool` name is
 over 64 characters, or that another tool already has, is left out;
 `/status` says which, and what started.
+
+### Servers at a url
+
+```ini
+[github]
+url = https://api.githubcopilot.com/mcp/
+token = github                 ; a stored secret, sent as Authorization: Bearer
+header = X-MCP-Toolsets: issues,pull_requests   ; repeatable
+
+[atlassian]
+url = https://mcp.atlassian.com/v1/mcp
+login = oauth                  ; sign in once: harness mcp login atlassian
+```
+
+A section with `url` instead of `command` is a server reached over MCP's
+Streamable HTTP (MCP 2025-06-18, or 2025-03-26 when the server answers
+with it). `url` is https, or http to this machine (localhost, 127.0.0.1,
+[::1]). `token` names a stored secret (`harness secret add github`), sent
+as `Authorization: Bearer`. `header = Name: value` lines are sent as
+written; they may not set Authorization, Host, Content-*, Mcp-* or
+MCP-Protocol-Version, nor the headers harness writes itself (Accept,
+Accept-Encoding, Connection, Transfer-Encoding, User-Agent,
+Last-Event-ID). `command` and `url` exclude each other, and so do `token`
+and `login = oauth`; `secret =` is for programs; `client_id` and `scope`
+are for a sign-in. A bad line is named with its number at start and in
+`/status`.
+
+Its tools are a program's for the gate, rules, grants, money and the log
+(`mcp github/list_issues *`), and what it answers is masked the same way,
+a token it says back too. A server that ends its session gets a new one
+once and the call is sent again (a call answered 404 did not run). With
+subscriptions, its resource updates come on an event stream kept open
+and opened again with backoff; its session is deleted when harness stops
+or reloads. Redirects are not followed. What goes wrong is said with what
+to do, as for model providers: "atlassian refused the sign-in: harness
+mcp login atlassian", "github refused the token stored as github: store
+the right one with harness secret add github"; 403 refused, 5xx an
+upstream error, a 429 is waited for as told, once, within the turn's
+time.
+
+### Signing in
+
+`harness mcp login atlassian` (in a terminal, with `harness run` going or
+not) signs in with OAuth as MCP's authorization spec says: harness asks
+the server where its sign-in is, registers itself with the authorization
+server (unless `client_id =` names a client registered beforehand) and
+prints a link; it does not open it. Open the link in a browser on this
+machine within 5 minutes: the authorization server sends the browser back
+to `http://127.0.0.1:PORT/callback`, where harness takes that one answer
+and exchanges its code (PKCE S256, a state, the server as the resource).
+`scope =` asks for other scopes than the server names.
+
+On a machine without a browser (one you reach over SSH), forward the port
+the command prints, then open the link on your own machine:
+
+```
+ssh -L 53682:127.0.0.1:53682 you@harness-machine
+```
+
+The tokens and the client are kept as the secret `mcp-atlassian` in the
+secret store (the Keychain, the Credential Manager, or a file only you
+can read; never in the data folder), masked in all output, renewed before
+they expire and once after a 401. A running harness takes a new sign-in
+at its next request to that server, and `/reload` starts a server that
+was not signed in; `/status` names the servers that need a sign-in.
+`harness mcp logout atlassian` forgets it (a running harness stops using
+it on `/reload`). `harness mcp list` shows each server, its kind
+(program, token, sign-in or url), whether it is signed in, and its tools
+as `SERVER/TOOL`, the names rules and workflows use (programs are started
+to list theirs, then stopped).
+
+Not built: client-credential and device sign-ins, signing in from a
+conversation, a stored secret sent in another header than Authorization.
 
 ### Money
 
@@ -1228,7 +1305,7 @@ act on the conversation they are sent in; `/stop`, `/dryrun` and
 CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `trigger list|test|run`, `memory [list|pin|unpin|forget ID]`,
 `snapshot list|take|changes|restore`, `env list|check|rm|key`,
-`agent list|show|rm`, `log verify|tail|runs|session`, `inbox [--json]`,
+`agent list|show|rm`, `mcp list|login|logout`, `log verify|tail|runs|session`, `inbox [--json]`,
 `app list|approve|rm`,
 `health`, `version`. `--home DIR` may come anywhere on the line;
 arguments a command does not take are refused. `health` exits 0 only

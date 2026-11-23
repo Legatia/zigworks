@@ -548,7 +548,8 @@ pub const Remote = struct {
                 const json = (try responseTo(arena, text, id)) orelse return r.say(error.BadAnswer, "{s} answered something that is not the response to the request", .{r.name});
                 return .{ .answer = .{ .json = json, .session = if (resp.kept[0]) |s| try arena.dupe(u8, s) else null } };
             },
-            202, 204 => return if (want == null) .accepted else .accepted,
+            // taken (for a request: not answered, said by the caller)
+            202, 204 => return .accepted,
             else => {
                 // what it says, a little of it
                 const text = resp.readAll(arena, 64 << 10) catch "";

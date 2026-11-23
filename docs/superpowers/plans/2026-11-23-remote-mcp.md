@@ -1,6 +1,6 @@
 # harness: remote MCP servers (HTTP, token, sign-in) — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** A section of `mcp.ini` may name a `url` instead of a `command`: the server is reached over MCP's Streamable HTTP, with a stored token or an OAuth sign-in (`harness mcp login NAME`). Its tools go through the gate, rules, grants, money and the log exactly as a program's (`mcp SERVER/TOOL`). `harness mcp list|login|logout`; `/status` says which servers need a sign-in.
 
@@ -47,9 +47,9 @@
 
 **Interfaces — Produces (mcp.zig):** `ServerConfig.url`, `.token` (a stored secret's name), `.headers: []const std.http.Header` (≤ 8), `.login: bool`, `.client_id`, `.scope` (all defaulted); `pub const Kind = enum { program, token, signin, url }`, `pub fn kind(cfg) Kind`, `pub fn signinSecret(buf, name) []const u8` (`mcp-NAME`); `pub const ConfigError`; `configReason` for each new error: `CommandAndUrl`, `TokenAndLogin`, `PlainHttpUrl`, `BadMcpUrl`, `BadMcpHeader`, `ReservedMcpHeader`, `SecretWithUrl`, `UrlOnlyKey`, `SignInOnlyKey`, `BadLoginValue` (names not used by rules, folders, environments or config, whose reasons share `parseProblem`'s chain).
 
-- [ ] Step 1: tests — `bad_mcp_ini_sections_name_their_line` (through `core.parseProblem`: command and url; token and login; http to a non-loopback host; a forbidden header — each "mcp.ini line N has an error: … (reason)"); `parse_config_reads_servers_at_a_url` (the spec's two examples; kinds; loopback http; headers in order; comments after values); `parse_config_refuses_bad_remote_lines` (the other refusals).
-- [ ] Step 2: run; compile errors (no fields, no errors).
-- [ ] Step 3: implement. Step 4: whole suite. Step 5: commit `harness mcp: url, token, header and login in mcp.ini`.
+- [x] Step 1: tests — `bad_mcp_ini_sections_name_their_line` (through `core.parseProblem`: command and url; token and login; http to a non-loopback host; a forbidden header — each "mcp.ini line N has an error: … (reason)"); `parse_config_reads_servers_at_a_url` (the spec's two examples; kinds; loopback http; headers in order; comments after values); `parse_config_refuses_bad_remote_lines` (the other refusals).
+- [x] Step 2: run; compile errors (no fields, no errors).
+- [x] Step 3: implement. Step 4: whole suite. Step 5: commit `harness mcp: url, token, header and login in mcp.ini`.
 
 ### Task 2: Streamable HTTP, the stand-in, and servers at a url in the instance
 
@@ -61,29 +61,37 @@
 - fake_mcp.zig `Http` (in `fake.Server.mcp`): `POST|GET|DELETE /mcp/FLAVOR` (json, sse, old, token, signin), sessions (`endSessions`, `dropStreams`, counters), event-stream answers with a notification and a `ping` first, `notify:URI` pushed on the session's GET stream, every request recorded in `mcp-requests.jsonl`.
 - core.zig: `McpStart.auth`; a token server's token by `secretValue` ("token \"X\" is not stored (harness secret add X)" when missing).
 
-- [ ] Step 1: tests — mcp_http.zig: `json_and_event_stream_answers_list_and_call_tools`, `a_session_that_ended_is_started_again`, `resource_updates_arrive_over_the_event_stream` (and the stream reopened after it ends), `a_2025_03_26_server_is_taken_and_another_version_refused`, `errors_name_the_server_and_what_to_do` (401 token, 403, 429 waited once, 5xx, a redirect not followed, 404 without a session), `stop_and_the_deadline_end_an_http_call`, `the_session_is_deleted_on_stop`; core.zig: `http_mcp_tools_list_and_call_through_the_gate`, `token_and_headers_are_sent_and_never_logged`.
-- [ ] Step 2: run; compile errors (no mcp_http, no `fake.Server.mcp`).
-- [ ] Step 3: implement. Step 4: whole suite. Step 5: commit `harness mcp: servers at a url over Streamable HTTP`.
+- [x] Step 1: tests — mcp_http.zig: `json_and_event_stream_answers_list_and_call_tools`, `a_session_that_ended_is_started_again`, `resource_updates_arrive_over_the_event_stream` (and the stream reopened after it ends), `a_2025_03_26_server_is_taken_and_another_version_refused`, `errors_name_the_server_and_what_to_do` (401 token, 403, 429 waited once, 5xx, a redirect not followed, 404 without a session), `stop_and_the_deadline_end_an_http_call`, `the_session_is_deleted_on_stop`; core.zig: `http_mcp_tools_list_and_call_through_the_gate`, `token_and_headers_are_sent_and_never_logged`.
+- [x] Step 2: run; compile errors (no mcp_http, no `fake.Server.mcp`).
+- [x] Step 3: implement. Step 4: whole suite. Step 5: commit `harness mcp: servers at a url over Streamable HTTP`.
 
 ### Task 3: signing in (OAuth)
 
 **Interfaces — Produces (oauth.zig):** `Tokens` (JSON in `mcp-NAME`), `load(io, gpa, store, name) !?Tokens`, `save`; `login(gpa, io, arena, LoginOptions) !Tokens` (error.Said + `said` text); `Keeper.open(gpa, io, store, name, masks) !*Keeper` (error.NotSignedIn), `bearer`, `renew(used)`, `refused()`. Fake: protected resource metadata, RFC 8414 and OpenID metadata, `/auth/register`, `/auth/authorize` (302 back with code, state, iss), `/auth/token` (PKCE S256 checked; refresh rotates), `expireTokens()`.
 
-- [ ] Step 1: tests — oauth.zig: `oauth_login_registers_exchanges_and_refreshes` (metadata, registration, PKCE and state checked by the stand-in, tokens kept; a keeper refreshes before expiry and once after a 401), `the_login_listener_takes_one_request_and_ends` (a wrong state ends it with nothing stored, the port closes; no request: it ends at its time), `a_set_client_id_skips_registration_and_openid_is_the_fallback`; core.zig: `a_sign_in_server_starts_signed_in_and_status_says_when_not`.
-- [ ] Step 2: run; compile errors. Step 3: implement. Step 4: whole suite. Step 5: commit `harness mcp: sign in with OAuth`.
+- [x] Step 1: tests — oauth.zig: `oauth_login_registers_exchanges_and_refreshes` (metadata, registration, PKCE and state checked by the stand-in, tokens kept; a keeper refreshes before expiry and once after a 401), `the_login_listener_takes_one_request_and_ends` (a wrong state ends it with nothing stored, the port closes; no request: it ends at its time), `a_set_client_id_skips_registration_and_openid_is_the_fallback`; core.zig: `a_sign_in_server_starts_signed_in_and_status_says_when_not`.
+- [x] Step 2: run; compile errors. Step 3: implement. Step 4: whole suite. Step 5: commit `harness mcp: sign in with OAuth`.
 
 ### Task 4: harness mcp list, login, logout
 
 **Interfaces — Produces (main.zig):** `mcp list | login NAME | logout NAME` (usage, `badArgs`); `App.mcpSecrets` adds tokens and sign-in values (masked from the start); `secret list` lines for tokens and sign-ins. fake_main.zig `--browse URL` (follows the stand-in's redirect to the listener).
 
-- [ ] Step 1: tests — main.zig `mcp_commands_take_their_arguments`; smoke: `mcp list` (program and token servers, their tools), `mcp login` through the browser stand-in, the tokens in the store and nowhere else, `mcp list` says signed in, `mcp logout`.
-- [ ] Step 2–5: run, implement, suite, commit `harness mcp: mcp list, login and logout`.
+- [x] Step 1: tests — main.zig `mcp_commands_take_their_arguments`; smoke: `mcp list` (program and token servers, their tools), `mcp login` through the browser stand-in, the tokens in the store and nowhere else, `mcp list` says signed in, `mcp logout`.
+- [x] Step 2–5: run, implement, suite, commit `harness mcp: mcp list, login and logout`.
 
 ### Task 5: README and final checks
 
-- [ ] README: remote servers (url, token, header), signing in (login, logout, `ssh -L` for a machine without a browser), errors, what is not built (client credentials, device flow, signing in from chat; a token in another header), commands, the State line's counts.
-- [ ] Debug and ReleaseSafe suites; cross builds and `unit-build`; commit `harness mcp: README for servers at a url and signing in`.
+- [x] README: remote servers (url, token, header), signing in (login, logout, `ssh -L` for a machine without a browser), errors, what is not built (client credentials, device flow, signing in from chat; a token in another header), commands, the State line's counts.
+- [x] Debug and ReleaseSafe suites; cross builds and `unit-build`; commit `harness mcp: README for servers at a url and signing in`.
 
 ## Done
 
-(filled in at the end)
+- Branch `platform/remote-mcp`: plan 3bbff8c; Task 1 52a5ee8, Task 2 918670d, Task 3 b305abd, Task 4 87f841e, Task 5 (README, a logout a running harness respects, this section).
+- Debug and ReleaseSafe: `Build Summary: 8/8 steps succeeded; 680/707 tests passed (27 skipped)` (baseline 658/685: +22); `smoke: all ok` (78 checks: +5). Cross builds and `unit-build` for x86_64-windows, x86_64-linux-musl, aarch64-linux-musl compile.
+- No existing test changed.
+- core.zig: `McpStart.auth` and its pass to `Server.start`; in `startMcp`, a token server's token (`secretValue`) and a sign-in server's store (not signed in: skipped with "not signed in (harness mcp login NAME)"); `/status`'s MCP part through `mcpStatus` (servers whose sign-in was refused since). Three tests next to the MCP tests. agent.zig: untouched (Ruling 2).
+- Further rulings made while building:
+  13. **A failure at start keeps its kind as the error name** (Refused, NotFound, Redirected, RateLimited, Upstream, Unreachable, BadVersion, BadAnswer), the worded text as the note's detail: core's note format stays ("atlassian: did not start (Refused) atlassian refused the sign-in: harness mcp login atlassian"). Cost if wrong: the word in parentheses repeats what follows.
+  14. **A logout is respected by a running harness**: a renewal first reads the store; nothing kept means refused (no renewal writes the tokens back), and `/reload` stops the server. Why: "logout forgets the tokens" would otherwise be undone at the next renewal. Cost if wrong: one store read per renewal.
+  15. **`harness mcp login|logout` refuse a name starting with `-`** (an option), though mcp.ini takes one. Cost if wrong: such a server can't be signed in to from the terminal.
+- Left out: the morning routine (after workflows, as the spec orders); resuming a POST's event stream (Ruling 5); client-credential and device sign-ins and signing in from a conversation (the spec's "not built"); a stored secret in another header than Authorization; proxies.
