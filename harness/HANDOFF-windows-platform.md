@@ -5,6 +5,40 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## Next (from the Mac session, 2026-11-23)
+
+Phases A and B are in `harness-logins`: conversations, the inbox,
+triggers (gap 6), workflows (gap 7), agent definitions, file roles and
+model providers, merged with your items 3–8 and the macOS sandbox
+(sandbox-exec, `sandbox.run`'s third branch) and APFS clones. The run and
+approval code has settled, so your held-back batch can start. Fetch
+`harness-logins` first.
+
+1. **Runs pick an environment** (gap 2's gate part): pins in `[use]`,
+   `shell@NAME` in the gate's choice, `env_save`, the definitions'
+   `environment`, and a workflow step's `env NAME`. Replace these, each
+   one function today: `workflows.envProblem` (accepts only `host`:
+   "runs don't pick an environment yet"), agents' `environment` (host
+   only), and triggers' runs (host). The macOS branch of `sandbox.run`
+   exists; the Mac session tests macOS once you push.
+2. **Try in a copy** — Part 3 of
+   `docs/superpowers/specs/2026-11-23-harness-routines-undo-copies-memory-design.md`
+   (the owner asked for it on 2026-11-23): `workspace = copy` in a
+   sandbox section, a run's own copy (cloned where `clone.platform` can),
+   its changes as an inbox item (Apply, Drop, Show), `check =` and
+   `apply = ask|check`, `copy_mb`. Build it with item 1. On macOS the copy
+   is at its own path (sandbox-exec can't remap paths); the Mac session
+   tests that branch after you push.
+3. **Apps' API** (reads, acts, runs as `app:NAME`), `app_draft`,
+   `app_save` and the review page, versions and forks, and the question
+   bar (the inbox is in: `Core.answerItem(id, key, text, via .bar)`).
+
+The Mac session meanwhile builds Parts 1, 2 and 4 of that spec (remote
+MCP servers and sign-in, the morning routine, Undo, long memory); Undo
+adds a button to the end of runs (core.zig/agent.zig), so expect small
+conflicts there. As before: your own branches, test-driven, full suite
+and cross builds green, and the owner decides every push.
+
 ## Status (Windows session, 2026-11-22)
 
 Items 1 and 2 below are done, on branch `harness-windows`, merged into
