@@ -1584,6 +1584,8 @@ pub const Core = struct {
             c.say(try std.fmt.allocPrint(arena.allocator(), "A message in a new topic was not taken: harness could not write state/conversations ({s}).", .{@errorName(e)}));
             return;
         };
+        // after bedtime, the night's first message gets one gentle line
+        if (m.voice != null or !std.mem.startsWith(u8, std.mem.trim(u8, text, " \t\r\n"), "/")) Bedtime.message(c, conv);
         // a voice note: transcribed, then taken as typed text (never a command)
         if (m.voice) |note| return c.voiceIn(conv, m, note);
         // a reply to one of an item's messages is its text answer
@@ -10337,6 +10339,7 @@ pub const Core = struct {
         \\/setup: where setup is; /setup home, /setup car, /setup calendar, /setup mail: connect them in chat
         \\/setup routines: the butler's routines, offered one at a time
         \\/med add NAME at 08:00, 20:00: a reminder with Taken; /meds, /med rm NAME, /med tell NAME MEMBER
+        \\/bedtime [23:30|off]: one gentle line on your first message after it
     ;
 
     /// A command sent in `main` (or from the command line).
@@ -10361,6 +10364,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/person")) return if (rest.len == 0) "Use /person NAME." else c.people.cardText(a, rest);
         if (eql(u8, cmd, "/setup")) return c.setupCommand(a, conv, rest);
         if (eql(u8, cmd, "/med") or eql(u8, cmd, "/meds")) return Meds.command(c, a, cmd, rest);
+        if (eql(u8, cmd, "/bedtime")) return Bedtime.command(c, a, rest);
         if (eql(u8, cmd, "/member")) return c.memberCommand(a, rest);
         if (eql(u8, cmd, "/join")) return "That code is for the person joining: they send /join CODE to the bot from their own account.";
         if (eql(u8, cmd, "/stop")) return if (rest.len == 0) c.stopAll() else c.stopAgent(a, rest);
@@ -23604,6 +23608,66 @@ const Meds = struct {
     }
 };
 
+/// Bedtime (Ruling 7): `[butler] bedtime` (off until set, `/bedtime`);
+/// from it to the end of quiet hours (06:00 without them), the owner's
+/// first message in their own chats gets one line, once a night
+/// (`state/bedtime` keeps the night said).
+const Bedtime = struct {
+    /// The owner's message in `conv` (text or a voice note, not a command).
+    fn message(c: *Core, conv: []const u8) void {
+        const bt = c.cfg.butler.bedtime orelse return;
+        const now_s = c.now();
+        const off = c.cfg.chat.utc_offset;
+        const end = meds_mod.nightEnd(c.quiet.effective(c.cfg.butler.quiet));
+        if (!meds_mod.inNight(bt, end, quiet_mod.minuteOf(now_s, off))) return;
+        const night = meds_mod.nightOf(now_s, off, end);
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const path = std.fs.path.join(a, &.{ c.paths.state, "bedtime" }) catch return;
+        {
+            // one at a time: two messages at once say it once
+            c.meds.mutex.lockUncancelable(c.io);
+            defer c.meds.mutex.unlock(c.io);
+            if (meds_mod.readNight(c.readOr(a, path)) == night) return;
+            util.writeReplace(c.io, path, std.fmt.allocPrint(a, "{d}\n", .{night}) catch return) catch |e| {
+                c.log.write(.chat, false, .{ .event = "bedtime not written", .why = @errorName(e) }) catch {};
+                return;
+            };
+        }
+        c.log.write(.chat, false, .{ .event = "bedtime", .conversation = conv }) catch {};
+        c.sayIn(conv, meds_mod.pastText(a, bt) catch return);
+    }
+
+    /// `/bedtime [HH:MM|off]`: config.ini's `[butler] bedtime`.
+    fn command(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        const line = "after it, your first message of the night gets one gentle line";
+        if (rest.len == 0) {
+            const bt = c.cfg.butler.bedtime orelse return "Bedtime is off. /bedtime 23:30 sets it: " ++ line ++ ".";
+            var b: [5]u8 = undefined;
+            return std.fmt.allocPrint(a, "Bedtime: {s}. After it, your first message of the night gets one gentle line. /bedtime off stops it.", .{meds_mod.clock(&b, bt)});
+        }
+        const off = std.ascii.eqlIgnoreCase(rest, "off");
+        const value: []const u8 = if (off) "off" else blk: {
+            const m = (meds_mod.parseTimes(a, rest) catch return "Use /bedtime 23:30, or /bedtime off.");
+            if (m.len != 1) return "Use /bedtime 23:30, or /bedtime off.";
+            var b: [5]u8 = undefined;
+            break :blk try a.dupe(u8, meds_mod.clock(&b, m[0]));
+        };
+        if (try setButler(c, a, "bedtime", value)) |why| return why;
+        return if (off) "Bedtime is off." else std.fmt.allocPrint(a, "Bedtime {s}: " ++ line ++ ". /bedtime off stops it.", .{value});
+    }
+};
+
+/// config.ini's `[butler] KEY = VALUE`, written whole and applied; null
+/// when it is, else what to say.
+fn setButler(c: *Core, a: std.mem.Allocator, key: []const u8, value: []const u8) !?[]const u8 {
+    const text = try mail_mod.setKey(a, c.readOr(a, c.paths.config), "butler", key, value);
+    c.writeSetting(c.paths.config, text) catch |e| return try std.fmt.allocPrint(a, "Not changed: config.ini could not be written ({s}).", .{@errorName(e)});
+    c.log.write(.config, false, .{ .event = "butler setting", .key = key, .value = value }) catch {};
+    return c.applySetup();
+}
+
 /// Minute `m` (the owner's, at +01:00) of a day to come, as Unix seconds.
 fn medAt(m: u16) i64 {
     return meds_mod.slotTime(@divFloor(quietDay(), 86400), m, 60);
@@ -23795,4 +23859,67 @@ test "members_cant_use_med" {
     try t.expectEqual(2, f.rec.countIn("anna", household.owner_only));
     try t.expectEqualStrings("No medication reminders. /med add NAME at 08:00, 20:00 sets one, with Taken each time.", try f.core.command(a, "/meds"));
     try t.expect(std.ascii.findIgnoreCase(try logText(&f), "sleeping") == null);
+}
+
+fn ownerSays(f: *Fix, text: []const u8) !void {
+    try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = text });
+}
+
+test "bedtime_says_one_gentle_line_a_night" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n[butler]\nbedtime = 23:30\nquiet = 22:00-07:00\n", "", "");
+    defer f.deinit();
+    const night = medAt(23 * 60 + 30);
+    f.core.fixed_now = night - 60;
+    try ownerSays(&f, "is the back door locked?");
+    try t.expectEqual(0, f.rec.count("It's past"));
+    // the first message after bedtime: one line, before the answer
+    f.core.fixed_now = night + 15 * 60;
+    try ownerSays(&f, "lights off please");
+    try f.rec.waitIn("main", "It's past half eleven.");
+    try ownerSays(&f, "and the heating down");
+    f.core.fixed_now = night + 3 * 3600;
+    try ownerSays(&f, "still up");
+    try t.expectEqual(1, f.rec.count("It's past"));
+    // the next night: a command or a tap doesn't count; a message does, in its own topic
+    f.core.fixed_now = night + 86400 + 10 * 60;
+    try ownerSays(&f, "/meds");
+    try t.expectEqual(1, f.rec.count("It's past"));
+    try f.core.handleIncoming(inTopic(5001, "Trips", "book the train for Friday"));
+    try f.rec.waitIn("trips", "It's past half eleven.");
+    try t.expectEqual(2, f.rec.count("It's past"));
+    // a restart keeps the night said
+    try restart(&f);
+    try f.core.setOwner(42);
+    try ownerSays(&f, "one more thing");
+    try t.expectEqual(2, f.rec.count("It's past"));
+    // morning: the night is over
+    f.core.fixed_now = night + 86400 + 8 * 3600;
+    try ownerSays(&f, "good morning");
+    try t.expectEqual(2, f.rec.count("It's past"));
+}
+
+test "bedtime_is_off_by_default" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    f.core.fixed_now = medAt(23 * 60 + 45);
+    try ownerSays(&f, "lights off please");
+    try t.expectEqual(0, f.rec.count("It's past"));
+    try t.expectEqual(1, f.core.queue.items.len);
+}
+
+test "bedtime_command_sets_and_clears" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try t.expectEqualStrings("Bedtime is off. /bedtime 23:30 sets it: after it, your first message of the night gets one gentle line.", try f.core.command(a, "/bedtime"));
+    try t.expectEqualStrings("Bedtime 23:30: after it, your first message of the night gets one gentle line. /bedtime off stops it.", try f.core.command(a, "/bedtime 23:30"));
+    try t.expectEqual(@as(?u16, 23 * 60 + 30), f.core.cfg.butler.bedtime);
+    try expectHas(fileText(&f, f.core.paths.config), "[butler]\nbedtime = 23:30\n");
+    try t.expectEqualStrings("Bedtime: 23:30. After it, your first message of the night gets one gentle line. /bedtime off stops it.", try f.core.command(a, "/bedtime"));
+    try t.expectEqualStrings("Bedtime is off.", try f.core.command(a, "/bedtime off"));
+    try t.expect(f.core.cfg.butler.bedtime == null);
+    try t.expectEqualStrings("Use /bedtime 23:30, or /bedtime off.", try f.core.command(a, "/bedtime 25:00"));
 }
