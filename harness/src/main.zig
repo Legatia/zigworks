@@ -50,6 +50,7 @@ const usage =
     \\  memory [list|pin|unpin|forget ID]
     \\  snapshot list FOLDER | take FOLDER [LABEL] | changes FOLDER ID | restore FOLDER ID
     \\                             a folder's snapshots, one now, what changed, put it back
+    \\  undo RUN                   take back the files run RUN changed
     \\  env list | check NAME | rm NAME | key NAME
     \\                             where commands can run (environments.ini): list them,
     \\                             try one, remove one's home; a remote's own SSH key
@@ -220,6 +221,7 @@ const App = struct {
         task,
         memory,
         snapshot,
+        undo,
         env,
         app,
         agent,
@@ -233,7 +235,7 @@ const App = struct {
         fn usesTools(r: Role) bool {
             return switch (r) {
                 .run, .chat, .task, .trigger, .workflow => true,
-                .brief, .memory, .snapshot, .env, .app, .agent => false,
+                .brief, .memory, .snapshot, .undo, .env, .app, .agent => false,
             };
         }
     };
@@ -340,7 +342,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "env", "app", "agent", "trigger", "workflow" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "undo", "env", "app", "agent", "trigger", "workflow" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -360,6 +362,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "task")) return taskCmd(app, rest);
     if (eql(cmd, "memory")) return memoryCmd(app, rest);
     if (eql(cmd, "snapshot")) return snapshotCmd(app, rest);
+    if (eql(cmd, "undo")) return undoCmd(app, rest);
     if (eql(cmd, "env")) return envCmd(app, rest);
     if (eql(cmd, "agent")) return agentCmd(app, rest);
     if (eql(cmd, "trigger")) return triggerCmd(app, rest);
@@ -1165,6 +1168,17 @@ fn snapshotCmd(app: *App, args: []const []const u8) !Exit {
     return .ok;
 }
 
+const undo_usage = "usage: harness undo RUN (a run's number)";
+
+/// `harness undo RUN`: the chat's /undo RUN, holding the data folder as
+/// `harness snapshot restore` does (so not while `harness run` holds it).
+fn undoCmd(app: *App, args: []const []const u8) !Exit {
+    const c = try app.open(.undo);
+    defer c.close();
+    try outPrint(app.io, "{s}\n", .{try c.command(app.arena, try std.fmt.allocPrint(app.arena, "/undo {s}", .{args[0]}))});
+    return .ok;
+}
+
 const env_usage = "usage: harness env list | env check NAME | env rm NAME | env key NAME";
 
 fn envArgsOk(rest: []const []const u8) bool {
@@ -1753,6 +1767,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     if (eql(cmd, "workflow")) return if (workflowArgsOk(rest)) null else workflow_usage;
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
+    if (eql(cmd, "undo")) return if (rest.len == 1 and (std.fmt.parseInt(u64, rest[0], 10) catch null) != null) null else undo_usage;
     if (eql(cmd, "env")) return if (envArgsOk(rest)) null else env_usage;
     if (eql(cmd, "login")) {
         if (rest.len == 0) return login_usage;
@@ -2287,6 +2302,16 @@ test "snapshot_arguments_are_checked" {
         std.debug.print("  {s}\n", .{why});
         return error.TestUnexpectedResult;
     };
+}
+
+test "undo_arguments_are_checked" {
+    for ([_][]const []const u8{
+        &.{"undo"}, &.{ "undo", "x" }, &.{ "undo", "1", "2" }, &.{ "undo", "-1" },
+    }) |line| if (badArgs(line) == null) {
+        printLine("accepted:", line);
+        return error.TestUnexpectedResult;
+    };
+    try t.expect(badArgs(&.{ "undo", "41" }) == null);
 }
 
 test "the_terminal_answers_by_id_when_several_are_open" {

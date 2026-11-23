@@ -539,7 +539,46 @@ pub const Store = struct {
         return res;
     }
 
-    const Pair = struct { name: []const u8, before: ?u64 = null, after: ?u64 = null };
+    /// A folder's "before" and "after" of a run, and how many files its
+    /// "after" counted as changed since the snapshot before it.
+    const Pair = struct { name: []const u8, before: ?u64 = null, after: ?u64 = null, changed: usize = 0 };
+
+    /// The newest run (the highest number) of `conversation` whose
+    /// snapshots show it changed files: by its pair, or, when its
+    /// "before" is gone, by what its "after" counted. Null: none kept.
+    pub fn newestRun(s: *Store, arena: std.mem.Allocator, conversation: []const u8) !?u64 {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        if (conversation.len == 0) return null;
+        var runs: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+        const root = try std.fs.path.join(arena, &.{ s.dir, "folders" });
+        var d = Io.Dir.cwd().openDir(s.io, root, .{ .iterate = true }) catch return null;
+        defer d.close(s.io);
+        var it = d.iterate();
+        while (try it.next(s.io)) |e| {
+            if (e.kind != .directory) continue;
+            const fdir = try std.fs.path.join(arena, &.{ root, e.name });
+            for (try s.ids(arena, fdir)) |id| {
+                const h = s.header(arena, fdir, id) catch continue;
+                if (h.when == .after and h.rid > 0 and std.mem.eql(u8, h.conversation, conversation)) try runs.put(arena, h.rid, {});
+            }
+        }
+        const rids = try arena.dupe(u64, runs.keys());
+        std.mem.sort(u64, rids, {}, std.sort.desc(u64));
+        for (rids) |rid| for (try s.pairsLocked(arena, rid)) |p| {
+            const after = p.after orelse continue;
+            const before = p.before orelse {
+                if (p.changed > 0) return rid;
+                continue;
+            };
+            const fdir = try s.folderDir(arena, p.name);
+            const b = s.load(arena, fdir, before) catch continue;
+            const af = s.load(arena, fdir, after) catch continue;
+            const ch = try changesBetween(arena, null, b.files, af.files);
+            if (ch.added.len + ch.changed.len + ch.removed.len > 0) return rid;
+        };
+        return null;
+    }
 
     /// The folders run `rid` snapshotted, by name: its "before" (its own,
     /// or one a helper of it took) and its "after" in each, null where
@@ -566,6 +605,7 @@ pub const Store = struct {
                 p.name = h.folder;
                 if (h.when == .after) {
                     p.after = id;
+                    p.changed = h.changed;
                 } else if (p.after == null) p.before = id;
             }
             if (p.name.len > 0) try out.append(arena, p);
@@ -1818,4 +1858,37 @@ test "a_run_whose_snapshots_were_pruned_is_too_old" {
     try t.expectEqualStrings("2", try f.get("a.md"));
     // a run never snapshotted
     try t.expect(!(try f.store.undo(a, 77, f.root, &fs)).found);
+}
+
+test "the_newest_run_with_changes_of_a_conversation" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const in = struct {
+        fn snap(fx: *Fx, when: When, rid: u64, conv: []const u8) !void {
+            _ = try fx.store.take(fx.arena.allocator(), fx.source(), .{ .when = when, .by = .{ .rid = rid, .conversation = conv } });
+        }
+    };
+    try f.put("a.md", "1");
+    // run 41 in main changes a file; run 45 in main changes nothing; run
+    // 43 in a topic changes one
+    try in.snap(&f, .before, 41, "main");
+    try f.put("a.md", "2");
+    try in.snap(&f, .after, 41, "main");
+    try in.snap(&f, .before, 43, "house-search");
+    try f.put("h.md", "h");
+    try in.snap(&f, .after, 43, "house-search");
+    try in.snap(&f, .before, 45, "main");
+    try in.snap(&f, .after, 45, "main");
+    try t.expectEqual(41, (try f.store.newestRun(a, "main")).?);
+    try t.expectEqual(43, (try f.store.newestRun(a, "house-search")).?);
+    try t.expectEqual(null, try f.store.newestRun(a, "elsewhere"));
+    // a run whose "before" is gone still counts by its "after"
+    try in.snap(&f, .before, 47, "main");
+    try f.put("a.md", "3");
+    try in.snap(&f, .after, 47, "main");
+    const fs = try folders.parse(a, "[src]\nsnapshots = 1\n");
+    _ = try f.store.prune(a, &fs);
+    try t.expectEqual(47, (try f.store.newestRun(a, "main")).?);
 }

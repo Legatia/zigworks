@@ -1670,7 +1670,7 @@ pub const Core = struct {
         const a = arena.allocator();
         var buf: [conversations.max_name]u8 = undefined;
         const conv = c.convAt(&buf, chat, thread);
-        const got = c.undoRun(a, rid, true) catch |e| return c.sayIn(conv, std.fmt.allocPrint(a, "Not undone: {s}.", .{@errorName(e)}) catch "Not undone.");
+        const got = c.undoRun(a, conv, rid, true) catch |e| return c.sayIn(conv, std.fmt.allocPrint(a, "Not undone: {s}.", .{@errorName(e)}) catch "Not undone.");
         if (!got.done) return c.sayIn(conv, got.text);
         const place: Place = .{ .name = conv, .chat = chat, .thread = thread };
         if (c.chan) |ch| {
@@ -1686,9 +1686,10 @@ pub const Core = struct {
     /// What an undo said; `done` false: refused for now (a run is going).
     const UndoSaid = struct { text: []const u8, done: bool = true };
 
-    /// Takes back run `rid`'s changes; refused while a run is going, as
+    /// Takes back run `rid_in`'s changes, or (null) those of the newest
+    /// run of `conv` with changes; refused while a run is going, as
     /// /restore is. `pressed`: from the run's Undo button.
-    fn undoRun(c: *Core, a: std.mem.Allocator, rid: u64, pressed: bool) !UndoSaid {
+    fn undoRun(c: *Core, a: std.mem.Allocator, conv: []const u8, rid_in: ?u64, pressed: bool) !UndoSaid {
         // no run may start meanwhile: the scheduler waits on
         // settings_mutex, the chat worker on queue_mutex (as for /restore)
         c.settings_mutex.lockUncancelable(c.io);
@@ -1697,9 +1698,17 @@ pub const Core = struct {
         defer c.queue_mutex.unlock(c.io);
         if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire))
             return .{ .text = if (pressed) "Not now: a run is going. Press Undo again when nothing is running." else "Not now: a run is going. Send /undo again when nothing is running.", .done = false };
+        const rid = rid_in orelse (try c.snaps.newestRun(a, conv)) orelse return .{ .text = "No run here changed files in a folder that keeps snapshots." };
         const res = try c.snaps.undo(a, rid, c.workspace, c.folderRoles());
         if (res.folders.len > 0) _ = c.snaps.prune(a, c.folderRoles()) catch {};
         return .{ .text = try undo_mod.outcome(a, rid, res, pressed) };
+    }
+
+    /// `/undo [RUN]`: takes back run RUN's changes, or those of the newest
+    /// run with changes in this conversation.
+    fn undoCommand(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        const rid: ?u64 = if (rest.len == 0) null else std.fmt.parseInt(u64, rest, 10) catch return "Use /undo, or /undo RUN with a run's number (its message's Undo, or /undo RUN in the terminal, names it).";
+        return (try c.undoRun(a, conv, rid, false)).text;
     }
 
     // ---- the inbox ----
@@ -6691,6 +6700,7 @@ pub const Core = struct {
         \\/snapshot FOLDER [LABEL]: one now
         \\/changes FOLDER ID: what changed since the one before
         \\/restore FOLDER ID: put the folder back as it was
+        \\/undo [RUN]: take back what a run changed (the newest here)
         \\/envs: where commands can run (environments.ini)
         \\/env check NAME: what a sandbox can read, write and reach
         \\/env rm NAME: remove an environment's home, snapshots and access
@@ -6868,6 +6878,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/snapshot")) return c.snapshotCommand(a, rest);
         if (eql(u8, cmd, "/changes")) return c.changesCommand(a, rest);
         if (eql(u8, cmd, "/restore")) return c.restoreCommand(a, rest);
+        if (eql(u8, cmd, "/undo")) return c.undoCommand(a, conv, rest);
         if (eql(u8, cmd, "/envs")) return c.envsText(a);
         if (eql(u8, cmd, "/env")) return c.envCommand(a, rest);
         if (eql(u8, cmd, "/agents")) return c.agentsText(a);
@@ -12760,6 +12771,86 @@ test "the_undo_button_needs_the_right_hmac_and_the_owner" {
     f.core.handleCallbackText(42, -100, 0, g.msg, g.data, "Wrote g.");
     try t.expect(!isIn(&f, notes, "g.md"));
     try t.expectEqual(1, f.rec.count(try std.fmt.allocPrint(a, "EDIT {d}: Wrote g.\n\nUndid run {d}: removed notes/g.md.", .{ g.msg, g.rid })));
+}
+
+test "undo_takes_back_the_newest_run_with_changes_here" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const notes = try withNotes(&f, "[notes]\nsnapshots = on\n");
+    // runs A and B in main, C in a topic
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/a.md\",\"content\":\"a\"}"));
+    try f.e.script(2, model.textReply("Wrote a."));
+    f.core.chatTurn("write a");
+    const run_a = try lastRunId(&f, "chat");
+    try f.e.script(3, model.toolReply("tu_2", "write_file", "{\"path\":\"notes/b.md\",\"content\":\"b\"}"));
+    try f.e.script(4, model.textReply("Wrote b."));
+    f.core.chatTurn("write b");
+    const run_b = try lastRunId(&f, "chat");
+    try f.e.script(5, model.toolReply("tu_3", "write_file", "{\"path\":\"notes/c.md\",\"content\":\"c\"}"));
+    try f.e.script(6, model.textReply("Wrote c."));
+    f.core.chatTurnIn("house-search", "write c");
+    const run_c = try lastRunId(&f, "chat");
+    try t.expect(run_a < run_b and run_b < run_c);
+    // /undo in main: the newest run there with changes, B
+    const said = try f.core.commandIn(a, "main", "/undo");
+    if (!std.mem.startsWith(u8, said, try std.fmt.allocPrint(a, "Undid run {d}: removed notes/b.md.\n/restore notes ", .{run_b}))) {
+        std.debug.print("said: {s}\n", .{said});
+        return error.TestUnexpectedResult;
+    }
+    try t.expect(isIn(&f, notes, "a.md"));
+    try t.expect(!isIn(&f, notes, "b.md"));
+    try t.expect(isIn(&f, notes, "c.md"));
+    // again: the same run, undone already
+    try t.expectEqualStrings(try std.fmt.allocPrint(a, "Run {d}'s changes are undone already.", .{run_b}), try f.core.commandIn(a, "main", "/undo"));
+    // /undo RUN: A
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, try std.fmt.allocPrint(a, "/undo {d}", .{run_a})), try std.fmt.allocPrint(a, "Undid run {d}: removed notes/a.md.", .{run_a})));
+    try t.expect(!isIn(&f, notes, "a.md"));
+    // in the topic: C
+    try t.expect(std.mem.startsWith(u8, try f.core.commandIn(a, "house-search", "/undo"), try std.fmt.allocPrint(a, "Undid run {d}: removed notes/c.md.", .{run_c})));
+    try t.expect(!isIn(&f, notes, "c.md"));
+    try t.expect(isIn(&f, notes, "old.md"));
+    // the words
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, "/undo x"), "Use /undo, or /undo RUN"));
+    try t.expectEqualStrings("Nothing kept for run 999999: too old to undo, or it changed no folder that keeps snapshots.", try f.core.command(a, "/undo 999999"));
+    try t.expectEqualStrings("No run here changed files in a folder that keeps snapshots.", try f.core.commandIn(a, "elsewhere", "/undo"));
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/help"), "/undo [RUN]") != null);
+}
+
+test "undo_is_refused_while_a_run_goes_and_when_too_old" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const notes = try withNotes(&f, "[notes]\nsnapshots = on\n");
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/a.md\",\"content\":\"a\"}"));
+    try f.e.script(2, model.textReply("Wrote a."));
+    f.core.chatTurn("write a");
+    const u = try undoButtonOf(&f, "Wrote a.");
+    // while a run is going: refused; a press says so and keeps its button
+    f.core.busy.store(true, .release);
+    try t.expectEqualStrings("Not now: a run is going. Send /undo again when nothing is running.", try f.core.command(a, try std.fmt.allocPrint(a, "/undo {d}", .{u.rid})));
+    const cleared = f.rec.cleared.items.len;
+    f.core.handleCallbackText(42, 42, 0, u.msg, u.data, "Wrote a.\n\nChanged 1 file in notes/.");
+    try t.expectEqual(1, f.rec.count("Not now: a run is going. Press Undo again when nothing is running."));
+    try t.expectEqual(cleared, f.rec.cleared.items.len);
+    f.core.busy.store(false, .release);
+    // a background run (a task, a trigger's, a workflow's) counts too
+    _ = f.core.bg_active.fetchAdd(1, .acq_rel);
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, try std.fmt.allocPrint(a, "/undo {d}", .{u.rid})), "Not now: a run is going."));
+    _ = f.core.bg_active.fetchSub(1, .acq_rel);
+    try t.expect(isIn(&f, notes, "a.md"));
+    // too old: notes keeps one snapshot, so a run's "before" goes when it ends
+    _ = try withNotes(&f, "[notes]\nsnapshots = 1\n");
+    try f.e.script(3, model.toolReply("tu_2", "write_file", "{\"path\":\"notes/o.md\",\"content\":\"o\"}"));
+    try f.e.script(4, model.textReply("Wrote o."));
+    f.core.chatTurn("write o");
+    // its reply still says what it changed, with Undo
+    const o = try undoButtonOf(&f, "Wrote o.\n\nChanged 1 file in notes/.");
+    f.core.handleCallbackText(42, 42, 0, o.msg, o.data, "Wrote o.\n\nChanged 1 file in notes/.");
+    try t.expectEqual(1, f.rec.count(try std.fmt.allocPrint(a, "EDIT {d}: Wrote o.\n\nChanged 1 file in notes/.\n\nToo old to undo: its snapshots were pruned.", .{o.msg})));
+    try t.expect(isIn(&f, notes, "o.md"));
 }
 
 test "a_secret_typed_into_a_snapshots_label_is_masked" {

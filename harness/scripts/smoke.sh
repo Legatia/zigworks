@@ -96,6 +96,11 @@ asked() {
 	echo "${q:-0}"
 }
 last_question() { grep -F '"inline_keyboard":[[' "$OUT" | tail -n 1; }
+# undo_button: "MESSAGE_ID DATA" of the last message's Undo button
+undo_button() {
+	grep -F '"callback_data":"u' "$OUT" 2>/dev/null | tail -n 1 |
+		sed -n 's/^{"method":"sendMessage","message_id":\([0-9]*\),.*"callback_data":"\(u[0-9]*-[0-9a-f]*\)".*/\1 \2/p'
+}
 # wait_asked N: until N questions have been asked
 wait_asked() {
 	i=0
@@ -345,6 +350,15 @@ say "/changes notes 2"
 check "changes says what the run added" 'wait_for "$OUT" "Since 1: added a.md."'
 say "/restore notes 1"
 check "restore puts notes back as before the run and says how to undo it" 'wait_for "$OUT" "Restored notes to 1: deleted a.md. /restore notes 3 undoes it." && [ ! -e "$HARNESS_HOME/workspace/notes/a.md" ]'
+# Undo: the reply of a run that changed files says so, with an Undo
+# button; a press takes the run's changes back and edits that message
+reply "$(call_reply tu_u1 write_file '{"path":"notes/b.md","content":"two"}')"
+reply "$(text_reply 'b written')"
+say "write b"
+check "a run's reply says what it changed and carries an Undo button" 'wait_for "$OUT" "b written" && grep -F "b written" "$OUT" | tail -n 1 | grep -qF "Changed 1 file in notes/." && undo_button | grep -qE "^[0-9]+ u[0-9]+-[0-9a-f]{16}$" && [ -f "$HARNESS_HOME/workspace/notes/b.md" ]'
+b=$(undo_button)
+inbox "{\"callback_query\":{\"id\":\"cb$inbox_n\",\"from\":{\"id\":42},\"message\":{\"message_id\":${b%% *},\"chat\":{\"id\":42},\"text\":\"b written\\n\\nChanged 1 file in notes/.\"},\"data\":\"${b#* }\"}}"
+check "Undo takes the run's changes back and edits its message" 'wait_for "$OUT" "Undid run" && grep -F "Undid run" "$OUT" | tail -n 1 | grep -qF "\"method\":\"editMessageText\"" && grep -F "Undid run" "$OUT" | tail -n 1 | grep -qF "\"message_id\":${b%% *},\"text\":\"b written\\n\\nChanged 1 file in notes/.\\n\\nUndid run " && grep -F "Undid run" "$OUT" | tail -n 1 | grep -qF "removed notes/b.md." && [ ! -e "$HARNESS_HOME/workspace/notes/b.md" ]'
 
 # two helpers' questions wait at once, each its own item; the newer is
 # answered first, and the older still waits
@@ -506,6 +520,14 @@ RPID=""
 reply "$(tool_reply tu_t2 'df -h')"
 reply "$(text_reply 'Disk is fine.')"
 check "the call allowed for a task runs on its next run" '"$H" task run disk 2>/dev/null | grep -qF "[disk] Disk is fine." && grep -qF "\"tool_use_id\":\"tu_t2\"" "$(req)" && ! result $mn tu_t2 "refused"'
+# the terminal prints /undo RUN under a run's answer that changed files,
+# and harness undo RUN takes those changes back
+reply "$(call_reply tu_u2 write_file '{"path":"notes/t.md","content":"from the terminal"}')"
+reply "$(text_reply 't written')"
+printf 'write t\n' | "$H" chat >"$T/chat-undo.out" 2>&1
+run_t=$(sed -n 's|^/undo \([0-9][0-9]*\)$|\1|p' "$T/chat-undo.out" | tail -n 1)
+check "the terminal prints /undo RUN under a run's answer that changed files" 'grep -qF "t written" "$T/chat-undo.out" && grep -qF "Changed 1 file in notes/." "$T/chat-undo.out" && [ -n "$run_t" ] && [ -f "$HARNESS_HOME/workspace/notes/t.md" ]'
+check "harness undo RUN takes them back" '"$H" undo "$run_t" 2>/dev/null | grep -qF "Undid run $run_t: removed notes/t.md." && [ ! -e "$HARNESS_HOME/workspace/notes/t.md" ]'
 check "the log chain verifies" '"$H" log verify | grep -qF "chain intact"'
 check "no secret value in the log, typed by the owner or not" '! grep -qE "og-smoke-key-123|telegram-smoke-token|brave-smoke-key|smoke-login-pass" "$HARNESS_HOME/log/actions.jsonl"'
 check "a login is removed with its secrets" '"$H" login rm bot >/dev/null && "$H" login list | grep -qF "No logins." && [ ! -e "$HARNESS_STORE/login-bot-password" ] && ! grep -qF "[bot]" "$HARNESS_HOME/logins.ini"'
