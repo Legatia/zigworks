@@ -1,5 +1,5 @@
 //! The instance's settings: config.ini (models and providers, chat,
-//! limits, memory), briefs.ini (topics and their sources) and tasks.ini
+//! limits, memory, voice notes, quiet hours), briefs.ini (topics and their sources) and tasks.ini
 //! (scheduled instructions). All three are small INI files: `[section]`,
 //! `key = value`, comments after `;` or `#`.
 const std = @import("std");
@@ -13,7 +13,7 @@ pub const Error = error{ BadConfig, OutOfMemory };
 
 /// What `parse` refuses besides a bad line: the `[provider NAME]`
 /// sections' problems, which `reason` says.
-pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider };
+pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider, BadVoice };
 
 pub const Config = struct {
     model: Model = .{},
@@ -28,6 +28,8 @@ pub const Config = struct {
     inbox: Inbox = .{},
     triggers: Triggers = .{},
     workflows: Workflows = .{},
+    voice: Voice = .{},
+    butler: Butler = .{},
     /// The `[provider NAME]` sections, in the order their names first
     /// appear (not a section of its own: `parse` reads them apart).
     providers: []const model.Section = &.{},
@@ -147,7 +149,52 @@ pub const Config = struct {
         /// for the next day.
         agent_steps_per_day: u32 = 100,
     };
+    /// Voice notes in Telegram: transcribed by an OpenAI-compatible
+    /// `/audio/transcriptions` of a provider.
+    pub const Voice = struct {
+        /// A preset or a `[provider NAME]` whose api is openai; "": off.
+        provider: []const u8 = "",
+        /// The transcription model (`whisper-large-v3-turbo` at Groq).
+        model: []const u8 = "",
+        /// The language spoken, as its ISO 639-1 code; "": the service
+        /// finds it.
+        language: []const u8 = "",
+    };
+    /// The butler's manners.
+    pub const Butler = struct {
+        /// Quiet hours, the owner's time: posts of runs nobody waits on
+        /// are held for a digest at their end; null: off until set.
+        quiet: ?Quiet = null,
+    };
 };
+
+/// Quiet hours: minutes after midnight, the owner's time; `start` is in
+/// them, `end` is not; they may go past midnight.
+pub const Quiet = struct {
+    start: u16,
+    end: u16,
+
+    /// Whether minute `m` of the day (the owner's time) is in them.
+    pub fn inside(q: Quiet, m: u16) bool {
+        if (q.start < q.end) return m >= q.start and m < q.end;
+        return m >= q.start or m < q.end;
+    }
+};
+
+/// "22:00-07:00" (spaces and an en dash too) → quiet hours.
+pub fn parseQuiet(v: []const u8) error{BadQuiet}!Quiet {
+    const dash = std.mem.indexOf(u8, v, "–") orelse std.mem.indexOfScalar(u8, v, '-') orelse return error.BadQuiet;
+    const width: usize = if (std.mem.startsWith(u8, v[dash..], "–")) "–".len else 1;
+    const start = parseClock(std.mem.trim(u8, v[0..dash], " \t")) catch return error.BadQuiet;
+    const end = parseClock(std.mem.trim(u8, v[dash + width ..], " \t")) catch return error.BadQuiet;
+    if (start == end) return error.BadQuiet;
+    return .{ .start = start, .end = end };
+}
+
+/// "22:00-07:00", as /quiet and the files write quiet hours.
+pub fn formatQuiet(buf: *[16]u8, q: Quiet) []const u8 {
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}-{d:0>2}:{d:0>2}", .{ q.start / 60, q.start % 60, q.end / 60, q.end % 60 }) catch "";
+}
 
 /// One `key = value` line, with the section it is in.
 pub const Line = struct { section: []const u8, key: []const u8, value: []const u8, n: usize };
@@ -212,7 +259,24 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
             if (std.mem.eql(u8, p.name, cfg.model.provider)) break;
         } else return error.UnknownProvider;
     }
+    if (cfg.voice.provider.len > 0) {
+        if (voiceApi(cfg, cfg.voice.provider) != .openai) return error.BadVoice;
+        if (cfg.voice.model.len == 0) return error.BadVoice;
+        const l = cfg.voice.language;
+        if (l.len > 0) {
+            if (l.len < 2 or l.len > 3) return error.BadVoice;
+            for (l) |ch| if (!std.ascii.isLower(ch)) return error.BadVoice;
+        }
+    }
     return cfg;
+}
+
+/// The format provider `name` speaks: its section's api, else its
+/// preset's; null when there is no such provider.
+fn voiceApi(cfg: Config, name: []const u8) ?model.Api {
+    for (cfg.providers) |p| if (std.mem.eql(u8, p.name, name)) if (p.api) |api| return api;
+    for (model.presets) |pr| if (std.mem.eql(u8, pr.name, name)) return pr.api;
+    return null;
 }
 
 /// What the providers are made from (`model.Providers.resolve`).
@@ -227,6 +291,7 @@ pub fn reason(e: anyerror) ?[]const u8 {
         error.BadHeader => "header = Name: value, at most 8 a provider; not Authorization or x-api-key (the key is the stored secret key = names), nor Host, Connection, Content-Length, Content-Type, Transfer-Encoding or anthropic-version",
         error.ProviderNeedsApiAndUrl => "a provider that is not a preset needs api = (anthropic or openai) and url =",
         error.UnknownProvider => "no provider has that name: use a preset (omnigate, anthropic, openrouter, opencode, openai) or a [provider NAME] section with api and url",
+        error.BadVoice => "[voice] provider = openai or a [provider NAME] section with api = openai (Groq, a whisper.cpp server), model = its transcription model (whisper-large-v3-turbo at Groq, gpt-4o-mini-transcribe at OpenAI), language = a two-letter code (pl) or nothing",
         else => null,
     };
 }
@@ -321,6 +386,8 @@ fn setField(sec: anytype, l: Line) Error!void {
                 @field(sec.*, fname) = parseOffset(l.value) catch return error.BadConfig;
             } else if (comptime std.mem.eql(u8, fname, "remind")) {
                 @field(sec.*, fname) = if (std.ascii.eqlIgnoreCase(l.value, "off")) null else parseClock(l.value) catch return error.BadConfig;
+            } else if (comptime std.mem.eql(u8, fname, "quiet")) {
+                @field(sec.*, fname) = if (std.ascii.eqlIgnoreCase(l.value, "off")) null else parseQuiet(l.value) catch return error.BadConfig;
             } else switch (ftype) {
                 []const u8 => {
                     // only omnigate's address may be left empty (not set yet)
@@ -576,6 +643,14 @@ pub const defaults_ini =
     \\[workflows]                         ; workflows (workflows/NAME.wf)
     \\instances = 50                      ; instances going at once, all workflows; past it a start is refused
     \\agent_steps_per_day = 100           ; agent steps a day, all workflows; past it they wait for the next day
+    \\
+    \\[voice]                             ; voice notes in Telegram (README: Voice notes)
+    \\; provider = groq                    ; openai, or a [provider NAME] with api = openai (Groq, a local whisper.cpp)
+    \\; model = whisper-large-v3-turbo
+    \\; language = pl                      ; the language you speak; empty: found by the service
+    \\
+    \\[butler]
+    \\; quiet = 22:00-07:00                ; quiet hours, your time: posts of schedules, triggers and workflows wait for a digest
     \\
 ;
 
@@ -1102,4 +1177,60 @@ test "workflow_settings_read" {
     try t.expectError(error.BadConfig, parse(a, "[workflows]\ninstances = 0\n"));
     try t.expectEqualDeep(d.workflows, (try parse(a, defaults_ini)).workflows);
     try t.expectEqualDeep(d.money, (try parse(a, defaults_ini)).money);
+}
+
+test "voice_settings_read_and_checked" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // off until set; harness init's file says the same
+    const d = try parse(a, "");
+    try t.expectEqualStrings("", d.voice.provider);
+    try t.expectEqualDeep(d.voice, (try parse(a, defaults_ini)).voice);
+    // Groq as a section of its own, or OpenAI's preset
+    const g = try parse(a, "[voice]\nprovider = groq\nmodel = whisper-large-v3-turbo\nlanguage = pl\n[provider groq]\napi = openai\nurl = https://api.groq.com/openai/v1\n");
+    try t.expectEqualStrings("groq", g.voice.provider);
+    try t.expectEqualStrings("whisper-large-v3-turbo", g.voice.model);
+    try t.expectEqualStrings("pl", g.voice.language);
+    const o = try parse(a, "[voice]\nprovider = openai\nmodel = gpt-4o-mini-transcribe\n");
+    try t.expectEqualStrings("", o.voice.language);
+    // a preset made to speak OpenAI's format may be one
+    _ = try parse(a, "[provider omnigate]\napi = openai\n[voice]\nprovider = omnigate\nmodel = whisper-1\n");
+    // refused: no such provider, one that speaks only Anthropic's format,
+    // no model, a language that is not a code
+    for ([_][]const u8{
+        "[voice]\nprovider = nowhere\nmodel = m\n",
+        "[voice]\nprovider = anthropic\nmodel = m\n",
+        "[voice]\nprovider = omnigate\nmodel = m\n",
+        "[provider proxy]\napi = anthropic\nurl = https://p.example.com/v1\n[voice]\nprovider = proxy\nmodel = m\n",
+        "[voice]\nprovider = openai\n",
+        "[voice]\nprovider = openai\nmodel = m\nlanguage = Polish\n",
+    }) |text| try t.expectError(error.BadVoice, parse(a, text));
+    try t.expect(reason(error.BadVoice) != null);
+    // named at its line, with why
+    const why = (try @import("core.zig").parseProblem(a, "config.ini", "[voice]\nprovider = anthropic\nmodel = m\n", parse)).?;
+    if (!std.mem.startsWith(u8, why, "config.ini line 2 has an error: provider = anthropic ([voice] provider = ")) {
+        std.debug.print("got: {s}\n", .{why});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "butler_quiet_reads_hours_or_off" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // off until set; harness init's file has the line as a comment
+    const d = try parse(a, "");
+    try t.expect(d.butler.quiet == null);
+    try t.expectEqualDeep(d.butler, (try parse(a, defaults_ini)).butler);
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "; quiet = 22:00-07:00") != null);
+    const c = try parse(a, "[butler]\nquiet = 22:00-07:00\n");
+    try t.expectEqual(22 * 60, c.butler.quiet.?.start);
+    try t.expectEqual(7 * 60, c.butler.quiet.?.end);
+    // as the README writes it, with spaces or an en dash
+    try t.expectEqual(13 * 60 + 30, (try parse(a, "[butler]\nquiet = 13:30 – 15:00\n")).butler.quiet.?.start);
+    try t.expect((try parse(a, "[butler]\nquiet = off\n")).butler.quiet == null);
+    for ([_][]const u8{ "22:00", "22:00-22:00", "25:00-07:00", "22-07", "22:00-07:00-08:00", "" }) |v| {
+        try t.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "[butler]\nquiet = {s}\n", .{v})));
+    }
 }

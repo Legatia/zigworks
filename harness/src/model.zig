@@ -392,7 +392,7 @@ pub const Client = struct {
 
     /// The path of an address http.Target.parse took, as written,
     /// without a trailing `/` ("" for none).
-    fn urlPath(url: []const u8) []const u8 {
+    pub fn urlPath(url: []const u8) []const u8 {
         var rest = url;
         if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
         var path = rest[std.mem.indexOfScalar(u8, rest, '/') orelse rest.len ..];

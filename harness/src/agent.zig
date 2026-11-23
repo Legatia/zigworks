@@ -158,6 +158,8 @@ pub const Delivery = struct {
         kept,
         /// Over its conversation's hourly limit: logged, not sent.
         held,
+        /// Quiet hours: kept for the digest at their end (`why` says when).
+        digest,
         /// Nothing to post (a scheduled run's NOTHING).
         silent,
         failed,
@@ -1782,6 +1784,7 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
         .sent => .{ .text = try std.fmt.allocPrint(a, "posted to {s} ({d} message{s}{s})", .{ target.name, d.parts, if (d.parts == 1) "" else "s", if (d.files == 0) "" else try std.fmt.allocPrint(a, ", {d} file{s}", .{ d.files, if (d.files == 1) "" else "s" }) }) },
         .kept => .{ .text = try std.fmt.allocPrint(a, "not delivered now ({s}); kept as item {d} and sent again later", .{ d.why, d.item }) },
         .held => .{ .text = try std.fmt.allocPrint(a, "not sent: {s}; it is in the log", .{d.why}), .is_error = true },
+        .digest => .{ .text = try std.fmt.allocPrint(a, "held for the digest: {s}", .{d.why}) },
         .silent => .{ .text = "nothing posted" },
         .failed => if (d.item != 0)
             .{ .text = try std.fmt.allocPrint(a, "not delivered ({s}); kept as item {d}", .{ d.why, d.item }), .is_error = true }

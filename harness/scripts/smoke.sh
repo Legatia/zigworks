@@ -135,6 +135,14 @@ url = $URL
 api = $URL
 [limits]
 approval_seconds = 30
+[provider whisper]
+api = openai
+url = $URL/v1
+auth = none
+[voice]
+provider = whisper
+model = large-v3-turbo
+language = pl
 EOF
 printf 'allow shell sleep *\nallow mcp fake/echo *\n' >"$HARNESS_HOME/rules"
 # shop: the same server, its echo a money tool capped at 10 a call
@@ -272,6 +280,17 @@ fi
 say "/remember I prefer short briefs"
 say "/memory"
 check "a remembered item is listed" 'wait_for "$OUT" "I prefer short briefs"'
+
+# a voice note: fetched from Telegram, transcribed by a local whisper
+# server (the stand-in), shown quoted, then answered as typed
+printf 'OggS-smoke-audio' >"$S/telegram/files/smokevoice"
+printf '{"text":"what is the weather"}' >"$S/transcribe/001.json"
+reply "$(text_reply 'It is sunny.')"
+inbox '{"message":{"from":{"id":42},"chat":{"id":42,"type":"private"},"voice":{"file_id":"smokevoice","duration":2,"mime_type":"audio/ogg","file_size":16}}}'
+check "a voice note is shown quoted, then answered" 'wait_for "$OUT" "It is sunny." && grep -qF "\"text\":\"\\\"what is the weather\\\"\"" "$OUT" && grep -qF "what is the weather" "$(req)" && grep -qF "OggS-smoke-audio" "$S/transcribe-requests/001.json"'
+check "the audio is in no log; the voice note line is" '! grep -qF "OggS-smoke-audio" "$HARNESS_HOME/log/actions.jsonl" && grep -qF "\"event\":\"voice note\"" "$HARNESS_HOME/log/actions.jsonl"'
+say "/quiet"
+check "quiet hours are off until set" 'wait_for "$OUT" "Quiet hours are off."'
 
 say "/status"
 check "the MCP server started" 'wait_for "$OUT" "MCP: fake (3 tools)"'

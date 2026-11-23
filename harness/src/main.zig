@@ -265,6 +265,7 @@ const App = struct {
         // each provider in use without its key or url, said once
         const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), .{ .ctx = @constCast(&sec), .get = startKey });
         for (try startNotes(app.arena, &set, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model })) |n| complain("{s}", .{n});
+        if (try voiceStartNote(app.arena, &set, cfg.voice.provider)) |n| complain("{s}", .{n});
         const c = Core.open(app.gpa, app.io, app.home, sec) catch |e| {
             switch (e) {
                 error.AlreadyRunning => complain("harness is already running on {s}; talk to it there (or stop it first)", .{app.home}),
@@ -321,6 +322,14 @@ pub fn startNotes(a: std.mem.Allocator, set: *const model.Providers, values: []c
         }
     }
     return out.items;
+}
+
+/// The voice notes' service without its key, said at start; null when
+/// none is set or its key is there (or it needs none).
+pub fn voiceStartNote(a: std.mem.Allocator, set: *const model.Providers, provider: []const u8) !?[]const u8 {
+    const p = set.find(provider) orelse return null;
+    if (p.hasKey()) return null;
+    return try std.fmt.allocPrint(a, "note: no {s} key stored under \"{s}\"; voice notes will be refused. Run: harness secret add {s}", .{ p.name, p.key_name, p.key_name });
 }
 
 pub fn main(init: std.process.Init) u8 {
@@ -441,12 +450,13 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         // the keys of the other providers in use or with a section
         const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), model.no_keys);
         const used = try set.used(app.arena, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model });
+        const voice_service = set.find(cfg.voice.provider);
         for (set.list) |*p| {
             if (std.mem.eql(u8, p.name, "omnigate") or p.auth == .none) continue;
             const has_section = for (cfg.providers) |sec| {
                 if (std.mem.eql(u8, sec.name, p.name)) break true;
             } else false;
-            if (std.mem.indexOfScalar(*const model.Provider, used, p) == null and !has_section) continue;
+            if (std.mem.indexOfScalar(*const model.Provider, used, p) == null and !has_section and voice_service != p) continue;
             const v = s.get(app.io, app.arena, p.key_name) catch null;
             try outPrint(app.io, "{s} ({s} key): {s}\n", .{ p.key_name, p.name, if (v != null) "stored" else "not stored" });
         }
@@ -812,7 +822,23 @@ const TgChan = struct {
     }
 
     fn channel(tc: *TgChan) core_mod.Channel {
-        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic };
+        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic, .file = file };
+    }
+
+    /// A file a message carried (a voice note): getFile, then the file,
+    /// through a bot of its own, so a download never holds up a send.
+    fn file(ctx: *anyopaque, a: std.mem.Allocator, file_id: []const u8, max: usize) anyerror![]u8 {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        const api = blk: {
+            tc.mutex.lockUncancelable(tc.io);
+            defer tc.mutex.unlock(tc.io);
+            break :blk try a.dupe(u8, tc.send_bot.api);
+        };
+        var bot = try telegram.Bot.init(tc.gpa, tc.io, api, tc.token);
+        defer bot.deinit();
+        const f = try bot.getFile(a, file_id);
+        if (f.size > max) return error.TooLarge;
+        return bot.download(a, f.path, max);
     }
 
     fn sendTo(ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void {
@@ -866,7 +892,7 @@ const TgChan = struct {
         if (place.chat == 0) return error.NotPaired;
         tc.mutex.lockUncancelable(tc.io);
         defer tc.mutex.unlock(tc.io);
-        return tc.send_bot.sendDocument(place.chat, place.thread, name, data) catch |e| {
+        return tc.send_bot.sendDocumentAs(place.chat, place.thread, name, data, .{ .quiet = place.quiet }) catch |e| {
             complain("telegram: sending a file failed: {s}", .{@errorName(e)});
             return if (e == error.TelegramRefused and place.thread != 0) error.TopicRefused else e;
         };
@@ -886,6 +912,26 @@ const TgChan = struct {
         tc.send_bot.answer(callback_id) catch {};
     }
 };
+
+/// One update from Telegram: a message (text, or a voice note) or a press.
+fn takeUpdate(c: *Core, tc: *TgChan, u: telegram.Update) void {
+    switch (u) {
+        .message => |m| if (m.text.len > 0 or m.voice != null) c.handleIncoming(.{
+            .from = m.from_id,
+            .chat = m.chat_id,
+            .chat_type = m.chat_type,
+            .thread = m.thread,
+            .topic = m.topic,
+            .text = m.text,
+            .reply_to = m.reply_to,
+            .voice = m.voice,
+        }) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
+        .callback => |cb| {
+            tc.answer(cb.id);
+            c.handleCallbackText(cb.from_id, cb.chat_id, cb.thread, cb.message_id, cb.data, cb.text);
+        },
+    }
+}
 
 fn ticker(c: *Core) void {
     while (!c.quitting.load(.acquire)) {
@@ -950,21 +996,7 @@ fn runCmd(app: *App) !Exit {
             offset = u.updateId() + 1;
             // saved first: after a crash an update is not handled twice
             telegram.Offset.save(app.io, c.paths.telegram, offset) catch {};
-            switch (u) {
-                .message => |m| if (m.text.len > 0) c.handleIncoming(.{
-                    .from = m.from_id,
-                    .chat = m.chat_id,
-                    .chat_type = m.chat_type,
-                    .thread = m.thread,
-                    .topic = m.topic,
-                    .text = m.text,
-                    .reply_to = m.reply_to,
-                }) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
-                .callback => |cb| {
-                    tc.answer(cb.id);
-                    c.handleCallbackText(cb.from_id, cb.chat_id, cb.thread, cb.message_id, cb.data, cb.text);
-                },
-            }
+            takeUpdate(c, &tc, u);
         }
         // a /reload among those messages may have changed the api url
         _ = tc.refresh() catch |e| complain("telegram: {s}", .{@errorName(e)});
@@ -2390,6 +2422,56 @@ test "telegram_bots_follow_a_changed_api_after_reload" {
     try t.expect(std.mem.indexOf(u8, try telegram.outbox(&e), "sent after the move") == null);
 }
 
+test "a_voice_note_from_telegram_is_transcribed_end_to_end" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const home = try testHome(&e);
+    const url = try e.url();
+    // a local whisper.cpp server at the stand-in: no key
+    const p = try core_mod.Paths.init(a, home);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.config, .data = try std.fmt.allocPrint(a, "[model]\nurl = {s}\n[search]\nurl = {s}\n[chat]\napi = {s}\n[provider whisper]\napi = openai\nurl = {s}/v1\nauth = none\n[voice]\nprovider = whisper\nmodel = large-v3-turbo\nlanguage = pl\n", .{ url, url, url, url }) });
+    const c = try Core.open(t.allocator, t.io, home, .{ .telegram = "123:abc", .omnigate = "og-key-for-tests" });
+    var tc: TgChan = undefined;
+    tc.init(t.allocator, t.io, c, c.cfg.chat.api, "123:abc") catch |err| {
+        c.close();
+        return err;
+    };
+    defer {
+        c.close();
+        tc.deinit();
+    }
+    c.attach(tc.channel());
+    try c.setOwner(42);
+    try c.startWorker();
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "telegram/files/AwACAgIAAxk", .data = "OggS-e2e-audio" });
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "transcribe/001.json", .data = "{\"text\":\"włącz światło w kuchni\"}" });
+    try e.script(1, model.textReply("Światło w kuchni jest włączone."));
+    try telegram.inbox(&e, 1, "{\"message\":{\"message_id\":5,\"from\":{\"id\":42},\"chat\":{\"id\":42,\"type\":\"private\"},\"voice\":{\"file_id\":\"AwACAgIAAxk\",\"duration\":3,\"mime_type\":\"audio/ogg\",\"file_size\":14}}}");
+    // as the poll loop takes them
+    for (try tc.poll.getUpdates(a, 0, 0)) |u| takeUpdate(c, &tc, u);
+    var waited: u32 = 0;
+    while (std.mem.indexOf(u8, try telegram.outbox(&e), "jest włączone") == null and waited < 8000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    const out = try telegram.outbox(&e);
+    if (std.mem.indexOf(u8, out, "jest włączone") == null) std.debug.print("out.jsonl:\n{s}\n", .{out});
+    // fetched from Telegram, then the quoted words without a sound, then the reply
+    try t.expect(std.mem.indexOf(u8, out, "\"method\":\"getFile\"") != null);
+    try t.expect(std.mem.indexOf(u8, out, "{\"method\":\"download\",\"path\":\"voice/AwACAgIAAxk.oga\"}") != null);
+    const heard = std.mem.indexOf(u8, out, "\"text\":\"\\\"włącz światło w kuchni\\\"\",\"link_preview_options\":{\"is_disabled\":true},\"disable_notification\":true") orelse {
+        std.debug.print("out.jsonl:\n{s}\n", .{out});
+        return error.TestUnexpectedResult;
+    };
+    try t.expect(heard < std.mem.indexOf(u8, out, "jest włączone").?);
+    // the model got the words; the stand-in got the audio, with no key
+    try t.expect(std.mem.indexOf(u8, try e.request(1), "włącz światło w kuchni") != null);
+    const sreq = try e.tmp.dir.readFileAlloc(t.io, "transcribe-requests/001.json", a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, sreq, "OggS-e2e-audio") != null);
+    try t.expect(std.mem.indexOf(u8, sreq, "Authorization") == null);
+    // the token went nowhere but the request paths
+    try t.expect(std.mem.indexOf(u8, out, "123:abc") == null);
+}
+
 test "login_add_and_rm_say_exactly_what_they_stored_and_removed" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
@@ -2456,6 +2538,8 @@ test {
     _ = @import("clone.zig");
     _ = @import("workflows.zig");
     _ = @import("wstate.zig");
+    _ = @import("voice.zig");
+    _ = @import("quiet.zig");
 }
 
 test "a_line_of_ctrl_d_leaves_the_chat_in_a_windows_console" {
@@ -2704,6 +2788,22 @@ test "start_notes_name_each_provider_in_use_without_its_key" {
     const on = try startNotes(a, &os, &.{ o.model.model, o.model.worker_model, o.model.memory_model });
     try t.expectEqual(1, on.len);
     try t.expectEqualStrings("note: no openrouter key stored under \"openrouter\"; model calls will be refused. Run: harness secret add openrouter", on[0]);
+}
+
+test "a_voice_service_without_its_key_is_named_at_start" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g = try config.parse(a, "[voice]\nprovider = groq\nmodel = whisper-large-v3-turbo\n[provider groq]\napi = openai\nurl = https://api.groq.com/openai/v1\n");
+    const gs = try model.Providers.resolve(a, config.providerSettings(g), model.no_keys);
+    try t.expectEqualStrings("note: no groq key stored under \"groq\"; voice notes will be refused. Run: harness secret add groq", (try voiceStartNote(a, &gs, g.voice.provider)).?);
+    // a local server needs none; no [voice], nothing to say
+    const l = try config.parse(a, "[voice]\nprovider = whisper\nmodel = m\n[provider whisper]\napi = openai\nurl = http://127.0.0.1:8090/v1\nauth = none\n");
+    const ls = try model.Providers.resolve(a, config.providerSettings(l), model.no_keys);
+    try t.expect((try voiceStartNote(a, &ls, l.voice.provider)) == null);
+    const d = try config.parse(a, "");
+    const ds = try model.Providers.resolve(a, config.providerSettings(d), model.no_keys);
+    try t.expect((try voiceStartNote(a, &ds, d.voice.provider)) == null);
 }
 
 test "mcp_commands_take_their_arguments" {
