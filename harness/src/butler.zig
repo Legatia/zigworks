@@ -839,7 +839,9 @@ pub const FillError = error{ UnknownPlaceholder, UnbalancedIf, OutOfMemory };
 /// indent) kept or dropped as `flags` say, then each `<key>` replaced by
 /// its value (`<Key>`: the value with a capital). A `<…>` that names no
 /// value is an error, `missing` saying which.
-pub fn fill(a: Allocator, template: []const u8, values: []const Value, flags: []const []const u8, missing: *[]const u8) FillError![]const u8 {
+pub fn fill(a: Allocator, template_in: []const u8, values: []const Value, flags: []const []const u8, missing: *[]const u8) FillError![]const u8 {
+    // a checkout made on Windows may end its lines with \r\n: read as \n
+    const template = if (std.mem.indexOf(u8, template_in, "\r\n") == null) template_in else try std.mem.replaceOwned(u8, a, template_in, "\r\n", "\n");
     var kept: std.ArrayList(u8) = .empty;
     var stack: std.ArrayList(bool) = .empty;
     var it = std.mem.splitScalar(u8, template, '\n');
@@ -1408,6 +1410,20 @@ test "routines_fill_from_the_sims_home" {
     try t.expectEqualStrings("Goodnight: when you say goodnight, or at 21:45, I switch off the lights, set the heating to 18 °C and ask with one tap before locking the front door.", try Routine.goodnight.sentence(a, p));
     try t.expectEqualStrings("Leak: when the sink leak finds water, I tell you at once, even at night, and one tap closes the water main.", try Routine.leak.sentence(a, p));
     try t.expectEqualStrings("Doors left open: when the back door stays open for 10 minutes, I tell you.", try Routine.@"door-open".sentence(a, p));
+}
+
+test "a_template_with_windows_line_ends_fills_as_with_plain_ones" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // a checkout made on Windows may end each line with \r\n
+    const plain = "step ask\n#if lock\napprove Lock <lock>\nyes Lock it\n#end\nsay Good night, <Owner>\n";
+    const windows = "step ask\r\n#if lock\r\napprove Lock <lock>\r\nyes Lock it\r\n#end\r\nsay Good night, <Owner>\r\n";
+    const values = [_]Value{ .{ .key = "lock", .value = "front_door" }, .{ .key = "owner", .value = "anna" } };
+    var missing: []const u8 = "";
+    const want = try fill(a, plain, &values, &.{"lock"}, &missing);
+    try t.expectEqualStrings("step ask\napprove Lock front_door\nyes Lock it\nsay Good night, Anna\n", want);
+    try t.expectEqualStrings(want, try fill(a, windows, &values, &.{"lock"}, &missing));
 }
 
 test "a_routine_whose_devices_are_missing_is_not_offered" {

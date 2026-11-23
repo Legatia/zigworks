@@ -1,0 +1,5 @@
+# Files harness builds in or reads byte for byte, and shell scripts, keep
+# \n line ends on every system (a Windows checkout would make them \r\n)
+harness/examples/** text eol=lf
+*.wf text eol=lf
+*.sh text eol=lf
