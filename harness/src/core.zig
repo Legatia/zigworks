@@ -25,6 +25,8 @@ const who_mod = @import("who.zig");
 const conversations = @import("conversations.zig");
 const jv = @import("jv.zig");
 const session = @import("session.zig");
+const history_mod = @import("history.zig");
+const summaries_mod = @import("summaries.zig");
 const folders_mod = @import("folders.zig");
 const environments_mod = @import("environments.zig");
 const copies = @import("copies.zig");
@@ -33,6 +35,7 @@ const remote = @import("remote.zig");
 const apps_mod = @import("apps.zig");
 const appserver = @import("appserver.zig");
 const snapshots_mod = @import("snapshots.zig");
+const undo_mod = @import("undo.zig");
 const agents = @import("agents.zig");
 const inbox_mod = @import("inbox.zig");
 const triggers = @import("triggers.zig");
@@ -473,6 +476,10 @@ pub const Core = struct {
     grants: gate.Grants,
     gate: gate.Gate,
     log: log_mod.Log,
+    /// Where runs' `history` reads the log, and the summaries' folder.
+    history_src: history_mod.Source,
+    /// The daily summaries by day, week and month: when a pass is due.
+    summary_job: summaries_mod.Job,
     mem: memory.Store,
     lock: Io.Mutex = .init,
     /// How many helpers run at once, across all runs.
@@ -674,6 +681,8 @@ pub const Core = struct {
         try c.log.setSecrets(c.secret_list);
         // without it private lines keep only sizes
         c.log.useKey(io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "log-key" })) catch {};
+        c.history_src = .{ .log_path = c.paths.log, .summaries_dir = try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "summaries" }), .summaries_on = &c.cfg.memory.summaries, .ctx = c, .shared = sharedConversation };
+        c.summary_job = .{};
         c.mem = try memory.Store.load(gpa, io, c.paths.memory);
         errdefer c.mem.deinit();
         c.mem.secrets = c.secret_list;
@@ -801,7 +810,7 @@ pub const Core = struct {
         c.watcher = null;
         c.stopRuns();
         if (c.worker) |w| w.join();
-        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
@@ -830,6 +839,7 @@ pub const Core = struct {
         for (c.start_edits.items) |e| c.gpa.free(e.text);
         c.start_edits.deinit(c.gpa);
         c.inbox.deinit();
+        c.summary_job.deinit(c.gpa);
         for (c.contexts.items) |x| c.freeContext(x);
         c.contexts.deinit(c.gpa);
         c.chat_client.deinit();
@@ -981,7 +991,7 @@ pub const Core = struct {
         c.queue_mutex.lockUncancelable(c.io);
         var queue_locked = true;
         defer if (queue_locked) c.queue_mutex.unlock(c.io);
-        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire)) return "Busy; send /reload again when nothing is running.";
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire) or c.summary_job.running.load(.acquire)) return "Busy; send /reload again when nothing is running.";
         var fresh: std.heap.ArenaAllocator = .init(c.gpa);
         const saved_cfg = c.cfg;
         const saved_rules = c.rule_list;
@@ -1522,10 +1532,17 @@ pub const Core = struct {
     }
 
     /// A button press in `chat`, topic `thread`: an item's (`i…`, see
-    /// `itemPress`) or a quick reply's (`r…`); any other press of the
-    /// owner's (an approval's from before the inbox) is out of date, and
-    /// the owner is told so.
+    /// `itemPress`), a quick reply's (`r…`) or a run's Undo (`u…`); any
+    /// other press of the owner's (an approval's from before the inbox) is
+    /// out of date, and the owner is told so.
     pub fn handleCallbackIn(c: *Core, from_id: i64, chat: i64, thread: i64, message_id: i64, data: []const u8) void {
+        c.handleCallbackText(from_id, chat, thread, message_id, data, "");
+    }
+
+    /// `handleCallbackIn`, with the text of the message the button is in
+    /// as Telegram sends it ("": not known): an Undo press edits it with
+    /// the outcome.
+    pub fn handleCallbackText(c: *Core, from_id: i64, chat: i64, thread: i64, message_id: i64, data: []const u8, text: []const u8) void {
         if (c.owner == null or from_id != c.owner.?) {
             c.log.write(.chat, false, .{ .event = "dropped", .from = from_id, .why = "button from someone else" }) catch {};
             return;
@@ -1535,6 +1552,7 @@ pub const Core = struct {
             return;
         }
         if (data.len > 0 and data[0] == 'i') return c.itemPress(chat, thread, message_id, data);
+        if (data.len > 0 and data[0] == 'u') return c.undoPress(chat, thread, message_id, data, text);
         if (data.len > 1 and data[0] == 's') if (std.fmt.parseInt(u64, data[1..], 10)) |id| return c.showPress(chat, thread, id) else |_| {};
         c.tellOutOfDate(chat, thread, message_id);
     }
@@ -1613,16 +1631,17 @@ pub const Core = struct {
         };
     }
 
-    /// Sends a post with quick replies to `conv`: the text in messages of
-    /// 4096 bytes, the buttons on the last; the post is noted so a press of
-    /// one counts.
-    fn sendWithButtons(c: *Core, a: std.mem.Allocator, conv: []const u8, agent_name: []const u8, text_in: []const u8, labels: []const []const u8) !Sent {
+    /// Sends a post with quick replies (and `extra`, a run's Undo) to
+    /// `conv`: the text in messages of 4096 bytes, the buttons on the last;
+    /// the post is noted so a press of a quick reply counts.
+    fn sendWithButtons(c: *Core, a: std.mem.Allocator, conv: []const u8, agent_name: []const u8, text_in: []const u8, labels: []const []const u8, extra: ?[2][]const u8) !Sent {
         const ch = c.chan orelse return error.NoChannel;
         const r = try c.placeOf(a, conv);
         const text = if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text_in }) else text_in;
-        const n = try c.quickPost(conv, agent_name, labels, text_in);
-        const bs = try a.alloc([2][]const u8, labels.len);
-        for (labels, bs, 1..) |l, *b, i| b.* = .{ l, try std.fmt.allocPrint(a, "r{d}-{s}:{d}", .{ n, &c.approval_nonce, i }) };
+        const n = if (labels.len > 0) try c.quickPost(conv, agent_name, labels, text_in) else 0;
+        const bs = try a.alloc([2][]const u8, labels.len + @intFromBool(extra != null));
+        for (labels, bs[0..labels.len], 1..) |l, *b, i| b.* = .{ l, try std.fmt.allocPrint(a, "r{d}-{s}:{d}", .{ n, &c.approval_nonce, i }) };
+        if (extra) |e| bs[labels.len] = e;
         const parts = try questionParts(a, text);
         var sent: Sent = .{};
         for (parts[0 .. parts.len - 1]) |part| {
@@ -1631,7 +1650,7 @@ pub const Core = struct {
             sent.count += s.count;
         }
         const id = ch.buttons(ch.ctx, r.place, parts[parts.len - 1], bs) orelse return error.ButtonsNotSent;
-        c.quickShown(n, id, r.place);
+        if (labels.len > 0) c.quickShown(n, id, r.place);
         if (sent.count == 0) sent.first = id;
         sent.count += 1;
         return sent;
@@ -1642,6 +1661,88 @@ pub const Core = struct {
         c.log.write(.chat, false, .{ .event = "button out of date", .message = message_id }) catch {};
         var buf: [conversations.max_name]u8 = undefined;
         c.sayIn(c.convAt(&buf, chat, thread), "That button is out of date: it answers nothing.");
+    }
+
+    // ---- undo ----
+
+    const UndoParts = struct { text: []const u8, button: ?[2][]const u8 = null };
+
+    /// A run's message that changed files: `text` with what it changed at
+    /// its end, and its Undo button (with no log key to check a press,
+    /// `/undo RUN` in the text instead).
+    fn undoParts(c: *Core, a: std.mem.Allocator, text: []const u8, ch: *const agent.Changed) !UndoParts {
+        const key = if (c.log.key) |*k| k else return .{ .text = try std.fmt.allocPrint(a, "{s}\n\n{s} /undo {d}", .{ text, ch.line(), ch.rid }) };
+        const buf = try a.create([48]u8);
+        return .{ .text = try std.fmt.allocPrint(a, "{s}\n\n{s}", .{ text, ch.line() }), .button = .{ undo_mod.label, undo_mod.data(buf, key, ch.rid) } };
+    }
+
+    /// Harness's own line at the end of a run that ended early (a limit,
+    /// an error) to `conv`: with what the run changed and Undo, as its
+    /// reply would have been.
+    fn sendRunEnd(c: *Core, run: *const agent.Run, conv: []const u8, text: []const u8) !void {
+        if (run.changed.files == 0) return c.deliverIn(conv, text);
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const u = try c.undoParts(a, text, &run.changed);
+        if (u.button) |b| {
+            _ = try c.sendWithButtons(a, conv, "", u.text, &.{}, b);
+        } else try c.deliverIn(conv, u.text);
+    }
+
+    /// A press of a run's Undo (`u<run>-<token>`): the token checked with
+    /// the log's key (a bad one is out of date); the owner's press (checked
+    /// before) takes back the run's changes and its message is edited with
+    /// the outcome, or, while a run is going, it is said and the button
+    /// stays.
+    fn undoPress(c: *Core, chat: i64, thread: i64, message_id: i64, data: []const u8, text: []const u8) void {
+        const key = if (c.log.key) |*k| k else return c.tellOutOfDate(chat, thread, message_id);
+        const rid = undo_mod.check(key, data) orelse return c.tellOutOfDate(chat, thread, message_id);
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var buf: [conversations.max_name]u8 = undefined;
+        const conv = c.convAt(&buf, chat, thread);
+        const got = c.undoRun(a, conv, rid, true) catch |e| return c.sayIn(conv, std.fmt.allocPrint(a, "Not undone: {s}.", .{@errorName(e)}) catch "Not undone.");
+        if (!got.done) return c.sayIn(conv, got.text);
+        const place: Place = .{ .name = conv, .chat = chat, .thread = thread };
+        if (c.chan) |ch| {
+            if (text.len > 0) if (ch.edit) |edit| {
+                const new = undo_mod.edited(a, text, got.text, message_max) catch text;
+                return edit(ch.ctx, place, message_id, new);
+            };
+            ch.clear(ch.ctx, place, message_id);
+        }
+        c.sayIn(conv, got.text);
+    }
+
+    /// What an undo said; `done` false: refused for now (a run is going).
+    const UndoSaid = struct { text: []const u8, done: bool = true };
+
+    /// Takes back run `rid_in`'s changes, or (null) those of the newest
+    /// run of `conv` with changes; refused while a run is going, as
+    /// /restore is. `pressed`: from the run's Undo button.
+    fn undoRun(c: *Core, a: std.mem.Allocator, conv: []const u8, rid_in: ?u64, pressed: bool) !UndoSaid {
+        // no run may start meanwhile: the scheduler waits on
+        // settings_mutex, the chat worker on queue_mutex (as for /restore)
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
+        c.queue_mutex.lockUncancelable(c.io);
+        defer c.queue_mutex.unlock(c.io);
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire))
+            return .{ .text = if (pressed) "Not now: a run is going. Press Undo again when nothing is running." else "Not now: a run is going. Send /undo again when nothing is running.", .done = false };
+        const rid = rid_in orelse (try c.snaps.newestRun(a, conv)) orelse return .{ .text = "No run here changed files in a folder that keeps snapshots." };
+        const res = try c.snaps.undo(a, rid, c.workspace, c.folderRoles());
+        if (res.folders.len > 0) _ = c.snaps.prune(a, c.folderRoles()) catch {};
+        // a group reads the outcome too: counts and folders, not file names
+        return .{ .text = try undo_mod.outcomeFor(a, rid, res, pressed, c.isShared(conv)) };
+    }
+
+    /// `/undo [RUN]`: takes back run RUN's changes, or those of the newest
+    /// run with changes in this conversation.
+    fn undoCommand(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        const rid: ?u64 = if (rest.len == 0) null else std.fmt.parseInt(u64, rest, 10) catch return "Use /undo, or /undo RUN with a run's number (its message's Undo, or /undo RUN in the terminal, names it).";
+        return (try c.undoRun(a, conv, rid, false)).text;
     }
 
     // ---- the inbox ----
@@ -2692,6 +2793,7 @@ pub const Core = struct {
             .grants_path = c.paths.grants,
             .log = &c.log,
             .mem = &c.mem,
+            .history = &c.history_src,
             .lock = &c.lock,
             .env = .{
                 .gpa = c.gpa,
@@ -2805,6 +2907,8 @@ pub const Core = struct {
         srv: ?*mcp.Server = null,
         err: anyerror = error.NotStarted,
         diag: mcp.Diag = .{},
+        /// A server at a url: its token or its sign-in.
+        auth: mcp.Auth = .none,
 
         fn run(st: *McpStart) void {
             const c = st.core;
@@ -2819,6 +2923,7 @@ pub const Core = struct {
                 .diag = &st.diag,
                 .stop = st.stop,
                 .updated = .{ .ctx = c, .f = resourceUpdated },
+                .auth = st.auth,
             }) catch |e| {
                 st.err = e;
                 return;
@@ -2872,6 +2977,23 @@ pub const Core = struct {
                 break;
             };
             if (st.skipped != null) continue;
+            // a server at a url: its stored token, or its sign-in
+            switch (mcp.kindOf(sc)) {
+                .token => st.auth = .{ .token = .{ .name = sc.token, .value = c.secretValue(a, sc.token) orelse {
+                    st.skipped = std.fmt.allocPrint(a, "token \"{s}\" is not stored (harness secret add {s})", .{ sc.token, sc.token }) catch "its token is not stored";
+                    continue;
+                } } },
+                .signin => {
+                    var nb: [40]u8 = undefined;
+                    const signed = if (c.store) |store| (store.get(c.io, a, mcp.signinSecret(&nb, sc.name)) catch null) != null else false;
+                    if (!signed) {
+                        st.skipped = std.fmt.allocPrint(a, "not signed in (harness mcp login {s})", .{sc.name}) catch "not signed in";
+                        continue;
+                    }
+                    st.auth = .{ .signin = .{ .store = c.store.?, .masks = &c.masks } };
+                },
+                else => {},
+            }
             st.values = values;
             st.dir = c.mcpDir(a, sc.name) catch |e| {
                 st.skipped = std.fmt.allocPrint(a, "did not start (its folder: {s})", .{@errorName(e)}) catch "did not start";
@@ -2931,6 +3053,20 @@ pub const Core = struct {
         c.mcp_tools = all.items;
         c.mcp_note = note.items;
         c.mcp_warn = warn.items;
+    }
+
+    /// What /status says of the MCP servers: what started, and the
+    /// servers at a url whose sign-in was refused since.
+    fn mcpStatus(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, std.mem.trimEnd(u8, c.mcp_note, "\n"));
+        c.mcp_mutex.lockUncancelable(c.io);
+        defer c.mcp_mutex.unlock(c.io);
+        for (c.mcp_servers.items) |srv| if (srv.signInRefused()) {
+            if (out.items.len > 0) try out.append(a, '\n');
+            try out.print(a, "{s}: the sign-in was refused (harness mcp login {s})", .{ srv.name, srv.name });
+        };
+        return out.items;
     }
 
     /// A client for a model value: "PROVIDER:MODEL", or a model of
@@ -3093,7 +3229,7 @@ pub const Core = struct {
         // said in harness's words, never with working text; else the
         // model's last text is the reply, through the same path as a send
         if (!res.stopped and !res.replied) {
-            if (res.ended_by) |why| c.sayIn(conv, why) else c.implicitReply(&run, arena.allocator(), conv, res.text);
+            if (res.ended_by) |why| c.sendRunEnd(&run, conv, why) catch {} else c.implicitReply(&run, arena.allocator(), conv, res.text);
         }
         if (!private) x.turns_since_memory += 1;
     }
@@ -3241,12 +3377,15 @@ pub const Core = struct {
     }
 
     fn postShaped(c: *Core, a: std.mem.Allocator, o: *RunOut, sc: ?*Sched, p: *const agent.Post) agent.Delivery {
-        const text = if (sc) |x|
+        const shaped = if (sc) |x|
             c.shapeReply(a, o, x, p.text) orelse return .{ .status = .silent }
         else if (o.tag.len > 0) std.fmt.allocPrint(a, "{s}{s}", .{ o.tag, p.text }) catch p.text else p.text;
+        // a run that changed files: what it changed at the end, and Undo
+        const undo = if (p.changed) |ch| c.undoParts(a, shaped, ch) catch UndoParts{ .text = shaped } else UndoParts{ .text = shaped };
+        const text = undo.text;
         c.ensureTopic(a, p.to);
         if (c.overHourly(a, p.to)) |why| return .{ .status = .held, .why = why };
-        const sending = if (p.buttons.len > 0) c.sendWithButtons(a, p.to, o.agent, text, p.buttons) else c.sendText(p.to, text);
+        const sending = if (p.buttons.len > 0 or undo.button != null) c.sendWithButtons(a, p.to, o.agent, text, p.buttons, undo.button) else c.sendText(p.to, text);
         const sent = sending catch |e| {
             // kept as an item, to be sent again as it is: nothing runs again for it
             const r = o.run;
@@ -3724,6 +3863,8 @@ pub const Core = struct {
         c.remindDue(now_s);
         // due triggers are polled, one at a time, on a thread of their own
         if (c.poller_on) c.startPoller(now_s);
+        // the daily summaries, where triggers are polled, on a thread of their own
+        if (c.poller_on) c.summariesDue(now_s);
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
         // posts that did not get through go again when their wait is over
@@ -4908,6 +5049,60 @@ pub const Core = struct {
         }
     }
 
+    /// The daily summaries ([memory] summaries): a pass at 03:00 the
+    /// owner's time or the first tick after, and again when a failed
+    /// call's wait is over; on a thread of its own, so chat never waits.
+    fn summariesDue(c: *Core, now_s: i64) void {
+        if (!c.cfg.memory.summaries or c.restarting.load(.acquire)) return;
+        if (!c.summary_job.due(now_s, c.cfg.chat.utc_offset)) return;
+        if (c.summary_job.running.swap(true, .acq_rel)) return;
+        const th = std.Thread.spawn(.{}, summaryThread, .{c}) catch {
+            c.summary_job.running.store(false, .release);
+            return;
+        };
+        th.detach();
+    }
+
+    fn summaryThread(c: *Core) void {
+        defer c.summary_job.running.store(false, .release);
+        c.summarizeNow();
+    }
+
+    /// One pass of the daily summaries, on this thread.
+    fn summarizeNow(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        // what it needs of the settings, under their lock (a /reload
+        // waits for the pass to end)
+        c.settings_mutex.lockUncancelable(c.io);
+        const utc_offset = c.cfg.chat.utc_offset;
+        var client = c.modelClient(if (c.cfg.memory.summary_model.len > 0) c.cfg.memory.summary_model else c.cfg.model.memory_model, 1024) catch |e| {
+            c.settings_mutex.unlock(c.io);
+            c.log.write(.memory, false, .{ .event = "summaries failed", .why = @errorName(e) }) catch {};
+            return;
+        };
+        c.settings_mutex.unlock(c.io);
+        defer client.deinit();
+        c.summary_job.pass(.{
+            .gpa = c.gpa,
+            .io = c.io,
+            .log_path = c.paths.log,
+            .dir = c.history_src.summaries_dir,
+            .now_s = c.now(),
+            .utc_offset = utc_offset,
+            .client = &client,
+            .log = &c.log,
+            .secrets = c.masks.snapshot(arena.allocator()) catch c.secret_list,
+            .private = .{ .ctx = c, .is = conversationIsPrivate },
+            .stop = &c.stop,
+        });
+    }
+
+    fn conversationIsPrivate(ctx: *anyopaque, name: []const u8) bool {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.convPrivate(name);
+    }
+
     /// The name (in `buf`) of an event trigger due at `now_s`, not paused.
     fn nextDue(c: *Core, buf: *[80]u8, now_s: i64) ?[]const u8 {
         c.trig_mutex.lockUncancelable(c.io);
@@ -5624,7 +5819,7 @@ pub const Core = struct {
     /// when it did not get through.
     fn triggerMessage(c: *Core, run: *const agent.Run, tr: triggers.Trigger, msg: []const u8) void {
         const where = if (c.isShared(tr.to)) "main" else tr.to;
-        c.deliverIn(where, msg) catch |e| {
+        c.sendRunEnd(run, where, msg) catch |e| {
             _ = c.keepDelivery(.{ .to = where, .text = msg, .retry = worthRetry(e), .who = run.who, .rid = run.rid, .label = run.label, .private = run.isPrivate() });
         };
     }
@@ -5781,7 +5976,7 @@ pub const Core = struct {
     /// a delivery item when it did not get through.
     fn taskMessage(c: *Core, run: *const agent.Run, tk: config.Task, keep: ?Keep, msg: []const u8) !Outcome {
         const where = if (c.isShared(tk.to)) "main" else tk.to;
-        c.deliverIn(where, msg) catch |e| {
+        c.sendRunEnd(run, where, msg) catch |e| {
             try c.log.write(.task, false, .{ .name = tk.name, .event = "done", .sent = false, .why = whyUndelivered(e) });
             _ = c.keepDelivery(.{ .to = where, .text = msg, .keep = keep, .retry = worthRetry(e), .who = run.who, .rid = run.rid, .label = run.label, .private = run.isPrivate() });
             return if (worthRetry(e)) .undelivered else .done;
@@ -6641,6 +6836,12 @@ pub const Core = struct {
         }
     }
 
+    /// `history`'s question: do others read conversation `name`?
+    fn sharedConversation(ctx: ?*anyopaque, name: []const u8) bool {
+        const c: *Core = @ptrCast(@alignCast(ctx.?));
+        return c.isShared(name);
+    }
+
     // ---- commands ----
 
     const help_text =
@@ -6667,6 +6868,7 @@ pub const Core = struct {
         \\/snapshot FOLDER [LABEL]: one now
         \\/changes FOLDER ID: what changed since the one before
         \\/restore FOLDER ID: put the folder back as it was
+        \\/undo [RUN]: take back what a run changed (the newest here)
         \\/envs: where commands can run (environments.ini)
         \\/env check NAME: what a sandbox can read, write and reach
         \\/env rm NAME: remove an environment's home, snapshots and access
@@ -6677,6 +6879,7 @@ pub const Core = struct {
         \\/conversation rename OLD NEW, /conversation rm NAME
         \\/conversation add NAME: sent in a group, the agent may post there
         \\/session [N]: the steps behind the last answer here (N runs back)
+        \\/history WORDS: earlier turns with every word, newest first
         \\/apps: the apps, with their links while the app server runs
         \\/app approve NAME: serve an app as its files are now
         \\/app rm NAME: remove an app, its data and its versions
@@ -6721,6 +6924,7 @@ pub const Core = struct {
             // folders that got no snapshot, and why
             var snap_note = std.mem.trimEnd(u8, try c.snaps.note(a), "\n");
             snap_note = try std.mem.replaceOwned(u8, a, snap_note, "\n", "; ");
+            const mcp_text = try c.mcpStatus(a);
             return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.\nProviders: {s}.{s}{s}{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
                 onOff(c.switches.auto_recall.load(.acquire)), onOff(c.convPrivate(conv)),
@@ -6728,8 +6932,8 @@ pub const Core = struct {
                 if (c.browser.len == 0) "none found" else "found",
                 c.login_list.len,
                 try c.providers.describe(a, &.{ c.cfg.model.model, c.cfg.model.worker_model, c.cfg.model.memory_model }),
-                if (c.mcp_note.len > 0) "\nMCP: " else "",
-                std.mem.trimEnd(u8, c.mcp_note, "\n"),
+                if (mcp_text.len > 0) "\nMCP: " else "",
+                mcp_text,
                 if (snap_note.len > 0) "\nSnapshots: " else "",
                 snap_note,
             });
@@ -6831,6 +7035,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/logins")) return c.loginsText(a);
         if (eql(u8, cmd, "/conversations")) return c.conversationsText(a);
         if (eql(u8, cmd, "/session")) return c.sessionText(a, conv, rest);
+        if (eql(u8, cmd, "/history")) return c.historyText(a, conv, rest);
         if (eql(u8, cmd, "/inbox")) return c.inboxCommand(a, conv);
         if (eql(u8, cmd, "/answer")) return c.answerCommand(a, conv, rest);
         if (eql(u8, cmd, "/grants")) return c.grantsText(a);
@@ -6844,6 +7049,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/snapshot")) return c.snapshotCommand(a, rest);
         if (eql(u8, cmd, "/changes")) return c.changesCommand(a, rest);
         if (eql(u8, cmd, "/restore")) return c.restoreCommand(a, rest);
+        if (eql(u8, cmd, "/undo")) return c.undoCommand(a, conv, rest);
         if (eql(u8, cmd, "/envs")) return c.envsText(a);
         if (eql(u8, cmd, "/env")) return c.envCommand(a, rest);
         if (eql(u8, cmd, "/agents")) return c.agentsText(a);
@@ -6878,6 +7084,21 @@ pub const Core = struct {
         const text = session.tail(c.io, a, c.paths.log, 4 << 20) catch |e| return std.fmt.allocPrint(a, "The log can't be read: {s}", .{@errorName(e)});
         const rid = (try session.lastRunIn(a, text, conv, back)) orelse return "No run here in the log's last 4 MB.";
         return (try session.render(a, text, rid, 3500)) orelse "No run here in the log's last 4 MB.";
+    }
+
+    /// `/history WORDS`: the turns that have every word (or a phrase in
+    /// double quotes), newest first, as the owner's runs here may see
+    /// them, in one message.
+    fn historyText(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        const terms = try history_mod.parseTerms(a, rest);
+        if (terms.len == 0) return "Use /history WORDS: the turns that have every word, newest first; a phrase goes in double quotes.";
+        const scope = c.history_src.scopeOf("owner", conv);
+        const found = history_mod.search(a, c.io, c.paths.log, scope, .{ .terms = terms }) catch |e| switch (e) {
+            error.FileNotFound => history_mod.Found{ .hits = &.{} },
+            else => return std.fmt.allocPrint(a, "The log can't be read: {s}", .{@errorName(e)}),
+        };
+        // the log was masked with the values of its time; these are today's
+        return c.masks.scrubAlloc(a, try history_mod.render(a, c.io, c.paths.log, found, terms, c.cfg.chat.utc_offset, 3500, scope));
     }
 
     /// A line per conversation: its name, where it is, private, last used.
@@ -9066,7 +9287,13 @@ pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, co
     // what the parser says of that line (the lines up to it are fine)
     _ = scratch.reset(.retain_capacity);
     const why: ?[]const u8 = if (parseFn(scratch.allocator(), text[0 .. it.index orelse text.len])) |_| null else |e| rules.reason(e) orelse mcp.configReason(e) orelse folders_mod.reason(e) orelse environments_mod.reason(e) orelse config.reason(e);
-    return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(std.mem.trim(u8, line, " \t\r"), 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
+    var shown = std.mem.trim(u8, line, " \t\r");
+    // a header's value is never said back: it may be a token
+    if (std.mem.startsWith(u8, shown, "header")) if (std.mem.indexOfScalar(u8, shown, '=')) |eq| if (std.mem.trim(u8, shown["header".len..eq], " \t").len == 0) {
+        const colon = std.mem.indexOfScalarPos(u8, shown, eq, ':') orelse eq;
+        shown = try std.fmt.allocPrint(a, "{s} …", .{shown[0 .. colon + 1]});
+    };
+    return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(shown, 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
 }
 
 /// The first line of `text` that does not read: the one after the longest
@@ -10166,8 +10393,14 @@ test "an_attachment_outside_the_workspace_or_holding_a_stored_secret_is_refused"
     try t.expectEqual(0, f.rec.count("a leak"));
     try t.expectEqual(0, f.rec.count("the settings"));
     try t.expect(std.mem.indexOf(u8, try logText(&f), "og-key-for-tests") == null);
-    const sends = try sendLines(&f);
-    try t.expect(std.mem.indexOf(u8, sends[sends.len - 1], "\"files\":\"flats.csv\"") != null);
+    // the post arrives a moment before its send line is written
+    var waited: u32 = 0;
+    const last = while (waited < 5000) : (waited += 20) {
+        const sends = try sendLines(&f);
+        if (sends.len > 0 and std.mem.indexOf(u8, sends[sends.len - 1], "\"files\":\"flats.csv\"") != null) break sends[sends.len - 1];
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    } else "";
+    try t.expect(std.mem.indexOf(u8, last, "\"files\":\"flats.csv\"") != null);
 }
 
 test "a_file_in_a_folder_the_run_may_not_read_is_not_posted" {
@@ -10351,6 +10584,139 @@ test "session_shows_the_last_run_here_and_only_labels_for_a_private_one" {
         try t.expect(l.len <= 3500);
         try t.expect(std.mem.indexOf(u8, l, "harness log session ") != null);
     };
+}
+
+test "history_keeps_to_what_the_run_may_see" {
+    var f: Fix = undefined;
+    try f.init("", "", "[digest]\nat = 23:59\nto = family\ndo = Post the flats digest.\n[watch]\nat = 23:59\nto = house-search\ndo = Look for news on the flats.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow send family\n" });
+    _ = try f.core.reload();
+    try addTopic(&f, "house-search", 5012);
+    try addGroup(&f, "family", -100);
+    // a turn in main, one in a topic, a scheduled post where others read
+    try f.e.script(1, model.textReply("Seefeld has two flats."));
+    f.core.chatTurnIn("main", "flats in Seefeld?");
+    try f.e.script(2, model.textReply("Basel flats cost more."));
+    f.core.chatTurnIn("house-search", "flats in Basel?");
+    try f.e.script(3, model.textReply("Digest: the flats of the week."));
+    _ = try f.core.runTask(f.core.tasks[0]);
+    try f.rec.waitIn("family", "Digest: the flats of the week.");
+    const main_rid = (try session.lastRunIn(a, try logText(&f), "main", 1)).?;
+    // the owner's run in main searches every conversation
+    try f.e.script(4, model.toolReply("tu_h", "history", "{\"words\":\"flats\"}"));
+    try f.e.script(5, model.textReply("Found them."));
+    f.core.chatTurnIn("main", "what did we find on flats?");
+    const all = try f.e.request(5);
+    for ([_][]const u8{ "flats in Seefeld?", "flats in Basel?", "Post the flats digest." }) |said| {
+        if (std.mem.indexOf(u8, all, said) == null) std.debug.print("missing {s} in {s}\n", .{ said, all });
+        try t.expect(std.mem.indexOf(u8, all, said) != null);
+    }
+    // a scheduled run searches its own conversation (its to), and sees no other run
+    try f.e.script(6, model.toolReply("tu_w", "history", "{\"words\":\"flats\"}"));
+    try f.e.script(7, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_r\",\"name\":\"history\",\"input\":{{\"words\":\"flats\",\"run\":{d}}}}}],\"stop_reason\":\"tool_use\"}}", .{main_rid}));
+    try f.e.script(8, model.textReply("NOTHING"));
+    _ = try f.core.runTask(f.core.tasks[1]);
+    const own = try f.e.request(7);
+    try t.expect(std.mem.indexOf(u8, own, "flats in Basel?") != null);
+    for ([_][]const u8{ "flats in Seefeld?", "Post the flats digest." }) |said| try t.expect(std.mem.indexOf(u8, own, said) == null);
+    try t.expect(std.mem.indexOf(u8, own, "Only house-search is searched from here.") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(8), try std.fmt.allocPrint(a, "No run {d} in house-search.", .{main_rid})) != null);
+}
+
+test "a_private_conversations_words_are_never_found" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addTopic(&f, "diary", 5014);
+    try f.core.handleTextIn("diary", "/private on");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.workspace, "plans.txt" }), .data = "a garden party at the lake" });
+    try f.e.script(1, model.toolReply("tu_1", "read_file", "{\"path\":\"plans.txt\"}"));
+    try f.e.script(2, model.textReply("Kept between us: the party by the lake."));
+    f.core.chatTurnIn("diary", "my secret plans for the summer");
+    const diary_rid = (try session.lastRunIn(a, try logText(&f), "diary", 1)).?;
+    // from main every conversation is searched: the diary's words are not in the log
+    try f.e.script(3, model.toolReply("tu_h", "history", "{\"words\":\"lake\"}"));
+    try f.e.script(4, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_r\",\"name\":\"history\",\"input\":{{\"words\":\"plans\",\"run\":{d}}}}}],\"stop_reason\":\"tool_use\"}}", .{diary_rid}));
+    try f.e.script(5, model.textReply("Nothing."));
+    f.core.chatTurnIn("main", "what did I plan?");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "No turn has all of: lake.") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), try std.fmt.allocPrint(a, "Run {d} is private: what was said in it is not in the log.", .{diary_rid})) != null);
+    const log = try logText(&f);
+    for ([_][]const u8{ "my secret plans", "garden party", "at the lake", "Kept between us" }) |said| try t.expect(std.mem.indexOf(u8, log, said) == null);
+}
+
+test "the_history_command_finds_old_turns" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "house-search", 5012);
+    try f.e.script(1, model.textReply("Seefeld has two flats."));
+    f.core.chatTurnIn("house-search", "flats in Seefeld?");
+    const rid = (try session.lastRunIn(f.e.arena.allocator(), try logText(&f), "house-search", 1)).?;
+    // the owner's command: every conversation, newest first, in one message
+    try f.core.handleTextIn("main", "/history seefeld FLATS");
+    try f.rec.waitIn("main", "1 turn, newest first (the owner's time):");
+    try t.expectEqual(1, f.rec.countIn("main", try std.fmt.allocPrint(f.e.arena.allocator(), ", house-search, run {d} (chat)\nOwner: flats in Seefeld?\nAgent: Seefeld has two flats.\n", .{rid})));
+    try f.core.handleTextIn("main", "/history \"two flats in\"");
+    try f.rec.waitIn("main", "No turn has all of: two flats in.");
+    try f.core.handleTextIn("main", "/history");
+    try f.rec.waitIn("main", "Use /history WORDS");
+}
+
+/// Waits until no summaries pass is going.
+fn waitSummaries(c: *Core) void {
+    var waited: u32 = 0;
+    while (c.summary_job.running.load(.acquire) and waited < 8000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+}
+
+test "summaries_off_makes_no_calls" {
+    var f: Fix = undefined;
+    try f.init("[memory]\nsummaries = off\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.script(1, model.textReply("Seefeld has two flats."));
+    f.core.chatTurnIn("main", "flats in Seefeld?");
+    // the day after tomorrow, 03:30 the owner's time, where harness runs
+    f.core.fixed_now = (@divFloor(util.nowSeconds(t.io), 86400) + 2) * 86400 + 3 * 3600 + 1800;
+    f.core.poller_on = true;
+    f.core.tick();
+    waitSummaries(f.core);
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().access(t.io, f.core.history_src.summaries_dir, .{}));
+    // on: one call for the day, with the memory model, and its file
+    f.core.cfg.memory.summaries = true;
+    try f.e.script(2, model.textReply("The owner looked for flats in Seefeld."));
+    f.core.tick();
+    waitSummaries(f.core);
+    try t.expectEqual(2, f.e.server.modelRequests());
+    const req = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req, "\"model\":\"claude-haiku\"") != null);
+    try t.expect(std.mem.indexOf(u8, req, "] Owner: flats in Seefeld?\\nAgent: Seefeld has two flats.") != null);
+    var d = try Io.Dir.cwd().openDir(t.io, try std.fs.path.join(a, &.{ f.core.history_src.summaries_dir, "main", "day" }), .{ .iterate = true });
+    defer d.close(t.io);
+    var it = d.iterate();
+    const e = (try it.next(t.io)).?;
+    try t.expectEqualStrings("The owner looked for flats in Seefeld.\n", try d.readFileAlloc(t.io, e.name, a, .unlimited));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"kind\":\"memory\",\"event\":\"summary\",\"conversation\":\"main\",\"period\":\"") != null);
+    // the prompt carries it; with summaries off, not (the file stays)
+    try f.e.script(3, model.textReply("Yes."));
+    f.core.chatTurnIn("main", "and the flats?");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "Earlier in this conversation:") != null);
+    f.core.cfg.memory.summaries = false;
+    try f.e.script(4, model.textReply("Yes."));
+    f.core.chatTurnIn("main", "and now?");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "Earlier in this conversation:") == null);
+    f.core.cfg.memory.summaries = true;
+    // not again that day; and /reload waits while a pass goes
+    f.core.tick();
+    waitSummaries(f.core);
+    try t.expectEqual(4, f.e.server.modelRequests());
+    f.core.summary_job.running.store(true, .release);
+    try t.expectEqualStrings("Busy; send /reload again when nothing is running.", try f.core.reload());
+    f.core.summary_job.running.store(false, .release);
 }
 
 test "a_bad_rules_line_names_its_section_or_environment" {
@@ -12515,6 +12881,120 @@ test "mcp_servers_start_together_under_one_deadline" {
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "one").? < std.mem.indexOf(u8, f.core.mcp_note, "two").?);
 }
 
+test "http_mcp_tools_list_and_call_through_the_gate" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // the stand-in's servers: one answering JSON, one event streams
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[web]\nurl = {s}/mcp/json\n[live]\nurl = {s}/mcp/sse\n", .{ try f.e.url(), try f.e.url() }) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp web/echo *\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.core.handleText("/status");
+    try f.rec.waitFor("MCP: web (3 tools)");
+    try f.rec.waitFor("live (3 tools)");
+    // allowed by a rule: runs; with no rule: asked, as a program's tool
+    try f.e.script(1, model.toolReply("tu_1", "web__echo", "{\"text\":\"from the web\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "live__echo", "{\"text\":\"from the stream\"}"));
+    try f.e.script(3, model.textReply("both done"));
+    try f.core.startWorker();
+    try f.core.handleText("use both");
+    try f.rec.waitFor("BUTTONS Allow this?");
+    try f.rec.waitFor("live__echo: live/echo");
+    try f.press("once");
+    try f.rec.waitFor("both done");
+    const first = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, first, "\"name\":\"web__echo\"") != null);
+    try t.expect(std.mem.indexOf(u8, first, "\"content\":\"from the web\"") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "\"content\":\"from the stream\"") != null);
+    // the log names them as it names a program's
+    const log = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, log, "\"tool\":\"web__echo\"") != null);
+    try t.expect(std.mem.indexOf(u8, log, "\"event\":\"mcp started\",\"server\":\"live\"") != null);
+}
+
+test "token_and_headers_are_sent_and_never_logged" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const token = "mcp-test-token-1";
+    // stored after the start: read on /reload, and masked from then on
+    const secrets_dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" });
+    f.core.store = .{ .dir = secrets_dir };
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[web]\nurl = {s}/mcp/token\ntoken = web-token\nheader = X-Team: tools\n", .{try f.e.url()}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp web/echo *\n" });
+    // not stored yet: not started, and said so
+    _ = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "web: token \"web-token\" is not stored (harness secret add web-token)") != null);
+    try f.core.store.?.put(t.io, "web-token", token);
+    _ = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "web (3 tools)") != null);
+    // the server says back the Authorization it got: masked in the model's request
+    try f.e.script(1, model.toolReply("tu_1", "web__echo", "{\"text\":\"auth\"}"));
+    try f.e.script(2, model.textReply("checked"));
+    try f.core.startWorker();
+    try f.core.handleText("what does it see");
+    try f.rec.waitFor("checked");
+    const req = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req, "Bearer [secret:web-token]") != null);
+    try t.expect(std.mem.indexOf(u8, req, token) == null);
+    // sent with the header lines, as written
+    const sent = try f.e.tmp.dir.readFileAlloc(t.io, "mcp-requests.jsonl", a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, sent, "\"Authorization\":\"Bearer " ++ token ++ "\"") != null);
+    try t.expect(std.mem.indexOf(u8, sent, "\"X-Team\":\"tools\"") != null);
+    // in no log line, no item, no message
+    try t.expect(std.mem.indexOf(u8, try logText(&f), token) == null);
+    try t.expectEqual(0, f.rec.count(token));
+}
+
+test "a_sign_in_server_starts_signed_in_and_status_says_when_not" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const oauth = @import("oauth.zig");
+    const fake = @import("fake.zig");
+    f.core.store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    const server = try std.fmt.allocPrint(a, "{s}/mcp/signin", .{try f.e.url()});
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[cloud]\nurl = {s}\nlogin = oauth\n", .{server}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp cloud/echo *\n" });
+    // not signed in: not started, and /status says what to do
+    _ = try f.core.reload();
+    try f.core.handleText("/status");
+    try f.rec.waitFor("cloud: not signed in (harness mcp login cloud)");
+    // signed in from the terminal, then /reload
+    var b: fake.Browser = .{ .io = t.io };
+    var said: []const u8 = "";
+    const tokens = try oauth.login(t.allocator, t.io, a, .{ .name = "cloud", .url = server, .link = .{ .ctx = &b, .f = fake.Browser.opened } }, &said);
+    b.join();
+    try oauth.save(t.io, t.allocator, f.core.store.?, "mcp-cloud", tokens);
+    _ = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "cloud (3 tools)") != null);
+    // the token it says back is masked in what the model sees
+    try f.e.script(1, model.toolReply("tu_1", "cloud__echo", "{\"text\":\"auth\"}"));
+    try f.e.script(2, model.textReply("seen"));
+    try f.core.startWorker();
+    try f.core.handleText("what does it get");
+    try f.rec.waitFor("seen");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "Bearer [secret:mcp-cloud]") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), tokens.access_token) == null);
+    // refused (the refresh token too): said in the call, and in /status
+    f.e.server.mcp.revokeRefresh();
+    f.e.server.mcp.expireTokens();
+    try f.e.script(3, model.toolReply("tu_2", "cloud__echo", "{\"text\":\"again\"}"));
+    try f.e.script(4, model.textReply("refused"));
+    try f.core.handleText("once more");
+    try f.rec.waitFor("refused");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "cloud refused the sign-in: harness mcp login cloud") != null);
+    try f.core.handleText("/status");
+    try f.rec.waitFor("cloud: the sign-in was refused (harness mcp login cloud)");
+    // no token in the log
+    const log = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, log, tokens.access_token) == null);
+    try t.expect(std.mem.indexOf(u8, log, tokens.refresh_token) == null);
+}
+
 test "reload_holds_no_lock_while_servers_start_and_stop_cuts_it_short" {
     var f: Fix = undefined;
     try f.init("", "", "");
@@ -12790,6 +13270,252 @@ test "a_folder_too_big_for_snapshots_is_said_in_status" {
     f.core.snaps.max_files = 1;
     try t.expectEqualStrings("No snapshot of notes: over 1 files.", try f.core.command(a, "/snapshot notes"));
     try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/status"), "\nSnapshots: notes: none (over 1 files)") != null);
+}
+
+// ---- undo ----
+
+const undo_t = @import("undo.zig");
+
+/// folders.ini as `text`, applied, and the workspace's `notes` with one
+/// file; its path.
+fn withNotes(f: *Fix, text: []const u8) ![]const u8 {
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.folders, .data = text });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.command(a, "/reload"));
+    const notes = try std.fs.path.join(a, &.{ f.core.workspace, "notes" });
+    try Io.Dir.cwd().createDirPath(t.io, notes);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ notes, "old.md" }), .data = "old" });
+    return notes;
+}
+
+/// Whether `name` is in folder `dir`.
+fn isIn(f: *Fix, dir: []const u8, name: []const u8) bool {
+    const p = std.fs.path.join(f.e.arena.allocator(), &.{ dir, name }) catch return false;
+    _ = Io.Dir.cwd().statFile(t.io, p, .{}) catch return false;
+    return true;
+}
+
+const UndoButton = struct { msg: i64, data: []const u8, rid: u64 };
+
+/// The Undo button under the last message whose line has `needle`, and
+/// the run its data names (checked with the log's key).
+fn undoButtonOf(f: *Fix, needle: []const u8) !UndoButton {
+    const b = f.rec.buttonsWith(needle) orelse return error.NoButtons;
+    for (0..b.n) |i| {
+        const d = b.buf[i][0..b.len[i]];
+        if (d.len == 0 or d[0] != 'u') continue;
+        const rid = undo_t.check(&f.core.log.key.?, d) orelse return error.BadUndoData;
+        return .{ .msg = b.msg, .data = try f.e.arena.allocator().dupe(u8, d), .rid = rid };
+    }
+    return error.NoUndoButton;
+}
+
+/// The id of the newest run labelled `label` in the log.
+fn lastRunId(f: *Fix, label: []const u8) !u64 {
+    const lt = try logText(f);
+    const needle = try std.fmt.allocPrint(f.e.arena.allocator(), "\"run\":\"{s}\",\"by\":", .{label});
+    const at = std.mem.lastIndexOf(u8, lt, needle) orelse return error.NoSuchRun;
+    const line_start = (std.mem.lastIndexOfScalar(u8, lt[0..at], '\n') orelse 0);
+    const rid_at = std.mem.indexOfPos(u8, lt, line_start, "\"rid\":").? + 6;
+    const end = std.mem.indexOfScalarPos(u8, lt, rid_at, ',').?;
+    return std.fmt.parseInt(u64, lt[rid_at..end], 10);
+}
+
+test "a_runs_reply_ends_with_what_it_changed_and_an_undo_button" {
+    var f: Fix = undefined;
+    try f.init("[limits]\nsteps_per_turn = 2\n", "", "");
+    defer f.deinit();
+    const notes = try withNotes(&f, "[notes]\nsnapshots = on\n");
+    // a chat turn that writes in notes
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/a.md\",\"content\":\"a\"}"));
+    try f.e.script(2, model.textReply("Wrote a."));
+    f.core.chatTurn("write a");
+    try t.expectEqual(1, f.rec.count("BUTTONS Wrote a.\n\nChanged 1 file in notes/. [u"));
+    const u = try undoButtonOf(&f, "Wrote a.");
+    try t.expectEqual(try lastRunId(&f, "chat"), u.rid);
+    try t.expect(isIn(&f, notes, "a.md"));
+    // a turn that changes nothing: no line, no button
+    try f.e.script(3, model.textReply("Nothing to do."));
+    f.core.chatTurn("anything?");
+    try t.expectEqual(1, f.rec.count("Nothing to do."));
+    try t.expectEqual(0, f.rec.count("BUTTONS Nothing to do."));
+    try t.expectEqual(0, f.rec.count("Nothing to do.\n\nChanged"));
+    // one that ends on its step limit after writing: harness's line carries it
+    try f.e.script(4, model.toolReply("tu_2", "write_file", "{\"path\":\"notes/b.md\",\"content\":\"b\"}"));
+    try f.e.script(5, model.toolReply("tu_3", "write_file", "{\"path\":\"notes/c.md\",\"content\":\"c\"}"));
+    f.core.chatTurn("write on and on");
+    try t.expectEqual(1, f.rec.count("BUTTONS Step limit reached for this turn.\n\nChanged 2 files in notes/. [u"));
+    // a task's post
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[watch]\nevery = 5m\ndo = Note the news.\n"));
+    try f.e.script(6, model.toolReply("tu_4", "write_file", "{\"path\":\"notes/t.md\",\"content\":\"t\"}"));
+    try f.e.script(7, model.textReply("Task wrote."));
+    f.core.tick();
+    try f.rec.waitFor("[watch] Task wrote.");
+    waitIdle(f.core);
+    try t.expectEqual(1, f.rec.count("BUTTONS [watch] Task wrote.\n\nChanged 1 file in notes/. [u"));
+    try t.expectEqual(try lastRunId(&f, "task watch"), (try undoButtonOf(&f, "[watch] Task wrote.")).rid);
+    // a task that writes and answers NOTHING posts nothing: no button
+    try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[watch]\nevery = 5m\ndo = Note the news.\n[quiet]\nevery = 5m\ndo = Note quietly.\n"));
+    try f.e.script(8, model.toolReply("tu_5", "write_file", "{\"path\":\"notes/q.md\",\"content\":\"q\"}"));
+    try f.e.script(9, model.textReply("NOTHING"));
+    f.core.tick();
+    waitIdle(f.core);
+    try t.expect(isIn(&f, notes, "q.md"));
+    try t.expectEqual(0, f.rec.count("[quiet]"));
+    try t.expectEqual(3, f.rec.count("BUTTONS "));
+}
+
+test "the_undo_button_needs_the_right_hmac_and_the_owner" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const notes = try withNotes(&f, "[notes]\nsnapshots = on\n");
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/a.md\",\"content\":\"a\"}"));
+    try f.e.script(2, model.textReply("Wrote a."));
+    f.core.chatTurn("write a");
+    const u = try undoButtonOf(&f, "Wrote a.");
+    const text = "Wrote a.\n\nChanged 1 file in notes/.";
+    // someone else's press is dropped
+    f.core.handleCallbackText(7, 42, 0, u.msg, u.data, text);
+    try t.expect(isIn(&f, notes, "a.md"));
+    try t.expectEqual(0, f.rec.count(out_of_date));
+    // a wrong HMAC, or this one on another run: out of date
+    const bad = try a.dupe(u8, u.data);
+    bad[bad.len - 1] = if (bad[bad.len - 1] == '0') '1' else '0';
+    f.core.handleCallbackText(42, 42, 0, u.msg, bad, text);
+    try t.expectEqual(1, f.rec.count(out_of_date));
+    const moved = try std.fmt.allocPrint(a, "u{d}{s}", .{ u.rid + 1, u.data[std.mem.indexOfScalar(u8, u.data, '-').?..] });
+    f.core.handleCallbackText(42, 42, 0, u.msg, moved, text);
+    try t.expectEqual(2, f.rec.count(out_of_date));
+    try t.expect(isIn(&f, notes, "a.md"));
+    // the owner's press: undone, and the message edited with the outcome
+    f.core.handleCallbackText(42, 42, 0, u.msg, u.data, text);
+    try t.expect(!isIn(&f, notes, "a.md"));
+    try t.expect(isIn(&f, notes, "old.md"));
+    const want = try std.fmt.allocPrint(a, "EDIT {d}: Wrote a.\n\nChanged 1 file in notes/.\n\nUndid run {d}: removed notes/a.md.\n/restore notes 3 takes the undo back.", .{ u.msg, u.rid });
+    try t.expectEqual(1, f.rec.count(want));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), try std.fmt.allocPrint(a, "\"kind\":\"files\",\"event\":\"undo\",\"run\":{d},\"folders\":\"notes\",\"undone\":1,\"left\":0", .{u.rid})) != null);
+    // pressed again: undone already
+    f.core.handleCallbackText(42, 42, 0, u.msg, u.data, text);
+    const again = try std.fmt.allocPrint(a, "Run {d}'s changes are undone already.", .{u.rid});
+    try t.expectEqual(1, f.rec.count(again));
+    // without the message's text: its button goes, the outcome is said
+    f.core.handleCallbackIn(42, 42, 0, u.msg, u.data);
+    try t.expectEqual(2, f.rec.count(again));
+    try t.expect(std.mem.count(i64, f.rec.cleared.items, &.{u.msg}) >= 2);
+    // in a group: the owner's press counts, nobody else's
+    try f.e.script(3, model.toolReply("tu_2", "write_file", "{\"path\":\"notes/g.md\",\"content\":\"g\"}"));
+    try f.e.script(4, model.textReply("Wrote g."));
+    f.core.chatTurn("write g");
+    const g = try undoButtonOf(&f, "Wrote g.");
+    f.core.handleCallbackText(7, -100, 0, g.msg, g.data, "Wrote g.");
+    try t.expect(isIn(&f, notes, "g.md"));
+    f.core.handleCallbackText(42, -100, 0, g.msg, g.data, "Wrote g.");
+    try t.expect(!isIn(&f, notes, "g.md"));
+    try t.expectEqual(1, f.rec.count(try std.fmt.allocPrint(a, "EDIT {d}: Wrote g.\n\nUndid run {d}: removed notes/g.md.", .{ g.msg, g.rid })));
+}
+
+test "undo_takes_back_the_newest_run_with_changes_here" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const notes = try withNotes(&f, "[notes]\nsnapshots = on\n");
+    // runs A and B in main, C in a topic
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/a.md\",\"content\":\"a\"}"));
+    try f.e.script(2, model.textReply("Wrote a."));
+    f.core.chatTurn("write a");
+    const run_a = try lastRunId(&f, "chat");
+    try f.e.script(3, model.toolReply("tu_2", "write_file", "{\"path\":\"notes/b.md\",\"content\":\"b\"}"));
+    try f.e.script(4, model.textReply("Wrote b."));
+    f.core.chatTurn("write b");
+    const run_b = try lastRunId(&f, "chat");
+    try f.e.script(5, model.toolReply("tu_3", "write_file", "{\"path\":\"notes/c.md\",\"content\":\"c\"}"));
+    try f.e.script(6, model.textReply("Wrote c."));
+    f.core.chatTurnIn("house-search", "write c");
+    const run_c = try lastRunId(&f, "chat");
+    try t.expect(run_a < run_b and run_b < run_c);
+    // /undo in main: the newest run there with changes, B
+    const said = try f.core.commandIn(a, "main", "/undo");
+    if (!std.mem.startsWith(u8, said, try std.fmt.allocPrint(a, "Undid run {d}: removed notes/b.md.\n/restore notes ", .{run_b}))) {
+        std.debug.print("said: {s}\n", .{said});
+        return error.TestUnexpectedResult;
+    }
+    try t.expect(isIn(&f, notes, "a.md"));
+    try t.expect(!isIn(&f, notes, "b.md"));
+    try t.expect(isIn(&f, notes, "c.md"));
+    // again: the same run, undone already
+    try t.expectEqualStrings(try std.fmt.allocPrint(a, "Run {d}'s changes are undone already.", .{run_b}), try f.core.commandIn(a, "main", "/undo"));
+    // /undo RUN: A
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, try std.fmt.allocPrint(a, "/undo {d}", .{run_a})), try std.fmt.allocPrint(a, "Undid run {d}: removed notes/a.md.", .{run_a})));
+    try t.expect(!isIn(&f, notes, "a.md"));
+    // in the topic: C
+    try t.expect(std.mem.startsWith(u8, try f.core.commandIn(a, "house-search", "/undo"), try std.fmt.allocPrint(a, "Undid run {d}: removed notes/c.md.", .{run_c})));
+    try t.expect(!isIn(&f, notes, "c.md"));
+    try t.expect(isIn(&f, notes, "old.md"));
+    // the words
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, "/undo x"), "Use /undo, or /undo RUN"));
+    try t.expectEqualStrings("Nothing kept for run 999999: too old to undo, or it changed no folder that keeps snapshots.", try f.core.command(a, "/undo 999999"));
+    try t.expectEqualStrings("No run here changed files in a folder that keeps snapshots.", try f.core.commandIn(a, "elsewhere", "/undo"));
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/help"), "/undo [RUN]") != null);
+}
+
+test "undo_in_a_shared_conversation_names_folders_not_files" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const notes = try withNotes(&f, "[notes]\nsnapshots = on\n");
+    try addGroup(&f, "family", -100);
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/secret-plan.md\",\"content\":\"a\"}"));
+    try f.e.script(2, model.textReply("Wrote it."));
+    f.core.chatTurn("write it");
+    const run = try lastRunId(&f, "chat");
+    try t.expect(isIn(&f, notes, "secret-plan.md"));
+    // sent in the family group, where others read along: what the reply
+    // said (folders and counts), not the owner's file names
+    const said = try f.core.commandIn(a, "family", try std.fmt.allocPrint(a, "/undo {d}", .{run}));
+    if (std.mem.indexOf(u8, said, "secret-plan") != null or std.mem.indexOf(u8, said, "removed 1 file in notes/") == null) {
+        std.debug.print("said: {s}\n", .{said});
+        return error.TestUnexpectedResult;
+    }
+    try t.expect(!isIn(&f, notes, "secret-plan.md"));
+}
+
+test "undo_is_refused_while_a_run_goes_and_when_too_old" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const notes = try withNotes(&f, "[notes]\nsnapshots = on\n");
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/a.md\",\"content\":\"a\"}"));
+    try f.e.script(2, model.textReply("Wrote a."));
+    f.core.chatTurn("write a");
+    const u = try undoButtonOf(&f, "Wrote a.");
+    // while a run is going: refused; a press says so and keeps its button
+    f.core.busy.store(true, .release);
+    try t.expectEqualStrings("Not now: a run is going. Send /undo again when nothing is running.", try f.core.command(a, try std.fmt.allocPrint(a, "/undo {d}", .{u.rid})));
+    const cleared = f.rec.cleared.items.len;
+    f.core.handleCallbackText(42, 42, 0, u.msg, u.data, "Wrote a.\n\nChanged 1 file in notes/.");
+    try t.expectEqual(1, f.rec.count("Not now: a run is going. Press Undo again when nothing is running."));
+    try t.expectEqual(cleared, f.rec.cleared.items.len);
+    f.core.busy.store(false, .release);
+    // a background run (a task, a trigger's, a workflow's) counts too
+    _ = f.core.bg_active.fetchAdd(1, .acq_rel);
+    try t.expect(std.mem.startsWith(u8, try f.core.command(a, try std.fmt.allocPrint(a, "/undo {d}", .{u.rid})), "Not now: a run is going."));
+    _ = f.core.bg_active.fetchSub(1, .acq_rel);
+    try t.expect(isIn(&f, notes, "a.md"));
+    // too old: notes keeps one snapshot, so a run's "before" goes when it ends
+    _ = try withNotes(&f, "[notes]\nsnapshots = 1\n");
+    try f.e.script(3, model.toolReply("tu_2", "write_file", "{\"path\":\"notes/o.md\",\"content\":\"o\"}"));
+    try f.e.script(4, model.textReply("Wrote o."));
+    f.core.chatTurn("write o");
+    // its reply still says what it changed, with Undo
+    const o = try undoButtonOf(&f, "Wrote o.\n\nChanged 1 file in notes/.");
+    f.core.handleCallbackText(42, 42, 0, o.msg, o.data, "Wrote o.\n\nChanged 1 file in notes/.");
+    try t.expectEqual(1, f.rec.count(try std.fmt.allocPrint(a, "EDIT {d}: Wrote o.\n\nChanged 1 file in notes/.\n\nToo old to undo: its snapshots were pruned.", .{o.msg})));
+    try t.expect(isIn(&f, notes, "o.md"));
 }
 
 test "a_secret_typed_into_a_snapshots_label_is_masked" {
@@ -14942,8 +15668,8 @@ test "another_step_cut_by_a_restart_asks_in_the_inbox" {
     try f.press("skip");
     runWorkflows(&f);
     try f.rec.waitFor("[ship#2] Step push failed: skipped by the owner after it was cut off");
-    // (cmd ends its lines with \r\n)
-    try t.expectEqual(1, f.rec.count(if (builtin.os.tag == .windows) "pushed\r\n" else "pushed\n"));
+    // cmd's echo ends its line with \r\n on Windows
+    try t.expectEqual(1, f.rec.count("pushed\n") + f.rec.count("pushed\r\n"));
 }
 
 test "stop_pauses_a_step_under_way_until_it_is_answered" {

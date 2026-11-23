@@ -1,0 +1,7 @@
+.{
+    .name = .cantap,
+    .version = "0.0.0",
+    .fingerprint = 0x3f12e9cc57d41e61,
+    .minimum_zig_version = "0.17.1",
+    .paths = .{ "build.zig", "build.zig.zon", "src", "sketch" },
+}

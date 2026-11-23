@@ -22,9 +22,17 @@
 //!   If-None-Match or If-Modified-Since gets 304. Each page request is
 //!   appended to `page-requests.jsonl` with its headers.
 //! - Telegram: see `telegram` below.
+//! - MCP servers over HTTP and an authorization server: `/mcp/FLAVOR`,
+//!   `/.well-known/…`, `/auth/…` (fake_mcp.zig's `Http`, steered by tests
+//!   through `mcp`); each such request is appended to `mcp-requests.jsonl`
+//!   with its method, target, headers and body. `browse` and `Browser`
+//!   play the owner's browser for a sign-in.
 const std = @import("std");
 const sock = @import("sock.zig");
 const jv = @import("jv.zig");
+const http = @import("http.zig");
+const url_mod = @import("url.zig");
+const fake_mcp = @import("fake_mcp.zig");
 const Io = std.Io;
 
 pub const Server = struct {
@@ -41,6 +49,8 @@ pub const Server = struct {
     tg_failed: std.atomic.Value(i64) = .init(0),
     mutex: Io.Mutex = .init,
     open: std.ArrayList(sock.Handle) = .empty,
+    /// The MCP servers over HTTP.
+    mcp: fake_mcp.Http = .{},
 
     const gpa = std.heap.page_allocator;
     const idle_ms = 60 * 60 * 1000;
@@ -50,7 +60,7 @@ pub const Server = struct {
         errdefer listener.close();
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
-        s.* = .{ .io = io, .dir = try gpa.dupe(u8, dir), .listener = listener, .port = listener.port };
+        s.* = .{ .io = io, .dir = try gpa.dupe(u8, dir), .listener = listener, .port = listener.port, .mcp = .{ .io = io } };
         inline for (.{ "requests", "model", "pages", "telegram/in" }) |sub| {
             const p = try std.fs.path.join(gpa, &.{ dir, sub });
             defer gpa.free(p);
@@ -72,6 +82,7 @@ pub const Server = struct {
         while (s.active.load(.acquire) > 0) s.io.sleep(.fromMilliseconds(1), .awake) catch {};
         s.listener.close();
         s.open.deinit(gpa);
+        s.mcp.deinit();
         gpa.free(s.dir);
         gpa.destroy(s);
     }
@@ -182,9 +193,12 @@ pub const Server = struct {
         // a page request's conditions
         var if_none_match: ?[]const u8 = null;
         var if_modified_since: ?[]const u8 = null;
+        // all of them, for the MCP servers
+        var all: std.ArrayList(fake_mcp.Header) = .empty;
         var it = req.iterateHeaders();
         while (it.next()) |h| {
             try headers.print(a, "{f}:{f},", .{ std.json.fmt(h.name, .{}), std.json.fmt(h.value, .{}) });
+            try all.append(a, .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) });
             if (std.ascii.eqlIgnoreCase(h.name, "if-none-match")) if_none_match = try a.dupe(u8, h.value);
             if (std.ascii.eqlIgnoreCase(h.name, "if-modified-since")) if_modified_since = try a.dupe(u8, h.value);
             if (std.ascii.eqlIgnoreCase(h.name, "x-api-key")) key = try a.dupe(u8, h.value);
@@ -194,6 +208,16 @@ pub const Server = struct {
         const body_reader = try req.readerExpectContinue(&body_buf);
         const body = try body_reader.allocRemaining(a, .limited(32 << 20));
         const route = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+        if (std.mem.startsWith(u8, route, "/mcp/") or std.mem.startsWith(u8, route, "/.well-known/") or std.mem.startsWith(u8, route, "/auth/")) {
+            {
+                s.mutex.lockUncancelable(s.io);
+                defer s.mutex.unlock(s.io);
+                const lp = try s.path(a, &.{"mcp-requests.jsonl"});
+                const line = try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"target\":{f},\"headers\":{{{s}\"\":\"\"}},\"body\":{f}}}\n", .{ @tagName(method), std.json.fmt(target, .{}), headers.items, std.json.fmt(body, .{}) });
+                try s.appendRecord(a, lp, line);
+            }
+            return s.mcp.handle(.{ .io = s.io, .dir = s.dir, .port = s.port, .stopping = &s.stopping }, a, req, method, target, all.items, body);
+        }
 
         if (method == .POST and !std.mem.startsWith(u8, route, "/page/") and !std.mem.startsWith(u8, route, "/bot")) {
             if (std.mem.endsWith(u8, route, "/messages")) return s.model(a, req, .anthropic, target, body, headers.items, key);
@@ -404,6 +428,111 @@ pub const Server = struct {
             try out.print(a, "{{\"update_id\":{d},{s}", .{ id, trimmed[1..] });
         }
         return out.items;
+    }
+};
+
+pub const BrowseOptions = struct {
+    /// A path asked of the host it is sent back to first (as a browser
+    /// asks for /favicon.ico).
+    first: ?[]const u8 = null,
+    /// Replaces the state the way back carries.
+    state: ?[]const u8 = null,
+};
+
+pub const Page = struct {
+    status: u16,
+    body: []const u8,
+    /// Where it was sent back to ("" when it wasn't).
+    back: []const u8 = "",
+    /// The status `first` got.
+    first_status: u16 = 0,
+};
+
+/// A browser for sign-ins: opens `link` and follows one redirect (to
+/// 127.0.0.1 only); the last page's status and body (in `a`).
+pub fn browse(io: Io, a: std.mem.Allocator, link: []const u8, o: BrowseOptions) !Page {
+    const first = try get(io, a, link);
+    if (first.status < 300 or first.status >= 400) return .{ .status = first.status, .body = first.body };
+    var back = first.location;
+    const u = try url_mod.parse(a, back);
+    if (!std.mem.eql(u8, u.host, "127.0.0.1")) return error.NotThisMachine;
+    var page: Page = .{ .status = 0, .body = "" };
+    if (o.first) |p| page.first_status = (try get(io, a, try std.fmt.allocPrint(a, "http://127.0.0.1:{d}{s}", .{ u.port, p }))).status;
+    if (o.state) |st| if (std.mem.indexOf(u8, back, "state=")) |at| {
+        const end = std.mem.indexOfScalarPos(u8, back, at, '&') orelse back.len;
+        back = try std.fmt.allocPrint(a, "{s}state={s}{s}", .{ back[0..at], st, back[end..] });
+    };
+    const last = try get(io, a, back);
+    page.status = last.status;
+    page.body = last.body;
+    page.back = back;
+    return page;
+}
+
+const Got = struct { status: u16, body: []const u8, location: []const u8 };
+
+fn get(io: Io, a: std.mem.Allocator, link: []const u8) !Got {
+    const u = try url_mod.parse(a, link);
+    var c = http.Client.init(a, io, .{ .https = u.https, .host = u.connectHost(), .port = u.port, .prefix = "" });
+    defer c.deinit();
+    var resp = try c.send(.{ .method = .GET, .path = u.target, .accept = "text/html", .limits = .{ .idle_ms = 15_000, .total_ms = 15_000 } });
+    defer resp.deinit();
+    const body = resp.readAll(a, 1 << 20) catch "";
+    return .{ .status = resp.status, .body = body, .location = if (resp.location) |l| try a.dupe(u8, l) else "" };
+}
+
+/// The owner's browser in sign-in tests: told the link (`opened`, as an
+/// oauth.Link), it opens it on a thread of its own; `join`, then read what
+/// it got.
+pub const Browser = struct {
+    io: Io,
+    first: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    link_buf: [4096]u8 = undefined,
+    link_len: usize = 0,
+    back_buf: [1024]u8 = undefined,
+    back_len: usize = 0,
+    body_buf: [1024]u8 = undefined,
+    body_len: usize = 0,
+    status: u16 = 0,
+    first_status: u16 = 0,
+    thread: ?std.Thread = null,
+
+    pub fn opened(ctx: ?*anyopaque, link: []const u8, port: u16) void {
+        _ = port;
+        const b: *Browser = @ptrCast(@alignCast(ctx.?));
+        const n = @min(link.len, b.link_buf.len);
+        @memcpy(b.link_buf[0..n], link[0..n]);
+        b.link_len = n;
+        b.thread = std.Thread.spawn(.{}, run, .{b}) catch null;
+    }
+
+    fn run(b: *Browser) void {
+        var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer arena.deinit();
+        const p = browse(b.io, arena.allocator(), b.link_buf[0..b.link_len], .{ .first = b.first, .state = b.state }) catch return;
+        b.status = p.status;
+        b.first_status = p.first_status;
+        const n = @min(p.body.len, b.body_buf.len);
+        @memcpy(b.body_buf[0..n], p.body[0..n]);
+        b.body_len = n;
+        const m = @min(p.back.len, b.back_buf.len);
+        @memcpy(b.back_buf[0..m], p.back[0..m]);
+        b.back_len = m;
+    }
+
+    pub fn join(b: *Browser) void {
+        if (b.thread) |th| th.join();
+        b.thread = null;
+    }
+
+    pub fn body(b: *const Browser) []const u8 {
+        return b.body_buf[0..b.body_len];
+    }
+
+    /// Where it was sent back to (the listener's address).
+    pub fn back(b: *const Browser) []const u8 {
+        return b.back_buf[0..b.back_len];
     }
 };
 

@@ -69,8 +69,10 @@ pub const Source = struct {
 /// before a restore), or by the agent's `snapshot` tool.
 pub const When = enum { before, after, hand, tool };
 
-/// Who took it: the run (its id, label and definition) and what started it.
-pub const By = struct { rid: u64 = 0, run: []const u8 = "", agent: []const u8 = "", by: []const u8 = "owner" };
+/// Who took it: the run (its id, label and definition) and what started
+/// it; a run's also the conversation it reports to, and a delegated run's
+/// the run that delegated it (`parent`), whose snapshots these are.
+pub const By = struct { rid: u64 = 0, run: []const u8 = "", agent: []const u8 = "", by: []const u8 = "owner", conversation: []const u8 = "", parent: u64 = 0 };
 
 pub const Take = struct {
     when: When,
@@ -126,6 +128,45 @@ pub const Restored = struct {
 
 pub const Pruned = struct { snapshots: usize = 0, objects: usize = 0 };
 
+/// What an undo did in one folder the run changed.
+pub const UndoFolder = struct {
+    /// The folder as the store names it (`/`, `notes`).
+    name: []const u8,
+    /// The snapshot taken before it wrote (restoring it takes the undo
+    /// back); 0: none, nothing was put back.
+    snapshot: u64 = 0,
+    /// The files put back (old content, made again, or removed), from the
+    /// workspace (`notes/a.md`).
+    undone: []const []const u8 = &.{},
+    /// Those of `undone` the run had made, so removed.
+    removed: []const []const u8 = &.{},
+    /// The files changed since the run, left as they are (a database is
+    /// named for its side files too).
+    left: []const []const u8 = &.{},
+    /// The files that could not be put back, and why.
+    failed: []const Failed = &.{},
+    /// Why nothing in it was put back (a symbolic link, too big to
+    /// snapshot first).
+    refused: ?[]const u8 = null,
+};
+
+/// What `Store.undo` did.
+pub const Undone = struct {
+    /// Some snapshot of the run is kept.
+    found: bool = false,
+    /// The folders the run changed files in.
+    folders: []const UndoFolder = &.{},
+    /// The folders whose "before" or "after" is gone: too old to undo.
+    pruned: []const []const u8 = &.{},
+    /// The files (a database with its side files as one) already as
+    /// before the run.
+    already: usize = 0,
+};
+
+/// The files that go with a database file: SQLite's write-ahead log, its
+/// index and its rollback journal.
+const side_suffixes = [_][]const u8{ "-wal", "-shm", "-journal" };
+
 const File = struct { path: []const u8, sha: [64]u8, size: u64, exec: bool, mtime: i128 };
 const Skipped = struct { path: []const u8, why: []const u8 };
 const Header = struct {
@@ -136,6 +177,8 @@ const Header = struct {
     run: []const u8 = "",
     agent: []const u8 = "",
     by: []const u8 = "",
+    conversation: []const u8 = "",
+    parent: u64 = 0,
     when: When = .hand,
     files: usize = 0,
     changed: usize = 0,
@@ -279,7 +322,7 @@ pub const Store = struct {
         const short = util.cut(opts.label, 200);
         const label = if (s.masks) |m| m.scrubAlloc(arena, short) catch short else short;
         var out: std.ArrayList(u8) = .empty;
-        try writeHeader(&out, arena, .{ .folder = src.name, .time = time, .label = label, .rid = opts.by.rid, .run = opts.by.run, .agent = opts.by.agent, .by = opts.by.by, .when = opts.when, .files = files.items.len, .changed = changed, .bytes = bytes });
+        try writeHeader(&out, arena, .{ .folder = src.name, .time = time, .label = label, .rid = opts.by.rid, .run = opts.by.run, .agent = opts.by.agent, .by = opts.by.by, .conversation = opts.by.conversation, .parent = opts.by.parent, .when = opts.when, .files = files.items.len, .changed = changed, .bytes = bytes });
         for (files.items) |nf| {
             try out.print(arena, "{s}\t{d}\t{s}\t{d}\t", .{ &nf.sha, nf.size, if (nf.exec) "x" else "-", nf.mtime });
             try util.escapeField(&out, arena, nf.path);
@@ -351,20 +394,237 @@ pub const Store = struct {
             if (k < id) before = k;
         }
         const old: []const File = if (before) |b| (try s.load(arena, fdir, b)).files else &.{};
-        var was: std.StringHashMapUnmanaged(File) = .empty;
-        for (old) |f| try was.put(arena, f.path, f);
-        var is: std.StringHashMapUnmanaged(void) = .empty;
-        var added: std.ArrayList([]const u8) = .empty;
-        var changed: std.ArrayList([]const u8) = .empty;
-        var removed: std.ArrayList([]const u8) = .empty;
-        for (now.files) |f| {
-            try is.put(arena, f.path, {});
-            if (was.get(f.path)) |o| {
-                if (!std.mem.eql(u8, &o.sha, &f.sha) or o.exec != f.exec) try changed.append(arena, f.path);
-            } else try added.append(arena, f.path);
+        return changesBetween(arena, before, old, now.files);
+    }
+
+    /// What changed from snapshot `from` of `name` to its snapshot `to`
+    /// (`before` is `from`): a run's changes, from its "before" and
+    /// "after".
+    pub fn diff(s: *Store, arena: std.mem.Allocator, name: []const u8, from: u64, to: u64) !Changes {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        const fdir = try s.folderDir(arena, name);
+        const old = try s.load(arena, fdir, from);
+        const now = try s.load(arena, fdir, to);
+        return changesBetween(arena, from, old.files, now.files);
+    }
+
+    /// Takes back run `rid`'s changes file by file, from its "before" and
+    /// "after" snapshot of each folder (a helper's "before" names the run
+    /// as its `parent`). A file now as the run left it gets its old
+    /// content and executable bit back (removed if the run made it, made
+    /// again if the run removed it); one now as before the run needs
+    /// nothing; one changed since is left and named. A database's `-wal`,
+    /// `-shm` and `-journal` files go with it, and are left with it. Before
+    /// it writes in a folder it snapshots it (by the owner), so a restore
+    /// of that snapshot takes the undo back; it never writes through a
+    /// symbolic link. `workspace` holds the folders; `f` gives their skip
+    /// patterns for that snapshot.
+    pub fn undo(s: *Store, arena: std.mem.Allocator, rid: u64, workspace: []const u8, f: ?*const folders.Folders) !Undone {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        const pairs = try s.pairsLocked(arena, rid);
+        var out: Undone = .{ .found = pairs.len > 0 };
+        var done: std.ArrayList(UndoFolder) = .empty;
+        var pruned: std.ArrayList([]const u8) = .empty;
+        var seen: std.ArrayList([]const u8) = .empty;
+        var undone: usize = 0;
+        var left: usize = 0;
+        for (pairs) |p| {
+            const fdir = try s.folderDir(arena, p.name);
+            const b: ?Snap = if (p.before) |id| s.load(arena, fdir, id) catch null else null;
+            const af: ?Snap = if (p.after) |id| s.load(arena, fdir, id) catch null else null;
+            if (b == null or af == null) {
+                try pruned.append(arena, p.name);
+                try seen.append(arena, p.name);
+                continue;
+            }
+            const uf = (try s.undoFolder(arena, rid, workspace, f, p.name, b.?, af.?, &out.already)) orelse continue;
+            undone += uf.undone.len;
+            left += uf.left.len;
+            try done.append(arena, uf);
+            try seen.append(arena, p.name);
         }
-        for (old) |f| if (!is.contains(f.path)) try removed.append(arena, f.path);
-        return .{ .before = before, .added = added.items, .changed = changed.items, .removed = removed.items };
+        out.folders = done.items;
+        out.pruned = pruned.items;
+        if (out.found) s.logLine(.{ .event = "undo", .run = rid, .folders = try std.mem.join(arena, ", ", seen.items), .undone = undone, .left = left });
+        return out;
+    }
+
+    /// The undo of one folder the run snapshotted; null when the run
+    /// changed no file in it.
+    fn undoFolder(s: *Store, arena: std.mem.Allocator, rid: u64, workspace: []const u8, f: ?*const folders.Folders, name: []const u8, b: Snap, af: Snap, already: *usize) !?UndoFolder {
+        const ch = try changesBetween(arena, null, b.files, af.files);
+        if (ch.added.len + ch.changed.len + ch.removed.len == 0) return null;
+        const base = if (std.mem.eql(u8, name, "/")) "" else name;
+        const root = if (base.len == 0) workspace else try std.fs.path.join(arena, &.{ workspace, try native(arena, base) });
+        var res: UndoFolder = .{ .name = name };
+        // the folder itself as it is, never what a link there points to
+        if (isLink(s.io, root)) {
+            res.refused = "it is a symbolic link";
+            return res;
+        }
+        var was: std.StringHashMapUnmanaged(File) = .empty;
+        for (b.files) |x| try was.put(arena, x.path, x);
+        var is: std.StringHashMapUnmanaged(File) = .empty;
+        for (af.files) |x| try is.put(arena, x.path, x);
+        // each changed file, or a database with its side files, is one group
+        var keys: std.StringArrayHashMapUnmanaged(void) = .empty;
+        for ([_][]const []const u8{ ch.added, ch.changed, ch.removed }) |paths| for (paths) |p| try keys.put(arena, groupKey(p, &was, &is), {});
+        var cur: std.StringHashMapUnmanaged(Now) = .empty;
+        const Write = struct { path: []const u8, from: ?File };
+        var writes: std.ArrayList(Write) = .empty;
+        var left: std.ArrayList([]const u8) = .empty;
+        for (keys.keys()) |key| {
+            var members: std.ArrayList([]const u8) = .empty;
+            try members.append(arena, key);
+            // a file's side files: those either snapshot has, or there now
+            if (was.contains(key) or is.contains(key)) for (side_suffixes) |sfx| {
+                const side = try std.mem.concat(arena, u8, &.{ key, sfx });
+                if (was.contains(side) or is.contains(side) or try s.nowCached(arena, &cur, root, side) != .absent) try members.append(arena, side);
+            };
+            var as_left = true;
+            var as_before = true;
+            for (members.items) |m| {
+                const now = try s.nowCached(arena, &cur, root, m);
+                if (!sameAs(now, is.get(m))) as_left = false;
+                if (!sameAs(now, was.get(m))) as_before = false;
+            }
+            if (as_before) {
+                already.* += 1;
+                continue;
+            }
+            if (!as_left) {
+                try left.append(arena, try shownPath(arena, base, key));
+                continue;
+            }
+            for (members.items) |m| if (!sameFile(was.get(m), is.get(m))) try writes.append(arena, .{ .path = m, .from = was.get(m) });
+        }
+        res.left = try sorted(arena, left.items);
+        if (writes.items.len == 0) return res;
+        // snapshotted first, so a restore of it takes the undo back
+        const src: Source = .{ .name = name, .path = root, .base = base, .skip = if (f) |fs| try skipsFor(fs.*, arena, base) else &.{} };
+        const first = s.takeLocked(arena, src, .{ .when = .hand, .label = try std.fmt.allocPrint(arena, "before undoing run {d}", .{rid}) }) catch |e| {
+            res.refused = whyNot(e);
+            return res;
+        };
+        if (first.refused) |why| {
+            res.refused = try std.fmt.allocPrint(arena, "it is {s}, so the undo could not be taken back", .{why});
+            return res;
+        }
+        res.snapshot = first.id;
+        var undone: std.ArrayList([]const u8) = .empty;
+        var removed: std.ArrayList([]const u8) = .empty;
+        var failed: std.ArrayList(Failed) = .empty;
+        // what the run made goes first, so a file can become a folder
+        for (writes.items) |w| if (w.from == null) {
+            s.deleteBack(arena, root, w.path) catch |e| {
+                try failed.append(arena, .{ .path = try shownPath(arena, base, w.path), .why = whyNot(e) });
+                continue;
+            };
+            const shown = try shownPath(arena, base, w.path);
+            try undone.append(arena, shown);
+            try removed.append(arena, shown);
+        };
+        for (writes.items) |w| if (w.from) |file| {
+            s.writeBack(arena, root, file) catch |e| {
+                try failed.append(arena, .{ .path = try shownPath(arena, base, w.path), .why = whyNot(e) });
+                continue;
+            };
+            try undone.append(arena, try shownPath(arena, base, w.path));
+        };
+        res.undone = try sorted(arena, undone.items);
+        res.removed = try sorted(arena, removed.items);
+        res.failed = failed.items;
+        return res;
+    }
+
+    /// A folder's "before" and "after" of a run, and how many files its
+    /// "after" counted as changed since the snapshot before it.
+    const Pair = struct { name: []const u8, before: ?u64 = null, after: ?u64 = null, changed: usize = 0 };
+
+    /// The newest run (the highest number) of `conversation` whose
+    /// snapshots show it changed files: by its pair, or, when its
+    /// "before" is gone, by what its "after" counted. Null: none kept.
+    pub fn newestRun(s: *Store, arena: std.mem.Allocator, conversation: []const u8) !?u64 {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        if (conversation.len == 0) return null;
+        const table = try s.headsLocked(arena);
+        var runs: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+        for (table) |fo| for (fo.heads) |hd| {
+            if (hd.h.when == .after and hd.h.rid > 0 and std.mem.eql(u8, hd.h.conversation, conversation)) try runs.put(arena, hd.h.rid, {});
+        };
+        const rids = try arena.dupe(u64, runs.keys());
+        std.mem.sort(u64, rids, {}, std.sort.desc(u64));
+        for (rids) |rid| for (try pairsIn(arena, table, rid)) |p| {
+            const after = p.after orelse continue;
+            // its "after" counted what changed since the snapshot just
+            // before it: the run's own "before", or one gone or between
+            const before = p.before orelse {
+                if (p.changed > 0) return rid;
+                continue;
+            };
+            if (before + 1 == after) {
+                if (p.changed > 0) return rid;
+                continue;
+            }
+            const fdir = try s.folderDir(arena, p.name);
+            const b = s.load(arena, fdir, before) catch continue;
+            const af = s.load(arena, fdir, after) catch continue;
+            const ch = try changesBetween(arena, null, b.files, af.files);
+            if (ch.added.len + ch.changed.len + ch.removed.len > 0) return rid;
+        };
+        return null;
+    }
+
+    /// The folders run `rid` snapshotted, by name: its "before" (its own,
+    /// or one a helper of it took) and its "after" in each, null where
+    /// gone. A helper's own number finds nothing.
+    fn pairsLocked(s: *Store, arena: std.mem.Allocator, rid: u64) ![]const Pair {
+        return pairsIn(arena, try s.headsLocked(arena), rid);
+    }
+
+    /// A snapshot's header and id.
+    const Head = struct { id: u64, h: Header };
+    /// A folder's snapshot headers, oldest first.
+    const Heads = struct { heads: []const Head };
+
+    /// Every folder's snapshot headers, read once.
+    fn headsLocked(s: *Store, arena: std.mem.Allocator) ![]const Heads {
+        var out: std.ArrayList(Heads) = .empty;
+        const root = try std.fs.path.join(arena, &.{ s.dir, "folders" });
+        var d = Io.Dir.cwd().openDir(s.io, root, .{ .iterate = true }) catch return out.items;
+        defer d.close(s.io);
+        var it = d.iterate();
+        while (try it.next(s.io)) |e| {
+            if (e.kind != .directory) continue;
+            const fdir = try std.fs.path.join(arena, &.{ root, e.name });
+            var heads: std.ArrayList(Head) = .empty;
+            for (try s.ids(arena, fdir)) |id| try heads.append(arena, .{ .id = id, .h = s.header(arena, fdir, id) catch continue });
+            if (heads.items.len > 0) try out.append(arena, .{ .heads = heads.items });
+        }
+        return out.items;
+    }
+
+    /// `nowOf`, read once per path.
+    fn nowCached(s: *Store, arena: std.mem.Allocator, cache: *std.StringHashMapUnmanaged(Now), root: []const u8, rel: []const u8) !Now {
+        if (cache.get(rel)) |n| return n;
+        const n = s.nowOf(arena, root, rel);
+        try cache.put(arena, rel, n);
+        return n;
+    }
+
+    /// What `rel` under `root` is now: absent, a file (its content's hash
+    /// and executable bit), or something else (a folder, a symbolic link,
+    /// or one on the way).
+    fn nowOf(s: *Store, arena: std.mem.Allocator, root: []const u8, rel: []const u8) Now {
+        s.checkWay(arena, root, rel, false) catch |e| return if (e == error.FileNotFound) .absent else .other;
+        const abs = std.fs.path.join(arena, &.{ root, native(arena, rel) catch return .other }) catch return .other;
+        const st = Io.Dir.cwd().statFile(s.io, abs, .{ .follow_symlinks = false }) catch |e| return if (e == error.FileNotFound) .absent else .other;
+        if (st.kind != .file) return .other;
+        const h = hashFile(s.io, abs) catch return .other;
+        return .{ .file = .{ .sha = h.sha, .exec = if (has_exec) st.permissions.toMode() & 0o111 != 0 else false } };
     }
 
     /// Puts `src` back as at snapshot `id`. It takes a snapshot first, so
@@ -806,6 +1066,106 @@ pub const Store = struct {
     }
 };
 
+/// A file as it is now: absent, a file, or something else.
+const Now = union(enum) {
+    absent,
+    file: struct { sha: [64]u8, exec: bool },
+    other,
+};
+
+/// Whether `now` is what a snapshot has for its path (null: none).
+fn sameAs(now: Now, entry: ?File) bool {
+    const e = entry orelse return now == .absent;
+    return switch (now) {
+        .file => |x| std.mem.eql(u8, &x.sha, &e.sha) and x.exec == e.exec,
+        .absent, .other => false,
+    };
+}
+
+/// Whether two snapshots have the same for a path (null: none).
+fn sameFile(x: ?File, y: ?File) bool {
+    const a = x orelse return y == null;
+    const b = y orelse return false;
+    return std.mem.eql(u8, &a.sha, &b.sha) and a.exec == b.exec;
+}
+
+/// The group a changed path undoes with: the database file a side file
+/// (`-wal`, `-shm`, `-journal`) belongs to, when that is a file in either
+/// snapshot; else the path itself.
+fn groupKey(path: []const u8, was: *const std.StringHashMapUnmanaged(File), is: *const std.StringHashMapUnmanaged(File)) []const u8 {
+    for (side_suffixes) |sfx| {
+        if (path.len <= sfx.len or !std.mem.endsWith(u8, path, sfx)) continue;
+        const base = path[0 .. path.len - sfx.len];
+        if (was.contains(base) or is.contains(base)) return base;
+    }
+    return path;
+}
+
+/// A path in folder `base` ("" the workspace) as the workspace has it.
+fn shownPath(arena: std.mem.Allocator, base: []const u8, rel: []const u8) ![]const u8 {
+    if (base.len == 0) return rel;
+    return std.fmt.allocPrint(arena, "{s}/{s}", .{ base, rel });
+}
+
+fn sorted(arena: std.mem.Allocator, names: []const []const u8) ![]const []const u8 {
+    const out = try arena.dupe([]const u8, names);
+    std.mem.sort([]const u8, out, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return out;
+}
+
+/// Run `rid`'s pair in each folder of `table` (see `Store.pairsLocked`),
+/// by folder name.
+fn pairsIn(arena: std.mem.Allocator, table: []const Store.Heads, rid: u64) ![]const Store.Pair {
+    var out: std.ArrayList(Store.Pair) = .empty;
+    if (rid == 0) return out.items;
+    for (table) |fo| {
+        var p: Store.Pair = .{ .name = "" };
+        for (fo.heads) |hd| {
+            const h = hd.h;
+            const mine = switch (h.when) {
+                .after => h.rid == rid,
+                .before => (h.rid == rid and h.parent == 0) or h.parent == rid,
+                .hand, .tool => false,
+            };
+            if (!mine) continue;
+            p.name = h.folder;
+            if (h.when == .after) {
+                p.after = hd.id;
+                p.changed = h.changed;
+            } else if (p.after == null) p.before = hd.id;
+        }
+        if (p.name.len > 0) try out.append(arena, p);
+    }
+    std.mem.sort(Store.Pair, out.items, {}, struct {
+        fn lt(_: void, x: Store.Pair, y: Store.Pair) bool {
+            return std.mem.lessThan(u8, x.name, y.name);
+        }
+    }.lt);
+    return out.items;
+}
+
+/// What changed from `old` to `now` (`before`: `old`'s id).
+fn changesBetween(arena: std.mem.Allocator, before: ?u64, old: []const File, now: []const File) !Changes {
+    var was: std.StringHashMapUnmanaged(File) = .empty;
+    for (old) |f| try was.put(arena, f.path, f);
+    var is: std.StringHashMapUnmanaged(void) = .empty;
+    var added: std.ArrayList([]const u8) = .empty;
+    var changed: std.ArrayList([]const u8) = .empty;
+    var removed: std.ArrayList([]const u8) = .empty;
+    for (now) |f| {
+        try is.put(arena, f.path, {});
+        if (was.get(f.path)) |o| {
+            if (!std.mem.eql(u8, &o.sha, &f.sha) or o.exec != f.exec) try changed.append(arena, f.path);
+        } else try added.append(arena, f.path);
+    }
+    for (old) |f| if (!is.contains(f.path)) try removed.append(arena, f.path);
+    return .{ .before = before, .added = added.items, .changed = changed.items, .removed = removed.items };
+}
+
 /// The snapshots a folder keeps: its section's `snapshots`, else 50.
 fn keepFor(f: ?*const folders.Folders, name: []const u8) usize {
     const fs = f orelse return folders.default_keep;
@@ -842,6 +1202,11 @@ fn writeHeader(out: *std.ArrayList(u8), arena: std.mem.Allocator, h: Header) !vo
     try util.jsonString(out, arena, h.agent);
     try out.appendSlice(arena, ",\"by\":");
     try util.jsonString(out, arena, h.by);
+    if (h.conversation.len > 0) {
+        try out.appendSlice(arena, ",\"conversation\":");
+        try util.jsonString(out, arena, h.conversation);
+    }
+    if (h.parent > 0) try out.print(arena, ",\"parent\":{d}", .{h.parent});
     try out.print(arena, ",\"when\":\"{s}\",\"files\":{d},\"changed\":{d},\"bytes\":{d}}}\n", .{ @tagName(h.when), h.files, h.changed, h.bytes });
 }
 
@@ -861,6 +1226,8 @@ fn parseHeader(arena: std.mem.Allocator, line: []const u8) !Header {
         .run = jv.str(jv.get(v, "run")) orelse "",
         .agent = jv.str(jv.get(v, "agent")) orelse "",
         .by = jv.str(jv.get(v, "by")) orelse "",
+        .conversation = jv.str(jv.get(v, "conversation")) orelse "",
+        .parent = num(jv.get(v, "parent")),
         .when = std.meta.stringToEnum(When, jv.str(jv.get(v, "when")) orelse "") orelse .hand,
         .files = @intCast(num(jv.get(v, "files"))),
         .changed = @intCast(num(jv.get(v, "changed"))),
@@ -1320,4 +1687,236 @@ test "changes_lists_added_changed_and_removed" {
     try t.expectEqual(null, c1.before);
     try expectNames(&.{ "a", "b" }, c1.added);
     try t.expectError(error.NoSuchSnapshot, f.store.changes(a, "src", 7));
+}
+
+// ---- undo ----
+
+/// A snapshot of `src` for run `rid` (a helper's names its run in `parent`).
+fn runSnap(f: *Fx, when: When, rid: u64, parent: u64) !Taken {
+    return f.store.take(f.arena.allocator(), f.source(), .{ .when = when, .by = .{ .rid = rid, .parent = parent, .run = "chat", .agent = "main", .conversation = "main" } });
+}
+
+fn isExec(f: *Fx, sub: []const u8) !bool {
+    const st = try f.tmp.dir.statFile(t.io, try std.fs.path.join(f.arena.allocator(), &.{ "src", sub }), .{});
+    return st.permissions.toMode() & 0o111 != 0;
+}
+
+test "undo_takes_back_only_that_runs_changes" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.put("a.md", "1");
+    try f.put("b.md", "2");
+    try f.put("x.sh", "#!/bin/sh\n");
+    if (posix) try f.tmp.dir.setFilePermissions(t.io, "src/x.sh", .fromMode(0o755), .{});
+    try f.put("keep.md", "k");
+    // run 41: its "before" taken by its helper, run 44
+    const before = try runSnap(&f, .before, 44, 41);
+    try f.put("a.md", "9");
+    try f.tmp.dir.deleteFile(t.io, "src/b.md");
+    try f.put("c/new.md", "made");
+    if (posix) try f.tmp.dir.setFilePermissions(t.io, "src/x.sh", .fromMode(0o644), .{});
+    _ = try runSnap(&f, .after, 41, 0);
+    // the helper's "before" names its run and the run's conversation
+    try expectHas(try f.snapText("src", before.id), "\"by\":\"owner\",\"conversation\":\"main\",\"parent\":41,\"when\":\"before\"");
+    // another run, after it
+    _ = try runSnap(&f, .before, 50, 0);
+    try f.put("d.md", "the other run's");
+    _ = try runSnap(&f, .after, 50, 0);
+    const u = try f.store.undo(a, 41, f.root, null);
+    try t.expect(u.found);
+    try t.expectEqual(1, u.folders.len);
+    const uf = u.folders[0];
+    try t.expectEqualStrings("src", uf.name);
+    if (posix) try expectNames(&.{ "src/a.md", "src/b.md", "src/c/new.md", "src/x.sh" }, uf.undone) else try expectNames(&.{ "src/a.md", "src/b.md", "src/c/new.md" }, uf.undone);
+    try expectNames(&.{"src/c/new.md"}, uf.removed);
+    try t.expectEqual(0, uf.left.len);
+    try t.expectEqual(0, uf.failed.len);
+    try t.expectEqual(0, u.pruned.len);
+    try t.expectEqualStrings("1", try f.get("a.md"));
+    try t.expectEqualStrings("2", try f.get("b.md"));
+    try t.expect(f.gone("src/c/new.md"));
+    if (posix) try t.expect(try isExec(&f, "x.sh"));
+    try t.expectEqualStrings("the other run's", try f.get("d.md"));
+    try t.expectEqualStrings("k", try f.get("keep.md"));
+    // a snapshot was taken first, by the owner
+    const infos = try f.store.list(a, "src");
+    const last = infos[infos.len - 1];
+    try t.expectEqual(uf.snapshot, last.id);
+    try t.expectEqual(.hand, last.when);
+    try t.expectEqualStrings("before undoing run 41", last.label);
+    try t.expectEqualStrings("owner", last.by);
+    try expectHas(try f.logText(), try std.fmt.allocPrint(a, "\"event\":\"undo\",\"run\":41,\"folders\":\"src\",\"undone\":{d},\"left\":0", .{uf.undone.len}));
+    // again: undone already, and nothing is snapshotted for it
+    const again = try f.store.undo(a, 41, f.root, null);
+    try t.expect(again.found);
+    try t.expectEqual(uf.undone.len, again.already);
+    try t.expectEqual(0, again.folders[0].undone.len);
+    try t.expectEqual(0, again.folders[0].snapshot);
+    try t.expectEqual(infos.len, (try f.store.list(a, "src")).len);
+    // a helper's own number finds nothing: its changes are its run's
+    try t.expect(!(try f.store.undo(a, 44, f.root, null)).found);
+}
+
+test "a_file_changed_since_is_left_and_listed" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.put("a.md", "1");
+    try f.put("b.md", "1");
+    try f.put("r.md", "removed by the run");
+    _ = try runSnap(&f, .before, 41, 0);
+    try f.put("a.md", "2");
+    try f.put("b.md", "2");
+    try f.put("m.md", "made by the run");
+    try f.tmp.dir.deleteFile(t.io, "src/r.md");
+    _ = try runSnap(&f, .after, 41, 0);
+    // since: b.md changed again, r.md made again with other words, and
+    // m.md deleted (as before the run: nothing to do)
+    try f.put("b.md", "3, by hand");
+    try f.put("r.md", "made again by hand");
+    try f.tmp.dir.deleteFile(t.io, "src/m.md");
+    const u = try f.store.undo(a, 41, f.root, null);
+    try expectNames(&.{"src/a.md"}, u.folders[0].undone);
+    try expectNames(&.{ "src/b.md", "src/r.md" }, u.folders[0].left);
+    try t.expectEqual(1, u.already);
+    try t.expectEqualStrings("1", try f.get("a.md"));
+    try t.expectEqualStrings("3, by hand", try f.get("b.md"));
+    try t.expectEqualStrings("made again by hand", try f.get("r.md"));
+    try t.expect(f.gone("src/m.md"));
+    try expectHas(try f.logText(), "\"event\":\"undo\",\"run\":41,\"folders\":\"src\",\"undone\":1,\"left\":2");
+    // a link where the run left a file is changed since, never written through
+    if (posix) {
+        _ = try runSnap(&f, .before, 60, 0);
+        try f.put("l.md", "the run's");
+        _ = try runSnap(&f, .after, 60, 0);
+        try f.tmp.dir.deleteFile(t.io, "src/l.md");
+        try f.tmp.dir.writeFile(t.io, .{ .sub_path = "outside.md", .data = "outside" });
+        try f.tmp.dir.symLink(t.io, "../outside.md", "src/l.md", .{});
+        const v = try f.store.undo(a, 60, f.root, null);
+        try expectNames(&.{"src/l.md"}, v.folders[0].left);
+        try t.expectEqualStrings("outside", try f.tmp.dir.readFileAlloc(t.io, "outside.md", a, .unlimited));
+    }
+}
+
+test "a_database_goes_with_its_wal_and_shm" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.put("app.db", "pages");
+    try f.put("app.db-wal", "wal 1");
+    // a side file's name with no file of its own name: a file of its own
+    try f.put("notes-journal", "a plain file");
+    _ = try runSnap(&f, .before, 41, 0);
+    // the run writes the database: its WAL grows, its index is made
+    try f.put("app.db-wal", "wal 1 2");
+    try f.put("app.db-shm", "index");
+    try f.put("notes-journal", "changed");
+    _ = try runSnap(&f, .after, 41, 0);
+    const u = try f.store.undo(a, 41, f.root, null);
+    try expectNames(&.{ "src/app.db-shm", "src/app.db-wal", "src/notes-journal" }, u.folders[0].undone);
+    try t.expectEqualStrings("pages", try f.get("app.db"));
+    try t.expectEqualStrings("wal 1", try f.get("app.db-wal"));
+    try t.expect(f.gone("src/app.db-shm"));
+    try t.expectEqualStrings("a plain file", try f.get("notes-journal"));
+    // a database used since the run: all of it is left, named by the database
+    _ = try runSnap(&f, .before, 60, 0);
+    try f.put("app.db", "pages 2");
+    try f.put("app.db-wal", "wal 3");
+    _ = try runSnap(&f, .after, 60, 0);
+    try f.put("app.db-journal", "a transaction since");
+    const v = try f.store.undo(a, 60, f.root, null);
+    try t.expectEqual(0, v.folders[0].undone.len);
+    try expectNames(&.{"src/app.db"}, v.folders[0].left);
+    try t.expectEqual(0, v.folders[0].snapshot);
+    try t.expectEqualStrings("pages 2", try f.get("app.db"));
+    try t.expectEqualStrings("wal 3", try f.get("app.db-wal"));
+    // and one whose WAL alone changed since
+    try f.tmp.dir.deleteFile(t.io, "src/app.db-journal");
+    try f.put("app.db-wal", "wal 3 4");
+    const w = try f.store.undo(a, 60, f.root, null);
+    try expectNames(&.{"src/app.db"}, w.folders[0].left);
+    try t.expectEqualStrings("pages 2", try f.get("app.db"));
+}
+
+test "undo_can_be_restored" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.put("a.md", "1");
+    _ = try runSnap(&f, .before, 41, 0);
+    try f.put("a.md", "2");
+    try f.put("n.md", "new");
+    _ = try runSnap(&f, .after, 41, 0);
+    const u = try f.store.undo(a, 41, f.root, null);
+    try t.expectEqualStrings("1", try f.get("a.md"));
+    try t.expect(f.gone("src/n.md"));
+    _ = try f.store.restore(a, f.source(), u.folders[0].snapshot, .{});
+    try t.expectEqualStrings("2", try f.get("a.md"));
+    try t.expectEqualStrings("new", try f.get("n.md"));
+}
+
+test "a_run_whose_snapshots_were_pruned_is_too_old" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.put("a.md", "1");
+    _ = try runSnap(&f, .before, 41, 0);
+    try f.put("a.md", "2");
+    _ = try runSnap(&f, .after, 41, 0);
+    const fs = try folders.parse(a, "[src]\nsnapshots = 1\n");
+    _ = try f.store.prune(a, &fs);
+    const u = try f.store.undo(a, 41, f.root, &fs);
+    try t.expect(u.found);
+    try expectNames(&.{"src"}, u.pruned);
+    try t.expectEqual(0, u.folders.len);
+    try t.expectEqualStrings("2", try f.get("a.md"));
+    // a run never snapshotted
+    try t.expect(!(try f.store.undo(a, 77, f.root, &fs)).found);
+}
+
+test "the_newest_run_with_changes_of_a_conversation" {
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const in = struct {
+        fn snap(fx: *Fx, when: When, rid: u64, conv: []const u8) !void {
+            _ = try fx.store.take(fx.arena.allocator(), fx.source(), .{ .when = when, .by = .{ .rid = rid, .conversation = conv } });
+        }
+    };
+    try f.put("a.md", "1");
+    // run 41 in main changes a file; run 45 in main changes nothing; run
+    // 43 in a topic changes one
+    try in.snap(&f, .before, 41, "main");
+    try f.put("a.md", "2");
+    try in.snap(&f, .after, 41, "main");
+    try in.snap(&f, .before, 43, "house-search");
+    try f.put("h.md", "h");
+    try in.snap(&f, .after, 43, "house-search");
+    try in.snap(&f, .before, 45, "main");
+    try in.snap(&f, .after, 45, "main");
+    try t.expectEqual(41, (try f.store.newestRun(a, "main")).?);
+    try t.expectEqual(43, (try f.store.newestRun(a, "house-search")).?);
+    try t.expectEqual(null, try f.store.newestRun(a, "elsewhere"));
+    // runs that overlap: run 51's pair falls between run 50's halves, so
+    // 50's "after" counts nothing new, yet 50's pair holds a change
+    try in.snap(&f, .before, 50, "main");
+    try in.snap(&f, .before, 51, "house-search");
+    try f.put("b.md", "b");
+    try in.snap(&f, .after, 51, "house-search");
+    try in.snap(&f, .after, 50, "main");
+    try t.expectEqual(50, (try f.store.newestRun(a, "main")).?);
+    // a run whose "before" is gone still counts by its "after"
+    try in.snap(&f, .before, 60, "main");
+    try f.put("a.md", "3");
+    try in.snap(&f, .after, 60, "main");
+    const fs = try folders.parse(a, "[src]\nsnapshots = 1\n");
+    _ = try f.store.prune(a, &fs);
+    try t.expectEqual(60, (try f.store.newestRun(a, "main")).?);
 }

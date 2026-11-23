@@ -5,8 +5,11 @@ with the bot or in a topic of it per subject. It does research, hands
 parts of a job to helpers that work in parallel, sends a morning brief on
 the topics you follow, runs scheduled tasks, watches feeds, pages, folders
 and MCP servers with triggers, runs workflows (steps with their state on
-disk, waiting for a time, an event or your approval), uses MCP servers and
-saved skills, and remembers what you bring up. Every action it takes, and every
+disk, waiting for a time, an event or your approval), uses MCP servers
+(programs it starts, or servers at a url with a token or a sign-in) and
+saved skills, remembers what you bring up, keeps summaries of each
+conversation by day, week and month, and can search every earlier turn.
+Every action it takes, and every
 action of its helpers, passes one gate and is written to one log you can
 check.
 
@@ -31,20 +34,23 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 737 unit tests (19 of them
+**State: 0.3.0, tested on macOS by its own tests: 817 unit tests (19 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 75 checks that drives the real binary against
+and an end-to-end script of 85 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram, feeds,
-search and two MCP servers. An earlier build of 0.3.0 also passed its
-tests in CI on Linux and Windows. On Windows 11 the browser and login
+search, two MCP servers run as programs, and MCP servers at a url with a
+token or a sign-in (with a stand-in authorization server and browser).
+An earlier build of 0.3.0 also passed its tests in CI on Linux and
+Windows. On Windows 11 the browser and login
 tests also run, against Chrome 157, and the console, lock, Credential
 Manager and process-cleanup checks of HANDOFF-windows-audit.md were run by
 hand. With environments, apps, clones and safe state files added,
 Windows 11 and Linux (WSL, bubblewrap 0.9, OpenSSH 9.6) pass their unit
 tests and the end-to-end script; on macOS 15.7 the sandbox (sandbox-exec)
 and APFS clone tests run with the rest. Nothing has run yet against a real
-omnigate or model provider, Telegram bot, MCP server or website.** See
+omnigate or model provider, Telegram bot, MCP server, authorization
+server or website.** See
 [Limits](#limits).
 
 ## Quick start
@@ -179,6 +185,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `apps/` | apps shown in your browser, a folder each with `app.ini` (see Apps); what was approved of each is in `state/apps/` |
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
+| `state/summaries/` | each conversation's summaries (see Long memory): `CONV/day/YYYY-MM-DD.md` (kept 60 days), `CONV/week/YYYY-Www.md` (ISO weeks, kept 400 days), `CONV/month/YYYY-MM.md` (kept); `PERIOD.given-up` where a call failed all day |
 | `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home and, on macOS, its temp; a remote's key), `workflows/NAME/` (each workflow's instances, `N/`, its starts waiting in line, earlier files in `versions/`, a removed file as `removed.wf`), `workflows/day.json` (today's agent steps) |
 
 On macOS and Linux, `config.ini`, `rules`, `logins.ini`, `mcp.ini`,
@@ -520,6 +527,42 @@ and after each run. Where the file system can share blocks (APFS on
 macOS, btrfs, XFS made with reflink, ReFS and Dev Drives on Windows) an
 object is a clone that takes no space until the file changes; elsewhere,
 and for a file made unchangeable (`chflags uchg`), it is a copy.
+
+### Undo
+
+A run that changed files in folders that keep snapshots ends its message
+with a line like "Changed 3 files in notes/ and site/." and an **Undo**
+button: the chat reply, a task's or trigger's post, or harness's own line
+when the run ended on a limit or an error. In the terminal `/undo RUN` is
+printed under it instead (RUN is the run's number in the log). A run that
+posts nothing (a task's NOTHING, a workflow's agent step, a stopped run)
+gets no button; `/undo RUN` still takes it back.
+
+Undo takes back that run's changes file by file, from its "before" and
+"after" snapshots (a helper's changes are its run's): a file as the run
+left it gets its old content and executable bit back, one the run made is
+removed, one it removed is made again. A file changed since the run (by
+you, a program or a later run) is left as it is and named ("notes/a.md
+changed since; left as it is"). A database file goes with its `-wal`,
+`-shm` and `-journal` files: they are put back together, or all left when
+any of them changed since. Before it writes, Undo takes a snapshot of each
+folder it writes in, so `/restore FOLDER ID` takes the undo back; the
+reply names it. Files snapshots don't keep (`skip` matches, `.git`,
+symbolic links, files over 100 MiB) are not taken back, and nothing is
+written through a symbolic link. Only files in the workspace are covered:
+databases reached through an MCP server or over the network keep what the
+run did to them.
+
+Undo is refused while a run is going, as `/restore` is, and once the run's
+snapshots were pruned ("Too old to undo: its snapshots were pruned.").
+Only your press counts, in a group too. The button carries the run's
+number and an HMAC of it with the log's key (`state/log-key`), so nothing
+is kept for it; a press whose HMAC doesn't match is out of date. Pressed,
+the message is edited with the outcome; while a run is going, it says so
+and the button stays. `/undo` takes back the newest run with changes in
+the conversation you send it in, `/undo RUN` that run, and `harness undo
+RUN` does the same from the command line (refused while `harness run`
+holds the folder, like `harness snapshot restore`).
 
 ## Environments
 
@@ -992,16 +1035,91 @@ max_per_day = 2000
 ```
 
 Servers start together (20 s in all) with `harness run`, `chat` and
-`task run` and on `/reload`, each in a folder of its own (`state/mcp/NAME`,
-never the workspace), with only PATH, HOME, LANG, TERM and their named
-secrets (`harness secret add github`; `/reload` picks up one added
-meanwhile). Their tools appear as `github__list_issues` and ask by
-default; a 24 h grant covers that tool with any input; rules match
+`task run` and on `/reload`, each program in a folder of its own
+(`state/mcp/NAME`, never the workspace), with only PATH, HOME, LANG, TERM
+and its named secrets (`harness secret add github`; `/reload` picks up
+one added meanwhile). Their tools appear as `github__list_issues` and ask
+by default; a 24 h grant covers that tool with any input; rules match
 `mcp github/list_issues *` (the server, the tool, then the whole input as
 JSON). Server names use a-z, 0-9, - and _, up to 32 (no `__`); secret
 names follow `harness secret add`. A tool whose `server__tool` name is
 over 64 characters, or that another tool already has, is left out;
 `/status` says which, and what started.
+
+### Servers at a url
+
+```ini
+[github]
+url = https://api.githubcopilot.com/mcp/
+token = github                 ; a stored secret, sent as Authorization: Bearer
+header = X-MCP-Toolsets: issues,pull_requests   ; repeatable
+
+[atlassian]
+url = https://mcp.atlassian.com/v1/mcp
+login = oauth                  ; sign in once: harness mcp login atlassian
+```
+
+A section with `url` instead of `command` is a server reached over MCP's
+Streamable HTTP (MCP 2025-06-18, or 2025-03-26 when the server answers
+with it). `url` is https, or http to this machine (localhost, 127.0.0.1,
+[::1]). `token` names a stored secret (`harness secret add github`), sent
+as `Authorization: Bearer`. `header = Name: value` lines are sent as
+written; they may not set Authorization, Host, Content-*, Mcp-* or
+MCP-Protocol-Version, nor the headers harness writes itself (Accept,
+Accept-Encoding, Connection, Transfer-Encoding, User-Agent,
+Last-Event-ID). `command` and `url` exclude each other, and so do `token`
+and `login = oauth`; `secret =` is for programs; `client_id` and `scope`
+are for a sign-in. A bad line is named with its number at start and in
+`/status`.
+
+Its tools are a program's for the gate, rules, grants, money and the log
+(`mcp github/list_issues *`), and what it answers is masked the same way,
+a token it says back too. A server that ends its session gets a new one
+once and the call is sent again (a call answered 404 did not run); a call
+whose connection was lost is said as failed, never sent twice (it may
+have run). With
+subscriptions, its resource updates come on an event stream kept open
+and opened again with backoff; its session is deleted when harness stops
+or reloads. Redirects are not followed. What goes wrong is said with what
+to do, as for model providers: "atlassian refused the sign-in: harness
+mcp login atlassian", "github refused the token stored as github: store
+the right one with harness secret add github"; 403 refused, 5xx an
+upstream error, a 429 is waited for as told, once, within the turn's
+time.
+
+### Signing in
+
+`harness mcp login atlassian` (in a terminal, with `harness run` going or
+not) signs in with OAuth as MCP's authorization spec says: harness asks
+the server where its sign-in is, registers itself with the authorization
+server (unless `client_id =` names a client registered beforehand) and
+prints a link; it does not open it. Open the link in a browser on this
+machine within 5 minutes: the authorization server sends the browser back
+to `http://127.0.0.1:PORT/callback`, where harness takes that one answer
+and exchanges its code (PKCE S256, a state, the server as the resource).
+`scope =` asks for other scopes than the server names.
+
+On a machine without a browser (one you reach over SSH), forward the port
+the command prints, then open the link on your own machine:
+
+```
+ssh -L 53682:127.0.0.1:53682 you@harness-machine
+```
+
+The tokens and the client are kept as the secret `mcp-atlassian` in the
+secret store (the Keychain, the Credential Manager, or a file only you
+can read; never in the data folder), masked in all output, renewed before
+they expire and once after a 401. A running harness takes a new sign-in
+at its next request to that server, and `/reload` starts a server that
+was not signed in; `/status` names the servers that need a sign-in.
+`harness mcp logout atlassian` forgets it (a running harness stops using
+it on `/reload`). `harness mcp list` shows each server, its kind
+(program, token, sign-in or url), whether it is signed in, and its tools
+as `SERVER/TOOL`, the names rules and workflows use (programs are started
+to list theirs, then stopped).
+
+Not built: client-credential and device sign-ins, signing in from a
+conversation, a stored secret sent in another header than Authorization.
 
 ### Money
 
@@ -1076,7 +1194,11 @@ saved or removed is a line of kind `agent`: `saved` (`name`, `by`,
 `poll` (status, bytes, new, queued, why), `check` (events, yes, tokens),
 `start` (the run, event ids), `done`, `dropped`, `paused`, `resumed`,
 `failed`, `saved` (`by`, `agent`, `item`, `sha256` of the section) and
-`removed` (`by`); no event content but ids. A poll's reads are lines of a
+`removed` (`by`); no event content but ids. Summaries are lines of kind
+`memory`: `summary` (`conversation`, `period`, `words`, `tokens`,
+`provider`), `summary failed` (`why`), `summary given up` (`tries`,
+`why`); a `history` call is a tool line like any other (its argument the
+words, or `run N`). A poll's reads are lines of a
 run labelled `poll NAME`, by `trigger:NAME`, with no definition. Workflows
 are lines of kind `workflow` (`instance` NAME#N, `event`): `start` (by,
 agent, input), `step` (step, try, ok, 200 bytes of result, the step run's
@@ -1094,7 +1216,8 @@ labels (`run`, `conversation`, `by`, `agent`, `to`, `event`, `tool`,
 it was taken, label, files, changed, bytes stored, and the run's rid,
 definition and who started it), `snapshot skipped` (folder, why),
 `restore` (folder, id, the id that undoes it, files written and
-deleted) and `prune` (snapshots and objects deleted). Each line carries the
+deleted), `undo` (run, folders, files put back, files left) and `prune`
+(snapshots and objects deleted). Each line carries the
 SHA-256 of the line before it; `harness log verify` finds the first line
 that was changed, removed or reordered, and also lines cut from the end,
 by the last line named in `state/status`. Harness warns at start if the
@@ -1124,6 +1247,65 @@ or a "not") is a new item. Commands: `/memory`, `/pin ID`, `/unpin ID`,
 something is looked up on request), `/private on|off` (on: nothing
 written to memory, and the log keeps only sizes and hashes keyed with
 `state/log-key`).
+
+## Long memory
+
+Beside the memory items, two ways back to what was said.
+
+**`history`.** A tool the agent has wherever it has `recall` (allowed by
+default; `deny history *` in `rules` stops it). It searches every earlier
+turn in the log: your messages, the agent's replies and posts, and tool
+results (the first 2 KB, what the log keeps). Every word must be in the
+turn (case does not matter, part of a word counts), or a phrase in double
+quotes as written. It answers up to 20 turns, newest first, each with its
+date (your time), conversation and run, then where the older ones start
+(`before = DATE TIME`); `conversation` keeps to one; with `run` it shows
+that run's steps (16 KB, as `/session` does). What a run may search:
+
+| The run | Searches |
+|---|---|
+| started by you in a conversation only you read (main, the terminal, your topics) | every conversation |
+| of a schedule, a trigger or a workflow, or where others read | only its own (its `to`) |
+
+What was said with `/private on` keeps only sizes and hashes in the log,
+so it is never found, and a private run's steps are not shown. You search
+the same way with `/history WORDS` (one message) and `harness log search
+WORDS` (every conversation; an argument with spaces is a phrase; it works
+while harness runs). A `delegate` task gets `history` when it names it
+(a task that names no tools keeps `helper`'s six).
+
+**Summaries by day, week and month.** Once a day, at 03:00 your time or
+the first tick after (where `harness run` or `harness chat` runs), the
+memory model summarises each conversation's earlier days from the log, up
+to 7 days back, oldest first: what you asked for and decided, facts,
+names, numbers, links, what is still open, in at most 150 words. A day's
+turns are the runs you started there and the others that posted there
+(200 KB at most, the newest kept); a day without any makes no call. After
+a Sunday the week's days fold into one summary (ISO weeks, 150 words);
+after a month's last day, its weeks and the days no week covers (200
+words). They are files in `state/summaries/` (see The data folder),
+written whole. A failed call is tried again that day (after 5, 10, 20,
+40 minutes, then hourly) and given up the next; chat never waits for
+them, and `/reload` answers Busy while they run.
+
+Each conversation's prompt gets its own, after the memory items and
+before the summary of its earlier turns: "Earlier in this conversation:",
+the 3 latest days, the 2 latest weeks those days do not cover, the 3
+latest months, at most 1,500 words (the oldest go first), and a line that
+`history` finds anything older or exact. They are in the part of the
+prompt kept for the prompt cache, so it holds: they change only when the
+daily pass writes a file. Helpers and definitions with `memory: pinned`
+don't get them.
+
+Cost: one small model call per active conversation per day, one more on
+Mondays (the week) and on the 1st (the month). `[memory] summaries = off`
+stops them, and keeps them out of prompts (the files stay);
+`summary_model = PROVIDER:MODEL` picks another model than
+`memory_model`. Private conversations get none.
+
+Not built: embeddings or a vector index, and an index of the log: a
+search reads the log from its end (all of a 50 MB log in about 0.1 s here,
+0.6 s in a debug build).
 
 ## Briefs
 
@@ -1507,10 +1689,10 @@ lists, workflows starting workflows (an agent step may `delegate`).
 `/task add|rm|resume`, `/memory`, `/remember`, `/pin`, `/unpin`,
 `/forget`, `/private on|off`, `/skills`, `/skill rm`, `/logins`,
 `/folders`, `/access WHO`, `/snapshots [FOLDER]`, `/snapshot FOLDER
-[LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/envs`, `/env
+[LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/undo [RUN]`, `/envs`, `/env
 check|rm NAME`, `/dryrun on|off`,
 `/reload`, `/conversations`, `/conversation new|rename|rm|add`,
-`/session [N]`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
+`/session [N]`, `/history WORDS`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
 `/agents`, `/agent [NAME]`, `/agent show|rm NAME`, `/ask NAME text`,
 `/triggers`, `/trigger NAME`, `/trigger add|rm|pause|resume|run|test`,
 `/apps`, `/app approve|rm NAME`, `/workflows`, `/workflow NAME|NAME#N`,
@@ -1521,8 +1703,8 @@ act on the conversation they are sent in; `/stop`, `/dryrun` and
 CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `trigger list|test|run`, `workflow list|check|start|stop`,
 `memory [list|pin|unpin|forget ID]`,
-`snapshot list|take|changes|restore`, `env list|check|rm|key`,
-`agent list|show|rm`, `log verify|tail|runs|session`, `inbox [--json]`,
+`snapshot list|take|changes|restore`, `undo RUN`, `env list|check|rm|key`,
+`agent list|show|rm`, `mcp list|login|logout`, `log verify|tail|runs|session|search`, `inbox [--json]`,
 `app list|approve|rm`,
 `health`, `version`. `--home DIR` may come anywhere on the line;
 arguments a command does not take are refused. `health` exits 0 only

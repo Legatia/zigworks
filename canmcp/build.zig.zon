@@ -1,0 +1,16 @@
+.{
+    .name = .canmcp,
+    .version = "0.1.0",
+    .fingerprint = 0x1ed313b10dc20faa,
+    .minimum_zig_version = "0.17.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "profiles",
+        "dbc",
+        "scripts",
+        "README.md",
+        "LICENSE",
+    },
+}

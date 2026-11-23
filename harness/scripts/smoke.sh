@@ -96,6 +96,11 @@ asked() {
 	echo "${q:-0}"
 }
 last_question() { grep -F '"inline_keyboard":[[' "$OUT" | tail -n 1; }
+# undo_button: "MESSAGE_ID DATA" of the last message's Undo button
+undo_button() {
+	grep -F '"callback_data":"u' "$OUT" 2>/dev/null | tail -n 1 |
+		sed -n 's/^{"method":"sendMessage","message_id":\([0-9]*\),.*"callback_data":"\(u[0-9]*-[0-9a-f]*\)".*/\1 \2/p'
+}
 # wait_asked N: until N questions have been asked
 wait_asked() {
 	i=0
@@ -345,6 +350,15 @@ say "/changes notes 2"
 check "changes says what the run added" 'wait_for "$OUT" "Since 1: added a.md."'
 say "/restore notes 1"
 check "restore puts notes back as before the run and says how to undo it" 'wait_for "$OUT" "Restored notes to 1: deleted a.md. /restore notes 3 undoes it." && [ ! -e "$HARNESS_HOME/workspace/notes/a.md" ]'
+# Undo: the reply of a run that changed files says so, with an Undo
+# button; a press takes the run's changes back and edits that message
+reply "$(call_reply tu_u1 write_file '{"path":"notes/b.md","content":"two"}')"
+reply "$(text_reply 'b written')"
+say "write b"
+check "a run's reply says what it changed and carries an Undo button" 'wait_for "$OUT" "b written" && grep -F "b written" "$OUT" | tail -n 1 | grep -qF "Changed 1 file in notes/." && undo_button | grep -qE "^[0-9]+ u[0-9]+-[0-9a-f]{16}$" && [ -f "$HARNESS_HOME/workspace/notes/b.md" ]'
+b=$(undo_button)
+inbox "{\"callback_query\":{\"id\":\"cb$inbox_n\",\"from\":{\"id\":42},\"message\":{\"message_id\":${b%% *},\"chat\":{\"id\":42},\"text\":\"b written\\n\\nChanged 1 file in notes/.\"},\"data\":\"${b#* }\"}}"
+check "Undo takes the run's changes back and edits its message" 'wait_for "$OUT" "Undid run" && grep -F "Undid run" "$OUT" | tail -n 1 | grep -qF "\"method\":\"editMessageText\"" && grep -F "Undid run" "$OUT" | tail -n 1 | grep -qF "\"message_id\":${b%% *},\"text\":\"b written\\n\\nChanged 1 file in notes/.\\n\\nUndid run " && grep -F "Undid run" "$OUT" | tail -n 1 | grep -qF "removed notes/b.md." && [ ! -e "$HARNESS_HOME/workspace/notes/b.md" ]'
 
 # two helpers' questions wait at once, each its own item; the newer is
 # answered first, and the older still waits
@@ -506,12 +520,42 @@ RPID=""
 reply "$(tool_reply tu_t2 'df -h')"
 reply "$(text_reply 'Disk is fine.')"
 check "the call allowed for a task runs on its next run" '"$H" task run disk 2>/dev/null | grep -qF "[disk] Disk is fine." && grep -qF "\"tool_use_id\":\"tu_t2\"" "$(req)" && ! result $mn tu_t2 "refused"'
+# the terminal prints /undo RUN under a run's answer that changed files,
+# and harness undo RUN takes those changes back
+reply "$(call_reply tu_u2 write_file '{"path":"notes/t.md","content":"from the terminal"}')"
+reply "$(text_reply 't written')"
+printf 'write t\n' | "$H" chat >"$T/chat-undo.out" 2>&1
+run_t=$(sed -n 's|^/undo \([0-9][0-9]*\)$|\1|p' "$T/chat-undo.out" | tail -n 1)
+check "the terminal prints /undo RUN under a run's answer that changed files" 'grep -qF "t written" "$T/chat-undo.out" && grep -qF "Changed 1 file in notes/." "$T/chat-undo.out" && [ -n "$run_t" ] && [ -f "$HARNESS_HOME/workspace/notes/t.md" ]'
+check "harness undo RUN takes them back" '"$H" undo "$run_t" 2>/dev/null | grep -qF "Undid run $run_t: removed notes/t.md." && [ ! -e "$HARNESS_HOME/workspace/notes/t.md" ]'
 check "the log chain verifies" '"$H" log verify | grep -qF "chain intact"'
 check "no secret value in the log, typed by the owner or not" '! grep -qE "og-smoke-key-123|telegram-smoke-token|brave-smoke-key|smoke-login-pass" "$HARNESS_HOME/log/actions.jsonl"'
 check "a login is removed with its secrets" '"$H" login rm bot >/dev/null && "$H" login list | grep -qF "No logins." && [ ! -e "$HARNESS_STORE/login-bot-password" ] && ! grep -qF "[bot]" "$HARNESS_HOME/logins.ini"'
 check "memory list works offline" '"$H" memory list 2>/dev/null | grep -qF "I prefer short briefs"'
 check "snapshot list works offline" '"$H" snapshot list notes 2>/dev/null | grep -qF "Snapshots of notes:"'
 check "agent list works offline" '"$H" agent list 2>/dev/null | grep -qF "researcher: Research across several sources"'
+check "log search finds an earlier turn, offline" '"$H" log search "disk is FINE" 2>/dev/null | grep -qF "(task disk)" && "$H" log search "disk is FINE" 2>/dev/null | grep -qF "Agent: Disk is fine."'
+
+# servers at a url (the stand-in's): one with a token, one with a sign-in
+printf 'mcp-smoke-token-1\n' >"$S/mcp-token"
+printf 'mcp-smoke-token-1\n' | "$H" secret add webtok --stdin 2>/dev/null
+cp "$HARNESS_HOME/mcp.ini" "$T/mcp.ini.saved"
+printf '[fake]\ncommand = "%s" --mcp\n[web]\nurl = %s/mcp/token\ntoken = webtok\n[cloud]\nurl = %s/mcp/signin\nlogin = oauth\n' "$F" "$URL" "$URL" >"$HARNESS_HOME/mcp.ini"
+check "mcp list names each server's kind and its tools" '"$H" mcp list >"$T/mcp-list.out" 2>&1 && grep -qxF "fake (program): 3 tools" "$T/mcp-list.out" && grep -qxF "web (token webtok, stored): 3 tools" "$T/mcp-list.out" && grep -qxF "  web/echo  Echo text back." "$T/mcp-list.out" && grep -qxF "cloud (sign-in, not signed in): harness mcp login cloud" "$T/mcp-list.out"'
+# the owner opens the printed link (harness-fake plays the browser)
+"$H" mcp login cloud >"$T/login.out" 2>&1 &
+LPID=$!
+wait_for "$T/login.out" "/auth/authorize?" 10
+LINK=$(grep -o 'http://127\.0\.0\.1:[0-9]*/auth/authorize?[^ ]*' "$T/login.out" | head -n 1)
+"$F" --browse "$LINK" >"$T/browse.out" 2>&1
+wait_for "$T/login.out" "Signed in to cloud." 10
+kill "$LPID" 2>/dev/null
+wait "$LPID" 2>/dev/null
+check "mcp login prints a link and keeps the tokens in the store" 'grep -qF "No browser here? Forward the port first" "$T/login.out" && grep -qF "Signed in to cloud." "$T/login.out" && grep -qF "Signed in to cloud." "$T/browse.out" && grep -qF "fake-access-" "$HARNESS_STORE/mcp-cloud"'
+check "the tokens are in no file of the data folder and never said" '! grep -rqF "fake-access-" "$HARNESS_HOME" && ! grep -qE "fake-(access|refresh)-" "$T/login.out"'
+check "mcp list says the server is signed in, with its tools" '"$H" mcp list 2>&1 | grep -qxF "cloud (sign-in, signed in): 3 tools"'
+check "mcp logout forgets the tokens" '"$H" mcp logout cloud | grep -qxF "Signed out of cloud." && [ ! -e "$HARNESS_STORE/mcp-cloud" ] && "$H" mcp logout cloud | grep -qxF "cloud was not signed in."'
+cp "$T/mcp.ini.saved" "$HARNESS_HOME/mcp.ini"
 
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	echo "smoke: FAILED"

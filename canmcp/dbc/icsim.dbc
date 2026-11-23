@@ -1,0 +1,28 @@
+VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: CONTROLS ICSIM
+
+BO_ 580 SPEED: 5 CONTROLS
+ SG_ speed : 31|16@0+ (0.01,0) [0|655.35] "km/h" ICSIM
+
+BO_ 392 INDICATORS: 4 CONTROLS
+ SG_ left : 0|1@1+ (1,0) [0|1] "" ICSIM
+ SG_ right : 1|1@1+ (1,0) [0|1] "" ICSIM
+
+BO_ 411 DOORS: 3 CONTROLS
+ SG_ door1_locked : 16|1@1+ (1,0) [0|1] "" ICSIM
+ SG_ door2_locked : 17|1@1+ (1,0) [0|1] "" ICSIM
+ SG_ door3_locked : 18|1@1+ (1,0) [0|1] "" ICSIM
+ SG_ door4_locked : 19|1@1+ (1,0) [0|1] "" ICSIM
+
+CM_ "ICSim's default frames (github.com/zombieCraig/ICSim, controls.c and icsim.c), not randomized: speed in hundredths of km/h, big-endian in bytes 3 and 4 (a few km/h of noise while idle); indicators in byte 0; door locks in byte 2, a set bit meaning locked.";
+VAL_ 392 left 0 "off" 1 "on" ;
+VAL_ 392 right 0 "off" 1 "on" ;
+VAL_ 411 door1_locked 0 "unlocked" 1 "locked" ;
+VAL_ 411 door2_locked 0 "unlocked" 1 "locked" ;
+VAL_ 411 door3_locked 0 "unlocked" 1 "locked" ;
+VAL_ 411 door4_locked 0 "unlocked" 1 "locked" ;

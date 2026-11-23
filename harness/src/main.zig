@@ -13,10 +13,14 @@ const agent = @import("agent.zig");
 const logins = @import("logins.zig");
 const totp = @import("totp.zig");
 const session = @import("session.zig");
+const history_mod = @import("history.zig");
 const remote = @import("remote.zig");
 const folders = @import("folders.zig");
 const inbox_mod = @import("inbox.zig");
 const model = @import("model.zig");
+const oauth = @import("oauth.zig");
+const scrub = @import("scrub.zig");
+const undo_mod = @import("undo.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -49,6 +53,7 @@ const usage =
     \\  memory [list|pin|unpin|forget ID]
     \\  snapshot list FOLDER | take FOLDER [LABEL] | changes FOLDER ID | restore FOLDER ID
     \\                             a folder's snapshots, one now, what changed, put it back
+    \\  undo RUN                   take back the files run RUN changed
     \\  env list | check NAME | rm NAME | key NAME
     \\                             where commands can run (environments.ini): list them,
     \\                             try one, remove one's home; a remote's own SSH key
@@ -60,9 +65,14 @@ const usage =
     \\  log tail [N]               print the last N log lines (default 20)
     \\  log runs [N]               a line per run, the last N (default 20)
     \\  log session RID [--json]   a run and its helpers, step by step
+    \\  log search WORDS           earlier turns with every word, newest first
+    \\                             (an argument with spaces is a phrase)
     \\  app list | approve NAME | rm NAME
     \\                             the apps in apps/: list them, serve one as its files
     \\                             are now, remove one with its data
+    \\  mcp list                   the MCP servers in mcp.ini: kind, sign-in and tools
+    \\  mcp login NAME             sign in to a server with login = oauth (prints a link)
+    \\  mcp logout NAME            forget a server's sign-in
     \\  inbox [--json]             what waits for you (--json: every item kept, format v1)
     \\  health                     exit 0 if `harness run` is running and recent
     \\  version | help
@@ -197,16 +207,26 @@ const App = struct {
         return out.items;
     }
 
-    /// The stored secrets the servers in mcp.ini name.
+    /// The stored secrets the servers in mcp.ini name: their programs'
+    /// variables, their tokens, and their sign-ins' tokens and client.
     fn mcpSecrets(app: *App, s: store_mod.Store) []const core_mod.Secrets.Named {
         const p = std.fs.path.join(app.arena, &.{ app.home, "mcp.ini" }) catch return &.{};
         const text = Io.Dir.cwd().readFileAlloc(app.io, p, app.arena, .limited(1 << 20)) catch return &.{};
         const cfgs = mcp.parseConfig(app.arena, text) catch return &.{};
         var out: std.ArrayList(core_mod.Secrets.Named) = .empty;
-        for (cfgs) |sc| for (sc.secrets) |es| {
-            const v = (s.get(app.io, app.arena, es.secret) catch null) orelse continue;
-            out.append(app.arena, .{ .name = es.secret, .value = v }) catch {};
-        };
+        for (cfgs) |sc| {
+            for (sc.secrets) |es| {
+                const v = (s.get(app.io, app.arena, es.secret) catch null) orelse continue;
+                out.append(app.arena, .{ .name = es.secret, .value = v }) catch {};
+            }
+            if (sc.token.len > 0) if (s.get(app.io, app.arena, sc.token) catch null) |v| out.append(app.arena, .{ .name = sc.token, .value = v }) catch {};
+            if (sc.login) {
+                var nb: [40]u8 = undefined;
+                const name = app.arena.dupe(u8, mcp.signinSecret(&nb, sc.name)) catch continue;
+                const tk = (oauth.load(app.io, app.arena, s, name) catch null) orelse continue;
+                for (tk.secrets(app.arena, name) catch continue) |x| out.append(app.arena, .{ .name = x.name, .value = x.value }) catch {};
+            }
+        }
         return out.items;
     }
 
@@ -219,6 +239,7 @@ const App = struct {
         task,
         memory,
         snapshot,
+        undo,
         env,
         app,
         agent,
@@ -232,7 +253,7 @@ const App = struct {
         fn usesTools(r: Role) bool {
             return switch (r) {
                 .run, .chat, .task, .trigger, .workflow => true,
-                .brief, .memory, .snapshot, .env, .app, .agent => false,
+                .brief, .memory, .snapshot, .undo, .env, .app, .agent => false,
             };
         }
     };
@@ -339,7 +360,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "env", "app", "agent", "trigger", "workflow" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "undo", "env", "app", "agent", "trigger", "workflow", "mcp" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -359,10 +380,12 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "task")) return taskCmd(app, rest);
     if (eql(cmd, "memory")) return memoryCmd(app, rest);
     if (eql(cmd, "snapshot")) return snapshotCmd(app, rest);
+    if (eql(cmd, "undo")) return undoCmd(app, rest);
     if (eql(cmd, "env")) return envCmd(app, rest);
     if (eql(cmd, "agent")) return agentCmd(app, rest);
     if (eql(cmd, "trigger")) return triggerCmd(app, rest);
     if (eql(cmd, "workflow")) return workflowCmd(app, rest);
+    if (eql(cmd, "mcp")) return mcpCmd(app, rest);
     if (eql(cmd, "log")) return logCmd(app, rest);
     if (eql(cmd, "app")) return appCmd(app, rest);
     if (eql(cmd, "inbox")) return inboxCmd(app, rest);
@@ -430,10 +453,25 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         const p = try std.fs.path.join(app.arena, &.{ app.home, "mcp.ini" });
         if (Io.Dir.cwd().readFileAlloc(app.io, p, app.arena, .limited(1 << 20))) |text| {
             const cfgs = mcp.parseConfig(app.arena, text) catch &.{};
-            for (cfgs) |sc| for (sc.secrets) |es| {
-                const v = s.get(app.io, app.arena, es.secret) catch null;
-                try outPrint(app.io, "{s} (MCP {s}): {s}\n", .{ es.secret, sc.name, if (v != null) "stored" else "not stored" });
-            };
+            for (cfgs) |sc| {
+                for (sc.secrets) |es| {
+                    const v = s.get(app.io, app.arena, es.secret) catch null;
+                    try outPrint(app.io, "{s} (MCP {s}): {s}\n", .{ es.secret, sc.name, if (v != null) "stored" else "not stored" });
+                }
+                if (sc.token.len > 0) {
+                    const v = s.get(app.io, app.arena, sc.token) catch null;
+                    try outPrint(app.io, "{s} (MCP {s} token): {s}\n", .{ sc.token, sc.name, if (v != null) "stored" else "not stored" });
+                }
+                if (sc.login) {
+                    var nb: [40]u8 = undefined;
+                    const name = mcp.signinSecret(&nb, sc.name);
+                    const v = s.get(app.io, app.arena, name) catch null;
+                    if (v != null)
+                        try outPrint(app.io, "{s} (MCP {s} sign-in): stored\n", .{ name, sc.name })
+                    else
+                        try outPrint(app.io, "{s} (MCP {s} sign-in): not stored (harness mcp login {s})\n", .{ name, sc.name, sc.name });
+                }
+            }
         } else |_| {}
         return .ok;
     }
@@ -924,7 +962,7 @@ fn runCmd(app: *App) !Exit {
                 }) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
                 .callback => |cb| {
                     tc.answer(cb.id);
-                    c.handleCallbackIn(cb.from_id, cb.chat_id, cb.thread, cb.message_id, cb.data);
+                    c.handleCallbackText(cb.from_id, cb.chat_id, cb.thread, cb.message_id, cb.data, cb.text);
                 },
             }
         }
@@ -973,10 +1011,14 @@ const TermChan = struct {
             outPrint(tc.io, "{s}{s}\n", .{ tc.tag(&tb, place), text }) catch {};
             return 0;
         }
-        // quick replies: type one (a press is a message here)
-        if (bs.len > 0 and bs[0][1].len > 0 and bs[0][1][0] == 'r') {
+        // quick replies: type one (a press is a message here); a run's
+        // Undo: typed as /undo RUN
+        if (bs.len > 0 and bs[0][1].len > 0 and (bs[0][1][0] == 'r' or bs[0][1][0] == 'u')) {
             outPrint(tc.io, "{s}{s}\n", .{ tc.tag(&tb, place), text }) catch {};
-            for (bs) |b| outPrint(tc.io, "  > {s}\n", .{b[0]}) catch {};
+            for (bs) |b| {
+                var lb: [64]u8 = undefined;
+                outPrint(tc.io, "{s}\n", .{termButton(&lb, b)}) catch {};
+            }
             return 0;
         }
         // only the answers this question has: money has no 24 h
@@ -1001,6 +1043,13 @@ const TermChan = struct {
         return 0;
     }
 };
+
+/// How the terminal shows a post's button: a quick reply to type
+/// ("  > Yes"), or a run's Undo as its command ("/undo 41").
+fn termButton(buf: []u8, b: [2][]const u8) []const u8 {
+    if (undo_mod.runOf(b[1])) |run| return std.fmt.bufPrint(buf, "/undo {d}", .{run}) catch "/undo";
+    return std.fmt.bufPrint(buf, "  > {s}", .{util.cut(b[0], buf.len - 4)}) catch b[0];
+}
 
 /// The keys for an item's buttons ("[o] allow once  [n] deny"): an
 /// approval's by what each answers, another item's by their place
@@ -1150,6 +1199,17 @@ fn snapshotCmd(app: *App, args: []const []const u8) !Exit {
     const c = try app.open(.snapshot);
     defer c.close();
     try outPrint(app.io, "{s}\n", .{try c.command(app.arena, text.items)});
+    return .ok;
+}
+
+const undo_usage = "usage: harness undo RUN (a run's number)";
+
+/// `harness undo RUN`: the chat's /undo RUN, holding the data folder as
+/// `harness snapshot restore` does (so not while `harness run` holds it).
+fn undoCmd(app: *App, args: []const []const u8) !Exit {
+    const c = try app.open(.undo);
+    defer c.close();
+    try outPrint(app.io, "{s}\n", .{try c.command(app.arena, try std.fmt.allocPrint(app.arena, "/undo {s}", .{args[0]}))});
     return .ok;
 }
 
@@ -1343,6 +1403,247 @@ fn workflowCmd(app: *App, args: []const []const u8) !Exit {
     return if (std.mem.startsWith(u8, said, "Not started")) .failed else .ok;
 }
 
+// ---- MCP servers ----
+
+const mcp_usage = "usage: harness mcp list | mcp login NAME | mcp logout NAME";
+
+fn mcpArgsOk(rest: []const []const u8) bool {
+    if (rest.len == 1 and eql(rest[0], "list")) return true;
+    // an option is never a server's name
+    if (rest.len == 2 and (eql(rest[0], "login") or eql(rest[0], "logout"))) return mcp.validName(rest[1]) and rest[1][0] != '-';
+    return false;
+}
+
+fn mcpCmd(app: *App, args: []const []const u8) !Exit {
+    if (!mcpArgsOk(args)) {
+        complain(mcp_usage, .{});
+        return .usage;
+    }
+    const s = app.store();
+    const p = try std.fs.path.join(app.arena, &.{ app.home, "mcp.ini" });
+    const text: []const u8 = Io.Dir.cwd().readFileAlloc(app.io, p, app.arena, .limited(1 << 20)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => return e,
+    };
+    const cfgs = mcp.parseConfig(app.arena, text) catch {
+        const why = (core_mod.parseProblem(app.arena, "mcp.ini", text, mcp.parseConfig) catch null) orelse "mcp.ini has an error";
+        complain("{s}", .{why});
+        return .failed;
+    };
+    if (eql(args[0], "list")) {
+        if (cfgs.len == 0) {
+            try outAll(app.io, "No MCP servers: mcp.ini has none.\n");
+            return .ok;
+        }
+        try outAll(app.io, try mcpListText(app.gpa, app.arena, app.io, cfgs, .{
+            .store = s,
+            .home = app.home,
+            .path_var = app.env.get("PATH") orelse "",
+            .home_var = app.env.get(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME") orelse "",
+            .system_vars = util.pickVars(app.arena, app.env, util.system_var_names) catch &.{},
+        }));
+        return .ok;
+    }
+    const name = args[1];
+    var nb: [40]u8 = undefined;
+    const secret = mcp.signinSecret(&nb, name);
+    if (eql(args[0], "logout")) {
+        const gone = s.removeLong(app.io, app.gpa, secret) catch {
+            complain("could not remove the sign-in of {s} from {s}", .{ name, s.describe() });
+            return .failed;
+        };
+        try outPrint(app.io, "{s}\n", .{if (gone) try std.fmt.allocPrint(app.arena, "Signed out of {s}.", .{name}) else try std.fmt.allocPrint(app.arena, "{s} was not signed in.", .{name})});
+        return .ok;
+    }
+    const sc = for (cfgs) |c| {
+        if (eql(c.name, name)) break c;
+    } else {
+        complain("mcp.ini has no server {s}", .{name});
+        return .failed;
+    };
+    if (!sc.login) {
+        complain("{s} does not sign in: set login = oauth in [{s}] in mcp.ini", .{ name, name });
+        return .failed;
+    }
+    var show: LinkShow = .{ .app = app, .name = name };
+    var said: []const u8 = "";
+    const tokens = oauth.login(app.gpa, app.io, app.arena, .{
+        .name = name,
+        .url = sc.url,
+        .headers = sc.headers,
+        .client_id = sc.client_id,
+        .scope = sc.scope,
+        .link = .{ .ctx = &show, .f = LinkShow.f },
+    }, &said) catch |e| {
+        complain("{s}", .{if (said.len > 0) said else @errorName(e)});
+        return .failed;
+    };
+    oauth.save(app.io, app.gpa, s, secret, tokens) catch |e| {
+        complain("could not keep the sign-in in {s}: {s}", .{ s.describe(), @errorName(e) });
+        return .failed;
+    };
+    try outPrint(app.io, "Signed in to {s}. Its tokens are kept as the secret {s} ({s}).\nA harness that is running takes them at its next request to {s}; /reload starts {s} if it did not start.\n", .{ name, secret, s.describe(), name, name });
+    return .ok;
+}
+
+/// Prints the sign-in's link (never opens it).
+const LinkShow = struct {
+    app: *App,
+    name: []const u8,
+
+    fn f(ctx: ?*anyopaque, link: []const u8, port: u16) void {
+        const ls: *LinkShow = @ptrCast(@alignCast(ctx.?));
+        outPrint(ls.app.io, "To sign in to {s}, open this link in a browser on this machine within 5 minutes:\n\n{s}\n\nNo browser here? Forward the port first (ssh -L {d}:127.0.0.1:{d} to this machine), then open the link where you are.\n", .{ ls.name, link, port, port }) catch {};
+    }
+};
+
+/// What `mcp list` starts the servers with.
+const McpListEnv = struct {
+    store: store_mod.Store,
+    /// The data folder: a program starts in state/mcp/NAME.
+    home: []const u8,
+    path_var: []const u8,
+    home_var: []const u8,
+    system_vars: []const util.Var,
+    /// All the starts end by then.
+    start_ms: u32 = 20_000,
+};
+
+/// One server of `mcp list`, started on a thread of its own.
+const McpProbe = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    cfg: mcp.ServerConfig,
+    env: *const McpListEnv,
+    deadline_ns: i128 = 0,
+    label: []const u8 = "",
+    /// What to do instead, when it was not started.
+    skipped: ?[]const u8 = null,
+    values: []const []const u8 = &.{},
+    auth: mcp.Auth = .none,
+    dir: []const u8 = "",
+    srv: ?*mcp.Server = null,
+    err: anyerror = error.NotStarted,
+    diag: mcp.Diag = .{},
+
+    fn run(p: *McpProbe) void {
+        p.srv = mcp.Server.start(p.gpa, p.io, p.cfg, .{
+            .cwd = p.dir,
+            .path_var = p.env.path_var,
+            .home = p.env.home_var,
+            .system_vars = p.env.system_vars,
+            .secret_values = p.values,
+            .deadline_ns = p.deadline_ns,
+            .diag = &p.diag,
+            .auth = p.auth,
+        }) catch |e| {
+            p.err = e;
+            return;
+        };
+    }
+};
+
+/// `harness mcp list`: each server, its kind, its sign-in, and its tools
+/// when it can be reached (programs are started for it, then stopped);
+/// masked.
+fn mcpListText(gpa: std.mem.Allocator, a: std.mem.Allocator, io: Io, cfgs: []const mcp.ServerConfig, env: McpListEnv) ![]const u8 {
+    const st = env.store;
+    var shown: std.ArrayList(scrub.Secret) = .empty;
+    const probes = try a.alloc(McpProbe, cfgs.len);
+    const threads = try a.alloc(?std.Thread, cfgs.len);
+    const deadline = Io.Clock.awake.now(io).nanoseconds + @as(i96, env.start_ms) * std.time.ns_per_ms;
+    for (cfgs, probes, threads) |sc, *p, *th| {
+        p.* = .{ .gpa = gpa, .io = io, .cfg = sc, .env = &env, .deadline_ns = deadline };
+        th.* = null;
+        switch (mcp.kindOf(sc)) {
+            .program => {
+                p.label = "program";
+                const values = try a.alloc([]const u8, sc.secrets.len);
+                for (sc.secrets, values) |es, *v| v.* = (st.get(io, a, es.secret) catch null) orelse {
+                    p.skipped = try std.fmt.allocPrint(a, "secret {s} is not stored: harness secret add {s}", .{ es.secret, es.secret });
+                    break;
+                };
+                // one missing: the values after it were never read
+                if (p.skipped != null) continue;
+                for (sc.secrets, values) |es, v| try shown.append(a, .{ .name = es.secret, .value = v });
+                p.values = values;
+                p.dir = mcpServerDir(io, a, env.home, sc.name) catch |e| {
+                    p.skipped = try std.fmt.allocPrint(a, "its folder can't be made ({s})", .{@errorName(e)});
+                    continue;
+                };
+            },
+            .token => {
+                const v = (st.get(io, a, sc.token) catch null) orelse {
+                    p.label = try std.fmt.allocPrint(a, "token {s}, not stored", .{sc.token});
+                    p.skipped = try std.fmt.allocPrint(a, "harness secret add {s}", .{sc.token});
+                    continue;
+                };
+                p.label = try std.fmt.allocPrint(a, "token {s}, stored", .{sc.token});
+                p.auth = .{ .token = .{ .name = sc.token, .value = v } };
+                try shown.append(a, .{ .name = sc.token, .value = v });
+            },
+            .signin => {
+                var nb: [40]u8 = undefined;
+                const secret = try a.dupe(u8, mcp.signinSecret(&nb, sc.name));
+                const tk = (oauth.load(io, a, st, secret) catch null) orelse {
+                    p.label = "sign-in, not signed in";
+                    p.skipped = try std.fmt.allocPrint(a, "harness mcp login {s}", .{sc.name});
+                    continue;
+                };
+                p.label = "sign-in, signed in";
+                p.auth = .{ .signin = .{ .store = st } };
+                try shown.appendSlice(a, try tk.secrets(a, secret));
+            },
+            .url => p.label = "url",
+        }
+        if (p.skipped != null) continue;
+        th.* = std.Thread.spawn(.{}, McpProbe.run, .{p}) catch blk: {
+            p.run();
+            break :blk null;
+        };
+    }
+    for (threads) |th| if (th) |x| x.join();
+    var out: std.ArrayList(u8) = .empty;
+    var started: std.ArrayList(*mcp.Server) = .empty;
+    for (probes) |*p| {
+        const name = p.cfg.name;
+        if (p.skipped) |why| {
+            try out.print(a, "{s} ({s}): {s}\n", .{ name, p.label, why });
+            continue;
+        }
+        const srv = p.srv orelse {
+            if (p.cfg.url.len > 0)
+                try out.print(a, "{s} ({s}): not reached: {s}\n", .{ name, p.label, if (p.diag.len > 0) p.diag.text() else @errorName(p.err) })
+            else
+                try out.print(a, "{s} ({s}): did not start ({s}) {s}\n", .{ name, p.label, @errorName(p.err), util.cut(p.diag.text(), 200) });
+            continue;
+        };
+        try started.append(a, srv);
+        try out.print(a, "{s} ({s}): {d} tools\n", .{ name, p.label, srv.tools().len });
+        for (srv.tools()) |tl| {
+            const desc = std.mem.trim(u8, tl.description[0 .. std.mem.indexOfAny(u8, tl.description, "\r\n") orelse tl.description.len], " \t");
+            try out.print(a, "  {s}/{s}{s}{s}\n", .{ name, tl.name, if (desc.len > 0) "  " else "", util.cut(desc, 100) });
+        }
+    }
+    mcp.stopAll(started.items);
+    if (shown.items.len == 0) return out.items;
+    var sc_mask = try scrub.Scrubber.init(a, shown.items);
+    return sc_mask.scrubAlloc(a, out.items);
+}
+
+/// state/mcp/NAME (0700): a program's own folder, as `harness run` makes it.
+fn mcpServerDir(io: Io, a: std.mem.Allocator, home: []const u8, name: []const u8) ![]const u8 {
+    const base = try std.fs.path.join(a, &.{ home, "state", "mcp" });
+    const dir = try std.fs.path.join(a, &.{ base, name });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    if (builtin.os.tag != .windows) for ([_][]const u8{ base, dir }) |d| {
+        var h = try Io.Dir.cwd().openDir(io, d, .{ .iterate = true });
+        defer h.close(io);
+        try h.setPermissions(io, .fromMode(0o700));
+    };
+    return dir;
+}
+
 fn logCmd(app: *App, args: []const []const u8) !Exit {
     const p = try core_mod.Paths.init(app.arena, app.home);
     if (args.len >= 1 and eql(args[0], "verify")) {
@@ -1402,7 +1703,23 @@ fn logCmd(app: *App, args: []const []const u8) !Exit {
         try outAll(app.io, shown);
         return .ok;
     }
-    complain("usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]", .{});
+    if (args.len >= 2 and eql(args[0], "search")) {
+        // dates in the owner's time, as config.ini says (UTC without it)
+        const offset: i32 = blk: {
+            const text = Io.Dir.cwd().readFileAlloc(app.io, p.config, app.arena, .limited(1 << 20)) catch break :blk 0;
+            break :blk (config.parse(app.arena, text) catch break :blk 0).chat.utc_offset;
+        };
+        const shown = history_mod.searchText(app.arena, app.io, p.log, args[1..], offset) catch |e| {
+            complain("can't read {s}: {s}", .{ p.log, @errorName(e) });
+            return .failed;
+        } orelse {
+            complain("usage: harness log search WORDS (a phrase in double quotes, or an argument with spaces)", .{});
+            return .usage;
+        };
+        try outPrint(app.io, "{s}\n", .{shown});
+        return .ok;
+    }
+    complain("usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json] | log search WORDS", .{});
     return .usage;
 }
 
@@ -1728,7 +2045,8 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
             if (rest.len == 2) return null;
             if (rest.len == 3 and eql(rest[2], "--json")) return null;
         }
-        return "usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json]";
+        if (rest.len >= 2 and eql(rest[0], "search")) return null;
+        return "usage: harness log verify | log tail [N] | log runs [N] | log session RID [--json] | log search WORDS";
     }
     if (eql(cmd, "app")) return if (appArgsOk(rest)) null else app_usage;
     if (eql(cmd, "agent")) {
@@ -1739,8 +2057,10 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     if (eql(cmd, "inbox")) return if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "--json"))) null else "usage: harness inbox [--json]";
     if (eql(cmd, "trigger")) return if (triggerArgsOk(rest)) null else trigger_usage;
     if (eql(cmd, "workflow")) return if (workflowArgsOk(rest)) null else workflow_usage;
+    if (eql(cmd, "mcp")) return if (mcpArgsOk(rest)) null else mcp_usage;
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
+    if (eql(cmd, "undo")) return if (rest.len == 1 and (std.fmt.parseInt(u64, rest[0], 10) catch null) != null) null else undo_usage;
     if (eql(cmd, "env")) return if (envArgsOk(rest)) null else env_usage;
     if (eql(cmd, "login")) {
         if (rest.len == 0) return login_usage;
@@ -2111,6 +2431,7 @@ test {
     _ = @import("sandbox.zig");
     _ = @import("remote.zig");
     _ = @import("snapshots.zig");
+    _ = @import("undo.zig");
     _ = @import("sock.zig");
     _ = @import("store.zig");
     _ = @import("scrub.zig");
@@ -2118,6 +2439,8 @@ test {
     _ = @import("skills.zig");
     _ = @import("agents.zig");
     _ = @import("mcp.zig");
+    _ = @import("mcp_http.zig");
+    _ = @import("oauth.zig");
     _ = @import("page.zig");
     _ = @import("totp.zig");
     _ = @import("logins.zig");
@@ -2246,6 +2569,18 @@ test "log_runs_and_log_session_read_runs_back" {
     try t.expect(badArgs(&.{ "log", "runs", "x" }) != null);
 }
 
+test "log_search_takes_words" {
+    try t.expect(badArgs(&.{ "log", "search", "flats" }) == null);
+    try t.expect(badArgs(&.{ "log", "search", "flight to oslo", "2026" }) == null);
+    try t.expect(badArgs(&.{ "log", "search" }) != null);
+}
+
+test "the_terminal_shows_a_runs_undo_as_its_command" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("/undo 41", termButton(&buf, .{ "Undo", "u41-0123456789abcdef" }));
+    try std.testing.expectEqualStrings("  > Yes", termButton(&buf, .{ "Yes", "r3-abc:1" }));
+}
+
 test "the_terminal_offers_only_the_answers_the_question_has" {
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("[o] allow once  [n] deny", keysLine(&buf, &.{ .{ "Allow once", "a3:once" }, .{ "Deny", "a3:deny" } }));
@@ -2269,6 +2604,16 @@ test "snapshot_arguments_are_checked" {
         std.debug.print("  {s}\n", .{why});
         return error.TestUnexpectedResult;
     };
+}
+
+test "undo_arguments_are_checked" {
+    for ([_][]const []const u8{
+        &.{"undo"}, &.{ "undo", "x" }, &.{ "undo", "1", "2" }, &.{ "undo", "-1" },
+    }) |line| if (badArgs(line) == null) {
+        printLine("accepted:", line);
+        return error.TestUnexpectedResult;
+    };
+    try t.expect(badArgs(&.{ "undo", "41" }) == null);
 }
 
 test "the_terminal_answers_by_id_when_several_are_open" {
@@ -2360,6 +2705,67 @@ test "start_notes_name_each_provider_in_use_without_its_key" {
     const on = try startNotes(a, &os, &.{ o.model.model, o.model.worker_model, o.model.memory_model });
     try t.expectEqual(1, on.len);
     try t.expectEqualStrings("note: no openrouter key stored under \"openrouter\"; model calls will be refused. Run: harness secret add openrouter", on[0]);
+}
+
+test "mcp_commands_take_their_arguments" {
+    for ([_][]const []const u8{ &.{ "mcp", "list" }, &.{ "mcp", "login", "atlassian" }, &.{ "mcp", "logout", "my_server-2" } }) |line| if (badArgs(line)) |why| {
+        std.debug.print("{s}: {s}\n", .{ line[1], why });
+        return error.TestUnexpectedResult;
+    };
+    for ([_][]const []const u8{ &.{"mcp"}, &.{ "mcp", "list", "x" }, &.{ "mcp", "login" }, &.{ "mcp", "logout" }, &.{ "mcp", "login", "--x" }, &.{ "mcp", "login", "a", "b" }, &.{ "mcp", "login", "Bad" }, &.{ "mcp", "login", "a__b" }, &.{ "mcp", "add", "x" }, &.{ "mcp", "logout", "" } }) |line|
+        try std.testing.expect(badArgs(line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "mcp list") != null);
+}
+
+test "mcp_list_says_each_servers_kind_sign_in_and_tools" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ e.dir, "secrets" }) };
+    try st.put(t.io, "webtok", "mcp-test-token-1");
+    const home = try std.fs.path.join(a, &.{ e.dir, "home" });
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, build_options.fake_path, a);
+    const text = try std.fmt.allocPrint(a,
+        \\[prog]
+        \\command = "{s}" --mcp
+        \\[needs]
+        \\command = "{s}" --mcp
+        \\secret = KEY_ONE:webtok, KEY_TWO:nothere, KEY_THREE:webtok
+        \\[web]
+        \\url = {s}/mcp/token
+        \\token = webtok
+        \\[nokey]
+        \\url = {s}/mcp/token
+        \\token = missing
+        \\[cloud]
+        \\url = {s}/mcp/signin
+        \\login = oauth
+        \\[gone]
+        \\url = http://127.0.0.1:1/mcp
+        \\
+    , .{ fake, fake, try e.url(), try e.url(), try e.url() });
+    const out = try mcpListText(t.allocator, a, t.io, try mcp.parseConfig(a, text), .{
+        .store = st,
+        .home = home,
+        .path_var = "/usr/bin:/bin",
+        .home_var = "/tmp",
+        .system_vars = &.{},
+    });
+    for ([_][]const u8{
+        "prog (program): 3 tools\n  prog/echo  Echo text back.\n  prog/fail  Always fails.\n  prog/sleep  Wait ms milliseconds.\n",
+        "web (token webtok, stored): 3 tools\n  web/echo  Echo text back.\n",
+        "nokey (token missing, not stored): harness secret add missing\n",
+        "needs (program): secret nothere is not stored: harness secret add nothere\n",
+        "cloud (sign-in, not signed in): harness mcp login cloud\n",
+        "gone (url): not reached: gone could not be reached (ConnectFailed)\n",
+    }) |want| {
+        if (std.mem.indexOf(u8, out, want) == null) std.debug.print("not in:\n{s}\nwanted:\n{s}\n", .{ out, want });
+        try std.testing.expect(std.mem.indexOf(u8, out, want) != null);
+    }
+    // in mcp.ini's order, and nothing secret in it
+    try std.testing.expect(std.mem.indexOf(u8, out, "prog").? < std.mem.indexOf(u8, out, "gone").?);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mcp-test-token-1") == null);
 }
 
 test "harness_trigger_takes_list_test_and_run" {

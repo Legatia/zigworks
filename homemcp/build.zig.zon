@@ -1,0 +1,15 @@
+.{
+    .name = .homemcp,
+    .version = "0.1.0",
+    .fingerprint = 0xef17c5959224eb9e,
+    .minimum_zig_version = "0.17.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "examples",
+        "README.md",
+        "LICENSE",
+    },
+}

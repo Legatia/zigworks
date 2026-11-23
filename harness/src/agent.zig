@@ -23,7 +23,10 @@ const sandbox = @import("sandbox.zig");
 const remote = @import("remote.zig");
 const copies = @import("copies.zig");
 const snapshots_mod = @import("snapshots.zig");
+const undo_mod = @import("undo.zig");
 const agents = @import("agents.zig");
+const history_mod = @import("history.zig");
+const summaries_mod = @import("summaries.zig");
 const Io = std.Io;
 
 /// What came of asking the owner. `once`, `day`, `deny`: an approval's
@@ -120,6 +123,24 @@ pub const Post = struct {
     final: bool = false,
     /// The model's last text, posted by harness: it did not use `send`.
     implicit: bool = false,
+    /// The reply of a run that changed files in folders that keep
+    /// snapshots: harness ends it with what changed, and Undo.
+    changed: ?*const Changed = null,
+};
+
+/// What a run changed in the folders that keep snapshots, from its
+/// "before" and "after" ones: its message says so, with an Undo button.
+pub const Changed = struct {
+    /// The run (its id in the log); 0: none.
+    rid: u64 = 0,
+    files: usize = 0,
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+
+    /// "Changed 3 files in notes/ and site/."
+    pub fn line(c: *const Changed) []const u8 {
+        return c.buf[0..c.len];
+    }
 };
 
 /// How a post went.
@@ -298,6 +319,9 @@ pub const Run = struct {
     grants_path: ?[]const u8 = null,
     log: *log_mod.Log,
     mem: *memory.Store,
+    /// Where `history` reads the log, and the prompt the conversation's
+    /// summaries (long memory); null: neither.
+    history: ?*const history_mod.Source = null,
     /// Held while memory or grants change; shared by all runs.
     lock: *Io.Mutex,
     env: tools.Env,
@@ -392,6 +416,9 @@ pub const Run = struct {
     /// The folders this run snapshotted before changing them (shared with
     /// its helpers); set by the top-level run's `turn`.
     snap_run: ?*SnapRun = null,
+    /// What the run changed in them, once its "after" snapshots are taken
+    /// (at its final post, else its end); its reply says so.
+    changed: Changed = .{},
     /// The definition the run is of: its own copy, taken when it starts
     /// (a change saved meanwhile applies to the next run).
     def: agents.Def = agents.builtin_main,
@@ -491,9 +518,10 @@ pub const Run = struct {
         return set.pick(value).provider.name;
     }
 
-    /// Who takes a snapshot in this run.
+    /// Who takes a snapshot in this run: the run, its conversation, and a
+    /// delegated run's the run that delegated it (whose pair it shares).
     fn snapBy(r: *const Run) snapshots_mod.By {
-        return .{ .rid = r.rid, .run = r.label, .agent = r.who.agent, .by = r.who.by };
+        return .{ .rid = r.rid, .run = r.label, .agent = r.who.agent, .by = r.who.by, .conversation = r.conversation, .parent = r.parent_rid orelse 0 };
     }
 
     /// Where this run's commands run, the first that applies: a `[use]`
@@ -543,6 +571,8 @@ pub const Run = struct {
             .delegate => if (r.model_cfg == null) return false,
             .mcp, .money => if (r.mcp.len == 0) return false,
             .skill, .skill_save => if (r.skills_dir.len == 0) return false,
+            // where there is a log to read, in every run, as recall
+            .history => if (r.history == null) return false,
             .browse => if (r.env.browser.len == 0) return false,
             // the browser with the logins (helpers never: above); on
             // Windows too since Chrome's pipes there are inherited handles
@@ -941,6 +971,7 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
         if (!r.allows(tool)) continue;
         try out.append(arena, if (tool == .shell) try shellDef(r, arena) else d);
     }
+    if (r.allows(.history)) try out.append(arena, history_mod.tool_def);
     if (r.allows(.send)) try out.append(arena, send_def);
     if (r.allows(.ask_owner)) try out.append(arena, ask_owner_def);
     if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
@@ -1459,6 +1490,9 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
         top_header = true;
         try out.print(arena, "- {s}\n", .{it.body});
     };
+    // the conversation's summaries by day, week and month (long memory):
+    // their files change once a day, so the cached part holds until then
+    if (try earlierBlock(arena, r)) |block| try out.appendSlice(arena, block);
     if (past.summary) |sm| {
         try out.print(arena, "\nSummary of the earlier conversation:\n{s}\n", .{sm});
         if (past.lost > 0) try out.print(arena, "{d} turns of this conversation were dropped without being summarised, to keep it short.\n", .{past.lost});
@@ -1477,6 +1511,15 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
         for (recalled.found) |it| try out.print(arena, "- {s}\n", .{it.body});
     }
     return .{ .stable = stable, .changing = out.items };
+}
+
+/// The summaries of the run's conversation for its prompt: not for a
+/// helper, nor for a definition that reads only pinned memory.
+fn earlierBlock(arena: std.mem.Allocator, r: *const Run) !?[]const u8 {
+    const src = r.history orelse return null;
+    if (src.summaries_on) |on| if (!on.*) return null;
+    if (r.helper or r.def.memory != .shared) return null;
+    return summaries_mod.promptBlock(arena, r.io, src.summaries_dir, r.conversation, r.allows(.history));
 }
 
 /// One turn. `from_owner`: the text is the owner's own words (mentions
@@ -1513,8 +1556,9 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     defer if (own_copy) endCopy(r, a, &copy_state);
     var snap_state: SnapRun = undefined;
     const own_snaps = !r.helper and r.snap_run == null and r.snaps != null and r.gate.folders != null;
+    if (!r.helper) r.changed = .{};
     if (own_snaps) {
-        snap_state = .{ .gpa = r.gpa };
+        snap_state = .{ .gpa = r.gpa, .rid = r.rid };
         r.snap_run = &snap_state;
     }
     defer if (own_snaps) {
@@ -1756,6 +1800,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         },
         // the whole input: rules and the owner see all of it
         .mcp, .money => try std.fmt.allocPrint(a, "{s}/{s} {s}", .{ mt.?.server.name, mt.?.tool, input_json }),
+        .history => history_mod.gateArg(a, input_json) catch return .{ .text = "history needs words, or a run's number", .is_error = true },
         else => tools.mainArg(a, tool, input_json) catch return .{ .text = "the tool's input is missing its main field", .is_error = true },
     };
     // a skill outside the definition's skills is no skill of this run's
@@ -1898,6 +1943,12 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
             break :blk .{ .text = said };
         },
         .delegate => try delegate(r, a, input_json),
+        // as far as this run may see; masked again with today's values
+        .history => blk: {
+            const src = r.history.?;
+            const got = try history_mod.call(a, r.io, src, .{ .scope = src.scopeOf(r.who.by, r.conversation), .utc_offset = r.utc_offset, .secrets = r.env.secrets }, input_json);
+            break :blk .{ .text = got.text, .is_error = got.is_error };
+        },
         .snapshot => try snapshotTool(r, a, arg, jv.str(jv.get(jv.parse(a, input_json), "label")) orelse ""),
         .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
         .skill => blk: {
@@ -2464,7 +2515,14 @@ fn postThrough(r: *Run, a: std.mem.Allocator, p: *const Post, target: Target, as
         try r.logRun(.send, private, .{ .to = target.name, .event = "refused", .bytes = p.text.len, .text = p.text, .files = files, .buttons = buttons, .final = p.final, .implicit = p.implicit, .delivered = false, .why = why });
         return .{ .refused = why };
     }
-    const d = ob.post(ob.ctx, a, p);
+    // the reply: what the run changed, from its "after" snapshots taken
+    // now (no call of the run runs after its final post)
+    var post = p.*;
+    if (p.final) {
+        finishSnaps(r, a);
+        if (r.changed.files > 0) post.changed = &r.changed;
+    }
+    const d = ob.post(ob.ctx, a, &post);
     try r.logRun(.send, private, .{
         .to = target.name,
         .event = @tagName(d.status),
@@ -2546,11 +2604,16 @@ pub fn sentText(a: std.mem.Allocator, name: []const u8, input_json: []const u8) 
 /// share the run's pair (the plan's Ruling 5).
 pub const SnapRun = struct {
     gpa: std.mem.Allocator,
+    /// The top-level run: the pair is its (its helpers' changes are its).
+    rid: u64 = 0,
     /// Held while a "before" snapshot is taken: a helper's change waits.
     mutex: Io.Mutex = .init,
     taken: std.ArrayList(Taken) = .empty,
+    /// The "after" snapshots are taken.
+    ended: bool = false,
 
-    const Taken = struct { folder: []u8, ok: bool };
+    /// A folder, whether its "before" was taken, and the ids of the pair.
+    const Taken = struct { folder: []u8, ok: bool, before: u64 = 0, after: u64 = 0 };
 
     pub fn deinit(s: *SnapRun) void {
         for (s.taken.items) |tk| s.gpa.free(tk.folder);
@@ -2586,20 +2649,55 @@ fn snapBefore(r: *Run, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) v
             continue;
         };
         const got = takeSnapshot(r, a, store, f, folder, .before) orelse continue;
-        sr.taken.items[sr.taken.items.len - 1].ok = got.refused == null;
+        const tk = &sr.taken.items[sr.taken.items.len - 1];
+        tk.ok = got.refused == null;
+        tk.before = got.id;
     }
 }
 
-/// When the top-level run ends: the "after" snapshot of each folder it
-/// snapshotted before, then old snapshots and unnamed objects go.
+/// The "after" snapshot of each folder the run snapshotted before, once:
+/// at its final post (no call of the run runs after it, and its message
+/// says what changed), else when it ends. What the run changed, from each
+/// pair, goes to `r.changed`.
+fn finishSnaps(r: *Run, a: std.mem.Allocator) void {
+    const store = r.snaps orelse return;
+    const sr = r.snap_run orelse return;
+    const f = r.gate.folders orelse return;
+    sr.mutex.lockUncancelable(r.io);
+    defer sr.mutex.unlock(r.io);
+    if (sr.ended) return;
+    sr.ended = true;
+    var files: usize = 0;
+    var names: std.ArrayList([]const u8) = .empty;
+    for (sr.taken.items) |*tk| if (tk.ok) {
+        const got = takeSnapshot(r, a, store, f, tk.folder, .after) orelse continue;
+        if (got.refused != null) continue;
+        tk.after = got.id;
+        const name = if (tk.folder.len == 0) "/" else tk.folder;
+        const d = store.diff(a, name, tk.before, got.id) catch continue;
+        const n = d.added.len + d.changed.len + d.removed.len;
+        if (n == 0) continue;
+        files += n;
+        names.append(a, name) catch continue;
+    };
+    if (files == 0) return;
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    r.changed = .{ .rid = sr.rid, .files = files };
+    r.changed.len = undo_mod.line(&r.changed.buf, files, names.items).len;
+}
+
+/// When the top-level run ends: its "after" snapshots, unless its final
+/// post took them, then old snapshots and unnamed objects go.
 fn snapAfter(r: *Run, a: std.mem.Allocator) void {
     const store = r.snaps orelse return;
     const sr = r.snap_run orelse return;
     const f = r.gate.folders orelse return;
     if (sr.taken.items.len == 0) return;
-    for (sr.taken.items) |tk| if (tk.ok) {
-        _ = takeSnapshot(r, a, store, f, tk.folder, .after);
-    };
+    finishSnaps(r, a);
     if (store.prune(a, f)) |_| {} else |e| r.log.write(.files, false, .{ .event = "prune failed", .why = @errorName(e) }) catch {};
 }
 
@@ -5045,6 +5143,58 @@ test "the_stable_instructions_stay_the_same_through_a_turn" {
     try t.expectEqualStrings(try systemOf(&f, 1), try systemOf(&f, 2));
 }
 
+test "the_prompt_carries_the_latest_summaries_within_1500_words" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const dir = try std.fs.path.join(a, &.{ f.e.dir, "summaries" });
+    for ([_][2][]const u8{
+        .{ "main/day/2026-11-21.md", "Saturday: the dentist moved to 11.\n" },
+        .{ "main/week/2026-W46.md", "Week 46: flats in Basel.\n" },
+        .{ "main/month/2026-10.md", "October: the move.\n" },
+        .{ "family/day/2026-11-21.md", "The family's Saturday.\n" },
+    }) |x| {
+        const p = try std.fs.path.join(a, &.{ dir, x[0] });
+        try Io.Dir.cwd().createDirPath(t.io, std.fs.path.dirname(p).?);
+        try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p, .data = x[1] });
+    }
+    var src: history_mod.Source = .{ .log_path = try std.fs.path.join(a, &.{ f.e.dir, "actions.jsonl" }), .summaries_dir = dir };
+    f.run.history = &src;
+    f.run.conversation = "main";
+    const pin = try f.mem.add("ask before deleting files", null, util.nowSeconds(t.io));
+    _ = try f.mem.setPinned(pin.id, true);
+    f.conv.summary = try t.allocator.dupe(u8, "The owner asked about flats.");
+    try f.e.script(1, model.textReply("one"));
+    try f.e.script(2, model.textReply("two"));
+    var r = try f.say("hello");
+    freeResult(&f.run, r);
+    r = try f.say("and again");
+    freeResult(&f.run, r);
+    // after pinned memory, before the rolling summary, in the cached part:
+    // the same bytes in every turn until the daily pass writes a file
+    const s1 = try systemOf(&f, 1);
+    try t.expectEqualStrings(s1, try systemOf(&f, 2));
+    const pinned = std.mem.indexOf(u8, s1, "Standing instructions from the owner").?;
+    const earlier = std.mem.indexOf(u8, s1, "Earlier in this conversation:").?;
+    const rolling = std.mem.indexOf(u8, s1, "Summary of the earlier conversation:").?;
+    try t.expect(pinned < earlier and earlier < rolling);
+    for ([_][]const u8{ "Month 2026-10: October: the move.", "Week 2026-W46 (2026-11-09 to 2026-11-15): Week 46: flats in Basel.", "2026-11-21 (Saturday): Saturday: the dentist moved to 11.", "history finds anything older than these, or the exact words." }) |want| {
+        if (std.mem.indexOf(u8, s1, want) == null) std.debug.print("missing {s} in {s}\n", .{ want, s1 });
+        try t.expect(std.mem.indexOf(u8, s1, want) != null);
+    }
+    // only this conversation's
+    try t.expect(std.mem.indexOf(u8, s1, "family") == null);
+    // a definition that reads pinned memory only, and a helper, get none
+    const recalled: memory.Recall = .{ .always = &.{}, .found = &.{} };
+    f.run.useDefinition(try defOf(&f, "quiet", "---\nname: quiet\ndescription: Q.\nmemory: pinned\n---\nQuiet.\n"));
+    try t.expect(std.mem.indexOf(u8, (try systemParts(a, &f.run, recalled, .{}, util.nowSeconds(t.io))).stable, "Earlier in this conversation") == null);
+    f.run.useDefinition(agents.builtin_main);
+    try t.expect(std.mem.indexOf(u8, (try systemParts(a, &f.run, recalled, .{}, util.nowSeconds(t.io))).stable, "Earlier in this conversation") != null);
+    f.run.helper = true;
+    try t.expect(std.mem.indexOf(u8, (try systemParts(a, &f.run, recalled, .{}, util.nowSeconds(t.io))).stable, "Earlier in this conversation") == null);
+}
+
 test "helpers_get_the_rest_of_the_turn_not_a_new_one" {
     var f: Fix = undefined;
     try f.init("");
@@ -5225,6 +5375,43 @@ test "kinds_without_a_tool_yet_are_not_offered_or_run" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "this tool is not available here") != null);
     try t.expectEqual(0, f.asked);
     try t.expect(std.mem.indexOf(u8, try f.logText(), "\"kind\":\"gate\"") == null);
+}
+
+test "history_is_offered_like_recall" {
+    var f: Fix = undefined;
+    try f.init("deny history password*\n");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    // no log to read: no history
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "history") == null);
+    var src: history_mod.Source = .{ .log_path = try std.fs.path.join(a, &.{ f.e.dir, "actions.jsonl" }) };
+    f.run.history = &src;
+    try t.expectEqualStrings("shell,read_file,write_file,fetch,search,recall,remember,history,ask_owner,delegate,", try toolNames(&f.run, a));
+    // runs nobody watches have it too
+    f.run.scheduled = true;
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "history,") != null);
+    f.run.scheduled = false;
+    // a definition names it; a delegate task that names no tools keeps 0.3's six
+    f.run.useDefinition(try defOf(&f, "reader", "---\nname: reader\ndescription: R.\ntools: recall, history\n---\n"));
+    try t.expectEqualStrings("recall,history,", try toolNames(&f.run, a));
+    f.run.useDefinition(try defOf(&f, "plain", "---\nname: plain\ndescription: P.\ntools: recall\n---\n"));
+    try t.expectEqualStrings("recall,", try toolNames(&f.run, a));
+    f.run.useDefinition(agents.builtin_main);
+    f.run.narrow = &agents.default_tools;
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "history") == null);
+    f.run.narrow = null;
+    // a call reads the log, without asking; a rule can stop it
+    try f.e.script(1, model.toolReply("tu_1", "history", "{\"words\":\"kayak\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "history", "{\"words\":\"password reset\"}"));
+    try f.e.script(3, model.textReply("found it"));
+    const r = try f.say("plan the kayak trip");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "Owner: plan the kayak trip") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "refused by the gate") != null);
+    try t.expectEqual(0, f.asked);
+    const log = try f.logText();
+    try t.expect(std.mem.indexOf(u8, log, "\"tool\":\"history\",\"decision\":\"allow\",\"why\":\"default for this tool\",\"arg\":\"kayak\"") != null);
 }
 
 test "web_is_offered_only_with_a_browser_and_never_to_helpers" {
@@ -6538,4 +6725,116 @@ test "env_save_asked_in_full" {
     f.run.helper = false;
     f.run.outbox = null;
     try t.expect(!f.run.allows(.env_save));
+}
+
+// ---- undo: what a run changed, on its reply ----
+
+/// An outbox that keeps each post's text and what it said the run changed.
+const ChangeBox = struct {
+    mutex: Io.Mutex = .init,
+    posts: std.ArrayList(Kept) = .empty,
+
+    const Kept = struct { text: []u8, final: bool, files: usize, rid: u64, line: []u8 };
+
+    fn find(_: *anyopaque, a: std.mem.Allocator, name: []const u8) ?Target {
+        return .{ .name = a.dupe(u8, name) catch return null };
+    }
+    fn names(_: *anyopaque, _: std.mem.Allocator) []const []const u8 {
+        return &.{"main"};
+    }
+    fn post(ctx: *anyopaque, _: std.mem.Allocator, p: *const Post) Delivery {
+        const b: *ChangeBox = @ptrCast(@alignCast(ctx));
+        b.mutex.lockUncancelable(t.io);
+        defer b.mutex.unlock(t.io);
+        const text = t.allocator.dupe(u8, p.text) catch return .{ .status = .failed };
+        const line = t.allocator.dupe(u8, if (p.changed) |c| c.line() else "") catch return .{ .status = .failed };
+        b.posts.append(t.allocator, .{ .text = text, .final = p.final, .files = if (p.changed) |c| c.files else 0, .rid = if (p.changed) |c| c.rid else 0, .line = line }) catch {};
+        return .{ .status = .sent, .parts = 1 };
+    }
+    fn outbox(b: *ChangeBox) Outbox {
+        return .{ .ctx = b, .find = find, .names = names, .post = post };
+    }
+    fn deinit(b: *ChangeBox) void {
+        for (b.posts.items) |k| {
+            t.allocator.free(k.text);
+            t.allocator.free(k.line);
+        }
+        b.posts.deinit(t.allocator);
+    }
+};
+
+test "a_runs_final_post_says_what_it_changed" {
+    var f: Fix = undefined;
+    try f.init("allow shell echo *\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const st = try withSnapshots(&f, "[notes]\nsnapshots = on\n[site]\nsnapshots = on\n[other]\nsnapshots = on\n");
+    defer st.deinit();
+    var box: ChangeBox = .{};
+    defer box.deinit();
+    f.run.outbox = box.outbox();
+    f.run.conversation = "main";
+    for ([_][]const u8{ "ws/notes", "ws/site", "ws/other" }) |d| try f.e.tmp.dir.createDirPath(t.io, d);
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "ws/notes/old.txt", .data = "old" });
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/a.txt\",\"content\":\"a\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "send", "{\"text\":\"working on it\"}"));
+    try f.e.script(3, model.toolReply("tu_3", "write_file", "{\"path\":\"notes/old.txt\",\"content\":\"new\"}"));
+    // a command: every folder that keeps snapshots gets its "before"
+    try f.e.script(4, model.toolReply("tu_4", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(5, model.toolReply("tu_5", "write_file", "{\"path\":\"site/c.txt\",\"content\":\"c\"}"));
+    try f.e.script(6, model.toolReply("tu_6", "send", "{\"text\":\"done\",\"final\":true}"));
+    const r1 = try f.say("write three");
+    freeResult(&f.run, r1);
+    try t.expectEqual(2, box.posts.items.len);
+    // a note while it works says nothing of it
+    try t.expectEqual(0, box.posts.items[0].files);
+    // the reply: three files in notes and site; other changed nothing
+    const reply = box.posts.items[1];
+    try t.expect(reply.final);
+    try t.expectEqual(3, reply.files);
+    try t.expectEqualStrings("Changed 3 files in notes/ and site/.", reply.line);
+    try t.expectEqual(f.run.rid, reply.rid);
+    // its "after" snapshots were taken before it went, and once
+    const lt = try f.logText();
+    const after_at = std.mem.indexOf(u8, lt, "\"event\":\"snapshot\",\"folder\":\"site\",\"id\":2,\"when\":\"after\"").?;
+    const sent_at = std.mem.indexOf(u8, lt, "\"text\":\"done\"").?;
+    try t.expect(after_at < sent_at);
+    for ([_][]const u8{ "notes", "site", "other" }) |name| try t.expectEqual(2, (try st.list(a, name)).len);
+    // a turn that changes nothing says nothing of it
+    try f.e.script(7, model.toolReply("tu_7", "send", "{\"text\":\"nothing new\",\"final\":true}"));
+    const r2 = try f.say("anything?");
+    freeResult(&f.run, r2);
+    try t.expectEqual(3, box.posts.items.len);
+    try t.expectEqual(0, box.posts.items[2].files);
+}
+
+test "a_helpers_changes_count_for_its_run" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    const st = try withSnapshots(&f, "[notes]\nsnapshots = on\n");
+    defer st.deinit();
+    var box: ChangeBox = .{};
+    defer box.deinit();
+    f.run.outbox = box.outbox();
+    f.run.conversation = "main";
+    try f.e.tmp.dir.createDirPath(t.io, "ws/notes");
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"write h\",\"tools\":[\"write_file\"]}]}"));
+    try f.e.script(2, model.toolReply("h1", "write_file", "{\"path\":\"notes/h.md\",\"content\":\"h\"}"));
+    try f.e.script(3, model.textReply("written"));
+    try f.e.script(4, model.toolReply("tu_2", "send", "{\"text\":\"the helper wrote it\",\"final\":true}"));
+    const r = try f.say("delegate a note");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, box.posts.items.len);
+    try t.expectEqualStrings("Changed 1 file in notes/.", box.posts.items[0].line);
+    // the helper took the "before"; the run's number finds the pair
+    const infos = try st.list(a, "notes");
+    try t.expectEqualStrings("chat/h1", infos[0].run);
+    try t.expectEqual(.after, infos[1].when);
+    const u = try st.undo(a, box.posts.items[0].rid, f.run.env.workspace, f.g.folders);
+    try t.expectEqual(1, u.folders.len);
+    try t.expectEqual(1, u.folders[0].undone.len);
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "ws/notes/h.md", .{}));
 }
