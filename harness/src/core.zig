@@ -54,6 +54,7 @@ const alerts_mod = @import("alerts.zig");
 const mail_mod = @import("mail.zig");
 const diary_mod = @import("diary.zig");
 const meds_mod = @import("meds.zig");
+const habits_mod = @import("habits.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -700,6 +701,10 @@ pub const Core = struct {
     /// Medication reminders: the schedule and today's reminders
     /// (state/meds; see Meds).
     meds: meds_mod.Store,
+    /// Habits: the week's look and what was suggested (state/habits; see
+    /// Habits), and whether a look is going, on a thread of its own.
+    habits: habits_mod.State,
+    habits_running: std.atomic.Value(bool),
     /// What /reload says when the settings files have an error.
     problem_buf: [800]u8 = undefined,
 
@@ -895,6 +900,10 @@ pub const Core = struct {
         c.meds = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "meds" }));
         errdefer c.meds.deinit();
         c.meds.load() catch |e| c.log.write(.config, false, .{ .event = "meds not read", .why = @errorName(e) }) catch {};
+        c.habits = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "habits" }));
+        errdefer c.habits.deinit();
+        c.habits.load() catch |e| c.log.write(.config, false, .{ .event = "habits not read", .why = @errorName(e) }) catch {};
+        c.habits_running = .init(false);
         c.role = "open";
         // problem_buf: written before it is read
         // the inbox: read, its first id from 0.3's approval numbers; items
@@ -950,7 +959,7 @@ pub const Core = struct {
         if (c.worker) |w| w.join();
         // no speech from now on; its requests going end (their runs stopped)
         c.stopVoiceAgent();
-        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire) or c.mail_job.running.load(.acquire) or c.diary.reading.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire) or c.mail_job.running.load(.acquire) or c.diary.reading.load(.acquire) or c.habits_running.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
@@ -970,6 +979,7 @@ pub const Core = struct {
         c.group_posts.deinit(c.gpa);
         c.diary.deinit();
         c.meds.deinit();
+        c.habits.deinit();
         c.defs.deinit();
         for (c.told_topics.items) |n| c.gpa.free(n);
         c.told_topics.deinit(c.gpa);
@@ -5680,6 +5690,8 @@ pub const Core = struct {
         if (c.poller_on) c.peopleDue(now_s);
         // the butler's mailbox: its owner's mail a conversation
         if (c.poller_on) c.mailDue(now_s);
+        // the week's look at the owner's habits (Habits)
+        if (c.poller_on) Habits.due(c, now_s);
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
         c.noteUrgent();
@@ -9339,7 +9351,7 @@ pub const Core = struct {
 
     /// An answer to a mail setup item (under the setup lock): written and
     /// applied before the item closes.
-    fn mailAnswer(c: *Core, a: std.mem.Allocator, run: []const u8, conv: []const u8, key: []const u8) !SetupDone {
+    fn mailAnswer(c: *Core, a: std.mem.Allocator, run: []const u8, conv: []const u8, key: []const u8) !Core.SetupDone {
         _ = conv;
         const eql = std.mem.eql;
         if (eql(u8, run, "mail others")) return .{ .said = try mail_mod.othersList(a, try mail_mod.parseItems(a, c.readOr(a, try c.mailPath(a, "others-said.json")))) };
@@ -9679,7 +9691,7 @@ pub const Core = struct {
     /// Looks right: calendar.ini, mcp.ini's [calendar] (its changes money
     /// tools) and the rules lines written, applied; the morning summary,
     /// when on, offered again so it lists the events.
-    fn setupCalendarAnswer(c: *Core, a: std.mem.Allocator, key: []const u8) !SetupDone {
+    fn setupCalendarAnswer(c: *Core, a: std.mem.Allocator, key: []const u8) !Core.SetupDone {
         if (std.mem.eql(u8, key, "change")) return .{ .said = calendar_change_help };
         const text = c.readOr(a, try c.setupPath(a, "calendar.ini"));
         if (text.len == 0) return error.NothingPending;
@@ -10051,11 +10063,12 @@ pub const Core = struct {
 
     /// An answer to a setup or routine item (`run` says which); written
     /// and applied before the item closes. error: nothing written.
-    fn setupAnswer(c: *Core, a: std.mem.Allocator, run: []const u8, conv: []const u8, key: []const u8, words: ?[]const u8) !SetupDone {
+    fn setupAnswer(c: *Core, a: std.mem.Allocator, run: []const u8, conv: []const u8, key: []const u8, words: ?[]const u8) !Core.SetupDone {
         c.setup_mutex.lockUncancelable(c.io);
         defer c.setup_mutex.unlock(c.io);
         const eql = std.mem.eql;
         if (std.mem.startsWith(u8, run, "mail ")) return c.mailAnswer(a, run, conv, key);
+        if (std.mem.startsWith(u8, run, "habit ")) return Habits.answer(c, a, run["habit ".len..], conv, key);
         if (eql(u8, run, "setup address")) {
             const w = std.mem.trim(u8, words orelse "", " \t\r\n<>");
             if (butler.looksLikeToken(w)) return .{ .said = token_pasted };
@@ -23928,4 +23941,342 @@ test "bedtime_command_sets_and_clears" {
 
 test {
     _ = @import("habits.zig");
+}
+
+/// Habits (Rulings 8–11 in docs/superpowers/plans/2026-11-23-habits.md):
+/// once a week from 10:00, the owner's own `home_set` calls of the last 14
+/// days, read from the log; one pattern at most becomes a schedule's item
+/// ([Yes] [No, and don't ask again]), held in quiet hours as any; Yes
+/// shows the routine's files, then writes them. Nothing here acts: only
+/// the routine the owner said yes to, through the gate as any routine.
+const Habits = struct {
+    const yes_label = "Yes";
+    const no_label = "No, and don't ask again";
+    const by = "schedule:habits";
+
+    /// From the tick where harness runs: the pass on a thread of its own.
+    fn due(c: *Core, now_s: i64) void {
+        if (c.restarting.load(.acquire)) return;
+        {
+            c.habits.mutex.lockUncancelable(c.io);
+            defer c.habits.mutex.unlock(c.io);
+            if (!habits_mod.passDue(c.habits.data.pass, now_s, c.cfg.chat.utc_offset)) return;
+        }
+        if (c.habits_running.swap(true, .acq_rel)) return;
+        const th = std.Thread.spawn(.{}, thread, .{c}) catch {
+            c.habits_running.store(false, .release);
+            return;
+        };
+        th.detach();
+    }
+
+    fn thread(c: *Core) void {
+        defer c.habits_running.store(false, .release);
+        pass(c, c.paths.log);
+    }
+
+    /// The week's pass over the log at `log_path`, when due: marked first
+    /// (the next in a week, whatever this one finds), then at most one
+    /// suggestion, none while the last waits for its answer.
+    fn pass(c: *Core, log_path: []const u8) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const now_s = c.now();
+        const off = c.cfg.chat.utc_offset;
+        const today = meds_mod.dayOf(now_s, off);
+        const d = blk: {
+            c.habits.mutex.lockUncancelable(c.io);
+            defer c.habits.mutex.unlock(c.io);
+            if (!habits_mod.passDue(c.habits.data.pass, now_s, off)) return;
+            var d = c.habits.data.clone(a) catch return;
+            d.pass = today;
+            c.habits.put(d) catch |e| {
+                c.log.write(.config, false, .{ .event = "habits not written", .why = @errorName(e) }) catch {};
+                return;
+            };
+            break :blk d;
+        };
+        if (d.waiting(today)) return;
+        const home = butler.parseHome(a, c.readOr(a, c.dataPath(a, "home.ini") catch return)) catch return;
+        if (home.devices.len == 0) return;
+        const calls = habits_mod.scan(a, c.io, log_path, now_s - habits_mod.span_days * 86400, now_s, off) catch |e| {
+            c.log.write(.config, false, .{ .event = "habits not read", .why = @errorName(e) }) catch {};
+            return;
+        };
+        var skip: std.ArrayList([]const u8) = .empty;
+        skip.appendSlice(a, d.skip(a, today) catch return) catch return;
+        // a routine of that name already there: not suggested again
+        const p = while (true) {
+            const p = (habits_mod.find(a, calls, home, skip.items) catch return) orelse {
+                c.log.write(.config, false, .{ .event = "habits", .calls = calls.len, .found = false }) catch {};
+                return;
+            };
+            if (c.workflowText(a, p.name(a) catch return) == null) break p;
+            skip.append(a, p.key(a) catch return) catch return;
+        };
+        const name = p.name(a) catch return;
+        const q = habits_mod.question(a, p) catch return;
+        // kept before it is asked
+        {
+            c.habits.mutex.lockUncancelable(c.io);
+            defer c.habits.mutex.unlock(c.io);
+            const nd = (c.habits.data.clone(a) catch return).with(a, .{ .pattern = p, .day = today }) catch return;
+            c.habits.put(nd) catch |e| {
+                c.log.write(.config, false, .{ .event = "habits not written", .why = @errorName(e) }) catch {};
+                return;
+            };
+        }
+        c.log.write(.config, false, .{ .event = "habit suggested", .name = name, .calls = calls.len, .days = p.count }) catch {};
+        if (c.addItem(.{
+            .kind = "routine",
+            .by = by,
+            .run = std.fmt.allocPrint(a, "habit {s}", .{name}) catch return,
+            .conversation = "main",
+            .title = q,
+            .body = q,
+            .choices = &.{ .{ .key = "yes", .label = yes_label }, .{ .key = "never", .label = no_label } },
+            .expires = now_s + habits_mod.expires_s,
+        })) |_| {} else |e| c.log.write(.config, false, .{ .event = "habit not asked", .why = @errorName(e) }) catch {};
+    }
+
+    /// The owner's answer to suggestion `name` (setupAnswer's `habit
+    /// NAME`): No, remembered; Yes, the device checked again, the files
+    /// shown, then written and applied.
+    fn answer(c: *Core, a: std.mem.Allocator, name: []const u8, conv: []const u8, key: []const u8) !Core.SetupDone {
+        c.habits.mutex.lockUncancelable(c.io);
+        defer c.habits.mutex.unlock(c.io);
+        var d = try c.habits.data.clone(a);
+        const o = (try d.byName(a, name)) orelse return error.NothingPending;
+        const p = o.pattern;
+        if (!std.mem.eql(u8, key, "yes")) {
+            o.said = "no";
+            try c.habits.put(d);
+            c.log.write(.config, false, .{ .event = "habit declined", .name = name }) catch {};
+            return .{ .said = "I won't suggest that again." };
+        }
+        // as home.ini has it now: never a device guarded since
+        const home = try butler.parseHome(a, c.readOr(a, try c.dataPath(a, "home.ini")));
+        const dev = home.find(p.device);
+        if (dev == null or !habits_mod.eligible(dev.?.*, p.action)) {
+            o.said = "no";
+            try c.habits.put(d);
+            c.log.write(.config, false, .{ .event = "habit refused", .name = name, .why = "the device is guarded or gone" }) catch {};
+            return .{ .said = try std.fmt.allocPrint(a, "The {s} is asked about every time now, or gone from home.ini, so I won't do it by myself.", .{try butler.spoken(a, p.device)}) };
+        }
+        const files = try habits_mod.routineFiles(a, p, try c.setupDate(a));
+        // read as harness will read them, before anything is written
+        var wd: workflows.Diag = .{};
+        _ = workflows.parse(a, name, files.workflow, &wd) catch return error.RoutineDoesNotRead;
+        const old_t = c.readOr(a, c.paths.triggers);
+        var trig_text = butler.dropSection(a, old_t, name) catch old_t;
+        trig_text = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ std.mem.trimEnd(u8, trig_text, "\n"), if (trig_text.len > 0) "\n\n" else "", files.triggers });
+        var td: triggers.Diag = .{};
+        _ = triggers.parse(a, trig_text, .triggers, &td) catch return error.RoutineDoesNotRead;
+        const rules_text = try c.withRules(a, files.rules);
+        _ = rules.parse(a, rules_text) catch return error.RoutineDoesNotRead;
+        // shown, then written
+        c.sayIn(conv, try std.fmt.allocPrint(a, "Yes writes workflows/{s}.wf:\n\n{s}\nadds to triggers.ini:\n\n{s}\nand to rules:\n\n{s}", .{ name, files.workflow, files.triggers, files.rules }));
+        try c.writeSetting(try std.fs.path.join(a, &.{ c.paths.workflows, try std.fmt.allocPrint(a, "{s}.wf", .{name}) }), files.workflow);
+        try c.writeSetting(c.paths.triggers, trig_text);
+        try c.writeSetting(c.paths.rules, rules_text);
+        o.said = "yes";
+        try c.habits.put(d);
+        c.log.write(.config, false, .{ .event = "routine on", .name = name, .by = "habits" }) catch {};
+        if (c.applySetup()) |why| return .{ .said = try std.fmt.allocPrint(a, "{s} is written. {s}", .{ name, why }) };
+        return .{ .said = try habits_mod.onText(a, p) };
+    }
+};
+
+/// A Monday to come at 10:00 (+01:00), and the log of the owner's
+/// requests at `path`: the living room light on at about 06:45 on the
+/// five weekdays before it, by `by_who`.
+const HabitWeek = struct {
+    now: i64,
+    monday: i64,
+};
+
+fn habitWeek() HabitWeek {
+    var d = @divFloor(quietDay(), 86400) + 7;
+    while (util.weekday(d) != 0) d += 1;
+    return .{ .now = d * 86400 + 9 * 3600, .monday = d };
+}
+
+/// A log with the owner's (or `who`'s) light on at about 06:45 (+01:00)
+/// on the weekdays of the week before `w`, and, with `heat`, the heating
+/// to 21 at 18:30 on each of the seven days before it.
+fn habitLog(f: *Fix, w: HabitWeek, who: []const u8, ok: bool, private: bool, heat: bool) ![]const u8 {
+    const a = f.e.arena.allocator();
+    var log: std.ArrayList(u8) = .empty;
+    var seq: u64 = 0;
+    const minutes = [_]i64{ 40, 50, 45, 55, 42 };
+    for (minutes, 0..) |m, i| {
+        const day = w.monday - 7 + @as(i64, @intCast(i));
+        try habits_mod.runLines(a, &log, &seq, day * 86400 + 5 * 3600 + m * 60, who, "home", "{\"device\": \"Living room light\", \"action\": \"on\"}", ok, private);
+    }
+    if (heat) for (0..7) |i| {
+        const day = w.monday - 7 + @as(i64, @intCast(i));
+        try habits_mod.runLines(a, &log, &seq, day * 86400 + 17 * 3600 + 30 * 60, who, "home", "{\"device\":\"hall_thermostat\",\"action\":\"temperature\",\"value\":\"21\"}", ok, private);
+    };
+    const path = try std.fs.path.join(a, &.{ f.e.dir, "habits-log" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = log.items });
+    return path;
+}
+
+/// The stand-ins' home, its home.ini written.
+fn withHabitsHome(f: *Fix) !void {
+    try withButler(f, false);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try dataFile(f, "home.ini"), .data = stand_in_home });
+}
+
+const habit_q = "You switch the living room light on at about 6:45 on weekdays. Shall I do that?";
+
+test "a_habit_is_suggested_and_written_only_on_yes" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withHabitsHome(&f);
+    const w = habitWeek();
+    const path = try habitLog(&f, w, "owner", true, false, false);
+    f.core.fixed_now = w.now - 3600;
+    Habits.pass(f.core, path);
+    try t.expectEqual(0, f.rec.count("Shall I"));
+    f.core.fixed_now = w.now;
+    Habits.pass(f.core, path);
+    try f.rec.waitFor("BUTTONS " ++ habit_q ++ " [i");
+    const b = f.lastButtons();
+    try t.expect(b.get("yes") != null and b.get("never") != null);
+    try expectHas(try inboxFile(&f), "\"choices\":[{\"key\":\"yes\",\"label\":\"Yes\"},{\"key\":\"never\",\"label\":\"No, and don't ask again\"}]");
+    // nothing written before the answer
+    const wf_path = try std.fs.path.join(a, &.{ f.core.paths.workflows, "habit-living-room-light-on.wf" });
+    try t.expect(!exists(wf_path));
+    try t.expect(std.mem.indexOf(u8, fileText(&f, f.core.paths.triggers), "habit-") == null);
+    try t.expect(std.mem.indexOf(u8, fileText(&f, f.core.paths.rules), "habit-") == null);
+    try f.press("yes");
+    try f.rec.waitFor("Done: I'll switch the living room light on at 06:45 on weekdays. /workflow rm habit-living-room-light-on stops it.");
+    // shown first, then written
+    try t.expect(f.rec.indexOf("Yes writes workflows/habit-living-room-light-on.wf:") < f.rec.indexOf("Done: I'll switch"));
+    try expectHas(fileText(&f, wf_path), "tool home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}");
+    try expectHas(fileText(&f, f.core.paths.triggers), "[habit-living-room-light-on]\nat = 06:45\ndays = mon, tue, wed, thu, fri\nstart = workflow habit-living-room-light-on\n");
+    try expectHas(fileText(&f, f.core.paths.rules), "[workflow:habit-living-room-light-on/act]\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}\n[all]\n");
+    try t.expect(f.core.workflowText(a, "habit-living-room-light-on") != null);
+}
+
+test "habits_count_only_the_owners_own_requests" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    try withHabitsHome(&f);
+    var w = habitWeek();
+    // a member's, a room's, a schedule's, a routine's; the owner's that
+    // failed or were private: none is a habit
+    const cases = [_]struct { who: []const u8, ok: bool, private: bool }{
+        .{ .who = "member:anna", .ok = true, .private = false },
+        .{ .who = "room:kitchen", .ok = true, .private = false },
+        .{ .who = "schedule:lights", .ok = true, .private = false },
+        .{ .who = "workflow:goodnight/night", .ok = true, .private = false },
+        .{ .who = "owner", .ok = false, .private = false },
+        .{ .who = "owner", .ok = true, .private = true },
+    };
+    for (cases) |x| {
+        const path = try habitLog(&f, w, x.who, x.ok, x.private, false);
+        f.core.fixed_now = w.now;
+        Habits.pass(f.core, path);
+        try t.expectEqual(0, f.rec.count("Shall I"));
+        w.now += 7 * 86400;
+        w.monday += 7;
+    }
+    // the front door, every evening at 22:00, by the owner: never
+    const a = f.e.arena.allocator();
+    var log: std.ArrayList(u8) = .empty;
+    var seq: u64 = 0;
+    for (0..7) |i| {
+        const day = w.monday - 7 + @as(i64, @intCast(i));
+        try habits_mod.runLines(a, &log, &seq, day * 86400 + 21 * 3600, "owner", "home", "{\"device\":\"front_door\",\"action\":\"lock\"}", true, false);
+    }
+    const path = try std.fs.path.join(a, &.{ f.e.dir, "habits-door" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = log.items });
+    f.core.fixed_now = w.now;
+    Habits.pass(f.core, path);
+    try t.expectEqual(0, f.rec.count("Shall I"));
+    try t.expectEqual(0, f.core.itemsWaiting());
+}
+
+test "one_suggestion_a_week_and_a_no_is_remembered" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    try withHabitsHome(&f);
+    const w = habitWeek();
+    const path = try habitLog(&f, w, "owner", true, false, true);
+    f.core.fixed_now = w.now;
+    Habits.pass(f.core, path);
+    // the heating, on all seven days, first; one a week
+    try f.rec.waitFor("BUTTONS You set the hall thermostat to 21 °C at about 18:30 every day. Shall I do that? [i");
+    f.core.fixed_now = w.now + 3600;
+    Habits.pass(f.core, path);
+    try t.expectEqual(1, f.rec.count("BUTTONS You"));
+    try f.press("never");
+    try f.rec.waitFor("I won't suggest that again.");
+    // answered: still none until the week is over
+    f.core.fixed_now = w.now + 6 * 86400;
+    Habits.pass(f.core, path);
+    try t.expectEqual(1, f.rec.count("BUTTONS You"));
+    // the next week: the other, never the one declined
+    f.core.fixed_now = w.now + 7 * 86400;
+    Habits.pass(f.core, path);
+    try f.rec.waitFor("BUTTONS " ++ habit_q);
+    try t.expectEqual(2, f.rec.count("BUTTONS You"));
+    try t.expectEqual(1, f.rec.count("BUTTONS You set the hall thermostat to 21"));
+    // a restart keeps what was said
+    try restart(&f);
+    try f.core.setOwner(42);
+    f.core.fixed_now = w.now + 14 * 86400;
+    Habits.pass(f.core, path);
+    try t.expectEqual(1, f.rec.count("BUTTONS You set the hall thermostat to 21"));
+}
+
+test "yes_refuses_a_device_guarded_since" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withHabitsHome(&f);
+    const w = habitWeek();
+    const path = try habitLog(&f, w, "owner", true, false, false);
+    f.core.fixed_now = w.now;
+    Habits.pass(f.core, path);
+    try f.rec.waitFor("BUTTONS " ++ habit_q);
+    const guarded = try std.mem.replaceOwned(u8, a, stand_in_home, "[device living_room_light]\n", "[device living_room_light]\nguarded = yes\n");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try dataFile(&f, "home.ini"), .data = guarded });
+    try f.press("yes");
+    try f.rec.waitFor("The living room light is asked about every time now, or gone from home.ini, so I won't do it by myself.");
+    try t.expectEqual(0, f.rec.count("Yes writes"));
+    try t.expect(!exists(try std.fs.path.join(a, &.{ f.core.paths.workflows, "habit-living-room-light-on.wf" })));
+}
+
+test "the_habits_routine_runs_its_one_call" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withHabitsHome(&f);
+    const w = habitWeek();
+    const path = try habitLog(&f, w, "owner", true, false, false);
+    f.core.fixed_now = w.now;
+    Habits.pass(f.core, path);
+    try f.rec.waitFor("BUTTONS " ++ habit_q);
+    try f.press("yes");
+    try f.rec.waitFor("Done: I'll switch");
+    try t.expectEqualStrings("living_room_light (light): off", try homeCall(&f, "home_state", "{\"device\":\"living_room_light\"}"));
+    // its schedule, at 06:45 the next day: the light on; nothing asked, nothing said
+    const said = f.rec.lines.items.len;
+    f.core.fixed_now = (w.monday + 1) * 86400 + 5 * 3600 + 45 * 60;
+    runWorkflows(&f);
+    try t.expectEqualStrings("living_room_light (light): on", try homeCall(&f, "home_state", "{\"device\":\"living_room_light\"}"));
+    _ = a;
+    try t.expectEqual(0, f.rec.count("Allow this?"));
+    try t.expectEqual(said, f.rec.lines.items.len);
+    try expectHas(try logText(&f), "\"by\":\"workflow:habit-living-room-light-on/act\"");
 }
