@@ -10,6 +10,7 @@ const agents = @import("agents.zig");
 const rules = @import("rules.zig");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
+const alerts = @import("alerts.zig");
 const Allocator = std.mem.Allocator;
 
 /// Which file a section is in.
@@ -41,6 +42,10 @@ pub const Field = struct { name: []const u8, value: []const u8 };
 
 /// `mcp = SERVER resource URI` (uri) or `mcp = SERVER/TOOL JSON` (tool, input).
 pub const Mcp = struct { server: []const u8, uri: []const u8 = "", tool: []const u8 = "", input: []const u8 = "" };
+
+/// Where `announce` is said: the event's room (its speakers, else every
+/// one), or every speaker (`speakers = all`).
+pub const Speakers = enum { room, all };
 
 /// What a match does: a run (`do`), a message without the model (`say`),
 /// a workflow (`start`, its name), or nothing but feed waiting workflows.
@@ -91,6 +96,12 @@ pub const Trigger = struct {
     /// `announce = TEXT`: a line said aloud on the house's speakers for
     /// each event (filled like `say`), beside its action; "": none.
     announce: []const u8 = "",
+    /// `speakers = all`: `announce` on every speaker, not the event's room.
+    speakers: Speakers = .room,
+    /// `escalate = 5m anna, …` (urgent only): who is told when the owner
+    /// doesn't acknowledge; empty: no one (`escalate = no`); null:
+    /// `[butler] escalate`.
+    escalate: ?[]const alerts.Step = null,
     /// "added by agent:main 2026-11-22 (item 41)": the comment right above its header.
     added: []const u8 = "",
     /// Its lines in the file (the mark above its header included), 1-based.
@@ -115,6 +126,7 @@ pub const Trigger = struct {
             .start => |x| .{ .start = try a.dupe(u8, x) },
         };
         if (tr.tools) |tl| o.tools = try dupeList(a, tl);
+        if (tr.escalate) |e| o.escalate = try alerts.dupeSteps(a, e);
         return o;
     }
 
@@ -340,7 +352,7 @@ fn briefSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
 }
 
 const source_keys = [_][]const u8{ "topic", "feed", "search", "page", "file", "mcp" };
-const other_keys = [_][]const u8{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "json", "key", "urgent", "announce" };
+const other_keys = [_][]const u8{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "json", "key", "urgent", "announce", "speakers", "escalate" };
 
 fn kindOfKey(key: []const u8) ?Kind {
     if (std.mem.eql(u8, key, "topic")) return .brief;
@@ -360,10 +372,10 @@ fn oneOf(word: []const u8, words: []const []const u8) bool {
 /// Whether a key goes with a trigger of `kind`.
 fn keyFits(kind: Kind, key: []const u8) bool {
     return switch (kind) {
-        .schedule => oneOf(key, &.{ "every", "at", "days", "do", "say", "start", "to", "agent", "urgent" }),
+        .schedule => oneOf(key, &.{ "every", "at", "days", "do", "say", "start", "to", "agent", "urgent", "escalate" }),
         .brief => oneOf(key, &.{ "topic", "at", "to" }),
         else => blk: {
-            if (oneOf(key, &.{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "urgent", "announce" })) break :blk true;
+            if (oneOf(key, &.{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "urgent", "announce", "speakers", "escalate" })) break :blk true;
             if (kindOfKey(key)) |k| break :blk k == kind;
             if (std.mem.eql(u8, key, "json")) break :blk kind == .page;
             if (std.mem.eql(u8, key, "key")) break :blk kind == .mcp;
@@ -394,6 +406,8 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
     var every_line: usize = 0;
     var at_line: usize = 0;
     var tools_line: usize = 0;
+    var speakers_line: usize = 0;
+    var escalate_line: usize = 0;
     for (g.lines) |l| {
         const v = l.value;
         if (!keyFits(k, l.key)) return badf(a, diag, l.n, "{s} is not a key of a {s} trigger", .{ l.key, @tagName(k) });
@@ -468,6 +482,16 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
             if (v.len == 0) return bad(diag, l.n, "announce needs its text: what the house's speakers say");
             if (try unknownPlaceholder(a, v, k)) |why| return bad(diag, l.n, why);
             tr.announce = v;
+        } else if (std.mem.eql(u8, l.key, "speakers")) {
+            speakers_line = l.n;
+            tr.speakers = std.meta.stringToEnum(Speakers, v) orelse return bad(diag, l.n, "speakers = all (every speaker) or room (the event's room, the default)");
+        } else if (std.mem.eql(u8, l.key, "escalate")) {
+            escalate_line = l.n;
+            var why: []const u8 = "";
+            tr.escalate = alerts.parseEscalate(a, v, &why) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadEscalate => return bad(diag, l.n, why),
+            };
         } else if (std.mem.eql(u8, l.key, "json")) {
             if (!jsonPath(v)) return bad(diag, l.n, "json is a path of names and [N], like data.amount or items[0].price");
             tr.json = v;
@@ -504,6 +528,11 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
     tr.skip = skip.items;
     if (every_line != 0 and at_line != 0) return bad(diag, @max(every_line, at_line), "every or at, not both");
     if (tools_line != 0 and tr.action != .do) return bad(diag, tools_line, "tools go with do");
+    if (speakers_line != 0 and tr.announce.len == 0) return bad(diag, speakers_line, "speakers goes with announce: where it is said");
+    if (escalate_line != 0) {
+        if (!tr.urgent) return bad(diag, escalate_line, "escalate goes with urgent = yes: only urgent alerts go to the household");
+        if (tr.action == .start) return bad(diag, escalate_line, "the workflow it starts says whom it goes to: escalate in the workflow's head");
+    }
     switch (k) {
         .schedule => {
             if (tr.action == .none) return bad(diag, g.head.n, "a schedule needs one of do, say or start");
@@ -888,6 +917,7 @@ pub fn reading(a: Allocator, tr: Trigger, check_model: []const u8) ![]const u8 {
             }
             if (!std.mem.eql(u8, tr.to, "main")) try out.print(a, "; posts to {s}", .{tr.to});
             if (tr.urgent) try out.appendSlice(a, urgent_words);
+            try out.appendSlice(a, try alerts.readingWords(a, tr.escalate));
             try out.append(a, '.');
             return out.items;
         },
@@ -946,9 +976,10 @@ pub fn reading(a: Allocator, tr: Trigger, check_model: []const u8) ![]const u8 {
         },
         .none => try out.appendSlice(a, " is kept for workflows that wait on it"),
     }
-    if (tr.announce.len > 0) try out.print(a, "; says it on the house's speakers: {s}", .{tr.announce});
+    if (tr.announce.len > 0) try out.print(a, "; says it on {s}: {s}", .{ if (tr.speakers == .all) "every speaker" else "the house's speakers", tr.announce });
     if (!std.mem.eql(u8, tr.to, "main")) try out.print(a, "; posts to {s}", .{tr.to});
     if (tr.urgent) try out.appendSlice(a, urgent_words);
+    try out.appendSlice(a, try alerts.readingWords(a, tr.escalate));
     try out.append(a, '.');
     return out.items;
 }
@@ -1284,6 +1315,35 @@ test "announce_is_said_on_the_house_speakers" {
     try refused(a, "[m]\ntopic = Zig | https://z.org/f\nannounce = x\n", 3, "not a key of a brief trigger");
     // the reading says it
     try t.expect(std.mem.indexOf(u8, try reading(a, leak, "claude-haiku"), "; says it on the house's speakers: Water under the kitchen sink. Close the water main.") != null);
+}
+
+test "escalate_and_speakers_are_read" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // its own escalation, or none; else [butler]'s (null)
+    const leak = try parseOne(a, "[leak]\nmcp = home resource home://device/sink_leak\nmatch = to has leak\nurgent = yes\nsay = Water under the kitchen sink.\nescalate = 5m anna, 15m piotr\n");
+    try t.expectEqual(2, leak.escalate.?.len);
+    try t.expectEqualStrings("piotr", (try leak.clone(a)).escalate.?[1].member);
+    try t.expect(std.mem.endsWith(u8, try reading(a, leak, "claude-haiku"), "; urgent: it goes through quiet hours; if you don't answer: anna after 5 min, then piotr after 15 min."));
+    const quiet = try parseOne(a, "[leak]\nmcp = home resource home://device/sink_leak\nurgent = yes\nsay = Water.\nescalate = no\n");
+    try t.expectEqual(0, quiet.escalate.?.len);
+    try t.expect(std.mem.endsWith(u8, try reading(a, quiet, "claude-haiku"), "; it goes to no one else."));
+    try t.expect((try parseOne(a, "[leak]\nmcp = home resource home://device/sink_leak\nurgent = yes\nsay = Water.\n")).escalate == null);
+    // a schedule may be urgent too
+    try t.expectEqual(1, (try parseOne(a, "[door]\nat = 23:00\nurgent = yes\nsay = The door.\nescalate = 10m anna\n")).escalate.?.len);
+    // only urgent alerts escalate; a workflow's head says its own
+    try refused(a, "[leak]\nmcp = home resource home://device/sink_leak\nsay = Water.\nescalate = 5m anna\n", 4, "escalate goes with urgent = yes");
+    try refused(a, "[leak]\nmcp = home resource home://device/sink_leak\nurgent = yes\nstart = workflow leak\nescalate = 5m anna\n", 5, "in the workflow's head");
+    try refused(a, "[leak]\nmcp = home resource home://device/sink_leak\nurgent = yes\nsay = Water.\nescalate = 15m piotr, 5m anna\n", 5, "each later than the one before");
+    // every speaker, or the event's room (the default)
+    const smoke = try parseOne(a, "[smoke]\nmcp = home resource home://device/kitchen_smoke\nmatch = to is ALARM\nurgent = yes\nsay = Smoke alarm.\nannounce = Smoke alarm in the kitchen.\nspeakers = all\n");
+    try t.expectEqual(Speakers.all, smoke.speakers);
+    try t.expectEqual(Speakers.all, (try smoke.clone(a)).speakers);
+    try t.expect(std.mem.indexOf(u8, try reading(a, smoke, "claude-haiku"), "; says it on every speaker: Smoke alarm in the kitchen.") != null);
+    try t.expectEqual(Speakers.room, (try parseOne(a, "[smoke]\nmcp = home resource home://device/kitchen_smoke\nsay = x\nannounce = y\nspeakers = room\n")).speakers);
+    try refused(a, "[smoke]\nmcp = home resource home://device/kitchen_smoke\nsay = x\nspeakers = all\n", 4, "speakers goes with announce");
+    try refused(a, "[smoke]\nmcp = home resource home://device/kitchen_smoke\nsay = x\nannounce = y\nspeakers = kitchen\n", 5, "speakers = all");
 }
 
 test "a_trigger_never_polls_what_speaks" {

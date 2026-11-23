@@ -20510,3 +20510,10 @@ test "an_event_is_said_once" {
     try t.expect(f.core.firstAnnounce("door", "341bb1f1c630816f0cfd049739c6456a"));
     try t.expect(f.core.firstAnnounce("leak", "8b02f6ae15b4b0f3e2a1dc7e4c3d9a10"));
 }
+
+// ---- emergencies: acknowledging, escalation, the fallback ----
+
+test {
+    _ = @import("alerts.zig");
+}
+
