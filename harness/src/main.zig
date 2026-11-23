@@ -1374,11 +1374,12 @@ fn envKeyCmd(app: *App, name: []const u8) !Exit {
     return .ok;
 }
 
-const app_usage = "usage: harness app list | app approve NAME | app rm NAME";
+const app_usage = "usage: harness app list | app approve NAME | app rm NAME | app fork NAME NEW | app versions NAME | app revert NAME N";
 
 fn appArgsOk(rest: []const []const u8) bool {
     if (rest.len == 1) return eql(rest[0], "list");
-    if (rest.len == 2) return eql(rest[0], "approve") or eql(rest[0], "rm");
+    if (rest.len == 2) return eql(rest[0], "approve") or eql(rest[0], "rm") or eql(rest[0], "versions");
+    if (rest.len == 3) return eql(rest[0], "fork") or eql(rest[0], "revert");
     return false;
 }
 
@@ -1388,7 +1389,7 @@ fn appCmd(app: *App, args: []const []const u8) !Exit {
         complain(app_usage, .{});
         return .usage;
     }
-    const text = if (eql(args[0], "list")) "/apps" else try std.fmt.allocPrint(app.arena, "/app {s} {s}", .{ args[0], args[1] });
+    const text = if (eql(args[0], "list")) "/apps" else try std.fmt.allocPrint(app.arena, "/app {s}", .{try std.mem.join(app.arena, " ", args)});
     const c = try app.open(.app);
     defer c.close();
     try outPrint(app.io, "{s}\n", .{try c.command(app.arena, text)});

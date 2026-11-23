@@ -471,6 +471,8 @@ pub const Run = struct {
     /// Where the `env_save` tool reaches harness; null: no `env_save` (only
     /// runs the owner started from a conversation get one).
     edesk: ?EnvDesk = null,
+    /// How app_draft and app_save reach harness (gap 8).
+    adesk: ?AppDesk = null,
     /// The run's own copy of the workspace (its environment has
     /// `workspace = copy`), shared with its helpers; set by the top-level
     /// run while it goes.
@@ -585,7 +587,7 @@ pub const Run = struct {
         // delegated runs answer the run that started them: they never
         // post, ask, save or move money (helpers since 0.3, the rest since)
         if (r.helper) switch (tool) {
-            .delegate, .remember, .skill_save, .send, .ask_owner, .money, .web, .agent_save, .trigger, .workflow, .app_save, .env_save => return false,
+            .delegate, .remember, .skill_save, .send, .ask_owner, .money, .web, .agent_save, .trigger, .workflow, .app_draft, .app_save, .env_save => return false,
             else => {},
         };
         switch (tool) {
@@ -611,8 +613,12 @@ pub const Run = struct {
             .trigger => if (r.desk == null or r.outbox == null or !std.mem.eql(u8, r.who.by, "owner")) return false,
             // the same for the workflow tool (its save is a setup call)
             .workflow => if (r.wdesk == null or r.outbox == null or !std.mem.eql(u8, r.who.by, "owner")) return false,
-            // the platform's kinds: the gate decides them, their tools come later
-            .mail, .app_read, .app_draft, .app_save => return false,
+            // the platform's kinds the gate decides and no tool calls: mail
+            // comes later, an app's reads are its API's
+            .mail, .app_read => return false,
+            // an app's draft and its save (a setup call): only in runs the
+            // owner started from a conversation
+            .app_draft, .app_save => if (r.adesk == null or r.outbox == null or !std.mem.eql(u8, r.who.by, "owner")) return false,
             // a setup call: only in runs the owner started from a conversation
             .env_save => if (r.edesk == null or r.outbox == null or !std.mem.eql(u8, r.who.by, "owner")) return false,
             // where there is a store and folders.ini has a section
@@ -864,6 +870,46 @@ const env_save_def: model.ToolDef = .{
     .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"a-z, 0-9, - and _, up to 32\"},\"text\":{\"type\":\"string\",\"description\":\"the section's lines, kind first (without the [NAME] line)\"}},\"required\":[\"name\",\"text\"]}",
 };
 
+/// What `app_save` is asked about: the folder as harness copied it.
+pub const AppStaged = struct {
+    /// Why it can't be saved; null: it can.
+    why: ?[]const u8 = null,
+    /// The copy's id (`state/apps/pending/ID`).
+    id: []const u8 = "",
+    version: u32 = 0,
+    /// What the owner is asked: the version, app.ini, what widens, each
+    /// file's size and SHA-256, the review page.
+    detail: []const u8 = "",
+    /// Pages with a script or handler written into them (they won't run).
+    inline_in: []const []const u8 = &.{},
+};
+
+/// How the app tools reach harness.
+pub const AppDesk = struct {
+    ctx: *anyopaque,
+    /// Copies app `name` into the workspace as `app-drafts/AS/`; null, or
+    /// why not.
+    draft: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, as: []const u8) ?[]const u8,
+    /// Checks the workspace folder `from` as app `name` and copies it.
+    stage: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, from: []const u8, asked_by: []const u8) AppStaged,
+    /// Installs the copy `id` (the owner allowed it); null, or why not.
+    install: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, id: []const u8, saved: Saved) ?[]const u8,
+    /// Takes the copy `id` away (denied, or never answered).
+    drop: *const fn (ctx: *anyopaque, a: std.mem.Allocator, id: []const u8) void,
+};
+
+const app_draft_def: model.ToolDef = .{
+    .name = "app_draft",
+    .description = "Copy an app (one of the owner's, or the built-in inbox, log or files) into the workspace as app-drafts/AS/, to change with write_file and then save with app_save. For a new app, write app-drafts/NAME/app.ini and index.html yourself instead. An app is a folder of web files harness shows in the owner's browser: app.ini ([app] name, title, description, reads = any of memory, inbox, log, files; files = workspace paths; acts = tools it may ask harness to run, SERVER/TOOL, run:DEFINITION; to = a conversation), index.html, and scripts and styles in files of their own (a script or an on...= handler written into a page never runs; nothing loads from another host). Its page calls fetch('api/info'), api/memory, api/inbox, api/log, api/files?path=, api/data/KEY (GET, PUT, DELETE), POST api/act {tool,input} and POST api/run {agent,text}.",
+    .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"the app to copy\"},\"as\":{\"type\":\"string\",\"description\":\"the draft's name: a-z, 0-9 and -, up to 32; the same name to change that app\"}},\"required\":[\"name\",\"as\"]}",
+};
+
+const app_save_def: model.ToolDef = .{
+    .name = "app_save",
+    .description = "Install an app from a folder in the workspace (default app-drafts/NAME): harness checks it, copies it, and asks the owner every time, showing app.ini, what it reads and may do, and each file's size and hash; what was copied is what is installed. Write {app:NAME} (or {app:NAME/VIEW}) in a message to the owner: harness puts the link in.",
+    .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"the app's name, as in its app.ini\"},\"from\":{\"type\":\"string\",\"description\":\"the folder in the workspace; default app-drafts/NAME\"}},\"required\":[\"name\"]}",
+};
+
 /// shell where environments.ini has environments: the description says
 /// where this run's commands run, and which others `env` may name.
 fn shellDef(r: *const Run, a: std.mem.Allocator) !model.ToolDef {
@@ -1003,6 +1049,8 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
     if (r.allows(.trigger)) try out.append(arena, trigger_def);
     if (r.allows(.workflow)) try out.append(arena, workflow_def);
     if (r.allows(.env_save)) try out.append(arena, env_save_def);
+    if (r.allows(.app_draft)) try out.append(arena, app_draft_def);
+    if (r.allows(.app_save)) try out.append(arena, app_save_def);
     for (r.mcp) |*m| if (r.allowsMcp(m)) try out.append(arena, m.def);
     return out.items;
 }
@@ -1811,6 +1859,8 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
     if (tool == .trigger) return triggerTool(r, a, input_json);
     if (tool == .workflow) return workflowTool(r, a, input_json);
     if (tool == .env_save) return envSave(r, a, input_json);
+    if (tool == .app_draft) return appDraft(r, a, input_json);
+    if (tool == .app_save) return appSave(r, a, input_json);
     if (tool == .ask_owner) return askOwnerTool(r, a, input_json);
     if (tool == .web) {
         // the tool asks the gate itself: for each host and login it uses
@@ -1849,6 +1899,13 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
     // runs a trigger starts move no money until the owner decides ([money] triggers)
     if (tool == .money and std.mem.startsWith(u8, r.who.by, "trigger:") and !r.money.triggers) {
         const why = "money is not moved in runs a trigger starts ([money] triggers = off)";
+        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+    }
+    // an app's own acts never move money, nor the runs it starts until the
+    // owner decides ([money] apps)
+    if (tool == .money and std.mem.startsWith(u8, r.who.by, "app:") and (r.who.agent.len == 0 or !r.money.apps)) {
+        const why = if (r.who.agent.len == 0) "an app's acts move no money" else "money is not moved in runs an app starts ([money] apps = off)";
         try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
     }
@@ -2175,6 +2232,51 @@ fn envSave(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output 
         break :out .{ .text = try std.fmt.allocPrint(a, "saved environment {s}; it applies now. {s}", .{ checked.name, checked.reading }) };
     };
     try r.logRun(.tool, r.isPrivate(), .{ .tool = "env_save", .arg = util.cut(name, 64), .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
+    return out;
+}
+
+/// `app_draft`: a copy of an app in the workspace, for the agent to change.
+fn appDraft(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
+    const desk = r.adesk orelse return .{ .text = "this tool is not available here", .is_error = true };
+    const v = jv.parse(a, input_json);
+    const name = jv.str(jv.get(v, "name")) orelse "";
+    const as = jv.str(jv.get(v, "as")) orelse name;
+    const out: tools.Output = out: {
+        if (try decideAndAsk(r, a, .app_draft, "app_draft", util.cut(name, 64), "", r.now())) |why|
+            break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+        if (desk.draft(desk.ctx, a, name, as)) |why| break :out .{ .text = try std.fmt.allocPrint(a, "no draft: {s}", .{why}), .is_error = true };
+        break :out .{ .text = try std.fmt.allocPrint(a, "copied {s} to app-drafts/{s}/ in the workspace; change it with write_file, then app_save {s}", .{ name, as, as }) };
+    };
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = "app_draft", .arg = util.cut(name, 64), .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
+    return out;
+}
+
+/// `app_save`: a folder of the workspace checked and copied, then asked
+/// every time; the copy is what is installed.
+fn appSave(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
+    const desk = r.adesk orelse return .{ .text = "this tool is not available here", .is_error = true };
+    const v = jv.parse(a, input_json);
+    const name = jv.str(jv.get(v, "name")) orelse "";
+    const from = jv.str(jv.get(v, "from")) orelse try std.fmt.allocPrint(a, "app-drafts/{s}", .{util.cut(name, 64)});
+    const out: tools.Output = out: {
+        const st = desk.stage(desk.ctx, a, name, from, r.def.name);
+        if (st.why) |why| {
+            try r.logRun(.app, false, .{ .event = "refused", .name = util.cut(name, 64), .why = why });
+            break :out .{ .text = try std.fmt.allocPrint(a, "not saved: {s}", .{why}), .is_error = true };
+        }
+        var item: u64 = 0;
+        if (try decideAndAskWith(r, a, .app_save, "app_save", name, st.detail, r.now(), .{ .item = &item })) |why| {
+            desk.drop(desk.ctx, a, st.id);
+            break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+        }
+        if (desk.install(desk.ctx, a, name, st.id, .{ .mark = "", .by = r.who.by, .agent = r.who.agent, .item = item })) |why| {
+            desk.drop(desk.ctx, a, st.id);
+            break :out .{ .text = try std.fmt.allocPrint(a, "not saved: {s}", .{why}), .is_error = true };
+        }
+        const notes = if (st.inline_in.len > 0) try std.fmt.allocPrint(a, " Scripts or on...= handlers written into {s} never run in an app: move them to a .js file.", .{try std.mem.join(a, ", ", st.inline_in)}) else "";
+        break :out .{ .text = try std.fmt.allocPrint(a, "saved app {s} as v{d}; it is served now. Write {{app:{s}}} in a message to the owner for its link.{s}", .{ name, st.version, name, notes }) };
+    };
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = "app_save", .arg = util.cut(name, 64), .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
     return out;
 }
 

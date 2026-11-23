@@ -548,6 +548,15 @@ pub const Core = struct {
     snaps: snapshots_mod.Store,
     /// The app server, when `harness run` or `chat` started it ([apps] on).
     app_server: ?*appserver.Server = null,
+    /// The apps' acts and runs, what each app read since its page loaded,
+    /// and when each started a run (all under `app_mutex`).
+    app_mutex: Io.Mutex = .init,
+    app_jobs: std.ArrayList(*AppJob) = .empty,
+    app_next: u64 = 0,
+    app_seen: std.ArrayList([]u8) = .empty,
+    app_runs: std.ArrayList(AppRan) = .empty,
+    /// Acts going: `close` waits for them.
+    app_active: std.atomic.Value(u32) = .init(0),
 
     chan: ?Channel = null,
     owner: ?i64 = null,
@@ -782,6 +791,12 @@ pub const Core = struct {
         c.settings_mutex = .init;
         c.chan = null;
         c.app_server = null;
+        c.app_mutex = .init;
+        c.app_jobs = .empty;
+        c.app_next = 0;
+        c.app_seen = .empty;
+        c.app_runs = .empty;
+        c.app_active = .init(0);
         c.owner = readOwner(io, c.paths.owner);
         c.switches = .{};
         c.switches.auto_recall.store(c.cfg.memory.auto, .release);
@@ -902,12 +917,22 @@ pub const Core = struct {
         if (c.worker) |w| w.join();
         // no speech from now on; its requests going end (their runs stopped)
         c.stopVoiceAgent();
-        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        // no call of an app from now on; those going end (their runs stopped)
+        if (c.app_server) |s| s.stop();
+        c.app_server = null;
+        while (c.bg_active.load(.acquire) > 0 or c.app_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        for (c.app_jobs.items) |j| {
+            j.arena.deinit();
+            c.gpa.destroy(j);
+        }
+        c.app_jobs.deinit(c.gpa);
+        for (c.app_seen.items) |k| c.gpa.free(k);
+        c.app_seen.deinit(c.gpa);
+        for (c.app_runs.items) |r| c.gpa.free(r.name);
+        c.app_runs.deinit(c.gpa);
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
-        if (c.app_server) |s| s.stop();
-        c.app_server = null;
         for (c.queue.items) |q| q.deinit(c.gpa);
         c.queue.deinit(c.gpa);
         c.run_flags.deinit(c.gpa);
@@ -1357,7 +1382,7 @@ pub const Core = struct {
         var r = try c.placeOf(a, conv);
         var again = false;
         while (true) {
-            const msg = if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text }) else text;
+            const msg = c.fillLinks(a, if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text }) else text);
             var place = r.place;
             place.quiet = quiet;
             if (ch.send(ch.ctx, place, msg)) |sent| return sent else |e| {
@@ -3224,7 +3249,7 @@ pub const Core = struct {
         const ch = c.chan orelse return error.NoChannel;
         var r = try c.placeOf(a, conv);
         r.place.quiet = quiet;
-        const text = if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text_in }) else text_in;
+        const text = c.fillLinks(a, if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text_in }) else text_in);
         const n = if (labels.len > 0) try c.quickPost(conv, agent_name, labels, text_in) else 0;
         const bs = try a.alloc([2][]const u8, labels.len + @intFromBool(extra != null));
         for (labels, bs[0..labels.len], 1..) |l, *b, i| b.* = .{ l, try std.fmt.allocPrint(a, "r{d}-{s}:{d}", .{ n, &c.approval_nonce, i }) };
@@ -3668,9 +3693,9 @@ pub const Core = struct {
         place.quiet = quiet;
         const prefix = if (where.prefix) |p| std.fmt.allocPrint(a, "[{s}] ", .{p}) catch "" else "";
         for (parts[0 .. parts.len - 1]) |part| {
-            _ = ch.send(ch.ctx, place, std.fmt.allocPrint(a, "{s}{s}", .{ prefix, part }) catch part) catch return c.notShown(id);
+            _ = ch.send(ch.ctx, place, c.fillLinks(a, std.fmt.allocPrint(a, "{s}{s}", .{ prefix, part }) catch part)) catch return c.notShown(id);
         }
-        const last = std.fmt.allocPrint(a, "{s}{s}", .{ prefix, parts[parts.len - 1] }) catch parts[parts.len - 1];
+        const last = c.fillLinks(a, std.fmt.allocPrint(a, "{s}{s}", .{ prefix, parts[parts.len - 1] }) catch parts[parts.len - 1]);
         // a question answered in words only has no buttons: its message is
         // the one a reply answers
         const msg = if (bs.len == 0)
@@ -4514,15 +4539,37 @@ pub const Core = struct {
     /// for this start only.
     pub fn startApps(c: *Core, a: std.mem.Allocator) ![]const u8 {
         if (c.cfg.apps.port > std.math.maxInt(u16)) return error.BadPort;
+        const apps_dir = try std.fs.path.join(a, &.{ c.paths.home, "apps" });
+        const state_dir = try std.fs.path.join(a, &.{ c.paths.state, "apps" });
+        // an install a crash cut ends; saves that were being asked go
+        // (their questions are void)
+        apps_mod.finishInstalls(c.io, a, apps_dir, state_dir) catch {};
+        c.noteChangedApps(a, apps_dir, state_dir);
         const s = try appserver.Server.start(c.gpa, c.io, .{
-            .apps_dir = try std.fs.path.join(a, &.{ c.paths.home, "apps" }),
-            .state_dir = try std.fs.path.join(a, &.{ c.paths.state, "apps" }),
+            .apps_dir = apps_dir,
+            .state_dir = state_dir,
+            .host = c.appHost(),
             .port = @intCast(c.cfg.apps.port),
             .log = &c.log,
             .version = @import("build_options").version,
         });
         c.app_server = s;
         return s.shellUrl(a);
+    }
+
+    /// Apps whose files differ from what was approved (an approved shell
+    /// command or a hand edit changed them): a log line each; they are not
+    /// served until `/app approve NAME`.
+    fn noteChangedApps(c: *Core, a: std.mem.Allocator, apps_dir: []const u8, state_dir: []const u8) void {
+        var d = Io.Dir.cwd().openDir(c.io, state_dir, .{ .iterate = true }) catch return;
+        defer d.close(c.io);
+        var it = d.iterate();
+        while (it.next(c.io) catch null) |e| {
+            if (e.kind != .directory or !apps_mod.validName(e.name)) continue;
+            if ((apps_mod.readApproved(c.io, a, state_dir, e.name) catch null) == null) continue;
+            if ((apps_mod.asApproved(c.io, a, apps_dir, state_dir, e.name) catch null) != null) continue;
+            c.log.write(.app, false, .{ .event = "changed outside harness", .name = e.name }) catch {};
+        }
     }
 
     fn findBrowser(c: *Core) void {
@@ -4847,6 +4894,7 @@ pub const Core = struct {
         run.desk = c.desk();
         run.wdesk = c.wfDesk();
         run.edesk = c.envDesk();
+        run.adesk = c.appDesk();
         var notify: Notify = .{ .core = c, .conv = conv };
         run.notice = .{ .ctx = &notify, .say = Notify.say };
         var here: [agents_name_max]u8 = undefined;
@@ -10191,24 +10239,60 @@ pub const Core = struct {
     }
 
     fn appCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
-        const use = "Use /app approve NAME or /app rm NAME.";
+        const use = "Use /app approve NAME, /app rm NAME, /app fork NAME NEW, /app versions NAME or /app revert NAME N.";
         var words = std.mem.tokenizeAny(u8, rest, " \t");
         const op = words.next() orelse return use;
         const name = words.next() orelse return use;
+        const third = words.next();
         if (words.next() != null) return use;
-        for (appserver.builtins) |b| if (std.mem.eql(u8, b.name, name)) return std.fmt.allocPrint(a, "{s} is built in: it changes with harness, and isn't yours to approve or remove.", .{name});
-        if (!apps_mod.validName(name)) return "An app's name is a-z, 0-9 and -.";
+        const eql = std.mem.eql;
+        const takes_third = eql(u8, op, "fork") or eql(u8, op, "revert");
+        if (takes_third != (third != null)) return use;
         const apps_dir = try std.fs.path.join(a, &.{ c.paths.home, "apps" });
         const state_dir = try std.fs.path.join(a, &.{ c.paths.state, "apps" });
-        if (std.mem.eql(u8, op, "approve")) {
-            const version = apps_mod.approve(c.io, a, apps_dir, state_dir, name, "owner", c.now()) catch |e| return switch (e) {
-                error.NoManifest, error.BadManifest, error.NameNotFolder, error.NoIndex, error.BadFileName, error.SymbolicLink, error.TooManyFiles, error.TooBig, error.FileTooBig, error.CaseClash => std.fmt.allocPrint(a, "Not approved: {s}.", .{apps_mod.folderReason(e)}),
-                else => std.fmt.allocPrint(a, "Not approved: {s}.", .{@errorName(e)}),
+        if (eql(u8, op, "fork")) {
+            const new = third.?;
+            const src = (try c.appSource(a, name)) orelse return std.fmt.allocPrint(a, "No app {s}: /apps lists them.", .{name});
+            apps_mod.fork(c.io, a, apps_dir, state_dir, src, name, new, &c.newToken(), "owner", c.now()) catch |e| return switch (e) {
+                error.BadAppName => "An app's name is a-z, 0-9 and -, up to 32.",
+                error.ReservedAppName => "inbox, log, files, api, home, review and pending are harness's own names.",
+                error.AppExists => std.fmt.allocPrint(a, "There is an apps/{s} already.", .{new}),
+                else => std.fmt.allocPrint(a, "Not forked: {s}.", .{appWhy(e)}),
             };
+            try c.log.write(.app, false, .{ .event = "forked", .name = new, .from = name, .by = "owner" });
+            return std.fmt.allocPrint(a, "Forked {s} as {s}: a copy to change in apps/{s} (not its data). After a change by hand, /app approve {s} serves it.", .{ name, new, new, new });
+        }
+        for (appserver.builtins) |b| if (eql(u8, b.name, name)) return std.fmt.allocPrint(a, "{s} is built in: it changes with harness, and isn't yours to approve or remove. /app fork {s} NEW makes a copy that is.", .{ name, name });
+        if (!apps_mod.validName(name)) return "An app's name is a-z, 0-9 and -.";
+        if (eql(u8, op, "approve")) {
+            const version = apps_mod.approve(c.io, a, apps_dir, state_dir, name, "owner", c.now()) catch |e| return std.fmt.allocPrint(a, "Not approved: {s}.", .{appWhy(e)});
             try c.log.write(.app, false, .{ .event = "approved", .name = name, .version = version, .by = "owner" });
             return std.fmt.allocPrint(a, "Approved {s} as v{d}: it is served as its files are now.", .{ name, version });
         }
-        if (std.mem.eql(u8, op, "rm")) {
+        if (eql(u8, op, "versions")) {
+            const ap = (try apps_mod.readApproved(c.io, a, state_dir, name)) orelse return std.fmt.allocPrint(a, "No approved app {s}.", .{name});
+            const vs = try apps_mod.versions(c.io, a, state_dir, name);
+            var out: std.ArrayList(u8) = .empty;
+            try out.print(a, "{s} is at v{d}.", .{ name, ap.version });
+            if (vs.len == 0) {
+                try out.appendSlice(a, " No earlier version is kept.");
+            } else {
+                try out.appendSlice(a, " Earlier versions kept:");
+                for (vs) |v| try out.print(a, " {d}", .{v});
+                try out.print(a, ". /app revert {s} N makes one of them the new version.", .{name});
+            }
+            return out.items;
+        }
+        if (eql(u8, op, "revert")) {
+            const n = std.fmt.parseInt(u32, third.?, 10) catch return use;
+            const version = apps_mod.revert(c.io, a, apps_dir, state_dir, name, n, &c.newToken(), "owner", c.now()) catch |e| return switch (e) {
+                error.NoSuchVersion => std.fmt.allocPrint(a, "No version {d} of {s} is kept: /app versions {s} lists them.", .{ n, name, name }),
+                else => std.fmt.allocPrint(a, "Not reverted: {s}.", .{appWhy(e)}),
+            };
+            try c.log.write(.app, false, .{ .event = "reverted", .name = name, .version = version, .to = n, .by = "owner" });
+            return std.fmt.allocPrint(a, "{s} is v{d} now, with the files of v{d}; its data is as it was.", .{ name, version, n });
+        }
+        if (eql(u8, op, "rm")) {
             const dir = try std.fs.path.join(a, &.{ apps_dir, name });
             const sdir = try std.fs.path.join(a, &.{ state_dir, name });
             const had = if (Io.Dir.cwd().statFile(c.io, dir, .{})) |_| true else |_| false;
@@ -10219,6 +10303,978 @@ pub const Core = struct {
             return std.fmt.allocPrint(a, "Removed {s}: its files, its data and its versions.", .{name});
         }
         return use;
+    }
+
+    /// Why an app's folder was not taken, in words.
+    fn appWhy(e: anyerror) []const u8 {
+        return switch (e) {
+            error.NoManifest, error.BadManifest, error.NameNotFolder, error.NoIndex, error.BadFileName, error.SymbolicLink, error.TooManyFiles, error.TooBig, error.FileTooBig, error.CaseClash => apps_mod.folderReason(e),
+            else => @errorName(e),
+        };
+    }
+
+    /// Where app `name`'s files are: the binary (a built-in) or its folder.
+    fn appSource(c: *Core, a: std.mem.Allocator, name: []const u8) !?apps_mod.Source {
+        for (appserver.builtins) |b| if (std.mem.eql(u8, b.name, name)) {
+            var m = apps_mod.builtinManifest(name).?;
+            m.version = 1;
+            return .{ .mem = .{ .ini = try apps_mod.iniText(a, m), .files = b.files } };
+        };
+        if (!apps_mod.validName(name)) return null;
+        const dir = try std.fs.path.join(a, &.{ c.paths.home, "apps", name });
+        _ = Io.Dir.cwd().statFile(c.io, try std.fs.path.join(a, &.{ dir, "app.ini" }), .{}) catch return null;
+        return .{ .dir = dir };
+    }
+
+    // ---- links to apps ----
+
+    /// `text` with `{app:NAME}`, `{app:NAME/VIEW}` and `{app-review:ID}`
+    /// turned into this start's links, as it leaves for the owner: the
+    /// log and the model only ever hold the placeholder. With no app
+    /// server running the placeholder says so.
+    fn fillLinks(c: *Core, a: std.mem.Allocator, text: []const u8) []const u8 {
+        if (std.mem.indexOf(u8, text, "{app") == null) return text;
+        var out: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < text.len) {
+            const at = std.mem.indexOfPos(u8, text, i, "{app") orelse break;
+            const end = std.mem.indexOfScalarPos(u8, text, at, '}') orelse break;
+            const inner = text[at + 1 .. end];
+            const link: ?[]const u8 = blk: {
+                if (std.mem.startsWith(u8, inner, "app-review:")) {
+                    const id = inner["app-review:".len..];
+                    if (!apps_mod.validId(id)) break :blk null;
+                    const s = c.app_server orelse break :blk "(the review page needs the app server: [apps] on = on, with harness run or harness chat)";
+                    break :blk s.reviewUrl(a, id) catch null;
+                }
+                if (!std.mem.startsWith(u8, inner, "app:")) break :blk null;
+                const rest = inner["app:".len..];
+                const slash = std.mem.indexOfScalar(u8, rest, '/');
+                const name = rest[0 .. slash orelse rest.len];
+                const view = if (slash) |sl| rest[sl + 1 ..] else "";
+                if (!apps_mod.validName(name) or view.len > 64) break :blk null;
+                for (view) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_')) break :blk null;
+                const s = c.app_server orelse break :blk std.fmt.allocPrint(a, "the {s} app (the app server is not running: [apps] on = on, with harness run or harness chat)", .{name}) catch null;
+                break :blk s.appUrl(a, name, view) catch null;
+            };
+            out.appendSlice(a, text[i..at]) catch return text;
+            out.appendSlice(a, link orelse text[at .. end + 1]) catch return text;
+            i = end + 1;
+        }
+        out.appendSlice(a, text[i..]) catch return text;
+        return out.items;
+    }
+
+    // ---- the apps' API (gap 8) ----
+
+    /// One act or run an app asked for: on a thread of its own, read back
+    /// by the app with its id.
+    const AppJob = struct {
+        core: *Core,
+        id: u64,
+        arena: std.heap.ArenaAllocator,
+        app: []const u8 = "",
+        /// A run of a definition; else one tool call.
+        is_run: bool = false,
+        /// The tool as a run's calls name it, or the definition.
+        name: []const u8 = "",
+        input: []const u8 = "",
+        to: []const u8 = "main",
+        flag: std.atomic.Value(bool) = .init(false),
+        asked: std.atomic.Value(bool) = .init(false),
+        ended: std.atomic.Value(bool) = .init(false),
+        refused: bool = false,
+        output: []const u8 = "",
+        deadline_s: i64 = 0,
+        ended_s: i64 = 0,
+    };
+
+    /// When app `name` started a run.
+    const AppRan = struct { name: []u8, at: i64 };
+
+    /// An app's questions: the run's, `[app:NAME] ` in front, in its `to`
+    /// conversation; while one waits the job says `asked`.
+    const AppAsk = struct {
+        chat: ChatAsk,
+        job: *AppJob,
+
+        fn ask(ctx: *anyopaque, a: std.mem.Allocator, q: agent.Question) agent.Reply {
+            const x: *AppAsk = @ptrCast(@alignCast(ctx));
+            var tagged = q;
+            tagged.text = std.fmt.allocPrint(a, "[app:{s}] {s}", .{ x.job.app, q.text }) catch q.text;
+            if (tagged.deadline_s == 0 or tagged.deadline_s > x.job.deadline_s) tagged.deadline_s = x.job.deadline_s;
+            x.job.asked.store(true, .release);
+            defer x.job.asked.store(false, .release);
+            return askOwner(&x.chat, a, tagged);
+        }
+    };
+
+    fn appHost(c: *Core) appserver.Host {
+        return .{ .ctx = c, .api = appApi, .shell = appShellApi, .opened = appOpened };
+    }
+
+    fn appErr(a: std.mem.Allocator, status: std.http.Status, why: []const u8) appserver.Answer {
+        var out: std.ArrayList(u8) = .empty;
+        out.appendSlice(a, "{\"error\":") catch return .{ .status = status, .body = "{\"error\":\"\"}" };
+        util.jsonString(&out, a, why) catch return .{ .status = status, .body = "{\"error\":\"\"}" };
+        out.append(a, '}') catch {};
+        return .{ .status = status, .body = out.items };
+    }
+
+    /// A page of app `name` went into a frame: logged, and its reads are
+    /// logged again from here (once per page load and subject).
+    fn appOpened(ctx: *anyopaque, name: []const u8, version: []const u8) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        var buf: [64]u8 = undefined;
+        var n: usize = 0;
+        if (c.appManifest(c.gpa, name) catch null) |mm| {
+            for (mm.m.reads) |r| {
+                const tag = @tagName(r);
+                if (n + tag.len + 1 > buf.len) break;
+                if (n > 0) {
+                    buf[n] = ',';
+                    n += 1;
+                }
+                @memcpy(buf[n..][0..tag.len], tag);
+                n += tag.len;
+            }
+            mm.arena.deinit();
+        }
+        const reads = buf[0..n];
+        c.log.write(.app, false, .{ .event = "opened", .name = name, .version = version, .reads = reads }) catch {};
+        c.app_mutex.lockUncancelable(c.io);
+        defer c.app_mutex.unlock(c.io);
+        var i: usize = 0;
+        while (i < c.app_seen.items.len) {
+            const k = c.app_seen.items[i];
+            if (k.len > name.len and std.mem.startsWith(u8, k, name) and k[name.len] == ' ') {
+                c.gpa.free(k);
+                _ = c.app_seen.swapRemove(i);
+            } else i += 1;
+        }
+    }
+
+    const Manifested = struct { m: apps_mod.Manifest, arena: std.heap.ArenaAllocator };
+
+    /// App `name`'s manifest, in an arena of its own (the caller's to end).
+    fn appManifest(c: *Core, gpa: std.mem.Allocator, name: []const u8) !?Manifested {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        errdefer arena.deinit();
+        if (apps_mod.builtinManifest(name)) |m| return .{ .m = m, .arena = arena };
+        const m = (try c.appManifestIn(arena.allocator(), name)) orelse {
+            arena.deinit();
+            return null;
+        };
+        return .{ .m = m, .arena = arena };
+    }
+
+    fn appManifestIn(c: *Core, a: std.mem.Allocator, name: []const u8) !?apps_mod.Manifest {
+        if (apps_mod.builtinManifest(name)) |m| return m;
+        if (!apps_mod.validName(name)) return null;
+        const ini = Io.Dir.cwd().readFileAlloc(c.io, try std.fs.path.join(a, &.{ c.paths.home, "apps", name, "app.ini" }), a, .limited(64 << 10)) catch return null;
+        return apps_mod.parse(a, ini) catch null;
+    }
+
+    /// Whether this is the first time since the app's page loaded that
+    /// `key` ("NAME SUBJECT") is read.
+    fn appFirstRead(c: *Core, key: []const u8) bool {
+        c.app_mutex.lockUncancelable(c.io);
+        defer c.app_mutex.unlock(c.io);
+        for (c.app_seen.items) |k| if (std.mem.eql(u8, k, key)) return false;
+        const own = c.gpa.dupe(u8, key) catch return true;
+        c.app_seen.append(c.gpa, own) catch c.gpa.free(own);
+        return true;
+    }
+
+    /// Null when app `m` may read `subject`: listed in its manifest
+    /// (unlisted: refused before the gate), then the gate as `app_read`
+    /// `NAME SUBJECT`. Logged once per page load and subject, and every
+    /// refusal. Files are decided path by path, as `read_file`.
+    fn appMayRead(c: *Core, a: std.mem.Allocator, m: apps_mod.Manifest, subject: apps_mod.Read) !?appserver.Answer {
+        const subj = @tagName(subject);
+        if (!m.hasRead(subject)) {
+            c.log.write(.app, false, .{ .event = "refused", .name = m.name, .read = subj, .why = "not in its reads" }) catch {};
+            return appErr(a, .forbidden, try std.fmt.allocPrint(a, "{s} is not in this app's reads", .{subj}));
+        }
+        if (subject == .files) return null;
+        const arg = try std.fmt.allocPrint(a, "{s} {s}", .{ m.name, subj });
+        const by = try std.fmt.allocPrint(a, "app:{s}", .{m.name});
+        const d = blk: {
+            c.lock.lockUncancelable(c.io);
+            defer c.lock.unlock(c.io);
+            break :blk c.gate.decide(a, .app_read, arg, c.now(), .{ .who = .{ .by = by, .agent = "" } });
+        };
+        if (d.action != .allow) {
+            c.log.write(.gate, false, .{ .run = try std.fmt.allocPrint(a, "app {s}", .{m.name}), .by = by, .tool = "app_read", .decision = "deny", .why = d.why, .arg = arg }) catch {};
+            return appErr(a, .forbidden, try std.fmt.allocPrint(a, "refused by the gate: {s}", .{d.why}));
+        }
+        if (c.appFirstRead(arg)) c.log.write(.app, false, .{ .event = "read", .name = m.name, .read = subj }) catch {};
+        return null;
+    }
+
+    fn appApi(ctx: *anyopaque, a: std.mem.Allocator, call: appserver.Call) appserver.Answer {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.appApiIn(a, call) catch |e| appErr(a, .internal_server_error, @errorName(e));
+    }
+
+    fn queryGet(query: []const u8, key: []const u8) ?[]const u8 {
+        var it = std.mem.splitScalar(u8, query, '&');
+        while (it.next()) |kv| {
+            const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+            if (std.mem.eql(u8, kv[0..eq], key)) return kv[eq + 1 ..];
+        }
+        return null;
+    }
+
+    fn queryInt(query: []const u8, key: []const u8) ?u64 {
+        return std.fmt.parseInt(u64, queryGet(query, key) orelse return null, 10) catch null;
+    }
+
+    /// `%XX` and `+` of a query value undone; null: not one.
+    fn urlDecode(a: std.mem.Allocator, s: []const u8) !?[]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            if (s[i] == '%') {
+                if (i + 2 >= s.len) return null;
+                try out.append(a, std.fmt.parseInt(u8, s[i + 1 .. i + 3], 16) catch return null);
+                i += 2;
+            } else try out.append(a, if (s[i] == '+') ' ' else s[i]);
+        }
+        return out.items;
+    }
+
+    fn appApiIn(c: *Core, a: std.mem.Allocator, call: appserver.Call) !appserver.Answer {
+        const eql = std.mem.eql;
+        const m = (try c.appManifestIn(a, call.app)) orelse return appErr(a, .not_found, "no such app");
+        const p = call.path;
+        const get = call.method == .GET or call.method == .HEAD;
+        const no_method = appErr(a, .method_not_allowed, "this call takes another method");
+        if (eql(u8, p, "info")) {
+            if (!get) return no_method;
+            var out: std.ArrayList(u8) = .empty;
+            try out.appendSlice(a, "{\"name\":");
+            try util.jsonString(&out, a, m.name);
+            try out.appendSlice(a, ",\"version\":");
+            try util.jsonString(&out, a, call.version);
+            try out.appendSlice(a, ",\"title\":");
+            try util.jsonString(&out, a, m.title);
+            try out.appendSlice(a, ",\"description\":");
+            try util.jsonString(&out, a, m.description);
+            try out.print(a, ",\"builtin\":{},\"reads\":[", .{call.builtin});
+            for (m.reads, 0..) |r, i| try out.print(a, "{s}\"{s}\"", .{ if (i > 0) "," else "", @tagName(r) });
+            try out.appendSlice(a, "],\"files\":");
+            try jsonList(&out, a, m.files);
+            try out.appendSlice(a, ",\"acts\":");
+            try jsonList(&out, a, m.acts);
+            try out.appendSlice(a, ",\"to\":");
+            try util.jsonString(&out, a, m.to);
+            try out.appendSlice(a, ",\"container\":");
+            try util.jsonString(&out, a, queryGet(call.query, "in") orelse "page");
+            try out.append(a, '}');
+            return .{ .body = out.items };
+        }
+        if (eql(u8, p, "memory")) {
+            if (!get) return no_method;
+            if (try c.appMayRead(a, m, .memory)) |no| return no;
+            return .{ .body = try c.masks.scrubAlloc(a, try c.appMemory(a)) };
+        }
+        if (eql(u8, p, "inbox")) {
+            if (!get) return no_method;
+            if (try c.appMayRead(a, m, .inbox)) |no| return no;
+            const all = if (queryGet(call.query, "state")) |s| eql(u8, s, "all") else false;
+            return .{ .body = try c.masks.scrubAlloc(a, try c.inboxJson(a, all)) };
+        }
+        if (eql(u8, p, "log") or std.mem.startsWith(u8, p, "log/")) {
+            if (!get) return no_method;
+            if (try c.appMayRead(a, m, .log)) |no| return no;
+            return c.appLog(a, call);
+        }
+        if (eql(u8, p, "files")) {
+            if (!get) return no_method;
+            if (try c.appMayRead(a, m, .files)) |no| return no;
+            return c.appFiles(a, m, call);
+        }
+        if (eql(u8, p, "data") or std.mem.startsWith(u8, p, "data/")) {
+            if (call.builtin) return appErr(a, .not_found, "a built-in app keeps no data");
+            return c.appData(a, call);
+        }
+        if (eql(u8, p, "act")) {
+            if (call.method != .POST) return no_method;
+            return c.appActStart(a, m, call);
+        }
+        if (eql(u8, p, "run")) {
+            if (call.method != .POST) return no_method;
+            return c.appRunStart(a, m, call);
+        }
+        if (std.mem.startsWith(u8, p, "act/") or std.mem.startsWith(u8, p, "run/")) {
+            if (!get) return no_method;
+            const id = std.fmt.parseInt(u64, p[4..], 10) catch return appErr(a, .not_found, "no such act or run");
+            return c.appJobState(a, call, id, p[0] == 'r');
+        }
+        return appErr(a, .not_found, "no such call; the API has info, memory, inbox, log, files, data, act and run");
+    }
+
+    fn jsonList(out: *std.ArrayList(u8), a: std.mem.Allocator, items: []const []const u8) !void {
+        try out.append(a, '[');
+        for (items, 0..) |x, i| {
+            if (i > 0) try out.append(a, ',');
+            try util.jsonString(out, a, x);
+        }
+        try out.append(a, ']');
+    }
+
+    /// Every memory item: id, level, pinned, created, body.
+    fn appMemory(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var tb: [20]u8 = undefined;
+        c.lock.lockUncancelable(c.io);
+        defer c.lock.unlock(c.io);
+        const ranked = try c.mem.levels(a, c.now(), c.cfg.memory.top_size);
+        try out.appendSlice(a, "{\"items\":[");
+        for (ranked, 0..) |r, i| {
+            if (i > 0) try out.append(a, ',');
+            try out.appendSlice(a, "{\"id\":");
+            try util.jsonString(&out, a, r.item.id);
+            try out.print(a, ",\"level\":\"{s}\",\"pinned\":{},\"created\":\"{s}\",\"body\":", .{ @tagName(r.level), r.item.pinned, util.isoTime(&tb, r.item.created_s) });
+            try util.jsonString(&out, a, r.item.body);
+            try out.append(a, '}');
+        }
+        try out.appendSlice(a, "]}");
+        return out.items;
+    }
+
+    /// The inbox in format v1 (never an item's token): the open items,
+    /// oldest first, or with `all` the closed ones kept too.
+    fn inboxJson(c: *Core, a: std.mem.Allocator, all: bool) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, "{\"items\":[");
+        c.inbox.mutex.lockUncancelable(c.io);
+        defer c.inbox.mutex.unlock(c.io);
+        var n: usize = 0;
+        for (c.inbox.items.items) |it| {
+            if (!all and it.status != .open) continue;
+            if (n > 0) try out.append(a, ',');
+            n += 1;
+            try inbox_mod.render(&out, a, it, false);
+        }
+        try out.appendSlice(a, "]}");
+        return out.items;
+    }
+
+    /// `api/log?after=SEQ&limit=N&wait=S` (lines after SEQ, the newest N;
+    /// with `wait` it holds up to 25 s for a new line), `api/log/runs`,
+    /// `api/log/session/RID`, `api/log/verify`.
+    fn appLog(c: *Core, a: std.mem.Allocator, call: appserver.Call) !appserver.Answer {
+        const p = call.path;
+        if (std.mem.eql(u8, p, "log/verify")) {
+            const v = log_mod.verify(c.io, c.paths.log) catch |e| return appErr(a, .internal_server_error, @errorName(e));
+            return .{ .body = try std.fmt.allocPrint(a, "{{\"ok\":{},\"lines\":{d},\"broken_at\":{d}}}", .{ v.broken_at == null, v.lines, v.broken_at orelse 0 }) };
+        }
+        if (std.mem.eql(u8, p, "log/runs")) {
+            const text = Io.Dir.cwd().readFileAlloc(c.io, c.paths.log, a, .limited(256 << 20)) catch "";
+            const all = try session.runs(a, text);
+            const n: usize = @intCast(@min(queryInt(call.query, "limit") orelse 100, 1000));
+            var out: std.ArrayList(u8) = .empty;
+            try out.appendSlice(a, "{\"runs\":[");
+            // newest first
+            var i = all.len;
+            var count: usize = 0;
+            while (i > 0 and count < n) : (count += 1) {
+                i -= 1;
+                const r = all[i];
+                if (count > 0) try out.append(a, ',');
+                try out.print(a, "{{\"rid\":{d},\"time\":", .{r.rid});
+                try util.jsonString(&out, a, r.time);
+                try out.appendSlice(a, ",\"label\":");
+                try util.jsonString(&out, a, r.label);
+                try out.appendSlice(a, ",\"by\":");
+                try util.jsonString(&out, a, r.by);
+                try out.appendSlice(a, ",\"conversation\":");
+                try util.jsonString(&out, a, r.conversation);
+                try out.appendSlice(a, ",\"parent\":");
+                if (r.parent) |x| try out.print(a, "{d}", .{x}) else try out.appendSlice(a, "null");
+                try out.appendSlice(a, ",\"steps\":");
+                if (r.steps) |x| try out.print(a, "{d}", .{x}) else try out.appendSlice(a, "null");
+                try out.appendSlice(a, ",\"end\":");
+                try util.jsonString(&out, a, r.end);
+                try out.append(a, '}');
+            }
+            try out.appendSlice(a, "]}");
+            return .{ .body = try c.masks.scrubAlloc(a, out.items) };
+        }
+        if (std.mem.startsWith(u8, p, "log/session/")) {
+            const rid = std.fmt.parseInt(u64, p["log/session/".len..], 10) catch return appErr(a, .not_found, "a run's id is a number");
+            const text = Io.Dir.cwd().readFileAlloc(c.io, c.paths.log, a, .limited(256 << 20)) catch "";
+            const lines = try session.raw(a, text, rid);
+            if (lines.len == 0) return appErr(a, .not_found, "no such run in the log");
+            return .{ .body = try c.masks.scrubAlloc(a, try linesJson(a, lines, 0, std.math.maxInt(usize))) };
+        }
+        if (!std.mem.eql(u8, p, "log")) return appErr(a, .not_found, "the log has log, log/runs, log/session/RID and log/verify");
+        const after = queryInt(call.query, "after") orelse 0;
+        const limit: usize = @intCast(@max(1, @min(queryInt(call.query, "limit") orelse 200, 1000)));
+        const wait_s = @min(queryInt(call.query, "wait") orelse 0, 25);
+        const end_ms = util.nowMs(c.io) + @as(i64, @intCast(wait_s)) * 1000;
+        while (c.logSeq() <= after and util.nowMs(c.io) < end_ms and !call.stop.load(.acquire) and !c.quitting.load(.acquire))
+            c.io.sleep(.fromMilliseconds(100), .awake) catch break;
+        // the log's end: what a viewer asks for is its newest lines
+        const text = session.tail(c.io, a, c.paths.log, 4 << 20) catch "";
+        return .{ .body = try c.masks.scrubAlloc(a, try linesJson(a, text, after, limit)) };
+    }
+
+    fn logSeq(c: *Core) u64 {
+        c.log.mutex.lockUncancelable(c.io);
+        defer c.log.mutex.unlock(c.io);
+        return c.log.seq;
+    }
+
+    /// `{"lines":[...],"last":SEQ}`: the log's lines in `text` after seq
+    /// `after`, the newest `limit` of them, each as it is in the log.
+    fn linesJson(a: std.mem.Allocator, text: []const u8, after: u64, limit: usize) ![]const u8 {
+        var picked: std.ArrayList([]const u8) = .empty;
+        var last: u64 = after;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            const head = "{\"seq\":";
+            if (!std.mem.startsWith(u8, line, head) or line[line.len - 1] != '}') continue;
+            const comma = std.mem.indexOfScalarPos(u8, line, head.len, ',') orelse continue;
+            const seq = std.fmt.parseInt(u64, line[head.len..comma], 10) catch continue;
+            if (seq <= after) continue;
+            try picked.append(a, line);
+            last = @max(last, seq);
+        }
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, "{\"lines\":[");
+        const from = picked.items.len -| limit;
+        for (picked.items[from..], 0..) |line, i| {
+            if (i > 0) try out.append(a, ',');
+            try out.appendSlice(a, line);
+        }
+        try out.print(a, "],\"last\":{d}}}", .{last});
+        return out.items;
+    }
+
+    /// `api/files?path=P`: a folder's entries, a text file (up to 1 MiB)
+    /// or an image, where the manifest's `files` names the path and the
+    /// gate allows `read_file` there for `app:NAME` (file rules and roles).
+    fn appFiles(c: *Core, a: std.mem.Allocator, m: apps_mod.Manifest, call: appserver.Call) !appserver.Answer {
+        const given = (try urlDecode(a, queryGet(call.query, "path") orelse "")) orelse return appErr(a, .bad_request, "path is not a query value");
+        const by = try std.fmt.allocPrint(a, "app:{s}", .{m.name});
+        const label = try std.fmt.allocPrint(a, "app {s}", .{m.name});
+        const cf = gate.confined(a, c.io, c.workspace, if (given.len == 0) "." else given) catch {
+            c.log.write(.gate, false, .{ .run = label, .by = by, .tool = "read_file", .decision = "deny", .why = "outside the workspace", .arg = util.cut(given, 300) }) catch {};
+            return appErr(a, .forbidden, "outside the workspace");
+        };
+        const listed = apps_mod.fileListed(m, cf.rel);
+        if (!listed and !apps_mod.fileAbove(m, cf.rel)) {
+            c.log.write(.app, false, .{ .event = "refused", .name = m.name, .read = "files", .why = "not in its files", .path = util.cut(cf.rel, 300) }) catch {};
+            return appErr(a, .forbidden, "this path is not in the app's files");
+        }
+        if (cf.rel.len > 0) {
+            const d = blk: {
+                c.lock.lockUncancelable(c.io);
+                defer c.lock.unlock(c.io);
+                break :blk c.gate.decide(a, .read_file, cf.rel, c.now(), .{ .who = .{ .by = by, .agent = "" } });
+            };
+            if (d.action != .allow) {
+                c.log.write(.gate, false, .{ .run = label, .by = by, .tool = "read_file", .decision = "deny", .why = d.why, .arg = util.cut(cf.rel, 300) }) catch {};
+                return appErr(a, .forbidden, try std.fmt.allocPrint(a, "refused by the gate: {s}", .{if (d.action == .ask) "an app's reads are not asked; a rule can allow this path" else d.why}));
+            }
+        }
+        if (c.appFirstRead(try std.fmt.allocPrint(a, "{s} files", .{m.name}))) c.log.write(.app, false, .{ .event = "read", .name = m.name, .read = "files" }) catch {};
+        const st = Io.Dir.cwd().statFile(c.io, cf.path, .{}) catch return appErr(a, .not_found, "no such file or folder");
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, "{\"path\":");
+        try util.jsonString(&out, a, cf.rel);
+        if (st.kind == .directory) {
+            var names: std.ArrayList(struct { name: []const u8, folder: bool, size: u64 }) = .empty;
+            var d = Io.Dir.cwd().openDir(c.io, cf.path, .{ .iterate = true }) catch return appErr(a, .not_found, "the folder can't be opened");
+            defer d.close(c.io);
+            var it = d.iterate();
+            while (try it.next(c.io)) |e| {
+                if (e.kind != .directory and e.kind != .file) continue;
+                const rel = if (cf.rel.len == 0) try a.dupe(u8, e.name) else try std.fmt.allocPrint(a, "{s}/{s}", .{ cf.rel, e.name });
+                // only what the app may open or pass through
+                if (!apps_mod.fileListed(m, rel) and !(e.kind == .directory and apps_mod.fileAbove(m, rel))) continue;
+                const size: u64 = if (e.kind == .file) (if (d.statFile(c.io, e.name, .{})) |s| s.size else |_| 0) else 0;
+                try names.append(a, .{ .name = try a.dupe(u8, e.name), .folder = e.kind == .directory, .size = size });
+                if (names.items.len >= 2000) break;
+            }
+            const Entry = @TypeOf(names.items[0]);
+            std.mem.sort(Entry, names.items, {}, struct {
+                fn lt(_: void, x: Entry, y: Entry) bool {
+                    if (x.folder != y.folder) return x.folder;
+                    return std.mem.lessThan(u8, x.name, y.name);
+                }
+            }.lt);
+            try out.appendSlice(a, ",\"kind\":\"folder\",\"entries\":[");
+            for (names.items, 0..) |e, i| {
+                if (i > 0) try out.append(a, ',');
+                try out.appendSlice(a, "{\"name\":");
+                try util.jsonString(&out, a, e.name);
+                try out.print(a, ",\"kind\":\"{s}\",\"size\":{d}}}", .{ if (e.folder) "folder" else "file", e.size });
+            }
+            try out.appendSlice(a, "]}");
+            return .{ .body = try c.masks.scrubAlloc(a, out.items) };
+        }
+        if (!listed) return appErr(a, .forbidden, "this path is not in the app's files");
+        if (st.size > 1 << 20) {
+            try out.print(a, ",\"kind\":\"big\",\"size\":{d}}}", .{st.size});
+            return .{ .body = out.items };
+        }
+        const data = Io.Dir.cwd().readFileAlloc(c.io, cf.path, a, .limited(1 << 20)) catch return appErr(a, .not_found, "the file can't be read");
+        // a stored secret never leaves in a file
+        for (c.secret_list) |sec| if (sec.value.len > 0 and std.mem.indexOf(u8, data, sec.value) != null and imageType(cf.rel) != null)
+            return appErr(a, .forbidden, "the file holds a stored secret");
+        if (imageType(cf.rel)) |mime| {
+            const enc = std.base64.standard.Encoder;
+            const b64 = try a.alloc(u8, enc.calcSize(data.len));
+            _ = enc.encode(b64, data);
+            try out.print(a, ",\"kind\":\"image\",\"size\":{d},\"mime\":\"{s}\",\"data\":\"{s}\"}}", .{ data.len, mime, b64 });
+            return .{ .body = out.items };
+        }
+        if (!std.unicode.utf8ValidateSlice(data)) {
+            try out.print(a, ",\"kind\":\"binary\",\"size\":{d}}}", .{data.len});
+            return .{ .body = out.items };
+        }
+        try out.print(a, ",\"kind\":\"file\",\"size\":{d},\"text\":", .{data.len});
+        try util.jsonString(&out, a, try c.masks.scrubAlloc(a, data));
+        try out.append(a, '}');
+        return .{ .body = out.items };
+    }
+
+    fn imageType(rel: []const u8) ?[]const u8 {
+        const ext = rel[(std.mem.lastIndexOfScalar(u8, rel, '.') orelse return null) + 1 ..];
+        for ([_][2][]const u8{ .{ "png", "image/png" }, .{ "jpg", "image/jpeg" }, .{ "jpeg", "image/jpeg" }, .{ "gif", "image/gif" }, .{ "webp", "image/webp" } }) |x|
+            if (std.ascii.eqlIgnoreCase(x[0], ext)) return x[1];
+        return null;
+    }
+
+    /// `GET api/data` (its keys), `GET`, `PUT`, `DELETE api/data/KEY`: the
+    /// app's own data, in `apps/NAME/data/`.
+    fn appData(c: *Core, a: std.mem.Allocator, call: appserver.Call) !appserver.Answer {
+        const apps_dir = try std.fs.path.join(a, &.{ c.paths.home, "apps" });
+        if (std.mem.eql(u8, call.path, "data")) {
+            if (call.method != .GET and call.method != .HEAD) return appErr(a, .method_not_allowed, "GET lists the keys");
+            var out: std.ArrayList(u8) = .empty;
+            try out.appendSlice(a, "{\"keys\":");
+            try jsonList(&out, a, try apps_mod.dataKeys(c.io, a, apps_dir, call.app));
+            try out.append(a, '}');
+            return .{ .body = out.items };
+        }
+        const key = call.path["data/".len..];
+        if (!apps_mod.validKey(key)) return appErr(a, .bad_request, "a key is 1 to 64 of A-Z a-z 0-9 . _ -");
+        switch (call.method) {
+            .GET, .HEAD => {
+                const v = (try apps_mod.dataGet(c.io, a, apps_dir, call.app, key)) orelse return appErr(a, .not_found, "no such key");
+                return .{ .body = v };
+            },
+            .PUT => {
+                apps_mod.dataPut(c.io, a, apps_dir, call.app, key, call.body) catch |e| return switch (e) {
+                    error.TooBig => appErr(a, .payload_too_large, "a value is at most 256 KiB"),
+                    error.TooManyKeys => appErr(a, .insufficient_storage, "an app keeps at most 1000 keys"),
+                    else => appErr(a, .internal_server_error, @errorName(e)),
+                };
+                return .{ .body = "{\"ok\":true}" };
+            },
+            .DELETE => {
+                _ = try apps_mod.dataDelete(c.io, a, apps_dir, call.app, key);
+                return .{ .body = "{\"ok\":true}" };
+            },
+            else => return appErr(a, .method_not_allowed, "GET, PUT or DELETE"),
+        }
+    }
+
+    /// The acts and runs going now: of app `name`, and of all apps.
+    fn appJobsGoing(c: *Core, name: []const u8, runs: bool) struct { own: u32, all: u32 } {
+        var own: u32 = 0;
+        var all: u32 = 0;
+        for (c.app_jobs.items) |j| {
+            if (j.ended.load(.acquire) or j.is_run != runs) continue;
+            all += 1;
+            if (std.mem.eql(u8, j.app, name)) own += 1;
+        }
+        return .{ .own = own, .all = all };
+    }
+
+    /// A new job (under `app_mutex`); those that ended 10 minutes ago go.
+    fn appNewJob(c: *Core, app: []const u8) !*AppJob {
+        const now_s = c.now();
+        var i: usize = 0;
+        while (i < c.app_jobs.items.len) {
+            const j = c.app_jobs.items[i];
+            if (j.ended.load(.acquire) and now_s - j.ended_s > 600) {
+                j.arena.deinit();
+                c.gpa.destroy(j);
+                _ = c.app_jobs.swapRemove(i);
+            } else i += 1;
+        }
+        const j = try c.gpa.create(AppJob);
+        errdefer c.gpa.destroy(j);
+        c.app_next += 1;
+        j.* = .{ .core = c, .id = c.app_next, .arena = .init(c.gpa) };
+        j.app = try j.arena.allocator().dupe(u8, app);
+        try c.app_jobs.append(c.gpa, j);
+        return j;
+    }
+
+    /// `POST api/act {"tool","input"}`: one call of a tool the manifest
+    /// lists under `acts`, on paths in its `files`, through the gate as
+    /// `app:NAME`: the same rules and questions as the agent's own call.
+    fn appActStart(c: *Core, a: std.mem.Allocator, m: apps_mod.Manifest, call: appserver.Call) !appserver.Answer {
+        const v = jv.parse(a, call.body) orelse return appErr(a, .bad_request, "the call is JSON: {\"tool\":..., \"input\":{...}}");
+        const tool = jv.str(jv.get(v, "tool")) orelse return appErr(a, .bad_request, "the call names its tool");
+        const refused = struct {
+            fn say(core: *Core, al: std.mem.Allocator, name: []const u8, t_: []const u8, why: []const u8) appserver.Answer {
+                core.log.write(.app, false, .{ .event = "refused", .name = name, .act = util.cut(t_, 64), .why = why }) catch {};
+                return appErr(al, .forbidden, why);
+            }
+        }.say;
+        // unasked: what the manifest does not list never reaches the gate
+        if (std.mem.startsWith(u8, tool, "run:") or !apps_mod.actListed(m, tool)) return refused(c, a, m.name, tool, "this tool is not in the app's acts");
+        const input_v = jv.get(v, "input");
+        const input = if (input_v) |x| try std.json.Stringify.valueAlloc(a, x, .{}) else "{}";
+        // the name a run's calls give it: a built-in's, or an MCP tool's
+        var name: []const u8 = tool;
+        if (std.mem.indexOfScalar(u8, tool, '/')) |slash| {
+            const mt = for (c.mcp_tools) |*x| {
+                if (std.mem.eql(u8, x.server.name, tool[0..slash]) and std.mem.eql(u8, x.tool, tool[slash + 1 ..])) break x;
+            } else return appErr(a, .service_unavailable, "that server is not running, or has no such tool");
+            if (mt.money) return refused(c, a, m.name, tool, "an app's acts move no money");
+            name = mt.def.name;
+        }
+        // its files: the paths the call names
+        if (std.mem.eql(u8, tool, "read_file") or std.mem.eql(u8, tool, "write_file")) {
+            const path = jv.str(jv.get(input_v, "path")) orelse return appErr(a, .bad_request, "the call's input names its path");
+            const cf = gate.confined(a, c.io, c.workspace, path) catch return refused(c, a, m.name, tool, "the path is outside the workspace");
+            if (!apps_mod.fileListed(m, cf.rel)) return refused(c, a, m.name, tool, "the path is not in the app's files");
+        }
+        if (std.mem.eql(u8, tool, "send")) for (jv.arr(jv.get(input_v, "files")) orelse &.{}) |pv| {
+            const cf = gate.confined(a, c.io, c.workspace, jv.str(pv) orelse "") catch return refused(c, a, m.name, tool, "a file is outside the workspace");
+            if (!apps_mod.fileListed(m, cf.rel)) return refused(c, a, m.name, tool, "a file is not in the app's files");
+        };
+        const job = blk: {
+            c.app_mutex.lockUncancelable(c.io);
+            defer c.app_mutex.unlock(c.io);
+            const going = c.appJobsGoing(m.name, false);
+            if (going.own >= 2 or going.all >= 4) return appErr(a, .too_many_requests, "an app runs 2 acts at once, all apps 4: wait for one to end");
+            break :blk try c.appNewJob(m.name);
+        };
+        const ja = job.arena.allocator();
+        job.name = try ja.dupe(u8, name);
+        job.input = try ja.dupe(u8, input);
+        job.to = try ja.dupe(u8, m.to);
+        job.deadline_s = c.now() + c.cfg.apps.act_seconds;
+        _ = c.app_active.fetchAdd(1, .acq_rel);
+        const th = std.Thread.spawn(.{}, appActThread, .{job}) catch {
+            _ = c.app_active.fetchSub(1, .acq_rel);
+            job.refused = true;
+            job.output = "harness could not start it";
+            job.ended_s = c.now();
+            job.ended.store(true, .release);
+            return appErr(a, .service_unavailable, "harness could not start it");
+        };
+        th.detach();
+        return .{ .body = try std.fmt.allocPrint(a, "{{\"id\":{d},\"state\":\"running\"}}", .{job.id}) };
+    }
+
+    fn appActThread(job: *AppJob) void {
+        const c = job.core;
+        defer _ = c.app_active.fetchSub(1, .acq_rel);
+        const ja = job.arena.allocator();
+        var out_text: []const u8 = "";
+        var refused = false;
+        work: {
+            var arena: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena.deinit();
+            const a = arena.allocator();
+            // never called: a run needs a client
+            var client = c.modelClient(c.cfg.model.model, c.cfg.model.max_tokens) catch |e| {
+                out_text = @errorName(e);
+                refused = true;
+                break :work;
+            };
+            defer client.deinit();
+            c.register(&job.flag, "");
+            defer c.unregister(&job.flag);
+            const by = std.fmt.allocPrint(a, "app:{s}", .{job.app}) catch break :work;
+            const label = std.fmt.allocPrint(a, "app {s}", .{job.app}) catch break :work;
+            var ask: AppAsk = .{ .chat = .{ .core = c, .flag = &job.flag, .conv = job.to }, .job = job };
+            var run = c.runIn(&client, label, .{ .by = by, .agent = "" }, job.to, &job.flag);
+            // an act is not a run nobody watches: its question can wait
+            run.scheduled = false;
+            run.asker = .{ .ctx = &ask, .ask = AppAsk.ask };
+            run.env.shell_seconds = @min(run.env.shell_seconds, c.cfg.apps.act_seconds);
+            var outbox: RunOut = .{ .core = c, .agent = "", .run = &run, .tag = std.fmt.allocPrint(a, "[app:{s}] ", .{job.app}) catch "" };
+            run.outbox = outbox.outbox();
+            const got = agent.stepCall(&run, a, job.name, job.input) catch |e| {
+                out_text = ja.dupe(u8, @errorName(e)) catch "";
+                refused = true;
+                break :work;
+            };
+            refused = got.is_error and gateRefused(got.text);
+            out_text = ja.dupe(u8, c.masks.scrubAlloc(a, got.text) catch "") catch "";
+        }
+        job.output = out_text;
+        job.refused = refused;
+        job.ended_s = c.now();
+        job.ended.store(true, .release);
+    }
+
+    /// `POST api/run {"agent","text"}`: a run of a definition the manifest
+    /// lists as `run:NAME`, labelled `app NAME`, by `app:NAME`; its calls
+    /// may ask; its answer goes to the app. One per app at a time,
+    /// `runs_per_hour`, counted in `concurrent_runs`.
+    fn appRunStart(c: *Core, a: std.mem.Allocator, m: apps_mod.Manifest, call: appserver.Call) !appserver.Answer {
+        const v = jv.parse(a, call.body) orelse return appErr(a, .bad_request, "the call is JSON: {\"agent\":..., \"text\":...}");
+        const agent_name = jv.str(jv.get(v, "agent")) orelse "main";
+        const text = jv.str(jv.get(v, "text")) orelse return appErr(a, .bad_request, "the call carries its text");
+        if (text.len == 0 or text.len > 64 << 10) return appErr(a, .bad_request, "the text has 1 byte to 64 KiB");
+        if (!agents.validName(agent_name) or !apps_mod.actListed(m, try std.fmt.allocPrint(a, "run:{s}", .{agent_name}))) {
+            c.log.write(.app, false, .{ .event = "refused", .name = m.name, .act = try std.fmt.allocPrint(a, "run:{s}", .{util.cut(agent_name, 64)}), .why = "not in its acts" }) catch {};
+            return appErr(a, .forbidden, "this run is not in the app's acts");
+        }
+        if ((try c.defs.get(a, agent_name)) == null) return appErr(a, .not_found, try std.fmt.allocPrint(a, "agent {s} is not defined", .{agent_name}));
+        const job = blk: {
+            c.app_mutex.lockUncancelable(c.io);
+            defer c.app_mutex.unlock(c.io);
+            if (c.appJobsGoing(m.name, true).own >= 1) return appErr(a, .too_many_requests, "this app has a run going: one at a time");
+            // the hour's runs of this app
+            const now_s = c.now();
+            var n: u32 = 0;
+            var i: usize = 0;
+            while (i < c.app_runs.items.len) {
+                const r = c.app_runs.items[i];
+                if (now_s - r.at >= 3600) {
+                    c.gpa.free(r.name);
+                    _ = c.app_runs.swapRemove(i);
+                    continue;
+                }
+                if (std.mem.eql(u8, r.name, m.name)) n += 1;
+                i += 1;
+            }
+            if (n >= c.cfg.apps.runs_per_hour) return appErr(a, .too_many_requests, try std.fmt.allocPrint(a, "this app started {d} runs in the last hour, the most it may (runs_per_hour)", .{n}));
+            // a place among the runs going (the chat keeps one)
+            const slots = @max(1, c.cfg.limits.concurrent_runs) - 1;
+            if (c.bg_active.load(.acquire) >= @max(1, slots)) return appErr(a, .too_many_requests, "other runs are going (concurrent_runs): try again when one ends");
+            const name = try c.gpa.dupe(u8, m.name);
+            c.app_runs.append(c.gpa, .{ .name = name, .at = now_s }) catch c.gpa.free(name);
+            _ = c.bg_active.fetchAdd(1, .acq_rel);
+            break :blk c.appNewJob(m.name) catch |e| {
+                _ = c.bg_active.fetchSub(1, .acq_rel);
+                return e;
+            };
+        };
+        const ja = job.arena.allocator();
+        job.is_run = true;
+        job.name = try ja.dupe(u8, agent_name);
+        job.input = try ja.dupe(u8, text);
+        job.to = try ja.dupe(u8, m.to);
+        job.deadline_s = c.now() + c.cfg.limits.turn_seconds;
+        const th = std.Thread.spawn(.{}, appRunThread, .{job}) catch {
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+            job.refused = true;
+            job.output = "harness could not start it";
+            job.ended_s = c.now();
+            job.ended.store(true, .release);
+            return appErr(a, .service_unavailable, "harness could not start it");
+        };
+        th.detach();
+        return .{ .body = try std.fmt.allocPrint(a, "{{\"id\":{d},\"state\":\"running\"}}", .{job.id}) };
+    }
+
+    fn appRunThread(job: *AppJob) void {
+        const c = job.core;
+        defer _ = c.bg_active.fetchSub(1, .acq_rel);
+        const ja = job.arena.allocator();
+        var out_text: []const u8 = "";
+        var refused = false;
+        work: {
+            var arena: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const def = (c.defs.get(a, job.name) catch null) orelse {
+                out_text = "the definition is gone";
+                refused = true;
+                break :work;
+            };
+            var client = c.modelClient(if (def.model.len > 0) def.model else c.cfg.model.model, c.cfg.model.max_tokens) catch |e| {
+                out_text = @errorName(e);
+                refused = true;
+                break :work;
+            };
+            defer client.deinit();
+            c.register(&job.flag, def.name);
+            defer c.unregister(&job.flag);
+            c.helper_pool.takeAlways(c.io, def.name);
+            defer c.helper_pool.give(c.io, def.name);
+            const by = std.fmt.allocPrint(a, "app:{s}", .{job.app}) catch break :work;
+            const label = std.fmt.allocPrint(a, "app {s}", .{job.app}) catch break :work;
+            var ask: AppAsk = .{ .chat = .{ .core = c, .flag = &job.flag, .conv = job.to }, .job = job };
+            var run = c.runIn(&client, label, .{ .by = by, .agent = def.name }, job.to, &job.flag);
+            run.useDefinition(def);
+            run.holds_place = true;
+            // an app's run is watched from its page: its calls may ask
+            run.scheduled = false;
+            run.asker = .{ .ctx = &ask, .ask = AppAsk.ask };
+            run.extra_instructions = std.fmt.allocPrint(a, "The app {s} started this run from the owner's browser. Your answer goes to the app, which shows it; it is not posted to a conversation.", .{job.app}) catch "";
+            var notify: Notify = .{ .core = c, .conv = job.to };
+            run.notice = .{ .ctx = &notify, .say = Notify.say };
+            run.context_note = c.contextNote(a, job.to) catch "";
+            var conv: agent.Conversation = .init(c.gpa);
+            defer conv.deinit();
+            const res = agent.turn(&run, &conv, job.input, false) catch |e| {
+                out_text = ja.dupe(u8, @errorName(e)) catch "";
+                refused = true;
+                break :work;
+            };
+            defer agent.freeResult(&run, res);
+            if (res.stopped) {
+                out_text = "stopped";
+                refused = true;
+            } else if (res.ended_by) |why| {
+                out_text = ja.dupe(u8, c.masks.scrubAlloc(a, why) catch "") catch "";
+                refused = true;
+            } else out_text = ja.dupe(u8, c.masks.scrubAlloc(a, res.text) catch "") catch "";
+        }
+        job.output = out_text;
+        job.refused = refused;
+        job.ended_s = c.now();
+        job.ended.store(true, .release);
+    }
+
+    /// `GET api/act/ID?wait=S` and `api/run/ID?wait=S`: `running`, `asked`
+    /// (a question waits for the owner), `done` or `refused`, with the
+    /// output once it ended. Only the app that started it.
+    fn appJobState(c: *Core, a: std.mem.Allocator, call: appserver.Call, id: u64, is_run: bool) !appserver.Answer {
+        const wait_s = @min(queryInt(call.query, "wait") orelse 0, 25);
+        const end_ms = util.nowMs(c.io) + @as(i64, @intCast(wait_s)) * 1000;
+        while (true) {
+            var state: []const u8 = "running";
+            var output: ?[]const u8 = null;
+            {
+                c.app_mutex.lockUncancelable(c.io);
+                defer c.app_mutex.unlock(c.io);
+                const job = for (c.app_jobs.items) |j| {
+                    if (j.id == id and j.is_run == is_run and std.mem.eql(u8, j.app, call.app)) break j;
+                } else return appErr(a, .not_found, "no such act or run of this app");
+                if (job.ended.load(.acquire)) {
+                    state = if (job.refused) "refused" else "done";
+                    output = try a.dupe(u8, job.output);
+                } else if (job.asked.load(.acquire)) state = "asked";
+            }
+            if (output != null or util.nowMs(c.io) >= end_ms or call.stop.load(.acquire) or c.quitting.load(.acquire)) {
+                var out: std.ArrayList(u8) = .empty;
+                try out.print(a, "{{\"id\":{d},\"state\":\"{s}\"", .{ id, state });
+                if (output) |o| {
+                    try out.appendSlice(a, ",\"output\":");
+                    try util.jsonString(&out, a, o);
+                }
+                try out.append(a, '}');
+                return .{ .body = out.items };
+            }
+            c.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        }
+    }
+
+    /// The bar's calls (`/s/SHELL/api/...`): `GET inbox`, every open item
+    /// oldest first; `POST answer {"id","key","text"}`, through the one
+    /// way an item is answered, via `bar`.
+    fn appShellApi(ctx: *anyopaque, a: std.mem.Allocator, call: appserver.ShellCall) appserver.Answer {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, call.path, "inbox") and (call.method == .GET or call.method == .HEAD)) {
+            const body = c.inboxJson(a, false) catch |e| return appErr(a, .internal_server_error, @errorName(e));
+            return .{ .body = c.masks.scrubAlloc(a, body) catch body };
+        }
+        if (std.mem.eql(u8, call.path, "answer") and call.method == .POST) {
+            const v = jv.parse(a, call.body) orelse return appErr(a, .bad_request, "the answer is JSON: {\"id\":N,\"key\":...,\"text\":...}");
+            const id = jv.int(jv.get(v, "id")) orelse return appErr(a, .bad_request, "the answer names its item");
+            if (id < 0) return appErr(a, .bad_request, "the answer names its item");
+            const key = jv.str(jv.get(v, "key")) orelse "";
+            const text = jv.str(jv.get(v, "text"));
+            const took = c.answerItem(@intCast(id), key, text, .bar);
+            const said: []const u8 = switch (took) {
+                .taken => "",
+                .unknown => "There is no such item.",
+                .closed => "That item was answered already.",
+                .not_offered => "That is not one of the item's choices.",
+                .buttons_only => "That item takes its buttons only.",
+                .failed => "It is still open.",
+            };
+            var out: std.ArrayList(u8) = .empty;
+            out.print(a, "{{\"took\":\"{s}\",\"said\":", .{@tagName(took)}) catch return appErr(a, .internal_server_error, "OutOfMemory");
+            util.jsonString(&out, a, said) catch {};
+            out.append(a, '}') catch {};
+            return .{ .body = out.items };
+        }
+        return appErr(a, .not_found, "the bar has inbox and answer");
+    }
+
+    // ---- the agent's app tools ----
+
+    fn appDesk(c: *Core) agent.AppDesk {
+        return .{ .ctx = c, .draft = appDeskDraft, .stage = appDeskStage, .install = appDeskInstall, .drop = appDeskDrop };
+    }
+
+    fn appDeskDraft(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, as: []const u8) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        const src = (c.appSource(a, name) catch null) orelse return std.fmt.allocPrint(a, "there is no app called {s}", .{util.cut(name, 64)}) catch "there is no such app";
+        const dest = std.fs.path.join(a, &.{ c.workspace, "app-drafts", as }) catch return "OutOfMemory";
+        apps_mod.draft(c.io, a, src, name, dest, as) catch |e| return switch (e) {
+            error.BadAppName => "a draft's name is a-z, 0-9 and -, up to 32",
+            error.ReservedAppName => "inbox, log, files, api, home, review and pending are harness's own names: give the draft another",
+            error.AppExists => std.fmt.allocPrint(a, "app-drafts/{s} is there already: change it, or pick another name", .{as}) catch "the draft is there already",
+            else => appWhy(e),
+        };
+        return null;
+    }
+
+    fn appDeskStage(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, from: []const u8, asked_by: []const u8) agent.AppStaged {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        if (!apps_mod.validName(name)) return .{ .why = "an app's name is a-z, 0-9 and -, up to 32" };
+        for (apps_mod.reserved) |r| if (std.mem.eql(u8, r, name)) return .{ .why = "inbox, log, files, api, home, review and pending are harness's own names" };
+        const cf = gate.confined(a, c.io, c.workspace, from) catch return .{ .why = "the folder is outside the workspace" };
+        const apps_dir = std.fs.path.join(a, &.{ c.paths.home, "apps" }) catch return .{ .why = "OutOfMemory" };
+        const state_dir = std.fs.path.join(a, &.{ c.paths.state, "apps" }) catch return .{ .why = "OutOfMemory" };
+        const id = a.dupe(u8, &c.newToken()) catch return .{ .why = "OutOfMemory" };
+        const s = apps_mod.stage(c.io, a, apps_dir, state_dir, name, .{ .dir = cf.path }, id) catch |e| {
+            // which line of app.ini, where that is what is wrong
+            if (e == error.BadManifest) {
+                const ini = Io.Dir.cwd().readFileAlloc(c.io, std.fs.path.join(a, &.{ cf.path, "app.ini" }) catch "", a, .limited(64 << 10)) catch "";
+                if (apps_mod.parse(a, ini)) |_| {} else |pe| if (apps_mod.reason(pe)) |why| return .{ .why = std.fmt.allocPrint(a, "{s}/app.ini: {s}", .{ cf.rel, why }) catch why };
+            }
+            return .{ .why = std.fmt.allocPrint(a, "{s}: {s}", .{ cf.rel, appWhy(e) }) catch appWhy(e) };
+        };
+        // a question holds 12 KB; the rest of a long list is on the review page
+        const detail = apps_mod.describe(a, s, asked_by, 9000) catch return .{ .why = "OutOfMemory" };
+        return .{ .id = s.id, .version = s.version, .detail = detail, .inline_in = s.inline_in };
+    }
+
+    fn appDeskInstall(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, id: []const u8, saved: agent.Saved) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        const apps_dir = std.fs.path.join(a, &.{ c.paths.home, "apps" }) catch return "OutOfMemory";
+        const state_dir = std.fs.path.join(a, &.{ c.paths.state, "apps" }) catch return "OutOfMemory";
+        const by = std.fmt.allocPrint(a, "agent:{s}", .{saved.agent}) catch return "OutOfMemory";
+        const version = apps_mod.install(c.io, a, apps_dir, state_dir, name, id, by, c.now()) catch |e| return appWhy(e);
+        const ap = (apps_mod.readApproved(c.io, a, state_dir, name) catch null);
+        const files = if (apps_mod.checkFolder(c.io, a, std.fs.path.join(a, &.{ apps_dir, name }) catch "", name)) |f| f.files.len else |_| 0;
+        c.log.write(.app, false, .{
+            .event = "saved",
+            .name = name,
+            .version = version,
+            .sha256 = if (ap) |x| @as([]const u8, &x.digest) else "",
+            .files = files,
+            .by = saved.by,
+            .agent = saved.agent,
+            .item = if (saved.item != 0) @as(?u64, saved.item) else null,
+        }) catch {};
+        return null;
+    }
+
+    fn appDeskDrop(ctx: *anyopaque, a: std.mem.Allocator, id: []const u8) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        apps_mod.dropPending(c.io, a, std.fs.path.join(a, &.{ c.paths.state, "apps" }) catch return, id);
     }
 
     /// One line per login: what is stored for it (never the values).
@@ -20509,4 +21565,545 @@ test "an_event_is_said_once" {
     try t.expect(!f.core.firstAnnounce("leak", "341bb1f1c630816f0cfd049739c6456a"));
     try t.expect(f.core.firstAnnounce("door", "341bb1f1c630816f0cfd049739c6456a"));
     try t.expect(f.core.firstAnnounce("leak", "8b02f6ae15b4b0f3e2a1dc7e4c3d9a10"));
+}
+
+// ---- apps (gap 8): the API, the bar, app_save ----
+
+var app_never_stops: std.atomic.Value(bool) = .init(false);
+
+/// One call of app `name`'s API, as the app server hands it over.
+fn appCall(f: *Fix, name: []const u8, method: std.http.Method, path: []const u8, query: []const u8, body: []const u8) appserver.Answer {
+    return Core.appApi(f.core, f.e.arena.allocator(), .{
+        .app = name,
+        .version = "1",
+        .builtin = apps_mod.builtinManifest(name) != null,
+        .method = method,
+        .path = path,
+        .query = query,
+        .body = body,
+        .stop = &app_never_stops,
+    });
+}
+
+/// One call of the bar's.
+fn barCall(f: *Fix, method: std.http.Method, path: []const u8, body: []const u8) appserver.Answer {
+    return Core.appShellApi(f.core, f.e.arena.allocator(), .{ .method = method, .path = path, .query = "", .body = body });
+}
+
+/// Installs an app as the owner's: `ini` and `files` (name, content).
+fn installApp(f: *Fix, name: []const u8, ini: []const u8, files: []const [2][]const u8) !void {
+    const a = f.e.arena.allocator();
+    const dir = try std.fs.path.join(a, &.{ f.core.workspace, "app-drafts", name });
+    try Io.Dir.cwd().createDirPath(t.io, dir);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "app.ini" }), .data = ini });
+    for (files) |file| try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, file[0] }), .data = file[1] });
+    const apps_dir = try std.fs.path.join(a, &.{ f.core.paths.home, "apps" });
+    const state_dir = try std.fs.path.join(a, &.{ f.core.paths.state, "apps" });
+    const id = f.core.newToken();
+    _ = try apps_mod.stage(t.io, a, apps_dir, state_dir, name, .{ .dir = dir }, &id);
+    _ = try apps_mod.install(t.io, a, apps_dir, state_dir, name, &id, "owner", 1);
+    try Io.Dir.cwd().deleteTree(t.io, dir);
+}
+
+/// The id a `POST api/act` or `api/run` answered with.
+fn jobId(f: *Fix, got: appserver.Answer) !u64 {
+    if (got.status != .ok) {
+        std.debug.print("not started: {d} {s}\n", .{ @backingInt(got.status), got.body });
+        return error.TestUnexpectedResult;
+    }
+    return @intCast(jv.int(jv.get(jv.parse(f.e.arena.allocator(), got.body), "id")).?);
+}
+
+/// Waits until act or run `id` of app `name` says `state`; its answer.
+fn waitJob(f: *Fix, name: []const u8, kind: []const u8, id: u64, state: []const u8) ![]const u8 {
+    const a = f.e.arena.allocator();
+    const path = try std.fmt.allocPrint(a, "{s}/{d}", .{ kind, id });
+    const want = try std.fmt.allocPrint(a, "\"state\":\"{s}\"", .{state});
+    var waited: u32 = 0;
+    var last: []const u8 = "";
+    while (waited < 15000) : (waited += 20) {
+        last = appCall(f, name, .GET, path, "", "").body;
+        if (std.mem.indexOf(u8, last, want) != null) return last;
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    std.debug.print("{s} never said {s}: {s}\n", .{ path, state, last });
+    return error.TestTimedOut;
+}
+
+/// The first message that went out holding `needle`.
+fn lineWith(f: *Fix, needle: []const u8) ![]const u8 {
+    f.rec.mutex.lockUncancelable(t.io);
+    defer f.rec.mutex.unlock(t.io);
+    for (f.rec.lines.items) |l| if (std.mem.indexOf(u8, l, needle) != null) return f.e.arena.allocator().dupe(u8, l);
+    return error.TestExpectedEqual;
+}
+
+fn countOf(text: []const u8, needle: []const u8) usize {
+    return std.mem.count(u8, text, needle);
+}
+
+test "app_reads_follow_the_manifest" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try installApp(&f, "notes", "[app]\nname = notes\ntitle = Notes\nreads = log, memory\n", &.{.{ "index.html", "<p>notes</p>" }});
+    // what it is: its manifest, as harness reads it
+    const info = appCall(&f, "notes", .GET, "info", "in=page", "");
+    try t.expectEqual(.ok, info.status);
+    try expectHas(info.body, "\"name\":\"notes\",\"version\":\"1\",\"title\":\"Notes\"");
+    try expectHas(info.body, "\"reads\":[\"log\",\"memory\"],\"files\":[],\"acts\":[],\"to\":\"main\",\"container\":\"page\"");
+    // unlisted: refused before the gate, said in the log, no gate line
+    const inbox = appCall(&f, "notes", .GET, "inbox", "", "");
+    try t.expectEqual(.forbidden, inbox.status);
+    try expectHas(inbox.body, "inbox is not in this app's reads");
+    try t.expectEqual(.forbidden, appCall(&f, "notes", .GET, "files", "path=", "").status);
+    var lt = try logText(&f);
+    try expectHas(lt, "\"kind\":\"app\",\"event\":\"refused\",\"name\":\"notes\",\"read\":\"inbox\",\"why\":\"not in its reads\"");
+    try t.expectEqual(0, countOf(lt, "\"tool\":\"app_read\""));
+    // listed, and a rule stops it: 403 with a gate line
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "deny app_read * log\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const denied = appCall(&f, "notes", .GET, "log", "", "");
+    try t.expectEqual(.forbidden, denied.status);
+    try expectHas(denied.body, "refused by the gate");
+    lt = try logText(&f);
+    try expectHas(lt, "\"run\":\"app notes\",\"by\":\"app:notes\",\"tool\":\"app_read\",\"decision\":\"deny\"");
+    try expectHas(lt, "\"arg\":\"notes log\"");
+    // memory is another subject: read
+    try t.expectEqual(.ok, appCall(&f, "notes", .GET, "memory", "", "").status);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    // 50 polls: one `read` line, until its page loads again
+    for (0..50) |_| try t.expectEqual(.ok, appCall(&f, "notes", .GET, "log", "after=0", "").status);
+    lt = try logText(&f);
+    try t.expectEqual(1, countOf(lt, "\"event\":\"read\",\"name\":\"notes\",\"read\":\"log\""));
+    Core.appOpened(f.core, "notes", "1");
+    for (0..5) |_| _ = appCall(&f, "notes", .GET, "log", "", "");
+    lt = try logText(&f);
+    try t.expectEqual(2, countOf(lt, "\"event\":\"read\",\"name\":\"notes\",\"read\":\"log\""));
+    try expectHas(lt, "\"event\":\"opened\",\"name\":\"notes\",\"version\":\"1\",\"reads\":\"log,memory\"");
+    // the log's lines, newest, after a seq; its runs; a session; verify
+    const all = appCall(&f, "notes", .GET, "log", "after=0&limit=3", "");
+    const v = jv.parse(a, all.body).?;
+    try t.expectEqual(3, jv.arr(jv.get(v, "lines")).?.len);
+    const last = jv.int(jv.get(v, "last")).?;
+    try t.expect(last >= 3);
+    const none = appCall(&f, "notes", .GET, "log", try std.fmt.allocPrint(a, "after={d}", .{last + 100}), "");
+    try expectHas(none.body, "{\"lines\":[],\"last\":");
+    try expectHas(appCall(&f, "notes", .GET, "log/runs", "", "").body, "{\"runs\":[");
+    try expectHas(appCall(&f, "notes", .GET, "log/verify", "", "").body, "{\"ok\":true,\"lines\":");
+    try t.expectEqual(.not_found, appCall(&f, "notes", .GET, "log/session/999999", "", "").status);
+    try t.expectEqual(.not_found, appCall(&f, "notes", .GET, "nothing", "", "").status);
+    try t.expectEqual(.method_not_allowed, appCall(&f, "notes", .POST, "log", "", "{}").status);
+    try t.expectEqual(.not_found, appCall(&f, "no-such-app", .GET, "info", "", "").status);
+}
+
+test "app_log_waits_for_a_new_line" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const first = jv.int(jv.get(jv.parse(a, appCall(&f, "log", .GET, "log", "", "").body), "last")).?;
+    const Later = struct {
+        fn write(c: *Core) void {
+            c.io.sleep(.fromMilliseconds(300), .awake) catch {};
+            c.log.write(.config, false, .{ .event = "a later line" }) catch {};
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Later.write, .{f.core});
+    defer th.join();
+    const started = util.nowMs(t.io);
+    const got = appCall(&f, "log", .GET, "log", try std.fmt.allocPrint(a, "after={d}&wait=10", .{first}), "");
+    try expectHas(got.body, "a later line");
+    try t.expect(util.nowMs(t.io) - started >= 250);
+    try t.expect(util.nowMs(t.io) - started < 9000);
+}
+
+test "app_answers_are_masked" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try installApp(&f, "notes", "[app]\nname = notes\nreads = memory, log, files, inbox\nfiles = *\n", &.{.{ "index.html", "x" }});
+    // a stored secret in a memory, a file, a log line and an item
+    {
+        f.core.lock.lockUncancelable(t.io);
+        defer f.core.lock.unlock(t.io);
+        f.core.mem.secrets = &.{};
+        _ = try f.core.mem.add("the key is og-key-for-tests", null, f.core.now());
+    }
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.workspace, "k.txt" }), .data = "key: og-key-for-tests\n" });
+    const mem_body = appCall(&f, "notes", .GET, "memory", "", "").body;
+    try expectHas(mem_body, "the key is [secret:omnigate]");
+    try expectHas(mem_body, "\"level\":\"");
+    const file = appCall(&f, "notes", .GET, "files", "path=k.txt", "");
+    try t.expectEqual(.ok, file.status);
+    try expectHas(file.body, "\"kind\":\"file\"");
+    try expectHas(file.body, "key: [secret:omnigate]");
+    for ([_][]const u8{ mem_body, file.body, appCall(&f, "notes", .GET, "log", "", "").body, appCall(&f, "notes", .GET, "inbox", "state=all", "").body }) |body|
+        try t.expect(std.mem.indexOf(u8, body, "og-key-for-tests") == null);
+}
+
+test "app_files_follow_the_manifest_and_the_file_rules" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try installApp(&f, "reader", "[app]\nname = reader\nreads = files\nfiles = reading/*, deep/in/*\n", &.{.{ "index.html", "x" }});
+    for ([_][]const u8{ "reading/sub", "deep/in", "deep/other", "private" }) |d| try Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(a, &.{ f.core.workspace, d }));
+    for ([_][2][]const u8{ .{ "reading/a.md", "# A\n" }, .{ "reading/sub/b.md", "b" }, .{ "deep/in/c.txt", "c" }, .{ "deep/other/d.txt", "d" }, .{ "private/k", "k" }, .{ "top.txt", "t" }, .{ "reading/dot.png", "\x89PNG" } }) |file|
+        try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.workspace, file[0] }), .data = file[1] });
+    // the workspace: only the folders on the way to its files
+    const root = appCall(&f, "reader", .GET, "files", "path=", "");
+    try t.expectEqual(.ok, root.status);
+    try t.expectEqualStrings("{\"path\":\"\",\"kind\":\"folder\",\"entries\":[{\"name\":\"deep\",\"kind\":\"folder\",\"size\":0},{\"name\":\"reading\",\"kind\":\"folder\",\"size\":0}]}", root.body);
+    try t.expectEqualStrings("{\"path\":\"deep\",\"kind\":\"folder\",\"entries\":[{\"name\":\"in\",\"kind\":\"folder\",\"size\":0}]}", appCall(&f, "reader", .GET, "files", "path=deep", "").body);
+    const reading = appCall(&f, "reader", .GET, "files", "path=reading", "").body;
+    try expectHas(reading, "{\"name\":\"sub\",\"kind\":\"folder\",\"size\":0},{\"name\":\"a.md\",\"kind\":\"file\",\"size\":4}");
+    try t.expectEqualStrings("{\"path\":\"reading/a.md\",\"kind\":\"file\",\"size\":4,\"text\":\"# A\\n\"}", appCall(&f, "reader", .GET, "files", "path=reading%2Fa.md", "").body);
+    try expectHas(appCall(&f, "reader", .GET, "files", "path=reading/dot.png", "").body, "\"kind\":\"image\",\"size\":4,\"mime\":\"image/png\",\"data\":\"iVBORw==\"");
+    // not its files, the data folder, outside the workspace
+    for ([_][]const u8{ "path=top.txt", "path=private/k", "path=deep/other/d.txt", "path=deep/other", "path=..", "path=../config.ini", "path=%2e%2e/rules" }) |q| {
+        const got = appCall(&f, "reader", .GET, "files", q, "");
+        if (got.status != .forbidden) std.debug.print("{s}: {s}\n", .{ q, got.body });
+        try t.expectEqual(.forbidden, got.status);
+    }
+    try t.expectEqual(.not_found, appCall(&f, "reader", .GET, "files", "path=reading/none.md", "").status);
+    // a file rule decides as for read_file, for app:reader
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "deny read_file reading/sub/*\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expectEqual(.forbidden, appCall(&f, "reader", .GET, "files", "path=reading/sub/b.md", "").status);
+    try t.expectEqual(.ok, appCall(&f, "reader", .GET, "files", "path=reading/a.md", "").status);
+    const lt = try logText(&f);
+    try expectHas(lt, "\"by\":\"app:reader\",\"tool\":\"read_file\",\"decision\":\"deny\"");
+    try t.expectEqual(1, countOf(lt, "\"event\":\"read\",\"name\":\"reader\",\"read\":\"files\""));
+    // the built-in files app reads all of the workspace
+    try expectHas(appCall(&f, "files", .GET, "files", "path=", "").body, "{\"name\":\"top.txt\",\"kind\":\"file\",\"size\":1}");
+}
+
+test "an_apps_data_through_its_api" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try installApp(&f, "notes", "[app]\nname = notes\n", &.{.{ "index.html", "x" }});
+    try t.expectEqualStrings("{\"keys\":[]}", appCall(&f, "notes", .GET, "data", "", "").body);
+    try t.expectEqual(.not_found, appCall(&f, "notes", .GET, "data/list.json", "", "").status);
+    try t.expectEqual(.ok, appCall(&f, "notes", .PUT, "data/list.json", "", "[1,2]").status);
+    try t.expectEqualStrings("[1,2]", appCall(&f, "notes", .GET, "data/list.json", "", "").body);
+    try t.expectEqualStrings("{\"keys\":[\"list.json\"]}", appCall(&f, "notes", .GET, "data", "", "").body);
+    try t.expectEqual(.bad_request, appCall(&f, "notes", .PUT, "data/..%2Fapp.ini", "", "x").status);
+    try t.expectEqual(.bad_request, appCall(&f, "notes", .GET, "data/a/b", "", "").status);
+    try t.expectEqual(.ok, appCall(&f, "notes", .DELETE, "data/list.json", "", "").status);
+    try t.expectEqual(.not_found, appCall(&f, "notes", .GET, "data/list.json", "", "").status);
+    // its data is not part of what was approved, and a built-in keeps none
+    try t.expectEqual(.ok, appCall(&f, "notes", .PUT, "data/k", "", "v").status);
+    try expectHas(try f.core.command(f.e.arena.allocator(), "/apps"), "notes: v1");
+    try t.expectEqual(.not_found, appCall(&f, "log", .PUT, "data/k", "", "v").status);
+}
+
+test "app_act_passes_the_gate_as_the_app" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try installApp(&f, "notes", "[app]\nname = notes\nfiles = notes/*\nacts = shell, write_file\n", &.{.{ "index.html", "x" }});
+    // a tool with the gate's default allow: done, as app:notes
+    const w = try jobId(&f, appCall(&f, "notes", .POST, "act", "", "{\"tool\":\"write_file\",\"input\":{\"path\":\"notes/a.txt\",\"content\":\"from the app\\n\"}}"));
+    _ = try waitJob(&f, "notes", "act", w, "done");
+    try t.expectEqualStrings("from the app\n", try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ f.core.workspace, "notes", "a.txt" }), a, .unlimited));
+    // one that asks: the question names the app, in its conversation
+    const id = try jobId(&f, appCall(&f, "notes", .POST, "act", "", "{\"tool\":\"shell\",\"input\":{\"command\":\"echo app-ran\"}}"));
+    _ = try waitJob(&f, "notes", "act", id, "asked");
+    try f.rec.waitFor("[app:notes] shell: echo app-ran");
+    try waitInbox(&f, "\"by\":\"app:notes\"");
+    try f.press("once");
+    const done = try waitJob(&f, "notes", "act", id, "done");
+    try expectHas(done, "app-ran");
+    // denied: refused, with why
+    const id2 = try jobId(&f, appCall(&f, "notes", .POST, "act", "", "{\"tool\":\"shell\",\"input\":{\"command\":\"echo second\"}}"));
+    _ = try waitJob(&f, "notes", "act", id2, "asked");
+    try f.rec.waitFor("[app:notes] shell: echo second");
+    try f.press("deny");
+    try expectHas(try waitJob(&f, "notes", "act", id2, "refused"), "refused by the gate");
+    // not in its acts, not in its files, a run as an act: unasked
+    const before = f.core.itemsWaiting();
+    for ([_][]const u8{
+        "{\"tool\":\"fetch\",\"input\":{\"url\":\"https://example.com\"}}",
+        "{\"tool\":\"write_file\",\"input\":{\"path\":\"other/b.txt\",\"content\":\"x\"}}",
+        "{\"tool\":\"write_file\",\"input\":{\"path\":\"../rules\",\"content\":\"allow shell *\"}}",
+        "{\"tool\":\"run:main\",\"input\":{}}",
+        "{\"tool\":\"app_save\",\"input\":{\"name\":\"notes\"}}",
+    }) |body| {
+        const got = appCall(&f, "notes", .POST, "act", "", body);
+        if (got.status != .forbidden) std.debug.print("{s}: {s}\n", .{ body, got.body });
+        try t.expectEqual(.forbidden, got.status);
+    }
+    try t.expectEqual(before, f.core.itemsWaiting());
+    try t.expectEqual(.bad_request, appCall(&f, "notes", .POST, "act", "", "not json").status);
+    // another app can't read this one's acts
+    try installApp(&f, "other", "[app]\nname = other\n", &.{.{ "index.html", "x" }});
+    try t.expectEqual(.not_found, appCall(&f, "other", .GET, try std.fmt.allocPrint(a, "act/{d}", .{id}), "", "").status);
+    const lt = try logText(&f);
+    try expectHas(lt, "\"run\":\"app notes\",\"by\":\"app:notes\"");
+    try expectHas(lt, "\"tool\":\"shell\",\"decision\":\"allow\",\"why\":\"allowed once by the owner (item 1)\"");
+    try expectHas(lt, "\"event\":\"refused\",\"name\":\"notes\",\"act\":\"fetch\",\"why\":\"this tool is not in the app's acts\"");
+}
+
+test "app_grants_cover_one_app_only" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try installApp(&f, "one", "[app]\nname = one\nacts = shell\n", &.{.{ "index.html", "x" }});
+    try installApp(&f, "two", "[app]\nname = two\nacts = shell\n", &.{.{ "index.html", "x" }});
+    const body = "{\"tool\":\"shell\",\"input\":{\"command\":\"echo granted\"}}";
+    const id = try jobId(&f, appCall(&f, "one", .POST, "act", "", body));
+    _ = try waitJob(&f, "one", "act", id, "asked");
+    try f.rec.waitFor("[app:one] shell: echo granted");
+    try f.press("day");
+    _ = try waitJob(&f, "one", "act", id, "done");
+    // the same call again from that app: not asked
+    const again = try jobId(&f, appCall(&f, "one", .POST, "act", "", body));
+    try expectHas(try waitJob(&f, "one", "act", again, "done"), "granted");
+    // from another app: asked
+    const other = try jobId(&f, appCall(&f, "two", .POST, "act", "", body));
+    _ = try waitJob(&f, "two", "act", other, "asked");
+    try f.rec.waitFor("[app:two] shell: echo granted");
+    try f.press("deny");
+    _ = try waitJob(&f, "two", "act", other, "refused");
+    try expectHas(try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.grants, f.e.arena.allocator(), .unlimited), "app:one");
+}
+
+test "stop_ends_app_acts_and_runs" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try installApp(&f, "notes", "[app]\nname = notes\nacts = shell\n", &.{.{ "index.html", "x" }});
+    // two at once per app; a third waits its turn
+    const body = "{\"tool\":\"shell\",\"input\":{\"command\":\"echo held\"}}";
+    const one = try jobId(&f, appCall(&f, "notes", .POST, "act", "", body));
+    const two = try jobId(&f, appCall(&f, "notes", .POST, "act", "", body));
+    try t.expectEqual(.too_many_requests, appCall(&f, "notes", .POST, "act", "", body).status);
+    _ = try waitJob(&f, "notes", "act", one, "asked");
+    _ = try waitJob(&f, "notes", "act", two, "asked");
+    _ = f.core.stopAll();
+    _ = try waitJob(&f, "notes", "act", one, "refused");
+    _ = try waitJob(&f, "notes", "act", two, "refused");
+    try t.expectEqual(0, f.core.itemsWaiting());
+}
+
+test "app_run_within_limits" {
+    var f: Fix = undefined;
+    try f.init("[apps]\nruns_per_hour = 2\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try installApp(&f, "notes", "[app]\nname = notes\nacts = run:main\n", &.{.{ "index.html", "x" }});
+    try installApp(&f, "plain", "[app]\nname = plain\n", &.{.{ "index.html", "x" }});
+    // not in its acts: unasked, no run
+    try t.expectEqual(.forbidden, appCall(&f, "plain", .POST, "run", "", "{\"agent\":\"main\",\"text\":\"hello\"}").status);
+    try t.expectEqual(.forbidden, appCall(&f, "notes", .POST, "run", "", "{\"agent\":\"helper\",\"text\":\"hello\"}").status);
+    // a run whose call asks: the app sees `asked`; a second run: 429
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo from-the-run\"}"));
+    try f.e.script(2, model.textReply("The answer is 42."));
+    const id = try jobId(&f, appCall(&f, "notes", .POST, "run", "", "{\"agent\":\"main\",\"text\":\"what is the answer?\"}"));
+    _ = try waitJob(&f, "notes", "run", id, "asked");
+    try f.rec.waitFor("[app:notes] shell: echo from-the-run");
+    try t.expectEqual(.too_many_requests, appCall(&f, "notes", .POST, "run", "", "{\"agent\":\"main\",\"text\":\"again\"}").status);
+    try f.press("once");
+    // its answer goes to the app, not to a conversation
+    const done = try waitJob(&f, "notes", "run", id, "done");
+    try expectHas(done, "\"output\":\"The answer is 42.\"");
+    try t.expectEqual(0, f.rec.countIn("main", "The answer is 42."));
+    const lt = try logText(&f);
+    try expectHas(lt, "\"run\":\"app notes\",\"by\":\"app:notes\",\"agent\":\"main\"");
+    // the hour's runs: two, then 429
+    try f.e.script(3, model.textReply("second"));
+    const id2 = try jobId(&f, appCall(&f, "notes", .POST, "run", "", "{\"agent\":\"main\",\"text\":\"two\"}"));
+    _ = try waitJob(&f, "notes", "run", id2, "done");
+    const third = appCall(&f, "notes", .POST, "run", "", "{\"agent\":\"main\",\"text\":\"three\"}");
+    try t.expectEqual(.too_many_requests, third.status);
+    try expectHas(third.body, "runs_per_hour");
+    _ = a;
+}
+
+test "bar_shows_every_open_item_and_answers_each_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    var ids: [3]u64 = undefined;
+    for (&ids, [_][]const u8{ "first", "second", "third" }) |*id, title| id.* = try f.core.addItem(.{
+        .kind = "question",
+        .by = "workflow:w/s",
+        .conversation = "main",
+        .waiter = "harness",
+        .title = title,
+        .body = title,
+        .choices = &.{ .{ .key = "approve", .label = "Approve" }, .{ .key = "deny", .label = "Deny" } },
+    });
+    // every open item at once, oldest first, never its token
+    const list = barCall(&f, .GET, "inbox", "");
+    try t.expectEqual(.ok, list.status);
+    const items = jv.arr(jv.get(jv.parse(a, list.body), "items")).?;
+    try t.expectEqual(3, items.len);
+    for (items, [_][]const u8{ "first", "second", "third" }, ids) |it, title, id| {
+        try t.expectEqualStrings(title, jv.str(jv.get(it, "title")).?);
+        try t.expectEqual(@as(i64, @intCast(id)), jv.int(jv.get(it, "id")).?);
+        try t.expectEqualStrings("approve", jv.str(jv.get(jv.arr(jv.get(it, "choices")).?[0], "key")).?);
+    }
+    try t.expect(std.mem.indexOf(u8, list.body, "\"token\"") == null);
+    // answered out of order, each once: the first answer wins
+    const second = barCall(&f, .POST, "answer", try std.fmt.allocPrint(a, "{{\"id\":{d},\"key\":\"approve\"}}", .{ids[1]}));
+    try t.expectEqualStrings("{\"took\":\"taken\",\"said\":\"\"}", second.body);
+    const again = barCall(&f, .POST, "answer", try std.fmt.allocPrint(a, "{{\"id\":{d},\"key\":\"deny\"}}", .{ids[1]}));
+    try t.expectEqualStrings("{\"took\":\"closed\",\"said\":\"That item was answered already.\"}", again.body);
+    try expectHas(barCall(&f, .POST, "answer", try std.fmt.allocPrint(a, "{{\"id\":{d},\"key\":\"maybe\"}}", .{ids[0]})).body, "\"took\":\"not_offered\"");
+    try expectHas(barCall(&f, .POST, "answer", "{\"id\":999,\"key\":\"approve\"}").body, "\"took\":\"unknown\"");
+    try t.expectEqual(.bad_request, barCall(&f, .POST, "answer", "{}").status);
+    try t.expectEqual(2, jv.arr(jv.get(jv.parse(a, barCall(&f, .GET, "inbox", "").body), "items")).?.len);
+    try expectHas(barCall(&f, .POST, "answer", try std.fmt.allocPrint(a, "{{\"id\":{d},\"key\":\"deny\"}}", .{ids[2]})).body, "taken");
+    // written with how it was answered; Telegram's buttons are edited
+    const inbox = try inboxFile(&f);
+    try expectHas(inbox, "\"answer\":{\"key\":\"approve\"");
+    try expectHas(inbox, "\"via\":\"bar\"");
+    try f.rec.waitFor("second\nAnswered: Approve");
+    // a later press of Telegram's own button says so
+    try t.expectEqual(.closed, f.core.answerItem(ids[1], "approve", null, .telegram));
+    // an app has no such call
+    try installApp(&f, "notes", "[app]\nname = notes\nreads = inbox\n", &.{.{ "index.html", "x" }});
+    try t.expectEqual(.not_found, appCall(&f, "notes", .POST, "answer", "", try std.fmt.allocPrint(a, "{{\"id\":{d},\"key\":\"approve\"}}", .{ids[0]})).status);
+    try t.expectEqual(.method_not_allowed, appCall(&f, "notes", .POST, "inbox", "", "{}").status);
+    try t.expectEqual(itemStatus(&f, ids[0]), .open);
+    // its read of the inbox: format v1, open or all
+    const open = appCall(&f, "notes", .GET, "inbox", "state=open", "").body;
+    try t.expectEqual(1, jv.arr(jv.get(jv.parse(a, open), "items")).?.len);
+    try expectHas(open, "{\"v\":1,\"id\":");
+    try t.expectEqual(3, jv.arr(jv.get(jv.parse(a, appCall(&f, "notes", .GET, "inbox", "state=all", "").body), "items")).?.len);
+}
+
+test "app_save_asks_every_time_and_installs_what_was_shown" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // an allow rule lifts nothing: it is a setup call
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow app_save *\nallow write_file *\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"app-drafts/list/app.ini\",\"content\":\"[app]\\nname = list\\ntitle = Reading list\\nreads = files\\nfiles = reading/*\\n\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "write_file", "{\"path\":\"app-drafts/list/index.html\",\"content\":\"<p onclick=\\\"go()\\\">list</p>\"}"));
+    try f.e.script(3, model.toolReply("tu_3", "app_save", "{\"name\":\"list\"}"));
+    try f.e.script(4, model.textReply("Your reading list is ready: {app:list}"));
+    try f.core.startWorker();
+    try f.core.handleText("make me a reading list app");
+    try f.rec.waitFor("app_save: list");
+    const q = try lineWith(&f, "app_save: list");
+    for ([_][]const u8{ "list v1 (a new app), asked by main", "It reads: files. Files: reading/*. It may ask harness to: nothing.", "title = Reading list", "index.html  26 B  ", "  new", "Every file in full: (the review page needs the app server" }) |want| try expectHas(q, want);
+    // no 24 h for a setup call
+    try t.expect(f.lastButtons().get("day") == null);
+    // the draft changes after the question: the copy is what is installed
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.workspace, "app-drafts", "list", "index.html" }), .data = "<p>swapped</p>" });
+    try f.press("once");
+    try f.rec.waitFor("Your reading list is ready: the list app (the app server is not running");
+    try t.expectEqualStrings("<p onclick=\"go()\">list</p>", try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ f.core.paths.home, "apps", "list", "index.html" }), a, .unlimited));
+    try expectHas(try f.core.command(a, "/apps"), "list: v1");
+    const lt = try logText(&f);
+    try expectHas(lt, "\"kind\":\"app\"");
+    try expectHas(lt, "\"event\":\"saved\",\"name\":\"list\",\"version\":1,\"sha256\":\"");
+    try expectHas(lt, "\"files\":1,\"by\":\"owner\",\"agent\":\"main\",\"item\":");
+    // the tool's answer names the handler that won't run; the log holds
+    // the placeholder, never a link
+    try expectHas(lt, "Scripts or on...= handlers written into index.html never run in an app");
+    try expectHas(lt, "{app:list}");
+    try t.expect(std.mem.indexOf(u8, lt, "127.0.0.1") == null);
+    // nothing left of the save that was asked
+    var pending = try Io.Dir.cwd().openDir(t.io, try std.fs.path.join(a, &.{ f.core.paths.state, "apps", "pending" }), .{ .iterate = true });
+    defer pending.close(t.io);
+    var left = pending.iterate();
+    try t.expectEqual(null, try left.next(t.io));
+}
+
+test "app_save_denied_or_unreadable_installs_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const desk = f.core.appDesk();
+    // a folder that doesn't read goes back unasked, with the line that is wrong
+    try Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(a, &.{ f.core.workspace, "app-drafts", "bad" }));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.workspace, "app-drafts", "bad", "app.ini" }), .data = "[app]\nname = bad\nacts = money\n" });
+    try expectHas(desk.stage(desk.ctx, a, "bad", "app-drafts/bad", "main").why.?, "app-drafts/bad/app.ini: acts = tools");
+    try expectHas(desk.stage(desk.ctx, a, "inbox", "app-drafts/bad", "main").why.?, "harness's own names");
+    try expectHas(desk.stage(desk.ctx, a, "bad", "../apps", "main").why.?, "outside the workspace");
+    try expectHas(desk.stage(desk.ctx, a, "none", "app-drafts/none", "main").why.?, "it has no app.ini");
+    // a draft of a built-in, saved under its own name; then dropped
+    try t.expectEqual(null, desk.draft(desk.ctx, a, "log", "my-log"));
+    try expectHas(desk.draft(desk.ctx, a, "log", "my-log").?, "is there already");
+    try expectHas(desk.draft(desk.ctx, a, "nothing", "x").?, "there is no app called nothing");
+    try expectHas(desk.draft(desk.ctx, a, "log", "log").?, "harness's own names");
+    const st = desk.stage(desk.ctx, a, "my-log", "app-drafts/my-log", "main");
+    try t.expectEqual(null, st.why);
+    try expectHas(st.detail, "my-log v1 (a new app), asked by main");
+    try expectHas(st.detail, "forked_from = log");
+    desk.drop(desk.ctx, a, st.id);
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, try std.fs.path.join(a, &.{ f.core.paths.home, "apps", "my-log" }), .{}));
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, try std.fs.path.join(a, &.{ f.core.paths.state, "apps", "pending", st.id }), .{}));
+}
+
+test "app_placeholder_filled_only_when_sent" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try installApp(&f, "notes", "[app]\nname = notes\n", &.{.{ "index.html", "x" }});
+    const url = try f.core.startApps(a);
+    const s = f.core.app_server.?;
+    try t.expect(std.mem.startsWith(u8, url, "http://127.0.0.1:"));
+    f.core.say("Open {app:notes}, or this week: {app:notes/week}. Review: {app-review:00000000000000aa}. Left as it is: {app:Not A Name} {apple}");
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "Open http://127.0.0.1:{d}/s/{s}/notes, or this week: http://127.0.0.1:{d}/s/{s}/notes?view=week. Review: http://127.0.0.1:{d}/s/{s}/review/00000000000000aa. Left as it is: {{app:Not A Name}} {{apple}}", .{ s.port, &s.shell_token, s.port, &s.shell_token, s.port, &s.shell_token }));
+    // an item's text too
+    _ = try f.core.addItem(.{ .kind = "question", .by = "owner", .conversation = "main", .waiter = "harness", .title = "See {app:notes}", .body = "See {app:notes}", .choices = &.{.{ .key = "ok", .label = "OK" }} });
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "See http://127.0.0.1:{d}/s/{s}/notes", .{ s.port, &s.shell_token }));
+    // neither the log nor the inbox holds this start's token
+    try t.expect(std.mem.indexOf(u8, try logText(&f), &s.shell_token) == null);
+    try t.expect(std.mem.indexOf(u8, try inboxFile(&f), &s.shell_token) == null);
+    try expectHas(try logText(&f), "\"kind\":\"app\",\"event\":\"server started\",\"port\":");
+    // the apps list carries the links while the server runs
+    try expectHas(try f.core.command(a, "/apps"), try std.fmt.allocPrint(a, "notes: v1 http://127.0.0.1:{d}/s/{s}/notes", .{ s.port, &s.shell_token }));
+}
+
+test "the_app_commands_fork_list_versions_and_revert" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try expectHas(try f.core.command(a, "/app fork log my-log"), "Forked log as my-log: a copy to change in apps/my-log");
+    try expectHas(try f.core.command(a, "/apps"), "my-log: v1");
+    try expectHas(try f.core.command(a, "/app fork log my-log"), "There is an apps/my-log already.");
+    try expectHas(try f.core.command(a, "/app fork nothing x"), "No app nothing");
+    try expectHas(try f.core.command(a, "/app fork log inbox"), "harness's own names");
+    try expectHas(try f.core.command(a, "/app approve log"), "log is built in");
+    try expectHas(try f.core.command(a, "/app versions my-log"), "my-log is at v1. No earlier version is kept.");
+    // a change by hand, approved: v2; v1 is not kept (only a save keeps
+    // the version before it), so a save makes v3 and keeps v2
+    const index = try std.fs.path.join(a, &.{ f.core.paths.home, "apps", "my-log", "index.html" });
+    const first = try Io.Dir.cwd().readFileAlloc(t.io, index, a, .unlimited);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = index, .data = "<p>by hand</p>" });
+    try expectHas(try f.core.command(a, "/apps"), "changed outside harness");
+    try expectHas(try f.core.command(a, "/app approve my-log"), "Approved my-log as v2");
+    const desk = f.core.appDesk();
+    try t.expectEqual(null, desk.draft(desk.ctx, a, "my-log", "my-log"));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.workspace, "app-drafts", "my-log", "index.html" }), .data = "<p>by the agent</p>" });
+    const st = desk.stage(desk.ctx, a, "my-log", "app-drafts/my-log", "main");
+    try t.expectEqual(null, st.why);
+    try expectHas(st.detail, "my-log v3 (was v2)");
+    try t.expectEqual(null, desk.install(desk.ctx, a, "my-log", st.id, .{ .mark = "", .by = "owner", .agent = "main", .item = 3 }));
+    try expectHas(try f.core.command(a, "/app versions my-log"), "my-log is at v3. Earlier versions kept: 2. /app revert my-log N");
+    try expectHas(try f.core.command(a, "/app revert my-log 2"), "my-log is v4 now, with the files of v2");
+    try t.expectEqualStrings("<p>by hand</p>", try Io.Dir.cwd().readFileAlloc(t.io, index, a, .unlimited));
+    try expectHas(try f.core.command(a, "/app revert my-log 9"), "No version 9 of my-log is kept");
+    try expectHas(try f.core.command(a, "/app revert my-log"), "Use /app approve NAME");
+    try expectHas(try f.core.command(a, "/app rm my-log"), "Removed my-log");
+    const lt = try logText(&f);
+    for ([_][]const u8{ "\"event\":\"forked\",\"name\":\"my-log\",\"from\":\"log\"", "\"event\":\"reverted\",\"name\":\"my-log\",\"version\":4,\"to\":2", "\"event\":\"removed\",\"name\":\"my-log\"" }) |want| try expectHas(lt, want);
+    _ = first;
 }

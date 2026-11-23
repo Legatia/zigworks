@@ -384,7 +384,7 @@ pub fn approve(io: Io, arena: std.mem.Allocator, apps_dir: []const u8, state_dir
     if (before) |b| if (std.mem.eql(u8, &b.digest, &f.digest)) return b.version;
     const version: u32 = if (before) |b| @max(b.version + 1, f.manifest.version) else f.manifest.version;
     if (version != f.manifest.version) {
-        try writeVersion(io, arena, dir, version);
+        try setKey(io, arena, dir, "version", try std.fmt.allocPrint(arena, "{d}", .{version}));
         f = try checkFolder(io, arena, dir, name);
     }
     const sdir = try std.fs.path.join(arena, &.{ state_dir, name });
@@ -392,33 +392,6 @@ pub fn approve(io: Io, arena: std.mem.Allocator, apps_dir: []const u8, state_dir
     const text = try std.fmt.allocPrint(arena, "version {d}\nsha256 {s}\nwhen {d}\nby {s}\n", .{ version, &f.digest, now_s, by });
     try util.writeReplace(io, try std.fs.path.join(arena, &.{ sdir, "approved" }), text);
     return version;
-}
-
-/// app.ini with its `version` line saying `version` (added after [app]
-/// when it has none).
-fn writeVersion(io: Io, arena: std.mem.Allocator, dir: []const u8, version: u32) !void {
-    const path = try std.fs.path.join(arena, &.{ dir, "app.ini" });
-    const text = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 10));
-    var out: std.ArrayList(u8) = .empty;
-    var done = false;
-    var it = std.mem.splitScalar(u8, text, '\n');
-    var first = true;
-    while (it.next()) |raw| {
-        if (!first) try out.append(arena, '\n');
-        first = false;
-        const line = std.mem.trim(u8, config.stripComment(raw), " \t\r");
-        if (!done and std.mem.startsWith(u8, line, "version") and std.mem.indexOfScalar(u8, line, '=') != null) {
-            try out.print(arena, "version = {d}", .{version});
-            done = true;
-            continue;
-        }
-        try out.appendSlice(arena, raw);
-        if (!done and std.mem.eql(u8, line, "[app]")) {
-            try out.print(arena, "\nversion = {d}", .{version});
-            done = true;
-        }
-    }
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
 }
 
 /// Whether app `name` is as approved now (its files unchanged since).
@@ -1024,6 +997,12 @@ test "an_app_folder_is_checked_and_approved_versions_follow_its_files" {
     try t.expectEqual(2, try approve(t.io, a, apps_dir, state_dir, "notes", "owner", 102));
     try t.expect(std.mem.indexOf(u8, try apps.readFileAlloc(t.io, "notes/app.ini", a, .limited(4096)), "version = 2") != null);
     try t.expect(try asApproved(t.io, a, apps_dir, state_dir, "notes") != null);
+    // again, now that app.ini has its version line: one line, not two
+    try apps.writeFile(t.io, .{ .sub_path = "notes/app.js", .data = "3" });
+    try t.expectEqual(3, try approve(t.io, a, apps_dir, state_dir, "notes", "owner", 103));
+    const ini3 = try apps.readFileAlloc(t.io, "notes/app.ini", a, .limited(4096));
+    try t.expectEqual(1, std.mem.count(u8, ini3, "version"));
+    try t.expect(std.mem.indexOf(u8, ini3, "version = 3") != null);
     // what the folder may not hold
     try writeApp(apps, "bad", "[app]\nname = bad\n", &.{.{ "index.html", "x" }});
     try apps.writeFile(t.io, .{ .sub_path = "bad/run.exe", .data = "MZ" });
