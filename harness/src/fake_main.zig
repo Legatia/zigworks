@@ -14,6 +14,7 @@ const std = @import("std");
 const fake = @import("fake.zig");
 const fake_mcp = @import("fake_mcp.zig");
 const fake_cal = @import("fake_cal.zig");
+const fake_shop = @import("fake_shop.zig");
 
 pub fn main(init: std.process.Init) u8 {
     const io = init.io;
@@ -24,6 +25,8 @@ pub fn main(init: std.process.Init) u8 {
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--home")) return fake_mcp.runHome(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--car")) return fake_mcp.runCar(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--tesla")) return fake_mcp.runTesla(io, init.gpa, init.environ_map);
+    // a shop's server, for the reorders (fake_shop.zig)
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--shop")) return fake_shop.run(io, init.gpa);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp")) return fake_mcp.runWork(io, init.gpa, init.environ_map, args[2]);
     // calmcp's, for /setup calendar: discover URL USER, check FILE (a calendar file)
     if (args.len == 4 and std.mem.eql(u8, args[1], "discover")) return fake_cal.discover(io, init.environ_map);

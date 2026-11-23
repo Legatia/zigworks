@@ -21,7 +21,10 @@ in the chat, with routines that ask with one tap before a lock or a valve
 household in turn (Emergencies, below). With your calendar (through
 calmcp) it keeps the day: today's events in the morning summary, when to
 leave, a note before a meeting, posts held while you're busy, and changes
-only when you say (The diary, below).
+only when you say (The diary, below). It keeps the household's shopping
+lists, proposes an order from a shop you set up and buys it only when you
+tap, follows your parcels, and reminds you of the boiler's service and the
+car's insurance (Errands and upkeep, below).
 Every action it takes, and every
 action of its helpers, passes one gate and is written to one log you can
 check.
@@ -47,14 +50,15 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 1062 unit tests (20 of them
+**State: 0.3.0, tested on macOS by its own tests: 1100 unit tests (20 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 103 checks that drives the real binary against
+and an end-to-end script of 109 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram (voice
-notes and their files too), a transcription service, feeds, search, two
-MCP servers run as programs, and MCP servers at a url with a token or a
-sign-in (with a stand-in authorization server and browser); with homemcp
+notes and their files too), a transcription service, feeds, search, three
+MCP servers run as programs (one a shop, ordered from on a tap), and MCP
+servers at a url with a token or a sign-in (with a stand-in authorization
+server and browser); with homemcp
 and carcloud built (HOMEMCP_BIN, CARCLOUD_BIN), 23 more: an event pushed
 by homemcp, and the butler's setup in the chat and each routine (the
 leak's fallback turned on, a smoke alarm going off and answered with I'm
@@ -64,7 +68,9 @@ and Home Assistant asking the voice agent (a test client sending what its
 llama.cpp integration sends); with calmcp built (CALMCP_BIN), 5 more:
 `/setup calendar` and a change asked and made, against calmcp-sim (a
 stand-in CalDAV server). The diary has not met a real calendar yet, nor
-mail a real mail server (mailmcp's own tests run it against its stand-in).
+mail a real mail server (mailmcp's own tests run it against its stand-in);
+errands and upkeep (lists, reorders, parcels, the car's odometer) have met
+only stand-ins: no real shop, carrier's page or car.
 An earlier build of 0.3.0 also passed its tests in CI on Linux and
 Windows. Emergencies (escalation to the household, the leak's fallback,
 the smoke routine) are tested against stand-ins only: no real household,
@@ -558,7 +564,11 @@ its own conversation to post to (no files). With no rules for members:
 | Alone | web search; homemcp's `home_state`, `home_wait` and `home_set` (reading the home, and lights, plugs, heating and blinds within the home file's limits) |
 | Asked of you, every time | money tools, homemcp's `home_guarded` among them (locks, alarms, valves, the garage), and every other MCP tool (the car's too) |
 | Not at all | reading web pages (`fetch`, `browse`), posting anywhere else |
-| Never, whatever the rules | commands, files, memory, `history`, `web` with your logins, `skill`, `delegate`, `ask_owner`, setting up triggers, workflows or definitions, and every slash command but `/help` |
+| Never, whatever the rules | commands, files, memory, `history`, `web` with your logins, `skill`, `delegate`, `ask_owner`, setting up triggers, workflows or definitions, and every slash command but `/help` and `/list` |
+
+The shared lists are harness's own, not a tool: members add to them, take
+things off and read them by message ("add milk") or `/list`, never
+clear them or order from them (Errands and upkeep, below).
 
 **When you are asked.** The member's request doesn't wait for you. You
 get one message in your chat, "Anna asks to unlock the front door." with
@@ -1050,6 +1060,178 @@ Not yet: an `email` entry in `/conversations` (it is a place of its own,
 not a Telegram topic); files in the butler's answers; OAuth sign-in for
 Gmail and Outlook (mailmcp takes an access token from the environment, as
 `auth = xoauth2`); away mode beyond the Leaving routine.
+
+## Errands and upkeep
+
+The household's shopping lists, orders from a shop you set up (bought
+only on your tap), parcels on their way, and the house's upkeep: each in a
+small file of `state/`, each said plainly.
+
+### Lists
+
+```
+You:     add milk and eggs
+Butler:  Added milk and eggs to shopping (2 items).
+Anna:    we're out of coffee
+Butler:  Added coffee to shopping (3 items).
+You:     what's on the list?
+Butler:  Shopping (3): milk, eggs, coffee.
+```
+
+harness reads these words itself, without a model (so they work at once,
+for members too, and in a voice note): "add X [to the … list]", "put X on
+the list", "we're out of X", "remove X [from the list]", "take X off",
+"cross X off", "got X" and "bought X" (when X is on a list), "list" or
+"what's on the list?" to read it, and in Polish "dodaj X", "usuń X",
+"lista", "lista zakupów". Several at once with commas and "and". A bare
+"add X" counts only when X is short, with no time and no "to", and isn't a
+reminder, a meeting, an event, a routine, a light and the like: those go
+to the model as before. Anything else about lists goes to the model,
+which has no list tool, so say it in these words.
+
+- `shopping` is the list unless you name another ("add nails to the
+  hardware list" makes `hardware`). `/list` shows them, `/list NAME` one,
+  `/list [NAME] add ITEM, ITEM`, `/list [NAME] rm ITEM`, `/list [NAME]
+  clear`.
+- **Members** (Household, above) add, take off and read, in their own
+  chat or a group (`@BOT add milk`), and `/list` works for them; only you
+  clear a list, set when it is posted or set up a shop. You aren't told
+  of their adds.
+- **Before a planned shop**: an event in your calendar (The diary, above)
+  whose title says shop, shopping, groceries, supermarket, market,
+  zakupy, sklep, a shop's name or a list's name gets the list an hour
+  before it starts ("Groceries at 17:00. Shopping (3): milk, eggs,
+  coffee."); `/list [NAME] every sat 09:00` posts it each week (`every day
+  18:30`, `every off`). Neither when the list is empty; quiet hours and
+  busy events hold them.
+- `state/lists/NAME`: a line an item, written whole; you can edit it.
+
+### Reorders: bought only on your tap
+
+A shop you order from online, through its MCP server: add the server to
+mcp.ini as any other, with its order tool a money tool and the field that
+carries the total, then set it up in the chat:
+
+```ini
+[frisco]
+command = /path/to/the-shops-mcp-server
+money = shop_order
+amount = shop_order:total
+max_per_call = 300
+```
+
+```
+/setup reorder frisco at 10 items          ; or: every sat 09:00, or both; LIST if not shopping
+Butler:  Order from Frisco: 64.20 PLN, delivery Sat 28 Nov, 10:00–12:00.
+         - milk: Mleko 2% 1 l, 4.20
+         - coffee beans: Lavazza Oro 1 kg, 52.00
+         - eggs, 8.00
+         Not found: oat milk (stays on the list).     [Order it] [Not now]
+You:     (taps Order it)
+Butler:  Ordered from Frisco: 3 items, 64.20 PLN; off shopping. The shop says: Order 4471 placed, delivery Sat 28 Nov 10:00–12:00.
+```
+
+- **What the shop's server needs**: a tool that prices a basket (its name
+  has quote, price, basket or cart; not a money tool), given `{"items":
+  ["milk", …]}` and answering JSON `{"total", "currency", "lines":
+  [{"item", "product", "price"}], "missing", "delivery"}`; and its order
+  tool, given `{"items": […], "total": 64.20}` (your amount field), the
+  total a ceiling the shop holds to. No shop has a standard here: a real
+  one needs a small server or adapter that speaks this.
+- **When**: when an add brings the list to its size, or at its weekly
+  time with something on it; one proposal open at a time; after Not now
+  (or no answer in `approval_seconds`) the size proposes again only once
+  the list was under it.
+- **Never bought unasked.** The proposal is one item in your inbox, the
+  whole order in it; the exact call it would make is kept in
+  `state/errands` under the item's number. Only your **Order it** makes
+  it, once (it is taken off the file before the call), as your own call
+  through the gate: a `deny` rule stops it, `/dryrun on` makes nothing,
+  the caps (`max_per_call`, `max_per_day`: the shop's section, else
+  `[money]`) are checked. A total over the per-call cap isn't proposed
+  (a line says so). Not now, no answer, a restart before the tap, a
+  member's or anyone else's press: nothing is ordered. What was ordered
+  comes off the list; what the shop hadn't stays.
+- `/setup reorder SHOP off` stops it. Members' adds can bring a list to
+  its size; the proposal is yours alone.
+
+Not built: ordering through a shop's website with your login (the `web`
+tool), and money in any run you didn't tap for.
+
+### Deliveries
+
+```
+You:     track my DPD parcel 1000123456789U
+Butler:  Tracking your DPD parcel 1000123456789U: I'll say when it's out for delivery and when it's delivered.
+11:02    Your DPD parcel 1000123456789U is out for delivery.
+14:31    Your DPD parcel 1000123456789U was delivered.
+```
+
+- **Where parcels come from**: your messages (a tracking number with the
+  carrier's name, or "track", "parcel", "package", "paczka",
+  "przesyłka"; a number with no carrier is asked about), and, with your
+  mailbox on (Mail, above), the delivery mails of the last 14 days, read
+  every 30 minutes (`mail_list` and `mail_read`, harness's own reads).
+  harness finds the numbers itself, never a model: UPS `1Z…`, DHL `JJD…`,
+  postal `RR123456789PL`, DPD's `…U`, and runs of digits next to a word
+  like "tracking number" or "numer przesyłki"; the carrier from the
+  number, the sender or the one carrier the mail names. Kept: the number,
+  the carrier, the sender's name and the day mailmcp says it comes; never
+  the mail's text.
+- **The carrier's page**, from harness's own table (never a link from a
+  mail): InPost's public tracking API, DPD Poland, GLS, DHL, UPS, Poczta
+  Polska, FedEx; every 2 hours from 08:00 to 20:00, every 30 minutes once
+  it's out for delivery. Only its status is kept. A `deny fetch` rule on
+  the address stops it. Pages that need a browser to show the status
+  (DHL's, UPS's, Poczta Polska's, FedEx's today) say nothing: those
+  parcels still count for the doorbell on the day their mail gives.
+- **Lines**: out for delivery, waiting at the parcel locker (InPost),
+  delivered; each once, to main (quiet hours hold them). A parcel found
+  in mail says nothing for what its first read finds.
+- **The doorbell**: `Core.deliveryHint` gives "probably the DPD parcel"
+  (or "probably the DPD or the InPost parcel", "probably a parcel") when
+  one is out for delivery or due today, for the door's routine.
+- `/deliveries` lists them, `/deliveries rm NUMBER` stops one. Delivered
+  ones go after 2 days, others after 30. `state/deliveries` keeps them.
+
+### Upkeep
+
+```
+09:00    Boiler service is due in a week (Mon 30 Nov).            [Done]
+09:00    Car insurance ends in a week (Fri 15 Jan).               [Renewed]
+You:     the boiler was serviced today
+Butler:  Boiler service done today; next due 23 Nov 2027.
+```
+
+- **What is kept**: things with an interval, by time or by the car's
+  distance, and documents with an end day. `/setup upkeep` offers the
+  usual ones one at a time (the boiler's service yearly, filters every 3
+  months, the smoke alarms' test monthly; with a car, its service every
+  15,000 km or yearly, its insurance and its inspection), [Add it] (from
+  today) or a reply with when it was last done (a document: the day it
+  ends). Others: `/upkeep add Gutters every 6 months [last 2026-03-12]`,
+  `/upkeep add Car service every 15000 km or every year`, `/upkeep add
+  Dishwasher warranty ends 2028-05-01` (insurance, inspections and
+  registrations renew yearly; `renews every 6 months` for another).
+  `/upkeep` lists them, `/upkeep done NAME [on DATE]`, `/upkeep rm NAME`.
+- **The lines**, from 09:00 once a day (quiet hours hold them): a week
+  before (or less, when added late) and on the day, each once; one found
+  already late says so once. [Done] counts the next from today; a
+  document that renews has [Renewed], moving its end a renewal on; a
+  warranty's line has no button. A line's button is open for 7 days.
+- **"Serviced today" in chat**: a message of yours that names a kept thing
+  (a word of its name: boiler, filters, smoke alarm, car) with a done
+  word (serviced, replaced, changed, cleaned, tested, checked, done,
+  renewed, inspected) and today, yesterday, a date or no day counts it
+  done; a question or a future ("will", "next", "needs") doesn't.
+- **The car's distance**: with carcloud in mcp.ini as `car`, its
+  odometer (`car_status`) is read once a day while a distance is kept;
+  due at the last service's km plus the interval, "in a week" when the
+  car is within a week of driving of it (from readings 7 days or more
+  apart, else 40 km a day). "the car was serviced today at 45200 km"
+  takes that km.
+- Members can't reach upkeep or deliveries (their words go to their own
+  run, which has neither). `state/upkeep` keeps it all.
 
 ## Folders
 
@@ -2512,15 +2694,16 @@ memory notices held at night.
 [LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/undo [RUN]`, `/envs`, `/env
 check|rm NAME`, `/quiet [on|off|HH:MM-HH:MM]`, `/dryrun on|off`,
 `/reload`, `/conversations`, `/conversation new|rename|rm|add`,
-`/session [N]`, `/history WORDS`, `/people`, `/person NAME`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
+`/session [N]`, `/history WORDS`, `/people`, `/person NAME`, `/list [NAME]
+[add|rm|clear|every]`, `/deliveries [rm NUMBER]`, `/upkeep [add|done|rm]`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
 `/agents`, `/agent [NAME]`, `/agent show|rm NAME`, `/ask NAME text`,
 `/triggers`, `/trigger NAME`, `/trigger add|rm|pause|resume|run|test`,
 `/apps`, `/app approve|rm NAME`, `/workflows`, `/workflow NAME|NAME#N`,
 `/workflow start|stop|resume|rm`, `/members`, `/member add|rm NAME`,
-`/setup [home|car|mail|routines]`, `/help`. `/new`, `/private` and `/agent`
+`/setup [home|car|calendar|mail|routines|upkeep|reorder]`, `/help`. `/new`, `/private` and `/agent`
 act on the conversation they are sent in; `/stop`, `/dryrun` and
-`/memory auto` on everything. Household members have `/help` and
-`/join CODE`; any other command of theirs is answered with a no.
+`/memory auto` on everything. Household members have `/help`, `/list`
+and `/join CODE`; any other command of theirs is answered with a no.
 
 CLI: `init [--butler]`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `trigger list|test|run`, `workflow list|check|start|stop`,

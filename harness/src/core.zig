@@ -54,6 +54,9 @@ const alerts_mod = @import("alerts.zig");
 const mail_mod = @import("mail.zig");
 const diary_mod = @import("diary.zig");
 const warmcar = @import("warmcar.zig");
+const lists_mod = @import("lists.zig");
+const deliveries_mod = @import("deliveries.zig");
+const upkeep_mod = @import("upkeep.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -697,6 +700,8 @@ pub const Core = struct {
     /// The diary: the calendar's events read last, the lines said
     /// (state/diary), the busy window that held posts.
     diary: diary_mod.State,
+    /// Lists, reorders, deliveries, upkeep (the Errands block).
+    errands: Errands,
     /// What /reload says when the settings files have an error.
     problem_buf: [800]u8 = undefined,
 
@@ -889,6 +894,7 @@ pub const Core = struct {
         c.diary = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "diary" }));
         errdefer c.diary.deinit();
         c.diary.load() catch |e| c.log.write(.config, false, .{ .event = "diary not read", .why = @errorName(e) }) catch {};
+        c.errands = try Errands.init(gpa, io, c.paths.state, c.paths_arena.allocator());
         c.role = "open";
         // problem_buf: written before it is read
         // the inbox: read, its first id from 0.3's approval numbers; items
@@ -944,7 +950,7 @@ pub const Core = struct {
         if (c.worker) |w| w.join();
         // no speech from now on; its requests going end (their runs stopped)
         c.stopVoiceAgent();
-        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire) or c.mail_job.running.load(.acquire) or c.diary.reading.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire) or c.mail_job.running.load(.acquire) or c.diary.reading.load(.acquire) or c.errands.running.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
@@ -963,6 +969,7 @@ pub const Core = struct {
         c.announced.deinit(c.gpa);
         c.group_posts.deinit(c.gpa);
         c.diary.deinit();
+        c.errands.deinit();
         c.defs.deinit();
         for (c.told_topics.items) |n| c.gpa.free(n);
         c.told_topics.deinit(c.gpa);
@@ -1136,7 +1143,7 @@ pub const Core = struct {
         c.queue_mutex.lockUncancelable(c.io);
         var queue_locked = true;
         defer if (queue_locked) c.queue_mutex.unlock(c.io);
-        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.diary.reading.load(.acquire)) return "Busy; send /reload again when nothing is running.";
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.diary.reading.load(.acquire) or c.errands.running.load(.acquire)) return "Busy; send /reload again when nothing is running.";
         var fresh: std.heap.ArenaAllocator = .init(c.gpa);
         const saved_cfg = c.cfg;
         const saved_rules = c.rule_list;
@@ -1697,9 +1704,15 @@ pub const Core = struct {
         const conv = group orelse try c.memberChat(a, who, m.from);
         if (cmd[0] == '/') {
             try c.log.write(.chat, false, .{ .event = "member command", .name = who, .command = cmd });
-            c.memberSay(conv, if (std.mem.eql(u8, cmd, "/help") or std.mem.eql(u8, cmd, "/start")) household.help else household.owner_only);
+            if (std.mem.eql(u8, cmd, "/list")) {
+                c.memberSay(conv, Errands.memberList(c, a, conv, who, arg));
+                return true;
+            }
+            c.memberSay(conv, if (std.mem.eql(u8, cmd, "/help") or std.mem.eql(u8, cmd, "/start")) household.help ++ "\n" ++ Errands.member_help else household.owner_only);
             return true;
         }
+        // the lists' words: members add, take off and read (no model run)
+        if (Errands.words(c, conv, who, text)) return true;
         try c.queueMember(conv, who, text);
         return true;
     }
@@ -2717,6 +2730,12 @@ pub const Core = struct {
         }
         // a workflow's phrase ("goodnight") starts it, no model call (Ruling 2)
         if (c.phraseStart(conv, text)) return;
+        // the lists' words ("add milk"): harness's own, no model call
+        if (Errands.words(c, conv, "", text)) return;
+        // a parcel named ("track DPD 1000…"): tracked
+        if (Errands.parcelWords(c, conv, text)) return;
+        // "the boiler was serviced today": upkeep reset
+        if (Errands.upkeepWords(c, conv, text)) return;
         return c.queueMessage(conv, text, null);
     }
 
@@ -2843,6 +2862,9 @@ pub const Core = struct {
         if (flag.load(.acquire)) return;
         // a phrase said aloud starts its workflow, as typed (Ruling 2)
         if (c.phraseStart(conv, text)) return;
+        if (Errands.words(c, conv, "", text)) return;
+        if (Errands.parcelWords(c, conv, text)) return;
+        if (Errands.upkeepWords(c, conv, text)) return;
         c.chatTurnAs(conv, agent_name, text, voice_context);
     }
 
@@ -3651,6 +3673,8 @@ pub const Core = struct {
         if (std.mem.startsWith(u8, waiter, "member ")) c.memberAnswered(id);
         // speech's call: made on the owner's yes (nothing is said in the room)
         if (std.mem.startsWith(u8, waiter, "room ")) c.roomAnswered(id);
+        // an order or an upkeep line: made on the owner's tap
+        if (std.mem.startsWith(u8, waiter, "errand ")) Errands.answered(c, id);
         return true;
     }
 
@@ -5655,6 +5679,8 @@ pub const Core = struct {
         c.diaryPost(now_s);
         // warm the car: before a cold morning's leave-by, one question
         c.warmCarDue(now_s);
+        // lists before a planned shop
+        Errands.due(c, now_s);
         // quiet hours over: what they held, a digest per conversation
         c.quietDue(now_s);
         // urgent alerts nobody is on: the household in turn, a fallback
@@ -8927,6 +8953,13 @@ pub const Core = struct {
         return c.isShared(name);
     }
 
+    /// The doorbell's hint, for the door's routine: "probably the DPD
+    /// parcel" when a parcel is out for delivery or due today, else null
+    /// (deliveries, the household spec's §3).
+    pub fn deliveryHint(c: *Core, a: std.mem.Allocator) ?[]const u8 {
+        return Errands.hint(c, a);
+    }
+
     // ---- mail (the email spec): the butler's address is conversation email ----
 
     /// The [mail] settings, copied under the settings lock.
@@ -9898,6 +9931,8 @@ pub const Core = struct {
         }
         if (eql(u8, what, "mail")) return c.setupMail(a, conv, words.rest());
         if (eql(u8, what, "calendar")) return c.setupCalendar(a, conv, std.mem.trim(u8, words.rest(), " \t"));
+        if (eql(u8, what, "reorder")) return Errands.setupReorder(c, a, words.rest());
+        if (eql(u8, what, "upkeep")) return Errands.setupUpkeep(c, a, conv);
         return "Use /setup home, /setup car, /setup calendar, /setup mail or /setup routines; /setup alone says where setup is.";
     }
 
@@ -9926,6 +9961,7 @@ pub const Core = struct {
         var on: std.ArrayList([]const u8) = .empty;
         for (butler.all) |r| if (c.workflowText(a, r.name()) != null) try on.append(a, r.title());
         if (on.items.len > 0) try o.print(a, "\nRoutines on: {s}. /setup routines offers the others.", .{try std.mem.join(a, ", ", on.items)}) else try o.appendSlice(a, "\nRoutines: none on yet. /setup routines offers them, once the home is connected.");
+        try o.appendSlice(a, try Errands.setupLine(c, a));
         return o.items;
     }
 
@@ -10406,6 +10442,9 @@ pub const Core = struct {
         \\/session [N]: the steps behind the last answer here (N runs back)
         \\/history WORDS: earlier turns with every word, newest first
         \\/people: the people you deal with; /person NAME: what is known of one
+        \\/list [NAME]: the shopping list (or another); /list clear, /list add ITEM; or write "add milk"
+        \\/deliveries: the parcels tracked; write "track DPD 1000123456789U" to add one
+        \\/upkeep: the boiler's service, filters, documents and when each is due; /setup upkeep offers the usual ones
         \\/apps: the apps, with their links while the app server runs
         \\/app approve NAME: serve an app as its files are now
         \\/app rm NAME: remove an app, its data and its versions
@@ -10448,6 +10487,9 @@ pub const Core = struct {
         if (eql(u8, cmd, "/pair")) return "Already paired.";
         if (eql(u8, cmd, "/members")) return c.membersText(a);
         if (eql(u8, cmd, "/people")) return c.people.listing(a, 100);
+        if (eql(u8, cmd, "/list") or eql(u8, cmd, "/lists")) return Errands.listCommand(c, a, conv, rest);
+        if (eql(u8, cmd, "/deliveries")) return Errands.deliveriesCommand(c, a, rest);
+        if (eql(u8, cmd, "/upkeep")) return Errands.upkeepCommand(c, a, rest);
         if (eql(u8, cmd, "/person")) return if (rest.len == 0) "Use /person NAME." else c.people.cardText(a, rest);
         if (eql(u8, cmd, "/setup")) return c.setupCommand(a, conv, rest);
         if (eql(u8, cmd, "/member")) return c.memberCommand(a, rest);
@@ -23588,4 +23630,2020 @@ test "setup_offers_warm_car_when_the_car_can_warm" {
     const p = try f.core.setupPicks(a);
     try t.expect(p.car_warms);
     try t.expect(butler.Routine.@"warm-car".offered(p));
+}
+
+// ---- errands and upkeep (the household spec's §3 and §4) ----
+
+/// Lists, reorders, deliveries and upkeep: their state (`state/lists/`,
+/// `state/errands`, `state/deliveries`, `state/upkeep`), and what harness
+/// does with them. One field of Core (`errands`); the functions take the
+/// core. Members reach the lists only (Ruling 3 of the plan).
+const Errands = struct {
+    gpa: std.mem.Allocator,
+    lists: lists_mod.Store,
+    /// `state/errands`: shops, weekly posts, what was said, open orders.
+    path: []const u8,
+    /// Held while `state/errands` is read and written, and `pending`.
+    mutex: Io.Mutex,
+    /// Shops to propose from (names, owned), for the errands' job.
+    pending: std.ArrayList([]u8),
+    /// The errands' job is going (the tick starts it; close waits).
+    running: std.atomic.Value(bool),
+    /// When the tick next looks whether deliveries or upkeep wait.
+    next_look: std.atomic.Value(i64),
+    /// When the lists' posts were last looked at (the tick's).
+    last_due: std.atomic.Value(i64),
+    /// Tests: the carriers' pages at this address ("": their own).
+    track_url: []const u8,
+
+    /// What starts the errands' own jobs (their who `by`, which rules
+    /// sections and quiet hours read), one constant each, all here. No
+    /// rules are shipped for them.
+    const by_lists = "schedule:lists";
+    const by_reorder = "schedule:reorder";
+    const by_deliveries = "schedule:deliveries";
+    const by_upkeep = "schedule:upkeep";
+
+    fn init(gpa: std.mem.Allocator, io: Io, state: []const u8, a: std.mem.Allocator) !Errands {
+        return .{
+            .gpa = gpa,
+            .lists = .init(gpa, io, try std.fs.path.join(a, &.{ state, "lists" })),
+            .path = try std.fs.path.join(a, &.{ state, "errands" }),
+            .mutex = .init,
+            .pending = .empty,
+            .running = .init(false),
+            .next_look = .init(0),
+            .last_due = .init(0),
+            .track_url = "",
+        };
+    }
+
+    fn deinit(e: *Errands) void {
+        for (e.pending.items) |x| e.gpa.free(x);
+        e.pending.deinit(e.gpa);
+    }
+
+    // ---- state/errands ----
+
+    fn load(c: *Core, a: std.mem.Allocator) lists_mod.State {
+        const text = Io.Dir.cwd().readFileAlloc(c.io, c.errands.path, a, .limited(4 << 20)) catch return .{};
+        return lists_mod.parseState(a, text) catch .{};
+    }
+
+    fn save(c: *Core, a: std.mem.Allocator, st: lists_mod.State) !void {
+        try Io.Dir.cwd().createDirPath(c.io, c.paths.state);
+        try util.writeReplace(c.io, c.errands.path, try lists_mod.stateText(a, st, c.now()));
+    }
+
+    /// Whether `key` was said, and notes it (under the mutex); false: say it.
+    fn once(c: *Core, a: std.mem.Allocator, key: []const u8) bool {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        var st = load(c, a);
+        for (st.said) |x| if (std.mem.eql(u8, x.key, key)) return true;
+        var said: std.ArrayList(lists_mod.Said) = .empty;
+        said.appendSlice(a, st.said) catch return true;
+        said.append(a, .{ .key = key, .at = c.now() }) catch return true;
+        st.said = said.items;
+        save(c, a, st) catch |err| {
+            c.log.write(.chat, false, .{ .event = "errands not written", .why = @errorName(err) }) catch {};
+            return true;
+        };
+        return false;
+    }
+
+    // ---- what harness says ----
+
+    /// A line of `by` (`schedule:lists`, …) to main, as a schedule's: held
+    /// in quiet hours and busy events; one that does not get through is
+    /// kept to send again.
+    fn post(c: *Core, a: std.mem.Allocator, by: []const u8, label: []const u8, text: []const u8) void {
+        const private = c.convPrivate("main");
+        if (c.quietEnd(by)) |_| held: {
+            const masked = c.masks.scrubAlloc(a, text) catch break :held;
+            const id = c.quiet.hold(.{ .at = c.now(), .conv = "main", .by = by, .text = masked, .private = private }) catch |err| {
+                c.log.write(.chat, false, .{ .event = "not held", .conversation = "main", .by = by, .why = @errorName(err) }) catch {};
+                break :held;
+            };
+            c.log.write(.chat, false, .{ .event = "held", .id = id, .conversation = "main", .by = by }) catch {};
+            return;
+        }
+        _ = c.sendText("main", text) catch |err| {
+            c.log.write(.chat, false, .{ .event = "not delivered", .by = by, .why = whyUndelivered(err) }) catch {};
+            _ = c.keepDelivery(.{ .to = "main", .text = text, .retry = err != error.NoChannel, .who = .{ .by = by, .agent = "" }, .label = label, .private = private });
+            return;
+        };
+        c.touch("main");
+    }
+
+    /// Said in `conv` to the owner, or to member `member` there.
+    fn answer(c: *Core, conv: []const u8, member: []const u8, text: []const u8) void {
+        if (member.len > 0) c.memberSay(conv, text) else c.sayIn(conv, text);
+    }
+
+    // ---- lists ----
+
+    /// The owner's (`member` "") or member `member`'s words about the lists
+    /// in `conv`, acted on and answered there; false when `text` isn't
+    /// about lists (it goes to the model as before).
+    fn words(c: *Core, conv: []const u8, member: []const u8, text: []const u8) bool {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const known = c.errands.lists.names(a) catch &.{};
+        const w = (lists_mod.read(a, text, known) catch return false) orelse return false;
+        const said: []const u8 = switch (w) {
+            .show => |name| showLists(c, a, name) catch |err| errText(a, err),
+            .add => |ch| addTo(c, a, conv, member, if (ch.list.len > 0) ch.list else lists_mod.default_list, ch.items),
+            .remove => |ch| takeOff(c, a, conv, member, ch.list, ch.items, true) orelse return false,
+            .got => |ch| takeOff(c, a, conv, member, ch.list, ch.items, false) orelse return false,
+        };
+        answer(c, conv, member, said);
+        return true;
+    }
+
+    fn errText(a: std.mem.Allocator, err: anyerror) []const u8 {
+        return switch (err) {
+            error.TooManyLists => std.fmt.allocPrint(a, "There are {d} lists already: clear one first (/list clear NAME).", .{lists_mod.max_lists}) catch "Too many lists.",
+            error.BadName => "A list's name is a-z, 0-9, - and _ (up to 32).",
+            else => std.fmt.allocPrint(a, "The list couldn't be written: {s}.", .{@errorName(err)}) catch "The list couldn't be written.",
+        };
+    }
+
+    /// `name`'s items as read; "" all of them ("Shopping is empty." when
+    /// there are none).
+    fn showLists(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        if (name.len > 0) {
+            if (!lists_mod.validName(name)) return error.BadName;
+            return lists_mod.showText(a, name, try c.errands.lists.items(a, name));
+        }
+        const all = try c.errands.lists.names(a);
+        if (all.len == 0) return lists_mod.showText(a, lists_mod.default_list, &.{});
+        var parts: std.ArrayList([]const u8) = .empty;
+        for (all) |n| {
+            const list = try c.errands.lists.items(a, n);
+            // other lists only when they hold something
+            if (list.len == 0 and !std.mem.eql(u8, n, lists_mod.default_list) and all.len > 1) continue;
+            try parts.append(a, try lists_mod.showText(a, n, list));
+        }
+        return std.mem.join(a, "\n", parts.items);
+    }
+
+    fn addTo(c: *Core, a: std.mem.Allocator, conv: []const u8, member: []const u8, name: []const u8, items: []const []const u8) []const u8 {
+        const got = c.errands.lists.add(a, name, items) catch |err| return errText(a, err);
+        c.log.write(.chat, c.convPrivate(conv), .{ .event = "list", .op = "add", .list = name, .count = got.added.len, .member = if (member.len > 0) member else null }) catch {};
+        // a shop's size reached: its order proposed to the owner
+        noteCount(c, a, name, got.before, got.count);
+        return lists_mod.addedText(a, name, got) catch "Added.";
+    }
+
+    /// Takes `items` off list `name` ("" the first that has one of them);
+    /// null when `said` is false and no list has any of them.
+    fn takeOff(c: *Core, a: std.mem.Allocator, conv: []const u8, member: []const u8, name_in: []const u8, items: []const []const u8, said: bool) ?[]const u8 {
+        var name = name_in;
+        if (name.len == 0) {
+            const all = c.errands.lists.names(a) catch &.{};
+            name = for (all) |n| {
+                const has = for (items) |x| {
+                    if (c.errands.lists.has(a, n, x) catch false) break true;
+                } else false;
+                if (has) break n;
+            } else blk: {
+                if (!said) return null;
+                break :blk lists_mod.default_list;
+            };
+        } else if (!lists_mod.validName(name)) return errText(a, error.BadName);
+        const got = c.errands.lists.remove(a, name, items) catch |err| return errText(a, err);
+        if (!said and got.removed.len == 0) return null;
+        noteCount(c, a, name, got.count + got.removed.len, got.count);
+        c.log.write(.chat, c.convPrivate(conv), .{ .event = "list", .op = "remove", .list = name, .count = got.removed.len, .member = if (member.len > 0) member else null }) catch {};
+        return lists_mod.removedText(a, name, got) catch "Taken off.";
+    }
+
+    /// `/list`, `/list NAME`, `/list [NAME] clear|add ITEMS|rm ITEMS|every
+    /// DAY HH:MM|every off`: the owner's.
+    fn listCommand(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        var it = std.mem.tokenizeAny(u8, rest, " \t");
+        var name: []const u8 = "";
+        var op = it.next() orelse return showLists(c, a, "");
+        const ops = [_][]const u8{ "clear", "add", "rm", "every" };
+        const is_op = for (ops) |o| {
+            if (std.mem.eql(u8, o, op)) break true;
+        } else false;
+        if (!is_op) {
+            if (!lists_mod.validName(op)) return list_help;
+            name = op;
+            op = it.next() orelse return showLists(c, a, name);
+        }
+        const list = if (name.len > 0) name else lists_mod.default_list;
+        const tail = std.mem.trim(u8, it.rest(), " \t");
+        const eql = std.mem.eql;
+        if (eql(u8, op, "clear")) {
+            const n = c.errands.lists.clear(a, list) catch |err| return errText(a, err);
+            noteCount(c, a, list, n, 0);
+            c.log.write(.chat, c.convPrivate(conv), .{ .event = "list", .op = "clear", .list = list, .count = n }) catch {};
+            if (n == 0) return std.fmt.allocPrint(a, "{s} is empty already.", .{try lists_mod.title(a, list)});
+            return std.fmt.allocPrint(a, "Cleared {s} ({d} item{s}).", .{ list, n, if (n == 1) "" else "s" });
+        }
+        if (eql(u8, op, "add") or eql(u8, op, "rm")) {
+            if (tail.len == 0) return list_help;
+            var items: std.ArrayList([]const u8) = .empty;
+            var parts = std.mem.splitScalar(u8, tail, ',');
+            while (parts.next()) |p| {
+                const x = std.mem.trim(u8, p, " \t");
+                if (x.len > 0) try items.append(a, x);
+            }
+            if (eql(u8, op, "add")) return addTo(c, a, conv, "", list, items.items);
+            return takeOff(c, a, conv, "", list, items.items, true).?;
+        }
+        if (eql(u8, op, "every")) return everyCommand(c, a, list, tail);
+        return list_help;
+    }
+
+    /// What a member's /help adds.
+    const member_help = "For the shopping list, write \"add milk\" or \"we're out of coffee\", \"got the milk\" to take it off, and \"list\" (or /list) to read it.";
+
+    /// A member's `/list [NAME] [add|rm ITEMS]`: reading, adding and taking
+    /// off; clearing and posting are the owner's.
+    fn memberList(c: *Core, a: std.mem.Allocator, conv: []const u8, member: []const u8, rest: []const u8) []const u8 {
+        var it = std.mem.tokenizeAny(u8, rest, " \t");
+        var name: []const u8 = "";
+        var op = it.next() orelse return showLists(c, a, "") catch |err| errText(a, err);
+        if (!std.mem.eql(u8, op, "clear") and !std.mem.eql(u8, op, "every") and !std.mem.eql(u8, op, "add") and !std.mem.eql(u8, op, "rm")) {
+            if (!lists_mod.validName(op)) return "Use /list, or /list NAME for another list.";
+            name = op;
+            op = it.next() orelse return showLists(c, a, name) catch |err| errText(a, err);
+        }
+        if (std.mem.eql(u8, op, "clear")) return "Only the owner clears a list. Take things off by writing, like \"remove milk\".";
+        if (std.mem.eql(u8, op, "every")) return "Only the owner sets when a list is posted.";
+        const list = if (name.len > 0) name else lists_mod.default_list;
+        var items: std.ArrayList([]const u8) = .empty;
+        var parts = std.mem.splitScalar(u8, std.mem.trim(u8, it.rest(), " \t"), ',');
+        while (parts.next()) |p| {
+            const x = std.mem.trim(u8, p, " \t");
+            if (x.len > 0) items.append(a, x) catch {};
+        }
+        if (items.items.len == 0) return "Use /list add ITEM, or just write \"add milk\".";
+        if (std.mem.eql(u8, op, "add")) return addTo(c, a, conv, member, list, items.items);
+        return takeOff(c, a, conv, member, list, items.items, true).?;
+    }
+
+    const list_help =
+        \\/list: the lists; /list NAME: one
+        \\/list [NAME] add ITEM, ITEM: add; /list [NAME] rm ITEM: take off
+        \\/list [NAME] clear: empty it
+        \\/list [NAME] every sat 09:00: posted then each week; /list [NAME] every off
+        \\Or write it: "add milk", "we're out of coffee", "got the milk", "what's on the list?"
+    ;
+
+    /// `/list [NAME] every DAY HH:MM` or `every off`.
+    fn everyCommand(c: *Core, a: std.mem.Allocator, list: []const u8, tail: []const u8) ![]const u8 {
+        const when = lists_mod.parseWeekly(tail);
+        const off = std.mem.eql(u8, tail, "off");
+        if (when == null and !off) return "Say when: /list every sat 09:00 (a day, or \"day\" for every day, then the time), or /list every off.";
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        var st = load(c, a);
+        var posts: std.ArrayList(lists_mod.Post) = .empty;
+        for (st.posts) |p| if (!std.mem.eql(u8, p.list, list)) try posts.append(a, p);
+        if (when) |w| try posts.append(a, .{ .list = list, .day = w.day, .at = w.at });
+        st.posts = posts.items;
+        try save(c, a, st);
+        c.log.write(.config, false, .{ .event = "list post", .list = list, .on = !off }) catch {};
+        if (off) return std.fmt.allocPrint(a, "{s} is no longer posted each week.", .{try lists_mod.title(a, list)});
+        return std.fmt.allocPrint(a, "{s} is posted {s}, when it has something on it.", .{ try lists_mod.title(a, list), try lists_mod.weeklyText(a, when.?) });
+    }
+
+    /// From the tick: lists before a planned shop (a calendar event within
+    /// the hour, a weekly post), once each.
+    fn due(c: *Core, now_s: i64) void {
+        // what waits on a server, on its own thread
+        if (c.poller_on) startJob(c);
+        if (c.chan == null) return;
+        // the rest every 30 seconds (from the tick, every few)
+        const last = c.errands.last_due.load(.acquire);
+        if (now_s >= last and now_s - last < 30) return;
+        c.errands.last_due.store(now_s, .release);
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const known = c.errands.lists.names(a) catch return;
+        // an event of the calendar that is a shop, within the hour
+        for (c.diary.events(a)) |ev| {
+            if (ev.cancelled or ev.all_day or ev.start <= now_s or ev.start - now_s > 3600) continue;
+            const name = lists_mod.shopEvent(a, ev.title, known, shopNames(c, a)) orelse continue;
+            const list = c.errands.lists.items(a, name) catch continue;
+            if (list.len == 0) continue;
+            const key = std.fmt.allocPrint(a, "event {s} {d}", .{ ev.id, ev.start }) catch continue;
+            if (once(c, a, key)) continue;
+            var cb: [8]u8 = undefined;
+            const text = std.fmt.allocPrint(a, "{s} at {s}. {s}", .{ ev.title, diary_mod.clock(&cb, ev.start, ev.offset), lists_mod.showText(a, name, list) catch continue }) catch continue;
+            c.log.write(.chat, false, .{ .event = "list", .op = "post", .list = name, .count = list.len, .why = "calendar" }) catch {};
+            post(c, a, by_lists, "lists", text);
+        }
+        // the weekly posts
+        const st = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            break :blk load(c, a);
+        };
+        const day = c.localDay(now_s);
+        const minute = c.localMinutes(now_s);
+        for (st.posts) |p| {
+            if (!lists_mod.weeklyDue(.{ .day = p.day, .at = p.at }, day, minute)) continue;
+            const key = std.fmt.allocPrint(a, "post {s} {d}", .{ p.list, day }) catch continue;
+            const list = c.errands.lists.items(a, p.list) catch continue;
+            if (once(c, a, key) or list.len == 0) continue;
+            c.log.write(.chat, false, .{ .event = "list", .op = "post", .list = p.list, .count = list.len, .why = "weekly" }) catch {};
+            post(c, a, by_lists, "lists", lists_mod.showText(a, p.list, list) catch continue);
+        }
+        // reorders at their weekly time, when their list has something
+        for (st.shops) |s| {
+            if (!lists_mod.weeklyDue(.{ .day = s.day, .at = s.at }, day, minute)) continue;
+            const key = std.fmt.allocPrint(a, "reorder {s} {d}", .{ s.shop, day }) catch continue;
+            if (once(c, a, key)) continue;
+            want(c, s.shop);
+        }
+    }
+
+    /// `/setup`'s lines of the errands: upkeep and reorders.
+    fn setupLine(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        var o: std.ArrayList(u8) = .empty;
+        try o.print(a, "\nUpkeep: {d} kept. /setup upkeep offers the usual ones; /upkeep lists them.", .{upkeepState(c, a).items.len});
+        var shops: std.ArrayList([]const u8) = .empty;
+        for (load(c, a).shops) |s| try shops.append(a, try lists_mod.title(a, s.shop));
+        if (shops.items.len > 0) try o.print(a, "\nReorders: from {s}, each asked. /setup reorder SHOP off stops one.", .{try lists_mod.andList(a, shops.items)}) else try o.appendSlice(a, "\nReorders: none. /setup reorder SHOP orders from a shop's MCP server, only when you tap.");
+        return o.items;
+    }
+
+    // ---- reorders ----
+
+    /// `/setup reorder SHOP [LIST] [at N items] [every DAY HH:MM]`, or
+    /// `/setup reorder SHOP off`: the owner's.
+    fn setupReorder(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        var it = std.mem.tokenizeAny(u8, rest, " \t");
+        const shop = it.next() orelse return reorder_help;
+        if (!shopName(shop)) return reorder_help;
+        var shop_cfg: lists_mod.Shop = .{ .shop = shop };
+        var by_size = false;
+        var by_date = false;
+        while (it.next()) |w| {
+            const eql = std.mem.eql;
+            if (eql(u8, w, "off")) return reorderOff(c, a, shop);
+            if (eql(u8, w, "at")) {
+                const n = std.fmt.parseInt(u32, it.next() orelse return reorder_help, 10) catch return reorder_help;
+                const unit = it.next() orelse return reorder_help;
+                if (!eql(u8, unit, "items") and !eql(u8, unit, "item")) return reorder_help;
+                if (n == 0 or n > lists_mod.max_items) return reorder_help;
+                shop_cfg.size = n;
+                by_size = true;
+            } else if (eql(u8, w, "every")) {
+                const d = it.next() orelse return reorder_help;
+                const tm = it.next() orelse return reorder_help;
+                const wk = lists_mod.parseWeekly(try std.fmt.allocPrint(a, "{s} {s}", .{ d, tm })) orelse return reorder_help;
+                shop_cfg.day = wk.day;
+                shop_cfg.at = wk.at;
+                by_date = true;
+            } else if (lists_mod.validName(w)) {
+                shop_cfg.list = w;
+            } else return reorder_help;
+        }
+        // only a date said: not by size too
+        if (by_date and !by_size) shop_cfg.size = 0;
+        const tl = shopTools(c, a, shop);
+        if (tl.why) |why| return why;
+        shop_cfg.quote = tl.quote.?.tool;
+        shop_cfg.order = tl.order.?.tool;
+        {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var st = load(c, a);
+            var shops: std.ArrayList(lists_mod.Shop) = .empty;
+            for (st.shops) |s| if (!std.mem.eql(u8, s.shop, shop)) try shops.append(a, s);
+            try shops.append(a, shop_cfg);
+            st.shops = shops.items;
+            try save(c, a, st);
+        }
+        c.log.write(.config, false, .{ .event = "reorder", .shop = shop, .list = shop_cfg.list, .size = shop_cfg.size, .on = true }) catch {};
+        var when: std.ArrayList([]const u8) = .empty;
+        if (shop_cfg.size > 0) try when.append(a, try std.fmt.allocPrint(a, "when {s} reaches {d} items", .{ shop_cfg.list, shop_cfg.size }));
+        if (shop_cfg.day >= 0) try when.append(a, try std.fmt.allocPrint(a, "{s} when {s} has something on it", .{ try lists_mod.weeklyText(a, .{ .day = shop_cfg.day, .at = shop_cfg.at }), shop_cfg.list }));
+        const per_call = tl.order.?.max_per_call orelse c.cfg.money.max_per_call;
+        const cap = if (per_call > 0) try std.fmt.allocPrint(a, " An order over {d} a call is not proposed (your cap).", .{per_call}) else "";
+        return std.fmt.allocPrint(a, "Reorders from {s} are on: {s}, I price the list with {s} and send you the whole order, each item and the total. Nothing is bought until you tap Order it.{s} /setup reorder {s} off stops them.", .{ try lists_mod.title(a, shop), try std.mem.join(a, ", and ", when.items), try lists_mod.title(a, shop), cap, shop });
+    }
+
+    /// An MCP server's name as `/setup reorder` takes it.
+    fn shopName(s: []const u8) bool {
+        if (s.len == 0 or s.len > 64) return false;
+        for (s) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_')) return false;
+        return true;
+    }
+
+    const reorder_help =
+        \\Use /setup reorder SHOP [LIST] [at 10 items] [every sat 09:00]: SHOP the shop's MCP server in mcp.ini, LIST shopping unless you name another.
+        \\The shop's server needs a tool that prices a basket (its name has quote, price, basket or cart) and its order tool listed as money in mcp.ini with amount =, so every order is asked and your caps apply.
+        \\/setup reorder SHOP off stops it.
+    ;
+
+    fn reorderOff(c: *Core, a: std.mem.Allocator, shop: []const u8) ![]const u8 {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        var st = load(c, a);
+        var shops: std.ArrayList(lists_mod.Shop) = .empty;
+        for (st.shops) |s| if (!std.mem.eql(u8, s.shop, shop)) try shops.append(a, s);
+        if (shops.items.len == st.shops.len) return std.fmt.allocPrint(a, "No reorders from {s} were on.", .{shop});
+        st.shops = shops.items;
+        try save(c, a, st);
+        c.log.write(.config, false, .{ .event = "reorder", .shop = shop, .on = false }) catch {};
+        return std.fmt.allocPrint(a, "Reorders from {s} are off.", .{try lists_mod.title(a, shop)});
+    }
+
+    /// A shop's two tools, or why it can't be one (Ruling 6 of the plan).
+    const ShopTools = struct { quote: ?agent.McpTool = null, order: ?agent.McpTool = null, why: ?[]const u8 = null };
+
+    fn shopTools(c: *Core, a: std.mem.Allocator, shop: []const u8) ShopTools {
+        var any = false;
+        var quote: ?agent.McpTool = null;
+        var order: ?agent.McpTool = null;
+        var orders: usize = 0;
+        for (c.mcp_tools) |m| {
+            if (!std.mem.eql(u8, m.server.name, shop)) continue;
+            any = true;
+            if (m.money) {
+                orders += 1;
+                if (order == null or std.ascii.findIgnoreCase(m.tool, "order") != null) order = m;
+            } else if (quote == null and lists_mod.quoteName(m.tool)) quote = m;
+        }
+        const title_s = lists_mod.title(a, shop) catch shop;
+        if (!any) return .{ .why = std.fmt.allocPrint(a, "No MCP server called {s} is running. Add the shop's server to mcp.ini (its order tool under money =, with amount =), then /reload.", .{shop}) catch "No such shop." };
+        if (order == null) return .{ .why = std.fmt.allocPrint(a, "{s} has no tool mcp.ini lists as money: I only order through a tool that is asked every time. Add its order tool to money = (with amount =) in its section, then /reload.", .{title_s}) catch "No order tool." };
+        if (orders > 1 and std.ascii.findIgnoreCase(order.?.tool, "order") == null) return .{ .why = std.fmt.allocPrint(a, "{s} has several money tools and none is called order: I can't tell which one orders.", .{title_s}) catch "Several money tools." };
+        if (order.?.amount != .name) return .{ .why = std.fmt.allocPrint(a, "{s}'s order tool has no amount field in mcp.ini (amount = {s}:FIELD): without it your money caps can't check an order.", .{ title_s, order.?.tool }) catch "No amount field." };
+        if (quote == null) return .{ .why = std.fmt.allocPrint(a, "{s} has no tool that prices a basket (a name with quote, price, basket or cart), so I can't propose an order in full.", .{title_s}) catch "No quote tool." };
+        return .{ .quote = quote, .order = order };
+    }
+
+    /// A shop to propose from, for the errands' job (once in the list).
+    fn want(c: *Core, shop: []const u8) void {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        for (c.errands.pending.items) |x| if (std.mem.eql(u8, x, shop)) return;
+        const owned = c.gpa.dupe(u8, shop) catch return;
+        c.errands.pending.append(c.gpa, owned) catch c.gpa.free(owned);
+    }
+
+    /// List `name` now holds `count` (`before` before): a shop whose size
+    /// it reached from under is wanted; one it fell under may propose
+    /// again (Ruling 7).
+    fn noteCount(c: *Core, a: std.mem.Allocator, name: []const u8, before: usize, count: usize) void {
+        var wanted: std.ArrayList([]const u8) = .empty;
+        {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var st = load(c, a);
+            const shops = a.dupe(lists_mod.Shop, st.shops) catch return;
+            var changed = false;
+            for (shops) |*s| {
+                if (!std.mem.eql(u8, s.list, name) or s.size == 0) continue;
+                if (count < s.size and !s.low) {
+                    s.low = true;
+                    changed = true;
+                } else if (count >= s.size and before < s.size and s.low) {
+                    s.low = false;
+                    changed = true;
+                    wanted.append(a, s.shop) catch {};
+                }
+            }
+            if (changed) {
+                st.shops = shops;
+                save(c, a, st) catch |err| c.log.write(.chat, false, .{ .event = "errands not written", .why = @errorName(err) }) catch {};
+            }
+        }
+        for (wanted.items) |s| want(c, s);
+    }
+
+    /// Whether shop `shop` has an order waiting for the owner.
+    fn orderOpen(c: *Core, a: std.mem.Allocator, shop: []const u8) bool {
+        const st = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            break :blk load(c, a);
+        };
+        for (st.orders) |o| if (std.mem.eql(u8, o.shop, shop)) {
+            if (c.itemNow(o.item) != .closed) return true;
+        };
+        return false;
+    }
+
+    /// Proposes an order from shop `shop_name`: its list priced by its
+    /// quote tool, then the whole order as the owner's one-tap item; the
+    /// call it would make kept first (`state/errands`). What goes wrong is
+    /// said in a line.
+    fn propose(c: *Core, shop_name: []const u8) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const by = by_reorder;
+        const shop = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            for (load(c, a).shops) |s| if (std.mem.eql(u8, s.shop, shop_name)) break :blk s;
+            return;
+        };
+        if (orderOpen(c, a, shop.shop)) return;
+        const items = c.errands.lists.items(a, shop.list) catch return;
+        if (items.len == 0) return;
+        const shop_title = lists_mod.title(a, shop.shop) catch shop.shop;
+        const tl = shopTools(c, a, shop.shop);
+        if (tl.why) |why| {
+            c.log.write(.chat, false, .{ .event = "order not proposed", .shop = shop.shop, .why = why }) catch {};
+            return post(c, a, by, "reorder", std.fmt.allocPrint(a, "No order from {s} this time: {s}", .{ shop_title, why }) catch return);
+        }
+        const quote = tl.quote.?;
+        const order = tl.order.?;
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "");
+        defer c.unregister(&flag);
+        const got = quote.server.call(a, quote.tool, lists_mod.quoteInput(a, items) catch return, &flag, 60_000, 256 * 1024) catch |err| {
+            c.log.write(.chat, false, .{ .event = "order not proposed", .shop = shop.shop, .why = @errorName(err) }) catch {};
+            return post(c, a, by, "reorder", std.fmt.allocPrint(a, "{s} couldn't price {s} ({s}): no order proposed.", .{ shop_title, shop.list, @errorName(err) }) catch return);
+        };
+        if (got.is_error) {
+            c.log.write(.chat, false, .{ .event = "order not proposed", .shop = shop.shop, .why = "the quote failed" }) catch {};
+            return post(c, a, by, "reorder", std.fmt.allocPrint(a, "{s} couldn't price {s}: {s}", .{ shop_title, shop.list, util.cut(std.mem.trim(u8, got.text, " \t\r\n"), 300) }) catch return);
+        }
+        const q = lists_mod.parseQuote(a, got.text) catch {
+            c.log.write(.chat, false, .{ .event = "order not proposed", .shop = shop.shop, .why = "the quote didn't read" }) catch {};
+            return post(c, a, by, "reorder", std.fmt.allocPrint(a, "{s}'s price for {s} didn't read as one: no order proposed.", .{ shop_title, shop.list }) catch return);
+        };
+        const plan = lists_mod.planOrder(a, q, items) catch return;
+        if (plan.order.len == 0) return post(c, a, by, "reorder", std.fmt.allocPrint(a, "{s} has none of {s}'s items: no order proposed.", .{ shop_title, shop.list }) catch return);
+        const total = lists_mod.amountText(a, q.total, q.currency) catch return;
+        // a cap the gate would hold it to: said, not asked (Ruling 10)
+        const per_call = order.max_per_call orelse c.cfg.money.max_per_call;
+        if (per_call > 0 and q.total > @as(f64, @floatFromInt(per_call))) {
+            c.log.write(.chat, false, .{ .event = "order not proposed", .shop = shop.shop, .why = "over the cap per call" }) catch {};
+            return post(c, a, by, "reorder", std.fmt.allocPrint(a, "The order from {s} would be {s}, over your cap of {d} a call: nothing is proposed. Take something off {s}, or raise max_per_call.", .{ shop_title, total, per_call, shop.list }) catch return);
+        }
+        const input = jv.canonical(a, lists_mod.orderInput(a, plan.order, order.amount.name, q.total) catch return) orelse return;
+        const arg = std.fmt.allocPrint(a, "{s}/{s} {s}", .{ order.server.name, order.tool, input }) catch return;
+        const body = c.masks.scrubAlloc(a, lists_mod.proposal(a, shop.shop, q, plan) catch return) catch return;
+        const title_line = std.fmt.allocPrint(a, "Order from {s}: {s}", .{ shop_title, total }) catch return;
+        const choices = [_]inbox_mod.Choice{ .{ .key = "order", .label = "Order it" }, .{ .key = "later", .label = "Not now" } };
+        c.makeRoom();
+        const id = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = c.inbox.add(.{
+                .kind = "confirm",
+                .by = by,
+                .run = std.fmt.allocPrint(a, "reorder {s}", .{shop.shop}) catch return,
+                .conversation = "main",
+                .waiter = order_waiter,
+                .title = title_line,
+                .body = body,
+                .choices = &choices,
+                .expires = c.now() + @as(i64, c.cfg.limits.approval_seconds),
+            }, c.now(), c.newToken()) catch return;
+            c.saveInbox();
+            c.logOpen(it);
+            break :blk it.id;
+        };
+        // the call kept before the item is shown: a tap at once finds it
+        {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var st = load(c, a);
+            var orders: std.ArrayList(lists_mod.Order) = .empty;
+            orders.appendSlice(a, st.orders) catch return;
+            orders.append(a, .{ .item = id, .shop = shop.shop, .list = shop.list, .arg = arg, .items = plan.order, .total = total }) catch return;
+            st.orders = orders.items;
+            save(c, a, st) catch {
+                _ = c.settle(id, .void, .{ .text = "it could not be kept", .at = c.now(), .via = .harness });
+                return;
+            };
+        }
+        c.log.write(.chat, false, .{ .event = "order proposed", .shop = shop.shop, .item = id, .items = plan.order.len, .missing = plan.missing.len }) catch {};
+        if (!c.showItem(id, null)) _ = c.settle(id, .void, .{ .text = "it could not be shown", .at = c.now(), .via = .harness });
+    }
+
+    const order_waiter = "errand order";
+
+    /// The order item `id` closed: its call taken off `state/errands` first
+    /// (a crash never orders twice), then made on the owner's Order it,
+    /// on a thread of its own; anything else orders nothing.
+    fn orderAnswered(c: *Core, a: std.mem.Allocator, id: u64, status: inbox_mod.Status, key: []const u8) void {
+        const yes = status == .answered and std.mem.eql(u8, key, "order");
+        const o = takeOrder(c, a, id) orelse {
+            if (yes) c.say(std.fmt.allocPrint(a, "Item {d}: nothing was ordered: harness no longer has that order. It's proposed again at the next time.", .{id}) catch "Nothing was ordered.");
+            return;
+        };
+        if (!yes) {
+            c.log.write(.chat, false, .{ .event = "order not made", .shop = o.shop, .item = id, .why = @tagName(status) }) catch {};
+            return;
+        }
+        const box = c.gpa.create(OrderJob) catch return c.say("Nothing was ordered: harness could not start the order.");
+        box.arena = .init(c.gpa);
+        box.order = copyOrder(box.arena.allocator(), o) catch {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return c.say("Nothing was ordered: harness could not start the order.");
+        };
+        _ = c.bg_active.fetchAdd(1, .acq_rel);
+        const th = std.Thread.spawn(.{}, orderJob, .{ c, box }) catch {
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return c.say("Nothing was ordered: harness could not start the order.");
+        };
+        th.detach();
+    }
+
+    const OrderJob = struct { arena: std.heap.ArenaAllocator, order: lists_mod.Order };
+
+    fn copyOrder(a: std.mem.Allocator, o: lists_mod.Order) !lists_mod.Order {
+        var items = try a.alloc([]const u8, o.items.len);
+        for (o.items, 0..) |x, i| items[i] = try a.dupe(u8, x);
+        return .{ .item = o.item, .shop = try a.dupe(u8, o.shop), .list = try a.dupe(u8, o.list), .arg = try a.dupe(u8, o.arg), .items = items, .total = try a.dupe(u8, o.total) };
+    }
+
+    fn orderJob(c: *Core, box: *OrderJob) void {
+        defer {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+        }
+        makeOrder(c, box.arena.allocator(), box.order);
+    }
+
+    /// Takes the order of item `id` off `state/errands`; null: none.
+    fn takeOrder(c: *Core, a: std.mem.Allocator, id: u64) ?lists_mod.Order {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        var st = load(c, a);
+        var kept: std.ArrayList(lists_mod.Order) = .empty;
+        var found: ?lists_mod.Order = null;
+        for (st.orders) |o| {
+            if (o.item == id) found = o else kept.append(a, o) catch return null;
+        }
+        const o = found orelse return null;
+        st.orders = kept.items;
+        save(c, a, st) catch |err| {
+            // not taken off: not made either
+            c.log.write(.chat, false, .{ .event = "errands not written", .why = @errorName(err) }) catch {};
+            return null;
+        };
+        return o;
+    }
+
+    /// The asker of an order the owner tapped: yes to that exact call,
+    /// once; no to anything else.
+    const OrderGo = struct {
+        arg: []const u8,
+        item: u64,
+        used: bool = false,
+
+        fn ask(ctx: *anyopaque, a: std.mem.Allocator, q: agent.Question) agent.Reply {
+            _ = a;
+            const g: *OrderGo = @ptrCast(@alignCast(ctx));
+            if (g.used or q.kind != .approval or !std.mem.eql(u8, q.arg, g.arg)) return .{ .answer = .deny, .text = "not the order the owner tapped", .item = g.item };
+            g.used = true;
+            return .{ .answer = .once, .item = g.item };
+        }
+    };
+
+    /// Makes order `o` the owner tapped: as the owner's (who `owner`, the
+    /// built-in main definition), through the gate again (a deny, the
+    /// caps, dry run), whose asker allows that exact call once. The shop's
+    /// words read back; what was ordered taken off the list.
+    fn makeOrder(c: *Core, a: std.mem.Allocator, o: lists_mod.Order) void {
+        while (c.restarting.load(.acquire) and !c.quitting.load(.acquire)) c.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        const shop_title = lists_mod.title(a, o.shop) catch o.shop;
+        const call = household.splitCall(o.arg) orelse return;
+        const mt: ?agent.McpTool = for (c.mcp_tools) |m| {
+            if (std.mem.eql(u8, m.server.name, call.server) and std.mem.eql(u8, m.tool, call.tool)) break m;
+        } else null;
+        const m = mt orelse return c.say(std.fmt.allocPrint(a, "The order from {s} wasn't made: its server isn't running. Nothing was taken off {s}.", .{ shop_title, o.list }) catch "The order wasn't made.");
+        if (!m.money) return c.say(std.fmt.allocPrint(a, "The order from {s} wasn't made: its order tool is no longer a money tool in mcp.ini.", .{shop_title}) catch "The order wasn't made.");
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "main");
+        defer c.unregister(&flag);
+        var run = c.runIn(&c.chat_client, "reorder", .{ .agent = "main", .by = "owner" }, "main", &flag);
+        run.useDefinition(agents.builtin_main);
+        var go: OrderGo = .{ .arg = o.arg, .item = o.item };
+        run.asker = .{ .ctx = &go, .ask = OrderGo.ask };
+        const out: tools.Output = agent.stepCall(&run, a, m.def.name, call.input) catch |e| .{ .text = @errorName(e), .is_error = true };
+        const words_said = util.cut(std.mem.trim(u8, out.text, " \t\r\n"), 600);
+        if (out.is_error or !go.used) {
+            c.log.write(.chat, false, .{ .event = "order failed", .shop = o.shop, .item = o.item }) catch {};
+            return c.say(std.fmt.allocPrint(a, "The order from {s} wasn't made: {s}. Nothing was taken off {s}.", .{ shop_title, std.mem.trimEnd(u8, words_said, "."), o.list }) catch "The order wasn't made.");
+        }
+        if (std.mem.startsWith(u8, words_said, "dry run:")) {
+            c.log.write(.chat, false, .{ .event = "order dry run", .shop = o.shop, .item = o.item }) catch {};
+            return c.say(std.fmt.allocPrint(a, "Dry run is on: nothing was ordered from {s}.", .{shop_title}) catch "Dry run is on: nothing was ordered.");
+        }
+        const got = c.errands.lists.remove(a, o.list, o.items) catch Store.Removed{};
+        noteCount(c, a, o.list, got.count + got.removed.len, got.count);
+        c.log.write(.chat, false, .{ .event = "order made", .shop = o.shop, .item = o.item, .items = o.items.len }) catch {};
+        c.say(std.fmt.allocPrint(a, "Ordered from {s}: {d} item{s}, {s}; off {s}. The shop says: {s}", .{ shop_title, o.items.len, if (o.items.len == 1) "" else "s", o.total, o.list, words_said }) catch "Ordered.");
+    }
+
+    const Store = lists_mod.Store;
+
+    /// An item of the errands (waiter `errand …`) closed.
+    fn answered(c: *Core, id: u64) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const Got = struct { status: inbox_mod.Status, key: []const u8 = "", waiter: []const u8 = "", words: ?[]const u8 = null, conv: []const u8 = "main" };
+        const got: Got = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = c.inbox.find(id) orelse return;
+            const key = if (it.answer) |ans| a.dupe(u8, ans.key orelse "") catch "" else "";
+            const said: ?[]const u8 = if (it.answer) |ans| (if (ans.text) |x| a.dupe(u8, x) catch null else null) else null;
+            break :blk .{ .status = it.status, .key = key, .waiter = a.dupe(u8, it.waiter) catch return, .words = said, .conv = a.dupe(u8, it.conversation) catch "main" };
+        };
+        if (std.mem.eql(u8, got.waiter, order_waiter)) return orderAnswered(c, a, id, got.status, got.key);
+        if (std.mem.eql(u8, got.waiter, upkeep_waiter)) return upkeepAnswered(c, a, id, got.status, got.key);
+        if (std.mem.startsWith(u8, got.waiter, offer_waiter)) return offerAnswered(c, a, got.waiter[offer_waiter.len..], got.status, got.key, got.words, got.conv);
+    }
+
+    // ---- deliveries ----
+
+    fn parcelsPath(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(a, &.{ c.paths.state, "deliveries" });
+    }
+
+    /// `state/deliveries` as read (under `c.errands.mutex`).
+    fn parcels(c: *Core, a: std.mem.Allocator) deliveries_mod.File {
+        const text = Io.Dir.cwd().readFileAlloc(c.io, parcelsPath(c, a) catch return .{}, a, .limited(4 << 20)) catch return .{};
+        return deliveries_mod.parseFile(a, text) catch .{};
+    }
+
+    fn saveParcels(c: *Core, a: std.mem.Allocator, f: deliveries_mod.File) !void {
+        try Io.Dir.cwd().createDirPath(c.io, c.paths.state);
+        try util.writeReplace(c.io, try parcelsPath(c, a), try deliveries_mod.fileText(a, f));
+    }
+
+    /// The owner's message naming a parcel ("track 1Z…", "my DPD parcel
+    /// 1000…"): tracked, and said; false when it names none.
+    fn parcelWords(c: *Core, conv: []const u8, text: []const u8) bool {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const found = (deliveries_mod.fromMessage(a, text) catch return false) orelse return false;
+        if (found.carrier.len == 0) {
+            c.sayIn(conv, std.fmt.allocPrint(a, "Which carrier is {s} with? Send it again with the carrier's name, like: DPD {s}.", .{ found.number, found.number }) catch return true);
+            return true;
+        }
+        const name = deliveries_mod.carrierName(found.carrier);
+        const added = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            const got = deliveries_mod.add(a, parcels(c, a), .{ .number = found.number, .carrier = found.carrier, .added = c.now() }) catch return false;
+            saveParcels(c, a, got.file) catch |err| {
+                c.sayIn(conv, std.fmt.allocPrint(a, "Not tracked: harness could not write state/deliveries ({s}).", .{@errorName(err)}) catch return true);
+                return true;
+            };
+            break :blk got.added;
+        };
+        c.log.write(.chat, c.convPrivate(conv), .{ .event = "delivery", .op = if (added) "track" else "again", .carrier = found.carrier }) catch {};
+        if (!added) {
+            c.sayIn(conv, std.fmt.allocPrint(a, "I'm tracking your {s} parcel {s} already. /deliveries says where it is.", .{ name, found.number }) catch return true);
+            return true;
+        }
+        c.sayIn(conv, std.fmt.allocPrint(a, "Tracking your {s} parcel {s}: I'll say when it's out for delivery and when it's delivered.", .{ name, found.number }) catch return true);
+        return true;
+    }
+
+    /// `/deliveries`, `/deliveries rm NUMBER`.
+    fn deliveriesCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        var f = parcels(c, a);
+        if (std.mem.startsWith(u8, rest, "rm ")) {
+            const number = std.mem.trim(u8, rest[3..], " \t");
+            var kept: std.ArrayList(deliveries_mod.Parcel) = .empty;
+            for (f.parcels) |p| if (!std.ascii.eqlIgnoreCase(p.number, number)) try kept.append(a, p);
+            if (kept.items.len == f.parcels.len) return std.fmt.allocPrint(a, "No parcel {s} is tracked.", .{number});
+            f.parcels = kept.items;
+            try saveParcels(c, a, f);
+            return std.fmt.allocPrint(a, "Stopped tracking {s}.", .{number});
+        }
+        if (rest.len > 0) return "Use /deliveries, or /deliveries rm NUMBER.";
+        if (f.parcels.len == 0) return "No parcels tracked. Write \"track\" and the number with its carrier, like: track DPD 1000123456789U; with your mailbox on, I find them in your mail.";
+        var lines: std.ArrayList([]const u8) = .empty;
+        for (f.parcels) |p| try lines.append(a, try deliveries_mod.listLine(a, p));
+        return std.mem.join(a, "\n", lines.items);
+    }
+
+    /// The doorbell's hint (the door's routine): "probably the DPD parcel"
+    /// when one is out for delivery or due today, null when none is.
+    pub fn hint(c: *Core, a: std.mem.Allocator) ?[]const u8 {
+        const f = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            break :blk parcels(c, a);
+        };
+        return deliveries_mod.hint(a, f.parcels, c.localDay(c.now())) catch null;
+    }
+
+    /// The owner's mail, every 30 minutes with their mailbox on: the
+    /// delivery mails of the last 14 days not read before, their parcels
+    /// tracked (quietly first: Ruling 12).
+    fn readMail(c: *Core, a: std.mem.Allocator, flag: *std.atomic.Value(bool)) void {
+        if (!c.mailMineOn(a)) return;
+        const now_s = c.now();
+        {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            const f = parcels(c, a);
+            if (now_s < f.mail_next) return;
+            var g = f;
+            g.mail_next = now_s + 30 * 60;
+            saveParcels(c, a, g) catch return;
+        }
+        const ms = c.mailSet(a) catch return;
+        const srv = c.serverNamed(ms.server) orelse return;
+        const input = std.fmt.allocPrint(a, "{{\"mailbox\":{f},\"kind\":\"delivery\",\"since\":\"14d\"}}", .{std.json.fmt(ms.mine, .{})}) catch return;
+        const got = srv.call(a, "mail_list", input, flag, 60_000, 1 << 20) catch |err| {
+            c.log.write(.chat, false, .{ .event = "delivery mail not read", .why = @errorName(err) }) catch {};
+            return;
+        };
+        if (got.is_error) return;
+        const seen = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            break :blk parcels(c, a).mail_seen;
+        };
+        for (deliveries_mod.mailItems(a, got.text)) |it| {
+            if (it.id.len == 0 or it.uid <= 0) continue;
+            const known = for (seen) |s| {
+                if (std.mem.eql(u8, s, it.id)) break true;
+            } else false;
+            if (known) continue;
+            const read_in = std.fmt.allocPrint(a, "{{\"mailbox\":{f},\"uid\":{d},\"format\":\"json\"}}", .{ std.json.fmt(ms.mine, .{}), it.uid }) catch continue;
+            const r = srv.call(a, "mail_read", read_in, flag, 60_000, 256 * 1024) catch continue;
+            if (r.is_error) continue;
+            const m = deliveries_mod.mailRead(a, r.text) orelse continue;
+            const text = std.fmt.allocPrint(a, "{s}\n{s}", .{ m.subject, m.text }) catch continue;
+            const found = deliveries_mod.find(a, text, if (m.from_addr.len > 0) m.from_addr else m.from) catch continue;
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var f = parcels(c, a);
+            var n: usize = 0;
+            for (found) |x| {
+                const res = deliveries_mod.add(a, f, .{ .number = x.number, .carrier = x.carrier, .from = util.cut(deliveries_mod.senderName(it.from), 60), .day = deliveries_mod.dayOf(it.day), .added = now_s, .quiet = true }) catch continue;
+                f = res.file;
+                if (res.added) n += 1;
+            }
+            var ids: std.ArrayList([]const u8) = .empty;
+            ids.appendSlice(a, f.mail_seen) catch continue;
+            if (ids.items.len >= deliveries_mod.max_seen) _ = ids.orderedRemove(0);
+            ids.append(a, it.id) catch continue;
+            f.mail_seen = ids.items;
+            saveParcels(c, a, f) catch continue;
+            // the mail's text is not kept or logged: only that it was read
+            c.log.write(.chat, false, .{ .event = "delivery mail", .uid = it.uid, .parcels = n }) catch {};
+        }
+    }
+
+    /// The carriers' pages of the parcels due (08:00–20:00, the owner's
+    /// time), each read by harness itself; a change of status said once
+    /// (Rulings 13 and 14).
+    fn readPages(c: *Core, a: std.mem.Allocator, flag: *std.atomic.Value(bool)) void {
+        const now_s = c.now();
+        const minute = c.localMinutes(now_s);
+        if (minute < 8 * 60 or minute >= 20 * 60) return;
+        const to_read = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            const f = deliveries_mod.prune(a, parcels(c, a), now_s) catch return;
+            var list: std.ArrayList(deliveries_mod.Parcel) = .empty;
+            for (f.parcels) |p| if (p.carrier.len > 0 and now_s >= p.next_read) list.append(a, p) catch return;
+            break :blk list.items;
+        };
+        for (to_read) |p| {
+            if (flag.load(.acquire) or c.stop.load(.acquire)) return;
+            const url = (deliveries_mod.pageUrl(a, p.carrier, p.number, c.errands.track_url) catch null) orelse continue;
+            const status = readPage(c, a, url, flag);
+            var said: ?[]const u8 = null;
+            {
+                c.errands.mutex.lockUncancelable(c.io);
+                defer c.errands.mutex.unlock(c.io);
+                var f = deliveries_mod.prune(a, parcels(c, a), now_s) catch continue;
+                const list = a.dupe(deliveries_mod.Parcel, f.parcels) catch continue;
+                for (list) |*x| {
+                    if (!std.mem.eql(u8, x.number, p.number)) continue;
+                    const s = status orelse x.status;
+                    x.next_read = if (status == null) now_s + 2 * 3600 else deliveries_mod.nextRead(s, now_s);
+                    const first = x.quiet;
+                    x.quiet = false;
+                    if (status == null or s == x.status) break;
+                    x.status = s;
+                    if (s == .delivered or s == .ready) x.done_at = now_s;
+                    const flagged: *bool = switch (s) {
+                        .out => &x.said_out,
+                        .ready => &x.said_ready,
+                        .delivered => &x.said_delivered,
+                        else => break,
+                    };
+                    if (flagged.*) break;
+                    flagged.* = true;
+                    // a parcel from mail: its first read only notes it
+                    if (first) break;
+                    said = deliveries_mod.lineFor(a, x.*, s) catch null;
+                    break;
+                }
+                f.parcels = list;
+                saveParcels(c, a, f) catch |err| {
+                    c.log.write(.chat, false, .{ .event = "deliveries not written", .why = @errorName(err) }) catch {};
+                    continue;
+                };
+            }
+            if (said) |text| {
+                c.log.write(.chat, false, .{ .event = "delivery", .op = "line", .carrier = p.carrier, .status = @tagName(status.?) }) catch {};
+                post(c, a, by_deliveries, "deliveries", text);
+            }
+        }
+    }
+
+    /// A carrier's page: its status, null when it couldn't be read. A
+    /// `deny fetch` rule on its address stops it.
+    fn readPage(c: *Core, a: std.mem.Allocator, url: []const u8, flag: *std.atomic.Value(bool)) ?deliveries_mod.Status {
+        const by = by_deliveries;
+        const d = blk: {
+            c.lock.lockUncancelable(c.io);
+            defer c.lock.unlock(c.io);
+            // as if someone could be asked: only a deny rule stops it (an
+            // ask, fetch's default, would be "no one to ask" here)
+            break :blk c.gate.decide(a, .fetch, url, c.now(), .{ .who = .{ .by = by, .agent = "" } });
+        };
+        if (d.action == .deny) {
+            c.log.write(.gate, false, .{ .run = "deliveries", .by = by, .tool = "fetch", .decision = "deny", .why = d.why, .arg = url }) catch {};
+            return null;
+        }
+        const g = tools.getUntil(c.gpa, c.io, a, url, &.{}, 1 << 20, null, .{ .deadline_s = util.nowSeconds(c.io) + 60, .stop = flag }) catch |err| {
+            c.log.write(.tool, false, .{ .run = "deliveries", .by = by, .tool = "fetch", .arg = url, .is_error = true, .output = @errorName(err) }) catch {};
+            return null;
+        };
+        c.log.write(.tool, false, .{ .run = "deliveries", .by = by, .tool = "fetch", .arg = url, .status = g.status, .bytes = g.body.len }) catch {};
+        if (g.status != 200) return null;
+        // a carrier's API answers JSON; a page, its readable text
+        const body = std.mem.trim(u8, g.body, " \t\r\n");
+        const json_body = body.len > 0 and (body[0] == '{' or body[0] == '[');
+        const text = if (!json_body and std.ascii.findIgnoreCase(g.content_type, "html") != null) (page.extract(a, g.body, url) catch return null).text else g.body;
+        // read, and nothing said of it yet: on its way
+        const s = deliveries_mod.statusOf(a, text);
+        return if (s == .unknown) .transit else s;
+    }
+
+    /// Whether deliveries wait on a server: the mail's time, or a page.
+    fn deliveriesDue(c: *Core, a: std.mem.Allocator, now_s: i64) bool {
+        const f = parcels(c, a);
+        if (now_s >= f.mail_next and c.mailMineOn(a)) return true;
+        const minute = c.localMinutes(now_s);
+        if (minute < 8 * 60 or minute >= 20 * 60) return false;
+        for (f.parcels) |p| if (p.carrier.len > 0 and p.done_at == 0 and now_s >= p.next_read) return true;
+        return false;
+    }
+
+    // ---- upkeep ----
+
+    const upkeep_waiter = "errand upkeep";
+    const offer_waiter = "errand upkeep-offer ";
+
+    fn upkeepPath(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(a, &.{ c.paths.state, "upkeep" });
+    }
+
+    /// `state/upkeep` as read (under `c.errands.mutex`).
+    fn upkeepState(c: *Core, a: std.mem.Allocator) upkeep_mod.State {
+        const text = Io.Dir.cwd().readFileAlloc(c.io, upkeepPath(c, a) catch return .{}, a, .limited(4 << 20)) catch return .{};
+        return upkeep_mod.parseState(a, text) catch .{};
+    }
+
+    fn saveUpkeep(c: *Core, a: std.mem.Allocator, st: upkeep_mod.State) !void {
+        try Io.Dir.cwd().createDirPath(c.io, c.paths.state);
+        try util.writeReplace(c.io, try upkeepPath(c, a), try upkeep_mod.stateText(a, st));
+    }
+
+    const upkeep_help =
+        \\/upkeep: what is kept, and when each is due
+        \\/upkeep add Boiler service every year [last 2026-03-12]
+        \\/upkeep add Car service every 15000 km or every year
+        \\/upkeep add Car insurance ends 2027-01-15 (insurance and inspections renew yearly; add "renews every 6 months" for another)
+        \\/upkeep done NAME [on DATE], /upkeep rm NAME
+        \\Or write it: "the boiler was serviced today". /setup upkeep offers the usual ones.
+    ;
+
+    /// `/upkeep`, `/upkeep add …`, `/upkeep done NAME [on DATE]`, `/upkeep rm NAME`.
+    fn upkeepCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        const today = c.localDay(c.now());
+        const eql = std.mem.eql;
+        var it = std.mem.tokenizeAny(u8, rest, " \t");
+        const op = it.next() orelse {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            const st = upkeepState(c, a);
+            if (st.items.len == 0) return "Nothing kept yet. /setup upkeep offers the usual ones; /upkeep add Boiler service every year adds one.";
+            var lines: std.ArrayList([]const u8) = .empty;
+            for (st.items) |x| try lines.append(a, try upkeep_mod.listLine(a, x, st.odo, today));
+            return std.mem.join(a, "\n", lines.items);
+        };
+        const tail = std.mem.trim(u8, it.rest(), " \t");
+        if (eql(u8, op, "add")) {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var st = upkeepState(c, a);
+            const item = upkeep_mod.parseAdd(a, tail, today, st.odo.last_km) catch |err| return if (err == error.BadDate) "That date didn't read: write it like 2026-03-12 or 12 Mar 2026." else upkeep_help;
+            if (st.items.len >= upkeep_mod.max_items) return std.fmt.allocPrint(a, "{d} things are kept already: /upkeep rm one first.", .{upkeep_mod.max_items});
+            for (st.items) |x| if (std.ascii.eqlIgnoreCase(x.name, item.name)) return std.fmt.allocPrint(a, "{s} is kept already: /upkeep rm {s} first to change it.", .{ x.name, x.name });
+            var items: std.ArrayList(upkeep_mod.Item) = .empty;
+            try items.appendSlice(a, st.items);
+            try items.append(a, item);
+            st.items = items.items;
+            try saveUpkeep(c, a, st);
+            c.log.write(.config, false, .{ .event = "upkeep added", .name = item.name }) catch {};
+            return std.fmt.allocPrint(a, "Kept: {s}", .{try upkeep_mod.listLine(a, item, st.odo, today)});
+        }
+        if (eql(u8, op, "rm")) {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var st = upkeepState(c, a);
+            const i = upkeep_mod.find(st.items, tail) orelse return std.fmt.allocPrint(a, "Nothing kept is called {s}. /upkeep lists them.", .{tail});
+            const name = st.items[i].name;
+            var items: std.ArrayList(upkeep_mod.Item) = .empty;
+            try items.appendSlice(a, st.items);
+            _ = items.orderedRemove(i);
+            st.items = items.items;
+            try saveUpkeep(c, a, st);
+            c.log.write(.config, false, .{ .event = "upkeep removed", .name = name }) catch {};
+            return std.fmt.allocPrint(a, "Removed {s}.", .{name});
+        }
+        if (eql(u8, op, "done")) {
+            const on = std.mem.indexOf(u8, tail, " on ");
+            const name = if (on) |o| tail[0..o] else tail;
+            const day = if (on) |o| upkeep_mod.parseDate(tail[o + 4 ..], today) orelse return "That date didn't read: write it like 2026-03-12 or 12 Mar 2026." else today;
+            if (day > today) return "That day hasn't come yet.";
+            const i = blk: {
+                c.errands.mutex.lockUncancelable(c.io);
+                defer c.errands.mutex.unlock(c.io);
+                break :blk upkeep_mod.find(upkeepState(c, a).items, name) orelse return std.fmt.allocPrint(a, "Nothing kept is called {s}. /upkeep lists them.", .{name});
+            };
+            return doneNow(c, a, i, day, 0);
+        }
+        return upkeep_help;
+    }
+
+    /// Item `index` done on `day` (the car at `km`, 0: its last reading):
+    /// counted again from then, its open line's button closed. What is said.
+    fn doneNow(c: *Core, a: std.mem.Allocator, index: usize, day: i64, km: f64) []const u8 {
+        const today = c.localDay(c.now());
+        var open: u64 = 0;
+        var key: []const u8 = "done";
+        const said = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var st = upkeepState(c, a);
+            if (index >= st.items.len) return "It is no longer kept.";
+            const items = a.dupe(upkeep_mod.Item, st.items) catch return "Not noted.";
+            open = items[index].item;
+            if (items[index].ends > 0) key = "renewed";
+            items[index] = upkeep_mod.done(items[index], day, if (km > 0) km else st.odo.last_km);
+            st.items = items;
+            saveUpkeep(c, a, st) catch |err| return std.fmt.allocPrint(a, "Not noted: harness could not write state/upkeep ({s}).", .{@errorName(err)}) catch "Not noted.";
+            c.log.write(.chat, false, .{ .event = "upkeep done", .name = items[index].name }) catch {};
+            break :blk upkeep_mod.doneText(a, items[index], st.odo, day, today) catch "Noted.";
+        };
+        // its line's button: answered (the mutex is free: the close comes back here)
+        if (open != 0) _ = c.settle(open, .answered, .{ .key = key, .at = c.now(), .via = .harness });
+        return said;
+    }
+
+    /// The owner's "the boiler was serviced today": done; false when the
+    /// message says no item done.
+    fn upkeepWords(c: *Core, conv: []const u8, text: []const u8) bool {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const today = c.localDay(c.now());
+        const got = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            const st = upkeepState(c, a);
+            if (st.items.len == 0) return false;
+            break :blk (upkeep_mod.doneWords(a, st.items, text, today) catch return false) orelse return false;
+        };
+        c.sayIn(conv, doneNow(c, a, got.index, got.day, got.km));
+        return true;
+    }
+
+    /// An upkeep line's item closed: [Done] or [Renewed] counts it done
+    /// today; anything else leaves it due.
+    fn upkeepAnswered(c: *Core, a: std.mem.Allocator, id: u64, status: inbox_mod.Status, key: []const u8) void {
+        const i = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var st = upkeepState(c, a);
+            const items = a.dupe(upkeep_mod.Item, st.items) catch return;
+            const i = for (items, 0..) |x, k| {
+                if (x.item == id) break k;
+            } else return;
+            const yes = status == .answered and (std.mem.eql(u8, key, "done") or std.mem.eql(u8, key, "renewed"));
+            if (yes) break :blk i;
+            items[i].item = 0;
+            st.items = items;
+            saveUpkeep(c, a, st) catch {};
+            return;
+        };
+        c.say(doneNow(c, a, i, c.localDay(c.now()), 0));
+    }
+
+    /// The day's pass, from 09:00 the owner's time, once a day: the car's
+    /// odometer read when a distance is kept, then each line due, said
+    /// once (kept before it is said: a crash never says it twice).
+    fn upkeepPass(c: *Core, a: std.mem.Allocator, flag: *std.atomic.Value(bool)) void {
+        const now_s = c.now();
+        if (c.localMinutes(now_s) < 9 * 60) return;
+        const today = c.localDay(now_s);
+        const by = by_upkeep;
+        var st = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            break :blk upkeepState(c, a);
+        };
+        if (st.pass >= today) return;
+        var km_kept = false;
+        for (st.items) |x| if (x.km > 0) {
+            km_kept = true;
+        };
+        // the car's odometer, harness's own read (Ruling 18)
+        const reading: ?f64 = if (km_kept) odo: {
+            const srv = c.serverNamed("car") orelse break :odo null;
+            const got = srv.call(a, "car_status", "{}", flag, 60_000, 64 * 1024) catch |err| {
+                c.log.write(.chat, false, .{ .event = "odometer not read", .why = @errorName(err) }) catch {};
+                break :odo null;
+            };
+            if (got.is_error) break :odo null;
+            break :odo upkeep_mod.odometer(got.text);
+        } else null;
+        var ls: []const upkeep_mod.Line = &.{};
+        {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            st = upkeepState(c, a);
+            if (st.pass >= today) return;
+            if (reading) |km| st = upkeep_mod.noteReading(a, st, today, km) catch return;
+            ls = upkeep_mod.lines(a, st, today) catch return;
+            const items = a.dupe(upkeep_mod.Item, st.items) catch return;
+            for (ls) |l| {
+                items[l.index].said_week = l.due;
+                if (l.kind != .week) items[l.index].said_day = l.due;
+            }
+            st.items = items;
+            st.pass = today;
+            saveUpkeep(c, a, st) catch |err| {
+                c.log.write(.chat, false, .{ .event = "upkeep not written", .why = @errorName(err) }) catch {};
+                return;
+            };
+        }
+        if (reading) |km| c.log.write(.chat, false, .{ .event = "odometer", .km = km }) catch {};
+        for (ls) |l| {
+            const name = st.items[l.index].name;
+            c.log.write(.chat, false, .{ .event = "upkeep", .line = @tagName(l.kind), .name = name }) catch {};
+            if (l.button.len == 0) {
+                post(c, a, by, "upkeep", l.text);
+                continue;
+            }
+            const key: []const u8 = if (std.mem.eql(u8, l.button, "Renewed")) "renewed" else "done";
+            const choices = [_]inbox_mod.Choice{.{ .key = key, .label = l.button }};
+            const id = c.addItem(.{
+                .kind = "confirm",
+                .by = by,
+                .run = std.fmt.allocPrint(a, "upkeep {s}", .{name}) catch continue,
+                .conversation = "main",
+                .waiter = upkeep_waiter,
+                .title = l.text,
+                .body = l.text,
+                .choices = &choices,
+                .expires = now_s + 7 * 86400,
+            }) catch continue;
+            // the item of its line now; an older line's button goes
+            var old: u64 = 0;
+            {
+                c.errands.mutex.lockUncancelable(c.io);
+                defer c.errands.mutex.unlock(c.io);
+                var now_st = upkeepState(c, a);
+                const items = a.dupe(upkeep_mod.Item, now_st.items) catch continue;
+                for (items) |*x| if (std.mem.eql(u8, x.name, name)) {
+                    old = x.item;
+                    x.item = id;
+                };
+                now_st.items = items;
+                saveUpkeep(c, a, now_st) catch {};
+            }
+            if (old != 0) _ = c.settle(old, .withdrawn, .{ .text = "a newer line came", .at = c.now(), .via = .harness });
+        }
+    }
+
+    /// Whether the day's pass waits (under `c.errands.mutex`).
+    fn upkeepDue(c: *Core, a: std.mem.Allocator, now_s: i64) bool {
+        if (c.localMinutes(now_s) < 9 * 60) return false;
+        const st = upkeepState(c, a);
+        return st.items.len > 0 and st.pass < c.localDay(now_s);
+    }
+
+    /// `/setup upkeep`: the usual ones not kept yet, offered one at a time.
+    fn setupUpkeep(c: *Core, a: std.mem.Allocator, conv: []const u8) ![]const u8 {
+        const car = c.carOn(a);
+        {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var st = upkeepState(c, a);
+            var keys: std.ArrayList([]const u8) = .empty;
+            for (upkeep_mod.usual) |u| {
+                if (u.car and !car) continue;
+                const kept = for (st.items) |x| {
+                    if (std.ascii.eqlIgnoreCase(x.name, u.name)) break true;
+                } else false;
+                if (!kept) try keys.append(a, u.key);
+            }
+            if (keys.items.len == 0) return "The usual ones are all kept. /upkeep lists them; /upkeep add adds others.";
+            st.offers = keys.items;
+            try saveUpkeep(c, a, st);
+        }
+        offerUpkeep(c, a, conv);
+        return "";
+    }
+
+    /// The next usual one offered: [Add it] [Not now], or a reply with when
+    /// it was last done (a document: the day it ends).
+    fn offerUpkeep(c: *Core, a: std.mem.Allocator, conv: []const u8) void {
+        const Next = struct { key: []const u8, kept: usize };
+        const next: Next = blk: {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            var st = upkeepState(c, a);
+            if (st.offers.len == 0) break :blk .{ .key = "", .kept = st.items.len };
+            const k = st.offers[0];
+            st.offers = st.offers[1..];
+            saveUpkeep(c, a, st) catch return;
+            break :blk .{ .key = k, .kept = st.items.len };
+        };
+        const key = next.key;
+        const kept = next.kept;
+        if (key.len == 0) return c.sayIn(conv, std.fmt.allocPrint(a, "That's the usual ones: {d} kept. /upkeep lists them; /upkeep add NAME every 6 months adds another.", .{kept}) catch "That's the usual ones.");
+        const u = upkeep_mod.usualOf(key) orelse return offerUpkeep(c, a, conv);
+        const add = [_]inbox_mod.Choice{ .{ .key = "add", .label = "Add it" }, .{ .key = "later", .label = "Not now" } };
+        const later = [_]inbox_mod.Choice{.{ .key = "later", .label = "Not now" }};
+        const body = if (u.doc) u.sentence else std.fmt.allocPrint(a, "{s} Add it counts from today; or reply with when it was last done, like 12 Mar 2026.", .{u.sentence}) catch return;
+        _ = c.addItem(.{
+            .kind = "confirm",
+            .conversation = conv,
+            .waiter = std.fmt.allocPrint(a, "{s}{s}", .{ offer_waiter, key }) catch return,
+            .title = u.name,
+            .body = body,
+            .choices = if (u.doc) &later else &add,
+            .text = .answer,
+            .expires = c.now() + 7 * 86400,
+        }) catch |err| c.sayIn(conv, std.fmt.allocPrint(a, "Not offered: {s}.", .{@errorName(err)}) catch "Not offered.");
+    }
+
+    /// A usual one's offer answered: Add it counts from today, a reply from
+    /// its date (a document: its end); then the next.
+    fn offerAnswered(c: *Core, a: std.mem.Allocator, key: []const u8, status: inbox_mod.Status, choice: []const u8, reply: ?[]const u8, conv: []const u8) void {
+        const u = upkeep_mod.usualOf(key) orelse return;
+        const today = c.localDay(c.now());
+        const day: ?i64 = if (status != .answered) null else if (std.mem.eql(u8, choice, "add")) today else if (reply) |w| upkeep_mod.parseDate(w, today) else null;
+        if (status == .answered and reply != null and day == null) {
+            c.sayIn(conv, std.fmt.allocPrint(a, "That date didn't read, so {s} isn't kept: /upkeep add adds it (/upkeep says how).", .{u.name}) catch "That date didn't read.");
+        } else if (day) |d| {
+            const said = blk: {
+                c.errands.mutex.lockUncancelable(c.io);
+                defer c.errands.mutex.unlock(c.io);
+                var st = upkeepState(c, a);
+                const item = upkeep_mod.fromUsual(u, d, st.odo.last_km);
+                var items: std.ArrayList(upkeep_mod.Item) = .empty;
+                items.appendSlice(a, st.items) catch return;
+                items.append(a, item) catch return;
+                st.items = items.items;
+                saveUpkeep(c, a, st) catch |err| break :blk std.fmt.allocPrint(a, "Not kept: harness could not write state/upkeep ({s}).", .{@errorName(err)}) catch "Not kept.";
+                c.log.write(.config, false, .{ .event = "upkeep added", .name = item.name }) catch {};
+                break :blk std.fmt.allocPrint(a, "Kept: {s}", .{upkeep_mod.listLine(a, item, st.odo, today) catch item.name}) catch "Kept.";
+            };
+            c.sayIn(conv, said);
+        }
+        // expired or withdrawn: the offers end there
+        if (status == .answered) offerUpkeep(c, a, conv);
+    }
+
+    // ---- the errands' job: what waits on a server, on a thread of its own ----
+
+    /// Starts the job when something waits for it (Ruling 21); where
+    /// harness runs (`poller_on`).
+    fn startJob(c: *Core) void {
+        if (c.errands.running.load(.acquire) or !jobDue(c)) return;
+        // under the settings lock: /reload sees it running, or this sees /reload
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
+        if (c.restarting.load(.acquire) or c.stop.load(.acquire)) return;
+        if (c.errands.running.swap(true, .acq_rel)) return;
+        const th = std.Thread.spawn(.{}, jobThread, .{c}) catch {
+            c.errands.running.store(false, .release);
+            return;
+        };
+        th.detach();
+    }
+
+    fn jobDue(c: *Core) bool {
+        {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            if (c.errands.pending.items.len > 0) return true;
+        }
+        // deliveries and upkeep: looked at once a minute
+        const now_s = c.now();
+        if (now_s < c.errands.next_look.load(.acquire)) return false;
+        c.errands.next_look.store(now_s + 60, .release);
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        return deliveriesDue(c, a, now_s) or upkeepDue(c, a, now_s);
+    }
+
+    fn jobThread(c: *Core) void {
+        defer c.errands.running.store(false, .release);
+        work(c);
+    }
+
+    /// What waits: the shops wanted, the delivery mails and the
+    /// carriers' pages due.
+    fn work(c: *Core) void {
+        while (true) {
+            const shop = blk: {
+                c.errands.mutex.lockUncancelable(c.io);
+                defer c.errands.mutex.unlock(c.io);
+                if (c.errands.pending.items.len == 0) break;
+                break :blk c.errands.pending.orderedRemove(0);
+            };
+            defer c.gpa.free(shop);
+            if (c.stop.load(.acquire)) continue;
+            propose(c, shop);
+        }
+        if (c.stop.load(.acquire)) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "");
+        defer c.unregister(&flag);
+        readMail(c, a, &flag);
+        readPages(c, a, &flag);
+        upkeepPass(c, a, &flag);
+    }
+
+    /// The shops' names (state/errands).
+    fn shopNames(c: *Core, a: std.mem.Allocator) []const []const u8 {
+        c.errands.mutex.lockUncancelable(c.io);
+        defer c.errands.mutex.unlock(c.io);
+        const st = load(c, a);
+        var out: std.ArrayList([]const u8) = .empty;
+        for (st.shops) |s| out.append(a, s.shop) catch {};
+        return out.items;
+    }
+};
+
+// ---- errands: lists ----
+
+fn listFile(f: *Fix, name: []const u8) []const u8 {
+    const a = f.e.arena.allocator();
+    return fileText(f, std.fs.path.join(a, &.{ f.core.paths.state, "lists", name }) catch return "");
+}
+
+test "the_owner_adds_and_reads_the_list" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.core.handleText("add milk and eggs");
+    try f.rec.waitFor("Added milk and eggs to shopping (2 items).");
+    try f.core.handleText("We're out of coffee");
+    try f.rec.waitFor("Added coffee to shopping (3 items).");
+    try f.core.handleText("what's on the list?");
+    try f.rec.waitFor("Shopping (3): milk, eggs, coffee.");
+    try f.core.handleText("got the milk");
+    try f.rec.waitFor("Took milk off shopping (2 left).");
+    // no model was asked, nothing queued
+    try t.expectEqual(0, f.e.server.modelRequests());
+    try t.expectEqual(0, f.core.queue.items.len);
+    // "got" what no list has is not about lists: the model's
+    try f.core.handleText("got your message");
+    try t.expectEqual(1, f.core.queue.items.len);
+    // the commands
+    try t.expectEqualStrings("Shopping (2): eggs, coffee.", try f.core.command(a, "/list"));
+    try t.expectEqualStrings("Added nails to hardware (1 item).", try f.core.command(a, "/list hardware add nails"));
+    try t.expectEqualStrings("Shopping (2): eggs, coffee.\nHardware (1): nails.", try f.core.command(a, "/list"));
+    try expectHas(listFile(&f, "hardware"), "\nnails\n");
+    try t.expectEqualStrings("Cleared shopping (2 items).", try f.core.command(a, "/list clear"));
+    try t.expectEqualStrings("Shopping is empty.", try f.core.command(a, "/list shopping"));
+    try t.expectEqualStrings("Shopping is empty already.", try f.core.command(a, "/list clear"));
+    // logged, the items not
+    const lt = try logText(&f);
+    try expectHas(lt, "\"event\":\"list\",\"op\":\"add\",\"list\":\"shopping\",\"count\":2");
+    try t.expect(std.mem.indexOf(u8, lt, "coffee") == null);
+}
+
+test "a_member_adds_milk_in_the_group" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.setBot("harness_test_bot", true);
+    try addGroup(&f, "home", -100777);
+    try joinMember(&f, "anna", 77);
+    try f.core.handleIncoming(.{ .from = 77, .chat = -100777, .chat_type = "supergroup", .text = "@harness_test_bot add milk" });
+    try f.rec.waitIn("home", "Added milk to shopping (1 item).");
+    // in her own chat: read it, in words and with /list
+    try f.core.handleIncoming(fromAccount(77, "what's on the list"));
+    try f.rec.waitIn("anna", "Shopping (1): milk.");
+    try f.core.handleIncoming(fromAccount(77, "/list"));
+    try t.expectEqual(2, f.rec.countIn("anna", "Shopping (1): milk."));
+    // no model run, and the owner isn't told
+    try t.expectEqual(0, f.e.server.modelRequests());
+    try t.expectEqual(0, f.core.queue.items.len);
+    try t.expectEqual(0, f.rec.countIn("main", "milk"));
+    try expectHas(try logText(&f), "\"event\":\"list\",\"op\":\"add\",\"list\":\"shopping\",\"count\":1,\"member\":\"anna\"");
+    // the owner sees it
+    try t.expectEqualStrings("Shopping (1): milk.", try f.core.command(f.e.arena.allocator(), "/list"));
+}
+
+test "members_cannot_clear_a_list" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try joinMember(&f, "anna", 77);
+    try f.core.handleText("add milk");
+    try f.core.handleIncoming(fromAccount(77, "/list clear"));
+    try f.rec.waitIn("anna", "Only the owner clears a list. Take things off by writing, like \"remove milk\".");
+    try f.core.handleIncoming(fromAccount(77, "/list every sat 09:00"));
+    try t.expectEqual(2, f.rec.countIn("anna", "Only the owner"));
+    try expectHas(listFile(&f, "shopping"), "\nmilk\n");
+    try f.core.handleIncoming(fromAccount(77, "remove milk"));
+    try f.rec.waitIn("anna", "Took milk off shopping; it's empty now.");
+    // her help says how
+    try f.core.handleIncoming(fromAccount(77, "/help"));
+    try f.rec.waitIn("anna", "\"add milk\"");
+}
+
+test "the_list_is_posted_before_a_shop_in_the_calendar" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const dir = try withCalendar(&f);
+    const t0 = diaryAt();
+    try writeUpcoming(&f, dir, &.{.{ .id = "personal/shop-1@calmcp-sim", .calendar = "personal", .title = "Groceries", .start = t0, .end = t0 + 3600, .offset = 60, .busy = true }});
+    try f.core.handleText("add milk, eggs");
+    f.core.fixed_now = t0 - 61 * 60;
+    try f.core.diaryReadNow();
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("Groceries at"));
+    f.core.fixed_now = t0 - 60 * 60;
+    f.core.tick();
+    try f.rec.waitFor("Groceries at 10:30. Shopping (2): milk, eggs.");
+    f.core.fixed_now = t0 - 30 * 60;
+    f.core.tick();
+    try t.expectEqual(1, f.rec.count("Groceries at"));
+    // another event is no shop
+    try writeUpcoming(&f, dir, &.{.{ .id = "personal/dentist-2@calmcp-sim", .calendar = "personal", .title = "Dentist", .start = t0 + 7200, .end = t0 + 9000, .offset = 60, .busy = true }});
+    try f.core.diaryReadNow();
+    f.core.fixed_now = t0 + 3600 + 60;
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("Dentist at"));
+}
+
+test "a_weekly_list_post" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try t.expectEqualStrings("Shopping is posted every Saturday at 09:00, when it has something on it.", try f.core.command(a, "/list every sat 09:00"));
+    // the next Saturday, 08:59 then 09:00 (the tests' owner time is UTC)
+    var day = @divFloor(util.nowSeconds(t.io), 86400) + 1;
+    while (util.weekday(day) != 5) day += 1;
+    f.core.fixed_now = day * 86400 + 9 * 3600 - 60;
+    f.core.tick();
+    // empty: nothing said that day
+    f.core.fixed_now = day * 86400 + 9 * 3600;
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("Shopping ("));
+    try f.core.handleText("add bread");
+    f.core.fixed_now = (day + 7) * 86400 + 9 * 3600 - 60;
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("Shopping (1): bread."));
+    f.core.fixed_now = (day + 7) * 86400 + 9 * 3600;
+    f.core.tick();
+    try f.rec.waitFor("Shopping (1): bread.");
+    f.core.fixed_now = (day + 7) * 86400 + 10 * 3600;
+    f.core.tick();
+    try t.expectEqual(1, f.rec.count("Shopping (1): bread."));
+    try t.expectEqualStrings("Shopping is no longer posted each week.", try f.core.command(a, "/list every off"));
+}
+
+test "add_milk_in_a_voice_note" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try voiceSetup(&f, "");
+    try sttScript(&f, 1, "{\"text\":\" Add milk.\"}");
+    try f.core.startWorker();
+    try f.core.handleIncoming(voiceNote(2));
+    try f.rec.waitFor("\"Add milk.\"");
+    try f.rec.waitFor("Added milk to shopping (1 item).");
+    try t.expectEqual(0, f.e.server.modelRequests());
+}
+
+// ---- errands: reorders ----
+
+/// mcp.ini with the shop's stand-in as `frisco` (its order a money tool,
+/// `total` its amount), `extra` lines after; applied.
+fn withShop(f: *Fix, extra: []const u8) !void {
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[frisco]\ncommand = \"{s}\" --mcp --shop\n{s}", .{ fake, extra }) });
+    try Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "frisco" }));
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+}
+
+const shop_money = "money = shop_order\namount = shop_order:total\n";
+
+fn shopOrders(f: *Fix) []const u8 {
+    const a = f.e.arena.allocator();
+    return fileText(f, std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "frisco", "orders.jsonl" }) catch return "");
+}
+
+/// Waits up to 5 s for `needle` in the shop's orders.
+fn waitOrders(f: *Fix, needle: []const u8) !void {
+    var waited: u32 = 0;
+    while (waited < 5000) : (waited += 50) {
+        if (std.mem.indexOf(u8, shopOrders(f), needle) != null) return;
+        t.io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+    std.debug.print("orders: {s}\n", .{shopOrders(f)});
+    return error.TestTimedOut;
+}
+
+test "a_reorder_is_bought_only_on_the_owners_tap" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    try t.expectEqualStrings("Reorders from Frisco are on: when shopping reaches 3 items, I price the list with Frisco and send you the whole order, each item and the total. Nothing is bought until you tap Order it. /setup reorder frisco off stops them.", try f.core.command(a, "/setup reorder frisco at 3 items"));
+    try f.core.handleText("add milk and eggs");
+    Errands.work(f.core);
+    try t.expectEqual(0, f.rec.count("Order from"));
+    try f.core.handleText("add oat milk, coffee");
+    try f.rec.waitFor("Added oat milk and coffee to shopping (4 items).");
+    Errands.work(f.core);
+    // the whole order, each line, the total, what wasn't found
+    try f.rec.waitFor("BUTTONS Order from Frisco: 15.00 PLN, delivery Sat 28 Nov, 10:00–12:00.\n- milk: milk (Shop's own), 5.00\n- eggs: eggs (Shop's own), 5.00\n- coffee: coffee (Shop's own), 5.00\nNot found: oat milk (stays on the list).");
+    try t.expectEqualStrings("", shopOrders(&f));
+    // nothing more is proposed while it waits
+    try f.core.handleText("add bread");
+    Errands.work(f.core);
+    try t.expectEqual(1, f.rec.count("BUTTONS Order from"));
+    // a member's press is not the owner's
+    const b = f.lastButtons();
+    f.core.handleCallback(77, b.msg, b.get("order").?);
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expectEqualStrings("", shopOrders(&f));
+    // the owner's tap: that exact order, once
+    try f.press("order");
+    try f.rec.waitFor("Ordered from Frisco: 3 items, 15.00 PLN; off shopping. The shop says: Order 4471 placed: 15.00 PLN, delivery Sat 28 Nov, 10:00–12:00.");
+    try waitOrders(&f, "{\"items\":[\"milk\",\"eggs\",\"coffee\"],\"total\":15}");
+    try t.expectEqualStrings("Shopping (2): oat milk, bread.", try f.core.command(a, "/list"));
+    // a second press orders nothing
+    f.core.handleCallback(42, b.msg, b.get("order").?);
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expectEqual(1, std.mem.count(u8, shopOrders(&f), "\n"));
+    // the call went through the gate as the owner's, asked by the tap
+    const lt = try logText(&f);
+    try expectHas(lt, "\"by\":\"owner\"");
+    try expectHas(lt, "\"tool\":\"frisco__shop_order\"");
+    try expectHas(lt, "\"event\":\"order made\",\"shop\":\"frisco\"");
+}
+
+test "not_now_and_expiry_order_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    _ = try f.core.command(a, "/setup reorder frisco at 2 items");
+    try f.core.handleText("add milk, eggs");
+    Errands.work(f.core);
+    try f.rec.waitFor("BUTTONS Order from Frisco: 10.00 PLN");
+    try f.press("later");
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expectEqualStrings("", shopOrders(&f));
+    // more items: not again until the list was under its size
+    try f.core.handleText("add bread");
+    Errands.work(f.core);
+    try t.expectEqual(1, f.rec.count("BUTTONS Order from"));
+    try f.core.handleText("got the milk, eggs");
+    try f.core.handleText("add jam");
+    Errands.work(f.core);
+    try f.rec.waitFor("BUTTONS Order from Frisco: 10.00 PLN");
+    try t.expectEqual(2, f.rec.count("BUTTONS Order from"));
+    // no answer in time: nothing
+    f.core.fixed_now = f.core.now() + f.core.cfg.limits.approval_seconds + 60;
+    f.core.tick();
+    try f.rec.waitFor("No answer in time.");
+    try t.expectEqualStrings("", shopOrders(&f));
+    try expectHas(try logText(&f), "\"event\":\"order not made\",\"shop\":\"frisco\"");
+}
+
+test "the_order_goes_through_the_gates_caps_and_dry_run" {
+    var f: Fix = undefined;
+    try f.init("[money]\nmax_per_call = 8\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    _ = try f.core.command(a, "/setup reorder frisco at 2 items");
+    try f.core.handleText("add milk, eggs");
+    Errands.work(f.core);
+    // over the cap a call: said, nothing asked
+    try f.rec.waitFor("The order from Frisco would be 10.00 PLN, over your cap of 8 a call: nothing is proposed.");
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    // the shop's own cap lifts it; dry run is on
+    try withShop(&f, shop_money ++ "max_per_call = 50\n");
+    try f.core.handleText("got the milk");
+    try f.core.handleText("add milk");
+    Errands.work(f.core);
+    try f.rec.waitFor("BUTTONS Order from Frisco: 10.00 PLN");
+    _ = try f.core.command(a, "/dryrun on");
+    try f.press("order");
+    try f.rec.waitFor("Dry run is on: nothing was ordered from Frisco.");
+    try t.expectEqualStrings("", shopOrders(&f));
+    try t.expectEqualStrings("Shopping (2): eggs, milk.", try f.core.command(a, "/list"));
+    // a deny rule stops it at the tap
+    _ = try f.core.command(a, "/dryrun off");
+    try writeRules(&f, "deny mcp frisco/shop_order *\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.core.handleText("got the milk");
+    try f.core.handleText("add milk");
+    Errands.work(f.core);
+    try t.expectEqual(2, f.rec.count("BUTTONS Order from"));
+    try f.press("order");
+    try f.rec.waitFor("The order from Frisco wasn't made: ");
+    try t.expectEqualStrings("", shopOrders(&f));
+}
+
+test "a_shop_whose_order_tool_is_not_money_is_refused" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, "");
+    try t.expectEqualStrings("Frisco has no tool mcp.ini lists as money: I only order through a tool that is asked every time. Add its order tool to money = (with amount =) in its section, then /reload.", try f.core.command(a, "/setup reorder frisco"));
+    try withShop(&f, "money = shop_order\n");
+    try expectHas(try f.core.command(a, "/setup reorder frisco"), "Frisco's order tool has no amount field in mcp.ini (amount = shop_order:FIELD)");
+    try expectHas(try f.core.command(a, "/setup reorder nosuch"), "No MCP server called nosuch is running.");
+    // set up, then mcp.ini changed: nothing proposed, said why
+    try withShop(&f, shop_money);
+    _ = try f.core.command(a, "/setup reorder frisco at 1 items");
+    try withShop(&f, "");
+    try f.core.handleText("add milk");
+    Errands.work(f.core);
+    try f.rec.waitFor("No order from Frisco this time: Frisco has no tool mcp.ini lists as money");
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+}
+
+test "a_tap_after_a_restart_still_orders_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    _ = try f.core.command(a, "/setup reorder frisco at 1 items");
+    try f.core.handleText("add milk");
+    Errands.work(f.core);
+    try f.rec.waitFor("BUTTONS Order from Frisco: 5.00 PLN");
+    const b = f.lastButtons();
+    try restart(&f);
+    try f.core.setOwner(42);
+    f.core.startExtras();
+    f.core.handleCallback(42, b.msg, b.get("order").?);
+    try f.rec.waitFor("Ordered from Frisco: 1 item, 5.00 PLN; off shopping.");
+    try waitOrders(&f, "\"milk\"");
+    f.core.handleCallback(42, b.msg, b.get("order").?);
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expectEqual(1, std.mem.count(u8, shopOrders(&f), "\n"));
+}
+
+test "a_members_add_proposes_to_the_owner_only" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    _ = try f.core.command(a, "/setup reorder frisco at 1 items");
+    try joinMember(&f, "anna", 77);
+    try f.core.handleIncoming(fromAccount(77, "add milk"));
+    try f.rec.waitIn("anna", "Added milk to shopping (1 item).");
+    Errands.work(f.core);
+    try f.rec.waitIn("main", "Order from Frisco: 5.00 PLN");
+    try t.expectEqual(0, f.rec.countIn("anna", "Order"));
+    // her /setup is the owner's
+    try f.core.handleIncoming(fromAccount(77, "/setup reorder frisco off"));
+    try f.rec.waitIn("anna", "Commands are for the owner.");
+}
+
+// ---- errands: deliveries ----
+
+/// The carriers' pages at the stand-in: `/page/track-CARRIER-NUMBER`.
+fn trackAt(f: *Fix) !void {
+    f.core.errands.track_url = try std.fmt.allocPrint(f.e.arena.allocator(), "{s}/page/track-", .{try f.e.url()});
+}
+
+/// 10:00 (UTC, the tests' owner time) of a day to come.
+fn deliveryDay() i64 {
+    return quietDay() + 10 * 3600;
+}
+
+test "a_parcel_from_a_message_is_tracked_and_said" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try trackAt(&f);
+    const t0 = deliveryDay();
+    f.core.fixed_now = t0;
+    try writePage(&f, "track-dpd-1000123456789U", "<html><body><p>Parcel data received</p></body></html>");
+    try f.core.handleText("track my DPD parcel 1000123456789U");
+    try f.rec.waitFor("Tracking your DPD parcel 1000123456789U: I'll say when it's out for delivery and when it's delivered.");
+    try t.expectEqual(0, f.e.server.modelRequests());
+    try t.expect(f.core.deliveryHint(a) == null);
+    Errands.work(f.core);
+    try t.expectEqualStrings("DPD 1000123456789U: on its way.", try f.core.command(a, "/deliveries"));
+    // read again two hours on: out for delivery
+    try writePage(&f, "track-dpd-1000123456789U", "<html><body><p>23.11 09:12 Out for delivery</p><p>Your parcel will be delivered today</p><p>22.11 18:00 Parcel data received</p></body></html>");
+    f.core.fixed_now = t0 + 2 * 3600 - 60;
+    Errands.work(f.core);
+    try t.expectEqual(0, f.rec.count("out for delivery."));
+    f.core.fixed_now = t0 + 2 * 3600;
+    Errands.work(f.core);
+    try f.rec.waitFor("Your DPD parcel 1000123456789U is out for delivery.");
+    try t.expectEqualStrings("probably the DPD parcel", f.core.deliveryHint(a).?);
+    // then every 30 minutes: delivered, once
+    try writePage(&f, "track-dpd-1000123456789U", "<html><body><p>23.11 11:40 Przesyłka doręczona do odbiorcy</p><p>23.11 09:12 Out for delivery</p></body></html>");
+    f.core.fixed_now = t0 + 2 * 3600 + 30 * 60;
+    Errands.work(f.core);
+    try f.rec.waitFor("Your DPD parcel 1000123456789U was delivered.");
+    f.core.fixed_now = t0 + 4 * 3600;
+    Errands.work(f.core);
+    try t.expectEqual(1, f.rec.count("was delivered."));
+    try t.expectEqual(1, f.rec.count("is out for delivery."));
+    try t.expect(f.core.deliveryHint(a) == null);
+    try t.expectEqualStrings("DPD 1000123456789U: delivered.", try f.core.command(a, "/deliveries"));
+    // the same number again; one with no carrier
+    try f.core.handleText("track my DPD parcel 1000123456789U");
+    try f.rec.waitFor("I'm tracking your DPD parcel 1000123456789U already.");
+    try f.core.handleText("track my package 1234567890");
+    try f.rec.waitFor("Which carrier is 1234567890 with? Send it again with the carrier's name, like: DPD 1234567890.");
+    try t.expectEqual(0, f.e.server.modelRequests());
+    const lt = try logText(&f);
+    try expectHas(lt, "\"event\":\"delivery\",\"op\":\"line\",\"carrier\":\"dpd\",\"status\":\"out\"");
+    try expectHas(lt, "\"run\":\"deliveries\",\"by\":\"schedule:deliveries\",\"tool\":\"fetch\"");
+    try t.expectEqualStrings("Stopped tracking 1000123456789U.", try f.core.command(a, "/deliveries rm 1000123456789U"));
+    try expectHas(try f.core.command(a, "/deliveries"), "No parcels tracked.");
+}
+
+test "a_parcel_from_the_mail_is_tracked_quietly_first" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withMail(&f);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try dataFile(&f, "mail.ini"), .data = "[mine]\naddress = me@example.com\n" });
+    try trackAt(&f);
+    const t0 = deliveryDay();
+    f.core.fixed_now = t0;
+    const c = util.civil(@divFloor(t0, 86400));
+    const today = try std.fmt.allocPrint(a, "{d}-{d:0>2}-{d:0>2}", .{ c.y, c.m, c.d });
+    try mailFile(&f, "list-mine.json", try std.fmt.allocPrint(a, "[{{\"id\":\"mine/INBOX/7/5\",\"uid\":5,\"from\":\"Allegro <powiadomienia@allegro.pl>\",\"subject\":\"Twoja paczka jest w drodze\",\"kind\":\"delivery\",\"day\":\"{s}\"}}]", .{today}));
+    try mailFile(&f, "read-mine-5.json", "{\"uid\":5,\"from\":\"Allegro <powiadomienia@allegro.pl>\",\"from_addr\":\"powiadomienia@allegro.pl\",\"subject\":\"Twoja paczka jest w drodze\",\"text\":\"Paczka InPost nr 602677439331630337653846 jest w drodze do Paczkomatu KRA01M.\"}");
+    try writePage(&f, "track-inpost-602677439331630337653846", "{\"tracking_number\":\"602677439331630337653846\",\"status\":\"out_for_delivery\"}");
+    Errands.work(f.core);
+    // its first read only notes it
+    try t.expectEqualStrings("InPost 602677439331630337653846 from Allegro: out for delivery.", try f.core.command(a, "/deliveries"));
+    try t.expectEqual(0, f.rec.count("out for delivery."));
+    try t.expectEqualStrings("probably the InPost parcel", f.core.deliveryHint(a).?);
+    // at the locker, half an hour on
+    try writePage(&f, "track-inpost-602677439331630337653846", "{\"status\":\"ready_to_pickup\"}");
+    f.core.fixed_now = t0 + 30 * 60;
+    Errands.work(f.core);
+    try f.rec.waitFor("Your InPost parcel from Allegro is waiting at the parcel locker.");
+    try t.expect(f.core.deliveryHint(a) == null);
+    // the mail was read once, and its text is in no log line
+    const lt = try logText(&f);
+    try t.expectEqual(1, std.mem.count(u8, lt, "\"event\":\"delivery mail\""));
+    try t.expect(std.mem.indexOf(u8, lt, "KRA01M") == null);
+}
+
+test "delivery_lines_wait_for_quiet_hours" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 09:00-11:00\n", "", "");
+    defer f.deinit();
+    try trackAt(&f);
+    const t0 = deliveryDay();
+    f.core.fixed_now = t0 - 3 * 3600;
+    try writePage(&f, "track-ups-1Z999AA10123456784", "<html><body><p>In transit</p></body></html>");
+    try f.core.handleText("track 1Z999AA10123456784");
+    try f.rec.waitFor("Tracking your UPS parcel 1Z999AA10123456784");
+    // 07:00: nothing is read before 08:00
+    Errands.work(f.core);
+    try t.expectEqual(0, std.mem.count(u8, fileText(&f, try std.fs.path.join(f.e.arena.allocator(), &.{ f.e.dir, "page-requests.jsonl" })), "track-ups"));
+    // 10:00, in quiet hours: read, said in the digest
+    try writePage(&f, "track-ups-1Z999AA10123456784", "<html><body><p>Out for delivery</p></body></html>");
+    f.core.fixed_now = t0;
+    Errands.work(f.core);
+    try t.expectEqual(0, f.rec.count("is out for delivery."));
+    f.core.fixed_now = t0 + 3600;
+    f.core.tick();
+    try f.rec.waitFor("Your UPS parcel 1Z999AA10123456784 is out for delivery.");
+}
+
+test "a_deny_rule_stops_a_carriers_page" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try trackAt(&f);
+    f.core.fixed_now = deliveryDay();
+    try writeRules(&f, "deny fetch http://127.0.0.1*\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try writePage(&f, "track-dpd-1000123456789U", "<html><body><p>Out for delivery</p></body></html>");
+    try f.core.handleText("track DPD 1000123456789U");
+    Errands.work(f.core);
+    try t.expectEqual(0, std.mem.count(u8, fileText(&f, try std.fs.path.join(f.e.arena.allocator(), &.{ f.e.dir, "page-requests.jsonl" })), "track-dpd"));
+    try t.expectEqual(0, f.rec.count("is out for delivery."));
+    try expectHas(try logText(&f), "\"run\":\"deliveries\",\"by\":\"schedule:deliveries\",\"tool\":\"fetch\",\"decision\":\"deny\"");
+}
+
+// ---- errands: upkeep ----
+
+/// "Mon 30 Nov 2026" style, as upkeep says a day (`day` and the owner's today).
+fn upkeepDay(f: *Fix, day: i64, today: i64) ![]const u8 {
+    return upkeep_mod.dayText(f.e.arena.allocator(), day, today);
+}
+
+fn upkeepDate(f: *Fix, day: i64) ![]const u8 {
+    return upkeep_mod.dateText(f.e.arena.allocator(), day);
+}
+
+test "upkeep_lines_a_week_before_and_on_the_day_with_done" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const t0 = quietDay();
+    const today = @divFloor(t0, 86400);
+    f.core.fixed_now = t0 + 8 * 3600;
+    try t.expectEqualStrings(try std.fmt.allocPrint(a, "Kept: Boiler service: weekly; next {s}.", .{try upkeepDate(&f, today + 7)}), try f.core.command(a, "/upkeep add Boiler service every 7 days"));
+    // 08:00: not yet
+    Errands.work(f.core);
+    try t.expectEqual(0, f.rec.count("Boiler service is due"));
+    f.core.fixed_now = t0 + 9 * 3600;
+    Errands.work(f.core);
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "BUTTONS Boiler service is due in a week ({s}).", .{try upkeepDay(&f, today + 7, today)}));
+    Errands.work(f.core);
+    f.core.fixed_now = t0 + 86400 + 9 * 3600;
+    Errands.work(f.core);
+    try t.expectEqual(1, f.rec.count("Boiler service is due"));
+    // on the day: the week's button goes, the day's comes
+    f.core.fixed_now = t0 + 7 * 86400 + 9 * 3600;
+    Errands.work(f.core);
+    try f.rec.waitFor("BUTTONS Boiler service is due today.");
+    try f.rec.waitFor("Withdrawn: a newer line came.");
+    try f.press("done");
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "Boiler service done today; next due {s}.", .{try upkeepDate(&f, today + 14)}));
+    try t.expectEqualStrings(try std.fmt.allocPrint(a, "Boiler service: weekly; next {s}.", .{try upkeepDate(&f, today + 14)}), try f.core.command(a, "/upkeep"));
+    try expectHas(try logText(&f), "\"event\":\"upkeep done\",\"name\":\"Boiler service\"");
+    // a document that renews: [Renewed]; a warranty: a line alone
+    _ = try f.core.command(a, try std.fmt.allocPrint(a, "/upkeep add Car insurance ends {s}", .{try upkeepDate(&f, today + 14)}));
+    _ = try f.core.command(a, try std.fmt.allocPrint(a, "/upkeep add Dishwasher warranty ends {s}", .{try upkeepDate(&f, today + 14)}));
+    try t.expectEqualStrings("Removed Dishwasher warranty.", try f.core.command(a, "/upkeep rm dishwasher"));
+    f.core.fixed_now = t0 + 8 * 86400 + 9 * 3600;
+    Errands.work(f.core);
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "BUTTONS Car insurance ends in 6 days ({s}).", .{try upkeepDay(&f, today + 14, today + 8)}));
+    try f.press("renewed");
+    try f.rec.waitFor("Car insurance renewed: it ends ");
+}
+
+test "serviced_today_in_chat_resets" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const t0 = quietDay();
+    const today = @divFloor(t0, 86400);
+    f.core.fixed_now = t0 + 10 * 3600;
+    _ = try f.core.command(a, "/upkeep add Boiler service every 7 days last yesterday");
+    _ = try f.core.command(a, "/upkeep add Filters every 3 months");
+    try f.core.handleText("The boiler was serviced today.");
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "Boiler service done today; next due {s}.", .{try upkeepDate(&f, today + 7)}));
+    try f.core.handleText("changed the filters yesterday");
+    try f.rec.waitFor("Filters done on ");
+    try t.expectEqual(0, f.e.server.modelRequests());
+    try t.expectEqual(0, f.core.queue.items.len);
+    // a question, a future: the model's
+    try f.core.handleText("was the boiler serviced?");
+    try f.core.handleText("the boiler needs a service next week");
+    try t.expectEqual(2, f.core.queue.items.len);
+    // its open line's button closes with it
+    f.core.fixed_now = t0 + 6 * 86400 + 9 * 3600;
+    Errands.work(f.core);
+    try f.rec.waitFor("BUTTONS Boiler service is due tomorrow");
+    try f.core.handleText("boiler serviced");
+    try f.rec.waitFor("Done, ");
+}
+
+test "the_cars_service_by_its_odometer" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[car]\ncommand = \"{s}\" --mcp --car\n", .{fake}) });
+    const car_dir = try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "car" });
+    try Io.Dir.cwd().createDirPath(t.io, car_dir);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const odo = try std.fs.path.join(a, &.{ car_dir, "odometer" });
+    const t0 = quietDay();
+    f.core.fixed_now = t0 + 9 * 3600;
+    try t.expectEqualStrings("Kept: Car service: every 15,000 km; due once the car's odometer is read.", try f.core.command(a, "/upkeep add Car service every 15000 km"));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = odo, .data = "44000" });
+    Errands.work(f.core);
+    try t.expectEqualStrings("Car service: every 15,000 km; next at 59,000 km (the car is at 44,000 km).", try f.core.command(a, "/upkeep"));
+    try t.expectEqual(0, f.rec.count("Car service is due"));
+    // the next day, 200 km to go (40 km a day: within the week)
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = odo, .data = "58800" });
+    f.core.fixed_now = t0 + 86400 + 9 * 3600;
+    Errands.work(f.core);
+    try f.rec.waitFor("BUTTONS Car service is due in about 200 km (at 59,000 km; the car is at 58,800 km).");
+    try f.core.handleText("the car was serviced today at 59100 km");
+    try f.rec.waitFor("Car service done today; next due at 74,100 km.");
+    try expectHas(try logText(&f), "\"event\":\"odometer\",\"km\":58800");
+}
+
+test "setup_offers_the_usual_ones" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const t0 = quietDay();
+    const today = @divFloor(t0, 86400);
+    f.core.fixed_now = t0 + 10 * 3600;
+    try t.expectEqualStrings("", try f.core.command(a, "/setup upkeep"));
+    try f.rec.waitFor("BUTTONS Boiler service, once a year: I tell you a week before it's due and on the day. Add it counts from today; or reply with when it was last done, like 12 Mar 2026.");
+    try f.press("add");
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "Kept: Boiler service: yearly; next {s}.", .{try upkeepDate(&f, upkeep_mod.addMonths(today, 12))}));
+    try f.rec.waitFor("BUTTONS Filters (the cooker hood, the air or water filters), every 3 months.");
+    // a reply with the day it was last done
+    const id = f.core.inbox.items.items[f.core.inbox.items.items.len - 1].id;
+    try expectHas(try f.core.command(a, try std.fmt.allocPrint(a, "/answer {d} {s}", .{ id, try upkeepDate(&f, today - 30) })), "");
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "Kept: Filters: every 3 months; next {s}.", .{try upkeepDate(&f, upkeep_mod.addMonths(today - 30, 3))}));
+    try f.rec.waitFor("BUTTONS Smoke alarm test, monthly");
+    try f.press("later");
+    // no car: its ones aren't offered
+    try f.rec.waitFor("That's the usual ones: 2 kept.");
+    try t.expectEqual(0, f.rec.count("Car service,"));
+    try expectHas(try f.core.command(a, "/setup"), "\nUpkeep: 2 kept. /setup upkeep offers the usual ones; /upkeep lists them.\nReorders: none. /setup reorder SHOP orders from a shop's MCP server, only when you tap.");
+    // again: only what isn't kept
+    try t.expectEqualStrings("", try f.core.command(a, "/setup upkeep"));
+    try f.rec.waitFor("BUTTONS Smoke alarm test, monthly");
+    try t.expectEqual(2, f.rec.count("BUTTONS Smoke alarm test"));
+}
+
+test "members_never_reach_upkeep_or_deliveries" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try joinMember(&f, "anna", 77);
+    _ = try f.core.command(a, "/upkeep add Boiler service every year");
+    const before = try f.core.command(a, "/upkeep");
+    try f.core.handleIncoming(fromAccount(77, "the boiler was serviced today"));
+    try f.core.handleIncoming(fromAccount(77, "track my DPD parcel 1000123456789U"));
+    try t.expectEqual(2, f.core.queue.items.len);
+    try t.expectEqualStrings(before, try f.core.command(a, "/upkeep"));
+    try expectHas(try f.core.command(a, "/deliveries"), "No parcels tracked.");
+    for ([_][]const u8{ "/upkeep", "/deliveries", "/setup upkeep" }) |cmd| try f.core.handleIncoming(fromAccount(77, cmd));
+    try t.expectEqual(3, f.rec.countIn("anna", "Commands are for the owner."));
 }

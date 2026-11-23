@@ -64,7 +64,11 @@ const Car = struct {
     fn call(c: *Car, a: std.mem.Allocator, name: []const u8, args: ?std.json.ObjectMap) ![]const u8 {
         const eql = std.mem.eql;
         if (c.tesla) return c.teslaCall(a, name, args);
-        if (eql(u8, name, "car_status")) return textResult(a, try std.fmt.allocPrint(a, "battery: 34%\nrange: 150 km\ncharging: {s}\nplugged in: yes\ncharge limit: 80%\nlocked: yes\ndata: from 5 minutes ago", .{if (c.charging) "yes" else "no"}), false);
+        if (eql(u8, name, "car_status")) {
+            // the file `odometer` of its folder, when there is one: its km
+            const odo = if (fileOf(c.io, a, "odometer")) |km| try std.fmt.allocPrint(a, "\nodometer: {s} km", .{std.mem.trim(u8, km, " \r\n")}) else "";
+            return textResult(a, try std.fmt.allocPrint(a, "battery: 34%\nrange: 150 km\ncharging: {s}\nplugged in: yes\ncharge limit: 80%\nlocked: yes{s}\ndata: from 5 minutes ago", .{ if (c.charging) "yes" else "no", odo }), false);
+        }
         if (!eql(u8, name, "car_command")) return textResult(a, "unknown tool", true);
         const cv = (args orelse return textResult(a, "say which command", true)).get("command") orelse return textResult(a, "say which command", true);
         const command = if (cv == .string) cv.string else "";
@@ -223,7 +227,7 @@ pub fn runHome(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.M
 
 /// carcloud's stand-in on stdio.
 pub fn runCar(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) u8 {
-    var car: Car = .{};
+    var car: Car = .{ .io = io };
     return serveAs(io, gpa, env, .{ .car = &car });
 }
 
