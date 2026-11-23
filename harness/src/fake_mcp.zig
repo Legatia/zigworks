@@ -147,7 +147,15 @@ pub const Header = struct { name: []const u8, value: []const u8 };
 /// (answers are event streams with a notification and a `ping` first),
 /// `old` (MCP 2025-03-26), `future` (a version harness doesn't speak),
 /// `token` (wants `Authorization: Bearer` with the token; a wrong one is
-/// refused and said back), `nostream` (no GET stream: 405); others 404.
+/// refused and said back), `nostream` (no GET stream: 405), `signin`
+/// (wants a token of the authorization server below; its 401 names its
+/// metadata) and `signin-hidden` (the same, its 401 names nothing); others
+/// 404. The authorization server (issuer `/auth`) serves its protected
+/// resource metadata, its RFC 8414 metadata (or, `setOpenIdOnly`, OpenID
+/// discovery's), registration, `/auth/authorize` (sends the browser back
+/// at once with a code, the state and iss) and `/auth/token` (checks the
+/// code's PKCE S256 verifier; a refresh gives new tokens and ends the
+/// old ones).
 /// The same tools and resources as on stdio; `echo` "notify:URI" says URI
 /// changed on the session's GET stream, "auth" says the Authorization it
 /// got, "pinged" whether the session answered a ping. A session is
@@ -170,6 +178,23 @@ pub const Http = struct {
     drop_epoch: std.atomic.Value(u32) = .init(0),
     /// The next POSTs' failure (under `mutex`).
     fail: Fail = .{},
+
+    // the authorization server (under `mutex`)
+    registered: std.atomic.Value(u32) = .init(0),
+    refreshes: std.atomic.Value(u32) = .init(0),
+    /// Codes exchanged with their verifier checked.
+    pkce_ok: std.atomic.Value(u32) = .init(0),
+    expires_in: i64 = 3600,
+    openid_only: bool = false,
+    clients: std.ArrayList(Client) = .empty,
+    codes: std.ArrayList(Code) = .empty,
+    tokens: std.ArrayList(Tok) = .empty,
+    /// The last /auth/authorize query, as it came.
+    last_authorize: std.ArrayList(u8) = .empty,
+
+    const Client = struct { id: []u8, redirect: []u8 };
+    const Code = struct { code: []u8, client: []u8, redirect: []u8, challenge: []u8, resource: []u8, scope: []u8, used: bool = false };
+    const Tok = struct { access: []u8, refresh: []u8, scope: []u8, access_ok: bool = true, refresh_ok: bool = true };
 
     const gpa = std.heap.page_allocator;
 
@@ -207,6 +232,16 @@ pub const Http = struct {
             gpa.destroy(s);
         }
         h.sessions.deinit(gpa);
+        for (h.clients.items) |x| {
+            gpa.free(x.id);
+            gpa.free(x.redirect);
+        }
+        h.clients.deinit(gpa);
+        for (h.codes.items) |x| for ([_][]u8{ x.code, x.client, x.redirect, x.challenge, x.resource, x.scope }) |y| gpa.free(y);
+        h.codes.deinit(gpa);
+        for (h.tokens.items) |x| for ([_][]u8{ x.access, x.refresh, x.scope }) |y| gpa.free(y);
+        h.tokens.deinit(gpa);
+        h.last_authorize.deinit(gpa);
     }
 
     /// The server forgets every session: the next request with one gets 404.
@@ -228,6 +263,48 @@ pub const Http = struct {
         h.fail = f;
     }
 
+    /// The tokens issued from now on expire in `seconds`.
+    pub fn setExpiresIn(h: *Http, seconds: i64) void {
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        h.expires_in = seconds;
+    }
+
+    /// Only OpenID discovery's metadata (no RFC 8414 document).
+    pub fn setOpenIdOnly(h: *Http, on: bool) void {
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        h.openid_only = on;
+    }
+
+    /// Every access token issued so far is refused (401).
+    pub fn expireTokens(h: *Http) void {
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        for (h.tokens.items) |*x| x.access_ok = false;
+    }
+
+    /// Every refresh token issued so far is refused.
+    pub fn revokeRefresh(h: *Http) void {
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        for (h.tokens.items) |*x| x.refresh_ok = false;
+    }
+
+    /// The last /auth/authorize query (in `a`).
+    pub fn lastAuthorize(h: *Http, a: std.mem.Allocator) ![]const u8 {
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        return a.dupe(u8, h.last_authorize.items);
+    }
+
+    fn validAccess(h: *Http, io: Io, token: []const u8) bool {
+        h.mutex.lockUncancelable(io);
+        defer h.mutex.unlock(io);
+        for (h.tokens.items) |x| if (x.access_ok and std.mem.eql(u8, x.access, token)) return true;
+        return false;
+    }
+
     /// How many sessions subscribed to `uri`.
     pub fn subscribedIn(h: *Http, uri: []const u8) u32 {
         h.mutex.lockUncancelable(h.io);
@@ -239,11 +316,13 @@ pub const Http = struct {
         return n;
     }
 
-    /// `/mcp/…` (and, for sign-ins, `/.well-known/…` and `/auth/…`).
-    pub fn handle(h: *Http, c: Ctx, a: std.mem.Allocator, req: *std.http.Server.Request, method: std.http.Method, route: []const u8, hs: []const Header, body: []const u8) !void {
+    /// `/mcp/…`, and for sign-ins `/.well-known/…` and `/auth/…`.
+    pub fn handle(h: *Http, c: Ctx, a: std.mem.Allocator, req: *std.http.Server.Request, method: std.http.Method, target: []const u8, hs: []const Header, body: []const u8) !void {
+        const route = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+        if (std.mem.startsWith(u8, route, "/.well-known/") or std.mem.startsWith(u8, route, "/auth/")) return h.authServer(c, a, req, method, target, route, body);
         if (!std.mem.startsWith(u8, route, "/mcp/")) return json(req, .not_found, "{}");
         const flavor = route["/mcp/".len..];
-        const known = [_][]const u8{ "json", "sse", "old", "future", "token", "nostream" };
+        const known = [_][]const u8{ "json", "sse", "old", "future", "token", "nostream", "signin", "signin-hidden" };
         for (known) |k| {
             if (std.mem.eql(u8, k, flavor)) break;
         } else return json(req, .not_found, "{\"error\":\"no such server\"}");
@@ -256,12 +335,33 @@ pub const Http = struct {
                     .{ .name = "www-authenticate", .value = "Bearer error=\"invalid_token\"" },
                 } });
         }
+        if (std.mem.startsWith(u8, flavor, "signin")) {
+            const got = header(hs, "authorization") orelse "";
+            if (!std.mem.startsWith(u8, got, "Bearer ") or !h.validAccess(c.io, got["Bearer ".len..])) {
+                const www = if (std.mem.eql(u8, flavor, "signin"))
+                    try std.fmt.allocPrint(a, "Bearer resource_metadata=\"http://127.0.0.1:{d}/.well-known/oauth-protected-resource/mcp/signin\"", .{c.port})
+                else
+                    "Bearer error=\"invalid_token\"";
+                return req.respond("{\"error\":\"invalid_token\"}", .{ .status = .unauthorized, .extra_headers = &.{
+                    .{ .name = "content-type", .value = "application/json" },
+                    .{ .name = "www-authenticate", .value = www },
+                } });
+            }
+        }
         return switch (method) {
             .POST => h.post(c, a, req, flavor, hs, body),
             .GET => h.stream(c, a, req, flavor, hs),
             .DELETE => h.delete(c, req, hs),
             else => json(req, .method_not_allowed, "{}"),
         };
+    }
+
+    fn authServer(h: *Http, c: Ctx, a: std.mem.Allocator, req: *std.http.Server.Request, method: std.http.Method, target: []const u8, route: []const u8, body: []const u8) !void {
+        return authServerImpl(h, c, a, req, method, target, route, body);
+    }
+
+    fn issue(h: *Http, c: Ctx, a: std.mem.Allocator, req: *std.http.Server.Request, scope: []const u8, expires: i64) !void {
+        return issueImpl(h, c, a, req, scope, expires);
     }
 
     fn takeFail(h: *Http, io: Io) ?Fail {
@@ -438,6 +538,171 @@ pub const Http = struct {
         return json(req, .ok, "{}");
     }
 };
+
+/// The authorization server's routes (see `Http`).
+fn authServerImpl(h: *Http, c: Ctx, a: std.mem.Allocator, req: *std.http.Server.Request, method: std.http.Method, target: []const u8, route: []const u8, body: []const u8) !void {
+    const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{c.port});
+    const issuer = try std.fmt.allocPrint(a, "{s}/auth", .{base});
+    const prm = "/.well-known/oauth-protected-resource/mcp/";
+    if (method == .GET and std.mem.startsWith(u8, route, prm)) {
+        const flavor = route[prm.len..];
+        if (!std.mem.eql(u8, flavor, "signin") and !std.mem.eql(u8, flavor, "signin-hidden")) return json(req, .not_found, "{}");
+        return json(req, .ok, try std.fmt.allocPrint(a, "{{\"resource\":\"{s}/mcp/{s}\",\"authorization_servers\":[\"{s}\"],\"scopes_supported\":[\"mcp.read\",\"mcp.write\"],\"bearer_methods_supported\":[\"header\"]}}", .{ base, flavor, issuer }));
+    }
+    const openid_only = blk: {
+        h.mutex.lockUncancelable(c.io);
+        defer h.mutex.unlock(c.io);
+        break :blk h.openid_only;
+    };
+    const metadata = try std.fmt.allocPrint(a, "{{\"issuer\":\"{s}\",\"authorization_endpoint\":\"{s}/authorize\",\"token_endpoint\":\"{s}/token\",\"registration_endpoint\":\"{s}/register\",\"response_types_supported\":[\"code\"],\"grant_types_supported\":[\"authorization_code\",\"refresh_token\"],\"code_challenge_methods_supported\":[\"S256\"],\"token_endpoint_auth_methods_supported\":[\"none\"]}}", .{ issuer, issuer, issuer, issuer });
+    if (method == .GET and std.mem.eql(u8, route, "/.well-known/oauth-authorization-server/auth")) return if (openid_only) json(req, .not_found, "{}") else json(req, .ok, metadata);
+    if (method == .GET and std.mem.eql(u8, route, "/auth/.well-known/openid-configuration")) return if (openid_only) json(req, .ok, metadata) else json(req, .not_found, "{}");
+    if (method == .POST and std.mem.eql(u8, route, "/auth/register")) {
+        const v = jv.parse(a, body) orelse return json(req, .bad_request, "{\"error\":\"invalid_client_metadata\"}");
+        const redirect = jv.str(jv.at(v, &.{ "redirect_uris", "0" })) orelse return json(req, .bad_request, "{\"error\":\"invalid_redirect_uri\"}");
+        const id = blk: {
+            h.mutex.lockUncancelable(c.io);
+            defer h.mutex.unlock(c.io);
+            const id = try std.fmt.allocPrint(Http.gpa, "client-{d}", .{h.clients.items.len + 1});
+            try h.clients.append(Http.gpa, .{ .id = id, .redirect = try Http.gpa.dupe(u8, redirect) });
+            break :blk try a.dupe(u8, id);
+        };
+        _ = h.registered.fetchAdd(1, .acq_rel);
+        return req.respond(try std.fmt.allocPrint(a, "{{\"client_id\":\"{s}\",\"redirect_uris\":[{f}],\"token_endpoint_auth_method\":\"none\",\"grant_types\":[\"authorization_code\",\"refresh_token\"],\"response_types\":[\"code\"]}}", .{ id, std.json.fmt(redirect, .{}) }), .{ .status = .created, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
+    }
+    if (method == .GET and std.mem.eql(u8, route, "/auth/authorize")) {
+        const query = target[@min(route.len + 1, target.len)..];
+        {
+            h.mutex.lockUncancelable(c.io);
+            defer h.mutex.unlock(c.io);
+            h.last_authorize.clearRetainingCapacity();
+            try h.last_authorize.appendSlice(Http.gpa, query);
+        }
+        const client = try param(a, query, "client_id") orelse "";
+        const redirect = try param(a, query, "redirect_uri") orelse "";
+        const challenge = try param(a, query, "code_challenge") orelse "";
+        const state = try param(a, query, "state") orelse "";
+        const res_uri = try param(a, query, "resource") orelse "";
+        const scope = try param(a, query, "scope") orelse "";
+        const why: ?[]const u8 = blk: {
+            if (!std.mem.eql(u8, try param(a, query, "response_type") orelse "", "code")) break :blk "response_type is not code";
+            if (!std.mem.eql(u8, try param(a, query, "code_challenge_method") orelse "", "S256") or challenge.len != 43) break :blk "no S256 code challenge";
+            if (state.len == 0) break :blk "no state";
+            if (!std.mem.startsWith(u8, res_uri, base) or !std.mem.startsWith(u8, res_uri[base.len..], "/mcp/signin")) break :blk "not a resource of this server";
+            const known = known: {
+                if (std.mem.eql(u8, client, "fixed-client")) break :known std.mem.startsWith(u8, redirect, "http://127.0.0.1:") and std.mem.endsWith(u8, redirect, "/callback");
+                h.mutex.lockUncancelable(c.io);
+                defer h.mutex.unlock(c.io);
+                for (h.clients.items) |cl| if (std.mem.eql(u8, cl.id, client)) break :known std.mem.eql(u8, cl.redirect, redirect);
+                break :known false;
+            };
+            if (!known) break :blk "unknown client or redirect_uri";
+            break :blk null;
+        };
+        if (why) |w| return req.respond(try std.fmt.allocPrint(a, "bad request: {s}\n", .{w}), .{ .status = .bad_request, .extra_headers = &.{.{ .name = "content-type", .value = "text/plain" }} });
+        var raw: [6]u8 = undefined;
+        c.io.random(&raw);
+        const code = try std.fmt.allocPrint(Http.gpa, "code-{x}", .{raw});
+        {
+            h.mutex.lockUncancelable(c.io);
+            defer h.mutex.unlock(c.io);
+            try h.codes.append(Http.gpa, .{ .code = code, .client = try Http.gpa.dupe(u8, client), .redirect = try Http.gpa.dupe(u8, redirect), .challenge = try Http.gpa.dupe(u8, challenge), .resource = try Http.gpa.dupe(u8, res_uri), .scope = try Http.gpa.dupe(u8, scope) });
+        }
+        const location = try std.fmt.allocPrint(a, "{s}?code={s}&state={s}&iss={s}", .{ redirect, code, try escape(a, state), try escape(a, issuer) });
+        return req.respond("", .{ .status = .found, .extra_headers = &.{.{ .name = "location", .value = location }} });
+    }
+    if (method == .POST and std.mem.eql(u8, route, "/auth/token")) {
+        const grant = try param(a, body, "grant_type") orelse "";
+        const expires = blk: {
+            h.mutex.lockUncancelable(c.io);
+            defer h.mutex.unlock(c.io);
+            break :blk h.expires_in;
+        };
+        if (std.mem.eql(u8, grant, "authorization_code")) {
+            const code = try param(a, body, "code") orelse "";
+            const verifier = try param(a, body, "code_verifier") orelse "";
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
+            var want: [43]u8 = undefined;
+            _ = std.base64.url_safe_no_pad.Encoder.encode(&want, &digest);
+            h.mutex.lockUncancelable(c.io);
+            defer h.mutex.unlock(c.io);
+            for (h.codes.items) |*cd| {
+                if (cd.used or !std.mem.eql(u8, cd.code, code)) continue;
+                cd.used = true;
+                if (!std.mem.eql(u8, try param(a, body, "client_id") orelse "", cd.client)) return grantError(req, "client_id is not the code's");
+                if (!std.mem.eql(u8, try param(a, body, "redirect_uri") orelse "", cd.redirect)) return grantError(req, "redirect_uri is not the code's");
+                if (!std.mem.eql(u8, try param(a, body, "resource") orelse "", cd.resource)) return grantError(req, "resource is not the code's");
+                if (!std.mem.eql(u8, &want, cd.challenge)) return grantError(req, "PKCE check failed");
+                _ = h.pkce_ok.fetchAdd(1, .acq_rel);
+                return h.issue(c, a, req, cd.scope, expires);
+            }
+            return grantError(req, "unknown or used code");
+        }
+        if (std.mem.eql(u8, grant, "refresh_token")) {
+            const refresh = try param(a, body, "refresh_token") orelse "";
+            h.mutex.lockUncancelable(c.io);
+            defer h.mutex.unlock(c.io);
+            for (h.tokens.items) |*x| {
+                if (!x.refresh_ok or !std.mem.eql(u8, x.refresh, refresh)) continue;
+                x.refresh_ok = false;
+                x.access_ok = false;
+                _ = h.refreshes.fetchAdd(1, .acq_rel);
+                return h.issue(c, a, req, x.scope, expires);
+            }
+            return grantError(req, "unknown refresh token");
+        }
+        return req.respond("{\"error\":\"unsupported_grant_type\"}", .{ .status = .bad_request, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
+    }
+    return json(req, .not_found, "{}");
+}
+
+/// New tokens (under `mutex`).
+fn issueImpl(h: *Http, c: Ctx, a: std.mem.Allocator, req: *std.http.Server.Request, scope: []const u8, expires: i64) !void {
+    var raw: [6]u8 = undefined;
+    c.io.random(&raw);
+    const n = h.tokens.items.len + 1;
+    const access = try std.fmt.allocPrint(Http.gpa, "fake-access-{d}-{x}", .{ n, raw });
+    const refresh = try std.fmt.allocPrint(Http.gpa, "fake-refresh-{d}-{x}", .{ n, raw });
+    try h.tokens.append(Http.gpa, .{ .access = access, .refresh = refresh, .scope = try Http.gpa.dupe(u8, scope) });
+    return json(req, .ok, try std.fmt.allocPrint(a, "{{\"access_token\":\"{s}\",\"token_type\":\"Bearer\",\"expires_in\":{d},\"refresh_token\":\"{s}\",\"scope\":{f}}}", .{ access, expires, refresh, std.json.fmt(scope, .{}) }));
+}
+
+fn grantError(req: *std.http.Server.Request, why: []const u8) !void {
+    var buf: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(&buf, "{{\"error\":\"invalid_grant\",\"error_description\":\"{s}\"}}", .{why}) catch "{\"error\":\"invalid_grant\"}";
+    return req.respond(body, .{ .status = .bad_request, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
+}
+
+/// A form's or query's parameter, decoded; null when absent.
+fn param(a: std.mem.Allocator, form: []const u8, name: []const u8) !?[]const u8 {
+    var it = std.mem.splitScalar(u8, form, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+        if (!std.mem.eql(u8, pair[0..eq], name)) continue;
+        const raw = if (eq < pair.len) pair[eq + 1 ..] else "";
+        var out: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < raw.len) : (i += 1) {
+            if (raw[i] == '+') {
+                try out.append(a, ' ');
+            } else if (raw[i] == '%' and i + 2 < raw.len and std.ascii.isHex(raw[i + 1]) and std.ascii.isHex(raw[i + 2])) {
+                try out.append(a, (std.fmt.charToDigit(raw[i + 1], 16) catch 0) * 16 + (std.fmt.charToDigit(raw[i + 2], 16) catch 0));
+                i += 2;
+            } else try out.append(a, raw[i]);
+        }
+        return out.items;
+    }
+    return null;
+}
+
+fn escape(a: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (s) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '.' or ch == '_' or ch == '~') try out.append(a, ch) else try out.print(a, "%{X:0>2}", .{ch});
+    }
+    return out.items;
+}
 
 /// A header's value (the first of that name, any case).
 pub fn header(hs: []const Header, name: []const u8) ?[]const u8 {

@@ -2660,7 +2660,7 @@ pub const Core = struct {
         srv: ?*mcp.Server = null,
         err: anyerror = error.NotStarted,
         diag: mcp.Diag = .{},
-        /// A server at a url: its token.
+        /// A server at a url: its token or its sign-in.
         auth: mcp.Auth = .none,
 
         fn run(st: *McpStart) void {
@@ -2730,11 +2730,23 @@ pub const Core = struct {
                 break;
             };
             if (st.skipped != null) continue;
-            // a server at a url: its stored token
-            if (mcp.kindOf(sc) == .token) st.auth = .{ .token = .{ .name = sc.token, .value = c.secretValue(a, sc.token) orelse {
-                st.skipped = std.fmt.allocPrint(a, "token \"{s}\" is not stored (harness secret add {s})", .{ sc.token, sc.token }) catch "its token is not stored";
-                continue;
-            } } };
+            // a server at a url: its stored token, or its sign-in
+            switch (mcp.kindOf(sc)) {
+                .token => st.auth = .{ .token = .{ .name = sc.token, .value = c.secretValue(a, sc.token) orelse {
+                    st.skipped = std.fmt.allocPrint(a, "token \"{s}\" is not stored (harness secret add {s})", .{ sc.token, sc.token }) catch "its token is not stored";
+                    continue;
+                } } },
+                .signin => {
+                    var nb: [40]u8 = undefined;
+                    const signed = if (c.store) |store| (store.get(c.io, a, mcp.signinSecret(&nb, sc.name)) catch null) != null else false;
+                    if (!signed) {
+                        st.skipped = std.fmt.allocPrint(a, "not signed in (harness mcp login {s})", .{sc.name}) catch "not signed in";
+                        continue;
+                    }
+                    st.auth = .{ .signin = .{ .store = c.store.?, .masks = &c.masks } };
+                },
+                else => {},
+            }
             st.values = values;
             st.dir = c.mcpDir(a, sc.name) catch |e| {
                 st.skipped = std.fmt.allocPrint(a, "did not start (its folder: {s})", .{@errorName(e)}) catch "did not start";
@@ -2794,6 +2806,20 @@ pub const Core = struct {
         c.mcp_tools = all.items;
         c.mcp_note = note.items;
         c.mcp_warn = warn.items;
+    }
+
+    /// What /status says of the MCP servers: what started, and the
+    /// servers at a url whose sign-in was refused since.
+    fn mcpStatus(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, std.mem.trimEnd(u8, c.mcp_note, "\n"));
+        c.mcp_mutex.lockUncancelable(c.io);
+        defer c.mcp_mutex.unlock(c.io);
+        for (c.mcp_servers.items) |srv| if (srv.signInRefused()) {
+            if (out.items.len > 0) try out.append(a, '\n');
+            try out.print(a, "{s}: the sign-in was refused (harness mcp login {s})", .{ srv.name, srv.name });
+        };
+        return out.items;
     }
 
     /// A client for a model value: "PROVIDER:MODEL", or a model of
@@ -5688,6 +5714,7 @@ pub const Core = struct {
             // folders that got no snapshot, and why
             var snap_note = std.mem.trimEnd(u8, try c.snaps.note(a), "\n");
             snap_note = try std.mem.replaceOwned(u8, a, snap_note, "\n", "; ");
+            const mcp_text = try c.mcpStatus(a);
             return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.\nProviders: {s}.{s}{s}{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
                 onOff(c.switches.auto_recall.load(.acquire)), onOff(c.convPrivate(conv)),
@@ -5695,8 +5722,8 @@ pub const Core = struct {
                 if (c.browser.len == 0) "none found" else "found",
                 c.login_list.len,
                 try c.providers.describe(a, &.{ c.cfg.model.model, c.cfg.model.worker_model, c.cfg.model.memory_model }),
-                if (c.mcp_note.len > 0) "\nMCP: " else "",
-                std.mem.trimEnd(u8, c.mcp_note, "\n"),
+                if (mcp_text.len > 0) "\nMCP: " else "",
+                mcp_text,
                 if (snap_note.len > 0) "\nSnapshots: " else "",
                 snap_note,
             });
@@ -10214,6 +10241,53 @@ test "token_and_headers_are_sent_and_never_logged" {
     // in no log line, no item, no message
     try t.expect(std.mem.indexOf(u8, try logText(&f), token) == null);
     try t.expectEqual(0, f.rec.count(token));
+}
+
+test "a_sign_in_server_starts_signed_in_and_status_says_when_not" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const oauth = @import("oauth.zig");
+    const fake = @import("fake.zig");
+    f.core.store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    const server = try std.fmt.allocPrint(a, "{s}/mcp/signin", .{try f.e.url()});
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[cloud]\nurl = {s}\nlogin = oauth\n", .{server}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp cloud/echo *\n" });
+    // not signed in: not started, and /status says what to do
+    _ = try f.core.reload();
+    try f.core.handleText("/status");
+    try f.rec.waitFor("cloud: not signed in (harness mcp login cloud)");
+    // signed in from the terminal, then /reload
+    var b: fake.Browser = .{ .io = t.io };
+    var said: []const u8 = "";
+    const tokens = try oauth.login(t.allocator, t.io, a, .{ .name = "cloud", .url = server, .link = .{ .ctx = &b, .f = fake.Browser.opened } }, &said);
+    b.join();
+    try oauth.save(t.io, t.allocator, f.core.store.?, "mcp-cloud", tokens);
+    _ = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "cloud (3 tools)") != null);
+    // the token it says back is masked in what the model sees
+    try f.e.script(1, model.toolReply("tu_1", "cloud__echo", "{\"text\":\"auth\"}"));
+    try f.e.script(2, model.textReply("seen"));
+    try f.core.startWorker();
+    try f.core.handleText("what does it get");
+    try f.rec.waitFor("seen");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "Bearer [secret:mcp-cloud]") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), tokens.access_token) == null);
+    // refused (the refresh token too): said in the call, and in /status
+    f.e.server.mcp.revokeRefresh();
+    f.e.server.mcp.expireTokens();
+    try f.e.script(3, model.toolReply("tu_2", "cloud__echo", "{\"text\":\"again\"}"));
+    try f.e.script(4, model.textReply("refused"));
+    try f.core.handleText("once more");
+    try f.rec.waitFor("refused");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "cloud refused the sign-in: harness mcp login cloud") != null);
+    try f.core.handleText("/status");
+    try f.rec.waitFor("cloud: the sign-in was refused (harness mcp login cloud)");
+    // no token in the log
+    const log = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, log, tokens.access_token) == null);
+    try t.expect(std.mem.indexOf(u8, log, tokens.refresh_token) == null);
 }
 
 test "reload_holds_no_lock_while_servers_start_and_stop_cuts_it_short" {

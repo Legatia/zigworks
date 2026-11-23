@@ -2062,6 +2062,7 @@ test {
     _ = @import("agents.zig");
     _ = @import("mcp.zig");
     _ = @import("mcp_http.zig");
+    _ = @import("oauth.zig");
     _ = @import("page.zig");
     _ = @import("totp.zig");
     _ = @import("logins.zig");

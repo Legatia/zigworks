@@ -363,7 +363,8 @@ fn items(arena: std.mem.Allocator, value: []const u8) error{ BadConfig, OutOfMem
     return out.items;
 }
 
-fn validName(name: []const u8) bool {
+/// A server's name: a-z, 0-9, - and _, up to 32, no "__".
+pub fn validName(name: []const u8) bool {
     if (name.len == 0 or name.len > 32 or std.mem.indexOf(u8, name, "__") != null) return false;
     for (name) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_' or c == '-')) return false;
     return true;
@@ -809,6 +810,13 @@ pub const Server = struct {
     pub fn alive(s: *const Server) bool {
         if (s.remote != null) return true;
         return !s.eof.load(.acquire);
+    }
+
+    /// A server at a url whose sign-in was refused since it started
+    /// (`harness mcp login NAME` mends it).
+    pub fn signInRefused(s: *const Server) bool {
+        const r = s.remote orelse return false;
+        return r.signInRefused();
     }
 
     /// The end of what the server wrote to stderr ("" for a server at a

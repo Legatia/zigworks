@@ -26,6 +26,9 @@ const url_mod = @import("url.zig");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
 const scrub = @import("scrub.zig");
+const oauth = @import("oauth.zig");
+const store_mod = @import("store.zig");
+const masks_mod = @import("masks.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -45,8 +48,13 @@ pub const Auth = union(enum) {
     none,
     /// `token =`: a stored secret sent as `Authorization: Bearer`.
     token: Token,
+    /// `login = oauth`: the sign-in kept in the store as `mcp-NAME`
+    /// (`harness mcp login NAME`), renewed and kept there; its values are
+    /// added to `masks`.
+    signin: SignIn,
 
     pub const Token = struct { name: []const u8, value: []const u8 };
+    pub const SignIn = struct { store: store_mod.Store, masks: ?*masks_mod.List = null };
 };
 
 /// Told a resource the server was asked to watch changed. Called on the
@@ -88,6 +96,8 @@ pub const Remote = struct {
     path: []const u8,
     headers: []const std.http.Header,
     auth: Auth,
+    /// A sign-in's tokens (`auth` is .signin).
+    keeper: ?*oauth.Keeper = null,
     updated: ?Updated,
     backoff_ms: u32,
 
@@ -126,7 +136,8 @@ pub const Remote = struct {
     why_len: usize = 0,
     why_err: anyerror = error.Refused,
 
-    pub fn open(gpa: Allocator, io: Io, o: Options) error{ OutOfMemory, BadUrl }!*Remote {
+    /// error.NotSignedIn for a sign-in with nothing kept.
+    pub fn open(gpa: Allocator, io: Io, o: Options) !*Remote {
         // made here, then moved into the Remote (`a` is not used after)
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
         errdefer arena_state.deinit();
@@ -138,8 +149,16 @@ pub const Remote = struct {
         const name = try a.dupe(u8, o.name);
         const auth: Auth = switch (o.auth) {
             .token => |tk| .{ .token = .{ .name = try a.dupe(u8, tk.name), .value = try a.dupe(u8, tk.value) } },
-            else => o.auth,
+            .signin => |si| .{ .signin = .{ .store = try storeCopy(a, si.store), .masks = si.masks } },
+            .none => .none,
         };
+        var keeper: ?*oauth.Keeper = null;
+        if (auth == .signin) {
+            var buf: [40]u8 = undefined;
+            const secret = std.fmt.bufPrint(&buf, "mcp-{s}", .{o.name}) catch return error.BadUrl;
+            keeper = try oauth.Keeper.open(gpa, io, auth.signin.store, o.name, secret, auth.signin.masks);
+        }
+        errdefer if (keeper) |k| k.destroy();
         const r = try gpa.create(Remote);
         r.* = .{
             .gpa = gpa,
@@ -151,6 +170,7 @@ pub const Remote = struct {
             .path = u.target,
             .headers = hs,
             .auth = auth,
+            .keeper = keeper,
             .updated = o.updated,
             .backoff_ms = @max(o.backoff_ms, 10),
             .post = .init(gpa, io, target),
@@ -190,6 +210,7 @@ pub const Remote = struct {
         r.side.deinit();
         for (r.subscribed.items) |u| r.gpa.free(u);
         r.subscribed.deinit(r.gpa);
+        if (r.keeper) |k| k.destroy();
         r.arena_state.deinit();
         r.gpa.destroy(r);
     }
@@ -213,8 +234,8 @@ pub const Remote = struct {
     /// Whether the server refused the sign-in since it started (for
     /// /status).
     pub fn signInRefused(r: *const Remote) bool {
-        _ = r;
-        return false;
+        const k = r.keeper orelse return false;
+        return k.refused();
     }
 
     /// `text` with the server's token, or its sign-in's values, masked.
@@ -223,6 +244,7 @@ pub const Remote = struct {
         switch (r.auth) {
             .none => {},
             .token => |tk| try list.append(arena, .{ .name = tk.name, .value = tk.value }),
+            .signin => if (r.keeper) |k| try list.appendSlice(arena, try k.secrets(arena)),
         }
         if (list.items.len == 0) return text;
         var s = try scrub.Scrubber.init(arena, list.items);
@@ -319,10 +341,10 @@ pub const Remote = struct {
     /// The token to send now: the stored one, or the sign-in's (renewed
     /// first when it is about to expire).
     fn bearerNow(r: *Remote, a: Allocator) error{OutOfMemory}!?[]const u8 {
-        _ = a;
         return switch (r.auth) {
             .none => null,
             .token => |tk| tk.value,
+            .signin => if (r.keeper) |k| try k.bearer(a) else null,
         };
     }
 
@@ -346,6 +368,7 @@ pub const Remote = struct {
         const body = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":{f},\"params\":{s}}}", .{ id, std.json.fmt(method, .{}), params_json });
         const initializing = std.mem.eql(u8, method, "initialize");
         var restarted = !may_restart;
+        var renewed = false;
         var limited = false;
         var connect_retry = false;
         while (true) {
@@ -375,7 +398,14 @@ pub const Remote = struct {
                         try r.restart(arena, stop, deadline_ns);
                         continue;
                     } else return r.statusFailure(arena, st),
-                    401 => return r.refused(),
+                    401 => {
+                        // a sign-in: renewed once (or one made since taken)
+                        if (!renewed) if (r.keeper) |k| {
+                            renewed = true;
+                            if (k.renew(arena, bearer orelse "")) continue;
+                        };
+                        return r.refused();
+                    },
                     429 => {
                         if (!limited) {
                             limited = true;
@@ -390,6 +420,7 @@ pub const Remote = struct {
     }
 
     fn notifyLocked(r: *Remote, arena: Allocator, json: []const u8, stop: *const std.atomic.Value(bool), deadline_ns: i128) Error!void {
+        var renewed = false;
         var connect_retry = false;
         while (true) {
             const bearer = try r.bearerNow(arena);
@@ -404,7 +435,13 @@ pub const Remote = struct {
                     return r.unreached(e);
                 },
                 .status => |st| switch (st.code) {
-                    401 => return r.refused(),
+                    401 => {
+                        if (!renewed) if (r.keeper) |k| {
+                            renewed = true;
+                            if (k.renew(arena, bearer orelse "")) continue;
+                        };
+                        return r.refused();
+                    },
                     else => return r.statusFailure(arena, st),
                 },
             }
@@ -626,6 +663,10 @@ pub const Remote = struct {
     fn refused(r: *Remote) Error {
         return switch (r.auth) {
             .token => |tk| r.say(error.Refused, "{s} refused the token stored as {s}: store the right one with harness secret add {s}", .{ r.name, tk.name, tk.name }),
+            .signin => blk: {
+                if (r.keeper) |k| k.markRefused();
+                break :blk r.say(error.Refused, "{s} refused the sign-in: harness mcp login {s}", .{ r.name, r.name });
+            },
             .none => r.say(error.Refused, "{s} needs a sign-in: add login = oauth to [{s}] in mcp.ini, then harness mcp login {s} (or token = a stored secret)", .{ r.name, r.name, r.name }),
         };
     }
@@ -715,6 +756,10 @@ pub const Remote = struct {
                 if (st.session.len > 0) r.session_gone.store(true, .release);
                 return .failed;
             },
+            401 => {
+                if (r.keeper) |k| _ = k.renew(a, bearer orelse "");
+                return .failed;
+            },
             else => return .failed,
         }
         if (!startsWithIgnoreCase(resp.contentType(), "text/event-stream")) return .failed;
@@ -739,6 +784,15 @@ pub const Remote = struct {
         return .{ .ended = sse.retry_ms };
     }
 };
+
+/// A store whose name or folder is in `a`.
+fn storeCopy(a: Allocator, st: store_mod.Store) !store_mod.Store {
+    return switch (st) {
+        .dir => |d| .{ .dir = try a.dupe(u8, d) },
+        .keychain => |ns| .{ .keychain = try a.dupe(u8, ns) },
+        .wincred => |ns| .{ .wincred = try a.dupe(u8, ns) },
+    };
+}
 
 /// The JSON-RPC response with id `id` in `text` (an object, or a batch
 /// of them); null when it isn't there.

@@ -292,6 +292,18 @@ pub const Listener = struct {
         return h;
     }
 
+    /// `accept`, waiting at most `timeout_ms`; null when the time is up or
+    /// `stop` is set first.
+    pub fn acceptWithin(l: Listener, io: Io, timeout_ms: u32, stop: ?*const std.atomic.Value(bool)) !?Handle {
+        const end = nowNs(io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
+        while (true) {
+            if (stopped(stop)) return null;
+            const left: i64 = @intCast(@divFloor(end - nowNs(io), std.time.ns_per_ms));
+            if (left <= 0) return null;
+            if (try sys.poll(l.handle, .in, @intCast(@max(@min(left, 100), 1)))) return try l.accept();
+        }
+    }
+
     pub fn close(l: Listener) void {
         sys.close(l.handle);
     }
@@ -681,6 +693,22 @@ const winsock = struct {
         return got;
     }
 };
+
+test "a_listener_waits_for_a_connection_only_so_long" {
+    const l = try Listener.openExclusive(0);
+    defer l.close();
+    const t0 = nowNs(std.testing.io);
+    try std.testing.expectEqual(null, try l.acceptWithin(std.testing.io, 150, null));
+    const took_ms = @divFloor(nowNs(std.testing.io) - t0, std.time.ns_per_ms);
+    if (took_ms < 100 or took_ms > 2000) std.debug.print("a wait of 150 ms took {d} ms\n", .{took_ms});
+    try std.testing.expect(took_ms >= 100 and took_ms < 2000);
+    const there = try connect(std.testing.io, "127.0.0.1", l.port, 1000);
+    defer closeHandle(there);
+    const here = (try l.acceptWithin(std.testing.io, 2000, null)) orelse return error.TestUnexpectedResult;
+    closeHandle(here);
+    var stop: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectEqual(null, try l.acceptWithin(std.testing.io, 5000, &stop));
+}
 
 test "an_accepted_connection_sends_small_writes_at_once" {
     // A stream of tokens is many small writes. Held back until the other
