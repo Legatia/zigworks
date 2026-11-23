@@ -501,7 +501,7 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
 }
 
 /// "30s", "5m", "1h", "2d" in seconds.
-fn parseDuration(v: []const u8) ?u32 {
+pub fn parseDuration(v: []const u8) ?u32 {
     if (v.len < 2) return null;
     const n = std.fmt.parseInt(u32, v[0 .. v.len - 1], 10) catch return null;
     if (n == 0) return null;
@@ -939,7 +939,7 @@ fn when(a: Allocator, tr: Trigger, capital: bool) ![]const u8 {
 }
 
 /// `title has "release" or "rc"`, `move > 3`.
-fn condText(a: Allocator, c: Cond) ![]const u8 {
+pub fn condText(a: Allocator, c: Cond) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     const op: []const u8 = switch (c.op) {
         .has => "has",
