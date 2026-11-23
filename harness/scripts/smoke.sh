@@ -143,6 +143,8 @@ auth = none
 provider = whisper
 model = large-v3-turbo
 language = pl
+[voice_agent]
+listen = 127.0.0.1:0
 EOF
 printf 'allow shell sleep *\nallow mcp fake/echo *\n' >"$HARNESS_HOME/rules"
 # shop: the same server, its echo a money tool capped at 10 a call
@@ -227,6 +229,9 @@ check "a feed trigger's run answers with the new item as data" '"$H" trigger run
 printf '{"data":{"amount":"104"}}' >"$S/pages/btc.json"
 check "a page say sends with no model request" 'n0=$(ls "$S/requests" | wc -l) && "$H" trigger run btc 2>/dev/null | grep -qF "[btc] BTC 104 (+4.0%)" && [ "$(ls "$S/requests" | wc -l)" = "$n0" ]'
 
+# Home Assistant's voice agent: its token stored, on a free port of 127.0.0.1
+HATOKEN=ha-agent-smoke-token-1
+printf '%s\n' "$HATOKEN" | "$H" secret add ha-agent --stdin 2>/dev/null
 "$H" run >"$T/run.out" 2>&1 &
 RPID=$!
 wait_for "$T/run.out" "running on" 5
@@ -248,6 +253,17 @@ check "the member joins with it from their own chat" 'wait_for "$OUT" "Hi Anna, 
 reply "$(text_reply 'The hall light is off.')"
 inbox "{\"message\":{\"from\":{\"id\":77},\"chat\":{\"id\":77,\"type\":\"private\"},\"text\":\"is the hall light on?\"}}"
 check "a member is answered in their own chat, as member:anna" 'wait_for "$OUT" "The hall light is off." && grep -F "The hall light is off." "$OUT" | grep -qF "\"chat_id\":77" && grep -qF "\"by\":\"member:anna\"" "$HARNESS_HOME/log/actions.jsonl" && grep -qF "From: Anna (member:anna)" "$(req)"'
+
+# someone speaks in the kitchen: Home Assistant (harness-fake --ha) asks the voice agent
+wait_for "$HARNESS_HOME/log/actions.jsonl" "\"event\":\"voice agent listening\"" 10
+VPORT=$(grep -o '"event":"voice agent listening","address":"127[.]0[.]0[.]1:[0-9]*"' "$HARNESS_HOME/log/actions.jsonl" | tail -n 1 | sed 's/.*://; s/"//')
+HA_SAID='{"model":"harness","messages":[{"role":"system","content":"You are a voice assistant for Home Assistant.\nRoom: Kitchen\nLanguage: en"},{"role":"user","content":"is the back door closed?"}]}'
+reply "$(text_reply '**Yes**, the back door is closed.')"
+"$F" --ha "http://127.0.0.1:$VPORT/v1/chat/completions" "$HATOKEN" "$HA_SAID" >"$T/ha-said.out" 2>&1
+check "Home Assistant's request is answered for the ear, as room:kitchen" 'head -n 1 "$T/ha-said.out" | grep -qxF 200 && grep -qF "\"content\":\"Yes, the back door is closed.\"" "$T/ha-said.out" && grep -qF "\"conversation\":\"home\",\"run\":\"speech\",\"by\":\"room:kitchen\"" "$HARNESS_HOME/log/actions.jsonl" && grep -qF "Room: Kitchen." "$(req)"'
+n_req=$(ls "$S/requests" | wc -l)
+"$F" --ha "http://127.0.0.1:$VPORT/v1/chat/completions" "wrong-token-for-the-smoke" "$HA_SAID" >"$T/ha-wrong.out" 2>&1
+check "a request with another token is refused, unheard" 'head -n 1 "$T/ha-wrong.out" | grep -qxF 401 && [ "$(ls "$S/requests" | wc -l)" = "$n_req" ] && ! grep -qF "$HATOKEN" "$HARNESS_HOME/log/actions.jsonl"'
 
 reply "$(tool_reply tu_1 'echo smoke-ran')"
 reply "$(text_reply 'done: smoke-ran')"

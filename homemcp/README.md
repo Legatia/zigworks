@@ -6,6 +6,7 @@ the agent may see and, for each one, what it may do. Locks, alarms and
 valves go through a separate tool that the client asks a person about every
 time. After every action homemcp reads the device back and says whether it
 took. Changes in the home are pushed to the client as MCP resource updates.
+`announce` says a short message aloud on the speakers the home file allows.
 
 ```
 agent ◀─MCP, stdio─▶ homemcp ──MQTT──────────▶ Zigbee2MQTT ──▶ devices
@@ -17,9 +18,10 @@ macOS, Linux and Windows. One binary, nothing beyond the Zig standard
 library (and libc on macOS). Secrets come from the environment, never from
 the home file.
 
-**State: 0.2.0, tested against its own stand-in, `homemcp-sim`, and never
-with a real hub or device.** The tests cover Home Assistant's REST and
-WebSocket APIs, and Zigbee2MQTT over MQTT. 0.2.0 ran on macOS, where the
+**State: 0.2.0 and `announce`, tested against its own stand-in,
+`homemcp-sim`, and never with a real hub, device or speaker.** The tests
+cover Home Assistant's REST and WebSocket APIs (`announce` against the
+stand-in's voice satellite and media player), and Zigbee2MQTT over MQTT. 0.2.0 ran on macOS, where the
 Zigbee2MQTT checks ran against a small stand-in broker, not Mosquitto; it is
 built for Linux and Windows but not yet run there. 0.1.0 passed on Linux and
 on Windows with Mosquitto. homemcp 0.1.0 has also been run under
@@ -37,7 +39,7 @@ WebSocket):
 $ zig build -Doptimize=ReleaseSafe
 $ ./zig-out/bin/homemcp-sim ha 8123 not-a-real-token &
 $ HA_TOKEN=not-a-real-token ./zig-out/bin/homemcp check examples/ha.ini
-The flat (made up by homemcp-sim): 14 devices in 5 rooms. Home Assistant at http://127.0.0.1:8123.
+The flat (made up by homemcp-sim): 15 devices in 5 rooms. Home Assistant at http://127.0.0.1:8123.
 Changes come in as they happen (Home Assistant's WebSocket API).
 Living room
   living_room_light (light.living_room, light; also called: the big light): off; may: on, off, brightness
@@ -46,12 +48,13 @@ Bedroom
   ceiling_fan (fan.ceiling_fan, fan): off; may: on, off, speed
 Kitchen
   kettle (switch.kettle, plug): off, 0 W; may: off
-  kitchen_speaker (media_player.kitchen_speaker, media): idle, volume 20%; may: play, pause, volume
+  kitchen_speaker (media_player.kitchen_speaker, media): idle, volume 20%; may: play, pause, volume, announce
   water_main (valve.water_main, valve, guarded): open; may: close
   back_door (binary_sensor.back_door, sensor): closed; may: nothing (only seen)
   sink_leak (binary_sensor.sink_leak, sensor): dry; may: nothing (only seen)
 Hall
   thermostat (climate.hall, climate; also called: the heating): 19.5 °C, set to 20 °C, mode heat, heating; may: temperature, mode
+  hall_voice (assist_satellite.hall_voice, satellite): idle; may: announce
   front_door (lock.front_door, lock, guarded): locked; may: lock
   hall_motion (binary_sensor.hall_motion, sensor): nobody there; may: nothing (only seen)
 Garage
@@ -59,6 +62,7 @@ Garage
 No room
   evening (scene.evening, scene): not run since Home Assistant started; may: activate
   leaving (scene.leaving, scene, guarded): not run since Home Assistant started; may: activate
+Speakers that may announce: kitchen_speaker (Kitchen, through tts.piper), hall_voice (Hall).
 People: anna (person.anna) is home, ben (person.ben) is away.
 ```
 
@@ -85,6 +89,7 @@ any of `occupancy`, `contact`, `available`, `temperature`, `locked`,
 | `home_set` | One action on an ordinary device: a light (on, off, brightness, colour, colour temperature), switch, plug, thermostat, cover, fan, scene, speaker. |
 | `home_guarded` | One action on a guarded device: locks, alarms, valves, and anything else marked `guarded = yes`. It carries `_meta["anthropic/requiresUserInteraction"]: true` and `destructiveHint`, so clients that honour them ask a person every time. |
 | `home_wait` | Waits until a device's property changes or meets a condition (`open == yes`, `temperature > 21`, `lock == unlocked`), for at most `timeout_s` seconds (default 60, at most 300). Only reads. |
+| `announce` | Says a short message aloud on the speakers that may (see Speakers): one by name, a room's, or every one. Offered when the home file has one. |
 
 A device can be named by its name in the home file or by one of its
 aliases; case, spaces, `_` and a leading "the" don't matter. What the agent
@@ -150,6 +155,47 @@ one changes, then reads it (`resources/read`):
   without a push, so a restart doesn't look like a burst of changes.
   `check` says whether changes come in.
 
+## Speakers: announce
+
+A Home Assistant voice satellite (`kind = satellite`, an
+`assist_satellite.*` entity: Voice PE, an ESPHome or Wyoming satellite)
+or a media player (`kind = media`) with `announce` on its `allow` line
+may be given a message to say: a satellite through Home Assistant's
+`assist_satellite.announce` (with its chime first), a media player
+through `tts.speak` and the text-to-speech entity `[home] tts` names
+(`tts.piper`, `tts.home_assistant_cloud`). Home Assistant only.
+
+```
+> announce {"room":"Kitchen","message":"Water under the kitchen sink."}
+done: said on kitchen_speaker (Kitchen); it is playing
+> announce {"message":"The back door is open."}
+done: said on kitchen_speaker (Kitchen); it is playing; done: said on hall_voice (Hall)
+> announce {"speaker":"hall_voice","message":"<speak>hi</speak>"}
+text only: no < or > (no markup, no sound files)
+```
+
+- **Where:** `speaker` (a name or alias), or `room` (that room's speakers;
+  every speaker when it has none, said so in the answer), or neither
+  (every speaker that may).
+- **What:** text only, one line, at most 300 bytes: no control
+  characters, no `<` or `>` (no markup a text-to-speech engine would
+  read, no sound files or streams).
+- **How often:** a speaker says at most one message every 10 s and 20 an
+  hour; past it the answer says which speaker waits and why (counted in
+  memory: a restart starts them again).
+- **Read back:** Home Assistant answers a satellite's call once the
+  message was played (its REST call waits up to 10 s); a media player
+  must show `playing` within 5 s, else "sent, but … has not confirmed".
+  An offline speaker gets nothing.
+- **On record:** each message is a line of the log (`"tool":"announce"`,
+  the speaker, the message, done, unconfirmed, refused or failed).
+- **Listed:** the resource `home://speakers` (each speaker, its room and
+  kind) and `check`'s "Speakers that may announce" line.
+
+It is not guarded: a message changes nothing that stays. A client should
+still decide when the house may speak (harness: only urgent things during
+quiet hours).
+
 ## Writing the home file: discover
 
 ```sh
@@ -177,6 +223,7 @@ The defaults:
 | What | In the file |
 |---|---|
 | Lights, plugs, switches, thermostats, fans, blinds and other covers, scenes, speakers | may act, within `[limits]` |
+| Voice satellites | may announce (a media player only when you add `announce` and `[home] tts`) |
 | Locks, alarm panels, garage doors and gates, valves | guarded, and only the safe way: `lock`, `close`, `arm_home`, `arm_away` |
 | A scene that sets any of those | guarded |
 | A switch whose name says valve | guarded, `off` only; one whose name says garage, gate, door, lock or alarm: guarded, nothing allowed until you add it |
@@ -201,6 +248,7 @@ hub = zigbee2mqtt              ; or homeassistant
 mqtt = 127.0.0.1:1883          ; zigbee2mqtt: the broker
 base = zigbee2mqtt             ; zigbee2mqtt: its base topic
 url = http://127.0.0.1:8123    ; homeassistant: its address (http or https)
+tts = tts.piper                ; homeassistant: the text-to-speech a media player announces with
 log = actions.jsonl            ; optional: one line per call
 
 [limits]                       ; the values the agent may choose
@@ -233,7 +281,8 @@ anna = person.anna
 | `cover` | `open`, `close`, `stop`, `position` |
 | `fan` | `on`, `off`, `speed` (%, or low, medium, high) |
 | `scene` (Home Assistant) | `activate` |
-| `media` (Home Assistant) | `play`, `pause`, `volume` |
+| `media` (Home Assistant) | `play`, `pause`, `volume`, `announce` (with `[home] tts`) |
+| `satellite` (Home Assistant, an `assist_satellite`) | `announce` |
 | `lock` (always guarded) | `lock`, `unlock` |
 | `alarm` (always guarded, Home Assistant) | `arm_home`, `arm_away`, `disarm` |
 | `valve` (always guarded) | `open`, `close` |
@@ -313,13 +362,22 @@ allow mcp home/home_wait *
 ```
 
 A trigger in `triggers.ini` reads a resource; harness subscribes to it, so
-the trigger runs when homemcp pushes the change, not on its next poll:
+the trigger runs when homemcp pushes the change, not on its next poll.
+`announce` says a line aloud for each event, in the room homemcp's change
+names (only urgent triggers speak during quiet hours):
 
 ```ini
 [back-door]
 mcp = home resource home://device/back_door
 match = text has "to":"open"
 say = The back door: {text}
+
+[leak]
+mcp = home resource home://device/sink_leak
+match = text has "to":"wet"
+urgent = yes
+say = Water under the kitchen sink.
+announce = Water under the kitchen sink.
 
 [everyone-out]
 mcp = home resource home://presence
@@ -387,6 +445,8 @@ fired by a pushed change.
 - `home_state`, `home_wait` and the read-back after an action ask Home
   Assistant over REST; `home_wait` checks twice a second.
 - Presence only from Home Assistant's person entities.
+- `announce` only through Home Assistant; how often each speaker spoke is
+  kept in memory, so a restart starts its counts again.
 - Matter devices only through Home Assistant.
 - No cameras, by design.
 
