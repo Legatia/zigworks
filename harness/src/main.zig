@@ -2723,6 +2723,7 @@ test {
     _ = @import("people.zig");
     _ = @import("lists.zig");
     _ = @import("deliveries.zig");
+    _ = @import("upkeep.zig");
 }
 
 test "harness_people_takes_list_show_and_import" {
