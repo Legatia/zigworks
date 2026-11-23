@@ -20,6 +20,7 @@ const who_mod = @import("who.zig");
 const folders_mod = @import("folders.zig");
 const snapshots_mod = @import("snapshots.zig");
 const agents = @import("agents.zig");
+const history_mod = @import("history.zig");
 const Io = std.Io;
 
 /// What came of asking the owner. `once`, `day`, `deny`: an approval's
@@ -292,6 +293,9 @@ pub const Run = struct {
     grants_path: ?[]const u8 = null,
     log: *log_mod.Log,
     mem: *memory.Store,
+    /// Where `history` reads the log, and the prompt the conversation's
+    /// summaries (long memory); null: neither.
+    history: ?*const history_mod.Source = null,
     /// Held while memory or grants change; shared by all runs.
     lock: *Io.Mutex,
     env: tools.Env,
@@ -505,6 +509,8 @@ pub const Run = struct {
             .delegate => if (r.model_cfg == null) return false,
             .mcp, .money => if (r.mcp.len == 0) return false,
             .skill, .skill_save => if (r.skills_dir.len == 0) return false,
+            // where there is a log to read, in every run, as recall
+            .history => if (r.history == null) return false,
             .browse => if (r.env.browser.len == 0) return false,
             // the browser with the logins (helpers never: above); on
             // Windows too since Chrome's pipes there are inherited handles
@@ -650,6 +656,7 @@ pub fn toolDefs(r: *const Run, arena: std.mem.Allocator) ![]const model.ToolDef 
         if (!r.allows(tool)) continue;
         try out.append(arena, if (tool == .shell and r.gate.folders != null) shell_dir_def else d);
     }
+    if (r.allows(.history)) try out.append(arena, history_mod.tool_def);
     if (r.allows(.send)) try out.append(arena, send_def);
     if (r.allows(.ask_owner)) try out.append(arena, ask_owner_def);
     if (r.allows(.web)) try out.append(arena, try web_mod.toolDef(arena, r.logins));
@@ -1449,6 +1456,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
         },
         // the whole input: rules and the owner see all of it
         .mcp, .money => try std.fmt.allocPrint(a, "{s}/{s} {s}", .{ mt.?.server.name, mt.?.tool, input_json }),
+        .history => history_mod.gateArg(a, input_json) catch return .{ .text = "history needs words, or a run's number", .is_error = true },
         else => tools.mainArg(a, tool, input_json) catch return .{ .text = "the tool's input is missing its main field", .is_error = true },
     };
     // a skill outside the definition's skills is no skill of this run's
@@ -1577,6 +1585,12 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
             break :blk .{ .text = said };
         },
         .delegate => try delegate(r, a, input_json),
+        // as far as this run may see; masked again with today's values
+        .history => blk: {
+            const src = r.history.?;
+            const got = try history_mod.call(a, r.io, src, .{ .scope = src.scopeOf(r.who.by, r.conversation), .utc_offset = r.utc_offset, .secrets = r.env.secrets }, input_json);
+            break :blk .{ .text = got.text, .is_error = got.is_error };
+        },
         .snapshot => try snapshotTool(r, a, arg, jv.str(jv.get(jv.parse(a, input_json), "label")) orelse ""),
         .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
         .skill => blk: {
@@ -4641,6 +4655,43 @@ test "kinds_without_a_tool_yet_are_not_offered_or_run" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "this tool is not available here") != null);
     try t.expectEqual(0, f.asked);
     try t.expect(std.mem.indexOf(u8, try f.logText(), "\"kind\":\"gate\"") == null);
+}
+
+test "history_is_offered_like_recall" {
+    var f: Fix = undefined;
+    try f.init("deny history password*\n");
+    defer f.deinit();
+    try withHelpers(&f);
+    const a = f.e.arena.allocator();
+    // no log to read: no history
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "history") == null);
+    var src: history_mod.Source = .{ .log_path = try std.fs.path.join(a, &.{ f.e.dir, "actions.jsonl" }) };
+    f.run.history = &src;
+    try t.expectEqualStrings("shell,read_file,write_file,fetch,search,recall,remember,history,ask_owner,delegate,", try toolNames(&f.run, a));
+    // runs nobody watches have it too
+    f.run.scheduled = true;
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "history,") != null);
+    f.run.scheduled = false;
+    // a definition names it; a delegate task that names no tools keeps 0.3's six
+    f.run.useDefinition(try defOf(&f, "reader", "---\nname: reader\ndescription: R.\ntools: recall, history\n---\n"));
+    try t.expectEqualStrings("recall,history,", try toolNames(&f.run, a));
+    f.run.useDefinition(try defOf(&f, "plain", "---\nname: plain\ndescription: P.\ntools: recall\n---\n"));
+    try t.expectEqualStrings("recall,", try toolNames(&f.run, a));
+    f.run.useDefinition(agents.builtin_main);
+    f.run.narrow = &agents.default_tools;
+    try t.expect(std.mem.indexOf(u8, try toolNames(&f.run, a), "history") == null);
+    f.run.narrow = null;
+    // a call reads the log, without asking; a rule can stop it
+    try f.e.script(1, model.toolReply("tu_1", "history", "{\"words\":\"kayak\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "history", "{\"words\":\"password reset\"}"));
+    try f.e.script(3, model.textReply("found it"));
+    const r = try f.say("plan the kayak trip");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "Owner: plan the kayak trip") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "refused by the gate") != null);
+    try t.expectEqual(0, f.asked);
+    const log = try f.logText();
+    try t.expect(std.mem.indexOf(u8, log, "\"tool\":\"history\",\"decision\":\"allow\",\"why\":\"default for this tool\",\"arg\":\"kayak\"") != null);
 }
 
 test "web_is_offered_only_with_a_browser_and_never_to_helpers" {

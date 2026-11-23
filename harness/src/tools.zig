@@ -74,6 +74,8 @@ pub fn mainArg(arena: std.mem.Allocator, tool: gate.Tool, input_json: []const u8
         .read_file, .write_file => "path",
         .fetch, .browse => "url",
         .search, .recall => "query",
+        // the words, or the run (history.gateArg)
+        .history => return error.NotHere,
         .remember => "text",
         .skill, .skill_save => "name",
         .snapshot => "folder",
@@ -123,6 +125,8 @@ fn runRaw(env: Env, arena: std.mem.Allocator, tool: gate.Tool, input_json: []con
         .fetch => fetch(env, arena, arg, startOf(arena, input_json)),
         .browse => browse(env, arena, arg, startOf(arena, input_json)),
         .search => search(env, arena, arg),
+        // the agent reads the log itself
+        .history => error.NotHere,
         .recall, .remember, .delegate, .skill, .skill_save, .mcp, .money, .web, .login => error.NotHere,
         .send, .ask_owner, .mail, .trigger, .workflow, .agent_save, .app_read, .app_draft, .app_save, .env_save, .snapshot => error.NotHere,
     };

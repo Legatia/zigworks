@@ -10,6 +10,7 @@ const util = @import("util.zig");
 const jv = @import("jv.zig");
 const session = @import("session.zig");
 const model = @import("model.zig");
+const scrub = @import("scrub.zig");
 const Io = std.Io;
 
 /// Turns a search returns at most.
@@ -651,6 +652,68 @@ pub fn runView(a: std.mem.Allocator, io: Io, path: []const u8, scope: Scope, rid
     // a private run's line keeps sizes and hashes, not what was said
     if (std.mem.indexOf(u8, first, "\":{\"bytes\":") != null) return std.fmt.allocPrint(a, "Run {d} is private: what was said in it is not in the log.", .{rid});
     return (try session.render(a, text, rid, max_bytes)) orelse none;
+}
+
+// ---- the tool ----
+
+pub const tool_def: model.ToolDef = .{
+    .name = "history",
+    .description = "Search every earlier turn in the log: the owner's messages, your replies and posts, and tool results (their first 2 KB). Every word must be in the turn (case does not matter, part of a word counts); a phrase in double quotes is found as written. Up to 20 turns, newest first, each with its date, conversation and run. With run, that run's steps. What was said where private mode was on is not in the log.",
+    .schema_json =
+    \\{"type":"object","properties":{"words":{"type":"string","description":"the words a turn must have; a phrase in double quotes"},"conversation":{"type":"string","description":"only this conversation"},"before":{"type":"string","description":"only turns before this, in the owner's time: YYYY-MM-DD or YYYY-MM-DD HH:MM"},"run":{"type":"integer","description":"a run's number, as a result names it: that run's steps"}},"required":["words"]}
+    ,
+};
+
+/// What a run may search and how it is shown to it.
+pub const View = struct {
+    scope: Scope,
+    utc_offset: i32 = 0,
+    /// Masked in the answer: the values masked now (the log was masked with
+    /// those of its time).
+    secrets: []const scrub.Secret = &.{},
+};
+
+pub const Answer = struct { text: []const u8, is_error: bool = false };
+
+/// The run a call asks for (a number, or digits as text), or null.
+fn runOf(v: ?jv.Value) ?u64 {
+    const x = jv.get(v, "run") orelse return null;
+    if (jv.int(x)) |n| return if (n > 0) @intCast(n) else null;
+    const s = jv.str(x) orelse return null;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch null;
+}
+
+/// What the gate matches a call against: its words, or `run N`.
+pub fn gateArg(a: std.mem.Allocator, input_json: []const u8) ![]const u8 {
+    const v = jv.parse(a, input_json) orelse return error.BadInput;
+    if (runOf(v)) |rid| return std.fmt.allocPrint(a, "run {d}", .{rid});
+    const w = jv.str(jv.get(v, "words")) orelse return error.BadInput;
+    if (std.mem.trim(u8, w, " \t\r\n").len == 0) return error.BadInput;
+    return w;
+}
+
+/// A `history` call, answered from the log as far as `view` may see.
+pub fn call(a: std.mem.Allocator, io: Io, src: *const Source, view: View, input_json: []const u8) !Answer {
+    const got = try callRaw(a, io, src, view, input_json);
+    var sc = try scrub.Scrubber.init(a, view.secrets);
+    return .{ .text = try sc.scrubAlloc(a, got.text), .is_error = got.is_error };
+}
+
+fn callRaw(a: std.mem.Allocator, io: Io, src: *const Source, view: View, input_json: []const u8) !Answer {
+    const v = jv.parse(a, input_json) orelse return .{ .text = "history needs words, or a run's number", .is_error = true };
+    if (runOf(v)) |rid| return .{ .text = try runView(a, io, src.log_path, view.scope, rid, max_view) };
+    const terms = try parseTerms(a, jv.str(jv.get(v, "words")) orelse "");
+    if (terms.len == 0) return .{ .text = "history needs words, or a run's number", .is_error = true };
+    var q: Query = .{ .terms = terms, .conversation = jv.str(jv.get(v, "conversation")) };
+    if (q.conversation) |c| if (!view.scope.all and !std.mem.eql(u8, c, view.scope.conversation))
+        return .{ .text = try std.fmt.allocPrint(a, "Only {s} is searched from here.", .{view.scope.conversation}), .is_error = true };
+    if (jv.str(jv.get(v, "before"))) |b| q.before_s = parseBefore(b, view.utc_offset) orelse
+        return .{ .text = "before is a date in the owner's time: YYYY-MM-DD, or YYYY-MM-DD HH:MM", .is_error = true };
+    const found = search(a, io, src.log_path, view.scope, q) catch |e| switch (e) {
+        error.FileNotFound => Found{ .hits = &.{} },
+        else => return e,
+    };
+    return .{ .text = try render(a, io, src.log_path, found, terms, view.utc_offset, max_view, view.scope) };
 }
 
 const t = std.testing;

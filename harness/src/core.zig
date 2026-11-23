@@ -25,6 +25,7 @@ const who_mod = @import("who.zig");
 const conversations = @import("conversations.zig");
 const jv = @import("jv.zig");
 const session = @import("session.zig");
+const history_mod = @import("history.zig");
 const folders_mod = @import("folders.zig");
 const environments_mod = @import("environments.zig");
 const sandbox = @import("sandbox.zig");
@@ -413,6 +414,8 @@ pub const Core = struct {
     grants: gate.Grants,
     gate: gate.Gate,
     log: log_mod.Log,
+    /// Where runs' `history` reads the log, and the summaries' folder.
+    history_src: history_mod.Source,
     mem: memory.Store,
     lock: Io.Mutex = .init,
     /// How many helpers run at once, across all runs.
@@ -608,6 +611,7 @@ pub const Core = struct {
         try c.log.setSecrets(c.secret_list);
         // without it private lines keep only sizes
         c.log.useKey(io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "log-key" })) catch {};
+        c.history_src = .{ .log_path = c.paths.log, .summaries_dir = try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "summaries" }), .ctx = c, .shared = sharedConversation };
         c.mem = try memory.Store.load(gpa, io, c.paths.memory);
         errdefer c.mem.deinit();
         c.mem.secrets = c.secret_list;
@@ -2550,6 +2554,7 @@ pub const Core = struct {
             .grants_path = c.paths.grants,
             .log = &c.log,
             .mem = &c.mem,
+            .history = &c.history_src,
             .lock = &c.lock,
             .env = .{
                 .gpa = c.gpa,
@@ -5604,6 +5609,12 @@ pub const Core = struct {
         return e.audience == .shared;
     }
 
+    /// `history`'s question: do others read conversation `name`?
+    fn sharedConversation(ctx: ?*anyopaque, name: []const u8) bool {
+        const c: *Core = @ptrCast(@alignCast(ctx.?));
+        return c.isShared(name);
+    }
+
     // ---- commands ----
 
     const help_text =
@@ -7977,6 +7988,68 @@ test "session_shows_the_last_run_here_and_only_labels_for_a_private_one" {
         try t.expect(l.len <= 3500);
         try t.expect(std.mem.indexOf(u8, l, "harness log session ") != null);
     };
+}
+
+test "history_keeps_to_what_the_run_may_see" {
+    var f: Fix = undefined;
+    try f.init("", "", "[digest]\nat = 23:59\nto = family\ndo = Post the flats digest.\n[watch]\nat = 23:59\nto = house-search\ndo = Look for news on the flats.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow send family\n" });
+    _ = try f.core.reload();
+    try addTopic(&f, "house-search", 5012);
+    try addGroup(&f, "family", -100);
+    // a turn in main, one in a topic, a scheduled post where others read
+    try f.e.script(1, model.textReply("Seefeld has two flats."));
+    f.core.chatTurnIn("main", "flats in Seefeld?");
+    try f.e.script(2, model.textReply("Basel flats cost more."));
+    f.core.chatTurnIn("house-search", "flats in Basel?");
+    try f.e.script(3, model.textReply("Digest: the flats of the week."));
+    _ = try f.core.runTask(f.core.tasks[0]);
+    try f.rec.waitIn("family", "Digest: the flats of the week.");
+    const main_rid = (try session.lastRunIn(a, try logText(&f), "main", 1)).?;
+    // the owner's run in main searches every conversation
+    try f.e.script(4, model.toolReply("tu_h", "history", "{\"words\":\"flats\"}"));
+    try f.e.script(5, model.textReply("Found them."));
+    f.core.chatTurnIn("main", "what did we find on flats?");
+    const all = try f.e.request(5);
+    for ([_][]const u8{ "flats in Seefeld?", "flats in Basel?", "Post the flats digest." }) |said| {
+        if (std.mem.indexOf(u8, all, said) == null) std.debug.print("missing {s} in {s}\n", .{ said, all });
+        try t.expect(std.mem.indexOf(u8, all, said) != null);
+    }
+    // a scheduled run searches its own conversation (its to), and sees no other run
+    try f.e.script(6, model.toolReply("tu_w", "history", "{\"words\":\"flats\"}"));
+    try f.e.script(7, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_r\",\"name\":\"history\",\"input\":{{\"words\":\"flats\",\"run\":{d}}}}}],\"stop_reason\":\"tool_use\"}}", .{main_rid}));
+    try f.e.script(8, model.textReply("NOTHING"));
+    _ = try f.core.runTask(f.core.tasks[1]);
+    const own = try f.e.request(7);
+    try t.expect(std.mem.indexOf(u8, own, "flats in Basel?") != null);
+    for ([_][]const u8{ "flats in Seefeld?", "Post the flats digest." }) |said| try t.expect(std.mem.indexOf(u8, own, said) == null);
+    try t.expect(std.mem.indexOf(u8, own, "Only house-search is searched from here.") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(8), try std.fmt.allocPrint(a, "No run {d} in house-search.", .{main_rid})) != null);
+}
+
+test "a_private_conversations_words_are_never_found" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addTopic(&f, "diary", 5014);
+    try f.core.handleTextIn("diary", "/private on");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.workspace, "plans.txt" }), .data = "a garden party at the lake" });
+    try f.e.script(1, model.toolReply("tu_1", "read_file", "{\"path\":\"plans.txt\"}"));
+    try f.e.script(2, model.textReply("Kept between us: the party by the lake."));
+    f.core.chatTurnIn("diary", "my secret plans for the summer");
+    const diary_rid = (try session.lastRunIn(a, try logText(&f), "diary", 1)).?;
+    // from main every conversation is searched: the diary's words are not in the log
+    try f.e.script(3, model.toolReply("tu_h", "history", "{\"words\":\"lake\"}"));
+    try f.e.script(4, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_r\",\"name\":\"history\",\"input\":{{\"words\":\"plans\",\"run\":{d}}}}}],\"stop_reason\":\"tool_use\"}}", .{diary_rid}));
+    try f.e.script(5, model.textReply("Nothing."));
+    f.core.chatTurnIn("main", "what did I plan?");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "No turn has all of: lake.") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), try std.fmt.allocPrint(a, "Run {d} is private: what was said in it is not in the log.", .{diary_rid})) != null);
+    const log = try logText(&f);
+    for ([_][]const u8{ "my secret plans", "garden party", "at the lake", "Kept between us" }) |said| try t.expect(std.mem.indexOf(u8, log, said) == null);
 }
 
 test "a_bad_rules_line_names_its_section_or_environment" {
