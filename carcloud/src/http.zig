@@ -127,8 +127,10 @@ pub const Client = struct {
     gpa: std.mem.Allocator,
     io: Io,
     target: Target,
-    /// Accept any https certificate (self-signed internal servers).
-    insecure: bool = false,
+    /// The certificates trusted for https, a PEM file (a server's own,
+    /// such as tesla-http-proxy's); "": the system's roots. There is no
+    /// way to turn the check off.
+    ca_file: []const u8 = "",
     user_agent: []const u8 = "harness",
     conn: ?*Conn = null,
     ca: ?std.crypto.Certificate.Bundle = null,
@@ -175,9 +177,15 @@ pub const Client = struct {
         conn.s.setLimits(limits.idle_ms, limits.total_ms);
         if (t.https) {
             const plain = mem[read_buf_len + write_buf_len ..];
-            if (!c.insecure and c.ca == null) {
+            if (c.ca == null) {
                 var bundle: std.crypto.Certificate.Bundle = .empty;
-                bundle.rescan(c.gpa, c.io, Io.Clock.real.now(c.io)) catch |e| {
+                const now = Io.Clock.real.now(c.io);
+                const loaded = if (c.ca_file.len > 0)
+                    bundle.addCertsFromFilePath(c.gpa, c.io, now, Io.Dir.cwd(), c.ca_file)
+                else
+                    bundle.rescan(c.gpa, c.io, now);
+                loaded catch |e| {
+                    bundle.deinit(c.gpa);
                     c.detail = e;
                     return error.TlsFailed;
                 };
@@ -190,8 +198,8 @@ pub const Client = struct {
                 return error.TlsFailed;
             };
             conn.tls_client = tls.Client.init(&conn.s.reader, &conn.s.writer, .{
-                .host = if (c.insecure) .no_verification else .{ .explicit = t.host },
-                .ca = if (c.insecure) .no_verification else .{ .bundle = .{
+                .host = .{ .explicit = t.host },
+                .ca = .{ .bundle = .{
                     .gpa = c.gpa,
                     .io = c.io,
                     .lock = &c.ca_lock,

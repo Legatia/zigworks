@@ -14,6 +14,10 @@
 //! the files `device-NAME.json` and `presence.json` of its folder.
 //! `harness-fake --mcp --car` is carcloud's: `car_status` (34 %, plugged
 //! in, not charging) and `car_command` (charge_start, charge_stop).
+//! `--mcp --tesla` is carcloud's with a Tesla: `car_status` says the car
+//! sleeps unless asked to wake it, then reads the file `outside` of its
+//! folder (-3 by default) as the outside temperature; `car_climate`; each
+//! call written as a line of `calls` in its folder; unknown fields refused.
 //! `--mcp --slack`, `--jira` and `--github` play the work morning's
 //! servers: a read each (mentions, issues, notifications, as JSON lists),
 //! and Slack's and GitHub's posts, written as lines to `posted.jsonl` in
@@ -45,12 +49,21 @@ const car_tools_json =
     \\{"tools":[{"name":"car_status","description":"Battery, range, charging, plugged in. Only reads.","inputSchema":{"type":"object","properties":{}}},{"name":"car_command","description":"One of the commands the car file allows.","inputSchema":{"type":"object","properties":{"command":{"type":"string"},"percent":{"type":"integer"}},"required":["command"]}}]}
 ;
 
+const tesla_tools_json =
+    \\{"tools":[{"name":"car_status","description":"The car, read live; wake true wakes it. Only reads.","inputSchema":{"type":"object","properties":{"wake":{"type":"boolean"}}},"annotations":{"readOnlyHint":true}},{"name":"car_climate","description":"Climate on or off, or its temperature.","inputSchema":{"type":"object","properties":{"state":{"type":"string","enum":["on","off"]},"temperature":{"type":"number"}}}}]}
+;
+
 /// carcloud's stand-in: a car at 34 %, plugged in, not charging.
 const Car = struct {
     charging: bool = false,
+    /// `--tesla`: carcloud's Tesla tools instead.
+    tesla: bool = false,
+    climate_on: bool = false,
+    io: Io = undefined,
 
     fn call(c: *Car, a: std.mem.Allocator, name: []const u8, args: ?std.json.ObjectMap) ![]const u8 {
         const eql = std.mem.eql;
+        if (c.tesla) return c.teslaCall(a, name, args);
         if (eql(u8, name, "car_status")) return textResult(a, try std.fmt.allocPrint(a, "battery: 34%\nrange: 150 km\ncharging: {s}\nplugged in: yes\ncharge limit: 80%\nlocked: yes\ndata: from 5 minutes ago", .{if (c.charging) "yes" else "no"}), false);
         if (!eql(u8, name, "car_command")) return textResult(a, "unknown tool", true);
         const cv = (args orelse return textResult(a, "say which command", true)).get("command") orelse return textResult(a, "say which command", true);
@@ -64,6 +77,32 @@ const Car = struct {
             return textResult(a, "done: charging stopped, confirmed by the car", false);
         }
         return textResult(a, try std.fmt.allocPrint(a, "no command called {s}", .{command}), true);
+    }
+
+    fn teslaCall(c: *Car, a: std.mem.Allocator, name: []const u8, args: ?std.json.ObjectMap) ![]const u8 {
+        const eql = std.mem.eql;
+        const line = try std.fmt.allocPrint(a, "{s} {s}\n", .{ name, try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = args orelse .empty }, .{}) });
+        const old = Io.Dir.cwd().readFileAlloc(c.io, "calls", a, .limited(1 << 20)) catch "";
+        Io.Dir.cwd().writeFile(c.io, .{ .sub_path = "calls", .data = try std.fmt.allocPrint(a, "{s}{s}", .{ old, line }) }) catch {};
+        const known: []const []const u8 = if (eql(u8, name, "car_status")) &.{"wake"} else if (eql(u8, name, "car_climate")) &.{ "state", "temperature" } else return textResult(a, try std.fmt.allocPrint(a, "no tool called {s}", .{name}), true);
+        if (args) |m| {
+            var it = m.iterator();
+            while (it.next()) |e| {
+                for (known) |k| {
+                    if (eql(u8, k, e.key_ptr.*)) break;
+                } else return textResult(a, try std.fmt.allocPrint(a, "{s} has no field {s}", .{ name, e.key_ptr.* }), true);
+            }
+        }
+        const outside = std.mem.trim(u8, fileOf(c.io, a, "outside") orelse "-3", " \r\n");
+        if (eql(u8, name, "car_status")) {
+            const wake = if (args) |m| (if (m.get("wake")) |w| w == .bool and w.bool else false) else false;
+            if (!wake) return textResult(a, "The car:\nasleep: yes; reading it would wake it (car_status with wake true wakes it; 3 of 3 wakes left in 24 hours)\ncommands the owner allowed: climate", false);
+            return textResult(a, try std.fmt.allocPrint(a, "The car:\nbattery: 64%\nrange: 294.4 km\ncharging: no\nplugged in: yes\ncharge limit: 80%\nlocked: yes\ninside: 4 °C\noutside: {s} °C\nclimate: {s}, set to 21 °C\ndata: from the last minutes\nwoken for this read (2 of 3 wakes left in 24 hours)\ncommands the owner allowed: climate", .{ outside, if (c.climate_on) "on" else "off" }), false);
+        }
+        const state = if (args) |m| (if (m.get("state")) |x| (if (x == .string) x.string else "") else "") else "";
+        if (eql(u8, state, "on")) c.climate_on = true else if (eql(u8, state, "off")) c.climate_on = false else return textResult(a, "say state (on or off), temperature (°C), or both", true);
+        if (!c.climate_on) return textResult(a, try std.fmt.allocPrint(a, "Climate off; inside 4 °C, outside {s} °C.", .{outside}), false);
+        return textResult(a, try std.fmt.allocPrint(a, "Climate on, set to 21 °C; inside 4 °C, outside {s} °C.", .{outside}), false);
     }
 };
 
@@ -185,6 +224,12 @@ pub fn runHome(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.M
 /// carcloud's stand-in on stdio.
 pub fn runCar(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) u8 {
     var car: Car = .{};
+    return serveAs(io, gpa, env, .{ .car = &car });
+}
+
+/// carcloud's stand-in with a Tesla (car_climate) on stdio.
+pub fn runTesla(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) u8 {
+    var car: Car = .{ .tesla = true, .io = io };
     return serveAs(io, gpa, env, .{ .car = &car });
 }
 
@@ -505,7 +550,7 @@ fn serveAs(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, 
             result = switch (role) {
                 .plain => tools_json,
                 .home => home_tools_json,
-                .car => car_tools_json,
+                .car => |c| if (c.tesla) tesla_tools_json else car_tools_json,
                 .slack => slack_tools_json,
                 .jira => jira_tools_json,
                 .github => github_tools_json,

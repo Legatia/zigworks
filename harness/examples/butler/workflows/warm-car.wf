@@ -1,0 +1,31 @@
+# Warm the car: harness starts it itself (schedule:warm-car) 30 minutes
+# before a morning leave-by in the diary, when the car reads below
+# [butler] warm_below outside (it wakes the car once to read it). One tap
+# makes the call below, exactly as it is; without the tap nothing is sent.
+workflow warm-car
+about Before a morning leave-by when it is below <warm below> °C at the car: asks with one tap to warm the car.
+start schedule:warm-car
+tag no
+limits steps 6, days 1
+
+step ask
+approve Warm the car for {event.leave}? It's {event.outside} °C at the car.
+yes Warm it
+no Not today
+timeout 30m
+on deny goto skip
+
+step warm
+tool car/car_climate {"state": "on"}
+on fail goto failed
+
+step warming
+say {warm}
+end
+
+step failed
+say The car didn't start warming: {warm.error}
+end
+
+step skip
+end

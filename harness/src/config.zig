@@ -214,6 +214,9 @@ pub const Config = struct {
         /// A maps MCP server's travel-time tool, SERVER/TOOL; "": none
         /// (`travel` for every event).
         maps: []const u8 = "",
+        /// °C: below this at the car (its own reading), the warm-car
+        /// routine asks to warm it before a morning leave-by.
+        warm_below: f64 = 5,
     };
 };
 
@@ -485,6 +488,13 @@ fn setField(sec: anytype, l: Line) Error!void {
                 return error.BadConfig;
             } else if (comptime T == Config.Butler and std.mem.eql(u8, fname, "travel")) {
                 @field(sec.*, fname) = parseMinutes(l.value) orelse return error.BadConfig;
+            } else if (comptime T == Config.Butler and std.mem.eql(u8, fname, "warm_below")) {
+                // °C, from -40 to 25: "3", "-2.5", "3 °C"
+                var v = std.mem.trim(u8, l.value, " \t");
+                if (std.mem.endsWith(u8, v, "°C")) v = std.mem.trim(u8, v[0 .. v.len - "°C".len], " \t");
+                const x = std.fmt.parseFloat(f64, v) catch return error.BadConfig;
+                if (!(x >= -40 and x <= 25)) return error.BadConfig;
+                @field(sec.*, fname) = x;
             } else if (comptime T == Config.Butler and std.mem.eql(u8, fname, "maps")) {
                 // SERVER/TOOL
                 const slash = std.mem.indexOfScalar(u8, l.value, '/') orelse return error.BadConfig;
@@ -806,6 +816,7 @@ pub const defaults_ini =
     \\; calmcp = /usr/local/bin/calmcp     ; /setup calendar runs it; the same
     \\; travel = 30m                      ; how long before an event with a place the diary says it's time to leave
     \\; maps = maps/travel_time           ; a maps MCP server's tool that gives the travel time instead
+    \\; warm_below = 5                    ; °C at the car: below it, the warm-car routine asks to warm it before a morning leave-by
     \\
     \\[voice_agent]                       ; Home Assistant's voice assistant answered by harness (README: Home Assistant's voice)
     \\; listen = 192.168.1.20:8765         ; for Home Assistant on another machine: this one's LAN address (default: this machine only)
@@ -1439,6 +1450,21 @@ test "butler_travel_maps_and_calmcp_read" {
     try t.expectEqualStrings("maps/travel_time", c.butler.maps);
     try t.expectEqualStrings("/opt/calmcp", c.butler.calmcp);
     try t.expectError(error.BadConfig, parse(a, "[butler]\nmaps = travel_time\n"));
+}
+
+test "butler_warm_below_reads" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 5 °C unless set; the line is a comment in harness init's file
+    try t.expectEqual(@as(f64, 5), (try parse(a, "")).butler.warm_below);
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "; warm_below = 5") != null);
+    for ([_]struct { []const u8, f64 }{ .{ "2", 2 }, .{ "-2.5", -2.5 }, .{ "3 °C", 3 }, .{ "0", 0 } }) |c| {
+        try t.expectEqual(c[1], (try parse(a, try std.fmt.allocPrint(a, "[butler]\nwarm_below = {s}\n", .{c[0]}))).butler.warm_below);
+    }
+    for ([_][]const u8{ "cold", "30", "-41", "5 F" }) |v| {
+        try t.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "[butler]\nwarm_below = {s}\n", .{v})));
+    }
 }
 
 test "voice_agent_settings_read_and_checked" {

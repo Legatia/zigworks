@@ -16,8 +16,8 @@ are helping with.
 - A computer that stays on: a Mac (Apple Silicon), Linux (x86-64, or a
   Raspberry Pi 4 or 5 with a 64-bit system) or Windows (x86-64).
 - harness and homemcp for that computer (from the releases), in one
-  folder; carcloud too if your car is on Smartcar. harness looks for
-  homemcp and carcloud next to itself.
+  folder; carcloud too if your car is on Smartcar, or is a Tesla. harness
+  looks for homemcp and carcloud next to itself.
 - A model: an omnigate address and key, or an API key of Anthropic,
   OpenRouter, OpenCode Zen or OpenAI. Which one, and its address, go in
   `config.ini`'s `[model]` (harness's README: Models and providers).
@@ -69,6 +69,14 @@ Then in Telegram:
    VEHICLE_ID USER_ID` (from Smartcar's Dashboard). Smartcar's free plan
    reads the car but sends no commands: charging from harness needs a paid
    plan.
+   A Tesla, to warm it on cold mornings, goes through Tesla's own API
+   instead, and takes longer: your own developer application, its key
+   paired with the car in the Tesla app, and Tesla's `tesla-http-proxy`
+   running beside harness (carcloud's README: With a Tesla). Write the car
+   file from carcloud's `examples/tesla.ini`, run `TESLA_CLIENT_SECRET=...
+   carcloud login car.ini` once, add `[car]` with `command = carcloud
+   /path/to/car.ini` to mcp.ini, `/reload`, then `/setup routines` offers
+   **Warm the car** (with your calendar connected).
 
 5. Your calendar: `harness secret add caldav` in the terminal (the app
    password), then `/setup calendar ADDRESS USER`, like `/setup calendar
@@ -155,6 +163,13 @@ notes):
   them (`/person`), and when they last came up. Ask "move it to
   tomorrow": one question shows the exact change before anything is
   written. During a busy event, the routines' posts wait for its end.
+- **A cold morning, with a Tesla.** With Warm the car on, put a morning
+  event with a place in your calendar. Half an hour before it's time to
+  leave, when it's below 5 °C at the car, you get "Warm the car for 8:10?
+  It's -3 °C at the car." with **Warm it**: tap it and the reply says what
+  the car reads back. Tell us if it came too early or too late, if the
+  car didn't wake, or if it asked on a warm morning; tap **Not today** once
+  to see that nothing is sent.
 - **Any day.** `/session` shows the steps behind the last answer; `/quiet`
   what quiet hours hold; `/workflows` the routines that are on.
 
@@ -219,8 +234,11 @@ on what you did, what happened, and what you expected.
 - **Nothing a device reports is an instruction.** A sensor's name or reading
   is data, never something it obeys.
 - **The car: only what car.ini lists**, through Smartcar: starting and
-  stopping charging and the charge limit (60–90 %). It can't lock or
-  unlock the car, and nothing is plugged into it.
+  stopping charging and the charge limit (60–90 %); with a Tesla, its
+  climate (18–24 °C) and seat heating too, if car.ini lists them. It can't
+  lock or unlock the car, and nothing is plugged into it. It never warms
+  the car unasked: the cold-morning question is one tap, and no answer
+  means nothing is sent.
 - **Your mail: read and drafts, nothing more.** It never sends from your
   mailbox, never deletes, moves, flags or marks your mail as read, and
   never reads it before you tap **Turn on**. It sends only from its own

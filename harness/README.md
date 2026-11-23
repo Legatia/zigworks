@@ -47,7 +47,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 1052 unit tests (20 of them
+**State: 0.3.0, tested on macOS by its own tests: 1062 unit tests (20 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 103 checks that drives the real binary against
@@ -68,7 +68,9 @@ mail a real mail server (mailmcp's own tests run it against its stand-in).
 An earlier build of 0.3.0 also passed its tests in CI on Linux and
 Windows. Emergencies (escalation to the household, the leak's fallback,
 the smoke routine) are tested against stand-ins only: no real household,
-alarm or valve yet. On Windows 11 the browser and login
+alarm or valve yet. Warming the car is tested against a stand-in of
+carcloud with a Tesla (and carcloud's Tesla backend against its own
+stand-ins of Tesla's API and tesla-http-proxy): no real Tesla yet. On Windows 11 the browser and login
 tests also run, against Chrome 157, and the console, lock, Credential
 Manager and process-cleanup checks of HANDOFF-windows-audit.md were run by
 hand. With environments, apps, clones and safe state files added,
@@ -807,6 +809,7 @@ turns one off, and the files can be edited and `/reload`ed.
 | Smoke alarm | a smoke or CO alarm goes off | at once, through quiet hours, on every speaker; nothing is acted on |
 | Doors left open | a door or window opens | after 10 minutes, if it still is open, a line |
 | Car for tomorrow | 90 minutes before quiet hours | a line when the car is low and not plugged in; one tap to start charging when it is |
+| Warm the car | 30 minutes before a morning leave-by in your calendar, when the car reads below `[butler] warm_below` (5 °C) outside | "Warm the car for 8:10? It's -3 °C at the car." [Warm it] [Not today]; the tap turns the car's climate on, read back; offered for a car that warms (below) |
 | Bills | your mailbox is on (Mail) | a line 3 days before a bill is due: who, how much, when |
 | Deliveries | your mailbox is on | a line on the day a parcel comes |
 | Flights, Invitations | your mailbox and a calendar are on | the time offered for the calendar, asked first |
@@ -870,6 +873,21 @@ offered again, to list today's events.
   event's id, its title and its start now, and the new start), which
   calmcp checks against the calendar before writing and reads back after.
   harness never accepts or declines an invitation on its own.
+
+- **Warming the car.** With the warm-car routine on (setup offers it when
+  the car server, `car`, has carcloud's `car_climate`, a Tesla, and a
+  calendar is connected): 30 minutes before a leave-by before noon, harness
+  reads the car once (`car_status` with `wake`: a sleeping Tesla is woken
+  to read it) and, below `[butler] warm_below` outside (5 °C; the car's own
+  thermometer), asks "Warm the car for 8:10? It's -3 °C at the car."
+  [Warm it] [Not today]. Only the tap makes the call, `car_climate
+  {"state": "on"}` as the routine's file has it, and what the car reads
+  back is said ("Climate on, set to 21 °C; inside 4 °C, outside -3 °C.").
+  Not today, or no answer by the leave-by, sends nothing. Each leave-by is
+  asked about once (`state/diary`); a warm morning, an afternoon, a car
+  that can't be read: no question, a `warm car` line in the log. harness
+  starts the routine itself (`schedule:warm-car`, no triggers.ini section),
+  so quiet hours and busy events hold its question like any routine's.
 
 The diary reads calmcp's `cal://upcoming` (today and tomorrow, as data)
 every 10 minutes and after `/reload`. Its lines go to main at their

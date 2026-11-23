@@ -2,7 +2,7 @@
 //! search, for the end-to-end tests. `harness-fake --dir DIR [--port N]`
 //! prints `port N` and serves until killed. `harness-fake --mcp` is an MCP
 //! server on stdio instead (see fake_mcp.zig; `--mcp --home` is homemcp's
-//! stand-in, `--mcp --car` carcloud's, `--mcp --slack|--jira|--github`
+//! stand-in, `--mcp --car` carcloud's (`--tesla` with a Tesla), `--mcp --slack|--jira|--github`
 //! the work morning's). `harness-fake discover URL`, `check FILE` and
 //! `FILE.ini` answer as homemcp and carcloud do, for /setup (and as calmcp
 //! does for a calendar file: fake_cal.zig). `harness-fake --browse URL` is the owner's browser for a
@@ -23,6 +23,7 @@ pub fn main(init: std.process.Init) u8 {
     if (args.len == 2 and std.mem.eql(u8, args[1], "--mcp")) return fake_mcp.run(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--home")) return fake_mcp.runHome(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--car")) return fake_mcp.runCar(io, init.gpa, init.environ_map);
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--tesla")) return fake_mcp.runTesla(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp")) return fake_mcp.runWork(io, init.gpa, init.environ_map, args[2]);
     // calmcp's, for /setup calendar: discover URL USER, check FILE (a calendar file)
     if (args.len == 4 and std.mem.eql(u8, args[1], "discover")) return fake_cal.discover(io, init.environ_map);
