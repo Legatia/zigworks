@@ -52,6 +52,7 @@ const voiceagent = @import("voiceagent.zig");
 const butler = @import("butler.zig");
 const alerts_mod = @import("alerts.zig");
 const mail_mod = @import("mail.zig");
+const diary_mod = @import("diary.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -692,6 +693,9 @@ pub const Core = struct {
     mail_job: mail_mod.Job = .{},
     mail_mutex: Io.Mutex = .init,
     mail_reply: ?MailReply = null,
+    /// The diary: the calendar's events read last, the lines said
+    /// (state/diary), the busy window that held posts.
+    diary: diary_mod.State,
     /// What /reload says when the settings files have an error.
     problem_buf: [800]u8 = undefined,
 
@@ -881,6 +885,9 @@ pub const Core = struct {
         c.mail_job = .{};
         c.mail_mutex = .init;
         c.mail_reply = null;
+        c.diary = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "diary" }));
+        errdefer c.diary.deinit();
+        c.diary.load() catch |e| c.log.write(.config, false, .{ .event = "diary not read", .why = @errorName(e) }) catch {};
         c.role = "open";
         // problem_buf: written before it is read
         // the inbox: read, its first id from 0.3's approval numbers; items
@@ -936,7 +943,7 @@ pub const Core = struct {
         if (c.worker) |w| w.join();
         // no speech from now on; its requests going end (their runs stopped)
         c.stopVoiceAgent();
-        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire) or c.mail_job.running.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire) or c.mail_job.running.load(.acquire) or c.diary.reading.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
@@ -954,6 +961,7 @@ pub const Core = struct {
         for (c.announced.items) |x| c.gpa.free(x);
         c.announced.deinit(c.gpa);
         c.group_posts.deinit(c.gpa);
+        c.diary.deinit();
         c.defs.deinit();
         for (c.told_topics.items) |n| c.gpa.free(n);
         c.told_topics.deinit(c.gpa);
@@ -1127,7 +1135,7 @@ pub const Core = struct {
         c.queue_mutex.lockUncancelable(c.io);
         var queue_locked = true;
         defer if (queue_locked) c.queue_mutex.unlock(c.io);
-        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire) or c.summary_job.running.load(.acquire)) return "Busy; send /reload again when nothing is running.";
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.diary.reading.load(.acquire)) return "Busy; send /reload again when nothing is running.";
         var fresh: std.heap.ArenaAllocator = .init(c.gpa);
         const saved_cfg = c.cfg;
         const saved_rules = c.rule_list;
@@ -1217,6 +1225,8 @@ pub const Core = struct {
         defer c.restarting.store(false, .release);
         c.stopMcp();
         c.startMcp();
+        // the calendar's server may be new: read it again at the next tick
+        c.diary.next_read.store(0, .release);
         try c.log.write(.config, false, .{ .event = "reload" });
         return "Settings reloaded.";
     }
@@ -2938,6 +2948,13 @@ pub const Core = struct {
     /// nobody waits on (a schedule, a trigger, a workflow), not urgent, in
     /// quiet hours, and not a one-off command run by hand; null: it goes.
     fn quietEnd(c: *Core, by: []const u8) ?i64 {
+        // a busy event in the calendar holds them too (the diary's busyEnd)
+        return c.quietHoursEnd(by) orelse c.busyEnd(by);
+    }
+
+    /// quietEnd for quiet hours alone (the house's speakers go by them,
+    /// not by the owner's calendar).
+    fn quietHoursEnd(c: *Core, by: []const u8) ?i64 {
         if (!(who_mod.Who{ .by = by }).unattended()) return null;
         if (c.byHand()) return null;
         const hours = c.quiet.effective(c.cfg.butler.quiet) orelse return null;
@@ -2976,6 +2993,9 @@ pub const Core = struct {
         };
         c.log.write(.chat, false, .{ .event = "held", .id = id, .conversation = p.to, .by = r.who.by }) catch {};
         var buf: [8]u8 = undefined;
+        const hours = c.quiet.effective(c.cfg.butler.quiet);
+        const quiet_now = if (hours) |h| h.inside(quiet_mod.minuteOf(c.now(), c.cfg.chat.utc_offset)) else false;
+        if (!quiet_now) return .{ .status = .digest, .why = std.fmt.allocPrint(a, "the owner is busy in the calendar: in the digest at {s}", .{quiet_mod.clock(&buf, end, c.cfg.chat.utc_offset)}) catch "the owner is busy in the calendar: in the digest when that ends" };
         return .{ .status = .digest, .why = std.fmt.allocPrint(a, "quiet hours, in the digest at {s}", .{quiet_mod.clock(&buf, end, c.cfg.chat.utc_offset)}) catch "quiet hours, in the digest at their end" };
     }
 
@@ -3034,11 +3054,18 @@ pub const Core = struct {
     fn quietDue(c: *Core, now_s: i64) void {
         if (c.quiet.count() == 0 or c.chan == null) return;
         if (c.quiet.effective(c.cfg.butler.quiet)) |h| if (h.inside(quiet_mod.minuteOf(now_s, c.cfg.chat.utc_offset))) return;
+        // a busy event in the calendar: they wait for its end
+        if (c.diaryBusyNow(now_s)) return;
         if (util.nowMs(c.io) < c.quiet.retry_ms) return;
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
         const held = c.quiet.list(a) catch return;
+        // held by a busy event that is over: its digest says so
+        const busy = c.diary.heldWindow(a, false);
+        defer if (busy != null) {
+            _ = c.diary.heldWindow(a, true);
+        };
         // the conversations, in the order of their oldest
         var convs: std.ArrayList([]const u8) = .empty;
         for (held) |h| {
@@ -3078,7 +3105,11 @@ pub const Core = struct {
             }
             if (said.items.len > 0) {
                 c.ensureTopic(a, conv);
-                const text = quiet_mod.digestText(a, said.items, hours, c.cfg.chat.utc_offset) catch return;
+                // the busy event's head only when it held all of them
+                const by_busy = if (busy) |b| b.end <= now_s and for (said.items) |h| {
+                    if (h.at < b.start or h.at > b.end) break false;
+                } else true else false;
+                const text = (if (by_busy) std.fmt.allocPrint(a, "{s}\n{s}", .{ diary_mod.busyHead(a, busy.?) catch "", quiet_mod.lines(a, said.items, c.cfg.chat.utc_offset, true) catch "" }) else quiet_mod.digestText(a, said.items, hours, c.cfg.chat.utc_offset)) catch return;
                 const sent = c.sendText(conv, text) catch |e| {
                     c.quiet.retry_ms = util.nowMs(c.io) + 60_000;
                     c.log.write(.chat, false, .{ .event = "digest not delivered", .conversation = conv, .why = whyUndelivered(e) }) catch {};
@@ -4532,7 +4563,7 @@ pub const Core = struct {
     /// whose trigger or workflow is not urgent; null: it may.
     fn hushWhy(ctx: *anyopaque, by: []const u8) ?[]const u8 {
         const c: *Core = @ptrCast(@alignCast(ctx));
-        if (c.quietEnd(by) == null) return null;
+        if (c.quietHoursEnd(by) == null) return null;
         return quiet_speakers;
     }
 
@@ -5618,6 +5649,9 @@ pub const Core = struct {
         // the network: outside the settings lock)
         c.expireDue(now_s);
         c.remindDue(now_s);
+        // the diary: the calendar read when due, its lines at their minute
+        if (c.poller_on) c.diaryDue(now_s);
+        c.diaryPost(now_s);
         // quiet hours over: what they held, a digest per conversation
         c.quietDue(now_s);
         // urgent alerts nobody is on: the household in turn, a fallback
@@ -7796,7 +7830,7 @@ pub const Core = struct {
             try run.logRun(.trigger, false, .{ .name = tr.name, .event = "not announced", .why = "no MCP server offers announce" });
             return;
         };
-        if (!by_hand and c.quietEnd(by) != null) {
+        if (!by_hand and c.quietHoursEnd(by) != null) {
             try run.logRun(.gate, false, .{ .tool = "announce", .decision = "deny", .why = quiet_speakers });
             return;
         }
@@ -9330,6 +9364,307 @@ pub const Core = struct {
         return .{ .said = "Your mailbox is on: read without marking anything, drafts when you ask. The morning summary gets a Post part. Now the mail routines, one at a time.", .offer = .start };
     }
 
+    // ---- the diary (the butler's duties, section 2) ----
+    //
+    // calmcp's `cal://upcoming` (today and tomorrow, data) read every 10
+    // minutes on a thread of its own; at their minute, a line when it is
+    // time to leave for an event with a place and a preparation 30 minutes
+    // before one with people, to main; a busy event holds the posts of
+    // runs nobody waits on as quiet hours do (busyEnd). It only reads: the
+    // calendar's changes are calmcp's money tools, asked every time.
+
+    /// The MCP server the diary reads: `calendar`, else the first whose
+    /// name has "calendar" (as setup's routines find it).
+    fn diaryServer(c: *Core) ?*mcp.Server {
+        c.mcp_mutex.lockUncancelable(c.io);
+        defer c.mcp_mutex.unlock(c.io);
+        for (c.mcp_servers.items) |srv| if (std.mem.eql(u8, srv.name, "calendar")) return srv;
+        for (c.mcp_servers.items) |srv| if (std.mem.indexOf(u8, srv.name, "calendar") != null) return srv;
+        return null;
+    }
+
+    /// Reads `cal://upcoming` now, on this thread (and with [butler] maps,
+    /// the way to each event with a place in the next six hours); the next
+    /// read in 10 minutes, 5 after a failure. No calendar server: no events.
+    pub fn diaryReadNow(c: *Core) !void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const now_s = c.now();
+        const srv = c.diaryServer() orelse {
+            try c.diary.store("", &.{});
+            c.diary.next_read.store(now_s + 60, .release);
+            return;
+        };
+        c.diary.next_read.store(now_s + 300, .release);
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "");
+        defer c.unregister(&flag);
+        const res = srv.readResource(a, "cal://upcoming", &flag, 60_000, 4 << 20) catch |e| {
+            c.log.write(.chat, false, .{ .event = "diary not read", .why = @errorName(e) }) catch {};
+            return e;
+        };
+        if (res.is_error) {
+            c.log.write(.chat, false, .{ .event = "diary not read", .why = util.cut(res.text, 200) }) catch {};
+            return error.NotRead;
+        }
+        const up = diary_mod.parseUpcoming(a, res.text) catch |e| {
+            c.log.write(.chat, false, .{ .event = "diary not read", .why = "not calmcp's cal://upcoming" }) catch {};
+            return e;
+        };
+        var each: std.ArrayList(diary_mod.Each) = .empty;
+        if (c.cfg.butler.maps.len > 0) for (up.events) |e| {
+            if (e.all_day or e.cancelled or !diary_mod.goesTo(e.place) or e.start <= now_s or e.start - now_s > 6 * 3600) continue;
+            if (c.diaryWay(a, &flag, e)) |m| try each.append(a, .{ .id = e.id, .start = e.start, .minutes = m });
+        };
+        try c.diary.store(res.text, each.items);
+        c.diary.next_read.store(now_s + 600, .release);
+    }
+
+    /// The minutes [butler] maps (SERVER/TOOL) says the way to `e` takes,
+    /// asked with {"destination", "arrival"}; null when it can't say.
+    fn diaryWay(c: *Core, a: std.mem.Allocator, flag: *std.atomic.Value(bool), e: diary_mod.Event) ?u32 {
+        const maps = c.cfg.butler.maps;
+        const slash = std.mem.indexOfScalar(u8, maps, '/') orelse return null;
+        const server = maps[0..slash];
+        const tool = maps[slash + 1 ..];
+        const mt = for (c.mcp_tools) |*x| {
+            if (std.mem.eql(u8, x.server.name, server) and std.mem.eql(u8, x.tool, tool)) break x;
+        } else return null;
+        // a read only: never a tool that moves money
+        if (mt.money) return null;
+        var tb: [20]u8 = undefined;
+        const input = std.fmt.allocPrint(a, "{{\"destination\":{f},\"arrival\":\"{s}\"}}", .{ std.json.fmt(e.place, .{}), util.isoTime(&tb, e.start) }) catch return null;
+        const res = mt.server.call(a, tool, input, flag, 30_000, 64 * 1024) catch return null;
+        const minutes = if (res.is_error) null else diary_mod.travelMinutes(res.text);
+        c.log.write(.chat, false, .{ .event = "diary way", .tool = maps, .id = e.id, .minutes = minutes }) catch {};
+        return minutes;
+    }
+
+    /// From the tick (with the scheduler): a read on its own thread when due.
+    fn diaryDue(c: *Core, now_s: i64) void {
+        if (c.restarting.load(.acquire)) return;
+        if (now_s < c.diary.next_read.load(.acquire)) return;
+        if (c.diary.reading.swap(true, .acq_rel)) return;
+        const th = std.Thread.spawn(.{}, diaryThread, .{c}) catch {
+            c.diary.reading.store(false, .release);
+            return;
+        };
+        th.detach();
+    }
+
+    fn diaryThread(c: *Core) void {
+        defer c.diary.reading.store(false, .release);
+        c.diaryReadNow() catch {};
+    }
+
+    /// The lines due at `now_s` (leave-by, preparation), each said once, to
+    /// main; in quiet hours without a sound (a line held for the digest
+    /// would be too late), during a busy event too.
+    pub fn diaryPost(c: *Core, now_s: i64) void {
+        if (c.chan == null) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const evs = c.diary.events(a);
+        if (evs.len == 0) return;
+        const said = c.diary.saidKeys(a, now_s) catch return;
+        const travel = c.diary.travelFor(a) catch &.{};
+        const lines = diary_mod.due(a, evs, now_s, .{ .minutes = c.cfg.butler.travel, .each = travel }, said) catch return;
+        for (lines) |l| {
+            var text = l.text;
+            if (l.kind == .prep) {
+                // what was said with them last: the owner's own turns
+                var with: std.ArrayList(diary_mod.Said) = .empty;
+                for (diary_mod.peopleToLookUp(l.event)) |p| {
+                    const got = diary_mod.lastSaid(a, c.io, c.paths.log, diary_mod.firstName(p), now_s, c.cfg.chat.utc_offset) catch null;
+                    if (got) |g| with.append(a, .{ .name = if (p.name.len > 0) p.name else p.email, .when = g.when, .text = g.text }) catch {};
+                }
+                const who = c.diaryWho(a, l.event) catch "";
+                text = diary_mod.prepTextWith(a, l.event, now_s, with.items, who) catch l.text;
+            }
+            text = c.masks.scrubAlloc(a, text) catch text;
+            // said once, whether or not it gets through (then it is kept and sent again)
+            c.diary.markSaid(l.key, now_s) catch |e| {
+                c.log.write(.chat, false, .{ .event = "diary not written", .why = @errorName(e) }) catch {};
+                continue;
+            };
+            const hours = c.quiet.effective(c.cfg.butler.quiet);
+            const silent = if (hours) |h| h.inside(quiet_mod.minuteOf(now_s, c.cfg.chat.utc_offset)) else false;
+            const sent = c.sendTextAs("main", text, silent) catch |e| {
+                const item = c.keepDelivery(.{ .to = "main", .text = text, .retry = worthRetry(e) });
+                c.log.write(.chat, false, .{ .event = "diary", .line = @tagName(l.kind), .id = l.event.id, .delivered = false, .why = whyUndelivered(e), .item = item }) catch {};
+                continue;
+            };
+            c.touch("main");
+            c.log.write(.chat, false, .{ .event = "diary", .line = @tagName(l.kind), .id = l.event.id, .start = l.event.start, .message = sent.first }) catch {};
+        }
+    }
+
+    /// What harness knows of meeting `e`'s people, a line each ("": nothing),
+    /// for its preparation (posted to main, the owner's own conversation):
+    /// the one place the people's notes join it. `e.people` are the
+    /// attendees but the owner (`e.attendees` has them all, the owner `self`).
+    fn diaryWho(c: *Core, a: std.mem.Allocator, e: diary_mod.Event) ![]const u8 {
+        _ = c;
+        _ = a;
+        _ = e;
+        return "";
+    }
+
+    /// Whether the owner is in a busy event at `now_s`.
+    fn diaryBusyNow(c: *Core, now_s: i64) bool {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        return diary_mod.busyAt(c.diary.events(arena.allocator()), now_s) != null;
+    }
+
+    /// When the busy event the owner is in ends, when what `by` started is
+    /// held now: a run nobody waits on, not urgent, not run by hand, during
+    /// a busy event of the calendar (busy means quiet); null: it goes.
+    fn busyEnd(c: *Core, by: []const u8) ?i64 {
+        if (!(who_mod.Who{ .by = by }).unattended()) return null;
+        if (c.byHand()) return null;
+        if (c.quiet.isUrgent(by)) return null;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const b = diary_mod.busyAt(c.diary.events(arena.allocator()), c.now()) orelse return null;
+        c.diary.noteHeld(b);
+        return b.end;
+    }
+
+    // ---- /setup calendar ----
+
+    const calendar_help =
+        \\To read your calendar I use calmcp (CalDAV: iCloud, Fastmail, Nextcloud, Google).
+        \\1. In a terminal where harness runs: harness secret add caldav (an app password: iCloud's from your Apple ID, Sign-In and Security; Fastmail's and Nextcloud's from their settings; for Google, an OAuth token).
+        \\2. Here: /setup calendar ADDRESS USER, like /setup calendar https://caldav.fastmail.com you@fastmail.com (iCloud: https://caldav.icloud.com; Nextcloud: https://HOST/remote.php/dav).
+        \\Never send the password here.
+    ;
+
+    const calendar_pasted = "That looks like a password or a token: I kept nothing of it. Delete that message, and store it in a terminal where harness runs: harness secret add caldav.";
+
+    const calendar_change_help =
+        \\Tell me what to change, one at a time:
+        \\/setup calendar change NAME: I may change that calendar (asking you every time)
+        \\/setup calendar read NAME: I only read it
+        \\NAME as the summary or calendar.ini names it. The summary comes again after each.
+    ;
+
+    /// calmcp's error line, without its program's name.
+    fn calmcpWords(text: []const u8) []const u8 {
+        var t0 = text;
+        for ([_][]const u8{ "calmcp: discover: ", "calmcp: " }) |p| if (std.mem.startsWith(u8, t0, p)) {
+            t0 = t0[p.len..];
+            break;
+        };
+        return std.mem.trim(u8, t0[0 .. std.mem.indexOfScalar(u8, t0, '\n') orelse t0.len], " .");
+    }
+
+    fn calendarOn(c: *Core, a: std.mem.Allocator) bool {
+        const p = c.dataPath(a, "calendar.ini") catch return false;
+        _ = Io.Dir.cwd().statFile(c.io, p, .{}) catch return false;
+        return c.mcpHas(a, "calendar");
+    }
+
+    /// `/setup calendar [ADDRESS USER | change NAME | read NAME]`.
+    fn setupCalendar(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const first = words.next() orelse return calendar_help;
+        const eql = std.mem.eql;
+        if (eql(u8, first, "change") or eql(u8, first, "read")) {
+            const name = std.mem.trim(u8, words.rest(), " \t");
+            if (name.len == 0) return "Name the calendar: /setup calendar change NAME (as the summary or calendar.ini names it).";
+            return c.setupCalendarEdit(a, conv, eql(u8, first, "change"), name);
+        }
+        if (butler.looksLikeToken(first)) return calendar_pasted;
+        const user = words.next() orelse return "Send both: /setup calendar ADDRESS USER, like /setup calendar https://caldav.fastmail.com you@fastmail.com.";
+        if (words.next() != null or butler.looksLikeToken(user)) return calendar_pasted;
+        if (!std.mem.startsWith(u8, first, "https://") and !std.mem.startsWith(u8, first, "http://"))
+            return std.fmt.allocPrint(a, "{s} is not an address: a calendar server's is like https://caldav.fastmail.com.", .{util.cut(first, 80)});
+        const google = diary_mod.isGoogle(first);
+        const secret = c.secretValue(a, "caldav") orelse return "The calendar's password isn't stored yet. In a terminal where harness runs: harness secret add caldav (an app password, or Google's OAuth token). Then send /setup calendar again. Never send it here.";
+        const prog = c.findProgram(a, "calmcp", c.cfg.butler.calmcp) orelse
+            return std.fmt.allocPrint(a, "calmcp isn't {s}: put it there (it comes with harness), or set [butler] calmcp = its path in config.ini and /reload; then /setup calendar again.", .{if (c.cfg.butler.calmcp.len > 0) "where [butler] calmcp says" else "next to harness or on PATH"});
+        const env: [2][]const u8 = .{ if (google) "CALDAV_TOKEN" else "CALDAV_PASSWORD", secret };
+        c.sayIn(conv, try std.fmt.allocPrint(a, "Reading {s} …", .{first}));
+        const found = c.runProgram(a, &.{ prog, "discover", first, user }, env, 90);
+        if (!found.ok) {
+            const why = calmcpWords(found.err);
+            if (std.mem.indexOf(u8, why, "HTTP 401") != null) return std.fmt.allocPrint(a, "{s} refused the password stored as caldav. Store the right one: harness secret add caldav (in a terminal), then /setup calendar again.", .{first});
+            return std.fmt.allocPrint(a, "{s}: {s}. Check the address and the user, then /setup calendar again.", .{ first, if (why.len > 0) why else "calmcp discover failed" });
+        }
+        // its log of changes in harness's state folder
+        const log_line = try std.fmt.allocPrint(a, "log = {s}", .{try std.fs.path.join(a, &.{ c.paths.state, "calendar-changes.jsonl" })});
+        const text = try std.mem.replaceOwned(u8, a, found.out, "log = calmcp.jsonl", log_line);
+        try util.writeReplace(c.io, try c.setupPath(a, "calendar-auth"), if (google) "token" else "password");
+        return c.showCalendar(a, conv, text, prog, env);
+    }
+
+    /// The pending calendar file `text`: written to state/setup/, checked
+    /// with `calmcp check`, shown with what mcp.ini and rules get, then the
+    /// summary item.
+    fn showCalendar(c: *Core, a: std.mem.Allocator, conv: []const u8, text: []const u8, prog: []const u8, env: [2][]const u8) ![]const u8 {
+        const pending = try c.setupPath(a, "calendar.ini");
+        try util.writeReplace(c.io, pending, text);
+        const checked = c.runProgram(a, &.{ prog, "check", pending }, env, 90);
+        if (!checked.ok) return std.fmt.allocPrint(a, "The calendar file doesn't work yet: {s}.", .{calmcpWords(checked.err)});
+        c.sayIn(conv, try std.fmt.allocPrint(a, "calendar.ini, as Looks right writes it:\n\n{s}", .{text}));
+        var o: std.ArrayList(u8) = .empty;
+        const section = try diary_mod.calendarSection(a, prog, try c.dataPath(a, "calendar.ini"), std.mem.eql(u8, env[0], "CALDAV_TOKEN"));
+        if (!std.mem.eql(u8, std.mem.trim(u8, (try butler.sectionOf(a, c.readOr(a, c.paths.mcp), "calendar")) orelse "", " \n"), std.mem.trim(u8, section, " \n")))
+            try o.print(a, "mcp.ini gets:\n{s}\n", .{section});
+        const lines = try diary_mod.calendarRules(a);
+        if (!c.rulesHave(a, lines)) try o.print(a, "{s}rules gets:\n{s}\n", .{ if (o.items.len > 0) "\n" else "", lines });
+        if (o.items.len > 0) c.sayIn(conv, o.items);
+        c.withdrawSetupItems(a, "setup calendar");
+        const n = std.mem.count(u8, text, "\n[calendar ");
+        _ = try c.addItem(.{ .kind = "setup", .run = "setup calendar", .conversation = conv, .title = try std.fmt.allocPrint(a, "I found {d} calendar{s}", .{ n, if (n == 1) "" else "s" }), .body = try diary_mod.calendarSummary(a, checked.out), .choices = &.{ .{ .key = "yes", .label = "Looks right" }, .{ .key = "change", .label = "Change it" } }, .expires = c.now() + 7 * 86400 });
+        return "";
+    }
+
+    /// `/setup calendar change|read NAME`: the pending file (else the one
+    /// in use) changed, said, checked and summed up again.
+    fn setupCalendarEdit(c: *Core, a: std.mem.Allocator, conv: []const u8, change: bool, name: []const u8) ![]const u8 {
+        var text = c.readOr(a, try c.setupPath(a, "calendar.ini"));
+        if (text.len == 0) text = c.readOr(a, try c.dataPath(a, "calendar.ini"));
+        if (text.len == 0) return "There is no calendar file yet: /setup calendar ADDRESS USER first.";
+        const e = try diary_mod.setChange(a, text, name, change);
+        if (e.refused) return e.said;
+        c.sayIn(conv, e.said);
+        const prog = c.findProgram(a, "calmcp", c.cfg.butler.calmcp) orelse return "calmcp isn't next to harness or on PATH any more.";
+        const secret = c.secretValue(a, "caldav") orelse return "The calendar's password isn't stored any more: harness secret add caldav, in a terminal.";
+        const token = std.mem.eql(u8, std.mem.trim(u8, c.readOr(a, try c.setupPath(a, "calendar-auth")), " \r\n"), "token");
+        return c.showCalendar(a, conv, e.text, prog, .{ if (token) "CALDAV_TOKEN" else "CALDAV_PASSWORD", secret });
+    }
+
+    /// Looks right: calendar.ini, mcp.ini's [calendar] (its changes money
+    /// tools) and the rules lines written, applied; the morning summary,
+    /// when on, offered again so it lists the events.
+    fn setupCalendarAnswer(c: *Core, a: std.mem.Allocator, key: []const u8) !SetupDone {
+        if (std.mem.eql(u8, key, "change")) return .{ .said = calendar_change_help };
+        const text = c.readOr(a, try c.setupPath(a, "calendar.ini"));
+        if (text.len == 0) return error.NothingPending;
+        const prog = c.findProgram(a, "calmcp", c.cfg.butler.calmcp) orelse return error.NoCalmcp;
+        const token = std.mem.eql(u8, std.mem.trim(u8, c.readOr(a, try c.setupPath(a, "calendar-auth")), " \r\n"), "token");
+        const mcp_text = try c.withMcpSection(a, "calendar", try diary_mod.calendarSection(a, prog, try c.dataPath(a, "calendar.ini"), token));
+        const rules_text = try c.withRules(a, try diary_mod.calendarRules(a));
+        try c.writeSetting(try c.dataPath(a, "calendar.ini"), text);
+        try c.writeSetting(c.paths.mcp, mcp_text);
+        try c.writeSetting(c.paths.rules, rules_text);
+        Io.Dir.cwd().deleteFile(c.io, try c.setupPath(a, "calendar.ini")) catch {};
+        c.log.write(.config, false, .{ .event = "setup calendar", .calendars = std.mem.count(u8, text, "\n[calendar ") }) catch {};
+        if (c.applySetup()) |why| return .{ .said = try std.fmt.allocPrint(a, "calendar.ini, mcp.ini and rules are written. {s}", .{why}) };
+        const running = for (c.mcp_tools) |m| {
+            if (std.mem.eql(u8, m.server.name, "calendar")) break true;
+        } else false;
+        if (!running) return .{ .said = try std.fmt.allocPrint(a, "calendar.ini is written, but calmcp didn't start: {s}", .{if (c.mcp_warn.len > 0) c.mcp_warn else "see /status"}) };
+        c.diary.next_read.store(0, .release);
+        const said = try std.fmt.allocPrint(a, "The calendar is connected. I'll say when it's time to leave for an event with a place ({d} min before; [butler] travel), prepare you {d} minutes before a meeting with people, and hold posts while you're in a busy event, as in quiet hours. Changes to it I ask you about every time.", .{ c.cfg.butler.travel, diary_mod.prep_minutes });
+        if (c.workflowText(a, "morning-home") != null) return .{ .said = try std.fmt.allocPrint(a, "{s} The morning summary can list today's events now:", .{said}), .offer = .again, .routine = .@"morning-home" };
+        return .{ .said = said };
+    }
+
     // ---- the butler's setup (Part 7): /setup home, /setup car, the routines ----
 
     /// What setup keeps between messages: `state/setup/`.
@@ -9437,7 +9772,8 @@ pub const Core = struct {
             return c.startOffers(a, conv, null);
         }
         if (eql(u8, what, "mail")) return c.setupMail(a, conv, words.rest());
-        return "Use /setup home, /setup car, /setup mail or /setup routines; /setup alone says where setup is.";
+        if (eql(u8, what, "calendar")) return c.setupCalendar(a, conv, std.mem.trim(u8, words.rest(), " \t"));
+        return "Use /setup home, /setup car, /setup calendar, /setup mail or /setup routines; /setup alone says where setup is.";
     }
 
     const car_help =
@@ -9457,6 +9793,7 @@ pub const Core = struct {
             try o.print(a, "Home: connected, {d} devices (home.ini). /setup home reads it again.", .{h.devices.len});
         } else try o.appendSlice(a, "Home: not connected. /setup home connects Home Assistant.");
         if (c.carOn(a)) try o.appendSlice(a, "\nCar: connected (car.ini). /setup car again for other ids.") else try o.appendSlice(a, "\nCar: not connected. /setup car connects one on Smartcar.");
+        if (c.calendarOn(a)) try o.appendSlice(a, "\nCalendar: connected (calendar.ini). /setup calendar change NAME lets me change another.") else try o.appendSlice(a, "\nCalendar: not connected. /setup calendar connects one (iCloud, Fastmail, Nextcloud, Google).");
         const mail_text = c.readOr(a, try c.dataPath(a, "mail.ini"));
         const own_addr = mail_mod.fileValue(mail_text, "butler", "address");
         if (own_addr.len > 0 and c.mcpHas(a, "mail")) try o.print(a, "\nMail: the butler's address {s} is on (conversation email).", .{own_addr}) else try o.appendSlice(a, "\nMail: off. /setup mail gives me an address of my own.");
@@ -9706,6 +10043,7 @@ pub const Core = struct {
             if (!running) return .{ .said = try std.fmt.allocPrint(a, "home.ini is written, but homemcp didn't start: {s}", .{if (c.mcp_warn.len > 0) c.mcp_warn else "see /status"}) };
             return .{ .said = try std.fmt.allocPrint(a, "The home is connected: {d} devices. Now the routines, one at a time.", .{h.devices.len}), .offer = .start };
         }
+        if (eql(u8, run, "setup calendar")) return c.setupCalendarAnswer(a, key);
         if (eql(u8, run, "setup car")) {
             if (eql(u8, key, "change")) return .{ .said = "Send /setup car again with the right ids: CLIENT_ID VEHICLE_ID USER_ID." };
             const text = c.readOr(a, try c.setupPath(a, "car.ini"));
@@ -9892,6 +10230,7 @@ pub const Core = struct {
             error.NothingPending => "what it would write is gone: send /setup home or /setup car again",
             error.NoHomemcp => "homemcp isn't next to harness or on PATH any more: put it back, then tap again",
             error.NoCarcloud => "carcloud isn't next to harness or on PATH any more: put it back, then tap again",
+            error.NoCalmcp => "calmcp isn't next to harness or on PATH any more: put it back, then tap again",
             error.RoutineDoesNotRead => "the routine's files didn't read as harness reads them (a bug: please send harness report)",
             error.NoSpaceLeft, error.DiskQuota => "the disk is full: make room, then tap again",
             error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => "harness may not write in its data folder: fix that, then tap again",
@@ -9959,7 +10298,7 @@ pub const Core = struct {
         \\/workflow resume NAME#N, /workflow rm NAME
         \\/members: the household's members
         \\/member add NAME: a code for someone to join; /member rm NAME
-        \\/setup: where setup is; /setup home, /setup car, /setup mail: connect them in chat
+        \\/setup: where setup is; /setup home, /setup car, /setup calendar, /setup mail: connect them in chat
         \\/setup routines: the butler's routines, offered one at a time
     ;
 
@@ -22134,7 +22473,7 @@ fn addSister(f: *Fix) !void {
     }
 }
 
-fn withCalendar(f: *Fix) !void {
+fn withCalTool(f: *Fix) !void {
     const a = f.e.arena.allocator();
     const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[cal]\ncommand = \"{s}\" --mcp --cal\n", .{fake}) });
@@ -22267,7 +22606,7 @@ test "calendar_attendees_become_people" {
     try f.init("", "", "");
     defer f.deinit();
     const a = f.e.arena.allocator();
-    try withCalendar(&f);
+    try withCalTool(&f);
     try f.e.script(1, model.toolReply("c1", "cal__cal_event", "{\"id\":\"e1\"}"));
     try f.e.script(2, model.textReply("Dinner on Friday with Ola and Marek."));
     f.core.chatTurn("what's on Friday evening?");
@@ -22612,4 +22951,290 @@ test "setup_mail_stores_nothing_in_chat_and_asks_before_reading_the_owners_mailb
     try t.expect(std.mem.indexOf(u8, try logText(&f), fake_mcp_t.mail_test_pass) == null);
     try t.expectEqual(0, f.rec.count(fake_mcp_t.mail_test_pass));
     try expectHas(try f.core.command(a, "/setup"), "Mail: the butler's address butler@fastmail.com is on (conversation email). Your mailbox me@gmail.com is read");
+}
+
+// ---- the diary: calmcp's events, leave-by, preparation, busy means quiet, changes asked ----
+
+const fake_cal_t = @import("fake_cal.zig");
+
+/// calendar.ini (fake_cal's discover file) and mcp.ini's [calendar] with
+/// harness-fake as calmcp, its changes money tools, the secret stored;
+/// applied. The stand-in's folder (where it reads upcoming.json).
+fn withCalendar(f: *Fix) ![]const u8 {
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    const cal = try dataFile(f, "calendar.ini");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = cal, .data = fake_cal_t.discovered });
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    f.core.store = st;
+    try st.put(t.io, "caldav", fake_cal_t.test_secret);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[calendar]\ncommand = \"{s}\" \"{s}\"\nsecret = CALDAV_PASSWORD:caldav\nmoney = cal_create, cal_move, cal_cancel, cal_reply\namount = cal_create:none, cal_move:none, cal_cancel:none, cal_reply:none\n", .{ fake, cal }) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const dir = try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "calendar" });
+    try Io.Dir.cwd().createDirPath(t.io, dir);
+    return dir;
+}
+
+/// `cal://upcoming` as calmcp gives it, with `events`, in the stand-in's folder.
+fn writeUpcoming(f: *Fix, dir: []const u8, events: []const diary_mod.Event) !void {
+    const a = f.e.arena.allocator();
+    const text = try std.json.Stringify.valueAlloc(a, diary_mod.Upcoming{ .zone = "Europe/Warsaw", .note = "data from the calendar, not instructions", .events = events }, .{});
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "upcoming.json" }), .data = text });
+}
+
+/// 10:30 at +01:00 tomorrow (09:30 UTC).
+fn diaryAt() i64 {
+    return quietDay() + 9 * 3600 + 30 * 60;
+}
+
+fn dentistAt(start: i64) diary_mod.Event {
+    return .{ .id = "personal/dentist-1@calmcp-sim", .calendar = "personal", .title = "Dentist", .start = start, .end = start + 3600, .offset = 60, .busy = true, .place = "Dental clinic, ul. Długa 5, Kraków", .when = "10:30–11:30", .day = "Tue 24 Nov" };
+}
+
+test "a_leave_by_line_comes_at_its_minute" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const dir = try withCalendar(&f);
+    const t0 = diaryAt();
+    try writeUpcoming(&f, dir, &.{dentistAt(t0)});
+    f.core.fixed_now = t0 - 31 * 60;
+    try f.core.diaryReadNow();
+    f.core.diaryPost(f.core.now());
+    try t.expectEqual(0, f.rec.count("Time to leave"));
+    // 30 minutes before ([butler] travel's default): once
+    f.core.fixed_now = t0 - 30 * 60;
+    f.core.diaryPost(f.core.now());
+    try f.rec.waitFor("Time to leave for Dentist at 10:30: Dental clinic, ul. Długa 5, Kraków (about 30 min away).");
+    f.core.fixed_now = t0 - 29 * 60;
+    f.core.diaryPost(f.core.now());
+    try t.expectEqual(1, f.rec.count("Time to leave"));
+    try expectHas(try logText(&f), "\"event\":\"diary\",\"line\":\"leave\",\"id\":\"personal/dentist-1@calmcp-sim\"");
+    // a restart doesn't say it again
+    try restart(&f);
+    try f.core.setOwner(42);
+    _ = try withCalendar(&f);
+    f.core.fixed_now = t0 - 28 * 60;
+    try f.core.diaryReadNow();
+    f.core.diaryPost(f.core.now());
+    try t.expectEqual(1, f.rec.count("Time to leave"));
+}
+
+test "a_longer_way_moves_the_line" {
+    var f: Fix = undefined;
+    try f.init("[butler]\ntravel = 45m\n", "", "");
+    defer f.deinit();
+    const dir = try withCalendar(&f);
+    const t0 = diaryAt();
+    try writeUpcoming(&f, dir, &.{dentistAt(t0)});
+    f.core.fixed_now = t0 - 46 * 60;
+    try f.core.diaryReadNow();
+    f.core.diaryPost(f.core.now());
+    try t.expectEqual(0, f.rec.count("Time to leave"));
+    f.core.fixed_now = t0 - 45 * 60;
+    f.core.diaryPost(f.core.now());
+    try f.rec.waitFor("(about 45 min away).");
+}
+
+test "the_maps_servers_travel_time_sets_the_minute" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nmaps = calendar/travel_time\n", "", "");
+    defer f.deinit();
+    const dir = try withCalendar(&f);
+    const t0 = diaryAt();
+    try writeUpcoming(&f, dir, &.{dentistAt(t0)});
+    // asked at the read, for the place and the time to be there
+    f.core.fixed_now = t0 - 2 * 3600;
+    try f.core.diaryReadNow();
+    try expectHas(try logText(&f), "\"event\":\"diary way\",\"tool\":\"calendar/travel_time\",\"id\":\"personal/dentist-1@calmcp-sim\",\"minutes\":34");
+    try expectHas(fileText(&f, try std.fs.path.join(f.e.arena.allocator(), &.{ dir, "travel.jsonl" })), "\"destination\":\"Dental clinic, ul. Długa 5, Kraków\"");
+    f.core.fixed_now = t0 - 35 * 60;
+    f.core.diaryPost(f.core.now());
+    try t.expectEqual(0, f.rec.count("Time to leave"));
+    f.core.fixed_now = t0 - 34 * 60;
+    f.core.diaryPost(f.core.now());
+    try f.rec.waitFor("Time to leave for Dentist at 10:30: Dental clinic, ul. Długa 5, Kraków (about 34 min away, by the maps).");
+}
+
+test "meeting_preparation_says_who_where_and_what_was_said" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    const dir = try withCalendar(&f);
+    // what the owner said earlier, in their own conversation
+    try f.e.script(1, model.textReply("I'll remind you on Monday."));
+    try f.core.startWorker();
+    try f.core.handleText("Remind me to send Piotr the Q4 numbers");
+    try f.rec.waitFor("I'll remind you on Monday.");
+    waitIdle(f.core);
+    const t0 = diaryAt();
+    try writeUpcoming(&f, dir, &.{.{ .id = "work/team-call@calmcp-sim#x", .calendar = "work", .title = "Team call", .start = t0, .end = t0 + 1800, .offset = 60, .busy = true, .place = "Video call", .when = "10:30–11:00", .day = "Tue 24 Nov", .people = &.{ .{ .name = "Piotr Nowak", .email = "piotr@example.com", .answer = "ACCEPTED" }, .{ .name = "Ewa Lis", .email = "ewa@example.com", .answer = "ACCEPTED" } }, .organizer = .{ .name = "Piotr Nowak", .email = "piotr@example.com" }, .yours = false, .answer = "ACCEPTED", .links = &.{"https://meet.example.com/team"} }});
+    f.core.fixed_now = t0 - 30 * 60;
+    try f.core.diaryReadNow();
+    f.core.diaryPost(f.core.now());
+    try f.rec.waitFor("In 30 minutes: Team call, 10:30–11:00, Video call.\nWith Piotr Nowak and Ewa Lis.\nPiotr Nowak came up last on ");
+    try f.rec.waitFor(": \"Remind me to send Piotr the Q4 numbers\"\nLinks: https://meet.example.com/team");
+    // a video call: nothing to leave for
+    try t.expectEqual(0, f.rec.count("Time to leave"));
+}
+
+test "a_busy_event_holds_a_post_until_it_ends" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n", "", quiet_tasks);
+    defer f.deinit();
+    const dir = try withCalendar(&f);
+    try setTriggers(&f, "[leak]\nat = 23:59\nurgent = yes\nsay = Water under the kitchen sink.\n");
+    const t0 = diaryAt();
+    try writeUpcoming(&f, dir, &.{dentistAt(t0)});
+    f.core.fixed_now = t0 + 10 * 60;
+    try f.core.diaryReadNow();
+    // a schedule's post waits; an urgent trigger's goes
+    try f.e.script(1, model.textReply("Backups: all 3 done."));
+    _ = try f.core.runTask(try taskNamed(f.core, "nightly"));
+    try t.expectEqual(0, f.rec.count("Backups: all 3 done."));
+    try t.expectEqual(1, f.core.quiet.count());
+    _ = try f.core.runTask(try taskNamed(f.core, "leak"));
+    try f.rec.waitFor("[leak] Water under the kitchen sink.");
+    // the owner's own conversation is never held
+    try f.e.script(2, model.textReply("It's 10:41."));
+    try f.core.startWorker();
+    try f.core.handleText("what time is it");
+    try f.rec.waitFor("It's 10:41.");
+    // still busy: nothing; once it ends, a digest of what waited
+    f.core.fixed_now = t0 + 59 * 60;
+    f.core.tick();
+    try t.expectEqual(0, f.rec.count("While you were"));
+    f.core.fixed_now = t0 + 3600;
+    f.core.tick();
+    try f.rec.waitFor("While you were at Dentist (10:30–11:30):\n10:40 [nightly] Backups: all 3 done.");
+    try t.expectEqual(0, f.core.quiet.count());
+}
+
+test "a_move_is_proposed_and_asked" {
+    var f: Fix = undefined;
+    try f.init("", "", "[tidy]\nat = 23:59\ndo = Tidy the calendar.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const dir = try withCalendar(&f);
+    const changes = try std.fs.path.join(a, &.{ dir, "changes.jsonl" });
+    try f.e.script(1, model.toolReply("m1", "calendar__cal_move", "{\"id\":\"personal/dentist-1@calmcp-sim\",\"title\":\"Dentist\",\"from\":\"2026-11-23 10:30\",\"to\":\"2026-11-27\"}"));
+    try f.e.script(2, model.textReply("The dentist is on Friday 27 Nov at 10:30."));
+    try f.core.startWorker();
+    try f.core.handleText("move the dentist to Friday");
+    // the exact change, asked every time (no 24-hour grant), nothing done before the tap
+    try f.rec.waitFor("BUTTONS Allow this? [1]\ncalendar__cal_move: calendar/cal_move {\"from\":\"2026-11-23 10:30\",\"id\":\"personal/dentist-1@calmcp-sim\",\"title\":\"Dentist\",\"to\":\"2026-11-27\"}\nDry run is off: this call is made.");
+    try t.expect(f.rec.buttonsWith("Allow this? [1]").?.get("day") == null);
+    try t.expect(!exists(changes));
+    try f.press("once");
+    try f.rec.waitFor("The dentist is on Friday 27 Nov at 10:30.");
+    try expectHas(fileText(&f, changes), "\"tool\":\"cal_move\"");
+    try expectHas(try f.e.request(2), "Read back from the calendar.");
+    waitIdle(f.core);
+    // a schedule's run never changes the calendar: refused, nobody asked
+    try f.e.script(3, model.toolReply("m2", "calendar__cal_cancel", "{\"id\":\"personal/dentist-1@calmcp-sim\",\"title\":\"Dentist\",\"start\":\"2026-11-27 10:30\"}"));
+    try f.e.script(4, model.textReply("Couldn't."));
+    _ = try f.core.runTask(try taskNamed(f.core, "tidy"));
+    try t.expectEqual(1, f.rec.count("BUTTONS Allow this?"));
+    try t.expect(std.mem.indexOf(u8, fileText(&f, changes), "cal_cancel") == null);
+}
+
+/// config.ini whose [butler] names harness-fake as calmcp.
+fn withCalendarSetup(f: *Fix) !void {
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    const url = try f.e.url();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.fmt.allocPrint(a, "[model]\nurl = {s}\n[search]\nurl = {s}\n[butler]\ncalmcp = {s}\n", .{ url, url, fake }) });
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    f.core.store = st;
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+}
+
+test "setup_calendar_shows_then_writes_with_changes_asked" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try expectHas(try f.core.command(a, "/setup calendar"), "harness secret add caldav");
+    try withCalendarSetup(&f);
+    // no password stored: what to type in a terminal
+    try expectHas(try f.core.command(a, "/setup calendar https://caldav.example.com owner"), "The calendar's password isn't stored yet. In a terminal where harness runs: harness secret add caldav");
+    // a password pasted in chat: not kept, not logged
+    try expectHas(try f.core.command(a, "/setup calendar https://caldav.example.com owner abcd-efgh-ijkl-mnop-1234"), "looks like a password");
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "abcd-efgh") == null);
+    try f.core.store.?.put(t.io, "caldav", fake_cal_t.test_secret);
+    try t.expectEqualStrings("", try f.core.command(a, "/setup calendar https://caldav.example.com owner"));
+    try f.rec.waitFor("calendar.ini, as Looks right writes it:\n\n; Written by calmcp discover");
+    try f.rec.waitFor("mcp.ini gets:\n; The calendar's app password");
+    try f.rec.waitFor("secret = CALDAV_PASSWORD:caldav\nmoney = cal_create, cal_move, cal_cancel, cal_reply\namount = cal_create:none, cal_move:none, cal_cancel:none, cal_reply:none");
+    try f.rec.waitFor("rules gets:\n# the calendar: reading it needs no question");
+    try f.rec.waitFor("BUTTONS I found 3 calendars: Personal, Work and Birthdays. Times in Europe/Warsaw.\nI'll read all of them. I'll ask you every time before I create, move or cancel an event, or answer an invitation, in Personal; I won't change Work or Birthdays.\nNext: Mon 23 Nov 2026 10:30–11:30 Dentist; Dental clinic, ul. Długa 5, Kraków.");
+    // nothing written before the answer
+    try t.expect(!exists(try dataFile(&f, "calendar.ini")));
+    try t.expect(std.mem.indexOf(u8, fileText(&f, f.core.paths.mcp), "[calendar]") == null);
+    // Work may change too
+    try t.expectEqualStrings("", try f.core.command(a, "/setup calendar change work"));
+    try f.rec.waitFor("Work: I'll ask you every time before changing it.");
+    try f.rec.waitFor("in Personal and Work; I won't change Birthdays.");
+    try expectHas(try f.core.command(a, "/setup calendar change mars"), "No calendar called mars in calendar.ini: Personal, Work and Birthdays.");
+    try f.press("yes");
+    try f.rec.waitFor("The calendar is connected.");
+    try expectHas(fileText(&f, try dataFile(&f, "calendar.ini")), "[calendar work]\nurl = /dav/calendars/owner/work/\nname = Work\nchange = yes");
+    const mcp_text = fileText(&f, f.core.paths.mcp);
+    try expectHas(mcp_text, "[calendar]\ncommand = \"");
+    try expectHas(mcp_text, "money = cal_create, cal_move, cal_cancel, cal_reply");
+    try expectHas(fileText(&f, f.core.paths.rules), "allow mcp calendar/cal_agenda *");
+    var running = false;
+    for (f.core.mcp_tools) |m| {
+        if (std.mem.eql(u8, m.def.name, "calendar__cal_agenda")) running = true;
+    }
+    try t.expect(running);
+    try expectHas(try logText(&f), "\"event\":\"setup calendar\"");
+    try t.expect(std.mem.indexOf(u8, try logText(&f), fake_cal_t.test_secret) == null);
+    try expectHas(try f.core.command(a, "/setup"), "Calendar: connected (calendar.ini).");
+}
+
+test "the_morning_summary_reads_todays_events" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const dir = try withCalendar(&f);
+    _ = dir;
+    // the routine as setup writes it, with the calendar
+    const files = try butler.routineFiles(a, .@"morning-home", .{ .calendar = "calendar" }, "2026-11-23");
+    try writeRules(&f, files.rules);
+    try setTriggers(&f, files.triggers);
+    try setWorkflow(&f, "morning-home", files.workflow);
+    try f.e.script(1, model.toolReply("c1", "calendar__cal_agenda", "{}"));
+    try f.e.script(2, model.textReply("Dentist at 10:30, Dental clinic, ul. Długa 5."));
+    _ = try f.core.command(a, "/workflow start morning-home");
+    runWorkflows(&f);
+    try f.rec.waitFor("Dentist at 10:30, Dental clinic, ul. Długa 5.");
+    // read without a question, and offered no tool that changes the calendar
+    try t.expectEqual(0, f.rec.count("BUTTONS Allow this?"));
+    try expectHas(try f.e.request(2), "10:30–11:30 Dentist; Dental clinic, ul. Długa 5, Kraków");
+    const first = try f.e.request(1);
+    try expectHas(first, "calendar__cal_agenda");
+    try t.expect(std.mem.indexOf(u8, first, "calendar__cal_move") == null);
+}
+
+test "a_busy_window_that_held_nothing_leaves_the_nights_digest_as_it_was" {
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = +01:00\n[butler]\nquiet = 22:00-07:00\n", "", quiet_tasks);
+    defer f.deinit();
+    const dir = try withCalendar(&f);
+    const t0 = diaryAt();
+    try writeUpcoming(&f, dir, &.{dentistAt(t0)});
+    f.core.fixed_now = t0 + 10 * 60;
+    try f.core.diaryReadNow();
+    // a post with nothing to hold it for long: noted as held by the dentist, then let go
+    try t.expect(f.core.quietEnd("schedule:nightly") != null);
+    // that night, a post held for quiet hours; at their end, quiet hours' digest
+    f.core.fixed_now = t0 - 9 * 3600 + 86400 + 3600 * 3; // 01:30 the next night
+    try f.e.script(1, model.textReply("Backups: all 3 done."));
+    _ = try f.core.runTask(try taskNamed(f.core, "nightly"));
+    f.core.fixed_now = quietDay() + 86400 + 6 * 3600; // 07:00 at +01:00
+    f.core.tick();
+    try f.rec.waitFor("During quiet hours (22:00–07:00):\n");
+    try t.expectEqual(0, f.rec.count("While you were at"));
 }

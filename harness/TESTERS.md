@@ -25,6 +25,10 @@ are helping with.
 - Home Assistant, and a long-lived access token: in Home Assistant, your
   profile, Security, Long-lived access tokens, Create token. Give it a name
   like "harness" so you can revoke it later.
+- Optional: your calendar on iCloud, Fastmail, Nextcloud or Google, calmcp
+  next to harness, and an app password for the calendar (iCloud: your
+  Apple ID, Sign-In and Security, App-specific passwords; Fastmail and
+  Nextcloud: an app password in their settings).
 
 ## Setting it up (about ten minutes)
 
@@ -66,6 +70,12 @@ Then in Telegram:
    reads the car but sends no commands: charging from harness needs a paid
    plan.
 
+5. Your calendar: `harness secret add caldav` in the terminal (the app
+   password), then `/setup calendar ADDRESS USER`, like `/setup calendar
+   https://caldav.icloud.com you@icloud.com`. It shows the file it would
+   write and says which calendars it reads and which one it may change,
+   asking you each time. Tap **Looks right**.
+
 `harness doctor` says, a line each, whether harness runs, whether the bot,
 the model, the home and the car answer, and what to do about any that
 don't.
@@ -83,7 +93,10 @@ a-pretend-token-1234 binary_sensor.sink_leak '{"leak": true}'` floods its
 kitchen; `person.anna '{"home": false}'` sends everyone out. carcloud's
 `carcloud-sim 8740 a-pretend-secret-1` is a made-up car: `/setup car
 sim-client 0c5f52b4-6a39-4a66-b2bd-6fdc1a5c8b11 5a2b7c1e-sim-user
-http://127.0.0.1:8740`, with `a-pretend-secret-1` stored as `smartcar`.
+http://127.0.0.1:8740`, with `a-pretend-secret-1` stored as `smartcar`. calmcp's
+`calmcp-sim 8742 owner a-pretend-password-1 &` is a made-up calendar (a
+dentist at 10:30, a weekly team call): store `a-pretend-password-1` as
+`caldav`, then `/setup calendar http://127.0.0.1:8742/ owner`.
 
 ## Your first week
 
@@ -136,6 +149,12 @@ notes):
   **Turn on**): the morning summary gets a Post line, a bill gets a line 3
   days before it is due, and "draft a reply to Tomek" puts a draft in
   your Drafts for you to send.
+- **Day 10, calendar.** With your calendar: put in an event with a place
+  an hour from now; a line comes when it is time to leave. Add one with a
+  person: half an hour before it, a short note on who and when they last
+  came up. Ask "move it to tomorrow": one question shows the exact change
+  before anything is written. During a busy event, the routines' posts
+  wait for its end.
 - **Any day.** `/session` shows the steps behind the last answer; `/quiet`
   what quiet hours hold; `/workflows` the routines that are on.
 
@@ -161,6 +180,9 @@ Tell us about anything like this, with the time it happened:
 - Mail in your own mailbox that shows as read, moved or flagged after
   harness read it; a draft you didn't ask for; a mail sent that you weren't
   asked about; a stranger's mail that started anything.
+- A calendar line at the wrong time (your time zone, summer time), a
+  repeating event on the wrong day, or a change made that you didn't ask
+  for.
 
 ## Sending a report
 
@@ -205,6 +227,10 @@ on what you did, what happened, and what you expected.
   address, and asks you every time, except its answer to your own mail in
   the thread. What a mail says is data, never an instruction; your family
   and the speakers never get your mail.
+- **Never changes your calendar unasked.** Creating, moving and
+  cancelling events and answering invitations are asked every time, never
+  from a schedule, and only in the calendars you let it change; it never
+  accepts or declines an invitation on its own.
 - **Only you approve.** Your family can ask it things; a lock, the garage, a
   valve or money becomes your one-tap question. When they get an alert
   you didn't answer, their only button is **I'm on it**.

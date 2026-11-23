@@ -826,10 +826,65 @@ else
 	echo "# homemcp or carcloud isn't built next to harness (or HOMEMCP_BIN, CARCLOUD_BIN): the butler's setup and routines against their stand-ins are skipped"
 fi
 
+# the diary: /setup calendar against calmcp-sim through calmcp, then a
+# change the owner asks for, asked once and made, read back. calmcp from
+# CALMCP_BIN, or built next to harness (zig build in ../calmcp); skipped
+# without it
+# (two steps: macOS's sh, bash 3.2, ends ${...:-...} at a } inside $(...))
+CM=${CALMCP_BIN:-}
+[ -n "$CM" ] || CM=$(cd "$(dirname "$0")/../../calmcp/zig-out/bin" 2>/dev/null && { pwd -W 2>/dev/null || pwd; })
+if [ -n "$CM" ] && [ -x "$CM/calmcp" ] && [ -x "$CM/calmcp-sim" ]; then
+	"$CM/calmcp-sim" 0 owner smoke-caldav-pass --day 2026-11-23 >"$T/calsim.out" 2>&1 &
+	SPID=$!
+	wait_for "$T/calsim.out" "127.0.0.1:" 5
+	CALPORT=$(sed -n 's/.*127[.]0[.]0[.]1:\([0-9]*\).*/\1/p' "$T/calsim.out")
+	CH="$T/calhome"
+	HARNESS_HOME="$CH" "$H" init >/dev/null 2>&1
+	cat >"$CH/config.ini" <<EOF
+[model]
+url = $URL
+[search]
+url = $URL
+[chat]
+api = $URL
+[butler]
+calmcp = $CM/calmcp
+EOF
+	chmod 600 "$CH/config.ini"
+	printf 'smoke-caldav-pass\n' | "$H" secret add caldav --stdin 2>/dev/null
+	HARNESS_HOME="$CH" "$H" run >"$T/crun.out" 2>&1 &
+	RPID=$!
+	wait_for "$T/crun.out" "running on" 15
+	CCODE=$(HARNESS_HOME="$CH" "$H" pair | sed -n 's|^/pair ||p')
+	say "/pair $CCODE"
+	wait_for "$OUT" "I answer only you from now on." 10
+	n0=$(asked)
+	say "/setup calendar http://127.0.0.1:$CALPORT/ owner"
+	check "/setup calendar finds the calendars through calmcp discover and shows the file first" 'wait_for "$OUT" "calendar.ini, as Looks right writes it:" 20 && wait_asked_long $((n0 + 1)) && last_question | grep -qF "I found 3 calendars: Personal, Work and Birthdays. Times in Europe/Warsaw." && [ ! -e "$CH/calendar.ini" ]'
+	press yes
+	check "Looks right connects it, its changes asked every time" 'wait_for "$OUT" "The calendar is connected." 30 && grep -qF "money = cal_create, cal_move, cal_cancel, cal_reply" "$CH/mcp.ini" && grep -qF "secret = CALDAV_PASSWORD:caldav" "$CH/mcp.ini" && grep -qxF "change = yes" "$CH/calendar.ini"'
+	reply "$(call_reply tu_cal1 calendar__cal_move '{"id":"personal/dentist-1@calmcp-sim","title":"Dentist","from":"2026-11-23 10:30","to":"2026-11-27"}')"
+	reply "$(text_reply 'The dentist is on Friday at 10:30.')"
+	n0=$(asked)
+	say "move the dentist to Friday"
+	check "a change the owner asks for is asked, the exact call, before anything is written" 'wait_asked_long $((n0 + 1)) && last_question | grep -qF "calendar/cal_move" && last_question | grep -qF "Dentist" && ! python3 -c "import sys,urllib.request; sys.exit(0 if b\"20261127T103000\" in urllib.request.urlopen(sys.argv[1]).read() else 1)" "http://127.0.0.1:$CALPORT/sim/object?path=/dav/calendars/owner/personal/dentist-1.ics"'
+	press once
+	check "one tap moves it in its own zone, read back from the calendar" 'wait_for "$OUT" "The dentist is on Friday at 10:30." 30 && grep -qF "Moved: Dentist is now Fri 27 Nov 2026 10:30" "$(req)" && python3 -c "import sys,urllib.request; sys.exit(0 if b\"DTSTART;TZID=Europe/Warsaw:20261127T103000\" in urllib.request.urlopen(sys.argv[1]).read() else 1)" "http://127.0.0.1:$CALPORT/sim/object?path=/dav/calendars/owner/personal/dentist-1.ics"'
+	check "no calendar password in the log" '! grep -qF "smoke-caldav-pass" "$CH/log/actions.jsonl"'
+	kill "$RPID" 2>/dev/null
+	wait "$RPID" 2>/dev/null
+	RPID=""
+	kill "$SPID" 2>/dev/null
+	SPID=""
+else
+	echo "# calmcp isn't built next to harness (or CALMCP_BIN): the calendar's setup and an asked change are skipped"
+fi
+
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	echo "smoke: FAILED"
 	echo "--- run output"; cat "$T/run.out"
 	[ -f "$T/brun.out" ] && { echo "--- the butler's run output"; cat "$T/brun.out"; }
+	[ -f "$T/crun.out" ] && { echo "--- the calendar's run output"; cat "$T/crun.out"; }
 	for x in bcheck1 bcheck2 bcheck3 bcheck4; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
 	echo "--- outbox"; cat "$OUT" 2>/dev/null
 	exit 1

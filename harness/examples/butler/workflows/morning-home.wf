@@ -13,9 +13,9 @@ do:
   It is morning. Read <morning parts> and write the owner's morning message
   from them: at most four short lines, plain words with units, no greeting,
   no tool names. Only what matters today: the car's battery, range and
-  whether it is plugged in; today's events with their times; the weather
-  (temperature, rain); doors or windows open, lights on, the heating. Leave
-  out what can't be read.
+  whether it is plugged in; every event of today with its time (and place);
+  the weather (temperature, rain); doors or windows open, lights on, the
+  heating. Leave out what can't be read.
 #if mail
   The post, in one line: read the owner's mail since yesterday
   (mail/mail_list, mailbox mine, since 1d; mail/mail_read for a bill whose
