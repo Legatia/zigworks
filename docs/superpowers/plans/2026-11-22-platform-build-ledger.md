@@ -122,3 +122,4 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
  as 
  (test RED→GREEN) and .gitattributes keeps examples, .wf and .sh files 
 . Three macos-15 jobs (unchanged tools) cancelled waiting for runners. 951/971 Debug, smoke ok.
+- CI for dcc2742 (Windows line ends fixed): Windows harness green; harness and keygate on macos-15 cancelled waiting for runners, then rerun: attempt 2: success.
