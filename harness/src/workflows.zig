@@ -360,6 +360,10 @@ pub fn parse(a: Allocator, name: []const u8, text: []const u8, diag: *Diag) Erro
     for (steps.items, 0..) |s, i| if (s.yes.len > 0) {
         if (s.ifs.len > 0 or s.goto.len > 0 or s.end) return bad(diag, s.yes_line, "a step with yes goes on to the step right after it: no if, goto or end in it");
         if (i + 1 >= steps.items.len or steps.items[i + 1].action != .tool) return bad(diag, s.yes_line, "yes needs a tool step right after it: its button makes that step's call");
+        // the tap makes exactly the call the owner saw when the file was
+        // saved: no {value} may change it at run time
+        const v = jv.parse(a, steps.items[i + 1].action.tool.json) orelse return bad(diag, s.yes_line, "the tool's input is a JSON object");
+        if (jsonHasPlaceholder(v)) return bad(diag, s.yes_line, "yes makes the next step's call as the file has it: its input takes no {value}, so the tap makes exactly the call you saw");
     };
     if (w.phrases.len > 0 and !w.allows("owner", false)) {
         const n = for (lines) |l| {
@@ -689,6 +693,41 @@ fn namesIn(a: Allocator, w: Workflow, s: Step, diag: *Diag) Error!void {
     }
     for (s.match) |m| try checkText(a, w, m, s.match_line, diag);
     for (s.ifs) |f| if (try nameProblem(a, w, f.cond.field)) |why| return bad(diag, f.line, why);
+}
+
+/// Whether `text` holds a `{value}` (a brace before a name; `{{` is a brace).
+fn hasPlaceholder(text: []const u8) bool {
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] != '{') {
+            i += 1;
+            continue;
+        }
+        if (i + 1 < text.len and text[i + 1] == '{') {
+            i += 2;
+            continue;
+        }
+        const close = std.mem.indexOfScalarPos(u8, text, i, '}') orelse return false;
+        if (placeholderName(text[i + 1 .. close])) return true;
+        i += 1;
+    }
+    return false;
+}
+
+/// Whether a value anywhere in `v` holds a `{value}` (keys are never filled).
+fn jsonHasPlaceholder(v: jv.Value) bool {
+    return switch (v) {
+        .string => |str_v| hasPlaceholder(str_v),
+        .array => |arr| for (arr.items) |x| {
+            if (jsonHasPlaceholder(x)) break true;
+        } else false,
+        .object => |o| blk: {
+            var it = o.iterator();
+            while (it.next()) |e| if (jsonHasPlaceholder(e.value_ptr.*)) break :blk true;
+            break :blk false;
+        },
+        else => false,
+    };
 }
 
 fn checkJson(a: Allocator, w: Workflow, v: jv.Value, n: usize, diag: *Diag) Error!void {
@@ -1421,6 +1460,19 @@ test "yes_and_no_go_on_an_approve_before_a_tool_step" {
     try refused(a, "x", "workflow x\nstep a\napprove Go?\nyes Go\nif input is x goto c\nstep b\ntool shell {\"command\": \"ls\"}\nstep c\nsay hi\n", 4, "a step with yes goes on to the step right after it");
     try refused(a, "x", "workflow x\nstep a\napprove Go?\nyes Close the water main and the garden tap too\nstep b\ntool shell {\"command\": \"ls\"}\n", 4, "1 to 32 bytes");
     try refused(a, "x", "workflow x\nstep a\napprove Go?\nyes Go {input}\nstep b\ntool shell {\"command\": \"ls\"}\n", 4, "shown as they are");
+}
+
+test "a_yes_tap_makes_only_a_call_fixed_in_the_file" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // the tap makes the next step's call: with a {value} in it, the call
+    // could be one the owner never saw when the file was saved
+    try refused(a, "x", "workflow x\nstep a\napprove Lock it?\nyes Lock it\nstep b\ntool home/home_guarded {\"device\": \"{input}\", \"action\": \"lock\"}\n", 4, "yes makes the next step's call as the file has it");
+    try refused(a, "x", "workflow x\nstep a\napprove Lock it?\nyes Lock it\nstep b\ntool home/home_guarded {\"device\": \"front_door\", \"action\": \"{event.action}\"}\n", 4, "yes makes the next step's call as the file has it");
+    // fixed, or a {{ that is only a brace: read
+    var d: Diag = .{};
+    _ = try parse(a, "x", "workflow x\nstep a\napprove Lock it?\nyes Lock it\nstep b\ntool home/home_guarded {\"device\": \"front_door\", \"action\": \"lock\"}\n", &d);
 }
 
 test "phrases_start_by_the_owners_words" {
