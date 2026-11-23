@@ -15510,6 +15510,19 @@ fn logText(f: *Fix) ![]u8 {
     return Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.log, f.e.arena.allocator(), .unlimited);
 }
 
+/// Waits until the log holds `needle`: for a line written on another
+/// thread after what the test last saw (a transcript said, a stand-in's
+/// file written).
+fn waitLog(f: *Fix, needle: []const u8) !void {
+    var waited: u32 = 0;
+    while (waited < 8000) : (waited += 20) {
+        if (std.mem.indexOf(u8, logText(f) catch "", needle) != null) return;
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    std.debug.print("the log never held {s}:\n{s}\n", .{ needle, logText(f) catch "" });
+    return error.TestTimedOut;
+}
+
 /// A brief due at midnight (so due whenever the test runs) on one feed.
 fn dueBrief(f: *Fix, items: []const u8) !void {
     const a = f.e.arena.allocator();
@@ -19164,6 +19177,8 @@ test "a_phrase_said_in_a_voice_note_starts_it_too" {
     try f.core.startWorker();
     try f.core.handleIncoming(voiceNote(2));
     try f.rec.waitFor("\"Good night.\"");
+    // the chat worker starts it after it shows the transcript
+    try waitLog(&f, "\"instance\":\"goodnight#1\",\"event\":\"start\",\"by\":\"owner\"");
     runWorkflows(&f);
     try f.rec.waitFor("Night night.");
     try t.expectEqual(0, f.e.server.modelRequests());
