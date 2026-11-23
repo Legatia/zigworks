@@ -71,17 +71,59 @@ fn checkHome(a: std.mem.Allocator, io: Io, cfg: *const config.Config, hub: hub_m
         if (known == states.len) break;
         io.sleep(.fromMilliseconds(200), .awake) catch {};
     }
+    // the rooms, in the order the file names them
+    var rooms: std.ArrayList([]const u8) = .empty;
+    var roomless = false;
+    for (cfg.devices) |dv| {
+        if (dv.room.len == 0) {
+            roomless = true;
+            continue;
+        }
+        for (rooms.items) |r| {
+            if (eql(r, dv.room)) break;
+        } else try rooms.append(a, dv.room);
+    }
     var o: std.ArrayList(u8) = .empty;
-    try o.print(a, "{s}: {d} devices. {s}.\n", .{ cfg.name, cfg.devices.len, try hub.status(a) });
-    for (cfg.devices, 0..) |dv, i| {
-        const what = if (i < states.len) try model.describe(a, dv.kind, states[i].props) else "unknown";
-        try o.print(a, "{s} ({s}, {s}{s}): {s}; may: ", .{ dv.name, dv.id, @tagName(dv.kind), if (dv.guarded) ", guarded" else "", what });
-        if (dv.allow.len == 0) try o.appendSlice(a, "nothing (only seen)");
-        for (dv.allow, 0..) |x, j| try o.print(a, "{s}{s}", .{ if (j > 0) ", " else "", @tagName(x) });
-        try o.append(a, '\n');
+    if (rooms.items.len > 0) {
+        try o.print(a, "{s}: {d} devices in {d} room{s}. {s}.\n", .{ cfg.name, cfg.devices.len, rooms.items.len, if (rooms.items.len == 1) "" else "s", try hub.status(a) });
+    } else try o.print(a, "{s}: {d} devices. {s}.\n", .{ cfg.name, cfg.devices.len, try hub.status(a) });
+    for (rooms.items) |r| {
+        try o.print(a, "{s}\n", .{r});
+        for (cfg.devices, 0..) |dv, i| if (eql(dv.room, r)) try checkLine(a, &o, "  ", &dv, if (i < states.len) states[i].props else null);
+    }
+    if (roomless) {
+        if (rooms.items.len > 0) try o.appendSlice(a, "No room\n");
+        for (cfg.devices, 0..) |dv, i| if (dv.room.len == 0) try checkLine(a, &o, if (rooms.items.len > 0) "  " else "", &dv, if (i < states.len) states[i].props else null);
+    }
+    if (cfg.people.len > 0) {
+        try o.appendSlice(a, "People: ");
+        const where = hub.people(a) catch null;
+        for (cfg.people, 0..) |p, i| {
+            const at: model.Presence = if (where) |w| w[i] else .unknown;
+            try o.print(a, "{s}{s} ({s}) is {s}", .{ if (i > 0) ", " else "", p.name, p.id, switch (at) {
+                .home => "home",
+                .away => "away",
+                .unknown => "not known to be home or away",
+            } });
+        }
+        try o.appendSlice(a, ".\n");
     }
     try out(io, o.items);
     return 0;
+}
+
+/// "  front_door (lock.front_door, lock, guarded): locked; may: lock"
+fn checkLine(a: std.mem.Allocator, o: *std.ArrayList(u8), indent: []const u8, dv: *const config.Device, props: ?model.Props) !void {
+    const what = if (props) |p| try model.describe(a, dv.kind, p) else "unknown";
+    try o.print(a, "{s}{s} ({s}, {s}{s}", .{ indent, dv.name, dv.id, @tagName(dv.kind), if (dv.guarded) ", guarded" else "" });
+    if (dv.aliases.len > 0) {
+        try o.appendSlice(a, "; also called: ");
+        for (dv.aliases, 0..) |al, j| try o.print(a, "{s}{s}", .{ if (j > 0) ", " else "", al });
+    }
+    try o.print(a, "): {s}; may: ", .{what});
+    if (dv.allow.len == 0) try o.appendSlice(a, "nothing (only seen)");
+    for (dv.allow, 0..) |x, j| try o.print(a, "{s}{s}", .{ if (j > 0) ", " else "", @tagName(x) });
+    try o.append(a, '\n');
 }
 
 fn eql(x: []const u8, y: []const u8) bool {
@@ -106,4 +148,6 @@ test {
     _ = @import("ini.zig");
     _ = @import("jv.zig");
     _ = @import("http.zig");
+    _ = @import("color.zig");
+    _ = @import("when.zig");
 }

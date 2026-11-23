@@ -10,6 +10,8 @@ const mqtt = @import("mqtt.zig");
 const http = @import("http.zig");
 const jv = @import("jv.zig");
 const sock = @import("sock.zig");
+const color = @import("color.zig");
+const when = @import("when.zig");
 
 pub const State = struct {
     props: model.Props,
@@ -62,11 +64,29 @@ pub const Hub = union(enum) {
         };
     }
 
+    /// Where each person of the home file's [people] is, in its order.
+    pub fn people(h: Hub, a: Allocator) ![]model.Presence {
+        return switch (h) {
+            .z2m => &.{},
+            .ha => |x| x.people(a),
+        };
+    }
+
     /// One line on how the hub is reached.
     pub fn status(h: Hub, a: Allocator) ![]const u8 {
         return switch (h) {
             .z2m => |z| z.status(a),
             .ha => |x| std.fmt.allocPrint(a, "Home Assistant at {s}{s}{s}", .{ x.cfg.url, if (x.problem.len > 0) ": the last request failed: " else "", x.problem }),
+        };
+    }
+
+    /// For a scene: the first thing it sets that homemcp guards (a lock, an
+    /// alarm, a valve, a garage door or gate, a device the home file
+    /// guards); null when none, or when the scene doesn't say what it sets.
+    pub fn sceneSets(h: Hub, a: Allocator, dev: *const config.Device) !?[]const u8 {
+        return switch (h) {
+            .z2m => null,
+            .ha => |x| x.sceneSets(a, dev),
         };
     }
 
@@ -235,9 +255,16 @@ pub const Z2m = struct {
     fn command(z: *Z2m, a: Allocator, dev: *const config.Device, action: model.Action, number: ?f64, text: ?[]const u8) !void {
         const i = z.cfg.device(dev.name).?;
         const payload: []const u8 = switch (action) {
-            .on => "{\"state\":\"ON\"}",
-            .off => "{\"state\":\"OFF\"}",
+            .on => if (dev.kind == .fan) "{\"fan_state\":\"ON\"}" else "{\"state\":\"ON\"}",
+            .off => if (dev.kind == .fan) "{\"fan_state\":\"OFF\"}" else "{\"state\":\"OFF\"}",
             .brightness => try std.fmt.allocPrint(a, "{{\"state\":\"ON\",\"brightness\":{d}}}", .{@as(i64, @intFromFloat(@round(number.? * 254.0 / 100.0)))}),
+            .color => blk: {
+                var hb: [7]u8 = undefined;
+                break :blk try std.fmt.allocPrint(a, "{{\"state\":\"ON\",\"color\":{{\"hex\":\"{s}\"}}}}", .{color.hex(&hb, color.parse(text.?) orelse return error.BadValue)});
+            },
+            // Zigbee2MQTT takes colour temperature in mireds
+            .color_temp => try std.fmt.allocPrint(a, "{{\"state\":\"ON\",\"color_temp\":{d}}}", .{@as(i64, @intFromFloat(@round(1e6 / number.?)))}),
+            .speed => try std.fmt.allocPrint(a, "{{\"fan_mode\":\"{s}\"}}", .{fanMode(number.?)}),
             .temperature => blk: {
                 // the device's own setpoint property: never both
                 z.lock.lockUncancelable(z.io);
@@ -252,7 +279,7 @@ pub const Z2m = struct {
             .position => try std.fmt.allocPrint(a, "{{\"position\":{d}}}", .{@as(i64, @intFromFloat(@round(number.?)))}),
             .lock => "{\"state\":\"LOCK\"}",
             .unlock => "{\"state\":\"UNLOCK\"}",
-            .arm_home, .arm_away, .disarm => return error.NotSupportedByHub,
+            .arm_home, .arm_away, .disarm, .activate, .play, .pause, .volume => return error.NotSupportedByHub,
         };
         const topic = try std.fmt.allocPrint(a, "{s}/{s}/set", .{ z.cfg.base, dev.id });
         z.lock.lockUncancelable(z.io);
@@ -272,7 +299,8 @@ pub const Ha = struct {
     client: http.Client,
     problem: []const u8 = "",
 
-    fn states(h: *Ha, a: Allocator) ![]State {
+    /// Every entity's state object (GET /api/states).
+    fn allStates(h: *Ha, a: Allocator) ![]jv.Value {
         const ans = http.fetch(&h.client, a, .{
             .method = .GET,
             .path = "/api/states",
@@ -291,7 +319,36 @@ pub const Ha = struct {
             return error.BadAnswer;
         }
         h.problem = "";
-        const list = jv.arr(jv.parse(a, ans.body)) orelse return error.BadAnswer;
+        return jv.arr(jv.parse(a, ans.body)) orelse error.BadAnswer;
+    }
+
+    fn people(h: *Ha, a: Allocator) ![]model.Presence {
+        const list = try h.allStates(a);
+        const out = try a.alloc(model.Presence, h.cfg.people.len);
+        for (h.cfg.people, out) |p, *o| {
+            o.* = .unknown;
+            for (list) |x| if (std.mem.eql(u8, jv.str(jv.get(x, "entity_id")) orelse "", p.id)) {
+                o.* = .of(jv.str(jv.get(x, "state")) orelse "");
+                break;
+            };
+        }
+        return out;
+    }
+
+    fn sceneSets(h: *Ha, a: Allocator, dev: *const config.Device) !?[]const u8 {
+        const list = try h.allStates(a);
+        const scene = for (list) |x| {
+            if (std.mem.eql(u8, jv.str(jv.get(x, "entity_id")) orelse "", dev.id)) break x;
+        } else return null;
+        for (jv.arr(jv.at(scene, &.{ "attributes", "entity_id" })) orelse &.{}) |m| {
+            const id = jv.str(m) orelse continue;
+            if (guardedEntity(h.cfg, list, id)) return try a.dupe(u8, id);
+        }
+        return null;
+    }
+
+    fn states(h: *Ha, a: Allocator) ![]State {
+        const list = try h.allStates(a);
         const out = try a.alloc(State, h.cfg.devices.len);
         for (h.cfg.devices, 0..) |d, i| {
             out[i] = .{ .props = .{ .available = false } };
@@ -311,6 +368,16 @@ pub const Ha = struct {
             .on => .{ .service = "turn_on" },
             .off => .{ .service = "turn_off" },
             .brightness => .{ .service = "turn_on", .extra = try std.fmt.allocPrint(a, ",\"brightness_pct\":{d}", .{@as(i64, @intFromFloat(@round(number.?)))}) },
+            .color => blk: {
+                const c = color.parse(text.?) orelse return error.BadValue;
+                break :blk .{ .service = "turn_on", .extra = try std.fmt.allocPrint(a, ",\"rgb_color\":[{d},{d},{d}]", .{ c.r, c.g, c.b }) };
+            },
+            .color_temp => .{ .service = "turn_on", .extra = try std.fmt.allocPrint(a, ",\"color_temp_kelvin\":{d}", .{@as(i64, @intFromFloat(@round(number.?)))}) },
+            .speed => .{ .service = "set_percentage", .extra = try std.fmt.allocPrint(a, ",\"percentage\":{d}", .{@as(i64, @intFromFloat(@round(number.?)))}) },
+            .activate => .{ .service = "turn_on" },
+            .play => .{ .service = "media_play" },
+            .pause => .{ .service = "media_pause" },
+            .volume => .{ .service = "volume_set", .extra = try std.fmt.allocPrint(a, ",\"volume_level\":{s}", .{model.num(@round(number.?) / 100)}) },
             .temperature => .{ .service = "set_temperature", .extra = try std.fmt.allocPrint(a, ",\"temperature\":{s}", .{model.num(number.?)}) },
             .mode => .{ .service = "set_hvac_mode", .extra = try std.fmt.allocPrint(a, ",\"hvac_mode\":{f}", .{std.json.fmt(text.?, .{})}) },
             .open => .{ .service = if (dev.kind == .valve) "open_valve" else "open_cover" },
@@ -337,27 +404,31 @@ pub const Ha = struct {
     }
 };
 
+/// Whether Home Assistant entity `id` is one homemcp guards: a lock, an
+/// alarm panel, a valve, a garage door, gate or door, or a device the home
+/// file guards. `states` are every entity's, for a cover's device class.
+pub fn guardedEntity(cfg: *const config.Config, states: []const jv.Value, id: []const u8) bool {
+    const domain = id[0 .. std.mem.indexOfScalar(u8, id, '.') orelse id.len];
+    for ([_][]const u8{ "lock", "alarm_control_panel", "valve" }) |x| if (std.mem.eql(u8, domain, x)) return true;
+    if (std.mem.eql(u8, domain, "cover")) for (states) |st| {
+        if (!std.mem.eql(u8, jv.str(jv.get(st, "entity_id")) orelse "", id)) continue;
+        const dc = jv.str(jv.at(st, &.{ "attributes", "device_class" })) orelse "";
+        for ([_][]const u8{ "garage", "gate", "door" }) |x| if (std.mem.eql(u8, dc, x)) return true;
+    };
+    for (cfg.devices) |d| if (d.guarded and std.mem.eql(u8, d.id, id)) return true;
+    return false;
+}
+
+/// Zigbee2MQTT's fan modes for a speed in %.
+fn fanMode(pct: f64) []const u8 {
+    return if (pct <= 34) "low" else if (pct <= 67) "medium" else "high";
+}
+
 /// Seconds since an ISO 8601 time such as 2026-11-22T10:01:02.123+00:00.
 fn ageOf(io: Io, iso: ?[]const u8) ?f64 {
-    const s = iso orelse return null;
-    if (s.len < 19) return null;
-    const y = std.fmt.parseInt(i64, s[0..4], 10) catch return null;
-    const mo = std.fmt.parseInt(u8, s[5..7], 10) catch return null;
-    const d = std.fmt.parseInt(u8, s[8..10], 10) catch return null;
-    const hh = std.fmt.parseInt(i64, s[11..13], 10) catch return null;
-    const mm = std.fmt.parseInt(i64, s[14..16], 10) catch return null;
-    const ss = std.fmt.parseInt(i64, s[17..19], 10) catch return null;
-    // days from civil (Howard Hinnant)
-    const yy = if (mo <= 2) y - 1 else y;
-    const era = @divFloor(yy, 400);
-    const yoe = yy - era * 400;
-    const mp: i64 = if (mo > 2) mo - 3 else mo + 9;
-    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    const days = era * 146097 + doe - 719468;
-    const then = days * 86400 + hh * 3600 + mm * 60 + ss;
-    const now = @divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s);
-    return @floatFromInt(@max(0, now - then));
+    const then = when.parseMs(iso orelse return null) orelse return null;
+    const now = @divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms);
+    return @as(f64, @floatFromInt(@max(0, now - then))) / 1000;
 }
 
 test "online and offline, in both of Zigbee2MQTT's forms" {

@@ -162,6 +162,35 @@ time.sleep(1.5)
 poke(names["back"], {"contact": False})
 text, err = answer(i)
 check("a wait ends when the back door opens", not err and "back_door open == yes: yes" in text, text)
+text, err = call("home_state", {"device": "living_room_light"})
+check("state names the room and what people call it", not err and "room: Living room" in text and "also called: the big light" in text, text)
+text, err = call("home_set", {"device": "the big light", "action": "off"})
+check("an alias names a device", not err and text.startswith("done: living_room_light is off"), text)
+text, err = call("home_set", {"device": "bedroom_lamp", "action": "color", "value": "orange"})
+check("a colour by name, read back", not err and text.startswith("done: bedroom_lamp is on") and text.endswith("orange"), text)
+text, err = call("home_set", {"device": "bedroom_lamp", "action": "color", "value": "#0000ff"})
+check("a colour as #rrggbb, read back", not err and text.endswith("blue"), text)
+text, err = call("home_set", {"device": "bedroom_lamp", "action": "color", "value": "warm white"})
+check("a colour that isn't one is refused, saying what to use", err and "for warm or cool white use color_temp" in text, text)
+text, err = call("home_set", {"device": "bedroom_lamp", "action": "color_temp", "value": "2700K"})
+check("colour temperature, read back", not err and text.startswith("done: bedroom_lamp is on") and text.endswith(" K"), text)
+text, err = call("home_set", {"device": "bedroom_lamp", "action": "color_temp", "value": 9000})
+check("colour temperature outside the limits is refused", err and "from 2200 to 6500 K" in text, text)
+text, err = call("home_set", {"device": "ceiling_fan", "action": "speed", "value": "medium"})
+check("a fan's speed in words, read back", not err and text == "done: ceiling_fan is on, speed 66%", text)
+if hub == "ha":
+    text, err = call("home_set", {"device": "kitchen_speaker", "action": "play"})
+    check("a speaker plays", not err and text.startswith("done: kitchen_speaker is playing"), text)
+    text, err = call("home_set", {"device": "kitchen_speaker", "action": "volume", "value": 30})
+    check("volume, read back", not err and text.endswith("volume 30%"), text)
+    text, err = call("home_set", {"device": "kitchen_speaker", "action": "volume", "value": 90})
+    check("volume past the limit is refused", err and "from 0 to 60%" in text, text)
+    text, err = call("home_set", {"device": "evening", "action": "activate"})
+    check("a scene runs, read back", not err and text.startswith("done: evening is last run "), text)
+    text, err = call("home_set", {"device": "leaving_unguarded", "action": "activate"})
+    check("a scene that sets the front door is refused through home_set", err and "also sets lock.front_door" in text, text)
+    text, err = call("home_guarded", {"device": "leaving", "action": "activate"})
+    check("... and runs through home_guarded when the file guards it", not err and text.startswith("done: leaving is last run "), text)
 poke(names["light"], {"available": False})
 time.sleep(1.0)
 text, err = call("home_set", {"device": "living_room_light", "action": "off"})
@@ -177,13 +206,15 @@ HA_PORT=$(free_port)
 PIDS="$PIDS $!"
 # awk, not sed: BSD sed (macOS) has no \n in replacements
 awk -v port="$HA_PORT" -v logf="$T/ha-actions.jsonl" '/^url = / { print "url = http://127.0.0.1:" port; print "log = " logf; next } { print }' examples/ha.ini >"$T/ha.ini"
+# the Leaving scene as if the file didn't guard it
+printf '\n[device leaving_unguarded]\nid = scene.leaving\nkind = scene\nallow = activate\n' >>"$T/ha.ini"
 check "the Home Assistant stand-in starts" 'wait_port "$HA_PORT"'
 check "check: every device through Home Assistant" 'HA_TOKEN=smoke-token "$B" check "$T/ha.ini" >"$T/c" && grep -q "front_door (lock.front_door, lock, guarded): locked; may: lock" "$T/c"'
 check "check: a wrong token is named" '! HA_TOKEN=wrong "$B" check "$T/ha.ini" 2>"$T/err" && grep -q "token was refused" "$T/err"'
 sed -e "s|^log = .*|log = nowhere/actions.jsonl|" "$T/ha.ini" >"$T/badlog.ini"
 check "a log that can't be opened is named" '! HA_TOKEN=smoke-token "$B" "$T/badlog.ini" </dev/null 2>"$T/err" && grep -q "can.t open the log .*nowhere" "$T/err"'
 HA_TOKEN=smoke-token python3 -I "$T/mcp.py" ha "$B" "$T/ha.ini" "$HA_PORT" || fail=1
-check "the log has one line per action" '[ "$(grep -c "\"result\":\"done\"" "$T/ha-actions.jsonl")" = 4 ] && grep -q "is offline: nothing was sent" "$T/ha-actions.jsonl"'
+check "the log has one line per action" '[ "$(grep -c "\"result\":\"done\"" "$T/ha-actions.jsonl")" = 13 ] && grep -q "is offline: nothing was sent" "$T/ha-actions.jsonl"'
 check "... refused ones too: what the agent tried is on record" 'grep -q "\"device\":\"kettle\".*\"action\":\"on\".*\"result\":\"refused\"" "$T/ha-actions.jsonl" && grep -q "\"device\":\"front_door\".*\"action\":\"unlock\".*\"result\":\"refused\"" "$T/ha-actions.jsonl" && grep -q "\"tool\":\"home_set\",\"device\":\"front_door\".*\"result\":\"refused\",\"message\":\"front_door is guarded" "$T/ha-actions.jsonl" && grep -q "\"device\":\"thermostat\".*\"value\":30,\"result\":\"refused\"" "$T/ha-actions.jsonl"'
 
 # --- as Zigbee2MQTT, through mosquitto ---
@@ -197,7 +228,7 @@ if command -v mosquitto >/dev/null || [ -x /usr/sbin/mosquitto ]; then
 	PIDS="$PIDS $!"
 	sed -e "s|mqtt = 127.0.0.1:1883|mqtt = 127.0.0.1:$MQ_PORT|" examples/z2m.ini >"$T/z2m.ini"
 	sleep 1
-	check "check: every device through Zigbee2MQTT" '"$B" check "$T/z2m.ini" >"$T/c" && grep -q "connected, bridge online" "$T/c" && grep -q "thermostat (Hall thermostat, climate): .*set to 20" "$T/c"'
+	check "check: every device through Zigbee2MQTT" '"$B" check "$T/z2m.ini" >"$T/c" && grep -q "connected, bridge online" "$T/c" && grep -q "  thermostat (Hall thermostat, climate; also called: the heating): .*set to 20" "$T/c"'
 	python3 -I "$T/mcp.py" z2m "$B" "$T/z2m.ini" "$MQ_PORT" || fail=1
 else
 	echo "# mosquitto missing: the Zigbee2MQTT checks are skipped"

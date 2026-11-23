@@ -11,6 +11,7 @@ const config = @import("config.zig");
 const model = @import("model.zig");
 const hub_mod = @import("hub.zig");
 const jv = @import("jv.zig");
+const color = @import("color.zig");
 
 pub const max_wait_s = 300;
 const confirm_ms = 5000;
@@ -83,14 +84,17 @@ pub const Server = struct {
     // ---- tools ----
 
     fn stateTool(s: *Server, a: Allocator, id: []const u8, args: ?jv.Value) !void {
-        const only = jv.str(jv.get(args, "device"));
-        if (only) |n| if (s.cfg.device(n) == null) return s.text(a, id, try std.fmt.allocPrint(a, "no device called {s}; there are: {s}", .{ n, try s.deviceNames(a, null) }), true);
+        var only: ?usize = null;
+        if (jv.str(jv.get(args, "device"))) |n| only = s.cfg.device(n) orelse return s.text(a, id, try std.fmt.allocPrint(a, "no device called {s}; there are: {s}", .{ n, try s.deviceNames(a, null) }), true);
         const states = s.hub.states(a) catch |e| return s.text(a, id, try std.fmt.allocPrint(a, "{s}: {s}", .{ try s.hub.status(a), @errorName(e) }), true);
         var o: std.ArrayList(u8) = .empty;
         try o.print(a, "{s}. {s}.\n", .{ s.cfg.name, try s.hub.status(a) });
-        for (s.cfg.devices, states) |d, st| {
-            if (only) |n| if (!eql(n, d.name)) continue;
-            try o.print(a, "{s} ({s}, {s}): {s}", .{ d.name, d.id, @tagName(d.kind), try model.describe(a, d.kind, st.props) });
+        for (s.cfg.devices, states, 0..) |d, st, i| {
+            if (only) |oi| if (oi != i) continue;
+            try o.print(a, "{s} ({s}, {s}", .{ d.name, d.id, @tagName(d.kind) });
+            if (d.room.len > 0) try o.print(a, "; room: {s}", .{d.room});
+            if (d.aliases.len > 0) try o.print(a, "; also called: {s}", .{try join(a, d.aliases)});
+            try o.print(a, "): {s}", .{try model.describe(a, d.kind, st.props)});
             if (st.age_s) |age| if (age >= 600) try o.print(a, " (changed {s} ago)", .{try ago(a, age)});
             if (d.allow.len > 0) {
                 try o.print(a, ". May: {s}", .{try actionList(a, &d, s.cfg)});
@@ -99,14 +103,28 @@ pub const Server = struct {
             if (d.note.len > 0) try o.print(a, ". {s}", .{d.note});
             try o.appendSlice(a, ".\n");
         }
+        if (only == null and s.cfg.people.len > 0) {
+            try o.appendSlice(a, "People: ");
+            const where = s.hub.people(a) catch null;
+            for (s.cfg.people, 0..) |p, i| {
+                const at: model.Presence = if (where) |w| w[i] else .unknown;
+                try o.print(a, "{s}{s} is {s}", .{ if (i > 0) ", " else "", p.name, switch (at) {
+                    .home => "home",
+                    .away => "away",
+                    .unknown => "not known to be home or away",
+                } });
+            }
+            try o.appendSlice(a, ".\n");
+        }
         return s.text(a, id, o.items, false);
     }
 
     fn actTool(s: *Server, a: Allocator, id: []const u8, args: ?jv.Value, guarded: bool) !void {
         const tool = if (guarded) "home_guarded" else "home_set";
-        const name = jv.str(jv.get(args, "device")) orelse return s.text(a, id, "say which device", true);
-        const di = s.cfg.device(name) orelse return s.text(a, id, try std.fmt.allocPrint(a, "no device called {s}; {s} can act on: {s}", .{ name, tool, try s.deviceNames(a, guarded) }), true);
+        const asked = jv.str(jv.get(args, "device")) orelse return s.text(a, id, "say which device", true);
+        const di = s.cfg.device(asked) orelse return s.text(a, id, try std.fmt.allocPrint(a, "no device called {s}; {s} can act on: {s}", .{ asked, tool, try s.deviceNames(a, guarded) }), true);
         const d = &s.cfg.devices[di];
+        const name = d.name;
         // From here on every answer goes into the log, refusals too: what
         // the agent tried matters as much as what was done.
         const act_s = jv.str(jv.get(args, "action")) orelse "";
@@ -120,24 +138,31 @@ pub const Server = struct {
         switch (action.needs()) {
             .nothing => {},
             .number => {
-                number = numberArg(jv.get(args, "value")) orelse return s.finish(a, id, tool, d, act_s, null, null, "refused", try std.fmt.allocPrint(a, "{s} needs a number as value", .{act_s}), true);
-                const r = switch (action) {
-                    .brightness => s.cfg.brightness,
-                    .temperature => s.cfg.temperature,
-                    else => s.cfg.position,
-                };
-                if (number.? < r.min or number.? > r.max) return s.finish(a, id, tool, d, act_s, number, null, "refused", try std.fmt.allocPrint(a, "{s} must be from {s} to {s}", .{ act_s, model.num(r.min), model.num(r.max) }), true);
+                const value = jv.get(args, "value");
+                number = numberArg(value) orelse (if (action == .speed) speedWord(value) else null) orelse return s.finish(a, id, tool, d, act_s, null, null, "refused", try std.fmt.allocPrint(a, "{s} needs a number as value{s}", .{ act_s, if (action == .speed) " (or low, medium, high)" else "" }), true);
+                const r = limitOf(s.cfg, action);
+                if (number.? < r.min or number.? > r.max) return s.finish(a, id, tool, d, act_s, number, null, "refused", try std.fmt.allocPrint(a, "{s} must be from {s} to {s}{s}", .{ act_s, model.num(r.min), model.num(r.max), unitOf(action) }), true);
             },
             .text => {
-                txt = jv.str(jv.get(args, "value")) orelse return s.finish(a, id, tool, d, act_s, null, null, "refused", "mode needs a value", true);
-                const known = for (d.modes) |m| {
-                    if (std.ascii.eqlIgnoreCase(m, txt.?)) break true;
-                } else false;
-                if (!known) return s.finish(a, id, tool, d, act_s, null, txt, "refused", try std.fmt.allocPrint(a, "{s} may only be set to: {s}", .{ name, try join(a, d.modes) }), true);
+                txt = jv.str(jv.get(args, "value")) orelse return s.finish(a, id, tool, d, act_s, null, null, "refused", try std.fmt.allocPrint(a, "{s} needs a value", .{act_s}), true);
+                if (action == .color) {
+                    if (color.parse(txt.?) == null) return s.finish(a, id, tool, d, act_s, null, txt, "refused", try std.fmt.allocPrint(a, "color is a name ({s}) or #rrggbb; for warm or cool white use color_temp", .{try colorNames(a)}), true);
+                } else {
+                    const known = for (d.modes) |m| {
+                        if (std.ascii.eqlIgnoreCase(m, txt.?)) break true;
+                    } else false;
+                    if (!known) return s.finish(a, id, tool, d, act_s, null, txt, "refused", try std.fmt.allocPrint(a, "{s} may only be set to: {s}", .{ name, try join(a, d.modes) }), true);
+                }
             },
         }
         const before = s.hub.states(a) catch |e| return s.finish(a, id, tool, d, act_s, number, txt, "failed", try std.fmt.allocPrint(a, "can't reach the hub: {s}", .{@errorName(e)}), true);
         if (before[di].props.available == false) return s.finish(a, id, tool, d, act_s, number, txt, "refused", try std.fmt.allocPrint(a, "{s} is offline: nothing was sent", .{name}), true);
+        // a scene that sets a lock, an alarm, a valve or a garage door is
+        // a way around the guard: only through home_guarded
+        if (action == .activate and !d.guarded) {
+            const sets = s.hub.sceneSets(a, d) catch |e| return s.finish(a, id, tool, d, act_s, number, txt, "failed", try std.fmt.allocPrint(a, "can't reach the hub: {s}", .{@errorName(e)}), true);
+            if (sets) |what| return s.finish(a, id, tool, d, act_s, number, txt, "refused", try std.fmt.allocPrint(a, "{s} also sets {s}: a scene that sets a lock, an alarm, a valve or a garage door runs only through home_guarded (guarded = yes in the home file)", .{ name, what }), true);
+        }
         s.hub.command(a, d, action, number, txt) catch |e| return s.finish(a, id, tool, d, act_s, number, txt, "failed", try std.fmt.allocPrint(a, "not sent: {s}", .{@errorName(e)}), true);
         // read it back: did it take?
         var waited: u32 = 0;
@@ -146,7 +171,7 @@ pub const Server = struct {
             const now = s.hub.states(a) catch null;
             if (now) |st| {
                 last = st[di].props;
-                if (model.took(action, number, txt, last) == true) {
+                if (model.took(action, number, txt, last, before[di].props) == true) {
                     return s.finish(a, id, tool, d, act_s, number, txt, "done", try std.fmt.allocPrint(a, "done: {s} is {s}", .{ name, try model.describe(a, d.kind, last) }), false);
                 }
             }
@@ -163,8 +188,9 @@ pub const Server = struct {
     }
 
     fn waitTool(s: *Server, a: Allocator, id: []const u8, args: ?jv.Value) !void {
-        const name = jv.str(jv.get(args, "device")) orelse return s.text(a, id, "say which device", true);
-        const di = s.cfg.device(name) orelse return s.text(a, id, try std.fmt.allocPrint(a, "no device called {s}; there are: {s}", .{ name, try s.deviceNames(a, null) }), true);
+        const asked = jv.str(jv.get(args, "device")) orelse return s.text(a, id, "say which device", true);
+        const di = s.cfg.device(asked) orelse return s.text(a, id, try std.fmt.allocPrint(a, "no device called {s}; there are: {s}", .{ asked, try s.deviceNames(a, null) }), true);
+        const name = s.cfg.devices[di].name;
         const prop = jv.str(jv.get(args, "property")) orelse return s.text(a, id, "say which property", true);
         const known = for (model.Props.fields) |f| {
             if (eql(f, prop)) break true;
@@ -292,8 +318,8 @@ fn toolsJson(gpa: Allocator, cfg: *const config.Config) ![]u8 {
     try o.appendSlice(a, "{\"tools\":[");
     try o.print(a, "{{\"name\":\"home_state\",\"description\":\"Every device in the home (or one): its state now, and what may be done with it. Only reads.\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"device\":{{\"type\":\"string\",\"enum\":[{s}]}}}}}},\"annotations\":{{\"readOnlyHint\":true}}}}", .{all.items});
     if (plain.items.len > 0) {
-        const desc = try std.fmt.allocPrint(a, "Act on an ordinary device and read back whether it took. Allowed: {s}. brightness and position are %, temperature is °C; they need value.", .{plain_about.items});
-        try o.print(a, ",{{\"name\":\"home_set\",\"description\":{f},\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"device\":{{\"type\":\"string\",\"enum\":[{s}]}},\"action\":{{\"type\":\"string\"}},\"value\":{{\"type\":\"string\",\"description\":\"for brightness, position, temperature, mode\"}}}},\"required\":[\"device\",\"action\"]}}}}", .{ std.json.fmt(desc, .{}), plain.items });
+        const desc = try std.fmt.allocPrint(a, "Act on an ordinary device and read back whether it took. Allowed: {s}. brightness, position, speed and volume are %, temperature is °C, color_temp is K, color is a name or #rrggbb; they need value.", .{plain_about.items});
+        try o.print(a, ",{{\"name\":\"home_set\",\"description\":{f},\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"device\":{{\"type\":\"string\",\"enum\":[{s}]}},\"action\":{{\"type\":\"string\"}},\"value\":{{\"type\":\"string\",\"description\":\"for brightness, color, color_temp, position, temperature, mode, speed, volume\"}}}},\"required\":[\"device\",\"action\"]}}}}", .{ std.json.fmt(desc, .{}), plain.items });
     }
     if (guarded.items.len > 0) {
         const desc = try std.fmt.allocPrint(a, "Act on a guarded device (locks, alarms, valves, doors and gates, anything that matters if it goes wrong) and read back whether it took. The owner should be asked before every call. Allowed: {s}.", .{guarded_about.items});
@@ -309,13 +335,52 @@ fn actionList(a: Allocator, d: *const config.Device, cfg: *const config.Config) 
     for (d.allow, 0..) |x, i| {
         if (i > 0) try o.appendSlice(a, ", ");
         try o.appendSlice(a, @tagName(x));
-        switch (x) {
-            .brightness => try o.print(a, " {s}-{s}%", .{ model.num(cfg.brightness.min), model.num(cfg.brightness.max) }),
-            .temperature => try o.print(a, " {s}-{s} °C", .{ model.num(cfg.temperature.min), model.num(cfg.temperature.max) }),
-            .position => try o.print(a, " {s}-{s}%", .{ model.num(cfg.position.min), model.num(cfg.position.max) }),
-            .mode => try o.print(a, " ({s})", .{try join(a, d.modes)}),
-            else => {},
+        switch (x.needs()) {
+            .number => {
+                const r = limitOf(cfg, x);
+                try o.print(a, " {s}-{s}{s}", .{ model.num(r.min), model.num(r.max), unitOf(x) });
+            },
+            .text => if (x == .mode) try o.print(a, " ({s})", .{try join(a, d.modes)}) else try o.appendSlice(a, " (a name or #rrggbb)"),
+            .nothing => {},
         }
+    }
+    return o.items;
+}
+
+/// The values an action may take, from [limits].
+fn limitOf(cfg: *const config.Config, action: model.Action) config.Range {
+    return switch (action) {
+        .brightness => cfg.brightness,
+        .temperature => cfg.temperature,
+        .color_temp => cfg.color_temp,
+        .volume => cfg.volume,
+        .speed => cfg.speed,
+        else => cfg.position,
+    };
+}
+
+fn unitOf(action: model.Action) []const u8 {
+    return switch (action) {
+        .temperature => " °C",
+        .color_temp => " K",
+        else => "%",
+    };
+}
+
+/// A fan's speed in words: low, medium, high.
+fn speedWord(v: ?jv.Value) ?f64 {
+    const w = jv.str(v) orelse return null;
+    if (std.ascii.eqlIgnoreCase(w, "low")) return 33;
+    if (std.ascii.eqlIgnoreCase(w, "medium")) return 66;
+    if (std.ascii.eqlIgnoreCase(w, "high")) return 100;
+    return null;
+}
+
+fn colorNames(a: Allocator) ![]u8 {
+    var o: std.ArrayList(u8) = .empty;
+    for (color.names, 0..) |n, i| {
+        if (i > 0) try o.appendSlice(a, ", ");
+        try o.appendSlice(a, n.name);
     }
     return o.items;
 }
@@ -343,7 +408,7 @@ fn numberArg(v: ?jv.Value) ?f64 {
     return switch (x) {
         .integer => |n| @floatFromInt(n),
         .float => |f| f,
-        .number_string, .string => |s| std.fmt.parseFloat(f64, std.mem.trim(u8, s, " %°C")) catch null,
+        .number_string, .string => |s| std.fmt.parseFloat(f64, std.mem.trim(u8, s, " %°CK")) catch null,
         else => null,
     };
 }
