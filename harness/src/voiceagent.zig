@@ -37,8 +37,9 @@ pub const Options = struct {
     head_ms: u32 = 10_000,
     /// A kept connection waits this long for its next request.
     idle_ms: u32 = 30_000,
-    /// Connections at once; more are closed as they come.
-    max_connections: u32 = 4,
+    /// Connections at once; more are closed as they come (a device on the
+    /// network holding a few open keeps no one out).
+    max_connections: u32 = 16,
 };
 
 /// The shortest token taken: Home Assistant's API key field holds the same.
@@ -117,17 +118,15 @@ pub const Server = struct {
         return s.addr_buf[0..s.addr_len];
     }
 
-    /// Stops listening and waits for the requests going to end (their
-    /// speech turns were stopped first).
+    /// Stops listening and waits for the requests going to end: one that
+    /// waits for its head or body ends at once (its socket's stop flag); an
+    /// answer being made is made and written (a cut connection would have
+    /// Home Assistant send the request again). Speech turns are stopped
+    /// first when harness ends.
     pub fn stop(s: *Server) void {
         s.stopping.store(true, .release);
         if (sock.connect(s.io, s.wake_host[0..s.wake_len], s.port, 1000)) |c| sock.closeHandle(c) else |_| {}
         if (s.thread) |th| th.join();
-        {
-            s.mutex.lockUncancelable(s.io);
-            defer s.mutex.unlock(s.io);
-            for (s.open.items) |c| sock.shutdown(c);
-        }
         var waited: u32 = 0;
         while (s.active.load(.acquire) > 0 and waited < 60_000) : (waited += 5) s.io.sleep(.fromMilliseconds(5), .awake) catch {};
         s.listener.close();
@@ -230,8 +229,9 @@ pub const Server = struct {
             else => "not a chat request in JSON",
         });
         const words = s.answerer.answer(s.answerer.ctx, a, said);
-        // the answer may have taken its time: its writing gets its own
-        sk.setLimits(10_000, 10_000, &s.stopping);
+        // the answer may have taken its time: its writing gets its own, and
+        // a stop meanwhile doesn't cut it
+        sk.setLimits(10_000, 10_000, null);
         const n = s.seq.fetchAdd(1, .acq_rel) + 1;
         const created = @divFloor(Io.Clock.real.now(s.io).nanoseconds, std.time.ns_per_s);
         const content = try jsonString(a, words);
@@ -524,4 +524,50 @@ test "voice_agent_drops_a_slow_request" {
     if (took_ms >= 3000) std.debug.print("a head of 300 ms was dropped after {d} ms\n", .{took_ms});
     try t.expect(took_ms < 3000);
     try t.expectEqual(0, f.heard.count());
+}
+
+test "voice_agent_answers_beside_idle_connections" {
+    var f: Fix = undefined;
+    try f.init(.{ .listen = "127.0.0.1:0", .token = token, .answerer = undefined });
+    defer f.deinit();
+    // devices on the network that open connections and say nothing
+    var idle: [6]sock.Handle = undefined;
+    for (&idle) |*h| h.* = try sock.connect(t.io, "127.0.0.1", f.s.port, 2000);
+    defer for (idle) |h| sock.closeHandle(h);
+    t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    // Home Assistant still gets in
+    const got = try f.send(.{ .auth = "Bearer " ++ token, .body = say_kitchen });
+    try t.expectEqual(200, got.status);
+}
+
+/// An answerer that takes its time.
+const Slow = struct {
+    fn answer(ctx: *anyopaque, a: std.mem.Allocator, said: speech.Said) []const u8 {
+        _ = ctx;
+        _ = said;
+        t.io.sleep(.fromMilliseconds(800), .awake) catch {};
+        return a.dupe(u8, "Done, after a while.") catch "";
+    }
+};
+
+test "a_stop_lets_an_answer_being_made_go_out" {
+    var dummy: u8 = 0;
+    const s = try Server.start(t.allocator, t.io, .{ .listen = "127.0.0.1:0", .token = token, .answerer = .{ .ctx = &dummy, .answer = Slow.answer } });
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const Client = struct {
+        fn run(port: u16, out: *?Reply, a: std.mem.Allocator) void {
+            out.* = request(t.io, a, "127.0.0.1", port, .{ .auth = "Bearer " ++ token, .body = say_kitchen }) catch null;
+        }
+    };
+    var got: ?Reply = null;
+    const th = try std.Thread.spawn(.{}, Client.run, .{ s.port, &got, arena.allocator() });
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    // stopped while the answer is being made: it still goes out (a cut
+    // connection would have Home Assistant send it again)
+    s.stop();
+    th.join();
+    const r = got orelse return error.NoAnswer;
+    try t.expectEqual(200, r.status);
+    try expectHas(r.body, "Done, after a while.");
 }

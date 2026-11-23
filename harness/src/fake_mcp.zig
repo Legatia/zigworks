@@ -47,6 +47,8 @@ const Home = struct {
             if (message.len == 0) return textResult(a, "say what to announce: message", true);
             const room = field(args, "room");
             const where = if (room.len > 0) room else "every speaker";
+            // a house of satellites takes its time
+            if (std.mem.indexOf(u8, message, "(slow)") != null) io.sleep(.fromMilliseconds(2500), .awake) catch {};
             const old = Io.Dir.cwd().readFileAlloc(io, "announced", a, .limited(1 << 20)) catch "";
             Io.Dir.cwd().writeFile(io, .{ .sub_path = "announced", .data = try std.fmt.allocPrint(a, "{s}{s}: {s}\n", .{ old, where, message }) }) catch {};
             return textResult(a, if (room.len > 0) try std.fmt.allocPrint(a, "done: said in {s}", .{room}) else "done: said on every speaker", false);

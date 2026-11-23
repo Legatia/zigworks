@@ -37,6 +37,9 @@ pub const Error = error{
     BadHostRule,
     /// A `[...]` line that is not `[all]` or a who pattern.
     BadSection,
+    /// `[room:NAME]` written otherwise than speech's who holds a room
+    /// (capitals, an apostrophe): it would never match.
+    BadRoomSection,
     /// `TOOL@ENV` for a tool that runs in no environment, or a bad name.
     BadEnv,
     OutOfMemory,
@@ -50,6 +53,7 @@ pub fn reason(e: anyerror) ?[]const u8 {
         error.BadHostRule => "an allow rule for web takes a host: a name, *.name or *, like *.example.com; a port, when given, is a number or *",
         error.BadSection => "a section is [all] or a who: owner, schedule:NAME, trigger:NAME, workflow:NAME/STEP, app:NAME, agent:NAME, member:NAME or room:NAME; a kind alone covers all its names, and * works as in rules",
         error.BadEnv => "only shell takes an environment: shell@NAME, the name in a-z, 0-9, - and _",
+        error.BadRoomSection => "a room's section names it as harness does: the area's name in lower case, spaces as _, no apostrophes, like [room:living_room] or [room:łazienka]",
         else => null,
     };
 }
@@ -196,6 +200,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Error![]Rule {
             if (std.mem.eql(u8, inner, "all")) {
                 section = null;
             } else if (who.isPattern(inner)) {
+                if (who.roomName(inner)) |name| if (!who.roomNameOk(name)) return error.BadRoomSection;
                 section = inner;
             } else return error.BadSection;
             continue;
@@ -378,4 +383,18 @@ test "member_sections_parse" {
     try t.expectEqualStrings("member", rs[0].section.?);
     try t.expectEqualStrings("member:anna", rs[1].section.?);
     try t.expect(std.mem.indexOf(u8, reason(error.BadSection).?, "member:NAME") != null);
+}
+
+test "a_rooms_section_names_it_as_harness_does" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // lower case, spaces as _, no apostrophes: what speech's who holds
+    const rs = try parse(a, "[room]\nallow mcp home/announce *\n[room:kitchen]\nask mcp */home_set *\n[room:łazienka]\ndeny mcp */home_set *\n[room:kids_*]\ndeny mcp */home_set *\n");
+    try t.expectEqual(4, rs.len);
+    try t.expectEqualStrings("room:łazienka", rs[2].section.?);
+    // anything else would never match: refused, saying how to write it
+    for ([_][]const u8{ "[room:Kitchen]", "[room:Łazienka]", "[room:kid's_room]", "[room:KIDS*]" }) |line|
+        try t.expectError(error.BadRoomSection, parse(a, line));
+    try t.expect(std.mem.indexOf(u8, reason(error.BadRoomSection).?, "[room:living_room]") != null);
 }

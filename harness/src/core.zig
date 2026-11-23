@@ -563,6 +563,10 @@ pub const Core = struct {
     speech_busy: std.atomic.Value(bool),
     /// Speech's calls waiting for the owner (state/room-asks).
     room_asks: household.Asks,
+    /// The events triggers' `announce` said lately ("TRIGGER\x00ID", the
+    /// last 256): a retry over the same events says nothing again.
+    announced: std.ArrayList([]u8),
+    announced_mutex: Io.Mutex,
     /// Harness's recent messages in groups for members (in memory): a
     /// member's reply to one is addressed to the bot.
     group_posts: std.ArrayList(GroupPost) = .empty,
@@ -785,6 +789,8 @@ pub const Core = struct {
         c.room_asks = .init(gpa, io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "room-asks" }));
         errdefer c.room_asks.deinit();
         c.room_asks.load() catch |e| c.log.write(.config, false, .{ .event = "room asks not read", .why = @errorName(e) }) catch {};
+        c.announced = .empty;
+        c.announced_mutex = .init;
         c.group_posts = .empty;
         c.group_posts_mutex = .init;
         c.bot_name_len = 0;
@@ -890,6 +896,8 @@ pub const Core = struct {
         c.member_asks.deinit();
         c.room_asks.deinit();
         c.speech_contexts.deinit();
+        for (c.announced.items) |x| c.gpa.free(x);
+        c.announced.deinit(c.gpa);
         c.group_posts.deinit(c.gpa);
         c.defs.deinit();
         for (c.told_topics.items) |n| c.gpa.free(n);
@@ -7152,10 +7160,8 @@ pub const Core = struct {
             try take.append(a, ev);
         }
         if (take.items.len == 0) return;
-        // said aloud first: a leak is heard before it is read
-        if (tr.announce.len > 0) c.triggerAnnounce(a, tr, take.items, by_hand) catch |e| {
-            c.log.write(.trigger, false, .{ .name = tr.name, .event = "announce failed", .why = @errorName(e) }) catch {};
-        };
+        // said aloud beside its action: the post never waits for the speakers
+        if (tr.announce.len > 0) c.startAnnounce(tr, take.items, by_hand);
         switch (tr.action) {
             .say => |template| try c.triggerSay(a, tr, template, take.items, by_hand),
             .do => |instruction| try c.triggerDo(a, tr, instruction, take.items, by_hand),
@@ -7430,6 +7436,8 @@ pub const Core = struct {
             return;
         }
         for (events[0..@min(events.len, 3)]) |ev| {
+            // said once, whatever retries the events see
+            if (!c.firstAnnounce(tr.name, ev.id)) continue;
             const text = std.mem.trim(u8, try triggers.fill(a, tr.announce, ev.fields), " \t\r\n");
             if (text.len == 0) continue;
             var input: std.ArrayList(u8) = .empty;
@@ -7450,6 +7458,72 @@ pub const Core = struct {
             };
             try run.logRun(.tool, false, .{ .tool = m.def.name, .arg = arg, .is_error = res.is_error, .output = res.text, .bytes = res.text.len });
         }
+    }
+
+    /// Whether trigger `name`'s event `id` is said for the first time (and
+    /// it is noted): the last 256 are kept, in memory.
+    fn firstAnnounce(c: *Core, name: []const u8, id: []const u8) bool {
+        var buf: [160]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}\x00{s}", .{ name, id }) catch return true;
+        c.announced_mutex.lockUncancelable(c.io);
+        defer c.announced_mutex.unlock(c.io);
+        for (c.announced.items) |x| if (std.mem.eql(u8, x, key)) return false;
+        const owned = c.gpa.dupe(u8, key) catch return true;
+        if (c.announced.items.len >= 256) c.gpa.free(c.announced.orderedRemove(0));
+        c.announced.append(c.gpa, owned) catch {
+            c.gpa.free(owned);
+            return true;
+        };
+        return true;
+    }
+
+    /// A trigger's `announce` on a thread of its own, with copies of what
+    /// it says: the action goes on at once (a house of satellites takes
+    /// seconds a line). Counted as a background run.
+    const Announce = struct { arena: std.heap.ArenaAllocator, tr: triggers.Trigger, events: []tstate.Event, by_hand: bool };
+
+    fn startAnnounce(c: *Core, tr: triggers.Trigger, events: []const tstate.Event, by_hand: bool) void {
+        const box = c.gpa.create(Announce) catch return;
+        box.arena = .init(c.gpa);
+        const a = box.arena.allocator();
+        const copied = blk: {
+            const list = a.alloc(tstate.Event, @min(events.len, 3)) catch break :blk null;
+            for (list, events[0..list.len]) |*o, ev| {
+                const fields = a.alloc(triggers.Field, ev.fields.len) catch break :blk null;
+                for (fields, ev.fields) |*f, x| f.* = .{ .name = a.dupe(u8, x.name) catch break :blk null, .value = a.dupe(u8, x.value) catch break :blk null };
+                o.* = .{ .id = a.dupe(u8, ev.id) catch break :blk null, .at = ev.at, .fields = fields };
+            }
+            break :blk list;
+        };
+        const trc = tr.clone(a) catch null;
+        if (copied == null or trc == null) {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return;
+        }
+        box.tr = trc.?;
+        box.events = copied.?;
+        box.by_hand = by_hand;
+        _ = c.bg_active.fetchAdd(1, .acq_rel);
+        const th = std.Thread.spawn(.{}, announceJob, .{ c, box }) catch {
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return;
+        };
+        th.detach();
+    }
+
+    fn announceJob(c: *Core, box: *Announce) void {
+        defer {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+        }
+        if (c.quitting.load(.acquire)) return;
+        c.triggerAnnounce(box.arena.allocator(), box.tr, box.events, box.by_hand) catch |e| {
+            c.log.write(.trigger, false, .{ .name = box.tr.name, .event = "announce failed", .why = @errorName(e) }) catch {};
+        };
     }
 
     /// The room an event says: its `room` field, or the one in its `text`
@@ -18666,4 +18740,43 @@ test "announce_is_quiet_at_night_unless_urgent" {
     try f.e.script(6, model.textReply("NOTHING"));
     _ = try f.core.runTask(try taskNamed(f.core, "night"));
     try expectHas(try f.e.request(6), "done: said on every speaker");
+}
+
+test "a_triggers_post_never_waits_for_the_speakers" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withHome(&f);
+    const dir = try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", "home" });
+    try Io.Dir.cwd().createDirPath(t.io, dir);
+    const leak_path = try std.fs.path.join(a, &.{ dir, "leak" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = leak_path, .data = "{\"device\":\"sink_leak\",\"room\":\"Kitchen\",\"to\":\"dry\"}" });
+    // the stand-in takes 2.5 s to say a line with "(slow)" in it, as a
+    // house of satellites does
+    try setTriggers(&f, "[leak]\nmcp = home resource fake://leak\nmatch = text has \"to\":\"wet\"\nurgent = yes\nsay = Water under the kitchen sink.\nannounce = Water under the kitchen sink (slow).\n");
+    _ = try f.core.pollNow("leak");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = leak_path, .data = "{\"device\":\"sink_leak\",\"room\":\"Kitchen\",\"to\":\"wet\"}" });
+    try t.expectEqual(1, (try f.core.pollNow("leak")).queued);
+    const started = util.nowMs(t.io);
+    f.core.tick();
+    try f.rec.waitFor("[leak] Water under the kitchen sink.");
+    const posted = util.nowMs(t.io) - started;
+    waitIdle(f.core);
+    const said = util.nowMs(t.io) - started;
+    std.debug.print("the leak was posted after {d} ms, said after {d} ms\n", .{ posted, said });
+    try t.expect(posted < 2000);
+    try t.expectEqualStrings("Kitchen: Water under the kitchen sink (slow).\n", try announcedText(&f));
+}
+
+test "an_event_is_said_once" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    // a retry (a restart in a run, a budget pause, Resume) takes the same
+    // pending events again: they were said already
+    try t.expect(f.core.firstAnnounce("leak", "341bb1f1c630816f0cfd049739c6456a"));
+    try t.expect(!f.core.firstAnnounce("leak", "341bb1f1c630816f0cfd049739c6456a"));
+    try t.expect(f.core.firstAnnounce("door", "341bb1f1c630816f0cfd049739c6456a"));
+    try t.expect(f.core.firstAnnounce("leak", "8b02f6ae15b4b0f3e2a1dc7e4c3d9a10"));
 }

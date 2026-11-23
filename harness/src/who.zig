@@ -55,6 +55,35 @@ pub fn roomName(by: []const u8) ?[]const u8 {
     return nameOf(by);
 }
 
+/// A letter's lower case: ASCII, Latin-1 and Latin Extended-A (Polish
+/// among them), Greek and Cyrillic capitals; others as they are. A room's
+/// name in its who is written so (speech.zig).
+pub fn lowerLetter(cp: u21) u21 {
+    if (cp < 0x80) return std.ascii.toLower(@intCast(cp));
+    if (cp >= 0xC0 and cp <= 0xDE and cp != 0xD7) return cp + 0x20;
+    if (cp >= 0x100 and cp <= 0x137) return if (cp % 2 == 0) cp + 1 else cp;
+    if (cp >= 0x139 and cp <= 0x148) return if (cp % 2 == 1) cp + 1 else cp;
+    if (cp >= 0x14A and cp <= 0x177) return if (cp % 2 == 0) cp + 1 else cp;
+    if (cp == 0x178) return 0xFF;
+    if (cp >= 0x179 and cp <= 0x17E) return if (cp % 2 == 1) cp + 1 else cp;
+    if (cp >= 0x391 and cp <= 0x3A9 and cp != 0x3A2) return cp + 0x20;
+    if (cp >= 0x410 and cp <= 0x42F) return cp + 0x20;
+    if (cp >= 0x400 and cp <= 0x40F) return cp + 0x50;
+    return cp;
+}
+
+/// Whether a room's name (a section's, `*` allowed) is written as speech's
+/// who holds it: no capital, space or apostrophe; else it never matches.
+pub fn roomNameOk(name: []const u8) bool {
+    const view = std.unicode.Utf8View.init(name) catch return false;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp == ' ' or cp == '\'' or cp == 0x2019) return false;
+        if (lowerLetter(cp) != cp) return false;
+    }
+    return true;
+}
+
 /// What runs with the household's scope (gate.zig's member order): a
 /// member's message or speech in a room, or a pattern of either.
 pub fn isHousehold(text: []const u8) bool {

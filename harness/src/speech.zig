@@ -8,6 +8,7 @@
 const std = @import("std");
 const jv = @import("jv.zig");
 const agent = @import("agent.zig");
+const who = @import("who.zig");
 
 /// The conversation speech runs in (only in the log and its contexts: no
 /// Telegram place has it).
@@ -170,7 +171,7 @@ pub fn roomWho(buf: *[max_who]u8, room: []const u8) []const u8 {
     var it = view.iterator();
     while (it.nextCodepoint()) |cp| {
         if (cp == '\'' or cp == 0x2019) continue;
-        const low: u21 = if (cp == ' ') '_' else lower(cp);
+        const low: u21 = if (cp == ' ') '_' else who.lowerLetter(cp);
         const len = std.unicode.utf8CodepointSequenceLength(low) catch continue;
         if (n + len > buf.len) break;
         _ = std.unicode.utf8Encode(low, buf[n..][0..len]) catch continue;
@@ -178,22 +179,6 @@ pub fn roomWho(buf: *[max_who]u8, room: []const u8) []const u8 {
     }
     if (n == 5) return "room:unknown";
     return buf[0..n];
-}
-
-/// A letter's lower case: ASCII, Latin-1 and Latin Extended-A (Polish
-/// among them), Greek and Cyrillic capitals; others as they are.
-fn lower(cp: u21) u21 {
-    if (cp < 0x80) return std.ascii.toLower(@intCast(cp));
-    if (cp >= 0xC0 and cp <= 0xDE and cp != 0xD7) return cp + 0x20;
-    if (cp >= 0x100 and cp <= 0x137) return if (cp % 2 == 0) cp + 1 else cp;
-    if (cp >= 0x139 and cp <= 0x148) return if (cp % 2 == 1) cp + 1 else cp;
-    if (cp >= 0x14A and cp <= 0x177) return if (cp % 2 == 0) cp + 1 else cp;
-    if (cp == 0x178) return 0xFF;
-    if (cp >= 0x179 and cp <= 0x17E) return if (cp % 2 == 1) cp + 1 else cp;
-    if (cp >= 0x391 and cp <= 0x3A9 and cp != 0x3A2) return cp + 0x20;
-    if (cp >= 0x410 and cp <= 0x42F) return cp + 0x20;
-    if (cp >= 0x400 and cp <= 0x40F) return cp + 0x50;
-    return cp;
 }
 
 /// What the model answered, made for the ear: markdown's marks, code
@@ -304,21 +289,30 @@ fn emoji(cp: u21) bool {
     return (cp >= 0x1F000 and cp <= 0x1FAFF) or (cp >= 0x2600 and cp <= 0x27BF) or cp == 0xFE0F or cp == 0x200D or (cp >= 0x1F1E6 and cp <= 0x1F1FF);
 }
 
-/// At most `max_spoken` bytes: up to the last sentence's end that fits,
-/// else the last whole word and "…".
+/// At most `max_spoken` bytes: up to the last sentence's end that fits
+/// (". ", "! ", "? ", or a full stop of Japanese or Chinese), else the
+/// last whole word and "…", else (a language without spaces) as many
+/// whole letters as fit and "…".
 fn cutSpoken(a: std.mem.Allocator, said: []const u8) ![]const u8 {
     if (said.len <= max_spoken) return a.dupe(u8, said);
     var end: usize = 0;
     var i: usize = 0;
-    while (i + 1 < said.len and i < max_spoken) : (i += 1) {
-        if (std.mem.indexOfScalar(u8, ".!?", said[i]) != null and said[i + 1] == ' ') end = i + 1;
+    while (i < said.len and i < max_spoken) : (i += 1) {
+        if (i + 1 < said.len and std.mem.indexOfScalar(u8, ".!?", said[i]) != null and said[i + 1] == ' ') end = i + 1;
+        for ([_][]const u8{ "。", "！", "？" }) |stop| {
+            if (i + stop.len <= max_spoken and std.mem.startsWith(u8, said[i..], stop)) end = i + stop.len;
+        }
     }
     if (end > max_spoken / 3) return a.dupe(u8, said[0..end]);
     const ell = "…";
-    var cut = max_spoken - ell.len;
+    const limit = max_spoken - ell.len;
+    var cut = limit;
     while (cut > 0 and said[cut] != ' ') cut -= 1;
-    // never inside a letter's bytes
-    while (cut > 0 and (said[cut] & 0xC0) == 0x80) cut -= 1;
+    // no space in reach: between letters, never inside a letter's bytes
+    if (cut < limit / 3) {
+        cut = limit;
+        while (cut > 0 and (said[cut] & 0xC0) == 0x80) cut -= 1;
+    }
     return std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, said[0..cut], " ,;:"), ell });
 }
 
@@ -517,8 +511,8 @@ test "the_room_as_a_who" {
     try t.expectEqualStrings("room:żółta_ściana", roomWho(&buf, "ŻÓŁTA Ściana"));
     try t.expectEqualStrings("room:unknown", roomWho(&buf, ""));
     // what the gate and the rules file read
-    const who = @import("who.zig");
     try t.expect(who.isValue(roomWho(&buf, "Pokój dzienny")));
+    try t.expect(who.roomNameOk(roomWho(&buf, "ŻÓŁTA Ściana")["room:".len..]));
     try t.expect(who.matchesBy("room:pokój_*", roomWho(&buf, "Pokój dzienny")));
 }
 
@@ -590,4 +584,24 @@ test "speech_contexts_expire_and_are_capped" {
     try t.expectEqual(max_contexts, c.items.items.len);
     try t.expect(c.find("c0") == null);
     try t.expect(c.find("c10") != null);
+}
+
+test "a_long_answer_without_spaces_is_cut_between_letters" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Japanese and Chinese: their own full stops end sentences
+    var ja: std.ArrayList(u8) = .empty;
+    for (0..40) |_| try ja.appendSlice(a, "今日は晴れです。");
+    const cut = try forTheEar(a, ja.items);
+    try t.expect(cut.len > max_spoken / 2 and cut.len <= max_spoken);
+    try t.expect(std.mem.endsWith(u8, cut, "。"));
+    try t.expect(std.unicode.utf8ValidateSlice(cut));
+    // no stop and no space at all: cut between letters, never to nothing
+    var run: std.ArrayList(u8) = .empty;
+    for (0..200) |_| try run.appendSlice(a, "晴");
+    const long = try forTheEar(a, run.items);
+    try t.expect(long.len > max_spoken / 2 and long.len <= max_spoken);
+    try t.expect(std.mem.endsWith(u8, long, "…"));
+    try t.expect(std.unicode.utf8ValidateSlice(long));
 }

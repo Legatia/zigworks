@@ -635,6 +635,9 @@ fn memberDefault(tool: Tool, subject: []const u8, room: bool) Decision {
             // "SERVER/TOOL INPUT"
             const head = subject[0 .. std.mem.indexOfScalar(u8, subject, ' ') orelse subject.len];
             const slash = std.mem.indexOfScalar(u8, head, '/') orelse break :blk .{ .action = .ask, .why = "household default: the owner decides", .subject = subject };
+            // speech answers within seconds, and homemcp serves one call at a
+            // time: a wait of minutes would hold the house's tool
+            if (room and std.mem.eql(u8, head[slash + 1 ..], "home_wait")) break :blk .{ .action = .deny, .why = "household default for speech: it waits on no device (an allow line under [room] lets it)", .subject = subject };
             if (oneOf(head[slash + 1 ..], &home_tools)) break :blk .{ .action = .allow, .why = "household default: the home's reads and ordinary devices", .subject = subject };
             break :blk .{ .action = .ask, .why = "household default: the owner decides", .subject = subject };
         },
@@ -1643,9 +1646,15 @@ test "a_rooms_defaults" {
     const a = f.arena.allocator();
     const r: Ctx = .{ .who = kitchen };
     // the household's: homemcp's reads and ordinary devices, and search
-    for ([_][]const u8{ "home/home_state {}", "house/home_wait {\"device\":\"hall_motion\"}", "home/home_set {\"device\":\"hall_light\",\"action\":\"on\"}" }) |arg|
+    for ([_][]const u8{ "home/home_state {}", "home/home_set {\"device\":\"hall_light\",\"action\":\"on\"}" }) |arg|
         try t.expectEqual(.allow, f.act(.mcp, arg, r));
     try t.expectEqual(.allow, f.act(.search, "weather tomorrow", r));
+    // but no waiting on a device: an answer is spoken within seconds, and
+    // homemcp serves one call at a time (a member may wait)
+    const wait = f.gate.decide(a, .mcp, "house/home_wait {\"device\":\"hall_motion\"}", 1000, r);
+    try t.expectEqual(.deny, wait.action);
+    try t.expectEqualStrings("household default for speech: it waits on no device (an allow line under [room] lets it)", wait.why);
+    try t.expectEqual(.allow, f.act(.mcp, "house/home_wait {\"device\":\"hall_motion\"}", .{ .who = anna }));
     // another MCP tool, money and the guarded tool: the owner's, never for a day
     const car = f.gate.decide(a, .mcp, "cloud/car_status {}", 1000, r);
     try t.expectEqual(.ask, car.action);

@@ -630,6 +630,11 @@ fn mcpSource(a: Allocator, v: []const u8, why: *[]const u8) Bad!Mcp {
             why.* = shape;
             return error.BadValue;
         };
+        // a poll would say it again and again, at night too
+        if (std.mem.eql(u8, tool, "announce")) {
+            why.* = "announce speaks aloud: a trigger doesn't poll it (announce = TEXT says a line per event)";
+            return error.BadValue;
+        }
         const input = if (rest.len == 0) "{}" else rest;
         const parsed = jv.parse(a, input);
         if (parsed == null or parsed.? != .object) {
@@ -1263,4 +1268,12 @@ test "announce_is_said_on_the_house_speakers" {
     try refused(a, "[m]\ntopic = Zig | https://z.org/f\nannounce = x\n", 3, "not a key of a brief trigger");
     // the reading says it
     try t.expect(std.mem.indexOf(u8, try reading(a, leak, "claude-haiku"), "; says it on the house's speakers: Water under the kitchen sink. Close the water main.") != null);
+}
+
+test "a_trigger_never_polls_what_speaks" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // a poll would say it every time, at night too: announce = TEXT says a line per event
+    try refused(a, "[x]\nmcp = home/announce {\"message\":\"hi\"}\nsay = x\n", 2, "announce speaks aloud: a trigger doesn't poll it");
 }
