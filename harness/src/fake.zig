@@ -15,9 +15,12 @@
 //! - search: `GET /res/v1/web/search?q=…` answers `search.json`.
 //! - pages and feeds: `GET /page/NAME` answers the file `pages/NAME`
 //!   (POST too; `?delay_ms=N` answers after N ms), or, when there is a
-//!   file `pages/NAME.redirect` holding "STATUS LOCATION", that redirect.
-//!   Each page request is appended to `page-requests.jsonl` with its
-//!   headers.
+//!   file `pages/NAME.redirect` holding "STATUS LOCATION", that redirect;
+//!   `pages/NAME.status` holding "STATUS [RETRY_AFTER]" answers that
+//!   status; `pages/NAME.etag` and `pages/NAME.modified` are sent as its
+//!   ETag and Last-Modified, and a request carrying the same in
+//!   If-None-Match or If-Modified-Since gets 304. Each page request is
+//!   appended to `page-requests.jsonl` with its headers.
 //! - Telegram: see `telegram` below.
 const std = @import("std");
 const sock = @import("sock.zig");
@@ -176,9 +179,14 @@ pub const Server = struct {
         var headers: std.ArrayList(u8) = .empty;
         // the key a model request carries, for `echo_key`
         var key: []const u8 = "";
+        // a page request's conditions
+        var if_none_match: ?[]const u8 = null;
+        var if_modified_since: ?[]const u8 = null;
         var it = req.iterateHeaders();
         while (it.next()) |h| {
             try headers.print(a, "{f}:{f},", .{ std.json.fmt(h.name, .{}), std.json.fmt(h.value, .{}) });
+            if (std.ascii.eqlIgnoreCase(h.name, "if-none-match")) if_none_match = try a.dupe(u8, h.value);
+            if (std.ascii.eqlIgnoreCase(h.name, "if-modified-since")) if_modified_since = try a.dupe(u8, h.value);
             if (std.ascii.eqlIgnoreCase(h.name, "x-api-key")) key = try a.dupe(u8, h.value);
             if (std.ascii.eqlIgnoreCase(h.name, "authorization") and std.mem.startsWith(u8, h.value, "Bearer ")) key = try a.dupe(u8, h.value["Bearer ".len..]);
         }
@@ -224,9 +232,36 @@ pub const Server = struct {
                 while (Io.Clock.awake.now(s.io).nanoseconds < until and !s.stopping.load(.acquire)) s.io.sleep(.fromMilliseconds(20), .awake) catch {};
             }
             if (name.len == 0 or std.mem.indexOf(u8, name, "..") != null) return json(req, .not_found, "{}");
+            // `pages/NAME.status`: "STATUS [RETRY_AFTER]"
+            if (s.readScript(a, &.{ "pages", try std.fmt.allocPrint(a, "{s}.status", .{name}) })) |st_text| {
+                var parts = std.mem.tokenizeAny(u8, st_text, " \r\n\t");
+                const st = std.fmt.parseInt(u10, parts.next() orelse "500", 10) catch 500;
+                if (parts.next()) |retry| return req.respond("{}", .{ .status = @fromBackingInt(st), .extra_headers = &.{
+                    .{ .name = "content-type", .value = "application/json" },
+                    .{ .name = "retry-after", .value = retry },
+                } });
+                return json(req, @fromBackingInt(st), "{}");
+            }
+            const etag = if (s.readScript(a, &.{ "pages", try std.fmt.allocPrint(a, "{s}.etag", .{name}) })) |x| std.mem.trim(u8, x, " \r\n\t") else null;
+            const modified = if (s.readScript(a, &.{ "pages", try std.fmt.allocPrint(a, "{s}.modified", .{name}) })) |x| std.mem.trim(u8, x, " \r\n\t") else null;
+            var extra: [3]std.http.Header = undefined;
+            var n: usize = 0;
+            if (etag) |e| {
+                extra[n] = .{ .name = "etag", .value = e };
+                n += 1;
+            }
+            if (modified) |m| {
+                extra[n] = .{ .name = "last-modified", .value = m };
+                n += 1;
+            }
+            const same_tag = etag != null and if_none_match != null and std.mem.eql(u8, etag.?, if_none_match.?);
+            const same_time = modified != null and if_modified_since != null and std.mem.eql(u8, modified.?, if_modified_since.?);
+            if (same_tag or same_time) return req.respond("", .{ .status = .not_modified, .extra_headers = extra[0..n] });
             const text = s.readScript(a, &.{ "pages", name }) orelse return json(req, .not_found, "{}");
-            const ct = if (std.mem.endsWith(u8, name, ".bin")) "application/octet-stream" else if (std.mem.endsWith(u8, name, ".xml")) "application/rss+xml" else "text/html; charset=utf-8";
-            return req.respond(text, .{ .extra_headers = &.{.{ .name = "content-type", .value = ct }} });
+            const ct = if (std.mem.endsWith(u8, name, ".bin")) "application/octet-stream" else if (std.mem.endsWith(u8, name, ".xml")) "application/rss+xml" else if (std.mem.endsWith(u8, name, ".json")) "application/json" else if (std.mem.endsWith(u8, name, ".txt")) "text/plain; charset=utf-8" else "text/html; charset=utf-8";
+            extra[n] = .{ .name = "content-type", .value = ct };
+            n += 1;
+            return req.respond(text, .{ .extra_headers = extra[0..n] });
         }
         if (std.mem.startsWith(u8, route, "/bot")) return s.telegram(a, req, route, body);
         return json(req, .not_found, "{\"error\":\"no such route\"}");

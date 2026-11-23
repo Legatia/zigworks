@@ -7,6 +7,7 @@ const conversations = @import("conversations.zig");
 const agents = @import("agents.zig");
 const model = @import("model.zig");
 const mcp = @import("mcp.zig");
+const triggers = @import("triggers.zig");
 
 pub const Error = error{ BadConfig, OutOfMemory };
 
@@ -24,6 +25,7 @@ pub const Config = struct {
     browser: Browser = .{},
     money: Money = .{},
     inbox: Inbox = .{},
+    triggers: Triggers = .{},
     /// The `[provider NAME]` sections, in the order their names first
     /// appear (not a section of its own: `parse` reads them apart).
     providers: []const model.Section = &.{},
@@ -93,6 +95,9 @@ pub const Config = struct {
         max_per_day: u32 = 0,
         /// Money calls in scheduled runs, without asking, inside the caps.
         scheduled: bool = false,
+        /// Runs a trigger starts follow `scheduled` (on) or never move
+        /// money (off: the owner has not decided yet).
+        triggers: bool = false,
     };
     /// What waits for the owner (state/inbox).
     pub const Inbox = struct {
@@ -102,6 +107,18 @@ pub const Config = struct {
         /// Minutes after midnight (owner's time) of the daily reminder of
         /// items open over 12 hours; null: off.
         remind: ?u16 = 9 * 60,
+    };
+    /// Event triggers (triggers.ini).
+    pub const Triggers = struct {
+        /// The model of `check =` lines; "": `[model] worker_model`.
+        check_model: []const u8 = "",
+        /// Check questions a day, all triggers together.
+        checks_per_day: u32 = 200,
+        /// Runs triggers start, all of them together.
+        runs_per_hour: u32 = 20,
+        runs_per_day: u32 = 100,
+        /// Events waiting per trigger; past it the trigger pauses.
+        queue: u32 = 200,
     };
 };
 
@@ -161,7 +178,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
         }
         if (!found) return error.BadConfig;
     }
-    if (cfg.inbox.questions == 0) return error.BadConfig;
+    if (cfg.inbox.questions == 0 or cfg.triggers.queue == 0) return error.BadConfig;
     cfg.providers = try providerSections(arena, text, provs.items);
     if (!model.isPreset(cfg.model.provider)) {
         for (cfg.providers) |p| {
@@ -333,35 +350,30 @@ pub const Brief = struct {
     topics: []const Topic,
     /// The conversation it posts to (`to =`).
     to: []const u8 = "main",
+
+    /// A copy whose every slice is in `a` (a background run's own).
+    pub fn clone(b: Brief, a: std.mem.Allocator) !Brief {
+        const topics = try a.alloc(Topic, b.topics.len);
+        for (b.topics, topics) |tp, *o| o.* = .{ .name = try a.dupe(u8, tp.name), .feeds = try dupeList(a, tp.feeds), .searches = try dupeList(a, tp.searches) };
+        return .{ .name = try a.dupe(u8, b.name), .at_minutes = b.at_minutes, .topics = topics, .to = try a.dupe(u8, b.to) };
+    }
 };
 
+fn dupeList(a: std.mem.Allocator, list: []const []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, list.len);
+    for (list, out) |x, *o| o.* = try a.dupe(u8, x);
+    return out;
+}
+
+/// briefs.ini, read by the one parser of tasks.ini, briefs.ini and
+/// triggers.ini (triggers.zig): at, to, topic lines.
 pub fn parseBriefs(arena: std.mem.Allocator, text: []const u8) Error![]Brief {
-    var briefs: std.ArrayList(Brief) = .empty;
-    var topics: std.ArrayList(Topic) = .empty;
-    var cur: ?Brief = null;
-    for (try lines(arena, text)) |l| {
-        if (l.section.len == 0) return error.BadConfig;
-        if (cur == null or !std.mem.eql(u8, cur.?.name, l.section)) {
-            if (cur) |*c| {
-                c.topics = try topics.toOwnedSlice(arena);
-                try briefs.append(arena, c.*);
-            }
-            for (briefs.items) |b| if (std.mem.eql(u8, b.name, l.section)) return error.BadConfig;
-            cur = .{ .name = l.section, .at_minutes = 7 * 60, .topics = &.{} };
-        }
-        if (std.mem.eql(u8, l.key, "at")) {
-            cur.?.at_minutes = parseClock(l.value) catch return error.BadConfig;
-        } else if (std.mem.eql(u8, l.key, "to")) {
-            cur.?.to = try conversationName(l.value);
-        } else if (std.mem.eql(u8, l.key, "topic")) {
-            try topics.append(arena, try parseTopic(arena, l.value));
-        } else return error.BadConfig;
-    }
-    if (cur) |*c| {
-        c.topics = try topics.toOwnedSlice(arena);
-        try briefs.append(arena, c.*);
-    }
-    return briefs.items;
+    var d: triggers.Diag = .{};
+    const list = triggers.parse(arena, text, .briefs, &d) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BadTrigger => error.BadConfig,
+    };
+    return triggers.briefsOf(arena, list);
 }
 
 /// "Name | https://feed | search: words" → a topic.
@@ -406,46 +418,32 @@ pub const Task = struct {
     to: []const u8 = "main",
     /// The definition that runs it (`agent =`).
     agent: []const u8 = "main",
+    /// A schedule of triggers.ini may say a fixed text instead of `do`
+    /// (no model call), or start a workflow (its name).
+    say: []const u8 = "",
+    start: []const u8 = "",
+    /// It is a schedule of triggers.ini, not a task of tasks.ini.
+    in_triggers: bool = false,
+
+    /// A copy whose every slice is in `a` (a background run's own).
+    pub fn clone(tk: Task, a: std.mem.Allocator) !Task {
+        var o = tk;
+        inline for (.{ "name", "do", "to", "agent", "say", "start" }) |f| @field(o, f) = try a.dupe(u8, @field(tk, f));
+        return o;
+    }
 };
 
 pub const day_names = [_][]const u8{ "mon", "tue", "wed", "thu", "fri", "sat", "sun" };
 
+/// tasks.ini, read by the one parser of tasks.ini, briefs.ini and
+/// triggers.ini (triggers.zig): at, every, days, do, to, agent.
 pub fn parseTasks(arena: std.mem.Allocator, text: []const u8) Error![]Task {
-    var tasks: std.ArrayList(Task) = .empty;
-    for (try lines(arena, text)) |l| {
-        if (l.section.len == 0) return error.BadConfig;
-        if (tasks.items.len == 0 or !std.mem.eql(u8, tasks.items[tasks.items.len - 1].name, l.section)) {
-            for (tasks.items) |other| if (std.mem.eql(u8, other.name, l.section)) return error.BadConfig;
-            try tasks.append(arena, .{ .name = l.section });
-        }
-        const tk = &tasks.items[tasks.items.len - 1];
-        if (std.mem.eql(u8, l.key, "at")) {
-            tk.at_minutes = parseClock(l.value) catch return error.BadConfig;
-        } else if (std.mem.eql(u8, l.key, "every")) {
-            tk.every_minutes = parseEvery(l.value) catch return error.BadConfig;
-        } else if (std.mem.eql(u8, l.key, "days")) {
-            tk.days = parseDays(l.value) catch return error.BadConfig;
-        } else if (std.mem.eql(u8, l.key, "do")) {
-            tk.do = l.value;
-        } else if (std.mem.eql(u8, l.key, "to")) {
-            tk.to = try conversationName(l.value);
-        } else if (std.mem.eql(u8, l.key, "agent")) {
-            if (!agents.validName(l.value)) return error.BadConfig;
-            tk.agent = l.value;
-        } else return error.BadConfig;
-    }
-    for (tasks.items) |tk| {
-        if (tk.do.len == 0) return error.BadConfig;
-        if ((tk.at_minutes == null) == (tk.every_minutes == null)) return error.BadConfig;
-    }
-    return tasks.items;
-}
-
-/// A `to =` value: a conversation's name (a-z, 0-9, - and _, up to 32);
-/// one that is no conversation yet opens that topic at its first post.
-fn conversationName(v: []const u8) Error![]const u8 {
-    if (!conversations.validName(v)) return error.BadConfig;
-    return v;
+    var d: triggers.Diag = .{};
+    const list = triggers.parse(arena, text, .tasks, &d) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BadTrigger => error.BadConfig,
+    };
+    return triggers.tasksOf(arena, list);
 }
 
 /// "15m", "2h" → minutes; at least 5.
@@ -528,10 +526,18 @@ pub const defaults_ini =
     \\max_per_call = 0                    ; in the tool's amount units; 0 = no cap
     \\max_per_day = 0
     \\scheduled = off                     ; on: scheduled runs may move money, within the caps
+    \\triggers = off                      ; on: runs a trigger starts move money as scheduled = says; off: never
     \\
     \\[inbox]                             ; what waits for you (/inbox)
     \\questions = 20                      ; questions and approvals waiting at once
     \\remind = 09:00                      ; once a day, if something waited over 12 hours; off: never
+    \\
+    \\[triggers]                          ; event triggers (triggers.ini)
+    \\; check_model = claude-haiku         ; the model of check = lines; default worker_model
+    \\checks_per_day = 200                ; check questions a day, all triggers together
+    \\runs_per_hour = 20                  ; runs triggers start, all together
+    \\runs_per_day = 100
+    \\queue = 200                         ; events waiting per trigger; past it the trigger pauses
     \\
 ;
 
@@ -546,12 +552,12 @@ pub const rules_example =
     \\# send (a post) to a conversation others read is asked every time
     \\# unless an allow rule names it (allow send family).
     \\# agent_save (a new agent definition, or a change to the agent's own)
-    \\# is asked every time, whatever the rules; a deny rule stops it.
-    \\# Not used yet (their tools come later): mail, trigger rm and workflow
-    \\# start and stop ask; app_save, env_save, trigger add and workflow save
-    \\# are asked every time.
-    \\# A line [agent:NAME], [owner] or [schedule:NAME] starts rules for those
-    \\# calls only; [all] goes back to rules for every call. shell@NAME is for
+    \\# and trigger add (a trigger the agent proposes) are asked every time,
+    \\# whatever the rules; a deny rule stops them; trigger rm asks.
+    \\# Not used yet (their tools come later): mail and workflow start and
+    \\# stop ask; app_save, env_save and workflow save are asked every time.
+    \\# A line [agent:NAME], [owner], [schedule:NAME] or [trigger:NAME] starts
+    \\# rules for those calls only; [all] goes back to rules for every call. shell@NAME is for
     \\# commands in environment NAME (host is the only one for now).
     \\# After the agent writes a file in the workspace, a shell command that
     \\# a rule or a 24 h grant allows is asked first, naming the files, until
@@ -571,6 +577,29 @@ pub const briefs_example =
     \\; [morning]
     \\; at = 07:00
     \\; topic = Zig | https://ziglang.org/news/index.xml | search: zig release
+    \\
+;
+
+pub const triggers_example =
+    \\; Triggers: an event source with a filter; a match starts a run (do),
+    \\; says a line without the model (say), or starts a workflow (start).
+    \\; A section's keys give its kind: feed = URL, search = WORDS,
+    \\; page = URL (json = PATH for a value), file = FOLDER/PATTERN,
+    \\; mcp = SERVER resource URI or SERVER/TOOL {"json": "input"} (key = FIELD);
+    \\; every or at alone is a schedule, topic lines a brief.
+    \\; Then: every (feed 1h, search 6h, page 1h, file 1m, mcp 15m) or at
+    \\; (+ days); match = FIELD OP VALUE (each must hold), skip = FIELD OP
+    \\; VALUE; check = a yes/no question for the model; one of do, say
+    \\; ({field} filled in) and start = workflow NAME; agent, tools, to,
+    \\; max_runs (6 an hour), max_events (20 a run), checks_per_day (50).
+    \\; A first poll only marks what is there. README: Triggers.
+    \\;
+    \\; [btc]
+    \\; page = https://api.coinbase.com/v2/prices/BTC-USD/spot
+    \\; json = data.amount
+    \\; every = 5m
+    \\; match = move > 3
+    \\; say = BTC {value} ({change}% since the last message)
     \\
 ;
 
@@ -934,4 +963,69 @@ test "provider_sections_refuse_bad_values" {
     for (0..9) |i| try nine.print(a, "header = X-H{d}: v\n", .{i});
     try t.expectError(error.BadHeader, parse(a, nine.items));
     for ([_]anyerror{ error.BadProvider, error.BadHeader, error.ProviderNeedsApiAndUrl, error.UnknownProvider }) |e| try t.expect(reason(e) != null);
+}
+
+test "old_task_and_brief_files_run_as_before" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // read by the one parser of the three files, the same tasks and briefs
+    const ts = try parseTasks(a, "; a comment\n[btc-watch]\nevery = 15m\ndo = Check the price.\nto = house-search\n[weekly review]\nat = 18:00\ndays = fri\nagent = researcher\ndo = Summarise.\n");
+    try t.expectEqual(2, ts.len);
+    try t.expectEqualStrings("btc-watch", ts[0].name);
+    try t.expectEqual(15, ts[0].every_minutes.?);
+    try t.expectEqual(null, ts[0].at_minutes);
+    try t.expectEqualStrings("Check the price.", ts[0].do);
+    try t.expectEqualStrings("house-search", ts[0].to);
+    try t.expectEqualStrings("main", ts[0].agent);
+    try t.expectEqualStrings("", ts[0].say);
+    try t.expect(!ts[0].in_triggers);
+    // a name 0.3 allowed still reads
+    try t.expectEqualStrings("weekly review", ts[1].name);
+    try t.expectEqual(18 * 60, ts[1].at_minutes.?);
+    try t.expectEqual(0b0010000, ts[1].days);
+    try t.expectEqualStrings("researcher", ts[1].agent);
+    // the keys tasks.ini takes, and no others
+    try t.expectError(error.BadConfig, parseTasks(a, "[x]\nevery = 5m\nsay = hi\n"));
+    try t.expectError(error.BadConfig, parseTasks(a, "[x]\nevery = 5m\nfeed = https://z.org/f\ndo = y\n"));
+    try t.expectError(error.BadConfig, parseTasks(a, "every = 5m\n[x]\ndo = y\n"));
+    try t.expectError(error.BadConfig, parseTasks(a, "[a]\nevery = 5m\ndo = y\n[b]\nevery = 5m\ndo = y\n[a]\ndo = z\n"));
+    const bs = try parseBriefs(a, "[morning]\ntopic = Zig | https://ziglang.org/news/index.xml\n[Evening News]\nat = 19:30\nto = news\n");
+    try t.expectEqual(2, bs.len);
+    try t.expectEqual(7 * 60, bs[0].at_minutes);
+    try t.expectEqual(1, bs[0].topics.len);
+    try t.expectEqualStrings("Evening News", bs[1].name);
+    try t.expectEqual(0, bs[1].topics.len);
+    try t.expectEqualStrings("news", bs[1].to);
+    try t.expectError(error.BadConfig, parseBriefs(a, "[m]\nevery = 5m\n"));
+    // a clone shares nothing with the settings it came from
+    var other: std.heap.ArenaAllocator = .init(t.allocator);
+    const tk = try ts[0].clone(other.allocator());
+    const br = try bs[0].clone(other.allocator());
+    arena.deinit();
+    arena = .init(t.allocator);
+    try t.expectEqualStrings("btc-watch", tk.name);
+    try t.expectEqualStrings("Check the price.", tk.do);
+    try t.expectEqualStrings("https://ziglang.org/news/index.xml", br.topics[0].feeds[0]);
+    other.deinit();
+}
+
+test "trigger_and_money_settings_read" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try parse(a, "");
+    try t.expectEqualStrings("", d.triggers.check_model);
+    try t.expectEqual(200, d.triggers.checks_per_day);
+    try t.expectEqual(20, d.triggers.runs_per_hour);
+    try t.expectEqual(100, d.triggers.runs_per_day);
+    try t.expectEqual(200, d.triggers.queue);
+    try t.expect(!d.money.triggers);
+    const c = try parse(a, "[triggers]\ncheck_model = tiny\nqueue = 5\n[money]\ntriggers = on\n");
+    try t.expectEqualStrings("tiny", c.triggers.check_model);
+    try t.expectEqual(5, c.triggers.queue);
+    try t.expect(c.money.triggers);
+    try t.expectError(error.BadConfig, parse(a, "[triggers]\nqueue = 0\n"));
+    try t.expectEqualDeep(d.triggers, (try parse(a, defaults_ini)).triggers);
+    try t.expectEqualDeep(d.money, (try parse(a, defaults_ini)).money);
 }

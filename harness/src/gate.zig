@@ -136,8 +136,9 @@ pub const Ctx = struct {
     /// No one is there to answer: `ask` becomes `deny`. Set for runs a
     /// schedule, a trigger or a workflow started (`Who.unattended`).
     scheduled: bool = false,
-    /// A feed or search the owner listed in briefs.ini.
-    brief_source: bool = false,
+    /// A source the owner listed: the file that lists it (`briefs.ini`,
+    /// `triggers.ini`); a read of it is allowed as an allow rule would.
+    listed: ?[]const u8 = null,
     /// The owner switched on money calls in scheduled runs ([money]
     /// scheduled = on); the caps were checked before the gate.
     money_unattended: bool = false,
@@ -460,8 +461,9 @@ pub const Gate = struct {
             if (g.matches(arena, tool, r.pattern, subject) or (given.len > 0 and g.matches(arena, tool, r.pattern, given)))
                 return .{ .action = .deny, .why = ruleWhy(arena, r), .subject = subject };
         }
-        // listing a source in briefs.ini allows it, as an allow rule would
-        if (ctx.brief_source) return .{ .action = .allow, .why = "listed in briefs.ini", .subject = subject };
+        // listing a source in briefs.ini or triggers.ini allows it, as an
+        // allow rule would
+        if (ctx.listed) |file| return .{ .action = .allow, .why = std.fmt.allocPrint(arena, "listed in {s}", .{file}) catch "listed by the owner", .subject = subject };
         if (tool == .money) {
             // no grant or allow rule lifts this: the owner is asked every time
             if (!ctx.scheduled) return .{ .action = .ask, .why = "money is asked every time", .subject = subject };
@@ -766,18 +768,18 @@ test "listed_brief_source_is_allowed" {
     var f: Fixture = undefined;
     try f.init("");
     defer f.deinit();
-    try t.expectEqual(.allow, f.act(.fetch, "https://feeds.example.com/rss", .{ .scheduled = true, .brief_source = true }));
+    try t.expectEqual(.allow, f.act(.fetch, "https://feeds.example.com/rss", .{ .scheduled = true, .listed = "briefs.ini" }));
     // but not past the hard limits
-    try t.expectEqual(.deny, f.act(.fetch, "file:///etc/passwd", .{ .brief_source = true }));
+    try t.expectEqual(.deny, f.act(.fetch, "file:///etc/passwd", .{ .listed = "briefs.ini" }));
 }
 
 test "a_deny_rule_applies_to_brief_sources_too" {
     var f: Fixture = undefined;
     try f.init("deny fetch https://feeds.example.com/*\ndeny search *passwords*\n");
     defer f.deinit();
-    try t.expectEqual(.deny, f.act(.fetch, "https://feeds.example.com/rss", .{ .scheduled = true, .brief_source = true }));
-    try t.expectEqual(.deny, f.act(.search, "leaked passwords list", .{ .scheduled = true, .brief_source = true }));
-    try t.expectEqual(.allow, f.act(.fetch, "https://other.example.com/rss", .{ .scheduled = true, .brief_source = true }));
+    try t.expectEqual(.deny, f.act(.fetch, "https://feeds.example.com/rss", .{ .scheduled = true, .listed = "briefs.ini" }));
+    try t.expectEqual(.deny, f.act(.search, "leaked passwords list", .{ .scheduled = true, .listed = "briefs.ini" }));
+    try t.expectEqual(.allow, f.act(.fetch, "https://other.example.com/rss", .{ .scheduled = true, .listed = "briefs.ini" }));
 }
 
 test "paths_outside_workspace_are_refused" {

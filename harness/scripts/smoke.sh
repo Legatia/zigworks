@@ -188,6 +188,31 @@ printf '%s\t%s\n' "$(sha https://z.org/old)" "$(date +%s)" >"$HARNESS_HOME/state
 reply "$(text_reply 'Zag: Fresh item (https://y.org/fresh)')"
 check "harness brief collects and prints a brief" '"$H" brief evening 2>/dev/null | grep -qF "Zag: Fresh item (https://y.org/fresh)" && grep -qF "y.org/fresh" "$(req)"'
 
+# triggers, run by hand before the service starts: a feed trigger's run
+# gets the new item as data; a page's say needs no model call
+printf '<rss><channel><item><title>First</title><link>https://n.org/1</link></item></channel></rss>\n' >"$S/pages/news.xml"
+printf '{"data":{"amount":"100"}}' >"$S/pages/btc.json"
+cat >"$HARNESS_HOME/triggers.ini" <<EOF
+[news]
+feed = $URL/page/news.xml
+do = Tell me what is new.
+
+[btc]
+page = $URL/page/btc.json
+json = data.amount
+every = 5m
+match = move > 3
+say = BTC {value} ({change}%)
+EOF
+chmod 600 "$HARNESS_HOME/triggers.ini"
+"$H" trigger run news >/dev/null 2>&1
+printf '<rss><channel><item><title>First</title><link>https://n.org/1</link></item><item><title>Second</title><link>https://n.org/2</link></item></channel></rss>\n' >"$S/pages/news.xml"
+reply "$(text_reply 'Second is out.')"
+check "a feed trigger's run answers with the new item as data" '"$H" trigger run news 2>/dev/null | grep -qF "[news] Second is out." && grep -qF "Events from trigger news" "$(req)" && grep -qF "https://n.org/2" "$(req)" && ! grep -qF "https://n.org/1" "$(req)"'
+"$H" trigger run btc >/dev/null 2>&1
+printf '{"data":{"amount":"104"}}' >"$S/pages/btc.json"
+check "a page say sends with no model request" 'n0=$(ls "$S/requests" | wc -l) && "$H" trigger run btc 2>/dev/null | grep -qF "[btc] BTC 104 (+4.0%)" && [ "$(ls "$S/requests" | wc -l)" = "$n0" ]'
+
 "$H" run >"$T/run.out" 2>&1 &
 RPID=$!
 wait_for "$T/run.out" "running on" 5
@@ -413,6 +438,18 @@ reply "$(text_reply 'Dated answer.')"
 say "and now"
 check "the next run uses the change" 'wait_for "$OUT" "Dated answer." && grep -qF "Cite dates." "$(req)"'
 say "/agent main"
+
+# the agent proposes a trigger: asked every time with harness's reading;
+# allowed, it is added under its mark and listed
+before=$(asked)
+reply "$(call_reply tu_tg trigger '{"action":"add","text":"[zig]\nsearch = zig release\nsay = {title}\n"}')"
+reply "$(text_reply 'Trigger added.')"
+say "watch zig releases"
+check "the agent's trigger add is asked with harness's reading and no Allow 24 h" 'wait_asked $((before + 1)) && last_question | grep -qF "trigger: add zig" && last_question | grep -qF "Searches for" && [ -z "$(button day)" ]'
+press once
+wait_for "$OUT" "Trigger added."
+say "/triggers"
+check "an allowed trigger is added, marked and listed" 'wait_for "$OUT" "zig (search, triggers.ini): every 6 h, says a line" && grep -qF "; added by agent:main " "$HARNESS_HOME/triggers.ini"'
 
 # a question still open when harness stops: after a restart its button
 # answers nothing, and harness says why

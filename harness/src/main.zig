@@ -38,6 +38,9 @@ const usage =
     \\  chat                       talk to the agent in this terminal
     \\  brief [NAME]               collect and print a brief now
     \\  task run NAME              run a scheduled task now and print its answer
+    \\  trigger list | test NAME | run NAME
+    \\                             the triggers (triggers.ini, tasks, briefs); a poll
+    \\                             now that keeps nothing; a poll now and its action
     \\  memory [list|pin|unpin|forget ID]
     \\  snapshot list FOLDER | take FOLDER [LABEL] | changes FOLDER ID | restore FOLDER ID
     \\                             a folder's snapshots, one now, what changed, put it back
@@ -205,6 +208,7 @@ const App = struct {
         memory,
         snapshot,
         agent,
+        trigger,
 
         /// Whether it needs the MCP servers and the browser: a brief is
         /// one model call without tools, memory, snapshot and agent
@@ -212,7 +216,7 @@ const App = struct {
         /// 20 s and runs their code.
         fn usesTools(r: Role) bool {
             return switch (r) {
-                .run, .chat, .task => true,
+                .run, .chat, .task, .trigger => true,
                 .brief, .memory, .snapshot, .agent => false,
             };
         }
@@ -315,7 +319,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "agent" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "snapshot", "agent", "trigger" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -336,6 +340,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "memory")) return memoryCmd(app, rest);
     if (eql(cmd, "snapshot")) return snapshotCmd(app, rest);
     if (eql(cmd, "agent")) return agentCmd(app, rest);
+    if (eql(cmd, "trigger")) return triggerCmd(app, rest);
     if (eql(cmd, "log")) return logCmd(app, rest);
     if (eql(cmd, "inbox")) return inboxCmd(app, rest);
     if (eql(cmd, "health")) return healthCmd(app);
@@ -860,6 +865,8 @@ fn runCmd(app: *App) !Exit {
             complain("telegram: getMe failed ({s}); topics are taken to be on", .{@errorName(e)});
     }
     try c.startWorker();
+    // triggers are polled where harness runs
+    c.poller_on = true;
     const tick_thread = try std.Thread.spawn(.{}, ticker, .{c});
     defer tick_thread.join();
     defer c.quitting.store(true, .release);
@@ -999,6 +1006,7 @@ fn chatCmd(app: *App) !Exit {
     var tc: TermChan = .{ .io = app.io };
     c.attach(tc.channel());
     try c.startWorker();
+    c.poller_on = true;
     const tick_thread = try std.Thread.spawn(.{}, ticker, .{c});
     defer tick_thread.join();
     defer c.quitting.store(true, .release);
@@ -1141,6 +1149,40 @@ fn agentCmd(app: *App, args: []const []const u8) !Exit {
     const c = try app.open(.agent);
     defer c.close();
     try outPrint(app.io, "{s}\n", .{std.mem.trimEnd(u8, try c.command(app.arena, text), "\n")});
+    return .ok;
+}
+
+const trigger_usage = "usage: harness trigger list | trigger test NAME | trigger run NAME";
+
+/// Whether a `harness trigger` line has what its action takes.
+fn triggerArgsOk(rest: []const []const u8) bool {
+    if (rest.len == 1) return eql(rest[0], "list");
+    if (rest.len != 2 or rest[1].len == 0 or rest[1][0] == '-') return false;
+    return eql(rest[0], "test") or eql(rest[0], "run");
+}
+
+/// `harness trigger list | test NAME | run NAME`: the chat's commands, and
+/// a poll now whose action runs here, its posts printed.
+fn triggerCmd(app: *App, args: []const []const u8) !Exit {
+    if (!triggerArgsOk(args)) {
+        complain(trigger_usage, .{});
+        return .usage;
+    }
+    const c = try app.open(.trigger);
+    defer c.close();
+    if (eql(args[0], "list")) {
+        try outPrint(app.io, "{s}\n", .{std.mem.trimEnd(u8, try c.command(app.arena, "/triggers"), "\n")});
+        return .ok;
+    }
+    if (eql(args[0], "test")) {
+        try outPrint(app.io, "{s}\n", .{try c.command(app.arena, try std.fmt.allocPrint(app.arena, "/trigger test {s}", .{args[1]}))});
+        return .ok;
+    }
+    var tc: TermChan = .{ .io = app.io };
+    tc.home = c.triggerTo(app.arena, args[1]);
+    c.attach(tc.channel());
+    const said = try c.runTriggerHere(app.arena, args[1]);
+    if (said.len > 0) try errPrint(app.io, "{s}\n", .{said});
     return .ok;
 }
 
@@ -1537,6 +1579,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
         return if ((agentCommandText(fba.allocator(), rest) catch null) == null) agent_usage else null;
     }
     if (eql(cmd, "inbox")) return if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "--json"))) null else "usage: harness inbox [--json]";
+    if (eql(cmd, "trigger")) return if (triggerArgsOk(rest)) null else trigger_usage;
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
     if (eql(cmd, "login")) {
@@ -1919,6 +1962,9 @@ test {
     _ = @import("web.zig");
     _ = @import("url.zig");
     _ = @import("proc.zig");
+    _ = @import("triggers.zig");
+    _ = @import("tstate.zig");
+    _ = @import("sources.zig");
 }
 
 test "a_line_of_ctrl_d_leaves_the_chat_in_a_windows_console" {
@@ -2145,4 +2191,13 @@ test "start_notes_name_each_provider_in_use_without_its_key" {
     const on = try startNotes(a, &os, &.{ o.model.model, o.model.worker_model, o.model.memory_model });
     try t.expectEqual(1, on.len);
     try t.expectEqualStrings("note: no openrouter key stored under \"openrouter\"; model calls will be refused. Run: harness secret add openrouter", on[0]);
+}
+
+test "harness_trigger_takes_list_test_and_run" {
+    for ([_][]const []const u8{ &.{ "trigger", "list" }, &.{ "trigger", "test", "btc" }, &.{ "trigger", "run", "btc" } }) |line| if (badArgs(line)) |why| {
+        std.debug.print("{s}: {s}\n", .{ line[1], why });
+        return error.TestUnexpectedResult;
+    };
+    for ([_][]const []const u8{ &.{"trigger"}, &.{ "trigger", "list", "x" }, &.{ "trigger", "go", "x" }, &.{ "trigger", "test" }, &.{ "trigger", "run", "-x" }, &.{ "trigger", "run", "a", "b" } }) |line|
+        try std.testing.expect(badArgs(line) != null);
 }

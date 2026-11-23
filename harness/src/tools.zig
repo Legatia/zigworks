@@ -333,6 +333,11 @@ pub const Got = struct {
     /// A redirect that was not followed, and why; `status` is then the
     /// redirect's own and `url` the address that answered with it.
     stopped: ?Stopped = null,
+    /// The answer's ETag and Last-Modified ("" for none), and how long it
+    /// asked to wait before the next request.
+    etag: []const u8 = "",
+    last_modified: []const u8 = "",
+    retry_after_s: ?u32 = null,
 
     pub const Stopped = struct { to: []const u8, why: []const u8 };
 };
@@ -471,9 +476,11 @@ fn getOne(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, u: url_mod.U
     var resp = c.send(.{ .method = .GET, .path = u.target, .headers = headers, .limits = .{ .idle_ms = @min(30_000, total_ms), .total_ms = total_ms, .stop = until.stop } }) catch |e| return cutShort(e, io, until);
     defer resp.deinit();
     const ct = try arena.dupe(u8, resp.contentType());
+    const etag = if (resp.etag) |x| try arena.dupe(u8, x) else "";
+    const modified = if (resp.last_modified) |x| try arena.dupe(u8, x) else "";
     if (isRedirect(resp.status)) if (resp.location) |l| {
         // a redirect's own body is not wanted
-        return .{ .got = .{ .status = resp.status, .content_type = ct, .body = "", .truncated = false, .url = u.href }, .location = try arena.dupe(u8, l) };
+        return .{ .got = .{ .status = resp.status, .content_type = ct, .body = "", .truncated = false, .url = u.href, .retry_after_s = resp.retry_after_s }, .location = try arena.dupe(u8, l) };
     };
     var body: std.ArrayList(u8) = .empty;
     var truncated = false;
@@ -486,7 +493,7 @@ fn getOne(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, u: url_mod.U
         }
         try body.appendSlice(arena, part);
     }
-    return .{ .got = .{ .status = resp.status, .content_type = ct, .body = body.items, .truncated = truncated, .url = u.href }, .location = null };
+    return .{ .got = .{ .status = resp.status, .content_type = ct, .body = body.items, .truncated = truncated, .url = u.href, .etag = etag, .last_modified = modified, .retry_after_s = resp.retry_after_s }, .location = null };
 }
 
 /// A request that failed: because of /stop or the turn's end, when one of
