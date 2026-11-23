@@ -31,6 +31,7 @@ pub const Config = struct {
     voice: Voice = .{},
     butler: Butler = .{},
     voice_agent: VoiceAgent = .{},
+    mail: Mail = .{},
     /// The `[provider NAME]` sections, in the order their names first
     /// appear (not a section of its own: `parse` reads them apart).
     providers: []const model.Section = &.{},
@@ -173,6 +174,23 @@ pub const Config = struct {
         seconds: u32 = 20,
         /// Its model (PROVIDER:MODEL as anywhere); "": the chat's.
         model: []const u8 = "",
+    };
+    /// Mail (the email spec): the butler's own address is conversation
+    /// `email`; `owner` says whose mail there is a message.
+    pub const Mail = struct {
+        /// The owner's addresses, comma-separated: only their mail to the
+        /// butler's address starts a turn. "": the email conversation is off.
+        owner: []const u8 = "",
+        /// mailmcp's section in mcp.ini.
+        server: []const u8 = "mail",
+        /// The mail file's sections: the butler's own mailbox, the owner's.
+        butler: []const u8 = "butler",
+        mine: []const u8 = "mine",
+        /// mailmcp's program for /setup mail; "": next to harness, else on PATH.
+        mailmcp: []const u8 = "",
+        /// When the day's line about others' mail to the butler comes
+        /// (HH:MM, the owner's time).
+        others_at: []const u8 = "18:00",
     };
     /// The butler's manners.
     pub const Butler = struct {
@@ -712,6 +730,11 @@ pub const defaults_ini =
     \\; listen = 192.168.1.20:8765         ; for Home Assistant on another machine: this one's LAN address (default: this machine only)
     \\; token = ha-agent                   ; the secret Home Assistant's API key must be: harness secret add ha-agent
     \\; seconds = 20                       ; a spoken answer's time
+    \\
+    \\[mail]                              ; mail (README: Mail); /setup mail writes it
+    \\; owner = me@example.com             ; your addresses: only your mail to the butler's address is a message
+    \\; mailmcp = /usr/local/bin/mailmcp   ; /setup mail runs it; default: next to harness, else on PATH
+    \\; others_at = 18:00                  ; when the day's line about others' mail to the butler comes
     \\
 ;
 

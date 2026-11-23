@@ -526,6 +526,8 @@ fn pollMcp(env: Env, a: Allocator, tr: triggers.Trigger, prev: tstate.State, see
             out.failed = try std.fmt.allocPrint(a, "{s} resource {s}: {s}", .{ m.server, m.uri, util.cut(got.text, 200) });
             return;
         }
+        // a list (mailmcp's new mail): an event per item whose `key` is new
+        if (jv.parse(a, got.text)) |v| if (v == .array) return listItems(a, tr, prev, seen, v, now_s, out);
         return changedText(a, prev, got.text, now_s, out);
     }
     const arg = try std.fmt.allocPrint(a, "{s}/{s} {s}", .{ m.server, m.tool, m.input });
@@ -548,7 +550,14 @@ fn pollMcp(env: Env, a: Allocator, tr: triggers.Trigger, prev: tstate.State, see
         out.failed = try std.fmt.allocPrint(a, "{s}/{s} said: {s}", .{ m.server, m.tool, util.cut(got.text, 200) });
         return;
     }
-    if (jv.parse(a, got.text)) |v| if (v == .array) {
+    if (jv.parse(a, got.text)) |v| if (v == .array) return listItems(a, tr, prev, seen, v, now_s, out);
+    return changedText(a, prev, got.text, now_s, out);
+}
+
+/// A JSON list's items: an event for each whose `key` is new (a first
+/// poll only marks).
+fn listItems(a: Allocator, tr: triggers.Trigger, prev: tstate.State, seen: *const brief.Seen, v: jv.Value, now_s: i64, out: *Outcome) !void {
+    {
         var found: std.ArrayList(Found) = .empty;
         var all: std.ArrayList([]const u8) = .empty;
         for (v.array.items) |item| {
@@ -570,9 +579,7 @@ fn pollMcp(env: Env, a: Allocator, tr: triggers.Trigger, prev: tstate.State, see
         out.found = found.items;
         out.seen_all = all.items;
         out.next.polled = true;
-        return;
-    };
-    return changedText(a, prev, got.text, now_s, out);
+    }
 }
 
 /// What tells an MCP tool's list item apart: its `key` field as text, else
@@ -940,4 +947,27 @@ test "a_json_resource_gives_its_fields" {
     res.text = "{\"text\":\"inner\"}";
     const shadow = try poll_(env, a, tr, plain.next, &f.seen, "", 1796083380);
     try t.expectEqualStrings("{\"text\":\"inner\"}", fieldOf(shadow.found[0].event, "text").?);
+}
+
+test "a_json_list_resource_gives_an_event_per_new_item" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    var res: OneResource = .{ .text = "[{\"id\":\"mine/INBOX/7/1\",\"uid\":1,\"kind\":\"other\",\"subject\":\"Hello\"}]" };
+    var env = try f.env();
+    env.mcp = .{ .ctx = &res, .call = OneResource.call, .read = OneResource.read };
+    const tr = try f.trigger("[flight-mail]\nmcp = mail resource mail://mine/new\nmatch = kind is travel\nsay = {subject}\n");
+    const a = f.e.arena.allocator();
+    // a first poll marks what is there
+    const first = try poll_(env, a, tr, .{}, &f.seen, "", 1796083200);
+    try t.expectEqual(0, first.found.len);
+    for (first.seen_all) |k| try f.seen.add(k, 1796083200);
+    // two mails at once: an event each, the old one none
+    res.text = "[{\"id\":\"mine/INBOX/7/1\",\"uid\":1,\"kind\":\"other\",\"subject\":\"Hello\"},{\"id\":\"mine/INBOX/7/2\",\"uid\":2,\"kind\":\"travel\",\"subject\":\"Flight LO 3921\"},{\"id\":\"mine/INBOX/7/3\",\"uid\":3,\"kind\":\"bill\",\"subject\":\"Faktura\"}]";
+    const out = try poll_(env, a, tr, first.next, &f.seen, "", 1796083260);
+    try t.expectEqual(2, out.found.len);
+    try t.expectEqualStrings("Flight LO 3921", fieldOf(out.found[0].event, "subject").?);
+    try t.expectEqualStrings("2", fieldOf(out.found[0].event, "uid").?);
+    try t.expect(triggers.holds(tr.match[0], out.found[0].event.fields));
+    try t.expect(!triggers.holds(tr.match[0], out.found[1].event.fields));
 }
