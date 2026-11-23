@@ -117,3 +117,8 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
 - The butler spec's Parts 1–9 are built. Not yet run against a real Telegram bot, Home Assistant, Smartcar, transcription service or speaker: the testers' part (TESTERS.md).
 - The Windows session pushed its batch (1e355f3 data folder refused inside read = on Linux and Windows; c0dde2e runs pick an environment; 370f96e try in a copy; 8b7ca23 docs; afad6d2 smoke paths on Windows). Merged here (agent 1, core 3; kept both: hush and env/copy fields; the inbox answer settles setup/routine and copy items). Its smoke change broke macOS's sh (bash 3.2) → fixed in two steps. 950/970 (20 skipped) Debug and ReleaseSafe, smoke 101 (122 with the stand-ins), cross builds ok.
 - Everything specced in this round is built: the platform gaps (Windows and Mac), the close ones (remote MCP, Undo, try in a copy, long memory, the morning routine) and the butler (Parts 1–9). Next is real-world testing with recruited testers (TESTERS.md).
+- CI for d1e2718: Windows failed three butler tests (the checkout made the built-in routine templates 
+) → 07d8df9: fill reads 
+ as 
+ (test RED→GREEN) and .gitattributes keeps examples, .wf and .sh files 
+. Three macos-15 jobs (unchanged tools) cancelled waiting for runners. 951/971 Debug, smoke ok.
