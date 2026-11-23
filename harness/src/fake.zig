@@ -22,9 +22,13 @@
 //!   If-None-Match or If-Modified-Since gets 304. Each page request is
 //!   appended to `page-requests.jsonl` with its headers.
 //! - Telegram: see `telegram` below.
+//! - MCP servers over HTTP: `/mcp/FLAVOR` (fake_mcp.zig's `Http`, steered
+//!   by tests through `mcp`); each such request is appended to
+//!   `mcp-requests.jsonl` with its method, target, headers and body.
 const std = @import("std");
 const sock = @import("sock.zig");
 const jv = @import("jv.zig");
+const fake_mcp = @import("fake_mcp.zig");
 const Io = std.Io;
 
 pub const Server = struct {
@@ -41,6 +45,8 @@ pub const Server = struct {
     tg_failed: std.atomic.Value(i64) = .init(0),
     mutex: Io.Mutex = .init,
     open: std.ArrayList(sock.Handle) = .empty,
+    /// The MCP servers over HTTP.
+    mcp: fake_mcp.Http = .{},
 
     const gpa = std.heap.page_allocator;
     const idle_ms = 60 * 60 * 1000;
@@ -50,7 +56,7 @@ pub const Server = struct {
         errdefer listener.close();
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
-        s.* = .{ .io = io, .dir = try gpa.dupe(u8, dir), .listener = listener, .port = listener.port };
+        s.* = .{ .io = io, .dir = try gpa.dupe(u8, dir), .listener = listener, .port = listener.port, .mcp = .{ .io = io } };
         inline for (.{ "requests", "model", "pages", "telegram/in" }) |sub| {
             const p = try std.fs.path.join(gpa, &.{ dir, sub });
             defer gpa.free(p);
@@ -72,6 +78,7 @@ pub const Server = struct {
         while (s.active.load(.acquire) > 0) s.io.sleep(.fromMilliseconds(1), .awake) catch {};
         s.listener.close();
         s.open.deinit(gpa);
+        s.mcp.deinit();
         gpa.free(s.dir);
         gpa.destroy(s);
     }
@@ -182,9 +189,12 @@ pub const Server = struct {
         // a page request's conditions
         var if_none_match: ?[]const u8 = null;
         var if_modified_since: ?[]const u8 = null;
+        // all of them, for the MCP servers
+        var all: std.ArrayList(fake_mcp.Header) = .empty;
         var it = req.iterateHeaders();
         while (it.next()) |h| {
             try headers.print(a, "{f}:{f},", .{ std.json.fmt(h.name, .{}), std.json.fmt(h.value, .{}) });
+            try all.append(a, .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) });
             if (std.ascii.eqlIgnoreCase(h.name, "if-none-match")) if_none_match = try a.dupe(u8, h.value);
             if (std.ascii.eqlIgnoreCase(h.name, "if-modified-since")) if_modified_since = try a.dupe(u8, h.value);
             if (std.ascii.eqlIgnoreCase(h.name, "x-api-key")) key = try a.dupe(u8, h.value);
@@ -194,6 +204,16 @@ pub const Server = struct {
         const body_reader = try req.readerExpectContinue(&body_buf);
         const body = try body_reader.allocRemaining(a, .limited(32 << 20));
         const route = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+        if (std.mem.startsWith(u8, route, "/mcp/")) {
+            {
+                s.mutex.lockUncancelable(s.io);
+                defer s.mutex.unlock(s.io);
+                const lp = try s.path(a, &.{"mcp-requests.jsonl"});
+                const line = try std.fmt.allocPrint(a, "{{\"method\":\"{s}\",\"target\":{f},\"headers\":{{{s}\"\":\"\"}},\"body\":{f}}}\n", .{ @tagName(method), std.json.fmt(target, .{}), headers.items, std.json.fmt(body, .{}) });
+                try s.appendRecord(a, lp, line);
+            }
+            return s.mcp.handle(.{ .io = s.io, .dir = s.dir, .port = s.port, .stopping = &s.stopping }, a, req, method, route, all.items, body);
+        }
 
         if (method == .POST and !std.mem.startsWith(u8, route, "/page/") and !std.mem.startsWith(u8, route, "/bot")) {
             if (std.mem.endsWith(u8, route, "/messages")) return s.model(a, req, .anthropic, target, body, headers.items, key);

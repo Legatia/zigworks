@@ -81,7 +81,7 @@ pub const Limits = struct {
 };
 
 pub const Request = struct {
-    method: enum { GET, POST } = .POST,
+    method: enum { GET, POST, DELETE } = .POST,
     /// Path after the target's prefix, as "/v1/models".
     path: []const u8,
     /// JSON to send.
@@ -92,8 +92,16 @@ pub const Request = struct {
     headers: []const std.http.Header = &.{},
     /// What the body is.
     content_type: []const u8 = "application/json",
+    /// What the answer may be.
+    accept: []const u8 = "*/*",
+    /// Headers of the answer to keep (any case): their values are in
+    /// `Response.kept`, in this order (at most `max_kept`).
+    keep: []const []const u8 = &.{},
     limits: Limits = .{},
 };
+
+/// The most response headers a request keeps (`Request.keep`).
+pub const max_kept = 4;
 
 /// One part of a multipart/form-data body: a field, or a file when it has
 /// a `filename`.
@@ -308,6 +316,7 @@ pub const Client = struct {
             if (resp.location) |l| c.gpa.free(l);
             if (resp.etag) |x| c.gpa.free(x);
             if (resp.last_modified) |x| c.gpa.free(x);
+            for (resp.kept) |k| if (k) |x| c.gpa.free(x);
         }
         if (head.content_type) |ct| {
             const n = @min(ct.len, resp.content_type_buf.len);
@@ -325,9 +334,12 @@ pub const Client = struct {
             } else if (std.ascii.eqlIgnoreCase(h.name, "last-modified") and resp.last_modified == null) {
                 resp.last_modified = try c.gpa.dupe(u8, std.mem.trim(u8, h.value, " \t"));
             }
+            for (req.keep[0..@min(req.keep.len, max_kept)], 0..) |name, i| {
+                if (resp.kept[i] == null and std.ascii.eqlIgnoreCase(h.name, name)) resp.kept[i] = try c.gpa.dupe(u8, std.mem.trim(u8, h.value, " \t"));
+            }
         }
         conn.keep = head.keep_alive;
-        const no_body = req.method == .GET and head.content_length == null and head.transfer_encoding == .none and head.keep_alive;
+        const no_body = (req.method == .GET or req.method == .DELETE) and head.content_length == null and head.transfer_encoding == .none and head.keep_alive;
         const buf = try c.gpa.alloc(u8, body_buf_len);
         resp.body_buf = buf;
         resp.body = if (no_body or head.status == .no_content or head.status == .not_modified)
@@ -344,7 +356,7 @@ fn writeHead(w: *Io.Writer, t: Target, req: Request, user_agent: []const u8) !vo
     const v6 = std.mem.indexOfScalar(u8, t.host, ':') != null;
     try w.print("Host: {s}{s}{s}", .{ if (v6) "[" else "", t.host, if (v6) "]" else "" });
     if (t.port != default_port) try w.print(":{d}", .{t.port});
-    try w.print("\r\nUser-Agent: {s}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n", .{user_agent});
+    try w.print("\r\nUser-Agent: {s}\r\nAccept: {s}\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n", .{ user_agent, req.accept });
     if (req.key) |k| try w.print("Authorization: Bearer {s}\r\n", .{k});
     for (req.headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
     if (req.body) |b| try w.print("Content-Type: {s}\r\nContent-Length: {d}\r\n", .{ req.content_type, b.len });
@@ -366,6 +378,8 @@ pub const Response = struct {
     /// Its ETag and Last-Modified, as sent, when it has them.
     etag: ?[]u8 = null,
     last_modified: ?[]u8 = null,
+    /// The headers `Request.keep` named, when the answer has them.
+    kept: [max_kept]?[]u8 = @splat(null),
     ended: bool = false,
 
     pub fn contentType(r: *const Response) []const u8 {
@@ -407,6 +421,7 @@ pub const Response = struct {
         if (r.location) |l| c.gpa.free(l);
         if (r.etag) |x| c.gpa.free(x);
         if (r.last_modified) |x| c.gpa.free(x);
+        for (r.kept) |k| if (k) |x| c.gpa.free(x);
         const conn = c.conn orelse return;
         if (!(r.ended and conn.keep and conn.reader.state == .ready)) c.drop();
     }

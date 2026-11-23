@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const url_mod = @import("url.zig");
+const mcp_http = @import("mcp_http.zig");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
 const proc = @import("proc.zig");
@@ -455,14 +456,21 @@ pub const StartOptions = struct {
     /// Where `notifications/resources/updated` goes (a trigger reads the
     /// resource again).
     updated: ?Updated = null,
+    /// A server at a url: how its requests are signed (its token, or its
+    /// sign-in). The process options above are not used for it.
+    auth: Auth = .none,
+    /// A server at a url: the first wait before its GET stream is opened
+    /// again (it doubles up to a minute).
+    stream_backoff_ms: u32 = 1000,
 };
 
+/// How a server at a url signs its requests.
+pub const Auth = mcp_http.Auth;
+
 /// Told a resource the server was asked to watch changed: the server's
-/// name and the resource's uri. Called on the server's reader thread.
-pub const Updated = struct {
-    ctx: *anyopaque,
-    f: *const fn (ctx: *anyopaque, server: []const u8, uri: []const u8) void,
-};
+/// name and the resource's uri. Called on the server's reader thread (a
+/// server at a url: its stream's).
+pub const Updated = mcp_http.Updated;
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
@@ -507,11 +515,16 @@ pub const Server = struct {
     th_out: ?std.Thread = null,
     th_err: ?std.Thread = null,
 
+    /// A server at a url: reached over HTTP; then there is no process and
+    /// the fields above for one are unused.
+    remote: ?*mcp_http.Remote = null,
+
     /// Starts `cfg.command` in its own process group in `opts.cwd`, with
     /// only PATH, HOME, LANG, TERM and the named secrets in its
-    /// environment; then initialize, notifications/initialized and
-    /// tools/list.
+    /// environment (a server at a url: reaches it); then initialize,
+    /// notifications/initialized and tools/list.
     pub fn start(gpa: std.mem.Allocator, io: std.Io, cfg: ServerConfig, opts: StartOptions) !*Server {
+        if (cfg.url.len > 0) return startRemote(gpa, io, cfg, opts);
         if (opts.secret_values.len != cfg.secrets.len) return error.BadSecrets;
         var tmp_state = std.heap.ArenaAllocator.init(gpa);
         defer tmp_state.deinit();
@@ -575,17 +588,77 @@ pub const Server = struct {
         }
         s.th_out = try std.Thread.spawn(.{}, readOut, .{s});
         s.th_err = try std.Thread.spawn(.{}, readErr, .{s});
-        const a = s.arena_state.allocator();
-        s.name = try a.dupe(u8, cfg.name);
-
+        s.name = try s.arena_state.allocator().dupe(u8, cfg.name);
         var never: std.atomic.Value(bool) = .init(false);
-        const stop = opts.stop orelse &never;
-        const deadline = if (opts.deadline_ns > 0) opts.deadline_ns else nowNs(io) + @as(i128, opts.start_timeout_ms) * std.time.ns_per_ms;
+        try s.handshake(tmp, opts.stop orelse &never, startDeadline(io, opts));
+        return s;
+    }
+
+    /// A server at a url: its session, then the same requests as a
+    /// program's; with subscriptions, its GET stream.
+    fn startRemote(gpa: std.mem.Allocator, io: std.Io, cfg: ServerConfig, opts: StartOptions) !*Server {
+        var tmp_state = std.heap.ArenaAllocator.init(gpa);
+        defer tmp_state.deinit();
+        const tmp = tmp_state.allocator();
+        const deadline = startDeadline(io, opts);
+        const s = try gpa.create(Server);
+        s.* = .{
+            .gpa = gpa,
+            .io = io,
+            .arena_state = .init(gpa),
+            .child = undefined,
+            .pid = undefined,
+            .stdin = null,
+            .stdout = undefined,
+            .stderr = undefined,
+            .updated = opts.updated,
+        };
+        errdefer {
+            if (s.remote) |r| {
+                if (opts.diag) |d| {
+                    const w = r.why();
+                    const n = @min(w.len, d.buf.len);
+                    @memcpy(d.buf[0..n], w[0..n]);
+                    d.len = n;
+                }
+                r.end();
+                r.destroy();
+            }
+            s.arena_state.deinit();
+            gpa.destroy(s);
+        }
+        s.name = try s.arena_state.allocator().dupe(u8, cfg.name);
+        s.remote = try mcp_http.Remote.open(gpa, io, .{
+            .name = cfg.name,
+            .url = cfg.url,
+            .headers = cfg.headers,
+            .auth = opts.auth,
+            .updated = opts.updated,
+            .backoff_ms = opts.stream_backoff_ms,
+        });
+        var never: std.atomic.Value(bool) = .init(false);
+        // a failure said: of its kind (the start's note says the rest)
+        s.handshake(tmp, opts.stop orelse &never, deadline) catch |e| return if (e == error.Said) s.remote.?.failure() else e;
+        if (s.subscribes and s.updated != null) s.remote.?.startStream();
+        return s;
+    }
+
+    /// When a start must be over (awake clock, ns).
+    fn startDeadline(io: Io, opts: StartOptions) i128 {
+        return if (opts.deadline_ns > 0) opts.deadline_ns else nowNs(io) + @as(i128, opts.start_timeout_ms) * std.time.ns_per_ms;
+    }
+
+    /// initialize, notifications/initialized and tools/list.
+    fn handshake(s: *Server, tmp: std.mem.Allocator, stop: *std.atomic.Value(bool), deadline: i128) !void {
+        const a = s.arena_state.allocator();
         const init_raw = try s.request(tmp, "initialize", "{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"harness\",\"version\":\"" ++ @import("build_options").version ++ "\"}}", stop, deadline);
         const init_v = jv.parse(tmp, init_raw) orelse return error.BadResponse;
         if (jv.get(init_v, "result") == null) return error.InitFailed;
         s.subscribes = jv.boolean(jv.at(init_v, &.{ "result", "capabilities", "resources", "subscribe" })) orelse false;
-        try s.send(tmp, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+        if (s.remote) |r|
+            try r.notify(tmp, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}", stop, deadline)
+        else
+            try s.send(tmp, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
 
         var list: std.ArrayList(Tool) = .empty;
         var cursor: ?[]const u8 = null;
@@ -621,7 +694,6 @@ pub const Server = struct {
             cursor = next;
         }
         s.tool_list = list.items;
-        return s;
     }
 
     pub fn tools(s: *const Server) []const Tool {
@@ -647,7 +719,7 @@ pub const Server = struct {
         s.call_mutex.lockUncancelable(s.io);
         defer s.call_mutex.unlock(s.io);
         const deadline = nowNs(s.io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
-        const raw = try s.request(arena, "tools/call", params.items, stop, deadline);
+        const raw = s.request(arena, "tools/call", params.items, stop, deadline) catch |e| return s.said(arena, e, max_bytes);
         const v = jv.parse(arena, raw) orelse return error.BadResponse;
         if (jv.get(v, "error")) |e| {
             const msg = jv.str(jv.get(e, "message")) orelse "";
@@ -672,7 +744,22 @@ pub const Server = struct {
         if (out.items.len == 0) {
             if (jv.get(result, "structuredContent")) |sc| try out.appendSlice(arena, try std.json.Stringify.valueAlloc(arena, sc, .{}));
         }
-        return .{ .text = cap(arena, out.items, max_bytes), .is_error = jv.boolean(jv.get(result, "isError")) orelse false };
+        return .{ .text = cap(arena, try s.masked(arena, out.items), max_bytes), .is_error = jv.boolean(jv.get(result, "isError")) orelse false };
+    }
+
+    /// A failure a server at a url said, as the call's error; other
+    /// errors as they are.
+    fn said(s: *Server, arena: std.mem.Allocator, e: anyerror, max_bytes: usize) !Result {
+        if (e != error.Said) return e;
+        const r = s.remote orelse return e;
+        return .{ .text = cap(arena, try arena.dupe(u8, r.why()), max_bytes), .is_error = true };
+    }
+
+    /// What a server at a url answered, with its token or sign-in masked
+    /// (one renewed during the call too); a program's as it is.
+    fn masked(s: *Server, arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+        const r = s.remote orelse return text;
+        return r.mask(arena, text);
     }
 
     /// resources/read: the text of its contents joined by "\n" (a blob as
@@ -685,7 +772,7 @@ pub const Server = struct {
         s.call_mutex.lockUncancelable(s.io);
         defer s.call_mutex.unlock(s.io);
         const deadline = nowNs(s.io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
-        const raw = try s.request(arena, "resources/read", params.items, stop, deadline);
+        const raw = s.request(arena, "resources/read", params.items, stop, deadline) catch |e| return s.said(arena, e, max_bytes);
         const v = jv.parse(arena, raw) orelse return error.BadResponse;
         if (jv.get(v, "error")) |e| {
             const msg = jv.str(jv.get(e, "message")) orelse "";
@@ -698,7 +785,7 @@ pub const Server = struct {
             if (out.items.len > 0) try out.append(arena, '\n');
             try out.appendSlice(arena, jv.str(jv.get(item, "text")) orelse "[blob]");
         }
-        return .{ .text = cap(arena, out.items, max_bytes), .is_error = false };
+        return .{ .text = cap(arena, try s.masked(arena, out.items), max_bytes), .is_error = false };
     }
 
     /// resources/subscribe: the server says when `uri` changes (`updated`).
@@ -710,18 +797,24 @@ pub const Server = struct {
         s.call_mutex.lockUncancelable(s.io);
         defer s.call_mutex.unlock(s.io);
         const deadline = nowNs(s.io) + @as(i128, timeout_ms) * std.time.ns_per_ms;
-        const raw = try s.request(arena, "resources/subscribe", params.items, stop, deadline);
+        const raw = s.request(arena, "resources/subscribe", params.items, stop, deadline) catch |e| return if (e == error.Said) error.Refused else e;
         const v = jv.parse(arena, raw) orelse return error.BadResponse;
         if (jv.get(v, "error") != null) return error.Refused;
+        // a new session subscribes again
+        if (s.remote) |r| r.remember(uri);
     }
 
-    /// False once the server closed its output (it exited or crashed).
+    /// False once the server closed its output (it exited or crashed);
+    /// a server at a url is there until it is stopped.
     pub fn alive(s: *const Server) bool {
+        if (s.remote != null) return true;
         return !s.eof.load(.acquire);
     }
 
-    /// The end of what the server wrote to stderr.
+    /// The end of what the server wrote to stderr ("" for a server at a
+    /// url).
     pub fn stderrTail(s: *Server, buf: *[2048]u8) []const u8 {
+        if (s.remote != null) return buf[0..0];
         s.state_mutex.lockUncancelable(s.io);
         defer s.state_mutex.unlock(s.io);
         @memcpy(buf[0..s.err_len], s.err_tail[0..s.err_len]);
@@ -732,13 +825,16 @@ pub const Server = struct {
     /// once; frees nothing (`deinit` still has to follow, unless the
     /// process is ending).
     pub fn kill(s: *Server) void {
+        // a server at a url: its stream ends, nothing else runs here
+        if (s.remote) |r| return r.stopStream();
         killTree(s.pid, &s.job);
     }
 
     /// Closes stdin, gives the server a moment to exit, kills its process
-    /// group, waits for it and frees everything.
+    /// group, waits for it and frees everything (a server at a url: ends
+    /// its stream and deletes its session).
     pub fn deinit(s: *Server) void {
-        s.shutdown();
+        if (s.remote) |r| r.end() else s.shutdown();
         s.free();
     }
 
@@ -784,6 +880,7 @@ pub const Server = struct {
     }
 
     fn free(s: *Server) void {
+        if (s.remote) |r| r.destroy();
         s.job.close();
         if (s.got) |g| s.gpa.free(g);
         s.arena_state.deinit();
@@ -794,6 +891,7 @@ pub const Server = struct {
 
     /// Sends a request and waits for its response line (copied to `arena`).
     fn request(s: *Server, arena: std.mem.Allocator, method: []const u8, params_json: []const u8, stop: *std.atomic.Value(bool), deadline_ns: i128) ![]const u8 {
+        if (s.remote) |r| return r.request(arena, method, params_json, stop, deadline_ns);
         s.state_mutex.lockUncancelable(s.io);
         const id = s.next_id;
         s.next_id += 1;
@@ -942,10 +1040,16 @@ fn validToolName(name: []const u8) bool {
 
 /// Stops servers, each with its group (Windows: its job), and frees them: all are told
 /// together (their stdin closed) and share one grace, so stopping many
-/// takes no longer than stopping one.
+/// takes no longer than stopping one. Servers at a url end their streams
+/// and sessions meanwhile, each on a thread of its own.
 pub fn stopAll(servers: []const *Server) void {
     if (servers.len == 0) return;
     const io = servers[0].io;
+    var ends: [64]?std.Thread = @splat(null);
+    for (servers, 0..) |srv, i| if (srv.remote) |r| {
+        if (i < ends.len) ends[i] = std.Thread.spawn(.{}, mcp_http.Remote.end, .{r}) catch null;
+        if (i >= ends.len or ends[i] == null) r.end();
+    };
     for (servers) |srv| srv.closeInput();
     const until = nowNs(io) + 500 * std.time.ns_per_ms;
     while (nowNs(io) < until) {
@@ -957,10 +1061,9 @@ pub fn stopAll(servers: []const *Server) void {
         if (!open) break;
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    for (servers) |srv| {
-        srv.shutdownWith(0);
-        srv.free();
-    }
+    for (servers) |srv| if (srv.remote == null) srv.shutdownWith(0);
+    for (ends) |th| if (th) |x| x.join();
+    for (servers) |srv| srv.free();
 }
 
 /// The process group on POSIX; the job on Windows (the process alone

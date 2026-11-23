@@ -2660,6 +2660,8 @@ pub const Core = struct {
         srv: ?*mcp.Server = null,
         err: anyerror = error.NotStarted,
         diag: mcp.Diag = .{},
+        /// A server at a url: its token.
+        auth: mcp.Auth = .none,
 
         fn run(st: *McpStart) void {
             const c = st.core;
@@ -2674,6 +2676,7 @@ pub const Core = struct {
                 .diag = &st.diag,
                 .stop = st.stop,
                 .updated = .{ .ctx = c, .f = resourceUpdated },
+                .auth = st.auth,
             }) catch |e| {
                 st.err = e;
                 return;
@@ -2727,6 +2730,11 @@ pub const Core = struct {
                 break;
             };
             if (st.skipped != null) continue;
+            // a server at a url: its stored token
+            if (mcp.kindOf(sc) == .token) st.auth = .{ .token = .{ .name = sc.token, .value = c.secretValue(a, sc.token) orelse {
+                st.skipped = std.fmt.allocPrint(a, "token \"{s}\" is not stored (harness secret add {s})", .{ sc.token, sc.token }) catch "its token is not stored";
+                continue;
+            } } };
             st.values = values;
             st.dir = c.mcpDir(a, sc.name) catch |e| {
                 st.skipped = std.fmt.allocPrint(a, "did not start (its folder: {s})", .{@errorName(e)}) catch "did not start";
@@ -10139,6 +10147,73 @@ test "mcp_servers_start_together_under_one_deadline" {
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "mute: did not start (Timeout)") != null);
     // in mcp.ini's order
     try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "one").? < std.mem.indexOf(u8, f.core.mcp_note, "two").?);
+}
+
+test "http_mcp_tools_list_and_call_through_the_gate" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // the stand-in's servers: one answering JSON, one event streams
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[web]\nurl = {s}/mcp/json\n[live]\nurl = {s}/mcp/sse\n", .{ try f.e.url(), try f.e.url() }) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp web/echo *\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.core.handleText("/status");
+    try f.rec.waitFor("MCP: web (3 tools)");
+    try f.rec.waitFor("live (3 tools)");
+    // allowed by a rule: runs; with no rule: asked, as a program's tool
+    try f.e.script(1, model.toolReply("tu_1", "web__echo", "{\"text\":\"from the web\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "live__echo", "{\"text\":\"from the stream\"}"));
+    try f.e.script(3, model.textReply("both done"));
+    try f.core.startWorker();
+    try f.core.handleText("use both");
+    try f.rec.waitFor("BUTTONS Allow this?");
+    try f.rec.waitFor("live__echo: live/echo");
+    try f.press("once");
+    try f.rec.waitFor("both done");
+    const first = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, first, "\"name\":\"web__echo\"") != null);
+    try t.expect(std.mem.indexOf(u8, first, "\"content\":\"from the web\"") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "\"content\":\"from the stream\"") != null);
+    // the log names them as it names a program's
+    const log = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, log, "\"tool\":\"web__echo\"") != null);
+    try t.expect(std.mem.indexOf(u8, log, "\"event\":\"mcp started\",\"server\":\"live\"") != null);
+}
+
+test "token_and_headers_are_sent_and_never_logged" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const token = "mcp-test-token-1";
+    // stored after the start: read on /reload, and masked from then on
+    const secrets_dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" });
+    f.core.store = .{ .dir = secrets_dir };
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[web]\nurl = {s}/mcp/token\ntoken = web-token\nheader = X-Team: tools\n", .{try f.e.url()}) });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow mcp web/echo *\n" });
+    // not stored yet: not started, and said so
+    _ = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "web: token \"web-token\" is not stored (harness secret add web-token)") != null);
+    try f.core.store.?.put(t.io, "web-token", token);
+    _ = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "web (3 tools)") != null);
+    // the server says back the Authorization it got: masked in the model's request
+    try f.e.script(1, model.toolReply("tu_1", "web__echo", "{\"text\":\"auth\"}"));
+    try f.e.script(2, model.textReply("checked"));
+    try f.core.startWorker();
+    try f.core.handleText("what does it see");
+    try f.rec.waitFor("checked");
+    const req = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req, "Bearer [secret:web-token]") != null);
+    try t.expect(std.mem.indexOf(u8, req, token) == null);
+    // sent with the header lines, as written
+    const sent = try f.e.tmp.dir.readFileAlloc(t.io, "mcp-requests.jsonl", a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, sent, "\"Authorization\":\"Bearer " ++ token ++ "\"") != null);
+    try t.expect(std.mem.indexOf(u8, sent, "\"X-Team\":\"tools\"") != null);
+    // in no log line, no item, no message
+    try t.expect(std.mem.indexOf(u8, try logText(&f), token) == null);
+    try t.expectEqual(0, f.rec.count(token));
 }
 
 test "reload_holds_no_lock_while_servers_start_and_stop_cuts_it_short" {
