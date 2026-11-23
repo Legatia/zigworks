@@ -477,4 +477,15 @@ Left:
 - `/reload` does not look for apps changed outside harness; a start,
   `/apps` and the serving of an app's page do.
 - The end-to-end script (`scripts/smoke.sh`) has no step for apps.
-- macOS: nothing here is per-system, but none of it ran on a Mac.
+- macOS: nothing here is per-system, but none of it ran on a Mac (it
+  type-checks for aarch64-macos).
+
+Also fixed there: `scripts/smoke.sh` ran `harness report` from another
+folder with the relative path Windows' build hands it; the check failed
+and left the model's replies one off for the four checks after it. The
+binary's path is absolute now.
+
+Merged with `harness-logins` 5e4d0d4: Windows 11 971 pass, 48 skip,
+smoke all ok; Linux (WSL, user tester) 999 pass, 19 skip, smoke all ok
+run alone, and the one failure this machine's WSL always has
+(`mcp_list_says_each_servers_kind_sign_in_and_tools`).
