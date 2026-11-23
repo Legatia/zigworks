@@ -5651,6 +5651,7 @@ pub const Core = struct {
         \\/conversation rename OLD NEW, /conversation rm NAME
         \\/conversation add NAME: sent in a group, the agent may post there
         \\/session [N]: the steps behind the last answer here (N runs back)
+        \\/history WORDS: earlier turns with every word, newest first
         \\/apps: the apps, with their links while the app server runs
         \\/app approve NAME: serve an app as its files are now
         \\/app rm NAME: remove an app, its data and its versions
@@ -5799,6 +5800,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/logins")) return c.loginsText(a);
         if (eql(u8, cmd, "/conversations")) return c.conversationsText(a);
         if (eql(u8, cmd, "/session")) return c.sessionText(a, conv, rest);
+        if (eql(u8, cmd, "/history")) return c.historyText(a, conv, rest);
         if (eql(u8, cmd, "/inbox")) return c.inboxCommand(a, conv);
         if (eql(u8, cmd, "/answer")) return c.answerCommand(a, conv, rest);
         if (eql(u8, cmd, "/grants")) return c.grantsText(a);
@@ -5846,6 +5848,21 @@ pub const Core = struct {
         const text = session.tail(c.io, a, c.paths.log, 4 << 20) catch |e| return std.fmt.allocPrint(a, "The log can't be read: {s}", .{@errorName(e)});
         const rid = (try session.lastRunIn(a, text, conv, back)) orelse return "No run here in the log's last 4 MB.";
         return (try session.render(a, text, rid, 3500)) orelse "No run here in the log's last 4 MB.";
+    }
+
+    /// `/history WORDS`: the turns that have every word (or a phrase in
+    /// double quotes), newest first, as the owner's runs here may see
+    /// them, in one message.
+    fn historyText(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        const terms = try history_mod.parseTerms(a, rest);
+        if (terms.len == 0) return "Use /history WORDS: the turns that have every word, newest first; a phrase goes in double quotes.";
+        const scope = c.history_src.scopeOf("owner", conv);
+        const found = history_mod.search(a, c.io, c.paths.log, scope, .{ .terms = terms }) catch |e| switch (e) {
+            error.FileNotFound => history_mod.Found{ .hits = &.{} },
+            else => return std.fmt.allocPrint(a, "The log can't be read: {s}", .{@errorName(e)}),
+        };
+        // the log was masked with the values of its time; these are today's
+        return c.masks.scrubAlloc(a, try history_mod.render(a, c.io, c.paths.log, found, terms, c.cfg.chat.utc_offset, 3500, scope));
     }
 
     /// A line per conversation: its name, where it is, private, last used.
@@ -8050,6 +8067,24 @@ test "a_private_conversations_words_are_never_found" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(5), try std.fmt.allocPrint(a, "Run {d} is private: what was said in it is not in the log.", .{diary_rid})) != null);
     const log = try logText(&f);
     for ([_][]const u8{ "my secret plans", "garden party", "at the lake", "Kept between us" }) |said| try t.expect(std.mem.indexOf(u8, log, said) == null);
+}
+
+test "the_history_command_finds_old_turns" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "house-search", 5012);
+    try f.e.script(1, model.textReply("Seefeld has two flats."));
+    f.core.chatTurnIn("house-search", "flats in Seefeld?");
+    const rid = (try session.lastRunIn(f.e.arena.allocator(), try logText(&f), "house-search", 1)).?;
+    // the owner's command: every conversation, newest first, in one message
+    try f.core.handleTextIn("main", "/history seefeld FLATS");
+    try f.rec.waitIn("main", "1 turn, newest first (the owner's time):");
+    try t.expectEqual(1, f.rec.countIn("main", try std.fmt.allocPrint(f.e.arena.allocator(), ", house-search, run {d} (chat)\nOwner: flats in Seefeld?\nAgent: Seefeld has two flats.\n", .{rid})));
+    try f.core.handleTextIn("main", "/history \"two flats in\"");
+    try f.rec.waitIn("main", "No turn has all of: two flats in.");
+    try f.core.handleTextIn("main", "/history");
+    try f.rec.waitIn("main", "Use /history WORDS");
 }
 
 test "a_bad_rules_line_names_its_section_or_environment" {

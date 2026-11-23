@@ -654,6 +654,30 @@ pub fn runView(a: std.mem.Allocator, io: Io, path: []const u8, scope: Scope, rid
     return (try session.render(a, text, rid, max_bytes)) orelse none;
 }
 
+/// `harness log search WORDS…`: every conversation, no size limit; an
+/// argument with a space in it is a phrase (the shell kept it whole).
+/// Null: no words.
+pub fn searchText(a: std.mem.Allocator, io: Io, path: []const u8, args: []const []const u8, utc_offset: i32) !?[]const u8 {
+    var words_in: std.ArrayList(u8) = .empty;
+    for (args) |w| {
+        const x = std.mem.trim(u8, w, " \t");
+        if (x.len == 0) continue;
+        if (words_in.items.len > 0) try words_in.append(a, ' ');
+        if (std.mem.indexOfAny(u8, x, " \t") != null and std.mem.indexOfScalar(u8, x, '"') == null)
+            try words_in.print(a, "\"{s}\"", .{x})
+        else
+            try words_in.appendSlice(a, x);
+    }
+    const terms = try parseTerms(a, words_in.items);
+    if (terms.len == 0) return null;
+    const all: Scope = .{ .all = true };
+    const found = search(a, io, path, all, .{ .terms = terms }) catch |e| switch (e) {
+        error.FileNotFound => Found{ .hits = &.{} },
+        else => return e,
+    };
+    return try render(a, io, path, found, terms, utc_offset, 0, all);
+}
+
 // ---- the tool ----
 
 pub const tool_def: model.ToolDef = .{
@@ -955,4 +979,66 @@ test "history_run_returns_its_session" {
     try t.expectEqualStrings(try std.fmt.allocPrint(a, "Run {d} is private: what was said in it is not in the log.", .{private}), try runView(a, t.io, path, all, private, max_view));
     try t.expectEqualStrings("No run 99999 in the log.", try runView(a, t.io, path, all, 99999, max_view));
     try t.expectEqualStrings("No run 3 in the log.", try runView(a, t.io, path, all, 3, max_view));
+}
+
+test "log_search_takes_words_and_phrases_from_the_command_line" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var l: Lines = .{ .a = a };
+    const flight = try l.start("2026-11-04T08:00:00Z", "house-search", "chat", "owner", "When do I fly?");
+    try l.post("2026-11-04T08:00:03Z", flight, "house-search", "Your flight to Oslo leaves at 9.");
+    _ = try l.start("2026-11-05T08:00:00Z", "main", "chat", "owner", "Compare Oslo prices for a flight");
+    const path = try l.save(&tmp);
+    // an argument the shell kept whole, spaces and all, is a phrase
+    const one = (try searchText(a, t.io, path, &.{"flight to oslo"}, 60)).?;
+    try expectIn(one, "1 turn, newest first (the owner's time):\n\n2026-11-04 09:00, house-search, run 1 (chat)\n");
+    const two = (try searchText(a, t.io, path, &.{ "oslo", "flight" }, 0)).?;
+    try expectIn(two, "2 turns, newest first");
+    try t.expectEqual(null, try searchText(a, t.io, path, &.{"  "}, 0));
+}
+
+test "a_search_over_a_50_mb_log_stays_fast" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // a 50 MB log of runs that each fetched a page: the word is only in the oldest
+    var f = try tmp.dir.createFile(t.io, "actions.jsonl", .{});
+    var l: Lines = .{ .a = a };
+    var filler: std.ArrayList(u8) = .empty;
+    while (filler.items.len < 1800) try filler.appendSlice(a, "Listings of flats with balconies near the lake, prices in francs, viewings on weekdays. ");
+    const first = try l.start("2026-10-01T09:00:00Z", "main", "chat", "owner", "find the quokka photo");
+    try l.tool("2026-10-01T09:00:02Z", first, "main", "fetch", "https://zoo.example/quokka", filler.items);
+    var size: usize = 0;
+    var day: u32 = 0;
+    while (size + l.out.items.len < 50 << 20) : (day += 1) {
+        const time = try std.fmt.allocPrint(a, "2026-11-{d:0>2}T10:00:00Z", .{1 + day % 28});
+        const rid = try l.start(time, if (day % 3 == 0) "house-search" else "main", "chat", "owner", "any new flats with a balcony?");
+        try l.tool(time, rid, "main", "fetch", "https://flats.example/list", filler.items);
+        try l.tool(time, rid, "main", "fetch", "https://flats.example/more", filler.items);
+        try l.post(time, rid, "main", "Two new flats with balconies; one near the lake.");
+        if (l.out.items.len > 1 << 20) {
+            try f.writeStreamingAll(t.io, l.out.items);
+            size += l.out.items.len;
+            l.out.clearRetainingCapacity();
+        }
+    }
+    try f.writeStreamingAll(t.io, l.out.items);
+    size += l.out.items.len;
+    f.close(t.io);
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const path = try std.fs.path.join(a, &.{ dir, "actions.jsonl" });
+    const started = Io.Clock.awake.now(t.io);
+    const found = try search(a, t.io, path, .{ .all = true }, .{ .terms = try parseTerms(a, "quokka") });
+    const ms = started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
+    try t.expectEqual(1, found.hits.len);
+    try t.expectEqual(first, found.hits[0].rid);
+    // a busy machine and a debug build get a wide margin
+    const bound: i64 = if (@import("builtin").mode == .debug) 20_000 else 5_000;
+    if (ms > bound) std.debug.print("a search over {d} MB took {d} ms (bound {d} ms)\n", .{ size >> 20, ms, bound });
+    try t.expect(ms <= bound);
 }
