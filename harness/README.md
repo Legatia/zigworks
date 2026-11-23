@@ -30,9 +30,8 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 685 unit tests (27 of them
-don't run on macOS: Windows or Linux only, or the macOS sandbox and clones,
-not built yet), among
+**State: 0.3.0, tested on macOS by its own tests: 691 unit tests (19 of them
+don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 73 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram, feeds,
@@ -42,7 +41,8 @@ tests also run, against Chrome 157, and the console, lock, Credential
 Manager and process-cleanup checks of HANDOFF-windows-audit.md were run by
 hand. With environments, apps, clones and safe state files added,
 Windows 11 and Linux (WSL, bubblewrap 0.9, OpenSSH 9.6) pass their unit
-tests and the end-to-end script. Nothing has run yet against a real
+tests and the end-to-end script; on macOS 15.7 the sandbox (sandbox-exec)
+and APFS clone tests run with the rest. Nothing has run yet against a real
 omnigate or model provider, Telegram bot, MCP server or website.** See
 [Limits](#limits).
 
@@ -177,7 +177,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `apps/` | apps shown in your browser, a folder each with `app.ini` (see Apps); what was approved of each is in `state/apps/` |
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
-| `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home, a remote's key) |
+| `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home and, on macOS, its temp; a remote's key) |
 
 On macOS and Linux, `config.ini`, `rules`, `logins.ini`, `mcp.ini`,
 `folders.ini`, `triggers.ini`, `environments.ini`, the folder `agents/` and its files are
@@ -511,10 +511,10 @@ reach: each content once in `objects/`, a file a snapshot in
 `folders/KEY/ID`. Snapshots past a folder's count go, and the oldest while
 all of them hold more than `[limits] snapshot_mb` (default 5120; each
 folder keeps its newest); content no snapshot names is deleted at start
-and after each run. Where the file system can share blocks (btrfs, XFS
-made with reflink, ReFS and Dev Drives on Windows; APFS to come) an object
-is a clone that takes no space until the file changes; elsewhere it is a
-copy.
+and after each run. Where the file system can share blocks (APFS on
+macOS, btrfs, XFS made with reflink, ReFS and Dev Drives on Windows) an
+object is a clone that takes no space until the file changes; elsewhere,
+and for a file made unchangeable (`chflags uchg`), it is a copy.
 
 ## Environments
 
@@ -540,11 +540,28 @@ read-only or not at all), a home of its own kept between commands
 (`state/env/NAME/home`) and the system's programs, and without the rest
 of the data folder, your home, any secret or the network unless `network
 = on` (outside hosts; on Windows never this machine or the local
-network). A stop, the time limit and the command's end end everything it
-started. On Linux it is bubblewrap (`bwrap`, which you install); on
-Windows an AppContainer, with access to its folders given to it on first
-use, in a job object; on macOS it is not built yet. A sandbox that can't
-run here refuses the command; it never runs on the host instead.
+network; on macOS never this machine). A stop, the time limit and the
+command's end end everything it started (on macOS, all that stays in its
+process group). On Linux it is bubblewrap (`bwrap`, which you install);
+on Windows an AppContainer, with access to its folders given to it on
+first use, in a job object; on macOS `sandbox-exec`, which comes with
+the system, with a profile written for each command. A sandbox that
+can't run here refuses the command; it never runs on the host instead.
+
+On macOS a sandboxed command reads the system's folders (`/usr`, `/bin`,
+`/sbin`, `/System`, `/Library` but its Keychains, `/opt/homebrew` but
+its `var`, `/private/etc`) and the developer tools `xcode-select` names,
+so git, make, cc and python3 run; programs elsewhere, in your home for
+one, need `read =`. It writes only to the workspace (when `rw`), its
+home and its own temp (`state/env/NAME/tmp`, as TMPDIR); `/tmp` and your
+own temporary folder are out of its reach. Never, even inside a `read =`
+folder: the data folder and the Keychain (its services and its files).
+Nor the terminal, programs that run as another user (`ps`, `sudo`), or
+other processes but its own (it can see their command lines, not signal
+them or read their environment). With `network = on` it connects to other
+machines, those on your local network too, never to this one
+(127.0.0.1 or any of its addresses), and it can't listen; names resolve
+through the system's resolver (`dig` and `host` don't work).
 
 `/envs` lists them and whether each can run here; `/env check NAME` runs
 a few probes inside a sandbox and says what it can read and write and

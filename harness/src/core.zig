@@ -6277,7 +6277,7 @@ pub const Core = struct {
             .{ .what = "outside (example.com)", .command = if (win) "curl.exe -s -m 8 -o NUL https://example.com" else "curl -s -m 8 -o /dev/null https://example.com", .want = e.network },
         };
         var out: std.ArrayList(u8) = .empty;
-        try out.print(a, "{s} ({s}):\n", .{ name, if (win) "AppContainer" else "bubblewrap" });
+        try out.print(a, "{s} ({s}):\n", .{ name, sandbox.backend });
         var odd: u32 = 0;
         for (probes) |p| {
             if (p.what[0] == 'y' and c.home_var.len == 0) continue;
