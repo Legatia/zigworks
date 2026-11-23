@@ -3,9 +3,8 @@
 //! so a snapshot of a large folder costs no space until its files change.
 //! Linux: FICLONE (btrfs; XFS made with reflink, the default since 2019).
 //! Windows: block cloning (FSCTL_DUPLICATE_EXTENTS_TO_FILE) on ReFS and
-//! Dev Drives. macOS: clonefile on APFS, the Mac session's. Where the file
-//! system can't, a helper says false and leaves nothing behind: the store
-//! then copies.
+//! Dev Drives. macOS: clonefile on APFS. Where the file system can't, a
+//! helper says false and leaves nothing behind: the store then copies.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -18,8 +17,57 @@ pub const Fn = *const fn (io: Io, src: []const u8, dst: []const u8) anyerror!boo
 pub const platform: ?Fn = switch (builtin.os.tag) {
     .linux => linuxClone,
     .windows => windowsClone,
+    .macos => macClone,
     else => null,
 };
+
+/// clonefile: `dst`, made now, shares `src`'s blocks (APFS). A clone takes
+/// its source's mode and flags, so it is made the owner's alone, as a
+/// copied object is, and a file made unchangeable (chflags) is copied
+/// instead: its clone could be neither renamed nor deleted.
+fn macClone(io: Io, src: []const u8, dst: []const u8) anyerror!bool {
+    if (builtin.os.tag != .macos) return false;
+    _ = io;
+    const c = std.c;
+    const s = try std.posix.toPosixPath(src);
+    const d = try std.posix.toPosixPath(dst);
+    var st: c.Stat = undefined;
+    const rc = c.fstatat(c.AT.FDCWD, &s, &st, c.AT.SYMLINK_NOFOLLOW);
+    if (rc != 0) return failed(std.posix.errno(rc));
+    if (st.flags & no_clone_flags != 0) return false;
+    const cl = clonefile(&s, &d, clone_nofollow);
+    if (cl != 0) {
+        const e = std.posix.errno(cl);
+        // the file system can't (HFS+, exFAT, a network share; EOPNOTSUPP
+        // is 102 beside ENOTSUP), or another volume: the store copies
+        if (e == .OPNOTSUPP or e == .XDEV or @backingInt(e) == 102) return false;
+        return failed(e);
+    }
+    if (c.chmod(&d, 0o600) != 0) {
+        _ = c.unlink(&d);
+        return false;
+    }
+    return true;
+}
+
+const clone_nofollow: u32 = 0x1;
+/// UF_IMMUTABLE, UF_APPEND, SF_IMMUTABLE, SF_APPEND, SF_RESTRICTED,
+/// SF_NOUNLINK: what keeps a file from being renamed or deleted.
+const no_clone_flags: u32 = 0x2 | 0x4 | 0x20000 | 0x40000 | 0x80000 | 0x100000;
+extern "c" fn clonefile(src: [*:0]const u8, dst: [*:0]const u8, flags: u32) c_int;
+
+/// An errno from clonefile or stat as an error; EEXIST: `dst` is there and
+/// is never overwritten.
+fn failed(e: std.posix.E) anyerror {
+    return switch (e) {
+        .EXIST => error.PathAlreadyExists,
+        .NOENT => error.FileNotFound,
+        .ACCES, .PERM => error.AccessDenied,
+        .NOSPC => error.NoSpaceLeft,
+        .NAMETOOLONG => error.NameTooLong,
+        else => std.posix.unexpectedErrno(e),
+    };
+}
 
 /// FICLONE: `dst`, made now, shares `src`'s extents.
 fn linuxClone(io: Io, src: []const u8, dst: []const u8) anyerror!bool {
@@ -190,13 +238,21 @@ test "a_clone_is_whole_where_the_file_system_can_and_nothing_where_it_cannot" {
 
 test "clones_share_blocks_on_copy_on_write_file_systems" {
     // folders on btrfs, XFS (reflink), ReFS or a Dev Drive, `;`-separated
-    // (made for the test; this machine's own file systems usually can't)
+    // (made for the test; this machine's own file systems usually can't);
+    // on macOS without them, the test's own folder when it is on APFS
     const clone = platform orelse return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var env = try t.environ.createMap(a);
-    const dirs = env.get("HARNESS_TEST_COW_DIRS") orelse return error.SkipZigTest;
+    const dirs = env.get("HARNESS_TEST_COW_DIRS") orelse blk: {
+        if (builtin.os.tag != .macos) return error.SkipZigTest;
+        const own = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+        if (!try onApfs(own)) return error.SkipZigTest;
+        break :blk own;
+    };
     var it = std.mem.tokenizeScalar(u8, dirs, ';');
     var tried: usize = 0;
     while (it.next()) |dir| {
@@ -220,3 +276,67 @@ test "clones_share_blocks_on_copy_on_write_file_systems" {
     }
     try t.expect(tried > 0);
 }
+
+/// macOS: whether the folder `path` is on APFS, which clones.
+fn onApfs(path: []const u8) !bool {
+    if (builtin.os.tag != .macos) return false;
+    const p = try std.posix.toPosixPath(path);
+    var st: Statfs = undefined;
+    if (statfs(&p, &st) != 0) return false;
+    return std.mem.eql(u8, std.mem.sliceTo(&st.fstypename, 0), "apfs");
+}
+
+/// macOS's struct statfs (64-bit inodes).
+const Statfs = extern struct {
+    bsize: u32,
+    iosize: i32,
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    fsid: [2]i32,
+    owner: u32,
+    type: u32,
+    flags: u32,
+    fssubtype: u32,
+    fstypename: [16]u8,
+    mntonname: [1024]u8,
+    mntfromname: [1024]u8,
+    flags_ext: u32,
+    reserved: [7]u32,
+};
+
+/// x86_64 Macs keep the 64-bit-inode struct under another name.
+const statfs = @extern(*const fn ([*:0]const u8, *Statfs) callconv(.c) c_int, .{ .name = if (builtin.cpu.arch == .x86_64) "statfs$INODE64" else "statfs" });
+
+test "an_apfs_clone_is_owner_only_and_an_unchangeable_file_is_copied_instead" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    if (!try onApfs(root)) return error.SkipZigTest;
+    const src = try std.fs.path.join(a, &.{ root, "src.bin" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "src.bin", .data = "shared\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    // a clone keeps its source's mode; an object is the owner's alone, as
+    // a copied one is
+    const dst = try std.fs.path.join(a, &.{ root, "dst.bin" });
+    try t.expect(try macClone(t.io, src, dst));
+    try t.expectEqual(@as(u32, 0o600), (try tmp.dir.statFile(t.io, "dst.bin", .{})).permissions.toMode() & 0o7777);
+    // a file made unchangeable (chflags uchg) would be cloned so too, and
+    // the store could neither rename nor delete it: copied instead
+    const p = try std.posix.toPosixPath(src);
+    try t.expectEqual(@as(c_int, 0), chflags(&p, uf_immutable));
+    defer _ = chflags(&p, 0);
+    const locked = try std.fs.path.join(a, &.{ root, "locked.bin" });
+    const lp = try std.posix.toPosixPath(locked);
+    defer _ = chflags(&lp, 0);
+    try t.expect(!try macClone(t.io, src, locked));
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(t.io, "locked.bin", .{}));
+}
+
+extern "c" fn chflags(path: [*:0]const u8, flags: u32) c_int;
+const uf_immutable: u32 = 0x2;
