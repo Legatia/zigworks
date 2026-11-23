@@ -37,6 +37,8 @@ pub const Source = struct {
     log_path: []const u8,
     /// state/summaries ("": none), for the summaries in the prompt.
     summaries_dir: []const u8 = "",
+    /// `[memory] summaries`, read when a prompt is made; null: on.
+    summaries_on: ?*const bool = null,
     ctx: ?*anyopaque = null,
     /// Whether others read conversation `name` (a group).
     shared: ?*const fn (ctx: ?*anyopaque, name: []const u8) bool = null,

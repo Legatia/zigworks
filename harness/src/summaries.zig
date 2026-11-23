@@ -593,6 +593,100 @@ fn takeLine(a: std.mem.Allocator, la: std.mem.Allocator, env: Env, line: []const
     }
 }
 
+// ---- the prompt ----
+
+/// A summary in the prompt.
+const Shown = struct { period: Period, text: []const u8 };
+
+/// The summaries of `kind` in `conv`'s folder, newest first (the
+/// given-up marks are no summaries).
+fn listed(a: std.mem.Allocator, io: Io, dir: []const u8, conv: []const u8, kind: Kind) ![]Period {
+    var out: std.ArrayList(Period) = .empty;
+    const path = try std.fs.path.join(a, &.{ dir, conv, @tagName(kind) });
+    var d = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return out.items;
+    defer d.close(io);
+    var it = d.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".md")) continue;
+        try out.append(a, Period.parse(kind, e.name[0 .. e.name.len - 3]) orelse continue);
+    }
+    std.mem.sort(Period, out.items, {}, struct {
+        fn newer(_: void, x: Period, y: Period) bool {
+            return x.first > y.first;
+        }
+    }.newer);
+    return out.items;
+}
+
+fn readShown(a: std.mem.Allocator, io: Io, dir: []const u8, conv: []const u8, p: Period) !?Shown {
+    var nb: [16]u8 = undefined;
+    const path = try std.fs.path.join(a, &.{ dir, conv, @tagName(p.kind), try std.fmt.allocPrint(a, "{s}.md", .{p.name(&nb)}) });
+    const text = Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 * 1024)) catch return null;
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return .{ .period = p, .text = trimmed };
+}
+
+/// The summaries of conversation `conv` for its prompt, oldest first:
+/// the 3 latest days, the 2 latest weeks those days do not cover (a week
+/// is covered when it has day summaries and all are shown), the 3 latest
+/// months; within 1,500 words, the oldest dropped first (one alone over
+/// it cut to its first 1,500), then a line on `history` when the run has
+/// it. Only `conv`'s own. Null: there are none. The files change when the
+/// daily pass writes one, so these bytes stay the same until then (the
+/// prompt cache holds).
+pub fn promptBlock(a: std.mem.Allocator, io: Io, dir: []const u8, conv: []const u8, history_line: bool) !?[]const u8 {
+    if (dir.len == 0 or !conversations.validName(conv)) return null;
+    var items: std.ArrayList(Shown) = .empty;
+    const days = try listed(a, io, dir, conv, .day);
+    const shown_days = days[0..@min(days.len, 3)];
+    for (shown_days) |p| if (try readShown(a, io, dir, conv, p)) |x| try items.append(a, x);
+    var weeks: usize = 0;
+    for (try listed(a, io, dir, conv, .week)) |w| {
+        if (weeks == 2) break;
+        var any = false;
+        var all_shown = true;
+        for (days) |d| if (d.first >= w.first and d.first <= w.last()) {
+            any = true;
+            for (shown_days) |s| {
+                if (s.first == d.first) break;
+            } else all_shown = false;
+        };
+        if (any and all_shown) continue;
+        if (try readShown(a, io, dir, conv, w)) |x| {
+            try items.append(a, x);
+            weeks += 1;
+        }
+    }
+    const months = try listed(a, io, dir, conv, .month);
+    for (months[0..@min(months.len, 3)]) |p| if (try readShown(a, io, dir, conv, p)) |x| try items.append(a, x);
+    if (items.items.len == 0) return null;
+    // oldest first: months, weeks, days
+    std.mem.sort(Shown, items.items, {}, struct {
+        fn older(_: void, x: Shown, y: Shown) bool {
+            return x.period.first < y.period.first or (x.period.first == y.period.first and @intFromEnum(x.period.kind) > @intFromEnum(y.period.kind));
+        }
+    }.older);
+    var total: usize = 0;
+    for (items.items) |x| total += countWords(x.text);
+    var from: usize = 0;
+    while (total > prompt_words and items.items.len - from > 1) : (from += 1) total -= countWords(items.items[from].text);
+    const kept = items.items[from..];
+    if (total > prompt_words) kept[0].text = cutWords(kept[0].text, prompt_words);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, "\nEarlier in this conversation:\n");
+    var b1: [16]u8 = undefined;
+    var b2: [16]u8 = undefined;
+    var b3: [16]u8 = undefined;
+    for (kept) |x| switch (x.period.kind) {
+        .month => try out.print(a, "Month {s}: {s}\n", .{ x.period.name(&b1), x.text }),
+        .week => try out.print(a, "Week {s} ({s} to {s}): {s}\n", .{ x.period.name(&b1), dayText(&b2, x.period.first), dayText(&b3, x.period.last()), x.text }),
+        .day => try out.print(a, "{s} ({s}): {s}\n", .{ dayText(&b1, x.period.first), weekday_names[util.weekday(x.period.first)], x.text }),
+    };
+    if (history_line) try out.appendSlice(a, "history finds anything older than these, or the exact words.\n");
+    return out.items;
+}
+
 /// Days older than 60 days go, weeks that ended over 400 days ago; months
 /// stay.
 fn prune(a: std.mem.Allocator, env: Env, today: i64) void {
@@ -855,4 +949,84 @@ test "a_summary_never_holds_a_secret" {
     try t.expect(std.mem.indexOf(u8, req, "tok-4141-secret") == null);
     try expectIn(req, "my token is [secret:github]");
     try t.expectEqualStrings("The owner's token is [secret:github].\n", f.file("main/day/2026-11-22.md").?);
+}
+
+/// Writes summary files under `dir`: `rel` and its text.
+fn writeSummaries(a: std.mem.Allocator, dir: []const u8, files: []const [2][]const u8) !void {
+    for (files) |x| {
+        const p = try std.fs.path.join(a, &.{ dir, x[0] });
+        try Io.Dir.cwd().createDirPath(t.io, std.fs.path.dirname(p).?);
+        try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p, .data = x[1] });
+    }
+}
+
+/// `n` words.
+fn wordsOf(a: std.mem.Allocator, word: []const u8, n: usize) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (0..n) |i| try out.print(a, "{s}{s}", .{ if (i > 0) " " else "", word });
+    return out.items;
+}
+
+test "the_latest_summaries_are_picked_within_1500_words" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try t.expectEqual(null, try promptBlock(a, t.io, dir, "main", true));
+    try writeSummaries(a, dir, &.{
+        .{ "main/day/2026-11-19.md", "Thursday: gym.\n" },
+        .{ "main/day/2026-11-20.md", "Friday: dentist at 10.\n" },
+        .{ "main/day/2026-11-21.md", "Saturday: hike.\n" },
+        .{ "main/day/2026-11-23.md", "Monday: flight booked.\n" },
+        .{ "main/day/2026-11-18.given-up", "Given up.\n" },
+        // W47 has a day not shown (the 19th): it is shown; W48 is covered
+        .{ "main/week/2026-W48.md", "Week 48: covered by its days.\n" },
+        .{ "main/week/2026-W47.md", "Week 47: dentist, gym, hike.\n" },
+        .{ "main/week/2026-W46.md", "Week 46: flats.\n" },
+        .{ "main/week/2026-W45.md", "Week 45: too old for two.\n" },
+        .{ "main/month/2026-07.md", "July: too old for three.\n" },
+        .{ "main/month/2026-08.md", "August: holidays.\n" },
+        .{ "main/month/2026-09.md", "September: new job.\n" },
+        .{ "main/month/2026-10.md", "October: the move.\n" },
+        .{ "family/day/2026-11-22.md", "The family's day.\n" },
+    });
+    const block = (try promptBlock(a, t.io, dir, "main", true)).?;
+    try t.expectEqualStrings(
+        \\
+        \\Earlier in this conversation:
+        \\Month 2026-08: August: holidays.
+        \\Month 2026-09: September: new job.
+        \\Month 2026-10: October: the move.
+        \\Week 2026-W46 (2026-11-09 to 2026-11-15): Week 46: flats.
+        \\Week 2026-W47 (2026-11-16 to 2026-11-22): Week 47: dentist, gym, hike.
+        \\2026-11-20 (Friday): Friday: dentist at 10.
+        \\2026-11-21 (Saturday): Saturday: hike.
+        \\2026-11-23 (Monday): Monday: flight booked.
+        \\history finds anything older than these, or the exact words.
+        \\
+    , block);
+    // a run without history gets no line about it; another conversation only its own
+    try t.expect(std.mem.indexOf(u8, (try promptBlock(a, t.io, dir, "main", false)).?, "history") == null);
+    try t.expectEqualStrings("\nEarlier in this conversation:\n2026-11-22 (Sunday): The family's day.\n", (try promptBlock(a, t.io, dir, "family", false)).?);
+    // over 1,500 words: the oldest go first
+    try writeSummaries(a, dir, &.{
+        .{ "main/month/2026-08.md", try wordsOf(a, "aug", 600) },
+        .{ "main/month/2026-09.md", try wordsOf(a, "sep", 600) },
+        .{ "main/month/2026-10.md", try wordsOf(a, "oct", 600) },
+    });
+    const capped = (try promptBlock(a, t.io, dir, "main", false)).?;
+    try t.expect(std.mem.indexOf(u8, capped, "Month 2026-08") == null);
+    try t.expect(std.mem.indexOf(u8, capped, "Month 2026-09") != null);
+    try t.expect(std.mem.indexOf(u8, capped, "Month 2026-10") != null);
+    try t.expect(std.mem.indexOf(u8, capped, "2026-11-23 (Monday)") != null);
+    try t.expect(countWords(capped) <= prompt_words + 60);
+    // one summary alone over it: its first 1,500 words
+    try writeSummaries(a, dir, &.{.{ "main/day/2026-11-23.md", try wordsOf(a, "long", 2000) }});
+    const one = (try promptBlock(a, t.io, dir, "main", false)).?;
+    try t.expect(std.mem.indexOf(u8, one, "Month") == null);
+    try t.expectEqual(1500, std.mem.count(u8, one, "long"));
+    // a name that is no conversation's reads nothing
+    try t.expectEqual(null, try promptBlock(a, t.io, dir, "../main", true));
 }

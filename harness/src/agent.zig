@@ -21,6 +21,7 @@ const folders_mod = @import("folders.zig");
 const snapshots_mod = @import("snapshots.zig");
 const agents = @import("agents.zig");
 const history_mod = @import("history.zig");
+const summaries_mod = @import("summaries.zig");
 const Io = std.Io;
 
 /// What came of asking the owner. `once`, `day`, `deny`: an approval's
@@ -1173,6 +1174,9 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
         top_header = true;
         try out.print(arena, "- {s}\n", .{it.body});
     };
+    // the conversation's summaries by day, week and month (long memory):
+    // their files change once a day, so the cached part holds until then
+    if (try earlierBlock(arena, r)) |block| try out.appendSlice(arena, block);
     if (past.summary) |sm| {
         try out.print(arena, "\nSummary of the earlier conversation:\n{s}\n", .{sm});
         if (past.lost > 0) try out.print(arena, "{d} turns of this conversation were dropped without being summarised, to keep it short.\n", .{past.lost});
@@ -1191,6 +1195,15 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
         for (recalled.found) |it| try out.print(arena, "- {s}\n", .{it.body});
     }
     return .{ .stable = stable, .changing = out.items };
+}
+
+/// The summaries of the run's conversation for its prompt: not for a
+/// helper, nor for a definition that reads only pinned memory.
+fn earlierBlock(arena: std.mem.Allocator, r: *const Run) !?[]const u8 {
+    const src = r.history orelse return null;
+    if (src.summaries_on) |on| if (!on.*) return null;
+    if (r.helper or r.def.memory != .shared) return null;
+    return summaries_mod.promptBlock(arena, r.io, src.summaries_dir, r.conversation, r.allows(.history));
 }
 
 /// One turn. `from_owner`: the text is the owner's own words (mentions
@@ -4473,6 +4486,58 @@ test "the_stable_instructions_stay_the_same_through_a_turn" {
     freeResult(&f.run, r);
     // what the turn saved is in the next turn's instructions, not this one's
     try t.expectEqualStrings(try systemOf(&f, 1), try systemOf(&f, 2));
+}
+
+test "the_prompt_carries_the_latest_summaries_within_1500_words" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const dir = try std.fs.path.join(a, &.{ f.e.dir, "summaries" });
+    for ([_][2][]const u8{
+        .{ "main/day/2026-11-21.md", "Saturday: the dentist moved to 11.\n" },
+        .{ "main/week/2026-W46.md", "Week 46: flats in Basel.\n" },
+        .{ "main/month/2026-10.md", "October: the move.\n" },
+        .{ "family/day/2026-11-21.md", "The family's Saturday.\n" },
+    }) |x| {
+        const p = try std.fs.path.join(a, &.{ dir, x[0] });
+        try Io.Dir.cwd().createDirPath(t.io, std.fs.path.dirname(p).?);
+        try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p, .data = x[1] });
+    }
+    var src: history_mod.Source = .{ .log_path = try std.fs.path.join(a, &.{ f.e.dir, "actions.jsonl" }), .summaries_dir = dir };
+    f.run.history = &src;
+    f.run.conversation = "main";
+    const pin = try f.mem.add("ask before deleting files", null, util.nowSeconds(t.io));
+    _ = try f.mem.setPinned(pin.id, true);
+    f.conv.summary = try t.allocator.dupe(u8, "The owner asked about flats.");
+    try f.e.script(1, model.textReply("one"));
+    try f.e.script(2, model.textReply("two"));
+    var r = try f.say("hello");
+    freeResult(&f.run, r);
+    r = try f.say("and again");
+    freeResult(&f.run, r);
+    // after pinned memory, before the rolling summary, in the cached part:
+    // the same bytes in every turn until the daily pass writes a file
+    const s1 = try systemOf(&f, 1);
+    try t.expectEqualStrings(s1, try systemOf(&f, 2));
+    const pinned = std.mem.indexOf(u8, s1, "Standing instructions from the owner").?;
+    const earlier = std.mem.indexOf(u8, s1, "Earlier in this conversation:").?;
+    const rolling = std.mem.indexOf(u8, s1, "Summary of the earlier conversation:").?;
+    try t.expect(pinned < earlier and earlier < rolling);
+    for ([_][]const u8{ "Month 2026-10: October: the move.", "Week 2026-W46 (2026-11-09 to 2026-11-15): Week 46: flats in Basel.", "2026-11-21 (Saturday): Saturday: the dentist moved to 11.", "history finds anything older than these, or the exact words." }) |want| {
+        if (std.mem.indexOf(u8, s1, want) == null) std.debug.print("missing {s} in {s}\n", .{ want, s1 });
+        try t.expect(std.mem.indexOf(u8, s1, want) != null);
+    }
+    // only this conversation's
+    try t.expect(std.mem.indexOf(u8, s1, "family") == null);
+    // a definition that reads pinned memory only, and a helper, get none
+    const recalled: memory.Recall = .{ .always = &.{}, .found = &.{} };
+    f.run.useDefinition(try defOf(&f, "quiet", "---\nname: quiet\ndescription: Q.\nmemory: pinned\n---\nQuiet.\n"));
+    try t.expect(std.mem.indexOf(u8, (try systemParts(a, &f.run, recalled, .{}, util.nowSeconds(t.io))).stable, "Earlier in this conversation") == null);
+    f.run.useDefinition(agents.builtin_main);
+    try t.expect(std.mem.indexOf(u8, (try systemParts(a, &f.run, recalled, .{}, util.nowSeconds(t.io))).stable, "Earlier in this conversation") != null);
+    f.run.helper = true;
+    try t.expect(std.mem.indexOf(u8, (try systemParts(a, &f.run, recalled, .{}, util.nowSeconds(t.io))).stable, "Earlier in this conversation") == null);
 }
 
 test "helpers_get_the_rest_of_the_turn_not_a_new_one" {
