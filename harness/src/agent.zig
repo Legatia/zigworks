@@ -27,8 +27,10 @@ const Io = std.Io;
 /// `timeout`: no answer in time; `unsent`: the question did not get to the
 /// owner (a part or its buttons could not be sent); `withdrawn`: no one is
 /// left to answer (the run stopped, the terminal was left); `full`: no
-/// place in the inbox before the turn's end.
-pub const Answer = enum { once, day, deny, answered, timeout, unsent, withdrawn, full };
+/// place in the inbox before the turn's end; `deferred`: the question waits
+/// in the inbox and the call stops there (a workflow's step, which is not
+/// a run: it goes on once answered).
+pub const Answer = enum { once, day, deny, answered, timeout, unsent, withdrawn, full, deferred };
 
 /// One question for the owner: may this call run (`approval`), the agent's
 /// question (`question`), or a draft to review (`draft`). It becomes an
@@ -1550,7 +1552,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []co
     // asked too; by its path inside the workspace, as the gate sees it
     if (tool == .write_file) if (r.written) |w| {
         const cf = gate.confined(a, r.io, r.env.workspace, arg) catch null;
-        w.addBy(if (cf) |x| x.rel else arg, try std.fmt.allocPrint(a, "agent:{s}", .{r.who.agent}), r.label);
+        w.addBy(if (cf) |x| x.rel else arg, try writerOf(r, a), r.label);
     };
 
     const out: tools.Output = switch (tool) {
@@ -1898,6 +1900,7 @@ fn askOwnerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Ou
             .withdrawn => .{ .text = if (r.env.stop.load(.acquire)) "stopped by the owner" else "no one is left to answer", .is_error = true },
             .full => .{ .text = if (got.text.len > 0) got.text else "no place in the inbox until the turn's end", .is_error = true },
             .once, .day, .deny => .{ .text = "not an answer to this question", .is_error = true },
+            .deferred => .{ .text = "no answer now", .is_error = true },
         };
     };
     try r.logRun(.tool, r.isPrivate(), .{ .tool = "ask_owner", .arg = question, .is_error = out.is_error, .output = out.text, .bytes = out.text.len });
@@ -1965,6 +1968,32 @@ pub fn postReply(r: *Run, a: std.mem.Allocator, text: []const u8) !Posted {
     const target = ob.find(ob.ctx, a, r.conversation) orelse Target{ .name = r.conversation, .exists = false };
     const post: Post = .{ .to = target.name, .text = text, .final = true, .implicit = true };
     return postThrough(r, a, &post, target, null);
+}
+
+/// A workflow's `say`: `text` posted to the run's conversation through the
+/// gate as a `send` (not the reply, not implicit).
+pub fn postText(r: *Run, a: std.mem.Allocator, text: []const u8) !Posted {
+    const ob = r.outbox orelse return .{ .refused = "nowhere to post" };
+    const target = ob.find(ob.ctx, a, r.conversation) orelse Target{ .name = r.conversation, .exists = false };
+    const post: Post = .{ .to = target.name, .text = text };
+    return postThrough(r, a, &post, target, null);
+}
+
+/// Who an "Allow 24 h" covers: the definition that asked (`agent:D`), or
+/// for a call with no definition what started it (a workflow's tool step:
+/// `workflow:NAME`, all its steps and instances, nothing else).
+fn dayWho(r: *const Run, a: std.mem.Allocator) ![]const u8 {
+    if (r.who.agent.len > 0) return std.fmt.allocPrint(a, "agent:{s}", .{r.who.agent});
+    const by = r.who.by;
+    if (std.mem.startsWith(u8, by, "workflow:")) return by[0 .. std.mem.indexOfScalarPos(u8, by, "workflow:".len, '/') orelse by.len];
+    return by;
+}
+
+/// Who writes a file in this run: its definition (`agent:D`), or for a
+/// call with no definition what started it (`workflow:NAME/STEP`).
+fn writerOf(r: *const Run, a: std.mem.Allocator) ![]const u8 {
+    if (r.who.agent.len > 0) return std.fmt.allocPrint(a, "agent:{s}", .{r.who.agent});
+    return r.who.by;
 }
 
 /// The text of a `send` call (the agent's words, for memory and
@@ -2207,7 +2236,7 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
     // files the agent wrote since the owner last allowed a command: one
     // that a rule or a grant allows is asked first, naming them
     // named for the asker: files it wrote itself go without who wrote them
-    const writer: Written.Writer = .{ .who = try std.fmt.allocPrint(a, "agent:{s}", .{r.who.agent}), .run = r.label };
+    const writer: Written.Writer = .{ .who = try writerOf(r, a), .run = r.label };
     const wrote: ?Written.Listed = if (tool != .shell) null else if (r.written) |w| try w.listFor(a, writer, null) else null;
     if (wrote != null and action == .allow) {
         if (r.scheduled or r.asker == null) {
@@ -2227,6 +2256,8 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             why = w;
         }
     };
+    // what the gate line says when that is not the action (a question waiting in the inbox)
+    var logged: ?@TypeOf(action) = null;
     if (action == .ask) ask: {
         action = .deny;
         const asker = r.asker orelse {
@@ -2279,9 +2310,9 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
                 r.lock.lockUncancelable(r.io);
                 defer r.lock.unlock(r.io);
                 // the form the gate matches (for files, the path inside the
-                // workspace), for the definition that asked
-                const definition = try std.fmt.allocPrint(a, "agent:{s}", .{r.who.agent});
-                try r.gate.grants.addFor(tool, ctx.env, gate.grantKey(tool, d.subject), definition, now_s + 86400);
+                // workspace), for the definition that asked (a workflow's
+                // tool step: that workflow)
+                try r.gate.grants.addFor(tool, ctx.env, gate.grantKey(tool, d.subject), try dayWho(r, a), now_s + 86400);
                 if (r.grants_path) |p| r.gate.grants.save(r.io, p, now_s) catch {};
             },
             .deny => why = try ownerSaid(a, "denied by the owner", got.text, got.item),
@@ -2290,14 +2321,19 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             .withdrawn => why = try ownerSaid(a, if (r.env.stop.load(.acquire)) "stopped by the owner" else "withdrawn: no one is left to answer", "", got.item),
             .full => why = if (got.text.len > 0) got.text else "no place in the inbox until the turn's end",
             .answered => why = try ownerSaid(a, "not an answer to this question", "", got.item),
+            .deferred => {
+                why = try ownerSaid(a, "waits for the owner in the inbox", "", got.item);
+                logged = .ask;
+            },
         }
         // the owner saw those files and allowed a command all the same
         if (action == .allow) if (wrote) |wr| r.written.?.clear(wr.upto);
     }
+    const decision = @tagName(logged orelse action);
     if (dir.len > 0)
-        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = @tagName(action), .why = why, .arg = arg, .dir = dir })
+        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = decision, .why = why, .arg = arg, .dir = dir })
     else
-        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = @tagName(action), .why = why, .arg = arg });
+        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = decision, .why = why, .arg = arg });
     return if (action == .allow) null else why;
 }
 

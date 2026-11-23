@@ -856,7 +856,7 @@ pub fn reading(a: Allocator, tr: Trigger, check_model: []const u8) ![]const u8 {
             switch (tr.action) {
                 .do => |x| try out.print(a, ", a run of {s}: {s}", .{ tr.agent, util.cut(x, 200) }),
                 .say => |x| try out.print(a, ", no model call, says: {s}", .{x}),
-                .start => |x| try out.print(a, ", starts workflow {s} (workflows aren't built yet)", .{x}),
+                .start => |x| try out.print(a, ", starts workflow {s}", .{x}),
                 .none => {},
             }
             if (!std.mem.eql(u8, tr.to, "main")) try out.print(a, "; posts to {s}", .{tr.to});
@@ -911,8 +911,8 @@ pub fn reading(a: Allocator, tr: Trigger, check_model: []const u8) ![]const u8 {
             if (tr.max_events != 20) try out.print(a, ", {d} events a run", .{tr.max_events});
         },
         .say => |x| try out.print(a, " says: {s}", .{x}),
-        .start => |x| try out.print(a, " starts workflow {s} (workflows aren't built yet)", .{x}),
-        .none => try out.appendSlice(a, " is kept for workflows that wait on it (none yet)"),
+        .start => |x| try out.print(a, " starts workflow {s}, an instance each", .{x}),
+        .none => try out.appendSlice(a, " is kept for workflows that wait on it"),
     }
     if (!std.mem.eql(u8, tr.to, "main")) try out.print(a, "; posts to {s}", .{tr.to});
     try out.append(a, '.');

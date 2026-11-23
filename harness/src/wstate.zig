@@ -39,6 +39,9 @@ pub const Wait = struct {
     /// An event came: its fields, a JSON object, in `event`.
     got: bool = false,
     event: []const u8 = "",
+    /// An `approval`'s question, its SHA-256: the owner's answer goes to
+    /// that question alone when the call is decided again.
+    ask: []const u8 = "",
 };
 
 pub const State = struct {
@@ -75,7 +78,7 @@ pub const State = struct {
     pub fn clone(s: State, a: Allocator) !State {
         var o = s;
         inline for (.{ "name", "step", "call", "by", "agent", "input", "why", "values" }) |f| @field(o, f) = try a.dupe(u8, @field(s, f));
-        inline for (.{ "phase", "trigger", "event" }) |f| @field(o.wait, f) = try a.dupe(u8, @field(s.wait, f));
+        inline for (.{ "phase", "trigger", "event", "ask" }) |f| @field(o.wait, f) = try a.dupe(u8, @field(s.wait, f));
         return o;
     }
 
@@ -116,6 +119,8 @@ pub fn stateJson(a: Allocator, s: State) ![]const u8 {
     try util.jsonString(&out, a, s.wait.trigger);
     try out.print(a, ",\"since\":{d},\"got\":{},\"event\":", .{ s.wait.since, s.wait.got });
     try out.appendSlice(a, if (s.wait.event.len > 0) s.wait.event else "null");
+    try out.appendSlice(a, ",\"ask\":");
+    try util.jsonString(&out, a, s.wait.ask);
     try out.appendSlice(a, "},\"call\":");
     try util.jsonString(&out, a, s.call);
     inline for (.{ "by", "agent", "input" }) |f| {
@@ -152,6 +157,7 @@ pub fn parseState(a: Allocator, text: []const u8) ?State {
         s.wait.since = jv.int(jv.get(w, "since")) orelse 0;
         s.wait.got = jv.boolean(jv.get(w, "got")) orelse false;
         if (jv.get(w, "event")) |e| s.wait.event = std.json.Stringify.valueAlloc(a, e, .{}) catch return null;
+        s.wait.ask = jv.str(jv.get(w, "ask")) orelse "";
     }
     s.call = jv.str(jv.get(v, "call")) orelse "";
     s.by = jv.str(jv.get(v, "by")) orelse "owner";
@@ -359,7 +365,7 @@ pub const Instance = struct {
 /// `wait`, `inbox`, `retry`, `resume`, `stopped`, `done`, `failed`), whether it went
 /// well, and up to 2 KB of its result or why.
 pub const Entry = struct {
-    at: i64,
+    at: i64 = 0,
     step: []const u8 = "",
     try_n: u32 = 0,
     event: []const u8,
@@ -440,7 +446,7 @@ test "state_is_written_whole_and_read_back" {
         .try_n = 2,
         .steps = 5,
         .under_way = true,
-        .wait = .{ .kind = .event, .until = 1_800_000_000, .item = 41, .phase = "approve", .trigger = "issues", .since = 1_700_000_000, .got = true, .event = "{\"number\":42,\"title\":\"x\"}" },
+        .wait = .{ .kind = .event, .until = 1_800_000_000, .item = 41, .phase = "approve", .trigger = "issues", .since = 1_700_000_000, .got = true, .event = "{\"number\":42,\"title\":\"x\"}", .ask = "ab12" },
         .call = "{\"text\":\"hi\"}",
         .by = "trigger:issues",
         .agent = "main",
