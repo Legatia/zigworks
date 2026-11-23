@@ -23329,3 +23329,9 @@ test "a_flight_in_the_mail_goes_to_the_calendar_through_calmcps_cal_create_asked
     const inv = try butler.routineFiles(a, .invitation, try butler.pick(a, h, .{ .mail = true, .calendar = "calendar" }), "2026-11-23");
     try expectHas(inv.workflow, "tool calendar/cal_create {\"title\": \"{read.title}\", \"start\": \"{read.start}\", \"end\": \"{read.end}\", \"place\": \"{read.place}\"}");
 }
+
+// ---- health (the household spec's §5): medication reminders, bedtime ----
+
+test {
+    _ = @import("meds.zig");
+}

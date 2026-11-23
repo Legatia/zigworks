@@ -214,6 +214,11 @@ pub const Config = struct {
         /// A maps MCP server's travel-time tool, SERVER/TOOL; "": none
         /// (`travel` for every event).
         maps: []const u8 = "",
+        /// After it (the owner's time), the owner's first message of the
+        /// night gets one gentle line; null: off.
+        bedtime: ?u16 = null,
+        /// The evening message's time (the owner's); null: off.
+        evening: ?u16 = null,
     };
 };
 
@@ -476,7 +481,7 @@ fn setField(sec: anytype, l: Line) Error!void {
         if (std.mem.eql(u8, l.key, fname)) {
             if (comptime std.mem.eql(u8, fname, "utc_offset")) {
                 @field(sec.*, fname) = parseOffset(l.value) catch return error.BadConfig;
-            } else if (comptime std.mem.eql(u8, fname, "remind")) {
+            } else if (comptime std.mem.eql(u8, fname, "remind") or std.mem.eql(u8, fname, "bedtime") or std.mem.eql(u8, fname, "evening")) {
                 @field(sec.*, fname) = if (std.ascii.eqlIgnoreCase(l.value, "off")) null else parseClock(l.value) catch return error.BadConfig;
             } else if (comptime std.mem.eql(u8, fname, "quiet")) {
                 @field(sec.*, fname) = if (std.ascii.eqlIgnoreCase(l.value, "off")) null else parseQuiet(l.value) catch return error.BadConfig;
@@ -806,6 +811,8 @@ pub const defaults_ini =
     \\; calmcp = /usr/local/bin/calmcp     ; /setup calendar runs it; the same
     \\; travel = 30m                      ; how long before an event with a place the diary says it's time to leave
     \\; maps = maps/travel_time           ; a maps MCP server's tool that gives the travel time instead
+    \\; bedtime = 23:30                   ; after it, your first message of the night gets one gentle line (/bedtime)
+    \\; evening = 21:00                   ; one message about tomorrow (/evening): the first event, the weather, the car, bills, the inbox
     \\
     \\[voice_agent]                       ; Home Assistant's voice assistant answered by harness (README: Home Assistant's voice)
     \\; listen = 192.168.1.20:8765         ; for Home Assistant on another machine: this one's LAN address (default: this machine only)
@@ -1439,6 +1446,28 @@ test "butler_travel_maps_and_calmcp_read" {
     try t.expectEqualStrings("maps/travel_time", c.butler.maps);
     try t.expectEqualStrings("/opt/calmcp", c.butler.calmcp);
     try t.expectError(error.BadConfig, parse(a, "[butler]\nmaps = travel_time\n"));
+}
+
+test "butler_bedtime_and_evening_read" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // both off until set; harness init's file has them as comments
+    const d = try parse(a, "");
+    try t.expect(d.butler.bedtime == null);
+    try t.expect(d.butler.evening == null);
+    try t.expectEqualDeep(d.butler, (try parse(a, defaults_ini)).butler);
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "; bedtime = 23:30") != null);
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "; evening = 21:00") != null);
+    const c = try parse(a, "[butler]\nbedtime = 23:30\nevening = 21:00\n");
+    try t.expectEqual(@as(?u16, 23 * 60 + 30), c.butler.bedtime);
+    try t.expectEqual(@as(?u16, 21 * 60), c.butler.evening);
+    const off = try parse(a, "[butler]\nbedtime = off\nevening = off\n");
+    try t.expect(off.butler.bedtime == null and off.butler.evening == null);
+    for ([_][]const u8{ "24:00", "23.30", "11pm", "" }) |v| {
+        try t.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "[butler]\nbedtime = {s}\n", .{v})));
+        try t.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "[butler]\nevening = {s}\n", .{v})));
+    }
 }
 
 test "voice_agent_settings_read_and_checked" {
