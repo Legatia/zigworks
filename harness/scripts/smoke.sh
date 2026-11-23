@@ -3,7 +3,8 @@
 # other model providers, Telegram, feeds, search). No network, no real keys.
 # Usage: smoke.sh HARNESS HARNESS_FAKE
 set -u
-H=$1
+# absolute as well: a check runs it from another folder
+H=$(cd "$(dirname "$1")" && { pwd -W 2>/dev/null || pwd; })/$(basename "$1")
 # absolute: MCP servers start in a folder of their own (state/mcp/NAME)
 # (pwd -W under Git for Windows: D:/..., a path the Windows program can open)
 F=$(cd "$(dirname "$2")" && { pwd -W 2>/dev/null || pwd; })/$(basename "$2")
