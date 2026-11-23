@@ -17,6 +17,7 @@ const logins_mod = @import("logins.zig");
 const store_mod = @import("store.zig");
 const masks_mod = @import("masks.zig");
 const who_mod = @import("who.zig");
+const mail_mod = @import("mail.zig");
 const folders_mod = @import("folders.zig");
 const environments = @import("environments.zig");
 const sandbox = @import("sandbox.zig");
@@ -368,6 +369,8 @@ pub const Run = struct {
     conversation: []const u8 = "",
     /// Its conversation's /private switch, read when used.
     conv_private: ?*const std.atomic.Value(bool) = null,
+    /// Its conversation is one others read: no mail tool is offered.
+    no_mail: bool = false,
     /// What the per-turn context block says of the conversations
     /// ("Conversation: house-search (Telegram topic). Others: main.").
     context_note: []const u8 = "",
@@ -573,6 +576,8 @@ pub const Run = struct {
     /// `server/tool`, as definitions and narrowings name it.
     pub fn allowsMcp(r: *const Run, m: *const McpTool) bool {
         if (!r.allows(if (m.money) .money else .mcp)) return false;
+        // mail is the owner's: never for members, speech or where others read
+        if (mail_mod.isMailTool(m.tool) and (r.no_mail or who_mod.isHousehold(r.who.by))) return false;
         var buf: [160]u8 = undefined;
         const name = std.fmt.bufPrint(&buf, "{s}/{s}", .{ m.server.name, m.tool }) catch return false;
         if (!r.permits(name)) return false;

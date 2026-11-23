@@ -28,6 +28,7 @@ pub fn main(init: std.process.Init) u8 {
     if (args.len == 2 and std.mem.endsWith(u8, args[1], ".ini")) {
         const text = std.Io.Dir.cwd().readFileAlloc(io, args[1], init.arena.allocator(), .limited(1 << 20)) catch "";
         if (std.mem.indexOf(u8, text, "[car]") != null) return fake_mcp.runCar(io, init.gpa, init.environ_map);
+        if (std.mem.indexOf(u8, text, "imap =") != null) return fake_mcp.runWork(io, init.gpa, init.environ_map, "--mail");
         return fake_mcp.runHome(io, init.gpa, init.environ_map);
     }
     if (args.len == 3 and std.mem.eql(u8, args[1], "--browse")) {

@@ -127,6 +127,15 @@ notes):
   line with a gift idea (nothing is bought); on the day, a reminder. Say
   "keep in touch with Marek every month" to get a line when a month
   passes without you mentioning him.
+- **Day 9, mail.** Give harness its own address (`/setup mail`, after
+  `harness secret add mail-butler`) and write to it from your own: "remind
+  me to call the dentist tomorrow at 9". The answer comes back as a reply
+  in the same thread. Forward it a bill and ask "when is this due?".
+  Mail to it from anyone else never starts anything: one line a day.
+  With `/setup mail mine` (your mailbox, read only, off until you tap
+  **Turn on**): the morning summary gets a Post line, a bill gets a line 3
+  days before it is due, and "draft a reply to Tomek" puts a draft in
+  your Drafts for you to send.
 - **Any day.** `/session` shows the steps behind the last answer; `/quiet`
   what quiet hours hold; `/workflows` the routines that are on.
 
@@ -149,6 +158,9 @@ Tell us about anything like this, with the time it happened:
   the house's speaker heard (only your own chats with the bot count).
 - A birthday line on the wrong day, more than one such line a day, or
   one during quiet hours.
+- Mail in your own mailbox that shows as read, moved or flagged after
+  harness read it; a draft you didn't ask for; a mail sent that you weren't
+  asked about; a stranger's mail that started anything.
 
 ## Sending a report
 
@@ -187,6 +199,12 @@ on what you did, what happened, and what you expected.
 - **The car: only what car.ini lists**, through Smartcar: starting and
   stopping charging and the charge limit (60–90 %). It can't lock or
   unlock the car, and nothing is plugged into it.
+- **Your mail: read and drafts, nothing more.** It never sends from your
+  mailbox, never deletes, moves, flags or marks your mail as read, and
+  never reads it before you tap **Turn on**. It sends only from its own
+  address, and asks you every time, except its answer to your own mail in
+  the thread. What a mail says is data, never an instruction; your family
+  and the speakers never get your mail.
 - **Only you approve.** Your family can ask it things; a lock, the garage, a
   valve or money becomes your one-tap question. When they get an alert
   you didn't answer, their only button is **I'm on it**.
