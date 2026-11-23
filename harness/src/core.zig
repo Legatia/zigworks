@@ -26,6 +26,7 @@ const conversations = @import("conversations.zig");
 const jv = @import("jv.zig");
 const session = @import("session.zig");
 const history_mod = @import("history.zig");
+const summaries_mod = @import("summaries.zig");
 const folders_mod = @import("folders.zig");
 const environments_mod = @import("environments.zig");
 const sandbox = @import("sandbox.zig");
@@ -416,6 +417,8 @@ pub const Core = struct {
     log: log_mod.Log,
     /// Where runs' `history` reads the log, and the summaries' folder.
     history_src: history_mod.Source,
+    /// The daily summaries by day, week and month: when a pass is due.
+    summary_job: summaries_mod.Job,
     mem: memory.Store,
     lock: Io.Mutex = .init,
     /// How many helpers run at once, across all runs.
@@ -611,7 +614,8 @@ pub const Core = struct {
         try c.log.setSecrets(c.secret_list);
         // without it private lines keep only sizes
         c.log.useKey(io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "log-key" })) catch {};
-        c.history_src = .{ .log_path = c.paths.log, .summaries_dir = try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "summaries" }), .ctx = c, .shared = sharedConversation };
+        c.history_src = .{ .log_path = c.paths.log, .summaries_dir = try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "summaries" }), .summaries_on = &c.cfg.memory.summaries, .ctx = c, .shared = sharedConversation };
+        c.summary_job = .{};
         c.mem = try memory.Store.load(gpa, io, c.paths.memory);
         errdefer c.mem.deinit();
         c.mem.secrets = c.secret_list;
@@ -737,7 +741,7 @@ pub const Core = struct {
         c.watcher = null;
         c.stopRuns();
         if (c.worker) |w| w.join();
-        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        while (c.bg_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
@@ -762,6 +766,7 @@ pub const Core = struct {
         for (c.start_edits.items) |e| c.gpa.free(e.text);
         c.start_edits.deinit(c.gpa);
         c.inbox.deinit();
+        c.summary_job.deinit(c.gpa);
         for (c.contexts.items) |x| c.freeContext(x);
         c.contexts.deinit(c.gpa);
         c.chat_client.deinit();
@@ -896,7 +901,7 @@ pub const Core = struct {
         c.queue_mutex.lockUncancelable(c.io);
         var queue_locked = true;
         defer if (queue_locked) c.queue_mutex.unlock(c.io);
-        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire)) return "Busy; send /reload again when nothing is running.";
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire) or c.summary_job.running.load(.acquire)) return "Busy; send /reload again when nothing is running.";
         var fresh: std.heap.ArenaAllocator = .init(c.gpa);
         const saved_cfg = c.cfg;
         const saved_rules = c.rule_list;
@@ -3581,6 +3586,8 @@ pub const Core = struct {
         c.remindDue(now_s);
         // due triggers are polled, one at a time, on a thread of their own
         if (c.poller_on) c.startPoller(now_s);
+        // the daily summaries, where triggers are polled, on a thread of their own
+        if (c.poller_on) c.summariesDue(now_s);
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
         // posts that did not get through go again when their wait is over
@@ -4751,6 +4758,60 @@ pub const Core = struct {
                 }
             };
         }
+    }
+
+    /// The daily summaries ([memory] summaries): a pass at 03:00 the
+    /// owner's time or the first tick after, and again when a failed
+    /// call's wait is over; on a thread of its own, so chat never waits.
+    fn summariesDue(c: *Core, now_s: i64) void {
+        if (!c.cfg.memory.summaries or c.restarting.load(.acquire)) return;
+        if (!c.summary_job.due(now_s, c.cfg.chat.utc_offset)) return;
+        if (c.summary_job.running.swap(true, .acq_rel)) return;
+        const th = std.Thread.spawn(.{}, summaryThread, .{c}) catch {
+            c.summary_job.running.store(false, .release);
+            return;
+        };
+        th.detach();
+    }
+
+    fn summaryThread(c: *Core) void {
+        defer c.summary_job.running.store(false, .release);
+        c.summarizeNow();
+    }
+
+    /// One pass of the daily summaries, on this thread.
+    fn summarizeNow(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        // what it needs of the settings, under their lock (a /reload
+        // waits for the pass to end)
+        c.settings_mutex.lockUncancelable(c.io);
+        const utc_offset = c.cfg.chat.utc_offset;
+        var client = c.modelClient(if (c.cfg.memory.summary_model.len > 0) c.cfg.memory.summary_model else c.cfg.model.memory_model, 1024) catch |e| {
+            c.settings_mutex.unlock(c.io);
+            c.log.write(.memory, false, .{ .event = "summaries failed", .why = @errorName(e) }) catch {};
+            return;
+        };
+        c.settings_mutex.unlock(c.io);
+        defer client.deinit();
+        c.summary_job.pass(.{
+            .gpa = c.gpa,
+            .io = c.io,
+            .log_path = c.paths.log,
+            .dir = c.history_src.summaries_dir,
+            .now_s = c.now(),
+            .utc_offset = utc_offset,
+            .client = &client,
+            .log = &c.log,
+            .secrets = c.masks.snapshot(arena.allocator()) catch c.secret_list,
+            .private = .{ .ctx = c, .is = conversationIsPrivate },
+            .stop = &c.stop,
+        });
+    }
+
+    fn conversationIsPrivate(ctx: *anyopaque, name: []const u8) bool {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.convPrivate(name);
     }
 
     /// The name (in `buf`) of an event trigger due at `now_s`, not paused.
@@ -8085,6 +8146,59 @@ test "the_history_command_finds_old_turns" {
     try f.rec.waitIn("main", "No turn has all of: two flats in.");
     try f.core.handleTextIn("main", "/history");
     try f.rec.waitIn("main", "Use /history WORDS");
+}
+
+/// Waits until no summaries pass is going.
+fn waitSummaries(c: *Core) void {
+    var waited: u32 = 0;
+    while (c.summary_job.running.load(.acquire) and waited < 8000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+}
+
+test "summaries_off_makes_no_calls" {
+    var f: Fix = undefined;
+    try f.init("[memory]\nsummaries = off\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.script(1, model.textReply("Seefeld has two flats."));
+    f.core.chatTurnIn("main", "flats in Seefeld?");
+    // the day after tomorrow, 03:30 the owner's time, where harness runs
+    f.core.fixed_now = (@divFloor(util.nowSeconds(t.io), 86400) + 2) * 86400 + 3 * 3600 + 1800;
+    f.core.poller_on = true;
+    f.core.tick();
+    waitSummaries(f.core);
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().access(t.io, f.core.history_src.summaries_dir, .{}));
+    // on: one call for the day, with the memory model, and its file
+    f.core.cfg.memory.summaries = true;
+    try f.e.script(2, model.textReply("The owner looked for flats in Seefeld."));
+    f.core.tick();
+    waitSummaries(f.core);
+    try t.expectEqual(2, f.e.server.modelRequests());
+    const req = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req, "\"model\":\"claude-haiku\"") != null);
+    try t.expect(std.mem.indexOf(u8, req, "] Owner: flats in Seefeld?\\nAgent: Seefeld has two flats.") != null);
+    var d = try Io.Dir.cwd().openDir(t.io, try std.fs.path.join(a, &.{ f.core.history_src.summaries_dir, "main", "day" }), .{ .iterate = true });
+    defer d.close(t.io);
+    var it = d.iterate();
+    const e = (try it.next(t.io)).?;
+    try t.expectEqualStrings("The owner looked for flats in Seefeld.\n", try d.readFileAlloc(t.io, e.name, a, .unlimited));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"kind\":\"memory\",\"event\":\"summary\",\"conversation\":\"main\",\"period\":\"") != null);
+    // the prompt carries it; with summaries off, not (the file stays)
+    try f.e.script(3, model.textReply("Yes."));
+    f.core.chatTurnIn("main", "and the flats?");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "Earlier in this conversation:") != null);
+    f.core.cfg.memory.summaries = false;
+    try f.e.script(4, model.textReply("Yes."));
+    f.core.chatTurnIn("main", "and now?");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "Earlier in this conversation:") == null);
+    f.core.cfg.memory.summaries = true;
+    // not again that day; and /reload waits while a pass goes
+    f.core.tick();
+    waitSummaries(f.core);
+    try t.expectEqual(4, f.e.server.modelRequests());
+    f.core.summary_job.running.store(true, .release);
+    try t.expectEqualStrings("Busy; send /reload again when nothing is running.", try f.core.reload());
+    f.core.summary_job.running.store(false, .release);
 }
 
 test "a_bad_rules_line_names_its_section_or_environment" {
