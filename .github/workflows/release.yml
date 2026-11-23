@@ -1,6 +1,11 @@
 name: Release
 
 # Push a tag named <project>-v<version>, e.g. `trigrep-v0.2.0` or `headterm-v0.2.0`.
+# harness's package also holds TESTERS.md and its examples (the butler's
+# routines, the work morning); homemcp's and carcloud's hold their
+# stand-ins (homemcp-sim, carcloud-sim), so testers can try harness without
+# a home or a car. harness, homemcp and carcloud are built ReleaseSafe: they
+# hold secrets and act in homes, so their safety checks stay on.
 # headdesk is Linux only: its tag builds the two Linux binaries and nothing else;
 # its package also holds its test client, headdesk-testclient.
 # Builds static Linux binaries (x86_64, arm64) and an Apple Silicon macOS binary, and
@@ -10,7 +15,7 @@ name: Release
 # packages also hold its stand-in server, llmcheck-fake.
 on:
   push:
-    tags: ["trigrep-v*", "headterm-v*", "headsight-v*", "headsound-v*", "llmcheck-v*", "headdesk-v*"]
+    tags: ["trigrep-v*", "headterm-v*", "headsight-v*", "headsound-v*", "llmcheck-v*", "headdesk-v*", "harness-v*", "homemcp-v*", "carcloud-v*"]
 
 permissions:
   contents: read
@@ -44,7 +49,7 @@ jobs:
         run: |
           project="${GITHUB_REF_NAME%%-v*}"
           version="${GITHUB_REF_NAME#*-v}"
-          case "$project" in trigrep|headterm|headsight|headsound|llmcheck|headdesk) ;; *) echo "unknown project in tag: $project"; exit 1 ;; esac
+          case "$project" in trigrep|headterm|headsight|headsound|llmcheck|headdesk|harness|homemcp|carcloud) ;; *) echo "unknown project in tag: $project"; exit 1 ;; esac
           if [ "${{ matrix.name }}" = x86_64-windows ] && [ "$project" = headsight ]; then
             echo "SKIP=1" >> "$GITHUB_ENV"; exit 0
           fi
@@ -57,12 +62,16 @@ jobs:
           cd "$project"
           zig build test
           if [ "${{ matrix.target }}" = native ]; then target_flag=-Dcpu=apple_m1; else target_flag=-Dtarget=${{ matrix.target }}; fi
-          zig build -Doptimize=ReleaseFast -Dstrip=true $target_flag --prefix out
+          optimize=ReleaseFast
+          case "$project" in harness|homemcp|carcloud) optimize=ReleaseSafe ;; esac
+          zig build -Doptimize=$optimize -Dstrip=true $target_flag --prefix out
           pkg="$project-$version-${{ matrix.name }}"
           mkdir "$pkg"
           if [ "${{ matrix.name }}" = x86_64-windows ]; then
             cp out/bin/"$project".exe README.md LICENSE "$pkg"/
             if [ "$project" = llmcheck ]; then cp out/bin/llmcheck-fake.exe "$pkg"/; fi
+            if [ "$project" = harness ]; then cp -r TESTERS.md examples "$pkg"/; fi
+            if [ "$project" = homemcp ] || [ "$project" = carcloud ]; then cp out/bin/"$project"-sim.exe "$pkg"/; fi
             7z a "$pkg.zip" "$pkg" > /dev/null
             sha256sum "$pkg.zip" > "$pkg.zip.sha256"
             exit 0
@@ -72,6 +81,8 @@ jobs:
           fi
           cp out/bin/"$project" README.md LICENSE "$pkg"/
           if [ "$project" = llmcheck ]; then cp out/bin/llmcheck-fake "$pkg"/; fi
+          if [ "$project" = harness ]; then cp -r TESTERS.md examples "$pkg"/; fi
+          if [ "$project" = homemcp ] || [ "$project" = carcloud ]; then cp out/bin/"$project"-sim "$pkg"/; fi
           if [ "$project" = headdesk ]; then cp out/bin/headdesk-testclient "$pkg"/; fi
           tar czf "$pkg.tar.gz" "$pkg"
           shasum -a 256 "$pkg.tar.gz" > "$pkg.tar.gz.sha256"

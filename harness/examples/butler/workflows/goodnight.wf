@@ -1,0 +1,77 @@
+# Goodnight: when you say goodnight, or at a set time. Lights off, the
+# heating down for the night, and one tap before the door is locked.
+# /setup routines fills in the <...> parts with your devices. By hand: put
+# your device names (from home.ini) in their place; #if blocks stay or go
+# with what your home has.
+workflow goodnight
+about When you say goodnight (or at <goodnight at>): the lights off<night heating words><night lock words>.
+start owner, schedule:goodnight-at
+phrases goodnight, good night, night night
+tag no
+limits steps 20, days 1
+
+step night
+tools home/home_state, home/home_set
+do:
+  It is bedtime. Switch off every light that is on. <night heating instruction>
+  Don't touch anything else. Then answer in one short sentence what you did,
+  as the devices read back, with units, like: "Lights are off downstairs and
+  the heating is at 18 °C." If something didn't take, say so plainly.
+on fail goto night_failed
+
+step tell
+say {night}
+#if lock
+goto door
+#end
+#if !lock
+end
+#end
+
+step night_failed
+say The lights and the heating didn't change: {night.error}
+#if !lock
+end
+#end
+#if lock
+
+step door
+tool home/home_wait {"device": "<lock>", "property": "lock", "condition": "==", "value": "unlocked", "timeout_s": 0}
+on fail goto end_night
+if door has not within goto locked
+
+step ask
+approve The <lock label> is unlocked.
+yes Lock it
+no Leave it
+timeout 30m
+on deny goto left
+
+step lock
+tool home/home_guarded {"device": "<lock>", "action": "lock"}
+on fail goto lock_failed
+if lock starts done goto done
+
+step unsure
+say I sent it, but the <lock label> hasn't said it is locked: {lock}
+end
+
+step done
+say <Lock label> locked. Good night.
+end
+
+step lock_failed
+say The <lock label> didn't lock: {lock.error}
+end
+
+step left
+say <Lock label> left unlocked. Good night.
+end
+
+step locked
+say The <lock label> is locked. Good night.
+end
+
+step end_night
+end
+#end

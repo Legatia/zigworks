@@ -74,6 +74,9 @@ pub const Trigger = struct {
     /// A question the model answers yes or no about each event the rules passed.
     check: []const u8 = "",
     action: Action = .none,
+    /// `start = workflow NAME TEXT`: TEXT, its `{field}`s filled from the
+    /// event, is the instance's input; "": the event as text.
+    start_input: []const u8 = "",
     /// The definition a `do` runs.
     agent: []const u8 = "main",
     /// What a `do` run may use, within its definition's tools; null: all of them.
@@ -97,7 +100,7 @@ pub const Trigger = struct {
     /// A copy whose every slice is in `a`.
     pub fn clone(tr: Trigger, a: Allocator) !Trigger {
         var o = tr;
-        inline for (.{ "name", "json", "key", "check", "agent", "to", "added", "announce" }) |f| @field(o, f) = try a.dupe(u8, @field(tr, f));
+        inline for (.{ "name", "json", "key", "check", "agent", "to", "added", "announce", "start_input" }) |f| @field(o, f) = try a.dupe(u8, @field(tr, f));
         o.sources = try dupeList(a, tr.sources);
         if (tr.mcp) |m| o.mcp = .{ .server = try a.dupe(u8, m.server), .uri = try a.dupe(u8, m.uri), .tool = try a.dupe(u8, m.tool), .input = try a.dupe(u8, m.input) };
         const topics = try a.alloc(config.Topic, tr.topics.len);
@@ -430,9 +433,14 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
                 tr.action = .{ .say = v };
             } else {
                 const word = "workflow ";
-                const name = if (std.mem.startsWith(u8, v, word)) std.mem.trim(u8, v[word.len..], " \t") else "";
-                if (!workflowName(name)) return bad(diag, l.n, "start = workflow NAME (a-z, 0-9, - and _)");
+                const rest = if (std.mem.startsWith(u8, v, word)) std.mem.trim(u8, v[word.len..], " \t") else "";
+                const sp = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
+                const name = rest[0..sp];
+                if (!workflowName(name)) return bad(diag, l.n, "start = workflow NAME (a-z, 0-9, - and _), then the text it starts with, if any");
+                const input = std.mem.trim(u8, rest[sp..], " \t");
+                if (try unknownPlaceholder(a, input, k)) |why| return bad(diag, l.n, why);
                 tr.action = .{ .start = name };
+                tr.start_input = input;
             }
         } else if (std.mem.eql(u8, l.key, "agent")) {
             if (!agents.validName(v)) return bad(diag, l.n, "agent names a definition: a-z, 0-9 and -");
@@ -872,7 +880,10 @@ pub fn reading(a: Allocator, tr: Trigger, check_model: []const u8) ![]const u8 {
             switch (tr.action) {
                 .do => |x| try out.print(a, ", a run of {s}: {s}", .{ tr.agent, util.cut(x, 200) }),
                 .say => |x| try out.print(a, ", no model call, says: {s}", .{x}),
-                .start => |x| try out.print(a, ", starts workflow {s}", .{x}),
+                .start => |x| {
+                    try out.print(a, ", starts workflow {s}", .{x});
+                    if (tr.start_input.len > 0) try out.print(a, " with \"{s}\"", .{tr.start_input});
+                },
                 .none => {},
             }
             if (!std.mem.eql(u8, tr.to, "main")) try out.print(a, "; posts to {s}", .{tr.to});
@@ -928,7 +939,11 @@ pub fn reading(a: Allocator, tr: Trigger, check_model: []const u8) ![]const u8 {
             if (tr.max_events != 20) try out.print(a, ", {d} events a run", .{tr.max_events});
         },
         .say => |x| try out.print(a, " says: {s}", .{x}),
-        .start => |x| try out.print(a, " starts workflow {s}, an instance each", .{x}),
+        .start => |x| {
+            try out.print(a, " starts workflow {s}", .{x});
+            if (tr.start_input.len > 0) try out.print(a, " with \"{s}\"", .{tr.start_input});
+            try out.appendSlice(a, ", an instance each");
+        },
         .none => try out.appendSlice(a, " is kept for workflows that wait on it"),
     }
     if (tr.announce.len > 0) try out.print(a, "; says it on the house's speakers: {s}", .{tr.announce});
@@ -1022,6 +1037,7 @@ pub fn tasksOf(a: Allocator, list: []const Trigger) ![]config.Task {
                 .start => |x| x,
                 else => "",
             },
+            .start_input = tr.start_input,
             .to = tr.to,
             .agent = tr.agent,
             .in_triggers = tr.file == .triggers,
@@ -1276,4 +1292,23 @@ test "a_trigger_never_polls_what_speaks" {
     const a = arena.allocator();
     // a poll would say it every time, at night too: announce = TEXT says a line per event
     try refused(a, "[x]\nmcp = home/announce {\"message\":\"hi\"}\nsay = x\n", 2, "announce speaks aloud: a trigger doesn't poll it");
+}
+
+test "start_takes_text_for_the_input" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const door = try parseOne(a, "[door-back_door]\nmcp = home resource home://device/back_door\nmatch = to is open\nstart = workflow door-open Back door ({room})\n");
+    try t.expectEqualStrings("door-open", door.action.start);
+    try t.expectEqualStrings("Back door ({room})", door.start_input);
+    try t.expectEqualStrings("Back door ({room})", (try door.clone(a)).start_input);
+    // filled from the event, as say is
+    try t.expectEqualStrings("Back door (Kitchen)", try fill(a, door.start_input, &.{.{ .name = "room", .value = "Kitchen" }}));
+    const plain = try parseOne(a, "[d]\nsearch = zig\nstart = workflow w\n");
+    try t.expectEqualStrings("w", plain.action.start);
+    try t.expectEqualStrings("", plain.start_input);
+    // a field the source doesn't give is refused, as in say
+    try refused(a, "[x]\nsearch = z\nstart = workflow w about {nope}\n", 3, "{nope} is no field of a search event");
+    // the reading says it
+    try t.expect(std.mem.indexOf(u8, try reading(a, door, "claude-haiku"), "starts workflow door-open with \"Back door ({room})\"") != null);
 }

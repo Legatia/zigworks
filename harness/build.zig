@@ -16,6 +16,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = target.result.os.tag == .macos,
     });
     mod.addOptions("build_options", options);
+    // the butler's routines (examples/butler/), built in
+    const butler_files = b.createModule(.{ .root_source_file = b.path("examples/butler/files.zig") });
+    mod.addImport("butler_files", butler_files);
     linkSystem(mod, target);
     const exe = b.addExecutable(.{ .name = "harness", .root_module = mod });
     b.installArtifact(exe);
@@ -46,6 +49,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = target.result.os.tag == .macos,
     });
     test_mod.addOptions("build_options", test_options);
+    test_mod.addImport("butler_files", butler_files);
     linkSystem(test_mod, target);
     // -Dtest-filter=NAME (more than once for more): only the unit tests whose name has it
     const filters = b.option([]const []const u8, "test-filter", "Run only the unit tests whose names contain this") orelse &.{};

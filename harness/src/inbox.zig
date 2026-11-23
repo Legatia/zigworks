@@ -622,9 +622,20 @@ fn parseItem(gpa: std.mem.Allocator, v: jv.Value) !*Item {
 
 // ---- what the owner reads ----
 
-/// The head of an item's message: "Allow this? [41]", "Question [44]" …
+/// Kinds whose message is their text alone, under no head: a routine's
+/// one-tap question (`confirm`, an approve step with yes), setup's
+/// questions (`setup`) and the routines offered (`routine`). Their buttons
+/// name what they do.
+pub fn plain(kind: []const u8) bool {
+    for ([_][]const u8{ "confirm", "setup", "routine" }) |k| if (std.mem.eql(u8, k, kind)) return true;
+    return false;
+}
+
+/// The head of an item's message: "Allow this? [41]", "Question [44]" …;
+/// "" for a plain kind.
 fn headOf(a: std.mem.Allocator, it: *const Item) ![]const u8 {
     const eql = std.mem.eql;
+    if (plain(it.kind)) return "";
     if (eql(u8, it.kind, "approval")) return std.fmt.allocPrint(a, "Allow this? [{d}]", .{it.id});
     if (eql(u8, it.kind, "question")) return std.fmt.allocPrint(a, "Question [{d}]", .{it.id});
     if (eql(u8, it.kind, "draft")) return std.fmt.allocPrint(a, "Draft to review [{d}]", .{it.id});
@@ -668,8 +679,15 @@ pub fn messageParts(a: std.mem.Allocator, it: *const Item) ![]const []const u8 {
     const out = try a.alloc([]const u8, pieces.items.len);
     for (pieces.items, out, 1..) |p, *o, i| {
         const last = i == pieces.items.len;
+        const tail: []const u8 = if (last and hint.len > 0) try std.fmt.allocPrint(a, "\n{s}", .{hint}) else "";
+        if (head.len == 0) {
+            // a plain kind: its text, counted when it takes several
+            const counted = if (pieces.items.len > 1) try std.fmt.allocPrint(a, "({d}/{d})\n", .{ i, pieces.items.len }) else "";
+            o.* = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ counted, p, tail });
+            continue;
+        }
         const counted = if (pieces.items.len > 1) try std.fmt.allocPrint(a, " ({d}/{d})", .{ i, pieces.items.len }) else "";
-        o.* = try std.fmt.allocPrint(a, "{s}{s}\n{s}{s}{s}", .{ head, counted, p, if (last and hint.len > 0) "\n" else "", if (last) hint else "" });
+        o.* = try std.fmt.allocPrint(a, "{s}{s}\n{s}{s}", .{ head, counted, p, tail });
     }
     return out;
 }
@@ -709,6 +727,12 @@ pub fn outcome(a: std.mem.Allocator, it: *const Item, utc_offset: i32) ![]const 
                 break :blk std.fmt.allocPrint(a, "denied{s}, {s}", .{ if (has_text) " with your reason" else "", hm });
             }
             if (eql(u8, key, "text")) break :blk std.fmt.allocPrint(a, "answered in words, {s}", .{hm});
+            // a plain kind's outcome is its button's own words
+            if (plain(it.kind)) if (it.choiceLabel(key)) |label| {
+                const said = try a.dupe(u8, label);
+                if (said.len > 0) said[0] = std.ascii.toLower(said[0]);
+                break :blk std.fmt.allocPrint(a, "{s}, {s}", .{ said, hm });
+            };
             if (eql(u8, key, "use")) break :blk std.fmt.allocPrint(a, "{s}, {s}", .{ if (has_text) "replaced with your version" else "used as it is", hm });
             if (eql(u8, key, "drop")) break :blk std.fmt.allocPrint(a, "dropped, {s}", .{hm});
             if (eql(u8, key, "dismiss")) break :blk std.fmt.allocPrint(a, "dismissed, {s}", .{hm});
@@ -1105,4 +1129,39 @@ test "press_data_carries_id_token_and_key" {
     try t.expectEqualStrings("i9223372036854775808-0123456789abcdef:dismiss", data);
     try t.expect(data.len <= 64);
     try t.expectEqual(it.id, Press.parse(data).?.id);
+}
+
+test "plain_kinds_show_their_text_alone" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = try testBox(try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(t.io, ".", a), "inbox" }));
+    defer b.deinit();
+    b.next = 50;
+    // a routine's one-tap question: its text and its buttons, no head
+    const c = try b.add(.{ .kind = "confirm", .title = "Water under the kitchen sink.", .body = "Water under the kitchen sink.", .choices = &.{ .{ .key = "approve", .label = "Close the water main" }, .{ .key = "deny", .label = "Ignore" } } }, test_now, test_token);
+    try t.expectEqualStrings("Water under the kitchen sink.", (try messageParts(a, c))[0]);
+    // its outcome is the button's own words
+    b.close(c, .answered, .{ .key = "approve", .at = test_now, .via = .telegram });
+    try t.expectEqualStrings("close the water main, 14:03", try outcome(a, c, 0));
+    try t.expectEqualStrings("Already answered: close the water main, 14:03.", try already(a, c, 0));
+    // setup's questions and the routines' offers too
+    for ([_][]const u8{ "setup", "routine" }) |kind| {
+        const s = try b.add(.{ .kind = kind, .title = "I found 15 devices in 5 rooms.", .body = "I found 15 devices in 5 rooms.\nI'll switch lights.", .choices = &.{ .{ .key = "yes", .label = "Looks right" }, .{ .key = "change", .label = "Change it" } } }, test_now, test_token);
+        try t.expectEqualStrings("I found 15 devices in 5 rooms.\nI'll switch lights.", (try messageParts(a, s))[0]);
+        // /inbox still lists it with its number
+        try t.expect(std.mem.startsWith(u8, try listLine(a, s, test_now), try std.fmt.allocPrint(a, "[{d}] {s}, main, just now: I found 15 devices", .{ s.id, kind })));
+    }
+    // a long one: counted parts, still no head
+    var long: std.ArrayList(u8) = .empty;
+    for (0..150) |i| try long.print(a, "line {d:0>3} {s}\n", .{ i, &@as([50]u8, @splat('y')) });
+    const big = try b.add(.{ .kind = "setup", .title = "long", .body = long.items }, test_now, test_token);
+    const parts = try messageParts(a, big);
+    try t.expectEqual(3, parts.len);
+    try t.expect(std.mem.startsWith(u8, parts[0], "(1/3)\nline 000"));
+    // a question keeps its head
+    const q = try b.add(.{ .kind = "question", .title = "Which?", .body = "Which?" }, test_now, test_token);
+    try t.expect(std.mem.startsWith(u8, (try messageParts(a, q))[0], "Question ["));
 }

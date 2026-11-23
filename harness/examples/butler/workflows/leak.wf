@@ -1,0 +1,44 @@
+# A leak: water where it shouldn't be. Urgent, so it comes through quiet
+# hours; one tap closes the water main. It never opens it.
+workflow leak
+about Water where it shouldn't be: says where at once, even at night<valve words>.
+start <leak starts>
+urgent yes
+tag no
+limits steps 10, days 1
+#if valve
+
+step ask
+approve Water leak: {input}.
+yes Close the <valve label>
+no Ignore
+timeout 2h
+on deny goto ignored
+
+step close
+tool home/home_guarded {"device": "<valve>", "action": "<valve action>"}
+on fail goto failed
+if close starts done goto closed
+
+step unsure
+say I sent it, but the <valve label> hasn't said it is closed: {close}
+end
+
+step closed
+say <Valve label> closed (it reports closed).
+end
+
+step failed
+say The <valve label> didn't close: {close.error}
+end
+
+step ignored
+say <Valve label> left open.
+end
+#end
+#if !valve
+
+step tell
+say Water leak: {input}.
+end
+#end

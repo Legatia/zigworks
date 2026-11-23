@@ -179,6 +179,10 @@ pub const Config = struct {
         /// Quiet hours, the owner's time: posts of runs nobody waits on
         /// are held for a digest at their end; null: off until set.
         quiet: ?Quiet = null,
+        /// homemcp's and carcloud's programs for /setup; "": next to
+        /// harness, else on PATH.
+        homemcp: []const u8 = "",
+        carcloud: []const u8 = "",
     };
 };
 
@@ -564,13 +568,15 @@ pub const Task = struct {
     /// (no model call), or start a workflow (its name).
     say: []const u8 = "",
     start: []const u8 = "",
+    /// The text a schedule's workflow starts with (`start = workflow NAME TEXT`).
+    start_input: []const u8 = "",
     /// It is a schedule of triggers.ini, not a task of tasks.ini.
     in_triggers: bool = false,
 
     /// A copy whose every slice is in `a` (a background run's own).
     pub fn clone(tk: Task, a: std.mem.Allocator) !Task {
         var o = tk;
-        inline for (.{ "name", "do", "to", "agent", "say", "start" }) |f| @field(o, f) = try a.dupe(u8, @field(tk, f));
+        inline for (.{ "name", "do", "to", "agent", "say", "start", "start_input" }) |f| @field(o, f) = try a.dupe(u8, @field(tk, f));
         return o;
     }
 };
@@ -699,6 +705,8 @@ pub const defaults_ini =
     \\
     \\[butler]
     \\; quiet = 22:00-07:00                ; quiet hours, your time: posts of schedules, triggers and workflows wait for a digest
+    \\; homemcp = /usr/local/bin/homemcp   ; /setup home runs it; default: next to harness, else on PATH
+    \\; carcloud = /usr/local/bin/carcloud ; /setup car runs it; the same
     \\
     \\[voice_agent]                       ; Home Assistant's voice assistant answered by harness (README: Home Assistant's voice)
     \\; listen = 192.168.1.20:8765         ; for Home Assistant on another machine: this one's LAN address (default: this machine only)

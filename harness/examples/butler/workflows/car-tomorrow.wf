@@ -1,0 +1,56 @@
+# The car for tomorrow: in the evening, a line when the car is low, and one
+# tap to start charging when it is plugged in but not charging.
+workflow car-tomorrow
+about At <car at>: tells you when the car is under half and not plugged in, and asks with one tap to start charging when it is plugged in but not charging.
+start owner, schedule:car-evening
+tag no
+limits steps 10, days 1
+
+step status
+tool car/car_status {}
+retry 1 wait 10m
+
+step read
+answer json
+tools none
+do:
+  The car's status, read just now, is in the data below. Answer only JSON:
+  {"line": "...", "low": true or false, "plugged": true or false, "charging": true or false}
+  "line": one short sentence with the battery (%), the range (km) and
+  whether it is plugged in or charging, like "Car 34 %, 150 km, not plugged in."
+  "low": true when the battery is under 50 %.
+  The car's status: {status}
+if read.low is false goto fine
+if read.charging is true goto fine
+if read.plugged is false goto plug
+
+step ask
+approve {read.line}
+yes Start charging
+no Leave it
+timeout 2h
+on deny goto fine
+
+step charge
+tool car/car_command {"command": "charge_start"}
+on fail goto charge_failed
+if charge starts done goto charging
+
+step charge_unsure
+say I asked the car to charge; it hasn't confirmed: {charge}
+end
+
+step charging
+say Charging started.
+end
+
+step charge_failed
+say The car didn't start charging: {charge.error}
+end
+
+step plug
+say {read.line} Plug it in for tomorrow.
+end
+
+step fine
+end

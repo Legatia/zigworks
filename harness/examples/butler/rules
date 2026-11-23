@@ -1,0 +1,41 @@
+# The butler's lines in rules. /setup home adds the first part, /setup car
+# the second, and /setup routines the lines of the routines you turn on.
+
+# the home: reading it needs no question; what you ask for switches what
+# home.ini allows (locks, the garage and valves stay asked every time:
+# home_guarded is a money tool in mcp.ini)
+allow mcp home/home_state *
+allow mcp home/home_wait *
+[owner]
+allow mcp home/home_set *
+[all]
+
+# the car: reading it needs no question; charging and the charge limit
+# when you ask. car.ini (as /setup car writes it) allows car_command only
+# charge_start, charge_stop and charge_limit (60-90 %): carcloud refuses the
+# rest, locking and unlocking among them. That list is what bounds the
+# allow line below; never pair it with an ask or deny for part of the same
+# tool (the gate matches the call's JSON as written, so a space or another
+# key order would slip past the ask): add lock to car.ini and it is unasked.
+allow mcp car/car_status *
+[owner]
+allow mcp car/car_command *
+[all]
+
+# goodnight: its run switches the lights and the heating
+[workflow:goodnight/night]
+allow mcp home/home_set *
+[all]
+
+# arriving: the heating back up, this call alone (exact, its keys in
+# order, so it matches however the gate reads JSON; any other call is asked)
+[workflow:arriving/heat]
+allow mcp home/home_set {"action":"temperature","device":"<thermostat>","value":"<home temp>"}
+[all]
+
+# the morning summary: a calendar is read, never changed
+[workflow:morning-home/read]
+allow mcp calendar/list*
+allow mcp calendar/get*
+allow mcp calendar/search*
+[all]

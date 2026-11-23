@@ -1,0 +1,21 @@
+# The morning summary, as quiet hours end (what they held comes just
+# before it, as the digest): the car, today's calendar, the weather and
+# the house, in a few lines.
+workflow morning-home
+about At <morning at>, as quiet hours end: <morning parts>, in a few lines.
+start owner, schedule:morning-home-at
+tag no
+limits steps 5, days 1
+
+step read
+tools <morning tools>
+do:
+  It is morning. Read <morning parts> and write the owner's morning message
+  from them: at most four short lines, plain words with units, no greeting,
+  no tool names. Only what matters today: the car's battery, range and
+  whether it is plugged in; today's events with their times; the weather
+  (temperature, rain); doors or windows open, lights on, the heating. Leave
+  out what can't be read.
+
+step tell
+say {read}
