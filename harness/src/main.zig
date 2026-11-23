@@ -2671,6 +2671,7 @@ test {
     _ = @import("wstate.zig");
     _ = @import("voice.zig");
     _ = @import("quiet.zig");
+    _ = @import("diary.zig");
     _ = @import("household.zig");
     _ = @import("butler.zig");
     _ = @import("doctor.zig");

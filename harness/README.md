@@ -17,7 +17,10 @@ at home can speak to Home Assistant's voice satellites and hear it
 answer (Home Assistant's voice, below), and with Home Assistant (through
 homemcp) and a car on Smartcar (through carcloud) it runs a home: set up
 in the chat, with routines that ask with one tap before a lock or a valve
-(Home butler, below).
+(Home butler, below). With your calendar (through calmcp) it keeps the
+day: today's events in the morning summary, when to leave, a note before
+a meeting, posts held while you're busy, and changes only when you say
+(The diary, below).
 Every action it takes, and every
 action of its helpers, passes one gate and is written to one log you can
 check.
@@ -43,7 +46,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 971 unit tests (20 of them
+**State: 0.3.0, tested on macOS by its own tests: 988 unit tests (20 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
 and an end-to-end script of 101 checks that drives the real binary against
@@ -55,7 +58,9 @@ and carcloud built (HOMEMCP_BIN, CARCLOUD_BIN), 21 more: an event pushed
 by homemcp, and the butler's setup in the chat and each routine, against
 homemcp-sim and carcloud-sim (stand-ins for Home Assistant and Smartcar),
 and Home Assistant asking the voice agent (a test client sending what its
-llama.cpp integration sends).
+llama.cpp integration sends); with calmcp built (CALMCP_BIN), 5 more:
+`/setup calendar` and a change asked and made, against calmcp-sim (a
+stand-in CalDAV server). The diary has not met a real calendar yet.
 An earlier build of 0.3.0 also passed its tests in CI on Linux and
 Windows. On Windows 11 the browser and login
 tests also run, against Chrome 157, and the console, lock, Credential
@@ -799,6 +804,59 @@ Workflows), and no answer means nothing happens. The files are in
 [examples/butler](examples/butler/), built into harness; where the setup
 is, `/setup`. Where homemcp and carcloud are: `[butler] homemcp =` and
 `carcloud =` in config.ini, else next to harness, else on PATH.
+
+### The diary
+
+With [calmcp](../calmcp/) (CalDAV: iCloud, Fastmail, Nextcloud, Google),
+harness reads your calendar and changes it when you ask.
+
+```
+harness secret add caldav  # an app password (iCloud, Fastmail, Nextcloud); Google: an OAuth token
+```
+
+then in the chat **`/setup calendar ADDRESS USER`**, like `/setup calendar
+https://caldav.fastmail.com you@fastmail.com` (iCloud:
+`https://caldav.icloud.com`, Nextcloud: `https://HOST/remote.php/dav`). It
+runs `calmcp discover` and shows calendar.ini as it would be written: every
+calendar read, the server's calendar for new events the one that may
+change. One message says which, and the next event. [Looks right] [Change
+it]; `/setup calendar change NAME` and `/setup calendar read NAME` move a
+calendar between the two. **Looks right** writes calendar.ini, mcp.ini's
+`[calendar]` and the calendar's lines of `rules` (reading needs no
+question), each shown first, then `/reload`. calmcp's changes (`cal_create`,
+`cal_move`, `cal_cancel`, `cal_reply`) are money tools there: asked every
+time, never granted for a day, never given to helpers, refused from
+schedules, triggers and workflows. With the morning summary on, it is
+offered again, to list today's events.
+
+- **The morning summary** lists today's events with their times, read with
+  `cal_agenda`; its step is given no tool that changes the calendar.
+- **Time to leave.** For an event with a place (not a call or a link), at
+  its start less `[butler] travel` (30 minutes): "Time to leave for Dentist
+  at 10:30: Dental clinic, ul. Długa 5, Kraków (about 30 min away)." With
+  `[butler] maps = SERVER/TOOL`, a maps MCP server's travel time to that
+  place, asked with `{"destination", "arrival"}`, instead.
+- **Before a meeting.** 30 minutes before an event with people: when and
+  where, who, the last time each came up in your own conversations (long
+  memory's search of the log; never members', schedules' or private
+  turns), and the event's links.
+- **Busy means quiet.** While you are in an event the calendar shows as
+  busy, the posts of runs nobody waits on wait as in quiet hours and come
+  in one digest when it ends ("While you were at Dentist (10:30–11:30):");
+  urgent ones and replies to you go at once. Events shown as free,
+  declined or all day don't count; back-to-back events are one wait.
+- **Changes are asked.** For "move the dentist to Friday" the model reads
+  the event and proposes the change; the question is the exact call (the
+  event's id, its title and its start now, and the new start), which
+  calmcp checks against the calendar before writing and reads back after.
+  harness never accepts or declines an invitation on its own.
+
+The diary reads calmcp's `cal://upcoming` (today and tomorrow, as data)
+every 10 minutes and after `/reload`. Its lines go to main at their
+minute, through quiet hours (without a sound) and busy events, once each:
+`state/diary` keeps the ones said for two days, and each is a `diary` line
+(kind `chat`) in the log. Where calmcp is: `[butler] calmcp =`, else next
+to harness, else on PATH.
 
 **`harness doctor`** says, a line each, whether `harness run` runs, the
 settings files read, the bot answers and you are paired, the model answers
@@ -2151,6 +2209,10 @@ it goes at once, without a sound.
   urgent; a workflow an urgent trigger starts is urgent only if it says
   so. Harness's reading of a proposed trigger or workflow says when it is
   urgent.
+- **Busy in the calendar.** With the calendar connected (The diary,
+  under Home butler), a busy event holds the same posts and questions until
+  it ends, and the digest then starts "While you were at …". The house's
+  speakers go by quiet hours alone.
 - **The house's speakers.** During quiet hours only urgent triggers and
   workflows speak aloud (homemcp's `announce`, a trigger's `announce`
   line); the rest of what runs nobody watches says nothing aloud, and

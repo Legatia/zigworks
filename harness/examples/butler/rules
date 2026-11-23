@@ -33,9 +33,15 @@ allow mcp home/home_set *
 allow mcp home/home_set {"action":"temperature","device":"<thermostat>","value":"<home temp>"}
 [all]
 
-# the morning summary: a calendar is read, never changed
+# the morning summary: the calendar is read (calmcp's cal_agenda), never
+# changed (its changes are asked every time, and never offered to the step)
 [workflow:morning-home/read]
-allow mcp calendar/list*
-allow mcp calendar/get*
-allow mcp calendar/search*
+allow mcp calendar/cal_agenda *
 [all]
+
+# the calendar: reading it needs no question; its changes (cal_create,
+# cal_move, cal_cancel, cal_reply) are money tools in mcp.ini, asked every
+# time, and calmcp's file says in which calendars they may be made
+allow mcp calendar/cal_agenda *
+allow mcp calendar/cal_free *
+allow mcp calendar/cal_event *

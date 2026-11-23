@@ -813,7 +813,7 @@ fn sensorList(a: Allocator, list: []const Device, one_of: []const u8) ![]const u
 fn morningParts(a: Allocator, p: Picks, tools: bool) ![]const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
     if (p.car) try parts.append(a, if (tools) "the car (car/car_status)" else "the car");
-    if (p.calendar.len > 0) try parts.append(a, if (tools) try std.fmt.allocPrint(a, "today's calendar ({s}/*)", .{p.calendar}) else "today's calendar");
+    if (p.calendar.len > 0) try parts.append(a, if (tools) try std.fmt.allocPrint(a, "today's calendar ({s}/cal_agenda)", .{p.calendar}) else "today's calendar");
     if (p.search and p.town.len > 0) try parts.append(a, if (tools) try std.fmt.allocPrint(a, "today's weather in {s} (search)", .{p.town}) else try std.fmt.allocPrint(a, "the weather in {s}", .{p.town}));
     try parts.append(a, if (tools) "the house (home/home_state)" else "the house");
     return andList(a, parts.items);
@@ -1035,7 +1035,8 @@ fn commonValues(a: Allocator, p: Picks) ![]Value {
     try tools.append(a, "home/home_state");
     if (p.car) try tools.append(a, "car/car_status");
     if (p.search and p.town.len > 0) try tools.append(a, "search");
-    if (p.calendar.len > 0) try tools.append(a, try std.fmt.allocPrint(a, "{s}/*", .{p.calendar}));
+    // the calendar is read, never changed: its changes are not offered to a scheduled step
+    if (p.calendar.len > 0) try tools.append(a, try std.fmt.allocPrint(a, "{s}/cal_agenda", .{p.calendar}));
     try v.append(a, .{ .key = "morning tools", .value = try std.mem.join(a, ", ", tools.items) });
     // the start lines of the routines a trigger per sensor starts
     var leak_starts: std.ArrayList([]const u8) = .empty;
@@ -1404,7 +1405,10 @@ test "routines_fill_from_the_sims_home" {
     try t.expect(std.mem.indexOf(u8, lk.workflow, "yes Close the water main") != null);
     try t.expect(std.mem.indexOf(u8, lk.workflow, "tool home/home_guarded {\"device\": \"water_main\", \"action\": \"close\"}") != null);
     const mh = try routineFiles(a, .@"morning-home", p, "2026-11-23");
-    try t.expect(std.mem.indexOf(u8, mh.workflow, "tools home/home_state, car/car_status, search, calendar/*") != null);
+    // a scheduled step reads the calendar and is given no tool that changes it
+    try t.expect(std.mem.indexOf(u8, mh.workflow, "tools home/home_state, car/car_status, search, calendar/cal_agenda\n") != null);
+    try t.expect(std.mem.indexOf(u8, mh.rules, "[workflow:morning-home/read]\nallow mcp calendar/cal_agenda *\n[all]") != null);
+    try t.expect(std.mem.indexOf(u8, mh.workflow, "every event of today with its time") != null);
     try t.expect(std.mem.indexOf(u8, mh.workflow, "Read the car, today's calendar, the weather in Kraków and the house") != null);
     // the sentences setup offers them with
     try t.expectEqualStrings("Goodnight: when you say goodnight, or at 21:45, I switch off the lights, set the heating to 18 °C and ask with one tap before locking the front door.", try Routine.goodnight.sentence(a, p));
