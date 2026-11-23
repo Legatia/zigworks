@@ -17,6 +17,7 @@ const remote = @import("remote.zig");
 const folders = @import("folders.zig");
 const inbox_mod = @import("inbox.zig");
 const model = @import("model.zig");
+const undo_mod = @import("undo.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -924,7 +925,7 @@ fn runCmd(app: *App) !Exit {
                 }) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
                 .callback => |cb| {
                     tc.answer(cb.id);
-                    c.handleCallbackIn(cb.from_id, cb.chat_id, cb.thread, cb.message_id, cb.data);
+                    c.handleCallbackText(cb.from_id, cb.chat_id, cb.thread, cb.message_id, cb.data, cb.text);
                 },
             }
         }
@@ -973,10 +974,14 @@ const TermChan = struct {
             outPrint(tc.io, "{s}{s}\n", .{ tc.tag(&tb, place), text }) catch {};
             return 0;
         }
-        // quick replies: type one (a press is a message here)
-        if (bs.len > 0 and bs[0][1].len > 0 and bs[0][1][0] == 'r') {
+        // quick replies: type one (a press is a message here); a run's
+        // Undo: typed as /undo RUN
+        if (bs.len > 0 and bs[0][1].len > 0 and (bs[0][1][0] == 'r' or bs[0][1][0] == 'u')) {
             outPrint(tc.io, "{s}{s}\n", .{ tc.tag(&tb, place), text }) catch {};
-            for (bs) |b| outPrint(tc.io, "  > {s}\n", .{b[0]}) catch {};
+            for (bs) |b| {
+                var lb: [64]u8 = undefined;
+                outPrint(tc.io, "{s}\n", .{termButton(&lb, b)}) catch {};
+            }
             return 0;
         }
         // only the answers this question has: money has no 24 h
@@ -1001,6 +1006,13 @@ const TermChan = struct {
         return 0;
     }
 };
+
+/// How the terminal shows a post's button: a quick reply to type
+/// ("  > Yes"), or a run's Undo as its command ("/undo 41").
+fn termButton(buf: []u8, b: [2][]const u8) []const u8 {
+    if (undo_mod.runOf(b[1])) |run| return std.fmt.bufPrint(buf, "/undo {d}", .{run}) catch "/undo";
+    return std.fmt.bufPrint(buf, "  > {s}", .{util.cut(b[0], buf.len - 4)}) catch b[0];
+}
 
 /// The keys for an item's buttons ("[o] allow once  [n] deny"): an
 /// approval's by what each answers, another item's by their place
@@ -2111,6 +2123,7 @@ test {
     _ = @import("sandbox.zig");
     _ = @import("remote.zig");
     _ = @import("snapshots.zig");
+    _ = @import("undo.zig");
     _ = @import("sock.zig");
     _ = @import("store.zig");
     _ = @import("scrub.zig");
@@ -2243,6 +2256,12 @@ test "log_runs_and_log_session_read_runs_back" {
     try t.expect(badArgs(&.{ "log", "session" }) != null);
     try t.expect(badArgs(&.{ "log", "session", "x" }) != null);
     try t.expect(badArgs(&.{ "log", "runs", "x" }) != null);
+}
+
+test "the_terminal_shows_a_runs_undo_as_its_command" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("/undo 41", termButton(&buf, .{ "Undo", "u41-0123456789abcdef" }));
+    try std.testing.expectEqualStrings("  > Yes", termButton(&buf, .{ "Yes", "r3-abc:1" }));
 }
 
 test "the_terminal_offers_only_the_answers_the_question_has" {

@@ -138,6 +138,8 @@ pub const UndoFolder = struct {
     /// The files put back (old content, made again, or removed), from the
     /// workspace (`notes/a.md`).
     undone: []const []const u8 = &.{},
+    /// Those of `undone` the run had made, so removed.
+    removed: []const []const u8 = &.{},
     /// The files changed since the run, left as they are (a database is
     /// named for its side files too).
     left: []const []const u8 = &.{},
@@ -512,6 +514,7 @@ pub const Store = struct {
         }
         res.snapshot = first.id;
         var undone: std.ArrayList([]const u8) = .empty;
+        var removed: std.ArrayList([]const u8) = .empty;
         var failed: std.ArrayList(Failed) = .empty;
         // what the run made goes first, so a file can become a folder
         for (writes.items) |w| if (w.from == null) {
@@ -519,7 +522,9 @@ pub const Store = struct {
                 try failed.append(arena, .{ .path = try shownPath(arena, base, w.path), .why = whyNot(e) });
                 continue;
             };
-            try undone.append(arena, try shownPath(arena, base, w.path));
+            const shown = try shownPath(arena, base, w.path);
+            try undone.append(arena, shown);
+            try removed.append(arena, shown);
         };
         for (writes.items) |w| if (w.from) |file| {
             s.writeBack(arena, root, file) catch |e| {
@@ -529,6 +534,7 @@ pub const Store = struct {
             try undone.append(arena, try shownPath(arena, base, w.path));
         };
         res.undone = try sorted(arena, undone.items);
+        res.removed = try sorted(arena, removed.items);
         res.failed = failed.items;
         return res;
     }
@@ -1664,6 +1670,7 @@ test "undo_takes_back_only_that_runs_changes" {
     const uf = u.folders[0];
     try t.expectEqualStrings("src", uf.name);
     if (posix) try expectNames(&.{ "src/a.md", "src/b.md", "src/c/new.md", "src/x.sh" }, uf.undone) else try expectNames(&.{ "src/a.md", "src/b.md", "src/c/new.md" }, uf.undone);
+    try expectNames(&.{"src/c/new.md"}, uf.removed);
     try t.expectEqual(0, uf.left.len);
     try t.expectEqual(0, uf.failed.len);
     try t.expectEqual(0, u.pruned.len);
