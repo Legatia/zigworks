@@ -1710,7 +1710,8 @@ pub const Core = struct {
         const rid = rid_in orelse (try c.snaps.newestRun(a, conv)) orelse return .{ .text = "No run here changed files in a folder that keeps snapshots." };
         const res = try c.snaps.undo(a, rid, c.workspace, c.folderRoles());
         if (res.folders.len > 0) _ = c.snaps.prune(a, c.folderRoles()) catch {};
-        return .{ .text = try undo_mod.outcome(a, rid, res, pressed) };
+        // a group reads the outcome too: counts and folders, not file names
+        return .{ .text = try undo_mod.outcomeFor(a, rid, res, pressed, c.isShared(conv)) };
     }
 
     /// `/undo [RUN]`: takes back run RUN's changes, or those of the newest
@@ -13199,6 +13200,28 @@ test "undo_takes_back_the_newest_run_with_changes_here" {
     try t.expectEqualStrings("Nothing kept for run 999999: too old to undo, or it changed no folder that keeps snapshots.", try f.core.command(a, "/undo 999999"));
     try t.expectEqualStrings("No run here changed files in a folder that keeps snapshots.", try f.core.commandIn(a, "elsewhere", "/undo"));
     try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/help"), "/undo [RUN]") != null);
+}
+
+test "undo_in_a_shared_conversation_names_folders_not_files" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const notes = try withNotes(&f, "[notes]\nsnapshots = on\n");
+    try addGroup(&f, "family", -100);
+    try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"notes/secret-plan.md\",\"content\":\"a\"}"));
+    try f.e.script(2, model.textReply("Wrote it."));
+    f.core.chatTurn("write it");
+    const run = try lastRunId(&f, "chat");
+    try t.expect(isIn(&f, notes, "secret-plan.md"));
+    // sent in the family group, where others read along: what the reply
+    // said (folders and counts), not the owner's file names
+    const said = try f.core.commandIn(a, "family", try std.fmt.allocPrint(a, "/undo {d}", .{run}));
+    if (std.mem.indexOf(u8, said, "secret-plan") != null or std.mem.indexOf(u8, said, "removed 1 file in notes/") == null) {
+        std.debug.print("said: {s}\n", .{said});
+        return error.TestUnexpectedResult;
+    }
+    try t.expect(!isIn(&f, notes, "secret-plan.md"));
 }
 
 test "undo_is_refused_while_a_run_goes_and_when_too_old" {

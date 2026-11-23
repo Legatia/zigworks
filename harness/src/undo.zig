@@ -77,6 +77,13 @@ fn plural(n: usize) []const u8 {
 /// the run certainly changed files, and a run with no snapshot kept is
 /// too old.
 pub fn outcome(a: std.mem.Allocator, rid: u64, res: snapshots.Undone, pressed: bool) ![]const u8 {
+    return outcomeFor(a, rid, res, pressed, false);
+}
+
+/// `outcome`, for a conversation others read too when `shared`: counts and
+/// folders, as the run's "Changed N files in notes/." line said, never the
+/// owner's file names.
+pub fn outcomeFor(a: std.mem.Allocator, rid: u64, res: snapshots.Undone, pressed: bool, shared: bool) ![]const u8 {
     if (!res.found) {
         if (pressed) return "Too old to undo: its snapshots were pruned.";
         return std.fmt.allocPrint(a, "Nothing kept for run {d}: too old to undo, or it changed no folder that keeps snapshots.", .{rid});
@@ -87,6 +94,8 @@ pub fn outcome(a: std.mem.Allocator, rid: u64, res: snapshots.Undone, pressed: b
     var left: std.ArrayList([]const u8) = .empty;
     var failed: std.ArrayList(u8) = .empty;
     var restores: std.ArrayList([]const u8) = .empty;
+    var touched: std.ArrayList([]const u8) = .empty;
+    var n_failed: usize = 0;
     var out: std.ArrayList(u8) = .empty;
     for (res.folders) |uf| {
         for (uf.undone) |p| {
@@ -96,16 +105,27 @@ pub fn outcome(a: std.mem.Allocator, rid: u64, res: snapshots.Undone, pressed: b
             try (if (gone) &removed else &put_back).append(a, p);
         }
         try left.appendSlice(a, uf.left);
+        n_failed += uf.failed.len;
+        if (uf.undone.len > 0) try touched.append(a, uf.name);
         for (uf.failed) |fl| try failed.print(a, "{s}{s} ({s})", .{ if (failed.items.len > 0) ", " else "", fl.path, fl.why });
         if (uf.snapshot > 0) try restores.append(a, try std.fmt.allocPrint(a, "/restore {s} {d}", .{ uf.name, uf.snapshot }));
     }
     if (put_back.items.len + removed.items.len > 0) {
         try out.print(a, "Undid run {d}: ", .{rid});
-        if (put_back.items.len > 0) {
+        if (shared) {
+            const np = put_back.items.len;
+            const nr = removed.items.len;
+            if (np > 0) try out.print(a, "put back {d} file{s}", .{ np, plural(np) });
+            if (nr > 0) {
+                if (np > 0) try out.print(a, " and removed {d}", .{nr}) else try out.print(a, "removed {d} file{s}", .{ nr, plural(nr) });
+            }
+            try out.appendSlice(a, " in ");
+            try folderNames(&out, a, touched.items);
+        } else if (put_back.items.len > 0) {
             try out.appendSlice(a, "put back ");
             try names(&out, a, put_back.items);
         }
-        if (removed.items.len > 0) {
+        if (!shared and removed.items.len > 0) {
             try out.appendSlice(a, if (put_back.items.len > 0) "; removed " else "removed ");
             try names(&out, a, removed.items);
         }
@@ -114,12 +134,17 @@ pub fn outcome(a: std.mem.Allocator, rid: u64, res: snapshots.Undone, pressed: b
         if (res.already > 0) return std.fmt.allocPrint(a, "Run {d}'s changes are undone already.", .{rid});
         return std.fmt.allocPrint(a, "Run {d} changed no files in folders that keep snapshots.", .{rid});
     } else try out.print(a, "Nothing of run {d} was undone.", .{rid});
-    if (left.items.len > 0) {
+    if (left.items.len > 0 and shared) {
+        const n = left.items.len;
+        try out.print(a, "\n{d} file{s} changed since; left as {s}.", .{ n, plural(n), if (n == 1) "it is" else "they are" });
+    } else if (left.items.len > 0) {
         try out.append(a, '\n');
         try names(&out, a, left.items);
         try out.appendSlice(a, if (left.items.len == 1) " changed since; left as it is." else " changed since; left as they are.");
     }
-    if (failed.items.len > 0) try out.print(a, "\nNot put back: {s}.", .{failed.items});
+    if (n_failed > 0 and shared) {
+        try out.print(a, "\n{d} file{s} not put back.", .{ n_failed, plural(n_failed) });
+    } else if (failed.items.len > 0) try out.print(a, "\nNot put back: {s}.", .{failed.items});
     for (res.folders) |uf| if (uf.refused) |why| try out.print(a, "\n{s}: not undone, {s}.", .{ shown(uf.name), why });
     for (res.pruned) |p| try out.print(a, "\n{s}: too old to undo, its snapshots were pruned.", .{shown(p)});
     if (restores.items.len > 0) {
@@ -142,6 +167,14 @@ fn shown(name: []const u8) []const u8 {
 }
 
 /// "a", "a and b", "a, b and c" (the first 20, then how many more).
+/// Folders as the changed line names them: `notes/ and the workspace`.
+fn folderNames(out: *std.ArrayList(u8), a: std.mem.Allocator, list: []const []const u8) !void {
+    for (list, 0..) |f, i| {
+        if (i > 0) try out.appendSlice(a, if (i + 1 == list.len) " and " else ", ");
+        if (std.mem.eql(u8, f, "/")) try out.appendSlice(a, "the workspace") else try out.print(a, "{s}/", .{f});
+    }
+}
+
 fn names(out: *std.ArrayList(u8), a: std.mem.Allocator, list: []const []const u8) !void {
     const n = @min(list.len, 20);
     for (list[0..n], 0..) |x, i| {
@@ -208,6 +241,26 @@ test "the_changed_line_names_the_folders" {
     try t.expectEqualStrings("Changed 2 files in the workspace.", line(&buf, 2, &.{"/"}));
     var small: [40]u8 = undefined;
     try t.expectEqualStrings("Changed 9 files in 4 folders.", line(&small, 9, &.{ "first-folder", "second-folder", "third", "fourth" }));
+}
+
+test "a_shared_conversation_hears_counts_not_file_names" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const x = arena.allocator();
+    const all: snapshots.Undone = .{ .found = true, .folders = &.{.{ .name = "notes", .snapshot = 7, .undone = &.{ "notes/a.md", "notes/b.md", "notes/c.md" }, .removed = &.{"notes/c.md"} }} };
+    try t.expectEqualStrings("Undid run 41: put back 2 files and removed 1 in notes/.\n/restore notes 7 takes the undo back.", try outcomeFor(x, 41, all, true, true));
+    const some: snapshots.Undone = .{ .found = true, .pruned = &.{"site"}, .folders = &.{
+        .{ .name = "notes", .snapshot = 7, .undone = &.{"notes/c.md"}, .removed = &.{"notes/c.md"}, .left = &.{ "notes/a.md", "notes/b.md" }, .failed = &.{.{ .path = "notes/d.md", .why = "in use or not allowed" }} },
+        .{ .name = "/", .snapshot = 3, .undone = &.{"x.txt"} },
+    } };
+    try t.expectEqualStrings(
+        \\Undid run 41: put back 1 file and removed 1 in notes/ and the workspace.
+        \\2 files changed since; left as they are.
+        \\1 file not put back.
+        \\site: too old to undo, its snapshots were pruned.
+        \\/restore notes 7 and /restore / 3 take the undo back.
+    , try outcomeFor(x, 41, some, false, true));
+    try t.expectEqualStrings("Undid run 9: removed 1 file in notes/.", try outcomeFor(x, 9, .{ .found = true, .folders = &.{.{ .name = "notes", .undone = &.{"notes/g.md"}, .removed = &.{"notes/g.md"} }} }, true, true));
 }
 
 test "what_an_undo_says" {
