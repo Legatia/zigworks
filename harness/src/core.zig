@@ -42,6 +42,7 @@ const tstate = @import("tstate.zig");
 const sources = @import("sources.zig");
 const workflows = @import("workflows.zig");
 const wstate = @import("wstate.zig");
+const voice_mod = @import("voice.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -222,6 +223,10 @@ pub const Channel = struct {
     /// Opens a topic called `name` in the private chat `chat`; returns its
     /// thread. Null where there are no topics (the terminal).
     open_topic: ?*const fn (ctx: *anyopaque, chat: i64, name: []const u8) anyerror!i64 = null,
+    /// The bytes of file `file_id` a message carried (a voice note), at
+    /// most `max` (error.TooLarge past it), in `a`. Null where messages
+    /// carry no files (the terminal).
+    file: ?*const fn (ctx: *anyopaque, a: std.mem.Allocator, file_id: []const u8, max: usize) anyerror![]u8 = null,
 };
 
 /// A Telegram message, with where it came from.
@@ -237,6 +242,8 @@ pub const Incoming = struct {
     text: []const u8,
     /// The message it replies to; 0: none.
     reply_to: i64 = 0,
+    /// A voice note or audio file it carries instead of text.
+    voice: ?voice_mod.Note = null,
 };
 
 /// A run's stop flag, its definition, and the flag of the run that
@@ -332,12 +339,15 @@ const Queued = struct {
     text: []u8,
     /// A quick reply: the post it answers, said in its turn's context.
     note: ?[]u8 = null,
+    /// A voice note: transcribed when its turn comes (`text` is "").
+    voice: ?voice_mod.Note = null,
 
     fn deinit(q: Queued, gpa: std.mem.Allocator) void {
         gpa.free(q.conv);
         gpa.free(q.agent);
         gpa.free(q.text);
         if (q.note) |n| gpa.free(n);
+        if (q.voice) |v| v.deinit(gpa);
     }
 };
 
@@ -1395,6 +1405,8 @@ pub const Core = struct {
             c.say(try std.fmt.allocPrint(arena.allocator(), "A message in a new topic was not taken: harness could not write state/conversations ({s}).", .{@errorName(e)}));
             return;
         };
+        // a voice note: transcribed, then taken as typed text (never a command)
+        if (m.voice) |note| return c.voiceIn(conv, m, note);
         // a reply to one of an item's messages is its text answer
         const is_command = std.mem.startsWith(u8, std.mem.trim(u8, text, " \t\r\n"), "/");
         if (m.reply_to != 0 and !is_command and c.replyAnswer(conv, m.chat, m.reply_to, text)) return;
@@ -1482,23 +1494,172 @@ pub const Core = struct {
     /// Queues the owner's message `text` in `conv` for the instance of
     /// definition `agent_name` there.
     fn queueTo(c: *Core, conv: []const u8, agent_name: []const u8, text: []const u8, note: ?[]const u8) !void {
+        return c.queueItem(conv, agent_name, text, note, null);
+    }
+
+    /// Queues `text` (or voice note `voice`, then `text` is "") in `conv`
+    /// for the instance of `agent_name` there.
+    fn queueItem(c: *Core, conv: []const u8, agent_name: []const u8, text: []const u8, note: ?[]const u8, voice: ?voice_mod.Note) !void {
         const conv_owned = try c.gpa.dupe(u8, conv);
         errdefer c.gpa.free(conv_owned);
         const agent_owned = try c.gpa.dupe(u8, agent_name);
         errdefer c.gpa.free(agent_owned);
         const text_owned = try c.gpa.dupe(u8, text);
         errdefer c.gpa.free(text_owned);
-        const item: Queued = .{ .conv = conv_owned, .agent = agent_owned, .text = text_owned, .note = if (note) |n| try c.gpa.dupe(u8, n) else null };
+        const note_owned = if (note) |n| try c.gpa.dupe(u8, n) else null;
+        errdefer if (note_owned) |n| c.gpa.free(n);
+        const voice_owned = if (voice) |v| try v.clone(c.gpa) else null;
+        errdefer if (voice_owned) |v| v.deinit(c.gpa);
+        const item: Queued = .{ .conv = conv_owned, .agent = agent_owned, .text = text_owned, .note = note_owned, .voice = voice_owned };
         const queued_behind = blk: {
             c.queue_mutex.lockUncancelable(c.io);
             defer c.queue_mutex.unlock(c.io);
-            c.queue.append(c.gpa, item) catch |e| {
-                if (item.note) |n| c.gpa.free(n);
-                return e;
-            };
+            try c.queue.append(c.gpa, item);
             break :blk c.busy.load(.acquire) or c.queue.items.len > 1;
         };
         if (queued_behind) c.sayIn(conv, "Queued; /stop cancels the current turn.");
+    }
+
+    // ---- voice notes ----
+
+    /// What the turn of a voice note is told of it.
+    const voice_context = "This message is a voice note, transcribed: a word may be misheard.";
+
+    /// A voice note of the owner's in `conv` (Ruling 1 of the plan): one
+    /// that can't be taken is said in a line; a reply to one of an item's
+    /// messages answers it at once; else it waits in the chat queue like a
+    /// typed message and is transcribed when its turn comes.
+    fn voiceIn(c: *Core, conv: []const u8, m: Incoming, note: voice_mod.Note) !void {
+        c.touch(conv);
+        var buf: [160]u8 = undefined;
+        if (c.voiceRefusal(&buf, note)) |why| {
+            c.log.write(.chat, c.convPrivate(conv), .{ .event = "voice note refused", .seconds = note.seconds, .bytes = note.size, .why = why }) catch {};
+            return c.sayIn(conv, why);
+        }
+        if (m.reply_to != 0 and c.itemOfMessage(m.chat, m.reply_to) != null) return c.startVoiceAnswer(conv, m.chat, m.reply_to, note);
+        var abuf: [agents_name_max]u8 = undefined;
+        return c.queueItem(conv, c.convAgent(&abuf, conv), "", null, note);
+    }
+
+    /// Why voice note `note` is not taken; null: it is.
+    fn voiceRefusal(c: *Core, buf: *[160]u8, note: voice_mod.Note) ?[]const u8 {
+        if (c.cfg.voice.provider.len == 0) return "Voice notes need a transcription service: [voice] provider and model in config.ini (README: Voice notes), then /reload.";
+        const ch = c.chan orelse return "Voice notes can't be fetched here.";
+        if (ch.file == null) return "Voice notes can't be fetched here.";
+        if (note.seconds > voice_mod.max_seconds) {
+            var lb: [16]u8 = undefined;
+            return std.fmt.bufPrint(buf, "Voice notes can be up to 2 minutes; this one is {s}.", .{note.length(&lb)}) catch "Voice notes can be up to 2 minutes.";
+        }
+        if (note.size > voice_mod.max_bytes) return too_large_note;
+        return null;
+    }
+
+    const too_large_note = "That file is over 20 MB, more than Telegram lets a bot download.";
+
+    /// The item one of whose messages is `message` in `chat`, if any.
+    fn itemOfMessage(c: *Core, chat: i64, message: i64) ?u64 {
+        c.inbox.mutex.lockUncancelable(c.io);
+        defer c.inbox.mutex.unlock(c.io);
+        for (c.inbox.items.items) |it| for (it.shown.items) |sh| if (sh.chat == chat and sh.message == message) return it.id;
+        return null;
+    }
+
+    /// A voice note's turn (the chat worker's): fetched and transcribed
+    /// under a stop flag of its own (/stop ends it there), its transcript
+    /// shown, then the turn runs on it.
+    fn voiceTurn(c: *Core, conv: []const u8, agent_name: []const u8, note: voice_mod.Note) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, agent_name);
+        const heard = c.transcribe(arena.allocator(), conv, note, &flag);
+        c.unregister(&flag);
+        const text = heard orelse return;
+        if (flag.load(.acquire)) return;
+        c.chatTurnAs(conv, agent_name, text, voice_context);
+    }
+
+    /// Fetches voice note `note` and transcribes it for `conv`: the
+    /// transcript shown in one quoted line (without a sound) and returned,
+    /// or why not said and null. The audio is only in `a`.
+    fn transcribe(c: *Core, a: std.mem.Allocator, conv: []const u8, note: voice_mod.Note, flag: *std.atomic.Value(bool)) ?[]const u8 {
+        const private = c.convPrivate(conv);
+        const started = util.nowMs(c.io);
+        const ch = c.chan orelse return null;
+        const fetch = ch.file orelse return null;
+        const audio = fetch(ch.ctx, a, note.file_id, voice_mod.max_bytes) catch |e| {
+            if (flag.load(.acquire)) return null;
+            c.log.write(.chat, private, .{ .event = "voice note not transcribed", .seconds = note.seconds, .why = @errorName(e) }) catch {};
+            c.sayIn(conv, if (e == error.TooLarge) too_large_note else std.fmt.allocPrint(a, "The voice note could not be fetched from Telegram ({s}); send it again.", .{@errorName(e)}) catch "The voice note could not be fetched from Telegram; send it again.");
+            return null;
+        };
+        const prov = c.providers.find(c.cfg.voice.provider) orelse {
+            c.sayIn(conv, "Voice notes need a transcription service: [voice] provider and model in config.ini (README: Voice notes), then /reload.");
+            return null;
+        };
+        var tr: voice_mod.Transcriber = .{ .gpa = c.gpa, .io = c.io, .provider = prov.*, .model = c.cfg.voice.model, .language = c.cfg.voice.language };
+        const text = tr.transcribe(a, audio, voice_mod.fileName(note), flag) catch |e| {
+            if (e == error.Stopped or flag.load(.acquire)) return null;
+            const why = tr.failure(a, e);
+            c.log.write(.chat, private, .{ .event = "voice note not transcribed", .seconds = note.seconds, .bytes = audio.len, .provider = prov.name, .why = why }) catch {};
+            c.sayIn(conv, why);
+            return null;
+        };
+        c.log.write(.chat, private, .{ .event = "voice note", .seconds = note.seconds, .bytes = audio.len, .provider = prov.name, .model = c.cfg.voice.model, .ms = util.nowMs(c.io) - started, .chars = text.len }) catch {};
+        if (text.len == 0) {
+            c.sayIn(conv, "The voice note had no words in it.");
+            return null;
+        }
+        _ = c.sendTextAs(conv, voice_mod.quoted(a, text) catch text, true) catch {};
+        return text;
+    }
+
+    /// A voice reply to an item's message, transcribed on a thread of its
+    /// own: the turn that asked holds the chat worker.
+    const VoiceAnswer = struct {
+        conv: []u8,
+        chat: i64,
+        reply_to: i64,
+        note: voice_mod.Note,
+
+        fn free(v: *VoiceAnswer, gpa: std.mem.Allocator) void {
+            gpa.free(v.conv);
+            v.note.deinit(gpa);
+            gpa.destroy(v);
+        }
+    };
+
+    fn startVoiceAnswer(c: *Core, conv: []const u8, chat: i64, reply_to: i64, note: voice_mod.Note) !void {
+        const job = try c.gpa.create(VoiceAnswer);
+        errdefer c.gpa.destroy(job);
+        const conv_owned = try c.gpa.dupe(u8, conv);
+        errdefer c.gpa.free(conv_owned);
+        job.* = .{ .conv = conv_owned, .chat = chat, .reply_to = reply_to, .note = try note.clone(c.gpa) };
+        // background work: /reload and close wait for it
+        _ = c.bg_active.fetchAdd(1, .acq_rel);
+        const th = std.Thread.spawn(.{}, voiceAnswer, .{ c, job }) catch |e| {
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+            job.note.deinit(c.gpa);
+            return e;
+        };
+        th.detach();
+    }
+
+    /// Transcribes the reply, shows it, and answers the item with it as a
+    /// typed reply would; an item gone meanwhile makes it a message.
+    fn voiceAnswer(c: *Core, job: *VoiceAnswer) void {
+        defer {
+            job.free(c.gpa);
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+        }
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "main");
+        defer c.unregister(&flag);
+        const text = c.transcribe(arena.allocator(), job.conv, job.note, &flag) orelse return;
+        if (flag.load(.acquire)) return;
+        if (!c.replyAnswer(job.conv, job.chat, job.reply_to, text)) c.queueMessage(job.conv, text, voice_context) catch {};
     }
 
     /// A button press (`data`) in message `message_id` of the owner's
@@ -2661,7 +2822,7 @@ pub const Core = struct {
         while (!c.quitting.load(.acquire)) {
             if (c.popQueue()) |item| {
                 defer item.deinit(c.gpa);
-                c.chatTurnAs(item.conv, item.agent, item.text, item.note);
+                if (item.voice) |note| c.voiceTurn(item.conv, item.agent, note) else c.chatTurnAs(item.conv, item.agent, item.text, item.note);
                 c.busy.store(false, .release);
                 continue;
             }
@@ -9352,6 +9513,11 @@ const Recorder = struct {
     /// Called once buttons are recorded, before their message id is
     /// returned: an owner who presses before harness knows the message.
     early: ?Early = null,
+    /// What a voice note's file holds, how often one was fetched, and
+    /// while set, the error fetching one fails with.
+    audio: []const u8 = "OggS-test-audio",
+    fetched: usize = 0,
+    file_fail: ?anyerror = null,
 
     const Early = struct { ctx: *anyopaque, press: *const fn (ctx: *anyopaque, b: *const Buttons) void };
 
@@ -9386,7 +9552,27 @@ const Recorder = struct {
     }
 
     fn channel(r: *Recorder) Channel {
-        return .{ .ctx = r, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic };
+        return .{ .ctx = r, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic, .file = file };
+    }
+
+    /// A voice note's file: `audio`, counted.
+    fn file(ctx: *anyopaque, a: std.mem.Allocator, file_id: []const u8, max: usize) anyerror![]u8 {
+        _ = file_id;
+        const r: *Recorder = @ptrCast(@alignCast(ctx));
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        if (r.file_fail) |e| return e;
+        r.fetched += 1;
+        if (r.audio.len > max) return error.TooLarge;
+        return a.dupe(u8, r.audio);
+    }
+
+    /// Where line `needle` first is (lines.len: nowhere).
+    fn indexOf(r: *Recorder, needle: []const u8) usize {
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        for (r.lines.items, 0..) |l, i| if (std.mem.indexOf(u8, l, needle) != null) return i;
+        return r.lines.items.len;
     }
 
     /// Notes a line and where it went (under the mutex).
@@ -15811,4 +15997,179 @@ test "a_start_in_line_is_masked_and_checked_again" {
     runWorkflows(&f);
     try t.expectEqual(1, (try d.numbers(a)).len);
     try expectHas(try logText(&f), "\"name\":\"one\",\"event\":\"dropped\",\"by\":\"agent:main\"");
+}
+
+// ---- voice notes ----
+
+/// config.ini with a transcription provider at the fake server (`groq`,
+/// its key stored), then `extra`; reloaded.
+fn voiceSetup(f: *Fix, extra: []const u8) !void {
+    const a = f.e.arena.allocator();
+    const url = try f.e.url();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.fmt.allocPrint(a, "[model]\nurl = {s}\n[search]\nurl = {s}\n[provider groq]\napi = openai\nurl = {s}/v1\n[voice]\nprovider = groq\nmodel = whisper-large-v3-turbo\nlanguage = pl\n{s}", .{ url, url, url, extra }) });
+    const st: store_mod.Store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
+    f.core.store = st;
+    try st.put(t.io, "groq", "gsk-voice-test-key-1");
+    const said = try f.core.reload();
+    if (!std.mem.eql(u8, said, "Settings reloaded.")) std.debug.print("reload: {s}\n", .{said});
+    try t.expectEqualStrings("Settings reloaded.", said);
+}
+
+/// A voice note of the owner's, `seconds` long, in their chat.
+fn voiceNote(seconds: u32) Incoming {
+    return .{ .from = 42, .chat = 42, .text = "", .voice = .{ .file_id = "AwACAgIAAxk", .seconds = seconds, .size = 7316, .mime = "audio/ogg" } };
+}
+
+/// The n-th transcription's scripted answer.
+fn sttScript(f: *Fix, n: u32, body: []const u8) !void {
+    const name = try std.fmt.allocPrint(f.e.arena.allocator(), "transcribe/{d:0>3}.json", .{n});
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = name, .data = body });
+}
+
+/// The n-th transcription request as the fake server got it.
+fn sttRequest(f: *Fix, n: u32) ![]u8 {
+    const name = try std.fmt.allocPrint(f.e.arena.allocator(), "transcribe-requests/{d:0>3}.json", .{n});
+    return f.e.tmp.dir.readFileAlloc(t.io, name, f.e.arena.allocator(), .unlimited);
+}
+
+test "a_voice_note_is_shown_quoted_then_answered" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try voiceSetup(&f, "");
+    try sttScript(&f, 1, "{\"text\":\" turn the heating up a bit\\nin the living room \"}");
+    try f.e.script(1, model.textReply("Living room heating is at 21.5 °C (was 20.5)."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(voiceNote(4));
+    try f.rec.waitFor("Living room heating is at 21.5");
+    // what was heard first, in one quoted line and without a sound; then the reply
+    const heard = "\"turn the heating up a bit in the living room\"";
+    try t.expectEqual(true, f.rec.quietOf(heard).?);
+    try t.expect(f.rec.indexOf(heard) < f.rec.indexOf("Living room heating is at 21.5"));
+    try t.expectEqual(1, f.rec.fetched);
+    // the model got the words as the owner's message, and that they were spoken
+    const req = try f.e.request(1);
+    try t.expect(std.mem.indexOf(u8, req, "turn the heating up a bit\\nin the living room") != null);
+    try t.expect(std.mem.indexOf(u8, req, "voice note, transcribed") != null);
+    // to groq with its key, the audio as the file, the model and the language
+    const sreq = try sttRequest(&f, 1);
+    try t.expect(std.mem.indexOf(u8, sreq, "\"Authorization\":\"Bearer gsk-voice-test-key-1\"") != null);
+    for ([_][]const u8{ "filename=\\\"voice.ogg\\\"", "OggS-test-audio", "whisper-large-v3-turbo", "name=\\\"language\\\"\\r\\n\\r\\npl" }) |want| {
+        if (std.mem.indexOf(u8, sreq, want) == null) std.debug.print("missing {s} in {s}\n", .{ want, sreq });
+        try t.expect(std.mem.indexOf(u8, sreq, want) != null);
+    }
+    // the log: a voice line with its numbers, the words as the turn's text;
+    // never the audio or the key
+    const lt = try logText(&f);
+    for ([_][]const u8{ "\"event\":\"voice note\"", "\"seconds\":4", "\"bytes\":15", "\"provider\":\"groq\"", "\"model\":\"whisper-large-v3-turbo\"", "in the living room" }) |want| {
+        if (std.mem.indexOf(u8, lt, want) == null) std.debug.print("missing {s} in the log\n", .{want});
+        try t.expect(std.mem.indexOf(u8, lt, want) != null);
+    }
+    try t.expect(std.mem.indexOf(u8, lt, "OggS-test-audio") == null);
+    try t.expect(std.mem.indexOf(u8, lt, "gsk-voice-test-key-1") == null);
+}
+
+test "a_voice_note_over_two_minutes_or_without_voice_set_is_refused_plainly" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.core.startWorker();
+    // nothing set up: how to set it up
+    try f.core.handleIncoming(voiceNote(4));
+    try f.rec.waitFor("Voice notes need a transcription service");
+    try t.expect(f.rec.count("[voice] provider") == 1);
+    try voiceSetup(&f, "");
+    // over two minutes: said, nothing fetched or sent
+    try f.core.handleIncoming(voiceNote(192));
+    try f.rec.waitFor("Voice notes can be up to 2 minutes; this one is 3:12.");
+    // over 20 MB by what Telegram says
+    var big = voiceNote(60);
+    big.voice.?.size = 21 * 1024 * 1024;
+    try f.core.handleIncoming(big);
+    try f.rec.waitFor("over 20 MB");
+    try t.expectEqual(0, f.rec.fetched);
+    try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "transcribe-requests/001.json", .{}));
+    try t.expectEqual(0, f.e.server.modelRequests());
+}
+
+test "a_failed_transcription_is_said_and_runs_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try voiceSetup(&f, "");
+    try sttScript(&f, 1, "{\"status\":401,\"echo_key\":true}");
+    try f.core.startWorker();
+    try f.core.handleIncoming(voiceNote(4));
+    try f.rec.waitFor("Voice notes are refused: groq refused the key stored as groq");
+    try t.expect(f.rec.count("gsk-voice-test-key-1") == 0);
+    // a file Telegram would not give
+    f.rec.file_fail = error.TelegramRefused;
+    try f.core.handleIncoming(voiceNote(4));
+    try f.rec.waitFor("The voice note could not be fetched from Telegram");
+    try t.expectEqual(0, f.e.server.modelRequests());
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"voice note not transcribed\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "gsk-voice-test-key-1") == null);
+    // nothing heard: said, nothing run
+    f.rec.file_fail = null;
+    try sttScript(&f, 2, "{\"text\":\"  \"}");
+    try f.core.handleIncoming(voiceNote(2));
+    try f.rec.waitFor("The voice note had no words in it.");
+    try t.expectEqual(0, f.e.server.modelRequests());
+}
+
+test "a_voice_reply_to_a_question_answers_it" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try voiceSetup(&f, "");
+    // the turn asks which room, and waits
+    try f.e.script(1, model.toolReply("tu_1", "ask_owner", "{\"question\":\"Which room?\",\"choices\":[\"Kitchen\",\"Hall\"],\"text\":true}"));
+    try f.e.script(2, model.textReply("Kitchen light on."));
+    try sttScript(&f, 1, "{\"text\":\"the kitchen please\"}");
+    try f.core.startWorker();
+    try f.core.handleText("turn on a light");
+    try f.rec.waitFor("Which room?");
+    const msg = f.lastButtons().msg;
+    // the owner answers by voice, in reply to the question
+    var note = voiceNote(2);
+    note.reply_to = msg;
+    try f.core.handleIncoming(note);
+    try f.rec.waitFor("Kitchen light on.");
+    try t.expect(f.rec.indexOf("\"the kitchen please\"") < f.rec.indexOf("Kitchen light on."));
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "wrote: the kitchen please") != null);
+}
+
+test "a_voice_note_and_a_message_typed_after_it_keep_their_order" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try voiceSetup(&f, "");
+    // the transcription takes a while; the typed message comes meanwhile
+    try sttScript(&f, 1, "{\"delay_ms\":600,\"text\":\"turn on the living room light\"}");
+    try f.e.script(1, model.textReply("Living room light on."));
+    try f.e.script(2, model.textReply("Kitchen too."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(voiceNote(3));
+    try f.core.handleText("and the kitchen too");
+    try f.rec.waitFor("Kitchen too.");
+    try t.expect(std.mem.indexOf(u8, try f.e.request(1), "turn on the living room light") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "and the kitchen too") != null);
+}
+
+test "a_private_conversations_voice_note_logs_no_words" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try voiceSetup(&f, "");
+    try f.core.handleText("/private on");
+    try sttScript(&f, 1, "{\"text\":\"my secret plan for tuesday\"}");
+    try f.e.script(1, model.textReply("Noted."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(voiceNote(3));
+    try f.rec.waitFor("Noted.");
+    try f.rec.waitFor("\"my secret plan for tuesday\"");
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"voice note\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "secret plan") == null);
 }

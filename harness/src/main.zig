@@ -812,7 +812,23 @@ const TgChan = struct {
     }
 
     fn channel(tc: *TgChan) core_mod.Channel {
-        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic };
+        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic, .file = file };
+    }
+
+    /// A file a message carried (a voice note): getFile, then the file,
+    /// through a bot of its own, so a download never holds up a send.
+    fn file(ctx: *anyopaque, a: std.mem.Allocator, file_id: []const u8, max: usize) anyerror![]u8 {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        const api = blk: {
+            tc.mutex.lockUncancelable(tc.io);
+            defer tc.mutex.unlock(tc.io);
+            break :blk try a.dupe(u8, tc.send_bot.api);
+        };
+        var bot = try telegram.Bot.init(tc.gpa, tc.io, api, tc.token);
+        defer bot.deinit();
+        const f = try bot.getFile(a, file_id);
+        if (f.size > max) return error.TooLarge;
+        return bot.download(a, f.path, max);
     }
 
     fn sendTo(ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void {
@@ -887,6 +903,26 @@ const TgChan = struct {
     }
 };
 
+/// One update from Telegram: a message (text, or a voice note) or a press.
+fn takeUpdate(c: *Core, tc: *TgChan, u: telegram.Update) void {
+    switch (u) {
+        .message => |m| if (m.text.len > 0 or m.voice != null) c.handleIncoming(.{
+            .from = m.from_id,
+            .chat = m.chat_id,
+            .chat_type = m.chat_type,
+            .thread = m.thread,
+            .topic = m.topic,
+            .text = m.text,
+            .reply_to = m.reply_to,
+            .voice = m.voice,
+        }) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
+        .callback => |cb| {
+            tc.answer(cb.id);
+            c.handleCallbackText(cb.from_id, cb.chat_id, cb.thread, cb.message_id, cb.data, cb.text);
+        },
+    }
+}
+
 fn ticker(c: *Core) void {
     while (!c.quitting.load(.acquire)) {
         c.tick();
@@ -950,21 +986,7 @@ fn runCmd(app: *App) !Exit {
             offset = u.updateId() + 1;
             // saved first: after a crash an update is not handled twice
             telegram.Offset.save(app.io, c.paths.telegram, offset) catch {};
-            switch (u) {
-                .message => |m| if (m.text.len > 0) c.handleIncoming(.{
-                    .from = m.from_id,
-                    .chat = m.chat_id,
-                    .chat_type = m.chat_type,
-                    .thread = m.thread,
-                    .topic = m.topic,
-                    .text = m.text,
-                    .reply_to = m.reply_to,
-                }) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
-                .callback => |cb| {
-                    tc.answer(cb.id);
-                    c.handleCallbackText(cb.from_id, cb.chat_id, cb.thread, cb.message_id, cb.data, cb.text);
-                },
-            }
+            takeUpdate(c, &tc, u);
         }
         // a /reload among those messages may have changed the api url
         _ = tc.refresh() catch |e| complain("telegram: {s}", .{@errorName(e)});
@@ -2388,6 +2410,56 @@ test "telegram_bots_follow_a_changed_api_after_reload" {
     c.say("sent after the move");
     try t.expect(std.mem.indexOf(u8, try telegram.outbox(&moved), "sent after the move") != null);
     try t.expect(std.mem.indexOf(u8, try telegram.outbox(&e), "sent after the move") == null);
+}
+
+test "a_voice_note_from_telegram_is_transcribed_end_to_end" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const home = try testHome(&e);
+    const url = try e.url();
+    // a local whisper.cpp server at the stand-in: no key
+    const p = try core_mod.Paths.init(a, home);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.config, .data = try std.fmt.allocPrint(a, "[model]\nurl = {s}\n[search]\nurl = {s}\n[chat]\napi = {s}\n[provider whisper]\napi = openai\nurl = {s}/v1\nauth = none\n[voice]\nprovider = whisper\nmodel = large-v3-turbo\nlanguage = pl\n", .{ url, url, url, url }) });
+    const c = try Core.open(t.allocator, t.io, home, .{ .telegram = "123:abc", .omnigate = "og-key-for-tests" });
+    var tc: TgChan = undefined;
+    tc.init(t.allocator, t.io, c, c.cfg.chat.api, "123:abc") catch |err| {
+        c.close();
+        return err;
+    };
+    defer {
+        c.close();
+        tc.deinit();
+    }
+    c.attach(tc.channel());
+    try c.setOwner(42);
+    try c.startWorker();
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "telegram/files/AwACAgIAAxk", .data = "OggS-e2e-audio" });
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "transcribe/001.json", .data = "{\"text\":\"włącz światło w kuchni\"}" });
+    try e.script(1, model.textReply("Światło w kuchni jest włączone."));
+    try telegram.inbox(&e, 1, "{\"message\":{\"message_id\":5,\"from\":{\"id\":42},\"chat\":{\"id\":42,\"type\":\"private\"},\"voice\":{\"file_id\":\"AwACAgIAAxk\",\"duration\":3,\"mime_type\":\"audio/ogg\",\"file_size\":14}}}");
+    // as the poll loop takes them
+    for (try tc.poll.getUpdates(a, 0, 0)) |u| takeUpdate(c, &tc, u);
+    var waited: u32 = 0;
+    while (std.mem.indexOf(u8, try telegram.outbox(&e), "jest włączone") == null and waited < 8000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    const out = try telegram.outbox(&e);
+    if (std.mem.indexOf(u8, out, "jest włączone") == null) std.debug.print("out.jsonl:\n{s}\n", .{out});
+    // fetched from Telegram, then the quoted words without a sound, then the reply
+    try t.expect(std.mem.indexOf(u8, out, "\"method\":\"getFile\"") != null);
+    try t.expect(std.mem.indexOf(u8, out, "{\"method\":\"download\",\"path\":\"voice/AwACAgIAAxk.oga\"}") != null);
+    const heard = std.mem.indexOf(u8, out, "\"text\":\"\\\"włącz światło w kuchni\\\"\",\"link_preview_options\":{\"is_disabled\":true},\"disable_notification\":true") orelse {
+        std.debug.print("out.jsonl:\n{s}\n", .{out});
+        return error.TestUnexpectedResult;
+    };
+    try t.expect(heard < std.mem.indexOf(u8, out, "jest włączone").?);
+    // the model got the words; the stand-in got the audio, with no key
+    try t.expect(std.mem.indexOf(u8, try e.request(1), "włącz światło w kuchni") != null);
+    const sreq = try e.tmp.dir.readFileAlloc(t.io, "transcribe-requests/001.json", a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, sreq, "OggS-e2e-audio") != null);
+    try t.expect(std.mem.indexOf(u8, sreq, "Authorization") == null);
+    // the token went nowhere but the request paths
+    try t.expect(std.mem.indexOf(u8, out, "123:abc") == null);
 }
 
 test "login_add_and_rm_say_exactly_what_they_stored_and_removed" {
