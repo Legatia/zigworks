@@ -521,6 +521,7 @@ const now: i64 = 1796083200; // 2026-12-01
 // long memory's own files: the search of the log, the summaries
 test {
     _ = @import("history.zig");
+    _ = @import("summaries.zig");
 }
 
 const Fix = struct {

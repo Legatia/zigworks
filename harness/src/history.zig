@@ -742,14 +742,15 @@ fn callRaw(a: std.mem.Allocator, io: Io, src: *const Source, view: View, input_j
 
 const t = std.testing;
 
-/// Log lines as harness writes them, at times a test picks.
-const Lines = struct {
+/// Log lines as harness writes them, at times a test picks (summaries.zig's
+/// tests use it too).
+pub const Lines = struct {
     a: std.mem.Allocator,
     out: std.ArrayList(u8) = .empty,
     seq: u64 = 0,
 
     /// A run's first line, a turn with its message: the run's id.
-    fn start(l: *Lines, time: []const u8, conv: []const u8, label: []const u8, by: []const u8, text: []const u8) !u64 {
+    pub fn start(l: *Lines, time: []const u8, conv: []const u8, label: []const u8, by: []const u8, text: []const u8) !u64 {
         l.seq += 1;
         try l.out.print(l.a, "{{\"seq\":{d},\"time\":\"{s}\",\"kind\":\"turn\",\"rid\":{d},\"conversation\":\"{s}\",\"run\":\"{s}\",\"by\":\"{s}\",\"agent\":\"main\",\"text\":{s}", .{ l.seq, time, l.seq, conv, label, by, try l.js(text) });
         try l.close();
@@ -757,39 +758,39 @@ const Lines = struct {
     }
 
     /// A later line of run `rid`: its kind, then `fields` (JSON, from a comma).
-    fn add(l: *Lines, time: []const u8, rid: u64, conv: []const u8, kind: []const u8, fields: []const u8) !void {
+    pub fn add(l: *Lines, time: []const u8, rid: u64, conv: []const u8, kind: []const u8, fields: []const u8) !void {
         l.seq += 1;
         try l.out.print(l.a, "{{\"seq\":{d},\"time\":\"{s}\",\"kind\":\"{s}\",\"rid\":{d},\"conversation\":\"{s}\",\"run\":\"chat\"{s}", .{ l.seq, time, kind, rid, conv, fields });
         try l.close();
     }
 
     /// A line of no run.
-    fn other(l: *Lines, time: []const u8) !void {
+    pub fn other(l: *Lines, time: []const u8) !void {
         l.seq += 1;
         try l.out.print(l.a, "{{\"seq\":{d},\"time\":\"{s}\",\"kind\":\"config\",\"event\":\"settings files changed\"", .{ l.seq, time });
         try l.close();
     }
 
-    fn close(l: *Lines) !void {
+    pub fn close(l: *Lines) !void {
         const zeros: [64]u8 = @splat('0');
         try l.out.print(l.a, ",\"prev\":\"{s}\"}}\n", .{&zeros});
     }
 
-    fn js(l: *Lines, s: []const u8) ![]const u8 {
+    pub fn js(l: *Lines, s: []const u8) ![]const u8 {
         var o: std.ArrayList(u8) = .empty;
         try util.jsonString(&o, l.a, s);
         return o.items;
     }
 
-    fn post(l: *Lines, time: []const u8, rid: u64, conv: []const u8, text: []const u8) !void {
+    pub fn post(l: *Lines, time: []const u8, rid: u64, conv: []const u8, text: []const u8) !void {
         try l.add(time, rid, conv, "send", try std.fmt.allocPrint(l.a, ",\"to\":\"{s}\",\"event\":\"sent\",\"bytes\":{d},\"text\":{s},\"final\":true,\"implicit\":false,\"delivered\":true", .{ conv, text.len, try l.js(text) }));
     }
 
-    fn tool(l: *Lines, time: []const u8, rid: u64, conv: []const u8, name: []const u8, arg: []const u8, output: []const u8) !void {
+    pub fn tool(l: *Lines, time: []const u8, rid: u64, conv: []const u8, name: []const u8, arg: []const u8, output: []const u8) !void {
         try l.add(time, rid, conv, "tool", try std.fmt.allocPrint(l.a, ",\"agent\":\"main\",\"tool\":\"{s}\",\"arg\":{s},\"is_error\":false,\"output\":{s},\"bytes\":{d}", .{ name, try l.js(arg), try l.js(output), output.len }));
     }
 
-    fn save(l: *Lines, tmp: *t.TmpDir) ![]const u8 {
+    pub fn save(l: *Lines, tmp: *t.TmpDir) ![]const u8 {
         try tmp.dir.writeFile(t.io, .{ .sub_path = "actions.jsonl", .data = l.out.items });
         const dir = try tmp.dir.realPathFileAlloc(t.io, ".", l.a);
         return std.fs.path.join(l.a, &.{ dir, "actions.jsonl" });
