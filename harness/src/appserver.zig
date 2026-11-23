@@ -301,7 +301,17 @@ pub const Server = struct {
         var body: []const u8 = "";
         if (method == .POST or method == .PUT) {
             const too_big = "A call carries at most 1 MiB.";
-            if (req.head.content_length) |n| if (n > max_body) return s.plain(req, .payload_too_large, too_big, own_origin, null);
+            if (req.head.content_length) |n| if (n > max_body) {
+                // read off first (up to 4 MiB): closed with its body unread,
+                // Windows resets the connection and the answer is lost
+                if (n <= 4 << 20) {
+                    var drain_buf: [8192]u8 = undefined;
+                    if (req.readerExpectContinue(&drain_buf)) |r| {
+                        _ = r.discardRemaining() catch {};
+                    } else |_| {}
+                }
+                return s.plain(req, .payload_too_large, too_big, own_origin, null);
+            };
             var body_buf: [8192]u8 = undefined;
             const r = req.readerExpectContinue(&body_buf) catch return false;
             body = r.allocRemaining(a, .limited(max_body)) catch |e| switch (e) {
@@ -1009,9 +1019,7 @@ test "app_api_calls_reach_the_host_from_the_apps_own_paths" {
     try t.expectEqual(403, (try send(a, f.s.port, "POST", try f.appPath("notes", "1", "api/act"), try std.fmt.allocPrint(a, "{s}Origin: http://evil.test\r\n", .{f.host}), "{}")).status);
     const big = try a.alloc(u8, max_body + 1);
     @memset(big, 'x');
-    // (the server answers before the body is in and closes: the answer may
-    // be lost to the reset; the host is not called either way)
-    if (send(a, f.s.port, "POST", try f.appPath("notes", "1", "api/act"), f.host, big)) |got| try t.expectEqual(413, got.status) else |_| {}
+    try t.expectEqual(413, (try send(a, f.s.port, "POST", try f.appPath("notes", "1", "api/act"), f.host, big)).status);
     try t.expectEqual(calls, fh.api_calls);
     // its page into a frame is told to the host, a script is not
     _ = try get(a, f.s.port, try f.appPath("notes", "1", ""), try f.frame());

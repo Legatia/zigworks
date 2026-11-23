@@ -215,8 +215,17 @@ pub const Server = struct {
         // the token, before anything of the request is read
         if (!s.authorized(req)) return s.refuse(req, .token, .unauthorized, "invalid_api_key", "the API key is not the one stored as harness's [voice_agent] token");
         if (models) return s.respond(req, .ok, models_json, "application/json");
-        if (req.head.content_length) |n| if (n > s.max_body)
+        if (req.head.content_length) |n| if (n > s.max_body) {
+            // read off first (up to 4 MiB): closed with its body unread,
+            // Windows resets the connection and the answer is lost
+            if (n <= 4 << 20) {
+                var drain_buf: [8192]u8 = undefined;
+                if (req.readerExpectContinue(&drain_buf)) |r| {
+                    _ = r.discardRemaining() catch {};
+                } else |_| {}
+            }
             return s.refuse(req, .size, .payload_too_large, "request_too_large", "the request is over 256 KB: switch off Home Assistant's AI tools for this agent");
+        };
         var body_buf: [8192]u8 = undefined;
         const r = req.readerExpectContinue(&body_buf) catch return false;
         const body = r.allocRemaining(a, .limited(s.max_body)) catch |e| switch (e) {
