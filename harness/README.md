@@ -4,8 +4,9 @@ A personal agent you talk to in Telegram (or the terminal), in your chat
 with the bot or in a topic of it per subject. It does research, hands
 parts of a job to helpers that work in parallel, sends a morning brief on
 the topics you follow, runs scheduled tasks, watches feeds, pages, folders
-and MCP servers with triggers, uses MCP servers and saved skills, and
-remembers what you bring up. Every action it takes, and every
+and MCP servers with triggers, uses MCP servers and saved skills,
+remembers what you bring up, keeps summaries of each conversation by day,
+week and month, and can search every earlier turn. Every action it takes, and every
 action of its helpers, passes one gate and is written to one log you can
 check.
 
@@ -30,10 +31,10 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 691 unit tests (19 of them
+**State: 0.3.0, tested on macOS by its own tests: 713 unit tests (19 of them
 don't run on macOS: Windows or Linux only), among
 them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 73 checks that drives the real binary against
+and an end-to-end script of 74 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram, feeds,
 search and two MCP servers. An earlier build of 0.3.0 also passed its
 tests in CI on Linux and Windows. On Windows 11 the browser and login
@@ -177,6 +178,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `apps/` | apps shown in your browser, a folder each with `app.ini` (see Apps); what was approved of each is in `state/apps/` |
 | `log/actions.jsonl` | the action log |
 | `secrets/` | Linux: the stored secrets, a file each |
+| `state/summaries/` | each conversation's summaries (see Long memory): `CONV/day/YYYY-MM-DD.md` (kept 60 days), `CONV/week/YYYY-Www.md` (ISO weeks, kept 400 days), `CONV/month/YYYY-MM.md` (kept); `PERIOD.given-up` where a call failed all day |
 | `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home and, on macOS, its temp; a remote's key) |
 
 On macOS and Linux, `config.ini`, `rules`, `logins.ini`, `mcp.ini`,
@@ -1001,7 +1003,11 @@ saved or removed is a line of kind `agent`: `saved` (`name`, `by`,
 `poll` (status, bytes, new, queued, why), `check` (events, yes, tokens),
 `start` (the run, event ids), `done`, `dropped`, `paused`, `resumed`,
 `failed`, `saved` (`by`, `agent`, `item`, `sha256` of the section) and
-`removed` (`by`); no event content but ids. A poll's reads are lines of a
+`removed` (`by`); no event content but ids. Summaries are lines of kind
+`memory`: `summary` (`conversation`, `period`, `words`, `tokens`,
+`provider`), `summary failed` (`why`), `summary given up` (`tries`,
+`why`); a `history` call is a tool line like any other (its argument the
+words, or `run N`). A poll's reads are lines of a
 run labelled `poll NAME`, by `trigger:NAME`, with no definition. A private run's lines, and a post into a private conversation,
 keep sizes and keyed hashes of what was said, while their labels (`run`,
 `conversation`, `by`, `agent`, `to`, `event`, `tool`, `decision`, `why`)
@@ -1039,6 +1045,65 @@ or a "not") is a new item. Commands: `/memory`, `/pin ID`, `/unpin ID`,
 something is looked up on request), `/private on|off` (on: nothing
 written to memory, and the log keeps only sizes and hashes keyed with
 `state/log-key`).
+
+## Long memory
+
+Beside the memory items, two ways back to what was said.
+
+**`history`.** A tool the agent has wherever it has `recall` (allowed by
+default; `deny history *` in `rules` stops it). It searches every earlier
+turn in the log: your messages, the agent's replies and posts, and tool
+results (the first 2 KB, what the log keeps). Every word must be in the
+turn (case does not matter, part of a word counts), or a phrase in double
+quotes as written. It answers up to 20 turns, newest first, each with its
+date (your time), conversation and run, then where the older ones start
+(`before = DATE TIME`); `conversation` keeps to one; with `run` it shows
+that run's steps (16 KB, as `/session` does). What a run may search:
+
+| The run | Searches |
+|---|---|
+| started by you in a conversation only you read (main, the terminal, your topics) | every conversation |
+| of a schedule, a trigger or a workflow, or where others read | only its own (its `to`) |
+
+What was said with `/private on` keeps only sizes and hashes in the log,
+so it is never found, and a private run's steps are not shown. You search
+the same way with `/history WORDS` (one message) and `harness log search
+WORDS` (every conversation; an argument with spaces is a phrase; it works
+while harness runs). A `delegate` task gets `history` when it names it
+(a task that names no tools keeps `helper`'s six).
+
+**Summaries by day, week and month.** Once a day, at 03:00 your time or
+the first tick after (where `harness run` or `harness chat` runs), the
+memory model summarises each conversation's earlier days from the log, up
+to 7 days back, oldest first: what you asked for and decided, facts,
+names, numbers, links, what is still open, in at most 150 words. A day's
+turns are the runs you started there and the others that posted there
+(200 KB at most, the newest kept); a day without any makes no call. After
+a Sunday the week's days fold into one summary (ISO weeks, 150 words);
+after a month's last day, its weeks and the days no week covers (200
+words). They are files in `state/summaries/` (see The data folder),
+written whole. A failed call is tried again that day (after 5, 10, 20,
+40 minutes, then hourly) and given up the next; chat never waits for
+them, and `/reload` answers Busy while they run.
+
+Each conversation's prompt gets its own, after the memory items and
+before the summary of its earlier turns: "Earlier in this conversation:",
+the 3 latest days, the 2 latest weeks those days do not cover, the 3
+latest months, at most 1,500 words (the oldest go first), and a line that
+`history` finds anything older or exact. They are in the part of the
+prompt kept for the prompt cache, so it holds: they change only when the
+daily pass writes a file. Helpers and definitions with `memory: pinned`
+don't get them.
+
+Cost: one small model call per active conversation per day, one more on
+Mondays (the week) and on the 1st (the month). `[memory] summaries = off`
+stops them, and keeps them out of prompts (the files stay);
+`summary_model = PROVIDER:MODEL` picks another model than
+`memory_model`. Private conversations get none.
+
+Not built: embeddings or a vector index, and an index of the log: a
+search reads the log from its end (all of a 50 MB log in about 0.1 s here,
+0.6 s in a debug build).
 
 ## Briefs
 
@@ -1235,7 +1300,7 @@ triggers = off`, see Money), workflows, webhooks and websockets.
 [LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/envs`, `/env
 check|rm NAME`, `/dryrun on|off`,
 `/reload`, `/conversations`, `/conversation new|rename|rm|add`,
-`/session [N]`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
+`/session [N]`, `/history WORDS`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
 `/agents`, `/agent [NAME]`, `/agent show|rm NAME`, `/ask NAME text`,
 `/triggers`, `/trigger NAME`, `/trigger add|rm|pause|resume|run|test`,
 `/apps`, `/app approve|rm NAME`, `/help`. `/new`, `/private` and `/agent`
@@ -1245,7 +1310,7 @@ act on the conversation they are sent in; `/stop`, `/dryrun` and
 CLI: `init`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`, `chat`, `brief [NAME]`,
 `task run NAME`, `trigger list|test|run`, `memory [list|pin|unpin|forget ID]`,
 `snapshot list|take|changes|restore`, `env list|check|rm|key`,
-`agent list|show|rm`, `log verify|tail|runs|session`, `inbox [--json]`,
+`agent list|show|rm`, `log verify|tail|runs|session|search`, `inbox [--json]`,
 `app list|approve|rm`,
 `health`, `version`. `--home DIR` may come anywhere on the line;
 arguments a command does not take are refused. `health` exits 0 only

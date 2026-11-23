@@ -42,8 +42,9 @@
 - `pub fn answer(a, io, src: *const Source, view: View{ scope, utc_offset }, input_json) !Answer{ text, is_error }`; `pub fn gateArg(a, input_json) ![]const u8` (the words, or `run N`); `pub const tool_def: model.ToolDef`.
 
 Tests (hand-written log lines in a temp file):
-- [ ] `history_finds_old_turns_by_words_and_phrase`: all words in one run across owner message, post and tool output (any case) → hit; a word missing → no hit; `"flight to oslo"` matches as typed only; newest first; 25 matching runs → 20 shown and "before = …" for the rest; `before` keeps older ones only; a word only in a label (`chat`, `owner`) finds nothing; `history`'s own tool output is not searched.
-- [ ] `search_keeps_to_its_scope`: all vs one conversation; `conversation` filter; private lines (`{"bytes":N,"hmac":…}`) never match.
+- [ ] `history_finds_old_turns_by_words_and_phrase`: all words in one run across owner message, post and tool output (any case) → hit; a word missing → no hit; `"flight to oslo"` matches as typed only; newest first; a word only in a label (`chat`, `owner`) finds nothing.
+- [ ] `history_shows_20_turns_and_where_the_older_ones_are`: 25 matching runs → 20 shown and "before = …" for the rest; `before` keeps older ones only.
+- [ ] `search_keeps_to_its_scope`: all vs one conversation; `conversation` filter; private lines (`{"bytes":N,"hmac":…}`) never match; `history`'s own tool output is not searched.
 - [ ] `history_run_returns_its_session`: run view ≤ 16 KB with "harness log session N shows all" when cut; a run of another conversation: "No run N here"; a private run refused.
 - [ ] Run each with `-Dtest-filter`, see it fail (no file), implement, see it pass; commit.
 
@@ -53,13 +54,13 @@ Tests (hand-written log lines in a temp file):
 
 - [ ] `history_keeps_to_what_the_run_may_see` (core): chat in main finds main's, house-search's and family's turns; a task with `to = house-search` finds only house-search's; its run view of main's run says "No run … here".
 - [ ] `a_private_conversations_words_are_never_found` (core): a turn in a private topic, then history from main: nothing; the words are not in the log file.
-- [ ] Offered like recall: main's tool list has `history`; a bare `delegate` task's helper keeps 0.3's six (Ruling 3). Full suite; commit.
+- [ ] `history_is_offered_like_recall` (agent): main's tool list has `history`, scheduled runs too; a definition names it; a bare `delegate` task keeps 0.3's six (Ruling 3); a call is allowed without asking, a deny rule stops it. Full suite; commit.
 
 ### Task 3: `/history` and `harness log search`, and a large log
 
 **Files:** `core.zig` (`/history WORDS` → `historyText`, 3,500 bytes, help line), `main.zig` (`log search WORDS…`: an argument with spaces is a phrase; dates in config.ini's utc_offset; usage line), `history.zig` (timing test).
 
-- [ ] `the_history_command_and_log_search_find_old_turns` (core + main's function).
+- [ ] `the_history_command_finds_old_turns` (core), `log_search_takes_words_and_phrases_from_the_command_line` (history.zig, `searchText`), `log_search_takes_words` (main.zig, the argument check).
 - [ ] `a_search_over_a_50_mb_log_stays_fast`: builds a 50 MB log in the temp folder, searches a word in its oldest run; prints ms; bound 20 s Debug / 5 s release-modes. Commit.
 
 ### Task 4: summaries.zig — the daily pass
@@ -71,7 +72,7 @@ Tests (hand-written log lines in a temp file):
 - [ ] `days_fold_into_weeks_and_months` (fake clock: `now_s` passed in; fake model: TestEnv): a log over 2026-10-26 … 2026-12-01; passes day by day; day files with the model's text; Monday's pass folds the week (request carries that week's day summaries, 150 words); Dec 1 folds November (weeks whose Sunday is in it + Nov 30's day); a day with no turns makes no call; a silent scheduled run makes no call; `memory` lines `summary` with conversation, period, words, tokens.
 - [ ] `missed_days_are_caught_up_oldest_first_at_most_7_back`.
 - [ ] `a_failed_summary_is_tried_again_then_given_up`: 500 → no file, retry not before 5 min; same day success → file; failure through the day → next day's pass writes `.given-up`, logs `summary given up`, no call.
-- [ ] `summaries_are_kept_60_days_weeks_400_months_always`; secrets in the log input are masked in the request. Commit.
+- [ ] `a_pass_stops_after_3_failed_calls`, `summaries_are_kept_60_days_weeks_400_days_months_always`, `a_summary_never_holds_a_secret` (a value stored after the line was written is masked in the request and the file). Commit.
 
 ### Task 5: summaries where harness runs
 
@@ -94,4 +95,28 @@ Tests (hand-written log lines in a temp file):
 
 ## Rulings
 
-(filled in as they are made; see the end of this file)
+Each: what – why – cost if wrong.
+
+1. **A turn is a run.** `history` matches a run (one `rid`): its first line's message, its posts (not refused ones, not a scheduled run's NOTHING), its answer, its tool calls' arguments and results (the 2 KB the log keeps). Helpers are runs of their own. `history`'s own results are not searched. – The log keeps a run's words on several lines; "every word must be in the turn" needs one unit, and a URL is found by its address. – A word that is only in a gate line's reason or a label (tool, run, conversation) is not found.
+2. **Who sees what.** A run whose `by` is `owner`, in a conversation not shared, searches every conversation (0.3's lines without one too); every other run only its own conversation (its `to`). `/history` is the owner's: as an owner's run in the conversation it is sent in. `harness log search`: everything. A run view or a `conversation` outside the scope says only what this run searches. – The spec's three cases come to this one rule (owners' runs only happen where the owner talks; groups are post-only). – None expected; an app's run (gap 8) is treated as a scheduled one.
+3. **Helpers keep 0.3's six default tools.** `history` is offered wherever there is a log, within a definition's `tools` and a task's narrowing, exactly as `recall` is; but a `delegate` task that names no tools still gets search, fetch, browse, read_file, recall, skill. – `agents.default_tools` is documented as "0.3's six" in agents.zig, the README and the delegate tool's description; a helper is handed a standalone task. – A bare helper can't search the history; cost to change: one word in `default_tools` and three texts.
+4. **The log does not rotate** (log.zig has no rotation): history and the summaries read `log/actions.jsonl` only. – Nothing to read beside it. – When rotation is built, `search` and `readDays` read the parts too.
+5. **A private run's view is refused** ("Run 41 is private: what was said in it is not in the log"), not shown with its labels. – "Private conversations are never found"; the labels say where and when the owner talked privately. – The model can't see a private run's steps; the owner still has `/session` there.
+6. **A day's input.** The runs of that conversation that day the owner started, and the others that posted there (`sent` or `kept`); helpers left out (their answers are in their run's delegate result); the owner's messages (scheduled runs' instructions with their label), posts, the answer of a run that posted nothing, tool calls with 300 bytes of their argument and 500 of their result; 200 KB, newest runs kept. – A trigger or task that checks every 5 minutes and stays silent would otherwise make every day of `main` "active" and fill its summaries with checks. – A scheduled run that only wrote files leaves nothing in the summaries (`history` still finds it).
+7. **Folds.** A week folds in the pass after its Sunday (Monday 03:00), from its day summaries; a month in the pass after its last day, from the summaries of the ISO weeks whose Sunday falls in it, and the day summaries of its days no such week summary covers (the days after its last Sunday, a week whose fold was given up). – ISO weeks cross months; on the 1st the month's last week is not over. – A week across two months is summarised with the month its Sunday is in.
+8. **Retries.** A failed call is tried again by a later pass 5 minutes after, then 10, 20, 40, then every hour, while it is the same day (the owner's time); the first pass of a later day gives it up: it logs `summary given up` and writes `PERIOD.given-up` beside the summaries (pruned with them), so it is not tried again. A pass stops after 3 failed calls (the model is likely not there). A week or month waits for its days that wait. The failures are kept in memory: after a restart a failing period gets one more day of tries. – Bounded cost, nothing blocks chat. – A failing period costs up to about 20 failed calls on its day.
+9. **"Weeks not covered" and the cap.** A week is covered when it has day summaries and all of them are among the 3 shown; one with none left (older than 60 days) is not. Months: the 3 latest, as written. Past 1,500 words whole summaries go, the oldest period first; one alone over it is cut to its first 1,500 words. – The spec names "not covered" for weeks only. – The latest month can repeat what a shown week says.
+10. **Which prompts.** Runs whose definition reads shared memory (`memory: shared`), in their conversation (a task's: its `to`); not helpers, not `memory: pinned` definitions. The block is in the cached part, after the memory items (pinned and the strongest) and before the rolling summary: its bytes change only when the daily pass writes a file (once a day, plus a retry's success that day). – A definition with `memory: pinned` gets "pinned items only" (the agents spec's R3); helpers get their task alone. – A quiet definition does not see what was said in the conversation.
+11. **Where the pass runs.** In `harness run` and `harness chat` (where `tick` starts pollers), on a thread of its own; `/reload` says Busy while it runs and `close` waits for it; settings are read under their lock at its start. – A pass reads the providers that /reload replaces. – A one-off `harness task run` makes no summaries.
+12. **Matching.** Case is ignored for ASCII letters; a word matches inside a longer one ("flat" finds "flats"); a phrase matches as written, single spaces included. – std only; no stemming. – "É" and "é" differ; a phrase split by a line break is not found (its words are).
+13. **Long summaries** are cut at twice the asked words (300, 300, 400) when written. – A model that ignores the limit would otherwise push the rest out of the prompt. – None.
+14. **`summaries = off` also keeps the summaries already written out of prompts** (the files stay; on brings them back). – Off reads as "the feature is off"; an owner who switches it off for privacy would not expect last week in the prompt. – An owner who only wanted to save the calls loses summaries that cost nothing more.
+15. **`before` also takes a time** (`YYYY-MM-DD HH:MM[:SS]`, the owner's time), which the "more turns" line gives, so the next page starts where the last one ended. – A date alone can't page through a busy day. – None.
+
+## Notes (as built)
+
+- Commits: 32a7fba (history.zig), 4249a47 (the tool in runs), b2405e6 (`/history`, `log search`), 7dd6ff7 (summaries.zig), then the prompt, the daily job, the README.
+- Speed (Task 3): a search that reads all of a 50 MB log (the word only in its oldest run) took 613 ms in a debug build and 66 ms in ReleaseSafe on this Mac, busy with a VM and two other builds; the test's bound is 20 s debug, 5 s otherwise. No index.
+- Existing tests changed: none. The prompt changes only where a conversation has summaries, and the tool list only where a run has a log (agent.zig's test fixture has none).
+- Shared files touched: agent.zig (one import each for history and summaries, the Run field `history`, one line each in `allows`, `toolDefs`, `callToolRaw`'s argument and call, `earlierBlock` and its one line in `systemParts`; two tests), core.zig (two imports, fields `history_src` and `summary_job` set in `open`, `baseRun`'s `.history`, `/history` and its help line, `historyText`, `sharedConversation`, the tick's one line, `summariesDue`/`summaryThread`/`summarizeNow`/`conversationIsPrivate`, close's wait and free, /reload's Busy; four tests), config.zig (`[memory] summaries`, `summary_model`, two template lines; one test), gate.zig (the kind), tools.zig (two switch arms), main.zig (`log search`, usage, argument check; one test), memory.zig (a test block pulling in history.zig and summaries.zig, so main.zig's list is unchanged).
+- Flake seen once in a full run, passing alone three times: `an_attachment_outside_the_workspace_or_holding_a_stored_secret_is_refused` (core.zig): it waits for the post to arrive, then reads the log's last `send` line, which is written just after the post is delivered. Not changed here.
