@@ -990,7 +990,8 @@ when the house is empty and acts like it:
   owner has been told.").
 - **One line at 20:00**: "All quiet at home." when no door, window or
   movement came since the last one, else what did and when; then each
-  ring at the door and each parcel left.
+  ring at the door and each parcel the deliveries saw delivered ("A
+  parcel was left at 14:10.", Errands and upkeep).
 - **What it may do by itself**: `home_set` alone, through the gate as
   `schedule:away` with nobody to ask (a rule must allow each call:
   `[schedule:away]` in rules, these calls exactly); never `home_guarded`,
@@ -1041,9 +1042,11 @@ a Zigbee2MQTT button named a doorbell) push `ring`. The **Doorbell**
 routine:
 
 - while someone is home: "Someone's at the front door, probably the DHL
-  parcel." (the parcel when your mailbox has one due today: only a
-  carrier's name from a fixed list, never a mail's words), said on every
-  speaker when the home has one; quiet hours hold it as any routine's line;
+  parcel." (the parcel the deliveries expect: out for delivery or due
+  today, from your messages and your mailbox (Errands and upkeep); only a
+  carrier's name from their table, never a mail's or a sender's words),
+  said on every speaker when the home has one; quiet hours hold it as any
+  routine's line;
 - while you're away: "Someone's at the front door while you're away.",
   urgent, through quiet hours and to the household, noted for the 20:00
   line, and never with a button that unlocks;
@@ -1317,9 +1320,10 @@ Butler:  Tracking your DPD parcel 1000123456789U: I'll say when it's out for del
 - **Lines**: out for delivery, waiting at the parcel locker (InPost),
   delivered; each once, to main (quiet hours hold them). A parcel found
   in mail says nothing for what its first read finds.
-- **The doorbell**: `Core.deliveryHint` gives "probably the DPD parcel"
-  (or "probably the DPD or the InPost parcel", "probably a parcel") when
-  one is out for delivery or due today, for the door's routine.
+- **The doorbell**: "probably the DPD parcel" (or "probably the DPD or
+  the InPost parcel", "probably a parcel") when one is out for delivery
+  or due today, in the door's routine (The door); delivered, and away
+  mode on, it is in the 20:00 line.
 - `/deliveries` lists them, `/deliveries rm NUMBER` stops one. Delivered
   ones go after 2 days, others after 30. `state/deliveries` keeps them.
 
@@ -2600,8 +2604,7 @@ only after a 3% move. A section's keys give its kind:
   is dropped as it comes (see Away and travel). `tag = no` posts a `say`
   without `[NAME]` in front, as the butler's routines speak. A doorbell's
   event (homemcp's kind `doorbell`) has a field `hint` too: ", probably
-  the DHL parcel" when your mailbox has a delivery due today (see The
-  door).
+  the DHL parcel" when the deliveries expect one today (see The door).
 - **State.** `state/triggers/NAME/` keeps `state` (where its polls are,
   what it counted), `seen`, `queue` and a page's `last` text. A poll
   writes its events to `queue` before its cursor moves, and an event is

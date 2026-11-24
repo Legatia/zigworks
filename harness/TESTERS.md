@@ -212,8 +212,8 @@ notes):
   the first of you comes home.
 - **Day 12, the door.** With a doorbell in Home Assistant (or a
   Zigbee2MQTT button named "doorbell"), ring it: "Someone's at the front
-  door." (with "probably the DHL parcel" when your mailbox has one due
-  today). If you added `unlock` to the front door's `allow` line in
+  door." (with "probably the DPD parcel" when a parcel you track, or one
+  from your mailbox, is out for delivery or due today). If you added `unlock` to the front door's `allow` line in
   home.ini yourself, the line has **Unlock the door**: tap it only if you
   mean it; with no tap nothing happens. While you're away the ring comes
   at once, with no button to unlock.

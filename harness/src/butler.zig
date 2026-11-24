@@ -1339,6 +1339,8 @@ pub fn routineFiles(a: Allocator, r: Routine, p: Picks, date: []const u8) !Files
         const body = tmpl[(std.mem.indexOf(u8, tmpl, "[") orelse 0)..];
         const each: []const Device = if (std.mem.indexOf(u8, sname, "<leak>") != null) p.leaks else if (std.mem.indexOf(u8, sname, "<door>") != null) p.doors else if (std.mem.indexOf(u8, sname, "<smoke>") != null) p.smokes else if (std.mem.indexOf(u8, sname, "<watch>") != null) try std.mem.concat(a, Device, &.{ p.doors, p.motions }) else if (std.mem.indexOf(u8, sname, "<bell>") != null) p.doorbells else &.{};
         if (each.len == 0) {
+            // a section for each sensor, and none (away in a home with lights only): no section
+            if (std.mem.indexOfScalar(u8, sname, '<') != null) continue;
             try trig.print(a, "; added by /setup routines {s}: {s}\n{s}\n", .{ date, r.title(), try fill(a, body, values, flags, &missing) });
             continue;
         }
@@ -1984,6 +1986,19 @@ test "the_away_routine_fills" {
     // other lights, other lines; none: no light line
     try t.expectEqualStrings("allow mcp home/home_set {\"action\":\"on\",\"device\":\"hall_light\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"hall_light\"}", try awayCalls(a, &.{"hall_light"}, null, 21));
     try t.expectEqualStrings("# no lights, no heating", try awayCalls(a, &.{}, null, 21));
+}
+
+test "the_away_routine_fills_for_a_home_with_lights_only" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try parseHome(a, "[home]\nname = Small flat\n[device hall_light]\nkind = light\nroom = Hall\nallow = on, off\n");
+    const p = try pick(a, h, .{});
+    try t.expect(Routine.away.offered(p));
+    // no door, window or motion sensor: no trigger of its own; the light still goes on and off
+    const f = try routineFiles(a, .away, p, "2026-11-23");
+    try t.expectEqualStrings("", f.triggers);
+    try expectIn(f.rules, "allow mcp home/home_set {\"action\":\"on\",\"device\":\"hall_light\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"hall_light\"}");
 }
 
 test "the_doorbell_routine_fills" {
