@@ -280,8 +280,8 @@ release.
   `answerItem(…, via .bar)`, the shell's path, keeping the shell's 0.5 s
   click guard.
 - **Voice input:** the mic button shows only when `[voice]` is set.
-  1. It records in the page (MediaRecorder; the fixed port keeps the
-     permission).
+  1. It records in the page (MediaRecorder); the desk app grants the
+     microphone for this origin only.
   2. It posts the audio to a shell path (up to 10 MB, a larger body cap
      for that path only).
   3. harness transcribes it with `Transcriber.transcribe`. The transcript
