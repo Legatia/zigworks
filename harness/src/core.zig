@@ -62,6 +62,7 @@ const habits_mod = @import("habits.zig");
 const evening_mod = @import("evening.zig");
 const away_mod = @import("away.zig");
 const trips_mod = @import("trips.zig");
+const taskfiles = @import("taskfiles.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -117,6 +118,8 @@ pub const Paths = struct {
     workflows: []const u8,
     /// Their instances, `state/workflows/NAME/N/`.
     workflows_state: []const u8,
+    /// Tasks' instructions in files of their own (`do_file`), `tasks/NAME.md`.
+    tasks_dir: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -166,6 +169,7 @@ pub const Paths = struct {
             .triggers_state = try j(a, &.{ state, "triggers" }),
             .workflows = try j(a, &.{ home, "workflows" }),
             .workflows_state = try j(a, &.{ state, "workflows" }),
+            .tasks_dir = try j(a, &.{ home, "tasks" }),
         };
     }
 };
@@ -1139,7 +1143,9 @@ pub const Core = struct {
         c.cfg = config.parse(a, texts[0]) catch return error.BadSettings;
         c.rule_list = rules.parse(a, texts[1]) catch return error.BadSettings;
         c.briefs = config.parseBriefs(a, texts[2]) catch return error.BadSettings;
-        c.tasks = config.parseTasks(a, texts[3]) catch return error.BadSettings;
+        const tasks = config.parseTasks(a, texts[3]) catch return error.BadSettings;
+        if (try taskfiles.resolve(c.io, a, c.paths.tasks_dir, tasks) != null) return error.BadSettings;
+        c.tasks = tasks;
         c.login_list = logins.parse(a, texts[4]) catch return error.BadSettings;
         c.folder_list = folders_mod.parse(a, texts[6]) catch return error.BadSettings;
         c.env_list = environments_mod.parse(a, texts[8]) catch return error.BadSettings;
@@ -4816,6 +4822,11 @@ pub const Core = struct {
                 break;
             };
             if (st.skipped != null) continue;
+            // a plain env value that is a stored secret: said, not started
+            if (mcp.envHoldsSecret(sc, c.secret_list)) |name| {
+                st.skipped = std.fmt.allocPrint(a, "env {s} holds a stored secret; give it with secret = {s}:NAME", .{ name, name }) catch "env holds a stored secret";
+                continue;
+            }
             // a server at a url: its stored token, or its sign-in
             switch (mcp.kindOf(sc)) {
                 .token => st.auth = .{ .token = .{ .name = sc.token, .value = c.secretValue(a, sc.token) orelse {
@@ -14882,7 +14893,9 @@ pub fn settingsProblemWith(io: Io, a: std.mem.Allocator, p: Paths, secrets: []co
     var loaded = set.read(a, &diag) catch return null;
     defer loaded.deinit();
     const tasks_text = Io.Dir.cwd().readFileAlloc(io, p.tasks, a, .limited(1 << 20)) catch "";
-    const tasks = config.parseTasks(a, tasks_text) catch &.{};
+    var no_tasks: [0]config.Task = .{};
+    const tasks = config.parseTasks(a, tasks_text) catch no_tasks[0..];
+    if (try taskfiles.resolve(io, a, p.tasks_dir, tasks)) |why| return why;
     for (tasks) |tk| if (!loaded.has(tk.agent))
         return try std.fmt.allocPrint(a, "tasks.ini: task {s} names agent {s}, which is not defined (no agents/{s}.md)", .{ tk.name, tk.agent, tk.agent });
     // triggers.ini: a line that does not read, a name taken, a definition missing
@@ -16375,6 +16388,23 @@ test "session_shows_the_last_run_here_and_only_labels_for_a_private_one" {
         try t.expect(l.len <= 3500);
         try t.expect(std.mem.indexOf(u8, l, "harness log session ") != null);
     };
+}
+
+test "a_task_with_do_file_runs_its_file" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // a task whose instructions are their own file: a missing one is a settings problem
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.tasks, .data = "[brief]\nat = 23:59\ndo_file = brief.md\n" });
+    try t.expect(std.mem.indexOf(u8, try f.core.reload(), "task brief names tasks/brief.md, which can't be read") != null);
+    try Io.Dir.cwd().createDirPath(t.io, f.core.paths.tasks_dir);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.paths.tasks_dir, "brief.md" }), .data = "Check the feeds ; then the inbox #now\n\nSecond paragraph, whole." });
+    _ = try f.core.reload();
+    try f.e.script(1, model.textReply("NOTHING"));
+    _ = try f.core.runTask(f.core.tasks[0]);
+    const req = try f.e.request(1);
+    for ([_][]const u8{ "Check the feeds ; then the inbox #now", "Second paragraph, whole." }) |said| try t.expect(std.mem.indexOf(u8, req, said) != null);
 }
 
 test "history_keeps_to_what_the_run_may_see" {
@@ -18456,6 +18486,20 @@ test "a_server_whose_money_list_names_a_missing_tool_is_not_started" {
     try t.expectEqual(0, f.core.mcp_tools.len);
     try f.core.handleText("/status");
     try f.rec.waitFor("fake: not started: money = names \"place_order\", which is not one of its tools");
+}
+
+test "a_server_whose_env_holds_a_stored_secret_is_not_started" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const key = f.core.secrets.omnigate.?;
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\nenv = FAKE_PLAIN={s}\n", .{ fake, key }) });
+    _ = try f.core.reload();
+    try t.expectEqual(0, f.core.mcp_servers.items.len);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, "fake: env FAKE_PLAIN holds a stored secret; give it with secret = FAKE_PLAIN:NAME") != null);
+    try t.expect(std.mem.indexOf(u8, f.core.mcp_note, key) == null);
 }
 
 test "mcp_start_errors_are_masked_in_the_log" {

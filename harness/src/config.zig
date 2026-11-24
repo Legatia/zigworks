@@ -703,11 +703,13 @@ pub const Task = struct {
     start_input: []const u8 = "",
     /// It is a schedule of triggers.ini, not a task of tasks.ini.
     in_triggers: bool = false,
+    /// `do_file = NAME.md`: `do` is read from tasks/NAME.md (taskfiles.zig).
+    do_file: []const u8 = "",
 
     /// A copy whose every slice is in `a` (a background run's own).
     pub fn clone(tk: Task, a: std.mem.Allocator) !Task {
         var o = tk;
-        inline for (.{ "name", "do", "to", "agent", "say", "start", "start_input" }) |f| @field(o, f) = try a.dupe(u8, @field(tk, f));
+        inline for (.{ "name", "do", "to", "agent", "say", "start", "start_input", "do_file" }) |f| @field(o, f) = try a.dupe(u8, @field(tk, f));
         return o;
     }
 };
@@ -945,6 +947,8 @@ pub const tasks_example =
     \\; you unless it is NOTHING; to = NAME posts it to that conversation
     \\; (default main, the private chat; a new name opens that topic);
     \\; agent = NAME runs it as that definition (default main, agents/).
+    \\; do_file = NAME.md instead of do: the instructions are the file
+    \\; tasks/NAME.md, read whole (several lines, ; and # kept).
     \\;
     \\; [weekly-review]
     \\; at = 18:00

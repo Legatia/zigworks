@@ -79,6 +79,9 @@ pub const Trigger = struct {
     /// A question the model answers yes or no about each event the rules passed.
     check: []const u8 = "",
     action: Action = .none,
+    /// tasks.ini's `do_file = NAME.md`: the instructions are the file
+    /// tasks/NAME.md, read whole (taskfiles.zig); "": `do` says them.
+    do_file: []const u8 = "",
     /// `start = workflow NAME TEXT`: TEXT, its `{field}`s filled from the
     /// event, is the instance's input; "": the event as text.
     start_input: []const u8 = "",
@@ -117,7 +120,7 @@ pub const Trigger = struct {
     /// A copy whose every slice is in `a`.
     pub fn clone(tr: Trigger, a: Allocator) !Trigger {
         var o = tr;
-        inline for (.{ "name", "json", "key", "check", "agent", "to", "added", "announce", "start_input" }) |f| @field(o, f) = try a.dupe(u8, @field(tr, f));
+        inline for (.{ "name", "json", "key", "check", "agent", "to", "added", "announce", "start_input", "do_file" }) |f| @field(o, f) = try a.dupe(u8, @field(tr, f));
         o.sources = try dupeList(a, tr.sources);
         if (tr.mcp) |m| o.mcp = .{ .server = try a.dupe(u8, m.server), .uri = try a.dupe(u8, m.uri), .tool = try a.dupe(u8, m.tool), .input = try a.dupe(u8, m.input) };
         const topics = try a.alloc(config.Topic, tr.topics.len);
@@ -315,11 +318,18 @@ pub fn parse(a: Allocator, text: []const u8, file: File, diag: *Diag) Error![]Tr
     return out.items;
 }
 
-/// A tasks.ini section: at, every (minutes, at least 5), days, do, to,
-/// agent; `do` and one of `at` and `every`.
+/// `do_file`'s value: NAME.md, NAME by the name rule, a file directly in tasks/.
+pub fn validDoFile(file: []const u8) bool {
+    if (!std.mem.endsWith(u8, file, ".md")) return false;
+    return validName(file[0 .. file.len - 3]);
+}
+
+/// A tasks.ini section: at, every (minutes, at least 5), days, do or
+/// do_file, to, agent; one of `do` and `do_file`, one of `at` and `every`.
 fn taskSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
     var tr: Trigger = .{ .name = g.name, .file = .tasks, .kind = .schedule };
     var do: []const u8 = "";
+    var do_line: usize = 0;
     for (g.lines) |l| {
         if (std.mem.eql(u8, l.key, "at")) {
             tr.at = config.parseClock(l.value) catch return bad(diag, l.n, "at is HH:MM");
@@ -327,17 +337,24 @@ fn taskSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
             tr.every_s = 60 * (config.parseEvery(l.value) catch return bad(diag, l.n, "every is like 15m or 2h, at least 5m"));
         } else if (std.mem.eql(u8, l.key, "days")) {
             tr.days = config.parseDays(l.value) catch return bad(diag, l.n, "days are mon, tue, wed, thu, fri, sat, sun, separated by commas");
-        } else if (std.mem.eql(u8, l.key, "do")) {
-            do = l.value;
+        } else if (std.mem.eql(u8, l.key, "do") or std.mem.eql(u8, l.key, "do_file")) {
+            if (do_line != 0) return bad(diag, l.n, "a task takes do or do_file, not both");
+            do_line = l.n;
+            if (std.mem.eql(u8, l.key, "do")) {
+                do = l.value;
+            } else {
+                if (!validDoFile(l.value)) return bad(diag, l.n, "do_file names a file in tasks/: NAME.md, the name in a-z, 0-9, - and _");
+                tr.do_file = l.value;
+            }
         } else if (std.mem.eql(u8, l.key, "to")) {
             if (!conversations.validName(l.value)) return bad(diag, l.n, "to names a conversation: a-z, 0-9, - and _");
             tr.to = l.value;
         } else if (std.mem.eql(u8, l.key, "agent")) {
             if (!agents.validName(l.value)) return bad(diag, l.n, "agent names a definition: a-z, 0-9 and -");
             tr.agent = l.value;
-        } else return badf(a, diag, l.n, "tasks.ini takes at, every, days, do, to and agent, not {s}", .{l.key});
+        } else return badf(a, diag, l.n, "tasks.ini takes at, every, days, do, do_file, to and agent, not {s}", .{l.key});
     }
-    if (do.len == 0) return bad(diag, g.head.n, "a task needs do");
+    if (do.len == 0 and tr.do_file.len == 0) return bad(diag, g.head.n, "a task needs do or do_file");
     if ((tr.at == null) == (tr.every_s == null)) return bad(diag, g.head.n, "a task needs every or at, not both");
     tr.action = .{ .do = do };
     return tr;
@@ -1092,6 +1109,7 @@ pub fn tasksOf(a: Allocator, list: []const Trigger) ![]config.Task {
                 else => "",
             },
             .start_input = tr.start_input,
+            .do_file = tr.do_file,
             .to = tr.to,
             .agent = tr.agent,
             .in_triggers = tr.file == .triggers,
@@ -1417,4 +1435,30 @@ test "while_is_read" {
     try t.expect(!plain_say.tag);
     try t.expect(!(try plain_say.clone(a)).tag);
     try refused(a, "[x]\nmcp = home resource home://device/x\nstart = workflow y\ntag = no\n", 4, "tag goes with say");
+}
+
+test "do_file_names_a_file_in_tasks" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    const ts = try parse(a, "[brief]\nat = 07:00\ndo_file = brief.md\n", .tasks, &d);
+    try t.expectEqualStrings("brief.md", ts[0].do_file);
+    const tasks = try tasksOf(a, ts);
+    try t.expectEqualStrings("brief.md", tasks[0].do_file);
+    try t.expectEqualStrings("brief.md", (try tasks[0].clone(a)).do_file);
+    for ([_][2][]const u8{
+        .{ "[x]\nat = 07:00\ndo = y\ndo_file = x.md\n", "a task takes do or do_file, not both" },
+        .{ "[x]\nat = 07:00\ndo_file = ../x.md\n", "do_file names a file in tasks/" },
+        .{ "[x]\nat = 07:00\ndo_file = x.txt\n", "do_file names a file in tasks/" },
+        .{ "[x]\nat = 07:00\ndo_file = Big.md\n", "do_file names a file in tasks/" },
+        .{ "[x]\nat = 07:00\n", "a task needs do or do_file" },
+    }) |c| {
+        d = .{};
+        try t.expectError(error.BadTrigger, parse(a, c[0], .tasks, &d));
+        try t.expect(std.mem.indexOf(u8, d.why, c[1]) != null);
+    }
+    // not a key of triggers.ini
+    d = .{};
+    try t.expectError(error.BadTrigger, parse(a, "[x]\nat = 07:00\ndo_file = x.md\n", .triggers, &d));
 }
