@@ -89,11 +89,14 @@ fn say(r: Run, comptime fmt: []const u8, args: anytype) void {
 /// relative to it), and what its SKILL.md says.
 const Found = struct { folder: []const u8, files: []skillsrc.File, facts: ?skillsrc.Facts = null, why: ?[]const u8 = null };
 
+/// Files over a skill's limit for one file, kept as their size alone.
+const Oversize = targz.Oversize;
+
 /// What was fetched: the skills in it, and the commit or "-".
 const Fetched = struct { skills: []Found, pin: []const u8, source: []const u8 };
 
 fn add(r: Run, dir: []const u8, args: Args) !u8 {
-    const got = fetch(r, args.target) catch |e| {
+    const got = fetch(r, args.target, args.skill orelse "") catch |e| {
         say(r, "{s}: {s}\n", .{ args.target, fetchWhy(e) });
         return 1;
     };
@@ -246,19 +249,20 @@ fn referredFiles(a: std.mem.Allocator, md: []const u8) ![]const []const u8 {
 }
 
 /// The skills at a source, each with its files and facts (or why it can't be installed).
-fn fetch(r: Run, text: []const u8) !Fetched {
+/// `want`: the one skill's folder name `--skill` names ("" for all of them).
+fn fetch(r: Run, text: []const u8, want: []const u8) !Fetched {
     const cwd = Io.Dir.cwd();
     const is_folder = if (cwd.statFile(r.io, text, .{})) |st| st.kind == .directory else |_| false;
     const src = try skillsrc.parseSource(r.a, if (is_folder) (cwd.realPathFileAlloc(r.io, text, r.a) catch text) else text, is_folder);
     switch (src) {
         .hermes => return error.NoSource,
-        .folder => |f| return .{ .skills = try skillsIn(r.a, try folderFiles(r, f), std.fs.path.basename(f)), .pin = "-", .source = f },
+        .folder => |f| return .{ .skills = try skillsIn(r.a, try folderFiles(r, f), &.{}, std.fs.path.basename(f)), .pin = "-", .source = f },
         .link => |l| {
             const body = try download(r, l, skills.max_body + 1);
             if (body.len > skills.max_body) return error.SkillMdTooLarge;
             const files = try r.a.alloc(skillsrc.File, 1);
             files[0] = .{ .rel = "SKILL.md", .data = body };
-            var found = try skillsIn(r.a, files, "");
+            var found = try skillsIn(r.a, files, &.{}, "");
             // a link names no folder: the skill's own name is its folder's
             for (found) |*fd| if (fd.facts) |fa| {
                 fd.folder = fa.name;
@@ -272,12 +276,12 @@ fn fetch(r: Run, text: []const u8) !Fetched {
             const u = try std.fmt.allocPrint(r.a, "{s}/{s}/{s}/tar.gz/{s}", .{ std.mem.trimEnd(u8, base, "/"), g.owner, g.repo, if (g.ref.len > 0) g.ref else "HEAD" });
             const gz = download(r, u, 50 * 1024 * 1024) catch |e| return if (e == error.NotFound) error.NoSuchRepo else e;
             var d: targz.Diag = .{};
-            const ar = targz.read(r.a, gz, .{ .path = g.path }, &d) catch |e| {
+            const ar = targz.read(r.a, gz, .{ .path = g.path, .folder = want }, &d) catch |e| {
                 say(r, "{s}/{s}: {s}\n", .{ g.owner, g.repo, d.why });
                 return e;
             };
             // a path's last part is the skill's folder; a repo's root has none
-            return .{ .skills = try skillsIn(r.a, ar.files, std.fs.path.basenamePosix(g.path)), .pin = ar.commit, .source = try skillsrc.sourceText(r.a, src) };
+            return .{ .skills = try skillsIn(r.a, ar.files, ar.oversize, std.fs.path.basenamePosix(g.path)), .pin = ar.commit, .source = try skillsrc.sourceText(r.a, src) };
         },
     }
 }
@@ -297,17 +301,19 @@ fn fetchWhy(e: anyerror) []const u8 {
     };
 }
 
+/// A folder source's files: a folder of skills may hold more than one
+/// skill's limits (each skill's are checked on its own).
 fn folderFiles(r: Run, folder: []const u8) ![]skillsrc.File {
-    return skillsrc.readFolder(r.io, r.a, folder);
+    return skillsrc.readFolderMax(r.io, r.a, folder, 5000, 200 * 1024 * 1024);
 }
 
 /// The skills in a set of files: one, when SKILL.md is at the top (its
 /// folder named `top`, "" when it has no folder to match); else one per
 /// folder holding a SKILL.md (its files those under it).
-fn skillsIn(a: std.mem.Allocator, files: []skillsrc.File, top: []const u8) ![]Found {
+fn skillsIn(a: std.mem.Allocator, files: []skillsrc.File, oversize: []const Oversize, top: []const u8) ![]Found {
     var out: std.ArrayList(Found) = .empty;
     for (files) |f| if (std.mem.eql(u8, f.rel, "SKILL.md")) {
-        var one = try check(a, top, files);
+        var one = try check(a, top, files, oversize);
         one.folder = "";
         try out.append(a, one);
         return out.items;
@@ -325,14 +331,25 @@ fn skillsIn(a: std.mem.Allocator, files: []skillsrc.File, top: []const u8) ![]Fo
         for (files) |g| if (std.mem.startsWith(u8, g.rel, folder) and g.rel.len > folder.len and g.rel[folder.len] == '/') {
             try mine.append(a, .{ .rel = g.rel[folder.len + 1 ..], .data = g.data, .exec = g.exec });
         };
-        try out.append(a, try check(a, folder, mine.items));
+        var big: std.ArrayList(Oversize) = .empty;
+        for (oversize) |o| if (std.mem.startsWith(u8, o.rel, folder) and o.rel.len > folder.len and o.rel[folder.len] == '/') {
+            try big.append(a, .{ .rel = o.rel[folder.len + 1 ..], .size = o.size });
+        };
+        try out.append(a, try check(a, folder, mine.items, big.items));
     }
     return out.items;
 }
 
-/// A skill's checks: its SKILL.md reads, its name is valid and its folder's.
-fn check(a: std.mem.Allocator, folder: []const u8, files: []skillsrc.File) !Found {
+/// A skill's checks: its limits (300 files, 10 MB, 64 KB for SKILL.md,
+/// 256 KB a file), its SKILL.md reads, its name is valid and its folder's.
+fn check(a: std.mem.Allocator, folder: []const u8, files: []skillsrc.File, oversize: []const Oversize) !Found {
     var out: Found = .{ .folder = folder, .files = files };
+    var bytes: usize = 0;
+    for (files) |f| bytes += f.data.len;
+    for (oversize) |o| if (std.mem.eql(u8, o.rel, "SKILL.md")) {
+        out.why = "its SKILL.md is over 64 KB";
+        return out;
+    };
     var md: []const u8 = "";
     for (files) |f| if (std.mem.eql(u8, f.rel, "SKILL.md")) {
         md = f.data;
@@ -357,9 +374,25 @@ fn check(a: std.mem.Allocator, folder: []const u8, files: []skillsrc.File) !Foun
         out.why = try std.fmt.allocPrint(a, "its name {s} doesn't match its folder {s}", .{ fa.name, base });
     }
     for (files) |f| if (f.data.len > skills.max_file) {
-        out.why = try std.fmt.allocPrint(a, "{s} is over 256 KB", .{f.rel});
+        out.why = try std.fmt.allocPrint(a, "{s} is {s} bytes; harness takes at most 262,144 a file", .{ f.rel, try thousands(a, f.data.len) });
     };
+    for (oversize) |o| if (!std.mem.eql(u8, o.rel, "SKILL.md")) {
+        out.why = try std.fmt.allocPrint(a, "{s} is {s} bytes; harness takes at most 262,144 a file", .{ o.rel, try thousands(a, o.size) });
+    };
+    if (files.len + oversize.len > skillsrc.max_files) out.why = try std.fmt.allocPrint(a, "{d} files; harness takes at most 300 a skill", .{files.len + oversize.len});
+    if (bytes > skillsrc.max_total) out.why = try std.fmt.allocPrint(a, "{s} bytes; harness takes at most 10 MB a skill", .{try thousands(a, bytes)});
     return out;
+}
+
+/// 12345 → "12,345".
+fn thousands(a: std.mem.Allocator, n: u64) ![]const u8 {
+    const digits = try std.fmt.allocPrint(a, "{d}", .{n});
+    var out: std.ArrayList(u8) = .empty;
+    for (digits, 0..) |d, i| {
+        if (i > 0 and (digits.len - i) % 3 == 0) try out.append(a, ',');
+        try out.append(a, d);
+    }
+    return out.items;
 }
 
 /// GETs `link` (https, or http to this machine), following up to three
@@ -465,18 +498,30 @@ fn updateOne(r: Run, dir: []const u8, name: []const u8, args: Args) !u8 {
         say(r, "{s}: edited since it was installed; harness skill update {s} --force replaces it\n", .{ name, name });
         return 1;
     }
-    const got = fetch(r, line.source) catch |e| {
+    const got = fetch(r, line.source, "") catch |e| {
         say(r, "{s}: {s}: {s}\n", .{ name, line.source, fetchWhy(e) });
         return 1;
     };
-    var fresh: ?Found = null;
-    for (got.skills) |f| if (f.facts != null and std.mem.eql(u8, f.facts.?.name, name)) {
-        fresh = f;
+    // the skill at its source: the one there, else the one of its name there
+    // (its name at the source when harness renamed it)
+    const upstream = if (line.upstream.len > 0) line.upstream else name;
+    var fresh: ?Found = if (got.skills.len == 1) got.skills[0] else null;
+    if (fresh == null) for (got.skills) |g| {
+        const base = std.fs.path.basenamePosix(g.folder);
+        if ((g.facts != null and std.mem.eql(u8, g.facts.?.name, upstream)) or std.mem.eql(u8, base, upstream)) fresh = g;
     };
-    const f = fresh orelse {
+    var f = fresh orelse {
         say(r, "{s}: {s} no longer has it\n", .{ name, line.source });
         return 1;
     };
+    // a skill harness renamed keeps harness's name
+    if (f.facts != null and !std.mem.eql(u8, f.facts.?.name, name)) {
+        const files = try r.a.dupe(skillsrc.File, f.files);
+        for (files) |*x| if (std.mem.eql(u8, x.rel, "SKILL.md")) {
+            x.data = try skillsrc.renameSkill(r.a, x.data, name);
+        };
+        f = try check(r.a, "", files, &.{});
+    }
     if (f.why) |why| {
         say(r, "{s}: {s}\n", .{ name, why });
         return 1;
@@ -527,7 +572,7 @@ fn updateOne(r: Run, dir: []const u8, name: []const u8, args: Args) !u8 {
         say(r, "{s}: not replaced ({s})\n", .{ name, @errorName(e) });
         return 1;
     };
-    try skillsrc.putSource(r.io, r.a, dir, .{ .name = name, .source = line.source, .pin = got.pin, .hash = &new_hash, .time = time });
+    try skillsrc.putSource(r.io, r.a, dir, .{ .name = name, .source = line.source, .pin = got.pin, .hash = &new_hash, .time = time, .upstream = line.upstream });
     say(r, "{s}: replaced (the old one is in {s}).\n", .{ name, kept });
     return 0;
 }
@@ -842,4 +887,46 @@ test "scripts_keep_their_executable_bit" {
 test "skill_commands_take_their_arguments" {
     for ([_][]const []const u8{ &.{"list"}, &.{ "show", "x" }, &.{ "rm", "x" }, &.{"update"}, &.{ "update", "x", "--force", "--yes" }, &.{ "add", "o/r", "--skill", "pdf", "--yes" } }) |w| try t.expect(parseArgs(w) != null);
     for ([_][]const []const u8{ &.{}, &.{"add"}, &.{ "show" }, &.{ "rm", "a", "b" }, &.{ "list", "x" }, &.{ "add", "o/r", "--skill" }, &.{ "add", "o/r", "--force" }, &.{ "update", "a", "b" } }) |w| try t.expect(parseArgs(w) == null);
+}
+
+
+test "a_repo_of_many_skills_keeps_limits_per_skill" {
+    var sx: Sx = undefined;
+    try sx.init();
+    defer sx.deinit();
+    try sx.put("repos/anthropics/skills/skills/pdf/SKILL.md", "---\nname: pdf\ndescription: PDFs.\n---\nx\n");
+    try sx.put("repos/anthropics/skills/skills/xlsx/SKILL.md", "---\nname: xlsx\ndescription: Sheets.\n---\nx\n");
+    const big = try sx.a().alloc(u8, 346 * 1024);
+    @memset(big, 'x');
+    try sx.put("repos/anthropics/skills/skills/xlsx/big.bin", big);
+    try sx.put("repos/anthropics/skills/skills/docx/SKILL.md", "---\nname: docx\ndescription: Docs.\n---\nx\n");
+    for (0..310) |i| try sx.put(try std.fmt.allocPrint(sx.a(), "repos/anthropics/skills/skills/docx/r/f{d}.txt", .{i}), "x");
+    // the one asked for, whatever the rest holds
+    try t.expectEqual(0, try sx.run(&.{ "add", "anthropics/skills", "--skill", "pdf", "--yes" }));
+    try t.expect(sx.installed("pdf/SKILL.md") != null);
+    try t.expect(sx.installed("xlsx/SKILL.md") == null);
+    _ = try skills.remove(t.io, try std.fs.path.join(sx.a(), &.{ sx.home, "skills" }), "pdf");
+    _ = try skillsrc.dropSource(t.io, sx.a(), try std.fs.path.join(sx.a(), &.{ sx.home, "skills" }), "pdf");
+    // all of them: each within its own limits
+    sx.out = .empty;
+    try t.expectEqual(0, try sx.run(&.{ "add", "anthropics/skills", "--yes" }));
+    try t.expect(sx.installed("pdf/SKILL.md") != null);
+    try t.expect(sx.said("xlsx: big.bin is 354,304 bytes; harness takes at most 262,144 a file"));
+    try t.expect(sx.said("docx: 311 files; harness takes at most 300 a skill"));
+}
+
+test "update_finds_a_renamed_skill_by_its_upstream_name" {
+    var sx: Sx = undefined;
+    try sx.init();
+    defer sx.deinit();
+    const dir = try std.fs.path.join(sx.a(), &.{ sx.home, "skills" });
+    // as the import leaves a renamed GitHub hub skill: my-pdf, upstream pdf
+    try skillsrc.install(t.io, sx.a(), dir, "my-pdf", &.{.{ .rel = "SKILL.md", .data = "---\nname: my-pdf\ndescription: Old.\n---\nOld.\n" }});
+    try skillsrc.putSource(t.io, sx.a(), dir, .{ .name = "my-pdf", .source = "o/r/skills/pdf", .pin = "-", .hash = &(try skillsrc.hashFolder(t.io, sx.a(), try std.fs.path.join(sx.a(), &.{ dir, "my-pdf" }))), .time = "2026-11-24T12:00:00Z", .upstream = "pdf" });
+    try sx.put("repos/o/r/skills/pdf/SKILL.md", "---\nname: pdf\ndescription: New.\n---\nNew.\n");
+    try t.expectEqual(0, try sx.run(&.{ "update", "my-pdf", "--yes" }));
+    const md = sx.installed("my-pdf/SKILL.md").?;
+    try t.expect(std.mem.indexOf(u8, md, "name: my-pdf\n") != null);
+    try t.expect(std.mem.indexOf(u8, md, "New.") != null);
+    try t.expectEqualStrings("pdf", (try sx.sources())[0].upstream);
 }

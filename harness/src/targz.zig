@@ -11,16 +11,24 @@ const Io = std.Io;
 pub const Opts = struct {
     /// Keep the files under this path in the repo ("" for all of it).
     path: []const u8 = "",
-    max_files: usize = skillsrc.max_files,
-    max_bytes: usize = skillsrc.max_total,
-    /// `SKILL.md`s (any under the path) and every other file.
+    /// Most files and bytes kept from the whole archive (a skill's own
+    /// limits are its reader's: skill_cmd.zig).
+    max_files: usize = 5000,
+    max_bytes: usize = 200 * 1024 * 1024,
+    /// A `SKILL.md` or another file over these is kept as its size alone
+    /// (`Archive.oversize`), so the skill holding it is refused, not the archive.
     max_skill_md: usize = 64 * 1024,
     max_file: usize = 256 * 1024,
     /// Every entry's size together (what would be unpacked to read it).
     max_total: u64 = 1024 * 1024 * 1024,
+    /// Keep only the files of skill folders of this name under `path` ("" for all).
+    folder: []const u8 = "",
 };
 
-pub const Archive = struct { commit: []const u8, files: []skillsrc.File };
+/// A file kept as its size alone, being over a skill's limit for one file.
+pub const Oversize = struct { rel: []const u8, size: u64 };
+
+pub const Archive = struct { commit: []const u8, files: []skillsrc.File, oversize: []const Oversize = &.{} };
 
 /// Why an archive was refused.
 pub const Diag = struct { why: []const u8 = "" };
@@ -59,7 +67,9 @@ pub fn read(a: std.mem.Allocator, gz: []const u8, o: Opts, diag: *Diag) !Archive
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
     var it: std.tar.Iterator = .init(r, .{ .file_name_buffer = &name_buf, .link_name_buffer = &link_buf });
     var files: std.ArrayList(skillsrc.File) = .empty;
+    var oversize: std.ArrayList(Oversize) = .empty;
     var total: u64 = 0;
+    var bytes: u64 = 0;
     var kept: usize = 0;
     while (true) {
         const f = (it.next() catch return fail(diag, error.BadArchive, "an entry doesn't read")) orelse break;
@@ -71,17 +81,20 @@ pub fn read(a: std.mem.Allocator, gz: []const u8, o: Opts, diag: *Diag) !Archive
         const inner = std.mem.trimEnd(u8, f.name[slash + 1 ..], "/");
         if (inner.len == 0) continue;
         const rel = if (want.len == 0) inner else if (std.mem.startsWith(u8, inner, want) and inner.len > want.len and inner[want.len] == '/') inner[want.len + 1 ..] else continue;
+        if (!inFolder(rel, want, o.folder)) continue;
         if (f.kind == .sym_link) return fail(diag, error.BadEntry, try std.fmt.allocPrint(a, "it holds a link ({s})", .{inner}));
-        if (try badName(a, rel)) |why| return fail(diag, error.BadEntry, why);
+        if (try skillsrc.badName(a, rel)) |why| return fail(diag, error.BadEntry, why);
         if (f.kind == .directory) continue;
         kept += 1;
         if (kept > o.max_files) return fail(diag, error.TooLarge, try std.fmt.allocPrint(a, "it has more than {d} files", .{o.max_files}));
         const is_md = std.mem.eql(u8, std.fs.path.basename(rel), "SKILL.md");
         const cap = if (is_md) o.max_skill_md else o.max_file;
-        if (f.size > cap) return fail(diag, error.TooLarge, try std.fmt.allocPrint(a, "{s} is {d} bytes; harness takes at most {d}", .{ rel, f.size, cap }));
-        var bytes: u64 = 0;
-        for (files.items) |x| bytes += x.data.len;
-        if (bytes + f.size > o.max_bytes) return fail(diag, error.TooLarge, "its files are over 10 MB together");
+        if (f.size > cap) {
+            try oversize.append(a, .{ .rel = try a.dupe(u8, rel), .size = f.size });
+            continue;
+        }
+        bytes += f.size;
+        if (bytes > o.max_bytes) return fail(diag, error.TooLarge, try std.fmt.allocPrint(a, "its files are over {d} MB together", .{o.max_bytes / (1024 * 1024)}));
         var w: Io.Writer.Allocating = .init(a);
         it.streamRemaining(f, &w.writer) catch return fail(diag, error.BadArchive, "an entry ends early");
         try files.append(a, .{ .rel = try a.dupe(u8, rel), .data = w.written(), .exec = f.mode & 0o111 != 0 });
@@ -91,30 +104,25 @@ pub fn read(a: std.mem.Allocator, gz: []const u8, o: Opts, diag: *Diag) !Archive
             return std.mem.lessThan(u8, x.rel, y.rel);
         }
     }.lt);
-    return .{ .commit = try a.dupe(u8, found), .files = files.items };
+    return .{ .commit = try a.dupe(u8, found), .files = files.items, .oversize = oversize.items };
+}
+
+/// Whether `rel` (a path under `path`) is in a skill folder named
+/// `folder`: any part of it before the file, or `path`'s own last part.
+fn inFolder(rel: []const u8, path: []const u8, folder: []const u8) bool {
+    if (folder.len == 0) return true;
+    if (std.mem.eql(u8, std.fs.path.basenamePosix(path), folder)) return true;
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |part| {
+        if (it.index == null) return false;
+        if (std.mem.eql(u8, part, folder)) return true;
+    }
+    return false;
 }
 
 fn fail(diag: *Diag, e: anyerror, why: []const u8) anyerror {
     diag.why = why;
     return e;
-}
-
-/// Why a path kept from an archive can't be written here or on Windows
-/// (`..`, `\`, a reserved device name, `<>:"|?*`, a control character, a
-/// part ending in a dot or space), or null.
-fn badName(a: std.mem.Allocator, rel: []const u8) !?[]const u8 {
-    var it = std.mem.splitScalar(u8, rel, '/');
-    while (it.next()) |part| {
-        if (part.len == 0) continue;
-        if (std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".")) return try std.fmt.allocPrint(a, "it holds a .. path ({s})", .{rel});
-        for (part) |c| if (c < 0x20 or std.mem.indexOfScalar(u8, "<>:\"|?*\\", c) != null) return try std.fmt.allocPrint(a, "it holds a name Windows can't hold ({s})", .{rel});
-        if (part[part.len - 1] == '.' or part[part.len - 1] == ' ') return try std.fmt.allocPrint(a, "it holds a name Windows can't hold ({s})", .{rel});
-        const stem = part[0 .. std.mem.indexOfScalar(u8, part, '.') orelse part.len];
-        for ([_][]const u8{ "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9" }) |dev| {
-            if (std.ascii.eqlIgnoreCase(stem, dev)) return try std.fmt.allocPrint(a, "it holds a name Windows can't hold ({s})", .{rel});
-        }
-    }
-    return null;
 }
 
 fn octal(field: []const u8) ?usize {
@@ -292,21 +300,27 @@ test "limits_stop_an_archive" {
     defer arena.deinit();
     const a = arena.allocator();
     var d: Diag = .{};
+    // the archive's own caps (a skill's are its reader's): files, bytes, unpacked size
     var many: std.ArrayList(Entry) = .empty;
-    for (0..301) |i| try many.append(a, .{ .name = try std.fmt.allocPrint(a, "r-m/s/f{d}.txt", .{i}), .data = "x" });
-    try t.expectError(error.TooLarge, read(a, try write(a, commit, many.items), .{ .path = "s" }, &d));
-    try t.expect(std.mem.indexOf(u8, d.why, "300 files") != null);
+    for (0..11) |i| try many.append(a, .{ .name = try std.fmt.allocPrint(a, "r-m/s/f{d}.txt", .{i}), .data = "x" });
+    try t.expectError(error.TooLarge, read(a, try write(a, commit, many.items), .{ .path = "s", .max_files = 10 }, &d));
+    try t.expect(std.mem.indexOf(u8, d.why, "10 files") != null);
     const big = try a.alloc(u8, 256 * 1024 + 1);
     @memset(big, 'x');
-    try t.expectError(error.TooLarge, read(a, try write(a, commit, &.{.{ .name = "r-m/s/big.bin", .data = big }}), .{ .path = "s" }, &d));
-    try t.expect(std.mem.indexOf(u8, d.why, "big.bin") != null);
-    try t.expectError(error.TooLarge, read(a, try write(a, commit, &.{.{ .name = "r-m/s/SKILL.md", .data = big[0 .. 64 * 1024 + 1] }}), .{ .path = "s" }, &d));
     var heavy: std.ArrayList(Entry) = .empty;
-    for (0..41) |i| try heavy.append(a, .{ .name = try std.fmt.allocPrint(a, "r-m/s/h{d}.bin", .{i}), .data = big[0 .. 256 * 1024] });
-    try t.expectError(error.TooLarge, read(a, try write(a, commit, heavy.items), .{ .path = "s" }, &d));
-    try t.expect(std.mem.indexOf(u8, d.why, "10 MB") != null);
-    // everything an archive would unpack, kept or not
-    try t.expectError(error.TooLarge, read(a, try write(a, commit, heavy.items), .{ .path = "other", .max_total = 1024 * 1024 }, &d));
+    for (0..5) |i| try heavy.append(a, .{ .name = try std.fmt.allocPrint(a, "r-m/s/h{d}.bin", .{i}), .data = big[0 .. 200 * 1024] });
+    try t.expectError(error.TooLarge, read(a, try write(a, commit, heavy.items), .{ .path = "s", .max_bytes = 512 * 1024 }, &d));
+    try t.expectError(error.TooLarge, read(a, try write(a, commit, heavy.items), .{ .path = "other", .max_total = 512 * 1024 }, &d));
+    // a file over a skill's 256 KB is kept as its size alone: the skill holding it is refused, not the archive
+    const ar = try read(a, try write(a, commit, &.{ .{ .name = "r-m/s/a/SKILL.md", .data = "x" }, .{ .name = "r-m/s/b/big.bin", .data = big } }), .{ .path = "s" }, &d);
+    try t.expectEqual(1, ar.files.len);
+    try t.expectEqual(1, ar.oversize.len);
+    try t.expectEqualStrings("b/big.bin", ar.oversize[0].rel);
+    try t.expectEqual(big.len, ar.oversize[0].size);
+    // only one skill's folder kept
+    const one = try read(a, try write(a, commit, &.{ .{ .name = "r-m/s/a/SKILL.md", .data = "x" }, .{ .name = "r-m/s/b/big.bin", .data = big }, .{ .name = "r-m/s/b/SKILL.md", .data = "y" } }), .{ .path = "s", .folder = "a" }, &d);
+    try t.expectEqual(1, one.files.len);
+    try t.expectEqual(0, one.oversize.len);
 }
 
 test "an_archive_without_a_commit_is_refused" {

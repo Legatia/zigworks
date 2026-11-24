@@ -24,7 +24,7 @@ const Io = std.Io;
 pub const Group = enum { will, needs, not };
 pub const Line = struct { group: Group, text: []const u8 };
 
-pub const NewMemory = struct { body: []const u8, pinned: bool = false, from: []const u8 };
+pub const NewMemory = struct { body: []const u8, pinned: bool = false, from: []const u8, hash: []const u8 = "" };
 pub const NewSkill = struct {
     name: []const u8,
     /// Where it was in Hermes (under skills/).
@@ -34,6 +34,8 @@ pub const NewSkill = struct {
     /// `skills/.sources`'s source: `OWNER/REPO/PATH` for a GitHub hub
     /// install, else `hermes` (nothing to update from).
     source: []const u8,
+    /// Its name in Hermes when harness renamed it ("" when it didn't).
+    upstream: []const u8 = "",
 };
 pub const TaskFile = struct { name: []const u8, text: []const u8 };
 pub const SecretLine = struct { name: []const u8, where: []const u8 };
@@ -87,6 +89,10 @@ pub const Harness = struct {
     skills: []const Installed = &.{},
     /// harness's stored secrets: masked too.
     stored: []const scrub.Secret = &.{},
+    /// The files in tasks/ now: an import never writes over one.
+    task_files: []const []const u8 = &.{},
+    /// The hashes of memory entries imported before (state/imports/hermes-entries).
+    imported: []const []const u8 = &.{},
 };
 
 pub const Opts = struct {
@@ -96,6 +102,8 @@ pub const Opts = struct {
     bundled: bool = false,
     /// The TZ environment variable, for a Hermes home with no timezone.
     local_zone: []const u8 = "",
+    /// HERMES_TIMEZONE (the environment's, else .env's): over config.yaml's timezone.
+    hermes_timezone: []const u8 = "",
     /// Where this import's copies, suggestions and report go (as the plan names it).
     import_dir: []const u8 = "state/imports/hermes-TIME",
 };
@@ -117,6 +125,8 @@ pub fn makePlan(io: Io, a: std.mem.Allocator, s: hermes.Setup, h: Harness, o: Op
     var c: Ctx = .{ .io = io, .a = a, .s = s, .h = h, .o = o, .p = &p, .sc = try scrub.Scrubber.init(a, all.items), .cfg = cfg };
     try c.planMemory();
     try c.planSoul();
+    if (c.skipped_imported > 0) try c.line(.not, "memory: {d} entr{s} imported before {s} skipped, forgotten ones too (state/imports/hermes-entries keeps what was imported once)", .{ c.skipped_imported, if (c.skipped_imported == 1) "y" else "ies", if (c.skipped_imported == 1) "is" else "are" });
+    for (s.env) |e| if (std.mem.eql(u8, e.name, "HERMES_TIMEZONE")) try c.used_env.put(a, e.name, {});
     try c.planSkills();
     try c.planJobs();
     try c.planServers();
@@ -149,6 +159,8 @@ const Ctx = struct {
     every_note: bool = false,
     at_note: bool = false,
     tasks_any: bool = false,
+    /// Memory entries skipped as imported before.
+    skipped_imported: usize = 0,
 
     fn line(c: *Ctx, g: Group, comptime fmt: []const u8, args: anytype) !void {
         try c.p.lines.append(c.a, .{ .group = g, .text = try c.mask(try std.fmt.allocPrint(c.a, fmt, args)) });
@@ -172,11 +184,16 @@ const Ctx = struct {
         for (c.s.memory) |e| {
             const from = if (e.file == .memory) "MEMORY.md" else "USER.md";
             for (try splitParts(c.a, try c.mask(e.text), memory_cap)) |part| {
+                const hash = try entryHash(c.a, part);
+                if (inList(c.h.imported, hash)) {
+                    c.skipped_imported += 1;
+                    continue;
+                }
                 if (c.h.memory) |store| if (try store.repeatOf(c.a, part)) |it| {
                     try c.line(.not, "memory: {s} ({s}): already in memory as {s}", .{ try c.shown(part), from, it.id });
                     continue;
                 };
-                try c.p.memory.append(c.a, .{ .body = part, .from = from });
+                try c.p.memory.append(c.a, .{ .body = part, .from = from, .hash = hash });
                 try c.line(.will, "memory: {s} ({s})", .{ try c.shown(part), from });
             }
         }
@@ -191,8 +208,13 @@ const Ctx = struct {
         const body = try c.mask(try std.fmt.allocPrint(c.a, "How to talk with me: {s}", .{text}));
         if (body.len > memory_cap)
             return c.line(.not, "SOUL.md: {s} bytes, over memory's 2,000: to keep it, make it agents/main.md by hand (that file replaces harness's built-in instructions)", .{try thousands(c.a, text.len)});
+        const hash = try entryHash(c.a, body);
+        if (inList(c.h.imported, hash)) {
+            c.skipped_imported += 1;
+            return;
+        }
         if (c.h.memory) |store| if (try store.repeatOf(c.a, body)) |it| return c.line(.not, "SOUL.md: already in memory as {s}", .{it.id});
-        try c.p.memory.append(c.a, .{ .body = body, .pinned = true, .from = "SOUL.md" });
+        try c.p.memory.append(c.a, .{ .body = body, .pinned = true, .from = "SOUL.md", .hash = hash });
         try c.line(.will, "memory, pinned: {s} (SOUL.md)", .{try c.shown(body)});
     }
 
@@ -215,6 +237,14 @@ const Ctx = struct {
                 continue;
             };
             if (try c.skillTooBig(sk, name)) continue;
+            // a file name harness can't write here (on any system it runs on)
+            const bad = for (sk.files) |fi| {
+                if (try skillsrc.badName(c.a, fi.rel)) |why| break .{ fi.rel, why };
+            } else null;
+            if (bad) |b| {
+                try c.line(.not, "skill {s} ({s}): its file {s} can't be written here ({s})", .{ name, sk.rel, b[0], b[1] });
+                continue;
+            }
             var files: std.ArrayList(skillsrc.File) = .empty;
             for (sk.files) |fi| {
                 const path = try std.fs.path.join(c.a, &.{ sk.folder, fi.rel });
@@ -224,11 +254,26 @@ const Ctx = struct {
                 };
                 try files.append(c.a, .{ .rel = fi.rel, .data = data, .exec = fi.exec });
             } else {
+                if (try c.secretInFiles(files.items)) |hit| {
+                    try c.line(.needs, "skill {s} ({s}): {s} holds the value of {s}, so it isn't imported; take the value out, then harness skill add the folder", .{ name, sk.rel, hit[0], hit[1] });
+                    continue;
+                }
                 try c.planSkill(sk, name, files.items, &planned);
             }
         }
+        for (c.s.linked_skills) |l| try c.line(.not, "skill folder {s} is a link to {s}; to bring it over: harness skill add {s}", .{ l.rel, l.target, l.target });
         if (bundled.items.len > 0)
             try c.line(.not, "Hermes's own skills, never edited ({d}): {s} (harness import hermes --bundled brings them)", .{ bundled.items.len, try std.mem.join(c.a, ", ", bundled.items) });
+    }
+
+    /// The first file holding a secret value (Hermes's or harness's), with
+    /// the value's name; never the value.
+    fn secretInFiles(c: *Ctx, files: []const skillsrc.File) !?[2][]const u8 {
+        for (files) |f| {
+            for (c.s.secrets) |sec| if (sec.value.len >= 8 and std.mem.indexOf(u8, f.data, sec.value) != null) return .{ f.rel, sec.name };
+            for (c.h.stored) |sec| if (sec.value.len >= 8 and std.mem.indexOf(u8, f.data, sec.value) != null) return .{ f.rel, sec.name };
+        }
+        return null;
     }
 
     /// Whether a skill is over harness's limits (said in the plan with its sizes).
@@ -274,7 +319,7 @@ const Ctx = struct {
         }
         if (desc.len == 0 or desc.len > skills.max_description)
             return c.line(.not, "skill {s} ({s}): its SKILL.md has no description of at most 1,024 characters; harness needs one", .{ name, sk.rel });
-        if (!std.mem.eql(u8, fm_name, name)) files[mi].data = try renameSkill(c.a, files[mi].data, name);
+        if (!std.mem.eql(u8, fm_name, name)) files[mi].data = try skillsrc.renameSkill(c.a, files[mi].data, name);
         const hash = try skillsrc.hashFiles(c.a, files);
         for (c.h.skills) |ins| if (std.mem.eql(u8, ins.name, name)) {
             if (std.mem.eql(u8, ins.hash, &hash)) return c.line(.not, "skill {s} ({s}): already there", .{ name, sk.rel });
@@ -294,7 +339,7 @@ const Ctx = struct {
             } else try notes.append(c.a, try std.fmt.allocPrint(c.a, "from {s}; harness can't update it", .{hub.source}));
         }
         try c.skill_names.put(c.a, sk.name, name);
-        try c.p.skills.append(c.a, .{ .name = name, .rel = sk.rel, .files = files, .hash = hash, .source = source });
+        try c.p.skills.append(c.a, .{ .name = name, .rel = sk.rel, .files = files, .hash = hash, .source = source, .upstream = if (std.mem.eql(u8, name, sk.name)) "" else sk.name });
         if (notes.items.len == 0) return c.line(.will, "skill {s} ({s})", .{ name, sk.rel });
         try c.line(.will, "skill {s} ({s}): {s}", .{ name, sk.rel, try std.mem.join(c.a, "; ", notes.items) });
     }
@@ -334,7 +379,7 @@ const Ctx = struct {
             .cron => {
                 if (cronAt(j.schedule.expr)) |at| {
                     var r: Shifted = .{ .minutes = at.minutes, .days = at.days };
-                    const zone = if (j.timezone.len > 0) j.timezone else if (c.s.config.timezone.len > 0) c.s.config.timezone else c.o.local_zone;
+                    const zone = if (j.timezone.len > 0) j.timezone else if (c.o.hermes_timezone.len > 0) c.o.hermes_timezone else if (envValue(c.s, "HERMES_TIMEZONE")) |z| z else if (c.s.config.timezone.len > 0) c.s.config.timezone else c.o.local_zone;
                     const zone_name = if (zone.len > 0) zone else "this computer's zone";
                     if (zones.offsetAt(c.io, c.a, c.o.zone_dirs, zone, c.o.now_s)) |off| {
                         if (off != c.cfg.chat.utc_offset) {
@@ -394,16 +439,29 @@ const Ctx = struct {
             if (same_name and std.mem.eql(u8, tk.do, instr)) return c.line(.not, "task {s} (Hermes job {s}): already there", .{ tk.name, jname });
         }
         var sec: std.ArrayList(u8) = .empty;
-        try sec.print(c.a, "[{s}]\n{s}", .{ name, sched_lines });
+        var file: ?[]const u8 = null;
         if (fitsOneLine(instr)) {
-            try sec.print(c.a, "do = {s}\n", .{instr});
+            try sec.print(c.a, "[{s}]\n{s}do = {s}\n", .{ name, sched_lines, instr });
+            if (commented != null and std.mem.indexOf(u8, c.h.tasks_text, try commentOut(c.a, sec.items)) != null) return c.line(.not, "task {s} (Hermes job {s}): already there", .{ name, jname });
         } else {
-            const file = try std.fmt.allocPrint(c.a, "{s}.md", .{name});
-            try sec.print(c.a, "do_file = {s}\n", .{file});
-            try c.p.task_files.append(c.a, .{ .name = file, .text = instr });
+            // its own file, never one there: NAME.md, else NAME-2.md, …; a
+            // commented-out job is there already under any of those names
+            var n: usize = 1;
+            while (true) : (n += 1) {
+                const f = if (n == 1) try std.fmt.allocPrint(c.a, "{s}.md", .{name}) else try std.fmt.allocPrint(c.a, "{s}-{d}.md", .{ name, n });
+                const text = try std.fmt.allocPrint(c.a, "[{s}]\n{s}do_file = {s}\n", .{ name, sched_lines, f });
+                if (commented != null and std.mem.indexOf(u8, c.h.tasks_text, try commentOut(c.a, text)) != null) return c.line(.not, "task {s} (Hermes job {s}): already there", .{ name, jname });
+                const taken_file = inList(c.h.task_files, f) or for (c.p.task_files.items) |tf| {
+                    if (std.mem.eql(u8, tf.name, f)) break true;
+                } else false;
+                if (taken_file) continue;
+                try sec.appendSlice(c.a, text);
+                file = f;
+                break;
+            }
+            try c.p.task_files.append(c.a, .{ .name = file.?, .text = instr });
         }
         const body = if (commented != null) try commentOut(c.a, sec.items) else sec.items;
-        if (commented != null and std.mem.indexOf(u8, c.h.tasks_text, body) != null) return c.line(.not, "task {s} (Hermes job {s}): already there", .{ name, jname });
         try c.p.tasks.print(c.a, "\n; from Hermes job {s}: {s}{s}\n{s}", .{ j.id, try c.shown(jname), if (commented) |why| try std.fmt.allocPrint(c.a, " (commented out: {s})", .{why}) else "", body });
         try taken.append(c.a, name);
         try c.p.task_names.append(c.a, name);
@@ -442,7 +500,11 @@ const Ctx = struct {
         try sec.print(c.a, "[{s}]\n", .{name});
         if (m.url.len > 0) {
             if (std.ascii.eqlIgnoreCase(m.transport, "sse")) return c.line(.not, "server {s}: it speaks SSE; harness speaks Streamable HTTP only", .{name});
-            try sec.print(c.a, "url = {s}\n", .{m.url});
+            if (try c.secretIn(m.url)) |hit| {
+                commented = try std.fmt.allocPrint(c.a, "its url holds a secret ({s}); mcp.ini has no place for a secret in a url", .{hit.why});
+                _ = try c.hitSecret(hit, m.name, name, "url", "url");
+                try sec.print(c.a, "url = {s}\n", .{try hide(c.a, m.url, hit)});
+            } else try sec.print(c.a, "url = {s}\n", .{m.url});
             for (m.headers) |hd| {
                 if (std.ascii.eqlIgnoreCase(hd.name, "authorization")) {
                     const v = std.mem.trim(u8, hd.value, " ");
@@ -468,17 +530,43 @@ const Ctx = struct {
                 try needs.append(c.a, try std.fmt.allocPrint(c.a, "harness mcp login {s}    (server {s} signs in with oauth)", .{ name, name }));
             }
         } else if (m.command.len > 0) {
-            if (try quoteArgs(c.a, m.command, m.args)) |cmd| {
+            // the command line: a secret in it comes over masked, the server commented out
+            const shown_args = try c.a.dupe([]const u8, m.args);
+            var command = m.command;
+            var hit_at: ?[]const u8 = null;
+            if (try c.secretIn(m.command)) |hit| {
+                hit_at = try std.fmt.allocPrint(c.a, "the command, {s}", .{hit.why});
+                _ = try c.hitSecret(hit, m.name, name, "command", "key");
+                command = try hide(c.a, m.command, hit);
+            }
+            for (m.args, 0..) |arg, i| {
+                // a flag alone (--verbose) isn't tested for a key; its value after = is
+                const val = if (arg.len > 0 and arg[0] == '-') if (std.mem.indexOfScalar(u8, arg, '=')) |eq| arg[eq + 1 ..] else "" else arg;
+                const hit = (try c.secretIn(arg)) orelse (if (val.len > 0 and val.len < arg.len) try c.secretIn(val) else null) orelse continue;
+                if (!(hit.ref != null or hit.env != null or hit.stored != null) and val.len == 0) continue;
+                const n = i + 2;
+                if (hit_at == null) hit_at = try std.fmt.allocPrint(c.a, "argument {d}{s}{s}", .{ n - 1, if (hit.kind == .found) ", " else "", if (hit.kind == .found) hit.why else "" });
+                const flag = if (i > 0 and m.args[i - 1].len > 1 and m.args[i - 1][0] == '-') std.mem.trimStart(u8, m.args[i - 1], "-") else if (arg[0] == '-') std.mem.trimStart(u8, arg[0 .. std.mem.indexOfScalar(u8, arg, '=') orelse arg.len], "-") else "arg";
+                _ = try c.hitSecret(hit, m.name, name, try std.fmt.allocPrint(c.a, "args[{d}]", .{i}), flag);
+                shown_args[i] = try hide(c.a, arg, hit);
+            }
+            if (hit_at) |where| commented = try std.fmt.allocPrint(c.a, "its command line holds a secret ({s}); harness gives a program secrets only as variables", .{where});
+            if (try quoteArgs(c.a, command, shown_args)) |cmd| {
                 try sec.print(c.a, "command = {s}\n", .{cmd});
             } else {
-                commented = "an argument can't be written in mcp.ini (a \", ; or # in it, or a new line)";
-                try sec.print(c.a, "command = {s}\n", .{m.command});
+                if (commented == null) commented = "an argument can't be written in mcp.ini (a \", ; or # in it, or a new line)";
+                try sec.print(c.a, "command = {s}\n", .{command});
             }
             var plain: std.ArrayList(u8) = .empty;
             for (m.env) |e| {
                 const ref = hermes.envRefIn(e.value);
                 const env_name = envNameOf(c.s, e.value);
-                if (ref != null or env_name != null or hermes.looksSecret(e.name, e.value) or mcp.secretLike(e.name)) {
+                const hit = try c.secretIn(e.value);
+                if (hit) |h| if (h.env) |en| if (env_name == null) {
+                    // a .env value inside it: the whole value is stored
+                    try c.used_env.put(c.a, en, {});
+                };
+                if (hit != null or hermes.looksSecret(e.name, e.value) or mcp.secretLike(e.name)) {
                     const sname = if (ref) |r| blk: {
                         if (hermes.envRef(e.value) == null) try needs.append(c.a, try std.fmt.allocPrint(c.a, "{s}: env {s} is built from ${{{s}}}; store its whole value", .{ name, e.name, r }));
                         break :blk try c.secretFor(try std.fmt.allocPrint(c.a, "env:{s}", .{r}), r, name, try c.envWhere(r));
@@ -494,16 +582,19 @@ const Ctx = struct {
             if (secrets_line.items.len > 0) try sec.print(c.a, "secret = {s}\n", .{secrets_line.items});
             try sec.appendSlice(c.a, plain.items);
         } else return c.line(.not, "server {s}: it has neither a command nor a url", .{name});
+        if (m.include) |inc| if (inc.len == 0) {
+            commented = "Hermes offered none of its tools (include: [])";
+        };
         if (!m.enabled) commented = "disabled in Hermes";
         // it reads as mcp.ini, or it comes over commented out with the reason
         if (commented == null) _ = mcp.parseConfig(c.a, sec.items) catch |e| {
             commented = mcp.configReason(e) orelse "it doesn't read as mcp.ini";
         };
         for (m.exclude) |g| try c.mcp_denies.append(c.a, try std.fmt.allocPrint(c.a, "deny mcp {s}/{s} *", .{ name, narrowGlob(c.a, g) catch g }));
-        if (m.include) |inc| try needs.append(c.a, try std.fmt.allocPrint(c.a, "{s}: Hermes offered only its tools {s}; harness offers all of them: add a deny rule for each other one (deny mcp {s}/TOOL *)", .{ name, try std.mem.join(c.a, ", ", inc), name }));
-        const body = if (commented != null) try commentOut(c.a, sec.items) else sec.items;
+        if (m.include) |inc| if (inc.len > 0) try needs.append(c.a, try std.fmt.allocPrint(c.a, "{s}: Hermes offered only its tools {s}; harness offers all of them: add a deny rule for each other one (deny mcp {s}/TOOL *)", .{ name, try std.mem.join(c.a, ", ", inc), name }));
+        const body = if (commented != null) try commentOut(c.a, try c.mask(sec.items)) else sec.items;
         if (commented != null and std.mem.indexOf(u8, c.h.mcp_text, body) != null) return c.line(.not, "server {s}: already there", .{name});
-        try c.p.mcp.print(c.a, "\n; from Hermes: mcp_servers.{s}{s}\n{s}", .{ m.name, if (commented) |why| try std.fmt.allocPrint(c.a, " (commented out: {s})", .{why}) else "", body });
+        try c.p.mcp.appendSlice(c.a, try c.mask(try std.fmt.allocPrint(c.a, "\n; from Hermes: mcp_servers.{s}{s}\n{s}", .{ m.name, if (commented) |why| try std.fmt.allocPrint(c.a, " (commented out: {s})", .{why}) else "", body })));
         try names.append(c.a, name);
         try c.p.server_names.append(c.a, name);
         c.p.server_count += 1;
@@ -512,6 +603,30 @@ const Ctx = struct {
             try c.line(.will, "server {s} (commented out: {s})", .{ name, why });
         } else try c.line(.will, "server {s}: {s}", .{ name, if (m.url.len > 0) m.url else m.command });
         for (needs.items) |n| try c.line(.needs, "{s}", .{n});
+    }
+
+    /// The secret test for a value in a server's command line, url or env:
+    /// a `${VAR}` reference; a .env value (any length when it is the whole
+    /// value, 8 or more inside it); a value harness stores; a password in
+    /// an address; a key-like value or query value.
+    fn secretIn(c: *Ctx, v: []const u8) !?Hit {
+        if (v.len == 0) return null;
+        if (hermes.envRefIn(v)) |r| return .{ .why = try std.fmt.allocPrint(c.a, "${{{s}}}", .{r}), .ref = r, .kind = .ref };
+        for (c.s.env) |e| if (e.value.len > 0 and std.mem.eql(u8, e.value, v)) return .{ .why = try std.fmt.allocPrint(c.a, "the value of {s}", .{e.name}), .env = e.name, .value = e.value };
+        for (c.s.env) |e| if (e.value.len >= 8 and std.mem.indexOf(u8, v, e.value) != null) return .{ .why = try std.fmt.allocPrint(c.a, "the value of {s}", .{e.name}), .env = e.name, .value = e.value };
+        for (c.h.stored) |sec| if (sec.value.len >= 8 and std.mem.indexOf(u8, v, sec.value) != null) return .{ .why = try std.fmt.allocPrint(c.a, "the value of harness's secret {s}", .{sec.name}), .stored = sec.name, .value = sec.value };
+        if (hermes.urlPassword(v)) |pw| return .{ .why = "a password", .value = pw, .kind = .password };
+        if (hermes.valueLooksSecret(v)) return .{ .why = "a key", .value = v, .kind = .key };
+        for (try hermes.queryPairs(c.a, v)) |q| if (hermes.secretName(q.name) or hermes.valueLooksSecret(q.value)) return .{ .why = try std.fmt.allocPrint(c.a, "its {s}", .{q.name}), .value = q.value, .kind = .key };
+        return null;
+    }
+
+    /// The stored secret a hit needs (its `harness secret add` line).
+    fn hitSecret(c: *Ctx, hit: Hit, server: []const u8, name: []const u8, field: []const u8, want: []const u8) ![]const u8 {
+        if (hit.ref) |r| return c.secretFor(try std.fmt.allocPrint(c.a, "env:{s}", .{r}), r, name, try c.envWhere(r));
+        if (hit.env) |e| return c.secretFor(try std.fmt.allocPrint(c.a, "env:{s}", .{e}), e, name, try c.envWhere(e));
+        if (hit.stored) |sn| return sn;
+        return c.secretFor(try std.fmt.allocPrint(c.a, "lit:{s}.{s}", .{ server, field }), try std.fmt.allocPrint(c.a, "{s}-{s}", .{ name, want }), name, try std.fmt.allocPrint(c.a, "the {s} in mcp_servers.{s}.{s} in Hermes's config.yaml", .{ if (hit.kind == .password) "password" else "key", server, field }));
     }
 
     /// The stored secret's name for a value (`id` says which), given once;
@@ -548,11 +663,14 @@ const Ctx = struct {
                 try c.line(.not, "deny rule {s}: it can't be written on one line", .{p});
                 continue;
             }
-            try lines.append(c.a, .{ .line = try std.fmt.allocPrint(c.a, "deny shell {s}", .{try narrowGlob(c.a, p)}), .from = p });
+            // Hermes finds the command anywhere in a line (after cd, sudo, a
+            // path): a leading * only denies more
+            const g = try narrowGlob(c.a, p);
+            try lines.append(c.a, .{ .line = try std.fmt.allocPrint(c.a, "deny shell {s}{s}", .{ if (std.mem.startsWith(u8, g, "*")) "" else "*", g }), .from = p });
         }
         for (c.mcp_denies.items) |l| try lines.append(c.a, .{ .line = l, .from = l["deny mcp ".len..] });
         for (lines.items) |l| {
-            if (hasLine(c.h.rules_text, l.line)) {
+            if (sharedHasLine(c.h.rules_text, l.line)) {
                 try c.line(.not, "deny rule {s}: already there", .{l.from});
                 continue;
             }
@@ -561,7 +679,7 @@ const Ctx = struct {
             count += 1;
         }
         if (count == 0) return;
-        if (c.s.config.deny.len > 0) try c.line(.will, "deny rules: Hermes's were matched case-insensitively in Hermes; harness matches them as written, and ? and [...] became *, which denies more", .{});
+        if (c.s.config.deny.len > 0) try c.line(.will, "deny rules: Hermes's were matched case-insensitively in Hermes; harness matches them as written (that difference remains). A leading * and ? and [...] as * only deny more", .{});
         c.p.rule_count = count;
         try c.p.rules.print(c.a, "\n[all]\n# from Hermes: approvals.deny and the tools its MCP servers left out\n{s}", .{block.items});
         _ = rules.parse(c.a, c.p.rules.items) catch {
@@ -698,7 +816,10 @@ const Ctx = struct {
         for (c.s.config.problems) |pr| try c.line(.not, "config.yaml near line {d} ({s}): couldn't read it; add it by hand", .{ pr.line, pr.key });
         if (c.s.config.external_dirs.len > 0)
             try c.line(.not, "skills in other folders Hermes read: {s} (harness reads its own skills/ alone: copy any you want with harness skill add FOLDER)", .{try std.mem.join(c.a, ", ", c.s.config.external_dirs)});
-        for (c.s.config.skill_config) |kv| try c.line(.not, "skill settings (skills.config): {s} = {s}; harness has no store for these", .{ kv.name, kv.value });
+        for (c.s.config.skill_config) |kv| {
+            const secret = hermes.secretName(kv.name) or hermes.valueLooksSecret(kv.value) or (try c.secretIn(kv.value)) != null;
+            try c.line(.not, "skill settings (skills.config): {s} = {s}; harness has no store for these", .{ kv.name, if (secret) "(a secret, not shown)" else kv.value });
+        }
         for (c.s.others) |o| {
             if (std.mem.eql(u8, o.rel, "config.yaml")) {
                 try c.line(.not, "{s}: not brought over", .{o.what});
@@ -723,6 +844,29 @@ const Ctx = struct {
         if (unused.items.len > 0) try c.line(.not, ".env keys nothing here uses: {s} (their values stay in Hermes)", .{try std.mem.join(c.a, ", ", unused.items)});
     }
 };
+
+/// A secret found in a value: why (said in the plan, never the value),
+/// where it comes from, and the bytes to mask ("" for a reference).
+const Hit = struct {
+    why: []const u8,
+    ref: ?[]const u8 = null,
+    env: ?[]const u8 = null,
+    stored: ?[]const u8 = null,
+    value: []const u8 = "",
+    kind: enum { found, ref, password, key } = .found,
+};
+
+/// `text` with a hit's value as `[secret]`.
+fn hide(a: std.mem.Allocator, text: []const u8, hit: Hit) ![]const u8 {
+    if (hit.value.len == 0) return text;
+    return std.mem.replaceOwned(u8, a, text, hit.value, "[secret]");
+}
+
+/// The value of a variable in Hermes's .env (not empty), or null.
+fn envValue(s: hermes.Setup, name: []const u8) ?[]const u8 {
+    for (s.env) |e| if (std.mem.eql(u8, e.name, name) and std.mem.trim(u8, e.value, " ").len > 0) return std.mem.trim(u8, e.value, " ");
+    return null;
+}
 
 /// Whether `value` is the value of a variable in Hermes's .env.
 fn isEnvValue(s: hermes.Setup, value: []const u8) bool {
@@ -757,11 +901,27 @@ fn githubId(id: []const u8) bool {
     return n >= 2;
 }
 
-/// `lines` with `line` as one of them (trimmed).
-fn hasLine(text: []const u8, line: []const u8) bool {
+/// Whether the rules' shared part (before any `[WHO]`, or after `[all]`)
+/// has `line`: one under a who's section is that who's alone.
+fn sharedHasLine(text: []const u8, line: []const u8) bool {
+    var shared = true;
     var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |l| if (std.mem.eql(u8, std.mem.trim(u8, l, " \t\r"), line)) return true;
+    while (it.next()) |raw| {
+        const l = std.mem.trim(u8, raw, " \t\r");
+        if (l.len > 1 and l[0] == '[' and l[l.len - 1] == ']') {
+            shared = std.mem.eql(u8, std.mem.trim(u8, l[1 .. l.len - 1], " \t"), "all");
+            continue;
+        }
+        if (shared and std.mem.eql(u8, l, line)) return true;
+    }
     return false;
+}
+
+/// A memory entry's hash, as state/imports/hermes-entries keeps it.
+fn entryHash(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var h: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &h, .{});
+    return a.dupe(u8, &std.fmt.bytesToHex(h, .lower));
 }
 
 /// The `[NAME]` headers of an INI text, added to `out`.
@@ -867,44 +1027,6 @@ pub fn harnessName(a: std.mem.Allocator, raw: []const u8) ?[]const u8 {
     }
     const n = std.mem.trimEnd(u8, out.items, "-");
     return if (skills.validName(n)) n else null;
-}
-
-/// SKILL.md with its frontmatter's `name` set to `name` (added after the
-/// first fence when there is none); line ends kept.
-fn renameSkill(a: std.mem.Allocator, md: []const u8, name: []const u8) ![]const u8 {
-    const crlf = std.mem.indexOf(u8, md, "\r\n") != null;
-    const nl: []const u8 = if (crlf) "\r\n" else "\n";
-    var out: std.ArrayList(u8) = .empty;
-    var it = std.mem.splitScalar(u8, md, '\n');
-    var n: usize = 0;
-    var done = false;
-    var in_header = false;
-    while (it.next()) |raw| {
-        n += 1;
-        const l = std.mem.trimEnd(u8, raw, "\r");
-        if (n > 1) try out.append(a, '\n');
-        if (n == 1) {
-            in_header = true;
-            try out.appendSlice(a, raw);
-            continue;
-        }
-        if (in_header and std.mem.eql(u8, std.mem.trimEnd(u8, l, " \t"), "---")) {
-            in_header = false;
-            if (!done) {
-                try out.print(a, "name: {s}{s}", .{ name, nl });
-                done = true;
-            }
-            try out.appendSlice(a, raw);
-            continue;
-        }
-        if (in_header and !done and std.mem.startsWith(u8, l, "name:")) {
-            try out.print(a, "name: {s}{s}", .{ name, if (crlf) "\r" else "" });
-            done = true;
-            continue;
-        }
-        try out.appendSlice(a, raw);
-    }
-    return out.items;
 }
 
 /// config.ini with `key = value` in `[sect]`: the value replaced where the
@@ -1326,7 +1448,7 @@ pub fn runImport(r: Run, args: Args) !u8 {
     const iso = util.isoTime(&tb, r.now_s);
     const stamp = try std.fmt.allocPrint(a, "hermes-{s}{s}{s}-{s}{s}{s}", .{ iso[0..4], iso[5..7], iso[8..10], iso[11..13], iso[14..16], iso[17..19] });
     const import_rel = try std.fmt.allocPrint(a, "state/imports/{s}", .{stamp});
-    const p = try makePlan(r.io, a, s, h, .{ .now_s = r.now_s, .zone_dirs = r.zone_dirs, .bundled = args.bundled, .local_zone = r.env.get("TZ") orelse "", .import_dir = import_rel });
+    const p = try makePlan(r.io, a, s, h, .{ .now_s = r.now_s, .zone_dirs = r.zone_dirs, .bundled = args.bundled, .local_zone = r.env.get("TZ") orelse "", .hermes_timezone = std.mem.trim(u8, r.env.get("HERMES_TIMEZONE") orelse "", " "), .import_dir = import_rel });
     const text = try planText(a, s, &p);
     say(r, text);
     if (!writesAnything(&p)) {
@@ -1350,9 +1472,18 @@ pub fn runImport(r: Run, args: Args) !u8 {
         }
     }
     const dir = try std.fs.path.join(a, &.{ paths.state, "imports", stamp });
-    const report = try apply(r, paths, dir, &p, &store, text, iso);
-    say(r, try std.fmt.allocPrint(a, "\nImported. The report, with how to undo it: {s}\n", .{report}));
+    const done = try apply(r, paths, dir, &p, &store, text, iso);
+    if (done.failed.len > 0) {
+        say(r, try std.fmt.allocPrint(a, "\nImported in part: these weren't written: {s}. The report says what was, and how to undo it: {s}\n", .{ try std.mem.join(a, "; ", done.failed), done.report }));
+        return 1;
+    }
+    say(r, try std.fmt.allocPrint(a, "\nImported. The report, with how to undo it: {s}\n", .{done.report}));
     return 0;
+}
+
+/// state/imports/hermes-entries: the hashes of memory entries imported once.
+fn entriesPath(a: std.mem.Allocator, paths: @import("core.zig").Paths) ![]const u8 {
+    return std.fs.path.join(a, &.{ paths.state, "imports", "hermes-entries" });
 }
 
 /// "tasks.ini can't be read (StreamTooLong)" for the first settings file
@@ -1395,12 +1526,24 @@ pub fn loadHarness(io: Io, a: std.mem.Allocator, paths: @import("core.zig").Path
         .memory = store,
         .stored = stored,
     };
+    var task_files: std.ArrayList([]const u8) = .empty;
+    if (Io.Dir.cwd().openDir(io, paths.tasks_dir, .{ .iterate = true })) |d_| {
+        var d = d_;
+        defer d.close(io);
+        var it = d.iterate();
+        while (it.next(io) catch null) |e| try task_files.append(a, try a.dupe(u8, e.name));
+    } else |_| {}
+    h.task_files = task_files.items;
+    var imported: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.tokenizeAny(u8, read(io, a, try entriesPath(a, paths)), "\r\n");
+    while (lines.next()) |l| if (l.len == 64) try imported.append(a, l);
+    h.imported = imported.items;
     if (config.parseTasks(a, h.tasks_text)) |tasks| {
         _ = @import("taskfiles.zig").resolve(io, a, paths.tasks_dir, tasks) catch null;
         h.tasks = tasks;
     } else |_| {}
     var installed: std.ArrayList(Installed) = .empty;
-    for (try skills.list(a, io, paths.skills)) |sk| {
+    for (skills.list(a, io, paths.skills) catch &.{}) |sk| {
         const hash = skillsrc.hashFolder(io, a, try std.fs.path.join(a, &.{ paths.skills, sk.name })) catch continue;
         try installed.append(a, .{ .name = sk.name, .hash = try a.dupe(u8, &hash) });
     }
@@ -1409,7 +1552,7 @@ pub fn loadHarness(io: Io, a: std.mem.Allocator, paths: @import("core.zig").Path
         var d = d_;
         defer d.close(io);
         var it = d.iterate();
-        while (try it.next(io)) |e| {
+        while (it.next(io) catch null) |e| {
             if (e.kind != .directory or e.name[0] == '.') continue;
             for (installed.items) |ins| {
                 if (std.mem.eql(u8, ins.name, e.name)) break;
@@ -1420,91 +1563,160 @@ pub fn loadHarness(io: Io, a: std.mem.Allocator, paths: @import("core.zig").Path
     return h;
 }
 
-/// Writes the plan: the copies first, then each file whole, the memory
-/// items, the skills, the log line and the report (its path returned).
-fn apply(r: Run, paths: @import("core.zig").Paths, dir: []const u8, p: *const Plan, store: *memory.Store, plan_text: []const u8, iso: []const u8) ![]const u8 {
+/// What an import wrote: its report, and what it couldn't write.
+const Done = struct { report: []const u8, failed: []const []const u8 };
+
+/// Writes the plan: the copies first, then each file whole, the tasks'
+/// files, the memory items, the skills, the log line and the report. A
+/// part that fails is listed and the rest written; the report says which.
+fn apply(r: Run, paths: @import("core.zig").Paths, dir: []const u8, p: *const Plan, store: *memory.Store, plan_text: []const u8, iso: []const u8) !Done {
     const a = r.a;
     const cwd = Io.Dir.cwd();
     const before = try std.fs.path.join(a, &.{ dir, "before" });
     try cwd.createDirPath(r.io, before);
     var undo: std.ArrayList(u8) = .empty;
-    // every harness file it changes, copied as it was
-    const Change = struct { path: []const u8, name: []const u8, add: []const u8, whole: ?[]const u8 = null };
-    const changes = [_]Change{
+    var failed: std.ArrayList([]const u8) = .empty;
+    // every harness file it changes, copied as it was; one that can't be
+    // copied isn't changed
+    const Change = struct { path: []const u8, name: []const u8, add: []const u8, whole: ?[]const u8 = null, undo: []const u8 = "", ok: bool = true };
+    var changes = [_]Change{
         .{ .path = paths.tasks, .name = "tasks.ini", .add = p.tasks.items },
         .{ .path = paths.mcp, .name = "mcp.ini", .add = p.mcp.items },
         .{ .path = paths.rules, .name = "rules", .add = p.rules.items },
         .{ .path = paths.config, .name = "config.ini", .add = "", .whole = p.config_ini },
     };
-    for (changes) |ch| {
+    for (&changes) |*ch| {
         if (ch.add.len == 0 and ch.whole == null) continue;
-        if (cwd.readFileAlloc(r.io, ch.path, a, .limited(1 << 20))) |old| {
-            try util.writeReplace(r.io, try std.fs.path.join(a, &.{ before, ch.name }), old);
-            try undo.print(a, "- {s}: put back {s}{s}before{s}{s}\n", .{ ch.name, dir, std.fs.path.sep_str, std.fs.path.sep_str, ch.name });
-        } else |e| switch (e) {
-            error.FileNotFound => try undo.print(a, "- {s} didn't exist before: remove it\n", .{ch.name}),
-            else => return e,
-        }
+        copyBefore(r, before, dir, ch.path, ch.name, &ch.undo) catch |e| {
+            ch.ok = false;
+            try failed.append(a, try std.fmt.allocPrint(a, "{s} (its copy couldn't be made: {s})", .{ ch.name, @errorName(e) }));
+        };
     }
+    // tasks' own files, in the guarded tasks/ folder, never over one there
+    var task_dir_ok = true;
+    if (p.task_files.items.len > 0) _ = cwd.createDirPathStatus(r.io, paths.tasks_dir, @import("agents.zig").private_dir) catch |e| {
+        task_dir_ok = false;
+        try failed.append(a, try std.fmt.allocPrint(a, "the tasks folder ({s})", .{@errorName(e)}));
+    };
+    if (task_dir_ok) for (p.task_files.items) |tf| {
+        writeNew(r.io, try std.fs.path.join(a, &.{ paths.tasks_dir, tf.name }), tf.text) catch |e| {
+            try failed.append(a, try std.fmt.allocPrint(a, "tasks{s}{s} ({s})", .{ std.fs.path.sep_str, tf.name, @errorName(e) }));
+            continue;
+        };
+        try undo.print(a, "- remove tasks{s}{s}\n", .{ std.fs.path.sep_str, tf.name });
+    };
     for (changes) |ch| {
-        if (ch.whole) |w| {
-            try util.writeReplace(r.io, ch.path, w);
-        } else if (ch.add.len > 0) {
-            const old = cwd.readFileAlloc(r.io, ch.path, a, .limited(1 << 20)) catch |e| switch (e) {
-                error.FileNotFound => "",
-                else => return e,
-            };
-            try util.writeReplace(r.io, ch.path, try std.fmt.allocPrint(a, "{s}{s}{s}", .{ old, if (old.len > 0 and old[old.len - 1] != '\n') "\n" else "", ch.add }));
-        }
+        if ((ch.add.len == 0 and ch.whole == null) or !ch.ok) continue;
+        writeChange(r, ch.path, ch.add, ch.whole) catch |e| {
+            try failed.append(a, try std.fmt.allocPrint(a, "{s} ({s})", .{ ch.name, @errorName(e) }));
+            continue;
+        };
+        try undo.appendSlice(a, ch.undo);
     }
-    // tasks' own files, in the guarded tasks/ folder
-    if (p.task_files.items.len > 0) {
-        _ = try cwd.createDirPathStatus(r.io, paths.tasks_dir, @import("agents.zig").private_dir);
-        for (p.task_files.items) |tf| {
-            try util.writeReplace(r.io, try std.fs.path.join(a, &.{ paths.tasks_dir, tf.name }), tf.text);
-            try undo.print(a, "- remove tasks{s}{s}\n", .{ std.fs.path.sep_str, tf.name });
-        }
-    }
-    if (p.suggested.items.len > 0) try util.writeReplace(r.io, try std.fs.path.join(a, &.{ dir, "rules.suggested" }), p.suggested.items);
-    // memory: the agent's words, dated back; SOUL.md pinned
+    if (p.suggested.items.len > 0) util.writeReplace(r.io, try std.fs.path.join(a, &.{ dir, "rules.suggested" }), p.suggested.items) catch |e| {
+        try failed.append(a, try std.fmt.allocPrint(a, "rules.suggested ({s})", .{@errorName(e)}));
+    };
+    // memory: the agent's words, dated back; SOUL.md pinned; each entry's
+    // hash kept so a rerun never brings back one the owner forgot
     var ids: std.ArrayList([]const u8) = .empty;
+    var hashes: std.ArrayList(u8) = .empty;
+    var memory_failed: usize = 0;
     for (p.memory.items) |m| {
         const res = store.addFrom(m.body, null, p.mention_s, .other) catch |e| switch (e) {
             error.EmptyMemory => continue,
-            else => return e,
+            else => {
+                memory_failed += 1;
+                continue;
+            },
         };
+        try hashes.print(a, "{s}\n", .{m.hash});
         if (res.merged) continue;
-        if (m.pinned) _ = try store.setPinned(res.id, true);
+        if (m.pinned) _ = store.setPinned(res.id, true) catch {};
         try ids.append(a, try a.dupe(u8, res.id));
         try undo.print(a, "- harness memory forget {s}\n", .{res.id});
     }
+    if (memory_failed > 0) try failed.append(a, try std.fmt.allocPrint(a, "{d} memory item{s}", .{ memory_failed, if (memory_failed == 1) "" else "s" }));
+    if (hashes.items.len > 0) appendFile(r.io, a, try entriesPath(a, paths), hashes.items) catch |e| {
+        try failed.append(a, try std.fmt.allocPrint(a, "state{s}imports{s}hermes-entries ({s}): a rerun may bring forgotten entries back", .{ std.fs.path.sep_str, std.fs.path.sep_str, @errorName(e) }));
+    };
     // skills, each with its source line
     var skill_names: std.ArrayList([]const u8) = .empty;
     for (p.skills.items) |sk| {
         skillsrc.install(r.io, a, paths.skills, sk.name, sk.files) catch |e| switch (e) {
             error.Exists => continue,
-            else => return e,
+            else => {
+                try failed.append(a, try std.fmt.allocPrint(a, "skill {s} ({s})", .{ sk.name, @errorName(e) }));
+                continue;
+            },
         };
-        try skillsrc.putSource(r.io, a, paths.skills, .{ .name = sk.name, .source = sk.source, .pin = "-", .hash = &sk.hash, .time = iso });
         try skill_names.append(a, sk.name);
         try undo.print(a, "- harness skill rm {s}\n", .{sk.name});
+        skillsrc.putSource(r.io, a, paths.skills, .{ .name = sk.name, .source = sk.source, .pin = "-", .hash = &sk.hash, .time = iso, .upstream = sk.upstream }) catch |e| {
+            try failed.append(a, try std.fmt.allocPrint(a, "skill {s}'s line in skills{s}.sources ({s})", .{ sk.name, std.fs.path.sep_str, @errorName(e) }));
+        };
     }
     // the log: what kind of things and how many, no values
-    var log = try @import("log.zig").Log.open(r.gpa, r.io, paths.log);
-    defer log.close();
-    try log.setSecrets(r.stored);
-    try log.write(.config, false, .{ .event = "import", .from = "hermes", .memory = ids.items.len, .skills = skill_names.items.len, .tasks = p.task_names.items.len, .servers = p.server_names.items.len, .rules = p.rule_count, .config = p.config_ini != null });
-    // the report
+    logImport(r, paths, p, ids.items.len, skill_names.items.len, failed.items.len) catch |e| {
+        try failed.append(a, try std.fmt.allocPrint(a, "the log line ({s})", .{@errorName(e)}));
+    };
+    // the report, always
     var rep: std.ArrayList(u8) = .empty;
     try rep.print(a, "# Imported from Hermes, {s}\n\n```\n{s}```\n\n", .{ iso, plan_text });
+    for (failed.items) |f| try rep.print(a, "Not written: {s}\n", .{f});
+    if (failed.items.len > 0) try rep.appendSlice(a, "\n");
     try rep.print(a, "New memory items: {s}\n", .{if (ids.items.len > 0) try std.mem.join(a, ", ", ids.items) else "none"});
     try rep.print(a, "New skills: {s}\n", .{if (skill_names.items.len > 0) try std.mem.join(a, ", ", skill_names.items) else "none"});
-    try rep.print(a, "New tasks: {s}\n", .{if (p.task_names.items.len > 0) try std.mem.join(a, ", ", p.task_names.items) else "none"});
-    try rep.print(a, "New MCP servers: {s}\n\n", .{if (p.server_names.items.len > 0) try std.mem.join(a, ", ", p.server_names.items) else "none"});
+    try rep.print(a, "New tasks: {s}\n", .{if (p.task_names.items.len > 0 and changes[0].ok) try std.mem.join(a, ", ", p.task_names.items) else "none"});
+    try rep.print(a, "New MCP servers: {s}\n\n", .{if (p.server_names.items.len > 0 and changes[1].ok) try std.mem.join(a, ", ", p.server_names.items) else "none"});
     try rep.print(a, "## To undo it\n\nWith harness stopped:\n\n{s}", .{undo.items});
     const report = try std.fs.path.join(a, &.{ dir, "report.md" });
     try util.writeReplace(r.io, report, rep.items);
-    return report;
+    return .{ .report = report, .failed = failed.items };
+}
+
+/// Copies a settings file into before/ and says how to put it back.
+fn copyBefore(r: Run, before: []const u8, dir: []const u8, path: []const u8, name: []const u8, undo: *[]const u8) !void {
+    const a = r.a;
+    if (Io.Dir.cwd().readFileAlloc(r.io, path, a, .limited(1 << 20))) |old| {
+        try util.writeReplace(r.io, try std.fs.path.join(a, &.{ before, name }), old);
+        undo.* = try std.fmt.allocPrint(a, "- {s}: put back {s}{s}before{s}{s}\n", .{ name, dir, std.fs.path.sep_str, std.fs.path.sep_str, name });
+    } else |e| switch (e) {
+        error.FileNotFound => undo.* = try std.fmt.allocPrint(a, "- {s} didn't exist before: remove it\n", .{name}),
+        else => return e,
+    }
+}
+
+/// A settings file with `add` at its end, or `whole` in its place.
+fn writeChange(r: Run, path: []const u8, add: []const u8, whole: ?[]const u8) !void {
+    if (whole) |w| return util.writeReplace(r.io, path, w);
+    const old = Io.Dir.cwd().readFileAlloc(r.io, path, r.a, .limited(1 << 20)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => return e,
+    };
+    try util.writeReplace(r.io, path, try std.fmt.allocPrint(r.a, "{s}{s}{s}", .{ old, if (old.len > 0 and old[old.len - 1] != '\n') "\n" else "", add }));
+}
+
+/// A new file with `data`; error.PathAlreadyExists when one is there.
+fn writeNew(io: Io, path: []const u8, data: []const u8) !void {
+    var f = try Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, data);
+}
+
+/// `data` added at the end of a file (made when it isn't there).
+fn appendFile(io: Io, a: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    const old = Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => return e,
+    };
+    try util.writeReplace(io, path, try std.mem.concat(a, u8, &.{ old, data }));
+}
+
+fn logImport(r: Run, paths: @import("core.zig").Paths, p: *const Plan, memory_n: usize, skills_n: usize, failed_n: usize) !void {
+    var log = try @import("log.zig").Log.open(r.gpa, r.io, paths.log);
+    defer log.close();
+    try log.setSecrets(r.stored);
+    try log.write(.config, false, .{ .event = "import", .from = "hermes", .memory = memory_n, .skills = skills_n, .tasks = p.task_names.items.len, .servers = p.server_names.items.len, .rules = p.rule_count, .config = p.config_ini != null, .not_written = failed_n });
 }
 
 /// What `harness init` says when there is a Hermes setup to import, or null.
@@ -1859,13 +2071,14 @@ test "deny_patterns_narrow_only" {
     var tf: Tf = undefined;
     try tf.init(false);
     defer tf.deinit();
-    const p = try tf.plan(.{ .rules_text = "deny shell git push --force*\n" }, false);
+    const p = try tf.plan(.{ .rules_text = "deny shell *git push --force*\n" }, false);
     const r = p.rules.items;
     try t.expect(std.mem.startsWith(u8, r, "\n[all]\n# from Hermes"));
-    try t.expect(contains(r, "deny shell rm -rf /*\n"));
+    // Hermes matches a command anywhere in a line (after cd, sudo, a path): a leading * only denies more
+    try t.expect(contains(r, "deny shell *rm -rf /*\n"));
     try t.expect(!contains(r, "git push --force"));
-    try t.expect(contains(r, "deny shell curl *ttp*\n"));
-    try t.expect(contains(r, "deny shell shutdown **\n"));
+    try t.expect(contains(r, "deny shell *curl *ttp*\n"));
+    try t.expect(contains(r, "deny shell *shutdown **\n"));
     try t.expect(p.has(.will, "matched case-insensitively in Hermes; harness matches them as written"));
     try t.expect(p.has(.not, "deny rule git push --force*: already there"));
     _ = try rules.parse(tf.f.a(), r);
@@ -1954,7 +2167,7 @@ test "the_plan_has_three_groups_in_order" {
     const needs = std.mem.indexOf(u8, text, "\nNeeds you\n").?;
     const not = std.mem.indexOf(u8, text, "\nNot imported\n").?;
     try t.expect(will < needs and needs < not);
-    try t.expect(contains(text, "6 memory items (1 pinned), 4 skills, 6 tasks (3 commented out), 7 MCP servers (2 commented out), 6 deny rules, the model"));
+    try t.expect(contains(text, "6 memory items (1 pinned), 4 skills, 6 tasks (3 commented out), 11 MCP servers (5 commented out), 6 deny rules, the model"));
     for (hermes.Fixture.secrets) |v| try t.expect(!contains(text, v));
 }
 
@@ -2063,13 +2276,14 @@ test "import_writes_what_maps_and_leaves_a_report" {
     try t.expectEqualStrings("Check the build ; report failures #ci", try rx.file("tasks" ++ std.fs.path.sep_str ++ "poll.md"));
     _ = try config.parseTasks(rx.tf.f.a(), tasks);
     try t.expect(contains(try rx.file("mcp.ini"), "[github]\n"));
-    try t.expect(contains(try rx.file("rules"), "deny shell rm -rf /*\n"));
+    try t.expect(contains(try rx.file("rules"), "deny shell *rm -rf /*\n"));
     try t.expect(contains(try rx.file("config.ini"), "provider = openrouter\n"));
     try t.expect(contains(try rx.file("skills" ++ std.fs.path.sep_str ++ "deploy-helper-v2" ++ std.fs.path.sep_str ++ "SKILL.md"), "name: deploy-helper-v2\n"));
     try t.expect(rx.exists("skills" ++ std.fs.path.sep_str ++ "deploy-helper-v2" ++ std.fs.path.sep_str ++ "scripts" ++ std.fs.path.sep_str ++ "run.sh"));
     const sources = try rx.file("skills" ++ std.fs.path.sep_str ++ ".sources");
     try t.expect(contains(sources, "pdf-tools\tanthropics/skills/skills/pdf\t-\t"));
     try t.expect(contains(sources, "deploy-helper-v2\thermes\t-\t"));
+    try t.expect(contains(sources, "\tdeploy.helper_v2\n"));
     try t.expectEqual(6, try rx.memoryCount());
     // the copies taken first, the suggestions, the report
     const dir = try rx.importDir();
@@ -2110,7 +2324,9 @@ test "running_it_again_adds_nothing_twice" {
     defer d.close(t.io);
     var it = d.iterate();
     var n: usize = 0;
-    while (try it.next(t.io)) |_| n += 1;
+    while (try it.next(t.io)) |e| if (e.kind == .directory) {
+        n += 1;
+    };
     try t.expectEqual(1, n);
     try t.expectEqualStrings(tasks, try rx.file("tasks.ini"));
     try t.expectEqualStrings(mcp_text, try rx.file("mcp.ini"));
@@ -2208,7 +2424,7 @@ test "a_profile_and_windows_line_endings_import" {
     // 06:00 at +02:00 is 05:00 at +01:00
     try t.expect(contains(try rx.file("tasks.ini"), "[shift]\nat = 05:00\ndays = mon,tue,wed,thu,fri\ndo = Check the rota\n"));
     try t.expect(!contains(try allText(rx.tf.f.a(), try std.fs.path.join(rx.tf.f.a(), &.{ rx.home, "memory" })), "\r"));
-    try t.expect(contains(try rx.file("rules"), "deny shell rm -rf *\n"));
+    try t.expect(contains(try rx.file("rules"), "deny shell *rm -rf *\n"));
 }
 
 test "no_secret_value_reaches_any_file_output_or_log" {
@@ -2243,4 +2459,156 @@ test "a_file_it_cant_read_stops_the_import_before_anything_is_written" {
     try t.expectEqual(big.len, (try rx.file("tasks.ini")).len);
     try t.expect(!rx.exists("mcp.ini"));
     try t.expectEqual(0, try rx.memoryCount());
+}
+
+
+test "mcp_secrets_in_command_url_and_env_never_reach_mcp_ini" {
+    var tf: Tf = undefined;
+    try tf.init(false);
+    defer tf.deinit();
+    const p = try tf.plan(.{}, false);
+    const m = p.mcp.items;
+    for ([_][]const u8{ "1b4e28ba-2fa1-11d2-883f-0016d3cca427", "exa-fixture-0009abcd", "hunter2pass" }) |v| try t.expect(!contains(m, v));
+    // an argument that is a secret: commented out, the argument masked
+    try t.expect(contains(m, "; [keyed]\n; command = keyed-mcp --key [secret]\n"));
+    try t.expect(p.has(.will, "server keyed (commented out: its command line holds a secret (argument 2); harness gives a program secrets only as variables)"));
+    // a url holding a .env value: commented out, the query masked, the key named
+    try t.expect(contains(m, "; [exa]\n; url = https://mcp.exa.ai/mcp?exaApiKey=[secret]\n"));
+    try t.expect(p.has(.will, "server exa (commented out: its url holds a secret (the value of EXA_API_KEY)"));
+    try t.expect(p.has(.needs, "harness secret add exa_api_key"));
+    try t.expect(!p.has(.not, "EXA_API_KEY"));
+    // a password in a url, ${env:VAR}: stored secrets, never env =
+    try t.expect(contains(m, "[db]\ncommand = db-mcp\nsecret = DATABASE_URL:database_url, MY_TOKEN:github_token\n"));
+    try t.expect(p.has(.needs, "harness secret add database_url"));
+    // include: [] offered no tool at all
+    try t.expect(contains(m, "; [closed]\n"));
+    try t.expect(p.has(.will, "server closed (commented out: Hermes offered none of its tools (include: []))"));
+    _ = try mcp.parseConfig(tf.f.a(), m);
+}
+
+test "a_skill_holding_a_secret_is_not_imported" {
+    var tf: Tf = undefined;
+    try tf.init(false);
+    defer tf.deinit();
+    const p = try tf.plan(.{}, false);
+    for (p.skills.items) |sk| try t.expect(!std.mem.eql(u8, sk.name, "leaky"));
+    try t.expect(p.has(.needs, "skill leaky (leaky): references/setup.md holds the value of OPENROUTER_API_KEY, so it isn't imported; take the value out, then harness skill add the folder"));
+    for (p.lines.items) |l| try t.expect(!contains(l.text, "sk-fixture-openrouter-0001"));
+}
+
+test "a_skill_file_name_harness_cant_write_is_listed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tf: Tf = undefined;
+    try tf.init(false);
+    defer tf.deinit();
+    try tf.f.put("skills/notes/SKILL.md", "---\nname: notes\ndescription: Notes.\n---\nx\n");
+    try tf.f.put("skills/notes/notes:2024.md", "x\n");
+    const p = try tf.plan(.{}, false);
+    for (p.skills.items) |sk| try t.expect(!std.mem.eql(u8, sk.name, "notes"));
+    try t.expect(p.has(.not, "skill notes (notes): its file notes:2024.md can't be written here"));
+}
+
+test "a_linked_skill_folder_is_listed_with_skill_add" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tf: Tf = undefined;
+    try tf.init(false);
+    defer tf.deinit();
+    try tf.f.tmp.dir.createDirPath(t.io, "elsewhere/shared");
+    try tf.f.tmp.dir.writeFile(t.io, .{ .sub_path = "elsewhere/shared/SKILL.md", .data = "---\nname: shared\ndescription: Shared.\n---\nx\n" });
+    const target = try tf.f.tmp.dir.realPathFileAlloc(t.io, "elsewhere/shared", tf.f.a());
+    try tf.f.tmp.dir.symLink(t.io, target, "hermes/skills/shared", .{ .is_directory = true });
+    const p = try tf.plan(.{}, false);
+    try t.expect(p.has(.not, try std.fmt.allocPrint(tf.f.a(), "skill folder shared is a link to {s}; to bring it over: harness skill add {s}", .{ target, target })));
+}
+
+test "a_failure_while_writing_is_reported_and_the_rest_written" {
+    var rx: Rx = undefined;
+    try rx.init(false);
+    defer rx.deinit();
+    // skills/ is a file: no skill can be installed
+    const skills_dir = try std.fs.path.join(rx.tf.f.a(), &.{ rx.home, "skills" });
+    try Io.Dir.cwd().deleteTree(t.io, skills_dir);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = skills_dir, .data = "not a folder" });
+    try t.expectEqual(1, try rx.run(.{ .yes = true }));
+    try t.expect(contains(rx.talk.out.items, "weren't written"));
+    // the rest was written, and the report says what wasn't
+    try t.expect(contains(try rx.file("mcp.ini"), "[github]\n"));
+    try t.expectEqual(6, try rx.memoryCount());
+    const report = try rx.file(try std.fs.path.join(rx.tf.f.a(), &.{ try rx.importDir(), "report.md" }));
+    try t.expect(contains(report, "Not written: skill deploy-helper-v2"));
+    try t.expect(contains(try rx.file("log" ++ std.fs.path.sep_str ++ "actions.jsonl"), "\"event\":\"import\""));
+}
+
+test "task_files_are_never_overwritten_and_a_rerun_adds_none" {
+    var rx: Rx = undefined;
+    try rx.init(false);
+    defer rx.deinit();
+    // a file of the owner's where the import would write poll.md
+    const tasks_dir = try std.fs.path.join(rx.tf.f.a(), &.{ rx.home, "tasks" });
+    try Io.Dir.cwd().createDirPath(t.io, tasks_dir);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(rx.tf.f.a(), &.{ tasks_dir, "poll.md" }), .data = "Mine." });
+    try rx.tf.f.put("cron/jobs.json", "{\"jobs\":[{\"id\":\"p1\",\"name\":\"poll\",\"prompt\":\"Check the build ; report\",\"schedule\":{\"kind\":\"interval\",\"minutes\":30},\"deliver\":\"origin\"},{\"id\":\"p2\",\"name\":\"later\",\"prompt\":\"Line one\\nLine two\",\"schedule\":{\"kind\":\"interval\",\"minutes\":60},\"deliver\":\"origin\",\"enabled\":false}]}");
+    try t.expectEqual(0, try rx.run(.{ .yes = true }));
+    try t.expectEqualStrings("Mine.", try rx.file("tasks" ++ std.fs.path.sep_str ++ "poll.md"));
+    try t.expectEqualStrings("Check the build ; report", try rx.file("tasks" ++ std.fs.path.sep_str ++ "poll-2.md"));
+    try t.expect(contains(try rx.file("tasks.ini"), "do_file = poll-2.md\n"));
+    try t.expectEqualStrings("Line one\nLine two", try rx.file("tasks" ++ std.fs.path.sep_str ++ "later.md"));
+    // run again: the commented-out job's file isn't written again, nor a second one
+    rx.talk.out = .empty;
+    try t.expectEqual(0, try rx.run(.{ .yes = true }));
+    try t.expect(contains(rx.talk.out.items, "Nothing new to import"));
+    try t.expect(!rx.exists("tasks" ++ std.fs.path.sep_str ++ "later-2.md"));
+    try t.expect(!rx.exists("tasks" ++ std.fs.path.sep_str ++ "poll-3.md"));
+}
+
+test "a_deny_under_a_who_section_is_not_already_there" {
+    var tf: Tf = undefined;
+    try tf.init(false);
+    defer tf.deinit();
+    const p = try tf.plan(.{ .rules_text = "[agent:coder]\ndeny shell *rm -rf /*\n[all]\ndeny shell *curl *ttp*\n" }, false);
+    try t.expect(contains(p.rules.items, "deny shell *rm -rf /*\n"));
+    try t.expect(!contains(p.rules.items, "curl"));
+}
+
+test "hermes_timezone_overrides_config_yaml" {
+    var tf: Tf = undefined;
+    try tf.init(false);
+    defer tf.deinit();
+    try tf.f.put("cron/jobs.json", "{\"jobs\":[{\"id\":\"n1\",\"name\":\"nine\",\"prompt\":\"Hi\",\"schedule\":{\"kind\":\"cron\",\"expr\":\"0 9 * * *\"},\"deliver\":\"origin\"}]}");
+    // config.yaml says Europe/Warsaw (+01:00, harness's); HERMES_TIMEZONE says +02:00
+    var p = try tf.plan(.{}, false);
+    try t.expect(contains(p.tasks.items, "[nine]\nat = 09:00\n"));
+    var hh: Harness = .{ .config_text = harness_config, .memory = &tf.store };
+    _ = &hh;
+    p = try makePlan(t.io, tf.f.a(), try tf.setup(), hh, .{ .now_s = testNow(), .zone_dirs = &.{tf.zones}, .hermes_timezone = "Test/Plus2" });
+    try t.expect(contains(p.tasks.items, "[nine]\nat = 08:00\n"));
+}
+
+test "skill_settings_that_hold_secrets_are_not_shown" {
+    var tf: Tf = undefined;
+    try tf.init(false);
+    defer tf.deinit();
+    const p = try tf.plan(.{}, false);
+    try t.expect(p.has(.not, "skill settings (skills.config): api.token = (a secret, not shown)"));
+    try t.expect(p.has(.not, "skill settings (skills.config): wiki.path = ~/wiki"));
+}
+
+test "a_rerun_doesnt_bring_back_forgotten_memory" {
+    var rx: Rx = undefined;
+    try rx.init(false);
+    defer rx.deinit();
+    try t.expectEqual(0, try rx.run(.{ .yes = true }));
+    {
+        var store = try memory.Store.load(t.allocator, t.io, try std.fs.path.join(rx.tf.f.a(), &.{ rx.home, "memory" }));
+        defer store.deinit();
+        for (store.items.items) |it| if (contains(it.body, "Kraków")) {
+            _ = try store.forget(it.id);
+            break;
+        };
+    }
+    try t.expectEqual(5, try rx.memoryCount());
+    rx.talk.out = .empty;
+    try t.expectEqual(0, try rx.run(.{ .yes = true }));
+    try t.expectEqual(5, try rx.memoryCount());
+    try t.expect(contains(rx.talk.out.items, "memory: 6 entries imported before are skipped"));
 }

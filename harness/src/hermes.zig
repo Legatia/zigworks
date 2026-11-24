@@ -31,6 +31,44 @@ pub fn defaultRoot(a: std.mem.Allocator, env: *const Map, os: std.Target.Os.Tag)
     return std.fs.path.join(a, &.{ home, ".hermes" }) catch null;
 }
 
+/// A path as Hermes expands HERMES_HOME: a leading `~` (the home folder),
+/// `$NAME`, `${NAME}` and, on Windows, `%NAME%`; an unknown name is left.
+pub fn expand(a: std.mem.Allocator, env: *const Map, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    if (text.len > 0 and text[0] == '~' and (text.len == 1 or text[1] == '/' or text[1] == '\\')) {
+        const home = env.get(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME") orelse env.get("HOME") orelse "";
+        try out.appendSlice(a, home);
+        i = 1;
+    }
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '$' or (c == '%' and builtin.os.tag == .windows)) {
+            var name_start = i + 1;
+            var name_end = name_start;
+            var close: usize = 0;
+            if (c == '$' and name_start < text.len and text[name_start] == '{') {
+                name_start += 1;
+                name_end = std.mem.indexOfScalarPos(u8, text, name_start, '}') orelse text.len;
+                close = 1;
+            } else if (c == '%') {
+                name_end = std.mem.indexOfScalarPos(u8, text, name_start, '%') orelse text.len;
+                close = 1;
+            } else {
+                while (name_end < text.len and (std.ascii.isAlphanumeric(text[name_end]) or text[name_end] == '_')) name_end += 1;
+            }
+            if (name_end > name_start and name_end <= text.len) if (env.get(text[name_start..name_end])) |v| {
+                try out.appendSlice(a, v);
+                i = @min(text.len, name_end + close);
+                continue;
+            };
+        }
+        try out.append(a, c);
+        i += 1;
+    }
+    return out.items;
+}
+
 fn isDir(io: Io, p: []const u8) bool {
     const st = Io.Dir.cwd().statFile(io, p, .{}) catch return false;
     return st.kind == .directory;
@@ -52,7 +90,7 @@ pub fn locate(io: Io, a: std.mem.Allocator, env: *const Map, from: ?[]const u8, 
     const root = from orelse blk: {
         if (env.get("HERMES_HOME")) |h| {
             const x = std.mem.trim(u8, h, " ");
-            if (x.len > 0) break :blk x;
+            if (x.len > 0) break :blk try expand(a, env, x);
         }
         break :blk defaultRoot(a, env, builtin.os.tag) orelse return error.NoHermes;
     };
@@ -201,6 +239,9 @@ pub const Config = struct {
 /// the home, or the file that names it).
 pub const Other = struct { what: []const u8, rel: []const u8 };
 
+/// A link under skills/ to a folder elsewhere: its path there and where it points.
+pub const Linked = struct { rel: []const u8, target: []const u8 };
+
 pub const Setup = struct {
     home: Home,
     env: []const EnvLine = &.{},
@@ -213,6 +254,8 @@ pub const Setup = struct {
     /// Why `cron/jobs.json` didn't read, when it didn't.
     jobs_problem: ?[]const u8 = null,
     others: []const Other = &.{},
+    /// Skill folders under skills/ that are links: named, never followed.
+    linked_skills: []const Linked = &.{},
     /// Every key value found (`.env`, literal keys in config.yaml), to mask
     /// them wherever they turn up; never written or printed.
     secrets: []const scrub.Secret = &.{},
@@ -251,7 +294,7 @@ pub fn read(io: Io, a: std.mem.Allocator, home: Home) !Setup {
         }
     }
     s.memory = mem.items;
-    s.skills = try readSkills(io, a, home.dir, s.config.disabled);
+    s.skills = try readSkills(io, a, home.dir, s.config.disabled, &s.linked_skills);
     if (try readOpt(io, a, home.dir, &.{ "cron", "jobs.json" }, 16 << 20)) |text| {
         s.jobs = parseJobs(a, text) catch |e| switch (e) {
             error.OutOfMemory => return e,
@@ -330,20 +373,47 @@ fn envName(name: []const u8) bool {
     return true;
 }
 
-/// NAME when `value` is a `${NAME}` reference and nothing else.
+/// NAME when `value` is a `${NAME}` reference and nothing else
+/// (`${env:NAME}` and names with `-` too).
 pub fn envRef(value: []const u8) ?[]const u8 {
     const v = std.mem.trim(u8, value, " \t");
     if (v.len < 4 or !std.mem.startsWith(u8, v, "${") or v[v.len - 1] != '}') return null;
-    const name = v[2 .. v.len - 1];
-    return if (envName(name)) name else null;
+    return refName(v[2 .. v.len - 1]);
 }
 
-/// NAME of the first `${NAME}` in `value` (`Bearer ${TOKEN}`).
+/// NAME of the first `${NAME}` in `value` (`Bearer ${TOKEN}`, `${env:TOKEN}`).
 pub fn envRefIn(value: []const u8) ?[]const u8 {
-    const start = std.mem.indexOf(u8, value, "${") orelse return null;
-    const end = std.mem.indexOfScalarPos(u8, value, start, '}') orelse return null;
-    const name = value[start + 2 .. end];
-    return if (envName(name)) name else null;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, value, from, "${")) |start| {
+        const end = std.mem.indexOfScalarPos(u8, value, start, '}') orelse return null;
+        if (refName(value[start + 2 .. end])) |n| return n;
+        from = start + 2;
+    }
+    return null;
+}
+
+/// A reference's variable: `env:` taken off; letters, digits, `_` and `-`.
+fn refName(inner: []const u8) ?[]const u8 {
+    const name = if (std.mem.startsWith(u8, inner, "env:")) inner["env:".len..] else inner;
+    if (name.len == 0) return null;
+    for (name) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return null;
+    return name;
+}
+
+/// The password in a `scheme://user:password@host` address in `text`, or null.
+pub fn urlPassword(text: []const u8) ?[]const u8 {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, "://")) |at| {
+        const rest = text[at + 3 ..];
+        const end = std.mem.indexOfAny(u8, rest, "/?# \t") orelse rest.len;
+        const auth = rest[0..end];
+        if (std.mem.lastIndexOfScalar(u8, auth, '@')) |sign| {
+            const userinfo = auth[0..sign];
+            if (std.mem.indexOfScalar(u8, userinfo, ':')) |colon| if (colon + 1 < userinfo.len) return userinfo[colon + 1 ..];
+        }
+        from = at + 3;
+    }
+    return null;
 }
 
 /// Names that hold no secret by Hermes's own rule (`_URL`, `_HOST`, …).
@@ -367,10 +437,22 @@ fn maskable(name: []const u8, value: []const u8) bool {
 /// value looks like a key (a known prefix, or 24 or more letters and
 /// digits without spaces). A `${VAR}` reference is always one.
 pub fn looksSecret(name: []const u8, value: []const u8) bool {
-    if (envRefIn(value) != null) return true;
+    if (envRefIn(value) != null or urlPassword(value) != null) return true;
+    if (secretName(name)) return true;
+    return valueLooksSecret(value);
+}
+
+/// Whether a name says its value is a secret (the words `looksSecret` names).
+pub fn secretName(name: []const u8) bool {
     for ([_][]const u8{ "token", "key", "secret", "password", "passwd", "pass", "pwd", "auth", "credential", "private", "cookie", "session", "bearer", "jwt" }) |w| {
         if (std.ascii.findIgnoreCase(name, w) != null) return true;
     }
+    return false;
+}
+
+/// Whether a value alone looks like a key: a known prefix, or 24 or more
+/// letters and digits (with `-_.=+`) and no spaces.
+pub fn valueLooksSecret(value: []const u8) bool {
     const v = std.mem.trim(u8, value, " \t");
     for ([_][]const u8{ "sk-", "sk_", "ghp_", "gho_", "ghs_", "ghu_", "github_pat_", "xoxb-", "xoxp-", "xoxa-", "glpat-", "AKIA", "AIza", "ya29.", "eyJ" }) |pre| {
         if (std.mem.startsWith(u8, v, pre)) return true;
@@ -385,6 +467,13 @@ pub fn looksSecret(name: []const u8, value: []const u8) bool {
 }
 
 fn configSecrets(a: std.mem.Allocator, cfg: Config, out: *std.ArrayList(scrub.Secret)) !void {
+    for (cfg.mcp) |m| {
+        for (m.args) |arg| if (valueLooksSecret(arg) and envRef(arg) == null) try out.append(a, .{ .name = try std.fmt.allocPrint(a, "mcp_servers.{s}.args", .{m.name}), .value = arg });
+        for (try queryPairs(a, m.url)) |q| if (q.value.len >= 4 and envRefIn(q.value) == null and (secretName(q.name) or valueLooksSecret(q.value))) try out.append(a, .{ .name = try std.fmt.allocPrint(a, "mcp_servers.{s}.url", .{m.name}), .value = q.value });
+        if (urlPassword(m.url)) |pw| if (pw.len >= 4) try out.append(a, .{ .name = try std.fmt.allocPrint(a, "mcp_servers.{s}.url", .{m.name}), .value = pw });
+        for (m.env) |e| if (urlPassword(e.value)) |pw| if (pw.len >= 4) try out.append(a, .{ .name = try std.fmt.allocPrint(a, "mcp_servers.{s}.env.{s}", .{ m.name, e.name }), .value = pw });
+    }
+    for (cfg.skill_config) |kv| if ((secretName(kv.name) or valueLooksSecret(kv.value)) and kv.value.len >= 4) try out.append(a, .{ .name = try std.fmt.allocPrint(a, "skills.config.{s}", .{kv.name}), .value = kv.value });
     if (maskable("api_key", cfg.model.api_key)) try out.append(a, .{ .name = "model.api_key", .value = cfg.model.api_key });
     for (cfg.providers) |p| if (maskable("api_key", p.api_key)) try out.append(a, .{ .name = try std.fmt.allocPrint(a, "providers.{s}.api_key", .{p.name}), .value = p.api_key });
     for (cfg.mcp) |m| {
@@ -395,6 +484,18 @@ fn configSecrets(a: std.mem.Allocator, cfg: Config, out: *std.ArrayList(scrub.Se
             if (looksSecret(h.name, v) and maskable(h.name, v)) try out.append(a, .{ .name = try std.fmt.allocPrint(a, "mcp_servers.{s}.headers.{s}", .{ m.name, h.name }), .value = v });
         }
     }
+}
+
+/// A url's query as names and values (`?a=1&b=2`).
+pub fn queryPairs(a: std.mem.Allocator, url: []const u8) ![]const KV {
+    var out: std.ArrayList(KV) = .empty;
+    const q = std.mem.indexOfScalar(u8, url, '?') orelse return out.items;
+    var it = std.mem.splitAny(u8, url[q + 1 ..], "&#");
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (eq + 1 < pair.len) try out.append(a, .{ .name = pair[0..eq], .value = pair[eq + 1 ..] });
+    }
+    return out.items;
 }
 
 // ---- memory and SOUL.md ----
@@ -717,10 +818,12 @@ fn oneOf(x: []const u8, list: []const []const u8) bool {
     return false;
 }
 
-fn readSkills(io: Io, a: std.mem.Allocator, dir: []const u8, disabled: []const []const u8) ![]const SkillDir {
+fn readSkills(io: Io, a: std.mem.Allocator, dir: []const u8, disabled: []const []const u8, linked: *[]const Linked) ![]const SkillDir {
     const root = try std.fs.path.join(a, &.{ dir, "skills" });
-    var found: std.ArrayList(SkillDir) = .empty;
-    try walkSkills(io, a, root, "", &found);
+    var walk: Walk = .{};
+    try walkSkills(io, a, root, "", &walk);
+    linked.* = walk.linked.items;
+    const found = walk.skills;
     std.mem.sort(SkillDir, found.items, {}, struct {
         fn lt(_: void, x: SkillDir, y: SkillDir) bool {
             return std.mem.lessThan(u8, x.rel, y.rel);
@@ -775,17 +878,28 @@ fn readSkills(io: Io, a: std.mem.Allocator, dir: []const u8, disabled: []const [
 
 /// Each folder holding a SKILL.md, below `root` (`rel` the path walked so
 /// far); a skill's own subfolders hold no skills of their own here.
-fn walkSkills(io: Io, a: std.mem.Allocator, root: []const u8, rel: []const u8, out: *std.ArrayList(SkillDir)) !void {
+const Walk = struct { skills: std.ArrayList(SkillDir) = .empty, linked: std.ArrayList(Linked) = .empty };
+
+fn walkSkills(io: Io, a: std.mem.Allocator, root: []const u8, rel: []const u8, out: *Walk) !void {
     const here = if (rel.len == 0) root else try std.fs.path.join(a, &.{ root, rel });
     var d = Io.Dir.cwd().openDir(io, here, .{ .iterate = true }) catch return;
     defer d.close(io);
     if (rel.len > 0) if (d.statFile(io, "SKILL.md", .{})) |_| {
-        try out.append(a, try skillAt(io, a, here, try slashes(a, rel)));
+        try out.skills.append(a, try skillAt(io, a, here, try slashes(a, rel)));
         return;
     } else |_| {};
     var names: std.ArrayList([]const u8) = .empty;
     var it = d.iterate();
     while (try it.next(io)) |e| {
+        if (e.kind == .sym_link) {
+            // a link to a folder: named, never followed
+            const p = try std.fs.path.join(a, &.{ here, e.name });
+            const st = Io.Dir.cwd().statFile(io, p, .{}) catch continue;
+            if (st.kind != .directory) continue;
+            const target = Io.Dir.cwd().realPathFileAlloc(io, p, a) catch continue;
+            try out.linked.append(a, .{ .rel = try slashes(a, if (rel.len == 0) e.name else try std.fs.path.join(a, &.{ rel, e.name })), .target = target });
+            continue;
+        }
         if (e.kind != .directory) continue;
         if (oneOf(e.name, &excluded_dirs)) continue;
         try names.append(a, try a.dupe(u8, e.name));
@@ -988,6 +1102,10 @@ pub const Fixture = struct {
         "sk-fixture-files-0006",
         "sk-fixture-weather-0007",
         "sk-fixture-workgw-0008",
+        "1b4e28ba-2fa1-11d2-883f-0016d3cca427",
+        "exa-fixture-0009abcd",
+        "hunter2pass",
+        "sk-fixture-skillcfg-0010",
     };
 
     /// Hermes's hash of the fixture's `arxiv` skill (computed with Python's
@@ -1009,6 +1127,7 @@ pub const Fixture = struct {
             \\TELEGRAM_ALLOWED_USERS=42
             \\LINEAR_API_KEY='lin_fixture_linear_0004'   # the team's
             \\WORK_GW_KEY=sk-fixture-workgw-0008
+            \\EXA_API_KEY=exa-fixture-0009abcd
             \\API_SERVER_URL=https://hermes.example.com
             \\
         );
@@ -1071,6 +1190,20 @@ pub const Fixture = struct {
             \\  sleepy:
             \\    command: sleepy-mcp
             \\    enabled: false
+            \\  keyed:
+            \\    command: keyed-mcp
+            \\    args: ["--key", "1b4e28ba-2fa1-11d2-883f-0016d3cca427"]
+            \\  exa:
+            \\    url: https://mcp.exa.ai/mcp?exaApiKey=exa-fixture-0009abcd
+            \\  db:
+            \\    command: db-mcp
+            \\    env:
+            \\      DATABASE_URL: postgres://me:hunter2pass@db.example.com/app
+            \\      MY_TOKEN: ${env:GITHUB_TOKEN}
+            \\  closed:
+            \\    command: closed-mcp
+            \\    tools:
+            \\      include: []
             \\approvals:
             \\  deny:
             \\    - "rm -rf /*"
@@ -1086,6 +1219,8 @@ pub const Fixture = struct {
             \\  config:
             \\    wiki:
             \\      path: ~/wiki
+            \\    api:
+            \\      token: sk-fixture-skillcfg-0010
             \\plugins:
             \\  base: &b {x: 1}
             \\
@@ -1113,6 +1248,8 @@ pub const Fixture = struct {
             \\}}
         );
         try f.w(crlf, "skills/docs/pdf-tools/SKILL.md", "---\nname: pdf-tools\ndescription: Work with PDFs.\nlicense: Apache-2.0\n---\nUse pdftotext.\n");
+        try f.w(crlf, "skills/leaky/SKILL.md", "---\nname: leaky\ndescription: Holds a key.\n---\nSee references/setup.md.\n");
+        try f.w(crlf, "skills/leaky/references/setup.md", "export OPENROUTER_API_KEY=sk-fixture-openrouter-0001\n");
         try f.w(crlf, "skills/claw/SKILL.md", "---\nname: claw\ndescription: From ClawHub.\n---\nx\n");
         const filler = try f.a().alloc(u8, 70 * 1024);
         @memset(filler, 'x');
@@ -1279,7 +1416,7 @@ test "skills_are_found_with_category_hub_and_bundled_facts" {
     for (s.skills) |sk| try names.append(f.a(), sk.name);
     const joined = try std.mem.join(f.a(), ",", names.items);
     // sorted by their path under skills/; .git and scripts/inner are no skills
-    try t.expectEqualStrings("big,claw,deploy.helper_v2,pdf-tools,noisy,arxiv,edited-bundle", joined);
+    try t.expectEqualStrings("big,claw,deploy.helper_v2,pdf-tools,leaky,noisy,arxiv,edited-bundle", joined);
     const by = struct {
         fn name(list: []const SkillDir, n: []const u8) SkillDir {
             for (list) |x| if (std.mem.eql(u8, x.name, n)) return x;
@@ -1327,7 +1464,7 @@ test "config_yaml_keys_are_read" {
     try t.expectEqualStrings("anthropic_messages", c.providers[2].api_mode);
     try t.expectEqualStrings("Europe/Warsaw", c.timezone);
     try t.expectEqualStrings("honcho", c.memory_provider);
-    try t.expectEqual(8, c.mcp.len);
+    try t.expectEqual(12, c.mcp.len);
     const gh = c.mcp[0];
     try t.expectEqualStrings("github", gh.name);
     try t.expectEqualStrings("npx", gh.command);
@@ -1369,6 +1506,41 @@ test "config_yaml_keys_are_read" {
     try t.expectEqual(4, bad.config.problems[0].line);
     try t.expectEqual(1, bad.config.deny.len);
     try t.expectEqualStrings("openrouter/x", bad.config.model.name);
+}
+
+test "a_linked_skill_folder_is_named_not_followed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.put("skills/mine/SKILL.md", "---\nname: mine\ndescription: Mine.\n---\nx\n");
+    try f.tmp.dir.createDirPath(t.io, "elsewhere/shared");
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "elsewhere/shared/SKILL.md", .data = "---\nname: shared\ndescription: Shared.\n---\nx\n" });
+    const target = try f.tmp.dir.realPathFileAlloc(t.io, "elsewhere/shared", f.a());
+    try f.tmp.dir.symLink(t.io, target, "hermes/skills/shared", .{ .is_directory = true });
+    const s = try read(t.io, f.a(), .{ .root = f.root, .dir = f.root, .profile = "default" });
+    try t.expectEqual(1, s.skills.len);
+    try t.expectEqualStrings("mine", s.skills[0].name);
+    try t.expectEqual(1, s.linked_skills.len);
+    try t.expectEqualStrings("shared", s.linked_skills[0].rel);
+    try t.expectEqualStrings(target, s.linked_skills[0].target);
+}
+
+test "hermes_home_takes_a_tilde_and_variables" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.a();
+    try f.put("config.yaml", "model: x\n");
+    const want = try std.fs.path.resolve(a, &.{f.root});
+    for ([_][]const u8{ "~/hermes", "$BASE/hermes", "${BASE}/hermes" }) |raw| {
+        var env = Map.init(a);
+        try env.put(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME", f.base);
+        try env.put("BASE", f.base);
+        try env.put("HERMES_HOME", raw);
+        const h = try locate(t.io, a, &env, null, null);
+        try t.expectEqualStrings(want, try std.fs.path.resolve(a, &.{h.root}));
+    }
 }
 
 /// Hermes's current stock SOUL.md (hermes_cli/default_soul.py, MIT), the

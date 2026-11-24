@@ -2333,8 +2333,9 @@ ignored; the gate decides) and the variables it expects. Then it asks
   `state/skills/NAME/versions/`;
 - `harness skill rm NAME`: removes it.
 
-Limits: 300 files, 10 MB, 64 KB for `SKILL.md`, 256 KB a file; no
-links, absolute paths or `..`. A download stops past 50 MB. Fetching is
+Limits, per skill: 300 files, 10 MB, 64 KB for `SKILL.md`, 256 KB a
+file; no links, absolute paths or `..`. A skill over them is listed and
+the rest of a repo still installs. A download stops past 50 MB. Fetching is
 your command, not the agent's: https only (plain http only to this
 machine). An installed skill's scripts run only through `shell`, which
 the gate decides.
@@ -2354,10 +2355,10 @@ for the plan alone. With neither and no terminal, it exits 2.
 |---|---|
 | `memories/MEMORY.md`, `USER.md` | memory items, one per entry, as the agent's words, dated 60 days back: they sit below what you said lately; a long entry is split at paragraph breaks |
 | `SOUL.md`, edited | a pinned memory item, "How to talk with me: …". Hermes's own text is skipped; one over 2,000 bytes is listed (make it `agents/main.md` by hand: it replaces harness's built-in instructions) |
-| your skills | `skills/NAME/`, out of their category folders. A name with `.`, `_` or `--` is renamed; Hermes's own skills come only edited, or with `--bundled`; disabled ones and ones over the limits are listed. A skill Hermes installed from GitHub keeps its source for `harness skill update` |
-| `cron/jobs.json` | `tasks.ini` sections. An interval of 5 minutes or more is `every`; a time on days is `at` and `days`, converted to your `utc_offset` at the job's zone's offset today; `0 */N * * *` is `every = Nh` (not aligned to the hour). A prompt one line can't hold goes in `tasks/NAME.md` (`do_file`). Paused jobs, and ones delivered where harness can't reach, come over commented out |
-| `mcp_servers` | `mcp.ini` sections. A secret value or a `${VAR}` is `secret =`, a plain value `env =`; a bearer token is `token =`; `auth: oauth` is `login = oauth`. Excluded tools become deny rules; an include list is yours to turn into rules |
-| `approvals.deny` | `deny shell` rules, in an `[all]` block (`?` and `[…]` become `*`, which only denies more) |
+| your skills | `skills/NAME/`, out of their category folders. A name with `.`, `_` or `--` is renamed; Hermes's own skills come only edited, or with `--bundled`; disabled ones, ones over the limits and ones holding a secret value are listed; a linked skill folder is listed with the `harness skill add` line for it. A skill Hermes installed from GitHub keeps its source, and its name there, for `harness skill update` |
+| `cron/jobs.json` | `tasks.ini` sections. An interval of 5 minutes or more is `every`; a time on days is `at` and `days`, converted to your `utc_offset` at the job's zone's offset today (the job's zone, else `HERMES_TIMEZONE`, else config.yaml's); `0 */N * * *` is `every = Nh` (not aligned to the hour). A prompt one line can't hold goes in `tasks/NAME.md` (`do_file`; `NAME-2.md` when that file is there). Paused jobs, and ones delivered where harness can't reach, come over commented out |
+| `mcp_servers` | `mcp.ini` sections. In `env`, a secret value or a `${VAR}` is `secret =`, a plain value `env =`; a bearer token is `token =`; `auth: oauth` is `login = oauth`. A secret in the command, an argument or the url (a key, a `.env` value, a password in an address) comes over commented out and masked, with its `harness secret add` line. Excluded tools become deny rules; an include list is yours to turn into rules; `include: []` comes over commented out |
+| `approvals.deny` | `deny shell *PATTERN` rules, in an `[all]` block: Hermes finds a command anywhere in a line, so a leading `*`; `?` and `[…]` become `*`. Both only deny more. Hermes matched without case; harness matches as written |
 | `command_allowlist` | only suggested: commented `allow` lines in `state/imports/hermes-TIME/rules.suggested` |
 | `model`, `providers` | `[model]` (only while harness has no provider set) and `[provider NAME]` sections for OpenAI- and Anthropic-format endpoints |
 
@@ -2371,8 +2372,10 @@ plugins and the rest stay in Hermes; the plan names each.
 
 Before writing, the import copies each harness file it changes to
 `state/imports/hermes-TIME/before/`. It leaves `report.md` there: what
-it did, the new memory ids, and how to undo it. Run again, it adds
-nothing twice. It refuses while `harness run` runs, as `undo` does;
+it did, the new memory ids, and how to undo it. A part it can't write
+is listed there and in its output (exit 1); the rest is written. Run
+again, it adds nothing twice, and a memory entry you forgot stays
+forgotten (`state/imports/hermes-entries` keeps what came over). It refuses while `harness run` runs, as `undo` does;
 `--dry-run` works anyway. `harness init` says when it finds a Hermes
 setup.
 

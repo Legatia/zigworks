@@ -39,14 +39,19 @@ pub const max_total = 10 * 1024 * 1024;
 /// A skill folder's files (paths with `/`), up to the limits
 /// (error.TooLarge past them); links, `.tmp` files and `.git` left out.
 pub fn readFolder(io: Io, a: std.mem.Allocator, folder: []const u8) ![]File {
+    return readFolderMax(io, a, folder, max_files, max_total);
+}
+
+/// `readFolder` with other limits (a folder of several skills).
+pub fn readFolderMax(io: Io, a: std.mem.Allocator, folder: []const u8, files_cap: usize, bytes_cap: usize) ![]File {
     var out: std.ArrayList(File) = .empty;
     var total: usize = 0;
-    try readInto(io, a, folder, "", &out, &total);
+    try readInto(io, a, folder, "", &out, &total, files_cap, bytes_cap);
     std.mem.sort(File, out.items, {}, lessFile);
     return out.items;
 }
 
-fn readInto(io: Io, a: std.mem.Allocator, folder: []const u8, rel: []const u8, out: *std.ArrayList(File), total: *usize) !void {
+fn readInto(io: Io, a: std.mem.Allocator, folder: []const u8, rel: []const u8, out: *std.ArrayList(File), total: *usize, files_cap: usize, bytes_cap: usize) !void {
     const here = if (rel.len == 0) folder else try std.fs.path.join(a, &.{ folder, rel });
     var d = try Io.Dir.cwd().openDir(io, here, .{ .iterate = true });
     defer d.close(io);
@@ -55,16 +60,16 @@ fn readInto(io: Io, a: std.mem.Allocator, folder: []const u8, rel: []const u8, o
         const r = if (rel.len == 0) try a.dupe(u8, e.name) else try std.fmt.allocPrint(a, "{s}/{s}", .{ rel, e.name });
         switch (e.kind) {
             // a clone's history is no part of the skill
-            .directory => if (!std.mem.eql(u8, e.name, ".git")) try readInto(io, a, folder, r, out, total),
+            .directory => if (!std.mem.eql(u8, e.name, ".git")) try readInto(io, a, folder, r, out, total, files_cap, bytes_cap),
             .file => {
                 if (std.mem.endsWith(u8, e.name, ".tmp")) continue;
-                if (out.items.len >= max_files) return error.TooLarge;
-                const data = d.readFileAlloc(io, e.name, a, .limited(max_total - total.* + 1)) catch |err| switch (err) {
+                if (out.items.len >= files_cap) return error.TooLarge;
+                const data = d.readFileAlloc(io, e.name, a, .limited(bytes_cap - total.* + 1)) catch |err| switch (err) {
                     error.StreamTooLong => return error.TooLarge,
                     else => return err,
                 };
                 total.* += data.len;
-                if (total.* > max_total) return error.TooLarge;
+                if (total.* > bytes_cap) return error.TooLarge;
                 const exec = builtin.os.tag != .windows and if (d.statFile(io, e.name, .{})) |st| st.permissions.toMode() & 0o111 != 0 else |_| false;
                 try out.append(a, .{ .rel = r, .data = data, .exec = exec });
             },
@@ -82,8 +87,9 @@ pub fn hashFolder(io: Io, a: std.mem.Allocator, folder: []const u8) ![64]u8 {
 
 /// One installed skill: its name, where it came from (a folder,
 /// `OWNER/REPO[/PATH][@REF]`, a link, or `hermes`), the commit or link it
-/// was pinned to ("-" for none), its hash when installed, and when.
-pub const Line = struct { name: []const u8, source: []const u8, pin: []const u8, hash: []const u8, time: []const u8 };
+/// was pinned to ("-" for none), its hash when installed, when, and its
+/// name at the source when harness renamed it ("" when it didn't).
+pub const Line = struct { name: []const u8, source: []const u8, pin: []const u8, hash: []const u8, time: []const u8, upstream: []const u8 = "" };
 
 pub const sources_file = ".sources";
 
@@ -107,6 +113,7 @@ pub fn readSources(io: Io, a: std.mem.Allocator, skills_dir: []const u8) ![]Line
             .pin = f.next() orelse continue,
             .hash = f.next() orelse continue,
             .time = f.next() orelse continue,
+            .upstream = f.next() orelse "",
         };
         if (f.next() != null or line.name.len == 0 or line.source.len == 0) continue;
         try out.append(a, line);
@@ -116,8 +123,8 @@ pub fn readSources(io: Io, a: std.mem.Allocator, skills_dir: []const u8) ![]Line
 
 pub fn writeSources(io: Io, a: std.mem.Allocator, skills_dir: []const u8, lines: []const Line) !void {
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(a, "# Installed skills: name, source, commit or link, hash, time (harness skill list)\n");
-    for (lines) |l| try out.print(a, "{s}\t{s}\t{s}\t{s}\t{s}\n", .{ l.name, l.source, l.pin, l.hash, l.time });
+    try out.appendSlice(a, "# Installed skills: name, source, commit or link, hash, time, name at the source (harness skill list)\n");
+    for (lines) |l| try out.print(a, "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{ l.name, l.source, l.pin, l.hash, l.time, l.upstream });
     try @import("util.zig").writeReplace(io, try std.fs.path.join(a, &.{ skills_dir, sources_file }), out.items);
 }
 
@@ -297,6 +304,64 @@ pub fn facts(a: std.mem.Allocator, md: []const u8) !Facts {
 }
 
 // ---- installing ----
+
+/// Why a path kept from an archive can't be written here or on Windows
+/// (`..`, `\`, a reserved device name, `<>:"|?*`, a control character, a
+/// part ending in a dot or space), or null.
+pub fn badName(a: std.mem.Allocator, rel: []const u8) !?[]const u8 {
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        if (std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".")) return try std.fmt.allocPrint(a, "it holds a .. path ({s})", .{rel});
+        for (part) |c| if (c < 0x20 or std.mem.indexOfScalar(u8, "<>:\"|?*\\", c) != null) return try std.fmt.allocPrint(a, "it holds a name Windows can't hold ({s})", .{rel});
+        if (part[part.len - 1] == '.' or part[part.len - 1] == ' ') return try std.fmt.allocPrint(a, "it holds a name Windows can't hold ({s})", .{rel});
+        const stem = part[0 .. std.mem.indexOfScalar(u8, part, '.') orelse part.len];
+        for ([_][]const u8{ "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9" }) |dev| {
+            if (std.ascii.eqlIgnoreCase(stem, dev)) return try std.fmt.allocPrint(a, "it holds a name Windows can't hold ({s})", .{rel});
+        }
+    }
+    return null;
+}
+
+/// SKILL.md with its frontmatter's `name` set to `name` (added after the
+/// first fence when there is none); line ends kept.
+pub fn renameSkill(a: std.mem.Allocator, md: []const u8, name: []const u8) ![]const u8 {
+    const crlf = std.mem.indexOf(u8, md, "\r\n") != null;
+    const nl: []const u8 = if (crlf) "\r\n" else "\n";
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.splitScalar(u8, md, '\n');
+    var n: usize = 0;
+    var done = false;
+    var in_header = false;
+    while (it.next()) |raw| {
+        n += 1;
+        const l = std.mem.trimEnd(u8, raw, "\r");
+        if (n > 1) try out.append(a, '\n');
+        if (n == 1) {
+            in_header = true;
+            try out.appendSlice(a, raw);
+            continue;
+        }
+        if (in_header and std.mem.eql(u8, std.mem.trimEnd(u8, l, " \t"), "---")) {
+            in_header = false;
+            if (!done) {
+                try out.print(a, "name: {s}{s}", .{ name, nl });
+                done = true;
+            }
+            try out.appendSlice(a, raw);
+            continue;
+        }
+        if (in_header and !done and std.mem.startsWith(u8, l, "name:")) {
+            try out.print(a, "name: {s}{s}", .{ name, if (crlf) "\r" else "" });
+            done = true;
+            continue;
+        }
+        try out.appendSlice(a, raw);
+    }
+    return out.items;
+}
+
+
 
 /// Whether a path in a skill stays in it: relative, `/` between parts,
 /// none empty, `.` or `..`.

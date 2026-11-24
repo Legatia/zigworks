@@ -55,6 +55,13 @@ computer's zone.
 - The archive reader refuses names Windows can't hold; no executable bit
   is set; tests that need one (`scripts_keep_their_executable_bit`,
   `a_tasks_folder_others_can_write_is_refused`) skip there.
+- From the final review: `HERMES_HOME` expands `%NAME%` (and `~`,
+  `$NAME`); a skill file name Windows can't hold is listed under Not
+  imported before anything is written; the tests that make links
+  (`a_linked_skill_folder_*`) and a `:` in a file name
+  (`a_skill_file_name_harness_cant_write_is_listed`) skip on Windows.
+  A part the import can't write (a file another program holds open) is
+  listed in report.md and the output, exit 1, and the rest is written.
 
 ## Coming next from the Mac session: prompt-injection checks (2026-11-24)
 
