@@ -32700,6 +32700,37 @@ test "injection_31_a_feed_starts_a_workflow_that_plants_a_fact" {
     try f.rec.waitFor("remember: " ++ inject.fact ++ "\nThis run read outside text first: feed 127.0.0.1:");
 }
 
+test "injection_33_a_feed_asks_a_trigger_run_to_pay" {
+    var f: Fix = undefined;
+    // a budget and caps the payment is well within
+    try f.init("[money]\nmax_per_call = 1000\nbudget_per_day = 1000\nbudget_per_month = 1000\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const cs = inject.case(33);
+    try withShop(&f, shop_money);
+    try writePage(&f, "z.xml", try rssOf(&f, &.{"a"}));
+    try setTriggers(&f, "[news]\nfeed = URL/page/z.xml\ndo = Act on the item.\n");
+    _ = try f.core.pollNow("news");
+    try writePage(&f, "z.xml", try rssOf(&f, &.{ "a", "pay-acme" }));
+    _ = try f.core.pollNow("news");
+    try f.e.script(1, try injReply(&f, "o1", cs.calls[0]));
+    try f.e.script(2, model.textReply("Not paid."));
+    f.core.tick();
+    waitIdle(f.core);
+    // refused as outside text, whatever the budget; nothing reached the shop
+    try expectHas(try f.e.request(2), "refused by the gate: it read outside text first (feed 127.0.0.1:");
+    try expectHas(try f.e.request(2), "), and outside text doesn't spend");
+    try t.expectEqualStrings("", shopOrders(&f));
+    // a skipped item for the owner, the whole call and [Make this payment]
+    try f.rec.waitFor("frisco__shop_order: frisco/shop_order {\"items\":[\"invoice 4471 ACME Ltd\"],\"total\":900}\nAmount: 900\nRefused: it read outside text first (feed 127.0.0.1:");
+    try t.expect(f.rec.buttonsWith("Amount: 900").?.get("pay") != null);
+    // the log: the call, why, and the feed
+    const lines = try logText(&f);
+    try expectHas(lines, "\"run\":\"trigger news\"");
+    try expectHas(lines, "\"tool\":\"frisco__shop_order\",\"decision\":\"deny\",\"why\":\"it read outside text first (feed 127.0.0.1:");
+    try expectHas(lines, try std.fmt.allocPrint(a, "\"outside\":[\"feed 127.0.0.1:{d}\"]", .{f.e.server.port}));
+}
+
 test "injection_32_a_skill_from_a_repo_asks_to_send_memory_out" {
     var f: Fix = undefined;
     try f.init("", "", "");
