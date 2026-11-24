@@ -422,7 +422,7 @@ reply "$(text_reply 'both helpers answered')"
 say "ask twice at once"
 check "two helpers' questions wait at once" 'wait_asked $((before + 2)) && [ "$(open_items)" = 2 ]'
 press deny
-check "the newer is answered first while the older waits" 'sleep 1 && [ "$(open_items)" = 1 ] && ! grep -qF "both helpers answered" "$OUT"'
+check "the newer is answered first while the older waits" 'n=0; while [ "$(open_items)" != 1 ] && [ $n -lt 20 ]; do sleep 0.5; n=$((n + 1)); done; sleep 1 && [ "$(open_items)" = 1 ] && ! grep -qF "both helpers answered" "$OUT"'
 press_at 2 once
 check "then the older, and the turn goes on" 'wait_for "$OUT" "both helpers answered" && [ "$(open_items)" = 0 ]'
 

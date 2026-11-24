@@ -642,7 +642,10 @@ const Sx = struct {
     }
 
     fn path(sx: *Sx, rel: []const u8) []const u8 {
-        return std.fs.path.join(sx.a(), &.{ sx.e.dir, rel }) catch unreachable;
+        const p = std.fs.path.join(sx.a(), &.{ sx.e.dir, rel }) catch unreachable;
+        // as the command prints it: Windows' own separators all the way
+        if (std.fs.path.sep != '/') std.mem.replaceScalar(u8, p, '/', std.fs.path.sep);
+        return p;
     }
 
     fn installed(sx: *Sx, rel: []const u8) ?[]const u8 {
