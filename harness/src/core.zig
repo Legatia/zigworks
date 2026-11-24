@@ -29380,7 +29380,8 @@ test "the_order_goes_through_the_gates_caps_and_dry_run" {
     Errands.work(f.core);
     // over the cap a call: said, nothing asked
     try f.rec.waitFor("The order from Frisco would be 10.00 PLN, over your cap of 8 a call: nothing is proposed.");
-    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    // (setup's budget question is the one item)
+    try t.expectEqual(0, f.rec.count("BUTTONS Order from"));
     // the shop's own cap lifts it; dry run is on
     try withShop(&f, shop_money ++ "max_per_call = 50\n");
     try f.core.handleText("got the milk");
@@ -29422,7 +29423,8 @@ test "a_shop_whose_order_tool_is_not_money_is_refused" {
     try f.core.handleText("add milk");
     Errands.work(f.core);
     try f.rec.waitFor("No order from Frisco this time: Frisco has no tool mcp.ini lists as money");
-    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    // (setup's budget question is the one item)
+    try t.expectEqual(0, f.rec.count("BUTTONS Order from"));
 }
 
 test "a_tap_after_a_restart_still_orders_once" {
