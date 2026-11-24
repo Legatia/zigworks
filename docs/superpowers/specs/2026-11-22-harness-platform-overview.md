@@ -385,7 +385,10 @@ specs, marked "settled".
    triggers, workflows and apps: host or sandbox? Host: as today; allowed
    commands reach the data folder. Sandbox: no data folder, home or
    network unless allowed; Linux needs bubblewrap.
-4. Apps on your phone (apps) before hosting? No: links open only on the
+4. **Answered 2026-11-24: "App we do desktop first. Mobile will be using tg or
+   WhatsApp for now. Also since we don't rent server for clients pc side is
+   naturally the best place."** So apps stay on the harness machine, and the
+   phone is the chat. The question was: Apps on your phone (apps) before hosting? No: links open only on the
    harness machine (or via `ssh -L`). Yes: harness behind a TLS front you
    run (`tailscale serve`); anyone reaching it with a link opens apps
    until restart.

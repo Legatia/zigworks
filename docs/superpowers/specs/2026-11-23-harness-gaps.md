@@ -128,6 +128,19 @@ scheduled departure; `/setup car` for a Tesla (the car file and
 `carcloud login` by hand); a harness smoke check of warm-car against the
 real carcloud (unit tests with harness-fake's Tesla stand-in).
 
+## The owner's direction on the app and hosting (2026-11-24)
+
+- **The app is desktop first,** on the owner's own machine, where harness
+  runs: "we don't rent server for clients". A design follows.
+- **The phone is the chat:** Telegram now. WhatsApp as the owner's channel
+  isn't built. Meta's Cloud API needs a public HTTPS webhook and a business
+  account (the 0.2 design kept it for the hosted service). Without a server
+  of ours, each owner would need a tunnel they run themselves, or an
+  unofficial WhatsApp client. The unofficial client breaks WhatsApp's terms,
+  and its accounts get banned. Open: which of the two, if any.
+- **The hosted version** (`2026-11-22-harness-hosted-design.md`) is set
+  aside: no servers rented for clients.
+
 ## Parked: AI avatar livestreams (owner, 2026-11-24: "not top priority")
 
 Use case: a 24-hour AI avatar livestream that sells or chats.
