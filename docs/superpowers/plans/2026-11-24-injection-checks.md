@@ -134,7 +134,20 @@
 12. **A workflow instance keeps a mark in its state**, from the trigger that started it, its `wait event` triggers and its steps' sources; each step's run starts with it. Why: steps pass outside words to later steps through values. Cost if wrong: none found.
 13. **The question line is part of the question's text** (so every asker shows it) and of member and skipped items' bodies. Cost if wrong: a question near 12 KB that fit before is refused as too long.
 14. **Mentions in a forwarded message don't count** (`from_owner` false): they aren't the owner's words. Cost if wrong: none found.
+15. **A workflow's stored answer is matched on the question without its outside-text line.** Why: a tool step's own read marked its retry, so the owner was asked a third time for a call they had answered (each_question_of_a_call_keeps_its_own_answer went red). Cost if wrong: a call answered before the instance read outside text runs without the line being shown again.
+16. **A forwarded voice note** is transcribed after the voice checks, then a marked turn; never a phrase, list words or an item's answer. Cost if wrong: none found.
+17. **Case 10 (the browser) runs at the agent level** through web's gate hook: the web tool needs Chrome, which runners may lack; web.zig's Chrome tests cover the browser half. Cost if wrong: the browser's mark is covered by the hook's test only.
+18. **Case 18's speech asks to unlock the front door**, not open a garage: the stand-in home has no garage; the outcome is the same one-tap item. Cost if wrong: none.
+19. **The demo's `--check` leaves nothing behind**; plain mode keeps the log in a folder it names. `--serve` writes case 5's store path as the data folder's `secrets/`, a path it never reads. Cost if wrong: none.
+20. **Gate lines harness's own jobs write directly** (people, away, trips, the evening, deliveries, apps' reads, a workflow's approve) carry no outside list: they are not a model's calls in a run. A marked workflow's approve and review items do carry the line. Cost if wrong: those lines don't say what the instance had read.
+21. **Setup's `[car]` server marks nothing, like `[home]`:** its results are the owner's own car's state, and the spec's call keeps household runs free of the line (the car-for-tomorrow routine's question got "mcp car"). Cost if wrong: a car server answering with third-party words wouldn't mark.
+22. **calendar_attendees_become_people** failed on the baseline too (dated fixture, real clock): it takes harness-logins' ed34e74.
 
 ## Done
 
-(Filled in at the end.)
+- Commits: the plan; outside.zig and the log's fields; the mark on the conversation; the two new asks and logged unoffered calls; the mark at the edges; the memory writer; the catalog and its unit cases; the demo; approve items' line; forwarded voice notes; the car's role; the calendar test (ed34e74); docs.
+- harness: 1254/1274 (20 skipped) Debug and ReleaseSafe; smoke 131, 164 with homemcp, carcloud, calmcp and mailmcp built (the demo's 21 checks and its count among them). The demo: "8 cases. The gate held in 8.", in about 3 s; `--serve` tried with a temp HARNESS_HOME. Cross builds (x86_64-windows, x86_64-linux-musl, aarch64-linux-musl; build and unit-build) ok.
+- Holes the catalog's checks found in today's code, each RED then GREEN: a feed's words, and a feed-started workflow step's, saved a memory unasked (a_feed_triggers_run_starts_marked, a_workflow_started_by_a_feed_keeps_its_mark); a forwarded "/dryrun on" ran as the owner's command (a_forwarded_message_is_marked_and_never_a_command); a forwarded voice note skipped the voice checks (a_forwarded_voice_note_gets_the_voice_checks). With the two new asks and the line taken out, 14 of the 23 unit cases fail; the other nine pin earlier behaviour or an absence.
+- Tests changed on purpose: kinds_without_a_tool_yet_are_not_offered_or_run (a refused line now); outside's role tests for the car; calendar_attendees_become_people (ed34e74).
+- Skipped on Windows: injection_23 and injection_25 (POSIX commands). The demo's case 5 runs `type` there.
+- Left out: long memory's summaries carry no mark (a README limit); the gate lines of harness's own jobs carry no outside list (Ruling 20).

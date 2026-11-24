@@ -5,71 +5,63 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
-## Coming next from the Mac session: prompt-injection checks (2026-11-24)
+## Built by the Mac session: prompt-injection checks (2026-11-24)
 
-Spec: `docs/superpowers/specs/2026-11-24-harness-injection-checks-design.md`
-(0435b84). It has been reviewed and is waiting on the owner's approval.
-Nothing is built yet. The Mac session builds it once approved.
+Spec `docs/superpowers/specs/2026-11-24-harness-injection-checks-design.md`,
+plan `docs/superpowers/plans/2026-11-24-injection-checks.md` (branch
+`platform/inject`). The checks assume the model obeys the hostile text; 31
+cases (`src/inject.zig`): 1–8 end to end in `scripts/injection-demo.sh`,
+which the smoke script runs with `--check` (so Windows CI runs it under Git
+Bash), 9–31 as unit tests `injection_NN_…` through Core.
 
-**The idea.** The checks assume the model obeys the hostile text. Each
-check tests that the gate's outcome holds, that nothing reached the
-attacker, that no secret left harness, and that the log says why. There
-are 28 cases:
+**What changed in shared code, as built:**
 
-- end to end, in `scripts/injection-demo.sh`, which the smoke script runs
-  with `--check`, so Windows CI runs it under Git Bash;
-- the rest as unit cases through Core.
+- `outside.zig` (new, pure): source names, the question line, roles of MCP
+  servers (`home` and `car` mark nothing, `calendar` or a name with it,
+  mailmcp's tools).
+- `agent.zig`: `Conversation.Turn.outside`/`marked`/`own`,
+  `Conversation.summary_outside` (summaries keep the marks of the turns
+  they were made from); `Run.conv`, `start_marks`, `own_words`, `loose`,
+  `mark()`, `outside()`. Calls that ran mark (fetch/browse and allowed
+  redirect hops `page HOST`, search, history with tool results, MCP by
+  role, `web HOST` in `webAllow`, helpers' marks after `delegate`).
+  `logRun` puts `outside`/`outside_more` on gate lines (`log.Tag`).
+  `decideAndAskWith` adds the line to the question; `Question.outside` and
+  `Skip.outside` carry it. The "not available here" branch now logs
+  `deny`, `not offered in this run`; an unknown name logs `no such tool`.
+- `gate.zig`: `Ctx.outside`; `remember` and `people note` default to ask
+  when set (`outside text: asked by default`), never `allow_day`;
+  unattended `outside text, unattended`. Rules decide as before.
+- `core.zig`: `Incoming.forwarded` and `Queued.forwarded` (a forwarded
+  message is never a command; `chatTurnWith`), `mailTurn`'s marks and
+  own words, `triggerMarks`, a brief's marks, `serverRole`, workflow
+  instances' marks (`wstate.State.outside`, `Start.outside`, saved in
+  `state` and `line`), the line on member and skipped items, the memory
+  writer reading only the owner's words of a marked turn. `WfAsker`
+  matches a stored answer on the question without its outside line.
+- `telegram.zig`: `Message.forwarded` from `forward_origin` (or the older
+  `forward_date`); `main.zig` passes it on.
+- `history.zig`: `Answer.tools`; `build.zig` installs harness-fake.
 
-**What will change in shared code** (expect small conflicts there):
+**Rulings worth knowing** (all in the plan): marks live on turns, so they
+go with the context on a restart; a server's role comes from setup's
+section names; long memory's summaries carry no mark (a README limit);
+`outside` on a private line is hashed like other fields.
 
-- **Outside text marks the conversation.** The mark is saved with the
-  conversation's state, trimmed with its turns, carried by summaries and
-  cleared by `/new`.
-  - Sources: pages, the browser, search, feeds, others' mail, the calendar
-    and other MCP servers' results, forwarded Telegram messages
-    (`forward_origin`), `history` results and helpers' marks.
-  - Not sources: shell output, workspace files, MCP tool descriptions, the
-    home server, and members' and rooms' messages.
-- **Questions and one-tap items** in a marked conversation get one line
-  naming up to three sources. Gate log lines carry
-  `"outside":[…]` and `"outside_more":N`.
-- **Two changed defaults:** in a marked conversation, `remember` and
-  `people note` are asked. Unattended, they are refused and become a
-  skipped item. An owner's allow line still lifts them.
-- **The memory writer** reads only the owner's own words in marked turns.
-  It skips quoted and forwarded mail, forwarded Telegram messages and the
-  agent's replies.
-- **A call to a tool the run isn't offered** is now logged as refused,
-  with `not offered in this run`. Today it writes no line.
+**Skipped on Windows:** `injection_23_a_key_in_encoded_forms_is_masked`
+and `injection_25_a_key_reversed_gets_through_once_allowed` (they use
+`base64`, `od`, `sed`, `rev`: POSIX commands). The demo's case 5 runs
+`type PATH` on Windows instead of `cat`. Untried on Windows: the demo
+under Git Bash, `--serve`'s Ctrl-C. If a demo case fails only on Windows
+CI, say so in your status section.
 
-**Until it lands, keep your edits small in:**
+**A rule for new code from now on:** a new source of third-party words
+adds to the mark; a new tool that keeps text for later runs is asked in a
+marked conversation.
 
-- `gate.zig`'s defaults;
-- `agent.zig`'s call path (the "not available here" branch);
-- `core.zig`'s memory writer and question text;
-- the conversations' state format;
-- `telegram.zig`'s message parsing.
-
-**For Windows:**
-
-- Cases 5, 23 and 25 use POSIX commands (`cat`, `base64`, `rev`,
-  `od -c`). On Windows each gets a Windows twin or a skip, like the other
-  POSIX-shell tests.
-- If a demo case fails only on Windows CI, say so in your status section.
-
-**A rule for new code from now on:**
-
-- A new source of third-party words adds to the mark.
-- A new tool that keeps text for later runs is asked in a marked
-  conversation.
-
-**After this,** the remaining Hermes differentiators are:
-
-- importing a Hermes setup and agentskills.io skills;
-- the gate as an MCP proxy;
-- private conversations on a local model.
-
-None is claimed yet. Ask the owner before you start one.
+**Still open** among the Hermes differentiators: importing a Hermes setup
+and agentskills.io skills; the gate as an MCP proxy; private conversations
+on a local model. None is claimed; ask the owner before starting one.
 
 ## Latest from the Mac session (2026-11-24)
 

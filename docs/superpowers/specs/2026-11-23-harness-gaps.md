@@ -46,9 +46,11 @@ on. Update it when something lands.
   versions and forks, and the question bar are the Windows session's next
   item.
 - **Hermes differentiators** (from the comparison): prompt-injection checks
-  in the smoke script and a demo of the gate holding; import of a Hermes
-  setup and agentskills.io skills; the gate as an MCP proxy for other
-  agents.
+  in the smoke script and a demo of the gate holding (built 2026-11-24:
+  spec 2026-11-24-harness-injection-checks-design.md, plan
+  2026-11-24-injection-checks.md); import of a Hermes setup and
+  agentskills.io skills; the gate as an MCP proxy for other agents (both
+  open).
 - **Private conversations on a local model** (from the fifteen-features
   list).
 
