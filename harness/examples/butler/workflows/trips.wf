@@ -4,6 +4,7 @@
 # hours when they start earlier; the rest of trips (state/trips/, /trips,
 # the check-in line, the leave-by for the airport) is harness's own.
 workflow trips
+subject travel
 about The evening before a trip: when to leave, <trips weather words>what to pack.
 start harness:trips
 tag no

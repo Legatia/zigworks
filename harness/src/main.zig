@@ -467,6 +467,11 @@ fn initCmd(app: *App, args: []const []const u8) !Exit {
         const text = Io.Dir.cwd().readFileAlloc(app.io, p.config, app.arena, .limited(1 << 20)) catch "";
         const on = try butlerConfig(app.arena, text);
         if (!std.mem.eql(u8, on, text)) try util.writeReplace(app.io, p.config, on);
+        // the butler's manner: persona.md, unless the owner has one
+        if (Io.Dir.cwd().createFile(app.io, p.persona, .{ .exclusive = true, .permissions = util.private_file })) |f| {
+            defer f.close(app.io);
+            try f.writeStreamingAll(app.io, butler_persona);
+        } else |e| if (e != error.PathAlreadyExists) return e;
     }
     try outAll(app.io, try initText(app.arena, app.home, butler_on, asked));
     // a Hermes setup to bring over: said, never done
@@ -551,6 +556,9 @@ fn isYes(answer: []const u8) bool {
     return std.ascii.eqlIgnoreCase(w, "y") or std.ascii.eqlIgnoreCase(w, "yes");
 }
 
+/// persona.md as `init --butler` writes it (when there is none).
+const butler_persona = "---\npreset: butler\n---\n";
+
 /// config.ini with quiet hours on (22:00-07:00), as a home butler's are:
 /// init's commented line turned on; a file that says otherwise is left.
 fn butlerConfig(a: std.mem.Allocator, text: []const u8) ![]const u8 {
@@ -565,6 +573,7 @@ fn initText(a: std.mem.Allocator, home: []const u8, butler_on: bool, asked: bool
     if (butler_on) return std.fmt.allocPrint(a,
         \\Data folder: {s}
         \\A home butler: quiet hours are on, 22:00-07:00 (config.ini, [butler]).
+        \\persona.md: the butler's manner (/persona changes it).
         \\Next:
         \\  1. The model: set the omnigate url (there is none by default) and route names in config.ini,
         \\     or another provider: [model] provider (README: Models and providers).
@@ -986,7 +995,63 @@ const TgChan = struct {
     }
 
     fn channel(tc: *TgChan) core_mod.Channel {
-        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic, .file = file };
+        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic, .file = file, .rich = rich, .buttons_rich = buttonsRich, .replace = replace, .pin = pin, .topics = topics, .me = me };
+    }
+
+    /// `send` with message entities (topic links, folded quotes).
+    fn rich(ctx: *anyopaque, place: core_mod.Place, text: []const u8, ents: []const telegram.Entity) anyerror!core_mod.Sent {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return error.NotPaired;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        const sent = tc.send_bot.sendRich(place.chat, place.thread, text, ents, .{ .quiet = place.quiet }) catch |e| {
+            complain("telegram: sending failed: {s}", .{@errorName(e)});
+            return if (e == error.TelegramRefused and place.thread != 0) error.TopicRefused else e;
+        };
+        return .{ .first = sent.first, .count = sent.count };
+    }
+
+    fn buttonsRich(ctx: *anyopaque, place: core_mod.Place, text: []const u8, ents: []const telegram.Entity, bs: []const [2][]const u8) ?i64 {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return null;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return tc.send_bot.sendButtonsRich(place.chat, place.thread, text, ents, bs, .{ .quiet = place.quiet }) catch null;
+    }
+
+    /// A card's new text; error.MessageGone when Telegram no longer has it.
+    fn replace(ctx: *anyopaque, place: core_mod.Place, id: i64, text: []const u8, ents: []const telegram.Entity) anyerror!void {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return error.NotPaired;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return tc.send_bot.editRich(place.chat, id, text, ents);
+    }
+
+    fn pin(ctx: *anyopaque, place: core_mod.Place, id: i64) anyerror!void {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return error.NotPaired;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return tc.send_bot.pin(place.chat, id);
+    }
+
+    /// Topics in private chats on (setMySettings).
+    fn topics(ctx: *anyopaque, on: bool) anyerror!void {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return tc.send_bot.setTopics(on);
+    }
+
+    /// Whether topics in private chats are on now (getMe).
+    fn me(ctx: *anyopaque) anyerror!bool {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        var arena: std.heap.ArenaAllocator = .init(tc.gpa);
+        defer arena.deinit();
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return (try tc.send_bot.getMe(arena.allocator())).topics;
     }
 
     /// A file a message carried (a voice note): getFile, then the file,
@@ -1142,7 +1207,8 @@ fn runCmd(app: *App) !Exit {
     const tick_thread = try std.Thread.spawn(.{}, ticker, .{c});
     defer tick_thread.join();
     defer c.quitting.store(true, .release);
-    try errPrint(app.io, "harness {s}: running on {s}{s}\n", .{ build_options.version, app.home, if (c.owner == null) "; not paired yet: run harness pair" else "" });
+    const persona_note = c.personaNote();
+    try errPrint(app.io, "harness {s}: running on {s}{s}{s}{s}\n", .{ build_options.version, app.home, if (c.owner == null) "; not paired yet: run harness pair" else "", if (persona_note.len > 0) "; " else "", persona_note });
 
     var offset = telegram.Offset.load(app.io, c.paths.telegram);
     var failures: u32 = 0;
@@ -2474,6 +2540,9 @@ test "init_asks_whether_this_is_a_home_butler" {
     try t.expect(std.mem.indexOf(u8, plain, "secret add ha") == null);
     try t.expect(std.mem.indexOf(u8, plain, "harness init --butler") != null);
     try t.expect(std.mem.indexOf(u8, try initText(a, "/data", false, true), "harness init --butler") == null);
+    // the butler's manner: persona.md
+    try t.expectEqualStrings("---\npreset: butler\n---\n", butler_persona);
+    try t.expect(std.mem.indexOf(u8, said, "persona.md: the butler's manner (/persona changes it).") != null);
     // --butler, and nothing else
     try t.expect(badArgs(&.{ "init", "--butler" }) == null);
     try t.expect(badArgs(&.{ "init", "x" }) != null);
@@ -2792,6 +2861,10 @@ test {
     _ = @import("masks.zig");
     _ = @import("skills.zig");
     _ = @import("agents.zig");
+    _ = @import("persona.zig");
+    _ = @import("topics.zig");
+    _ = @import("card.zig");
+    _ = @import("work.zig");
     _ = @import("mcp.zig");
     _ = @import("mcp_http.zig");
     _ = @import("oauth.zig");

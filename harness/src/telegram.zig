@@ -72,6 +72,64 @@ pub const Callback = struct {
 /// The messages a text was sent in: the first one's id and how many.
 pub const Sent = struct { first: i64 = 0, count: u32 = 0 };
 
+/// A message entity: a link over part of the text, or a quote folded
+/// until tapped. Offsets and lengths in bytes of the text; sent in UTF-16
+/// units, as the Bot API counts them. No parse_mode is ever used, so text
+/// from outside can't make markup.
+pub const Entity = struct {
+    kind: Kind,
+    offset: usize,
+    len: usize,
+    /// A text_link's address.
+    url: []const u8 = "",
+
+    pub const Kind = enum { text_link, expandable_blockquote };
+};
+
+/// How many UTF-16 units `s` is (a byte that isn't UTF-8: one).
+pub fn utf16Len(s: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch {
+            n += 1;
+            i += 1;
+            continue;
+        };
+        if (i + len > s.len) {
+            n += 1;
+            i += 1;
+            continue;
+        }
+        const cp = std.unicode.utf8Decode(s[i .. i + len]) catch {
+            n += 1;
+            i += 1;
+            continue;
+        };
+        n += if (cp >= 0x10000) 2 else 1;
+        i += len;
+    }
+    return n;
+}
+
+/// `,"entities":[…]` for `ents` of `text` (in UTF-16 units); nothing for none.
+fn entitiesJson(body: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8, ents: []const Entity) !void {
+    var first = true;
+    for (ents) |e| {
+        if (e.len == 0 or e.offset + e.len > text.len) continue;
+        try body.appendSlice(a, if (first) ",\"entities\":[" else ",");
+        first = false;
+        // counted on the text as it is sent (broken UTF-8 replaced)
+        try body.print(a, "{{\"type\":\"{s}\",\"offset\":{d},\"length\":{d}", .{ @tagName(e.kind), utf16Len(try util.validUtf8(a, text[0..e.offset])), utf16Len(try util.validUtf8(a, text[e.offset .. e.offset + e.len])) });
+        if (e.kind == .text_link) {
+            try body.appendSlice(a, ",\"url\":");
+            try util.jsonString(body, a, e.url);
+        }
+        try body.append(a, '}');
+    }
+    if (!first) try body.append(a, ']');
+}
+
 /// What the bot is (`getMe`).
 pub const Me = struct {
     username: []const u8,
@@ -134,6 +192,12 @@ pub const Bot = struct {
     }
 
     fn callAs(b: *Bot, arena: std.mem.Allocator, method: []const u8, body: []const u8, content_type: []const u8, idle_ms: u32) !?jv.Value {
+        var why: []const u8 = "";
+        return b.callWhy(arena, method, body, content_type, idle_ms, &why);
+    }
+
+    /// `callAs`; a refusal's description in `why` (in `arena`).
+    fn callWhy(b: *Bot, arena: std.mem.Allocator, method: []const u8, body: []const u8, content_type: []const u8, idle_ms: u32, why: *[]const u8) !?jv.Value {
         b.mutex.lockUncancelable(b.io);
         defer b.mutex.unlock(b.io);
         const path = try std.fmt.allocPrint(arena, "/bot{s}/{s}", .{ b.token, method });
@@ -150,6 +214,7 @@ pub const Bot = struct {
                 b.io.sleep(.fromSeconds(@max(wait, 1)), .awake) catch {};
                 continue;
             }
+            why.* = jv.str(jv.get(v, "description")) orelse "";
             return error.TelegramRefused;
         }
     }
@@ -229,13 +294,20 @@ pub const Bot = struct {
 
     /// `sendButtons` to topic `thread` of the chat (0: the chat itself).
     pub fn sendButtonsTo(b: *Bot, chat_id: i64, thread: i64, text: []const u8, buttons: []const [2][]const u8, opts: Opts) !i64 {
+        return b.sendButtonsRich(chat_id, thread, text, &.{}, buttons, opts);
+    }
+
+    /// `sendButtonsTo` with message entities (no parse_mode).
+    pub fn sendButtonsRich(b: *Bot, chat_id: i64, thread: i64, text: []const u8, ents: []const Entity, buttons: []const [2][]const u8, opts: Opts) !i64 {
         var arena: std.heap.ArenaAllocator = .init(b.gpa);
         defer arena.deinit();
         const a = arena.allocator();
         var body: std.ArrayList(u8) = .empty;
+        const cut = util.cut(text, max_text);
         try where(&body, a, chat_id, thread);
         try body.appendSlice(a, ",\"text\":");
-        try util.jsonString(&body, a, util.cut(text, max_text));
+        try util.jsonString(&body, a, cut);
+        try entitiesJson(&body, a, cut, ents);
         if (opts.quiet) try body.appendSlice(a, ",\"disable_notification\":true");
         try body.appendSlice(a, ",\"reply_markup\":{\"inline_keyboard\":[[");
         const row = rowLength(buttons.len);
@@ -275,6 +347,77 @@ pub const Bot = struct {
         const ct = try std.fmt.allocPrint(a, "multipart/form-data; boundary={s}", .{boundary});
         const res = try b.callAs(a, "sendDocument", body, ct, 60_000);
         return jv.int(jv.get(res, "message_id")) orelse 0;
+    }
+
+    /// `sendTo` with message entities (no parse_mode): each part gets the
+    /// entities wholly in it.
+    pub fn sendRich(b: *Bot, chat_id: i64, thread: i64, text: []const u8, ents: []const Entity, opts: Opts) !Sent {
+        var arena: std.heap.ArenaAllocator = .init(b.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var sent: Sent = .{};
+        var at: usize = 0;
+        for (try split(a, if (text.len > 0) text else "(empty)", max_text)) |part| {
+            defer at += part.len;
+            var mine: std.ArrayList(Entity) = .empty;
+            for (ents) |e| if (e.offset >= at and e.offset + e.len <= at + part.len) {
+                var x = e;
+                x.offset -= at;
+                try mine.append(a, x);
+            };
+            var body: std.ArrayList(u8) = .empty;
+            try where(&body, a, chat_id, thread);
+            try body.appendSlice(a, ",\"text\":");
+            try util.jsonString(&body, a, part);
+            try entitiesJson(&body, a, part, mine.items);
+            try body.appendSlice(a, ",\"link_preview_options\":{\"is_disabled\":true}");
+            if (opts.quiet) try body.appendSlice(a, ",\"disable_notification\":true");
+            try body.append(a, '}');
+            const res = try b.call(a, "sendMessage", body.items, 30_000);
+            const id = jv.int(jv.get(res, "message_id")) orelse 0;
+            if (sent.count == 0) sent.first = id;
+            sent.count += 1;
+        }
+        return sent;
+    }
+
+    /// Replaces a message's text and entities; error.MessageGone when
+    /// Telegram no longer has it (the same text again is no error).
+    pub fn editRich(b: *Bot, chat_id: i64, message_id: i64, text: []const u8, ents: []const Entity) !void {
+        var arena: std.heap.ArenaAllocator = .init(b.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var body: std.ArrayList(u8) = .empty;
+        const cut = util.cut(text, max_text);
+        try body.print(a, "{{\"chat_id\":{d},\"message_id\":{d},\"text\":", .{ chat_id, message_id });
+        try util.jsonString(&body, a, cut);
+        try entitiesJson(&body, a, cut, ents);
+        try body.appendSlice(a, ",\"link_preview_options\":{\"is_disabled\":true}}");
+        var why: []const u8 = "";
+        _ = b.callWhy(a, "editMessageText", body.items, "application/json", 30_000, &why) catch |e| {
+            if (e != error.TelegramRefused) return e;
+            if (std.mem.indexOf(u8, why, "not modified") != null) return;
+            if (std.mem.indexOf(u8, why, "not found") != null or std.mem.indexOf(u8, why, "can't be edited") != null) return error.MessageGone;
+            return e;
+        };
+    }
+
+    /// Pins a message without a sound.
+    pub fn pin(b: *Bot, chat_id: i64, message_id: i64) !void {
+        var arena: std.heap.ArenaAllocator = .init(b.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const body = try std.fmt.allocPrint(a, "{{\"chat_id\":{d},\"message_id\":{d},\"disable_notification\":true}}", .{ chat_id, message_id });
+        _ = try b.call(a, "pinChatMessage", body, 30_000);
+    }
+
+    /// Switches topics in private chats on (or off) for the bot (Bot API
+    /// 10.5's setMySettings).
+    pub fn setTopics(b: *Bot, on: bool) !void {
+        var arena: std.heap.ArenaAllocator = .init(b.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        _ = try b.call(a, "setMySettings", if (on) "{\"has_topics_enabled\":true}" else "{\"has_topics_enabled\":false}", 30_000);
     }
 
     /// Opens a topic called `name` in the chat; returns its thread.
@@ -735,4 +878,70 @@ test "offset_persists_across_restart" {
     defer b2.deinit();
     try t.expectEqual(3, Offset.load(t.io, path));
     try t.expectEqual(0, (try b2.getUpdates(a, Offset.load(t.io, path), 0)).len);
+}
+
+test "entities_count_utf16_units" {
+    try t.expectEqual(5, utf16Len("hello"));
+    // Polish letters: one unit each; an emoji: two
+    try t.expectEqual(4, utf16Len("łódź"));
+    try t.expectEqual(2, utf16Len("\u{1F600}"));
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    var b = try Bot.init(t.allocator, t.io, try e.url(), "123:abc");
+    defer b.deinit();
+    // "Kraków 😀 (Travel)": the link over "Travel", after an emoji and a ó
+    const text = "Kraków \u{1F600} (Travel)";
+    const at = std.mem.indexOf(u8, text, "Travel").?;
+    _ = try b.sendRich(42, 5003, text, &.{.{ .kind = .text_link, .offset = at, .len = 6, .url = "https://t.me/harness_test_bot/5003" }}, .{ .quiet = true });
+    const out = try outbox(&e);
+    try t.expect(std.mem.indexOf(u8, out, "\"entities\":[{\"type\":\"text_link\",\"offset\":11,\"length\":6,\"url\":\"https://t.me/harness_test_bot/5003\"}]") != null);
+    try t.expect(std.mem.indexOf(u8, out, "\"message_thread_id\":5003") != null);
+    try t.expect(std.mem.indexOf(u8, out, "\"disable_notification\":true") != null);
+    try t.expect(std.mem.indexOf(u8, out, "parse_mode") == null);
+}
+
+test "set_my_settings_pin_and_a_gone_edit" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "telegram/me.json", .data = "{\"id\":1,\"is_bot\":true,\"username\":\"harness_test_bot\",\"has_topics_enabled\":false}" });
+    var b = try Bot.init(t.allocator, t.io, try e.url(), "123:abc");
+    defer b.deinit();
+    const a = e.arena.allocator();
+    try t.expect(!(try b.getMe(a)).topics);
+    try b.setTopics(true);
+    try t.expect((try b.getMe(a)).topics);
+    try b.pin(42, 9);
+    try b.editRich(42, 9, "Travel\nPending: none.", &.{});
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "telegram/gone", .data = "9\n" });
+    try t.expectError(error.MessageGone, b.editRich(42, 9, "Travel\nPending: one.", &.{}));
+    const out = try outbox(&e);
+    try t.expect(std.mem.indexOf(u8, out, "\"method\":\"setMySettings\",\"message_id\":") != null);
+    try t.expect(std.mem.indexOf(u8, out, "{\"has_topics_enabled\":true}") != null);
+    try t.expect(std.mem.indexOf(u8, out, "\"method\":\"pinChatMessage\",\"message_id\":") != null);
+    try t.expect(std.mem.indexOf(u8, out, "{\"chat_id\":42,\"message_id\":9,\"disable_notification\":true}") != null);
+    // the setting refused: an error, said by the caller
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = "telegram/no-settings", .data = "" });
+    try t.expectError(error.TelegramRefused, b.setTopics(true));
+}
+
+test "entities_after_broken_utf8_line_up" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    var b = try Bot.init(t.allocator, t.io, try e.url(), "123:abc");
+    defer b.deinit();
+    const a = e.arena.allocator();
+    // a cut emoji, then the link
+    const text = "ab\xf0\x9f\x98Xcd (Travel)";
+    const at = std.mem.indexOf(u8, text, "Travel").?;
+    _ = try b.sendRich(42, 0, text, &.{.{ .kind = .text_link, .offset = at, .len = 6, .url = "https://t.me/b/5003" }}, .{});
+    const out = try outbox(&e);
+    const line = out[0 .. std.mem.indexOfScalar(u8, out, '\n') orelse out.len];
+    const v = jv.parse(a, line).?;
+    const sent = jv.str(jv.at(v, &.{ "body", "text" })).?;
+    const want = utf16Len(sent[0..std.mem.indexOf(u8, sent, "Travel").?]);
+    const ents = jv.arr(jv.at(v, &.{ "body", "entities" })).?;
+    try t.expectEqual(@as(i64, @intCast(want)), jv.int(jv.get(ents[0], "offset")).?);
 }

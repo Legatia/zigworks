@@ -19,6 +19,7 @@ const zones = @import("zones.zig");
 const scrub = @import("scrub.zig");
 const util = @import("util.zig");
 const model = @import("model.zig");
+const persona_mod = @import("persona.zig");
 const Io = std.Io;
 
 pub const Group = enum { will, needs, not };
@@ -64,6 +65,8 @@ pub const Plan = struct {
     suggested: std.ArrayList(u8) = .empty,
     /// config.ini as it will be, when it changes.
     config_ini: ?[]const u8 = null,
+    /// persona.md as it will be (SOUL.md's words), when it changes.
+    persona: ?[]const u8 = null,
     secrets: std.ArrayList(SecretLine) = .empty,
 
     pub fn has(p: *const Plan, group: Group, needle: []const u8) bool {
@@ -93,6 +96,8 @@ pub const Harness = struct {
     task_files: []const []const u8 = &.{},
     /// The hashes of memory entries imported before (state/imports/hermes-entries).
     imported: []const []const u8 = &.{},
+    /// persona.md as it is ("": none).
+    persona_text: []const u8 = "",
 };
 
 pub const Opts = struct {
@@ -199,23 +204,24 @@ const Ctx = struct {
         }
     }
 
+    /// An edited SOUL.md is persona.md's words: filled where persona.md
+    /// has none (its preset kept), else Needs you; over 4 KB, Needs you.
     fn planSoul(c: *Ctx) !void {
         const raw = c.s.soul orelse return;
         const norm = try std.mem.replaceOwned(u8, c.a, raw, "\r\n", "\n");
         const text = std.mem.trim(u8, std.mem.trimStart(u8, norm, "\xEF\xBB\xBF"), " \t\r\n");
         if (text.len == 0) return;
         if (hermes.isStockSoul(raw)) return c.line(.not, "SOUL.md: Hermes's own text, never edited", .{});
-        const body = try c.mask(try std.fmt.allocPrint(c.a, "How to talk with me: {s}", .{text}));
-        if (body.len > memory_cap)
-            return c.line(.not, "SOUL.md: {s} bytes, over memory's 2,000: to keep it, make it agents/main.md by hand (that file replaces harness's built-in instructions)", .{try thousands(c.a, text.len)});
-        const hash = try entryHash(c.a, body);
-        if (inList(c.h.imported, hash)) {
-            c.skipped_imported += 1;
-            return;
-        }
-        if (c.h.memory) |store| if (try store.repeatOf(c.a, body)) |it| return c.line(.not, "SOUL.md: already in memory as {s}", .{it.id});
-        try c.p.memory.append(c.a, .{ .body = body, .pinned = true, .from = "SOUL.md", .hash = hash });
-        try c.line(.will, "memory, pinned: {s} (SOUL.md)", .{try c.shown(body)});
+        const path = try std.fs.path.join(c.a, &.{ c.s.home.dir, "SOUL.md" });
+        const body = try c.mask(text);
+        if (body.len > persona_mod.max_body) return c.line(.needs, "SOUL.md ({s}): longer than persona.md holds (4 KB); shorten it into persona.md.", .{path});
+        var p = persona_mod.parse(c.a, c.h.persona_text) catch
+            return c.line(.needs, "SOUL.md ({s}): persona.md doesn't read as it is; put SOUL.md's words in it by hand.", .{path});
+        if (std.mem.eql(u8, p.body, body)) return c.line(.not, "SOUL.md: already persona.md's words", .{});
+        if (p.body.len > 0) return c.line(.needs, "SOUL.md ({s}): persona.md has words of its own; to use SOUL.md's, put them in persona.md by hand.", .{path});
+        p.body = body;
+        c.p.persona = try persona_mod.fileText(c.a, p);
+        try c.line(.will, "persona.md: SOUL.md's words: {s}", .{try c.shown(body)});
     }
 
     // ---- skills ----
@@ -1347,6 +1353,7 @@ pub fn planText(a: std.mem.Allocator, s: hermes.Setup, p: *const Plan) ![]const 
     if (p.task_count > 0) try counts.append(a, try std.fmt.allocPrint(a, "{d} task{s}{s}", .{ p.task_count, if (p.task_count == 1) "" else "s", if (p.task_commented > 0) try std.fmt.allocPrint(a, " ({d} commented out)", .{p.task_commented}) else "" }));
     if (p.server_count > 0) try counts.append(a, try std.fmt.allocPrint(a, "{d} MCP server{s}{s}", .{ p.server_count, if (p.server_count == 1) "" else "s", if (p.server_commented > 0) try std.fmt.allocPrint(a, " ({d} commented out)", .{p.server_commented}) else "" }));
     if (p.rule_count > 0) try counts.append(a, try std.fmt.allocPrint(a, "{d} deny rule{s}", .{ p.rule_count, if (p.rule_count == 1) "" else "s" }));
+    if (p.persona != null) try counts.append(a, "persona.md's words");
     if (p.model_set) try counts.append(a, "the model");
     if (p.provider_count > 0) try counts.append(a, try std.fmt.allocPrint(a, "{d} provider{s}", .{ p.provider_count, if (p.provider_count == 1) "" else "s" }));
     if (counts.items.len == 0) try out.appendSlice(a, "  Nothing.\n") else try out.print(a, "  {s}\n", .{try std.mem.join(a, ", ", counts.items)});
@@ -1505,7 +1512,7 @@ fn say(r: Run, text: []const u8) void {
 /// Whether the plan changes anything in harness (the suggestions file
 /// alone is no change: it comes with an import, never makes one).
 fn writesAnything(p: *const Plan) bool {
-    return p.memory.items.len > 0 or p.skills.items.len > 0 or p.tasks.items.len > 0 or p.mcp.items.len > 0 or p.rules.items.len > 0 or p.config_ini != null;
+    return p.memory.items.len > 0 or p.skills.items.len > 0 or p.tasks.items.len > 0 or p.mcp.items.len > 0 or p.rules.items.len > 0 or p.config_ini != null or p.persona != null;
 }
 
 /// harness's side as it is now: its settings, its tasks (do_file read),
@@ -1523,6 +1530,7 @@ pub fn loadHarness(io: Io, a: std.mem.Allocator, paths: @import("core.zig").Path
         .briefs_text = read(io, a, paths.briefs),
         .mcp_text = read(io, a, paths.mcp),
         .rules_text = read(io, a, paths.rules),
+        .persona_text = read(io, a, paths.persona),
         .memory = store,
         .stored = stored,
     };
@@ -1584,6 +1592,7 @@ fn apply(r: Run, paths: @import("core.zig").Paths, dir: []const u8, p: *const Pl
         .{ .path = paths.mcp, .name = "mcp.ini", .add = p.mcp.items },
         .{ .path = paths.rules, .name = "rules", .add = p.rules.items },
         .{ .path = paths.config, .name = "config.ini", .add = "", .whole = p.config_ini },
+        .{ .path = paths.persona, .name = "persona.md", .add = "", .whole = p.persona },
     };
     for (&changes) |*ch| {
         if (ch.add.len == 0 and ch.whole == null) continue;
@@ -1828,7 +1837,7 @@ test "entries_become_items_dated_60_days_back" {
     try tf.init(false);
     defer tf.deinit();
     const p = try tf.plan(.{}, false);
-    try t.expectEqual(6, p.memory.items.len);
+    try t.expectEqual(5, p.memory.items.len);
     try t.expectEqualStrings("Owner's server is at home.example.com.", p.memory.items[0].body);
     try t.expectEqualStrings("MEMORY.md", p.memory.items[0].from);
     try t.expect(contains(p.memory.items[2].body, "[secret:OPENROUTER_API_KEY]"));
@@ -1886,30 +1895,43 @@ test "entries_already_in_memory_are_already_there" {
     defer tf.deinit();
     const kept = try tf.store.add("The owner lives in Kraków", null, testNow() - 86400);
     const p = try tf.plan(.{}, false);
-    try t.expectEqual(5, p.memory.items.len);
+    try t.expectEqual(4, p.memory.items.len);
     for (p.memory.items) |m| try t.expect(!contains(m.body, "Lives in Kraków"));
     try t.expect(p.has(.not, try std.fmt.allocPrint(tf.f.a(), "memory: Lives in Kraków. (USER.md): already in memory as {s}", .{kept.id})));
 }
 
-test "a_stock_soul_is_skipped_an_edited_one_pinned_a_long_one_listed" {
+test "a_soul_fills_an_empty_persona_body_or_waits_for_you" {
     var tf: Tf = undefined;
     try tf.init(false);
     defer tf.deinit();
+    // no persona.md: SOUL.md's words, on top of assistant; nothing pinned
     var p = try tf.plan(.{}, false);
-    const soul = p.memory.items[p.memory.items.len - 1];
-    try t.expect(soul.pinned);
-    try t.expectEqualStrings("How to talk with me: Speak plainly. Use metric units.", soul.body);
-    try t.expect(p.has(.will, "memory, pinned: How to talk with me: Speak plainly. Use metric units. (SOUL.md)"));
+    for (p.memory.items) |m| try t.expect(!m.pinned);
+    try t.expectEqualStrings("---\npreset: assistant\n---\nSpeak plainly. Use metric units.\n", p.persona.?);
+    try t.expect(p.has(.will, "persona.md: SOUL.md's words: Speak plainly. Use metric units."));
+    // init --butler's persona.md (no words): filled, its preset kept
+    p = try tf.plan(.{ .persona_text = "---\npreset: butler\n---\n" }, false);
+    try t.expectEqualStrings("---\npreset: butler\n---\nSpeak plainly. Use metric units.\n", p.persona.?);
+    // words of its own: Needs you, with SOUL.md's path
+    p = try tf.plan(.{ .persona_text = "---\npreset: friend\n---\nWarm.\n" }, false);
+    try t.expect(p.persona == null);
+    try t.expect(p.has(.needs, try std.fmt.allocPrint(tf.f.a(), "SOUL.md ({s}): persona.md has words of its own; to use SOUL.md's, put them in persona.md by hand.", .{try std.fs.path.join(tf.f.a(), &.{ tf.f.root, "SOUL.md" })})));
+    // the same words: already there
+    p = try tf.plan(.{ .persona_text = "Speak plainly. Use metric units.\n" }, false);
+    try t.expect(p.persona == null);
+    try t.expect(p.has(.not, "SOUL.md: already persona.md's words"));
+    // Hermes's own text: skipped
     try tf.f.put("SOUL.md", hermes.stock_soul ++ "\n");
     p = try tf.plan(.{}, false);
-    for (p.memory.items) |m| try t.expect(!m.pinned);
+    try t.expect(p.persona == null);
     try t.expect(p.has(.not, "SOUL.md: Hermes's own text, never edited"));
-    const big = try tf.f.a().alloc(u8, 2500);
+    // over 4 KB: Needs you
+    const big = try tf.f.a().alloc(u8, 5000);
     @memset(big, 'p');
     try tf.f.put("SOUL.md", big);
     p = try tf.plan(.{}, false);
-    for (p.memory.items) |m| try t.expect(!m.pinned);
-    try t.expect(p.has(.not, "SOUL.md: 2,500 bytes, over memory's 2,000: to keep it, make it agents/main.md by hand (that file replaces harness's built-in instructions)"));
+    try t.expect(p.persona == null);
+    try t.expect(p.has(.needs, "): longer than persona.md holds (4 KB); shorten it into persona.md."));
 }
 
 test "skills_are_flattened_renamed_and_filtered" {
@@ -2167,7 +2189,7 @@ test "the_plan_has_three_groups_in_order" {
     const needs = std.mem.indexOf(u8, text, "\nNeeds you\n").?;
     const not = std.mem.indexOf(u8, text, "\nNot imported\n").?;
     try t.expect(will < needs and needs < not);
-    try t.expect(contains(text, "6 memory items (1 pinned), 4 skills, 6 tasks (3 commented out), 11 MCP servers (5 commented out), 6 deny rules, the model"));
+    try t.expect(contains(text, "5 memory items, 4 skills, 6 tasks (3 commented out), 11 MCP servers (5 commented out), 6 deny rules, persona.md's words, the model"));
     for (hermes.Fixture.secrets) |v| try t.expect(!contains(text, v));
 }
 
@@ -2237,7 +2259,9 @@ const Rx = struct {
         var d = try Io.Dir.cwd().openDir(t.io, p, .{ .iterate = true });
         defer d.close(t.io);
         var it = d.iterate();
-        while (try it.next(t.io)) |e| if (std.mem.startsWith(u8, e.name, "hermes-")) return std.fs.path.join(rx.tf.f.a(), &.{ "state", "imports", try rx.tf.f.a().dupe(u8, e.name) });
+        // the import's folder, not `hermes-entries` beside it (a file): a
+        // listing's order differs between systems
+        while (try it.next(t.io)) |e| if (e.kind == .directory and std.mem.startsWith(u8, e.name, "hermes-")) return std.fs.path.join(rx.tf.f.a(), &.{ "state", "imports", try rx.tf.f.a().dupe(u8, e.name) });
         return error.FileNotFound;
     }
 
@@ -2284,7 +2308,9 @@ test "import_writes_what_maps_and_leaves_a_report" {
     try t.expect(contains(sources, "pdf-tools\tanthropics/skills/skills/pdf\t-\t"));
     try t.expect(contains(sources, "deploy-helper-v2\thermes\t-\t"));
     try t.expect(contains(sources, "\tdeploy.helper_v2\n"));
-    try t.expectEqual(6, try rx.memoryCount());
+    try t.expectEqual(5, try rx.memoryCount());
+    // SOUL.md's words: persona.md
+    try t.expectEqualStrings("---\npreset: assistant\n---\nSpeak plainly. Use metric units.\n", try rx.file("persona.md"));
     // the copies taken first, the suggestions, the report
     const dir = try rx.importDir();
     for ([_][]const u8{ "tasks.ini", "rules", "config.ini" }) |n| {
@@ -2294,6 +2320,7 @@ test "import_writes_what_maps_and_leaves_a_report" {
     const report = try rx.file(try std.fs.path.join(rx.tf.f.a(), &.{ dir, "report.md" }));
     try t.expect(contains(report, "harness memory forget "));
     try t.expect(contains(report, "harness skill rm deploy-helper-v2"));
+    try t.expect(contains(report, "- persona.md didn't exist before: remove it"));
     try t.expect(contains(report, "mcp.ini didn't exist before: remove it"));
     try t.expect(contains(rx.talk.out.items, "report.md"));
     // tasks/ is guarded like workflows/; harness reads what was written
@@ -2533,7 +2560,7 @@ test "a_failure_while_writing_is_reported_and_the_rest_written" {
     try t.expect(contains(rx.talk.out.items, "weren't written"));
     // the rest was written, and the report says what wasn't
     try t.expect(contains(try rx.file("mcp.ini"), "[github]\n"));
-    try t.expectEqual(6, try rx.memoryCount());
+    try t.expectEqual(5, try rx.memoryCount());
     const report = try rx.file(try std.fs.path.join(rx.tf.f.a(), &.{ try rx.importDir(), "report.md" }));
     try t.expect(contains(report, "Not written: skill deploy-helper-v2"));
     try t.expect(contains(try rx.file("log" ++ std.fs.path.sep_str ++ "actions.jsonl"), "\"event\":\"import\""));
@@ -2606,9 +2633,9 @@ test "a_rerun_doesnt_bring_back_forgotten_memory" {
             break;
         };
     }
-    try t.expectEqual(5, try rx.memoryCount());
+    try t.expectEqual(4, try rx.memoryCount());
     rx.talk.out = .empty;
     try t.expectEqual(0, try rx.run(.{ .yes = true }));
-    try t.expectEqual(5, try rx.memoryCount());
-    try t.expect(contains(rx.talk.out.items, "memory: 6 entries imported before are skipped"));
+    try t.expectEqual(4, try rx.memoryCount());
+    try t.expect(contains(rx.talk.out.items, "memory: 5 entries imported before are skipped"));
 }

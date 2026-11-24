@@ -322,6 +322,16 @@ check "the audio is in no log; the voice note line is" '! grep -qF "OggS-smoke-a
 say "/quiet"
 check "quiet hours are off until set" 'wait_for "$OUT" "Quiet hours are off."'
 
+# the persona: /persona writes persona.md (yours only), shown back; no topics yet
+say "/persona butler"
+check "persona butler writes persona.md" 'wait_for "$OUT" "Persona: butler, from your next message." && grep -qF "preset: butler" "$HARNESS_HOME/persona.md"'
+say "/persona"
+check "persona shows the preset and the presets" 'wait_for "$OUT" "Persona: butler. Name: none. Address: plainly." && wait_for "$OUT" "Presets: butler, assistant, friend."'
+say "/overview"
+check "overview without topics says how to make them" 'wait_for "$OUT" "No topics yet. /setup topics makes the butler'"'"'s"'
+say "/persona assistant"
+check "persona assistant goes back" 'wait_for "$OUT" "Persona: assistant, from your next message."'
+
 say "/status"
 check "the MCP server started" 'wait_for "$OUT" "MCP: fake (3 tools)"'
 reply '{"content":[{"type":"tool_use","id":"tu_m","name":"fake__echo","input":{"text":"env"}}],"stop_reason":"tool_use"}'
@@ -687,7 +697,7 @@ fi
 
 # a home butler: init asks (here --butler says yes) and turns quiet hours on
 BH="$T/butler"
-check "init --butler turns quiet hours on and names /setup" 'HARNESS_HOME="$BH" "$H" init --butler >"$T/binit.out" 2>&1 && grep -qE "^quiet = 22:00-07:00 " "$BH/config.ini" && grep -qF "In the chat: /setup home" "$T/binit.out" && grep -qF "harness secret add ha " "$T/binit.out"'
+check "init --butler turns quiet hours on and names /setup" 'HARNESS_HOME="$BH" "$H" init --butler >"$T/binit.out" 2>&1 && grep -qE "^quiet = 22:00-07:00 " "$BH/config.ini" && grep -qF "In the chat: /setup home" "$T/binit.out" && grep -qF "harness secret add ha " "$T/binit.out" && grep -qF "preset: butler" "$BH/persona.md"'
 
 # the butler, set up in chat against homemcp-sim and carcloud-sim: /setup
 # home through homemcp discover, every routine turned on and run against
@@ -759,11 +769,12 @@ EOF
 		press on
 		wait_asked_long $((n0 + 1))
 	done
-	# then the evening message and the butler's manner: Not now writes nothing
-	for r in evening manner; do
+	# then the evening message, the butler's manner and topics: Not now
+	# (Keep everything in main) writes nothing
+	for r in evening manner topics; do
 		n0=$(asked)
 		press later
-		[ "$r" = manner ] || wait_asked_long $((n0 + 1))
+		[ "$r" = topics ] || wait_asked_long $((n0 + 1))
 	done
 	check "every routine the home has what for is on" 'wait_for "$OUT" "That'"'"'s all the routines: 9 on." 30 && ! grep -q "^evening" "$BH/config.ini" && [ ! -e "$BH/agents/butler.md" ] && [ -f "$BH/workflows/leak.wf" ] && grep -qF "[doorbell-front_door_bell]" "$BH/triggers.ini" && grep -qF "[away-back_door]" "$BH/triggers.ini" && grep -qF "[harness:away]" "$BH/rules" && grep -qF "fallback 5m" "$BH/workflows/leak.wf" && grep -qF "[leak-sink_leak]" "$BH/triggers.ini" && grep -qF "[smoke-kitchen_smoke_alarm]" "$BH/triggers.ini" && grep -qF "speakers = all" "$BH/triggers.ini" && grep -qF "[door-back_door]" "$BH/triggers.ini" && grep -qF "[workflow:arriving/heat]" "$BH/rules"'
 	# the triggers' first polls only mark what is there

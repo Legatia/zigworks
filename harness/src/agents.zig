@@ -101,6 +101,70 @@ fn dupeList(a: std.mem.Allocator, list: []const []const u8) ![]const []const u8 
 /// A definition's tools when its file names none: the helper's six of 0.3.
 pub const default_tools = [_][]const u8{ "search", "fetch", "browse", "read_file", "recall", "skill" };
 
+/// A plain helper's reach: what main may save without asking
+/// (`[agents]`' limits and `[model] worker_model`).
+pub const Reach = struct { steps: u32, tokens: u32, answer_bytes: u32, worker: []const u8 };
+
+/// Why `d` is beyond a plain helper's reach (asked as any change is);
+/// null: within it.
+pub fn withinReach(d: Def, r: Reach) ?[]const u8 {
+    for (d.tools) |tl| {
+        const six = for (default_tools) |x| {
+            if (std.mem.eql(u8, x, tl)) break true;
+        } else false;
+        if (!six) return "tools beyond a helper's six (search, fetch, browse, read_file, recall, skill)";
+    }
+    if (d.model.len > 0 and !std.mem.eql(u8, d.model, r.worker)) return "a model other than [model] worker_model";
+    if (d.memory != .pinned) return "memory other than pinned";
+    if (d.environment_given) return "an environment";
+    if ((d.steps orelse 0) > r.steps) return "steps above [agents]";
+    if ((d.tokens orelse 0) > r.tokens) return "tokens above [agents]";
+    if ((d.answer_bytes orelse 0) > r.answer_bytes) return "answer_bytes above [agents]";
+    return null;
+}
+
+/// What changed from `old` to `new`, in words ("added fetch; its
+/// instructions"), for the owner's one line.
+pub fn changeWords(a: std.mem.Allocator, old: Def, new: Def) ![]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    var added: std.ArrayList([]const u8) = .empty;
+    var dropped: std.ArrayList([]const u8) = .empty;
+    for (new.tools) |x| if (!listHas(old.tools, x)) try added.append(a, x);
+    for (old.tools) |x| if (!listHas(new.tools, x)) try dropped.append(a, x);
+    if (added.items.len > 0) try parts.append(a, try std.fmt.allocPrint(a, "added {s}", .{try std.mem.join(a, ", ", added.items)}));
+    if (dropped.items.len > 0) try parts.append(a, try std.fmt.allocPrint(a, "took out {s}", .{try std.mem.join(a, ", ", dropped.items)}));
+    if (!std.mem.eql(u8, old.description, new.description)) try parts.append(a, "its description");
+    if (!std.mem.eql(u8, old.model, new.model)) try parts.append(a, "its model");
+    if (old.steps != new.steps or old.tokens != new.tokens or old.seconds != new.seconds or old.answer_bytes != new.answer_bytes) try parts.append(a, "its limits");
+    if (!std.mem.eql(u8, old.body, new.body)) try parts.append(a, "its instructions");
+    if (parts.items.len == 0) return "saved again, the same";
+    return std.mem.join(a, "; ", parts.items);
+}
+
+fn listHas(list: []const []const u8, x: []const u8) bool {
+    for (list) |y| if (std.mem.eql(u8, x, y)) return true;
+    return false;
+}
+
+/// The texts of `name`'s earlier versions (state/agents/NAME/versions/),
+/// oldest first.
+pub fn versionTexts(io: Io, a: std.mem.Allocator, state: []const u8, name: []const u8) ![]const []const u8 {
+    const vdir = try std.fmt.allocPrint(a, "{s}{c}{s}{c}versions", .{ state, std.fs.path.sep, name, std.fs.path.sep });
+    var d = Io.Dir.cwd().openDir(io, vdir, .{ .iterate = true }) catch return &.{};
+    defer d.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = d.iterate();
+    while (try it.next(io)) |e| if (e.kind == .file and std.mem.endsWith(u8, e.name, ".md")) try names.append(a, try a.dupe(u8, e.name));
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.lt);
+    const out = try a.alloc([]const u8, names.items.len);
+    for (names.items, out) |n, *o| o.* = try d.readFileAlloc(io, n, a, .limited(1 << 20));
+    return out;
+}
+
 /// Where a definition does not read, and why.
 pub const Diag = struct {
     /// "agents/researcher.md" (set by the folder's reader).
@@ -265,9 +329,40 @@ pub const main_md =
     \\---
     \\You are a personal agent working for one person, the owner, who talks to you in a chat.
     \\Be brief and plain. Do what was asked; ask when something is unclear.
+    \\Keep the owner's affairs to the owner: where others may read, say no more than the request needs.
+    \\Give no medical advice: for health, only the reminders the owner set.
     \\Use `remember` for lasting facts about the owner or their wishes, not for passing details.
     \\
 ;
+
+/// `main_md` as harness wrote it before the persona: an agents/main.md
+/// still exactly this is replaced by today's at start (`upgradeMain`).
+pub const main_md_before =
+    \\---
+    \\name: main
+    \\description: The agent: talks with the owner in every conversation and runs the scheduled tasks.
+    \\tools: *
+    \\---
+    \\You are a personal agent working for one person, the owner, who talks to you in a chat.
+    \\Be brief and plain. Do what was asked; ask when something is unclear.
+    \\Use `remember` for lasting facts about the owner or their wishes, not for passing details.
+    \\
+;
+
+/// Today's `main_md` for a file that is still exactly harness's earlier
+/// one (\r\n too); null: the owner's own (left as it is).
+pub fn upgradeMain(text: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, text, main_md_before)) return main_md;
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < text.len and j < main_md_before.len) {
+        if (text[i] == '\r' and i + 1 < text.len and text[i + 1] == '\n') i += 1;
+        if (text[i] != main_md_before[j]) return null;
+        i += 1;
+        j += 1;
+    }
+    return if (i == text.len and j == main_md_before.len) main_md else null;
+}
 
 /// The built-in `helper`, as `harness init` writes it.
 pub const helper_md =
@@ -1294,4 +1389,33 @@ test "the_saved_line_is_harnesss" {
     try t.expectEqualStrings("---\r\nname: x\r\ndescription: X.\r\nsaved: agent:x 2026-11-22T15:00:00Z\n---\r\nB\r\n", try withSaved(a, "---\r\nname: x\r\nsaved: owner, honest\r\ndescription: X.\r\n---\r\nB\r\n", "agent:x 2026-11-22T15:00:00Z"));
     // no header: as it was (the parser refuses it)
     try t.expectEqualStrings("no header", try withSaved(a, "no header", "v"));
+}
+
+test "a_plain_helper_is_within_reach" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const reach: Reach = .{ .steps = 12, .tokens = 150000, .answer_bytes = 4000, .worker = "claude-worker" };
+    var d: Diag = .{};
+    const ok = try parse(a, "researcher", "---\nname: researcher\ndescription: Reads pages.\ntools: search, fetch\nmemory: pinned\n---\nRead.\n", &d);
+    try t.expectEqual(null, withinReach(ok, reach));
+    const cases = [_][2][]const u8{
+        .{ "tools: search, shell\nmemory: pinned\n", "tools" },
+        .{ "tools: search, fake/echo\nmemory: pinned\n", "tools" },
+        .{ "tools: *\nmemory: pinned\n", "tools" },
+        .{ "tools: search\nmodel: claude-big\nmemory: pinned\n", "model" },
+        .{ "tools: search\n", "memory" },
+        .{ "tools: search\nmemory: pinned\nenvironment: host\n", "environment" },
+        .{ "tools: search\nmemory: pinned\nsteps: 13\n", "steps" },
+        .{ "tools: search\nmemory: pinned\ntokens: 200000\n", "tokens" },
+        .{ "tools: search\nmemory: pinned\nanswer_bytes: 9000\n", "answer_bytes" },
+    };
+    for (cases) |cs| {
+        const def = try parse(a, "researcher", try std.fmt.allocPrint(a, "---\nname: researcher\ndescription: R.\n{s}---\nRead.\n", .{cs[0]}), &d);
+        const why = withinReach(def, reach) orelse return error.TestUnexpectedResult;
+        try t.expect(std.mem.indexOf(u8, why, cs[1]) != null);
+    }
+    // the worker model by name is fine
+    const w = try parse(a, "researcher", "---\nname: researcher\ndescription: R.\ntools: search\nmodel: claude-worker\nmemory: pinned\n---\nRead.\n", &d);
+    try t.expectEqual(null, withinReach(w, reach));
 }

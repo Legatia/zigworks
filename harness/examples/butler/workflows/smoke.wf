@@ -3,6 +3,7 @@
 # speakers say it in every room. Nothing to close: harness never acts on
 # the alarm.
 workflow smoke
+subject house
 about When a smoke or CO alarm goes off: says which at once, even at night<smoke speaker words>.
 start <smoke starts>
 urgent yes

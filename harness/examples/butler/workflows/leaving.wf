@@ -1,6 +1,7 @@
 # Leaving: when the last of you goes out. One tap to lock, one to turn
 # the heating down; nothing is done without your tap.
 workflow leaving
+subject house
 about When everyone has left: says what is still open or on<leaving words>.
 start trigger:everyone-left
 tag no

@@ -374,15 +374,21 @@ specs, marked "settled".
    to, or your mailbox? Own: your threads are conversations; harness sees
    only what you forward. Yours: mail triggers read your whole INBOX,
    read-only; no email conversations.
-2. Money (triggers, workflows): may runs started by mail, feeds, pages or
+2. **Answered 2026-11-24: "Move money with a budget."** Designed in
+   `2026-11-24-harness-money-budget-and-sandbox-default-design.md`,
+   Part 1. The question was: Money (triggers, workflows): may runs started by mail, feeds, pages or
    workflows move money under `[money] scheduled = on`? Yes: as specced.
    No: never; workflows only in tool steps asked in the inbox. Or a
    separate switch, off by default.
-3. Default environment (environments) for runs started by schedules,
+3. **Answered 2026-11-24: "Sandbox on priority."** Designed in the same
+   file, Part 2. The question was: Default environment (environments) for runs started by schedules,
    triggers, workflows and apps: host or sandbox? Host: as today; allowed
    commands reach the data folder. Sandbox: no data folder, home or
    network unless allowed; Linux needs bubblewrap.
-4. Apps on your phone (apps) before hosting? No: links open only on the
+4. **Answered 2026-11-24: "App we do desktop first. Mobile will be using tg or
+   WhatsApp for now. Also since we don't rent server for clients pc side is
+   naturally the best place."** So apps stay on the harness machine, and the
+   phone is the chat. The question was: Apps on your phone (apps) before hosting? No: links open only on the
    harness machine (or via `ssh -L`). Yes: harness behind a TLS front you
    run (`tailscale serve`); anyone reaching it with a link opens apps
    until restart.

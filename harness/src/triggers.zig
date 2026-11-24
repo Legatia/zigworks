@@ -91,6 +91,11 @@ pub const Trigger = struct {
     tools: ?[]const []const u8 = null,
     /// The conversation it posts to.
     to: []const u8 = "main",
+    /// `to` was written (the owner's own wins over `subject`).
+    to_set: bool = false,
+    /// `subject = house` (topics.zig): with no `to`, it posts to that
+    /// subject's topic when topics are in use; "": none.
+    subject: []const u8 = "",
     max_runs: u32 = 6,
     max_events: u32 = 20,
     checks_per_day: u32 = 50,
@@ -120,7 +125,7 @@ pub const Trigger = struct {
     /// A copy whose every slice is in `a`.
     pub fn clone(tr: Trigger, a: Allocator) !Trigger {
         var o = tr;
-        inline for (.{ "name", "json", "key", "check", "agent", "to", "added", "announce", "start_input", "do_file" }) |f| @field(o, f) = try a.dupe(u8, @field(tr, f));
+        inline for (.{ "name", "json", "key", "check", "agent", "to", "subject", "added", "announce", "start_input", "do_file" }) |f| @field(o, f) = try a.dupe(u8, @field(tr, f));
         o.sources = try dupeList(a, tr.sources);
         if (tr.mcp) |m| o.mcp = .{ .server = try a.dupe(u8, m.server), .uri = try a.dupe(u8, m.uri), .tool = try a.dupe(u8, m.tool), .input = try a.dupe(u8, m.input) };
         const topics = try a.alloc(config.Topic, tr.topics.len);
@@ -379,7 +384,7 @@ fn briefSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
 }
 
 const source_keys = [_][]const u8{ "topic", "feed", "search", "page", "file", "mcp" };
-const other_keys = [_][]const u8{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "json", "key", "urgent", "announce", "speakers", "escalate", "while", "tag" };
+const other_keys = [_][]const u8{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "subject", "max_runs", "max_events", "checks_per_day", "json", "key", "urgent", "announce", "speakers", "escalate", "while", "tag" };
 
 fn kindOfKey(key: []const u8) ?Kind {
     if (std.mem.eql(u8, key, "topic")) return .brief;
@@ -399,10 +404,10 @@ fn oneOf(word: []const u8, words: []const []const u8) bool {
 /// Whether a key goes with a trigger of `kind`.
 fn keyFits(kind: Kind, key: []const u8) bool {
     return switch (kind) {
-        .schedule => oneOf(key, &.{ "every", "at", "days", "do", "say", "start", "to", "agent", "urgent", "escalate", "tag" }),
+        .schedule => oneOf(key, &.{ "every", "at", "days", "do", "say", "start", "to", "subject", "agent", "urgent", "escalate", "tag" }),
         .brief => oneOf(key, &.{ "topic", "at", "to" }),
         else => blk: {
-            if (oneOf(key, &.{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "max_runs", "max_events", "checks_per_day", "urgent", "announce", "speakers", "escalate", "while", "tag" })) break :blk true;
+            if (oneOf(key, &.{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "subject", "max_runs", "max_events", "checks_per_day", "urgent", "announce", "speakers", "escalate", "while", "tag" })) break :blk true;
             if (kindOfKey(key)) |k| break :blk k == kind;
             if (std.mem.eql(u8, key, "json")) break :blk kind == .page;
             if (std.mem.eql(u8, key, "key")) break :blk kind == .mcp;
@@ -500,6 +505,10 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
         } else if (std.mem.eql(u8, l.key, "to")) {
             if (!conversations.validName(v)) return bad(diag, l.n, "to names a conversation: a-z, 0-9, - and _");
             tr.to = v;
+            tr.to_set = true;
+        } else if (std.mem.eql(u8, l.key, "subject")) {
+            if (!oneOf(v, &.{ "house", "travel", "errands", "mail", "work" })) return bad(diag, l.n, "subject = house, travel, errands, mail or work: the topic it posts to, with no to");
+            tr.subject = v;
         } else if (std.mem.eql(u8, l.key, "max_runs") or std.mem.eql(u8, l.key, "max_events") or std.mem.eql(u8, l.key, "checks_per_day")) {
             const x = std.fmt.parseInt(u32, v, 10) catch 0;
             if (x == 0 or (std.mem.eql(u8, l.key, "max_events") and x > 200)) return badf(a, diag, l.n, "{s} is a whole number from 1{s}", .{ l.key, if (std.mem.eql(u8, l.key, "max_events")) " to 200" else "" });
@@ -1461,4 +1470,17 @@ test "do_file_names_a_file_in_tasks" {
     // not a key of triggers.ini
     d = .{};
     try t.expectError(error.BadTrigger, parse(a, "[x]\nat = 07:00\ndo_file = x.md\n", .triggers, &d));
+}
+
+test "a_subject_line_is_read" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    const list = try parse(a, "[delivery-today]\nmcp = mail/mail_list {}\nevery = 1h\nkey = id\nstart = workflow delivery\nsubject = errands\n\n[bed]\nat = 22:00\nsay = Bed.\nsubject = house\nto = main\n", .triggers, &d);
+    try t.expectEqualStrings("errands", list[0].subject);
+    try t.expect(!list[0].to_set);
+    try t.expectEqualStrings("house", list[1].subject);
+    try t.expect(list[1].to_set);
+    try t.expectError(error.BadTrigger, parse(a, "[bed]\nat = 22:00\nsay = Bed.\nsubject = garden\n", .triggers, &d));
 }

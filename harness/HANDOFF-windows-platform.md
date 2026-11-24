@@ -5,6 +5,37 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: the owner answered question 3 (2026-11-24)
+
+> "Move money with a budget. Sandbox on priority"
+
+Spec: `docs/superpowers/specs/2026-11-24-harness-money-budget-and-sandbox-default-design.md`.
+It has been builder-checked against the code.
+
+**Approved by the owner on 2026-11-24 ("Approve 1"): build it.** The Mac session is building Part 1 on `platform/money-budget`.
+
+**Part 2 (unattended runs in a sandbox) is yours,** since you own
+environments and the sandbox runners. In short:
+
+- a built-in `sandbox` environment: `kind = sandbox`, `workspace = rw`,
+  `network = off`. An owner's `[sandbox]` section replaces it, and must be
+  `kind = sandbox`;
+- `[default] unattended`, which defaults to `sandbox`, for
+  `who.unattended()` whos, workflow tool steps included;
+- an unattended run's shell `env` field leaves `host` out unless
+  something names it;
+- with no sandbox available, the shell calls are refused, never run on
+  the host instead. Doctor and the start line say how to fix it;
+- the upgrade line, behind the `state/upgrades/sandbox-default` marker.
+
+Its "Tests, Part 2" and "Tests that change on purpose" are the contract.
+The Mac session tests macOS (sandbox-exec) after you push.
+
+**Part 1 (money within a budget) is the Mac session's.** It touches
+agent.zig's moneyCheck and MoneyLedger, core.zig's skipped items and the
+reorder, config.zig's `[money]` and mcp.zig. Keep your edits to those
+small while it's built.
+
 ## CI after your cmd push (772c8c4, dfb489f): red on Windows
 
 Runs 45388410033 and 45392418965 fail on Windows, in Debug, in
@@ -31,6 +62,82 @@ The same runs also failed on all three systems in
 `calendar_attendees_become_people`. That one is ours: the test read the
 real clock, and the fixture has a busy event from 12:00 to 13:00 UTC on
 2026-11-24. It's fixed in ed34e74 with a fixed clock.
+
+## Built: a persona, one chat filed into topics, helpers main manages (2026-11-24)
+
+Spec: `docs/superpowers/specs/2026-11-24-harness-persona-and-topics-design.md`;
+plan with its rulings: `docs/superpowers/plans/2026-11-24-persona-topics.md`.
+Branch `platform/persona-topics`, merged with `harness-logins` at the end.
+New files: `persona.zig`, `topics.zig`, `card.zig`, `work.zig`.
+
+**Shared code it changed:**
+
+- **State.** `state/conversations` lines may carry `title`, `focus`,
+  `subject` and `card` (each only where set; old lines read as before).
+  New files: `persona.md` (data folder, 0600), `state/topics-said`,
+  `state/helpers`, `state/agents/NAME/saves` (a SHA-256 line per
+  `agent_save`), `state/setup/manner`, `state/setup/persona.md` (a draft),
+  `state/persona-told`. `inbox` shown entries may carry `"short":true` (a
+  pointer in main).
+- **Telegram.** `telegram.Entity` (byte offsets; sent in UTF-16 units,
+  `utf16Len`), `Bot.sendRich`, `sendButtonsRich` (`sendButtonsTo` now calls
+  it with none), `editRich` (error.MessageGone; "not modified" is fine),
+  `pin` (`pinChatMessage`, no thread), `setTopics` (`setMySettings` with
+  `has_topics_enabled`); `callWhy` keeps a refusal's description. No
+  `parse_mode` anywhere. `core.Channel` gained optional `rich`,
+  `buttons_rich`, `replace`, `pin`, `topics`, `me`; `TgChan` and the
+  Recorder implement them, `TermChan` doesn't (it sends plain text).
+  harness-fake: `setMySettings` switches what `getMe` says (refused while
+  `telegram/no-settings` exists); an `editMessageText` of an id listed in
+  `telegram/gone` answers "message to edit not found".
+- **The subject on posts.** `{topic:NAME}` in harness's own text becomes
+  the topic's title as a link at send time (`Core.linked`, where
+  `fillLinks` is). Harness's own posts pick their conversation with
+  `subjectConv` (postAway, postTrips, postPeople, diaryPost,
+  awaySummaryDue, tripsStatus, mailSay, the others' mail line, Errands'
+  `post` by label); triggers are routed when applied (`routedTriggers`:
+  open after the conversations are read, `/reload`, `/trigger add|rm`),
+  workflow instances when they run (`routineTo`); `triggers.zig` and
+  `workflows.zig` read `subject` and know `to_set`. `RunOut.subject` gives
+  an urgent alert's record line. `sendTextAs` notes a topic's last lines
+  for its card (`sendTextOpts` doesn't: digests, cards).
+- **agent.zig.** `Run.persona` (after the definition's body; helpers get
+  none), `Run.helpers` (`HelperDesk`) and `Run.work` (`WorkSink`, called
+  after each `delegate`, helpers' rids in `Helper.rid`). `agent_save`: main
+  may change and retire (`retire: true`) what it saved itself; a save by
+  main is quiet when `quietWhy` finds nothing (main only, no outside mark,
+  within `agents.withinReach`, nothing named by core's `Helpers.why`), and
+  the gate then gets `Ctx.own_helper` (default allow, no grant counts, not a
+  setup call: the owner's deny and ask lines decide). The tool's schema has
+  `retire` and `name` alone is required.
+- **The migration.** At open, `main` pointing at an `agents/butler.md` that
+  is exactly `evening.presetFile(address)` becomes `persona.md`
+  (`preset: butler`, that address), `main` points at `main`, the file goes
+  to its versions; said at the first attach (`sayAtStart`). An
+  `agents/main.md` still exactly the earlier built-in is rewritten to
+  today's (two lines added: others may read; no medical advice).
+- **Setup.** After the manner, `topics` is offered; `/setup topics`.
+  `applySetup` takes any "Settings reloaded." start as success (a persona
+  note may follow it).
+
+**After the final review's fix pass:** links are built only by harness
+(`Core.Linked`: `text`, `topic`, `join`; `sendLinked`/`sendTextRich`); no
+generic send expands `{topic:NAME}` any more. An item edit can be main's
+pointer (`Edit.pointer`, `.title`: its line rebuilt in `applyEdits`).
+`agent.Post.links` and `postTextLinked` carry a routine's `{topics}`
+links (`InstRun.say_links`). `card.overviewLine(a, facts)` and
+`card.summaryLine(a, title, news)` lost their tokens. `HelperDesk.unseen`
+(state/agents/NAME/unseen) puts a quietly saved helper's file in a
+trigger's or workflow's setup question. `WorkDone.by`: only the owner's
+runs post to Work. `workflows.zig`'s `checkText` takes whether it reads
+a say step (`{topics}` is a say's, unless a step is called `topics`).
+`utf16Len` counts the text as sent (`util.validUtf8`).
+
+**Windows:** nothing new is POSIX-only except
+`persona_load_falls_back_with_a_reason`'s writable-by-others case, which
+returns before it on Windows (as agents.zig's does). Paths in the new tests
+are built with `std.fs.path.join` and `sep_str` the way the product builds
+them; the versions folder is opened `.iterate = true`.
 
 ## Built: the Hermes import (2026-11-24)
 

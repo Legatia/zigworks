@@ -2,6 +2,7 @@
 # hours; one tap closes the water main. It never opens it. With fallback
 # (setup offers it), nobody on it in 5 minutes closes it all the same.
 workflow leak
+subject house
 about Water where it shouldn't be: says where at once, even at night<valve words>.
 start <leak starts>
 urgent yes

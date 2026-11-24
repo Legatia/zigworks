@@ -1,6 +1,7 @@
 # A flight confirmation in the owner's mail: its time offered for the
 # calendar. The calendar's own tool asks you before the entry is made.
 workflow flight
+subject travel
 about A flight confirmation in your mail: its time offered for the calendar (you're asked first).
 start trigger:flight-mail
 tag no

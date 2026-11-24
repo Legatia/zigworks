@@ -4,6 +4,7 @@
 # your device names (from home.ini) in their place; #if blocks stay or go
 # with what your home has.
 workflow goodnight
+subject house
 about When you say goodnight (or at <goodnight at>): the lights off<night heating words><night lock words>.
 start owner, schedule:goodnight-at
 phrases goodnight, good night, night night
