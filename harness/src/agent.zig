@@ -4142,6 +4142,14 @@ fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []co
 fn unattendedMoney(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []const u8, arg: []const u8, now_s: i64, res: *Reservation, pass: *MoneyPass) ?[]const u8 {
     if (mail_mod.isSendCall(arg)) return null;
     const by = r.who.by;
+    const b = money_mod.budgetFor(r.money, m.budget_per_day, m.budget_per_month);
+    // every decision's line carries the budget's numbers as they are
+    if (r.money_ledger) |l| {
+        l.mutex.lockUncancelable(r.io);
+        defer l.mutex.unlock(r.io);
+        const day = l.dayFor(m.server.name, moneyDay(r, now_s));
+        pass.note = budgetNote(a, b, l.spentAuto(m.server.name, day), l.spentAutoMonth(m.server.name, l.monthFor(m.server.name, day))) catch "";
+    }
     if (std.mem.startsWith(u8, by, "harness:") and !std.mem.eql(u8, by, "harness:reorder"))
         return "harness's own jobs move no money (the reorder alone, within the budget)";
     // like the door unlock: never unattended, whatever the budget
@@ -4168,7 +4176,6 @@ fn unattendedMoney(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json:
             return std.fmt.allocPrint(a, "it read outside text first ({s}{s}), and outside text doesn't spend", .{ list, more }) catch "it read outside text first, and outside text doesn't spend";
         }
     }
-    const b = money_mod.budgetFor(r.money, m.budget_per_day, m.budget_per_month);
     if (b.none) return std.fmt.allocPrint(a, "automation spends nothing at {s} (budget = none in mcp.ini)", .{m.server.name}) catch "automation spends nothing at this server";
     if (!b.any()) return "no budget for automation: /money budget N a day sets one";
     const amount = amountOf(a, input_json, field) orelse
@@ -5799,6 +5806,8 @@ test "paused_automation_spends_nothing" {
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: automation spending is paused (/money resume restarts it)") != null);
     try t.expectEqual(@as(f64, 0), f.ledger.sum());
+    // logged with the budget's numbers, as every unattended money decision
+    try t.expect(std.mem.indexOf(u8, try gateLines(&f, "fake__echo"), "\"budget\":\"today 0 of 30; this month 0\"") != null);
 }
 
 test "two_calls_cannot_both_pass_the_budget" {
