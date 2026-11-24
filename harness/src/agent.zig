@@ -32,6 +32,7 @@ const summaries_mod = @import("summaries.zig");
 const outside_mod = @import("outside.zig");
 const url_mod = @import("url.zig");
 const topics_mod = @import("topics.zig");
+const money_mod = @import("money.zig");
 const Io = std.Io;
 
 /// What came of asking the owner. `once`, `day`, `deny`: an approval's
@@ -1387,31 +1388,50 @@ pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, cfg: mcp.ServerConfig,
     return .{ .tools = out.items, .notes = notes.items };
 }
 
-/// What each server's money tools moved today, in the owner's day.
+/// What each server's money tools moved, in the owner's days: a day's
+/// total (everyone's), and since budgets automation's own a day and a
+/// month, and everyone's a month.
 pub const MoneyLedger = struct {
     mutex: Io.Mutex = .init,
-    entries: [max_servers]Entry = undefined,
-    len: usize = 0,
-    /// Where it is kept, a line "SERVER DAY TOTAL" each; null in tests.
+    /// One table a kind (`Kind`), each with its own slots: the daily
+    /// lines can't push a month's out.
+    tables: [kinds]Table = .{ .{}, .{}, .{}, .{} },
+    /// Where it is kept, a line each: "SERVER DAY TOTAL" (a day's), and
+    /// "auto:day SERVER DAY TOTAL", "auto:month SERVER MONTH TOTAL",
+    /// "all:month SERVER MONTH TOTAL"; null in tests.
     path: ?[]const u8 = null,
     /// Why the record read at start cannot be trusted; while set, every
     /// money call is refused with it.
     trouble_buf: [160]u8 = undefined,
     trouble_len: usize = 0,
 
-    /// Servers whose totals are kept at once.
+    /// Servers whose totals are kept at once (a kind's slots).
     pub const max_servers = 64;
-    /// The longest line: a name, a day and a total printed whole (up to
-    /// 309 digits for the largest f64).
-    const max_line = 32 + 1 + 20 + 1 + 330 + 1;
-    const max_file = max_servers * max_line;
+    /// The longest line: a kind's word, a name, a day and a total printed
+    /// whole (up to 309 digits for the largest f64).
+    const max_line = 11 + 32 + 1 + 20 + 1 + 330 + 1;
+    const max_file = kinds * max_servers * max_line;
     /// A total from before totals were kept per server ("DAY TOTAL"): it
     /// counts for every server, so none can pass its cap on that day.
     const everyone = "*";
 
+    /// What a line counts: a day's total (everyone's), automation's day,
+    /// automation's month, everyone's month.
+    pub const Kind = enum(u2) { day, auto_day, auto_month, month };
+    const kinds = 4;
+    /// Each kind's first word (none: a day's line, as before budgets); no
+    /// server's name has a `:`.
+    const words = [kinds][]const u8{ "", "auto:day", "auto:month", "all:month" };
+
+    const Table = struct {
+        entries: [max_servers]Entry = undefined,
+        len: usize = 0,
+    };
+
     const Entry = struct {
         name_buf: [32]u8 = undefined,
         name_len: u8 = 0,
+        /// The day, or for a month's kind the month (`money.monthOf`).
         day: i64 = 0,
         total: f64 = 0,
 
@@ -1420,13 +1440,18 @@ pub const MoneyLedger = struct {
         }
     };
 
+    fn table(l: *MoneyLedger, k: Kind) *Table {
+        return &l.tables[@intFromEnum(k)];
+    }
+
     /// Reads the record. One that is there but cannot be read, or is
     /// damaged, refuses money calls (see `trouble`) rather than starting
     /// the day from 0.
     pub fn load(l: *MoneyLedger, io: Io) void {
         const p = l.path orelse return;
-        var buf: [max_file + 1]u8 = undefined;
-        const got = Io.Dir.cwd().readFile(io, p, &buf) catch |e| switch (e) {
+        const buf = std.heap.page_allocator.alloc(u8, max_file + 1) catch return l.setTrouble("the money record (state/money) could not be read (OutOfMemory)", .{});
+        defer std.heap.page_allocator.free(buf);
+        const got = Io.Dir.cwd().readFile(io, p, buf) catch |e| switch (e) {
             error.FileNotFound => return,
             else => return l.setTrouble("the money record (state/money) could not be read ({s})", .{@errorName(e)}),
         };
@@ -1435,20 +1460,33 @@ pub const MoneyLedger = struct {
         var n_line: usize = 0;
         while (lines.next()) |line| {
             n_line += 1;
-            var parts: [3][]const u8 = undefined;
+            var parts: [4][]const u8 = undefined;
             var n: usize = 0;
+            var more = false;
             var it = std.mem.tokenizeAny(u8, line, " \t");
             while (it.next()) |x| {
-                if (n == parts.len) break;
+                if (n == parts.len) {
+                    more = true;
+                    break;
+                }
                 parts[n] = x;
                 n += 1;
             }
-            const bad = it.next() != null or n < 2;
-            const name = if (n == 2) everyone else parts[0];
+            // four fields: a kind's own first word; three: a day's line;
+            // two: a day's from before totals were kept per server
+            const kind: ?Kind = switch (n) {
+                2, 3 => .day,
+                4 => for (words[1..], 1..) |w, i| {
+                    if (std.mem.eql(u8, parts[0], w)) break @as(Kind, @enumFromInt(i));
+                } else null,
+                else => null,
+            };
+            const bad = more or kind == null;
+            const name = if (n == 2) everyone else if (n == 4) parts[1] else parts[0];
             const day = if (bad) null else std.fmt.parseInt(i64, parts[n - 2], 10) catch null;
             const total = if (bad) null else std.fmt.parseFloat(f64, parts[n - 1]) catch null;
             const good_total = if (total) |x| x >= 0 and !std.math.isNan(x) and !std.math.isInf(x) else false;
-            const e = if (day != null and good_total) l.entry(name, day.?) else null;
+            const e = if (day != null and good_total) l.entry(kind.?, name, day.?) else null;
             const slot = e orelse return l.setTrouble("the money record (state/money) is damaged at line {d}", .{n_line});
             slot.day = day.?;
             slot.total = total.?;
@@ -1465,20 +1503,22 @@ pub const MoneyLedger = struct {
         return if (l.trouble_len > 0) l.trouble_buf[0..l.trouble_len] else null;
     }
 
-    fn find(l: *MoneyLedger, name: []const u8) ?*Entry {
-        for (l.entries[0..l.len]) |*e| if (std.mem.eql(u8, e.name(), name)) return e;
+    fn find(l: *MoneyLedger, k: Kind, name: []const u8) ?*Entry {
+        const tb = l.table(k);
+        for (tb.entries[0..tb.len]) |*e| if (std.mem.eql(u8, e.name(), name)) return e;
         return null;
     }
 
-    /// The entry for `name`, made if there is none (in place of one of a
-    /// day before `day` when all are taken); null when none is free.
-    fn entry(l: *MoneyLedger, name: []const u8, day: i64) ?*Entry {
-        if (l.find(name)) |e| return e;
+    /// Kind `k`'s entry for `name`, made if there is none (in place of one
+    /// of a period before `day` when all are taken); null when none is free.
+    fn entry(l: *MoneyLedger, k: Kind, name: []const u8, day: i64) ?*Entry {
+        if (l.find(k, name)) |e| return e;
         if (name.len == 0 or name.len > 32) return null;
-        const e = if (l.len < max_servers) blk: {
-            l.len += 1;
-            break :blk &l.entries[l.len - 1];
-        } else for (l.entries[0..l.len]) |*old| {
+        const tb = l.table(k);
+        const e = if (tb.len < max_servers) blk: {
+            tb.len += 1;
+            break :blk &tb.entries[tb.len - 1];
+        } else for (tb.entries[0..tb.len]) |*old| {
             if (old.day < day) break old;
         } else return null;
         e.* = .{ .day = day };
@@ -1491,75 +1531,125 @@ pub const MoneyLedger = struct {
     /// another run already counted past midnight (so today's total is
     /// never wiped by yesterday's).
     fn dayFor(l: *MoneyLedger, server: []const u8, day: i64) i64 {
-        const e = l.find(server) orelse return day;
-        return @max(e.day, day);
+        var d = day;
+        for ([_]Kind{ .day, .auto_day }) |k| if (l.find(k, server)) |e| {
+            d = @max(d, e.day);
+        };
+        return d;
     }
 
-    /// What `server` moved on `day`.
+    /// The month a reservation on `day` counts toward (likewise never an
+    /// earlier one than counted).
+    fn monthFor(l: *MoneyLedger, server: []const u8, day: i64) i64 {
+        var m = money_mod.monthOf(day);
+        for ([_]Kind{ .month, .auto_month }) |k| if (l.find(k, server)) |e| {
+            m = @max(m, e.day);
+        };
+        return m;
+    }
+
+    fn totalOf(l: *MoneyLedger, k: Kind, server: []const u8, period: i64) f64 {
+        const e = l.find(k, server) orelse return 0;
+        return if (e.day == period) e.total else 0;
+    }
+
+    /// What `server` moved on `day`, everyone's.
     fn spent(l: *MoneyLedger, server: []const u8, day: i64) f64 {
         var so_far: f64 = 0;
-        for ([_][]const u8{ server, everyone }) |n| if (l.find(n)) |e| {
-            if (e.day == day) so_far += e.total;
-        };
+        for ([_][]const u8{ server, everyone }) |n| so_far += l.totalOf(.day, n, day);
         return so_far;
     }
 
-    /// Counts `amount` toward `server`'s day (`dayFor`) and saves it.
-    /// error.NoRoom when no entry is free; when the save fails, nothing is
-    /// counted and its error is returned: a reservation that would be
-    /// forgotten at the next start is not made.
-    fn reserve(l: *MoneyLedger, io: Io, server: []const u8, day_in: i64, amount: f64) !Reservation {
-        const day = l.dayFor(server, day_in);
-        const before = l.entries;
-        const before_len = l.len;
-        const e = l.entry(server, day) orelse return error.NoRoom;
-        if (e.day != day) {
-            e.day = day;
-            e.total = 0;
-        }
-        e.total += amount;
-        l.save(io, day) catch |err| {
-            l.entries = before;
-            l.len = before_len;
-            return err;
-        };
-        return .{ .day = day, .amount = amount };
+    /// What automation moved through `server` on `day`.
+    pub fn spentAuto(l: *MoneyLedger, server: []const u8, day: i64) f64 {
+        return l.totalOf(.auto_day, server, day);
     }
 
-    /// Takes back what `reserve` counted, for a call not made. A day that
-    /// is over is left as it was (it no longer counts), and a total never
-    /// goes below 0.
+    /// What automation moved through `server` in `month` (`money.monthOf`).
+    pub fn spentAutoMonth(l: *MoneyLedger, server: []const u8, month: i64) f64 {
+        return l.totalOf(.auto_month, server, month);
+    }
+
+    /// What everyone moved through `server` in `month`, since budgets.
+    pub fn spentMonth(l: *MoneyLedger, server: []const u8, month: i64) f64 {
+        return l.totalOf(.month, server, month);
+    }
+
+    /// Counts `amount` toward `server`'s day (`dayFor`) and month, and
+    /// when `auto` toward automation's day and month too, and saves it.
+    /// error.NoRoom when an entry is not free; when the save fails,
+    /// nothing is counted and its error is returned: a reservation that
+    /// would be forgotten at the next start is not made.
+    fn reserve(l: *MoneyLedger, io: Io, server: []const u8, day_in: i64, amount: f64, auto: bool) !Reservation {
+        const day = l.dayFor(server, day_in);
+        const month = l.monthFor(server, day);
+        const before = l.tables;
+        errdefer l.tables = before;
+        const counted: []const Kind = if (auto) &.{ .day, .auto_day, .auto_month, .month } else &.{ .day, .month };
+        for (counted) |k| {
+            const period = if (k == .day or k == .auto_day) day else month;
+            const e = l.entry(k, server, period) orelse return error.NoRoom;
+            if (e.day != period) {
+                e.day = period;
+                e.total = 0;
+            }
+            e.total += amount;
+        }
+        try l.save(io, day);
+        return .{ .day = day, .month = month, .amount = amount, .auto = auto };
+    }
+
+    /// Takes back what `reserve` counted, for a call not made. A period
+    /// that is over is left as it was (it no longer counts), and a total
+    /// never goes below 0.
     /// When the save fails, the file keeps the higher total, which is
     /// the safe side; the next reservation saves both or is refused.
     fn release(l: *MoneyLedger, io: Io, server: []const u8, res: Reservation) !void {
         if (res.amount == 0) return;
-        const e = l.find(server) orelse return;
-        if (e.day != res.day) return;
-        e.total = @max(0, e.total - res.amount);
+        const counted: []const Kind = if (res.auto) &.{ .day, .auto_day, .auto_month, .month } else &.{ .day, .month };
+        for (counted) |k| {
+            const period = if (k == .day or k == .auto_day) res.day else res.month;
+            const e = l.find(k, server) orelse continue;
+            if (e.day != period) continue;
+            e.total = @max(0, e.total - res.amount);
+        }
         try l.save(io, res.day);
     }
 
-    /// Writes the totals of `today` and later (an older day no longer
-    /// counts) to a new file that then replaces the old one, so a crash
-    /// half way leaves the old record, not a cut one.
+    /// Writes the totals of `today` and later, and of this month and later
+    /// (an older one no longer counts), to a new file that then replaces
+    /// the old one, so a crash half way leaves the old record, not a cut
+    /// one.
     fn save(l: *MoneyLedger, io: Io, today: i64) !void {
         const p = l.path orelse return;
-        var buf: [max_file]u8 = undefined;
-        var w: Io.Writer = .fixed(&buf);
-        for (l.entries[0..l.len]) |*e| if (e.day >= today) try w.print("{s} {d} {d}\n", .{ e.name(), e.day, e.total });
+        const buf = try std.heap.page_allocator.alloc(u8, max_file);
+        defer std.heap.page_allocator.free(buf);
+        var w: Io.Writer = .fixed(buf);
+        const this_month = money_mod.monthOf(today);
+        for (0..kinds) |i| {
+            const k: Kind = @enumFromInt(i);
+            const from = if (k == .day or k == .auto_day) today else this_month;
+            const tb = l.table(k);
+            for (tb.entries[0..tb.len]) |*e| if (e.day >= from) {
+                if (words[i].len > 0) try w.print("{s} ", .{words[i]});
+                try w.print("{s} {d} {d}\n", .{ e.name(), e.day, e.total });
+            };
+        }
         try util.writeReplace(io, p, w.buffered());
     }
 
-    /// Everything counted, whatever the server and day (for tests).
-    fn sum(l: *const MoneyLedger) f64 {
-        var total: f64 = 0;
-        for (l.entries[0..l.len]) |e| total += e.total;
-        return total;
+    /// Every day total counted, whatever the server and day (for tests).
+    fn sum(l: *MoneyLedger) f64 {
+        var all: f64 = 0;
+        const tb = l.table(.day);
+        for (tb.entries[0..tb.len]) |e| all += e.total;
+        return all;
     }
 };
 
-/// An amount counted toward a server's day before its call is asked.
-const Reservation = struct { day: i64 = 0, amount: f64 = 0 };
+/// An amount counted toward a server's day and month before its call is
+/// asked; `auto`: automation's too.
+const Reservation = struct { day: i64 = 0, month: i64 = 0, amount: f64 = 0, auto: bool = false };
 
 pub const ModelCfg = struct {
     /// omnigate's address and key, used only without `providers` (tests).
@@ -3959,7 +4049,7 @@ fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []co
     const spent = l.spent(m.server.name, day);
     if (per_day > 0 and spent + amount > @as(f64, @floatFromInt(per_day)))
         return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount, per_day, spent }) catch "over the cap per day";
-    res.* = l.reserve(r.io, m.server.name, day, amount) catch |e| return switch (e) {
+    res.* = l.reserve(r.io, m.server.name, day, amount, false) catch |e| return switch (e) {
         error.NoRoom => "the day totals of too many servers are kept already",
         else => std.fmt.allocPrint(a, "today's money total could not be saved to state/money ({s}), so no money call is made while it cannot be", .{@errorName(e)}) catch "the money record could not be saved",
     };
@@ -5571,7 +5661,7 @@ test "money_ledger_keeps_a_total_per_server_and_reads_the_old_file" {
     try t.expectEqual(@as(f64, 40), l.spent("broker", 20000));
     try t.expectEqual(@as(f64, 40), l.spent("other", 20000));
     try t.expectEqual(@as(f64, 0), l.spent("broker", 20001));
-    _ = try l.reserve(t.io, "broker", 20000, 5);
+    _ = try l.reserve(t.io, "broker", 20000, 5, false);
     var again: MoneyLedger = .{ .path = p };
     again.load(t.io);
     try t.expectEqual(@as(f64, 45), again.spent("broker", 20000));
@@ -5580,12 +5670,111 @@ test "money_ledger_keeps_a_total_per_server_and_reads_the_old_file" {
     try t.expectError(error.FileNotFound, tmp.dir.statFile(t.io, "money.tmp", .{}));
     const first = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(1024));
     defer t.allocator.free(first);
-    try t.expectEqualStrings("* 20000 40\nbroker 20000 5\n", first);
+    // today's lines as before; since budgets a month's line follows
+    var mb: [64]u8 = undefined;
+    try t.expectEqualStrings(try std.fmt.bufPrint(&mb, "* 20000 40\nbroker 20000 5\nall:month broker {d} 5\n", .{money_mod.monthOf(20000)}), first);
     // a day that is over is not written again
-    _ = try again.reserve(t.io, "broker", 20001, 1);
+    _ = try again.reserve(t.io, "broker", 20001, 1, false);
     const later = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(1024));
     defer t.allocator.free(later);
-    try t.expectEqualStrings("broker 20001 1\n", later);
+    try t.expectEqualStrings(try std.fmt.bufPrint(&mb, "broker 20001 1\nall:month broker {d} 6\n", .{money_mod.monthOf(20001)}), later);
+}
+
+test "the_ledger_keeps_automations_day_and_month_apart" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const p = try std.fs.path.join(t.allocator, &.{ dir, "money" });
+    defer t.allocator.free(p);
+    const day: i64 = 20781; // 2026-11-24
+    const m = money_mod.monthOf(day);
+    var l: MoneyLedger = .{ .path = p };
+    // the owner's 5, automation's 7
+    _ = try l.reserve(t.io, "shop", day, 5, false);
+    const r7 = try l.reserve(t.io, "shop", day, 7, true);
+    try t.expectEqual(@as(f64, 12), l.spent("shop", day));
+    try t.expectEqual(@as(f64, 7), l.spentAuto("shop", day));
+    try t.expectEqual(@as(f64, 12), l.spentMonth("shop", m));
+    try t.expectEqual(@as(f64, 7), l.spentAutoMonth("shop", m));
+    // a line each, each kind its own first word
+    const text = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(4096));
+    defer t.allocator.free(text);
+    var want_buf: [256]u8 = undefined;
+    try t.expectEqualStrings(try std.fmt.bufPrint(&want_buf, "shop {d} 12\nauto:day shop {d} 7\nauto:month shop {d} 7\nall:month shop {d} 12\n", .{ day, day, m, m }), text);
+    // read back
+    var again: MoneyLedger = .{ .path = p };
+    again.load(t.io);
+    try t.expectEqual(null, again.trouble());
+    try t.expectEqual(@as(f64, 12), again.spent("shop", day));
+    try t.expectEqual(@as(f64, 7), again.spentAuto("shop", day));
+    try t.expectEqual(@as(f64, 7), again.spentAutoMonth("shop", m));
+    try t.expectEqual(@as(f64, 12), again.spentMonth("shop", m));
+    // taken back from each
+    try again.release(t.io, "shop", r7);
+    try t.expectEqual(@as(f64, 5), again.spent("shop", day));
+    try t.expectEqual(@as(f64, 0), again.spentAuto("shop", day));
+    try t.expectEqual(@as(f64, 0), again.spentAutoMonth("shop", m));
+    try t.expectEqual(@as(f64, 5), again.spentMonth("shop", m));
+    // the next day: its day starts at 0, the month goes on
+    _ = try again.reserve(t.io, "shop", day + 1, 3, true);
+    try t.expectEqual(@as(f64, 3), again.spentAuto("shop", day + 1));
+    try t.expectEqual(@as(f64, 3), again.spentAutoMonth("shop", m));
+    try t.expectEqual(@as(f64, 8), again.spentMonth("shop", m));
+    // another month starts at 0
+    try t.expectEqual(@as(f64, 0), again.spentAutoMonth("shop", money_mod.monthOf(day + 7)));
+    // a file from before (three fields, and the oldest two) reads as it did
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "money", .data = "shop 20781 4\r\n20781 1\r\n" });
+    var old: MoneyLedger = .{ .path = p };
+    old.load(t.io);
+    try t.expectEqual(null, old.trouble());
+    try t.expectEqual(@as(f64, 5), old.spent("shop", day));
+    try t.expectEqual(@as(f64, 0), old.spentAuto("shop", day));
+    // four fields with another first word, or five: damage
+    for ([_][]const u8{ "auto:week shop 20781 4\n", "auto:day shop 20781 4 5\n", "auto:day shop 20781\n" }) |bad| {
+        try tmp.dir.writeFile(t.io, .{ .sub_path = "money", .data = bad });
+        var d: MoneyLedger = .{ .path = p };
+        d.load(t.io);
+        try t.expect(std.mem.indexOf(u8, d.trouble() orelse "", "damaged at line 1") != null);
+    }
+}
+
+test "month_lines_are_kept_apart_from_the_day_slots" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const p = try std.fs.path.join(t.allocator, &.{ dir, "money" });
+    defer t.allocator.free(p);
+    const day: i64 = 20781;
+    const m = money_mod.monthOf(day);
+    var l: MoneyLedger = .{ .path = p };
+    var name_buf: [32]u8 = undefined;
+    // every server's slots taken, each kind's: four lines a server
+    for (0..MoneyLedger.max_servers) |i| _ = try l.reserve(t.io, try std.fmt.bufPrint(&name_buf, "server-{d}", .{i}), day, 2, true);
+    var again: MoneyLedger = .{ .path = p };
+    again.load(t.io);
+    try t.expectEqual(null, again.trouble());
+    for (0..MoneyLedger.max_servers) |i| {
+        const n = try std.fmt.bufPrint(&name_buf, "server-{d}", .{i});
+        try t.expectEqual(@as(f64, 2), again.spent(n, day));
+        try t.expectEqual(@as(f64, 2), again.spentAutoMonth(n, m));
+    }
+    // the next day's lines take the day slots; the month's are kept
+    for (0..MoneyLedger.max_servers) |i| _ = try again.reserve(t.io, try std.fmt.bufPrint(&name_buf, "server-{d}", .{i}), day + 1, 1, false);
+    var third: MoneyLedger = .{ .path = p };
+    third.load(t.io);
+    try t.expectEqual(@as(f64, 2), third.spentAutoMonth("server-63", m));
+    try t.expectEqual(@as(f64, 3), third.spentMonth("server-63", m));
+    try t.expectEqual(@as(f64, 0), third.spentAuto("server-63", day + 1));
+    // a new month: last month's lines are not written again
+    const next_month: i64 = 20788; // 2026-12-01
+    _ = try third.reserve(t.io, "server-0", next_month, 1, true);
+    const text = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(1 << 20));
+    defer t.allocator.free(text);
+    var mb: [32]u8 = undefined;
+    try t.expect(std.mem.indexOf(u8, text, try std.fmt.bufPrint(&mb, " {d} ", .{m})) == null);
+    try t.expectEqual(@as(f64, 1), third.spentAutoMonth("server-0", money_mod.monthOf(next_month)));
 }
 
 test "the_money_record_holds_every_server_however_large_its_total" {
@@ -5598,7 +5787,7 @@ test "the_money_record_holds_every_server_however_large_its_total" {
     var l: MoneyLedger = .{ .path = p };
     var name_buf: [32]u8 = undefined;
     // with no cap nothing bounds an amount: the largest still fits
-    for (0..MoneyLedger.max_servers) |i| _ = try l.reserve(t.io, try std.fmt.bufPrint(&name_buf, "server-{d}", .{i}), 20000, std.math.floatMax(f64));
+    for (0..MoneyLedger.max_servers) |i| _ = try l.reserve(t.io, try std.fmt.bufPrint(&name_buf, "server-{d}", .{i}), 20000, std.math.floatMax(f64), false);
     var again: MoneyLedger = .{ .path = p };
     again.load(t.io);
     try t.expectEqual(null, again.trouble());
@@ -5635,14 +5824,14 @@ test "a_release_for_a_day_that_is_over_leaves_today_alone" {
     var l: MoneyLedger = .{};
     // 30 counted late on day 100 while the owner is asked; after midnight
     // another run moves 5
-    const late = try l.reserve(t.io, "broker", 100, 30);
-    _ = try l.reserve(t.io, "broker", 101, 5);
+    const late = try l.reserve(t.io, "broker", 100, 30, false);
+    _ = try l.reserve(t.io, "broker", 101, 5, false);
     // the owner says no after midnight: day 100's 30 is taken back
     try l.release(t.io, "broker", late);
     try t.expectEqual(@as(f64, 5), l.spent("broker", 101));
     // a run that read the clock just before midnight but counts after
     // another run did counts toward the new day, not over it
-    const behind = try l.reserve(t.io, "broker", 100, 2);
+    const behind = try l.reserve(t.io, "broker", 100, 2, false);
     try t.expectEqual(101, behind.day);
     try t.expectEqual(@as(f64, 7), l.spent("broker", 101));
     // and a total never goes below 0
