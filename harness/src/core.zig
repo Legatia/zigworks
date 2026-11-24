@@ -67,6 +67,7 @@ const trips_mod = @import("trips.zig");
 const taskfiles = @import("taskfiles.zig");
 const persona_mod = @import("persona.zig");
 const topics_mod = @import("topics.zig");
+const card_mod = @import("card.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -1536,6 +1537,23 @@ pub const Core = struct {
 
     /// `sendText`, without a sound when `quiet`.
     fn sendTextAs(c: *Core, conv: []const u8, text: []const u8, quiet: bool) !Sent {
+        const sent = try c.sendTextOpts(conv, text, quiet);
+        // a topic's card says what came lately (a digest is no news)
+        c.noteSent(conv, text);
+        return sent;
+    }
+
+    /// The last lines a topic that files a subject got (its card's Lately).
+    fn noteSent(c: *Core, conv: []const u8, text: []const u8) void {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        const e = c.convs.find(conv) orelse return;
+        if (e.subject.len == 0 or std.mem.eql(u8, e.subject, "work")) return;
+        e.noteLately(text, c.now());
+    }
+
+    /// `sendTextAs`, nothing noted for a card.
+    fn sendTextOpts(c: *Core, conv: []const u8, text: []const u8, quiet: bool) !Sent {
         // the butler's address: by mail, in the thread
         if (mail_mod.isEmail(conv)) return c.mailSay(text, quiet);
         const ch = c.chan orelse return error.NoChannel;
@@ -3387,7 +3405,7 @@ pub const Core = struct {
                     text = std.fmt.allocPrint(a, "{s}\n{s}", .{ text, line }) catch text;
                     topics_said = true;
                 };
-                const sent = c.sendText(conv, text) catch |e| {
+                const sent = c.sendTextOpts(conv, text, false) catch |e| {
                     c.quiet.retry_ms = util.nowMs(c.io) + 60_000;
                     c.log.write(.chat, false, .{ .event = "digest not delivered", .conversation = conv, .why = whyUndelivered(e) }) catch {};
                     return;
@@ -3403,7 +3421,7 @@ pub const Core = struct {
         }
         // main held nothing itself: the line alone
         if (!topics_said) if (in_topics) |line| {
-            if (c.sendText("main", line)) |_| {} else |e| c.log.write(.chat, false, .{ .event = "digest not delivered", .conversation = "main", .why = whyUndelivered(e) }) catch {};
+            if (c.sendTextOpts("main", line, false)) |_| {} else |e| c.log.write(.chat, false, .{ .event = "digest not delivered", .conversation = "main", .why = whyUndelivered(e) }) catch {};
         };
     }
 
@@ -6212,6 +6230,8 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
         c.awayDue(now_s);
         // quiet hours over: what they held, a digest per conversation
         c.quietDue(now_s);
+        // each topic's card, at most once a minute (Topics)
+        Topics.cardsDue(c, now_s);
         // urgent alerts nobody is on: the household in turn, a fallback
         Emergency.due(c, now_s);
         // due triggers are polled, one at a time, on a thread of their own
@@ -12053,6 +12073,8 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
         if (eql(u8, cmd, "/evening")) return Evening.command(c, a, rest);
         if (eql(u8, cmd, "/persona")) return Persona.command(c, a, conv, rest);
         if (eql(u8, cmd, "/focus")) return Topics.focusCommand(c, a, conv, rest);
+        if (eql(u8, cmd, "/card")) return Topics.cardCommand(c, a, conv);
+        if (eql(u8, cmd, "/overview")) return Topics.overview(c, a, conv);
         if (eql(u8, cmd, "/away")) return c.awayCommand(a, rest);
         if (eql(u8, cmd, "/trips")) return c.tripsCommand(a);
         if (eql(u8, cmd, "/member")) return c.memberCommand(a, rest);
@@ -32282,6 +32304,167 @@ const Topics = struct {
         if (!std.mem.eql(u8, with, trig)) try c.writeSetting(c.paths.triggers, with);
     }
 
+    /// A topic's facts for its card and /overview, from harness's state:
+    /// what waits on the owner there, what comes next for its subject,
+    /// the last lines posted there.
+    fn facts(c: *Core, a: std.mem.Allocator, name: []const u8, subject: []const u8, title: []const u8, lately: []const conversations.Entry.Late) !card_mod.Facts {
+        const now_s = c.now();
+        const off = c.cfg.chat.utc_offset;
+        var pending: std.ArrayList([]const u8) = .empty;
+        {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            for (c.inbox.items.items) |it| if (it.status == .open and std.mem.eql(u8, it.conversation, name)) try pending.append(a, try a.dupe(u8, it.title));
+        }
+        var next: std.ArrayList([]const u8) = .empty;
+        const eql = std.mem.eql;
+        if (eql(u8, subject, "errands")) {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            const list = c.errands.lists.items(a, lists_mod.default_list) catch &.{};
+            if (list.len > 0) try next.append(a, try std.fmt.allocPrint(a, "the list: {s}", .{try std.mem.join(a, ", ", list)}));
+            const f = Errands.parcels(c, a);
+            for (f.parcels) |p| if (p.done_at == 0) try next.append(a, try deliveries_mod.listLine(a, p));
+        } else if (eql(u8, subject, "house")) {
+            c.errands.mutex.lockUncancelable(c.io);
+            defer c.errands.mutex.unlock(c.io);
+            const st = Errands.upkeepState(c, a);
+            const today = c.localDay(now_s);
+            for (st.items) |x| try next.append(a, try upkeep_mod.listLine(a, x, st.odo, today));
+        } else if (eql(u8, subject, "travel")) {
+            const list = c.trips.load(a) catch &.{};
+            const any = for (list) |tr| {
+                if (tr.legs.len > 0 and tr.end() >= now_s) break true;
+            } else false;
+            const txt = if (any) try trips_mod.listText(a, list, now_s, off) else "";
+            var it = std.mem.splitScalar(u8, txt, '\n');
+            while (it.next()) |l| if (std.mem.trim(u8, l, " \t").len > 0 and next.items.len < card_mod.max_each) try next.append(a, l);
+        } else if (eql(u8, subject, "mail")) {
+            for (c.diary.events(a)) |ev| {
+                if (ev.cancelled or ev.start < now_s or ev.start > now_s + 2 * 86400) continue;
+                var cb: [8]u8 = undefined;
+                const day = c.localDay(ev.start) - c.localDay(now_s);
+                try next.append(a, try std.fmt.allocPrint(a, "{s} {s}at {s}", .{ ev.title, if (day == 1) "tomorrow " else if (day > 1) "the day after tomorrow " else "", quiet_mod.clock(&cb, ev.start, off) }));
+            }
+        }
+        var late: std.ArrayList([]const u8) = .empty;
+        for (lately) |l| {
+            var cb: [8]u8 = undefined;
+            try late.append(a, try std.fmt.allocPrint(a, "{s} at {s}", .{ std.mem.trimEnd(u8, l.buf[0..l.len], ". "), quiet_mod.clock(&cb, l.at, off) }));
+        }
+        return .{ .title = title, .pending = pending.items, .next = next.items, .lately = late.items };
+    }
+
+    /// A topic that has a card: it files a subject other than Work.
+    const Carded = struct { name: []const u8, subject: []const u8, title: []const u8, card: i64, card_s: i64, hash: [32]u8, lately: []const conversations.Entry.Late };
+
+    fn carded(c: *Core, a: std.mem.Allocator) ![]Carded {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        var out: std.ArrayList(Carded) = .empty;
+        for (c.convs.items.items) |e| {
+            if (e.subject.len == 0 or std.mem.eql(u8, e.subject, "work") or e.thread == 0 or e.refused) continue;
+            try out.append(a, .{ .name = try a.dupe(u8, e.name), .subject = try a.dupe(u8, e.subject), .title = try a.dupe(u8, if (e.title.len > 0) e.title else e.name), .card = e.card, .card_s = e.card_s, .hash = e.card_hash, .lately = try a.dupe(conversations.Entry.Late, e.lately[0..e.lately_n]) });
+        }
+        return out.items;
+    }
+
+    /// From the tick: each topic's card made when it has none, else
+    /// edited when what it says changed, at most once a minute; a card
+    /// Telegram no longer has is posted again and pinned.
+    fn cardsDue(c: *Core, now_s: i64) void {
+        const ch = c.chan orelse return;
+        if (ch.replace == null or ch.pin == null or !c.topics_on) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        for (carded(c, a) catch return) |x| {
+            if (x.card != 0 and now_s - x.card_s < 60) continue;
+            const text = card_mod.text(a, facts(c, a, x.name, x.subject, x.title, x.lately) catch continue) catch continue;
+            var h: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(text, &h, .{});
+            if (x.card != 0 and std.mem.eql(u8, &h, &x.hash)) {
+                noteCard(c, x.name, x.card, now_s, h);
+                continue;
+            }
+            if (x.card != 0) {
+                const where = c.placeOf(a, x.name) catch continue;
+                if (ch.replace.?(ch.ctx, where.place, x.card, text, &.{})) |_| {
+                    noteCard(c, x.name, x.card, now_s, h);
+                    continue;
+                } else |e| if (e != error.MessageGone) {
+                    c.log.write(.chat, false, .{ .event = "card not edited", .conversation = x.name, .why = whyUndelivered(e) }) catch {};
+                    noteCard(c, x.name, x.card, now_s, x.hash);
+                    continue;
+                }
+            }
+            _ = postCard(c, a, x.name, text, now_s);
+        }
+    }
+
+    fn noteCard(c: *Core, name: []const u8, card: i64, at: i64, h: [32]u8) void {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        const e = c.convs.find(name) orelse return;
+        if (e.card != card) c.convs.setCard(name, card) catch |err| c.log.write(.chat, false, .{ .event = "card not written", .conversation = name, .why = @errorName(err) }) catch {};
+        e.card_s = at;
+        e.card_hash = h;
+    }
+
+    /// Posts `text` as topic `name`'s card, without a sound, and pins it.
+    fn postCard(c: *Core, a: std.mem.Allocator, name: []const u8, text: []const u8, now_s: i64) ?i64 {
+        const ch = c.chan orelse return null;
+        const sent = c.sendTextOpts(name, text, true) catch |e| {
+            c.log.write(.chat, false, .{ .event = "card not posted", .conversation = name, .why = whyUndelivered(e) }) catch {};
+            return null;
+        };
+        if (ch.pin) |pin| {
+            const where = c.placeOf(a, name) catch return sent.first;
+            pin(ch.ctx, where.place, sent.first) catch |e| c.log.write(.chat, false, .{ .event = "card not pinned", .conversation = name, .why = whyUndelivered(e) }) catch {};
+        }
+        var h: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(text, &h, .{});
+        noteCard(c, name, sent.first, now_s, h);
+        c.log.write(.chat, false, .{ .event = "card", .conversation = name, .message = sent.first }) catch {};
+        return sent.first;
+    }
+
+    /// `/card` in a topic: a fresh card, pinned (an unpinned one can't be
+    /// told apart).
+    fn cardCommand(c: *Core, a: std.mem.Allocator, conv: []const u8) ![]const u8 {
+        const here = "Use /card in a topic: it posts and pins that topic's card.";
+        for (carded(c, a) catch return here) |x| if (std.mem.eql(u8, x.name, conv)) {
+            const text = try card_mod.text(a, try facts(c, a, x.name, x.subject, x.title, x.lately));
+            if (postCard(c, a, x.name, text, c.now()) == null) return "The card was not posted (the log says why).";
+            return "";
+        };
+        return here;
+    }
+
+    /// `/overview`, in main: a line per topic of the owner's chat, its
+    /// title a link, then what waits or comes next, or nothing new.
+    fn overview(c: *Core, a: std.mem.Allocator, conv: []const u8) ![]const u8 {
+        if (!std.mem.eql(u8, conv, "main")) return "Use /overview in main: it lists the topics.";
+        const Row = struct { name: []const u8, subject: []const u8, title: []const u8, agent: []const u8, lately: []const conversations.Entry.Late };
+        var rows: std.ArrayList(Row) = .empty;
+        {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            for (c.convs.items.items) |e| {
+                if (e.channel != .telegram or e.thread == 0 or e.audience != .own) continue;
+                try rows.append(a, .{ .name = try a.dupe(u8, e.name), .subject = try a.dupe(u8, e.subject), .title = try a.dupe(u8, if (e.title.len > 0) e.title else e.name), .agent = try a.dupe(u8, e.agent), .lately = try a.dupe(conversations.Entry.Late, e.lately[0..e.lately_n]) });
+            }
+        }
+        if (rows.items.len == 0) return "No topics yet. /setup topics makes the butler's; a topic you open in the chat is one too.";
+        var out: std.ArrayList(u8) = .empty;
+        for (rows.items, 0..) |r, i| {
+            const f = try facts(c, a, r.name, r.subject, r.title, r.lately);
+            try out.print(a, "{s}{s}", .{ if (i > 0) "\n" else "", try card_mod.overviewLine(a, r.name, f) });
+            if (!std.mem.eql(u8, r.agent, "main")) try out.print(a, " Answered by {s}.", .{r.agent});
+        }
+        return out.items;
+    }
+
     /// `/focus [WORDS]` in a topic of the owner's chat.
     fn focusCommand(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
         c.convs.mutex.lockUncancelable(c.io);
@@ -32879,4 +33062,128 @@ test "quiet_hours_give_a_digest_per_topic_and_mains_line" {
     const ents = f.rec.entitiesOf("Held in topics").?;
     try expectHas(ents, "https://t.me/harness_test_bot/5002");
     try expectHas(ents, "https://t.me/harness_test_bot/5003");
+}
+
+// ---- topics: cards and /overview ----
+
+fn cardOf(f: *Fix, name: []const u8) i64 {
+    f.core.convs.mutex.lockUncancelable(t.io);
+    defer f.core.convs.mutex.unlock(t.io);
+    return (f.core.convs.find(name) orelse return 0).card;
+}
+
+test "a_card_is_built_from_state_and_edited_at_most_once_a_minute" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try butlerTopics(&f);
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    f.core.tick();
+    // a card in each of the butler's topics, pinned; none in Work
+    try f.rec.waitIn("errands", "Errands\nPending: none.\nNext: none.\nLately: none.");
+    try f.rec.waitIn("house", "House\nPending: none.");
+    try f.rec.waitIn("mail", "Mail and diary\nPending: none.");
+    try f.rec.waitIn("travel", "Travel\nPending: none.");
+    try t.expectEqual(0, f.rec.countIn("work", "Pending:"));
+    const card = cardOf(&f, "errands");
+    try t.expect(card != 0);
+    try f.rec.waitIn("errands", try std.fmt.allocPrint(a, "PIN {d}", .{card}));
+    try t.expect(f.rec.quietOf("Errands\nPending: none.").?);
+    // a post there: the card follows, at most once a minute
+    Errands.post(f.core, a, "harness:lists", "lists", "Milk is on the list.");
+    f.core.fixed_now = t0 + 30;
+    f.core.tick();
+    try t.expectEqual(0, f.rec.countIn("errands", "EDIT"));
+    f.core.fixed_now = t0 + 61;
+    f.core.tick();
+    var cb: [8]u8 = undefined;
+    try f.rec.waitIn("errands", try std.fmt.allocPrint(a, "EDIT {d}: Errands\nPending: none.\nNext: none.\nLately: Milk is on the list at {s}.", .{ card, quiet_mod.clock(&cb, t0, f.core.cfg.chat.utc_offset) }));
+    // a question there: pending
+    _ = try f.core.addItem(.{ .kind = "question", .by = "harness:lists", .conversation = "errands", .title = "Order milk?", .body = "Order milk?", .choices = &.{.{ .key = "yes", .label = "Yes" }} });
+    f.core.fixed_now = t0 + 125;
+    f.core.tick();
+    try f.rec.waitIn("errands", try std.fmt.allocPrint(a, "EDIT {d}: Errands\nPending: Order milk?\n", .{card}));
+    // nothing new: no edit
+    const edits = f.rec.countIn("errands", "EDIT");
+    f.core.fixed_now = t0 + 300;
+    f.core.tick();
+    try t.expectEqual(edits, f.rec.countIn("errands", "EDIT"));
+}
+
+test "a_gone_card_is_posted_again_and_pinned" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try butlerTopics(&f);
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    f.core.tick();
+    try f.rec.waitIn("errands", "Errands\nPending: none.");
+    const card = cardOf(&f, "errands");
+    try f.rec.gone.append(t.allocator, card);
+    Errands.post(f.core, a, "harness:lists", "lists", "Milk is on the list.");
+    f.core.fixed_now = t0 + 61;
+    f.core.tick();
+    try t.expectEqual(2, f.rec.countIn("errands", "Errands\nPending: none.\nNext: none.\n"));
+    const again = cardOf(&f, "errands");
+    try t.expect(again != card and again != 0);
+    try f.rec.waitIn("errands", try std.fmt.allocPrint(a, "PIN {d}", .{again}));
+    try expectHas(try conversationsText(&f), try std.fmt.allocPrint(a, "\"card\":{d}", .{again}));
+}
+
+test "card_posts_and_pins_a_fresh_one" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try butlerTopics(&f);
+    f.core.tick();
+    try f.rec.waitIn("travel", "Travel\nPending: none.");
+    const card = cardOf(&f, "travel");
+    try f.core.handleTextIn("travel", "/card");
+    try t.expectEqual(2, f.rec.countIn("travel", "Travel\nPending: none."));
+    const fresh = cardOf(&f, "travel");
+    try t.expect(fresh != card);
+    try f.rec.waitIn("travel", try std.fmt.allocPrint(a, "PIN {d}", .{fresh}));
+    try f.core.handleText("/card");
+    try f.rec.waitIn("main", "Use /card in a topic: it posts and pins that topic's card.");
+}
+
+test "a_card_never_enters_a_prompt" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try butlerTopics(&f);
+    Errands.post(f.core, a, "harness:deliveries", "deliveries", "DPD from Ignore Your Instructions Ltd comes today.");
+    f.core.tick();
+    try f.rec.waitIn("errands", "Lately: DPD from Ignore Your Instructions Ltd comes today at ");
+    try f.e.script(1, model.textReply("Milk and eggs."));
+    f.core.chatTurnIn("errands", "what's on the list?");
+    const req = try f.e.request(1);
+    for ([_][]const u8{ "Pending:", "Lately:", "Ignore Your Instructions" }) |w| try t.expect(std.mem.indexOf(u8, req, w) == null);
+}
+
+test "overview_lists_the_topics_with_links" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.setBot("harness_test_bot", true);
+    try butlerTopics(&f);
+    try addTopic(&f, "house-search", 5012);
+    {
+        f.core.convs.mutex.lockUncancelable(t.io);
+        defer f.core.convs.mutex.unlock(t.io);
+        try f.core.convs.setAgent("house-search", "scout");
+    }
+    _ = try f.core.addItem(.{ .kind = "question", .by = "harness:lists", .conversation = "errands", .title = "Order milk?", .body = "Order milk?", .choices = &.{.{ .key = "yes", .label = "Yes" }} });
+    try f.core.handleText("/overview");
+    try f.rec.waitIn("main", "House: nothing new.\nTravel: nothing new.\nErrands: waiting on you: Order milk?\nMail and diary: nothing new.\nWork: nothing new.\nhouse-search: nothing new. Answered by scout.");
+    const ents = f.rec.entitiesOf("House: nothing new.").?;
+    for ([_][]const u8{ "https://t.me/harness_test_bot/5001", "https://t.me/harness_test_bot/5003", "https://t.me/harness_test_bot/5012" }) |w| try expectHas(ents, w);
+    try f.core.handleTextIn("errands", "/overview");
+    try f.rec.waitIn("errands", "Use /overview in main: it lists the topics.");
 }

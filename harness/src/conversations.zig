@@ -57,8 +57,13 @@ pub const Entry = struct {
 
     /// When its card was last edited (at most once a minute).
     card_s: i64 = 0,
-    /// Its subject's state changed since: the card is edited when it may be.
-    card_due: bool = false,
+    /// The card's text as last posted or edited (its SHA-256).
+    card_hash: [32]u8 = @splat(0),
+    /// The last three lines posted here (a topic that files a subject),
+    /// for its card's Lately; oldest first.
+    lately: [3]Late = @splat(.{}),
+    lately_n: u8 = 0,
+
 
     /// Telegram refused its topic: its posts go to main with its name in
     /// front; `told` once the owner heard why.
@@ -78,6 +83,24 @@ pub const Entry = struct {
     told_held_s: i64 = 0,
 
     pub const Dropped = struct { agent: []u8, turns: usize };
+
+    pub const Late = struct { buf: [160]u8 = undefined, len: u8 = 0, at: i64 = 0 };
+
+    /// Notes `text`'s first line as posted here at `at`.
+    pub fn noteLately(e: *Entry, text: []const u8, at: i64) void {
+        const line = std.mem.trim(u8, text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len], " \t\r");
+        if (line.len == 0) return;
+        if (e.lately_n == e.lately.len) {
+            e.lately[0] = e.lately[1];
+            e.lately[1] = e.lately[2];
+            e.lately_n -= 1;
+        }
+        const cut = util.cut(line, 160);
+        var l: Late = .{ .len = @intCast(cut.len), .at = at };
+        @memcpy(l.buf[0..cut.len], cut);
+        e.lately[e.lately_n] = l;
+        e.lately_n += 1;
+    }
 
     pub fn isPrivate(e: *const Entry) bool {
         return e.private.load(.acquire);

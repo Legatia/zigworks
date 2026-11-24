@@ -2863,6 +2863,7 @@ test {
     _ = @import("agents.zig");
     _ = @import("persona.zig");
     _ = @import("topics.zig");
+    _ = @import("card.zig");
     _ = @import("mcp.zig");
     _ = @import("mcp_http.zig");
     _ = @import("oauth.zig");
