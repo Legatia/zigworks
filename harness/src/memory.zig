@@ -284,6 +284,22 @@ pub const Store = struct {
         return .{ .id = item.id, .merged = false };
     }
 
+    /// The item `body_in` would nearly repeat, found as `addFrom` finds
+    /// one (masked, its terms overlapping 80% or more, the same facts), or
+    /// null; nothing is written.
+    pub fn repeatOf(s: *Store, arena: std.mem.Allocator, body_in: []const u8) !?*Item {
+        var sc = try scrub.Scrubber.init(arena, s.secrets);
+        const masked = try sc.scrubAlloc(arena, body_in);
+        const body = std.mem.trim(u8, util.cut(masked, max_body), " \t\r\n");
+        var ts = try words(arena, body);
+        if (ts.len > max_terms) ts = ts[0..max_terms];
+        if (ts.len == 0) return null;
+        for (s.items.items) |it| {
+            if (match(ts, @ptrCast(it.terms)) >= same_item and sameFacts(body, it.body)) return it;
+        }
+        return null;
+    }
+
     fn newId(s: *Store, now_s: i64) ![]u8 {
         const c = util.civil(@divFloor(now_s, 86400));
         var prefix_buf: [16]u8 = undefined;
@@ -776,4 +792,19 @@ test "forget_removes_file" {
     try t.expectEqual(0, s2.items.items.len);
     const listing = try f.store.render(f.arena.allocator(), now, 20);
     try t.expectEqualStrings("No memories yet.", listing);
+}
+
+test "repeat_of_finds_what_add_would_merge" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const kept = try f.addAt("The owner lives in Krakow near the old town square", now - day);
+    try t.expectEqualStrings(kept.id, (try f.store.repeatOf(a, "Lives in Krakow, near the old town square.")).?.id);
+    // a changed number is a new fact
+    _ = try f.addAt("Standup is at 9 every weekday morning", now - day);
+    try t.expect(try f.store.repeatOf(a, "Standup is at 10 every weekday morning") == null);
+    try t.expect(try f.store.repeatOf(a, "Something else entirely about gardening") == null);
+    // nothing written
+    try t.expectEqual(2, f.store.items.items.len);
 }

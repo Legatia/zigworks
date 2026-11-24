@@ -198,10 +198,10 @@ const Rule = struct {
 
 const t = std.testing;
 
-/// A TZif file (version 2) for the tests: `transitions` with the index of
+/// A TZif file (version 2), for the tests here and the import's: `transitions` with the index of
 /// their type, `types` (seconds east of UTC, daylight saving or not), and
 /// the POSIX rule after the last transition.
-fn tzif(a: std.mem.Allocator, transitions: []const struct { at: i64, type: u8 }, types: []const struct { off: i32, dst: bool }, footer: []const u8) ![]u8 {
+pub fn tzif(a: std.mem.Allocator, transitions: []const struct { at: i64, type: u8 }, types: []const struct { off: i32, dst: bool }, footer: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     const w = struct {
         fn int(o: *std.ArrayList(u8), al: std.mem.Allocator, comptime T: type, v: T) !void {

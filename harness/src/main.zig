@@ -22,6 +22,7 @@ const oauth = @import("oauth.zig");
 const scrub = @import("scrub.zig");
 const undo_mod = @import("undo.zig");
 const doctor = @import("doctor.zig");
+const hermes_import = @import("hermes_import.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -85,6 +86,10 @@ const usage =
     \\                             for each that doesn't work; one short model request
     \\  report                     one file for a bug report, secrets masked: the version,
     \\                             the settings, the log's last 200 lines, doctor's lines
+    \\  import hermes [--from DIR] [--profile NAME] [--dry-run] [--yes] [--bundled]
+    \\                             bring over a Hermes setup: memory, skills, scheduled
+    \\                             jobs, MCP servers, deny rules, the model; the plan
+    \\                             first, no key copied (README: Coming from Hermes)
     \\  version | help
     \\
     \\The data folder is --home (anywhere on the line), else HARNESS_HOME, else
@@ -387,7 +392,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     }
     const cmd = args[0];
     const rest = args[1..];
-    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "people", "snapshot", "undo", "env", "app", "agent", "trigger", "workflow", "mcp", "doctor", "report" }) |c| if (eql(cmd, c)) {
+    inline for (.{ "secret", "login", "run", "chat", "brief", "task", "memory", "people", "snapshot", "undo", "env", "app", "agent", "trigger", "workflow", "mcp", "doctor", "report", "import" }) |c| if (eql(cmd, c)) {
         app.prepareStore() catch |e| {
             complain("can't tell where the secrets of {s} are kept: {s} (state/store-id)", .{ app.home, @errorName(e) });
             return .failed;
@@ -420,6 +425,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "health")) return healthCmd(app);
     if (eql(cmd, "doctor")) return doctorCmd(app);
     if (eql(cmd, "report")) return reportCmd(app);
+    if (eql(cmd, "import")) return importCmd(app, rest);
     complain("unknown command {s}; see harness help", .{cmd});
     return .usage;
 }
@@ -451,8 +457,60 @@ fn initCmd(app: *App, args: []const []const u8) !Exit {
         if (!std.mem.eql(u8, on, text)) try util.writeReplace(app.io, p.config, on);
     }
     try outAll(app.io, try initText(app.arena, app.home, butler_on, asked));
+    // a Hermes setup to bring over: said, never done
+    if (hermes_import.noticeFor(app.io, app.arena, app.env)) |line| try outPrint(app.io, "{s}\n", .{line});
     return .ok;
 }
+
+const import_usage = "usage: harness import hermes [--from DIR] [--profile NAME] [--dry-run] [--yes] [--bundled]";
+
+/// `harness import hermes`: hermes_import.zig, at this terminal.
+fn importCmd(app: *App, args: []const []const u8) !Exit {
+    const parsed = hermes_import.parseArgs(args) orelse {
+        complain(import_usage, .{});
+        return .usage;
+    };
+    const cfg = try app.settings();
+    const stored = core_mod.secretList(app.arena, app.secrets(cfg)) catch &.{};
+    var term: ImportTerm = .{ .app = app };
+    const code = try hermes_import.runImport(.{
+        .io = app.io,
+        .gpa = app.gpa,
+        .a = app.arena,
+        .home = app.home,
+        .env = app.env,
+        .term = .{ .ctx = &term, .print = ImportTerm.print, .ask = if (Io.File.stdin().isTty(app.io) catch false) ImportTerm.ask else null },
+        .now_s = util.nowSeconds(app.io),
+        .zone_dirs = try zoneDirs(app),
+        .stored = stored,
+    }, parsed);
+    return @enumFromInt(code);
+}
+
+/// Where zone files are: TZDIR first, then the usual folders.
+fn zoneDirs(app: *App) ![]const []const u8 {
+    const tz = app.env.get("TZDIR") orelse return &@import("zones.zig").default_dirs;
+    var list: std.ArrayList([]const u8) = .empty;
+    try list.append(app.arena, tz);
+    try list.appendSlice(app.arena, &@import("zones.zig").default_dirs);
+    return list.items;
+}
+
+/// The import's plan to stdout, its question at the terminal.
+const ImportTerm = struct {
+    app: *App,
+
+    fn print(ctx: ?*anyopaque, text: []const u8) void {
+        const it: *ImportTerm = @ptrCast(@alignCast(ctx.?));
+        outAll(it.app.io, text) catch {};
+    }
+
+    fn ask(ctx: ?*anyopaque, question: []const u8) ?[]const u8 {
+        const it: *ImportTerm = @ptrCast(@alignCast(ctx.?));
+        errAll(it.app.io, question) catch return null;
+        return readLine(it.app, Io.File.stdin()) catch null;
+    }
+};
 
 /// "y", "yes" (any case, spaces around it).
 fn isYes(answer: []const u8) bool {
@@ -2249,6 +2307,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     if (eql(cmd, "people")) return if (peopleArgsOk(rest)) null else people_usage;
     if (eql(cmd, "undo")) return if (rest.len == 1 and (std.fmt.parseInt(u64, rest[0], 10) catch null) != null) null else undo_usage;
     if (eql(cmd, "env")) return if (envArgsOk(rest)) null else env_usage;
+    if (eql(cmd, "import")) return if (hermes_import.parseArgs(rest) == null) import_usage else null;
     if (eql(cmd, "login")) {
         if (rest.len == 0) return login_usage;
         if (eql(rest[0], "list") and rest.len != 1) return login_usage;
@@ -2733,6 +2792,8 @@ test {
     _ = @import("yaml.zig");
     _ = @import("zones.zig");
     _ = @import("hermes.zig");
+    _ = @import("skillsrc.zig");
+    _ = @import("hermes_import.zig");
 }
 
 test "harness_people_takes_list_show_and_import" {
@@ -3082,4 +3143,37 @@ test "harness_workflow_takes_list_check_start_stop" {
     };
     for ([_][]const []const u8{ &.{"workflow"}, &.{ "workflow", "list", "x" }, &.{ "workflow", "go" }, &.{ "workflow", "check" }, &.{ "workflow", "start" }, &.{ "workflow", "stop" }, &.{ "workflow", "stop", "a", "b" }, &.{ "workflow", "start", "-x" } }) |line|
         try std.testing.expect(badArgs(line) != null);
+}
+
+test "import_takes_its_options" {
+    for ([_][]const []const u8{
+        &.{ "import", "hermes" },
+        &.{ "import", "hermes", "--dry-run" },
+        &.{ "import", "hermes", "--from", "/x", "--profile", "work", "--yes", "--bundled" },
+    }) |line| if (badArgs(line)) |why| {
+        std.debug.print("{s}: {s}\n", .{ line[1], why });
+        return error.TestUnexpectedResult;
+    };
+    for ([_][]const []const u8{ &.{"import"}, &.{ "import", "openclaw" }, &.{ "import", "hermes", "--from" }, &.{ "import", "hermes", "--profile", "--yes" }, &.{ "import", "hermes", "--fast" }, &.{ "import", "hermes", "--from", "a", "--from", "b" } }) |line|
+        try std.testing.expect(badArgs(line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "import hermes [--from DIR] [--profile NAME] [--dry-run] [--yes] [--bundled]") != null);
+}
+
+test "init_notices_a_hermes_setup" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env = std.process.Environ.Map.init(a);
+    try tmp.dir.createDirPath(t.io, "h");
+    try env.put("HERMES_HOME", try tmp.dir.realPathFileAlloc(t.io, "h", a));
+    // an empty folder is no setup
+    try t.expect(@import("hermes_import.zig").noticeFor(t.io, a, &env) == null);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "h/config.yaml", .data = "model: x\n" });
+    const said = @import("hermes_import.zig").noticeFor(t.io, a, &env).?;
+    try t.expect(std.mem.indexOf(u8, said, "To see what would come over: harness import hermes --dry-run") != null);
+    var none = std.process.Environ.Map.init(a);
+    try none.put("HOME", try tmp.dir.realPathFileAlloc(t.io, ".", a));
+    try t.expect(@import("hermes_import.zig").noticeFor(t.io, a, &none) == null);
 }
