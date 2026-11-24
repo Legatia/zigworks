@@ -239,6 +239,15 @@ fn value(line: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime name: []cons
         .@"enum", .enum_literal => return util.jsonString(line, gpa, @tagName(v)),
         else => {},
     }
+    // a list of strings (a gate line's outside text): each as a string is
+    if (V == []const []const u8) {
+        try line.append(gpa, '[');
+        for (v, 0..) |x, i| {
+            if (i > 0) try line.append(gpa, ',');
+            try value(line, gpa, name, x, ctx);
+        }
+        return line.append(gpa, ']');
+    }
     const raw: []const u8 = v;
     // a value the owner typed or a tool read never reaches the file
     const masked: ?[]u8 = if (ctx.scrubber) |x| try x.scrubAlloc(gpa, raw) else null;

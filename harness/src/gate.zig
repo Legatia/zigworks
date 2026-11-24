@@ -426,7 +426,10 @@ pub const Gate = struct {
         // decides each time
         const member = if (ctx.who) |w| who_mod.isHousehold(w.by) else false;
         // a memory or a fact asked for outside text: the argument never repeats
-        d.allow_day = !(tool == .money or tool.setup(arg) or (tool == .send and ctx.shared) or member or (ctx.outside and keepsText(tool, arg)));
+        // a workflow started from a run that read outside text: its input
+        // varies with what was read
+        const varies = ctx.outside and (keepsText(tool, arg) or (tool == .workflow and std.mem.eql(u8, firstWord(arg), "start")));
+        d.allow_day = !(tool == .money or tool.setup(arg) or (tool == .send and ctx.shared) or member or varies);
         d.dir = dir;
         return d;
     }
@@ -1450,6 +1453,18 @@ test "outside_text_asks_remember_and_people_note" {
     f.gate.rules = try rules.parse(a, "allow people note anna *\n");
     try t.expectEqual(.allow, f.act(.people, "note anna email", .{ .outside = true }));
     try t.expectEqual(.ask, f.act(.people, "note ben email", .{ .outside = true }));
+}
+
+test "a_workflow_start_after_outside_text_offers_no_day" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    // its input varies with what was read: never granted for a day
+    try t.expect(f.gate.decide(a, .workflow, "start digest", 1000, .{}).allow_day);
+    const d = f.gate.decide(a, .workflow, "start digest", 1000, .{ .outside = true });
+    try t.expectEqual(.ask, d.action);
+    try t.expect(!d.allow_day);
 }
 
 test "deny_mcp_rule_covers_money_tools_of_that_server" {

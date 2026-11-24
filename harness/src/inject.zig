@@ -406,9 +406,21 @@ pub fn fill(a: Allocator, text: []const u8, origin: []const u8, store: []const u
     return std.mem.replaceOwned(u8, a, x, "{store}", store);
 }
 
+/// `fill` for a JSON text (a call's input): the values JSON-escaped (a
+/// Windows path's backslashes).
+pub fn fillJson(a: Allocator, text: []const u8, origin: []const u8, store: []const u8) ![]const u8 {
+    return fill(a, text, try jsonInner(a, origin), try jsonInner(a, store));
+}
+
+/// `s` as it is inside a JSON string.
+pub fn jsonInner(a: Allocator, s: []const u8) ![]const u8 {
+    const quoted = try std.json.Stringify.valueAlloc(a, s, .{});
+    return quoted[1 .. quoted.len - 1];
+}
+
 /// A model's answer that makes `call` (an Anthropic Messages reply).
 pub fn reply(a: Allocator, id: []const u8, call: Call, origin: []const u8, store: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}],\"stop_reason\":\"tool_use\"}}", .{ id, call.tool, try fill(a, call.input, origin, store) });
+    return std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}],\"stop_reason\":\"tool_use\"}}", .{ id, call.tool, try fillJson(a, call.input, origin, store) });
 }
 
 /// The hostile page of a case, as the stand-in serves it.
@@ -463,7 +475,7 @@ pub fn writeDemo(io: std.Io, a: Allocator, dir: []const u8, origin: []const u8, 
             try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ pages, try std.fmt.allocPrint(a, "case-{d}.html", .{cs.n}) }), .data = try page(a, cs, origin, store) });
         }
         var calls: std.ArrayList(u8) = .empty;
-        for (cs.calls) |c| try calls.print(a, "{s}\t{s}\n", .{ c.tool, try fill(a, c.input, origin, store) });
+        for (cs.calls) |c| try calls.print(a, "{s}\t{s}\n", .{ c.tool, try fillJson(a, c.input, origin, store) });
         try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out, try std.fmt.allocPrint(a, "{d}.calls", .{cs.n}) }), .data = calls.items });
         try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out, try std.fmt.allocPrint(a, "{d}.title", .{cs.n}) }), .data = try std.fmt.allocPrint(a, "{s}\n", .{cs.title}) });
         try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out, try std.fmt.allocPrint(a, "{d}.said", .{cs.n}) }), .data = try std.fmt.allocPrint(a, "{s}\n", .{try said(a, hostile)}) });
@@ -510,4 +522,20 @@ test "the_catalog_is_numbered_and_whole" {
     defer arena.deinit();
     const p = try page(arena.allocator(), case(2), "http://127.0.0.1:9", "/s");
     try t.expect(std.mem.indexOf(u8, p, "http://127.0.0.1:9/page/collect?d=") != null);
+}
+
+test "filled_calls_are_json_whatever_the_paths" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // a Windows store folder: backslashes, which JSON must escape
+    const store = "C:\\Users\\me\\AppData\\Local\\Temp\\secrets";
+    for (cases) |cs| for (cs.calls) |c| {
+        const input = try fillJson(a, c.input, "http://127.0.0.1:9", store);
+        try t.expect(try std.json.validate(a, input));
+        try t.expect(try std.json.validate(a, try reply(a, "id", c, "http://127.0.0.1:9", store)));
+    };
+    const five = try fillJson(a, case(5).calls[0].input, "o", store);
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, five, .{});
+    try t.expectEqualStrings(store ++ "/omnigate", v.object.get("path").?.string);
 }

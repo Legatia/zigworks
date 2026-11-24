@@ -965,7 +965,7 @@ while IFS= read -r line; do
 		;;
 	esac
 done <"$T/demo.tap"
-check "the injection demo ran all its checks" '[ $demo_n = 21 ]'
+check "the injection demo ran all its checks" '[ $demo_n = 28 ]'
 
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	echo "smoke: FAILED"

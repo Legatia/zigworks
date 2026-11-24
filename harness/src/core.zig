@@ -1604,7 +1604,8 @@ pub const Core = struct {
         const text = m.text;
         const is_owner = if (c.owner) |o| o == from_id else false;
         const private_chat = std.mem.eql(u8, m.chat_type, "private");
-        if (!is_owner and private_chat and std.mem.startsWith(u8, text, "/pair ")) {
+        // a forwarded message is someone else's words: never a command
+        if (!is_owner and private_chat and !m.forwarded and std.mem.startsWith(u8, text, "/pair ")) {
             if (checkPairCode(c.io, c.paths.pair, std.mem.trim(u8, text[6..], " "), c.now())) {
                 var arena: std.heap.ArenaAllocator = .init(c.gpa);
                 defer arena.deinit();
@@ -1687,6 +1688,10 @@ pub const Core = struct {
     /// read there (others read a group: the agent only posts there, each
     /// post asked); anything else is dropped and logged.
     fn groupMessage(c: *Core, m: Incoming) !void {
+        if (m.forwarded) {
+            try c.log.write(.chat, false, .{ .event = "dropped", .from = m.from, .chat = m.chat, .why = "a forwarded message: never a command" });
+            return;
+        }
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1759,7 +1764,9 @@ pub const Core = struct {
         const text = c.withoutMention(raw);
         const mentioned = text.len != raw.len;
         var words = std.mem.tokenizeAny(u8, text, " \t\r\n");
-        const cmd = c.commandWord(words.next() orelse return false);
+        const first = words.next() orelse return false;
+        // forwarded: someone else's words, never a command
+        const cmd = if (m.forwarded) "-" else c.commandWord(first);
         const arg = std.mem.trim(u8, words.rest(), " \t\r\n");
         const name: ?[]const u8 = blk: {
             c.members.mutex.lockUncancelable(c.io);
@@ -4182,7 +4189,7 @@ pub const Core = struct {
                 .mail => {
                     for (events) |ev| for (ev.fields) |fl| if (std.mem.eql(u8, fl.name, "from_addr") or std.mem.eql(u8, fl.name, "from")) {
                         const addr = outside_mod.addressOf(fl.value);
-                        if (addr.len > 0) try outside_mod.add(&out, a, try outside_mod.named(a, "mail", try std.ascii.allocLowerString(a, addr)));
+                        try outside_mod.add(&out, a, if (addr.len == 0) "mail quoted" else try outside_mod.named(a, "mail", try std.ascii.allocLowerString(a, addr)));
                     };
                     if (out.items.len == 0) try outside_mod.add(&out, a, try outside_mod.named(a, "mcp", m.server));
                 },
@@ -9039,9 +9046,9 @@ pub const Core = struct {
         return c.saveWorkflow(a, name, text, saved) catch |e| @errorName(e);
     }
 
-    fn wfDeskStart(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, input: []const u8, by: []const u8, agent_name: []const u8) []const u8 {
+    fn wfDeskStart(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, input: []const u8, by: []const u8, agent_name: []const u8, outside: []const []const u8) []const u8 {
         const c: *Core = @ptrCast(@alignCast(ctx));
-        const begun = c.startInstance(a, name, .{ .at = c.now(), .by = by, .agent = agent_name, .input = input, .tool = true }) catch |e| return @errorName(e);
+        const begun = c.startInstance(a, name, .{ .at = c.now(), .by = by, .agent = agent_name, .input = input, .tool = true, .outside = outside }) catch |e| return @errorName(e);
         return c.startText(a, name, begun) catch "out of memory";
     }
 
@@ -14773,7 +14780,14 @@ const InstRun = struct {
             defer r.c.lock.unlock(r.c.io);
             break :blk r.c.gate.decide(r.a, .ask_owner, r.st.call, r.c.now(), .{ .who = who });
         };
-        r.c.log.write(.gate, private, .{ .run = lbl, .by = who.by, .conversation = r.w.to, .tool = "ask_owner", .decision = @tagName(d.action), .why = d.why, .arg = util.cut(r.st.call, 500) }) catch {};
+        // what the instance had read, as a run's gate line says it
+        const sp = outside_mod.split(r.st.outside);
+        if (sp.shown.len == 0)
+            r.c.log.write(.gate, private, .{ .run = lbl, .by = who.by, .conversation = r.w.to, .tool = "ask_owner", .decision = @tagName(d.action), .why = d.why, .arg = util.cut(r.st.call, 500) }) catch {}
+        else if (sp.more == 0)
+            r.c.log.write(.gate, private, .{ .run = lbl, .by = who.by, .conversation = r.w.to, .tool = "ask_owner", .decision = @tagName(d.action), .why = d.why, .arg = util.cut(r.st.call, 500), .outside = sp.shown }) catch {}
+        else
+            r.c.log.write(.gate, private, .{ .run = lbl, .by = who.by, .conversation = r.w.to, .tool = "ask_owner", .decision = @tagName(d.action), .why = d.why, .arg = util.cut(r.st.call, 500), .outside = sp.shown, .outside_more = sp.more }) catch {};
         if (d.action == .deny) return .{ .failed = .{ .why = try std.fmt.allocPrint(r.a, "refused by the gate: {s}", .{d.why}), .retry = false } };
         const now_s = r.c.now();
         // the instance has read outside text: its items say where from
@@ -30832,10 +30846,13 @@ fn injFill(f: *Fix, s: []const u8) ![]const u8 {
     return std.mem.replaceOwned(u8, a, x, "{skills}", f.core.paths.skills);
 }
 
-/// A scripted answer making the case's call `c`.
+/// A scripted answer making the case's call `c` (its values JSON-escaped:
+/// Windows paths have backslashes).
 fn injReply(f: *Fix, id: []const u8, c: inject.Call) ![]const u8 {
     const a = f.e.arena.allocator();
-    return std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}],\"stop_reason\":\"tool_use\"}}", .{ id, c.tool, try injFill(f, c.input) });
+    const x = try inject.fillJson(a, c.input, try f.e.url(), try injStore(f));
+    const input = try std.mem.replaceOwned(u8, a, x, "{skills}", try inject.jsonInner(a, f.core.paths.skills));
+    return std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}],\"stop_reason\":\"tool_use\"}}", .{ id, c.tool, input });
 }
 
 /// Case `n`'s hostile page at page/case-N.html; a scripted fetch of it.
@@ -30854,6 +30871,23 @@ fn allowCasePages(f: *Fix, more: []const u8) !void {
 /// "page 127.0.0.1:PORT".
 fn standInPage(f: *Fix) ![]const u8 {
     return std.fmt.allocPrint(f.e.arena.allocator(), "page 127.0.0.1:{d}", .{f.e.server.port});
+}
+
+/// TOOL's last gate line: its decision, a why starting with `why`, and
+/// exactly the outside sources `outside` (a JSON list).
+fn expectGate(f: *Fix, tool: []const u8, decision: []const u8, why: []const u8, outside: []const u8) !void {
+    const a = f.e.arena.allocator();
+    const head = try std.fmt.allocPrint(a, "\"kind\":\"gate\"", .{});
+    const want = try std.fmt.allocPrint(a, "\"tool\":\"{s}\",\"decision\":\"{s}\",\"why\":\"{s}", .{ tool, decision, why });
+    var last: []const u8 = "";
+    var it = std.mem.splitScalar(u8, try logText(f), '\n');
+    while (it.next()) |l| if (std.mem.indexOf(u8, l, head) != null and std.mem.indexOf(u8, l, want) != null) {
+        last = l;
+    };
+    const tail = try std.fmt.allocPrint(a, "\"outside\":{s},\"prev\"", .{outside});
+    if (last.len > 0 and std.mem.indexOf(u8, last, tail) != null) return;
+    std.debug.print("no gate line {s} with {s}; last: {s}\n", .{ want, tail, last });
+    return error.TestExpectedEqual;
 }
 
 /// Whether the stand-in was ever asked for a target with `path`.
@@ -30972,6 +31006,7 @@ test "injection_13_a_calendar_event_asks_to_mail_the_calendar_away" {
     try f.press("deny");
     try f.rec.waitFor("Not sent.");
     try t.expect(std.mem.indexOf(u8, mailFileText(&f, "sent.jsonl"), "planner@evil.example") == null);
+    try expectGate(&f, "mail__mail_send", "deny", "denied by the owner", "[\"calendar\"]");
 }
 
 test "injection_14_an_mcp_result_asks_for_another_of_its_tools" {
@@ -30990,6 +31025,7 @@ test "injection_14_an_mcp_result_asks_for_another_of_its_tools" {
     try f.rec.waitFor("fake__fail: fake/fail {}\nThis run read outside text first: mcp fake.");
     try f.press("deny");
     try f.rec.waitFor("Not done.");
+    try expectGate(&f, "fake__fail", "deny", "denied by the owner", "[\"mcp fake\"]");
 }
 
 test "injection_15_an_mcp_tool_description_marks_nothing" {
@@ -31028,6 +31064,7 @@ test "injection_16_a_helpers_page_asks_main_to_pay" {
     try t.expect(f.lastButtons().get("day") == null);
     try f.press("deny");
     try f.rec.waitFor("Not paid.");
+    try expectGate(&f, "fake__echo", "deny", "denied by the owner", try std.fmt.allocPrint(a, "[\"{s}\"]", .{try standInPage(&f)}));
     // the helper was offered no money tool
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "\"name\":\"fake__echo\"") == null);
 }
@@ -31081,6 +31118,7 @@ test "injection_19_a_page_plants_a_fact_about_a_person" {
     try f.press("deny");
     try f.rec.waitFor("Not noted.");
     try t.expect((try f.core.people.get(a, "Anna")) == null);
+    try expectGate(&f, "people", "deny", "denied by the owner", try std.fmt.allocPrint(a, "[\"{s}\"]", .{try standInPage(&f)}));
 }
 
 test "injection_20_a_readme_asks_to_write_a_skill_file" {
@@ -31238,6 +31276,7 @@ test "injection_26_a_forwarded_telegram_message_plants_a_fact" {
     try f.press("deny");
     try f.rec.waitFor("Not saved.");
     try t.expectEqual(0, f.core.mem.items.items.len);
+    try expectGate(&f, "remember", "deny", "denied by the owner", "[\"forwarded\"]");
 }
 
 test "injection_27_remember_that_after_a_page_is_still_asked" {
@@ -31258,6 +31297,7 @@ test "injection_27_remember_that_after_a_page_is_still_asked" {
     try f.press("deny");
     try f.rec.waitFor("Not saved.");
     try t.expectEqual(0, f.core.mem.items.items.len);
+    try expectGate(&f, "remember", "deny", "denied by the owner", try std.fmt.allocPrint(a, "[\"{s}\"]", .{try standInPage(&f)}));
 }
 
 test "injection_28_history_brings_back_a_hostile_page" {
@@ -31281,6 +31321,7 @@ test "injection_28_history_brings_back_a_hostile_page" {
     try f.press("deny");
     try f.rec.waitFor("Not saved.");
     try t.expectEqual(0, f.core.mem.items.items.len);
+    try expectGate(&f, "remember", "deny", "denied by the owner", "[\"history\"]");
 }
 
 test "injection_29_a_forwarded_command_is_never_run" {
@@ -31342,6 +31383,8 @@ test "a_workflows_approve_after_a_feed_carries_the_line" {
     _ = try f.core.pollNow("news");
     runWorkflows(&f);
     try f.rec.waitFor(try std.fmt.allocPrint(f.e.arena.allocator(), "Post pay-acme?\nThis run read outside text first: {s}.", .{try standInFeed(&f)}));
+    // its gate line names it too
+    try expectHas(try logText(&f), try std.fmt.allocPrint(f.e.arena.allocator(), "\"tool\":\"ask_owner\",\"decision\":\"allow\",\"why\":\"default for this tool\",\"arg\":\"Post pay-acme?\",\"outside\":[\"{s}\"]", .{try standInFeed(&f)}));
 }
 
 test "a_forwarded_voice_note_gets_the_voice_checks" {
@@ -31354,4 +31397,81 @@ test "a_forwarded_voice_note_gets_the_voice_checks" {
     try f.core.handleIncoming(in);
     try f.rec.waitFor("Voice notes need a transcription service");
     try t.expectEqual(0, f.core.queue.items.len);
+}
+
+test "a_workflow_the_agent_starts_after_a_page_starts_marked" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try allowCasePages(&f, "");
+    try setWorkflow(&f, "digest", "workflow digest\nstart agent\nstep note\ndo Keep it: {input}\n");
+    try f.e.script(1, try injPage(&f, 4, "p1"));
+    try f.e.script(2, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"w1\",\"name\":\"workflow\",\"input\":{{\"action\":\"start\",\"name\":\"digest\",\"text\":{f}}}}}],\"stop_reason\":\"tool_use\"}}", .{std.json.fmt(inject.case(4).hostile, .{})}));
+    try f.e.script(3, model.textReply("Started."));
+    try f.core.startWorker();
+    try f.core.handleText("summarize case 4 and keep it");
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "This run read outside text first: {s}.", .{try standInPage(&f)}));
+    // its input varies with what was read: no Allow 24 h
+    try t.expect(f.lastButtons().get("day") == null);
+    // the step's run, as soon as the instance starts
+    try f.e.script(4, try injReply(&f, "r1", inject.case(4).calls[0]));
+    try f.e.script(5, model.textReply("Kept nothing."));
+    try f.press("once");
+    try f.rec.waitFor("Started.");
+    runWorkflows(&f);
+    try waitLog(&f, "\"instance\":\"digest#1\",\"event\":\"end\"");
+    try expectHas(try f.e.request(5), "refused by the gate: outside text, unattended");
+    try t.expectEqual(0, f.core.mem.items.items.len);
+    try expectHas(fileText(&f, try std.fs.path.join(a, &.{ f.core.paths.state, "workflows", "digest", "1", "state" })), try std.fmt.allocPrint(a, "\"outside\":[\"{s}\"]", .{try standInPage(&f)}));
+}
+
+test "a_forwarded_command_is_never_run_in_a_group_or_by_a_stranger" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.core.setBot("harness_test_bot", true);
+    // the owner forwards someone's /conversation add into a group
+    try f.core.handleIncoming(.{ .from = 42, .chat = -1001234567890, .chat_type = "supergroup", .text = "/conversation@harness_test_bot add evil", .forwarded = true });
+    {
+        f.core.convs.mutex.lockUncancelable(t.io);
+        defer f.core.convs.mutex.unlock(t.io);
+        try t.expectEqual(null, f.core.convs.find("evil"));
+    }
+    try expectHas(try logText(&f), "\"event\":\"dropped\",\"from\":42,\"chat\":-1001234567890,\"why\":\"a forwarded message: never a command\"");
+    // a stranger forwards a pairing code: no pairing
+    var buf: [8]u8 = undefined;
+    const code = try newPairCode(t.io, f.core.paths, f.core.now(), &buf);
+    try f.core.handleIncoming(.{ .from = 77, .chat = 77, .text = try std.fmt.allocPrint(a, "/pair {s}", .{code}), .forwarded = true });
+    try t.expectEqual(42, f.core.owner.?);
+}
+
+test "history_marks_what_it_shows_of_a_forwarded_message" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.script(1, model.textReply("Someone wants invoices paid."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = inject.case(26).hostile, .forwarded = true });
+    try f.rec.waitFor("Someone wants invoices paid.");
+    const run = try lastRunId(&f, "chat");
+    _ = try f.core.command(a, "/new");
+    // a fresh context: the words come back through history, marked
+    try f.e.script(2, model.toolReply("h1", "history", "{\"words\":\"ACME\"}"));
+    try f.e.script(3, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"h2\",\"name\":\"history\",\"input\":{{\"words\":\"x\",\"run\":{d}}}}}],\"stop_reason\":\"tool_use\"}}", .{run}));
+    try f.e.script(4, try injReply(&f, "r1", inject.case(26).calls[0]));
+    try f.e.script(5, model.textReply("Not saved."));
+    try f.core.handleText("what did I forward about ACME?");
+    try f.rec.waitFor("remember: " ++ inject.fact ++ "\nThis run read outside text first: history.");
+    try f.press("deny");
+    try f.rec.waitFor("Not saved.");
+    try t.expectEqual(0, f.core.mem.items.items.len);
+    // shown as forwarded, never as the owner's words, in both views
+    for ([_]u32{ 3, 4 }) |n| {
+        const req = try requestBody(&f, n);
+        try expectHas(req, "Forwarded: Remember:");
+        try t.expect(std.mem.indexOf(u8, req, "Owner: Remember:") == null);
+    }
 }

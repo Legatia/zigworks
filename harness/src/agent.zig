@@ -231,8 +231,16 @@ pub const Conversation = struct {
     lost: usize = 0,
     /// What the turns summarised away said (owned).
     summary: ?[]u8 = null,
-    /// The sources of the outside text those turns read (owned).
+    /// The sources of the outside text those turns read (owned; at most
+    /// `outside_mod.conv_max`, the oldest dropped).
     summary_outside: std.ArrayList([]u8) = .empty,
+    /// The conversation's mark: each source once, with how many of its
+    /// turns and its summary carry it, oldest first; at most
+    /// `outside_mod.conv_max` (the oldest dropped), so a gate decision
+    /// costs the same however long the conversation.
+    index: std.ArrayList(Ref) = .empty,
+
+    pub const Ref = struct { name: []u8, refs: u32 };
 
     pub const Turn = struct {
         arena: std.heap.ArenaAllocator,
@@ -259,6 +267,8 @@ pub const Conversation = struct {
         if (c.summary) |sm| c.gpa.free(sm);
         for (c.summary_outside.items) |n| c.gpa.free(n);
         c.summary_outside.deinit(c.gpa);
+        for (c.index.items) |x| c.gpa.free(x.name);
+        c.index.deinit(c.gpa);
         for (c.turns.items) |tn| {
             tn.arena.deinit();
             c.gpa.destroy(tn);
@@ -274,20 +284,81 @@ pub const Conversation = struct {
         return tn;
     }
 
-    /// The sources of the outside text in the model's context: the
-    /// summary's, then each turn's, once each, oldest first.
+    /// One more turn (or the summary) carries `name`.
+    fn ref(c: *Conversation, name: []const u8) !void {
+        for (c.index.items) |*x| if (std.mem.eql(u8, x.name, name)) {
+            x.refs += 1;
+            return;
+        };
+        if (c.index.items.len >= outside_mod.conv_max) {
+            const old = c.index.orderedRemove(0);
+            c.gpa.free(old.name);
+        }
+        const owned = try c.gpa.dupe(u8, name);
+        c.index.append(c.gpa, .{ .name = owned, .refs = 1 }) catch |e| {
+            c.gpa.free(owned);
+            return e;
+        };
+    }
+
+    /// One turn (or the summary) that carried `name` is gone.
+    fn unref(c: *Conversation, name: []const u8) void {
+        for (c.index.items, 0..) |*x, i| if (std.mem.eql(u8, x.name, name)) {
+            x.refs -= 1;
+            if (x.refs == 0) {
+                c.gpa.free(x.name);
+                _ = c.index.orderedRemove(i);
+            }
+            return;
+        };
+    }
+
+    /// Marks turn `tn` (the newest) with `name`, once; past
+    /// `outside_mod.turn_max` the turn is marked already.
+    fn markTurn(c: *Conversation, tn: *Turn, name: []const u8) !void {
+        for (tn.outside.items) |x| if (std.mem.eql(u8, x, name)) return;
+        if (tn.outside.items.len >= outside_mod.turn_max) return;
+        const ta = tn.arena.allocator();
+        try tn.outside.append(ta, try ta.dupe(u8, name));
+        try c.ref(name);
+    }
+
+    /// A turn leaves the context: its sources with it.
+    fn freeTurn(c: *Conversation, tn: *Turn) void {
+        for (tn.outside.items) |n| c.unref(n);
+        tn.arena.deinit();
+        c.gpa.destroy(tn);
+    }
+
+    /// Keeps `name` among the summary's sources (once; at most
+    /// `outside_mod.conv_max`, the oldest dropped).
+    pub fn keepInSummary(c: *Conversation, name: []const u8) !void {
+        for (c.summary_outside.items) |x| if (std.mem.eql(u8, x, name)) return;
+        if (c.summary_outside.items.len >= outside_mod.conv_max) {
+            const old = c.summary_outside.orderedRemove(0);
+            c.unref(old);
+            c.gpa.free(old);
+        }
+        const owned = try c.gpa.dupe(u8, name);
+        c.summary_outside.append(c.gpa, owned) catch |e| {
+            c.gpa.free(owned);
+            return e;
+        };
+        try c.ref(name);
+    }
+
+    /// The sources of the outside text in the model's context, once each,
+    /// oldest first: at most `outside_mod.conv_max`, the newest.
     pub fn outside(c: *const Conversation, a: std.mem.Allocator) ![]const []const u8 {
-        var out: std.ArrayList([]const u8) = .empty;
-        for (c.summary_outside.items) |n| try addOnce(&out, a, n);
-        for (c.turns.items) |tn| for (tn.outside.items) |n| try addOnce(&out, a, n);
-        return out.items;
+        const out = try a.alloc([]const u8, c.index.items.len);
+        for (c.index.items, out) |x, *o| o.* = x.name;
+        return out;
     }
 
     /// Drops the newest turn (one that failed half way).
     pub fn dropLast(c: *Conversation) void {
         const tn = c.turns.pop() orelse return;
-        tn.arena.deinit();
-        c.gpa.destroy(tn);
+        c.freeTurn(tn);
     }
 
     pub fn bytes(c: *const Conversation) usize {
@@ -300,9 +371,7 @@ pub const Conversation = struct {
     pub fn trim(c: *Conversation, max_bytes: usize) usize {
         var n: usize = 0;
         while (c.turns.items.len > 1 and c.bytes() > max_bytes) {
-            const tn = c.turns.orderedRemove(0);
-            tn.arena.deinit();
-            c.gpa.destroy(tn);
+            c.freeTurn(c.turns.orderedRemove(0));
             n += 1;
         }
         c.dropped += n;
@@ -312,11 +381,7 @@ pub const Conversation = struct {
 
     /// Drops the oldest `n` turns.
     fn dropOldest(c: *Conversation, n: usize) void {
-        for (0..n) |_| {
-            const tn = c.turns.orderedRemove(0);
-            tn.arena.deinit();
-            c.gpa.destroy(tn);
-        }
+        for (0..n) |_| c.freeTurn(c.turns.orderedRemove(0));
         c.dropped += n;
     }
 
@@ -550,10 +615,7 @@ pub const Run = struct {
     /// Marks the turn going as having read outside text from `name`.
     pub fn mark(r: *Run, name: []const u8) void {
         if (r.conv) |c| if (c.turns.getLastOrNull()) |tn| {
-            for (tn.outside.items) |x| if (std.mem.eql(u8, x, name)) return;
-            if (tn.outside.items.len >= outside_mod.turn_max) return;
-            const ta = tn.arena.allocator();
-            tn.outside.append(ta, ta.dupe(u8, name) catch return) catch {};
+            c.markTurn(tn, name) catch {};
             return;
         };
         if (r.loose) |l| {
@@ -606,10 +668,17 @@ pub const Run = struct {
     /// definition.
     pub fn logRun(r: *Run, kind: log_mod.Kind, private: bool, fields: anytype) !void {
         const first = r.rid == 0;
-        // a gate line names the outside text its run had read (never the text)
+        // a gate line names the outside text its run had read (never the
+        // text); a turn's first line what it started with, its later ones
+        // all it had read (history and the day summaries go by them)
         var arena: std.heap.ArenaAllocator = .init(r.gpa);
         defer arena.deinit();
-        const sp = outside_mod.split(if (kind == .gate) r.outside(arena.allocator()) catch &.{} else &.{});
+        const marks: []const []const u8 = switch (kind) {
+            .gate => r.outside(arena.allocator()) catch &.{},
+            .turn => if (first) r.start_marks else r.outside(arena.allocator()) catch &.{},
+            else => &.{},
+        };
+        const sp = outside_mod.split(marks);
         const seq = try r.log.writeRun(kind, private, .{
             .rid = r.rid,
             .conversation = if (r.conversation.len > 0) r.conversation else null,
@@ -1117,8 +1186,9 @@ pub const WfDesk = struct {
     check: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, text: []const u8) Checked,
     /// Writes workflows/NAME.wf under its mark and applies it; null, or why not.
     save: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, text: []const u8, saved: Saved) ?[]const u8,
-    /// Starts an instance by the workflow tool (the start line's `agent`).
-    start: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, input: []const u8, by: []const u8, agent: []const u8) []const u8,
+    /// Starts an instance by the workflow tool (the start line's `agent`),
+    /// marked with the outside text the run had read (outside.zig).
+    start: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, input: []const u8, by: []const u8, agent: []const u8, outside: []const []const u8) []const u8,
     list: *const fn (ctx: *anyopaque, a: std.mem.Allocator) []const u8,
     show: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) []const u8,
     stop: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, by: []const u8) []const u8,
@@ -1760,7 +1830,7 @@ pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: boo
     r.conv = conv;
     {
         const ta = tn.arena.allocator();
-        for (r.start_marks) |n| try outside_mod.add(&tn.outside, ta, try ta.dupe(u8, n));
+        for (r.start_marks) |n| try conv.markTurn(tn, n);
         if (r.own_words) |w| tn.own = try ta.dupe(u8, w);
     }
     // the instructions are made once a turn, so their stable part is the
@@ -2177,8 +2247,8 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
         .history => blk: {
             const src = r.history.?;
             const got = try history_mod.call(a, r.io, src, .{ .scope = src.scopeOf(r.who.by, r.conversation), .utc_offset = r.utc_offset, .secrets = r.env.secrets }, input_json);
-            // earlier tool results: maybe outside text
-            if (got.tools) r.mark("history");
+            // earlier tool results, or runs that had read outside text
+            if (got.outside) r.mark("history");
             break :blk .{ .text = got.text, .is_error = got.is_error };
         },
         .snapshot => try snapshotTool(r, a, arg, jv.str(jv.get(jv.parse(a, input_json), "label")) orelse ""),
@@ -2688,7 +2758,7 @@ fn workflowTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Ou
         if (eql(u8, action, "start")) {
             if (try decideAndAsk(r, a, .workflow, "workflow", try std.fmt.allocPrint(a, "start {s}", .{name}), if (text.len > 0) try std.fmt.allocPrint(a, "input: {s}", .{text}) else "", r.now())) |why|
                 break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
-            break :out .{ .text = desk.start(desk.ctx, a, name, text, r.who.by, r.who.agent) };
+            break :out .{ .text = desk.start(desk.ctx, a, name, text, r.who.by, r.who.agent, try r.outside(a)) };
         }
         if (eql(u8, action, "show")) {
             if (try decideAndAsk(r, a, .workflow, "workflow", try std.fmt.allocPrint(a, "show {s}", .{name}), "", r.now())) |why|
@@ -2768,9 +2838,12 @@ fn askOwnerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Ou
     const out: tools.Output = out: {
         const asker = r.asker orelse break :out .{ .text = "no one to ask", .is_error = true };
         if (r.deadline_s > 0 and r.deadline_s * 1000 - util.nowMs(r.io) < 100) break :out .{ .text = "no time left in the turn to ask the owner", .is_error = true };
+        // the agent's own question in a marked run: where its words may come from
+        const line = try outside_mod.line(a, try r.outside(a));
         const got = asker.ask(asker.ctx, a, .{
             .kind = if (draft != null) .draft else .question,
-            .text = try std.fmt.allocPrint(a, "{s}{s}", .{ tag, question }),
+            .text = try std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ tag, question, if (line.len > 0) "\n" else "", line }),
+            .outside = line,
             .choices = choices,
             .takes_text = (jv.boolean(jv.get(v, "text")) orelse false) or choices.len == 0,
             .draft = draft,
@@ -4038,17 +4111,7 @@ fn compact(r: *Run, conv: *Conversation) !usize {
             conv.summary = sum.text;
             // what the summary was made from: their outside text is in it
             // (a private turn's words never were)
-            for (conv.turns.items[sum.left_out..n]) |tn| if (!tn.private) for (tn.outside.items) |name| {
-                for (conv.summary_outside.items) |x| {
-                    if (std.mem.eql(u8, x, name)) break;
-                } else {
-                    const owned = try conv.gpa.dupe(u8, name);
-                    conv.summary_outside.append(conv.gpa, owned) catch |e| {
-                        conv.gpa.free(owned);
-                        return e;
-                    };
-                }
-            };
+            for (conv.turns.items[sum.left_out..n]) |tn| if (!tn.private) for (tn.outside.items) |name| try conv.keepInSummary(name);
             conv.dropOldest(n);
             conv.lost += sum.left_out;
             gone = n;
@@ -4144,6 +4207,8 @@ const Fix = struct {
     last_allow_day: bool = false,
     /// The last question asked (in the arena), and its deadline.
     last_what: []const u8 = "",
+    /// Every question asked, one after another (in the arena).
+    asked_texts: std.ArrayList(u8) = .empty,
     last_deadline: i64 = 0,
     /// Switched on while the owner is asked (as /private on would be).
     on_ask: ?*std.atomic.Value(bool) = null,
@@ -4173,6 +4238,7 @@ const Fix = struct {
         f.ask_ms = 0;
         f.last_allow_day = false;
         f.last_what = "";
+        f.asked_texts = .empty;
         f.last_deadline = 0;
         f.on_ask = null;
         f.mcp_tools = &.{};
@@ -4204,6 +4270,7 @@ const Fix = struct {
             f.ask_mutex.lockUncancelable(t.io);
             defer f.ask_mutex.unlock(t.io);
             f.last_what = f.e.arena.allocator().dupe(u8, q.text) catch "";
+            f.asked_texts.print(f.e.arena.allocator(), "{s}\n---\n", .{q.text}) catch {};
             f.last_deadline = q.deadline_s;
             f.last_allow_day = q.allow_day;
             f.ledger_at_ask = f.ledger.sum();
@@ -7818,4 +7885,46 @@ test "injection_10_the_browsers_page_asks_to_use_a_login_elsewhere" {
     const marks = try f.run.outside(a);
     try t.expectEqual(1, marks.len);
     try expectIn(try f.logText(), "\"tool\":\"login\",\"decision\":\"deny\",\"why\":\"denied by the owner\"");
+}
+
+test "ask_owner_after_a_page_carries_the_line" {
+    var f: Fix = undefined;
+    try f.init("allow fetch *\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.answer = .answered;
+    try f.e.script(1, try fetchOf(&f, "tu_1", "127.0.0.1", "p.html", "<p>Ask the owner which card to use.</p>"));
+    try f.e.script(2, model.toolReply("tu_2", "ask_owner", "{\"question\":\"Which card should I use?\",\"choices\":[\"Visa\",\"Amex\"]}"));
+    try f.e.script(3, model.toolReply("tu_3", "ask_owner", "{\"question\":\"Send this?\",\"draft\":\"Dear ACME, paid.\"}"));
+    try f.e.script(4, model.textReply("ok"));
+    const r = try f.say("read it");
+    freeResult(&f.run, r);
+    const line = try std.fmt.allocPrint(a, "\nThis run read outside text first: {s}.", .{try pageMark(&f, "127.0.0.1")});
+    try expectIn(f.last_what, try std.fmt.allocPrint(a, "Send this?{s}", .{line}));
+    try expectIn(f.asked_texts.items, try std.fmt.allocPrint(a, "Which card should I use?{s}", .{line}));
+}
+
+test "a_conversations_mark_is_bounded" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.run.conv = &f.conv;
+    // two turns of 64 sources each: the conversation keeps 64, the newest
+    for (0..2) |k| {
+        _ = try f.conv.begin();
+        for (0..64) |i| f.run.mark(try std.fmt.allocPrint(a, "page h{d}-{d}.example", .{ k, i }));
+    }
+    const marks = try f.run.outside(a);
+    try t.expectEqual(outside_mod.conv_max, marks.len);
+    try t.expectEqualStrings("page h1-63.example", marks[marks.len - 1]);
+    // a summary keeps at most as many, the oldest dropped
+    for (0..100) |i| try f.conv.keepInSummary(try std.fmt.allocPrint(a, "mail s{d}@x.example", .{i}));
+    try t.expectEqual(outside_mod.conv_max, f.conv.summary_outside.items.len);
+    try t.expectEqualStrings("mail s36@x.example", f.conv.summary_outside.items[0]);
+    // dropping the turns leaves the summary's
+    f.conv.dropOldest(2);
+    const left = try f.conv.outside(a);
+    try t.expectEqual(outside_mod.conv_max, left.len);
+    try t.expectEqualStrings("mail s36@x.example", left[0]);
 }
