@@ -41,7 +41,14 @@ pub const Choice = struct { key: []const u8, label: []const u8 };
 pub const Answer = struct { key: ?[]const u8 = null, text: ?[]const u8 = null, at: i64, via: Via };
 
 /// A message with the item's buttons.
-pub const Shown = struct { chat: i64, thread: i64, message: i64 };
+pub const Shown = struct {
+    chat: i64,
+    thread: i64,
+    message: i64,
+    /// main's one-line pointer to an item shown in its topic: edited with
+    /// that line and the outcome when it closes.
+    short: bool = false,
+};
 
 /// A delivery's post, to be sent again as it was.
 pub const Post = struct {
@@ -473,7 +480,7 @@ pub fn render(out: *std.ArrayList(u8), gpa: std.mem.Allocator, it: *const Item, 
     } else try out.appendSlice(gpa, "null");
     if (kept) {
         try out.print(gpa, ",\"token\":\"{s}\",\"shown\":[", .{&it.token});
-        for (it.shown.items, 0..) |s, i| try out.print(gpa, "{s}{{\"chat\":{d},\"thread\":{d},\"message\":{d}}}", .{ if (i > 0) "," else "", s.chat, s.thread, s.message });
+        for (it.shown.items, 0..) |s, i| try out.print(gpa, "{s}{{\"chat\":{d},\"thread\":{d},\"message\":{d}{s}}}", .{ if (i > 0) "," else "", s.chat, s.thread, s.message, if (s.short) ",\"short\":true" else "" });
         try out.appendSlice(gpa, "],\"post\":");
         if (it.post) |p| {
             try out.appendSlice(gpa, "{\"conversation\":");
@@ -593,7 +600,7 @@ fn parseItem(gpa: std.mem.Allocator, v: jv.Value) !*Item {
     }
     for (jv.arr(jv.get(v, "shown")) orelse &.{}) |s| {
         if (it.shown.items.len == max_shown) break;
-        try it.shown.append(a, .{ .chat = jv.int(jv.get(s, "chat")) orelse 0, .thread = jv.int(jv.get(s, "thread")) orelse 0, .message = jv.int(jv.get(s, "message")) orelse continue });
+        try it.shown.append(a, .{ .chat = jv.int(jv.get(s, "chat")) orelse 0, .thread = jv.int(jv.get(s, "thread")) orelse 0, .message = jv.int(jv.get(s, "message")) orelse continue, .short = jv.boolean(jv.get(s, "short")) orelse false });
     }
     if (jv.get(v, "post")) |p| {
         var links: std.ArrayList([]const u8) = .empty;
