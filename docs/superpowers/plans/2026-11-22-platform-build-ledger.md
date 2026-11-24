@@ -169,3 +169,4 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
   - Final: minor (deferred): workflow files that don't parse aren't seen by "nothing names it".
   - Final: deferred: an injection case for whether `history` returns harness's own topic posts unmarked.
 - CI 45479751508 (31505ed, the persona merge): 29/31. A macOS headterm job was cancelled while waiting for a runner. Linux harness: two `hermes_import` tests failed. Their helper `importDir` took the first `state/imports` entry starting with `hermes-`, and since the fix pass `hermes-entries` (a file) sits beside the import's folder. ext4's listing order put the file first. The helper now takes folders only (the test was wrong; the product is unchanged).
+- CI 45485959370 (2f67124, importDir takes folders only): 30/31, with harness green on all three systems. Windows llmcheck hung for 59 minutes with no log, its third hang that day. Rerun; noted in the gaps list's Infrastructure section.

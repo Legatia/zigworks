@@ -236,6 +236,17 @@ tried against Telegram yet:
 
 ## Infrastructure
 
+**llmcheck hangs on Windows CI (2026-11-24).** It hung three times in one day:
+
+- at 2d3c3d2, failed after 8 minutes;
+- run 45414619782, 52 minutes with no log;
+- run 45485959370, 59 minutes with no log.
+
+None of those commits touched llmcheck, and the reruns passed. A test there
+likely waits on something (a pipe or a child process) that can stall on
+Windows. Look for an unbounded wait in llmcheck's Windows path before
+releasing it.
+
 GitHub cancels macOS jobs that wait about 15 minutes for a runner (most
 pushes lose one or two); they pass when rerun. A paid plan or fewer macOS
 jobs would end it.
