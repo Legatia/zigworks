@@ -1089,6 +1089,7 @@ fn takeUpdate(c: *Core, tc: *TgChan, u: telegram.Update) void {
             .text = m.text,
             .reply_to = m.reply_to,
             .voice = m.voice,
+            .forwarded = m.forwarded,
         }) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
         .callback => |cb| {
             tc.answer(cb.id);
@@ -2819,6 +2820,8 @@ test {
     _ = @import("mail.zig");
     _ = @import("doctor.zig");
     _ = @import("people.zig");
+    _ = @import("outside.zig");
+    _ = @import("inject.zig");
     _ = @import("lists.zig");
     _ = @import("deliveries.zig");
     _ = @import("upkeep.zig");

@@ -984,9 +984,26 @@ printf 'abcdefabcdefabcdefabcdefabcdefabcdefabcd\n' >"$S/repos/acme/skills.commi
 check "skill add OWNER/REPO/PATH installs it from GitHub's archive, pinned" 'HARNESS_HOME="$HH" HARNESS_CODELOAD_URL="$URL/codeload" "$H" skill add acme/skills/skills/hello --yes >"$T/skill.out" 2>&1 && [ -f "$HH/skills/hello/SKILL.md" ] && grep -qF "acme/skills/skills/hello" "$HH/skills/.sources" && grep -qF "abcdefabcdefabcdefabcdefabcdefabcdefabcd" "$HH/skills/.sources"'
 check "skill list names each skill's source" 'HARNESS_HOME="$HH" "$H" skill list >"$T/skills.out" 2>&1 && grep -qF "hello  acme/skills/skills/hello, commit abcdefabcdef" "$T/skills.out"'
 check "skill rm removes the folder and its line" 'HARNESS_HOME="$HH" "$H" skill rm hello >/dev/null 2>&1 && [ ! -e "$HH/skills/hello" ] && ! grep -qF "acme/skills" "$HH/skills/.sources"'
+# the prompt-injection demo, in check mode: what it shows is what CI checks
+sh "$(dirname "$0")/injection-demo.sh" --check "$H" "$F" >"$T/demo.tap" 2>&1
+demo_n=0
+while IFS= read -r line; do
+	case "$line" in
+	"ok "*)
+		demo_n=$((demo_n + 1))
+		check "injection demo: ${line#ok * - }" true
+		;;
+	"not ok "*)
+		demo_n=$((demo_n + 1))
+		check "injection demo: ${line#not ok * - }" false
+		;;
+	esac
+done <"$T/demo.tap"
+check "the injection demo ran all its checks" '[ $demo_n = 28 ]'
 
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	echo "smoke: FAILED"
+	echo "--- injection demo"; cat "$T/demo.tap"
 	echo "--- run output"; cat "$T/run.out"
 	[ -f "$T/brun.out" ] && { echo "--- the butler's run output"; cat "$T/brun.out"; }
 	[ -f "$T/crun.out" ] && { echo "--- the calendar's run output"; cat "$T/crun.out"; }
