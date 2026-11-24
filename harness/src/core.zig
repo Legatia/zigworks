@@ -4405,6 +4405,9 @@ pub const Core = struct {
         // a run's copy (environment, copy) and where its item is shown:
         // Show, Apply or Drop acts on it
         var copy: ?struct { env: []const u8, name: []const u8, conv: []const u8 } = null;
+        // [Make this payment]: the call a skipped item holds, and where it
+        // is shown
+        var pay: ?struct { call: []const u8, conv: []const u8 } = null;
         {
             c.inbox.mutex.lockUncancelable(c.io);
             defer c.inbox.mutex.unlock(c.io);
@@ -4417,6 +4420,16 @@ pub const Core = struct {
             } else if (!it.offers(key)) return .not_offered;
             if (std.mem.eql(u8, it.kind, "skipped") and std.mem.eql(u8, key, "allow")) if (it.grant) |g| {
                 grant = .{ .tool = a.dupe(u8, g.tool) catch return .not_offered, .key = a.dupe(u8, g.key) catch return .not_offered, .who = a.dupe(u8, g.who) catch return .not_offered };
+                it.settling = true;
+            };
+            if (std.mem.eql(u8, it.kind, "skipped") and std.mem.eql(u8, key, "pay")) if (it.skip) |ref| {
+                // "BY\tmoney\tSERVER/TOOL {json}"
+                var parts = std.mem.splitScalar(u8, ref, '\t');
+                _ = parts.next();
+                if (!std.mem.eql(u8, parts.next() orelse "", "money")) return .not_offered;
+                const call = parts.rest();
+                if (household.splitCall(call) == null) return .not_offered;
+                pay = .{ .call = a.dupe(u8, call) catch return .not_offered, .conv = a.dupe(u8, it.conversation) catch return .not_offered };
                 it.settling = true;
             };
             if (std.mem.eql(u8, it.kind, "delivery")) if (it.post) |p| {
@@ -4517,7 +4530,71 @@ pub const Core = struct {
         // closing it ends `settling`: no other answer slips in before
         if (!c.settle(id, .answered, .{ .key = key, .text = if (setup != null) null else said, .at = c.now(), .via = via })) return .closed;
         if (setup_done) |d| c.setupFollow(a, setup.?.conv, d);
+        // closed first: a second tap makes nothing
+        if (pay) |p| c.startPayment(p.call, if (c.isShared(p.conv)) "main" else p.conv, id);
         return .taken;
+    }
+
+    const PayJob = struct { arena: std.heap.ArenaAllocator, call: []const u8, conv: []const u8, item: u64 };
+
+    /// [Make this payment] was tapped on item `item`: `call` made on a
+    /// thread of its own (the tap's answer comes first).
+    fn startPayment(c: *Core, call: []const u8, conv: []const u8, item: u64) void {
+        const box = c.gpa.create(PayJob) catch return c.sayIn(conv, "Not paid: harness could not start the payment.");
+        box.arena = .init(c.gpa);
+        const ba = box.arena.allocator();
+        box.call = ba.dupe(u8, call) catch "";
+        box.conv = ba.dupe(u8, conv) catch "main";
+        box.item = item;
+        _ = c.bg_active.fetchAdd(1, .acq_rel);
+        const th = std.Thread.spawn(.{}, payJob, .{ c, box }) catch {
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            return c.sayIn(conv, "Not paid: harness could not start the payment.");
+        };
+        th.detach();
+    }
+
+    fn payJob(c: *Core, box: *PayJob) void {
+        defer {
+            box.arena.deinit();
+            c.gpa.destroy(box);
+            _ = c.bg_active.fetchSub(1, .acq_rel);
+        }
+        c.makePayment(box.arena.allocator(), box.call, box.conv, box.item);
+    }
+
+    /// Makes `call` ("SERVER/TOOL {json}") the owner tapped [Make this
+    /// payment] for: as the owner's (the built-in main), through the money
+    /// checks and the gate again (the caps, a deny line, dry run), whose
+    /// asker allows that exact call once; counted as the owner's. What the
+    /// server said is said in `conv`.
+    fn makePayment(c: *Core, a: std.mem.Allocator, call: []const u8, conv: []const u8, item: u64) void {
+        while (c.restarting.load(.acquire) and !c.quitting.load(.acquire)) c.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        const sc = household.splitCall(call) orelse return;
+        const mt: ?agent.McpTool = for (c.mcp_tools) |m| {
+            if (std.mem.eql(u8, m.server.name, sc.server) and std.mem.eql(u8, m.tool, sc.tool)) break m;
+        } else null;
+        const m = mt orelse return c.sayIn(conv, std.fmt.allocPrint(a, "Not paid: {s} isn't running.", .{sc.server}) catch "Not paid: its server isn't running.");
+        if (!m.money) return c.sayIn(conv, "Not paid: its tool is no longer a money tool in mcp.ini.");
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "main");
+        defer c.unregister(&flag);
+        var run = c.runIn(&c.chat_client, "payment", .{ .agent = "main", .by = "owner" }, conv, &flag);
+        run.useDefinition(agents.builtin_main);
+        var go: Errands.OrderGo = .{ .arg = call, .item = item };
+        run.asker = .{ .ctx = &go, .ask = Errands.OrderGo.ask };
+        const out: tools.Output = agent.stepCall(&run, a, m.def.name, sc.input) catch |e| .{ .text = @errorName(e), .is_error = true };
+        const words = util.cut(std.mem.trim(u8, out.text, " \t\r\n"), 600);
+        const shown = c.masks.scrubAlloc(a, std.fmt.allocPrint(a, "{s} {s}", .{ m.def.name, sc.input }) catch call) catch call;
+        if (out.is_error or !go.used) {
+            c.log.write(.chat, false, .{ .event = "payment not made", .item = item, .tool = m.def.name }) catch {};
+            return c.sayIn(conv, std.fmt.allocPrint(a, "Not paid: {s}.", .{std.mem.trimEnd(u8, words, ".")}) catch "Not paid.");
+        }
+        if (std.mem.startsWith(u8, words, "dry run:")) return c.sayIn(conv, "Dry run is on: nothing was paid.");
+        c.log.write(.chat, false, .{ .event = "payment made", .item = item, .tool = m.def.name }) catch {};
+        c.sayIn(conv, std.fmt.allocPrint(a, "Paid: {s}. The server says: {s}", .{ shown, words }) catch "Paid.");
     }
 
     /// Lets item `id` be answered again (its action is done or failed).
@@ -4627,10 +4704,15 @@ pub const Core = struct {
         const skip = try std.fmt.allocPrint(a, "{s}\t{s}\t{s}", .{ s.who.by, tool, key });
         const who = grantWho(s.who.by);
         const offered = s.grantable and who != null and std.mem.eql(u8, key, s.key);
+        // a payment: made by the tap only as it was (no stored secret in it)
+        const payable = s.payable and std.mem.eql(u8, key, s.key);
         var choices: std.ArrayList(inbox_mod.Choice) = .empty;
         if (offered) try choices.append(a, .{ .key = "allow", .label = try std.fmt.allocPrint(a, "Allow for this {s}", .{ranKind(s.who.by)}) });
+        if (payable) try choices.append(a, .{ .key = "pay", .label = "Make this payment" });
         try choices.append(a, .{ .key = "dismiss", .label = "Dismiss" });
-        const line = try c.masks.scrubAlloc(a, try std.fmt.allocPrint(a, "{s}: {s}{s}{s}", .{ s.name, s.arg, if (s.outside.len > 0) "\n" else "", s.outside }));
+        const amount_line = if (s.amount.len > 0) try std.fmt.allocPrint(a, "\nAmount: {s}", .{s.amount}) else "";
+        const why_line = if (s.why.len > 0) try std.fmt.allocPrint(a, "\nRefused: {s}.", .{std.mem.trimEnd(u8, s.why, ".")}) else "";
+        const line = try c.masks.scrubAlloc(a, try std.fmt.allocPrint(a, "{s}: {s}{s}{s}{s}{s}", .{ s.name, s.arg, amount_line, why_line, if (s.outside.len > 0) "\n" else "", s.outside }));
         c.makeRoom();
         const id = blk: {
             c.inbox.mutex.lockUncancelable(c.io);
@@ -28877,6 +28959,96 @@ test "a_reorder_is_bought_only_on_the_owners_tap" {
     try expectHas(lt, "\"by\":\"owner\"");
     try expectHas(lt, "\"tool\":\"frisco__shop_order\"");
     try expectHas(lt, "\"event\":\"order made\",\"shop\":\"frisco\"");
+}
+
+// ---- money from automation, within a budget ----
+
+/// The label of the button whose data is `data` (`i<id>-<token>:<key>`), as
+/// its item offers it.
+fn itemLabel(f: *Fix, data: []const u8) !?[]const u8 {
+    const dash = std.mem.indexOfScalar(u8, data, '-') orelse return null;
+    const id = try std.fmt.parseInt(u64, data[1..dash], 10);
+    const key = data[(std.mem.lastIndexOfScalar(u8, data, ':') orelse return null) + 1 ..];
+    f.core.inbox.mutex.lockUncancelable(t.io);
+    defer f.core.inbox.mutex.unlock(t.io);
+    const it = f.core.inbox.find(id) orelse return null;
+    return if (it.choiceLabel(key)) |l| try f.e.arena.allocator().dupe(u8, l) else null;
+}
+
+/// What the money record says frisco moved today: everyone's, automation's.
+fn friscoToday(f: *Fix) struct { all: f64, auto: f64 } {
+    const day = @divFloor(util.nowSeconds(t.io) + @as(i64, f.core.cfg.chat.utc_offset) * 60, 86400);
+    f.core.money_ledger.mutex.lockUncancelable(t.io);
+    defer f.core.money_ledger.mutex.unlock(t.io);
+    return .{ .all = f.core.money_ledger.spent("frisco", day), .auto = f.core.money_ledger.spentAuto("frisco", day) };
+}
+
+test "make_this_payment_makes_exactly_that_call_as_the_owner" {
+    var f: Fix = undefined;
+    // caps, and no budget for automation
+    try f.init("[money]\nmax_per_call = 100\n", "", "[groceries]\nat = 23:59\ndo = Order the groceries.\n");
+    defer f.deinit();
+    try withShop(&f, shop_money);
+    try f.e.script(1, model.toolReply("o1", "frisco__shop_order", "{\"items\":[\"milk\"],\"total\":12.5}"));
+    try f.e.script(2, model.textReply("Not ordered."));
+    _ = try f.core.runTask(try taskNamed(f.core, "groceries"));
+    // kept for the owner: the whole call, the amount, why, and the tap
+    try f.rec.waitFor("could not make this call without you:\nfrisco__shop_order: frisco/shop_order {\"items\":[\"milk\"],\"total\":12.5}\nAmount: 12.50\nRefused: no budget for automation: /money budget N a day sets one.");
+    const b = f.rec.buttonsWith("Amount: 12.50").?;
+    try t.expect(b.get("pay") != null and b.get("dismiss") != null and b.get("allow") == null);
+    try t.expectEqualStrings("Make this payment", (try itemLabel(&f, b.get("pay").?)).?);
+    try t.expectEqualStrings("", shopOrders(&f));
+    // the tap: exactly that call, once, as the owner's
+    f.core.handleCallback(42, b.msg, b.get("pay").?);
+    try f.rec.waitFor("Paid: frisco__shop_order {\"items\":[\"milk\"],\"total\":12.5}. The server says: Order 4471 placed");
+    try waitOrders(&f, "{\"items\":[\"milk\"],\"total\":12.5}");
+    f.core.handleCallback(42, b.msg, b.get("pay").?);
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expectEqual(1, std.mem.count(u8, shopOrders(&f), "\n"));
+    // the owner's spending, asked by the tap: not automation's
+    const lt = try logText(&f);
+    try expectHas(lt, "\"run\":\"payment\",\"by\":\"owner\"");
+    try expectHas(lt, "\"tool\":\"frisco__shop_order\",\"decision\":\"allow\",\"why\":\"allowed once by the owner");
+    const spent = friscoToday(&f);
+    try t.expectEqual(@as(f64, 12.5), spent.all);
+    try t.expectEqual(@as(f64, 0), spent.auto);
+    // another skipped, then the cap lowered before the tap: refused, nothing paid
+    try f.e.script(3, model.toolReply("o2", "frisco__shop_order", "{\"items\":[\"eggs\"],\"total\":40}"));
+    try f.e.script(4, model.textReply("Not ordered."));
+    _ = try f.core.runTask(try taskNamed(f.core, "groceries"));
+    try f.rec.waitFor("Amount: 40\n");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.fmt.allocPrint(f.e.arena.allocator(), "{s}[money]\nmax_per_call = 30\n", .{fileText(&f, f.core.paths.config)[0 .. std.mem.indexOf(u8, fileText(&f, f.core.paths.config), "[money]").?]}) });
+    _ = try f.core.reload();
+    const b2 = f.rec.buttonsWith("Amount: 40").?;
+    f.core.handleCallback(42, b2.msg, b2.get("pay").?);
+    try f.rec.waitFor("Not paid: refused by the gate: 40 is over the cap of 30 per call.");
+    try t.expectEqual(1, std.mem.count(u8, shopOrders(&f), "\n"));
+}
+
+test "no_amount_tools_and_mail_send_are_never_unattended" {
+    var f: Fix = undefined;
+    // a budget set: still never
+    try f.init("[money]\nbudget_per_day = 1000\nbudget_per_month = 1000\n", "", "[night]\nat = 23:59\ndo = Lock up and mail the report.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[home]\ncommand = \"{s}\" --mcp --home\nmoney = home_guarded\namount = home_guarded:none\n[mail]\ncommand = \"{s}\" --mcp --mail\nmoney = mail_send\namount = mail_send:none\n", .{ fake, fake }) });
+    for ([_][]const u8{ "home", "mail" }) |n| try Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", n }));
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(1, model.toolReply("g1", "home__home_guarded", "{\"device\":\"front_door\",\"action\":\"unlock\"}"));
+    try f.e.script(2, model.toolReply("m1", "mail__mail_send", "{\"mailbox\":\"butler\",\"to\":\"x@example.com\",\"subject\":\"Report\",\"text\":\"Done.\"}"));
+    try f.e.script(3, model.textReply("Neither done."));
+    _ = try f.core.runTask(try taskNamed(f.core, "night"));
+    try expectHas(try f.e.request(2), "refused by the gate: a money tool that names no amount is never used unattended");
+    // the gate's mail check first, as before budgets
+    try expectHas(try f.e.request(3), "refused by the gate: mail is never sent from a run nobody watches");
+    // each kept for the owner, with Dismiss alone
+    try f.rec.waitFor("home__home_guarded: home/home_guarded {\"action\":\"unlock\",\"device\":\"front_door\"}");
+    try f.rec.waitFor("mail__mail_send: mail/mail_send {");
+    for ([_][]const u8{ "home__home_guarded: home/", "mail__mail_send: mail/" }) |needle| {
+        const b = f.rec.buttonsWith(needle).?;
+        try t.expect(b.get("dismiss") != null and b.get("pay") == null and b.get("allow") == null);
+    }
 }
 
 test "not_now_and_expiry_order_nothing" {

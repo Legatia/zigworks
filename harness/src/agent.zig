@@ -1556,7 +1556,7 @@ pub const MoneyLedger = struct {
     }
 
     /// What `server` moved on `day`, everyone's.
-    fn spent(l: *MoneyLedger, server: []const u8, day: i64) f64 {
+    pub fn spent(l: *MoneyLedger, server: []const u8, day: i64) f64 {
         var so_far: f64 = 0;
         for ([_][]const u8{ server, everyone }) |n| so_far += l.totalOf(.day, n, day);
         return so_far;
@@ -2314,6 +2314,8 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
                 try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg, .budget = pass.note })
             else
                 try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+            // nobody to ask: kept for the owner, a payment they may still make
+            if (r.scheduled) skipMoney(r, a, mt.?, name, arg, input_json, why, pass.payable);
             // a household member's run, or speech, doesn't learn the owner's spending
             const said = if (who_mod.isHousehold(r.who.by)) "a money limit of the owner's is reached" else why;
             return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{said}), .is_error = true };
@@ -3655,6 +3657,13 @@ pub const Skip = struct {
     private: bool,
     /// The line naming its run's outside text (outside.zig); "": none.
     outside: []const u8 = "",
+    /// Why it was refused ("": the gate's question with no one to ask).
+    why: []const u8 = "",
+    /// A money call the owner may still make with a tap ([Make this
+    /// payment]): `key` is then the whole call.
+    payable: bool = false,
+    /// A money call's amount, as the owner reads it; "": none named.
+    amount: []const u8 = "",
 };
 
 /// Keeps a skipped call as an inbox item; returns its id (0: none).
@@ -3977,6 +3986,36 @@ fn skip(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: [
         .conversation = r.conversation,
         .private = r.isPrivate(),
         .outside = outside_mod.line(a, r.outside(a) catch &.{}) catch "",
+    }) else 0;
+    s.add(r.io, name, arg, item);
+}
+
+/// An unattended money call moneyCheck refused: listed in the run's post
+/// and kept as an item with the whole call, its amount and why; when
+/// `payable`, its key is the whole call (each payment its own item) and
+/// the owner's tap may make it.
+fn skipMoney(r: *Run, a: std.mem.Allocator, m: *const McpTool, name: []const u8, arg: []const u8, input_json: []const u8, why: []const u8, payable: bool) void {
+    const s = r.skipped orelse return;
+    const amount: []const u8 = switch (m.amount) {
+        .name => |field| if (amountOf(a, input_json, field)) |x| money_mod.amountText(a, x) catch "" else "",
+        else => "",
+    };
+    const item = if (s.keeper) |k| k.keep(k.ctx, a, .{
+        .tool = .money,
+        .env = "",
+        .name = name,
+        .arg = arg,
+        .key = if (payable) arg else gate.grantKey(.money, arg),
+        .grantable = false,
+        .who = r.who,
+        .rid = r.rid,
+        .label = r.label,
+        .conversation = r.conversation,
+        .private = r.isPrivate(),
+        .outside = outside_mod.line(a, r.outside(a) catch &.{}) catch "",
+        .why = why,
+        .payable = payable,
+        .amount = amount,
     }) else 0;
     s.add(r.io, name, arg, item);
 }
