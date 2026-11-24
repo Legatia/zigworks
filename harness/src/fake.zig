@@ -33,12 +33,18 @@
 //!   through `mcp`); each such request is appended to `mcp-requests.jsonl`
 //!   with its method, target, headers and body. `browse` and `Browser`
 //!   play the owner's browser for a sign-in.
+//! - GitHub's codeload: `GET /codeload/OWNER/REPO/tar.gz/REF` answers the
+//!   folder `repos/OWNER/REPO/` as a tar.gz (top folder `REPO-REF/`), its
+//!   pax header naming the commit in `repos/OWNER/REPO.commit` (else
+//!   0123…); no such folder: 404. Each request is appended to
+//!   `codeload-requests.jsonl`.
 const std = @import("std");
 const sock = @import("sock.zig");
 const jv = @import("jv.zig");
 const http = @import("http.zig");
 const url_mod = @import("url.zig");
 const fake_mcp = @import("fake_mcp.zig");
+const targz = @import("targz.zig");
 const Io = std.Io;
 
 pub const Server = struct {
@@ -296,9 +302,49 @@ pub const Server = struct {
             n += 1;
             return req.respond(text, .{ .extra_headers = extra[0..n] });
         }
+        if (method == .GET and std.mem.startsWith(u8, route, "/codeload/")) return s.codeload(a, req, route);
         if (method == .GET and std.mem.startsWith(u8, route, "/file/bot")) return s.telegramFile(a, req, route);
         if (std.mem.startsWith(u8, route, "/bot")) return s.telegram(a, req, route, body);
         return json(req, .not_found, "{\"error\":\"no such route\"}");
+    }
+
+    /// codeload.github.com's tar.gz of a folder of the script's `repos/`.
+    fn codeload(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, route: []const u8) !void {
+        {
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            try s.appendRecord(a, try s.path(a, &.{"codeload-requests.jsonl"}), try std.fmt.allocPrint(a, "{{\"target\":{f}}}\n", .{std.json.fmt(route, .{})}));
+        }
+        var parts = std.mem.splitScalar(u8, route["/codeload/".len..], '/');
+        const owner = parts.next() orelse "";
+        const repo_name = parts.next() orelse "";
+        const kind = parts.next() orelse "";
+        const ref = parts.rest();
+        if (owner.len == 0 or repo_name.len == 0 or ref.len == 0 or !std.mem.eql(u8, kind, "tar.gz") or std.mem.indexOf(u8, route, "..") != null) return json(req, .not_found, "{}");
+        const root = try s.path(a, &.{ "repos", owner, repo_name });
+        const commit = if (s.readScript(a, &.{ "repos", owner, try std.fmt.allocPrint(a, "{s}.commit", .{repo_name}) })) |c| std.mem.trim(u8, c, " \r\n") else "0123456789abcdef0123456789abcdef01234567";
+        const top = try std.fmt.allocPrint(a, "{s}-{s}", .{ repo_name, ref });
+        for (top) |*ch| if (ch.* == '/') {
+            ch.* = '-';
+        };
+        var entries: std.ArrayList(targz.Entry) = .empty;
+        try entries.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}/", .{top}), .kind = .dir });
+        var d = Io.Dir.cwd().openDir(s.io, root, .{ .iterate = true }) catch return json(req, .not_found, "{}");
+        defer d.close(s.io);
+        var w = try d.walk(a);
+        defer w.deinit();
+        while (try w.next(s.io)) |e| {
+            if (e.kind != .file) continue;
+            const rel = try a.dupe(u8, e.path);
+            for (rel) |*ch| if (ch.* == '\\') {
+                ch.* = '/';
+            };
+            const data = try d.readFileAlloc(s.io, e.path, a, .limited(64 << 20));
+            const exec = @import("builtin").os.tag != .windows and if (d.statFile(s.io, e.path, .{})) |st| st.permissions.toMode() & 0o111 != 0 else |_| false;
+            try entries.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}/{s}", .{ top, rel }), .data = data, .exec = exec });
+        }
+        const gz = try targz.write(a, commit, entries.items);
+        return req.respond(gz, .{ .extra_headers = &.{.{ .name = "content-type", .value = "application/x-gzip" }} });
     }
 
     /// The format a model request is in, and its errors are answered in.

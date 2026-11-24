@@ -32,42 +32,75 @@ The same runs also failed on all three systems in
 real clock, and the fixture has a busy event from 12:00 to 13:00 UTC on
 2026-11-24. It's fixed in ed34e74 with a fixed clock.
 
-## Also designed: the Hermes import (2026-11-24)
+## Built: the Hermes import (2026-11-24)
 
 Spec: `docs/superpowers/specs/2026-11-24-harness-hermes-import-design.md`
-(91a62e0). Approved by the owner; the Mac session is building it on
-`platform/hermes-import`.
+(91a62e0, approved by the owner); plan with its rulings:
+`docs/superpowers/plans/2026-11-24-hermes-import.md`. Branch
+`platform/hermes-import`, merged with `harness-logins` (the injection
+checks) at the end.
 
 **What it adds:**
 
-- `harness import hermes`: memory, skills, scheduled jobs, MCP servers,
-  deny rules and models from `~/.hermes`. It shows a plan first, copies
-  no secrets, and refuses while `harness run` is running.
+- `harness import hermes [--from DIR] [--profile NAME] [--dry-run] [--yes] [--bundled]`:
+  memory, an edited SOUL.md, skills, cron jobs, MCP servers, deny rules
+  and the model from a Hermes home. A plan first; no key copied (each is a
+  `harness secret add` line); refused while `harness run` holds the folder.
 - `harness skill add|list|show|update|rm`: skills from a folder, a GitHub
-  `owner/repo` or a `SKILL.md` link. Each keeps its source and a hash in
-  `skills/.sources`.
+  repo (codeload's tar.gz, pinned to the archive's commit) or a link to a
+  `SKILL.md`, each with its source and hash in `skills/.sources`.
+- New files: `yaml.zig`, `zones.zig`, `hermes.zig`, `hermes_import.zig`,
+  `skillsrc.zig`, `targz.zig`, `skill_cmd.zig`, `taskfiles.zig`.
 
-**Shared code it will touch:**
+**Shared code it changed:**
 
-- `config.zig`: tasks get `do_file`, read from a guarded `tasks/` folder;
-- `mcp.zig`: an `env = NAME=VALUE` key;
-- `skills.zig`: a closing fence followed by spaces;
-- `main.zig`: the new commands.
+- `triggers.zig`, `config.zig`: tasks take `do_file = NAME.md`, read whole
+  from `tasks/` (guarded like `workflows/`; `taskfiles.zig`); `core.zig`
+  one line each in `loadSettings` and `settingsProblemWith`, and
+  `Paths.tasks_dir`.
+- `mcp.zig`: `env = NAME=VALUE` (a secret-like name refused); `core.zig`
+  doesn't start a server whose `env` value is a stored secret.
+- `skills.zig`: a closing `---` followed by spaces is a fence.
+- `memory.zig`: `Store.repeatOf` (read only).
+- `fake.zig`: `GET /codeload/OWNER/REPO/tar.gz/REF` from the script's
+  `repos/`; `fake_mcp.zig`: echo `env:NAME`.
+- `main.zig`: the two commands, their help, and `harness init`'s line when
+  a Hermes setup is there.
+
+**Rulings worth knowing** (all in the plan): codeload's top folder is
+`REPO-REF`, so the commit comes only from the pax header; an excluded MCP
+tool becomes `deny mcp SERVER/GLOB *`; `command_allowlist` entries are told
+apart by Hermes's own 122 pattern names; skills from Hermes that can't be
+updated get a `hermes` source line; Hermes's empty `timezone` is this
+computer's zone.
 
 **For Windows:**
 
-- Hermes's home is `%LOCALAPPDATA%\hermes`.
-- The skill archive reader refuses names Windows can't hold.
-- There's no executable bit.
+- Hermes's home is `%LOCALAPPDATA%\hermes` (else `%USERPROFILE%\AppData\Local\hermes`).
+- There are no zone files: a job's time in another zone is kept as
+  written, and the plan says to check it (`zones.offsetAt` is null).
+- Hermes on Windows hashes its bundled skills with `\` paths, ordered
+  case-folded; the fixture carries both systems' hashes.
+- The archive reader refuses names Windows can't hold; no executable bit
+  is set; tests that need one (`scripts_keep_their_executable_bit`,
+  `a_tasks_folder_others_can_write_is_refused`) skip there.
+- From the final review: `HERMES_HOME` expands `%NAME%` (and `~`,
+  `$NAME`); a skill file name Windows can't hold is listed under Not
+  imported before anything is written; the tests that make links
+  (`a_linked_skill_folder_*`) and a `:` in a file name
+  (`a_skill_file_name_harness_cant_write_is_listed`) skip on Windows.
+  A part the import can't write (a file another program holds open) is
+  listed in report.md and the output, exit 1, and the rest is written.
 
 ## Built by the Mac session: prompt-injection checks (2026-11-24)
 
 Spec `docs/superpowers/specs/2026-11-24-harness-injection-checks-design.md`,
 plan `docs/superpowers/plans/2026-11-24-injection-checks.md` (branch
-`platform/inject`). The checks assume the model obeys the hostile text; 31
+`platform/inject`). The checks assume the model obeys the hostile text; 32
 cases (`src/inject.zig`): 1–8 end to end in `scripts/injection-demo.sh`,
 which the smoke script runs with `--check` (so Windows CI runs it under Git
-Bash), 9–31 as unit tests `injection_NN_…` through Core.
+Bash), 9–32 as unit tests `injection_NN_…` through Core. Case 32 came with
+the Hermes import: a skill installed from a repo asks to send memory out.
 
 **What changed in shared code, as built:**
 

@@ -49,8 +49,19 @@ on. Update it when something lands.
   in the smoke script and a demo of the gate holding (built 2026-11-24:
   spec 2026-11-24-harness-injection-checks-design.md, plan
   2026-11-24-injection-checks.md); import of a Hermes setup and
-  agentskills.io skills; the gate as an MCP proxy for other agents (both
-  open).
+  agentskills.io skills (built, below); the gate as an MCP proxy for
+  other agents (open).
+- ~~Import of a Hermes setup and agentskills.io skills~~ **built
+  (2026-11-24, platform/hermes-import)**: `harness import hermes` (memory,
+  SOUL.md, skills, cron jobs, MCP servers, deny rules, the model; a plan
+  first, no key copied) and `harness skill add|list|show|update|rm`
+  (folders, GitHub repos, SKILL.md links). Plan
+  `docs/superpowers/plans/2026-11-24-hermes-import.md`.
+- **`utc_offset` doesn't follow daylight saving** (found by the Hermes
+  import, 2026-11-24): harness keeps one fixed offset for every time it
+  says or schedules; a 07:00 task moves an hour against the wall clock
+  twice a year until `utc_offset` is changed by hand. The import converts
+  a job's time at its zone's offset on the import day and says so.
 - **Private conversations on a local model** (from the fifteen-features
   list).
 

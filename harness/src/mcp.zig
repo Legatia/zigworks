@@ -60,9 +60,33 @@ pub const ServerConfig = struct {
     /// the ones in config.ini's [money].
     max_per_call: ?u32 = null,
     max_per_day: ?u32 = null,
+    /// `env = NAME=VALUE` lines: a program's plain variables, in order.
+    env: []const EnvVar = &.{},
 };
 
 pub const EnvSecret = struct { env: []const u8, secret: []const u8 };
+
+/// A plain variable a program is started with (`env = NAME=VALUE`).
+pub const EnvVar = struct { name: []const u8, value: []const u8 };
+
+/// Whether a variable's name says it holds a secret: TOKEN, KEY, SECRET,
+/// PASSWORD or AUTH in it, any case. Such a value is a stored secret,
+/// given with `secret =`, never written in mcp.ini.
+pub fn secretLike(name: []const u8) bool {
+    for ([_][]const u8{ "token", "key", "secret", "password", "auth" }) |w| {
+        if (std.ascii.findIgnoreCase(name, w) != null) return true;
+    }
+    return false;
+}
+
+/// The `env =` variable of `cfg` whose value is one of `secrets`
+/// (stored secrets), or null: such a value belongs in `secret =`.
+pub fn envHoldsSecret(cfg: ServerConfig, secrets: []const @import("scrub.zig").Secret) ?[]const u8 {
+    for (cfg.env) |v| for (secrets) |sec| {
+        if (sec.value.len > 0 and std.mem.eql(u8, v.value, sec.value)) return v.name;
+    };
+    return null;
+}
 
 /// Where a money tool's input holds the amount it moves.
 pub const Field = union(enum) {
@@ -114,6 +138,8 @@ pub fn configReason(e: anyerror) ?[]const u8 {
         error.SignInOnlyKey => "client_id and scope are for a sign-in (login = oauth)",
         error.BadLoginValue => "login takes oauth (then: harness mcp login NAME)",
         error.BadTokenName => "token = the name of a stored secret (harness secret add NAME): a-z, 0-9, - and _",
+        error.SecretEnv => "env = is for plain values; a variable named like a secret (TOKEN, KEY, SECRET, PASSWORD, AUTH) is given with secret = NAME:storedname",
+        error.EnvWithUrl => "env = gives a program its plain variables; a server at a url takes none",
         else => null,
     };
 }
@@ -132,6 +158,8 @@ pub const ConfigError = error{
     SignInOnlyKey,
     BadLoginValue,
     BadTokenName,
+    SecretEnv,
+    EnvWithUrl,
     OutOfMemory,
 };
 
@@ -232,15 +260,16 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) ConfigError![]Ser
         for (out.items) |o| if (std.mem.eql(u8, o.name, name)) return error.BadConfig;
         var cfg: ServerConfig = .{ .name = name, .command = "", .secrets = &.{}, .money = &.{} };
         var headers: std.ArrayList(std.http.Header) = .empty;
-        const keys = [_][]const u8{ "command", "secret", "money", "amount", "max_per_call", "max_per_day", "url", "token", "header", "login", "client_id", "scope" };
+        var env_vars: std.ArrayList(EnvVar) = .empty;
+        const keys = [_][]const u8{ "command", "secret", "money", "amount", "max_per_call", "max_per_day", "url", "token", "header", "login", "client_id", "scope", "env" };
         var seen: [keys.len]bool = @splat(false);
         while (i < ls.len and std.mem.eql(u8, ls[i].section, name)) : (i += 1) {
             const l = ls[i];
             const k = for (keys, 0..) |key, n| {
                 if (std.mem.eql(u8, l.key, key)) break n;
             } else return error.BadConfig;
-            // header is said once a line
-            if (seen[k] and k != 8) return error.BadConfig;
+            // header and env are said once a line
+            if (seen[k] and k != 8 and k != 12) return error.BadConfig;
             seen[k] = true;
             // keys of a server at a url, in a program's section (either way round)
             const url_keys = seen[7] or seen[8] or seen[9] or seen[10] or seen[11];
@@ -257,6 +286,7 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) ConfigError![]Ser
                 6 => {
                     if (seen[0]) return error.CommandAndUrl;
                     if (seen[1]) return error.SecretWithUrl;
+                    if (seen[12]) return error.EnvWithUrl;
                     cfg.url = try parseUrl(arena, l.value);
                 },
                 7 => {
@@ -300,6 +330,15 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) ConfigError![]Ser
                     for (names) |n| if (std.mem.indexOfAny(u8, n, " \t") != null) return error.BadConfig;
                     cfg.money = names;
                 },
+                12 => {
+                    if (seen[6]) return error.EnvWithUrl;
+                    const eq = std.mem.indexOfScalar(u8, l.value, '=') orelse return error.BadConfig;
+                    const var_name = std.mem.trim(u8, l.value[0..eq], " \t");
+                    const value = std.mem.trim(u8, l.value[eq + 1 ..], " \t");
+                    if (!validEnv(var_name) or value.len == 0) return error.BadConfig;
+                    if (secretLike(var_name)) return error.SecretEnv;
+                    try env_vars.append(arena, .{ .name = var_name, .value = value });
+                },
                 3 => cfg.amount = try parseAmount(arena, l.value),
                 4 => cfg.max_per_call = try parseCap(l.value),
                 5 => cfg.max_per_day = try parseCap(l.value),
@@ -310,6 +349,7 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) ConfigError![]Ser
         // a client and scopes are a sign-in's
         if ((cfg.client_id.len > 0 or cfg.scope.len > 0) and !cfg.login) return error.SignInOnlyKey;
         cfg.headers = headers.items;
+        cfg.env = env_vars.items;
         // caps are for money tools: without them they are a mistake
         if ((cfg.max_per_call != null or cfg.max_per_day != null) and cfg.money.len == 0) return error.BadConfig;
         // an amount names money tools: without them it is a mistake
@@ -537,6 +577,7 @@ pub const Server = struct {
         if (opts.home.len > 0) try vars.put("HOME", opts.home);
         try vars.put("LANG", "C.UTF-8");
         try vars.put("TERM", "dumb");
+        for (cfg.env) |v| try vars.put(v.name, v.value);
         for (cfg.secrets, opts.secret_values) |sec, val| try vars.put(sec.env, val);
 
         // Windows: in a job before it can start anything (see proc.zig)
@@ -1793,4 +1834,51 @@ test "resources_are_read_and_updates_passed_on" {
     try t.expectEqualStrings("fake://res.txt", ups.buf[0..ups.len]);
     // the stand-in's echo reads a file of its folder
     try t.expectEqualStrings("version one", (try f.call(s, "echo", "{\"text\":\"file:res.txt\"}", 5000)).text);
+}
+
+test "env_lines_give_a_program_plain_values" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const servers = try parseConfig(a, "[a]\ncommand = x\nenv = LOG_LEVEL=info\nenv = REGION = eu=west   ; a comment\n");
+    try t.expectEqual(2, servers[0].env.len);
+    try t.expectEqualStrings("LOG_LEVEL", servers[0].env[0].name);
+    try t.expectEqualStrings("info", servers[0].env[0].value);
+    try t.expectEqualStrings("REGION", servers[0].env[1].name);
+    try t.expectEqualStrings("eu=west", servers[0].env[1].value);
+    // a name that says it holds a secret goes to secret =
+    for ([_][]const u8{ "GITHUB_TOKEN", "api_key", "MY_SECRET", "DB_PASSWORD", "AUTH_HEADER" }) |name| {
+        try t.expectError(error.SecretEnv, parseConfig(a, try std.fmt.allocPrint(a, "[a]\ncommand = x\nenv = {s}=v\n", .{name})));
+    }
+    try t.expect(std.mem.indexOf(u8, configReason(error.SecretEnv).?, "secret =") != null);
+    // a program's, not a server at a url's (either way round)
+    try t.expectError(error.EnvWithUrl, parseConfig(a, "[a]\nurl = https://x.example/mcp\nenv = A=b\n"));
+    try t.expectError(error.EnvWithUrl, parseConfig(a, "[a]\nenv = A=b\nurl = https://x.example/mcp\n"));
+    for ([_][]const u8{ "env = =x", "env = A", "env = 1A=x", "env = A-B=x", "env = A=" }) |line| {
+        try t.expectError(error.BadConfig, parseConfig(a, try std.fmt.allocPrint(a, "[a]\ncommand = x\n{s}\n", .{line})));
+    }
+    // and the program has them
+    var f: Fx = undefined;
+    try f.init();
+    defer f.deinit();
+    const s = try Server.start(t.allocator, t.io, .{ .name = "fake", .command = try std.fmt.allocPrint(f.a(), "\"{s}\" --mcp", .{f.fake}), .secrets = &.{}, .money = &.{}, .env = &.{.{ .name = "FAKE_PLAIN", .value = "eu-west" }} }, .{
+        .cwd = f.ws,
+        .path_var = "/usr/bin:/bin",
+        .home = "/home/tester",
+        .secret_values = &.{},
+        .start_timeout_ms = 10000,
+    });
+    defer s.deinit();
+    const r = try f.call(s, "echo", "{\"text\":\"env:FAKE_PLAIN\"}", 5000);
+    try t.expectEqualStrings("eu-west", r.text);
+}
+
+test "an_env_value_equal_to_a_stored_secret_is_named" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const servers = try parseConfig(a, "[a]\ncommand = x\nenv = LOG_LEVEL=info\nenv = REGION=sk-fixture-stored-0001\n");
+    const stored = [_]@import("scrub.zig").Secret{.{ .name = "github", .value = "sk-fixture-stored-0001" }};
+    try t.expectEqualStrings("REGION", envHoldsSecret(servers[0], &stored).?);
+    try t.expect(envHoldsSecret(servers[0], &.{}) == null);
 }

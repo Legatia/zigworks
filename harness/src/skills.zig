@@ -86,7 +86,8 @@ pub fn readHeader(arena: std.mem.Allocator, text: []const u8) !Header {
             pending = null;
             block = .empty;
         }
-        if (std.mem.eql(u8, line, "---")) {
+        // a closing fence may have spaces after it, as Hermes writes them
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, line, " \t"), "---")) {
             closed = true;
             break;
         }
@@ -482,4 +483,20 @@ test "promptList" {
     try t.expect(cutoff.len <= 120 + 32);
     try t.expect(std.mem.endsWith(u8, cutoff, "\u{2026} and 2 more\n"));
     try t.expect(std.mem.indexOf(u8, cutoff, "- a: one\n") != null);
+}
+
+test "a_closing_fence_with_trailing_spaces_reads" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(t.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // Hermes writes (and reads) a closing `---` with spaces after it
+    try put(&tmp, "s/spaced/SKILL.md", "---\nname: spaced\ndescription: Fence with spaces\n---  \nBody\n");
+    try put(&tmp, "s/crlf/SKILL.md", "---\r\nname: crlf\r\ndescription: Tabbed fence\r\n---\t\r\nBody\r\n");
+    const got = try list(a, t.io, try tmpPath(&tmp, a, "s"));
+    try t.expectEqual(@as(usize, 2), got.len);
+    try t.expectEqualStrings("crlf", got[0].name);
+    try t.expectEqualStrings("spaced", got[1].name);
+    try t.expectEqualStrings("Body\n", try load(a, t.io, try tmpPath(&tmp, a, "s"), "spaced"));
 }

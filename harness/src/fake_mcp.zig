@@ -1,6 +1,6 @@
 //! `harness-fake --mcp`: a small MCP server on stdio for the tests of
 //! mcp.zig. Tools: `echo` (returns `text`; "env" returns FAKE_SECRET and
-//! HOME; "file:NAME" the file NAME of its folder; "notify:URI" sends
+//! HOME; "env:NAME" that variable; "file:NAME" the file NAME of its folder; "notify:URI" sends
 //! notifications/resources/updated for URI first), `fail` (isError),
 //! `sleep` (waits `ms` then answers "slept"). Resources: `fake://NAME` is
 //! the file NAME of its folder; it takes subscriptions.
@@ -651,6 +651,8 @@ fn call(io: Io, a: std.mem.Allocator, v: std.json.Value, env: *const std.process
             const s = try std.fmt.allocPrint(a, "secret={s} home={s} user={s}", .{ env.get("FAKE_SECRET") orelse "", env.get("HOME") orelse "", env.get("USER") orelse "" });
             return textResult(a, s, false);
         }
+        // "env:NAME": that variable's value
+        if (std.mem.startsWith(u8, text, "env:")) return textResult(a, env.get(text["env:".len..]) orelse "", false);
         if (std.mem.eql(u8, text, "pinged")) return textResult(a, if (pinged) "yes" else "no", false);
         if (std.mem.startsWith(u8, text, "file:")) return textResult(a, fileOf(io, a, text["file:".len..]) orelse "no such file", false);
         if (std.mem.startsWith(u8, text, "notify:")) {
