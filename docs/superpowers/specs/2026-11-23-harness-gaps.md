@@ -129,5 +129,12 @@ GitHub cancels macOS jobs that wait about 15 minutes for a runner (most
 pushes lose one or two); they pass when rerun. A paid plan or fewer macOS
 jobs would end it.
 
+Windows runners sometimes drop mid-job ("The hosted runner lost
+communication with the server"): 2 of 5 harness runs on 2026-11-24,
+with no log kept and nothing on githubstatus.com. Linux and macOS passed
+the same code at the same time, and the rerun passed in the usual time
+(Debug 8 min, ReleaseSafe 11). If it keeps happening, look for a Windows
+test that starves the machine.
+
 - ~~calmcp ignores tool fields it doesn't know~~ **done (2026-11-24, carheat)**: a field a tool doesn't take is refused, nothing read or written.
 - ~~**Security (from a review, 2026-11-23): harness's own jobs share the `schedule:NAME` principal with user tasks, briefs and schedules.**~~ **Fixed (2026-11-24)**: harness's own jobs run as `harness:NAME` (`harness:people`, `harness:away`, `harness:trips`, `harness:warm-car`, `harness:habits`, `harness:evening`, `harness:lists`, `harness:reorder`, `harness:deliveries`, `harness:upkeep`), a who kind no settings file produces: rules sections `[harness:NAME]`, nobody to ask in them (as schedules), and only harness's own workflow of that name may name it in its start line. The shipped rules say `[harness:away]`; a task named `away` or `people` gets none of their lines (tests a_task_named_away_gets_none_of_harnesss_away_lines, a_task_named_people_gets_none_of_harnesss_people_lines).
