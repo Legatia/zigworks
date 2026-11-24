@@ -31,6 +31,9 @@ pub fn build(b: *std.Build) void {
     });
     if (target.result.os.tag == .windows) fake_mod.linkSystemLibrary("ws2_32", .{});
     const fake = b.addExecutable(.{ .name = "harness-fake", .root_module = fake_mod });
+    // installed beside harness: the injection demo runs it (release
+    // packages copy harness alone)
+    b.installArtifact(fake);
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
