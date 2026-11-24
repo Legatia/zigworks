@@ -161,8 +161,8 @@ pub const Ctx = struct {
     /// A source the owner listed: the file that lists it (`briefs.ini`,
     /// `triggers.ini`); a read of it is allowed as an allow rule would.
     listed: ?[]const u8 = null,
-    /// The owner switched on money calls in scheduled runs ([money]
-    /// scheduled = on); the caps were checked before the gate.
+    /// An unattended money call agent.zig's moneyCheck found within the
+    /// budget for automation, the caps and the switches.
     money_unattended: bool = false,
     /// Who makes the call; null: main, in a run the owner started.
     who: ?Who = null,
@@ -508,7 +508,7 @@ pub const Gate = struct {
         if (tool == .money) {
             // no grant or allow rule lifts this: the owner is asked every time
             if (!ctx.scheduled) return .{ .action = .ask, .why = "money is asked every time", .subject = subject };
-            if (ctx.money_unattended) return .{ .action = .allow, .why = "money in scheduled runs is switched on, within the caps", .subject = subject };
+            if (ctx.money_unattended) return .{ .action = .allow, .why = "within the budget for automation", .subject = subject };
             return .{ .action = .deny, .why = "money is not moved in scheduled runs", .subject = subject };
         }
         if (tool.setup(arg) and !(tool == .agent_save and ctx.own_helper and !ctx.scheduled)) {
