@@ -25,7 +25,9 @@ Bash), 9–31 as unit tests `injection_NN_…` through Core.
   `mark()`, `outside()`. Calls that ran mark (fetch/browse and allowed
   redirect hops `page HOST`, search, history with tool results, MCP by
   role, `web HOST` in `webAllow`, helpers' marks after `delegate`).
-  `logRun` puts `outside`/`outside_more` on gate lines (`log.Tag`).
+  `logRun` puts `outside`/`outside_more` on gate lines (`log.Tag`), and on
+  turn lines (the first: what the run started with; later: all it read).
+  `Conversation.index` keeps the mark bounded (64 sources).
   `decideAndAskWith` adds the line to the question; `Question.outside` and
   `Skip.outside` carry it. The "not available here" branch now logs
   `deny`, `not offered in this run`; an unknown name logs `no such tool`.
@@ -41,12 +43,17 @@ Bash), 9–31 as unit tests `injection_NN_…` through Core.
   matches a stored answer on the question without its outside line.
 - `telegram.zig`: `Message.forwarded` from `forward_origin` (or the older
   `forward_date`); `main.zig` passes it on.
-- `history.zig`: `Answer.tools`; `build.zig` installs harness-fake.
+- `history.zig`: `Answer.outside` (tool results, or a run that had read
+  outside text); history and `session.zig` label a run's start with
+  `outside.startLabel` ("Forwarded", never "Owner"). `summaries.zig`: the
+  day summariser leaves outside text out. `agent.WfDesk.start` takes the
+  run's mark. A forwarded message is never a command in groups either.
+  `build.zig` installs harness-fake.
 
 **Rulings worth knowing** (all in the plan): marks live on turns, so they
 go with the context on a restart; a server's role comes from setup's
-section names; long memory's summaries carry no mark (a README limit);
-`outside` on a private line is hashed like other fields.
+section names; the day summariser and the memory writer leave outside
+text out; `outside` on a private line is hashed like other fields.
 
 **Skipped on Windows:** `injection_23_a_key_in_encoded_forms_is_masked`
 and `injection_25_a_key_reversed_gets_through_once_allowed` (they use

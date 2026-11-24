@@ -505,9 +505,19 @@ What holds:
 - The memory writer reads only your own words of a marked turn: not the
   agent's replies, not quoted or forwarded mail, not a forwarded message.
   A fact from outside reaches memory only through an asked `remember`.
-- A forwarded Telegram message is someone else's words: never a command.
-- Every call the model makes leaves a log line, one to a tool its run
-  isn't offered too ("not offered in this run").
+  Long memory's day summaries follow the same rule: they leave out what
+  pages, search and other servers answered, and the agent's words in runs
+  that had read outside text. `history` shows a forwarded message or a
+  mail's outside parts as such, never as your words, and a run that
+  had read outside text marks the conversation it is shown in.
+- A forwarded Telegram message is someone else's words: never a command,
+  in your chat or a group.
+- A call the model makes is logged with what came of it: a gate line for
+  each call decided, refused ones included ("not offered in this run" for
+  a tool its run doesn't have, "no such tool" for a name none has), and a
+  tool line for one not run because the reply was cut off or came after
+  the final `send`. A call whose input doesn't read (not JSON, a missing
+  field) or comes after `/stop` is answered without a line.
 
 The demo needs no network and no key: harness-fake plays the model,
 Telegram, the pages and a shop, and the stand-in model makes exactly the
@@ -538,7 +548,7 @@ What the gate can't hold:
 - With `[money] scheduled = on`, unattended runs move money within the
   caps.
 - A file an earlier run saved from a page carries no mark when a later run
-  reads it; nor do long memory's day, week and month summaries.
+  reads it.
 - Workspace writes are allowed; Undo takes them back.
 
 ## Conversations
