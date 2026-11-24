@@ -648,6 +648,12 @@ const Sx = struct {
         return p;
     }
 
+    /// A folder's path as `add` keeps it: the system's own full path (on
+    /// Windows backslashes throughout, where `path` joins `src/deploy` as is).
+    fn real(sx: *Sx, rel: []const u8) []const u8 {
+        return Io.Dir.cwd().realPathFileAlloc(t.io, sx.path(rel), sx.a()) catch unreachable;
+    }
+
     fn installed(sx: *Sx, rel: []const u8) ?[]const u8 {
         return Io.Dir.cwd().readFileAlloc(t.io, std.fs.path.join(sx.a(), &.{ sx.home, "skills", rel }) catch return null, sx.a(), .unlimited) catch null;
     }
@@ -706,7 +712,7 @@ test "add_from_a_folder_shows_then_installs" {
         std.debug.print("missing: {s}\n{s}\n", .{ line, sx.out.items });
         return error.TestUnexpectedResult;
     };
-    try t.expect(sx.said(try std.fmt.allocPrint(sx.a(), "Source: {s}", .{sx.path("src/deploy")})));
+    try t.expect(sx.said(try std.fmt.allocPrint(sx.a(), "Source: {s}", .{sx.real("src/deploy")})));
     // at a terminal, yes installs it
     sx.answer = "y";
     try t.expectEqual(0, try sx.run(&.{ "add", sx.path("src/deploy") }));
@@ -715,7 +721,7 @@ test "add_from_a_folder_shows_then_installs" {
     try t.expect(sx.installed("deploy/.git/config") == null);
     const src = (try sx.sources())[0];
     try t.expectEqualStrings("deploy", src.name);
-    try t.expectEqualStrings(sx.path("src/deploy"), src.source);
+    try t.expectEqualStrings(sx.real("src/deploy"), src.source);
     try t.expectEqualStrings("-", src.pin);
     // a folder of skill folders: all of them, or the one --skill names
     try sx.put("many/one/SKILL.md", "---\nname: one\ndescription: One.\n---\n");
@@ -861,7 +867,7 @@ test "list_shows_each_source" {
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(sx.a(), &.{ dir, "deploy", "SKILL.md" }), .data = "---\nname: deploy\ndescription: Edited.\n---\n" });
     sx.out = .empty;
     try t.expectEqual(0, try sx.run(&.{"list"}));
-    try t.expect(sx.said(try std.fmt.allocPrint(sx.a(), "deploy  {s} (edited since it was installed)", .{sx.path("src/deploy")})));
+    try t.expect(sx.said(try std.fmt.allocPrint(sx.a(), "deploy  {s} (edited since it was installed)", .{sx.real("src/deploy")})));
     try t.expect(sx.said("imported  from Hermes (no source to update from)"));
     try t.expect(sx.said("mine  saved by the agent"));
     sx.out = .empty;
