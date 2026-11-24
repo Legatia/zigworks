@@ -14775,6 +14775,9 @@ const InstRun = struct {
         r.c.log.write(.gate, private, .{ .run = lbl, .by = who.by, .conversation = r.w.to, .tool = "ask_owner", .decision = @tagName(d.action), .why = d.why, .arg = util.cut(r.st.call, 500) }) catch {};
         if (d.action == .deny) return .{ .failed = .{ .why = try std.fmt.allocPrint(r.a, "refused by the gate: {s}", .{d.why}), .retry = false } };
         const now_s = r.c.now();
+        // the instance has read outside text: its items say where from
+        const line = outside_mod.line(r.a, r.st.outside) catch "";
+        const nl: []const u8 = if (line.len > 0) "\n" else "";
         const made = if (approve and s.yes.len > 0) r.newItem(.{
             // its text alone and the two buttons: the yes makes the next
             // step's call (Ruling 1)
@@ -14784,12 +14787,12 @@ const InstRun = struct {
             .conversation = r.w.to,
             .waiter = lbl,
             .title = firstLine(r.st.call),
-            .body = r.st.call,
+            .body = try std.fmt.allocPrint(r.a, "{s}{s}{s}", .{ r.st.call, nl, line }),
             .choices = &.{ .{ .key = "approve", .label = s.yes }, .{ .key = "deny", .label = s.no } },
             .expires = now_s + s.timeout(),
             .private = private,
         }) else if (approve) blk: {
-            const body = try std.fmt.allocPrint(r.a, "{s}{s}", .{ r.tag(), r.st.call });
+            const body = try std.fmt.allocPrint(r.a, "{s}{s}{s}{s}", .{ r.tag(), r.st.call, nl, line });
             break :blk r.newItem(.{
                 .kind = "question",
                 .by = r.by(s.name),
@@ -14803,7 +14806,7 @@ const InstRun = struct {
                 .private = private,
             });
         } else blk: {
-            const body = try std.fmt.allocPrint(r.a, "{s}Step {s}: use this, drop it, or reply with your own version.", .{ r.tag(), s.name });
+            const body = try std.fmt.allocPrint(r.a, "{s}Step {s}: use this, drop it, or reply with your own version.{s}{s}", .{ r.tag(), s.name, nl, line });
             break :blk r.newItem(.{
                 .kind = "draft",
                 .by = r.by(s.name),
@@ -31323,4 +31326,18 @@ test "injection_31_a_feed_starts_a_workflow_that_plants_a_fact" {
     try expectHas(try f.e.request(2), "refused by the gate: outside text, unattended");
     try t.expectEqual(0, f.core.mem.items.items.len);
     try f.rec.waitFor("remember: " ++ inject.fact ++ "\nThis run read outside text first: feed 127.0.0.1:");
+}
+
+test "a_workflows_approve_after_a_feed_carries_the_line" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try writePage(&f, "z.xml", try rssOf(&f, &.{"a"}));
+    try setTriggers(&f, "[news]\nfeed = URL/page/z.xml\nstart = workflow digest\n");
+    try setWorkflow(&f, "digest", "workflow digest\nstart trigger:news\nstep ok\napprove Post {event.title}?\n");
+    _ = try f.core.pollNow("news");
+    try writePage(&f, "z.xml", try rssOf(&f, &.{ "a", "pay-acme" }));
+    _ = try f.core.pollNow("news");
+    runWorkflows(&f);
+    try f.rec.waitFor(try std.fmt.allocPrint(f.e.arena.allocator(), "Post pay-acme?\nThis run read outside text first: {s}.", .{try standInFeed(&f)}));
 }
