@@ -383,7 +383,8 @@ test "the_token_file_sits_beside_the_car_file" {
     var c = try parse(a, "[car]\nbackend = tesla\nvin = V\nclient_id = c\nregion = eu\ncommand_api = https://localhost:4443\ncommand_ca = proxy.pem\n", &d);
     try placeFiles(a, &c, "/etc/carcloud/car.ini");
     try std.testing.expectEqualStrings("/etc/carcloud/car.ini.token", c.token_path);
-    try std.testing.expectEqualStrings("/etc/carcloud/proxy.pem", c.command_ca);
+    // joined with the system's separator (\\ on Windows)
+    try std.testing.expectEqualStrings("/etc/carcloud" ++ std.fs.path.sep_str ++ "proxy.pem", c.command_ca);
     var c2 = try parse(a, "[car]\nbackend = tesla\nvin = V\nclient_id = c\nregion = eu\ntoken = /var/lib/carcloud/tesla.token\n", &d);
     try placeFiles(a, &c2, "/etc/carcloud/car.ini");
     try std.testing.expectEqualStrings("/var/lib/carcloud/tesla.token", c2.token_path);
