@@ -1027,8 +1027,19 @@ test "fetch_and_search_end_when_the_turns_time_is_up" {
     const s = try f.call(.search, "{\"query\":\"zig\"}");
     try t.expect(s_start.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2000);
     try t.expect(s.is_error);
-    // with no time left nothing is sent
-    const before = try f.e.tmp.dir.readFileAlloc(t.io, "page-requests.jsonl", a, .unlimited);
+    // with no time left nothing is sent: what was, once the stand-in has
+    // written both slow requests (it may still be writing the second; on
+    // Windows a read then is a sharing violation)
+    const before = blk: {
+        var waited: u32 = 0;
+        while (waited < 8000) : (waited += 20) {
+            const text = f.e.tmp.dir.readFileAlloc(t.io, "page-requests.jsonl", a, .unlimited) catch "";
+            if (std.mem.count(u8, text, "delay_ms=4000") >= 2) break :blk text;
+            t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        }
+        std.debug.print("the stand-in never recorded both slow requests:\n{s}\n", .{f.e.tmp.dir.readFileAlloc(t.io, "page-requests.jsonl", a, .unlimited) catch ""});
+        return error.TestTimedOut;
+    };
     f.env.deadline_s = util.nowSeconds(t.io) - 1;
     try t.expect((try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/slow.html\"}}", .{base}))).is_error);
     try t.expectEqualStrings(before, try f.e.tmp.dir.readFileAlloc(t.io, "page-requests.jsonl", a, .unlimited));
