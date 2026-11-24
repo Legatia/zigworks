@@ -19,6 +19,8 @@ The owner, 2026-11-24, across one conversation:
 > "There shouldn't be any static moment. At least make him close eyes
 > looping breathing if no tasks."
 
+> "It should be an desktop app, not on web. Skip female for now."
+
 The mockup from this conversation is the reference for look and layout:
 https://claude.ai/artifact/NnXy5J39fEoiQFwsmxavC1 (Desktop app; the female
 version; the states sheet). The clips and stills made for it are in the
@@ -44,15 +46,18 @@ assistant.
 
 ## Goals
 
-1. **The desk is harness's own page:** the app server's shell, which
-   today is the frame around the apps. The other apps stay framed and
-   sandboxed, reachable from it.
+1. **The desk is a desktop app:** `harness-desk`, a small native program
+   per system with its own window, icon, Dock or taskbar entry and badge.
+   It shows harness's own desk pages (the app server's shell) in the
+   system's web view: WKWebView on macOS, WebView2 on Windows, WebKitGTK on
+   Linux. It's not a browser tab. The other apps stay framed and sandboxed,
+   reachable from it.
 2. **A chat that's a harness conversation.** Typing in the desk is the
    owner's turn in `main` or a topic. Replies show in the desk and in
    Telegram.
 3. **The side panel:** Needs you, Topics and Lately.
 4. **The avatar:**
-   - a choice of built-in male or female, or the owner's upload;
+   - a choice of the built-in male or the owner's upload (female later);
    - motion from a clip pack;
    - states from harness's own state, never from the model.
 5. **Speech:** the desk can speak replies; the avatar talks only while the
@@ -64,7 +69,9 @@ assistant.
 - A mobile app. The phone is Telegram; WhatsApp is a separate open
   decision (gaps list).
 - The hosted version, which is set aside.
-- A native GUI toolkit.
+- Drawing the interface natively per system: inside the window it's HTML
+  in the system's web view, as in most desktop apps; no Electron, no
+  bundled browser.
 - Exact lip-sync on every word. That's a later GPU add-on (LiveTalking).
 - Generating avatar clips from inside harness. The owner makes them with
   a tool they have, following the desk's guide.
@@ -96,43 +103,157 @@ desk only**, harness's own page, never for apps:
   `Origin: null`. That's today's rule for `answer` (appserver.zig ~355).
 - **The desk can't be forked,** because it's the shell, not an app.
 
-## Getting in
+## The desktop app and getting in
 
-The app server stays on 127.0.0.1, with its Host and Origin checks.
+`harness-desk` is a small program per system. It links only the system's
+window and web-view libraries:
 
-- **A fixed port.** `harness init` picks a free high port and writes
-  `[apps] port`. Existing installs get one at the next start. With port 0,
-  each start was a new browser origin, so the browser forgot its
-  microphone and autoplay permission every time.
-- **One-time code, then a cookie.**
-  - When harness opens the desk, it makes a one-time code: used once, and
-    valid for 60 s.
-  - It opens the browser at `http://127.0.0.1:PORT/enter?code=…`. The
-    page trades the code for an HttpOnly, SameSite=Strict cookie, then
-    moves to `/desk`.
-  - The cookie is the shell's credential from then on, so no token sits in
-    a URL, in history, or in a file.
-  - A code that's already used, or expired, gets "This link was used.
-    Open the desk again with `harness open`."
-- **Who opens it:**
-  - `harness run` and `harness chat` open the desk at start when
-    `[desk] open = on`, which is the default.
-  - `harness open` asks the running instance to open it. The request file
-    (`state/open-request`) holds no secret. The instance itself opens the
-    browser with a fresh code.
-- **The browser:**
-  - a Chromium-family browser in app mode, `--app=URL`, without an
-    address bar;
-  - the lookup is extended to Edge on macOS and Linux, and Brave
-    (page.zig ~1040);
-  - otherwise the system's default browser (`open`, `xdg-open`, `start`).
-  - When harness launches app mode it adds
-    `--autoplay-policy=no-user-gesture-required` for that window only, so
-    the desk can speak an urgent alert without a click first.
-- **A limit, stated in the README:** a program running as you on this
-  computer could race for a fresh code, or read the browser's cookie.
-  That's the same as for any local app. harness's own commands run
-  sandboxed when unattended, and on the host only with your approval.
+- **macOS:** Cocoa and WebKit. It uses Zig and one Objective-C `.m` file
+  for the WebKit delegates. headsound already builds a `.m` the same way.
+  Minimum macOS 12.
+- **Windows:** WebView2, through `WebView2Loader.dll`. The DLL is loaded at
+  run time. The C interfaces in Microsoft's `WebView2.h` are used from Zig,
+  because the static loader is MSVC-only and releases are built with gnu.
+- **Linux:** GTK 3 and WebKitGTK 4.1.
+
+The harness binary is unchanged: std only, as it builds today. The desk app
+is built natively in each system's release job, and CI gains a desk-app job
+per system. It's a sizeable piece of work: WebView2's COM handlers by hand,
+three systems' start, stop and login mechanics, and packaging. Who builds
+what is below.
+
+**Finding harness:**
+
+- An app opened from the Dock sees neither `PATH` nor `HARNESS_HOME`. It
+  looks in the default data folder, unless `harness open` launched it with
+  `--home DIR`.
+- At each start, harness writes `state/desk.json` there: its binary's
+  path, the port, the data folder and harness's version.
+- Before harness has ever run, the app says: "Set up harness first: run
+  `harness init`."
+
+**Its own pages and the bridge:**
+
+- **Two built-in screens,** shipped in the app because harness may not be
+  running:
+  - "harness isn't running", with [Start harness];
+  - "Connecting…".
+- **The page and the app talk over the web view's message bridge:**
+  `WKScriptMessageHandler`, WebView2's `WebMessageReceived`, and WebKitGTK's
+  `script-message-received`. Messages go one way, from the page to the app:
+  - `{"badge": N}`: the number of items needing you;
+  - `{"attention": "urgent"}`: an urgent item arrived;
+  - `{"reenter": true}`: the session ended (harness restarted), so enter
+    again.
+- **Liveness:** while disconnected, the app checks every 5 s that harness
+  answers on its port (`GET /alive`: no data, just 200). It enters as soon
+  as harness does.
+
+**Getting in (one-time code, a session cookie, nothing reusable on disk):**
+
+1. The app writes `state/open-request`, which holds no secret.
+2. The running harness writes a one-time code to `state/desk-code`. The
+   code is used once and valid for 60 s, and the file sits in the data
+   folder (on Windows, `%LOCALAPPDATA%`'s own ACL).
+3. The app reads and deletes the file, and loads
+   `http://127.0.0.1:PORT/enter?code=…`.
+4. harness answers with a session cookie: HttpOnly, SameSite=Strict, no
+   Expires. harness holds the session in memory only.
+
+The web view uses a non-persistent store (`WKWebsiteDataStore
+nonPersistent`, WebView2 InPrivate, WebKitGTK ephemeral), so nothing
+reusable reaches disk. A restart of harness or of the app re-enters on its
+own through the bridge's `reenter`; you don't notice.
+
+**What the app server learns:**
+
+- routes for `/alive`, `/enter` and `/desk/…`;
+- the Cookie header, and Set-Cookie;
+- POST on the desk paths;
+- a 10 MB body limit for the voice and upload paths only;
+- 20 MB byte-range serving from `avatars/`.
+
+The new owner-acting desk paths answer only to the session cookie:
+
+- sending as the owner;
+- settings;
+- upload;
+- the run view.
+
+**The old `/s/TOKEN/` shell link** keeps exactly what it has today: the
+apps, and answering items through the bar. It gains nothing new. From the
+desk, apps open in `/desk/apps/NAME`, which frames the app's own `/a/…`
+token path as today.
+
+**The web view is configured as an app:**
+
+- no navigation away from `127.0.0.1:PORT`; other links open in the system
+  browser;
+- media plays without a click;
+- the app answers the page's microphone request for this origin only:
+  - macOS: `requestMediaCapturePermissionFor…`, plus
+    `NSMicrophoneUsageDescription` in Info.plist;
+  - Windows: `PermissionRequested`;
+  - Linux: `permission-request`, with `enable-media-stream` on.
+- **macOS Info.plist** also needs `NSAllowsLocalNetworking`. Since macOS
+  14, App Transport Security refuses plain HTTP to IP addresses by default.
+- **Windows:** the web view's data folder is set explicitly, under
+  `%LOCALAPPDATA%\harness\desk-webview`. If the WebView2 Runtime is
+  missing (a few Windows 10 machines), the app says so and links
+  Microsoft's installer. CI's smoke installs the runtime first.
+- **Linux:** MP4 (H.264) needs `gstreamer1.0-libav` and
+  `gstreamer1.0-plugins-bad`. The README and CI install them. WebKitGTK has
+  no speech synthesis, so `speak = browser` isn't offered on Linux; a
+  provider, or off.
+
+**Badge and attention:**
+
+| System | Badge | Urgent attention |
+|---|---|---|
+| macOS | the Dock badge, a real count (`NSDockTile badgeLabel`) | `requestUserAttention` once |
+| Windows | an overlay dot on the taskbar icon (ITaskbarList3), and the count in the window title, "harness (2)" | `FlashWindowEx` once |
+| Linux | the count in the window title | the GTK 3 urgency hint |
+
+There are no system notifications this round, because Telegram already
+rings the phone.
+
+**harness runs on its own, and the app doesn't own it:**
+
+- [Start harness] runs `harness run` detached; it keeps running after the
+  window closes.
+- **Stop** is a new command, `harness stop`. It writes
+  `state/stop-request`, and the running instance exits cleanly on its next
+  tick. That works the same on all three systems, consoles or none.
+- **Open at login** is a new command, `harness autostart on|off`, which
+  starts `harness run` at login:
+  - macOS: a LaunchAgent in `~/Library/LaunchAgents`;
+  - Windows: the HKCU Run key;
+  - Linux: an XDG autostart entry.
+
+  The app's menu calls these commands. The app itself isn't started at
+  login; you open it when you want the window.
+
+**The fixed port.** `harness init` writes `[apps] port`, a free high port;
+existing installs get one at the next start. If it's taken at start,
+harness tries the next ten, writes the one it used back, and says so.
+
+**A limit, stated in the README.** A program running as you on this
+computer could read the code file within its 60 s, or talk to harness the
+way the app does. That's the same as for any local app. harness's own
+commands run sandboxed when unattended, and on the host only with your
+approval.
+
+**Release:**
+
+| System | What ships |
+|---|---|
+| macOS | a `.app` bundle (arm64 and x86_64), ad-hoc signed in CI. Without the owner's Apple developer signing it opens through System Settings › Open Anyway on first run. |
+| Windows | `harness-desk.exe` with `WebView2Loader.dll` beside it. The DLL comes from Microsoft's NuGet package, pinned by version and SHA-256 in CI, and is redistributable. |
+| Linux x86_64 | a dynamically linked binary that needs `libwebkit2gtk-4.1-0` and the GStreamer plugins above |
+
+Linux arm64 is left out this round. Proper signing, with an Apple
+developer account and a Windows certificate, is the owner's decision at
+release.
 
 ## The chat
 
@@ -159,8 +280,8 @@ The app server stays on 127.0.0.1, with its Host and Origin checks.
   `answerItem(…, via .bar)`, the shell's path, keeping the shell's 0.5 s
   click guard.
 - **Voice input:** the mic button shows only when `[voice]` is set.
-  1. It records in the page (MediaRecorder; the fixed port keeps the
-     permission).
+  1. It records in the page (MediaRecorder); the desk app grants the
+     microphone for this origin only.
   2. It posts the audio to a shell path (up to 10 MB, a larger body cap
      for that path only).
   3. harness transcribes it with `Transcriber.transcribe`. The transcript
@@ -272,9 +393,8 @@ nothing is re-encoded.
 
 ### Built-in avatars
 
-- **Packs ship in the release archive** under `avatars/`, not in the
-  binary (about 25 MB for both). `harness init` copies them to the data
-  folder.
+- **The male pack ships in the release archive** under `avatars/`, not in
+  the binary (about 12 MB). `harness init` copies it to the data folder.
 - **The male pack's files** (made 2026-11-24):
 
   | Pack file | Source |
@@ -287,8 +407,9 @@ nothing is re-encoded.
   | `rest` | `neon_suited_man.mp4` |
 
   Still to make: `wake`, `sleep`, `glance`, `smile` and `concern`.
-- **The female pack** has only its still (`Neon Butler Portrait
-  (Female).jpg`, 1920×1088). It needs a 2K still and its clips.
+- **The female avatar is skipped for now** (the owner, 2026-11-24). Only
+  her still exists (`Neon Butler Portrait (Female).jpg`). This round ships
+  the male pack alone.
 - **Shipping** the generated portraits publicly is the owner's call
   before a release, and is noted in the gaps list.
 
@@ -296,7 +417,7 @@ nothing is re-encoded.
 
 The Avatar settings in the desk:
 
-- **Choose** male, female, or one of your own. The choice is written to
+- **Choose** the built-in male, or one of your own (female later). The choice is written to
   `[desk] avatar` through harness's write-then-reload path, as `/persona`
   does.
 - **Upload a photo**, JPEG or PNG, up to 10 MB. The upload requires one
@@ -332,8 +453,8 @@ The Avatar settings in the desk:
   - Quiet hours: urgent alerts only.
 - **Talking motion:** `talk.mp4` from its start, repeated while the voice
   still plays, ending on its last frame. Then back to the state's loop.
-- **A browser opened without app mode** asks for one click per session
-  before it may speak ("Click to let the desk speak").
+- **No click needed:** the desk app's web view is set to play media and
+  speech without one, so an urgent alert is spoken at once.
 - **"Play the message"** replays the last spoken reply.
 
 ## The look
@@ -358,22 +479,32 @@ From the mockup:
 
 ## Constraints
 
-- Zig 0.17.1, std only, on harness's side. The desk is HTML, CSS and
+- Zig 0.17.1, std only, on harness's side, built as today. The desk is HTML, CSS and
   plain JS in the binary, with no build step.
+- **The desk app is the one exception:** it links each system's own window
+  and web-view libraries (Cocoa and WebKit; WebView2 and its loader; GTK
+  and WebKitGTK 4.1). It's built on each system, not cross-built. The CI
+  matrix gains a desk-app job per system.
 - **The app server's rules hold:** loopback only, Host and Origin checks,
   and a CSP with every load on this server. Shell paths refuse
   `Origin: null`.
 - **Names:**
-  - the command is `harness open`;
-  - the page is the desk, at `/desk`;
+  - the app is `harness-desk` ("harness" in the Dock), and `harness open`
+    starts it or brings it to the front;
+  - the page is at `/desk`;
   - code names must not clash with core's `desk`, `appDesk` or `wfDesk`;
   - `desk` joins `apps.reserved`.
 - **Injection rules hold:** outside text is shown, never put in a prompt.
   Desk messages are the owner's words, and avatar files are the owner's.
 - Copy follows CLAUDE.md.
 - **Tests:**
-  - the code-to-cookie entry: a code works once, an expired one is
-    refused, and nothing is written to disk;
+  - the code-to-cookie entry: a code works once and an expired one is
+    refused; the code file is readable only by you and is deleted when it's
+    read or expires; no reusable credential is written to disk;
+  - the desk app on each system: it starts, connects, shows the badge,
+    keeps navigation on 127.0.0.1, and opens other links in the system
+    browser (a smoke run per system in CI where a display exists; on
+    Linux under Xvfb);
   - shell-only paths refuse a framed app;
   - a desk turn goes to the right conversation, with Telegram's echo and
     reply;
@@ -391,17 +522,31 @@ From the mockup:
     generation by API;
   - the ledger and the Windows handoff.
 
+## Who builds what
+
+- The Mac session: harness's side (the shell pages, the API, entry, the run
+  view, serving, speech) and the macOS app.
+- The Windows session: the Windows app (WebView2) and the Linux app
+  (WebKitGTK, tested in WSLg), against the same pages and API.
+
 ## Left to the builder
 
 - The event shapes and API paths, and the desk's JS structure.
-- The browser lookup per system.
+- How each system's app is structured: the Objective-C runtime calls on
+  macOS, the WebView2 COM interfaces on Windows, the GTK and WebKitGTK
+  calls on Linux.
 - How the fixed port is chosen at init, and what happens when it's taken
   at start: try the next one, write it back, and say so.
 
 ## Calls I made (the owner can overrule)
 
-- **The desk is harness's own page** in an app-mode browser window, not
-  an app and not a native GUI.
+- **The desk is a native desktop app per system,** with the system's web
+  view inside: no Electron, no browser tab. harness stays std only; the
+  app links only the system's window and web-view libraries.
+- **The app connects to harness and can start it, but doesn't own it.**
+  Closing the window leaves the butler running.
+- **A badge, plus one bounce or flash for urgent items.** No system
+  notifications this round, because Telegram already rings the phone.
 - **One agent, one set of conversations.** The desk is an extra output,
   and Telegram gets a quiet echo of what you type there.
 - **Entry by a one-time code and a cookie,** with no reusable token in
@@ -411,7 +556,8 @@ From the mockup:
 - **Private conversations' desk history stays in memory only.**
 - **States and the status card come from harness's facts,** never from
   model text.
-- **Built-in packs ship beside the binary.** Speech is off by default.
+- **The built-in male pack ships beside the binary;** female comes later.
+  Speech is off by default.
 - **Uploads work as a still at once.** Full motion comes from a pack you
   make with the guide.
 - **Upload requires the consent line.**

@@ -1140,6 +1140,11 @@ fn shellDef(r: *const Run, a: std.mem.Allocator) !model.ToolDef {
         try d.appendSlice(a, " In a sandbox the workspace is a drive of the sandbox's own (W:\\ unless the machine has one), and its home another: paths inside the workspace work as everywhere.");
         break;
     };
+    // Windows Server: a sandbox can't open NUL
+    if (@import("builtin").os.tag == .windows and !sandbox.nulOpen()) for (list.envs) |e| if (e.kind == .sandbox) {
+        try d.appendSlice(a, " In a sandbox on this Windows nothing can open NUL: don't redirect to nul there (>nul, 2>nul, <nul are refused); leave the output be, or redirect to a file in %TEMP%.");
+        break;
+    };
     try s.appendSlice(a, "},\"required\":[\"command\"]}");
     return .{ .name = "shell", .description = d.items, .schema_json = s.items };
 }

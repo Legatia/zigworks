@@ -565,14 +565,29 @@ Rulings:
   45388410033 failed on. The SHARING_VIOLATION in its trace is a rename
   `util.writeReplace` tried again and got through (a test's error trace
   holds the errors handled on the way).
-- R39. Open: on GitHub's Windows Server 2025 runner (CI run 45400796941)
-  the sandbox had its drives, and a `dir` of the home drive's root from
-  `/env check` still said "Access is denied", while `ren`, `del`, `cd /d`
-  and a `dir` of a folder below it pass there in the sandbox's own test.
-  Not seen on this machine (Windows 11, build 26300). `/env check` now
-  tries a file made, renamed and deleted in the home; the sandbox test
-  prints what a `dir` of each drive's root answers, without requiring
-  it, so the next CI run says more.
+- R39. Closed. What GitHub's Windows Server 2025 runner refused was
+  never `dir`: the probe was `dir /b "%USERPROFILE%" >nul`, and it is
+  NUL a sandbox can't open there. The device's permissions on Windows
+  Server 2025 (build 26100) are `(A;;0x1201bf;;;WD)(A;;FA;;;SY)
+  (A;;FA;;;BA)(A;;0x1200a9;;;RC)`; Windows 11 (build 26300) has two more,
+  `(A;;0x1201bf;;;AC)` and one for S-1-15-2-2: the entries that let app
+  containers in. Found with three runs of a scratch branch
+  (`diag/win-dir`, runs 45482958613, 45484140100, 45485153178): on the runner
+  both drives' roots list, and `>nul`, `2>nul`, `<nul`, `type nul` all say
+  "Access is denied". R38's guess (an empty folder) was wrong too.
+- R40. Harness doesn't change NUL's permissions (Windows' own, an
+  administrator's to change) and doesn't fake the device. It says so:
+  `sandbox.nulOpen` reads the device's permissions once; where they have
+  no entry for app containers the shell tool's description tells the
+  agent not to redirect to nul in a sandbox, and `/env check` has a line
+  that tries it ("NUL (>nul, 2>nul): yes" or no, with why). None of
+  `/env check`'s other probes uses NUL any more (`type FILE >nul` and
+  `curl -o NUL` would have said "no" on Windows Server whatever the
+  environment allowed). Tests: the sandbox test and the `/env check` test
+  both require that what a real `echo x>nul` does is what `nulOpen` says,
+  so they hold on Windows 11 and on the runner.
+  Not checked: a released Windows 11 24H2 (build 26100, the same base as
+  Server 2025); only this machine's Insider build was read.
 
 Measured here: a sandboxed `echo` takes about 35 ms more (142 ms against 109).
 

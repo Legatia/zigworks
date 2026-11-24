@@ -13143,9 +13143,9 @@ pub const Core = struct {
             // can't be used: they ask the drive, which a sandbox may not open)
             .{ .what = if (copy_mode) "its copy of the workspace: read" else "workspace: read", .command = if (win) try std.fmt.allocPrint(a, "if not exist \"{s}/*\" exit 1", .{seen}) else try std.fmt.allocPrint(a, "ls -A {s} >/dev/null", .{try shQuote(a, seen)}), .want = e.workspace != .none },
             .{ .what = if (copy_mode) "its copy of the workspace: write" else "workspace: write", .command = if (win) try std.fmt.allocPrint(a, "echo probe> \"{s}\"", .{check_file}) else try std.fmt.allocPrint(a, ": > {s} && rm {s}", .{ try shQuote(a, check_file), try shQuote(a, check_file) }), .want = e.workspace == .rw or copy_mode },
-            .{ .what = "the data folder: read", .command = if (win) try std.fmt.allocPrint(a, "type \"{s}\" >nul", .{c.paths.config}) else try std.fmt.allocPrint(a, "cat {s} >/dev/null", .{try shQuote(a, c.paths.config)}), .want = false },
+            .{ .what = "the data folder: read", .command = if (win) try std.fmt.allocPrint(a, "type \"{s}\"", .{c.paths.config}) else try std.fmt.allocPrint(a, "cat {s} >/dev/null", .{try shQuote(a, c.paths.config)}), .want = false },
             .{ .what = "your home: read", .command = if (win) try std.fmt.allocPrint(a, "if not exist \"{s}/*\" exit 1", .{c.home_var}) else try std.fmt.allocPrint(a, "ls -A {s} >/dev/null", .{try shQuote(a, c.home_var)}), .want = false },
-            .{ .what = "outside (example.com)", .command = if (win) "curl.exe -s -m 8 -o NUL https://example.com" else "curl -s -m 8 -o /dev/null https://example.com", .want = e.network },
+            .{ .what = "outside (example.com)", .command = if (win) "curl.exe -s -m 8 -I https://example.com" else "curl -s -m 8 -o /dev/null https://example.com", .want = e.network },
         };
         var out: std.ArrayList(u8) = .empty;
         try out.print(a, "{s} ({s}):\n", .{ name, sandbox.backend });
@@ -13168,13 +13168,18 @@ pub const Core = struct {
         if (win) {
             var r = req;
             // (in its home: a file made, renamed and deleted, the commands
-            // that ask the drive. Not a dir of a folder: an empty one is
-            // an error to some Windows, and Windows Server 2025's dir
-            // refused the home drive's root on CI where these worked)
+            // that ask the drive; nothing to NUL, which Windows Server
+            // refuses a sandbox, and no dir of a folder that may be empty)
             r.command = "cd /d \"%USERPROFILE%\" && echo x> harness-env-check.txt && ren harness-env-check.txt harness-env-check2.txt && del harness-env-check2.txt";
             if (sandbox.run(tenv, a, r)) |o| {
                 if (!o.is_error) try out.appendSlice(a, "cmd's own dir, del, ren, copy, move: yes\n") else try out.print(a, "cmd's own dir, del, ren, copy, move: no (they need Windows' Secondary Logon service, which gives the sandbox drive letters of its own; Windows' error the last time it refused: {d}; the try said: {s}. Programs and the agent's file tools work without it)\n", .{ @import("proc.zig").last_session_error.load(.acquire), util.cut(std.mem.trim(u8, o.text, " \r\n"), 200) });
             } else |err| try out.print(a, "cmd's own dir, del, ren, copy, move: not tried ({s})\n", .{@errorName(err)});
+            // NUL: Windows Server gives the device no entry for sandboxes
+            // (none of the probes above uses it, for that reason)
+            r.command = "echo x>nul";
+            if (sandbox.run(tenv, a, r)) |o| {
+                if (!o.is_error) try out.appendSlice(a, "NUL (>nul, 2>nul): yes\n") else try out.appendSlice(a, "NUL (>nul, 2>nul): no (this Windows gives sandboxes no access to it, as Windows Server does; only an administrator could change that. Commands there must leave output be or redirect to a file. The agent is told.)\n");
+            } else |err| try out.print(a, "NUL (>nul, 2>nul): not tried ({s})\n", .{@errorName(err)});
         }
         if (odd == 0) try out.appendSlice(a, "As environments.ini says.") else try out.print(a, "{d} not as environments.ini says (outside: is this machine online?).", .{odd});
         return out.items;
@@ -23642,6 +23647,9 @@ test "env_check_probes_a_sandbox_and_a_copy_environment" {
         for ([_][]const u8{ box, cbox }) |said| {
             if (std.mem.indexOf(u8, said, "cmd's own dir, del, ren, copy, move: yes\n") == null) std.debug.print("/env check said:\n{s}\n", .{said});
             try t.expect(std.mem.indexOf(u8, said, "cmd's own dir, del, ren, copy, move: yes\n") != null);
+            // NUL: as this Windows gives it to sandboxes (Windows Server: not)
+            const nul_line = if (sandbox.nulOpen()) "NUL (>nul, 2>nul): yes\n" else "NUL (>nul, 2>nul): no (";
+            try t.expect(std.mem.indexOf(u8, said, nul_line) != null);
         }
     }
     // nothing of the probes is left in the workspace
