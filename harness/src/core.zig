@@ -68,6 +68,7 @@ const taskfiles = @import("taskfiles.zig");
 const persona_mod = @import("persona.zig");
 const topics_mod = @import("topics.zig");
 const card_mod = @import("card.zig");
+const work_mod = @import("work.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -5003,6 +5004,7 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
             .snaps = &c.snaps,
             .defs = &c.defs,
             .helpers = .{ .ctx = c, .why = Helpers.why, .saved = Helpers.saved },
+            .work = .{ .ctx = c, .post = WorkTopic.post },
             .registry = c.registry(),
             .hush = .{ .ctx = c, .why = hushWhy },
             .envs = .{ .list = c.env_list, .root = c.paths.env_dir, .data_home = c.paths.home, .owner_home = c.home_var },
@@ -12078,6 +12080,7 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
         if (eql(u8, cmd, "/focus")) return Topics.focusCommand(c, a, conv, rest);
         if (eql(u8, cmd, "/card")) return Topics.cardCommand(c, a, conv);
         if (eql(u8, cmd, "/overview")) return Topics.overview(c, a, conv);
+        if (eql(u8, cmd, "/work")) return WorkTopic.command(c, a, conv);
         if (eql(u8, cmd, "/away")) return c.awayCommand(a, rest);
         if (eql(u8, cmd, "/trips")) return c.tripsCommand(a);
         if (eql(u8, cmd, "/member")) return c.memberCommand(a, rest);
@@ -32213,6 +32216,55 @@ test "history_marks_what_it_shows_of_a_forwarded_message" {
     }
 }
 
+/// The Work topic (work.zig): a quiet post per `delegate` call, built from
+/// the log; without topics, `/work` shows the latest.
+const WorkTopic = struct {
+    /// agent.WorkSink.post: filed in Work when topics are in use.
+    fn post(ctx: *anyopaque, a: std.mem.Allocator, d: agent.WorkDone) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        const conv = c.subjectConv(a, "work");
+        if (std.mem.eql(u8, conv, "main")) return;
+        const ch = c.chan orelse return;
+        const p = build(c, a, d.parent, d.helpers, d.conversation, d.private) orelse return;
+        const r = topics_mod.expand(a, p.text, p.entities, .{ .ctx = c, .find = Core.topicTarget }) catch return;
+        const where = c.placeOf(a, conv) catch return;
+        var place = where.place;
+        place.quiet = true;
+        const sent = if (ch.rich) |f| f(ch.ctx, place, r.text, r.entities) else ch.send(ch.ctx, place, r.text);
+        if (sent) |x| {
+            c.touch(conv);
+            c.log.write(.chat, false, .{ .event = "work", .conversation = conv, .parent = d.parent, .helpers = d.helpers.len, .message = x.first }) catch {};
+        } else |e| c.log.write(.chat, false, .{ .event = "work not delivered", .why = whyUndelivered(e) }) catch {};
+    }
+
+    /// The post for helpers `rids` of run `parent`, from the log's last
+    /// 4 MB, masked.
+    fn build(c: *Core, a: std.mem.Allocator, parent: u64, rids: []const u64, conv: []const u8, private: bool) ?work_mod.Post {
+        const text = session.tail(c.io, a, c.paths.log, 4 << 20) catch return null;
+        const masked = c.masks.scrubAlloc(a, text) catch return null;
+        return work_mod.build(a, masked, parent, rids, .{ .conversation = conv, .private = private }) catch null;
+    }
+
+    /// `/work`: the latest delegated run here, its post as plain text.
+    fn command(c: *Core, a: std.mem.Allocator, conv: []const u8) ![]const u8 {
+        const none = "No delegated run here in the log's last 4 MB.";
+        const text = session.tail(c.io, a, c.paths.log, 4 << 20) catch |e| return std.fmt.allocPrint(a, "The log can't be read: {s}", .{@errorName(e)});
+        const all = try session.runs(a, text);
+        var i = all.len;
+        while (i > 0) {
+            i -= 1;
+            const r = all[i];
+            if (r.parent != null or !std.mem.eql(u8, r.conversation, conv)) continue;
+            var kids: std.ArrayList(u64) = .empty;
+            for (all) |k| if (k.parent) |p| if (p == r.rid) try kids.append(a, k.rid);
+            if (kids.items.len == 0) continue;
+            const p = build(c, a, r.rid, kids.items, conv, c.convPrivate(conv)) orelse return none;
+            return work_mod.plain(p);
+        }
+        return none;
+    }
+};
+
 /// Helpers main manages itself (Part 3): what makes a save the owner's to
 /// ask, each save's SHA-256 (state/agents/NAME/saves), and the one quiet
 /// line in Work (or main) with [Remove] or [Undo] (state/helpers).
@@ -33612,4 +33664,51 @@ test "remove_and_undo_buttons_work" {
     // pressed again: nothing more
     f.core.handleCallback(42, made.msg, made.get("remove").?);
     try f.rec.waitFor("That button is out of date");
+}
+
+// ---- the Work topic (Part 3) ----
+
+test "each_delegate_call_posts_once_to_work_silently" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.setBot("harness_test_bot", true);
+    try butlerTopics(&f);
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"look at flat one\"},{\"task\":\"look at flat two\"}]}"));
+    try f.e.script(2, model.textReply("A flat answer <b>ok</b> *star*."));
+    try f.e.script(3, model.textReply("A flat answer <b>ok</b> *star*."));
+    try f.e.script(4, model.toolReply("tu_2", "delegate", "{\"tasks\":[{\"task\":\"check the price\"}]}"));
+    try f.e.script(5, model.textReply("2,900 PLN."));
+    try f.e.script(6, model.textReply("Both flats work."));
+    f.core.chatTurnIn("travel", "Find a flat in Kraków\nwith a balcony");
+    try f.rec.waitIn("travel", "Both flats work.");
+    try f.rec.waitIn("work", "For: Find a flat in Kraków\nAnswer in Travel.");
+    try t.expectEqual(2, f.rec.countIn("work", "For: Find a flat in Kraków"));
+    try t.expect(f.rec.quietOf("For: Find a flat in Kraków").?);
+    try f.rec.waitIn("work", "A flat answer <b>ok</b> *star*.");
+    try f.rec.waitIn("work", "Altogether: 1 helper,");
+    const ents = f.rec.entitiesOf("For: Find a flat in Kraków").?;
+    try expectHas(ents, "expandable_blockquote");
+    try expectHas(ents, "text_link 38+6 https://t.me/harness_test_bot/5002");
+    // nothing of it reached the model
+    try t.expect(std.mem.indexOf(u8, try f.e.request(6), "Altogether") == null);
+}
+
+test "without_topics_work_shows_the_latest" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"compare the two flats\"}]}"));
+    try f.e.script(2, model.textReply("The first is cheaper."));
+    try f.e.script(3, model.textReply("Take the first."));
+    f.core.chatTurn("compare two flats");
+    try f.rec.waitIn("main", "Take the first.");
+    try t.expectEqual(0, f.rec.count("Altogether"));
+    try f.core.handleText("/work");
+    try f.rec.waitIn("main", "For: compare two flats\nAnswer in main.");
+    try f.rec.waitIn("main", "helper: compare the two flats");
+    try f.rec.waitIn("main", "The first is cheaper.");
+    try addTopic(&f, "house-search", 5012);
+    try f.core.handleTextIn("house-search", "/work");
+    try f.rec.waitIn("house-search", "No delegated run here in the log's last 4 MB.");
 }

@@ -565,6 +565,8 @@ pub const Run = struct {
     /// What says whether main may save a helper without asking, and
     /// keeps and tells of each save (core.zig); null: every save asked.
     helpers: ?HelperDesk = null,
+    /// Where a `delegate` call's work is filed (the Work topic); null: nowhere.
+    work: ?WorkSink = null,
     /// The run holds a place of its definition (its `parallel`).
     holds_place: bool = false,
     /// Where a delegated run registers its own stop flag (so `/stop NAME`
@@ -1157,6 +1159,15 @@ const trigger_def: model.ToolDef = .{
 /// What harness reads in a trigger section the agent proposes: its name,
 /// harness's own reading (never the model's) and the section as it will be
 /// written; or why it can't be added, with the line.
+/// A `delegate` call ended: its helpers' runs, for the Work topic (built
+/// from the log by core.zig, never by the model).
+pub const WorkSink = struct {
+    ctx: *anyopaque,
+    post: *const fn (ctx: *anyopaque, a: std.mem.Allocator, d: WorkDone) void,
+};
+
+pub const WorkDone = struct { parent: u64, helpers: []const u64, conversation: []const u8, private: bool };
+
 /// Helpers main manages itself (core.zig's side).
 pub const HelperDesk = struct {
     ctx: *anyopaque,
@@ -4050,6 +4061,8 @@ const Helper = struct {
     failed_buf: [200]u8 = undefined,
     /// The sources of the outside text it read (owned by parent.gpa).
     outside: [][]u8 = &.{},
+    /// Its run's id in the log (0: it never started).
+    rid: u64 = 0,
 };
 
 fn delegate(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
@@ -4069,6 +4082,12 @@ fn delegate(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
         if (threads[i] == null) hs[i].failed = "could not start";
     }
     for (threads) |th| if (th) |x| x.join();
+    // the call's work, filed from the log (the Work topic)
+    if (r.work) |w| {
+        var rids: std.ArrayList(u64) = .empty;
+        for (hs) |h| if (h.rid != 0) try rids.append(a, h.rid);
+        if (rids.items.len > 0) w.post(w.ctx, a, .{ .parent = r.rid, .helpers = rids.items, .conversation = r.conversation, .private = r.isPrivate() });
+    }
 
     var out: std.ArrayList(u8) = .empty;
     for (hs) |*h| {
@@ -4156,6 +4175,7 @@ fn helperRun(h: *Helper) !void {
     w.starter = p;
     w.extra_instructions = "";
     w.helpers = null;
+    w.work = null;
     // a helper's words go to the agent, not to a person: no persona
     w.persona = "";
     w.cache = h.cache;
@@ -4170,6 +4190,7 @@ fn helperRun(h: *Helper) !void {
     defer conv.deinit();
     const res = try turn(&w, &conv, h.task.text, false);
     defer freeResult(&w, res);
+    h.rid = w.rid;
     h.steps = res.steps;
     {
         var arena: std.heap.ArenaAllocator = .init(p.gpa);
