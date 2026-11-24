@@ -169,6 +169,8 @@ pub const New = struct {
     run: ?[]const u8 = null,
     conversation: []const u8 = "main",
     waiter: []const u8 = "harness",
+    /// The app that shows it (gap 8); null: none.
+    app: ?[]const u8 = null,
     title: []const u8,
     body: []const u8,
     choices: []const Choice = &.{},
@@ -313,6 +315,7 @@ pub const Box = struct {
         it.run = try dupeOpt(a, n.run);
         it.conversation = try a.dupe(u8, n.conversation);
         it.waiter = try a.dupe(u8, n.waiter);
+        it.app = try dupeOpt(a, n.app);
         it.title = try a.dupe(u8, util.cut(n.title, max_title));
         it.body = try a.dupe(u8, util.cut(n.body, max_body));
         const choices = try a.alloc(Choice, n.choices.len);

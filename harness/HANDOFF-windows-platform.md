@@ -39,6 +39,19 @@ adds a button to the end of runs (core.zig/agent.zig), so expect small
 conflicts there. As before: your own branches, test-driven, full suite
 and cross builds green, and the owner decides every push.
 
+### Status from the Windows session (2026-11-23, branch `win/apps`)
+
+- Done, tested on Windows and Linux: item 3 (the apps' API, the bar,
+  `app_draft`, `app_save` and the review page, versions and forks).
+  What was built, the rulings (R15 to R29) and what is left:
+  `docs/superpowers/plans/2026-11-22-windows-platform.md`, section 8.
+- `[apps] on` is on by default now: `harness run` and `harness chat` print
+  an "Apps:" line.
+- `inbox.New` has `app`; `agent.Question` has `app`; `[money] apps` and
+  `[apps] act_seconds`, `runs_per_hour` are new settings.
+- Still open from before: cmd's built-ins in a Windows sandbox (section
+  7.4), for the owner to decide.
+
 ### Status from the Windows session (2026-11-23, branch `win/envs`)
 
 - Done, tested on Windows and Linux: the data folder inside a `read =`

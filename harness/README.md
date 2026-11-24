@@ -1758,41 +1758,106 @@ folder above it (who may use it stays the same), and it stays so after
 ## Apps
 
 An app is a folder of web files in `apps/NAME/` with an `app.ini`, which
-harness serves to your browser:
+harness serves to your browser. It reads what its manifest lists and asks
+harness to act; it holds no secret, moves no money and loads nothing from
+another host.
 
 ```ini
 [app]
 name = reading-list      ; its folder: a-z, 0-9 and -
 title = Reading list
+description = Links I saved, with notes.
 reads = files            ; any of memory, inbox, log, files
 files = reading/*        ; workspace paths it may read and act on
-acts = write_file, fetch ; what it may ask harness to do
+acts = write_file, fetch, run:main   ; tools, SERVER/TOOL, run:DEFINITION
+to = main                ; where its questions are asked
 ```
 
-With `[apps] on = on` in config.ini, `harness run` and `harness chat`
-start the app server on 127.0.0.1 and print its link, made new at each
-start (`port = 0` takes a free port; a fixed one lets you reach it over
-`ssh -L`). The page lists the apps; each opens in a frame of harness's
-page that keeps it away from that page, other apps, cookies and storage,
-and whose rules let it load nothing from anywhere but harness. Requests
-under another name for this machine (localhost) or from another site
-are refused. An app's files may be HTML, scripts, styles, JSON, images,
-fonts, text and Markdown, 200 files and 4 MiB at most; an app never names
-another host (copy a library into it instead).
+`harness run` and `harness chat` start the app server on 127.0.0.1 and
+print its link, made new at each start (`[apps] on = off` in config.ini
+switches it off; `port = 0` takes a free port, a fixed one lets you reach
+it over `ssh -L`). The page lists the apps; each opens in a frame of
+harness's page that keeps it away from that page, other apps, cookies
+and storage, and whose rules let it load nothing from anywhere but
+harness. Requests under another name for this machine (localhost) or
+from another site are refused. An app's files may be HTML, scripts,
+styles, JSON, images, fonts, text and Markdown, 200 files and 4 MiB at
+most. A script or an `on...=` handler written into a page never runs:
+scripts go in files of their own.
 
-An app is served only as approved: `/app approve NAME` (or `harness app
-approve NAME`) checks its folder and approves it as its files are now,
-as a new version when they changed. A file changed afterwards, by a
-command or by hand, stops it being served until it is approved again.
-`/apps` lists the apps, whether each is served and why not, with links
-while the server runs; `/app rm NAME` removes one with its data. Inbox,
-log and files are built in.
+**The bar.** Above every app, harness's page shows every open inbox item,
+oldest first, each with its choices and a text box where the item takes
+text. An answer there goes the same way as Telegram's buttons and the
+terminal's keys (the log says `via bar`); the first answer wins and the
+other places are updated. Apps can't reach the bar or press its buttons:
+only the owner answers.
 
-Not here yet: the API through which apps read memory, the inbox, the log
-and files and ask harness to act (each through the gate), the agent
-building apps, versions and forks, and the bar for questions above an
-app. Until then apps can show only their own files, and the built-ins
-say they have nothing to read; so `[apps]` is off by default.
+**What an app can call** (`fetch('api/...')` from its pages; JSON; stored
+secrets masked):
+
+| Call | What |
+|---|---|
+| `GET api/info` | its name, version and manifest |
+| `GET api/memory` | every memory: id, level, pinned, created, body |
+| `GET api/inbox?state=open\|all` | the inbox's items (never their tokens) |
+| `GET api/log?after=SEQ&limit=N&wait=S` | log lines after SEQ, the newest N; `wait` holds up to 25 s for a new line |
+| `GET api/log/runs`, `api/log/session/RID`, `api/log/verify` | as `harness log runs`, `log session` and `log verify` |
+| `GET api/files?path=P` | a folder's entries, a text file up to 1 MiB, or an image |
+| `GET api/data`, `GET\|PUT\|DELETE api/data/KEY` | its own data: 1000 keys of 256 KiB, in `apps/NAME/data/` |
+| `POST api/act {"tool","input"}`, `GET api/act/ID?wait=S` | one tool call; `running`, `asked`, `done` or `refused`, with its output |
+| `POST api/run {"agent","text"}`, `GET api/run/ID?wait=S` | a run of a definition; its answer goes to the app |
+
+A read the manifest does not list is refused before the gate. A listed
+one passes the gate as `app_read NAME memory|inbox|log` (allowed unless
+a rule says otherwise: `deny app_read * log` stops every app reading the
+log); a file passes as `read_file` for `app:NAME`, so file rules and
+folders.ini apply, and only paths in `files` are shown. Reads are logged
+once per page load and subject, refusals every time.
+
+An act runs only when its tool is in `acts` and its path in `files`;
+then it passes the gate exactly as the agent's own call would, started by
+`app:NAME`: the same rules and defaults, the question in the app's `to`
+conversation with `[app:NAME]` in front, and "Allow 24 h" kept for that
+app alone. Two acts at once per app, four in all, each at most `[apps]
+act_seconds` (120); `/stop` ends them. `run:NAME` starts a run of that
+definition, labelled `app NAME`: one per app at a time, `[apps]
+runs_per_hour` (20), and it takes a place among `concurrent_runs`. An
+app's acts never call a money tool, and a run it starts moves money only
+with `[money] apps = on` (off by default).
+
+**How the agent builds one.** In a conversation with you, the agent can
+copy an app into the workspace (`app_draft`, into `app-drafts/NAME/`),
+change it with `write_file`, and ask to install it (`app_save`). Harness
+checks the folder, copies it, and asks you every time (no "Allow 24 h",
+no rule lifts it): the question shows the version, what it reads and may
+do and how that changes, app.ini in full, and each file's size and
+SHA-256, with a link to a review page that shows every file in full and
+the draft running with no reads or acts. What was copied when you were
+asked is what is installed, whatever happens to the draft meanwhile. The
+agent writes `{app:NAME}` in a message and harness puts the link in as
+it is sent, so no link reaches the log or the model.
+
+**Versions and forks.** Every save is a new version, and the last ten
+earlier ones are kept: `harness app versions NAME`, `harness app revert
+NAME N` (version N's files become a new version; the app's data stays).
+`harness app fork NAME NEW` copies an app, a built-in one too, under a
+new name for you or the agent to change. Inbox, log and files are built
+in and change with harness.
+
+An app is served only as approved. A file changed afterwards by a
+command or by hand stops it being served ("changed outside harness" in
+`/apps` and the log) until `/app approve NAME` (or `harness app approve
+NAME`) approves it as its files are now, as a new version. `/apps` lists
+the apps, whether each is served and why not, with links while the
+server runs; `/app rm NAME` removes one with its data and versions.
+
+Limits: the links work only on the machine running harness, until it
+restarts; whoever has a link and reaches that machine's 127.0.0.1 can
+open the apps, and Telegram sees the links it carries. The browser's
+rules for an app don't cover WebRTC or DNS prefetch, so an app could
+leak what it reads that way: install apps you would let read what their
+manifest lists. An app's browser storage lasts one start; its `api/data`
+lasts.
 
 ## Inbox
 
@@ -2206,7 +2271,9 @@ triggers = off` (the default, until you decide): the call is refused,
 naming the setting; with `on` they follow `[money] scheduled` and the caps
 as scheduled runs do. A workflow's agent steps are the same under `[money]
 workflows` (off by default); its tool steps' money calls are asked every
-time in the inbox, whatever `scheduled` says (see Workflows).
+time in the inbox, whatever `scheduled` says (see Workflows). A run an
+app starts is the same under `[money] apps` (off by default), and an
+app's own acts never call a money tool (see Apps).
 
 In mcp.ini, `amount =` and the caps need a `money =` line in the same
 section, a per-tool `amount` names only tools listed there, and `none` is
@@ -2941,7 +3008,7 @@ check|rm NAME`, `/quiet [on|off|HH:MM-HH:MM]`, `/dryrun on|off`,
 `/away [on|until DAY|off|lights NAME…]`, `/trips`, `/inbox`, `/answer ID TEXT`, `/grants`, `/grant rm N`,
 `/agents`, `/agent [NAME]`, `/agent show|rm NAME`, `/ask NAME text`,
 `/triggers`, `/trigger NAME`, `/trigger add|rm|pause|resume|run|test`,
-`/apps`, `/app approve|rm NAME`, `/workflows`, `/workflow NAME|NAME#N`,
+`/apps`, `/app approve|rm|versions NAME`, `/app fork NAME NEW`, `/app revert NAME N`, `/workflows`, `/workflow NAME|NAME#N`,
 `/workflow start|stop|resume|rm`, `/members`, `/member add|rm NAME`,
 `/setup [home|car|calendar|mail|routines|upkeep|reorder|butler]`, `/med add|rm|tell`, `/meds`,
 `/bedtime [HH:MM|off]`, `/evening [HH:MM|off|now]`, `/help`. `/new`, `/private` and `/agent`
@@ -2954,7 +3021,7 @@ CLI: `init [--butler]`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`
 `memory [list|pin|unpin|forget ID]`, `people list|show|import`,
 `snapshot list|take|changes|restore`, `undo RUN`, `env list|check|rm|key`,
 `agent list|show|rm`, `mcp list|login|logout`, `log verify|tail|runs|session|search`, `inbox [--json]`,
-`app list|approve|rm`,
+`app list|approve|rm|fork|versions|revert`,
 `health`, `doctor`, `report`, `version`. `--home DIR` may come anywhere on
 the line; arguments a command does not take are refused. `health` exits 0
 only while `harness run` holds the folder and has ticked in the last 90 s;

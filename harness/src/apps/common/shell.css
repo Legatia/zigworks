@@ -39,3 +39,18 @@ main li { padding: 6px 0; }
 main small { color: var(--muted); margin-left: 6px; }
 main a { color: var(--accent); }
 iframe { flex: 1; width: 100%; border: 0; }
+#bar { border-bottom: 1px solid var(--line); max-height: 45vh; overflow: auto; }
+#bar:empty { display: none; }
+#bar .note { margin: 0; padding: 6px 16px; color: var(--muted); }
+#bar .item { padding: 8px 16px; border-top: 1px solid var(--line); }
+#bar .item:first-child { border-top: 0; }
+#bar .head { display: flex; gap: 10px; color: var(--muted); font-size: 13px; }
+#bar .title { font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
+#bar pre { margin: 6px 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.4 ui-monospace, Consolas, monospace; }
+#bar .choices { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+#bar button { font: inherit; padding: 3px 12px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: var(--fg); cursor: pointer; }
+#bar input { font: inherit; flex: 1; min-width: 160px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: var(--fg); }
+main.review { overflow: auto; flex: 1; display: flex; flex-direction: column; }
+main.review h2 { font-size: 15px; margin: 18px 0 6px; }
+main.review pre { margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.4 ui-monospace, Consolas, monospace; }
+main.review iframe { min-height: 480px; border: 1px solid var(--line); border-radius: 4px; }

@@ -32,3 +32,16 @@ ul.list li:first-child { border-top: 0; }
 code, pre { font: 13px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 a { color: var(--accent); }
+h2 { font-size: 14px; margin: 14px 0 4px; color: var(--muted); font-weight: 600; }
+ul.list.short { max-height: 30vh; overflow: auto; margin-bottom: 16px; }
+ul.list li.bad > div:first-child { color: #b3261e; }
+ul.list li.wanted { border-left: 3px solid var(--accent); padding-left: 8px; }
+.title { font-weight: 600; overflow-wrap: anywhere; }
+pre.draft { border-left: 3px solid var(--line); padding-left: 8px; }
+p.tools { display: flex; gap: 8px; }
+input[type="search"] { flex: 1; font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: var(--fg); }
+button { font: inherit; padding: 3px 12px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: var(--fg); cursor: pointer; }
+.text { font: 13px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.text .line { display: flex; gap: 12px; }
+.text .no { color: var(--muted); min-width: 3em; text-align: right; user-select: none; flex: none; }
+img { max-width: 100%; }

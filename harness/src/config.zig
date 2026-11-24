@@ -114,13 +114,19 @@ pub const Config = struct {
         /// money (off: the owner has not decided yet); a tool step's money
         /// call is asked every time either way.
         workflows: bool = false,
+        /// Runs an app starts follow `scheduled` (on) or never move money
+        /// (off: the owner has not decided yet); an app's own acts never.
+        apps: bool = false,
     };
     /// The app server (gap 8): apps shown in your browser.
     pub const Apps = struct {
-        /// Off until the apps' API is in: before it, apps read nothing.
-        on: bool = false,
+        on: bool = true,
         /// 0: a free one each start; a fixed one to reach it over ssh -L.
         port: u32 = 0,
+        /// How long one act an app asks for may take, its question included.
+        act_seconds: u32 = 120,
+        /// Runs an app may start in an hour.
+        runs_per_hour: u32 = 20,
     };
     /// What waits for the owner (state/inbox).
     pub const Inbox = struct {
@@ -803,10 +809,13 @@ pub const defaults_ini =
     \\scheduled = off                     ; on: scheduled runs may move money, within the caps
     \\triggers = off                      ; on: runs a trigger starts move money as scheduled = says; off: never
     \\workflows = off                     ; on: agent steps of workflows move money as scheduled = says; off: never (tool steps are asked every time)
+    \\apps = off                          ; on: runs an app starts move money as scheduled = says; off: never (an app's own acts never do)
     \\
     \\[apps]                              ; apps in your browser, on this machine only
-    \\on = off
+    \\on = on
     \\port = 0                            ; 0 = a free one each start
+    \\act_seconds = 120                   ; the longest one act an app asks for may take
+    \\runs_per_hour = 20                  ; runs an app may start in an hour
     \\
     \\[inbox]                             ; what waits for you (/inbox)
     \\questions = 20                      ; questions and approvals waiting at once
@@ -871,8 +880,9 @@ pub const rules_example =
     \\# trigger add (a trigger the agent proposes) and workflow save (a
     \\# workflow it proposes) are asked every time, whatever the rules; a deny
     \\# rule stops them; trigger rm, workflow start and workflow stop ask.
-    \\# Not used yet (their tools come later): mail asks; app_save and
-    \\# env_save are asked every time.
+    \\# app_save (an app the agent built) and env_save (an environment it
+    \\# proposes) are asked every time, whatever the rules; a deny rule stops
+    \\# them. Not used yet (its tool comes later): mail asks.
     \\# A line [agent:NAME], [owner], [schedule:NAME], [trigger:NAME] or
     \\# [workflow:NAME] starts rules for those calls only (a workflow's tool
     \\# steps are [workflow:NAME]'s, not a definition's); [all] goes back to
