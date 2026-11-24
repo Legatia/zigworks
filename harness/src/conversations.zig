@@ -43,8 +43,22 @@ pub const Entry = struct {
     /// The definition that answers here (`/agent NAME`): `main` unless the
     /// owner picked another; in the file only then.
     agent: []u8,
+    /// A topic's title as Telegram shows it ("Mail and diary"); "": its name.
+    title: []u8 = &.{},
+    /// What the topic is about (the owner's or setup's words, put in its
+    /// turns' context); "": nothing said.
+    focus: []u8 = &.{},
+    /// The butler's subject it files (topics.zig); "": none.
+    subject: []u8 = &.{},
+    /// Its pinned card's message; 0: none.
+    card: i64 = 0,
 
     // in memory only
+
+    /// When its card was last edited (at most once a minute).
+    card_s: i64 = 0,
+    /// Its subject's state changed since: the card is edited when it may be.
+    card_due: bool = false,
 
     /// Telegram refused its topic: its posts go to main with its name in
     /// front; `told` once the owner heard why.
@@ -93,6 +107,10 @@ pub const New = struct {
     private: bool = false,
     created: i64 = 0,
     agent: []const u8 = "main",
+    title: []const u8 = "",
+    focus: []const u8 = "",
+    subject: []const u8 = "",
+    card: i64 = 0,
 };
 
 pub const Error = error{
@@ -131,6 +149,9 @@ pub const List = struct {
     fn free(l: *List, e: *Entry) void {
         l.gpa.free(e.name);
         l.gpa.free(e.agent);
+        l.gpa.free(e.title);
+        l.gpa.free(e.focus);
+        l.gpa.free(e.subject);
         for (e.dropped.items) |d| l.gpa.free(d.agent);
         e.dropped.deinit(l.gpa);
         e.posts.deinit(l.gpa);
@@ -144,7 +165,13 @@ pub const List = struct {
         errdefer l.gpa.free(name);
         const agent = try l.gpa.dupe(u8, n.agent);
         errdefer l.gpa.free(agent);
-        e.* = .{ .name = name, .channel = n.channel, .chat = n.chat, .thread = n.thread, .audience = n.audience, .private = .init(n.private), .created = n.created, .agent = agent };
+        const title = try l.gpa.dupe(u8, n.title);
+        errdefer l.gpa.free(title);
+        const focus = try l.gpa.dupe(u8, n.focus);
+        errdefer l.gpa.free(focus);
+        const subject = try l.gpa.dupe(u8, n.subject);
+        errdefer l.gpa.free(subject);
+        e.* = .{ .name = name, .channel = n.channel, .chat = n.chat, .thread = n.thread, .audience = n.audience, .private = .init(n.private), .created = n.created, .agent = agent, .title = title, .focus = focus, .subject = subject, .card = n.card };
         try l.items.append(l.gpa, e);
         return e;
     }
@@ -179,6 +206,10 @@ pub const List = struct {
                 .created = util.parseIso(jv.str(jv.get(v, "created")) orelse "") orelse 0,
                 // a name that is no definition's: main answers
                 .agent = if (jv.str(jv.get(v, "agent"))) |ag| (if (agents.validName(ag)) ag else "main") else "main",
+                .title = jv.str(jv.get(v, "title")) orelse "",
+                .focus = jv.str(jv.get(v, "focus")) orelse "",
+                .subject = jv.str(jv.get(v, "subject")) orelse "",
+                .card = jv.int(jv.get(v, "card")) orelse 0,
             });
         }
     }
@@ -202,6 +233,12 @@ pub const List = struct {
                 try out.appendSlice(l.gpa, ",\"agent\":");
                 try util.jsonString(&out, l.gpa, e.agent);
             }
+            // a topic's: only where set, so older lines stay as they were
+            inline for (.{ "title", "focus", "subject" }) |field| if (@field(e, field).len > 0) {
+                try out.appendSlice(l.gpa, ",\"" ++ field ++ "\":");
+                try util.jsonString(&out, l.gpa, @field(e, field));
+            };
+            if (e.card != 0) try out.print(l.gpa, ",\"card\":{d}", .{e.card});
             try out.appendSlice(l.gpa, "}\n");
         }
         try util.writeReplace(l.io, l.path, out.items);
@@ -366,6 +403,49 @@ pub const List = struct {
         return name;
     }
 
+    /// The topic that files `subject`.
+    pub fn bySubject(l: *const List, subject: []const u8) ?*Entry {
+        if (subject.len == 0) return null;
+        for (l.items.items) |e| if (std.mem.eql(u8, e.subject, subject)) return e;
+        return null;
+    }
+
+    /// A topic's title, focus and subject, written before they apply.
+    pub fn setTopic(l: *List, name: []const u8, title: []const u8, focus: []const u8, subject: []const u8) !void {
+        const e = l.find(name) orelse return error.NotFound;
+        const nt = try l.gpa.dupe(u8, title);
+        errdefer l.gpa.free(nt);
+        const nf = try l.gpa.dupe(u8, focus);
+        errdefer l.gpa.free(nf);
+        const ns = try l.gpa.dupe(u8, subject);
+        errdefer l.gpa.free(ns);
+        const before = .{ e.title, e.focus, e.subject };
+        e.title, e.focus, e.subject = .{ nt, nf, ns };
+        l.save() catch |err| {
+            e.title, e.focus, e.subject = before;
+            return err;
+        };
+        l.gpa.free(before[0]);
+        l.gpa.free(before[1]);
+        l.gpa.free(before[2]);
+    }
+
+    pub fn setFocus(l: *List, name: []const u8, focus: []const u8) !void {
+        const e = l.find(name) orelse return error.NotFound;
+        return l.setTopic(name, e.title, focus, e.subject);
+    }
+
+    /// Its card's message (0: none).
+    pub fn setCard(l: *List, name: []const u8, id: i64) !void {
+        const e = l.find(name) orelse return error.NotFound;
+        const before = e.card;
+        e.card = id;
+        l.save() catch |err| {
+            e.card = before;
+            return err;
+        };
+    }
+
     /// Every conversation's name, in the list's order (in `a`).
     pub fn names(l: *const List, a: std.mem.Allocator) ![]const []const u8 {
         const out = try a.alloc([]const u8, l.items.items.len);
@@ -525,4 +605,35 @@ test "each_conversation_keeps_its_agent" {
     try again.setDropped(e, "researcher", 5);
     try t.expectEqual(5, e.droppedOf("researcher"));
     try t.expectEqual(0, e.droppedOf("main"));
+}
+
+test "topic_fields_are_kept_and_old_files_read" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var l = try tmpList(&tmp, a);
+    defer l.deinit();
+    const t0 = util.parseIso("2026-11-24T09:00:00Z").?;
+    _ = try l.add(.{ .name = "main", .chat = 42, .created = t0 });
+    _ = try l.add(.{ .name = "travel", .chat = 42, .thread = 5003, .created = t0, .title = "Travel", .focus = "trips, flights, check-in, packing.", .subject = "travel" });
+    try l.setCard("travel", 777);
+    try l.setFocus("travel", "trips and flights.");
+    const text = try tmp.dir.readFileAlloc(t.io, "conversations", a, .unlimited);
+    // an old line stays as it was; the new fields only where set
+    try t.expect(std.mem.startsWith(u8, text, "{\"name\":\"main\",\"channel\":\"telegram\",\"chat\":42,\"thread\":0,\"audience\":\"own\",\"private\":false,\"created\":\"2026-11-24T09:00:00Z\"}\n"));
+    try t.expect(std.mem.indexOf(u8, text, ",\"title\":\"Travel\",\"focus\":\"trips and flights.\",\"subject\":\"travel\",\"card\":777}") != null);
+    var again: List = .init(t.allocator, t.io, l.path);
+    defer again.deinit();
+    try again.load();
+    const tr = again.bySubject("travel").?;
+    try t.expectEqualStrings("travel", tr.name);
+    try t.expectEqualStrings("Travel", tr.title);
+    try t.expectEqualStrings("trips and flights.", tr.focus);
+    try t.expectEqual(777, tr.card);
+    try t.expectEqual(null, again.bySubject("house"));
+    try t.expectEqualStrings("", again.find("main").?.title);
+    try again.setTopic("main", "", "", "");
+    try t.expectEqualStrings("", again.find("main").?.subject);
 }

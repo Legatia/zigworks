@@ -995,7 +995,63 @@ const TgChan = struct {
     }
 
     fn channel(tc: *TgChan) core_mod.Channel {
-        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic, .file = file };
+        return .{ .ctx = tc, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic, .file = file, .rich = rich, .buttons_rich = buttonsRich, .replace = replace, .pin = pin, .topics = topics, .me = me };
+    }
+
+    /// `send` with message entities (topic links, folded quotes).
+    fn rich(ctx: *anyopaque, place: core_mod.Place, text: []const u8, ents: []const telegram.Entity) anyerror!core_mod.Sent {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return error.NotPaired;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        const sent = tc.send_bot.sendRich(place.chat, place.thread, text, ents, .{ .quiet = place.quiet }) catch |e| {
+            complain("telegram: sending failed: {s}", .{@errorName(e)});
+            return if (e == error.TelegramRefused and place.thread != 0) error.TopicRefused else e;
+        };
+        return .{ .first = sent.first, .count = sent.count };
+    }
+
+    fn buttonsRich(ctx: *anyopaque, place: core_mod.Place, text: []const u8, ents: []const telegram.Entity, bs: []const [2][]const u8) ?i64 {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return null;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return tc.send_bot.sendButtonsRich(place.chat, place.thread, text, ents, bs, .{ .quiet = place.quiet }) catch null;
+    }
+
+    /// A card's new text; error.MessageGone when Telegram no longer has it.
+    fn replace(ctx: *anyopaque, place: core_mod.Place, id: i64, text: []const u8, ents: []const telegram.Entity) anyerror!void {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return error.NotPaired;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return tc.send_bot.editRich(place.chat, id, text, ents);
+    }
+
+    fn pin(ctx: *anyopaque, place: core_mod.Place, id: i64) anyerror!void {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        if (place.chat == 0) return error.NotPaired;
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return tc.send_bot.pin(place.chat, id);
+    }
+
+    /// Topics in private chats on (setMySettings).
+    fn topics(ctx: *anyopaque, on: bool) anyerror!void {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return tc.send_bot.setTopics(on);
+    }
+
+    /// Whether topics in private chats are on now (getMe).
+    fn me(ctx: *anyopaque) anyerror!bool {
+        const tc: *TgChan = @ptrCast(@alignCast(ctx));
+        var arena: std.heap.ArenaAllocator = .init(tc.gpa);
+        defer arena.deinit();
+        tc.mutex.lockUncancelable(tc.io);
+        defer tc.mutex.unlock(tc.io);
+        return (try tc.send_bot.getMe(arena.allocator())).topics;
     }
 
     /// A file a message carried (a voice note): getFile, then the file,
@@ -2806,6 +2862,7 @@ test {
     _ = @import("skills.zig");
     _ = @import("agents.zig");
     _ = @import("persona.zig");
+    _ = @import("topics.zig");
     _ = @import("mcp.zig");
     _ = @import("mcp_http.zig");
     _ = @import("oauth.zig");

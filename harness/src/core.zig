@@ -66,6 +66,7 @@ const away_mod = @import("away.zig");
 const trips_mod = @import("trips.zig");
 const taskfiles = @import("taskfiles.zig");
 const persona_mod = @import("persona.zig");
+const topics_mod = @import("topics.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -256,6 +257,21 @@ pub const Channel = struct {
     /// most `max` (error.TooLarge past it), in `a`. Null where messages
     /// carry no files (the terminal).
     file: ?*const fn (ctx: *anyopaque, a: std.mem.Allocator, file_id: []const u8, max: usize) anyerror![]u8 = null,
+    /// Sends `text` with message entities (links, folded quotes; byte
+    /// offsets); null where there are none (the terminal): `send` then.
+    rich: ?*const fn (ctx: *anyopaque, place: Place, text: []const u8, entities: []const topics_mod.Entity) anyerror!Sent = null,
+    /// `buttons` with entities.
+    buttons_rich: ?*const fn (ctx: *anyopaque, place: Place, text: []const u8, entities: []const topics_mod.Entity, buttons: []const [2][]const u8) ?i64 = null,
+    /// Replaces message `id`'s text (a card), saying when it is gone
+    /// (error.MessageGone); null where messages can't be changed.
+    replace: ?*const fn (ctx: *anyopaque, place: Place, id: i64, text: []const u8, entities: []const topics_mod.Entity) anyerror!void = null,
+    /// Pins message `id` (a card) without a sound; null: no pins.
+    pin: ?*const fn (ctx: *anyopaque, place: Place, id: i64) anyerror!void = null,
+    /// Switches topics in private chats on for the bot (setMySettings);
+    /// null where there are no topics.
+    topics: ?*const fn (ctx: *anyopaque, on: bool) anyerror!void = null,
+    /// Whether topics in private chats are on for the bot now (getMe).
+    me: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
 };
 
 /// A Telegram message, with where it came from.
@@ -1521,7 +1537,7 @@ pub const Core = struct {
             const msg = c.fillLinks(a, if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text }) else text);
             var place = r.place;
             place.quiet = quiet;
-            if (ch.send(ch.ctx, place, msg)) |sent| return sent else |e| {
+            if (c.sendLinked(ch, a, place, msg)) |sent| return sent else |e| {
                 if (e == error.TopicRefused and !again) {
                     again = true;
                     c.topicRefused(conv);
@@ -1549,6 +1565,42 @@ pub const Core = struct {
         if (!tell) return;
         var buf: [256]u8 = undefined;
         c.say(std.fmt.bufPrint(&buf, "Telegram refused the topic of {s}, so its posts come here with [{s}] in front.", .{ conv, conv }) catch "Telegram refused a topic; its posts come here.");
+    }
+
+    /// `text` with each `{topic:NAME}` its topic's title, linked where the
+    /// topic is a Telegram topic of the owner's chat (topics.zig).
+    fn linked(c: *Core, a: std.mem.Allocator, text: []const u8) topics_mod.Rich {
+        if (std.mem.indexOf(u8, text, "{topic:") == null) return .{ .text = text, .entities = &.{} };
+        return topics_mod.expand(a, text, &.{}, .{ .ctx = c, .find = topicTarget }) catch .{ .text = text, .entities = &.{} };
+    }
+
+    /// A token's topic: its title and link; a subject with no topic yet,
+    /// its title alone; null: no such topic (the token stays).
+    fn topicTarget(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) ?topics_mod.Target {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        if (c.convs.find(name)) |e| if (e.channel == .telegram and e.audience == .own) {
+            const title = a.dupe(u8, if (e.title.len > 0) e.title else e.name) catch return null;
+            if (e.thread == 0 or e.refused or c.bot_name_len == 0) return .{ .title = title };
+            return .{ .title = title, .url = topics_mod.link(a, c.bot_name_buf[0..c.bot_name_len], e.thread) catch "" };
+        };
+        const s = std.meta.stringToEnum(topics_mod.Subject, name) orelse return null;
+        return .{ .title = topics_mod.title(s) };
+    }
+
+    /// Sends `text` to `place`, its topic tokens as links where the channel
+    /// sends entities.
+    fn sendLinked(c: *Core, ch: Channel, a: std.mem.Allocator, place: Place, text: []const u8) anyerror!Sent {
+        const r = c.linked(a, text);
+        if (r.entities.len > 0) if (ch.rich) |f| return f(ch.ctx, place, r.text, r.entities);
+        return ch.send(ch.ctx, place, r.text);
+    }
+
+    fn buttonsLinked(c: *Core, ch: Channel, a: std.mem.Allocator, place: Place, text: []const u8, bs: []const [2][]const u8) ?i64 {
+        const r = c.linked(a, text);
+        if (r.entities.len > 0) if (ch.buttons_rich) |f| return f(ch.ctx, place, r.text, r.entities, bs);
+        return ch.buttons(ch.ctx, place, r.text, bs);
     }
 
     /// Notes that a message came from `conv` or a post went to it.
@@ -3470,11 +3522,11 @@ pub const Core = struct {
         const parts = try questionParts(a, text);
         var sent: Sent = .{};
         for (parts[0 .. parts.len - 1]) |part| {
-            const s = try ch.send(ch.ctx, r.place, part);
+            const s = try c.sendLinked(ch, a, r.place, part);
             if (sent.count == 0) sent.first = s.first;
             sent.count += s.count;
         }
-        const id = ch.buttons(ch.ctx, r.place, parts[parts.len - 1], bs) orelse return error.ButtonsNotSent;
+        const id = c.buttonsLinked(ch, a, r.place, parts[parts.len - 1], bs) orelse return error.ButtonsNotSent;
         if (labels.len > 0) c.quickShown(n, id, r.place);
         if (sent.count == 0) sent.first = id;
         sent.count += 1;
@@ -3917,15 +3969,15 @@ pub const Core = struct {
         place.quiet = quiet;
         const prefix = if (where.prefix) |p| std.fmt.allocPrint(a, "[{s}] ", .{p}) catch "" else "";
         for (parts[0 .. parts.len - 1]) |part| {
-            _ = ch.send(ch.ctx, place, c.fillLinks(a, std.fmt.allocPrint(a, "{s}{s}", .{ prefix, part }) catch part)) catch return c.notShown(id);
+            _ = c.sendLinked(ch, a, place, c.fillLinks(a, std.fmt.allocPrint(a, "{s}{s}", .{ prefix, part }) catch part)) catch return c.notShown(id);
         }
         const last = c.fillLinks(a, std.fmt.allocPrint(a, "{s}{s}", .{ prefix, parts[parts.len - 1] }) catch parts[parts.len - 1]);
         // a question answered in words only has no buttons: its message is
         // the one a reply answers
         const msg = if (bs.len == 0)
-            (ch.send(ch.ctx, place, last) catch return c.notShown(id)).first
+            (c.sendLinked(ch, a, place, last) catch return c.notShown(id)).first
         else
-            ch.buttons(ch.ctx, place, last, bs) orelse return c.notShown(id);
+            c.buttonsLinked(ch, a, place, last, bs) orelse return c.notShown(id);
         // noted; a press that came meanwhile counts only from this message
         var early_take: ?[]const u8 = null;
         var early_elsewhere: ?i64 = null;
@@ -5666,9 +5718,11 @@ pub const Core = struct {
         c.convs.mutex.lockUncancelable(c.io);
         defer c.convs.mutex.unlock(c.io);
         var out: std.ArrayList(u8) = .empty;
-        if (c.convs.find(conv)) |e|
-            try out.print(a, "Conversation: {s} ({s}).", .{ conv, e.where() })
-        else
+        if (c.convs.find(conv)) |e| {
+            try out.print(a, "Conversation: {s} ({s}).", .{ conv, e.where() });
+            // the owner's or setup's words on what the topic is about
+            if (e.focus.len > 0) try out.print(a, " You're in the {s} topic: {s}{s}", .{ if (e.title.len > 0) e.title else e.name, e.focus, if (std.mem.endsWith(u8, e.focus, ".")) "" else "." });
+        } else
             try out.print(a, "Conversation: {s} (a Telegram topic opened at the first post).", .{conv});
         var others: usize = 0;
         for (c.convs.items.items) |e| {
@@ -11796,6 +11850,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/bedtime")) return Bedtime.command(c, a, rest);
         if (eql(u8, cmd, "/evening")) return Evening.command(c, a, rest);
         if (eql(u8, cmd, "/persona")) return Persona.command(c, a, conv, rest);
+        if (eql(u8, cmd, "/focus")) return Topics.focusCommand(c, a, conv, rest);
         if (eql(u8, cmd, "/away")) return c.awayCommand(a, rest);
         if (eql(u8, cmd, "/trips")) return c.tripsCommand(a);
         if (eql(u8, cmd, "/member")) return c.memberCommand(a, rest);
@@ -15638,6 +15693,14 @@ const Recorder = struct {
     next_text: i64 = 100_000,
     /// The thread the next topic opened gets, less one.
     next_thread: i64 = 5000,
+    /// Each rich line's entities ("KIND OFFSET+LEN URL; …").
+    ents: std.ArrayList(Ent) = .empty,
+    /// Messages Telegram no longer has: an edit of one fails.
+    gone: std.ArrayList(i64) = .empty,
+    /// Topics in private chats on for the bot (getMe), and while set,
+    /// setMySettings fails.
+    topics_now: bool = true,
+    settings_fail: bool = false,
     /// While set, Telegram opens no topic.
     topics_fail: bool = false,
     /// While set, a send to a topic is refused (Telegram lost the topic).
@@ -15663,6 +15726,8 @@ const Recorder = struct {
     audio: []const u8 = "OggS-test-audio",
     fetched: usize = 0,
     file_fail: ?anyerror = null,
+
+    const Ent = struct { line: usize, desc: []u8 };
 
     const Early = struct { ctx: *anyopaque, press: *const fn (ctx: *anyopaque, b: *const Buttons) void };
 
@@ -15694,10 +15759,75 @@ const Recorder = struct {
         r.where.deinit(t.allocator);
         r.cleared.deinit(t.allocator);
         r.asked.deinit(t.allocator);
+        for (r.ents.items) |e| t.allocator.free(e.desc);
+        r.ents.deinit(t.allocator);
+        r.gone.deinit(t.allocator);
     }
 
     fn channel(r: *Recorder) Channel {
-        return .{ .ctx = r, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic, .file = file };
+        return .{ .ctx = r, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .send_to = sendTo, .document = document, .open_topic = openTopic, .file = file, .rich = rich, .buttons_rich = buttonsRich, .replace = replace, .pin = pinIt, .topics = setTopics, .me = me };
+    }
+
+    /// Notes the entities of the last line recorded (under the mutex).
+    fn noteEnts(r: *Recorder, text: []const u8, ents: []const topics_mod.Entity) !void {
+        var d: std.ArrayList(u8) = .empty;
+        defer d.deinit(t.allocator);
+        for (ents, 0..) |e, i| {
+            _ = text;
+            try d.print(t.allocator, "{s}{s} {d}+{d}{s}{s}", .{ if (i > 0) "; " else "", @tagName(e.kind), e.offset, e.len, if (e.url.len > 0) " " else "", e.url });
+        }
+        try r.ents.append(t.allocator, .{ .line = r.lines.items.len - 1, .desc = try d.toOwnedSlice(t.allocator) });
+    }
+
+    fn rich(ctx: *anyopaque, place: Place, text: []const u8, ents: []const topics_mod.Entity) anyerror!Sent {
+        const sent = try send(ctx, place, text);
+        const r: *Recorder = @ptrCast(@alignCast(ctx));
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        try r.noteEnts(text, ents);
+        return sent;
+    }
+
+    fn buttonsRich(ctx: *anyopaque, place: Place, text: []const u8, ents: []const topics_mod.Entity, bs: []const [2][]const u8) ?i64 {
+        const id = buttons(ctx, place, text, bs) orelse return null;
+        const r: *Recorder = @ptrCast(@alignCast(ctx));
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        r.noteEnts(text, ents) catch {};
+        return id;
+    }
+
+    /// A card's new text, as "EDIT <id>: <text>"; a gone message fails.
+    fn replace(ctx: *anyopaque, place: Place, id: i64, text: []const u8, ents: []const topics_mod.Entity) anyerror!void {
+        const r: *Recorder = @ptrCast(@alignCast(ctx));
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        if (std.mem.indexOfScalar(i64, r.gone.items, id) != null) return error.MessageGone;
+        try r.note(place, try std.fmt.allocPrint(t.allocator, "EDIT {d}: {s}", .{ id, text }));
+        try r.noteEnts(text, ents);
+    }
+
+    fn pinIt(ctx: *anyopaque, place: Place, id: i64) anyerror!void {
+        const r: *Recorder = @ptrCast(@alignCast(ctx));
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        try r.note(place, try std.fmt.allocPrint(t.allocator, "PIN {d}", .{id}));
+    }
+
+    fn setTopics(ctx: *anyopaque, on: bool) anyerror!void {
+        const r: *Recorder = @ptrCast(@alignCast(ctx));
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        if (r.settings_fail) return error.TelegramRefused;
+        r.topics_now = on;
+        try r.note(.{ .name = "(settings)" }, try std.fmt.allocPrint(t.allocator, "SETTINGS topics {s}", .{if (on) "on" else "off"}));
+    }
+
+    fn me(ctx: *anyopaque) anyerror!bool {
+        const r: *Recorder = @ptrCast(@alignCast(ctx));
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        return r.topics_now;
     }
 
     /// A voice note's file: `audio`, counted.
@@ -15776,6 +15906,18 @@ const Recorder = struct {
         if (r.topics_fail) return error.TelegramRefused;
         r.next_thread += 1;
         return r.next_thread;
+    }
+
+    /// The entities of the first line containing `needle`, as
+    /// "KIND OFFSET+LEN URL; …"; null: it had none.
+    fn entitiesOf(r: *Recorder, needle: []const u8) ?[]const u8 {
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        for (r.lines.items, 0..) |l, i| if (std.mem.indexOf(u8, l, needle) != null) {
+            for (r.ents.items) |e| if (e.line == i) return if (e.desc.len > 0) e.desc else null;
+            return null;
+        };
+        return null;
     }
 
     /// Where the first line containing `needle` went.
@@ -31809,6 +31951,29 @@ test "history_marks_what_it_shows_of_a_forwarded_message" {
     }
 }
 
+/// Topics: one chat with the bot filed by subject (topics.zig): a
+/// topic's focus, setup's offer, cards, `/overview`.
+const Topics = struct {
+    const not_here = "Use /focus in a topic: it says what that topic is about.";
+
+    /// `/focus [WORDS]` in a topic of the owner's chat.
+    fn focusCommand(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        const e = c.convs.find(conv) orelse return not_here;
+        if (e.channel != .telegram or e.thread == 0 or e.audience != .own) return not_here;
+        if (rest.len == 0) {
+            if (e.focus.len == 0) return "No focus here yet. /focus WORDS says what this topic is about.";
+            return std.fmt.allocPrint(a, "Focus: {s} /focus WORDS changes it.", .{e.focus});
+        }
+        if (rest.len > 300 or std.mem.indexOfAny(u8, rest, "\r\n") != null) return "Keep it to a sentence or two (up to 300 characters, one line).";
+        const words = if (std.mem.endsWith(u8, rest, ".")) rest else try std.fmt.allocPrint(a, "{s}.", .{rest});
+        c.convs.setFocus(conv, words) catch |err| return std.fmt.allocPrint(a, "Not changed: state/conversations could not be written ({s}).", .{@errorName(err)});
+        c.log.write(.config, false, .{ .event = "focus", .name = conv }) catch {};
+        return std.fmt.allocPrint(a, "Focus: {s}", .{words});
+    }
+};
+
 /// `/persona` (persona.zig): shows, switches and writes persona.md, the
 /// owner's file, then reads it again; `/persona write` takes the owner's
 /// reply to its question as the words, quoted back with [Save] [Cancel].
@@ -32116,4 +32281,51 @@ test "a_member_cannot_change_the_persona" {
     try f.core.handleIncoming(fromAccount(77, "/persona friend"));
     try f.rec.waitIn("anna", "That's the owner's to change.");
     try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, f.core.paths.persona, .{}));
+}
+
+// ---- topics: focus, links (topics.zig) ----
+
+/// A topic of the owner's chat with a title, focus and subject, as
+/// setup's [Use topics] makes them.
+fn addSubjectTopic(f: *Fix, subject: topics_mod.Subject, thread: i64) !void {
+    try addTopic(f, @tagName(subject), thread);
+    f.core.convs.mutex.lockUncancelable(t.io);
+    defer f.core.convs.mutex.unlock(t.io);
+    try f.core.convs.setTopic(@tagName(subject), topics_mod.title(subject), topics_mod.focus(subject), @tagName(subject));
+}
+
+test "focus_is_set_in_a_topic_and_reaches_the_context" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addSubjectTopic(&f, .travel, 5003);
+    try f.e.script(1, model.textReply("At 6."));
+    f.core.chatTurnIn("travel", "when do I leave?");
+    try expectHas(try f.e.request(1), "You're in the Travel topic: trips, flights, check-in, leaving for the airport, packing.");
+    try f.core.handleTextIn("travel", "/focus flights and check-in only");
+    try f.rec.waitIn("travel", "Focus: flights and check-in only.");
+    try expectHas(try conversationsText(&f), "\"focus\":\"flights and check-in only.\"");
+    try f.e.script(2, model.textReply("At 6."));
+    f.core.chatTurnIn("travel", "and the gate?");
+    try expectHas(try f.e.request(2), "You're in the Travel topic: flights and check-in only.");
+    try f.core.handleTextIn("travel", "/focus");
+    try f.rec.waitIn("travel", "Focus: flights and check-in only. /focus WORDS changes it.");
+    // not in main
+    try f.core.handleText("/focus everything");
+    try f.rec.waitIn("main", "Use /focus in a topic: it says what that topic is about.");
+}
+
+test "a_topic_link_is_the_title_linked" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.setBot("harness_test_bot", true);
+    try addSubjectTopic(&f, .errands, 5004);
+    f.core.say("Errands: two deliveries today. ({topic:errands})");
+    try f.rec.waitIn("main", "Errands: two deliveries today. (Errands)");
+    try t.expectEqualStrings("text_link 32+7 https://t.me/harness_test_bot/5004", f.rec.entitiesOf("two deliveries").?);
+    // no such topic: the subject's title, plain
+    f.core.say("Mail: nothing new. ({topic:mail})");
+    try f.rec.waitIn("main", "Mail: nothing new. (Mail and diary)");
+    try t.expectEqual(null, f.rec.entitiesOf("nothing new"));
 }
