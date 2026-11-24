@@ -128,6 +128,78 @@ scheduled departure; `/setup car` for a Tesla (the car file and
 `carcloud login` by hand); a harness smoke check of warm-car against the
 real carcloud (unit tests with harness-fake's Tesla stand-in).
 
+## Parked: AI avatar livestreams (owner, 2026-11-24: "not top priority")
+
+Use case: a 24-hour AI avatar livestream that sells or chats.
+Viewers' messages and gifts come in; the avatar answers aloud, moves,
+changes outfits, and the picture goes out through OBS, RTMP or a
+virtual camera to Douyin, Bilibili or YouTube. Projects the owner
+pointed at:
+
+- **lipku/LiveTalking** (Apache-2.0, 11k stars). The renderer, fully
+  local: wav2lip, MuseTalk, ER-NeRF and Ultralight; a cloned voice;
+  speech that can be interrupted; idle clips; WebRTC, RTMP or a virtual
+  camera. It runs on an RTX 3060 for wav2lip, or 3080 Ti or better for
+  MuseTalk. The HTTP API takes `POST /human {sessionid, text, type,
+  interrupt}`, plus `/interrupt_talk`, `/is_speaking`, `/set_audiotype`,
+  `/record`, and SSE events.
+- **garycaogan/gary-ai-live-avatar** (MIT; macOS and Linux). The middle
+  layer: it filters viewers' messages against a word list, queues them
+  (gifts first), routes them by rules with no model (chat, outfit,
+  action), keeps a topic pool for quiet moments, and holds a wardrobe of
+  whole-image outfits (about 6 s to change). It has a dry run, a Vidu
+  stand-in, a session budget and a time cap. Vidu S2 renders the
+  picture, the voice and the reply, at about 169 RMB an hour. The HTTP
+  API is in `WORKBENCH_API.md`: `/api/state`, SSE `/api/events`,
+  `/api/session/start|stop`, `/api/danmaku`, `/api/manual`
+  (`text_msg`, `text_dialog`, `text_action`, `interrupt`, `reset`) and
+  `/api/safety`. Selling isn't built yet. Douyin chat must come through
+  Douyin's open-platform live API, and its pages must not be scraped.
+- **cyber-xiaoya/cyber-xiaoya-live** (AGPL-3.0; Windows first, with a
+  `mac` branch). A whole stack: a stage page and a local FastAPI bridge
+  (:8795); an OpenAI-compatible model that streams its reply sentence
+  by sentence into local TTS (OmniVoice, needing at least 8 GB of VRAM);
+  Vidu S2 for the lips and actions; viewers' messages and gifts turned
+  into actions; songs with lyrics; outfits and props from reference
+  images; recording. A companion repo collects viewers' messages from
+  Douyin, Bilibili, YouTube and Channels. It is AGPL: talk to it over
+  HTTP, never copy its code.
+
+**Where harness would fit.** These projects are the avatar's face and
+voice. harness would be the operator, and the brain that's safe to put
+in front of strangers:
+
+1. **`livemcp`**, a small Zig MCP server like homemcp:
+   - backends for gary-ai-live-avatar's and LiveTalking's HTTP APIs, and
+     a sim;
+   - tools `live_state`, `live_say`, `live_action`, `live_outfit` and
+     `live_interrupt`;
+   - `live_start` and `live_stop` as money tools: Vidu bills by the
+     second, so caps and asking apply;
+   - viewers' messages as a resource that triggers subscribe to.
+2. **Viewers are outside text, and their runs are unattended.** The
+   injection checks already keep such a run from remembering, posting
+   elsewhere or spending. A `[trigger:live]` rules section allows only
+   the `live_*` speech and motion tools.
+3. **Prices only from the owner's product list.** The avatar quotes a
+   product through `live_product NAME`, which reads the owner's list.
+   `live_say` text carrying a currency amount is refused. That's a fixed
+   pattern, not a classifier.
+4. **The operator side, on the owner's phone:**
+   - alerts for a dropped session, a low budget or a gift;
+   - streams started and stopped on a schedule (a one-tap start, since
+     it costs money);
+   - a summary after each stream: questions asked, products asked
+     about, cost.
+
+**Open before a design:**
+
+- which renderer the owner would run (local GPU or Vidu);
+- which platform, and whether they have Douyin's open-platform live
+  access;
+- the platforms' current rules on unattended AI streams. Keep the "AI
+  generated" label the projects already show.
+
 ## Not tested in the world
 
 Nothing has run against a real model provider (omnigate included),
