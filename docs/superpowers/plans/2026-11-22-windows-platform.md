@@ -551,6 +551,13 @@ Rulings:
   before either.
 - R36. The gate, grants and the log keep the workspace's own paths; only
   what a command prints may show `W:\`.
+- R37. Only an error that says the service is not to be had (disabled,
+  not installed, a dependency missing, a logon type not granted) ends
+  the drives for this start. Any other is tried again (five times, a
+  little longer apart each time), then that one command runs by its real
+  paths. Before, any failure ended them: on GitHub's Windows runner one
+  command's failure made `/env check` say no (CI run 45388410033).
+  `/env check`'s line names Windows' error.
 
 Measured here: a sandboxed `echo` takes about 35 ms more (142 ms against 109).
 
