@@ -281,6 +281,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `rules` | gate rules |
 | `briefs.ini` | briefs and their topics |
 | `tasks.ini` | scheduled tasks |
+| `tasks/` | a task's instructions in a file of their own (`do_file = NAME.md`); writable by you alone, like `workflows/` |
 | `triggers.ini` | triggers: feeds, searches, pages, folders, MCP sources, schedules of their own (see Triggers) |
 | `workflows/` | workflows, one file each (`NAME.wf`, see Workflows) |
 | `mcp.ini` | MCP servers (optional) |
@@ -288,7 +289,8 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `environments.ini` | where commands can run: sandboxes on this machine, remote machines (see Environments) |
 | `logins.ini` | the agent's own logins: name, site, username (no secrets) |
 | `profiles/` | each login's browser profile (its cookies) |
-| `skills/` | saved skills, one folder each (`NAME/SKILL.md`) |
+| `skills/` | saved skills, one folder each (`NAME/SKILL.md`); `skills/.sources`: where installed ones came from (see Skills) |
+| `state/imports/` | each Hermes import's copies, suggestions and report (see Coming from Hermes) |
 | `agents/` | agent definitions, one file each (`NAME.md`) |
 | `memory/` | one file per memory item |
 | `workspace/` | where the agent's files and commands live |
@@ -2179,7 +2181,10 @@ form, however the model wrote it: keys sorted, no spaces
 field sits; a rule on how the input starts (`{"command":"lock"*`) misses a
 call with a field sorted before it. An input that names a field twice is
 refused. Server names use a-z, 0-9, - and _, up to 32 (no `__`); secret
-names follow `harness secret add`. A tool whose `server__tool` name is
+names follow `harness secret add`. A plain variable a program needs is
+`env = NAME=VALUE`, a line each; a name with TOKEN, KEY, SECRET, PASSWORD
+or AUTH in it is refused there (use `secret =`), and so is a server whose
+`env` value is a stored secret. A tool whose `server__tool` name is
 over 64 characters, or that another tool already has, is left out;
 `/status` says which, and what started.
 
@@ -2304,6 +2309,78 @@ descriptions (those its definition's `skills` take), loads one with
 `skill_save` (asked, showing its name, description and body; the file a
 save replaces is kept in `state/skills/NAME/versions/`, the last 10). `/skills`
 lists them, `/skill rm NAME` removes one.
+
+At the terminal, `harness skill add SOURCE` installs one:
+
+- from a folder (a folder of skills installs each of them, or the one
+  `--skill NAME` names);
+- from GitHub: `OWNER/REPO[/PATH][@REF]`, the names skills.sh lists, or a
+  github.com link. The repo comes as one archive (no `git` needed),
+  pinned to the commit it names;
+- from an https link to a `SKILL.md`: that file alone.
+
+It shows the skill first: its description and source, its files and
+scripts, its license, what it asks for (`allowed-tools`: shown, then
+ignored; the gate decides) and the variables it expects. Then it asks
+(`--yes` from a script). A name already installed is refused.
+`skills/.sources` keeps each one's source, commit and hash:
+
+- `harness skill list`: each skill and its source ("saved by the agent"
+  for the agent's own; "edited" when changed since it was installed);
+- `harness skill show NAME`: its whole `SKILL.md`;
+- `harness skill update [NAME]`: fetches again, shows what changed and
+  asks. One you edited needs `--force`; the old one is kept in
+  `state/skills/NAME/versions/`;
+- `harness skill rm NAME`: removes it.
+
+Limits: 300 files, 10 MB, 64 KB for `SKILL.md`, 256 KB a file; no
+links, absolute paths or `..`. A download stops past 50 MB. Fetching is
+your command, not the agent's: https only (plain http only to this
+machine). An installed skill's scripts run only through `shell`, which
+the gate decides.
+
+## Coming from Hermes
+
+`harness import hermes` brings over a Hermes setup: `~/.hermes`
+(`%LOCALAPPDATA%\hermes` on Windows), `HERMES_HOME`, or `--from DIR`.
+It follows `active_profile` as `hermes` does; `--profile NAME` picks
+another. Hermes's files are only read.
+
+It prints a plan first: Will import, Needs you, and Not imported, each
+item with its reason. Then it asks: `--yes` from a script, `--dry-run`
+for the plan alone. With neither and no terminal, it exits 2.
+
+| Hermes | harness |
+|---|---|
+| `memories/MEMORY.md`, `USER.md` | memory items, one per entry, as the agent's words, dated 60 days back: they sit below what you said lately; a long entry is split at paragraph breaks |
+| `SOUL.md`, edited | a pinned memory item, "How to talk with me: …". Hermes's own text is skipped; one over 2,000 bytes is listed (make it `agents/main.md` by hand: it replaces harness's built-in instructions) |
+| your skills | `skills/NAME/`, out of their category folders. A name with `.`, `_` or `--` is renamed; Hermes's own skills come only edited, or with `--bundled`; disabled ones and ones over the limits are listed. A skill Hermes installed from GitHub keeps its source for `harness skill update` |
+| `cron/jobs.json` | `tasks.ini` sections. An interval of 5 minutes or more is `every`; a time on days is `at` and `days`, converted to your `utc_offset` at the job's zone's offset today; `0 */N * * *` is `every = Nh` (not aligned to the hour). A prompt one line can't hold goes in `tasks/NAME.md` (`do_file`). Paused jobs, and ones delivered where harness can't reach, come over commented out |
+| `mcp_servers` | `mcp.ini` sections. A secret value or a `${VAR}` is `secret =`, a plain value `env =`; a bearer token is `token =`; `auth: oauth` is `login = oauth`. Excluded tools become deny rules; an include list is yours to turn into rules |
+| `approvals.deny` | `deny shell` rules, in an `[all]` block (`?` and `[…]` become `*`, which only denies more) |
+| `command_allowlist` | only suggested: commented `allow` lines in `state/imports/hermes-TIME/rules.suggested` |
+| `model`, `providers` | `[model]` (only while harness has no provider set) and `[provider NAME]` sections for OpenAI- and Anthropic-format endpoints |
+
+No key or token is copied. The plan lists each one as `harness secret
+add NAME`, with where its value is in Hermes. Values from `.env` and
+`config.yaml` are masked wherever they turn up (a memory entry, a
+prompt). The Telegram bot isn't moved: one bot can't be read by two
+agents at once. Make a new bot for harness, or stop Hermes's gateway
+first. Conversations (`state.db`, `sessions/`), external memory,
+plugins and the rest stay in Hermes; the plan names each.
+
+Before writing, the import copies each harness file it changes to
+`state/imports/hermes-TIME/before/`. It leaves `report.md` there: what
+it did, the new memory ids, and how to undo it. Run again, it adds
+nothing twice. It refuses while `harness run` runs, as `undo` does;
+`--dry-run` works anyway. `harness init` says when it finds a Hermes
+setup.
+
+Imported tasks run under harness's rules: in a run nobody watches,
+every question is a refusal. A job that worked because Hermes always
+allowed a command is refused here until you add a rule. `utc_offset`
+doesn't follow daylight saving: check the imported times when the
+clocks change.
 
 ## The log
 
@@ -2580,7 +2657,11 @@ want of approval are listed either way ("Skipped (needs approval): shell:
 df -h (item 45)"), each an item you can allow for that task (see Inbox). A task whose model budget is spent (a 402
 from its provider) is paused until `/task resume NAME`. `/tasks`,
 `/task add NAME | every 15m | instruction` (a new name follows the rule of
-Triggers' names), `/task rm NAME`.
+Triggers' names), `/task rm NAME`. Instructions that one `do =` line
+can't hold (several lines, ` ;` or ` #`) go in a file: `do_file =
+NAME.md` reads `tasks/NAME.md` whole; harness doesn't start while others
+can write that folder or its files. An edit to such a file takes
+`/reload`.
 
 ## Triggers
 
@@ -3036,7 +3117,7 @@ CLI: `init [--butler]`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`
 `memory [list|pin|unpin|forget ID]`, `people list|show|import`,
 `snapshot list|take|changes|restore`, `undo RUN`, `env list|check|rm|key`,
 `agent list|show|rm`, `mcp list|login|logout`, `log verify|tail|runs|session|search`, `inbox [--json]`,
-`app list|approve|rm|fork|versions|revert`,
+`app list|approve|rm|fork|versions|revert`, `import hermes`, `skill add|list|show|update|rm`,
 `health`, `doctor`, `report`, `version`. `--home DIR` may come anywhere on
 the line; arguments a command does not take are refused. `health` exits 0
 only while `harness run` holds the folder and has ticked in the last 90 s;

@@ -20,6 +20,8 @@ cleanup() {
 }
 trap cleanup EXIT
 export HARNESS_HOME="$T/home" HARNESS_STORE="$T/secrets"
+# harness init looks for a Hermes setup: never the real ~/.hermes here
+export HERMES_HOME="$T/no-hermes"
 S="$T/script"
 mkdir -p "$S"
 case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) windows=1 ;; *) windows=0 ;; esac
@@ -950,6 +952,39 @@ kill "$RPID" 2>/dev/null
 wait "$RPID" 2>/dev/null
 RPID=""
 
+# Coming from Hermes: harness import hermes against a Hermes home of its
+# own (a fake key in .env and in a memory entry), then harness skill
+# against harness-fake's stand-in for GitHub's codeload
+HH="$T/fromhermes"
+HM="$T/hermes-home"
+HARNESS_HOME="$HH" "$H" init >/dev/null 2>&1
+mkdir -p "$HM/memories" "$HM/cron"
+printf 'OPENROUTER_API_KEY=sk-smoke-hermes-0001\n' >"$HM/.env"
+cat >"$HM/config.yaml" <<'EOF'
+model:
+  provider: openrouter
+  default: anthropic/claude-sonnet-4
+mcp_servers:
+  notes:
+    command: notes-mcp
+    env:
+      NOTES_TOKEN: ${OPENROUTER_API_KEY}
+approvals:
+  deny:
+    - "rm -rf /*"
+EOF
+printf 'Prefers metric units.\n\302\247\nThe key is sk-smoke-hermes-0001.\n' >"$HM/memories/MEMORY.md"
+printf '{"jobs":[{"id":"j1","name":"Morning","prompt":"Say good morning ; then the weather","schedule":{"kind":"cron","expr":"0 7 * * *"},"deliver":"origin"}]}\n' >"$HM/cron/jobs.json"
+check "import hermes --dry-run prints the plan and writes nothing" 'HARNESS_HOME="$HH" "$H" import hermes --from "$HM" --dry-run >"$T/imp-dry.out" 2>&1 && grep -qF "Will import" "$T/imp-dry.out" && grep -qF "Needs you" "$T/imp-dry.out" && grep -qF "Not imported" "$T/imp-dry.out" && [ ! -e "$HH/mcp.ini" ]'
+check "import hermes without a terminal or --yes exits 2" 'HARNESS_HOME="$HH" "$H" import hermes --from "$HM" </dev/null >"$T/imp-2.out" 2>&1; [ $? = 2 ] && grep -qF "add --yes" "$T/imp-2.out" && [ ! -e "$HH/mcp.ini" ]'
+check "import hermes --yes writes what maps, no key copied, harness reads it" 'HARNESS_HOME="$HH" "$H" import hermes --from "$HM" --yes >"$T/imp.out" 2>&1 && grep -qF "secret = NOTES_TOKEN:openrouter_api_key" "$HH/mcp.ini" && grep -qF "deny shell rm -rf /*" "$HH/rules" && grep -qF "do_file = morning.md" "$HH/tasks.ini" && grep -rqF "Prefers metric units." "$HH/memory" && ! grep -rqF "sk-smoke-hermes-0001" "$HH" && ! grep -qF "sk-smoke-hermes-0001" "$T/imp.out" && HARNESS_HOME="$HH" "$H" memory list >"$T/imp-mem.out" 2>&1 && grep -qF "Prefers metric units." "$T/imp-mem.out"'
+mkdir -p "$S/repos/acme/skills/skills/hello"
+printf -- '---\nname: hello\ndescription: Say hello.\n---\nSay hello.\n' >"$S/repos/acme/skills/skills/hello/SKILL.md"
+printf 'abcdefabcdefabcdefabcdefabcdefabcdefabcd\n' >"$S/repos/acme/skills.commit"
+check "skill add OWNER/REPO/PATH installs it from GitHub's archive, pinned" 'HARNESS_HOME="$HH" HARNESS_CODELOAD_URL="$URL/codeload" "$H" skill add acme/skills/skills/hello --yes >"$T/skill.out" 2>&1 && [ -f "$HH/skills/hello/SKILL.md" ] && grep -qF "acme/skills/skills/hello" "$HH/skills/.sources" && grep -qF "abcdefabcdefabcdefabcdefabcdefabcdefabcd" "$HH/skills/.sources"'
+check "skill list names each skill's source" 'HARNESS_HOME="$HH" "$H" skill list >"$T/skills.out" 2>&1 && grep -qF "hello  acme/skills/skills/hello, commit abcdefabcdef" "$T/skills.out"'
+check "skill rm removes the folder and its line" 'HARNESS_HOME="$HH" "$H" skill rm hello >/dev/null 2>&1 && [ ! -e "$HH/skills/hello" ] && ! grep -qF "acme/skills" "$HH/skills/.sources"'
+
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	echo "smoke: FAILED"
 	echo "--- run output"; cat "$T/run.out"
@@ -957,6 +992,7 @@ if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	[ -f "$T/crun.out" ] && { echo "--- the calendar's run output"; cat "$T/crun.out"; }
 	[ -f "$T/erun.out" ] && { echo "--- the errands' run output"; cat "$T/erun.out"; }
 	for x in bcheck1 bcheck2 bcheck3 bcheck4; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
+	for x in imp-dry imp-2 imp imp-mem skill skills; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
 	echo "--- outbox"; cat "$OUT" 2>/dev/null
 	exit 1
 fi
