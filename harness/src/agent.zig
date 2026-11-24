@@ -7796,3 +7796,26 @@ test "a_call_to_a_tool_not_offered_is_logged_as_refused" {
     try expectIn(log, "\"tool\":\"rm_rf\",\"decision\":\"deny\",\"why\":\"no such tool\"");
     try expectIn(log, "\"tool\":\"fake__echo\",\"decision\":\"deny\",\"why\":\"no such tool\"");
 }
+
+test "injection_10_the_browsers_page_asks_to_use_a_login_elsewhere" {
+    // the browser needs Chrome: its gate hook is checked here, its own
+    // half in web.zig (a login is typed only on its site, after the gate)
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.run.conv = &f.conv;
+    _ = try f.conv.begin();
+    // the page the browser is on: its host the owner let it use
+    f.answer = .once;
+    try t.expect(webAllow(&f.run, a, .web, "offers.example") == null);
+    // it asks to sign in to the bank elsewhere: that host is asked, then the login
+    f.answer = .deny;
+    try t.expect(webAllow(&f.run, a, .web, "bank.example") != null);
+    try t.expect(webAllow(&f.run, a, .login, "bank bank.example") != null);
+    try t.expectEqual(3, f.asked);
+    try expectIn(f.last_what, "login: bank bank.example\nThis run read outside text first: web offers.example.");
+    const marks = try f.run.outside(a);
+    try t.expectEqual(1, marks.len);
+    try expectIn(try f.logText(), "\"tool\":\"login\",\"decision\":\"deny\",\"why\":\"denied by the owner\"");
+}
