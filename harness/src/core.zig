@@ -1006,6 +1006,8 @@ pub const Core = struct {
         // the workflow instances going, and items of none void
         c.loadInstances();
         c.checkLogAgainstStatus();
+        // the butler's manner of before: persona.md now (once)
+        Manner.migrate(c);
         try c.log.write(.config, false, .{ .event = "start", .pid = pidNumber() });
         // the status says who holds the folder now, not who held it last
         c.writeStatus() catch {};
@@ -1580,6 +1582,13 @@ pub const Core = struct {
         const bot = c.bot_name_buf[0..c.bot_name_len];
         if (bot.len == 0 or std.ascii.eqlIgnoreCase(word[at + 1 ..], bot)) return word[0..at];
         return word;
+    }
+
+    /// Said to the owner once a channel is attached (now, when one is).
+    fn sayAtStart(c: *Core, text: []const u8) void {
+        if (c.chan != null) return c.say(text);
+        const pa = c.paths_arena.allocator();
+        c.pending_warning = if (c.pending_warning) |w| (std.fmt.allocPrint(pa, "{s}\n{s}", .{ w, text }) catch w) else (pa.dupe(u8, text) catch return);
     }
 
     pub fn attach(c: *Core, ch: Channel) void {
@@ -29862,8 +29871,20 @@ const Evening = struct {
 /// manner and how to address the owner; the answer shows
 /// `agents/butler.md`, writes it, and main answers as it.
 const Manner = struct {
+    /// Offered until the question was answered once (state/setup/manner),
+    /// unless the owner has a butler of their own (agents/butler.md) or
+    /// persona.md is the butler with an address already.
     fn open(c: *Core) bool {
-        return !c.defs.has("butler");
+        if (c.defs.has("butler")) return false;
+        var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        if (Io.Dir.cwd().statFile(c.io, askedPath(c, &buf), .{})) |_| return false else |_| {}
+        c.persona_mutex.lockUncancelable(c.io);
+        defer c.persona_mutex.unlock(c.io);
+        return !(c.persona.present and c.persona.p.preset == .butler and c.persona.p.address.len > 0);
+    }
+
+    fn askedPath(c: *Core, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}{s}setup{s}manner", .{ c.paths.state, std.fs.path.sep_str, std.fs.path.sep_str }) catch "";
     }
 
     /// `run`: `manner` in setup's offers (the next follows), `manner
@@ -29883,6 +29904,8 @@ const Manner = struct {
         });
     }
 
+    /// The answer writes persona.md (`preset: butler`, the address; the
+    /// owner's words kept), shown first; main stays main.
     fn answer(c: *Core, a: std.mem.Allocator, run: []const u8, conv: []const u8, key: []const u8, words: ?[]const u8) !Core.SetupDone {
         const then: Core.Offer = if (std.mem.eql(u8, run, "manner")) .next else .none;
         if (std.mem.eql(u8, key, "later")) return .{ .offer = then };
@@ -29891,18 +29914,56 @@ const Manner = struct {
             if (!evening_mod.addressOk(w)) return error.NotAName;
             break :blk w;
         } else null;
-        const text = try evening_mod.presetFile(a, address);
+        var p = (try Persona.current(c, a)) orelse return .{ .said = "persona.md doesn't read as it is: fix it by hand (/persona says why), then /setup butler again.", .offer = then };
+        p.preset = .butler;
+        p.address = address orelse "";
+        const text = try persona_mod.fileText(a, p);
         // shown, then written
-        c.sayIn(conv, try std.fmt.allocPrint(a, "agents/butler.md:\n\n{s}", .{text}));
-        try c.defs.save("butler", text);
+        c.sayIn(conv, try std.fmt.allocPrint(a, "persona.md:\n\n{s}", .{text}));
+        try util.writeReplace(c.io, c.paths.persona, text);
+        c.loadPersona();
+        util.writeReplace(c.io, try c.setupPath(a, "manner"), "asked\n") catch {};
+        c.log.write(.config, false, .{ .event = "persona", .set = "preset", .preset = "butler", .via = "setup" }) catch {};
+        return .{ .said = try evening_mod.presetOnText(a, address), .offer = then };
+    }
+
+    /// At start, once: main pointing at an agents/butler.md exactly as the
+    /// old preset wrote it becomes persona.md (`preset: butler`, its
+    /// address), main answers as main and the file goes to its versions;
+    /// an edited one is left, and the owner told once of /persona.
+    fn migrate(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const points = blk: {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            const m = c.convs.find("main") orelse break :blk false;
+            break :blk std.mem.eql(u8, m.agent, "butler");
+        };
+        if (!points) return;
+        const path = std.fs.path.join(a, &.{ c.paths.agents, "butler.md" }) catch return;
+        const text = Io.Dir.cwd().readFileAlloc(c.io, path, a, .limited(1 << 20)) catch return;
+        const addr = (evening_mod.presetAddress(a, text) catch null) orelse {
+            const told = std.fs.path.join(a, &.{ c.paths.state, "persona-told" }) catch return;
+            if (Io.Dir.cwd().statFile(c.io, told, .{})) |_| return else |_| {}
+            util.writeReplace(c.io, told, "butler\n") catch return;
+            c.sayAtStart("agents/butler.md answers here as you wrote it. /persona now sets a character on top of harness's own instructions instead.");
+            return;
+        };
+        var p = (Persona.current(c, a) catch null) orelse return;
+        p.preset = .butler;
+        p.address = addr.name orelse "";
+        util.writeReplace(c.io, c.paths.persona, persona_mod.fileText(a, p) catch return) catch return;
         {
             c.convs.mutex.lockUncancelable(c.io);
             defer c.convs.mutex.unlock(c.io);
-            try c.convs.setAgent("main", "butler");
+            c.convs.setAgent("main", "main") catch return;
         }
-        c.log.write(.agent, false, .{ .event = "saved", .name = "butler", .by = "owner", .via = "setup" }) catch {};
-        c.log.write(.config, false, .{ .event = "conversation agent", .name = "main", .agent = "butler" }) catch {};
-        return .{ .said = try evening_mod.presetOnText(a, address), .offer = then };
+        c.defs.remove("butler") catch |e| c.log.write(.agent, false, .{ .event = "not removed", .name = "butler", .why = @errorName(e) }) catch {};
+        c.loadPersona();
+        c.log.write(.config, false, .{ .event = "persona", .set = "migrated", .preset = "butler" }) catch {};
+        c.sayAtStart(std.fmt.allocPrint(a, "Your butler's manner is now persona.md (preset: butler, {s}{s}); main answers here again. /persona shows it.", .{ if (addr.name != null) "address: " else "plainly", addr.name orelse "" }) catch return);
     }
 };
 
@@ -30065,16 +30126,18 @@ test "setup_offers_the_evening_and_the_butler" {
     // the manner: one question, the address in it; a reply that isn't a name leaves it open
     try f.rec.waitFor("BUTTONS I can answer you here as a butler: courteous, brief and discreet. How shall I address you?");
     const msg = f.lastButtons().msg;
-    try t.expect(!f.core.defs.has("butler"));
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, f.core.paths.persona, .{}));
     try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = "007", .reply_to = msg });
     try f.rec.waitFor("Not done: that isn't a name I can use: reply with a name (like Tobias), or tap Plainly.");
-    try t.expect(!f.core.defs.has("butler"));
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, f.core.paths.persona, .{}));
     try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = "Tobias", .reply_to = msg });
-    try f.rec.waitFor("Very well, Tobias. I answer here as your butler from your next message; /agent main goes back.");
-    try t.expect(f.rec.indexOf("agents/butler.md:\n\n---\nname: butler") < f.rec.indexOf("Very well, Tobias."));
-    try expectHas(fileText(&f, try std.fs.path.join(a, &.{ f.core.paths.agents, "butler.md" })), "Address the owner as Tobias.\n");
+    try f.rec.waitFor("Very well, Tobias. I answer as your butler from your next message; /persona assistant goes back.");
+    // shown, then written: persona.md, and main answers as main
+    try t.expect(f.rec.indexOf("persona.md:\n\n---\npreset: butler\naddress: Tobias\n---\n") < f.rec.indexOf("Very well, Tobias."));
+    try t.expectEqualStrings("---\npreset: butler\naddress: Tobias\n---\n", fileText(&f, f.core.paths.persona));
+    try t.expect(!f.core.defs.has("butler"));
     var buf: [agents_name_max]u8 = undefined;
-    try t.expectEqualStrings("butler", f.core.convAgent(&buf, "main"));
+    try t.expectEqualStrings("main", f.core.convAgent(&buf, "main"));
     try f.rec.waitFor("That's all the routines: 0 on.");
 }
 
@@ -30086,17 +30149,74 @@ test "the_butler_preset_asks_how_to_address_you_once" {
     try t.expectEqualStrings("", try f.core.command(a, "/setup butler"));
     try f.rec.waitFor("BUTTONS I can answer you here as a butler");
     try f.press("plain");
-    try f.rec.waitFor("Very well. I answer here as your butler from your next message; /agent main goes back.");
-    try expectHas(fileText(&f, try std.fs.path.join(a, &.{ f.core.paths.agents, "butler.md" })), "Address the owner plainly");
-    // one question: nothing more is offered after it
+    try f.rec.waitFor("Very well. I answer as your butler from your next message; /persona assistant goes back.");
+    try t.expectEqualStrings("---\npreset: butler\n---\n", fileText(&f, f.core.paths.persona));
+    try t.expect(!f.core.defs.has("butler"));
+    // one question: nothing more is offered after it, nor again
     try t.expectEqual(0, f.rec.count("That's all the routines"));
     try t.expectEqual(1, f.rec.count("BUTTONS I can answer you here as a butler"));
-    // its instructions reach the model in main
+    try t.expect(!Manner.open(f.core));
+    // main's instructions, then the butler's manner, reach the model in main
     try f.e.script(1, model.textReply("Lights are off."));
     try f.core.startWorker();
     try f.core.handleText("lights off");
     try f.rec.waitFor("Lights are off.");
-    try expectHas(try f.e.request(1), "You are a butler working for one person");
+    const req = try f.e.request(1);
+    try expectHas(req, "You are a personal agent");
+    try expectHas(req, persona_mod.presetText(.butler));
+    try expectHas(req, "Address the owner plainly, with no name or title.");
+}
+
+/// What the butler preset's agents/butler.md was before the persona:
+/// main pointed at it.
+fn oldButler(f: *Fix, text: []const u8) !void {
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.paths.agents, "butler.md" }), .data = text });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    f.core.convs.mutex.lockUncancelable(t.io);
+    defer f.core.convs.mutex.unlock(t.io);
+    try f.core.convs.setAgent("main", "butler");
+}
+
+test "an_unedited_butler_definition_becomes_persona_md" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try oldButler(&f, try evening_mod.presetFile(a, "Tobias"));
+    try restart(&f);
+    try t.expectEqualStrings("---\npreset: butler\naddress: Tobias\n---\n", fileText(&f, f.core.paths.persona));
+    var buf: [agents_name_max]u8 = undefined;
+    try t.expectEqualStrings("main", f.core.convAgent(&buf, "main"));
+    try t.expect(!f.core.defs.has("butler"));
+    try t.expectEqual(1, f.core.defs.versions("butler"));
+    try f.rec.waitIn("main", "Your butler's manner is now persona.md (preset: butler, address: Tobias); main answers here again. /persona shows it.");
+    // once
+    try restart(&f);
+    try t.expectEqual(1, f.rec.count("Your butler's manner is now persona.md"));
+    // plainly, too
+    try Io.Dir.cwd().deleteFile(t.io, f.core.paths.persona);
+    try oldButler(&f, try evening_mod.presetFile(a, null));
+    try restart(&f);
+    try t.expectEqualStrings("---\npreset: butler\n---\n", fileText(&f, f.core.paths.persona));
+    try f.rec.waitIn("main", "Your butler's manner is now persona.md (preset: butler, plainly)");
+}
+
+test "an_edited_butler_definition_is_left_alone" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const edited = try std.fmt.allocPrint(a, "{s}Mention the weather.\n", .{try evening_mod.presetFile(a, "Tobias")});
+    try oldButler(&f, edited);
+    try restart(&f);
+    try t.expectEqualStrings(edited, fileText(&f, try std.fs.path.join(a, &.{ f.core.paths.agents, "butler.md" })));
+    var buf: [agents_name_max]u8 = undefined;
+    try t.expectEqualStrings("butler", f.core.convAgent(&buf, "main"));
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, f.core.paths.persona, .{}));
+    try f.rec.waitIn("main", "agents/butler.md answers here as you wrote it. /persona now sets a character on top of harness's own instructions instead.");
+    try restart(&f);
+    try t.expectEqual(1, f.rec.count("/persona now sets a character"));
 }
 
 // ---- away and travel, the door (the household spec, sections 1 and 2) ----

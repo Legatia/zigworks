@@ -258,10 +258,27 @@ pub fn addressOk(s: []const u8) bool {
     return letter;
 }
 
-/// Said once the preset is written.
+/// Said once the preset is written (persona.md, `preset: butler`).
 pub fn presetOnText(a: Allocator, address: ?[]const u8) ![]const u8 {
-    if (address) |x| return std.fmt.allocPrint(a, "Very well, {s}. I answer here as your butler from your next message; /agent main goes back.", .{x});
-    return "Very well. I answer here as your butler from your next message; /agent main goes back.";
+    if (address) |x| return std.fmt.allocPrint(a, "Very well, {s}. I answer as your butler from your next message; /persona assistant goes back.", .{x});
+    return "Very well. I answer as your butler from your next message; /persona assistant goes back.";
+}
+
+/// How an `agents/butler.md` exactly as `presetFile` writes it addresses
+/// the owner (`name` null: plainly); null for any other text (edited).
+pub const PresetAddress = struct { name: ?[]const u8 };
+
+pub fn presetAddress(a: Allocator, file: []const u8) !?PresetAddress {
+    const key = "\nAddress the owner as ";
+    if (std.mem.indexOf(u8, file, key)) |i| {
+        const rest = file[i + key.len ..];
+        const end = std.mem.indexOf(u8, rest, ".\n") orelse return null;
+        const x = rest[0..end];
+        if (addressOk(x) and std.mem.eql(u8, try presetFile(a, x), file)) return .{ .name = x };
+        return null;
+    }
+    if (std.mem.eql(u8, try presetFile(a, null), file)) return .{ .name = null };
+    return null;
 }
 
 // ---- tests ----

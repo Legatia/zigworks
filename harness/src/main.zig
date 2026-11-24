@@ -467,6 +467,11 @@ fn initCmd(app: *App, args: []const []const u8) !Exit {
         const text = Io.Dir.cwd().readFileAlloc(app.io, p.config, app.arena, .limited(1 << 20)) catch "";
         const on = try butlerConfig(app.arena, text);
         if (!std.mem.eql(u8, on, text)) try util.writeReplace(app.io, p.config, on);
+        // the butler's manner: persona.md, unless the owner has one
+        if (Io.Dir.cwd().createFile(app.io, p.persona, .{ .exclusive = true, .permissions = util.private_file })) |f| {
+            defer f.close(app.io);
+            try f.writeStreamingAll(app.io, butler_persona);
+        } else |e| if (e != error.PathAlreadyExists) return e;
     }
     try outAll(app.io, try initText(app.arena, app.home, butler_on, asked));
     // a Hermes setup to bring over: said, never done
@@ -551,6 +556,9 @@ fn isYes(answer: []const u8) bool {
     return std.ascii.eqlIgnoreCase(w, "y") or std.ascii.eqlIgnoreCase(w, "yes");
 }
 
+/// persona.md as `init --butler` writes it (when there is none).
+const butler_persona = "---\npreset: butler\n---\n";
+
 /// config.ini with quiet hours on (22:00-07:00), as a home butler's are:
 /// init's commented line turned on; a file that says otherwise is left.
 fn butlerConfig(a: std.mem.Allocator, text: []const u8) ![]const u8 {
@@ -565,6 +573,7 @@ fn initText(a: std.mem.Allocator, home: []const u8, butler_on: bool, asked: bool
     if (butler_on) return std.fmt.allocPrint(a,
         \\Data folder: {s}
         \\A home butler: quiet hours are on, 22:00-07:00 (config.ini, [butler]).
+        \\persona.md: the butler's manner (/persona changes it).
         \\Next:
         \\  1. The model: set the omnigate url (there is none by default) and route names in config.ini,
         \\     or another provider: [model] provider (README: Models and providers).
@@ -2475,6 +2484,9 @@ test "init_asks_whether_this_is_a_home_butler" {
     try t.expect(std.mem.indexOf(u8, plain, "secret add ha") == null);
     try t.expect(std.mem.indexOf(u8, plain, "harness init --butler") != null);
     try t.expect(std.mem.indexOf(u8, try initText(a, "/data", false, true), "harness init --butler") == null);
+    // the butler's manner: persona.md
+    try t.expectEqualStrings("---\npreset: butler\n---\n", butler_persona);
+    try t.expect(std.mem.indexOf(u8, said, "persona.md: the butler's manner (/persona changes it).") != null);
     // --butler, and nothing else
     try t.expect(badArgs(&.{ "init", "--butler" }) == null);
     try t.expect(badArgs(&.{ "init", "x" }) != null);
