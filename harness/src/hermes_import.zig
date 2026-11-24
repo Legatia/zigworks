@@ -2259,7 +2259,9 @@ const Rx = struct {
         var d = try Io.Dir.cwd().openDir(t.io, p, .{ .iterate = true });
         defer d.close(t.io);
         var it = d.iterate();
-        while (try it.next(t.io)) |e| if (std.mem.startsWith(u8, e.name, "hermes-")) return std.fs.path.join(rx.tf.f.a(), &.{ "state", "imports", try rx.tf.f.a().dupe(u8, e.name) });
+        // the import's folder, not `hermes-entries` beside it (a file): a
+        // listing's order differs between systems
+        while (try it.next(t.io)) |e| if (e.kind == .directory and std.mem.startsWith(u8, e.name, "hermes-")) return std.fs.path.join(rx.tf.f.a(), &.{ "state", "imports", try rx.tf.f.a().dupe(u8, e.name) });
         return error.FileNotFound;
     }
 
