@@ -25546,6 +25546,9 @@ test "calendar_attendees_become_people" {
     try f.init("", "", "");
     defer f.deinit();
     const a = f.e.arena.allocator();
+    // a time inside none of the fixture's busy events (a busy event holds
+    // the line): 2026-11-23 07:00 UTC, before the team call
+    f.core.fixed_now = 1795417200;
     const dir = try withCalendar(&f);
     const upcoming = try std.fs.path.join(a, &.{ dir, "upcoming.json" });
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = upcoming, .data = calmcp_upcoming });
