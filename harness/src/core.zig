@@ -1037,6 +1037,8 @@ pub const Core = struct {
         c.checkLogAgainstStatus();
         // the butler's manner of before: persona.md now (once)
         Manner.migrate(c);
+        // an install that spent before budgets gets one, and is told (once)
+        Money.upgrade(c);
         try c.log.write(.config, false, .{ .event = "start", .pid = pidNumber() });
         // the status says who holds the folder now, not who held it last
         c.writeStatus() catch {};
@@ -11957,6 +11959,7 @@ pub const Core = struct {
         if (eql(u8, run, "evening")) return Evening.answer(c, a, key);
         if (eql(u8, run, "manner") or eql(u8, run, "manner alone")) return Manner.answer(c, a, run, conv, key, words);
         if (eql(u8, run, "topics")) return Topics.answer(c, a, conv, key);
+        if (std.mem.startsWith(u8, run, "budget ")) return Money.setupAnswer(c, a, run["budget ".len..], key, words);
         if (eql(u8, run, "persona write") or eql(u8, run, "persona save")) return Persona.answer(c, a, run, conv, key, words);
         if (eql(u8, run, "setup address")) {
             const w = std.mem.trim(u8, words orelse "", " \t\r\n<>");
@@ -12196,6 +12199,7 @@ pub const Core = struct {
             error.NoCalmcp => "calmcp isn't next to harness or on PATH any more: put it back, then tap again",
             error.RoutineDoesNotRead => "the routine's files didn't read as harness reads them (a bug: please send harness report)",
             error.NotAName => "that isn't a name I can use: reply with a name (like Tobias), or tap Plainly",
+            error.NotABudget => "that isn't an amount I can use: reply like 50 a day, 300 a month, or tap a button",
             error.NoSpaceLeft, error.DiskQuota => "the disk is full: make room, then tap again",
             error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => "harness may not write in its data folder: fix that, then tap again",
             else => @errorName(e),
@@ -27759,6 +27763,9 @@ const Errands = struct {
         if (shop_cfg.day >= 0) try when.append(a, try std.fmt.allocPrint(a, "{s} when {s} has something on it", .{ try lists_mod.weeklyText(a, .{ .day = shop_cfg.day, .at = shop_cfg.at }), shop_cfg.list }));
         const per_call = tl.order.?.max_per_call orelse c.cfg.money.max_per_call;
         const cap = if (per_call > 0) try std.fmt.allocPrint(a, " An order over {d} a call is not proposed (your cap).", .{per_call}) else "";
+        // a shop is a money server with an amount: how much routines may
+        // spend there, asked once
+        Money.askBudget(c, a, tl.order.?);
         // with a budget for routines, within it the reorder orders itself
         if (budgetFor(c, tl.order.?))
             return std.fmt.allocPrint(a, "Reorders from {s} are on: {s}, I price the list with {s}. Within your budget for routines (/money) I order it and tell you; over it, I send you the whole order and nothing is bought until you tap Order it.{s} /setup reorder {s} off stops them.", .{ try lists_mod.title(a, shop), try std.mem.join(a, ", and ", when.items), try lists_mod.title(a, shop), cap, shop });
@@ -29205,6 +29212,75 @@ test "dry_run_spends_nothing_unattended_and_tells_nothing" {
     try t.expectEqual(0, f.rec.count("Spent "));
     try t.expectEqualStrings("", shopOrders(&f));
     try t.expectEqual(@as(f64, 0), friscoToday(&f).auto);
+}
+
+test "an_install_that_spent_gets_a_budget_from_max_per_day_once" {
+    var f: Fix = undefined;
+    try f.init("[money]\nmax_per_day = 50\nscheduled = on\n", "", "");
+    defer f.deinit();
+    const said = "Routines now spend within a budget of their own. So what they spent before goes on, budget_per_day is set from max_per_day: 50 in config.ini's [money]. /money shows it; /money pause stops it.";
+    try f.rec.waitIn("main", said);
+    try expectHas(fileText(&f, f.core.paths.config), "[money]\nmax_per_day = 50\nscheduled = on\nbudget_per_day = 50\n");
+    try t.expectEqual(50, f.core.cfg.money.budget_per_day);
+    // once
+    try restart(&f);
+    try t.expectEqual(1, f.rec.count(said));
+    try t.expectEqual(50, f.core.cfg.money.budget_per_day);
+    // never spent (no scheduled line of its own: the default changed, not the owner): nothing
+    var g: Fix = undefined;
+    try g.init("[money]\nmax_per_day = 50\n", "", "");
+    defer g.deinit();
+    try t.expectEqual(0, g.rec.count("Routines now spend"));
+    try t.expectEqual(0, g.core.cfg.money.budget_per_day);
+    // spent with a per-call cap alone: told it stops until a budget is set
+    var h: Fix = undefined;
+    try h.init("[money]\nmax_per_call = 10\nscheduled = on\n", "", "");
+    defer h.deinit();
+    try h.rec.waitIn("main", "Routines now spend only within a budget of their own, and none is set (no max_per_day to take it from): they spend nothing without asking you until /money budget N a day sets one.");
+    try t.expectEqual(0, h.core.cfg.money.budget_per_day);
+}
+
+test "setup_reorder_asks_once_how_much_routines_may_spend" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    _ = try f.core.command(a, "/setup reorder frisco at 2 items");
+    try f.rec.waitFor("BUTTONS How much may routines spend without asking you, a day and a month?");
+    const b = f.rec.buttonsWith("How much may routines spend").?;
+    try t.expectEqualStrings("None", (try itemLabel(&f, b.get("none").?)).?);
+    try t.expectEqualStrings("Set an amount", (try itemLabel(&f, b.get("set").?)).?);
+    try t.expectEqualStrings("Like this: 30 a day, 200 a month", (try itemLabel(&f, b.get("like").?)).?);
+    f.core.handleCallback(42, b.msg, b.get("like").?);
+    try f.rec.waitFor("Routines may spend up to 30 a day and 200 a month without asking you. /money shows it.");
+    try expectHas(fileText(&f, f.core.paths.config), "budget_per_day = 30\nbudget_per_month = 200\n");
+    try t.expectEqual(200, f.core.cfg.money.budget_per_month);
+    // asked once
+    _ = try f.core.command(a, "/setup reorder frisco at 3 items");
+    try t.expectEqual(1, f.rec.count("BUTTONS How much may routines spend"));
+    // a reply in words; None writes nothing and isn't asked again
+    var g: Fix = undefined;
+    try g.init("", "", "");
+    defer g.deinit();
+    try withShop(&g, shop_money);
+    _ = try g.core.command(g.e.arena.allocator(), "/setup reorder frisco at 2 items");
+    try g.rec.waitFor("BUTTONS How much may routines spend");
+    const id = (try std.fmt.parseInt(u64, g.lastButtons().buf[0][1..std.mem.indexOfScalar(u8, g.lastButtons().buf[0][0..g.lastButtons().len[0]], '-').?], 10));
+    try t.expectEqual(Core.Took.taken, g.core.answerItem(id, "", "50 a day, 300 a month", .telegram));
+    try g.rec.waitFor("Routines may spend up to 50 a day and 300 a month without asking you. /money shows it.");
+    try t.expectEqual(50, g.core.cfg.money.budget_per_day);
+    var h: Fix = undefined;
+    try h.init("", "", "");
+    defer h.deinit();
+    try withShop(&h, shop_money);
+    _ = try h.core.command(h.e.arena.allocator(), "/setup reorder frisco at 2 items");
+    try h.rec.waitFor("BUTTONS How much may routines spend");
+    try h.press("none");
+    try h.rec.waitFor("Routines spend nothing without asking you. /money budget N a day sets a budget.");
+    try t.expect(std.mem.indexOf(u8, fileText(&h, h.core.paths.config), "budget_per") == null);
+    _ = try h.core.command(h.e.arena.allocator(), "/setup reorder frisco at 3 items");
+    try t.expectEqual(1, h.rec.count("BUTTONS How much may routines spend"));
 }
 
 test "no_amount_tools_and_mail_send_are_never_unattended" {
@@ -33413,6 +33489,89 @@ const Money = struct {
         const conv = c.convAt(&buf, chat, thread);
         if (c.chan) |ch| ch.clear(ch.ctx, .{ .name = conv, .chat = chat, .thread = thread }, message_id);
         c.sayIn(conv, setPaused(c, arena.allocator(), true) orelse paused_text);
+    }
+
+    /// At the first start after budgets (`state/upgrades/money-budget`):
+    /// an install that spent unattended before gets its budget a day from
+    /// its cap a day, and is told once in main. A file that can't be
+    /// written is tried again at the next start.
+    fn upgrade(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const dir = std.fs.path.join(a, &.{ c.paths.state, "upgrades" }) catch return;
+        const marker = std.fs.path.join(a, &.{ dir, "money-budget" }) catch return;
+        if (Io.Dir.cwd().statFile(c.io, marker, .{})) |_| return else |_| {}
+        const up = money_mod.upgradeTexts(a, c.readOr(a, c.paths.config), c.readOr(a, c.paths.mcp)) catch null;
+        if (up) |u| {
+            if (u.config) |text| {
+                c.writeSetting(c.paths.config, text) catch |e| return c.log.write(.config, false, .{ .event = "money upgrade not written", .file = "config.ini", .why = @errorName(e) }) catch {};
+                c.cfg.money.budget_per_day = c.cfg.money.max_per_day;
+            }
+            if (u.mcp) |text| c.writeSetting(c.paths.mcp, text) catch |e| return c.log.write(.config, false, .{ .event = "money upgrade not written", .file = "mcp.ini", .why = @errorName(e) }) catch {};
+            c.log.write(.config, false, .{ .event = "money upgrade", .config = u.config != null, .mcp = u.mcp != null }) catch {};
+            c.sayAtStart(u.line);
+        }
+        Io.Dir.cwd().createDirPath(c.io, dir) catch return;
+        util.writeReplace(c.io, marker, if (up != null) "said\n" else "nothing to do\n") catch {};
+    }
+
+    const budget_question = "How much may routines spend without asking you, a day and a month? Tap one, or reply with the amounts, like 50 a day, 300 a month.";
+
+    /// `/setup reorder`'s question, once a shop (`state/setup/budget-SHOP`),
+    /// while no budget for routines applies there.
+    fn askBudget(c: *Core, a: std.mem.Allocator, order: agent.McpTool) void {
+        const b = money_mod.budgetFor(c.cfg.money, order.budget_per_day, order.budget_per_month);
+        if (b.any() or b.none) return;
+        const mark = c.setupPath(a, std.fmt.allocPrint(a, "budget-{s}", .{order.server.name}) catch return) catch return;
+        if (Io.Dir.cwd().statFile(c.io, mark, .{})) |_| return else |_| {}
+        const run = std.fmt.allocPrint(a, "budget {s}", .{order.server.name}) catch return;
+        c.withdrawSetupItems(a, run);
+        _ = c.addItem(.{
+            .kind = "setup",
+            .run = run,
+            .title = "A budget for routines",
+            .body = budget_question,
+            .choices = &.{ .{ .key = "none", .label = "None" }, .{ .key = "set", .label = "Set an amount" }, .{ .key = "like", .label = "Like this: 30 a day, 200 a month" } },
+            .text = .answer,
+            .expires = c.now() + 7 * 86400,
+        }) catch {};
+    }
+
+    /// The question's answer: None and Set an amount write nothing; Like
+    /// this, or a reply ("50 a day, 300 a month"), writes `[money]`'s
+    /// budgets and applies them. Each marks the question answered.
+    fn setupAnswer(c: *Core, a: std.mem.Allocator, shop: []const u8, key: []const u8, words: ?[]const u8) !Core.SetupDone {
+        const mark = try c.setupPath(a, try std.fmt.allocPrint(a, "budget-{s}", .{shop}));
+        var day: ?u32 = null;
+        var month: ?u32 = null;
+        if (std.mem.eql(u8, key, "like")) {
+            day = 30;
+            month = 200;
+        } else if (std.mem.eql(u8, key, "text")) {
+            const said = try std.mem.replaceOwned(u8, a, words orelse "", " and ", ",");
+            var parts = std.mem.tokenizeAny(u8, said, ",;\r\n");
+            while (parts.next()) |part| {
+                const w = money_mod.parseBudget(std.mem.trim(u8, part, " \t.")) orelse return error.NotABudget;
+                if (w.period == .day) day = w.n else month = w.n;
+            }
+            if (day == null and month == null) return error.NotABudget;
+        } else {
+            util.writeReplace(c.io, mark, "asked\n") catch {};
+            if (std.mem.eql(u8, key, "set")) return .{ .said = "Send /money budget N a day, and /money budget N a month for a month's." };
+            return .{ .said = "Routines spend nothing without asking you. /money budget N a day sets a budget." };
+        }
+        var text = c.readOr(a, c.paths.config);
+        if (day) |d| text = try mail_mod.setKey(a, text, "money", "budget_per_day", try std.fmt.allocPrint(a, "{d}", .{d}));
+        if (month) |m| text = try mail_mod.setKey(a, text, "money", "budget_per_month", try std.fmt.allocPrint(a, "{d}", .{m}));
+        try c.writeSetting(c.paths.config, text);
+        util.writeReplace(c.io, mark, "asked\n") catch {};
+        c.log.write(.config, false, .{ .event = "money budget", .via = "setup", .day = day, .month = month }) catch {};
+        if (c.applySetup()) |why| return .{ .said = try std.fmt.allocPrint(a, "config.ini is written. {s}", .{why}) };
+        var amounts: std.ArrayList(u8) = .empty;
+        if (day) |d| try amounts.print(a, "{d} a day", .{d});
+        if (month) |m| try amounts.print(a, "{s}{d} a month", .{ if (amounts.items.len > 0) " and " else "", m });
+        return .{ .said = try std.fmt.allocPrint(a, "Routines may spend up to {s} without asking you. /money shows it.", .{amounts.items}) };
     }
 
     /// `/money`, `/money budget N a day|a month`, `/money pause|resume`:
