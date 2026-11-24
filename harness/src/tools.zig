@@ -1007,6 +1007,14 @@ test "redirects_stop_after_five_and_headers_stay_with_their_host" {
     try t.expectEqual(2, checked);
 }
 
+/// A turn's deadline about a second away: the clock counts whole seconds,
+/// so `now + 1` can be a moment away and end a call before it is sent.
+fn aSecondAway() i64 {
+    const s0 = util.nowSeconds(t.io);
+    while (util.nowSeconds(t.io) == s0) t.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    return s0 + 2;
+}
+
 test "fetch_and_search_end_when_the_turns_time_is_up" {
     var f: Fix = undefined;
     try f.init();
@@ -1014,7 +1022,7 @@ test "fetch_and_search_end_when_the_turns_time_is_up" {
     const a = f.e.arena.allocator();
     const base = try f.e.url();
     try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "pages/slow.html", .data = "<p>late</p>" });
-    f.env.deadline_s = util.nowSeconds(t.io) + 1;
+    f.env.deadline_s = aSecondAway();
     const start = Io.Clock.awake.now(t.io);
     const o = try f.call(.fetch, try std.fmt.allocPrint(a, "{{\"url\":\"{s}/page/slow.html?delay_ms=4000\"}}", .{base}));
     try t.expect(start.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2000);
@@ -1022,7 +1030,7 @@ test "fetch_and_search_end_when_the_turns_time_is_up" {
     try t.expect(std.mem.indexOf(u8, o.text, "time is up") != null);
     // search the same way (a slow stand-in for the search API)
     f.env.search_url = try std.fmt.allocPrint(a, "{s}/page/s?delay_ms=4000&", .{base});
-    f.env.deadline_s = util.nowSeconds(t.io) + 1;
+    f.env.deadline_s = aSecondAway();
     const s_start = Io.Clock.awake.now(t.io);
     const s = try f.call(.search, "{\"query\":\"zig\"}");
     try t.expect(s_start.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2000);
