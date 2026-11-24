@@ -58,51 +58,49 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 1183 unit tests (20 of them
-don't run on macOS: Windows or Linux only), among
-them the browser and login tests against headless Chrome and local pages,
-and an end-to-end script of 109 checks that drives the real binary against
+**State: 0.3.0, tested on macOS by its own tests: 1189 unit tests (20 of
+them don't run on macOS: Windows or Linux only), among them the browser
+and login tests against headless Chrome and local pages, and an
+end-to-end script of 109 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram (voice
 notes and their files too), a transcription service, feeds, search, three
 MCP servers run as programs (one a shop, ordered from on a tap), and MCP
 servers at a url with a token or a sign-in (with a stand-in authorization
-server and browser); with homemcp
-and carcloud built (HOMEMCP_BIN, CARCLOUD_BIN), 28 more: an event pushed
-by homemcp, and the butler's setup in the chat and each routine (the
-leak's fallback turned on, a smoke alarm going off and answered with I'm
-on it, a ring at the door, away mode with a door and a ring while
-away), against
-homemcp-sim and carcloud-sim (stand-ins for Home Assistant and Smartcar),
-and Home Assistant asking the voice agent (a test client sending what its
+server and browser); with homemcp and carcloud built (HOMEMCP_BIN,
+CARCLOUD_BIN), 28 more: an event pushed by homemcp, and the butler's
+setup in the chat and each routine (the leak's fallback turned on, a
+smoke alarm going off and answered with I'm on it, a ring at the door,
+away mode with a door and a ring while away), against homemcp-sim and
+carcloud-sim (stand-ins for Home Assistant and Smartcar), and Home
+Assistant asking the voice agent (a test client sending what its
 llama.cpp integration sends); with calmcp built (CALMCP_BIN), 5 more:
 `/setup calendar` and a change asked and made, against calmcp-sim (a
 stand-in CalDAV server). The diary has not met a real calendar yet, nor
-mail a real mail server (mailmcp's own tests run it against its stand-in);
-errands and upkeep (lists, reorders, parcels, the car's odometer) have met
-only stand-ins: no real shop, carrier's page or car. Medication
-reminders, bedtime, habits, the evening message and the butler's manner
-are tested by unit tests with a fake clock, a written log and the
-stand-ins only: no real household or week of habits yet. Away mode,
-trips and the doorbell are tested against stand-ins only (no real
-doorbell, trip, airline or flight-status server yet).
-An earlier build of 0.3.0 also passed its tests in CI on Linux and
-Windows. Emergencies (escalation to the household, the leak's fallback,
-the smoke routine) are tested against stand-ins only: no real household,
-alarm or valve yet. Warming the car is tested against a stand-in of
-carcloud with a Tesla (and carcloud's Tesla backend against its own
-stand-ins of Tesla's API and tesla-http-proxy): no real Tesla yet. On Windows 11 the browser and login
-tests also run, against Chrome 157, and the console, lock, Credential
-Manager and process-cleanup checks of HANDOFF-windows-audit.md were run by
-hand. With environments, apps, clones and safe state files added,
-Windows 11 and Linux (WSL, bubblewrap 0.9, OpenSSH 9.6) pass their unit
-tests and the end-to-end script; on macOS 15.7 the sandbox (sandbox-exec)
-and APFS clone tests run with the rest. Nothing has run yet against a real
-omnigate or model provider, Telegram bot, transcription service, MCP
-server, authorization server, website, Home Assistant, Smartcar or mail
-server; mail (the butler's address and your mailbox) is tested against a
-stand-in of mailmcp, and mailmcp against its own stand-in IMAP and SMTP
-server.** See
-[Limits](#limits).
+mail a real mail server (mailmcp's own tests run it against its
+stand-in); errands and upkeep (lists, reorders, parcels, the car's
+odometer) have met only stand-ins: no real shop, carrier's page or car.
+Medication reminders, bedtime, habits, the evening message and the
+butler's manner are tested by unit tests with a fake clock, a written log
+and the stand-ins only: no real household or week of habits yet. Away
+mode, trips and the doorbell are tested against stand-ins only (no real
+doorbell, trip, airline or flight-status server yet). An earlier build
+of 0.3.0 also passed its tests in CI on Linux and Windows. Emergencies
+(escalation to the household, the leak's fallback, the smoke routine)
+are tested against stand-ins only: no real household, alarm or valve
+yet. Warming the car is tested against a stand-in of carcloud with a
+Tesla (and carcloud's Tesla backend against its own stand-ins of Tesla's
+API and tesla-http-proxy): no real Tesla yet. On Windows 11 the browser
+and login tests also run, against Chrome 157, and the console, lock,
+Credential Manager and process-cleanup checks of HANDOFF-windows-audit.md
+were run by hand. With environments, apps, clones and safe state files
+added, Windows 11 and Linux (WSL, bubblewrap 0.9, OpenSSH 9.6) pass their
+unit tests and the end-to-end script; on macOS 15.7 the sandbox
+(sandbox-exec) and APFS clone tests run with the rest. Nothing has run
+yet against a real omnigate or model provider, Telegram bot,
+transcription service, MCP server, authorization server, website, Home
+Assistant, Smartcar or mail server; mail (the butler's address and your
+mailbox) is tested against a stand-in of mailmcp, and mailmcp against
+its own stand-in IMAP and SMTP server.** See [Limits](#limits).
 
 ## Quick start
 

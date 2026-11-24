@@ -3,7 +3,9 @@
 Everything specced through 2026-11-23 is built and green in CI on Linux,
 macOS and Windows (dcc2742): the platform gaps, the "close ones", the
 butler's Parts 1–9. The butler's duties (emergencies, the diary, people)
-and email are built and merged on harness-logins (2026-11-23), not yet
+and email are built and merged on harness-logins (2026-11-23), and so
+are the household duties (away and travel, the door, errands, upkeep,
+health, habits, the car's heating, the evening; 2026-11-24), not yet
 pushed. This file lists what is not, in one place, with what each waits
 on. Update it when something lands.
 
@@ -27,14 +29,14 @@ on. Update it when something lands.
 | Diary | **built 2026-11-23** | — (calmcp; agenda, leave-by, meeting preparation with what harness knows of the people, busy means quiet, changes asked) |
 | People and occasions | **built 2026-11-23** | — (state/people, the people tool, occasions, keeping in touch, vCard import, calendar attendees) |
 | Post and messages | email built (A and C) | messages to others on the owner's behalf through other channels (asked every time) |
-| The door | **specced 2026-11-23 (household spec)** | doorbell: who is there, announced, one tap to answer; deliveries |
-| Away and travel | **specced 2026-11-23 (household spec)** | away mode (lived-in lights, stricter watch, daily summary); itinerary, flight status, check-in, packing list |
-| Errands | **specced 2026-11-23 (household spec)** | shopping list and pantry, reorders within caps, delivery tracking; pay-per-call services (pay.sh, x402) |
-| Habits | **specced 2026-11-23 (household spec)** | suggesting a routine from a seen pattern (never turned on unasked) |
-| House upkeep | **specced 2026-11-23 (household spec)** | service dates (boiler, filters, car), manuals and warranties remembered |
-| Health | **specced 2026-11-23 (household spec)** | medication reminders, sleep nudges, wearable data (optional) |
-| Manner | **specced 2026-11-23 (household spec)** | a butler persona preset, an evening wrap-up |
-| The car | partly | warming it (Tesla Fleet API or BMW CarData; Smartcar has no climate); an in-car box (research only) |
+| The door | **built 2026-11-24** | — (homemcp's doorbells, the Doorbell routine: who is there, the parcel the deliveries expect, urgent while away, [Unlock the door] only for a lock you let unlock) |
+| Away and travel | **built 2026-11-24** | — (away mode: lived-in lights, doors urgent, the 20:00 line, the heating; trips from the calendar and travel mail, check-in, the airport's leave-by, the evening before, flight status only from a source) |
+| Errands | **built 2026-11-24** | pay-per-call services (pay.sh, x402); a shop's website with a login (lists, reorders on the owner's tap, deliveries built) |
+| Habits | **built 2026-11-24** | — (one suggestion a week from the owner's own home_set calls, written only on Yes) |
+| House upkeep | **built 2026-11-24** | manuals remembered (service dates by time and the car's distance, documents and warranties built) |
+| Health | **built 2026-11-24** | wearable data (medication reminders with Taken, bedtime built) |
+| Manner | **built 2026-11-24** | — (the butler preset, the evening message) |
+| The car | partly | BMW CarData; an in-car box (research only); warming a Tesla built (carcloud through tesla-http-proxy, the warm-car routine) |
 | Phone calls | not specced | calling on the owner's behalf |
 
 ## Platform pieces not finished
@@ -85,6 +87,34 @@ dates (name days kept, not reminded); a birthday missed while harness was
 down; an [In touch] button; vCard 2.1's quoted-printable and `NOTE`,
 `ADR`, `ORG`; people in the morning summary.
 
+Away and travel, the door: a flight-status page as a source (an MCP
+tool only); a calendar trip beyond tomorrow (calmcp's `cal://upcoming`);
+lights at sunset (fixed evening minutes); away mode per person (the
+house is empty or not); a delivery mail with no tracking number gives
+the doorbell no hint (the hint is the deliveries', which keep only
+parcels with a number).
+
+Errands and upkeep: ordering through a shop's website with a login; a
+room's speech adding to lists (it goes to the model, which has no list
+tool); a list tool for the model; carriers' pages that need a browser
+(DHL, UPS, Poczta Polska, FedEx give no status); a smoke check of a
+carrier's page; with a Tesla, the daily odometer read (and the evening's
+car line) get nothing while the car sleeps (`car_status` wakes it only
+when asked).
+
+Health, habits and the evening: reminders in the terminal's chat (main
+only); a medication's history (by design); habits from tools other than
+homemcp's `home_set`, across midnight, or of Home Assistant's own voice;
+a weather MCP server (search and one model call instead); the evening's
+leave-by from a maps server (`[butler] travel` only); `/setup` status
+lines for the evening and the manner; the preset in topics (main only).
+
+The car's heating: signing Tesla's commands in Zig (tesla-http-proxy
+does it); Tesla over BLE, Fleet Telemetry, `vehicle_data_cached`,
+scheduled departure; `/setup car` for a Tesla (the car file and
+`carcloud login` by hand); a harness smoke check of warm-car against the
+real carcloud (unit tests with harness-fake's Tesla stand-in).
+
 ## Not tested in the world
 
 Nothing has run against a real model provider (omnigate included),
@@ -99,5 +129,5 @@ GitHub cancels macOS jobs that wait about 15 minutes for a runner (most
 pushes lose one or two); they pass when rerun. A paid plan or fewer macOS
 jobs would end it.
 
-- calmcp ignores tool fields it doesn't know (a routine sending `location` for `place` lost the place silently until the stand-in refused it); calmcp itself should refuse unknown fields, as homemcp does.
-- **Security (from a review, 2026-11-23): harness's own jobs share the `schedule:NAME` principal with user tasks, briefs and schedules.** `schedule:people` (people's daily pass, merged), `schedule:away`/`schedule:trips` (away), `schedule:warm-car` (car heating) and any other internal job: a user task named the same gets the rules written for harness's job. Fix after the household merges: a who kind `harness:NAME` no settings file can produce, used by every internal job and the shipped rules.
+- ~~calmcp ignores tool fields it doesn't know~~ **done (2026-11-24, carheat)**: a field a tool doesn't take is refused, nothing read or written.
+- ~~**Security (from a review, 2026-11-23): harness's own jobs share the `schedule:NAME` principal with user tasks, briefs and schedules.**~~ **Fixed (2026-11-24)**: harness's own jobs run as `harness:NAME` (`harness:people`, `harness:away`, `harness:trips`, `harness:warm-car`, `harness:habits`, `harness:evening`, `harness:lists`, `harness:reorder`, `harness:deliveries`, `harness:upkeep`), a who kind no settings file produces: rules sections `[harness:NAME]`, nobody to ask in them (as schedules), and only harness's own workflow of that name may name it in its start line. The shipped rules say `[harness:away]`; a task named `away` or `people` gets none of their lines (tests a_task_named_away_gets_none_of_harnesss_away_lines, a_task_named_people_gets_none_of_harnesss_people_lines).

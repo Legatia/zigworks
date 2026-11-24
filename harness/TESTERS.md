@@ -185,24 +185,19 @@ notes):
   inspection): tap **Add it**, or reply with when it was last done. A
   week before something is due, and on the day, one line with **Done**.
   Write "the boiler was serviced today" when it was. `/upkeep` lists them.
-- **Day 11, health.** `/med add Vitamin D at` a time a minute from now:
+- **Day 13, health.** `/med add Vitamin D at` a time a minute from now:
   the reminder comes with **Taken**; leave it, and half an hour later it
   comes once more. Tap Taken (or reply "taken"): both say when. With Anna
   in, `/med tell Vitamin D anna`: an hour after a reminder nobody tapped,
   she reads the time, never the medicine. `/bedtime 23:30`: your first
   message after it gets one gentle line, once a night.
-- **Day 12, the evening.** Turn on the evening (`/setup routines` offers
+- **Day 14, the evening.** Turn on the evening (`/setup routines` offers
   it, or `/evening 21:00`); `/evening now` tries it: tomorrow's first
   event and when to leave, the weather, the car, a bill due tomorrow, what
   waits in `/inbox`, each only when there is something. `/setup butler`
   asks how to address you, once, and the bot answers as a butler from
   then on.
-- **After two weeks, habits.** Ask for the same thing at about the same
-  time on four days or more (the coffee machine at 6:45): once a week at
-  most, one question comes, "You switch the coffee machine on at about
-  6:45 on weekdays. Shall I do that?" **Yes** shows what it writes, then
-  writes it; **No, and don't ask again** is for good.
-- **Day 11, away.** Turn on the Away routine (`/setup routines`), then
+- **Day 15, away.** Turn on the Away routine (`/setup routines`), then
   `/away until tomorrow`: one message says away mode is on and, if the
   heating is above 17 °C, asks once to turn it down. Open a door or walk
   past a motion sensor: the line comes at once, even at night. In the
@@ -210,14 +205,14 @@ notes):
   day; `/away lights NAME` picks others); at 20:00 one line says how the
   day was. `/away off` when you're back, or it goes off by itself when
   the first of you comes home.
-- **Day 12, the door.** With a doorbell in Home Assistant (or a
+- **Day 16, the door.** With a doorbell in Home Assistant (or a
   Zigbee2MQTT button named "doorbell"), ring it: "Someone's at the front
   door." (with "probably the DPD parcel" when a parcel you track, or one
   from your mailbox, is out for delivery or due today). If you added `unlock` to the front door's `allow` line in
   home.ini yourself, the line has **Unlock the door**: tap it only if you
   mean it; with no tap nothing happens. While you're away the ring comes
   at once, with no button to unlock.
-- **Day 13, a trip.** Turn on Trips, then forward yourself (or have in
+- **Day 17, a trip.** Turn on Trips, then forward yourself (or have in
   your mailbox) a flight confirmation, or put "Flight LO 3921 Kraków –
   Lisbon" in your calendar at its airport. `/trips` lists it, each time in
   its place's own time. A day before the flight: the check-in line; on
@@ -225,6 +220,11 @@ notes):
   the evening before: the weather there (with search set) and what to
   pack. When the trip begins and nobody is home, away mode comes on, and
   the heating goes back up two hours before you're back.
+- **After two weeks, habits.** Ask for the same thing at about the same
+  time on four days or more (the coffee machine at 6:45): once a week at
+  most, one question comes, "You switch the coffee machine on at about
+  6:45 on weekdays. Shall I do that?" **Yes** shows what it writes, then
+  writes it; **No, and don't ask again** is for good.
 - **Any day.** `/session` shows the steps behind the last answer; `/quiet`
   what quiet hours hold; `/workflows` the routines that are on.
 
