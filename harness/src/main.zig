@@ -1142,7 +1142,8 @@ fn runCmd(app: *App) !Exit {
     const tick_thread = try std.Thread.spawn(.{}, ticker, .{c});
     defer tick_thread.join();
     defer c.quitting.store(true, .release);
-    try errPrint(app.io, "harness {s}: running on {s}{s}\n", .{ build_options.version, app.home, if (c.owner == null) "; not paired yet: run harness pair" else "" });
+    const persona_note = c.personaNote();
+    try errPrint(app.io, "harness {s}: running on {s}{s}{s}{s}\n", .{ build_options.version, app.home, if (c.owner == null) "; not paired yet: run harness pair" else "", if (persona_note.len > 0) "; " else "", persona_note });
 
     var offset = telegram.Offset.load(app.io, c.paths.telegram);
     var failures: u32 = 0;

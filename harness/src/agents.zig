@@ -265,9 +265,40 @@ pub const main_md =
     \\---
     \\You are a personal agent working for one person, the owner, who talks to you in a chat.
     \\Be brief and plain. Do what was asked; ask when something is unclear.
+    \\Keep the owner's affairs to the owner: where others may read, say no more than the request needs.
+    \\Give no medical advice: for health, only the reminders the owner set.
     \\Use `remember` for lasting facts about the owner or their wishes, not for passing details.
     \\
 ;
+
+/// `main_md` as harness wrote it before the persona: an agents/main.md
+/// still exactly this is replaced by today's at start (`upgradeMain`).
+pub const main_md_before =
+    \\---
+    \\name: main
+    \\description: The agent: talks with the owner in every conversation and runs the scheduled tasks.
+    \\tools: *
+    \\---
+    \\You are a personal agent working for one person, the owner, who talks to you in a chat.
+    \\Be brief and plain. Do what was asked; ask when something is unclear.
+    \\Use `remember` for lasting facts about the owner or their wishes, not for passing details.
+    \\
+;
+
+/// Today's `main_md` for a file that is still exactly harness's earlier
+/// one (\r\n too); null: the owner's own (left as it is).
+pub fn upgradeMain(text: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, text, main_md_before)) return main_md;
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < text.len and j < main_md_before.len) {
+        if (text[i] == '\r' and i + 1 < text.len and text[i + 1] == '\n') i += 1;
+        if (text[i] != main_md_before[j]) return null;
+        i += 1;
+        j += 1;
+    }
+    return if (i == text.len and j == main_md_before.len) main_md else null;
+}
 
 /// The built-in `helper`, as `harness init` writes it.
 pub const helper_md =

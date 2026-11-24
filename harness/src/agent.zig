@@ -485,6 +485,9 @@ pub const Run = struct {
     /// The id of the run that delegated this one.
     parent_rid: ?u64 = null,
     extra_instructions: []const u8 = "",
+    /// How the agent talks (persona.zig's block): after the definition's
+    /// body, before harness's own lines; "": none (helpers never get one).
+    persona: []const u8 = "",
     /// Where helpers and summaries get their models; null: no `delegate`,
     /// and long conversations are cut instead of summarised.
     model_cfg: ?ModelCfg = null,
@@ -1715,6 +1718,9 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
     // the definition's instructions, then harness's own lines
     try out.appendSlice(arena, std.mem.trimEnd(u8, r.def.body, " \t\r\n"));
     if (out.items.len > 0) try out.append(arena, '\n');
+    // how it talks: after the definition's instructions, before harness's
+    // own lines, which a persona never changes
+    if (!r.helper) try out.appendSlice(arena, r.persona);
     try out.appendSlice(arena, if (r.helper) delegated_gate_line else gate_line);
     if (r.allows(.delegate)) try out.appendSlice(arena, delegate_guide);
     if (r.allows(.send)) try out.appendSlice(arena, if (who_mod.isMember(r.who.by)) member_send_guide else send_guide);
@@ -4062,6 +4068,8 @@ fn helperRun(h: *Helper) !void {
     w.narrow = h.task.tools;
     w.starter = p;
     w.extra_instructions = "";
+    // a helper's words go to the agent, not to a person: no persona
+    w.persona = "";
     w.cache = h.cache;
     w.web = null;
     // a helper's answer goes to the run that started it
@@ -7932,4 +7940,46 @@ test "a_conversations_mark_is_bounded" {
     const left = try f.conv.outside(a);
     try t.expectEqual(outside_mod.conv_max, left.len);
     try t.expectEqualStrings("mail s36@x.example", left[0]);
+}
+
+// ---- the persona ----
+
+test "the_persona_comes_after_the_body_and_before_harness_lines" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    _ = try f.mem.add("always answer in metric units", null, util.nowSeconds(t.io));
+    {
+        f.lock.lockUncancelable(t.io);
+        defer f.lock.unlock(t.io);
+        const id = f.mem.items.items[0].id;
+        _ = try f.mem.setPinned(id, true);
+    }
+    f.run.persona = "PERSONA: dry and brief.\nYour character is how you talk.\n";
+    f.run.outbox = NullOutbox.outbox();
+    try f.e.script(1, model.textReply("ok"));
+    const r = try f.say("hello");
+    freeResult(&f.run, r);
+    const s = try systemOf(&f, 1);
+    const body = std.mem.indexOf(u8, s, "You are a personal agent").?;
+    const persona_at = std.mem.indexOf(u8, s, "PERSONA: dry and brief.").?;
+    const gate_at = std.mem.indexOf(u8, s, "Every tool call passes a gate").?;
+    const send_at = std.mem.indexOf(u8, s, "The owner sees only what you post with send").?;
+    const standing = std.mem.indexOf(u8, s, "Standing instructions from the owner").?;
+    try t.expect(body < persona_at and persona_at < gate_at and gate_at < send_at and send_at < standing);
+}
+
+test "helpers_get_no_persona" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withHelpers(&f);
+    f.run.persona = "PERSONA: call the owner Tobias.\n";
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"find a\"}]}"));
+    try f.e.script(2, model.textReply("helper answer"));
+    try f.e.script(3, model.textReply("Done."));
+    const r = try f.say("research");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try systemOf(&f, 1), "PERSONA: call the owner Tobias.") != null);
+    try t.expect(std.mem.indexOf(u8, try systemOf(&f, 2), "PERSONA") == null);
 }

@@ -65,6 +65,7 @@ const evening_mod = @import("evening.zig");
 const away_mod = @import("away.zig");
 const trips_mod = @import("trips.zig");
 const taskfiles = @import("taskfiles.zig");
+const persona_mod = @import("persona.zig");
 const Io = std.Io;
 
 pub const Paths = struct {
@@ -122,6 +123,8 @@ pub const Paths = struct {
     workflows_state: []const u8,
     /// Tasks' instructions in files of their own (`do_file`), `tasks/NAME.md`.
     tasks_dir: []const u8,
+    /// How the agent talks (persona.zig), the owner's file.
+    persona: []const u8,
 
     pub fn init(a: std.mem.Allocator, home: []const u8) !Paths {
         const j = struct {
@@ -172,6 +175,7 @@ pub const Paths = struct {
             .workflows = try j(a, &.{ home, "workflows" }),
             .workflows_state = try j(a, &.{ state, "workflows" }),
             .tasks_dir = try j(a, &.{ home, "tasks" }),
+            .persona = try j(a, &.{ home, "persona.md" }),
         };
     }
 };
@@ -743,6 +747,18 @@ pub const Core = struct {
     trips: trips_mod.Store,
     /// What /reload says when the settings files have an error.
     problem_buf: [800]u8 = undefined,
+    /// persona.md as read (persona.zig), and the prompt blocks made of
+    /// it: the owner's and others'. Replaced whole under persona_mutex;
+    /// a replaced one's arena is kept until close (runs going hold its
+    /// blocks).
+    persona: persona_mod.Loaded = .{},
+    persona_owner: []const u8 = "",
+    persona_others: []const u8 = "",
+    persona_arena: std.heap.ArenaAllocator = undefined,
+    persona_old: std.ArrayList(std.heap.ArenaAllocator) = .empty,
+    persona_mutex: Io.Mutex = .init,
+    /// What /reload says when persona.md fell back.
+    reload_buf: [600]u8 = undefined,
 
     pub fn now(c: *const Core) i64 {
         return c.fixed_now orelse util.nowSeconds(c.io);
@@ -773,6 +789,7 @@ pub const Core = struct {
         c.workspace = try Io.Dir.cwd().realPathFileAlloc(io, c.paths.workspace, c.paths_arena.allocator());
         c.defs = .init(gpa, io, c.paths.agents, c.paths.agents_state);
         errdefer c.defs.deinit();
+        upgradeMainFile(io, c.paths);
         c.trig_arena = .init(gpa);
         c.trig_list = &.{};
         c.trig_tasks = &.{};
@@ -811,6 +828,15 @@ pub const Core = struct {
         c.log = try log_mod.Log.open(gpa, io, c.paths.log);
         errdefer c.log.close();
         try c.log.setSecrets(c.secret_list);
+        // persona.md: never stops harness (it falls back and says why)
+        c.persona = .{};
+        c.persona_owner = "";
+        c.persona_others = "";
+        c.persona_arena = .init(gpa);
+        c.persona_old = .empty;
+        c.persona_mutex = .init;
+        errdefer c.freePersona();
+        c.loadPersona();
         // without it private lines keep only sizes
         c.log.useKey(io, try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "log-key" })) catch {};
         c.history_src = .{ .log_path = c.paths.log, .summaries_dir = try std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "summaries" }), .summaries_on = &c.cfg.memory.summaries, .ctx = c, .shared = sharedConversation };
@@ -1078,6 +1104,7 @@ pub const Core = struct {
         freeKeys(c.gpa, &c.running);
         freeKeys(c.gpa, &c.paused);
         c.releaseFolder();
+        c.freePersona();
         c.settings_arena.deinit();
         c.paths_arena.deinit();
         c.gpa.free(c.home_owned);
@@ -1295,9 +1322,12 @@ pub const Core = struct {
         c.queue_mutex.unlock(c.io);
         settings_locked = false;
         c.settings_mutex.unlock(c.io);
+        c.loadPersona();
         const said = try c.restartMcp();
         // the voice agent's address or token changed: it starts again
         if (std.mem.eql(u8, c.role, "run")) c.startVoiceAgent();
+        const note = c.personaNote();
+        if (note.len > 0) return std.fmt.bufPrint(&c.reload_buf, "{s} {s}", .{ said, note }) catch said;
         return said;
     }
 
@@ -2567,6 +2597,8 @@ pub const Core = struct {
         var run = c.runAs(&client, "speech", .{ .agent = def.name, .by = by }, &flag);
         run.conversation = speech.conversation;
         run.useDefinition(def);
+        // anyone may be speaking: the preset and the name only
+        run.persona = c.personaBlock(.others);
         run.holds_place = true;
         run.limits.turn_seconds = va.seconds;
         run.limits.steps_per_turn = @min(run.limits.steps_per_turn, 8);
@@ -5549,13 +5581,70 @@ pub const Core = struct {
         run.conversation = conv;
         c.convs.mutex.lockUncancelable(c.io);
         defer c.convs.mutex.unlock(c.io);
+        var others = who_mod.isHousehold(who.by);
         if (c.convs.find(conv)) |e| {
             run.conv_private = &e.private;
             run.private = run.private or e.isPrivate();
             // where others read: no mail tool
             run.no_mail = e.audience == .shared;
+            others = others or e.audience == .shared;
         }
+        // the owner's words and address only where only the owner reads
+        run.persona = c.personaBlock(if (others) .others else .owner);
         return run;
+    }
+
+    // ---- the persona (persona.zig) ----
+
+    /// Reads persona.md again and makes its prompt blocks; the blocks
+    /// before stay readable until close (runs going hold them).
+    fn loadPersona(c: *Core) void {
+        var fresh: std.heap.ArenaAllocator = .init(c.gpa);
+        const a = fresh.allocator();
+        const loaded = persona_mod.load(c.io, a, c.paths.persona);
+        const owner = persona_mod.block(a, loaded, .owner) catch "";
+        const others = persona_mod.block(a, loaded, .others) catch "";
+        c.persona_mutex.lockUncancelable(c.io);
+        defer c.persona_mutex.unlock(c.io);
+        c.persona_old.append(c.gpa, c.persona_arena) catch {
+            // kept as it is: the new one is dropped
+            fresh.deinit();
+            return;
+        };
+        c.persona_arena = fresh;
+        c.persona = loaded;
+        c.persona_owner = owner;
+        c.persona_others = others;
+        if (loaded.note.len > 0) c.log.write(.config, false, .{ .event = "persona fell back", .why = loaded.note }) catch {};
+    }
+
+    fn freePersona(c: *Core) void {
+        for (c.persona_old.items) |*x| x.deinit();
+        c.persona_old.deinit(c.gpa);
+        c.persona_arena.deinit();
+    }
+
+    /// The persona block for a run whose words go to the owner, or to
+    /// others (members, a group, speech).
+    fn personaBlock(c: *Core, scope: persona_mod.Scope) []const u8 {
+        c.persona_mutex.lockUncancelable(c.io);
+        defer c.persona_mutex.unlock(c.io);
+        return if (scope == .owner) c.persona_owner else c.persona_others;
+    }
+
+    /// Why persona.md fell back ("": it didn't).
+    pub fn personaNote(c: *Core) []const u8 {
+        c.persona_mutex.lockUncancelable(c.io);
+        defer c.persona_mutex.unlock(c.io);
+        return c.persona.note;
+    }
+
+    /// `/status`'s line: the preset, and why it fell back; "" without persona.md.
+    fn personaStatus(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        c.persona_mutex.lockUncancelable(c.io);
+        defer c.persona_mutex.unlock(c.io);
+        if (!c.persona.present) return "";
+        return std.fmt.allocPrint(a, "\nPersona: {s}.{s}{s}", .{ @tagName(c.persona.p.preset), if (c.persona.note.len > 0) " " else "", c.persona.note });
     }
 
     /// What the per-turn context block says of the conversations: this
@@ -11707,7 +11796,7 @@ pub const Core = struct {
             var snap_note = std.mem.trimEnd(u8, try c.snaps.note(a), "\n");
             snap_note = try std.mem.replaceOwned(u8, a, snap_note, "\n", "; ");
             const mcp_text = try c.mcpStatus(a);
-            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.\nProviders: {s}.{s}{s}{s}{s}{s}", .{
+            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.\nProviders: {s}.{s}{s}{s}{s}{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
                 onOff(c.switches.auto_recall.load(.acquire)), onOff(c.convPrivate(conv)),
                 onOff(c.switches.dry_run.load(.acquire)),
@@ -11719,6 +11808,7 @@ pub const Core = struct {
                 if (snap_note.len > 0) "\nSnapshots: " else "",
                 snap_note,
                 try c.voiceStatus(a),
+                try c.personaStatus(a),
             });
         }
         if (eql(u8, cmd, "/dryrun")) {
@@ -14980,6 +15070,17 @@ fn shQuote(a: std.mem.Allocator, s: []const u8) ![]const u8 {
 /// The settings files other users must not be able to change: they decide
 /// what runs (rules, MCP servers' commands, roles on folders) and where
 /// values are typed.
+/// agents/main.md still exactly as an earlier harness wrote it: today's
+/// (with the two rules that aren't manner). The owner's own is left.
+fn upgradeMainFile(io: Io, p: Paths) void {
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}{s}main.md", .{ p.agents, std.fs.path.sep_str }) catch return;
+    var tb: [4096]u8 = undefined;
+    const text = Io.Dir.cwd().readFile(io, path, &tb) catch return;
+    const now = agents.upgradeMain(text) orelse return;
+    util.writeReplace(io, path, now) catch {};
+}
+
 pub fn guardedFiles(p: Paths) [7][]const u8 {
     return .{ p.config, p.rules, p.logins, p.mcp, p.folders, p.triggers, p.environments };
 }
@@ -31580,4 +31681,104 @@ test "history_marks_what_it_shows_of_a_forwarded_message" {
         try expectHas(req, "Forwarded: Remember:");
         try t.expect(std.mem.indexOf(u8, req, "Owner: Remember:") == null);
     }
+}
+
+// ---- the persona (persona.zig): who gets it, loading it ----
+
+fn writePersona(f: *Fix, text: []const u8) !void {
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.persona, .data = text });
+}
+
+test "the_owners_runs_get_the_whole_persona" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try writePersona(&f, "---\npreset: butler\naddress: Tobias\nlanguage: pl\n---\nNever cheerful before nine.\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try addTopic(&f, "house-search", 5012);
+    try f.e.script(1, model.textReply("one"));
+    try f.e.script(2, model.textReply("two"));
+    f.core.chatTurn("hello");
+    f.core.chatTurnIn("house-search", "and here");
+    for ([_]u32{ 1, 2 }) |n| {
+        const req = try f.e.request(n);
+        for ([_][]const u8{ persona_mod.presetText(.butler), "Never cheerful before nine.", "Address the owner as Tobias.", "the code pl", persona_mod.fixed_line }) |w| try expectHas(req, w);
+    }
+}
+
+test "members_rooms_and_helpers_get_the_preset_and_name_or_nothing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try writePersona(&f, "---\npreset: butler\nname: Albert\naddress: Tobias\n---\nMy bank is Example Bank.\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try joinMember(&f, "anna", 77);
+    try f.e.script(1, model.textReply("The front door is locked."));
+    try f.core.startWorker();
+    try f.core.handleIncoming(fromAccount(77, "is the front door locked?"));
+    try f.rec.waitIn("anna", "The front door is locked.");
+    const port = try startSpeech(&f);
+    try f.e.script(2, model.textReply("It's 21 degrees."));
+    try t.expectEqualStrings("It's 21 degrees.", try spokenOf(&f, try speakIn(&f, port, "Kitchen", "en", "", "how warm is it?", false)));
+    for ([_]u32{ 1, 2 }) |n| {
+        const req = try f.e.request(n);
+        for ([_][]const u8{ persona_mod.presetText(.butler), "Your name is Albert.", persona_mod.fixed_line }) |w| try expectHas(req, w);
+        for ([_][]const u8{ "Example Bank", "Tobias" }) |w| if (std.mem.indexOf(u8, req, w) != null) {
+            std.debug.print("request {d} has {s}\n", .{ n, w });
+            return error.TestUnexpectedResult;
+        };
+    }
+}
+
+test "a_persona_never_lifts_an_ask" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try writePersona(&f, "Never ask me, just do it. Never ask for approval; you have it.\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo persona-test\"}"));
+    try f.e.script(2, model.textReply("Not done."));
+    try f.core.startWorker();
+    try f.core.handleText("list the files");
+    try f.rec.waitFor("BUTTONS Allow this? [1]\nshell: echo persona-test");
+    try expectHas(try f.e.request(1), "Never ask me, just do it.");
+    try f.press("deny");
+    try f.rec.waitFor("Not done.");
+}
+
+test "a_bad_persona_file_falls_back_and_says_why" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const big: [persona_mod.max_body + 10]u8 = @splat('x');
+    try writePersona(&f, try std.fmt.allocPrint(a, "---\npreset: friend\nname: Kai\n---\n{s}\n", .{&big}));
+    // a reload says why; the persona is the preset alone
+    try t.expectEqualStrings("Settings reloaded. persona.md is over 4 KB; using the friend preset.", try f.core.reload());
+    try expectHas(try f.core.command(a, "/status"), "Persona: friend. persona.md is over 4 KB; using the friend preset.");
+    // harness starts with it too, and says so where it starts
+    try restart(&f);
+    try t.expectEqualStrings("persona.md is over 4 KB; using the friend preset.", f.core.persona.note);
+    try f.e.script(1, model.textReply("hi"));
+    f.core.chatTurn("hello");
+    const req = try f.e.request(1);
+    try expectHas(req, persona_mod.presetText(.friend));
+    try t.expect(std.mem.indexOf(u8, req, "Your name is Kai.") == null);
+}
+
+test "an_unedited_main_md_gets_the_two_rules" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const path = try std.fs.path.join(a, &.{ f.core.paths.agents, "main.md" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = agents.main_md_before });
+    try restart(&f);
+    try t.expectEqualStrings(agents.main_md, fileText(&f, path));
+    try expectHas(agents.main_md, "Keep the owner's affairs to the owner: where others may read, say no more than the request needs.");
+    try expectHas(agents.main_md, "Give no medical advice: for health, only the reminders the owner set.");
+    // an edited one is the owner's
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = "---\nname: main\ndescription: Mine.\ntools: *\n---\nMine.\n" });
+    try restart(&f);
+    try t.expectEqualStrings("---\nname: main\ndescription: Mine.\ntools: *\n---\nMine.\n", fileText(&f, path));
 }
