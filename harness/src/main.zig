@@ -2731,6 +2731,7 @@ test {
     _ = @import("upkeep.zig");
     _ = @import("taskfiles.zig");
     _ = @import("yaml.zig");
+    _ = @import("zones.zig");
 }
 
 test "harness_people_takes_list_show_and_import" {
