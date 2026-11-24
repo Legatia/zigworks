@@ -558,6 +558,13 @@ Rulings:
   paths. Before, any failure ended them: on GitHub's Windows runner one
   command's failure made `/env check` say no (CI run 45388410033).
   `/env check`'s line names Windows' error.
+- R38. `/env check`'s line for cmd's own commands lists the sandbox's
+  home, never the workspace: `dir` of an empty folder is an error on
+  some Windows (the runner's; not on this machine's build 26300), and the
+  test's workspace is empty. That, most likely, is what CI run
+  45388410033 failed on. The SHARING_VIOLATION in its trace is a rename
+  `util.writeReplace` tried again and got through (a test's error trace
+  holds the errors handled on the way).
 
 Measured here: a sandboxed `echo` takes about 35 ms more (142 ms against 109).
 

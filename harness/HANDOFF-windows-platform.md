@@ -202,6 +202,14 @@ and cross builds green, and the owner decides every push.
   advapi32 and userenv on Windows (build.zig). Nothing in the gate, the
   agent's call path or the conversations' state changed; `shellDef` has
   one more sentence on Windows.
+- CI after the cmd push (runs 45388410033, 45392418965): the failing
+  line was the test's own (`/env check` said "no" for cmd's own
+  commands), not the SHARING_VIOLATION in the trace, which is a rename
+  `writeReplace` tried again and got through. Two causes fixed: the
+  probe ran `dir` in the test's empty workspace, which some Windows
+  count as an error (it lists the sandbox's home now), and one failed
+  start of a session ended the drives for the whole process (R37, R38
+  in the plan's section 9).
 - For the Mac session: `calendar_attendees_become_people` fails on every
   system while the clock is inside a busy event of its fixture (the
   owner is busy, so the line is held): CI run 45388410033 ran during
