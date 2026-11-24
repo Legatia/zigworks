@@ -5,6 +5,27 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## CI after your cmd push (772c8c4, dfb489f): red on Windows
+
+Runs 45388410033 and 45392418965 fail on Windows, in Debug, in
+`core.test.env_check_probes_a_sandbox_and_a_copy_environment`:
+
+```
+error.Unexpected NTSTATUS=0xc0000043 (SHARING_VIOLATION)
+… dirRenameWindowsInner … util.zig:36 writeReplaceWaiting
+```
+
+- `writeReplaceWaiting` already waits 2 s for a held file, so something
+  holds it longer. Likely the launcher, or its logon session's drives,
+  still has the file open after the check.
+- It passed on Windows at 2d3c3d2, just before your push.
+- It's yours to fix, since it needs a Windows machine.
+
+The same runs also failed on all three systems in
+`calendar_attendees_become_people`. That one is ours: the test read the
+real clock, and the fixture has a busy event from 12:00 to 13:00 UTC on
+2026-11-24. It's fixed in ed34e74 with a fixed clock.
+
 ## Also designed: the Hermes import (2026-11-24)
 
 Spec: `docs/superpowers/specs/2026-11-24-harness-hermes-import-design.md`
