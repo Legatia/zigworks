@@ -208,6 +208,19 @@ service, speaker, MCP server, authorization server, mail server (IMAP,
 SMTP), CalDAV server or website: stand-ins only. `harness/TESTERS.md` is
 for the people who will.
 
+Two Telegram facts the persona-and-topics build leans on and nobody has
+tried against Telegram yet:
+
+- **Pins in private topics.** That a message pinned with `pinChatMessage`
+  shows at the top of its topic in a private chat (each topic seems to keep
+  its own pins: `unpinAllForumTopicMessages` accepts private chats), and
+  whether pins there are limited. If a pin doesn't show, the card is still
+  the topic's first message, edited in place.
+- **Topic links.** That `https://t.me/<bot_username>/<thread>` (Bot API
+  10.5) opens that topic for the owner, from a link entity in a message;
+  and that `setMySettings` with `has_topics_enabled` switches topics on
+  (setup explains the @BotFather switch when it fails).
+
 ## Infrastructure
 
 GitHub cancels macOS jobs that wait about 15 minutes for a runner (most
@@ -223,3 +236,4 @@ test that starves the machine.
 
 - ~~calmcp ignores tool fields it doesn't know~~ **done (2026-11-24, carheat)**: a field a tool doesn't take is refused, nothing read or written.
 - ~~**Security (from a review, 2026-11-23): harness's own jobs share the `schedule:NAME` principal with user tasks, briefs and schedules.**~~ **Fixed (2026-11-24)**: harness's own jobs run as `harness:NAME` (`harness:people`, `harness:away`, `harness:trips`, `harness:warm-car`, `harness:habits`, `harness:evening`, `harness:lists`, `harness:reorder`, `harness:deliveries`, `harness:upkeep`), a who kind no settings file produces: rules sections `[harness:NAME]`, nobody to ask in them (as schedules), and only harness's own workflow of that name may name it in its start line. The shipped rules say `[harness:away]`; a task named `away` or `people` gets none of their lines (tests a_task_named_away_gets_none_of_harnesss_away_lines, a_task_named_people_gets_none_of_harnesss_people_lines).
+- ~~A persona, one chat filed into topics, helpers main manages~~ **built (2026-11-24, persona-topics)**: `persona.md` (butler, assistant, friend or the owner's words) after main's instructions, members and speech the preset and name only, helpers none; `/persona`; the butler manner migrated; SOUL.md → persona.md. Topics: [Use topics] (setMySettings or the BotFather switch), House, Travel, Errands, Mail and diary, Work; posts filed by subject (routines' `subject`, the owner's `to` wins, urgent in main with a record line); questions in their topic with a pointer in main; a digest per topic and main's line; a pinned card per topic built from state, edited at most once a minute; `/overview`, `/focus`, `/card`; the evening's and the morning's `{topics}` lines. `main` saves, changes and retires its own plain helpers without asking (a quiet line with [Remove]/[Undo]); a quiet Work post per `delegate` call built from the log (folded quotes, entities, no parse_mode); `/work`.

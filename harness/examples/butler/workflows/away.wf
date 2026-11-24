@@ -6,6 +6,7 @@
 # evening, and one line comes at 20:00; before you're back the heating
 # goes up again. Nothing guarded is ever touched.
 workflow away
+subject house
 about When the house is empty (everyone out <away after>, a trip, or /away): a line, and one tap before the heating goes down.
 start owner, harness:away
 tag no

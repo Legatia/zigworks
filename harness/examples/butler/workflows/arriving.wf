@@ -1,5 +1,6 @@
 # Arriving: when the first of you comes home, the heating goes back up.
 workflow arriving
+subject house
 about When the first of you comes home: the heating back to <home temp> °C, and a line saying so.
 start trigger:first-home
 tag no

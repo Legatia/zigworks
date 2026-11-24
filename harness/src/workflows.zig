@@ -113,6 +113,11 @@ pub const Workflow = struct {
     limits: Limits = .{},
     /// The conversation it reports to.
     to: []const u8 = "main",
+    /// `to` was written (the owner's own wins over `subject`).
+    to_set: bool = false,
+    /// `subject house` (topics.zig): with no `to`, its posts go to that
+    /// subject's topic when topics are in use; "": none.
+    subject: []const u8 = "",
     /// The definition its agent steps run.
     agent: []const u8 = "main",
     agent_line: usize = 0,
@@ -280,7 +285,7 @@ fn readLines(a: Allocator, text: []const u8, diag: *Diag, saved: *[]const u8) Er
     return out.items;
 }
 
-const head_keys = [_][]const u8{ "workflow", "about", "start", "limits", "to", "urgent", "phrases", "tag", "escalate" };
+const head_keys = [_][]const u8{ "workflow", "about", "start", "limits", "to", "subject", "urgent", "phrases", "tag", "escalate" };
 const step_keys = [_][]const u8{ "tool", "do", "wait", "approve", "review", "say", "answer", "tools", "match", "if", "retry", "on", "timeout", "env", "goto", "end", "yes", "no", "fallback" };
 
 /// What a fallback may do: homemcp's guarded tool, the safe way only.
@@ -461,6 +466,10 @@ fn headLine(a: Allocator, w: *Workflow, l: Line, file_name: []const u8, diag: *D
     } else if (eql(u8, l.key, "to")) {
         if (!conversations.validName(v)) return bad(diag, l.n, "to names a conversation: a-z, 0-9, - and _");
         w.to = v;
+        w.to_set = true;
+    } else if (eql(u8, l.key, "subject")) {
+        if (!oneOf(v, &subjects)) return bad(diag, l.n, "subject is house, travel, errands, mail or work: the topic its posts go to, with no to");
+        w.subject = v;
     } else if (eql(u8, l.key, "urgent")) {
         // `urgent yes`, or as triggers.ini writes it, `urgent = yes`
         const word = std.mem.trim(u8, if (std.mem.startsWith(u8, v, "=")) v[1..] else v, " \t");
@@ -491,6 +500,9 @@ fn headLine(a: Allocator, w: *Workflow, l: Line, file_name: []const u8, diag: *D
         };
     }
 }
+
+/// The butler's subjects (topics.zig's).
+pub const subjects = [_][]const u8{ "house", "travel", "errands", "mail", "work" };
 
 /// The built-in tools a `tool` step may call.
 const step_tools = [_][]const u8{ "shell", "read_file", "write_file", "fetch", "browse", "search", "recall", "remember", "skill", "snapshot" };
@@ -731,15 +743,16 @@ fn condOf(a: Allocator, text: []const u8, placeholders: bool) !triggers.Cond {
 fn namesIn(a: Allocator, w: Workflow, s: Step, diag: *Diag) Error!void {
     const n = if (s.action_line != 0) s.action_line else s.line;
     switch (s.action) {
-        .do, .approve, .review, .say => |text| try checkText(a, w, text, n, diag),
+        .do, .approve, .review => |text| try checkText(a, w, text, n, diag, false),
+        .say => |text| try checkText(a, w, text, n, diag, true),
         .tool => |tl| {
             const v = jv.parse(a, tl.json) orelse return bad(diag, n, "the tool's input is a JSON object");
             try checkJson(a, w, v, n, diag);
         },
         else => {},
     }
-    for (s.match) |m| try checkText(a, w, m, s.match_line, diag);
-    for (s.ifs) |f| if (try nameProblem(a, w, f.cond.field)) |why| return bad(diag, f.line, why);
+    for (s.match) |m| try checkText(a, w, m, s.match_line, diag, false);
+    for (s.ifs) |f| if (try nameProblem(a, w, f.cond.field, false)) |why| return bad(diag, f.line, why);
 }
 
 /// Whether `text` holds a `{value}` (a brace before a name; `{{` is a brace).
@@ -779,7 +792,7 @@ fn jsonHasPlaceholder(v: jv.Value) bool {
 
 fn checkJson(a: Allocator, w: Workflow, v: jv.Value, n: usize, diag: *Diag) Error!void {
     switch (v) {
-        .string => |s| try checkText(a, w, s, n, diag),
+        .string => |s| try checkText(a, w, s, n, diag, false),
         .array => |arr| for (arr.items) |x| try checkJson(a, w, x, n, diag),
         .object => |o| {
             var it = o.iterator();
@@ -789,7 +802,7 @@ fn checkJson(a: Allocator, w: Workflow, v: jv.Value, n: usize, diag: *Diag) Erro
     }
 }
 
-fn checkText(a: Allocator, w: Workflow, text: []const u8, n: usize, diag: *Diag) Error!void {
+fn checkText(a: Allocator, w: Workflow, text: []const u8, n: usize, diag: *Diag, say: bool) Error!void {
     var i: usize = 0;
     while (i < text.len) {
         if (text[i] != '{') {
@@ -808,15 +821,21 @@ fn checkText(a: Allocator, w: Workflow, text: []const u8, n: usize, diag: *Diag)
             continue;
         }
         if (std.mem.startsWith(u8, name, "secret:")) return bad(diag, n, "a step names no secret: MCP servers hold their own (mcp.ini)");
-        if (try nameProblem(a, w, name)) |why| return bad(diag, n, why);
+        if (try nameProblem(a, w, name, say)) |why| return bad(diag, n, why);
         i = close + 1;
     }
 }
 
 /// Why `name` is no value an instance can have; null: it can be.
-fn nameProblem(a: Allocator, w: Workflow, name: []const u8) !?[]const u8 {
+fn nameProblem(a: Allocator, w: Workflow, name: []const u8, say: bool) !?[]const u8 {
     const dot = std.mem.indexOfScalar(u8, name, '.');
     const root = name[0 .. dot orelse name.len];
+    // {topics}: a line per topic with news, which core fills in a say
+    // step; a step called topics is that step's value
+    if (std.mem.eql(u8, name, "topics") and w.find("topics") == null) {
+        if (say) return null;
+        return "{topics} is for a say step: a line per topic with news";
+    }
     if (oneOf(root, &.{ "input", "instance", "now" })) {
         if (dot != null) return try std.fmt.allocPrint(a, "{{{s}}}: {s} has no fields", .{ name, root });
         return null;
@@ -825,7 +844,7 @@ fn nameProblem(a: Allocator, w: Workflow, name: []const u8) !?[]const u8 {
     if (w.find(root) != null) return null;
     var names: std.ArrayList(u8) = .empty;
     for (w.steps, 0..) |s, i| try names.print(a, "{s}{s}", .{ if (i > 0) ", " else "", s.name });
-    return try std.fmt.allocPrint(a, "{{{s}}} names no step (steps: {s}) nor input, event, instance or now", .{ name, names.items });
+    return try std.fmt.allocPrint(a, "{{{s}}} names no step (steps: {s}) nor input, event, instance, now or topics", .{ name, names.items });
 }
 
 /// A placeholder's name: letters, digits, `_`, `-`, `.` (and `:` only to
@@ -1682,4 +1701,29 @@ test "harness_jobs_start_their_workflows_without_a_section" {
     // any other schedule needs its section, away's name too
     for ([_][]const u8{ "workflow away\nstart schedule:away\nstep s\nsay hi\n", "workflow away\nstart schedule:nightly\nstep s\nsay hi\n" }) |text|
         try t.expectError(error.BadWorkflow, check(a, try parse(a, "away", text, &d), .{}, &d));
+}
+
+test "subject_is_read_and_to_set_known" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    const w = try parse(a, "bill", "workflow bill\nsubject mail\nstep tell\nsay {input}{topics}\n", &d);
+    try t.expectEqualStrings("mail", w.subject);
+    try t.expect(!w.to_set);
+    try t.expectEqualStrings("main", w.to);
+    const own = try parse(a, "bill", "workflow bill\nsubject mail\nto main\nstep tell\nsay hi\n", &d);
+    try t.expect(own.to_set);
+    try t.expectError(error.BadWorkflow, parse(a, "bill", "workflow bill\nsubject kitchen\nstep tell\nsay hi\n", &d));
+    try t.expect(std.mem.indexOf(u8, d.why, "subject is house, travel, errands, mail or work") != null);
+}
+
+test "a_step_may_be_called_topics_and_topics_is_for_say" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    _ = try parse(a, "w", "workflow w\nstep topics\ndo Make the topics.\nstep tell\nsay {topics}\n", &d);
+    try t.expectError(error.BadWorkflow, parse(a, "w", "workflow w\nstep a\ndo Use {topics}.\n", &d));
+    try t.expect(std.mem.indexOf(u8, d.why, "{topics} is for a say step") != null);
 }

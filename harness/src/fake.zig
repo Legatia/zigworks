@@ -59,6 +59,8 @@ pub const Server = struct {
     /// Transcription requests seen so far.
     stt_n: std.atomic.Value(u32) = .init(0),
     tg_n: std.atomic.Value(u32) = .init(0),
+    /// What setMySettings set for topics: 0 nothing yet, 1 off, 2 on.
+    tg_topics: std.atomic.Value(u8) = .init(0),
     /// Telegram calls answered with `telegram/fail.json`'s error so far.
     tg_failed: std.atomic.Value(i64) = .init(0),
     mutex: Io.Mutex = .init,
@@ -473,6 +475,21 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, method, "createForumTopic") and s.readScript(a, &.{ "telegram", "no-topics" }) != null)
             return json(req, .bad_request, "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: topics are not enabled in this chat\"}");
+        // setMySettings refused while telegram/no-settings exists; else
+        // getMe answers what it set
+        if (std.mem.eql(u8, method, "setMySettings")) {
+            if (s.readScript(a, &.{ "telegram", "no-settings" }) != null)
+                return json(req, .bad_request, "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: method is not available\"}");
+            const on = jv.boolean(jv.get(jv.parse(a, body), "has_topics_enabled")) orelse false;
+            s.tg_topics.store(if (on) 2 else 1, .release);
+        }
+        // an edit of a message listed in telegram/gone: Telegram no longer has it
+        if (std.mem.eql(u8, method, "editMessageText")) if (s.readScript(a, &.{ "telegram", "gone" })) |gone| {
+            const id = jv.int(jv.get(jv.parse(a, body), "message_id")) orelse 0;
+            var it = std.mem.tokenizeAny(u8, gone, " \r\n");
+            while (it.next()) |w| if ((std.fmt.parseInt(i64, w, 10) catch -1) == id)
+                return json(req, .bad_request, "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message to edit not found\"}");
+        };
         // record everything else, with the message id it is answered with
         // (numbered under the lock, so the lines and the ids agree)
         const n = blk: {
@@ -493,7 +510,13 @@ pub const Server = struct {
         };
         // getMe: telegram/me.json, else a bot with topics in private chats
         if (std.mem.eql(u8, method, "getMe")) {
-            const me = s.readScript(a, &.{ "telegram", "me.json" }) orelse "{\"id\":1,\"is_bot\":true,\"first_name\":\"harness\",\"username\":\"harness_test_bot\",\"has_topics_enabled\":true}";
+            const scripted = s.readScript(a, &.{ "telegram", "me.json" });
+            const set = s.tg_topics.load(.acquire);
+            if (set != 0) {
+                const name = if (scripted) |x| jv.str(jv.get(jv.parse(a, x), "username")) orelse "harness_test_bot" else "harness_test_bot";
+                return json(req, .ok, try std.fmt.allocPrint(a, "{{\"ok\":true,\"result\":{{\"id\":1,\"is_bot\":true,\"first_name\":\"harness\",\"username\":{f},\"has_topics_enabled\":{}}}}}", .{ std.json.fmt(name, .{}), set == 2 }));
+            }
+            const me = scripted orelse "{\"id\":1,\"is_bot\":true,\"first_name\":\"harness\",\"username\":\"harness_test_bot\",\"has_topics_enabled\":true}";
             return json(req, .ok, try std.fmt.allocPrint(a, "{{\"ok\":true,\"result\":{s}}}", .{std.mem.trim(u8, me, " \r\n")}));
         }
         // getFile: telegram/files/ID, as voice/ID.oga; none: a 400
