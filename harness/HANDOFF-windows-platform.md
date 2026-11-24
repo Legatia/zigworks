@@ -5,6 +5,34 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## Also designed: the Hermes import (2026-11-24)
+
+Spec: `docs/superpowers/specs/2026-11-24-harness-hermes-import-design.md`
+(91a62e0). It has been reviewed and is waiting on the owner's approval.
+Nothing is built yet.
+
+**What it adds:**
+
+- `harness import hermes`: memory, skills, scheduled jobs, MCP servers,
+  deny rules and models from `~/.hermes`. It shows a plan first, copies
+  no secrets, and refuses while `harness run` is running.
+- `harness skill add|list|show|update|rm`: skills from a folder, a GitHub
+  `owner/repo` or a `SKILL.md` link. Each keeps its source and a hash in
+  `skills/.sources`.
+
+**Shared code it will touch:**
+
+- `config.zig`: tasks get `do_file`, read from a guarded `tasks/` folder;
+- `mcp.zig`: an `env = NAME=VALUE` key;
+- `skills.zig`: a closing fence followed by spaces;
+- `main.zig`: the new commands.
+
+**For Windows:**
+
+- Hermes's home is `%LOCALAPPDATA%\hermes`.
+- The skill archive reader refuses names Windows can't hold.
+- There's no executable bit.
+
 ## Coming next from the Mac session: prompt-injection checks (2026-11-24)
 
 Spec: `docs/superpowers/specs/2026-11-24-harness-injection-checks-design.md`
