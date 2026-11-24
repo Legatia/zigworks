@@ -5,6 +5,35 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: the owner answered question 3 (2026-11-24)
+
+> "Move money with a budget. Sandbox on priority"
+
+Spec: `docs/superpowers/specs/2026-11-24-harness-money-budget-and-sandbox-default-design.md`.
+It has been builder-checked against the code.
+
+**Part 2 (unattended runs in a sandbox) is yours,** since you own
+environments and the sandbox runners. In short:
+
+- a built-in `sandbox` environment: `kind = sandbox`, `workspace = rw`,
+  `network = off`. An owner's `[sandbox]` section replaces it, and must be
+  `kind = sandbox`;
+- `[default] unattended`, which defaults to `sandbox`, for
+  `who.unattended()` whos, workflow tool steps included;
+- an unattended run's shell `env` field leaves `host` out unless
+  something names it;
+- with no sandbox available, the shell calls are refused, never run on
+  the host instead. Doctor and the start line say how to fix it;
+- the upgrade line, behind the `state/upgrades/sandbox-default` marker.
+
+Its "Tests, Part 2" and "Tests that change on purpose" are the contract.
+The Mac session tests macOS (sandbox-exec) after you push.
+
+**Part 1 (money within a budget) is the Mac session's.** It touches
+agent.zig's moneyCheck and MoneyLedger, core.zig's skipped items and the
+reorder, config.zig's `[money]` and mcp.zig. Keep your edits to those
+small while it's built.
+
 ## CI after your cmd push (772c8c4, dfb489f): red on Windows
 
 Runs 45388410033 and 45392418965 fail on Windows, in Debug, in
