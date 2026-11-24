@@ -6,6 +6,7 @@
 const std = @import("std");
 const jv = @import("jv.zig");
 const util = @import("util.zig");
+const outside_mod = @import("outside.zig");
 const Io = std.Io;
 
 /// One run, from its lines in the log.
@@ -195,7 +196,8 @@ pub fn render(a: std.mem.Allocator, text: []const u8, rid: u64, max: usize) !?[]
             const by = field(a, v, "by");
             try out.print(a, "Run {d}: {s}, by {s}, in {s}, {s}\n", .{ rid, field(a, v, "run"), by, field(a, v, "conversation"), field(a, v, "time") });
             if (std.mem.eql(u8, l.kind, "turn")) {
-                try out.print(a, "{s}: {s}\n", .{ if (std.mem.eql(u8, by, "owner")) "Owner" else "Instruction", util.cut(field(a, v, "text"), 200) });
+                // someone else's words it started with are never the owner's
+                try out.print(a, "{s}: {s}\n", .{ outside_mod.startLabel(std.mem.eql(u8, by, "owner"), try outside_mod.ofLine(a, v)), util.cut(field(a, v, "text"), 200) });
                 continue;
             }
         }

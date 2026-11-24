@@ -9,13 +9,16 @@
 //! sign-in: it opens URL, follows its redirect to 127.0.0.1, and prints the
 //! page's status and text. `harness-fake --ha URL TOKEN BODY` is Home
 //! Assistant's llama.cpp integration: it POSTs BODY to URL with TOKEN as
-//! its API key and prints the answer's status and body.
+//! its API key and prints the answer's status and body. `harness-fake
+//! inject DIR ORIGIN STORE` writes the prompt-injection demo's pages and
+//! calls into DIR from the catalog (inject.zig).
 const std = @import("std");
 const fake = @import("fake.zig");
 const fake_mcp = @import("fake_mcp.zig");
 const fake_cal = @import("fake_cal.zig");
 const fake_shop = @import("fake_shop.zig");
 const proc = @import("proc.zig");
+const inject = @import("inject.zig");
 
 pub fn main(init: std.process.Init) u8 {
     const io = init.io;
@@ -55,6 +58,14 @@ pub fn main(init: std.process.Init) u8 {
         const out = std.fmt.allocPrint(init.arena.allocator(), "{d}\n{s}\n", .{ page.status, page.body }) catch return 1;
         std.Io.File.stdout().writeStreamingAll(io, out) catch return 1;
         return if (page.status == 200) 0 else 1;
+    }
+    // the injection demo's pages and calls, from the catalog
+    if (args.len == 5 and std.mem.eql(u8, args[1], "inject")) {
+        inject.writeDemo(io, init.arena.allocator(), args[2], args[3], args[4]) catch |e| {
+            std.debug.print("harness-fake: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        return 0;
     }
     if (args.len == 5 and std.mem.eql(u8, args[1], "--ha")) {
         const page = fake.sayAsHomeAssistant(io, init.arena.allocator(), args[2], args[3], args[4]) catch |e| {

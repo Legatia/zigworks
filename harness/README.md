@@ -330,7 +330,8 @@ Every tool call is decided in one place, in this order:
    memory, `skill`, `snapshot` and `delegate` are allowed (each helper's
    own calls pass the gate like any other). `agent_save`, `trigger` `add`
    and `workflow` `save` are asked every time; `trigger` `rm`, `workflow`
-   `start` and `workflow` `stop` ask.
+   `start` and `workflow` `stop` ask. Once a run has read outside text,
+   `remember` and `people note` ask too (see Prompt injection).
 
 ```
 deny  shell rm -rf *
@@ -462,6 +463,93 @@ turn's time.
 Money tools (below), `agent_save` (Agent definitions), the `trigger`
 tool's `add` (Triggers) and the `workflow` tool's `save` (Workflows) are
 the exception: asked every time.
+
+## Prompt injection
+
+Pages, search results, feeds, other people's mail and other servers'
+results can carry words written to steer the agent. harness doesn't try
+to spot them: the gate decides each call by who started the run and your
+rules, and a page's words change neither.
+
+What holds:
+
+- Every call passes the gate, decided by who started the run.
+- Money and setup calls (`agent_save`, `env_save`, `app_save`, `trigger`
+  `add`, `workflow` `save`) are asked every time while you're there,
+  with no "Allow 24 h".
+- A run nobody watches (a schedule, a trigger, a workflow) can't wait for
+  an answer: whatever would be asked is refused, and you get a skipped
+  item.
+- Secrets never reach the model, and tool output is masked, including a
+  value's unbroken base64, hex and URL-encoded forms.
+- Outside text marks the conversation that read it: pages (`fetch`,
+  `browse`, the `web` browser's hosts), search results, what a trigger or
+  brief collected, others' mail and the quoted or forwarded parts of
+  yours, the calendar's and other MCP servers' results, a Telegram
+  message you forwarded, `history` results with earlier tool results,
+  and helpers' pages. The mark lasts while those words are in the model's
+  context: a summary keeps it, trimming drops it with its turn, `/new`
+  clears it. A workflow keeps its own in its state. Shell output,
+  workspace files, MCP tool descriptions, the home and car servers
+  (`[home]`, `[car]`) and household messages don't mark.
+- In a marked conversation every question, one-tap item and gate line
+  names up to three sources: "This run read outside text first: page
+  blog.example, mail from x@y.example." in the question,
+  `"outside":["page blog.example", …]` (and `"outside_more":N`) in the
+  log, never the text itself.
+- In a marked conversation `remember` and `people note` are asked, showing
+  the whole memory, or the name, field and value; never for 24 hours.
+  Unattended they are refused ("outside text, unattended") and kept as
+  skipped items. Your own lines decide: `allow remember *` lifts it, a
+  `deny` still refuses.
+- The memory writer reads only your own words of a marked turn: not the
+  agent's replies, not quoted or forwarded mail, not a forwarded message.
+  A fact from outside reaches memory only through an asked `remember`.
+  Long memory's day summaries follow the same rule: they leave out what
+  pages, search and other servers answered, and the agent's words in runs
+  that had read outside text. `history` shows a forwarded message or a
+  mail's outside parts as such, never as your words, and a run that
+  had read outside text marks the conversation it is shown in.
+- A forwarded Telegram message is someone else's words: never a command,
+  in your chat or a group.
+- A call the model makes is logged with what came of it: a gate line for
+  each call decided, refused ones included ("not offered in this run" for
+  a tool its run doesn't have, "no such tool" for a name none has), and a
+  tool line for one not run because the reply was cut off or came after
+  the final `send`. A call whose input doesn't read (not JSON, a missing
+  field) or comes after `/stop` is answered without a line.
+
+The demo needs no network and no key: harness-fake plays the model,
+Telegram, the pages and a shop, and the stand-in model makes exactly the
+calls the hostile text asks for. Its eight cases are the catalog's first
+(`src/inject.zig`); the others run in `zig build test`.
+
+```
+zig build
+sh scripts/injection-demo.sh           # the eight cases, printed
+sh scripts/injection-demo.sh --check   # TAP lines; the smoke script runs this
+sh scripts/injection-demo.sh --serve   # the pages, for your own agent
+```
+
+`--serve` starts only the pages on this machine and prints a line to send
+your agent for each (cases 1, 2, 4 and 5), then each request that reaches
+the collector. Your harness, model and phone do the rest. It never reads
+your settings or secrets; when you stop it, it prints your log's lines
+about those pages, read only (`HARNESS_HOME`, else the data folder).
+
+What the gate can't hold:
+
+- The agent's own words to you can repeat a lie or a phishing link from a
+  page. The mark doesn't reach replies.
+- A call you approve is made. A shell command that prints a key reversed
+  or spaced gets past the masking once approved: the protection there is
+  the question and the sandbox.
+- Grants and allow lines you wrote apply in marked conversations too.
+- With `[money] scheduled = on`, unattended runs move money within the
+  caps.
+- A file an earlier run saved from a page carries no mark when a later run
+  reads it.
+- Workspace writes are allowed; Undo takes them back.
 
 ## Conversations
 
@@ -3111,7 +3199,7 @@ screenshots, and the hosted service.
 ## Build
 
 ```
-zig build                     # zig-out/bin/harness
+zig build                     # zig-out/bin/harness, and harness-fake (the stand-ins)
 zig build test --summary all  # unit tests, then scripts/smoke.sh end to end
 ```
 

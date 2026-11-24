@@ -40,6 +40,9 @@ pub const Message = struct {
     reply_to: i64 = 0,
     /// A voice note or an audio file it carries (its text is then "").
     voice: ?voice.Note = null,
+    /// The owner forwarded it (`forward_origin`, or an older client's
+    /// `forward_date`): someone else's words.
+    forwarded: bool = false,
 };
 
 /// Where a file is (`getFile`): its path for `download`, and its size (0:
@@ -169,6 +172,7 @@ pub const Bot = struct {
                     .topic = jv.str(jv.at(m, &.{ "forum_topic_created", "name" })) orelse jv.str(jv.at(m, &.{ "reply_to_message", "forum_topic_created", "name" })),
                     .reply_to = if (jv.get(m, "reply_to_message")) |r| (if (jv.get(r, "forum_topic_created") != null) 0 else jv.int(jv.get(r, "message_id")) orelse 0) else 0,
                     .voice = noteOf(m),
+                    .forwarded = jv.get(m, "forward_origin") != null or jv.get(m, "forward_date") != null,
                 } });
             } else if (jv.get(u, "callback_query")) |c| {
                 try out.append(arena, .{ .callback = .{
@@ -442,6 +446,22 @@ test "updates_parsed_messages_and_callbacks" {
     try t.expectEqualStrings("a:once", ups[1].callback.data);
     try t.expectEqual(7, ups[1].callback.message_id);
     try t.expectEqual(2, ups[1].updateId());
+}
+
+test "a_forwarded_message_is_read_as_forwarded" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try inbox(&e, 1, "{\"message\":{\"message_id\":5,\"from\":{\"id\":42},\"chat\":{\"id\":42},\"forward_origin\":{\"type\":\"user\",\"date\":1,\"sender_user\":{\"id\":7}},\"text\":\"/dryrun off\"}}");
+    try inbox(&e, 2, "{\"message\":{\"message_id\":6,\"from\":{\"id\":42},\"chat\":{\"id\":42},\"forward_date\":1,\"text\":\"an older client's forward\"}}");
+    try inbox(&e, 3, "{\"message\":{\"message_id\":7,\"from\":{\"id\":42},\"chat\":{\"id\":42},\"text\":\"my own words\"}}");
+    var b = try Bot.init(t.allocator, t.io, try e.url(), "123:abc");
+    defer b.deinit();
+    const ups = try b.getUpdates(e.arena.allocator(), 0, 0);
+    try t.expectEqual(3, ups.len);
+    try t.expect(ups[0].message.forwarded);
+    try t.expect(ups[1].message.forwarded);
+    try t.expect(!ups[2].message.forwarded);
 }
 
 test "a_callbacks_message_text_is_kept" {
