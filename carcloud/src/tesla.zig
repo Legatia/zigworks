@@ -600,7 +600,8 @@ test "tesla_refusals_said_plainly" {
 }
 
 test "the_token_file_is_owner_only_and_replaced_whole" {
-    var tmp = t.tmpDir(.{});
+    // listed below: on Linux a directory opened without iterate can't be
+    var tmp = t.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();

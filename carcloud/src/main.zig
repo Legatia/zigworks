@@ -10,6 +10,12 @@ const tesla = @import("tesla.zig");
 const server = @import("server.zig");
 const jv = @import("jv.zig");
 
+/// An OS call's unexpected error is returned, never traced: std's Debug
+/// trace prints a Windows error code's name and panics on a code it has
+/// none for, as crypt32's when it can't check the proxy's certificate
+/// (Debug builds crashed where release builds say "not accepted").
+pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
+
 const usage =
     \\usage: carcloud CAR.ini          serve MCP on stdin and stdout (what an agent starts)
     \\       carcloud check CAR.ini    read the car file, then ask the carmaker's cloud for the car's state
@@ -169,4 +175,14 @@ test {
     _ = @import("ini.zig");
     _ = @import("jv.zig");
     _ = @import("http.zig");
+}
+
+test "an_os_error_std_has_no_name_for_is_a_refusal_not_a_crash" {
+    // On Windows, when the car file's CA doesn't verify the proxy, std's TLS
+    // client asks the system; crypt32 fails an Ed25519 CA with
+    // NTE_BAD_ALGID, a code std has no name for, and std's Debug trace of
+    // an unexpected error prints the code's name: a panic. Without the
+    // trace the error is TlsCertificateNotVerified: "not accepted".
+    try std.testing.expect(std.enums.tagName(std.os.windows.Win32Error, @fromBackingInt(0x80090008)) == null);
+    try std.testing.expect(!std_options.unexpected_error_tracing);
 }

@@ -48,6 +48,7 @@ import json, os, queue, socket, struct, subprocess, sys, threading, time, urllib
 
 hub, binary, home, port = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 p = subprocess.Popen([binary, home], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+born = time.time()
 lines = queue.Queue()
 n = 0
 failed = False
@@ -185,7 +186,10 @@ check("closing it again is pushed too", wait_note("home://device/back_door", 2),
 check("nothing pushed for what wasn't subscribed to", set(notes) == {"home://device/back_door"}, str(notes))
 # the doorbell: every press is pushed, though each reads "ring"
 rpc("resources/subscribe", {"uri": "home://device/front_door_bell"})
-time.sleep(0.5 if hub == "z2m" else 0)
+# Zigbee2MQTT: homemcp keeps a ring heard in its first 3 s on the broker
+# as old news (the answers to the gets it sends then), so press after that
+if hub == "z2m":
+    time.sleep(max(0.5, born + 4.0 - time.time()))
 poke(names["bell"], {"ring": True})
 check("a doorbell's ring is pushed", wait_note("home://device/front_door_bell", 1), str(notes))
 text = read("home://device/front_door_bell")
