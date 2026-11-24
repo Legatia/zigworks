@@ -995,6 +995,7 @@ fn takeUpdate(c: *Core, tc: *TgChan, u: telegram.Update) void {
             .text = m.text,
             .reply_to = m.reply_to,
             .voice = m.voice,
+            .forwarded = m.forwarded,
         }) catch |e| complain("handling a message: {s}", .{@errorName(e)}),
         .callback => |cb| {
             tc.answer(cb.id);

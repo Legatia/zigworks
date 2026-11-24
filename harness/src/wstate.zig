@@ -85,6 +85,9 @@ pub const State = struct {
     /// Minutes nobody answered before a fallback made a call: its next
     /// say begins "No one answered in N minutes: "; 0: none.
     absent: u32 = 0,
+    /// The sources of outside text its steps have read or been given
+    /// (outside.zig): each step's run starts marked with them.
+    outside: []const []const u8 = &.{},
 
     /// A copy whose every slice is in `a`.
     pub fn clone(s: State, a: Allocator) !State {
@@ -94,6 +97,7 @@ pub const State = struct {
         const answers = try a.alloc(Answer, s.answers.len);
         for (s.answers, answers) |x, *y| y.* = .{ .ask = try a.dupe(u8, x.ask), .key = try a.dupe(u8, x.key), .item = x.item };
         o.answers = answers;
+        o.outside = try dupeAll(a, s.outside);
         return o;
     }
 
@@ -107,6 +111,29 @@ pub const State = struct {
         return s.status == .done or s.status == .stopped;
     }
 };
+
+fn dupeAll(a: Allocator, list: []const []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, list.len);
+    for (list, out) |x, *o| o.* = try a.dupe(u8, x);
+    return out;
+}
+
+/// `,"outside":[…]` when there are any.
+fn outsideJson(out: *std.ArrayList(u8), a: Allocator, list: []const []const u8) !void {
+    if (list.len == 0) return;
+    try out.appendSlice(a, ",\"outside\":[");
+    for (list, 0..) |x, i| {
+        if (i > 0) try out.append(a, ',');
+        try util.jsonString(out, a, x);
+    }
+    try out.append(a, ']');
+}
+
+fn outsideOf(a: Allocator, v: ?jv.Value) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (jv.arr(v) orelse &.{}) |x| if (jv.str(x)) |s| try out.append(a, s);
+    return out.items;
+}
 
 /// "NAME#N".
 pub fn idOf(a: Allocator, name: []const u8, n: u32) ![]const u8 {
@@ -156,6 +183,7 @@ pub fn stateJson(a: Allocator, s: State) ![]const u8 {
     try out.appendSlice(a, ",\"values\":");
     try out.appendSlice(a, if (s.values.len > 0) s.values else "{}");
     if (s.absent > 0) try out.print(a, ",\"absent\":{d}", .{s.absent});
+    try outsideJson(&out, a, s.outside);
     try out.appendSlice(a, "}\n");
     return out.items;
 }
@@ -204,6 +232,7 @@ pub fn parseState(a: Allocator, text: []const u8) ?State {
     s.ends = time(jv.get(v, "ends"));
     s.absent = count(jv.get(v, "absent"), 0);
     s.why = jv.str(jv.get(v, "why")) orelse "";
+    s.outside = outsideOf(a, jv.get(v, "outside")) catch return null;
     const values = jv.get(v, "values") orelse jv.Value{ .object = .empty };
     if (values != .object) return null;
     s.values = std.json.Stringify.valueAlloc(a, values, .{}) catch return null;
@@ -240,6 +269,8 @@ pub const Start = struct {
     event: []const u8 = "",
     /// Started by the workflow tool (the start line's `agent`).
     tool: bool = false,
+    /// The outside text its event is (outside.zig).
+    outside: []const []const u8 = &.{},
 };
 
 fn startJson(a: Allocator, s: Start) ![]const u8 {
@@ -252,7 +283,9 @@ fn startJson(a: Allocator, s: Start) ![]const u8 {
     try util.jsonString(&out, a, s.input);
     try out.appendSlice(a, ",\"event\":");
     try out.appendSlice(a, if (s.event.len > 0) s.event else "null");
-    try out.print(a, ",\"tool\":{}}}\n", .{s.tool});
+    try out.print(a, ",\"tool\":{}", .{s.tool});
+    try outsideJson(&out, a, s.outside);
+    try out.appendSlice(a, "}\n");
     return out.items;
 }
 
@@ -314,6 +347,7 @@ pub const Dir = struct {
                 .input = jv.str(jv.get(v, "input")) orelse "",
                 .event = if (jv.get(v, "event")) |e| try std.json.Stringify.valueAlloc(a, e, .{}) else "",
                 .tool = jv.boolean(jv.get(v, "tool")) orelse false,
+                .outside = try outsideOf(a, jv.get(v, "outside")),
             });
         }
         return out.items;
