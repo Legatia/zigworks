@@ -1311,6 +1311,12 @@ pub fn runImport(r: Run, args: Args) !u8 {
             return e;
         };
     }
+    // a settings file that is there but doesn't read (over 1 MB, no
+    // access) stops it: the plan would take it for empty, the write lose it
+    if (unreadable(r.io, a, paths)) |why| {
+        say(r, try std.fmt.allocPrint(a, "{s}; nothing imported.\n", .{why}));
+        return 1;
+    }
     const s = try hermes.read(r.io, a, home);
     var store = try memory.Store.load(r.gpa, r.io, paths.memory);
     defer store.deinit();
@@ -1347,6 +1353,18 @@ pub fn runImport(r: Run, args: Args) !u8 {
     const report = try apply(r, paths, dir, &p, &store, text, iso);
     say(r, try std.fmt.allocPrint(a, "\nImported. The report, with how to undo it: {s}\n", .{report}));
     return 0;
+}
+
+/// "tasks.ini can't be read (StreamTooLong)" for the first settings file
+/// that is there but doesn't read as the import reads them; null when all do.
+fn unreadable(io: Io, a: std.mem.Allocator, paths: @import("core.zig").Paths) ?[]const u8 {
+    for ([_][]const u8{ paths.config, paths.tasks, paths.triggers, paths.briefs, paths.mcp, paths.rules }) |p| {
+        _ = Io.Dir.cwd().readFileAlloc(io, p, a, .limited(1 << 20)) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => return std.fmt.allocPrint(a, "{s} can't be read ({s})", .{ std.fs.path.basename(p), @errorName(e) }) catch "a settings file can't be read",
+        };
+    }
+    return null;
 }
 
 fn say(r: Run, text: []const u8) void {
@@ -1423,13 +1441,19 @@ fn apply(r: Run, paths: @import("core.zig").Paths, dir: []const u8, p: *const Pl
         if (cwd.readFileAlloc(r.io, ch.path, a, .limited(1 << 20))) |old| {
             try util.writeReplace(r.io, try std.fs.path.join(a, &.{ before, ch.name }), old);
             try undo.print(a, "- {s}: put back {s}{s}before{s}{s}\n", .{ ch.name, dir, std.fs.path.sep_str, std.fs.path.sep_str, ch.name });
-        } else |_| try undo.print(a, "- {s} didn't exist before: remove it\n", .{ch.name});
+        } else |e| switch (e) {
+            error.FileNotFound => try undo.print(a, "- {s} didn't exist before: remove it\n", .{ch.name}),
+            else => return e,
+        }
     }
     for (changes) |ch| {
         if (ch.whole) |w| {
             try util.writeReplace(r.io, ch.path, w);
         } else if (ch.add.len > 0) {
-            const old = cwd.readFileAlloc(r.io, ch.path, a, .limited(1 << 20)) catch "";
+            const old = cwd.readFileAlloc(r.io, ch.path, a, .limited(1 << 20)) catch |e| switch (e) {
+                error.FileNotFound => "",
+                else => return e,
+            };
             try util.writeReplace(r.io, ch.path, try std.fmt.allocPrint(a, "{s}{s}{s}", .{ old, if (old.len > 0 and old[old.len - 1] != '\n') "\n" else "", ch.add }));
         }
     }
@@ -2202,4 +2226,21 @@ test "no_secret_value_reaches_any_file_output_or_log" {
     }
     // the memory entry that held one says where it was
     try t.expect(contains(everything, "[secret:OPENROUTER_API_KEY]"));
+}
+
+test "a_file_it_cant_read_stops_the_import_before_anything_is_written" {
+    var rx: Rx = undefined;
+    try rx.init(false);
+    defer rx.deinit();
+    // a tasks.ini over what is read (harness itself would refuse it): kept whole
+    const big = try rx.tf.f.a().alloc(u8, (1 << 20) + 10);
+    @memset(big, ';');
+    big[big.len - 1] = '\n';
+    const path = try std.fs.path.join(rx.tf.f.a(), &.{ rx.home, "tasks.ini" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = big });
+    try t.expectEqual(1, try rx.run(.{ .yes = true }));
+    try t.expect(contains(rx.talk.out.items, "tasks.ini can't be read"));
+    try t.expectEqual(big.len, (try rx.file("tasks.ini")).len);
+    try t.expect(!rx.exists("mcp.ini"));
+    try t.expectEqual(0, try rx.memoryCount());
 }
