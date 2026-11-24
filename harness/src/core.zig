@@ -3544,6 +3544,8 @@ pub const Core = struct {
         }
         if (data.len > 0 and data[0] == 'i') return c.itemPress(chat, thread, message_id, data);
         if (data.len > 0 and data[0] == 'u') return c.undoPress(chat, thread, message_id, data, text);
+        // a helper main saved: [Remove] or [Undo]
+        if (data.len > 0 and data[0] == 'h') return Helpers.press(c, chat, thread, message_id, data);
         if (data.len > 1 and data[0] == 's') if (std.fmt.parseInt(u64, data[1..], 10)) |id| return c.showPress(chat, thread, id) else |_| {};
         c.tellOutOfDate(chat, thread, message_id);
     }
@@ -5000,6 +5002,7 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
             .written = &c.written,
             .snaps = &c.snaps,
             .defs = &c.defs,
+            .helpers = .{ .ctx = c, .why = Helpers.why, .saved = Helpers.saved },
             .registry = c.registry(),
             .hush = .{ .ctx = c, .why = hushWhy },
             .envs = .{ .list = c.env_list, .root = c.paths.env_dir, .data_home = c.paths.home, .owner_home = c.home_var },
@@ -32210,6 +32213,177 @@ test "history_marks_what_it_shows_of_a_forwarded_message" {
     }
 }
 
+/// Helpers main manages itself (Part 3): what makes a save the owner's to
+/// ask, each save's SHA-256 (state/agents/NAME/saves), and the one quiet
+/// line in Work (or main) with [Remove] or [Undo] (state/helpers).
+const Helpers = struct {
+    fn savesPath(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        return std.fs.path.join(a, &.{ c.paths.agents_state, name, "saves" });
+    }
+
+    /// agent.HelperDesk.why: what names `name` (a task, trigger, workflow
+    /// or its step, a conversation) or makes it the owner's (a rules
+    /// section, a live grant, a hand edit, an earlier version they
+    /// wrote); null: nothing.
+    fn why(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        const eql = std.mem.eql;
+        {
+            c.settings_mutex.lockUncancelable(c.io);
+            defer c.settings_mutex.unlock(c.io);
+            for (c.tasks) |tk| if (eql(u8, tk.agent, name)) return "a task names it";
+            for (c.trig_tasks) |tk| if (eql(u8, tk.agent, name)) return "a trigger names it";
+            for (c.trig_list) |tr| if (eql(u8, tr.agent, name)) return "a trigger names it";
+            for (c.wf_defs) |w| {
+                if (eql(u8, w.agent, name)) return "a workflow names it";
+                for (w.steps) |st| if (eql(u8, st.agent, name)) return "a workflow step names it";
+            }
+            const who = std.fmt.allocPrint(a, "agent:{s}", .{name}) catch return "out of memory";
+            for (c.rule_list) |ru| if (ru.section) |sec| if (rules.glob(sec, who)) return "a section of the rules names it";
+        }
+        {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            for (c.convs.items.items) |e| if (eql(u8, e.agent, name)) return "a conversation is answered by it";
+        }
+        {
+            c.lock.lockUncancelable(c.io);
+            defer c.lock.unlock(c.io);
+            const who = std.fmt.allocPrint(a, "agent:{s}", .{name}) catch return "out of memory";
+            const now_s = c.now();
+            for (c.grants.items.items) |g| if (g.expires_s > now_s and eql(u8, g.who, who)) return "a grant is held for it";
+        }
+        // the file and every kept version are main's own saves
+        const saves = c.readOr(a, savesPath(c, a, name) catch return "out of memory");
+        const path = std.fs.path.join(a, &.{ c.paths.agents, std.fmt.allocPrint(a, "{s}.md", .{name}) catch return "out of memory" }) catch return "out of memory";
+        if (Io.Dir.cwd().readFileAlloc(c.io, path, a, .limited(1 << 20))) |text| {
+            if (!eql(u8, lastMain(saves), &shaHex(text))) return "its file was edited by hand";
+        } else |_| {}
+        for (agents.versionTexts(c.io, a, c.paths.agents_state, name) catch return "its versions can't be read") |v| {
+            if (std.mem.indexOf(u8, saves, &shaHex(v)) == null) return "an earlier version of it is yours";
+        }
+        return null;
+    }
+
+    fn shaHex(text: []const u8) [64]u8 {
+        var d: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(text, &d, .{});
+        return std.fmt.bytesToHex(d, .lower);
+    }
+
+    /// The SHA-256 main's last save wrote ("": none).
+    fn lastMain(saves: []const u8) []const u8 {
+        var last: []const u8 = "";
+        var it = std.mem.splitScalar(u8, saves, '\n');
+        while (it.next()) |l| if (std.mem.startsWith(u8, l, "agent:main ")) {
+            last = std.mem.trim(u8, l["agent:main ".len..], " \r");
+        };
+        return last;
+    }
+
+    /// agent.HelperDesk.saved: the save's SHA-256 kept; a quiet one told.
+    fn saved(ctx: *anyopaque, a: std.mem.Allocator, sv: agent.HelperSaved) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        if (sv.kind != .retired) {
+            const path = savesPath(c, a, sv.name) catch return;
+            Io.Dir.cwd().createDirPath(c.io, std.fs.path.dirname(path) orelse return) catch return;
+            const before = c.readOr(a, path);
+            util.writeReplace(c.io, path, std.fmt.allocPrint(a, "{s}agent:{s} {s}\n", .{ before, sv.who, sv.sha }) catch return) catch |e| {
+                c.log.write(.agent, false, .{ .event = "save not kept", .name = sv.name, .why = @errorName(e) }) catch {};
+            };
+        }
+        if (!sv.told) return;
+        const desc = std.mem.trimEnd(u8, sv.what, ". ");
+        const text = switch (sv.kind) {
+            .made => std.fmt.allocPrint(a, "Made a helper: {s}. {s}.", .{ sv.name, desc }),
+            .changed => std.fmt.allocPrint(a, "Changed {s}: {s}.", .{ sv.name, desc }),
+            .retired => std.fmt.allocPrint(a, "Retired {s}.", .{sv.name}),
+        } catch return;
+        const key = if (c.log.key) |*k| k else {
+            c.sayIn(c.subjectConv(a, "work"), text);
+            return;
+        };
+        // its record: the button names it
+        const rec_path = std.fs.path.join(a, &.{ c.paths.state, "helpers" }) catch return;
+        const recs = c.readOr(a, rec_path);
+        var id: u64 = 1;
+        var it = std.mem.splitScalar(u8, recs, '\n');
+        while (it.next()) |l| {
+            const n = std.fmt.parseInt(u64, l[0 .. std.mem.indexOfScalar(u8, l, '\t') orelse l.len], 10) catch continue;
+            id = @max(id, n + 1);
+        }
+        util.writeReplace(c.io, rec_path, std.fmt.allocPrint(a, "{s}{d}\t{s}\t{s}\t{s}\t{s}\n", .{ recs, id, sv.name, @tagName(sv.kind), sv.sha, text }) catch return) catch return;
+        const tk = undo_mod.token(key, id + helper_ids);
+        const op = if (sv.kind == .made) "remove" else "undo";
+        const button: [2][]const u8 = .{ if (sv.kind == .made) "Remove" else undo_mod.label, std.fmt.allocPrint(a, "h{d}-{s}:{s}", .{ id, &tk, op }) catch return };
+        _ = c.sendWithButtons(a, c.subjectConv(a, "work"), "", text, &.{}, button, true) catch |e| {
+            c.log.write(.agent, false, .{ .event = "not told", .name = sv.name, .why = whyUndelivered(e) }) catch {};
+        };
+    }
+
+    /// Keeps a helper button's tokens apart from a run's Undo's.
+    const helper_ids: u64 = 1 << 62;
+
+    /// A press of [Remove] or [Undo] (`h<id>-<token>:<op>`): the token
+    /// checked, the record found; Remove takes away a helper main made,
+    /// Undo puts back what a change or retirement replaced, each only
+    /// while its file is as that save left it. The line is edited with
+    /// the outcome; pressed again it is out of date.
+    fn press(c: *Core, chat: i64, thread: i64, message_id: i64, data: []const u8) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const key = if (c.log.key) |*k| k else return c.tellOutOfDate(chat, thread, message_id);
+        const dash = std.mem.indexOfScalar(u8, data, '-') orelse return c.tellOutOfDate(chat, thread, message_id);
+        const colon = std.mem.lastIndexOfScalar(u8, data, ':') orelse return c.tellOutOfDate(chat, thread, message_id);
+        const id = std.fmt.parseInt(u64, data[1..dash], 10) catch return c.tellOutOfDate(chat, thread, message_id);
+        const want = undo_mod.token(key, id + helper_ids);
+        if (colon <= dash or !std.mem.eql(u8, data[dash + 1 .. colon], &want)) return c.tellOutOfDate(chat, thread, message_id);
+        const rec_path = std.fs.path.join(a, &.{ c.paths.state, "helpers" }) catch return;
+        const recs = c.readOr(a, rec_path);
+        var kept: std.ArrayList(u8) = .empty;
+        var found: ?[]const u8 = null;
+        var it = std.mem.splitScalar(u8, recs, '\n');
+        while (it.next()) |l| {
+            if (l.len == 0) continue;
+            const n = std.fmt.parseInt(u64, l[0 .. std.mem.indexOfScalar(u8, l, '\t') orelse l.len], 10) catch continue;
+            if (n == id) found = l else kept.print(a, "{s}\n", .{l}) catch return;
+        }
+        const line = found orelse return c.tellOutOfDate(chat, thread, message_id);
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        _ = fields.next();
+        const name = fields.next() orelse return;
+        const kind = fields.next() orelse return;
+        const sha = fields.next() orelse return;
+        const shown = fields.rest();
+        const path = std.fs.path.join(a, &.{ c.paths.agents, std.fmt.allocPrint(a, "{s}.md", .{name}) catch return }) catch return;
+        const now_text: ?[]const u8 = Io.Dir.cwd().readFileAlloc(c.io, path, a, .limited(1 << 20)) catch null;
+        const same = if (now_text) |x| std.mem.eql(u8, &shaHex(x), sha) else std.mem.eql(u8, kind, "retired");
+        var buf: [conversations.max_name]u8 = undefined;
+        const conv = c.convAt(&buf, chat, thread);
+        if (!same) return c.sayIn(conv, std.fmt.allocPrint(a, "{s} changed since: nothing undone (/agent rm {s} removes it).", .{ name, name }) catch "Changed since: nothing undone.");
+        const said: []const u8 = blk: {
+            if (std.mem.eql(u8, kind, "made")) {
+                c.defs.remove(name) catch |e| return c.sayIn(conv, std.fmt.allocPrint(a, "Not removed: {s}.", .{@errorName(e)}) catch "Not removed.");
+                break :blk "Removed.";
+            }
+            const versions = agents.versionTexts(c.io, a, c.paths.agents_state, name) catch &.{};
+            if (versions.len == 0) return c.sayIn(conv, "Nothing to put back: no earlier version is kept.");
+            c.defs.save(name, versions[versions.len - 1]) catch |e| return c.sayIn(conv, std.fmt.allocPrint(a, "Not undone: {s}.", .{@errorName(e)}) catch "Not undone.");
+            break :blk if (std.mem.eql(u8, kind, "retired")) std.fmt.allocPrint(a, "Undone: {s} is back.", .{name}) catch "Undone." else std.fmt.allocPrint(a, "Undone: {s} is as it was.", .{name}) catch "Undone.";
+        };
+        util.writeReplace(c.io, rec_path, kept.items) catch {};
+        c.log.write(.agent, false, .{ .event = if (std.mem.eql(u8, kind, "made")) "removed" else "undone", .name = name, .by = "owner", .via = "button" }) catch {};
+        const ch = c.chan orelse return;
+        const place: Place = .{ .name = conv, .chat = chat, .thread = thread };
+        const edited = std.fmt.allocPrint(a, "{s}\n{s}", .{ shown, said }) catch return;
+        if (ch.edit) |f| f(ch.ctx, place, message_id, edited) else {
+            ch.clear(ch.ctx, place, message_id);
+            c.sayIn(conv, edited);
+        }
+    }
+};
+
 /// Topics: one chat with the bot filed by subject (topics.zig): a
 /// topic's focus, setup's offer, cards, `/overview`.
 const Topics = struct {
@@ -33267,4 +33441,175 @@ test "morning_topics_placeholder_fills_with_the_lines" {
     runWorkflows(&f);
     try t.expectEqual(2, f.rec.countIn("main", "Good morning."));
     try t.expectEqual(1, f.rec.countIn("main", "Errands: DPD comes today"));
+}
+
+// ---- helpers main manages itself (Part 3) ----
+
+const plain_helper = "---\nname: researcher\ndescription: Searches and reads pages, for comparing listings.\ntools: search, fetch\nmemory: pinned\n---\nCompare listings.\n";
+
+/// The model's `n`-th reply: agent_save of `name` with `text` (or retire).
+fn saveScript(f: *Fix, n: u32, name: []const u8, text: ?[]const u8) !void {
+    const a = f.e.arena.allocator();
+    const input = if (text) |x| try std.fmt.allocPrint(a, "{{\"name\":\"{s}\",\"text\":{f}}}", .{ name, std.json.fmt(x, .{}) }) else try std.fmt.allocPrint(a, "{{\"name\":\"{s}\",\"retire\":true}}", .{name});
+    try f.e.script(n, try std.fmt.allocPrint(a, "{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_{d}\",\"name\":\"agent_save\",\"input\":{s}}}],\"stop_reason\":\"tool_use\"}}", .{ n, input }));
+}
+
+/// The owner asks main for it; the model saves, then says `said`.
+fn helperTurn(f: *Fix, n: u32, name: []const u8, text: ?[]const u8, comptime said: []const u8) !void {
+    try saveScript(f, n, name, text);
+    try f.e.script(n + 1, model.textReply(said));
+    try f.core.handleText("see to the helper");
+}
+
+fn helperFile(f: *Fix, name: []const u8) []const u8 {
+    const a = f.e.arena.allocator();
+    return fileText(f, std.fs.path.join(a, &.{ f.core.paths.agents, std.fmt.allocPrint(a, "{s}.md", .{name}) catch "" }) catch "");
+}
+
+test "main_saves_a_plain_helper_without_asking_with_one_silent_line" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try butlerTopics(&f);
+    try f.core.startWorker();
+    try helperTurn(&f, 1, "researcher", plain_helper, "Made it.");
+    try f.rec.waitFor("Made it.");
+    try t.expectEqual(0, f.rec.count("Allow this?"));
+    try expectHas(helperFile(&f, "researcher"), "saved: agent:main ");
+    try f.rec.waitIn("work", "BUTTONS Made a helper: researcher. Searches and reads pages, for comparing listings. [h");
+    try t.expect(f.rec.quietOf("Made a helper").?);
+    try t.expect(f.rec.buttonsWith("Made a helper").?.get("remove") != null);
+    try expectHas(try logText(&f), "\"kind\":\"agent\",\"event\":\"saved\",\"name\":\"researcher\"");
+    // /agents says who saved it
+    try expectHas(try f.core.command(f.e.arena.allocator(), "/agents"), "researcher");
+}
+
+const HelperCase = enum { marked, task, trigger, step, conversation, tool, mcp, model, shared, environment, limits, section, grant, hand_edit, owner_version, main_itself, ask_line, deny_line };
+
+test "each_of_these_asks" {
+    for (std.enums.values(HelperCase)) |case| {
+        var f: Fix = undefined;
+        try f.init("", "", "");
+        defer f.deinit();
+        const a = f.e.arena.allocator();
+        try f.core.startWorker();
+        const changed = "---\nname: researcher\ndescription: Searches and reads pages, for comparing listings.\ntools: search, fetch\nmemory: pinned\n---\nCompare listings, with prices.\n";
+        // main made it quietly first (but where the owner wrote it once)
+        if (case != .owner_version) {
+            try helperTurn(&f, 1, "researcher", plain_helper, "Made it.");
+            try f.rec.waitFor("Made it.");
+            try t.expectEqual(0, f.rec.count("Allow this?"));
+        }
+        var text: []const u8 = changed;
+        var name: []const u8 = "researcher";
+        switch (case) {
+            .marked, .tool, .mcp, .model, .shared, .environment, .limits, .main_itself => {},
+            .task => {
+                try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.tasks, .data = "[look]\nevery = 1h\ndo = Look around.\nagent = researcher\n" });
+                try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+            },
+            .trigger => try setTriggers(&f, "[look]\nevery = 1h\ndo = Look around.\nagent = researcher\n"),
+            .step => try setWorkflow(&f, "look", "workflow look\nstep a\ndo Look around.\nagent researcher\n"),
+            .conversation => {
+                try addTopic(&f, "house-search", 5012);
+                f.core.convs.mutex.lockUncancelable(t.io);
+                defer f.core.convs.mutex.unlock(t.io);
+                try f.core.convs.setAgent("house-search", "researcher");
+            },
+            .section => {
+                try writeRules(&f, "[agent:r*]\nallow fetch *\n");
+                try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+            },
+            .grant => try f.core.grants.addFor(.fetch, "", "https://example.com", "agent:researcher", util.nowSeconds(t.io) + 3600),
+            .hand_edit => {
+                try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.paths.agents, "researcher.md" }), .data = try std.fmt.allocPrint(a, "{s}Mine now.\n", .{helperFile(&f, "researcher")}) });
+                try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+            },
+            .owner_version => {
+                try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.paths.agents, "researcher.md" }), .data = plain_helper });
+                try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+                try f.core.defs.remove("researcher");
+                text = plain_helper;
+            },
+            .ask_line, .deny_line => {
+                try writeRules(&f, if (case == .ask_line) "ask agent_save *\n" else "deny agent_save *\n");
+                try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+            },
+        }
+        text = switch (case) {
+            .tool => "---\nname: researcher\ndescription: R.\ntools: search, shell\nmemory: pinned\n---\nRun things.\n",
+            .mcp => "---\nname: researcher\ndescription: R.\ntools: search, home/*\nmemory: pinned\n---\nUse the home.\n",
+            .model => "---\nname: researcher\ndescription: R.\ntools: search\nmodel: claude-big\nmemory: pinned\n---\nThink hard.\n",
+            .shared => "---\nname: researcher\ndescription: R.\ntools: search\n---\nRemember.\n",
+            .environment => "---\nname: researcher\ndescription: R.\ntools: search\nmemory: pinned\nenvironment: host\n---\nHere.\n",
+            .limits => "---\nname: researcher\ndescription: R.\ntools: search\nmemory: pinned\nsteps: 999\n---\nLong.\n",
+            .main_itself => blk: {
+                name = "main";
+                break :blk "---\nname: main\ndescription: Me.\ntools: *\n---\nBe me.\n";
+            },
+            else => text,
+        };
+        const n: u32 = if (case == .owner_version) 1 else 3;
+        try saveScript(&f, n, name, text);
+        try f.e.script(n + 1, model.textReply("Done or not."));
+        if (case == .marked) {
+            try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = "Save the researcher again, with prices.", .forwarded = true });
+        } else try f.core.handleText("change the helper");
+        if (case == .deny_line) {
+            try f.rec.waitFor("Done or not.");
+            try t.expectEqual(0, f.rec.count("Allow this?"));
+            try expectHas(try f.e.request(n + 1), "refused by the gate: rule on line 1");
+            continue;
+        }
+        f.rec.waitFor("BUTTONS Allow this? [") catch |e| {
+            std.debug.print("case {s} was not asked\n", .{@tagName(case)});
+            return e;
+        };
+        try f.press("deny");
+        try f.rec.waitFor("Done or not.");
+    }
+}
+
+test "main_changes_and_retires_its_own" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try butlerTopics(&f);
+    try f.core.startWorker();
+    try helperTurn(&f, 1, "researcher", plain_helper, "Made it.");
+    try f.rec.waitFor("Made it.");
+    try helperTurn(&f, 3, "researcher", "---\nname: researcher\ndescription: Searches and reads pages, for comparing listings.\ntools: search, fetch, browse\nmemory: pinned\n---\nCompare listings, with prices.\n", "Changed it.");
+    try f.rec.waitFor("Changed it.");
+    try f.rec.waitIn("work", "BUTTONS Changed researcher: added browse; its instructions. [h");
+    try t.expect(f.rec.buttonsWith("Changed researcher").?.get("undo") != null);
+    try helperTurn(&f, 5, "researcher", null, "Retired it.");
+    try f.rec.waitFor("Retired it.");
+    try f.rec.waitIn("work", "BUTTONS Retired researcher. [h");
+    try t.expectEqual(0, f.rec.count("Allow this?"));
+    try t.expect(!f.core.defs.has("researcher"));
+    try t.expectEqual(2, f.core.defs.versions("researcher"));
+}
+
+test "remove_and_undo_buttons_work" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.core.startWorker();
+    // without topics: the lines in main
+    try helperTurn(&f, 1, "researcher", plain_helper, "Made it.");
+    try f.rec.waitIn("main", "BUTTONS Made a helper: researcher.");
+    try helperTurn(&f, 3, "researcher", "---\nname: researcher\ndescription: Searches and reads pages, for comparing listings.\ntools: search, fetch\nmemory: pinned\n---\nCompare listings, with prices.\n", "Changed it.");
+    try f.rec.waitIn("main", "BUTTONS Changed researcher: its instructions. [h");
+    const undo = f.rec.buttonsWith("Changed researcher").?;
+    f.core.handleCallback(42, undo.msg, undo.get("undo").?);
+    try f.rec.waitIn("main", try std.fmt.allocPrint(a, "EDIT {d}: Changed researcher: its instructions.\nUndone: researcher is as it was.", .{undo.msg}));
+    try expectHas(helperFile(&f, "researcher"), "Compare listings.\n");
+    const made = f.rec.buttonsWith("Made a helper").?;
+    f.core.handleCallback(42, made.msg, made.get("remove").?);
+    try f.rec.waitIn("main", try std.fmt.allocPrint(a, "EDIT {d}: Made a helper: researcher. Searches and reads pages, for comparing listings.\nRemoved.", .{made.msg}));
+    try t.expect(!f.core.defs.has("researcher"));
+    // pressed again: nothing more
+    f.core.handleCallback(42, made.msg, made.get("remove").?);
+    try f.rec.waitFor("That button is out of date");
 }

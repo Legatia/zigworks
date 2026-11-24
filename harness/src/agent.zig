@@ -562,6 +562,9 @@ pub const Run = struct {
     /// The definitions, for `delegate` and `agent_save`; null: the
     /// built-ins only, and no `agent_save`.
     defs: ?*agents.Set = null,
+    /// What says whether main may save a helper without asking, and
+    /// keeps and tells of each save (core.zig); null: every save asked.
+    helpers: ?HelperDesk = null,
     /// The run holds a place of its definition (its `parallel`).
     holds_place: bool = false,
     /// Where a delegated run registers its own stop flag (so `/stop NAME`
@@ -1142,8 +1145,8 @@ const snapshot_def: model.ToolDef = .{
 };
 const agent_save_def: model.ToolDef = .{
     .name = "agent_save",
-    .description = "Propose a new agent definition, or a change to your own: the whole file agents/NAME.md, a header between --- lines (name, description; and if needed model, tools, skills, memory, steps, tokens, seconds, answer_bytes, parallel) and then the instructions. The owner sees all of it and approves it every time; it applies from the next run.",
-    .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"a-z, 0-9 and -\"},\"text\":{\"type\":\"string\",\"description\":\"the whole file\"}},\"required\":[\"name\",\"text\"]}",
+    .description = "Propose a new agent definition, or a change to your own: the whole file agents/NAME.md, a header between --- lines (name, description; and if needed model, tools, skills, memory, steps, tokens, seconds, answer_bytes, parallel) and then the instructions. It applies from the next run. The owner approves each one, except that main saves, changes and retires (retire: true) its own plain helpers itself: tools only from search, fetch, browse, read_file, recall and skill, memory: pinned, no model but the worker model, no environment, limits within [agents]; the owner is told.",
+    .schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"a-z, 0-9 and -\"},\"text\":{\"type\":\"string\",\"description\":\"the whole file\"},\"retire\":{\"type\":\"boolean\",\"description\":\"true: retire a definition main saved (no text)\"}},\"required\":[\"name\"]}",
 };
 const trigger_def: model.ToolDef = .{
     .name = "trigger",
@@ -1154,6 +1157,30 @@ const trigger_def: model.ToolDef = .{
 /// What harness reads in a trigger section the agent proposes: its name,
 /// harness's own reading (never the model's) and the section as it will be
 /// written; or why it can't be added, with the line.
+/// Helpers main manages itself (core.zig's side).
+pub const HelperDesk = struct {
+    ctx: *anyopaque,
+    /// Why `name` is the owner's or named somewhere (asked as today);
+    /// null: main may save it without asking.
+    why: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) ?[]const u8,
+    /// A save or retirement happened: its file's SHA-256 kept, and when
+    /// it was not asked, the owner told once, quietly.
+    saved: *const fn (ctx: *anyopaque, a: std.mem.Allocator, s: HelperSaved) void,
+};
+
+pub const HelperSaved = struct {
+    name: []const u8,
+    kind: enum { made, changed, retired },
+    /// The file's SHA-256 (hex): as written, or as retired.
+    sha: []const u8,
+    /// The definition that saved it.
+    who: []const u8,
+    /// Not asked: the owner hears of it once (Work, or main).
+    told: bool,
+    /// A new one's description; a change in words.
+    what: []const u8 = "",
+};
+
 pub const Checked = struct {
     name: []const u8 = "",
     reading: []const u8 = "",
@@ -2604,21 +2631,26 @@ fn sendTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
     };
 }
 
-/// `agent_save`: a new definition, or a change to the run's own, written
-/// once the owner allows it (asked every time). Harness reads the text
-/// first, as it will be written; one that does not read goes back
-/// unasked. The question says who asks, new or change, what widens
-/// first, then the whole file.
+/// `agent_save`: a new definition, a change to the run's own, or (for
+/// main) a change to or the retirement (`retire: true`) of one main saved
+/// itself, written once the gate allows it: asked every time, except
+/// main's plain helper (`quietWhy`), which the owner's lines decide and
+/// the owner hears of once. Harness reads the text first, as it will be
+/// written; one that does not read goes back unasked. The question says
+/// who asks, new or change, what widens first, then the whole file.
 fn agentSave(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output {
     const set = r.defs orelse return .{ .text = "this tool is not available here", .is_error = true };
     const v = jv.parse(a, input_json);
     const name = jv.str(jv.get(v, "name")) orelse "";
-    const text_in = jv.str(jv.get(v, "text")) orelse return saveRefused(r, a, name, "agent_save needs the name and the whole file as text");
+    const retire = jv.boolean(jv.get(v, "retire")) orelse false;
+    const text_in = jv.str(jv.get(v, "text")) orelse if (retire) "" else return saveRefused(r, a, name, "agent_save needs the name and the whole file as text (or retire: true)");
     if (!agents.validName(name)) return saveRefused(r, a, name, "a definition's name uses a-z, 0-9 and - (up to 64), and is not list, show or rm");
-    // a new definition, or this run's own: never another's
+    // a new definition, this run's own, or one main saved itself: never another's
     const old = try set.get(a, name);
-    if (old != null and !std.mem.eql(u8, name, r.def.name))
+    const mine = old != null and std.mem.eql(u8, r.def.name, "main") and std.mem.startsWith(u8, old.?.saved, "agent:main ");
+    if (old != null and !std.mem.eql(u8, name, r.def.name) and !mine)
         return saveRefused(r, a, name, try std.fmt.allocPrint(a, "{s} is another definition: agent_save makes a new one or changes this run's own ({s})", .{ name, r.def.name }));
+    if (retire) return agentRetire(r, a, set, name, old, mine);
     var tb: [20]u8 = undefined;
     const shown = try agents.withSaved(a, text_in, try std.fmt.allocPrint(a, "agent:{s} {s}", .{ r.who.agent, util.isoTime(&tb, r.now()) }));
     var diag: agents.Diag = .{ .file = try std.fmt.allocPrint(a, "agents/{s}.md", .{name}) };
@@ -2627,8 +2659,9 @@ fn agentSave(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Outpu
         error.BadDefinition => return saveRefused(r, a, name, try diag.text(a)),
     };
     const cmp = try agents.compare(a, old, new, r.defaults());
+    const quiet = (try quietWhy(r, a, name, new)) == null;
     const detail = try std.fmt.allocPrint(a, "{s}, asked by {s}\n{s}The whole file, {d} bytes:\n{s}", .{
-        if (old == null) "a new definition" else "a change to its own definition",
+        if (old == null) "a new definition" else if (std.mem.eql(u8, name, r.def.name)) "a change to its own definition" else "a change to a definition main saved",
         r.def.name,
         try agents.readingText(a, old, cmp),
         shown.len,
@@ -2636,7 +2669,7 @@ fn agentSave(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Outpu
     });
     // the inbox item it is asked in: its number goes in the saved line
     var item: u64 = 0;
-    if (try decideAndAskWith(r, a, .agent_save, "agent_save", name, detail, r.now(), .{ .item = &item })) |why| {
+    if (try decideAndAskWith(r, a, .agent_save, "agent_save", name, detail, r.now(), .{ .item = &item, .own_helper = quiet })) |why| {
         const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
         try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = true, .output = out.text, .bytes = out.text.len });
         return out;
@@ -2654,6 +2687,7 @@ fn agentSave(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Outpu
     };
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
     try r.log.write(.agent, false, .{
         .event = "saved",
         .name = name,
@@ -2661,9 +2695,60 @@ fn agentSave(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Outpu
         .agent = r.who.agent,
         .item = if (item != 0) @as(?u64, item) else null,
         .widens = try std.mem.join(a, "; ", cmp.widens),
-        .sha256 = &std.fmt.bytesToHex(digest, .lower),
+        .sha256 = &hex,
+        .asked = item != 0 or !quiet,
+    });
+    if (r.helpers) |h| h.saved(h.ctx, a, .{
+        .name = name,
+        .kind = if (old == null) .made else .changed,
+        .sha = &hex,
+        .who = r.who.agent,
+        .told = quiet and item == 0,
+        .what = if (old) |o| try agents.changeWords(a, o, new) else new.description,
     });
     const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "saved agents/{s}.md; runs that start from now on use it", .{name}) };
+    try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = false, .output = out.text, .bytes = out.text.len });
+    return out;
+}
+
+/// Why main's save of `name` (as `def`, null for a retirement) is asked
+/// as today; null: main manages this helper itself. Main only, in a
+/// conversation with no outside text, never `main` or `helper`, within a
+/// plain helper's reach, nothing naming it and nothing of the owner's on
+/// it (core.zig's `why`).
+fn quietWhy(r: *Run, a: std.mem.Allocator, name: []const u8, def: ?agents.Def) !?[]const u8 {
+    if (!std.mem.eql(u8, r.def.name, "main")) return "not main";
+    const h = r.helpers orelse return "no desk";
+    if (std.mem.eql(u8, name, "main") or std.mem.eql(u8, name, "helper")) return "harness's own";
+    if ((try r.outside(a)).len > 0) return "outside text";
+    if (def) |d| if (agents.withinReach(d, .{ .steps = r.agents.steps, .tokens = r.agents.tokens, .answer_bytes = r.agents.answer_bytes, .worker = if (r.model_cfg) |m| m.worker else "" })) |why| return why;
+    return h.why(h.ctx, a, name);
+}
+
+/// `agent_save` with `retire: true`: a definition main saved itself goes
+/// to its versions, on the same terms as a save.
+fn agentRetire(r: *Run, a: std.mem.Allocator, set: *agents.Set, name: []const u8, old: ?agents.Def, mine: bool) !tools.Output {
+    const o = old orelse return saveRefused(r, a, name, try std.fmt.allocPrint(a, "there is no definition called {s} to retire", .{name}));
+    if (!mine) return saveRefused(r, a, name, try std.fmt.allocPrint(a, "agent_save retires only a definition main saved itself; {s} is not one", .{name}));
+    const quiet = (try quietWhy(r, a, name, o)) == null;
+    const detail = try std.fmt.allocPrint(a, "retiring {s}, asked by {s}: its file goes to its versions (state/agents/{s}/versions/)\nThe whole file, {d} bytes:\n{s}", .{ name, r.def.name, name, o.text.len, o.text });
+    var item: u64 = 0;
+    if (try decideAndAskWith(r, a, .agent_save, "agent_save", name, detail, r.now(), .{ .item = &item, .own_helper = quiet })) |why| {
+        const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+        try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = true, .output = out.text, .bytes = out.text.len });
+        return out;
+    }
+    set.remove(name) catch |e| {
+        const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "not retired: {s}", .{@errorName(e)}), .is_error = true };
+        try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = true, .output = out.text, .bytes = out.text.len });
+        return out;
+    };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(o.text, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    try r.log.write(.agent, false, .{ .event = "retired", .name = name, .by = r.who.by, .agent = r.who.agent, .item = if (item != 0) @as(?u64, item) else null, .sha256 = &hex });
+    if (r.helpers) |h| h.saved(h.ctx, a, .{ .name = name, .kind = .retired, .sha = &hex, .who = r.who.agent, .told = quiet and item == 0 });
+    const out: tools.Output = .{ .text = try std.fmt.allocPrint(a, "retired agents/{s}.md (kept in its versions)", .{name}) };
     try r.logRun(.tool, r.isPrivate(), .{ .tool = "agent_save", .arg = name, .is_error = false, .output = out.text, .bytes = out.text.len });
     return out;
 }
@@ -3253,6 +3338,8 @@ fn decideAndAskIn(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const 
 const AskExtra = struct {
     /// A post to a conversation others read: asked every time.
     shared: bool = false,
+    /// An agent_save by main of a plain helper it manages (`quietWhy`).
+    own_helper: bool = false,
     /// Why a call the gate allows is asked all the same (a file a post
     /// carries whose name programs read as settings).
     ask_why: ?[]const u8 = null,
@@ -3276,7 +3363,7 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
     // the outside text this run's model has seen: named in the question
     const marks = try r.outside(a);
     const outside_line = try outside_mod.line(a, marks);
-    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who, .shared = extra.shared, .dir = dir, .env = extra.env, .here = tool == .send and std.mem.eql(u8, arg, r.conversation), .outside = marks.len > 0 };
+    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who, .shared = extra.shared, .dir = dir, .env = extra.env, .here = tool == .send and std.mem.eql(u8, arg, r.conversation), .outside = marks.len > 0, .own_helper = extra.own_helper };
     const env_logged: []const u8 = if (extra.env_note.len > 0) extra.env else "";
     const d = blk: {
         r.lock.lockUncancelable(r.io);
@@ -4068,6 +4155,7 @@ fn helperRun(h: *Helper) !void {
     w.narrow = h.task.tools;
     w.starter = p;
     w.extra_instructions = "";
+    w.helpers = null;
     // a helper's words go to the agent, not to a person: no persona
     w.persona = "";
     w.cache = h.cache;
@@ -6582,7 +6670,8 @@ test "agent_save_refuses_another_definition_and_a_bad_file_unasked" {
     defer f.deinit();
     const a = f.e.arena.allocator();
     const first = try researcherWith(a, "Research with two sources.");
-    var set = try defsWith(&f, &.{.{ "researcher", first }});
+    const finder = "---\nname: finder\ndescription: Finds things.\nsaved: agent:main 2026-11-24T09:00:00Z\ntools: search\nmemory: pinned\n---\nFind.\n";
+    var set = try defsWith(&f, &.{ .{ "researcher", first }, .{ "finder", finder } });
     defer set.deinit();
     ownerRunWith(&f, &set);
     try f.e.script(1, try saveCall(&f, "tu_1", "researcher", try researcherWith(a, "Taken over.")));
@@ -6597,6 +6686,22 @@ test "agent_save_refuses_another_definition_and_a_bad_file_unasked" {
     try t.expect(std.mem.indexOf(u8, try f.e.request(4), "unknown tool telnet") != null);
     try t.expectEqualStrings(first, try f.e.tmp.dir.readFileAlloc(t.io, "agents/researcher.md", a, .unlimited));
     try t.expectError(error.FileNotFound, f.e.tmp.dir.statFile(t.io, "agents/writer.md", .{}));
+    // main changes one it saved itself (saved: agent:main): asked here,
+    // where no core says it may go quietly
+    try f.e.script(5, try saveCall(&f, "tu_5", "finder", "---\nname: finder\ndescription: Finds things.\ntools: search, fetch\nmemory: pinned\n---\nFind more.\n"));
+    try f.e.script(6, model.textReply("changed"));
+    const r2 = try f.say("change the finder");
+    freeResult(&f.run, r2);
+    try t.expectEqual(1, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.tmp.dir.readFileAlloc(t.io, "agents/finder.md", a, .unlimited), "Find more.") != null);
+    // another definition still can't touch one that isn't its own
+    f.run.useDefinition((try set.get(a, "researcher")).?);
+    try f.e.script(7, try saveCall(&f, "tu_7", "finder", "---\nname: finder\ndescription: Taken.\ntools: search\n---\nTaken.\n"));
+    try f.e.script(8, model.textReply("could not"));
+    const r3 = try f.say("take the finder");
+    freeResult(&f.run, r3);
+    try t.expectEqual(1, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(8), "finder is another definition") != null);
 }
 
 test "agent_save_is_offered_only_in_runs_the_owner_started_from_a_conversation" {

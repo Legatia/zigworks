@@ -125,6 +125,8 @@ fn defaultFor(tool: Tool, arg: []const u8, ctx: Ctx) rules.Action {
         .send => if (ctx.shared) .ask else .allow,
         .trigger => if (oneOf(firstWord(arg), &.{ "test", "list" })) .allow else .ask,
         .workflow => if (oneOf(firstWord(arg), &.{ "check", "list", "show" })) .allow else .ask,
+        // main's own plain helper (agent.zig checked it)
+        .agent_save => if (ctx.own_helper) .allow else .ask,
         else => tool.default(),
     };
 }
@@ -177,6 +179,9 @@ pub const Ctx = struct {
     /// The run's model has read outside text (outside.zig): `remember`
     /// and `people note` are asked by default.
     outside: bool = false,
+    /// An `agent_save` by main of a plain helper it manages itself
+    /// (agent.zig checked the rest): allowed by default, no setup call.
+    own_helper: bool = false,
 };
 
 /// What a grant covers: the exact argument, or for `fetch` and `browse`
@@ -506,7 +511,7 @@ pub const Gate = struct {
             if (ctx.money_unattended) return .{ .action = .allow, .why = "money in scheduled runs is switched on, within the caps", .subject = subject };
             return .{ .action = .deny, .why = "money is not moved in scheduled runs", .subject = subject };
         }
-        if (tool.setup(arg)) {
+        if (tool.setup(arg) and !(tool == .agent_save and ctx.own_helper and !ctx.scheduled)) {
             // like money: no grant or allow rule lifts this
             if (ctx.scheduled) return .{ .action = .deny, .why = "no one to ask in a scheduled run", .subject = subject };
             return .{ .action = .ask, .why = "asked every time: it changes what runs without you watching", .subject = subject };
@@ -514,7 +519,8 @@ pub const Gate = struct {
         // a grant for this tool (a shell command in this environment) and
         // key, for any run, the call's definition or what started its run;
         // a post others read is asked every time (an allow rule lifts that)
-        const asked_every_time = tool == .send and ctx.shared;
+        // main's own helper: the owner's lines decide, never a grant
+        const asked_every_time = (tool == .send and ctx.shared) or (tool == .agent_save and ctx.own_helper);
         if (!asked_every_time and g.grants.covers(tool, ctx.env, grantKey(tool, subject), w, now_s)) return .{ .action = .allow, .why = "a grant covers it (/grants)", .subject = subject };
         var d: Decision = .{ .action = defaultFor(tool, arg, ctx), .why = "default for this tool", .subject = subject };
         // programs read these as their settings (.git/config, .npmrc, .env):
@@ -1371,6 +1377,8 @@ test "the_platforms_kinds_have_their_defaults" {
     for ([_][]const u8{ "save release", "start release", "stop release#3" }) |arg| try t.expectEqual(.ask, f.act(.workflow, arg, .{}));
     for ([_][]const u8{ "check", "list", "show release" }) |arg| try t.expectEqual(.allow, f.act(.workflow, arg, .{}));
     try t.expectEqual(.ask, f.act(.agent_save, "researcher", .{}));
+    // a plain helper main manages itself: allowed by default
+    try t.expectEqual(.allow, f.act(.agent_save, "researcher", .{ .own_helper = true }));
     try t.expectEqual(.ask, f.act(.app_save, "notes", .{}));
     try t.expectEqual(.ask, f.act(.env_save, "box", .{}));
     try t.expectEqual(.allow, f.act(.app_read, "notes log", .{}));
@@ -1397,6 +1405,18 @@ test "setup_calls_are_asked_every_time_like_money" {
     try t.expectEqual(.deny, f.act(.env_save, "box", .{ .scheduled = true }));
     try t.expect(f.gate.decide(a, .shell, "ls", 1000, .{}).allow_day);
     try t.expect(!f.gate.decide(a, .money, "broker/x {}", 1000, .{}).allow_day);
+    // main's own plain helper is no setup call: the owner's lines decide,
+    // and it is never given a day
+    const own = f.gate.decide(a, .agent_save, "researcher", 1000, .{ .own_helper = true });
+    try t.expectEqual(.allow, own.action);
+    try t.expect(!own.allow_day);
+    f.gate.rules = try rules.parse(a, "ask agent_save *\n");
+    try t.expectEqual(.ask, f.act(.agent_save, "researcher", .{ .own_helper = true }));
+    f.gate.rules = try rules.parse(a, "deny agent_save research*\n");
+    try t.expectEqual(.deny, f.act(.agent_save, "researcher", .{ .own_helper = true }));
+    // nobody watching: a setup call is refused, a quiet helper save too is
+    // only for runs the owner started (agent.zig offers agent_save there)
+    try t.expectEqual(.deny, f.act(.agent_save, "researcher", .{ .scheduled = true }));
 }
 
 test "a_send_others_read_is_asked_every_time_and_an_allow_rule_lifts_it" {
