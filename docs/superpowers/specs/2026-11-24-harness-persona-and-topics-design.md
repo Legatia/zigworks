@@ -45,6 +45,27 @@ evening.zig `presetFile`, core.zig `Manner`) works like this:
   - each subject has its own topic for the details;
   - opening a topic shows, at the top, what that subject holds now.
 
+The owner added, the same day:
+
+> "Subagents are still possible and likely required, main agent should
+> be able to init and manage them by themselves, user should be able to
+> see the communication between main and sub agents. But user shouldn't
+> be bothered to manage or chat with subagents unless he really wants to."
+
+So helpers stay. `main` should make and manage them itself. The owner
+should be able to see the exchange between `main` and its helpers, but
+never has to manage them, or talk to them, unless they choose to.
+
+**Today:**
+
+- **Delegating:** `main` delegates with `delegate`. Helpers keep their
+  parent's `by`, so every helper call passes the gate as the parent's
+  would.
+- **Making a definition:** `main` can make one for a recurring kind of
+  task with `agent_save`, but that's a setup call, asked every time (the
+  agents spec).
+- **Seeing the work:** only `/session`, one run at a time, on request.
+
 ## Goals
 
 1. **A persona:**
@@ -69,6 +90,18 @@ evening.zig `presetFile`, core.zig `Manner`) works like this:
 5. **The summaries point into topics:** the evening message, and the
    morning routine where the owner has one, carry one line per topic
    with news, each linking to its topic.
+6. **`main` manages its helpers:** it makes, changes and retires the
+   definitions it uses itself, without asking. Two exceptions:
+   - a change that widens what a helper may do, or what it costs;
+   - a definition something unattended uses.
+
+   Those are asked as today.
+7. **The owner can watch the work:** the exchange between `main` and its
+   helpers is filed, quietly, in a Work topic. Without topics, `/work`
+   shows it.
+8. **Talking to a helper is optional:** today's `/ask NAME TEXT` and a
+   topic pointed at a definition stay as they are, and nothing sets
+   them up.
 
 ## Non-goals
 
@@ -383,6 +416,120 @@ title as a link.
   - an owner's own morning file gets the lines only if it says
     `{topics}`.
 
+## Part 3: helpers `main` manages itself
+
+### Saving a definition without asking
+
+`agent_save` stays the one way a definition is written. Today a run may
+save only a new definition or its own (agent.zig ~2611).
+
+**What changes:** `main` may also change and retire the definitions it
+saved itself (`saved: agent:main …`). Any other definition, `scout` say,
+keeps today's rule: only its own, and asked.
+
+A save by `main` is allowed without a question when all of these hold:
+
+1. **No mark.** The conversation carries no outside-text mark. The
+   injection rule says a tool that keeps text for later runs is asked in
+   a marked conversation.
+2. **Nothing names it.**
+   - No task (`agent =`), trigger, workflow or workflow step names the
+     definition, and no conversation's `agent` field does.
+   - So it runs only through `delegate`, as a helper whose calls pass
+     the gate as its parent's.
+   - An unattended run may still delegate to it. Its asks become
+     refusals there, as for any helper.
+3. **It stays within a plain helper's reach.**
+   - `tools` is within the six a helper task gets by default: `search`,
+     `fetch`, `browse`, `read_file`, `recall` and `skill` (agents.zig ~97).
+   - There are no MCP tools and no skills beyond what `skill` reads.
+   - `model` is empty, or `[model] worker_model`.
+   - `memory: pinned`.
+   - There's no `environment`.
+   - `steps`, `tokens` and `answer_bytes` are no higher than `[agents]`'
+     values. A definition's own value replaces `[agents]`' rather than
+     being capped by it, so this check is the bound.
+   - The bound is fixed, not "narrower than before". A file outside it
+     is asked even for an instructions-only change.
+4. **No owner's mark on the name.**
+   - No section of the rules file matches `agent:NAME`, globs included
+     (`[agent:*]`, `[agent:r*]`).
+   - No live grant is held for `agent:NAME`.
+   - The definition is new, or its file still matches the sha256 logged
+     at `main`'s last save of it. A hand edit makes it the owner's.
+   - No earlier version in `state/agents/NAME/versions/` was written by
+     the owner. That covers a name the owner wrote and then removed.
+   - `main` and `helper` themselves are always asked.
+
+**Anything else is asked exactly as today,** with the "Widens:" list.
+The owner's own lines still decide:
+
+- a `deny agent_save` rule refuses;
+- an owner's `ask agent_save` line makes every save asked.
+
+**Retiring:** `agent_save {"name":…,"retire":true}` moves a definition
+`main` saved to `state/agents/NAME/versions/`, under the same
+conditions. "Nothing names it" checks tasks, triggers, workflows and
+their steps, and conversations. Today's `/agent rm` checks only tasks.
+
+**The owner hears about it once, quietly:**
+
+- **Where:** the Work topic, or `main` without topics.
+- **Which messages:** "Made a helper: researcher. Searches and reads
+  pages, for comparing listings." or "Changed researcher: added fetch.",
+  sent silently.
+- **Undo:** a [Remove] button on a new definition, an [Undo] button on a
+  change. The versions are already kept.
+- **`/agents`** already shows who saved each definition, or that it was
+  written by hand.
+
+### The Work topic
+
+When topics are in use, setup adds `work`, titled "Work". Every post
+there is silent (`disable_notification`).
+
+**When:** a run that delegated posts one message per `delegate` call
+(at most 8 helpers) when the call ends. It's built from the log, never
+by the model:
+
+- a header: the request's first line, and where the answer went (a link
+  to that topic);
+- one expandable blockquote per helper: its definition, its task, steps,
+  the tools it used, and its answer;
+- tokens in and out, and model calls. harness keeps no prices.
+
+**Formatting:** sent with message entities (`expandable_blockquote`,
+offsets in UTF-16 units). No `parse_mode` is used, so outside text in an
+answer needs no escaping and can't inject markup. This is the first
+formatted send in `telegram.zig`, which sends plain text today.
+
+**Size:** the message fits in 4,096 characters. The answers share what
+the header leaves, at least 200 characters each, cut with "…".
+
+**Expanding:** each helper stays folded until the owner taps it. That's
+"expand to see the contents", at the level of one piece of work.
+
+**Privacy and masking:**
+
+- A run in a private conversation posts only who, the step counts and
+  the tokens.
+- Secrets are masked.
+- The helper's answer may hold outside text. It's shown, never put in a
+  prompt, as with the cards.
+
+**Without topics,** nothing is posted. `/work` in any of the owner's
+conversations shows the latest delegated run's post there, as plain
+text. `/session` stays as it is: one line per helper.
+
+### Talking to a helper
+
+The owner never has to, and the way to do it already exists. Today,
+`/ask NAME TEXT` queues a turn of definition NAME in that conversation,
+with its own context there, its answers marked `[NAME]` (core.zig
+~12048). It stays as it is. So does the `agent` field on a conversation,
+for an owner who wants a whole topic answered by one definition.
+Nothing harness writes sets either.
+
 ## Constraints
 
 - Zig 0.17.1, std only. Copy follows CLAUDE.md: plain labels, sentence
@@ -439,6 +586,44 @@ title as a link.
   the morning routine's `{topics}`.
 - **Quiet hours:** a digest per topic, plus `main`'s line.
 
+**Helpers:**
+
+- **Allowed without asking:** `main` saves a new definition within a
+  helper's reach, in an unmarked conversation, with nothing naming it
+  and no rules section or grant for its name. It's saved without a
+  question, with one silent line and [Remove].
+- **Each of these asks:**
+  - a marked conversation;
+  - a task, trigger, workflow step or conversation naming it;
+  - a tool outside the six;
+  - an MCP tool;
+  - a model other than `worker_model`;
+  - shared memory;
+  - an environment;
+  - limits above `[agents]`;
+  - a matching `[agent:…]` section;
+  - a live grant;
+  - a hand-edited file;
+  - an earlier version by the owner;
+  - `main` or `helper` itself;
+  - an owner's `ask agent_save` line.
+
+  A `deny agent_save` line refuses.
+- **Whose definitions:** `main` changes and retires its own. Another
+  definition still can't touch one that isn't its own (the test at
+  agent.zig ~6571 changes on purpose for `main` only).
+- **The Work post:** one per `delegate` call, with entities. It fits
+  4,096 characters with eight long answers. Outside text with `<`, `*`
+  and `_` is shown as it is. A private run posts metadata only. Without
+  topics, `/work` shows it.
+- **Tests that change on purpose,** where they assume `main`'s own
+  definitions are always asked:
+  - gate.zig ~1373 and ~1381;
+  - agent.zig ~6536 and ~6571;
+  - core.zig ~19967.
+
+  The rest hold.
+
 ## Left to the builder
 
 - The presets' exact wording.
@@ -465,3 +650,19 @@ title as a link.
   `home` is taken.
 - **The new commands are `/overview`, `/focus` and `/card`,** since
   `/topic` belongs to briefs.
+- **`main` saves its own helpers without asking,** but only within a
+  plain helper's reach:
+  - the six read tools;
+  - the worker model;
+  - pinned memory;
+  - no environment;
+  - the default limits.
+
+  It also needs an unmarked conversation, nothing naming the helper, and
+  nothing the owner wrote for that name. Anything else is still asked
+  every time.
+- **The Work topic is silent,** with a folded section per helper, and
+  built from the log, not by the model. Without topics, `/work` shows the
+  same.
+- **`/ask` and topics pointed at a helper stay as they are today:**
+  optional, and never set up by harness.
