@@ -5762,7 +5762,10 @@ test "kinds_without_a_tool_yet_are_not_offered_or_run" {
         try t.expect(std.mem.indexOf(u8, req1, try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{name})) == null);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "this tool is not available here") != null);
     try t.expectEqual(0, f.asked);
-    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"kind\":\"gate\"") == null);
+    // the call is logged as refused, and no rule was matched for it
+    const log = try f.logText();
+    try t.expect(std.mem.indexOf(u8, log, "\"tool\":\"send\",\"decision\":\"deny\",\"why\":\"not offered in this run\"") != null);
+    try t.expect(std.mem.indexOf(u8, log, "\"decision\":\"allow\"") == null);
 }
 
 /// Notices a run gives the owner, kept.
