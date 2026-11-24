@@ -5,6 +5,7 @@
 //! one apart.
 const std = @import("std");
 const builtin = @import("builtin");
+const url_mod = @import("url.zig");
 const Io = std.Io;
 
 /// One file of a skill: its path in the skill's folder (with `/`), its
@@ -36,7 +37,7 @@ pub const max_files = 300;
 pub const max_total = 10 * 1024 * 1024;
 
 /// A skill folder's files (paths with `/`), up to the limits
-/// (error.TooLarge past them); links and `.tmp` files left out.
+/// (error.TooLarge past them); links, `.tmp` files and `.git` left out.
 pub fn readFolder(io: Io, a: std.mem.Allocator, folder: []const u8) ![]File {
     var out: std.ArrayList(File) = .empty;
     var total: usize = 0;
@@ -53,7 +54,8 @@ fn readInto(io: Io, a: std.mem.Allocator, folder: []const u8, rel: []const u8, o
     while (try it.next(io)) |e| {
         const r = if (rel.len == 0) try a.dupe(u8, e.name) else try std.fmt.allocPrint(a, "{s}/{s}", .{ rel, e.name });
         switch (e.kind) {
-            .directory => try readInto(io, a, folder, r, out, total),
+            // a clone's history is no part of the skill
+            .directory => if (!std.mem.eql(u8, e.name, ".git")) try readInto(io, a, folder, r, out, total),
             .file => {
                 if (std.mem.endsWith(u8, e.name, ".tmp")) continue;
                 if (out.items.len >= max_files) return error.TooLarge;
@@ -146,6 +148,152 @@ pub fn dropSource(io: Io, a: std.mem.Allocator, skills_dir: []const u8, name: []
 pub fn findSource(lines: []const Line, name: []const u8) ?Line {
     for (lines) |l| if (std.mem.eql(u8, l.name, name)) return l;
     return null;
+}
+
+// ---- sources ----
+
+/// Where a skill comes from: a folder, a GitHub repo (the path in it, the
+/// ref; "" for the default branch), a link to a SKILL.md, or Hermes
+/// (nothing to update from).
+pub const Source = union(enum) {
+    folder: []const u8,
+    github: Github,
+    link: []const u8,
+    hermes,
+};
+
+pub const Github = struct { owner: []const u8, repo: []const u8, path: []const u8 = "", ref: []const u8 = "" };
+
+/// SOURCE as `harness skill add` takes it (`is_folder`: it names a folder
+/// on this machine, which the caller found): a folder; `OWNER/REPO[/PATH][@REF]`;
+/// a github.com link (`/tree/REF/PATH`, `/blob/REF/PATH/SKILL.md`); another
+/// https link (or http to this machine): one SKILL.md; or `hermes`.
+pub fn parseSource(a: std.mem.Allocator, text: []const u8, is_folder: bool) !Source {
+    if (is_folder) return .{ .folder = text };
+    if (std.mem.eql(u8, text, "hermes")) return .hermes;
+    if (std.mem.startsWith(u8, text, "https://github.com/") or std.mem.startsWith(u8, text, "http://github.com/")) {
+        const rest = text[std.mem.indexOf(u8, text, "github.com/").? + "github.com/".len ..];
+        var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, rest, "/"), '/');
+        const owner = it.next() orelse return error.BadSource;
+        var repo = it.next() orelse return error.BadSource;
+        if (std.mem.endsWith(u8, repo, ".git")) repo = repo[0 .. repo.len - 4];
+        var g: Github = .{ .owner = owner, .repo = repo };
+        if (it.next()) |kind| {
+            if (!std.mem.eql(u8, kind, "tree") and !std.mem.eql(u8, kind, "blob")) return error.BadSource;
+            g.ref = it.next() orelse return error.BadSource;
+            var path = it.rest();
+            if (std.mem.eql(u8, kind, "blob")) path = std.fs.path.dirnamePosix(path) orelse "";
+            g.path = path;
+        }
+        try checkGithub(g);
+        return .{ .github = g };
+    }
+    if (std.mem.startsWith(u8, text, "https://") or std.mem.startsWith(u8, text, "http://")) {
+        const u = url_mod.parse(a, text) catch return error.BadSource;
+        if (!u.https and !loopback(u.host)) return error.PlainHttp;
+        return .{ .link = text };
+    }
+    if (std.mem.indexOf(u8, text, "://") != null) return error.BadSource;
+    var g: Github = .{ .owner = "", .repo = "" };
+    var main = text;
+    if (std.mem.lastIndexOfScalar(u8, text, '@')) |at| {
+        g.ref = text[at + 1 ..];
+        if (g.ref.len == 0) return error.BadSource;
+        main = text[0..at];
+    }
+    var it = std.mem.splitScalar(u8, main, '/');
+    g.owner = it.next() orelse return error.BadSource;
+    g.repo = it.next() orelse return error.BadSource;
+    g.path = it.rest();
+    try checkGithub(g);
+    return .{ .github = g };
+}
+
+fn loopback(host: []const u8) bool {
+    return std.mem.eql(u8, host, "localhost") or std.mem.eql(u8, host, "[::1]") or std.mem.startsWith(u8, host, "127.");
+}
+
+fn checkGithub(g: Github) !void {
+    for ([_][]const u8{ g.owner, g.repo }) |n| {
+        if (n.len == 0 or n.len > 100 or n[0] == '-' or n[0] == '.') return error.BadSource;
+        for (n) |c| if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.')) return error.BadSource;
+    }
+    if (g.path.len > 0 and !safeRel(g.path)) return error.BadSource;
+    for (g.ref) |c| if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-_./", c) != null)) return error.BadSource;
+    if (std.mem.indexOf(u8, g.ref, "..") != null) return error.BadSource;
+}
+
+/// The source as `skills/.sources` keeps it (and `parseSource` reads back:
+/// a folder is kept absolute).
+pub fn sourceText(a: std.mem.Allocator, src: Source) ![]const u8 {
+    return switch (src) {
+        .folder => |f| f,
+        .link => |l| l,
+        .hermes => "hermes",
+        .github => |g| std.fmt.allocPrint(a, "{s}/{s}{s}{s}{s}{s}", .{ g.owner, g.repo, if (g.path.len > 0) "/" else "", g.path, if (g.ref.len > 0) "@" else "", g.ref }),
+    };
+}
+
+/// What `skill add` shows of a SKILL.md: its frontmatter's name,
+/// description, license, compatibility, allowed-tools, and Hermes's
+/// platforms and required environment variables.
+pub const Facts = struct {
+    name: []const u8 = "",
+    description: []const u8 = "",
+    license: []const u8 = "",
+    compatibility: []const u8 = "",
+    allowed_tools: []const u8 = "",
+    platforms: []const []const u8 = &.{},
+    env_vars: []const []const u8 = &.{},
+};
+
+pub fn facts(a: std.mem.Allocator, md: []const u8) !Facts {
+    const yaml = @import("yaml.zig");
+    // the frontmatter's lines, read as YAML (a closing fence may have spaces)
+    const h = try @import("skills.zig").readHeader(a, md);
+    const head_end = @intFromPtr(h.body.ptr) - @intFromPtr(md.ptr);
+    const first_nl = (std.mem.indexOfScalar(u8, md, '\n') orelse return error.NoFrontmatter) + 1;
+    const block = md[first_nl..head_end];
+    const close = std.mem.lastIndexOf(u8, std.mem.trimEnd(u8, block, "\r\n \t"), "\n") orelse 0;
+    const yaml_text = block[0..close];
+    var f: Facts = .{};
+    var d: yaml.Diag = .{};
+    if (yaml.parse(a, yaml_text, &d)) |v| {
+        const str = struct {
+            fn s(x: ?yaml.Value) []const u8 {
+                return std.mem.trim(u8, yaml.str(x) orelse "", " \n");
+            }
+        }.s;
+        f.name = str(yaml.get(v, "name"));
+        f.description = try std.mem.replaceOwned(u8, a, str(yaml.get(v, "description")), "\n", " ");
+        f.license = str(yaml.get(v, "license"));
+        f.compatibility = str(yaml.get(v, "compatibility"));
+        var tools: std.ArrayList([]const u8) = .empty;
+        for (try yaml.list(a, yaml.get(v, "allowed-tools"))) |x| if (yaml.str(x)) |sx| try tools.append(a, sx);
+        f.allowed_tools = try std.mem.join(a, " ", tools.items);
+        var plats: std.ArrayList([]const u8) = .empty;
+        for (try yaml.list(a, yaml.get(v, "platforms"))) |x| if (yaml.str(x)) |sx| try plats.append(a, sx);
+        f.platforms = plats.items;
+        var vars: std.ArrayList([]const u8) = .empty;
+        for (try yaml.list(a, yaml.get(v, "required_environment_variables"))) |x| {
+            const n = yaml.str(x) orelse yaml.str(yaml.get(x, "name")) orelse continue;
+            try vars.append(a, n);
+        }
+        for (try yaml.list(a, yaml.get(yaml.get(v, "prerequisites"), "env_vars"))) |x| if (yaml.str(x)) |n| try vars.append(a, n);
+        for (try yaml.list(a, yaml.get(yaml.get(v, "setup"), "collect_secrets"))) |x| if (yaml.str(yaml.get(x, "env_var"))) |n| try vars.append(a, n);
+        f.env_vars = vars.items;
+    } else |_| {
+        // skills.zig's own reading, for the plain fields
+        for (h.fields) |fl| {
+            if (fl.nested) continue;
+            if (std.mem.eql(u8, fl.key, "name")) f.name = fl.value;
+            if (std.mem.eql(u8, fl.key, "description")) f.description = fl.value;
+            if (std.mem.eql(u8, fl.key, "license")) f.license = fl.value;
+            if (std.mem.eql(u8, fl.key, "compatibility")) f.compatibility = fl.value;
+            if (std.mem.eql(u8, fl.key, "allowed-tools")) f.allowed_tools = fl.value;
+        }
+    }
+    return f;
 }
 
 // ---- installing ----
@@ -269,4 +417,73 @@ test "install_writes_the_folder_whole" {
     var n: usize = 0;
     while (try it.next(t.io)) |_| n += 1;
     try t.expectEqual(1, n);
+}
+
+test "sources_are_told_apart" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqualStrings("/home/me/skills/x", (try parseSource(a, "/home/me/skills/x", true)).folder);
+    const short = (try parseSource(a, "anthropics/skills", false)).github;
+    try t.expectEqualStrings("anthropics", short.owner);
+    try t.expectEqualStrings("skills", short.repo);
+    try t.expectEqualStrings("", short.path);
+    try t.expectEqualStrings("", short.ref);
+    const full = (try parseSource(a, "anthropics/skills/skills/pdf@v1.2", false)).github;
+    try t.expectEqualStrings("skills/pdf", full.path);
+    try t.expectEqualStrings("v1.2", full.ref);
+    try t.expectEqualStrings("anthropics/skills/skills/pdf@v1.2", try sourceText(a, .{ .github = full }));
+    const tree = (try parseSource(a, "https://github.com/anthropics/skills/tree/main/skills/pdf", false)).github;
+    try t.expectEqualStrings("main", tree.ref);
+    try t.expectEqualStrings("skills/pdf", tree.path);
+    const blob = (try parseSource(a, "https://github.com/anthropics/skills/blob/main/skills/pdf/SKILL.md", false)).github;
+    try t.expectEqualStrings("skills/pdf", blob.path);
+    const bare = (try parseSource(a, "https://github.com/anthropics/skills.git", false)).github;
+    try t.expectEqualStrings("skills", bare.repo);
+    try t.expectEqualStrings("https://raw.githubusercontent.com/o/r/main/s/SKILL.md", (try parseSource(a, "https://raw.githubusercontent.com/o/r/main/s/SKILL.md", false)).link);
+    try t.expectEqualStrings("http://127.0.0.1:8080/SKILL.md", (try parseSource(a, "http://127.0.0.1:8080/SKILL.md", false)).link);
+    for ([_][]const u8{ "http://example.com/SKILL.md", "ftp://x/y", "justaword", "a/../b", "o/r@", "o/r/../x", "-x/y" }) |bad| {
+        if (parseSource(a, bad, false)) |_| {
+            std.debug.print("taken: {s}\n", .{bad});
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+    try t.expect(try parseSource(a, "hermes", false) == .hermes);
+}
+
+test "facts_show_what_the_skill_asks_for" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try facts(a,
+        \\---
+        \\name: deploy
+        \\description: >
+        \\  Deploy the site,
+        \\  safely.
+        \\license: MIT
+        \\compatibility: needs git and ssh
+        \\allowed-tools: Bash(git:*) Read
+        \\platforms: [linux, macos]
+        \\required_environment_variables:
+        \\  - name: DEPLOY_TOKEN
+        \\    prompt: Your token
+        \\  - SSH_HOST
+        \\metadata:
+        \\  hermes:
+        \\    tags: [x]
+        \\---  
+        \\Body
+    );
+    try t.expectEqualStrings("deploy", f.name);
+    try t.expectEqualStrings("Deploy the site, safely.", f.description);
+    try t.expectEqualStrings("MIT", f.license);
+    try t.expectEqualStrings("needs git and ssh", f.compatibility);
+    try t.expectEqualStrings("Bash(git:*) Read", f.allowed_tools);
+    try t.expectEqual(2, f.platforms.len);
+    try t.expectEqualStrings("DEPLOY_TOKEN", f.env_vars[0]);
+    try t.expectEqualStrings("SSH_HOST", f.env_vars[1]);
+    // a list of tools reads too; no frontmatter: error
+    try t.expectEqualStrings("Read Write", (try facts(a, "---\nname: x\ndescription: d\nallowed-tools: [Read, Write]\n---\n")).allowed_tools);
+    try t.expectError(error.NoFrontmatter, facts(a, "no header"));
 }

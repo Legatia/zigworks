@@ -23,6 +23,7 @@ const scrub = @import("scrub.zig");
 const undo_mod = @import("undo.zig");
 const doctor = @import("doctor.zig");
 const hermes_import = @import("hermes_import.zig");
+const skill_cmd = @import("skill_cmd.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -90,6 +91,16 @@ const usage =
     \\                             bring over a Hermes setup: memory, skills, scheduled
     \\                             jobs, MCP servers, deny rules, the model; the plan
     \\                             first, no key copied (README: Coming from Hermes)
+    \\  skill add SOURCE [--skill NAME] [--yes]
+    \\                             install a skill: a folder, OWNER/REPO[/PATH][@REF]
+    \\                             from GitHub, or an https link to a SKILL.md; what it
+    \\                             holds and asks for is shown first
+    \\  skill list | show NAME | rm NAME
+    \\                             the skills and where each came from; one in full;
+    \\                             remove one
+    \\  skill update [NAME] [--force] [--yes]
+    \\                             fetch again and show what changed; an edited one only
+    \\                             with --force
     \\  version | help
     \\
     \\The data folder is --home (anywhere on the line), else HARNESS_HOME, else
@@ -426,6 +437,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "doctor")) return doctorCmd(app);
     if (eql(cmd, "report")) return reportCmd(app);
     if (eql(cmd, "import")) return importCmd(app, rest);
+    if (eql(cmd, "skill")) return skillCmd(app, rest);
     complain("unknown command {s}; see harness help", .{cmd});
     return .usage;
 }
@@ -483,6 +495,27 @@ fn importCmd(app: *App, args: []const []const u8) !Exit {
         .now_s = util.nowSeconds(app.io),
         .zone_dirs = try zoneDirs(app),
         .stored = stored,
+    }, parsed);
+    return @enumFromInt(code);
+}
+
+const skill_usage = "usage: harness skill add SOURCE [--skill NAME] [--yes] | skill list | skill show NAME | skill update [NAME] [--force] [--yes] | skill rm NAME";
+
+/// `harness skill ...`: skill_cmd.zig, at this terminal.
+fn skillCmd(app: *App, args: []const []const u8) !Exit {
+    const parsed = skill_cmd.parseArgs(args) orelse {
+        complain(skill_usage, .{});
+        return .usage;
+    };
+    var term: ImportTerm = .{ .app = app };
+    const code = try skill_cmd.runSkill(.{
+        .io = app.io,
+        .gpa = app.gpa,
+        .a = app.arena,
+        .home = app.home,
+        .env = app.env,
+        .term = .{ .ctx = &term, .print = ImportTerm.print, .ask = if (Io.File.stdin().isTty(app.io) catch false) ImportTerm.ask else null },
+        .now_s = util.nowSeconds(app.io),
     }, parsed);
     return @enumFromInt(code);
 }
@@ -2308,6 +2341,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     if (eql(cmd, "undo")) return if (rest.len == 1 and (std.fmt.parseInt(u64, rest[0], 10) catch null) != null) null else undo_usage;
     if (eql(cmd, "env")) return if (envArgsOk(rest)) null else env_usage;
     if (eql(cmd, "import")) return if (hermes_import.parseArgs(rest) == null) import_usage else null;
+    if (eql(cmd, "skill")) return if (skill_cmd.parseArgs(rest) == null) skill_usage else null;
     if (eql(cmd, "login")) {
         if (rest.len == 0) return login_usage;
         if (eql(rest[0], "list") and rest.len != 1) return login_usage;
@@ -2794,6 +2828,8 @@ test {
     _ = @import("hermes.zig");
     _ = @import("skillsrc.zig");
     _ = @import("hermes_import.zig");
+    _ = @import("targz.zig");
+    _ = @import("skill_cmd.zig");
 }
 
 test "harness_people_takes_list_show_and_import" {
@@ -3176,4 +3212,13 @@ test "init_notices_a_hermes_setup" {
     var none = std.process.Environ.Map.init(a);
     try none.put("HOME", try tmp.dir.realPathFileAlloc(t.io, ".", a));
     try t.expect(@import("hermes_import.zig").noticeFor(t.io, a, &none) == null);
+}
+
+test "skill_takes_its_commands" {
+    for ([_][]const []const u8{ &.{ "skill", "list" }, &.{ "skill", "add", "o/r", "--yes" }, &.{ "skill", "show", "x" }, &.{ "skill", "update" }, &.{ "skill", "update", "x", "--force" }, &.{ "skill", "rm", "x" } }) |line| if (badArgs(line)) |why| {
+        std.debug.print("{s}: {s}\n", .{ line[1], why });
+        return error.TestUnexpectedResult;
+    };
+    for ([_][]const []const u8{ &.{"skill"}, &.{ "skill", "add" }, &.{ "skill", "remove", "x" }, &.{ "skill", "list", "--yes" } }) |line| try std.testing.expect(badArgs(line) != null);
+    for ([_][]const u8{ "skill add SOURCE [--skill NAME] [--yes]", "skill list | show NAME | rm NAME", "skill update [NAME] [--force] [--yes]" }) |l| try std.testing.expect(std.mem.indexOf(u8, usage, l) != null);
 }
