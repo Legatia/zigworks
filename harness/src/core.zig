@@ -66,6 +66,7 @@ const away_mod = @import("away.zig");
 const trips_mod = @import("trips.zig");
 const taskfiles = @import("taskfiles.zig");
 const persona_mod = @import("persona.zig");
+const money_mod = @import("money.zig");
 const topics_mod = @import("topics.zig");
 const card_mod = @import("card.zig");
 const work_mod = @import("work.zig");
@@ -912,6 +913,7 @@ pub const Core = struct {
         c.switches = .{};
         c.switches.auto_recall.store(c.cfg.memory.auto, .release);
         c.loadSwitches();
+        Money.load(c);
         c.convs = .init(gpa, io, c.paths.conversations);
         errdefer c.convs.deinit();
         try c.convs.load();
@@ -3609,6 +3611,8 @@ pub const Core = struct {
         if (data.len > 0 and data[0] == 'u') return c.undoPress(chat, thread, message_id, data, text);
         // a helper main saved: [Remove] or [Undo]
         if (data.len > 0 and data[0] == 'h') return Helpers.press(c, chat, thread, message_id, data);
+        // an automated spend's [Pause automation spending]
+        if (std.mem.eql(u8, data, "p")) return Money.press(c, chat, thread, message_id);
         if (data.len > 1 and data[0] == 's') if (std.fmt.parseInt(u64, data[1..], 10)) |id| return c.showPress(chat, thread, id) else |_| {};
         c.tellOutOfDate(chat, thread, message_id);
     }
@@ -5183,6 +5187,7 @@ pub const Core = struct {
             .mcp = c.mcp_tools,
             .money = c.cfg.money,
             .money_ledger = &c.money_ledger,
+            .spend = .{ .ctx = c, .told = Money.told },
             .dry_run = c.switches.dry_run.load(.acquire),
             .logins = c.login_list,
             .store = c.store,
@@ -12229,6 +12234,7 @@ pub const Core = struct {
         \\/env rm NAME: remove an environment's home, snapshots and access
         \\/quiet [on|off|22:00-07:00]: quiet hours, and what they hold for the digest
         \\/dryrun on|off: money tools are not called while on
+        \\/money: the caps, the budget for routines and what was spent; /money budget N a day (or a month); /money pause, /money resume
         \\/reload: apply changed settings files
         \\/conversations: where you and the agent talk
         \\/conversation new NAME: open a topic for a subject
@@ -12301,6 +12307,7 @@ pub const Core = struct {
         if (eql(u8, cmd, "/bedtime")) return Bedtime.command(c, a, rest);
         if (eql(u8, cmd, "/evening")) return Evening.command(c, a, rest);
         if (eql(u8, cmd, "/persona")) return Persona.command(c, a, conv, rest);
+        if (eql(u8, cmd, "/money")) return Money.command(c, a, conv, rest);
         if (eql(u8, cmd, "/focus")) return Topics.focusCommand(c, a, conv, rest);
         if (eql(u8, cmd, "/card")) return Topics.cardCommand(c, a, conv);
         if (eql(u8, cmd, "/overview")) return Topics.overview(c, a, conv);
@@ -29025,6 +29032,128 @@ test "make_this_payment_makes_exactly_that_call_as_the_owner" {
     try t.expectEqual(1, std.mem.count(u8, shopOrders(&f), "\n"));
 }
 
+const groceries_task = "[weekly-groceries]\nat = 23:59\ndo = Order the groceries.\n";
+
+test "an_automated_spend_is_told_in_main_with_a_pause_button" {
+    var f: Fix = undefined;
+    // quiet hours now: the line goes all the same, with a sound
+    try f.init("[money]\nbudget_per_day = 30\nbudget_per_month = 200\n[butler]\nquiet = 22:00-07:00\n", "", groceries_task);
+    defer f.deinit();
+    try withShop(&f, shop_money);
+    f.core.fixed_now = quietDay() + 3 * 3600;
+    try f.e.script(1, model.toolReply("o1", "frisco__shop_order", "{\"items\":[\"milk\"],\"total\":12.5}"));
+    try f.e.script(2, model.textReply("Ordered the milk."));
+    _ = try f.core.runTask(try taskNamed(f.core, "weekly-groceries"));
+    try waitOrders(&f, "{\"items\":[\"milk\"],\"total\":12.5}");
+    try f.rec.waitIn("main", "BUTTONS Spent 12.50 on frisco/shop_order for the weekly-groceries task. Today 12.50 of 30; this month 12.50 of 200.");
+    try t.expectEqual(false, f.rec.quietOf("BUTTONS Spent 12.50").?);
+    // the run's own reply waits for the digest; the line didn't
+    try t.expectEqual(0, f.rec.count("Ordered the milk."));
+    try t.expectEqual(@as(f64, 12.5), friscoToday(&f).auto);
+    const b = f.rec.buttonsWith("Spent 12.50").?;
+    try t.expectEqualStrings("p", b.get("p") orelse b.buf[0][0..b.len[0]]);
+    // its button pauses: the next payment is kept for the owner instead
+    f.core.handleCallback(42, b.msg, b.buf[0][0..b.len[0]]);
+    try f.rec.waitFor("Routines' spending is paused: each payment they try waits for you. /money resume restarts it.");
+    try t.expect(f.core.switches.money_paused.load(.acquire));
+    // in the morning (skipped items wait out quiet hours)
+    f.core.fixed_now = quietDay() + 8 * 3600;
+    try f.e.script(3, model.toolReply("o2", "frisco__shop_order", "{\"items\":[\"eggs\"],\"total\":5}"));
+    try f.e.script(4, model.textReply("Not ordered."));
+    _ = try f.core.runTask(try taskNamed(f.core, "weekly-groceries"));
+    try f.rec.waitFor("Amount: 5\nRefused: automation spending is paused (/money resume restarts it).");
+    try t.expect(f.rec.buttonsWith("Amount: 5\n").?.get("pay") != null);
+    try t.expectEqual(1, std.mem.count(u8, shopOrders(&f), "\n"));
+    try expectHas(try logText(&f), "\"tool\":\"frisco__shop_order\",\"decision\":\"allow\",\"why\":\"within the budget for automation: today 12.50 of 30; this month 12.50 of 200\"");
+}
+
+test "money_pause_and_resume_are_kept_across_restarts" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try t.expectEqualStrings("Routines' spending is paused: each payment they try waits for you. /money resume restarts it.", try f.core.command(a, "/money pause"));
+    try restart(&f);
+    try t.expect(f.core.switches.money_paused.load(.acquire));
+    try expectHas(try f.core.command(a, "/money"), "Routines' spending: paused. /money resume restarts it.");
+    try t.expectEqualStrings("Routines may spend again, within the budget.", try f.core.command(a, "/money resume"));
+    try restart(&f);
+    try t.expect(!f.core.switches.money_paused.load(.acquire));
+    try expectHas(try f.core.command(a, "/money"), "Routines' spending: on. /money pause stops it.");
+}
+
+test "money_shows_the_caps_budgets_spending_and_switches" {
+    var f: Fix = undefined;
+    try f.init("[money]\nmax_per_call = 100\nmax_per_day = 150\nbudget_per_day = 30\nbudget_per_month = 200\napps = off\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money ++ "budget_per_day = 20\n");
+    const day = @divFloor(util.nowSeconds(t.io) + @as(i64, f.core.cfg.chat.utc_offset) * 60, 86400);
+    {
+        f.core.money_ledger.mutex.lockUncancelable(t.io);
+        defer f.core.money_ledger.mutex.unlock(t.io);
+        _ = try f.core.money_ledger.reserve(t.io, "frisco", day, 5, false);
+        _ = try f.core.money_ledger.reserve(t.io, "frisco", day, 12.5, true);
+    }
+    try t.expectEqualStrings(
+        \\Caps: 100 a call, 150 a day (yours and routines' together).
+        \\Budget for routines: 30 a day, 200 a month.
+        \\frisco: its own budget, 20 a day, 200 a month.
+        \\Today: frisco 5 by you, 12.50 by routines.
+        \\This month: frisco 5 by you, 12.50 by routines.
+        \\Switches: scheduled on, triggers on, workflows on, apps off.
+        \\Routines' spending: on. /money pause stops it.
+    , try f.core.command(a, "/money"));
+    // none set: plainly so
+    var g: Fix = undefined;
+    try g.init("", "", "");
+    defer g.deinit();
+    try t.expectEqualStrings(
+        \\Caps: none.
+        \\Budget for routines: none, so they spend nothing without asking you. /money budget N a day sets one.
+        \\Today: nothing spent.
+        \\Switches: scheduled on, triggers on, workflows on, apps off.
+        \\Routines' spending: on. /money pause stops it.
+    , try g.core.command(g.e.arena.allocator(), "/money"));
+}
+
+test "money_budget_writes_config_and_reloads" {
+    var f: Fix = undefined;
+    try f.init("[money]\nscheduled = off\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // the switch an older install wrote off is said, not changed
+    try t.expectEqualStrings("Routines may spend up to 30 a day without asking you. Not yet: [money] scheduled = off in config.ini keeps them from spending; set it on, then /reload.", try f.core.command(a, "/money budget 30 a day"));
+    try expectHas(fileText(&f, f.core.paths.config), "[money]\nscheduled = off\nbudget_per_day = 30\n");
+    try t.expectEqual(30, f.core.cfg.money.budget_per_day);
+    try t.expectEqualStrings("Routines may spend up to 200 a month without asking you. Not yet: [money] scheduled = off in config.ini keeps them from spending; set it on, then /reload.", try f.core.command(a, "/money budget 200 a month"));
+    try t.expectEqual(200, f.core.cfg.money.budget_per_month);
+    try t.expectEqualStrings("Use /money, /money budget N a day, /money budget N a month, /money pause or /money resume.", try f.core.command(a, "/money budget lots"));
+    // 0 takes one off; both off: nothing spends
+    _ = try f.core.command(a, "/money budget 0 a month");
+    try t.expectEqualStrings("No budget a day for routines now: they spend nothing without asking you.", try f.core.command(a, "/money budget 0 a day"));
+    // in a conversation others read: not shown, not changed
+    try addGroup(&f, "family", -100);
+    try t.expectEqualStrings("Money is shown and changed only in your own conversations: send /money in main.", try f.core.commandIn(a, "family", "/money budget 5 a day"));
+    try t.expectEqual(0, f.core.cfg.money.budget_per_day);
+}
+
+test "dry_run_spends_nothing_unattended_and_tells_nothing" {
+    var f: Fix = undefined;
+    try f.init("[money]\nbudget_per_day = 30\n", "", groceries_task);
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    _ = try f.core.command(a, "/dryrun on");
+    try f.e.script(1, model.toolReply("o1", "frisco__shop_order", "{\"items\":[\"milk\"],\"total\":12.5}"));
+    try f.e.script(2, model.textReply("Done."));
+    _ = try f.core.runTask(try taskNamed(f.core, "weekly-groceries"));
+    try expectHas(try f.e.request(2), "dry run: would call frisco/shop_order");
+    try t.expectEqual(0, f.rec.count("Spent "));
+    try t.expectEqualStrings("", shopOrders(&f));
+    try t.expectEqual(@as(f64, 0), friscoToday(&f).auto);
+}
+
 test "no_amount_tools_and_mail_send_are_never_unattended" {
     var f: Fix = undefined;
     // a budget set: still never
@@ -33136,6 +33265,167 @@ const Topics = struct {
 /// `/persona` (persona.zig): shows, switches and writes persona.md, the
 /// owner's file, then reads it again; `/persona write` takes the owner's
 /// reply to its question as the words, quoted back with [Save] [Cancel].
+/// Money from automation, within a budget: the line told of each spend
+/// and its [Pause automation spending] (`p`), `/money`, the pause kept
+/// in `state/money-paused` across restarts.
+const Money = struct {
+    const paused_text = "Routines' spending is paused: each payment they try waits for you. /money resume restarts it.";
+    const usage = "Use /money, /money budget N a day, /money budget N a month, /money pause or /money resume.";
+
+    fn pausedPath(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(a, &.{ c.paths.state, "money-paused" });
+    }
+
+    /// At open: paused while state/money-paused is there, or when that
+    /// can't be told (the safe side).
+    fn load(c: *Core) void {
+        var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const p = std.fmt.bufPrint(&buf, "{s}{s}money-paused", .{ c.paths.state, std.fs.path.sep_str }) catch return c.switches.money_paused.store(true, .release);
+        if (Io.Dir.cwd().statFile(c.io, p, .{})) |_| {
+            c.switches.money_paused.store(true, .release);
+        } else |e| switch (e) {
+            error.FileNotFound => {},
+            else => c.switches.money_paused.store(true, .release),
+        }
+    }
+
+    /// Pauses (`on`) or resumes routines' spending, kept in state; null
+    /// when kept, else what to say.
+    fn setPaused(c: *Core, a: std.mem.Allocator, on: bool) ?[]const u8 {
+        const p = pausedPath(c, a) catch return "Not changed: harness could not name state/money-paused.";
+        if (on) {
+            c.switches.money_paused.store(true, .release);
+            util.writeReplace(c.io, p, "paused\n") catch |e| return std.fmt.allocPrint(a, "Paused until harness stops: state/money-paused could not be written ({s}).", .{@errorName(e)}) catch "Paused until harness stops.";
+        } else {
+            Io.Dir.cwd().deleteFile(c.io, p) catch |e| switch (e) {
+                error.FileNotFound => {},
+                else => return std.fmt.allocPrint(a, "Still paused: state/money-paused could not be removed ({s}).", .{@errorName(e)}) catch "Still paused.",
+            };
+            c.switches.money_paused.store(false, .release);
+        }
+        c.log.write(.config, false, .{ .event = "money", .paused = on }) catch {};
+        return null;
+    }
+
+    /// agent.SpendDesk.told: the line in main, with a sound, never held for
+    /// quiet hours, with [Pause automation spending].
+    fn told(ctx: *anyopaque, s: money_mod.Spent) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const text = money_mod.toldLine(a, s) catch return;
+        c.log.write(.chat, false, .{ .event = "spent", .server = s.server, .tool = s.tool, .by = s.by, .amount = s.amount }) catch {};
+        _ = c.sendWithButtons(a, "main", "", text, &.{}, .{ "Pause automation spending", "p" }, false) catch |e| {
+            c.log.write(.chat, false, .{ .event = "spend not told", .why = whyUndelivered(e) }) catch {};
+        };
+    }
+
+    /// [Pause automation spending]: paused, the button gone, said where
+    /// it was pressed.
+    fn press(c: *Core, chat: i64, thread: i64, message_id: i64) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        var buf: [conversations.max_name]u8 = undefined;
+        const conv = c.convAt(&buf, chat, thread);
+        if (c.chan) |ch| ch.clear(ch.ctx, .{ .name = conv, .chat = chat, .thread = thread }, message_id);
+        c.sayIn(conv, setPaused(c, arena.allocator(), true) orelse paused_text);
+    }
+
+    /// `/money`, `/money budget N a day|a month`, `/money pause|resume`:
+    /// the owner's, in their own conversations.
+    fn command(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
+        if (c.isShared(conv)) return "Money is shown and changed only in your own conversations: send /money in main.";
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        const first = words.next() orelse return status(c, a);
+        const more = std.mem.trim(u8, words.rest(), " \t");
+        if (std.mem.eql(u8, first, "pause") and more.len == 0) return setPaused(c, a, true) orelse paused_text;
+        if (std.mem.eql(u8, first, "resume") and more.len == 0) return setPaused(c, a, false) orelse "Routines may spend again, within the budget.";
+        if (std.mem.eql(u8, first, "budget")) return budgetCommand(c, a, more);
+        return usage;
+    }
+
+    fn budgetCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
+        const b = money_mod.parseBudget(rest) orelse return usage;
+        const key = if (b.period == .day) "budget_per_day" else "budget_per_month";
+        const per = if (b.period == .day) "a day" else "a month";
+        const text = try mail_mod.setKey(a, c.readOr(a, c.paths.config), "money", key, try std.fmt.allocPrint(a, "{d}", .{b.n}));
+        c.writeSetting(c.paths.config, text) catch |e| return std.fmt.allocPrint(a, "Not changed: config.ini could not be written ({s}).", .{@errorName(e)});
+        c.log.write(.config, false, .{ .event = "money budget", .key = key, .value = b.n }) catch {};
+        if (c.applySetup()) |why| return std.fmt.allocPrint(a, "config.ini is written. {s}", .{why});
+        if (b.n == 0) {
+            const left = c.cfg.money.budget_per_day > 0 or c.cfg.money.budget_per_month > 0;
+            return std.fmt.allocPrint(a, "No budget {s} for routines now{s}", .{ per, if (left) "." else ": they spend nothing without asking you." });
+        }
+        const blocked: []const u8 = if (!c.cfg.money.scheduled) " Not yet: [money] scheduled = off in config.ini keeps them from spending; set it on, then /reload." else "";
+        return std.fmt.allocPrint(a, "Routines may spend up to {d} {s} without asking you.{s}", .{ b.n, per, blocked });
+    }
+
+    /// "30 a day, 200 a month" ("" when neither is set).
+    fn perText(a: std.mem.Allocator, day: u32, day_word: []const u8, month: u32, month_word: []const u8) ![]const u8 {
+        var o: std.ArrayList(u8) = .empty;
+        if (day > 0) try o.print(a, "{d} {s}", .{ day, day_word });
+        if (month > 0) try o.print(a, "{s}{d} {s}", .{ if (o.items.len > 0) ", " else "", month, month_word });
+        return o.items;
+    }
+
+    /// `/money`: the caps, the budgets ([money]'s, a server's own), what
+    /// each money server moved today and this month by the owner and by
+    /// routines, the switches, and whether routines' spending is paused.
+    fn status(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        const mc = c.cfg.money;
+        var o: std.ArrayList(u8) = .empty;
+        const caps = try perText(a, mc.max_per_call, "a call", mc.max_per_day, "a day (yours and routines' together)");
+        try o.print(a, "Caps: {s}.\n", .{if (caps.len > 0) caps else "none"});
+        const budget = try perText(a, mc.budget_per_day, "a day", mc.budget_per_month, "a month");
+        if (budget.len > 0) try o.print(a, "Budget for routines: {s}.\n", .{budget}) else try o.appendSlice(a, "Budget for routines: none, so they spend nothing without asking you. /money budget N a day sets one.\n");
+        // the money servers running, once each
+        var servers: std.ArrayList(agent.McpTool) = .empty;
+        for (c.mcp_tools) |m| {
+            if (!m.money) continue;
+            for (servers.items) |x| {
+                if (std.mem.eql(u8, x.server.name, m.server.name)) break;
+            } else try servers.append(a, m);
+        }
+        for (servers.items) |m| {
+            var parts: std.ArrayList(u8) = .empty;
+            if (m.budget_per_day != null or m.budget_per_month != null) {
+                const b = money_mod.budgetFor(mc, m.budget_per_day, m.budget_per_month);
+                if (b.none) try parts.appendSlice(a, "its own budget, none (routines spend nothing there)") else try parts.print(a, "its own budget, {s}", .{try perText(a, b.day, "a day", b.month, "a month")});
+            }
+            if (m.max_per_call != null or m.max_per_day != null) {
+                const own = try perText(a, m.max_per_call orelse mc.max_per_call, "a call", m.max_per_day orelse mc.max_per_day, "a day");
+                try parts.print(a, "{s}its own caps, {s}", .{ if (parts.items.len > 0) "; " else "", if (own.len > 0) own else "none" });
+            }
+            if (parts.items.len > 0) try o.print(a, "{s}: {s}.\n", .{ m.server.name, parts.items });
+        }
+        // what was spent, by the owner and by routines
+        const day = @divFloor(util.nowSeconds(c.io) + @as(i64, c.cfg.chat.utc_offset) * 60, 86400);
+        var today: std.ArrayList(u8) = .empty;
+        var month: std.ArrayList(u8) = .empty;
+        {
+            const l = &c.money_ledger;
+            l.mutex.lockUncancelable(c.io);
+            defer l.mutex.unlock(c.io);
+            const mo = money_mod.monthOf(day);
+            for (servers.items) |m| {
+                const n = m.server.name;
+                const all = l.spent(n, day);
+                const auto = l.spentAuto(n, day);
+                if (all > 0) try today.print(a, "{s}{s} {s} by you, {s} by routines", .{ if (today.items.len > 0) "; " else "", n, try money_mod.amountText(a, @max(0, all - auto)), try money_mod.amountText(a, auto) });
+                const m_all = l.spentMonth(n, mo);
+                const m_auto = l.spentAutoMonth(n, mo);
+                if (m_all > 0) try month.print(a, "{s}{s} {s} by you, {s} by routines", .{ if (month.items.len > 0) "; " else "", n, try money_mod.amountText(a, @max(0, m_all - m_auto)), try money_mod.amountText(a, m_auto) });
+            }
+        }
+        if (today.items.len > 0) try o.print(a, "Today: {s}.\n", .{today.items}) else try o.appendSlice(a, "Today: nothing spent.\n");
+        if (month.items.len > 0) try o.print(a, "This month: {s}.\n", .{month.items});
+        try o.print(a, "Switches: scheduled {s}, triggers {s}, workflows {s}, apps {s}.\n", .{ onOff(mc.scheduled), onOff(mc.triggers), onOff(mc.workflows), onOff(mc.apps) });
+        try o.appendSlice(a, if (c.switches.money_paused.load(.acquire)) "Routines' spending: paused. /money resume restarts it." else "Routines' spending: on. /money pause stops it.");
+        return o.items;
+    }
+};
+
 const Persona = struct {
     const usage = "Use /persona butler, assistant or friend; /persona name, address or language WORDS (none clears); /persona write; /persona reset.";
     const not_a_name = "That isn't a name I can use: up to 40 letters, spaces, . ' and -.";

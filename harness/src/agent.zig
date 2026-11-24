@@ -519,6 +519,9 @@ pub const Run = struct {
     money: config.Config.Money = .{},
     /// What money tools moved today; shared by all runs.
     money_ledger: ?*MoneyLedger = null,
+    /// Where each automated spend is told (main, with a pause button);
+    /// null: nowhere.
+    spend: ?SpendDesk = null,
     /// /dryrun on from the start of this run: money tools are not called,
     /// whatever the switch says later (see `dryRun`).
     dry_run: bool = false,
@@ -1582,7 +1585,7 @@ pub const MoneyLedger = struct {
     /// error.NoRoom when an entry is not free; when the save fails,
     /// nothing is counted and its error is returned: a reservation that
     /// would be forgotten at the next start is not made.
-    fn reserve(l: *MoneyLedger, io: Io, server: []const u8, day_in: i64, amount: f64, auto: bool) !Reservation {
+    pub fn reserve(l: *MoneyLedger, io: Io, server: []const u8, day_in: i64, amount: f64, auto: bool) !Reservation {
         const day = l.dayFor(server, day_in);
         const month = l.monthFor(server, day);
         const before = l.tables;
@@ -2380,6 +2383,8 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
         w.addBy(if (cf) |x| x.rel else arg, try writerOf(r, a), r.label);
     };
 
+    // dry run as it is now, for the call and what is told of it
+    const dry = tool == .money and r.dryRun();
     const out: tools.Output = switch (tool) {
         .recall => blk: {
             r.lock.lockUncancelable(r.io);
@@ -2424,7 +2429,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
             if (got.notice) |text| if (r.notice) |n| n.say(n.ctx, text);
             break :blk .{ .text = got.text, .is_error = got.is_error };
         },
-        .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
+        .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved, dry),
         .skill => blk: {
             const v = jv.parse(a, input_json).?;
             const text = if (jv.str(jv.get(v, "file"))) |file|
@@ -2457,6 +2462,13 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
         },
         .shell => if (where.env) |e| try runElsewhere(r, a, env, e, arg, dir) else try tools.run(env, a, tool, input_json),
         else => try tools.run(env, a, tool, input_json),
+    };
+    // made unasked within the budget: the owner is told (it stays counted
+    // whatever came back)
+    if (pass.spent) |sp| if (!dry) if (r.spend) |sd| {
+        var told = sp;
+        told.failed = out.is_error;
+        sd.told(sd.ctx, told);
     };
     // what it read from outside marks the conversation
     try markCall(r, a, tool, mt, arg, out);
@@ -3666,6 +3678,13 @@ pub const Skip = struct {
     amount: []const u8 = "",
 };
 
+/// Tells the owner of a money call an unattended run made unasked, within
+/// the budget.
+pub const SpendDesk = struct {
+    ctx: *anyopaque,
+    told: *const fn (ctx: *anyopaque, s: money_mod.Spent) void,
+};
+
 /// Keeps a skipped call as an inbox item; returns its id (0: none).
 pub const Keeper = struct {
     ctx: *anyopaque,
@@ -4071,6 +4090,8 @@ const MoneyPass = struct {
     note: []const u8 = "",
     /// A refusal the owner may still make with a tap ([Make this payment]).
     payable: bool = false,
+    /// Within the budget: what the owner is told once it is made.
+    spent: ?money_mod.Spent = null,
 };
 
 /// An unattended run's call (`r.scheduled`) goes by `unattendedMoney`:
@@ -4180,6 +4201,7 @@ fn unattendedMoney(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json:
     pass.budget = true;
     pass.payable = false;
     pass.note = budgetNote(a, b, auto_day + amount, auto_month + amount) catch "";
+    pass.spent = .{ .server = m.server.name, .tool = m.tool, .by = by, .amount = amount, .day_spent = auto_day + amount, .month_spent = auto_month + amount, .budget = b };
     return null;
 }
 
@@ -4203,8 +4225,8 @@ fn releaseMoney(r: *Run, m: *const McpTool, res: Reservation) void {
         r.logRun(.gate, false, .{ .tool = m.def.name, .event = "money record not saved", .why = @errorName(e) }) catch {};
 }
 
-fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, reserved: Reservation) !tools.Output {
-    if (m.money and r.dryRun()) {
+fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, reserved: Reservation, dry: bool) !tools.Output {
+    if (m.money and dry) {
         releaseMoney(r, m, reserved);
         return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
     }
