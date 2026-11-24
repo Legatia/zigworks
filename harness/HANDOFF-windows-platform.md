@@ -153,6 +153,11 @@ and cross builds green, and the owner decides every push.
   advapi32 and userenv on Windows (build.zig). Nothing in the gate, the
   agent's call path or the conversations' state changed; `shellDef` has
   one more sentence on Windows.
+- For the Mac session: `calendar_attendees_become_people` fails on every
+  system while the clock is inside a busy event of its fixture (the
+  owner is busy, so the line is held): CI run 45388410033 ran during
+  "Lunch with Anna", 24 Nov 12:00 to 13:00 UTC. Its events are in the
+  past from then on, but the fixture's dates should not be real ones.
 
 ### Status from the Windows session (2026-11-23, branch `win/apps`)
 

@@ -12431,7 +12431,7 @@ pub const Core = struct {
             var r = req;
             r.command = "dir /b >nul";
             const works = if (sandbox.run(tenv, a, r)) |o| !o.is_error else |_| false;
-            try out.appendSlice(a, if (works) "cmd's own dir, del, ren, copy, move: yes\n" else "cmd's own dir, del, ren, copy, move: no (they need Windows' Secondary Logon service, which gives the sandbox drive letters of its own; programs and the agent's file tools work without it)\n");
+            if (works) try out.appendSlice(a, "cmd's own dir, del, ren, copy, move: yes\n") else try out.print(a, "cmd's own dir, del, ren, copy, move: no (they need Windows' Secondary Logon service, which gives the sandbox drive letters of its own; Windows said error {d}. Programs and the agent's file tools work without it)\n", .{@import("proc.zig").last_session_error.load(.acquire)});
         }
         if (odd == 0) try out.appendSlice(a, "As environments.ini says.") else try out.print(a, "{d} not as environments.ini says (outside: is this machine online?).", .{odd});
         return out.items;
@@ -22692,8 +22692,10 @@ test "env_check_probes_a_sandbox_and_a_copy_environment" {
     }
     // Windows: with drive letters of its own, cmd's own commands work
     if (builtin.os.tag == .windows) {
-        try t.expect(std.mem.indexOf(u8, box, "cmd's own dir, del, ren, copy, move: yes\n") != null);
-        try t.expect(std.mem.indexOf(u8, cbox, "cmd's own dir, del, ren, copy, move: yes\n") != null);
+        for ([_][]const u8{ box, cbox }) |said| {
+            if (std.mem.indexOf(u8, said, "cmd's own dir, del, ren, copy, move: yes\n") == null) std.debug.print("/env check said:\n{s}\n", .{said});
+            try t.expect(std.mem.indexOf(u8, said, "cmd's own dir, del, ren, copy, move: yes\n") != null);
+        }
     }
     // nothing of the probes is left in the workspace
     var ws = try Io.Dir.cwd().openDir(t.io, f.core.workspace, .{ .iterate = true });

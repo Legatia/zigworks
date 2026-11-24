@@ -300,7 +300,9 @@ pub const SessionSpawn = struct {
 /// Windows: starts the launcher suspended (for Job.adopt) in a logon
 /// session of its own, with stdout and stderr pipes and stdin NUL, which
 /// it hands on to the sandbox's command. error.NoSession: the Secondary
-/// Logon service doesn't start one here (switched off, or not allowed).
+/// Logon service doesn't start one here (switched off, not there, or not
+/// allowed). error.SessionNotNow: it didn't this time (Windows' error is
+/// in `last_session_error`); another try may.
 pub fn spawnInSession(io: Io, arena: std.mem.Allocator, o: SessionSpawn) !std.process.Child {
     if (!is_windows) return error.Unsupported;
     var vars = try o.env.clone(arena);
@@ -342,9 +344,14 @@ pub fn spawnInSession(io: Io, arena: std.mem.Allocator, o: SessionSpawn) !std.pr
     const flags = win.CREATE_SUSPENDED | win.CREATE_NO_WINDOW | win.CREATE_UNICODE_ENVIRONMENT;
     // a name and password that are never checked here (LOGON_NETCREDENTIALS_ONLY)
     if (!win.CreateProcessWithLogonW(W("harness-sandbox"), W("."), W("-"), win.LOGON_NETCREDENTIALS_ONLY, exe, cmd, flags, block.ptr, cwd, &si, &pi).toBool()) {
-        return switch (win.GetLastError()) {
+        const code = win.GetLastError();
+        last_session_error.store(code, .release);
+        return switch (code) {
             2, 3, 267 => error.FileNotFound,
-            else => error.NoSession,
+            // the service is disabled, not installed, can't start, or
+            // this account may not use it
+            1058, 1060, 1068, 1069, 1385 => error.NoSession,
+            else => error.SessionNotNow,
         };
     }
     return .{
@@ -356,6 +363,10 @@ pub fn spawnInSession(io: Io, arena: std.mem.Allocator, o: SessionSpawn) !std.pr
         .request_resource_usage_statistics = false,
     };
 }
+
+/// Windows' error the last time a session of its own could not be
+/// started; 0: never.
+pub var last_session_error: std.atomic.Value(u32) = .init(0);
 
 /// The launcher, in its new logon session: names the drives, starts the
 /// AppContainer's command with this process's own stdin, stdout and

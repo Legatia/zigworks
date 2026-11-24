@@ -758,7 +758,7 @@ fn spawnAppContainer(io: Io, arena: std.mem.Allocator, req: Request, home: []con
         for ([_][]const u8{ "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "HOME" }) |k|
             try on.put(k, try onDrive(arena, letters[1], home, vars.get(k).?));
         const start = if (!sees) try onDrive(arena, letters[0], home, home) else try onDrive(arena, letters[0], req.workspace, if (req.cwd.len > 0) req.cwd else req.workspace);
-        if (proc.spawnInSession(io, arena, .{
+        const spawn: proc.SessionSpawn = .{
             .launcher = try launcher(io, arena),
             .app = cmd_exe,
             .command_line = try proc.cmdLine(arena, try std.fmt.allocPrint(arena, "cd /d \"{s}\"||exit 1&{s}", .{ start, req.command })),
@@ -767,11 +767,25 @@ fn spawnAppContainer(io: Io, arena: std.mem.Allocator, req: Request, home: []con
             .profile = req.profile,
             .network = req.env.network,
             .drives = &.{ .{ .letter = letters[0], .folder = if (sees) req.workspace else home }, .{ .letter = letters[1], .folder = home } },
-        })) |child| return child else |e| switch (e) {
-            // no session of its own here: as before, by its real paths
-            // (cmd's own dir, del, ren, copy, move and cd /d then fail)
-            error.NoSession => no_session.store(true, .release),
-            else => return e,
+        };
+        var tries: u32 = 0;
+        while (true) : (tries += 1) {
+            if (proc.spawnInSession(io, arena, spawn)) |child| return child else |e| switch (e) {
+                // no session of its own on this machine: from now on as
+                // before, by its real paths (cmd's own dir, del, ren,
+                // copy, move and cd /d then fail)
+                error.NoSession => {
+                    no_session.store(true, .release);
+                    break;
+                },
+                // not this time (the service was busy): tried again, then
+                // this one command runs by its real paths
+                error.SessionNotNow => {
+                    if (tries >= 4) break;
+                    io.sleep(.fromMilliseconds(100 * (@as(i64, tries) + 1)), .awake) catch {};
+                },
+                else => return e,
+            }
         }
     };
     return proc.spawnRaw(io, arena, .{
