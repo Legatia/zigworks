@@ -1655,9 +1655,9 @@ pub const Core = struct {
         if (m.voice != null or !std.mem.startsWith(u8, std.mem.trim(u8, text, " \t\r\n"), "/")) Bedtime.message(c, conv);
         // someone else's words the owner forwarded: never a command, a
         // phrase, a list's words or an answer; a turn marked `forwarded`
-        if (m.forwarded) {
+        if (m.forwarded and m.voice == null) {
             var abuf: [agents_name_max]u8 = undefined;
-            return c.queueItem(conv, c.convAgent(&abuf, conv), if (m.voice != null) "" else text, null, m.voice, true);
+            return c.queueItem(conv, c.convAgent(&abuf, conv), text, null, null, true);
         }
         // a voice note: transcribed, then taken as typed text (never a command)
         if (m.voice) |note| return c.voiceIn(conv, m, note);
@@ -2897,9 +2897,10 @@ pub const Core = struct {
             c.log.write(.chat, c.convPrivate(conv), .{ .event = "voice note refused", .seconds = note.seconds, .bytes = note.size, .why = why }) catch {};
             return c.sayIn(conv, why);
         }
-        if (m.reply_to != 0 and c.itemOfMessage(m.chat, m.reply_to) != null) return c.startVoiceAnswer(conv, m.chat, m.reply_to, note);
+        // a forwarded one is someone else's voice: never an answer
+        if (!m.forwarded and m.reply_to != 0 and c.itemOfMessage(m.chat, m.reply_to) != null) return c.startVoiceAnswer(conv, m.chat, m.reply_to, note);
         var abuf: [agents_name_max]u8 = undefined;
-        return c.queueItem(conv, c.convAgent(&abuf, conv), "", null, note, false);
+        return c.queueItem(conv, c.convAgent(&abuf, conv), "", null, note, m.forwarded);
     }
 
     /// Why voice note `note` is not taken; null: it is.
@@ -31340,4 +31341,16 @@ test "a_workflows_approve_after_a_feed_carries_the_line" {
     _ = try f.core.pollNow("news");
     runWorkflows(&f);
     try f.rec.waitFor(try std.fmt.allocPrint(f.e.arena.allocator(), "Post pay-acme?\nThis run read outside text first: {s}.", .{try standInFeed(&f)}));
+}
+
+test "a_forwarded_voice_note_gets_the_voice_checks" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    // no transcription service: refused as any voice note is
+    var in = voiceNote(4);
+    in.forwarded = true;
+    try f.core.handleIncoming(in);
+    try f.rec.waitFor("Voice notes need a transcription service");
+    try t.expectEqual(0, f.core.queue.items.len);
 }
