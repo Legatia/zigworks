@@ -13,9 +13,9 @@ pub const ask_before_s: i64 = 30 * 60;
 /// A leave-by before this minute of the day (the owner's time) is a
 /// morning's.
 pub const morning_until: i64 = 12 * 60;
-/// The workflow harness starts, and its built-in schedule.
+/// The workflow harness starts, and who starts it: harness's own job.
 pub const workflow = "warm-car";
-pub const by = "schedule:warm-car";
+pub const by = "harness:warm-car";
 
 /// A leave-by whose question is due: its key in state/diary, when to
 /// leave, the event.

@@ -1,11 +1,11 @@
 # Trips: the evening before a trip, one message: where, when to leave,
 # the weather there (when search is set) and what to pack. harness starts
-# it (schedule:trips) at 19:00 the day before, or 15 minutes before quiet
+# it (harness:trips) at 19:00 the day before, or 15 minutes before quiet
 # hours when they start earlier; the rest of trips (state/trips/, /trips,
 # the check-in line, the leave-by for the airport) is harness's own.
 workflow trips
 about The evening before a trip: when to leave, <trips weather words>what to pack.
-start schedule:trips
+start harness:trips
 tag no
 limits steps 5, days 1
 #if search

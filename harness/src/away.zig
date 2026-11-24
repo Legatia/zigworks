@@ -10,8 +10,9 @@ const Allocator = std.mem.Allocator;
 
 /// Who away mode's own work is, to the gate, the log and rules (its
 /// workflow's start line and the routine's rules section name it too, in
-/// examples/butler: away.wf, rules). One place, to be renamed together.
-pub const who = "schedule:away";
+/// examples/butler: away.wf, rules): harness's own job, never a task's or
+/// a schedule's of the same name.
+pub const who = "harness:away";
 /// The rules section the Away routine writes for it.
 pub const rules_section = "[" ++ who ++ "]";
 

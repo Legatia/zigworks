@@ -33,10 +33,10 @@ allow mcp home/home_set *
 allow mcp home/home_set {"action":"temperature","device":"<thermostat>","value":"<home temp>"}
 [all]
 
-# away: what harness does by itself while you're away (as schedule:away):
+# away: what harness does by itself while you're away (as harness:away):
 # the lights go on and off in the evening (/away lights changes which),
 # and the heating goes back up before you come home; these calls alone
-[schedule:away]
+[harness:away]
 <away calls>
 [all]
 

@@ -749,7 +749,7 @@ pub fn awayLight(d: Device) bool {
     return d.kind == .light and !d.isGuarded() and d.allows("on") and d.allows("off");
 }
 
-/// The rules lines of what away mode does by itself (`schedule:away`):
+/// The rules lines of what away mode does by itself (`harness:away`):
 /// each light on and off, and the heating back to `home_temp` (keys in
 /// order, as the gate reads a call).
 pub fn awayCalls(a: Allocator, lights: []const []const u8, thermostat: ?[]const u8, home_temp: u32) ![]const u8 {
@@ -1803,7 +1803,7 @@ test "warm_car_is_offered_when_the_car_can_warm_and_the_diary_is_on" {
     var d: workflows.Diag = .{};
     const w = try workflows.parse(a, "warm-car", f.workflow, &d);
     _ = try workflows.check(a, w, .{}, &d);
-    try t.expectEqualStrings("schedule:warm-car", w.start[0]);
+    try t.expectEqualStrings("harness:warm-car", w.start[0]);
     // with \r\n line ends (a Windows checkout) it fills the same
     var missing: []const u8 = "";
     const crlf = try std.mem.replaceOwned(u8, a, workflowTemplate(.@"warm-car"), "\n", "\r\n");
@@ -1974,12 +1974,12 @@ test "the_away_routine_fills" {
     try expectIn(f.triggers, "[away-hall_motion]\nmcp = home resource home://device/hall_motion\nmatch = to is someone there\nwhile = away\nurgent = yes\nsay = Movement in the hall while you're away.\ntag = no\n");
     // started by harness as away mode comes on (or by you): one tap for the
     // heating, only when it is set above the away temperature
-    try expectIn(f.workflow, "\nstart owner, schedule:away\n");
+    try expectIn(f.workflow, "\nstart owner, harness:away\n");
     try expectIn(f.workflow, "tool home/home_wait {\"device\": \"hall_thermostat\", \"property\": \"setpoint\", \"condition\": \">\", \"value\": \"17\", \"timeout_s\": 0}");
     try expectIn(f.workflow, "approve {input} Heating to 17 °C while you're away?\nyes Heating to 17 °C\nno Leave it\ntimeout 12h");
     try expectIn(f.workflow, "tool home/home_set {\"device\": \"hall_thermostat\", \"action\": \"temperature\", \"value\": \"17\"}");
     // what harness may do by itself while you're away: these calls alone
-    try expectIn(f.rules, "[schedule:away]\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"bedroom_lamp\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"bedroom_lamp\"}\nallow mcp home/home_set {\"action\":\"temperature\",\"device\":\"hall_thermostat\",\"value\":\"21\"}\n[all]");
+    try expectIn(f.rules, "[harness:away]\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"bedroom_lamp\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"bedroom_lamp\"}\nallow mcp home/home_set {\"action\":\"temperature\",\"device\":\"hall_thermostat\",\"value\":\"21\"}\n[all]");
     // nothing guarded, ever
     for ([_][]const u8{ f.workflow, f.triggers, f.rules }) |text| try t.expect(std.mem.indexOf(u8, text, "home_guarded") == null);
     try t.expectEqualStrings("Away: when everyone has been out 12 hours (or you're on a trip, or say /away), any door, window or movement comes to you at once, the living room light and the bedroom lamp go on and off in the evening, one tap sets the heating to 17 °C and at 20:00 one line says how it was.", try Routine.away.sentence(a, p));
@@ -2051,7 +2051,7 @@ test "the_trips_routine_fills" {
     const f = try routineFiles(a, .trips, p, "2026-11-23");
     // harness starts it the evening before; no trigger of its own
     try t.expectEqualStrings("", f.triggers);
-    try expectIn(f.workflow, "\nstart schedule:trips\n");
+    try expectIn(f.workflow, "\nstart harness:trips\n");
     try expectIn(f.workflow, "tools search\n");
     try expectIn(f.workflow, "say {input} {weather.line} Pack: {event.pack}{weather.more}.");
     try expectIn(f.workflow, "\nstep plain\nsay {input} Pack: {event.pack}.");

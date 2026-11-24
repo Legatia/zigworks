@@ -11,8 +11,8 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 /// Who trips' own work is, to the gate, the log and rules (trips.wf's
-/// start line names it too). One place, to be renamed together.
-pub const who = "schedule:trips";
+/// start line names it too): harness's own job.
+pub const who = "harness:trips";
 
 pub const Kind = enum { flight, train, hotel };
 

@@ -7058,10 +7058,11 @@ pub const Core = struct {
         c.postPeople(a, std.mem.join(a, "\n", lines.items) catch return);
     }
 
-    /// A people post to main, as a schedule's (`schedule:people`): held in
-    /// quiet hours; one that does not get through is kept to send again.
+    /// A people post to main, as harness's own job's (`harness:people`):
+    /// held in quiet hours; one that does not get through is kept to send
+    /// again.
     fn postPeople(c: *Core, a: std.mem.Allocator, text: []const u8) void {
-        const by = "schedule:people";
+        const by = people_mod.by;
         const private = c.convPrivate("main");
         if (c.quietEnd(by)) |_| held: {
             const masked = c.masks.scrubAlloc(a, text) catch break :held;
@@ -7081,13 +7082,13 @@ pub const Core = struct {
     }
 
     /// A gift idea for week line `l`: a search for its one interest (as a
-    /// call of `schedule:people`, the gate deciding it), then one model
+    /// call of `harness:people`, the gate deciding it), then one model
     /// call over the preferences and what was found, never told the name,
     /// the relation or the date. Null: no interest, the search refused or
     /// failed, or no idea.
     fn giftIdea(c: *Core, a: std.mem.Allocator, l: people_mod.Line) ?[]const u8 {
         const interest = l.interest orelse return null;
-        const by = "schedule:people";
+        const by = people_mod.by;
         const private = c.convPrivate("main");
         const query = people_mod.giftQuery(a, interest) catch return null;
         const d = blk: {
@@ -9662,7 +9663,7 @@ pub const Core = struct {
     // before a morning leave-by of the diary the car is read on a thread
     // of its own (car_status, woken once: carcloud's wakes_per_day bounds
     // it); below [butler] warm_below outside, the routine's instance
-    // starts as harness's own schedule:warm-car: its one question, and only
+    // starts as harness's own job (harness:warm-car): its one question, and only
     // the owner's tap makes the call. Each leave-by once (state/diary).
 
     /// The car server lists car_climate: a car that warms (a Tesla).
@@ -10043,7 +10044,7 @@ pub const Core = struct {
 
     /// The lights away mode switches: home.ini's lights that aren't
     /// guarded and go on and off, of them those rules lets
-    /// `schedule:away` switch on. Nothing else, whatever rules says.
+    /// `harness:away` switch on. Nothing else, whatever rules says.
     fn awayLightNames(c: *Core, a: std.mem.Allocator) ![]const []const u8 {
         const h = c.homeNow(a) orelse return &.{};
         var out: std.ArrayList([]const u8) = .empty;
@@ -10062,7 +10063,7 @@ pub const Core = struct {
     }
 
     /// One call of homemcp's (`tool`, `input` canonical JSON) by away mode
-    /// itself, as `schedule:away`: the gate decides it (a rule must allow
+    /// itself, as `harness:away`: the gate decides it (a rule must allow
     /// it: nobody is asked), and both are logged. Null: not made.
     fn awayCall(c: *Core, a: std.mem.Allocator, tool: []const u8, input: []const u8) ?mcp.Result {
         const mt = for (c.mcp_tools) |*m| {
@@ -10463,7 +10464,7 @@ pub const Core = struct {
     }
 
     /// The evening before trip `tr`: trips.wf says it (with the weather
-    /// when search is set), as `schedule:trips`.
+    /// when search is set), as `harness:trips`.
     fn tripsEveningStart(c: *Core, a: std.mem.Allocator, tr: trips_mod.Trip, now_s: i64) !void {
         const off = c.cfg.chat.utc_offset;
         const line = try trips_mod.eveningText(a, tr, off, c.cfg.butler.airport, c.cfg.butler.travel);
@@ -23890,7 +23891,7 @@ test "a_birthday_week_line_has_a_gift_idea_from_a_search" {
     for ([_][]const u8{ "likes Polish poetry", "allergic to nuts", "Map: Collected and Last Poems", "Nothing is bought" }) |want| try expectHas(req, want);
     for ([_][]const u8{ "Ola", "Kowalska", "sister", "1989", "+48" }) |never| try t.expect(std.mem.indexOf(u8, req, never) == null);
     const lt = try logText(&f);
-    try expectHas(lt, "\"by\":\"schedule:people\",\"tool\":\"search\",\"decision\":\"allow\"");
+    try expectHas(lt, "\"by\":\"harness:people\",\"tool\":\"search\",\"decision\":\"allow\"");
     try expectHas(lt, "\"arg\":\"gift ideas for someone who likes Polish poetry\"");
     // once a day: nothing more today, and no model call
     f.core.peopleNow();
@@ -24700,12 +24701,12 @@ const Errands = struct {
     track_url: []const u8,
 
     /// What starts the errands' own jobs (their who `by`, which rules
-    /// sections and quiet hours read), one constant each, all here. No
-    /// rules are shipped for them.
-    const by_lists = "schedule:lists";
-    const by_reorder = "schedule:reorder";
-    const by_deliveries = "schedule:deliveries";
-    const by_upkeep = "schedule:upkeep";
+    /// sections and quiet hours read), one constant each, all here:
+    /// harness's own jobs. No rules are shipped for them.
+    const by_lists = "harness:lists";
+    const by_reorder = "harness:reorder";
+    const by_deliveries = "harness:deliveries";
+    const by_upkeep = "harness:upkeep";
 
     fn init(gpa: std.mem.Allocator, io: Io, state: []const u8, a: std.mem.Allocator) !Errands {
         return .{
@@ -24757,7 +24758,7 @@ const Errands = struct {
 
     // ---- what harness says ----
 
-    /// A line of `by` (`schedule:lists`, …) to main, as a schedule's: held
+    /// A line of `by` (`harness:lists`, …) to main, as a schedule's: held
     /// in quiet hours and busy events; one that does not get through is
     /// kept to send again.
     fn post(c: *Core, a: std.mem.Allocator, by: []const u8, label: []const u8, text: []const u8) void {
@@ -26465,7 +26466,7 @@ test "a_parcel_from_a_message_is_tracked_and_said" {
     try t.expectEqual(0, f.e.server.modelRequests());
     const lt = try logText(&f);
     try expectHas(lt, "\"event\":\"delivery\",\"op\":\"line\",\"carrier\":\"dpd\",\"status\":\"out\"");
-    try expectHas(lt, "\"run\":\"deliveries\",\"by\":\"schedule:deliveries\",\"tool\":\"fetch\"");
+    try expectHas(lt, "\"run\":\"deliveries\",\"by\":\"harness:deliveries\",\"tool\":\"fetch\"");
     try t.expectEqualStrings("Stopped tracking 1000123456789U.", try f.core.command(a, "/deliveries rm 1000123456789U"));
     try expectHas(try f.core.command(a, "/deliveries"), "No parcels tracked.");
 }
@@ -26538,7 +26539,7 @@ test "a_deny_rule_stops_a_carriers_page" {
     Errands.work(f.core);
     try t.expectEqual(0, std.mem.count(u8, fileText(&f, try std.fs.path.join(f.e.arena.allocator(), &.{ f.e.dir, "page-requests.jsonl" })), "track-dpd"));
     try t.expectEqual(0, f.rec.count("is out for delivery."));
-    try expectHas(try logText(&f), "\"run\":\"deliveries\",\"by\":\"schedule:deliveries\",\"tool\":\"fetch\",\"decision\":\"deny\"");
+    try expectHas(try logText(&f), "\"run\":\"deliveries\",\"by\":\"harness:deliveries\",\"tool\":\"fetch\",\"decision\":\"deny\"");
 }
 
 // ---- errands: upkeep ----
@@ -27623,7 +27624,7 @@ test {
 /// (`state/evening`), on a thread of its own: tomorrow's first event from
 /// the diary, the weather (search, then one memory-model call), the car
 /// (`car_status`), bills due tomorrow (the owner's mailbox, when on), what
-/// waits in the inbox. Each read is the gate's, as `schedule:evening`,
+/// waits in the inbox. Each read is the gate's, as `harness:evening`,
 /// and logged; nothing is asked or changed. To main: without a sound in
 /// quiet hours, held while a busy event lasts.
 const Evening = struct {
@@ -27715,7 +27716,7 @@ const Evening = struct {
         return n;
     }
 
-    /// `server`'s read `tool` with `input`, as `schedule:evening`: the
+    /// `server`'s read `tool` with `input`, as `harness:evening`: the
     /// gate decides it (a question would be no; a money tool is never
     /// called), the log keeps it; its text masked, or null.
     fn read(c: *Core, a: std.mem.Allocator, server: []const u8, tool: []const u8, input: []const u8) ?[]const u8 {
@@ -27745,7 +27746,7 @@ const Evening = struct {
         return c.masks.scrubAlloc(a, res.text) catch null;
     }
 
-    /// Tomorrow's weather in `town`: a search as `schedule:evening` (the
+    /// Tomorrow's weather in `town`: a search as `harness:evening` (the
     /// gate's), then one memory-model call over the results, as data.
     fn weather(c: *Core, a: std.mem.Allocator, town: []const u8) ?[]const u8 {
         const private = c.convPrivate("main");
@@ -27963,7 +27964,7 @@ test "the_evening_reads_through_the_gate_and_asks_nothing" {
     try t.expectEqual(0, f.rec.count("Car "));
     try t.expectEqual(0, f.rec.count("Allow this?"));
     const log = try logText(&f);
-    try expectHas(log, "\"run\":\"evening\",\"by\":\"schedule:evening\",\"tool\":\"car__car_status\",\"decision\":\"deny\"");
+    try expectHas(log, "\"run\":\"evening\",\"by\":\"harness:evening\",\"tool\":\"car__car_status\",\"decision\":\"deny\"");
     try t.expect(std.mem.indexOf(u8, log, "\"kind\":\"tool\",\"run\":\"evening\"") == null);
     // with the car's rules: read, and logged
     try writeRules(&f, try std.fmt.allocPrint(a, "{s}\n{s}\n", .{ try butler.setupRules(a, .home), try butler.setupRules(a, .car) }));
@@ -27971,8 +27972,8 @@ test "the_evening_reads_through_the_gate_and_asks_nothing" {
     f.core.fixed_now = eveningAt() + 86400;
     Evening.now(f.core, false);
     try f.rec.waitIn("main", "Car 34 %, 150 km, plugged in.");
-    try expectHas(try logText(&f), "\"run\":\"evening\",\"by\":\"schedule:evening\",\"tool\":\"car__car_status\",\"decision\":\"allow\"");
-    try expectHas(try logText(&f), "\"run\":\"evening\",\"by\":\"schedule:evening\",\"tool\":\"car__car_status\",\"arg\":\"car/car_status {}\",\"is_error\":false");
+    try expectHas(try logText(&f), "\"run\":\"evening\",\"by\":\"harness:evening\",\"tool\":\"car__car_status\",\"decision\":\"allow\"");
+    try expectHas(try logText(&f), "\"run\":\"evening\",\"by\":\"harness:evening\",\"tool\":\"car__car_status\",\"arg\":\"car/car_status {}\",\"is_error\":false");
     try t.expectEqual(0, f.rec.count("Allow this?"));
 }
 
@@ -28277,7 +28278,7 @@ test "lived_in_lights_go_on_and_off_at_varied_minutes" {
     try expectHas(try deviceState(&f, "living_room_light"), ": off");
     tickAt(&f, away_day + @as(i64, m.on) * 60);
     try expectHas(try deviceState(&f, "living_room_light"), ": on");
-    try expectHas(try logText(&f), "\"by\":\"schedule:away\",\"tool\":\"mcp\",\"decision\":\"allow\"");
+    try expectHas(try logText(&f), "\"by\":\"harness:away\",\"tool\":\"mcp\",\"decision\":\"allow\"");
     tickAt(&f, away_day + (@as(i64, m.off) - 1) * 60);
     try expectHas(try deviceState(&f, "living_room_light"), ": on");
     tickAt(&f, away_day + @as(i64, m.off) * 60);
@@ -28304,17 +28305,17 @@ test "away_lights_are_only_unguarded_lights" {
     try writeRules(&f, try std.mem.replaceOwned(u8, a, fileText(&f, f.core.paths.rules), "\n", "\r\n"));
     try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
     try t.expectEqualStrings("While you're away, the living room light goes on and off in the evening.", try f.core.command(a, "/away lights living_room_light"));
-    try expectHas(fileText(&f, f.core.paths.rules), "[schedule:away]\r\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"temperature\",\"device\":\"hall_thermostat\",\"value\":\"21\"}\n[all]");
+    try expectHas(fileText(&f, f.core.paths.rules), "[harness:away]\r\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"off\",\"device\":\"living_room_light\"}\nallow mcp home/home_set {\"action\":\"temperature\",\"device\":\"hall_thermostat\",\"value\":\"21\"}\n[all]");
     // a line written by hand for the lock is never used: away switches
     // home.ini's lights that aren't guarded, and nothing else
-    try writeRules(&f, try std.fmt.allocPrint(a, "{s}\n[schedule:away]\nallow mcp home/home_set {{\"action\":\"on\",\"device\":\"front_door\"}}\n[all]\n", .{fileText(&f, f.core.paths.rules)}));
+    try writeRules(&f, try std.fmt.allocPrint(a, "{s}\n[harness:away]\nallow mcp home/home_set {{\"action\":\"on\",\"device\":\"front_door\"}}\n[all]\n", .{fileText(&f, f.core.paths.rules)}));
     try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
     _ = try f.core.command(a, "/away on");
     runWorkflows(&f);
     tickAt(&f, away_day + 19 * 3600 + 31 * 60);
     try expectHas(try deviceState(&f, "living_room_light"), ": on");
     var lines = std.mem.splitScalar(u8, try logText(&f), '\n');
-    while (lines.next()) |l| if (std.mem.indexOf(u8, l, "schedule:away") != null and std.mem.indexOf(u8, l, "front_door") != null) {
+    while (lines.next()) |l| if (std.mem.indexOf(u8, l, "harness:away") != null and std.mem.indexOf(u8, l, "front_door") != null) {
         std.debug.print("away touched the lock: {s}\n", .{l});
         return error.TestUnexpectedResult;
     };
@@ -28749,4 +28750,56 @@ test "a_parcel_delivered_while_away_is_in_the_eight_oclock_line" {
     try f.rec.waitFor("Your DPD parcel 1000123456789U was delivered.");
     tickAt(&f, away_day + 20 * 3600);
     try f.rec.waitFor("All quiet at home. A parcel was left at 14:10.");
+}
+
+// ---- harness's own jobs: harness:NAME, never a task's or a schedule's ----
+
+test "a_task_named_away_gets_none_of_harnesss_away_lines" {
+    var f: Fix = undefined;
+    // the owner's own task, named away
+    try f.init("", "", "[away]\nat = 23:59\ndo = Switch the living room light on.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withAway(&f, away_day + 9 * 3600);
+    // the lines setup writes are harness's away job's
+    try expectHas(fileText(&f, f.core.paths.rules), "[harness:away]\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}");
+    try f.e.script(1, model.toolReply("t1", "home__home_set", "{\"action\":\"on\",\"device\":\"living_room_light\"}"));
+    try f.e.script(2, model.textReply("It wasn't allowed."));
+    _ = try f.core.runTask(try taskNamed(f.core, "away"));
+    try expectHas(try deviceState(&f, "living_room_light"), ": off");
+    try expectHas(try logText(&f), "\"run\":\"task away\",\"by\":\"schedule:away\"");
+    try expectHas(try logText(&f), "\"run\":\"task away\",\"agent\":\"main\",\"tool\":\"home__home_set\",\"decision\":\"deny\",\"why\":\"no one to ask in a scheduled run\"");
+    // harness's own away job switches it in the evening
+    _ = try f.core.command(a, "/away on");
+    runWorkflows(&f);
+    try f.press("deny");
+    runWorkflows(&f);
+    tickAt(&f, away_day + 19 * 3600 + 31 * 60);
+    try expectHas(try deviceState(&f, "living_room_light"), ": on");
+    try expectHas(try logText(&f), "\"run\":\"away\",\"by\":\"harness:away\",\"tool\":\"mcp\",\"decision\":\"allow\"");
+}
+
+test "a_task_named_people_gets_none_of_harnesss_people_lines" {
+    var f: Fix = undefined;
+    // the owner's own task, named people
+    try f.init("", "", "[people]\nat = 23:59\ndo = Look up gift ideas.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addSister(&f);
+    // the owner stops harness's people job from searching
+    try writeRules(&f, try std.fmt.allocPrint(a, "{s}\n[harness:people]\ndeny search *\n[all]\n", .{fileText(&f, f.core.paths.rules)}));
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "search.json", .data = "{\"web\":{\"results\":[{\"title\":\"Map: Collected and Last Poems\",\"url\":\"https://example.com/map\",\"description\":\"Poems.\"}]}}" });
+    // the task named people searches: that line isn't its
+    try f.e.script(1, model.toolReply("p1", "search", "{\"query\":\"poetry gifts\"}"));
+    try f.e.script(2, model.textReply("Found one."));
+    _ = try f.core.runTask(try taskNamed(f.core, "people"));
+    try expectHas(try logText(&f), "\"run\":\"task people\",\"by\":\"schedule:people\"");
+    try expectHas(try logText(&f), "\"run\":\"task people\",\"agent\":\"main\",\"tool\":\"search\",\"decision\":\"allow\"");
+    // harness's own people pass: its search refused, the week line without a gift idea
+    f.core.fixed_now = peopleMorning(2027, 11, 21);
+    f.core.peopleNow();
+    try f.rec.waitIn("main", "Ola's birthday is in a week, on Sunday 28 November (turns 38).");
+    try expectHas(try logText(&f), "\"run\":\"people\",\"by\":\"harness:people\",\"tool\":\"search\",\"decision\":\"deny\"");
+    try t.expectEqual(0, f.rec.count("Gift idea"));
 }

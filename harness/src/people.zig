@@ -22,6 +22,9 @@ pub const max_values = 16;
 pub const max_people = 5000;
 /// The minute of the day (the owner's) from which the day's lines go.
 pub const day_minute = 9 * 60;
+/// Who the day's pass is, to the gate, the log and quiet hours: harness's
+/// own job, never a task's or a schedule's of the same name.
+pub const by = "harness:people";
 /// A file's id, at most (bytes).
 const max_id = 48;
 

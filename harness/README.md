@@ -354,6 +354,7 @@ every call.
 | `[agent:helper]` | helpers' calls |
 | `[agent:NAME]` | the calls of definition NAME (`agents/NAME.md`), wherever it runs |
 | `[room]`, `[room:NAME]` | speech in the house, through Home Assistant's voice satellites (see Home Assistant's voice) |
+| `[harness:NAME]` | harness's own jobs, which nobody watches: `away` and `trips` (Away and travel), `warm-car`, `people`, `lists`, `reorder`, `deliveries`, `upkeep`, `habits`, `evening`. No task, brief, schedule or trigger is ever one, so a task you call `away` never gets `[harness:away]`'s lines |
 
 A kind alone covers all its names (`[schedule]`), and `*` works as in
 rules (`[schedule:btc-*]`). A section for the call's own definition may
@@ -920,7 +921,7 @@ offered again, to list today's events.
   Not today, or no answer by the leave-by, sends nothing. Each leave-by is
   asked about once (`state/diary`); a warm morning, an afternoon, a car
   that can't be read: no question, a `warm car` line in the log. harness
-  starts the routine itself (`schedule:warm-car`, no triggers.ini section),
+  starts the routine itself (`harness:warm-car`, no triggers.ini section),
   so quiet hours and busy events hold its question like any routine's.
 
 The diary reads calmcp's `cal://upcoming` (today and tomorrow, as data)
@@ -979,7 +980,7 @@ when the house is empty and acts like it:
   goes off unless the Arriving routine does it, back to `[butler]
   home_temp` (21 °C), but only when it is at the away temperature or below.
 - **Lights that make it look lived in**: those `rules` lets
-  `schedule:away` switch (the routine writes two, a living room's first;
+  `harness:away` switch (the routine writes two, a living room's first;
   `/away lights NAME, NAME` or `/away lights none` changes them, and takes
   only home.ini's lights that aren't guarded). On from 19:00 and off from
   22:30, each up to 30 minutes later, at a minute of their own every
@@ -993,8 +994,8 @@ when the house is empty and acts like it:
   ring at the door and each parcel the deliveries saw delivered ("A
   parcel was left at 14:10.", Errands and upkeep).
 - **What it may do by itself**: `home_set` alone, through the gate as
-  `schedule:away` with nobody to ask (a rule must allow each call:
-  `[schedule:away]` in rules, these calls exactly); never `home_guarded`,
+  `harness:away` with nobody to ask (a rule must allow each call:
+  `[harness:away]` in rules, these calls exactly); never `home_guarded`,
   never a lock, a valve, the garage or an alarm.
 - **State.** `state/away` (on or off, why, since, until, the lights'
   seed and evening, what happened since the last 20:00 line), written
@@ -1454,7 +1455,7 @@ Butler:  Tomorrow: Dentist at 10:30 (Dental clinic, ul. Długa 5, Kraków); leav
   memory_model` over the results, as data); the car from carcloud's
   `car_status`; bills due tomorrow from your mailbox, when it is on
   (Mail); the items open in `/inbox`.
-- Each read is the gate's, as `schedule:evening`, and in the log; nothing
+- Each read is the gate's, as `harness:evening`, and in the log; nothing
   is asked or changed, and a read the rules don't allow leaves its line
   out.
 - Once an evening (`state/evening`); at its time in quiet hours without a
@@ -2442,7 +2443,7 @@ calendar adds anyone. `deny people note*` in `rules` stops notes;
 At most one such post a day: the day's own birthdays and anniversaries
 first, then the nearest week line, then the longest wait; the rest come
 on the following days (a week line not said by the day before is left
-for the day's reminder). They go to main as `schedule:people`, so quiet
+for the day's reminder). They go to main as `harness:people`, so quiet
 hours hold them for the digest. What was said is kept in
 `state/people-told`.
 

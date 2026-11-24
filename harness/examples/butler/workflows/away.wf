@@ -2,12 +2,12 @@
 # [butler] away_after, a trip under way, or /away): one line saying so,
 # and one tap before the heating goes down. While you're away, doors,
 # windows and movement come at once (triggers.ini's away-... sections),
-# the lights rules lets schedule:away switch go on and off in the
+# the lights rules lets harness:away switch go on and off in the
 # evening, and one line comes at 20:00; before you're back the heating
 # goes up again. Nothing guarded is ever touched.
 workflow away
 about When the house is empty (everyone out <away after>, a trip, or /away): a line, and one tap before the heating goes down.
-start owner, schedule:away
+start owner, harness:away
 tag no
 limits steps 10, days 1
 #if thermostat

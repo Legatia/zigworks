@@ -32,8 +32,9 @@ pub const pass_every_days = 7;
 pub const expires_s = 7 * 86400;
 
 /// Who the week's look is, as its item says (quiet hours hold it as a
-/// schedule's): the one place this value is.
-pub const who = "schedule:habits";
+/// schedule's): harness's own job, the one place this value is. (The
+/// routines it writes on the owner's Yes are the owner's: `schedule:habit-…`.)
+pub const who = "harness:habits";
 /// The routine's names: `habit-…` for its workflow and its trigger, and
 /// its one step; its rules section is `[workflow:NAME/act]`
 /// (`rulesSection`).

@@ -12,23 +12,26 @@ pub const Who = struct {
     /// What started the run, the same down a delegation chain: `owner`,
     /// `schedule:NAME`, `trigger:NAME`, `workflow:NAME/STEP`, `app:NAME`,
     /// `member:NAME` (a household member's message), `room:NAME` (speech
-    /// in a room of the house, through Home Assistant's voice satellites).
+    /// in a room of the house, through Home Assistant's voice satellites),
+    /// `harness:NAME` (harness's own jobs: away mode, the people's pass;
+    /// no settings file names one into being, so no task, brief, schedule
+    /// or trigger the owner names the same ever has its rules).
     by: []const u8 = "owner",
     /// The run that delegated this one: its definition is the first that
     /// delegated, its parent's the next.
     parent: ?*const Who = null,
 
     /// A run nobody watches, so nobody can answer a question in it: one a
-    /// schedule, a trigger or a workflow started. (A workflow's tool step
-    /// is not a run and can wait in the inbox.)
+    /// schedule, a trigger, a workflow or harness's own job started. (A
+    /// workflow's tool step is not a run and can wait in the inbox.)
     pub fn unattended(w: Who) bool {
         const k = kindOf(w.by);
-        return eql(k, "schedule") or eql(k, "trigger") or eql(k, "workflow");
+        return eql(k, "schedule") or eql(k, "trigger") or eql(k, "workflow") or eql(k, "harness");
     }
 };
 
 /// The kinds of a who: what started a run, and `agent` for definitions.
-const kinds = [_][]const u8{ "owner", "schedule", "trigger", "workflow", "app", "agent", "member", "room" };
+const kinds = [_][]const u8{ "owner", "schedule", "trigger", "workflow", "app", "agent", "member", "room", "harness" };
 
 /// A household member's (`member:NAME`), or a pattern of members' (`member`,
 /// `member:a*`).
@@ -280,4 +283,20 @@ test "room_is_a_who_kind" {
     for ([_][]const u8{ "owner", "schedule:x", "trigger:room", "workflow:member/x", "agent:main" }) |w| try t.expect(!isHousehold(w));
     // the owner answers what a room asks, later: not a run nobody watches
     try t.expect(!(Who{ .by = "room:kitchen" }).unattended());
+}
+
+test "harness_is_a_who_kind_of_its_own" {
+    // harness's own jobs (away mode, the people's pass): harness:NAME
+    try t.expect(isValue("harness:away"));
+    try t.expect(!isValue("harness"));
+    for ([_][]const u8{ "harness", "harness:away", "harness:p*" }) |p| try t.expect(isPattern(p));
+    try t.expect(matchesBy("harness", "harness:away"));
+    try t.expect(matchesBy("harness:away", "harness:away"));
+    // a task, brief or schedule named the same is another who
+    try t.expect(!matchesBy("harness:away", "schedule:away"));
+    try t.expect(!matchesBy("schedule:away", "harness:away"));
+    try t.expect(!matchesBy("schedule", "harness:people"));
+    try t.expect(!matchesBy("trigger:away", "harness:away"));
+    // nobody watches it: nobody can answer in it
+    try t.expect((Who{ .by = "harness:away" }).unattended());
 }

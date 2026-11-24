@@ -883,6 +883,8 @@ pub const rules_example =
     \\# [room] and [room:NAME] are for speech in the house through Home
     \\# Assistant's voice assistant (README: Home Assistant's voice), the
     \\# same way: [room:living_room] for one room.
+    \\# [harness:NAME] is for harness's own jobs ([harness:away]: away
+    \\# mode's lights); no task, brief or schedule of yours is ever one.
     \\# After the agent writes a file in the workspace, a shell command that
     \\# a rule or a 24 h grant allows is asked first, naming the files, until
     \\# you allow one; a scheduled run skips it.

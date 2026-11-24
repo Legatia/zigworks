@@ -762,7 +762,7 @@ EOF
 		press later
 		[ "$r" = manner ] || wait_asked_long $((n0 + 1))
 	done
-	check "every routine the home has what for is on" 'wait_for "$OUT" "That'"'"'s all the routines: 9 on." 30 && ! grep -q "^evening" "$BH/config.ini" && [ ! -e "$BH/agents/butler.md" ] && [ -f "$BH/workflows/leak.wf" ] && grep -qF "[doorbell-front_door_bell]" "$BH/triggers.ini" && grep -qF "[away-back_door]" "$BH/triggers.ini" && grep -qF "[schedule:away]" "$BH/rules" && grep -qF "fallback 5m" "$BH/workflows/leak.wf" && grep -qF "[leak-sink_leak]" "$BH/triggers.ini" && grep -qF "[smoke-kitchen_smoke_alarm]" "$BH/triggers.ini" && grep -qF "speakers = all" "$BH/triggers.ini" && grep -qF "[door-back_door]" "$BH/triggers.ini" && grep -qF "[workflow:arriving/heat]" "$BH/rules"'
+	check "every routine the home has what for is on" 'wait_for "$OUT" "That'"'"'s all the routines: 9 on." 30 && ! grep -q "^evening" "$BH/config.ini" && [ ! -e "$BH/agents/butler.md" ] && [ -f "$BH/workflows/leak.wf" ] && grep -qF "[doorbell-front_door_bell]" "$BH/triggers.ini" && grep -qF "[away-back_door]" "$BH/triggers.ini" && grep -qF "[harness:away]" "$BH/rules" && grep -qF "fallback 5m" "$BH/workflows/leak.wf" && grep -qF "[leak-sink_leak]" "$BH/triggers.ini" && grep -qF "[smoke-kitchen_smoke_alarm]" "$BH/triggers.ini" && grep -qF "speakers = all" "$BH/triggers.ini" && grep -qF "[door-back_door]" "$BH/triggers.ini" && grep -qF "[workflow:arriving/heat]" "$BH/rules"'
 	# the triggers' first polls only mark what is there
 	for tr in leak-sink_leak smoke-kitchen_smoke_alarm door-back_door everyone-left first-home doorbell-front_door_bell doorbell-away-front_door_bell away-back_door away-hall_motion; do
 		wait_for "$BH/state/triggers/$tr/state" "\"polled\":true" 20

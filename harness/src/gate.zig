@@ -1188,6 +1188,21 @@ test "a_by_section_allows_for_that_origins_runs" {
     try t.expectEqual(.ask, f.act(.fetch, u, .{}));
 }
 
+test "a_harness_section_never_reaches_a_schedule_of_the_same_name" {
+    var f: Fixture = undefined;
+    try f.init("[harness:away]\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}\n[harness:people]\ndeny search *\n");
+    defer f.deinit();
+    const call = "home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}";
+    // harness's own away job: its line
+    try t.expectEqual(.allow, f.act(.mcp, call, .{ .who = .{ .by = "harness:away", .agent = "" }, .scheduled = true }));
+    // the owner's task named away: not its line; nobody to ask
+    try t.expectEqual(.deny, f.act(.mcp, call, .{ .who = .{ .by = "schedule:away" }, .scheduled = true }));
+    try t.expectEqual(.deny, f.act(.mcp, call, .{ .who = .{ .by = "trigger:away" }, .scheduled = true }));
+    // harness's people job is refused its search; a task named people is not
+    try t.expectEqual(.deny, f.act(.search, "gift ideas", .{ .who = .{ .by = "harness:people", .agent = "" }, .scheduled = true }));
+    try t.expectEqual(.allow, f.act(.search, "gift ideas", .{ .who = .{ .by = "schedule:people" }, .scheduled = true }));
+}
+
 test "an_ask_in_a_by_or_delegator_section_turns_an_allow_from_another_section_into_ask" {
     var f: Fixture = undefined;
     try f.init("[agent:main]\nallow shell make*\n[schedule]\nask shell *\n");

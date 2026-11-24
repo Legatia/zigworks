@@ -435,8 +435,9 @@ fn headLine(a: Allocator, w: *Workflow, l: Line, file_name: []const u8, diag: *D
             const s = std.mem.trim(u8, raw, " \t");
             const ok = eql(u8, s, "owner") or eql(u8, s, "agent") or
                 (std.mem.startsWith(u8, s, "trigger:") and triggers.validName(s["trigger:".len..])) or
-                (std.mem.startsWith(u8, s, "schedule:") and triggers.validName(s["schedule:".len..]));
-            if (!ok) return bad(diag, l.n, "start lists owner, agent, trigger:NAME or schedule:NAME, separated by commas");
+                (std.mem.startsWith(u8, s, "schedule:") and triggers.validName(s["schedule:".len..])) or
+                (std.mem.startsWith(u8, s, "harness:") and triggers.validName(s["harness:".len..]));
+            if (!ok) return bad(diag, l.n, "start lists owner, agent, trigger:NAME, schedule:NAME or harness:NAME (harness's own job), separated by commas");
             if (!oneOf(s, list.items)) try list.append(a, s);
         }
         w.start = list.items;
@@ -840,10 +841,11 @@ fn placeholderName(n: []const u8) bool {
 /// A running MCP server and its tools.
 pub const McpServer = struct { name: []const u8, tools: []const []const u8 };
 
-/// The schedules harness runs itself, which a workflow's start line may
-/// name without a triggers.ini section: away mode coming on, a trip's
-/// evening before.
-pub const harness_schedules = [_][]const u8{ "away", "trips" };
+/// harness's own jobs that start a workflow of the same name, as
+/// `harness:NAME` (who.zig): away mode coming on, a trip's evening before,
+/// the diary's leave-by warming the car. Only that workflow's start line
+/// may name it, with no triggers.ini section; no settings file starts one.
+pub const harness_jobs = [_][]const u8{ "away", "trips", "warm-car" };
 
 /// What a workflow may name besides its own steps.
 pub const Context = struct {
@@ -857,11 +859,6 @@ pub const Context = struct {
     mcp: ?[]const McpServer = null,
 };
 
-/// The schedule harness keeps for itself: the warm-car routine, started
-/// before a morning leave-by of the diary (warmcar.zig), needs no
-/// triggers.ini section.
-pub const builtin_schedule = "warm-car";
-
 /// Checks what `w` names outside itself: a `start` trigger or schedule
 /// whose `start = workflow NAME` names it, `wait event` triggers (and the
 /// fields `match` reads), definitions, MCP tools of servers that run.
@@ -869,13 +866,16 @@ pub const builtin_schedule = "warm-car";
 pub fn check(a: Allocator, w: Workflow, ctx: Context, diag: *Diag) Error![]const []const u8 {
     var warns: std.ArrayList([]const u8) = .empty;
     for (w.start) |s| {
+        // harness's own job starts its own workflow, and only it: no section
+        if (std.mem.startsWith(u8, s, "harness:")) {
+            const job = s["harness:".len..];
+            if (!oneOf(job, &harness_jobs)) return badf(a, diag, w.start_line, "harness starts no workflow as {s} (its own: harness:away, harness:trips, harness:warm-car)", .{s});
+            if (!std.mem.eql(u8, job, w.name)) return badf(a, diag, w.start_line, "{s} starts only workflow {s}", .{ s, job });
+            continue;
+        }
         const trigger = std.mem.startsWith(u8, s, "trigger:");
         if (!trigger and !std.mem.startsWith(u8, s, "schedule:")) continue;
         const name = s[std.mem.indexOfScalar(u8, s, ':').? + 1 ..];
-        // harness's own schedule: the diary's leave-by starts warm-car, and only it
-        if (!trigger and std.mem.eql(u8, name, builtin_schedule) and std.mem.eql(u8, w.name, builtin_schedule)) continue;
-        // harness's own schedules (away mode, trips) need no section
-        if (!trigger and oneOf(name, &harness_schedules)) continue;
         const tr = findTrigger(ctx.triggers, name);
         const ok = if (tr) |x| x.isEvent() == trigger and x.action == .start and std.mem.eql(u8, x.action.start, w.name) else false;
         if (!ok) return badf(a, diag, w.start_line, "{s} has no start = workflow {s} in triggers.ini ({s})", .{ name, w.name, if (trigger) "an event trigger" else "a schedule" });
@@ -1146,6 +1146,8 @@ pub fn reading(a: Allocator, w: Workflow, money: ?*const fn (ctx: ?*anyopaque, t
             try out.appendSlice(a, "the agent (the workflow tool, asked)");
         } else if (std.mem.startsWith(u8, s, "trigger:")) {
             try out.print(a, "trigger {s} (an instance per event)", .{s["trigger:".len..]});
+        } else if (std.mem.startsWith(u8, s, "harness:")) {
+            try out.print(a, "harness itself (its {s} job)", .{s["harness:".len..]});
         } else try out.print(a, "schedule {s}", .{s["schedule:".len..]});
     }
     try out.appendSlice(a, ".");
@@ -1649,27 +1651,35 @@ test "harness_starts_warm_car_itself_without_a_triggers_section" {
     defer arena.deinit();
     const a = arena.allocator();
     var d: Diag = .{};
-    // the diary's leave-by starts it (schedule:warm-car): no section needed
-    const w = try parse(a, "warm-car", "workflow warm-car\nstart schedule:warm-car\nstep a\nsay hi\n", &d);
+    // the diary's leave-by starts it (harness:warm-car): no section needed
+    const w = try parse(a, "warm-car", "workflow warm-car\nstart harness:warm-car\nstep a\nsay hi\n", &d);
     _ = try check(a, w, .{}, &d);
-    // any other schedule still needs its section
-    const x = try parse(a, "other", "workflow other\nstart schedule:other\nstep a\nsay hi\n", &d);
-    try t.expectError(error.BadWorkflow, check(a, x, .{}, &d));
+    try t.expect(std.mem.indexOf(u8, try reading(a, w, null, null), "Who may start it: harness itself (its warm-car job).") != null);
+    // a schedule of the same name is the owner's: its section is needed
+    const s = try parse(a, "warm-car", "workflow warm-car\nstart schedule:warm-car\nstep a\nsay hi\n", &d);
+    try t.expectError(error.BadWorkflow, check(a, s, .{}, &d));
+    try t.expectEqualStrings("warm-car has no start = workflow warm-car in triggers.ini (a schedule)", d.why);
     // and harness starts only warm-car so: another workflow can't borrow its name
-    const y = try parse(a, "mine", "workflow mine\nstart schedule:warm-car\nstep a\nsay hi\n", &d);
+    const y = try parse(a, "mine", "workflow mine\nstart harness:warm-car\nstep a\nsay hi\n", &d);
     try t.expectError(error.BadWorkflow, check(a, y, .{}, &d));
-    try t.expectEqualStrings("warm-car has no start = workflow mine in triggers.ini (a schedule)", d.why);
+    try t.expectEqualStrings("harness:warm-car starts only workflow warm-car", d.why);
 }
 
-test "harness_schedules_start_without_a_section" {
+test "harness_jobs_start_their_workflows_without_a_section" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var d: Diag = .{};
     // away mode and trips start their routines themselves
-    const w = try parse(a, "away", "workflow away\nstart owner, schedule:away\nstep s\nsay {input}\n", &d);
+    const w = try parse(a, "away", "workflow away\nstart owner, harness:away\nstep s\nsay {input}\n", &d);
     _ = try check(a, w, .{}, &d);
-    // any other schedule needs its section
-    const x = try parse(a, "x", "workflow x\nstart schedule:nightly\nstep s\nsay hi\n", &d);
+    try t.expect(w.allows("harness:away", false) and !w.allows("schedule:away", false));
+    _ = try check(a, try parse(a, "trips", "workflow trips\nstart harness:trips\nstep s\nsay {input}\n", &d), .{}, &d);
+    // harness has no job of another name
+    const x = try parse(a, "x", "workflow x\nstart harness:x\nstep s\nsay hi\n", &d);
     try t.expectError(error.BadWorkflow, check(a, x, .{}, &d));
+    try t.expectEqualStrings("harness starts no workflow as harness:x (its own: harness:away, harness:trips, harness:warm-car)", d.why);
+    // any other schedule needs its section, away's name too
+    for ([_][]const u8{ "workflow away\nstart schedule:away\nstep s\nsay hi\n", "workflow away\nstart schedule:nightly\nstep s\nsay hi\n" }) |text|
+        try t.expectError(error.BadWorkflow, check(a, try parse(a, "away", text, &d), .{}, &d));
 }
