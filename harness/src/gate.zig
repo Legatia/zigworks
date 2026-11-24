@@ -129,6 +129,16 @@ fn defaultFor(tool: Tool, arg: []const u8, ctx: Ctx) rules.Action {
     };
 }
 
+/// A call whose text outlasts the context that carries the outside text
+/// it may repeat: a memory, or a fact noted about a person. Asked by
+/// default once the run has read outside text.
+fn keepsText(tool: Tool, arg: []const u8) bool {
+    return tool == .remember or (tool == .people and std.mem.eql(u8, firstWord(arg), "note"));
+}
+
+/// Why such a call is asked.
+const outside_why = "outside text: asked by default";
+
 fn firstWord(arg: []const u8) []const u8 {
     return arg[0 .. std.mem.indexOfScalar(u8, arg, ' ') orelse arg.len];
 }
@@ -415,7 +425,8 @@ pub const Gate = struct {
         // a member, or speech in a room, is never given a day: the owner
         // decides each time
         const member = if (ctx.who) |w| who_mod.isHousehold(w.by) else false;
-        d.allow_day = !(tool == .money or tool.setup(arg) or (tool == .send and ctx.shared) or member);
+        // a memory or a fact asked for outside text: the argument never repeats
+        d.allow_day = !(tool == .money or tool.setup(arg) or (tool == .send and ctx.shared) or member or (ctx.outside and keepsText(tool, arg)));
         d.dir = dir;
         return d;
     }
@@ -506,6 +517,10 @@ pub const Gate = struct {
         // programs read these as their settings (.git/config, .npmrc, .env):
         // a file written there can make the next command run something else
         if (tool == .write_file and dotPart(subject)) d = .{ .action = .ask, .why = "a name starting with \".\" asks: programs read those as settings", .subject = subject };
+        // outside text read first: what would outlast this context is asked
+        // (a changed default: the owner's own allow or ask line decides)
+        const by_mark = ctx.outside and keepsText(tool, subject);
+        if (by_mark) d = .{ .action = .ask, .why = outside_why, .subject = subject };
         // the first allow or ask in the sections for the call's definition,
         // then in those for what started its run, then in the shared part
         var from: ?rules.Rule = null;
@@ -528,7 +543,7 @@ pub const Gate = struct {
             d = .{ .action = .ask, .why = ruleWhy(arena, r), .subject = subject };
             break;
         };
-        if (d.action == .ask and ctx.scheduled) return .{ .action = .deny, .why = "no one to ask in a scheduled run", .subject = subject };
+        if (d.action == .ask and ctx.scheduled) return .{ .action = .deny, .why = if (from == null and by_mark) "outside text, unattended" else "no one to ask in a scheduled run", .subject = subject };
         return d;
     }
 
@@ -1395,6 +1410,46 @@ test "a_send_others_read_is_asked_every_time_and_an_allow_rule_lifts_it" {
     try t.expectEqual(.allow, f.act(.send, "family", .{ .shared = true }));
     f.gate.rules = try rules.parse(a, "deny send main\n");
     try t.expectEqual(.deny, f.act(.send, "main", .{}));
+}
+
+test "outside_text_asks_remember_and_people_note" {
+    var f: Fixture = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.arena.allocator();
+    // unmarked: as before
+    try t.expectEqual(.allow, f.act(.remember, "the owner likes tea", .{}));
+    try t.expectEqual(.allow, f.act(.people, "note anna email", .{}));
+    // marked: asked, the whole call every time, never for a day
+    const d = f.gate.decide(a, .remember, "the owner likes tea", 1000, .{ .outside = true });
+    try t.expectEqual(.ask, d.action);
+    try t.expect(!d.allow_day);
+    try t.expectEqualStrings("outside text: asked by default", d.why);
+    const n = f.gate.decide(a, .people, "note anna email", 1000, .{ .outside = true });
+    try t.expectEqual(.ask, n.action);
+    try t.expect(!n.allow_day);
+    // reading people, and other tools, are not asked for it
+    try t.expectEqual(.allow, f.act(.people, "show anna", .{ .outside = true }));
+    try t.expectEqual(.allow, f.act(.recall, "tea", .{ .outside = true }));
+    try t.expectEqual(.allow, f.act(.read_file, "notes.txt", .{ .outside = true }));
+    try t.expect(f.gate.decide(a, .shell, "ls", 1000, .{ .outside = true }).allow_day);
+    // unattended: refused, saying why
+    const u = f.gate.decide(a, .remember, "the owner likes tea", 1000, .{ .outside = true, .scheduled = true });
+    try t.expectEqual(.deny, u.action);
+    try t.expectEqualStrings("outside text, unattended", u.why);
+    // the owner's own lines decide: an allow lifts it, a deny refuses
+    f.gate.rules = try rules.parse(a, "allow remember *\n");
+    try t.expectEqual(.allow, f.act(.remember, "x", .{ .outside = true }));
+    try t.expectEqual(.allow, f.act(.remember, "x", .{ .outside = true, .scheduled = true }));
+    f.gate.rules = try rules.parse(a, "deny remember *\n");
+    try t.expectEqual(.deny, f.act(.remember, "x", .{ .outside = true }));
+    // an ask the owner wrote, unattended, is the usual refusal
+    f.gate.rules = try rules.parse(a, "ask remember *\n");
+    try t.expectEqualStrings("no one to ask in a scheduled run", f.gate.decide(a, .remember, "x", 1000, .{ .outside = true, .scheduled = true }).why);
+    // rules still match people's subject
+    f.gate.rules = try rules.parse(a, "allow people note anna *\n");
+    try t.expectEqual(.allow, f.act(.people, "note anna email", .{ .outside = true }));
+    try t.expectEqual(.ask, f.act(.people, "note ben email", .{ .outside = true }));
 }
 
 test "deny_mcp_rule_covers_money_tools_of_that_server" {
