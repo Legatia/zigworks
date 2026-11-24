@@ -27759,6 +27759,9 @@ const Errands = struct {
         if (shop_cfg.day >= 0) try when.append(a, try std.fmt.allocPrint(a, "{s} when {s} has something on it", .{ try lists_mod.weeklyText(a, .{ .day = shop_cfg.day, .at = shop_cfg.at }), shop_cfg.list }));
         const per_call = tl.order.?.max_per_call orelse c.cfg.money.max_per_call;
         const cap = if (per_call > 0) try std.fmt.allocPrint(a, " An order over {d} a call is not proposed (your cap).", .{per_call}) else "";
+        // with a budget for routines, within it the reorder orders itself
+        if (budgetFor(c, tl.order.?))
+            return std.fmt.allocPrint(a, "Reorders from {s} are on: {s}, I price the list with {s}. Within your budget for routines (/money) I order it and tell you; over it, I send you the whole order and nothing is bought until you tap Order it.{s} /setup reorder {s} off stops them.", .{ try lists_mod.title(a, shop), try std.mem.join(a, ", and ", when.items), try lists_mod.title(a, shop), cap, shop });
         return std.fmt.allocPrint(a, "Reorders from {s} are on: {s}, I price the list with {s} and send you the whole order, each item and the total. Nothing is bought until you tap Order it.{s} /setup reorder {s} off stops them.", .{ try lists_mod.title(a, shop), try std.mem.join(a, ", and ", when.items), try lists_mod.title(a, shop), cap, shop });
     }
 
@@ -27917,7 +27920,14 @@ const Errands = struct {
         }
         const input = jv.canonical(a, lists_mod.orderInput(a, plan.order, order.amount.name, q.total) catch return) orelse return;
         const arg = std.fmt.allocPrint(a, "{s}/{s} {s}", .{ order.server.name, order.tool, input }) catch return;
-        const body = c.masks.scrubAlloc(a, lists_mod.proposal(a, shop.shop, q, plan) catch return) catch return;
+        // within the budget for routines it orders itself; refused, it's
+        // proposed as without one, saying why
+        var not_ordered: []const u8 = "";
+        if (budgetFor(c, order)) switch (orderWithin(c, a, shop, order, input, plan.order, total)) {
+            .done => return,
+            .refused => |why| not_ordered = std.fmt.allocPrint(a, "\nNot ordered on its own: {s}.", .{std.mem.trimEnd(u8, why, ".")}) catch "",
+        };
+        const body = c.masks.scrubAlloc(a, std.fmt.allocPrint(a, "{s}{s}", .{ lists_mod.proposal(a, shop.shop, q, plan) catch return, not_ordered }) catch return) catch return;
         const title_line = std.fmt.allocPrint(a, "Order from {s}: {s}", .{ shop_title, total }) catch return;
         const choices = [_]inbox_mod.Choice{ .{ .key = "order", .label = "Order it" }, .{ .key = "later", .label = "Not now" } };
         c.makeRoom();
@@ -27958,6 +27968,49 @@ const Errands = struct {
     }
 
     const order_waiter = "errand order";
+
+    /// Whether the reorder may order from `order`'s server itself: a
+    /// budget for routines there, and `[money] scheduled` on.
+    fn budgetFor(c: *Core, order: agent.McpTool) bool {
+        return c.cfg.money.scheduled and money_mod.budgetFor(c.cfg.money, order.budget_per_day, order.budget_per_month).any();
+    }
+
+    const Within = union(enum) { done, refused: []const u8 };
+
+    /// The order made by the reorder itself (`harness:reorder`, nobody
+    /// to ask), through the money checks and the gate: within the budget
+    /// and the caps it's made, told (agent.zig's line) and said, and what
+    /// was ordered comes off the list; refused, the reason, for a proposal.
+    fn orderWithin(c: *Core, a: std.mem.Allocator, shop: lists_mod.Shop, order: agent.McpTool, input: []const u8, items: []const []const u8, total: []const u8) Within {
+        const shop_title = lists_mod.title(a, shop.shop) catch shop.shop;
+        var flag: std.atomic.Value(bool) = .init(false);
+        c.register(&flag, "");
+        defer c.unregister(&flag);
+        var run = c.runAs(&c.chat_client, "reorder", .{ .agent = "", .by = by_reorder }, &flag);
+        run.useDefinition(agents.builtin_main);
+        const out: tools.Output = agent.stepCall(&run, a, order.def.name, input) catch |e| .{ .text = @errorName(e), .is_error = true };
+        const said = util.cut(std.mem.trim(u8, out.text, " \t\r\n"), 600);
+        if (out.is_error and gateRefused(said)) {
+            const why = if (std.mem.startsWith(u8, said, "refused by the gate: ")) said["refused by the gate: ".len..] else said;
+            c.log.write(.chat, false, .{ .event = "order not made unasked", .shop = shop.shop, .why = why }) catch {};
+            return .{ .refused = why };
+        }
+        if (std.mem.startsWith(u8, said, "dry run:")) {
+            c.log.write(.chat, false, .{ .event = "order dry run", .shop = shop.shop }) catch {};
+            post(c, a, by_reorder, "reorder", std.fmt.allocPrint(a, "Dry run is on: nothing was ordered from {s}.", .{shop_title}) catch return .done);
+            return .done;
+        }
+        if (out.is_error) {
+            c.log.write(.chat, false, .{ .event = "order failed", .shop = shop.shop, .by = by_reorder }) catch {};
+            post(c, a, by_reorder, "reorder", std.fmt.allocPrint(a, "The order from {s} failed: {s}. Nothing was taken off {s}.", .{ shop_title, std.mem.trimEnd(u8, said, "."), shop.list }) catch return .done);
+            return .done;
+        }
+        const got = c.errands.lists.remove(a, shop.list, items) catch Store.Removed{};
+        noteCount(c, a, shop.list, got.count + got.removed.len, got.count);
+        c.log.write(.chat, false, .{ .event = "order made", .shop = shop.shop, .by = by_reorder, .items = items.len }) catch {};
+        post(c, a, by_reorder, "reorder", std.fmt.allocPrint(a, "Ordered from {s}: {d} item{s}, {s}; off {s}. The shop says: {s}", .{ shop_title, items.len, if (items.len == 1) "" else "s", total, shop.list, said }) catch return .done);
+        return .done;
+    }
 
     /// The order item `id` closed: its call taken off `state/errands` first
     /// (a crash never orders twice), then made on the owner's Order it,
@@ -29178,6 +29231,36 @@ test "no_amount_tools_and_mail_send_are_never_unattended" {
         const b = f.rec.buttonsWith(needle).?;
         try t.expect(b.get("dismiss") != null and b.get("pay") == null and b.get("allow") == null);
     }
+}
+
+test "the_reorder_orders_within_the_budget_and_proposes_over_it" {
+    var f: Fix = undefined;
+    try f.init("[money]\nbudget_per_day = 12\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try withShop(&f, shop_money);
+    try t.expectEqualStrings("Reorders from Frisco are on: when shopping reaches 2 items, I price the list with Frisco. Within your budget for routines (/money) I order it and tell you; over it, I send you the whole order and nothing is bought until you tap Order it. /setup reorder frisco off stops them.", try f.core.command(a, "/setup reorder frisco at 2 items"));
+    // within the budget: ordered by harness:reorder, told, off the list
+    try f.core.handleText("add milk, eggs");
+    Errands.work(f.core);
+    try waitOrders(&f, "{\"items\":[\"milk\",\"eggs\"],\"total\":10}");
+    try f.rec.waitIn("main", "BUTTONS Spent 10 on frisco/shop_order for the reorder. Today 10 of 12; this month 10.");
+    try f.rec.waitFor("Ordered from Frisco: 2 items, 10.00 PLN; off shopping. The shop says: Order 4471 placed");
+    try t.expectEqual(0, f.rec.count("BUTTONS Order from"));
+    try t.expectEqualStrings("Shopping is empty.", try f.core.command(a, "/list"));
+    try t.expectEqual(@as(f64, 10), friscoToday(&f).auto);
+    try expectHas(try logText(&f), "\"run\":\"reorder\",\"by\":\"harness:reorder\"");
+    // over it: proposed for the tap, as without a budget, saying why
+    try f.core.handleText("add bread, jam");
+    Errands.work(f.core);
+    try f.rec.waitFor("BUTTONS Order from Frisco: 10.00 PLN");
+    try f.rec.waitFor("Not ordered on its own: 10 more would be over the budget of 12 a day for automation (10 so far today).");
+    try t.expectEqual(1, std.mem.count(u8, shopOrders(&f), "\n"));
+    // the tap orders it as the owner's
+    try f.press("order");
+    try waitOrders(&f, "{\"items\":[\"bread\",\"jam\"],\"total\":10}");
+    try t.expectEqual(@as(f64, 10), friscoToday(&f).auto);
+    try t.expectEqual(@as(f64, 20), friscoToday(&f).all);
 }
 
 test "not_now_and_expiry_order_nothing" {
