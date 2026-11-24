@@ -565,6 +565,14 @@ Rulings:
   45388410033 failed on. The SHARING_VIOLATION in its trace is a rename
   `util.writeReplace` tried again and got through (a test's error trace
   holds the errors handled on the way).
+- R39. Open: on GitHub's Windows Server 2025 runner (CI run 45400796941)
+  the sandbox had its drives, and a `dir` of the home drive's root from
+  `/env check` still said "Access is denied", while `ren`, `del`, `cd /d`
+  and a `dir` of a folder below it pass there in the sandbox's own test.
+  Not seen on this machine (Windows 11, build 26300). `/env check` now
+  tries a file made, renamed and deleted in the home; the sandbox test
+  prints what a `dir` of each drive's root answers, without requiring
+  it, so the next CI run says more.
 
 Measured here: a sandboxed `echo` takes about 35 ms more (142 ms against 109).
 

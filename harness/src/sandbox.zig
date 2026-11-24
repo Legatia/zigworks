@@ -1636,6 +1636,12 @@ test "sandbox_changes_files_the_owner_made" {
         // in its home and its temporary folder too (a drive of their own)
         try expectOk(try f.run("echo t> \"%TEMP%\\t.txt\" && dir /b \"%TEMP%\" && del \"%TEMP%\\t.txt\""));
         try expectOk(try f.run("cd /d \"%USERPROFILE%\" && echo h> h.txt && ren h.txt i.txt && del i.txt"));
+        // (said, not required: Windows Server 2025 on CI refused a dir of
+        // the home drive's root from /env check, and this machine doesn't)
+        for ([_][]const u8{ "dir /b \"%USERPROFILE%\"", "cd /d \"%USERPROFILE%\" && dir /b", "dir /b W:\\", "icacls \"%USERPROFILE%.\"" }) |probe| {
+            const got = try f.run(probe);
+            if (got.is_error) std.debug.print("sandbox drive probe `{s}` said:\n{s}\n", .{ probe, got.text });
+        }
         // the real path still names the same files, for programs
         const real = try std.fmt.allocPrint(f.a, "type \"{s}\\moved\\c.txt\"", .{f.ws});
         try expectHas((try f.run(real)).text, "changed");

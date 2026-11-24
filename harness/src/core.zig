@@ -12542,11 +12542,13 @@ pub const Core = struct {
         // Windows: cmd's own commands need the sandbox's own drive letters
         if (win) {
             var r = req;
-            // (its home, which is never empty: some Windows' dir says an
-            // empty folder is an error)
-            r.command = "dir /b \"%USERPROFILE%\" >nul";
+            // (in its home: a file made, renamed and deleted, the commands
+            // that ask the drive. Not a dir of a folder: an empty one is
+            // an error to some Windows, and Windows Server 2025's dir
+            // refused the home drive's root on CI where these worked)
+            r.command = "cd /d \"%USERPROFILE%\" && echo x> harness-env-check.txt && ren harness-env-check.txt harness-env-check2.txt && del harness-env-check2.txt";
             if (sandbox.run(tenv, a, r)) |o| {
-                if (!o.is_error) try out.appendSlice(a, "cmd's own dir, del, ren, copy, move: yes\n") else try out.print(a, "cmd's own dir, del, ren, copy, move: no (they need Windows' Secondary Logon service, which gives the sandbox drive letters of its own; Windows' error the last time it refused: {d}; dir said: {s}. Programs and the agent's file tools work without it)\n", .{ @import("proc.zig").last_session_error.load(.acquire), util.cut(std.mem.trim(u8, o.text, " \r\n"), 200) });
+                if (!o.is_error) try out.appendSlice(a, "cmd's own dir, del, ren, copy, move: yes\n") else try out.print(a, "cmd's own dir, del, ren, copy, move: no (they need Windows' Secondary Logon service, which gives the sandbox drive letters of its own; Windows' error the last time it refused: {d}; the try said: {s}. Programs and the agent's file tools work without it)\n", .{ @import("proc.zig").last_session_error.load(.acquire), util.cut(std.mem.trim(u8, o.text, " \r\n"), 200) });
             } else |err| try out.print(a, "cmd's own dir, del, ren, copy, move: not tried ({s})\n", .{@errorName(err)});
         }
         if (odd == 0) try out.appendSlice(a, "As environments.ini says.") else try out.print(a, "{d} not as environments.ini says (outside: is this machine online?).", .{odd});
