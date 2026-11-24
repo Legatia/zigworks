@@ -12,6 +12,8 @@ environments (gap 2), the open Windows items and the hosted design notes.
 Spec: `docs/superpowers/specs/2026-11-24-harness-money-budget-and-sandbox-default-design.md`.
 It has been builder-checked against the code.
 
+**Approved by the owner on 2026-11-24 ("Approve 1"): build it.** The Mac session is building Part 1 on `platform/money-budget`.
+
 **Part 2 (unattended runs in a sandbox) is yours,** since you own
 environments and the sandbox runners. In short:
 

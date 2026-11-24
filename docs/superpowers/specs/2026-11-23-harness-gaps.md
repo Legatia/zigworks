@@ -141,6 +141,15 @@ real carcloud (unit tests with harness-fake's Tesla stand-in).
 - **The hosted version** (`2026-11-22-harness-hosted-design.md`) is set
   aside: no servers rented for clients.
 
+## The desk: decisions on 2026-11-24
+
+- **A desktop app, not a page in a browser:** "It should be an desktop app,
+  not on web." The design is being revised.
+- **The female avatar is skipped for now:** "Skip female for now." Only her
+  still exists (`Neon Butler Portrait (Female).jpg`).
+- **Shipping the generated portraits and clips publicly** is the owner's call
+  before a release.
+
 ## Parked: AI avatar livestreams (owner, 2026-11-24: "not top priority")
 
 Use case: a 24-hour AI avatar livestream that sells or chats.
