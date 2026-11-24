@@ -89,6 +89,19 @@ New files: `persona.zig`, `topics.zig`, `card.zig`, `work.zig`.
   `applySetup` takes any "Settings reloaded." start as success (a persona
   note may follow it).
 
+**After the final review's fix pass:** links are built only by harness
+(`Core.Linked`: `text`, `topic`, `join`; `sendLinked`/`sendTextRich`); no
+generic send expands `{topic:NAME}` any more. An item edit can be main's
+pointer (`Edit.pointer`, `.title`: its line rebuilt in `applyEdits`).
+`agent.Post.links` and `postTextLinked` carry a routine's `{topics}`
+links (`InstRun.say_links`). `card.overviewLine(a, facts)` and
+`card.summaryLine(a, title, news)` lost their tokens. `HelperDesk.unseen`
+(state/agents/NAME/unseen) puts a quietly saved helper's file in a
+trigger's or workflow's setup question. `WorkDone.by`: only the owner's
+runs post to Work. `workflows.zig`'s `checkText` takes whether it reads
+a say step (`{topics}` is a say's, unless a step is called `topics`).
+`utf16Len` counts the text as sent (`util.validUtf8`).
+
 **Windows:** nothing new is POSIX-only except
 `persona_load_falls_back_with_a_reason`'s writable-by-others case, which
 returns before it on Windows (as agents.zig's does). Paths in the new tests

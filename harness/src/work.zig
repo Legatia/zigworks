@@ -20,10 +20,10 @@ pub const max_helpers = 8;
 
 pub const Post = struct { text: []const u8, entities: []const Entity };
 
-/// Where the request came from: its conversation (its title links there
-/// once sent: `{topic:NAME}`), and whether it was private (then only who,
-/// the step counts and the tokens).
-pub const Header = struct { conversation: []const u8, private: bool = false };
+/// Where the answer went: the conversation's title, and its link ("":
+/// none, the title goes plain); whether the run was private (then only
+/// who, the step counts and the tokens).
+pub const Header = struct { conversation: []const u8, title: []const u8 = "", url: []const u8 = "", private: bool = false };
 
 /// The post for helpers `rids` of run `parent`, from the log `text`; null
 /// when the log has none of them.
@@ -81,11 +81,9 @@ pub fn build(a: std.mem.Allocator, text: []const u8, parent: u64, rids: []const 
     for (helps) |x| if (x.found) try kept.append(a, x);
     if (kept.items.len == 0) return null;
     // the header and each helper's head, then the answers share the rest
-    const head = if (h.private)
-        try std.fmt.allocPrint(a, "A private run's helpers.\nAnswer in {{topic:{s}}}.\n", .{h.conversation})
-    else
-        try std.fmt.allocPrint(a, "For: {s}\nAnswer in {{topic:{s}}}.\n", .{ firstLine(request), h.conversation });
-    var heads: std.ArrayList([]const u8) = .empty;
+    const title = if (h.title.len > 0) h.title else h.conversation;
+    const first = if (h.private) "A private run's helpers.\nAnswer in " else try std.fmt.allocPrint(a, "For: {s}\nAnswer in ", .{try cut(a, firstLine(request), 200)});
+    const head = try std.fmt.allocPrint(a, "{s}{s}.\n", .{ first, title });
     var tin: i64 = 0;
     var tout: i64 = 0;
     var tcalls: i64 = 0;
@@ -93,27 +91,31 @@ pub fn build(a: std.mem.Allocator, text: []const u8, parent: u64, rids: []const 
         tin += x.in;
         tout += x.out;
         tcalls += x.calls;
-        const stats = try std.fmt.allocPrint(a, "{d} step{s}; {s}{s} tokens in, {s} out, {d} model call{s}{s}{s}", .{
-            x.steps,                                                                   if (x.steps == 1) "" else "s",
-            if (h.private) "" else try std.fmt.allocPrint(a, "used {s}; ", .{if (x.tools.items.len > 0) try std.mem.join(a, ", ", x.tools.items) else "no tools"}),
-            try thousands(a, x.in),                                                    try thousands(a, x.out),
-            x.calls,                                                                   if (x.calls == 1) "" else "s",
-            if (x.ended.len > 0) "; ended early: " else "",                            x.ended,
-        });
-        try heads.append(a, if (h.private)
-            try std.fmt.allocPrint(a, "{s}: {s}", .{ x.agent, stats })
-        else
-            try std.fmt.allocPrint(a, "{s}: {s}\n{s}\n", .{ x.agent, try cut(a, firstLine(x.task), 200), stats }));
     }
     const total = try std.fmt.allocPrint(a, "Altogether: {d} helper{s}, {s} tokens in, {s} out, {d} model call{s}.", .{ kept.items.len, if (kept.items.len == 1) "" else "s", try thousands(a, tin), try thousands(a, tout), tcalls, if (tcalls == 1) "" else "s" });
-    var fixed: usize = head.len + total.len;
-    for (heads.items) |x| fixed += x.len + 1;
-    // room for the topic's title in place of its token
+    // the heads with tasks cut shorter until the answers get their floor;
+    // past that, the answers share what is left
     const budget = max_post - 64;
-    const share = @max(min_answer, (budget -| fixed) / kept.items.len);
+    var task_cap: usize = 200;
+    var heads: std.ArrayList([]const u8) = .empty;
+    var fixed: usize = 0;
+    while (true) {
+        heads = .empty;
+        fixed = head.len + total.len;
+        for (kept.items) |x| {
+            const hd = try headOf(a, x.agent, x.task, x.steps, x.tools.items, x.in, x.out, x.calls, x.ended, task_cap, h.private);
+            fixed += hd.len + 1;
+            try heads.append(a, hd);
+        }
+        if (h.private or fixed + kept.items.len * min_answer <= budget or task_cap <= 24) break;
+        task_cap = task_cap * 2 / 3;
+    }
+    const share = (budget -| fixed) / kept.items.len;
     var out: std.ArrayList(u8) = .empty;
     var ents: std.ArrayList(Entity) = .empty;
-    try out.appendSlice(a, head);
+    try out.appendSlice(a, first);
+    if (h.url.len > 0) try ents.append(a, .{ .kind = .text_link, .offset = out.items.len, .len = title.len, .url = h.url });
+    try out.print(a, "{s}.\n", .{title});
     for (kept.items, heads.items) |x, hd| {
         const at = out.items.len;
         try out.appendSlice(a, hd);
@@ -123,6 +125,19 @@ pub fn build(a: std.mem.Allocator, text: []const u8, parent: u64, rids: []const 
     }
     try out.appendSlice(a, total);
     return .{ .text = out.items, .entities = ents.items };
+}
+
+/// A helper's head in the post: its definition and task, then its numbers.
+fn headOf(a: std.mem.Allocator, agent: []const u8, task: []const u8, steps: i64, used: []const []const u8, in: i64, out: i64, calls: i64, ended: []const u8, task_cap: usize, private: bool) ![]const u8 {
+    const stats = try std.fmt.allocPrint(a, "{d} step{s}; {s}{s} tokens in, {s} out, {d} model call{s}{s}{s}", .{
+        steps,                                                             if (steps == 1) "" else "s",
+        if (private) "" else try std.fmt.allocPrint(a, "used {s}; ", .{if (used.len > 0) try std.mem.join(a, ", ", used) else "no tools"}),
+        try thousands(a, in),                                              try thousands(a, out),
+        calls,                                                             if (calls == 1) "" else "s",
+        if (ended.len > 0) "; ended early: " else "",                      try cut(a, ended, 80),
+    });
+    if (private) return std.fmt.allocPrint(a, "{s}: {s}", .{ agent, stats });
+    return std.fmt.allocPrint(a, "{s}: {s}\n{s}\n", .{ agent, try cut(a, firstLine(task), task_cap), stats });
 }
 
 fn firstLine(s: []const u8) []const u8 {
@@ -199,7 +214,12 @@ test "a_post_has_a_folded_quote_per_helper" {
     const a = arena.allocator();
     const lg = try logOf(a, 2, "Two flats: Długa 5 (2,900 PLN) and Rynek 1.", false);
     const p = (try build(a, lg.text, 10, lg.rids, .{ .conversation = "travel" })).?;
-    try t.expect(std.mem.startsWith(u8, p.text, "For: Find a flat in Kraków\nAnswer in {topic:travel}.\n"));
+    try t.expect(std.mem.startsWith(u8, p.text, "For: Find a flat in Kraków\nAnswer in travel.\n"));
+    // with the topic's title and link: the title is the link
+    const linked = (try build(a, lg.text, 10, lg.rids, .{ .conversation = "travel", .title = "Travel", .url = "https://t.me/b/5002" })).?;
+    try t.expect(std.mem.startsWith(u8, linked.text, "For: Find a flat in Kraków\nAnswer in Travel.\n"));
+    try t.expectEqual(Entity.Kind.text_link, linked.entities[0].kind);
+    try t.expectEqualStrings("Travel", linked.text[linked.entities[0].offset .. linked.entities[0].offset + linked.entities[0].len]);
     var quotes: usize = 0;
     for (p.entities) |e| if (e.kind == .expandable_blockquote) {
         quotes += 1;
@@ -252,4 +272,30 @@ test "a_private_run_posts_metadata_only" {
     try t.expect(std.mem.startsWith(u8, p.text, "A private run's helpers.\n"));
     for ([_][]const u8{ "Długa", "Find a flat", "listing", "search, fetch" }) |w| try t.expect(std.mem.indexOf(u8, p.text, w) == null);
     try t.expect(std.mem.indexOf(u8, p.text, "researcher: 4 steps; 1,500 tokens in, 120 out") != null);
+}
+
+test "long_tasks_and_a_long_request_fit_one_message" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    const request: [1500]u8 = @splat('r');
+    try out.print(a, "{{\"seq\":10,\"kind\":\"turn\",\"rid\":10,\"conversation\":\"travel\",\"run\":\"chat\",\"by\":\"owner\",\"agent\":\"main\",\"text\":\"{s}\"}}\n", .{&request});
+    var seq: u64 = 10;
+    var rids: std.ArrayList(u64) = .empty;
+    const task: [400]u8 = @splat('k');
+    const answer: [1500]u8 = @splat('w');
+    for (0..max_helpers) |i| {
+        const rid: u64 = 100 * (i + 1);
+        try runLines(a, &out, &seq, rid, 10, "researcher", &task, &.{ "search", "fetch" }, &answer, false);
+        try rids.append(a, rid);
+    }
+    const p = (try build(a, out.items, 10, rids.items, .{ .conversation = "travel" })).?;
+    try t.expect(p.text.len <= max_post - 64);
+    var quotes: usize = 0;
+    for (p.entities) |e| if (e.kind == .expandable_blockquote) {
+        quotes += 1;
+        try t.expect(e.offset + e.len <= p.text.len);
+    };
+    try t.expectEqual(max_helpers, quotes);
 }

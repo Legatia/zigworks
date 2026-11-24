@@ -1112,7 +1112,11 @@ pub const Core = struct {
         c.wf_arena.deinit();
         for (c.quick.items) |q| q.deinit(c.gpa);
         c.quick.deinit(c.gpa);
-        for (c.start_edits.items) |e| c.gpa.free(e.text);
+        for (c.start_edits.items) |e| {
+            c.gpa.free(e.text);
+            c.gpa.free(e.pointer);
+            c.gpa.free(e.title);
+        }
         c.start_edits.deinit(c.gpa);
         c.inbox.deinit();
         c.quiet.deinit();
@@ -1538,13 +1542,12 @@ pub const Core = struct {
 
     /// `sendText`, without a sound when `quiet`.
     fn sendTextAs(c: *Core, conv: []const u8, text: []const u8, quiet: bool) !Sent {
-        const sent = try c.sendTextOpts(conv, text, quiet);
-        // a topic's card says what came lately (a digest is no news)
-        c.noteSent(conv, text);
-        return sent;
+        return c.sendTextOpts(conv, text, quiet);
     }
 
-    /// The last lines a topic that files a subject got (its card's Lately).
+    /// A line of harness's own, or a routine's `say`, posted in `conv`: a
+    /// topic that files a subject keeps the last three for its card's
+    /// Lately (never a run's reply, which the model wrote).
     fn noteSent(c: *Core, conv: []const u8, text: []const u8) void {
         c.convs.mutex.lockUncancelable(c.io);
         defer c.convs.mutex.unlock(c.io);
@@ -1567,7 +1570,7 @@ pub const Core = struct {
             const msg = c.fillLinks(a, if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] {s}", .{ p, text }) else text);
             var place = r.place;
             place.quiet = quiet;
-            if (c.sendLinked(ch, a, place, msg)) |sent| return sent else |e| {
+            if (ch.send(ch.ctx, place, msg)) |sent| return sent else |e| {
                 if (e == error.TopicRefused and !again) {
                     again = true;
                     c.topicRefused(conv);
@@ -1643,15 +1646,76 @@ pub const Core = struct {
         c.topics_on = me(ch.ctx) catch c.topics_on;
     }
 
-    /// `text` with each `{topic:NAME}` its topic's title, linked where the
-    /// topic is a Telegram topic of the owner's chat (topics.zig).
-    fn linked(c: *Core, a: std.mem.Allocator, text: []const u8) topics_mod.Rich {
-        if (std.mem.indexOf(u8, text, "{topic:") == null) return .{ .text = text, .entities = &.{} };
-        return topics_mod.expand(a, text, &.{}, .{ .ctx = c, .find = topicTarget }) catch .{ .text = text, .entities = &.{} };
+    /// A line harness builds with topic links in it: text, and topics
+    /// whose titles are links (`topic`). Only harness's own parts go in
+    /// as topics; anyone else's text goes in as text, a token in it too.
+    pub const Linked = struct {
+        buf: std.ArrayList(u8) = .empty,
+        ents: std.ArrayList(topics_mod.Entity) = .empty,
+
+        pub fn text(l: *Linked, a: std.mem.Allocator, s: []const u8) !void {
+            try l.buf.appendSlice(a, s);
+        }
+
+        /// Topic `name`'s title, a link where it is a topic of the
+        /// owner's chat (a subject with none yet: its title, plain).
+        pub fn topic(l: *Linked, c: *Core, a: std.mem.Allocator, name: []const u8) !void {
+            const tg = topicTarget(c, a, name) orelse topics_mod.Target{ .title = name };
+            if (tg.url.len > 0) try l.ents.append(a, .{ .kind = .text_link, .offset = l.buf.items.len, .len = tg.title.len, .url = tg.url });
+            try l.buf.appendSlice(a, tg.title);
+        }
+
+        /// Another linked line after this one's text.
+        pub fn join(l: *Linked, a: std.mem.Allocator, other: Linked) !void {
+            const at = l.buf.items.len;
+            try l.buf.appendSlice(a, other.buf.items);
+            for (other.ents.items) |e| {
+                var x = e;
+                x.offset += at;
+                try l.ents.append(a, x);
+            }
+        }
+    };
+
+    /// Sends a line harness built with its topic links (`Linked`).
+    pub fn sendLinked(c: *Core, conv: []const u8, l: Linked, quiet: bool) !Sent {
+        return c.sendTextRich(conv, l.buf.items, l.ents.items, quiet);
     }
 
-    /// A token's topic: its title and link; a subject with no topic yet,
-    /// its title alone; null: no such topic (the token stays).
+    /// `sendTextAs` with message entities of `text` (byte offsets); the
+    /// name put in front of a refused topic's post moves them along.
+    fn sendTextRich(c: *Core, conv: []const u8, text: []const u8, ents: []const topics_mod.Entity, quiet: bool) !Sent {
+        if (ents.len == 0) return c.sendTextOpts(conv, text, quiet);
+        if (mail_mod.isEmail(conv)) return c.mailSay(text, quiet);
+        const ch = c.chan orelse return error.NoChannel;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var r = try c.placeOf(a, conv);
+        var again = false;
+        while (true) {
+            const pre = if (r.prefix) |p| try std.fmt.allocPrint(a, "[{s}] ", .{p}) else "";
+            const shifted = try a.dupe(topics_mod.Entity, ents);
+            for (shifted) |*e| e.offset += pre.len;
+            const msg = try std.fmt.allocPrint(a, "{s}{s}", .{ pre, text });
+            var place = r.place;
+            place.quiet = quiet;
+            const sending = if (ch.rich) |f| f(ch.ctx, place, msg, shifted) else ch.send(ch.ctx, place, msg);
+            if (sending) |sent| return sent else |e| {
+                if (e == error.TopicRefused and !again) {
+                    again = true;
+                    c.topicRefused(conv);
+                    r = try c.placeOf(a, conv);
+                    continue;
+                }
+                c.log.write(.chat, false, .{ .event = "not delivered", .why = whyUndelivered(e), .bytes = text.len }) catch {};
+                return e;
+            }
+        }
+    }
+
+    /// A topic's title and link; a subject with no topic yet, its title
+    /// alone; null: no such topic.
     fn topicTarget(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) ?topics_mod.Target {
         const c: *Core = @ptrCast(@alignCast(ctx));
         c.convs.mutex.lockUncancelable(c.io);
@@ -1663,20 +1727,6 @@ pub const Core = struct {
         };
         const s = std.meta.stringToEnum(topics_mod.Subject, name) orelse return null;
         return .{ .title = topics_mod.title(s) };
-    }
-
-    /// Sends `text` to `place`, its topic tokens as links where the channel
-    /// sends entities.
-    fn sendLinked(c: *Core, ch: Channel, a: std.mem.Allocator, place: Place, text: []const u8) anyerror!Sent {
-        const r = c.linked(a, text);
-        if (r.entities.len > 0) if (ch.rich) |f| return f(ch.ctx, place, r.text, r.entities);
-        return ch.send(ch.ctx, place, r.text);
-    }
-
-    fn buttonsLinked(c: *Core, ch: Channel, a: std.mem.Allocator, place: Place, text: []const u8, bs: []const [2][]const u8) ?i64 {
-        const r = c.linked(a, text);
-        if (r.entities.len > 0) if (ch.buttons_rich) |f| return f(ch.ctx, place, r.text, r.entities, bs);
-        return ch.buttons(ch.ctx, place, r.text, bs);
     }
 
     /// Notes that a message came from `conv` or a post went to it.
@@ -1727,7 +1777,11 @@ pub const Core = struct {
         }
         // the messages of items voided at start
         c.applyEdits(c.start_edits.items, null);
-        for (c.start_edits.items) |e| c.gpa.free(e.text);
+        for (c.start_edits.items) |e| {
+            c.gpa.free(e.text);
+            c.gpa.free(e.pointer);
+            c.gpa.free(e.title);
+        }
         c.start_edits.clearRetainingCapacity();
     }
 
@@ -3401,12 +3455,15 @@ pub const Core = struct {
                 const by_busy = if (busy) |b| b.end <= now_s and for (said.items) |h| {
                     if (h.at < b.start or h.at > b.end) break false;
                 } else true else false;
-                var text = (if (by_busy) std.fmt.allocPrint(a, "{s}\n{s}", .{ diary_mod.busyHead(a, busy.?) catch "", quiet_mod.lines(a, said.items, c.cfg.chat.utc_offset, true) catch "" }) else quiet_mod.digestText(a, said.items, hours, c.cfg.chat.utc_offset)) catch return;
+                const text = (if (by_busy) std.fmt.allocPrint(a, "{s}\n{s}", .{ diary_mod.busyHead(a, busy.?) catch "", quiet_mod.lines(a, said.items, c.cfg.chat.utc_offset, true) catch "" }) else quiet_mod.digestText(a, said.items, hours, c.cfg.chat.utc_offset)) catch return;
+                var digest: Linked = .{};
+                digest.text(a, text) catch return;
                 if (std.mem.eql(u8, conv, "main")) if (in_topics) |line| {
-                    text = std.fmt.allocPrint(a, "{s}\n{s}", .{ text, line }) catch text;
+                    digest.text(a, "\n") catch return;
+                    digest.join(a, line) catch return;
                     topics_said = true;
                 };
-                const sent = c.sendTextOpts(conv, text, false) catch |e| {
+                const sent = c.sendLinked(conv, digest, false) catch |e| {
                     c.quiet.retry_ms = util.nowMs(c.io) + 60_000;
                     c.log.write(.chat, false, .{ .event = "digest not delivered", .conversation = conv, .why = whyUndelivered(e) }) catch {};
                     return;
@@ -3422,13 +3479,13 @@ pub const Core = struct {
         }
         // main held nothing itself: the line alone
         if (!topics_said) if (in_topics) |line| {
-            if (c.sendTextOpts("main", line, false)) |_| {} else |e| c.log.write(.chat, false, .{ .event = "digest not delivered", .conversation = "main", .why = whyUndelivered(e) }) catch {};
+            if (c.sendLinked("main", line, false)) |_| {} else |e| c.log.write(.chat, false, .{ .event = "digest not delivered", .conversation = "main", .why = whyUndelivered(e) }) catch {};
         };
     }
 
     /// "Held in topics: {topic:travel} 1, {topic:errands} 2." for what
     /// quiet hours held in topics of the owner's chat; null: nothing.
-    fn heldInTopics(c: *Core, a: std.mem.Allocator, held: []const quiet_mod.Held) !?[]const u8 {
+    fn heldInTopics(c: *Core, a: std.mem.Allocator, held: []const quiet_mod.Held) !?Linked {
         const Count = struct { conv: []const u8, n: usize };
         var counts: std.ArrayList(Count) = .empty;
         for (held) |h| {
@@ -3448,11 +3505,15 @@ pub const Core = struct {
             } else try counts.append(a, .{ .conv = h.conv, .n = 1 });
         }
         if (counts.items.len == 0) return null;
-        var out: std.ArrayList(u8) = .empty;
-        try out.appendSlice(a, "Held in topics: ");
-        for (counts.items, 0..) |x, i| try out.print(a, "{s}{{topic:{s}}} {d}", .{ if (i > 0) ", " else "", x.conv, x.n });
-        try out.append(a, '.');
-        return out.items;
+        var l: Linked = .{};
+        try l.text(a, "Held in topics: ");
+        for (counts.items, 0..) |x, i| {
+            if (i > 0) try l.text(a, ", ");
+            try l.topic(c, a, x.conv);
+            try l.text(a, try std.fmt.allocPrint(a, " {d}", .{x.n}));
+        }
+        try l.text(a, ".");
+        return l;
     }
 
     /// What follows a digest: a held question shown, a held post sent as
@@ -3468,6 +3529,7 @@ pub const Core = struct {
         const sending = if (h.buttons.len > 0 or undo != null) c.sendWithButtons(a, h.conv, h.agent, h.text, h.buttons, undo, true) else c.sendTextAs(h.conv, h.text, true);
         if (sending) |sent| {
             c.touch(h.conv);
+            if (std.mem.startsWith(u8, h.by, "harness:")) c.noteSent(h.conv, h.text);
             c.log.write(.chat, false, .{ .event = "released", .id = h.id, .message = sent.first }) catch {};
         } else |e| {
             const item = c.keepDelivery(.{ .to = h.conv, .text = h.text, .retry = worthRetry(e), .who = .{ .by = h.by, .agent = h.agent }, .rid = h.rid, .private = h.private });
@@ -3640,11 +3702,11 @@ pub const Core = struct {
         const parts = try questionParts(a, text);
         var sent: Sent = .{};
         for (parts[0 .. parts.len - 1]) |part| {
-            const s = try c.sendLinked(ch, a, r.place, part);
+            const s = try ch.send(ch.ctx, r.place, part);
             if (sent.count == 0) sent.first = s.first;
             sent.count += s.count;
         }
-        const id = c.buttonsLinked(ch, a, r.place, parts[parts.len - 1], bs) orelse return error.ButtonsNotSent;
+        const id = ch.buttons(ch.ctx, r.place, parts[parts.len - 1], bs) orelse return error.ButtonsNotSent;
         if (labels.len > 0) c.quickShown(n, id, r.place);
         if (sent.count == 0) sent.first = id;
         sent.count += 1;
@@ -3773,7 +3835,9 @@ pub const Core = struct {
 
     /// A message of an item that closed: its new text (the item's and the
     /// outcome); the buttons go.
-    const Edit = struct { chat: i64, thread: i64, message: i64, text: []const u8 };
+    /// A message's new text; `pointer`: it is main's pointer to an item
+    /// in that topic, its line rebuilt (with its link) before `text`.
+    const Edit = struct { chat: i64, thread: i64, message: i64, text: []const u8, pointer: []const u8 = "", title: []const u8 = "" };
 
     /// How an item closed: its messages' new texts, and the outcome alone.
     const Closed = struct { edits: []const Edit = &.{}, outcome: []const u8 = "" };
@@ -4001,10 +4065,12 @@ pub const Core = struct {
         const out = a.dupe(u8, said) catch return .{};
         if (out.len > 0) out[0] = std.ascii.toUpper(out[0]);
         const text = std.fmt.allocPrint(a, "{s}\n{s}", .{ if (parts.len > 0) parts[parts.len - 1] else "", out }) catch return .{ .outcome = out };
-        // main's pointer: its own line and the outcome
-        const short = std.fmt.allocPrint(a, "{s}\n{s}", .{ pointerText(a, it) catch "", out }) catch text;
+        // main's pointer: its own line (rebuilt with its link), the outcome
         var edits: std.ArrayList(Edit) = .empty;
-        for (it.shown.items) |s| edits.append(a, .{ .chat = s.chat, .thread = s.thread, .message = s.message, .text = if (s.short) short else text }) catch {};
+        for (it.shown.items) |s| edits.append(a, if (s.short)
+            .{ .chat = s.chat, .thread = s.thread, .message = s.message, .text = out, .pointer = a.dupe(u8, it.conversation) catch "", .title = a.dupe(u8, it.title) catch "" }
+        else
+            .{ .chat = s.chat, .thread = s.thread, .message = s.message, .text = text }) catch {};
         return .{ .edits = edits.items, .outcome = out };
     }
 
@@ -4017,12 +4083,19 @@ pub const Core = struct {
         for (edits) |e| {
             var buf: [conversations.max_name]u8 = undefined;
             const place: Place = .{ .name = c.convAt(&buf, e.chat, e.thread), .chat = e.chat, .thread = e.thread };
-            // a pointer's topic link stays a link
-            const r = c.linked(arena.allocator(), e.text);
-            if (r.entities.len > 0) if (ch.replace) |f| {
-                if (f(ch.ctx, place, e.message, r.text, r.entities)) |_| continue else |_| {}
-            };
-            if (ch.edit) |f| f(ch.ctx, place, e.message, r.text) else ch.clear(ch.ctx, place, e.message);
+            // main's pointer: its line again, its topic's title a link
+            if (e.pointer.len > 0) {
+                const a = arena.allocator();
+                var l = c.pointerLine(a, e.pointer, e.title) catch continue;
+                l.text(a, "\n") catch continue;
+                l.text(a, e.text) catch continue;
+                if (l.ents.items.len > 0) if (ch.replace) |f| {
+                    if (f(ch.ctx, place, e.message, l.buf.items, l.ents.items)) |_| continue else |_| {}
+                };
+                if (ch.edit) |f| f(ch.ctx, place, e.message, l.buf.items) else ch.clear(ch.ctx, place, e.message);
+                continue;
+            }
+            if (ch.edit) |f| f(ch.ctx, place, e.message, e.text) else ch.clear(ch.ctx, place, e.message);
         }
         if (ch.edit == null) if (note) |n| c.sayIn(n.conv, n.text);
     }
@@ -4043,7 +4116,20 @@ pub const Core = struct {
             any = true;
             for (closed.edits) |e| {
                 const text = c.gpa.dupe(u8, e.text) catch continue;
-                c.start_edits.append(c.gpa, .{ .chat = e.chat, .thread = e.thread, .message = e.message, .text = text }) catch c.gpa.free(text);
+                const pointer = c.gpa.dupe(u8, e.pointer) catch {
+                    c.gpa.free(text);
+                    continue;
+                };
+                const title = c.gpa.dupe(u8, e.title) catch {
+                    c.gpa.free(text);
+                    c.gpa.free(pointer);
+                    continue;
+                };
+                c.start_edits.append(c.gpa, .{ .chat = e.chat, .thread = e.thread, .message = e.message, .text = text, .pointer = pointer, .title = title }) catch {
+                    c.gpa.free(text);
+                    c.gpa.free(pointer);
+                    c.gpa.free(title);
+                };
             }
         }
         if (any) c.saveInbox();
@@ -4062,6 +4148,8 @@ pub const Core = struct {
     /// `showItem`, without a sound when `hush` (after the digest).
     fn showItemHow(c: *Core, id: u64, at: ?[]const u8, hush: bool) bool {
         const ch = c.chan orelse return false;
+        // a pointer goes to main: the topic's copy is silent (it rings once)
+        const pointer = at == null and c.wantsPointer(id);
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -4088,7 +4176,7 @@ pub const Core = struct {
             }
             bs = list;
             conv = a.dupe(u8, at orelse it.conversation) catch return false;
-            quiet = hush or std.mem.eql(u8, it.waiter, "harness");
+            quiet = hush or pointer or std.mem.eql(u8, it.waiter, "harness");
             it.showing = true;
         }
         const where = c.placeOf(a, if (c.isShared(conv)) "main" else conv) catch return c.notShown(id);
@@ -4096,15 +4184,15 @@ pub const Core = struct {
         place.quiet = quiet;
         const prefix = if (where.prefix) |p| std.fmt.allocPrint(a, "[{s}] ", .{p}) catch "" else "";
         for (parts[0 .. parts.len - 1]) |part| {
-            _ = c.sendLinked(ch, a, place, c.fillLinks(a, std.fmt.allocPrint(a, "{s}{s}", .{ prefix, part }) catch part)) catch return c.notShown(id);
+            _ = ch.send(ch.ctx, place, c.fillLinks(a, std.fmt.allocPrint(a, "{s}{s}", .{ prefix, part }) catch part)) catch return c.notShown(id);
         }
         const last = c.fillLinks(a, std.fmt.allocPrint(a, "{s}{s}", .{ prefix, parts[parts.len - 1] }) catch parts[parts.len - 1]);
         // a question answered in words only has no buttons: its message is
         // the one a reply answers
         const msg = if (bs.len == 0)
-            (c.sendLinked(ch, a, place, last) catch return c.notShown(id)).first
+            (ch.send(ch.ctx, place, last) catch return c.notShown(id)).first
         else
-            c.buttonsLinked(ch, a, place, last, bs) orelse return c.notShown(id);
+            ch.buttons(ch.ctx, place, last, bs) orelse return c.notShown(id);
         // noted; a press that came meanwhile counts only from this message
         var early_take: ?[]const u8 = null;
         var early_elsewhere: ?i64 = null;
@@ -4133,34 +4221,65 @@ pub const Core = struct {
         if (early_elsewhere) |m| c.tellOutOfDate(place.chat, place.thread, m);
         if (early_take) |k| _ = c.answerItem(id, k, null, .telegram);
         // shown in the topic it was filed in: a pointer in main
-        if (at == null) c.pointItem(id);
+        if (pointer) c.pointItem(id);
         return true;
     }
 
-    /// Item `id`, a question a routine or harness filed in a subject's
-    /// topic, gets a one-line pointer in main with the same buttons
-    /// ("Waiting on you in Errands: TITLE."); pressing either answers it,
-    /// and closing it edits both.
+    /// Whether item `id`, shown in its conversation, gets a pointer in
+    /// main: a question (approval, confirm, question, draft) of a run
+    /// nobody watches, filed in a subject's topic other than Work.
+    fn wantsPointer(c: *Core, id: u64) bool {
+        var buf: [conversations.max_name]u8 = undefined;
+        const conv = blk: {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            const it = c.inbox.find(id) orelse return false;
+            if (it.status != .open or it.choices.len == 0) return false;
+            const asks = for ([_][]const u8{ "approval", "confirm", "question", "draft" }) |k| {
+                if (std.mem.eql(u8, it.kind, k)) break true;
+            } else false;
+            if (!asks or !(who_mod.Who{ .by = it.by }).unattended()) return false;
+            if (it.conversation.len > buf.len) return false;
+            @memcpy(buf[0..it.conversation.len], it.conversation);
+            break :blk buf[0..it.conversation.len];
+        };
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        const e = c.convs.find(conv) orelse return false;
+        return e.subject.len > 0 and !std.mem.eql(u8, e.subject, "work") and e.thread != 0 and !e.refused;
+    }
+
+    /// main's pointer to a question filed in `topic`: "Waiting on you in
+    /// Errands: TITLE." (the topic's title a link; the item's title text).
+    fn pointerLine(c: *Core, a: std.mem.Allocator, topic: []const u8, title_in: []const u8) !Linked {
+        const title = std.mem.trim(u8, title_in, " \t\r\n");
+        var l: Linked = .{};
+        try l.text(a, "Waiting on you in ");
+        try l.topic(c, a, topic);
+        try l.text(a, ": ");
+        try l.text(a, title);
+        if (!(title.len > 0 and std.mem.indexOfScalar(u8, ".?!", title[title.len - 1]) != null)) try l.text(a, ".");
+        return l;
+    }
+
+    /// Item `id`'s one-line pointer in main with the same buttons;
+    /// pressing either answers it, and closing it edits both.
     fn pointItem(c: *Core, id: u64) void {
         const ch = c.chan orelse return;
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        var text: []const u8 = "";
         var conv: []const u8 = "";
+        var title: []const u8 = "";
         var quiet = false;
         var bs: []const [2][]const u8 = &.{};
         {
             c.inbox.mutex.lockUncancelable(c.io);
             defer c.inbox.mutex.unlock(c.io);
             const it = c.inbox.find(id) orelse return;
-            if (it.status != .open or it.choices.len == 0) return;
-            const asks = for ([_][]const u8{ "approval", "confirm", "question", "draft" }) |k| {
-                if (std.mem.eql(u8, it.kind, k)) break true;
-            } else false;
-            if (!asks or !(who_mod.Who{ .by = it.by }).unattended()) return;
+            if (it.status != .open) return;
             conv = a.dupe(u8, it.conversation) catch return;
-            text = pointerText(a, it) catch return;
+            title = a.dupe(u8, it.title) catch return;
             quiet = std.mem.eql(u8, it.waiter, "harness");
             const list = a.alloc([2][]const u8, it.choices.len) catch return;
             for (it.choices, list) |choice, *b| {
@@ -4169,17 +4288,11 @@ pub const Core = struct {
             }
             bs = list;
         }
-        // a topic that files a subject, not Work
-        {
-            c.convs.mutex.lockUncancelable(c.io);
-            defer c.convs.mutex.unlock(c.io);
-            const e = c.convs.find(conv) orelse return;
-            if (e.subject.len == 0 or std.mem.eql(u8, e.subject, "work") or e.thread == 0 or e.refused) return;
-        }
+        const line = c.pointerLine(a, conv, title) catch return;
         const where = c.placeOf(a, "main") catch return;
         var place = where.place;
         place.quiet = quiet;
-        const msg = c.buttonsLinked(ch, a, place, text, bs) orelse return;
+        const msg = (if (line.ents.items.len > 0) if (ch.buttons_rich) |f| f(ch.ctx, place, line.buf.items, line.ents.items, bs) else ch.buttons(ch.ctx, place, line.buf.items, bs) else ch.buttons(ch.ctx, place, line.buf.items, bs)) orelse return;
         c.inbox.mutex.lockUncancelable(c.io);
         defer c.inbox.mutex.unlock(c.io);
         const it = c.inbox.find(id) orelse return;
@@ -4823,14 +4936,7 @@ pub const Core = struct {
 
     /// `what` in parts that each fit one message with their heading ("Allow
     /// this? (2/3)"), cut after a line break near the end where there is one.
-    /// main's line for an item filed in topic `it.conversation`.
-fn pointerText(a: std.mem.Allocator, it: *const inbox_mod.Item) ![]const u8 {
-    const title = std.mem.trim(u8, it.title, " \t\r\n");
-    const end = if (title.len > 0 and std.mem.indexOfScalar(u8, ".?!", title[title.len - 1]) != null) "" else ".";
-    return std.fmt.allocPrint(a, "Waiting on you in {{topic:{s}}}: {s}{s}", .{ it.conversation, title, end });
-}
-
-fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
+    fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
         const room = message_max - 32;
         var out: std.ArrayList([]const u8) = .empty;
         var rest = what;
@@ -5003,7 +5109,7 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
             .written = &c.written,
             .snaps = &c.snaps,
             .defs = &c.defs,
-            .helpers = .{ .ctx = c, .why = Helpers.why, .saved = Helpers.saved },
+            .helpers = .{ .ctx = c, .why = Helpers.why, .saved = Helpers.saved, .unseen = Helpers.unseen },
             .work = .{ .ctx = c, .post = WorkTopic.post },
             .registry = c.registry(),
             .hush = .{ .ctx = c, .why = hushWhy },
@@ -5481,6 +5587,9 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
         /// Its routine's subject (topics.zig): an urgent alert it posts in
         /// main leaves a record line in that topic; "": none.
         subject: []const u8 = "",
+        /// A routine's `say` (harness's words, not the model's): its posts
+        /// count for a topic card's Lately.
+        lately: bool = false,
 
         fn outbox(o: *RunOut) agent.Outbox {
             return .{ .ctx = o, .find = find, .names = names, .post = post };
@@ -5620,7 +5729,13 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
         const alert = Emergency.post(c, a, o, p, text);
         const extra = undo.button orelse if (alert) |al| al.button else null;
         if (c.overHourly(a, p.to)) |why| return .{ .status = .held, .why = why };
-        const sending = if (p.buttons.len > 0 or extra != null) c.sendWithButtons(a, p.to, o.agent, text, p.buttons, extra, hush) else c.sendTextAs(p.to, text, hush);
+        // a routine's {topics}: harness's links, moved past the tag
+        const links = if (p.links.len > 0 and std.mem.startsWith(u8, text, o.tag) and std.mem.eql(u8, text[o.tag.len..][0..@min(p.text.len, text.len - o.tag.len)], p.text)) blk: {
+            const l = a.dupe(topics_mod.Entity, p.links) catch break :blk &[_]topics_mod.Entity{};
+            for (l) |*e| e.offset += o.tag.len;
+            break :blk l;
+        } else &[_]topics_mod.Entity{};
+        const sending = if (p.buttons.len > 0 or extra != null) c.sendWithButtons(a, p.to, o.agent, text, p.buttons, extra, hush) else c.sendTextRich(p.to, text, links, hush);
         const sent = sending catch |e| {
             // kept as an item, to be sent again as it is: nothing runs again for it
             const r = o.run;
@@ -5639,6 +5754,7 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
             return .{ .status = if (worthRetry(e)) .kept else .failed, .why = whyUndelivered(e), .item = id };
         };
         c.touch(p.to);
+        if (o.lately) c.noteSent(p.to, p.text);
         if (alert) |al| {
             Emergency.sent(c, a, al.id, p.to, sent);
             // its subject's topic keeps a line for the record
@@ -6235,10 +6351,11 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
         c.awayDue(now_s);
         // quiet hours over: what they held, a digest per conversation
         c.quietDue(now_s);
-        // each topic's card, at most once a minute (Topics)
-        Topics.cardsDue(c, now_s);
         // urgent alerts nobody is on: the household in turn, a fallback
         Emergency.due(c, now_s);
+        // each topic's card, at most once a minute (Topics): after the
+        // alerts, so a Telegram outage never holds them up
+        Topics.cardsDue(c, now_s);
         // due triggers are polled, one at a time, on a thread of their own
         if (c.poller_on) c.startPoller(now_s);
         // the daily summaries, where triggers are polled, on a thread of their own
@@ -7593,6 +7710,7 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
             return;
         };
         c.touch(conv);
+        c.noteSent(conv, text);
     }
 
     /// A gift idea for week line `l`: a search for its one interest (as a
@@ -8403,7 +8521,7 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
         var run = c.runIn(&client, try std.fmt.allocPrint(a, "trigger {s}", .{tr.name}), .{ .by = try std.fmt.allocPrint(a, "trigger:{s}", .{tr.name}), .agent = tr.agent }, tr.to, &flag);
         run.start_marks = try c.triggerMarks(a, tr, events);
         var sched: Sched = .{};
-        var out: RunOut = .{ .core = c, .tag = if (tr.tag) try std.fmt.allocPrint(a, "[{s}] ", .{tr.name}) else "", .agent = tr.agent, .sched = &sched, .run = &run, .asked = by_hand, .subject = tr.subject };
+        var out: RunOut = .{ .core = c, .tag = if (tr.tag) try std.fmt.allocPrint(a, "[{s}] ", .{tr.name}) else "", .agent = tr.agent, .sched = &sched, .run = &run, .asked = by_hand, .subject = tr.subject, .lately = true };
         run.outbox = out.outbox();
         try run.logRun(.trigger, false, .{ .name = tr.name, .event = "start", .events = try idsOf(a, events) });
         const got = try agent.postReply(&run, a, text.items);
@@ -9117,7 +9235,20 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
             any = true;
             for (closed.edits) |e| {
                 const text = c.gpa.dupe(u8, e.text) catch continue;
-                c.start_edits.append(c.gpa, .{ .chat = e.chat, .thread = e.thread, .message = e.message, .text = text }) catch c.gpa.free(text);
+                const pointer = c.gpa.dupe(u8, e.pointer) catch {
+                    c.gpa.free(text);
+                    continue;
+                };
+                const title = c.gpa.dupe(u8, e.title) catch {
+                    c.gpa.free(text);
+                    c.gpa.free(pointer);
+                    continue;
+                };
+                c.start_edits.append(c.gpa, .{ .chat = e.chat, .thread = e.thread, .message = e.message, .text = text, .pointer = pointer, .title = title }) catch {
+                    c.gpa.free(text);
+                    c.gpa.free(pointer);
+                    c.gpa.free(title);
+                };
             }
         }
         if (any) c.saveInbox();
@@ -10133,6 +10264,7 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
                 continue;
             };
             c.touch(conv);
+            c.noteSent(conv, text);
             c.log.write(.chat, false, .{ .event = "diary", .line = @tagName(l.kind), .id = l.event.id, .start = l.event.start, .message = sent.first }) catch {};
         }
     }
@@ -10695,6 +10827,7 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
             return;
         };
         c.touch(conv);
+        c.noteSent(conv, text);
         c.log.write(.chat, false, .{ .event = "away summary", .notes = notes.len, .message = sent.first }) catch {};
     }
 
@@ -10762,6 +10895,7 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
             return;
         };
         c.touch(conv);
+        c.noteSent(conv, text);
     }
 
     /// A parcel left while you're away (the deliveries' "delivered"), for
@@ -11177,9 +11311,11 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
                 status.items[i] = .{ .key = key, .text = text, .at = now_s };
                 if (!std.mem.eql(u8, old, text)) if (c.statusChange(a, l, old, text)) |line| {
                     const conv = c.subjectConv(a, "travel");
-                    _ = c.sendTextAs(conv, line, false) catch |e| {
+                    if (c.sendTextAs(conv, line, false)) |_| {
+                        c.noteSent(conv, line);
+                    } else |e| {
                         _ = c.keepDelivery(.{ .to = conv, .text = line, .retry = worthRetry(e) });
-                    };
+                    }
                     c.log.write(.chat, false, .{ .event = "flight status", .flight = l.number }) catch {};
                 };
             } else try status.append(a, .{ .key = key, .text = text, .at = now_s });
@@ -11222,6 +11358,7 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
             return;
         };
         c.touch(conv);
+        c.noteSent(conv, text);
     }
 
     /// `/trips`: the trips coming or under way.
@@ -14367,6 +14504,8 @@ const InstRun = struct {
     flag: *std.atomic.Value(bool),
     /// The value a fill missed.
     missing: []const u8 = "",
+    /// A say step's `{topics}` links (offsets in its text); none else.
+    say_links: []const topics_mod.Entity = &.{},
     /// The last step run's id in the log (its step line carries it).
     rid: u64 = 0,
     /// An approve step with yes was answered yes in this item: the next
@@ -14542,12 +14681,25 @@ const InstRun = struct {
         return switch (s.action) {
             .tool => |tl| workflows.fillJson(r.a, tl.json, v, &r.missing),
             .say => |text| blk: {
-                // {topics}: a line per topic with news (the morning summary)
-                if (std.mem.indexOf(u8, text, "{topics}") == null or v != .object) break :blk workflows.fillText(r.a, text, v, &r.missing);
+                r.say_links = &.{};
+                // {topics}: a line per topic with news (the morning summary),
+                // unless a step is called topics
+                if (std.mem.indexOf(u8, text, "{topics}") == null or v != .object or r.w.find("topics") != null) break :blk workflows.fillText(r.a, text, v, &r.missing);
+                // a mark no value can hold, then the lines in its place,
+                // their links where they land
+                var raw: [12]u8 = undefined;
+                r.c.io.random(&raw);
+                const mark = try std.fmt.allocPrint(r.a, "\x00{s}\x00", .{std.fmt.bytesToHex(raw, .lower)});
                 var obj = try v.object.clone(r.a);
-                const lines = r.c.masks.scrubAlloc(r.a, Topics.summaryLines(r.c, r.a, true) catch "") catch "";
-                try obj.put(r.a, "topics", .{ .string = if (lines.len > 0) try std.fmt.allocPrint(r.a, "\n{s}", .{lines}) else "" });
-                break :blk workflows.fillText(r.a, text, .{ .object = obj }, &r.missing);
+                try obj.put(r.a, "topics", .{ .string = mark });
+                const filled = try workflows.fillText(r.a, text, .{ .object = obj }, &r.missing);
+                const at = std.mem.indexOf(u8, filled, mark) orelse break :blk filled;
+                const lines = Topics.summaryLines(r.c, r.a, true) catch Core.Linked{};
+                if (lines.buf.items.len == 0) break :blk try std.mem.concat(r.a, u8, &.{ filled[0..at], filled[at + mark.len ..] });
+                const links = try r.a.dupe(topics_mod.Entity, lines.ents.items);
+                for (links) |*e| e.offset += at + 1;
+                r.say_links = links;
+                break :blk try std.mem.concat(r.a, u8, &.{ filled[0..at], "\n", lines.buf.items, filled[at + mark.len ..] });
             },
             .approve, .review => |text| workflows.fillText(r.a, text, v, &r.missing),
             .do => |text| blk: {
@@ -15075,13 +15227,13 @@ const InstRun = struct {
         defer client.deinit();
         var ask = try r.asker(s);
         var run = r.stepRun(&client, s, &ask);
-        var out: Core.RunOut = .{ .core = r.c, .tag = if (r.w.tag) r.tag() else "", .agent = "", .run = &run, .subject = r.w.subject };
+        var out: Core.RunOut = .{ .core = r.c, .tag = if (r.w.tag) r.tag() else "", .agent = "", .run = &run, .subject = r.w.subject, .lately = true };
         run.outbox = out.outbox();
         try run.logRun(.workflow, false, .{ .instance = r.id, .event = "step", .step = s.name, .@"try" = r.st.try_n });
         r.rid = run.rid;
         // a fallback made the call before it: said first, plainly
         const text = if (r.st.absent > 0) try std.fmt.allocPrint(r.a, "No one answered in {s}: {s}", .{ try Emergency.minutesWords(r.a, r.st.absent), r.st.call }) else r.st.call;
-        const got = try agent.postText(&run, r.a, text);
+        const got = try agent.postTextLinked(&run, r.a, text, if (r.st.absent == 0) r.say_links else &.{});
         r.st.absent = 0;
         if (ask.deferred) return r.deferred(&ask);
         if (r.flag.load(.acquire)) return .stopped;
@@ -15944,6 +16096,8 @@ const Recorder = struct {
     /// setMySettings fails.
     topics_now: bool = true,
     settings_fail: bool = false,
+    /// While set, setMySettings answers ok and changes nothing.
+    settings_noop: bool = false,
     /// While set, Telegram opens no topic.
     topics_fail: bool = false,
     /// While set, a send to a topic is refused (Telegram lost the topic).
@@ -16062,7 +16216,7 @@ const Recorder = struct {
         r.mutex.lockUncancelable(t.io);
         defer r.mutex.unlock(t.io);
         if (r.settings_fail) return error.TelegramRefused;
-        r.topics_now = on;
+        if (!r.settings_noop) r.topics_now = on;
         try r.note(.{ .name = "(settings)" }, try std.fmt.allocPrint(t.allocator, "SETTINGS topics {s}", .{if (on) "on" else "off"}));
     }
 
@@ -25343,11 +25497,13 @@ const Emergency = struct {
         const first = std.mem.trimEnd(u8, util.cut(firstLine(text), 300), " .!");
         var cb: [8]u8 = undefined;
         const line = std.fmt.allocPrint(a, "{s} at {s}. Alerted in {s}.", .{ first, quiet_mod.clock(&cb, c.now(), c.cfg.chat.utc_offset), conv }) catch return;
-        _ = c.sendTextAs(topic, c.masks.scrubAlloc(a, line) catch return, true) catch |e| {
+        const masked = c.masks.scrubAlloc(a, line) catch return;
+        _ = c.sendTextAs(topic, masked, true) catch |e| {
             c.log.write(.alert, false, .{ .event = "record not delivered", .conversation = topic, .why = whyUndelivered(e) }) catch {};
             return;
         };
         c.touch(topic);
+        c.noteSent(topic, masked);
     }
 
     /// Alert `id`'s post went out as `sent` in `conv`: a reply to it, or a
@@ -27215,6 +27371,7 @@ const Errands = struct {
             return;
         };
         c.touch(conv);
+        c.noteSent(conv, text);
     }
 
     /// Said in `conv` to the owner, or to member `member` there.
@@ -30109,10 +30266,16 @@ const Evening = struct {
             if (read(c, a, c.cfg.mail.server, "mail_list", input)) |s| f.bills = evening_mod.billsLine(a, s) catch null;
         }
         f.waiting = waiting(c);
-        var text: []const u8 = c.masks.scrubAlloc(a, evening_mod.text(a, f) catch return) catch return;
+        const base = c.masks.scrubAlloc(a, evening_mod.text(a, f) catch return) catch return;
         // a line per topic with news, each linking to its topic
-        const topic_lines = c.masks.scrubAlloc(a, Topics.summaryLines(c, a, !by_hand) catch "") catch "";
-        if (topic_lines.len > 0) text = if (text.len > 0) (std.fmt.allocPrint(a, "{s}\n{s}", .{ text, topic_lines }) catch text) else topic_lines;
+        const topic_lines = Topics.summaryLines(c, a, !by_hand) catch Core.Linked{};
+        var msg: Core.Linked = .{};
+        msg.text(a, base) catch return;
+        if (topic_lines.buf.items.len > 0) {
+            if (base.len > 0) msg.text(a, "\n") catch return;
+            msg.join(a, topic_lines) catch return;
+        }
+        const text = msg.buf.items;
         if (!by_hand) {
             // said before it is sent: a crash never sends it twice
             c.evening_said.store(day, .release);
@@ -30136,7 +30299,7 @@ const Evening = struct {
             c.log.write(.chat, false, .{ .event = "held", .id = id, .conversation = "main", .by = by }) catch {};
             return;
         };
-        const sent = c.sendTextAs("main", text, silent) catch |e| {
+        const sent = c.sendLinked("main", msg, silent) catch |e| {
             const item = c.keepDelivery(.{ .to = "main", .text = text, .retry = worthRetry(e), .who = .{ .by = by, .agent = "" }, .label = "evening", .private = c.convPrivate("main") });
             c.log.write(.chat, false, .{ .event = "evening", .lines = lines, .delivered = false, .why = whyUndelivered(e), .item = item }) catch {};
             return;
@@ -30371,6 +30534,8 @@ const Manner = struct {
         }
         c.defs.remove("butler") catch |e| c.log.write(.agent, false, .{ .event = "not removed", .name = "butler", .why = @errorName(e) }) catch {};
         c.loadPersona();
+        // the question setup asks is answered by the old one
+        if (c.setupPath(a, "manner")) |mp| util.writeReplace(c.io, mp, "asked\n") catch {} else |_| {}
         c.log.write(.config, false, .{ .event = "persona", .set = "migrated", .preset = "butler" }) catch {};
         c.sayAtStart(std.fmt.allocPrint(a, "Your butler's manner is now persona.md (preset: butler, {s}{s}); main answers here again. /persona shows it.", .{ if (addr.name != null) "address: " else "plainly", addr.name orelse "" }) catch return);
     }
@@ -30612,6 +30777,8 @@ test "an_unedited_butler_definition_becomes_persona_md" {
     try restart(&f);
     try t.expectEqualStrings("---\npreset: butler\n---\n", fileText(&f, f.core.paths.persona));
     try f.rec.waitIn("main", "Your butler's manner is now persona.md (preset: butler, plainly)");
+    // answered already: setup doesn't ask how to address you again
+    try t.expect(!Manner.open(f.core));
 }
 
 test "an_edited_butler_definition_is_left_alone" {
@@ -32227,15 +32394,16 @@ const WorkTopic = struct {
     /// agent.WorkSink.post: filed in Work when topics are in use.
     fn post(ctx: *anyopaque, a: std.mem.Allocator, d: agent.WorkDone) void {
         const c: *Core = @ptrCast(@alignCast(ctx));
+        // only the owner's own runs, in conversations only they read
+        if (!std.mem.eql(u8, d.by, "owner") or c.isShared(d.conversation)) return;
         const conv = c.subjectConv(a, "work");
         if (std.mem.eql(u8, conv, "main")) return;
         const ch = c.chan orelse return;
-        const p = build(c, a, d.parent, d.helpers, d.conversation, d.private) orelse return;
-        const r = topics_mod.expand(a, p.text, p.entities, .{ .ctx = c, .find = Core.topicTarget }) catch return;
+        const p = build(c, a, d.parent, d.helpers, d.conversation, d.private, true) orelse return;
         const where = c.placeOf(a, conv) catch return;
         var place = where.place;
         place.quiet = true;
-        const sent = if (ch.rich) |f| f(ch.ctx, place, r.text, r.entities) else ch.send(ch.ctx, place, r.text);
+        const sent = if (ch.rich) |f| f(ch.ctx, place, p.text, p.entities) else ch.send(ch.ctx, place, p.text);
         if (sent) |x| {
             c.touch(conv);
             c.log.write(.chat, false, .{ .event = "work", .conversation = conv, .parent = d.parent, .helpers = d.helpers.len, .message = x.first }) catch {};
@@ -32244,10 +32412,11 @@ const WorkTopic = struct {
 
     /// The post for helpers `rids` of run `parent`, from the log's last
     /// 4 MB, masked.
-    fn build(c: *Core, a: std.mem.Allocator, parent: u64, rids: []const u64, conv: []const u8, private: bool) ?work_mod.Post {
+    fn build(c: *Core, a: std.mem.Allocator, parent: u64, rids: []const u64, conv: []const u8, private: bool, link: bool) ?work_mod.Post {
         const text = session.tail(c.io, a, c.paths.log, 4 << 20) catch return null;
         const masked = c.masks.scrubAlloc(a, text) catch return null;
-        return work_mod.build(a, masked, parent, rids, .{ .conversation = conv, .private = private }) catch null;
+        const tg = Core.topicTarget(c, a, conv) orelse topics_mod.Target{ .title = conv };
+        return work_mod.build(a, masked, parent, rids, .{ .conversation = conv, .title = tg.title, .url = if (link) tg.url else "", .private = private }) catch null;
     }
 
     /// `/work`: the latest delegated run here, its post as plain text.
@@ -32263,7 +32432,7 @@ const WorkTopic = struct {
             var kids: std.ArrayList(u64) = .empty;
             for (all) |k| if (k.parent) |p| if (p == r.rid) try kids.append(a, k.rid);
             if (kids.items.len == 0) continue;
-            const p = build(c, a, r.rid, kids.items, conv, c.convPrivate(conv)) orelse return none;
+            const p = build(c, a, r.rid, kids.items, conv, c.convPrivate(conv), false) orelse return none;
             return work_mod.plain(p);
         }
         return none;
@@ -32296,7 +32465,9 @@ const Helpers = struct {
                 for (w.steps) |st| if (eql(u8, st.agent, name)) return "a workflow step names it";
             }
             const who = std.fmt.allocPrint(a, "agent:{s}", .{name}) catch return "out of memory";
-            for (c.rule_list) |ru| if (ru.section) |sec| if (rules.glob(sec, who)) return "a section of the rules names it";
+            _ = who;
+            // a section for every definition ([agent]) or this one, globs too
+            for (c.rule_list) |ru| if (ru.section) |sec| if (who_mod.matchesAgent(sec, name)) return "a section of the rules names it";
         }
         {
             c.convs.mutex.lockUncancelable(c.io);
@@ -32341,6 +32512,10 @@ const Helpers = struct {
     /// agent.HelperDesk.saved: the save's SHA-256 kept; a quiet one told.
     fn saved(ctx: *anyopaque, a: std.mem.Allocator, sv: agent.HelperSaved) void {
         const c: *Core = @ptrCast(@alignCast(ctx));
+        // saved without asking: unseen until a setup question shows it
+        if (unseenPath(c, a, sv.name)) |up| {
+            if (sv.told and sv.kind != .retired) util.writeReplace(c.io, up, "unseen\n") catch {} else Io.Dir.cwd().deleteFile(c.io, up) catch {};
+        } else |_| {}
         if (sv.kind != .retired) {
             const path = savesPath(c, a, sv.name) catch return;
             Io.Dir.cwd().createDirPath(c.io, std.fs.path.dirname(path) orelse return) catch return;
@@ -32357,7 +32532,7 @@ const Helpers = struct {
             .retired => std.fmt.allocPrint(a, "Retired {s}.", .{sv.name}),
         } catch return;
         const key = if (c.log.key) |*k| k else {
-            c.sayIn(c.subjectConv(a, "work"), text);
+            _ = c.sendTextAs(c.subjectConv(a, "work"), text, true) catch {};
             return;
         };
         // its record: the button names it
@@ -32376,6 +32551,24 @@ const Helpers = struct {
         _ = c.sendWithButtons(a, c.subjectConv(a, "work"), "", text, &.{}, button, true) catch |e| {
             c.log.write(.agent, false, .{ .event = "not told", .name = sv.name, .why = whyUndelivered(e) }) catch {};
         };
+    }
+
+    fn unseenPath(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        const dir = try std.fs.path.join(a, &.{ c.paths.agents_state, name });
+        try Io.Dir.cwd().createDirPath(c.io, dir);
+        return std.fs.path.join(a, &.{ dir, "unseen" });
+    }
+
+    /// agent.HelperDesk.unseen: the whole file of a helper main saved
+    /// without asking that no question showed yet (seen from now on).
+    fn unseen(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        const up = std.fs.path.join(a, &.{ c.paths.agents_state, name, "unseen" }) catch return null;
+        _ = Io.Dir.cwd().statFile(c.io, up, .{}) catch return null;
+        const path = std.fs.path.join(a, &.{ c.paths.agents, std.fmt.allocPrint(a, "{s}.md", .{name}) catch return null }) catch return null;
+        const text = Io.Dir.cwd().readFileAlloc(c.io, path, a, .limited(1 << 20)) catch return null;
+        Io.Dir.cwd().deleteFile(c.io, up) catch {};
+        return text;
     }
 
     /// Keeps a helper button's tokens apart from a run's Undo's.
@@ -32491,7 +32684,10 @@ const Topics = struct {
                 c.log.write(.config, false, .{ .event = "topics not switched on", .why = @errorName(e) }) catch {};
                 return .{ .said = botfather, .offer = .next };
             };
-            c.topics_on = true;
+            // asked again: only what Telegram says now counts
+            c.topics_on = false;
+            c.readTopicsOn();
+            if (!c.topics_on) return .{ .said = botfather, .offer = .next };
             c.log.write(.config, false, .{ .event = "topics on" }) catch {};
         }
         const chat = blk: {
@@ -32507,7 +32703,7 @@ const Topics = struct {
                 if (c.convs.bySubject(name) != null) continue;
                 // a topic of the owner's of that name already: it files the subject
                 if (c.convs.find(name)) |e| if (e.thread != 0 and e.audience == .own) {
-                    try c.convs.setTopic(name, if (e.title.len > 0) e.title else topics_mod.title(s), topics_mod.focus(s), name);
+                    try c.convs.setTopic(name, if (e.title.len > 0) e.title else topics_mod.title(s), if (e.focus.len > 0) e.focus else topics_mod.focus(s), name);
                     continue;
                 };
             }
@@ -32600,12 +32796,13 @@ const Topics = struct {
     /// The summaries' lines: one per topic with news since the last
     /// summary (state/topics-said keeps what each said), ending with the
     /// topic's title as a link; "" for none. `record`: noted as said.
-    fn summaryLines(c: *Core, a: std.mem.Allocator, record: bool) ![]const u8 {
-        if (!c.topics_on) return "";
+    fn summaryLines(c: *Core, a: std.mem.Allocator, record: bool) !Core.Linked {
+        var l: Core.Linked = .{};
+        if (!c.topics_on) return l;
         const path = try std.fs.path.join(a, &.{ c.paths.state, "topics-said" });
         const before = c.readOr(a, path);
         var after: std.ArrayList(u8) = .empty;
-        var lines: std.ArrayList([]const u8) = .empty;
+        var n: usize = 0;
         for (try carded(c, a)) |x| {
             const f = try facts(c, a, x.name, x.subject, x.title, x.lately);
             const news = (try card_mod.newsOf(a, f)) orelse continue;
@@ -32614,10 +32811,15 @@ const Topics = struct {
             const key = try std.fmt.allocPrint(a, "{s} {s}\n", .{ x.name, &std.fmt.bytesToHex(h, .lower) });
             try after.appendSlice(a, key);
             if (std.mem.indexOf(u8, before, key) != null) continue;
-            try lines.append(a, try card_mod.summaryLine(a, x.name, x.title, news));
+            if (n > 0) try l.text(a, "\n");
+            n += 1;
+            try l.text(a, try c.masks.scrubAlloc(a, try card_mod.summaryLine(a, x.title, news)));
+            try l.text(a, " (");
+            try l.topic(c, a, x.name);
+            try l.text(a, ")");
         }
-        if (record and lines.items.len > 0) util.writeReplace(c.io, path, after.items) catch |e| c.log.write(.chat, false, .{ .event = "topics said not written", .why = @errorName(e) }) catch {};
-        return std.mem.join(a, "\n", lines.items);
+        if (record and n > 0) util.writeReplace(c.io, path, after.items) catch |e| c.log.write(.chat, false, .{ .event = "topics said not written", .why = @errorName(e) }) catch {};
+        return l;
     }
 
     /// A topic that has a card: it files a subject other than Work.
@@ -32644,7 +32846,8 @@ const Topics = struct {
         defer arena.deinit();
         const a = arena.allocator();
         for (carded(c, a) catch return) |x| {
-            if (x.card != 0 and now_s - x.card_s < 60) continue;
+            // at most once a minute: an edit, or a post that failed
+            if (x.card_s != 0 and now_s - x.card_s < 60) continue;
             const text = card_mod.text(a, facts(c, a, x.name, x.subject, x.title, x.lately) catch continue) catch continue;
             var h: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(text, &h, .{});
@@ -32663,7 +32866,7 @@ const Topics = struct {
                     continue;
                 }
             }
-            _ = postCard(c, a, x.name, text, now_s);
+            if (postCard(c, a, x.name, text, now_s) == null) noteCard(c, x.name, 0, now_s, x.hash);
         }
     }
 
@@ -32671,22 +32874,28 @@ const Topics = struct {
         c.convs.mutex.lockUncancelable(c.io);
         defer c.convs.mutex.unlock(c.io);
         const e = c.convs.find(name) orelse return;
+        // 0: the card is dropped (gone, or not posted): a new one next time
         if (e.card != card) c.convs.setCard(name, card) catch |err| c.log.write(.chat, false, .{ .event = "card not written", .conversation = name, .why = @errorName(err) }) catch {};
         e.card_s = at;
         e.card_hash = h;
     }
 
-    /// Posts `text` as topic `name`'s card, without a sound, and pins it.
+    /// Posts `text` as topic `name`'s card, without a sound, and pins it;
+    /// never in main: a topic Telegram refused (or one gone) has no card
+    /// until it is back, and main is told once (topicRefused). Null: not
+    /// posted (tried again a minute later).
     fn postCard(c: *Core, a: std.mem.Allocator, name: []const u8, text: []const u8, now_s: i64) ?i64 {
         const ch = c.chan orelse return null;
-        const sent = c.sendTextOpts(name, text, true) catch |e| {
+        const where = c.placeOf(a, name) catch return null;
+        if (where.prefix != null or where.place.thread == 0) return null;
+        var place = where.place;
+        place.quiet = true;
+        const sent = ch.send(ch.ctx, place, text) catch |e| {
+            if (e == error.TopicRefused) c.topicRefused(name);
             c.log.write(.chat, false, .{ .event = "card not posted", .conversation = name, .why = whyUndelivered(e) }) catch {};
             return null;
         };
-        if (ch.pin) |pin| {
-            const where = c.placeOf(a, name) catch return sent.first;
-            pin(ch.ctx, where.place, sent.first) catch |e| c.log.write(.chat, false, .{ .event = "card not pinned", .conversation = name, .why = whyUndelivered(e) }) catch {};
-        }
+        if (ch.pin) |pin| pin(ch.ctx, place, sent.first) catch |e| c.log.write(.chat, false, .{ .event = "card not pinned", .conversation = name, .why = whyUndelivered(e) }) catch {};
         var h: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(text, &h, .{});
         noteCard(c, name, sent.first, now_s, h);
@@ -32721,13 +32930,17 @@ const Topics = struct {
             }
         }
         if (rows.items.len == 0) return "No topics yet. /setup topics makes the butler's; a topic you open in the chat is one too.";
-        var out: std.ArrayList(u8) = .empty;
+        var out: Core.Linked = .{};
         for (rows.items, 0..) |r, i| {
             const f = try facts(c, a, r.name, r.subject, r.title, r.lately);
-            try out.print(a, "{s}{s}", .{ if (i > 0) "\n" else "", try card_mod.overviewLine(a, r.name, f) });
-            if (!std.mem.eql(u8, r.agent, "main")) try out.print(a, " Answered by {s}.", .{r.agent});
+            if (i > 0) try out.text(a, "\n");
+            try out.topic(c, a, r.name);
+            try out.text(a, ": ");
+            try out.text(a, try card_mod.overviewLine(a, f));
+            if (!std.mem.eql(u8, r.agent, "main")) try out.text(a, try std.fmt.allocPrint(a, " Answered by {s}.", .{r.agent}));
         }
-        return out.items;
+        _ = try c.sendLinked(conv, out, false);
+        return "";
     }
 
     /// `/focus [WORDS]` in a topic of the owner's chat.
@@ -32780,7 +32993,8 @@ const Persona = struct {
             });
             return "";
         }
-        var p = (try current(c, a)) orelse return "persona.md doesn't read as it is: fix it by hand (/persona says why), or remove it.";
+        // reset replaces the words: a body too big is no reason to refuse it
+        var p = (try currentOpts(c, a, std.mem.eql(u8, what, "reset"))) orelse return "persona.md doesn't read as it is: fix it by hand (/persona says why), or remove it.";
         var said: []const u8 = undefined;
         var set: []const u8 = what;
         if (std.meta.stringToEnum(persona_mod.Preset, what)) |preset| {
@@ -32818,11 +33032,17 @@ const Persona = struct {
     /// persona.md as it reads now (a missing one: the default); null when
     /// it doesn't read as written (a change would lose what it says).
     fn current(c: *Core, a: std.mem.Allocator) !?persona_mod.Persona {
+        return currentOpts(c, a, false);
+    }
+
+    /// `current`; `drop_big_body`: a body over 4 KB is dropped rather than
+    /// refused (reset and write replace it).
+    fn currentOpts(c: *Core, a: std.mem.Allocator, drop_big_body: bool) !?persona_mod.Persona {
         const text = Io.Dir.cwd().readFileAlloc(c.io, c.paths.persona, a, .limited(64 * 1024)) catch |e| switch (e) {
             error.FileNotFound => return .{},
             else => return null,
         };
-        return persona_mod.parse(a, text) catch null;
+        return persona_mod.parseOpts(a, text, drop_big_body) catch null;
     }
 
     /// Writes `p` as persona.md (only the owner can read it), then reads
@@ -32866,7 +33086,7 @@ const Persona = struct {
         defer Io.Dir.cwd().deleteFile(c.io, path) catch {};
         if (!eql(u8, key, "save")) return .{ .said = "persona.md is as it was." };
         const body = Io.Dir.cwd().readFileAlloc(c.io, path, a, .limited(persona_mod.max_body + 1)) catch return error.NothingPending;
-        var p = (try current(c, a)) orelse return .{ .said = "persona.md doesn't read as it is: fix it by hand (/persona says why), or remove it." };
+        var p = (try currentOpts(c, a, true)) orelse return .{ .said = "persona.md doesn't read as it is: fix it by hand (/persona says why), or remove it." };
         p.body = body;
         if (try write(c, a, p, "words")) |why| return .{ .said = why };
         return .{ .said = "Saved: persona.md has your words from your next message." };
@@ -33093,15 +33313,28 @@ test "a_topic_link_is_the_title_linked" {
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
+    const a = f.e.arena.allocator();
     f.core.setBot("harness_test_bot", true);
     try addSubjectTopic(&f, .errands, 5004);
-    f.core.say("Errands: two deliveries today. ({topic:errands})");
+    // harness's own line: the title linked
+    var line: Core.Linked = .{};
+    try line.text(a, "Errands: two deliveries today. (");
+    try line.topic(f.core, a, "errands");
+    try line.text(a, ")");
+    _ = try f.core.sendLinked("main", line, false);
     try f.rec.waitIn("main", "Errands: two deliveries today. (Errands)");
     try t.expectEqualStrings("text_link 32+7 https://t.me/harness_test_bot/5004", f.rec.entitiesOf("two deliveries").?);
     // no such topic: the subject's title, plain
-    f.core.say("Mail: nothing new. ({topic:mail})");
+    var plain: Core.Linked = .{};
+    try plain.text(a, "Mail: nothing new. (");
+    try plain.topic(f.core, a, "mail");
+    try plain.text(a, ")");
+    _ = try f.core.sendLinked("main", plain, false);
     try f.rec.waitIn("main", "Mail: nothing new. (Mail and diary)");
     try t.expectEqual(null, f.rec.entitiesOf("nothing new"));
+    // anyone else's text: a token is text, as written
+    f.core.say("See {topic:errands}.");
+    try f.rec.waitIn("main", "See {topic:errands}.");
 }
 
 // ---- topics: setup's offer ----
@@ -33267,6 +33500,9 @@ test "a_question_is_in_its_topic_with_a_pointer_in_main" {
     try f.rec.waitIn("errands", "BUTTONS Order milk from Frisco? [");
     try f.rec.waitIn("main", "BUTTONS Waiting on you in Errands: Order milk from Frisco? [");
     try t.expectEqualStrings("text_link 18+7 https://t.me/harness_test_bot/5003", f.rec.entitiesOf("Waiting on you in Errands").?);
+    // it rings once: in main; the topic's copy is silent
+    try t.expect(f.rec.quietOf("BUTTONS Order milk from Frisco? [").?);
+    try t.expect(!f.rec.quietOf("BUTTONS Waiting on you in Errands").?);
     const in_topic = f.rec.buttonsWith("BUTTONS Order milk from Frisco? [").?;
     const pointer = f.rec.buttonsWith("Waiting on you in Errands").?;
     // the pointer's button answers it; both messages are edited
@@ -33541,7 +33777,7 @@ test "main_saves_a_plain_helper_without_asking_with_one_silent_line" {
     try expectHas(try f.core.command(f.e.arena.allocator(), "/agents"), "researcher");
 }
 
-const HelperCase = enum { marked, task, trigger, step, conversation, tool, mcp, model, shared, environment, limits, section, grant, hand_edit, owner_version, main_itself, ask_line, deny_line };
+const HelperCase = enum { marked, task, trigger, step, conversation, tool, mcp, model, shared, environment, limits, section, kind_section, grant, hand_edit, owner_version, main_itself, ask_line, deny_line };
 
 test "each_of_these_asks" {
     for (std.enums.values(HelperCase)) |case| {
@@ -33573,8 +33809,9 @@ test "each_of_these_asks" {
                 defer f.core.convs.mutex.unlock(t.io);
                 try f.core.convs.setAgent("house-search", "researcher");
             },
-            .section => {
-                try writeRules(&f, "[agent:r*]\nallow fetch *\n");
+            .section, .kind_section => {
+                // a glob on the name, and the kind alone (every definition)
+                try writeRules(&f, if (case == .section) "[agent:r*]\nallow fetch *\n" else "[agent]\nallow fetch *\n");
                 try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
             },
             .grant => try f.core.grants.addFor(.fetch, "", "https://example.com", "agent:researcher", util.nowSeconds(t.io) + 3600),
@@ -33716,4 +33953,182 @@ test "without_topics_work_shows_the_latest" {
     try addTopic(&f, "house-search", 5012);
     try f.core.handleTextIn("house-search", "/work");
     try f.rec.waitIn("house-search", "No delegated run here in the log's last 4 MB.");
+}
+
+// ---- the final review's fixes ----
+
+test "a_topic_token_from_outside_stays_as_written" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.setBot("harness_test_bot", true);
+    try butlerTopics(&f);
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"curl https://x/{topic:main}\"}"));
+    try f.e.script(2, model.textReply("See {topic:errands} for it."));
+    try f.core.startWorker();
+    try f.core.handleText("fetch it");
+    try f.rec.waitFor("BUTTONS Allow this? [1]\nshell: curl https://x/{topic:main}");
+    try f.press("deny");
+    try f.rec.waitIn("main", "See {topic:errands} for it.");
+    try t.expectEqual(null, f.rec.entitiesOf("See {topic:errands} for it."));
+}
+
+test "a_card_never_shows_a_reply" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try butlerTopics(&f);
+    try f.e.script(1, model.textReply("Buy 100 shares of Example Corp now."));
+    f.core.chatTurnIn("errands", "anything for me?");
+    try f.rec.waitIn("errands", "Buy 100 shares");
+    f.core.tick();
+    try f.rec.waitIn("errands", "Errands\nPending: none.\nNext: none.\nLately: none.");
+    try t.expectEqualStrings("", (try Topics.summaryLines(f.core, a, false)).buf.items);
+    // a routine's say and harness's own lines are news
+    try setWorkflow(&f, "bread", "workflow bread\nsubject errands\ntag no\nstep a\nsay Bread is on the list.\n");
+    _ = try f.core.command(a, "/workflow start bread");
+    runWorkflows(&f);
+    try f.rec.waitIn("errands", "Bread is on the list.");
+    try expectHas((try Topics.summaryLines(f.core, a, false)).buf.items, "Errands: Bread is on the list at ");
+}
+
+test "a_failing_card_post_waits_a_minute" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try butlerTopics(&f);
+    const t0 = util.nowSeconds(t.io);
+    f.core.fixed_now = t0;
+    f.rec.setFail(error.TelegramRefused);
+    f.core.tick();
+    const lt = try logText(&f);
+    try t.expectEqual(4, std.mem.count(u8, lt, "\"event\":\"card not posted\""));
+    f.core.fixed_now = t0 + 5;
+    f.core.tick();
+    try t.expectEqual(4, std.mem.count(u8, try logText(&f), "\"event\":\"card not posted\""));
+    f.rec.setFail(null);
+    f.core.fixed_now = t0 + 61;
+    f.core.tick();
+    try f.rec.waitIn("errands", "Errands\nPending: none.");
+}
+
+test "a_refused_topic_never_gets_its_card_in_main" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try butlerTopics(&f);
+    f.rec.threads_fail = true;
+    f.core.tick();
+    try f.rec.waitIn("main", "Telegram refused the topic of");
+    try t.expectEqual(0, f.rec.countIn("main", "Pending:"));
+    try t.expectEqual(0, f.rec.countIn("main", "PIN "));
+    try t.expectEqual(0, cardOf(&f, "errands"));
+}
+
+test "set_my_settings_that_changes_nothing_explains_botfather" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.rec.topics_now = false;
+    f.rec.settings_noop = true;
+    try t.expectEqualStrings("", try f.core.command(a, "/setup topics"));
+    try f.rec.waitFor("BUTTONS Topics: ");
+    try f.press("on");
+    try f.rec.waitFor(Topics.botfather);
+    try t.expect(!f.core.topics_on);
+    f.core.convs.mutex.lockUncancelable(t.io);
+    defer f.core.convs.mutex.unlock(t.io);
+    try t.expectEqual(null, f.core.convs.bySubject("house"));
+}
+
+test "the_helper_line_is_silent_without_a_log_key" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.log.key = null;
+    try f.core.startWorker();
+    try helperTurn(&f, 1, "researcher", plain_helper, "Made it.");
+    try f.rec.waitIn("main", "Made a helper: researcher.");
+    try t.expect(f.rec.quietOf("Made a helper: researcher.").?);
+}
+
+test "a_trigger_naming_a_quiet_helper_shows_its_file" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.core.startWorker();
+    try helperTurn(&f, 1, "researcher", plain_helper, "Made it.");
+    try f.rec.waitFor("Made it.");
+    try f.e.script(3, model.toolReply("ta1", "trigger", "{\"action\":\"add\",\"text\":\"[look]\\nevery = 1h\\ndo = Look around.\\nagent = researcher\\n\"}"));
+    try f.e.script(4, model.textReply("Asked."));
+    try f.core.handleText("look every hour");
+    try f.rec.waitFor("This helper was saved without asking; you haven't seen it before.");
+    try f.rec.waitFor("Compare listings.");
+    try f.press("deny");
+    try f.rec.waitFor("Asked.");
+}
+
+test "persona_reset_and_write_work_when_only_the_body_is_too_big" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const big: [persona_mod.max_body + 10]u8 = @splat('x');
+    try writePersona(&f, try std.fmt.allocPrint(a, "---\npreset: friend\nname: Kai\n---\n{s}\n", .{&big}));
+    try t.expectEqualStrings("Your words are dropped; the friend preset stays.", try f.core.command(a, "/persona reset"));
+    try t.expectEqualStrings("---\npreset: friend\nname: Kai\n---\n", fileText(&f, f.core.paths.persona));
+    try writePersona(&f, try std.fmt.allocPrint(a, "---\npreset: friend\nname: Kai\n---\n{s}\n", .{&big}));
+    try t.expectEqualStrings("", try f.core.command(a, "/persona write"));
+    try f.rec.waitFor("BUTTONS Reply to this message with the character in your own words");
+    const msg = f.lastButtons().msg;
+    try f.core.handleIncoming(.{ .from = 42, .chat = 42, .text = "Short again.", .reply_to = msg });
+    try f.rec.waitFor("BUTTONS Your words for persona.md:\n\nShort again.");
+    try f.press("save");
+    try f.rec.waitFor("Saved: persona.md has your words from your next message.");
+    try t.expectEqualStrings("---\npreset: friend\nname: Kai\n---\nShort again.\n", fileText(&f, f.core.paths.persona));
+}
+
+test "only_the_owners_runs_post_to_work" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try butlerTopics(&f);
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"look at the flat\"}]}"));
+    try f.e.script(2, model.textReply("Fine flat."));
+    try f.e.script(3, model.textReply("Take it."));
+    f.core.chatTurnIn("travel", "Is the flat fine?");
+    try f.rec.waitIn("work", "For: Is the flat fine?");
+    // the same run's helpers, as if someone else's run had delegated them
+    const runs = try session.runs(a, try logText(&f));
+    var parent: u64 = 0;
+    var kids: std.ArrayList(u64) = .empty;
+    for (runs) |r| if (r.parent) |p| {
+        parent = p;
+        try kids.append(a, r.rid);
+    };
+    for ([_][]const u8{ "member:anna", "room:kitchen", "schedule:look" }) |by|
+        WorkTopic.post(f.core, a, .{ .parent = parent, .helpers = kids.items, .conversation = "travel", .private = false, .by = by });
+    try t.expectEqual(1, f.rec.countIn("work", "For: Is the flat fine?"));
+}
+
+test "an_adopted_topic_keeps_its_focus" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addTopic(&f, "travel", 5007);
+    try f.core.handleTextIn("travel", "/focus My own trips.");
+    try f.rec.waitIn("travel", "Focus: My own trips.");
+    try t.expectEqualStrings("", try f.core.command(a, "/setup topics"));
+    try f.rec.waitFor("BUTTONS Topics: ");
+    try f.press("on");
+    try f.rec.waitFor("Topics are on:");
+    f.core.convs.mutex.lockUncancelable(t.io);
+    defer f.core.convs.mutex.unlock(t.io);
+    const e = f.core.convs.bySubject("travel").?;
+    try t.expectEqual(5007, e.thread);
+    try t.expectEqualStrings("My own trips.", e.focus);
 }

@@ -31,6 +31,7 @@ const people_mod = @import("people.zig");
 const summaries_mod = @import("summaries.zig");
 const outside_mod = @import("outside.zig");
 const url_mod = @import("url.zig");
+const topics_mod = @import("topics.zig");
 const Io = std.Io;
 
 /// What came of asking the owner. `once`, `day`, `deny`: an approval's
@@ -139,6 +140,9 @@ pub const Post = struct {
     /// The reply of a run that changed files in folders that keep
     /// snapshots: harness ends it with what changed, and Undo.
     changed: ?*const Changed = null,
+    /// Topic links harness put in `text` (a routine's `{topics}`): byte
+    /// offsets; never from the model.
+    links: []const topics_mod.Entity = &.{},
 };
 
 /// What a run changed in the folders that keep snapshots, from its
@@ -1166,7 +1170,7 @@ pub const WorkSink = struct {
     post: *const fn (ctx: *anyopaque, a: std.mem.Allocator, d: WorkDone) void,
 };
 
-pub const WorkDone = struct { parent: u64, helpers: []const u64, conversation: []const u8, private: bool };
+pub const WorkDone = struct { parent: u64, helpers: []const u64, conversation: []const u8, private: bool, by: []const u8 = "owner" };
 
 /// Helpers main manages itself (core.zig's side).
 pub const HelperDesk = struct {
@@ -1177,7 +1181,27 @@ pub const HelperDesk = struct {
     /// A save or retirement happened: its file's SHA-256 kept, and when
     /// it was not asked, the owner told once, quietly.
     saved: *const fn (ctx: *anyopaque, a: std.mem.Allocator, s: HelperSaved) void,
+    /// The whole file of a helper main saved without asking that the
+    /// owner hasn't seen yet (now seen); null: none.
+    unseen: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) ?[]const u8,
 };
+
+/// A setup question's note on each helper main saved without asking that
+/// `section` names (`agent = NAME`, a step's `agent NAME`) and the owner
+/// hasn't seen: its whole file, once.
+fn unseenHelpers(r: *Run, a: std.mem.Allocator, section: []const u8) ![]const u8 {
+    const h = r.helpers orelse return "";
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, section, '\n');
+    while (lines.next()) |raw| {
+        const l = std.mem.trim(u8, raw, " \t\r");
+        if (!std.mem.startsWith(u8, l, "agent")) continue;
+        const name = std.mem.trim(u8, l["agent".len..], " \t=");
+        if (!agents.validName(name)) continue;
+        if (h.unseen(h.ctx, a, name)) |file| try out.print(a, "\n\nThis helper was saved without asking; you haven't seen it before. agents/{s}.md:\n{s}", .{ name, file });
+    }
+    return out.items;
+}
 
 pub const HelperSaved = struct {
     name: []const u8,
@@ -2778,7 +2802,7 @@ fn triggerTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Out
         if (eql(u8, action, "add")) {
             const checked = desk.check(desk.ctx, a, text);
             if (checked.why) |why| break :out .{ .text = try std.fmt.allocPrint(a, "not added: {s}", .{why}), .is_error = true };
-            const detail = try std.fmt.allocPrint(a, "a new trigger, asked by {s}\nHarness reads it as: {s}\nThe section, {d} bytes:\n{s}", .{ r.def.name, checked.reading, checked.section.len, checked.section });
+            const detail = try std.fmt.allocPrint(a, "a new trigger, asked by {s}\nHarness reads it as: {s}\nThe section, {d} bytes:\n{s}{s}", .{ r.def.name, checked.reading, checked.section.len, checked.section, try unseenHelpers(r, a, checked.section) });
             var item: u64 = 0;
             if (try decideAndAskWith(r, a, .trigger, "trigger", try std.fmt.allocPrint(a, "add {s}", .{checked.name}), detail, r.now(), .{ .item = &item })) |why|
                 break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
@@ -2839,7 +2863,7 @@ fn workflowTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Ou
         if (eql(u8, action, "save")) {
             const checked = desk.check(desk.ctx, a, name, text);
             if (checked.why) |why| break :out .{ .text = try std.fmt.allocPrint(a, "not saved: {s}", .{why}), .is_error = true };
-            const detail = try std.fmt.allocPrint(a, "{s}, asked by {s}\nHarness reads it as:\n{s}\nSaving it replaces the current file; instances already going keep theirs.\nThe file, {d} bytes:\n{s}", .{ if (checked.replaces) try std.fmt.allocPrint(a, "a change to workflow {s}", .{checked.name}) else "a new workflow", r.def.name, checked.reading, checked.section.len, checked.section });
+            const detail = try std.fmt.allocPrint(a, "{s}, asked by {s}\nHarness reads it as:\n{s}\nSaving it replaces the current file; instances already going keep theirs.\nThe file, {d} bytes:\n{s}{s}", .{ if (checked.replaces) try std.fmt.allocPrint(a, "a change to workflow {s}", .{checked.name}) else "a new workflow", r.def.name, checked.reading, checked.section.len, checked.section, try unseenHelpers(r, a, checked.section) });
             // the question must fit an inbox item: else the agent shortens it
             const size = detail.len + checked.name.len + 32;
             if (size > max_question) break :out .{ .text = try std.fmt.allocPrint(a, "not saved: its question would be {d} bytes, over the {d} an inbox item holds; shorten the file (the owner can still write it by hand, up to 64 KB)", .{ size, max_question }), .is_error = true };
@@ -3066,9 +3090,14 @@ pub fn stepCall(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []c
 /// A workflow's `say`: `text` posted to the run's conversation through the
 /// gate as a `send` (not the reply, not implicit).
 pub fn postText(r: *Run, a: std.mem.Allocator, text: []const u8) !Posted {
+    return postTextLinked(r, a, text, &.{});
+}
+
+/// `postText` with topic links harness put in it (a routine's `{topics}`).
+pub fn postTextLinked(r: *Run, a: std.mem.Allocator, text: []const u8, links: []const topics_mod.Entity) !Posted {
     const ob = r.outbox orelse return .{ .refused = "nowhere to post" };
     const target = ob.find(ob.ctx, a, r.conversation) orelse Target{ .name = r.conversation, .exists = false };
-    const post: Post = .{ .to = target.name, .text = text };
+    const post: Post = .{ .to = target.name, .text = text, .links = links };
     return postThrough(r, a, &post, target, null);
 }
 
@@ -4086,7 +4115,7 @@ fn delegate(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Output
     if (r.work) |w| {
         var rids: std.ArrayList(u64) = .empty;
         for (hs) |h| if (h.rid != 0) try rids.append(a, h.rid);
-        if (rids.items.len > 0) w.post(w.ctx, a, .{ .parent = r.rid, .helpers = rids.items, .conversation = r.conversation, .private = r.isPrivate() });
+        if (rids.items.len > 0) w.post(w.ctx, a, .{ .parent = r.rid, .helpers = rids.items, .conversation = r.conversation, .private = r.isPrivate(), .by = r.who.by });
     }
 
     var out: std.ArrayList(u8) = .empty;

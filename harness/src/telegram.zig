@@ -119,7 +119,8 @@ fn entitiesJson(body: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8
         if (e.len == 0 or e.offset + e.len > text.len) continue;
         try body.appendSlice(a, if (first) ",\"entities\":[" else ",");
         first = false;
-        try body.print(a, "{{\"type\":\"{s}\",\"offset\":{d},\"length\":{d}", .{ @tagName(e.kind), utf16Len(text[0..e.offset]), utf16Len(text[e.offset .. e.offset + e.len]) });
+        // counted on the text as it is sent (broken UTF-8 replaced)
+        try body.print(a, "{{\"type\":\"{s}\",\"offset\":{d},\"length\":{d}", .{ @tagName(e.kind), utf16Len(try util.validUtf8(a, text[0..e.offset])), utf16Len(try util.validUtf8(a, text[e.offset .. e.offset + e.len])) });
         if (e.kind == .text_link) {
             try body.appendSlice(a, ",\"url\":");
             try util.jsonString(body, a, e.url);
@@ -923,4 +924,24 @@ test "set_my_settings_pin_and_a_gone_edit" {
     // the setting refused: an error, said by the caller
     try e.tmp.dir.writeFile(t.io, .{ .sub_path = "telegram/no-settings", .data = "" });
     try t.expectError(error.TelegramRefused, b.setTopics(true));
+}
+
+test "entities_after_broken_utf8_line_up" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    var b = try Bot.init(t.allocator, t.io, try e.url(), "123:abc");
+    defer b.deinit();
+    const a = e.arena.allocator();
+    // a cut emoji, then the link
+    const text = "ab\xf0\x9f\x98Xcd (Travel)";
+    const at = std.mem.indexOf(u8, text, "Travel").?;
+    _ = try b.sendRich(42, 0, text, &.{.{ .kind = .text_link, .offset = at, .len = 6, .url = "https://t.me/b/5003" }}, .{});
+    const out = try outbox(&e);
+    const line = out[0 .. std.mem.indexOfScalar(u8, out, '\n') orelse out.len];
+    const v = jv.parse(a, line).?;
+    const sent = jv.str(jv.at(v, &.{ "body", "text" })).?;
+    const want = utf16Len(sent[0..std.mem.indexOf(u8, sent, "Travel").?]);
+    const ents = jv.arr(jv.at(v, &.{ "body", "entities" })).?;
+    try t.expectEqual(@as(i64, @intCast(want)), jv.int(jv.get(ents[0], "offset")).?);
 }

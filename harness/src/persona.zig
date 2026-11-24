@@ -49,6 +49,12 @@ pub const Error = error{ BadLine, BadPreset, BadName, BadAddress, BadLanguage, T
 /// `none` clears a name, address or language), then the body. No
 /// frontmatter: all body. `\r\n` reads the same.
 pub fn parse(a: std.mem.Allocator, text_in: []const u8) Error!Persona {
+    return parseOpts(a, text_in, false);
+}
+
+/// `parse`; with `drop_big_body`, a body over 4 KB is dropped instead of
+/// refused (`/persona reset` and `write` replace it anyway).
+pub fn parseOpts(a: std.mem.Allocator, text_in: []const u8, drop_big_body: bool) Error!Persona {
     const text = try std.mem.replaceOwned(u8, a, std.mem.trimStart(u8, text_in, "\xEF\xBB\xBF"), "\r\n", "\n");
     var p: Persona = .{};
     var rest: []const u8 = text;
@@ -80,7 +86,11 @@ pub fn parse(a: std.mem.Allocator, text_in: []const u8) Error!Persona {
         }
     }
     const body = std.mem.trim(u8, rest, " \t\n");
-    if (body.len > max_body) return error.TooBig;
+    if (body.len > max_body) {
+        if (!drop_big_body) return error.TooBig;
+        p.body = "";
+        return p;
+    }
     p.body = body;
     return p;
 }

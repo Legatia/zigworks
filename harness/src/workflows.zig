@@ -159,7 +159,7 @@ pub const Error = error{ BadWorkflow, OutOfMemory };
 /// The words the workflow commands take: never a workflow's name.
 const command_words = [_][]const u8{ "start", "stop", "resume", "rm", "list", "check", "show", "save" };
 /// The values every instance has: never a step's name.
-const builtin_values = [_][]const u8{ "input", "event", "instance", "now", "topics" };
+const builtin_values = [_][]const u8{ "input", "event", "instance", "now" };
 
 const name_rule = "a-z, 0-9, - and _ (up to 64), starting with a letter or digit";
 
@@ -743,15 +743,16 @@ fn condOf(a: Allocator, text: []const u8, placeholders: bool) !triggers.Cond {
 fn namesIn(a: Allocator, w: Workflow, s: Step, diag: *Diag) Error!void {
     const n = if (s.action_line != 0) s.action_line else s.line;
     switch (s.action) {
-        .do, .approve, .review, .say => |text| try checkText(a, w, text, n, diag),
+        .do, .approve, .review => |text| try checkText(a, w, text, n, diag, false),
+        .say => |text| try checkText(a, w, text, n, diag, true),
         .tool => |tl| {
             const v = jv.parse(a, tl.json) orelse return bad(diag, n, "the tool's input is a JSON object");
             try checkJson(a, w, v, n, diag);
         },
         else => {},
     }
-    for (s.match) |m| try checkText(a, w, m, s.match_line, diag);
-    for (s.ifs) |f| if (try nameProblem(a, w, f.cond.field)) |why| return bad(diag, f.line, why);
+    for (s.match) |m| try checkText(a, w, m, s.match_line, diag, false);
+    for (s.ifs) |f| if (try nameProblem(a, w, f.cond.field, false)) |why| return bad(diag, f.line, why);
 }
 
 /// Whether `text` holds a `{value}` (a brace before a name; `{{` is a brace).
@@ -791,7 +792,7 @@ fn jsonHasPlaceholder(v: jv.Value) bool {
 
 fn checkJson(a: Allocator, w: Workflow, v: jv.Value, n: usize, diag: *Diag) Error!void {
     switch (v) {
-        .string => |s| try checkText(a, w, s, n, diag),
+        .string => |s| try checkText(a, w, s, n, diag, false),
         .array => |arr| for (arr.items) |x| try checkJson(a, w, x, n, diag),
         .object => |o| {
             var it = o.iterator();
@@ -801,7 +802,7 @@ fn checkJson(a: Allocator, w: Workflow, v: jv.Value, n: usize, diag: *Diag) Erro
     }
 }
 
-fn checkText(a: Allocator, w: Workflow, text: []const u8, n: usize, diag: *Diag) Error!void {
+fn checkText(a: Allocator, w: Workflow, text: []const u8, n: usize, diag: *Diag, say: bool) Error!void {
     var i: usize = 0;
     while (i < text.len) {
         if (text[i] != '{') {
@@ -820,17 +821,22 @@ fn checkText(a: Allocator, w: Workflow, text: []const u8, n: usize, diag: *Diag)
             continue;
         }
         if (std.mem.startsWith(u8, name, "secret:")) return bad(diag, n, "a step names no secret: MCP servers hold their own (mcp.ini)");
-        if (try nameProblem(a, w, name)) |why| return bad(diag, n, why);
+        if (try nameProblem(a, w, name, say)) |why| return bad(diag, n, why);
         i = close + 1;
     }
 }
 
 /// Why `name` is no value an instance can have; null: it can be.
-fn nameProblem(a: Allocator, w: Workflow, name: []const u8) !?[]const u8 {
+fn nameProblem(a: Allocator, w: Workflow, name: []const u8, say: bool) !?[]const u8 {
     const dot = std.mem.indexOfScalar(u8, name, '.');
     const root = name[0 .. dot orelse name.len];
-    // topics: a line per topic with news (core fills it in a say step)
-    if (oneOf(root, &.{ "input", "instance", "now", "topics" })) {
+    // {topics}: a line per topic with news, which core fills in a say
+    // step; a step called topics is that step's value
+    if (std.mem.eql(u8, name, "topics") and w.find("topics") == null) {
+        if (say) return null;
+        return "{topics} is for a say step: a line per topic with news";
+    }
+    if (oneOf(root, &.{ "input", "instance", "now" })) {
         if (dot != null) return try std.fmt.allocPrint(a, "{{{s}}}: {s} has no fields", .{ name, root });
         return null;
     }
@@ -1710,4 +1716,14 @@ test "subject_is_read_and_to_set_known" {
     try t.expect(own.to_set);
     try t.expectError(error.BadWorkflow, parse(a, "bill", "workflow bill\nsubject kitchen\nstep tell\nsay hi\n", &d));
     try t.expect(std.mem.indexOf(u8, d.why, "subject is house, travel, errands, mail or work") != null);
+}
+
+test "a_step_may_be_called_topics_and_topics_is_for_say" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    _ = try parse(a, "w", "workflow w\nstep topics\ndo Make the topics.\nstep tell\nsay {topics}\n", &d);
+    try t.expectError(error.BadWorkflow, parse(a, "w", "workflow w\nstep a\ndo Use {topics}.\n", &d));
+    try t.expect(std.mem.indexOf(u8, d.why, "{topics} is for a say step") != null);
 }

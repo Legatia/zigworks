@@ -1,10 +1,10 @@
 //! Topics: one chat with the bot, filed by subject. The butler's subjects
-//! and their titles, a topic's link, and the `{topic:NAME}` token harness
-//! puts in its own lines: at send time it becomes the topic's title as a
-//! link (a Telegram text_link entity, offsets in bytes here and UTF-16
-//! units in telegram.zig). A token only ever links to the owner's own
-//! topic (`https://t.me/<bot>/<thread>`, which opens only for them), so
-//! one that came in outside text is harmless.
+//! and their titles, a topic's link (`https://t.me/<bot>/<thread>`, which
+//! opens only for the owner), and message entities (offsets in bytes here,
+//! UTF-16 units in telegram.zig). Core builds the lines that carry links
+//! itself (`Core.Linked`): only harness's own words become links, never a
+//! run's text or outside text. `expand` reads `{topic:NAME}` tokens; core
+//! no longer uses it on anything it sends.
 const std = @import("std");
 const telegram = @import("telegram.zig");
 

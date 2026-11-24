@@ -615,6 +615,9 @@ in its start line, `/status` and `/reload`. An edit by hand applies at
   them back with [Save] [Cancel]. A forwarded message is never taken.
 - `/persona reset`: your words dropped, the preset kept.
 
+`reset` and `write` also work on a `persona.md` whose only problem is
+words over 4 KB; the other commands leave a file that doesn't read alone.
+
 Each writes `persona.md` (only you can read it) and applies from the next
 message. `/setup butler`, setup's offer of the butler's manner and
 `harness init --butler` write `preset: butler` (setup asks how to address
@@ -729,11 +732,11 @@ holds now. `main` answers in all of them, with all its tools.
   to `main` as before. [Use topics] adds `subject` to the routines setup
   wrote where they have no `to` and no `subject`, and `{topics}` to the
   morning summary setup wrote.
-- **Questions** go to their topic as an inbox item, and `main` gets one
-  line pointing there with the same buttons ("Waiting on you in Errands:
-  Order milk from Frisco?"); pressing either answers it, and closing it
-  edits both. (A question from your own turn in a topic gets no pointer:
-  you're there.)
+- **Questions** go to their topic as an inbox item, silently, and `main`
+  gets one line pointing there with the same buttons ("Waiting on you in
+  Errands: Order milk from Frisco?"), so it rings once; pressing either
+  answers it, and closing it edits both. (A question from your own turn in
+  a topic gets no pointer: you're there.)
 - **Urgent alerts** stay in `main`, with [I'm on it] and reply to
   acknowledge; the topic gets a line for the record: "Smoke in the
   kitchen at 03:12. Alerted in main."
@@ -747,19 +750,25 @@ holds now. `main` answers in all of them, with all its tools.
   pinned, built from harness's state (never by the model, and never put
   in a prompt: it holds outside text): its title, `Pending:` (what waits
   on you there), `Next:` (the list and parcels, upkeep, trips, the next
-  two days' events) and `Lately:` (the last three lines posted there). It
-  is edited when what it says changes, at most once a minute; one
-  Telegram no longer has is posted again and pinned. `/card` in a topic
-  posts and pins a fresh one (an unpinned card can't be told apart).
+  two days' events) and `Lately:` (the last three of harness's own lines
+  there: its posts, a routine's `say`, an alert's record line; never a
+  reply the model wrote). It is edited when what it says changes, at most
+  once a minute; one Telegram no longer has is posted again and pinned;
+  one that can't be posted is tried a minute later. A topic Telegram
+  refused has no card (never one in `main`) until it is back. `/card` in a
+  topic posts and pins a fresh one (an unpinned card can't be told apart).
 - **`/overview`**, in `main`: a line per topic, its title a link, then
   what waits on you there, else what comes next, else "nothing new"; a
   topic another definition answers says "Answered by NAME".
 - **The summaries** carry a line per topic with news since the last one,
   each ending with the topic's title as a link ("Errands: DPD comes today
   at 14:10. (Errands)"): the evening message always, the morning routine
-  where its `say` has `{topics}` (the shipped one does).
+  where its `say` has `{topics}` (the shipped one does; `{topics}` is a
+  say step's alone, unless a step is called `topics`).
 - **Links** are `https://t.me/<bot_username>/<thread>`, which open only
-  for you; harness sends them as message entities, never with markup.
+  for you; harness sends them as message entities, never with markup, and
+  only in lines it writes itself (a model's text, a question or anything
+  from outside is sent as written).
 
 Not verified in the world (the Bot API documents both, but neither was
 tried against Telegram): that a pinned message shows at the top of its
@@ -2238,7 +2247,9 @@ new or still as `main` last saved it; no earlier version you wrote; never
 `main` or `helper` themselves). Anything else is asked as always. Your own
 lines still decide: `deny agent_save` refuses, `ask agent_save` asks every
 time. `agent_save {"name": …, "retire": true}` retires one `main` saved,
-on the same terms. You hear of each once, without a sound, in the Work
+on the same terms. When a trigger or workflow `main` proposes names one
+you haven't seen, its question shows the helper's whole file. You hear of
+each once, without a sound, in the Work
 topic (or `main` without topics): "Made a helper: researcher. Searches and
 reads pages, for comparing listings." [Remove], "Changed researcher: added
 fetch." [Undo], "Retired researcher." [Undo]. Each save's SHA-256 is kept in
@@ -2248,8 +2259,10 @@ The Work topic gets one post per `delegate` call, without a sound, built
 from the log (never by the model): the request's first line and where the
 answer went (a link), a folded quote per helper (its definition, task,
 steps, the tools it used, its tokens and its answer; tap to open) and the
-totals; it fits one message, the answers sharing what's left (at least 200
-characters each, cut with "…"). A private conversation's run posts only
+totals; it fits one message (the request cut to 200 characters, then the
+tasks, then the answers, each cut with "…"; answers get at least 200
+when they can). Only your own runs in your own conversations post there.
+A private conversation's run posts only
 who, the steps and the tokens; secrets are masked; outside text in an
 answer is shown as it is (no markup), never put in a prompt. Without
 topics nothing is posted: `/work` shows the latest delegated run of the

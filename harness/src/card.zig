@@ -50,25 +50,27 @@ fn endsAsked(s: []const u8) bool {
     return s.len > 0 and (s[s.len - 1] == '?' or s[s.len - 1] == '!');
 }
 
-/// `/overview`'s line for topic `name`: its title as a link, then what
-/// waits on the owner, else what comes next, else "nothing new".
-pub fn overviewLine(a: std.mem.Allocator, name: []const u8, f: Facts) ![]const u8 {
+/// `/overview`'s line for a topic, after its title (a link, which core
+/// puts in front): what waits on the owner, else what comes next, else
+/// "nothing new".
+pub fn overviewLine(a: std.mem.Allocator, f: Facts) ![]const u8 {
     if (f.pending.len > 0) {
         const first = try item(a, f.pending[0]);
         const more = if (f.pending.len > 1) try std.fmt.allocPrint(a, " (and {d} more)", .{f.pending.len - 1}) else "";
-        return std.fmt.allocPrint(a, "{{topic:{s}}}: waiting on you: {s}{s}{s}", .{ name, first, if (more.len == 0 and !endsAsked(first)) "." else "", more });
+        return std.fmt.allocPrint(a, "waiting on you: {s}{s}{s}", .{ first, if (more.len == 0 and !endsAsked(first)) "." else "", more });
     }
     if (f.next.len > 0) {
         const first = try item(a, f.next[0]);
-        return std.fmt.allocPrint(a, "{{topic:{s}}}: next: {s}{s}", .{ name, first, if (endsAsked(first)) "" else "." });
+        return std.fmt.allocPrint(a, "next: {s}{s}", .{ first, if (endsAsked(first)) "" else "." });
     }
-    return std.fmt.allocPrint(a, "{{topic:{s}}}: nothing new.", .{name});
+    return a.dupe(u8, "nothing new.");
 }
 
-/// A summary's line for topic `name`: its news, then its title as a link.
-pub fn summaryLine(a: std.mem.Allocator, name: []const u8, title: []const u8, news: []const u8) ![]const u8 {
+/// A summary's line for a topic, before its title as a link (core adds
+/// " (TITLE)"): the title, then its news.
+pub fn summaryLine(a: std.mem.Allocator, title: []const u8, news: []const u8) ![]const u8 {
     const n = try item(a, news);
-    return std.fmt.allocPrint(a, "{s}: {s}{s} ({{topic:{s}}})", .{ title, n, if (endsAsked(n)) "" else ".", name });
+    return std.fmt.allocPrint(a, "{s}: {s}{s}", .{ title, n, if (endsAsked(n)) "" else "." });
 }
 
 /// A topic's news for a summary: what waits on the owner, else the last
@@ -101,15 +103,15 @@ test "a_card_has_its_parts_and_none" {
     const got = try text(a, .{ .title = "Mail and diary", .next = &.{ &long, "Dentist\nat 10:30" } });
     try t.expect(std.mem.indexOf(u8, got, "x…; Dentist at 10:30.") != null);
     // the overview: pending first, else next, else nothing new
-    try t.expectEqualStrings("{topic:errands}: waiting on you: Order milk from Frisco? (and 1 more)", try overviewLine(a, "errands", .{ .title = "Errands", .pending = &.{ "Order milk from Frisco?", "Renew the passport" } }));
-    try t.expectEqualStrings("{topic:house}: next: boiler service due 2 December.", try overviewLine(a, "house", .{ .title = "House", .next = &.{"boiler service due 2 December."} }));
-    try t.expectEqualStrings("{topic:travel}: nothing new.", try overviewLine(a, "travel", .{ .title = "Travel", .lately = &.{"Gate B12"} }));
+    try t.expectEqualStrings("waiting on you: Order milk from Frisco? (and 1 more)", try overviewLine(a, .{ .title = "Errands", .pending = &.{ "Order milk from Frisco?", "Renew the passport" } }));
+    try t.expectEqualStrings("next: boiler service due 2 December.", try overviewLine(a, .{ .title = "House", .next = &.{"boiler service due 2 December."} }));
+    try t.expectEqualStrings("nothing new.", try overviewLine(a, .{ .title = "Travel", .lately = &.{"Gate B12"} }));
 }
 
 test "a_summary_line_ends_with_its_topic" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try t.expectEqualStrings("Errands: two deliveries today. ({topic:errands})", try summaryLine(a, "errands", "Errands", "two deliveries today"));
-    try t.expectEqualStrings("Travel: waiting on you: Check in now? ({topic:travel})", try summaryLine(a, "travel", "Travel", "waiting on you: Check in now?"));
+    try t.expectEqualStrings("Errands: two deliveries today.", try summaryLine(a, "Errands", "two deliveries today"));
+    try t.expectEqualStrings("Travel: waiting on you: Check in now?", try summaryLine(a, "Travel", "waiting on you: Check in now?"));
 }
