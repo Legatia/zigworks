@@ -2732,6 +2732,7 @@ test {
     _ = @import("taskfiles.zig");
     _ = @import("yaml.zig");
     _ = @import("zones.zig");
+    _ = @import("hermes.zig");
 }
 
 test "harness_people_takes_list_show_and_import" {
