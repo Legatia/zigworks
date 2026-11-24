@@ -2723,6 +2723,7 @@ test {
     _ = @import("mail.zig");
     _ = @import("doctor.zig");
     _ = @import("people.zig");
+    _ = @import("outside.zig");
     _ = @import("lists.zig");
     _ = @import("deliveries.zig");
     _ = @import("upkeep.zig");

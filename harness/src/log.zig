@@ -185,6 +185,16 @@ pub const Log = struct {
             try line.print(gpa, ",\"{s}\":", .{name});
             try value(&line, gpa, name, @field(fields, name), ctx);
         }
+        // a gate line's outside text: where it came from, never the text
+        if (tag) |tg| if (tg.outside.len > 0) {
+            try line.appendSlice(gpa, ",\"outside\":[");
+            for (tg.outside, 0..) |o, i| {
+                if (i > 0) try line.append(gpa, ',');
+                try value(&line, gpa, "outside", o, ctx);
+            }
+            try line.append(gpa, ']');
+            if (tg.outside_more > 0) try line.print(gpa, ",\"outside_more\":{d}", .{tg.outside_more});
+        };
         try line.print(gpa, ",\"prev\":\"{s}\"}}", .{l.last});
         const h = hashLine(line.items);
         try line.append(gpa, '\n');
@@ -210,6 +220,10 @@ pub const Tag = struct {
     parent: ?u64 = null,
     /// The conversation the run reports to (every line; gap 4).
     conversation: ?[]const u8 = null,
+    /// A gate line's outside text: up to three sources its conversation
+    /// read, and how many more (outside.zig).
+    outside: []const []const u8 = &.{},
+    outside_more: usize = 0,
 };
 
 /// How a line's fields are written.
@@ -473,6 +487,43 @@ test "torn_last_line_is_dropped_and_recovery_logged" {
     try t.expectEqual(3, v.lines);
     const text = try Io.Dir.cwd().readFileAlloc(t.io, path, arena.allocator(), .unlimited);
     try t.expect(std.mem.indexOf(u8, text, "\"kind\":\"recovered\"") != null);
+}
+
+test "gate_lines_carry_outside_after_the_fields" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const path = try tmpPath(&tmp, arena.allocator());
+    var l = try Log.open(t.allocator, t.io, path);
+    _ = try l.writeRun(.gate, false, .{ .run = "chat", .outside = &.{ "page blog.example", "mail x@y.example", "search" }, .outside_more = 2 }, .{ .tool = "shell", .decision = "deny", .why = "denied by the owner" });
+    _ = try l.writeRun(.gate, false, .{ .run = "chat", .outside = &.{"search"} }, .{ .tool = "remember", .decision = "allow" });
+    _ = try l.writeRun(.gate, false, .{ .run = "chat" }, .{ .tool = "shell", .decision = "allow" });
+    l.close();
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, path, arena.allocator(), .unlimited);
+    for ([_][]const u8{
+        "\"tool\":\"shell\",\"decision\":\"deny\",\"why\":\"denied by the owner\",\"outside\":[\"page blog.example\",\"mail x@y.example\",\"search\"],\"outside_more\":2,\"prev\"",
+        "\"tool\":\"remember\",\"decision\":\"allow\",\"outside\":[\"search\"],\"prev\"",
+        "\"tool\":\"shell\",\"decision\":\"allow\",\"prev\"",
+    }) |want| {
+        if (std.mem.indexOf(u8, text, want) == null) std.debug.print("missing {s} in:\n{s}\n", .{ want, text });
+        try t.expect(std.mem.indexOf(u8, text, want) != null);
+    }
+    try t.expectEqual(null, (try verify(t.io, path)).broken_at);
+}
+
+test "outside_on_a_private_line_keeps_only_sizes" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const path = try tmpPath(&tmp, arena.allocator());
+    var l = try Log.open(t.allocator, t.io, path);
+    _ = try l.writeRun(.gate, true, .{ .run = "chat", .outside = &.{"page blog.example"} }, .{ .tool = "shell", .decision = "deny" });
+    l.close();
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, path, arena.allocator(), .unlimited);
+    try t.expect(std.mem.indexOf(u8, text, "blog.example") == null);
+    try t.expect(std.mem.indexOf(u8, text, "\"outside\":[{\"bytes\":17}]") != null);
 }
 
 test "private_lines_keep_only_metadata" {
