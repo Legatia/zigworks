@@ -301,7 +301,7 @@ copy carries them. With `HARNESS_STORE=DIR` they are files in DIR.
 | `state/people/` | the people you deal with, a file each (`NAME.txt`, see People); what of them was said, in `state/people-told` |
 | `state/meds`, `state/bedtime`, `state/habits`, `state/evening` | medication reminders (the schedule, today's and yesterday's reminders), the night bedtime's line was said, the week's look at your habits and its suggestions, the evening last said (see Health, habits and the evening) |
 | `state/summaries/` | each conversation's summaries (see Long memory): `CONV/day/YYYY-MM-DD.md` (kept 60 days), `CONV/week/YYYY-Www.md` (ISO weeks, kept 400 days), `CONV/month/YYYY-MM.md` (kept); `PERIOD.given-up` where a call failed all day |
-| `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), speech's calls waiting for you (`room-asks`), what quiet hours hold (`quiet`), status, lock, money totals, the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home and, on macOS, its temp; a remote's key), `workflows/NAME/` (each workflow's instances, `N/`, its starts waiting in line, earlier files in `versions/`, a removed file as `removed.wf`), `workflows/day.json` (today's agent steps), `mail/` (the butler's mail already handled, others' mail for the day's line) |
+| `state/` | grants, seen feed items, owner, the conversations (`conversations`), what waits for you (`inbox`), speech's calls waiting for you (`room-asks`), what quiet hours hold (`quiet`), status, lock, money totals (`money`: a day and a month, yours and routines'), `money-paused` (routines' spending paused), `upgrades/` (what a first start after an upgrade did), the log's key, `store-id`, files the agent wrote since you last allowed a command, and who wrote them (`written`), `mcp/NAME` (each MCP server's own folder), `agents/NAME/versions/` (each definition's earlier files), `triggers/NAME/` (each trigger's state, seen items and queue), `env/NAME` (each environment's own: a sandbox's home and, on macOS, its temp; a remote's key), `workflows/NAME/` (each workflow's instances, `N/`, its starts waiting in line, earlier files in `versions/`, a removed file as `removed.wf`), `workflows/day.json` (today's agent steps), `mail/` (the butler's mail already handled, others' mail for the day's line) |
 
 On macOS and Linux, `config.ini`, `rules`, `logins.ini`, `mcp.ini`,
 `folders.ini`, `triggers.ini`, `environments.ini`, the folders `agents/` and `workflows/` and
@@ -547,8 +547,9 @@ What the gate can't hold:
   or spaced gets past the masking once approved: the protection there is
   the question and the sandbox.
 - Grants and allow lines you wrote apply in marked conversations too.
-- With `[money] scheduled = on`, unattended runs move money within the
-  caps.
+- With a budget for routines set, unattended runs move money within it.
+  Outside text never spends, but the paying server's own results can
+  steer what is spent at that same server, within the budget.
 - A file an earlier run saved from a page carries no mark when a later run
   reads it.
 - Workspace writes are allowed; Undo takes them back.
@@ -1482,7 +1483,7 @@ which has no list tool, so say it in these words.
   busy events hold them.
 - `state/lists/NAME`: a line an item, written whole; you can edit it.
 
-### Reorders: bought only on your tap
+### Reorders
 
 A shop you order from online, through its MCP server: add the server to
 mcp.ini as any other, with its order tool a money tool and the field that
@@ -1518,8 +1519,16 @@ Butler:  Ordered from Frisco: 3 items, 64.20 PLN; off shopping. The shop says: O
   time with something on it; one proposal open at a time; after Not now
   (or no answer in `approval_seconds`) the size proposes again only once
   the list was under it.
-- **Never bought unasked.** The proposal is one item in your inbox, the
-  whole order in it; the exact call it would make is kept in
+- **Within your budget for routines** (`[money] budget_per_day` or
+  `budget_per_month`, or the shop's own in mcp.ini), the reorder orders by
+  itself as `harness:reorder`, through the money checks and the gate,
+  tells you (the spend's line, then "Ordered from Frisco: …") and takes
+  what was ordered off the list. Over it, with no budget, or while
+  spending is paused, it proposes the order as below, saying why it
+  wasn't ordered on its own. `/setup reorder` asks once how much routines
+  may spend: None, Set an amount, or Like this: 30 a day, 200 a month.
+- **Otherwise bought only on your tap.** The proposal is one item in your
+  inbox, the whole order in it; the exact call it would make is kept in
   `state/errands` under the item's number. Only your **Order it** makes
   it, once (it is taken off the file before the call), as your own call
   through the gate: a `deny` rule stops it, `/dryrun on` makes nothing,
@@ -1532,7 +1541,7 @@ Butler:  Ordered from Frisco: 3 items, 64.20 PLN; off shopping. The shop says: O
   its size; the proposal is yours alone.
 
 Not built: ordering through a shop's website with your login (the `web`
-tool), and money in any run you didn't tap for.
+tool).
 
 ### Deliveries
 
@@ -2083,7 +2092,8 @@ act_seconds` (120); `/stop` ends them. `run:NAME` starts a run of that
 definition, labelled `app NAME`: one per app at a time, `[apps]
 runs_per_hour` (20), and it takes a place among `concurrent_runs`. An
 app's acts never call a money tool, and a run it starts moves money only
-with `[money] apps = on` (off by default).
+with `[money] apps = on` (off by default), asked every time; no budget
+for routines applies to it.
 
 **How the agent builds one.** In a conversation with you, the agent can
 copy an app into the workspace (`app_draft`, into `app-drafts/NAME/`),
@@ -2448,6 +2458,7 @@ money = place_order, cancel_order              ; tools that move money
 amount = place_order:notional_usd, cancel_order:none   ; or one field for all: amount = notional_usd
 max_per_call = 500   ; this server's caps; default: [money] in config.ini
 max_per_day = 2000
+budget_per_day = none   ; what routines may spend here unasked; none: nothing (see Money)
 ```
 
 Servers start together (20 s in all) with `harness run`, `chat` and
@@ -2567,16 +2578,71 @@ toward the day from the moment you are asked, so two runs cannot both
 pass the same cap; it is taken back only if the call is not made. A call
 that was sent stays counted even if it failed or timed out, since that
 does not prove nothing happened. If `state/money` is damaged or cannot be
-read or written, money calls are refused with the reason. Scheduled runs
-never move money unless you set `[money] scheduled = on` and a cap for
-that server. Runs a trigger starts never move money while `[money]
-triggers = off` (the default, until you decide): the call is refused,
-naming the setting; with `on` they follow `[money] scheduled` and the caps
-as scheduled runs do. A workflow's agent steps are the same under `[money]
-workflows` (off by default); its tool steps' money calls are asked every
-time in the inbox, whatever `scheduled` says (see Workflows). A run an
-app starts is the same under `[money] apps` (off by default), and an
-app's own acts never call a money tool (see Apps).
+read or written, money calls are refused with the reason. A workflow's
+tool steps' money calls are asked every time in the inbox (see
+Workflows). A run an app starts can ask you, so its money calls are
+asked, only with `[money] apps = on` (off by default), and no budget
+applies to it; an app's own acts never call a money tool (see Apps).
+
+#### Routines spend within a budget
+
+Runs nobody watches (a schedule's, a trigger's, a workflow's agent step,
+and the reorder) move money without asking you only within a budget for
+routines:
+
+```ini
+[money]
+budget_per_day = 30      ; in the tool's amount units
+budget_per_month = 200
+```
+
+- **Off until you set one.** Routines spend only while a budget is above
+  0, and each one above 0 limits its own period. None is set by default.
+  `/money budget 30 a day` (or `a month`) writes it.
+- **Per server**, for more than one currency: a money server's section in
+  mcp.ini may say `budget_per_day` and `budget_per_month`, over `[money]`'s
+  key by key. `none` there: routines spend nothing at that server; `0` is
+  an error.
+- **What counts where.** What routines spend counts against the budget and
+  against `max_per_day` and `max_per_call`; what you approve yourself
+  (asked, a tool step, Order it, Make this payment) only against
+  `max_per_day`. `state/money` keeps both, a day and a month.
+- **When a routine's call is made unasked**, all of these hold: its switch
+  is on (`[money] scheduled`, and `triggers` or `workflows` for those runs;
+  on by default); the tool names an amount (`amount =`) within
+  `max_per_call`, `max_per_day` and the budget, today and this month;
+  spending isn't paused; and the run read no outside text but that same
+  server's own results, such as the shop's quote before its order. Every
+  such decision is logged with the budget's numbers.
+- **Never from a routine, whatever the budget:** a money tool that names no
+  amount (`home_guarded`'s door unlock and water main, the calendar's
+  changes), and `mail_send`.
+- **Outside text doesn't spend.** A routine that read a page, a feed, mail,
+  the calendar, another server, a forwarded message or history makes no
+  money call. The paying server's own results are the one exception, so
+  a routine can price and then buy; what that server's own text steers
+  at that same server is bounded by the budget.
+- **Anything else is refused**, and waits in your inbox as a skipped item
+  with the whole call, its amount and why, and **Make this payment**. Your
+  tap makes exactly that call as your own, through the caps and the rules
+  again. A no-amount tool's and `mail_send`'s items offer Dismiss only.
+- **Every spend is told** in main at once, with a sound, in quiet hours
+  too, with **Pause automation spending**:
+
+  ```
+  Spent 12.50 on shop/shop_order for the weekly-groceries task. Today 12.50 of 30; this month 40 of 200.
+  ```
+- **`/money`** shows the caps, the budgets, what each server moved today
+  and this month (by you and by routines), the switches, and whether
+  spending is paused. `/money pause` and `/money resume` stop and restart
+  all of routines' spending; a pause is kept across restarts
+  (`state/money-paused`). Only in your own conversations.
+- **Upgrading.** An install whose config.ini said `scheduled = on`, with no
+  budget, gets `budget_per_day` set from `max_per_day` (`[money]`'s, and a
+  money server's own in mcp.ini) at the first start, and is told once in
+  main; with only `max_per_call`, it's told that routines spend nothing
+  until a budget is set. A config.ini an older harness wrote with
+  `scheduled = off` keeps it: `/money budget` says so.
 
 In mcp.ini, `amount =` and the caps need a `money =` line in the same
 section, a per-tool `amount` names only tools listed there, and `none` is
@@ -3107,8 +3173,8 @@ only after a 3% move. A section's keys give its kind:
   file patterns ignore case on macOS and Windows.
 
 Not yet: mail triggers (whether harness reads your mailbox or an address
-of its own is still your call), money in runs a trigger starts (`[money]
-triggers = off`, see Money), webhooks and websockets.
+of its own is still your call), webhooks and websockets. Money in runs a
+trigger starts goes by the budget for routines (see Money).
 
 ## Workflows
 
@@ -3259,14 +3325,13 @@ sections `[workflow:NAME]`), labelled `workflow NAME#N/STEP`.
   an item holds is not asked: the step fails. A shell step after files
   were written is asked, naming them.
 - **Money** in a tool step is asked every time in the inbox, never for 24
-  h, whatever `[money] scheduled` says; caps are checked when the item is
+  h, whatever the budget for routines says; caps are checked when the item is
   made and again on Allow, when the amount counts and the call follows at
   once; `/dryrun` applies at the call.
 - **Agent steps** are runs nobody watches: `ask` is deny, each skipped
   call an item "Allow for this workflow" and `{STEP.skipped}`; they get no
-  `send` (their answer is the step's value). They move no money until you
-  decide: `[money] workflows = off`, the default; `on` makes them money in
-  scheduled runs, within the caps.
+  `send` (their answer is the step's value). They move money as routines
+  do, within the budget (`[money] workflows`, on by default; see Money).
 - An `approve` answer is data, not a grant: a later call the gate asks
   about is asked too. The one exception is `yes`: an `approve` step with
   `yes Lock it` (and `no Leave it`; No by default), right before a tool
@@ -3314,9 +3379,9 @@ sections `[workflow:NAME]`), labelled `workflow NAME#N/STEP`.
 | each step | `turn_seconds`, values 16 KB (1 MB an instance) | the step fails |
 
 Running steps take the background slots tasks use, one per instance at a
-time. Not yet: environments other than host (`env NAME`), money in agent
-steps (`[money] workflows`, your call), parallel branches, loops over
-lists, workflows starting workflows (an agent step may `delegate`).
+time. Not yet: environments other than host (`env NAME`), parallel
+branches, loops over lists, workflows starting workflows (an agent step
+may `delegate`).
 
 ## Quiet hours and the digest
 
@@ -3386,6 +3451,7 @@ memory notices held at night.
 `/folders`, `/access WHO`, `/snapshots [FOLDER]`, `/snapshot FOLDER
 [LABEL]`, `/changes FOLDER ID`, `/restore FOLDER ID`, `/undo [RUN]`, `/envs`, `/env
 check|rm NAME`, `/quiet [on|off|HH:MM-HH:MM]`, `/dryrun on|off`,
+`/money [budget N a day|a month|pause|resume]`,
 `/reload`, `/conversations`, `/conversation new|rename|rm|add`,
 `/session [N]`, `/history WORDS`, `/people`, `/person NAME`, `/list [NAME]
 [add|rm|clear|every]`, `/deliveries [rm NUMBER]`, `/upkeep [add|done|rm]`,
