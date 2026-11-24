@@ -65,6 +65,25 @@ pub fn overviewLine(a: std.mem.Allocator, name: []const u8, f: Facts) ![]const u
     return std.fmt.allocPrint(a, "{{topic:{s}}}: nothing new.", .{name});
 }
 
+/// A summary's line for topic `name`: its news, then its title as a link.
+pub fn summaryLine(a: std.mem.Allocator, name: []const u8, title: []const u8, news: []const u8) ![]const u8 {
+    const n = try item(a, news);
+    return std.fmt.allocPrint(a, "{s}: {s}{s} ({{topic:{s}}})", .{ title, n, if (endsAsked(n)) "" else ".", name });
+}
+
+/// A topic's news for a summary: what waits on the owner, else the last
+/// thing posted there, else what comes next; null: nothing.
+pub fn newsOf(a: std.mem.Allocator, f: Facts) !?[]const u8 {
+    if (f.pending.len > 0) {
+        const first = try item(a, f.pending[0]);
+        if (f.pending.len == 1) return try std.fmt.allocPrint(a, "waiting on you: {s}", .{first});
+        return try std.fmt.allocPrint(a, "{d} waiting on you, first: {s}", .{ f.pending.len, first });
+    }
+    if (f.lately.len > 0) return f.lately[f.lately.len - 1];
+    if (f.next.len > 0) return f.next[0];
+    return null;
+}
+
 const t = std.testing;
 
 test "a_card_has_its_parts_and_none" {
@@ -85,4 +104,12 @@ test "a_card_has_its_parts_and_none" {
     try t.expectEqualStrings("{topic:errands}: waiting on you: Order milk from Frisco? (and 1 more)", try overviewLine(a, "errands", .{ .title = "Errands", .pending = &.{ "Order milk from Frisco?", "Renew the passport" } }));
     try t.expectEqualStrings("{topic:house}: next: boiler service due 2 December.", try overviewLine(a, "house", .{ .title = "House", .next = &.{"boiler service due 2 December."} }));
     try t.expectEqualStrings("{topic:travel}: nothing new.", try overviewLine(a, "travel", .{ .title = "Travel", .lately = &.{"Gate B12"} }));
+}
+
+test "a_summary_line_ends_with_its_topic" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqualStrings("Errands: two deliveries today. ({topic:errands})", try summaryLine(a, "errands", "Errands", "two deliveries today"));
+    try t.expectEqualStrings("Travel: waiting on you: Check in now? ({topic:travel})", try summaryLine(a, "travel", "Travel", "waiting on you: Check in now?"));
 }

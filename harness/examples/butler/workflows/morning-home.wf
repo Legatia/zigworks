@@ -25,4 +25,4 @@ do:
 #end
 
 step tell
-say {read}
+say {read}{topics}
