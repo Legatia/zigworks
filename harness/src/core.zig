@@ -25537,6 +25537,8 @@ test "calendar_attendees_become_people" {
     const dir = try withCalendar(&f);
     const upcoming = try std.fs.path.join(a, &.{ dir, "upcoming.json" });
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = upcoming, .data = calmcp_upcoming });
+    // the morning of the calendar's day (its events are dated)
+    f.core.fixed_now = 1795420800 - 2 * 3600;
     // the diary's read of cal://upcoming: who is new, in one line
     try f.core.diaryReadNow();
     try f.rec.waitIn("main", "From your calendar, now in people: Piotr Nowak, Ewa Lis, Sam Lee, Anna Kowalska. (/people)");
