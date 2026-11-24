@@ -61,11 +61,12 @@ pub fn split(names: []const []const u8) Split {
 /// What an MCP server is to the mark.
 pub const Role = enum { home, calendar, mail, other };
 
-/// A server's role, from the name setup gives it (`[home]`, `[calendar]`,
-/// or a name with "calendar" as the diary finds it) and the tools it
-/// offers (mailmcp's, on whatever name).
+/// A server's role, from the name setup gives it (`[home]`, and `[car]`
+/// for the owner's car: their own devices' state; `[calendar]`, or a name
+/// with "calendar" as the diary finds it) and the tools it offers
+/// (mailmcp's, on whatever name).
 pub fn roleOf(server: []const u8, tool_names: []const []const u8) Role {
-    if (std.mem.eql(u8, server, "home")) return .home;
+    if (std.mem.eql(u8, server, "home") or std.mem.eql(u8, server, "car")) return .home;
     if (std.mem.indexOf(u8, server, "calendar") != null) return .calendar;
     for (tool_names) |tl| if (mail.isMailTool(tl)) return .mail;
     return .other;
@@ -174,7 +175,9 @@ test "server_roles_come_from_the_setup_names" {
     try t.expectEqual(Role.calendar, roleOf("calendar", &.{"cal_agenda"}));
     try t.expectEqual(Role.calendar, roleOf("work-calendar", &.{"cal_agenda"}));
     try t.expectEqual(Role.mail, roleOf("box", &.{ "mail_list", "mail_read" }));
-    try t.expectEqual(Role.other, roleOf("car", &.{"car_status"}));
+    // the owner's car, as /setup car names it: their own device's state
+    try t.expectEqual(Role.home, roleOf("car", &.{"car_status"}));
+    try t.expectEqual(Role.other, roleOf("shop", &.{"shop_order"}));
     try t.expectEqual(Role.other, roleOf("homely", &.{"echo"}));
 }
 
@@ -200,7 +203,8 @@ test "mcp_results_mark_by_role" {
     // the agent's own drafts and sends are no one else's words
     try t.expectEqual(0, (try ofMcp(a, "mail", .mail, "mail_draft", "draft saved")).len);
     try t.expectEqual(0, (try ofMcp(a, "mail", .mail, "mail_send", "sent")).len);
-    try t.expectEqualStrings("mcp car", (try ofMcp(a, "car", .other, "car_status", "34 %"))[0]);
+    try t.expectEqual(0, (try ofMcp(a, "car", roleOf("car", &.{}), "car_status", "34 %")).len);
+    try t.expectEqualStrings("mcp shop", (try ofMcp(a, "shop", .other, "shop_quote", "5.00"))[0]);
 }
 
 test "a_mail_turn_marks_what_it_forwards_and_quotes" {
