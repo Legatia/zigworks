@@ -950,8 +950,26 @@ kill "$RPID" 2>/dev/null
 wait "$RPID" 2>/dev/null
 RPID=""
 
+# the prompt-injection demo, in check mode: what it shows is what CI checks
+sh "$(dirname "$0")/injection-demo.sh" --check "$H" "$F" >"$T/demo.tap" 2>&1
+demo_n=0
+while IFS= read -r line; do
+	case "$line" in
+	"ok "*)
+		demo_n=$((demo_n + 1))
+		check "injection demo: ${line#ok * - }" true
+		;;
+	"not ok "*)
+		demo_n=$((demo_n + 1))
+		check "injection demo: ${line#not ok * - }" false
+		;;
+	esac
+done <"$T/demo.tap"
+check "the injection demo ran all its checks" '[ $demo_n = 28 ]'
+
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	echo "smoke: FAILED"
+	echo "--- injection demo"; cat "$T/demo.tap"
 	echo "--- run output"; cat "$T/run.out"
 	[ -f "$T/brun.out" ] && { echo "--- the butler's run output"; cat "$T/brun.out"; }
 	[ -f "$T/crun.out" ] && { echo "--- the calendar's run output"; cat "$T/crun.out"; }
