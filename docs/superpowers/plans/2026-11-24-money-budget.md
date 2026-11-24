@@ -145,7 +145,23 @@ A refusal's gate line has `budget` with the numbers. Attended money calls are as
 10. An install whose config.ini says `scheduled = off` (the old init wrote that line) keeps it; `/money budget` says the switch keeps routines from spending — an owner's line is never changed — cost if wrong: such owners edit one line before their budget applies.
 11. Setup's budget question is asked in `/setup reorder SHOP` (the only setup that connects a money server with an amount: home's, mail's and the calendar's money tools name none and never spend unattended), once per shop; its answers write `[money]` — cost if wrong: a money server added by hand is never asked about.
 12. The reorder's own line follows the told line (two messages) — the told line is the same for every automated spend; the reorder's says what came off the list — cost if wrong: one more message per order.
+13. The switches' default flip moved to Task 3's commit, so no commit has them on without the budget check — cost if wrong: none.
+14. The ledger reader treats a fifth field as damage (the old loop let one extra slip through) — cost if wrong: none.
+15. Refusal reasons keep the caps' number style ("12.5"); the budget's note and the told line use two decimals ("12.50") — cost if wrong: two styles in the log.
+16. Refusal order: `mail_send` to the gate; `harness:` jobs; no amount; then (payable) switches, paused, outside text, budget none or missing, amount, caps, budget a day, a month — cost if wrong: a refusal names its first reason only.
+17. The payment tap reuses `Errands.OrderGo`; its result is said in the item's conversation (main when others read it) — cost if wrong: one line where the owner didn't look.
+18. `/money`'s text is built in core.zig (it reads the ledger, config and running servers); money.zig keeps the pure pieces — cost if wrong: none.
+19. A failed automated call is told too ("The server said it failed; it stays counted.") — cost if wrong: a line for a payment that may not have happened (it says so).
+20. Skipped items wait out quiet hours as every skipped item does; only the told line goes at once — cost if wrong: a payment refused at night waits for the morning.
+21. A budget-refused reorder proposal says "Not ordered on its own: WHY." at the end of its body; the reorder's own lines go through the errands' post (held in quiet hours) — cost if wrong: at night "Ordered from…" waits while the told line went.
+22. The upgrade marker is written at every first start (said, or nothing to do); a file it can't write leaves it unmarked for the next start — cost if wrong: none found.
+23. Setup's question also takes a reply ("50 a day, 300 a month"); Set an amount says the commands — cost if wrong: one more line.
+24. Every unattended money decision's gate line has the budget's numbers, refusals before the budget check too — cost if wrong: one more ledger lock per call.
 
 ## Done
 
-(Filled at the end.)
+- Commits: the plan (0610a03); keys (b8eefcf); the ledger's lines (2ab7398); moneyCheck's unattended branch, switches on (65a69ca); skipped payments and [Make this payment] (743f2e0); told line, pause, `/money` (32ce546); the reorder within the budget (077a702); old installs and setup's question (12df3ca); injection case 33 (dd3361a); numbers on every decision (26f8f8f); two reorder tests changed on purpose (807a1c3); docs and smoke (b6b10e0).
+- Before the merge (b6b10e0): 1457 pass, 22 skipped of 1479 (baseline 1427 of 1449: 30 new), Debug and ReleaseSafe; smoke 152 (148 + 4: `/money`, `/money budget`, pause, resume), 185 with homemcp, carcloud, calmcp and mailmcp (181 + 4), both modes. Cross builds and unit-builds (x86_64-windows, x86_64-linux-musl, aarch64-linux-musl) ok.
+- Tests changed on purpose: config `agents_browser_and_money_sections`, `trigger_and_money_settings_read`, `workflow_settings_read` (the defaults; their defaults_ini lines follow); agent `money_in_scheduled_runs_only_when_switched_on`, `unattended_money_needs_a_cap` (now `…_needs_a_budget`), `none_in_a_servers_section_lifts_config_inis_cap_and_says_so`, `money_in_trigger_runs_is_refused_while_triggers_is_off`, `money_in_agent_steps_is_refused_while_workflows_is_off`, `money_ledger_keeps_a_total_per_server_and_reads_the_old_file` (the month line after today's); core `the_order_goes_through_the_gates_caps_and_dry_run`, `a_shop_whose_order_tool_is_not_money_is_refused` (setup's budget question is an item). gate `money_ignores_grants_and_allow_rules_and_is_refused_unattended` holds unchanged.
+- Found against the spec: `home_guarded` (amount none) was not refused unattended before this change when `scheduled = on` with a cap (amount 0 passed the caps and the gate allowed it); it is now, whatever the budget (`a_money_tool_with_no_amount_is_never_unattended`, `no_amount_tools_and_mail_send_are_never_unattended`).
+- Seen on this Mac at the base (75a5f48) too: core `each_of_these_asks` is flaky (reload says Busy), 2 of 5 runs alone.
