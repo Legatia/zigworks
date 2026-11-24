@@ -1,6 +1,7 @@
 # A delivery in the owner's mail: a line on the day it comes. Its trigger
 # (delivery-today) lists the parcels coming today; each is said once.
 workflow delivery
+subject errands
 about A delivery in your mail: a line on the day it comes.
 start trigger:delivery-today
 tag no

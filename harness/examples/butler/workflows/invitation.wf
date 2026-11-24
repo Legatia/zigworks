@@ -1,6 +1,7 @@
 # An invitation in the owner's mail: offered for the calendar. The
 # calendar's own tool asks you before the entry is made.
 workflow invitation
+subject mail
 about An invitation in your mail: offered for the calendar (you're asked first).
 start trigger:invitation-mail
 tag no

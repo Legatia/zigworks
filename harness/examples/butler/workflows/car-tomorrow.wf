@@ -1,6 +1,7 @@
 # The car for tomorrow: in the evening, a line when the car is low, and one
 # tap to start charging when it is plugged in but not charging.
 workflow car-tomorrow
+subject house
 about At <car at>: tells you when the car is under half and not plugged in, and asks with one tap to start charging when it is plugged in but not charging.
 start owner, schedule:car-evening
 tag no

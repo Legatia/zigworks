@@ -1,5 +1,6 @@
 # A door or window left open: said after 10 minutes, if it still is.
 workflow door-open
+subject house
 about A door or window left open: tells you after 10 minutes, if it still is.
 start <door starts>
 tag no

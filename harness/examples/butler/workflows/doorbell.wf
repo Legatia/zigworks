@@ -7,6 +7,7 @@
 # used. While you're away, triggers.ini's doorbell-away-... says it at
 # once instead, through quiet hours, with no unlock.
 workflow doorbell
+subject house
 about When someone rings while you're home: says so at once<doorbell words>.
 start <bell starts>
 tag no

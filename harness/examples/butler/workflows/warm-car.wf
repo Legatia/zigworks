@@ -3,6 +3,7 @@
 # [butler] warm_below outside (it wakes the car once to read it). One tap
 # makes the call below, exactly as it is; without the tap nothing is sent.
 workflow warm-car
+subject house
 about Before a morning leave-by when it is below <warm below> °C at the car: asks with one tap to warm the car.
 start harness:warm-car
 tag no

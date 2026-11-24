@@ -1341,6 +1341,8 @@ pub const Core = struct {
         settings_locked = false;
         c.settings_mutex.unlock(c.io);
         c.loadPersona();
+        // topics switched on or off in @BotFather meanwhile
+        c.readTopicsOn();
         const said = try c.restartMcp();
         // the voice agent's address or token changed: it starts again
         if (std.mem.eql(u8, c.role, "run")) c.startVoiceAgent();
@@ -1565,6 +1567,14 @@ pub const Core = struct {
         if (!tell) return;
         var buf: [256]u8 = undefined;
         c.say(std.fmt.bufPrint(&buf, "Telegram refused the topic of {s}, so its posts come here with [{s}] in front.", .{ conv, conv }) catch "Telegram refused a topic; its posts come here.");
+    }
+
+    /// Whether topics in private chats are on for the bot, asked again
+    /// (getMe); as before when it can't be asked.
+    fn readTopicsOn(c: *Core) void {
+        const ch = c.chan orelse return;
+        const me = ch.me orelse return;
+        c.topics_on = me(ch.ctx) catch c.topics_on;
     }
 
     /// `text` with each `{topic:NAME}` its topic's title, linked where the
@@ -11260,6 +11270,12 @@ pub const Core = struct {
             try Manner.offer(c, a, conv, "manner alone");
             return "";
         }
+        if (eql(u8, what, "topics")) {
+            if (Topics.made(c)) return "Topics are on already: /overview lists them.";
+            if (!Topics.open(c)) return "Topics are Telegram's: send /setup topics in your chat with the bot, where harness run answers.";
+            try Topics.offer(c, a, conv);
+            return "";
+        }
         if (eql(u8, what, "calendar")) return c.setupCalendar(a, conv, std.mem.trim(u8, words.rest(), " \t"));
         if (eql(u8, what, "reorder")) return Errands.setupReorder(c, a, words.rest());
         if (eql(u8, what, "upkeep")) return Errands.setupUpkeep(c, a, conv);
@@ -11487,7 +11503,8 @@ pub const Core = struct {
         var tries: u32 = 0;
         while (true) : (tries += 1) {
             const r = c.reload() catch |e| return @errorName(e);
-            if (std.mem.eql(u8, r, "Settings reloaded.")) return null;
+            // persona.md's note after it is no failure
+            if (std.mem.startsWith(u8, r, "Settings reloaded.")) return null;
             if (!std.mem.startsWith(u8, r, "Busy") or tries >= 80) return if (std.mem.startsWith(u8, r, "Busy")) "Written; it applies after /reload, when nothing is running." else r;
             c.io.sleep(.fromMilliseconds(250), .awake) catch {};
         }
@@ -11512,6 +11529,7 @@ pub const Core = struct {
         if (std.mem.startsWith(u8, run, "habit ")) return Habits.answer(c, a, run["habit ".len..], conv, key);
         if (eql(u8, run, "evening")) return Evening.answer(c, a, key);
         if (eql(u8, run, "manner") or eql(u8, run, "manner alone")) return Manner.answer(c, a, run, conv, key, words);
+        if (eql(u8, run, "topics")) return Topics.answer(c, a, conv, key);
         if (eql(u8, run, "persona write") or eql(u8, run, "persona save")) return Persona.answer(c, a, run, conv, key, words);
         if (eql(u8, run, "setup address")) {
             const w = std.mem.trim(u8, words orelse "", " \t\r\n<>");
@@ -11643,6 +11661,8 @@ pub const Core = struct {
         // then the evening message and the butler's manner (Evening, Manner)
         if (only == null and Evening.open(c)) try names.appendSlice(a, "evening\n");
         if (only == null and Manner.open(c)) try names.appendSlice(a, "manner\n");
+        // then topics, once the household's routines are on (Topics)
+        if (only == null and Topics.open(c)) try names.appendSlice(a, "topics\n");
         try util.writeReplace(c.io, try c.setupPath(a, "offers"), names.items);
         if (names.items.len == 0) return "Every routine your home has what for is on. /workflows lists them.";
         try c.offerNext(a, conv);
@@ -11677,6 +11697,10 @@ pub const Core = struct {
             }
             if (std.mem.eql(u8, name, "manner")) {
                 if (Manner.open(c)) return Manner.offer(c, a, conv, "manner");
+                continue;
+            }
+            if (std.mem.eql(u8, name, "topics")) {
+                if (Topics.open(c)) return Topics.offer(c, a, conv);
                 continue;
             }
             const r = std.meta.stringToEnum(butler.Routine, name) orelse continue;
@@ -22378,6 +22402,9 @@ test "a_routine_is_shown_then_written_on_turn_on" {
     try f.press("later");
     try f.rec.waitFor("BUTTONS I can answer you here as a butler");
     try f.press("later");
+    // then topics: Keep everything in main
+    try f.rec.waitFor("BUTTONS Topics: ");
+    try f.press("later");
     try f.rec.waitFor("That's all the routines: 3 on.");
     try t.expect(f.core.cfg.butler.evening == null and !f.core.defs.has("butler"));
     try expectHas(try f.core.command(a, "/setup"), "Routines on: Goodnight, Morning summary, Leak.");
@@ -30280,6 +30307,9 @@ test "setup_offers_the_evening_and_the_butler" {
     try t.expect(!f.core.defs.has("butler"));
     var buf: [agents_name_max]u8 = undefined;
     try t.expectEqualStrings("main", f.core.convAgent(&buf, "main"));
+    // then topics: Keep everything in main
+    try f.rec.waitFor("BUTTONS Topics: House, Travel, Errands, Mail and diary, and Work");
+    try f.press("later");
     try f.rec.waitFor("That's all the routines: 0 on.");
 }
 
@@ -31955,6 +31985,106 @@ test "history_marks_what_it_shows_of_a_forwarded_message" {
 /// topic's focus, setup's offer, cards, `/overview`.
 const Topics = struct {
     const not_here = "Use /focus in a topic: it says what that topic is about.";
+    const all = [_]topics_mod.Subject{ .house, .travel, .errands, .mail, .work };
+    const botfather = "Telegram didn't let harness switch topics on for the bot. In @BotFather: your bot, Bot Settings, Topics in private chats, on. Then /setup topics again.";
+
+    /// The butler's topics are made (their subjects have topics).
+    fn made(c: *Core) bool {
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        for (all) |s| if (c.convs.bySubject(@tagName(s)) == null) return false;
+        return true;
+    }
+
+    /// Setup offers them: Telegram has topics, and they aren't made yet.
+    fn open(c: *Core) bool {
+        const ch = c.chan orelse return false;
+        if (ch.open_topic == null) return false;
+        return !made(c);
+    }
+
+    fn offer(c: *Core, a: std.mem.Allocator, conv: []const u8) !void {
+        c.withdrawSetupItems(a, "topics");
+        _ = try c.addItem(.{
+            .kind = "routine",
+            .run = "topics",
+            .conversation = conv,
+            .title = "Topics",
+            .body = "Topics: House, Travel, Errands, Mail and diary, and Work each get a topic for their posts, with a card at the top saying what each holds now. main keeps the summaries, urgent alerts and what waits on you. Use topics switches topics on for the bot and opens the five.",
+            .choices = &.{ .{ .key = "on", .label = "Use topics" }, .{ .key = "later", .label = "Keep everything in main" } },
+            .expires = c.now() + 7 * 86400,
+        });
+    }
+
+    /// [Use topics]: topics on for the bot (setMySettings, else the
+    /// BotFather switch explained), the five topics opened and written,
+    /// the routines harness wrote filed into them; applied.
+    fn answer(c: *Core, a: std.mem.Allocator, conv: []const u8, key: []const u8) !Core.SetupDone {
+        _ = conv;
+        if (!std.mem.eql(u8, key, "on")) return .{ .offer = .next };
+        const ch = c.chan orelse return .{ .said = "There is no chat to open topics in.", .offer = .next };
+        const open_topic = ch.open_topic orelse return .{ .said = "Topics are Telegram's: send /setup topics in your chat with the bot.", .offer = .next };
+        c.readTopicsOn();
+        if (!c.topics_on) {
+            const set = ch.topics orelse return .{ .said = botfather, .offer = .next };
+            set(ch.ctx, true) catch |e| {
+                c.log.write(.config, false, .{ .event = "topics not switched on", .why = @errorName(e) }) catch {};
+                return .{ .said = botfather, .offer = .next };
+            };
+            c.topics_on = true;
+            c.log.write(.config, false, .{ .event = "topics on" }) catch {};
+        }
+        const chat = blk: {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            break :blk (c.convs.find("main") orelse return .{ .said = "Pair the bot first: harness pair.", .offer = .next }).chat;
+        };
+        for (all) |s| {
+            const name = @tagName(s);
+            {
+                c.convs.mutex.lockUncancelable(c.io);
+                defer c.convs.mutex.unlock(c.io);
+                if (c.convs.bySubject(name) != null) continue;
+                // a topic of the owner's of that name already: it files the subject
+                if (c.convs.find(name)) |e| if (e.thread != 0 and e.audience == .own) {
+                    try c.convs.setTopic(name, if (e.title.len > 0) e.title else topics_mod.title(s), topics_mod.focus(s), name);
+                    continue;
+                };
+            }
+            const thread = open_topic(ch.ctx, chat, topics_mod.title(s)) catch |e|
+                return .{ .said = try std.fmt.allocPrint(a, "Telegram didn't open the topic {s} ({s}); /setup topics tries again.", .{ topics_mod.title(s), @errorName(e) }), .offer = .next };
+            {
+                c.convs.mutex.lockUncancelable(c.io);
+                defer c.convs.mutex.unlock(c.io);
+                _ = try c.convs.add(.{ .name = name, .chat = chat, .thread = thread, .created = c.now(), .title = topics_mod.title(s), .focus = topics_mod.focus(s), .subject = name });
+            }
+            c.log.write(.chat, false, .{ .event = "conversation added", .name = name, .thread = thread, .subject = name }) catch {};
+        }
+        try fileRoutines(c, a);
+        if (c.applySetup()) |why| return .{ .said = try std.fmt.allocPrint(a, "The topics are made. {s}", .{why}), .offer = .next };
+        return .{ .said = "Topics are on: House, Travel, Errands, Mail and diary, and Work. Their posts go there from now on; main keeps the summaries, urgent alerts and what waits on you. /overview lists them.", .offer = .next };
+    }
+
+    /// The routines harness wrote get their subject (where they have no
+    /// to and no subject), the morning summary its topics' lines.
+    fn fileRoutines(c: *Core, a: std.mem.Allocator) !void {
+        for (butler.all) |r| {
+            const path = try std.fs.path.join(a, &.{ c.paths.workflows, try std.fmt.allocPrint(a, "{s}.wf", .{r.name()}) });
+            const text = c.readOr(a, path);
+            if (text.len == 0) continue;
+            var now = text;
+            if (butler.subjectOf(r)) |s| if (try butler.withSubject(a, now, s)) |x| {
+                now = x;
+            };
+            if (r == .@"morning-home") if (try butler.morningWithTopics(a, now)) |x| {
+                now = x;
+            };
+            if (now.ptr != text.ptr) try c.writeSetting(path, now);
+        }
+        const trig = c.readOr(a, c.paths.triggers);
+        const with = try butler.triggersWithSubjects(a, trig);
+        if (!std.mem.eql(u8, with, trig)) try c.writeSetting(c.paths.triggers, with);
+    }
 
     /// `/focus [WORDS]` in a topic of the owner's chat.
     fn focusCommand(c: *Core, a: std.mem.Allocator, conv: []const u8, rest: []const u8) ![]const u8 {
@@ -32328,4 +32458,88 @@ test "a_topic_link_is_the_title_linked" {
     f.core.say("Mail: nothing new. ({topic:mail})");
     try f.rec.waitIn("main", "Mail: nothing new. (Mail and diary)");
     try t.expectEqual(null, f.rec.entitiesOf("nothing new"));
+}
+
+// ---- topics: setup's offer ----
+
+test "use_topics_turns_them_on_and_makes_five_topics" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // a persona.md that falls back says so, and setup's steps still apply
+    try writePersona(&f, "---\npreset: pirate\n---\n");
+    f.rec.topics_now = false;
+    f.core.topics_on = false;
+    try t.expectEqualStrings("", try f.core.command(a, "/setup topics"));
+    try f.rec.waitFor("BUTTONS Topics: House, Travel, Errands, Mail and diary, and Work each get a topic for their posts");
+    try f.press("on");
+    try f.rec.waitFor("SETTINGS topics on");
+    try f.rec.waitFor("Topics are on: House, Travel, Errands, Mail and diary, and Work. Their posts go there from now on; main keeps the summaries, urgent alerts and what waits on you. /overview lists them.");
+    try t.expect(f.core.topics_on);
+    {
+        f.core.convs.mutex.lockUncancelable(t.io);
+        defer f.core.convs.mutex.unlock(t.io);
+        for ([_]topics_mod.Subject{ .house, .travel, .errands, .mail, .work }) |s| {
+            const e = f.core.convs.bySubject(@tagName(s)).?;
+            try t.expectEqualStrings(@tagName(s), e.name);
+            try t.expectEqualStrings(topics_mod.title(s), e.title);
+            try t.expectEqualStrings(topics_mod.focus(s), e.focus);
+            try t.expect(e.thread > 5000);
+            try t.expectEqual(42, e.chat);
+        }
+    }
+    try expectHas(try conversationsText(&f), "\"title\":\"Mail and diary\"");
+    // once
+    try t.expectEqualStrings("Topics are on already: /overview lists them.", try f.core.command(a, "/setup topics"));
+}
+
+test "where_set_my_settings_fails_the_botfather_switch_is_explained" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    f.rec.topics_now = false;
+    f.rec.settings_fail = true;
+    try t.expectEqualStrings("", try f.core.command(a, "/setup topics"));
+    try f.rec.waitFor("BUTTONS Topics: ");
+    try f.press("on");
+    try f.rec.waitFor("Telegram didn't let harness switch topics on for the bot. In @BotFather: your bot, Bot Settings, Topics in private chats, on. Then /setup topics again.");
+    f.core.convs.mutex.lockUncancelable(t.io);
+    defer f.core.convs.mutex.unlock(t.io);
+    try t.expectEqual(null, f.core.convs.bySubject("house"));
+}
+
+test "use_topics_adds_subject_lines_only_where_missing" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const mark = "# added by /setup routines 2026-11-01: the butler's Goodnight routine (harness/examples/butler)\n";
+    try writeWorkflow(&f, "goodnight", mark ++ "workflow goodnight\nabout Lights off.\nstart owner\n\nstep tell\nsay Good night.\n");
+    try writeWorkflow(&f, "leaving", "# added by /setup routines 2026-11-01: the butler's Leaving routine (harness/examples/butler)\nworkflow leaving\nto main\nstart owner\n\nstep tell\nsay Bye.\n");
+    try writeWorkflow(&f, "arriving", "workflow arriving\nstart owner\n\nstep tell\nsay Hello.\n");
+    try writeWorkflow(&f, "morning-home", "# added by /setup routines 2026-11-01: the butler's Morning summary routine (harness/examples/butler)\nworkflow morning-home\nstart owner\n\nstep read\ndo Read the house.\n\nstep tell\nsay {read}\n");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.triggers, .data = "; added by /setup routines 2026-11-01: Goodnight\n[goodnight-at]\nat = 21:30\nstart = workflow goodnight\n\n[mine]\nat = 08:00\nsay = Mine.\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expectEqualStrings("", try f.core.command(a, "/setup topics"));
+    try f.rec.waitFor("BUTTONS Topics: ");
+    try f.press("on");
+    try f.rec.waitFor("Topics are on:");
+    const wf = struct {
+        fn text(fx: *Fix, name: []const u8) []const u8 {
+            const al = fx.e.arena.allocator();
+            return fileText(fx, std.fs.path.join(al, &.{ fx.core.paths.workflows, std.fmt.allocPrint(al, "{s}.wf", .{name}) catch "" }) catch "");
+        }
+    }.text;
+    try expectHas(wf(&f, "goodnight"), "workflow goodnight\nsubject house\n");
+    // the owner's to, and a file harness didn't write: as they were
+    try t.expect(std.mem.indexOf(u8, wf(&f, "leaving"), "subject") == null);
+    try t.expect(std.mem.indexOf(u8, wf(&f, "arriving"), "subject") == null);
+    // the morning summary: the topics' lines
+    try expectHas(wf(&f, "morning-home"), "say {read}{topics}\n");
+    const trig = fileText(&f, f.core.paths.triggers);
+    try expectHas(trig, "[goodnight-at]\nsubject = house\nat = 21:30\n");
+    try expectHas(trig, "[mine]\nat = 08:00\nsay = Mine.\n");
+    try t.expectEqual(1, std.mem.count(u8, trig, "subject"));
 }

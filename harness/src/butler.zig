@@ -962,6 +962,82 @@ pub fn onText(a: Allocator, r: Routine, p: Picks) ![]const u8 {
 }
 
 /// The routines in the order setup offers them.
+/// The topic a routine's posts are filed in when topics are in use
+/// (topics.zig); null: main (the summaries).
+pub fn subjectOf(r: Routine) ?[]const u8 {
+    return switch (r) {
+        .@"morning-home" => null,
+        .goodnight, .leaving, .arriving, .leak, .smoke, .@"door-open", .doorbell, .away, .@"car-tomorrow", .@"warm-car" => "house",
+        .bill, .invitation => "mail",
+        .delivery => "errands",
+        .flight, .trips => "travel",
+    };
+}
+
+/// The first line of a workflow /setup routines wrote.
+pub const setup_mark = "# added by /setup routines ";
+
+/// A workflow harness wrote (setup's mark first) with `subject S` after
+/// its `workflow` line, where its head has no `to` and no `subject`;
+/// null: left as it is.
+pub fn withSubject(a: Allocator, text: []const u8, subject: []const u8) !?[]const u8 {
+    if (!std.mem.startsWith(u8, text, setup_mark)) return null;
+    const head = text[0 .. std.mem.indexOf(u8, text, "\nstep ") orelse text.len];
+    var lines = std.mem.splitScalar(u8, head, '\n');
+    while (lines.next()) |raw| {
+        const l = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.eql(u8, l, "to") or std.mem.startsWith(u8, l, "to ") or std.mem.startsWith(u8, l, "subject ")) return null;
+    }
+    const w = std.mem.indexOf(u8, text, "\nworkflow ") orelse return null;
+    const eol = std.mem.indexOfScalarPos(u8, text, w + 1, '\n') orelse return null;
+    return try std.fmt.allocPrint(a, "{s}subject {s}\n{s}", .{ text[0 .. eol + 1], subject, text[eol + 1 ..] });
+}
+
+/// triggers.ini with `subject = S` after the header of each section
+/// /setup routines added (its `; added by` line names the routine) that
+/// has no `to` and no `subject`.
+pub fn triggersWithSubjects(a: Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var all_lines: std.ArrayList([]const u8) = .empty;
+    while (lines.next()) |l| try all_lines.append(a, l);
+    const ls = all_lines.items;
+    var subject: ?[]const u8 = null;
+    for (ls, 0..) |raw, i| {
+        const l = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.startsWith(u8, l, "; added by /setup routines ")) {
+            subject = null;
+            if (std.mem.indexOf(u8, l, ": ")) |c| for (all) |r| if (std.mem.eql(u8, l[c + 2 ..], r.title())) {
+                subject = subjectOf(r);
+            };
+        }
+        try out.appendSlice(a, raw);
+        if (i + 1 < ls.len) try out.append(a, '\n');
+        if (l.len > 0 and l[0] == '[') {
+            const s = subject orelse continue;
+            subject = null;
+            // the section's own lines: a to or subject of its own stays
+            const has = for (ls[i + 1 ..]) |nraw| {
+                const n = std.mem.trim(u8, nraw, " \t\r");
+                if (n.len > 0 and n[0] == '[') break false;
+                if (std.mem.startsWith(u8, n, "to ") or std.mem.startsWith(u8, n, "to=") or std.mem.startsWith(u8, n, "subject")) break true;
+            } else false;
+            if (!has) try out.print(a, "subject = {s}\n", .{s});
+        }
+    }
+    return out.items;
+}
+
+/// The morning summary harness wrote, with the topics' lines after what
+/// it reads (`say {read}{topics}`); null: an edited or owner's file.
+pub fn morningWithTopics(a: Allocator, text: []const u8) !?[]const u8 {
+    if (!std.mem.startsWith(u8, text, setup_mark) or std.mem.indexOf(u8, text, "{topics}") != null) return null;
+    const at = std.mem.indexOf(u8, text, "\nsay {read}") orelse return null;
+    const end = at + "\nsay {read}".len;
+    if (end < text.len and text[end] != '\n' and text[end] != '\r') return null;
+    return try std.fmt.allocPrint(a, "{s}{{topics}}{s}", .{ text[0..end], text[end..] });
+}
+
 pub const all = [_]Routine{ .goodnight, .leaving, .arriving, .@"morning-home", .leak, .smoke, .@"door-open", .doorbell, .away, .@"car-tomorrow", .@"warm-car", .bill, .delivery, .flight, .invitation, .trips };
 
 /// Where a doorbell rings, from its name: "the front door" for
@@ -1693,7 +1769,9 @@ test "routines_fill_from_the_sims_home" {
     const gn = try routineFiles(a, .goodnight, p, "2026-11-23");
     try t.expect(std.mem.indexOf(u8, gn.workflow, "about When you say goodnight (or at 21:45): the lights off, the heating to 18 °C, and one tap before the front door is locked.") != null);
     try t.expect(std.mem.indexOf(u8, gn.workflow, "approve The front door is unlocked.\nyes Lock it\nno Leave it") != null);
-    try t.expectEqualStrings("; added by /setup routines 2026-11-23: Goodnight\n[goodnight-at]\nat = 21:45\nstart = workflow goodnight\n", gn.triggers);
+    try t.expectEqualStrings("; added by /setup routines 2026-11-23: Goodnight\n[goodnight-at]\nat = 21:45\nstart = workflow goodnight\nsubject = house\n", gn.triggers);
+    // filed in the house's topic when topics are in use
+    try t.expect(std.mem.indexOf(u8, gn.workflow, "\nsubject house\n") != null);
     const lk = try routineFiles(a, .leak, p, "2026-11-23");
     try t.expect(std.mem.indexOf(u8, lk.triggers, "[leak-sink_leak]\nmcp = home resource home://device/sink_leak\nmatch = to has leak\nstart = workflow leak Sink leak, Kitchen\nurgent = yes") != null);
     try t.expect(std.mem.indexOf(u8, lk.workflow, "yes Close the water main") != null);
