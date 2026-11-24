@@ -563,5 +563,11 @@ nothing; a real drive's root still refused),
 `the_sandbox_launcher_starts_nothing_it_was_not_told_to`,
 `env_check_probes_a_sandbox_and_a_copy_environment` (its new line).
 
+At 772c8c4: Windows 11 1172 pass, 48 skip, smoke all ok; Linux (WSL, user
+tester) 1198 pass, 21 skip, smoke all ok run alone, and the one failure
+this machine's WSL always has. With the built binary: `harness env check
+box` says "cmd's own dir, del, ren, copy, move: yes"; `harness
+sandbox-launch` by hand starts nothing (exit 125).
+
 Left: GitHub's Windows runners were not tried before the push; if the
 service is off there, the tests that need the drives say so in CI.
