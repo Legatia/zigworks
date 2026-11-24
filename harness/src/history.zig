@@ -562,7 +562,7 @@ fn readLine(a: std.mem.Allocator, io: Io, f: Io.File, ref: LineRef) ![]const u8 
 
 /// One hit as shown: when and where, what the run started with, its
 /// posts (or its answer), the tool calls with a term in them.
-fn hitText(a: std.mem.Allocator, io: Io, f: Io.File, h: Hit, terms: []const Term, utc_offset: i32) !struct { text: []const u8, start_s: i64 } {
+fn hitText(a: std.mem.Allocator, io: Io, f: Io.File, h: Hit, terms: []const Term, utc_offset: i32) !struct { text: []const u8, start_s: i64, tools: bool } {
     const v = jv.parse(a, try readLine(a, io, f, h.first)) orelse return error.BadLogLine;
     const start_s = util.parseIso(jv.str(jv.get(v, "time")) orelse "") orelse 0;
     const conv = jv.str(jv.get(v, "conversation")) orelse "-";
@@ -596,13 +596,19 @@ fn hitText(a: std.mem.Allocator, io: Io, f: Io.File, h: Hit, terms: []const Term
     }
     // a reply posted by harness is a post; before posts, the answer was it
     if (posts == 0) if (answer) |x| if (x.len > 0) try out.print(a, "Agent: {s}\n", .{try snippet(a, x, terms)});
-    return .{ .text = out.items, .start_s = start_s };
+    return .{ .text = out.items, .start_s = start_s, .tools = calls > 0 };
 }
 
 /// What a search found, as the agent or the owner reads it: each run with
 /// its date (the owner's time), conversation and run, newest first, within
 /// `max_bytes` (0: no limit), then where older ones are.
 pub fn render(a: std.mem.Allocator, io: Io, path: []const u8, found: Found, terms: []const Term, utc_offset: i32, max_bytes: usize, scope: Scope) ![]const u8 {
+    var seen = false;
+    return renderSeen(a, io, path, found, terms, utc_offset, max_bytes, scope, &seen);
+}
+
+/// `render`; `saw_tools` is set when a turn shown had tool calls.
+fn renderSeen(a: std.mem.Allocator, io: Io, path: []const u8, found: Found, terms: []const Term, utc_offset: i32, max_bytes: usize, scope: Scope, saw_tools: *bool) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     if (found.hits.len == 0) {
         var said: std.ArrayList(u8) = .empty;
@@ -620,6 +626,7 @@ pub fn render(a: std.mem.Allocator, io: Io, path: []const u8, found: Found, term
             // room for the line that says where the rest is
             if (max_bytes > 0 and out.items.len + part.text.len + 160 > max_bytes and shown > 0) break;
             try out.appendSlice(a, if (max_bytes > 0) util.cut(part.text, max_bytes -| 160) else part.text);
+            if (part.tools) saw_tools.* = true;
             shown += 1;
             oldest = part.start_s;
         }
@@ -639,6 +646,13 @@ pub fn render(a: std.mem.Allocator, io: Io, path: []const u8, found: Found, term
 /// Run `rid` step by step (the session view, at most `max_bytes`), if the
 /// scope holds it and it was not private.
 pub fn runView(a: std.mem.Allocator, io: Io, path: []const u8, scope: Scope, rid: u64, max_bytes: usize) ![]const u8 {
+    var seen = false;
+    return runViewSeen(a, io, path, scope, rid, max_bytes, &seen);
+}
+
+/// `runView`; `saw_tools` is set when the run had tool calls (their
+/// results are in the view).
+pub fn runViewSeen(a: std.mem.Allocator, io: Io, path: []const u8, scope: Scope, rid: u64, max_bytes: usize, saw_tools: *bool) ![]const u8 {
     const none = if (scope.all)
         try std.fmt.allocPrint(a, "No run {d} in the log.", .{rid})
     else
@@ -663,7 +677,9 @@ pub fn runView(a: std.mem.Allocator, io: Io, path: []const u8, scope: Scope, rid
     }
     // a private run's line keeps sizes and hashes, not what was said
     if (std.mem.indexOf(u8, first, "\":{\"bytes\":") != null) return std.fmt.allocPrint(a, "Run {d} is private: what was said in it is not in the log.", .{rid});
-    return (try session.render(a, text, rid, max_bytes)) orelse none;
+    const shown = (try session.render(a, text, rid, max_bytes)) orelse return none;
+    saw_tools.* = std.mem.indexOf(u8, text, try std.fmt.allocPrint(a, "\"kind\":\"tool\",\"rid\":{d},", .{rid})) != null;
+    return shown;
 }
 
 /// `harness log search WORDS…`: every conversation, no size limit; an
@@ -709,7 +725,12 @@ pub const View = struct {
     secrets: []const scrub.Secret = &.{},
 };
 
-pub const Answer = struct { text: []const u8, is_error: bool = false };
+pub const Answer = struct {
+    text: []const u8,
+    is_error: bool = false,
+    /// What it shows holds earlier tool results: outside text, maybe.
+    tools: bool = false,
+};
 
 /// The run a call asks for (a number, or digits as text), or null.
 fn runOf(v: ?jv.Value) ?u64 {
@@ -732,12 +753,16 @@ pub fn gateArg(a: std.mem.Allocator, input_json: []const u8) ![]const u8 {
 pub fn call(a: std.mem.Allocator, io: Io, src: *const Source, view: View, input_json: []const u8) !Answer {
     const got = try callRaw(a, io, src, view, input_json);
     var sc = try scrub.Scrubber.init(a, view.secrets);
-    return .{ .text = try sc.scrubAlloc(a, got.text), .is_error = got.is_error };
+    return .{ .text = try sc.scrubAlloc(a, got.text), .is_error = got.is_error, .tools = got.tools };
 }
 
 fn callRaw(a: std.mem.Allocator, io: Io, src: *const Source, view: View, input_json: []const u8) !Answer {
     const v = jv.parse(a, input_json) orelse return .{ .text = "history needs words, or a run's number", .is_error = true };
-    if (runOf(v)) |rid| return .{ .text = try runView(a, io, src.log_path, view.scope, rid, max_view) };
+    if (runOf(v)) |rid| {
+        var seen = false;
+        const text = try runViewSeen(a, io, src.log_path, view.scope, rid, max_view, &seen);
+        return .{ .text = text, .tools = seen };
+    }
     const terms = try parseTerms(a, jv.str(jv.get(v, "words")) orelse "");
     if (terms.len == 0) return .{ .text = "history needs words, or a run's number", .is_error = true };
     var q: Query = .{ .terms = terms, .conversation = jv.str(jv.get(v, "conversation")) };
@@ -749,7 +774,9 @@ fn callRaw(a: std.mem.Allocator, io: Io, src: *const Source, view: View, input_j
         error.FileNotFound => Found{ .hits = &.{} },
         else => return e,
     };
-    return .{ .text = try render(a, io, src.log_path, found, terms, view.utc_offset, max_view, view.scope) };
+    var seen = false;
+    const text = try renderSeen(a, io, src.log_path, found, terms, view.utc_offset, max_view, view.scope, &seen);
+    return .{ .text = text, .tools = seen };
 }
 
 const t = std.testing;

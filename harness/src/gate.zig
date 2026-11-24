@@ -164,6 +164,9 @@ pub const Ctx = struct {
     /// A `send` to the run's own conversation (where its message came
     /// from): a household member's run may post there.
     here: bool = false,
+    /// The run's model has read outside text (outside.zig): `remember`
+    /// and `people note` are asked by default.
+    outside: bool = false,
 };
 
 /// What a grant covers: the exact argument, or for `fetch` and `browse`
