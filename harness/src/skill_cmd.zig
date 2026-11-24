@@ -642,10 +642,7 @@ const Sx = struct {
     }
 
     fn path(sx: *Sx, rel: []const u8) []const u8 {
-        const p = std.fs.path.join(sx.a(), &.{ sx.e.dir, rel }) catch unreachable;
-        // as the command prints it: Windows' own separators all the way
-        if (std.fs.path.sep != '/') std.mem.replaceScalar(u8, p, '/', std.fs.path.sep);
-        return p;
+        return std.fs.path.join(sx.a(), &.{ sx.e.dir, rel }) catch unreachable;
     }
 
     /// A folder's path as `add` keeps it: the system's own full path (on
