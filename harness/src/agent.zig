@@ -1317,6 +1317,10 @@ pub const McpTool = struct {
     /// config.ini's [money].
     max_per_call: ?u32 = null,
     max_per_day: ?u32 = null,
+    /// The server's own budgets for automation (mcp.ini); 0: none (it
+    /// spends nothing there unattended); null: config.ini's [money].
+    budget_per_day: ?u32 = null,
+    budget_per_month: ?u32 = null,
 };
 
 /// What one server offers the model, and what the owner should know about
@@ -1378,7 +1382,7 @@ pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, cfg: mcp.ServerConfig,
         const field: mcp.Field = if (is_money) cfg.amount.of(tl.name) else .unset;
         if (is_money and field == .unset and capped)
             try notes.print(arena, "{s}: {s} has no amount field in mcp.ini (amount =), so its calls are refused while a money cap is set\n", .{ tl.server, tl.name });
-        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = field, .max_per_call = cfg.max_per_call, .max_per_day = cfg.max_per_day });
+        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = field, .max_per_call = cfg.max_per_call, .max_per_day = cfg.max_per_day, .budget_per_day = cfg.budget_per_day, .budget_per_month = cfg.budget_per_month });
     }
     return .{ .tools = out.items, .notes = notes.items };
 }

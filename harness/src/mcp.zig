@@ -60,6 +60,11 @@ pub const ServerConfig = struct {
     /// the ones in config.ini's [money].
     max_per_call: ?u32 = null,
     max_per_day: ?u32 = null,
+    /// `budget_per_day =`, `budget_per_month =`: what automation may spend
+    /// at this server; 0 for `none` (automation spends nothing here);
+    /// null: config.ini's [money].
+    budget_per_day: ?u32 = null,
+    budget_per_month: ?u32 = null,
     /// `env = NAME=VALUE` lines: a program's plain variables, in order.
     env: []const EnvVar = &.{},
 };
@@ -127,6 +132,7 @@ pub const Amount = union(enum) {
 pub fn configReason(e: anyerror) ?[]const u8 {
     return switch (e) {
         error.ZeroCap => "0 is not a cap here: write none to lift config.ini's cap for this server, or remove the line to use config.ini's",
+        error.ZeroBudget => "0 is not a budget here: write none (automation spends nothing at this server), or remove the line to use config.ini's",
         error.CommandAndUrl => "command and url exclude each other: a server is a program to start or an address to reach",
         error.TokenAndLogin => "token and login = oauth exclude each other: a server takes a stored token or a sign-in",
         error.PlainHttpUrl => "url is https, or http only to this machine (localhost, 127.0.0.1 or [::1])",
@@ -147,6 +153,7 @@ pub fn configReason(e: anyerror) ?[]const u8 {
 pub const ConfigError = error{
     BadConfig,
     ZeroCap,
+    ZeroBudget,
     CommandAndUrl,
     TokenAndLogin,
     PlainHttpUrl,
@@ -238,6 +245,15 @@ pub fn isLoopback(host: []const u8) bool {
 }
 
 /// A server's cap: a whole number above 0, or `none` (0 here: no cap).
+/// A server's budget: `none` (0: automation spends nothing here) or a
+/// whole number above 0.
+fn parseBudget(value: []const u8) error{ BadConfig, ZeroBudget }!u32 {
+    if (std.mem.eql(u8, value, "none")) return 0;
+    const n = std.fmt.parseInt(u32, value, 10) catch return error.BadConfig;
+    if (n == 0) return error.ZeroBudget;
+    return n;
+}
+
 fn parseCap(value: []const u8) error{ BadConfig, ZeroCap }!u32 {
     if (std.mem.eql(u8, value, "none")) return 0;
     const n = std.fmt.parseInt(u32, value, 10) catch return error.BadConfig;
@@ -261,7 +277,7 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) ConfigError![]Ser
         var cfg: ServerConfig = .{ .name = name, .command = "", .secrets = &.{}, .money = &.{} };
         var headers: std.ArrayList(std.http.Header) = .empty;
         var env_vars: std.ArrayList(EnvVar) = .empty;
-        const keys = [_][]const u8{ "command", "secret", "money", "amount", "max_per_call", "max_per_day", "url", "token", "header", "login", "client_id", "scope", "env" };
+        const keys = [_][]const u8{ "command", "secret", "money", "amount", "max_per_call", "max_per_day", "url", "token", "header", "login", "client_id", "scope", "env", "budget_per_day", "budget_per_month" };
         var seen: [keys.len]bool = @splat(false);
         while (i < ls.len and std.mem.eql(u8, ls[i].section, name)) : (i += 1) {
             const l = ls[i];
@@ -342,6 +358,8 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) ConfigError![]Ser
                 3 => cfg.amount = try parseAmount(arena, l.value),
                 4 => cfg.max_per_call = try parseCap(l.value),
                 5 => cfg.max_per_day = try parseCap(l.value),
+                13 => cfg.budget_per_day = try parseBudget(l.value),
+                14 => cfg.budget_per_month = try parseBudget(l.value),
                 else => unreachable,
             }
         }
@@ -351,7 +369,7 @@ pub fn parseConfig(arena: std.mem.Allocator, text: []const u8) ConfigError![]Ser
         cfg.headers = headers.items;
         cfg.env = env_vars.items;
         // caps are for money tools: without them they are a mistake
-        if ((cfg.max_per_call != null or cfg.max_per_day != null) and cfg.money.len == 0) return error.BadConfig;
+        if ((cfg.max_per_call != null or cfg.max_per_day != null or cfg.budget_per_day != null or cfg.budget_per_month != null) and cfg.money.len == 0) return error.BadConfig;
         // an amount names money tools: without them it is a mistake
         switch (cfg.amount) {
             .unset => {},
@@ -1261,6 +1279,26 @@ test "parse_config_takes_the_amount_field_per_tool" {
             return error.TestUnexpectedResult;
         } else |e| try t.expectEqual(error.BadConfig, e);
     }
+}
+
+test "parse_config_takes_budgets_per_server" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const servers = try parseConfig(a, "[b]\ncommand = x\nmoney = p\namount = usd\nbudget_per_day = 30\nbudget_per_month = none\n[c]\ncommand = y\nmoney = q\n");
+    try t.expectEqual(30, servers[0].budget_per_day.?);
+    // none: automation spends nothing at this server
+    try t.expectEqual(0, servers[0].budget_per_month.?);
+    try t.expectEqual(null, servers[1].budget_per_day);
+    try t.expectEqual(null, servers[1].budget_per_month);
+    try t.expectError(error.ZeroBudget, parseConfig(a, "[b]\ncommand = x\nmoney = p\nbudget_per_day = 0\n"));
+    try t.expect(std.mem.indexOf(u8, configReason(error.ZeroBudget).?, "write none (automation spends nothing at this server)") != null);
+    for ([_][]const u8{
+        "[b]\ncommand = x\nbudget_per_day = 10\n", // a budget without money tools
+        "[b]\ncommand = x\nmoney = p\nbudget_per_day = 1\nbudget_per_day = 2\n",
+        "[b]\ncommand = x\nmoney = p\nbudget_per_month = -1\n",
+        "[b]\ncommand = x\nmoney = p\nbudget_per_month = None\n",
+    }) |text| try t.expectError(error.BadConfig, parseConfig(a, text));
 }
 
 test "parse_config_takes_money_caps_per_server" {
