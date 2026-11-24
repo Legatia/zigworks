@@ -2792,6 +2792,7 @@ test {
     _ = @import("masks.zig");
     _ = @import("skills.zig");
     _ = @import("agents.zig");
+    _ = @import("persona.zig");
     _ = @import("mcp.zig");
     _ = @import("mcp_http.zig");
     _ = @import("oauth.zig");
