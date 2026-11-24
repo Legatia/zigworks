@@ -248,6 +248,11 @@ and cross builds green, and the owner decides every push.
   count as an error (it lists the sandbox's home now), and one failed
   start of a session ended the drives for the whole process (R37, R38
   in the plan's section 9).
+- The Windows runner's refusal is explained (plan R39, R40): Windows
+  Server gives sandboxes (app containers) no access to NUL, so `>nul`
+  there says "Access is denied". It was never `dir` or the drives. For
+  the Mac session: a test or smoke step that runs a command in a Windows
+  sandbox must not redirect to nul; outside a sandbox nul is fine.
 - For the Mac session: `calendar_attendees_become_people` fails on every
   system while the clock is inside a busy event of its fixture (the
   owner is busy, so the line is held): CI run 45388410033 ran during

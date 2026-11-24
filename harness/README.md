@@ -1855,6 +1855,14 @@ of cmd's don't. `/env check NAME` says which it is ("cmd's own dir, del,
 ren, copy, move: yes"). Starting a command this way takes a little
 longer (some tens of milliseconds).
 
+On Windows Server nothing in a sandbox can open `NUL`: `>nul`, `2>nul`
+and `<nul` say "Access is denied", and so does a program that opens it
+itself. Windows Server gives that device no entry for app containers
+(Windows 11 does), and only an administrator could add one; harness
+doesn't. `/env check NAME` says which it is ("NUL (>nul, 2>nul): yes"),
+and where it is no the agent is told to leave output be or redirect to a
+file.
+
 The data folder inside a `read =` folder (`read = ~`) is refused on every
 system; on Windows that makes the data folder stop inheriting access from
 the folder above it (who may use it stays the same), and it stays so

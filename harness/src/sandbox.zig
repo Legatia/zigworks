@@ -811,6 +811,34 @@ pub fn hasDriveLetters() bool {
     return is_windows and drive_letters and !no_session.load(.acquire);
 }
 
+/// Whether a sandbox here can open NUL (`>nul`, `2>nul`, a program's own
+/// null output). Windows Server gives the device no entry for app
+/// containers (Windows 11 does), and only an administrator could add one.
+/// True where it can't be told.
+pub fn nulOpen() bool {
+    if (!is_windows) return true;
+    const known = nul_known.load(.acquire);
+    if (known != 0) return known == 1;
+    const yes = nulAllowsAppContainers() catch true;
+    nul_known.store(if (yes) 1 else 2, .release);
+    return yes;
+}
+
+var nul_known: std.atomic.Value(u8) = .init(0);
+
+fn nulAllowsAppContainers() !bool {
+    var dacl: ?*anyopaque = null;
+    var sd: ?*anyopaque = null;
+    const name = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\NUL");
+    if (win.GetNamedSecurityInfoW(name, win.SE_FILE_OBJECT, win.DACL_SECURITY_INFORMATION, null, null, &dacl, null, &sd) != 0) return error.Unknown;
+    defer _ = win.LocalFree(sd);
+    var text: ?[*:0]u16 = null;
+    if (win.ConvertSecurityDescriptorToStringSecurityDescriptorW(sd.?, 1, win.DACL_SECURITY_INFORMATION, &text, null) == .FALSE) return error.Unknown;
+    defer _ = win.LocalFree(text);
+    // an allow entry for ALL APPLICATION PACKAGES: `(A;…;;;AC)`
+    return std.mem.indexOf(u16, std.mem.span(text.?), std.unicode.utf8ToUtf16LeStringLiteral(";;;AC)")) != null;
+}
+
 /// The program that is the launcher: harness itself; in the unit tests,
 /// harness-fake.
 fn launcher(io: Io, arena: std.mem.Allocator) ![2][]const u8 {
@@ -864,6 +892,7 @@ const win = struct {
     extern "advapi32" fn GetNamedSecurityInfoW(name: [*:0]const u16, kind: c_int, info: u32, owner: ?*?PSID, group: ?*?PSID, dacl: *?*anyopaque, sacl: ?*?*anyopaque, sd: *?*anyopaque) callconv(.winapi) u32;
     extern "advapi32" fn SetEntriesInAclW(count: u32, entries: [*]EXPLICIT_ACCESS_W, old: ?*anyopaque, new: *?*anyopaque) callconv(.winapi) u32;
     extern "advapi32" fn SetNamedSecurityInfoW(name: [*:0]u16, kind: c_int, info: u32, owner: ?PSID, group: ?PSID, dacl: ?*anyopaque, sacl: ?*anyopaque) callconv(.winapi) u32;
+    extern "advapi32" fn ConvertSecurityDescriptorToStringSecurityDescriptorW(sd: *anyopaque, rev: u32, info: u32, text: *?[*:0]u16, len: ?*u32) callconv(.winapi) windows.BOOL;
     extern "advapi32" fn GetAce(acl: *anyopaque, index: u32, ace: *?*anyopaque) callconv(.winapi) windows.BOOL;
     extern "advapi32" fn DeleteAce(acl: *anyopaque, index: u32) callconv(.winapi) windows.BOOL;
     extern "advapi32" fn EqualSid(a: PSID, b: PSID) callconv(.winapi) windows.BOOL;
@@ -1636,12 +1665,12 @@ test "sandbox_changes_files_the_owner_made" {
         // in its home and its temporary folder too (a drive of their own)
         try expectOk(try f.run("echo t> \"%TEMP%\\t.txt\" && dir /b \"%TEMP%\" && del \"%TEMP%\\t.txt\""));
         try expectOk(try f.run("cd /d \"%USERPROFILE%\" && echo h> h.txt && ren h.txt i.txt && del i.txt"));
-        // (said, not required: Windows Server 2025 on CI refused a dir of
-        // the home drive's root from /env check, and this machine doesn't)
-        for ([_][]const u8{ "dir /b \"%USERPROFILE%\"", "cd /d \"%USERPROFILE%\" && dir /b", "dir /b W:\\", "icacls \"%USERPROFILE%.\"" }) |probe| {
-            const got = try f.run(probe);
-            if (got.is_error) std.debug.print("sandbox drive probe `{s}` said:\n{s}\n", .{ probe, got.text });
-        }
+        // a drive's root lists, the home's too
+        try expectOk(try f.run("dir W:\\"));
+        try expectOk(try f.run("dir \"%USERPROFILE%\""));
+        // NUL opens where Windows lets app containers at it (Windows 11),
+        // and not where it doesn't (Windows Server): as nulOpen says
+        try t.expectEqual(nulOpen(), !(try f.run("echo x>nul")).is_error);
         // the real path still names the same files, for programs
         const real = try std.fmt.allocPrint(f.a, "type \"{s}\\moved\\c.txt\"", .{f.ws});
         try expectHas((try f.run(real)).text, "changed");
