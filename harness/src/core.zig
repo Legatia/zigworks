@@ -12047,6 +12047,11 @@ fn questionParts(a: std.mem.Allocator, what: []const u8) ![]const []const u8 {
         \\/bedtime [23:30|off]: one gentle line on your first message after it
         \\/evening [21:00|off|now]: one message about tomorrow
         \\/setup butler: answer as a butler, addressing you as you like
+        \\/persona [butler|assistant|friend]: how the agent talks; /persona name, address or language WORDS; /persona write; /persona reset
+        \\/setup topics: House, Travel, Errands, Mail and diary and Work, each a topic of this chat
+        \\/overview: a line per topic, with links (in main)
+        \\/focus WORDS: what this topic is about; /card: post and pin this topic's card
+        \\/work: the latest helpers' work here (the Work topic has each)
     ;
 
     /// A command sent in `main` (or from the command line).

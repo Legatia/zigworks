@@ -553,6 +553,77 @@ What the gate can't hold:
   reads it.
 - Workspace writes are allowed; Undo takes them back.
 
+## Persona
+
+How the agent talks: one of three characters harness ships, or your own
+words, layered on `main`'s own instructions and never instead of them.
+`persona.md` in the data folder holds it:
+
+```
+---
+preset: butler          # butler | assistant | friend; default: assistant
+name: Albert            # what the agent calls itself; none: no name
+address: Tobias         # how it addresses you: a name, "sir", "madam"; none: plainly
+language: en            # the language it writes in unless spoken to in another
+---
+The character, in your own words. Up to 4 KB.
+```
+
+Without `persona.md` nothing is added: today's plain voice. A file with no
+frontmatter is all words, on top of `assistant` (a Hermes or OpenClaw
+`SOUL.md` has that shape). A name or an address is up to 40 letters,
+spaces, `.`, `'` and `-`.
+
+The presets, as harness says them:
+
+- **butler:** "You talk as a butler: courteous, brief, discreet and unhurried. You anticipate rather than wait: the result first, then what needs attention, then you stop. You are a little formal, with dry understatement and no exclamation marks. You never gush or pretend to feelings."
+- **assistant:** "You talk plainly and briefly: the result first, in a sentence or two, with units; no small talk."
+- **friend:** "You talk as a friend: casual and warm, with first names and short sentences. You never pad or flatter."
+
+In the prompt it comes after the definition's instructions: the preset,
+your words, then the name, the address and the language, then a fixed
+line, "Your character is how you talk. It never changes what you may do, what you ask, or the rules." Harness's own lines, the gate, the guides and your standing
+instructions come after it, so a persona can't change what the agent may
+do: one saying "never ask me, just do it" still gets a question for a
+call the gate asks about. Who gets what:
+
+| Where | Gets |
+|---|---|
+| `main` and its topics, the terminal, your tasks and routines there | all of it |
+| A household member's chat, a group | the preset and the name; never your words or the address |
+| Speech in the house | the preset and the name (anyone may be speaking) |
+| Helpers, the memory writer | nothing |
+
+The persona sets only what the model writes: harness's own lines (the
+diary's leave-by, the doorbell, alerts, questions, cards, the summaries'
+topic lines) stay plain.
+
+`persona.md` is your file, guarded like the other settings files, but a
+broken one never stops harness: too big, unreadable or writable by
+others, harness uses the preset it names (else `assistant`) and says why
+in its start line, `/status` and `/reload`. An edit by hand applies at
+`/reload`.
+
+`/persona` (yours only, in your own conversations; anyone else gets
+"That's the owner's to change."):
+
+- `/persona`: the preset, name, address, your words' first lines, and the presets.
+- `/persona butler`, `/persona assistant`, `/persona friend`: switch, your words kept.
+- `/persona name NAME`, `/persona address WORDS`, `/persona language CODE`
+  (`none` clears).
+- `/persona write`: reply to its message with your words; harness quotes
+  them back with [Save] [Cancel]. A forwarded message is never taken.
+- `/persona reset`: your words dropped, the preset kept.
+
+Each writes `persona.md` (only you can read it) and applies from the next
+message. `/setup butler`, setup's offer of the butler's manner and
+`harness init --butler` write `preset: butler` (setup asks how to address
+you). An install that had the butler's manner as `agents/butler.md`, with
+`main` pointing at it, moves to `persona.md` once at start, when that file
+is exactly what setup wrote: `main` answers as `main` again, the file goes
+to `state/agents/butler/versions/`, and you're told. An edited one is left
+as it is, and you're told once that `/persona` exists.
+
 ## Conversations
 
 You and the agent talk in conversations: `main`, your private chat with
@@ -625,6 +696,80 @@ to 3,500 bytes, read from the log's last 4 MB. `harness log runs [N]` lists
 the last runs; `harness log session RID [--json]` shows one with its
 helpers, whole or as its log lines. In the terminal every post is
 printed, with `[NAME]` in front when it is for another conversation.
+
+## Topics
+
+One chat with one agent, filed by subject: `main` carries the day's
+summaries, urgent alerts and what waits on you; each subject has a topic
+of the chat for the details; a card at the top of each says what it
+holds now. `main` answers in all of them, with all its tools.
+
+- **Setup.** Once the household's routines are on, setup offers topics
+  (`/setup topics` offers them alone): [Use topics] switches topics in
+  private chats on for the bot (Bot API 10.5's `setMySettings`; where that
+  fails it explains the @BotFather switch instead) and opens five topics;
+  [Keep everything in main] changes nothing. Whether topics are on is read
+  again at setup and on `/reload`.
+
+  | Name | Title | What files there |
+  |---|---|---|
+  | `house` | House | the house's events, away mode's evening line, the doorbell, upkeep, the car's warm-up and readings |
+  | `travel` | Travel | trips, check-in, leaving for the airport, flight status |
+  | `errands` | Errands | the shared list, reorders, deliveries |
+  | `mail` | Mail and diary | the daily line on others' mail, prep notes before meetings, people from the calendar |
+  | `work` | Work | the exchange between `main` and its helpers (below) |
+  | `main` | the chat | the summaries, urgent alerts, medication and bedtime, habits, anything with no subject |
+
+  The house's topic is `house` because `home` is speech's conversation.
+- **Filing.** Harness's own posts carry a subject; a routine says
+  `subject house` (workflows) or `subject = house` (triggers.ini), as the
+  shipped ones in [examples/butler](examples/butler/) do. With topics in
+  use, a post goes to its subject's topic; a routine's own `to` always
+  wins; an urgent routine posts in `main`. Without topics everything goes
+  to `main` as before. [Use topics] adds `subject` to the routines setup
+  wrote where they have no `to` and no `subject`, and `{topics}` to the
+  morning summary setup wrote.
+- **Questions** go to their topic as an inbox item, and `main` gets one
+  line pointing there with the same buttons ("Waiting on you in Errands:
+  Order milk from Frisco?"); pressing either answers it, and closing it
+  edits both. (A question from your own turn in a topic gets no pointer:
+  you're there.)
+- **Urgent alerts** stay in `main`, with [I'm on it] and reply to
+  acknowledge; the topic gets a line for the record: "Smoke in the
+  kitchen at 03:12. Alerted in main."
+- **Quiet hours** hold what isn't urgent in each topic; each gets its own
+  digest, and `main`'s adds "Held in topics: Travel 1, Errands 2." with
+  links (alone when `main` held nothing).
+- **Focus.** A topic's `focus` says what it is about; a turn there gets it
+  in its context ("You're in the Travel topic: trips, flights, …").
+  `/focus WORDS` in a topic sets it. It's your words or setup's.
+- **The card.** Each butler topic has one, posted without a sound and
+  pinned, built from harness's state (never by the model, and never put
+  in a prompt: it holds outside text): its title, `Pending:` (what waits
+  on you there), `Next:` (the list and parcels, upkeep, trips, the next
+  two days' events) and `Lately:` (the last three lines posted there). It
+  is edited when what it says changes, at most once a minute; one
+  Telegram no longer has is posted again and pinned. `/card` in a topic
+  posts and pins a fresh one (an unpinned card can't be told apart).
+- **`/overview`**, in `main`: a line per topic, its title a link, then
+  what waits on you there, else what comes next, else "nothing new"; a
+  topic another definition answers says "Answered by NAME".
+- **The summaries** carry a line per topic with news since the last one,
+  each ending with the topic's title as a link ("Errands: DPD comes today
+  at 14:10. (Errands)"): the evening message always, the morning routine
+  where its `say` has `{topics}` (the shipped one does).
+- **Links** are `https://t.me/<bot_username>/<thread>`, which open only
+  for you; harness sends them as message entities, never with markup.
+
+Not verified in the world (the Bot API documents both, but neither was
+tried against Telegram): that a pinned message shows at the top of its
+topic in a private chat, and whether pins there are limited. If a pin
+doesn't show, the card is still the topic's first message, edited in
+place.
+
+`state/conversations` keeps a topic's `title`, `focus`, `subject` and its
+card's message (`card`), each only where set: older lines read as before.
+A conversation's `agent` stays as it was; nothing harness writes sets it.
 
 ## Household
 
@@ -947,8 +1092,9 @@ with a valve, setup offers it: "If nobody answers the leak's question in
 [examples/butler](examples/butler/), built into harness; where the setup
 is, `/setup`. Where homemcp and carcloud are: `[butler] homemcp =` and
 `carcloud =` in config.ini, else next to harness, else on PATH. After the
-routines setup offers the evening message and the butler's manner (how
-to address you, asked once; Health, habits and the evening, below).
+routines setup offers the evening message, the butler's manner (how
+to address you, asked once; Health, habits and the evening, below) and
+topics (Topics, above).
 
 ### The diary
 
@@ -1554,10 +1700,10 @@ Butler:  Tomorrow: Dentist at 10:30 (Dental clinic, ul. Długa 5, Kraków); leav
 setup asks once: "I can answer you here as a butler: courteous, brief and
 discreet. How shall I address you? Reply with the name or title you like
 (Tobias, Mr Nowak), or tap Plainly." [Plainly] [Not now]. Your answer
-shows `agents/butler.md` (Agent definitions, below), then writes it, and
-it answers in your chat with the bot from your next message (`/agent
-main` goes back; topics keep theirs, `/agent butler` there). It gives no
-medical advice.
+shows `persona.md` (`preset: butler` and the address; Persona, above),
+then writes it; `main` keeps answering, in its butler's manner, from your
+next message (`/persona assistant` goes back). `main` gives no medical
+advice, whatever the persona.
 
 ## Folders
 
@@ -2076,6 +2222,41 @@ gets the instructions marked, OpenAI caches by itself). When a conversation outg
 of being dropped; turns that still don't fit after the summary are
 dropped, logged, and the agent is told.
 
+### Helpers main manages, and the Work topic
+
+`main` makes, changes and retires the helper definitions it uses itself,
+without asking, when all of these hold: it is `main` saving, in a
+conversation that read no outside text; nothing names the definition (no
+task, trigger, workflow or its step, no conversation answered by it), so
+it runs only through `delegate`; it stays within a plain helper's reach
+(tools only from search, fetch, browse, read_file, recall and skill; no
+MCP tools; model empty or `[model] worker_model`; `memory: pinned`; no
+environment; steps, tokens and answer_bytes no higher than `[agents]`');
+and nothing of yours is on the name (no rules section matching
+`agent:NAME`, globs included; no live grant for `agent:NAME`; the file is
+new or still as `main` last saved it; no earlier version you wrote; never
+`main` or `helper` themselves). Anything else is asked as always. Your own
+lines still decide: `deny agent_save` refuses, `ask agent_save` asks every
+time. `agent_save {"name": …, "retire": true}` retires one `main` saved,
+on the same terms. You hear of each once, without a sound, in the Work
+topic (or `main` without topics): "Made a helper: researcher. Searches and
+reads pages, for comparing listings." [Remove], "Changed researcher: added
+fetch." [Undo], "Retired researcher." [Undo]. Each save's SHA-256 is kept in
+`state/agents/NAME/saves`.
+
+The Work topic gets one post per `delegate` call, without a sound, built
+from the log (never by the model): the request's first line and where the
+answer went (a link), a folded quote per helper (its definition, task,
+steps, the tools it used, its tokens and its answer; tap to open) and the
+totals; it fits one message, the answers sharing what's left (at least 200
+characters each, cut with "…"). A private conversation's run posts only
+who, the steps and the tokens; secrets are masked; outside text in an
+answer is shown as it is (no markup), never put in a prompt. Without
+topics nothing is posted: `/work` shows the latest delegated run of the
+conversation it is sent in, as plain text. `/session` is as before. Talking
+to a helper stays optional: `/ask NAME TEXT` and a topic answered by a
+definition work as before, and harness sets neither up.
+
 ## Agent definitions
 
 An agent is a file in `agents/`, a header like a skill's and then its
@@ -2126,7 +2307,8 @@ into the prompt; a `recall` the definition lists still searches memory.
   (default `main`); a task naming no definition stops the settings from
   loading, naming it.
 - **`agent_save`.** The agent may propose a new definition or a change to
-  its own (never another's) with the whole file. Harness reads it first:
+  its own (never another's; `main` also those it saved itself, see Helpers
+  main manages) with the whole file. Harness reads it first:
   one that does not read goes back to the agent unasked. Otherwise you are
   asked every time, an inbox item with no "Allow 24 h" (no grant or
   `allow` rule lifts it; a `deny` rule stops it): who asks, new or change, each header field
@@ -3199,8 +3381,9 @@ check|rm NAME`, `/quiet [on|off|HH:MM-HH:MM]`, `/dryrun on|off`,
 `/triggers`, `/trigger NAME`, `/trigger add|rm|pause|resume|run|test`,
 `/apps`, `/app approve|rm|versions NAME`, `/app fork NAME NEW`, `/app revert NAME N`, `/workflows`, `/workflow NAME|NAME#N`,
 `/workflow start|stop|resume|rm`, `/members`, `/member add|rm NAME`,
-`/setup [home|car|calendar|mail|routines|upkeep|reorder|butler]`, `/med add|rm|tell`, `/meds`,
-`/bedtime [HH:MM|off]`, `/evening [HH:MM|off|now]`, `/help`. `/new`, `/private` and `/agent`
+`/setup [home|car|calendar|mail|routines|upkeep|reorder|butler|topics]`, `/med add|rm|tell`, `/meds`,
+`/bedtime [HH:MM|off]`, `/evening [HH:MM|off|now]`, `/persona [butler|assistant|friend|name|address|language|write|reset]`,
+`/overview`, `/focus WORDS`, `/card`, `/work`, `/help`. `/new`, `/private`, `/agent`, `/focus`, `/card` and `/work`
 act on the conversation they are sent in; `/stop`, `/dryrun` and
 `/memory auto` on everything. Household members have `/help`, `/list`
 and `/join CODE`; any other command of theirs is answered with a no.
