@@ -21,6 +21,12 @@ error.Unexpected NTSTATUS=0xc0000043 (SHARING_VIOLATION)
 - It passed on Windows at 2d3c3d2, just before your push.
 - It's yours to fix, since it needs a Windows machine.
 
+Still red at 615d9f3 (run 45414619782), the injection checks' merge.
+That merge's unit tests all pass on Windows: 1235/1286, 50 skipped, and
+`env_check` is the only failure. The smoke step depends on the unit
+step, though, so the injection demo hasn't had its first Windows run.
+It runs once `env_check` passes.
+
 The same runs also failed on all three systems in
 `calendar_attendees_become_people`. That one is ours: the test read the
 real clock, and the fixture has a busy event from 12:00 to 13:00 UTC on

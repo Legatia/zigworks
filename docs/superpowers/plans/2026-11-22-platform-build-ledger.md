@@ -148,3 +148,4 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
   - Final: Ruling: the calendar attendees job, quick replies, the owner's own audio and the `people note` grant key are left as they are. Each is the owner's own action, or behaviour that predates this work.
   - Final: minor (deferred): `raw_input` on unoffered-call lines is logged uncut (the web tool cuts at 1500).
   - Final: minor (deferred): `skill_save` keeps "Allow 24 h" in a marked conversation.
+- CI 45414619782 (615d9f3, the injection checks merged): 29/31. Linux and macOS are green, injection cases and demo included. Windows harness: `env_check_probes_a_sandbox_and_a_copy_environment` fails (SHARING_VIOLATION). It has been the Windows session's since 772c8c4, and it blocks the smoke and demo there. Every injection unit test passes on Windows. Windows llmcheck ran 52 minutes with no result (a lost runner); rerun.
