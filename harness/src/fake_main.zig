@@ -15,6 +15,7 @@ const fake = @import("fake.zig");
 const fake_mcp = @import("fake_mcp.zig");
 const fake_cal = @import("fake_cal.zig");
 const fake_shop = @import("fake_shop.zig");
+const proc = @import("proc.zig");
 
 pub fn main(init: std.process.Init) u8 {
     const io = init.io;
@@ -22,6 +23,8 @@ pub fn main(init: std.process.Init) u8 {
     var dir: ?[]const u8 = null;
     var port: u16 = 0;
     if (args.len == 2 and std.mem.eql(u8, args[1], "--mcp")) return fake_mcp.run(io, init.gpa, init.environ_map);
+    // the unit tests' sandboxes: harness's own launcher (proc.zig)
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--" ++ proc.launch_arg)) return proc.sandboxLaunch(init.arena.allocator(), init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--home")) return fake_mcp.runHome(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--car")) return fake_mcp.runCar(io, init.gpa, init.environ_map);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--mcp") and std.mem.eql(u8, args[2], "--tesla")) return fake_mcp.runTesla(io, init.gpa, init.environ_map);

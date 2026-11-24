@@ -12401,8 +12401,8 @@ pub const Core = struct {
         const check_file = try std.fs.path.join(a, &.{ seen, ".harness-env-check" });
         const Probe = struct { what: []const u8, command: []const u8, want: bool };
         const probes = [_]Probe{
-            // (Windows: cmd's own dir and del can't be used in a sandbox:
-            // they ask the drive, which it may not open)
+            // (Windows: by their real paths, where cmd's own dir and del
+            // can't be used: they ask the drive, which a sandbox may not open)
             .{ .what = if (copy_mode) "its copy of the workspace: read" else "workspace: read", .command = if (win) try std.fmt.allocPrint(a, "if not exist \"{s}/*\" exit 1", .{seen}) else try std.fmt.allocPrint(a, "ls -A {s} >/dev/null", .{try shQuote(a, seen)}), .want = e.workspace != .none },
             .{ .what = if (copy_mode) "its copy of the workspace: write" else "workspace: write", .command = if (win) try std.fmt.allocPrint(a, "echo probe> \"{s}\"", .{check_file}) else try std.fmt.allocPrint(a, ": > {s} && rm {s}", .{ try shQuote(a, check_file), try shQuote(a, check_file) }), .want = e.workspace == .rw or copy_mode },
             .{ .what = "the data folder: read", .command = if (win) try std.fmt.allocPrint(a, "type \"{s}\" >nul", .{c.paths.config}) else try std.fmt.allocPrint(a, "cat {s} >/dev/null", .{try shQuote(a, c.paths.config)}), .want = false },
@@ -12424,8 +12424,15 @@ pub const Core = struct {
             if (yes != p.want) odd += 1;
             try out.print(a, "{s}: {s}{s}\n", .{ p.what, if (yes) "yes" else "no", if (yes != p.want) " (not what environments.ini says)" else "" });
         }
-        // (Windows: what the write probe left; the sandbox's cmd can't del)
+        // (Windows: what the write probe left)
         Io.Dir.cwd().deleteFile(c.io, check_file) catch {};
+        // Windows: cmd's own commands need the sandbox's own drive letters
+        if (win) {
+            var r = req;
+            r.command = "dir /b >nul";
+            const works = if (sandbox.run(tenv, a, r)) |o| !o.is_error else |_| false;
+            try out.appendSlice(a, if (works) "cmd's own dir, del, ren, copy, move: yes\n" else "cmd's own dir, del, ren, copy, move: no (they need Windows' Secondary Logon service, which gives the sandbox drive letters of its own; programs and the agent's file tools work without it)\n");
+        }
         if (odd == 0) try out.appendSlice(a, "As environments.ini says.") else try out.print(a, "{d} not as environments.ini says (outside: is this machine online?).", .{odd});
         return out.items;
     }
@@ -22682,6 +22689,11 @@ test "env_check_probes_a_sandbox_and_a_copy_environment" {
     for ([_][]const u8{ "its copy of the workspace: read: yes\n", "its copy of the workspace: write: yes\n", "the data folder: read: no\n", "As environments.ini says." }) |want| {
         if (std.mem.indexOf(u8, cbox, want) == null) std.debug.print("/env check cbox said:\n{s}\n", .{cbox});
         try t.expect(std.mem.indexOf(u8, cbox, want) != null);
+    }
+    // Windows: with drive letters of its own, cmd's own commands work
+    if (builtin.os.tag == .windows) {
+        try t.expect(std.mem.indexOf(u8, box, "cmd's own dir, del, ren, copy, move: yes\n") != null);
+        try t.expect(std.mem.indexOf(u8, cbox, "cmd's own dir, del, ren, copy, move: yes\n") != null);
     }
     // nothing of the probes is left in the workspace
     var ws = try Io.Dir.cwd().openDir(t.io, f.core.workspace, .{ .iterate = true });

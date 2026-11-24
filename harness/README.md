@@ -1745,15 +1745,30 @@ and the copy is then kept 7 days (its path is said). Nothing is written
 through a symbolic link. Each run has its own copy, so several can work
 at once.
 
-**Windows sandboxes and cmd.** Inside an AppContainer, cmd's own `dir`,
-`del`, `ren`, `copy`, `move` and `cd /d` say "Access is denied": they
-first ask the drive what file system it has, and a sandbox may not open
-a drive's root. Programs (git, python, node, a compiler) and `type`,
-`echo >` and `if exist` work, and so do the agent's file tools. The data
-folder inside a `read =` folder (`read = ~`) is refused on every system;
-on Windows that makes the data folder stop inheriting access from the
-folder above it (who may use it stays the same), and it stays so after
-`/env rm`.
+**Windows sandboxes and their drives.** On Windows a sandbox sees the
+workspace as a drive of its own (`W:\`, or the next letter down that the
+machine doesn't use) and its home as another (`V:\`); a `workspace =
+copy` run sees its copy there. cmd's own `dir`, `del`, `ren`, `copy`,
+`move` and `cd /d` first ask a path's drive what file system it has, and
+a sandbox may not open a real drive's root, so on the real paths they say
+"Access is denied"; on the sandbox's own drives they work. The letters
+exist only for the sandbox and what it starts: not in your Explorer, not
+for other programs, and they are gone when the command ends. The real
+paths still name the same files, for programs that are given one.
+
+Harness gets those drives from Windows' Secondary Logon service (the one
+behind `runas`), which starts each sandboxed command in a logon session
+of its own. Where that service is switched off, sandboxes run as before
+by their real paths: programs (git, python, node, a compiler), `type`,
+`echo >`, `if exist` and the agent's file tools work, those six commands
+of cmd's don't. `/env check NAME` says which it is ("cmd's own dir, del,
+ren, copy, move: yes"). Starting a command this way takes a little
+longer (some tens of milliseconds).
+
+The data folder inside a `read =` folder (`read = ~`) is refused on every
+system; on Windows that makes the data folder stop inheriting access from
+the folder above it (who may use it stays the same), and it stays so
+after `/env rm`.
 
 ## Apps
 

@@ -254,7 +254,205 @@ pub fn systemDir(gpa: std.mem.Allocator) ![]u8 {
     return std.unicode.utf16LeToUtf8Alloc(gpa, buf[0..n]);
 }
 
+// ---- Windows: a sandbox with drive letters of its own ----
+//
+// cmd's own dir, del, ren, copy, move and cd /d first ask a path's drive
+// what file system it has, and an AppContainer may not open a real
+// drive's root (its access list is an administrator's to change). So the
+// folders a sandbox works in are drives of its own. DOS device names
+// belong to a logon session: the sandbox is started from a launcher that
+// Windows' Secondary Logon service starts in a new one (as `runas
+// /netonly` does: the same user here, other credentials only toward the
+// network, which an AppContainer doesn't use). There the launcher names
+// the drives and starts the AppContainer's cmd; every program that starts
+// sees them, no other session does (not Explorer either), and they are
+// gone with the session's last process.
+
+/// The launcher's argument, for harness itself and for harness-fake.
+pub const launch_arg = "sandbox-launch";
+
+/// The drive letters this session has (bit 0 is A).
+pub fn logicalDrives() u32 {
+    return if (is_windows) win.GetLogicalDrives() else 0;
+}
+
+/// The variables that tell the launcher what to start; it takes them out
+/// of what the sandbox gets.
+const launch_prefix = "HARNESS_SBX_";
+
+pub const Drive = struct { letter: u8, folder: []const u8 };
+
+pub const SessionSpawn = struct {
+    /// The program that is the launcher, and the argument that makes it one.
+    launcher: [2][]const u8,
+    app: []const u8,
+    command_line: []const u8,
+    env: *const std.process.Environ.Map,
+    /// Where the launcher starts (a real path); the command changes to
+    /// its drive itself.
+    cwd: []const u8,
+    /// The AppContainer's name, and whether it reaches outside hosts.
+    profile: []const u8,
+    network: bool,
+    drives: []const Drive,
+};
+
+/// Windows: starts the launcher suspended (for Job.adopt) in a logon
+/// session of its own, with stdout and stderr pipes and stdin NUL, which
+/// it hands on to the sandbox's command. error.NoSession: the Secondary
+/// Logon service doesn't start one here (switched off, or not allowed).
+pub fn spawnInSession(io: Io, arena: std.mem.Allocator, o: SessionSpawn) !std.process.Child {
+    if (!is_windows) return error.Unsupported;
+    var vars = try o.env.clone(arena);
+    try vars.put(launch_prefix ++ "APP", o.app);
+    try vars.put(launch_prefix ++ "LINE", o.command_line);
+    try vars.put(launch_prefix ++ "PROFILE", o.profile);
+    try vars.put(launch_prefix ++ "NET", if (o.network) "1" else "0");
+    var list: std.ArrayList(u8) = .empty;
+    for (o.drives) |d| try list.print(arena, "{c}={s}|", .{ d.letter, d.folder });
+    try vars.put(launch_prefix ++ "DRIVES", list.items);
+    const block = try envBlock(arena, &vars);
+    const exe = try std.unicode.utf8ToUtf16LeAllocZ(arena, o.launcher[0]);
+    const cmd = try std.unicode.utf8ToUtf16LeAllocZ(arena, try std.fmt.allocPrint(arena, "\"{s}\" {s}", .{ o.launcher[0], o.launcher[1] }));
+    const cwd = try std.unicode.utf8ToUtf16LeAllocZ(arena, o.cwd);
+
+    const out = try Pipe.open();
+    errdefer out.read.close(io);
+    defer out.write.close(io);
+    const err = try Pipe.open();
+    errdefer err.read.close(io);
+    defer err.write.close(io);
+    var sa: win.SECURITY_ATTRIBUTES = .{ .length = @sizeOf(win.SECURITY_ATTRIBUTES), .descriptor = null, .inherit = .TRUE };
+    const nul = win.CreateFileW(std.unicode.utf8ToUtf16LeStringLiteral("NUL"), win.GENERIC_READ, 3, &sa, win.OPEN_EXISTING, 0, null);
+    if (nul == windows.INVALID_HANDLE_VALUE) return error.Unexpected;
+    defer windows.CloseHandle(nul);
+    for ([_]windows.HANDLE{ out.write.handle, err.write.handle }) |h| {
+        if (!win.SetHandleInformation(h, win.HANDLE_FLAG_INHERIT, win.HANDLE_FLAG_INHERIT).toBool()) return error.Unexpected;
+    }
+    // (the service copies these three to the new process; it passes on no
+    // other handle)
+    var si: win.STARTUPINFOW = std.mem.zeroes(win.STARTUPINFOW);
+    si.cb = @sizeOf(win.STARTUPINFOW);
+    si.dwFlags = win.STARTF_USESTDHANDLES;
+    si.hStdInput = nul;
+    si.hStdOutput = out.write.handle;
+    si.hStdError = err.write.handle;
+    var pi: win.PROCESS_INFORMATION = undefined;
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    const flags = win.CREATE_SUSPENDED | win.CREATE_NO_WINDOW | win.CREATE_UNICODE_ENVIRONMENT;
+    // a name and password that are never checked here (LOGON_NETCREDENTIALS_ONLY)
+    if (!win.CreateProcessWithLogonW(W("harness-sandbox"), W("."), W("-"), win.LOGON_NETCREDENTIALS_ONLY, exe, cmd, flags, block.ptr, cwd, &si, &pi).toBool()) {
+        return switch (win.GetLastError()) {
+            2, 3, 267 => error.FileNotFound,
+            else => error.NoSession,
+        };
+    }
+    return .{
+        .id = pi.process,
+        .thread_handle = pi.thread,
+        .stdin = null,
+        .stdout = out.read,
+        .stderr = err.read,
+        .request_resource_usage_statistics = false,
+    };
+}
+
+/// The launcher, in its new logon session: names the drives, starts the
+/// AppContainer's command with this process's own stdin, stdout and
+/// stderr, waits for it and ends with its exit code. Never returns on
+/// Windows.
+pub fn sandboxLaunch(arena: std.mem.Allocator, env: *const std.process.Environ.Map) u8 {
+    if (!is_windows) return 2;
+    const code = launchIn(arena, env) catch |e| blk: {
+        std.debug.print("harness: the sandbox could not be started: {s}\n", .{@errorName(e)});
+        break :blk 125;
+    };
+    win.ExitProcess(code);
+}
+
+fn launchIn(arena: std.mem.Allocator, env: *const std.process.Environ.Map) !u32 {
+    const app8 = env.get(launch_prefix ++ "APP") orelse return error.NotALauncher;
+    const line8 = env.get(launch_prefix ++ "LINE") orelse return error.NotALauncher;
+    const profile8 = env.get(launch_prefix ++ "PROFILE") orelse return error.NotALauncher;
+    const network = std.mem.eql(u8, env.get(launch_prefix ++ "NET") orelse "0", "1");
+    var drives = std.mem.tokenizeScalar(u8, env.get(launch_prefix ++ "DRIVES") orelse "", '|');
+    while (drives.next()) |d| {
+        if (d.len < 3 or d[1] != '=') return error.BadDrive;
+        const name = try std.unicode.utf8ToUtf16LeAllocZ(arena, &.{ d[0], ':' });
+        const target = try std.unicode.utf8ToUtf16LeAllocZ(arena, std.mem.trimEnd(u8, d[2..], "\\/"));
+        std.mem.replaceScalar(u16, target, '/', '\\');
+        if (!win.DefineDosDeviceW(0, name, target).toBool()) return error.DriveNotNamed;
+    }
+    // what the sandbox gets: this process's variables without the launcher's
+    var vars = std.process.Environ.Map.init(arena);
+    var it = env.iterator();
+    while (it.next()) |e| {
+        if (std.ascii.startsWithIgnoreCase(e.key_ptr.*, launch_prefix)) continue;
+        try vars.put(e.key_ptr.*, e.value_ptr.*);
+    }
+    const block = try envBlock(arena, &vars);
+    const app = try std.unicode.utf8ToUtf16LeAllocZ(arena, app8);
+    const cmd = try std.unicode.utf8ToUtf16LeAllocZ(arena, line8);
+
+    var sid: ?*anyopaque = null;
+    if (win.DeriveAppContainerSidFromAppContainerName(try std.unicode.utf8ToUtf16LeAllocZ(arena, profile8), &sid) != 0) return error.NoProfile;
+    var net_sid: ?*anyopaque = null;
+    var caps: [1]win.SID_AND_ATTRIBUTES = undefined;
+    var cap_count: u32 = 0;
+    if (network) {
+        // internetClient: outside hosts, never loopback or the LAN
+        if (!win.ConvertStringSidToSidW(std.unicode.utf8ToUtf16LeStringLiteral("S-1-15-3-1"), &net_sid).toBool()) return error.Unexpected;
+        caps[0] = .{ .sid = net_sid, .attributes = 0x4 };
+        cap_count = 1;
+    }
+    const sc: win.SECURITY_CAPABILITIES = .{ .app_container_sid = sid, .capabilities = if (cap_count > 0) &caps else null, .capability_count = cap_count };
+
+    var handles: [3]windows.HANDLE = undefined;
+    for (&handles, [_]i32{ -10, -11, -12 }) |*h, n| {
+        h.* = win.GetStdHandle(@bitCast(n)) orelse return error.NoStdHandle;
+        if (!win.SetHandleInformation(h.*, win.HANDLE_FLAG_INHERIT, win.HANDLE_FLAG_INHERIT).toBool()) return error.Unexpected;
+    }
+    var size: usize = 0;
+    _ = win.InitializeProcThreadAttributeList(null, 2, 0, &size);
+    const list = try arena.alignedAlloc(u8, .of(usize), size);
+    if (!win.InitializeProcThreadAttributeList(list.ptr, 2, 0, &size).toBool()) return error.Unexpected;
+    defer win.DeleteProcThreadAttributeList(list.ptr);
+    if (!win.UpdateProcThreadAttribute(list.ptr, 0, win.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &handles, @sizeOf(@TypeOf(handles)), null, null).toBool()) return error.Unexpected;
+    if (!win.UpdateProcThreadAttribute(list.ptr, 0, win.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &sc, win.security_capabilities_size, null, null).toBool()) return error.Unexpected;
+    var si: win.STARTUPINFOEXW = std.mem.zeroes(win.STARTUPINFOEXW);
+    si.si.cb = @sizeOf(win.STARTUPINFOEXW);
+    si.si.dwFlags = win.STARTF_USESTDHANDLES;
+    si.si.hStdInput = handles[0];
+    si.si.hStdOutput = handles[1];
+    si.si.hStdError = handles[2];
+    si.attribute_list = list.ptr;
+    var pi: win.PROCESS_INFORMATION = undefined;
+    const flags = win.EXTENDED_STARTUPINFO_PRESENT | win.CREATE_NO_WINDOW | win.CREATE_UNICODE_ENVIRONMENT;
+    if (!win.CreateProcessW(app, cmd, null, null, .TRUE, flags, block.ptr, null, &si, &pi).toBool()) return error.CommandNotStarted;
+    _ = win.WaitForSingleObject(pi.process, 0xFFFFFFFF);
+    var code: u32 = 1;
+    _ = win.GetExitCodeProcess(pi.process, &code);
+    return code;
+}
+
 const win = struct {
+    const LOGON_NETCREDENTIALS_ONLY: u32 = 2;
+    const SID_AND_ATTRIBUTES = extern struct { sid: ?*anyopaque, attributes: u32 };
+    const SECURITY_CAPABILITIES = extern struct {
+        app_container_sid: ?*anyopaque,
+        capabilities: ?[*]SID_AND_ATTRIBUTES,
+        capability_count: u32,
+        reserved: u32 = 0,
+    };
+    extern "advapi32" fn CreateProcessWithLogonW(user: [*:0]const u16, domain: ?[*:0]const u16, password: [*:0]const u16, logon_flags: u32, app: ?[*:0]const u16, cmd: ?[*:0]u16, flags: u32, env: ?*anyopaque, cwd: ?[*:0]const u16, si: *STARTUPINFOW, pi: *PROCESS_INFORMATION) callconv(.winapi) windows.BOOL;
+    extern "advapi32" fn ConvertStringSidToSidW(s: [*:0]const u16, sid: *?*anyopaque) callconv(.winapi) windows.BOOL;
+    extern "userenv" fn DeriveAppContainerSidFromAppContainerName(name: [*:0]const u16, sid: *?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn DefineDosDeviceW(flags: u32, name: [*:0]const u16, target: ?[*:0]const u16) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn GetStdHandle(n: u32) callconv(.winapi) ?windows.HANDLE;
+    extern "kernel32" fn WaitForSingleObject(h: windows.HANDLE, ms: u32) callconv(.winapi) u32;
+    extern "kernel32" fn GetExitCodeProcess(h: windows.HANDLE, code: *u32) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn ExitProcess(code: u32) callconv(.winapi) noreturn;
+    pub extern "kernel32" fn GetLogicalDrives() callconv(.winapi) u32;
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
     const JobObjectBasicAccountingInformation: c_int = 1;
     const JobObjectExtendedLimitInformation: c_int = 9;
@@ -437,4 +635,15 @@ test "waitReadable_sees_bytes_the_end_of_a_pipe_and_being_told_to_stop" {
     try t.expectEqual(@as(usize, 0), out.readStreaming(t.io, &.{&buf}) catch 0);
     ended.store(true, .release);
     try t.expect(!waitReadable(t.io, out, &ended));
+}
+
+test "the_sandbox_launcher_starts_nothing_it_was_not_told_to" {
+    if (!is_windows) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    // run by hand, or by a program that isn't harness: no variables, nothing
+    var none = std.process.Environ.Map.init(arena.allocator());
+    try t.expectError(error.NotALauncher, launchIn(arena.allocator(), &none));
+    try none.put("HARNESS_SBX_APP", "cmd.exe");
+    try t.expectError(error.NotALauncher, launchIn(arena.allocator(), &none));
 }

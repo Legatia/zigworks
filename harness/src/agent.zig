@@ -956,6 +956,11 @@ fn shellDef(r: *const Run, a: std.mem.Allocator) !model.ToolDef {
         try d.append(a, '.');
         try s.appendSlice(a, ",\"env\":{\"type\":\"string\",\"description\":\"another environment to run this command in\"}");
     }
+    // Windows: where a sandbox's command finds itself
+    if (@import("builtin").os.tag == .windows and sandbox.hasDriveLetters()) for (list.envs) |e| if (e.kind == .sandbox) {
+        try d.appendSlice(a, " In a sandbox the workspace is a drive of the sandbox's own (W:\\ unless the machine has one), and its home another: paths inside the workspace work as everywhere.");
+        break;
+    };
     try s.appendSlice(a, "},\"required\":[\"command\"]}");
     return .{ .name = "shell", .description = d.items, .schema_json = s.items };
 }

@@ -695,12 +695,38 @@ fn windowsVars(arena: std.mem.Allocator, req: Request, home: []const u8) !std.pr
     return m;
 }
 
+/// The letters a sandbox's drives get: the first two of W down to L that
+/// are no drive of this machine.
+pub fn freeLetters(taken: u32) ?[2]u8 {
+    var out: [2]u8 = undefined;
+    var n: usize = 0;
+    var letter: u8 = 'W';
+    while (letter >= 'L') : (letter -= 1) {
+        if (taken & (@as(u32, 1) << @intCast(letter - 'A')) != 0) continue;
+        out[n] = letter;
+        n += 1;
+        if (n == 2) return out;
+    }
+    return null;
+}
+
+/// `path` (inside `root`, or `root` itself) on drive `letter`.
+fn onDrive(arena: std.mem.Allocator, letter: u8, root: []const u8, path: []const u8) ![]const u8 {
+    const rest = if (path.len > root.len) std.mem.trimStart(u8, path[root.len..], "\\/") else "";
+    const out = try std.fmt.allocPrint(arena, "{c}:\\{s}", .{ letter, rest });
+    std.mem.replaceScalar(u8, out, '/', '\\');
+    return out;
+}
+
 fn spawnAppContainer(io: Io, arena: std.mem.Allocator, req: Request, home: []const u8) !std.process.Child {
     if (!is_windows) unreachable;
     const sid = try containerSid(arena, req.profile);
     defer _ = win.FreeSid(sid);
     const vars = try windowsVars(arena, req, home);
     for ([_][]const u8{ "APPDATA", "LOCALAPPDATA", "TEMP" }) |k| try Io.Dir.cwd().createDirPath(io, vars.get(k).?);
+    // Windows gives an AppContainer's processes its own LOCALAPPDATA and
+    // TEMP under the one it was started with: Packages\PROFILE\AC[\Temp]
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(arena, &.{ vars.get("LOCALAPPDATA").?, "Packages", req.profile, "AC", "Temp" }));
     try applyGrants(io, arena, req, home, sid);
 
     // network = on: internetClient (outside hosts; never loopback or the LAN)
@@ -721,13 +747,61 @@ fn spawnAppContainer(io: Io, arena: std.mem.Allocator, req: Request, home: []con
         .capability_count = cap_count,
     };
     const sys = try proc.systemDir(arena);
+    const cmd_exe = try std.fs.path.join(arena, &.{ sys, "cmd.exe" });
+    const sees = req.env.workspace != .none;
+    // with drives of its own (see proc.zig): the workspace's (the home's,
+    // where it doesn't see the workspace) and the home's, whose folders
+    // its variables then name. The launcher starts in the home by its real
+    // path; the command changes to its drive, and is not run if it can't.
+    if (drive_letters and !no_session.load(.acquire)) if (freeLetters(proc.logicalDrives())) |letters| {
+        var on = try vars.clone(arena);
+        for ([_][]const u8{ "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "HOME" }) |k|
+            try on.put(k, try onDrive(arena, letters[1], home, vars.get(k).?));
+        const start = if (!sees) try onDrive(arena, letters[0], home, home) else try onDrive(arena, letters[0], req.workspace, if (req.cwd.len > 0) req.cwd else req.workspace);
+        if (proc.spawnInSession(io, arena, .{
+            .launcher = try launcher(io, arena),
+            .app = cmd_exe,
+            .command_line = try proc.cmdLine(arena, try std.fmt.allocPrint(arena, "cd /d \"{s}\"||exit 1&{s}", .{ start, req.command })),
+            .env = &on,
+            .cwd = home,
+            .profile = req.profile,
+            .network = req.env.network,
+            .drives = &.{ .{ .letter = letters[0], .folder = if (sees) req.workspace else home }, .{ .letter = letters[1], .folder = home } },
+        })) |child| return child else |e| switch (e) {
+            // no session of its own here: as before, by its real paths
+            // (cmd's own dir, del, ren, copy, move and cd /d then fail)
+            error.NoSession => no_session.store(true, .release),
+            else => return e,
+        }
+    };
     return proc.spawnRaw(io, arena, .{
-        .app = try std.fs.path.join(arena, &.{ sys, "cmd.exe" }),
+        .app = cmd_exe,
         .command_line = try proc.cmdLine(arena, req.command),
         .env = &vars,
-        .cwd = if (req.env.workspace == .none) home else if (req.cwd.len > 0) req.cwd else req.workspace,
+        .cwd = if (!sees) home else if (req.cwd.len > 0) req.cwd else req.workspace,
         .security_capabilities = &sc,
     });
+}
+
+/// Tests: off, a sandbox runs by its real paths, as where no logon
+/// session of its own can be made.
+pub var drive_letters: bool = true;
+
+/// Set once the Secondary Logon service refused: not tried again until
+/// harness starts again.
+var no_session: std.atomic.Value(bool) = .init(false);
+
+/// Whether sandboxes here get drive letters of their own, so far as is
+/// known (true until a command found they can't).
+pub fn hasDriveLetters() bool {
+    return is_windows and drive_letters and !no_session.load(.acquire);
+}
+
+/// The program that is the launcher: harness itself; in the unit tests,
+/// harness-fake.
+fn launcher(io: Io, arena: std.mem.Allocator) ![2][]const u8 {
+    if (builtin.is_test) return .{ @import("build_options").fake_path, "--" ++ proc.launch_arg };
+    return .{ try std.process.executablePathAlloc(io, arena), proc.launch_arg };
 }
 
 const win = struct {
@@ -974,8 +1048,42 @@ test "sandbox_workspace_modes" {
     try t.expect(none.is_error);
     try expectNot(none.text, "in the workspace");
     const where = try f.run(if (is_windows) "cd" else "pwd");
-    // Linux shows the home at linux_home; Windows and macOS where it is
-    try expectHas(where.text, if (is_linux) linux_home else "home");
+    // Linux shows the home at linux_home, Windows as a drive of the
+    // sandbox's own, macOS where it is
+    try expectHas(where.text, if (is_linux) linux_home else if (is_windows and hasDriveLetters()) ":\\\r\n" else "home");
+}
+
+test "windows_sandbox_without_a_session_of_its_own_runs_by_its_real_paths" {
+    if (!is_windows) return error.SkipZigTest;
+    var f: Fix = undefined;
+    try f.init(.{ .name = "box", .line = 1, .kind = .sandbox });
+    defer f.deinit();
+    // as where the Secondary Logon service is switched off
+    drive_letters = false;
+    defer drive_letters = true;
+    try expectHas((try f.run("cd")).text, f.ws);
+    try expectHas((try f.run("type a.txt")).text, "in the workspace");
+    try expectOk(try f.run("echo more>> a.txt"));
+    // cmd's own commands that ask the drive's root: refused, as before
+    try expectHas((try f.run("dir /b")).text, "Access is denied");
+}
+
+test "a_sandboxes_drive_letters_are_none_of_the_machines" {
+    // W and V on a machine with C and D
+    try t.expectEqualSlices(u8, "WV", &freeLetters(0b1100).?);
+    // W is a drive here: V and U
+    try t.expectEqualSlices(u8, "VU", &freeLetters(0b1100 | (1 << 22)).?);
+    // none left from L to W but one: none
+    var taken: u32 = 0;
+    for ('L'..'W' + 1) |c| taken |= @as(u32, 1) << @intCast(c - 'A');
+    try t.expectEqual(null, freeLetters(taken));
+    try t.expectEqual(null, freeLetters(taken & ~(@as(u32, 1) << ('P' - 'A'))));
+    if (is_windows) {
+        var arena: std.heap.ArenaAllocator = .init(t.allocator);
+        defer arena.deinit();
+        try t.expectEqualStrings("W:\\", try onDrive(arena.allocator(), 'W', "D:\\data\\workspace", "D:\\data\\workspace"));
+        try t.expectEqualStrings("W:\\sub\\x", try onDrive(arena.allocator(), 'W', "D:\\data\\workspace", "D:\\data\\workspace\\sub/x"));
+    }
 }
 
 test "sandbox_home_persists" {
@@ -1496,13 +1604,31 @@ test "sandbox_changes_files_the_owner_made" {
     try expectOk(try f.run(if (is_windows) "echo changed> a.txt" else "echo changed > a.txt"));
     try expectHas((try f.run(if (is_windows) "type a.txt" else "cat a.txt")).text, "changed");
     if (is_windows) {
-        // cmd's own dir, del, ren, copy and move first ask the drive what
-        // file system it has, and an AppContainer may not open a drive's
-        // root: they say "Access is denied" (README: Environments). The
-        // file is still there.
-        const del = try f.run("del a.txt");
-        try expectHas(del.text, "Access is denied");
-        _ = try f.tmp.dir.statFile(t.io, "data/workspace/a.txt", .{});
+        // cmd's own commands ask a path's drive what file system it has:
+        // the workspace is a drive of the sandbox's own, so they work
+        // (and what cmd starts sees that drive too: another cmd, a program)
+        try expectHas((try f.run("cd")).text, ":\\");
+        try expectHas((try f.run("cmd /c dir /b")).text, "a.txt");
+        try expectHas((try f.run("findstr changed a.txt")).text, "changed");
+        try expectHas((try f.run("more a.txt")).text, "changed");
+        try expectHas((try f.run("dir /b")).text, "a.txt");
+        try expectOk(try f.run("copy a.txt b.txt"));
+        try expectOk(try f.run("ren b.txt c.txt"));
+        try expectOk(try f.run("md moved && move c.txt moved && cd /d moved && dir /b"));
+        try expectHas((try f.run("dir /b moved")).text, "c.txt");
+        try expectOk(try f.run("del a.txt"));
+        try t.expectError(error.FileNotFound, f.tmp.dir.statFile(t.io, "data/workspace/a.txt", .{}));
+        _ = try f.tmp.dir.statFile(t.io, "data/workspace/moved/c.txt", .{});
+        // in its home and its temporary folder too (a drive of their own)
+        try expectOk(try f.run("echo t> \"%TEMP%\\t.txt\" && dir /b \"%TEMP%\" && del \"%TEMP%\\t.txt\""));
+        try expectOk(try f.run("cd /d \"%USERPROFILE%\" && echo h> h.txt && ren h.txt i.txt && del i.txt"));
+        // the real path still names the same files, for programs
+        const real = try std.fmt.allocPrint(f.a, "type \"{s}\\moved\\c.txt\"", .{f.ws});
+        try expectHas((try f.run(real)).text, "changed");
+        // and it can't make a drive of its own, or reach a real drive's root
+        try expectHas((try f.run("subst K: C:\\Windows & dir K:\\ 2>&1")).text, "cannot find");
+        const drive = f.ws[0..2];
+        try expectHas((try f.run(try std.fmt.allocPrint(f.a, "dir {s}\\ 2>&1", .{drive}))).text, "denied");
         return;
     }
     try expectOk(try f.run("rm a.txt"));

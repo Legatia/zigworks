@@ -139,6 +139,21 @@ adds a button to the end of runs (core.zig/agent.zig), so expect small
 conflicts there. As before: your own branches, test-driven, full suite
 and cross builds green, and the owner decides every push.
 
+### Status from the Windows session (2026-11-24, branch `win/cmd`)
+
+- Done: cmd's own `dir`, `del`, `ren`, `copy`, `move` and `cd /d` work in
+  a Windows sandbox (the owner's decision on 7.4). A sandbox's command
+  starts through a launcher in a logon session of its own, where the
+  workspace and the home are drives of the sandbox's own; what was tried,
+  the rulings (R30 to R36) and the fallback:
+  `docs/superpowers/plans/2026-11-22-windows-platform.md`, section 9.
+- New in shared code: `proc.spawnInSession` and `proc.sandboxLaunch`
+  (Windows only), `harness sandbox-launch` (main.zig, first thing in
+  `main`), `harness-fake --sandbox-launch`, and harness-fake links
+  advapi32 and userenv on Windows (build.zig). Nothing in the gate, the
+  agent's call path or the conversations' state changed; `shellDef` has
+  one more sentence on Windows.
+
 ### Status from the Windows session (2026-11-23, branch `win/apps`)
 
 - Done, tested on Windows and Linux: item 3 (the apps' API, the bar,

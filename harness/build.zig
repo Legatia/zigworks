@@ -29,7 +29,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    if (target.result.os.tag == .windows) fake_mod.linkSystemLibrary("ws2_32", .{});
+    if (target.result.os.tag == .windows) {
+        fake_mod.linkSystemLibrary("ws2_32", .{});
+        // the sandbox's launcher, which the unit tests start it as
+        fake_mod.linkSystemLibrary("advapi32", .{});
+        fake_mod.linkSystemLibrary("userenv", .{});
+    }
     const fake = b.addExecutable(.{ .name = "harness-fake", .root_module = fake_mod });
 
     const run = b.addRunArtifact(exe);

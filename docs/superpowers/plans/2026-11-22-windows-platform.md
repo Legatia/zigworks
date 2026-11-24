@@ -489,3 +489,79 @@ Merged with `harness-logins` 5e4d0d4: Windows 11 971 pass, 48 skip,
 smoke all ok; Linux (WSL, user tester) 999 pass, 19 skip, smoke all ok
 run alone, and the one failure this machine's WSL always has
 (`mcp_list_says_each_servers_kind_sign_in_and_tools`).
+
+## 9. cmd's own commands in a Windows sandbox (2026-11-24, branch `win/cmd`, on `harness-logins` 2d3c3d2)
+
+The owner's decision on 7.4: fix it.
+
+What it is: cmd's `dir`, `del`, `ren`, `copy`, `move` and `cd /d` call
+GetVolumeInformation on the root of a path's drive, which an AppContainer
+may not open. On a drive whose root is a folder the sandbox may read,
+they work. So a sandbox gets drives of its own: the workspace (the copy,
+for `workspace = copy`; the home, where it doesn't see the workspace) as
+`W:`, its home as `V:` (the first two letters from W down to L that are
+no drive of the machine); its command starts there, and USERPROFILE,
+APPDATA, LOCALAPPDATA, TEMP, TMP and HOME name the home's drive.
+
+How the drives are the sandbox's own:
+
+- **Tried first, and not kept: a device map on the process**
+  (NtSetInformationProcess, ProcessDeviceMap, with an object directory
+  holding the links). The first process sees the drive; what it starts
+  does not (with LUID device maps on, as they are everywhere, a process's
+  map is not inherited): a nested cmd and `more` could not open `W:\`.
+- **Kept: a logon session of its own.** DOS device names belong to a
+  logon session. `proc.spawnInSession` starts a launcher with
+  CreateProcessWithLogonW and LOGON_NETCREDENTIALS_ONLY (the Secondary
+  Logon service, as `runas /netonly`: the same user here, a new session,
+  a name and password that are never checked). The launcher
+  (`proc.sandboxLaunch`: `harness sandbox-launch`, a command nobody
+  types; `harness-fake --sandbox-launch` in the unit tests) names the
+  drives with DefineDosDevice, starts the AppContainer's cmd with its own
+  stdin, stdout and stderr, waits and ends with its exit code. Every
+  process the sandbox starts is in that session and sees the drives; no
+  other session does; they end with the session's last process, a killed
+  one too.
+
+Rulings:
+
+- R30. The launcher is started suspended and goes in the command's job
+  like any child; the AppContainer's cmd is its child, so `/stop` and the
+  time limit end both.
+- R31. What to start travels in the launcher's variables
+  (`HARNESS_SBX_APP`, `_LINE`, `_PROFILE`, `_NET`, `_DRIVES`), which it
+  takes out of what the sandbox gets. Run without them it starts nothing
+  (exit 125).
+- R32. The launcher starts in the home by its real path (this process
+  checks that folder before the drives exist); the command line is
+  `cd /d "W:\DIR"||exit 1&COMMAND`: a command is not run where its drive
+  can't be reached.
+- R33. Where the service refuses (switched off, or policy),
+  `error.NoSession`: that sandbox and every later one in this start run
+  as before by their real paths (`sandbox.hasDriveLetters()` is false
+  from then). `/env check` has a line for it; the shell tool's
+  description tells the agent of the drives only while they are there.
+- R34. Windows gives an AppContainer's processes LOCALAPPDATA and TEMP
+  under the one they were started with (`Packages\PROFILE\AC[\Temp]`);
+  harness makes that folder (before, this process's CreateProcess could
+  see the path; now it is on the sandbox's drive).
+- R35. The new session's credentials toward the network are the unchecked
+  ones: integrated sign-in to a file share or proxy from a sandbox would
+  fail. An AppContainer without the enterprise capability had none
+  before either.
+- R36. The gate, grants and the log keep the workspace's own paths; only
+  what a command prints may show `W:\`.
+
+Measured here: a sandboxed `echo` takes about 35 ms more (142 ms against 109).
+
+Tests: `sandbox_changes_files_the_owner_made` (dir, copy, ren, md, move,
+cd /d, del in the workspace, the home and the temporary folder; a nested
+cmd, findstr and more; the real path still reads; `subst` inside reaches
+nothing; a real drive's root still refused),
+`windows_sandbox_without_a_session_of_its_own_runs_by_its_real_paths`,
+`a_sandboxes_drive_letters_are_none_of_the_machines`,
+`the_sandbox_launcher_starts_nothing_it_was_not_told_to`,
+`env_check_probes_a_sandbox_and_a_copy_environment` (its new line).
+
+Left: GitHub's Windows runners were not tried before the push; if the
+service is off there, the tests that need the drives say so in CI.

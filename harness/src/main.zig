@@ -351,6 +351,9 @@ pub fn main(init: std.process.Init) u8 {
     const gpa = std.heap.smp_allocator;
     const arena = init.arena.allocator();
     const raw = init.minimal.args.toSlice(arena) catch return @intFromEnum(Exit.failed);
+    // Windows: a sandbox's launcher, in its own logon session (proc.zig);
+    // harness starts it, nobody types it
+    if (raw.len == 2 and eql(raw[1], @import("proc.zig").launch_arg)) return @import("proc.zig").sandboxLaunch(arena, init.environ_map);
     var app: App = .{ .gpa = gpa, .arena = arena, .io = init.io, .env = init.environ_map };
     const cli = parseCli(arena, raw[1..]) catch |e| switch (e) {
         error.Usage => {
