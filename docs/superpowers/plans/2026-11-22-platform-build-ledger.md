@@ -155,3 +155,16 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
 - Persona and topics (branch `platform/persona-topics`, plan `2026-11-24-persona-topics.md`, 13 tasks, 34 rulings): `persona.md` (butler, assistant, friend, or the owner's words) after main's instructions, members and speech the preset and name, helpers none; `/persona`; the butler manner migrated; SOUL.md → persona.md. Topics: setup's [Use topics] (setMySettings, else the BotFather switch), five topics, posts filed by subject, questions with a pointer in main, urgent alerts' record lines, a digest per topic, pinned cards built from state, `/overview`, `/focus`, `/card`, the summaries' topic lines. `main` manages its own plain helpers without asking (one quiet line, [Remove]/[Undo]); a quiet Work post per `delegate` call from the log (entities, no parse_mode); `/work`. 1414/1436 (22 skipped) Debug and ReleaseSafe; smoke 148 (181 with the four stand-ins); cross builds ok. harness-logins had nothing new to merge.
 - Persona and topics, final review's fix pass (3c2d468): 16 findings fixed, each test-first ([agent] sections ask; the Work post fits one message; cards and summaries from harness's own lines only; card back-off; links only in lines harness builds; UTF-16 counted on the sent text; no card in main; one ring per question; setMySettings confirmed; `topics` no reserved step name; quiet helper line; unseen helpers shown in setup questions; `/persona reset`/`write` past a too-big body; Work for the owner's runs; an adopted topic's focus kept). 1427/1449 (22 skipped) Debug and ReleaseSafe; smoke 148 (181 with stand-ins); cross builds ok; harness-logins unchanged.
 
+- CI 45446239520 (e396ef7, the injection checks, the Hermes import and the Windows session's sandbox fixes): 31/31 after rerunning two macOS jobs that were cancelled while waiting for a runner. Windows headterm failed once on 48197a2 and passed on rerun (flake).
+- 2026-11-24 persona and topics: final review (fresh reviewer). No Critical. Four Important, fixed test-first in 3c2d468:
+  - an `[agent]` section not making main's save asked;
+  - the Work post over 4,096;
+  - Lately and summary lines carrying model replies (Ruling 22 overturned);
+  - card posts retried every tick with no back-off.
+
+  Ten Minor were re-graded Important and fixed: link tokens expanded in approval questions (Ruling 10 overturned); UTF-16 offsets on broken UTF-8; a card pinned in main; the plainly migration re-asking; double rings; setMySettings unconfirmed; `topics` as a reserved step name; the helper line ringing; trigger and workflow questions hiding a quietly saved helper; `/persona` reset and write with an oversized body. Two of the coordinator's own: Work posts only for the owner's runs; an adopted topic keeps its focus.
+  - Final: Ruling: helper versions are pruned at 10. Cost if wrong: an owner's version older than 10 saves no longer counts, and every one of those saves was asked.
+  - Final: Ruling: `seconds` and `parallel` are outside the reach bound, as the spec lists it.
+  - Final: minor (deferred): `delegate` reads the log's last 4 MB per call.
+  - Final: minor (deferred): workflow files that don't parse aren't seen by "nothing names it".
+  - Final: deferred: an injection case for whether `history` returns harness's own topic posts unmarked.
