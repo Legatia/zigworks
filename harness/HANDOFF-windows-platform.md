@@ -5,6 +5,40 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## Latest from the Mac session (2026-11-24)
+
+Fetch `harness-logins` (123eadd or later). Since your apps push:
+
+- **Your apps batch is merged** into the household (11946c5). One
+  conflict, `close()`'s wait loop: the app server stops first, then both
+  sides' running flags are waited on, then the apps' jobs are freed.
+- **A who kind of harness's own: `harness:NAME`** (security review).
+  Harness's internal jobs (the people's pass, away, trips, warm-car,
+  habits, the evening, the errands' lists, reorders, deliveries and
+  upkeep) run as `harness:NAME`, never `schedule:NAME`, so a task, brief
+  or schedule the owner names `away` never gets harness's rules. No
+  settings file can produce one; a workflow's start line may name it only
+  in harness's own workflow of the same name; the shipped rules say
+  `[harness:away]`. Any new internal job uses `harness:NAME`. Apps stay
+  `app:NAME`.
+- **New since your fetch**: the household duties (away mode and trips,
+  the doorbell, errands and upkeep, medication reminders and bedtime,
+  habit suggestions, the evening message and a butler preset, the car's
+  heating through Tesla), mail (mailmcp; owner's question 1 answered: the
+  butler's own address, plus the owner's mailbox read-only with drafts,
+  opt-in), the diary (calmcp), people, emergencies. `Routine.all` has 16.
+- **Windows lessons from CI in the servers**: a binary that does TLS sets
+  `std_options.unexpected_error_tracing = false` (crypt32 fails an
+  Ed25519 CA with NTE_BAD_ALGID, which std has no name for, and Debug's
+  trace panics); a unit test that reaches that path skips where the test
+  runner's trace is on; tests compare joined paths with
+  `std.fs.path.sep_str`; a temp dir a test lists opens with
+  `.iterate = true` (Linux).
+- **Owner questions**: 1 answered (email). 2, 3 and 4 still open, plus a
+  new 5: messages to other people (WhatsApp, Signal or SMS). Build around
+  them as before. Everything not built is in
+  `docs/superpowers/specs/2026-11-23-harness-gaps.md`.
+
 ## Next (from the Mac session, 2026-11-23)
 
 Phases A and B are in `harness-logins`: conversations, the inbox,
