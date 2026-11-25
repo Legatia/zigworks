@@ -181,6 +181,8 @@ const MOMENTS = {
 };
 const GLANCE = { browInnerUp: 0.2, ...both('browOuterUp', 0.12), ...both('eyeWide', 0.12) };
 const MOUTH = /^(mouth|jaw|cheekPuff|tongue)/;
+// the shapes that push the lids; a shut lid sits where the closed projection has it
+const LID_LOOKS = ['eyeSquint', 'eyeWide', 'eyeLookUp', 'eyeLookDown', 'eyeLookIn', 'eyeLookOut'];
 
 function blinkCurve(d) {
   if (d < 0) return 0;
@@ -232,7 +234,7 @@ async function loadPack(base) {
  *  portrait when there is none. Per column of the eye, from the crease to
  *  the lash line: the crease's shadow, the lit lid, darker into the lashes;
  *  the skin's grain borrowed from under the eye; soft at every edge. */
-function drawClosedEyes(still, meta) {
+export function drawClosedEyes(still, meta) {
   const c = document.createElement('canvas');
   c.width = still.width; c.height = still.height;
   const g = c.getContext('2d', { willReadFrequently: true });
@@ -547,13 +549,15 @@ function buildScene(pack, renderer) {
           vec3 tongue = vec3(0.34, 0.12, 0.13) * (1.0 - 0.55 * smoothstep(30.0 * k, 120.0 * k, vHid));
           col = mix(lipInner, mix(roof, tongue, below), deep);
         } else {
-          col = texture2D(tOpen, vUv).rgb;
+          vec3 n = normalize(vN), n0 = normalize(vN0);
+          float d = dot(n, L0) - dot(n0, L0);
+          // the relight shades a deformation against the open portrait's own
+          // light; the eyes-closed portrait was photographed shut, so it isn't
+          // relit (else a shut lid is brighter than what shows round it: a seam)
+          col = texture2D(tOpen, vUv).rgb * clamp(1.0 + relight * d, 0.4, 1.5);
           vec2 m = texture2D(tMask, vUvC).rg;
           float wc = clamp(m.r * smoothstep(0.5, 0.97, blinkA) + m.g * smoothstep(0.5, 0.97, blinkB), 0.0, 1.0);
           col = mix(col, texture2D(tClosed, vUvC).rgb, wc);
-          vec3 n = normalize(vN), n0 = normalize(vN0);
-          float d = dot(n, L0) - dot(n0, L0);
-          col *= clamp(1.0 + relight * d, 0.4, 1.5);
           a = smoothstep(0.04, 0.32, n0.z);
           // what can't be seen, or is hidden at rest, must not mask the eyeballs
           if (a < 0.02 || vHid > crease || !gl_FrontFacing) discard;
@@ -591,15 +595,17 @@ function buildScene(pack, renderer) {
     const cl = e.catchlight || [iris[0], iris[1], 3.6 * k];
     const u = {
       tEyes: { value: tEyes }, tClosed: { value: tClosed }, size: { value: new THREE.Vector2(W, H) }, center: { value: center.clone() }, blink: { value: 0 },
-      glint: { value: new THREE.Vector3() }, glintR: { value: 3.6 * k }, glintI: { value: 0.85 },
+      glint: { value: new THREE.Vector3() }, glintR: { value: 3.6 * k }, glintI: { value: 0.85 }, local: { value: new THREE.Matrix4() },
     };
     const m = new THREE.ShaderMaterial({
       uniforms: u, transparent: true, depthTest: false, depthWrite: false,
       stencilWrite: true, stencilRef: 1, stencilFunc: THREE.NotEqualStencilFunc, stencilZPass: THREE.KeepStencilOp,
       vertexShader: `
-        uniform vec3 center;
+        uniform mat4 local;
         varying vec2 vUv; varying vec3 vW; varying vec3 vN; varying vec3 vHome;
-        void main() { vUv = uv; vHome = center + position; vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; vN = normalize(mat3(modelMatrix) * normal);
+        // vHome: where this point is shown, in the head's space (the gaze's turn
+        // included), so a shut eye shows the closed portrait where the lid's is
+        void main() { vUv = uv; vHome = (local * vec4(position, 1.0)).xyz; vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; vN = normalize(mat3(modelMatrix) * normal);
           gl_Position = projectionMatrix * viewMatrix * w; }`,
       fragmentShader: `
         uniform sampler2D tEyes; uniform sampler2D tClosed; uniform vec2 size; uniform float blink;
@@ -683,7 +689,9 @@ function buildScene(pack, renderer) {
       for (const e of eyes) e.u.glint.value.copy(headSpace.localToWorld(tmp.copy(e.glintLocal)));
       renderer.render(scene, camera);
     },
-    gaze(gx, gy) { for (const e of eyes) e.mesh.rotation.set(-gy * D2R, gx * D2R, 0); },
+    gaze(gx, gy) {
+      for (const e of eyes) { e.mesh.rotation.set(-gy * D2R, gx * D2R, 0); e.mesh.updateMatrix(); e.u.local.value.copy(e.mesh.matrix); }
+    },
     dispose() {
       for (const t of textures) t.dispose();
       hg.dispose(); plate.dispose(); headMat.dispose(); plateMat.dispose(); teethMat.dispose();
@@ -1033,8 +1041,15 @@ export async function createAvatar(element, packUrl, options = {}) {
     addTo(infl, lids);
     infl[IDX.eyeBlink_L] = Math.max(infl[IDX.eyeBlink_L], blink);
     infl[IDX.eyeBlink_R] = Math.max(infl[IDX.eyeBlink_R], blink);
-    infl[IDX.eyeSquint_L] += 0.3 * ease((infl[IDX.eyeBlink_L] - 0.6) / 0.4);
-    infl[IDX.eyeSquint_R] += 0.3 * ease((infl[IDX.eyeBlink_R] - 0.6) / 0.4);
+    for (const side of ['_L', '_R']) {
+      const b = infl[IDX['eyeBlink' + side]];
+      // the lower lid rises as the eye closes...
+      infl[IDX['eyeSquint' + side]] += 0.3 * ease((b - 0.6) / 0.4);
+      // ...and a shut lid isn't pushed (squint, wide, the gaze's): it sits
+      // where the eyes-closed projection has it, or its lash line shows a seam
+      const open = 1 - ease((b - 0.8) / 0.2);
+      for (const n of LID_LOOKS) infl[IDX[n + side]] *= open;
+    }
     if (debug && debug.shapes) for (const name in debug.shapes) if (name in IDX) infl[IDX[name]] = debug.shapes[name];
     for (let i = 0; i < n; i++) infl[i] = clamp(infl[i], 0, 1);
 
@@ -1097,6 +1112,17 @@ export async function createAvatar(element, packUrl, options = {}) {
   // ---- go ----
   avatar.lose = head ? () => head.renderer.forceContextLoss() : () => {};
   avatar.shapes = () => (head ? Object.fromEntries(Object.entries(head.IDX).map(([k2, i]) => [k2, head.infl[i]])) : {});
+  /** For checks: draws a frame now and returns a 2D copy of it (null
+   *  without a head), with the photo's view in it ({ x0, y0, w, h }). */
+  avatar.snapshot = () => {
+    if (!head || lost || disposed) return null;
+    frame(now());
+    const c = document.createElement('canvas');
+    c.width = canvas.width; c.height = canvas.height;
+    c.getContext('2d').drawImage(canvas, 0, 0);
+    c.view = frameView(head.W, head.H, head.face, canvas.width / canvas.height);
+    return c;
+  };
   /** For checks: frames drawn, the pose, the eyes' closure, the voice's clock. */
   avatar.inspect = () => ({
     drawn, state: S.state, pose: { ...S.pose }, closed: S.closed, talking: !!(S.talk && S.talk.playing),

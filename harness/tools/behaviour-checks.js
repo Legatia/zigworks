@@ -1,5 +1,6 @@
 // Dev only: see behaviour-checks.html. Each check logs `ok NAME` or `FAIL NAME: why`.
-import { createAvatar } from '/desk/static/avatar.js';
+import { createAvatar, drawClosedEyes, readHead } from '/desk/static/avatar.js';
+import { loadImage } from '/desk/static/fit.js';
 
 const q = new URLSearchParams(location.search);
 const pack = q.get('pack') || '/desk/avatars/butler/';
@@ -12,6 +13,91 @@ const check = (name, ok, detail) => { results[name] = { ok: !!ok, detail }; log(
 /** Samples f() every frame for ms. */
 const sample = (ms, f) => new Promise((ok) => { const out = [], t0 = performance.now(); const step = () => { out.push(f()); if (performance.now() - t0 < ms) requestAnimationFrame(step); else ok(out); }; step(); });
 
+// 0. drawn closed lids: the lash line runs smoothly, no step between neighbouring columns
+{
+  const still = await loadImage(pack + 'still.jpg');
+  const meta = readHead(await (await fetch(pack + 'head.bin', { cache: 'no-cache' })).arrayBuffer()).meta;
+  const c = drawClosedEyes(still, meta), g = c.getContext('2d');
+  const lines = meta.eyes.map((e) => {
+    const xs = e.outline.map((p) => p[0]), ys = e.outline.map((p) => p[1]);
+    const x0 = Math.ceil(Math.min(...xs) + 0.2 * (Math.max(...xs) - Math.min(...xs))), x1 = Math.floor(Math.max(...xs) - 0.2 * (Math.max(...xs) - Math.min(...xs)));
+    const y0 = Math.floor(Math.min(...ys) - 6), y1 = Math.ceil(Math.max(...ys) + 6);
+    const d = g.getImageData(x0, y0, x1 - x0, y1 - y0).data, w = x1 - x0;
+    const rows = [];
+    // within the eye's opening (where the lids meet when drawn shut)
+    const inside = (px, py) => { let c = false; const o = e.outline; for (let i = 0, j = o.length - 1; i < o.length; j = i++) { const [ax, ay] = o[i], [bx, by] = o[j]; if ((ay > py) !== (by > py) && px < ((bx - ax) * (py - ay)) / (by - ay) + ax) c = !c; } return c; };
+    for (let x = 0; x < w; x++) {
+      let best = Infinity, by = null;
+      for (let y = 0; y < y1 - y0; y++) {
+        if (!inside(x0 + x + 0.5, y0 + y + 0.5)) continue;
+        const o = (y * w + x) * 4, l = 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2];
+        if (l < best) { best = l; by = y; }
+      }
+      if (by !== null) rows.push(by);
+    }
+    const jumps = rows.slice(1).map((r, i) => Math.abs(r - rows[i]));
+    return { maxJump: Math.max(...jumps), columns: rows.length };
+  });
+  check('drawn_lash_lines_have_no_step', lines.every((l) => l.maxJump <= 1), { lines });
+  // and on the drawn face, shut and resting: no second line beside the lash line
+  // (it was the relight brightening the shut lid's surface, the eyeball showing the
+  // closed portrait without its turn, and the gaze's shapes pushing a shut lid)
+  const lashOn = async (gy, rm) => {
+    const el = document.createElement('div');
+    el.style.width = '1400px'; el.style.height = '800px';
+    document.body.appendChild(el);
+    const r = await createAvatar(el, '/desk/avatars/drawn/', { reducedMotion: rm, debug: { time: 0, breath: 0, gaze: { x: 0, y: gy } } });
+    r.setState('resting');
+    const shot = r.snapshot(), v = shot.view, sg = shot.getContext('2d');
+    const sx = shot.width / v.w, sy = shot.height / v.h;
+    const drawn = meta.eyes.map((e) => {
+      const xs = e.outline.map((p) => p[0]), ys = e.outline.map((p) => p[1]);
+      const ax = Math.min(...xs), bx = Math.max(...xs);
+      const X0 = Math.ceil((ax + 0.2 * (bx - ax) - v.x0) * sx), X1 = Math.floor((bx - 0.2 * (bx - ax) - v.x0) * sx);
+      const Y0 = Math.floor((Math.min(...ys) - 4 - v.y0) * sy), Y1 = Math.ceil((Math.max(...ys) + 4 - v.y0) * sy);
+      const d = sg.getImageData(X0, Y0, X1 - X0, Y1 - Y0).data, w = X1 - X0, rows = [];
+      const inside = (px, py) => { let c = false; const o = e.outline; for (let i = 0, j = o.length - 1; i < o.length; j = i++) { const [qx, qy] = o[i], [rx, ry] = o[j]; if ((qy > py) !== (ry > py) && px < ((rx - qx) * (py - qy)) / (ry - qy) + qx) c = !c; } return c; };
+      const L = (x, y) => { const o = (y * w + x) * 4; return 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2]; };
+      const H = Y1 - Y0;
+      // the lash line: the darkest row in the opening at the middle column, then followed
+      // column by column (within 2 rows) out to both sides
+      const mid = w >> 1;
+      let r0 = 0, best = Infinity;
+      for (let y = 0; y < H; y++) if (inside(v.x0 + (X0 + mid + 0.5) / sx, v.y0 + (Y0 + y + 0.5) / sy) && L(mid, y) < best) { best = L(mid, y); r0 = y; }
+      const ridge = new Array(w);
+      ridge[mid] = r0;
+      for (const dir of [1, -1]) for (let x = mid + dir; x >= 0 && x < w; x += dir) {
+        const p = ridge[x - dir];
+        let rb = p, lb = Infinity;
+        for (let y = Math.max(0, p - 2); y <= Math.min(H - 1, p + 2); y++) if (L(x, y) < lb) { lb = L(x, y); rb = y; }
+        ridge[x] = rb;
+      }
+      // a doubled line: another dark line 3–9 rows above the ridge, a light band
+      // between (the photo's own lower lashes lie below it, and stay)
+      let doubled = 0;
+      const at = [];
+      for (let x = 0; x < w; x++) {
+        const r = ridge[x], lr = L(x, r);
+        for (const dir of [-1]) {
+          let peak = lr, found = false;
+          for (let k = 1; k <= 9; k++) {
+            const y = r + dir * k;
+            if (y < 0 || y >= H) break;
+            const l = L(x, y);
+            peak = Math.max(peak, l);
+            if (k >= 3 && l < lr + 12 && peak > lr + 30) { found = true; break; }
+          }
+          if (found) { doubled++; at.push(x); break; }
+        }
+      }
+      return { doubled, columns: w, scale: +sx.toFixed(2), at: at.join(',') };
+    });
+    r.dispose(); el.remove();
+    return drawn;
+  };
+  const seen = { straight: await lashOn(0, false), up: await lashOn(3, false), downStill: await lashOn(-3, true) };
+  check('drawn_lids_shut_without_a_step_in_the_lash_line', Object.values(seen).every((d) => d.every((l) => l.doubled <= 2)), seen);
+}
 const a = await createAvatar(document.getElementById('a'), pack, {});
 a.setState('needs');
 await sleep(500);
