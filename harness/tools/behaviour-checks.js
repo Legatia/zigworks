@@ -1,0 +1,271 @@
+// Dev only: see behaviour-checks.html. Each check logs `ok NAME` or `FAIL NAME: why`.
+import { createAvatar, drawClosedEyes, readHead } from '/desk/static/avatar.js';
+import { loadImage } from '/desk/static/fit.js';
+
+const q = new URLSearchParams(location.search);
+const pack = q.get('pack') || '/desk/avatars/butler/';
+const voice = '/desk/avatars/audio/voice.wav';
+const logEl = document.getElementById('log');
+const results = {};
+const log = (m) => { logEl.textContent += m + '\n'; console.log('[behaviour] ' + m); };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const check = (name, ok, detail) => { results[name] = { ok: !!ok, detail }; log((ok ? 'ok ' : 'FAIL ') + name + ' ' + JSON.stringify(detail)); };
+/** Samples f() every frame for ms. */
+const sample = (ms, f) => new Promise((ok) => { const out = [], t0 = performance.now(); const step = () => { out.push(f()); if (performance.now() - t0 < ms) requestAnimationFrame(step); else ok(out); }; step(); });
+
+// 0. drawn closed lids: the lash line runs smoothly, no step between neighbouring columns
+{
+  const still = await loadImage(pack + 'still.jpg');
+  const meta = readHead(await (await fetch(pack + 'head.bin', { cache: 'no-cache' })).arrayBuffer()).meta;
+  const c = drawClosedEyes(still, meta), g = c.getContext('2d');
+  const lines = meta.eyes.map((e) => {
+    const xs = e.outline.map((p) => p[0]), ys = e.outline.map((p) => p[1]);
+    const x0 = Math.ceil(Math.min(...xs) + 0.2 * (Math.max(...xs) - Math.min(...xs))), x1 = Math.floor(Math.max(...xs) - 0.2 * (Math.max(...xs) - Math.min(...xs)));
+    const y0 = Math.floor(Math.min(...ys) - 6), y1 = Math.ceil(Math.max(...ys) + 6);
+    const d = g.getImageData(x0, y0, x1 - x0, y1 - y0).data, w = x1 - x0;
+    const rows = [];
+    // within the eye's opening (where the lids meet when drawn shut)
+    const inside = (px, py) => { let c = false; const o = e.outline; for (let i = 0, j = o.length - 1; i < o.length; j = i++) { const [ax, ay] = o[i], [bx, by] = o[j]; if ((ay > py) !== (by > py) && px < ((bx - ax) * (py - ay)) / (by - ay) + ax) c = !c; } return c; };
+    for (let x = 0; x < w; x++) {
+      let best = Infinity, by = null;
+      for (let y = 0; y < y1 - y0; y++) {
+        if (!inside(x0 + x + 0.5, y0 + y + 0.5)) continue;
+        const o = (y * w + x) * 4, l = 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2];
+        if (l < best) { best = l; by = y; }
+      }
+      if (by !== null) rows.push(by);
+    }
+    const jumps = rows.slice(1).map((r, i) => Math.abs(r - rows[i]));
+    return { maxJump: Math.max(...jumps), columns: rows.length };
+  });
+  check('drawn_lash_lines_have_no_step', lines.every((l) => l.maxJump <= 1), { lines });
+  // and on the drawn face, shut and resting: no second line beside the lash line
+  // (it was the relight brightening the shut lid's surface, the eyeball showing the
+  // closed portrait without its turn, and the gaze's shapes pushing a shut lid)
+  const lashOn = async (gy, rm) => {
+    const el = document.createElement('div');
+    el.style.width = '1400px'; el.style.height = '800px';
+    document.body.appendChild(el);
+    const r = await createAvatar(el, '/desk/avatars/drawn/', { reducedMotion: rm, debug: { time: 0, breath: 0, gaze: { x: 0, y: gy } } });
+    r.setState('resting');
+    const shot = r.snapshot(), v = shot.view, sg = shot.getContext('2d');
+    const sx = shot.width / v.w, sy = shot.height / v.h;
+    const drawn = meta.eyes.map((e) => {
+      const xs = e.outline.map((p) => p[0]), ys = e.outline.map((p) => p[1]);
+      const ax = Math.min(...xs), bx = Math.max(...xs);
+      const X0 = Math.ceil((ax + 0.2 * (bx - ax) - v.x0) * sx), X1 = Math.floor((bx - 0.2 * (bx - ax) - v.x0) * sx);
+      const Y0 = Math.floor((Math.min(...ys) - 4 - v.y0) * sy), Y1 = Math.ceil((Math.max(...ys) + 4 - v.y0) * sy);
+      const d = sg.getImageData(X0, Y0, X1 - X0, Y1 - Y0).data, w = X1 - X0, rows = [];
+      const inside = (px, py) => { let c = false; const o = e.outline; for (let i = 0, j = o.length - 1; i < o.length; j = i++) { const [qx, qy] = o[i], [rx, ry] = o[j]; if ((qy > py) !== (ry > py) && px < ((rx - qx) * (py - qy)) / (ry - qy) + qx) c = !c; } return c; };
+      const L = (x, y) => { const o = (y * w + x) * 4; return 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2]; };
+      const H = Y1 - Y0;
+      // the lash line: the darkest row in the opening at the middle column, then followed
+      // column by column (within 2 rows) out to both sides
+      const mid = w >> 1;
+      let r0 = 0, best = Infinity;
+      for (let y = 0; y < H; y++) if (inside(v.x0 + (X0 + mid + 0.5) / sx, v.y0 + (Y0 + y + 0.5) / sy) && L(mid, y) < best) { best = L(mid, y); r0 = y; }
+      const ridge = new Array(w);
+      ridge[mid] = r0;
+      for (const dir of [1, -1]) for (let x = mid + dir; x >= 0 && x < w; x += dir) {
+        const p = ridge[x - dir];
+        let rb = p, lb = Infinity;
+        for (let y = Math.max(0, p - 2); y <= Math.min(H - 1, p + 2); y++) if (L(x, y) < lb) { lb = L(x, y); rb = y; }
+        ridge[x] = rb;
+      }
+      // a doubled line: another dark line 3–9 rows above the ridge, a light band
+      // between (the photo's own lower lashes lie below it, and stay)
+      let doubled = 0;
+      const at = [];
+      for (let x = 0; x < w; x++) {
+        const r = ridge[x], lr = L(x, r);
+        for (const dir of [-1]) {
+          let peak = lr, found = false;
+          for (let k = 1; k <= 9; k++) {
+            const y = r + dir * k;
+            if (y < 0 || y >= H) break;
+            const l = L(x, y);
+            peak = Math.max(peak, l);
+            if (k >= 3 && l < lr + 12 && peak > lr + 30) { found = true; break; }
+          }
+          if (found) { doubled++; at.push(x); break; }
+        }
+      }
+      return { doubled, columns: w, scale: +sx.toFixed(2), at: at.join(',') };
+    });
+    r.dispose(); el.remove();
+    return drawn;
+  };
+  const seen = { straight: await lashOn(0, false), up: await lashOn(3, false), downStill: await lashOn(-3, true) };
+  check('drawn_lids_shut_without_a_step_in_the_lash_line', Object.values(seen).every((d) => d.every((l) => l.doubled <= 2)), seen);
+}
+const a = await createAvatar(document.getElementById('a'), pack, {});
+a.setState('needs');
+await sleep(500);
+
+// 1. a provider's voice: the mouth moves only while it plays, the jaw with its loudness
+{
+  const t0 = performance.now();
+  const p = a.speak({ text: 'Your flight to Lisbon moved to nine forty.', audioUrl: voice });
+  const frames = await sample(2600, () => { const i = a.inspect(); return { tau: i.tau, jaw: a.shapes().jawOpen, talking: i.talking }; });
+  const done = await p;
+  const ms = performance.now() - t0;
+  const before = Math.max(0, ...frames.filter((f) => f.tau !== null && f.tau < 0.4).map((f) => f.jaw));
+  const during = Math.max(0, ...frames.filter((f) => f.tau !== null && f.tau > 0.6 && f.tau < 1.6).map((f) => f.jaw));
+  const after = await sample(400, () => a.shapes().jawOpen);
+  check('provider_voice_moves_the_mouth_only_while_it_plays', done === true && before < 0.03 && during > 0.1 && after[after.length - 1] < 0.02,
+    { done, ms: Math.round(ms), jawBefore: +before.toFixed(3), jawDuring: +during.toFixed(3), jawAfter: +after[after.length - 1].toFixed(3) });
+}
+// 2. a second speak ends the first: the first resolves false
+{
+  const first = a.speak({ text: 'One.', audioUrl: voice });
+  await sleep(700);
+  const second = a.speak({ text: 'Two.', audioUrl: voice });
+  const r1 = await first, r2 = await second;
+  check('a_second_speak_ends_the_first', r1 === false && r2 === true, { first: r1, second: r2 });
+}
+// 3. stop while the voice is still loading: nothing plays
+{
+  const p = a.speak({ text: 'Never heard.', audioUrl: voice });
+  a.stop();
+  const r = await p;
+  const jaws = await sample(800, () => a.shapes().jawOpen);
+  check('stop_while_loading_plays_nothing', r === false && Math.max(...jaws) < 0.03 && !a.inspect().talking, { resolved: r, maxJaw: +Math.max(...jaws).toFixed(3) });
+}
+// 4. a voice that isn't there: rejected, no mouth movement
+{
+  let err = null;
+  try { await a.speak({ text: 'Nothing.', audioUrl: '/desk/avatars/audio/none.wav' }); } catch (e) { err = e.message; }
+  check('a_missing_voice_is_refused_plainly', err && /didn't play/.test(err) && a.shapes().jawOpen < 0.03, { err });
+}
+// 5. the browser's voice (headless Chrome may have none): it ends or is refused, and the mouth only moves once it started
+{
+  let r, err = null;
+  const t0 = performance.now();
+  const p = a.speak({ text: 'Hello.', browser: true }).then((x) => (r = x), (e) => (err = e.message));
+  const jaws = await sample(6000, () => ({ jaw: a.shapes().jawOpen, talking: a.inspect().talking }));
+  await p;
+  const moved = jaws.some((j) => j.jaw > 0.05 && !j.talking);
+  check('the_browser_voice_moves_the_mouth_only_once_it_speaks', !moved && (r === true || err), { resolved: r ?? null, err, ms: Math.round(performance.now() - t0), voices: speechSynthesis.getVoices().length });
+}
+// 6. resting draws at most 30 a second (frames at least 29 ms apart), working on every frame
+{
+  const draws = async (ms) => {
+    const ticks = await sample(ms, () => ({ t: performance.now(), drawn: a.inspect().drawn }));
+    const at = [];
+    for (let i = 1; i < ticks.length; i++) if (ticks[i].drawn > ticks[i - 1].drawn) at.push(ticks[i].t);
+    const gaps = at.slice(1).map((x, i) => x - at[i]);
+    return { ticks: ticks.length - 1, draws: at.length, minGap: gaps.length ? Math.round(Math.min(...gaps)) : null };
+  };
+  a.setState('resting'); await sleep(600);
+  const resting = await draws(2000);
+  a.setState('working'); await sleep(300);
+  const working = await draws(2000);
+  check('resting_draws_30_a_second', resting.minGap >= 29 && working.draws >= working.ticks * 0.9, { resting, working });
+}
+// 7. nothing is drawn while the page is hidden; drawing comes back
+{
+  Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+  document.dispatchEvent(new Event('visibilitychange'));
+  await sleep(100);
+  const d0 = a.inspect().drawn; await sleep(1000); const hiddenFrames = a.inspect().drawn - d0;
+  Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+  document.dispatchEvent(new Event('visibilitychange'));
+  const d1 = a.inspect().drawn; await sleep(600); const back = a.inspect().drawn - d1;
+  check('nothing_is_drawn_while_hidden', hiddenFrames === 0 && back > 3, { hiddenFrames, back });
+}
+// 8. the states' faces
+{
+  const settle = async (st) => { a.setState(st); await sleep(1800); return a.shapes(); };
+  const r = await settle('resting');
+  const qd = await settle('quiet'); const filter = a.inspect().filter;
+  const w = await settle('working');
+  const n = await settle('needs');
+  const u = await settle('urgent');
+  check('the_states_show', r.eyeBlink_L > 0.9 && qd.eyeBlink_L > 0.9 && /brightness\(0\.6\)/.test(filter) && w.browDown_L > 0.25 && n.browInnerUp > 0.15 && n.eyeBlink_L < 0.9 && u.browOuterUp_L > 0.3 && u.eyeWide_L > 0.2,
+    { resting: +r.eyeBlink_L.toFixed(2), quiet: [+qd.eyeBlink_L.toFixed(2), filter], working: +w.browDown_L.toFixed(2), needsYou: +n.browInnerUp.toFixed(2), urgent: [+u.browOuterUp_L.toFixed(2), +u.eyeWide_L.toFixed(2)] });
+  // arrive in resting: the eyes open for the glance, then close again
+  a.setState('resting'); await sleep(2500);
+  a.arrive();
+  const open = await sample(1200, () => a.shapes().eyeBlink_L);
+  await sleep(2500);
+  check('arrive_opens_the_eyes_for_a_glance', Math.min(...open) < 0.3 && a.shapes().eyeBlink_L > 0.7, { minDuringGlance: +Math.min(...open).toFixed(2), after: +a.shapes().eyeBlink_L.toFixed(2) });
+  // moments
+  a.setState('needs'); await sleep(1500);
+  a.moment('smile'); await sleep(900); const sm = a.shapes().mouthSmile_L; await sleep(2200); const smAfter = a.shapes().mouthSmile_L;
+  a.moment('concern'); await sleep(900); const co = a.shapes().mouthFrown_L;
+  check('moments_come_and_go', sm > 0.4 && smAfter < 0.15 && co > 0.2, { smile: +sm.toFixed(2), smileAfter2s: +smAfter.toFixed(2), concern: +co.toFixed(2) });
+}
+// 9. reduced motion: no drift, no nods, no mouth outside speech; blinks and breathing stay
+{
+  a.dispose(); // one avatar drawing at a time from here
+  const b = await createAvatar(document.getElementById('b'), pack, { reducedMotion: true });
+  b.setState('working'); await sleep(3000);
+  const poses = await sample(4000, () => b.inspect().pose);
+  const span = (k) => Math.max(...poses.map((p) => p[k])) - Math.min(...poses.map((p) => p[k]));
+  b.moment('smile'); await sleep(900);
+  const s = b.shapes();
+  const p = b.speak({ text: 'Your flight moved.', audioUrl: voice });
+  const jaw = await sample(1800, () => b.shapes().jawOpen);
+  await p;
+  const blinks = await sample(7000, () => b.shapes().eyeBlink_L);
+  check('reduced_motion_keeps_blinks_and_breath_drops_drift_nods_and_mouth', span('pitch') < 0.05 && span('yaw') < 0.05 && s.mouthSmile_L < 0.01 && s.cheekSquint_L > 0.2 && Math.max(...jaw) > 0.1 && Math.max(...blinks) > 0.5,
+    { pitchSpan: +span('pitch').toFixed(3), yawSpan: +span('yaw').toFixed(3), smileMouth: +s.mouthSmile_L.toFixed(3), smileCheek: +s.cheekSquint_L.toFixed(2), jawSpeaking: +Math.max(...jaw).toFixed(2), blinked: +Math.max(...blinks).toFixed(2) });
+  // 10. dispose mid-speech: the promise settles, the audio closes, the canvas goes
+  const p2 = b.speak({ text: 'Cut short.', audioUrl: voice });
+  await sleep(900);
+  b.dispose();
+  const r2 = await p2;
+  await sleep(200);
+  check('dispose_mid_speech_ends_it', r2 === false && b.inspect().audio === 'closed' && !document.querySelector('#b canvas'), { resolved: r2, audio: b.inspect().audio });
+}
+// 11. after dispose: speaking does nothing and settles at once
+{
+  const c = await createAvatar(document.getElementById('b'), pack, {});
+  const glCanvas = document.querySelector('#b canvas');
+  const gl = glCanvas.getContext('webgl2');
+  c.dispose();
+  const t0 = performance.now();
+  const r1 = await Promise.race([c.speak({ text: 'Gone.', browser: true }), sleep(3000).then(() => 'pending')]);
+  const spoke = speechSynthesis.speaking || speechSynthesis.pending;
+  const r2 = await Promise.race([c.speak({ text: 'Gone.', audioUrl: voice }), sleep(3000).then(() => 'pending')]);
+  let threw = null;
+  try { c.setState('working'); c.moment('smile'); c.arrive(); c.stop(); } catch (e) { threw = e.message; }
+  check('after_dispose_speak_settles_and_says_nothing', r1 === false && r2 === false && !spoke && !threw && performance.now() - t0 < 1000, { browser: r1, audio: r2, spoke, threw });
+  // its WebGL context is let go, not left for the garbage collector
+  check('dispose_lets_the_webgl_context_go', gl && gl.isContextLost(), { lost: gl && gl.isContextLost() });
+}
+// 12. a browser voice that fails doesn't cut off the next one 5 s later
+{
+  const c = await createAvatar(document.getElementById('b'), pack, {});
+  const orig = speechSynthesis.speak.bind(speechSynthesis);
+  let first = true;
+  speechSynthesis.speak = (u) => { if (first) { first = false; setTimeout(() => u.onerror({ error: 'synthesis-failed' }), 20); return; } orig(u); };
+  let err = null;
+  try { await c.speak({ text: 'This fails.', browser: true }); } catch (e) { err = e.message; }
+  const t0 = performance.now();
+  const long = 'The morning brief is ready. Your flight to Lisbon moved to nine forty, the driver knows, the calendar is updated, and the hotel has your late arrival on file. Two packages arrive today, one needs a signature, and the boiler service is on Thursday at ten.';
+  const r = await c.speak({ text: long, browser: true });
+  const ms = Math.round(performance.now() - t0);
+  speechSynthesis.speak = orig;
+  check('a_failed_browser_voice_does_not_cut_off_the_next', err && r === true && ms > 5500, { err, resolved: r, ms });
+  // 13. a voice that starts and never says it ended: the talk still ends
+  speechSynthesis.speak = (u) => { setTimeout(() => u.onstart && u.onstart(), 20); };
+  const t1 = performance.now();
+  const r3 = await Promise.race([c.speak({ text: 'Hello there.', browser: true }), sleep(15000).then(() => 'pending')]);
+  speechSynthesis.speak = orig;
+  check('a_voice_that_never_ends_still_ends_the_talk', r3 !== 'pending' && !c.inspect().talking, { resolved: r3, ms: Math.round(performance.now() - t1) });
+  // 14. audio that can't start (an autoplay policy holding the audio back): refused, not hanging
+  const Real = globalThis.AudioContext;
+  globalThis.AudioContext = class extends Real { get state() { return 'suspended'; } resume() { return new Promise(() => {}); } };
+  c.dispose();
+  const d = await createAvatar(document.getElementById('b'), pack, {});
+  let err2 = null;
+  const r4 = await Promise.race([d.speak({ text: 'Held.', audioUrl: voice }).catch((e) => { err2 = e.message; return 'rejected'; }), sleep(8000).then(() => 'pending')]);
+  globalThis.AudioContext = Real;
+  check('audio_that_cannot_start_is_refused', r4 === 'rejected' && /didn't start/.test(err2 || ''), { result: r4, err: err2 });
+  d.dispose();
+}
+const failed = Object.entries(results).filter(([, v]) => !v.ok).map(([k]) => k);
+log(failed.length ? failed.length + ' failed: ' + failed.join(', ') : 'all ' + Object.keys(results).length + ' passed');
+window.__r = { results, failed };
+window.__ready = true;

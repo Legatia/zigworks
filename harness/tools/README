@@ -1,0 +1,69 @@
+Dev tools for the desk's avatar. Not shipped; harness doesn't use them.
+
+  fetch-desk-assets.sh DIR
+      MediaPipe's fit files into DIR/mediapipe/, checked by SHA-256.
+      DIR is what the desk serves as /desk/assets/ (the data folder's
+      desk-assets/).
+
+  devserver.py PORT DATA [--csp POLICY | --no-csp] [--cache]
+      127.0.0.1 only. The desk's URL layout over this tree and DATA:
+      /desk/static/ (src/desk/), /desk/avatars/ (DATA/avatars/),
+      /desk/assets/ (DATA/desk-assets/), /tools/; POST /save/PATH writes
+      DATA/PATH under avatars/, desk-assets/ or debug/. It prints a token
+      for the run: pages that save are opened with #token=TOKEN and send
+      it as X-Dev-Token (another page in the browser can't), and requests
+      must name 127.0.0.1:PORT or localhost:PORT. Every response carries
+      the desk's CSP; violations are logged to DATA/csp-reports.log.
+
+  headless.mjs URL [--wait EXPR] [--eval EXPR] [--shot FILE]
+      Headless Chrome (SwiftShader) over the DevTools protocol: opens URL,
+      waits for EXPR (default window.__ready), prints the page's console,
+      a value and a screenshot.
+
+  make-base-head.html
+      desk-assets/base-head.bin from desk-assets/facecap.glb (three.js
+      r170's Face Cap sample, SHA-256 checked): the neutral head rendered,
+      MediaPipe's 478 landmarks found on it and kept as points on its
+      surface. three's loaders come from jsDelivr (0.170.0), so the dev
+      server runs with --no-csp for it.
+
+  fit-pack.html?pack=NAME#token=TOKEN
+      Fits avatars/NAME's still (and closed photo) with the desk's fit.js
+      and saves head.bin, eyes.png, eyemask.png and avatar.ini into it.
+
+  fit-checks.html
+      The fit's checks on real images made from avatars/butler: no face,
+      two faces, eyes closed, a small face, a soft one, a tall photo, a
+      closed photo moved, resized or open; the reflections removed; an
+      Exif-turned copy (avatars/checks/still-exif6.jpg) fitted upright.
+
+  avatar-preview.html
+      The avatar module with buttons for each state, moment, arrive,
+      speak and stop. Its query freezes a pose for screenshots: pack,
+      state, shapes=jawOpen:0.3,..., pose=YAW,PITCH,ROLL, gaze=X,Y,
+      breath, neutral=1 (no state's shapes), reduced=1, nogl=1, lose=1,
+      bare=1 (no controls). It sets window.__ready when drawn.
+
+  behaviour-checks.html
+      The module's behaviour, live: speech from avatars/audio/voice.wav
+      (0.5 s silence, 1.2 s voice, 0.4 s silence), speech replaced,
+      stopped and disposed, the browser voice, frame rates, hiding, the
+      states, moments, reduced motion.
+
+  cache-checks.html#token=TOKEN
+      Against the dev server with --cache (the desk's caching: max-age
+      and an ETag): a pack changed on disk is seen by the next
+      createAvatar, and a head over another still of the same size shows
+      the still.
+
+  test-avatar.mjs [--write-fixture]
+      node checks for fit.js's and avatar.js's pure parts; --write-fixture
+      rewrites src/testdata/avatar/tiny-head.bin (the Zig tests' head).
+
+Run them from harness/:
+
+  sh tools/fetch-desk-assets.sh DATA/desk-assets
+  python3 -I tools/devserver.py 8731 DATA
+
+Keep DATA outside the repository: the base head, Face Cap's model and the
+butler's files aren't cleared for it (README: Avatar packs).

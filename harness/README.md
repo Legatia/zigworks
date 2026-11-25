@@ -3579,6 +3579,135 @@ Not yet: the day's informational posts gathered into the morning digest,
 harness's own lines (a task paused for its budget, settings changed) and
 memory notices held at night.
 
+## Avatar packs
+
+The desk's avatar is a live 3D head: a portrait projected onto a rigged
+head with the 52 standard (ARKit) expression shapes, so it blinks, looks
+about, breathes, nods, smiles and moves its mouth with the voice. An
+avatar is a folder, `avatars/NAME/` in the data folder, with `avatar.ini`
+naming its files:
+
+| Key | File |
+|---|---|
+| `still` | the portrait: eyes open, facing the camera, mouth closed (JPEG or PNG) |
+| `closed` | optional: the same portrait with the eyes closed, nothing else changed |
+| `head` | the fitted head, `head.bin` |
+| `eyes` | the eyes' texture, `eyes.png` |
+| `eyemask` | where the eyes-closed portrait blends in, `eyemask.png` |
+
+```ini
+# avatars/butler/avatar.ini
+[avatar]
+still = still.jpg
+closed = closed.jpg
+head = head.bin
+eyes = eyes.png
+eyemask = eyemask.png
+```
+
+The keys sit in an `[avatar]` section (as the desk's upload writes it);
+other sections are refused by `avatar check` and skipped by the desk.
+Values are file names in the pack's own folder. `head`, `eyes` and
+`eyemask` come together: a pack with only a still hasn't been fitted yet,
+and the desk shows the still, breathing, and offers to fit it. The desk
+serves pack files up to 20 MB each.
+
+### Fitting
+
+The desk fits a portrait itself, in its window, in a few seconds: it
+finds the face's landmarks (MediaPipe's face landmarker), maps a neutral
+base head onto them and carries every expression shape along. It refuses
+a photo with the reason:
+
+| Check | Message |
+|---|---|
+| no face found | No face found. Use a clear photo of one face. |
+| more than one face | There's more than one face. Use a photo of one person. |
+| turned more than 8° | The face is turned. Use a photo facing the camera. |
+| mouth open | The mouth is open. Use a photo with the mouth closed. |
+| eyes closed | The eyes are closed. Use a photo with the eyes open; add an eyes-closed version after. |
+| face under 250 px wide | The face is too small. Use a larger photo. |
+
+and warns without refusing: a face under 500 px wide ("This will look
+soft. A larger photo looks sharper."), a photo taller than wide ("A photo
+wider than tall fills the window; this one leaves bands at the sides.").
+
+The fit needs its files in the data folder's `desk-assets/`: MediaPipe
+tasks-vision 0.10.14 and its face landmarker model (Apache 2.0), and the
+base head, `base-head.bin`. For local use, `sh tools/fetch-desk-assets.sh
+DATA/desk-assets` fetches MediaPipe's files and checks each by SHA-256;
+the base head is made with `tools/make-base-head.html` (tools/README).
+
+### What the desk's page needs
+
+The avatar module (`src/desk/avatar.js`) and the fit (`src/desk/fit.js`)
+run under the desk's Content-Security-Policy with every load on harness's
+own server. They need, besides `'self'`:
+
+- `script-src 'wasm-unsafe-eval'`: the face landmarker is WebAssembly
+  (without it the fit can't start). No `'unsafe-eval'`, no `'unsafe-inline'`,
+  no worker. The landmarker adds a `<script src>` for its loader
+  (`/desk/assets/mediapipe/wasm/…`, same origin) to the page's body.
+- `img-src blob:`: images are decoded from fetched bytes (a pack's files,
+  an uploaded File) through `blob:` URLs.
+- `.wasm` served as `application/wasm` and `.mjs` as `text/javascript`
+  (else a slower fallback with a console error).
+
+Pack files are fetched with `no-cache`, so a refit shows at once while the
+server's `Cache-Control: private, max-age=86400` and ETag keep reloads
+cheap. The fit records the still's SHA-256 in the head: the desk saves as
+the still exactly the bytes it gave the fit (re-encoding it, or stripping
+its EXIF, makes the head read as fitted to another photo, and the still
+shows instead).
+
+### An eyes-closed version
+
+The avatar rests with its eyes closed, and a blink lands on the
+eyes-closed portrait, so adding one is recommended. Make it with an image
+tool (any that edits a photo from a prompt): give it the portrait and ask
+"Close the eyes. Change nothing else." It's one image edit, not a video.
+It must line up with the portrait: the landmarks outside the eyes may
+move 12 px at most, else "This eyes-closed photo doesn't line up with the
+portrait. Change only the eyes." Without one, the closed eyes are drawn in
+the skin's own tone.
+
+### Checking a pack
+
+`harness avatar check NAME` checks `avatars/NAME/`: `avatar.ini`, each
+file's type by its first bytes and its size, that the eyes-closed photo
+and the head match the still's size (as shown, a phone photo's rotation
+applied) and that the head was fitted to these very bytes, and the head
+file's header: its version, its vertex count, the
+52 shapes, and that every array lies inside the file. It exits 0 when the
+pack is good, 1 with the problems listed.
+
+### The head file
+
+`head.bin`, format version 1: 8 bytes `\x89HEAD\r\n\x1a`, a 32-bit
+little-endian version (1), a 32-bit little-endian header length (a
+multiple of 4), the header as JSON padded with spaces, then the arrays.
+The header's `arrays` maps each name to `[TYPE, OFFSET, COUNT]` (`f32`,
+`i16`, `u16`, `u32` or `u8`; the offset from the arrays' start, a
+multiple of 4; the count in values). A fitted head (`"kind": "head"`)
+has `vertices`, `image` (the still's width and height), `still` (its
+bytes and SHA-256, when the fit had them), `shapes` and `shapeScale`,
+the photo's `face`, `mouth` and `eyes` (outlines, irises, reflections,
+lid tones) and `eyeCrop`; its arrays are `head.pos`,
+`head.nrm`, `head.uv`, `head.uvC` (the eyes-closed projection),
+`head.idx`, a `shape.NAME.pos` and `shape.NAME.nrm` per shape (16-bit,
+scaled by `shapeScale`), `teeth.pos` and `teeth.idx`. Coordinates are
+the photo's pixels, x right, y up. The base head is the same container
+with `"kind": "base"`, the model's own units, and the 478 landmarks.
+
+### What isn't shipped yet
+
+The base head is three.js's Face Cap sample (r170, by Bannaflak), and its
+license hasn't been verified, so neither `base-head.bin` nor the built-in
+butler (its portraits and its fitted files) is in the repository or the
+release yet; until it's cleared, fitting works only where the owner made
+the base head locally. The gaps list keeps this open, with an own base
+head as the alternative.
+
 ## Commands
 
 `/stop [NAME]`, `/new`, `/status`, `/brief [NAME]`, `/topics`, `/topic add|rm`, `/tasks`,
@@ -3608,7 +3737,7 @@ CLI: `init [--butler]`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`
 `memory [list|pin|unpin|forget ID]`, `people list|show|import`,
 `snapshot list|take|changes|restore`, `undo RUN`, `env list|check|rm|key`,
 `agent list|show|rm`, `mcp list|login|logout`, `log verify|tail|runs|session|search`, `inbox [--json]`,
-`app list|approve|rm|fork|versions|revert`, `import hermes`, `skill add|list|show|update|rm`,
+`app list|approve|rm|fork|versions|revert`, `import hermes`, `skill add|list|show|update|rm`, `avatar check NAME`,
 `stop`, `open`, `autostart on|off`, `health`, `doctor`, `report`, `version`. `--home DIR` may come anywhere on
 the line; arguments a command does not take are refused. `health` exits 0
 only while `harness run` holds the folder and has ticked in the last 90 s;

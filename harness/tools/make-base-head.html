@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Base head</title>
+<!-- Dev only. Makes desk-assets/base-head.bin from desk-assets/facecap.glb.
+     three's loaders come from jsDelivr (pinned at 0.170.0), so run the dev
+     server with --no-csp for this page:
+       python3 -I tools/devserver.py 8731 DATA --no-csp
+       node tools/headless.mjs 'http://127.0.0.1:8731/tools/make-base-head.html#token=TOKEN' --wait window.__done
+     (TOKEN: the one the dev server printed; saving needs it) -->
+<style>body { margin: 0; background: #111; color: #ddd; font: 12px ui-monospace, monospace } canvas { max-width: 48vw; margin: 4px }</style>
+<pre id="log"></pre>
+<div id="pics"></div>
+<script type="importmap">
+{ "imports": {
+  "three": "/desk/static/vendor/three.module.min.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<script type="module" src="make-base-head.js"></script>

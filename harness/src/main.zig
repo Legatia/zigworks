@@ -28,6 +28,7 @@ const deskwin = @import("deskwin.zig");
 const autostart = @import("autostart.zig");
 const mail_mod = @import("mail.zig");
 const sock = @import("sock.zig");
+const avatar = @import("avatar.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -108,6 +109,8 @@ const usage =
     \\  skill update [NAME] [--force] [--yes]
     \\                             fetch again and show what changed; an edited one only
     \\                             with --force
+    \\  avatar check NAME          check the desk's avatar pack in avatars/NAME: its
+    \\                             files, avatar.ini and the head file
     \\  version | help
     \\
     \\The data folder is --home (anywhere on the line), else HARNESS_HOME, else
@@ -452,6 +455,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "report")) return reportCmd(app);
     if (eql(cmd, "import")) return importCmd(app, rest);
     if (eql(cmd, "skill")) return skillCmd(app, rest);
+    if (eql(cmd, "avatar")) return avatarCmd(app, rest[1]);
     complain("unknown command {s}; see harness help", .{cmd});
     return .usage;
 }
@@ -1594,6 +1598,19 @@ fn envKeyCmd(app: *App, name: []const u8) !Exit {
     return .ok;
 }
 
+/// `harness avatar check NAME`: the pack in avatars/NAME (avatar.zig).
+fn avatarCmd(app: *App, name: []const u8) !Exit {
+    const dir = try std.fs.path.join(app.arena, &.{ app.home, "avatars", name });
+    const st = Io.Dir.cwd().statFile(app.io, dir, .{}) catch null;
+    if (st == null or st.?.kind != .directory) {
+        complain("no avatar {s}: there is no folder {s}", .{ name, dir });
+        return .failed;
+    }
+    const r = try avatar.check(app.io, app.arena, dir);
+    try outAll(app.io, try avatar.text(app.arena, name, dir, r));
+    return if (r.problems.len == 0) .ok else .failed;
+}
+
 const app_usage = "usage: harness app list | app approve NAME | app rm NAME | app fork NAME NEW | app versions NAME | app revert NAME N";
 
 fn appArgsOk(rest: []const []const u8) bool {
@@ -2606,6 +2623,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
     if (eql(cmd, "people")) return if (peopleArgsOk(rest)) null else people_usage;
+    if (eql(cmd, "avatar")) return if (rest.len == 2 and eql(rest[0], "check") and avatar.validName(rest[1])) null else avatar.usage;
     if (eql(cmd, "undo")) return if (rest.len == 1 and (std.fmt.parseInt(u64, rest[0], 10) catch null) != null) null else undo_usage;
     if (eql(cmd, "env")) return if (envArgsOk(rest)) null else env_usage;
     if (eql(cmd, "import")) return if (hermes_import.parseArgs(rest) == null) import_usage else null;
@@ -2715,6 +2733,14 @@ test "stop_autostart_open_take_their_arguments" {
     try t.expect(std.mem.indexOf(u8, usage, "  stop ") != null);
     try t.expect(std.mem.indexOf(u8, usage, "  autostart [on|off] ") != null);
     try t.expect(std.mem.indexOf(u8, usage, "  open ") != null);
+}
+
+test "avatar_takes_check_and_a_name" {
+    for ([_][]const []const u8{ &.{"avatar"}, &.{ "avatar", "check" }, &.{ "avatar", "check", "a", "b" }, &.{ "avatar", "show", "a" }, &.{ "avatar", "check", "../x" }, &.{ "avatar", "check", "Butler" } }) |line| if (badArgs(line) == null) {
+        printLine("accepted:", line);
+        return error.TestUnexpectedResult;
+    };
+    try t.expectEqual(null, badArgs(&.{ "avatar", "check", "butler" }));
 }
 
 test "agent_takes_list_show_and_rm" {
@@ -3108,6 +3134,7 @@ test {
     _ = @import("butler.zig");
     _ = @import("mail.zig");
     _ = @import("doctor.zig");
+    _ = @import("avatar.zig");
     _ = @import("people.zig");
     _ = @import("outside.zig");
     _ = @import("inject.zig");

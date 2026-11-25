@@ -1,0 +1,2 @@
+body { margin: 0; padding: 8px; background: #111; color: #ddd; font: 12px/1.4 ui-monospace, Menlo, monospace }
+img, canvas { max-width: 48vw; margin: 4px; vertical-align: top; background: #333 }
