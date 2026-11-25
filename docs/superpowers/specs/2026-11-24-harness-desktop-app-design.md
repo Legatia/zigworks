@@ -582,10 +582,51 @@ built apart:
 
 ## Speech
 
-- **Off by default:** `[desk] speak = off | browser | PROVIDER`. A
-  provider is an OpenAI-format text-to-speech endpoint from `[provider
-  NAME]`, with its key in the store. harness fetches the audio, and the
-  key never reaches the page.
+- **Off by default, and any provider can be swapped in** (the owner: "keep it
+  configurable, user should be able to swap with their own api or provider
+  preferred"). `[desk] speak = off | browser | NAME`. harness fetches the
+  audio, and the key never reaches the page.
+  - **`browser`:** the system's own voices, local and free; not on Linux.
+  - **NAME, any speaking provider:**
+    - Two presets work with a stored key alone: `openai` (OpenAI's API,
+      key `openai`) and `gemini` (the Gemini API, key `gemini`).
+    - Any `[provider NAME]` section works too, with the same lines
+      providers take today: `url`, `key` (a stored secret's name),
+      `auth` and `header`. That covers your own key, a proxy, a gateway
+      such as LiteLLM or OpenRouter, or a local server. Its `api` says
+      how to talk to it:
+      - `api = openai`: OpenAI-format `POST {url}/audio/speech`, with MP3
+        back;
+      - `api = gemini`: Gemini-format `POST {url}/models/MODEL:generateContent`
+        with audio output and a prebuilt voice, the key in
+        `x-goog-api-key`, or as the section's `auth` and `header` say.
+        Gemini returns raw 16-bit PCM (24 kHz, mono), which harness wraps
+        in a WAV header for the page.
+    - `api = gemini` is for speech only for now. A chat model set to one
+      is refused with a plain reason.
+  - **Model and voice:** `[desk] speak_model` and `speak_voice` apply to the
+    chosen provider. When they're not set, each kind has its own default:
+    - openai: `tts-1`, `alloy`;
+    - gemini: `gemini-3.8-flash-lite-tts`, with a voice suited to a
+      butler.
+    Preview models retire, so the README names the date the defaults were
+    checked.
+  - **In the desk's settings,** Speak replies lists:
+    - Off;
+    - Browser, except on Linux;
+    - every configured provider that can speak, by name.
+
+    For a provider it also shows Model and Voice fields, with the kind's
+    defaults as placeholders. Choices are written through
+    write-then-reload. Adding a provider (its url and key) stays in
+    config.ini and `harness secret add`, so keys are never typed into the
+    page. The README shows both presets and a gateway example.
+- **Gemini's free tier lets Google use the text** to improve its products;
+  a paid key doesn't. harness can't tell which tier a key is on. So
+  whenever the chosen provider is `api = gemini`, Speak replies shows
+  inline, not behind an "i": "On Gemini's free tier, Google may use the
+  spoken text to improve its products. A key on a paid plan keeps it
+  out." It's a privacy disclosure the owner must see before choosing.
 - **Section names:** `[speech]` already belongs to the Home Assistant
   agent's settings, so none of this uses it.
 - **What's spoken:**
