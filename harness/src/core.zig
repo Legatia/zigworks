@@ -37434,6 +37434,22 @@ test "desk_alone_a_reply_reaches_the_desk_with_nobody_paired" {
     try t.expect(std.mem.indexOf(u8, h, "You, on the desk") == null);
 }
 
+test "desk_alone_history_is_back_after_a_restart" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    try f.e.script(1, model.textReply("Three flats match."));
+    try f.core.startWorker();
+    try t.expectEqual(std.http.Status.ok, deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"Find flats\"}").status);
+    _ = try waitDesk(&f, "history", "conv=main", "Three flats match.");
+    f.core.close();
+    f.core = try Core.open(t.allocator, t.io, f.home, .{ .omnigate = "og-key-for-tests", .search = "search-key-123" });
+    f.core.attachAlone();
+    const h = deskCall(&f, .GET, "history", "conv=main", "").body;
+    try expectHas(h, "\"from\":\"you\",\"text\":\"Find flats\"");
+    try expectHas(h, "\"from\":\"harness\",\"text\":\"Three flats match.\"");
+}
+
 test "desk_alone_a_name_harness_does_not_know_goes_to_main_with_it_in_front" {
     var f: Fix = undefined;
     try f.initAlone("", "");
