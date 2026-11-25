@@ -5,7 +5,7 @@ Dev tools for the desk's avatar. Not shipped; harness doesn't use them.
       DIR is what the desk serves as /desk/assets/ (the data folder's
       desk-assets/).
 
-  devserver.py PORT DATA
+  devserver.py PORT DATA [--csp POLICY | --no-csp] [--cache]
       127.0.0.1 only. The desk's URL layout over this tree and DATA:
       /desk/static/ (src/desk/), /desk/avatars/ (DATA/avatars/),
       /desk/assets/ (DATA/desk-assets/), /tools/; POST /save/PATH writes
@@ -49,6 +49,12 @@ Dev tools for the desk's avatar. Not shipped; harness doesn't use them.
       (0.5 s silence, 1.2 s voice, 0.4 s silence), speech replaced,
       stopped and disposed, the browser voice, frame rates, hiding, the
       states, moments, reduced motion.
+
+  cache-checks.html#token=TOKEN
+      Against the dev server with --cache (the desk's caching: max-age
+      and an ETag): a pack changed on disk is seen by the next
+      createAvatar, and a head over another still of the same size shows
+      the still.
 
   test-avatar.mjs [--write-fixture]
       node checks for fit.js's and avatar.js's pure parts; --write-fixture
