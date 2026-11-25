@@ -108,5 +108,15 @@
 2. Files a post carries are kept in `state/desk-files/` and the desk names them. Cost: a file the owner must open from the folder.
 3. Posts to shared conversations (groups, members) fail as "Telegram is off" and are not retried. Cost: the household isn't told while Telegram is off.
 4. `config set` takes `provider NAME.url` as one argument or two words. `get` prints `auto` for an auto offset.
+7. `config set` takes several `KEY VALUE` pairs in one call, written together and parsed once: a new provider's `api` and `url` only read together, so the app's "Other" needs one call (`config set "provider other.api" openai "provider other.url" URL model.provider other`). The spec's one-pair form is unchanged. Cost if wrong: the app builder uses a form the spec didn't name.
+8. `config set` keeps the changed line's own comment and changes the last occurrence (the one in use); a setting named `key` or `token` takes only a secret's name (a-z, 0-9, - and _). A value with control characters or ` ;`/` #` is refused.
+9. A running harness after `config set`: "send /reload" except `chat.telegram`, `chat.token`, `apps.on`, `apps.port` ("restart"). Nothing is printed when harness isn't running.
+10. Desk alone, `/conversation new`: "Conversations other than main are Telegram topics, and Telegram is off." Topics made before still work on the desk.
+11. doctor: no bot token or Telegram off is fine (the desk is the way in), not a failure.
+12. `utc_offset = auto` is resolved at settings load and once a minute in the tick (under the settings lock); readers keep reading the `i32`. `config.Config.utc_auto` is not a key of its own.
 5. TZ environment variable is not read; the system's zone is.
 6. Offset refreshed once a minute; a time computed for the future uses today's offset.
+
+## Done
+
+Tasks 1 to 7 done; see the branch log. Verification and review results are in the branch's final report.
