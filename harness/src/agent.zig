@@ -625,6 +625,11 @@ pub const Run = struct {
     own_words: ?[]const u8 = null,
     /// Where a call made outside a turn (a workflow's tool step) marks.
     loose: ?*Marks = null,
+    /// Where the desk's run view hears of a top-level run starting and
+    /// ending and of its helpers; null: nowhere.
+    live: ?Live = null,
+    /// The top-level run's id there (its helpers report under it); 0: none.
+    live_id: u64 = 0,
 
     fn now(r: *const Run) i64 {
         return util.nowSeconds(r.io);
@@ -1814,6 +1819,20 @@ pub const PageCache = struct {
     }
 };
 
+/// The desk's live view of runs (core.zig): a top-level run's start, its
+/// end, and each helper `delegate` starts and ends under it.
+pub const Live = struct {
+    ctx: *anyopaque,
+    /// Returns the run's id (0: not tracked).
+    begin: *const fn (ctx: *anyopaque, by: []const u8, conversation: []const u8, text: []const u8) u64,
+    end: *const fn (ctx: *anyopaque, id: u64, outcome: Outcome) void,
+    helpers: *const fn (ctx: *anyopaque, id: u64, delta: i32) void,
+
+    /// How a run ended: with a reply, in an error (or cut short), or
+    /// quietly (stopped, nothing said).
+    pub const Outcome = enum { replied, failed, quiet };
+};
+
 pub const TurnResult = struct {
     text: []const u8,
     stopped: bool = false,
@@ -1955,6 +1974,21 @@ fn earlierBlock(arena: std.mem.Allocator, r: *const Run) !?[]const u8 {
 /// One turn. `from_owner`: the text is the owner's own words (mentions
 /// count); false for scheduled instructions.
 pub fn turn(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: bool) !TurnResult {
+    // the desk's run view: a top-level run, reported by its start and end
+    const lv = if (r.helper) null else r.live;
+    if (lv) |l| r.live_id = l.begin(l.ctx, r.who.by, r.conversation, user_text);
+    const res = turnRun(r, conv, user_text, from_owner) catch |e| {
+        if (lv) |l| if (r.live_id != 0) l.end(l.ctx, r.live_id, .failed);
+        return e;
+    };
+    if (lv) |l| if (r.live_id != 0) {
+        const outcome: Live.Outcome = if (res.ended_by != null) .failed else if (res.stopped) .quiet else if (res.replied or res.text.len > 0) .replied else .quiet;
+        l.end(l.ctx, r.live_id, outcome);
+    };
+    return res;
+}
+
+fn turnRun(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: bool) !TurnResult {
     var arena_state: std.heap.ArenaAllocator = .init(r.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -4414,6 +4448,9 @@ fn helperMain(h: *Helper) void {
 
 fn helperRun(h: *Helper) !void {
     const p = h.parent;
+    // counted for the desk's run view while it goes
+    if (p.live) |l| if (p.live_id != 0) l.helpers(l.ctx, p.live_id, 1);
+    defer if (p.live) |l| if (p.live_id != 0) l.helpers(l.ctx, p.live_id, -1);
     const cfg = p.model_cfg orelse return error.NoModelSettings;
     const d = h.def;
     // its own stop flag, set with its parent's, so /stop NAME reaches it alone

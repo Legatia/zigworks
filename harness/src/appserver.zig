@@ -14,6 +14,8 @@ const Io = std.Io;
 const sock = @import("sock.zig");
 const apps = @import("apps.zig");
 const log_mod = @import("log.zig");
+const deskwin = @import("deskwin.zig");
+const config = @import("config.zig");
 
 pub const Options = struct {
     /// DATA/apps.
@@ -27,6 +29,28 @@ pub const Options = struct {
     version: []const u8,
     /// What answers the apps' API and the bar; null: both answer 404.
     host: ?Host = null,
+    /// The desk (harness's own window); null: its paths answer 404.
+    desk: ?DeskOptions = null,
+};
+
+/// Where the desk's files and entry are.
+pub const DeskOptions = struct {
+    /// DATA: `avatars/` and `desk-assets/` are served from it.
+    home: []const u8,
+    /// DATA/state: `open-request` and `desk-code`.
+    state: []const u8,
+};
+
+/// One call of the desk's API (`/desk/api/PATH`), its session checked.
+pub const DeskCall = struct {
+    method: std.http.Method,
+    /// After `/desk/api/`.
+    path: []const u8,
+    query: []const u8,
+    body: []const u8,
+    content_type: []const u8 = "",
+    /// Set when the server stops: a long-poll ends.
+    stop: *const std.atomic.Value(bool),
 };
 
 /// One call of an app's API (`/a/TOKEN/api/PATH`).
@@ -64,10 +88,45 @@ pub const Host = struct {
     shell: *const fn (ctx: *anyopaque, a: std.mem.Allocator, call: ShellCall) Answer,
     /// An app's page went into a frame.
     opened: *const fn (ctx: *anyopaque, name: []const u8, version: []const u8) void,
+    /// The desk's API; null: it answers 404.
+    desk: ?*const fn (ctx: *anyopaque, a: std.mem.Allocator, call: DeskCall) Answer = null,
 };
 
 /// The longest body a call may carry.
 pub const max_body: usize = 1 << 20;
+/// The desk's voice and upload paths take this much.
+pub const max_desk_body: usize = 10 << 20;
+/// The largest avatar or fit file served.
+pub const max_desk_file: u64 = 20 << 20;
+
+/// The desk's page and its files, in the binary (`/desk/static/F`).
+pub const desk_files = [_][2][]const u8{
+    .{ "index.html", @embedFile("desk/index.html") },
+    .{ "desk.css", @embedFile("desk/desk.css") },
+    .{ "desk.js", @embedFile("desk/desk.js") },
+    .{ "avatar.js", @embedFile("desk/avatar.js") },
+    .{ "fit.js", @embedFile("desk/fit.js") },
+    .{ "vendor/three.module.min.js", @embedFile("desk/vendor/three.module.min.js") },
+    .{ "fonts/chakra-petch-latin-400-normal.woff2", @embedFile("desk/fonts/chakra-petch-latin-400-normal.woff2") },
+    .{ "fonts/chakra-petch-latin-500-normal.woff2", @embedFile("desk/fonts/chakra-petch-latin-500-normal.woff2") },
+    .{ "fonts/chakra-petch-latin-600-normal.woff2", @embedFile("desk/fonts/chakra-petch-latin-600-normal.woff2") },
+    .{ "fonts/chakra-petch-latin-700-normal.woff2", @embedFile("desk/fonts/chakra-petch-latin-700-normal.woff2") },
+    .{ "fonts/chakra-petch-latin-ext-400-normal.woff2", @embedFile("desk/fonts/chakra-petch-latin-ext-400-normal.woff2") },
+    .{ "fonts/chakra-petch-latin-ext-500-normal.woff2", @embedFile("desk/fonts/chakra-petch-latin-ext-500-normal.woff2") },
+    .{ "fonts/chakra-petch-latin-ext-600-normal.woff2", @embedFile("desk/fonts/chakra-petch-latin-ext-600-normal.woff2") },
+    .{ "fonts/chakra-petch-latin-ext-700-normal.woff2", @embedFile("desk/fonts/chakra-petch-latin-ext-700-normal.woff2") },
+    .{ "fonts/jetbrains-mono-latin-400-normal.woff2", @embedFile("desk/fonts/jetbrains-mono-latin-400-normal.woff2") },
+    .{ "fonts/jetbrains-mono-latin-500-normal.woff2", @embedFile("desk/fonts/jetbrains-mono-latin-500-normal.woff2") },
+    .{ "fonts/jetbrains-mono-latin-ext-400-normal.woff2", @embedFile("desk/fonts/jetbrains-mono-latin-ext-400-normal.woff2") },
+    .{ "fonts/jetbrains-mono-latin-ext-500-normal.woff2", @embedFile("desk/fonts/jetbrains-mono-latin-ext-500-normal.woff2") },
+    .{ "fonts/OFL-chakra-petch.txt", @embedFile("desk/fonts/OFL-chakra-petch.txt") },
+    .{ "fonts/OFL-jetbrains-mono.txt", @embedFile("desk/fonts/OFL-jetbrains-mono.txt") },
+};
+
+fn deskFile(rel: []const u8) ?[]const u8 {
+    for (desk_files) |f| if (std.mem.eql(u8, f[0], rel)) return f[1];
+    return null;
+}
 
 /// The apps in the binary, read-only; fork one to change it.
 pub const builtins = [_]Builtin{
@@ -109,7 +168,7 @@ const draft_api = "{\"error\":\"a draft being reviewed reads nothing and asks ha
 /// one alike.
 const old_link = "This link is from an earlier start of harness. Ask for the app again.";
 
-const Refusal = enum { host, origin, token, frame };
+const Refusal = enum { host, origin, token, frame, desk };
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
@@ -130,7 +189,14 @@ pub const Server = struct {
     mutex: Io.Mutex = .init,
     open: std.ArrayList(sock.Handle) = .empty,
     /// When a refusal of each kind was last logged (one a minute).
-    last_refusal_ms: [4]i64 = @splat(-std.math.maxInt(i32)),
+    last_refusal_ms: [5]i64 = @splat(-std.math.maxInt(i32)),
+    /// The desk: DATA and DATA/state ("": off), its code and sessions, and
+    /// the thread that answers `state/open-request`.
+    desk_home: []u8 = &.{},
+    desk_state: []u8 = &.{},
+    codes: deskwin.Codes = .{},
+    sessions: deskwin.Sessions = .{},
+    desk_thread: ?std.Thread = null,
 
     const max_connections = 32;
     const idle_ms = 30 * 1000;
@@ -157,9 +223,41 @@ pub const Server = struct {
         var raw: [16]u8 = undefined;
         try io.randomSecure(&raw);
         _ = std.base64.url_safe_no_pad.Encoder.encode(&s.shell_token, &raw);
+        if (o.desk) |d| {
+            s.desk_home = try gpa.dupe(u8, d.home);
+            s.desk_state = try gpa.dupe(u8, d.state);
+            s.desk_thread = try std.Thread.spawn(.{}, deskLoop, .{s});
+        }
         if (s.log) |l| l.write(.app, false, .{ .event = "server started", .port = s.port }) catch {};
         s.thread = try std.Thread.spawn(.{}, acceptLoop, .{s});
         return s;
+    }
+
+    /// Every 200 ms: a request for a code (`state/open-request`, written by
+    /// the desk app) is taken and a code written to `state/desk-code`; a
+    /// code past its 60 s goes.
+    fn deskLoop(s: *Server) void {
+        var arena: std.heap.ArenaAllocator = .init(s.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const request = std.fs.path.join(a, &.{ s.desk_state, "open-request" }) catch return;
+        const code = std.fs.path.join(a, &.{ s.desk_state, "desk-code" }) catch return;
+        // a code an earlier start left (it ended without its cleanup) is no
+        // code of this start's
+        Io.Dir.cwd().deleteFile(s.io, code) catch {};
+        while (!s.stopping.load(.acquire)) {
+            const now = Io.Clock.awake.now(s.io).toMilliseconds();
+            if (Io.Dir.cwd().statFile(s.io, request, .{})) |_| {
+                Io.Dir.cwd().deleteFile(s.io, request) catch {};
+                if (s.codes.issue(s.io, code, @intCast(now))) |_| {
+                    if (s.log) |l| l.write(.app, false, .{ .event = "desk code written" }) catch {};
+                } else |e| if (s.log) |l| l.write(.app, false, .{ .event = "desk code not written", .why = @errorName(e) }) catch {};
+            } else |_| {}
+            s.codes.expire(s.io, code, @intCast(now));
+            s.io.sleep(.fromMilliseconds(200), .awake) catch {};
+        }
+        // a code nobody took goes with this start
+        s.codes.expire(s.io, code, std.math.maxInt(i64));
     }
 
     /// Ends within 2 s, connections kept open by browsers too.
@@ -172,6 +270,7 @@ pub const Server = struct {
             defer s.mutex.unlock(s.io);
             for (s.open.items) |c| sock.shutdown(c);
         }
+        if (s.desk_thread) |th| th.join();
         var waited: u32 = 0;
         while (s.active.load(.acquire) > 0 and waited < 2000) : (waited += 5) s.io.sleep(.fromMilliseconds(5), .awake) catch {};
         s.listener.close();
@@ -181,6 +280,8 @@ pub const Server = struct {
         s.gpa.free(s.apps_dir);
         s.gpa.free(s.state_dir);
         s.gpa.free(s.version);
+        s.gpa.free(s.desk_home);
+        s.gpa.free(s.desk_state);
         s.gpa.destroy(s);
     }
 
@@ -281,11 +382,17 @@ pub const Server = struct {
         var host: ?[]const u8 = null;
         var origin: ?[]const u8 = null;
         var dest: ?[]const u8 = null;
+        var cookie: []const u8 = "";
+        var if_none: []const u8 = "";
+        var ctype: []const u8 = "";
         var it = req.iterateHeaders();
         while (it.next()) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "host")) host = try a.dupe(u8, h.value);
             if (std.ascii.eqlIgnoreCase(h.name, "origin")) origin = try a.dupe(u8, h.value);
             if (std.ascii.eqlIgnoreCase(h.name, "sec-fetch-dest")) dest = try a.dupe(u8, h.value);
+            if (std.ascii.eqlIgnoreCase(h.name, "cookie")) cookie = try a.dupe(u8, h.value);
+            if (std.ascii.eqlIgnoreCase(h.name, "if-none-match")) if_none = try a.dupe(u8, h.value);
+            if (std.ascii.eqlIgnoreCase(h.name, "content-type")) ctype = try a.dupe(u8, h.value);
         }
         const own = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{s.port});
         const own_origin = try std.fmt.allocPrint(a, "http://{s}", .{own});
@@ -297,14 +404,17 @@ pub const Server = struct {
         // files are read; only a token's `api/` paths take calls
         const reads = method == .GET or method == .HEAD;
         const calls = method == .POST or method == .PUT or method == .DELETE or method == .OPTIONS;
-        if (!reads and !(calls and isApi(path))) return s.plain(req, .method_not_allowed, "Only GET.", own_origin, null);
+        const desk_api = std.mem.startsWith(u8, path, "/desk/api/");
+        if (!reads and !(calls and (isApi(path) or desk_api))) return s.plain(req, .method_not_allowed, "Only GET.", own_origin, null);
+        // the desk's voice and upload take more
+        const limit: usize = if (std.mem.eql(u8, path, "/desk/api/voice") or std.mem.eql(u8, path, "/desk/api/upload")) max_desk_body else max_body;
         var body: []const u8 = "";
         if (method == .POST or method == .PUT) {
-            const too_big = "A call carries at most 1 MiB.";
-            if (req.head.content_length) |n| if (n > max_body) {
+            const too_big = if (limit == max_body) "A call carries at most 1 MiB." else "A call carries at most 10 MB.";
+            if (req.head.content_length) |n| if (n > limit) {
                 // read off first (up to 4 MiB): closed with its body unread,
                 // Windows resets the connection and the answer is lost
-                if (n <= 4 << 20) {
+                if (n <= @max(4 << 20, limit + (1 << 20))) {
                     var drain_buf: [8192]u8 = undefined;
                     if (req.readerExpectContinue(&drain_buf)) |r| {
                         _ = r.discardRemaining() catch {};
@@ -314,12 +424,17 @@ pub const Server = struct {
             };
             var body_buf: [8192]u8 = undefined;
             const r = req.readerExpectContinue(&body_buf) catch return false;
-            body = r.allocRemaining(a, .limited(max_body)) catch |e| switch (e) {
+            body = r.allocRemaining(a, .limited(limit)) catch |e| switch (e) {
                 error.StreamTooLong => return s.plain(req, .payload_too_large, too_big, own_origin, null),
                 else => return false,
             };
         }
-        const rq: Rq = .{ .req = req, .method = method, .query = query, .body = body, .origin = origin, .dest = dest, .own_origin = own_origin };
+        const rq: Rq = .{ .req = req, .method = method, .query = query, .body = body, .origin = origin, .dest = dest, .own_origin = own_origin, .cookie = cookie, .if_none = if_none, .content_type = ctype };
+        if (std.mem.eql(u8, path, "/alive")) return s.respondEx(req, .ok, "", "text/plain; charset=utf-8", own_origin, .plain, null, .{});
+        if (s.desk_home.len > 0) {
+            if (std.mem.eql(u8, path, "/enter")) return s.enter(a, rq);
+            if (std.mem.eql(u8, path, "/desk") or std.mem.startsWith(u8, path, "/desk/")) return s.desk(a, rq, path);
+        }
         if (std.mem.startsWith(u8, path, "/s/")) return s.shell(a, rq, path["/s/".len..]);
         if (in_app) return s.app(a, rq, path["/a/".len..]);
         return s.plain(req, .not_found, old_link, own_origin, null);
@@ -334,7 +449,88 @@ pub const Server = struct {
         origin: ?[]const u8,
         dest: ?[]const u8,
         own_origin: []const u8,
+        cookie: []const u8 = "",
+        if_none: []const u8 = "",
+        content_type: []const u8 = "",
     };
+
+    // ---- the desk ----
+
+    /// `/enter?code=C`: the code the desk app read from `state/desk-code`,
+    /// once, within its 60 s: a session, kept in memory only, as a cookie.
+    fn enter(s: *Server, a: std.mem.Allocator, rq: Rq) !bool {
+        const req = rq.req;
+        const gone = "This code was used or has expired. Open the desk again.";
+        const code = queryValue(rq.query, "code") orelse return s.refuse(req, .desk, .forbidden, gone);
+        const path = try std.fs.path.join(a, &.{ s.desk_state, "desk-code" });
+        if (!s.codes.take(s.io, path, code, @intCast(Io.Clock.awake.now(s.io).toMilliseconds()))) return s.refuse(req, .desk, .forbidden, gone);
+        const tok = try s.sessions.create(s.io);
+        var buf: [128]u8 = undefined;
+        if (s.log) |l| l.write(.app, false, .{ .event = "desk entered" }) catch {};
+        return s.respondEx(req, .see_other, "", "text/plain; charset=utf-8", rq.own_origin, .plain, null, .{ .headers = &.{
+            .{ .name = "location", .value = "/desk" },
+            .{ .name = "set-cookie", .value = deskwin.setCookie(&buf, &tok) },
+        } });
+    }
+
+    /// `/desk…`: the page, its files, the avatars and fit files, an app in
+    /// its frame, and the API; each only to a session.
+    fn desk(s: *Server, a: std.mem.Allocator, rq: Rq, path: []const u8) !bool {
+        const req = rq.req;
+        const o = rq.own_origin;
+        const signed_in = if (deskwin.cookieOf(rq.cookie, deskwin.cookie_name)) |tok| s.sessions.valid(s.io, tok) else false;
+        if (std.mem.startsWith(u8, path, "/desk/api/")) {
+            if (!signed_in) return s.respond(req, .unauthorized, "{\"error\":\"signed out\"}", "application/json", o, .plain, null);
+            if (rq.method == .OPTIONS) return s.plain(req, .method_not_allowed, "Only GET and POST.", o, null);
+            const h = s.host orelse return s.respond(req, .not_found, "{\"error\":\"not here\"}", "application/json", o, .plain, null);
+            const f = h.desk orelse return s.respond(req, .not_found, "{\"error\":\"not here\"}", "application/json", o, .plain, null);
+            const got = f(h.ctx, a, .{ .method = rq.method, .path = path["/desk/api/".len..], .query = rq.query, .body = rq.body, .content_type = rq.content_type, .stop = &s.stopping });
+            return s.respond(req, got.status, got.body, got.content_type, o, .plain, null);
+        }
+        if (!signed_in) return s.refuse(req, .desk, .unauthorized, "Open the desk from the harness app.");
+        if (std.mem.eql(u8, path, "/desk") or std.mem.eql(u8, path, "/desk/")) return s.respond(req, .ok, deskFile("index.html").?, "text/html; charset=utf-8", o, .desk, null);
+        if (std.mem.startsWith(u8, path, "/desk/static/")) {
+            const rel = path["/desk/static/".len..];
+            const body = deskFile(rel) orelse return s.plain(req, .not_found, "No such file.", o, null);
+            return s.respond(req, .ok, body, contentType(rel), o, .desk, null);
+        }
+        if (std.mem.startsWith(u8, path, "/desk/apps/")) return s.deskApp(a, rq, path["/desk/apps/".len..]);
+        // the owner's avatars and the fit's files, from the data folder
+        var dir: []const u8 = "";
+        var rel: []const u8 = "";
+        if (std.mem.startsWith(u8, path, "/desk/avatars/")) {
+            const rest = path["/desk/avatars/".len..];
+            const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return s.plain(req, .not_found, "No such file.", o, null);
+            const name = rest[0..slash];
+            rel = rest[slash + 1 ..];
+            if (!config.avatarName(name) or std.mem.indexOfScalar(u8, rel, '/') != null) return s.plain(req, .not_found, "No such file.", o, null);
+            dir = try std.fs.path.join(a, &.{ s.desk_home, "avatars", name });
+        } else if (std.mem.startsWith(u8, path, "/desk/assets/")) {
+            rel = path["/desk/assets/".len..];
+            dir = try std.fs.path.join(a, &.{ s.desk_home, "desk-assets" });
+        } else return s.plain(req, .not_found, "No such file.", o, null);
+        if (!deskName(rel)) return s.plain(req, .not_found, "No such file.", o, null);
+        const body = readDeskFile(s.io, a, dir, rel) catch |e| switch (e) {
+            error.TooBig => return s.plain(req, .payload_too_large, "Files here are at most 20 MB.", o, null),
+            else => return e,
+        } orelse return s.plain(req, .not_found, "No such file.", o, null);
+        const tag = deskwin.etag(body);
+        const cache = "private, max-age=86400";
+        if (std.mem.eql(u8, std.mem.trim(u8, rq.if_none, " "), &tag)) return s.respondEx(req, .not_modified, "", contentType(rel), o, .plain, null, .{ .cache = cache, .headers = &.{.{ .name = "etag", .value = &tag }} });
+        return s.respondEx(req, .ok, body, contentType(rel), o, .plain, null, .{ .cache = cache, .headers = &.{.{ .name = "etag", .value = &tag }} });
+    }
+
+    /// `/desk/apps/NAME`: the app in its frame, as `/s/TOKEN/NAME` shows it.
+    fn deskApp(s: *Server, a: std.mem.Allocator, rq: Rq, name: []const u8) !bool {
+        const req = rq.req;
+        const found = (try s.findApp(a, name)) orelse return s.plain(req, .not_found, "No app by that name; the page of apps lists them.", rq.own_origin, null);
+        const token = s.appToken(found.name, found.version);
+        var out: std.ArrayList(u8) = .empty;
+        try s.pageHead(&out, a, found.title, try std.fmt.allocPrint(a, "<a href=\"/desk\">Desk</a><span>{s}</span>", .{try escape(a, found.title)}));
+        try out.print(a, "<iframe sandbox=\"allow-scripts allow-forms\" referrerpolicy=\"no-referrer\" allow=\"\" src=\"/a/{s}/?in=page&amp;view={s}\" title=\"{s}\"></iframe>", .{ &token, viewOf(rq.query), try escape(a, found.title) });
+        try s.pageTail(&out, a);
+        return s.shellPage(req, out.items, rq.own_origin);
+    }
 
     /// `/s/TOKEN/api/...` or `/a/TOKEN/api/...`.
     fn isApi(path: []const u8) bool {
@@ -580,14 +776,23 @@ pub const Server = struct {
         return s.respond(req, status, text, "text/plain; charset=utf-8", "", .plain, null);
     }
 
-    const Kind = enum { shell, app, plain };
+    const Kind = enum { shell, app, plain, desk };
 
-    /// Every response: no referrer, no sniffing, nothing kept; the shell's
-    /// and an app's own CSP.
+    /// What a response carries beyond the usual: its caching, and headers
+    /// (a cookie, a redirect, an ETag).
+    const Extra = struct { cache: []const u8 = "no-store", headers: []const std.http.Header = &.{} };
+
     fn respond(s: *Server, req: *std.http.Server.Request, status: std.http.Status, body: []const u8, ct: []const u8, own_origin: []const u8, kind: Kind, cors: ?[]const u8) !bool {
+        return s.respondEx(req, status, body, ct, own_origin, kind, cors, .{});
+    }
+
+    /// Every response: no referrer, no sniffing, nothing kept (but the
+    /// desk's avatar and fit files); the shell's, an app's and the desk's
+    /// own CSP.
+    fn respondEx(s: *Server, req: *std.http.Server.Request, status: std.http.Status, body: []const u8, ct: []const u8, own_origin: []const u8, kind: Kind, cors: ?[]const u8, extra: Extra) !bool {
         _ = s;
         var buf: [1024]u8 = undefined;
-        var headers: [9]std.http.Header = undefined;
+        var headers: [14]std.http.Header = undefined;
         var n: usize = 0;
         headers[n] = .{ .name = "content-type", .value = ct };
         n += 1;
@@ -595,7 +800,7 @@ pub const Server = struct {
         n += 1;
         headers[n] = .{ .name = "x-content-type-options", .value = "nosniff" };
         n += 1;
-        headers[n] = .{ .name = "cache-control", .value = "no-store" };
+        headers[n] = .{ .name = "cache-control", .value = extra.cache };
         n += 1;
         switch (kind) {
             .shell => {
@@ -614,13 +819,27 @@ pub const Server = struct {
                 headers[n] = .{ .name = "content-security-policy", .value = "default-src 'none'; frame-ancestors 'none'" };
                 n += 1;
             },
+            .desk => {
+                headers[n] = .{ .name = "cross-origin-opener-policy", .value = "same-origin" };
+                n += 1;
+                headers[n] = .{ .name = "cross-origin-resource-policy", .value = "same-origin" };
+                n += 1;
+                // MediaPipe's WebAssembly (the fit) needs wasm-unsafe-eval; a
+                // photo picked for the fit and the voice's audio are blob URLs
+                headers[n] = .{ .name = "content-security-policy", .value = try std.fmt.bufPrint(&buf, "default-src 'none'; script-src {0s} 'wasm-unsafe-eval'; style-src {0s}; img-src {0s} blob:; font-src {0s}; media-src {0s} blob:; connect-src {0s}; worker-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'", .{own_origin}) };
+                n += 1;
+            },
         }
         if (cors) |c| {
             headers[n] = .{ .name = "access-control-allow-origin", .value = c };
             n += 1;
         }
+        for (extra.headers) |h| {
+            headers[n] = h;
+            n += 1;
+        }
         // an error ends the connection; so does a client that asked to
-        const keep = status == .ok and req.head.keep_alive;
+        const keep = (status == .ok or status == .not_modified) and req.head.keep_alive;
         try req.respond(body, .{ .status = status, .extra_headers = headers[0..n], .keep_alive = keep });
         return keep;
     }
@@ -630,6 +849,55 @@ pub const Server = struct {
 fn tokenEql(given: []const u8, want: *const [22]u8) bool {
     if (given.len != want.len) return false;
     return std.crypto.timing_safe.eql([22]u8, given[0..22].*, want.*);
+}
+
+/// `key=V` from a query (as given); null: not there.
+fn queryValue(query: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |kv| {
+        if (kv.len > key.len and std.mem.startsWith(u8, kv, key) and kv[key.len] == '=') return kv[key.len + 1 ..];
+    }
+    return null;
+}
+
+/// A file of an avatar or of the fit: parts of letters, digits, `.`, `_`
+/// and `-` (none starting or ending with a dot, no device names), with an
+/// extension those files have.
+fn deskName(rel: []const u8) bool {
+    if (rel.len == 0 or rel.len > 512) return false;
+    var parts = std.mem.splitScalar(u8, rel, '/');
+    var last: []const u8 = "";
+    while (parts.next()) |part| {
+        if (part.len == 0 or part[0] == '.' or part[part.len - 1] == '.') return false;
+        for (part) |c| if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-')) return false;
+        const base = part[0 .. std.mem.indexOfScalar(u8, part, '.') orelse part.len];
+        for ([_][]const u8{ "con", "prn", "aux", "nul" }) |d| if (std.ascii.eqlIgnoreCase(base, d)) return false;
+        if (base.len == 4 and (std.ascii.startsWithIgnoreCase(base, "com") or std.ascii.startsWithIgnoreCase(base, "lpt")) and base[3] >= '1' and base[3] <= '9') return false;
+        last = part;
+    }
+    const dot = std.mem.lastIndexOfScalar(u8, last, '.') orelse return false;
+    const ext = last[dot + 1 ..];
+    for ([_][]const u8{ "jpg", "jpeg", "png", "webp", "bin", "ini", "wasm", "js", "mjs", "task", "json", "txt" }) |e| if (std.ascii.eqlIgnoreCase(e, ext)) return true;
+    return false;
+}
+
+/// `rel` in `dir` as `readFileIn` reads it, up to 20 MB (error.TooBig
+/// past it); null: not there, or not a file.
+fn readDeskFile(io: Io, a: std.mem.Allocator, dir: []const u8, rel: []const u8) !?[]const u8 {
+    var path = dir;
+    var parts = std.mem.splitScalar(u8, rel, '/');
+    while (parts.next()) |part| {
+        path = try std.fs.path.join(a, &.{ path, part });
+        const st = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return null;
+        const last = parts.peek() == null;
+        if (last and st.kind != .file) return null;
+        if (!last and st.kind != .directory) return null;
+        if (last and st.size > max_desk_file) return error.TooBig;
+    }
+    return Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_desk_file)) catch |e| switch (e) {
+        error.StreamTooLong => error.TooBig,
+        else => null,
+    };
 }
 
 /// `view=V` from a query: letters, digits, - and _ (up to 64), else "".
@@ -687,7 +955,8 @@ fn contentType(rel: []const u8) []const u8 {
         .{ "css", "text/css; charset=utf-8" },   .{ "json", "application/json" },             .{ "svg", "image/svg+xml" },
         .{ "png", "image/png" },                 .{ "jpg", "image/jpeg" },                    .{ "gif", "image/gif" },
         .{ "webp", "image/webp" },               .{ "ico", "image/x-icon" },                  .{ "woff2", "font/woff2" },
-        .{ "txt", "text/plain; charset=utf-8" }, .{ "md", "text/markdown; charset=utf-8" },
+        .{ "txt", "text/plain; charset=utf-8" }, .{ "md", "text/markdown; charset=utf-8" }, .{ "jpeg", "image/jpeg" },
+        .{ "wasm", "application/wasm" },        .{ "ini", "text/plain; charset=utf-8" },
     };
     for (map) |m| if (std.ascii.eqlIgnoreCase(m[0], ext)) return m[1];
     return "application/octet-stream";
@@ -949,9 +1218,16 @@ const FakeHost = struct {
     api_calls: u32 = 0,
     shell_calls: u32 = 0,
     opened: u32 = 0,
+    desk_calls: u32 = 0,
 
     fn host(h: *FakeHost) Host {
-        return .{ .ctx = h, .api = api, .shell = shell, .opened = wasOpened };
+        return .{ .ctx = h, .api = api, .shell = shell, .opened = wasOpened, .desk = deskCall };
+    }
+
+    fn deskCall(ctx: *anyopaque, a: std.mem.Allocator, call: DeskCall) Answer {
+        const h: *FakeHost = @ptrCast(@alignCast(ctx));
+        h.desk_calls += 1;
+        return .{ .body = std.fmt.allocPrint(a, "{{\"desk\":\"{s}\",\"method\":\"{s}\",\"query\":\"{s}\",\"body\":{d},\"type\":\"{s}\"}}", .{ call.path, @tagName(call.method), call.query, call.body.len, call.content_type }) catch "{}" };
     }
 
     fn api(ctx: *anyopaque, a: std.mem.Allocator, call: Call) Answer {
@@ -1102,4 +1378,344 @@ test "the_review_page_shows_a_save_in_full_and_its_draft_reads_nothing" {
     try t.expectEqual(404, (try get(a, f.s.port, try f.shellPath("review/00000000000000d1"), f.host)).status);
     try t.expectEqual(404, (try get(a, f.s.port, try std.fmt.allocPrint(a, "/a/{s}/", .{&token}), try f.frame())).status);
     for ([_][]const u8{ "review/../../x", "review/zz", "review/" }) |bad| try t.expectEqual(404, (try get(a, f.s.port, try f.shellPath(bad), f.host)).status);
+}
+
+// ---- the desk ----
+
+/// The fixture's server again, with the desk on (DATA is the fixture's
+/// folder) and answered by `fh`.
+fn withDesk(f: *Fix, fh: *FakeHost) !void {
+    f.s.stop();
+    const root = try f.tmp.dir.realPathFileAlloc(t.io, ".", f.a);
+    try f.tmp.dir.createDirPath(t.io, "state");
+    f.s = try Server.start(t.allocator, t.io, .{ .apps_dir = f.apps_dir, .state_dir = f.state_dir, .version = "0.3.0", .host = fh.host(), .desk = .{ .home = root, .state = try std.fs.path.join(f.a, &.{ root, "state" }) } });
+    f.host = try std.fmt.allocPrint(f.a, "Host: 127.0.0.1:{d}\r\n", .{f.s.port});
+}
+
+/// What the desk app does: asks for a code, reads it, enters; returns the
+/// code and the session's Cookie header line.
+fn enterDesk(f: *Fix) !struct { code: []const u8, cookie: []const u8, entered: Got } {
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "state/open-request", .data = "" });
+    var waited: u32 = 0;
+    const code = while (waited < 3000) : (waited += 20) {
+        if (f.tmp.dir.readFileAlloc(t.io, "state/desk-code", f.a, .limited(64))) |x| {
+            if (x.len > 0) break std.mem.trim(u8, x, " \r\n");
+        } else |_| {}
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    } else return error.NoCode;
+    const got = try get(f.a, f.s.port, try std.fmt.allocPrint(f.a, "/enter?code={s}", .{code}), f.host);
+    const at = std.mem.indexOf(u8, got.head, "set-cookie: harness_desk=") orelse return .{ .code = code, .cookie = "", .entered = got };
+    const v = got.head[at + "set-cookie: ".len ..];
+    const tok = v[0..std.mem.indexOfScalar(u8, v, ';').?];
+    return .{ .code = code, .cookie = try std.fmt.allocPrint(f.a, "Cookie: {s}\r\n", .{tok}), .entered = got };
+}
+
+test "alive_answers_and_nothing_else" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    var fh: FakeHost = .{};
+    try withDesk(&f, &fh);
+    const got = try get(f.a, f.s.port, "/alive", f.host);
+    try t.expectEqual(200, got.status);
+    try t.expectEqualStrings("", got.body);
+    try expectHas(got.head, "cache-control: no-store");
+    try t.expectEqual(403, (try get(f.a, f.s.port, "/alive", try std.fmt.allocPrint(f.a, "Host: localhost:{d}\r\n", .{f.s.port}))).status);
+    try t.expectEqual(405, (try send(f.a, f.s.port, "POST", "/alive", f.host, "")).status);
+}
+
+test "enter_sets_a_session_cookie_once" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    var fh: FakeHost = .{};
+    try withDesk(&f, &fh);
+    const e = try enterDesk(&f);
+    // the request was taken
+    try t.expectError(error.FileNotFound, f.tmp.dir.statFile(t.io, "state/open-request", .{}));
+    try t.expectEqual(303, e.entered.status);
+    try expectHas(e.entered.head, "location: /desk");
+    try expectHas(e.entered.head, "; Path=/; HttpOnly; SameSite=Strict");
+    try t.expect(std.mem.indexOf(u8, e.entered.head, "Expires") == null);
+    try t.expect(std.mem.indexOf(u8, e.entered.head, "Max-Age") == null);
+    // used once: the file is gone, the code refused again
+    try t.expectError(error.FileNotFound, f.tmp.dir.statFile(t.io, "state/desk-code", .{}));
+    const again = try get(f.a, f.s.port, try std.fmt.allocPrint(f.a, "/enter?code={s}", .{e.code}), f.host);
+    try t.expectEqual(403, again.status);
+    try t.expect(std.mem.indexOf(u8, again.head, "set-cookie") == null);
+    try t.expectEqual(403, (try get(f.a, f.s.port, "/enter?code=AAAAAAAAAAAAAAAAAAAAAA", f.host)).status);
+    try t.expectEqual(403, (try get(f.a, f.s.port, "/enter", f.host)).status);
+    // the session opens the desk; nothing reusable was left in the data folder
+    try t.expectEqual(200, (try get(f.a, f.s.port, "/desk", try std.fmt.allocPrint(f.a, "{s}{s}", .{ f.host, e.cookie }))).status);
+    const tok = e.cookie["Cookie: harness_desk=".len .. e.cookie.len - 2];
+    var it = try f.tmp.dir.walk(f.a);
+    defer it.deinit();
+    while (try it.next(t.io)) |w| if (w.kind == .file) {
+        const text = try f.tmp.dir.readFileAlloc(t.io, w.path, f.a, .unlimited);
+        try t.expect(std.mem.indexOf(u8, text, tok) == null);
+    };
+}
+
+test "desk_paths_refuse_a_framed_app_and_need_the_cookie" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.a;
+    var fh: FakeHost = .{};
+    try withDesk(&f, &fh);
+    const e = try enterDesk(&f);
+    const with = try std.fmt.allocPrint(a, "{s}{s}", .{ f.host, e.cookie });
+    const ok = try get(a, f.s.port, "/desk/api/state?x=1", with);
+    try t.expectEqual(200, ok.status);
+    try t.expectEqualStrings("{\"desk\":\"state\",\"method\":\"GET\",\"query\":\"x=1\",\"body\":0,\"type\":\"\"}", ok.body);
+    try expectHas(ok.head, "cache-control: no-store");
+    const sent = try send(a, f.s.port, "POST", "/desk/api/send", try std.fmt.allocPrint(a, "{s}Content-Type: application/json\r\nOrigin: http://127.0.0.1:{d}\r\n", .{ with, f.s.port }), "{\"conv\":\"main\",\"text\":\"hi\"}");
+    try t.expectEqual(200, sent.status);
+    try expectHas(sent.body, "\"method\":\"POST\",\"query\":\"\",\"body\":27,\"type\":\"application/json\"");
+    try t.expectEqual(2, fh.desk_calls);
+    // no cookie, a made-up one: signed out
+    const out = try get(a, f.s.port, "/desk/api/state", f.host);
+    try t.expectEqual(401, out.status);
+    try t.expectEqualStrings("{\"error\":\"signed out\"}", out.body);
+    try t.expectEqual(401, (try get(a, f.s.port, "/desk/api/state", try std.fmt.allocPrint(a, "{s}Cookie: harness_desk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n", .{f.host}))).status);
+    try t.expectEqual(401, (try get(a, f.s.port, "/desk", f.host)).status);
+    // a framed app (Origin: null), even with the cookie, and another site
+    try t.expectEqual(403, (try send(a, f.s.port, "POST", "/desk/api/send", try std.fmt.allocPrint(a, "{s}Origin: null\r\n", .{with}), "{}")).status);
+    try t.expectEqual(403, (try get(a, f.s.port, "/desk/api/state", try std.fmt.allocPrint(a, "{s}Origin: null\r\n", .{with}))).status);
+    try t.expectEqual(403, (try send(a, f.s.port, "POST", "/desk/api/answer", try std.fmt.allocPrint(a, "{s}Origin: http://evil.test\r\n", .{with}), "{}")).status);
+    try t.expectEqual(403, (try get(a, f.s.port, "/desk/avatars/butler/avatar.ini", try std.fmt.allocPrint(a, "{s}Origin: null\r\n", .{with}))).status);
+    try t.expectEqual(2, fh.desk_calls);
+    // an app's token reaches no desk path
+    try t.expectEqual(404, (try get(a, f.s.port, try std.fmt.allocPrint(a, "/a/{s}/desk/api/state", .{&f.s.appToken("notes", "1")}), with)).status);
+    try t.expectEqual(2, fh.desk_calls);
+}
+
+test "desk_page_and_static_files_with_their_csp" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.a;
+    var fh: FakeHost = .{};
+    try withDesk(&f, &fh);
+    const e = try enterDesk(&f);
+    const with = try std.fmt.allocPrint(a, "{s}{s}", .{ f.host, e.cookie });
+    const o = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{f.s.port});
+    const csp = try std.fmt.allocPrint(a, "content-security-policy: default-src 'none'; script-src {0s} 'wasm-unsafe-eval'; style-src {0s}; img-src {0s} blob:; font-src {0s}; media-src {0s} blob:; connect-src {0s}; worker-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'", .{o});
+    for ([_][]const u8{ "/desk", "/desk/" }) |p| {
+        const page = try get(a, f.s.port, p, with);
+        try t.expectEqual(200, page.status);
+        try expectHas(page.head, "content-type: text/html; charset=utf-8");
+        try expectHas(page.head, csp);
+        try expectHas(page.body, "<script type=\"module\" src=\"/desk/static/desk.js\"></script>");
+        try t.expect(std.mem.indexOf(u8, page.body, "<script>") == null);
+    }
+    for ([_][2][]const u8{
+        .{ "desk.js", "text/javascript" },
+        .{ "avatar.js", "text/javascript" },
+        .{ "fit.js", "text/javascript" },
+        .{ "vendor/three.module.min.js", "text/javascript" },
+        .{ "desk.css", "text/css" },
+        .{ "fonts/chakra-petch-latin-400-normal.woff2", "font/woff2" },
+        .{ "fonts/jetbrains-mono-latin-ext-500-normal.woff2", "font/woff2" },
+        .{ "fonts/OFL-chakra-petch.txt", "text/plain" },
+    }) |x| {
+        const got = try get(a, f.s.port, try std.fmt.allocPrint(a, "/desk/static/{s}", .{x[0]}), with);
+        try t.expectEqual(200, got.status);
+        try expectHas(got.head, try std.fmt.allocPrint(a, "content-type: {s}", .{x[1]}));
+        try expectHas(got.head, csp);
+    }
+    try t.expectEqual(404, (try get(a, f.s.port, "/desk/static/nothing.js", with)).status);
+    try t.expectEqual(404, (try get(a, f.s.port, "/desk/static/../index.html", with)).status);
+    // the stand-in's fit says it isn't there yet
+    try expectHas((try get(a, f.s.port, "/desk/static/fit.js", with)).body, "Fitting isn't available yet");
+    try expectHas((try get(a, f.s.port, "/desk/static/avatar.js", with)).body, "export async function createAvatar(");
+}
+
+test "desk_files_are_served_with_caching_and_no_tricks" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.a;
+    var fh: FakeHost = .{};
+    try withDesk(&f, &fh);
+    const e = try enterDesk(&f);
+    const with = try std.fmt.allocPrint(a, "{s}{s}", .{ f.host, e.cookie });
+    try f.tmp.dir.createDirPath(t.io, "avatars/butler");
+    try f.tmp.dir.createDirPath(t.io, "desk-assets/mediapipe/wasm");
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "avatars/butler/avatar.ini", .data = "[avatar]\nstill = still.jpg\n" });
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "avatars/butler/still.jpg", .data = "\xff\xd8\xffportrait" });
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "desk-assets/mediapipe/wasm/vision_wasm_internal.wasm", .data = "\x00asm\x01" });
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "desk-assets/base-head.bin", .data = "head" });
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "config.ini", .data = "[model]\n" });
+    const still = try get(a, f.s.port, "/desk/avatars/butler/still.jpg", with);
+    try t.expectEqual(200, still.status);
+    try t.expectEqualStrings("\xff\xd8\xffportrait", still.body);
+    try expectHas(still.head, "content-type: image/jpeg");
+    try expectHas(still.head, "cache-control: private, max-age=86400");
+    const tag = deskwin.etag("\xff\xd8\xffportrait");
+    try expectHas(still.head, try std.fmt.allocPrint(a, "etag: {s}", .{&tag}));
+    // asked again with its tag: not sent again
+    const same = try get(a, f.s.port, "/desk/avatars/butler/still.jpg", try std.fmt.allocPrint(a, "{s}If-None-Match: {s}\r\n", .{ with, &tag }));
+    try t.expectEqual(304, same.status);
+    try t.expectEqualStrings("", same.body);
+    try expectHas((try get(a, f.s.port, "/desk/avatars/butler/avatar.ini", with)).body, "still = still.jpg");
+    const wasm = try get(a, f.s.port, "/desk/assets/mediapipe/wasm/vision_wasm_internal.wasm", with);
+    try t.expectEqual(200, wasm.status);
+    try expectHas(wasm.head, "content-type: application/wasm");
+    try expectHas(wasm.head, "cache-control: private, max-age=86400");
+    try t.expectEqual(200, (try get(a, f.s.port, "/desk/assets/base-head.bin", with)).status);
+    // without the session, nothing
+    try t.expectEqual(401, (try get(a, f.s.port, "/desk/avatars/butler/still.jpg", f.host)).status);
+    // tricks
+    for ([_][]const u8{
+        "/desk/avatars/../config.ini",
+        "/desk/avatars/butler/../../config.ini",
+        "/desk/avatars/%2e%2e/config.ini",
+        "/desk/avatars/Butler/still.jpg",
+        "/desk/avatars/butler/",
+        "/desk/avatars/butler",
+        "/desk/avatars/butler/sub/still.jpg",
+        "/desk/avatars/butler/.hidden.jpg",
+        "/desk/avatars/butler/con.jpg",
+        "/desk/assets/../config.ini",
+        "/desk/assets/mediapipe/../../config.ini",
+        "/desk/assets/",
+        "/desk/assets/nothing.bin",
+    }) |tr| {
+        const got = try get(a, f.s.port, tr, with);
+        if (got.status != 404) std.debug.print("{s}: {d}\n", .{ tr, got.status });
+        try t.expectEqual(404, got.status);
+    }
+    // a link where a file was: never followed (where links can be made)
+    if (f.tmp.dir.symLink(t.io, "../../config.ini", "avatars/butler/link.jpg", .{})) {
+        try t.expectEqual(404, (try get(a, f.s.port, "/desk/avatars/butler/link.jpg", with)).status);
+    } else |_| {}
+    // past 20 MB: refused
+    const big = try a.alloc(u8, max_desk_file + 1);
+    @memset(big, 0);
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "desk-assets/big.bin", .data = big });
+    try t.expectEqual(413, (try get(a, f.s.port, "/desk/assets/big.bin", with)).status);
+}
+
+test "desk_bodies_may_be_10_mb_for_voice_and_upload_only" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.a;
+    var fh: FakeHost = .{};
+    try withDesk(&f, &fh);
+    const e = try enterDesk(&f);
+    const with = try std.fmt.allocPrint(a, "{s}{s}", .{ f.host, e.cookie });
+    const two = try a.alloc(u8, 2 << 20);
+    @memset(two, 'x');
+    for ([_][]const u8{ "voice?conv=main", "upload?avatar=mine&part=still&consent=yes" }) |p| {
+        const got = try sendBig(a, f.s.port, "POST", try std.fmt.allocPrint(a, "/desk/api/{s}", .{p}), with, two);
+        try t.expectEqual(200, got.status);
+        try expectHas(got.body, "\"body\":2097152");
+    }
+    try t.expectEqual(413, (try sendBig(a, f.s.port, "POST", "/desk/api/send", with, two)).status);
+    const over = try a.alloc(u8, max_desk_body + 1);
+    @memset(over, 'x');
+    try t.expectEqual(413, (try sendBig(a, f.s.port, "POST", "/desk/api/voice", with, over)).status);
+    try t.expectEqual(2, fh.desk_calls);
+}
+
+/// `send` for bodies larger than the socket's buffers.
+fn sendBig(a: std.mem.Allocator, port: u16, method: []const u8, path: []const u8, extra: []const u8, body: []const u8) !Got {
+    const h = try sock.connect(t.io, "127.0.0.1", port, 2000);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var wbuf: [64 * 1024]u8 = undefined;
+    var sk: sock.Socket = undefined;
+    sk.init(t.io, h, &rbuf, &wbuf, 10_000);
+    defer sk.close();
+    try sk.writer.print("{s} {s} HTTP/1.1\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n", .{ method, path, extra, body.len });
+    sk.writer.writeAll(body) catch {};
+    sk.writer.flush() catch {};
+    const all = try sk.reader.allocRemaining(a, .limited(4 << 20));
+    const split = std.mem.indexOf(u8, all, "\r\n\r\n") orelse return error.BadResponse;
+    const status = try std.fmt.parseInt(u16, all[9..12], 10);
+    return .{ .status = status, .head = all[0..split], .body = all[split + 4 ..] };
+}
+
+test "the_settings_page_carries_the_photo_rules" {
+    const page = deskFile("index.html").?;
+    // inline beside the upload button, the consent line, the privacy line
+    for ([_][]const u8{
+        "Facing the camera, eyes open, mouth closed.",
+        "One face, head and shoulders, wider than tall.",
+        "Works best without glasses.",
+        "JPEG or PNG, up to 10 MB.",
+        "This is me, someone who agreed, or a made-up character.",
+        "The photo stays on this computer",
+        "Add an eyes-closed version",
+        "Recommended: the avatar rests with its eyes closed.",
+        // behind the "i" bubbles
+        "The photo is fitted onto a 3D head and becomes the whole scene: its background, hair, shoulders and lighting.",
+        "These are refused, with the reason: a face turned more than about 8°, an open mouth or teeth showing, closed eyes, more than one face, a face too small to find.",
+        "These fit but may look off: glasses (the eyes move behind frames drawn on the skin), hair over the eyes, cartoon or anime styles (which may not be found at all).",
+        "Every avatar gets the same teeth and mouth, and turns its head a few degrees at most.",
+        "Make one with an image tool: ask it to close the eyes and change nothing else. It's one image edit, not a video.",
+        "It must line up with the first photo, and the desk checks this.",
+        "Without it, closed eyes are drawn in the skin's tone.",
+        "Play the message",
+        "Needs you",
+        "Lately",
+    }) |line| try expectHas(page, line);
+    // the consent tick gates the upload: the button starts disabled
+    try expectHas(page, "<button type=\"button\" id=\"upBtn\" class=\"btn cut-s\" disabled>Upload</button>");
+    try expectHas(page, "<input type=\"checkbox\" id=\"upConsent\">");
+    // no inline style or script: the CSP allows neither
+    try t.expect(std.mem.indexOf(u8, page, "style=") == null);
+    try t.expect(std.mem.indexOf(u8, page, "<script>") == null);
+    try t.expect(std.mem.indexOf(u8, page, "http://") == null and std.mem.indexOf(u8, page, "https://") == null);
+    // the script gates the upload on the tick too
+    try expectHas(deskFile("desk.js").?, "upConsent");
+}
+
+test "a_code_left_by_an_earlier_start_is_gone" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.createDirPath(t.io, "state");
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "state/desk-code", .data = "AAAAAAAAAAAAAAAAAAAAAA\n" });
+    var fh: FakeHost = .{};
+    try withDesk(&f, &fh);
+    var waited: u32 = 0;
+    while (waited < 2000) : (waited += 20) {
+        _ = f.tmp.dir.statFile(t.io, "state/desk-code", .{}) catch break;
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    try t.expectError(error.FileNotFound, f.tmp.dir.statFile(t.io, "state/desk-code", .{}));
+    try t.expectEqual(403, (try get(f.a, f.s.port, "/enter?code=AAAAAAAAAAAAAAAAAAAAAA", f.host)).status);
+}
+
+test "an_app_opens_from_the_desk_in_its_frame" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    var fh: FakeHost = .{};
+    try withDesk(&f, &fh);
+    const e = try enterDesk(&f);
+    const with = try std.fmt.allocPrint(f.a, "{s}{s}", .{ f.host, e.cookie });
+    const page = try get(f.a, f.s.port, "/desk/apps/notes", with);
+    try t.expectEqual(200, page.status);
+    try expectHas(page.body, try std.fmt.allocPrint(f.a, "src=\"/a/{s}/?in=page&amp;view=\"", .{&f.s.appToken("notes", "1")}));
+    try expectHas(page.body, "<a href=\"/desk\">Desk</a>");
+    try t.expectEqual(401, (try get(f.a, f.s.port, "/desk/apps/notes", f.host)).status);
+    try t.expectEqual(404, (try get(f.a, f.s.port, "/desk/apps/nothing", with)).status);
+}
+
+test "the_desk_page_keeps_to_its_own_facts_and_says_where_speech_goes" {
+    const js = deskFile("desk.js").?;
+    // while speaking the card says so, never the reply's words
+    try expectHas(js, "\"Reading a reply aloud.\"");
+    try t.expect(std.mem.indexOf(u8, js, "one = S.lastSpoken") == null);
+    // a provider's voice: the replies go to it, said inline
+    try expectHas(js, "\"Replies are sent to \"");
+    try expectHas(deskFile("index.html").?, "id=\"speakWhere\"");
+    // targets of 44 px, the "i" too
+    try expectHas(deskFile("desk.css").?, ".info > button { width: 44px; height: 44px;");
+    // the apps, from the side panel
+    try expectHas(deskFile("index.html").?, "id=\"apps\"");
+    try expectHas(js, "\"/desk/apps/\"");
 }

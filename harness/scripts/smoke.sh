@@ -975,6 +975,53 @@ kill "$RPID" 2>/dev/null
 wait "$RPID" 2>/dev/null
 RPID=""
 
+# the desk, harness's own window, over HTTP as the desk app opens it
+# (harness-fake --desk plays the app and its page): entered by a one-time
+# code, one message, its quiet echo in Telegram; harness stop; harness open
+# with no app; open at login on and off (a HOME of the smoke's own; on
+# Windows it is the registry, not tried here)
+DH="$T/desk"
+HARNESS_HOME="$DH" "$H" init >/dev/null 2>&1
+check "init writes a fixed port for the desk" 'grep -qE "^port = [1-9][0-9]*" "$DH/config.ini"'
+DPORT=$(sed -n 's/^port = \([0-9]*\).*/\1/p' "$DH/config.ini")
+cat >"$DH/config.ini" <<EOF
+[model]
+url = $URL
+[search]
+url = $URL
+[chat]
+api = $URL
+[apps]
+port = $DPORT
+EOF
+chmod 600 "$DH/config.ini"
+HARNESS_HOME="$DH" "$H" run >"$T/drun.out" 2>&1 &
+RPID=$!
+wait_for "$T/drun.out" "running on" 15
+paired_n=$(grep -c "I answer only you from now on." "$OUT")
+DCODE=$(HARNESS_HOME="$DH" "$H" pair | sed -n 's|^/pair ||p')
+say "/pair $DCODE"
+i=0
+while [ $i -lt 100 ] && [ "$(grep -c "I answer only you from now on." "$OUT")" -le "$paired_n" ]; do
+	sleep 0.1
+	i=$((i + 1))
+done
+check "state/desk.json names this harness, its port and its PATH" 'grep -qF "\"port\":$DPORT," "$DH/state/desk.json" && grep -qF "\"version\":\"" "$DH/state/desk.json" && grep -qF "\"binary\":\"" "$DH/state/desk.json" && grep -qF "\"path\":\"" "$DH/state/desk.json"'
+reply "$(text_reply 'Three flats match.')"
+"$F" --desk "$DH" "Find me a two-bedroom near Kazimierz" >"$T/desk.out" 2>&1
+check "the desk is entered by a one-time code: a session cookie, the code good once" 'grep -qxF "entered 303 httponly samesite" "$T/desk.out" && grep -qxF "again 403" "$T/desk.out" && [ ! -e "$DH/state/desk-code" ] && [ ! -e "$DH/state/open-request" ]'
+check "the desk page and its state answer to the session" 'grep -qxF "page 200 with its script" "$T/desk.out" && grep -qE "^state 200 " "$T/desk.out"'
+check "a message from the desk is a turn in main, and its reply comes back to the desk" 'grep -qxF "sent 200" "$T/desk.out" && grep -qxF "harness: Three flats match." "$T/desk.out" && grep -qF "Find me a two-bedroom near Kazimierz" "$(req)"'
+check "Telegram gets a quiet echo of it, then the reply" 'grep -F "You, on the desk: Find me a two-bedroom near Kazimierz" "$OUT" | grep -qF "\"disable_notification\":true" && grep -qF "Three flats match." "$OUT"'
+check "harness stop ends the running harness, and the desk app still finds it" 'HARNESS_HOME="$DH" "$H" stop >"$T/stop.out" 2>&1 && grep -qxF "Stopped." "$T/stop.out" && grep -qF "\"binary\":\"" "$DH/state/desk.json"'
+wait "$RPID" 2>/dev/null
+RPID=""
+check "harness stop says so when nothing runs" '! HARNESS_HOME="$DH" "$H" stop 2>"$T/stop2.err" && grep -qF "t running." "$T/stop2.err"'
+check "harness open says plainly when the desk app is not installed" '! HARNESS_HOME="$DH" "$H" open 2>"$T/open.err" && grep -qF "The desk app isn" "$T/open.err"'
+if [ $windows = 0 ]; then
+	check "autostart on writes the login item, off removes it, and alone it says which first" 'HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart | grep -qE "^off" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart on >/dev/null && grep -rqF -- "--home" "$T/user" && grep -rqF "$DH" "$T/user" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart | grep -qE "^on" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart off >/dev/null && [ -z "$(find "$T/user" -type f)" ]'
+fi
+
 # Coming from Hermes: harness import hermes against a Hermes home of its
 # own (a fake key in .env and in a memory entry), then harness skill
 # against harness-fake's stand-in for GitHub's codeload
@@ -1031,6 +1078,7 @@ if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	[ -f "$T/brun.out" ] && { echo "--- the butler's run output"; cat "$T/brun.out"; }
 	[ -f "$T/crun.out" ] && { echo "--- the calendar's run output"; cat "$T/crun.out"; }
 	[ -f "$T/erun.out" ] && { echo "--- the errands' run output"; cat "$T/erun.out"; }
+	[ -f "$T/drun.out" ] && { echo "--- the desk's run output"; cat "$T/drun.out"; cat "$T/desk.out" 2>/dev/null; }
 	for x in bcheck1 bcheck2 bcheck3 bcheck4; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
 	for x in imp-dry imp-2 imp imp-mem skill skills; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
 	echo "--- outbox"; cat "$OUT" 2>/dev/null

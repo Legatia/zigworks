@@ -349,6 +349,17 @@ pub const Store = struct {
     }
 
     /// The open alert whose question is `item`.
+    /// Alerts open now (nobody on them yet, their question not closed).
+    pub fn openCount(s: *Store) usize {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        var n: usize = 0;
+        for (s.list.items) |x| if (x.ended.len == 0) {
+            n += 1;
+        };
+        return n;
+    }
+
     pub fn byItem(s: *Store, item: u64) ?u64 {
         s.mutex.lockUncancelable(s.io);
         defer s.mutex.unlock(s.io);

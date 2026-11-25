@@ -112,6 +112,9 @@ pub const Item = struct {
     /// How often the same thing came up.
     count: u32 = 1,
     answer: ?Answer = null,
+    /// From an urgent post, trigger or workflow (`"urgent":true` only
+    /// when set).
+    urgent: bool = false,
 
     // kept in the file only
 
@@ -188,6 +191,8 @@ pub const New = struct {
     grant: ?Grant = null,
     skip: ?[]const u8 = null,
     private: bool = false,
+    /// From an urgent post, trigger or workflow: the desk shows it first.
+    urgent: bool = false,
 };
 
 /// The items, and `state/inbox`. Callers hold `mutex` for every call but
@@ -334,6 +339,7 @@ pub const Box = struct {
         if (n.grant) |g| it.grant = .{ .tool = try a.dupe(u8, g.tool), .key = try a.dupe(u8, g.key), .who = try a.dupe(u8, g.who) };
         it.skip = try dupeOpt(a, n.skip);
         it.private = n.private;
+        it.urgent = n.urgent;
         try b.items.append(b.gpa, it);
         b.next += 1;
         return it;
@@ -478,6 +484,7 @@ pub fn render(out: *std.ArrayList(u8), gpa: std.mem.Allocator, it: *const Item, 
         if (h != null and h.?.answer != null) try writeMark(out, gpa, h.?.answer.?) else if (an.text) |x| try util.jsonString(out, gpa, x) else try out.appendSlice(gpa, "null");
         try out.print(gpa, ",\"at\":\"{s}\",\"via\":\"{s}\"}}", .{ util.isoTime(&tb, an.at), @tagName(an.via) });
     } else try out.appendSlice(gpa, "null");
+    if (it.urgent) try out.appendSlice(gpa, ",\"urgent\":true");
     if (kept) {
         try out.print(gpa, ",\"token\":\"{s}\",\"shown\":[", .{&it.token});
         for (it.shown.items, 0..) |s, i| try out.print(gpa, "{s}{{\"chat\":{d},\"thread\":{d},\"message\":{d}{s}}}", .{ if (i > 0) "," else "", s.chat, s.thread, s.message, if (s.short) ",\"short\":true" else "" });
@@ -628,6 +635,7 @@ fn parseItem(gpa: std.mem.Allocator, v: jv.Value) !*Item {
     }
     it.skip = try dupeOpt(a, jv.str(jv.get(v, "skip")));
     it.private = jv.boolean(jv.get(v, "private")) orelse false;
+    it.urgent = jv.boolean(jv.get(v, "urgent")) orelse false;
     if (any_mark) it.hidden = hidden;
     return it;
 }
@@ -850,6 +858,38 @@ fn approval(body: []const u8) New {
         .text = .reason,
         .expires = test_now + 600,
     };
+}
+
+test "an_urgent_item_keeps_its_mark" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(t.io, ".", a), "inbox" });
+    {
+        var b = try testBox(path);
+        defer b.deinit();
+        var n = approval("Close the water main now?");
+        n.by = "trigger:leak";
+        n.urgent = true;
+        _ = try b.add(n, test_now, test_token);
+        _ = try b.add(approval("shell: ls"), test_now, test_token);
+        try b.save(test_now);
+    }
+    const text = try tmp.dir.readFileAlloc(t.io, "inbox", a, .unlimited);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    _ = lines.next();
+    // the mark in the v1 part, only where it is set
+    try t.expect(std.mem.indexOf(u8, lines.next().?, ",\"urgent\":true") != null);
+    try t.expect(std.mem.indexOf(u8, lines.next().?, "\"urgent\"") == null);
+    var b = try testBox(path);
+    defer b.deinit();
+    try t.expect(b.find(1).?.urgent);
+    try t.expect(!b.find(2).?.urgent);
+    var out: std.ArrayList(u8) = .empty;
+    try render(&out, a, b.find(1).?, false);
+    try t.expect(std.mem.indexOf(u8, out.items, ",\"urgent\":true") != null);
 }
 
 test "items_are_written_whole_and_read_back" {

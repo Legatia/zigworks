@@ -49,7 +49,7 @@ against the spec and adjust.
 | Branch | What | State |
 |---|---|---|
 | `platform/desk-mac` | harness-desk for macOS | merged into harness-logins (d252816): reviewed, unit 61/61, window smoke 46/46 |
-| `platform/desk` | harness's side and the desk page | building; lands next |
+| `platform/desk` | harness's side and the desk page | merged into harness-logins: reviewed, unit 1513/1535, smoke 162 (195 with the stand-ins); avatar.js, fit.js and three.js are stand-ins until the avatar lands |
 | `platform/desk-avatar` | the 3D head module, the fit, `harness avatar check` | building; lands next |
 
 ### The desk app's code is yours to extend
@@ -199,6 +199,33 @@ or Dock icon reopens it.
   - Linux x86_64: a dynamically linked binary.
 
 The README's "Desk app (macOS)" section is the model for yours.
+
+### harness's side, from `platform/desk`
+
+**Built on `platform/desk` (2026-11-25): the paths and messages.** The
+README's "The desk's paths" has them; in short, for your apps:
+
+- `state/desk.json`: `{"binary":…,"port":N,"home":…,"version":…}`, written
+  at every start of `harness run` or `harness chat`.
+- `state/open-request` (empty) → within 200 ms `state/desk-code` (one line,
+  22 characters, 60 s, once; read it and delete it) → `GET
+  http://127.0.0.1:PORT/enter?code=CODE` → 303 to `/desk` with
+  `Set-Cookie: harness_desk=…; Path=/; HttpOnly; SameSite=Strict`; 403 for
+  a used or late code.
+- `GET /alive` → 200, empty, whenever the app server runs.
+- A lost session: the page's calls answer 401 and the page posts
+  `{"reenter": true}`; enter again with a new code.
+- The bridge: the page posts objects `{"badge": N}`, `{"attention":
+  "urgent"}`, `{"reenter": true}` through `window.chrome.webview.postMessage`
+  (WebView2's WebMessageReceived; WebKitGTK: register a handler named
+  `harness`, the page calls `window.webkit.messageHandlers.harness`).
+- `harness open` starts `harness-desk.exe` (Windows) or `harness-desk`
+  (Linux, beside harness or on PATH) with `--home DIR`, detached; the app
+  keeps one window and brings it to the front. `harness stop` and
+  `harness autostart on|off` are there for your menus (Windows: the HKCU
+  Run value `harness`).
+- The page's CSP allows `'wasm-unsafe-eval'` (MediaPipe for the fit) and
+  `blob:` images and media; WebGL needs nothing more.
 
 ## For you: the owner answered question 3 (2026-11-24)
 

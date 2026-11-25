@@ -50,7 +50,7 @@ pub const max_total: u64 = 4 << 20;
 pub const max_file: u64 = 1 << 20;
 
 /// Names an app can't have: the built-ins and the shell's own paths.
-pub const reserved = [_][]const u8{ "inbox", "log", "files", "api", "home", "review", "pending" };
+pub const reserved = [_][]const u8{ "inbox", "log", "files", "api", "home", "review", "pending", "desk" };
 
 /// The tools an app may list in `acts`: never money, the browser, logins,
 /// helpers, memory writes, skills, questions of its own or setup calls.
@@ -1190,6 +1190,8 @@ test "app_versions_fork_revert" {
     try t.expect(try asApproved(t.io, a, f.apps_dir, f.state_dir, "my-notes") != null);
     try t.expectError(error.AppExists, fork(t.io, a, f.apps_dir, f.state_dir, .{ .dir = notes_dir }, "notes", "my-notes", "00000000000000c4", "owner", 3));
     try t.expectError(error.ReservedAppName, fork(t.io, a, f.apps_dir, f.state_dir, .{ .dir = notes_dir }, "notes", "log", "00000000000000c4", "owner", 3));
+    // the desk is harness's own page
+    try t.expectError(error.ReservedAppName, fork(t.io, a, f.apps_dir, f.state_dir, .{ .dir = notes_dir }, "notes", "desk", "00000000000000c4", "owner", 3));
     const log_ini = try iniText(a, builtinManifest("log").?);
     try fork(t.io, a, f.apps_dir, f.state_dir, .{ .mem = .{ .ini = log_ini, .files = &.{ .{ "index.html", "<p>log</p>" }, .{ "app.js", "x" } } } }, "log", "my-log", "00000000000000c5", "owner", 4);
     const mine = try parse(a, try f.read("apps/my-log/app.ini"));
