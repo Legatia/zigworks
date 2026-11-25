@@ -15,7 +15,7 @@ on. Update it when something lands.
 |---|---|---|
 | Email | answered 2026-11-23: A (its own address) and C (your mailbox read-only + drafts, opt-in) | **built**: mailmcp, conversation `email`, `/setup mail`, `/setup mail mine` |
 | Money from automation | Q2 answered 2026-11-24: "Move money with a budget" | **built (Part 1)**: a budget for routines (`budget_per_day`, `budget_per_month`), off until set; apps still asked; tool steps asked every time |
-| Default environment for unattended runs | Q3: host or sandbox | host |
+| Default environment for unattended runs | Q3 answered 2026-11-24: "Sandbox on priority" | **built (Part 2)**: a built-in `sandbox`; `[default] unattended`; refused, never the host, where no sandbox can be made |
 | Apps opened from the phone | Q4: a TLS front (tailscale serve) or loopback only | loopback only |
 | Hosted version | five questions in the hosted design (VMs, EU, one balance, support access, home connector) | design only |
 | Messages to other people (WhatsApp, Signal, SMS) | Q5: which channel (WhatsApp has no personal API; Signal through signal-cli; SMS through a provider) | email only |

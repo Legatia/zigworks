@@ -1,7 +1,7 @@
 //! Whether harness answers on its port: `GET /alive`, a 200 within a time
-//! limit. The socket is the system's own, non-blocking, waited on with poll:
-//! std's connect can't yet take a time limit (harness's sock.zig says the
-//! same).
+//! limit. The socket is the system's own, non-blocking, waited on with poll
+//! (Windows: Winsock's, waited on with WSAPoll): std's connect can't yet
+//! take a time limit (harness's sock.zig says the same).
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -16,7 +16,116 @@ pub fn check(port: u16, timeout_ms: u32) bool {
     return checkOrFail(port, timeout_ms) catch false;
 }
 
+const is_windows = builtin.os.tag == .windows;
+
+/// Winsock, as much of it as one request needs.
+const ws = struct {
+    const SOCKET = usize;
+    const INVALID_SOCKET: SOCKET = ~@as(SOCKET, 0);
+    const AF_INET: c_int = 2;
+    const SOCK_STREAM: c_int = 1;
+    const IPPROTO_TCP: c_int = 6;
+    const FIONBIO: c_long = @bitCast(@as(c_ulong, 0x8004667e));
+    const SOL_SOCKET: c_int = 0xffff;
+    const SO_ERROR: c_int = 0x1007;
+    const WSAEWOULDBLOCK: c_int = 10035;
+    const WSAEINPROGRESS: c_int = 10036;
+    const POLLRDNORM: i16 = 0x0100;
+    const POLLWRNORM: i16 = 0x0010;
+    const sockaddr_in = extern struct { family: u16 = 2, port: u16, addr: u32, zero: [8]u8 = @splat(0) };
+    const pollfd = extern struct { fd: SOCKET, events: i16, revents: i16 };
+    const WSADATA = extern struct { bytes: [512]u8 };
+    extern "ws2_32" fn WSAStartup(version: u16, data: *WSADATA) callconv(.winapi) c_int;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+    extern "ws2_32" fn socket(af: c_int, kind: c_int, proto: c_int) callconv(.winapi) SOCKET;
+    extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
+    extern "ws2_32" fn ioctlsocket(s: SOCKET, cmd: c_long, arg: *c_ulong) callconv(.winapi) c_int;
+    extern "ws2_32" fn connect(s: SOCKET, addr: *const sockaddr_in, len: c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn getsockopt(s: SOCKET, level: c_int, name: c_int, value: *c_int, len: *c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn WSAPoll(fds: [*]pollfd, n: c_ulong, timeout_ms: c_int) callconv(.winapi) c_int;
+    extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+
+    var started: std.atomic.Value(bool) = .init(false);
+
+    fn ready(s: SOCKET, events: i16, deadline: i64) bool {
+        const left = deadline - nowMs();
+        if (left <= 0) return false;
+        var fds = [_]pollfd{.{ .fd = s, .events = events, .revents = 0 }};
+        return WSAPoll(&fds, 1, @intCast(left)) > 0;
+    }
+};
+
+/// The same request over Winsock.
+fn checkWindows(port: u16, timeout_ms: u32) !bool {
+    const deadline = nowMs() + timeout_ms;
+    if (!ws.started.load(.acquire)) {
+        var data: ws.WSADATA = undefined;
+        if (ws.WSAStartup(0x0202, &data) != 0) return error.NoSocket;
+        ws.started.store(true, .release);
+    }
+    // (a socket made by socket() is not inherited by what the app starts
+    // unless handed over, so there is no close-on-exec to set)
+    const s = ws.socket(ws.AF_INET, ws.SOCK_STREAM, ws.IPPROTO_TCP);
+    if (s == ws.INVALID_SOCKET) return error.NoSocket;
+    defer _ = ws.closesocket(s);
+    var on: c_ulong = 1;
+    if (ws.ioctlsocket(s, ws.FIONBIO, &on) != 0) return error.Fcntl;
+
+    const addr: ws.sockaddr_in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
+    };
+    if (ws.connect(s, &addr, @sizeOf(ws.sockaddr_in)) != 0) {
+        switch (ws.WSAGetLastError()) {
+            ws.WSAEWOULDBLOCK, ws.WSAEINPROGRESS => {},
+            else => return false,
+        }
+        // (a refused connection ends the wait with an error flag, and
+        // SO_ERROR says which)
+        if (!ws.ready(s, ws.POLLWRNORM, deadline)) return false;
+        var code: c_int = 0;
+        var size: c_int = @sizeOf(c_int);
+        if (ws.getsockopt(s, ws.SOL_SOCKET, ws.SO_ERROR, &code, &size) != 0 or code != 0) return false;
+    }
+
+    var req_buf: [128]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "GET /alive HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n", .{port});
+    var sent: usize = 0;
+    while (sent < req.len) {
+        const n = ws.send(s, req[sent..].ptr, @intCast(req.len - sent), 0);
+        if (n < 0) {
+            if (ws.WSAGetLastError() != ws.WSAEWOULDBLOCK) return false;
+            if (!ws.ready(s, ws.POLLWRNORM, deadline)) return false;
+            continue;
+        }
+        sent += @intCast(n);
+    }
+
+    var resp: [64]u8 = undefined;
+    var got: usize = 0;
+    while (got < resp.len and std.mem.indexOf(u8, resp[0..got], "\r\n") == null) {
+        if (!ws.ready(s, ws.POLLRDNORM, deadline)) return false;
+        const n = ws.recv(s, resp[got..].ptr, @intCast(resp.len - got), 0);
+        if (n < 0) {
+            if (ws.WSAGetLastError() == ws.WSAEWOULDBLOCK) continue;
+            return false;
+        }
+        if (n == 0) break;
+        got += @intCast(n);
+    }
+    return is200(resp[0..got]);
+}
+
+/// "HTTP/1.x 200 …": the status line is enough.
+fn is200(line: []const u8) bool {
+    return (std.mem.startsWith(u8, line, "HTTP/1.1 200") or std.mem.startsWith(u8, line, "HTTP/1.0 200")) and
+        line.len > 12 and (line[12] == ' ' or line[12] == '\r');
+}
+
 fn checkOrFail(port: u16, timeout_ms: u32) !bool {
+    if (is_windows) return checkWindows(port, timeout_ms);
     const deadline = nowMs() + timeout_ms;
     const fd = c.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
     if (fd < 0) return error.NoSocket;
@@ -77,9 +186,7 @@ fn checkOrFail(port: u16, timeout_ms: u32) !bool {
         if (n == 0) break;
         got += @intCast(n);
     }
-    const line = resp[0..got];
-    return (std.mem.startsWith(u8, line, "HTTP/1.1 200") or std.mem.startsWith(u8, line, "HTTP/1.0 200")) and
-        line.len > 12 and (line[12] == ' ' or line[12] == '\r');
+    return is200(resp[0..got]);
 }
 
 /// Whether `fd` became ready for `events` before `deadline`.
@@ -98,6 +205,7 @@ fn ready(fd: posix.fd_t, events: i16, deadline: i64) !bool {
 }
 
 fn nowMs() i64 {
+    if (is_windows) return @intCast(ws.GetTickCount64());
     var ts: c.timespec = undefined;
     _ = c.clock_gettime(c.CLOCK.MONOTONIC, &ts);
     return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);

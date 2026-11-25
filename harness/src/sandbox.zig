@@ -66,8 +66,12 @@ pub const backend = switch (builtin.os.tag) {
     else => "bubblewrap",
 };
 
+/// Tests: sandboxes can't run here, for this reason.
+pub var unavailable_override: ?[]const u8 = null;
+
 /// Why sandboxes can't run here; null when they can.
 pub fn unavailable(io: Io, arena: std.mem.Allocator) !?[]const u8 {
+    if (builtin.is_test) if (unavailable_override) |why| return why;
     return switch (builtin.os.tag) {
         .linux => blk: {
             const bwrap = (try findBwrap(io, arena)) orelse break :blk "install bubblewrap (the bwrap command) to use sandboxes";

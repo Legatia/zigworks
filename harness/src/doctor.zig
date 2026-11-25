@@ -18,6 +18,8 @@ const tstate = @import("tstate.zig");
 const quiet_mod = @import("quiet.zig");
 const folders = @import("folders.zig");
 const logins = @import("logins.zig");
+const environments = @import("environments.zig");
+const sandbox = @import("sandbox.zig");
 const util = @import("util.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -85,10 +87,24 @@ pub fn check(a: Allocator, env: Env) ![]const Line {
     try out.append(a, try modelLine(a, env, cfg));
     try out.append(a, try program(a, env, p, "home"));
     try out.append(a, try program(a, env, p, "car"));
+    try out.append(a, try sandboxLine(a, env, p));
     try out.appendSlice(a, try triggerLines(a, env, p));
     try out.append(a, try voiceLine(a, env, cfg));
     try out.append(a, try quietLine(a, env, cfg, p));
     return out.items;
+}
+
+/// Where the commands of runs nobody watches run (`[default] unattended`,
+/// the built-in sandbox unless environments.ini says otherwise), and
+/// whether that can be made here: where it can't they are refused.
+fn sandboxLine(a: Allocator, env: Env, p: core.Paths) !Line {
+    const name = "Routines' commands";
+    // (a file that doesn't read is the Settings line's)
+    const list = environments.parse(a, read(env, a, p.environments)) catch return .{ .name = name, .text = "environments.ini doesn't read: see Settings", .ok = false };
+    const e = list.find(list.unattended) orelse return .{ .name = name, .text = "run on this machine (environments.ini: unattended = host)", .ok = true };
+    if (e.kind != .sandbox) return .{ .name = name, .text = try std.fmt.allocPrint(a, "run in {s} ({s})", .{ e.name, try environments.describe(a, e.*) }), .ok = true };
+    if (try core.Core.sandboxMissing(env.io, a, list)) |why| return .{ .name = name, .text = std.mem.trimEnd(u8, why, "."), .ok = false };
+    return .{ .name = name, .text = try std.fmt.allocPrint(a, "run in {s} ({s}), by {s}", .{ e.name, try environments.describe(a, e.*), sandbox.backend }), .ok = true };
 }
 
 fn bot(a: Allocator, env: Env, cfg: config.Config, p: core.Paths) !Line {
@@ -438,6 +454,27 @@ test "doctor_names_each_broken_piece" {
     try t.expect(!allOk(lines));
     // a stored secret never in what it says
     try t.expect(std.mem.indexOf(u8, try text(a, lines), "a-wrong-token-12345") == null);
+}
+
+test "doctor_says_where_routines_commands_run_and_when_they_cannot" {
+    var f: Fold = undefined;
+    try f.init("");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const name = "Routines' commands";
+    // the built-in sandbox, where one can be made
+    if (try sandbox.unavailable(t.io, a) == null)
+        try expectLine(try check(a, f.env), name, true, "run in sandbox (sandbox; workspace rw, no network), by " ++ sandbox.backend);
+    // none can: said, with both ways out
+    sandbox.unavailable_override = "install bubblewrap (the bwrap command) to use sandboxes";
+    defer sandbox.unavailable_override = null;
+    try expectLine(try check(a, f.env), name, false, "are refused on this machine: they run in sandbox, a sandbox, and install bubblewrap (the bwrap command) to use sandboxes. Fix that; or keep them on this machine with unattended = host under [default] in environments.ini, then /reload");
+    // on the host by the owner's own line: nothing wrong
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.p.environments, .data = "[default]\nunattended = host\n" });
+    try expectLine(try check(a, f.env), name, true, "run on this machine (environments.ini: unattended = host)");
+    // a remote
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.p.environments, .data = "[default]\nunattended = far\n[far]\nkind = remote\nhost = a@192.0.2.1\n" });
+    try expectLine(try check(a, f.env), name, true, "run in far (remote a@192.0.2.1)");
 }
 
 test "doctor_says_all_is_well_when_it_is" {

@@ -1872,8 +1872,11 @@ holds the folder, like `harness snapshot restore`).
 
 ## Environments
 
-`environments.ini` (optional) names where commands can run besides the
-workspace on this machine (`host`, built in):
+Two places for commands are built in: the workspace on this machine
+(`host`), where your own runs' commands run, and a sandbox (`sandbox`:
+the workspace read-write, no network, no home folder), where the
+commands of runs nobody watches run. `environments.ini` (optional) names
+more, and says otherwise:
 
 ```ini
 [box]
@@ -1884,10 +1887,38 @@ read = /opt/tools, ~/go  ; more folders it may read
 
 [default]
 env = host               ; a run's environment unless named below
+unattended = sandbox     ; the same for runs nobody watches
 
 [use]                    ; runs started by these always run there
-schedule = box
+schedule:backup = host
 ```
+
+**Runs nobody watches run in a sandbox.** A schedule's run, a trigger's
+and a workflow's (its agent steps and its tool steps) can't ask you
+anything while they run, so their commands run in `sandbox` unless
+something names another place: a `[use]` pin, the workflow step's `env`,
+the definition's `environment`, or `[default] unattended`. Such a run
+can't pick this machine itself: its shell tool doesn't offer `host`, and
+a call that names it is refused. To keep one routine's commands on this
+machine, pin it (`schedule:backup = host` under `[use]`); `unattended =
+host` under `[default]` keeps them all there, as before this default.
+Your own runs, your household's, a room's and an app's stay on `host`
+unless you say otherwise.
+
+Write your own `[sandbox]` section to change what routines run in
+(`network = on`, say); it replaces the built-in one and must be `kind =
+sandbox`. Only commands run in an environment: fetches, MCP tools and
+the rest are harness's own calls, here as everywhere.
+
+Where no sandbox can be made (Linux without bubblewrap, for one), those
+commands are refused, never run on this machine instead: each refusal is
+in the log and kept as a skipped item with the reason, and `harness
+doctor` ("Routines' commands") and a line at start say how to fix it:
+install bubblewrap, or set `unattended = host`.
+
+At the first start after this default, an install whose rules or grants
+let routines run commands on this machine is told once that they run in
+a sandbox now, with the `[use]` line that keeps each on this machine.
 
 A sandbox runs a command on this machine with the workspace (read-write,
 read-only or not at all), a home of its own kept between commands
@@ -1948,9 +1979,11 @@ host key.
 over what started the run (`owner`, `schedule`, `trigger:NAME`,
 `workflow:NAME/STEP`, `app:NAME`; a kind alone covers every name), a
 workflow step's `env NAME` line, the definition's `environment`, then
-`[default] env`. Helpers run where the run that delegated them does. The
+`[default] env` (`[default] unattended` for a run nobody watches).
+Helpers run where the run that delegated them does. The
 shell tool tells the agent where its commands run; a run that is not
-pinned may name another environment for one command (`env`), and the
+pinned may name another environment for one command (`env`; never
+`host`, for a run nobody watches), and the
 gate decides that as `shell@THAT`; a pinned run that names another is
 refused before the gate. A command in an environment that isn't in
 environments.ini, or whose sandbox or remote can't run here, is refused:
@@ -1960,9 +1993,10 @@ Rules and grants are per environment: `allow shell@box *` allows in box
 only, a plain `shell` rule applies everywhere, and "Allow 24 h" covers
 the command in the environment it was asked in. A question says where:
 `shell in box (sandbox; workspace rw, no network): make test`. Log lines
-of commands outside the host carry `"env":"box"`. With `schedule = box`
-and `allow shell@box *`, a scheduled task runs its commands unattended in
-the sandbox. Files the agent wrote make the next command ask on the host
+of commands outside the host carry `"env":"box"`. With `allow
+shell@sandbox *`, routines run their commands unattended in the built-in
+sandbox; without a rule that allows one, a command is kept as a skipped
+item with "Allow for this task". Files the agent wrote make the next command ask on the host
 and in a sandbox with the network on; not in a sandbox without it (what
 it wrote reaches neither the data folder nor the network), nor on a
 remote. An environment runs `parallel` commands at once (2 unless set).
@@ -1971,7 +2005,7 @@ The agent can propose an environment, or a change to one, with
 `env_save` (in runs you started from a conversation): you see the whole
 section and the one it replaces and are asked every time; it is written
 into environments.ini under a line saying who saved it and applies at
-once. Never `host`, `[default]` or `[use]`.
+once. Never `host`, `sandbox`, `[default]` or `[use]`.
 
 **Try in a copy.** `workspace = copy` gives each run in that sandbox its
 own copy of the workspace, so it can change anything and run its tests
