@@ -50,7 +50,7 @@ const usage =
     \\  run                        run the agent: Telegram and the scheduler
     \\  stop                       ask the running harness to stop, and wait for it
     \\  open                       open the desk app (harness-desk), or bring it to the front
-    \\  autostart on|off           start harness run when you log in, or no longer
+    \\  autostart [on|off]         start harness run when you log in, or no longer; alone: which
     \\  chat                       talk to the agent in this terminal
     \\  brief [NAME]               collect and print a brief now
     \\  task run NAME              run a scheduled task now and print its answer
@@ -447,7 +447,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "health")) return healthCmd(app);
     if (eql(cmd, "stop")) return stopCmd(app);
     if (eql(cmd, "open")) return openCmd(app);
-    if (eql(cmd, "autostart")) return autostartCmd(app, rest[0]);
+    if (eql(cmd, "autostart")) return autostartCmd(app, if (rest.len == 0) "" else rest[0]);
     if (eql(cmd, "doctor")) return doctorCmd(app);
     if (eql(cmd, "report")) return reportCmd(app);
     if (eql(cmd, "import")) return importCmd(app, rest);
@@ -2129,7 +2129,7 @@ fn writeDeskJson(app: *App, c: *Core) !void {
     const exe = std.process.executablePathAlloc(app.io, app.arena) catch "";
     const home = Io.Dir.cwd().realPathFileAlloc(app.io, app.home, app.arena) catch app.home;
     const path = try std.fs.path.join(app.arena, &.{ c.paths.state, "desk.json" });
-    try util.writeReplace(app.io, path, try deskwin.deskJson(app.arena, exe, s.port, home, build_options.version));
+    try util.writeReplace(app.io, path, try deskwin.deskJson(app.arena, exe, s.port, home, build_options.version, app.env.get("PATH") orelse ""));
 }
 
 /// `harness stop`: state/stop-request for the running harness, which ends
@@ -2153,11 +2153,25 @@ fn stopCmd(app: *App) !Exit {
     return .failed;
 }
 
-/// `harness autostart on|off`: `harness --home DIR run` at login.
+/// `harness autostart on|off`: `harness --home DIR run` at login; alone,
+/// whether it does (`on` or `off` first).
 fn autostartCmd(app: *App, word: []const u8) !Exit {
     const on = eql(word, "on");
     const exe = try std.process.executablePathAlloc(app.io, app.arena);
     const home = Io.Dir.cwd().realPathFileAlloc(app.io, app.home, app.arena) catch app.home;
+    if (word.len == 0) {
+        const is_on = switch (builtin.os.tag) {
+            .windows => winRun.exists(app.arena),
+            else => blk: {
+                const user = app.env.get("HOME") orelse break :blk false;
+                const path = if (builtin.os.tag == .macos) try autostart.launchAgentPath(app.arena, user) else try autostart.xdgPath(app.arena, app.env.get("XDG_CONFIG_HOME"), user);
+                _ = Io.Dir.cwd().statFile(app.io, path, .{}) catch break :blk false;
+                break :blk true;
+            },
+        };
+        try outAll(app.io, autostart.statusLine(is_on));
+        return .ok;
+    }
     switch (builtin.os.tag) {
         .windows => {
             const value = try autostart.runValue(app.arena, exe, home);
@@ -2198,6 +2212,16 @@ const winRun = struct {
     const REG_SZ: u32 = 1;
     extern "advapi32" fn RegSetKeyValueW(key: usize, sub: [*:0]const u16, name: [*:0]const u16, kind: u32, data: ?*const anyopaque, len: u32) callconv(.winapi) i32;
     extern "advapi32" fn RegDeleteKeyValueW(key: usize, sub: [*:0]const u16, name: [*:0]const u16) callconv(.winapi) i32;
+    extern "advapi32" fn RegGetValueW(key: usize, sub: [*:0]const u16, name: [*:0]const u16, flags: u32, kind: ?*u32, data: ?*anyopaque, len: ?*u32) callconv(.winapi) i32;
+
+    /// Whether the value is there.
+    fn exists(a: std.mem.Allocator) bool {
+        if (builtin.os.tag != .windows) return false;
+        const sub = std.unicode.utf8ToUtf16LeAllocZ(a, subkey) catch return false;
+        const name = std.unicode.utf8ToUtf16LeAllocZ(a, "harness") catch return false;
+        // RRF_RT_REG_SZ
+        return RegGetValueW(HKEY_CURRENT_USER, sub, name, 0x2, null, null, null) == 0;
+    }
 
     fn set(a: std.mem.Allocator, value: []const u8) !void {
         if (builtin.os.tag != .windows) return error.Unsupported;
@@ -2545,7 +2569,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     const cmd = args[0];
     const rest = args[1..];
     if (eql(cmd, "init")) return if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "--butler"))) null else "usage: harness init [--butler]";
-    if (eql(cmd, "autostart")) return if (rest.len == 1 and (eql(rest[0], "on") or eql(rest[0], "off"))) null else "usage: harness autostart on|off";
+    if (eql(cmd, "autostart")) return if (rest.len == 0 or (rest.len == 1 and (eql(rest[0], "on") or eql(rest[0], "off")))) null else "usage: harness autostart [on|off]";
     inline for (.{ "help", "--help", "-h", "version", "pair", "run", "chat", "health", "doctor", "report", "stop", "open" }) |c| {
         if (eql(cmd, c)) return if (rest.len == 0) null else "usage: harness " ++ c ++ " (it takes no arguments)";
     }
@@ -2682,14 +2706,14 @@ test "extra_or_unknown_arguments_are_refused" {
 }
 
 test "stop_autostart_open_take_their_arguments" {
-    for ([_][]const []const u8{ &.{"stop"}, &.{"open"}, &.{ "autostart", "on" }, &.{ "autostart", "off" } }) |line| if (badArgs(line)) |why| {
+    for ([_][]const []const u8{ &.{"stop"}, &.{"open"}, &.{ "autostart", "on" }, &.{ "autostart", "off" }, &.{"autostart"} }) |line| if (badArgs(line)) |why| {
         std.debug.print("{s}: {s}\n", .{ line[0], why });
         return error.TestUnexpectedResult;
     };
-    for ([_][]const []const u8{ &.{ "stop", "now" }, &.{ "open", "x" }, &.{"autostart"}, &.{ "autostart", "maybe" }, &.{ "autostart", "on", "x" } }) |line|
+    for ([_][]const []const u8{ &.{ "stop", "now" }, &.{ "open", "x" }, &.{ "autostart", "maybe" }, &.{ "autostart", "on", "x" } }) |line|
         try t.expect(badArgs(line) != null);
     try t.expect(std.mem.indexOf(u8, usage, "  stop ") != null);
-    try t.expect(std.mem.indexOf(u8, usage, "  autostart on|off ") != null);
+    try t.expect(std.mem.indexOf(u8, usage, "  autostart [on|off] ") != null);
     try t.expect(std.mem.indexOf(u8, usage, "  open ") != null);
 }
 

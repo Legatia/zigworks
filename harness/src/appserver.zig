@@ -242,6 +242,9 @@ pub const Server = struct {
         const a = arena.allocator();
         const request = std.fs.path.join(a, &.{ s.desk_state, "open-request" }) catch return;
         const code = std.fs.path.join(a, &.{ s.desk_state, "desk-code" }) catch return;
+        // a code an earlier start left (it ended without its cleanup) is no
+        // code of this start's
+        Io.Dir.cwd().deleteFile(s.io, code) catch {};
         while (!s.stopping.load(.acquire)) {
             const now = Io.Clock.awake.now(s.io).toMilliseconds();
             if (Io.Dir.cwd().statFile(s.io, request, .{})) |_| {
@@ -1667,4 +1670,21 @@ test "the_settings_page_carries_the_photo_rules" {
     try t.expect(std.mem.indexOf(u8, page, "http://") == null and std.mem.indexOf(u8, page, "https://") == null);
     // the script gates the upload on the tick too
     try expectHas(deskFile("desk.js").?, "upConsent");
+}
+
+test "a_code_left_by_an_earlier_start_is_gone" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.createDirPath(t.io, "state");
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "state/desk-code", .data = "AAAAAAAAAAAAAAAAAAAAAA\n" });
+    var fh: FakeHost = .{};
+    try withDesk(&f, &fh);
+    var waited: u32 = 0;
+    while (waited < 2000) : (waited += 20) {
+        _ = f.tmp.dir.statFile(t.io, "state/desk-code", .{}) catch break;
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    try t.expectError(error.FileNotFound, f.tmp.dir.statFile(t.io, "state/desk-code", .{}));
+    try t.expectEqual(403, (try get(f.a, f.s.port, "/enter?code=AAAAAAAAAAAAAAAAAAAAAA", f.host)).status);
 }

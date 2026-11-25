@@ -1006,20 +1006,20 @@ while [ $i -lt 100 ] && [ "$(grep -c "I answer only you from now on." "$OUT")" -
 	sleep 0.1
 	i=$((i + 1))
 done
-check "state/desk.json names this harness and its port" 'grep -qF "\"port\":$DPORT," "$DH/state/desk.json" && grep -qF "\"version\":\"" "$DH/state/desk.json" && grep -qF "\"binary\":\"" "$DH/state/desk.json"'
+check "state/desk.json names this harness, its port and its PATH" 'grep -qF "\"port\":$DPORT," "$DH/state/desk.json" && grep -qF "\"version\":\"" "$DH/state/desk.json" && grep -qF "\"binary\":\"" "$DH/state/desk.json" && grep -qF "\"path\":\"" "$DH/state/desk.json"'
 reply "$(text_reply 'Three flats match.')"
 "$F" --desk "$DH" "Find me a two-bedroom near Kazimierz" >"$T/desk.out" 2>&1
 check "the desk is entered by a one-time code: a session cookie, the code good once" 'grep -qxF "entered 303 httponly samesite" "$T/desk.out" && grep -qxF "again 403" "$T/desk.out" && [ ! -e "$DH/state/desk-code" ] && [ ! -e "$DH/state/open-request" ]'
 check "the desk page and its state answer to the session" 'grep -qxF "page 200 with its script" "$T/desk.out" && grep -qE "^state 200 " "$T/desk.out"'
 check "a message from the desk is a turn in main, and its reply comes back to the desk" 'grep -qxF "sent 200" "$T/desk.out" && grep -qxF "harness: Three flats match." "$T/desk.out" && grep -qF "Find me a two-bedroom near Kazimierz" "$(req)"'
 check "Telegram gets a quiet echo of it, then the reply" 'grep -F "You, on the desk: Find me a two-bedroom near Kazimierz" "$OUT" | grep -qF "\"disable_notification\":true" && grep -qF "Three flats match." "$OUT"'
-check "harness stop ends the running harness" 'HARNESS_HOME="$DH" "$H" stop >"$T/stop.out" 2>&1 && grep -qxF "Stopped." "$T/stop.out"'
+check "harness stop ends the running harness, and the desk app still finds it" 'HARNESS_HOME="$DH" "$H" stop >"$T/stop.out" 2>&1 && grep -qxF "Stopped." "$T/stop.out" && grep -qF "\"binary\":\"" "$DH/state/desk.json"'
 wait "$RPID" 2>/dev/null
 RPID=""
 check "harness stop says so when nothing runs" '! HARNESS_HOME="$DH" "$H" stop 2>"$T/stop2.err" && grep -qF "t running." "$T/stop2.err"'
 check "harness open says plainly when the desk app is not installed" '! HARNESS_HOME="$DH" "$H" open 2>"$T/open.err" && grep -qF "The desk app isn" "$T/open.err"'
 if [ $windows = 0 ]; then
-	check "autostart on writes the login item, off removes it" 'HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart on >/dev/null && grep -rqF -- "--home" "$T/user" && grep -rqF "$DH" "$T/user" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart off >/dev/null && [ -z "$(find "$T/user" -type f)" ]'
+	check "autostart on writes the login item, off removes it, and alone it says which first" 'HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart | grep -qE "^off" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart on >/dev/null && grep -rqF -- "--home" "$T/user" && grep -rqF "$DH" "$T/user" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart | grep -qE "^on" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart off >/dev/null && [ -z "$(find "$T/user" -type f)" ]'
 fi
 
 # Coming from Hermes: harness import hermes against a Hermes home of its

@@ -91,6 +91,12 @@ pub fn runValue(a: std.mem.Allocator, exe: []const u8, home: []const u8) ![]cons
     return std.fmt.allocPrint(a, "\"{s}\" --home \"{s}\" run", .{ exe, home });
 }
 
+/// What `harness autostart` alone says: `on` or `off` first (the desk
+/// app's menu reads that word).
+pub fn statusLine(on: bool) []const u8 {
+    return if (on) "on: harness run starts when you log in.\n" else "off: harness run doesn't start when you log in.\n";
+}
+
 pub const Os = enum { macos, windows, linux };
 
 /// Where `harness open` looks for the desk app, in order: beside harness,
@@ -164,6 +170,11 @@ test "windows_run_value_quotes_its_paths" {
     defer arena.deinit();
     const a = arena.allocator();
     try t.expectEqualStrings("\"C:\\Program Files\\harness\\harness.exe\" --home \"C:\\Users\\x\\AppData\\Local\\harness\" run", try runValue(a, "C:\\Program Files\\harness\\harness.exe", "C:\\Users\\x\\AppData\\Local\\harness"));
+}
+
+test "autostart_says_on_or_off_first" {
+    try t.expectEqualStrings("on: harness run starts when you log in.\n", statusLine(true));
+    try t.expectEqualStrings("off: harness run doesn't start when you log in.\n", statusLine(false));
 }
 
 test "the_desk_app_is_looked_for_beside_then_in_applications" {

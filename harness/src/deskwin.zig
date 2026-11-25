@@ -32,14 +32,23 @@ pub const Codes = struct {
         c.mutex.lockUncancelable(io);
         defer c.mutex.unlock(io);
         c.live = false;
-        // made new, so its mode is ours from the start
-        Io.Dir.cwd().deleteFile(io, path) catch {};
-        var f = try Io.Dir.cwd().createFile(io, path, .{ .exclusive = true, .permissions = util.private_file });
-        defer f.close(io);
-        var line: [23]u8 = undefined;
-        @memcpy(line[0..22], &code);
-        line[22] = '\n';
-        try f.writeStreamingAll(io, &line);
+        // whole: a temporary file, made new (its mode is ours from the
+        // start), then renamed into place; the app never reads half of it
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return error.NameTooLong;
+        Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        {
+            var f = try Io.Dir.cwd().createFile(io, tmp, .{ .exclusive = true, .permissions = util.private_file });
+            defer f.close(io);
+            var line: [23]u8 = undefined;
+            @memcpy(line[0..22], &code);
+            line[22] = '\n';
+            try f.writeStreamingAll(io, &line);
+        }
+        Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), path, io) catch |e| {
+            Io.Dir.cwd().deleteFile(io, tmp) catch {};
+            return e;
+        };
         c.code = code;
         c.issued_ms = now_ms;
         c.live = true;
@@ -447,8 +456,9 @@ pub fn etag(data: []const u8) [34]u8 {
     return out;
 }
 
-/// `state/desk.json`: where the desk app finds harness.
-pub fn deskJson(a: std.mem.Allocator, binary: []const u8, port: u16, home: []const u8, version: []const u8) ![]const u8 {
+/// `state/desk.json`: where the desk app finds harness, and the PATH it
+/// runs with (an app opened from the Dock has launchd's short one).
+pub fn deskJson(a: std.mem.Allocator, binary: []const u8, port: u16, home: []const u8, version: []const u8, path_var: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(a, "{\"binary\":");
     try util.jsonString(&out, a, binary);
@@ -456,6 +466,8 @@ pub fn deskJson(a: std.mem.Allocator, binary: []const u8, port: u16, home: []con
     try util.jsonString(&out, a, home);
     try out.appendSlice(a, ",\"version\":");
     try util.jsonString(&out, a, version);
+    try out.appendSlice(a, ",\"path\":");
+    try util.jsonString(&out, a, path_var);
     try out.appendSlice(a, "}\n");
     return out.items;
 }
@@ -510,7 +522,9 @@ test "a_code_works_once_and_expires" {
     const path = try tmpPath(&tmp, a, "desk-code");
     var c: Codes = .{};
     const code = try c.issue(t.io, path, 1000);
-    // the file holds the code, readable only by its owner
+    // the file holds the code, readable only by its owner, written whole
+    // (a temporary file renamed into place: none is left)
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(t.io, "desk-code.tmp", .{}));
     const text = try tmp.dir.readFileAlloc(t.io, "desk-code", a, .unlimited);
     try t.expectEqualStrings(&code, std.mem.trimEnd(u8, text, "\n"));
     if (@import("builtin").os.tag != .windows) {
@@ -708,7 +722,7 @@ test "desk_json_names_binary_port_home_version" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try t.expectEqualStrings("{\"binary\":\"C:\\\\h\\\\harness.exe\",\"port\":47811,\"home\":\"/home/x/.harness\",\"version\":\"0.4.0\"}\n", try deskJson(a, "C:\\h\\harness.exe", 47811, "/home/x/.harness", "0.4.0"));
+    try t.expectEqualStrings("{\"binary\":\"C:\\\\h\\\\harness.exe\",\"port\":47811,\"home\":\"/home/x/.harness\",\"version\":\"0.4.0\",\"path\":\"/usr/local/bin:/usr/bin\"}\n", try deskJson(a, "C:\\h\\harness.exe", 47811, "/home/x/.harness", "0.4.0", "/usr/local/bin:/usr/bin"));
 }
 
 test "pack_files_are_checked_by_magic" {
