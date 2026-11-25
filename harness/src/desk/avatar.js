@@ -216,31 +216,71 @@ async function loadPack(base) {
   return pack;
 }
 
-/** The still with each eye drawn shut in its lid's own tone, a soft lash
- *  line where the lids meet: the eyes-closed portrait when there is none. */
+/** The still with each eye drawn shut in its lid's own tone: the eyes-closed
+ *  portrait when there is none. Per column of the eye, from the crease to
+ *  the lash line: the crease's shadow, the lit lid, darker into the lashes;
+ *  the skin's grain borrowed from under the eye; soft at every edge. */
 function drawClosedEyes(still, meta) {
   const c = document.createElement('canvas');
   c.width = still.width; c.height = still.height;
-  const g = c.getContext('2d');
+  const g = c.getContext('2d', { willReadFrequently: true });
   g.drawImage(still, 0, 0);
-  const rgb = (v, f, a = 1) => `rgba(${v.map((x) => Math.round(clamp(x * f, 0, 255))).join(',')},${a})`;
+  const mix = (a, b, t) => a + (b - a) * clamp(t, 0, 1);
   for (const e of meta.eyes) {
     const lid = e.lid || [150, 120, 115];
-    const [cx, cy] = e.center, grow = Math.max(1.5, e.width * 0.035);
-    const poly = e.outline.map(([x, y]) => { const dx = x - cx, dy = y - cy, l = Math.hypot(dx, dy) || 1; return [x + (dx / l) * grow, y + (dy / l) * grow]; });
-    const ys = poly.map((p) => p[1]), top = Math.min(...ys), bot = Math.max(...ys);
-    const grad = g.createLinearGradient(0, top, 0, bot);
-    grad.addColorStop(0, rgb(lid, 1.04)); grad.addColorStop(0.6, rgb(lid, 1)); grad.addColorStop(1, rgb(lid, 0.84));
-    g.fillStyle = grad;
-    g.beginPath(); poly.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath(); g.fill();
-    // the lashes: the lower lid's line (outline points 0–8), raised a little
-    const lift = (bot - top) * 0.16;
-    const lash = e.outline.slice(0, 9).map(([x, y]) => [x, y - lift]);
-    g.lineCap = 'round'; g.lineJoin = 'round';
-    for (const [wd, a] of [[0.04, 0.18], [0.025, 0.35], [0.014, 0.6]]) {
-      g.strokeStyle = rgb(lid, 0.3, a); g.lineWidth = Math.max(1, e.width * wd);
-      g.beginPath(); lash.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.stroke();
+    const k = e.width / 130;
+    const o = e.outline;
+    // the lower lid runs corner to corner over points 0–8, the upper over 8–15 and back to 0
+    const lower = o.slice(0, 9), upper = [o[8], ...o.slice(9), o[0]];
+    const yAt = (arc, x) => {
+      for (let i = 1; i < arc.length; i++) {
+        const [ax, ay] = arc[i - 1], [bx, by] = arc[i];
+        if ((x - ax) * (x - bx) <= 0 && ax !== bx) return ay + ((by - ay) * (x - ax)) / (bx - ax);
+      }
+      return null;
+    };
+    const xs = o.map((p) => p[0]), xL = Math.min(...xs), xR = Math.max(...xs);
+    const feather = 2.5 * k;
+    const bx0 = Math.max(0, Math.floor(xL - feather - 2)), bx1 = Math.min(c.width, Math.ceil(xR + feather + 2));
+    const by0 = Math.max(0, Math.floor(Math.min(...o.map((p) => p[1])) - 12 * k)), by1 = Math.min(c.height, Math.ceil(Math.max(...o.map((p) => p[1])) + 40 * k));
+    const w = bx1 - bx0, h = by1 - by0;
+    if (w < 2 || h < 2) continue;
+    const img = g.getImageData(bx0, by0, w, h), D = img.data, src = new Uint8ClampedArray(D);
+    const at = (x, y) => ((y - by0) * w + (x - bx0)) * 4;
+    // the skin under the eye: its mean, for the grain's ratio
+    let mean = [0, 0, 0], mn = 0;
+    for (let x = Math.ceil(xL); x < xR; x++) {
+      const yb = yAt(lower, x);
+      if (yb === null) continue;
+      for (let y = Math.round(yb + 6 * k); y < Math.min(by1, yb + 22 * k); y++) { const q = at(x, y); for (let ch = 0; ch < 3; ch++) mean[ch] += src[q + ch]; mn++; }
     }
+    mean = mn ? mean.map((v) => v / mn) : lid;
+    for (let x = bx0; x < bx1; x++) {
+      const xc = clamp(x, xL + 0.5, xR - 0.5);
+      const yt0 = yAt(upper, xc), yb0 = yAt(lower, xc);
+      if (yt0 === null || yb0 === null) continue;
+      const u = (xc - xL) / (xR - xL);
+      const top = yt0 - 4 * k * Math.sin(Math.PI * u); // over the upper lashes
+      const bot = Math.max(top + 1, yb0 + 1.5 * k);
+      const side = clamp(Math.min(x - (xL - feather), xR + feather - x) / (2 * feather), 0, 1); // soft at the corners
+      for (let y = Math.max(by0, Math.floor(top - feather)); y < Math.min(by1, Math.ceil(bot + feather)); y++) {
+        const v = (y - top) / (bot - top);
+        const edge = v < 0 ? 1 - (top - y) / feather : v > 1 ? 1 - (y - bot) / feather : 1;
+        const a = clamp(edge, 0, 1) * side;
+        if (a <= 0) continue;
+        const shade = v < 0.15 ? mix(0.62, 1.0, v / 0.15) : v < 0.55 ? mix(1.0, 1.05, (v - 0.15) / 0.4) : v < 0.86 ? mix(1.05, 0.88, (v - 0.55) / 0.31) : mix(0.88, 0.5, (v - 0.86) / 0.14);
+        const lash = Math.exp(-(((v - 0.9) * (bot - top)) ** 2) / (2 * (1.1 * k) ** 2)); // the lash line
+        // the grain: the skin under the eye, mirrored up
+        const sy = clamp(Math.round(bot + (bot - y) * 0.6 + 6 * k), by0, by1 - 1);
+        const q = at(x, y), sq = at(x, sy);
+        for (let ch = 0; ch < 3; ch++) {
+          const grain = clamp(src[sq + ch] / (mean[ch] || 1), 0.85, 1.15);
+          const col = lid[ch] * shade * grain * (1 - 0.55 * lash);
+          D[q + ch] = Math.round(src[q + ch] + (col - src[q + ch]) * a);
+        }
+      }
+    }
+    g.putImageData(img, bx0, by0);
   }
   return c;
 }
@@ -371,11 +411,12 @@ function buildHead(pack, canvas) {
     tMap: { value: tOpen }, hRot: { value: new THREE.Matrix3() }, pivot: { value: pivot.clone() }, hOff: { value: new THREE.Vector3() },
     zc: { value: zc }, headEll: { value: new THREE.Vector4(faceCx, -(browY + chinY) / 2 + 0.08 * faceH, faceW * 0.62, faceH * 0.72) },
     neck: { value: new THREE.Vector4(chinY, chinY + 0.42 * faceH, faceW * 0.3, faceCx) }, breath: { value: 0 }, k: { value: k },
+    size: { value: new THREE.Vector2(W, H) },
   };
   const plateMat = new THREE.ShaderMaterial({
     uniforms: plateU, depthWrite: false, depthTest: false,
     vertexShader: `
-      uniform mat3 hRot; uniform vec3 pivot; uniform vec3 hOff; uniform float zc; uniform vec4 headEll; uniform vec4 neck; uniform float breath; uniform float k;
+      uniform mat3 hRot; uniform vec3 pivot; uniform vec3 hOff; uniform float zc; uniform vec4 headEll; uniform vec4 neck; uniform float breath; uniform float k; uniform vec2 size;
       attribute float zd;
       varying vec2 vUv;
       void main() {
@@ -392,6 +433,9 @@ function buildHead(pack, canvas) {
         float ws = smoothstep(neck.x - 40.0 * k, neck.y + 120.0 * k, yi);
         d.y += breath * ws;
         d.x += breath * 0.12 * ws * (p.x - neck.w) / (300.0 * k);
+        // the photo's border stays put, so nothing past it comes into view
+        float border = min(min(p.x, size.x - p.x), min(-p.y, size.y + p.y));
+        d *= smoothstep(0.0, 48.0 * k, border);
         gl_Position = projectionMatrix * modelViewMatrix * vec4(p.xy + d, -1000.0, 1.0);
       }`,
     fragmentShader: `
