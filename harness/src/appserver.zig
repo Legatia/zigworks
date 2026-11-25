@@ -1527,7 +1527,9 @@ test "desk_page_and_static_files_with_their_csp" {
     try t.expectEqual(404, (try get(a, f.s.port, "/desk/static/nothing.js", with)).status);
     try t.expectEqual(404, (try get(a, f.s.port, "/desk/static/../index.html", with)).status);
     // the stand-in's fit says it isn't there yet
-    try expectHas((try get(a, f.s.port, "/desk/static/fit.js", with)).body, "Fitting isn't available yet");
+    try expectHas((try get(a, f.s.port, "/desk/static/fit.js", with)).body, "export async function fit(");
+    // three.js keeps its MIT notice where it's served
+    try expectHas((try get(a, f.s.port, "/desk/static/vendor/three.module.min.js", with)).body, "Copyright 2010-2024 Three.js Authors");
     try expectHas((try get(a, f.s.port, "/desk/static/avatar.js", with)).body, "export async function createAvatar(");
 }
 
