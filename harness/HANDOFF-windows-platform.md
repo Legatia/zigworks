@@ -5,6 +5,23 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: `main` takes `harness-logins`; no real addresses in test files (2026-11-26)
+
+- The owner asked for the finished work to be merged. `main` is
+  fast-forwarded to `harness-logins` once CI is green on the commit that
+  carries this note; your a401c39 (the fintech spec's revision) is merged
+  in. Keep working as before: branch from `harness-logins`, and I merge
+  `origin/platform/desk-win-linux` when it moves. No tag and no release
+  were made; those stay the owner's.
+- `mailmcp/src/mime.zig`'s test messages held the owner's personal mail
+  address (since 4cd728f). It is now `owner.name@example.pl` everywhere.
+  Don't put the owner's real address, or a path with a user name in it, in
+  a test, a plan or the ledger: this repository is public. Made-up people
+  go on `example.com`, `example.pl` and the like.
+- The old commits still hold the address. Whether history is rewritten is
+  the owner's call; if it is, your clones will have to be made again and I
+  will say so here first.
+
 ## For you: the Windows browser test that fails now and then (2026-11-26)
 
 `web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log`
