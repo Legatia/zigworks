@@ -734,14 +734,18 @@ pub const Run = struct {
 
     /// Where this run's commands run, the first that applies: a `[use]`
     /// pin over what started it, its workflow step's `env`, its
-    /// definition's `environment`, `[default] env`. A delegated run takes
-    /// the run's that started it.
+    /// definition's `environment`, `[default] env` (`[default] unattended`
+    /// for a run nobody watches, a workflow's tool step too). A delegated
+    /// run takes the run's that started it.
     pub fn picked(r: *const Run) Picked {
         var top = r;
         while (top.starter) |s| top = s;
         const list = top.envs.list;
         if (list.pinFor(top.who.by)) |p| return .{ .name = p.env, .pinned = true };
-        return .{ .name = list.pick(top.who.by, top.step_env, if (top.def.environment_given) top.def.environment else null) };
+        const name = list.pick(top.who.by, top.step_env, if (top.def.environment_given) top.def.environment else null);
+        // nobody watches it: the host only where environments.ini (or its
+        // step, or its definition) put it there, never by the model's choice
+        return .{ .name = name, .no_host = top.who.unattended() and !std.mem.eql(u8, name, "host") };
     }
 
     /// Makes the run one of definition `d`: its who names it, and a run
@@ -1043,9 +1047,10 @@ fn useCopy(r: *Run, a: std.mem.Allocator, cr: *CopyRun) !?[]const u8 {
     return null;
 }
 
-/// Where a run's commands run, and whether a `[use]` pin says so (then it
-/// can't name another).
-pub const Picked = struct { name: []const u8, pinned: bool = false };
+/// Where a run's commands run, whether a `[use]` pin says so (then it
+/// can't name another), and whether its calls may not name the host (a
+/// run nobody watches that nothing put there).
+pub const Picked = struct { name: []const u8, pinned: bool = false, no_host: bool = false };
 
 /// How the `env_save` tool reaches harness.
 pub const EnvDesk = struct {
@@ -1118,21 +1123,24 @@ fn shellDef(r: *const Run, a: std.mem.Allocator) !model.ToolDef {
     var s: std.ArrayList(u8) = .empty;
     try s.appendSlice(a, "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}");
     if (with_dir) try s.appendSlice(a, ",\"dir\":{\"type\":\"string\",\"description\":\"a folder in the workspace to start in; default the workspace\"}");
-    if (pk.pinned) {
-        try d.appendSlice(a, ", and nowhere else.");
-    } else {
-        try d.appendSlice(a, ". `env` names another:");
-        var n: usize = 0;
-        if (!std.mem.eql(u8, pk.name, "host")) {
-            try d.appendSlice(a, " host (this machine)");
+    // the others `env` may name: not the host for a run nobody watches
+    var others: std.ArrayList(u8) = .empty;
+    var n: usize = 0;
+    if (!pk.pinned) {
+        if (!pk.no_host and !std.mem.eql(u8, pk.name, "host")) {
+            try others.appendSlice(a, " host (this machine)");
             n += 1;
         }
         for (list.envs) |e| {
             if (std.mem.eql(u8, e.name, pk.name)) continue;
-            try d.print(a, "{s} {s}", .{ if (n > 0) "," else "", try envLine(a, list, e.name) });
+            try others.print(a, "{s} {s}", .{ if (n > 0) "," else "", try envLine(a, list, e.name) });
             n += 1;
         }
-        try d.append(a, '.');
+    }
+    if (n == 0) {
+        try d.appendSlice(a, ", and nowhere else.");
+    } else {
+        try d.print(a, ". `env` names another:{s}.", .{others.items});
         try s.appendSlice(a, ",\"env\":{\"type\":\"string\",\"description\":\"another environment to run this command in\"}");
     }
     // Windows: where a sandbox's command finds itself
@@ -2296,6 +2304,8 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
             .in => |w| where = w,
             .refused => |x| {
                 try gateLine(r, name, "deny", x.why, arg, dir, x.env);
+                // nobody to tell in the run: kept for the owner, with why
+                if (x.unattended) skipRefused(r, a, name, arg, x.env, x.why);
                 return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{x.why}), .is_error = true };
             },
         }
@@ -2543,8 +2553,20 @@ const Where = struct {
 
 const WhereOr = union(enum) {
     in: Where,
-    refused: struct { why: []const u8, env: []const u8 },
+    /// `unattended`: refused because nobody watches the run (the host it
+    /// may not pick, or its sandbox missing): kept for the owner.
+    refused: struct { why: []const u8, env: []const u8, unattended: bool = false },
 };
+
+/// What a `[use]` line names this run's starter by: `schedule:news`,
+/// `workflow:deploy` (a step's `workflow:deploy/build` is its workflow's).
+fn pinKey(a: std.mem.Allocator, r: *const Run) ![]const u8 {
+    var top = r;
+    while (top.starter) |s| top = s;
+    const by = top.who.by;
+    const slash = std.mem.indexOfScalar(u8, by, '/') orelse by.len;
+    return a.dupe(u8, by[0..slash]);
+}
 
 /// Where a shell call runs: the environment its `env` names, else the
 /// run's. Refused before the gate: a pinned run naming another, a name
@@ -2556,6 +2578,9 @@ fn shellWhere(r: *Run, a: std.mem.Allocator, input_json: []const u8, dir: []cons
     const name = if (asked.len > 0) asked else pk.name;
     if (pk.pinned and !std.mem.eql(u8, name, pk.name))
         return .{ .refused = .{ .why = try std.fmt.allocPrint(a, "this run's commands run in {s} (environments.ini [use]): it can't run one in {s}", .{ pk.name, util.cut(name, 64) }), .env = "" } };
+    // a run nobody watches never picks this machine itself
+    if (pk.no_host and std.mem.eql(u8, name, "host"))
+        return .{ .refused = .{ .why = try std.fmt.allocPrint(a, "nobody watches this run, so its commands run in {s}, not on this machine (host); environments.ini can put it there: [use] {s} = host", .{ pk.name, try pinKey(a, r) }), .env = "", .unattended = true } };
     if (std.mem.eql(u8, name, "host")) return .{ .in = .{} };
     const e = r.envs.list.find(name) orelse
         return .{ .refused = .{ .why = try std.fmt.allocPrint(a, "there is no environment {s} (environments.ini)", .{util.cut(name, 64)}), .env = "" } };
@@ -2564,7 +2589,12 @@ fn shellWhere(r: *Run, a: std.mem.Allocator, input_json: []const u8, dir: []cons
         .sandbox => try sandbox.unavailable(r.io, a),
         .remote => try remote.notReady(r.io, a, e.name, edir),
     };
-    if (missing) |why| return .{ .refused = .{ .why = try std.fmt.allocPrint(a, "{s} can't run commands here: {s}", .{ name, why }), .env = e.name } };
+    if (missing) |why| return .{ .refused = .{
+        // never the host instead; a run nobody watches is told the way out
+        .why = if (pk.no_host) try std.fmt.allocPrint(a, "{s} can't run commands here: {s}. Nobody watches this run, so it isn't run on this machine instead ([default] unattended = host in environments.ini would)", .{ name, why }) else try std.fmt.allocPrint(a, "{s} can't run commands here: {s}", .{ name, why }),
+        .env = e.name,
+        .unattended = pk.no_host,
+    } };
     if (dir.len > 0 and (e.kind == .remote or e.workspace == .none))
         return .{ .refused = .{ .why = try std.fmt.allocPrint(a, "{s} doesn't see the workspace: no dir there", .{name}), .env = e.name } };
     return .{ .in = .{ .name = e.name, .env = e, .note = try environments.describe(a, e.*) } };
@@ -4010,6 +4040,29 @@ fn skip(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: [
         .conversation = r.conversation,
         .private = r.isPrivate(),
         .outside = outside_mod.line(a, r.outside(a) catch &.{}) catch "",
+    }) else 0;
+    s.add(r.io, name, arg, item);
+}
+
+/// A command a run nobody watches could not run where it must (its
+/// sandbox can't run here, or it named the host): listed in the run's post
+/// and kept as an item with why. No grant lifts it: environments.ini does.
+fn skipRefused(r: *Run, a: std.mem.Allocator, name: []const u8, arg: []const u8, env: []const u8, why: []const u8) void {
+    const s = r.skipped orelse return;
+    const item = if (s.keeper) |k| k.keep(k.ctx, a, .{
+        .tool = .shell,
+        .env = if (env.len > 0) env else "host",
+        .name = name,
+        .arg = arg,
+        .key = gate.grantKey(.shell, arg),
+        .grantable = false,
+        .who = r.who,
+        .rid = r.rid,
+        .label = r.label,
+        .conversation = r.conversation,
+        .private = r.isPrivate(),
+        .outside = outside_mod.line(a, r.outside(a) catch &.{}) catch "",
+        .why = why,
     }) else 0;
     s.add(r.io, name, arg, item);
 }
@@ -7908,15 +7961,126 @@ test "run_picks_pin_step_definition_default" {
     f.run.def.environment_given = false;
     const a = f.e.arena.allocator();
     const free = try shellDef(&f.run, a);
-    try t.expect(std.mem.indexOf(u8, free.description, "Commands run in box (sandbox; workspace rw, no network). `env` names another: host (this machine), netbox (sandbox; workspace rw, network), far (remote agent@192.0.2.1).") != null);
+    try t.expect(std.mem.indexOf(u8, free.description, "Commands run in box (sandbox; workspace rw, no network). `env` names another: host (this machine), netbox (sandbox; workspace rw, network), far (remote agent@192.0.2.1), sandbox (sandbox; workspace rw, no network).") != null);
     try t.expect(std.mem.indexOf(u8, free.schema_json, "\"env\"") != null);
     f.run.who.by = "schedule:news";
     const pinned = try shellDef(&f.run, a);
     try t.expect(std.mem.indexOf(u8, pinned.description, "Commands run in netbox (sandbox; workspace rw, network), and nowhere else.") != null);
     try t.expect(std.mem.indexOf(u8, pinned.schema_json, "\"env\"") == null);
-    // without environments the tool is as it was
+    // without environments.ini: the host, and the built-in sandbox to name
+    f.run.who.by = "owner";
     f.run.envs = .{};
-    try t.expectEqualStrings(tools.defs()[0].description, (try shellDef(&f.run, a)).description);
+    const plain = try shellDef(&f.run, a);
+    try t.expect(std.mem.indexOf(u8, plain.description, "Commands run in host (this machine). `env` names another: sandbox (sandbox; workspace rw, no network).") != null);
+    try t.expect(std.mem.indexOf(u8, plain.schema_json, "\"env\"") != null);
+}
+
+test "a_run_nobody_watches_runs_in_the_sandbox_and_cannot_name_the_host" {
+    var f: Fix = undefined;
+    try f.init("allow shell *\n");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try useEnvs(&f, "[box]\nkind = sandbox\nnetwork = on\n");
+    // the owner's, a member's, a room's and an app's runs: the host, and
+    // the host stays theirs to name from another
+    for ([_][]const u8{ "owner", "member:anna", "room:kitchen", "app:notes" }) |by| {
+        f.run.who.by = by;
+        try t.expectEqualStrings("host", f.run.picked().name);
+        try t.expect(!f.run.picked().no_host);
+    }
+    // a schedule's, a trigger's, a workflow's agent step and its tool step
+    for ([_][]const u8{ "schedule:news", "trigger:mail", "workflow:deploy", "workflow:deploy/build" }) |by| {
+        f.run.who.by = by;
+        const pk = f.run.picked();
+        try t.expectEqualStrings("sandbox", pk.name);
+        try t.expect(pk.no_host and !pk.pinned);
+        const d = try shellDef(&f.run, a);
+        try t.expect(std.mem.indexOf(u8, d.description, "Commands run in sandbox (sandbox; workspace rw, no network). `env` names another: box (sandbox; workspace rw, network).") != null);
+        try t.expect(std.mem.indexOf(u8, d.description, "host (this machine)") == null);
+    }
+    // a helper it delegated to: its starter's
+    var w = f.run;
+    w.starter = &f.run;
+    w.who = .{ .agent = "helper", .by = "owner" };
+    try t.expectEqualStrings("sandbox", w.picked().name);
+    try t.expect(w.picked().no_host);
+    // its step or its definition names another, the host too: then it is there
+    f.run.who.by = "workflow:deploy/build";
+    f.run.step_env = "box";
+    try t.expectEqualStrings("box", f.run.picked().name);
+    try t.expect(f.run.picked().no_host);
+    f.run.step_env = "host";
+    try t.expectEqualStrings("host", f.run.picked().name);
+    try t.expect(!f.run.picked().no_host);
+    f.run.step_env = null;
+    f.run.who.by = "schedule:news";
+    f.run.def.environment = "host";
+    f.run.def.environment_given = true;
+    try t.expectEqualStrings("host", f.run.picked().name);
+    const named = try shellDef(&f.run, a);
+    try t.expect(std.mem.indexOf(u8, named.description, "Commands run in host (this machine). `env` names another: box (sandbox; workspace rw, network), sandbox (sandbox; workspace rw, no network).") != null);
+    f.run.def.environment_given = false;
+    // [default] unattended = host: as before this default
+    try useEnvs(&f, "[default]\nunattended = host\n");
+    try t.expectEqualStrings("host", f.run.picked().name);
+    try t.expect(!f.run.picked().no_host);
+    // with the sandbox alone and nothing else to name: no env field
+    try useEnvs(&f, "");
+    const alone = try shellDef(&f.run, a);
+    try t.expect(std.mem.indexOf(u8, alone.description, "Commands run in sandbox (sandbox; workspace rw, no network), and nowhere else.") != null);
+    try t.expect(std.mem.indexOf(u8, alone.schema_json, "\"env\"") == null);
+
+    // the model names the host all the same: refused, never run, kept
+    // for the owner with the line that would put the run there
+    var skipped: Skipped = .init(t.allocator);
+    defer skipped.deinit();
+    f.run.skipped = &skipped;
+    f.run.scheduled = true;
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo on-host\",\"env\":\"host\"}"));
+    try f.e.script(2, model.textReply("refused"));
+    const r1 = try f.say("run it on the host");
+    freeResult(&f.run, r1);
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "refused by the gate: nobody watches this run, so its commands run in sandbox, not on this machine (host); environments.ini can put it there: [use] schedule:news = host") != null);
+    try t.expect(std.mem.indexOf(u8, req2, "exit code 0") == null);
+    try t.expectEqual(1, skipped.items.items.len);
+    try t.expect(std.mem.indexOf(u8, skipped.items.items[0], "shell: echo on-host") != null);
+    const lt = try f.logText();
+    try t.expect(std.mem.indexOf(u8, lt, "\"decision\":\"deny\",\"why\":\"nobody watches this run") != null);
+}
+
+test "without_a_sandbox_a_run_nobody_watches_is_refused_never_run_on_the_host" {
+    var f: Fix = undefined;
+    try f.init("allow shell *\n");
+    defer f.deinit();
+    try useEnvs(&f, "");
+    sandbox.unavailable_override = "bubblewrap (bwrap) is not installed";
+    defer sandbox.unavailable_override = null;
+    var skipped: Skipped = .init(t.allocator);
+    defer skipped.deinit();
+    f.run.skipped = &skipped;
+    f.run.scheduled = true;
+    f.run.who.by = "trigger:mail";
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo must-not-run > ran.txt\"}"));
+    try f.e.script(2, model.textReply("refused"));
+    const r1 = try f.say("run it");
+    freeResult(&f.run, r1);
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "refused by the gate: sandbox can't run commands here: bubblewrap (bwrap) is not installed. Nobody watches this run, so it isn't run on this machine instead ([default] unattended = host in environments.ini would)") != null);
+    // nothing ran, on the host or anywhere
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, try std.fs.path.join(f.e.arena.allocator(), &.{ f.run.env.workspace, "ran.txt" }), .{}));
+    try t.expectEqual(1, skipped.items.items.len);
+    const lt = try f.logText();
+    try t.expect(std.mem.indexOf(u8, lt, "\"decision\":\"deny\",\"why\":\"sandbox can't run commands here") != null);
+    try t.expect(std.mem.indexOf(u8, lt, "\"env\":\"sandbox\"") != null);
+    // the owner's own run is untouched by it: the host
+    f.run.who.by = "owner";
+    f.run.scheduled = false;
+    try f.e.script(3, model.toolReply("tu_2", "shell", "{\"command\":\"echo owner-ran\"}"));
+    try f.e.script(4, model.textReply("done"));
+    const r2 = try f.say("run it");
+    freeResult(&f.run, r2);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "owner-ran") != null);
 }
 
 test "pinned_run_cannot_name_another" {

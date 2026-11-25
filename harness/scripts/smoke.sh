@@ -611,10 +611,13 @@ check "people list and show work offline" '"$H" people list 2>/dev/null | grep -
 check "snapshot list works offline" '"$H" snapshot list notes 2>/dev/null | grep -qF "Snapshots of notes:"'
 check "agent list works offline" '"$H" agent list 2>/dev/null | grep -qF "researcher: Research across several sources"'
 check "log search finds an earlier turn, offline" '"$H" log search "disk is FINE" 2>/dev/null | grep -qF "(task disk)" && "$H" log search "disk is FINE" 2>/dev/null | grep -qF "Agent: Disk is fine."'
+# the sandbox every install has, and where routines' commands run
+check "env list names the built-in sandbox, and that routines run in it" '"$H" env list >"$T/envs.out" 2>/dev/null; grep -qF "sandbox: sandbox (built in), workspace rw, network off" "$T/envs.out" && grep -qF "for runs nobody watches (schedules, triggers, workflows): sandbox." "$T/envs.out"'
 # the tester kit: doctor's lines and the report (each makes one short model request)
 reply "$(text_reply 'ok')"
 check "doctor says each piece in a line, and what to do where one doesn't work" '"$H" doctor >"$T/doctor.out" 2>&1; grep -qF "Bot: @harness_test_bot answers; you are paired" "$T/doctor.out" && grep -qF "Model: claude-sonnet at omnigate answers" "$T/doctor.out" && grep -qF "harness run: not running. Start it: harness run" "$T/doctor.out" && grep -qF "Home: not connected. In the chat: /setup home" "$T/doctor.out"'
 reply "$(text_reply 'ok')"
+check "doctor says where routines run their commands" 'grep -q "Routines. commands: " "$T/doctor.out"'
 check "report writes one file, every stored secret masked" '(cd "$T" && "$H" report >"$T/report.out" 2>&1) && R=$(sed -n "s/^Wrote \(.*[.]txt\) (.*/\1/p" "$T/report.out") && [ -f "$R" ] && grep -qF "== harness doctor ==" "$R" && grep -qF "== the log" "$R" && ! grep -qE "og-smoke-key-123|telegram-smoke-token|brave-smoke-key|smoke-login-pass" "$R"'
 
 # servers at a url (the stand-in's): one with a token, one with a sign-in

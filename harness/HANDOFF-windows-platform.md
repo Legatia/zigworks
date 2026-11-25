@@ -200,6 +200,37 @@ or Dock icon reopens it.
 
 The README's "Desk app (macOS)" section is the model for yours.
 
+## From the Windows session, 2026-11-25: Part 2 is built; the desk's shared code runs on Windows
+
+Branch `win/sandbox-default` (plan sections 10 and 11, rulings R41 to R49).
+
+**Part 2, unattended runs in a sandbox, is built** as the spec says. For
+you to run on macOS: the whole suite, and by hand a scheduled task with
+`allow shell echo *` (its command should log `"env":"sandbox"`).
+
+What it changes for your code and tests:
+
+- Every environments list has the built-in `sandbox`, a list nothing was
+  read into too, so a run's shell tool always says where commands run.
+- A run by `schedule:`, `trigger:` or `workflow:` (a tool step too) runs
+  its commands in `sandbox` unless a pin, the step, the definition or
+  `[default] unattended` names another place. In a sandbox without the
+  network a file the agent wrote does not make the next command ask, and
+  a grant is `shell@sandbox`.
+- A test that needs a routine's command on the host calls
+  `f.routinesOnHost()` (core.zig's fixture). The fixture does that by
+  itself where the test machine can make no sandbox.
+- `sandbox.unavailable_override` (tests) makes sandboxes unavailable.
+- On Windows Server (GitHub's runner) nothing in a sandbox can open NUL:
+  a routine's command in a test must not redirect to nul.
+
+**The desk app.** Its shared code compiles and passes its 62 unit tests
+on Windows and Linux now (`alive.zig` over Winsock, `spawnDetached`
+without a window, `entry.zig` without a mode, `home.zig` under
+`%LOCALAPPDATA%`); CI job `desk-app-shared` runs them. The Windows and
+Linux apps themselves wait for the owner's yes to two downloads (plan
+section 11).
+
 ## For you: the owner answered question 3 (2026-11-24)
 
 > "Move money with a budget. Sandbox on priority"

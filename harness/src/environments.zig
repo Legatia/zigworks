@@ -3,9 +3,14 @@
 //! environment a run gets unless something names another (`[default]`) and
 //! the pins that put runs started by some who in one always (`[use]`).
 //!
+//! One sandbox is built in, `sandbox` (workspace rw, no network): what runs
+//! nobody watches run in unless something names another (`[default]
+//! unattended`). An owner's own `[sandbox]` section replaces it.
+//!
 //! ```ini
 //! [default]
 //! env = host
+//! unattended = sandbox
 //! [box]
 //! kind = sandbox
 //! workspace = rw        ; rw | ro | none
@@ -64,7 +69,15 @@ pub const Env = struct {
     parallel: u8 = default_parallel,
     /// The section has apply or copy_mb (they go with `workspace = copy`).
     copy_keys: bool = false,
+    /// The built-in `sandbox`, not a section of the file.
+    built_in: bool = false,
 };
+
+/// The sandbox every install has: what unattended runs run in unless
+/// environments.ini says otherwise.
+pub const sandbox_name = "sandbox";
+pub const built_in_sandbox: Env = .{ .name = sandbox_name, .line = 0, .kind = .sandbox, .workspace = .rw, .network = false, .built_in = true };
+const built_in_list = [_]Env{built_in_sandbox};
 
 /// A `[use]` line: runs whose `by` matches `who` run in `env`.
 pub const Pin = struct {
@@ -74,9 +87,13 @@ pub const Pin = struct {
 };
 
 pub const Environments = struct {
-    envs: []const Env = &.{},
+    /// The file's sections, and the built-in sandbox last unless a
+    /// section replaces it.
+    envs: []const Env = &built_in_list,
     /// A run's environment when nothing names one.
     default: []const u8 = "host",
+    /// The same for a run nobody watches (`who.unattended`).
+    unattended: []const u8 = sandbox_name,
     pins: []const Pin = &.{},
 
     pub fn find(e: Environments, name: []const u8) ?*const Env {
@@ -107,14 +124,122 @@ pub const Environments = struct {
     }
 
     /// Where a run runs, the first that applies: a pin over its `by`, the
-    /// environment a workflow step names, its definition's, the default.
+    /// environment a workflow step names, its definition's, the default
+    /// (`[default] unattended` for a run nobody watches, a workflow's tool
+    /// step too; `[default] env` for the rest).
     pub fn pick(e: Environments, by: []const u8, step: ?[]const u8, definition: ?[]const u8) []const u8 {
         if (e.pinFor(by)) |p| return p.env;
         if (step) |s| return s;
         if (definition) |d| return d;
-        return e.default;
+        return if ((who.Who{ .by = by }).unattended()) e.unattended else e.default;
+    }
+
+    /// How many sections of the file are environments.
+    pub fn own(e: Environments) usize {
+        var n: usize = 0;
+        for (e.envs) |x| {
+            if (!x.built_in) n += 1;
+        }
+        return n;
     }
 };
+
+/// The kinds of run nobody watches that the owner pins by name.
+const routine_kinds = [_][]const u8{ "schedule", "trigger", "workflow" };
+
+/// What an install from before the sandbox default is told at its first
+/// start after it, or null where nothing of it ran commands on this
+/// machine unattended. It did when rules.ini allows `shell` in the shared
+/// part or in a section of a schedule, a trigger or a workflow, or has a
+/// `shell@host` rule, or a run nobody watches holds a grant for the host
+/// (`grant_whos`: the whos of the shell grants there). Each kind found
+/// gets the `[use]` line that keeps it on this machine, by its name where
+/// the rules or the grants give one.
+pub fn upgradeLine(arena: std.mem.Allocator, list: Environments, rule_list: []const rules.Rule, grant_whos: []const []const u8) !?[]const u8 {
+    // the owner's file already says the host: nothing changes
+    if (std.mem.eql(u8, list.unattended, "host")) return null;
+    var found: [routine_kinds.len]bool = @splat(false);
+    var names: [routine_kinds.len]std.ArrayList([]const u8) = @splat(.empty);
+    var every = false;
+    for (rule_list) |r| {
+        if (!std.mem.eql(u8, r.tool, "shell") or r.action == .deny) continue;
+        const on_host = if (r.env) |e| std.mem.eql(u8, e, "host") else false;
+        // shell@box: never the host's
+        if (r.env != null and !on_host) continue;
+        if (r.section) |s| {
+            if (r.action != .allow and !on_host) continue;
+            if (!try noteRoutine(arena, s, &found, &names) and on_host) every = true;
+        } else if (r.action == .allow or on_host) every = true;
+    }
+    for (grant_whos) |w| _ = try noteRoutine(arena, w, &found, &names);
+    if (every) found = @splat(true);
+    if (!found[0] and !found[1] and !found[2]) return null;
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, "Commands that routines run now run in a sandbox: no network, no home folder. To keep one on this machine, add its line under [use] in environments.ini and send /reload:");
+    var n: usize = 0;
+    for (routine_kinds, 0..) |kind, i| {
+        if (!found[i]) continue;
+        if (names[i].items.len == 0) {
+            try out.print(arena, "{s} {s}:NAME = host", .{ if (n > 0) "," else "", kind });
+            n += 1;
+        } else for (names[i].items) |name| {
+            try out.print(arena, "{s} {s}:{s} = host", .{ if (n > 0) "," else "", kind, name });
+            n += 1;
+        }
+    }
+    try out.appendSlice(arena, ". (unattended = host under [default] keeps them all there.)");
+    if (list.find(sandbox_name)) |s| if (!s.built_in) try out.appendSlice(arena, " Your [sandbox] section is now what routines run in.");
+    return out.items;
+}
+
+/// Notes `text` (a rules section's who pattern, or a grant's who) when it
+/// is a routine's: its kind, and its name when it has one without a `*`
+/// (a workflow step's is its workflow's). False for any other who.
+fn noteRoutine(arena: std.mem.Allocator, text: []const u8, found: *[routine_kinds.len]bool, names: *[routine_kinds.len]std.ArrayList([]const u8)) !bool {
+    const colon = std.mem.indexOfScalar(u8, text, ':');
+    const kind = text[0 .. colon orelse text.len];
+    const i = for (routine_kinds, 0..) |k, j| {
+        if (std.mem.eql(u8, k, kind)) break j;
+    } else return false;
+    found[i] = true;
+    var name = if (colon) |c| text[c + 1 ..] else return true;
+    if (std.mem.indexOfScalar(u8, name, '/')) |slash| name = name[0..slash];
+    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '*') != null) return true;
+    for (names[i].items) |x| if (std.mem.eql(u8, x, name)) return true;
+    if (names[i].items.len < 6) try names[i].append(arena, name);
+    return true;
+}
+
+test "the_upgrade_line_is_for_installs_whose_routines_ran_commands_on_the_host" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const none = try parse(a, "");
+    // nothing allowed shell unattended: no line
+    for ([_][]const u8{ "", "allow fetch https://example.com/*\n", "[owner]\nallow shell *\n", "[agent:coder]\nallow shell make\n", "allow shell@sandbox echo *\n", "deny shell *\n", "[member:anna]\nallow shell ls\n" }) |text|
+        try t.expectEqual(null, try upgradeLine(a, none, try rules.parse(a, text), &.{}));
+    // the shared part, or [all]: every kind, by NAME
+    for ([_][]const u8{ "allow shell echo *\n", "[owner]\nallow fetch https://example.com/*\n[all]\nallow shell ls\n", "ask shell@host make\n", "[agent:coder]\nallow shell@host make\n" }) |text| {
+        const line = (try upgradeLine(a, none, try rules.parse(a, text), &.{})).?;
+        try t.expectEqualStrings("Commands that routines run now run in a sandbox: no network, no home folder. To keep one on this machine, add its line under [use] in environments.ini and send /reload: schedule:NAME = host, trigger:NAME = host, workflow:NAME = host. (unattended = host under [default] keeps them all there.)", line);
+    }
+    // a routine's own section: its kind alone, by its name where it has one
+    const named = (try upgradeLine(a, none, try rules.parse(a, "[schedule:news]\nallow shell git pull\n[schedule:n*]\nallow shell ls\n[workflow:deploy/build]\nallow shell make\n"), &.{})).?;
+    try t.expect(std.mem.indexOf(u8, named, "/reload: schedule:news = host, workflow:deploy = host. (") != null);
+    try t.expect(std.mem.indexOf(u8, named, "trigger") == null);
+    const kind_only = (try upgradeLine(a, none, try rules.parse(a, "[trigger]\nallow shell ls\n"), &.{})).?;
+    try t.expect(std.mem.indexOf(u8, kind_only, "/reload: trigger:NAME = host. (") != null);
+    // a grant for the host a routine holds; an owner's or any run's is none
+    try t.expectEqual(null, try upgradeLine(a, none, &.{}, &.{ "", "owner", "agent:coder", "app:notes" }));
+    const granted = (try upgradeLine(a, none, &.{}, &.{ "trigger:mail", "workflow:deploy/build", "trigger:mail" })).?;
+    try t.expect(std.mem.indexOf(u8, granted, "/reload: trigger:mail = host, workflow:deploy = host. (") != null);
+    // an owner's own [sandbox] section: said too
+    const own_box = try parse(a, "[sandbox]\nkind = sandbox\nnetwork = on\n");
+    const with_own = (try upgradeLine(a, own_box, try rules.parse(a, "allow shell ls\n"), &.{})).?;
+    try t.expect(std.mem.endsWith(u8, with_own, " Your [sandbox] section is now what routines run in."));
+    // the file already keeps them on the host: nothing changes, no line
+    try t.expectEqual(null, try upgradeLine(a, try parse(a, "[default]\nunattended = host\n"), try rules.parse(a, "allow shell ls\n"), &.{}));
+}
 
 /// environments.ini's `text` with section `[name]` replaced by `section`
 /// (a header and its lines, a comment line above them or not), or with it
@@ -235,6 +360,8 @@ pub const Error = error{
     BadPin,
     /// [default] or a pin naming no environment.
     UnknownEnv,
+    /// [sandbox] that is not `kind = sandbox`.
+    SandboxIsASandbox,
     OutOfMemory,
 };
 
@@ -244,7 +371,7 @@ pub fn reason(e: anyerror) ?[]const u8 {
         error.BadEnvName => "a section is [default], [use] or an environment's name: a-z, 0-9, - and _, up to 32; keys come after one",
         error.HostIsBuiltIn => "host is built in: it is the workspace on this machine, as without environments.ini",
         error.DuplicateEnv => "this section is there already",
-        error.BadEnvKey => "a sandbox takes kind, workspace, network, read and parallel (and with workspace = copy: check, apply, copy_mb); a remote kind, host, port, dir and parallel; [default] env; [use] WHO = NAME; each once, as key = value",
+        error.BadEnvKey => "a sandbox takes kind, workspace, network, read and parallel (and with workspace = copy: check, apply, copy_mb); a remote kind, host, port, dir and parallel; [default] env and unattended; [use] WHO = NAME; each once, as key = value",
         error.BadCheck => "check = a command to run in the copy after the run",
         error.BadApply => "apply = ask or check",
         error.BadCopyMb => "copy_mb = the most the workspace may hold, in MiB, 1 to 1048576",
@@ -261,7 +388,8 @@ pub fn reason(e: anyerror) ?[]const u8 {
         error.BadRemotePort => "port = 1 to 65535",
         error.BadRemoteDir => "dir = an absolute folder on the remote machine, or one starting with ~/",
         error.BadPin => "a [use] line is WHO = NAME, WHO being what starts runs: owner, schedule, trigger, workflow or app, alone or as KIND:NAME (* works as in rules)",
-        error.UnknownEnv => "no environment has that name: host, or a section of this file",
+        error.UnknownEnv => "no environment has that name: host, sandbox, or a section of this file",
+        error.SandboxIsASandbox => "[sandbox] is what routines run in when nobody watches: it must be kind = sandbox (name a remote something else)",
         else => null,
     };
 }
@@ -269,15 +397,23 @@ pub fn reason(e: anyerror) ?[]const u8 {
 /// Written by `harness init`: comments only, so nothing changes until the
 /// owner writes a section.
 pub const example =
-    \\; Where commands run. Without a section every command runs in the
-    \\; workspace on this machine (host), as before. A sandbox runs them on
-    \\; this machine without the data folder, your home, your secrets or the
-    \\; network unless allowed; a remote runs them on another machine over
-    \\; SSH (harness env key NAME makes its own key). Changes apply after
-    \\; /reload.
+    \\; Where commands run. Without a section your own runs' commands run in
+    \\; the workspace on this machine (host), and those of runs nobody watches
+    \\; (schedules, triggers, workflows) in the built-in sandbox: the
+    \\; workspace read-write, no network, no home folder. A sandbox runs
+    \\; commands on this machine without the data folder, your home, your
+    \\; secrets or the network unless allowed; a remote runs them on another
+    \\; machine over SSH (harness env key NAME makes its own key). Changes
+    \\; apply after /reload.
     \\;
     \\; [default]
     \\; env = host               ; a run's environment unless named below
+    \\; unattended = sandbox     ; the same for runs nobody watches; host
+    \\;                          ; puts them on this machine as before
+    \\;
+    \\; [sandbox]                ; your own in place of the built-in one
+    \\; kind = sandbox
+    \\; network = on
     \\;
     \\; [box]
     \\; kind = sandbox
@@ -303,7 +439,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Error!Environments {
     var envs: std.ArrayList(Env) = .empty;
     var pins: std.ArrayList(Pin) = .empty;
     var default: ?[]const u8 = null;
-    var default_line: usize = 0;
+    var unattended: ?[]const u8 = null;
     var seen_default = false;
     var seen_use = false;
     // keys of the section being read, each once
@@ -351,6 +487,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Error!Environments {
             // an environment's section: kind first
             if (!std.mem.eql(u8, key, "kind")) return error.EnvKindFirst;
             const kind = std.meta.stringToEnum(Kind, value) orelse return error.BadEnvKind;
+            if (kind != .sandbox and std.mem.eql(u8, p.name, sandbox_name)) return error.SandboxIsASandbox;
             try envs.append(arena, .{ .name = p.name, .line = p.line, .kind = kind });
             cur = .{ .env = envs.items.len - 1 };
             pending = null;
@@ -359,9 +496,12 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Error!Environments {
         switch (cur) {
             .none => return error.BadEnvName,
             .default => {
-                if (!std.mem.eql(u8, key, "env") or value.len == 0) return error.BadEnvKey;
-                default = value;
-                default_line = n;
+                if (value.len == 0) return error.BadEnvKey;
+                if (std.mem.eql(u8, key, "env")) {
+                    default = value;
+                } else if (std.mem.eql(u8, key, "unattended")) {
+                    unattended = value;
+                } else return error.BadEnvKey;
             },
             .use => {
                 if (!who.isPattern(key) or std.mem.startsWith(u8, key, "agent")) return error.BadPin;
@@ -372,9 +512,14 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Error!Environments {
         }
     }
     if (cur == .env) try finish(envs.items[cur.env]);
-    const out: Environments = .{ .envs = envs.items, .default = default orelse "host", .pins = pins.items };
+    // the built-in sandbox, unless a section of that name replaces it
+    const replaced = for (envs.items) |x| {
+        if (std.mem.eql(u8, x.name, sandbox_name)) break true;
+    } else false;
+    if (!replaced) try envs.append(arena, built_in_sandbox);
+    const out: Environments = .{ .envs = envs.items, .default = default orelse "host", .unattended = unattended orelse sandbox_name, .pins = pins.items };
     // names point at environments, wherever in the file those are
-    if (!out.has(out.default)) return error.UnknownEnv;
+    if (!out.has(out.default) or !out.has(out.unattended)) return error.UnknownEnv;
     for (out.pins) |p| if (!out.has(p.env)) return error.UnknownEnv;
     return out;
 }
@@ -506,7 +651,11 @@ test "environments_ini_reads_sandboxes_remotes_pins_and_the_default" {
     ;
     const e = try parse(arena.allocator(), text);
     try t.expectEqualStrings("box", e.default);
-    try t.expectEqual(2, e.envs.len);
+    // its two sections, and the built-in sandbox after them
+    try t.expectEqual(3, e.envs.len);
+    try t.expectEqual(2, e.own());
+    try t.expect(e.envs[2].built_in);
+    try t.expectEqualStrings("sandbox", e.unattended);
     const box = e.find("box").?;
     try t.expectEqual(Kind.sandbox, box.kind);
     try t.expectEqual(Mode.ro, box.workspace);
@@ -526,15 +675,68 @@ test "environments_ini_reads_sandboxes_remotes_pins_and_the_default" {
     try t.expect(!e.has("nobox"));
 }
 
-test "environments_ini_without_sections_is_the_host_alone" {
+test "environments_ini_without_sections_is_the_host_and_the_built_in_sandbox" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     for ([_][]const u8{ "", example, "; nothing\n\n" }) |text| {
         const e = try parse(arena.allocator(), text);
         try t.expectEqualStrings("host", e.default);
-        try t.expectEqual(0, e.envs.len);
-        try t.expectEqualStrings("host", e.pick("schedule:news", null, null));
+        try t.expectEqualStrings("sandbox", e.unattended);
+        try t.expectEqual(1, e.envs.len);
+        try t.expectEqual(0, e.own());
+        const s = e.find("sandbox").?;
+        try t.expect(s.built_in);
+        try t.expectEqual(Kind.sandbox, s.kind);
+        try t.expectEqual(Mode.rw, s.workspace);
+        try t.expect(!s.network);
+        try t.expectEqual(0, s.read.len);
     }
+    // a list nothing was read into is the same
+    const none: Environments = .{};
+    try t.expectEqualStrings("sandbox", none.pick("schedule:news", null, null));
+    try t.expectEqualStrings("host", none.pick("owner", null, null));
+}
+
+test "unattended_runs_default_to_the_sandbox_and_the_rest_to_the_host" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const e = try parse(arena.allocator(), "");
+    // nobody watches: a schedule's, a trigger's, a workflow's agent step
+    // and its tool step (`workflow:NAME/STEP`), harness's own jobs
+    for ([_][]const u8{ "schedule:news", "trigger:mail", "workflow:deploy", "workflow:deploy/build", "harness:away" }) |by|
+        try t.expectEqualStrings("sandbox", e.pick(by, null, null));
+    // someone can answer: the owner's, a member's, a room's, an app's
+    for ([_][]const u8{ "owner", "member:anna", "room:kitchen", "app:notes" }) |by|
+        try t.expectEqualStrings("host", e.pick(by, null, null));
+    // a pin, a step or a definition wins, the host too
+    const pinned = try parse(arena.allocator(), "[box]\nkind = sandbox\n[use]\nschedule:news = host\ntrigger = box\n");
+    try t.expectEqualStrings("host", pinned.pick("schedule:news", "box", "box"));
+    try t.expectEqualStrings("sandbox", pinned.pick("schedule:other", null, null));
+    try t.expectEqualStrings("box", pinned.pick("trigger:mail", null, null));
+    try t.expectEqualStrings("box", pinned.pick("workflow:deploy/build", "box", "host"));
+    try t.expectEqualStrings("host", pinned.pick("workflow:deploy/build", null, "host"));
+    // [default] unattended names another, the host too; env stays its own
+    const opted = try parse(arena.allocator(), "[default]\nunattended = host\n");
+    try t.expectEqualStrings("host", opted.pick("schedule:news", null, null));
+    const both = try parse(arena.allocator(), "[default]\nenv = box\nunattended = far\n[box]\nkind = sandbox\n[far]\nkind = remote\nhost = h\n");
+    try t.expectEqualStrings("far", both.pick("trigger:mail", null, null));
+    try t.expectEqualStrings("box", both.pick("owner", null, null));
+}
+
+test "an_owners_sandbox_section_replaces_the_built_in_one" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const e = try parse(arena.allocator(), "[sandbox]\nkind = sandbox\nnetwork = on\nworkspace = ro\n");
+    try t.expectEqual(1, e.envs.len);
+    try t.expectEqual(1, e.own());
+    const s = e.find("sandbox").?;
+    try t.expect(!s.built_in);
+    try t.expect(s.network);
+    try t.expectEqual(Mode.ro, s.workspace);
+    try t.expectEqualStrings("sandbox", e.pick("schedule:news", null, null));
+    // it must be a sandbox: the file is refused, with why
+    try t.expectError(error.SandboxIsASandbox, parse(arena.allocator(), "[sandbox]\nkind = remote\nhost = h\n"));
+    try t.expect(std.mem.indexOf(u8, reason(error.SandboxIsASandbox).?, "kind = sandbox") != null);
 }
 
 test "environments_ini_refuses_bad_sections" {
@@ -573,6 +775,10 @@ test "environments_ini_refuses_bad_sections" {
         .{ "[r]\nkind = remote\nhost = h\ndir = work\n", error.BadRemoteDir },
         .{ "[r]\nkind = remote\nhost = h\nworkspace = ro\n", error.BadEnvKey },
         .{ "[default]\nenv = nobox\n", error.UnknownEnv },
+        .{ "[default]\nunattended = nobox\n", error.UnknownEnv },
+        .{ "[default]\nunattended =\n", error.BadEnvKey },
+        .{ "[default]\nunattended = host\nunattended = host\n", error.BadEnvKey },
+        .{ "[sandbox]\nkind = remote\nhost = h\n", error.SandboxIsASandbox },
         .{ "[default]\nhost = box\n", error.BadEnvKey },
         .{ "[use]\napp = nobox\n", error.UnknownEnv },
         .{ "[use]\nagent:main = host\n", error.BadPin },
@@ -624,7 +830,9 @@ test "a_pin_naming_the_run_beats_a_pattern_and_a_kind_alone" {
     // unpinned: the step's, then the definition's, then the default
     try t.expectEqualStrings("b", e.pick("owner", "b", "a"));
     try t.expectEqualStrings("a", e.pick("owner", null, "a"));
-    try t.expectEqualStrings("c", e.pick("trigger:mail", null, null));
+    try t.expectEqualStrings("c", e.pick("member:anna", null, null));
+    // (a run nobody watches goes by [default] unattended)
+    try t.expectEqualStrings("sandbox", e.pick("trigger:mail", null, null));
     // a pin beats what the step and the definition name
     try t.expectEqualStrings("a", e.pick("app:shop", "b", "c"));
 }

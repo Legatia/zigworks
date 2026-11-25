@@ -608,3 +608,132 @@ sandbox-launch` by hand starts nothing (exit 125).
 
 Left: GitHub's Windows runners were not tried before the push; if the
 service is off there, the tests that need the drives say so in CI.
+
+## 10. Unattended runs in a sandbox (2026-11-25, branch `win/sandbox-default`, on `harness-logins` 693ee01)
+
+Part 2 of `docs/superpowers/specs/2026-11-24-harness-money-budget-and-sandbox-default-design.md`
+(the owner: "Sandbox on priority"; approved as "Approve 1"). Part 1 is the
+Mac session's and is merged.
+
+What it is:
+
+- `environments.zig`: a built-in `sandbox` (workspace rw, no network), in
+  every list, last, unless a `[sandbox]` section replaces it (which must be
+  `kind = sandbox`: `error.SandboxIsASandbox`); `[default] unattended`
+  (default `sandbox`); `pick` takes it for a who that is `unattended()`;
+  `upgradeLine`.
+- `agent.zig`: `Picked.no_host`; the shell tool leaves `host` out of `env`
+  for such a run and `shellWhere` refuses a call that names it; a refusal
+  for want of a sandbox, or for naming the host, is kept as a skipped item
+  with why (`skipRefused`).
+- `core.zig`: `/envs` lists the built-in sandbox and both defaults;
+  `env_save` refuses `sandbox`; `sandboxDefaultUpgrade` (the marker
+  `state/upgrades/sandbox-default`, beside the money one);
+  `sandboxMissing` and the line at start.
+- `doctor.zig`: the line "Routines' commands".
+
+Rulings (mine; the owner can overrule):
+
+- R41. The built-in sandbox is in a list nothing was read into too
+  (`Environments{}`), so there are always environments and the shell
+  tool always says where commands run. `own()` counts the file's own
+  sections (what `env_save`'s check needs).
+- R42. A run nobody watches whose environment is not the host can't name
+  the host: its shell tool doesn't list it, and a call with `env: host`
+  is refused before the gate with the `[use]` line that would put that
+  routine there. Where a pin, the step, the definition or `[default]
+  unattended` put it on the host, it is on the host and may name the
+  others. A helper goes by the run that started it.
+- R43. With nothing else to name (the sandbox alone), the tool has no
+  `env` field and says "and nowhere else".
+- R44. Such a refusal is a gate line (deny, with the environment) and,
+  where the run keeps skipped calls, an item: "Refused: WHY", Dismiss
+  only. No "Allow for this task": no grant lifts it, environments.ini
+  does.
+- R45. `env_save` never saves `sandbox`: what routines run in is the
+  owner's to write, as `[default]` and `[use]` are. (Not in the spec.)
+- R46. The upgrade line is said when rules.ini allows `shell` in the
+  shared part, in `[all]`, or in a section of a schedule, a trigger or a
+  workflow; or has a `shell@host` rule that is not a deny (an `ask` too,
+  and in any section); or a shell grant for the host is held by such a
+  who. Not when `[default] unattended = host` is already written (nothing
+  changes then). Each kind found is named, by its routines' names where
+  the rules or grants give them (six a kind at most), else `KIND:NAME`;
+  the shared part names all three kinds. The line adds "(unattended =
+  host under [default] keeps them all there.)", which the spec's line
+  doesn't have.
+- R47. The line at start for a missing sandbox is said at every start,
+  only where the install has a task, a trigger or a workflow; `harness
+  doctor` always has its line. `harness:` jobs count as unattended (they
+  run no shell).
+- R48. Tests. The core tests' fixture writes `[default] unattended =
+  host` where the test machine can make no sandbox (Linux without
+  bubblewrap), so the suite passes there as before; the tests of the
+  default skip there. Five tests of what holds on the host (a grant's
+  `shell@host`; a file the agent wrote makes the next command ask) pin
+  `unattended = host`: in a sandbox without the network that rule doesn't
+  apply, by design. The fixture gives a Windows sandbox what it needs to
+  start cmd.
+- R49. On Windows Server a routine's commands in the sandbox can't use
+  NUL (R40): the shell tool tells the agent. Nothing more is done.
+
+Tests, Part 2 (the spec's list):
+
+- Defaults: `unattended_runs_default_to_the_sandbox_and_the_rest_to_the_host`,
+  `environments_ini_without_sections_is_the_host_and_the_built_in_sandbox`,
+  `a_run_nobody_watches_runs_in_the_sandbox_and_cannot_name_the_host`,
+  `a_routines_command_runs_in_the_built_in_sandbox_and_the_owners_on_the_host`
+  (a real task's command, its log line `"env":"sandbox"`).
+- Who wins: the same two unit tests (a pin, a step, a definition, the
+  host too).
+- The env field: `a_run_nobody_watches_…` (no `host`; with it when named;
+  none at all with the sandbox alone), and the changed
+  `run_picks_pin_step_definition_default`.
+- No sandbox: `without_a_sandbox_a_run_nobody_watches_is_refused_never_run_on_the_host`,
+  `without_a_sandbox_a_routines_command_is_refused_kept_and_said_at_start`,
+  `doctor_says_where_routines_commands_run_and_when_they_cannot`.
+- The owner's section: `an_owners_sandbox_section_replaces_the_built_in_one`,
+  and the reload's error in `the_sandbox_default_is_said_once_…`.
+- Upgrading: `the_upgrade_line_is_for_installs_whose_routines_ran_commands_on_the_host`,
+  `the_sandbox_default_is_said_once_to_an_install_whose_routines_ran_commands_here`.
+
+Tests that changed on purpose: `run_picks_pin_step_definition_default`
+(the tool without a file now names the sandbox),
+`environments_ini_is_guarded_watched_and_applied_on_reload` (`/envs`),
+`a_pin_naming_the_run_beats_a_pattern_and_a_kind_alone`, and the five
+of R48.
+
+Left: macOS (sandbox-exec) is the Mac session's to run. A run nobody
+watches that a rule doesn't allow a command in the sandbox still skips it
+with "Allow for this task" (`shell@sandbox`), as on the host before.
+
+## 11. The desk app's shared code on Windows (2026-11-25, same branch)
+
+The Windows and Linux desk apps (WebView2; GTK 3 and WebKitGTK) are this
+session's by the handoff. Both need downloads the owner has not approved
+yet, so only what needs none is done: the three POSIX spots of
+`harness/desk-app` the handoff names.
+
+- `alive.zig`: the same request over Winsock on Windows (a non-blocking
+  socket, WSAPoll for the time limit).
+- `commands.zig`: `spawnDetached` on Windows starts with no window and
+  no process group (`create_no_window`); nothing there ends a process
+  with the one that started it.
+- `entry.zig`: no file mode on Windows (the data folder is under the
+  owner's profile); the pid from Windows.
+- `home.zig`: on Windows the default data folder is
+  `%LOCALAPPDATA%\harness`, as harness's own `builtinHome` (it was
+  `$HOME/.local/share/harness` everywhere).
+- CI: job `desk-app-shared` runs the unit tests on windows-latest and
+  ubuntu-latest (Debug and ReleaseSafe).
+
+Unit tests: 62 of 62 on Windows 11 and on Linux (WSL); macOS not run
+here (its job runs on push).
+
+Needed before the apps themselves, each the owner's to approve:
+
+- Windows: NuGet package Microsoft.Web.WebView2 1.0.4370.26, from
+  api.nuget.org, 9.4 MiB (its `WebView2.h` and `WebView2Loader.dll`).
+- Linux, in the `zigworks` distro by apt: libgtk-3-dev and
+  libwebkit2gtk-4.1-dev, and xvfb for the smoke: 186 packages, about
+  103 MiB, by the lists of 2026-11-19 (an `apt-get update` first).
