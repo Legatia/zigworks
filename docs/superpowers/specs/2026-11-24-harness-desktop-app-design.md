@@ -879,3 +879,33 @@ This section closes them. It is my call throughout, not the owner's (see
 - **`utc_offset = auto`** is the default for new data folders.
 - **The fit files ship in the release archives,** fetched in the release
   job, not committed and not built into the binary.
+- **The app's setup, as built** (2026-11-25, `platform/desk-app-setup`;
+  the builder's calls, which the spec left open):
+  - The Set up screen is a built-in page in the app's web view, the same
+    HTML on all three systems. Only the key's field is native.
+  - The form opens on Anthropic. The usual models come from harness's own
+    code and README:
+    - omnigate: `claude-sonnet` (helpers `claude-haiku`), as `harness init`
+      writes them;
+    - Anthropic: `claude-opus-4-8` (helpers `claude-haiku-4-5`). It is the
+      newest Claude that answers without thinking when a request doesn't
+      ask for it, and harness's requests don't carry thinking blocks;
+    - OpenAI: `gpt-5`;
+    - OpenRouter: `anthropic/claude-sonnet-4`;
+    - opencode and Other: none named, so the owner types one.
+  - Other is written as `[provider other]` (`api`, `url`), with
+    `model.provider other`, in one `config set`. A provider of one's own
+    already in use keeps its section's name.
+  - `memory_model` and `worker_model` follow the model (or the provider's
+    helper) at the first setup and when the provider changes, since the old
+    ones belonged to the old provider. Otherwise they stay as the owner set
+    them.
+  - "Provider and key…" asks for the key again when Replace the key is
+    ticked, or when the provider's key is stored under another name.
+  - A change while harness runs: `harness config set`'s own line ("send
+    /reload to use it.") in an alert, then the desk again. The app doesn't
+    restart harness, which would end the owner's turn in progress. When
+    harness isn't running, the app starts it.
+  - `harness init` runs only when the data folder has no config.ini.
+  - The package's fit files come from `pack-desk-assets.sh`, strictly, in
+    the release. `DESK_ASSETS=none` leaves them out, and says so, for CI.
