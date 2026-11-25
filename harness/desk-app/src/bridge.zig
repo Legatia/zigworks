@@ -1,22 +1,29 @@
 //! The messages the page sends the app, one way: `{"badge": N}`,
 //! `{"attention": "urgent"}`, `{"reenter": true}`, and from the app's own
-//! "harness isn't running" page `{"start": true}`. Through
+//! "harness isn't running" page `{"start": true}`, and from its "Set up"
+//! page `{"setup": {provider, model, url, api, replace}}` and `{"cancel": true}`. Through
 //! `window.webkit.messageHandlers.harness.postMessage(…)`, an object or its JSON
 //! text.
 const std = @import("std");
 
 const policy = @import("policy.zig");
+const setup = @import("setup.zig");
 
 pub const Message = struct {
     badge: ?u32 = null,
     attention: bool = false,
     reenter: bool = false,
     start: bool = false,
+    /// The "Set up" page's [Continue]: the form as typed (never a key).
+    setup: ?setup.Form = null,
+    /// Its [Cancel].
+    cancel: bool = false,
 };
 
 pub const max_badge = 99999;
 
-/// The message in `json`, or null when it says nothing the app knows.
+/// The message in `json`, or null when it says nothing the app knows. The
+/// form's strings are copied into `a` (an arena is expected).
 pub fn parse(a: std.mem.Allocator, json: []const u8) ?Message {
     const parsed = std.json.parseFromSlice(std.json.Value, a, json, .{}) catch return null;
     defer parsed.deinit();
@@ -42,7 +49,48 @@ pub fn parse(a: std.mem.Allocator, json: []const u8) ?Message {
         m.start = true;
         any = true;
     };
+    if (obj.get("cancel")) |v| if (v == .bool and v.bool) {
+        m.cancel = true;
+        any = true;
+    };
+    if (obj.get("setup")) |v| if (formOf(a, v)) |f| {
+        m.setup = f;
+        any = true;
+    };
     return if (any) m else null;
+}
+
+/// The longest Model or Address taken (more is no form of ours).
+const max_field = 2048;
+
+/// The form in `v`, its strings copied into `a`; null when it isn't one.
+/// Only its own fields are read: anything else in it is left behind.
+fn formOf(a: std.mem.Allocator, v: std.json.Value) ?setup.Form {
+    const o = switch (v) {
+        .object => |o| o,
+        else => return null,
+    };
+    var f: setup.Form = .{};
+    f.provider = switch (o.get("provider") orelse return null) {
+        .string => |s| std.meta.stringToEnum(setup.Provider, s) orelse return null,
+        else => return null,
+    };
+    inline for (.{ "model", "url" }) |name| if (o.get(name)) |x| switch (x) {
+        .string => |s| {
+            if (s.len > max_field) return null;
+            @field(f, name) = a.dupe(u8, s) catch return null;
+        },
+        else => return null,
+    };
+    if (o.get("api")) |x| f.api = switch (x) {
+        .string => |s| std.meta.stringToEnum(setup.Api, s) orelse return null,
+        else => return null,
+    };
+    if (o.get("replace")) |x| f.replace = switch (x) {
+        .bool => |b| b,
+        else => return null,
+    };
+    return f;
 }
 
 pub const Source = enum { desk, builtin, other };
@@ -71,6 +119,43 @@ test "messages_parse" {
     const both = parse(a, "{\"badge\": 2, \"attention\": \"urgent\", \"other\": 1}").?;
     try t.expectEqual(@as(?u32, 2), both.badge);
     try t.expect(both.attention and !both.reenter and !both.start);
+}
+
+test "setup_and_cancel_parse" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const m = parse(a, "{\"setup\": {\"provider\": \"other\", \"model\": \" m1 \", \"url\": \"http://127.0.0.1:8080/v1\", \"api\": \"anthropic\", \"replace\": true}}").?;
+    const f = m.setup.?;
+    try t.expectEqual(setup.Provider.other, f.provider);
+    try t.expectEqualStrings(" m1 ", f.model);
+    try t.expectEqualStrings("http://127.0.0.1:8080/v1", f.url);
+    try t.expectEqual(setup.Api.anthropic, f.api);
+    try t.expect(f.replace);
+    // missing fields: the defaults; a provider or format it doesn't know: nothing
+    const min = parse(a, "{\"setup\": {\"provider\": \"openai\"}}").?.setup.?;
+    try t.expectEqualStrings("", min.model);
+    try t.expect(!min.replace);
+    try t.expect(parse(a, "{\"setup\": {\"provider\": \"gemini\", \"model\": \"m\"}}") == null);
+    try t.expect(parse(a, "{\"setup\": {\"provider\": \"other\", \"api\": \"gemini\"}}") == null);
+    try t.expect(parse(a, "{\"setup\": {\"provider\": \"openai\", \"model\": 3}}") == null);
+    try t.expect(parse(a, "{\"setup\": \"anthropic\"}") == null);
+    try t.expect(parse(a, "{\"cancel\": true}").?.cancel);
+    try t.expect(parse(a, "{\"cancel\": 1}") == null);
+}
+
+test "a_key_field_in_a_message_is_ignored" {
+    // the page never holds the key; a message that brings one doesn't pass it on
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const m = parse(a, "{\"setup\": {\"provider\": \"anthropic\", \"model\": \"claude-opus-4-8\", \"key\": \"sk-test-not-a-key\"}, \"key\": \"sk-test-not-a-key\"}").?;
+    const f = m.setup.?;
+    inline for (@typeInfo(setup.Form).@"struct".field_names) |name| {
+        const v = @field(f, name);
+        if (@TypeOf(v) == []const u8) try t.expect(std.mem.indexOf(u8, v, "sk-test") == null);
+    }
+    try t.expect(parse(a, "{\"key\": \"sk-test-not-a-key\"}") == null);
 }
 
 test "wrong_shapes_are_nothing" {

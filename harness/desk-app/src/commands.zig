@@ -87,6 +87,50 @@ pub const Result = struct {
     }
 };
 
+/// `runWait` with `input` written to its standard input, which is then
+/// closed (the key, for `harness secret add NAME --stdin`). `input` is the
+/// caller's to clear; nothing here keeps a copy of it.
+pub fn runWithStdin(io: Io, a: std.mem.Allocator, args: []const []const u8, env: ?*const Environ.Map, input: []const u8) !Result {
+    var child = try std.process.spawn(io, .{
+        .argv = args,
+        .environ_map = env,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .create_no_window = true,
+    });
+    defer child.kill(io);
+    {
+        // what's written fits the pipe: the child reads it whenever it likes
+        var stdin = child.stdin.?;
+        child.stdin = null;
+        defer stdin.close(io);
+        stdin.writeStreamingAll(io, input) catch |e| switch (e) {
+            // it ended without reading: what it said is the answer
+            error.BrokenPipe => {},
+            else => return e,
+        };
+    }
+    var buffer: Io.File.MultiReader.Buffer(2) = undefined;
+    var reader: Io.File.MultiReader = undefined;
+    reader.init(a, io, buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer reader.deinit();
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } };
+    while (reader.fill(64, timeout)) |_| {
+        if (reader.reader(0).buffered().len > 64 * 1024 or reader.reader(1).buffered().len > 64 * 1024) return error.StreamTooLong;
+    } else |e| switch (e) {
+        error.EndOfStream => {},
+        else => return e,
+    }
+    try reader.checkAnyError();
+    const term = try child.wait(io);
+    const code: ?u8 = switch (term) {
+        .exited => |c| c,
+        else => null,
+    };
+    return .{ .ok = code == 0, .code = code, .out = try reader.toOwnedSlice(0), .err = try reader.toOwnedSlice(1) };
+}
+
 /// Runs `argv` to its end (at most 30 s), keeping what it printed.
 pub fn runWait(io: Io, a: std.mem.Allocator, args: []const []const u8, env: ?*const Environ.Map) !Result {
     const r = try std.process.run(a, io, .{
@@ -226,4 +270,25 @@ test "run_wait_gives_output_and_status" {
     const quiet = try runWait(t.io, a, &.{ "/bin/sh", "-c", "exit 4" }, null);
     try t.expectEqualStrings("It ended with code 4.", try quiet.why(a));
     try t.expectError(error.FileNotFound, runWait(t.io, a, &.{"/no/such/harness"}, null));
+}
+
+test "run_with_stdin_feeds_and_closes_the_input" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (is_windows) {
+        // sort reads to the end of its input: it ends only once that is closed
+        const r = try runWithStdin(t.io, a, &.{ "cmd.exe", "/d", "/c", "sort" }, null, "fed-in\n");
+        try t.expect(r.ok);
+        try t.expectEqualStrings("fed-in", std.mem.trim(u8, r.out, " \r\n"));
+        return;
+    }
+    // cat ends only once its input is closed; no newline at the end
+    const r = try runWithStdin(t.io, a, &.{"/bin/cat"}, null, "fed-in");
+    try t.expect(r.ok);
+    try t.expectEqualStrings("fed-in", r.out);
+    const bad = try runWithStdin(t.io, a, &.{ "/bin/sh", "-c", "cat >/dev/null; echo refused >&2; exit 2" }, null, "x");
+    try t.expect(!bad.ok);
+    try t.expectEqualStrings("refused", try bad.why(a));
+    try t.expectError(error.FileNotFound, runWithStdin(t.io, a, &.{"/no/such/harness"}, null, "x"));
 }
