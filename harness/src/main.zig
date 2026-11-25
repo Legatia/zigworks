@@ -137,6 +137,17 @@ const App = struct {
     home: []const u8 = "",
     /// Where this folder's secrets are kept (`prepareStore`).
     store_cache: ?store_mod.Store = null,
+    /// The notes `open` said on stderr (a key missing, mcp.ini's problems):
+    /// the desk alone says them too, where the owner reads.
+    notes: std.ArrayList([]const u8) = .empty,
+
+    /// A note at start: on stderr, and kept for the desk.
+    fn note(app: *App, comptime fmt: []const u8, args: anytype) void {
+        complain(fmt, args);
+        const line = std.fmt.allocPrint(app.arena, fmt, args) catch return;
+        const plain = if (std.mem.startsWith(u8, line, "note: ")) line["note: ".len..] else line;
+        app.notes.append(app.arena, plain) catch {};
+    }
 
     fn defaultHome(app: *App) ![]const u8 {
         if (app.env.get("HARNESS_HOME")) |h| if (h.len > 0) return h;
@@ -307,8 +318,8 @@ const App = struct {
         const sec = app.secrets(cfg);
         // each provider in use without its key or url, said once
         const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), .{ .ctx = @constCast(&sec), .get = startKey });
-        for (try startNotes(app.arena, &set, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model })) |n| complain("{s}", .{n});
-        if (try voiceStartNote(app.arena, &set, cfg.voice.provider)) |n| complain("{s}", .{n});
+        for (try startNotes(app.arena, &set, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model })) |n| app.note("{s}", .{n});
+        if (try voiceStartNote(app.arena, &set, cfg.voice.provider)) |n| app.note("{s}", .{n});
         const c = Core.open(app.gpa, app.io, app.home, sec) catch |e| {
             switch (e) {
                 error.AlreadyRunning => complain("harness is already running on {s}; talk to it there (or stop it first)", .{app.home}),
@@ -344,13 +355,13 @@ const App = struct {
         if ((role == .run or role == .chat) and c.cfg.apps.on) {
             if (c.startApps(app.arena)) |url| {
                 complain("Apps: {s}   (new each start)", .{url});
-                if (c.apps_note.len > 0) complain("note: {s}", .{c.apps_note});
-                writeDeskJson(app, c) catch |e| complain("note: state/desk.json was not written: {s}", .{@errorName(e)});
+                if (c.apps_note.len > 0) app.note("note: {s}", .{c.apps_note});
+                writeDeskJson(app, c) catch |e| app.note("note: state/desk.json was not written: {s}", .{@errorName(e)});
             } else |e| complain("note: the app server didn't start: {s}", .{@errorName(e)});
         }
         var warns = std.mem.tokenizeScalar(u8, c.mcp_warn, '\n');
-        while (warns.next()) |w| complain("note: mcp.ini: {s}", .{w});
-        if (c.money_ledger.trouble()) |why| complain("note: {s}; money calls are refused until it is fixed", .{why});
+        while (warns.next()) |w| app.note("note: mcp.ini: {s}", .{w});
+        if (c.money_ledger.trouble()) |why| app.note("note: {s}; money calls are refused until it is fixed", .{why});
         return c;
     }
 };
@@ -1349,8 +1360,10 @@ fn runAlone(app: *App, c: *Core) !Exit {
     }
     complain("{s}", .{said.start});
     c.attachAlone();
-    // once on the desk too
+    // once on the desk too, with what start found (said on stderr, which
+    // nobody reads when the desk app or a login started harness)
     c.say(said.start);
+    if (app.notes.items.len > 0) c.say(try std.mem.join(app.arena, "\n", app.notes.items));
     try c.startWorker();
     c.poller_on = true;
     const tick_thread = try std.Thread.spawn(.{}, ticker, .{c});

@@ -348,7 +348,10 @@ async function press(box, id, n) {
     const d = await post("press", { id, n });
     if (d.said) box.append(el("p", "said", d.said));
   } catch (e) {
-    if (!(e instanceof SignedOut)) box.append(el("p", "said", "The press didn't reach harness."));
+    if (!(e instanceof SignedOut)) {
+      box.append(el("p", "said", "The press didn't reach harness."));
+      for (const b of box.querySelectorAll("button")) b.disabled = false;
+    }
   }
 }
 

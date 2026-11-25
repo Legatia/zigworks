@@ -116,7 +116,25 @@ pub fn setAll(a: std.mem.Allocator, text: []const u8, pairs: []const Pair) !Resu
         out = r.text.?;
     }
     if (try core.parseProblem(a, "config.ini", out, config.parse)) |why| return .{ .refused = try std.fmt.allocPrint(a, "Not changed: {s}", .{why}) };
+    for (pairs) |p| if (startProblem(p)) |why| return .{ .refused = try std.fmt.allocPrint(a, "Not changed: {s}.{s} {s}", .{ p.key.section, p.key.key, why }) };
     return .{ .text = out };
+}
+
+/// What harness would refuse at its start of a value config.ini reads
+/// (an address it can't call, a port past 65535); null: nothing.
+fn startProblem(p: Pair) ?[]const u8 {
+    const v = std.mem.trim(u8, p.value, " \t");
+    const urls = [_][2][]const u8{ .{ "model", "url" }, .{ "search", "url" }, .{ "chat", "api" } };
+    for (urls) |u| if (std.mem.eql(u8, p.key.section, u[0]) and std.mem.eql(u8, p.key.key, u[1])) {
+        // omnigate's may stay unset
+        if (v.len == 0 and std.mem.eql(u8, u[0], "model")) return null;
+        return if (model.validUrl(v)) null else "takes an http:// or https:// address";
+    };
+    if (std.mem.eql(u8, p.key.section, "apps") and std.mem.eql(u8, p.key.key, "port")) {
+        const n = std.fmt.parseInt(u32, v, 10) catch return "is a port, 0 to 65535";
+        if (n > std.math.maxInt(u16)) return "is a port, 0 to 65535";
+    }
+    return null;
 }
 
 /// One setting written into `text`, unparsed.
@@ -350,4 +368,18 @@ test "several_settings_go_in_at_once_and_are_parsed_together" {
     try t.expect(parsePairs(x, &.{ "model.model", "a", "model.url" }) == null);
     try t.expect(parsePairs(x, &.{}) == null);
     try t.expect(parsePairs(x, &.{ "provider", "x" }) == null);
+}
+
+test "a_value_harness_would_refuse_at_start_is_refused_now" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const x = arena.allocator();
+    try t.expectEqualStrings("Not changed: model.url takes an http:// or https:// address", (try setText(x, "", parseKey(x, &.{"model.url"}).?, "notaurl")).refused.?);
+    try t.expect((try setText(x, "", parseKey(x, &.{"search.url"}).?, "ftp://x.example")).refused != null);
+    try t.expect((try setText(x, "", parseKey(x, &.{"chat.api"}).?, "api.telegram.org")).refused != null);
+    try t.expectEqualStrings("Not changed: apps.port is a port, 0 to 65535", (try setText(x, "", parseKey(x, &.{"apps.port"}).?, "70000")).refused.?);
+    try t.expect((try setText(x, "", parseKey(x, &.{"model.url"}).?, "https://og.example")).text != null);
+    try t.expect((try setText(x, "", parseKey(x, &.{"apps.port"}).?, "8642")).text != null);
+    // a file broken already elsewhere doesn't stop another change
+    try t.expect((try setText(x, "[search]\nurl = nope\n", parseKey(x, &.{"model.model"}).?, "gpt")).text != null);
 }

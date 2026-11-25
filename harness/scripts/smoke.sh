@@ -1043,6 +1043,7 @@ APORT=$(sed -n 's/^port = \([0-9]*\).*/\1/p' "$AH/config.ini")
 cat >"$AH/config.ini" <<EOF
 [model]
 url = $URL
+worker_model = anthropic:claude-haiku
 [search]
 url = $URL
 [chat]
@@ -1073,6 +1074,8 @@ desk_has() {
 }
 check "the desk is entered with no pairing, and says once why it is the only way in" '[ -n "$ACOOKIE" ] && desk_has main "The desk is the only way in." && [ "$(grep -o "\"text\":\"No bot token is stored" "$T/ahist.out" | wc -l | tr -d " ")" = 1 ]'
 check "a scheduled task's result arrives on the desk" 'desk_has main "[check] Price is flat." 15'
+check "what start found reaches the desk too, not only stderr" 'grep -qF "no anthropic key stored" "$T/arun.out" && desk_has main "no anthropic key stored under"'
+
 reply "$(text_reply 'Three flats match.')"
 check "a message sent on the desk is a turn, and its reply comes back to the desk" '"$F" --desk-api "$AH" "$ACOOKIE" POST send "{\"conv\":\"main\",\"text\":\"Find flats\"}" >/dev/null && desk_has main "Three flats match." 15'
 reply "$(tool_reply tu_a1 'echo desk-alone')"

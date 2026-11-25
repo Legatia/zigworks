@@ -345,8 +345,6 @@ pub const DeskOnly = struct {
     /// The next message id: from the clock at start, so an id kept across
     /// a restart (a reminder's, an alert's) never names a new message.
     next: i64 = 0,
-    kept_buf: [512]u8 = undefined,
-    kept_len: usize = 0,
 
     fn of(ctx: *anyopaque) *DeskOnly {
         return @ptrCast(@alignCast(ctx));
@@ -404,27 +402,19 @@ pub const DeskOnly = struct {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const dir = try std.fs.path.join(a, &.{ c.paths.state, "desk-files" });
-        _ = try Io.Dir.cwd().createDirPathStatus(c.io, dir, agents.private_dir);
+        _ = try Io.Dir.cwd().createDirPathStatus(c.io, try std.fs.path.join(a, &.{ c.paths.state, "desk-files" }), agents.private_dir);
         const id = d.take();
-        const file = try std.fmt.allocPrint(a, "{d}-{s}", .{ id, try safeFileName(a, name) });
-        const path = try std.fs.path.join(a, &.{ dir, file });
+        const path = try d.keptPath(a, id, name);
         var f = try Io.Dir.cwd().createFile(c.io, path, .{ .exclusive = true, .permissions = util.private_file });
         defer f.close(c.io);
         try f.writeStreamingAll(c.io, data);
-        d.mutex.lockUncancelable(c.io);
-        defer d.mutex.unlock(c.io);
-        const n = @min(path.len, d.kept_buf.len);
-        @memcpy(d.kept_buf[0..n], path[0..n]);
-        d.kept_len = n;
         return id;
     }
 
-    /// Where the last file was kept.
-    fn lastKept(d: *DeskOnly) []const u8 {
-        d.mutex.lockUncancelable(d.core.io);
-        defer d.mutex.unlock(d.core.io);
-        return d.kept_buf[0..d.kept_len];
+    /// Where file `name` of message `id` is kept.
+    fn keptPath(d: *DeskOnly, a: std.mem.Allocator, id: i64, name: []const u8) ![]const u8 {
+        const file = try std.fmt.allocPrint(a, "{d}-{s}", .{ id, try safeFileName(a, name) });
+        return std.fs.path.join(a, &.{ d.core.paths.state, "desk-files", file });
     }
 };
 
@@ -523,8 +513,10 @@ const DeskTee = struct {
         const d = of(ctx);
         const id = try d.inner.document.?(d.inner.ctx, place, name, data);
         var buf: [400]u8 = undefined;
+        var arena: std.heap.ArenaAllocator = .init(d.core.gpa);
+        defer arena.deinit();
         const line = if (d.core.alone)
-            std.fmt.bufPrint(&buf, "A file: {s}, kept in {s}", .{ util.cut(name, 100), util.cut(d.core.desk_only.lastKept(), 250) }) catch "A file, kept in state/desk-files."
+            std.fmt.bufPrint(&buf, "A file: {s}, kept in {s}", .{ util.cut(name, 100), util.cut(d.core.desk_only.keptPath(arena.allocator(), id, name) catch "state/desk-files", 250) }) catch "A file, kept in state/desk-files."
         else
             std.fmt.bufPrint(&buf, "A file: {s}", .{util.cut(name, 100)}) catch "A file.";
         d.core.deskNoteAs(place.name, line, 0, false, d.chanOf(id), &.{});
@@ -6936,7 +6928,12 @@ pub const Core = struct {
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
         // the computer's zone, read again each minute (the clocks change)
-        if (now_s - c.local_checked_s >= 60 or now_s < c.local_checked_s) c.refreshLocalTime(now_s);
+        if (now_s - c.local_checked_s >= 60 or now_s < c.local_checked_s) {
+            const was = c.cfg.chat.utc_offset;
+            c.refreshLocalTime(now_s);
+            // the desk's clock follows
+            if (c.cfg.chat.utc_offset != was) c.desk_feed.push("facts", "");
+        }
         c.noteUrgent();
         // posts that did not get through go again when their wait is over
         c.resendDue(now_s);
@@ -14730,7 +14727,16 @@ pub const Core = struct {
     /// the desk alone shows under it.
     fn deskNoteAs(c: *Core, conv: []const u8, text: []const u8, item: u64, urgent: bool, chan: i64, bs: []const [2][]const u8) void {
         if (!c.deskShows(conv)) return;
-        _ = c.deskRecord(conv, .{ .from = .harness, .text = text, .at = c.now(), .item = item, .urgent = urgent, .chan = chan, .buttons = bs }) catch {};
+        // the desk alone: a post past what one message keeps goes in several
+        // (as Telegram would split it), the marks and buttons on the last
+        var rest = text;
+        if (c.alone) while (rest.len > deskwin.History.max_text) {
+            var cut: usize = deskwin.History.max_text;
+            while (cut > 0 and rest[cut] & 0xc0 == 0x80) cut -= 1;
+            _ = c.deskRecord(conv, .{ .from = .harness, .text = rest[0..cut], .at = c.now() }) catch {};
+            rest = rest[cut..];
+        };
+        _ = c.deskRecord(conv, .{ .from = .harness, .text = rest, .at = c.now(), .item = item, .urgent = urgent, .chan = chan, .buttons = bs }) catch {};
     }
 
     /// The desk alone's message `chan` changed (an outcome in place of
@@ -37427,4 +37433,32 @@ test "desk_alone_a_new_conversation_says_why_there_is_none" {
     try f.initAlone("", "");
     defer f.deinit();
     try t.expectEqualStrings("Conversations other than main are Telegram topics, and Telegram is off.", try f.core.command(f.e.arena.allocator(), "/conversation new trips"));
+}
+
+test "desk_alone_a_long_post_reaches_the_desk_whole" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const long = try a.alloc(u8, deskwin.History.max_text * 2 + 10);
+    @memset(long, 'x');
+    long[long.len - 1] = 'Z';
+    try f.core.deliver(long);
+    const h = deskCall(&f, .GET, "history", "conv=main", "").body;
+    try expectHas(h, "xZ\"");
+    try t.expectEqual(3, std.mem.count(u8, h, "\"from\":\"harness\""));
+}
+
+test "a_change_of_offset_tells_the_desk" {
+    local_reader = testZone;
+    defer local_reader = zones.localNow;
+    test_offset = 60;
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = auto\n", "", "");
+    defer f.deinit();
+    const before = f.core.desk_feed.last();
+    test_offset = 120;
+    f.core.fixed_now = util.nowSeconds(t.io) + 61;
+    f.core.tick();
+    try expectHas(deskCall(&f, .GET, "events", try std.fmt.allocPrint(f.e.arena.allocator(), "after={d}&wait=0", .{before}), "").body, "\"type\":\"facts\"");
 }
