@@ -307,3 +307,4 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
 - CI, 2026-11-25:
   - run 45662585632 (94c3f94): Windows harness smoke checks 64-66 failed with `harness-fake: FileNotFound` (Git's sh rewrote the stand-in's path); fixed in 3f97af9. Three macOS jobs cancelled.
   - run 45667859969 (3f97af9): 33 of 34 jobs passed, Windows harness in Debug and ReleaseSafe among them. `test (macos-15, headterm)` was cancelled: no macOS arm64 runner took it. Not re-run; the next run covers the same code.
+  - run 45671644320 (8c4130a): all 34 jobs passed.
