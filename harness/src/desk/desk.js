@@ -934,6 +934,8 @@ for (const b of document.querySelectorAll(".info > button")) {
 function openSettings() {
   renderSettings();
   if (!$("settings").open) $("settings").showModal();
+  // a folder put in avatars/ since the page loaded is among the choices
+  loadState();
 }
 
 $("settingsBtn").addEventListener("click", openSettings);

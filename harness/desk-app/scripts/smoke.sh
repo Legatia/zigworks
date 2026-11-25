@@ -452,6 +452,14 @@ if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     cmd "js document.getElementById('muteBtn').click()"
     desk_probe unmuted "$sound"
     expect_probe '"sounding waves on cross off"' "real harness: and the waves again once unmuted"
+    # a folder put in avatars/ while the desk is open (nothing tells the
+    # page) is among the choices once Settings is opened
+    mkdir -p "$REAL_HOME/avatars/guest"
+    cmd "js document.getElementById('settingsBtn').click()"
+    desk_until choices "'avatars: ' + Array.prototype.map.call(document.querySelectorAll('#avatarChoices input'), function (i) { return i.value; }).join(',')" 'guest' 12
+    expect_probe 'guest' "real harness: an avatar folder added while the desk is open is listed when Settings opens"
+    cmd "js document.getElementById('settingsClose').click()"
+    rmdir "$REAL_HOME/avatars/guest"
     # replies are read aloud with no avatar chosen. The built-in voice and
     # the provider's answer are stood in for on the page: nothing sounds
     # (the audio is silence) and no provider is asked. The model here can't
