@@ -34,6 +34,7 @@ const sandbox = @import("sandbox.zig");
 const remote = @import("remote.zig");
 const apps_mod = @import("apps.zig");
 const appserver = @import("appserver.zig");
+const deskwin = @import("deskwin.zig");
 const snapshots_mod = @import("snapshots.zig");
 const undo_mod = @import("undo.zig");
 const agents = @import("agents.zig");
@@ -302,6 +303,137 @@ const RunFlag = struct {
     flag: *std.atomic.Value(bool),
     agent: []const u8,
     parent: ?*std.atomic.Value(bool) = null,
+};
+
+/// A run going, as the desk's status card shows it.
+const DeskRun = struct { id: u64, label: []u8, by: []u8, conv: []u8, started: i64, helpers: i32 = 0 };
+
+/// When the owner last opened a conversation on the desk.
+const DeskSeen = struct { name: []u8, at: i64 };
+
+/// In front of the channel: every post goes on as it would, and one that
+/// got through to a conversation only the owner reads also goes into the
+/// desk's history and feed (an item's buttons mark its item, an urgent
+/// alert's [I'm on it] the alert).
+const DeskTee = struct {
+    core: *Core,
+    inner: Channel,
+
+    fn of(ctx: *anyopaque) *DeskTee {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn channel(d: *DeskTee) Channel {
+        const in = d.inner;
+        return .{
+            .ctx = d,
+            .send = send,
+            .buttons = buttons,
+            .clear = clear,
+            .edit = if (in.edit != null) edit else null,
+            .send_to = if (in.send_to != null) sendTo else null,
+            .document = if (in.document != null) document else null,
+            .open_topic = if (in.open_topic != null) openTopic else null,
+            .file = if (in.file != null) file else null,
+            .rich = if (in.rich != null) rich else null,
+            .buttons_rich = if (in.buttons_rich != null) buttonsRich else null,
+            .replace = if (in.replace != null) replace else null,
+            .pin = if (in.pin != null) pin else null,
+            .topics = if (in.topics != null) topics else null,
+            .me = if (in.me != null) me else null,
+        };
+    }
+
+    fn send(ctx: *anyopaque, place: Place, text: []const u8) anyerror!Sent {
+        const d = of(ctx);
+        const sent = try d.inner.send(d.inner.ctx, place, text);
+        d.core.deskNote(place.name, text, 0, false);
+        return sent;
+    }
+
+    fn rich(ctx: *anyopaque, place: Place, text: []const u8, entities: []const topics_mod.Entity) anyerror!Sent {
+        const d = of(ctx);
+        const sent = try d.inner.rich.?(d.inner.ctx, place, text, entities);
+        d.core.deskNote(place.name, text, 0, false);
+        return sent;
+    }
+
+    fn buttons(ctx: *anyopaque, place: Place, text: []const u8, bs: []const [2][]const u8) ?i64 {
+        const d = of(ctx);
+        const id = d.inner.buttons(d.inner.ctx, place, text, bs) orelse return null;
+        const m = marks(bs);
+        d.core.deskNote(place.name, text, m.item, m.urgent);
+        return id;
+    }
+
+    fn buttonsRich(ctx: *anyopaque, place: Place, text: []const u8, entities: []const topics_mod.Entity, bs: []const [2][]const u8) ?i64 {
+        const d = of(ctx);
+        const id = d.inner.buttons_rich.?(d.inner.ctx, place, text, entities, bs) orelse return null;
+        const m = marks(bs);
+        d.core.deskNote(place.name, text, m.item, m.urgent);
+        return id;
+    }
+
+    fn document(ctx: *anyopaque, place: Place, name: []const u8, data: []const u8) anyerror!i64 {
+        const d = of(ctx);
+        const id = try d.inner.document.?(d.inner.ctx, place, name, data);
+        var buf: [160]u8 = undefined;
+        d.core.deskNote(place.name, std.fmt.bufPrint(&buf, "A file: {s}", .{util.cut(name, 100)}) catch "A file.", 0, false);
+        return id;
+    }
+
+    /// An item's buttons (`iID-TOKEN:KEY`) and an urgent alert's
+    /// (`eID-TOKEN:onit`).
+    fn marks(bs: []const [2][]const u8) struct { item: u64 = 0, urgent: bool = false } {
+        var item: u64 = 0;
+        var urgent = false;
+        for (bs) |b| {
+            const data = b[1];
+            if (data.len < 3) continue;
+            const dash = std.mem.indexOfScalar(u8, data, '-') orelse continue;
+            const n = std.fmt.parseInt(u64, data[1..dash], 10) catch continue;
+            if (data[0] == 'i') item = n;
+            if (data[0] == 'e' and std.mem.endsWith(u8, data, ":onit")) urgent = true;
+        }
+        return .{ .item = item, .urgent = urgent };
+    }
+
+    fn clear(ctx: *anyopaque, place: Place, id: i64) void {
+        const d = of(ctx);
+        d.inner.clear(d.inner.ctx, place, id);
+    }
+    fn edit(ctx: *anyopaque, place: Place, id: i64, text: []const u8) void {
+        const d = of(ctx);
+        d.inner.edit.?(d.inner.ctx, place, id, text);
+    }
+    fn sendTo(ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void {
+        const d = of(ctx);
+        return d.inner.send_to.?(d.inner.ctx, chat_id, text);
+    }
+    fn openTopic(ctx: *anyopaque, chat: i64, name: []const u8) anyerror!i64 {
+        const d = of(ctx);
+        return d.inner.open_topic.?(d.inner.ctx, chat, name);
+    }
+    fn file(ctx: *anyopaque, a: std.mem.Allocator, file_id: []const u8, max: usize) anyerror![]u8 {
+        const d = of(ctx);
+        return d.inner.file.?(d.inner.ctx, a, file_id, max);
+    }
+    fn replace(ctx: *anyopaque, place: Place, id: i64, text: []const u8, entities: []const topics_mod.Entity) anyerror!void {
+        const d = of(ctx);
+        return d.inner.replace.?(d.inner.ctx, place, id, text, entities);
+    }
+    fn pin(ctx: *anyopaque, place: Place, id: i64) anyerror!void {
+        const d = of(ctx);
+        return d.inner.pin.?(d.inner.ctx, place, id);
+    }
+    fn topics(ctx: *anyopaque, on: bool) anyerror!void {
+        const d = of(ctx);
+        return d.inner.topics.?(d.inner.ctx, on);
+    }
+    fn me(ctx: *anyopaque) anyerror!bool {
+        const d = of(ctx);
+        return d.inner.me.?(d.inner.ctx);
+    }
 };
 
 /// One instance's context, a definition in a conversation: its turns
@@ -611,6 +743,19 @@ pub const Core = struct {
     app_runs: std.ArrayList(AppRan) = .empty,
     /// Acts going: `close` waits for them.
     app_active: std.atomic.Value(u32) = .init(0),
+    /// The desk (harness's own window): its feed of events, the last
+    /// messages of each conversation (in memory only), the tee in front of
+    /// the channel that fills them, the runs going, and when the owner
+    /// last opened each conversation there (state/desk-seen).
+    desk_feed: deskwin.Feed,
+    desk_history: deskwin.History,
+    desk_tee: DeskTee,
+    desk_mutex: Io.Mutex,
+    desk_runs: std.ArrayList(DeskRun),
+    desk_next_run: u64,
+    desk_seen: std.ArrayList(DeskSeen),
+    /// Quiet hours were on at the last tick (a change is an event).
+    desk_quiet: bool,
 
     chan: ?Channel = null,
     owner: ?i64 = null,
@@ -835,6 +980,14 @@ pub const Core = struct {
         c.wf_mutex = .init;
         c.wf_list = .empty;
         c.wf_test_stop = .none;
+        c.desk_feed = .init(gpa, io);
+        c.desk_history = .init(gpa, io);
+        c.desk_tee = .{ .core = c, .inner = undefined };
+        c.desk_mutex = .init;
+        c.desk_runs = .empty;
+        c.desk_next_run = 1;
+        c.desk_seen = .empty;
+        c.desk_quiet = false;
         // the stored secrets first: a workflow file holding one is refused
         c.secrets = secrets;
         c.secret_list = try secretList(c.paths_arena.allocator(), secrets);
@@ -1035,6 +1188,10 @@ pub const Core = struct {
         // the workflow instances going, and items of none void
         c.loadInstances();
         c.checkLogAgainstStatus();
+        // the desk: what the owner last opened there, and the history of
+        // conversations that aren't private, from the log
+        c.deskLoadSeen();
+        c.deskFill();
         // the butler's manner of before: persona.md now (once)
         Manner.migrate(c);
         // an install that spent before budgets gets one, and is told (once)
@@ -1086,6 +1243,7 @@ pub const Core = struct {
         for (c.queue.items) |q| q.deinit(c.gpa);
         c.queue.deinit(c.gpa);
         c.run_flags.deinit(c.gpa);
+        c.deskFree();
         c.convs.deinit();
         c.members.deinit();
         c.member_asks.deinit();
@@ -1378,6 +1536,8 @@ pub const Core = struct {
         // the calendar's server may be new: read it again at the next tick
         c.diary.next_read.store(0, .release);
         try c.log.write(.config, false, .{ .event = "reload" });
+        // the desk's settings may have changed
+        c.desk_feed.push("facts", "");
         return "Settings reloaded.";
     }
 
@@ -1558,6 +1718,7 @@ pub const Core = struct {
         const e = c.convs.find(conv) orelse return;
         if (e.subject.len == 0 or std.mem.eql(u8, e.subject, "work")) return;
         e.noteLately(text, c.now());
+        c.desk_feed.push("topics", "");
     }
 
     /// `sendTextAs`, nothing noted for a card.
@@ -1774,7 +1935,9 @@ pub const Core = struct {
     }
 
     pub fn attach(c: *Core, ch: Channel) void {
-        c.chan = ch;
+        // every post also goes to the desk (DeskTee)
+        c.desk_tee = .{ .core = c, .inner = ch };
+        c.chan = c.desk_tee.channel();
         if (c.pending_warning) |w| {
             c.say(w);
             c.pending_warning = null;
@@ -3037,8 +3200,14 @@ pub const Core = struct {
     }
 
     /// The owner's text in conversation `conv`: a command now (its reply
-    /// goes there), or a message for the chat queue.
+    /// goes there), or a message for the chat queue. The desk shows it.
     pub fn handleTextIn(c: *Core, conv: []const u8, text_in: []const u8) !void {
+        c.deskOwner(conv, text_in, if (std.mem.eql(u8, conv, "terminal")) "terminal" else "telegram");
+        return c.textIn(conv, text_in);
+    }
+
+    /// `handleTextIn`, not shown again on the desk.
+    fn textIn(c: *Core, conv: []const u8, text_in: []const u8) !void {
         const text = std.mem.trim(u8, text_in, " \t\r\n");
         if (text.len == 0) return;
         c.touch(conv);
@@ -3975,6 +4144,8 @@ pub const Core = struct {
     /// Writes state/inbox (under the inbox lock); a failure is logged.
     fn saveInbox(c: *Core) void {
         c.inbox.save(c.now()) catch |e| c.log.write(.inbox, false, .{ .event = "not written", .why = @errorName(e) }) catch {};
+        // the desk reads the items again
+        c.desk_feed.push("items", "");
     }
 
     fn logOpen(c: *Core, it: *const inbox_mod.Item) void {
@@ -5208,6 +5379,7 @@ pub const Core = struct {
             .envs = .{ .list = c.env_list, .root = c.paths.env_dir, .data_home = c.paths.home, .owner_home = c.home_var },
             .copy_keeper = .{ .ctx = c, .keep = copyKeep },
             .copy_skip = c.copy_skip,
+            .live = .{ .ctx = c, .begin = deskBegin, .end = deskEnd, .helpers = deskHelpers },
         };
     }
 
@@ -6418,6 +6590,7 @@ pub const Core = struct {
     /// file is refreshed, changed settings are noticed.
     pub fn tick(c: *Core) void {
         const now_s = c.now();
+        c.deskTick();
         if (util.nowSeconds(c.io) - c.last_status_s >= 30) {
             c.last_status_s = util.nowSeconds(c.io);
             c.writeStatus() catch {};
@@ -14232,6 +14405,522 @@ pub const Core = struct {
         return appErr(a, .not_found, "the bar has inbox and answer");
     }
 
+    // ---- the desk (harness's own window) ----
+
+    /// Whether the desk shows conversation `conv`: one only the owner reads.
+    fn deskShows(c: *Core, conv: []const u8) bool {
+        if (conv.len == 0 or mail_mod.isEmail(conv)) return false;
+        return !c.isShared(conv);
+    }
+
+    /// Harness's post `text` in `conv` got through: into the desk's
+    /// history, and its feed.
+    fn deskNote(c: *Core, conv: []const u8, text: []const u8, item: u64, urgent: bool) void {
+        if (!c.deskShows(conv)) return;
+        _ = c.deskRecord(conv, .{ .from = .harness, .text = text, .at = c.now(), .item = item, .urgent = urgent }) catch {};
+    }
+
+    /// The owner's words in `conv` (typed on the desk, in Telegram or the
+    /// terminal): into the desk's history, and its feed.
+    fn deskOwner(c: *Core, conv: []const u8, text_in: []const u8, via: []const u8) void {
+        const text = std.mem.trim(u8, text_in, " \t\r\n");
+        if (text.len == 0 or !c.deskShows(conv)) return;
+        _ = c.deskRecord(conv, .{ .from = .you, .text = text, .at = c.now(), .via = via }) catch {};
+    }
+
+    fn deskRecord(c: *Core, conv: []const u8, m: deskwin.Msg) !u64 {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var own = m;
+        own.text = try c.masks.scrubAlloc(a, m.text);
+        own.id = try c.desk_history.add(conv, own);
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, "\"conv\":");
+        try util.jsonString(&out, a, conv);
+        try out.appendSlice(a, ",\"msg\":");
+        try deskwin.msgJson(&out, a, own);
+        c.desk_feed.push("message", out.items);
+        return own.id;
+    }
+
+    /// A top-level run started (agent.Live): kept for the status card.
+    fn deskBegin(ctx: *anyopaque, by: []const u8, conv: []const u8, text: []const u8) u64 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const label = deskwin.runLabel(arena.allocator(), by, text) catch return 0;
+        const masked = c.masks.scrubAlloc(arena.allocator(), label) catch return 0;
+        const id = blk: {
+            c.desk_mutex.lockUncancelable(c.io);
+            defer c.desk_mutex.unlock(c.io);
+            const r: DeskRun = .{
+                .id = c.desk_next_run,
+                .label = c.gpa.dupe(u8, masked) catch return 0,
+                .by = c.gpa.dupe(u8, by) catch return 0,
+                .conv = c.gpa.dupe(u8, conv) catch return 0,
+                .started = c.now(),
+            };
+            c.desk_runs.append(c.gpa, r) catch return 0;
+            c.desk_next_run += 1;
+            break :blk r.id;
+        };
+        c.deskPushRuns();
+        return id;
+    }
+
+    /// It ended: gone from the card; a reply gives a smile, an error a
+    /// look of concern.
+    fn deskEnd(ctx: *anyopaque, id: u64, outcome: agent.Live.Outcome) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        {
+            c.desk_mutex.lockUncancelable(c.io);
+            defer c.desk_mutex.unlock(c.io);
+            for (c.desk_runs.items, 0..) |r, i| if (r.id == id) {
+                freeDeskRun(c.gpa, c.desk_runs.orderedRemove(i));
+                break;
+            };
+        }
+        c.deskPushRuns();
+        switch (outcome) {
+            .replied => c.desk_feed.push("moment", "\"moment\":\"smile\""),
+            .failed => c.desk_feed.push("moment", "\"moment\":\"concern\""),
+            .quiet => {},
+        }
+    }
+
+    /// One of its helpers started (+1) or ended (-1).
+    fn deskHelpers(ctx: *anyopaque, id: u64, delta: i32) void {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        {
+            c.desk_mutex.lockUncancelable(c.io);
+            defer c.desk_mutex.unlock(c.io);
+            for (c.desk_runs.items) |*r| if (r.id == id) {
+                r.helpers = @max(0, r.helpers + delta);
+            };
+        }
+        c.deskPushRuns();
+    }
+
+    fn freeDeskRun(gpa: std.mem.Allocator, r: DeskRun) void {
+        gpa.free(r.label);
+        gpa.free(r.by);
+        gpa.free(r.conv);
+    }
+
+    /// `[{"label","by","conv","started","helpers"}, …]`, oldest first.
+    fn deskRunsJson(c: *Core, a: std.mem.Allocator, out: *std.ArrayList(u8)) !usize {
+        c.desk_mutex.lockUncancelable(c.io);
+        defer c.desk_mutex.unlock(c.io);
+        try out.append(a, '[');
+        for (c.desk_runs.items, 0..) |r, i| {
+            if (i > 0) try out.append(a, ',');
+            try out.appendSlice(a, "{\"label\":");
+            try util.jsonString(out, a, r.label);
+            try out.appendSlice(a, ",\"by\":");
+            try util.jsonString(out, a, r.by);
+            try out.appendSlice(a, ",\"conv\":");
+            try util.jsonString(out, a, r.conv);
+            try out.print(a, ",\"started\":{d},\"helpers\":{d}}}", .{ r.started, r.helpers });
+        }
+        try out.append(a, ']');
+        return c.desk_runs.items.len;
+    }
+
+    fn deskPushRuns(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var out: std.ArrayList(u8) = .empty;
+        out.appendSlice(a, "\"runs\":") catch return;
+        _ = c.deskRunsJson(a, &out) catch return;
+        c.desk_feed.push("runs", out.items);
+    }
+
+    fn deskFree(c: *Core) void {
+        for (c.desk_runs.items) |r| freeDeskRun(c.gpa, r);
+        c.desk_runs.deinit(c.gpa);
+        for (c.desk_seen.items) |x| c.gpa.free(x.name);
+        c.desk_seen.deinit(c.gpa);
+        c.desk_history.deinit();
+        c.desk_feed.deinit();
+    }
+
+    fn deskSeenPath(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(a, &.{ c.paths.state, "desk-seen" });
+    }
+
+    /// state/desk-seen: a line `{"conv":NAME,"seen":SECONDS}` each.
+    fn deskLoadSeen(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const text = Io.Dir.cwd().readFileAlloc(c.io, c.deskSeenPath(a) catch return, a, .limited(1 << 20)) catch return;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            const v = jv.parse(a, line) orelse continue;
+            const name = jv.str(jv.get(v, "conv")) orelse continue;
+            const at = jv.int(jv.get(v, "seen")) orelse continue;
+            c.deskSetSeen(name, at) catch {};
+        }
+    }
+
+    fn deskSetSeen(c: *Core, name: []const u8, at: i64) !void {
+        c.desk_mutex.lockUncancelable(c.io);
+        defer c.desk_mutex.unlock(c.io);
+        for (c.desk_seen.items) |*x| if (std.mem.eql(u8, x.name, name)) {
+            x.at = at;
+            return;
+        };
+        try c.desk_seen.append(c.gpa, .{ .name = try c.gpa.dupe(u8, name), .at = at });
+    }
+
+    fn deskSeenOf(c: *Core, name: []const u8) i64 {
+        c.desk_mutex.lockUncancelable(c.io);
+        defer c.desk_mutex.unlock(c.io);
+        for (c.desk_seen.items) |x| if (std.mem.eql(u8, x.name, name)) return x.at;
+        return 0;
+    }
+
+    fn deskSaveSeen(c: *Core, a: std.mem.Allocator) !void {
+        var out: std.ArrayList(u8) = .empty;
+        {
+            c.desk_mutex.lockUncancelable(c.io);
+            defer c.desk_mutex.unlock(c.io);
+            for (c.desk_seen.items) |x| {
+                try out.appendSlice(a, "{\"conv\":");
+                try util.jsonString(&out, a, x.name);
+                try out.print(a, ",\"seen\":{d}}}\n", .{x.at});
+            }
+        }
+        try util.writeReplace(c.io, try c.deskSeenPath(a), out.items);
+    }
+
+    /// At start: the history of conversations that aren't private, from
+    /// the log's last 4 MB (the owner's turns, and the posts that got
+    /// through). A private conversation's words are never in the log.
+    fn deskFill(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var f = Io.Dir.cwd().openFile(c.io, c.paths.log, .{}) catch return;
+        defer f.close(c.io);
+        const len = f.length(c.io) catch return;
+        const want: u64 = @min(len, 4 << 20);
+        const buf = a.alloc(u8, @intCast(want)) catch return;
+        const got = f.readPositionalAll(c.io, buf, len - want) catch return;
+        var text = buf[0..got];
+        // from the first whole line
+        if (len > want) text = text[(std.mem.indexOfScalar(u8, text, '\n') orelse return) + 1 ..];
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            const is_turn = std.mem.indexOf(u8, line, "\"kind\":\"turn\"") != null;
+            const is_send = std.mem.indexOf(u8, line, "\"kind\":\"send\"") != null;
+            if (!is_turn and !is_send) continue;
+            const v = jv.parse(a, line) orelse continue;
+            const when = util.parseIso(jv.str(jv.get(v, "time")) orelse "") orelse continue;
+            if (is_turn) {
+                const by = jv.str(jv.get(v, "by")) orelse continue;
+                if (!std.mem.eql(u8, by, "owner")) continue;
+                const conv = jv.str(jv.get(v, "conversation")) orelse continue;
+                const words = jv.str(jv.get(v, "text")) orelse continue;
+                if (c.convPrivate(conv) or !c.deskShows(conv)) continue;
+                _ = c.desk_history.add(conv, .{ .from = .you, .text = words, .at = when }) catch {};
+            } else {
+                const ev = jv.str(jv.get(v, "event")) orelse continue;
+                if (!std.mem.eql(u8, ev, "sent")) continue;
+                const to = jv.str(jv.get(v, "to")) orelse continue;
+                const words = jv.str(jv.get(v, "text")) orelse continue;
+                if (c.convPrivate(to) or !c.deskShows(to)) continue;
+                _ = c.desk_history.add(to, .{ .from = .harness, .text = words, .at = when }) catch {};
+            }
+        }
+    }
+
+    /// Quiet hours now, and as config.ini or /quiet set them.
+    fn deskQuiet(c: *Core) struct { now: bool, hours: ?config.Quiet } {
+        const hours = c.quiet.effective(c.cfg.butler.quiet);
+        const inside = if (hours) |h| h.inside(quiet_mod.minuteOf(c.now(), c.cfg.chat.utc_offset)) else false;
+        return .{ .now = inside, .hours = hours };
+    }
+
+    /// From the tick: quiet hours starting or ending is news for the desk.
+    fn deskTick(c: *Core) void {
+        const q = c.deskQuiet().now;
+        if (q != c.desk_quiet) {
+            c.desk_quiet = q;
+            c.desk_feed.push("facts", "");
+        }
+    }
+
+    fn deskErr(a: std.mem.Allocator, status: std.http.Status, why: []const u8) appserver.Answer {
+        return appErr(a, status, why);
+    }
+
+    /// The desk's API (`/desk/api/...`, a session's): `GET state`,
+    /// `GET history?conv=`, `GET events?after=&wait=`, `POST send`,
+    /// `POST answer`, `POST seen`, `POST settings`, `POST voice?conv=`,
+    /// `POST upload?avatar=&part=&consent=`, `POST speech`.
+    fn deskApi(ctx: *anyopaque, a: std.mem.Allocator, call: appserver.DeskCall) appserver.Answer {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        return c.deskApiIn(a, call) catch |e| deskErr(a, .internal_server_error, @errorName(e));
+    }
+
+    fn deskApiIn(c: *Core, a: std.mem.Allocator, call: appserver.DeskCall) !appserver.Answer {
+        const eql = std.mem.eql;
+        const get = call.method == .GET or call.method == .HEAD;
+        const post = call.method == .POST;
+        if (get and eql(u8, call.path, "state")) return .{ .body = try c.deskState(a) };
+        if (get and eql(u8, call.path, "history")) return c.deskHistoryOf(a, queryGet(call.query, "conv") orelse "main");
+        if (get and eql(u8, call.path, "events")) {
+            const after: u64 = queryInt(call.query, "after") orelse 0;
+            const wait: u32 = @intCast(@min(queryInt(call.query, "wait") orelse 25, 25));
+            const got = try c.desk_feed.since(a, after, wait * 1000, call.stop);
+            return .{ .body = try deskwin.sinceJson(a, got) };
+        }
+        if (post and eql(u8, call.path, "send")) return c.deskSend(a, call.body);
+        if (post and eql(u8, call.path, "answer")) return appShellApi(c, a, .{ .method = .POST, .path = "answer", .query = "", .body = call.body });
+        if (post and eql(u8, call.path, "seen")) {
+            const v = jv.parse(a, call.body) orelse return deskErr(a, .bad_request, "{\"conv\":NAME}");
+            const conv = jv.str(jv.get(v, "conv")) orelse return deskErr(a, .bad_request, "{\"conv\":NAME}");
+            if (!conversations.validName(conv) and !eql(u8, conv, "main")) return deskErr(a, .bad_request, "no such conversation");
+            try c.deskSetSeen(conv, c.now());
+            c.deskSaveSeen(a) catch |e| c.log.write(.chat, false, .{ .event = "desk seen not written", .why = @errorName(e) }) catch {};
+            c.desk_feed.push("topics", "");
+            return .{ .body = "{\"ok\":true}" };
+        }
+        return deskErr(a, .not_found, "the desk has state, history, events, send, answer, seen, settings, voice, upload and speech");
+    }
+
+    /// A conversation the desk may write in: main, or one only the owner
+    /// reads that harness knows.
+    fn deskConv(c: *Core, conv: []const u8) bool {
+        if (std.mem.eql(u8, conv, "main") or std.mem.eql(u8, conv, "terminal")) return true;
+        c.convs.mutex.lockUncancelable(c.io);
+        defer c.convs.mutex.unlock(c.io);
+        const e = c.convs.find(conv) orelse return false;
+        return e.audience == .own;
+    }
+
+    /// `POST send {"conv","text"}`: the owner's turn there, as typed in
+    /// Telegram; Telegram gets a quiet echo first ([desk] echo).
+    fn deskSend(c: *Core, a: std.mem.Allocator, body: []const u8) !appserver.Answer {
+        const v = jv.parse(a, body) orelse return deskErr(a, .bad_request, "{\"conv\":NAME,\"text\":TEXT}");
+        const conv = jv.str(jv.get(v, "conv")) orelse "main";
+        const text = std.mem.trim(u8, jv.str(jv.get(v, "text")) orelse "", " \t\r\n");
+        if (text.len == 0) return deskErr(a, .bad_request, "an empty message");
+        if (text.len > 64 * 1024) return deskErr(a, .bad_request, "a message is at most 64 KB");
+        if (!c.deskConv(conv)) return deskErr(a, .not_found, "no such conversation");
+        if (c.cfg.desk.echo) c.deskEcho(a, conv, text);
+        c.deskOwner(conv, text, "desk");
+        try c.textIn(conv, text);
+        return .{ .body = "{\"ok\":true}" };
+    }
+
+    /// "You, on the desk: …", quietly, in `conv`, past the desk's own
+    /// history (the desk shows the words themselves).
+    fn deskEcho(c: *Core, a: std.mem.Allocator, conv: []const u8, text: []const u8) void {
+        if (c.chan == null) return;
+        const inner = c.desk_tee.inner;
+        const one = std.mem.trim(u8, text, " \t\r\n");
+        const cut = util.cut(one, 200);
+        const line = std.fmt.allocPrint(a, "You, on the desk: {s}{s}", .{ cut, if (cut.len < one.len) "…" else "" }) catch return;
+        const r = c.placeOf(a, conv) catch return;
+        var place = r.place;
+        place.quiet = true;
+        const msg = if (r.prefix) |pfx| std.fmt.allocPrint(a, "[{s}] {s}", .{ pfx, line }) catch line else line;
+        _ = inner.send(inner.ctx, place, msg) catch |e| {
+            c.log.write(.chat, false, .{ .event = "desk echo not sent", .why = whyUndelivered(e) }) catch {};
+        };
+    }
+
+    /// `GET history?conv=NAME`: its last 50 messages, and for a private
+    /// one that earlier ones aren't kept.
+    fn deskHistoryOf(c: *Core, a: std.mem.Allocator, conv: []const u8) !appserver.Answer {
+        const private = c.convPrivate(conv);
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, "{\"conv\":");
+        try util.jsonString(&out, a, conv);
+        try out.print(a, ",\"private\":{s}", .{if (private) "true" else "false"});
+        if (private) try out.appendSlice(a, ",\"note\":\"Earlier messages aren't kept for private conversations.\"");
+        try out.appendSlice(a, ",\"messages\":[");
+        if (c.deskShows(conv)) for (try c.desk_history.list(a, conv), 0..) |m, i| {
+            if (i > 0) try out.append(a, ',');
+            try deskwin.msgJson(&out, a, m);
+        };
+        try out.appendSlice(a, "]}");
+        return .{ .body = out.items };
+    }
+
+    /// When harness last posted in `conv` (its history, its card's Lately).
+    fn deskNewsAt(c: *Core, a: std.mem.Allocator, conv: []const u8, lately: []const conversations.Entry.Late) i64 {
+        var at: i64 = 0;
+        const msgs = c.desk_history.list(a, conv) catch &.{};
+        for (msgs) |m| if (m.from == .harness) {
+            at = @max(at, m.at);
+        };
+        for (lately) |l| at = @max(at, l.at);
+        return at;
+    }
+
+    /// `GET state`: what the desk draws, from harness's own facts.
+    fn deskState(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        const seq = c.desk_feed.last();
+        try out.print(a, "{{\"seq\":{d},\"version\":\"{s}\"", .{ seq, @import("build_options").version });
+        // items: urgent first, then newest
+        var urgent_n: usize = 0;
+        var open_n: usize = 0;
+        var items: std.ArrayList(u8) = .empty;
+        {
+            c.inbox.mutex.lockUncancelable(c.io);
+            defer c.inbox.mutex.unlock(c.io);
+            var open_items: std.ArrayList(*inbox_mod.Item) = .empty;
+            for (c.inbox.items.items) |it| if (it.status == .open) try open_items.append(a, it);
+            std.mem.sort(*inbox_mod.Item, open_items.items, {}, struct {
+                fn lt(_: void, x: *inbox_mod.Item, y: *inbox_mod.Item) bool {
+                    if (x.urgent != y.urgent) return x.urgent;
+                    if (x.created != y.created) return x.created > y.created;
+                    return x.id > y.id;
+                }
+            }.lt);
+            for (open_items.items, 0..) |it, i| {
+                if (i > 0) try items.append(a, ',');
+                try inbox_mod.render(&items, a, it, false);
+                if (it.urgent) urgent_n += 1;
+            }
+            open_n = open_items.items.len;
+        }
+        try out.appendSlice(a, ",\"items\":[");
+        try out.appendSlice(a, c.masks.scrubAlloc(a, items.items) catch items.items);
+        try out.append(a, ']');
+        const alerts_n = c.alerts.openCount();
+        try out.print(a, ",\"alerts\":{d},\"runs\":", .{alerts_n});
+        const runs_n = try c.deskRunsJson(a, &out);
+        const q = c.deskQuiet();
+        var qb: [16]u8 = undefined;
+        try out.print(a, ",\"quiet\":{{\"now\":{s},\"hours\":\"{s}\"}}", .{ if (q.now) "true" else "false", if (q.hours) |h| config.formatQuiet(&qb, h) else "" });
+        const st = deskwin.stateOf(.{ .urgent_items = urgent_n, .alerts = alerts_n, .open_items = open_n, .runs = runs_n, .quiet = q.now });
+        try out.print(a, ",\"state\":\"{s}\"", .{@tagName(st)});
+        // the conversations: main first, then the topics; a topic with a
+        // card says what waits or comes next; a dot for news since the
+        // owner last opened it here
+        const cards = Topics.carded(c, a) catch &.{};
+        const Conv = struct { name: []const u8, title: []const u8, topic: bool, private: bool };
+        var convs: std.ArrayList(Conv) = .empty;
+        {
+            c.convs.mutex.lockUncancelable(c.io);
+            defer c.convs.mutex.unlock(c.io);
+            for (c.convs.items.items) |e| {
+                if (e.audience != .own) continue;
+                const conv: Conv = .{ .name = try a.dupe(u8, e.name), .title = try a.dupe(u8, if (std.mem.eql(u8, e.name, "main")) "Main" else if (e.title.len > 0) e.title else e.name), .topic = e.thread != 0, .private = e.isPrivate() };
+                if (std.mem.eql(u8, e.name, "main")) try convs.insert(a, 0, conv) else try convs.append(a, conv);
+            }
+            if (convs.items.len == 0 or !std.mem.eql(u8, convs.items[0].name, "main")) try convs.insert(a, 0, .{ .name = "main", .title = "Main", .topic = false, .private = false });
+        }
+        try out.appendSlice(a, ",\"conversations\":[");
+        var next: []const u8 = "";
+        for (convs.items, 0..) |cv, i| {
+            if (i > 0) try out.append(a, ',');
+            var line: []const u8 = "";
+            var lately: []const conversations.Entry.Late = &.{};
+            for (cards) |x| if (std.mem.eql(u8, x.name, cv.name)) {
+                lately = x.lately;
+                const f = Topics.facts(c, a, x.name, x.subject, x.title, x.lately) catch break;
+                line = card_mod.overviewLine(a, f) catch "";
+                if (next.len == 0 and f.next.len > 0) next = card_mod.item(a, f.next[0]) catch "";
+            };
+            const news = c.deskNewsAt(a, cv.name, lately) > c.deskSeenOf(cv.name);
+            try out.appendSlice(a, "{\"name\":");
+            try util.jsonString(&out, a, cv.name);
+            try out.appendSlice(a, ",\"title\":");
+            try util.jsonString(&out, a, cv.title);
+            try out.print(a, ",\"topic\":{s},\"private\":{s},\"news\":{s},\"line\":", .{ if (cv.topic) "true" else "false", if (cv.private) "true" else "false", if (news) "true" else "false" });
+            try util.jsonString(&out, a, c.masks.scrubAlloc(a, line) catch line);
+            try out.append(a, '}');
+        }
+        try out.append(a, ']');
+        // Lately: the cards' own lines, newest first
+        const Late = struct { at: i64, text: []const u8, conv: []const u8 };
+        var late: std.ArrayList(Late) = .empty;
+        for (cards) |x| for (x.lately) |l| try late.append(a, .{ .at = l.at, .text = l.buf[0..l.len], .conv = x.name });
+        std.mem.sort(Late, late.items, {}, struct {
+            fn lt(_: void, x: Late, y: Late) bool {
+                return x.at > y.at;
+            }
+        }.lt);
+        try out.appendSlice(a, ",\"lately\":[");
+        for (late.items[0..@min(late.items.len, 12)], 0..) |l, i| {
+            if (i > 0) try out.append(a, ',');
+            try out.print(a, "{{\"at\":{d},\"text\":", .{l.at});
+            try util.jsonString(&out, a, c.masks.scrubAlloc(a, l.text) catch l.text);
+            try out.appendSlice(a, ",\"conv\":");
+            try util.jsonString(&out, a, l.conv);
+            try out.append(a, '}');
+        }
+        try out.appendSlice(a, "],\"next\":");
+        try util.jsonString(&out, a, c.masks.scrubAlloc(a, next) catch next);
+        try out.print(a, ",\"utc_offset\":{d}", .{c.cfg.chat.utc_offset});
+        try out.appendSlice(a, ",\"settings\":");
+        try c.deskSettingsJson(a, &out);
+        try out.append(a, '}');
+        return out.items;
+    }
+
+    /// The desk's settings and their choices.
+    fn deskSettingsJson(c: *Core, a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        const d = c.cfg.desk;
+        try out.appendSlice(a, "{\"avatar\":");
+        try util.jsonString(out, a, d.avatar);
+        try out.appendSlice(a, ",\"avatars\":[");
+        var n: usize = 0;
+        for (try c.deskAvatars(a)) |name| {
+            if (n > 0) try out.append(a, ',');
+            n += 1;
+            try util.jsonString(out, a, name);
+        }
+        try out.appendSlice(a, "],\"speak\":");
+        try util.jsonString(out, a, d.speak);
+        try out.appendSlice(a, ",\"speak_choices\":[\"off\"");
+        // WebKitGTK has no speech synthesis
+        if (builtin.os.tag != .linux) try out.appendSlice(a, ",\"browser\"");
+        for (c.deskSpeakers(a)) |p| {
+            try out.append(a, ',');
+            try util.jsonString(out, a, p);
+        }
+        try out.print(a, "],\"echo\":{s},\"voice\":{s}}}", .{ if (d.echo) "true" else "false", if (c.cfg.voice.provider.len > 0) "true" else "false" });
+    }
+
+    /// The avatars there are: `avatars/`'s folders, butler first.
+    fn deskAvatars(c: *Core, a: std.mem.Allocator) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        try out.append(a, "butler");
+        const dir = try std.fs.path.join(a, &.{ c.paths.home, "avatars" });
+        var d = Io.Dir.cwd().openDir(c.io, dir, .{ .iterate = true }) catch return out.items;
+        defer d.close(c.io);
+        var it = d.iterate();
+        while (it.next(c.io) catch null) |e| {
+            if (e.kind != .directory or !config.avatarName(e.name) or std.mem.eql(u8, e.name, "butler")) continue;
+            try out.append(a, try a.dupe(u8, e.name));
+        }
+        std.mem.sort([]const u8, out.items[1..], {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        return out.items;
+    }
+
+    /// Providers whose speech the desk can fetch: openai's preset and the
+    /// `[provider NAME]` sections whose api is openai.
+    fn deskSpeakers(c: *Core, a: std.mem.Allocator) []const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        out.append(a, "openai") catch return out.items;
+        for (c.cfg.providers) |p| if (p.api) |api| if (api == .openai and !std.mem.eql(u8, p.name, "openai")) out.append(a, p.name) catch {};
+        return out.items;
+    }
+
     // ---- the agent's app tools ----
 
     fn appDesk(c: *Core) agent.AppDesk {
@@ -16532,6 +17221,19 @@ const Recorder = struct {
             n += 1;
         };
         return n;
+    }
+
+    /// The last line with `needle` (a copy in the testing allocator's
+    /// arena is not needed: lines live as long as the recorder).
+    fn lastWith(r: *Recorder, needle: []const u8) ?[]const u8 {
+        r.mutex.lockUncancelable(t.io);
+        defer r.mutex.unlock(t.io);
+        var i = r.lines.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.indexOf(u8, r.lines.items[i], needle) != null) return r.lines.items[i];
+        }
+        return null;
     }
 };
 
@@ -24905,6 +25607,24 @@ fn appCall(f: *Fix, name: []const u8, method: std.http.Method, path: []const u8,
 /// One call of the bar's.
 fn barCall(f: *Fix, method: std.http.Method, path: []const u8, body: []const u8) appserver.Answer {
     return Core.appShellApi(f.core, f.e.arena.allocator(), .{ .method = method, .path = path, .query = "", .body = body });
+}
+
+/// One call of the desk's API, as the app server hands it over.
+fn deskCall(f: *Fix, method: std.http.Method, path: []const u8, query: []const u8, body: []const u8) appserver.Answer {
+    return Core.deskApi(f.core, f.e.arena.allocator(), .{ .method = method, .path = path, .query = query, .body = body, .stop = &app_never_stops });
+}
+
+/// `GET state` until it has `needle` (5 s).
+fn waitDesk(f: *Fix, path: []const u8, query: []const u8, needle: []const u8) ![]const u8 {
+    var i: u32 = 0;
+    var last: []const u8 = "";
+    while (i < 250) : (i += 1) {
+        last = deskCall(f, .GET, path, query, "").body;
+        if (std.mem.indexOf(u8, last, needle) != null) return last;
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    std.debug.print("desk {s}?{s} never had {s}:\n{s}\n", .{ path, query, needle, last });
+    return error.TestTimedOut;
 }
 
 /// Installs an app as the owner's: `ini` and `files` (name, content).
@@ -35100,3 +35820,224 @@ test "an_adopted_topic_keeps_its_focus" {
     try t.expectEqual(5007, e.thread);
     try t.expectEqualStrings("My own trips.", e.focus);
 }
+
+// ---- the desk ----
+
+test "a_desk_turn_goes_to_its_conversation_with_telegrams_echo" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try addTopic(&f, "house-search", 5012);
+    try f.e.script(1, model.textReply("Three flats match."));
+    try f.core.startWorker();
+    const got = deskCall(&f, .POST, "send", "", "{\"conv\":\"house-search\",\"text\":\"Find me a two-bedroom near Kazimierz\"}");
+    try t.expectEqual(std.http.Status.ok, got.status);
+    try f.rec.waitFor("Three flats match.");
+    try t.expectEqualStrings("house-search", f.rec.whereOf("Three flats match.").?.name);
+    // Telegram's quiet echo, in that conversation
+    const echo = "You, on the desk: Find me a two-bedroom near Kazimierz";
+    try f.rec.waitFor(echo);
+    try t.expectEqualStrings("house-search", f.rec.whereOf(echo).?.name);
+    try t.expect(f.rec.quietOf(echo).?);
+    // the model got the owner's words, not the echo
+    try expectHas(try f.e.request(1), "Find me a two-bedroom near Kazimierz");
+    // the desk's history: the owner's words and the reply, never the echo
+    const h = try waitDesk(&f, "history", "conv=house-search", "Three flats match.");
+    try expectHas(h, "\"from\":\"you\",\"text\":\"Find me a two-bedroom near Kazimierz\"");
+    try expectHas(h, "\"via\":\"desk\"");
+    try expectHas(h, "\"from\":\"harness\",\"text\":\"Three flats match.\"");
+    try t.expect(std.mem.indexOf(u8, h, "You, on the desk") == null);
+    // a long message's echo is cut
+    try f.e.script(2, model.textReply("ok long"));
+    const many_a: [300]u8 = @splat('a');
+    const long_text = try std.fmt.allocPrint(a, "{{\"conv\":\"main\",\"text\":\"{s}\"}}", .{&many_a});
+    _ = deskCall(&f, .POST, "send", "", long_text);
+    try f.rec.waitFor("ok long");
+    try f.rec.waitFor("You, on the desk: aaaa");
+    try expectHas(f.rec.lastWith("You, on the desk:").?, "a…");
+    // [desk] echo = off: none
+    const p = f.core.paths;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.config, .data = try std.fmt.allocPrint(a, "{s}\n[desk]\necho = off\n", .{f.core.readOr(a, p.config)}) });
+    try expectHas(try f.core.reload(), "Settings reloaded.");
+    try f.e.script(3, model.textReply("ok two"));
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"second\"}");
+    try f.rec.waitFor("ok two");
+    try t.expectEqual(0, f.rec.count("You, on the desk: second"));
+    // nowhere, nothing, and a shared conversation: refused
+    try t.expectEqual(std.http.Status.not_found, deskCall(&f, .POST, "send", "", "{\"conv\":\"nowhere\",\"text\":\"x\"}").status);
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"  \"}").status);
+    {
+        f.core.convs.mutex.lockUncancelable(t.io);
+        defer f.core.convs.mutex.unlock(t.io);
+        _ = try f.core.convs.add(.{ .name = "family", .chat = -100123, .audience = .shared });
+    }
+    try t.expectEqual(std.http.Status.not_found, deskCall(&f, .POST, "send", "", "{\"conv\":\"family\",\"text\":\"x\"}").status);
+}
+
+test "a_desk_press_answers_the_item_via_the_bar" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const id = try f.core.addItem(.{ .kind = "question", .by = "owner", .conversation = "main", .waiter = "harness", .title = "Order milk?", .body = "Order milk?", .choices = &.{ .{ .key = "yes", .label = "Yes" }, .{ .key = "no", .label = "No" } } });
+    const st = deskCall(&f, .GET, "state", "", "");
+    try expectHas(st.body, "\"title\":\"Order milk?\"");
+    try expectHas(st.body, "{\"key\":\"yes\",\"label\":\"Yes\"}");
+    const body = try std.fmt.allocPrint(f.e.arena.allocator(), "{{\"id\":{d},\"key\":\"yes\"}}", .{id});
+    try t.expectEqualStrings("{\"took\":\"taken\",\"said\":\"\"}", deskCall(&f, .POST, "answer", "", body).body);
+    try expectHas(deskCall(&f, .POST, "answer", "", body).body, "\"took\":\"closed\"");
+    try expectHas(try inboxFile(&f), "\"via\":\"bar\"");
+    try expectHas(deskCall(&f, .POST, "answer", "", "{\"id\":999,\"key\":\"yes\"}").body, "\"took\":\"unknown\"");
+}
+
+test "the_desk_long_poll_carries_messages_items_and_runs" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const start = f.core.desk_feed.last();
+    try f.e.script(1, model.textReply("All done."));
+    try f.core.startWorker();
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"do it\"}");
+    try f.rec.waitFor("All done.");
+    _ = try waitDesk(&f, "events", try std.fmt.allocPrint(a, "after={d}&wait=0", .{start}), "\"moment\":\"smile\"");
+    _ = try f.core.addItem(.{ .kind = "question", .by = "owner", .conversation = "main", .waiter = "harness", .title = "Order milk?", .body = "Order milk?", .choices = &.{.{ .key = "yes", .label = "Yes" }} });
+    const ev = deskCall(&f, .GET, "events", try std.fmt.allocPrint(a, "after={d}&wait=0", .{start}), "").body;
+    try expectHas(ev, "\"type\":\"message\",\"conv\":\"main\",\"msg\":{\"id\":");
+    try expectHas(ev, "\"from\":\"you\",\"text\":\"do it\"");
+    try expectHas(ev, "\"from\":\"harness\",\"text\":\"All done.\"");
+    try expectHas(ev, "\"type\":\"runs\",\"runs\":[{\"label\":\"do it\",\"by\":\"owner\",\"conv\":\"main\"");
+    try expectHas(ev, "\"type\":\"runs\",\"runs\":[]");
+    try expectHas(ev, "\"type\":\"items\"");
+    // the item's message carries its id
+    try expectHas(ev, "\"item\":1");
+    // the long-poll waits for the next event, and is answered by it
+    const seq = jv.int(jv.get(jv.parse(a, ev), "seq")).?;
+    const later = try std.Thread.spawn(.{}, struct {
+        fn go(c: *Core) void {
+            c.io.sleep(.fromMilliseconds(200), .awake) catch {};
+            c.say("A later line.");
+        }
+    }.go, .{f.core});
+    const waited = deskCall(&f, .GET, "events", try std.fmt.allocPrint(a, "after={d}&wait=10", .{seq}), "").body;
+    later.join();
+    try expectHas(waited, "A later line.");
+    // a cursor from an earlier start: reset
+    try expectHas(deskCall(&f, .GET, "events", "after=999999&wait=0", "").body, "\"reset\":true");
+}
+
+test "the_run_view_has_label_helpers_and_start" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.fixed_now = 1795356180;
+    try f.e.script(1, model.toolReply("tu_1", "delegate", "{\"tasks\":[{\"task\":\"one\",\"tools\":[\"shell\"]},{\"task\":\"two\",\"tools\":[\"shell\"]}]}"));
+    try f.e.script(2, model.toolReply("w1", "shell", "{\"command\":\"echo from-a-helper\"}"));
+    try f.e.script(3, model.toolReply("w2", "shell", "{\"command\":\"echo from-a-helper\"}"));
+    try f.e.script(4, model.textReply("helper done"));
+    try f.e.script(5, model.textReply("helper done"));
+    try f.e.script(6, model.textReply("Both answered."));
+    try f.core.startWorker();
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"Find me a two-bedroom near Kazimierz\\nunder 4000\"}");
+    try f.rec.waitFor("BUTTONS Allow this? [1]");
+    try f.rec.waitFor("BUTTONS Allow this? [2]");
+    // while both helpers wait: the owner's first line, 2 helpers, when it started
+    const st = try waitDesk(&f, "state", "", "\"helpers\":2");
+    try expectHas(st, "\"runs\":[{\"label\":\"Find me a two-bedroom near Kazimierz\",\"by\":\"owner\",\"conv\":\"main\",\"started\":1795356180,\"helpers\":2}]");
+    try expectHas(st, "\"state\":\"needs\"");
+    const first = f.rec.buttonsWith("Allow this? [1]").?;
+    const second = f.rec.buttonsWith("Allow this? [2]").?;
+    f.core.handleCallback(42, second.msg, second.get("deny").?);
+    f.core.handleCallback(42, first.msg, first.get("once").?);
+    try f.rec.waitFor("Both answered.");
+    const after = try waitDesk(&f, "state", "", "\"runs\":[]");
+    try expectHas(after, "\"state\":\"resting\"");
+}
+
+test "private_desk_history_stays_in_memory" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try addTopic(&f, "diary", 5014);
+    try f.core.handleTextIn("diary", "/private on");
+    try f.e.script(1, model.textReply("a private reply"));
+    try f.e.script(2, model.textReply("a public reply"));
+    try f.core.startWorker();
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"diary\",\"text\":\"my private thoughts xyzzy\"}");
+    try f.rec.waitFor("a private reply");
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"public words\"}");
+    try f.rec.waitFor("a public reply");
+    // while harness runs, the desk shows it, saying earlier ones aren't kept
+    const h = try waitDesk(&f, "history", "conv=diary", "a private reply");
+    try expectHas(h, "my private thoughts xyzzy");
+    try expectHas(h, "\"private\":true,\"note\":\"Earlier messages aren't kept for private conversations.\"");
+    // no file of the data folder holds its words
+    const a = f.e.arena.allocator();
+    var d = try Io.Dir.cwd().openDir(t.io, f.home, .{ .iterate = true });
+    defer d.close(t.io);
+    var w = try d.walk(a);
+    defer w.deinit();
+    while (try w.next(t.io)) |e| if (e.kind == .file) {
+        const text = d.readFileAlloc(t.io, e.path, a, .limited(64 << 20)) catch continue;
+        if (std.mem.indexOf(u8, text, "xyzzy") != null or std.mem.indexOf(u8, text, "a private reply") != null) {
+            std.debug.print("{s} holds the private words\n", .{e.path});
+            return error.TestUnexpectedResult;
+        }
+    };
+    // after a restart: the private one empty, main filled from the log
+    try restart(&f);
+    const again = deskCall(&f, .GET, "history", "conv=diary", "").body;
+    try expectHas(again, "\"messages\":[]");
+    try expectHas(again, "Earlier messages aren't kept for private conversations.");
+    const main = deskCall(&f, .GET, "history", "conv=main", "").body;
+    try expectHas(main, "\"from\":\"you\",\"text\":\"public words\"");
+    try expectHas(main, "\"from\":\"harness\",\"text\":\"a public reply\"");
+    try t.expect(std.mem.indexOf(u8, main, "\"private\":false") != null);
+}
+
+test "topics_have_news_dots_until_seen" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    f.core.fixed_now = 1795356180;
+    try addTopic(&f, "house-search", 5012);
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "{\"name\":\"house-search\",\"title\":\"house-search\",\"topic\":true,\"private\":false,\"news\":false");
+    f.core.sayIn("house-search", "Two new flats.");
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "{\"name\":\"house-search\",\"title\":\"house-search\",\"topic\":true,\"private\":false,\"news\":true");
+    f.core.fixed_now = 1795356180 + 5;
+    try t.expectEqual(std.http.Status.ok, deskCall(&f, .POST, "seen", "", "{\"conv\":\"house-search\"}").status);
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"name\":\"house-search\",\"title\":\"house-search\",\"topic\":true,\"private\":false,\"news\":false");
+    // kept across a restart
+    try restart(&f);
+    f.core.fixed_now = 1795356180 + 10;
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"name\":\"house-search\",\"title\":\"house-search\",\"topic\":true,\"private\":false,\"news\":false");
+    f.core.sayIn("house-search", "One more.");
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"name\":\"house-search\",\"title\":\"house-search\",\"topic\":true,\"private\":false,\"news\":true");
+    // main comes first, named Main
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"conversations\":[{\"name\":\"main\",\"title\":\"Main\"");
+}
+
+test "the_state_follows_harness_facts" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nquiet = 22:00-07:00\n[chat]\nutc_offset = +01:00\n", "", "");
+    defer f.deinit();
+    const day0 = quietDay();
+    f.core.fixed_now = day0 + 12 * 3600;
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"state\":\"resting\"");
+    f.core.fixed_now = day0 + 2 * 3600;
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"state\":\"quiet\"");
+    // a run going
+    const id = Core.deskBegin(f.core, "owner", "main", "look");
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"state\":\"working\"");
+    // an item open
+    _ = try f.core.addItem(.{ .kind = "question", .by = "owner", .conversation = "main", .waiter = "harness", .title = "Order milk?", .body = "Order milk?", .choices = &.{.{ .key = "yes", .label = "Yes" }} });
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"state\":\"needs\"");
+    // an urgent one: first in Needs you
+    _ = try f.core.addItem(.{ .kind = "question", .by = "owner", .conversation = "main", .waiter = "harness", .title = "Close the water main?", .body = "Close the water main?", .choices = &.{.{ .key = "yes", .label = "Yes" }}, .urgent = true });
+    const st = deskCall(&f, .GET, "state", "", "").body;
+    try expectHas(st, "\"state\":\"urgent\"");
+    try expectHas(st, "\"items\":[{\"v\":1,\"id\":2,");
+    try expectHas(st, "\"quiet\":{\"now\":true,\"hours\":\"22:00-07:00\"}");
+    Core.deskEnd(f.core, id, .replied);
+}
+
