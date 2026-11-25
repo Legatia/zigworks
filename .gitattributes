@@ -3,3 +3,6 @@
 harness/examples/** text eol=lf
 *.wf text eol=lf
 *.sh text eol=lf
+
+# A Windows command file keeps Windows line ends
+*.cmd text eol=crlf

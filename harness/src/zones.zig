@@ -400,3 +400,26 @@ test "the_computers_zone_reads_where_there_are_zone_files" {
     try t.expectEqual(offsetAt(t.io, arena.allocator(), &.{}, "", 1_780_000_000), got);
     if (got) |o| try t.expect(o >= -14 * 60 and o <= 14 * 60);
 }
+
+test "on_windows_the_computers_zone_is_what_its_clocks_say" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const k = struct {
+        extern "kernel32" fn GetSystemTime(out: *win.SystemTime) callconv(.winapi) void;
+        extern "kernel32" fn GetLocalTime(out: *win.SystemTime) callconv(.winapi) void;
+    };
+    // the local clock less the UTC clock, read within one minute
+    var utc: win.SystemTime = undefined;
+    var local: win.SystemTime = undefined;
+    var again: win.SystemTime = undefined;
+    var tries: u8 = 0;
+    while (true) : (tries += 1) {
+        k.GetSystemTime(&utc);
+        k.GetLocalTime(&local);
+        k.GetSystemTime(&again);
+        if (utc.minute == again.minute or tries == 5) break;
+    }
+    var want: i32 = (@as(i32, local.hour) * 60 + local.minute) - (@as(i32, utc.hour) * 60 + utc.minute);
+    if (want > 14 * 60) want -= 24 * 60;
+    if (want < -14 * 60) want += 24 * 60;
+    try t.expectEqual(@as(?i32, want), localNow(t.io, t.allocator, 0));
+}

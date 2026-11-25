@@ -760,3 +760,206 @@ Needed before the apps themselves, each the owner's to approve:
 - Linux, in the `zigworks` distro by apt: libgtk-3-dev and
   libwebkit2gtk-4.1-dev, and xvfb for the smoke: 186 packages, about
   103 MiB, by the lists of 2026-11-19 (an `apt-get update` first).
+
+## 12. The desk's Windows and Linux apps (2026-11-25, branch `win/sandbox-default`)
+
+The owner approved the two downloads ("Push and download"): the NuGet
+package Microsoft.Web.WebView2 1.0.4370.26 (9.4 MiB; its SHA-512 matched
+NuGet's catalog; unpacked to `D:\tools\webview2-dl`), and in the
+`zigworks` distro libgtk-3-dev, libwebkit2gtk-4.1-dev and xvfb (187
+packages, 108 MB; GTK 3.24.41, WebKitGTK 2.52.6).
+
+Both apps are a C file behind the macOS app's `hdesk_*` interface
+(`src/mac/desk.h`), with every decision in the shared Zig, as on macOS:
+
+- `src/windows/desk.c`: a Win32 window and menu, and WebView2 through
+  `WebView2.h`'s C interfaces (COBJMACROS), compiled by Zig's C compiler.
+  `WebView2Loader.dll` is loaded at run time from beside the program.
+- `src/linux/desk.c`: a GTK 3 window and menu, and a WebKitGTK 4.1 web
+  view.
+- `main.zig` exports the data folder (`hdesk_home`) and, on Linux, the
+  window's icon (`hdesk_icon`) to them; `icon.zig` also writes `.ico`
+  and `.png`.
+- `scripts/smoke-other.sh` (both systems), `fetch-webview2.sh`,
+  `package-windows.sh`, `package-linux.sh`; `test/fake_harness.cmd`; the
+  stand-in's page posts through either bridge and can make a frame.
+- CI jobs `desk-app-windows` and `desk-app-linux` (they replace
+  `desk-app-shared`); the release workflow's "Desk app (Windows)" and
+  "Desk app (Linux)" steps.
+
+Rulings (mine; the owner can overrule):
+
+- R50. The Windows layer is C that includes Microsoft's header, not the
+  interfaces written out again in Zig: the header is 2.9 MB of tables
+  that must match byte for byte, and Zig's C compiler takes it as it is
+  (one shim, `EventToken.h`, for a Windows SDK header Zig's set lacks).
+  The header and the loader are not in the repository: `-Dwebview2=DIR`
+  names the unpacked package, which `scripts/fetch-webview2.sh` downloads
+  by a pinned version and SHA-256.
+- R51. Closing the window minimizes it on both systems: a hidden window
+  has no taskbar button to bring it back or to carry the badge. Quit is in
+  the menu (Ctrl+Q).
+- R52. One window a data folder. Windows: a named mutex and the window's
+  class, both from the folder's path; a second start restores the first
+  and ends. Linux: GApplication over the session bus; without a bus a
+  lock file ends the second start without showing the first.
+- R53. Windows: the web view's own folder is `DATA\desk-webview` (the
+  spec's `%LOCALAPPDATA%\harness\desk-webview` for the default data
+  folder), with the window's place in `window-frame` beside it; InPrivate
+  where the runtime has it, else an ordinary profile there (the session
+  cookie has no Expires either way). Media without a click is the
+  browser argument `--autoplay-policy=no-user-gesture-required`, given
+  in the options object WebView2 asks at its start. (First through the
+  variable `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`: that held on this
+  machine and not on GitHub's Windows runner, where audio and speech were
+  refused: CI run 45622757764.) The options name 86.0.616.0 as the oldest
+  runtime, so an older one than the header's is taken. DevTools, the status bar, zoom
+  and the browser's own keys are off; Ctrl+R, F5 and Ctrl+Q are the
+  menu's.
+- R54. Windows: a frame's message is never the desk's. Frames get their
+  own handlers (messages as "not the main frame", permissions refused and
+  marked handled), and a message at the window's handler counts as the
+  main frame's only when its source is the window's own address. The
+  smoke frames a sandboxed page that posts: it arrives as `other`.
+- R55. Linux: WebKitGTK names no frame for a message. The handler is
+  registered in a script world of the app's, and two scripts injected
+  into the top frame only carry the page's `postMessage` to it through an
+  attribute on the document. A frame has no handler at all (the smoke's
+  framed page can't post).
+- R56. Linux: WebKitGTK names no frame for a navigation either. One the
+  owner made (a user gesture; the app's own loads count) is decided as
+  the main frame's; one a script made is decided as a frame's. The
+  desk's own address is allowed in both. So a link clicked inside a
+  framed app opens the system browser on Linux, where macOS and Windows
+  cancel it. Said in the README.
+- R57. Linux: the microphone is answered by the window's own address (no
+  frame is named); the desk page gives none of its frames the
+  microphone. WebGL is on with the hardware acceleration policy always;
+  autoplay needs WebKit's website policy as well as the old setting.
+- R58. The frame check on Linux reports the frame that was asked for and
+  saved, not what the window system made of it (a window manager, or
+  Wayland, may place a window elsewhere); on Windows it is the real one.
+- R59. The Linux smoke ranks GStreamer's real audio outputs out
+  (`GST_PLUGIN_FEATURE_RANK`): without a working sound device WebKit's
+  audio could wait for good and the page never finish loading (seen once
+  in six runs here). `DESK_SMOKE_SOUND=1` uses the machine's.
+- R60. CI installs Microsoft's WebView2 Runtime on the Windows runner
+  only where its image lacks it, after checking the installer's
+  signature is Microsoft's.
+
+Numbers, here:
+
+- Unit tests: 63 of 63 on Windows 11 and Linux (one new: the `.ico`).
+- Windows smoke: 48 of 48 (WebGL 2, media and speech without a click,
+  the framed page as `other`, a second start).
+- Linux smoke under Xvfb: 47 of 47, five runs in a row after R59 (speech
+  is not checked: WebKitGTK has none).
+- The packaged Windows program (ReleaseSafe, 0.8 MB, with the loader and
+  its licence) starts and shows its window.
+
+Not done or not seen:
+
+- The real desk page and its 3D head in these windows: only the
+  stand-in's page was loaded. The head's frame rate under WSLg is not
+  measured.
+- The missing-runtime message on Windows (this machine has the runtime).
+- A machine with a session bus on Linux (the second start presenting the
+  first), a real window manager, Wayland.
+- The CI jobs and the release steps have not run on GitHub yet.
+- Windows on ARM: the build picks the arm64 loader, untried.
+
+## 13. The Windows and Linux apps on the shared "Set up" (2026-11-25, branch `platform/desk-win-linux`)
+
+The owner: "go back to your job on the app". That evening both sessions
+wrote the shared set-up code; the Mac session's (`platform/desk-app-setup`,
+plan `2026-11-25-desk-app-setup.md`) landed on `harness-logins` first. Its
+code is the shared code. Mine was complete and passing (77 unit tests,
+smokes 76 and 75, the real harness by hand on both systems) and is kept on
+a local branch, `platform/desk-setup-own`, unpushed; what follows was then
+built on theirs.
+
+Built:
+
+- `src/windows/desk.c`: `hdesk_ask_key` (a window of Windows' own over the
+  app's, the app's window disabled meanwhile: the title above an edit
+  control with `ES_PASSWORD`, the note, Save and Cancel), `hdesk_test_key`,
+  the menu item "Provider and key…", the data folder made with its
+  parents.
+- `src/linux/desk.c`: the same with a `GtkDialog` and an entry whose text
+  isn't shown.
+- `scripts/package-windows.sh`, `scripts/package-linux.sh`: harness beside
+  the app and `desk-assets/` beside harness, with `DESK_ASSETS` as
+  `package-macos.sh` takes it.
+- `scripts/smoke-other.sh`: `smoke.sh`'s checks, with these systems'
+  differences; `test/fake_launcher.zig` for Windows.
+
+Rulings:
+
+- R61. **The key window is not a modal call.** `hdesk_ask_key` is called
+  inside a turn of the controller and its answer starts another, so it
+  opens the window and returns; the window's own procedure answers later.
+  On Windows the app's loop gives the key window its keys
+  (`IsDialogMessageW`). Cost: none known.
+- R62. **Closed before answered.** The window is destroyed, then
+  `hdesk_on_key` is called, because what the answer starts may ask for the
+  key again. The control is emptied and the copy zeroed in both layers.
+- R63. **The note under the field is by system** (`controller.keyNote`):
+  Linux has no key store harness uses, so it says the file. A change in
+  the Mac session's file; its test follows.
+- R64. **Windows' stand-in is a program.** The app looks for
+  `harness.exe` beside itself and Windows can't start a script, so the
+  smoke's build makes `fake-harness.exe`, which runs the script
+  `FAKE_HARNESS_PY` names. Cost: one more small program in the smoke's
+  build.
+- R65. **The stand-in doesn't use `os.kill(pid, 0)` on Windows:** there it
+  ends the process. It asks the port.
+- R66. **CI packs without the fit files** (`DESK_ASSETS=none`), as the
+  macOS job does; the release steps pack strictly and fail without them,
+  as harness's own archive does. (The base head came into the repository
+  later the same night, ff54518.)
+- R67. **The data folder's parents are made on Windows** (a new computer
+  has no `%LOCALAPPDATA%\harness` yet).
+- R68. **The usual models stay as the Mac session named them;** what the
+  providers' pages listed on 2026-11-25 is in the handoff for it.
+
+Verification (2026-11-25):
+
+- Unit tests: 102 of 102 on Windows 11 and on Linux.
+- Smokes against the stand-in: 90 of 90 on Windows 11, 89 of 89 on Linux
+  under Xvfb. In each, the real key window is opened, found to hide its
+  text, filled through the test hook and saved, and the key is found in
+  harness's input and in no log, output, setting or command line.
+- With `DESK_SMOKE_HARNESS` (the real harness of this branch, a file store
+  in place of the Credential Manager on Windows): 112 of 112 on Windows,
+  111 of 111 on Linux. init, config set with a named section, secret add,
+  harness run with no Telegram, the real desk entered, "Provider and
+  key…" reading the settings back, Stop; and, taken from `smoke.sh` after
+  the Mac session's page fix (3edebbc), the real desk page in these
+  windows: a long conversation leaves the message field inside the window
+  at the size it opens at and at its smallest (1024x700 inside on both),
+  the newest message stays shown, the sound button draws waves or a cross.
+- On GitHub (run 45681862540, 7476686): `desk-app-windows`,
+  `desk-app-linux` and `desk-app-macos` passed, with every other job but
+  one: mailmcp on Linux failed `idle_pushes_new_mail_to_a_subscriber`,
+  which nothing here touches.
+- Seen in screenshots on Windows: the form and the key window as they are
+  now ("Anthropic key" above a field that hides its text, the note, Save
+  and Cancel); and, with my first version, the real desk in the app's
+  window (the empty stage with [Add a portrait], the chat, times in this
+  computer's zone).
+- The packages: the Windows zip and the Linux archive hold harness; the
+  Windows one unpacked and started on a new folder showed "Set up". With
+  `DESK_ASSETS` unset the Windows script stopped with pack-desk-assets'
+  line about the base head, which was not in the repository yet; a strict
+  package with the base head there has not been made here (it downloads
+  MediaPipe's files, which I did not do without the owner's word).
+
+Not done or not seen:
+
+- The Credential Manager through the app (a file store stood in).
+- A real provider: no model call was made with the settings written.
+- The fit files in a package, and the 3D head in these windows.
+- The form and the key dialog by eye on Linux (Xvfb has no screen to look
+  at).
+- The release steps (never run).
+- `utc_offset = auto` in a summer zone, and a brief's time.
