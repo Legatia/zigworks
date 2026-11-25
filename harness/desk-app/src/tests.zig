@@ -10,4 +10,6 @@ test {
     _ = @import("controller.zig");
     _ = @import("commands.zig");
     _ = @import("pages.zig");
+    _ = @import("icon.zig");
+    _ = @import("plist.zig");
 }
