@@ -13,6 +13,13 @@ pub const Block = union(enum) {
     text: []const u8,
     tool_use: struct { id: []const u8, name: []const u8, input_json: []const u8 },
     tool_result: struct { id: []const u8, content: []const u8, is_error: bool = false },
+    /// The model's thinking before an answer, as Anthropic sent it: the
+    /// whole block's JSON (`thinking` or `redacted_thinking`; its text
+    /// may be empty, its signature is what counts). It goes back as it
+    /// came, in the same place, and only while what was sent before it is
+    /// the same: the API refuses it after any other request (the agent
+    /// sends it within its own turn only). Never shown, logged or summed.
+    thinking: []const u8,
 };
 
 pub const Role = enum { user, assistant };
@@ -713,6 +720,8 @@ pub fn anthropicBody(arena: std.mem.Allocator, model: []const u8, max_tokens: u3
                     if (mark) try out.appendSlice(arena, cache_mark);
                     try out.append(arena, '}');
                 },
+                // as it came: a cache mark is not allowed on it
+                .thinking => |raw| try out.appendSlice(arena, raw),
             }
         }
         try out.appendSlice(arena, "]}");
@@ -922,6 +931,10 @@ pub fn parseReply(arena: std.mem.Allocator, body: []const u8) ?Reply {
                 .name = jv.str(jv.get(b, "name")) orelse return null,
                 .input_json = input_json,
             } }) catch return null;
+        } else if (std.mem.eql(u8, typ, "thinking") or std.mem.eql(u8, typ, "redacted_thinking")) {
+            // every field, the ones this code does not know too
+            const raw = std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(b, .{})}) catch return null;
+            blocks.append(arena, .{ .thinking = raw }) catch return null;
         }
     }
     return .{
@@ -1008,6 +1021,17 @@ pub fn oaToolReply(a: std.mem.Allocator, id: []const u8, name: []const u8, input
     return std.fmt.allocPrint(a, "{{\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"Let me check.\",\"tool_calls\":[{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":{f}}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}", .{ id, name, std.json.fmt(input_json, .{}) });
 }
 
+/// An answer that thinks first (a block signed `sig`, its text left out as
+/// the API sends it), then says "Let me check." and calls `name`.
+pub fn thinkingToolReply(comptime sig: []const u8, comptime id: []const u8, comptime name: []const u8, comptime input: []const u8) []const u8 {
+    return "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"" ++ sig ++ "\"}," ++ comptime toolReply(id, name, input)["{\"content\":[".len..];
+}
+
+/// An answer that thinks first (a block signed `sig`), then says `s`.
+pub fn thinkingTextReply(comptime sig: []const u8, comptime s: []const u8) []const u8 {
+    return "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"" ++ sig ++ "\"}," ++ comptime textReply(s)["{\"content\":[".len..];
+}
+
 pub fn toolReply(comptime id: []const u8, comptime name: []const u8, comptime input: []const u8) []const u8 {
     return "{\"content\":[{\"type\":\"text\",\"text\":\"Let me check.\"},{\"type\":\"tool_use\",\"id\":\"" ++ id ++ "\",\"name\":\"" ++ name ++ "\",\"input\":" ++ input ++ "}],\"stop_reason\":\"tool_use\"}";
 }
@@ -1040,6 +1064,55 @@ test "tool_use_reply_parsed_with_input_json" {
     try t.expectEqualStrings("tu_1", u.id);
     try t.expectEqualStrings("shell", u.name);
     try t.expectEqualStrings("{\"command\":\"ls -l\"}", u.input_json);
+}
+
+test "a_replys_thinking_blocks_are_kept_as_they_came" {
+    var e: TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    try e.script(1, "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"sig-one\"},{\"type\":\"redacted_thinking\",\"data\":\"opaque-two\"},{\"type\":\"text\",\"text\":\"Let me check.\"},{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"shell\",\"input\":{}}],\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":10,\"output_tokens\":3}}");
+    var c = try e.client();
+    defer c.deinit();
+    const a = e.arena.allocator();
+    const r = try c.send(a, "", &.{.{ .role = .user, .blocks = &.{.{ .text = "list" }} }}, &.{.{ .name = "shell", .description = "run", .schema_json = "{\"type\":\"object\"}" }});
+    try t.expectEqual(4, r.blocks.len);
+    // every field as it was sent, an empty text and the signature too
+    try t.expectEqualStrings("{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"sig-one\"}", r.blocks[0].thinking);
+    try t.expectEqualStrings("{\"type\":\"redacted_thinking\",\"data\":\"opaque-two\"}", r.blocks[1].thinking);
+    // the answer's words are its text blocks alone
+    try t.expectEqualStrings("Let me check.", try r.text(a));
+    try t.expectEqualStrings("tu_1", r.blocks[3].tool_use.id);
+}
+
+const thought_messages: []const Message = &.{
+    .{ .role = .user, .blocks = &.{.{ .text = "run it" }} },
+    .{ .role = .assistant, .blocks = &.{
+        .{ .thinking = "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"sig-one\"}" },
+        .{ .text = "Let me check." },
+        .{ .tool_use = .{ .id = "tu_9", .name = "shell", .input_json = "{\"command\":\"date\"}" } },
+    } },
+    .{ .role = .user, .blocks = &.{.{ .tool_result = .{ .id = "tu_9", .content = "Thu", .is_error = false } }} },
+};
+
+test "thinking_blocks_go_back_to_anthropic_as_they_came" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try anthropicBody(a, "claude-test", 1000, .{ .stable = "sys" }, thought_messages, &.{}, true);
+    // in its place, before the text and the call it led to, with no cache mark of its own
+    try t.expect(std.mem.indexOf(u8, body, "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"sig-one\"},{\"type\":\"text\",\"text\":\"Let me check.\"},{\"type\":\"tool_use\"") != null);
+    try t.expect(jv.parse(a, body) != null);
+}
+
+test "thinking_blocks_are_left_out_of_an_openai_request" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try openaiBody(a, "gpt-test", "max_tokens", 1000, .{ .stable = "sys" }, thought_messages, &.{}, false);
+    try t.expect(std.mem.indexOf(u8, body, "sig-one") == null);
+    try t.expect(std.mem.indexOf(u8, body, "thinking") == null);
+    try t.expect(std.mem.indexOf(u8, body, "\"content\":\"Let me check.\"") != null);
+    try t.expect(jv.parse(a, body) != null);
 }
 
 test "request_carries_x_api_key_and_version" {

@@ -246,6 +246,9 @@ pub const Conversation = struct {
     /// `outside_mod.conv_max` (the oldest dropped), so a gate decision
     /// costs the same however long the conversation.
     index: std.ArrayList(Ref) = .empty,
+    /// The model API refused a request that carried the model's thinking
+    /// back and took it without: none is sent back from then on.
+    no_thinking: bool = false,
 
     pub const Ref = struct { name: []u8, refs: u32 };
 
@@ -394,10 +397,17 @@ pub const Conversation = struct {
 
     /// The messages to send: a turn that ended with tool results (a final
     /// `send`, a limit) has the next turn's message joined to them in one
-    /// user message, the results first.
+    /// user message, the results first. The model's thinking is sent
+    /// from the newest turn only: the API takes a thinking block back
+    /// only after the very instructions, tools and messages it was made
+    /// after, and those hold for a turn (`turn` makes the instructions
+    /// once), not from one turn to the next.
     pub fn messages(c: *const Conversation, arena: std.mem.Allocator) ![]model.Message {
         var out: std.ArrayList(model.Message) = .empty;
-        for (c.turns.items) |tn| for (tn.messages.items) |m| {
+        for (c.turns.items, 0..) |tn, ti| for (tn.messages.items) |kept| {
+            var m = kept;
+            if (c.no_thinking or ti + 1 < c.turns.items.len) m.blocks = try withoutThinking(arena, m.blocks);
+            if (m.blocks.len == 0) continue;
             if (out.items.len > 0 and out.items[out.items.len - 1].role == m.role) {
                 const last = &out.items[out.items.len - 1];
                 last.blocks = try std.mem.concat(arena, model.Block, &.{ last.blocks, m.blocks });
@@ -408,6 +418,19 @@ pub const Conversation = struct {
         return out.items;
     }
 };
+
+/// `blocks` without the model's thinking (the same slice when it has none).
+fn withoutThinking(arena: std.mem.Allocator, blocks: []const model.Block) ![]const model.Block {
+    if (!hasThinking(blocks)) return blocks;
+    var out: std.ArrayList(model.Block) = .empty;
+    for (blocks) |b| if (b != .thinking) try out.append(arena, b);
+    return out.items;
+}
+
+fn hasThinking(blocks: []const model.Block) bool {
+    for (blocks) |b| if (b == .thinking) return true;
+    return false;
+}
 
 /// Adds `name` to `list` once (no limit: a conversation's whole mark).
 fn addOnce(list: *std.ArrayList([]const u8), a: std.mem.Allocator, name: []const u8) !void {
@@ -430,11 +453,15 @@ fn keep(tn: *Conversation.Turn, m: model.Message) !void {
             .text => |s| .{ .text = try a.dupe(u8, s) },
             .tool_use => |u| .{ .tool_use = .{ .id = try a.dupe(u8, u.id), .name = try a.dupe(u8, u.name), .input_json = try a.dupe(u8, u.input_json) } },
             .tool_result => |r| .{ .tool_result = .{ .id = try a.dupe(u8, r.id), .content = try a.dupe(u8, r.content), .is_error = r.is_error } },
+            .thinking => |raw| .{ .thinking = try a.dupe(u8, raw) },
         };
         tn.bytes += switch (b) {
             .text => |s| s.len,
             .tool_use => |u| u.input_json.len + u.name.len,
             .tool_result => |r| r.content.len,
+            // sent within its own turn only (`Conversation.messages`):
+            // it never weighs on what the conversation sends later
+            .thinking => 0,
         };
     }
     try tn.messages.append(a, .{ .role = m.role, .blocks = blocks });
@@ -2099,6 +2126,8 @@ fn turnRun(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: bool
     var calls_made: usize = 0;
     // the model API refused the request: this turn is not kept
     var rejected = false;
+    // a request is being sent again without the model's thinking
+    var without_thinking = false;
     const defs = try toolDefs(r, a);
     while (true) {
         if (r.env.stop.load(.acquire)) {
@@ -2128,6 +2157,19 @@ fn turnRun(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: bool
                 result.ended_by = try r.gpa.dupe(u8, "Stopped.");
                 break;
             }
+            // refused with the model's thinking in it (a gateway that
+            // does not take it back, or one made after other requests):
+            // once more without, which the API always takes; if that goes
+            // through, this conversation sends none back from then on
+            if (e == error.Rejected and !conv.no_thinking and sentThinking(msgs)) {
+                try r.logRun(.model, false, .{ .result = @errorName(e), .provider = r.client.provider, .detail = r.client.lastError(), .event = "sent again without the model's thinking" });
+                conv.no_thinking = true;
+                without_thinking = true;
+                result.steps -= 1;
+                continue;
+            }
+            // refused without it too: the thinking was not why
+            if (without_thinking) conv.no_thinking = false;
             // the same words for every provider, naming it
             const why: []const u8 = switch (e) {
                 // kept, every later request would carry it and be refused too
@@ -2142,6 +2184,7 @@ fn turnRun(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: bool
             rejected = e == error.Rejected;
             break;
         };
+        without_thinking = false;
         used_tokens += reply.input_tokens + reply.cache_read_tokens + reply.cache_write_tokens;
         try r.logRun(.model, false, .{ .result = "ok", .provider = r.client.provider, .stop_reason = reply.stop_reason, .input_tokens = reply.input_tokens, .output_tokens = reply.output_tokens, .cache_read = reply.cache_read_tokens, .cache_write = reply.cache_write_tokens });
         // stopped while the model was answering: its answer is dropped
@@ -2150,8 +2193,12 @@ fn turnRun(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: bool
             result.ended_by = try r.gpa.dupe(u8, "Stopped.");
             break;
         }
-        if (reply.blocks.len == 0) {
-            result.ended_by = try r.gpa.dupe(u8, "The model gave an empty answer.");
+        // thinking alone says nothing, and kept it would be an assistant
+        // message the API does not take back
+        if ((try withoutThinking(a, reply.blocks)).len == 0) {
+            // thinking counts toward max_tokens: the owner can raise it
+            const cut_thinking = reply.blocks.len > 0 and std.mem.eql(u8, reply.stop_reason, "max_tokens");
+            result.ended_by = try r.gpa.dupe(u8, if (cut_thinking) "The model reached its output limit (max_tokens) while thinking, before it answered." else "The model gave an empty answer.");
             break;
         }
         try keep(tn, .{ .role = .assistant, .blocks = reply.blocks });
@@ -2221,6 +2268,11 @@ const cut_note = "not run: your reply was cut off at the output limit (max_token
 pub fn freeResult(r: *Run, res: TurnResult) void {
     r.gpa.free(res.text);
     if (res.ended_by) |w| r.gpa.free(w);
+}
+
+fn sentThinking(msgs: []const model.Message) bool {
+    for (msgs) |m| if (hasThinking(m.blocks)) return true;
+    return false;
 }
 
 fn callTool(r: *Run, a: std.mem.Allocator, name: []const u8, input_json: []const u8) !tools.Output {
@@ -4668,6 +4720,7 @@ fn summarise(r: *Run, conv: *Conversation, n: usize) !Summary {
                 else
                     try turn_text.print(a, "(tool {s}: {s})\n", .{ u.name, util.cut(u.input_json, 300) }),
                 .tool_result => |x| try turn_text.print(a, "(result: {s})\n", .{util.cut(x.content, 500)}),
+                .thinking => {},
             }
         };
         part.* = turn_text.items;
@@ -5110,6 +5163,113 @@ test "a_slow_model_call_ends_with_the_turn" {
     try t.expect(start.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 4500);
     try t.expectEqualStrings("Time limit reached for this turn.", r.text);
     try t.expectEqual(1, f.e.server.modelRequests());
+}
+
+test "the_models_thinking_goes_back_within_its_turn_and_not_after" {
+    var f: Fix = undefined;
+    try f.init("allow write_file *\n");
+    defer f.deinit();
+    try f.e.script(1, model.thinkingToolReply("sig-one", "tu_1", "write_file", "{\"path\":\"a.txt\",\"content\":\"hi\"}"));
+    try f.e.script(2, model.thinkingTextReply("sig-two", "Written."));
+    try f.e.script(3, model.textReply("Yes."));
+    const r1 = try f.say("write a file");
+    defer freeResult(&f.run, r1);
+    try t.expectEqualStrings("Written.", r1.text);
+    // the step after the call carries the thinking that led to it, in its place
+    const req2 = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, req2, "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"sig-one\"},{\"type\":\"text\"") != null);
+    // the next turn's instructions may differ, and thinking is bound to
+    // what came before it: none of an earlier turn's is sent
+    const r2 = try f.say("did it work?");
+    defer freeResult(&f.run, r2);
+    try t.expectEqualStrings("Yes.", r2.text);
+    const req3 = try f.e.request(3);
+    try t.expect(std.mem.indexOf(u8, req3, "sig-one") == null);
+    try t.expect(std.mem.indexOf(u8, req3, "sig-two") == null);
+    try t.expect(std.mem.indexOf(u8, req3, "\"thinking\"") == null);
+    // the rest of that turn is all there
+    try t.expect(std.mem.indexOf(u8, req3, "\"tool_result\",\"tool_use_id\":\"tu_1\"") != null);
+    try t.expect(std.mem.indexOf(u8, req3, "Written.") != null);
+}
+
+test "a_request_refused_with_thinking_in_it_is_sent_once_more_without" {
+    var f: Fix = undefined;
+    try f.init("allow write_file *\n");
+    defer f.deinit();
+    try f.e.script(1, model.thinkingToolReply("sig-one", "tu_1", "write_file", "{\"path\":\"a.txt\",\"content\":\"hi\"}"));
+    // the request that carries the thinking back is refused
+    try f.e.script(2, "{\"status\":400}");
+    try f.e.script(3, model.textReply("Written."));
+    const r1 = try f.say("write a file");
+    defer freeResult(&f.run, r1);
+    // the turn goes on: the owner sees the answer, not the refusal
+    try t.expectEqualStrings("Written.", r1.text);
+    try t.expectEqual(null, r1.ended_by);
+    try t.expectEqual(1, f.conv.turns.items.len);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "sig-one") != null);
+    const req3 = try f.e.request(3);
+    try t.expect(std.mem.indexOf(u8, req3, "sig-one") == null);
+    try t.expect(std.mem.indexOf(u8, req3, "\"tool_result\",\"tool_use_id\":\"tu_1\"") != null);
+    // the tool ran once
+    try t.expectEqualStrings("hi", try f.e.tmp.dir.readFileAlloc(t.io, "ws/a.txt", f.e.arena.allocator(), .unlimited));
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "sent again without the model's thinking") != null);
+    // and this conversation sends no thinking back from then on
+    try f.e.script(4, model.thinkingToolReply("sig-four", "tu_2", "write_file", "{\"path\":\"b.txt\",\"content\":\"ho\"}"));
+    try f.e.script(5, model.textReply("Written again."));
+    const r2 = try f.say("and another");
+    defer freeResult(&f.run, r2);
+    try t.expectEqualStrings("Written again.", r2.text);
+    try t.expectEqual(5, f.e.server.modelRequests());
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), "sig-four") == null);
+}
+
+test "a_request_still_refused_without_the_thinking_ends_the_turn_as_any_refusal" {
+    var f: Fix = undefined;
+    try f.init("allow write_file *\n");
+    defer f.deinit();
+    try f.e.script(1, model.thinkingToolReply("sig-one", "tu_1", "write_file", "{\"path\":\"a.txt\",\"content\":\"hi\"}"));
+    try f.e.script(2, "{\"status\":400}");
+    try f.e.script(3, "{\"status\":400}");
+    const r1 = try f.say("first message");
+    defer freeResult(&f.run, r1);
+    try t.expect(std.mem.indexOf(u8, r1.text, "refused the request: scripted error") != null);
+    try t.expectEqual(0, f.conv.turns.items.len);
+    // not sent a third time
+    try t.expectEqual(3, f.e.server.modelRequests());
+    // the thinking was not why: the next turn sends its own back again
+    try f.e.script(4, model.thinkingToolReply("sig-four", "tu_2", "write_file", "{\"path\":\"b.txt\",\"content\":\"ho\"}"));
+    try f.e.script(5, model.textReply("Written."));
+    const r2 = try f.say("second message");
+    defer freeResult(&f.run, r2);
+    try t.expectEqualStrings("Written.", r2.text);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), "sig-four") != null);
+}
+
+test "a_reply_of_thinking_alone_is_an_empty_answer" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try f.e.script(1, "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"sig-one\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":10,\"output_tokens\":3}}");
+    try f.e.script(2, model.textReply("Hello."));
+    const r1 = try f.say("hello");
+    defer freeResult(&f.run, r1);
+    try t.expectEqualStrings("The model gave an empty answer.", r1.text);
+    // nothing of it is kept: the next request is one the API takes
+    const r2 = try f.say("hello?");
+    defer freeResult(&f.run, r2);
+    try t.expectEqualStrings("Hello.", r2.text);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "sig-one") == null);
+}
+
+test "a_reply_cut_off_while_the_model_was_thinking_says_so" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    // thinking counts toward max_tokens: the limit can be reached before a word of the answer
+    try f.e.script(1, "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"sig-one\"}],\"stop_reason\":\"max_tokens\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4096}}");
+    const r1 = try f.say("hello");
+    defer freeResult(&f.run, r1);
+    try t.expectEqualStrings("The model reached its output limit (max_tokens) while thinking, before it answered.", r1.text);
 }
 
 test "a_turn_the_model_api_refuses_is_dropped" {
@@ -6911,7 +7071,12 @@ test "web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log" {
     // the owner was asked for the host and for the login, once each
     try t.expectEqual(2, f.asked);
     const req4 = try f.e.request(4);
-    try t.expect(std.mem.indexOf(u8, req4, "welcome agent-bot typed [secret:login-agent-password]") != null);
+    // seen failing twice on the Windows runner (354a8cb, 2562460) with
+    // nothing to say why: what the page showed is printed when it does
+    if (std.mem.indexOf(u8, req4, "welcome agent-bot typed [secret:login-agent-password]") == null) {
+        std.debug.print("request 4 ends: {s}\n", .{req4[req4.len -| 2500..]});
+        return error.TestUnexpectedResult;
+    }
     const lt = try f.logText();
     try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"web fill\",\"login\":\"agent\"") != null);
     try t.expect(std.mem.indexOf(u8, lt, "{login:agent.password}") != null);
