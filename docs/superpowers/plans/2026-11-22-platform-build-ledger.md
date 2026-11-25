@@ -213,3 +213,23 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
 
 - CI 45605592335 (2e27cfd, the session-cookie test's fix): 32/32. The desk (harness side, page, 3D avatar, macOS app) is green on all three systems.
 - Unattended runs in a sandbox (Part 2 of the budget and sandbox design; the Windows session, branch `win/sandbox-default`; plan `2026-11-22-windows-platform.md` section 10, rulings R41 to R49): a built-in `sandbox`, `[default] unattended`, no `host` for a run nobody watches unless environments.ini puts it there, refused and kept as an item where no sandbox can be made, the upgrade line once (`state/upgrades/sandbox-default`), doctor's "Routines' commands". The desk app's shared code on Windows and Linux (section 11): 62 of 62 unit tests on both; CI job `desk-app-shared`.
+- 2026-11-25 the desk's voice, any speaking provider (owner: "keep it configurable, user should be able to swap with their own api or provider preferred"); branch `platform/desk-voice` from 479ceea; plan `2026-11-25-desk-voice.md`, its 15 rulings and Done there; spec "Speech" (479ceea).
+  - `[desk] speak = off | browser | NAME`: the presets `openai` and `gemini` (key alone), or a `[provider NAME]` with `api = openai` or the new `api = gemini` (url, key, auth, header). `auth = x-goog-api-key` is new, the default for `api = gemini`. A chat preset with no api line of its own (openrouter, opencode) is no voice.
+  - Gemini: `POST {url}/models/MODEL:generateContent`, audio out, `prebuiltVoiceConfig.voiceName`; served as `audio/wav`.
+  - `api = gemini` is speech only: a chat model on it is refused, in config.ini for `[model]`'s three values, `summary_model`, `check_model` and `[voice_agent] model`, and at the call for the rest.
+  - Defaults per kind (checked 2026-11-25): openai `tts-1`/`alloy`; gemini `gemini-3.8-flash-lite-tts`/`Schedar`. `speak_model`/`speak_voice` are unset by default. An older init's `tts-1`/`alloy` count as unset for Gemini's format.
+  - The desk:
+    - Off, Browser (not Linux) and each voice by name;
+    - Model and Voice fields, the kind's defaults greyed in, written through write-then-reload; choosing a voice of another kind clears them;
+    - a missing key names the command;
+    - Gemini's free-tier line is inline whenever a Gemini-format voice is offered;
+    - "Not read aloud: …" under the chat when speech fails.
+  - Checked against Google's docs (2026-11-25):
+    - Gemini 3.8 TTS answers unary requests with WAV (RIFF), not raw PCM as the spec assumed. A WAV part is passed through and an L16 part is wrapped.
+    - The single-speaker example now shows `voiceConfig.voice`. `prebuiltVoiceConfig.voiceName` is kept, as the spec says (the API reference and the multi-speaker example still use it).
+  - OpenAI marks `tts-1`, `tts-1-hd` and `gpt-4o-mini-tts` deprecated, with shutdown on 2027-01-06. The spec's defaults are kept and the README says so.
+  - Final review (fresh reviewer): no Critical.
+    - 2 Important, fixed test-first: the free-tier line now shows before choosing (Ruling 6 overturned), and an old init's `tts-1` reaching Gemini on a hand edit.
+    - 1 Minor re-graded Important: invalid state JSON when a preset's section changed its api.
+    - 5 Minor deferred (plan's ledger).
+  - Suites at 5a6a20c (origin/harness-logins had nothing new: "Already up to date"), Debug and ReleaseSafe with the four stand-ins: unit 1560/1582 (22 skipped; base 1536/1558); smoke all ok, 200 (base 197). Cross builds and unit-builds ok for x86_64-windows, x86_64-linux-musl and aarch64-linux-musl. Seen once under load, while the reviewer ran beside the suite: core `a_text_reply_to_an_approval_denies_it_and_the_agent_gets_the_reason` timed out (6/6 alone, green in every later run). Not pushed.
