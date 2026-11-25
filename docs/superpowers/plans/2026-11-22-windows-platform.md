@@ -808,8 +808,12 @@ Rulings (mine; the owner can overrule):
   folder), with the window's place in `window-frame` beside it; InPrivate
   where the runtime has it, else an ordinary profile there (the session
   cookie has no Expires either way). Media without a click is the
-  browser argument `--autoplay-policy=no-user-gesture-required`, through
-  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`. DevTools, the status bar, zoom
+  browser argument `--autoplay-policy=no-user-gesture-required`, given
+  in the options object WebView2 asks at its start. (First through the
+  variable `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`: that held on this
+  machine and not on GitHub's Windows runner, where audio and speech were
+  refused: CI run 45622757764.) The options name 86.0.616.0 as the oldest
+  runtime, so an older one than the header's is taken. DevTools, the status bar, zoom
   and the browser's own keys are off; Ctrl+R, F5 and Ctrl+Q are the
   menu's.
 - R54. Windows: a frame's message is never the desk's. Frames get their

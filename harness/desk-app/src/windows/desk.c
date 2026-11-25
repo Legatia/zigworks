@@ -655,6 +655,41 @@ HANDLER(environment_done, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHan
 
 typedef HRESULT(STDAPICALLTYPE *create_env_fn)(PCWSTR browser, PCWSTR data, ICoreWebView2EnvironmentOptions *options, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *done);
 
+// What the web view's browser is started with: media and speech without a
+// click. Given as the options object WebView2 asks, which holds for every
+// way the program is started (the WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+// variable did here and not on GitHub's Windows runner). One object for
+// the program's life; what it hands out is a copy for the caller to free.
+static const wchar_t browser_args[] = L"--autoplay-policy=no-user-gesture-required";
+// the oldest runtime the app runs on (what it uses beyond that, it asks for
+// and does without where it is missing)
+static const wchar_t oldest_runtime[] = L"86.0.616.0";
+
+static HRESULT co_copy(const wchar_t *s, LPWSTR *out) {
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!s) return S_OK;
+    size_t bytes = (wcslen(s) + 1) * sizeof(wchar_t);
+    *out = (LPWSTR)CoTaskMemAlloc(bytes);
+    if (!*out) return E_OUTOFMEMORY;
+    memcpy(*out, s, bytes);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE opt_get_args(void *self, LPWSTR *v) { (void)self; return co_copy(browser_args, v); }
+static HRESULT STDMETHODCALLTYPE opt_get_language(void *self, LPWSTR *v) { (void)self; return co_copy(NULL, v); }
+static HRESULT STDMETHODCALLTYPE opt_get_version(void *self, LPWSTR *v) { (void)self; return co_copy(oldest_runtime, v); }
+static HRESULT STDMETHODCALLTYPE opt_put_text(void *self, LPCWSTR v) { (void)self; (void)v; return S_OK; }
+static HRESULT STDMETHODCALLTYPE opt_get_sso(void *self, BOOL *v) { (void)self; if (!v) return E_POINTER; *v = FALSE; return S_OK; }
+static HRESULT STDMETHODCALLTYPE opt_put_sso(void *self, BOOL v) { (void)self; (void)v; return S_OK; }
+static void *options_vtbl[11] = {
+    (void *)h_query, (void *)h_addref, (void *)h_release,
+    (void *)opt_get_args, (void *)opt_put_text,
+    (void *)opt_get_language, (void *)opt_put_text,
+    (void *)opt_get_version, (void *)opt_put_text,
+    (void *)opt_get_sso, (void *)opt_put_sso,
+};
+static handler options = { options_vtbl, &IID_ICoreWebView2EnvironmentOptions };
+
 // The loader, from beside this program and nowhere else.
 static create_env_fn loader(void) {
     wchar_t path[MAX_PATH * 2];
@@ -676,15 +711,13 @@ static void start_web_view(void) {
         PostQuitMessage(1);
         return;
     }
-    // media and speech without a click
-    SetEnvironmentVariableW(L"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", L"--autoplay-policy=no-user-gesture-required");
     // its own folder, in the data folder: never the folder the program is in
     wchar_t *home = wide(hdesk_home());
     wchar_t data[MAX_PATH * 2];
     _snwprintf(data, MAX_PATH * 2, L"%ls\\desk-webview", home ? home : L".");
     data[MAX_PATH * 2 - 1] = 0;
     free(home);
-    HRESULT hr = create(NULL, data, NULL, (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *)&environment_done);
+    HRESULT hr = create(NULL, data, (ICoreWebView2EnvironmentOptions *)&options, (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *)&environment_done);
     if (FAILED(hr)) no_web_view(hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ? L"isn't installed on this computer" : L"couldn't start here");
 }
 
