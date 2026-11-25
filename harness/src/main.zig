@@ -2848,6 +2848,7 @@ test {
     _ = @import("who.zig");
     _ = @import("conversations.zig");
     _ = @import("inbox.zig");
+    _ = @import("deskwin.zig");
     _ = @import("session.zig");
     _ = @import("folders.zig");
     _ = @import("environments.zig");
