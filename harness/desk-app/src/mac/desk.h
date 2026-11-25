@@ -44,6 +44,10 @@ void hdesk_every(double seconds, void (*fn)(void *), void *arg);
 // The window's frame on screen (x, y from the bottom left), and setting it.
 void hdesk_window_frame(double *x, double *y, double *w, double *h);
 void hdesk_set_window_frame(double x, double y, double w, double h);
+// The visible part of the window's screen (without the menu bar and the
+// Dock), and the smallest frame the window takes.
+void hdesk_screen_frame(double *x, double *y, double *w, double *h);
+void hdesk_min_frame(double *w, double *h);
 
 // Exported by Zig.
 void hdesk_on_ready(void);

@@ -18,6 +18,10 @@
 //!   `"echo_key":true` its message saying the key; `{"delay_ms":N,…}`
 //!   waits first). Each request is saved as `transcribe-requests/001.json`,
 //!   … with its target, headers and body (a string).
+//! - speech (OpenAI-compatible): `POST …/audio/speech` answers
+//!   `audio/mpeg` bytes, "ID3" and the request's `input`; each request is
+//!   saved as `speech-requests/001.json`, … with its target, headers and
+//!   body.
 //! - search: `GET /res/v1/web/search?q=…` answers `search.json`.
 //! - pages and feeds: `GET /page/NAME` answers the file `pages/NAME`
 //!   (POST too; `?delay_ms=N` answers after N ms), or, when there is a
@@ -58,6 +62,7 @@ pub const Server = struct {
     model_n: std.atomic.Value(u32) = .init(0),
     /// Transcription requests seen so far.
     stt_n: std.atomic.Value(u32) = .init(0),
+    tts_n: std.atomic.Value(u32) = .init(0),
     tg_n: std.atomic.Value(u32) = .init(0),
     /// What setMySettings set for topics: 0 nothing yet, 1 off, 2 on.
     tg_topics: std.atomic.Value(u8) = .init(0),
@@ -77,7 +82,7 @@ pub const Server = struct {
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
         s.* = .{ .io = io, .dir = try gpa.dupe(u8, dir), .listener = listener, .port = listener.port, .mcp = .{ .io = io } };
-        inline for (.{ "requests", "model", "pages", "telegram/in", "telegram/files", "transcribe", "transcribe-requests" }) |sub| {
+        inline for (.{ "requests", "model", "pages", "telegram/in", "telegram/files", "transcribe", "transcribe-requests", "speech-requests" }) |sub| {
             const p = try std.fs.path.join(gpa, &.{ dir, sub });
             defer gpa.free(p);
             try Io.Dir.cwd().createDirPath(io, p);
@@ -239,6 +244,7 @@ pub const Server = struct {
             if (std.mem.endsWith(u8, route, "/messages")) return s.model(a, req, .anthropic, target, body, headers.items, key);
             if (std.mem.endsWith(u8, route, "/chat/completions")) return s.model(a, req, .openai, target, body, headers.items, key);
             if (std.mem.endsWith(u8, route, "/audio/transcriptions")) return s.transcribe(a, req, target, body, headers.items, key);
+            if (std.mem.endsWith(u8, route, "/audio/speech")) return s.speech(a, req, target, body, headers.items);
         }
         if (method == .GET and std.mem.eql(u8, route, "/res/v1/web/search")) {
             const text = s.readScript(a, &.{"search.json"}) orelse "{\"web\":{\"results\":[]}}";
@@ -406,6 +412,18 @@ pub const Server = struct {
             return json(req, @fromBackingInt(@as(u10, @intCast(st))), try errorBody(a, .openai, st, msg));
         }
         return json(req, .ok, script);
+    }
+
+    /// `…/audio/speech`: "ID3" and the request's input, as audio; the
+    /// request kept as `speech-requests/NNN.json`.
+    fn speech(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, target: []const u8, body: []const u8, headers: []const u8) !void {
+        const n = s.tts_n.fetchAdd(1, .acq_rel) + 1;
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "{d:0>3}.json", .{n});
+        const saved = try std.fmt.allocPrint(a, "{{\"target\":{f},\"headers\":{{{s}\"\":\"\"}},\"body\":{f}}}", .{ std.json.fmt(target, .{}), headers, std.json.fmt(body, .{}) });
+        try s.writeRecord(a, try s.path(a, &.{ "speech-requests", name }), saved);
+        const input = jv.str(jv.get(jv.parse(a, body), "input")) orelse return json(req, .bad_request, try errorBody(a, .openai, 400, "no input"));
+        try req.respond(try std.fmt.allocPrint(a, "ID3{s}", .{input}), .{ .extra_headers = &.{.{ .name = "content-type", .value = "audio/mpeg" }} });
     }
 
     /// A file of Telegram's (`GET /file/bot<token>/<path>`, a path getFile
@@ -622,6 +640,87 @@ fn get(io: Io, a: std.mem.Allocator, link: []const u8) !Got {
     defer resp.deinit();
     const body = resp.readAll(a, 1 << 20) catch "";
     return .{ .status = resp.status, .body = body, .location = if (resp.location) |l| try a.dupe(u8, l) else "" };
+}
+
+/// One request to the desk's server on 127.0.0.1:`port`, its own
+/// connection; `cookie` the session ("" none).
+fn deskReq(io: Io, a: std.mem.Allocator, port: u16, method: []const u8, path: []const u8, cookie: []const u8, body: []const u8) !struct { status: u16, head: []const u8, body: []const u8 } {
+    const h = try sock.connect(io, "127.0.0.1", port, 2000);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var sk: sock.Socket = undefined;
+    sk.init(io, h, &rbuf, &wbuf, 40_000);
+    defer sk.close();
+    try sk.writer.print("{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n", .{ method, path, port });
+    if (cookie.len > 0) try sk.writer.print("Cookie: harness_desk={s}\r\n", .{cookie});
+    if (body.len > 0) try sk.writer.print("Content-Type: application/json\r\nOrigin: http://127.0.0.1:{d}\r\n", .{port});
+    try sk.writer.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len});
+    try sk.writer.writeAll(body);
+    try sk.writer.flush();
+    const all = try sk.reader.allocRemaining(a, .limited(4 << 20));
+    const split = std.mem.indexOf(u8, all, "\r\n\r\n") orelse return error.BadResponse;
+    if (all.len < 12) return error.BadResponse;
+    return .{ .status = try std.fmt.parseInt(u16, all[9..12], 10), .head = all[0..split], .body = all[split + 4 ..] };
+}
+
+/// `harness-fake --desk HOME TEXT`: what the desk app and its page do,
+/// over HTTP: a code asked for (state/open-request), read and deleted,
+/// entered for a session cookie; the page and the state read; TEXT sent in
+/// main; the events long-polled until harness's reply. A line each.
+pub fn deskClient(io: Io, a: std.mem.Allocator, home: []const u8, text: []const u8) !void {
+    const out = Io.File.stdout();
+    const state = try std.fs.path.join(a, &.{ home, "state" });
+    const info = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ state, "desk.json" }), a, .limited(64 << 10));
+    const port: u16 = @intCast(jv.int(jv.get(jv.parse(a, info), "port")) orelse return error.NoPort);
+    const code_path = try std.fs.path.join(a, &.{ state, "desk-code" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ state, "open-request" }), .data = "" });
+    var waited: u32 = 0;
+    const code = while (waited < 5000) : (waited += 50) {
+        if (Io.Dir.cwd().readFileAlloc(io, code_path, a, .limited(64))) |x| {
+            const c = std.mem.trim(u8, x, " \r\n");
+            if (c.len > 0) break c;
+        } else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    } else return error.NoCode;
+    Io.Dir.cwd().deleteFile(io, code_path) catch {};
+    try out.writeStreamingAll(io, "code read\n");
+    const entered = try deskReq(io, a, port, "GET", try std.fmt.allocPrint(a, "/enter?code={s}", .{code}), "", "");
+    const at = std.mem.indexOf(u8, entered.head, "set-cookie: harness_desk=") orelse return error.NoSession;
+    const v = entered.head[at + "set-cookie: harness_desk=".len ..];
+    const cookie = v[0 .. std.mem.indexOfScalar(u8, v, ';') orelse return error.NoSession];
+    try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "entered {d}{s}\n", .{ entered.status, if (std.mem.indexOf(u8, entered.head, "HttpOnly; SameSite=Strict") != null) " httponly samesite" else "" }));
+    // the same code again: refused
+    try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "again {d}\n", .{(try deskReq(io, a, port, "GET", try std.fmt.allocPrint(a, "/enter?code={s}", .{code}), "", "")).status}));
+    const page = try deskReq(io, a, port, "GET", "/desk", cookie, "");
+    try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "page {d}{s}\n", .{ page.status, if (std.mem.indexOf(u8, page.body, "/desk/static/desk.js") != null) " with its script" else "" }));
+    const st = try deskReq(io, a, port, "GET", "/desk/api/state", cookie, "");
+    const sv = jv.parse(a, st.body);
+    var seq = jv.int(jv.get(sv, "seq")) orelse 0;
+    try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "state {d} {s}\n", .{ st.status, jv.str(jv.get(sv, "state")) orelse "?" }));
+    var body: std.ArrayList(u8) = .empty;
+    try body.appendSlice(a, "{\"conv\":\"main\",\"text\":");
+    try @import("util.zig").jsonString(&body, a, text);
+    try body.append(a, '}');
+    const sent = try deskReq(io, a, port, "POST", "/desk/api/send", cookie, body.items);
+    try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "sent {d}\n", .{sent.status}));
+    // the events until harness's reply in main
+    var tries: u32 = 0;
+    while (tries < 8) : (tries += 1) {
+        const ev = try deskReq(io, a, port, "GET", try std.fmt.allocPrint(a, "/desk/api/events?after={d}&wait=5", .{seq}), cookie, "");
+        const e = jv.parse(a, ev.body);
+        seq = jv.int(jv.get(e, "seq")) orelse seq;
+        const list = jv.get(e, "events") orelse continue;
+        if (list != .array) continue;
+        for (list.array.items) |x| {
+            if (!std.mem.eql(u8, jv.str(jv.get(x, "type")) orelse "", "message")) continue;
+            const m = jv.get(x, "msg");
+            const from = jv.str(jv.get(m, "from")) orelse "";
+            const words = jv.str(jv.get(m, "text")) orelse "";
+            try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "{s}: {s}\n", .{ from, words }));
+            if (std.mem.eql(u8, from, "harness")) return;
+        }
+    }
+    return error.NoReply;
 }
 
 /// The owner's browser in sign-in tests: told the link (`opened`, as an

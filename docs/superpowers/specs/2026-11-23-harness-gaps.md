@@ -150,6 +150,23 @@ real carcloud (unit tests with harness-fake's Tesla stand-in).
 - **Shipping the generated portraits and clips publicly** is the owner's call
   before a release.
 
+## The desk: open after harness's side was built (2026-11-25)
+
+- **Face Cap's license** isn't verified: `facecap.glb`, the base head and the
+  fitted butler stay out of the repository and releases until it's
+  cleared; if it isn't, an own base head is needed.
+- **The portraits' licensing** (the butler's stills): the owner's call before
+  they ship in the release archive. Until then the butler is copied into
+  `avatars/butler/` by hand for local use.
+- **The female avatar** is skipped for now.
+- **Exact lip-sync timing:** mouth shapes are estimated from the text and
+  stretched to the voice; word-level timing is a later add-on.
+- **An urgent alert's [I'm on it] can't be pressed on the desk;** answering
+  its item (or Telegram) acknowledges it.
+- **The fit's results** reach the page in the shape the desk expects
+  (`head`, `eyes`, `eyemask`, `face.width`, `warnings`, `closed`), to be
+  aligned with the avatar module when it lands.
+
 ## Parked: AI avatar livestreams (owner, 2026-11-24: "not top priority")
 
 Use case: a 24-hour AI avatar livestream that sells or chats.

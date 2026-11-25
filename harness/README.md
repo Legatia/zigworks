@@ -2069,6 +2069,121 @@ system; on Windows that makes the data folder stop inheriting access from
 the folder above it (who may use it stays the same), and it stays so
 after `/env rm`.
 
+## Desk
+
+The desk is harness's own window on this computer: the avatar takes most
+of it, the chat runs along the bottom, and the side panel holds Needs you,
+Topics and Lately. It's a small app of its own, `harness-desk`, that shows
+harness's pages in the system's web view (WKWebView, WebView2, WebKitGTK);
+harness serves them on the app server's port, on 127.0.0.1 only.
+
+```
+harness open              # start the desk app, or bring it to the front
+harness stop              # ask the running harness to stop, and wait for it
+harness autostart on|off  # start harness run when you log in, or no longer
+```
+
+`harness open` looks for `harness-desk` beside harness (on macOS also
+`harness-desk.app` in Applications) and says so when it isn't there.
+Closing the window leaves harness running. `autostart on` writes a
+LaunchAgent (`~/Library/LaunchAgents/com.legatia.harness.plist`), an XDG
+autostart entry (`~/.config/autostart/harness.desktop`) or the HKCU Run
+key's `harness` value; each runs `harness --home DIR run` at login.
+
+**The port.** `[apps] port` is fixed: `harness init` writes a free one, and
+an install with `port = 0` gets one at its next start. If it's taken at a
+start, harness tries the next ten, writes the one it used and says so. At
+each start `state/desk.json` names the binary, the port, the data folder
+and the version, which is how the app finds harness.
+
+**Getting in.** The app writes `state/open-request`; harness answers with a
+one-time code in `state/desk-code`, good for 60 s and once, readable only
+by you, deleted when it's used or runs out. The app opens
+`/enter?code=…`, and harness answers with a session cookie (HttpOnly,
+SameSite=Strict, no expiry) that it keeps in memory only: a restart of
+harness ends every session, and the app enters again on its own. Nothing
+reusable is written to disk.
+
+A limit: a program running as you on this computer could read the code
+file within its 60 s, or talk to harness the way the app does. That's the
+same as for any local app. harness's own commands run sandboxed when
+unattended, and on the host only with your approval.
+
+**What it shows.** The avatar's state comes from harness's facts, never
+from what the model wrote:
+
+| State | When | Frame |
+|---|---|---|
+| urgent | an urgent item or alert is open | red |
+| speaking | the desk is reading a reply aloud | cyan |
+| needs you | an inbox item is open | magenta |
+| working | a run is going | cyan, with a sweep |
+| quiet | quiet hours | dimmed |
+| resting | none of these | grey |
+
+A run that ends with a reply gives a brief smile; one that ends in an
+error, a look of concern. The status card says what harness knows: the run
+going (your message's first line, or "Routine: NAME"), its helpers and how
+long; how many items wait; the next thing coming.
+
+**The chat** is main or a topic, the same conversations as Telegram.
+What you type there is your turn, as if typed in Telegram; Telegram gets a
+quiet "You, on the desk: …" first, so the phone's thread reads right
+(`[desk] echo = off` turns that off). Buttons answer items as Telegram's
+do. The desk keeps each conversation's last 50 messages in memory, filled
+from the log at start; a private conversation's are never on disk, so
+after a restart its history starts empty and the desk says so. The
+microphone shows when `[voice]` is set: what you say is transcribed, shown
+in quotes, and taken as typed.
+
+**Needs you** lists every open item, urgent ones first; **Topics** has a
+dot for news since you last opened a topic on the desk
+(`state/desk-seen`); **Lately** is the topics' cards' own lines.
+
+**Settings** (the gear): the avatar (Avatar packs, below), your own photo
+(JPEG or PNG, up to 10 MB, with the line "This is me, someone who agreed,
+or a made-up character." ticked first; it stays in `avatars/NAME/`), and
+speech.
+
+```ini
+[desk]
+echo = on            ; a quiet echo in Telegram of what you type on the desk
+avatar = butler      ; a folder in avatars/
+speak = off          ; off, browser (the system's voice), or a provider with api = openai
+speak_model = tts-1  ; that provider's speech model and voice
+speak_voice = alloy
+```
+
+### Speech
+
+Replies in the conversation the desk shows are read aloud once (a long one
+its first two sentences, then "The rest is on screen."); urgent alerts are
+always read while the desk is open and not muted; in quiet hours only
+they are. With a provider, harness fetches the audio
+(`POST {url}/audio/speech`) with the provider's key, so the key never
+reaches the page. "Play the message" reads the last one again. Linux's web
+view has no speech of its own, so there it's a provider or off.
+
+### The desk's paths
+
+For the desk apps (harness's side, on the app server's port):
+
+- `GET /alive`: 200 while harness runs.
+- `GET /enter?code=CODE`: 303 to `/desk` with the session cookie, or 403.
+- `/desk` (the page), `/desk/static/F` (its files, in the binary),
+  `/desk/avatars/NAME/F` (`avatars/`), `/desk/assets/P` (`desk-assets/`,
+  the fit's files), `/desk/apps/NAME` (an app in its frame); the files of
+  `avatars/` and `desk-assets/` up to 20 MB, kept by the web view for a
+  day.
+- `/desk/api/…`, the session's only and never a framed app's: `GET state`,
+  `GET history?conv=`, `GET events?after=N&wait=25`, `POST send`,
+  `POST answer`, `POST seen`, `POST settings`, `POST voice?conv=` and
+  `POST upload?avatar=&part=&consent=yes` (10 MB), `POST speech`. A lost
+  session answers 401 `{"error":"signed out"}`.
+- The page tells the app `{"badge": N}`, `{"attention": "urgent"}` and
+  `{"reenter": true}` through `window.webkit.messageHandlers.harness` or
+  `window.chrome.webview`.
+
 ## Apps
 
 An app is a folder of web files in `apps/NAME/` with an `app.ini`, which
@@ -2089,8 +2204,8 @@ to = main                ; where its questions are asked
 
 `harness run` and `harness chat` start the app server on 127.0.0.1 and
 print its link, made new at each start (`[apps] on = off` in config.ini
-switches it off; `port = 0` takes a free port, a fixed one lets you reach
-it over `ssh -L`). The page lists the apps; each opens in a frame of
+switches it off; its port is fixed, for the desk, and lets you reach it
+over `ssh -L`). The page lists the apps; each opens in a frame of
 harness's page that keeps it away from that page, other apps, cookies
 and storage, and whose rules let it load nothing from anywhere but
 harness. Requests under another name for this machine (localhost) or
@@ -3498,6 +3613,135 @@ Not yet: the day's informational posts gathered into the morning digest,
 harness's own lines (a task paused for its budget, settings changed) and
 memory notices held at night.
 
+## Avatar packs
+
+The desk's avatar is a live 3D head: a portrait projected onto a rigged
+head with the 52 standard (ARKit) expression shapes, so it blinks, looks
+about, breathes, nods, smiles and moves its mouth with the voice. An
+avatar is a folder, `avatars/NAME/` in the data folder, with `avatar.ini`
+naming its files:
+
+| Key | File |
+|---|---|
+| `still` | the portrait: eyes open, facing the camera, mouth closed (JPEG or PNG) |
+| `closed` | optional: the same portrait with the eyes closed, nothing else changed |
+| `head` | the fitted head, `head.bin` |
+| `eyes` | the eyes' texture, `eyes.png` |
+| `eyemask` | where the eyes-closed portrait blends in, `eyemask.png` |
+
+```ini
+# avatars/butler/avatar.ini
+[avatar]
+still = still.jpg
+closed = closed.jpg
+head = head.bin
+eyes = eyes.png
+eyemask = eyemask.png
+```
+
+The keys sit in an `[avatar]` section (as the desk's upload writes it);
+other sections are refused by `avatar check` and skipped by the desk.
+Values are file names in the pack's own folder. `head`, `eyes` and
+`eyemask` come together: a pack with only a still hasn't been fitted yet,
+and the desk shows the still, breathing, and offers to fit it. The desk
+serves pack files up to 20 MB each.
+
+### Fitting
+
+The desk fits a portrait itself, in its window, in a few seconds: it
+finds the face's landmarks (MediaPipe's face landmarker), maps a neutral
+base head onto them and carries every expression shape along. It refuses
+a photo with the reason:
+
+| Check | Message |
+|---|---|
+| no face found | No face found. Use a clear photo of one face. |
+| more than one face | There's more than one face. Use a photo of one person. |
+| turned more than 8° | The face is turned. Use a photo facing the camera. |
+| mouth open | The mouth is open. Use a photo with the mouth closed. |
+| eyes closed | The eyes are closed. Use a photo with the eyes open; add an eyes-closed version after. |
+| face under 250 px wide | The face is too small. Use a larger photo. |
+
+and warns without refusing: a face under 500 px wide ("This will look
+soft. A larger photo looks sharper."), a photo taller than wide ("A photo
+wider than tall fills the window; this one leaves bands at the sides.").
+
+The fit needs its files in the data folder's `desk-assets/`: MediaPipe
+tasks-vision 0.10.14 and its face landmarker model (Apache 2.0), and the
+base head, `base-head.bin`. For local use, `sh tools/fetch-desk-assets.sh
+DATA/desk-assets` fetches MediaPipe's files and checks each by SHA-256;
+the base head is made with `tools/make-base-head.html` (tools/README).
+
+### What the desk's page needs
+
+The avatar module (`src/desk/avatar.js`) and the fit (`src/desk/fit.js`)
+run under the desk's Content-Security-Policy with every load on harness's
+own server. They need, besides `'self'`:
+
+- `script-src 'wasm-unsafe-eval'`: the face landmarker is WebAssembly
+  (without it the fit can't start). No `'unsafe-eval'`, no `'unsafe-inline'`,
+  no worker. The landmarker adds a `<script src>` for its loader
+  (`/desk/assets/mediapipe/wasm/…`, same origin) to the page's body.
+- `img-src blob:`: images are decoded from fetched bytes (a pack's files,
+  an uploaded File) through `blob:` URLs.
+- `.wasm` served as `application/wasm` and `.mjs` as `text/javascript`
+  (else a slower fallback with a console error).
+
+Pack files are fetched with `no-cache`, so a refit shows at once while the
+server's `Cache-Control: private, max-age=86400` and ETag keep reloads
+cheap. The fit records the still's SHA-256 in the head: the desk saves as
+the still exactly the bytes it gave the fit (re-encoding it, or stripping
+its EXIF, makes the head read as fitted to another photo, and the still
+shows instead).
+
+### An eyes-closed version
+
+The avatar rests with its eyes closed, and a blink lands on the
+eyes-closed portrait, so adding one is recommended. Make it with an image
+tool (any that edits a photo from a prompt): give it the portrait and ask
+"Close the eyes. Change nothing else." It's one image edit, not a video.
+It must line up with the portrait: the landmarks outside the eyes may
+move 12 px at most, else "This eyes-closed photo doesn't line up with the
+portrait. Change only the eyes." Without one, the closed eyes are drawn in
+the skin's own tone.
+
+### Checking a pack
+
+`harness avatar check NAME` checks `avatars/NAME/`: `avatar.ini`, each
+file's type by its first bytes and its size, that the eyes-closed photo
+and the head match the still's size (as shown, a phone photo's rotation
+applied) and that the head was fitted to these very bytes, and the head
+file's header: its version, its vertex count, the
+52 shapes, and that every array lies inside the file. It exits 0 when the
+pack is good, 1 with the problems listed.
+
+### The head file
+
+`head.bin`, format version 1: 8 bytes `\x89HEAD\r\n\x1a`, a 32-bit
+little-endian version (1), a 32-bit little-endian header length (a
+multiple of 4), the header as JSON padded with spaces, then the arrays.
+The header's `arrays` maps each name to `[TYPE, OFFSET, COUNT]` (`f32`,
+`i16`, `u16`, `u32` or `u8`; the offset from the arrays' start, a
+multiple of 4; the count in values). A fitted head (`"kind": "head"`)
+has `vertices`, `image` (the still's width and height), `still` (its
+bytes and SHA-256, when the fit had them), `shapes` and `shapeScale`,
+the photo's `face`, `mouth` and `eyes` (outlines, irises, reflections,
+lid tones) and `eyeCrop`; its arrays are `head.pos`,
+`head.nrm`, `head.uv`, `head.uvC` (the eyes-closed projection),
+`head.idx`, a `shape.NAME.pos` and `shape.NAME.nrm` per shape (16-bit,
+scaled by `shapeScale`), `teeth.pos` and `teeth.idx`. Coordinates are
+the photo's pixels, x right, y up. The base head is the same container
+with `"kind": "base"`, the model's own units, and the 478 landmarks.
+
+### What isn't shipped yet
+
+The base head is three.js's Face Cap sample (r170, by Bannaflak), and its
+license hasn't been verified, so neither `base-head.bin` nor the built-in
+butler (its portraits and its fitted files) is in the repository or the
+release yet; until it's cleared, fitting works only where the owner made
+the base head locally. The gaps list keeps this open, with an own base
+head as the alternative.
+
 ## Commands
 
 `/stop [NAME]`, `/new`, `/status`, `/brief [NAME]`, `/topics`, `/topic add|rm`, `/tasks`,
@@ -3527,8 +3771,8 @@ CLI: `init [--butler]`, `secret add|rm|list`, `login add|list|rm`, `pair`, `run`
 `memory [list|pin|unpin|forget ID]`, `people list|show|import`,
 `snapshot list|take|changes|restore`, `undo RUN`, `env list|check|rm|key`,
 `agent list|show|rm`, `mcp list|login|logout`, `log verify|tail|runs|session|search`, `inbox [--json]`,
-`app list|approve|rm|fork|versions|revert`, `import hermes`, `skill add|list|show|update|rm`,
-`health`, `doctor`, `report`, `version`. `--home DIR` may come anywhere on
+`app list|approve|rm|fork|versions|revert`, `import hermes`, `skill add|list|show|update|rm`, `avatar check NAME`,
+`stop`, `open`, `autostart on|off`, `health`, `doctor`, `report`, `version`. `--home DIR` may come anywhere on
 the line; arguments a command does not take are refused. `health` exits 0
 only while `harness run` holds the folder and has ticked in the last 90 s;
 `doctor` exits 0 when every piece works (Home butler).

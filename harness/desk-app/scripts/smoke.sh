@@ -7,7 +7,8 @@
 # usage: scripts/smoke.sh path/to/harness-desk.app  (built by `zig build smoke`)
 # Needs a window session (Aqua); says SKIP without one. WebGL 2, media and
 # speech without a click are required here, and only reported on CI, whose
-# runners may have no GPU or audio.
+# runners may have no GPU or audio. DESK_SMOKE_SCREEN="X Y W H" pretends the
+# screen's visible part is that, for the frame checks.
 set -u
 
 APP=${1:?usage: smoke.sh path/to/harness-desk.app}
@@ -192,15 +193,42 @@ expect_again "show down" 2 "the window says harness isn't running" 20
 expect_log "exit 0 run" "the harness the app started is reaped"
 
 # ---- the frame ----
-cmd "frame 120 140 1100 760"
-expect_log "frame 120 140 1100 760" "the window takes a new frame"
+# One inside the screen's visible part, at least the window's smallest
+# frame, and not the one it has (a CI runner's screen may be 1024×768).
+# DESK_SMOKE_SCREEN="X Y W H" pretends the visible part is that, to try a
+# small screen on a large one.
+screen_line=$(grep "^screen " "$T/log" | head -1)
+target=none
+if [ -z "$screen_line" ]; then
+    not_ok "the app says where its window can go"
+else
+    # screen X Y W H min MW MH
+    set -- $screen_line
+    visible="$2 $3 $4 $5"
+    minimum="$7 $8"
+    [ -n "${DESK_SMOKE_SCREEN:-}" ] && visible=$DESK_SMOKE_SCREEN
+    current=$(grep "^frame " "$T/log" | tail -1 | cut -d' ' -f2-)
+    target=$(python3 "$HERE/scripts/frame_target.py" "$visible" "$minimum" "$current") || target=none
+fi
+if [ "$target" = none ]; then
+    echo "# SKIP: the screen's visible part ($visible) leaves no room for another frame of at least $minimum, so the frame isn't checked"
+else
+    cmd "frame $target"
+    expect_log "frame $target" "the window takes a new frame ($target, inside $visible)"
+fi
 cmd "quit"
 i=0
 while kill -0 "$APP_PID" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
 if kill -0 "$APP_PID" 2>/dev/null; then not_ok "Quit quits"; else ok "Quit quits"; fi
 launch
 expect_log "ready" "the app starts again" 30
-if [ "$(grep "^frame " "$T/log" | head -1)" = "frame 120 140 1100 760" ]; then ok "the window's frame is remembered"; else not_ok "the window's frame is remembered ($(grep "^frame " "$T/log" | head -1))"; fi
+if [ "$target" = none ]; then
+    echo "# SKIP: the window's frame is remembered (no other frame to set)"
+elif [ "$(grep "^frame " "$T/log" | head -1)" = "frame $target" ]; then
+    ok "the window's frame is remembered"
+else
+    not_ok "the window's frame is remembered ($(grep "^frame " "$T/log" | head -1), not $target)"
+fi
 cmd "quit"
 i=0
 while kill -0 "$APP_PID" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done

@@ -44,6 +44,8 @@ const sys = struct {
     extern fn hdesk_every(seconds: f64, f: *const fn (?*anyopaque) callconv(.c) void, arg: ?*anyopaque) void;
     extern fn hdesk_window_frame(x: *f64, y: *f64, w: *f64, h: *f64) void;
     extern fn hdesk_set_window_frame(x: f64, y: f64, w: f64, h: f64) void;
+    extern fn hdesk_screen_frame(x: *f64, y: *f64, w: *f64, h: *f64) void;
+    extern fn hdesk_min_frame(w: *f64, h: *f64) void;
 };
 
 const App = struct {
@@ -306,6 +308,7 @@ fn startRun(r: @FieldType(Effect, "run"), turn: std.mem.Allocator) void {
 export fn hdesk_on_ready() void {
     log("ready", .{});
     logFrame();
+    logScreen();
     dispatch(.start);
     sys.hdesk_every(1.0, onTick, null);
     if (hooks_on) if (app.hooks != null) sys.hdesk_every(0.1, onHooks, null);
@@ -393,6 +396,21 @@ fn logFrame() void {
     var h: f64 = 0;
     sys.hdesk_window_frame(&x, &y, &w, &h);
     log("frame {d} {d} {d} {d}", .{ x, y, w, h });
+}
+
+/// Where the window can go: the screen's visible frame, and the smallest
+/// frame the window takes (so the smoke picks a frame that fits).
+fn logScreen() void {
+    if (!hooks_on) return;
+    var x: f64 = 0;
+    var y: f64 = 0;
+    var w: f64 = 0;
+    var h: f64 = 0;
+    sys.hdesk_screen_frame(&x, &y, &w, &h);
+    var mw: f64 = 0;
+    var mh: f64 = 0;
+    sys.hdesk_min_frame(&mw, &mh);
+    log("screen {d} {d} {d} {d} min {d} {d}", .{ x, y, w, h, mw, mh });
 }
 
 fn onHooks(_: ?*anyopaque) callconv(.c) void {

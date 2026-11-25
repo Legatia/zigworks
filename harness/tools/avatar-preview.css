@@ -1,0 +1,18 @@
+:root { --bg: #07070D; --panel: rgba(14, 15, 26, 0.85); --line: #3A3D5C; --text: #E8E9F3; --muted: #9A9CB8; --cyan: #22E5FF; color-scheme: dark; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
+#stage { position: fixed; inset: 0; }
+.top { position: fixed; top: 12px; left: 16px; display: flex; gap: 8px; align-items: center; z-index: 2; }
+#status { padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); font: 12px ui-monospace, monospace; }
+.info { position: relative; }
+.info button { width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--line); background: var(--panel); color: var(--muted); cursor: pointer; }
+.bubble { position: absolute; top: 32px; left: 0; width: min(340px, calc(100vw - 32px)); padding: 10px 12px; background: #0E0F1A; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+.dock { position: fixed; left: 16px; right: 16px; bottom: 16px; display: flex; flex-wrap: wrap; gap: 8px 16px; justify-content: center; padding: 10px; background: var(--panel); border: 1px solid #24263A; border-radius: 12px; z-index: 2; }
+.group { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.lbl { font: 11px ui-monospace, monospace; color: var(--muted); margin-right: 4px; }
+button { font: inherit; color: var(--text); background: transparent; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; min-height: 32px; cursor: pointer; }
+button[aria-pressed="true"] { border-color: var(--cyan); color: var(--cyan); }
+.say input { font: inherit; color: var(--text); background: rgba(7, 7, 13, 0.6); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; min-width: 12rem; }
+.say #text { min-width: 22rem; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+body.bare .top, body.bare .dock { display: none; }

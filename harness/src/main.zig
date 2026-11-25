@@ -24,6 +24,11 @@ const undo_mod = @import("undo.zig");
 const doctor = @import("doctor.zig");
 const hermes_import = @import("hermes_import.zig");
 const skill_cmd = @import("skill_cmd.zig");
+const deskwin = @import("deskwin.zig");
+const autostart = @import("autostart.zig");
+const mail_mod = @import("mail.zig");
+const sock = @import("sock.zig");
+const avatar = @import("avatar.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -44,6 +49,9 @@ const usage =
     \\  login rm NAME              remove a login, its secrets and its browser profile
     \\  pair                       print a code to send to the bot as /pair CODE
     \\  run                        run the agent: Telegram and the scheduler
+    \\  stop                       ask the running harness to stop, and wait for it
+    \\  open                       open the desk app (harness-desk), or bring it to the front
+    \\  autostart [on|off]         start harness run when you log in, or no longer; alone: which
     \\  chat                       talk to the agent in this terminal
     \\  brief [NAME]               collect and print a brief now
     \\  task run NAME              run a scheduled task now and print its answer
@@ -101,6 +109,8 @@ const usage =
     \\  skill update [NAME] [--force] [--yes]
     \\                             fetch again and show what changed; an edited one only
     \\                             with --force
+    \\  avatar check NAME          check the desk's avatar pack in avatars/NAME: its
+    \\                             files, avatar.ini and the head file
     \\  version | help
     \\
     \\The data folder is --home (anywhere on the line), else HARNESS_HOME, else
@@ -325,7 +335,11 @@ const App = struct {
         if (role.usesTools()) c.startExtras();
         // apps in the browser, for as long as this start runs
         if ((role == .run or role == .chat) and c.cfg.apps.on) {
-            if (c.startApps(app.arena)) |url| complain("Apps: {s}   (new each start)", .{url}) else |e| complain("note: the app server didn't start: {s}", .{@errorName(e)});
+            if (c.startApps(app.arena)) |url| {
+                complain("Apps: {s}   (new each start)", .{url});
+                if (c.apps_note.len > 0) complain("note: {s}", .{c.apps_note});
+                writeDeskJson(app, c) catch |e| complain("note: state/desk.json was not written: {s}", .{@errorName(e)});
+            } else |e| complain("note: the app server didn't start: {s}", .{@errorName(e)});
         }
         var warns = std.mem.tokenizeScalar(u8, c.mcp_warn, '\n');
         while (warns.next()) |w| complain("note: mcp.ini: {s}", .{w});
@@ -434,10 +448,14 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
     if (eql(cmd, "app")) return appCmd(app, rest);
     if (eql(cmd, "inbox")) return inboxCmd(app, rest);
     if (eql(cmd, "health")) return healthCmd(app);
+    if (eql(cmd, "stop")) return stopCmd(app);
+    if (eql(cmd, "open")) return openCmd(app);
+    if (eql(cmd, "autostart")) return autostartCmd(app, if (rest.len == 0) "" else rest[0]);
     if (eql(cmd, "doctor")) return doctorCmd(app);
     if (eql(cmd, "report")) return reportCmd(app);
     if (eql(cmd, "import")) return importCmd(app, rest);
     if (eql(cmd, "skill")) return skillCmd(app, rest);
+    if (eql(cmd, "avatar")) return avatarCmd(app, rest[1]);
     complain("unknown command {s}; see harness help", .{cmd});
     return .usage;
 }
@@ -473,6 +491,8 @@ fn initCmd(app: *App, args: []const []const u8) !Exit {
             try f.writeStreamingAll(app.io, butler_persona);
         } else |e| if (e != error.PathAlreadyExists) return e;
     }
+    // the desk app finds harness on a fixed port
+    initPort(app) catch |e| complain("note: [apps] port was not written: {s}", .{@errorName(e)});
     try outAll(app.io, try initText(app.arena, app.home, butler_on, asked));
     // a Hermes setup to bring over: said, never done
     if (hermes_import.noticeFor(app.io, app.arena, app.env)) |line| try outPrint(app.io, "{s}\n", .{line});
@@ -1578,6 +1598,19 @@ fn envKeyCmd(app: *App, name: []const u8) !Exit {
     return .ok;
 }
 
+/// `harness avatar check NAME`: the pack in avatars/NAME (avatar.zig).
+fn avatarCmd(app: *App, name: []const u8) !Exit {
+    const dir = try std.fs.path.join(app.arena, &.{ app.home, "avatars", name });
+    const st = Io.Dir.cwd().statFile(app.io, dir, .{}) catch null;
+    if (st == null or st.?.kind != .directory) {
+        complain("no avatar {s}: there is no folder {s}", .{ name, dir });
+        return .failed;
+    }
+    const r = try avatar.check(app.io, app.arena, dir);
+    try outAll(app.io, try avatar.text(app.arena, name, dir, r));
+    return if (r.problems.len == 0) .ok else .failed;
+}
+
 const app_usage = "usage: harness app list | app approve NAME | app rm NAME | app fork NAME NEW | app versions NAME | app revert NAME N";
 
 fn appArgsOk(rest: []const []const u8) bool {
@@ -2094,6 +2127,185 @@ fn reportCmd(app: *App) !Exit {
     return .ok;
 }
 
+/// `[apps] port` when it is 0: a free port the system gives now.
+fn initPort(app: *App) !void {
+    const p = try core_mod.Paths.init(app.arena, app.home);
+    const text = Io.Dir.cwd().readFileAlloc(app.io, p.config, app.arena, .limited(1 << 20)) catch return;
+    const cfg = config.parse(app.arena, text) catch return;
+    if (cfg.apps.port != 0) return;
+    const l = try sock.Listener.openExclusive(0);
+    const port = l.port;
+    l.close();
+    try util.writeReplace(app.io, p.config, try mail_mod.setKey(app.arena, text, "apps", "port", try std.fmt.allocPrint(app.arena, "{d}", .{port})));
+}
+
+/// `state/desk.json`: where the desk app finds harness (this binary, its
+/// port, its data folder, its version).
+fn writeDeskJson(app: *App, c: *Core) !void {
+    const s = c.app_server orelse return;
+    const exe = std.process.executablePathAlloc(app.io, app.arena) catch "";
+    const home = Io.Dir.cwd().realPathFileAlloc(app.io, app.home, app.arena) catch app.home;
+    const path = try std.fs.path.join(app.arena, &.{ c.paths.state, "desk.json" });
+    try util.writeReplace(app.io, path, try deskwin.deskJson(app.arena, exe, s.port, home, build_options.version, app.env.get("PATH") orelse ""));
+}
+
+/// `harness stop`: state/stop-request for the running harness, which ends
+/// at its next tick; waits up to 20 s for it.
+fn stopCmd(app: *App) !Exit {
+    const p = try core_mod.Paths.init(app.arena, app.home);
+    if (!core_mod.lockHeld(app.io, p)) {
+        complain("harness isn't running.", .{});
+        return .failed;
+    }
+    try Io.Dir.cwd().writeFile(app.io, .{ .sub_path = try std.fs.path.join(app.arena, &.{ p.state, "stop-request" }), .data = "" });
+    var waited: u32 = 0;
+    while (waited < 20_000) : (waited += 100) {
+        if (!core_mod.lockHeld(app.io, p)) {
+            try outAll(app.io, "Stopped.\n");
+            return .ok;
+        }
+        app.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+    complain("Asked harness to stop; it is still finishing.", .{});
+    return .failed;
+}
+
+/// `harness autostart on|off`: `harness --home DIR run` at login; alone,
+/// whether it does (`on` or `off` first).
+fn autostartCmd(app: *App, word: []const u8) !Exit {
+    const on = eql(word, "on");
+    const exe = try std.process.executablePathAlloc(app.io, app.arena);
+    const home = Io.Dir.cwd().realPathFileAlloc(app.io, app.home, app.arena) catch app.home;
+    if (word.len == 0) {
+        const is_on = switch (builtin.os.tag) {
+            .windows => winRun.exists(app.arena),
+            else => blk: {
+                const user = app.env.get("HOME") orelse break :blk false;
+                const path = if (builtin.os.tag == .macos) try autostart.launchAgentPath(app.arena, user) else try autostart.xdgPath(app.arena, app.env.get("XDG_CONFIG_HOME"), user);
+                _ = Io.Dir.cwd().statFile(app.io, path, .{}) catch break :blk false;
+                break :blk true;
+            },
+        };
+        try outAll(app.io, autostart.statusLine(is_on));
+        return .ok;
+    }
+    switch (builtin.os.tag) {
+        .windows => {
+            const value = try autostart.runValue(app.arena, exe, home);
+            if (on) try winRun.set(app.arena, value) else if (!(winRun.delete(app.arena) catch false)) {
+                try outAll(app.io, "Open at login was already off.\n");
+                return .ok;
+            }
+        },
+        else => {
+            const user = app.env.get("HOME") orelse {
+                complain("no HOME is set: can't tell where your login items are", .{});
+                return .failed;
+            };
+            const path = if (builtin.os.tag == .macos) try autostart.launchAgentPath(app.arena, user) else try autostart.xdgPath(app.arena, app.env.get("XDG_CONFIG_HOME"), user);
+            if (on) {
+                const text = if (builtin.os.tag == .macos) try autostart.launchAgent(app.arena, exe, home, app.env.get("PATH") orelse "/usr/bin:/bin:/usr/sbin:/sbin") else try autostart.xdgEntry(app.arena, exe, home);
+                try Io.Dir.cwd().createDirPath(app.io, std.fs.path.dirname(path) orelse ".");
+                try util.writeReplace(app.io, path, text);
+            } else {
+                Io.Dir.cwd().deleteFile(app.io, path) catch |e| switch (e) {
+                    error.FileNotFound => {
+                        try outAll(app.io, "Open at login was already off.\n");
+                        return .ok;
+                    },
+                    else => return e,
+                };
+            }
+        },
+    }
+    try outAll(app.io, if (on) "harness run starts when you log in.\n" else "harness run no longer starts when you log in.\n");
+    return .ok;
+}
+
+/// The HKCU Run key's `harness` value (Windows).
+const winRun = struct {
+    const subkey = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const HKEY_CURRENT_USER: usize = 0x80000001;
+    const REG_SZ: u32 = 1;
+    extern "advapi32" fn RegSetKeyValueW(key: usize, sub: [*:0]const u16, name: [*:0]const u16, kind: u32, data: ?*const anyopaque, len: u32) callconv(.winapi) i32;
+    extern "advapi32" fn RegDeleteKeyValueW(key: usize, sub: [*:0]const u16, name: [*:0]const u16) callconv(.winapi) i32;
+    extern "advapi32" fn RegGetValueW(key: usize, sub: [*:0]const u16, name: [*:0]const u16, flags: u32, kind: ?*u32, data: ?*anyopaque, len: ?*u32) callconv(.winapi) i32;
+
+    /// Whether the value is there.
+    fn exists(a: std.mem.Allocator) bool {
+        if (builtin.os.tag != .windows) return false;
+        const sub = std.unicode.utf8ToUtf16LeAllocZ(a, subkey) catch return false;
+        const name = std.unicode.utf8ToUtf16LeAllocZ(a, "harness") catch return false;
+        // RRF_RT_REG_SZ
+        return RegGetValueW(HKEY_CURRENT_USER, sub, name, 0x2, null, null, null) == 0;
+    }
+
+    fn set(a: std.mem.Allocator, value: []const u8) !void {
+        if (builtin.os.tag != .windows) return error.Unsupported;
+        const v = try std.unicode.utf8ToUtf16LeAllocZ(a, value);
+        const rc = RegSetKeyValueW(HKEY_CURRENT_USER, try std.unicode.utf8ToUtf16LeAllocZ(a, subkey), try std.unicode.utf8ToUtf16LeAllocZ(a, "harness"), REG_SZ, v.ptr, @intCast((v.len + 1) * 2));
+        if (rc != 0) return error.RegistryRefused;
+    }
+
+    /// False: there was no such value.
+    fn delete(a: std.mem.Allocator) !bool {
+        if (builtin.os.tag != .windows) return error.Unsupported;
+        const rc = RegDeleteKeyValueW(HKEY_CURRENT_USER, try std.unicode.utf8ToUtf16LeAllocZ(a, subkey), try std.unicode.utf8ToUtf16LeAllocZ(a, "harness"));
+        if (rc == 2) return false;
+        if (rc != 0) return error.RegistryRefused;
+        return true;
+    }
+};
+
+/// `harness open`: the desk app started (or brought to the front) with
+/// this data folder; said plainly when it isn't installed.
+fn openCmd(app: *App) !Exit {
+    const exe_dir = std.process.executableDirPathAlloc(app.io, app.arena) catch ".";
+    const user = app.env.get(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME") orelse "";
+    const os: autostart.Os = switch (builtin.os.tag) {
+        .macos => .macos,
+        .windows => .windows,
+        else => .linux,
+    };
+    const home = Io.Dir.cwd().realPathFileAlloc(app.io, app.home, app.arena) catch app.home;
+    var found: ?[]const u8 = null;
+    for (try autostart.deskAppCandidates(app.arena, os, exe_dir, user)) |cand| {
+        if (Io.Dir.cwd().statFile(app.io, cand, .{})) |_| {
+            found = cand;
+            break;
+        } else |_| {}
+    }
+    // Linux: on PATH too
+    if (found == null and os == .linux) if (app.env.get("PATH")) |pv| {
+        var it = std.mem.splitScalar(u8, pv, ':');
+        while (it.next()) |dir| {
+            if (dir.len == 0) continue;
+            const cand = try std.fs.path.join(app.arena, &.{ dir, "harness-desk" });
+            if (Io.Dir.cwd().statFile(app.io, cand, .{})) |_| {
+                found = cand;
+                break;
+            } else |_| {}
+        }
+    };
+    const app_path = found orelse {
+        complain("The desk app isn't installed: put harness-desk beside harness (it comes in the release archive){s}.", .{if (os == .macos) ", or harness-desk.app in Applications" else ""});
+        return .failed;
+    };
+    if (os == .macos) {
+        // `open -a` starts it, or brings the running one to the front
+        var child = try std.process.spawn(app.io, .{ .argv = &.{ "/usr/bin/open", "-a", app_path, "--args", "--home", home }, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
+        const term = try child.wait(app.io);
+        if (term != .exited or term.exited != 0) {
+            complain("The desk app didn't open ({s}).", .{app_path});
+            return .failed;
+        }
+        return .ok;
+    }
+    // its own: one window, brought to the front by the app itself
+    _ = try std.process.spawn(app.io, .{ .argv = &.{ app_path, "--home", home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = if (os == .windows) null else 0 });
+    return .ok;
+}
+
 fn healthCmd(app: *App) !Exit {
     const p = try core_mod.Paths.init(app.arena, app.home);
     var buf: [256]u8 = undefined;
@@ -2172,6 +2384,11 @@ fn watchSignals(c: *Core) void {
         const n = got_signal.load(.acquire);
         if (n != 0) {
             c.endBySignal(signalName(n));
+            std.process.exit(0);
+        }
+        // `harness stop` (state/stop-request, taken by the tick)
+        if (c.stop_requested.load(.acquire)) {
+            c.endBySignal("harness stop");
             std.process.exit(0);
         }
         if (c.quitting.load(.acquire)) {
@@ -2369,7 +2586,8 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     const cmd = args[0];
     const rest = args[1..];
     if (eql(cmd, "init")) return if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "--butler"))) null else "usage: harness init [--butler]";
-    inline for (.{ "help", "--help", "-h", "version", "pair", "run", "chat", "health", "doctor", "report" }) |c| {
+    if (eql(cmd, "autostart")) return if (rest.len == 0 or (rest.len == 1 and (eql(rest[0], "on") or eql(rest[0], "off")))) null else "usage: harness autostart [on|off]";
+    inline for (.{ "help", "--help", "-h", "version", "pair", "run", "chat", "health", "doctor", "report", "stop", "open" }) |c| {
         if (eql(cmd, c)) return if (rest.len == 0) null else "usage: harness " ++ c ++ " (it takes no arguments)";
     }
     if (eql(cmd, "brief")) return if (rest.len <= 1) null else "usage: harness brief [NAME]";
@@ -2405,6 +2623,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
     if (eql(cmd, "secret")) return if (secretArgs(rest) == null) secret_usage else null;
     if (eql(cmd, "snapshot")) return if (snapshotArgsOk(rest)) null else snapshot_usage;
     if (eql(cmd, "people")) return if (peopleArgsOk(rest)) null else people_usage;
+    if (eql(cmd, "avatar")) return if (rest.len == 2 and eql(rest[0], "check") and avatar.validName(rest[1])) null else avatar.usage;
     if (eql(cmd, "undo")) return if (rest.len == 1 and (std.fmt.parseInt(u64, rest[0], 10) catch null) != null) null else undo_usage;
     if (eql(cmd, "env")) return if (envArgsOk(rest)) null else env_usage;
     if (eql(cmd, "import")) return if (hermes_import.parseArgs(rest) == null) import_usage else null;
@@ -2502,6 +2721,26 @@ test "extra_or_unknown_arguments_are_refused" {
         std.debug.print("  {s}\n", .{why});
         return error.TestUnexpectedResult;
     };
+}
+
+test "stop_autostart_open_take_their_arguments" {
+    for ([_][]const []const u8{ &.{"stop"}, &.{"open"}, &.{ "autostart", "on" }, &.{ "autostart", "off" }, &.{"autostart"} }) |line| if (badArgs(line)) |why| {
+        std.debug.print("{s}: {s}\n", .{ line[0], why });
+        return error.TestUnexpectedResult;
+    };
+    for ([_][]const []const u8{ &.{ "stop", "now" }, &.{ "open", "x" }, &.{ "autostart", "maybe" }, &.{ "autostart", "on", "x" } }) |line|
+        try t.expect(badArgs(line) != null);
+    try t.expect(std.mem.indexOf(u8, usage, "  stop ") != null);
+    try t.expect(std.mem.indexOf(u8, usage, "  autostart [on|off] ") != null);
+    try t.expect(std.mem.indexOf(u8, usage, "  open ") != null);
+}
+
+test "avatar_takes_check_and_a_name" {
+    for ([_][]const []const u8{ &.{"avatar"}, &.{ "avatar", "check" }, &.{ "avatar", "check", "a", "b" }, &.{ "avatar", "show", "a" }, &.{ "avatar", "check", "../x" }, &.{ "avatar", "check", "Butler" } }) |line| if (badArgs(line) == null) {
+        printLine("accepted:", line);
+        return error.TestUnexpectedResult;
+    };
+    try t.expectEqual(null, badArgs(&.{ "avatar", "check", "butler" }));
 }
 
 test "agent_takes_list_show_and_rm" {
@@ -2848,6 +3087,8 @@ test {
     _ = @import("who.zig");
     _ = @import("conversations.zig");
     _ = @import("inbox.zig");
+    _ = @import("deskwin.zig");
+    _ = @import("autostart.zig");
     _ = @import("session.zig");
     _ = @import("folders.zig");
     _ = @import("environments.zig");
@@ -2893,6 +3134,7 @@ test {
     _ = @import("butler.zig");
     _ = @import("mail.zig");
     _ = @import("doctor.zig");
+    _ = @import("avatar.zig");
     _ = @import("people.zig");
     _ = @import("outside.zig");
     _ = @import("inject.zig");
