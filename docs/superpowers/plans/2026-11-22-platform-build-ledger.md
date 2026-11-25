@@ -270,3 +270,40 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
   - Re-grade before the merge (2026-11-25):
     - Deferred minor 12 raised to Important and fixed test-first: an address that starts `http://` and isn't this computer now shows one line under the field, on the page ("http:// is not encrypted: what goes to this address, the key included, can be read on the network."). `setup.plainRemote` decides; the page's script holds the same rule and was checked against it on 19 addresses. Tests `a_plain_address_that_is_not_this_computer_is_told_apart` and `a_plain_address_elsewhere_is_said_on_the_page`, both seen failing first; desk-app unit 101/101.
     - Ruling: the Anthropic row keeps `claude-opus-4-8` and `claude-haiku-4-5`. harness's Anthropic requests ask for no thinking and `parseReply` drops thinking blocks, so a 5.5 model would answer every tool turn without the reasoning of the turns before it. Cost if wrong: the owner changes two strings in `setup.entries`. Gap noted: the Anthropic provider should keep and send back thinking blocks before 5.5 models become the usual ones.
+- 2026-11-25 the desk's base head from ICT-FaceKit, branch `platform/desk-base-head` (from aea003e): plan `2026-11-25-desk-base-head.md`, its 24 rulings and Done there.
+  - Face Cap (license unverified) is replaced by a base head made from USC ICT's ICT-FaceKit (MIT, commit da5f95a): `harness/desk-assets/base-head.bin` (3.2 MB, 4,500 vertices, 52 shapes, teeth, gums and tongue, 478 landmarks) with `desk-assets/base-head-NOTICE.txt`, committed. `tools/make-base-head.mjs` makes it again from 54 OBJs pinned by SHA-256 (byte-identical on a second run here).
+  - Head format stays version 1: optional `teeth.jaw`, `teeth.kind`, `head.part`; `avatar check` checks them when present. A fitted head is 3.3 MB (Face Cap's 1.8 MB).
+  - avatar.js draws ICT's own rows, gums and tongue on the jaw; older packs keep the old path and look as before.
+  - Checked on the butler and two public-domain portraits (scratch only).
+  - behaviour-checks: 18 of 19; `drawn_lids_shut_without_a_step_in_the_lash_line` fails on the ICT head (Ruling 21, the owner's call).
+  - fit-checks as expected; node checks 36.
+  - Final review (fresh, opus): no Critical; 4 Important fixed (2 test-first); 1 left as Ruling 21; 8 minor deferred.
+  - Debug and ReleaseSafe: unit 1561/1583 (22 skipped; base 1560/1582), smoke all ok. Cross builds and unit-builds ok for x86_64-windows, x86_64-linux-musl, aarch64-linux-musl.
+  - Not pushed.
+- 2026-11-25 desk base head, second pass (`platform/desk-base-head`, 6914021..):
+  - The notice is renamed `base-head-NOTICE.txt`.
+  - Shut lips hide the teeth: the mouth's parts show as the lips part, and the upper teeth's 2 mm comes as `teeth.show` (optional, format 1).
+  - The chin stays smooth as the jaw opens: the neck cut is made on triangles and smoothed, with a 60 px fade.
+  - `drawn_lids_shut_without_a_step_in_the_lash_line` is rewritten. It finds the drawn lash line by its path, gives Face Cap and ICT packs the same verdict, and catches a lid broken on purpose.
+  - Two new behaviour checks: closed lips, the chin's edge.
+  - behaviour-checks 21 of 21 (one flake seen in the_states_show, a blink at the sample).
+  - Debug and ReleaseSafe 1561/1583 (22 skipped), smoke all ok; cross builds ok. Not pushed.
+- 2026-11-25 desk base head, third pass (089d0c8):
+  - Two test faces' open mouths stayed dark. The lips' gap was read from the front-most vertices near landmarks 13 and 14, one spot on a shut mouth, so both picks could fall on one lip. The two lips are now told apart by the jaw's motion.
+  - New check `the_open_mouth_shows_its_teeth`. It and `closed_lips_show_no_teeth` run on every test face (`?faces=`).
+  - behaviour-checks 22 of 22; Debug and ReleaseSafe 1561/1583 (22 skipped); cross builds ok. Not pushed.
+- 2026-11-25 desk base head, fourth pass:
+  - Cause of the black arc under the nose tip at rest, on two faces: the upper gums showed through the nose's underside, which is cut away where hidden at rest. They are darkened while the lips are shut, and on these short-upper-lip faces they sat inside the mouth parts' fixed zone.
+  - Fix: the zone now stops at the photo's upper-lip top plus half the lip's height.
+  - New check `no_near_black_round_the_nose_at_rest`, on every test face. Not pushed.
+- 2026-11-25 desk base head, re-grade and merge (squashed into harness-logins, so `base-head.bin` is in history once, not five times):
+  - By eye on the pass-4 renders (three faces; poses 01, 07, 08, 14): no dark line under the nose at rest, open mouths show teeth, shut lips show none. Headless Chrome only; not seen in the desk app's own web views.
+  - `node tools/make-base-head.mjs` on ICT-FaceKit's files gives the committed file byte for byte (sha256 65901755…c220b).
+  - `scripts/pack-desk-assets.sh` succeeds with the committed head and carries `base-head-NOTICE.txt` (run with a local stand-in for the MediaPipe download).
+  - No Face Cap file, portrait or fitted pack is in the commit.
+  - Merged tree: Debug and ReleaseSafe 1604/1626 (22 skipped), smoke all ok; cross builds ok for x86_64-windows, x86_64-linux-musl, aarch64-linux-musl; node avatar checks 37 of 37; desk app smoke against this harness 104 of 104.
+  - Conflicts: this ledger and `harness/README.md` (both sides kept; the README names `base-head-NOTICE.txt` in the release folder).
+- 2026-11-25 merge 8c4130a (`platform/desk-app-setup`), merged tree: Debug and ReleaseSafe 1603/1625 (22 skipped), smoke all ok; cross builds ok; desk app unit 101/101 in both modes, smoke 88/88 (stand-in) and 104/104 (this harness). Pushed.
+- CI, 2026-11-25:
+  - run 45662585632 (94c3f94): Windows harness smoke checks 64-66 failed with `harness-fake: FileNotFound` (Git's sh rewrote the stand-in's path); fixed in 3f97af9. Three macOS jobs cancelled.
+  - run 45667859969 (3f97af9): 33 of 34 jobs passed, Windows harness in Debug and ReleaseSafe among them. `test (macos-15, headterm)` was cancelled: no macOS arm64 runner took it. Not re-run; the next run covers the same code.

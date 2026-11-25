@@ -152,9 +152,11 @@ real carcloud (unit tests with harness-fake's Tesla stand-in).
 
 ## The desk: open after harness's side was built (2026-11-25)
 
-- **Face Cap's license** isn't verified: `facecap.glb`, the base head and the
-  fitted butler stay out of the repository and releases until it's
-  cleared; if it isn't, an own base head is needed.
+- **The base head** (closed 2026-11-25): Face Cap's license was never
+  verified, so the base head is now made from ICT-FaceKit (MIT) and
+  committed (`harness/desk-assets/base-head.bin`, with `base-head-NOTICE.txt`). The fit
+  is still checked by eye on few faces (the butler and one public-domain
+  portrait).
 - **The portraits' licensing** (the butler's stills): the owner's call before
   they ship in the release archive. Until then the butler is copied into
   `avatars/butler/` by hand for local use.
