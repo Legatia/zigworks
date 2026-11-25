@@ -3565,6 +3565,75 @@ what speech asked for,
 helpers that report back later, cards and payments for the agent,
 screenshots, and the hosted service.
 
+## Desk app (macOS)
+
+`harness-desk` shows the desk in a window of its own: "harness" in the
+Dock, with a badge counting what needs you. It needs macOS 12 or later. It
+connects to the harness running on this Mac and can start it, but doesn't
+own it: closing the window or quitting the app leaves harness running.
+
+**Install.** Download `harness-desk-VERSION-macos.zip` from the release,
+open it, and move `harness.app` to Applications. One bundle runs on Apple
+Silicon and Intel Macs.
+
+**The first run.** The app is signed ad hoc, not with an Apple developer
+account, so macOS stops it the first time ("harness" can't be opened).
+Open System Settings › Privacy & Security, click Open Anyway next to the
+line about harness, and confirm; after that it opens normally. (On macOS
+14 and earlier, Control-click the app › Open does the same.) The first
+time you talk to the desk, macOS asks to let harness use the microphone.
+
+**Opening it.** `harness open` starts it, or brings it to the front, on
+your data folder. Opened from the Dock or Launchpad it uses the default
+one (`~/.local/share/harness`, or `$XDG_DATA_HOME/harness`). It reads
+`state/desk.json`, which harness writes at each start, for harness's port
+and program:
+
+- before harness has ever run: "Set up harness first: run `harness init`.";
+- while nothing answers on that port: "harness isn't running", with
+  [Start harness];
+- then "Connecting…", and the desk.
+
+It checks every 5 seconds, so a harness started in Terminal is found on
+its own.
+
+**Getting in.** The app writes `state/open-request`; harness answers with
+a one-time code in `state/desk-code` (used once, valid 60 s); the app reads
+and deletes it and trades it for a session cookie. The window keeps
+nothing on disk: no cookie, cache or storage outlives the app. When harness
+restarts, the app enters again by itself.
+
+**The window.** Links on harness's own address (`http://127.0.0.1:PORT`)
+open in the window; other links open in your browser. Sound and speech
+play without a click. Only the desk page itself may use the microphone,
+not an app shown inside it; the camera is never allowed. The window
+remembers its size and place. Closing it keeps the app running with its
+badge; click the Dock icon to bring the window back.
+
+**The menu** (harness, in the menu bar):
+
+| Item | What it does |
+|---|---|
+| Start harness | runs `harness run` in the background; it keeps running after you quit the app |
+| Stop harness | runs `harness stop`: harness exits cleanly on its next tick |
+| Open at login | runs `harness autostart on` or `off`; checked when harness starts at login (the app itself doesn't) |
+| Reload (⌘R) | loads the desk again |
+| Quit harness (⌘Q) | quits the app; harness keeps running |
+
+The commands run the program `state/desk.json` names, with `--home` set to
+the data folder and the PATH harness itself started with.
+
+**Building it.** It's built apart from harness, in `desk-app/`, with Xcode's
+command line tools, since it links Cocoa and WebKit and harness links
+nothing:
+
+```
+zig build                     # zig-out/harness.app, for this Mac
+zig build test --summary all  # unit tests
+zig build smoke               # the app in a window against a stand-in harness (test/fake_harness.py)
+scripts/package-macos.sh 0.3.0 harness-desk-0.3.0-macos.zip   # both kinds of Mac, signed ad hoc
+```
+
 ## Build
 
 ```
