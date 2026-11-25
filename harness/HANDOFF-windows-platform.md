@@ -5,6 +5,38 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: `model.Block` has a fourth kind, `thinking` (2026-11-25, night)
+
+Anthropic's 5.5 models think before every answer and the API expects the
+thinking blocks back while a tool loop runs. harness dropped them. Now:
+
+- `model.Block.thinking` holds the whole block's JSON as it came (`thinking`
+  or `redacted_thinking`). `parseReply` keeps it, `anthropicBody` writes it
+  back unchanged, `openaiBody` leaves it out.
+- **Any exhaustive `switch` over `model.Block` needs an arm.** Ignore the
+  block there (`.thinking => {}`): it is never shown, logged, summarised or
+  written to memory. `b == .tool_use` comparisons and `else` arms need
+  nothing.
+- A reply's blocks no longer start with its text: don't index
+  `reply.blocks[0]`; use `reply.text(a)`.
+- `Conversation.messages()` sends thinking from the newest turn only. The
+  API takes a thinking block back only after the same instructions, tools
+  and messages it was made after; that holds within a turn (the stable
+  system prompt and the tool list are built once per turn) and not from one
+  turn to the next. If you ever rebuild the system prompt or the tool list
+  inside a turn, or edit a turn's earlier messages, the replay breaks.
+- A request refused (`error.Rejected`) with thinking in it is sent once
+  more without; if that goes through, `conv.no_thinking` stays set for the
+  conversation. Refused again: the turn is left out as before.
+- A reply of thinking alone is not kept. Cut at `max_tokens`, the owner is
+  told so ("The model reached its output limit (max_tokens) while thinking,
+  before it answered.").
+
+None of this was run against Anthropic's API (no real keys in tests); the
+fake server and the retry are the safeguards. The setup screen's Anthropic
+models stay `claude-opus-4-8` and `claude-haiku-4-5` until the owner says
+otherwise.
+
 ## For you: the one red job on your merge was a test race (2026-11-25, night)
 
 CI on ff3262d (your merge of the desk apps) failed in `test (macos-15,

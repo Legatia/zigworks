@@ -6669,7 +6669,7 @@ pub const Core = struct {
                 },
                 // what it posted is the agent's words
                 .tool_use => |u| if (!tn.marked) if (agent.sentText(a, u.name, u.input_json)) |said| try one.print(a, "Agent: {s}\n", .{util.cut(said, 2000)}),
-                .tool_result => {},
+                .tool_result, .thinking => {},
             };
             if (size + one.items.len > memory_transcript_max) break;
             size += one.items.len;
