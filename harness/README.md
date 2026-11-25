@@ -3520,6 +3520,28 @@ base head, `base-head.bin`. For local use, `sh tools/fetch-desk-assets.sh
 DATA/desk-assets` fetches MediaPipe's files and checks each by SHA-256;
 the base head is made with `tools/make-base-head.html` (tools/README).
 
+### What the desk's page needs
+
+The avatar module (`src/desk/avatar.js`) and the fit (`src/desk/fit.js`)
+run under the desk's Content-Security-Policy with every load on harness's
+own server. They need, besides `'self'`:
+
+- `script-src 'wasm-unsafe-eval'`: the face landmarker is WebAssembly
+  (without it the fit can't start). No `'unsafe-eval'`, no `'unsafe-inline'`,
+  no worker. The landmarker adds a `<script src>` for its loader
+  (`/desk/assets/mediapipe/wasm/…`, same origin) to the page's body.
+- `img-src blob:`: images are decoded from fetched bytes (a pack's files,
+  an uploaded File) through `blob:` URLs.
+- `.wasm` served as `application/wasm` and `.mjs` as `text/javascript`
+  (else a slower fallback with a console error).
+
+Pack files are fetched with `no-cache`, so a refit shows at once while the
+server's `Cache-Control: private, max-age=86400` and ETag keep reloads
+cheap. The fit records the still's SHA-256 in the head: the desk saves as
+the still exactly the bytes it gave the fit (re-encoding it, or stripping
+its EXIF, makes the head read as fitted to another photo, and the still
+shows instead).
+
 ### An eyes-closed version
 
 The avatar rests with its eyes closed, and a blink lands on the
@@ -3536,7 +3558,8 @@ the skin's own tone.
 `harness avatar check NAME` checks `avatars/NAME/`: `avatar.ini`, each
 file's type by its first bytes and its size, that the eyes-closed photo
 and the head match the still's size (as shown, a phone photo's rotation
-applied), and the head file's header: its version, its vertex count, the
+applied) and that the head was fitted to these very bytes, and the head
+file's header: its version, its vertex count, the
 52 shapes, and that every array lies inside the file. It exits 0 when the
 pack is good, 1 with the problems listed.
 
@@ -3548,9 +3571,10 @@ multiple of 4), the header as JSON padded with spaces, then the arrays.
 The header's `arrays` maps each name to `[TYPE, OFFSET, COUNT]` (`f32`,
 `i16`, `u16`, `u32` or `u8`; the offset from the arrays' start, a
 multiple of 4; the count in values). A fitted head (`"kind": "head"`)
-has `vertices`, `image` (the still's width and height), `shapes` and
-`shapeScale`, the photo's `face`, `mouth` and `eyes` (outlines, irises,
-reflections, lid tones) and `eyeCrop`; its arrays are `head.pos`,
+has `vertices`, `image` (the still's width and height), `still` (its
+bytes and SHA-256, when the fit had them), `shapes` and `shapeScale`,
+the photo's `face`, `mouth` and `eyes` (outlines, irises, reflections,
+lid tones) and `eyeCrop`; its arrays are `head.pos`,
 `head.nrm`, `head.uv`, `head.uvC` (the eyes-closed projection),
 `head.idx`, a `shape.NAME.pos` and `shape.NAME.nrm` per shape (16-bit,
 scaled by `shapeScale`), `teeth.pos` and `teeth.idx`. Coordinates are

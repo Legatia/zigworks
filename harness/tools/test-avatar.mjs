@@ -352,6 +352,27 @@ check('framing_keeps_the_face_in_view', () => {
   eq(tall.x0 >= 0 && tall.x0 + tall.w <= 2720, true, 'inside the photo');
 });
 
+check('the_head_turns_a_few_degrees_at_most', () => {
+  // the spec: about ±4°; working's −2.2 yaw, drift and following the gaze reach −5.6
+  const p = av.limitPose({ pitch: 6, yaw: -5.6, roll: 4 });
+  eq(p.pitch, 4); eq(p.yaw, -4); eq(p.roll, 3);
+  const q = av.limitPose({ pitch: -1.2, yaw: 2.5, roll: -0.4 });
+  eq(q.pitch, -1.2); eq(q.yaw, 2.5); eq(q.roll, -0.4);
+});
+
+check('a_catchlight_is_found_or_none_never_nan', () => {
+  // a 60×60 crop: an iris of radius 20 at (30, 30), a dark lid band above it
+  const field = (iris, spot) => (x, y) => (y < 14 ? 40 : Math.hypot(x - 30, y - 30) <= 20 ? (Math.hypot(x - 30, y - 16) < 2 ? spot : iris) : 90);
+  const inCrop = (x, y) => x >= 0 && y >= 0 && x < 60 && y < 60;
+  const found = fit.findCatchlight(field(70, 230), inCrop, 30, 30, 20, 70);
+  eq(Array.isArray(found) && found.every(Number.isFinite), true, 'found ' + JSON.stringify(found));
+  near(found[0], 30, 1); near(found[1], 16, 1.5);
+  // an iris as bright as the spot (the median brighter than the dot): none, not NaN
+  eq(fit.findCatchlight(field(200, 205), inCrop, 30, 30, 20, 210), null);
+  // no bright spot at all
+  eq(fit.findCatchlight(field(70, 70), inCrop, 30, 30, 20, 70), null);
+});
+
 // ---------- the made-up head the Zig tests read ----------
 function tinyHead() {
   const b = syntheticBase(3);

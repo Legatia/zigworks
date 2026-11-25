@@ -132,6 +132,53 @@ await sleep(500);
   await sleep(200);
   check('dispose_mid_speech_ends_it', r2 === false && b.inspect().audio === 'closed' && !document.querySelector('#b canvas'), { resolved: r2, audio: b.inspect().audio });
 }
+// 11. after dispose: speaking does nothing and settles at once
+{
+  const c = await createAvatar(document.getElementById('b'), pack, {});
+  const glCanvas = document.querySelector('#b canvas');
+  const gl = glCanvas.getContext('webgl2');
+  c.dispose();
+  const t0 = performance.now();
+  const r1 = await Promise.race([c.speak({ text: 'Gone.', browser: true }), sleep(3000).then(() => 'pending')]);
+  const spoke = speechSynthesis.speaking || speechSynthesis.pending;
+  const r2 = await Promise.race([c.speak({ text: 'Gone.', audioUrl: voice }), sleep(3000).then(() => 'pending')]);
+  let threw = null;
+  try { c.setState('working'); c.moment('smile'); c.arrive(); c.stop(); } catch (e) { threw = e.message; }
+  check('after_dispose_speak_settles_and_says_nothing', r1 === false && r2 === false && !spoke && !threw && performance.now() - t0 < 1000, { browser: r1, audio: r2, spoke, threw });
+  // its WebGL context is let go, not left for the garbage collector
+  check('dispose_lets_the_webgl_context_go', gl && gl.isContextLost(), { lost: gl && gl.isContextLost() });
+}
+// 12. a browser voice that fails doesn't cut off the next one 5 s later
+{
+  const c = await createAvatar(document.getElementById('b'), pack, {});
+  const orig = speechSynthesis.speak.bind(speechSynthesis);
+  let first = true;
+  speechSynthesis.speak = (u) => { if (first) { first = false; setTimeout(() => u.onerror({ error: 'synthesis-failed' }), 20); return; } orig(u); };
+  let err = null;
+  try { await c.speak({ text: 'This fails.', browser: true }); } catch (e) { err = e.message; }
+  const t0 = performance.now();
+  const long = 'The morning brief is ready. Your flight to Lisbon moved to nine forty, the driver knows, the calendar is updated, and the hotel has your late arrival on file. Two packages arrive today, one needs a signature, and the boiler service is on Thursday at ten.';
+  const r = await c.speak({ text: long, browser: true });
+  const ms = Math.round(performance.now() - t0);
+  speechSynthesis.speak = orig;
+  check('a_failed_browser_voice_does_not_cut_off_the_next', err && r === true && ms > 5500, { err, resolved: r, ms });
+  // 13. a voice that starts and never says it ended: the talk still ends
+  speechSynthesis.speak = (u) => { setTimeout(() => u.onstart && u.onstart(), 20); };
+  const t1 = performance.now();
+  const r3 = await Promise.race([c.speak({ text: 'Hello there.', browser: true }), sleep(15000).then(() => 'pending')]);
+  speechSynthesis.speak = orig;
+  check('a_voice_that_never_ends_still_ends_the_talk', r3 !== 'pending' && !c.inspect().talking, { resolved: r3, ms: Math.round(performance.now() - t1) });
+  // 14. audio that can't start (an autoplay policy holding the audio back): refused, not hanging
+  const Real = globalThis.AudioContext;
+  globalThis.AudioContext = class extends Real { get state() { return 'suspended'; } resume() { return new Promise(() => {}); } };
+  c.dispose();
+  const d = await createAvatar(document.getElementById('b'), pack, {});
+  let err2 = null;
+  const r4 = await Promise.race([d.speak({ text: 'Held.', audioUrl: voice }).catch((e) => { err2 = e.message; return 'rejected'; }), sleep(8000).then(() => 'pending')]);
+  globalThis.AudioContext = Real;
+  check('audio_that_cannot_start_is_refused', r4 === 'rejected' && /didn't start/.test(err2 || ''), { result: r4, err: err2 });
+  d.dispose();
+}
 const failed = Object.entries(results).filter(([, v]) => !v.ok).map(([k]) => k);
 log(failed.length ? failed.length + ' failed: ' + failed.join(', ') : 'all ' + Object.keys(results).length + ' passed');
 window.__r = { results, failed };

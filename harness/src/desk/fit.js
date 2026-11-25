@@ -508,6 +508,37 @@ const edgeDist = (poly, x, y) => {
 const luma = (r, g, b) => 0.299 * r + 0.587 * g + 0.114 * b;
 const median = (vals, q = 0.5) => { if (!vals.length) return null; const s = [...vals].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(s.length * q))]; };
 
+/** The photo's reflection in an iris: the spot that stands out most from a
+ *  small ring round it (a catchlight is an isolated dot, often touching the
+ *  upper lid; the lids' wet edges are bright too, but as a band), grown to
+ *  the pixels brighter than halfway to the iris. [x, y, r], or null when
+ *  there's none. lumaAt(x, y) and inCrop(x, y) read the photo. */
+export function findCatchlight(lumaAt, inCrop, icx, icy, ir, irisL) {
+  const inIris = (x, y) => inCrop(x, y) && Math.hypot(x - icx, y - icy) <= ir * 0.95;
+  const ringR = Math.max(3, ir * 0.22);
+  let best = -Infinity, bx = 0, by = 0, bl = 0;
+  for (let y = Math.floor(icy - ir); y <= icy + ir; y++) for (let x = Math.floor(icx - ir); x <= icx + ir; x++) {
+    if (!inIris(x, y)) continue;
+    const l = lumaAt(x, y);
+    if (l < 120) continue;
+    let ring = 0, m = 0;
+    for (let q = 0; q < 12; q++) {
+      const rx = Math.round(x + ringR * Math.cos((q * Math.PI) / 6)), ry = Math.round(y + ringR * Math.sin((q * Math.PI) / 6));
+      if (inCrop(rx, ry)) { ring += lumaAt(rx, ry); m++; }
+    }
+    const score = l - ring / (m || 1);
+    if (score > best) { best = score; bx = x; by = y; bl = l; }
+  }
+  if (!(best > 50)) return null;
+  const th = (bl + irisL) / 2, reach = ringR;
+  let sx = 0, sy = 0, sn = 0;
+  for (let y = Math.floor(by - reach); y <= by + reach; y++) for (let x = Math.floor(bx - reach); x <= bx + reach; x++) {
+    if (!inCrop(x, y) || Math.hypot(x - bx, y - by) > reach || lumaAt(x, y) <= th) continue;
+    sx += x; sy += y; sn++;
+  }
+  return sn ? [sx / sn, sy / sn, Math.max(2, Math.sqrt(sn / Math.PI))] : null;
+}
+
 /** The eyeballs' texture: a crop round both eyes with the photo's
  *  reflections removed and each iris completed under the lids (by its
  *  mirror image), keeping a band of photo round the lids; plus where each
@@ -538,37 +569,8 @@ function eyeTexture(photo, meta) {
       if (into) for (let q = 0; q < 3; q++) into[q].push(src[o + q]);
     }
     const sclera = scl.map((v) => median(v, 0.6) ?? 120), irisCol = irs.map((v) => median(v) ?? 60);
-    // the reflection: the spot in the iris that stands out most from a small
-    // ring round it (a catchlight is an isolated dot, often touching the
-    // upper lid; the lids' wet edges are bright too, but as a band), grown
-    // to the pixels brighter than halfway to the iris
     const lumaAt = (x, y) => { const o = at(x, y); return luma(src[o], src[o + 1], src[o + 2]); };
-    const inIris = (x, y) => inCrop(x, y) && Math.hypot(x - icx, y - icy) <= ir * 0.95;
-    const ringR = Math.max(3, ir * 0.22);
-    let best = -Infinity, bx = 0, by = 0, bl = 0;
-    for (let y = Math.floor(icy - ir); y <= icy + ir; y++) for (let x = Math.floor(icx - ir); x <= icx + ir; x++) {
-      if (!inIris(x, y)) continue;
-      const l = lumaAt(x, y);
-      if (l < 120) continue;
-      let ring = 0, m = 0;
-      for (let q = 0; q < 12; q++) {
-        const rx = Math.round(x + ringR * Math.cos((q * Math.PI) / 6)), ry = Math.round(y + ringR * Math.sin((q * Math.PI) / 6));
-        if (inCrop(rx, ry)) { ring += lumaAt(rx, ry); m++; }
-      }
-      const score = l - ring / (m || 1);
-      if (score > best) { best = score; bx = x; by = y; bl = l; }
-    }
-    const irisL = luma(...irisCol);
-    let cl = null;
-    if (best > 50) {
-      const th = (bl + irisL) / 2, reach = ringR;
-      let sx = 0, sy = 0, sn = 0;
-      for (let y = Math.floor(by - reach); y <= by + reach; y++) for (let x = Math.floor(bx - reach); x <= bx + reach; x++) {
-        if (!inCrop(x, y) || Math.hypot(x - bx, y - by) > reach || lumaAt(x, y) <= th) continue;
-        sx += x; sy += y; sn++;
-      }
-      cl = [sx / sn, sy / sn, Math.max(2, Math.sqrt(sn / Math.PI))];
-    }
+    const cl = findCatchlight(lumaAt, inCrop, icx, icy, ir, luma(...irisCol));
     e.catchlight = cl;
     // the eye rebuilt
     const R2 = e.width * 1.2, band = 6 * k;

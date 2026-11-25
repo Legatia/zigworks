@@ -61,6 +61,11 @@ export function frameView(W, H, face, aspect) {
   return { x0: cx - vw / 2, y0: cy - vh / 2, w: vw, h: vh };
 }
 
+/** The head turns a few degrees at most (the spec: about ±4°; roll ±3°). */
+export function limitPose(p) {
+  return { pitch: clamp(p.pitch, -4, 4), yaw: clamp(p.yaw, -4, 4), roll: clamp(p.roll, -3, 3) };
+}
+
 // ---------- speech: text to mouth shapes ----------
 
 // mouth shapes (visemes) as ARKit shapes
@@ -300,6 +305,24 @@ function texture(canvas) {
  *  teeth and the backplate (the prototype's method). */
 function buildHead(pack, canvas) {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, stencil: true, powerPreference: 'high-performance' });
+  try {
+    return buildScene(pack, renderer);
+  } catch (e) {
+    letGo(renderer);
+    throw e;
+  }
+}
+
+/** Frees the renderer and its WebGL context at once (a page has only a
+ *  few contexts; a disposed avatar shouldn't hold one until collected). */
+function letGo(renderer) {
+  const gl = renderer.getContext();
+  renderer.dispose();
+  const ext = gl && gl.getExtension('WEBGL_lose_context');
+  if (ext && !gl.isContextLost()) ext.loseContext();
+}
+
+function buildScene(pack, renderer) {
   renderer.setPixelRatio(Math.min(globalThis.devicePixelRatio || 1, 2));
   renderer.setClearColor(0x07070d, 1);
   const { meta, arr } = pack.head;
@@ -661,7 +684,7 @@ function buildHead(pack, canvas) {
       hg.dispose(); plate.dispose(); headMat.dispose(); plateMat.dispose(); teethMat.dispose();
       for (const g of teethGeos) g.dispose();
       for (const e of eyes) { e.mesh.geometry.dispose(); e.mesh.material.dispose(); }
-      renderer.dispose();
+      letGo(renderer);
     },
   };
 }
@@ -784,6 +807,7 @@ export async function createAvatar(element, packUrl, options = {}) {
   }
 
   function setState(state) {
+    if (disposed) return;
     if (!STATES.includes(state)) { console.warn('avatar: no state ' + state); return; }
     if (state === S.state) return;
     S.state = state;
@@ -795,11 +819,13 @@ export async function createAvatar(element, packUrl, options = {}) {
     wake();
   }
   function moment(name) {
+    if (disposed) return;
     if (!MOMENTS[name]) { console.warn('avatar: no moment ' + name); return; }
     S.moment = name; S.momentUntil = now() + MOMENTS[name].secs;
     wake();
   }
   function arrive() {
+    if (disposed) return;
     S.glanceUntil = now() + 1.6;
     S.gazeT = { x: 0, y: 0 }; S.nextSaccade = S.glanceUntil;
     wake();
@@ -823,21 +849,27 @@ export async function createAvatar(element, packUrl, options = {}) {
     try { talk.source && talk.source.stop(); } catch {}
     if (talk.browser && synth && !done) synth.cancel();
     clearTimeout(talk.timer);
+    clearTimeout(talk.watch);
     applyDim();
     talk.resolve(done);
   }
 
   function speak({ text = '', audioUrl = null, browser = false, onWord = null } = {}) {
+    if (disposed) return Promise.resolve(false);
     endTalk(S.talk, false);
     return new Promise((resolve, reject) => {
       const talk = { resolve, reject, over: false, tl: null, playing: false, onWord, lastWord: -1, ends: new Set() };
       S.talk = talk;
-      const fail = (msg) => { if (talk.over) return; talk.over = true; if (S.talk === talk) S.talk = null; applyDim(); reject(new Error(msg)); };
+      const fail = (msg) => { if (talk.over) return; talk.over = true; clearTimeout(talk.timer); clearTimeout(talk.watch); if (S.talk === talk) S.talk = null; applyDim(); reject(new Error(msg)); };
       if (audioUrl) {
         (async () => {
           try {
             audioCtx = audioCtx || new (globalThis.AudioContext || globalThis.webkitAudioContext)();
-            if (audioCtx.state === 'suspended') await audioCtx.resume().catch(() => {});
+            if (audioCtx.state === 'suspended') {
+              await Promise.race([audioCtx.resume().catch(() => {}), new Promise((ok) => setTimeout(ok, 3000))]);
+              if (talk.over) return;
+              if (audioCtx.state !== 'running') { fail("The voice didn't start."); return; }
+            }
             const r = await fetch(audioUrl);
             if (!r.ok) throw new Error('the voice ' + r.status);
             const data = await r.arrayBuffer();
@@ -868,7 +900,12 @@ export async function createAvatar(element, packUrl, options = {}) {
         u.rate = 0.96; u.pitch = 0.9;
         let t0 = 0;
         talk.clock = () => now() - t0;
-        u.onstart = () => { if (talk.over) return; clearTimeout(talk.timer); t0 = now(); talk.playing = true; applyDim(); wake(); };
+        u.onstart = () => {
+          if (talk.over) return;
+          clearTimeout(talk.timer); t0 = now(); talk.playing = true; applyDim(); wake();
+          // some voices never send onend (network voices cut off): the talk ends anyway
+          talk.watch = setTimeout(() => endTalk(talk, true), (2 * tl.dur + 5) * 1000);
+        };
         u.onboundary = (e) => {
           if (talk.over || (e.name && e.name !== 'word')) return;
           const w = tl.words.find((x) => x.i1 > e.charIndex);
@@ -876,7 +913,7 @@ export async function createAvatar(element, packUrl, options = {}) {
         };
         u.onend = () => endTalk(talk, true);
         u.onerror = (e) => { if (e.error === 'interrupted' || e.error === 'canceled') endTalk(talk, false); else fail("The voice didn't play: " + e.error); };
-        talk.timer = setTimeout(() => { if (!talk.playing) { synth.cancel(); fail("The voice didn't start."); } }, 5000);
+        talk.timer = setTimeout(() => { if (!talk.over && !talk.playing) { synth.cancel(); fail("The voice didn't start."); } }, 5000);
         synth.cancel();
         synth.speak(u);
       } else fail('speak needs audioUrl or browser: true');
@@ -1011,7 +1048,8 @@ export async function createAvatar(element, packUrl, options = {}) {
     };
     if (talk && tau > 0 && !rm) tp.pitch += 0.35 * Math.sin(tau * 5.1) * Math.min(1, tau);
     if (debug && debug.pose) Object.assign(tp, debug.pose);
-    for (const key of ['pitch', 'yaw', 'roll']) S.pose[key] = approach(S.pose[key], tp[key], key === 'pitch' ? 9 : 4, dt);
+    const tl = limitPose(tp);
+    for (const key of ['pitch', 'yaw', 'roll']) S.pose[key] = approach(S.pose[key], tl[key], key === 'pitch' ? 9 : 4, dt);
 
     head.draw(S.pose, infl[IDX.eyeBlink_R], infl[IDX.eyeBlink_L], rise); // image-left eye, image-right eye
   }
@@ -1044,6 +1082,7 @@ export async function createAvatar(element, packUrl, options = {}) {
     if (synth) synth.removeEventListener?.('voiceschanged', pickVoice);
     if (head) head.dispose();
     if (still) still.dispose();
+    still = null;
     if (audioCtx) audioCtx.close().catch(() => {});
     canvas.remove();
     if (stillCanvas) stillCanvas.remove();
