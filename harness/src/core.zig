@@ -29290,11 +29290,40 @@ test "setup_reorder_asks_once_how_much_routines_may_spend" {
     _ = try h.core.command(h.e.arena.allocator(), "/setup reorder frisco at 2 items");
     try h.rec.waitFor("BUTTONS How much may routines spend");
     try h.press("none");
-    try h.rec.waitFor("Routines spend nothing at Frisco without asking you. /money budget N a day sets a budget at each money server.");
+    try h.rec.waitFor("No routine spending at Frisco. To change it: the budget lines in its section of mcp.ini.");
     try t.expect(std.mem.indexOf(u8, fileText(&h, h.core.paths.config), "budget_per") == null);
-    try t.expect(std.mem.indexOf(u8, fileText(&h, h.core.paths.mcp), "budget_per") == null);
+    try expectHas(fileText(&h, h.core.paths.mcp), "amount = shop_order:total\nbudget_per_day = none\n");
     _ = try h.core.command(h.e.arena.allocator(), "/setup reorder frisco at 3 items");
     try t.expectEqual(1, h.rec.count("BUTTONS How much may routines spend"));
+}
+
+test "none_for_a_shop_keeps_a_later_budget_away" {
+    var f: Fix = undefined;
+    try f.init("", "", groceries_task);
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[frisco]\ncommand = \"{s}\" --mcp --shop\n{s}[fake]\ncommand = \"{s}\" --mcp\nmoney = echo\namount = amount\n", .{ fake, shop_money, fake }) });
+    for ([_][]const u8{ "frisco", "fake" }) |n| try Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(a, &.{ f.core.paths.state, "mcp", n }));
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    // None for the shop
+    _ = try f.core.command(a, "/setup reorder frisco at 2 items");
+    try f.rec.waitFor("BUTTONS How much may routines spend at Frisco");
+    try f.press("none");
+    try f.rec.waitFor("No routine spending at Frisco.");
+    // then a budget for every money server: not at the shop
+    _ = try f.core.command(a, "/money budget 30 a day");
+    _ = try f.core.command(a, "/money budget 200 a month");
+    try f.e.script(1, model.toolReply("o1", "frisco__shop_order", "{\"items\":[\"milk\"],\"total\":5}"));
+    try f.e.script(2, model.toolReply("e1", "fake__echo", "{\"amount\":5,\"text\":\"x\"}"));
+    try f.e.script(3, model.textReply("Done."));
+    _ = try f.core.runTask(try taskNamed(f.core, "weekly-groceries"));
+    try expectHas(try f.e.request(2), "refused by the gate: automation spends nothing at frisco (budget = none in mcp.ini)");
+    try t.expectEqualStrings("", shopOrders(&f));
+    const day = @divFloor(util.nowSeconds(t.io) + @as(i64, f.core.cfg.chat.utc_offset) * 60, 86400);
+    f.core.money_ledger.mutex.lockUncancelable(t.io);
+    defer f.core.money_ledger.mutex.unlock(t.io);
+    try t.expectEqual(@as(f64, 5), f.core.money_ledger.spentAuto("fake", day));
 }
 
 test "setups_budget_is_the_shops_own_alone" {
@@ -33727,8 +33756,8 @@ const Money = struct {
     /// The question's answer, the shop's own (its section in mcp.ini, in
     /// its units; `/money budget` is every server's): Like this, or a
     /// reply ("50 a day, 300 a month"), writes its budgets and applies
-    /// them; Set an amount asks for them; None writes nothing. Each but
-    /// Set an amount marks the question answered.
+    /// them; Set an amount asks for them; None writes `budget_per_day =
+    /// none` there. Each but Set an amount marks the question answered.
     fn setupAnswer(c: *Core, a: std.mem.Allocator, shop: []const u8, key: []const u8, words: ?[]const u8) !Core.SetupDone {
         const mark = try c.setupPath(a, try std.fmt.allocPrint(a, "budget-{s}", .{shop}));
         const title = lists_mod.title(a, shop) catch shop;
@@ -33757,17 +33786,19 @@ const Money = struct {
                 .expires = c.now() + 7 * 86400,
             });
             return .{};
-        } else {
-            util.writeReplace(c.io, mark, "asked\n") catch {};
-            return .{ .said = try std.fmt.allocPrint(a, "Routines spend nothing at {s} without asking you. /money budget N a day sets a budget at each money server.", .{title}) };
         }
+        // None: `none` there, so a budget for every server (/money budget)
+        // doesn't reach a shop the owner said no to
+        const none = !std.mem.eql(u8, key, "like") and !std.mem.eql(u8, key, "text");
         var text = c.readOr(a, c.paths.mcp);
+        if (none) text = try mail_mod.setKey(a, text, shop, "budget_per_day", "none");
         if (day) |d| text = try mail_mod.setKey(a, text, shop, "budget_per_day", try std.fmt.allocPrint(a, "{d}", .{d}));
         if (month) |m| text = try mail_mod.setKey(a, text, shop, "budget_per_month", try std.fmt.allocPrint(a, "{d}", .{m}));
         try c.writeSetting(c.paths.mcp, text);
         util.writeReplace(c.io, mark, "asked\n") catch {};
         c.log.write(.config, false, .{ .event = "money budget", .via = "setup", .server = shop, .day = day, .month = month }) catch {};
         if (c.applySetup()) |why| return .{ .said = try std.fmt.allocPrint(a, "mcp.ini is written. {s}", .{why}) };
+        if (none) return .{ .said = try std.fmt.allocPrint(a, "No routine spending at {s}. To change it: the budget lines in its section of mcp.ini.", .{title}) };
         var amounts: std.ArrayList(u8) = .empty;
         if (day) |d| try amounts.print(a, "{d} a day", .{d});
         if (month) |m| try amounts.print(a, "{s}{d} a month", .{ if (amounts.items.len > 0) " and " else "", m });

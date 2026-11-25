@@ -1528,7 +1528,8 @@ Butler:  Ordered from Frisco: 3 items, 64.20 PLN; off shopping. The shop says: O
   wasn't ordered on its own. `/setup reorder` asks once how much routines
   may spend at that shop (None, Set an amount, or Like this: 30 a day, 200
   a month), written as the shop's own `budget_per_day` and
-  `budget_per_month` in mcp.ini.
+  `budget_per_month` in mcp.ini; None writes `budget_per_day = none`
+  there, so a later `/money budget` doesn't reach that shop.
 - **Otherwise bought only on your tap.** The proposal is one item in your
   inbox, the whole order in it; the exact call it would make is kept in
   `state/errands` under the item's number. Only your **Order it** makes
