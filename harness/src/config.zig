@@ -129,7 +129,8 @@ pub const Config = struct {
     /// The app server (gap 8): apps shown in your browser.
     pub const Apps = struct {
         on: bool = true,
-        /// 0: a free one each start; a fixed one to reach it over ssh -L.
+        /// The desk app finds harness here; 0: one is picked at the next
+        /// start and written (a taken one moves to the next of ten).
         port: u32 = 0,
         /// How long one act an app asks for may take, its question included.
         act_seconds: u32 = 120,
@@ -852,7 +853,7 @@ pub const defaults_ini =
     \\
     \\[apps]                              ; apps in your browser, on this machine only
     \\on = on
-    \\port = 0                            ; 0 = a free one each start
+    \\port = 0                            ; the desk finds harness here; 0: harness picks a free one and writes it here
     \\act_seconds = 120                   ; the longest one act an app asks for may take
     \\runs_per_hour = 20                  ; runs an app may start in an hour
     \\

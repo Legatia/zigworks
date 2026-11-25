@@ -756,6 +756,11 @@ pub const Core = struct {
     desk_seen: std.ArrayList(DeskSeen),
     /// Quiet hours were on at the last tick (a change is an event).
     desk_quiet: bool,
+    /// What startApps has to say of its port ("": nothing).
+    apps_note: []const u8 = "",
+    /// `harness stop` asked (state/stop-request): main's watcher ends
+    /// harness as a signal would.
+    stop_requested: std.atomic.Value(bool) = .init(false),
 
     chan: ?Channel = null,
     owner: ?i64 = null,
@@ -988,6 +993,8 @@ pub const Core = struct {
         c.desk_next_run = 1;
         c.desk_seen = .empty;
         c.desk_quiet = false;
+        c.apps_note = "";
+        c.stop_requested = .init(false);
         // the stored secrets first: a workflow file holding one is refused
         c.secrets = secrets;
         c.secret_list = try secretList(c.paths_arena.allocator(), secrets);
@@ -1192,6 +1199,8 @@ pub const Core = struct {
         // conversations that aren't private, from the log
         c.deskLoadSeen();
         c.deskFill();
+        // a stop asked of an earlier start is not one of this start's
+        Io.Dir.cwd().deleteFile(io, std.fs.path.join(c.paths_arena.allocator(), &.{ c.paths.state, "stop-request" }) catch "") catch {};
         // the butler's manner of before: persona.md now (once)
         Manner.migrate(c);
         // an install that spent before budgets gets one, and is told (once)
@@ -5423,16 +5432,45 @@ pub const Core = struct {
         // (their questions are void)
         apps_mod.finishInstalls(c.io, a, apps_dir, state_dir) catch {};
         c.noteChangedApps(a, apps_dir, state_dir);
-        const s = try appserver.Server.start(c.gpa, c.io, .{
-            .apps_dir = apps_dir,
-            .state_dir = state_dir,
-            .host = c.appHost(),
-            .port = @intCast(c.cfg.apps.port),
-            .log = &c.log,
-            .version = @import("build_options").version,
-        });
+        // the desk app finds harness on a fixed port: `port = 0` gets one
+        // (written); a taken one moves to the next of ten (written, said)
+        const want: u16 = @intCast(c.cfg.apps.port);
+        const tries: u16 = if (want == 0) 1 else @intCast(@min(11, @as(u32, std.math.maxInt(u16)) - want + 1));
+        var i: u16 = 0;
+        const s = while (i < tries) : (i += 1) {
+            break appserver.Server.start(c.gpa, c.io, .{
+                .apps_dir = apps_dir,
+                .state_dir = state_dir,
+                .host = c.appHost(),
+                .port = if (want == 0) 0 else want + i,
+                .log = &c.log,
+                .version = @import("build_options").version,
+                .desk = .{ .home = c.paths.home, .state = c.paths.state },
+            }) catch |e| switch (e) {
+                error.AddressInUse, error.AccessDenied => if (i + 1 < tries) continue else return e,
+                else => return e,
+            };
+        } else unreachable;
         c.app_server = s;
+        c.apps_note = "";
+        if (s.port != want) {
+            const text = try mail_mod.setKey(a, c.readOr(a, c.paths.config), "apps", "port", try std.fmt.allocPrint(a, "{d}", .{s.port}));
+            c.writeSetting(c.paths.config, text) catch |e| c.log.write(.config, false, .{ .event = "apps port not written", .why = @errorName(e) }) catch {};
+            c.noteSettingsWritten();
+            c.cfg.apps.port = s.port;
+            if (want != 0) c.apps_note = try std.fmt.allocPrint(c.paths_arena.allocator(), "Port {d} was taken; the desk uses {d} now (written to config.ini).", .{ want, s.port });
+            c.log.write(.app, false, .{ .event = "port written", .port = s.port, .was = want }) catch {};
+        }
         return s.shellUrl(a);
+    }
+
+    /// A settings file harness wrote itself: not "changed outside" at the
+    /// next check.
+    fn noteSettingsWritten(c: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const texts = c.readSettingsFiles(arena.allocator()) catch return;
+        c.settings_hashes = hashSettings(texts);
     }
 
     /// Apps whose files differ from what was approved (an approved shell
@@ -6590,6 +6628,7 @@ pub const Core = struct {
     /// file is refreshed, changed settings are noticed.
     pub fn tick(c: *Core) void {
         const now_s = c.now();
+        c.stopTick();
         c.deskTick();
         if (util.nowSeconds(c.io) - c.last_status_s >= 30) {
             c.last_status_s = util.nowSeconds(c.io);
@@ -13604,7 +13643,7 @@ pub const Core = struct {
     };
 
     fn appHost(c: *Core) appserver.Host {
-        return .{ .ctx = c, .api = appApi, .shell = appShellApi, .opened = appOpened };
+        return .{ .ctx = c, .api = appApi, .shell = appShellApi, .opened = appOpened, .desk = deskApi };
     }
 
     fn appErr(a: std.mem.Allocator, status: std.http.Status, why: []const u8) appserver.Answer {
@@ -14643,6 +14682,18 @@ pub const Core = struct {
         const hours = c.quiet.effective(c.cfg.butler.quiet);
         const inside = if (hours) |h| h.inside(quiet_mod.minuteOf(c.now(), c.cfg.chat.utc_offset)) else false;
         return .{ .now = inside, .hours = hours };
+    }
+
+    /// From the tick: `harness stop` wrote state/stop-request; taken, and
+    /// main's watcher ends harness the way a signal does.
+    fn stopTick(c: *Core) void {
+        var buf: [1024]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const p = std.fs.path.join(fba.allocator(), &.{ c.paths.state, "stop-request" }) catch return;
+        _ = Io.Dir.cwd().statFile(c.io, p, .{}) catch return;
+        Io.Dir.cwd().deleteFile(c.io, p) catch {};
+        c.log.write(.config, false, .{ .event = "stop requested" }) catch {};
+        c.stop_requested.store(true, .release);
     }
 
     /// From the tick: quiet hours starting or ending is news for the desk.
@@ -36273,4 +36324,49 @@ test "desk_speech_fetches_the_providers_audio" {
     // speak = off or browser: harness fetches nothing
     _ = deskCall(&f, .POST, "settings", "", "{\"speak\":\"off\"}");
     try t.expectEqual(std.http.Status.conflict, deskCall(&f, .POST, "speech", "", try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{id})).status);
+}
+
+test "a_taken_port_moves_to_the_next_and_is_written" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // port = 0: one is picked and written
+    _ = try f.core.startApps(a);
+    const first = f.core.app_server.?.port;
+    try expectHas(f.core.readOr(a, f.core.paths.config), try std.fmt.allocPrint(a, "port = {d}", .{first}));
+    try t.expectEqual(@as(u32, first), f.core.cfg.apps.port);
+    try t.expectEqualStrings("", f.core.apps_note);
+    // the written file isn't "changed settings"
+    f.core.checkSettingsChanged();
+    try t.expect(!f.core.told_settings_changed);
+    // taken at the next start: the next free one, written back, and said
+    f.core.app_server.?.stop();
+    f.core.app_server = null;
+    const blocker = try @import("sock.zig").Listener.openExclusive(first);
+    defer blocker.close();
+    _ = try f.core.startApps(a);
+    const second = f.core.app_server.?.port;
+    try t.expect(second > first and second <= first + 10);
+    try expectHas(f.core.readOr(a, f.core.paths.config), try std.fmt.allocPrint(a, "port = {d}", .{second}));
+    try t.expectEqualStrings(try std.fmt.allocPrint(a, "Port {d} was taken; the desk uses {d} now (written to config.ini).", .{ first, second }), f.core.apps_note);
+}
+
+test "a_stop_request_ends_harness_on_its_tick" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const req = try std.fs.path.join(a, &.{ f.core.paths.state, "stop-request" });
+    try t.expect(!f.core.stop_requested.load(.acquire));
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = req, .data = "" });
+    f.core.tick();
+    try t.expect(f.core.stop_requested.load(.acquire));
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, req, .{}));
+    // one left from before a start is not taken as a new request
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = req, .data = "" });
+    try restart(&f);
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, req, .{}));
+    f.core.tick();
+    try t.expect(!f.core.stop_requested.load(.acquire));
 }
