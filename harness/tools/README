@@ -12,6 +12,22 @@ Dev tools for the desk's avatar. Not shipped; harness doesn't use them.
       DATA/PATH. Every response carries the desk's CSP; violations are
       logged to DATA/csp-reports.log.
 
+  headless.mjs URL [--wait EXPR] [--eval EXPR] [--shot FILE]
+      Headless Chrome (SwiftShader) over the DevTools protocol: opens URL,
+      waits for EXPR (default window.__ready), prints the page's console,
+      a value and a screenshot.
+
+  make-base-head.html
+      desk-assets/base-head.bin from desk-assets/facecap.glb (three.js
+      r170's Face Cap sample, SHA-256 checked): the neutral head rendered,
+      MediaPipe's 478 landmarks found on it and kept as points on its
+      surface. three's loaders come from jsDelivr (0.170.0), so the dev
+      server runs with --no-csp for it.
+
+  test-avatar.mjs [--write-fixture]
+      node checks for fit.js's and avatar.js's pure parts; --write-fixture
+      rewrites src/testdata/avatar/tiny-head.bin (the Zig tests' head).
+
 Run them from harness/:
 
   sh tools/fetch-desk-assets.sh DATA/desk-assets
