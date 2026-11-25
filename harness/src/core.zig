@@ -17692,9 +17692,32 @@ const Fix = struct {
 
     /// The buttons under the last question, as the owner sees them.
     fn lastButtons(f: *Fix) Recorder.Buttons {
-        f.rec.mutex.lockUncancelable(t.io);
-        defer f.rec.mutex.unlock(t.io);
-        return f.rec.last;
+        const b = blk: {
+            f.rec.mutex.lockUncancelable(t.io);
+            defer f.rec.mutex.unlock(t.io);
+            break :blk f.rec.last;
+        };
+        if (b.n > 0) f.waitQuickNoted(b.buf[0][0..b.len[0]]);
+        return b;
+    }
+
+    /// A quick reply's post is noted with its message just after its
+    /// buttons are sent (sendWithButtons), on the worker's thread: waits
+    /// for that, so a press made as soon as the buttons show counts.
+    /// `data` is a button's ("rN-NONCE:I"); any other kind returns at once.
+    fn waitQuickNoted(f: *Fix, data: []const u8) void {
+        if (data.len < 2 or data[0] != 'r') return;
+        const dash = std.mem.indexOfScalar(u8, data, '-') orelse return;
+        const n = std.fmt.parseInt(u32, data[1..dash], 10) catch return;
+        var waited: u32 = 0;
+        while (waited < 8000) : (waited += 5) {
+            {
+                f.core.quick_mutex.lockUncancelable(t.io);
+                defer f.core.quick_mutex.unlock(t.io);
+                for (f.core.quick.items) |q| if (q.n == n and q.msg != null) return;
+            }
+            t.io.sleep(.fromMilliseconds(5), .awake) catch {};
+        }
     }
 
     /// The owner presses the last question's button that answers `which`.
