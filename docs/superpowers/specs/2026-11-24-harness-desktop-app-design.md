@@ -154,8 +154,8 @@ what is below.
   `--home DIR`.
 - At each start, harness writes `state/desk.json` there: its binary's
   path, the port, the data folder and harness's version.
-- Before harness has ever run, the app says: "Set up harness first: run
-  `harness init`."
+- Before harness has ever been set up, the app sets it up itself (see
+  "First run, and the desk alone").
 
 **Its own pages and the bridge:**
 
@@ -719,6 +719,113 @@ From the mockup:
     - exact lip-sync timing;
   - the ledger and the Windows handoff.
 
+## First run, and the desk alone (added 2026-11-25)
+
+On 2026-11-25 the real app was tried against a fresh data folder. Entry
+and a chat turn worked. Four things stood between a download and a
+working desk:
+
+- `harness run` exits without a Telegram bot;
+- setup is terminal-only, and the app only says to run `harness init`;
+- the stage is empty: no avatar and no fit files reach a fresh install;
+- times show UTC.
+
+This section closes them. It is my call throughout, not the owner's (see
+"Calls I made").
+
+### harness runs with the desk alone
+
+- `harness run` no longer needs Telegram. It runs with the desk as the
+  only way in when `[chat] telegram = off`, or when it is on and no token
+  is stored: the worker, the scheduler and the desk's server run, and no
+  Telegram poller.
+- It says which at start, on stderr and once on the desk:
+  - "Telegram is off. The desk is the only way in."
+  - "No bot token is stored under "NAME", so Telegram is off. The desk is
+    the only way in."
+- With neither Telegram nor the desk's server, it fails as before, with
+  one line naming what to turn on.
+- The desk needs no pairing: its entry is the one-time code.
+- Everything meant for the owner goes to the desk: replies, briefs, task
+  results, items needing you, urgent items, the digest. The echo to
+  Telegram is skipped. Nothing may fail or be dropped because Telegram is
+  missing.
+- With a token stored, nothing changes, pairing included.
+- `harness init`'s next steps name the desk first: the provider and its
+  key, `harness run`, `harness open`. Telegram follows as optional, "for
+  your phone".
+
+### `harness config set`
+
+- `harness config set SECTION.KEY VALUE` writes one setting in
+  config.ini. Comments and order are kept. The result is parsed first: a
+  change that doesn't parse is refused, and the file is untouched.
+- `harness config get SECTION.KEY` prints the value in use.
+- A named section is written `provider NAME.url`. A missing section is
+  added at the end.
+- It never takes a secret's value. A setting that names a secret (like
+  `model.key`) is an ordinary setting.
+- When harness is running, it says whether the change is in use or needs
+  `/reload` or a restart.
+
+### Local time
+
+- `[chat] utc_offset = auto` is the default `harness init` writes: the
+  computer's own zone at each use, daylight saving included.
+- `+HH:MM` still means exactly that. Config files already written are
+  unchanged.
+- When the computer's zone can't be read, it is UTC, and harness says so
+  once at start.
+
+### The app carries harness and sets it up
+
+- **One download.** `harness-desk.app` holds the harness binary
+  (`Contents/MacOS/harness`) and the fit files
+  (`Contents/Resources/desk-assets/`). The Windows and Linux packages
+  hold the same, beside the app's program.
+- **Finding harness:** the binary `state/desk.json` names, when it is
+  there. Otherwise the app's own copy.
+- **No config.ini in the data folder:** the app shows its own screen,
+  "Set up", instead of "Set up harness first":
+  - Provider: Anthropic, OpenAI, OpenRouter, opencode, omnigate, or
+    Other (an address that speaks OpenAI's or Anthropic's format);
+  - Model, filled in with the provider's usual one;
+  - Address, for omnigate and Other only;
+  - [Continue].
+- **What [Continue] does,** in order:
+  1. runs `harness init`;
+  2. writes the provider, model and address with `harness config set`;
+  3. asks for the key in a native secure field, and pipes it to
+     `harness secret add NAME --stdin`;
+  4. starts harness and enters the desk.
+- **The key never reaches a page.** The setup screen is the app's own,
+  and even it never holds the key. The secure field's note says where the
+  key goes: "harness keeps it in this computer's key store."
+- **A step that fails** shows the command's own line on the screen. What
+  was typed stays.
+- **Later changes:** the app's menu has "Provider and key…", which opens
+  the same screen with the values in use. The key is asked for again only
+  when the owner chooses to replace it.
+- Telegram is optional, and still set up in a terminal
+  (`harness secret add telegram`, `harness run`, `harness pair`).
+
+### The fit files and an empty stage
+
+- **harness's release archives hold `desk-assets/` beside the binary:**
+  MediaPipe's files, fetched at their pinned hashes by
+  `tools/fetch-desk-assets.sh` in the release job, and the base head.
+  They are not committed (23 MB), apart from the base head.
+- **harness serves `/desk/assets/…` from the first place that has the
+  file:** the data folder's `desk-assets/`, then `desk-assets/` beside
+  its binary, then `../Resources/desk-assets/` (the app bundle).
+- **No avatar** (none chosen, or its pack isn't there): the stage shows a
+  plain outline of a head and shoulders, the status card as usual, and
+  [Add a portrait], which opens Settings at the avatar part.
+- **No fit files:** Settings says "The fit files aren't installed.",
+  names the folder they go in, and turns the upload off.
+- The built-in butler stays held until its portraits' licensing is
+  cleared, so a fresh install starts with no avatar.
+
 ## Who builds what
 
 - The Mac session: harness's side (the shell pages, the API, entry, the run
@@ -763,3 +870,12 @@ From the mockup:
 - **Uploads are fitted at once,** in the desk. The eyes-closed version is
   optional, and made with the owner's own image tool.
 - **Upload requires the consent line.**
+- **harness runs with the desk alone** (2026-11-25): Telegram is optional.
+  A desktop app that can't start without a phone bot isn't a desktop app.
+- **The app carries harness and sets it up** (2026-11-25): provider,
+  model and address on the app's own screen, the key in a native secure
+  field. The desk's page still adds no provider and takes no key; a
+  speech provider is still added in config.ini.
+- **`utc_offset = auto`** is the default for new data folders.
+- **The fit files ship in the release archives,** fetched in the release
+  job, not committed and not built into the binary.
