@@ -8,4 +8,6 @@ test {
     _ = @import("policy.zig");
     _ = @import("bridge.zig");
     _ = @import("controller.zig");
+    _ = @import("commands.zig");
+    _ = @import("pages.zig");
 }
