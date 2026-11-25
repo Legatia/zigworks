@@ -3,4 +3,6 @@ test {
     _ = @import("args.zig");
     _ = @import("home.zig");
     _ = @import("deskjson.zig");
+    _ = @import("entry.zig");
+    _ = @import("alive.zig");
 }
