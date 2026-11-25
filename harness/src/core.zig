@@ -14839,6 +14839,16 @@ pub const Core = struct {
     /// the one config.ini names clears the model and the voice, which were
     /// the other kind's.
     fn deskSettings(c: *Core, a: std.mem.Allocator, body: []const u8) !appserver.Answer {
+        if (try c.deskSettingWrite(a, body)) |refused| return refused;
+        // applied after the write's lock: a reload that waits for a run
+        // holds up no other setting
+        if (c.applySetup()) |why| return deskErr(a, .conflict, why);
+        return .{ .body = "{\"ok\":true}" };
+    }
+
+    /// deskSettings' change written to config.ini, one writer at a time;
+    /// null when written, else the refusal.
+    fn deskSettingWrite(c: *Core, a: std.mem.Allocator, body: []const u8) !?appserver.Answer {
         const shape = "{\"avatar\":NAME}, {\"speak\":VALUE}, {\"speak_model\":M} or {\"speak_voice\":V}";
         const v = jv.parse(a, body) orelse return deskErr(a, .bad_request, shape);
         // exactly one setting, its value a string
@@ -14882,8 +14892,7 @@ pub const Core = struct {
         text = if (value.len == 0) try mail_mod.unsetKey(a, text, "desk", key) else try mail_mod.setKey(a, text, "desk", key, value);
         c.writeSetting(c.paths.config, text) catch |e| return deskErr(a, .internal_server_error, try std.fmt.allocPrint(a, "Not changed: config.ini could not be written ({s}).", .{@errorName(e)}));
         c.log.write(.config, false, .{ .event = "desk setting", .key = key, .value = value }) catch {};
-        if (c.applySetup()) |why| return deskErr(a, .conflict, why);
-        return .{ .body = "{\"ok\":true}" };
+        return null;
     }
 
     /// The kind of voice config.ini's `[desk] speak` names, by the file's
@@ -15233,6 +15242,10 @@ pub const Core = struct {
 
     /// The desk's settings and their choices.
     fn deskSettingsJson(c: *Core, a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        // the fit's files: all there in one place or another, and the
+        // folder they go in (the data folder's); looked at before the lock
+        const dirs = try appserver.assetDirs(a, c.paths.home, c.exe_dir);
+        const fit_there = appserver.fitFilesThere(c.io, a, dirs);
         // read under the settings' lock: a /reload frees them
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
@@ -15279,10 +15292,7 @@ pub const Core = struct {
             try out.append(a, '}');
         }
         try out.print(a, "],\"echo\":{s},\"voice\":{s}", .{ if (d.echo) "true" else "false", if (c.cfg.voice.provider.len > 0) "true" else "false" });
-        // the fit's files: all there in one place or another, and the
-        // folder they go in (the data folder's)
-        const dirs = try appserver.assetDirs(a, c.paths.home, c.exe_dir);
-        try out.print(a, ",\"fit_files\":{s},\"fit_dir\":", .{if (appserver.fitFilesThere(c.io, a, dirs)) "true" else "false"});
+        try out.print(a, ",\"fit_files\":{s},\"fit_dir\":", .{if (fit_there) "true" else "false"});
         try util.jsonString(out, a, dirs[0]);
         try out.append(a, '}');
     }

@@ -20,7 +20,9 @@ Apache License 2.0
 
 MediaPipe's licence, as its repository gives it at v0.10.14 (the Apache
 License 2.0 and the notice for the UTF-8 code it carries), is in
-LICENSE-mediapipe.txt. MediaPipe has no NOTICE file.
+LICENSE-mediapipe.txt. MediaPipe has no NOTICE file (none in its
+repository at v0.10.14, none in the npm package). The libraries its
+WebAssembly links, with their licences, are in THIRD-PARTY-mediapipe.txt.
 
 base-head.bin
   The neutral head the fit maps onto a portrait. Its source and licence

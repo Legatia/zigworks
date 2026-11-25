@@ -33,6 +33,8 @@ const S = {
   lastAlerts: 0,
   avatar: null,
   avatarName: null,
+  // each load's number: a load that isn't the latest is let go
+  avatarGen: 0,
   reentered: false,
 };
 
@@ -518,6 +520,7 @@ $("micBtn").addEventListener("click", async () => {
 async function ensureAvatar() {
   const name = (S.settings.avatars || []).includes(S.settings.avatar) ? S.settings.avatar : "";
   if (S.avatarName === name) return;
+  const gen = ++S.avatarGen;
   if (S.avatar) S.avatar.dispose && S.avatar.dispose();
   S.avatar = null;
   S.avatarName = name;
@@ -526,13 +529,16 @@ async function ensureAvatar() {
   if (!name) return;
   try {
     const av = await createAvatar($("avatar"), "/desk/avatars/" + encodeURIComponent(name) + "/", { reducedMotion });
-    // another was chosen meanwhile
-    if (S.avatarName !== name) return av.dispose && av.dispose();
+    // another load started meanwhile (another choice, or a fit's reload)
+    if (gen !== S.avatarGen) {
+      if (av.dispose) av.dispose();
+      return;
+    }
     S.avatar = av;
     S.avatar.setState(stateNow());
     $("emptyStage").hidden = true;
   } catch (_) {
-    if (S.avatarName !== name) return;
+    if (gen !== S.avatarGen) return;
     S.avatar = null;
     $("avatar").textContent = "";
     emptyStage(true);

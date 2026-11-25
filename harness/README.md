@@ -3766,13 +3766,15 @@ wider than tall fills the window; this one leaves bands at the sides.").
 The fit needs its files: MediaPipe tasks-vision 0.10.14 and its face
 landmarker model (Apache 2.0), and the base head, `base-head.bin`.
 harness's release archives hold them in `desk-assets/` beside the
-binary, with MediaPipe's licence (`LICENSE-mediapipe.txt`) and a
-`NOTICE.txt` naming each file; the desk app carries them in its bundle.
-harness serves each file from the first of these that has it:
+binary, with MediaPipe's licence (`LICENSE-mediapipe.txt`), the
+libraries its WebAssembly links (`THIRD-PARTY-mediapipe.txt`) and a
+`NOTICE.txt` naming each file. harness serves each file from the first
+of these that has it:
 
 1. the data folder's `desk-assets/`;
 2. `desk-assets/` beside harness's binary;
-3. `../Resources/desk-assets/` from the binary (a macOS app bundle).
+3. `../Resources/desk-assets/` from the binary, when it is in an app
+   bundle's `Contents/MacOS/`.
 
 Without them the desk's Settings says "The fit files aren't installed.",
 names the data folder's `desk-assets/`, and turns the upload off. Built

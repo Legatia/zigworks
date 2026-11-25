@@ -230,8 +230,14 @@ pub const Server = struct {
         _ = std.base64.url_safe_no_pad.Encoder.encode(&s.shell_token, &raw);
         if (o.desk) |d| {
             s.desk_home = try gpa.dupe(u8, d.home);
+            errdefer gpa.free(s.desk_home);
             s.desk_state = try gpa.dupe(u8, d.state);
+            errdefer gpa.free(s.desk_state);
             s.asset_dirs = try assetDirs(gpa, d.home, d.exe_dir);
+            errdefer {
+                for (s.asset_dirs) |x| gpa.free(x);
+                gpa.free(s.asset_dirs);
+            }
             s.desk_thread = try std.Thread.spawn(.{}, deskLoop, .{s});
         }
         if (s.log) |l| l.write(.app, false, .{ .event = "server started", .port = s.port }) catch {};
@@ -895,8 +901,8 @@ fn deskName(rel: []const u8) bool {
 
 /// Where the fit's files (`/desk/assets/`) are looked for, in order: the
 /// data folder's `desk-assets/`, then, when harness's own folder is known,
-/// `desk-assets/` beside the binary and `../Resources/desk-assets/` (a
-/// macOS app bundle). In `a`.
+/// `desk-assets/` beside the binary and, when that folder is an app
+/// bundle's `Contents/MacOS`, `../Resources/desk-assets/`. In `a`.
 pub fn assetDirs(a: std.mem.Allocator, home: []const u8, exe_dir: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -906,7 +912,9 @@ pub fn assetDirs(a: std.mem.Allocator, home: []const u8, exe_dir: []const u8) ![
     try out.append(a, try std.fs.path.join(a, &.{ home, "desk-assets" }));
     if (exe_dir.len > 0) {
         try out.append(a, try std.fs.path.join(a, &.{ exe_dir, "desk-assets" }));
-        if (std.fs.path.dirname(exe_dir)) |up| try out.append(a, try std.fs.path.join(a, &.{ up, "Resources", "desk-assets" }));
+        if (std.mem.eql(u8, std.fs.path.basename(exe_dir), "MacOS")) if (std.fs.path.dirname(exe_dir)) |up| {
+            if (std.mem.eql(u8, std.fs.path.basename(up), "Contents")) try out.append(a, try std.fs.path.join(a, &.{ up, "Resources", "desk-assets" }));
+        };
     }
     return out.toOwnedSlice(a);
 }
@@ -923,12 +931,12 @@ pub const fit_files = [_][]const u8{
     "base-head.bin",
 };
 
-/// Whether every one of fit_files would be served: each found, as the
-/// desk serves it, in one place or another. Stats only.
+/// Whether every one of fit_files would be served: the first place that
+/// has each has it within 20 MB, as the desk serves it. Stats only.
 pub fn fitFilesThere(io: Io, a: std.mem.Allocator, dirs: []const []const u8) bool {
     for (fit_files) |rel| {
         const found = for (dirs) |dir| {
-            if (deskFileAt(io, a, dir, rel) catch null) |f| if (f.size <= max_desk_file) break true;
+            if (deskFileAt(io, a, dir, rel) catch null) |f| break f.size <= max_desk_file;
         } else false;
         if (!found) return false;
     }
@@ -1839,6 +1847,32 @@ test "desk_assets_without_a_binary_folder_are_the_data_folders" {
     try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/data", "desk-assets" }), dirs[0]);
     try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/opt/x/Contents/MacOS", "desk-assets" }), dirs[1]);
     try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/opt/x/Contents", "Resources", "desk-assets" }), dirs[2]);
+    // a binary outside an app bundle: no Resources beside its folder
+    const plain = try assetDirs(a, "/data", "/usr/local/bin");
+    try t.expectEqual(2, plain.len);
+    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/usr/local/bin", "desk-assets" }), plain[1]);
+}
+
+test "fit_files_are_judged_as_they_are_served" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const dirs = try assetDirs(a, try std.fs.path.join(a, &.{ root, "data" }), try std.fs.path.join(a, &.{ root, "bin" }));
+    for (fit_files) |rel| {
+        const p = try std.fs.path.join(a, &.{ dirs[1], rel });
+        try Io.Dir.cwd().createDirPath(t.io, std.fs.path.dirname(p).?);
+        try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p, .data = "x" });
+    }
+    try t.expect(fitFilesThere(t.io, a, dirs));
+    // an oversized copy in the first place answers 413, so it isn't there
+    const big = try a.alloc(u8, max_desk_file + 1);
+    @memset(big, 0);
+    try Io.Dir.cwd().createDirPath(t.io, dirs[0]);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dirs[0], "base-head.bin" }), .data = big });
+    try t.expect(!fitFilesThere(t.io, a, dirs));
 }
 
 test "desk_assets_never_leave_their_places" {
