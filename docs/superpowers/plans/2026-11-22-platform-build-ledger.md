@@ -171,3 +171,21 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
 - CI 45479751508 (31505ed, the persona merge): 29/31. A macOS headterm job was cancelled while waiting for a runner. Linux harness: two `hermes_import` tests failed. Their helper `importDir` took the first `state/imports` entry starting with `hermes-`, and since the fix pass `hermes-entries` (a file) sits beside the import's folder. ext4's listing order put the file first. The helper now takes folders only (the test was wrong; the product is unchanged).
 - CI 45485959370 (2f67124, importDir takes folders only): 30/31, with harness green on all three systems. Windows llmcheck hung for 59 minutes with no log, its third hang that day. Rerun; noted in the gaps list's Infrastructure section.
 - 2026-11-24 money within a budget (Part 1 of the budget and sandbox design), branch `platform/money-budget`: plan `2026-11-24-money-budget.md`, its rulings and Done there. moneyCheck has an unattended branch before the gate (the gate allows unattended money only when the budget passed); the ledger adds `auto:day`, `auto:month`, `all:month` lines (each kind its own 64 slots; an old file reads as before); skipped money items carry the whole call and [Make this payment]; the reorder orders within the budget; `/money`; injection case 33. `scheduled`, `triggers`, `workflows` default on (no budget: nothing moves). Pre-existing flake seen on this Mac at 75a5f48: core `each_of_these_asks` (reload says Busy), 2 of 5 runs.
+  Whole-branch review (fresh reviewer, c05f7a5..7256e90): no Critical; three Important, all money moving where the owner never decided it could:
+  - The upgrade turned on spending in triggers and workflows that old installs never had lines for (absent meant off). The upgrade now writes `triggers = off` and `workflows = off` when the lines are missing.
+  - The upgrade gave `[money]`'s new budget to servers whose caps were all off (`max_per_day = none`). They now get `budget_per_day = none`.
+  - Setup's budget answer for one shop wrote `[money]`, which reached every money server. It now writes the shop's own section (Ruling 11's write target overturned).
+
+  Four Minor were re-graded Important and fixed:
+  - amounts below 1 showed as "0.00";
+  - an amount of 0 passed unattended (now refused);
+  - nothing said budgets are per server (now said, plus a README line that "outside text doesn't spend" goes by the mark);
+  - a half-written upgrade left the owner untold (mcp.ini is now written first, and the upgrade retries).
+
+  Also: the missing test for a deny line added before the [Make this payment] tap. In the coordinator's check, Ruling 28 was overturned: [None] for a shop now writes `budget_per_day = none` there, so a later `/money budget` doesn't reach it.
+  - Final: minor (deferred): setup's answer doesn't warn about `scheduled = off`.
+  - Final: minor (deferred): a tap that pays nothing closes the item with no retry.
+  - Final: minor (deferred): `mail_send`'s decision line carries no budget numbers.
+  - Final: minor (deferred): parseCap's doc comment sits above parseBudget.
+  - Final: minor (deferred): an agent test comment says "the next day" but only raises the budget.
+  - Merged as bc3829b on harness-logins (unit 1463 of 1485, 22 skipped; smoke 152, and 185 with the stand-ins, in both modes).
