@@ -38,6 +38,13 @@ else
     fi
 fi
 command -v $PY > /dev/null 2>&1 || { echo "SKIP: no $PY for the stand-in harness"; exit 0; }
+if [ $OS = linux ] && [ -z "${DESK_SMOKE_SOUND:-}" ]; then
+    # no sound device is asked for: without a working one (Xvfb, a CI runner)
+    # GStreamer can wait on it for good, and the page with it. With every
+    # real output ranked out it plays into nothing, which is all the check
+    # needs (that play() is allowed). DESK_SMOKE_SOUND=1 uses the machine's.
+    export GST_PLUGIN_FEATURE_RANK="pulsesink:NONE,pipewiresink:NONE,alsasink:NONE,jackaudiosink:NONE,osssink:NONE,oss4sink:NONE,openalsink:NONE"
+fi
 STRICT=yes
 [ -n "${CI:-}" ] && STRICT=no
 

@@ -1,0 +1,2 @@
+// The program's icon (harness.ico is drawn at build time: src/icon.zig).
+1 ICON "harness.ico"

@@ -170,12 +170,69 @@ pub fn icns(a: std.mem.Allocator) ![]u8 {
     return out.toOwnedSlice(a);
 }
 
-/// `icon OUT.icns`
+/// The sizes Windows asks for, as `harness.ico`: 16 to 64 px as 32-bit
+/// bitmaps (bottom row first, an empty mask after them), 256 px as a PNG.
+pub fn ico(a: std.mem.Allocator) ![]u8 {
+    const sizes = [_]u32{ 16, 24, 32, 48, 64, 256 };
+    var images: [sizes.len][]u8 = undefined;
+    for (sizes, &images) |size, *img| {
+        if (size == 256) {
+            img.* = try png(a, size);
+            continue;
+        }
+        const px = try a.alloc(u8, size * size * 4);
+        defer a.free(px);
+        draw(size, px);
+        const mask_row = (size + 31) / 32 * 4;
+        var one: std.ArrayList(u8) = .empty;
+        errdefer one.deinit(a);
+        var head: [40]u8 = @splat(0);
+        std.mem.writeInt(u32, head[0..4], 40, .little);
+        std.mem.writeInt(u32, head[4..8], size, .little);
+        // (the picture and its mask, one above the other)
+        std.mem.writeInt(u32, head[8..12], size * 2, .little);
+        std.mem.writeInt(u16, head[12..14], 1, .little);
+        std.mem.writeInt(u16, head[14..16], 32, .little);
+        std.mem.writeInt(u32, head[20..24], size * size * 4 + mask_row * size, .little);
+        try one.appendSlice(a, &head);
+        var row = size;
+        while (row > 0) {
+            row -= 1;
+            for (0..size) |x| {
+                const p = px[(row * size + x) * 4 ..][0..4];
+                try one.appendSlice(a, &.{ p[2], p[1], p[0], p[3] });
+            }
+        }
+        try one.appendNTimes(a, 0, mask_row * size);
+        img.* = try one.toOwnedSlice(a);
+    }
+    defer for (images) |img| a.free(img);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, &.{ 0, 0, 1, 0, sizes.len, 0 });
+    var at: u32 = 6 + 16 * sizes.len;
+    for (sizes, images) |size, img| {
+        var e: [16]u8 = @splat(0);
+        e[0] = @truncate(size); // 256 is written as 0
+        e[1] = @truncate(size);
+        std.mem.writeInt(u16, e[4..6], 1, .little);
+        std.mem.writeInt(u16, e[6..8], 32, .little);
+        std.mem.writeInt(u32, e[8..12], @intCast(img.len), .little);
+        std.mem.writeInt(u32, e[12..16], at, .little);
+        try out.appendSlice(a, &e);
+        at += @intCast(img.len);
+    }
+    for (images) |img| try out.appendSlice(a, img);
+    return out.toOwnedSlice(a);
+}
+
+/// `icon OUT.icns`, `icon OUT.ico`, or `icon OUT.png` (256 px).
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
     if (args.len != 2) return error.Usage;
-    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[1], .data = try icns(a) });
+    const data = if (std.mem.endsWith(u8, args[1], ".ico")) try ico(a) else if (std.mem.endsWith(u8, args[1], ".png")) try png(a, 256) else try icns(a);
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[1], .data = data });
 }
 
 const t = std.testing;
@@ -206,6 +263,34 @@ test "png_is_valid_and_inflates_to_the_size" {
     const raw = try d.reader.allocRemaining(a, .unlimited);
     try t.expectEqual(@as(usize, 32 * (1 + 32 * 4)), raw.len);
     try t.expectEqualSlices(u8, "\x00\x00\x00\x00IEND\xae\x42\x60\x82", p[p.len - 12 ..]);
+}
+
+test "ico_entries_point_at_their_images" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const data = try ico(arena.allocator());
+    try t.expectEqualSlices(u8, &.{ 0, 0, 1, 0, 6, 0 }, data[0..6]);
+    var end: u32 = 6 + 16 * 6;
+    for ([_]u32{ 16, 24, 32, 48, 64, 256 }, 0..) |size, i| {
+        const e = data[6 + 16 * i ..][0..16];
+        try t.expectEqual(@as(u8, @truncate(size)), e[0]);
+        try t.expectEqual(32, std.mem.readInt(u16, e[6..8], .little));
+        const len = std.mem.readInt(u32, e[8..12], .little);
+        const at = std.mem.readInt(u32, e[12..16], .little);
+        try t.expectEqual(end, at);
+        end += len;
+        const img = data[at..][0..len];
+        if (size == 256) {
+            try t.expectEqual([2]u32{ 256, 256 }, pngSize(img));
+        } else {
+            // a bitmap header: its width, and twice its height
+            try t.expectEqual(40, std.mem.readInt(u32, img[0..4], .little));
+            try t.expectEqual(size, std.mem.readInt(u32, img[4..8], .little));
+            try t.expectEqual(size * 2, std.mem.readInt(u32, img[8..12], .little));
+            try t.expectEqual(40 + size * size * 4 + (size + 31) / 32 * 4 * size, len);
+        }
+    }
+    try t.expectEqual(data.len, end);
 }
 
 test "icns_lengths_add_up" {

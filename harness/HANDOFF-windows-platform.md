@@ -251,12 +251,27 @@ What it changes for your code and tests:
 - On Windows Server (GitHub's runner) nothing in a sandbox can open NUL:
   a routine's command in a test must not redirect to nul.
 
-**The desk app.** Its shared code compiles and passes its 62 unit tests
-on Windows and Linux now (`alive.zig` over Winsock, `spawnDetached`
-without a window, `entry.zig` without a mode, `home.zig` under
-`%LOCALAPPDATA%`); CI job `desk-app-shared` runs them. The Windows and
-Linux apps themselves wait for the owner's yes to two downloads (plan
-section 11).
+**The desk app, Windows and Linux: built** (plan sections 11 and 12,
+rulings R50 to R60). `src/windows/desk.c` (WebView2) and
+`src/linux/desk.c` (GTK 3, WebKitGTK 4.1) sit behind your `hdesk_*`
+interface; `main.zig` gained two exports for them (`hdesk_home`,
+`hdesk_icon`) and nothing else changed for macOS. Smokes
+(`scripts/smoke-other.sh`): 48 of 48 on Windows, 47 of 47 on Linux under
+Xvfb. CI jobs `desk-app-windows` and `desk-app-linux`; release steps for
+both.
+
+For you:
+
+- `test/fake_harness.py`: `post()` goes through either bridge, the page
+  has `frame()` (a sandboxed frame that posts `{badge: 77}`), and
+  `FAKE_BINARY` names the program desk.json says harness is. Your smoke
+  doesn't use the new parts; a `cmd "js frame()"` check there would show
+  WKWebView's `isMainFrame` at work.
+- Only the stand-in's page has been in these windows. Once you can, tell
+  me what the real desk and the head need that they don't give.
+- Linux differs in three ways the README states: no speech synthesis, a
+  clicked link in a framed app opens the system browser, and the window's
+  place is the desktop's on Wayland.
 
 ## For you: the owner answered question 3 (2026-11-24)
 

@@ -3912,6 +3912,83 @@ zig build smoke               # the app in a window against a stand-in harness (
 scripts/package-macos.sh 0.3.0 harness-desk-0.3.0-macos.zip   # both kinds of Mac, signed ad hoc
 ```
 
+## Desk app (Windows)
+
+`harness-desk.exe` is the same window on Windows 10 and 11: "harness" on
+the taskbar, with the count of what needs you in its title ("harness
+(2)") and a red dot on its taskbar icon. It behaves as the macOS app
+does (what it says before harness runs, getting in by a one-time code,
+the menu, what the window may open); what differs:
+
+**Install.** Download `harness-desk-VERSION-windows.zip` from the release
+and unpack it anywhere. Keep `WebView2Loader.dll` beside
+`harness-desk.exe`: it is Microsoft's, passed on under its licence
+(`WebView2Loader-LICENSE.txt`), and finds the web view. The web view
+itself is Microsoft's WebView2 Runtime, which Windows 11 has and most
+Windows 10 machines too; where it is missing the app says so and offers
+Microsoft's page to install it.
+
+**The first run.** The program is not signed with a certificate, so
+Windows asks first ("Windows protected your PC"): More info › Run anyway.
+
+**Opening it.** `harness open` starts it, or brings its window to the
+front, on your data folder; started by itself it uses the default one
+(`%LOCALAPPDATA%\harness`). One window a data folder: a second start
+shows the first.
+
+**The window.** Closing it sends it to the taskbar, with its badge; the
+taskbar button brings it back. Quit harness (Ctrl+Q) in the harness menu
+ends the app, and harness keeps running. Reload is Ctrl+R or F5. The web
+view runs InPrivate, so no cookie or storage outlives the app; its own
+working folder is `desk-webview` in the data folder, which also holds the
+window's place. An urgent item flashes the taskbar button.
+
+**Building it.** In `desk-app/`, with Microsoft's NuGet package
+Microsoft.Web.WebView2 for the header and the loader (pinned by version
+and SHA-256 in the script, which downloads and checks it):
+
+    scripts/fetch-webview2.sh ../../webview2   # the pinned package, unpacked
+    zig build test                             # the decisions: no window needed
+    zig build app -Dwebview2=../../webview2    # zig-out/harness-desk/
+    zig build smoke -Dwebview2=../../webview2  # in a window, against a stand-in harness (Git Bash, python)
+    scripts/package-windows.sh 0.3.0 harness-desk-0.3.0-windows.zip ../../webview2
+
+## Desk app (Linux)
+
+`harness-desk` is the same window on Linux (x86_64), with GTK 3 and
+WebKitGTK 4.1. It needs `libgtk-3-0` and `libwebkit2gtk-4.1-0`
+installed, on a system at least as new as Ubuntu 24.04 (the release is
+built there, against its C library), and behaves as the macOS app does;
+what differs:
+
+**Install.** Download `harness-desk-VERSION-linux-x86_64.tar.gz` from the
+release, unpack it, and put `harness-desk` beside `harness` or on your
+PATH, where `harness open` finds it.
+
+**The window.** The count of what needs you is in the title ("harness
+(2)"); an urgent item sets the window's urgency hint, which most desktops
+show on the taskbar. Closing the window minimizes it; Quit harness
+(Ctrl+Q) ends the app. Nothing of the web view reaches disk. A second
+start shows the first window where your session has a D-Bus session bus,
+and ends quietly where it has none.
+
+**What Linux doesn't have.** WebKitGTK has no speech synthesis, so the
+desk speaks only through a provider (`speak =` a provider, or off),
+never the browser's own voice. And WebKitGTK doesn't tell the app which
+frame of a page is navigating: a link you click to another site opens in
+your browser from an app shown inside the desk too, where on macOS and
+Windows it goes nowhere; what a script does by itself goes nowhere, as
+everywhere. On Wayland the window's size is remembered and its place is
+the desktop's to choose.
+
+**Building it.** In `desk-app/`, with `libgtk-3-dev` and
+`libwebkit2gtk-4.1-dev` (found through pkg-config):
+
+    zig build test     # the decisions: no window needed
+    zig build app      # zig-out/harness-desk/harness-desk
+    zig build smoke    # in a window (under xvfb-run where there is no display), against a stand-in harness
+    scripts/package-linux.sh 0.3.0 harness-desk-0.3.0-linux-x86_64.tar.gz
+
 ## Build
 
 ```

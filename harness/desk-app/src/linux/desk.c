@@ -14,8 +14,9 @@
 #include <webkit2/webkit2.h>
 #include "../mac/desk.h"
 
-// The data folder, from Zig.
+// The data folder and the window's icon (a PNG), from Zig.
 const char *hdesk_home(void);
+const unsigned char *hdesk_icon(size_t *len);
 
 enum { MIN_W = 1024, MIN_H = 700, START_W = 1280, START_H = 820 };
 
@@ -339,6 +340,14 @@ static void build_window(void) {
     win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(win), "harness");
     gtk_window_set_default_size(GTK_WINDOW(win), START_W, START_H);
+    size_t icon_len = 0;
+    const unsigned char *icon = hdesk_icon(&icon_len);
+    GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
+    if (icon_len > 0 && gdk_pixbuf_loader_write(loader, icon, icon_len, NULL) && gdk_pixbuf_loader_close(loader, NULL)) {
+        GdkPixbuf *pix = gdk_pixbuf_loader_get_pixbuf(loader);
+        if (pix) gtk_window_set_icon(GTK_WINDOW(win), pix);
+    }
+    g_object_unref(loader);
     g_object_set(gtk_settings_get_default(), "gtk-application-prefer-dark-theme", TRUE, NULL);
     GtkAccelGroup *keys = gtk_accel_group_new();
     gtk_window_add_accel_group(GTK_WINDOW(win), keys);

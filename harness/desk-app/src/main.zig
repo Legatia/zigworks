@@ -314,6 +314,15 @@ export fn hdesk_home() [*:0]const u8 {
     return app.home_z.ptr;
 }
 
+/// Linux: the window's icon, a PNG drawn at build time (macOS has it in
+/// the bundle, Windows in the program's resources).
+const icon_png: []const u8 = if (@import("builtin").os.tag == .linux) @embedFile("icon_png") else "";
+
+export fn hdesk_icon(len: *usize) [*]const u8 {
+    len.* = icon_png.len;
+    return icon_png.ptr;
+}
+
 export fn hdesk_on_ready() void {
     log("ready", .{});
     logFrame();

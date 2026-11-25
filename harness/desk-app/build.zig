@@ -39,8 +39,8 @@ pub fn build(b: *std.Build) void {
 
     switch (target.result.os.tag) {
         .macos => {},
-        .windows => return addWindows(b, target, optimize, strip, version),
-        .linux => return addLinux(b, target, optimize, strip, version),
+        .windows => return addWindows(b, target, optimize, strip, version, icon_exe),
+        .linux => return addLinux(b, target, optimize, strip, version, icon_exe),
         else => return,
     }
 
@@ -91,7 +91,10 @@ pub fn build(b: *std.Build) void {
 /// beside it, and the same under `smoke/` with test hooks. The header and
 /// the loader come from Microsoft's NuGet package Microsoft.Web.WebView2,
 /// unpacked: `-Dwebview2=DIR` (CI pins its version and SHA-256).
-fn addWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, version: []const u8) void {
+fn addWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, version: []const u8, icon_exe: *std.Build.Step.Compile) void {
+    // the program's icon, drawn on the machine that builds
+    const ico_run = b.addRunArtifact(icon_exe);
+    const ico = ico_run.addOutputFileArg("harness.ico");
     const app = b.step("app", "Build zig-out/harness-desk/harness-desk.exe with its loader");
     const smoke = b.step("smoke", "Run the app against the stand-in harness (needs a desktop)");
     const sdk = b.option([]const u8, "webview2", "The unpacked Microsoft.Web.WebView2 package (WebView2.h and the loader)") orelse {
@@ -119,6 +122,7 @@ fn addWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "build", "native", "include" }) });
         mod.addIncludePath(b.path("src/windows"));
         mod.addCSourceFile(.{ .file = b.path("src/windows/desk.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+        mod.addWin32ResourceFile(.{ .file = b.path("src/windows/desk.rc"), .include_paths = &.{ico.dirname()} });
         for ([_][]const u8{ "user32", "gdi32", "shell32", "ole32" }) |lib| mod.linkSystemLibrary(lib, .{});
         const options = b.addOptions();
         options.addOption([]const u8, "version", version);
@@ -147,7 +151,10 @@ fn addWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 /// Linux: `harness-desk/harness-desk`, linked against the system's GTK 3
 /// and WebKitGTK 4.1 (found with pkg-config: libgtk-3-dev and
 /// libwebkit2gtk-4.1-dev), and the same under `smoke/` with test hooks.
-fn addLinux(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, version: []const u8) void {
+fn addLinux(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, version: []const u8, icon_exe: *std.Build.Step.Compile) void {
+    // the window's icon, drawn on the machine that builds, inside the program
+    const png_run = b.addRunArtifact(icon_exe);
+    const icon_png = png_run.addOutputFileArg("harness.png");
     const app = b.step("app", "Build zig-out/harness-desk/harness-desk");
     const smoke = b.step("smoke", "Run the app against the stand-in harness (needs a display, or xvfb-run)");
     inline for (.{ .{ "harness-desk", false, app }, .{ "smoke", true, smoke } }) |v| {
@@ -160,6 +167,7 @@ fn addLinux(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
         });
         // (GTK 3 marks much of itself as deprecated: not this file's to fix)
         mod.addCSourceFile(.{ .file = b.path("src/linux/desk.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror", "-Wno-deprecated-declarations" } });
+        mod.addAnonymousImport("icon_png", .{ .root_source_file = icon_png });
         mod.linkSystemLibrary("gtk+-3.0", .{});
         mod.linkSystemLibrary("webkit2gtk-4.1", .{});
         const options = b.addOptions();

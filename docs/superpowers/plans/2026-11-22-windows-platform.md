@@ -760,3 +760,106 @@ Needed before the apps themselves, each the owner's to approve:
 - Linux, in the `zigworks` distro by apt: libgtk-3-dev and
   libwebkit2gtk-4.1-dev, and xvfb for the smoke: 186 packages, about
   103 MiB, by the lists of 2026-11-19 (an `apt-get update` first).
+
+## 12. The desk's Windows and Linux apps (2026-11-25, branch `win/sandbox-default`)
+
+The owner approved the two downloads ("Push and download"): the NuGet
+package Microsoft.Web.WebView2 1.0.4370.26 (9.4 MiB; its SHA-512 matched
+NuGet's catalog; unpacked to `D:\tools\webview2-dl`), and in the
+`zigworks` distro libgtk-3-dev, libwebkit2gtk-4.1-dev and xvfb (187
+packages, 108 MB; GTK 3.24.41, WebKitGTK 2.52.6).
+
+Both apps are a C file behind the macOS app's `hdesk_*` interface
+(`src/mac/desk.h`), with every decision in the shared Zig, as on macOS:
+
+- `src/windows/desk.c`: a Win32 window and menu, and WebView2 through
+  `WebView2.h`'s C interfaces (COBJMACROS), compiled by Zig's C compiler.
+  `WebView2Loader.dll` is loaded at run time from beside the program.
+- `src/linux/desk.c`: a GTK 3 window and menu, and a WebKitGTK 4.1 web
+  view.
+- `main.zig` exports the data folder (`hdesk_home`) and, on Linux, the
+  window's icon (`hdesk_icon`) to them; `icon.zig` also writes `.ico`
+  and `.png`.
+- `scripts/smoke-other.sh` (both systems), `fetch-webview2.sh`,
+  `package-windows.sh`, `package-linux.sh`; `test/fake_harness.cmd`; the
+  stand-in's page posts through either bridge and can make a frame.
+- CI jobs `desk-app-windows` and `desk-app-linux` (they replace
+  `desk-app-shared`); the release workflow's "Desk app (Windows)" and
+  "Desk app (Linux)" steps.
+
+Rulings (mine; the owner can overrule):
+
+- R50. The Windows layer is C that includes Microsoft's header, not the
+  interfaces written out again in Zig: the header is 2.9 MB of tables
+  that must match byte for byte, and Zig's C compiler takes it as it is
+  (one shim, `EventToken.h`, for a Windows SDK header Zig's set lacks).
+  The header and the loader are not in the repository: `-Dwebview2=DIR`
+  names the unpacked package, which `scripts/fetch-webview2.sh` downloads
+  by a pinned version and SHA-256.
+- R51. Closing the window minimizes it on both systems: a hidden window
+  has no taskbar button to bring it back or to carry the badge. Quit is in
+  the menu (Ctrl+Q).
+- R52. One window a data folder. Windows: a named mutex and the window's
+  class, both from the folder's path; a second start restores the first
+  and ends. Linux: GApplication over the session bus; without a bus a
+  lock file ends the second start without showing the first.
+- R53. Windows: the web view's own folder is `DATA\desk-webview` (the
+  spec's `%LOCALAPPDATA%\harness\desk-webview` for the default data
+  folder), with the window's place in `window-frame` beside it; InPrivate
+  where the runtime has it, else an ordinary profile there (the session
+  cookie has no Expires either way). Media without a click is the
+  browser argument `--autoplay-policy=no-user-gesture-required`, through
+  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`. DevTools, the status bar, zoom
+  and the browser's own keys are off; Ctrl+R, F5 and Ctrl+Q are the
+  menu's.
+- R54. Windows: a frame's message is never the desk's. Frames get their
+  own handlers (messages as "not the main frame", permissions refused and
+  marked handled), and a message at the window's handler counts as the
+  main frame's only when its source is the window's own address. The
+  smoke frames a sandboxed page that posts: it arrives as `other`.
+- R55. Linux: WebKitGTK names no frame for a message. The handler is
+  registered in a script world of the app's, and two scripts injected
+  into the top frame only carry the page's `postMessage` to it through an
+  attribute on the document. A frame has no handler at all (the smoke's
+  framed page can't post).
+- R56. Linux: WebKitGTK names no frame for a navigation either. One the
+  owner made (a user gesture; the app's own loads count) is decided as
+  the main frame's; one a script made is decided as a frame's. The
+  desk's own address is allowed in both. So a link clicked inside a
+  framed app opens the system browser on Linux, where macOS and Windows
+  cancel it. Said in the README.
+- R57. Linux: the microphone is answered by the window's own address (no
+  frame is named); the desk page gives none of its frames the
+  microphone. WebGL is on with the hardware acceleration policy always;
+  autoplay needs WebKit's website policy as well as the old setting.
+- R58. The frame check on Linux reports the frame that was asked for and
+  saved, not what the window system made of it (a window manager, or
+  Wayland, may place a window elsewhere); on Windows it is the real one.
+- R59. The Linux smoke ranks GStreamer's real audio outputs out
+  (`GST_PLUGIN_FEATURE_RANK`): without a working sound device WebKit's
+  audio could wait for good and the page never finish loading (seen once
+  in six runs here). `DESK_SMOKE_SOUND=1` uses the machine's.
+- R60. CI installs Microsoft's WebView2 Runtime on the Windows runner
+  only where its image lacks it, after checking the installer's
+  signature is Microsoft's.
+
+Numbers, here:
+
+- Unit tests: 63 of 63 on Windows 11 and Linux (one new: the `.ico`).
+- Windows smoke: 48 of 48 (WebGL 2, media and speech without a click,
+  the framed page as `other`, a second start).
+- Linux smoke under Xvfb: 47 of 47, five runs in a row after R59 (speech
+  is not checked: WebKitGTK has none).
+- The packaged Windows program (ReleaseSafe, 0.8 MB, with the loader and
+  its licence) starts and shows its window.
+
+Not done or not seen:
+
+- The real desk page and its 3D head in these windows: only the
+  stand-in's page was loaded. The head's frame rate under WSLg is not
+  measured.
+- The missing-runtime message on Windows (this machine has the runtime).
+- A machine with a session bus on Linux (the second start presenting the
+  first), a real window manager, Wayland.
+- The CI jobs and the release steps have not run on GitHub yet.
+- Windows on ARM: the build picks the arm64 loader, untried.
