@@ -8,6 +8,8 @@ const Io = std.Io;
 /// Asks the running harness for a code: drops a code left from an earlier
 /// try (a stale one would only fail), then writes `state/open-request`,
 /// readable only by you, holding this program's pid and nothing reusable.
+/// (Windows: the data folder is under your own profile, whose access list
+/// the file inherits; there is no mode to set.)
 pub fn request(io: Io, home: []const u8) !void {
     var buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const cwd = Io.Dir.cwd();
@@ -15,10 +17,18 @@ pub fn request(io: Io, home: []const u8) !void {
         error.FileNotFound => {},
         else => return e,
     };
-    var f = try cwd.createFile(io, try statePath(&buf, home, "open-request"), .{ .truncate = true, .permissions = .fromMode(0o600) });
+    var f = try cwd.createFile(io, try statePath(&buf, home, "open-request"), if (is_windows) .{ .truncate = true } else .{ .truncate = true, .permissions = .fromMode(0o600) });
     defer f.close(io);
     var line: [32]u8 = undefined;
-    try f.writeStreamingAll(io, try std.fmt.bufPrint(&line, "pid {d}\n", .{std.c.getpid()}));
+    try f.writeStreamingAll(io, try std.fmt.bufPrint(&line, "pid {d}\n", .{pid()}));
+}
+
+const is_windows = @import("builtin").os.tag == .windows;
+
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+
+fn pid() u64 {
+    return if (is_windows) GetCurrentProcessId() else @intCast(std.c.getpid());
 }
 
 /// The code harness wrote, read once: the file is deleted as it's taken.
@@ -95,8 +105,10 @@ test "request_writes_no_secret_and_drops_a_stale_code" {
     const text = try tmp.dir.readFileAlloc(t.io, "state/open-request", a, .limited(1024));
     try t.expect(std.mem.startsWith(u8, text, "pid "));
     try t.expect(std.mem.indexOf(u8, text, "old-code") == null);
-    const st = try tmp.dir.statFile(t.io, "state/open-request", .{});
-    try t.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+    if (!is_windows) {
+        const st = try tmp.dir.statFile(t.io, "state/open-request", .{});
+        try t.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+    }
 
     // a second request over the first is fine
     try request(t.io, home);

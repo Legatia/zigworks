@@ -113,3 +113,30 @@ jobs:
           grep -a -E "not ok|FAIL|failed|error:" "$RUNNER_TEMP/test.log" | grep -v "^::error::" | head -12 | while IFS= read -r line; do
             echo "::error::desk-app: ${line:0:500}"
           done
+
+  # The desk app's shared decisions on Windows and Linux (the window code
+  # for each joins these jobs when it is built): the unit tests alone.
+  desk-app-shared:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: harness/desk-app
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.17.1
+      - run: |
+          set -o pipefail
+          zig build test --summary all 2>&1 | tee "$RUNNER_TEMP/test.log"
+      - run: zig build test -Doptimize=ReleaseSafe
+      - if: failure()
+        run: |
+          grep -a -E "not ok|FAIL|failed|error:" "$RUNNER_TEMP/test.log" | grep -v "^::error::" | head -12 | while IFS= read -r line; do
+            echo "::error::desk-app (${{ matrix.os }}): ${line:0:500}"
+          done
