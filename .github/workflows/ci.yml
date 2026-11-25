@@ -119,14 +119,12 @@ jobs:
             echo "::error::desk-app: ${line:0:500}"
           done
 
-  # The desk app's shared decisions on Windows and Linux (the window code
-  # for each joins these jobs when it is built): the unit tests alone.
-  desk-app-shared:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+  # The desk app for Windows: unit tests, the program with Microsoft's
+  # WebView2 loader beside it (the NuGet package pinned by version and
+  # SHA-256 in scripts/fetch-webview2.sh), packaged, and the smoke in a
+  # window against a stand-in harness.
+  desk-app-windows:
+    runs-on: windows-latest
     defaults:
       run:
         working-directory: harness/desk-app
@@ -140,8 +138,59 @@ jobs:
           set -o pipefail
           zig build test --summary all 2>&1 | tee "$RUNNER_TEMP/test.log"
       - run: zig build test -Doptimize=ReleaseSafe
+      - run: scripts/fetch-webview2.sh "$RUNNER_TEMP/webview2"
+      # (no fit files, as the macOS job: nothing is fetched for them here)
+      - run: DESK_ASSETS=none scripts/package-windows.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-windows.zip" "$RUNNER_TEMP/webview2"
+      # the web view itself is Windows' own, from Microsoft: installed here
+      # when the runner's image lacks it (the smoke says SKIP without it)
+      - name: WebView2 Runtime, where the runner has none
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          if (Test-Path $key) { "already there: $((Get-ItemProperty $key).pv)"; exit 0 }
+          $setup = Join-Path $env:RUNNER_TEMP 'MicrosoftEdgeWebview2Setup.exe'
+          Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $setup
+          $sig = Get-AuthenticodeSignature $setup
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw "the installer isn't signed by Microsoft: $($sig.Status)" }
+          Start-Process -FilePath $setup -ArgumentList '/silent', '/install' -Wait
+      - run: |
+          set -o pipefail
+          zig build smoke -Dwebview2="$RUNNER_TEMP/webview2" 2>&1 | tee -a "$RUNNER_TEMP/test.log"
       - if: failure()
         run: |
           grep -a -E "not ok|FAIL|failed|error:" "$RUNNER_TEMP/test.log" | grep -v "^::error::" | head -12 | while IFS= read -r line; do
-            echo "::error::desk-app (${{ matrix.os }}): ${line:0:500}"
+            echo "::error::desk-app (Windows): ${line:0:500}"
+          done
+
+  # The desk app for Linux: unit tests, the program linked against the
+  # system's GTK 3 and WebKitGTK 4.1, packaged, and the smoke under Xvfb.
+  desk-app-linux:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: harness/desk-app
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.17.1
+      # WebKitGTK starts its web process in a bubblewrap sandbox, which needs
+      # user namespaces (restricted on Ubuntu's runners, as for harness)
+      - run: |
+          sudo apt-get update -q && sudo apt-get install -y --no-install-recommends libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - run: |
+          set -o pipefail
+          zig build test --summary all 2>&1 | tee "$RUNNER_TEMP/test.log"
+      - run: zig build test -Doptimize=ReleaseSafe
+      # (no fit files, as the macOS job: nothing is fetched for them here)
+      - run: DESK_ASSETS=none scripts/package-linux.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-linux-x86_64.tar.gz"
+      - run: |
+          set -o pipefail
+          GDK_BACKEND=x11 zig build smoke 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+      - if: failure()
+        run: |
+          grep -a -E "not ok|FAIL|failed|error:" "$RUNNER_TEMP/test.log" | grep -v "^::error::" | head -12 | while IFS= read -r line; do
+            echo "::error::desk-app (Linux): ${line:0:500}"
           done

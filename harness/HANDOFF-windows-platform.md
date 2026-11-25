@@ -277,6 +277,148 @@ Nothing changes in your apps. For the record:
 - Don't commit or package `facecap.glb`, a Face Cap `base-head.bin`, or
   the butler pack.
 
+## From the Windows session, 2026-11-25, evening: your merges on Windows, and what "Set up" still needs
+
+On `platform/desk-win-linux` (merged with `harness-logins` at e5a743c).
+
+- **Your CI is red on Windows at e5a743c, and it is the smoke script, not
+  harness.** The three fit-file checks pass `/desk/assets/…` as arguments,
+  and Git Bash turns an argument that starts with `/` into
+  `C:/Program Files/Git/desk/assets/…`. You fixed it your way since
+  (2057083, 3f97af9); my branch now has yours and mine is gone. With it
+  all three pass here, the bundle place (`Contents/MacOS` beside
+  `Contents/Resources`) included.
+- **`utc_offset = auto` on Windows: checked.** A fresh folder starts with
+  no zone note, and a new test
+  (`on_windows_the_computers_zone_is_what_its_clocks_say`, zones.zig)
+  holds `localNow` to the local clock less the UTC clock. Here: +01:00.
+  Not checked: a daylight-saving change (I did not move this computer's
+  clock), and the desk's shown times in the app.
+- **354a8cb's Windows failure was one test,**
+  `web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log`,
+  with a sharing violation; the same code passed one commit earlier. Seen
+  once.
+
+**The owner's word since (2026-11-25, late): "go back to your job on the
+app".** We both wrote the shared set-up code that evening. Yours landed on
+`harness-logins` first, so yours is the shared code and mine is gone from
+this branch (kept on a local branch of mine, unpushed). The Windows and
+Linux layers are on yours now: see the section below.
+
+**A spec for the owner, not work for you:**
+`docs/superpowers/specs/2026-11-25-harness-fintech-design.md` (three jobs
+harness could be sold for to fintech companies, and what harness lacks for
+them). Nothing of it is built, and its build order starts only when a
+company agrees to try it.
+
+What I found the "Set up" screen and the one download still need:
+
+- **The shared part isn't in `desk-app/src/` yet** (no change there in
+  your merges). I need to know whether you are writing it, or I write it
+  and you add the Cocoa screen. I would rather not write it twice. What I
+  would put in it: the provider list and each one's usual model, the
+  `config set` lines per provider (one call, as your ruling 7 has it), the
+  order init → config set → key → run → enter, and a command runner that
+  pipes one value to a child's stdin and keeps its stderr line
+  (`commands.zig` has `runWait` without stdin).
+- **The `hdesk_*` interface has nothing for a native form.** It needs: show
+  the form with values, the form's answer, ask for the key (the C layer
+  hands the bytes to Zig for the pipe and wipes its copy), and a fifth menu
+  item.
+- **"The provider's usual model" has no source.** harness has one default
+  (`claude-sonnet`, omnigate's alias) and no table per preset. Someone
+  names the four others, and the list will age.
+- **Linux has no key store.** Secrets there are files in `DATA/secrets`
+  only the user can read, so the field's note "harness keeps it in this
+  computer's key store" is not true on Linux. The Linux screen needs its
+  own sentence, or harness needs libsecret.
+- **The packages can carry `harness` now, and not the fit files:**
+  `scripts/pack-desk-assets.sh` stops without
+  `harness/desk-assets/base-head.bin`, and `platform/desk-base-head` is
+  not on GitHub. With six of seven files the desk says the fit files
+  aren't installed, as it should.
+- **"Otherwise the app's own copy"** needs the app's own folder in the
+  shared code (`commands.zig` takes the binary from `desk.json` only).
+- **The smoke can't type into a native field.** The stand-in harness needs
+  `init`, `config set/get` and `secret add --stdin`, and each C layer a
+  test-only way to fill and press the form.
+
+## From the Windows session, 2026-11-25, night: the Windows and Linux apps on your set-up code
+
+On `platform/desk-win-linux` (merged with `harness-logins` at 8c4130a).
+Plan `2026-11-22-windows-platform.md` section 13, rulings R61 to R68.
+
+Done, against your interface:
+
+- **`hdesk_ask_key` / `hdesk_on_key` / `hdesk_test_key`** in
+  `src/windows/desk.c` (a window of Windows' own over the app's: your
+  title above an edit control with `ES_PASSWORD`, the note, Save and
+  Cancel; Enter, Esc and Tab work) and `src/linux/desk.c` (a `GtkDialog`:
+  an entry with visibility off). Both empty the control, hand Zig the
+  bytes, and zero their copy.
+- **"Provider and key…"** in both menus, and the fifth argument of
+  `hdesk_menu_state`.
+- **The packages carry harness and the fit files,** with your
+  `DESK_ASSETS` meanings (unset strict, a folder, `none`); CI packs with
+  `none`, the release steps strictly.
+- **`scripts/smoke-other.sh` follows your `smoke.sh`** check for check,
+  with `DESK_SMOKE_HARNESS` too. The stand-in is put beside the app as its
+  own harness; on Windows as `harness.exe`, a small program
+  (`test/fake_launcher.zig`, built for the smoke only) that runs the
+  script, since Windows can't start one.
+- Results: unit 102 of 102 on Windows 11 and Linux; smokes 90 of 90 on
+  Windows and 89 of 89 on Linux (Xvfb); with the real harness added, 106
+  and 105. Each fills the real key field through `key fill`
+  (`secure=1`).
+
+What I changed in files that are yours (small; say if you want them
+otherwise):
+
+- **`controller.zig`: `key_note` is by system** (`keyNote(os)`). On Linux
+  harness has no key store (secrets are files in `DATA/secrets`), so
+  there the field says "harness keeps it in its data folder, in a file
+  only you can read."
+- **`test/fake_harness.py`: `running()` on Windows asks the port.**
+  `os.kill(pid, 0)` ends the process on Windows (it is `TerminateProcess`
+  there), which stopped the stand-in at every `config set`.
+- **`build.zig`:** `-DHDESK_TEST_HOOKS=1` for the two C layers' smoke
+  builds, and the launcher.
+
+Your list for Windows:
+
+1. `utc_offset = auto`: read right in winter here (+01:00; the desk's
+   times in the Windows window showed local time), and held to the
+   system's clocks by a test. Summer, and a brief's time, not tried: that
+   needs the computer's zone or clock changed, which I did not do to the
+   owner's machine.
+2. `harness config get chat.utc_offset` prints `auto`: yes.
+3. A zone that can't be read: Windows' call does not fail here; only
+   `windowsOffset`'s test covers it.
+4. Several pairs with a named section in one `config set`, then `config
+   get "provider other.url"`: yes, by the real-harness smoke on Windows.
+
+Since your page fix (3edebbc): `smoke-other.sh` has your six page checks
+too, in its real-harness part, with a `desk_probe` that posts through
+either bridge. They pass in both windows; the windows' smallest inside
+size is 1024x700 on both. CI on 7476686: the three desk app jobs passed;
+mailmcp on Linux failed `idle_pushes_new_mail_to_a_subscriber` once.
+
+Things I saw that are yours to decide:
+
+- **The usual models may be behind.** On 2026-11-25 the providers' own
+  pages listed `claude-sonnet-5-5` and `claude-haiku-5-5` (Anthropic),
+  `gpt-6.2-sol` (OpenAI; its small `gpt-6-luna` calls tools on Chat
+  Completions only with reasoning off), and
+  `anthropic/claude-sonnet-5.5` on OpenRouter. `setup.entries` has
+  `claude-opus-4-8`, `claude-haiku-4-5` and `gpt-5`. I did not check
+  whether those still answer.
+- **opencode's address.** Its documentation now gives
+  `https://opencode.ai/inference/openai/v1` for chat completions; the
+  preset's `https://opencode.ai/zen/v1` is no longer documented and still
+  answers (no call with a key made).
+- **The Windows key window is plain** (no visual styles: the program has
+  no manifest for them). It works; it could look better.
+
 ## For you: the desk is approved, with a 3D head (2026-11-25)
 
 > "Use 3d head. Finish the frontend now"
@@ -528,12 +670,33 @@ What it changes for your code and tests:
 - On Windows Server (GitHub's runner) nothing in a sandbox can open NUL:
   a routine's command in a test must not redirect to nul.
 
-**The desk app.** Its shared code compiles and passes its 62 unit tests
-on Windows and Linux now (`alive.zig` over Winsock, `spawnDetached`
-without a window, `entry.zig` without a mode, `home.zig` under
-`%LOCALAPPDATA%`); CI job `desk-app-shared` runs them. The Windows and
-Linux apps themselves wait for the owner's yes to two downloads (plan
-section 11).
+**The desk app, Windows and Linux: built** (plan sections 11 and 12,
+rulings R50 to R60). `src/windows/desk.c` (WebView2) and
+`src/linux/desk.c` (GTK 3, WebKitGTK 4.1) sit behind your `hdesk_*`
+interface; `main.zig` gained two exports for them (`hdesk_home`,
+`hdesk_icon`) and nothing else changed for macOS. Smokes
+(`scripts/smoke-other.sh`): 48 of 48 on Windows, 47 of 47 on Linux under
+Xvfb. CI jobs `desk-app-windows` and `desk-app-linux`; release steps for
+both.
+
+For you:
+
+- `test/fake_harness.py`: `post()` goes through either bridge, the page
+  has `frame()` (a sandboxed frame that posts `{badge: 77}`), and
+  `FAKE_BINARY` names the program desk.json says harness is. Your smoke
+  doesn't use the new parts; a `cmd "js frame()"` check there would show
+  WKWebView's `isMainFrame` at work.
+- Only the stand-in's page has been in these windows. Once you can, tell
+  me what the real desk and the head need that they don't give.
+- Linux differs in three ways the README states: no speech synthesis, a
+  clicked link in a framed app opens the system browser, and the window's
+  place is the desktop's on Wayland.
+- CI 45612749693 (7e4fa7f, the sandbox default): every job passed but
+  macOS harness, whose Debug pass was whole (1536 pass, smoke all ok: the
+  default holds under sandbox-exec) and whose ReleaseSafe pass failed
+  `an_item_expires_at_approval_seconds_or_its_turns_end` with
+  "approval_seconds = 1 expired after 885 ms". Yours: the limit seems to
+  end on a whole second, so an item asked late in one expires early.
 
 ## For you: the owner answered question 3 (2026-11-24)
 

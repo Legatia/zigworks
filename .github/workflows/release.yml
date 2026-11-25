@@ -17,6 +17,14 @@ name: Release
 # Privacy & Security › Open Anyway on its first run). One download: the
 # bundle carries harness (both kinds of Mac) and the fit files, packed as
 # for the archives; a missing fit file fails the job with one line.
+# And the desk's Windows and Linux apps on their jobs:
+# harness-desk-<version>-windows.zip (harness-desk.exe with Microsoft's
+# WebView2Loader.dll beside it, the NuGet package pinned in
+# harness/desk-app/scripts/fetch-webview2.sh; not signed), and
+# harness-desk-<version>-linux-x86_64.tar.gz (linked against the system's GTK 3
+# and WebKitGTK 4.1). Each of the two is one download as well: harness and
+# desk-assets/ beside the app, the fit files packed strictly (DESK_ASSETS
+# unset).
 # Builds static Linux binaries (x86_64, arm64) and an Apple Silicon macOS binary, and
 # attaches them to a GitHub release for that tag. headsight's Linux binaries
 # capture the camera only (V4L2); the screen, windows and text need macOS.
@@ -109,6 +117,24 @@ jobs:
           zig build test
           # DESK_ASSETS unset: the fit files are packed here, strictly
           scripts/package-macos.sh "$version" "$GITHUB_WORKSPACE/harness/harness-desk-$version-macos.zip"
+      - name: Desk app (Windows)
+        if: env.SKIP != '1' && matrix.name == 'x86_64-windows' && startsWith(github.ref_name, 'harness-v')
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#*-v}"
+          cd harness/desk-app
+          zig build test
+          scripts/fetch-webview2.sh "$RUNNER_TEMP/webview2"
+          scripts/package-windows.sh "$version" "$GITHUB_WORKSPACE/harness/harness-desk-$version-windows.zip" "$RUNNER_TEMP/webview2"
+      - name: Desk app (Linux)
+        if: env.SKIP != '1' && matrix.name == 'x86_64-linux' && startsWith(github.ref_name, 'harness-v')
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#*-v}"
+          sudo apt-get update -q && sudo apt-get install -y --no-install-recommends libgtk-3-dev libwebkit2gtk-4.1-dev
+          cd harness/desk-app
+          zig build test
+          scripts/package-linux.sh "$version" "$GITHUB_WORKSPACE/harness/harness-desk-$version-linux-x86_64.tar.gz"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: env.SKIP != '1'
         with:

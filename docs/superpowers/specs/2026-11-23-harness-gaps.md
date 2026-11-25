@@ -169,6 +169,19 @@ real carcloud (unit tests with harness-fake's Tesla stand-in).
   (`head`, `eyes`, `eyemask`, `face.width`, `warnings`, `closed`), to be
   aligned with the avatar module when it lands.
 
+## Fintech companies (2026-11-25): specced, nothing built
+
+The owner asked what harness could be sold for to fintech companies and
+to spec it: `2026-11-25-harness-fintech-design.md`. Three jobs (card
+disputes, overdue invoices and failed subscription payments, business
+customer onboarding), each prepared by harness and decided by a named
+person. What harness lacks for them, in that file's build order: a run
+against real providers; a payment connector and PDFs; scored runs on past
+cases; more than one person with roles and sign-in, and a page for staff;
+webhooks; PDFs and images read; register and screening connectors;
+messages to customers under a plan approved once. Six questions for the
+owner are at its end; none is answered.
+
 ## Parked: AI avatar livestreams (owner, 2026-11-24: "not top priority")
 
 Use case: a 24-hour AI avatar livestream that sells or chats.

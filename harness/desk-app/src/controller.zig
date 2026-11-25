@@ -98,8 +98,17 @@ pub const Effect = union(enum) {
     mark: bool,
 };
 
-/// The secure field's note.
-pub const key_note = "harness keeps it in this computer's key store.";
+/// The secure field's note: where harness keeps the key. macOS has the
+/// Keychain and Windows the Credential Manager; elsewhere harness has no
+/// key store and keeps a file per secret in the data folder.
+pub const key_note = keyNote(@import("builtin").os.tag);
+
+pub fn keyNote(os: std.Target.Os.Tag) []const u8 {
+    return switch (os) {
+        .macos, .windows => "harness keeps it in this computer's key store.",
+        else => "harness keeps it in its data folder, in a file only you can read.",
+    };
+}
 
 pub const Controller = struct {
     gpa: std.mem.Allocator,
@@ -1212,7 +1221,11 @@ test "continue_asks_the_key_then_runs_init_config_and_stores_it" {
     try t.expect(stepOf(c1) == null);
     const ask = askOf(c1).?;
     try t.expectEqualStrings("Anthropic key", ask.title);
-    try t.expectEqualStrings("harness keeps it in this computer's key store.", ask.note);
+    try t.expectEqualStrings(key_note, ask.note);
+    try t.expectEqualStrings("harness keeps it in this computer's key store.", keyNote(.macos));
+    try t.expectEqualStrings("harness keeps it in this computer's key store.", keyNote(.windows));
+    // Linux has no key store harness uses: it says the file
+    try t.expect(std.mem.indexOf(u8, keyNote(.linux), "key store") == null);
     const c2 = try r.ev(.{ .key = .given });
     try t.expect(r.c.holdsKey());
     const s1 = stepOf(c2).?;
