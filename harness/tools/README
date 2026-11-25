@@ -1,0 +1,21 @@
+Dev tools for the desk's avatar. Not shipped; harness doesn't use them.
+
+  fetch-desk-assets.sh DIR
+      MediaPipe's fit files into DIR/mediapipe/, checked by SHA-256.
+      DIR is what the desk serves as /desk/assets/ (the data folder's
+      desk-assets/).
+
+  devserver.py PORT DATA
+      127.0.0.1 only. The desk's URL layout over this tree and DATA:
+      /desk/static/ (src/desk/), /desk/avatars/ (DATA/avatars/),
+      /desk/assets/ (DATA/desk-assets/), /tools/; POST /save/PATH writes
+      DATA/PATH. Every response carries the desk's CSP; violations are
+      logged to DATA/csp-reports.log.
+
+Run them from harness/:
+
+  sh tools/fetch-desk-assets.sh DATA/desk-assets
+  python3 -I tools/devserver.py 8731 DATA
+
+Keep DATA outside the repository: the base head, Face Cap's model and the
+butler's files aren't cleared for it (README: Avatar packs).
