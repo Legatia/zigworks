@@ -89,7 +89,9 @@ pub fn sniff(bytes: []const u8) Kind {
     return .other;
 }
 
-/// A JPEG's or PNG's width and height, from its header.
+/// A JPEG's or PNG's width and height as shown: a JPEG's Exif orientation
+/// of 5–8 (a quarter turn, as phones write) swaps them, as browsers do, so
+/// they match what the desk's fit saw.
 pub fn imageSize(bytes: []const u8) ?[2]u32 {
     switch (sniff(bytes)) {
         .png => {
@@ -97,6 +99,7 @@ pub fn imageSize(bytes: []const u8) ?[2]u32 {
             return .{ std.mem.readInt(u32, bytes[16..20], .big), std.mem.readInt(u32, bytes[20..24], .big) };
         },
         .jpeg => {
+            var turned = false;
             var i: usize = 2;
             while (i + 4 <= bytes.len) {
                 if (bytes[i] != 0xff) return null;
@@ -112,11 +115,14 @@ pub fn imageSize(bytes: []const u8) ?[2]u32 {
                 if (m == 0xd9 or m == 0xda) return null; // no frame before the scan
                 const len = std.mem.readInt(u16, bytes[i + 2 ..][0..2], .big);
                 const sof = m >= 0xc0 and m <= 0xcf and m != 0xc4 and m != 0xc8 and m != 0xcc;
+                if (m == 0xe1 and len >= 2 and i + 2 + len <= bytes.len) {
+                    if (exifOrientation(bytes[i + 4 .. i + 2 + len])) |o| turned = o >= 5 and o <= 8;
+                }
                 if (sof) {
                     if (i + 9 > bytes.len) return null;
                     const h = std.mem.readInt(u16, bytes[i + 5 ..][0..2], .big);
                     const w = std.mem.readInt(u16, bytes[i + 7 ..][0..2], .big);
-                    return .{ w, h };
+                    return if (turned) .{ h, w } else .{ w, h };
                 }
                 i += 2 + len;
             }
@@ -124,6 +130,23 @@ pub fn imageSize(bytes: []const u8) ?[2]u32 {
         },
         else => return null,
     }
+}
+
+/// The orientation tag (0x0112) of an APP1 segment's Exif block, if any.
+fn exifOrientation(seg: []const u8) ?u16 {
+    if (seg.len < 14 or !std.mem.eql(u8, seg[0..6], "Exif\x00\x00")) return null;
+    const tiff = seg[6..];
+    const endian: std.builtin.Endian = if (std.mem.eql(u8, tiff[0..2], "II")) .little else if (std.mem.eql(u8, tiff[0..2], "MM")) .big else return null;
+    const ifd = std.mem.readInt(u32, tiff[4..8], endian);
+    if (ifd > tiff.len or tiff.len - ifd < 2) return null;
+    const n = std.mem.readInt(u16, tiff[ifd..][0..2], endian);
+    var e: usize = 0;
+    while (e < n) : (e += 1) {
+        const at = ifd + 2 + e * 12;
+        if (at + 12 > tiff.len) return null;
+        if (std.mem.readInt(u16, tiff[at..][0..2], endian) == 0x0112) return std.mem.readInt(u16, tiff[at + 8 ..][0..2], endian);
+    }
+    return null;
 }
 
 const Ini = struct {
@@ -863,4 +886,67 @@ test "the_js_packer_and_this_reader_agree" {
     try t.expectEqual(9, h.vertices);
     try t.expectEqual(52, h.shapes);
     try t.expectEqual([2]u32{ 128, 96 }, h.image);
+}
+
+/// A JPEG with an Exif orientation tag (big- or little-endian), as phones write.
+fn jpegTurned(a: std.mem.Allocator, w: u16, h: u16, orientation: u16, little: bool) ![]u8 {
+    var tiff: std.ArrayList(u8) = .empty;
+    const put16 = struct {
+        fn f(l: *std.ArrayList(u8), al: std.mem.Allocator, v: u16, le: bool) !void {
+            var b: [2]u8 = undefined;
+            std.mem.writeInt(u16, &b, v, if (le) .little else .big);
+            try l.appendSlice(al, &b);
+        }
+    }.f;
+    const put32 = struct {
+        fn f(l: *std.ArrayList(u8), al: std.mem.Allocator, v: u32, le: bool) !void {
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(u32, &b, v, if (le) .little else .big);
+            try l.appendSlice(al, &b);
+        }
+    }.f;
+    try tiff.appendSlice(a, if (little) "II" else "MM");
+    try put16(&tiff, a, 42, little);
+    try put32(&tiff, a, 8, little);
+    try put16(&tiff, a, 2, little); // two entries: something else, then the orientation
+    try put16(&tiff, a, 0x010f, little); // Make, ASCII, 4 bytes inline
+    try put16(&tiff, a, 2, little);
+    try put32(&tiff, a, 4, little);
+    try tiff.appendSlice(a, "Foo\x00");
+    try put16(&tiff, a, 0x0112, little);
+    try put16(&tiff, a, 3, little);
+    try put32(&tiff, a, 1, little);
+    try put16(&tiff, a, orientation, little);
+    try put16(&tiff, a, 0, little);
+    try put32(&tiff, a, 0, little);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, "\xff\xd8\xff\xe1");
+    var len: [2]u8 = undefined;
+    std.mem.writeInt(u16, &len, @intCast(2 + 6 + tiff.items.len), .big);
+    try out.appendSlice(a, &len);
+    try out.appendSlice(a, "Exif\x00\x00");
+    try out.appendSlice(a, tiff.items);
+    const rest = try jpeg(a, w, h, 0xc0, false);
+    try out.appendSlice(a, rest[2..]);
+    return out.items;
+}
+
+test "phone_photos_are_sized_as_shown" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // stored 32 wide and 64 tall, shown turned a quarter (orientation 6 or 8): 64x32
+    try t.expectEqual([2]u32{ 64, 32 }, imageSize(try jpegTurned(a, 32, 64, 6, false)).?);
+    try t.expectEqual([2]u32{ 64, 32 }, imageSize(try jpegTurned(a, 32, 64, 8, true)).?);
+    // upright or upside down (1, 3): as stored
+    try t.expectEqual([2]u32{ 32, 64 }, imageSize(try jpegTurned(a, 32, 64, 1, true)).?);
+    try t.expectEqual([2]u32{ 32, 64 }, imageSize(try jpegTurned(a, 32, 64, 3, false)).?);
+    // a pack whose head was fitted to the photo as shown is good
+    var p: Pack = undefined;
+    try p.init();
+    defer p.deinit();
+    try p.fitted();
+    try p.put("still.jpg", try jpegTurned(p.a(), 32, 64, 6, false));
+    try p.put("closed.jpg", try jpegTurned(p.a(), 32, 64, 6, true));
+    try t.expectEqualStrings("", try problemsText(p.a(), try p.check()));
 }
