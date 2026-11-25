@@ -7071,7 +7071,12 @@ test "web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log" {
     // the owner was asked for the host and for the login, once each
     try t.expectEqual(2, f.asked);
     const req4 = try f.e.request(4);
-    try t.expect(std.mem.indexOf(u8, req4, "welcome agent-bot typed [secret:login-agent-password]") != null);
+    // seen failing twice on the Windows runner (354a8cb, 2562460) with
+    // nothing to say why: what the page showed is printed when it does
+    if (std.mem.indexOf(u8, req4, "welcome agent-bot typed [secret:login-agent-password]") == null) {
+        std.debug.print("request 4 ends: {s}\n", .{req4[req4.len -| 2500..]});
+        return error.TestUnexpectedResult;
+    }
     const lt = try f.logText();
     try t.expect(std.mem.indexOf(u8, lt, "\"event\":\"web fill\",\"login\":\"agent\"") != null);
     try t.expect(std.mem.indexOf(u8, lt, "{login:agent.password}") != null);
