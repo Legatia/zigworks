@@ -23,7 +23,9 @@ enum { MIN_W = 1024, MIN_H = 700, START_W = 1280, START_H = 820 };
 static GApplication *gapp;
 static GtkWidget *win;
 static GtkWidget *menu_bar;
-static GtkWidget *item_start, *item_stop, *item_autostart;
+static GtkWidget *item_start, *item_stop, *item_autostart, *item_provider;
+// the key dialog and its entry, while it is open
+static GtkWidget *key_dialog, *key_entry;
 static WebKitWebView *web;
 static char badge[32];
 static char *agent_name, *agent_version;
@@ -115,6 +117,7 @@ static void build_menu(GtkAccelGroup *keys) {
     item_stop = add_item(app, gtk_menu_item_new_with_mnemonic("S_top harness"), HDESK_MENU_STOP, keys, 0);
     gtk_menu_shell_append(GTK_MENU_SHELL(app), gtk_separator_menu_item_new());
     item_autostart = add_item(app, gtk_check_menu_item_new_with_mnemonic("_Open at login"), HDESK_MENU_AUTOSTART, keys, 0);
+    item_provider = add_item(app, gtk_menu_item_new_with_mnemonic("_Provider and key\xe2\x80\xa6"), HDESK_MENU_PROVIDER, keys, 0);
     gtk_menu_shell_append(GTK_MENU_SHELL(app), gtk_separator_menu_item_new());
     add_item(app, gtk_menu_item_new_with_mnemonic("_Quit harness"), -1, keys, GDK_KEY_q);
     GtkWidget *top = gtk_menu_item_new_with_mnemonic("_harness");
@@ -128,9 +131,97 @@ static void build_menu(GtkAccelGroup *keys) {
     gtk_widget_set_sensitive(item_start, FALSE);
     gtk_widget_set_sensitive(item_stop, FALSE);
     gtk_widget_set_sensitive(item_autostart, FALSE);
+    gtk_widget_set_sensitive(item_provider, FALSE);
 }
 
-void hdesk_menu_state(int start, int stop, int autostart_enabled, int autostart_on) {
+// ---- the key: a dialog of GTK's own over the window ----
+// `title` above an entry that doesn't show what is typed, `note` under it,
+// Save and Cancel. The web view has no part in it. Its answer goes to Zig
+// once (hdesk_on_key), as bytes in a buffer of our own that is zeroed right
+// after, the entry emptied first.
+
+static void wipe(char *p, size_t n) {
+    volatile char *v = p;
+    while (n--) *v++ = 0;
+}
+
+static void on_key_response(GtkDialog *d, gint response, gpointer unused) {
+    (void)d;
+    (void)unused;
+    GtkWidget *dlg = key_dialog, *entry = key_entry;
+    if (!dlg) return;
+    key_dialog = NULL;
+    key_entry = NULL;
+    if (response != GTK_RESPONSE_OK) {
+        gtk_entry_set_text(GTK_ENTRY(entry), "");
+        gtk_widget_destroy(dlg);
+        hdesk_on_key(NULL, -1);
+        return;
+    }
+    const char *typed = gtk_entry_get_text(GTK_ENTRY(entry));
+    size_t n = typed ? strlen(typed) : 0;
+    char *bytes = g_malloc(n + 1);
+    if (n) memcpy(bytes, typed, n);
+    bytes[n] = 0;
+    gtk_entry_set_text(GTK_ENTRY(entry), "");
+    // closed before the answer: what it starts may ask again
+    gtk_widget_destroy(dlg);
+    hdesk_on_key(bytes, (int)n);
+    wipe(bytes, n + 1);
+    g_free(bytes);
+}
+
+void hdesk_ask_key(const char *title, const char *note) {
+    if (key_dialog || !win) return;
+    GtkWidget *dlg = gtk_dialog_new_with_buttons("harness", GTK_WINDOW(win),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, "_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_OK, NULL);
+    gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_OK);
+    gtk_window_set_resizable(GTK_WINDOW(dlg), FALSE);
+    GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    gtk_container_set_border_width(GTK_CONTAINER(box), 16);
+    gtk_box_set_spacing(GTK_BOX(box), 8);
+    GtkWidget *head = gtk_label_new(NULL);
+    char *bold = g_markup_printf_escaped("<b>%s</b>", title ? title : "Key");
+    gtk_label_set_markup(GTK_LABEL(head), bold);
+    g_free(bold);
+    gtk_label_set_xalign(GTK_LABEL(head), 0);
+    gtk_box_pack_start(GTK_BOX(box), head, FALSE, FALSE, 0);
+    GtkWidget *entry = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(entry), FALSE);
+    gtk_entry_set_input_purpose(GTK_ENTRY(entry), GTK_INPUT_PURPOSE_PASSWORD);
+    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
+    gtk_entry_set_max_length(GTK_ENTRY(entry), 2000);
+    gtk_entry_set_width_chars(GTK_ENTRY(entry), 44);
+    gtk_box_pack_start(GTK_BOX(box), entry, FALSE, FALSE, 0);
+    GtkWidget *label = gtk_label_new(note ? note : "");
+    gtk_label_set_xalign(GTK_LABEL(label), 0);
+    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(label), 48);
+    gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+    key_dialog = dlg;
+    key_entry = entry;
+    g_signal_connect(dlg, "response", G_CALLBACK(on_key_response), NULL);
+    gtk_window_present(GTK_WINDOW(win));
+    gtk_widget_show_all(dlg);
+    gtk_widget_grab_focus(entry);
+}
+
+int hdesk_test_key(int action) {
+#ifdef HDESK_TEST_HOOKS
+    // a fake key, built into test builds only, set in the real entry
+    if (!key_dialog) return 0;
+    int secure = gtk_entry_get_visibility(GTK_ENTRY(key_entry)) ? 0 : 1;
+    if (action == 1) gtk_entry_set_text(GTK_ENTRY(key_entry), "sk-test-not-a-key");
+    gtk_dialog_response(GTK_DIALOG(key_dialog), action == 1 ? GTK_RESPONSE_OK : GTK_RESPONSE_CANCEL);
+    return secure;
+#else
+    (void)action;
+    return -1;
+#endif
+}
+
+void hdesk_menu_state(int start, int stop, int autostart_enabled, int autostart_on, int provider) {
+    gtk_widget_set_sensitive(item_provider, provider != 0);
     gtk_widget_set_sensitive(item_start, start != 0);
     gtk_widget_set_sensitive(item_stop, stop != 0);
     gtk_widget_set_sensitive(item_autostart, autostart_enabled != 0);

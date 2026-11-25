@@ -121,7 +121,8 @@ fn addWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         // (as a system header: its warnings are Microsoft's)
         mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "build", "native", "include" }) });
         mod.addIncludePath(b.path("src/windows"));
-        mod.addCSourceFile(.{ .file = b.path("src/windows/desk.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+        // (the smoke's build can fill the key window with its fake key)
+        mod.addCSourceFile(.{ .file = b.path("src/windows/desk.c"), .flags = if (v[1]) &.{ "-Wall", "-Wextra", "-Werror", "-DHDESK_TEST_HOOKS=1" } else &.{ "-Wall", "-Wextra", "-Werror" } });
         mod.addWin32ResourceFile(.{ .file = b.path("src/windows/desk.rc"), .include_paths = &.{ico.dirname()} });
         for ([_][]const u8{ "user32", "gdi32", "shell32", "ole32" }) |lib| mod.linkSystemLibrary(lib, .{});
         const options = b.addOptions();
@@ -134,11 +135,21 @@ fn addWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         const built = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = v[0] } } });
         const dll = b.addInstallFile(loader, v[0] ++ "/WebView2Loader.dll");
         if (v[1]) {
+            // the stand-in harness as a program: the smoke puts it beside
+            // the app as harness.exe, where the release carries harness
+            const launcher_mod = b.createModule(.{
+                .root_source_file = b.path("test/fake_launcher.zig"),
+                .target = target,
+                .optimize = .Debug,
+            });
+            const launcher = b.addInstallArtifact(b.addExecutable(.{ .name = "fake-harness", .root_module = launcher_mod }), .{ .dest_dir = .{ .override = .{ .custom = "smoke-tools" } } });
             const run = b.addSystemCommand(&.{ "sh", "scripts/smoke-other.sh" });
             run.addFileArg(.{ .relative = .{ .base = .install_prefix, .sub_path = "smoke/harness-desk.exe" } });
+            run.addFileArg(.{ .relative = .{ .base = .install_prefix, .sub_path = "smoke-tools/fake-harness.exe" } });
             run.has_side_effects = true;
             run.step.dependOn(&built.step);
             run.step.dependOn(&dll.step);
+            run.step.dependOn(&launcher.step);
             v[2].dependOn(&run.step);
         } else {
             v[2].dependOn(&built.step);
@@ -166,7 +177,8 @@ fn addLinux(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
             .link_libc = true,
         });
         // (GTK 3 marks much of itself as deprecated: not this file's to fix)
-        mod.addCSourceFile(.{ .file = b.path("src/linux/desk.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror", "-Wno-deprecated-declarations" } });
+        // (the smoke's build can fill the key dialog with its fake key)
+        mod.addCSourceFile(.{ .file = b.path("src/linux/desk.c"), .flags = if (v[1]) &.{ "-Wall", "-Wextra", "-Werror", "-Wno-deprecated-declarations", "-DHDESK_TEST_HOOKS=1" } else &.{ "-Wall", "-Wextra", "-Werror", "-Wno-deprecated-declarations" } });
         mod.addAnonymousImport("icon_png", .{ .root_source_file = icon_png });
         mod.linkSystemLibrary("gtk+-3.0", .{});
         mod.linkSystemLibrary("webkit2gtk-4.1", .{});

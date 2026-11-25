@@ -4126,12 +4126,19 @@ does (what it says before harness runs, getting in by a one-time code,
 the menu, what the window may open); what differs:
 
 **Install.** Download `harness-desk-VERSION-windows.zip` from the release
-and unpack it anywhere. Keep `WebView2Loader.dll` beside
-`harness-desk.exe`: it is Microsoft's, passed on under its licence
-(`WebView2Loader-LICENSE.txt`), and finds the web view. The web view
-itself is Microsoft's WebView2 Runtime, which Windows 11 has and most
-Windows 10 machines too; where it is missing the app says so and offers
-Microsoft's page to install it.
+and unpack it anywhere. It is the one download: `harness.exe` is in it,
+beside `harness-desk.exe`, with the avatar's fit files in `desk-assets\`,
+and the app sets harness up and starts it ("Set up", as on macOS). Keep
+the files together. `WebView2Loader.dll` is Microsoft's, passed on under
+its licence (`WebView2Loader-LICENSE.txt`), and finds the web view. The
+web view itself is Microsoft's WebView2 Runtime, which Windows 11 has and
+most Windows 10 machines too; where it is missing the app says so and
+offers Microsoft's page to install it.
+
+**The key.** [Continue] asks for it in a small window of Windows' own,
+over the app's: a password field, Save and Cancel. It is not in the web
+view. From there it goes through a pipe to `harness secret add NAME
+--stdin`, which keeps it in the Credential Manager.
 
 **The first run.** The program is not signed with a certificate, so
 Windows asks first ("Windows protected your PC"): More info › Run anyway.
@@ -4156,7 +4163,12 @@ and SHA-256 in the script, which downloads and checks it):
     zig build test                             # the decisions: no window needed
     zig build app -Dwebview2=../../webview2    # zig-out/harness-desk/
     zig build smoke -Dwebview2=../../webview2  # in a window, against a stand-in harness (Git Bash, python)
-    scripts/package-windows.sh 0.3.0 harness-desk-0.3.0-windows.zip ../../webview2
+    scripts/package-windows.sh 0.3.0 harness-desk-0.3.0-windows.zip ../../webview2   # with harness.exe and the fit files
+
+`DESK_SMOKE_HARNESS=PATH\harness.exe` adds the setup once more against
+that real harness (a data folder and a file store of the smoke's own, a
+provider on a dead local address). `DESK_ASSETS=none` packages without
+the fit files.
 
 ## Desk app (Linux)
 
@@ -4167,8 +4179,16 @@ built there, against its C library), and behaves as the macOS app does;
 what differs:
 
 **Install.** Download `harness-desk-VERSION-linux-x86_64.tar.gz` from the
-release, unpack it, and put `harness-desk` beside `harness` or on your
-PATH, where `harness open` finds it.
+release and unpack it. It is the one download: `harness` is in it, beside
+`harness-desk`, with the avatar's fit files in `desk-assets/`, and the app
+sets harness up and starts it ("Set up", as on macOS). Keep them together,
+or put the folder on your PATH, where `harness open` finds the app.
+
+**The key.** [Continue] asks for it in a dialog of GTK's own, with an
+entry that doesn't show what is typed. It is not in the web view. harness
+has no key store on Linux: `harness secret add` keeps it in `secrets/` in
+the data folder, in a file only you can read, and the dialog says that
+instead of "this computer's key store".
 
 **The window.** The count of what needs you is in the title ("harness
 (2)"); an urgent item sets the window's urgency hint, which most desktops
@@ -4192,7 +4212,9 @@ the desktop's to choose.
     zig build test     # the decisions: no window needed
     zig build app      # zig-out/harness-desk/harness-desk
     zig build smoke    # in a window (under xvfb-run where there is no display), against a stand-in harness
-    scripts/package-linux.sh 0.3.0 harness-desk-0.3.0-linux-x86_64.tar.gz
+    scripts/package-linux.sh 0.3.0 harness-desk-0.3.0-linux-x86_64.tar.gz   # with harness and the fit files
+
+`DESK_SMOKE_HARNESS=PATH/harness` and `DESK_ASSETS=none` as on Windows.
 
 ## Build
 

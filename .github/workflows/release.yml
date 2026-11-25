@@ -22,7 +22,9 @@ name: Release
 # WebView2Loader.dll beside it, the NuGet package pinned in
 # harness/desk-app/scripts/fetch-webview2.sh; not signed), and
 # harness-desk-<version>-linux-x86_64.tar.gz (linked against the system's GTK 3
-# and WebKitGTK 4.1).
+# and WebKitGTK 4.1). Each of the two is one download as well: harness and
+# desk-assets/ beside the app, the fit files packed strictly (DESK_ASSETS
+# unset).
 # Builds static Linux binaries (x86_64, arm64) and an Apple Silicon macOS binary, and
 # attaches them to a GitHub release for that tag. headsight's Linux binaries
 # capture the camera only (V4L2); the screen, windows and text need macOS.

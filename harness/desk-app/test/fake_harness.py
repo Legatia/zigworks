@@ -36,6 +36,7 @@ import http.server
 import json
 import os
 import secrets
+import socket
 import struct
 import sys
 import threading
@@ -257,6 +258,15 @@ def config_port(home):
 
 
 def running(home):
+    if os.name == "nt":
+        # (os.kill(pid, 0) ends the process on Windows: ask its port instead)
+        try:
+            with open(os.path.join(home, "state", "desk.json")) as f:
+                port = json.load(f)["port"]
+            socket.create_connection(("127.0.0.1", port), 0.5).close()
+            return True
+        except (OSError, ValueError, KeyError):
+            return False
     try:
         with open(os.path.join(home, "fake.pid")) as f:
             os.kill(int(f.read().strip()), 0)

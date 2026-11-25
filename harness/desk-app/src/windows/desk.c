@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <objbase.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <shobjidl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,10 +29,15 @@ DEFINE_GUID(HD_CLSID_TaskbarList, 0x56fdf344, 0xfd6d, 0x11d0, 0x95, 0x8a, 0x00, 
 DEFINE_GUID(HD_IID_ITaskbarList3, 0xea1afb91, 0x9e28, 0x4b86, 0x90, 0xe9, 0x9e, 0x9f, 0x8a, 0x5e, 0xef, 0xaf);
 
 enum { WM_HD_CALL = WM_APP + 1, WM_HD_ALERT = WM_APP + 2 };
-enum { ID_START = 1001, ID_STOP, ID_AUTOSTART, ID_RELOAD, ID_QUIT };
+enum { ID_START = 1001, ID_STOP, ID_AUTOSTART, ID_RELOAD, ID_QUIT, ID_PROVIDER };
 enum { MIN_W = 1024, MIN_H = 700, START_W = 1280, START_H = 820 };
 
 static HWND hwnd;
+// the key window, while it is open
+static struct {
+    HWND win, edit;
+    HFONT font, bold;
+} keybox;
 static HMENU menu_bar;
 static ICoreWebView2Environment *env;
 static ICoreWebView2Controller *ctl;
@@ -239,6 +245,7 @@ static void build_menu(void) {
     AppendMenuW(app, MF_STRING | MF_GRAYED, ID_STOP, L"S&top harness");
     AppendMenuW(app, MF_SEPARATOR, 0, NULL);
     AppendMenuW(app, MF_STRING | MF_GRAYED, ID_AUTOSTART, L"&Open at login");
+    AppendMenuW(app, MF_STRING | MF_GRAYED, ID_PROVIDER, L"&Provider and key\x2026");
     AppendMenuW(app, MF_SEPARATOR, 0, NULL);
     AppendMenuW(app, MF_STRING, ID_QUIT, L"&Quit harness\tCtrl+Q");
     AppendMenuW(menu_bar, MF_POPUP, (UINT_PTR)app, L"&harness");
@@ -247,7 +254,8 @@ static void build_menu(void) {
     AppendMenuW(menu_bar, MF_POPUP, (UINT_PTR)view, L"&View");
 }
 
-void hdesk_menu_state(int start, int stop, int autostart_enabled, int autostart_on) {
+void hdesk_menu_state(int start, int stop, int autostart_enabled, int autostart_on, int provider) {
+    EnableMenuItem(menu_bar, ID_PROVIDER, MF_BYCOMMAND | (provider ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(menu_bar, ID_START, MF_BYCOMMAND | (start ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(menu_bar, ID_STOP, MF_BYCOMMAND | (stop ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(menu_bar, ID_AUTOSTART, MF_BYCOMMAND | (autostart_enabled ? MF_ENABLED : MF_GRAYED));
@@ -745,6 +753,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_STOP: hdesk_on_menu(HDESK_MENU_STOP); return 0;
         case ID_AUTOSTART: hdesk_on_menu(HDESK_MENU_AUTOSTART); return 0;
         case ID_RELOAD: hdesk_on_menu(HDESK_MENU_RELOAD); return 0;
+        case ID_PROVIDER: hdesk_on_menu(HDESK_MENU_PROVIDER); return 0;
         case ID_QUIT: hdesk_quit(); return 0;
         }
         break;
@@ -845,7 +854,8 @@ int hdesk_run(const char *ua) {
     _snwprintf(dir, MAX_PATH * 2, L"%ls\\desk-webview", home ? home : L".");
     dir[MAX_PATH * 2 - 1] = 0;
     free(home);
-    CreateDirectoryW(dir, NULL);
+    // (with the folders above it: on a new computer the data folder isn't there yet)
+    SHCreateDirectoryExW(NULL, dir, NULL);
 
     SIZE s = outer(START_W, START_H);
     hwnd = CreateWindowExW(0, cls, L"harness", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, s.cx, s.cy, NULL, menu_bar, inst, NULL);
@@ -863,6 +873,8 @@ int hdesk_run(const char *ua) {
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        // the key window's keys: Enter saves, Esc cancels, Tab moves on
+        if (keybox.win && IsDialogMessageW(keybox.win, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -933,6 +945,160 @@ void hdesk_alert(const char *title, const char *text) {
 
 void hdesk_post_main(void (*fn)(void *), void *arg) {
     PostMessageW(hwnd, WM_HD_CALL, (WPARAM)fn, (LPARAM)arg);
+}
+
+// ---- the key: a small window of Windows' own controls over the app's ----
+// `title` above a password edit control, `note` under it, Save and Cancel.
+// The web view has no part in it. The app's window is disabled while it is
+// open; its answer goes to Zig once (hdesk_on_key), as bytes in a buffer of
+// our own that is zeroed right after, the control emptied first.
+
+static void key_close(void) {
+    HWND w = keybox.win;
+    HFONT f = keybox.font, b = keybox.bold;
+    memset(&keybox, 0, sizeof keybox);
+    // the app's window first, or another program's would come forward
+    EnableWindow(hwnd, TRUE);
+    SetForegroundWindow(hwnd);
+    if (w) DestroyWindow(w);
+    if (f) DeleteObject(f);
+    if (b) DeleteObject(b);
+}
+
+static void key_answer(int save) {
+    if (!keybox.win) return;
+    if (!save) {
+        SetWindowTextW(keybox.edit, L"");
+        key_close();
+        hdesk_on_key(NULL, -1);
+        return;
+    }
+    wchar_t typed[2048];
+    int n = GetWindowTextW(keybox.edit, typed, (int)(sizeof typed / sizeof typed[0]));
+    SetWindowTextW(keybox.edit, L"");
+    // (UTF-8 takes at most three bytes for each of these)
+    char bytes[sizeof typed / sizeof typed[0] * 3];
+    int out = n > 0 ? WideCharToMultiByte(CP_UTF8, 0, typed, n, bytes, (int)sizeof bytes, NULL, NULL) : 0;
+    SecureZeroMemory(typed, sizeof typed);
+    // closed before the answer: what it starts may ask again
+    key_close();
+    hdesk_on_key(bytes, out);
+    SecureZeroMemory(bytes, sizeof bytes);
+}
+
+static LRESULT CALLBACK key_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) {
+            key_answer(1);
+            return 0;
+        }
+        if (LOWORD(wp) == IDCANCEL) {
+            key_answer(0);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        key_answer(0);
+        return 0;
+    }
+    return DefWindowProcW(w, msg, wp, lp);
+}
+
+static void key_not_shown(void *unused) {
+    (void)unused;
+    hdesk_on_key(NULL, -1);
+}
+
+void hdesk_ask_key(const char *title, const char *note) {
+    static int registered;
+    if (keybox.win || !hwnd) return;
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    if (!registered) {
+        WNDCLASSEXW wc;
+        memset(&wc, 0, sizeof wc);
+        wc.cbSize = sizeof wc;
+        wc.lpfnWndProc = key_proc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"harness-desk-key";
+        registered = RegisterClassExW(&wc) != 0;
+    }
+    int d = (int)dpi();
+    int cw = MulDiv(440, d, 96), ch = MulDiv(176, d, 96), pad = MulDiv(16, d, 96);
+    int bw = MulDiv(88, d, 96), bh = MulDiv(28, d, 96), line = MulDiv(20, d, 96);
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    RECT r = { 0, 0, cw, ch };
+    AdjustWindowRectEx(&r, style, FALSE, WS_EX_DLGMODALFRAME);
+    RECT over;
+    GetWindowRect(hwnd, &over);
+    int ww = r.right - r.left, wh = r.bottom - r.top;
+    HWND win = registered ? CreateWindowExW(WS_EX_DLGMODALFRAME, L"harness-desk-key", L"harness", style,
+        over.left + ((over.right - over.left) - ww) / 2, over.top + ((over.bottom - over.top) - wh) / 2, ww, wh, hwnd, NULL, inst, NULL) : NULL;
+    wchar_t *wtitle = wide(title), *wnote = wide(note);
+    HWND head = NULL, edit = NULL, label = NULL, save = NULL, cancel = NULL;
+    if (win) {
+        head = CreateWindowExW(0, L"STATIC", wtitle ? wtitle : L"Key", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+            pad, pad, cw - 2 * pad, line, win, NULL, inst, NULL);
+        edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL,
+            pad, pad + line + MulDiv(6, d, 96), cw - 2 * pad, MulDiv(26, d, 96), win, NULL, inst, NULL);
+        label = CreateWindowExW(0, L"STATIC", wnote ? wnote : L"", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+            pad, pad + line + MulDiv(40, d, 96), cw - 2 * pad, 2 * line, win, NULL, inst, NULL);
+        save = CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            cw - pad - 2 * bw - MulDiv(8, d, 96), ch - pad - bh, bw, bh, win, (HMENU)(INT_PTR)IDOK, inst, NULL);
+        cancel = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            cw - pad - bw, ch - pad - bh, bw, bh, win, (HMENU)(INT_PTR)IDCANCEL, inst, NULL);
+    }
+    free(wtitle);
+    free(wnote);
+    if (!win || !edit) {
+        // no window to answer in: as a cancel, after this turn
+        if (win) DestroyWindow(win);
+        hdesk_post_main(key_not_shown, NULL);
+        return;
+    }
+    HFONT font = NULL, bold = NULL;
+    NONCLIENTMETRICSW ncm;
+    memset(&ncm, 0, sizeof ncm);
+    ncm.cbSize = sizeof ncm;
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0)) {
+        // (the system's size is for its own dots an inch; this window's may differ)
+        HDC dc = GetDC(NULL);
+        int system_dpi = GetDeviceCaps(dc, LOGPIXELSY);
+        ReleaseDC(NULL, dc);
+        if (system_dpi > 0) ncm.lfMessageFont.lfHeight = MulDiv(ncm.lfMessageFont.lfHeight, d, system_dpi);
+        font = CreateFontIndirectW(&ncm.lfMessageFont);
+        ncm.lfMessageFont.lfWeight = FW_SEMIBOLD;
+        bold = CreateFontIndirectW(&ncm.lfMessageFont);
+    }
+    HWND kids[] = { edit, label, save, cancel };
+    for (size_t i = 0; i < sizeof kids / sizeof kids[0]; i++)
+        if (kids[i] && font) SendMessageW(kids[i], WM_SETFONT, (WPARAM)font, TRUE);
+    if (head && bold) SendMessageW(head, WM_SETFONT, (WPARAM)bold, TRUE);
+    SendMessageW(edit, EM_SETLIMITTEXT, 2000, 0);
+
+    keybox.win = win;
+    keybox.edit = edit;
+    keybox.font = font;
+    keybox.bold = bold;
+    EnableWindow(hwnd, FALSE);
+    ShowWindow(win, SW_SHOW);
+    SetFocus(edit);
+}
+
+int hdesk_test_key(int action) {
+#ifdef HDESK_TEST_HOOKS
+    // a fake key, built into test builds only, set in the real control
+    if (!keybox.win) return 0;
+    int secure = (GetWindowLongW(keybox.edit, GWL_STYLE) & ES_PASSWORD) ? 1 : 0;
+    if (action == 1) SetWindowTextW(keybox.edit, L"sk-test-not-a-key");
+    key_answer(action == 1);
+    return secure;
+#else
+    (void)action;
+    return -1;
+#endif
 }
 
 void hdesk_every(double seconds, void (*fn)(void *), void *arg) {

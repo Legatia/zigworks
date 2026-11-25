@@ -867,3 +867,88 @@ Not done or not seen:
   first), a real window manager, Wayland.
 - The CI jobs and the release steps have not run on GitHub yet.
 - Windows on ARM: the build picks the arm64 loader, untried.
+
+## 13. The Windows and Linux apps on the shared "Set up" (2026-11-25, branch `platform/desk-win-linux`)
+
+The owner: "go back to your job on the app". That evening both sessions
+wrote the shared set-up code; the Mac session's (`platform/desk-app-setup`,
+plan `2026-11-25-desk-app-setup.md`) landed on `harness-logins` first. Its
+code is the shared code. Mine was complete and passing (77 unit tests,
+smokes 76 and 75, the real harness by hand on both systems) and is kept on
+a local branch, `platform/desk-setup-own`, unpushed; what follows was then
+built on theirs.
+
+Built:
+
+- `src/windows/desk.c`: `hdesk_ask_key` (a window of Windows' own over the
+  app's, the app's window disabled meanwhile: the title above an edit
+  control with `ES_PASSWORD`, the note, Save and Cancel), `hdesk_test_key`,
+  the menu item "Provider and key…", the data folder made with its
+  parents.
+- `src/linux/desk.c`: the same with a `GtkDialog` and an entry whose text
+  isn't shown.
+- `scripts/package-windows.sh`, `scripts/package-linux.sh`: harness beside
+  the app and `desk-assets/` beside harness, with `DESK_ASSETS` as
+  `package-macos.sh` takes it.
+- `scripts/smoke-other.sh`: `smoke.sh`'s checks, with these systems'
+  differences; `test/fake_launcher.zig` for Windows.
+
+Rulings:
+
+- R61. **The key window is not a modal call.** `hdesk_ask_key` is called
+  inside a turn of the controller and its answer starts another, so it
+  opens the window and returns; the window's own procedure answers later.
+  On Windows the app's loop gives the key window its keys
+  (`IsDialogMessageW`). Cost: none known.
+- R62. **Closed before answered.** The window is destroyed, then
+  `hdesk_on_key` is called, because what the answer starts may ask for the
+  key again. The control is emptied and the copy zeroed in both layers.
+- R63. **The note under the field is by system** (`controller.keyNote`):
+  Linux has no key store harness uses, so it says the file. A change in
+  the Mac session's file; its test follows.
+- R64. **Windows' stand-in is a program.** The app looks for
+  `harness.exe` beside itself and Windows can't start a script, so the
+  smoke's build makes `fake-harness.exe`, which runs the script
+  `FAKE_HARNESS_PY` names. Cost: one more small program in the smoke's
+  build.
+- R65. **The stand-in doesn't use `os.kill(pid, 0)` on Windows:** there it
+  ends the process. It asks the port.
+- R66. **CI packs without the fit files** (`DESK_ASSETS=none`), since the
+  base head isn't in the repository; the release steps pack strictly and
+  fail without it, as harness's own archive does.
+- R67. **The data folder's parents are made on Windows** (a new computer
+  has no `%LOCALAPPDATA%\harness` yet).
+- R68. **The usual models stay as the Mac session named them;** what the
+  providers' pages listed on 2026-11-25 is in the handoff for it.
+
+Verification (2026-11-25):
+
+- Unit tests: 102 of 102 on Windows 11 and on Linux.
+- Smokes against the stand-in: 90 of 90 on Windows 11, 89 of 89 on Linux
+  under Xvfb. In each, the real key window is opened, found to hide its
+  text, filled through the test hook and saved, and the key is found in
+  harness's input and in no log, output, setting or command line.
+- With `DESK_SMOKE_HARNESS` (the real harness of this branch, a file store
+  in place of the Credential Manager on Windows): 106 of 106 on Windows,
+  105 of 105 on Linux. init, config set with a named section, secret add,
+  harness run with no Telegram, the real desk entered, "Provider and
+  key…" reading the settings back, Stop.
+- Seen in screenshots on Windows: the form and the key window as they are
+  now ("Anthropic key" above a field that hides its text, the note, Save
+  and Cancel); and, with my first version, the real desk in the app's
+  window (the empty stage with [Add a portrait], the chat, times in this
+  computer's zone).
+- The packages: the Windows zip and the Linux archive hold harness; the
+  Windows one unpacked and started on a new folder showed "Set up". With
+  `DESK_ASSETS` unset both stop with pack-desk-assets' line about the base
+  head.
+
+Not done or not seen:
+
+- The Credential Manager through the app (a file store stood in).
+- A real provider: no model call was made with the settings written.
+- The fit files in a package, and the 3D head in these windows.
+- The form and the key dialog by eye on Linux (Xvfb has no screen to look
+  at).
+- The release steps (never run).
+- `utc_offset = auto` in a summer zone, and a brief's time.
