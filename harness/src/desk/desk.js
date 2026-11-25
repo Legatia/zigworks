@@ -419,8 +419,17 @@ async function speakMsg(m, conv) {
       await S.avatar.speak({ text: m.say || m.text, browser: true });
     } else {
       const r = await fetch(API + "speech", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: m.id }) });
-      if (r.status === 401) reenter();
-      if (!r.ok) throw new Error(await r.text());
+      if (r.status === 401) {
+        reenter();
+        throw new SignedOut("signed out");
+      }
+      if (!r.ok) {
+        let why = await r.text();
+        try {
+          why = JSON.parse(why).error || why;
+        } catch (_) {}
+        throw new Error(why);
+      }
       const url = URL.createObjectURL(await r.blob());
       try {
         await S.avatar.speak({ text: m.say || m.text, audioUrl: url });
@@ -428,7 +437,10 @@ async function speakMsg(m, conv) {
         URL.revokeObjectURL(url);
       }
     }
-  } catch (_) {
+    if ($("composeNote").textContent.startsWith("Not read aloud: ")) note("composeNote", "");
+  } catch (err) {
+    // said under the chat, in the provider's words as harness put them
+    if (!(err instanceof SignedOut)) note("composeNote", "Not read aloud: " + ((err && err.message) || "the voice didn't play."), true);
   } finally {
     S.speaking = false;
     $("caption").textContent = "";
@@ -638,7 +650,7 @@ function renderSettings() {
   const sel = $("speakSel");
   sel.textContent = "";
   for (const v of S.settings.speak_choices || ["off"]) {
-    const o = el("option", null, v === "off" ? "Off" : v === "browser" ? "The system's voice" : "Through " + v);
+    const o = el("option", null, v === "off" ? "Off" : v === "browser" ? "Browser" : v);
     o.value = v;
     o.selected = v === S.settings.speak;
     sel.append(o);
@@ -647,13 +659,29 @@ function renderSettings() {
   gateUploads();
 }
 
-/** A provider reads replies aloud: where they go is said inline. */
+/**
+ * A provider reads replies aloud: where they go (or the key it lacks), its
+ * model and voice with the kind's defaults greyed in, and, for Gemini's
+ * format, its free tier's data use, all inline.
+ */
 function speakWhere() {
   const v = $("speakSel").value || S.settings.speak;
+  const sp = (S.settings.speakers || []).find((x) => x.name === v);
   const p = $("speakWhere");
-  const provider = v && v !== "off" && v !== "browser";
-  p.hidden = !provider;
-  p.textContent = provider ? "Replies are sent to " + v + " to be read aloud." : "";
+  p.hidden = !sp;
+  p.textContent = !sp ? "" : sp.key ? "Replies are sent to " + v + " to be read aloud." : "No " + v + " key is stored (harness secret add " + sp.secret + ").";
+  $("speakTune").hidden = !sp;
+  if (sp) {
+    // what's written is the chosen provider's; another shows its defaults
+    const mine = v === S.settings.speak;
+    for (const [id, key, def] of [["speakModel", "speak_model", sp.model], ["speakVoice", "speak_voice", sp.voice]]) {
+      const input = $(id);
+      input.placeholder = def;
+      // never under the owner's typing
+      if (document.activeElement !== input) input.value = mine ? S.settings[key] || "" : "";
+    }
+  }
+  $("speakFree").hidden = !(sp && sp.api === "gemini");
 }
 
 async function setSetting(change, outcomeId) {
@@ -671,6 +699,10 @@ $("speakSel").addEventListener("change", () => {
   speakWhere();
   setSetting({ speak: $("speakSel").value }, "speakOutcome");
 });
+
+for (const [id, key] of [["speakModel", "speak_model"], ["speakVoice", "speak_voice"]]) {
+  $(id).addEventListener("change", () => setSetting({ [key]: $(id).value.trim() }, "speakOutcome"));
+}
 
 function targetName() {
   const typed = $("upName").value.trim();

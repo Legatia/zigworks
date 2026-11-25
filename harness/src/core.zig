@@ -15250,7 +15250,9 @@ pub const Core = struct {
             try util.jsonString(out, a, def.model);
             try out.appendSlice(a, ",\"voice\":");
             try util.jsonString(out, a, def.voice);
-            try out.print(a, ",\"key\":{s}}}", .{if (key) "true" else "false"});
+            try out.print(a, ",\"key\":{s},\"secret\":", .{if (key) "true" else "false"});
+            try util.jsonString(out, a, if (c.providers.find(name)) |p| p.key_name else name);
+            try out.append(a, '}');
         }
         try out.print(a, "],\"echo\":{s},\"voice\":{s}}}", .{ if (d.echo) "true" else "false", if (c.cfg.voice.provider.len > 0) "true" else "false" });
     }
@@ -36733,7 +36735,7 @@ test "desk_settings_list_every_speaker_with_its_defaults" {
     try f.init("[provider kokoro]\napi = openai\nurl = http://127.0.0.1:9/v1\nauth = none\n", "", "");
     defer f.deinit();
     const st = deskCall(&f, .GET, "state", "", "").body;
-    try expectHas(st, "\"speakers\":[{\"name\":\"openai\",\"api\":\"openai\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"key\":false},{\"name\":\"gemini\",\"api\":\"gemini\",\"model\":\"gemini-3.8-flash-lite-tts\",\"voice\":\"Schedar\",\"key\":false},{\"name\":\"kokoro\",\"api\":\"openai\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"key\":true}]");
+    try expectHas(st, "\"speakers\":[{\"name\":\"openai\",\"api\":\"openai\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"key\":false,\"secret\":\"openai\"},{\"name\":\"gemini\",\"api\":\"gemini\",\"model\":\"gemini-3.8-flash-lite-tts\",\"voice\":\"Schedar\",\"key\":false,\"secret\":\"gemini\"},{\"name\":\"kokoro\",\"api\":\"openai\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"key\":true,\"secret\":\"kokoro\"}]");
     try expectHas(st, "\"speak_model\":\"\",\"speak_voice\":\"\"");
     try expectHas(st, "\"openai\",\"gemini\",\"kokoro\"]");
 }

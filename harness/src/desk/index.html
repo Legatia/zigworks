@@ -175,11 +175,20 @@
               <li>New replies in the conversation you have open are read aloud once. A long one reads its first two sentences.</li>
               <li>Urgent alerts are always read while the desk is open and not muted; in quiet hours, only they are.</li>
               <li>A provider's voice is fetched by harness, so its key stays in harness.</li>
+              <li>Model and Voice belong to the chosen provider. Left empty, its default (in grey) is used. Choosing a provider of another kind clears them.</li>
+              <li>Providers and their keys are added in config.ini and with harness secret add (README: Speech).</li>
             </ul>
           </span>
         </span>
       </div>
+      <div class="row tune" id="speakTune" hidden>
+        <label for="speakModel">Model</label>
+        <input type="text" id="speakModel" maxlength="100" autocomplete="off" spellcheck="false">
+        <label for="speakVoice">Voice</label>
+        <input type="text" id="speakVoice" maxlength="100" autocomplete="off" spellcheck="false">
+      </div>
       <p class="fine" id="speakWhere" hidden></p>
+      <p class="disclose" id="speakFree" hidden>On Gemini's free tier, Google may use the spoken text to improve its products. A key on a paid plan keeps it out.</p>
       <p class="outcome" id="speakOutcome" role="status" hidden></p>
     </fieldset>
   </div>

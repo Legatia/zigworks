@@ -1332,6 +1332,8 @@ test "provider_presets_resolve_and_old_settings_still_reach_omnigate" {
         .{ .name = "openrouter", .api = .openai, .url = "https://openrouter.ai/api/v1", .auth = .bearer, .cache = true, .key = "openrouter" },
         .{ .name = "opencode", .api = .openai, .url = "https://opencode.ai/zen/v1", .auth = .bearer, .cache = false, .key = "opencode" },
         .{ .name = "openai", .api = .openai, .url = "https://api.openai.com/v1", .auth = .bearer, .cache = false, .key = "openai" },
+        // the desk's voice (speech only)
+        .{ .name = "gemini", .api = .gemini, .url = "https://generativelanguage.googleapis.com/v1beta", .auth = .x_goog_api_key, .cache = false, .key = "gemini" },
     };
     try t.expectEqual(want.len, set.list.len);
     for (want, set.list) |w, p| {

@@ -1721,6 +1721,18 @@ test "the_desk_page_keeps_to_its_own_facts_and_says_where_speech_goes" {
     // a provider's voice: the replies go to it, said inline
     try expectHas(js, "\"Replies are sent to \"");
     try expectHas(deskFile("index.html").?, "id=\"speakWhere\"");
+    // a provider's model and voice, labelled; Gemini's free tier said
+    // inline, never inside an "i" bubble
+    const html = deskFile("index.html").?;
+    try expectHas(html, "<label for=\"speakModel\">Model</label>");
+    try expectHas(html, "<label for=\"speakVoice\">Voice</label>");
+    const free = std.mem.indexOf(u8, html, "id=\"speakFree\"").?;
+    try expectHas(html[free..], "On Gemini's free tier, Google may use the spoken text to improve its products. A key on a paid plan keeps it out.");
+    const line_at = std.mem.indexOf(u8, html, "On Gemini's free tier").?;
+    const bubble_open = std.mem.lastIndexOf(u8, html[0..line_at], "class=\"bubble\"");
+    const bubble_close = std.mem.lastIndexOf(u8, html[0..line_at], "</span>");
+    try t.expect(bubble_open == null or (bubble_close != null and bubble_close.? > bubble_open.?));
+    try expectHas(js, "\"Not read aloud: \"");
     // targets of 44 px, the "i" too
     try expectHas(deskFile("desk.css").?, ".info > button { width: 44px; height: 44px;");
     // the apps, from the side panel
