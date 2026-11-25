@@ -480,15 +480,21 @@ Face Cap's license isn't verified, so:
   repository and out of releases until it's cleared (gaps list);
 - the test suite uses a small made-up head instead.
 
-**What it checks first:**
+**What it checks first, refusing with the reason:**
 
-- one face;
-- facing the camera, within 8°;
-- eyes open and mouth closed, by the landmarker's own blink and jaw
-  scores.
+| Check | Message |
+|---|---|
+| no face found | "No face found. Use a clear photo of one face." |
+| more than one face | "There's more than one face. Use a photo of one person." |
+| turned more than 8° | "The face is turned. Use a photo facing the camera." |
+| mouth open | "The mouth is open. Use a photo with the mouth closed." |
+| eyes closed | "The eyes are closed. Use a photo with the eyes open; add an eyes-closed version after." |
+| face under 250 px wide | "The face is too small. Use a larger photo." |
 
-When a check fails, it says so, for example: "Use a photo facing the
-camera with the mouth closed."
+It also warns without refusing:
+
+- a face under 500 px wide: "This will look soft. A larger photo looks sharper.";
+- a photo taller than wide: "A photo wider than tall fills the window; this one leaves bands at the sides."
 
 **For the eyes-closed version:** it must line up with the still. The
 landmarks outside the eyes may move by at most 12 px; the butler's pair
@@ -522,17 +528,42 @@ The Avatar settings in the desk:
 - **Choose** the built-in butler or one of your own. The choice is written
   to `[desk] avatar` through harness's write-then-reload path, as
   `/persona` does.
-- **Upload a photo,** JPEG or PNG, up to 10 MB. The upload requires one
-  ticked line:
+- **Upload a photo,** JPEG or PNG, up to 10 MB.
+  - **Shown inline beside the button,** because they decide whether the
+    upload works:
+    - Facing the camera, eyes open, mouth closed.
+    - One face, head and shoulders, wider than tall.
+    - Works best without glasses.
+    - JPEG or PNG, up to 10 MB.
+  - **Behind a small "i":**
+    - The photo is fitted onto a 3D head and becomes the whole scene: its
+      background, hair, shoulders and lighting.
+    - These are refused, with the reason: a face turned more than about
+      8°, an open mouth or teeth showing, closed eyes, more than one face,
+      a face too small to find.
+    - These fit but may look off: glasses (the eyes move behind frames
+      drawn on the skin), hair over the eyes, cartoon or anime styles
+      (which may not be found at all).
+    - Every avatar gets the same teeth and mouth, and turns its head a few
+      degrees at most.
+  - **The upload requires one ticked line,** inline:
 
-  > This is me, someone who agreed, or a made-up character.
+    > This is me, someone who agreed, or a made-up character.
 
   The photo stays on this computer, in `avatars/NAME/`.
 - **Fitting runs at once,** taking a few seconds, and the head goes live.
   While it runs, the still breathes.
-- **"Add an eyes-closed version"** takes a second photo. The guide says
-  how to make one: ask an image tool to close the eyes and change nothing
-  else. It's one image edit, not a video.
+- **"Add an eyes-closed version"** takes a second photo.
+  - Inline: "Recommended: the avatar rests with its eyes closed."
+  - Behind an "i":
+    - Make one with an image tool: ask it to close the eyes and change
+      nothing else. It's one image edit, not a video.
+    - It must line up with the first photo, and the desk checks this.
+    - Without it, closed eyes are drawn in the skin's tone.
+- **After a fit,** the settings show what the fit found:
+  - the face's size;
+  - any warning;
+  - whether an eyes-closed version is in use.
 
 ### The avatar module
 
