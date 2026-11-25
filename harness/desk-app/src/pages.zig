@@ -63,6 +63,11 @@ fn setupPage(a: std.mem.Allocator, out: *std.ArrayList(u8), note: []const u8, ho
         "<div class=\"bubble\" id=\"bubble-address\" hidden>Where the provider answers: the part before <code>/messages</code> or " ++
         "<code>/chat/completions</code>, like <code>https://gateway.example.com/v1</code>. For omnigate, its own address. " ++
         "A server of your own that takes no key: leave the key empty.</div>\n");
+    // a risk to see before Continue: shown on the page, not behind the "i"
+    try out.print(a, "<p class=\"warn\" id=\"warn-address\"{s}>" ++
+        "http:// is not encrypted: what goes to this address, the key included, can be read on the network.</p>\n", .{
+        if (e.address and setup.plainRemote(f.url)) "" else " hidden",
+    });
     try out.print(a, "<div class=\"row\" id=\"api-row\"{s}>", .{if (f.provider == .other) "" else " hidden"});
     try out.print(a, "<label for=\"api\">Format</label><select id=\"api\"><option value=\"openai\"{s}>OpenAI Chat Completions</option>" ++
         "<option value=\"anthropic\"{s}>Anthropic Messages</option></select></div>\n", .{
@@ -102,10 +107,25 @@ const setup_script =
     \\  if (w) w.postMessage(m);
     \\  else if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage(m);
     \\}
+    \\// setup.plainRemote's rule: http:// and not this computer
+    \\function plainRemote(u) {
+    \\  u = u.trim();
+    \\  if (u.indexOf("http://") !== 0) return false;
+    \\  var h = u.slice(7).split(/[\/?#]/)[0];
+    \\  h = h.slice(h.lastIndexOf("@") + 1);
+    \\  if (h.charAt(0) === "[") { var j = h.indexOf("]"); h = j < 0 ? h : h.slice(0, j + 1); }
+    \\  else h = h.split(":")[0];
+    \\  if (h === "") return false;
+    \\  var l = h.toLowerCase();
+    \\  if (l === "localhost" || /\.localhost$/.test(l) || h === "[::1]") return false;
+    \\  return !/^127\.\d+\.\d+\.\d+$/.test(h);
+    \\}
     \\(function () {
     \\  var $ = function (id) { return document.getElementById(id); };
     \\  var provider = $("provider"), model = $("model"), url = $("url"), api = $("api");
     \\  var typed = false;
+    \\  function warn() { $("warn-address").hidden = !(addressed[provider.value] && plainRemote(url.value)); }
+    \\  url.addEventListener("input", warn);
     \\  model.addEventListener("input", function () { typed = true; });
     \\  provider.addEventListener("change", function () {
     \\    var p = provider.value;
@@ -114,6 +134,7 @@ const setup_script =
     \\    $("address-row").hidden = !addressed[p];
     \\    $("api-row").hidden = p !== "other";
     \\    if (!addressed[p]) { $("bubble-address").hidden = true; $("i-address").setAttribute("aria-expanded", "false"); }
+    \\    warn();
     \\  });
     \\  $("i-address").addEventListener("click", function () {
     \\    var b = $("bubble-address");
@@ -169,7 +190,8 @@ const head =
     \\button:disabled { color: #9A9CB8; background: #24263A; cursor: default; }
     \\form { width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 12px; text-align: left; }
     \\.row { display: grid; grid-template-columns: 88px 1fr auto; align-items: center; gap: 10px; }
-    \\.row[hidden], .bubble[hidden] { display: none; }
+    \\.row[hidden], .bubble[hidden], .warn[hidden] { display: none; }
+    \\.warn { margin: 0 0 0 98px; font-size: 13px; color: #FFB454; }
     \\.row.check { grid-template-columns: 88px auto 1fr; }
     \\.row.check input { grid-column: 2; }
     \\label { color: #9A9CB8; }
@@ -239,6 +261,25 @@ test "screens_say_the_fixed_copy" {
 
 fn has(page: []const u8, text: []const u8) bool {
     return std.mem.indexOf(u8, page, text) != null;
+}
+
+test "a_plain_address_elsewhere_is_said_on_the_page" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const line = "http:// is not encrypted: what goes to this address, the key included, can be read on the network.";
+    const far = try html(a, .setup, "", "/h", .{ .form = .{ .provider = .other, .model = "m", .url = "http://192.168.1.20:8080/v1" } });
+    try t.expect(has(far, "<p class=\"warn\" id=\"warn-address\">" ++ line ++ "</p>"));
+    // not for this computer, not for https, and not while the Address row is hidden
+    const here = try html(a, .setup, "", "/h", .{ .form = .{ .provider = .other, .model = "m", .url = "http://127.0.0.1:9/v1" } });
+    try t.expect(has(here, "<p class=\"warn\" id=\"warn-address\" hidden>" ++ line ++ "</p>"));
+    const tls = try html(a, .setup, "", "/h", .{ .form = .{ .provider = .omnigate, .model = "m", .url = "https://gate.example.com" } });
+    try t.expect(has(tls, "<p class=\"warn\" id=\"warn-address\" hidden>"));
+    const none = try html(a, .setup, "", "/h", .{ .form = .{ .provider = .anthropic, .model = "m", .url = "http://192.168.1.20:8080/v1" } });
+    try t.expect(has(none, "<p class=\"warn\" id=\"warn-address\" hidden>"));
+    // the page keeps it right as the address is typed
+    try t.expect(has(far, "function plainRemote(u)"));
+    try t.expect(has(far, "url.addEventListener(\"input\", warn)"));
 }
 
 test "setup_page_has_the_fields_and_labels" {

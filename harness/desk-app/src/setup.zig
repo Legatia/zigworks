@@ -130,6 +130,34 @@ pub fn problem(f: Form) ?[]const u8 {
     return null;
 }
 
+/// An address that starts http:// and isn't this computer: what goes to it,
+/// the key included, crosses the network unencrypted. The "Set up" page
+/// says so under the Address field (its script holds the same rule).
+pub fn plainRemote(url: []const u8) bool {
+    const u = trim(url);
+    if (!std.mem.startsWith(u8, u, "http://")) return false;
+    var h = u["http://".len..];
+    if (std.mem.indexOfAny(u8, h, "/?#")) |i| h = h[0..i];
+    if (std.mem.lastIndexOfScalar(u8, h, '@')) |i| h = h[i + 1 ..];
+    if (h.len > 0 and h[0] == '[') {
+        h = h[0 .. (std.mem.indexOfScalar(u8, h, ']') orelse h.len - 1) + 1];
+    } else if (std.mem.indexOfScalar(u8, h, ':')) |i| h = h[0..i];
+    if (h.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(h, "localhost") or std.ascii.endsWithIgnoreCase(h, ".localhost") or std.mem.eql(u8, h, "[::1]")) return false;
+    // 127.0.0.0/8
+    var parts = std.mem.splitScalar(u8, h, '.');
+    var n: usize = 0;
+    var loop = true;
+    while (parts.next()) |part| : (n += 1) {
+        if (n == 0 and !std.mem.eql(u8, part, "127")) loop = false;
+        if (part.len == 0) loop = false;
+        for (part) |c| if (!std.ascii.isDigit(c)) {
+            loop = false;
+        };
+    }
+    return !(loop and n == 4);
+}
+
 fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
 }
@@ -440,4 +468,30 @@ test "a_key_loses_the_spaces_around_it" {
     try t.expectEqualStrings("sk-abc", trimKey(" sk-abc \r\n"));
     try t.expectEqualStrings("sk a", trimKey("\tsk a\n"));
     try t.expectEqualStrings("", trimKey(" \n"));
+}
+
+test "a_plain_address_that_is_not_this_computer_is_told_apart" {
+    for ([_][]const u8{
+        "http://gateway.example.com/v1",
+        "http://192.168.1.20:8080/v1",
+        " http://10.0.0.2 ",
+        "http://localhost.example.com/v1",
+        "http://127.0.0.1.example.com",
+        "http://127.0.0.1@gateway.example.com/v1",
+        "http://[2001:db8::1]:8080/v1",
+        "http://1270.0.0.1/v1",
+    }) |u| try t.expect(plainRemote(u));
+    for ([_][]const u8{
+        "https://gateway.example.com/v1",
+        "http://localhost:8080/v1",
+        "http://LOCALHOST/v1",
+        "http://app.localhost/v1",
+        "http://127.0.0.1:9/v1",
+        "http://127.8.9.10",
+        "http://[::1]:8080/v1",
+        "http://me@127.0.0.1:9/v1",
+        "http://",
+        "",
+        "gateway.example.com",
+    }) |u| try t.expect(!plainRemote(u));
 }

@@ -28,6 +28,10 @@ all three systems by `desk-app-shared`.
   system. It posts `{"setup": {provider, model, url, api, replace}}` and
   `{"cancel": true}` through the bridge (its script already tries
   `window.chrome.webview.postMessage`). It never asks for the key.
+  Under Address it shows one line while the address starts `http://` and
+  isn't this computer (`setup.plainRemote`; the page's script holds the
+  same rule): "http:// is not encrypted: what goes to this address, the
+  key included, can be read on the network." Nothing for you to draw.
 - `bridge.zig`: parses those two messages (only from the built-in page;
   a `key` field anywhere is dropped). It now copies the form's strings
   into the allocator you pass: give it an arena per message.

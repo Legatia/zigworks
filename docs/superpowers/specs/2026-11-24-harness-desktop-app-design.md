@@ -790,7 +790,10 @@ This section closes them. It is my call throughout, not the owner's (see
   - Provider: Anthropic, OpenAI, OpenRouter, opencode, omnigate, or
     Other (an address that speaks OpenAI's or Anthropic's format);
   - Model, filled in with the provider's usual one;
-  - Address, for omnigate and Other only;
+  - Address, for omnigate and Other only. While it starts `http://`
+    and isn't this computer (localhost, 127.x.x.x, ::1), one line under
+    it says the key would cross the network unencrypted. It is on the
+    page, not behind the "i": a risk to see before [Continue];
   - [Continue].
 - **What [Continue] does,** in order:
   1. runs `harness init`;
