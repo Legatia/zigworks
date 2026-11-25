@@ -80,6 +80,63 @@ Nothing changes in your apps. For the record:
 - Don't commit or package `facecap.glb`, a Face Cap `base-head.bin`, or
   the butler pack.
 
+## From the Windows session, 2026-11-25, evening: your merges on Windows, and what "Set up" still needs
+
+On `platform/desk-win-linux` (merged with `harness-logins` at e5a743c).
+
+- **Your CI is red on Windows at e5a743c, and it is the smoke script, not
+  harness.** The three fit-file checks pass `/desk/assets/…` as arguments,
+  and Git Bash turns an argument that starts with `/` into
+  `C:/Program Files/Git/desk/assets/…`. Fixed on my branch: the two
+  `--desk-get` lines run with `MSYS2_ARG_CONV_EXCL="/desk"` (the folder
+  argument still needs the rewriting, so not `MSYS_NO_PATHCONV`).
+  With that, all three pass here, the bundle place (`Contents/MacOS` beside
+  `Contents/Resources`) included. Take the two lines if you want green
+  before my branch is merged.
+- **`utc_offset = auto` on Windows: checked.** A fresh folder starts with
+  no zone note, and a new test
+  (`on_windows_the_computers_zone_is_what_its_clocks_say`, zones.zig)
+  holds `localNow` to the local clock less the UTC clock. Here: +01:00.
+  Not checked: a daylight-saving change (I did not move this computer's
+  clock), and the desk's shown times in the app.
+- **354a8cb's Windows failure was one test,**
+  `web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log`,
+  with a sharing violation; the same code passed one commit earlier. Seen
+  once.
+
+What I found the "Set up" screen and the one download still need, before I
+start (the owner asked me to list it first):
+
+- **The shared part isn't in `desk-app/src/` yet** (no change there in
+  your merges). I need to know whether you are writing it, or I write it
+  and you add the Cocoa screen. I would rather not write it twice. What I
+  would put in it: the provider list and each one's usual model, the
+  `config set` lines per provider (one call, as your ruling 7 has it), the
+  order init → config set → key → run → enter, and a command runner that
+  pipes one value to a child's stdin and keeps its stderr line
+  (`commands.zig` has `runWait` without stdin).
+- **The `hdesk_*` interface has nothing for a native form.** It needs: show
+  the form with values, the form's answer, ask for the key (the C layer
+  hands the bytes to Zig for the pipe and wipes its copy), and a fifth menu
+  item.
+- **"The provider's usual model" has no source.** harness has one default
+  (`claude-sonnet`, omnigate's alias) and no table per preset. Someone
+  names the four others, and the list will age.
+- **Linux has no key store.** Secrets there are files in `DATA/secrets`
+  only the user can read, so the field's note "harness keeps it in this
+  computer's key store" is not true on Linux. The Linux screen needs its
+  own sentence, or harness needs libsecret.
+- **The packages can carry `harness` now, and not the fit files:**
+  `scripts/pack-desk-assets.sh` stops without
+  `harness/desk-assets/base-head.bin`, and `platform/desk-base-head` is
+  not on GitHub. With six of seven files the desk says the fit files
+  aren't installed, as it should.
+- **"Otherwise the app's own copy"** needs the app's own folder in the
+  shared code (`commands.zig` takes the binary from `desk.json` only).
+- **The smoke can't type into a native field.** The stand-in harness needs
+  `init`, `config set/get` and `secret add --stdin`, and each C layer a
+  test-only way to fill and press the form.
+
 ## For you: the desk is approved, with a 3D head (2026-11-25)
 
 > "Use 3d head. Finish the frontend now"
