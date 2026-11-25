@@ -129,6 +129,11 @@ fn dispatch(ev: Event) void {
         return;
     };
     for (app.effects.items) |fx| perform(fx, a);
+    // a key typed is held only while the steps it waits for run
+    if (app.pending_key) |k| if (!app.ctl.holdsKey()) {
+        dropKey(k);
+        app.pending_key = null;
+    };
     if (app.last_state != app.ctl.state) {
         app.last_state = app.ctl.state;
         log("state {t}", .{app.ctl.state});
@@ -170,7 +175,7 @@ fn perform(fx: Effect, a: std.mem.Allocator) void {
         },
         .menu => |m| {
             log("menu start={d} stop={d} autostart={s} provider={d}", .{
-                @intFromBool(m.start),                                                                              @intFromBool(m.stop),
+                @intFromBool(m.start),                                                                       @intFromBool(m.stop),
                 if (!m.autostart_enabled) "-" else if (m.autostart) |on| (if (on) "on" else "off") else "?", @intFromBool(m.provider),
             });
             sys.hdesk_menu_state(@intFromBool(m.start), @intFromBool(m.stop), @intFromBool(m.autostart_enabled), if (m.autostart) |on| @intFromBool(on) else -1, @intFromBool(m.provider));
@@ -198,7 +203,22 @@ fn perform(fx: Effect, a: std.mem.Allocator) void {
             log("ask key {s}", .{k.title});
             sys.hdesk_ask_key(z(a, k.title), z(a, k.note));
         },
+        .mark => |on| {
+            log("mark {s}", .{if (on) "on" else "off"});
+            setMark(a, on);
+        },
     }
+}
+
+/// `state/setup-unfinished`: the first setup ran harness init and isn't
+/// done; while it is there the app shows "Set up" again.
+const mark_file = "setup-unfinished";
+
+fn setMark(a: std.mem.Allocator, on: bool) void {
+    const p = std.fs.path.join(a, &.{ app.home, "state", mark_file }) catch return;
+    if (on) {
+        Io.Dir.cwd().writeFile(app.io, .{ .sub_path = p, .data = "harness-desk: the first setup isn't finished\n" }) catch |e| log("mark not written: {t}", .{e});
+    } else Io.Dir.cwd().deleteFile(app.io, p) catch {};
 }
 
 /// Zeroes and frees the key, wherever it is held.
@@ -244,7 +264,11 @@ const CheckJob = struct {
         const a = j.arena.allocator();
         // never set up here: no config.ini
         const config = std.fs.path.join(a, &.{ app.home, "config.ini" }) catch "";
-        if (Io.Dir.cwd().access(app.io, config, .{})) |_| {
+        const mark = std.fs.path.join(a, &.{ app.home, "state", mark_file }) catch "";
+        const unfinished = if (Io.Dir.cwd().access(app.io, mark, .{})) |_| true else |_| false;
+        if (unfinished) {
+            j.result = .no_config;
+        } else if (Io.Dir.cwd().access(app.io, config, .{})) |_| {
             j.result = if (deskjson.read(app.io, a, app.home)) |found| r: {
                 var d = found orelse break :r .no_desk;
                 // a harness that isn't there any more: the app's own runs instead
@@ -357,7 +381,7 @@ const StepJob = struct {
             j.text = if (r.ok) "" else r.why(a) catch "";
             j.out = r.out;
         } else |e| {
-            j.text = std.fmt.allocPrint(a, "{s} couldn't be run ({t}).", .{ j.argv[0], e }) catch "";
+            j.text = commands.notRun(a, j.argv[0], e) catch "";
         }
         post(StepJob, j);
     }
@@ -405,7 +429,7 @@ const ReadJob = struct {
         const env: ?*const std.process.Environ.Map = if (j.env) |*e| e else null;
         const argv = try setup.readArgv(a, j.binary, j.home, key);
         const r = commands.runWait(app.io, a, argv, env) catch |e| {
-            j.text = try std.fmt.allocPrint(a, "{s} couldn't be run ({t}).", .{ j.binary, e });
+            j.text = try commands.notRun(a, j.binary, e);
             return error.Reported;
         };
         if (!r.ok) {
@@ -425,7 +449,7 @@ const ReadJob = struct {
 
     fn read(j: *ReadJob) !void {
         const provider = try j.get("model.provider");
-        var values: [6][]const u8 = undefined;
+        var values: [7][]const u8 = undefined;
         for (try setup.readKeys(j.arena.allocator(), provider), 0..) |key, i| values[i] = try j.get(key);
         j.in_use = setup.inUse(provider, values);
         j.ok = true;
@@ -556,20 +580,18 @@ export fn hdesk_on_key(buf: ?[*]const u8, len: c_int) void {
         log("key cancelled", .{});
         return dispatch(.{ .key = .cancelled });
     }
-    if (len == 0) {
+    const typed = setup.trimKey(buf.?[0..@intCast(len)]);
+    if (typed.len == 0) {
         log("key empty", .{});
         return dispatch(.{ .key = .empty });
     }
-    const key = app.gpa.alloc(u8, @intCast(len)) catch return dispatch(.{ .key = .cancelled });
-    @memcpy(key, buf.?[0..@intCast(len)]);
+    const key = app.gpa.alloc(u8, typed.len) catch return dispatch(.{ .key = .cancelled });
+    @memcpy(key, typed);
     app.pending_key = key;
     log("key given", .{});
+    // held while the controller's steps wait for it (dispatch lets it go
+    // otherwise), then handed to `harness secret add` with `store_key`
     dispatch(.{ .key = .given });
-    // nothing took it (the form had moved on): it goes now
-    if (app.pending_key) |k| {
-        dropKey(k);
-        app.pending_key = null;
-    }
 }
 
 export fn hdesk_on_menu(item: c_int) void {

@@ -168,34 +168,58 @@ probe note "document.getElementById('note').textContent"
 expect_probe "Address must start with http:" "an address without http(s):// is refused on the screen"
 if grep -q "^step " "$T/log"; then not_ok "nothing runs for a form with a problem"; else ok "nothing runs for a form with a problem"; fi
 
-# a step that fails: its own line, and what was typed stays
-cmd "js $(js_provider anthropic) $(js_set model refuse-me) $js_continue"
-expect_log "step $OWN init --home $H" "Continue runs harness init (the app's own copy)"
-expect_log "step $OWN config set model.provider anthropic model.model refuse-me model.memory_model claude-haiku-4-5 model.worker_model claude-haiku-4-5 --home $H" "then harness config set, every pair in one call"
-wait_page 4
-probe refused "[document.getElementById('note').textContent, document.getElementById('model').value, document.getElementById('provider').value].join('|')"
-expect_probe "model.model refuse-me is refused by the stand-in|refuse-me|anthropic" "the refused step's own line is shown, and what was typed stays"
-
-# Continue again: no second init; the key in the app's own secure field
-cmd "js $(js_set model claude-opus-4-8) $js_continue"
-expect_again "step $OWN config set model.provider anthropic model.model claude-opus-4-8" 1 "Continue again runs config set"
-if [ "$(count "$T/log" "init --home")" = 1 ]; then ok "harness init isn't run again"; else not_ok "harness init isn't run again"; fi
-expect_log "ask key Anthropic key" "the key is asked for in the app's own sheet"
+# the key first, in the app's own sheet; a cancel changes nothing
+cmd "js $(js_provider anthropic) $js_continue"
+expect_log "ask key Anthropic key" "Continue asks for the key in the app's own sheet, before anything runs"
 cmd "key cancel"
 expect_log "key-sheet cancel secure=1" "the sheet's field is an NSSecureTextField"
 expect_log "key cancelled" "Cancel answers"
-wait_page 6
+wait_page 4
 probe cancelled "document.getElementById('note').textContent"
-expect_probe "The key wasn't stored." "a cancelled key says so"
-if [ -e "$H/fake-store/anthropic" ]; then not_ok "nothing is stored on Cancel"; else ok "nothing is stored on Cancel"; fi
-cmd "js $js_continue"
+expect_probe "Cancelled. Nothing was changed." "a cancelled key says nothing was changed"
+if grep -q "^step " "$T/log" || [ -e "$H/config.ini" ]; then not_ok "nothing ran and nothing was written"; else ok "nothing ran and nothing was written"; fi
+
+# a step that fails: its own line, and what was typed stays
+cmd "js $(js_set model refuse-me) $js_continue"
 expect_again "ask key Anthropic key" 2 "Continue asks for the key again"
 cmd "key fill"
 expect_log "key given" "the key is given"
+expect_log "step $OWN init --home $H" "then harness init runs (the app's own copy)"
+expect_log "step $OWN config set model.provider anthropic model.model refuse-me model.memory_model claude-haiku-4-5 model.worker_model claude-haiku-4-5 --home $H" "then harness config set, every pair in one call"
+wait_page 6
+probe refused "[document.getElementById('note').textContent, document.getElementById('model').value, document.getElementById('provider').value].join('|')"
+expect_probe "model.model refuse-me is refused by the stand-in|refuse-me|anthropic" "the refused step's own line is shown, and what was typed stays"
+if grep -q "^store " "$T/log"; then not_ok "a key isn't stored after a failed step"; else ok "a key isn't stored after a failed step"; fi
+if [ -e "$H/state/setup-unfinished" ]; then ok "an unfinished first setup is marked"; else not_ok "an unfinished first setup is marked"; fi
+
+# harness refusing the key: its own line; the next start shows Set up again
+: > "$H/fake-refuse-secret"
+cmd "js $(js_set model claude-opus-4-8) $js_continue"
+expect_again "ask key Anthropic key" 3 "the key is asked for again"
+cmd "key fill"
+expect_log "step $OWN config set model.provider anthropic model.model claude-opus-4-8" "Continue again runs config set"
+if [ "$(count "$T/log" "init --home")" = 1 ]; then ok "harness init isn't run again"; else not_ok "harness init isn't run again"; fi
+expect_log "store $OWN secret add anthropic --stdin --home $H" "the key goes to harness secret add anthropic --stdin"
+wait_page 8
+probe short "document.getElementById('note').textContent"
+expect_probe "nothing stored" "harness's own line for a refused key"
+cmd "quit"
+i=0
+while kill -0 "$APP_PID" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+rm -f "$H/fake-refuse-secret"
+launch
+expect_log "show setup" "config.ini is there but the setup isn't finished: Set up again" 30
+wait_page 1
+cmd "js $js_continue"
+expect_log "ask key Anthropic key" "the key is asked for"
+cmd "key fill"
+expect_log "key-sheet fill secure=1" "the test build types its fake key into the secure field"
 expect_log "store $OWN secret add anthropic --stdin --home $H" "it goes to harness secret add anthropic --stdin"
 expect_fake "secret add anthropic (17 bytes)" "harness gets it on its input"
 if [ "$(cat "$H/fake-store/anthropic" 2>/dev/null)" = "$FAKE_KEY" ]; then ok "the stored key is the one typed"; else not_ok "the stored key is the one typed"; fi
 grep -qF '"model.provider": "anthropic"' "$H/fake-settings.json" && grep -qF '"model.model": "claude-opus-4-8"' "$H/fake-settings.json" && ok "config.ini has the provider and model" || not_ok "config.ini has the provider and model"
+expect_log "mark off" "the setup is finished"
+if [ -e "$H/state/setup-unfinished" ]; then not_ok "the mark is gone"; else ok "the mark is gone"; fi
 
 # ---- then harness is started and entered ----
 expect_log "run $OWN run --home $H" "then harness run is started"
@@ -280,6 +304,9 @@ expect_log "read ok=1" "Provider and key… reads the values in use"
 wait_page $((setups + 1))
 probe inuse "[document.querySelector('h1').textContent, document.getElementById('provider').value, document.getElementById('model').value, !!document.getElementById('replace'), document.getElementById('replace').checked].join('|')"
 expect_probe "Provider and key|anthropic|claude-opus-4-8|true|false" "it opens with the values in use, the key not asked for unless chosen"
+cmd "js $(js_provider openai)"
+probe switch "document.getElementById('model').value"
+expect_probe '"gpt-5"' "another provider brings its own model"
 cmd "js document.getElementById('cancel').click()"
 if wait_count "$H/fake.log" "enter ok" $((enters + 1)) 15; then ok "Cancel goes back to the desk"; else not_ok "Cancel goes back to the desk"; fi
 asks=$(count "$T/log" "ask key")
@@ -293,7 +320,7 @@ if [ "$(count "$T/log" "ask key")" = "$asks" ]; then ok "the key isn't asked for
 cmd "menu provider"
 wait_page $((setups + 4))
 cmd "js document.getElementById('replace').checked = true; $js_continue"
-expect_again "ask key Anthropic key" 3 "Replace the key asks for it"
+expect_again "ask key Anthropic key" 2 "Replace the key asks for it"
 cmd "key fill"
 expect_again "store $OWN secret add anthropic --stdin --home $H" 2 "and stores it again"
 if wait_count "$H/fake.log" "enter ok" $((enters + 3)) 15; then ok "then the desk again"; else not_ok "then the desk again"; fi
@@ -361,10 +388,10 @@ if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     expect_log "show setup" "real harness: the Set up screen" 30
     wait_page 1
     cmd "js $(js_provider other) $(js_set model smoke-model) $(js_set url http://127.0.0.1:9/v1) $js_continue"
-    expect_log "step $OWN init --home $REAL_HOME" "real harness: init"
-    expect_log "step $OWN config set provider other.api openai provider other.url http://127.0.0.1:9/v1 model.provider other model.model smoke-model" "real harness: config set"
     expect_log "ask key Key" "real harness: the key is asked for"
     cmd "key fill"
+    expect_log "step $OWN init --home $REAL_HOME" "real harness: init"
+    expect_log "step $OWN config set provider other.api openai provider other.url http://127.0.0.1:9/v1 model.provider other model.model smoke-model" "real harness: config set"
     expect_log "store $OWN secret add other --stdin --home $REAL_HOME" "real harness: secret add other --stdin"
     expect_again "stepped ok=1" 3 "real harness: init, config set and the key all succeed"
     expect_log "run $OWN run --home $REAL_HOME" "real harness: harness run is started" 15

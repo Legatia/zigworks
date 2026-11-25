@@ -21,7 +21,8 @@ all three systems by `desk-app-shared`.
   `Form`, `problem(form)` (the line under the form), the command line of
   each step (`initArgv`, `configArgv`, `secretArgv`, `readArgv`), the
   settings "Provider and key…" reads (`readKeys`, `inUse`), `keyName`, and
-  `beside(exe_dir, windows)`: where the bundled harness sits.
+  `beside(exe_dir, windows)`: where the bundled harness sits;
+  `keyOptional` (Other may take no key: `auth = none`) and `trimKey`.
 - `pages.zig`: `html(a, screen, note, home, view)`. The Set up screen is a
   built-in page like "harness isn't running": the same HTML on every
   system. It posts `{"setup": {provider, model, url, api, replace}}` and
@@ -39,18 +40,26 @@ all three systems by `desk-app-shared`.
     Start runs your own copy.
   - New events: `stepped`, `read`, `key` (`given`, `empty`, `cancelled`),
     `stored`, and `menu = .provider` ("Provider and key…").
+  - The order: [Continue] asks for the key first (`ask_key`), and nothing
+    runs until it is given, so a cancel changes nothing. Then `init`
+    (unless config.ini is there), `config set`, and `store_key`. Hold the
+    key from `key = .given` while `holdsKey()` is true; drop and zero it
+    as soon as it isn't (main.zig checks after every event).
   - New effects: `step` (run argv to its end; answer `stepped` with its
     error line and the first line it printed), `read_config` (run `config
     get` for `model.provider`, then `readKeys`; answer `read`), `ask_key`
     (show the secure field), `store_key` (pipe the key you hold to argv;
-    answer `stored`).
+    answer `stored`), and `mark` (write or remove
+    `state/setup-unfinished`; while it is there your check answers
+    `no_config`, so a first setup that stopped half way is offered again).
   - `show` carries `view` for the setup page; `Menu.provider` enables the
     menu item.
 - `commands.zig`: `runWithStdin(io, a, argv, env, input)` writes `input`,
   closes the pipe, and collects the output. It keeps no copy.
 
-`main.zig` (the macOS entry) has portable `StepJob` and `ReadJob` you can
-lift as they are: nothing in them is AppKit.
+`main.zig` (the macOS entry) has `StepJob` and `ReadJob`: no AppKit in
+them, but they call its `post` (onto the main thread), `dispatch`, `log`
+and the `app` global, which your entry supplies in its own way.
 
 **What your native side supplies:**
 
@@ -63,10 +72,11 @@ lift as they are: nothing in them is AppKit.
   1. Copy the bytes out of the control into a buffer of your own, and
      empty the control (`SetWindowTextW(…, L"")`, `gtk_entry_set_text(…,
      "")`).
-  2. Hand Zig the bytes and their length, or -1 on Cancel and 0 when
-     empty (macOS: `hdesk_on_key`). Zig copies them, pipes them to
-     `harness secret add NAME --stdin`, and zeroes its copy when the
-     command ends.
+  2. Hand Zig the bytes and their length, or -1 on Cancel (macOS:
+     `hdesk_on_key`). Zig trims spaces and line ends around them, copies
+     them, pipes them to `harness secret add NAME --stdin` once `init` and
+     `config set` have run, and zeroes its copy when that command ends (or
+     at once when a step fails).
   3. Zero yours (`SecureZeroMemory`, `explicit_bzero`).
 
   Never log it, and never put it in an argv or an environment variable.
@@ -99,6 +109,8 @@ as the builder's):
 - A change while harness runs shows `harness config set`'s own line ("send
   /reload to use it.") in an alert, and goes back to the desk. It doesn't
   restart harness. Not running: the app starts it.
+- The key is asked for before any command runs; for Other it may be left
+  empty (`auth = none`).
 
 **Please check on Windows** (only Windows can):
 

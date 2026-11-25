@@ -72,7 +72,25 @@ pub const InUse = struct {
     api: []const u8 = "",
     section_url: []const u8 = "",
     section_key: []const u8 = "",
+    /// `provider NAME.auth` of the provider in use ("": its format's own).
+    auth: []const u8 = "",
 };
+
+/// What [Continue] does about the key: nothing (`keep`), one was typed
+/// (`given`), or none, for a server that takes none (Other only).
+pub const KeyChoice = enum { keep, given, none };
+
+/// Whether the key may be left empty: an address of one's own may take
+/// none (a local server), so its section gets `auth = none`.
+pub fn keyOptional(p: Provider) bool {
+    return p == .other;
+}
+
+/// The key as typed, without the spaces or line ends around it (a pasted
+/// key often brings one).
+pub fn trimKey(key: []const u8) []const u8 {
+    return std.mem.trim(u8, key, " \t\r\n");
+}
 
 /// The form for the values in use. A provider that is no preset is a
 /// section of one's own: Other, with its format and address.
@@ -106,7 +124,8 @@ pub fn problem(f: Form) ?[]const u8 {
     if (entry(f.provider).address) {
         const u = trim(f.url);
         if (u.len == 0) return "Address is empty.";
-        if (!std.ascii.startsWithIgnoreCase(u, "http://") and !std.ascii.startsWithIgnoreCase(u, "https://")) return "Address must start with http:// or https://.";
+        // as harness reads it (model.validUrl): lower case
+        if (!std.mem.startsWith(u8, u, "http://") and !std.mem.startsWith(u8, u, "https://")) return "Address must start with http:// or https://.";
     }
     return null;
 }
@@ -125,7 +144,9 @@ pub fn initArgv(a: std.mem.Allocator, binary: []const u8, home: []const u8) ![]c
 /// `worker_model` follow at the first setup and when the provider changes
 /// (the old ones were the old provider's); otherwise they stay as the
 /// owner left them. `before`: the values in use ("Provider and key…").
-pub fn configArgv(a: std.mem.Allocator, binary: []const u8, home: []const u8, f: Form, before: ?InUse) ![]const []const u8 {
+/// For Other, `key` sets how the key is sent: `none` writes `auth = none`;
+/// a key `given` where `none` was in use writes the format's own way back.
+pub fn configArgv(a: std.mem.Allocator, binary: []const u8, home: []const u8, f: Form, before: ?InUse, key: KeyChoice) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     try out.appendSlice(a, &.{ binary, "config", "set" });
     const name = nameOf(f, before);
@@ -135,6 +156,13 @@ pub fn configArgv(a: std.mem.Allocator, binary: []const u8, home: []const u8, f:
             try std.fmt.allocPrint(a, "provider {s}.api", .{name}), @tagName(f.api),
             try std.fmt.allocPrint(a, "provider {s}.url", .{name}), trim(f.url),
         });
+        const was_none = if (before) |u| std.mem.eql(u8, u.provider, name) and std.mem.eql(u8, u.auth, "none") else false;
+        const auth: ?[]const u8 = switch (key) {
+            .none => "none",
+            .given => if (was_none) (if (f.api == .anthropic) "x-api-key" else "bearer") else null,
+            .keep => null,
+        };
+        if (auth) |v| try out.appendSlice(a, &.{ try std.fmt.allocPrint(a, "provider {s}.auth", .{name}), v });
     }
     try out.appendSlice(a, &.{ "model.provider", name, "model.model", model });
     if (f.provider == .omnigate) try out.appendSlice(a, &.{ "model.url", trim(f.url) });
@@ -173,7 +201,7 @@ pub fn readArgv(a: std.mem.Allocator, binary: []const u8, home: []const u8, key:
 
 /// What "Provider and key…" reads with `harness config get`, after
 /// `model.provider` said `provider`: in `inUse`'s order.
-pub fn readKeys(a: std.mem.Allocator, provider: []const u8) ![6][]const u8 {
+pub fn readKeys(a: std.mem.Allocator, provider: []const u8) ![7][]const u8 {
     return .{
         "model.model",
         "model.url",
@@ -181,11 +209,12 @@ pub fn readKeys(a: std.mem.Allocator, provider: []const u8) ![6][]const u8 {
         try std.fmt.allocPrint(a, "provider {s}.api", .{provider}),
         try std.fmt.allocPrint(a, "provider {s}.url", .{provider}),
         try std.fmt.allocPrint(a, "provider {s}.key", .{provider}),
+        try std.fmt.allocPrint(a, "provider {s}.auth", .{provider}),
     };
 }
 
 /// The values in use from `readKeys`' answers.
-pub fn inUse(provider: []const u8, values: [6][]const u8) InUse {
+pub fn inUse(provider: []const u8, values: [7][]const u8) InUse {
     return .{
         .provider = provider,
         .model = values[0],
@@ -194,6 +223,7 @@ pub fn inUse(provider: []const u8, values: [6][]const u8) InUse {
         .api = values[3],
         .section_url = values[4],
         .section_key = values[5],
+        .auth = values[6],
     };
 }
 
@@ -254,26 +284,26 @@ test "config_argv_per_provider" {
         "/b/harness",       "config",          "set",                "model.provider",   "anthropic",
         "model.model",      "claude-opus-4-8", "model.memory_model", "claude-haiku-4-5", "model.worker_model",
         "claude-haiku-4-5", "--home",          "/h",
-    }, try configArgv(a, "/b/harness", "/h", .{ .provider = .anthropic, .model = "claude-opus-4-8" }, null));
+    }, try configArgv(a, "/b/harness", "/h", .{ .provider = .anthropic, .model = "claude-opus-4-8" }, null, .keep));
     try expectArgv(&.{
         "/b/harness",  "config", "set",                "model.provider", "openai",
         "model.model", "gpt-5",  "model.memory_model", "gpt-5",          "model.worker_model",
         "gpt-5",       "--home", "/h",
-    }, try configArgv(a, "/b/harness", "/h", .{ .provider = .openai, .model = "gpt-5" }, null));
+    }, try configArgv(a, "/b/harness", "/h", .{ .provider = .openai, .model = "gpt-5" }, null, .keep));
     try expectArgv(&.{
         "/b/harness",   "config",             "set",          "model.provider",         "omnigate",
         "model.model",  "claude-sonnet",      "model.url",    "https://og.example.com", "model.memory_model",
         "claude-haiku", "model.worker_model", "claude-haiku", "--home",                 "/h",
-    }, try configArgv(a, "/b/harness", "/h", .{ .provider = .omnigate, .model = "claude-sonnet", .url = "https://og.example.com" }, null));
+    }, try configArgv(a, "/b/harness", "/h", .{ .provider = .omnigate, .model = "claude-sonnet", .url = "https://og.example.com" }, null, .keep));
     // an address of one's own: its section's format and address, in the same call
     try expectArgv(&.{
         "/b/harness",         "config",                   "set",            "provider other.api", "anthropic",
         "provider other.url", "http://127.0.0.1:8080/v1", "model.provider", "other",              "model.model",
         "m1",                 "model.memory_model",       "m1",             "model.worker_model", "m1",
         "--home",             "/h",
-    }, try configArgv(a, "/b/harness", "/h", .{ .provider = .other, .model = "m1", .url = "http://127.0.0.1:8080/v1", .api = .anthropic }, null));
+    }, try configArgv(a, "/b/harness", "/h", .{ .provider = .other, .model = "m1", .url = "http://127.0.0.1:8080/v1", .api = .anthropic }, null, .keep));
     // values are trimmed
-    const trimmed = try configArgv(a, "/b/harness", "/h", .{ .provider = .openai, .model = "  gpt-5 \t" }, null);
+    const trimmed = try configArgv(a, "/b/harness", "/h", .{ .provider = .openai, .model = "  gpt-5 \t" }, null, .keep);
     try t.expectEqualStrings("gpt-5", trimmed[6]);
 }
 
@@ -283,14 +313,14 @@ test "helpers_follow_only_on_first_setup_or_a_new_provider" {
     const a = arena.allocator();
     const before: InUse = .{ .provider = "openai", .model = "gpt-5" };
     // the same provider, another model: the helpers the owner may have tuned stay
-    try expectArgv(&.{ "/b/harness", "config", "set", "model.provider", "openai", "model.model", "gpt-5-mini", "--home", "/h" }, try configArgv(a, "/b/harness", "/h", .{ .provider = .openai, .model = "gpt-5-mini" }, before));
+    try expectArgv(&.{ "/b/harness", "config", "set", "model.provider", "openai", "model.model", "gpt-5-mini", "--home", "/h" }, try configArgv(a, "/b/harness", "/h", .{ .provider = .openai, .model = "gpt-5-mini" }, before, .keep));
     // another provider: they follow, since the old ones were the old provider's
-    const moved = try configArgv(a, "/b/harness", "/h", .{ .provider = .anthropic, .model = "claude-opus-4-8" }, before);
+    const moved = try configArgv(a, "/b/harness", "/h", .{ .provider = .anthropic, .model = "claude-opus-4-8" }, before, .keep);
     try t.expectEqualStrings("model.memory_model", moved[7]);
     try t.expectEqualStrings("claude-haiku-4-5", moved[8]);
     // a section of one's own named as before: the same provider
     const own: InUse = .{ .provider = "local", .model = "llama3.1:8b", .api = "openai", .section_url = "http://127.0.0.1:11434/v1" };
-    const same = try configArgv(a, "/b/harness", "/h", .{ .provider = .other, .model = "qwen", .url = "http://127.0.0.1:11434/v1" }, own);
+    const same = try configArgv(a, "/b/harness", "/h", .{ .provider = .other, .model = "qwen", .url = "http://127.0.0.1:11434/v1" }, own, .keep);
     try expectArgv(&.{ "/b/harness", "config", "set", "provider local.api", "openai", "provider local.url", "http://127.0.0.1:11434/v1", "model.provider", "local", "model.model", "qwen", "--home", "/h" }, same);
 }
 
@@ -343,7 +373,7 @@ test "values_are_single_argv_words" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const got = try configArgv(a, "/b/harness", "/h", .{ .provider = .other, .model = "a b \"c\" ; d", .url = "https://x.example/v1?a=1&b=2" }, null);
+    const got = try configArgv(a, "/b/harness", "/h", .{ .provider = .other, .model = "a b \"c\" ; d", .url = "https://x.example/v1?a=1&b=2" }, null, .keep);
     var seen_model = false;
     for (got) |w| if (std.mem.eql(u8, w, "a b \"c\" ; d")) {
         seen_model = true;
@@ -358,8 +388,9 @@ test "provider_and_key_reads_these_settings" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const keys = try readKeys(arena.allocator(), "local");
-    try expectArgv(&.{ "model.model", "model.url", "model.key", "provider local.api", "provider local.url", "provider local.key" }, &keys);
-    const u = inUse("local", .{ "llama3.1:8b", "", "omnigate", "openai", "http://127.0.0.1:11434/v1", "" });
+    try expectArgv(&.{ "model.model", "model.url", "model.key", "provider local.api", "provider local.url", "provider local.key", "provider local.auth" }, &keys);
+    const u = inUse("local", .{ "llama3.1:8b", "", "omnigate", "openai", "http://127.0.0.1:11434/v1", "", "none" });
+    try t.expectEqualStrings("none", u.auth);
     try t.expectEqualStrings("local", u.provider);
     try t.expectEqualStrings("llama3.1:8b", u.model);
     try t.expectEqualStrings("omnigate", u.model_key);
@@ -375,4 +406,38 @@ test "harness_sits_beside_the_apps_program" {
     try t.expectEqualStrings("/Applications/harness-desk.app/Contents/MacOS/harness", try beside(a, "/Applications/harness-desk.app/Contents/MacOS", false));
     try t.expectEqualStrings("/opt/harness/harness", try beside(a, "/opt/harness/", false));
     try t.expectEqualStrings("C:\\Program Files\\harness\\harness.exe", try beside(a, "C:\\Program Files\\harness", true));
+}
+
+test "other_without_a_key_takes_none_and_a_new_key_takes_it_back" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f: Form = .{ .provider = .other, .model = "llama3.1:8b", .url = "http://127.0.0.1:11434/v1" };
+    const none = try configArgv(a, "/b/harness", "/h", f, null, .none);
+    try t.expectEqualStrings("provider other.auth", none[7]);
+    try t.expectEqualStrings("none", none[8]);
+    // a key now, where none was taken: the format's own way of sending it
+    const was: InUse = .{ .provider = "other", .model = "m", .api = "anthropic", .section_url = "http://x/v1", .auth = "none" };
+    const given = try configArgv(a, "/b/harness", "/h", .{ .provider = .other, .model = "m", .url = "http://x/v1", .api = .anthropic }, was, .given);
+    try t.expectEqualStrings("provider other.auth", given[7]);
+    try t.expectEqualStrings("x-api-key", given[8]);
+    // a way of sending it set by hand stays
+    var hand = was;
+    hand.auth = "bearer";
+    const kept = try configArgv(a, "/b/harness", "/h", .{ .provider = .other, .model = "m", .url = "http://x/v1", .api = .anthropic }, hand, .given);
+    for (kept) |w| try t.expect(!std.mem.endsWith(u8, w, ".auth"));
+    // presets never get an auth line
+    for (try configArgv(a, "/b/harness", "/h", .{ .provider = .openai, .model = "gpt-5" }, null, .given)) |w| try t.expect(!std.mem.endsWith(u8, w, ".auth"));
+    try t.expect(keyOptional(.other) and !keyOptional(.anthropic) and !keyOptional(.omnigate));
+}
+
+test "the_address_is_checked_as_harness_checks_it" {
+    // harness takes http:// and https:// as written, lower case
+    try t.expectEqualStrings("Address must start with http:// or https://.", problem(.{ .provider = .other, .model = "m", .url = "HTTPS://gw.example.com/v1" }).?);
+}
+
+test "a_key_loses_the_spaces_around_it" {
+    try t.expectEqualStrings("sk-abc", trimKey(" sk-abc \r\n"));
+    try t.expectEqualStrings("sk a", trimKey("\tsk a\n"));
+    try t.expectEqualStrings("", trimKey(" \n"));
 }

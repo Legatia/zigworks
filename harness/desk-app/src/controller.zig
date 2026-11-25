@@ -89,8 +89,13 @@ pub const Effect = union(enum) {
     read_config: struct { gen: u32, binary: []const u8, home: []const u8, path: []const u8 },
     /// Ask for the key in the secure field; answer `key`.
     ask_key: struct { title: []const u8, note: []const u8 },
-    /// Pipe the key just typed to `argv`, then clear it; answer `stored`.
+    /// Pipe the key typed to `argv`, then clear it; answer `stored`. The
+    /// app holds the key from `key = .given` while `holdsKey()`.
     store_key: struct { gen: u32, argv: []const []const u8, path: []const u8 },
+    /// Write (true) or remove (false) `state/setup-unfinished`: harness
+    /// init ran from the first setup, which isn't finished, so the next
+    /// start shows "Set up" again.
+    mark: bool,
 };
 
 /// The secure field's note.
@@ -224,7 +229,8 @@ pub const Controller = struct {
             .stepped => |r| try c.onStepped(now, r.gen, r.ok, r.text, r.out, &fx, a),
             .read => |r| if (c.reading != null and c.reading.? == r.gen) {
                 c.reading = null;
-                if (r.ok) {
+                // a form opened meanwhile (the first setup's) stays
+                if (c.form != null) {} else if (r.ok) {
                     try c.openForm(.change, setup.formOf(r.in_use), r.in_use, &fx);
                 } else try fx.add(.{ .alert = .{ .title = "Couldn't read the settings", .text = r.text } });
             },
@@ -264,9 +270,10 @@ pub const Controller = struct {
             },
             .exited => |x| if (c.started_ms) |at| {
                 c.started_ms = null;
+                // the app's own copy isn't on PATH: the whole command
                 if (x.code != 0 and now - at < early_exit_ms) try fx.add(.{ .alert = .{
                     .title = "harness stopped",
-                    .text = try std.fmt.allocPrint(a, "It exited right after starting, with code {d}. Run harness run in Terminal to see why.", .{x.code}),
+                    .text = try std.fmt.allocPrint(a, "It exited right after starting, with code {d}. To see why, run in Terminal: \"{s}\" run --home \"{s}\"", .{ x.code, c.binary() orelse "harness", c.home }),
                 } });
             },
         }
@@ -363,7 +370,7 @@ pub const Controller = struct {
         if (c.starting(now)) return;
         const bin = c.binary() orelse return fx.add(.{ .alert = .{
             .title = "Couldn't start harness",
-            .text = "There's no harness beside the app, and state/desk.json doesn't name one. Run harness run in Terminal.",
+            .text = "There's no harness beside the app, and state/desk.json doesn't name one.",
         } });
         try fx.add(.{ .run = c.runOf(.run, bin) });
         c.started_ms = now;
@@ -445,14 +452,29 @@ pub const Controller = struct {
         if (f.step != null) return;
         f.form = try copyForm(c.form_arena.allocator(), form);
         f.note = "";
+        f.key = .keep;
         if (setup.problem(f.form)) |why| {
             f.note = why;
         } else if (c.binary()) |bin| {
-            try c.runStep(if (f.inited) .config else .init, bin, fx, a);
+            if (needKey(f.*)) {
+                // the key before anything is written: a cancel changes nothing
+                f.step = .key;
+                const e = setup.entry(f.form.provider);
+                try fx.add(.{ .ask_key = .{
+                    .title = if (f.form.provider == .other) "Key" else try std.fmt.allocPrint(a, "{s} key", .{e.label}),
+                    .note = key_note,
+                } });
+            } else try c.runStep(if (f.inited) .config else .init, bin, fx, a);
         } else {
             f.note = "There's no harness beside the app, and state/desk.json names none.";
         }
         try c.showForm(fx);
+    }
+
+    /// Whether the app holds a key typed for the steps running now.
+    pub fn holdsKey(c: *const Controller) bool {
+        const f = c.form orelse return false;
+        return f.key == .given and (f.step == .init or f.step == .config);
     }
 
     fn runStep(c: *Controller, step: Step, bin: []const u8, fx: *Fx, a: std.mem.Allocator) !void {
@@ -461,11 +483,13 @@ pub const Controller = struct {
         c.form_gen +%= 1;
         const argv = switch (step) {
             .init => try setup.initArgv(a, bin, c.home),
-            .config => try setup.configArgv(a, bin, c.home, f.form, f.before),
+            .config => try setup.configArgv(a, bin, c.home, f.form, f.before, f.key),
             .store => try setup.secretArgv(a, bin, c.home, setup.keyName(f.form, f.before)),
             .key => unreachable,
         };
         if (step == .store) {
+            // the app hands the key over with this effect
+            f.key = .keep;
             try fx.add(.{ .store_key = .{ .gen = c.form_gen, .argv = argv, .path = c.path() } });
         } else try fx.add(.{ .step = .{ .gen = c.form_gen, .argv = argv, .path = c.path() } });
     }
@@ -479,29 +503,27 @@ pub const Controller = struct {
         const bin = c.binary() orelse return c.failStep("There's no harness beside the app, and state/desk.json names none.", "", fx);
         if (step == .init) {
             f.inited = true;
+            if (f.mode == .first) try fx.add(.{ .mark = true });
             return c.runStep(.config, bin, fx, a);
         }
         f.said = try c.form_arena.allocator().dupe(u8, firstLine(out));
-        if (!needKey(f.*)) return c.finish(now, fx);
-        f.step = .key;
-        const e = setup.entry(f.form.provider);
-        try fx.add(.{ .ask_key = .{
-            .title = if (f.form.provider == .other) "Key" else try std.fmt.allocPrint(a, "{s} key", .{e.label}),
-            .note = key_note,
-        } });
+        if (f.key == .given) return c.runStep(.store, bin, fx, a);
+        try c.finish(now, fx);
     }
 
     fn onKey(c: *Controller, k: @FieldType(Event, "key"), fx: *Fx, a: std.mem.Allocator) !void {
         const f = &(c.form orelse return);
         if (f.step != .key) return;
+        const bin = c.binary() orelse return c.failStep("There's no harness beside the app, and state/desk.json names none.", "", fx);
         switch (k) {
-            .given => {
-                const bin = c.binary() orelse return c.failStep("There's no harness beside the app, and state/desk.json names none.", "", fx);
-                try c.runStep(.store, bin, fx, a);
-            },
-            .empty => try c.failStep("No key was typed. Nothing was stored.", "", fx),
-            .cancelled => try c.failStep("The key wasn't stored.", "", fx),
+            .given => f.key = .given,
+            // a server of one's own may take no key
+            .empty => if (setup.keyOptional(f.form.provider)) {
+                f.key = .none;
+            } else return c.failStep("No key was typed. Nothing was changed.", "", fx),
+            .cancelled => return c.failStep("Cancelled. Nothing was changed.", "", fx),
         }
+        try c.runStep(if (f.inited) .config else .init, bin, fx, a);
     }
 
     /// The step ended without doing its part: its line on the form, which
@@ -509,6 +531,8 @@ pub const Controller = struct {
     fn failStep(c: *Controller, text: []const u8, otherwise: []const u8, fx: *Fx) !void {
         const f = &c.form.?;
         f.step = null;
+        // a key typed is let go (the app drops it); Continue asks again
+        f.key = .keep;
         f.note = try c.form_arena.allocator().dupe(u8, if (text.len > 0) text else otherwise);
         try c.showForm(fx);
     }
@@ -518,6 +542,7 @@ pub const Controller = struct {
     /// desk again. Otherwise harness is started and entered.
     fn finish(c: *Controller, now: i64, fx: *Fx) !void {
         const said = c.form.?.said;
+        if (c.form.?.mode == .first) try fx.add(.{ .mark = false });
         c.form = null;
         c.state = .down;
         c.reentering = false;
@@ -634,6 +659,9 @@ const Form = struct {
     inited: bool,
     /// What `harness config set` said (whether harness runs).
     said: []const u8 = "",
+    /// The key: typed and held by the app (`given`), none for a server
+    /// that takes none, or left as it is.
+    key: setup.KeyChoice = .keep,
     note: []const u8 = "",
 };
 
@@ -1169,25 +1197,38 @@ test "no_config_shows_the_form" {
     try t.expectEqual(@as(usize, 0), (try r.ev(.{ .message = .{ .msg = .{ .setup = anthropic_form }, .source = .desk } })).len);
 }
 
-test "continue_runs_init_config_key_then_starts" {
+fn markOf(fx: []const Effect) ?bool {
+    for (fx) |f| if (f == .mark) return f.mark;
+    return null;
+}
+
+test "continue_asks_the_key_then_runs_init_config_and_stores_it" {
     var r: Rig = .initOwn(own_bin);
     defer r.deinit();
     _ = try toForm(&r);
     const c1 = try builtin(&r, .{ .setup = anthropic_form });
     try t.expect(viewOf(c1).?.busy);
-    const s1 = stepOf(c1).?;
-    try expectWords(&.{ own_bin, "init", "--home", "/data/harness" }, s1.argv);
-    const c2 = try r.ev(.{ .stepped = .{ .gen = s1.gen, .ok = true, .out = "Data folder: /data/harness" } });
-    const s2 = stepOf(c2).?;
-    try expectWords(&.{ own_bin, "config", "set", "model.provider", "anthropic", "model.model", "claude-opus-4-8", "model.memory_model", "claude-haiku-4-5", "model.worker_model", "claude-haiku-4-5", "--home", "/data/harness" }, s2.argv);
-    const c3 = try r.ev(.{ .stepped = .{ .gen = s2.gen, .ok = true } });
-    const ask = askOf(c3).?;
+    // the key first: nothing is written before it is given
+    try t.expect(stepOf(c1) == null);
+    const ask = askOf(c1).?;
     try t.expectEqualStrings("Anthropic key", ask.title);
     try t.expectEqualStrings("harness keeps it in this computer's key store.", ask.note);
-    const c4 = try r.ev(.{ .key = .given });
+    const c2 = try r.ev(.{ .key = .given });
+    try t.expect(r.c.holdsKey());
+    const s1 = stepOf(c2).?;
+    try expectWords(&.{ own_bin, "init", "--home", "/data/harness" }, s1.argv);
+    const c3 = try r.ev(.{ .stepped = .{ .gen = s1.gen, .ok = true, .out = "Data folder: /data/harness" } });
+    // from here a setup left half done is set up again at the next start
+    try t.expectEqual(@as(?bool, true), markOf(c3));
+    const s2 = stepOf(c3).?;
+    try expectWords(&.{ own_bin, "config", "set", "model.provider", "anthropic", "model.model", "claude-opus-4-8", "model.memory_model", "claude-haiku-4-5", "model.worker_model", "claude-haiku-4-5", "--home", "/data/harness" }, s2.argv);
+    try t.expect(r.c.holdsKey());
+    const c4 = try r.ev(.{ .stepped = .{ .gen = s2.gen, .ok = true } });
     const st = storeOf(c4).?;
     try expectWords(&.{ own_bin, "secret", "add", "anthropic", "--stdin", "--home", "/data/harness" }, st.argv);
+    try t.expect(!r.c.holdsKey());
     const c5 = try r.ev(.{ .stored = .{ .gen = st.gen, .ok = true } });
+    try t.expectEqual(@as(?bool, false), markOf(c5));
     const run = runOfFx(c5).?;
     try t.expectEqual(Command.run, run.cmd);
     try t.expectEqualStrings(own_bin, run.binary);
@@ -1205,12 +1246,18 @@ test "continue_runs_init_config_key_then_starts" {
     try t.expectEqual(@as(usize, 1), count(try r.ev(.{ .checked = .{ .gen = g3, .result = .{ .alive = d1 } } }), .enter));
 }
 
+/// Continue on the form, the key given: the first step's effect.
+fn continueWithKey(r: *Rig, form: setup.Form) !@FieldType(Effect, "step") {
+    _ = askOf(try builtin(r, .{ .setup = form })).?;
+    return stepOf(try r.ev(.{ .key = .given })).?;
+}
+
 test "a_failing_step_shows_its_line_and_keeps_the_form" {
     var r: Rig = .initOwn(own_bin);
     defer r.deinit();
     _ = try toForm(&r);
     const typed: setup.Form = .{ .provider = .other, .model = "llama3.1:8b", .url = "http://127.0.0.1:11434/v1", .api = .openai };
-    const s1 = stepOf(try builtin(&r, .{ .setup = typed })).?;
+    const s1 = try continueWithKey(&r, typed);
     const s2 = stepOf(try r.ev(.{ .stepped = .{ .gen = s1.gen, .ok = true } })).?;
     const line = "Not changed: config.ini line 12: a [provider NAME] section takes api = anthropic, openai or gemini";
     const fx = try r.ev(.{ .stepped = .{ .gen = s2.gen, .ok = false, .text = line } });
@@ -1220,7 +1267,9 @@ test "a_failing_step_shows_its_line_and_keeps_the_form" {
     try t.expectEqual(setup.Provider.other, v.form.provider);
     try t.expectEqualStrings("llama3.1:8b", v.form.model);
     try t.expectEqualStrings("http://127.0.0.1:11434/v1", v.form.url);
-    try t.expect(askOf(fx) == null and stepOf(fx) == null);
+    try t.expect(askOf(fx) == null and stepOf(fx) == null and storeOf(fx) == null);
+    // the key typed is let go: Continue asks for it again
+    try t.expect(!r.c.holdsKey());
     // a stale answer changes nothing
     try t.expectEqual(@as(usize, 0), (try r.ev(.{ .stepped = .{ .gen = s2.gen, .ok = true } })).len);
 }
@@ -1229,62 +1278,81 @@ test "continue_again_after_a_failure_skips_init_and_keeps_the_form" {
     var r: Rig = .initOwn(own_bin);
     defer r.deinit();
     _ = try toForm(&r);
-    const s1 = stepOf(try builtin(&r, .{ .setup = anthropic_form })).?;
+    const s1 = try continueWithKey(&r, anthropic_form);
     const s2 = stepOf(try r.ev(.{ .stepped = .{ .gen = s1.gen, .ok = true } })).?;
     _ = try r.ev(.{ .stepped = .{ .gen = s2.gen, .ok = false, .text = "can't read config.ini" } });
     // init ran: the folder has config.ini now, and init isn't run on it again
-    const again = stepOf(try builtin(&r, .{ .setup = anthropic_form })).?;
+    const again = try continueWithKey(&r, anthropic_form);
     try t.expectEqualStrings("config", again.argv[1]);
     // a failed init is run again
     var r2: Rig = .initOwn(own_bin);
     defer r2.deinit();
     _ = try toForm(&r2);
-    const first_init = stepOf(try builtin(&r2, .{ .setup = anthropic_form })).?;
+    const first_init = try continueWithKey(&r2, anthropic_form);
     _ = try r2.ev(.{ .stepped = .{ .gen = first_init.gen, .ok = false, .text = "can't create /data/harness: AccessDenied" } });
-    const second_init = stepOf(try builtin(&r2, .{ .setup = anthropic_form })).?;
-    try t.expectEqualStrings("init", second_init.argv[1]);
-    // pressed again while a step runs: nothing more starts
+    _ = askOf(try builtin(&r2, .{ .setup = anthropic_form })).?;
+    // pressed again while the key is asked for: nothing more starts
     try t.expectEqual(@as(usize, 0), (try builtin(&r2, .{ .setup = anthropic_form })).len);
+    const second_init = stepOf(try r2.ev(.{ .key = .given })).?;
+    try t.expectEqualStrings("init", second_init.argv[1]);
     _ = try r2.ev(.{ .stepped = .{ .gen = second_init.gen, .ok = false, .text = "can't create /data/harness: AccessDenied" } });
     // the form's own problems are said before anything runs
     const empty = try builtin(&r2, .{ .setup = .{ .provider = .opencode, .model = " " } });
-    try t.expect(stepOf(empty) == null);
+    try t.expect(stepOf(empty) == null and askOf(empty) == null);
     try t.expectEqualStrings("Model is empty.", noteOf(empty).?);
 }
 
-test "a_cancelled_key_says_so_and_continue_asks_again" {
+test "a_cancelled_key_changes_nothing_and_continue_asks_again" {
     var r: Rig = .initOwn(own_bin);
     defer r.deinit();
     _ = try toForm(&r);
-    const s1 = stepOf(try builtin(&r, .{ .setup = anthropic_form })).?;
-    const s2 = stepOf(try r.ev(.{ .stepped = .{ .gen = s1.gen, .ok = true } })).?;
-    _ = askOf(try r.ev(.{ .stepped = .{ .gen = s2.gen, .ok = true } })).?;
+    _ = askOf(try builtin(&r, .{ .setup = anthropic_form })).?;
     const cancelled = try r.ev(.{ .key = .cancelled });
-    try t.expect(storeOf(cancelled) == null);
-    try t.expectEqualStrings("The key wasn't stored.", noteOf(cancelled).?);
+    try t.expect(stepOf(cancelled) == null and storeOf(cancelled) == null);
+    try t.expectEqualStrings("Cancelled. Nothing was changed.", noteOf(cancelled).?);
     try t.expect(!viewOf(cancelled).?.busy);
-    const s3 = stepOf(try builtin(&r, .{ .setup = anthropic_form })).?;
-    try t.expectEqualStrings("config", s3.argv[1]);
-    _ = askOf(try r.ev(.{ .stepped = .{ .gen = s3.gen, .ok = true } })).?;
+    _ = askOf(try builtin(&r, .{ .setup = anthropic_form })).?;
     const empty = try r.ev(.{ .key = .empty });
-    try t.expect(storeOf(empty) == null);
-    try t.expectEqualStrings("No key was typed. Nothing was stored.", noteOf(empty).?);
+    try t.expect(stepOf(empty) == null);
+    try t.expectEqualStrings("No key was typed. Nothing was changed.", noteOf(empty).?);
     // harness refusing the key: its own line
-    const s4 = stepOf(try builtin(&r, .{ .setup = anthropic_form })).?;
-    _ = try r.ev(.{ .stepped = .{ .gen = s4.gen, .ok = true } });
-    const st = storeOf(try r.ev(.{ .key = .given })).?;
+    const s1 = try continueWithKey(&r, anthropic_form);
+    const s2 = stepOf(try r.ev(.{ .stepped = .{ .gen = s1.gen, .ok = true } })).?;
+    const st = storeOf(try r.ev(.{ .stepped = .{ .gen = s2.gen, .ok = true } })).?;
     const refused = try r.ev(.{ .stored = .{ .gen = st.gen, .ok = false, .text = "values shorter than 8 characters can't be masked reliably; nothing stored" } });
     try t.expectEqualStrings("values shorter than 8 characters can't be masked reliably; nothing stored", noteOf(refused).?);
     try t.expect(runOfFx(refused) == null);
+    // the setup isn't done: no mark taken off
+    try t.expect(markOf(refused) == null);
     // a key answer nobody asked for is dropped
     try t.expectEqual(@as(usize, 0), (try r.ev(.{ .key = .given })).len);
+    try t.expect(!r.c.holdsKey());
+}
+
+test "other_may_be_set_up_without_a_key" {
+    var r: Rig = .initOwn(own_bin);
+    defer r.deinit();
+    _ = try toForm(&r);
+    const local: setup.Form = .{ .provider = .other, .model = "llama3.1:8b", .url = "http://127.0.0.1:11434/v1" };
+    _ = askOf(try builtin(&r, .{ .setup = local })).?;
+    const s1 = stepOf(try r.ev(.{ .key = .empty })).?;
+    try t.expectEqualStrings("init", s1.argv[1]);
+    const s2 = stepOf(try r.ev(.{ .stepped = .{ .gen = s1.gen, .ok = true } })).?;
+    var none = false;
+    for (s2.argv, 0..) |w, i| if (std.mem.eql(u8, w, "provider other.auth") and std.mem.eql(u8, s2.argv[i + 1], "none")) {
+        none = true;
+    };
+    try t.expect(none);
+    const done = try r.ev(.{ .stepped = .{ .gen = s2.gen, .ok = true } });
+    try t.expect(storeOf(done) == null);
+    try t.expectEqual(Command.run, runOfFx(done).?.cmd);
 }
 
 test "checks_while_the_form_is_open_leave_it" {
     var r: Rig = .initOwn(own_bin);
     defer r.deinit();
     _ = try toForm(&r);
-    const s1 = stepOf(try builtin(&r, .{ .setup = anthropic_form })).?;
+    const s1 = try continueWithKey(&r, anthropic_form);
     _ = try r.ev(.{ .stepped = .{ .gen = s1.gen, .ok = true } });
     for ([_]CheckResult{ .no_desk, .bad_desk, .{ .dead = d1 }, .{ .alive = d1 }, .no_config }) |res| {
         r.wait(5000);
@@ -1373,16 +1441,71 @@ test "the_key_is_asked_again_only_when_chosen_or_new" {
         var r: Rig = .initOwn(own_bin);
         defer r.deinit();
         _ = try toChange(&r, before);
-        const s = stepOf(try builtin(&r, .{ .setup = case[0] })).?;
+        const c1 = try builtin(&r, .{ .setup = case[0] });
+        try t.expectEqual(case[1], askOf(c1) != null);
+        const s = if (case[1]) stepOf(try r.ev(.{ .key = .given })).? else stepOf(c1).?;
+        try t.expectEqualStrings("config", s.argv[1]);
         const fx = try r.ev(.{ .stepped = .{ .gen = s.gen, .ok = true, .out = "harness is running: send /reload to use it." } });
-        try t.expectEqual(case[1], askOf(fx) != null);
         if (case[1]) {
-            const st = storeOf(try r.ev(.{ .key = .given })).?;
+            const st = storeOf(fx).?;
             try t.expectEqualStrings(if (case[0].provider == .anthropic) "anthropic" else "openai", st.argv[3]);
             const done = try r.ev(.{ .stored = .{ .gen = st.gen, .ok = true } });
             try t.expectEqualStrings("harness is running: send /reload to use it.", alertOf(done).?.text);
-        }
+            // "Provider and key…" never marks the folder unfinished
+            try t.expect(markOf(done) == null);
+        } else try t.expect(storeOf(fx) == null and alertOf(fx) != null);
     }
+}
+
+test "cancelling_the_key_of_a_new_provider_leaves_config_ini_alone" {
+    var r: Rig = .initOwn(own_bin);
+    defer r.deinit();
+    _ = try toChange(&r, .{ .provider = "openai", .model = "gpt-5" });
+    _ = askOf(try builtin(&r, .{ .setup = .{ .provider = .anthropic, .model = "claude-opus-4-8" } })).?;
+    const fx = try r.ev(.{ .key = .cancelled });
+    try t.expect(stepOf(fx) == null and storeOf(fx) == null);
+    try t.expectEqualStrings("Cancelled. Nothing was changed.", noteOf(fx).?);
+    // and [Cancel] goes back with nothing run
+    const back = try builtin(&r, .{ .cancel = true });
+    try t.expect(stepOf(back) == null);
+    try t.expect(r.c.form == null);
+}
+
+test "a_late_read_doesnt_replace_an_open_form" {
+    var r: Rig = .initOwn(own_bin);
+    defer r.deinit();
+    try r.getIn(d1, "c1");
+    var rc: u32 = 0;
+    for (try r.ev(.{ .menu = .provider })) |f| if (f == .read_config) {
+        rc = f.read_config.gen;
+    };
+    // config.ini went meanwhile: the first setup's form
+    for (0..2) |_| {
+        r.wait(5000);
+        _ = try r.ev(.{ .checked = .{ .gen = try Rig.checkGen(try r.ev(.tick)), .result = .no_config } });
+    }
+    try t.expectEqual(pages.Mode.first, r.c.form.?.mode);
+    try t.expectEqual(@as(usize, 0), (try r.ev(.{ .read = .{ .gen = rc, .ok = true, .in_use = .{ .provider = "openai" } } })).len);
+    try t.expectEqual(pages.Mode.first, r.c.form.?.mode);
+    // and "Provider and key…" can be asked again later
+    try t.expect(r.c.reading == null);
+}
+
+test "an_early_exit_names_the_command_to_run" {
+    var r: Rig = .initOwn(own_bin);
+    defer r.deinit();
+    const g = try Rig.checkGen(try r.ev(.start));
+    _ = try r.ev(.{ .checked = .{ .gen = g, .result = .no_desk } });
+    _ = try r.ev(.{ .menu = .start });
+    r.wait(1000);
+    const al = alertOf(try r.ev(.{ .exited = .{ .code = 1 } })).?;
+    try t.expectEqualStrings("It exited right after starting, with code 1. To see why, run in Terminal: \"" ++ own_bin ++ "\" run --home \"/data/harness\"", al.text);
+    // no harness at all: said, with nothing to run in Terminal
+    var r2: Rig = .init();
+    defer r2.deinit();
+    const g2 = try Rig.checkGen(try r2.ev(.start));
+    _ = try r2.ev(.{ .checked = .{ .gen = g2, .result = .{ .dead = nobin } } });
+    try t.expectEqualStrings("There's no harness beside the app, and state/desk.json doesn't name one.", alertOf(try r2.ev(.{ .menu = .start })).?.text);
 }
 
 test "the_own_copy_runs_when_desk_json_names_none" {

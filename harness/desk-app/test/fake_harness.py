@@ -23,7 +23,9 @@ and getting in"), and nothing more:
       while `run` runs, says "harness is running: send /reload to use it."
   fake_harness.py config get KEY --home DIR
   fake_harness.py secret add NAME --stdin --home DIR
-      reads the value from its input into DIR/fake-store/NAME (never logged)
+      reads the value from its input into DIR/fake-store/NAME (never logged);
+      refuses it, as harness refuses a short one, while DIR/fake-refuse-secret
+      is there
 
 Everything it does goes to DIR/fake.log, a line each.
 """
@@ -334,7 +336,8 @@ def main():
             value = value[:-1]
         if value.endswith("\r"):
             value = value[:-1]
-        if len(value) < 8:
+        # the smoke makes it refuse a key, as harness refuses a short one
+        if len(value) < 8 or os.path.exists(os.path.join(home, "fake-refuse-secret")):
             print("values shorter than 8 characters can't be masked reliably; nothing stored", file=sys.stderr)
             return 1
         store = os.path.join(home, "fake-store")

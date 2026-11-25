@@ -131,6 +131,13 @@ pub fn runWithStdin(io: Io, a: std.mem.Allocator, args: []const []const u8, env:
     return .{ .ok = code == 0, .code = code, .out = try reader.toOwnedSlice(0), .err = try reader.toOwnedSlice(1) };
 }
 
+/// The line for a command that didn't come to an end: it ran too long, or
+/// couldn't be started.
+pub fn notRun(a: std.mem.Allocator, binary: []const u8, e: anyerror) ![]const u8 {
+    if (e == error.Timeout) return std.fmt.allocPrint(a, "{s} didn't finish within 30 s.", .{binary});
+    return std.fmt.allocPrint(a, "{s} couldn't be run ({t}).", .{ binary, e });
+}
+
 /// Runs `argv` to its end (at most 30 s), keeping what it printed.
 pub fn runWait(io: Io, a: std.mem.Allocator, args: []const []const u8, env: ?*const Environ.Map) !Result {
     const r = try std.process.run(a, io, .{
@@ -291,4 +298,12 @@ test "run_with_stdin_feeds_and_closes_the_input" {
     try t.expect(!bad.ok);
     try t.expectEqualStrings("refused", try bad.why(a));
     try t.expectError(error.FileNotFound, runWithStdin(t.io, a, &.{"/no/such/harness"}, null, "x"));
+}
+
+test "a_command_that_couldnt_finish_says_which_way" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqualStrings("/b/harness didn't finish within 30 s.", try notRun(a, "/b/harness", error.Timeout));
+    try t.expectEqualStrings("/b/harness couldn't be run (FileNotFound).", try notRun(a, "/b/harness", error.FileNotFound));
 }

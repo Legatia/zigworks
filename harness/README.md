@@ -4041,21 +4041,27 @@ its own copy of harness:
 or Other: an address that speaks OpenAI's or Anthropic's format), Model
 (filled in with the one harness's docs use for that provider; none for
 opencode and Other), Address (omnigate and Other only) and, for Other,
-Format. [Continue] runs, with the data folder:
+Format. [Continue] first asks for the key, in a field of the app's own (not
+the page); Cancel there changes nothing. Then it runs, with the data
+folder:
 
 1. `harness init` (only when there is no `config.ini` yet);
 2. `harness config set` with every setting in one call: `[model] provider`
    and `model`, omnigate's `url`, or a `[provider other]` section's `api`
    and `url`; `memory_model` and `worker_model` too when the provider is
    new;
-3. the key, asked for in a field of the app's own (not the page), piped to
-   `harness secret add NAME --stdin`: harness keeps it in this computer's
-   key store, and the app keeps no copy;
+3. `harness secret add NAME --stdin`, the key on its input: harness keeps
+   it in this computer's key store, and the app keeps no copy;
 4. `harness run`, and the desk.
 
-A step that fails shows its own line; what was typed stays, and
-[Continue] carries on from there. Telegram stays optional and is set up in
-Terminal (`harness secret add telegram`, `harness pair`).
+For Other the key may be left empty (a server that takes none): its
+section gets `auth = none` and nothing is stored. A step that fails shows
+its own line and what was typed stays; [Continue] runs the steps again
+(not `harness init` once it has run) and asks for the key again. A first
+setup that stopped after `harness init` is marked by
+`state/setup-unfinished`, so the next start shows "Set up" again. Telegram
+stays optional and is set up in Terminal (`harness secret add telegram`,
+`harness pair`).
 
 It checks every 5 seconds, so a harness started in Terminal is found on
 its own.

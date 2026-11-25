@@ -907,5 +907,13 @@ This section closes them. It is my call throughout, not the owner's (see
     restart harness, which would end the owner's turn in progress. When
     harness isn't running, the app starts it.
   - `harness init` runs only when the data folder has no config.ini.
+  - [Continue] asks for the key before any command runs, so Cancel in the
+    key's field changes nothing. The commands then run in this section's
+    order: init, config set, then the key piped to secret add. A first
+    setup that stopped after init leaves `state/setup-unfinished`, and the
+    next start shows "Set up" again.
+  - For Other the key may be left empty, for a server that takes none. Its
+    section then gets `auth = none`, and nothing is stored.
+  - The key is trimmed of spaces and line ends before it is stored.
   - The package's fit files come from `pack-desk-assets.sh`, strictly, in
     the release. `DESK_ASSETS=none` leaves them out, and says so, for CI.

@@ -61,7 +61,8 @@ fn setupPage(a: std.mem.Allocator, out: *std.ArrayList(u8), note: []const u8, ho
     try out.appendSlice(a, "\" spellcheck=\"false\" inputmode=\"url\">" ++
         "<button class=\"i\" id=\"i-address\" type=\"button\" aria-label=\"About Address\" aria-expanded=\"false\">i</button></div>\n" ++
         "<div class=\"bubble\" id=\"bubble-address\" hidden>Where the provider answers: the part before <code>/messages</code> or " ++
-        "<code>/chat/completions</code>, like <code>https://gateway.example.com/v1</code>. For omnigate, its own address.</div>\n");
+        "<code>/chat/completions</code>, like <code>https://gateway.example.com/v1</code>. For omnigate, its own address. " ++
+        "A server of your own that takes no key: leave the key empty.</div>\n");
     try out.print(a, "<div class=\"row\" id=\"api-row\"{s}>", .{if (f.provider == .other) "" else " hidden"});
     try out.print(a, "<label for=\"api\">Format</label><select id=\"api\"><option value=\"openai\"{s}>OpenAI Chat Completions</option>" ++
         "<option value=\"anthropic\"{s}>Anthropic Messages</option></select></div>\n", .{
@@ -91,9 +92,10 @@ fn setupPage(a: std.mem.Allocator, out: *std.ArrayList(u8), note: []const u8, ho
     return out.toOwnedSlice(a);
 }
 
-/// The form's own behaviour: the provider switches the model it starts
-/// with (unless one was typed) and the rows shown; Continue posts the form
-/// to the app, which runs the steps and shows the page again.
+/// The form's own behaviour: the provider switches the model to its usual
+/// one (unless one was typed since the last switch) and the rows shown;
+/// Continue posts the form to the app, which runs the steps and shows the
+/// page again.
 const setup_script =
     \\function post(m) {
     \\  var w = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.harness;
@@ -103,14 +105,15 @@ const setup_script =
     \\(function () {
     \\  var $ = function (id) { return document.getElementById(id); };
     \\  var provider = $("provider"), model = $("model"), url = $("url"), api = $("api");
-    \\  var was = provider.value;
+    \\  var typed = false;
+    \\  model.addEventListener("input", function () { typed = true; });
     \\  provider.addEventListener("change", function () {
     \\    var p = provider.value;
-    \\    if (model.value.trim() === "" || model.value === models[was]) model.value = models[p];
+    \\    if (!typed || model.value.trim() === "") model.value = models[p];
+    \\    typed = false;
     \\    $("address-row").hidden = !addressed[p];
     \\    $("api-row").hidden = p !== "other";
     \\    if (!addressed[p]) { $("bubble-address").hidden = true; $("i-address").setAttribute("aria-expanded", "false"); }
-    \\    was = p;
     \\  });
     \\  $("i-address").addEventListener("click", function () {
     \\    var b = $("bubble-address");
@@ -319,6 +322,7 @@ test "the_i_button_opens_a_bubble" {
     const page = try html(a, .setup, "", "/h", .{ .form = .{ .provider = .other } });
     try t.expect(has(page, "<button class=\"i\" id=\"i-address\" type=\"button\" aria-label=\"About Address\" aria-expanded=\"false\">i</button>"));
     try t.expect(has(page, "<div class=\"bubble\" id=\"bubble-address\" hidden>"));
+    try t.expect(has(page, "A server of your own that takes no key: leave the key empty."));
 }
 
 test "inserted_text_is_escaped" {
@@ -330,4 +334,14 @@ test "inserted_text_is_escaped" {
     try t.expect(std.mem.indexOf(u8, page, "&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;x&quot; &#39;y&#39;") != null);
     const set = try html(a, .setup, "", "/Users/<b>me</b>", .{});
     try t.expect(std.mem.indexOf(u8, set, "/Users/&lt;b&gt;me&lt;/b&gt;") != null);
+}
+
+test "a_new_provider_brings_its_model_unless_one_was_typed" {
+    // the model in use belongs to the provider in use: switching replaces
+    // it, unless the owner typed one since the last switch
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const page = try html(arena.allocator(), .setup, "", "/h", .{ .mode = .change, .form = .{ .provider = .openai, .model = "gpt-5-mini" } });
+    try t.expect(has(page, "model.addEventListener(\"input\", function () { typed = true; });"));
+    try t.expect(has(page, "if (!typed || model.value.trim() === \"\") model.value = models[p];"));
 }
