@@ -21132,7 +21132,7 @@ test "old_task_and_brief_files_run_as_before_beside_triggers" {
 fn setTriggers(f: *Fix, text: []const u8) !void {
     const a = f.e.arena.allocator();
     try writeTriggers(f, try std.mem.replaceOwned(u8, a, text, "URL", try f.e.url()));
-    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expectEqualStrings("Settings reloaded.", try reloadIdle(f));
 }
 
 fn writePage(f: *Fix, name: []const u8, data: []const u8) !void {
@@ -21767,10 +21767,21 @@ fn writeWorkflow(f: *Fix, name: []const u8, text: []const u8) !void {
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = try std.mem.replaceOwned(u8, a, text, "URL", try f.e.url()), .flags = .{ .permissions = util.private_file } });
 }
 
+/// /reload, waiting out a turn that is still finishing: a reply is posted
+/// before the worker is idle, so a reload right after waitFor can say Busy.
+fn reloadIdle(f: *Fix) ![]const u8 {
+    var waited: u32 = 0;
+    while (true) : (waited += 20) {
+        const said = try f.core.reload();
+        if (!std.mem.startsWith(u8, said, "Busy") or waited >= 10_000) return said;
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+}
+
 /// writeWorkflow, then /reload.
 fn setWorkflow(f: *Fix, name: []const u8, text: []const u8) !void {
     try writeWorkflow(f, name, text);
-    const said = try f.core.reload();
+    const said = try reloadIdle(f);
     if (!std.mem.eql(u8, said, "Settings reloaded.")) {
         std.debug.print("reload said: {s}\n", .{said});
         return error.TestUnexpectedResult;
@@ -34734,7 +34745,7 @@ test "each_of_these_asks" {
             .marked, .tool, .mcp, .model, .shared, .environment, .limits, .main_itself => {},
             .task => {
                 try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.tasks, .data = "[look]\nevery = 1h\ndo = Look around.\nagent = researcher\n" });
-                try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+                try t.expectEqualStrings("Settings reloaded.", try reloadIdle(&f));
             },
             .trigger => try setTriggers(&f, "[look]\nevery = 1h\ndo = Look around.\nagent = researcher\n"),
             .step => try setWorkflow(&f, "look", "workflow look\nstep a\ndo Look around.\nagent researcher\n"),
@@ -34747,22 +34758,22 @@ test "each_of_these_asks" {
             .section, .kind_section => {
                 // a glob on the name, and the kind alone (every definition)
                 try writeRules(&f, if (case == .section) "[agent:r*]\nallow fetch *\n" else "[agent]\nallow fetch *\n");
-                try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+                try t.expectEqualStrings("Settings reloaded.", try reloadIdle(&f));
             },
             .grant => try f.core.grants.addFor(.fetch, "", "https://example.com", "agent:researcher", util.nowSeconds(t.io) + 3600),
             .hand_edit => {
                 try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.paths.agents, "researcher.md" }), .data = try std.fmt.allocPrint(a, "{s}Mine now.\n", .{helperFile(&f, "researcher")}) });
-                try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+                try t.expectEqualStrings("Settings reloaded.", try reloadIdle(&f));
             },
             .owner_version => {
                 try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.paths.agents, "researcher.md" }), .data = plain_helper });
-                try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+                try t.expectEqualStrings("Settings reloaded.", try reloadIdle(&f));
                 try f.core.defs.remove("researcher");
                 text = plain_helper;
             },
             .ask_line, .deny_line => {
                 try writeRules(&f, if (case == .ask_line) "ask agent_save *\n" else "deny agent_save *\n");
-                try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+                try t.expectEqualStrings("Settings reloaded.", try reloadIdle(&f));
             },
         }
         text = switch (case) {
