@@ -14960,7 +14960,7 @@ pub const Core = struct {
             c.log.write(.chat, false, .{ .event = "desk speech failed", .provider = prov.name, .why = why }) catch {};
             return deskErr(a, .bad_gateway, why);
         };
-        return .{ .body = audio, .content_type = "audio/mpeg" };
+        return .{ .body = audio.bytes, .content_type = audio.content_type };
     }
 
     /// A conversation the desk may write in: main, or one only the owner
