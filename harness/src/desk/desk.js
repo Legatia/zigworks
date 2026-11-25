@@ -731,6 +731,8 @@ async function runFit(name) {
       const v = asBlob((res && res[k]) || (res && res.files && res.files[k]));
       if (v) await uploadPart(name, k, v, k === "head" ? "application/octet-stream" : "image/png");
     }
+    // the eyes-closed photo is kept only once the fit has taken it, so a refused one never reaches the pack
+    if (res && res.closed === true && lastClosed) await uploadPart(name, "closed", lastClosed, lastClosed.type);
   } catch (e) {
     note("fitOutcome", e.message, true);
     return;
@@ -776,13 +778,12 @@ $("closedBtn").addEventListener("click", async () => {
   if (why || !name) return note("fitOutcome", why || "Choose your own avatar first.", true);
   $("closedBtn").disabled = true;
   try {
-    await uploadPart(name, "closed", file, file.type);
-    lastClosed = file;
+    lastClosed = file; // saved after the fit accepts it (runFit)
     if (!lastPhoto || lastName !== name) {
       // the portrait as harness keeps it, for the line-up check
-      const ini = await fetch("/desk/avatars/" + encodeURIComponent(name) + "/avatar.ini", { credentials: "same-origin" }).then((r) => (r.ok ? r.text() : ""));
+      const ini = await fetch("/desk/avatars/" + encodeURIComponent(name) + "/avatar.ini", { credentials: "same-origin", cache: "no-cache" }).then((r) => (r.ok ? r.text() : ""));
       const still = (ini.match(/^still\s*=\s*(\S+)/m) || [])[1];
-      if (still) lastPhoto = await fetch("/desk/avatars/" + encodeURIComponent(name) + "/" + still, { credentials: "same-origin" }).then((r) => r.blob());
+      if (still) lastPhoto = await fetch("/desk/avatars/" + encodeURIComponent(name) + "/" + still, { credentials: "same-origin", cache: "no-cache" }).then((r) => r.blob());
       lastName = name;
     }
     await runFit(name);
