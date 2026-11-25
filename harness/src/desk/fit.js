@@ -55,6 +55,33 @@ export function packHead(meta, arrays) {
   return out.buffer;
 }
 
+const TYPES = { f32: Float32Array, i16: Int16Array, u16: Uint16Array, u32: Uint32Array, u8: Uint8Array };
+
+/** A head file (format version 1): { version, meta, arr(name) }. Throws a
+ *  plain Error when it isn't one this module reads. */
+export function readHead(buf) {
+  const bytes = new Uint8Array(buf);
+  if (bytes.length < 16 || HEAD_MAGIC.some((b, i) => bytes[i] !== b)) {
+    if (bytes.length >= 8 && HEAD_MAGIC.every((b, i) => bytes[i] === b)) throw new Error("the head file's header runs past the end of the file");
+    throw new Error('this is not a head file');
+  }
+  const dv = new DataView(buf);
+  const version = dv.getUint32(8, true), hlen = dv.getUint32(12, true);
+  if (version > 1) throw new Error(`the head file is format version ${version}, made by a newer harness`);
+  if (version < 1 || hlen % 4 || 16 + hlen > bytes.length) throw new Error("the head file's header runs past the end of the file");
+  const meta = JSON.parse(new TextDecoder().decode(bytes.subarray(16, 16 + hlen)));
+  const base = 16 + hlen;
+  const arr = (name) => {
+    const d = meta.arrays && meta.arrays[name];
+    if (!d) throw new Error('the head file has no ' + name);
+    const T = TYPES[d[0]];
+    if (!T || d[1] % 4 || base + d[1] + d[2] * T.BYTES_PER_ELEMENT > bytes.length) throw new Error('the head file\'s ' + name + ' runs past the end of the file');
+    return new T(buf, base + d[1], d[2]);
+  };
+  for (const name of Object.keys(meta.arrays || {})) arr(name);
+  return { version, meta, arr };
+}
+
 /** avatar.ini's text for a pack's files ({ still, closed?, head?, eyes?, eyemask? }). */
 export function packIni(files) {
   let s = '';
@@ -302,12 +329,19 @@ const score = (res, face, name) => {
   return c ? c.score : 0;
 };
 
-/** How far the face turns from the camera, in degrees, from the
- *  landmarker's transformation matrix (column-major 4×4). */
+/** How far the face turns from the camera, in degrees: the angle between
+ *  the face's forward axis and its line of sight to the camera, from the
+ *  landmarker's transformation matrix (column-major 4×4). A face off the
+ *  frame's centre that looks at the camera faces it. */
 export function turnedBy(matrix) {
   const m = matrix?.data || matrix;
   if (!m || m.length < 16) return 0;
-  return (Math.acos(Math.min(1, Math.abs(m[10]))) * 180) / Math.PI;
+  const f = [m[8], m[9], m[10]];
+  let c = [-m[12], -m[13], -m[14]];
+  const cl = Math.hypot(...c), fl = Math.hypot(...f) || 1;
+  c = cl > 1e-6 ? c.map((v) => v / cl) : [0, 0, 1];
+  const dot = (f[0] * c[0] + f[1] * c[1] + f[2] * c[2]) / fl;
+  return (Math.acos(Math.min(1, Math.max(-1, dot))) * 180) / Math.PI;
 }
 
 /** The still's checks, on the landmarker's result: null when it's fine. */
@@ -348,4 +382,255 @@ export function checkClosed(openRes, closedRes, W, H, W2, H2) {
   if (closedShift(openRes.faceLandmarks[0], closedRes.faceLandmarks[0], W, H) > 12) return problem('closed-moved');
   if (score(closedRes, 0, 'eyeBlinkLeft') < 0.5 || score(closedRes, 0, 'eyeBlinkRight') < 0.5) return problem('closed-open');
   return null;
+}
+
+// ---------- in the browser ----------
+
+/** An image as a canvas of its pixels as the browser shows it (a phone
+ *  photo's EXIF orientation applied). src: a Blob or File, a URL, an
+ *  image element, an ImageBitmap or a canvas. The avatar decodes its
+ *  still the same way, so the fit and the drawing agree. */
+export async function loadImage(src) {
+  let source = src;
+  let revoke = null;
+  if (typeof src === 'string' || (typeof Blob !== 'undefined' && src instanceof Blob)) {
+    const url = typeof src === 'string' ? src : (revoke = URL.createObjectURL(src));
+    source = new Image();
+    source.decoding = 'async';
+    try {
+      await new Promise((ok, no) => { source.onload = ok; source.onerror = () => no(new Error("the image didn't load")); source.src = url; });
+      if (source.decode) await source.decode().catch(() => {});
+    } finally { if (revoke) URL.revokeObjectURL(revoke); }
+  } else if (src && src.complete === false) {
+    await new Promise((ok, no) => { src.onload = ok; src.onerror = () => no(new Error("the image didn't load")); });
+  }
+  const w = source.naturalWidth || source.videoWidth || source.width, h = source.naturalHeight || source.videoHeight || source.height;
+  if (!w || !h) throw new Error("the image didn't load");
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').drawImage(source, 0, 0, w, h);
+  return c;
+}
+
+const ASSETS = '/desk/assets/';
+let landmarkerFor = null; // one landmarker per assets folder, made once
+
+async function landmarker(assets) {
+  if (landmarkerFor && landmarkerFor.assets === assets) return landmarkerFor.ready;
+  const ready = (async () => {
+    const { FaceLandmarker, FilesetResolver } = await import(assets + 'mediapipe/vision_bundle.mjs');
+    const fileset = await FilesetResolver.forVisionTasks(assets + 'mediapipe/wasm');
+    return FaceLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: assets + 'mediapipe/face_landmarker.task', delegate: 'CPU' },
+      runningMode: 'IMAGE', numFaces: 2, outputFaceBlendshapes: true, outputFacialTransformationMatrixes: true,
+    });
+  })();
+  landmarkerFor = { assets, ready };
+  ready.catch(() => { if (landmarkerFor && landmarkerFor.ready === ready) landmarkerFor = null; });
+  return ready;
+}
+
+// the fit files missing (desk-assets), or WebAssembly not allowed
+const NO_START = "Fitting couldn't start: its files (desk-assets) are missing or blocked.";
+const fitError = (p) => Object.assign(new Error(p.message), { code: p.code });
+
+const inPoly = (poly, x, y) => {
+  let ins = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [ax, ay] = poly[i], [bx, by] = poly[j];
+    if ((ay > y) !== (by > y) && x < ((bx - ax) * (y - ay)) / (by - ay) + ax) ins = !ins;
+  }
+  return ins;
+};
+const edgeDist = (poly, x, y) => {
+  let best = Infinity;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [ax, ay] = poly[j], [bx, by] = poly[i], dx = bx - ax, dy = by - ay;
+    const t = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy || 1)));
+    best = Math.min(best, Math.hypot(x - ax - t * dx, y - ay - t * dy));
+  }
+  return best;
+};
+const luma = (r, g, b) => 0.299 * r + 0.587 * g + 0.114 * b;
+const median = (vals, q = 0.5) => { if (!vals.length) return null; const s = [...vals].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(s.length * q))]; };
+
+/** The eyeballs' texture: a crop round both eyes with the photo's
+ *  reflections removed and each iris completed under the lids (by its
+ *  mirror image), keeping a band of photo round the lids; plus where each
+ *  reflection was. Mutates meta.eyes (catchlight) and sets meta.eyeCrop. */
+function eyeTexture(photo, meta) {
+  const W = photo.width, H = photo.height, eyes = meta.eyes;
+  const pad = 0.55;
+  const cx0 = Math.max(0, Math.floor(Math.min(...eyes.map((e) => e.center[0] - e.width * (0.5 + pad)))));
+  const cx1 = Math.min(W, Math.ceil(Math.max(...eyes.map((e) => e.center[0] + e.width * (0.5 + pad)))));
+  const cy0 = Math.max(0, Math.floor(Math.min(...eyes.map((e) => e.center[1] - e.width * (0.35 + pad)))));
+  const cy1 = Math.min(H, Math.ceil(Math.max(...eyes.map((e) => e.center[1] + e.width * (0.35 + pad)))));
+  const ew = cx1 - cx0, eh = cy1 - cy0;
+  const c = document.createElement('canvas');
+  c.width = ew; c.height = eh;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.drawImage(photo, cx0, cy0, ew, eh, 0, 0, ew, eh);
+  const img = g.getImageData(0, 0, ew, eh), D = img.data, src = new Uint8ClampedArray(D);
+  const at = (x, y) => ((y - cy0) * ew + (x - cx0)) * 4;
+  const inCrop = (x, y) => x >= cx0 && x < cx1 && y >= cy0 && y < cy1;
+  for (const e of eyes) {
+    const [icx, icy, ir] = e.iris, poly = e.outline, k = e.width / 130;
+    // the white and the iris, from the photo's own pixels
+    const scl = [[], [], []], irs = [[], [], []];
+    for (let y = Math.floor(icy - e.width); y < icy + e.width; y++) for (let x = Math.floor(e.center[0] - e.width); x < e.center[0] + e.width; x++) {
+      if (!inCrop(x, y) || !inPoly(poly, x, y)) continue;
+      const o = at(x, y), d = Math.hypot(x - icx, y - icy);
+      const into = d > ir * 1.2 ? scl : d < ir * 0.95 ? irs : null;
+      if (into) for (let q = 0; q < 3; q++) into[q].push(src[o + q]);
+    }
+    const sclera = scl.map((v) => median(v, 0.6) ?? 120), irisCol = irs.map((v) => median(v) ?? 60);
+    // the reflection: bright pixels in the iris
+    let sx = 0, sy = 0, sn = 0;
+    for (let y = Math.floor(icy - ir); y <= icy + ir; y++) for (let x = Math.floor(icx - ir); x <= icx + ir; x++) {
+      if (!inCrop(x, y) || Math.hypot(x - icx, y - icy) > ir * 1.05) continue;
+      const o = at(x, y);
+      if (luma(src[o], src[o + 1], src[o + 2]) > 175) { sx += x; sy += y; sn++; }
+    }
+    const cl = sn ? [sx / sn, sy / sn, Math.max(2, Math.sqrt(sn / Math.PI))] : null;
+    e.catchlight = cl;
+    // the eye rebuilt
+    const R2 = e.width * 1.2, band = 6 * k;
+    for (let y = Math.max(cy0, Math.floor(icy - R2)); y < Math.min(cy1, icy + R2); y++) for (let x = Math.max(cx0, Math.floor(icx - R2)); x < Math.min(cx1, icx + R2); x++) {
+      const o = at(x, y), d = Math.hypot(x - icx, y - icy);
+      let col;
+      if (cl && Math.hypot(x - cl[0], y - cl[1]) < cl[2] * 2.2) col = irisCol;
+      else if (inPoly(poly, x, y) || edgeDist(poly, x, y) < band) col = null; // the photo, and a band round the lids
+      else if (d < ir) {
+        const my = Math.round(2 * icy - y);
+        col = inCrop(x, my) && inPoly(poly, x, my) ? [src[at(x, my)], src[at(x, my) + 1], src[at(x, my) + 2]] : irisCol;
+      } else {
+        const f = Math.min(1, (d - ir) / (e.width * 0.9));
+        col = sclera.map((v) => v * (1 - 0.35 * f));
+      }
+      if (col) { D[o] = col[0]; D[o + 1] = col[1]; D[o + 2] = col[2]; }
+    }
+  }
+  g.putImageData(img, 0, 0);
+  meta.eyeCrop = [cx0, cy0, ew, eh];
+  return c;
+}
+
+/** The skin tone a drawn closed lid takes, per eye: the median of the
+ *  skin 6–22 px (at the butler's scale) under the lower lid. The open
+ *  upper lid is folded into the socket's shadow; a closed lid faces the
+ *  light like the skin under the eye (the butler's closed portrait: lids
+ *  about 135,119,115, the skin under the eyes about 125,100,100, the band
+ *  above the open lids about 52,34,37). */
+function lidTones(photo, meta) {
+  const g = photo.getContext('2d', { willReadFrequently: true });
+  for (const e of meta.eyes) {
+    const k = e.width / 130, xs = e.outline.map((p) => p[0]);
+    const x0 = Math.floor(Math.min(...xs)), x1 = Math.ceil(Math.max(...xs));
+    const y0 = Math.floor(e.center[1]), y1 = Math.min(photo.height, Math.ceil(Math.max(...e.outline.map((p) => p[1])) + 24 * k));
+    const w = Math.max(1, x1 - x0), data = g.getImageData(x0, y0, w, Math.max(1, y1 - y0)).data;
+    const ch = [[], [], []];
+    for (let x = x0 + Math.round(0.15 * (x1 - x0)); x < x1 - 0.15 * (x1 - x0); x++) {
+      // the lower lid's edge in this column
+      let bottom = null;
+      for (let y = y1 - 1; y >= y0; y--) if (inPoly(e.outline, x + 0.5, y + 0.5)) { bottom = y; break; }
+      if (bottom === null) continue;
+      for (let y = Math.round(bottom + 6 * k); y <= bottom + 22 * k && y < y1; y++) {
+        const o = ((y - y0) * w + (x - x0)) * 4;
+        for (let q = 0; q < 3; q++) ch[q].push(data[o + q]);
+      }
+    }
+    e.lid = ch.map((v) => Math.round(median(v) ?? 150));
+  }
+}
+
+/** Where the eyes-closed portrait blends in: a quarter-size mask, red for
+ *  the image-left eye and green for the other, soft at the edge. */
+function eyeMask(W, H, meta) {
+  const S = 4, mw = Math.round(W / S), mh = Math.round(H / S);
+  const r = new Float32Array(mw * mh), gr = new Float32Array(mw * mh);
+  meta.eyes.forEach((e, k) => {
+    const into = k === 0 ? r : gr;
+    const cx = e.center[0] / S, cy = (e.center[1] - e.width * 0.12) / S, ax = (e.width * 0.78) / S, ay = (e.width * 0.5) / S;
+    for (let y = Math.max(0, Math.floor(cy - ay - 1)); y <= Math.min(mh - 1, cy + ay + 1); y++) for (let x = Math.max(0, Math.floor(cx - ax - 1)); x <= Math.min(mw - 1, cx + ax + 1); x++) {
+      if (((x + 0.5 - cx) / ax) ** 2 + ((y + 0.5 - cy) / ay) ** 2 <= 1) into[y * mw + x] = 1;
+    }
+  });
+  // soften: three box blurs each way (about a Gaussian of the prototype's width)
+  const rad = Math.max(1, Math.round((meta.eyes[0].width * 0.12) / S / 1.7));
+  const blur = (a) => {
+    const tmp = new Float32Array(a.length), n = 2 * rad + 1;
+    for (let pass = 0; pass < 3; pass++) {
+      for (let y = 0; y < mh; y++) for (let x = 0; x < mw; x++) {
+        let s = 0;
+        for (let d = -rad; d <= rad; d++) s += a[y * mw + Math.min(mw - 1, Math.max(0, x + d))];
+        tmp[y * mw + x] = s / n;
+      }
+      for (let y = 0; y < mh; y++) for (let x = 0; x < mw; x++) {
+        let s = 0;
+        for (let d = -rad; d <= rad; d++) s += tmp[Math.min(mh - 1, Math.max(0, y + d)) * mw + x];
+        a[y * mw + x] = s / n;
+      }
+    }
+  };
+  blur(r); blur(gr);
+  const c = document.createElement('canvas');
+  c.width = mw; c.height = mh;
+  const g = c.getContext('2d');
+  const img = g.createImageData(mw, mh);
+  for (let i = 0; i < mw * mh; i++) { img.data[i * 4] = Math.round(255 * r[i]); img.data[i * 4 + 1] = Math.round(255 * gr[i]); img.data[i * 4 + 3] = 255; }
+  g.putImageData(img, 0, 0);
+  return c;
+}
+
+const toBlob = (c) => new Promise((ok, no) => c.toBlob((b) => (b ? ok(b) : no(new Error("the image couldn't be written"))), 'image/png'));
+const scores = (res) => Object.fromEntries((res.faceBlendshapes?.[0]?.categories || []).filter((c) => c.score >= 0.1).map((c) => [c.categoryName, +c.score.toFixed(2)]));
+
+/**
+ * Fits a portrait: the pack's head (head.bin), eye texture (eyes.png) and
+ * blink mask (eyemask.png). closedPhoto, the same portrait with the eyes
+ * closed, is checked against it. Rejects with an Error whose message is a
+ * plain line for the owner and whose `code` names the check.
+ * options.assets: where the fit files are (default /desk/assets/).
+ */
+export async function fit(photo, closedPhoto, options = {}) {
+  const assets = options.assets || ASSETS;
+  const t0 = performance.now();
+  const [still, closed] = await Promise.all([loadImage(photo), closedPhoto ? loadImage(closedPhoto) : null]);
+  let lmk, baseBuf;
+  try {
+    [lmk, baseBuf] = await Promise.all([
+      landmarker(assets),
+      fetch(assets + 'base-head.bin').then((r) => { if (!r.ok) throw new Error('base-head.bin ' + r.status); return r.arrayBuffer(); }),
+    ]);
+  } catch (e) {
+    throw Object.assign(new Error(NO_START), { code: 'assets', cause: e });
+  }
+  const base = readHead(baseBuf);
+  if (base.meta.kind !== 'base') throw Object.assign(new Error(NO_START), { code: 'assets' });
+  const W = still.width, H = still.height;
+  const res = lmk.detect(still);
+  const bad = checkPhoto(res);
+  if (bad) throw fitError(bad);
+  let closedShiftPx = null;
+  if (closed) {
+    const resC = closed.width === W && closed.height === H ? lmk.detect(closed) : { faceLandmarks: [] };
+    const badC = checkClosed(res, resC, W, H, closed.width, closed.height);
+    if (badC) throw fitError(badC);
+    closedShiftPx = closedShift(res.faceLandmarks[0], resC.faceLandmarks[0], W, H);
+  }
+  const L = res.faceLandmarks[0];
+  const P = L.map((p) => [p.x * W, -p.y * H, -p.z * W]);
+  const g = fitGeometry(base, P, W, H);
+  const eyesCanvas = eyeTexture(still, g.meta);
+  lidTones(still, g.meta);
+  const maskCanvas = eyeMask(W, H, g.meta);
+  g.meta.photo = { expression: scores(res), turned: +turnedBy(res.facialTransformationMatrixes?.[0]).toFixed(1) };
+  const head = packHead(g.meta, g.arrays);
+  const [eyes, eyemask] = await Promise.all([toBlob(eyesCanvas), toBlob(maskCanvas)]);
+  const report = {
+    ...g.report, image: [W, H], turned: g.meta.photo.turned, expression: g.meta.photo.expression, closedShift: closedShiftPx,
+    catchlights: g.meta.eyes.map((e) => e.catchlight), lids: g.meta.eyes.map((e) => e.lid), eyeCrop: g.meta.eyeCrop,
+    bytes: head.byteLength, ms: Math.round(performance.now() - t0),
+  };
+  return { head, eyes, eyemask, report };
 }

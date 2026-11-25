@@ -218,6 +218,18 @@ check('photo_checks_say_what_to_change', () => {
   eq(m.code, 'mouth-open'); eq(m.message, 'Use a photo facing the camera with the mouth closed.');
 });
 
+check('facing_the_camera_means_facing_where_the_camera_is', () => {
+  // a face above the frame's centre (y 3.2 at 31 away) that looks at the
+  // camera is pitched about 5.9° against the camera's axis, and faces it
+  const a = Math.atan2(3.2, 31);
+  const at = { data: [1, 0, 0, 0, 0, Math.cos(a), Math.sin(a), 0, 0, -Math.sin(a), Math.cos(a), 0, 0, 3.2, -31, 1] };
+  near(fit.turnedBy(at), 0, 0.01, 'looking at the camera');
+  // the same face pitched 8° more is turned 8°
+  const b = a + (8 * Math.PI) / 180;
+  near(fit.turnedBy({ data: [1, 0, 0, 0, 0, Math.cos(b), Math.sin(b), 0, 0, -Math.sin(b), Math.cos(b), 0, 0, 3.2, -31, 1] }), 8, 0.01, 'pitched');
+  near(fit.turnedBy(turned(6)), 6, 0.01, 'yaw at the centre');
+});
+
 check('a_closed_photo_must_line_up_with_the_still', () => {
   const open = result(), closed = result({ blink: 0.9 });
   eq(fit.checkClosed(open, closed, 1000, 800, 1000, 800), null);
