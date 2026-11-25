@@ -4014,7 +4014,9 @@ own it: closing the window or quitting the app leaves harness running.
 
 **Install.** Download `harness-desk-VERSION-macos.zip` from the release,
 open it, and move `harness-desk.app` to Applications (it shows as "harness"
-in the Dock). One bundle runs on Apple Silicon and Intel Macs.
+in the Dock). One bundle runs on Apple Silicon and Intel Macs. It carries
+harness itself (`Contents/MacOS/harness`) and the fit files
+(`Contents/Resources/desk-assets/`): nothing else to install.
 
 **The first run.** The app is signed ad hoc, not with an Apple developer
 account, so macOS stops it the first time ("harness" can't be opened).
@@ -4027,12 +4029,39 @@ time you talk to the desk, macOS asks to let harness use the microphone.
 your data folder. Opened from the Dock or Launchpad it uses the default
 one (`~/.local/share/harness`, or `$XDG_DATA_HOME/harness`). It reads
 `state/desk.json`, which harness writes at each start, for harness's port
-and program:
+and program; when there is none, or the program it names is gone, it uses
+its own copy of harness:
 
-- before harness has ever run: "Set up harness first: run `harness init`.";
-- while nothing answers on that port: "harness isn't running", with
+- no `config.ini` in the data folder: "Set up" (below);
+- while nothing answers on harness's port: "harness isn't running", with
   [Start harness];
 - then "Connecting…", and the desk.
+
+**Set up.** Provider (Anthropic, OpenAI, OpenRouter, opencode, omnigate,
+or Other: an address that speaks OpenAI's or Anthropic's format), Model
+(filled in with the one harness's docs use for that provider; none for
+opencode and Other), Address (omnigate and Other only) and, for Other,
+Format. [Continue] first asks for the key, in a field of the app's own (not
+the page); Cancel there changes nothing. Then it runs, with the data
+folder:
+
+1. `harness init` (only when there is no `config.ini` yet);
+2. `harness config set` with every setting in one call: `[model] provider`
+   and `model`, omnigate's `url`, or a `[provider other]` section's `api`
+   and `url`; `memory_model` and `worker_model` too when the provider is
+   new;
+3. `harness secret add NAME --stdin`, the key on its input: harness keeps
+   it in this computer's key store, and the app keeps no copy;
+4. `harness run`, and the desk.
+
+For Other the key may be left empty (a server that takes none): its
+section gets `auth = none` and nothing is stored. A step that fails shows
+its own line and what was typed stays; [Continue] runs the steps again
+(not `harness init` once it has run) and asks for the key again. A first
+setup that stopped after `harness init` is marked by
+`state/setup-unfinished`, so the next start shows "Set up" again. Telegram
+stays optional and is set up in Terminal (`harness secret add telegram`,
+`harness pair`).
 
 It checks every 5 seconds, so a harness started in Terminal is found on
 its own.
@@ -4057,11 +4086,13 @@ badge; click the Dock icon to bring the window back.
 | Start harness | runs `harness run` in the background; it keeps running after you quit the app |
 | Stop harness | runs `harness stop`: harness exits cleanly on its next tick |
 | Open at login | runs `harness autostart on` or `off`; checked when harness starts at login (the app itself doesn't) |
+| Provider and key… | the Set up screen with the values in use (`harness config get`); the key is asked for again only when you tick Replace the key or pick a provider whose key is stored under another name. While harness runs, it shows `harness config set`'s own line ("send /reload to use it") and goes back to the desk; you send `/reload` in the chat |
 | Reload (⌘R) | loads the desk again |
 | Quit harness (⌘Q) | quits the app; harness keeps running |
 
-The commands run the program `state/desk.json` names, with `--home` set to
-the data folder and the PATH harness itself started with.
+The commands run the program `state/desk.json` names (else the app's own
+copy), with `--home` set to the data folder and the PATH harness itself
+started with.
 
 **Building it.** It's built apart from harness, in `desk-app/`, with Xcode's
 command line tools, since it links Cocoa and WebKit and harness links
@@ -4070,8 +4101,20 @@ nothing:
 ```
 zig build                     # zig-out/harness-desk.app, for this Mac
 zig build test --summary all  # unit tests
-zig build smoke               # the app in a window against a stand-in harness (test/fake_harness.py)
-scripts/package-macos.sh 0.3.0 harness-desk-0.3.0-macos.zip   # both kinds of Mac, signed ad hoc
+zig build smoke               # the app in a window against a stand-in harness (test/fake_harness.py);
+                              # DESK_SMOKE_HARNESS=PATH sets up a real harness once more
+scripts/package-macos.sh 0.3.0 harness-desk-0.3.0-macos.zip   # both kinds of Mac, with harness and the fit files, signed ad hoc
+```
+
+The package needs the fit files: `harness/scripts/pack-desk-assets.sh`
+fetches MediaPipe's at their pinned hashes and takes the base head from
+the repository, and a missing file stops it with one line.
+`DESK_ASSETS=DIR` uses a desk-assets folder made already;
+`DESK_ASSETS=none` leaves them out and says so (CI does, without the
+network):
+
+```
+DESK_ASSETS=none scripts/package-macos.sh 0.0.0 test.zip
 ```
 
 ## Build

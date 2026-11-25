@@ -5,6 +5,130 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: the app sets harness up; the shared part is ready (2026-11-25, night)
+
+Branch `platform/desk-app-setup` (plan
+`docs/superpowers/plans/2026-11-25-desk-app-setup.md`). The macOS app now
+carries harness and sets it up on its own "Set up" screen, as the spec's
+"The app carries harness and sets it up" says. Everything but the window
+and the secure field is shared Zig in `harness/desk-app/src/`, tested on
+all three systems by `desk-app-shared`.
+
+**The shared interface (what your window code drives):**
+
+- `setup.zig`: the providers (`entries`: Anthropic, OpenAI, OpenRouter,
+  opencode, omnigate, Other, with harness's names and the usual model),
+  `Form`, `problem(form)` (the line under the form), the command line of
+  each step (`initArgv`, `configArgv`, `secretArgv`, `readArgv`), the
+  settings "Provider and key…" reads (`readKeys`, `inUse`), `keyName`, and
+  `beside(exe_dir, windows)`: where the bundled harness sits;
+  `keyOptional` (Other may take no key: `auth = none`) and `trimKey`.
+- `pages.zig`: `html(a, screen, note, home, view)`. The Set up screen is a
+  built-in page like "harness isn't running": the same HTML on every
+  system. It posts `{"setup": {provider, model, url, api, replace}}` and
+  `{"cancel": true}` through the bridge (its script already tries
+  `window.chrome.webview.postMessage`). It never asks for the key.
+  Under Address it shows one line while the address starts `http://` and
+  isn't this computer (`setup.plainRemote`; the page's script holds the
+  same rule): "http:// is not encrypted: what goes to this address, the
+  key included, can be read on the network." Nothing for you to draw.
+- `bridge.zig`: parses those two messages (only from the built-in page;
+  a `key` field anywhere is dropped). It now copies the form's strings
+  into the allocator you pass: give it an arena per message.
+- `controller.zig`:
+  - `Controller.init(gpa, home, own)`, `own` being harness beside your
+    program ("" when it isn't there). desk.json's binary wins when the file
+    exists (your check job blanks it when it doesn't).
+  - `CheckResult.no_config` (checked before desk.json): no config.ini, so
+    the Set up screen. No desk.json is now "harness isn't running", and
+    Start runs your own copy.
+  - New events: `stepped`, `read`, `key` (`given`, `empty`, `cancelled`),
+    `stored`, and `menu = .provider` ("Provider and key…").
+  - The order: [Continue] asks for the key first (`ask_key`), and nothing
+    runs until it is given, so a cancel changes nothing. Then `init`
+    (unless config.ini is there), `config set`, and `store_key`. Hold the
+    key from `key = .given` while `holdsKey()` is true; drop and zero it
+    as soon as it isn't (main.zig checks after every event).
+  - New effects: `step` (run argv to its end; answer `stepped` with its
+    error line and the first line it printed), `read_config` (run `config
+    get` for `model.provider`, then `readKeys`; answer `read`), `ask_key`
+    (show the secure field), `store_key` (pipe the key you hold to argv;
+    answer `stored`), and `mark` (write or remove
+    `state/setup-unfinished`; while it is there your check answers
+    `no_config`, so a first setup that stopped half way is offered again).
+  - `show` carries `view` for the setup page; `Menu.provider` enables the
+    menu item.
+- `commands.zig`: `runWithStdin(io, a, argv, env, input)` writes `input`,
+  closes the pipe, and collects the output. It keeps no copy.
+
+`main.zig` (the macOS entry) has `StepJob` and `ReadJob`: no AppKit in
+them, but they call its `post` (onto the main thread), `dispatch`, `log`
+and the `app` global, which your entry supplies in its own way.
+
+**What your native side supplies:**
+
+- **The secure field:** a modal dialog owned by the window. Windows: an
+  edit control with `ES_PASSWORD`. Linux: a `GtkEntry` with visibility
+  off. The `ask_key` title is above it, and the note under it, inline:
+  "harness keeps it in this computer's key store." Buttons: Save and
+  Cancel.
+- **The answer:**
+  1. Copy the bytes out of the control into a buffer of your own, and
+     empty the control (`SetWindowTextW(…, L"")`, `gtk_entry_set_text(…,
+     "")`).
+  2. Hand Zig the bytes and their length, or -1 on Cancel (macOS:
+     `hdesk_on_key`). Zig trims spaces and line ends around them, copies
+     them, pipes them to `harness secret add NAME --stdin` once `init` and
+     `config set` have run, and zeroes its copy when that command ends (or
+     at once when a step fails).
+  3. Zero yours (`SecureZeroMemory`, `explicit_bzero`).
+
+  Never log it, and never put it in an argv or an environment variable.
+  The test hooks don't carry it either: `key fill` types the test build's
+  own fake key (`sk-test-not-a-key`, compiled in with test hooks only)
+  into the real field and presses Save; `key cancel` presses Cancel.
+- **The menu item** "Provider and key…" (`MenuItem.provider`), enabled by
+  `Menu.provider`.
+- **The bundle:** `harness.exe` and `desk-assets\` beside
+  `harness-desk.exe`; Linux: `harness` and `desk-assets/` beside
+  `harness-desk`. harness serves `/desk/assets/` from `desk-assets/` beside
+  its own binary, so the one folder serves both. `setup.beside()` gives
+  the path the app looks for.
+- **The stand-in:** `test/fake_harness.py` now does `init`, `config
+  set/get` and `secret add --stdin` (its store is `HOME/fake-store/`). The
+  macOS smoke installs it as the app's own harness and walks the setup.
+  `DESK_SMOKE_HARNESS=PATH` walks it again against a real harness, with
+  `HARNESS_STORE` and `HERMES_HOME` in the smoke's temp folder and a
+  provider on a dead local address.
+
+**Calls made here that your apps follow** (spec, "Calls I made", marked
+as the builder's):
+
+- The form opens on Anthropic, with `claude-opus-4-8`. The usual models
+  are `setup.entries`.
+- Other is written as `[provider other]`; a provider of one's own already
+  in use keeps its section's name.
+- `memory_model` and `worker_model` follow the model only at the first
+  setup and when the provider changes.
+- A change while harness runs shows `harness config set`'s own line ("send
+  /reload to use it.") in an alert, and goes back to the desk. It doesn't
+  restart harness. Not running: the app starts it.
+- The key is asked for before any command runs; for Other it may be left
+  empty (`auth = none`).
+
+**Please check on Windows** (only Windows can):
+
+1. `[chat] utc_offset = auto` reads `GetTimeZoneInformation` right in a
+   zone with daylight saving, in summer and in winter (fake the clock or
+   the zone): the desk's times and a brief's time.
+2. `harness config get chat.utc_offset` prints `auto`.
+3. A zone that can't be read falls back to UTC, and harness says so once
+   at start.
+4. `harness config set` with several pairs in one call, a named section
+   among them (`harness config set "provider other.api" openai "provider
+   other.url" http://127.0.0.1:9/v1 model.provider other`), then
+   `harness config get "provider other.url"`.
+
 ## For you: first run changes your apps (2026-11-25, evening)
 
 The owner asked how far the desk is from a proper working app, and to
@@ -130,7 +254,7 @@ against the spec and adjust.
 | `platform/desk-base-head` | a base head made from ICT-FaceKit (MIT), replacing the Face Cap one | building |
 | `platform/desk-alone` | `harness run` without Telegram, `harness config set`, `utc_offset = auto` | building |
 | `platform/desk-fit-files` | the fit files in the release archives and served from beside the binary; the no-avatar stage | building |
-| (next) | the macOS app carries harness and sets it up | after the two above |
+| `platform/desk-app-setup` | the macOS app carries harness and sets it up (one download, the Set up screen, the key in a native field) | built; see "the app sets harness up" above |
 
 ### The desk app's code is yours to extend
 

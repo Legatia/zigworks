@@ -112,7 +112,9 @@ fn addApp(b: *std.Build, o: AppOptions) *std.Build.Step {
         mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
         mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
     }
-    mod.addCSourceFile(.{ .file = b.path("src/mac/desk.m"), .flags = &.{ "-fobjc-arc", "-Wall", "-Werror" } });
+    // the test hooks' fake key is compiled into the smoke's app only
+    const flags: []const []const u8 = if (o.test_hooks) &.{ "-fobjc-arc", "-Wall", "-Werror", "-DHDESK_TEST_HOOKS=1" } else &.{ "-fobjc-arc", "-Wall", "-Werror" };
+    mod.addCSourceFile(.{ .file = b.path("src/mac/desk.m"), .flags = flags });
     for ([_][]const u8{ "Foundation", "AppKit", "WebKit" }) |f| mod.linkFramework(f, .{});
     mod.linkSystemLibrary("objc", .{});
     const options = b.addOptions();

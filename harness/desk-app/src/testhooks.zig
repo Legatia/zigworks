@@ -12,8 +12,13 @@ pub const Command = union(enum) {
     /// Set the window's frame: x, y (from the bottom left), width, height.
     frame: [4]f64,
     log_frame,
+    /// The key sheet: filled with the test build's fake key and saved, or
+    /// cancelled.
+    key: KeyAction,
     quit,
 };
+
+pub const KeyAction = enum { fill, cancel };
 
 pub fn parseCommand(raw: []const u8) ?Command {
     const line = std.mem.trimEnd(u8, raw, "\r\n");
@@ -29,6 +34,7 @@ pub fn parseCommand(raw: []const u8) ?Command {
         if (it.next() != null) return null;
         return .{ .frame = f };
     }
+    if (std.mem.eql(u8, word, "key")) return .{ .key = std.meta.stringToEnum(KeyAction, rest) orelse return null };
     if (std.mem.eql(u8, line, "log-frame")) return .log_frame;
     if (std.mem.eql(u8, line, "quit")) return .quit;
     return null;
@@ -92,4 +98,14 @@ test "commands_parse" {
     for ([_][]const u8{ "", "menu", "menu nope", "frame 1 2 3", "frame a b c d", "js", "dance" }) |line| {
         try t.expect(parseCommand(line) == null);
     }
+}
+
+test "key_commands_parse" {
+    // the sheet is filled with the build's own fake key, never one from the
+    // command file
+    try t.expectEqual(KeyAction.fill, parseCommand("key fill").?.key);
+    try t.expectEqual(KeyAction.cancel, parseCommand("key cancel").?.key);
+    try t.expect(parseCommand("key sk-test-not-a-key") == null);
+    try t.expect(parseCommand("key") == null);
+    try t.expectEqual(MenuItem.provider, parseCommand("menu provider").?.menu);
 }
