@@ -400,3 +400,19 @@ void hdesk_set_window_frame(double x, double y, double w, double h) {
     [desk.window setFrame:NSMakeRect(x, y, w, h) display:YES];
     [desk.window saveFrameUsingName:@"harness"];
 }
+
+void hdesk_screen_frame(double *x, double *y, double *w, double *h) {
+    NSScreen *screen = desk.window.screen ?: [NSScreen mainScreen];
+    NSRect f = screen.visibleFrame;
+    *x = f.origin.x;
+    *y = f.origin.y;
+    *w = f.size.width;
+    *h = f.size.height;
+}
+
+void hdesk_min_frame(double *w, double *h) {
+    NSRect content = NSMakeRect(0, 0, desk.window.contentMinSize.width, desk.window.contentMinSize.height);
+    NSRect f = [desk.window frameRectForContentRect:content];
+    *w = f.size.width;
+    *h = f.size.height;
+}
