@@ -9,8 +9,11 @@ Dev tools for the desk's avatar. Not shipped; harness doesn't use them.
       127.0.0.1 only. The desk's URL layout over this tree and DATA:
       /desk/static/ (src/desk/), /desk/avatars/ (DATA/avatars/),
       /desk/assets/ (DATA/desk-assets/), /tools/; POST /save/PATH writes
-      DATA/PATH. Every response carries the desk's CSP; violations are
-      logged to DATA/csp-reports.log.
+      DATA/PATH under avatars/, desk-assets/ or debug/. It prints a token
+      for the run: pages that save are opened with #token=TOKEN and send
+      it as X-Dev-Token (another page in the browser can't), and requests
+      must name 127.0.0.1:PORT or localhost:PORT. Every response carries
+      the desk's CSP; violations are logged to DATA/csp-reports.log.
 
   headless.mjs URL [--wait EXPR] [--eval EXPR] [--shot FILE]
       Headless Chrome (SwiftShader) over the DevTools protocol: opens URL,

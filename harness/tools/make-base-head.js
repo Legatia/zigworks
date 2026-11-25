@@ -15,7 +15,9 @@ const logEl = document.getElementById('log');
 const log = (m) => { logEl.textContent += m + '\n'; console.log('[base] ' + m); };
 const fail = (m) => { log('ERROR ' + m); window.__done = { error: String(m) }; throw new Error(m); };
 window.onunhandledrejection = (e) => fail(e.reason && (e.reason.stack || e.reason));
-const save = async (path, body) => { const r = await fetch('/save/' + path, { method: 'POST', body }); if (!r.ok) fail('save ' + path + ' ' + r.status); log('saved ' + path); };
+// the dev server's token for this run, from the URL's #token=...
+const devToken = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+const save = async (path, body) => { const r = await fetch('/save/' + path, { method: 'POST', body, headers: { 'X-Dev-Token': devToken } }); if (!r.ok) fail('save ' + path + ' ' + r.status); log('saved ' + path); };
 const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 
 // ---------- the model, checked ----------
@@ -68,13 +70,16 @@ const res = landmarker.detect(rcan);
 if (!res.faceLandmarks.length) fail('no face found on the model render');
 const Q = res.faceLandmarks[0];
 log('landmarks on the render: ' + Q.length);
+// the eyeballs count as surface: the head mesh has holes at the eyes, and a
+// lid's landmark that falls through one lands inside the back of the skull
+const surface = [head, M.eyeLeft, M.eyeRight].filter(Boolean);
 const ray = new THREE.Raycaster();
 const lm = new Float32Array(478 * 3).fill(NaN);
 let hits = 0, hits468 = 0;
 for (let i = 0; i < 478; i++) {
   const wx = c.x - half + Q[i].x * 2 * half, wy = c.y + half - Q[i].y * 2 * half;
   ray.set(new THREE.Vector3(wx, wy, camZ), new THREE.Vector3(0, 0, -1));
-  const h = ray.intersectObject(head, false)[0];
+  const h = ray.intersectObjects(surface, false)[0];
   if (!h) continue;
   lm.set([h.point.x, h.point.y, h.point.z], i * 3);
   hits++; if (i < 468) hits468++;

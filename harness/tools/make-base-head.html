@@ -5,7 +5,8 @@
      three's loaders come from jsDelivr (pinned at 0.170.0), so run the dev
      server with --no-csp for this page:
        python3 -I tools/devserver.py 8731 DATA --no-csp
-       node tools/headless.mjs http://127.0.0.1:8731/tools/make-base-head.html --wait window.__done -->
+       node tools/headless.mjs 'http://127.0.0.1:8731/tools/make-base-head.html#token=TOKEN' --wait window.__done
+     (TOKEN: the one the dev server printed; saving needs it) -->
 <style>body { margin: 0; background: #111; color: #ddd; font: 12px ui-monospace, monospace } canvas { max-width: 48vw; margin: 4px }</style>
 <pre id="log"></pre>
 <div id="pics"></div>

@@ -6,7 +6,9 @@ const q = new URLSearchParams(location.search);
 const logEl = document.getElementById('log');
 const log = (m) => { logEl.textContent += m + '\n'; console.log('[fit] ' + m); };
 const show = (blob) => { const i = new Image(); i.src = URL.createObjectURL(blob); document.getElementById('pics').appendChild(i); };
-const save = async (path, body) => { const r = await fetch('/save/' + path, { method: 'POST', body }); if (!r.ok) throw new Error('save ' + path + ' ' + r.status); log('saved ' + path); };
+// the dev server's token for this run, from the URL's #token=...
+const devToken = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+const save = async (path, body) => { const r = await fetch('/save/' + path, { method: 'POST', body, headers: { 'X-Dev-Token': devToken } }); if (!r.ok) throw new Error('save ' + path + ' ' + r.status); log('saved ' + path); };
 
 try {
   const pack = q.get('pack');
