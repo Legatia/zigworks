@@ -1066,10 +1066,14 @@ printf 'outside' >"$FA/MacOS/outside.txt"
 HARNESS_HOME="$FH" "$HB" run >"$T/frun.out" 2>&1 &
 RPID=$!
 wait_for "$T/frun.out" "running on" 15
-# (Git Bash turns an argument that starts with / into a Windows path: right for the folder, wrong for these)
-MSYS2_ARG_CONV_EXCL="/desk" "$F" --desk-get "$FH" /desk/assets/a.txt /desk/assets/b.txt /desk/assets/c.txt /desk/assets/mediapipe/d.txt /desk/assets/../outside.txt /desk/assets/%2e%2e/outside.txt /desk/assets/mediapipe/../../outside.txt /desk/assets/link.txt /desk/assets/none.txt >"$T/fit1.out" 2>&1
+# (Git's sh on Windows rewrites an argument that starts with / into a
+# Windows path, unless told not to; told not to, it leaves the data
+# folder's path alone too, so that one is rewritten here)
+FHN="$FH"
+[ $windows = 1 ] && FHN=$(cygpath -m "$FH" 2>/dev/null || (cd "$FH" && pwd -W))
+MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$F" --desk-get "$FHN" /desk/assets/a.txt /desk/assets/b.txt /desk/assets/c.txt /desk/assets/mediapipe/d.txt /desk/assets/../outside.txt /desk/assets/%2e%2e/outside.txt /desk/assets/mediapipe/../../outside.txt /desk/assets/link.txt /desk/assets/none.txt >"$T/fit1.out" 2>&1
 rm "$FH/desk-assets/a.txt"
-MSYS2_ARG_CONV_EXCL="/desk" "$F" --desk-get "$FH" /desk/assets/a.txt >"$T/fit2.out" 2>&1
+MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$F" --desk-get "$FHN" /desk/assets/a.txt >"$T/fit2.out" 2>&1
 check "the fit files come from the data folder first, then beside the binary, then the app bundle" 'grep -qxF "/desk/assets/a.txt 200 data" "$T/fit1.out" && grep -qxF "/desk/assets/b.txt 200 beside" "$T/fit1.out" && grep -qxF "/desk/assets/c.txt 200 bundle" "$T/fit1.out" && grep -qxF "/desk/assets/mediapipe/d.txt 200 bundle wasm" "$T/fit1.out" && grep -qxF "/desk/assets/none.txt 404 No such file." "$T/fit1.out"'
 check "a fit file gone from the data folder is served from beside the binary" 'grep -qxF "/desk/assets/a.txt 200 beside" "$T/fit2.out"'
 check "no path leaves the fit files' folders, and a link there isn't followed" 'grep -qxF "/desk/assets/../outside.txt 404 No such file." "$T/fit1.out" && grep -qxF "/desk/assets/%2e%2e/outside.txt 404 No such file." "$T/fit1.out" && grep -qxF "/desk/assets/mediapipe/../../outside.txt 404 No such file." "$T/fit1.out" && { [ $windows = 1 ] || grep -qxF "/desk/assets/link.txt 404 No such file." "$T/fit1.out"; } && ! grep -qE " 200 (outside|\[model\])" "$T/fit1.out"'

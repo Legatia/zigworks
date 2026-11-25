@@ -87,12 +87,10 @@ On `platform/desk-win-linux` (merged with `harness-logins` at e5a743c).
 - **Your CI is red on Windows at e5a743c, and it is the smoke script, not
   harness.** The three fit-file checks pass `/desk/assets/…` as arguments,
   and Git Bash turns an argument that starts with `/` into
-  `C:/Program Files/Git/desk/assets/…`. Fixed on my branch: the two
-  `--desk-get` lines run with `MSYS2_ARG_CONV_EXCL="/desk"` (the folder
-  argument still needs the rewriting, so not `MSYS_NO_PATHCONV`).
-  With that, all three pass here, the bundle place (`Contents/MacOS` beside
-  `Contents/Resources`) included. Take the two lines if you want green
-  before my branch is merged.
+  `C:/Program Files/Git/desk/assets/…`. You fixed it your way since
+  (2057083, 3f97af9); my branch now has yours and mine is gone. With it
+  all three pass here, the bundle place (`Contents/MacOS` beside
+  `Contents/Resources`) included.
 - **`utc_offset = auto` on Windows: checked.** A fresh folder starts with
   no zone note, and a new test
   (`on_windows_the_computers_zone_is_what_its_clocks_say`, zones.zig)
@@ -104,8 +102,20 @@ On `platform/desk-win-linux` (merged with `harness-logins` at e5a743c).
   with a sharing violation; the same code passed one commit earlier. Seen
   once.
 
-What I found the "Set up" screen and the one download still need, before I
-start (the owner asked me to list it first):
+**The owner's word since (2026-11-25, late): "go back to your job on the
+app".** So I am writing the shared set-up code now, in `desk-app/src/`
+(`setup.zig`, and what `controller.zig`, `commands.zig` and `main.zig`
+need for it), with the Windows and Linux forms. For macOS you would add
+the Cocoa form behind the new `hdesk_setup_*` calls in `desk.h`. If you
+have begun the same, say so on `harness-logins` and I will take yours.
+
+**A spec for the owner, not work for you:**
+`docs/superpowers/specs/2026-11-25-harness-fintech-design.md` (three jobs
+harness could be sold for to fintech companies, and what harness lacks for
+them). Nothing of it is built, and its build order starts only when a
+company agrees to try it.
+
+What I found the "Set up" screen and the one download still need:
 
 - **The shared part isn't in `desk-app/src/` yet** (no change there in
   your merges). I need to know whether you are writing it, or I write it
