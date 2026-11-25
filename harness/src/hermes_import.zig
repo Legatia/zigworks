@@ -771,6 +771,15 @@ const Ctx = struct {
             }
             var prov: []const u8 = "";
             var key_line: ?struct { id: []const u8, where: []const u8 } = null;
+            // harness's gemini preset is for speech only (unless Hermes has
+            // a provider of that name, mapped to a section of its own)
+            const own_section = for (mapped.items) |mp| {
+                if (std.mem.eql(u8, mp.hermes, m.provider)) break true;
+            } else false;
+            if (!own_section and model.isPreset(m.provider) and !model.chatPreset(m.provider)) {
+                try c.line(.not, "model {s}: {s}: harness uses {s} for speech only for now; set [model] in config.ini by hand", .{ m.provider, m.name, m.provider });
+                break :model;
+            }
             if (model.isPreset(m.provider) and !std.mem.eql(u8, m.provider, "omnigate")) {
                 prov = m.provider;
                 const var_name = try std.ascii.allocUpperString(c.a, try std.fmt.allocPrint(c.a, "{s}_API_KEY", .{m.provider}));
@@ -2146,6 +2155,17 @@ test "the_model_is_kept_when_harness_has_a_provider" {
     const p = try tf.plan(.{ .config_text = "[model]\nprovider = anthropic\nmodel = claude-opus\n[chat]\nutc_offset = +01:00\n" }, false);
     try t.expect(p.has(.not, "model openrouter: anthropic/claude-sonnet-4: harness has its provider set (anthropic); not changed"));
     if (p.config_ini) |c| try t.expect(contains(c, "provider = anthropic\nmodel = claude-opus\n"));
+}
+
+test "a_hermes_model_on_gemini_is_left_to_set_by_hand" {
+    var tf: Tf = undefined;
+    try tf.init(false);
+    defer tf.deinit();
+    // gemini is harness's preset for speech only: not a model's provider
+    try tf.f.put("config.yaml", "model:\n  provider: gemini\n  default: gemini-3.8-flash\n");
+    const p = try tf.plan(.{}, false);
+    try t.expect(p.has(.not, "model gemini: gemini-3.8-flash: harness uses gemini for speech only for now; set [model] in config.ini by hand"));
+    if (p.config_ini) |c| try t.expect(!contains(c, "gemini"));
 }
 
 test "telegram_is_explained_not_moved" {

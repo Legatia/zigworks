@@ -22,6 +22,15 @@
 //!   `audio/mpeg` bytes, "ID3" and the request's `input`; each request is
 //!   saved as `speech-requests/001.json`, … with its target, headers and
 //!   body.
+//! - speech (Gemini's format): `POST …/models/MODEL:generateContent`
+//!   answers one inline part of raw PCM (`audio/L16;codec=pcm;rate=24000`)
+//!   whose bytes are the request's text (a 0 added to make it even), or
+//!   `gemini/001.json`, `002.json`, … when there is one:
+//!   `{"status":N}` that error in Google's shape (`"echo_key":true`: its
+//!   message says the key), `{"mime":"audio/wav"}` the same audio as a
+//!   WAV file, `{"answer":{…}}` that answer as it is. Each request is
+//!   saved as `gemini-requests/001.json`, … with its target, headers and
+//!   body (a string).
 //! - search: `GET /res/v1/web/search?q=…` answers `search.json`.
 //! - pages and feeds: `GET /page/NAME` answers the file `pages/NAME`
 //!   (POST too; `?delay_ms=N` answers after N ms), or, when there is a
@@ -63,6 +72,8 @@ pub const Server = struct {
     /// Transcription requests seen so far.
     stt_n: std.atomic.Value(u32) = .init(0),
     tts_n: std.atomic.Value(u32) = .init(0),
+    /// Gemini-format speech requests seen so far.
+    gem_n: std.atomic.Value(u32) = .init(0),
     tg_n: std.atomic.Value(u32) = .init(0),
     /// What setMySettings set for topics: 0 nothing yet, 1 off, 2 on.
     tg_topics: std.atomic.Value(u8) = .init(0),
@@ -82,7 +93,7 @@ pub const Server = struct {
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
         s.* = .{ .io = io, .dir = try gpa.dupe(u8, dir), .listener = listener, .port = listener.port, .mcp = .{ .io = io } };
-        inline for (.{ "requests", "model", "pages", "telegram/in", "telegram/files", "transcribe", "transcribe-requests", "speech-requests" }) |sub| {
+        inline for (.{ "requests", "model", "pages", "telegram/in", "telegram/files", "transcribe", "transcribe-requests", "speech-requests", "gemini", "gemini-requests" }) |sub| {
             const p = try std.fs.path.join(gpa, &.{ dir, sub });
             defer gpa.free(p);
             try Io.Dir.cwd().createDirPath(io, p);
@@ -222,7 +233,7 @@ pub const Server = struct {
             try all.append(a, .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) });
             if (std.ascii.eqlIgnoreCase(h.name, "if-none-match")) if_none_match = try a.dupe(u8, h.value);
             if (std.ascii.eqlIgnoreCase(h.name, "if-modified-since")) if_modified_since = try a.dupe(u8, h.value);
-            if (std.ascii.eqlIgnoreCase(h.name, "x-api-key")) key = try a.dupe(u8, h.value);
+            if (std.ascii.eqlIgnoreCase(h.name, "x-api-key") or std.ascii.eqlIgnoreCase(h.name, "x-goog-api-key")) key = try a.dupe(u8, h.value);
             if (std.ascii.eqlIgnoreCase(h.name, "authorization") and std.mem.startsWith(u8, h.value, "Bearer ")) key = try a.dupe(u8, h.value["Bearer ".len..]);
         }
         var body_buf: [8192]u8 = undefined;
@@ -245,6 +256,7 @@ pub const Server = struct {
             if (std.mem.endsWith(u8, route, "/chat/completions")) return s.model(a, req, .openai, target, body, headers.items, key);
             if (std.mem.endsWith(u8, route, "/audio/transcriptions")) return s.transcribe(a, req, target, body, headers.items, key);
             if (std.mem.endsWith(u8, route, "/audio/speech")) return s.speech(a, req, target, body, headers.items);
+            if (std.mem.endsWith(u8, route, ":generateContent")) return s.gemini(a, req, target, body, headers.items, key);
         }
         if (method == .GET and std.mem.eql(u8, route, "/res/v1/web/search")) {
             const text = s.readScript(a, &.{"search.json"}) orelse "{\"web\":{\"results\":[]}}";
@@ -424,6 +436,43 @@ pub const Server = struct {
         try s.writeRecord(a, try s.path(a, &.{ "speech-requests", name }), saved);
         const input = jv.str(jv.get(jv.parse(a, body), "input")) orelse return json(req, .bad_request, try errorBody(a, .openai, 400, "no input"));
         try req.respond(try std.fmt.allocPrint(a, "ID3{s}", .{input}), .{ .extra_headers = &.{.{ .name = "content-type", .value = "audio/mpeg" }} });
+    }
+
+    /// `…/models/MODEL:generateContent`: the request's text as raw PCM, or
+    /// `gemini/NNN.json` (see the top of the file); the request kept as
+    /// `gemini-requests/NNN.json`.
+    fn gemini(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, target: []const u8, body: []const u8, headers: []const u8, key: []const u8) !void {
+        const n = s.gem_n.fetchAdd(1, .acq_rel) + 1;
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "{d:0>3}.json", .{n});
+        const saved = try std.fmt.allocPrint(a, "{{\"target\":{f},\"headers\":{{{s}\"\":\"\"}},\"body\":{f}}}", .{ std.json.fmt(target, .{}), headers, std.json.fmt(body, .{}) });
+        try s.writeRecord(a, try s.path(a, &.{ "gemini-requests", name }), saved);
+        const v: ?jv.Value = if (s.readScript(a, &.{ "gemini", name })) |x| jv.parse(a, x) else null;
+        if (jv.int(jv.get(v, "status"))) |st| {
+            const echo = jv.boolean(jv.get(v, "echo_key")) orelse false;
+            const msg = if (echo) try std.fmt.allocPrint(a, "scripted error for key {s}", .{key}) else "scripted error";
+            return json(req, @fromBackingInt(@as(u10, @intCast(st))), try std.fmt.allocPrint(a, "{{\"error\":{{\"code\":{d},\"message\":{f},\"status\":\"SCRIPTED\"}}}}", .{ st, std.json.fmt(msg, .{}) }));
+        }
+        if (jv.get(v, "answer")) |ans| return json(req, .ok, try std.json.Stringify.valueAlloc(a, ans, .{}));
+        const text = jv.str(jv.at(jv.parse(a, body), &.{ "contents", "0", "parts", "0", "text" })) orelse
+            return json(req, .bad_request, "{\"error\":{\"code\":400,\"message\":\"no text\",\"status\":\"INVALID_ARGUMENT\"}}");
+        var pcm: std.ArrayList(u8) = .empty;
+        try pcm.appendSlice(a, text);
+        if (pcm.items.len % 2 == 1) try pcm.append(a, 0);
+        const as_wav = std.mem.eql(u8, jv.str(jv.get(v, "mime")) orelse "", "audio/wav");
+        var audio: std.ArrayList(u8) = .empty;
+        if (as_wav) {
+            // RIFF, mono, 16-bit, 24 kHz
+            const len: u32 = @intCast(pcm.items.len);
+            try audio.appendSlice(a, "RIFF");
+            try audio.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(u32, 36 + len)));
+            try audio.appendSlice(a, "WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data");
+            try audio.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(u32, len)));
+        }
+        try audio.appendSlice(a, pcm.items);
+        const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(audio.items.len));
+        const mime = if (as_wav) "audio/wav" else "audio/L16;codec=pcm;rate=24000";
+        return json(req, .ok, try std.fmt.allocPrint(a, "{{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"inlineData\":{{\"mimeType\":\"{s}\",\"data\":\"{s}\"}}}}]}},\"finishReason\":\"STOP\",\"index\":0}}],\"modelVersion\":\"stand-in\"}}", .{ mime, std.base64.standard.Encoder.encode(b64, audio.items) }));
     }
 
     /// A file of Telegram's (`GET /file/bot<token>/<path>`, a path getFile
@@ -663,10 +712,22 @@ fn deskReq(io: Io, a: std.mem.Allocator, port: u16, method: []const u8, path: []
     return .{ .status = try std.fmt.parseInt(u16, all[9..12], 10), .head = all[0..split], .body = all[split + 4 ..] };
 }
 
+/// Header `name`'s value in a response head (any case); null without it.
+fn headerOf(head: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitSequence(u8, head, "\r\n");
+    while (it.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name)) return std.mem.trim(u8, line[colon + 1 ..], " ");
+    }
+    return null;
+}
+
 /// `harness-fake --desk HOME TEXT`: what the desk app and its page do,
 /// over HTTP: a code asked for (state/open-request), read and deleted,
 /// entered for a session cookie; the page and the state read; TEXT sent in
-/// main; the events long-polled until harness's reply. A line each.
+/// main; the events long-polled until harness's reply, which is then asked
+/// for read aloud (`speech STATUS TYPE` and the audio's first 4 bytes, or
+/// the error). A line each.
 pub fn deskClient(io: Io, a: std.mem.Allocator, home: []const u8, text: []const u8) !void {
     const out = Io.File.stdout();
     const state = try std.fs.path.join(a, &.{ home, "state" });
@@ -717,7 +778,13 @@ pub fn deskClient(io: Io, a: std.mem.Allocator, home: []const u8, text: []const 
             const from = jv.str(jv.get(m, "from")) orelse "";
             const words = jv.str(jv.get(m, "text")) orelse "";
             try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "{s}: {s}\n", .{ from, words }));
-            if (std.mem.eql(u8, from, "harness")) return;
+            if (std.mem.eql(u8, from, "harness")) {
+                // read aloud, as the page asks for it
+                const sp = try deskReq(io, a, port, "POST", "/desk/api/speech", cookie, try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{jv.int(jv.get(m, "id")) orelse 0}));
+                const shown = if (sp.status == 200) sp.body[0..@min(4, sp.body.len)] else sp.body[0..@min(200, sp.body.len)];
+                try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "speech {d} {s} {s}\n", .{ sp.status, headerOf(sp.head, "content-type") orelse "-", shown }));
+                return;
+            }
         }
     }
     return error.NoReply;
