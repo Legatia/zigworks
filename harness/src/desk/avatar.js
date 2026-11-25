@@ -883,7 +883,7 @@ export async function createAvatar(element, packUrl, options = {}) {
   function stop() { endTalk(S.talk, false); }
 
   // ---- the frame loop ----
-  let raf = 0, prev = now(), lastDraw = 0, disposed = false, lost = false;
+  let raf = 0, prev = now(), lastDraw = 0, disposed = false, lost = false, drawn = 0;
   const loop = () => {
     raf = 0;
     if (disposed || lost || !head) return;
@@ -899,8 +899,9 @@ export async function createAvatar(element, packUrl, options = {}) {
   function wake() { if (!raf && head && !disposed && !lost && !document.hidden) { prev = now(); raf = requestAnimationFrame(loop); } }
 
   function frame(tNow) {
+    drawn++;
     const t = debug ? (debug.time ?? 0) : tNow;
-    const dt = debug ? 10 : Math.min(0.05, tNow - prev);
+    const dt = debug ? 10 : Math.min(0.1, tNow - prev); // slow frames still keep time; a long pause doesn't jump
     prev = tNow;
     const P = debug && debug.neutral ? { ...profile(), shapes: {}, closed: 0, micro: 0 } : profile();
     const rm = reduced();
@@ -1049,6 +1050,12 @@ export async function createAvatar(element, packUrl, options = {}) {
   // ---- go ----
   avatar.lose = head ? () => head.renderer.forceContextLoss() : () => {};
   avatar.shapes = () => (head ? Object.fromEntries(Object.entries(head.IDX).map(([k2, i]) => [k2, head.infl[i]])) : {});
+  /** For checks: frames drawn, the pose, the eyes' closure, the voice's clock. */
+  avatar.inspect = () => ({
+    drawn, state: S.state, pose: { ...S.pose }, closed: S.closed, talking: !!(S.talk && S.talk.playing),
+    tau: S.talk && S.talk.playing ? S.talk.clock() : null, filter: canvas.style.filter || (stillCanvas && stillCanvas.style.filter) || '',
+    audio: audioCtx ? audioCtx.state : null,
+  });
   if (!head) showStill();
   else {
     S.closed = PROFILES[S.state].closed;
