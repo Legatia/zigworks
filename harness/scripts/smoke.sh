@@ -996,8 +996,13 @@ url = $URL
 api = $URL
 [apps]
 port = $DPORT
+[provider gemini]
+url = $URL/v1beta
+[desk]
+speak = gemini
 EOF
 chmod 600 "$DH/config.ini"
+printf 'gm-smoke-key-1\n' | "$H" secret add gemini --stdin 2>/dev/null
 HARNESS_HOME="$DH" "$H" run >"$T/drun.out" 2>&1 &
 RPID=$!
 wait_for "$T/drun.out" "running on" 15
@@ -1015,6 +1020,9 @@ reply "$(text_reply 'Three flats match.')"
 check "the desk is entered by a one-time code: a session cookie, the code good once" 'grep -qxF "entered 303 httponly samesite" "$T/desk.out" && grep -qxF "again 403" "$T/desk.out" && [ ! -e "$DH/state/desk-code" ] && [ ! -e "$DH/state/open-request" ]'
 check "the desk page and its state answer to the session" 'grep -qxF "page 200 with its script" "$T/desk.out" && grep -qE "^state 200 " "$T/desk.out"'
 check "a message from the desk is a turn in main, and its reply comes back to the desk" 'grep -qxF "sent 200" "$T/desk.out" && grep -qxF "harness: Three flats match." "$T/desk.out" && grep -qF "Find me a two-bedroom near Kazimierz" "$(req)"'
+check "the desk's reply is read aloud through Gemini's format, as WAV" 'grep -qxF "speech 200 audio/wav RIFF" "$T/desk.out" && grep -qF "/v1beta/models/gemini-3.8-flash-lite-tts:generateContent" "$S/gemini-requests/001.json" && grep -qF "Schedar" "$S/gemini-requests/001.json"'
+check "the voice's key went as x-goog-api-key, never to the page" 'grep -qF "\"x-goog-api-key\":\"gm-smoke-key-1\"" "$S/gemini-requests/001.json" && ! grep -qF "gm-smoke-key" "$T/desk.out"'
+check "harness secret list names the desk's voice key" 'HARNESS_HOME="$DH" "$H" secret list | grep -qF "gemini (gemini key): stored"'
 check "Telegram gets a quiet echo of it, then the reply" 'grep -F "You, on the desk: Find me a two-bedroom near Kazimierz" "$OUT" | grep -qF "\"disable_notification\":true" && grep -qF "Three flats match." "$OUT"'
 check "harness stop ends the running harness, and the desk app still finds it" 'HARNESS_HOME="$DH" "$H" stop >"$T/stop.out" 2>&1 && grep -qxF "Stopped." "$T/stop.out" && grep -qF "\"binary\":\"" "$DH/state/desk.json"'
 wait "$RPID" 2>/dev/null

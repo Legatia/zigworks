@@ -141,6 +141,10 @@ is a `[provider NAME]` section in `config.ini`.
 | `opencode` (OpenCode Zen) | OpenAI Chat Completions | `https://opencode.ai/zen/v1` | `Authorization: Bearer` | no | `opencode` |
 | `openai` | OpenAI Chat Completions | `https://api.openai.com/v1` | `Authorization: Bearer` | no (OpenAI caches by itself) | `openai` |
 
+A sixth preset, `gemini` (the Gemini API), is for the desk's voice only for
+now (Desk, Speech): a model named on it, or on any section with `api =
+gemini`, is refused with the reason.
+
 ```ini
 [model]
 provider = omnigate              ; for models named without PROVIDER:
@@ -153,9 +157,9 @@ memory_model = anthropic:claude-haiku-4-5
 header = HTTP-Referer: https://example.org
 
 [provider local]                 ; any other gateway
-api = openai                     ; anthropic | openai
+api = openai                     ; anthropic | openai (gemini: speech only)
 url = http://127.0.0.1:11434/v1  ; what comes before /messages or /chat/completions
-auth = none                      ; x-api-key | bearer | none
+auth = none                      ; x-api-key | x-goog-api-key | bearer | none
 ```
 
 A model value is `PROVIDER:MODEL`, or a model of `[model] provider`:
@@ -168,9 +172,9 @@ one has that name, so `llama3.1:8b` is a model of the default provider and
 A section with a preset's name changes only the fields it sets; any other
 name is a new provider and needs `api` and `url`. A section takes `api`,
 `url`, `auth` (default `x-api-key` for `anthropic`, `bearer` for
-`openai`), `key` (the secret's name; default the provider's name), `cache
+`openai`, `x-goog-api-key` for `gemini`), `key` (the secret's name; default the provider's name), `cache
 = on|off` (default on for `anthropic`, off for `openai`) and `header =
-Name: value` (up to 8; not `Authorization`, `x-api-key`, `Host`,
+Name: value` (up to 8; not `Authorization`, `x-api-key`, `x-goog-api-key`, `Host`,
 `Connection`, `Content-Length`, `Content-Type`, `Transfer-Encoding` or
 `anthropic-version`). `auth = bearer` with `api = anthropic` is for
 Anthropic-compatible gateways that take a bearer token. The `openai`
@@ -2149,9 +2153,9 @@ speech.
 [desk]
 echo = on            ; a quiet echo in Telegram of what you type on the desk
 avatar = butler      ; a folder in avatars/
-speak = off          ; off, browser (the system's voice), or a provider with api = openai
-speak_model = tts-1  ; that provider's speech model and voice
-speak_voice = alloy
+speak = off          ; off, browser, openai, gemini, or a [provider NAME] with api = openai or gemini
+; speak_model =      ; that provider's model and voice; unset: its kind's default
+; speak_voice =
 ```
 
 ### Speech
@@ -2159,10 +2163,100 @@ speak_voice = alloy
 Replies in the conversation the desk shows are read aloud once (a long one
 its first two sentences, then "The rest is on screen."); urgent alerts are
 always read while the desk is open and not muted; in quiet hours only
-they are. With a provider, harness fetches the audio
-(`POST {url}/audio/speech`) with the provider's key, so the key never
-reaches the page. "Play the message" reads the last one again. Linux's web
-view has no speech of its own, so there it's a provider or off.
+they are. "Play the message" reads the last one again. A reply that
+couldn't be read aloud says why under the chat.
+
+`[desk] speak` picks the voice:
+
+- `off`, the default;
+- `browser`: the system's own voices, on this computer and free; not on
+  Linux, whose web view has none;
+- the name of a provider that can speak. harness fetches the audio with
+  that provider's key, so the key never reaches the page.
+
+Two presets need only a stored key:
+
+| `speak =` | Format | Address | Key sent as | Key's secret | Model, voice when unset |
+|---|---|---|---|---|---|
+| `openai` | OpenAI's `POST {url}/audio/speech`, MP3 back | `https://api.openai.com/v1` | `Authorization: Bearer` | `openai` | `tts-1`, `alloy` |
+| `gemini` | Gemini's `POST {url}/models/MODEL:generateContent`, audio out, a prebuilt voice | `https://generativelanguage.googleapis.com/v1beta` | `x-goog-api-key` | `gemini` | `gemini-3.8-flash-lite-tts`, `Schedar` |
+
+```ini
+[desk]
+speak = gemini
+; speak_model = gemini-3.8-flash-tts
+; speak_voice = Charon
+```
+
+Then `harness secret add gemini` (a key from Google AI Studio) and
+`/reload`, or choose it in the desk's settings.
+
+Any `[provider NAME]` with `api = openai` or `api = gemini` can speak too,
+with the lines providers take (Models and providers): `url`, `key`,
+`auth` and `header`. That covers your own key, a proxy, a gateway, or a
+speech server on this computer:
+
+```ini
+[provider gemini-proxy]          ; Gemini's format through your own proxy
+api = gemini
+url = https://gemini-proxy.example.com/v1beta
+auth = bearer                    ; the proxy takes a bearer token
+key = gemini-proxy
+
+[provider litellm]               ; a gateway: LiteLLM's proxy, OpenAI's format
+api = openai
+url = http://127.0.0.1:4000/v1
+key = litellm
+
+[provider kokoro]                ; a speech server on this computer
+api = openai
+url = http://127.0.0.1:8880/v1
+auth = none
+
+[desk]
+speak = litellm
+speak_model = tts                ; the model name the gateway routes
+```
+
+A chat preset (`openrouter`, `opencode`) isn't a voice unless its section
+says `api = openai` itself. `api = gemini` is for speech only for now.
+
+**Model and voice.** `speak_model` and `speak_voice` are the chosen
+provider's; unset, its kind's default (the table). The desk's settings
+show both, the defaults greyed in, and write what you type to config.ini.
+Choosing a provider of another kind there clears them: an older `harness
+init` wrote `speak_model = tts-1` and `speak_voice = alloy`, which Gemini
+doesn't know. By hand, delete those lines when you switch kinds. Gemini has
+30 prebuilt voices (Kore, Charon, Schedar, Sulafat, …; Google's speech
+generation docs list them); `Schedar` is even and unhurried, for the
+butler.
+
+**The defaults were checked on 2026-11-25.** Speech models are renamed and
+retired:
+
+- Gemini: `gemini-3.8-flash-lite-tts` and `gemini-3.8-flash-tts`; the
+  older `gemini-3.1-flash-tts-preview` and `gemini-2.5-pro-preview-tts`
+  still answer.
+- OpenAI marks `tts-1`, `tts-1-hd` and `gpt-4o-mini-tts` deprecated and
+  shuts them down on 2027-01-06. After that the `openai` preset's speech
+  stops until harness changes; a gateway or a local server keeps working.
+
+**Gemini's free tier.** On Gemini's free tier, Google may use the spoken
+text to improve its products. A key on a paid plan keeps it out. harness
+can't tell which tier a key is on, so the desk says this whenever a
+Gemini-format provider is chosen.
+
+**What the page gets.** `POST /desk/api/speech` answers with the audio:
+MP3 (`audio/mpeg`) from OpenAI's format; WAV (`audio/wav`) from Gemini's.
+Gemini 3.8 sends WAV, passed on as it is; older Gemini models send raw
+16-bit PCM (`audio/L16;codec=pcm;rate=24000`), which harness wraps in a
+WAV header (mono, 16-bit, the rate the type names, else 24 kHz). The
+avatar plays either and moves the mouth with it.
+
+**When it fails**, the line under the chat names the provider: its key
+refused (401, 403), its budget used up (402), rate limited (429), the
+request refused with its message (400), or no audio in its answer (with
+Google's reason when it gave one).
 
 ### The desk's paths
 

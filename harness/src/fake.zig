@@ -712,10 +712,22 @@ fn deskReq(io: Io, a: std.mem.Allocator, port: u16, method: []const u8, path: []
     return .{ .status = try std.fmt.parseInt(u16, all[9..12], 10), .head = all[0..split], .body = all[split + 4 ..] };
 }
 
+/// Header `name`'s value in a response head (any case); null without it.
+fn headerOf(head: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitSequence(u8, head, "\r\n");
+    while (it.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name)) return std.mem.trim(u8, line[colon + 1 ..], " ");
+    }
+    return null;
+}
+
 /// `harness-fake --desk HOME TEXT`: what the desk app and its page do,
 /// over HTTP: a code asked for (state/open-request), read and deleted,
 /// entered for a session cookie; the page and the state read; TEXT sent in
-/// main; the events long-polled until harness's reply. A line each.
+/// main; the events long-polled until harness's reply, which is then asked
+/// for read aloud (`speech STATUS TYPE` and the audio's first 4 bytes, or
+/// the error). A line each.
 pub fn deskClient(io: Io, a: std.mem.Allocator, home: []const u8, text: []const u8) !void {
     const out = Io.File.stdout();
     const state = try std.fs.path.join(a, &.{ home, "state" });
@@ -766,7 +778,13 @@ pub fn deskClient(io: Io, a: std.mem.Allocator, home: []const u8, text: []const 
             const from = jv.str(jv.get(m, "from")) orelse "";
             const words = jv.str(jv.get(m, "text")) orelse "";
             try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "{s}: {s}\n", .{ from, words }));
-            if (std.mem.eql(u8, from, "harness")) return;
+            if (std.mem.eql(u8, from, "harness")) {
+                // read aloud, as the page asks for it
+                const sp = try deskReq(io, a, port, "POST", "/desk/api/speech", cookie, try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{jv.int(jv.get(m, "id")) orelse 0}));
+                const shown = if (sp.status == 200) sp.body[0..@min(4, sp.body.len)] else sp.body[0..@min(200, sp.body.len)];
+                try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "speech {d} {s} {s}\n", .{ sp.status, headerOf(sp.head, "content-type") orelse "-", shown }));
+                return;
+            }
         }
     }
     return error.NoReply;
