@@ -15,6 +15,7 @@ const commands = @import("commands.zig");
 const pages = @import("pages.zig");
 const controller = @import("controller.zig");
 const testhooks = @import("testhooks.zig");
+const setup = @import("setup.zig");
 
 const Controller = controller.Controller;
 const Event = controller.Event;
@@ -38,7 +39,9 @@ const sys = struct {
     extern fn hdesk_badge_label(buf: [*]u8, len: c_int) void;
     extern fn hdesk_attention() void;
     extern fn hdesk_open_external(url: [*:0]const u8) void;
-    extern fn hdesk_menu_state(start: c_int, stop: c_int, autostart_enabled: c_int, autostart_on: c_int) void;
+    extern fn hdesk_menu_state(start: c_int, stop: c_int, autostart_enabled: c_int, autostart_on: c_int, provider: c_int) void;
+    extern fn hdesk_ask_key(title: [*:0]const u8, note: [*:0]const u8) void;
+    extern fn hdesk_test_key(action: c_int) c_int;
     extern fn hdesk_alert(title: [*:0]const u8, text: [*:0]const u8) void;
     extern fn hdesk_post_main(f: *const fn (?*anyopaque) callconv(.c) void, arg: ?*anyopaque) void;
     extern fn hdesk_every(seconds: f64, f: *const fn (?*anyopaque) callconv(.c) void, arg: ?*anyopaque) void;
@@ -60,6 +63,9 @@ const App = struct {
     dispatching: bool = false,
     last_state: ?controller.State = null,
     hooks: if (hooks_on) ?testhooks.Hooks else void = if (hooks_on) null else {},
+    /// The key just typed in the secure field, until `store_key` takes it
+    /// (or the turn ends without it): then zeroed and freed.
+    pending_key: ?[]u8 = null,
 };
 
 var app: App = undefined;
@@ -70,6 +76,15 @@ fn log(comptime fmt: []const u8, a: anytype) void {
 
 fn z(a: std.mem.Allocator, s: []const u8) [:0]const u8 {
     return a.dupeSentinel(u8, s, 0) catch "";
+}
+
+/// The harness the app carries, beside its own program; "" when it isn't
+/// there.
+fn ownHarness(io: Io, gpa: std.mem.Allocator) []const u8 {
+    const dir = std.process.executableDirPathAlloc(io, gpa) catch return "";
+    const p = setup.beside(gpa, dir, @import("builtin").os.tag == .windows) catch return "";
+    Io.Dir.cwd().access(io, p, .{}) catch return "";
+    return p;
 }
 
 fn nowMs() i64 {
@@ -89,7 +104,7 @@ pub fn main(init: std.process.Init) u8 {
         .gpa = gpa,
         .env = init.environ_map,
         .home = home,
-        .ctl = .init(gpa, home),
+        .ctl = .init(gpa, home, ownHarness(init.io, gpa)),
         .turn = .init(gpa),
     };
     if (hooks_on) if (args.test_dir) |dir| {
@@ -124,7 +139,7 @@ fn perform(fx: Effect, a: std.mem.Allocator) void {
     switch (fx) {
         .show => |s| {
             log("show {t}", .{s.screen});
-            const html = pages.html(a, s.screen, s.note, app.home) catch return;
+            const html = pages.html(a, s.screen, s.note, app.home, s.view) catch return;
             sys.hdesk_show_html(z(a, html));
         },
         .load => |url| {
@@ -154,17 +169,42 @@ fn perform(fx: Effect, a: std.mem.Allocator) void {
             sys.hdesk_attention();
         },
         .menu => |m| {
-            log("menu start={d} stop={d} autostart={s}", .{
-                @intFromBool(m.start), @intFromBool(m.stop),
-                if (!m.autostart_enabled) "-" else if (m.autostart) |on| (if (on) "on" else "off") else "?",
+            log("menu start={d} stop={d} autostart={s} provider={d}", .{
+                @intFromBool(m.start),                                                                              @intFromBool(m.stop),
+                if (!m.autostart_enabled) "-" else if (m.autostart) |on| (if (on) "on" else "off") else "?", @intFromBool(m.provider),
             });
-            sys.hdesk_menu_state(@intFromBool(m.start), @intFromBool(m.stop), @intFromBool(m.autostart_enabled), if (m.autostart) |on| @intFromBool(on) else -1);
+            sys.hdesk_menu_state(@intFromBool(m.start), @intFromBool(m.stop), @intFromBool(m.autostart_enabled), if (m.autostart) |on| @intFromBool(on) else -1, @intFromBool(m.provider));
         },
         .alert => |al| {
             log("alert {s} | {s}", .{ al.title, al.text });
             sys.hdesk_alert(z(a, al.title), z(a, al.text));
         },
+        .step => |st| {
+            log("step {s}", .{std.mem.join(a, " ", st.argv) catch ""});
+            startStep(st.gen, st.argv, st.path, null);
+        },
+        .store_key => |st| {
+            // the key itself is never logged: only the command it goes to
+            log("store {s}", .{std.mem.join(a, " ", st.argv) catch ""});
+            const key = app.pending_key orelse return;
+            app.pending_key = null;
+            startStep(st.gen, st.argv, st.path, key);
+        },
+        .read_config => |rc| {
+            log("read config", .{});
+            startRead(rc.gen, rc.binary, rc.home, rc.path);
+        },
+        .ask_key => |k| {
+            log("ask key {s}", .{k.title});
+            sys.hdesk_ask_key(z(a, k.title), z(a, k.note));
+        },
     }
+}
+
+/// Zeroes and frees the key, wherever it is held.
+fn dropKey(key: []u8) void {
+    std.crypto.secureZero(u8, key);
+    app.gpa.free(key);
 }
 
 // ---- work off the main thread ----
@@ -201,10 +241,21 @@ const CheckJob = struct {
     result: controller.CheckResult = .no_desk,
 
     fn work(j: *CheckJob) void {
-        j.result = if (deskjson.read(app.io, j.arena.allocator(), app.home)) |found| r: {
-            const d = found orelse break :r .no_desk;
-            break :r if (alive.check(d.port, alive_timeout_ms)) .{ .alive = d } else .{ .dead = d };
-        } else |_| .bad_desk;
+        const a = j.arena.allocator();
+        // never set up here: no config.ini
+        const config = std.fs.path.join(a, &.{ app.home, "config.ini" }) catch "";
+        if (Io.Dir.cwd().access(app.io, config, .{})) |_| {
+            j.result = if (deskjson.read(app.io, a, app.home)) |found| r: {
+                var d = found orelse break :r .no_desk;
+                // a harness that isn't there any more: the app's own runs instead
+                if (d.binary.len > 0) Io.Dir.cwd().access(app.io, d.binary, .{}) catch {
+                    d.binary = "";
+                };
+                break :r if (alive.check(d.port, alive_timeout_ms)) .{ .alive = d } else .{ .dead = d };
+            } else |_| .bad_desk;
+        } else |e| {
+            j.result = if (e == error.FileNotFound) .no_config else .bad_desk;
+        }
         post(CheckJob, j);
     }
 
@@ -280,6 +331,126 @@ const RunJob = struct {
     }
 };
 
+/// A setup step run to its end (`init`, `config set`), or with `key` on its
+/// input (`secret add NAME --stdin`): the key is zeroed and freed as soon
+/// as the command has ended.
+const StepJob = struct {
+    gen: u32,
+    arena: std.heap.ArenaAllocator = undefined,
+    argv: []const []const u8 = &.{},
+    env: ?std.process.Environ.Map = null,
+    key: ?[]u8 = null,
+    ok: bool = false,
+    text: []const u8 = "",
+    out: []const u8 = "",
+
+    fn work(j: *StepJob) void {
+        const a = j.arena.allocator();
+        const env: ?*const std.process.Environ.Map = if (j.env) |*e| e else null;
+        const result = if (j.key) |k| commands.runWithStdin(app.io, a, j.argv, env, k) else commands.runWait(app.io, a, j.argv, env);
+        if (j.key) |k| {
+            dropKey(k);
+            j.key = null;
+        }
+        if (result) |r| {
+            j.ok = r.ok;
+            j.text = if (r.ok) "" else r.why(a) catch "";
+            j.out = r.out;
+        } else |e| {
+            j.text = std.fmt.allocPrint(a, "{s} couldn't be run ({t}).", .{ j.argv[0], e }) catch "";
+        }
+        post(StepJob, j);
+    }
+
+    fn deliver(j: *StepJob) void {
+        log("stepped ok={d} {s}", .{ @intFromBool(j.ok), j.text });
+        if (j.argv.len > 2 and std.mem.eql(u8, j.argv[1], "secret")) {
+            dispatch(.{ .stored = .{ .gen = j.gen, .ok = j.ok, .text = j.text } });
+        } else dispatch(.{ .stepped = .{ .gen = j.gen, .ok = j.ok, .text = j.text, .out = j.out } });
+    }
+};
+
+fn startStep(gen: u32, argv: []const []const u8, path: []const u8, key: ?[]u8) void {
+    const job = app.gpa.create(StepJob) catch {
+        if (key) |k| dropKey(k);
+        return;
+    };
+    job.* = .{ .gen = gen, .arena = .init(app.gpa), .key = key };
+    const a = job.arena.allocator();
+    var copy: std.ArrayList([]const u8) = .empty;
+    for (argv) |w| copy.append(a, a.dupe(u8, w) catch "") catch {};
+    job.argv = copy.items;
+    if (path.len > 0) job.env = commands.withPath(a, app.env, path) catch null;
+    const th = std.Thread.spawn(.{}, StepJob.work, .{job}) catch {
+        StepJob.work(job);
+        return;
+    };
+    th.detach();
+}
+
+/// "Provider and key…": `harness config get` for `model.provider`, then for
+/// the settings that go with it (setup.readKeys).
+const ReadJob = struct {
+    gen: u32,
+    arena: std.heap.ArenaAllocator = undefined,
+    binary: []const u8 = "",
+    home: []const u8 = "",
+    env: ?std.process.Environ.Map = null,
+    ok: bool = false,
+    text: []const u8 = "",
+    in_use: setup.InUse = .{},
+
+    fn get(j: *ReadJob, key: []const u8) ![]const u8 {
+        const a = j.arena.allocator();
+        const env: ?*const std.process.Environ.Map = if (j.env) |*e| e else null;
+        const argv = try setup.readArgv(a, j.binary, j.home, key);
+        const r = commands.runWait(app.io, a, argv, env) catch |e| {
+            j.text = try std.fmt.allocPrint(a, "{s} couldn't be run ({t}).", .{ j.binary, e });
+            return error.Reported;
+        };
+        if (!r.ok) {
+            j.text = try r.why(a);
+            return error.Reported;
+        }
+        return std.mem.trim(u8, r.out, " \t\r\n");
+    }
+
+    fn work(j: *ReadJob) void {
+        j.read() catch |e| {
+            if (e != error.Reported) j.text = "The settings couldn't be read.";
+            j.ok = false;
+        };
+        post(ReadJob, j);
+    }
+
+    fn read(j: *ReadJob) !void {
+        const provider = try j.get("model.provider");
+        var values: [6][]const u8 = undefined;
+        for (try setup.readKeys(j.arena.allocator(), provider), 0..) |key, i| values[i] = try j.get(key);
+        j.in_use = setup.inUse(provider, values);
+        j.ok = true;
+    }
+
+    fn deliver(j: *ReadJob) void {
+        log("read ok={d} {s}", .{ @intFromBool(j.ok), j.text });
+        dispatch(.{ .read = .{ .gen = j.gen, .ok = j.ok, .text = j.text, .in_use = j.in_use } });
+    }
+};
+
+fn startRead(gen: u32, binary: []const u8, home: []const u8, path: []const u8) void {
+    const job = app.gpa.create(ReadJob) catch return;
+    job.* = .{ .gen = gen, .arena = .init(app.gpa) };
+    const a = job.arena.allocator();
+    job.binary = a.dupe(u8, binary) catch "";
+    job.home = a.dupe(u8, home) catch "";
+    if (path.len > 0) job.env = commands.withPath(a, app.env, path) catch null;
+    const th = std.Thread.spawn(.{}, ReadJob.work, .{job}) catch {
+        ReadJob.work(job);
+        return;
+    };
+    th.detach();
+}
+
 fn startRun(r: @FieldType(Effect, "run"), turn: std.mem.Allocator) void {
     const job = app.gpa.create(RunJob) catch return;
     job.* = .{ .cmd = r.cmd, .arena = .init(app.gpa) };
@@ -322,7 +493,9 @@ export fn hdesk_on_message(json: [*:0]const u8, main_frame: c_int, proto: [*:0]c
     const text = std.mem.span(json);
     const src = bridge.source(main_frame != 0, std.mem.span(proto), std.mem.span(host), @intCast(@max(port, 0)), app.ctl.port(), app.ctl.showingBuiltin());
     log("message {t} {s}", .{ src, text });
-    const msg = bridge.parse(app.gpa, text) orelse return;
+    var arena: std.heap.ArenaAllocator = .init(app.gpa);
+    defer arena.deinit();
+    const msg = bridge.parse(arena.allocator(), text) orelse return;
     dispatch(.{ .message = .{ .msg = msg, .source = src } });
 }
 
@@ -371,11 +544,40 @@ export fn hdesk_on_media(proto: [*:0]const u8, host: [*:0]const u8, port: c_int,
     return @intFromBool(ok);
 }
 
+/// The secure field's answer: `len` bytes typed (`len` < 0: cancelled).
+/// They are copied here and the caller clears its own; this copy goes to
+/// `harness secret add` and is zeroed after.
+export fn hdesk_on_key(buf: ?[*]const u8, len: c_int) void {
+    if (app.pending_key) |old| {
+        dropKey(old);
+        app.pending_key = null;
+    }
+    if (len < 0 or buf == null) {
+        log("key cancelled", .{});
+        return dispatch(.{ .key = .cancelled });
+    }
+    if (len == 0) {
+        log("key empty", .{});
+        return dispatch(.{ .key = .empty });
+    }
+    const key = app.gpa.alloc(u8, @intCast(len)) catch return dispatch(.{ .key = .cancelled });
+    @memcpy(key, buf.?[0..@intCast(len)]);
+    app.pending_key = key;
+    log("key given", .{});
+    dispatch(.{ .key = .given });
+    // nothing took it (the form had moved on): it goes now
+    if (app.pending_key) |k| {
+        dropKey(k);
+        app.pending_key = null;
+    }
+}
+
 export fn hdesk_on_menu(item: c_int) void {
     const m: controller.MenuItem = switch (item) {
         0 => .start,
         1 => .stop,
         2 => .autostart,
+        4 => .provider,
         else => .reload,
     };
     dispatch(.{ .menu = m });
@@ -428,6 +630,10 @@ fn onHooks(_: ?*anyopaque) callconv(.c) void {
             logFrame();
         },
         .log_frame => logFrame(),
+        .key => |k| {
+            const secure = sys.hdesk_test_key(if (k == .fill) 1 else 0);
+            log("key-sheet {t} secure={d}", .{ k, secure });
+        },
         .quit => sys.hdesk_quit(),
     };
 }

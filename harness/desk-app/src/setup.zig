@@ -171,6 +171,41 @@ pub fn readArgv(a: std.mem.Allocator, binary: []const u8, home: []const u8, key:
     return a.dupe([]const u8, &.{ binary, "config", "get", key, "--home", home });
 }
 
+/// What "Provider and key…" reads with `harness config get`, after
+/// `model.provider` said `provider`: in `inUse`'s order.
+pub fn readKeys(a: std.mem.Allocator, provider: []const u8) ![6][]const u8 {
+    return .{
+        "model.model",
+        "model.url",
+        "model.key",
+        try std.fmt.allocPrint(a, "provider {s}.api", .{provider}),
+        try std.fmt.allocPrint(a, "provider {s}.url", .{provider}),
+        try std.fmt.allocPrint(a, "provider {s}.key", .{provider}),
+    };
+}
+
+/// The values in use from `readKeys`' answers.
+pub fn inUse(provider: []const u8, values: [6][]const u8) InUse {
+    return .{
+        .provider = provider,
+        .model = values[0],
+        .url = values[1],
+        .model_key = values[2],
+        .api = values[3],
+        .section_url = values[4],
+        .section_key = values[5],
+    };
+}
+
+/// The harness the app carries: beside its own program, on every system
+/// (macOS: `harness-desk.app/Contents/MacOS/harness`; Windows:
+/// `harness.exe` beside `harness-desk.exe`; Linux: `harness` beside
+/// `harness-desk`).
+pub fn beside(a: std.mem.Allocator, exe_dir: []const u8, windows: bool) ![]const u8 {
+    const dir = std.mem.trimEnd(u8, exe_dir, if (windows) "\\/" else "/");
+    return std.fmt.allocPrint(a, "{s}{s}{s}", .{ dir, if (windows) "\\" else "/", if (windows) "harness.exe" else "harness" });
+}
+
 const t = std.testing;
 
 fn expectArgv(want: []const []const u8, got: []const []const u8) !void {
@@ -317,4 +352,27 @@ test "values_are_single_argv_words" {
     try expectArgv(&.{ "/b/harness", "init", "--home", "/h" }, try initArgv(a, "/b/harness", "/h"));
     try expectArgv(&.{ "/b/harness", "secret", "add", "anthropic", "--stdin", "--home", "/h" }, try secretArgv(a, "/b/harness", "/h", "anthropic"));
     try expectArgv(&.{ "/b/harness", "config", "get", "provider local.url", "--home", "/h" }, try readArgv(a, "/b/harness", "/h", "provider local.url"));
+}
+
+test "provider_and_key_reads_these_settings" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const keys = try readKeys(arena.allocator(), "local");
+    try expectArgv(&.{ "model.model", "model.url", "model.key", "provider local.api", "provider local.url", "provider local.key" }, &keys);
+    const u = inUse("local", .{ "llama3.1:8b", "", "omnigate", "openai", "http://127.0.0.1:11434/v1", "" });
+    try t.expectEqualStrings("local", u.provider);
+    try t.expectEqualStrings("llama3.1:8b", u.model);
+    try t.expectEqualStrings("omnigate", u.model_key);
+    try t.expectEqualStrings("openai", u.api);
+    try t.expectEqualStrings("http://127.0.0.1:11434/v1", u.section_url);
+    try t.expectEqualStrings("", u.section_key);
+}
+
+test "harness_sits_beside_the_apps_program" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqualStrings("/Applications/harness-desk.app/Contents/MacOS/harness", try beside(a, "/Applications/harness-desk.app/Contents/MacOS", false));
+    try t.expectEqualStrings("/opt/harness/harness", try beside(a, "/opt/harness/", false));
+    try t.expectEqualStrings("C:\\Program Files\\harness\\harness.exe", try beside(a, "C:\\Program Files\\harness", true));
 }
