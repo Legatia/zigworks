@@ -14,7 +14,7 @@ pub const Error = error{ BadConfig, OutOfMemory };
 
 /// What `parse` refuses besides a bad line: the `[provider NAME]`
 /// sections' problems, which `reason` says.
-pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider, BadVoice, BadVoiceAgent };
+pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider, BadVoice, BadVoiceAgent, BadDesk };
 
 pub const Config = struct {
     model: Model = .{},
@@ -33,6 +33,7 @@ pub const Config = struct {
     butler: Butler = .{},
     voice_agent: VoiceAgent = .{},
     mail: Mail = .{},
+    desk: Desk = .{},
     /// The `[provider NAME]` sections, in the order their names first
     /// appear (not a section of its own: `parse` reads them apart).
     providers: []const model.Section = &.{},
@@ -206,6 +207,19 @@ pub const Config = struct {
         /// (HH:MM, the owner's time).
         others_at: []const u8 = "18:00",
     };
+    /// The desk (harness's own window): what it shows and says.
+    pub const Desk = struct {
+        /// Telegram gets a quiet echo of what you type on the desk.
+        echo: bool = true,
+        /// The avatar: a folder of `avatars/` (`butler` is built in).
+        avatar: []const u8 = "butler",
+        /// Replies read aloud: off, browser (the system's voice), or a
+        /// provider whose api is openai (`/audio/speech`).
+        speak: []const u8 = "off",
+        /// The provider's speech model and voice.
+        speak_model: []const u8 = "tts-1",
+        speak_voice: []const u8 = "alloy",
+    };
     /// The butler's manners.
     pub const Butler = struct {
         /// Quiet hours, the owner's time: posts of runs nobody waits on
@@ -361,7 +375,20 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
             for (l) |ch| if (!std.ascii.isLower(ch)) return error.BadVoice;
         }
     }
+    const dk = cfg.desk;
+    if (!avatarName(dk.avatar)) return error.BadDesk;
+    if (!std.mem.eql(u8, dk.speak, "off") and !std.mem.eql(u8, dk.speak, "browser")) {
+        if (voiceApi(cfg, dk.speak) != .openai) return error.BadDesk;
+        if (dk.speak_model.len == 0 or dk.speak_voice.len == 0) return error.BadDesk;
+    }
     return cfg;
+}
+
+/// An avatar's folder name in `avatars/`: a-z, 0-9 and -, 1 to 32.
+pub fn avatarName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 32) return false;
+    for (name) |ch| if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-')) return false;
+    return true;
 }
 
 /// `[voice_agent] listen`: an IP address of this machine and its port
@@ -416,6 +443,7 @@ pub fn reason(e: anyerror) ?[]const u8 {
         error.UnknownProvider => "no provider has that name: use a preset (omnigate, anthropic, openrouter, opencode, openai) or a [provider NAME] section with api and url",
         error.BadVoice => "[voice] provider = openai or a [provider NAME] section with api = openai (Groq, a whisper.cpp server), model = its transcription model (whisper-large-v3-turbo at Groq, gpt-4o-mini-transcribe at OpenAI), language = a two-letter code (pl) or nothing",
         error.BadVoiceAgent => "[voice_agent] listen = an IP address of this machine and a port, like 127.0.0.1:8765 or 192.168.1.20:8765 (not a name, not 0.0.0.0 or ::), or off; seconds = 5 to 60; token = a stored secret's name (a-z, 0-9, - and _)",
+        error.BadDesk => "[desk] avatar = a folder name in avatars/ (a-z, 0-9, -), speak = off, browser, or a provider whose api is openai (with speak_model and speak_voice)",
         else => null,
     };
 }
@@ -847,6 +875,13 @@ pub const defaults_ini =
     \\; provider = groq                    ; openai, or a [provider NAME] with api = openai (Groq, a local whisper.cpp)
     \\; model = whisper-large-v3-turbo
     \\; language = pl                      ; the language you speak; empty: found by the service
+    \\
+    \\[desk]                              ; the desk, harness's own window (README: Desk)
+    \\echo = on                           ; Telegram gets a quiet echo of what you type on the desk
+    \\avatar = butler                     ; a folder in avatars/
+    \\speak = off                         ; replies read aloud: off, browser, or a provider with api = openai
+    \\speak_model = tts-1                 ; that provider's speech model and voice
+    \\speak_voice = alloy
     \\
     \\[butler]
     \\; quiet = 22:00-07:00                ; quiet hours, your time: posts of schedules, triggers and workflows wait for a digest
@@ -1464,6 +1499,34 @@ test "voice_settings_read_and_checked" {
         std.debug.print("got: {s}\n", .{why});
         return error.TestUnexpectedResult;
     }
+}
+
+test "desk_section_reads_and_checks" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try parse(a, "");
+    try t.expect(d.desk.echo);
+    try t.expectEqualStrings("butler", d.desk.avatar);
+    try t.expectEqualStrings("off", d.desk.speak);
+    try t.expectEqualStrings("tts-1", d.desk.speak_model);
+    try t.expectEqualStrings("alloy", d.desk.speak_voice);
+    try t.expectEqualDeep(d.desk, (try parse(a, defaults_ini)).desk);
+    const b = try parse(a, "[desk]\necho = off\navatar = my-face\nspeak = browser\n");
+    try t.expect(!b.desk.echo);
+    try t.expectEqualStrings("my-face", b.desk.avatar);
+    try t.expectEqualStrings("browser", b.desk.speak);
+    _ = try parse(a, "[desk]\nspeak = openai\n");
+    _ = try parse(a, "[provider tts]\napi = openai\nurl = https://tts.example.com/v1\n[desk]\nspeak = tts\nspeak_voice = onyx\n");
+    for ([_][]const u8{
+        "[desk]\nspeak = anthropic\n",
+        "[desk]\nspeak = nowhere\n",
+        "[desk]\navatar = Bad Name\n",
+        "[desk]\navatar = ../x\n",
+    }) |text| try t.expectError(error.BadDesk, parse(a, text));
+    // an empty value is any section's error
+    try t.expectError(error.BadConfig, parse(a, "[desk]\navatar = \n"));
+    try t.expect(reason(error.BadDesk) != null);
 }
 
 test "butler_escalate_reads" {

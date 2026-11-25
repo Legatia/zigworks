@@ -3965,6 +3965,7 @@ pub const Core = struct {
             .draft = draft,
             .expires = expires,
             .private = q.private,
+            .urgent = c.quiet.isUrgent(q.who.by),
         }, c.now(), c.newToken());
         c.saveInbox();
         c.logOpen(it);
@@ -4636,6 +4637,7 @@ pub const Core = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var m = n;
+        m.urgent = n.urgent or c.quiet.isUrgent(n.by);
         m.title = try c.masks.scrubAlloc(a, n.title);
         m.body = try c.masks.scrubAlloc(a, n.body);
         if (n.draft) |d| m.draft = try c.masks.scrubAlloc(a, d);
@@ -4743,6 +4745,7 @@ pub const Core = struct {
                 .grant = if (offered) .{ .tool = tool, .key = key, .who = who.? } else null,
                 .skip = skip,
                 .private = s.private,
+                .urgent = c.quiet.isUrgent(s.who.by),
             }, c.now(), c.newToken());
             c.saveInbox();
             c.logOpen(it);
@@ -6595,6 +6598,7 @@ pub const Core = struct {
                     .next = if (d.retry) now_s + retryWait(1) else 0,
                 },
                 .private = private,
+                .urgent = c.quiet.isUrgent(d.who.by),
             }, now_s, c.newToken()) catch return 0;
             c.saveInbox();
             c.logOpen(it);
@@ -13272,7 +13276,7 @@ pub const Core = struct {
             const src = (try c.appSource(a, name)) orelse return std.fmt.allocPrint(a, "No app {s}: /apps lists them.", .{name});
             apps_mod.fork(c.io, a, apps_dir, state_dir, src, name, new, &c.newToken(), "owner", c.now()) catch |e| return switch (e) {
                 error.BadAppName => "An app's name is a-z, 0-9 and -, up to 32.",
-                error.ReservedAppName => "inbox, log, files, api, home, review and pending are harness's own names.",
+                error.ReservedAppName => "inbox, log, files, api, home, review, pending and desk are harness's own names.",
                 error.AppExists => std.fmt.allocPrint(a, "There is an apps/{s} already.", .{new}),
                 else => std.fmt.allocPrint(a, "Not forked: {s}.", .{appWhy(e)}),
             };
@@ -14240,7 +14244,7 @@ pub const Core = struct {
         const dest = std.fs.path.join(a, &.{ c.workspace, "app-drafts", as }) catch return "OutOfMemory";
         apps_mod.draft(c.io, a, src, name, dest, as) catch |e| return switch (e) {
             error.BadAppName => "a draft's name is a-z, 0-9 and -, up to 32",
-            error.ReservedAppName => "inbox, log, files, api, home, review and pending are harness's own names: give the draft another",
+            error.ReservedAppName => "inbox, log, files, api, home, review, pending and desk are harness's own names: give the draft another",
             error.AppExists => std.fmt.allocPrint(a, "app-drafts/{s} is there already: change it, or pick another name", .{as}) catch "the draft is there already",
             else => appWhy(e),
         };
@@ -14250,7 +14254,7 @@ pub const Core = struct {
     fn appDeskStage(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, from: []const u8, asked_by: []const u8) agent.AppStaged {
         const c: *Core = @ptrCast(@alignCast(ctx));
         if (!apps_mod.validName(name)) return .{ .why = "an app's name is a-z, 0-9 and -, up to 32" };
-        for (apps_mod.reserved) |r| if (std.mem.eql(u8, r, name)) return .{ .why = "inbox, log, files, api, home, review and pending are harness's own names" };
+        for (apps_mod.reserved) |r| if (std.mem.eql(u8, r, name)) return .{ .why = "inbox, log, files, api, home, review, pending and desk are harness's own names" };
         const cf = gate.confined(a, c.io, c.workspace, from) catch return .{ .why = "the folder is outside the workspace" };
         const apps_dir = std.fs.path.join(a, &.{ c.paths.home, "apps" }) catch return .{ .why = "OutOfMemory" };
         const state_dir = std.fs.path.join(a, &.{ c.paths.state, "apps" }) catch return .{ .why = "OutOfMemory" };
@@ -24006,6 +24010,35 @@ test "a_held_question_waits_and_follows_the_digest_with_its_buttons" {
     runWorkflows(&f);
     try f.rec.waitFor("BUTTONS Question [2]\n[leak#1] Close the water main now? [");
     try t.expectEqual(0, f.core.quiet.count());
+}
+
+test "an_urgent_triggers_question_is_an_urgent_item" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try setWorkflow(&f, "leak", "workflow leak\nurgent yes\nstep ask\napprove Close the water main now?\n");
+    try setWorkflow(&f, "water", "workflow water\nstep ask\napprove Close the water main?\n");
+    _ = try f.core.command(a, "/workflow start leak");
+    runWorkflows(&f);
+    _ = try f.core.command(a, "/workflow start water");
+    runWorkflows(&f);
+    try f.rec.waitFor("Close the water main?");
+    f.core.inbox.mutex.lockUncancelable(t.io);
+    defer f.core.inbox.mutex.unlock(t.io);
+    var urgent: usize = 0;
+    var plain: usize = 0;
+    for (f.core.inbox.items.items) |it| {
+        if (std.mem.indexOf(u8, it.title, "now?") != null) {
+            try t.expect(it.urgent);
+            urgent += 1;
+        } else {
+            try t.expect(!it.urgent);
+            plain += 1;
+        }
+    }
+    try t.expectEqual(1, urgent);
+    try t.expectEqual(1, plain);
 }
 
 test "quiet_off_sends_what_is_held_and_quiet_on_holds_again" {
