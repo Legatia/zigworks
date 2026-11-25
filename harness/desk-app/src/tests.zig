@@ -7,4 +7,5 @@ test {
     _ = @import("alive.zig");
     _ = @import("policy.zig");
     _ = @import("bridge.zig");
+    _ = @import("controller.zig");
 }

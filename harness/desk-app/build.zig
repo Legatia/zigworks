@@ -11,7 +11,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    const unit = b.addTest(.{ .root_module = unit_mod });
+    const filters: []const []const u8 = if (b.option([]const u8, "test-filter", "Run only the tests whose names hold this")) |f| &.{f} else &.{};
+    const unit = b.addTest(.{ .root_module = unit_mod, .filters = filters });
     const run_unit = b.addRunArtifact(unit);
     b.step("test", "Run the unit tests").dependOn(&run_unit.step);
 }
