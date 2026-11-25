@@ -14984,14 +14984,17 @@ pub const Core = struct {
         // card says what waits or comes next; a dot for news since the
         // owner last opened it here
         const cards = Topics.carded(c, a) catch &.{};
-        const Conv = struct { name: []const u8, title: []const u8, topic: bool, private: bool };
+        const Conv = struct { name: []const u8, title: []const u8, topic: bool, private: bool, subject: []const u8 = "" };
         var convs: std.ArrayList(Conv) = .empty;
         {
             c.convs.mutex.lockUncancelable(c.io);
             defer c.convs.mutex.unlock(c.io);
+            // the terminal's conversation only where the terminal is the channel
+            const in_chat = std.mem.eql(u8, c.role, "chat");
             for (c.convs.items.items) |e| {
                 if (e.audience != .own) continue;
-                const conv: Conv = .{ .name = try a.dupe(u8, e.name), .title = try a.dupe(u8, if (std.mem.eql(u8, e.name, "main")) "Main" else if (e.title.len > 0) e.title else e.name), .topic = e.thread != 0, .private = e.isPrivate() };
+                if ((e.channel == .terminal) != in_chat and !std.mem.eql(u8, e.name, "main")) continue;
+                const conv: Conv = .{ .name = try a.dupe(u8, e.name), .title = try a.dupe(u8, if (std.mem.eql(u8, e.name, "main")) "Main" else if (e.title.len > 0) e.title else e.name), .topic = e.thread != 0, .private = e.isPrivate(), .subject = try a.dupe(u8, e.subject) };
                 if (std.mem.eql(u8, e.name, "main")) try convs.insert(a, 0, conv) else try convs.append(a, conv);
             }
             if (convs.items.len == 0 or !std.mem.eql(u8, convs.items[0].name, "main")) try convs.insert(a, 0, .{ .name = "main", .title = "Main", .topic = false, .private = false });
@@ -15015,6 +15018,8 @@ pub const Core = struct {
             try util.jsonString(&out, a, cv.title);
             try out.print(a, ",\"topic\":{s},\"private\":{s},\"news\":{s},\"line\":", .{ if (cv.topic) "true" else "false", if (cv.private) "true" else "false", if (news) "true" else "false" });
             try util.jsonString(&out, a, c.masks.scrubAlloc(a, line) catch line);
+            try out.appendSlice(a, ",\"subject\":");
+            try util.jsonString(&out, a, cv.subject);
             try out.append(a, '}');
         }
         try out.append(a, ']');

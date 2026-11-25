@@ -6,8 +6,180 @@
 <title>harness</title>
 <link rel="stylesheet" href="/desk/static/desk.css">
 </head>
-<body>
-<main id="desk" data-desk="1"></main>
+<body data-state="resting">
+<div class="app">
+  <header class="top">
+    <div class="brand">
+      <span class="mark">HARNESS</span>
+      <span class="where" id="where">main</span>
+    </div>
+    <div class="facts">
+      <span id="quietFact" hidden></span>
+      <span id="speakFact" hidden></span>
+      <button type="button" id="muteBtn" class="icon cut-s" aria-pressed="false" aria-label="Mute" title="Mute">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"></path><path id="muteWaves" d="M16 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12"></path></svg>
+      </button>
+      <button type="button" id="settingsBtn" class="icon cut-s" aria-label="Settings" title="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"></path></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="body">
+    <main class="main">
+      <section class="stage" aria-label="Avatar">
+        <div class="frame">
+          <div class="avatar" id="avatar"></div>
+          <div class="glow" aria-hidden="true"></div>
+          <span class="br tl" aria-hidden="true"></span><span class="br tr" aria-hidden="true"></span><span class="br bl" aria-hidden="true"></span><span class="br bk" aria-hidden="true"></span>
+          <div class="sweep" aria-hidden="true"></div>
+          <div class="readouts" id="readouts" aria-hidden="true"></div>
+          <div class="caption" id="caption" aria-hidden="true"></div>
+          <div class="card cut" id="card" role="status" aria-live="polite">
+            <div class="state"><span class="dot" aria-hidden="true"></span><span id="stateLabel">resting</span></div>
+            <div class="line1" id="line1"></div>
+            <div class="line2" id="line2"></div>
+            <div class="actions">
+              <button type="button" id="replayBtn" class="btn cut-s" hidden>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="square" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"></path><path d="M16 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12"></path></svg>
+                Play the message
+              </button>
+              <button type="button" id="workBtn" class="link" hidden>See the work</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="chat" aria-label="Chat">
+        <div class="chat-head">
+          <h2 id="chatTitle">Main</h2>
+          <span class="note" id="chatNote" hidden></span>
+        </div>
+        <ol class="log" id="log"></ol>
+        <form class="compose" id="compose">
+          <label class="sr" for="msg">Message</label>
+          <div class="field cut-s"><span class="prompt" aria-hidden="true">&gt;</span><input id="msg" type="text" autocomplete="off" placeholder="Message"></div>
+          <button type="button" id="micBtn" class="icon cut-s" aria-pressed="false" aria-label="Speak" title="Speak" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" aria-hidden="true"><rect x="9" y="3" width="6" height="12"></rect><path d="M5 11a7 7 0 0 0 14 0M12 18v3"></path></svg>
+          </button>
+          <button type="submit" class="send cut-s">Send</button>
+        </form>
+        <p class="compose-note" id="composeNote" role="status" hidden></p>
+      </section>
+    </main>
+
+    <aside class="side">
+      <section aria-labelledby="needsH">
+        <h2 id="needsH">Needs you <span class="count" id="needsCount"></span></h2>
+        <div id="needs"></div>
+        <p class="empty" id="needsEmpty">Nothing waits for you.</p>
+      </section>
+      <section aria-labelledby="topicsH">
+        <h2 id="topicsH">Topics</h2>
+        <ul class="topics" id="topics"></ul>
+      </section>
+      <section aria-labelledby="latelyH">
+        <h2 id="latelyH">Lately</h2>
+        <ul class="lately" id="lately"></ul>
+        <p class="empty" id="latelyEmpty">Nothing yet.</p>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<dialog id="settings" aria-labelledby="settingsH">
+  <div class="dlg">
+    <div class="dlg-head">
+      <h2 id="settingsH">Settings</h2>
+      <button type="button" id="settingsClose" class="btn cut-s">Close</button>
+    </div>
+
+    <fieldset>
+      <legend>Avatar</legend>
+      <div id="avatarChoices" role="radiogroup" aria-label="Avatar"></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Your own avatar</legend>
+      <h3>
+        Upload a photo
+        <span class="info">
+          <button type="button" aria-expanded="false" aria-controls="photoInfo" aria-label="About the photo">i</button>
+          <span class="bubble" id="photoInfo" hidden>
+            <ul>
+              <li>The photo is fitted onto a 3D head and becomes the whole scene: its background, hair, shoulders and lighting.</li>
+              <li>These are refused, with the reason: a face turned more than about 8°, an open mouth or teeth showing, closed eyes, more than one face, a face too small to find.</li>
+              <li>These fit but may look off: glasses (the eyes move behind frames drawn on the skin), hair over the eyes, cartoon or anime styles (which may not be found at all).</li>
+              <li>Every avatar gets the same teeth and mouth, and turns its head a few degrees at most.</li>
+            </ul>
+          </span>
+        </span>
+      </h3>
+      <ul class="rules">
+        <li>Facing the camera, eyes open, mouth closed.</li>
+        <li>One face, head and shoulders, wider than tall.</li>
+        <li>Works best without glasses.</li>
+        <li>JPEG or PNG, up to 10 MB.</li>
+      </ul>
+      <div class="row">
+        <label class="sr" for="upName">Name</label>
+        <input type="text" id="upName" placeholder="Name (a-z, 0-9, -)" maxlength="32" autocomplete="off" spellcheck="false">
+        <label class="sr" for="upFile">Photo</label>
+        <input type="file" id="upFile" accept="image/jpeg,image/png">
+      </div>
+      <label class="consent"><input type="checkbox" id="upConsent"><span>This is me, someone who agreed, or a made-up character.</span></label>
+      <p class="fine">The photo stays on this computer, in <span class="mono" id="upDir">avatars/NAME/</span>.</p>
+      <div class="row">
+        <button type="button" id="upBtn" class="btn cut-s" disabled>Upload</button>
+        <button type="button" id="fitBtn" class="btn cut-s" hidden>Fit it</button>
+      </div>
+      <p class="outcome" id="upOutcome" role="status" hidden></p>
+
+      <h3>
+        Add an eyes-closed version
+        <span class="info">
+          <button type="button" aria-expanded="false" aria-controls="closedInfo" aria-label="About the eyes-closed version">i</button>
+          <span class="bubble" id="closedInfo" hidden>
+            <ul>
+              <li>Make one with an image tool: ask it to close the eyes and change nothing else. It's one image edit, not a video.</li>
+              <li>It must line up with the first photo, and the desk checks this.</li>
+              <li>Without it, closed eyes are drawn in the skin's tone.</li>
+            </ul>
+          </span>
+        </span>
+      </h3>
+      <p class="fine">Recommended: the avatar rests with its eyes closed.</p>
+      <div class="row">
+        <label class="sr" for="closedFile">Eyes-closed photo</label>
+        <input type="file" id="closedFile" accept="image/jpeg,image/png">
+        <button type="button" id="closedBtn" class="btn cut-s" disabled>Add it</button>
+      </div>
+      <p class="outcome" id="fitOutcome" role="status" hidden></p>
+    </fieldset>
+
+    <fieldset>
+      <legend>
+        Speak replies
+      </legend>
+      <div class="row">
+        <label class="sr" for="speakSel">Speak replies</label>
+        <select id="speakSel"></select>
+        <span class="info">
+          <button type="button" aria-expanded="false" aria-controls="speakInfo" aria-label="About speaking">i</button>
+          <span class="bubble" id="speakInfo" hidden>
+            <ul>
+              <li>New replies in the conversation you have open are read aloud once. A long one reads its first two sentences.</li>
+              <li>Urgent alerts are always read while the desk is open and not muted; in quiet hours, only they are.</li>
+              <li>A provider's voice is fetched by harness, so its key stays in harness.</li>
+            </ul>
+          </span>
+        </span>
+      </div>
+      <p class="outcome" id="speakOutcome" role="status" hidden></p>
+    </fieldset>
+  </div>
+</dialog>
+
 <script type="module" src="/desk/static/desk.js"></script>
 </body>
 </html>

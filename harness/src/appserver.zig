@@ -1633,3 +1633,38 @@ fn sendBig(a: std.mem.Allocator, port: u16, method: []const u8, path: []const u8
     const status = try std.fmt.parseInt(u16, all[9..12], 10);
     return .{ .status = status, .head = all[0..split], .body = all[split + 4 ..] };
 }
+
+test "the_settings_page_carries_the_photo_rules" {
+    const page = deskFile("index.html").?;
+    // inline beside the upload button, the consent line, the privacy line
+    for ([_][]const u8{
+        "Facing the camera, eyes open, mouth closed.",
+        "One face, head and shoulders, wider than tall.",
+        "Works best without glasses.",
+        "JPEG or PNG, up to 10 MB.",
+        "This is me, someone who agreed, or a made-up character.",
+        "The photo stays on this computer",
+        "Add an eyes-closed version",
+        "Recommended: the avatar rests with its eyes closed.",
+        // behind the "i" bubbles
+        "The photo is fitted onto a 3D head and becomes the whole scene: its background, hair, shoulders and lighting.",
+        "These are refused, with the reason: a face turned more than about 8°, an open mouth or teeth showing, closed eyes, more than one face, a face too small to find.",
+        "These fit but may look off: glasses (the eyes move behind frames drawn on the skin), hair over the eyes, cartoon or anime styles (which may not be found at all).",
+        "Every avatar gets the same teeth and mouth, and turns its head a few degrees at most.",
+        "Make one with an image tool: ask it to close the eyes and change nothing else. It's one image edit, not a video.",
+        "It must line up with the first photo, and the desk checks this.",
+        "Without it, closed eyes are drawn in the skin's tone.",
+        "Play the message",
+        "Needs you",
+        "Lately",
+    }) |line| try expectHas(page, line);
+    // the consent tick gates the upload: the button starts disabled
+    try expectHas(page, "<button type=\"button\" id=\"upBtn\" class=\"btn cut-s\" disabled>Upload</button>");
+    try expectHas(page, "<input type=\"checkbox\" id=\"upConsent\">");
+    // no inline style or script: the CSP allows neither
+    try t.expect(std.mem.indexOf(u8, page, "style=") == null);
+    try t.expect(std.mem.indexOf(u8, page, "<script>") == null);
+    try t.expect(std.mem.indexOf(u8, page, "http://") == null and std.mem.indexOf(u8, page, "https://") == null);
+    // the script gates the upload on the tick too
+    try expectHas(deskFile("desk.js").?, "upConsent");
+}
