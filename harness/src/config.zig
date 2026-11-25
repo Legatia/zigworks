@@ -386,7 +386,13 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
     const dk = cfg.desk;
     if (!avatarName(dk.avatar)) return error.BadDesk;
     if (!std.mem.eql(u8, dk.speak, "off") and !std.mem.eql(u8, dk.speak, "browser")) {
-        if (speakApi(cfg, dk.speak) == null) return error.BadDesk;
+        const kind = speakApi(cfg, dk.speak) orelse return error.BadDesk;
+        // OpenAI's names, as harness init wrote them until 2026-11-25:
+        // never sent to a Gemini-format voice
+        if (kind == .gemini) {
+            if (std.mem.eql(u8, dk.speak_model, "tts-1")) cfg.desk.speak_model = "";
+            if (std.mem.eql(u8, dk.speak_voice, "alloy")) cfg.desk.speak_voice = "";
+        }
     }
     return cfg;
 }
@@ -454,7 +460,8 @@ pub fn speakApi(cfg: Config, name: []const u8) ?model.Api {
 /// the sections that can, in the file's order.
 pub fn speakers(a: std.mem.Allocator, cfg: Config) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    try out.appendSlice(a, &.{ "openai", "gemini" });
+    // a preset's section may make it speak another format
+    for ([_][]const u8{ "openai", "gemini" }) |name| if (speakApi(cfg, name) != null) try out.append(a, name);
     for (cfg.providers) |p| {
         if (std.mem.eql(u8, p.name, "openai") or std.mem.eql(u8, p.name, "gemini")) continue;
         if (speakApi(cfg, p.name) != null) try out.append(a, p.name);
@@ -1630,6 +1637,33 @@ test "speakers_are_the_two_presets_and_speaking_sections" {
     try t.expect(speakApi(c, "opencode") == null);
     try t.expect(speakApi(c, "anthropic") == null);
     try t.expect(speakApi(c, "off") == null);
+}
+
+test "an_old_inits_openai_lines_never_reach_gemini" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // what harness init wrote until 2026-11-25, with speak turned to a Gemini-format voice
+    for ([_][]const u8{ "", "[provider gem]\napi = gemini\nurl = https://p.example.com/v1beta\n" }, [_][]const u8{ "gemini", "gem" }) |extra, name| {
+        const c = try parse(a, try std.fmt.allocPrint(a, "{s}[desk]\nspeak = {s}\nspeak_model = tts-1\nspeak_voice = alloy\n", .{ extra, name }));
+        try t.expectEqualStrings("", c.desk.speak_model);
+        try t.expectEqualStrings("", c.desk.speak_voice);
+    }
+    // OpenAI's format keeps them; Gemini keeps its own
+    const o = try parse(a, "[desk]\nspeak = openai\nspeak_model = tts-1\nspeak_voice = alloy\n");
+    try t.expectEqualStrings("tts-1", o.desk.speak_model);
+    try t.expectEqualStrings("alloy", o.desk.speak_voice);
+    const g = try parse(a, "[desk]\nspeak = gemini\nspeak_model = gemini-3.8-flash-tts\nspeak_voice = Charon\n");
+    try t.expectEqualStrings("gemini-3.8-flash-tts", g.desk.speak_model);
+    try t.expectEqualStrings("Charon", g.desk.speak_voice);
+}
+
+test "a_preset_made_to_speak_another_format_is_no_voice" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try parse(a, "[provider openai]\napi = anthropic\nurl = https://p.example.com/v1\n");
+    try t.expectEqualDeep(@as([]const []const u8, &.{"gemini"}), try speakers(a, c));
 }
 
 test "butler_escalate_reads" {

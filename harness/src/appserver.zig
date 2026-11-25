@@ -1733,6 +1733,8 @@ test "the_desk_page_keeps_to_its_own_facts_and_says_where_speech_goes" {
     const bubble_close = std.mem.lastIndexOf(u8, html[0..line_at], "</span>");
     try t.expect(bubble_open == null or (bubble_close != null and bubble_close.? > bubble_open.?));
     try expectHas(js, "\"Not read aloud: \"");
+    // seen before choosing: shown whenever a Gemini-format voice is offered
+    try expectHas(js, "$(\"speakFree\").hidden = !(S.settings.speakers || []).some((x) => x.api === \"gemini\");");
     // targets of 44 px, the "i" too
     try expectHas(deskFile("desk.css").?, ".info > button { width: 44px; height: 44px;");
     // the apps, from the side panel

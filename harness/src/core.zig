@@ -15239,11 +15239,13 @@ pub const Core = struct {
         try util.jsonString(out, a, d.speak_voice);
         // each voice's kind, its defaults, and whether its key is there
         try out.appendSlice(a, ",\"speakers\":[");
-        for (c.deskSpeakers(a), 0..) |name, i| {
+        var written: usize = 0;
+        for (c.deskSpeakers(a)) |name| {
             const kind = config.speakApi(c.cfg, name) orelse continue;
             const def = voice_mod.speakDefaults(kind) orelse continue;
             const key = if (c.providers.find(name)) |p| p.hasKey() else false;
-            if (i > 0) try out.append(a, ',');
+            if (written > 0) try out.append(a, ',');
+            written += 1;
             try out.appendSlice(a, "{\"name\":");
             try util.jsonString(out, a, name);
             try out.print(a, ",\"api\":\"{s}\",\"model\":", .{@tagName(kind)});
@@ -36670,6 +36672,18 @@ test "desk_speech_fetches_the_providers_audio" {
     // speak = off or browser: harness fetches nothing
     _ = deskCall(&f, .POST, "settings", "", "{\"speak\":\"off\"}");
     try t.expectEqual(std.http.Status.conflict, deskCall(&f, .POST, "speech", "", try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{id})).status);
+}
+
+test "the_desk_state_reads_whatever_the_voices_are" {
+    var f: Fix = undefined;
+    // the openai preset pointed at an Anthropic-format gateway: no voice
+    try f.init("[provider openai]\napi = anthropic\nurl = http://127.0.0.1:9/v1\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const st = deskCall(&f, .GET, "state", "", "").body;
+    const v = jv.parse(a, st) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(1, jv.arr(jv.at(v, &.{ "settings", "speakers" })).?.len);
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "settings", "", "{\"speak\":\"openai\"}").status);
 }
 
 test "desk_model_and_voice_are_checked_then_written" {

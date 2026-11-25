@@ -661,8 +661,8 @@ function renderSettings() {
 
 /**
  * A provider reads replies aloud: where they go (or the key it lacks), its
- * model and voice with the kind's defaults greyed in, and, for Gemini's
- * format, its free tier's data use, all inline.
+ * model and voice with the kind's defaults greyed in, and, whenever a
+ * Gemini-format voice is offered, its free tier's data use, all inline.
  */
 function speakWhere() {
   const v = $("speakSel").value || S.settings.speak;
@@ -681,7 +681,8 @@ function speakWhere() {
       if (document.activeElement !== input) input.value = mine ? S.settings[key] || "" : "";
     }
   }
-  $("speakFree").hidden = !(sp && sp.api === "gemini");
+  // seen before choosing, not only once chosen
+  $("speakFree").hidden = !(S.settings.speakers || []).some((x) => x.api === "gemini");
 }
 
 async function setSetting(change, outcomeId) {

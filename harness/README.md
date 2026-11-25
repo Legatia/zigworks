@@ -2189,7 +2189,9 @@ speak = gemini
 ```
 
 Then `harness secret add gemini` (a key from Google AI Studio) and
-`/reload`, or choose it in the desk's settings.
+`/reload`, or choose it in the desk's settings. An older `harness init`
+wrote `speak_model = tts-1` and `speak_voice = alloy`: those two count as
+unset for a Gemini-format voice, so it gets its own defaults.
 
 Any `[provider NAME]` with `api = openai` or `api = gemini` can speak too,
 with the lines providers take (Models and providers): `url`, `key`,
@@ -2224,9 +2226,9 @@ says `api = openai` itself. `api = gemini` is for speech only for now.
 **Model and voice.** `speak_model` and `speak_voice` are the chosen
 provider's; unset, its kind's default (the table). The desk's settings
 show both, the defaults greyed in, and write what you type to config.ini.
-Choosing a provider of another kind there clears them: an older `harness
-init` wrote `speak_model = tts-1` and `speak_voice = alloy`, which Gemini
-doesn't know. By hand, delete those lines when you switch kinds. Gemini has
+Choosing a provider of another kind there clears them. By hand, change or
+delete them when you switch kinds (an older init's `tts-1` and `alloy` are
+ignored for Gemini's format). Gemini has
 30 prebuilt voices (Kore, Charon, Schedar, Sulafat, …; Google's speech
 generation docs list them); `Schedar` is even and unhurried, for the
 butler.
