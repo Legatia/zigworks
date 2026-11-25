@@ -5,6 +5,81 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: first run changes your apps (2026-11-25, evening)
+
+The owner asked how far the desk is from a proper working app, and to
+close the gaps. The real macOS app was tried against a fresh data folder.
+Entry, a chat turn, and an upload with its fit (2.2 s in WKWebView) work.
+Four things didn't:
+
+- `harness run` exits without a Telegram bot;
+- setup is terminal-only;
+- no avatar and no fit files reach a fresh install, so the stage is empty;
+- times show UTC.
+
+The spec has a new section for this: "First run, and the desk alone
+(added 2026-11-25)". They are the Mac session's calls, and the owner can
+overrule them. What it means for the Windows and Linux apps:
+
+- **Your package carries harness and the fit files.** Beside
+  `harness-desk.exe` (and the Linux binary): `harness.exe` and
+  `desk-assets/`. One download.
+- **Finding harness:** the binary `state/desk.json` names, when it is
+  there; otherwise your own copy.
+- **No config.ini in the data folder: show "Set up",** your own screen,
+  instead of "Set up harness first". It has Provider, Model, Address (for
+  omnigate and Other only) and [Continue], which:
+  1. runs `harness init`;
+  2. runs `harness config set SECTION.KEY VALUE` for each setting (new;
+     exit 0, or non-zero with one line on stderr and the file untouched);
+  3. asks for the key in a native secure field and pipes it to
+     `harness secret add NAME --stdin`;
+  4. starts harness and enters.
+- **The key never reaches a page,** your own screen included. Use a
+  native password field: a Win32 edit control with `ES_PASSWORD`, a
+  `GtkEntry` with visibility off.
+- **A menu item "Provider and key…"** opens the same screen with the
+  values in use (`harness config get SECTION.KEY`).
+- **harness serves `/desk/assets/…`** from the data folder's
+  `desk-assets/`, then `desk-assets/` beside its binary. Nothing for you
+  to do but pack the folder.
+- **`utc_offset = auto`** needs the system's zone on Windows. The Mac
+  session's builder adds the kernel32 call and cross-compiles it; it
+  can't run it. Please check it on Windows when `platform/desk-alone`
+  lands: the desk's times, and a brief's time across a daylight-saving
+  change if you can fake the clock.
+
+The macOS screen and its controller code land after `platform/desk-alone`
+and `platform/desk-fit-files`. As with the rest of the app, the shared
+part will be in `desk-app/src/` for you to reuse.
+
+### The desk's voice (merged, aea003e)
+
+Nothing changes in your apps. For the record:
+
+- `[desk] speak = off | browser | openai | gemini | NAME`, where NAME is a
+  `[provider NAME]` section with `api = openai` or `api = gemini`;
+  `speak_model` and `speak_voice` beside it, all three set in the desk's
+  Settings.
+- A provider's `api` may now be `gemini` (speech only), and `auth` may be
+  `x-goog-api-key`.
+- Gemini's audio is served to the page as `audio/wav`. Media must still
+  play without a click.
+- OpenAI shuts down `tts-1`, `tts-1-hd` and `gpt-4o-mini-tts` on
+  2027-01-06. The owner hasn't decided what the `openai` preset does
+  after that.
+
+### The base head and what can't ship yet
+
+- The base head the fit starts from was made from the Face Cap model,
+  whose licence isn't cleared. A replacement from ICT-FaceKit (MIT) is
+  being built on `platform/desk-base-head`.
+- The built-in butler's portraits are held too, until the owner says
+  where they came from. A fresh install starts with no avatar, and the
+  stage offers [Add a portrait].
+- Don't commit or package `facecap.glb`, a Face Cap `base-head.bin`, or
+  the butler pack.
+
 ## For you: the desk is approved, with a 3D head (2026-11-25)
 
 > "Use 3d head. Finish the frontend now"
@@ -50,7 +125,12 @@ against the spec and adjust.
 |---|---|---|
 | `platform/desk-mac` | harness-desk for macOS | merged into harness-logins (d252816): reviewed, unit 61/61, window smoke 46/46 |
 | `platform/desk` | harness's side and the desk page | merged into harness-logins: reviewed, unit 1513/1535, smoke 162 (195 with the stand-ins); avatar.js, fit.js and three.js are stand-ins until the avatar lands |
-| `platform/desk-avatar` | the 3D head module, the fit, `harness avatar check` | building; lands next |
+| `platform/desk-avatar` | the 3D head module, the fit, `harness avatar check` | merged (2ec85ec) |
+| `platform/desk-voice` | the desk's voice: any provider that speaks OpenAI's or Gemini's format | merged (aea003e) |
+| `platform/desk-base-head` | a base head made from ICT-FaceKit (MIT), replacing the Face Cap one | building |
+| `platform/desk-alone` | `harness run` without Telegram, `harness config set`, `utc_offset = auto` | building |
+| `platform/desk-fit-files` | the fit files in the release archives and served from beside the binary; the no-avatar stage | building |
+| (next) | the macOS app carries harness and sets it up | after the two above |
 
 ### The desk app's code is yours to extend
 
