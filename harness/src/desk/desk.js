@@ -6,7 +6,7 @@
 // The bridge tells the desk app the count of items, an urgent arrival and
 // a lost session.
 
-import { createAvatar } from "/desk/static/avatar.js";
+import { createAvatar, createVoice } from "/desk/static/avatar.js";
 
 const $ = (id) => document.getElementById(id);
 const API = "/desk/api/";
@@ -28,6 +28,7 @@ const S = {
   speakQueue: [],
   lastSpoken: null,
   muted: false,
+  speakTurn: 0,
   seenItems: null,
   lastBadge: -1,
   lastAlerts: 0,
@@ -430,8 +431,12 @@ $("compose").addEventListener("submit", async (e) => {
 
 // ---- the voice: speaking replies, and the microphone ----
 
+// spoken by the avatar, or with none chosen by a voice alone
+const plainVoice = createVoice();
+const voice = () => S.avatar || plainVoice;
+
 function speakable(m, live) {
-  if (!live || m.from !== "harness" || S.muted || !S.avatar) return false;
+  if (!live || m.from !== "harness" || S.muted) return false;
   const mode = S.settings.speak;
   if (mode === "off") return false;
   if (m.urgent) return true;
@@ -448,7 +453,8 @@ async function speakNext() {
 }
 
 async function speakMsg(m, conv) {
-  if (!S.avatar) return;
+  // muting, or a later reply, ends this one even while its voice is still on the way
+  const turn = ++S.speakTurn;
   S.speaking = true;
   S.lastSpoken = m;
   if (conv) S.speakingConv = conv;
@@ -456,7 +462,7 @@ async function speakMsg(m, conv) {
   renderCard();
   try {
     if (S.settings.speak === "browser") {
-      await S.avatar.speak({ text: m.say || m.text, browser: true });
+      await voice().speak({ text: m.say || m.text, browser: true });
     } else {
       const r = await fetch(API + "speech", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: m.id }) });
       if (r.status === 401) {
@@ -470,21 +476,21 @@ async function speakMsg(m, conv) {
         } catch (_) {}
         throw new Error(why);
       }
-      const url = URL.createObjectURL(await r.blob());
-      try {
-        await S.avatar.speak({ text: m.say || m.text, audioUrl: url });
-      } finally {
-        URL.revokeObjectURL(url);
-      }
+      const audio = await r.blob();
+      if (turn !== S.speakTurn) return;
+      // the audio itself: the page may fetch only harness, not a blob: address
+      await voice().speak({ text: m.say || m.text, audio });
     }
     if ($("composeNote").textContent.startsWith("Not read aloud: ")) note("composeNote", "");
   } catch (err) {
     // said under the chat, in the provider's words as harness put them
-    if (!(err instanceof SignedOut)) note("composeNote", "Not read aloud: " + ((err && err.message) || "the voice didn't play."), true);
+    if (turn === S.speakTurn && !(err instanceof SignedOut)) note("composeNote", "Not read aloud: " + ((err && err.message) || "the voice didn't play."), true);
   } finally {
-    S.speaking = false;
-    $("caption").textContent = "";
-    renderCard();
+    if (turn === S.speakTurn) {
+      S.speaking = false;
+      $("caption").textContent = "";
+      renderCard();
+    }
   }
 }
 
@@ -499,6 +505,8 @@ $("muteBtn").addEventListener("click", () => {
   } catch (_) {}
   if (S.muted) {
     S.speakQueue = [];
+    S.speakTurn++;
+    plainVoice.stop();
     if (S.avatar) S.avatar.stop();
     // not left waiting on a voice that was stopped
     S.speaking = false;

@@ -314,3 +314,9 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
   - the muted sound button changed only its colour: it draws a cross.
   - Debug and ReleaseSafe 1604/1626 (22 skipped), smoke all ok; cross builds ok; desk app smoke 110/110 with this harness.
   - Seen working: the stopped page, Settings at both sizes, "Provider and key…", a still-only avatar, the fit in WKWebView (an open-mouth photo refused, a closed-mouth one fitted and drawn), a reply, an `ask_owner` question with the badge and its answer. Not judged: the head's movement (screen locked, the page got no frames) and speech by ear.
+- 2026-11-25 CI for 5bf2b06 (run 45678880081): 34/34 after one rerun (three macOS jobs had been cancelled for lack of a runner).
+- 2026-11-25 the desk reads replies aloud: three defects in the page, each with an app smoke check seen failing first:
+  - with no avatar chosen (a fresh install) nothing was read aloud: `createVoice()` in avatar.js, the avatar's `speak()`/`stop()` with no face;
+  - with an avatar, a provider's audio never played: the page's content policy refuses the fetch of a `blob:` address ("Load failed"); the page hands over the audio itself;
+  - muting while a provider was still answering let the reply play when its audio arrived: a muted or overtaken reply is dropped.
+  - Debug and ReleaseSafe 1604/1626 (22 skipped), smoke all ok; cross builds ok; desk app smoke 115/115 with this harness; `tools/test-avatar.mjs` 41/41 (the four new ones seen failing against a broken copy); `tools/behaviour-checks.js` 25/25 in headless Chrome under the desk's policy. Seen in the app with a fitted avatar: a stood-in provider answer is played ("Load failed" before). Not judged: the voice by ear.

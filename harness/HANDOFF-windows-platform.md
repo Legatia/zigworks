@@ -5,6 +5,39 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: the desk reads replies aloud (2026-11-25, night)
+
+Three defects in the page, all fixed in `src/desk/`. Your app shows the
+same page, so it gets them with the next merge.
+
+- **With no avatar chosen nothing was read aloud.** A fresh install has
+  no avatar, so turning Speak replies on did nothing and said nothing.
+  `avatar.js` now exports `createVoice()`: the avatar's `speak()` and
+  `stop()` with no face. A provider's audio plays through an audio element
+  (`media-src` already allows `blob:`); the built-in voice is used as the
+  avatar uses it. `desk.js` speaks through the avatar when there is one,
+  else through this voice, and muting stops both.
+- **With an avatar, a provider's voice never played.** The page made a
+  `blob:` address from harness's audio and the avatar fetched it, which
+  the desk's content policy refuses (`connect-src` is harness alone):
+  "Not read aloud: The voice didn't play: Load failed". Seen in WKWebView
+  and in Chrome. The page now hands the avatar the audio itself
+  (`speak({ text, audio: Blob })`); the policy is unchanged. WebView2 is
+  Chromium, so yours had the same defect.
+- **Muting while a provider was still answering let that reply play**
+  once its audio arrived. A reply muted, or overtaken, before its audio
+  arrives is now dropped, and says nothing under the chat.
+- **What to check on your side:** that your web view plays an audio
+  element and the built-in voice without a click (ours is set to; the
+  smoke's "media plays without a click" and "speech starts without a
+  click"). The smoke's new checks stand in for the voice on the page
+  (`speechSynthesis.speak`, the page's `speech` request), so they need no
+  sound device and call no provider: copy them if your smoke drives the
+  real page.
+- **Not judged:** the voice by ear (this Mac's screen is locked). Speak
+  replies stays off by default, and off means urgent alerts aren't spoken
+  either.
+
 ## For you: the desk page fits its window (2026-11-25, late)
 
 Found by looking at the page in the macOS app, not by a test. Your app

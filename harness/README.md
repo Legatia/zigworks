@@ -2210,7 +2210,8 @@ Replies in the conversation the desk shows are read aloud once (a long one
 its first two sentences, then "The rest is on screen."); urgent alerts are
 always read while the desk is open and not muted; in quiet hours only
 they are. "Play the message" reads the last one again. A reply that
-couldn't be read aloud says why under the chat.
+couldn't be read aloud says why under the chat. With no avatar chosen the
+replies are read all the same, by the voice alone.
 
 `[desk] speak` picks the voice:
 

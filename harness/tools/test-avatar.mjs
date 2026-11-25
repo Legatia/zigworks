@@ -604,5 +604,74 @@ try {
   n++; console.log('ok ' + n + ' the_still_is_fingerprinted_by_sha256');
 } catch (e) { failed++; console.log('FAIL the_still_is_fingerprinted_by_sha256\n  ' + (e && e.stack || e)); }
 
+// the voice with no face (createVoice), over a stand-in built-in voice and
+// a stand-in audio element
+async function acheck(name, fn) {
+  try { await fn(); n++; console.log('ok ' + n + ' ' + name); }
+  catch (e) { failed++; console.log('FAIL ' + name + '\n  ' + (e && e.stack || e)); }
+}
+{
+  const kept = { synth: globalThis.speechSynthesis, utt: globalThis.SpeechSynthesisUtterance, audio: globalThis.Audio };
+  const said = []; let cancels = 0;
+  globalThis.SpeechSynthesisUtterance = class { constructor(text) { this.text = text; } };
+  globalThis.speechSynthesis = { getVoices: () => [{ name: 'Samantha', lang: 'en-US' }, { name: 'Daniel', lang: 'en-GB' }], speak: (u) => said.push(u), cancel: () => { cancels++; } };
+  const els = [];
+  globalThis.Audio = class { constructor() { els.push(this); this.paused = false; } play() { this.played = true; return Promise.resolve(); } pause() { this.paused = true; } };
+
+  await acheck('a_voice_alone_says_a_reply_with_the_built_in_voice', async () => {
+    const v = av.createVoice();
+    const p = v.speak({ text: 'Three flats match.', browser: true });
+    eq(said.length, 1); eq(said[0].text, 'Three flats match.'); eq(said[0].voice.name, 'Daniel');
+    said[0].onstart(); said[0].onend();
+    eq(await p, true);
+  });
+  await acheck('stopping_a_voice_alone_cancels_the_built_in_voice', async () => {
+    const v = av.createVoice();
+    const p = v.speak({ text: 'Never finished.', browser: true });
+    said[said.length - 1].onstart();
+    const before = cancels;
+    v.stop();
+    eq(await p, false); eq(cancels, before + 1);
+  });
+  await acheck('a_voice_alone_plays_a_providers_audio_and_lets_it_go', async () => {
+    const v = av.createVoice();
+    const made = [], gone = [];
+    const kc = URL.createObjectURL, kr = URL.revokeObjectURL;
+    URL.createObjectURL = (b) => { made.push(b); return 'blob:test-' + made.length; };
+    URL.revokeObjectURL = (u) => gone.push(u);
+    try {
+      const audio = new Blob([new Uint8Array(8)], { type: 'audio/wav' });
+      const p = v.speak({ text: 'Played.', audio });
+      const el = els[els.length - 1];
+      eq(made[0], audio); eq(el.src, 'blob:test-1'); eq(el.played, true);
+      await Promise.resolve();
+      el.onended();
+      eq(await p, true); eq(gone.join(), 'blob:test-1');
+      // a second reply replaces the first: the first ends unsaid
+      const first = v.speak({ text: 'One.', audio });
+      const one = els[els.length - 1];
+      const second = v.speak({ text: 'Two.', audio });
+      eq(await first, false); eq(one.paused, true);
+      els[els.length - 1].onended();
+      eq(await second, true);
+    } finally { URL.createObjectURL = kc; URL.revokeObjectURL = kr; }
+  });
+  await acheck('a_voice_alone_says_why_nothing_was_heard', async () => {
+    const v = av.createVoice();
+    let err = '';
+    globalThis.Audio = class { play() { return Promise.reject(new Error('no decoder')); } pause() {} };
+    try { await v.speak({ text: 'Unplayable.', audio: new Blob([new Uint8Array(4)]) }); } catch (e) { err = e.message; }
+    eq(err, "The voice didn't play: no decoder");
+    globalThis.speechSynthesis = undefined;
+    err = '';
+    try { await av.createVoice().speak({ text: 'No voice.', browser: true }); } catch (e) { err = e.message; }
+    eq(err, 'There is no built-in voice here.');
+    err = '';
+    try { await v.speak({ text: 'Nothing to say it with.' }); } catch (e) { err = e.message; }
+    eq(err, 'speak needs audio or browser: true');
+  });
+  globalThis.speechSynthesis = kept.synth; globalThis.SpeechSynthesisUtterance = kept.utt; globalThis.Audio = kept.audio;
+}
+
 console.log(failed ? `${failed} failed, ${n} passed` : `all ${n} passed`);
 process.exit(failed ? 1 : 0);

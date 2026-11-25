@@ -221,6 +221,21 @@ await sleep(500);
   check('provider_voice_moves_the_mouth_only_while_it_plays', done === true && before < 0.03 && during > 0.1 && after[after.length - 1] < 0.02,
     { done, ms: Math.round(ms), jawBefore: +before.toFixed(3), jawDuring: +during.toFixed(3), jawAfter: +after[after.length - 1].toFixed(3) });
 }
+// 1b. the same handed over as the audio itself, as the desk does (its page
+// may not fetch a blob: address), and a blob: address refused as the desk's is
+{
+  const audio = await (await fetch(voice)).blob();
+  const p = a.speak({ text: 'Your flight to Lisbon moved to nine forty.', audio });
+  const frames = await sample(2600, () => { const i = a.inspect(); return { tau: i.tau, jaw: a.shapes().jawOpen }; });
+  const done = await p;
+  const during = Math.max(0, ...frames.filter((f) => f.tau !== null && f.tau > 0.6 && f.tau < 1.6).map((f) => f.jaw));
+  check('provider_voice_plays_from_the_audio_itself', done === true && during > 0.1, { done, jawDuring: +during.toFixed(3) });
+  const url = URL.createObjectURL(audio);
+  let err = '';
+  try { await a.speak({ text: 'Refused.', audioUrl: url }); } catch (e) { err = e.message; }
+  URL.revokeObjectURL(url);
+  check('a_blob_address_is_not_fetched_under_the_desks_policy', err.startsWith("The voice didn't play: "), { err });
+}
 // 2. a second speak ends the first: the first resolves false
 {
   const first = a.speak({ text: 'One.', audioUrl: voice });

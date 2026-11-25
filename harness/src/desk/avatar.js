@@ -903,6 +903,80 @@ function buildStill(pack, canvas) {
 
 // ---------- the avatar ----------
 
+/** The built-in voice a butler would have: Daniel, else British, else English. */
+function builtInVoice(synth) {
+  const vs = synth ? synth.getVoices() : [];
+  return vs.find((v) => /daniel/i.test(v.name) && /^en/i.test(v.lang)) || vs.find((v) => /en-GB/i.test(v.lang) && /male/i.test(v.name))
+    || vs.find((v) => /en-GB/i.test(v.lang)) || vs.find((v) => /^en/i.test(v.lang)) || null;
+}
+
+/**
+ * A voice with no face, for the desk while no avatar is chosen: the
+ * avatar's speak() and stop(). speak({ text, audio }) plays a provider's
+ * reply (a Blob) through an audio element; speak({ text, browser: true })
+ * says it with the built-in voice. The promise is true once it was said to
+ * its end, false when stopped or replaced, and rejects with what to tell
+ * the owner.
+ */
+export function createVoice() {
+  let cur = null;
+  const synth = () => globalThis.speechSynthesis || null;
+  // the list fills in after the first ask
+  try { synth()?.getVoices(); } catch {}
+  const release = (t) => {
+    clearTimeout(t.timer); clearTimeout(t.watch);
+    if (cur === t) cur = null;
+    if (t.el) { try { t.el.pause(); } catch {} t.el.onended = t.el.onerror = null; }
+    if (t.url) URL.revokeObjectURL(t.url);
+  };
+  const end = (t, done) => {
+    if (!t || t.over) return;
+    t.over = true;
+    release(t);
+    if (t.browser && !done) synth()?.cancel();
+    t.resolve(done);
+  };
+  function speak({ text = '', audio = null, browser = false } = {}) {
+    end(cur, false);
+    return new Promise((resolve, reject) => {
+      const t = { resolve, over: false, playing: false };
+      cur = t;
+      const fail = (msg) => { if (t.over) return; t.over = true; release(t); reject(new Error(msg)); };
+      if (audio) {
+        try {
+          t.url = URL.createObjectURL(audio);
+          const el = t.el = new Audio();
+          el.onended = () => end(t, true);
+          el.onerror = () => fail("The voice didn't play.");
+          el.src = t.url;
+          Promise.resolve(el.play()).catch((e) => fail(e && e.name === 'NotAllowedError' ? "The voice didn't start." : "The voice didn't play: " + (e && e.message)));
+        } catch (e) { fail("The voice didn't play: " + (e && e.message)); }
+      } else if (browser) {
+        const sy = synth();
+        if (!sy || !globalThis.SpeechSynthesisUtterance) { fail('There is no built-in voice here.'); return; }
+        t.browser = true;
+        const u = new SpeechSynthesisUtterance(text);
+        const v = builtInVoice(sy);
+        if (v) u.voice = v;
+        u.rate = 0.96; u.pitch = 0.9;
+        const secs = buildTimeline(text).dur;
+        u.onstart = () => {
+          if (t.over) return;
+          clearTimeout(t.timer); t.playing = true;
+          // some voices never send onend (network voices cut off): the talk ends anyway
+          t.watch = setTimeout(() => end(t, true), (2 * secs + 5) * 1000);
+        };
+        u.onend = () => end(t, true);
+        u.onerror = (e) => { if (e.error === 'interrupted' || e.error === 'canceled') end(t, false); else fail("The voice didn't play: " + e.error); };
+        t.timer = setTimeout(() => { if (!t.over && !t.playing) { sy.cancel(); fail("The voice didn't start."); } }, 5000);
+        sy.cancel();
+        sy.speak(u);
+      } else fail('speak needs audio or browser: true');
+    });
+  }
+  return { speak, stop: () => end(cur, false) };
+}
+
 /**
  * Loads the pack at packUrl (like /desk/avatars/butler/) and starts drawing
  * in element. options:
@@ -1022,11 +1096,7 @@ export async function createAvatar(element, packUrl, options = {}) {
   // ---- speech ----
   let audioCtx = null, synthVoice = null;
   const synth = globalThis.speechSynthesis || null;
-  const pickVoice = () => {
-    const vs = synth ? synth.getVoices() : [];
-    synthVoice = vs.find((v) => /daniel/i.test(v.name) && /^en/i.test(v.lang)) || vs.find((v) => /en-GB/i.test(v.lang) && /male/i.test(v.name))
-      || vs.find((v) => /en-GB/i.test(v.lang)) || vs.find((v) => /^en/i.test(v.lang)) || null;
-  };
+  const pickVoice = () => { synthVoice = builtInVoice(synth); };
   if (synth) { pickVoice(); synth.addEventListener?.('voiceschanged', pickVoice); }
 
   /** Ends the current speech: its promise resolves `done`. */
@@ -1042,14 +1112,16 @@ export async function createAvatar(element, packUrl, options = {}) {
     talk.resolve(done);
   }
 
-  function speak({ text = '', audioUrl = null, browser = false, onWord = null } = {}) {
+  // audio: a provider's reply as a Blob (the desk's; its content policy
+  // lets a page fetch only harness, not a blob: address); audioUrl: fetched
+  function speak({ text = '', audio = null, audioUrl = null, browser = false, onWord = null } = {}) {
     if (disposed) return Promise.resolve(false);
     endTalk(S.talk, false);
     return new Promise((resolve, reject) => {
       const talk = { resolve, reject, over: false, tl: null, playing: false, onWord, lastWord: -1, ends: new Set() };
       S.talk = talk;
       const fail = (msg) => { if (talk.over) return; talk.over = true; clearTimeout(talk.timer); clearTimeout(talk.watch); if (S.talk === talk) S.talk = null; applyDim(); reject(new Error(msg)); };
-      if (audioUrl) {
+      if (audio || audioUrl) {
         (async () => {
           try {
             audioCtx = audioCtx || new (globalThis.AudioContext || globalThis.webkitAudioContext)();
@@ -1058,9 +1130,13 @@ export async function createAvatar(element, packUrl, options = {}) {
               if (talk.over) return;
               if (audioCtx.state !== 'running') { fail("The voice didn't start."); return; }
             }
-            const r = await fetch(audioUrl);
-            if (!r.ok) throw new Error('the voice ' + r.status);
-            const data = await r.arrayBuffer();
+            let data;
+            if (audio) data = await audio.arrayBuffer();
+            else {
+              const r = await fetch(audioUrl);
+              if (!r.ok) throw new Error('the voice ' + r.status);
+              data = await r.arrayBuffer();
+            }
             if (talk.over) return;
             const buf = await audioCtx.decodeAudioData(data);
             if (talk.over) return;
@@ -1104,7 +1180,7 @@ export async function createAvatar(element, packUrl, options = {}) {
         talk.timer = setTimeout(() => { if (!talk.over && !talk.playing) { synth.cancel(); fail("The voice didn't start."); } }, 5000);
         synth.cancel();
         synth.speak(u);
-      } else fail('speak needs audioUrl or browser: true');
+      } else fail('speak needs audio, audioUrl or browser: true');
     });
   }
   function stop() { endTalk(S.talk, false); }

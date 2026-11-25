@@ -142,6 +142,18 @@ desk_probe() {
 expect_probe() {
     case $PROBE in *"$1"*) ok "$2" ;; *) not_ok "$2 (the page said: ${PROBE:-nothing})" ;; esac
 }
+# desk_until NAME JS TEXT [TRIES]: desk_probe, twice a second, until the
+# page's answer holds TEXT
+desk_until() {
+    tries=0
+    while :; do
+        desk_probe "$1" "$2"
+        case $PROBE in *"$3"*) return 0 ;; esac
+        tries=$((tries + 1))
+        [ "$tries" -ge "${4:-40}" ] && return 1
+        sleep 0.5
+    done
+}
 # wait_page N: the setup page shown for the Nth time, and loaded since
 wait_page() {
     i=0
@@ -440,6 +452,43 @@ if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     cmd "js document.getElementById('muteBtn').click()"
     desk_probe unmuted "$sound"
     expect_probe '"sounding waves on cross off"' "real harness: and the waves again once unmuted"
+    # replies are read aloud with no avatar chosen. The built-in voice and
+    # the provider's answer are stood in for on the page: nothing sounds
+    # (the audio is silence) and no provider is asked. The model here can't
+    # be reached, so each message gets harness's own reply saying so
+    speak_by() { cmd "js var s = document.getElementById('speakSel'); s.value = '$1'; s.dispatchEvent(new Event('change', {bubbles: true}));"; }
+    say_desk() { cmd "js document.getElementById('msg').value = '$1'; document.getElementById('compose').requestSubmit();"; }
+    cmd "js window.__said = []; window.__cancels = 0; speechSynthesis.speak = function (u) { window.__said.push(u.text); setTimeout(function () { if (u.onstart) u.onstart({}); }, 20); }; speechSynthesis.cancel = function () { window.__cancels++; };"
+    speak_by browser
+    desk_until voice "[document.getElementById('speakFact').hidden ? 'off' : 'on', document.getElementById('emptyStage').hidden ? 'avatar' : 'no avatar'].join(', ')" '"on, no avatar"'
+    expect_probe '"on, no avatar"' "real harness: Speak replies takes the built-in voice, with no avatar chosen"
+    say_desk "Are you there?"
+    desk_until said "[window.__said.length + ' said', window.__said[0] && document.getElementById('caption').textContent === window.__said[0] ? 'captioned' : 'no caption', window.__said[0]].join(', ')" '"1 said, captioned, ' 60
+    expect_probe '"1 said, captioned, ' "real harness: the reply is read aloud without an avatar, its words under the stage"
+    cmd "js window.__before = window.__cancels; document.getElementById('muteBtn').click()"
+    desk_probe hushed "[window.__cancels > window.__before ? 'stopped' : 'still speaking', document.getElementById('caption').textContent === '' ? 'no caption' : 'captioned'].join(', ')"
+    expect_probe '"stopped, no caption"' "real harness: muting stops that voice"
+    cmd "js document.getElementById('muteBtn').click()"
+    cmd "js window.__played = 0; window.__asked = 0; (function () { var play = HTMLMediaElement.prototype.play; HTMLMediaElement.prototype.play = function () { window.__played++; return play.apply(this, arguments); }; var n = 1600, b = new ArrayBuffer(44 + 2 * n), v = new DataView(b), w = function (o, s) { for (var i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); }; w(0, 'RIFF'); v.setUint32(4, 36 + 2 * n, true); w(8, 'WAVEfmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, 8000, true); v.setUint32(28, 16000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, 2 * n, true); var f = window.fetch; window.fetch = function (u, o) { if (o && o.method === 'POST' && String(u).slice(-6) === 'speech') { window.__asked++; var answer = function () { return new Response(b.slice(0), {status: 200, headers: {'content-type': 'audio/wav'}}); }; if (window.__hold) return new Promise(function (done) { window.__let = function () { done(answer()); }; }); return Promise.resolve(answer()); } return f.apply(this, arguments); }; })();"
+    speak_by openai
+    i=0
+    while [ $i -lt 50 ] && [ "$("$OWN" config get desk.speak --home "$REAL_HOME" 2>/dev/null)" != openai ]; do sleep 0.1; i=$((i + 1)); done
+    sleep 1
+    say_desk "And now?"
+    desk_until played "[window.__asked + ' asked', window.__played + ' played', document.getElementById('composeNote').textContent].join(', ')" '"1 asked, 1 played, "' 60
+    expect_probe '"1 asked, 1 played, "' "real harness: and by a provider's audio, with nothing said to have gone wrong"
+    # muted while the provider is still answering: its audio, arriving after,
+    # isn't played
+    desk_until idle "document.getElementById('caption').textContent === '' ? 'idle' : 'busy'" '"idle"'
+    cmd "js window.__hold = true"
+    say_desk "One more?"
+    desk_until asked "window.__asked + ' asked'" '"2 asked"' 60
+    cmd "js document.getElementById('muteBtn').click(); window.__let();"
+    sleep 1
+    desk_probe late "[window.__asked + ' asked', window.__played + ' played', document.getElementById('caption').textContent === '' ? 'no caption' : 'captioned'].join(', ')"
+    expect_probe '"2 asked, 1 played, no caption"' "real harness: a voice that arrives after muting stays unheard"
+    cmd "js window.__hold = false; document.getElementById('muteBtn').click()"
+    speak_by off
     cmd "menu provider"
     expect_log "read ok=1" "real harness: Provider and key… reads the values in use"
     wait_page 3
