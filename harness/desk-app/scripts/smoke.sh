@@ -458,12 +458,14 @@ if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     # be reached, so each message gets harness's own reply saying so
     speak_by() { cmd "js var s = document.getElementById('speakSel'); s.value = '$1'; s.dispatchEvent(new Event('change', {bubbles: true}));"; }
     say_desk() { cmd "js document.getElementById('msg').value = '$1'; document.getElementById('compose').requestSubmit();"; }
-    cmd "js window.__said = []; window.__cancels = 0; speechSynthesis.speak = function (u) { window.__said.push(u.text); setTimeout(function () { if (u.onstart) u.onstart({}); }, 20); }; speechSynthesis.cancel = function () { window.__cancels++; };"
+    # on the prototype: WebKit drops what a page sets on the speechSynthesis
+    # object itself once that object is collected, and the real voice is back
+    cmd "js window.__said = []; window.__cancels = 0; SpeechSynthesis.prototype.speak = function (u) { window.__said.push(u.text); setTimeout(function () { if (u.onstart) u.onstart({}); }, 20); }; SpeechSynthesis.prototype.cancel = function () { window.__cancels++; };"
     speak_by browser
     desk_until voice "[document.getElementById('speakFact').hidden ? 'off' : 'on', document.getElementById('emptyStage').hidden ? 'avatar' : 'no avatar'].join(', ')" '"on, no avatar"'
     expect_probe '"on, no avatar"' "real harness: Speak replies takes the built-in voice, with no avatar chosen"
     say_desk "Are you there?"
-    desk_until said "[window.__said.length + ' said', window.__said[0] && document.getElementById('caption').textContent === window.__said[0] ? 'captioned' : 'no caption', window.__said[0]].join(', ')" '"1 said, captioned, ' 60
+    desk_until said "[window.__said.length + ' said', window.__said[0] && document.getElementById('caption').textContent === window.__said[0] ? 'captioned' : 'no caption', window.__said[0], 'speak ' + document.getElementById('speakSel').value, 'last: ' + ((document.getElementById('log').lastElementChild || {}).innerText || '').replace(/\s+/g, ' ').slice(0, 70)].join(', ')" '"1 said, captioned, ' 60
     expect_probe '"1 said, captioned, ' "real harness: the reply is read aloud without an avatar, its words under the stage"
     cmd "js window.__before = window.__cancels; document.getElementById('muteBtn').click()"
     desk_probe hushed "[window.__cancels > window.__before ? 'stopped' : 'still speaking', document.getElementById('caption').textContent === '' ? 'no caption' : 'captioned'].join(', ')"

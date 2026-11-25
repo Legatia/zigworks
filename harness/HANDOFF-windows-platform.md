@@ -33,7 +33,10 @@ same page, so it gets them with the next merge.
   click"). The smoke's new checks stand in for the voice on the page
   (`speechSynthesis.speak`, the page's `speech` request), so they need no
   sound device and call no provider: copy them if your smoke drives the
-  real page.
+  real page. Put the voice's stand-in on `SpeechSynthesis.prototype`, not
+  on `speechSynthesis` itself: WebKit drops what a page sets on that
+  object once it is collected, the real voice is back, and the check
+  fails now and then (ours did, 1 run in 14).
 - **Not judged:** the voice by ear (this Mac's screen is locked). Speak
   replies stays off by default, and off means urgent alerts aren't spoken
   either.
