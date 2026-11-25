@@ -239,3 +239,19 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
   - Gaps: `harness run` exits without a Telegram token; setup is terminal-only; no avatar or fit files reach a fresh install (empty stage); times show UTC.
   - Not checked: anything by eye or ear in the real app (the screen was locked: the stage's look, the microphone prompt, speech and lip-sync).
   - Spec: "First run, and the desk alone (added 2026-11-25)" (9ad4fe3), my calls. Builders started: `platform/desk-alone`, `platform/desk-fit-files`; `platform/desk-base-head` was already building. The app's own setup follows them.
+- 2026-11-25 the macOS app carries harness and sets it up. Branch `platform/desk-app-setup`, cut from harness-logins at eb5960d; plan `2026-11-25-desk-app-setup.md`; spec "The app carries harness and sets it up" (the builder's calls are added to "Calls I made").
+  - One download: `package-macos.sh` builds harness for both kinds of Mac (macOS 12+), lipos it into `Contents/MacOS/harness`, puts the fit files in `Contents/Resources/desk-assets/`, and signs the inner program before the bundle. `DESK_ASSETS` unset packs the fit files strictly: a missing file is one line and exit 1. `DIR` takes a ready folder; `none` leaves them out and says so (CI). harness's build.zig finds Xcode's SDK for a named Mac target, so the Intel slice builds on Apple Silicon.
+  - Finding harness: desk.json's binary when that file exists, else the copy beside the app's program.
+  - The Set up screen (no config.ini, or `state/setup-unfinished`): a built-in page, shared on all three systems. Provider, Model, Address, Format, Continue.
+  - [Continue]: the key first, in a native NSSecureTextField sheet ("harness keeps it in this computer's key store." under it); then `harness init` (once), `config set` (one call), and the key piped to `secret add NAME --stdin` and zeroed; then start and enter.
+  - "Provider and key…" reads the values in use with `config get`. While harness runs, a change shows config set's own line and goes back to the desk.
+  - Shared in `desk-app/src/`: `setup.zig`, plus the controller, the page, the bridge and `runWithStdin`. The Windows handoff has a dated section and the Windows checks.
+  - Rulings: the usual models from harness's own code. Anthropic's is `claude-opus-4-8`, since harness's requests carry no thinking blocks. Other is `[provider other]`, and may take no key (`auth = none`). The helpers follow a new provider only. The key is asked for before anything is written.
+  - Final review (one fresh reviewer): no Critical. Three Important, fixed test-first: Cancel left a new provider written without its key; a first setup left half done was never offered again; a server with no key couldn't be set up. Seven Minors fixed in the same pass; five deferred (the report has them).
+  - Suites at e111b74:
+    - harness unit 1603/1625 (22 skipped), Debug and ReleaseSafe, exit 0;
+    - harness cross builds ok for x86_64-windows, x86_64-linux-musl and aarch64-linux-musl;
+    - desk-app unit 99/99, Debug and ReleaseSafe; its shared tests compile for Windows and Linux (not run there);
+    - smoke 88/88 against the stand-in, and 104/104 with `DESK_SMOKE_HARNESS` set to this branch's harness;
+    - `package-macos.sh` end to end: both programs `x86_64 arm64`, the signature verifies, the fit files left out or sealed in as designed; the bundled harness ran init, config set and secret add headless on both slices, and served the bundle's fit files.
+  - Not seen by eye: the screen was locked, so the form's look and the key sheet's look were not seen. Not pushed.
