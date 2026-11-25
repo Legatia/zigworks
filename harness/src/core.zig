@@ -223,6 +223,21 @@ pub fn initHome(io: Io, a: std.mem.Allocator, home: []const u8) !void {
     }
 }
 
+/// A provider whose every slice is `a`'s: a call that outlives a /reload
+/// (which frees the settings) keeps reading what it started with.
+fn ownProvider(a: std.mem.Allocator, p: model.Provider) !model.Provider {
+    var o = p;
+    o.name = try a.dupe(u8, p.name);
+    o.url = try a.dupe(u8, p.url);
+    o.key_name = try a.dupe(u8, p.key_name);
+    o.key = try a.dupe(u8, p.key);
+    o.tokens_field = try a.dupe(u8, p.tokens_field);
+    const hs = try a.alloc(model.Header, p.headers.len);
+    for (p.headers, hs) |h, *d| d.* = .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) };
+    o.headers = hs;
+    return o;
+}
+
 /// Where a post goes: a conversation's Telegram chat and topic (thread 0:
 /// the chat itself), or the terminal. `name` is the conversation's.
 pub const Place = struct {
@@ -5434,15 +5449,18 @@ pub const Core = struct {
         c.noteChangedApps(a, apps_dir, state_dir);
         // the desk app finds harness on a fixed port: `port = 0` gets one
         // (written); a taken one moves to the next of ten (written, said)
+        // (Windows may reserve blocks of ports at boot: past the ten, any
+        // free one, written and said)
         const want: u16 = @intCast(c.cfg.apps.port);
-        const tries: u16 = if (want == 0) 1 else @intCast(@min(11, @as(u32, std.math.maxInt(u16)) - want + 1));
+        const tries: u16 = if (want == 0) 1 else @intCast(@min(11, @as(u32, std.math.maxInt(u16)) - want + 1) + 1);
         var i: u16 = 0;
         const s = while (i < tries) : (i += 1) {
+            const port: u16 = if (want == 0 or i + 1 == tries) 0 else want + i;
             break appserver.Server.start(c.gpa, c.io, .{
                 .apps_dir = apps_dir,
                 .state_dir = state_dir,
                 .host = c.appHost(),
-                .port = if (want == 0) 0 else want + i,
+                .port = port,
                 .log = &c.log,
                 .version = @import("build_options").version,
                 .desk = .{ .home = c.paths.home, .state = c.paths.state },
@@ -14784,10 +14802,13 @@ pub const Core = struct {
         const conv = queryGet(call.query, "conv") orelse "main";
         if (!c.deskConv(conv)) return deskErr(a, .not_found, "no such conversation");
         if (call.body.len == 0) return deskErr(a, .bad_request, "no audio");
-        const prov = c.providers.find(c.cfg.voice.provider) orelse return deskErr(a, .conflict, "Voice input needs [voice] in config.ini.");
+        // copies: a /reload meanwhile frees the settings
+        const prov_ref = c.providers.find(c.cfg.voice.provider) orelse return deskErr(a, .conflict, "Voice input needs [voice] in config.ini.");
+        const prov = try ownProvider(a, prov_ref.*);
+        const voice_model = try a.dupe(u8, c.cfg.voice.model);
         const ct = call.content_type;
         const name: []const u8 = if (std.mem.startsWith(u8, ct, "audio/ogg")) "voice.ogg" else if (std.mem.startsWith(u8, ct, "audio/mp4")) "voice.m4a" else if (std.mem.startsWith(u8, ct, "audio/wav")) "voice.wav" else if (std.mem.startsWith(u8, ct, "audio/mpeg")) "voice.mp3" else "voice.webm";
-        var tr: voice_mod.Transcriber = .{ .gpa = c.gpa, .io = c.io, .provider = prov.*, .model = c.cfg.voice.model, .language = c.cfg.voice.language };
+        var tr: voice_mod.Transcriber = .{ .gpa = c.gpa, .io = c.io, .provider = prov, .model = voice_model, .language = try a.dupe(u8, c.cfg.voice.language) };
         const private = c.convPrivate(conv);
         const started = util.nowMs(c.io);
         const heard = tr.transcribe(a, call.body, name, call.stop) catch |e| {
@@ -14795,12 +14816,16 @@ pub const Core = struct {
             c.log.write(.chat, private, .{ .event = "desk voice not transcribed", .bytes = call.body.len, .provider = prov.name, .why = why }) catch {};
             return deskErr(a, .bad_gateway, why);
         };
-        c.log.write(.chat, private, .{ .event = "desk voice", .bytes = call.body.len, .provider = prov.name, .model = c.cfg.voice.model, .ms = util.nowMs(c.io) - started, .chars = heard.len }) catch {};
+        c.log.write(.chat, private, .{ .event = "desk voice", .bytes = call.body.len, .provider = prov.name, .model = voice_model, .ms = util.nowMs(c.io) - started, .chars = heard.len }) catch {};
         if (heard.len == 0) return deskErr(a, .unprocessable_entity, "There were no words in it.");
         const quoted = voice_mod.quoted(a, heard) catch heard;
         if (c.cfg.desk.echo) c.deskEcho(a, conv, quoted);
         c.deskOwner(conv, quoted, "desk");
-        try c.textIn(conv, heard);
+        c.touch(conv);
+        // as a Telegram voice note's: a phrase, the lists' words, else a
+        // turn told it was transcribed (never a command)
+        if (!c.phraseStart(conv, heard) and !Errands.words(c, conv, "", heard) and !Errands.parcelWords(c, conv, heard) and !Errands.upkeepWords(c, conv, heard))
+            try c.queueMessage(conv, heard, voice_context);
         var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(a, "{\"text\":");
         try util.jsonString(&out, a, heard);
@@ -14853,15 +14878,17 @@ pub const Core = struct {
     /// `POST speech {"id":N}`: message N of the desk's history read aloud
     /// by `[desk] speak`'s provider, fetched here with its key.
     fn deskSpeech(c: *Core, a: std.mem.Allocator, call: appserver.DeskCall) !appserver.Answer {
-        const sp = c.cfg.desk.speak;
+        const sp = try a.dupe(u8, c.cfg.desk.speak);
         if (std.mem.eql(u8, sp, "off") or std.mem.eql(u8, sp, "browser")) return deskErr(a, .conflict, "Speech from a provider is off ([desk] speak).");
         const v = jv.parse(a, call.body) orelse return deskErr(a, .bad_request, "{\"id\":N}");
         const id = jv.int(jv.get(v, "id")) orelse return deskErr(a, .bad_request, "{\"id\":N}");
         if (id <= 0) return deskErr(a, .bad_request, "{\"id\":N}");
         const found = (try c.desk_history.find(a, @intCast(id))) orelse return deskErr(a, .not_found, "no such message");
         if (found.msg.from != .harness) return deskErr(a, .not_found, "no such message");
-        const prov = c.providers.find(sp) orelse return deskErr(a, .conflict, "That provider isn't set up.");
-        var speaker: voice_mod.Speaker = .{ .gpa = c.gpa, .io = c.io, .provider = prov.*, .model = c.cfg.desk.speak_model, .voice = c.cfg.desk.speak_voice };
+        // copies: a /reload meanwhile frees the settings
+        const prov_ref = c.providers.find(sp) orelse return deskErr(a, .conflict, "That provider isn't set up.");
+        const prov = try ownProvider(a, prov_ref.*);
+        var speaker: voice_mod.Speaker = .{ .gpa = c.gpa, .io = c.io, .provider = prov, .model = try a.dupe(u8, c.cfg.desk.speak_model), .voice = try a.dupe(u8, c.cfg.desk.speak_voice) };
         const audio = speaker.speak(a, try deskwin.spoken(a, found.msg.text), call.stop) catch |e| {
             const why = speaker.failure(a, e);
             c.log.write(.chat, false, .{ .event = "desk speech failed", .provider = prov.name, .why = why }) catch {};
@@ -14889,7 +14916,8 @@ pub const Core = struct {
         if (text.len == 0) return deskErr(a, .bad_request, "an empty message");
         if (text.len > 64 * 1024) return deskErr(a, .bad_request, "a message is at most 64 KB");
         if (!c.deskConv(conv)) return deskErr(a, .not_found, "no such conversation");
-        if (c.cfg.desk.echo) c.deskEcho(a, conv, text);
+        // a token pasted here isn't sent on to Telegram
+        if (c.cfg.desk.echo and !butler.anyTokenLike(text)) c.deskEcho(a, conv, text);
         c.deskOwner(conv, text, "desk");
         try c.textIn(conv, text);
         return .{ .body = "{\"ok\":true}" };
@@ -14902,7 +14930,7 @@ pub const Core = struct {
         const inner = c.desk_tee.inner;
         const one = std.mem.trim(u8, text, " \t\r\n");
         const cut = util.cut(one, 200);
-        const line = std.fmt.allocPrint(a, "You, on the desk: {s}{s}", .{ cut, if (cut.len < one.len) "…" else "" }) catch return;
+        const line = c.masks.scrubAlloc(a, std.fmt.allocPrint(a, "You, on the desk: {s}{s}", .{ cut, if (cut.len < one.len) "…" else "" }) catch return) catch return;
         const r = c.placeOf(a, conv) catch return;
         var place = r.place;
         place.quiet = true;
@@ -15044,10 +15072,51 @@ pub const Core = struct {
         try out.appendSlice(a, "],\"next\":");
         try util.jsonString(&out, a, c.masks.scrubAlloc(a, next) catch next);
         try out.print(a, ",\"utc_offset\":{d}", .{c.cfg.chat.utc_offset});
+        try out.appendSlice(a, ",\"apps\":");
+        try c.deskAppsJson(a, &out);
         try out.appendSlice(a, ",\"settings\":");
         try c.deskSettingsJson(a, &out);
         try out.append(a, '}');
         return out.items;
+    }
+
+    /// The apps the desk opens (`/desk/apps/NAME`): the built-ins, then the
+    /// approved ones served as approved.
+    fn deskAppsJson(c: *Core, a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try out.append(a, '[');
+        var n: usize = 0;
+        for (appserver.builtins) |b| {
+            if (n > 0) try out.append(a, ',');
+            n += 1;
+            try out.print(a, "{{\"name\":\"{s}\",\"title\":", .{b.name});
+            try util.jsonString(out, a, b.title);
+            try out.append(a, '}');
+        }
+        const apps_dir = try std.fs.path.join(a, &.{ c.paths.home, "apps" });
+        const state_dir = try std.fs.path.join(a, &.{ c.paths.state, "apps" });
+        var names: std.ArrayList([]const u8) = .empty;
+        if (Io.Dir.cwd().openDir(c.io, apps_dir, .{ .iterate = true })) |d_const| {
+            var d = d_const;
+            defer d.close(c.io);
+            var it = d.iterate();
+            while (it.next(c.io) catch null) |e| if (e.kind == .directory and apps_mod.validName(e.name)) try names.append(a, try a.dupe(u8, e.name));
+        } else |_| {}
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        for (names.items) |name| {
+            if ((apps_mod.asApproved(c.io, a, apps_dir, state_dir, name) catch null) == null) continue;
+            const ini = Io.Dir.cwd().readFileAlloc(c.io, try std.fs.path.join(a, &.{ apps_dir, name, "app.ini" }), a, .limited(64 << 10)) catch continue;
+            const m = apps_mod.parse(a, ini) catch continue;
+            if (n > 0) try out.append(a, ',');
+            n += 1;
+            try out.print(a, "{{\"name\":\"{s}\",\"title\":", .{name});
+            try util.jsonString(out, a, if (m.title.len > 0) m.title else name);
+            try out.append(a, '}');
+        }
+        try out.append(a, ']');
     }
 
     /// The desk's settings and their choices.
@@ -26486,6 +26555,8 @@ const Emergency = struct {
 
     fn logOpen(c: *Core, id: u64, x: alerts_mod.Alert) void {
         c.log.write(.alert, x.private, .{ .event = "open", .alert = id, .by = x.by, .conversation = x.conv, .item = if (x.item != 0) @as(?u64, x.item) else null, .steps = x.steps.len, .text = x.text }) catch {};
+        // the desk turns urgent
+        c.desk_feed.push("facts", "");
     }
 
     const PostAlert = struct { id: u64, button: [2][]const u8 };
@@ -26591,8 +26662,10 @@ const Emergency = struct {
             if (via == .harness or via == .fallback) return;
             return ack(c, aid, "owner", "answer");
         }
-        if (c.alerts.end(aid, "its question closed") catch false)
+        if (c.alerts.end(aid, "its question closed") catch false) {
             c.log.write(.alert, false, .{ .event = "closed", .alert = aid, .why = @tagName(status) }) catch {};
+            c.desk_feed.push("facts", "");
+        }
     }
 
     /// The owner pressed a button of message `message` in `chat`, or
@@ -26629,6 +26702,8 @@ const Emergency = struct {
             return;
         }) orelse return;
         c.log.write(.alert, false, .{ .event = "acknowledged", .alert = id, .by = by, .via = via, .after = now_s - was.at }) catch {};
+        // the desk is no longer urgent for it
+        c.desk_feed.push("facts", "");
         var cb: [8]u8 = undefined;
         const hm = quiet_mod.clock(&cb, now_s, c.cfg.chat.utc_offset);
         const member: ?[]const u8 = if (std.mem.startsWith(u8, by, "member:")) by["member:".len..] else null;
@@ -36374,4 +36449,112 @@ test "a_stop_request_ends_harness_on_its_tick" {
     try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, req, .{}));
     f.core.tick();
     try t.expect(!f.core.stop_requested.load(.acquire));
+}
+
+test "an_urgent_alert_turns_the_desk_urgent_until_someone_is_on_it" {
+    var f: Fix = undefined;
+    try f.init("[butler]\nescalate = 5m anna\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try joinMember(&f, "anna", 77);
+    _ = try leakAlert(&f, "urgent = yes\n");
+    const before = f.core.desk_feed.last();
+    try leakReads(&f, "wet");
+    try f.rec.waitFor("BUTTONS [leak] Water under the kitchen sink. [e");
+    // the alert is a fact of the desk's: urgent, and the page told to look again
+    const st = deskCall(&f, .GET, "state", "", "").body;
+    try expectHas(st, "\"alerts\":1");
+    try expectHas(st, "\"state\":\"urgent\"");
+    try expectHas(deskCall(&f, .GET, "events", try std.fmt.allocPrint(a, "after={d}&wait=0", .{before}), "").body, "\"type\":\"facts\"");
+    // its message on the desk is marked urgent
+    try expectHas(deskCall(&f, .GET, "history", "conv=main", "").body, "\"urgent\":true");
+    // the owner is on it: no longer urgent, and the page told
+    const mid = f.core.desk_feed.last();
+    const b = f.rec.buttonsWith("[leak] Water under the kitchen sink.") orelse return error.NoButton;
+    f.core.handleCallback(42, b.msg, b.get("onit").?);
+    const after = try waitDesk(&f, "state", "", "\"alerts\":0");
+    try t.expect(std.mem.indexOf(u8, after, "\"state\":\"urgent\"") == null);
+    try expectHas(deskCall(&f, .GET, "events", try std.fmt.allocPrint(a, "after={d}&wait=0", .{mid}), "").body, "\"type\":\"facts\"");
+}
+
+test "a_token_typed_on_the_desk_is_not_echoed_to_telegram" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.e.script(1, model.textReply("Noted."));
+    try f.core.startWorker();
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"my key is gsk_4f8a9c2b7d1e6f3a5b8c9d0e\"}");
+    try f.rec.waitFor("Noted.");
+    try t.expectEqual(0, f.rec.count("You, on the desk"));
+    // a stored secret is masked in an echo
+    try f.e.script(2, model.textReply("Fine."));
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"use og-key-for-tests there\"}");
+    try f.rec.waitFor("Fine.");
+    try f.rec.waitFor("You, on the desk: use [secret:omnigate] there");
+    try t.expectEqual(0, f.rec.count("og-key-for-tests"));
+}
+
+test "a_desk_voice_turn_is_told_it_was_transcribed" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const p = f.core.paths;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.config, .data = try std.fmt.allocPrint(a, "{s}\n[provider whisper]\napi = openai\nurl = {s}/v1\nauth = none\n[voice]\nprovider = whisper\nmodel = large-v3-turbo\n", .{ f.core.readOr(a, p.config), try f.e.url() }) });
+    try expectHas(try f.core.reload(), "Settings reloaded.");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "transcribe/001.json", .data = "{\"text\":\"turn off the lights\"}" });
+    try f.e.script(1, model.textReply("Done."));
+    try f.core.startWorker();
+    _ = Core.deskApi(f.core, a, .{ .method = .POST, .path = "voice", .query = "conv=main", .body = "\x1aE\xdf\xa3webm", .content_type = "audio/webm", .stop = &app_never_stops });
+    try f.rec.waitFor("Done.");
+    try expectHas(try f.e.request(1), "transcribed: a word may be misheard");
+}
+
+test "the_desk_lists_the_apps" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try installApp(&f, "notes", "[app]\nname = notes\ntitle = My notes\n", &.{.{ "index.html", "x" }});
+    const st = deskCall(&f, .GET, "state", "", "").body;
+    try expectHas(st, "\"apps\":[{\"name\":\"inbox\",\"title\":\"Inbox\"}");
+    try expectHas(st, "{\"name\":\"notes\",\"title\":\"My notes\"}");
+}
+
+test "the_port_falls_back_to_a_free_one_when_the_next_ten_are_taken" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    _ = try f.core.startApps(a);
+    const first = f.core.app_server.?.port;
+    f.core.app_server.?.stop();
+    f.core.app_server = null;
+    // that port and the ten after it, all taken (some by others maybe)
+    var held: std.ArrayList(@import("sock.zig").Listener) = .empty;
+    defer for (held.items) |l| l.close();
+    var i: u16 = 0;
+    while (i <= 10) : (i += 1) if (@import("sock.zig").Listener.openExclusive(first + i)) |l| try held.append(a, l) else |_| {};
+    _ = try f.core.startApps(a);
+    const got = f.core.app_server.?.port;
+    try t.expect(got < first or got > first + 10);
+    try expectHas(f.core.readOr(a, f.core.paths.config), try std.fmt.allocPrint(a, "port = {d}", .{got}));
+    try expectHas(f.core.apps_note, try std.fmt.allocPrint(a, "the desk uses {d} now", .{got}));
+}
+
+test "a_provider_copy_outlives_the_settings_it_came_from" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    var gone: std.heap.ArenaAllocator = .init(t.allocator);
+    const g = gone.allocator();
+    const hs = try g.alloc(model.Header, 1);
+    hs[0] = .{ .name = try g.dupe(u8, "X-Org"), .value = try g.dupe(u8, "acme") };
+    const p: model.Provider = .{ .name = try g.dupe(u8, "tts"), .api = .openai, .url = try g.dupe(u8, "https://tts.example.com/v1"), .auth = .bearer, .cache = false, .key_name = try g.dupe(u8, "tts"), .key = try g.dupe(u8, "sk-tts-123456"), .headers = hs };
+    const own = try ownProvider(arena.allocator(), p);
+    // the settings arena goes (a reload)
+    gone.deinit();
+    try t.expectEqualStrings("tts", own.name);
+    try t.expectEqualStrings("https://tts.example.com/v1", own.url);
+    try t.expectEqualStrings("sk-tts-123456", own.key);
+    try t.expectEqualStrings("X-Org", own.headers[0].name);
+    try t.expectEqualStrings("acme", own.headers[0].value);
 }

@@ -75,6 +75,7 @@ export async function createAvatar(element, packUrl, options = {}) {
   };
   raf = requestAnimationFrame(frame);
 
+  let settle = null;
   function stop() {
     if (audio) {
       audio.pause();
@@ -82,6 +83,9 @@ export async function createAvatar(element, packUrl, options = {}) {
     }
     if (utter && window.speechSynthesis) window.speechSynthesis.cancel();
     utter = null;
+    // speech stopped is speech ended
+    if (settle) settle();
+    settle = null;
   }
 
   return {
@@ -93,7 +97,12 @@ export async function createAvatar(element, packUrl, options = {}) {
     arrive() {},
     speak({ text, audioUrl, browser }) {
       stop();
-      return new Promise((resolve) => {
+      return new Promise((done) => {
+        const resolve = () => {
+          settle = null;
+          done();
+        };
+        settle = resolve;
         if (audioUrl) {
           audio = new Audio(audioUrl);
           audio.addEventListener("ended", () => resolve(), { once: true });

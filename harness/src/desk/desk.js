@@ -141,8 +141,10 @@ function renderCard() {
     one = n > 0 ? (n === 1 ? "An urgent item is open." : n + " urgent items are open.") : "An urgent alert is open.";
     two = n > 0 ? "It's first under Needs you." : "Answer it in Telegram, or under Needs you when it asks.";
   } else if (st === "speaking") {
-    one = S.lastSpoken ? S.lastSpoken.say || S.lastSpoken.text : "";
-    if (one.length > 140) one = one.slice(0, 139) + "…";
+    // the card says harness's facts only; the words are in the caption
+    one = "Reading a reply aloud.";
+    const c = S.convs.find((x) => x.name === (S.speakingConv || S.conv));
+    two = c ? "In " + c.title + "." : "";
   } else if (st === "needs") {
     one = S.items.length === 1 ? "One thing waits for you." : S.items.length + " things wait for you.";
     two = "Under Needs you.";
@@ -287,6 +289,18 @@ function renderTopics() {
   }
 }
 
+function renderApps() {
+  const ul = $("apps");
+  ul.textContent = "";
+  for (const app of (S.data && S.data.apps) || []) {
+    const li = el("li");
+    const link = el("a", null, app.title);
+    link.href = "/desk/apps/" + encodeURIComponent(app.name);
+    li.append(link);
+    ul.append(li);
+  }
+}
+
 function renderLately() {
   const ul = $("lately");
   ul.textContent = "";
@@ -389,14 +403,15 @@ async function speakNext() {
   if (S.speaking) return;
   const m = S.speakQueue.shift();
   if (!m) return;
-  await speakMsg(m);
+  await speakMsg(m, m.conv);
   speakNext();
 }
 
-async function speakMsg(m) {
+async function speakMsg(m, conv) {
   if (!S.avatar) return;
   S.speaking = true;
   S.lastSpoken = m;
+  if (conv) S.speakingConv = conv;
   $("caption").textContent = m.say || m.text;
   renderCard();
   try {
@@ -433,6 +448,10 @@ $("muteBtn").addEventListener("click", () => {
   if (S.muted) {
     S.speakQueue = [];
     if (S.avatar) S.avatar.stop();
+    // not left waiting on a voice that was stopped
+    S.speaking = false;
+    $("caption").textContent = "";
+    renderCard();
   }
   renderHeader();
 });
@@ -526,6 +545,7 @@ async function loadState() {
     renderNeeds();
     renderTopics();
     renderLately();
+    renderApps();
     renderChat();
     renderCard();
     renderSettings();
@@ -557,6 +577,7 @@ function onEvent(ev) {
       }
       if (m.urgent) bridge({ attention: "urgent" });
       if (speakable(m, true) && (ev.conv === S.conv || m.urgent)) {
+        m.conv = ev.conv;
         S.speakQueue.push(m);
         speakNext();
       }
@@ -622,7 +643,17 @@ function renderSettings() {
     o.selected = v === S.settings.speak;
     sel.append(o);
   }
+  speakWhere();
   gateUploads();
+}
+
+/** A provider reads replies aloud: where they go is said inline. */
+function speakWhere() {
+  const v = $("speakSel").value || S.settings.speak;
+  const p = $("speakWhere");
+  const provider = v && v !== "off" && v !== "browser";
+  p.hidden = !provider;
+  p.textContent = provider ? "Replies are sent to " + v + " to be read aloud." : "";
 }
 
 async function setSetting(change, outcomeId) {
@@ -636,7 +667,10 @@ async function setSetting(change, outcomeId) {
   }
 }
 
-$("speakSel").addEventListener("change", () => setSetting({ speak: $("speakSel").value }, "speakOutcome"));
+$("speakSel").addEventListener("change", () => {
+  speakWhere();
+  setSetting({ speak: $("speakSel").value }, "speakOutcome");
+});
 
 function targetName() {
   const typed = $("upName").value.trim();

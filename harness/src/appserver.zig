@@ -1688,3 +1688,34 @@ test "a_code_left_by_an_earlier_start_is_gone" {
     try t.expectError(error.FileNotFound, f.tmp.dir.statFile(t.io, "state/desk-code", .{}));
     try t.expectEqual(403, (try get(f.a, f.s.port, "/enter?code=AAAAAAAAAAAAAAAAAAAAAA", f.host)).status);
 }
+
+test "an_app_opens_from_the_desk_in_its_frame" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    var fh: FakeHost = .{};
+    try withDesk(&f, &fh);
+    const e = try enterDesk(&f);
+    const with = try std.fmt.allocPrint(f.a, "{s}{s}", .{ f.host, e.cookie });
+    const page = try get(f.a, f.s.port, "/desk/apps/notes", with);
+    try t.expectEqual(200, page.status);
+    try expectHas(page.body, try std.fmt.allocPrint(f.a, "src=\"/a/{s}/?in=page&amp;view=\"", .{&f.s.appToken("notes", "1")}));
+    try expectHas(page.body, "<a href=\"/desk\">Desk</a>");
+    try t.expectEqual(401, (try get(f.a, f.s.port, "/desk/apps/notes", f.host)).status);
+    try t.expectEqual(404, (try get(f.a, f.s.port, "/desk/apps/nothing", with)).status);
+}
+
+test "the_desk_page_keeps_to_its_own_facts_and_says_where_speech_goes" {
+    const js = deskFile("desk.js").?;
+    // while speaking the card says so, never the reply's words
+    try expectHas(js, "\"Reading a reply aloud.\"");
+    try t.expect(std.mem.indexOf(u8, js, "one = S.lastSpoken") == null);
+    // a provider's voice: the replies go to it, said inline
+    try expectHas(js, "\"Replies are sent to \"");
+    try expectHas(deskFile("index.html").?, "id=\"speakWhere\"");
+    // targets of 44 px, the "i" too
+    try expectHas(deskFile("desk.css").?, ".info > button { width: 44px; height: 44px;");
+    // the apps, from the side panel
+    try expectHas(deskFile("index.html").?, "id=\"apps\"");
+    try expectHas(js, "\"/desk/apps/\"");
+}
