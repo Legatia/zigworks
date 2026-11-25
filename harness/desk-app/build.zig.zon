@@ -1,0 +1,13 @@
+.{
+    .name = .harness_desk,
+    .version = "0.3.0",
+    .fingerprint = 0xf49822942088d489,
+    .minimum_zig_version = "0.17.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "test",
+    },
+}

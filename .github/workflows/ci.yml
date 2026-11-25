@@ -83,3 +83,33 @@ jobs:
       # up after optimization (headsight's diff did, on Zig 0.15.1 and 0.17.1).
       - run: zig build test -Doptimize=ReleaseSafe
       - run: zig build -Doptimize=ReleaseFast
+
+  # harness-desk, the desk's macOS app: the one piece built with the
+  # system's own libraries (Cocoa, WebKit), so it has a job of its own. Its
+  # unit tests, one bundle for Apple Silicon and Intel Macs signed ad hoc,
+  # and the smoke in a window against a stand-in harness (it says SKIP when
+  # the runner's session has no window server).
+  desk-app-macos:
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: harness/desk-app
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.17.1
+      - run: |
+          set -o pipefail
+          zig build test --summary all 2>&1 | tee "$RUNNER_TEMP/test.log"
+      - run: zig build test -Doptimize=ReleaseSafe
+      - run: scripts/package-macos.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-macos.zip"
+      - run: |
+          set -o pipefail
+          zig build smoke 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+      - if: failure()
+        run: |
+          grep -a -E "not ok|FAIL|failed|error:" "$RUNNER_TEMP/test.log" | grep -v "^::error::" | head -12 | while IFS= read -r line; do
+            echo "::error::desk-app: ${line:0:500}"
+          done

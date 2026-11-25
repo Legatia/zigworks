@@ -1,0 +1,197 @@
+//! Whether harness answers on its port: `GET /alive`, a 200 within a time
+//! limit. The socket is the system's own, non-blocking, waited on with poll:
+//! std's connect can't yet take a time limit (harness's sock.zig says the
+//! same).
+const std = @import("std");
+const builtin = @import("builtin");
+const Io = std.Io;
+const net = std.Io.net;
+
+const posix = std.posix;
+const c = std.c;
+
+/// True when harness answers `GET /alive` on 127.0.0.1:`port` with a 200
+/// within `timeout_ms` (connecting, sending and reading the status line).
+pub fn check(port: u16, timeout_ms: u32) bool {
+    return checkOrFail(port, timeout_ms) catch false;
+}
+
+fn checkOrFail(port: u16, timeout_ms: u32) !bool {
+    const deadline = nowMs() + timeout_ms;
+    const fd = c.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    if (fd < 0) return error.NoSocket;
+    defer _ = c.close(fd);
+    _ = c.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
+    const flags = c.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.Fcntl;
+    if (c.fcntl(fd, posix.F.SETFL, flags | (1 << @bitOffsetOf(posix.O, "NONBLOCK"))) < 0) return error.Fcntl;
+    if (builtin.os.tag.isDarwin()) {
+        // a write to a closed connection is an error, not a signal
+        const on: c_int = 1;
+        _ = c.setsockopt(fd, posix.SOL.SOCKET, 0x1022, &on, @sizeOf(c_int));
+    }
+
+    var addr: posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
+    };
+    if (c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 0) {
+        switch (posix.errno(@as(c_int, -1))) {
+            .INPROGRESS, .AGAIN, .INTR => {},
+            else => return false,
+        }
+        if (!try ready(fd, posix.POLL.OUT, deadline)) return false;
+        var code: c_int = 0;
+        var size: posix.socklen_t = @sizeOf(c_int);
+        if (c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&code), &size) != 0 or code != 0) return false;
+    }
+
+    var req_buf: [128]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "GET /alive HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n", .{port});
+    const send_flags: c_uint = if (builtin.os.tag == .linux) posix.MSG.NOSIGNAL else 0;
+    var sent: usize = 0;
+    while (sent < req.len) {
+        const n = c.send(fd, req[sent..].ptr, req.len - sent, @bitCast(send_flags));
+        if (n < 0) {
+            switch (posix.errno(n)) {
+                .AGAIN, .INTR => if (!try ready(fd, posix.POLL.OUT, deadline)) return false,
+                else => return false,
+            }
+            continue;
+        }
+        sent += @intCast(n);
+    }
+
+    // the status line is enough: "HTTP/1.x 200 …"
+    var resp: [64]u8 = undefined;
+    var got: usize = 0;
+    while (got < resp.len and std.mem.indexOf(u8, resp[0..got], "\r\n") == null) {
+        if (!try ready(fd, posix.POLL.IN, deadline)) return false;
+        const n = c.recv(fd, resp[got..].ptr, resp.len - got, 0);
+        if (n < 0) {
+            switch (posix.errno(n)) {
+                .AGAIN, .INTR => continue,
+                else => return false,
+            }
+        }
+        if (n == 0) break;
+        got += @intCast(n);
+    }
+    const line = resp[0..got];
+    return (std.mem.startsWith(u8, line, "HTTP/1.1 200") or std.mem.startsWith(u8, line, "HTTP/1.0 200")) and
+        line.len > 12 and (line[12] == ' ' or line[12] == '\r');
+}
+
+/// Whether `fd` became ready for `events` before `deadline`.
+fn ready(fd: posix.fd_t, events: i16, deadline: i64) !bool {
+    while (true) {
+        const left = deadline - nowMs();
+        if (left <= 0) return false;
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+        const n = c.poll(&fds, 1, @intCast(left));
+        if (n < 0) {
+            if (posix.errno(n) == .INTR) continue;
+            return error.Poll;
+        }
+        return n > 0;
+    }
+}
+
+fn nowMs() i64 {
+    var ts: c.timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
+}
+
+const t = std.testing;
+
+/// A server for one connection on 127.0.0.1, answering with `reply`
+/// (nothing, when null) and keeping the request it was sent.
+const OneShot = struct {
+    server: net.Server,
+    port: u16,
+    reply: ?[]const u8,
+    hold_ms: u32 = 0,
+    request: [1024]u8 = undefined,
+    request_len: usize = 0,
+    thread: ?std.Thread = null,
+
+    fn start(s: *OneShot) !void {
+        const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+        s.server = try addr.listen(t.io, .{ .reuse_address = true });
+        s.port = s.server.socket.address.getPort();
+        s.thread = try std.Thread.spawn(.{}, serve, .{s});
+    }
+
+    fn serve(s: *OneShot) void {
+        const conn = s.server.accept(t.io) catch return;
+        defer conn.close(t.io);
+        var rbuf: [1024]u8 = undefined;
+        var r = conn.reader(t.io, &rbuf);
+        while (s.request_len < s.request.len) {
+            const b = r.interface.takeByte() catch break;
+            s.request[s.request_len] = b;
+            s.request_len += 1;
+            if (std.mem.endsWith(u8, s.request[0..s.request_len], "\r\n\r\n")) break;
+        }
+        if (s.hold_ms > 0) t.io.sleep(.fromMilliseconds(s.hold_ms), .awake) catch {};
+        if (s.reply) |reply| {
+            var wbuf: [256]u8 = undefined;
+            var w = conn.writer(t.io, &wbuf);
+            w.interface.writeAll(reply) catch {};
+            w.interface.flush() catch {};
+        }
+    }
+
+    fn finish(s: *OneShot) void {
+        if (s.thread) |th| th.join();
+        s.server.deinit(t.io);
+    }
+};
+
+test "alive_is_200_only" {
+    var ok: OneShot = .{ .server = undefined, .port = 0, .reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" };
+    try ok.start();
+    try t.expect(check(ok.port, 2000));
+    ok.finish();
+
+    var missing: OneShot = .{ .server = undefined, .port = 0, .reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n" };
+    try missing.start();
+    try t.expect(!check(missing.port, 2000));
+    missing.finish();
+
+    var junk: OneShot = .{ .server = undefined, .port = 0, .reply = "SSH-2.0-OpenSSH\r\n" };
+    try junk.start();
+    try t.expect(!check(junk.port, 2000));
+    junk.finish();
+}
+
+test "nothing_listening_is_not_alive" {
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(t.io, .{});
+    const port = server.socket.address.getPort();
+    server.deinit(t.io);
+    try t.expect(!check(port, 2000));
+}
+
+test "a_server_that_never_answers_is_not_alive_within_the_time" {
+    var silent: OneShot = .{ .server = undefined, .port = 0, .reply = null, .hold_ms = 1500 };
+    try silent.start();
+    const started = Io.Clock.awake.now(t.io);
+    try t.expect(!check(silent.port, 300));
+    const took = started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
+    try t.expect(took < 1200);
+    silent.finish();
+}
+
+test "the_request_names_alive_and_the_host" {
+    var ok: OneShot = .{ .server = undefined, .port = 0, .reply = "HTTP/1.0 200 OK\r\n\r\n" };
+    try ok.start();
+    try t.expect(check(ok.port, 2000));
+    ok.finish();
+    const req = ok.request[0..ok.request_len];
+    try t.expect(std.mem.startsWith(u8, req, "GET /alive HTTP/1.1\r\n"));
+    var host_buf: [64]u8 = undefined;
+    const host = try std.fmt.bufPrint(&host_buf, "\r\nHost: 127.0.0.1:{d}\r\n", .{ok.port});
+    try t.expect(std.mem.indexOf(u8, req, host) != null);
+}
