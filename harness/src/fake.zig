@@ -18,6 +18,10 @@
 //!   `"echo_key":true` its message saying the key; `{"delay_ms":N,…}`
 //!   waits first). Each request is saved as `transcribe-requests/001.json`,
 //!   … with its target, headers and body (a string).
+//! - speech (OpenAI-compatible): `POST …/audio/speech` answers
+//!   `audio/mpeg` bytes, "ID3" and the request's `input`; each request is
+//!   saved as `speech-requests/001.json`, … with its target, headers and
+//!   body.
 //! - search: `GET /res/v1/web/search?q=…` answers `search.json`.
 //! - pages and feeds: `GET /page/NAME` answers the file `pages/NAME`
 //!   (POST too; `?delay_ms=N` answers after N ms), or, when there is a
@@ -58,6 +62,7 @@ pub const Server = struct {
     model_n: std.atomic.Value(u32) = .init(0),
     /// Transcription requests seen so far.
     stt_n: std.atomic.Value(u32) = .init(0),
+    tts_n: std.atomic.Value(u32) = .init(0),
     tg_n: std.atomic.Value(u32) = .init(0),
     /// What setMySettings set for topics: 0 nothing yet, 1 off, 2 on.
     tg_topics: std.atomic.Value(u8) = .init(0),
@@ -77,7 +82,7 @@ pub const Server = struct {
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
         s.* = .{ .io = io, .dir = try gpa.dupe(u8, dir), .listener = listener, .port = listener.port, .mcp = .{ .io = io } };
-        inline for (.{ "requests", "model", "pages", "telegram/in", "telegram/files", "transcribe", "transcribe-requests" }) |sub| {
+        inline for (.{ "requests", "model", "pages", "telegram/in", "telegram/files", "transcribe", "transcribe-requests", "speech-requests" }) |sub| {
             const p = try std.fs.path.join(gpa, &.{ dir, sub });
             defer gpa.free(p);
             try Io.Dir.cwd().createDirPath(io, p);
@@ -239,6 +244,7 @@ pub const Server = struct {
             if (std.mem.endsWith(u8, route, "/messages")) return s.model(a, req, .anthropic, target, body, headers.items, key);
             if (std.mem.endsWith(u8, route, "/chat/completions")) return s.model(a, req, .openai, target, body, headers.items, key);
             if (std.mem.endsWith(u8, route, "/audio/transcriptions")) return s.transcribe(a, req, target, body, headers.items, key);
+            if (std.mem.endsWith(u8, route, "/audio/speech")) return s.speech(a, req, target, body, headers.items);
         }
         if (method == .GET and std.mem.eql(u8, route, "/res/v1/web/search")) {
             const text = s.readScript(a, &.{"search.json"}) orelse "{\"web\":{\"results\":[]}}";
@@ -406,6 +412,18 @@ pub const Server = struct {
             return json(req, @fromBackingInt(@as(u10, @intCast(st))), try errorBody(a, .openai, st, msg));
         }
         return json(req, .ok, script);
+    }
+
+    /// `…/audio/speech`: "ID3" and the request's input, as audio; the
+    /// request kept as `speech-requests/NNN.json`.
+    fn speech(s: *Server, a: std.mem.Allocator, req: *std.http.Server.Request, target: []const u8, body: []const u8, headers: []const u8) !void {
+        const n = s.tts_n.fetchAdd(1, .acq_rel) + 1;
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "{d:0>3}.json", .{n});
+        const saved = try std.fmt.allocPrint(a, "{{\"target\":{f},\"headers\":{{{s}\"\":\"\"}},\"body\":{f}}}", .{ std.json.fmt(target, .{}), headers, std.json.fmt(body, .{}) });
+        try s.writeRecord(a, try s.path(a, &.{ "speech-requests", name }), saved);
+        const input = jv.str(jv.get(jv.parse(a, body), "input")) orelse return json(req, .bad_request, try errorBody(a, .openai, 400, "no input"));
+        try req.respond(try std.fmt.allocPrint(a, "ID3{s}", .{input}), .{ .extra_headers = &.{.{ .name = "content-type", .value = "audio/mpeg" }} });
     }
 
     /// A file of Telegram's (`GET /file/bot<token>/<path>`, a path getFile

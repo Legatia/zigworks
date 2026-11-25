@@ -209,7 +209,7 @@ pub const Transcriber = struct {
         }
     }
 
-    fn stopped(stop: ?*const std.atomic.Value(bool)) bool {
+    pub fn stopped(stop: ?*const std.atomic.Value(bool)) bool {
         const f = stop orelse return false;
         return f.load(.acquire);
     }
@@ -219,7 +219,7 @@ pub const Transcriber = struct {
     }
 
     /// Keeps the provider's message, the key masked as `[secret:NAME]`.
-    fn note(tr: *Transcriber, body: []const u8) void {
+    pub fn note(tr: *Transcriber, body: []const u8) void {
         var arena: std.heap.ArenaAllocator = .init(tr.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -255,6 +255,103 @@ pub const Transcriber = struct {
             else => if (msg.len > 0) std.fmt.allocPrint(a, "Transcription failed at {s}: {s} {s}", .{ p, @errorName(e), msg }) else std.fmt.allocPrint(a, "Transcription failed at {s}: {s}", .{ p, @errorName(e) }),
         } catch "Transcription failed.";
         return said;
+    }
+};
+
+/// The desk's voice: a provider's OpenAI-format `POST {url}/audio/speech`
+/// (`{"model","input","voice","response_format":"mp3"}`), fetched by
+/// harness, so the key never reaches the page.
+pub const Speaker = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    provider: model.Provider,
+    model: []const u8,
+    voice: []const u8,
+    last_error: [256]u8 = undefined,
+    last_error_len: usize = 0,
+    call_ms: u32 = 60_000,
+
+    /// The most audio taken back.
+    pub const max_audio = 10 << 20;
+
+    /// `text` read aloud, as MP3 bytes in `a`.
+    pub fn speak(sp: *Speaker, a: std.mem.Allocator, text: []const u8, stop: ?*const std.atomic.Value(bool)) Error![]const u8 {
+        const p = sp.provider;
+        if (p.url.len == 0) return error.NoUrl;
+        if (!p.hasKey()) return error.NoKey;
+        var target = try http.Target.parse(p.url);
+        target.prefix = model.Client.urlPath(p.url);
+        var client = http.Client.init(sp.gpa, sp.io, target);
+        defer client.deinit();
+        var body: std.ArrayList(u8) = .empty;
+        try body.appendSlice(a, "{\"model\":");
+        try util.jsonString(&body, a, sp.model);
+        try body.appendSlice(a, ",\"input\":");
+        try util.jsonString(&body, a, text);
+        try body.appendSlice(a, ",\"voice\":");
+        try util.jsonString(&body, a, sp.voice);
+        try body.appendSlice(a, ",\"response_format\":\"mp3\"}");
+        var hs: [model.max_headers + 1]std.http.Header = undefined;
+        var n: usize = 0;
+        if (p.auth == .x_api_key) {
+            hs[n] = .{ .name = "x-api-key", .value = p.key };
+            n += 1;
+        }
+        for (p.headers[0..@min(p.headers.len, model.max_headers)]) |h| {
+            hs[n] = h;
+            n += 1;
+        }
+        var resp = client.send(.{
+            .path = "/audio/speech",
+            .body = body.items,
+            .content_type = "application/json",
+            .accept = "audio/mpeg",
+            .key = if (p.auth == .bearer) p.key else null,
+            .headers = hs[0..n],
+            .resend = false,
+            .limits = .{ .idle_ms = @min(60_000, sp.call_ms), .total_ms = sp.call_ms, .stop = stop },
+        }) catch |e| return if (Transcriber.stopped(stop)) error.Stopped else e;
+        defer resp.deinit();
+        const got = resp.readAll(a, max_audio) catch |e| return if (Transcriber.stopped(stop)) error.Stopped else e;
+        if (Transcriber.stopped(stop)) return error.Stopped;
+        switch (resp.status) {
+            200 => return got,
+            401, 403 => {
+                sp.note(got);
+                return error.KeyRefused;
+            },
+            402 => return error.BudgetSpent,
+            429 => return error.RateLimited,
+            400, 413, 415, 422 => {
+                sp.note(got);
+                return error.Rejected;
+            },
+            else => {
+                sp.note(got);
+                return error.Upstream;
+            },
+        }
+    }
+
+    fn note(sp: *Speaker, body: []const u8) void {
+        var tr: Transcriber = .{ .gpa = sp.gpa, .io = sp.io, .provider = sp.provider, .model = sp.model };
+        tr.note(body);
+        @memcpy(sp.last_error[0..tr.last_error_len], tr.last_error[0..tr.last_error_len]);
+        sp.last_error_len = tr.last_error_len;
+    }
+
+    /// What the desk says when the voice wasn't fetched.
+    pub fn failure(sp: *const Speaker, a: std.mem.Allocator, e: anyerror) []const u8 {
+        const p = sp.provider.name;
+        const msg = sp.last_error[0..sp.last_error_len];
+        return switch (e) {
+            error.NoKey => std.fmt.allocPrint(a, "No {s} key is stored (harness secret add {s}).", .{ p, sp.provider.key_name }),
+            error.NoUrl => std.fmt.allocPrint(a, "No {s} url is set ([provider {s}] url in config.ini).", .{ p, p }),
+            error.KeyRefused => std.fmt.allocPrint(a, "{s} refused the key stored as {s}.", .{ p, sp.provider.key_name }),
+            error.BudgetSpent => std.fmt.allocPrint(a, "Speech budget used up at {s}.", .{p}),
+            error.RateLimited => std.fmt.allocPrint(a, "Speech is rate limited at {s}; try again later.", .{p}),
+            else => if (msg.len > 0) std.fmt.allocPrint(a, "Speech failed at {s}: {s} {s}", .{ p, @errorName(e), msg }) else std.fmt.allocPrint(a, "Speech failed at {s}: {s}", .{ p, @errorName(e) }),
+        } catch "Speech failed.";
     }
 };
 
@@ -349,6 +446,28 @@ test "each_status_is_said_in_the_providers_words" {
     const req = try sttRequest(&e, 7);
     try t.expect(jv.at(req, &.{ "headers", "Authorization" }) == null);
     try t.expect(jv.at(req, &.{ "headers", "x-api-key" }) == null);
+}
+
+test "speaker_posts_json_and_returns_audio" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    var sp: Speaker = .{ .gpa = t.allocator, .io = t.io, .provider = try e.provider("tts", .openai, .bearer, "sk-speech-key-1"), .model = "tts-1", .voice = "onyx" };
+    const audio = try sp.speak(a, "Three flats match.", null);
+    try t.expectEqualStrings("ID3Three flats match.", audio);
+    const text = try e.tmp.dir.readFileAlloc(t.io, "speech-requests/001.json", a, .unlimited);
+    const req = jv.parse(a, text).?;
+    try t.expectEqualStrings("/v1/audio/speech", jv.str(jv.get(req, "target")).?);
+    try t.expectEqualStrings("Bearer sk-speech-key-1", jv.str(jv.at(req, &.{ "headers", "Authorization" })).?);
+    const body = jv.parse(a, jv.str(jv.get(req, "body")).?).?;
+    try t.expectEqualStrings("tts-1", jv.str(jv.get(body, "model")).?);
+    try t.expectEqualStrings("Three flats match.", jv.str(jv.get(body, "input")).?);
+    try t.expectEqualStrings("onyx", jv.str(jv.get(body, "voice")).?);
+    try t.expectEqualStrings("mp3", jv.str(jv.get(body, "response_format")).?);
+    // no key: nothing sent
+    var none: Speaker = .{ .gpa = t.allocator, .io = t.io, .provider = try e.provider("tts", .openai, .bearer, ""), .model = "tts-1", .voice = "onyx" };
+    try t.expectError(error.NoKey, none.speak(a, "x", null));
 }
 
 test "a_note_name_follows_its_kind_and_type" {

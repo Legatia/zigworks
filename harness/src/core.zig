@@ -14690,7 +14690,133 @@ pub const Core = struct {
             c.desk_feed.push("topics", "");
             return .{ .body = "{\"ok\":true}" };
         }
+        if (post and eql(u8, call.path, "settings")) return c.deskSettings(a, call.body);
+        if (post and eql(u8, call.path, "voice")) return c.deskVoice(a, call);
+        if (post and eql(u8, call.path, "upload")) return c.deskUpload(a, call);
+        if (post and eql(u8, call.path, "speech")) return c.deskSpeech(a, call);
         return deskErr(a, .not_found, "the desk has state, history, events, send, answer, seen, settings, voice, upload and speech");
+    }
+
+    /// `POST settings {"avatar":NAME}` or `{"speak":VALUE}`: `[desk]` in
+    /// config.ini, written and applied (as /persona does).
+    fn deskSettings(c: *Core, a: std.mem.Allocator, body: []const u8) !appserver.Answer {
+        const v = jv.parse(a, body) orelse return deskErr(a, .bad_request, "{\"avatar\":NAME} or {\"speak\":VALUE}");
+        var key: []const u8 = "";
+        var value: []const u8 = "";
+        if (jv.str(jv.get(v, "avatar"))) |name| {
+            if (!config.avatarName(name)) return deskErr(a, .bad_request, "no such avatar");
+            const there = for (try c.deskAvatars(a)) |x| {
+                if (std.mem.eql(u8, x, name)) break true;
+            } else false;
+            if (!there) return deskErr(a, .bad_request, "no such avatar");
+            key = "avatar";
+            value = name;
+        } else if (jv.str(jv.get(v, "speak"))) |sp| {
+            const offered = std.mem.eql(u8, sp, "off") or (std.mem.eql(u8, sp, "browser") and builtin.os.tag != .linux) or for (c.deskSpeakers(a)) |x| {
+                if (std.mem.eql(u8, x, sp)) break true;
+            } else false;
+            if (!offered) return deskErr(a, .bad_request, "speak is off, browser, or a provider whose api is openai");
+            key = "speak";
+            value = sp;
+        } else return deskErr(a, .bad_request, "{\"avatar\":NAME} or {\"speak\":VALUE}");
+        const text = try mail_mod.setKey(a, c.readOr(a, c.paths.config), "desk", key, value);
+        c.writeSetting(c.paths.config, text) catch |e| return deskErr(a, .internal_server_error, try std.fmt.allocPrint(a, "Not changed: config.ini could not be written ({s}).", .{@errorName(e)}));
+        c.log.write(.config, false, .{ .event = "desk setting", .key = key, .value = value }) catch {};
+        if (c.applySetup()) |why| return deskErr(a, .conflict, why);
+        return .{ .body = "{\"ok\":true}" };
+    }
+
+    /// `POST voice?conv=NAME`: the owner's recorded words, transcribed
+    /// (`[voice]`), shown quoted, then a turn there as typed.
+    fn deskVoice(c: *Core, a: std.mem.Allocator, call: appserver.DeskCall) !appserver.Answer {
+        if (c.cfg.voice.provider.len == 0) return deskErr(a, .conflict, "Voice input needs [voice] in config.ini.");
+        const conv = queryGet(call.query, "conv") orelse "main";
+        if (!c.deskConv(conv)) return deskErr(a, .not_found, "no such conversation");
+        if (call.body.len == 0) return deskErr(a, .bad_request, "no audio");
+        const prov = c.providers.find(c.cfg.voice.provider) orelse return deskErr(a, .conflict, "Voice input needs [voice] in config.ini.");
+        const ct = call.content_type;
+        const name: []const u8 = if (std.mem.startsWith(u8, ct, "audio/ogg")) "voice.ogg" else if (std.mem.startsWith(u8, ct, "audio/mp4")) "voice.m4a" else if (std.mem.startsWith(u8, ct, "audio/wav")) "voice.wav" else if (std.mem.startsWith(u8, ct, "audio/mpeg")) "voice.mp3" else "voice.webm";
+        var tr: voice_mod.Transcriber = .{ .gpa = c.gpa, .io = c.io, .provider = prov.*, .model = c.cfg.voice.model, .language = c.cfg.voice.language };
+        const private = c.convPrivate(conv);
+        const started = util.nowMs(c.io);
+        const heard = tr.transcribe(a, call.body, name, call.stop) catch |e| {
+            const why = tr.failure(a, e);
+            c.log.write(.chat, private, .{ .event = "desk voice not transcribed", .bytes = call.body.len, .provider = prov.name, .why = why }) catch {};
+            return deskErr(a, .bad_gateway, why);
+        };
+        c.log.write(.chat, private, .{ .event = "desk voice", .bytes = call.body.len, .provider = prov.name, .model = c.cfg.voice.model, .ms = util.nowMs(c.io) - started, .chars = heard.len }) catch {};
+        if (heard.len == 0) return deskErr(a, .unprocessable_entity, "There were no words in it.");
+        const quoted = voice_mod.quoted(a, heard) catch heard;
+        if (c.cfg.desk.echo) c.deskEcho(a, conv, quoted);
+        c.deskOwner(conv, quoted, "desk");
+        try c.textIn(conv, heard);
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, "{\"text\":");
+        try util.jsonString(&out, a, heard);
+        try out.append(a, '}');
+        return .{ .body = out.items };
+    }
+
+    /// `POST upload?avatar=NAME&part=still|closed|head|eyes|eyemask
+    /// [&consent=yes]`: a file of one of the owner's avatars, into
+    /// `avatars/NAME/`; `avatar.ini` names what is there. A photo needs
+    /// the consent line ticked.
+    fn deskUpload(c: *Core, a: std.mem.Allocator, call: appserver.DeskCall) !appserver.Answer {
+        const name = queryGet(call.query, "avatar") orelse return deskErr(a, .bad_request, "avatar=NAME");
+        if (!config.avatarName(name)) return deskErr(a, .bad_request, "an avatar's name is a-z, 0-9 and -, up to 32");
+        if (std.mem.eql(u8, name, "butler")) return deskErr(a, .bad_request, "The butler is built in; give yours another name.");
+        const part = std.meta.stringToEnum(deskwin.Part, queryGet(call.query, "part") orelse "") orelse return deskErr(a, .bad_request, "part is still, closed, head, eyes or eyemask");
+        if ((part == .still or part == .closed) and !std.mem.eql(u8, queryGet(call.query, "consent") orelse "", "yes"))
+            return deskErr(a, .bad_request, "Tick the line first: This is me, someone who agreed, or a made-up character.");
+        const file_name = deskwin.packFile(part, call.body) orelse return deskErr(a, .bad_request, switch (part) {
+            .still, .closed => "A photo is a JPEG or PNG.",
+            .eyes, .eyemask => "That part is a PNG.",
+            .head => "An empty head file.",
+        });
+        const dir = try std.fs.path.join(a, &.{ c.paths.home, "avatars", name });
+        try Io.Dir.cwd().createDirPath(c.io, dir);
+        // one portrait of each kind: the other format goes
+        if (part == .still or part == .closed) {
+            const other = try std.fmt.allocPrint(a, "{s}.{s}", .{ @tagName(part), if (std.mem.endsWith(u8, file_name, ".jpg")) "png" else "jpg" });
+            Io.Dir.cwd().deleteFile(c.io, try std.fs.path.join(a, &.{ dir, other })) catch {};
+        }
+        try util.writeReplace(c.io, try std.fs.path.join(a, &.{ dir, file_name }), call.body);
+        var pack: deskwin.Pack = .{};
+        inline for (.{ "still", "closed" }) |k| for ([_][]const u8{ "jpg", "png" }) |ext| {
+            const f = try std.fmt.allocPrint(a, k ++ ".{s}", .{ext});
+            if (Io.Dir.cwd().statFile(c.io, try std.fs.path.join(a, &.{ dir, f }), .{})) |_| {
+                @field(pack, k) = f;
+            } else |_| {}
+        };
+        inline for (.{ .{ "head", "head.bin" }, .{ "eyes", "eyes.png" }, .{ "eyemask", "eyemask.png" } }) |kv| {
+            if (Io.Dir.cwd().statFile(c.io, try std.fs.path.join(a, &.{ dir, kv[1] }), .{})) |_| {
+                @field(pack, kv[0]) = kv[1];
+            } else |_| {}
+        }
+        try util.writeReplace(c.io, try std.fs.path.join(a, &.{ dir, "avatar.ini" }), try deskwin.avatarIni(a, pack));
+        c.log.write(.config, false, .{ .event = "desk avatar file", .avatar = name, .file = file_name, .bytes = call.body.len }) catch {};
+        c.desk_feed.push("facts", "");
+        return .{ .body = try std.fmt.allocPrint(a, "{{\"ok\":true,\"file\":\"{s}\"}}", .{file_name}) };
+    }
+
+    /// `POST speech {"id":N}`: message N of the desk's history read aloud
+    /// by `[desk] speak`'s provider, fetched here with its key.
+    fn deskSpeech(c: *Core, a: std.mem.Allocator, call: appserver.DeskCall) !appserver.Answer {
+        const sp = c.cfg.desk.speak;
+        if (std.mem.eql(u8, sp, "off") or std.mem.eql(u8, sp, "browser")) return deskErr(a, .conflict, "Speech from a provider is off ([desk] speak).");
+        const v = jv.parse(a, call.body) orelse return deskErr(a, .bad_request, "{\"id\":N}");
+        const id = jv.int(jv.get(v, "id")) orelse return deskErr(a, .bad_request, "{\"id\":N}");
+        if (id <= 0) return deskErr(a, .bad_request, "{\"id\":N}");
+        const found = (try c.desk_history.find(a, @intCast(id))) orelse return deskErr(a, .not_found, "no such message");
+        if (found.msg.from != .harness) return deskErr(a, .not_found, "no such message");
+        const prov = c.providers.find(sp) orelse return deskErr(a, .conflict, "That provider isn't set up.");
+        var speaker: voice_mod.Speaker = .{ .gpa = c.gpa, .io = c.io, .provider = prov.*, .model = c.cfg.desk.speak_model, .voice = c.cfg.desk.speak_voice };
+        const audio = speaker.speak(a, try deskwin.spoken(a, found.msg.text), call.stop) catch |e| {
+            const why = speaker.failure(a, e);
+            c.log.write(.chat, false, .{ .event = "desk speech failed", .provider = prov.name, .why = why }) catch {};
+            return deskErr(a, .bad_gateway, why);
+        };
+        return .{ .body = audio, .content_type = "audio/mpeg" };
     }
 
     /// A conversation the desk may write in: main, or one only the owner
@@ -36041,3 +36167,110 @@ test "the_state_follows_harness_facts" {
     Core.deskEnd(f.core, id, .replied);
 }
 
+test "desk_settings_write_and_reload" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"speak\":\"openai\"}").body);
+    try expectHas(f.core.readOr(a, f.core.paths.config), "[desk]\nspeak = openai");
+    try t.expectEqualStrings("openai", f.core.cfg.desk.speak);
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"speak\":\"openai\"");
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"speak\":\"off\"}").body);
+    try t.expectEqualStrings("off", f.core.cfg.desk.speak);
+    // an avatar there is; one there isn't, a speech nobody gives: refused
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "settings", "", "{\"avatar\":\"ghost\"}").status);
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "settings", "", "{\"avatar\":\"../x\"}").status);
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "settings", "", "{\"speak\":\"nowhere\"}").status);
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "settings", "", "{\"color\":\"red\"}").status);
+    try Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(a, &.{ f.home, "avatars", "me" }));
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"avatar\":\"me\"}").body);
+    try t.expectEqualStrings("me", f.core.cfg.desk.avatar);
+    const st = deskCall(&f, .GET, "state", "", "").body;
+    try expectHas(st, "\"avatar\":\"me\",\"avatars\":[\"butler\",\"me\"]");
+}
+
+test "desk_voice_is_transcribed_then_a_turn" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // no [voice]: said
+    const off = deskCall(&f, .POST, "voice", "conv=main", "\x1aE\xdf\xa3webm");
+    try t.expectEqual(std.http.Status.conflict, off.status);
+    try expectHas(off.body, "Voice input needs [voice] in config.ini.");
+    const p = f.core.paths;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.config, .data = try std.fmt.allocPrint(a, "{s}\n[provider whisper]\napi = openai\nurl = {s}/v1\nauth = none\n[voice]\nprovider = whisper\nmodel = large-v3-turbo\n", .{ f.core.readOr(a, p.config), try f.e.url() }) });
+    try expectHas(try f.core.reload(), "Settings reloaded.");
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "transcribe/001.json", .data = "{\"text\":\"turn on the kitchen light\"}" });
+    try f.e.script(1, model.textReply("The kitchen light is on."));
+    try f.core.startWorker();
+    const got = Core.deskApi(f.core, a, .{ .method = .POST, .path = "voice", .query = "conv=main", .body = "\x1aE\xdf\xa3webm", .content_type = "audio/webm;codecs=opus", .stop = &app_never_stops });
+    try t.expectEqual(std.http.Status.ok, got.status);
+    try t.expectEqualStrings("{\"text\":\"turn on the kitchen light\"}", got.body);
+    try f.rec.waitFor("The kitchen light is on.");
+    // sent as webm; the turn has the words; the desk shows them quoted
+    try expectHas(try f.e.tmp.dir.readFileAlloc(t.io, "transcribe-requests/001.json", a, .unlimited), "filename=\\\"voice.webm\\\"");
+    try expectHas(try f.e.request(1), "turn on the kitchen light");
+    try expectHas(deskCall(&f, .GET, "history", "conv=main", "").body, "\"from\":\"you\",\"text\":\"\\\"turn on the kitchen light\\\"\"");
+    try f.rec.waitFor("You, on the desk: \"turn on the kitchen light\"");
+}
+
+test "upload_writes_only_into_the_avatars_folder" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const jpg = "\xff\xd8\xff\xe0portrait";
+    const png = "\x89PNG\r\n\x1a\neyes";
+    // the consent line first, for a photo
+    const no = deskCall(&f, .POST, "upload", "avatar=me&part=still", jpg);
+    try t.expectEqual(std.http.Status.bad_request, no.status);
+    try expectHas(no.body, "This is me, someone who agreed, or a made-up character.");
+    try t.expectEqualStrings("{\"ok\":true,\"file\":\"still.jpg\"}", deskCall(&f, .POST, "upload", "avatar=me&part=still&consent=yes", jpg).body);
+    try t.expectEqualStrings("{\"ok\":true,\"file\":\"eyes.png\"}", deskCall(&f, .POST, "upload", "avatar=me&part=eyes", png).body);
+    const dir = try std.fs.path.join(a, &.{ f.home, "avatars", "me" });
+    try t.expectEqualStrings(jpg, try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ dir, "still.jpg" }), a, .unlimited));
+    try t.expectEqualStrings("[avatar]\nstill = still.jpg\neyes = eyes.png\n", try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ dir, "avatar.ini" }), a, .unlimited));
+    // a PNG portrait later replaces the JPEG
+    _ = deskCall(&f, .POST, "upload", "avatar=me&part=still&consent=yes", png);
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, try std.fs.path.join(a, &.{ dir, "still.jpg" }), .{}));
+    try expectHas(try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ dir, "avatar.ini" }), a, .unlimited), "still = still.png");
+    // refused: the built-in butler, a name that goes elsewhere, a part
+    // there is none of, what isn't a photo
+    for ([_][]const u8{ "avatar=butler&part=still&consent=yes", "avatar=../x&part=still&consent=yes", "avatar=me/../../x&part=still&consent=yes", "avatar=me&part=config&consent=yes", "avatar=Me&part=still&consent=yes", "part=still&consent=yes" }) |q| {
+        const got = deskCall(&f, .POST, "upload", q, jpg);
+        if (got.status != .bad_request) std.debug.print("{s}: {d}\n", .{ q, @backingInt(got.status) });
+        try t.expectEqual(std.http.Status.bad_request, got.status);
+    }
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "upload", "avatar=me&part=still&consent=yes", "GIF89a").status);
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "upload", "avatar=me&part=eyes", jpg).status);
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, try std.fs.path.join(a, &.{ f.home, "x" }), .{}));
+    try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, try std.fs.path.join(a, &.{ f.home, "avatars", "butler" }), .{}));
+}
+
+test "desk_speech_fetches_the_providers_audio" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const p = f.core.paths;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.config, .data = try std.fmt.allocPrint(a, "{s}\n[provider tts]\napi = openai\nurl = {s}/v1\nkey = tts\n[desk]\nspeak = tts\nspeak_voice = onyx\n", .{ f.core.readOr(a, p.config), try f.e.url() }) });
+    f.core.close();
+    f.core = try Core.open(t.allocator, t.io, f.home, .{ .omnigate = "og-key-for-tests", .search = "search-key-123", .named = &.{.{ .name = "tts", .value = "sk-desk-speech-1" }} });
+    f.core.attach(f.rec.channel());
+    f.core.say("Three flats match.");
+    const h = deskCall(&f, .GET, "history", "conv=main", "").body;
+    const id = jv.int(jv.at(jv.parse(a, h), &.{ "messages", "0", "id" })).?;
+    const got = deskCall(&f, .POST, "speech", "", try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{id}));
+    try t.expectEqual(std.http.Status.ok, got.status);
+    try t.expectEqualStrings("audio/mpeg", got.content_type);
+    try t.expectEqualStrings("ID3Three flats match.", got.body);
+    // the key went to the provider, never into the answer
+    try expectHas(try f.e.tmp.dir.readFileAlloc(t.io, "speech-requests/001.json", a, .unlimited), "Bearer sk-desk-speech-1");
+    try t.expect(std.mem.indexOf(u8, got.body, "sk-desk") == null);
+    try t.expectEqual(std.http.Status.not_found, deskCall(&f, .POST, "speech", "", "{\"id\":99999}").status);
+    // speak = off or browser: harness fetches nothing
+    _ = deskCall(&f, .POST, "settings", "", "{\"speak\":\"off\"}");
+    try t.expectEqual(std.http.Status.conflict, deskCall(&f, .POST, "speech", "", try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{id})).status);
+}
