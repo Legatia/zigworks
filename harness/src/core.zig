@@ -17942,7 +17942,25 @@ const Fix = struct {
             break :blk f.rec.last;
         };
         if (b.n > 0) f.waitQuickNoted(b.buf[0][0..b.len[0]]);
+        if (b.n > 0) f.waitShownNoted(b.msg, b.buf[0][0..b.len[0]]);
         return b;
+    }
+
+    /// An item's message is noted as shown just after it is sent, on the
+    /// worker's thread: waits for that, so a reply made as soon as the
+    /// buttons show finds its item. `data` is a button's ("iN-NONCE:KEY");
+    /// any other kind returns at once.
+    fn waitShownNoted(f: *Fix, msg: i64, data: []const u8) void {
+        if (data.len < 2 or data[0] != 'i') return;
+        var waited: u32 = 0;
+        while (waited < 8000) : (waited += 5) {
+            {
+                f.core.inbox.mutex.lockUncancelable(t.io);
+                defer f.core.inbox.mutex.unlock(t.io);
+                for (f.core.inbox.items.items) |it| for (it.shown.items) |s| if (s.message == msg) return;
+            }
+            t.io.sleep(.fromMilliseconds(5), .awake) catch {};
+        }
     }
 
     /// A quick reply's post is noted with its message just after its
@@ -19354,11 +19372,19 @@ test "the_21st_question_waits_for_a_place_until_its_turn_ends" {
     try t.expect(std.mem.indexOf(u8, lt, "\"why\":\"no place in the inbox until the turn's end: 1 question was open (questions in config.ini)\"") != null);
 }
 
-/// The message item `id` was shown in first.
+/// The message item `id` was shown in first. It is noted just after it is
+/// sent, on the worker's thread: waits for that.
 fn shownIn(f: *Fix, id: u64) i64 {
-    f.core.inbox.mutex.lockUncancelable(t.io);
-    defer f.core.inbox.mutex.unlock(t.io);
-    return f.core.inbox.find(id).?.shown.items[0].message;
+    var waited: u32 = 0;
+    while (waited < 8000) : (waited += 5) {
+        {
+            f.core.inbox.mutex.lockUncancelable(t.io);
+            defer f.core.inbox.mutex.unlock(t.io);
+            if (f.core.inbox.find(id)) |it| if (it.shown.items.len > 0) return it.shown.items[0].message;
+        }
+        t.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+    return 0;
 }
 
 test "ask_owner_returns_the_choice_or_the_text" {

@@ -5,6 +5,25 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: the one red job on your merge was a test race (2026-11-25, night)
+
+CI on ff3262d (your merge of the desk apps) failed in `test (macos-15,
+harness)`: `a_text_reply_to_an_approval_denies_it_and_the_agent_gets_the_reason`
+timed out. Nothing in your merge caused it. The test replied to the
+approval's message the moment its buttons were sent, before the worker had
+noted which item that message belongs to (`it.shown`), so the reply was
+queued as an ordinary message. A person can't reply that fast; the product
+is unchanged.
+
+- `Fix.lastButtons()` now also waits for an item's message to be noted
+  (`waitShownNoted`), and `shownIn()` waits instead of indexing an empty
+  list (`ask_owner_returns_the_choice_or_the_text` had the same race).
+- In a new test, take a message id to reply to from `f.lastButtons().msg`
+  or `shownIn()`, not from the recorder directly.
+- Found by pausing 60 ms between the send and the note: both tests failed
+  every time, and with the helpers waiting the whole suite passes with the
+  pause in.
+
 ## For you: the desk reads replies aloud (2026-11-25, night)
 
 Three defects in the page, all fixed in `src/desk/`. Your app shows the
