@@ -848,3 +848,19 @@ test "avatar_names_are_plain" {
     try t.expect(!validName(&long));
     try t.expect(validName(long[0..64]));
 }
+
+test "the_js_packer_and_this_reader_agree" {
+    // made by the desk's fit.js from a made-up 3x3 base head
+    // (node tools/test-avatar.mjs --write-fixture)
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    var why: []const u8 = "";
+    const h = readHeader(arena.allocator(), @embedFile("testdata/avatar/tiny-head.bin"), &why) catch |e| {
+        std.debug.print("\n{s}\n", .{why});
+        return e;
+    };
+    try t.expectEqual(1, h.version);
+    try t.expectEqual(9, h.vertices);
+    try t.expectEqual(52, h.shapes);
+    try t.expectEqual([2]u32{ 128, 96 }, h.image);
+}
