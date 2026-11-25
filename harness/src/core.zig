@@ -3999,6 +3999,13 @@ pub const Core = struct {
             c.log.write(.chat, false, .{ .event = "dropped", .from = from_id, .why = "button from someone else" }) catch {};
             return;
         }
+        c.ownerPress(chat, thread, message_id, data, text);
+    }
+
+    /// The owner pressed button `data` of message `message_id` at `chat`
+    /// and `thread` (in Telegram, or on the desk when it is the only way in).
+    fn ownerPress(c: *Core, chat: i64, thread: i64, message_id: i64, data: []const u8, text: []const u8) void {
+        if (data.len > 0 and data[0] == 'e') return Emergency.pressBy(c, 0, true, chat, message_id, data);
         Emergency.touched(c, chat, message_id, "button");
         // a medication reminder's [Taken]
         if (data.len > 0 and data[0] == 'm') return Meds.press(c, chat, thread, message_id, data);
@@ -14980,6 +14987,7 @@ pub const Core = struct {
         }
         if (post and eql(u8, call.path, "send")) return c.deskSend(a, call.body);
         if (post and eql(u8, call.path, "answer")) return appShellApi(c, a, .{ .method = .POST, .path = "answer", .query = "", .body = call.body });
+        if (post and eql(u8, call.path, "press")) return c.deskPress(a, call.body);
         if (post and eql(u8, call.path, "seen")) {
             const v = jv.parse(a, call.body) orelse return deskErr(a, .bad_request, "{\"conv\":NAME}");
             const conv = jv.str(jv.get(v, "conv")) orelse return deskErr(a, .bad_request, "{\"conv\":NAME}");
@@ -14993,7 +15001,7 @@ pub const Core = struct {
         if (post and eql(u8, call.path, "voice")) return c.deskVoice(a, call);
         if (post and eql(u8, call.path, "upload")) return c.deskUpload(a, call);
         if (post and eql(u8, call.path, "speech")) return c.deskSpeech(a, call);
-        return deskErr(a, .not_found, "the desk has state, history, events, send, answer, seen, settings, voice, upload and speech");
+        return deskErr(a, .not_found, "the desk has state, history, events, send, answer, press, seen, settings, voice, upload and speech");
     }
 
     /// `POST settings {"avatar":NAME}`, `{"speak":VALUE}`,
@@ -15177,6 +15185,24 @@ pub const Core = struct {
         if (c.cfg.desk.echo and !butler.anyTokenLike(text)) c.deskEcho(a, conv, text);
         c.deskOwner(conv, text, "desk");
         try c.textIn(conv, text);
+        return .{ .body = "{\"ok\":true}" };
+    }
+
+    /// `POST press {"id":MESSAGE,"n":BUTTON}`: the owner presses button
+    /// `n` under the desk's message `id`, as a press in Telegram would; only
+    /// when the desk is the only way in (with Telegram, buttons are there).
+    fn deskPress(c: *Core, a: std.mem.Allocator, body: []const u8) !appserver.Answer {
+        const shape = "{\"id\":MESSAGE,\"n\":BUTTON}";
+        const v = jv.parse(a, body) orelse return deskErr(a, .bad_request, shape);
+        const id = jv.int(jv.get(v, "id")) orelse return deskErr(a, .bad_request, shape);
+        const n = jv.int(jv.get(v, "n")) orelse return deskErr(a, .bad_request, shape);
+        if (id < 0 or n < 0) return deskErr(a, .bad_request, shape);
+        if (!c.alone) return deskErr(a, .conflict, "Buttons are pressed in Telegram.");
+        const found = (try c.desk_history.find(a, @intCast(id))) orelse return deskErr(a, .not_found, "no such message");
+        const m = found.msg;
+        if (m.chan == 0 or n >= m.buttons.len) return .{ .body = "{\"said\":\"That button is out of date.\"}" };
+        const r = try c.placeOf(a, found.conv);
+        c.ownerPress(r.place.chat, r.place.thread, m.chan, m.buttons[@intCast(n)][1], m.text);
         return .{ .body = "{\"ok\":true}" };
     }
 
@@ -27169,6 +27195,12 @@ const Emergency = struct {
     /// else's is dropped.
     fn press(c: *Core, from: i64, chat: i64, thread: i64, message: i64, data: []const u8) void {
         _ = thread;
+        pressBy(c, from, if (c.owner) |o| o == from else false, chat, message, data);
+    }
+
+    /// `press`, by the owner when `is_owner` (the desk alone has no
+    /// account to compare), else by account `from`.
+    fn pressBy(c: *Core, from: i64, is_owner: bool, chat: i64, message: i64, data: []const u8) void {
         const dash = std.mem.indexOfScalar(u8, data, '-') orelse return dropped(c, from, "not an alert's button");
         const colon = std.mem.lastIndexOfScalar(u8, data, ':') orelse return dropped(c, from, "not an alert's button");
         if (colon < dash) return dropped(c, from, "not an alert's button");
@@ -27178,7 +27210,6 @@ const Emergency = struct {
         const a = arena.allocator();
         const x = c.alerts.get(a, id) orelse return dropped(c, from, "an alert that is gone");
         if (!std.mem.eql(u8, data[dash + 1 .. colon], x.token)) return dropped(c, from, "an alert's button with another token");
-        const is_owner = if (c.owner) |o| o == from else false;
         const by: []const u8 = blk: {
             if (is_owner) {
                 if (x.msg) |m| if (m.chat == chat and message >= m.message and message < m.message + m.count) break :blk "owner";
@@ -37216,4 +37247,92 @@ test "desk_alone_an_approval_is_answered_on_the_desk" {
     _ = try waitDesk(&f, "history", "conv=main", try std.fmt.allocPrint(a, "\"item\":{d}", .{id}));
     try expectHas(deskCall(&f, .POST, "answer", "", try std.fmt.allocPrint(a, "{{\"id\":{d},\"key\":\"once\"}}", .{id})).body, "\"took\":\"taken\"");
     _ = try waitDesk(&f, "history", "conv=main", "Said hi.");
+}
+
+/// The id of the desk's last message in `conv` with buttons (5 s).
+fn deskButtonsMsg(f: *Fix, conv: []const u8, label: []const u8) !i64 {
+    const a = f.e.arena.allocator();
+    const h = try waitDesk(f, "history", try std.fmt.allocPrint(a, "conv={s}", .{conv}), label);
+    const v = jv.parse(a, h).?;
+    const msgs = jv.get(v, "messages").?.array.items;
+    var i = msgs.len;
+    while (i > 0) {
+        i -= 1;
+        if (jv.get(msgs[i], "buttons") != null) return jv.int(jv.get(msgs[i], "id")).?;
+    }
+    return error.NoButtons;
+}
+
+test "desk_alone_quick_replies_are_pressed_on_the_desk" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"text\":\"Three flats match.\",\"buttons\":[\"Book viewings\",\"Not now\"],\"final\":true}"));
+    try f.e.script(2, model.textReply("Booking them."));
+    try f.core.startWorker();
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"find flats\"}");
+    const id = try deskButtonsMsg(&f, "main", "\"buttons\":[\"Book viewings\",\"Not now\"]");
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "press", "", try std.fmt.allocPrint(a, "{{\"id\":{d},\"n\":0}}", .{id})).body);
+    _ = try waitDesk(&f, "history", "conv=main", "Booking them.");
+    try expectHas(try f.e.request(2), "{\"type\":\"text\",\"text\":\"Book viewings\"");
+    // its buttons are gone, and a second press answers nothing
+    try t.expect(std.mem.indexOf(u8, deskCall(&f, .GET, "history", "conv=main", "").body, "\"buttons\"") == null);
+    try expectHas(deskCall(&f, .POST, "press", "", try std.fmt.allocPrint(a, "{{\"id\":{d},\"n\":1}}", .{id})).body, "That button is out of date.");
+    try t.expectEqual(2, f.e.server.modelRequests());
+    try t.expectEqual(std.http.Status.not_found, deskCall(&f, .POST, "press", "", "{\"id\":999999,\"n\":0}").status);
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "press", "", "{\"id\":-1,\"n\":0}").status);
+}
+
+test "a_desk_press_with_telegram_is_refused" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.core.deliver("Hello.");
+    const h = try waitDesk(&f, "history", "conv=main", "Hello.");
+    try t.expect(std.mem.indexOf(u8, h, "\"buttons\"") == null);
+    try t.expectEqual(std.http.Status.conflict, deskCall(&f, .POST, "press", "", "{\"id\":1,\"n\":0}").status);
+}
+
+test "desk_alone_an_urgent_alert_is_taken_on_the_desk" {
+    var f: Fix = undefined;
+    try f.initAlone("[butler]\nescalate = 5m anna\n", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    _ = try leakAlert(&f, "urgent = yes\n");
+    try leakReads(&f, "wet");
+    _ = try waitDesk(&f, "state", "", "\"alerts\":1");
+    const id = try deskButtonsMsg(&f, "main", "\"buttons\":[\"I'm on it\"]");
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "press", "", try std.fmt.allocPrint(a, "{{\"id\":{d},\"n\":0}}", .{id})).body);
+    _ = try waitDesk(&f, "state", "", "\"alerts\":0");
+    _ = try waitDesk(&f, "history", "conv=main", "You're on it");
+}
+
+test "desk_alone_a_posted_file_is_kept" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.workspace, "flats.csv" }), .data = "street,rooms\n" });
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"text\":\"Here is the list.\",\"files\":[\"flats.csv\"],\"final\":true}"));
+    try f.core.startWorker();
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"send me the list\"}");
+    _ = try waitDesk(&f, "history", "conv=main", "A file: flats.csv, kept in ");
+    var d = try Io.Dir.cwd().openDir(t.io, try std.fs.path.join(a, &.{ f.core.paths.state, "desk-files" }), .{ .iterate = true });
+    defer d.close(t.io);
+    var it = d.iterate();
+    const e = (try it.next(t.io)).?;
+    try t.expect(std.mem.endsWith(u8, e.name, "-flats.csv"));
+    try t.expectEqualStrings("street,rooms\n", try d.readFileAlloc(t.io, e.name, a, .limited(100)));
+}
+
+test "a_kept_file_name_stays_in_its_folder" {
+    const a = t.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const x = arena.allocator();
+    try t.expectEqualStrings("passwd", try safeFileName(x, "../../etc/passwd"));
+    try t.expectEqualStrings("file", try safeFileName(x, ".."));
+    try t.expectEqualStrings("file", try safeFileName(x, ""));
+    try t.expectEqualStrings("a_b.txt", try safeFileName(x, "a b.txt"));
 }
