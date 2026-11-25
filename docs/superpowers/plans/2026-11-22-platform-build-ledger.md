@@ -189,3 +189,4 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
   - Final: minor (deferred): parseCap's doc comment sits above parseBudget.
   - Final: minor (deferred): an agent test comment says "the next day" but only raises the budget.
   - Merged as bc3829b on harness-logins (unit 1463 of 1485, 22 skipped; smoke 152, and 185 with the stand-ins, in both modes).
+- CI 45526946501 (2e0c251, the money-budget merge): 31/31.
