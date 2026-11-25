@@ -27,7 +27,8 @@
 //!   whose bytes are the request's text (a 0 added to make it even), or
 //!   `gemini/001.json`, `002.json`, … when there is one:
 //!   `{"status":N}` that error in Google's shape (`"echo_key":true`: its
-//!   message says the key), `{"mime":"audio/wav"}` the same audio as a
+//!   message says the key; `"body":{…}` that body instead),
+//!   `{"mime":"audio/wav"}` the same audio as a
 //!   WAV file, `{"answer":{…}}` that answer as it is. Each request is
 //!   saved as `gemini-requests/001.json`, … with its target, headers and
 //!   body (a string).
@@ -449,6 +450,8 @@ pub const Server = struct {
         try s.writeRecord(a, try s.path(a, &.{ "gemini-requests", name }), saved);
         const v: ?jv.Value = if (s.readScript(a, &.{ "gemini", name })) |x| jv.parse(a, x) else null;
         if (jv.int(jv.get(v, "status"))) |st| {
+            // Google's own error body, as given
+            if (jv.get(v, "body")) |b| return json(req, @fromBackingInt(@as(u10, @intCast(st))), try std.json.Stringify.valueAlloc(a, b, .{}));
             const echo = jv.boolean(jv.get(v, "echo_key")) orelse false;
             const msg = if (echo) try std.fmt.allocPrint(a, "scripted error for key {s}", .{key}) else "scripted error";
             return json(req, @fromBackingInt(@as(u10, @intCast(st))), try std.fmt.allocPrint(a, "{{\"error\":{{\"code\":{d},\"message\":{f},\"status\":\"SCRIPTED\"}}}}", .{ st, std.json.fmt(msg, .{}) }));
@@ -722,17 +725,13 @@ fn headerOf(head: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// `harness-fake --desk HOME TEXT`: what the desk app and its page do,
-/// over HTTP: a code asked for (state/open-request), read and deleted,
-/// entered for a session cookie; the page and the state read; TEXT sent in
-/// main; the events long-polled until harness's reply, which is then asked
-/// for read aloud (`speech STATUS TYPE` and the audio's first 4 bytes, or
-/// the error). A line each.
-pub fn deskClient(io: Io, a: std.mem.Allocator, home: []const u8, text: []const u8) !void {
-    const out = Io.File.stdout();
+/// The desk app's way in: a code asked for (state/open-request), read and
+/// deleted, entered for a session cookie; said line by line when `say`.
+fn deskEnter(io: Io, a: std.mem.Allocator, home: []const u8, say: bool) !struct { port: u16, cookie: []const u8 } {
     const state = try std.fs.path.join(a, &.{ home, "state" });
     const info = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ state, "desk.json" }), a, .limited(64 << 10));
     const port: u16 = @intCast(jv.int(jv.get(jv.parse(a, info), "port")) orelse return error.NoPort);
+    const out = Io.File.stdout();
     const code_path = try std.fs.path.join(a, &.{ state, "desk-code" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ state, "open-request" }), .data = "" });
     var waited: u32 = 0;
@@ -744,14 +743,44 @@ pub fn deskClient(io: Io, a: std.mem.Allocator, home: []const u8, text: []const 
         io.sleep(.fromMilliseconds(50), .awake) catch {};
     } else return error.NoCode;
     Io.Dir.cwd().deleteFile(io, code_path) catch {};
-    try out.writeStreamingAll(io, "code read\n");
+    if (say) try out.writeStreamingAll(io, "code read\n");
     const entered = try deskReq(io, a, port, "GET", try std.fmt.allocPrint(a, "/enter?code={s}", .{code}), "", "");
     const at = std.mem.indexOf(u8, entered.head, "set-cookie: harness_desk=") orelse return error.NoSession;
     const v = entered.head[at + "set-cookie: harness_desk=".len ..];
     const cookie = v[0 .. std.mem.indexOfScalar(u8, v, ';') orelse return error.NoSession];
-    try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "entered {d}{s}\n", .{ entered.status, if (std.mem.indexOf(u8, entered.head, "HttpOnly; SameSite=Strict") != null) " httponly samesite" else "" }));
+    if (say) try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "entered {d}{s}\n", .{ entered.status, if (std.mem.indexOf(u8, entered.head, "HttpOnly; SameSite=Strict") != null) " httponly samesite" else "" }));
     // the same code again: refused
-    try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "again {d}\n", .{(try deskReq(io, a, port, "GET", try std.fmt.allocPrint(a, "/enter?code={s}", .{code}), "", "")).status}));
+    if (say) try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "again {d}\n", .{(try deskReq(io, a, port, "GET", try std.fmt.allocPrint(a, "/enter?code={s}", .{code}), "", "")).status}));
+    return .{ .port = port, .cookie = cookie };
+}
+
+/// `harness-fake --desk-get HOME PATH...`: the desk entered, then each
+/// PATH asked for with the session: `PATH STATUS BODY`, the body's first
+/// 60 bytes on one line.
+pub fn deskGet(io: Io, a: std.mem.Allocator, home: []const u8, paths: []const [:0]const u8) !void {
+    const out = Io.File.stdout();
+    const in = try deskEnter(io, a, home, false);
+    for (paths) |p| {
+        const got = try deskReq(io, a, in.port, "GET", p, in.cookie, "");
+        const shown = try a.dupe(u8, got.body[0..@min(60, got.body.len)]);
+        for (shown) |*ch| if (ch.* == '\n' or ch.* == '\r') {
+            ch.* = ' ';
+        };
+        try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "{s} {d} {s}\n", .{ p, got.status, shown }));
+    }
+}
+
+/// `harness-fake --desk HOME TEXT`: what the desk app and its page do,
+/// over HTTP: a code asked for (state/open-request), read and deleted,
+/// entered for a session cookie; the page and the state read; TEXT sent in
+/// main; the events long-polled until harness's reply, which is then asked
+/// for read aloud (`speech STATUS TYPE` and the audio's first 4 bytes, or
+/// the error). A line each.
+pub fn deskClient(io: Io, a: std.mem.Allocator, home: []const u8, text: []const u8) !void {
+    const out = Io.File.stdout();
+    const in = try deskEnter(io, a, home, true);
+    const port = in.port;
+    const cookie = in.cookie;
     const page = try deskReq(io, a, port, "GET", "/desk", cookie, "");
     try out.writeStreamingAll(io, try std.fmt.allocPrint(a, "page {d}{s}\n", .{ page.status, if (std.mem.indexOf(u8, page.body, "/desk/static/desk.js") != null) " with its script" else "" }));
     const st = try deskReq(io, a, port, "GET", "/desk/api/state", cookie, "");
@@ -788,6 +817,28 @@ pub fn deskClient(io: Io, a: std.mem.Allocator, home: []const u8, text: []const 
         }
     }
     return error.NoReply;
+}
+
+/// The desk's port, from state/desk.json.
+fn deskPort(io: Io, a: std.mem.Allocator, home: []const u8) !u16 {
+    const info = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ home, "state", "desk.json" }), a, .limited(64 << 10));
+    return @intCast(jv.int(jv.get(jv.parse(a, info), "port")) orelse return error.NoPort);
+}
+
+/// `harness-fake --desk-enter HOME`: as the desk app enters (a code asked
+/// for, read, entered); prints the session cookie.
+pub fn deskEnterCookie(io: Io, a: std.mem.Allocator, home: []const u8) !void {
+    const in = try deskEnter(io, a, home, false);
+    try Io.File.stdout().writeStreamingAll(io, try std.fmt.allocPrint(a, "{s}\n", .{in.cookie}));
+}
+
+/// `harness-fake --desk-api HOME COOKIE METHOD PATH [BODY]`: one call of
+/// the desk's API (`/desk/api/PATH`); prints the status, then the body.
+pub fn deskApiCall(io: Io, a: std.mem.Allocator, home: []const u8, cookie: []const u8, method: []const u8, path: []const u8, body: []const u8) !u16 {
+    const port = try deskPort(io, a, home);
+    const got = try deskReq(io, a, port, method, try std.fmt.allocPrint(a, "/desk/api/{s}", .{path}), cookie, body);
+    try Io.File.stdout().writeStreamingAll(io, try std.fmt.allocPrint(a, "{d}\n{s}\n", .{ got.status, got.body }));
+    return got.status;
 }
 
 /// The owner's browser in sign-in tests: told the link (`opened`, as an

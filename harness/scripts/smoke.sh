@@ -1033,6 +1033,119 @@ if [ $windows = 0 ]; then
 	check "autostart on writes the login item, off removes it, and alone it says which first" 'HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart | grep -qE "^off" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart on >/dev/null && grep -rqF -- "--home" "$T/user" && grep -rqF "$DH" "$T/user" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart | grep -qE "^on" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart off >/dev/null && [ -z "$(find "$T/user" -type f)" ]'
 fi
 
+# the fit files (/desk/assets/) from the first place that has them: the
+# data folder's desk-assets/, then desk-assets/ beside harness's binary,
+# then the app bundle's Resources/desk-assets/ (the binary copied into a
+# bundle's layout); nothing outside them, links not followed
+FH="$T/fitdata"
+FA="$T/fitapp/Contents"
+mkdir -p "$FA/MacOS/desk-assets" "$FA/Resources/desk-assets/mediapipe"
+HB="$FA/MacOS/$(basename "$H")"
+cp "$H" "$HB"
+HARNESS_HOME="$FH" "$HB" init >/dev/null 2>&1
+FPORT=$(sed -n 's/^port = \([0-9]*\).*/\1/p' "$FH/config.ini")
+cat >"$FH/config.ini" <<EOF
+[model]
+url = $URL
+[search]
+url = $URL
+[chat]
+api = $URL
+[apps]
+port = $FPORT
+EOF
+chmod 600 "$FH/config.ini"
+mkdir -p "$FH/desk-assets"
+printf data >"$FH/desk-assets/a.txt"
+printf beside >"$FA/MacOS/desk-assets/a.txt"
+printf beside >"$FA/MacOS/desk-assets/b.txt"
+for f in a b c; do printf bundle >"$FA/Resources/desk-assets/$f.txt"; done
+printf 'bundle wasm' >"$FA/Resources/desk-assets/mediapipe/d.txt"
+printf 'outside' >"$FA/MacOS/outside.txt"
+[ $windows = 0 ] && ln -s "$FH/config.ini" "$FA/Resources/desk-assets/link.txt"
+HARNESS_HOME="$FH" "$HB" run >"$T/frun.out" 2>&1 &
+RPID=$!
+wait_for "$T/frun.out" "running on" 15
+"$F" --desk-get "$FH" /desk/assets/a.txt /desk/assets/b.txt /desk/assets/c.txt /desk/assets/mediapipe/d.txt /desk/assets/../outside.txt /desk/assets/%2e%2e/outside.txt /desk/assets/mediapipe/../../outside.txt /desk/assets/link.txt /desk/assets/none.txt >"$T/fit1.out" 2>&1
+rm "$FH/desk-assets/a.txt"
+"$F" --desk-get "$FH" /desk/assets/a.txt >"$T/fit2.out" 2>&1
+check "the fit files come from the data folder first, then beside the binary, then the app bundle" 'grep -qxF "/desk/assets/a.txt 200 data" "$T/fit1.out" && grep -qxF "/desk/assets/b.txt 200 beside" "$T/fit1.out" && grep -qxF "/desk/assets/c.txt 200 bundle" "$T/fit1.out" && grep -qxF "/desk/assets/mediapipe/d.txt 200 bundle wasm" "$T/fit1.out" && grep -qxF "/desk/assets/none.txt 404 No such file." "$T/fit1.out"'
+check "a fit file gone from the data folder is served from beside the binary" 'grep -qxF "/desk/assets/a.txt 200 beside" "$T/fit2.out"'
+check "no path leaves the fit files' folders, and a link there isn't followed" 'grep -qxF "/desk/assets/../outside.txt 404 No such file." "$T/fit1.out" && grep -qxF "/desk/assets/%2e%2e/outside.txt 404 No such file." "$T/fit1.out" && grep -qxF "/desk/assets/mediapipe/../../outside.txt 404 No such file." "$T/fit1.out" && { [ $windows = 1 ] || grep -qxF "/desk/assets/link.txt 404 No such file." "$T/fit1.out"; } && ! grep -qE " 200 (outside|\[model\])" "$T/fit1.out"'
+HARNESS_HOME="$FH" "$HB" stop >/dev/null 2>&1
+wait "$RPID" 2>/dev/null
+RPID=""
+
+# the desk alone: no bot token stored, so the desk is the only way in: a
+# scheduled task's result, a turn, an item with buttons answered there,
+# nothing to Telegram (a key store of its own, with no bot token)
+AH="$T/alone"
+AS="$T/alone-secrets"
+HARNESS_HOME="$AH" HARNESS_STORE="$AS" "$H" init >/dev/null 2>&1
+APORT=$(sed -n 's/^port = \([0-9]*\).*/\1/p' "$AH/config.ini")
+cat >"$AH/config.ini" <<EOF
+[model]
+url = $URL
+worker_model = anthropic:claude-haiku
+[search]
+url = $URL
+[chat]
+api = $URL
+utc_offset = +00:00
+[apps]
+port = $APORT
+EOF
+chmod 600 "$AH/config.ini"
+printf 'og-smoke-key-123\n' | HARNESS_HOME="$AH" HARNESS_STORE="$AS" "$H" secret add omnigate --stdin 2>/dev/null
+printf '[check]\nevery = 5m\ndo = Check the price.\n' >"$AH/tasks.ini"
+tg_before=$(wc -l <"$OUT")
+reply "$(text_reply 'Price is flat.')"
+HARNESS_HOME="$AH" HARNESS_STORE="$AS" "$H" run >"$T/arun.out" 2>&1 &
+RPID=$!
+wait_for "$T/arun.out" "running on" 15
+check "run with no bot token: the desk is the only way in, said at start" 'grep -qF "No bot token is stored under \"telegram\", so Telegram is off. The desk is the only way in." "$T/arun.out" && ! grep -qF "not paired" "$T/arun.out"'
+ACOOKIE=$("$F" --desk-enter "$AH" 2>/dev/null)
+# desk_has CONV TEXT [SECONDS]: until the desk's history of CONV has TEXT
+desk_has() {
+	i=0
+	while [ $i -lt $((${3:-10} * 10)) ]; do
+		"$F" --desk-api "$AH" "$ACOOKIE" GET "history?conv=$1" >"$T/ahist.out" 2>/dev/null && grep -qF -- "$2" "$T/ahist.out" && return 0
+		sleep 0.1
+		i=$((i + 1))
+	done
+	return 1
+}
+check "the desk is entered with no pairing, and says once why it is the only way in" '[ -n "$ACOOKIE" ] && desk_has main "The desk is the only way in." && [ "$(grep -o "\"text\":\"No bot token is stored" "$T/ahist.out" | wc -l | tr -d " ")" = 1 ]'
+check "a scheduled task's result arrives on the desk" 'desk_has main "[check] Price is flat." 15'
+check "what start found reaches the desk too, not only stderr" 'grep -qF "no anthropic key stored" "$T/arun.out" && desk_has main "no anthropic key stored under"'
+
+reply "$(text_reply 'Three flats match.')"
+check "a message sent on the desk is a turn, and its reply comes back to the desk" '"$F" --desk-api "$AH" "$ACOOKIE" POST send "{\"conv\":\"main\",\"text\":\"Find flats\"}" >/dev/null && desk_has main "Three flats match." 15'
+reply "$(tool_reply tu_a1 'echo desk-alone')"
+reply "$(text_reply 'Said it.')"
+"$F" --desk-api "$AH" "$ACOOKIE" POST send '{"conv":"main","text":"say it"}' >/dev/null 2>&1
+# the open item's id, from the desk's state
+AID=""
+i=0
+while [ $i -lt 100 ] && [ -z "$AID" ]; do
+	AID=$("$F" --desk-api "$AH" "$ACOOKIE" GET state 2>/dev/null | sed -n 's/.*"items":\[{"v":1,"id":\([0-9]*\),.*/\1/p')
+	[ -z "$AID" ] && sleep 0.1
+	i=$((i + 1))
+done
+check "a command's approval waits on the desk with its buttons, in Needs you and in the chat" '[ -n "$AID" ] && desk_has main "\"item\":$AID" && "$F" --desk-api "$AH" "$ACOOKIE" GET state | grep -qF "{\"key\":\"once\",\"label\":\"Allow once\"}"'
+check "the item is answered on the desk, and the turn goes on" '"$F" --desk-api "$AH" "$ACOOKIE" POST answer "{\"id\":$AID,\"key\":\"once\"}" | grep -qF "\"took\":\"taken\"" && desk_has main "Said it." 15 && grep -qF "desk-alone" "$(req)"'
+check "nothing went to Telegram" '[ "$(wc -l <"$OUT")" = "$tg_before" ]'
+check "config set while harness runs says what the change waits for" 'HARNESS_HOME="$AH" "$H" config set limits.sends_per_hour 50 | grep -qxF "harness is running: send /reload to use it." && HARNESS_HOME="$AH" "$H" config set chat.telegram on | grep -qF "restart it to use this"'
+HARNESS_HOME="$AH" "$H" stop >/dev/null 2>&1
+wait "$RPID" 2>/dev/null
+RPID=""
+printf '[apps]\non = off\n' >>"$AH/config.ini"
+check "with no bot token and no desk server, run fails with one line naming what to turn on" '! HARNESS_HOME="$AH" HARNESS_STORE="$AS" "$H" run >"$T/arun2.out" 2>&1 && grep -qF "server is off: turn on [apps] on in config.ini, or run: harness secret add telegram" "$T/arun2.out"'
+check "config set writes one setting in place, config get reads the value in use" 'HARNESS_HOME="$AH" "$H" config set chat.utc_offset +02:00 >/dev/null && HARNESS_HOME="$AH" "$H" config get chat.utc_offset | grep -qxF "+02:00" && grep -qxF "utc_offset = +02:00" "$AH/config.ini" && HARNESS_HOME="$AH" "$H" config get model.max_tokens | grep -qxF 4096'
+cp "$AH/config.ini" "$T/aconfig.before"
+check "a value that doesn't read is refused: non-zero, one line on stderr, the file untouched" '! HARNESS_HOME="$AH" "$H" config set chat.utc_offset 5 >/dev/null 2>"$T/acfg.err" && [ "$(wc -l <"$T/acfg.err" | tr -d " ")" = 1 ] && grep -qF "Not changed: config.ini line" "$T/acfg.err" && cmp -s "$T/aconfig.before" "$AH/config.ini"'
+check "a provider of one's own goes in with its api and url in one call" 'HARNESS_HOME="$AH" "$H" config set provider other.api openai "provider other.url" "$URL/v1" model.provider other >/dev/null && HARNESS_HOME="$AH" "$H" config get provider other.url | grep -qxF "$URL/v1" && HARNESS_HOME="$AH" "$H" config get model.provider | grep -qxF other'
+
 # Coming from Hermes: harness import hermes against a Hermes home of its
 # own (a fake key in .env and in a memory entry), then harness skill
 # against harness-fake's stand-in for GitHub's codeload
@@ -1090,6 +1203,8 @@ if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	[ -f "$T/crun.out" ] && { echo "--- the calendar's run output"; cat "$T/crun.out"; }
 	[ -f "$T/erun.out" ] && { echo "--- the errands' run output"; cat "$T/erun.out"; }
 	[ -f "$T/drun.out" ] && { echo "--- the desk's run output"; cat "$T/drun.out"; cat "$T/desk.out" 2>/dev/null; }
+	[ -f "$T/frun.out" ] && { echo "--- the fit files' run output"; cat "$T/frun.out"; cat "$T/fit1.out" "$T/fit2.out" 2>/dev/null; }
+	[ -f "$T/arun.out" ] && { echo "--- the desk alone's run output"; cat "$T/arun.out"; cat "$T/ahist.out" 2>/dev/null; cat "$T/arun2.out" 2>/dev/null; }
 	for x in bcheck1 bcheck2 bcheck3 bcheck4; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
 	for x in imp-dry imp-2 imp imp-mem skill skills; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
 	echo "--- outbox"; cat "$OUT" 2>/dev/null

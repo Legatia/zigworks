@@ -1,0 +1,29 @@
+desk-assets/: the files the desk fits a portrait with
+
+harness serves this folder as /desk/assets/. None of these files is part
+of harness's source or covered by harness's own licence.
+
+MediaPipe tasks-vision 0.10.14 (Google LLC), Apache License 2.0
+  mediapipe/vision_bundle.mjs
+  mediapipe/wasm/vision_wasm_internal.js
+  mediapipe/wasm/vision_wasm_internal.wasm
+  mediapipe/wasm/vision_wasm_nosimd_internal.js
+  mediapipe/wasm/vision_wasm_nosimd_internal.wasm
+  From the npm package @mediapipe/tasks-vision@0.10.14, unmodified.
+  https://github.com/google-ai-edge/mediapipe
+
+MediaPipe Face Landmarker model, float16, version 1 (Google LLC),
+Apache License 2.0
+  mediapipe/face_landmarker.task
+  From https://storage.googleapis.com/mediapipe-models/face_landmarker/
+  face_landmarker/float16/1/face_landmarker.task, unmodified.
+
+MediaPipe's licence, as its repository gives it at v0.10.14 (the Apache
+License 2.0 and the notice for the UTF-8 code it carries), is in
+LICENSE-mediapipe.txt. MediaPipe has no NOTICE file (none in its
+repository at v0.10.14, none in the npm package). The libraries its
+WebAssembly links, with their licences, are in THIRD-PARTY-mediapipe.txt.
+
+base-head.bin
+  The neutral head the fit maps onto a portrait. Its source and licence
+  are in the notice that comes with it in this folder.

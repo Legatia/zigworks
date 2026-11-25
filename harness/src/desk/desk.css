@@ -92,6 +92,14 @@ body[data-state="urgent"] .glow { opacity: 1; }
 body[data-state="working"] .sweep { display: block; }
 @keyframes blink { 50% { opacity: 0.35; } }
 
+/* no avatar: a head and shoulders drawn in the page, and the way to add one */
+.empty-stage { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; gap: 18px; padding-top: 28px; pointer-events: none; }
+.empty-stage .btn { flex: none; pointer-events: auto; border-color: var(--cyan); }
+.empty-stage .btn:hover { background: #1C1E38; }
+.bust { flex: 1 1 auto; min-height: 0; width: 100%; fill: none; stroke: var(--line-hi); stroke: color-mix(in srgb, var(--ring) 55%, var(--line-hi)); stroke-width: 1.5; stroke-linecap: round; transform-origin: 50% 100%; animation: breathe 5.2s ease-in-out infinite; }
+.bust * { vector-effect: non-scaling-stroke; }
+@keyframes breathe { 50% { transform: scale(1.006); } }
+
 .readouts { position: absolute; right: 20px; top: 18px; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; font: 12px var(--mono); color: var(--muted); text-shadow: 0 1px 8px rgba(0, 0, 0, 0.9); }
 
 /* the status card: harness's own facts */
@@ -152,13 +160,13 @@ body[data-state="resting"] .card .dot, body[data-state="quiet"] .card .dot { ani
 .item .body { font-size: 14px; color: var(--soft); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 12em; overflow-y: auto; }
 .item .meta { font: 12px var(--mono); color: var(--muted); }
 .item .meta.urgent { color: var(--alert); }
-.item .choices { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
-.item .choices button { height: 44px; padding: 0 18px; border: 1px solid var(--line-hi); background: transparent; font-size: 14px; }
-.item .choices button.first { border: 0; background: var(--magenta); color: var(--bg); font-weight: 700; }
+.item .choices, .msg > .choices { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.item .choices button, .msg > .choices button { height: 44px; padding: 0 18px; border: 1px solid var(--line-hi); background: transparent; font-size: 14px; }
+.item .choices button.first, .msg > .choices button.first { border: 0; background: var(--magenta); color: var(--bg); font-weight: 700; }
 .item.urgent .choices button.first { background: var(--alert); }
 .item .answer { display: flex; gap: 8px; width: 100%; }
 .item .answer input { flex: 1; min-width: 0; height: 44px; padding: 0 10px; background: var(--bg); border: 1px solid var(--line-hi); }
-.item .said { font-size: 13px; color: var(--soft); }
+.item .said, .msg > .said { font-size: 13px; color: var(--soft); }
 
 .topics { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
 .topics button { width: 100%; text-align: left; display: flex; align-items: flex-start; gap: 12px; padding: 10px; min-height: 44px; background: transparent; border: 1px solid transparent; }
@@ -199,6 +207,13 @@ dialog::backdrop { background: rgba(7, 7, 13, 0.75); }
 .disclose { margin: 8px 0 0; font-size: 14px; color: var(--soft); }
 .outcome { margin: 10px 0 0; font-size: 14px; color: var(--soft); }
 .outcome.bad { color: #FF8A7D; }
+.dlg fieldset.bare { border: 0; padding: 0; margin: 0; min-width: 0; }
+.dlg fieldset.bare:disabled { opacity: 0.5; }
+.missing { margin: 4px 0 18px; padding: 12px 14px; background: var(--panel-2); border: 1px solid var(--line-hi); }
+.missing:focus { outline: none; }
+.missing:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+.missing-line { margin: 0; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.missing .mono { overflow-wrap: anywhere; color: var(--soft); }
 .dlg select { height: 44px; padding: 0 10px; background: var(--bg); border: 1px solid var(--line-hi); min-width: 240px; }
 
 /* the "i" and its bubble */
@@ -222,4 +237,5 @@ dialog::backdrop { background: rgba(7, 7, 13, 0.75); }
   .sweep, body[data-state="working"] .sweep { display: none; animation: none; }
   .card .dot { animation: none; }
   .avatar, .glow { transition: none; }
+  .bust { animation: none; }
 }
