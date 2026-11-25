@@ -169,8 +169,14 @@ pub const Controller = struct {
                     try fx.add(.reload);
                 } else if (!c.checking) try c.checkNow(now, &fx),
             },
-            .loaded => |l| if (c.state == .in and (l.status == 401 or l.status == 403) and
-                now - c.last_enter_ms >= reenter_every_ms) try c.reenter(now, &fx),
+            .loaded => |l| if (c.state == .in and (l.status == 401 or l.status == 403)) {
+                if (now - c.last_enter_ms >= reenter_every_ms) {
+                    try c.reenter(now, &fx);
+                } else if (!c.entering) {
+                    // refused right after an entry: the next check enters again
+                    c.reentering = true;
+                }
+            },
             .failed => if (c.state == .in) {
                 c.misses = @max(c.misses, 1);
                 if (!c.checking) try c.checkNow(now, &fx);
@@ -197,7 +203,7 @@ pub const Controller = struct {
                 } });
             },
         }
-        const m = c.menu();
+        const m = c.menu(now);
         if (c.menu_sent == null or !std.meta.eql(c.menu_sent.?, m)) {
             c.menu_sent = m;
             try fx.add(.{ .menu = m });
@@ -207,6 +213,11 @@ pub const Controller = struct {
     fn onChecked(c: *Controller, now: i64, result: CheckResult, fx: *Fx) !void {
         switch (result) {
             .no_desk, .bad_desk => {
+                // harness may be rewriting it: the desk page stays one check
+                if (c.state == .in) {
+                    c.misses +|= 1;
+                    if (c.misses < 2) return;
+                }
                 try c.setDesk(null, fx);
                 // a code that still comes has no port to go to
                 c.entering = false;
@@ -228,14 +239,16 @@ pub const Controller = struct {
             .alive => |d| {
                 try c.setDesk(d, fx);
                 c.misses = 0;
-                if (c.entering) return;
                 if (c.state == .in) {
-                    if (c.reentering) try c.beginEntry(now, fx);
+                    // back on another port: the page shown is on the old one,
+                    // whose requests fail without a 401 to say so
+                    if (c.entered_port != d.port) c.reentering = true;
+                    if (c.reentering and !c.entering) try c.beginEntry(now, fx);
                     return;
                 }
                 c.state = .connecting;
                 if (c.screen != .connecting) try c.show(.connecting, "", fx);
-                try c.beginEntry(now, fx);
+                if (!c.entering) try c.beginEntry(now, fx);
             },
         }
     }
@@ -255,12 +268,14 @@ pub const Controller = struct {
     }
 
     fn reenter(c: *Controller, now: i64, fx: *Fx) !void {
-        if (c.entering or c.reentering) return;
+        if (c.entering) return;
         c.reentering = true;
         if (!c.checking) try c.checkNow(now, fx);
     }
 
     fn startHarness(c: *Controller, now: i64, fx: *Fx) !void {
+        // once until it answers, exits, or 15 s pass
+        if (c.starting(now)) return;
         const bin = c.binary() orelse return fx.add(.{ .alert = .{
             .title = "Couldn't start harness",
             .text = "Its state/desk.json doesn't say where harness is. Run harness run in Terminal.",
@@ -270,6 +285,11 @@ pub const Controller = struct {
         c.fast_until_ms = now + fast_for_ms;
         // the first check a second from now
         c.last_check_ms = @min(c.last_check_ms, now - check_every_ms + fast_check_every_ms);
+    }
+
+    fn starting(c: *const Controller, now: i64) bool {
+        const at = c.started_ms orelse return false;
+        return now - at < fast_for_ms;
     }
 
     fn show(c: *Controller, s: Screen, note: []const u8, fx: *Fx) !void {
@@ -320,10 +340,10 @@ pub const Controller = struct {
         }
     }
 
-    fn menu(c: *const Controller) Menu {
+    fn menu(c: *const Controller, now: i64) Menu {
         const known = c.binary() != null;
         const up = c.state == .in or c.state == .connecting;
-        return .{ .start = known and !up, .stop = known and up, .autostart_enabled = known, .autostart = c.autostart };
+        return .{ .start = known and !up and !c.starting(now), .stop = known and up, .autostart_enabled = known, .autostart = c.autostart };
     }
 };
 
@@ -696,4 +716,92 @@ test "desk_json_vanishing_during_an_entry_drops_it" {
     try t.expectEqual(Screen.setup, shown(try r.ev(.{ .checked = .{ .gen = g2, .result = .no_desk } })).?);
     try t.expect(loaded(try r.ev(.{ .entered = .{ .gen = e, .code = "late" } })) == null);
     try t.expectEqual(State.setup, r.c.state);
+}
+
+test "a_new_port_while_in_enters_again_without_a_reenter" {
+    // harness restarted on another port; the page's requests fail on the
+    // old one, so it never posts reenter
+    var r: Rig = .init();
+    defer r.deinit();
+    try r.getIn(d1, "c1");
+    var moved = d1;
+    moved.port = 50000;
+    r.wait(5000);
+    const g = try Rig.checkGen(try r.ev(.tick));
+    const e = try Rig.enterGen(try r.ev(.{ .checked = .{ .gen = g, .result = .{ .alive = moved } } }));
+    try t.expectEqualStrings("http://127.0.0.1:50000/enter?code=c2", loaded(try r.ev(.{ .entered = .{ .gen = e, .code = "c2" } })).?);
+    // and once there, an alive check on the same port enters no more
+    r.wait(5000);
+    const g2 = try Rig.checkGen(try r.ev(.tick));
+    try t.expectEqual(@as(usize, 0), count(try r.ev(.{ .checked = .{ .gen = g2, .result = .{ .alive = moved } } }), .enter));
+}
+
+test "a_code_refused_at_once_enters_again_at_the_next_check" {
+    var r: Rig = .init();
+    defer r.deinit();
+    try r.getIn(d1, "c1");
+    // /enter answered 403 straight away: no check now (at most every 5 s) ...
+    try t.expectEqual(@as(usize, 0), count(try r.ev(.{ .loaded = .{ .status = 403, .url = "http://127.0.0.1:41234/enter?code=c1" } }), .check));
+    // ... but the next check enters again
+    r.wait(5000);
+    const g = try Rig.checkGen(try r.ev(.tick));
+    try t.expectEqual(@as(usize, 1), count(try r.ev(.{ .checked = .{ .gen = g, .result = .{ .alive = d1 } } }), .enter));
+}
+
+test "one_unreadable_desk_json_while_in_is_a_miss" {
+    // harness may be rewriting it: the desk page stays for one check
+    var r: Rig = .init();
+    defer r.deinit();
+    try r.getIn(d1, "c1");
+    for ([_]CheckResult{ .bad_desk, .no_desk }) |first| {
+        r.wait(5000);
+        const g = try Rig.checkGen(try r.ev(.tick));
+        try t.expect(shown(try r.ev(.{ .checked = .{ .gen = g, .result = first } })) == null);
+        try t.expectEqual(State.in, r.c.state);
+        try t.expectEqual(@as(?u16, 41234), r.c.port());
+        r.wait(5000);
+        const g2 = try Rig.checkGen(try r.ev(.tick));
+        _ = try r.ev(.{ .checked = .{ .gen = g2, .result = .{ .alive = d1 } } });
+    }
+    // two in a row: it's gone
+    r.wait(5000);
+    _ = try r.ev(.{ .checked = .{ .gen = try Rig.checkGen(try r.ev(.tick)), .result = .no_desk } });
+    r.wait(5000);
+    try t.expectEqual(Screen.setup, shown(try r.ev(.{ .checked = .{ .gen = try Rig.checkGen(try r.ev(.tick)), .result = .no_desk } })).?);
+}
+
+test "alive_again_during_an_entry_shows_connecting" {
+    var r: Rig = .init();
+    defer r.deinit();
+    const g = try Rig.checkGen(try r.ev(.start));
+    _ = try Rig.enterGen(try r.ev(.{ .checked = .{ .gen = g, .result = .{ .alive = d1 } } }));
+    r.wait(5000);
+    // one slow /alive while harness writes the code
+    try t.expectEqual(Screen.down, shown(try r.ev(.{ .checked = .{ .gen = try Rig.checkGen(try r.ev(.tick)), .result = .{ .dead = d1 } } })).?);
+    r.wait(5000);
+    const fx = try r.ev(.{ .checked = .{ .gen = try Rig.checkGen(try r.ev(.tick)), .result = .{ .alive = d1 } } });
+    try t.expectEqual(Screen.connecting, shown(fx).?);
+    try t.expectEqual(@as(usize, 0), count(fx, .enter));
+    try t.expectEqual(State.connecting, r.c.state);
+}
+
+test "start_twice_runs_harness_once" {
+    var r: Rig = .init();
+    defer r.deinit();
+    const g = try Rig.checkGen(try r.ev(.start));
+    _ = try r.ev(.{ .checked = .{ .gen = g, .result = .{ .dead = d1 } } });
+    const first = try r.ev(.{ .menu = .start });
+    try t.expectEqual(Command.run, ran(first).?);
+    // the menu's Start is off while harness starts
+    try t.expect(!menuOf(first).?.start);
+    r.wait(1000);
+    try t.expect(ran(try r.ev(.{ .message = .{ .msg = .{ .start = true }, .source = .builtin } })) == null);
+    try t.expect(ran(try r.ev(.{ .menu = .start })) == null);
+    // after 15 s with no answer, it can be tried again
+    r.wait(15_000);
+    _ = try r.ev(.tick);
+    try t.expectEqual(Command.run, ran(try r.ev(.{ .menu = .start })).?);
+    // and when it exits at once, straight away
+    _ = try r.ev(.{ .exited = .{ .code = 1 } });
+    try t.expectEqual(Command.run, ran(try r.ev(.{ .menu = .start })).?);
 }

@@ -119,7 +119,7 @@ def page(path, port, other):
 <p><a id="blank" href="https://example.org/blank" target="_blank">Elsewhere, new window</a></p>
 <p><a id="file" href="file:///etc/hosts">A file</a></p>
 <script>
-function post(m) {{ window.webkit.messageHandlers.desk.postMessage(m); }}
+function post(m) {{ window.webkit.messageHandlers.harness.postMessage(m); }}
 function report(k, v) {{ fetch("/report?" + encodeURIComponent(k) + "=" + encodeURIComponent(v)); }}
 function click(id) {{ document.getElementById(id).click(); }}
 report("page", location.pathname + location.search);

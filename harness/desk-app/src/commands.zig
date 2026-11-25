@@ -6,7 +6,8 @@ const Environ = std.process.Environ;
 
 pub const Command = enum { run, stop, autostart_on, autostart_off, autostart_query };
 
-/// The command line for `cmd`, always naming the data folder.
+/// The command line for `cmd`, always naming the data folder; its strings
+/// are copied into `a`.
 pub fn argv(a: std.mem.Allocator, cmd: Command, binary: []const u8, home: []const u8) ![]const []const u8 {
     const words: []const []const u8 = switch (cmd) {
         .run => &.{"run"},
@@ -15,10 +16,11 @@ pub fn argv(a: std.mem.Allocator, cmd: Command, binary: []const u8, home: []cons
         .autostart_off => &.{ "autostart", "off" },
         .autostart_query => &.{"autostart"},
     };
+    // copies: the line outlives the controller's copy of desk.json
     var out: std.ArrayList([]const u8) = .empty;
-    try out.append(a, binary);
+    try out.append(a, try a.dupe(u8, binary));
     try out.appendSlice(a, words);
-    try out.appendSlice(a, &.{ "--home", home });
+    try out.appendSlice(a, &.{ "--home", try a.dupe(u8, home) });
     return out.toOwnedSlice(a);
 }
 
@@ -113,6 +115,24 @@ test "argv_per_command" {
         try t.expectEqual(w[1].len, got.len);
         for (w[1], got) |x, y| try t.expectEqualStrings(x, y);
     }
+}
+
+test "argv_copies_its_strings" {
+    // the binary's name lives in the controller's copy of desk.json, which
+    // is replaced when desk.json changes; the command line outlives that
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const bin = try t.allocator.dupe(u8, "/bin/harness");
+    const home = try t.allocator.dupe(u8, "/h");
+    const got = try argv(arena.allocator(), .stop, bin, home);
+    try t.expect(got[0].ptr != bin.ptr);
+    try t.expect(got[got.len - 1].ptr != home.ptr);
+    @memset(bin, 'x');
+    @memset(home, 'x');
+    t.allocator.free(bin);
+    t.allocator.free(home);
+    try t.expectEqualStrings("/bin/harness", got[0]);
+    try t.expectEqualStrings("/h", got[got.len - 1]);
 }
 
 test "autostart_output_reads_on_and_off" {

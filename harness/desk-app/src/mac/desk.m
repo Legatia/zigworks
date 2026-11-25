@@ -150,7 +150,7 @@ static NSMenuItem *item(NSMenu *m, NSString *title, SEL action, NSString *key, i
     // media and speech without a click
     cfg.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
     cfg.applicationNameForUserAgent = self.userAgent;
-    [cfg.userContentController addScriptMessageHandler:self name:@"desk"];
+    [cfg.userContentController addScriptMessageHandler:self name:@"harness"];
 
     WKWebView *web = [[WKWebView alloc] initWithFrame:w.contentView.bounds configuration:cfg];
     web.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;

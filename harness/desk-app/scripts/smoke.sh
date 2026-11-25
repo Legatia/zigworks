@@ -4,13 +4,13 @@
 # shows the badge, keeps navigation on 127.0.0.1:PORT and hands other links
 # to the system browser, enters again, runs the menu's commands, and
 # remembers its frame.
-# usage: scripts/smoke.sh path/to/harness.app  (built by `zig build smoke`)
+# usage: scripts/smoke.sh path/to/harness-desk.app  (built by `zig build smoke`)
 # Needs a window session (Aqua); says SKIP without one. WebGL 2, media and
 # speech without a click are required here, and only reported on CI, whose
 # runners may have no GPU or audio.
 set -u
 
-APP=${1:?usage: smoke.sh path/to/harness.app}
+APP=${1:?usage: smoke.sh path/to/harness-desk.app}
 case $APP in /*) ;; *) APP=$(pwd)/$APP ;; esac
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 FAKE=$HERE/test/fake_harness.py

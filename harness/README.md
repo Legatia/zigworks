@@ -3573,8 +3573,8 @@ connects to the harness running on this Mac and can start it, but doesn't
 own it: closing the window or quitting the app leaves harness running.
 
 **Install.** Download `harness-desk-VERSION-macos.zip` from the release,
-open it, and move `harness.app` to Applications. One bundle runs on Apple
-Silicon and Intel Macs.
+open it, and move `harness-desk.app` to Applications (it shows as "harness"
+in the Dock). One bundle runs on Apple Silicon and Intel Macs.
 
 **The first run.** The app is signed ad hoc, not with an Apple developer
 account, so macOS stops it the first time ("harness" can't be opened).
@@ -3628,7 +3628,7 @@ command line tools, since it links Cocoa and WebKit and harness links
 nothing:
 
 ```
-zig build                     # zig-out/harness.app, for this Mac
+zig build                     # zig-out/harness-desk.app, for this Mac
 zig build test --summary all  # unit tests
 zig build smoke               # the app in a window against a stand-in harness (test/fake_harness.py)
 scripts/package-macos.sh 0.3.0 harness-desk-0.3.0-macos.zip   # both kinds of Mac, signed ad hoc

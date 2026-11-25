@@ -1,5 +1,5 @@
 #!/bin/sh
-# harness.app for Apple Silicon and Intel Macs in one bundle, signed ad hoc
+# harness-desk.app for Apple Silicon and Intel Macs in one bundle, signed ad hoc
 # (it opens through System Settings › Privacy & Security › Open Anyway on
 # its first run), zipped, with its SHA-256 beside it.
 # usage: scripts/package-macos.sh VERSION OUT.zip
@@ -20,18 +20,18 @@ for arch in aarch64 x86_64; do
     # shellcheck disable=SC2086
     "$ZIG" build app -Doptimize=ReleaseSafe -Dstrip=true -Dtarget=$arch-macos -Dversion="$VERSION" --prefix "$W/$arch" ${ZIG_FLAGS:-}
 done
-cp -R "$W/aarch64/harness.app" "$W/harness.app"
-lipo -create "$W/aarch64/harness.app/Contents/MacOS/harness-desk" "$W/x86_64/harness.app/Contents/MacOS/harness-desk" \
-    -output "$W/harness.app/Contents/MacOS/harness-desk"
-archs=$(lipo -archs "$W/harness.app/Contents/MacOS/harness-desk")
+cp -R "$W/aarch64/harness-desk.app" "$W/harness-desk.app"
+lipo -create "$W/aarch64/harness-desk.app/Contents/MacOS/harness-desk" "$W/x86_64/harness-desk.app/Contents/MacOS/harness-desk" \
+    -output "$W/harness-desk.app/Contents/MacOS/harness-desk"
+archs=$(lipo -archs "$W/harness-desk.app/Contents/MacOS/harness-desk")
 [ "$archs" = "x86_64 arm64" ] || { echo "the program isn't for both Macs: $archs" >&2; exit 1; }
-plutil -lint -s "$W/harness.app/Contents/Info.plist"
+plutil -lint -s "$W/harness-desk.app/Contents/Info.plist"
 
-codesign --force --sign - --timestamp=none "$W/harness.app"
-codesign --verify --strict --verbose=2 "$W/harness.app"
+codesign --force --sign - --timestamp=none "$W/harness-desk.app"
+codesign --verify --strict --verbose=2 "$W/harness-desk.app"
 
 mkdir -p "$(dirname "$OUT")"
 rm -f "$OUT" "$OUT.sha256"
-ditto -c -k --keepParent "$W/harness.app" "$OUT"
+ditto -c -k --keepParent "$W/harness-desk.app" "$OUT"
 (cd "$(dirname "$OUT")" && shasum -a 256 "$(basename "$OUT")" > "$(basename "$OUT").sha256")
-echo "$OUT: harness.app $VERSION ($archs)"
+echo "$OUT: harness-desk.app $VERSION ($archs)"

@@ -76,7 +76,7 @@ const start_script =
     \\  b.addEventListener("click", function () {
     \\    b.disabled = true;
     \\    b.textContent = "Starting…";
-    \\    var w = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.desk;
+    \\    var w = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.harness;
     \\    if (w) w.postMessage({start: true});
     \\    else if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage({start: true});
     \\    setTimeout(function () { b.disabled = false; b.textContent = "Start harness"; }, 15000);
@@ -101,7 +101,7 @@ test "screens_say_the_fixed_copy" {
     const down = try html(a, .down, "", "/h");
     try t.expect(std.mem.indexOf(u8, down, "harness isn't running") != null);
     try t.expect(std.mem.indexOf(u8, down, ">Start harness</button>") != null);
-    try t.expect(std.mem.indexOf(u8, down, "messageHandlers.desk") != null);
+    try t.expect(std.mem.indexOf(u8, down, "messageHandlers.harness") != null);
     try t.expect(std.mem.indexOf(u8, down, "{start: true}") != null);
 
     const conn = try html(a, .connecting, "No answer from harness yet. Trying again.", "/h");

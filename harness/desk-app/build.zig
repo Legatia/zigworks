@@ -55,9 +55,9 @@ pub fn build(b: *std.Build) void {
         .version = version,
         .bundle_id = bundle_id,
         .test_hooks = test_hooks,
-        .dir = "harness.app",
+        .dir = "harness-desk.app",
         .step = "app",
-        .about = "Build zig-out/harness.app",
+        .about = "Build zig-out/harness-desk.app",
     });
     b.getInstallStep().dependOn(app);
 
@@ -72,12 +72,12 @@ pub fn build(b: *std.Build) void {
         .version = version,
         .bundle_id = "io.github.legatia.harness-desk.smoke",
         .test_hooks = true,
-        .dir = "smoke/harness.app",
+        .dir = "smoke/harness-desk.app",
         .step = "smoke-app",
-        .about = "Build zig-out/smoke/harness.app, with test hooks",
+        .about = "Build zig-out/smoke/harness-desk.app, with test hooks",
     });
     const smoke = b.addSystemCommand(&.{ "/bin/sh", "scripts/smoke.sh" });
-    smoke.addDirectoryArg(.{ .relative = .{ .base = .install_prefix, .sub_path = "smoke/harness.app" } });
+    smoke.addDirectoryArg(.{ .relative = .{ .base = .install_prefix, .sub_path = "smoke/harness-desk.app" } });
     smoke.has_side_effects = true;
     smoke.step.dependOn(smoke_app);
     b.step("smoke", "Run the app against the stand-in harness (needs a window session)").dependOn(&smoke.step);

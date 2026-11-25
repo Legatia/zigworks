@@ -1,7 +1,7 @@
 //! The messages the page sends the app, one way: `{"badge": N}`,
 //! `{"attention": "urgent"}`, `{"reenter": true}`, and from the app's own
 //! "harness isn't running" page `{"start": true}`. Through
-//! `window.webkit.messageHandlers.desk.postMessage(…)`, an object or its JSON
+//! `window.webkit.messageHandlers.harness.postMessage(…)`, an object or its JSON
 //! text.
 const std = @import("std");
 
