@@ -790,6 +790,44 @@ pub fn deskClient(io: Io, a: std.mem.Allocator, home: []const u8, text: []const 
     return error.NoReply;
 }
 
+/// The desk's port, from state/desk.json.
+fn deskPort(io: Io, a: std.mem.Allocator, home: []const u8) !u16 {
+    const info = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ home, "state", "desk.json" }), a, .limited(64 << 10));
+    return @intCast(jv.int(jv.get(jv.parse(a, info), "port")) orelse return error.NoPort);
+}
+
+/// `harness-fake --desk-enter HOME`: as the desk app enters (a code asked
+/// for, read, entered); prints the session cookie.
+pub fn deskEnter(io: Io, a: std.mem.Allocator, home: []const u8) !void {
+    const port = try deskPort(io, a, home);
+    const state = try std.fs.path.join(a, &.{ home, "state" });
+    const code_path = try std.fs.path.join(a, &.{ state, "desk-code" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ state, "open-request" }), .data = "" });
+    var waited: u32 = 0;
+    const code = while (waited < 5000) : (waited += 50) {
+        if (Io.Dir.cwd().readFileAlloc(io, code_path, a, .limited(64))) |x| {
+            const c = std.mem.trim(u8, x, " \r\n");
+            if (c.len > 0) break c;
+        } else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    } else return error.NoCode;
+    Io.Dir.cwd().deleteFile(io, code_path) catch {};
+    const entered = try deskReq(io, a, port, "GET", try std.fmt.allocPrint(a, "/enter?code={s}", .{code}), "", "");
+    const at = std.mem.indexOf(u8, entered.head, "set-cookie: harness_desk=") orelse return error.NoSession;
+    const v = entered.head[at + "set-cookie: harness_desk=".len ..];
+    const cookie = v[0 .. std.mem.indexOfScalar(u8, v, ';') orelse return error.NoSession];
+    try Io.File.stdout().writeStreamingAll(io, try std.fmt.allocPrint(a, "{s}\n", .{cookie}));
+}
+
+/// `harness-fake --desk-api HOME COOKIE METHOD PATH [BODY]`: one call of
+/// the desk's API (`/desk/api/PATH`); prints the status, then the body.
+pub fn deskApiCall(io: Io, a: std.mem.Allocator, home: []const u8, cookie: []const u8, method: []const u8, path: []const u8, body: []const u8) !u16 {
+    const port = try deskPort(io, a, home);
+    const got = try deskReq(io, a, port, method, try std.fmt.allocPrint(a, "/desk/api/{s}", .{path}), cookie, body);
+    try Io.File.stdout().writeStreamingAll(io, try std.fmt.allocPrint(a, "{d}\n{s}\n", .{ got.status, got.body }));
+    return got.status;
+}
+
 /// The owner's browser in sign-in tests: told the link (`opened`, as an
 /// oauth.Link), it opens it on a thread of its own; `join`, then read what
 /// it got.

@@ -1033,6 +1033,68 @@ if [ $windows = 0 ]; then
 	check "autostart on writes the login item, off removes it, and alone it says which first" 'HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart | grep -qE "^off" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart on >/dev/null && grep -rqF -- "--home" "$T/user" && grep -rqF "$DH" "$T/user" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart | grep -qE "^on" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart off >/dev/null && [ -z "$(find "$T/user" -type f)" ]'
 fi
 
+# the desk alone: no bot token stored, so the desk is the only way in: a
+# scheduled task's result, a turn, an item with buttons answered there,
+# nothing to Telegram (a key store of its own, with no bot token)
+AH="$T/alone"
+AS="$T/alone-secrets"
+HARNESS_HOME="$AH" HARNESS_STORE="$AS" "$H" init >/dev/null 2>&1
+APORT=$(sed -n 's/^port = \([0-9]*\).*/\1/p' "$AH/config.ini")
+cat >"$AH/config.ini" <<EOF
+[model]
+url = $URL
+[search]
+url = $URL
+[chat]
+api = $URL
+utc_offset = +00:00
+[apps]
+port = $APORT
+EOF
+chmod 600 "$AH/config.ini"
+printf 'og-smoke-key-123\n' | HARNESS_HOME="$AH" HARNESS_STORE="$AS" "$H" secret add omnigate --stdin 2>/dev/null
+printf '[check]\nevery = 5m\ndo = Check the price.\n' >"$AH/tasks.ini"
+tg_before=$(wc -l <"$OUT")
+reply "$(text_reply 'Price is flat.')"
+HARNESS_HOME="$AH" HARNESS_STORE="$AS" "$H" run >"$T/arun.out" 2>&1 &
+RPID=$!
+wait_for "$T/arun.out" "running on" 15
+check "run with no bot token: the desk is the only way in, said at start" 'grep -qF "No bot token is stored under \"telegram\", so Telegram is off. The desk is the only way in." "$T/arun.out" && ! grep -qF "not paired" "$T/arun.out"'
+ACOOKIE=$("$F" --desk-enter "$AH" 2>/dev/null)
+# desk_has CONV TEXT [SECONDS]: until the desk's history of CONV has TEXT
+desk_has() {
+	i=0
+	while [ $i -lt $((${3:-10} * 10)) ]; do
+		"$F" --desk-api "$AH" "$ACOOKIE" GET "history?conv=$1" >"$T/ahist.out" 2>/dev/null && grep -qF -- "$2" "$T/ahist.out" && return 0
+		sleep 0.1
+		i=$((i + 1))
+	done
+	return 1
+}
+check "the desk is entered with no pairing, and says once why it is the only way in" '[ -n "$ACOOKIE" ] && desk_has main "The desk is the only way in." && [ "$(grep -o "\"text\":\"No bot token is stored" "$T/ahist.out" | wc -l | tr -d " ")" = 1 ]'
+check "a scheduled task's result arrives on the desk" 'desk_has main "[check] Price is flat." 15'
+reply "$(text_reply 'Three flats match.')"
+check "a message sent on the desk is a turn, and its reply comes back to the desk" '"$F" --desk-api "$AH" "$ACOOKIE" POST send "{\"conv\":\"main\",\"text\":\"Find flats\"}" >/dev/null && desk_has main "Three flats match." 15'
+reply "$(tool_reply tu_a1 'echo desk-alone')"
+reply "$(text_reply 'Said it.')"
+"$F" --desk-api "$AH" "$ACOOKIE" POST send '{"conv":"main","text":"say it"}' >/dev/null 2>&1
+# the open item's id, from the desk's state
+AID=""
+i=0
+while [ $i -lt 100 ] && [ -z "$AID" ]; do
+	AID=$("$F" --desk-api "$AH" "$ACOOKIE" GET state 2>/dev/null | sed -n 's/.*"items":\[{"v":1,"id":\([0-9]*\),.*/\1/p')
+	[ -z "$AID" ] && sleep 0.1
+	i=$((i + 1))
+done
+check "a command's approval waits on the desk with its buttons, in Needs you and in the chat" '[ -n "$AID" ] && desk_has main "\"item\":$AID" && "$F" --desk-api "$AH" "$ACOOKIE" GET state | grep -qF "{\"key\":\"once\",\"label\":\"Allow once\"}"'
+check "the item is answered on the desk, and the turn goes on" '"$F" --desk-api "$AH" "$ACOOKIE" POST answer "{\"id\":$AID,\"key\":\"once\"}" | grep -qF "\"took\":\"taken\"" && desk_has main "Said it." 15 && grep -qF "desk-alone" "$(req)"'
+check "nothing went to Telegram" '[ "$(wc -l <"$OUT")" = "$tg_before" ]'
+HARNESS_HOME="$AH" "$H" stop >/dev/null 2>&1
+wait "$RPID" 2>/dev/null
+RPID=""
+printf '[apps]\non = off\n' >>"$AH/config.ini"
+check "with no bot token and no desk server, run fails with one line naming what to turn on" '! HARNESS_HOME="$AH" HARNESS_STORE="$AS" "$H" run >"$T/arun2.out" 2>&1 && grep -qF "server is off: turn on [apps] on in config.ini, or run: harness secret add telegram" "$T/arun2.out"'
+
 # Coming from Hermes: harness import hermes against a Hermes home of its
 # own (a fake key in .env and in a memory entry), then harness skill
 # against harness-fake's stand-in for GitHub's codeload
@@ -1090,6 +1152,7 @@ if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	[ -f "$T/crun.out" ] && { echo "--- the calendar's run output"; cat "$T/crun.out"; }
 	[ -f "$T/erun.out" ] && { echo "--- the errands' run output"; cat "$T/erun.out"; }
 	[ -f "$T/drun.out" ] && { echo "--- the desk's run output"; cat "$T/drun.out"; cat "$T/desk.out" 2>/dev/null; }
+	[ -f "$T/arun.out" ] && { echo "--- the desk alone's run output"; cat "$T/arun.out"; cat "$T/ahist.out" 2>/dev/null; cat "$T/arun2.out" 2>/dev/null; }
 	for x in bcheck1 bcheck2 bcheck3 bcheck4; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
 	for x in imp-dry imp-2 imp imp-mem skill skills; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
 	echo "--- outbox"; cat "$OUT" 2>/dev/null

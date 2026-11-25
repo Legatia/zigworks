@@ -108,8 +108,9 @@ fn sandboxLine(a: Allocator, env: Env, p: core.Paths) !Line {
 }
 
 fn bot(a: Allocator, env: Env, cfg: config.Config, p: core.Paths) !Line {
-    if (!cfg.chat.telegram) return .{ .name = "Bot", .text = "Telegram is off in config.ini; harness chat talks in a terminal", .ok = true };
-    const token = stored(env, a, cfg.chat.token) orelse return .{ .name = "Bot", .text = try std.fmt.allocPrint(a, "no bot token stored. Store the one @BotFather gave you: harness secret add {s}", .{cfg.chat.token}), .ok = false };
+    if (!cfg.chat.telegram) return .{ .name = "Bot", .text = "Telegram is off in config.ini; the desk is the way in (harness open)", .ok = true };
+    // no token: the desk alone, which is fine
+    const token = stored(env, a, cfg.chat.token) orelse return .{ .name = "Bot", .text = try std.fmt.allocPrint(a, "no bot token stored, so Telegram is off; the desk is the way in (harness open). For your phone: harness secret add {s}", .{cfg.chat.token}), .ok = true };
     var b = telegram.Bot.init(env.gpa, env.io, cfg.chat.api, token) catch return .{ .name = "Bot", .text = "[chat] api in config.ini is not a valid address", .ok = false };
     defer b.deinit();
     const me = b.getMe(a) catch |e| return .{ .name = "Bot", .text = if (e == error.TelegramRefused) try std.fmt.allocPrint(a, "Telegram refused the token stored as {s}. Store the right one: harness secret add {s}", .{ cfg.chat.token, cfg.chat.token }) else try std.fmt.allocPrint(a, "Telegram didn't answer ({s}). Check the network, then harness doctor again", .{@errorName(e)}), .ok = false };
@@ -444,7 +445,7 @@ test "doctor_names_each_broken_piece" {
     const lines = try check(a, f.env);
     try expectLine(lines, "harness run", false, "not running. Start it: harness run");
     try expectLine(lines, "Settings", true, "every file reads");
-    try expectLine(lines, "Bot", false, "no bot token stored. Store the one @BotFather gave you: harness secret add telegram");
+    try expectLine(lines, "Bot", true, "no bot token stored, so Telegram is off; the desk is the way in (harness open). For your phone: harness secret add telegram");
     try expectLine(lines, "Model", false, "no omnigate key is stored (harness secret add omnigate)");
     try expectLine(lines, "Home", false, "check says: Home Assistant at http://127.0.0.1:8123 refused the token (HA_TOKEN). Fix it, or /setup home again");
     try expectLine(lines, "Car", false, "its secret smartcar is not stored: harness secret add smartcar");
