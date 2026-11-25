@@ -32,23 +32,13 @@ pub const Codes = struct {
         c.mutex.lockUncancelable(io);
         defer c.mutex.unlock(io);
         c.live = false;
-        // whole: a temporary file, made new (its mode is ours from the
-        // start), then renamed into place; the app never reads half of it
-        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return error.NameTooLong;
-        Io.Dir.cwd().deleteFile(io, tmp) catch {};
-        {
-            var f = try Io.Dir.cwd().createFile(io, tmp, .{ .exclusive = true, .permissions = util.private_file });
-            defer f.close(io);
-            var line: [23]u8 = undefined;
-            @memcpy(line[0..22], &code);
-            line[22] = '\n';
-            try f.writeStreamingAll(io, &line);
-        }
-        Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), path, io) catch |e| {
-            Io.Dir.cwd().deleteFile(io, tmp) catch {};
-            return e;
-        };
+        // whole: a temporary file made new (its mode is ours from the
+        // start), then renamed into place, so the app never reads half of
+        // it; on Windows, waited on (up to 2 s) while a reader holds the old
+        var line: [23]u8 = undefined;
+        @memcpy(line[0..22], &code);
+        line[22] = '\n';
+        try util.writeReplace(io, path, &line);
         c.code = code;
         c.issued_ms = now_ms;
         c.live = true;
@@ -524,7 +514,12 @@ test "a_code_works_once_and_expires" {
     const code = try c.issue(t.io, path, 1000);
     // the file holds the code, readable only by its owner, written whole
     // (a temporary file renamed into place: none is left)
-    try t.expectError(error.FileNotFound, tmp.dir.statFile(t.io, "desk-code.tmp", .{}));
+    {
+        var d = try tmp.dir.openDir(t.io, ".", .{ .iterate = true });
+        defer d.close(t.io);
+        var it = d.iterate();
+        while (try it.next(t.io)) |e| try t.expect(!std.mem.startsWith(u8, e.name, "desk-code.tmp"));
+    }
     const text = try tmp.dir.readFileAlloc(t.io, "desk-code", a, .unlimited);
     try t.expectEqualStrings(&code, std.mem.trimEnd(u8, text, "\n"));
     if (@import("builtin").os.tag != .windows) {

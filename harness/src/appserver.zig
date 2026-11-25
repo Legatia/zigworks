@@ -1396,8 +1396,9 @@ fn withDesk(f: *Fix, fh: *FakeHost) !void {
 /// code and the session's Cookie header line.
 fn enterDesk(f: *Fix) !struct { code: []const u8, cookie: []const u8, entered: Got } {
     try f.tmp.dir.writeFile(t.io, .{ .sub_path = "state/open-request", .data = "" });
+    // up to 10 s, as a slow runner may need (the app waits 30 s)
     var waited: u32 = 0;
-    const code = while (waited < 3000) : (waited += 20) {
+    const code = while (waited < 10_000) : (waited += 20) {
         if (f.tmp.dir.readFileAlloc(t.io, "state/desk-code", f.a, .limited(64))) |x| {
             if (x.len > 0) break std.mem.trim(u8, x, " \r\n");
         } else |_| {}
@@ -1448,10 +1449,15 @@ test "enter_sets_a_session_cookie_once" {
     // the session opens the desk; nothing reusable was left in the data folder
     try t.expectEqual(200, (try get(f.a, f.s.port, "/desk", try std.fmt.allocPrint(f.a, "{s}{s}", .{ f.host, e.cookie }))).status);
     const tok = e.cookie["Cookie: harness_desk=".len .. e.cookie.len - 2];
-    var it = try f.tmp.dir.walk(f.a);
+    // walked through a handle opened to be read as a folder: the fixture's
+    // isn't (Linux opens it O_PATH, where reading it fails with EBADF;
+    // Windows refuses it)
+    var root = try f.tmp.dir.openDir(t.io, ".", .{ .iterate = true });
+    defer root.close(t.io);
+    var it = try root.walk(f.a);
     defer it.deinit();
     while (try it.next(t.io)) |w| if (w.kind == .file) {
-        const text = try f.tmp.dir.readFileAlloc(t.io, w.path, f.a, .unlimited);
+        const text = try root.readFileAlloc(t.io, w.path, f.a, .unlimited);
         try t.expect(std.mem.indexOf(u8, text, tok) == null);
     };
 }
