@@ -391,6 +391,18 @@ check "with /dryrun on an approved money call is not made" 'wait_for "$OUT" "dry
 say "/dryrun off"
 wait_for "$OUT" "Dry run is off: approved money calls are made."
 
+# /money: routines spend nothing until a budget is set; pause and resume
+say "/money"
+check "/money says no budget for routines is set" 'wait_for "$OUT" "Budget for routines: none, so they spend nothing without asking you."'
+say "/money budget 30 a day"
+check "/money budget writes [money] and reloads" 'wait_for "$OUT" "Routines may spend up to 30 a day at each money server without asking you." && grep -q "^budget_per_day = 30" "$HARNESS_HOME/config.ini"'
+say "/money pause"
+check "/money pause is kept in state" 'wait_for "$OUT" "spending is paused: each payment they try waits for you" && [ -f "$HARNESS_HOME/state/money-paused" ]'
+say "/money resume"
+check "/money resume restarts it" 'wait_for "$OUT" "Routines may spend again, within the budget." && [ ! -f "$HARNESS_HOME/state/money-paused" ]'
+say "/money budget 0 a day"
+wait_for "$OUT" "No budget a day for routines now"
+
 # folders.ini: notes written by the agent itself, not its helpers, and
 # snapshotted around the runs that change it
 printf '[notes]\nwrite = agent:main\nsnapshots = on\n' >"$HARNESS_HOME/folders.ini"

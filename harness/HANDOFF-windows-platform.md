@@ -36,6 +36,31 @@ agent.zig's moneyCheck and MoneyLedger, core.zig's skipped items and the
 reorder, config.zig's `[money]` and mcp.zig. Keep your edits to those
 small while it's built.
 
+**Part 1 is built (2026-11-24, branch `platform/money-budget`).** What it
+changed in shared code, so Part 2 doesn't collide:
+
+- `agent.zig`: `moneyCheck` gained an unattended branch (`unattendedMoney`)
+  that runs before the gate; `gate.Ctx.money_unattended` is now set only
+  when it passed the budget (`AskExtra.budget`). The trigger and workflow
+  switch checks moved out of `callToolRaw` into it. `MoneyLedger` has a
+  table per record kind (`day`, `auto_day`, `auto_month`, `month`;
+  `reserve(…, auto)`), `Switches.money_paused`, `Run.spend` (the told
+  line), `Skip.why`/`payable`/`amount`, `callMcp(…, dry)`.
+- `core.zig`: `keepSkip` offers [Make this payment] (`pay`, the item's
+  skip key the whole call) and `answerItem` makes it on a thread
+  (`startPayment`, `makePayment`, reusing `Errands.OrderGo`); a `Money`
+  namespace before `Persona` (`/money`, the `p` button, `state/money-paused`,
+  `state/upgrades/money-budget`, setup's `budget SHOP` question);
+  `Errands.propose` → `orderWithin` as `harness:reorder`. `Money.upgrade`
+  runs in `open` right after `Manner.migrate`: put the sandbox-default
+  upgrade beside it, with its own marker in `state/upgrades/`.
+- `config.zig`: `[money]` `budget_per_day`, `budget_per_month`;
+  `scheduled`, `triggers`, `workflows` default on. `mcp.zig`: a server's
+  `budget_per_day`/`budget_per_month` (`none` = 0, `0` = `error.ZeroBudget`).
+- New `money.zig`; `inject.zig` case 33. No edits to `environments.zig` or
+  `sandbox.zig`. Windows: nothing POSIX-only; paths joined with
+  `std.fs.path.join`.
+
 ## CI after your cmd push (772c8c4, dfb489f): red on Windows
 
 Runs 45388410033 and 45392418965 fail on Windows, in Debug, in

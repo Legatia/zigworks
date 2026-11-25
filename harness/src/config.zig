@@ -105,15 +105,22 @@ pub const Config = struct {
     pub const Money = struct {
         max_per_call: u32 = 0,
         max_per_day: u32 = 0,
-        /// Money calls in scheduled runs, without asking, inside the caps.
-        scheduled: bool = false,
+        /// What automation (unattended runs) may spend without asking, in
+        /// the tool's amount units, counted apart from the owner's own
+        /// spending; 0: limits nothing on its own. Automation spends only
+        /// while one of them is above 0.
+        budget_per_day: u32 = 0,
+        budget_per_month: u32 = 0,
+        /// Money calls in scheduled runs, without asking, within the caps
+        /// and the budget (on: with no budget nothing moves).
+        scheduled: bool = true,
         /// Runs a trigger starts follow `scheduled` (on) or never move
-        /// money (off: the owner has not decided yet).
-        triggers: bool = false,
+        /// money (off).
+        triggers: bool = true,
         /// Agent steps of workflows follow `scheduled` (on) or never move
-        /// money (off: the owner has not decided yet); a tool step's money
-        /// call is asked every time either way.
-        workflows: bool = false,
+        /// money (off); a tool step's money call is asked every time
+        /// either way.
+        workflows: bool = true,
         /// Runs an app starts follow `scheduled` (on) or never move money
         /// (off: the owner has not decided yet); an app's own acts never.
         apps: bool = false,
@@ -807,10 +814,12 @@ pub const defaults_ini =
     \\
     \\[money]                             ; MCP tools listed under money = in mcp.ini
     \\max_per_call = 0                    ; in the tool's amount units; 0 = no cap
-    \\max_per_day = 0
-    \\scheduled = off                     ; on: scheduled runs may move money, within the caps
-    \\triggers = off                      ; on: runs a trigger starts move money as scheduled = says; off: never
-    \\workflows = off                     ; on: agent steps of workflows move money as scheduled = says; off: never (tool steps are asked every time)
+    \\max_per_day = 0                     ; everything spent in a day, yours and routines'
+    \\budget_per_day = 0                  ; what routines may spend without asking you; 0 = none set
+    \\budget_per_month = 0                ; routines spend only while a budget is above 0
+    \\scheduled = on                      ; on: scheduled runs may move money, within the caps and the budget
+    \\triggers = on                       ; on: runs a trigger starts move money as scheduled = says; off: never
+    \\workflows = on                      ; on: agent steps of workflows move money as scheduled = says; off: never (tool steps are asked every time)
     \\apps = off                          ; on: runs an app starts move money as scheduled = says; off: never (an app's own acts never do)
     \\
     \\[apps]                              ; apps in your browser, on this machine only
@@ -1162,7 +1171,10 @@ test "agents_browser_and_money_sections" {
     try t.expectEqual(150000, d.agents.tokens);
     try t.expectEqual(4000, d.agents.answer_bytes);
     try t.expectEqual(0, d.money.max_per_call);
-    try t.expect(!d.money.scheduled);
+    // on by default: with no budget nothing moves unattended
+    try t.expect(d.money.scheduled);
+    try t.expectEqual(0, d.money.budget_per_day);
+    try t.expectEqual(0, d.money.budget_per_month);
     const c = try parse(arena.allocator(), "[model]\nworker_model = tiny\n[agents]\nparallel = 2\n[browser]\npath = /opt/chrome\n[money]\nmax_per_call = 100\nmax_per_day = 500\nscheduled = on\n");
     try t.expectEqualStrings("tiny", c.model.worker_model);
     try t.expectEqual(2, c.agents.parallel);
@@ -1171,6 +1183,21 @@ test "agents_browser_and_money_sections" {
     try t.expectEqual(500, c.money.max_per_day);
     try t.expect(c.money.scheduled);
     _ = try parse(arena.allocator(), defaults_ini);
+}
+
+test "budgets_are_read_from_money" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try parse(a, "[money]\nbudget_per_day = 30\nbudget_per_month = 200\n");
+    try t.expectEqual(30, c.money.budget_per_day);
+    try t.expectEqual(200, c.money.budget_per_month);
+    // 0: limits nothing on its own
+    try t.expectEqual(0, (try parse(a, "[money]\nbudget_per_day = 0\n")).money.budget_per_day);
+    try t.expectError(error.BadConfig, parse(a, "[money]\nbudget_per_day = lots\n"));
+    // the shipped file says each key, so an upgrade can tell it from an old one
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "\nbudget_per_day = 0") != null);
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "\nscheduled = on") != null);
 }
 
 test "inbox_settings_read_questions_and_remind" {
@@ -1375,11 +1402,11 @@ test "trigger_and_money_settings_read" {
     try t.expectEqual(20, d.triggers.runs_per_hour);
     try t.expectEqual(100, d.triggers.runs_per_day);
     try t.expectEqual(200, d.triggers.queue);
-    try t.expect(!d.money.triggers);
-    const c = try parse(a, "[triggers]\ncheck_model = tiny\nqueue = 5\n[money]\ntriggers = on\n");
+    try t.expect(d.money.triggers);
+    const c = try parse(a, "[triggers]\ncheck_model = tiny\nqueue = 5\n[money]\ntriggers = off\n");
     try t.expectEqualStrings("tiny", c.triggers.check_model);
     try t.expectEqual(5, c.triggers.queue);
-    try t.expect(c.money.triggers);
+    try t.expect(!c.money.triggers);
     try t.expectError(error.BadConfig, parse(a, "[triggers]\nqueue = 0\n"));
     try t.expectEqualDeep(d.triggers, (try parse(a, defaults_ini)).triggers);
     try t.expectEqualDeep(d.money, (try parse(a, defaults_ini)).money);
@@ -1393,11 +1420,11 @@ test "workflow_settings_read" {
     const d = try parse(a, "");
     try t.expectEqual(50, d.workflows.instances);
     try t.expectEqual(100, d.workflows.agent_steps_per_day);
-    try t.expect(!d.money.workflows);
-    const c = try parse(a, "[workflows]\ninstances = 5\nagent_steps_per_day = 7\n[money]\nworkflows = on\n");
+    try t.expect(d.money.workflows);
+    const c = try parse(a, "[workflows]\ninstances = 5\nagent_steps_per_day = 7\n[money]\nworkflows = off\n");
     try t.expectEqual(5, c.workflows.instances);
     try t.expectEqual(7, c.workflows.agent_steps_per_day);
-    try t.expect(c.money.workflows);
+    try t.expect(!c.money.workflows);
     try t.expectError(error.BadConfig, parse(a, "[workflows]\ninstances = 0\n"));
     try t.expectEqualDeep(d.workflows, (try parse(a, defaults_ini)).workflows);
     try t.expectEqualDeep(d.money, (try parse(a, defaults_ini)).money);

@@ -32,6 +32,7 @@ const summaries_mod = @import("summaries.zig");
 const outside_mod = @import("outside.zig");
 const url_mod = @import("url.zig");
 const topics_mod = @import("topics.zig");
+const money_mod = @import("money.zig");
 const Io = std.Io;
 
 /// What came of asking the owner. `once`, `day`, `deny`: an approval's
@@ -220,6 +221,8 @@ pub const Switches = struct {
     dry_run: std.atomic.Value(bool) = .init(false),
     private: std.atomic.Value(bool) = .init(false),
     auto_recall: std.atomic.Value(bool) = .init(true),
+    /// `/money pause`: automation spends nothing until `/money resume`.
+    money_paused: std.atomic.Value(bool) = .init(false),
 };
 
 const no_switches: Switches = .{};
@@ -516,6 +519,9 @@ pub const Run = struct {
     money: config.Config.Money = .{},
     /// What money tools moved today; shared by all runs.
     money_ledger: ?*MoneyLedger = null,
+    /// Where each automated spend is told (main, with a pause button);
+    /// null: nowhere.
+    spend: ?SpendDesk = null,
     /// /dryrun on from the start of this run: money tools are not called,
     /// whatever the switch says later (see `dryRun`).
     dry_run: bool = false,
@@ -1322,6 +1328,10 @@ pub const McpTool = struct {
     /// config.ini's [money].
     max_per_call: ?u32 = null,
     max_per_day: ?u32 = null,
+    /// The server's own budgets for automation (mcp.ini); 0: none (it
+    /// spends nothing there unattended); null: config.ini's [money].
+    budget_per_day: ?u32 = null,
+    budget_per_month: ?u32 = null,
 };
 
 /// What one server offers the model, and what the owner should know about
@@ -1383,36 +1393,55 @@ pub fn mcpTools(arena: std.mem.Allocator, s: *mcp.Server, cfg: mcp.ServerConfig,
         const field: mcp.Field = if (is_money) cfg.amount.of(tl.name) else .unset;
         if (is_money and field == .unset and capped)
             try notes.print(arena, "{s}: {s} has no amount field in mcp.ini (amount =), so its calls are refused while a money cap is set\n", .{ tl.server, tl.name });
-        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = field, .max_per_call = cfg.max_per_call, .max_per_day = cfg.max_per_day });
+        try out.append(arena, .{ .def = .{ .name = name, .description = desc, .schema_json = tl.schema_json }, .server = s, .tool = tl.name, .money = is_money, .amount = field, .max_per_call = cfg.max_per_call, .max_per_day = cfg.max_per_day, .budget_per_day = cfg.budget_per_day, .budget_per_month = cfg.budget_per_month });
     }
     return .{ .tools = out.items, .notes = notes.items };
 }
 
-/// What each server's money tools moved today, in the owner's day.
+/// What each server's money tools moved, in the owner's days: a day's
+/// total (everyone's), and since budgets automation's own a day and a
+/// month, and everyone's a month.
 pub const MoneyLedger = struct {
     mutex: Io.Mutex = .init,
-    entries: [max_servers]Entry = undefined,
-    len: usize = 0,
-    /// Where it is kept, a line "SERVER DAY TOTAL" each; null in tests.
+    /// One table a kind (`Kind`), each with its own slots: the daily
+    /// lines can't push a month's out.
+    tables: [kinds]Table = .{ .{}, .{}, .{}, .{} },
+    /// Where it is kept, a line each: "SERVER DAY TOTAL" (a day's), and
+    /// "auto:day SERVER DAY TOTAL", "auto:month SERVER MONTH TOTAL",
+    /// "all:month SERVER MONTH TOTAL"; null in tests.
     path: ?[]const u8 = null,
     /// Why the record read at start cannot be trusted; while set, every
     /// money call is refused with it.
     trouble_buf: [160]u8 = undefined,
     trouble_len: usize = 0,
 
-    /// Servers whose totals are kept at once.
+    /// Servers whose totals are kept at once (a kind's slots).
     pub const max_servers = 64;
-    /// The longest line: a name, a day and a total printed whole (up to
-    /// 309 digits for the largest f64).
-    const max_line = 32 + 1 + 20 + 1 + 330 + 1;
-    const max_file = max_servers * max_line;
+    /// The longest line: a kind's word, a name, a day and a total printed
+    /// whole (up to 309 digits for the largest f64).
+    const max_line = 11 + 32 + 1 + 20 + 1 + 330 + 1;
+    const max_file = kinds * max_servers * max_line;
     /// A total from before totals were kept per server ("DAY TOTAL"): it
     /// counts for every server, so none can pass its cap on that day.
     const everyone = "*";
 
+    /// What a line counts: a day's total (everyone's), automation's day,
+    /// automation's month, everyone's month.
+    pub const Kind = enum(u2) { day, auto_day, auto_month, month };
+    const kinds = 4;
+    /// Each kind's first word (none: a day's line, as before budgets); no
+    /// server's name has a `:`.
+    const words = [kinds][]const u8{ "", "auto:day", "auto:month", "all:month" };
+
+    const Table = struct {
+        entries: [max_servers]Entry = undefined,
+        len: usize = 0,
+    };
+
     const Entry = struct {
         name_buf: [32]u8 = undefined,
         name_len: u8 = 0,
+        /// The day, or for a month's kind the month (`money.monthOf`).
         day: i64 = 0,
         total: f64 = 0,
 
@@ -1421,13 +1450,18 @@ pub const MoneyLedger = struct {
         }
     };
 
+    fn table(l: *MoneyLedger, k: Kind) *Table {
+        return &l.tables[@intFromEnum(k)];
+    }
+
     /// Reads the record. One that is there but cannot be read, or is
     /// damaged, refuses money calls (see `trouble`) rather than starting
     /// the day from 0.
     pub fn load(l: *MoneyLedger, io: Io) void {
         const p = l.path orelse return;
-        var buf: [max_file + 1]u8 = undefined;
-        const got = Io.Dir.cwd().readFile(io, p, &buf) catch |e| switch (e) {
+        const buf = std.heap.page_allocator.alloc(u8, max_file + 1) catch return l.setTrouble("the money record (state/money) could not be read (OutOfMemory)", .{});
+        defer std.heap.page_allocator.free(buf);
+        const got = Io.Dir.cwd().readFile(io, p, buf) catch |e| switch (e) {
             error.FileNotFound => return,
             else => return l.setTrouble("the money record (state/money) could not be read ({s})", .{@errorName(e)}),
         };
@@ -1436,20 +1470,33 @@ pub const MoneyLedger = struct {
         var n_line: usize = 0;
         while (lines.next()) |line| {
             n_line += 1;
-            var parts: [3][]const u8 = undefined;
+            var parts: [4][]const u8 = undefined;
             var n: usize = 0;
+            var more = false;
             var it = std.mem.tokenizeAny(u8, line, " \t");
             while (it.next()) |x| {
-                if (n == parts.len) break;
+                if (n == parts.len) {
+                    more = true;
+                    break;
+                }
                 parts[n] = x;
                 n += 1;
             }
-            const bad = it.next() != null or n < 2;
-            const name = if (n == 2) everyone else parts[0];
+            // four fields: a kind's own first word; three: a day's line;
+            // two: a day's from before totals were kept per server
+            const kind: ?Kind = switch (n) {
+                2, 3 => .day,
+                4 => for (words[1..], 1..) |w, i| {
+                    if (std.mem.eql(u8, parts[0], w)) break @as(Kind, @enumFromInt(i));
+                } else null,
+                else => null,
+            };
+            const bad = more or kind == null;
+            const name = if (n == 2) everyone else if (n == 4) parts[1] else parts[0];
             const day = if (bad) null else std.fmt.parseInt(i64, parts[n - 2], 10) catch null;
             const total = if (bad) null else std.fmt.parseFloat(f64, parts[n - 1]) catch null;
             const good_total = if (total) |x| x >= 0 and !std.math.isNan(x) and !std.math.isInf(x) else false;
-            const e = if (day != null and good_total) l.entry(name, day.?) else null;
+            const e = if (day != null and good_total) l.entry(kind.?, name, day.?) else null;
             const slot = e orelse return l.setTrouble("the money record (state/money) is damaged at line {d}", .{n_line});
             slot.day = day.?;
             slot.total = total.?;
@@ -1466,20 +1513,22 @@ pub const MoneyLedger = struct {
         return if (l.trouble_len > 0) l.trouble_buf[0..l.trouble_len] else null;
     }
 
-    fn find(l: *MoneyLedger, name: []const u8) ?*Entry {
-        for (l.entries[0..l.len]) |*e| if (std.mem.eql(u8, e.name(), name)) return e;
+    fn find(l: *MoneyLedger, k: Kind, name: []const u8) ?*Entry {
+        const tb = l.table(k);
+        for (tb.entries[0..tb.len]) |*e| if (std.mem.eql(u8, e.name(), name)) return e;
         return null;
     }
 
-    /// The entry for `name`, made if there is none (in place of one of a
-    /// day before `day` when all are taken); null when none is free.
-    fn entry(l: *MoneyLedger, name: []const u8, day: i64) ?*Entry {
-        if (l.find(name)) |e| return e;
+    /// Kind `k`'s entry for `name`, made if there is none (in place of one
+    /// of a period before `day` when all are taken); null when none is free.
+    fn entry(l: *MoneyLedger, k: Kind, name: []const u8, day: i64) ?*Entry {
+        if (l.find(k, name)) |e| return e;
         if (name.len == 0 or name.len > 32) return null;
-        const e = if (l.len < max_servers) blk: {
-            l.len += 1;
-            break :blk &l.entries[l.len - 1];
-        } else for (l.entries[0..l.len]) |*old| {
+        const tb = l.table(k);
+        const e = if (tb.len < max_servers) blk: {
+            tb.len += 1;
+            break :blk &tb.entries[tb.len - 1];
+        } else for (tb.entries[0..tb.len]) |*old| {
             if (old.day < day) break old;
         } else return null;
         e.* = .{ .day = day };
@@ -1492,75 +1541,125 @@ pub const MoneyLedger = struct {
     /// another run already counted past midnight (so today's total is
     /// never wiped by yesterday's).
     fn dayFor(l: *MoneyLedger, server: []const u8, day: i64) i64 {
-        const e = l.find(server) orelse return day;
-        return @max(e.day, day);
+        var d = day;
+        for ([_]Kind{ .day, .auto_day }) |k| if (l.find(k, server)) |e| {
+            d = @max(d, e.day);
+        };
+        return d;
     }
 
-    /// What `server` moved on `day`.
-    fn spent(l: *MoneyLedger, server: []const u8, day: i64) f64 {
-        var so_far: f64 = 0;
-        for ([_][]const u8{ server, everyone }) |n| if (l.find(n)) |e| {
-            if (e.day == day) so_far += e.total;
+    /// The month a reservation on `day` counts toward (likewise never an
+    /// earlier one than counted).
+    fn monthFor(l: *MoneyLedger, server: []const u8, day: i64) i64 {
+        var m = money_mod.monthOf(day);
+        for ([_]Kind{ .month, .auto_month }) |k| if (l.find(k, server)) |e| {
+            m = @max(m, e.day);
         };
+        return m;
+    }
+
+    fn totalOf(l: *MoneyLedger, k: Kind, server: []const u8, period: i64) f64 {
+        const e = l.find(k, server) orelse return 0;
+        return if (e.day == period) e.total else 0;
+    }
+
+    /// What `server` moved on `day`, everyone's.
+    pub fn spent(l: *MoneyLedger, server: []const u8, day: i64) f64 {
+        var so_far: f64 = 0;
+        for ([_][]const u8{ server, everyone }) |n| so_far += l.totalOf(.day, n, day);
         return so_far;
     }
 
-    /// Counts `amount` toward `server`'s day (`dayFor`) and saves it.
-    /// error.NoRoom when no entry is free; when the save fails, nothing is
-    /// counted and its error is returned: a reservation that would be
-    /// forgotten at the next start is not made.
-    fn reserve(l: *MoneyLedger, io: Io, server: []const u8, day_in: i64, amount: f64) !Reservation {
-        const day = l.dayFor(server, day_in);
-        const before = l.entries;
-        const before_len = l.len;
-        const e = l.entry(server, day) orelse return error.NoRoom;
-        if (e.day != day) {
-            e.day = day;
-            e.total = 0;
-        }
-        e.total += amount;
-        l.save(io, day) catch |err| {
-            l.entries = before;
-            l.len = before_len;
-            return err;
-        };
-        return .{ .day = day, .amount = amount };
+    /// What automation moved through `server` on `day`.
+    pub fn spentAuto(l: *MoneyLedger, server: []const u8, day: i64) f64 {
+        return l.totalOf(.auto_day, server, day);
     }
 
-    /// Takes back what `reserve` counted, for a call not made. A day that
-    /// is over is left as it was (it no longer counts), and a total never
-    /// goes below 0.
+    /// What automation moved through `server` in `month` (`money.monthOf`).
+    pub fn spentAutoMonth(l: *MoneyLedger, server: []const u8, month: i64) f64 {
+        return l.totalOf(.auto_month, server, month);
+    }
+
+    /// What everyone moved through `server` in `month`, since budgets.
+    pub fn spentMonth(l: *MoneyLedger, server: []const u8, month: i64) f64 {
+        return l.totalOf(.month, server, month);
+    }
+
+    /// Counts `amount` toward `server`'s day (`dayFor`) and month, and
+    /// when `auto` toward automation's day and month too, and saves it.
+    /// error.NoRoom when an entry is not free; when the save fails,
+    /// nothing is counted and its error is returned: a reservation that
+    /// would be forgotten at the next start is not made.
+    pub fn reserve(l: *MoneyLedger, io: Io, server: []const u8, day_in: i64, amount: f64, auto: bool) !Reservation {
+        const day = l.dayFor(server, day_in);
+        const month = l.monthFor(server, day);
+        const before = l.tables;
+        errdefer l.tables = before;
+        const counted: []const Kind = if (auto) &.{ .day, .auto_day, .auto_month, .month } else &.{ .day, .month };
+        for (counted) |k| {
+            const period = if (k == .day or k == .auto_day) day else month;
+            const e = l.entry(k, server, period) orelse return error.NoRoom;
+            if (e.day != period) {
+                e.day = period;
+                e.total = 0;
+            }
+            e.total += amount;
+        }
+        try l.save(io, day);
+        return .{ .day = day, .month = month, .amount = amount, .auto = auto };
+    }
+
+    /// Takes back what `reserve` counted, for a call not made. A period
+    /// that is over is left as it was (it no longer counts), and a total
+    /// never goes below 0.
     /// When the save fails, the file keeps the higher total, which is
     /// the safe side; the next reservation saves both or is refused.
     fn release(l: *MoneyLedger, io: Io, server: []const u8, res: Reservation) !void {
         if (res.amount == 0) return;
-        const e = l.find(server) orelse return;
-        if (e.day != res.day) return;
-        e.total = @max(0, e.total - res.amount);
+        const counted: []const Kind = if (res.auto) &.{ .day, .auto_day, .auto_month, .month } else &.{ .day, .month };
+        for (counted) |k| {
+            const period = if (k == .day or k == .auto_day) res.day else res.month;
+            const e = l.find(k, server) orelse continue;
+            if (e.day != period) continue;
+            e.total = @max(0, e.total - res.amount);
+        }
         try l.save(io, res.day);
     }
 
-    /// Writes the totals of `today` and later (an older day no longer
-    /// counts) to a new file that then replaces the old one, so a crash
-    /// half way leaves the old record, not a cut one.
+    /// Writes the totals of `today` and later, and of this month and later
+    /// (an older one no longer counts), to a new file that then replaces
+    /// the old one, so a crash half way leaves the old record, not a cut
+    /// one.
     fn save(l: *MoneyLedger, io: Io, today: i64) !void {
         const p = l.path orelse return;
-        var buf: [max_file]u8 = undefined;
-        var w: Io.Writer = .fixed(&buf);
-        for (l.entries[0..l.len]) |*e| if (e.day >= today) try w.print("{s} {d} {d}\n", .{ e.name(), e.day, e.total });
+        const buf = try std.heap.page_allocator.alloc(u8, max_file);
+        defer std.heap.page_allocator.free(buf);
+        var w: Io.Writer = .fixed(buf);
+        const this_month = money_mod.monthOf(today);
+        for (0..kinds) |i| {
+            const k: Kind = @enumFromInt(i);
+            const from = if (k == .day or k == .auto_day) today else this_month;
+            const tb = l.table(k);
+            for (tb.entries[0..tb.len]) |*e| if (e.day >= from) {
+                if (words[i].len > 0) try w.print("{s} ", .{words[i]});
+                try w.print("{s} {d} {d}\n", .{ e.name(), e.day, e.total });
+            };
+        }
         try util.writeReplace(io, p, w.buffered());
     }
 
-    /// Everything counted, whatever the server and day (for tests).
-    fn sum(l: *const MoneyLedger) f64 {
-        var total: f64 = 0;
-        for (l.entries[0..l.len]) |e| total += e.total;
-        return total;
+    /// Every day total counted, whatever the server and day (for tests).
+    fn sum(l: *MoneyLedger) f64 {
+        var all: f64 = 0;
+        const tb = l.table(.day);
+        for (tb.entries[0..tb.len]) |e| all += e.total;
+        return all;
     }
 };
 
-/// An amount counted toward a server's day before its call is asked.
-const Reservation = struct { day: i64 = 0, amount: f64 = 0 };
+/// An amount counted toward a server's day and month before its call is
+/// asked; `auto`: automation's too.
+const Reservation = struct { day: i64 = 0, month: i64 = 0, amount: f64 = 0, auto: bool = false };
 
 pub const ModelCfg = struct {
     /// omnigate's address and key, used only without `providers` (tests).
@@ -2166,12 +2265,6 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
             return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
         };
     };
-    // runs a trigger starts move no money until the owner decides ([money] triggers)
-    if (tool == .money and std.mem.startsWith(u8, r.who.by, "trigger:") and !r.money.triggers) {
-        const why = "money is not moved in runs a trigger starts ([money] triggers = off)";
-        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
-        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
-    }
     // an app's own acts never move money, nor the runs it starts until the
     // owner decides ([money] apps)
     if (tool == .money and std.mem.startsWith(u8, r.who.by, "app:") and (r.who.agent.len == 0 or !r.money.apps)) {
@@ -2190,13 +2283,6 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
             return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
         };
     };
-    // nor a workflow's agent steps ([money] workflows); its tool steps (no
-    // definition) are asked every time
-    if (tool == .money and std.mem.startsWith(u8, r.who.by, "workflow:") and r.who.agent.len > 0 and !r.money.workflows) {
-        const why = "money is not moved in a workflow's agent steps ([money] workflows = off)";
-        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
-        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
-    }
     const now_s = r.now();
     // where a command starts, as the model gave it
     const dir: []const u8 = if (tool == .shell) jv.str(jv.get(jv.parse(a, input_json), "dir")) orelse "" else "";
@@ -2225,9 +2311,19 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
         }
     }
     var reserved: Reservation = .{};
+    // runs a trigger starts and a workflow's agent steps go by their own
+    // switches too ([money] triggers, workflows): checked there; a tool
+    // step (no definition) is asked every time
+    var pass: MoneyPass = .{};
     if (tool == .money) {
-        if (moneyCheck(r, a, mt.?, input_json, now_s, &reserved)) |why| {
-            try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+        if (moneyCheck(r, a, mt.?, input_json, arg, now_s, &reserved, &pass)) |why| {
+            // an unattended decision carries the budget's numbers
+            if (pass.note.len > 0)
+                try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg, .budget = pass.note })
+            else
+                try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+            // nobody to ask: kept for the owner, a payment they may still make
+            if (r.scheduled) skipMoney(r, a, mt.?, name, arg, input_json, why, pass.payable);
             // a household member's run, or speech, doesn't learn the owner's spending
             const said = if (who_mod.isHousehold(r.who.by)) "a money limit of the owner's is reached" else why;
             return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{said}), .is_error = true };
@@ -2254,7 +2350,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
         },
         else => "",
     };
-    if (try decideAndAskWith(r, a, tool, name, arg, detail, now_s, .{ .dir = dir, .env = where.name, .env_note = where.note, .unseen = where.unseen() })) |refused| {
+    if (try decideAndAskWith(r, a, tool, name, arg, detail, now_s, .{ .dir = dir, .env = where.name, .env_note = where.note, .unseen = where.unseen(), .budget = if (pass.budget) pass.note else null })) |refused| {
         if (tool == .money) releaseMoney(r, mt.?, reserved);
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{refused}), .is_error = true };
     }
@@ -2292,6 +2388,8 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
         w.addBy(if (cf) |x| x.rel else arg, try writerOf(r, a), r.label);
     };
 
+    // dry run as it is now, for the call and what is told of it
+    const dry = tool == .money and r.dryRun();
     const out: tools.Output = switch (tool) {
         .recall => blk: {
             r.lock.lockUncancelable(r.io);
@@ -2336,7 +2434,7 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
             if (got.notice) |text| if (r.notice) |n| n.say(n.ctx, text);
             break :blk .{ .text = got.text, .is_error = got.is_error };
         },
-        .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved),
+        .mcp, .money => try callMcp(r, a, mt.?, arg, input_json, reserved, dry),
         .skill => blk: {
             const v = jv.parse(a, input_json).?;
             const text = if (jv.str(jv.get(v, "file"))) |file|
@@ -2369,6 +2467,13 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
         },
         .shell => if (where.env) |e| try runElsewhere(r, a, env, e, arg, dir) else try tools.run(env, a, tool, input_json),
         else => try tools.run(env, a, tool, input_json),
+    };
+    // made unasked within the budget: the owner is told (it stays counted
+    // whatever came back)
+    if (pass.spent) |sp| if (!dry) if (r.spend) |sd| {
+        var told = sp;
+        told.failed = out.is_error;
+        sd.told(sd.ctx, told);
     };
     // what it read from outside marks the conversation
     try markCall(r, a, tool, mt, arg, out);
@@ -3401,6 +3506,9 @@ const AskExtra = struct {
     /// The command reaches neither the network nor the data folder, or
     /// doesn't see the workspace: files the agent wrote don't ask for it.
     unseen: bool = false,
+    /// An unattended money call moneyCheck found within the budget, and
+    /// the budget's numbers: the gate may allow it unasked.
+    budget: ?[]const u8 = null,
 };
 
 fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: []const u8, detail: []const u8, now_s: i64, extra: AskExtra) !?[]const u8 {
@@ -3408,7 +3516,7 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
     // the outside text this run's model has seen: named in the question
     const marks = try r.outside(a);
     const outside_line = try outside_mod.line(a, marks);
-    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = r.money.scheduled, .who = r.who, .shared = extra.shared, .dir = dir, .env = extra.env, .here = tool == .send and std.mem.eql(u8, arg, r.conversation), .outside = marks.len > 0, .own_helper = extra.own_helper };
+    const ctx: gate.Ctx = .{ .scheduled = r.scheduled, .money_unattended = extra.budget != null, .who = r.who, .shared = extra.shared, .dir = dir, .env = extra.env, .here = tool == .send and std.mem.eql(u8, arg, r.conversation), .outside = marks.len > 0, .own_helper = extra.own_helper };
     const env_logged: []const u8 = if (extra.env_note.len > 0) extra.env else "";
     const d = blk: {
         r.lock.lockUncancelable(r.io);
@@ -3520,6 +3628,10 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
         // the owner saw those files and allowed a command all the same
         if (action == .allow) if (wrote) |wr| r.written.?.clear(wr.upto);
     }
+    // allowed unasked within the budget: the line says by how much
+    if (action == .allow and tool == .money) if (extra.budget) |note| if (note.len > 0) {
+        why = try std.fmt.allocPrint(a, "{s}: {s}", .{ why, note });
+    };
     try gateLine(r, name, @tagName(logged orelse action), why, arg, dir, env_logged);
     return if (action == .allow) null else why;
 }
@@ -3562,6 +3674,20 @@ pub const Skip = struct {
     private: bool,
     /// The line naming its run's outside text (outside.zig); "": none.
     outside: []const u8 = "",
+    /// Why it was refused ("": the gate's question with no one to ask).
+    why: []const u8 = "",
+    /// A money call the owner may still make with a tap ([Make this
+    /// payment]): `key` is then the whole call.
+    payable: bool = false,
+    /// A money call's amount, as the owner reads it; "": none named.
+    amount: []const u8 = "",
+};
+
+/// Tells the owner of a money call an unattended run made unasked, within
+/// the budget.
+pub const SpendDesk = struct {
+    ctx: *anyopaque,
+    told: *const fn (ctx: *anyopaque, s: money_mod.Spent) void,
 };
 
 /// Keeps a skipped call as an inbox item; returns its id (0: none).
@@ -3888,6 +4014,36 @@ fn skip(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []const u8, arg: [
     s.add(r.io, name, arg, item);
 }
 
+/// An unattended money call moneyCheck refused: listed in the run's post
+/// and kept as an item with the whole call, its amount and why; when
+/// `payable`, its key is the whole call (each payment its own item) and
+/// the owner's tap may make it.
+fn skipMoney(r: *Run, a: std.mem.Allocator, m: *const McpTool, name: []const u8, arg: []const u8, input_json: []const u8, why: []const u8, payable: bool) void {
+    const s = r.skipped orelse return;
+    const amount: []const u8 = switch (m.amount) {
+        .name => |field| if (amountOf(a, input_json, field)) |x| money_mod.amountText(a, x) catch "" else "",
+        else => "",
+    };
+    const item = if (s.keeper) |k| k.keep(k.ctx, a, .{
+        .tool = .money,
+        .env = "",
+        .name = name,
+        .arg = arg,
+        .key = if (payable) arg else gate.grantKey(.money, arg),
+        .grantable = false,
+        .who = r.who,
+        .rid = r.rid,
+        .label = r.label,
+        .conversation = r.conversation,
+        .private = r.isPrivate(),
+        .outside = outside_mod.line(a, r.outside(a) catch &.{}) catch "",
+        .why = why,
+        .payable = payable,
+        .amount = amount,
+    }) else 0;
+    s.add(r.io, name, arg, item);
+}
+
 fn webAllow(ctx: *anyopaque, a: std.mem.Allocator, tool: gate.Tool, arg: []const u8) ?[]const u8 {
     const r: *Run = @ptrCast(@alignCast(ctx));
     if (r.env.stop.load(.acquire)) return "stopped by the owner";
@@ -3930,14 +4086,28 @@ fn moneyDay(r: *const Run, now_s: i64) i64 {
 /// passes, its amount is already counted in today's total (checked and
 /// counted under one lock, so two runs cannot both pass the same cap) as
 /// `res`; `releaseMoney` takes it back if the call is not made.
-fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []const u8, now_s: i64, res: *Reservation) ?[]const u8 {
+/// What moneyCheck found for an unattended call, beside its answer.
+const MoneyPass = struct {
+    /// Within the budget: the gate may allow it unasked.
+    budget: bool = false,
+    /// The budget's numbers, for the gate line ("today 25 of 30; this
+    /// month 25 of 200"); "": none known.
+    note: []const u8 = "",
+    /// A refusal the owner may still make with a tap ([Make this payment]).
+    payable: bool = false,
+    /// Within the budget: what the owner is told once it is made.
+    spent: ?money_mod.Spent = null,
+};
+
+/// An unattended run's call (`r.scheduled`) goes by `unattendedMoney`:
+/// within the budget, or refused.
+fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []const u8, arg: []const u8, now_s: i64, res: *Reservation, pass: *MoneyPass) ?[]const u8 {
+    if (r.scheduled) return unattendedMoney(r, a, m, input_json, arg, now_s, res, pass);
     var amount: f64 = 0;
     // the server's own caps, else config.ini's
     const per_call = m.max_per_call orelse r.money.max_per_call;
     const per_day = m.max_per_day orelse r.money.max_per_day;
     const capped = per_call > 0 or per_day > 0;
-    if (r.scheduled and r.money.scheduled and !capped)
-        return "money in scheduled runs needs max_per_call or max_per_day ([money] in config.ini, or the server's section in mcp.ini)";
     switch (m.amount) {
         .none => {},
         // without its field the caps cannot be checked: refused, not let through
@@ -3960,11 +4130,103 @@ fn moneyCheck(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []co
     const spent = l.spent(m.server.name, day);
     if (per_day > 0 and spent + amount > @as(f64, @floatFromInt(per_day)))
         return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount, per_day, spent }) catch "over the cap per day";
-    res.* = l.reserve(r.io, m.server.name, day, amount) catch |e| return switch (e) {
+    res.* = l.reserve(r.io, m.server.name, day, amount, false) catch |e| return switch (e) {
         error.NoRoom => "the day totals of too many servers are kept already",
         else => std.fmt.allocPrint(a, "today's money total could not be saved to state/money ({s}), so no money call is made while it cannot be", .{@errorName(e)}) catch "the money record could not be saved",
     };
     return null;
+}
+
+/// A money call nobody can be asked about: made only when the run may
+/// spend (its switch; the reorder alone of harness's own jobs), the tool
+/// names an amount, spending isn't paused, the run read no outside text
+/// but the paying server's own, and the amount is within the caps and the
+/// budget, today and this month; counted as automation's then (`pass`
+/// says so, and the budget's numbers). `mail_send` goes to the gate, whose
+/// mail check refuses it first.
+fn unattendedMoney(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json: []const u8, arg: []const u8, now_s: i64, res: *Reservation, pass: *MoneyPass) ?[]const u8 {
+    if (mail_mod.isSendCall(arg)) return null;
+    const by = r.who.by;
+    const b = money_mod.budgetFor(r.money, m.budget_per_day, m.budget_per_month);
+    // every decision's line carries the budget's numbers as they are
+    if (r.money_ledger) |l| {
+        l.mutex.lockUncancelable(r.io);
+        defer l.mutex.unlock(r.io);
+        const day = l.dayFor(m.server.name, moneyDay(r, now_s));
+        pass.note = budgetNote(a, b, l.spentAuto(m.server.name, day), l.spentAutoMonth(m.server.name, l.monthFor(m.server.name, day))) catch "";
+    }
+    if (std.mem.startsWith(u8, by, "harness:") and !std.mem.eql(u8, by, "harness:reorder"))
+        return "harness's own jobs move no money (the reorder alone, within the budget)";
+    // like the door unlock: never unattended, whatever the budget
+    const field = switch (m.amount) {
+        .name => |f| f,
+        else => return "a money tool that names no amount is never used unattended",
+    };
+    // from here a refusal is a payment the owner may still make
+    pass.payable = true;
+    if (!r.money.scheduled) return "money is not moved in unattended runs ([money] scheduled = off)";
+    if (std.mem.startsWith(u8, by, "trigger:") and !r.money.triggers) return "money is not moved in runs a trigger starts ([money] triggers = off)";
+    if (std.mem.startsWith(u8, by, "workflow:") and r.who.agent.len > 0 and !r.money.workflows) return "money is not moved in a workflow's agent steps ([money] workflows = off)";
+    if (r.switches.money_paused.load(.acquire)) return "automation spending is paused (/money resume restarts it)";
+    // outside text doesn't spend: the paying server's own results alone
+    {
+        const own = outside_mod.named(a, "mcp", m.server.name) catch return "the run's outside text could not be read";
+        const marks = r.outside(a) catch return "the run's outside text could not be read";
+        var others: std.ArrayList([]const u8) = .empty;
+        for (marks) |x| if (!std.mem.eql(u8, x, own)) others.append(a, x) catch return "the run's outside text could not be read";
+        if (others.items.len > 0) {
+            const shown = others.items[0..@min(others.items.len, 3)];
+            const list = std.mem.join(a, ", ", shown) catch "";
+            const more = if (others.items.len > shown.len) std.fmt.allocPrint(a, " and {d} more", .{others.items.len - shown.len}) catch "" else "";
+            return std.fmt.allocPrint(a, "it read outside text first ({s}{s}), and outside text doesn't spend", .{ list, more }) catch "it read outside text first, and outside text doesn't spend";
+        }
+    }
+    if (b.none) return std.fmt.allocPrint(a, "automation spends nothing at {s} (budget = none in mcp.ini)", .{m.server.name}) catch "automation spends nothing at this server";
+    if (!b.any()) return "no budget for automation: /money budget N a day sets one";
+    const amount = amountOf(a, input_json, field) orelse
+        return std.fmt.allocPrint(a, "no amount in the field \"{s}\", so the budget cannot be checked", .{field}) catch "no amount";
+    if (amount < 0 or std.math.isNan(amount) or std.math.isInf(amount)) return "the amount is not a positive number";
+    // a server may read 0 as "all": never unasked
+    if (amount == 0) return "an amount of 0 is never paid unattended (a server may read it as all)";
+    const per_call = m.max_per_call orelse r.money.max_per_call;
+    const per_day = m.max_per_day orelse r.money.max_per_day;
+    if (per_call > 0 and amount > @as(f64, @floatFromInt(per_call)))
+        return std.fmt.allocPrint(a, "{d} is over the cap of {d} per call", .{ amount, per_call }) catch "over the cap per call";
+    const l = r.money_ledger orelse return "no record of what automation spent";
+    l.mutex.lockUncancelable(r.io);
+    defer l.mutex.unlock(r.io);
+    if (l.trouble()) |why| return std.fmt.allocPrint(a, "{s}; no money call is made until it is fixed and harness restarted", .{why}) catch "the money record cannot be trusted";
+    const day = l.dayFor(m.server.name, moneyDay(r, now_s));
+    const month = l.monthFor(m.server.name, day);
+    const spent = l.spent(m.server.name, day);
+    const auto_day = l.spentAuto(m.server.name, day);
+    const auto_month = l.spentAutoMonth(m.server.name, month);
+    pass.note = budgetNote(a, b, auto_day, auto_month) catch "";
+    if (per_day > 0 and spent + amount > @as(f64, @floatFromInt(per_day)))
+        return std.fmt.allocPrint(a, "{d} more would be over the cap of {d} per day ({d} so far today)", .{ amount, per_day, spent }) catch "over the cap per day";
+    if (b.day > 0 and auto_day + amount > @as(f64, @floatFromInt(b.day)))
+        return std.fmt.allocPrint(a, "{d} more would be over the budget of {d} a day for automation ({d} so far today)", .{ amount, b.day, auto_day }) catch "over the budget a day";
+    if (b.month > 0 and auto_month + amount > @as(f64, @floatFromInt(b.month)))
+        return std.fmt.allocPrint(a, "{d} more would be over the budget of {d} a month for automation ({d} so far this month)", .{ amount, b.month, auto_month }) catch "over the budget a month";
+    res.* = l.reserve(r.io, m.server.name, day, amount, true) catch |e| return switch (e) {
+        error.NoRoom => "the totals of too many servers are kept already",
+        else => std.fmt.allocPrint(a, "today's money total could not be saved to state/money ({s}), so no money call is made while it cannot be", .{@errorName(e)}) catch "the money record could not be saved",
+    };
+    pass.budget = true;
+    pass.payable = false;
+    pass.note = budgetNote(a, b, auto_day + amount, auto_month + amount) catch "";
+    pass.spent = .{ .server = m.server.name, .tool = m.tool, .by = by, .amount = amount, .day_spent = auto_day + amount, .month_spent = auto_month + amount, .budget = b };
+    return null;
+}
+
+/// "today 25 of 30; this month 25 of 200": what automation spent at a
+/// server, with the budget where one is set.
+fn budgetNote(a: std.mem.Allocator, b: money_mod.Budget, day: f64, month: f64) ![]const u8 {
+    const d = try money_mod.amountText(a, day);
+    const mo = try money_mod.amountText(a, month);
+    const of_day = if (b.day > 0) try std.fmt.allocPrint(a, " of {d}", .{b.day}) else "";
+    const of_month = if (b.month > 0) try std.fmt.allocPrint(a, " of {d}", .{b.month}) else "";
+    return std.fmt.allocPrint(a, "today {s}{s}; this month {s}{s}", .{ d, of_day, mo, of_month });
 }
 
 /// Takes back an amount counted by `moneyCheck` for a call not made: from
@@ -3977,8 +4239,8 @@ fn releaseMoney(r: *Run, m: *const McpTool, res: Reservation) void {
         r.logRun(.gate, false, .{ .tool = m.def.name, .event = "money record not saved", .why = @errorName(e) }) catch {};
 }
 
-fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, reserved: Reservation) !tools.Output {
-    if (m.money and r.dryRun()) {
+fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, input_json: []const u8, reserved: Reservation, dry: bool) !tools.Output {
+    if (m.money and dry) {
         releaseMoney(r, m, reserved);
         return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
     }
@@ -5332,17 +5594,295 @@ test "money_in_scheduled_runs_only_when_switched_on" {
     defer s.deinit();
     f.run.scheduled = true;
     f.run.asker = null;
+    f.run.money = .{ .scheduled = false, .budget_per_day = 30 };
     try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"one\",\"amount\":1}"));
     try f.e.script(2, model.textReply("refused"));
     var r = try f.say("buy");
     freeResult(&f.run, r);
-    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "not moved in scheduled runs") != null);
-    f.run.money = .{ .scheduled = true, .max_per_call = 10 };
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "money is not moved in unattended runs ([money] scheduled = off)") != null);
+    f.run.money = .{ .scheduled = true, .max_per_call = 10, .budget_per_day = 30 };
     try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"two\",\"amount\":2}"));
     try f.e.script(4, model.textReply("bought"));
     r = try f.say("buy");
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(4), "two") != null);
+    try t.expectEqual(@as(f64, 2), f.ledger.sum());
+}
+
+/// The fixture's run as a scheduled task's (`schedule:groceries`): nobody
+/// to ask, the fake server's echo a money tool (amount `amount`).
+fn unattendedRun(f: *Fix, money: config.Config.Money) void {
+    f.run.scheduled = true;
+    f.run.asker = null;
+    f.run.who = .{ .by = "schedule:groceries" };
+    f.run.money = money;
+}
+
+/// The gate lines of the fixture's log for tool `name`.
+fn gateLines(f: *Fix, name: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.splitScalar(u8, try f.logText(), '\n');
+    var tag_buf: [96]u8 = undefined;
+    const tag = try std.fmt.bufPrint(&tag_buf, "\"tool\":\"{s}\",\"decision\"", .{name});
+    while (it.next()) |l| if (std.mem.indexOf(u8, l, tag) != null) try out.print(f.e.arena.allocator(), "{s}\n", .{l});
+    return out.items;
+}
+
+test "no_budget_refuses_unattended_money" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    // the switch on (the default) and caps, no budget: nothing moves
+    unattendedRun(&f, .{ .max_per_call = 10, .max_per_day = 50 });
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":1}"));
+    try f.e.script(2, model.textReply("refused"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: no budget for automation: /money budget N a day sets one") != null);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
+}
+
+test "a_budget_spends_within_it_and_refuses_past_it_per_day_and_month" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    unattendedRun(&f, .{ .budget_per_day = 30, .budget_per_month = 40 });
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"one\",\"amount\":25}"));
+    try f.e.script(2, model.toolReply("tu_2", "fake__echo", "{\"text\":\"two\",\"amount\":10}"));
+    try f.e.script(3, model.toolReply("tu_3", "fake__echo", "{\"text\":\"three\",\"amount\":\"5\"}"));
+    try f.e.script(4, model.textReply("bought"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    // within it: made, unasked, counted as automation's
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "\"content\":\"one") != null or std.mem.indexOf(u8, try f.e.request(2), "one") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "refused by the gate: 10 more would be over the budget of 30 a day for automation (25 so far today)") != null);
+    try t.expectEqual(@as(f64, 30), f.ledger.sum());
+    const day = moneyDay(&f.run, util.nowSeconds(t.io));
+    try t.expectEqual(@as(f64, 30), f.ledger.spentAuto("fake", day));
+    // the gate lines carry the budget's numbers
+    const lines = try gateLines(&f, "fake__echo");
+    try t.expect(std.mem.indexOf(u8, lines, "\"decision\":\"allow\",\"why\":\"within the budget for automation: today 25 of 30; this month 25 of 40\"") != null);
+    try t.expect(std.mem.indexOf(u8, lines, "\"decision\":\"deny\",\"why\":\"10 more would be over the budget of 30 a day for automation (25 so far today)\"") != null);
+    try t.expect(std.mem.indexOf(u8, lines, "\"budget\":\"today 25 of 30; this month 25 of 40\"") != null);
+    // the next day the day's budget is new, the month's goes on
+    f.run.money.budget_per_day = 100;
+    try f.e.script(5, model.toolReply("tu_4", "fake__echo", "{\"text\":\"four\",\"amount\":15}"));
+    try f.e.script(6, model.textReply("no"));
+    const r2 = try f.say("buy more");
+    freeResult(&f.run, r2);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(6), "refused by the gate: 15 more would be over the budget of 40 a month for automation (30 so far this month)") != null);
+}
+
+test "a_servers_budget_overrides_money_sections_and_none_spends_nothing" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    unattendedRun(&f, .{ .budget_per_day = 100 });
+    // the server's own: 10 a day, whatever [money] says
+    _ = try fakeTools(&f, s, "money = echo\namount = amount\nbudget_per_day = 10\n");
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":20}"));
+    try f.e.script(2, model.textReply("no"));
+    var r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "20 more would be over the budget of 10 a day for automation (0 so far today)") != null);
+    // none: automation spends nothing there
+    _ = try fakeTools(&f, s, "money = echo\namount = amount\nbudget_per_month = none\n");
+    try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"x\",\"amount\":1}"));
+    try f.e.script(4, model.textReply("no"));
+    r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "refused by the gate: automation spends nothing at fake (budget = none in mcp.ini)") != null);
+    // the server's own month with [money]'s day: both hold
+    _ = try fakeTools(&f, s, "money = echo\namount = amount\nbudget_per_month = 3\n");
+    try f.e.script(5, model.toolReply("tu_3", "fake__echo", "{\"text\":\"x\",\"amount\":4}"));
+    try f.e.script(6, model.textReply("no"));
+    r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(6), "4 more would be over the budget of 3 a month for automation") != null);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
+}
+
+test "the_owners_spending_counts_only_toward_max_per_day" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    const money: config.Config.Money = .{ .max_per_day = 50, .budget_per_day = 30 };
+    f.run.money = money;
+    // the owner's 25, asked and allowed: not the budget's
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"mine\",\"amount\":25}"));
+    try f.e.script(2, model.textReply("ok"));
+    var r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(1, f.asked);
+    const day = moneyDay(&f.run, util.nowSeconds(t.io));
+    try t.expectEqual(@as(f64, 0), f.ledger.spentAuto("fake", day));
+    // automation's 20 is within its 30, and within the day's 50 (45)
+    const asker = f.run.asker;
+    unattendedRun(&f, money);
+    try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"auto\",\"amount\":20}"));
+    try f.e.script(4, model.textReply("ok"));
+    r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(@as(f64, 20), f.ledger.spentAuto("fake", day));
+    try t.expectEqual(@as(f64, 45), f.ledger.spent("fake", day));
+    // automation's counts toward max_per_day: the owner's next 10 is over it
+    f.run.scheduled = false;
+    f.run.asker = asker;
+    f.run.who = .{};
+    try f.e.script(5, model.toolReply("tu_3", "fake__echo", "{\"text\":\"mine\",\"amount\":10}"));
+    try f.e.script(6, model.textReply("ok"));
+    r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(6), "10 more would be over the cap of 50 per day (45 so far today)") != null);
+    try t.expectEqual(1, f.asked);
+}
+
+test "a_money_tool_with_no_amount_is_never_unattended" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    unattendedRun(&f, .{ .budget_per_day = 1000, .budget_per_month = 1000 });
+    // like the door unlock: amount = TOOL:none
+    _ = try fakeTools(&f, s, "money = echo, fail\namount = echo:amount, fail:none\n");
+    try f.e.script(1, model.toolReply("tu_1", "fake__fail", "{}"));
+    try f.e.script(2, model.textReply("no"));
+    var r = try f.say("unlock");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: a money tool that names no amount is never used unattended") != null);
+    // and one whose amount mcp.ini doesn't say
+    _ = try fakeTools(&f, s, "money = echo\n");
+    try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"x\",\"amount\":1}"));
+    try f.e.script(4, model.textReply("no"));
+    r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "refused by the gate: a money tool that names no amount is never used unattended") != null);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
+}
+
+test "outside_text_doesnt_spend_but_the_servers_own_results_do" {
+    var f: Fix = undefined;
+    try f.init("allow mcp fake/fail *\n");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    unattendedRun(&f, .{ .budget_per_day = 30 });
+    _ = try fakeTools(&f, s, "money = echo\namount = amount\n");
+    // the shop's own results first (its quote): the order spends
+    try f.e.script(1, model.toolReply("tu_1", "fake__fail", "{}"));
+    try f.e.script(2, model.toolReply("tu_2", "fake__echo", "{\"text\":\"order\",\"amount\":5}"));
+    try f.e.script(3, model.textReply("bought"));
+    var r = try f.say("price then buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(@as(f64, 5), f.ledger.sum());
+    // a run marked by a page: refused, whatever the budget
+    f.conv.deinit();
+    f.conv = .init(t.allocator);
+    f.run.start_marks = &.{ "page blog.example", "mcp fake" };
+    try f.e.script(4, model.toolReply("tu_3", "fake__echo", "{\"text\":\"invoice\",\"amount\":5}"));
+    try f.e.script(5, model.textReply("no"));
+    r = try f.say("pay the invoice the page names");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(5), "refused by the gate: it read outside text first (page blog.example), and outside text doesn't spend") != null);
+    try t.expectEqual(@as(f64, 5), f.ledger.sum());
+}
+
+test "an_amount_of_0_is_never_paid_unattended" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    unattendedRun(&f, .{ .budget_per_day = 30 });
+    // a server may read 0 as "all"
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":0}"));
+    try f.e.script(2, model.textReply("no"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: an amount of 0 is never paid unattended (a server may read it as all)") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "home=") == null);
+}
+
+test "paused_automation_spends_nothing" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    var sw: Switches = .{};
+    f.run.switches = &sw;
+    unattendedRun(&f, .{ .budget_per_day = 30 });
+    sw.money_paused.store(true, .release);
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":1}"));
+    try f.e.script(2, model.textReply("no"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: automation spending is paused (/money resume restarts it)") != null);
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
+    // logged with the budget's numbers, as every unattended money decision
+    try t.expect(std.mem.indexOf(u8, try gateLines(&f, "fake__echo"), "\"budget\":\"today 0 of 30; this month 0\"") != null);
+}
+
+test "two_calls_cannot_both_pass_the_budget" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    unattendedRun(&f, .{ .budget_per_day = 30 });
+    const now_s = util.nowSeconds(t.io);
+    _ = try f.ledger.reserve(t.io, "fake", moneyDay(&f.run, now_s), 25, true);
+    const Racer = struct {
+        run: Run,
+        passed: bool = false,
+        fn go(x: *@This(), m: *const McpTool, at: i64) void {
+            var arena: std.heap.ArenaAllocator = .init(t.allocator);
+            defer arena.deinit();
+            var res: Reservation = .{};
+            var pass: MoneyPass = .{};
+            x.passed = moneyCheck(&x.run, arena.allocator(), m, "{\"amount\":5,\"text\":\"x\"}", "fake/echo {\"amount\":5,\"text\":\"x\"}", at, &res, &pass) == null;
+        }
+    };
+    var one: Racer = .{ .run = f.run };
+    var two: Racer = .{ .run = f.run };
+    const m = &f.mcp_tools[0];
+    const th1 = try std.Thread.spawn(.{}, Racer.go, .{ &one, m, now_s });
+    const th2 = try std.Thread.spawn(.{}, Racer.go, .{ &two, m, now_s });
+    th1.join();
+    th2.join();
+    // 25 + 5 fits, 25 + 5 + 5 does not: exactly one passed
+    try t.expect(one.passed != two.passed);
+    try t.expectEqual(@as(f64, 30), f.ledger.spentAuto("fake", moneyDay(&f.run, now_s)));
+}
+
+test "harness_jobs_but_the_reorder_move_no_money" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    unattendedRun(&f, .{ .budget_per_day = 30 });
+    f.run.who = .{ .by = "harness:people", .agent = "" };
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":1}"));
+    try f.e.script(2, model.textReply("no"));
+    var r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: harness's own jobs move no money (the reorder alone, within the budget)") != null);
+    f.run.who = .{ .by = "harness:reorder", .agent = "" };
+    try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"order\",\"amount\":2}"));
+    try f.e.script(4, model.textReply("ordered"));
+    r = try f.say("order");
+    freeResult(&f.run, r);
     try t.expectEqual(@as(f64, 2), f.ledger.sum());
 }
 
@@ -5390,7 +5930,7 @@ test "money_call_that_fails_still_counts" {
     try t.expectEqual(@as(f64, 7), f.ledger.sum());
 }
 
-test "unattended_money_needs_a_cap" {
+test "unattended_money_needs_a_budget" {
     var f: Fix = undefined;
     try f.init("");
     defer f.deinit();
@@ -5401,9 +5941,16 @@ test "unattended_money_needs_a_cap" {
     f.run.money = .{ .scheduled = true };
     try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":1}"));
     try f.e.script(2, model.textReply("ok"));
-    const r = try f.say("buy");
+    var r = try f.say("buy");
     freeResult(&f.run, r);
-    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "needs max_per_call or max_per_day") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "no budget for automation") != null);
+    // a budget alone bounds it: no cap needed
+    f.run.money = .{ .scheduled = true, .budget_per_month = 5 };
+    try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"x\",\"amount\":1}"));
+    try f.e.script(4, model.textReply("ok"));
+    r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expectEqual(@as(f64, 1), f.ledger.sum());
 }
 
 test "amount_field_can_differ_per_tool" {
@@ -5522,14 +6069,14 @@ test "none_in_a_servers_section_lifts_config_inis_cap_and_says_so" {
     // over config.ini's caps, and asked, not refused
     try t.expectEqual(1, f.asked);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "over the cap") == null);
-    // with no cap left, a scheduled run still moves no money there
+    // with no cap left and no budget, a scheduled run still moves no money there
     f.run.scheduled = true;
     f.run.money.scheduled = true;
     try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"x\",\"amount\":5}"));
     try f.e.script(4, model.textReply("ok"));
     const r2 = try f.say("buy");
     freeResult(&f.run, r2);
-    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "needs max_per_call or max_per_day") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(4), "no budget for automation") != null);
 }
 
 test "each_server_keeps_its_own_day_total" {
@@ -5572,7 +6119,7 @@ test "money_ledger_keeps_a_total_per_server_and_reads_the_old_file" {
     try t.expectEqual(@as(f64, 40), l.spent("broker", 20000));
     try t.expectEqual(@as(f64, 40), l.spent("other", 20000));
     try t.expectEqual(@as(f64, 0), l.spent("broker", 20001));
-    _ = try l.reserve(t.io, "broker", 20000, 5);
+    _ = try l.reserve(t.io, "broker", 20000, 5, false);
     var again: MoneyLedger = .{ .path = p };
     again.load(t.io);
     try t.expectEqual(@as(f64, 45), again.spent("broker", 20000));
@@ -5581,12 +6128,111 @@ test "money_ledger_keeps_a_total_per_server_and_reads_the_old_file" {
     try t.expectError(error.FileNotFound, tmp.dir.statFile(t.io, "money.tmp", .{}));
     const first = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(1024));
     defer t.allocator.free(first);
-    try t.expectEqualStrings("* 20000 40\nbroker 20000 5\n", first);
+    // today's lines as before; since budgets a month's line follows
+    var mb: [64]u8 = undefined;
+    try t.expectEqualStrings(try std.fmt.bufPrint(&mb, "* 20000 40\nbroker 20000 5\nall:month broker {d} 5\n", .{money_mod.monthOf(20000)}), first);
     // a day that is over is not written again
-    _ = try again.reserve(t.io, "broker", 20001, 1);
+    _ = try again.reserve(t.io, "broker", 20001, 1, false);
     const later = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(1024));
     defer t.allocator.free(later);
-    try t.expectEqualStrings("broker 20001 1\n", later);
+    try t.expectEqualStrings(try std.fmt.bufPrint(&mb, "broker 20001 1\nall:month broker {d} 6\n", .{money_mod.monthOf(20001)}), later);
+}
+
+test "the_ledger_keeps_automations_day_and_month_apart" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const p = try std.fs.path.join(t.allocator, &.{ dir, "money" });
+    defer t.allocator.free(p);
+    const day: i64 = 20781; // 2026-11-24
+    const m = money_mod.monthOf(day);
+    var l: MoneyLedger = .{ .path = p };
+    // the owner's 5, automation's 7
+    _ = try l.reserve(t.io, "shop", day, 5, false);
+    const r7 = try l.reserve(t.io, "shop", day, 7, true);
+    try t.expectEqual(@as(f64, 12), l.spent("shop", day));
+    try t.expectEqual(@as(f64, 7), l.spentAuto("shop", day));
+    try t.expectEqual(@as(f64, 12), l.spentMonth("shop", m));
+    try t.expectEqual(@as(f64, 7), l.spentAutoMonth("shop", m));
+    // a line each, each kind its own first word
+    const text = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(4096));
+    defer t.allocator.free(text);
+    var want_buf: [256]u8 = undefined;
+    try t.expectEqualStrings(try std.fmt.bufPrint(&want_buf, "shop {d} 12\nauto:day shop {d} 7\nauto:month shop {d} 7\nall:month shop {d} 12\n", .{ day, day, m, m }), text);
+    // read back
+    var again: MoneyLedger = .{ .path = p };
+    again.load(t.io);
+    try t.expectEqual(null, again.trouble());
+    try t.expectEqual(@as(f64, 12), again.spent("shop", day));
+    try t.expectEqual(@as(f64, 7), again.spentAuto("shop", day));
+    try t.expectEqual(@as(f64, 7), again.spentAutoMonth("shop", m));
+    try t.expectEqual(@as(f64, 12), again.spentMonth("shop", m));
+    // taken back from each
+    try again.release(t.io, "shop", r7);
+    try t.expectEqual(@as(f64, 5), again.spent("shop", day));
+    try t.expectEqual(@as(f64, 0), again.spentAuto("shop", day));
+    try t.expectEqual(@as(f64, 0), again.spentAutoMonth("shop", m));
+    try t.expectEqual(@as(f64, 5), again.spentMonth("shop", m));
+    // the next day: its day starts at 0, the month goes on
+    _ = try again.reserve(t.io, "shop", day + 1, 3, true);
+    try t.expectEqual(@as(f64, 3), again.spentAuto("shop", day + 1));
+    try t.expectEqual(@as(f64, 3), again.spentAutoMonth("shop", m));
+    try t.expectEqual(@as(f64, 8), again.spentMonth("shop", m));
+    // another month starts at 0
+    try t.expectEqual(@as(f64, 0), again.spentAutoMonth("shop", money_mod.monthOf(day + 7)));
+    // a file from before (three fields, and the oldest two) reads as it did
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "money", .data = "shop 20781 4\r\n20781 1\r\n" });
+    var old: MoneyLedger = .{ .path = p };
+    old.load(t.io);
+    try t.expectEqual(null, old.trouble());
+    try t.expectEqual(@as(f64, 5), old.spent("shop", day));
+    try t.expectEqual(@as(f64, 0), old.spentAuto("shop", day));
+    // four fields with another first word, or five: damage
+    for ([_][]const u8{ "auto:week shop 20781 4\n", "auto:day shop 20781 4 5\n", "auto:day shop 20781\n" }) |bad| {
+        try tmp.dir.writeFile(t.io, .{ .sub_path = "money", .data = bad });
+        var d: MoneyLedger = .{ .path = p };
+        d.load(t.io);
+        try t.expect(std.mem.indexOf(u8, d.trouble() orelse "", "damaged at line 1") != null);
+    }
+}
+
+test "month_lines_are_kept_apart_from_the_day_slots" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const p = try std.fs.path.join(t.allocator, &.{ dir, "money" });
+    defer t.allocator.free(p);
+    const day: i64 = 20781;
+    const m = money_mod.monthOf(day);
+    var l: MoneyLedger = .{ .path = p };
+    var name_buf: [32]u8 = undefined;
+    // every server's slots taken, each kind's: four lines a server
+    for (0..MoneyLedger.max_servers) |i| _ = try l.reserve(t.io, try std.fmt.bufPrint(&name_buf, "server-{d}", .{i}), day, 2, true);
+    var again: MoneyLedger = .{ .path = p };
+    again.load(t.io);
+    try t.expectEqual(null, again.trouble());
+    for (0..MoneyLedger.max_servers) |i| {
+        const n = try std.fmt.bufPrint(&name_buf, "server-{d}", .{i});
+        try t.expectEqual(@as(f64, 2), again.spent(n, day));
+        try t.expectEqual(@as(f64, 2), again.spentAutoMonth(n, m));
+    }
+    // the next day's lines take the day slots; the month's are kept
+    for (0..MoneyLedger.max_servers) |i| _ = try again.reserve(t.io, try std.fmt.bufPrint(&name_buf, "server-{d}", .{i}), day + 1, 1, false);
+    var third: MoneyLedger = .{ .path = p };
+    third.load(t.io);
+    try t.expectEqual(@as(f64, 2), third.spentAutoMonth("server-63", m));
+    try t.expectEqual(@as(f64, 3), third.spentMonth("server-63", m));
+    try t.expectEqual(@as(f64, 0), third.spentAuto("server-63", day + 1));
+    // a new month: last month's lines are not written again
+    const next_month: i64 = 20788; // 2026-12-01
+    _ = try third.reserve(t.io, "server-0", next_month, 1, true);
+    const text = try tmp.dir.readFileAlloc(t.io, "money", t.allocator, .limited(1 << 20));
+    defer t.allocator.free(text);
+    var mb: [32]u8 = undefined;
+    try t.expect(std.mem.indexOf(u8, text, try std.fmt.bufPrint(&mb, " {d} ", .{m})) == null);
+    try t.expectEqual(@as(f64, 1), third.spentAutoMonth("server-0", money_mod.monthOf(next_month)));
 }
 
 test "the_money_record_holds_every_server_however_large_its_total" {
@@ -5599,7 +6245,7 @@ test "the_money_record_holds_every_server_however_large_its_total" {
     var l: MoneyLedger = .{ .path = p };
     var name_buf: [32]u8 = undefined;
     // with no cap nothing bounds an amount: the largest still fits
-    for (0..MoneyLedger.max_servers) |i| _ = try l.reserve(t.io, try std.fmt.bufPrint(&name_buf, "server-{d}", .{i}), 20000, std.math.floatMax(f64));
+    for (0..MoneyLedger.max_servers) |i| _ = try l.reserve(t.io, try std.fmt.bufPrint(&name_buf, "server-{d}", .{i}), 20000, std.math.floatMax(f64), false);
     var again: MoneyLedger = .{ .path = p };
     again.load(t.io);
     try t.expectEqual(null, again.trouble());
@@ -5636,14 +6282,14 @@ test "a_release_for_a_day_that_is_over_leaves_today_alone" {
     var l: MoneyLedger = .{};
     // 30 counted late on day 100 while the owner is asked; after midnight
     // another run moves 5
-    const late = try l.reserve(t.io, "broker", 100, 30);
-    _ = try l.reserve(t.io, "broker", 101, 5);
+    const late = try l.reserve(t.io, "broker", 100, 30, false);
+    _ = try l.reserve(t.io, "broker", 101, 5, false);
     // the owner says no after midnight: day 100's 30 is taken back
     try l.release(t.io, "broker", late);
     try t.expectEqual(@as(f64, 5), l.spent("broker", 101));
     // a run that read the clock just before midnight but counts after
     // another run did counts toward the new day, not over it
-    const behind = try l.reserve(t.io, "broker", 100, 2);
+    const behind = try l.reserve(t.io, "broker", 100, 2, false);
     try t.expectEqual(101, behind.day);
     try t.expectEqual(@as(f64, 7), l.spent("broker", 101));
     // and a total never goes below 0
@@ -7123,14 +7769,14 @@ test "money_in_trigger_runs_is_refused_while_triggers_is_off" {
     f.run.scheduled = true;
     f.run.asker = null;
     f.run.who = .{ .by = "trigger:btc" };
-    f.run.money = .{ .scheduled = true, .max_per_call = 10 };
+    f.run.money = .{ .scheduled = true, .triggers = false, .max_per_call = 10, .budget_per_day = 30 };
     try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"one\",\"amount\":1}"));
     try f.e.script(2, model.textReply("refused"));
     var r = try f.say("buy");
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "money is not moved in runs a trigger starts ([money] triggers = off)") != null);
     try t.expectEqual(@as(f64, 0), f.ledger.sum());
-    // on: as in scheduled runs, within the caps
+    // on: as in scheduled runs, within the caps and the budget
     f.run.money.triggers = true;
     try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"two\",\"amount\":2}"));
     try f.e.script(4, model.textReply("bought"));
@@ -7164,14 +7810,14 @@ test "money_in_agent_steps_is_refused_while_workflows_is_off" {
     f.run.scheduled = true;
     f.run.asker = null;
     f.run.who = .{ .by = "workflow:shop/buy" };
-    f.run.money = .{ .scheduled = true, .max_per_call = 10 };
+    f.run.money = .{ .scheduled = true, .workflows = false, .max_per_call = 10, .budget_per_day = 30 };
     try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"one\",\"amount\":1}"));
     try f.e.script(2, model.textReply("refused"));
     var r = try f.say("buy");
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(2), "money is not moved in a workflow's agent steps ([money] workflows = off)") != null);
     try t.expectEqual(@as(f64, 0), f.ledger.sum());
-    // on: as in scheduled runs, within the caps
+    // on: as in scheduled runs, within the caps and the budget
     f.run.money.workflows = true;
     try f.e.script(3, model.toolReply("tu_2", "fake__echo", "{\"text\":\"two\",\"amount\":2}"));
     try f.e.script(4, model.textReply("bought"));
