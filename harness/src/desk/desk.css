@@ -194,6 +194,9 @@ dialog::backdrop { background: rgba(7, 7, 13, 0.75); }
 .consent { display: flex; align-items: flex-start; gap: 10px; margin: 10px 0 4px; font-size: 14px; }
 .consent input { margin-top: 3px; width: 18px; height: 18px; accent-color: var(--magenta); }
 .fine { margin: 4px 0 0; font-size: 13px; color: var(--muted); }
+.tune { margin-top: 10px; }
+.tune label { font-size: 14px; color: var(--soft); }
+.disclose { margin: 8px 0 0; font-size: 14px; color: var(--soft); }
 .outcome { margin: 10px 0 0; font-size: 14px; color: var(--soft); }
 .outcome.bad { color: #FF8A7D; }
 .dlg select { height: 44px; padding: 0 10px; background: var(--bg); border: 1px solid var(--line-hi); min-width: 240px; }

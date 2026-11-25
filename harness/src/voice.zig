@@ -117,6 +117,8 @@ pub const Error = error{
     Upstream,
     /// The answer had no `text`.
     BadReply,
+    /// A speech answer had no audio harness can play.
+    NoAudio,
     /// /stop came while it was under way.
     Stopped,
 } || http.Error;
@@ -258,9 +260,28 @@ pub const Transcriber = struct {
     }
 };
 
-/// The desk's voice: a provider's OpenAI-format `POST {url}/audio/speech`
-/// (`{"model","input","voice","response_format":"mp3"}`), fetched by
-/// harness, so the key never reaches the page.
+/// What a provider read aloud: the bytes, and what they are.
+pub const Audio = struct { bytes: []const u8, content_type: []const u8 };
+
+/// A kind's speech model and voice, when `[desk]` names none (checked
+/// 2026-11-25).
+pub const SpeakDefaults = struct { model: []const u8, voice: []const u8 };
+
+pub fn speakDefaults(api: model.Api) ?SpeakDefaults {
+    return switch (api) {
+        .openai => .{ .model = "tts-1", .voice = "alloy" },
+        // Schedar ("Even"): a steady, unhurried voice for the butler
+        .gemini => .{ .model = "gemini-3.8-flash-lite-tts", .voice = "Schedar" },
+        .anthropic => null,
+    };
+}
+
+/// The desk's voice, fetched by harness so the key never reaches the page:
+/// - api = openai: `POST {url}/audio/speech`
+///   (`{"model","input","voice","response_format":"mp3"}`), MP3 back;
+/// - api = gemini: `POST {url}/models/MODEL:generateContent` with audio out
+///   and a prebuilt voice; the answer's inline audio as WAV (Gemini 3.8
+///   sends WAV, older models raw 16-bit PCM, which is wrapped here).
 pub const Speaker = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -273,9 +294,12 @@ pub const Speaker = struct {
 
     /// The most audio taken back.
     pub const max_audio = 10 << 20;
+    /// The most of a Gemini answer read (its audio is base64 in JSON).
+    pub const max_answer = 16 << 20;
 
-    /// `text` read aloud, as MP3 bytes in `a`.
-    pub fn speak(sp: *Speaker, a: std.mem.Allocator, text: []const u8, stop: ?*const std.atomic.Value(bool)) Error![]const u8 {
+    /// `text` read aloud, in `a`.
+    pub fn speak(sp: *Speaker, a: std.mem.Allocator, text: []const u8, stop: ?*const std.atomic.Value(bool)) Error!Audio {
+        sp.last_error_len = 0;
         const p = sp.provider;
         if (p.url.len == 0) return error.NoUrl;
         if (!p.hasKey()) return error.NoKey;
@@ -284,17 +308,32 @@ pub const Speaker = struct {
         var client = http.Client.init(sp.gpa, sp.io, target);
         defer client.deinit();
         var body: std.ArrayList(u8) = .empty;
-        try body.appendSlice(a, "{\"model\":");
-        try util.jsonString(&body, a, sp.model);
-        try body.appendSlice(a, ",\"input\":");
-        try util.jsonString(&body, a, text);
-        try body.appendSlice(a, ",\"voice\":");
-        try util.jsonString(&body, a, sp.voice);
-        try body.appendSlice(a, ",\"response_format\":\"mp3\"}");
+        const path: []const u8 = switch (p.api) {
+            .openai => blk: {
+                try body.appendSlice(a, "{\"model\":");
+                try util.jsonString(&body, a, sp.model);
+                try body.appendSlice(a, ",\"input\":");
+                try util.jsonString(&body, a, text);
+                try body.appendSlice(a, ",\"voice\":");
+                try util.jsonString(&body, a, sp.voice);
+                try body.appendSlice(a, ",\"response_format\":\"mp3\"}");
+                break :blk "/audio/speech";
+            },
+            .gemini => blk: {
+                try body.appendSlice(a, "{\"contents\":[{\"parts\":[{\"text\":");
+                try util.jsonString(&body, a, text);
+                try body.appendSlice(a, "}]}],\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":");
+                try util.jsonString(&body, a, sp.voice);
+                try body.appendSlice(a, "}}}}}");
+                break :blk try std.fmt.allocPrint(a, "/models/{s}:generateContent", .{try pathSegment(a, sp.model)});
+            },
+            // config.ini lets no Anthropic-format provider speak
+            .anthropic => return error.Rejected,
+        };
         var hs: [model.max_headers + 1]std.http.Header = undefined;
         var n: usize = 0;
-        if (p.auth == .x_api_key) {
-            hs[n] = .{ .name = "x-api-key", .value = p.key };
+        if (model.keyHeader(p.auth)) |name| {
+            hs[n] = .{ .name = name, .value = p.key };
             n += 1;
         }
         for (p.headers[0..@min(p.headers.len, model.max_headers)]) |h| {
@@ -302,20 +341,26 @@ pub const Speaker = struct {
             n += 1;
         }
         var resp = client.send(.{
-            .path = "/audio/speech",
+            .path = path,
             .body = body.items,
             .content_type = "application/json",
-            .accept = "audio/mpeg",
+            .accept = if (p.api == .gemini) "application/json" else "audio/mpeg",
             .key = if (p.auth == .bearer) p.key else null,
             .headers = hs[0..n],
             .resend = false,
             .limits = .{ .idle_ms = @min(60_000, sp.call_ms), .total_ms = sp.call_ms, .stop = stop },
         }) catch |e| return if (Transcriber.stopped(stop)) error.Stopped else e;
         defer resp.deinit();
-        const got = resp.readAll(a, max_audio) catch |e| return if (Transcriber.stopped(stop)) error.Stopped else e;
+        const got = resp.readAll(a, if (p.api == .gemini) max_answer else max_audio) catch |e| return if (Transcriber.stopped(stop)) error.Stopped else e;
         if (Transcriber.stopped(stop)) return error.Stopped;
-        switch (resp.status) {
-            200 => return got,
+        if (resp.status != 200) return sp.statusError(resp.status, got);
+        if (p.api == .gemini) return sp.geminiAudio(a, got);
+        return .{ .bytes = got, .content_type = "audio/mpeg" };
+    }
+
+    /// An error status as every kind says it.
+    fn statusError(sp: *Speaker, status: u16, got: []const u8) Error {
+        switch (status) {
             401, 403 => {
                 sp.note(got);
                 return error.KeyRefused;
@@ -331,6 +376,39 @@ pub const Speaker = struct {
                 return error.Upstream;
             },
         }
+    }
+
+    /// The audio of a Gemini answer: its first WAV part as it is, else
+    /// its raw PCM parts joined and wrapped as WAV; none: NoAudio, with
+    /// Google's reason when it gave one.
+    fn geminiAudio(sp: *Speaker, a: std.mem.Allocator, got: []const u8) Error!Audio {
+        const v = jv.parse(a, got) orelse return error.NoAudio;
+        var pcm: std.ArrayList(u8) = .empty;
+        var rate: u32 = 24000;
+        for (jv.arr(jv.at(v, &.{ "candidates", "0", "content", "parts" })) orelse &.{}) |part| {
+            const data = jv.get(part, "inlineData") orelse continue;
+            const mime = jv.str(jv.get(data, "mimeType")) orelse "";
+            const bytes = try base64(a, jv.str(jv.get(data, "data")) orelse continue) orelse continue;
+            if (bytes.len == 0) continue;
+            if (isWav(bytes)) {
+                if (pcm.items.len == 0) return .{ .bytes = bytes, .content_type = "audio/wav" };
+                continue;
+            }
+            if (std.ascii.startsWithIgnoreCase(mime, "audio/l16") or std.ascii.startsWithIgnoreCase(mime, "audio/pcm")) {
+                if (pcm.items.len == 0) rate = pcmRate(mime);
+                try pcm.appendSlice(a, bytes);
+            }
+        }
+        if (pcm.items.len >= 2) return .{ .bytes = try wav(a, pcm.items, rate), .content_type = "audio/wav" };
+        if (jv.str(jv.at(v, &.{ "candidates", "0", "finishReason" }))) |r| {
+            sp.say("finishReason {s}", .{r});
+        } else if (jv.str(jv.at(v, &.{ "promptFeedback", "blockReason" }))) |r| sp.say("blockReason {s}", .{r});
+        return error.NoAudio;
+    }
+
+    fn say(sp: *Speaker, comptime fmt: []const u8, args: anytype) void {
+        const s = std.fmt.bufPrint(&sp.last_error, fmt, args) catch sp.last_error[0..];
+        sp.last_error_len = s.len;
     }
 
     fn note(sp: *Speaker, body: []const u8) void {
@@ -350,10 +428,77 @@ pub const Speaker = struct {
             error.KeyRefused => std.fmt.allocPrint(a, "{s} refused the key stored as {s}.", .{ p, sp.provider.key_name }),
             error.BudgetSpent => std.fmt.allocPrint(a, "Speech budget used up at {s}.", .{p}),
             error.RateLimited => std.fmt.allocPrint(a, "Speech is rate limited at {s}; try again later.", .{p}),
+            error.NoAudio => if (msg.len > 0) std.fmt.allocPrint(a, "Speech failed at {s}: its answer had no audio ({s}).", .{ p, msg }) else std.fmt.allocPrint(a, "Speech failed at {s}: its answer had no audio.", .{p}),
             else => if (msg.len > 0) std.fmt.allocPrint(a, "Speech failed at {s}: {s} {s}", .{ p, @errorName(e), msg }) else std.fmt.allocPrint(a, "Speech failed at {s}: {s}", .{ p, @errorName(e) }),
         } catch "Speech failed.";
     }
 };
+
+/// Whether `bytes` are a WAV file (its RIFF header says so).
+fn isWav(bytes: []const u8) bool {
+    return bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WAVE");
+}
+
+/// `text` decoded as base64 (padded or not, standard or URL-safe); null
+/// when it isn't.
+fn base64(a: std.mem.Allocator, text: []const u8) error{OutOfMemory}!?[]u8 {
+    inline for (.{ std.base64.standard.Decoder, std.base64.standard_no_pad.Decoder, std.base64.url_safe.Decoder, std.base64.url_safe_no_pad.Decoder }) |d| {
+        if (d.calcSizeForSlice(text)) |size| {
+            const out = try a.alloc(u8, size);
+            if (d.decode(out, text)) |_| return out else |_| {}
+        } else |_| {}
+    }
+    return null;
+}
+
+/// Raw 16-bit little-endian mono PCM at `rate` as a WAV file (a 44-byte
+/// header); half a sample at the end is dropped.
+pub fn wav(a: std.mem.Allocator, pcm: []const u8, rate: u32) error{OutOfMemory}![]u8 {
+    // at most Speaker.max_answer is read: it fits
+    const n: u32 = @intCast(pcm.len & ~@as(usize, 1));
+    const out = try a.alloc(u8, 44 + n);
+    @memcpy(out[0..4], "RIFF");
+    std.mem.writeInt(u32, out[4..8], 36 + n, .little);
+    @memcpy(out[8..16], "WAVEfmt ");
+    std.mem.writeInt(u32, out[16..20], 16, .little);
+    std.mem.writeInt(u16, out[20..22], 1, .little); // PCM
+    std.mem.writeInt(u16, out[22..24], 1, .little); // mono
+    std.mem.writeInt(u32, out[24..28], rate, .little);
+    std.mem.writeInt(u32, out[28..32], rate * 2, .little);
+    std.mem.writeInt(u16, out[32..34], 2, .little);
+    std.mem.writeInt(u16, out[34..36], 16, .little);
+    @memcpy(out[36..40], "data");
+    std.mem.writeInt(u32, out[40..44], n, .little);
+    @memcpy(out[44..], pcm[0..n]);
+    return out;
+}
+
+/// The sample rate a raw PCM type names (`audio/L16;codec=pcm;rate=24000`);
+/// 24000 when it names none, or one outside 8000 to 96000.
+pub fn pcmRate(mime: []const u8) u32 {
+    var it = std.mem.splitScalar(u8, mime, ';');
+    _ = it.next();
+    while (it.next()) |param| {
+        const kv = std.mem.trim(u8, param, " \t");
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, kv[0..eq], " \t"), "rate")) continue;
+        const r = std.fmt.parseInt(u32, std.mem.trim(u8, kv[eq + 1 ..], " \t\""), 10) catch return 24000;
+        return if (r >= 8000 and r <= 96000) r else 24000;
+    }
+    return 24000;
+}
+
+/// `s` as one segment of a URL path: every byte but A-Z a-z 0-9 - . _ ~
+/// percent-encoded.
+fn pathSegment(a: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (s) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '.' or ch == '_' or ch == '~') {
+            try out.append(a, ch);
+        } else try out.print(a, "%{X:0>2}", .{ch});
+    }
+    return out.items;
+}
 
 // ---- tests ----
 
@@ -455,7 +600,8 @@ test "speaker_posts_json_and_returns_audio" {
     const a = e.arena.allocator();
     var sp: Speaker = .{ .gpa = t.allocator, .io = t.io, .provider = try e.provider("tts", .openai, .bearer, "sk-speech-key-1"), .model = "tts-1", .voice = "onyx" };
     const audio = try sp.speak(a, "Three flats match.", null);
-    try t.expectEqualStrings("ID3Three flats match.", audio);
+    try t.expectEqualStrings("ID3Three flats match.", audio.bytes);
+    try t.expectEqualStrings("audio/mpeg", audio.content_type);
     const text = try e.tmp.dir.readFileAlloc(t.io, "speech-requests/001.json", a, .unlimited);
     const req = jv.parse(a, text).?;
     try t.expectEqualStrings("/v1/audio/speech", jv.str(jv.get(req, "target")).?);
@@ -490,4 +636,203 @@ test "the_quoted_line_is_one_line" {
     try t.expectEqualStrings("\"turn the heating up a bit in the living room\"", try quoted(a, "turn the heating up a bit in the living room"));
     try t.expectEqualStrings("\"one. two three\"", try quoted(a, "  one.\n\ttwo   three \r\n"));
     try t.expectEqualStrings("\"\"", try quoted(a, " \n "));
+}
+
+fn gemSpeaker(e: *model.TestEnv, auth: model.Auth, key: []const u8) !Speaker {
+    var p = try e.provider("gemini", .gemini, auth, key);
+    p.url = try std.fmt.allocPrint(e.arena.allocator(), "{s}/v1beta", .{try e.url()});
+    return .{ .gpa = t.allocator, .io = t.io, .provider = p, .model = "gemini-3.8-flash-lite-tts", .voice = "Schedar" };
+}
+
+fn gemScript(e: *model.TestEnv, n: u32, body: []const u8) !void {
+    const name = try std.fmt.allocPrint(e.arena.allocator(), "gemini/{d:0>3}.json", .{n});
+    try e.tmp.dir.writeFile(t.io, .{ .sub_path = name, .data = body });
+}
+
+fn gemRequest(e: *model.TestEnv, n: u32) !jv.Value {
+    const name = try std.fmt.allocPrint(e.arena.allocator(), "gemini-requests/{d:0>3}.json", .{n});
+    const text = try e.tmp.dir.readFileAlloc(t.io, name, e.arena.allocator(), .unlimited);
+    return jv.parse(e.arena.allocator(), text) orelse error.TestUnexpectedResult;
+}
+
+/// An answer of Gemini's with these inline parts (mime type, raw bytes).
+fn gemAnswer(a: std.mem.Allocator, parts: []const [2][]const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, "{\"answer\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[");
+    for (parts, 0..) |p, i| {
+        if (i > 0) try out.append(a, ',');
+        const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(p[1].len));
+        try out.print(a, "{{\"inlineData\":{{\"mimeType\":\"{s}\",\"data\":\"{s}\"}}}}", .{ p[0], std.base64.standard.Encoder.encode(b64, p[1]) });
+    }
+    try out.appendSlice(a, "]},\"finishReason\":\"STOP\"}]}}");
+    return out.items;
+}
+
+test "gemini_speech_posts_generate_content_and_wraps_pcm_as_wav" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    var sp = try gemSpeaker(&e, .x_goog_api_key, "gm-test-key-1");
+    const got = try sp.speak(a, "Three flats match.", null);
+    try t.expectEqualStrings("audio/wav", got.content_type);
+    // the stand-in's PCM is the text's 18 bytes, at 24 kHz
+    try t.expectEqual(44 + 18, got.bytes.len);
+    try t.expectEqualStrings("RIFF", got.bytes[0..4]);
+    try t.expectEqualStrings("WAVE", got.bytes[8..12]);
+    try t.expectEqual(24000, std.mem.readInt(u32, got.bytes[24..28], .little));
+    try t.expectEqualStrings("Three flats match.", got.bytes[44..]);
+    const req = try gemRequest(&e, 1);
+    try t.expectEqualStrings("/v1beta/models/gemini-3.8-flash-lite-tts:generateContent", jv.str(jv.get(req, "target")).?);
+    try t.expectEqualStrings("gm-test-key-1", jv.str(jv.at(req, &.{ "headers", "x-goog-api-key" })).?);
+    try t.expect(jv.at(req, &.{ "headers", "Authorization" }) == null);
+    try t.expectEqualStrings(
+        "{\"contents\":[{\"parts\":[{\"text\":\"Three flats match.\"}]}],\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":\"Schedar\"}}}}}",
+        jv.str(jv.get(req, "body")).?,
+    );
+}
+
+test "gemini_wav_passes_through_and_pcm_is_wrapped" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    var sp = try gemSpeaker(&e, .x_goog_api_key, "gm-test-key-1");
+    // Gemini 3.8's own WAV: as it came, never wrapped twice
+    try gemScript(&e, 1, "{\"mime\":\"audio/wav\"}");
+    const w = try sp.speak(a, "One.", null);
+    try t.expectEqualStrings("audio/wav", w.content_type);
+    try t.expectEqual(44 + 4, w.bytes.len);
+    try t.expectEqual(1, std.mem.count(u8, w.bytes, "RIFF"));
+    try t.expectEqualStrings("One.", w.bytes[44..]);
+    // older models' raw PCM in two parts at 16 kHz: joined, then wrapped
+    try gemScript(&e, 2, try gemAnswer(a, &.{ .{ "audio/L16;codec=pcm;rate=16000", "ab" }, .{ "audio/L16;codec=pcm;rate=16000", "cd" } }));
+    const p = try sp.speak(a, "x", null);
+    try t.expectEqualStrings("abcd", p.bytes[44..]);
+    try t.expectEqual(16000, std.mem.readInt(u32, p.bytes[24..28], .little));
+    try t.expectEqual(1, std.mem.count(u8, p.bytes, "RIFF"));
+    // a WAV said to be something else is still known by its header
+    const riff = "RIFF\x28\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\x04\x00\x00\x00wxyz";
+    try gemScript(&e, 3, try gemAnswer(a, &.{.{ "application/octet-stream", riff }}));
+    try t.expectEqualStrings(riff, (try sp.speak(a, "x", null)).bytes);
+}
+
+test "gemini_without_audio_says_why" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    var sp = try gemSpeaker(&e, .x_goog_api_key, "gm-test-key-1");
+    const Case = struct { script: []const u8, said: []const u8 };
+    const cases = [_]Case{
+        .{ .script = "{\"answer\":{\"candidates\":[{\"finishReason\":\"OTHER\"}]}}", .said = "Speech failed at gemini: its answer had no audio (finishReason OTHER)." },
+        .{ .script = "{\"answer\":{\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}}", .said = "Speech failed at gemini: its answer had no audio (blockReason SAFETY)." },
+        .{ .script = "{\"answer\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"I can't.\"}]},\"finishReason\":\"STOP\"}]}}", .said = "Speech failed at gemini: its answer had no audio (finishReason STOP)." },
+        .{ .script = "{\"answer\":{\"candidates\":[{\"content\":{\"parts\":[{\"inlineData\":{\"mimeType\":\"audio/L16;rate=24000\",\"data\":\"!!!\"}}]}}]}}", .said = "Speech failed at gemini: its answer had no audio." },
+        .{ .script = "{\"answer\":{\"candidates\":[{\"content\":{\"parts\":[{\"inlineData\":{\"mimeType\":\"audio/mulaw\",\"data\":\"AAAA\"}}]}}]}}", .said = "Speech failed at gemini: its answer had no audio." },
+        .{ .script = "{\"answer\":{\"candidates\":[]}}", .said = "Speech failed at gemini: its answer had no audio." },
+    };
+    for (cases, 1..) |cs, n| {
+        try gemScript(&e, @intCast(n), cs.script);
+        try t.expectError(error.NoAudio, sp.speak(a, "x", null));
+        try t.expectEqualStrings(cs.said, sp.failure(a, error.NoAudio));
+    }
+}
+
+test "gemini_errors_are_said_in_the_providers_words" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    var sp = try gemSpeaker(&e, .x_goog_api_key, "gm-test-key-1");
+    const Case = struct { script: []const u8, err: anyerror, said: []const u8 };
+    const cases = [_]Case{
+        .{ .script = "{\"status\":401,\"echo_key\":true}", .err = error.KeyRefused, .said = "gemini refused the key stored as gemini." },
+        .{ .script = "{\"status\":403}", .err = error.KeyRefused, .said = "gemini refused the key stored as gemini." },
+        .{ .script = "{\"status\":402}", .err = error.BudgetSpent, .said = "Speech budget used up at gemini." },
+        .{ .script = "{\"status\":429}", .err = error.RateLimited, .said = "Speech is rate limited at gemini; try again later." },
+        .{ .script = "{\"status\":400}", .err = error.Rejected, .said = "Speech failed at gemini: Rejected scripted error" },
+        .{ .script = "{\"status\":500}", .err = error.Upstream, .said = "Speech failed at gemini: Upstream scripted error" },
+    };
+    for (cases, 1..) |cs, n| {
+        try gemScript(&e, @intCast(n), cs.script);
+        try t.expectError(cs.err, sp.speak(a, "x", null));
+        const said = sp.failure(a, cs.err);
+        try t.expectEqualStrings(cs.said, said);
+        try t.expect(std.mem.indexOf(u8, said, "gm-test-key-1") == null);
+        // Google said the key back: kept masked
+        if (n == 1) try t.expectEqualStrings("scripted error for key [secret:gemini]", sp.last_error[0..sp.last_error_len]);
+    }
+    // one request each: a 429 is not tried again
+    try t.expect(e.tmp.dir.statFile(t.io, "gemini-requests/006.json", .{}) != error.FileNotFound);
+    try t.expectError(error.FileNotFound, e.tmp.dir.statFile(t.io, "gemini-requests/007.json", .{}));
+    // no key: refused before anything is sent
+    var none = try gemSpeaker(&e, .x_goog_api_key, "");
+    try t.expectError(error.NoKey, none.speak(a, "x", null));
+    try t.expectEqualStrings("No gemini key is stored (harness secret add gemini).", none.failure(a, error.NoKey));
+    try t.expectError(error.FileNotFound, e.tmp.dir.statFile(t.io, "gemini-requests/007.json", .{}));
+}
+
+test "gemini_takes_auth_and_headers_as_its_section_says" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    // a gateway that takes a bearer token, with a header of its own
+    var bearer = try gemSpeaker(&e, .bearer, "gw-test-key-1");
+    bearer.provider.headers = &.{.{ .name = "X-Gateway", .value = "desk" }};
+    _ = try bearer.speak(a, "x", null);
+    const r1 = try gemRequest(&e, 1);
+    try t.expectEqualStrings("Bearer gw-test-key-1", jv.str(jv.at(r1, &.{ "headers", "Authorization" })).?);
+    try t.expect(jv.at(r1, &.{ "headers", "x-goog-api-key" }) == null);
+    try t.expectEqualStrings("desk", jv.str(jv.at(r1, &.{ "headers", "X-Gateway" })).?);
+    // a local server that takes no key: none sent
+    var local = try gemSpeaker(&e, .none, "");
+    _ = try local.speak(a, "x", null);
+    const r2 = try gemRequest(&e, 2);
+    try t.expect(jv.at(r2, &.{ "headers", "Authorization" }) == null);
+    try t.expect(jv.at(r2, &.{ "headers", "x-goog-api-key" }) == null);
+}
+
+test "a_model_name_is_one_path_segment" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    var sp = try gemSpeaker(&e, .x_goog_api_key, "gm-test-key-1");
+    sp.model = "a b/c";
+    _ = try sp.speak(a, "x", null);
+    try t.expectEqualStrings("/v1beta/models/a%20b%2Fc:generateContent", jv.str(jv.get(try gemRequest(&e, 1), "target")).?);
+}
+
+test "wav_header_is_mono_16_bit" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqualStrings(
+        "RIFF\x28\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\x04\x00\x00\x00\x01\x02\x03\x04",
+        try wav(a, "\x01\x02\x03\x04", 24000),
+    );
+    // half a sample at the end: dropped
+    const odd = try wav(a, "\x01\x02\x03", 24000);
+    try t.expectEqual(44 + 2, odd.len);
+    try t.expectEqual(2, std.mem.readInt(u32, odd[40..44], .little));
+    try t.expectEqual(38, std.mem.readInt(u32, odd[4..8], .little));
+}
+
+test "pcm_rate_reads_the_mime_type" {
+    try t.expectEqual(16000, pcmRate("audio/L16;codec=pcm;rate=16000"));
+    try t.expectEqual(8000, pcmRate("audio/l16; RATE=8000"));
+    try t.expectEqual(24000, pcmRate("audio/L16"));
+    try t.expectEqual(24000, pcmRate("audio/L16;rate=5"));
+    try t.expectEqual(24000, pcmRate("audio/L16;rate=fast"));
+    try t.expectEqual(48000, pcmRate("audio/pcm;rate=48000;codec=pcm"));
+}
+
+test "speak_defaults_per_kind" {
+    try t.expectEqualStrings("tts-1", speakDefaults(.openai).?.model);
+    try t.expectEqualStrings("alloy", speakDefaults(.openai).?.voice);
+    try t.expectEqualStrings("gemini-3.8-flash-lite-tts", speakDefaults(.gemini).?.model);
+    try t.expectEqualStrings("Schedar", speakDefaults(.gemini).?.voice);
+    try t.expect(speakDefaults(.anthropic) == null);
 }

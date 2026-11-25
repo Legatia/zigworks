@@ -644,12 +644,14 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), model.no_keys);
         const used = try set.used(app.arena, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model });
         const voice_service = set.find(cfg.voice.provider);
+        // the desk's voice too
+        const desk_voice = set.find(cfg.desk.speak);
         for (set.list) |*p| {
             if (std.mem.eql(u8, p.name, "omnigate") or p.auth == .none) continue;
             const has_section = for (cfg.providers) |sec| {
                 if (std.mem.eql(u8, sec.name, p.name)) break true;
             } else false;
-            if (std.mem.indexOfScalar(*const model.Provider, used, p) == null and !has_section and voice_service != p) continue;
+            if (std.mem.indexOfScalar(*const model.Provider, used, p) == null and !has_section and voice_service != p and desk_voice != p) continue;
             const v = s.get(app.io, app.arena, p.key_name) catch null;
             try outPrint(app.io, "{s} ({s} key): {s}\n", .{ p.key_name, p.name, if (v != null) "stored" else "not stored" });
         }
