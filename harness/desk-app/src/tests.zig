@@ -13,4 +13,5 @@ test {
     _ = @import("icon.zig");
     _ = @import("plist.zig");
     _ = @import("testhooks.zig");
+    _ = @import("setup.zig");
 }
