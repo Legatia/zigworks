@@ -582,10 +582,28 @@ built apart:
 
 ## Speech
 
-- **Off by default:** `[desk] speak = off | browser | PROVIDER`. A
-  provider is an OpenAI-format text-to-speech endpoint from `[provider
-  NAME]`, with its key in the store. harness fetches the audio, and the
-  key never reaches the page.
+- **Off by default:** `[desk] speak = off | browser | openai | gemini |
+  PROVIDER`. harness fetches the audio, and the key never reaches the page.
+  The choices:
+  - `browser`: the system's own voices, local and free; not on Linux;
+  - `openai` or a `[provider NAME]` with `api = openai`: an OpenAI-format
+    text-to-speech endpoint (`/audio/speech`), its key in the store;
+  - `gemini` (added 2026-11-25, the owner: "Add"): Gemini API speech.
+    - harness calls `models/MODEL:generateContent` with audio output and a
+      prebuilt voice, using the key stored as `gemini` in the
+      `x-goog-api-key` header.
+    - Gemini returns raw 16-bit PCM (24 kHz, mono), which harness wraps in
+      a WAV header for the page.
+    - The default model is `gemini-3.8-flash-lite-tts`, with a voice that
+      suits a butler. `speak_model` and `speak_voice` change them; preview
+      models retire, so the README names the date the defaults were
+      checked.
+- **Gemini's free tier lets Google use the text** to improve its products;
+  a paid key doesn't. harness can't tell which tier a key is on. So
+  whenever `gemini` is chosen, Speak replies shows inline, not behind an
+  "i": "On Gemini's free tier, Google may use the spoken text to improve
+  its products. A key on a paid plan keeps it out." It's a privacy
+  disclosure the owner must see before choosing.
 - **Section names:** `[speech]` already belongs to the Home Assistant
   agent's settings, so none of this uses it.
 - **What's spoken:**
