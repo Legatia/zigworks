@@ -18,6 +18,14 @@ const agent = @import("agent.zig");
 const brief = @import("brief.zig");
 const scrub = @import("scrub.zig");
 const util = @import("util.zig");
+const zones = @import("zones.zig");
+
+/// The computer's offset from UTC now, in minutes east; null when it
+/// can't be read (a variable so the tests can be in any zone).
+pub var local_reader: *const fn (io: Io, a: std.mem.Allocator, now_s: i64) ?i32 = zones.localNow;
+
+/// Said once at start when `utc_offset = auto` and the zone can't be read.
+pub const zone_unread_line = "The computer's time zone can't be read, so times are in UTC. [chat] utc_offset = +HH:MM in config.ini sets them.";
 const logins = @import("logins.zig");
 const store_mod = @import("store.zig");
 const masks = @import("masks.zig");
@@ -326,6 +334,105 @@ const DeskRun = struct { id: u64, label: []u8, by: []u8, conv: []u8, started: i6
 /// When the owner last opened a conversation on the desk.
 const DeskSeen = struct { name: []u8, at: i64 };
 
+/// The channel when the desk is the only way in (`Core.attachAlone`):
+/// what Telegram would carry is taken here, given an id, and reaches the
+/// desk through the tee. A conversation the desk doesn't show (a group,
+/// a member's chat, mail) gets nothing: error.TelegramOff. A file is
+/// kept in state/desk-files/.
+pub const DeskOnly = struct {
+    core: *Core = undefined,
+    mutex: Io.Mutex = .init,
+    /// The next message id: from the clock at start, so an id kept across
+    /// a restart (a reminder's, an alert's) never names a new message.
+    next: i64 = 0,
+
+    fn of(ctx: *anyopaque) *DeskOnly {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    pub fn channel(d: *DeskOnly) Channel {
+        return .{ .ctx = d, .send = send, .buttons = buttons, .clear = clear, .edit = edit, .document = document };
+    }
+
+    fn take(d: *DeskOnly) i64 {
+        d.mutex.lockUncancelable(d.core.io);
+        defer d.mutex.unlock(d.core.io);
+        d.next += 1;
+        return d.next;
+    }
+
+    fn shown(d: *DeskOnly, place: Place) bool {
+        return d.core.deskShows(place.name);
+    }
+
+    fn send(ctx: *anyopaque, place: Place, text: []const u8) anyerror!Sent {
+        _ = text;
+        const d = of(ctx);
+        if (!d.shown(place)) return error.TelegramOff;
+        return .{ .first = d.take(), .count = 1 };
+    }
+
+    fn buttons(ctx: *anyopaque, place: Place, text: []const u8, bs: []const [2][]const u8) ?i64 {
+        _ = text;
+        _ = bs;
+        const d = of(ctx);
+        if (!d.shown(place)) return null;
+        return d.take();
+    }
+
+    fn clear(ctx: *anyopaque, place: Place, id: i64) void {
+        _ = ctx;
+        _ = place;
+        _ = id;
+    }
+
+    fn edit(ctx: *anyopaque, place: Place, id: i64, text: []const u8) void {
+        _ = ctx;
+        _ = place;
+        _ = id;
+        _ = text;
+    }
+
+    /// The file in state/desk-files/, its name made safe and the time in
+    /// front; where it went is `lastKept` (the tee names it on the desk).
+    fn document(ctx: *anyopaque, place: Place, name: []const u8, data: []const u8) anyerror!i64 {
+        const d = of(ctx);
+        if (!d.shown(place)) return error.TelegramOff;
+        const c = d.core;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        _ = try Io.Dir.cwd().createDirPathStatus(c.io, try std.fs.path.join(a, &.{ c.paths.state, "desk-files" }), agents.private_dir);
+        const id = d.take();
+        const path = try d.keptPath(a, id, name);
+        var f = try Io.Dir.cwd().createFile(c.io, path, .{ .exclusive = true, .permissions = util.private_file });
+        defer f.close(c.io);
+        try f.writeStreamingAll(c.io, data);
+        return id;
+    }
+
+    /// Where file `name` of message `id` is kept.
+    fn keptPath(d: *DeskOnly, a: std.mem.Allocator, id: i64, name: []const u8) ![]const u8 {
+        const file = try std.fmt.allocPrint(a, "{d}-{s}", .{ id, try safeFileName(a, name) });
+        return std.fs.path.join(a, &.{ d.core.paths.state, "desk-files", file });
+    }
+};
+
+/// A file's name as kept: its last part, letters, digits, `.`, `-` and
+/// `_` (anything else `_`), at most 80, never only dots; "file" for none.
+fn safeFileName(a: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const base = std.fs.path.basename(std.mem.trim(u8, name, " \t"));
+    const cut = base[0..@min(base.len, 80)];
+    const out = try a.dupe(u8, cut);
+    var dots = true;
+    for (out) |*ch| {
+        if (!(std.ascii.isAlphanumeric(ch.*) or ch.* == '.' or ch.* == '-' or ch.* == '_')) ch.* = '_';
+        if (ch.* != '.') dots = false;
+    }
+    if (out.len == 0 or dots) return "file";
+    return out;
+}
+
 /// In front of the channel: every post goes on as it would, and one that
 /// got through to a conversation only the owner reads also goes into the
 /// desk's history and feed (an item's buttons mark its item, an urgent
@@ -362,38 +469,57 @@ const DeskTee = struct {
     fn send(ctx: *anyopaque, place: Place, text: []const u8) anyerror!Sent {
         const d = of(ctx);
         const sent = try d.inner.send(d.inner.ctx, place, text);
-        d.core.deskNote(place.name, text, 0, false);
+        d.core.deskNoteAs(place.name, text, 0, false, d.chanOf(sent.first), &.{});
         return sent;
+    }
+
+    /// The channel's id of a message the desk keeps: the desk alone's
+    /// own; 0 with Telegram (pressed and edited there).
+    fn chanOf(d: *DeskTee, id: i64) i64 {
+        return if (d.core.alone) id else 0;
     }
 
     fn rich(ctx: *anyopaque, place: Place, text: []const u8, entities: []const topics_mod.Entity) anyerror!Sent {
         const d = of(ctx);
         const sent = try d.inner.rich.?(d.inner.ctx, place, text, entities);
-        d.core.deskNote(place.name, text, 0, false);
+        d.core.deskNoteAs(place.name, text, 0, false, d.chanOf(sent.first), &.{});
         return sent;
     }
 
     fn buttons(ctx: *anyopaque, place: Place, text: []const u8, bs: []const [2][]const u8) ?i64 {
         const d = of(ctx);
         const id = d.inner.buttons(d.inner.ctx, place, text, bs) orelse return null;
-        const m = marks(bs);
-        d.core.deskNote(place.name, text, m.item, m.urgent);
+        d.noted(place, text, bs, id);
         return id;
     }
 
     fn buttonsRich(ctx: *anyopaque, place: Place, text: []const u8, entities: []const topics_mod.Entity, bs: []const [2][]const u8) ?i64 {
         const d = of(ctx);
         const id = d.inner.buttons_rich.?(d.inner.ctx, place, text, entities, bs) orelse return null;
-        const m = marks(bs);
-        d.core.deskNote(place.name, text, m.item, m.urgent);
+        d.noted(place, text, bs, id);
         return id;
+    }
+
+    /// A post with buttons that got through: on the desk, an item's
+    /// marked with its item, an urgent alert's as urgent; the desk alone
+    /// keeps the buttons an item's box doesn't show, to be pressed there.
+    fn noted(d: *DeskTee, place: Place, text: []const u8, bs: []const [2][]const u8, id: i64) void {
+        const m = marks(bs);
+        const own: []const [2][]const u8 = if (d.core.alone and m.item == 0) bs else &.{};
+        d.core.deskNoteAs(place.name, text, m.item, m.urgent, d.chanOf(id), own);
     }
 
     fn document(ctx: *anyopaque, place: Place, name: []const u8, data: []const u8) anyerror!i64 {
         const d = of(ctx);
         const id = try d.inner.document.?(d.inner.ctx, place, name, data);
-        var buf: [160]u8 = undefined;
-        d.core.deskNote(place.name, std.fmt.bufPrint(&buf, "A file: {s}", .{util.cut(name, 100)}) catch "A file.", 0, false);
+        var buf: [400]u8 = undefined;
+        var arena: std.heap.ArenaAllocator = .init(d.core.gpa);
+        defer arena.deinit();
+        const line = if (d.core.alone)
+            std.fmt.bufPrint(&buf, "A file: {s}, kept in {s}", .{ util.cut(name, 100), util.cut(d.core.desk_only.keptPath(arena.allocator(), id, name) catch "state/desk-files", 250) }) catch "A file, kept in state/desk-files."
+        else
+            std.fmt.bufPrint(&buf, "A file: {s}", .{util.cut(name, 100)}) catch "A file.";
+        d.core.deskNoteAs(place.name, line, 0, false, d.chanOf(id), &.{});
         return id;
     }
 
@@ -416,10 +542,12 @@ const DeskTee = struct {
     fn clear(ctx: *anyopaque, place: Place, id: i64) void {
         const d = of(ctx);
         d.inner.clear(d.inner.ctx, place, id);
+        if (d.core.alone) d.core.deskEdited(id, null);
     }
     fn edit(ctx: *anyopaque, place: Place, id: i64, text: []const u8) void {
         const d = of(ctx);
         d.inner.edit.?(d.inner.ctx, place, id, text);
+        if (d.core.alone) d.core.deskEdited(id, text);
     }
     fn sendTo(ctx: *anyopaque, chat_id: i64, text: []const u8) anyerror!void {
         const d = of(ctx);
@@ -683,6 +811,10 @@ pub const Core = struct {
     /// Tests: an instance's job stops there, as if harness stopped.
     wf_test_stop: WfStop = .none,
     told_settings_changed: bool = false,
+    /// `utc_offset = auto` and the computer's zone couldn't be read (UTC
+    /// is used); when the offset was last read.
+    zone_unread: bool = false,
+    local_checked_s: i64 = 0,
     secrets: Secrets,
     /// The stored secrets read at open. What every tool's output is
     /// masked against is `masks`: these and the values added since.
@@ -778,6 +910,10 @@ pub const Core = struct {
     stop_requested: std.atomic.Value(bool) = .init(false),
 
     chan: ?Channel = null,
+    /// The desk is the only way in (`harness run` with no Telegram):
+    /// `desk_only` is the channel behind the tee.
+    alone: bool = false,
+    desk_only: DeskOnly,
     owner: ?i64 = null,
     /// The conversations (state/conversations).
     convs: conversations.List,
@@ -959,6 +1095,8 @@ pub const Core = struct {
         c.gpa = gpa;
         c.io = io;
         c.convs_ready = false;
+        c.zone_unread = false;
+        c.local_checked_s = 0;
         c.settings_arena = .init(gpa);
         errdefer c.settings_arena.deinit();
         const sa = c.settings_arena.allocator();
@@ -1077,6 +1215,7 @@ pub const Core = struct {
         c.seen_mutex = .init;
         c.settings_mutex = .init;
         c.chan = null;
+        c.alone = false;
         c.app_server = null;
         c.app_mutex = .init;
         c.app_jobs = .empty;
@@ -1239,7 +1378,24 @@ pub const Core = struct {
         c.mcp_warn = "";
         c.browser = "";
         c.store = null;
+        if (c.zone_unread) c.sayAtStart(zone_unread_line);
         return c;
+    }
+
+    /// `utc_offset = auto`: `cfg.chat.utc_offset` is the computer's offset
+    /// at `now_s` (daylight saving included), read here so every use of it
+    /// sees the current one; UTC when it can't be read. +HH:MM: as written.
+    fn refreshLocalTime(c: *Core, now_s: i64) void {
+        c.local_checked_s = now_s;
+        if (!c.cfg.utc_auto) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        if (local_reader(c.io, arena.allocator(), now_s)) |off| {
+            c.cfg.chat.utc_offset = off;
+        } else {
+            c.cfg.chat.utc_offset = 0;
+            c.zone_unread = true;
+        }
     }
 
     pub fn close(c: *Core) void {
@@ -1397,6 +1553,7 @@ pub const Core = struct {
         }
         const texts = try c.readSettingsFiles(a);
         c.cfg = config.parse(a, texts[0]) catch return error.BadSettings;
+        c.refreshLocalTime(util.nowSeconds(c.io));
         c.rule_list = rules.parse(a, texts[1]) catch return error.BadSettings;
         c.briefs = config.parseBriefs(a, texts[2]) catch return error.BadSettings;
         const tasks = config.parseTasks(a, texts[3]) catch return error.BadSettings;
@@ -1717,7 +1874,7 @@ pub const Core = struct {
         } else if (std.mem.eql(u8, conv, "main") or std.mem.eql(u8, conv, "terminal")) {
             // main before an owner is paired (Telegram says NotPaired)
             return .{ .place = .{ .name = try a.dupe(u8, conv) } };
-        } else if (c.chan) |ch| if (ch.open_topic == null) {
+        } else if (c.chan) |ch| if (ch.open_topic == null and !c.alone) {
             // no topics here (the terminal): the name says where it was for
             return .{ .place = .{ .name = try a.dupe(u8, conv) } };
         };
@@ -2036,6 +2193,15 @@ pub const Core = struct {
             c.gpa.free(e.title);
         }
         c.start_edits.clearRetainingCapacity();
+    }
+
+    /// The desk as the only way in: every post goes to the desk, none to
+    /// Telegram; a conversation the desk doesn't show (a group, a member's
+    /// chat) gets nothing (error.TelegramOff).
+    pub fn attachAlone(c: *Core) void {
+        c.alone = true;
+        c.desk_only = .{ .core = c, .next = util.nowMs(c.io) };
+        c.attach(c.desk_only.channel());
     }
 
     pub fn setOwner(c: *Core, id: i64) !void {
@@ -3857,6 +4023,13 @@ pub const Core = struct {
             c.log.write(.chat, false, .{ .event = "dropped", .from = from_id, .why = "button from someone else" }) catch {};
             return;
         }
+        c.ownerPress(chat, thread, message_id, data, text);
+    }
+
+    /// The owner pressed button `data` of message `message_id` at `chat`
+    /// and `thread` (in Telegram, or on the desk when it is the only way in).
+    fn ownerPress(c: *Core, chat: i64, thread: i64, message_id: i64, data: []const u8, text: []const u8) void {
+        if (data.len > 0 and data[0] == 'e') return Emergency.pressBy(c, 0, true, chat, message_id, data);
         Emergency.touched(c, chat, message_id, "button");
         // a medication reminder's [Taken]
         if (data.len > 0 and data[0] == 'm') return Meds.press(c, chat, thread, message_id, data);
@@ -6754,6 +6927,13 @@ pub const Core = struct {
         if (c.poller_on) Evening.due(c, now_s);
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
+        // the computer's zone, read again each minute (the clocks change)
+        if (now_s - c.local_checked_s >= 60 or now_s < c.local_checked_s) {
+            const was = c.cfg.chat.utc_offset;
+            c.refreshLocalTime(now_s);
+            // the desk's clock follows
+            if (c.cfg.chat.utc_offset != was) c.desk_feed.push("facts", "");
+        }
         c.noteUrgent();
         // posts that did not get through go again when their wait is over
         c.resendDue(now_s);
@@ -12980,6 +13160,7 @@ pub const Core = struct {
     /// Opens topic `name` in the owner's chat with the bot and keeps it as
     /// a conversation; returns what to tell the owner.
     fn openTopic(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        if (c.alone) return "Conversations other than main are Telegram topics, and Telegram is off.";
         const owner = c.owner orelse return "Pair an account first (harness pair).";
         const ch = c.chan orelse return "There is no chat to open a topic in.";
         const open_fn = ch.open_topic orelse return "Topics are Telegram's: send /conversation new there.";
@@ -14539,8 +14720,39 @@ pub const Core = struct {
     /// Harness's post `text` in `conv` got through: into the desk's
     /// history, and its feed.
     fn deskNote(c: *Core, conv: []const u8, text: []const u8, item: u64, urgent: bool) void {
+        c.deskNoteAs(conv, text, item, urgent, 0, &.{});
+    }
+
+    /// `deskNote`, with the channel's id of the message and the buttons
+    /// the desk alone shows under it.
+    fn deskNoteAs(c: *Core, conv: []const u8, text: []const u8, item: u64, urgent: bool, chan: i64, bs: []const [2][]const u8) void {
         if (!c.deskShows(conv)) return;
-        _ = c.deskRecord(conv, .{ .from = .harness, .text = text, .at = c.now(), .item = item, .urgent = urgent }) catch {};
+        // the desk alone: a post past what one message keeps goes in several
+        // (as Telegram would split it), the marks and buttons on the last
+        var rest = text;
+        if (c.alone) while (rest.len > deskwin.History.max_text) {
+            var cut: usize = deskwin.History.max_text;
+            while (cut > 0 and rest[cut] & 0xc0 == 0x80) cut -= 1;
+            _ = c.deskRecord(conv, .{ .from = .harness, .text = rest[0..cut], .at = c.now() }) catch {};
+            rest = rest[cut..];
+        };
+        _ = c.deskRecord(conv, .{ .from = .harness, .text = rest, .at = c.now(), .item = item, .urgent = urgent, .chan = chan, .buttons = bs }) catch {};
+    }
+
+    /// The desk alone's message `chan` changed (an outcome in place of
+    /// its buttons; `text` null: the buttons only gone): the page is told.
+    fn deskEdited(c: *Core, chan: i64, text: ?[]const u8) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const masked: ?[]const u8 = if (text) |x| (c.masks.scrubAlloc(a, x) catch return) else null;
+        const got = (c.desk_history.edit(a, chan, masked) catch return) orelse return;
+        var out: std.ArrayList(u8) = .empty;
+        out.appendSlice(a, "\"conv\":") catch return;
+        util.jsonString(&out, a, got.conv) catch return;
+        out.appendSlice(a, ",\"msg\":") catch return;
+        deskwin.msgJson(&out, a, got.msg) catch return;
+        c.desk_feed.push("edit", out.items);
     }
 
     /// The owner's words in `conv` (typed on the desk, in Telegram or the
@@ -14816,6 +15028,7 @@ pub const Core = struct {
         }
         if (post and eql(u8, call.path, "send")) return c.deskSend(a, call.body);
         if (post and eql(u8, call.path, "answer")) return appShellApi(c, a, .{ .method = .POST, .path = "answer", .query = "", .body = call.body });
+        if (post and eql(u8, call.path, "press")) return c.deskPress(a, call.body);
         if (post and eql(u8, call.path, "seen")) {
             const v = jv.parse(a, call.body) orelse return deskErr(a, .bad_request, "{\"conv\":NAME}");
             const conv = jv.str(jv.get(v, "conv")) orelse return deskErr(a, .bad_request, "{\"conv\":NAME}");
@@ -14829,7 +15042,7 @@ pub const Core = struct {
         if (post and eql(u8, call.path, "voice")) return c.deskVoice(a, call);
         if (post and eql(u8, call.path, "upload")) return c.deskUpload(a, call);
         if (post and eql(u8, call.path, "speech")) return c.deskSpeech(a, call);
-        return deskErr(a, .not_found, "the desk has state, history, events, send, answer, seen, settings, voice, upload and speech");
+        return deskErr(a, .not_found, "the desk has state, history, events, send, answer, press, seen, settings, voice, upload and speech");
     }
 
     /// `POST settings {"avatar":NAME}`, `{"speak":VALUE}`,
@@ -15044,10 +15257,29 @@ pub const Core = struct {
         return .{ .body = "{\"ok\":true}" };
     }
 
+    /// `POST press {"id":MESSAGE,"n":BUTTON}`: the owner presses button
+    /// `n` under the desk's message `id`, as a press in Telegram would; only
+    /// when the desk is the only way in (with Telegram, buttons are there).
+    fn deskPress(c: *Core, a: std.mem.Allocator, body: []const u8) !appserver.Answer {
+        const shape = "{\"id\":MESSAGE,\"n\":BUTTON}";
+        const v = jv.parse(a, body) orelse return deskErr(a, .bad_request, shape);
+        const id = jv.int(jv.get(v, "id")) orelse return deskErr(a, .bad_request, shape);
+        const n = jv.int(jv.get(v, "n")) orelse return deskErr(a, .bad_request, shape);
+        if (id < 0 or n < 0) return deskErr(a, .bad_request, shape);
+        if (!c.alone) return deskErr(a, .conflict, "Buttons are pressed in Telegram.");
+        const found = (try c.desk_history.find(a, @intCast(id))) orelse return deskErr(a, .not_found, "no such message");
+        const m = found.msg;
+        if (m.chan == 0 or n >= m.buttons.len) return .{ .body = "{\"said\":\"That button is out of date.\"}" };
+        const r = try c.placeOf(a, found.conv);
+        c.ownerPress(r.place.chat, r.place.thread, m.chan, m.buttons[@intCast(n)][1], m.text);
+        return .{ .body = "{\"ok\":true}" };
+    }
+
     /// "You, on the desk: …", quietly, in `conv`, past the desk's own
     /// history (the desk shows the words themselves).
     fn deskEcho(c: *Core, a: std.mem.Allocator, conv: []const u8, text: []const u8) void {
-        if (c.chan == null) return;
+        // no Telegram: nothing to echo to
+        if (c.chan == null or c.alone) return;
         const inner = c.desk_tee.inner;
         const one = std.mem.trim(u8, text, " \t\r\n");
         const cut = util.cut(one, 200);
@@ -17102,6 +17334,7 @@ fn whyUndelivered(e: anyerror) []const u8 {
     return switch (e) {
         error.NotPaired => "not paired yet",
         error.NoChannel => "nothing to send it through",
+        error.TelegramOff => "Telegram is off",
         else => @errorName(e),
     };
 }
@@ -17109,7 +17342,7 @@ fn whyUndelivered(e: anyerror) []const u8 {
 /// Whether a message that did not get through is worth sending again
 /// later: not while there is nobody to send it to.
 fn worthRetry(e: anyerror) bool {
-    return e != error.NotPaired and e != error.NoChannel;
+    return e != error.NotPaired and e != error.NoChannel and e != error.TelegramOff;
 }
 
 fn putKey(gpa: std.mem.Allocator, map: anytype, key: []const u8, v: anytype) !void {
@@ -17652,6 +17885,19 @@ const Fix = struct {
     core: *Core,
 
     fn init(f: *Fix, extra_config: []const u8, briefs_text: []const u8, tasks_text: []const u8) !void {
+        try f.open(extra_config, briefs_text, tasks_text);
+        f.core.attach(f.rec.channel());
+        try f.core.setOwner(42);
+    }
+
+    /// The desk as the only way in: no Telegram, nobody paired.
+    fn initAlone(f: *Fix, extra_config: []const u8, tasks_text: []const u8) !void {
+        try f.open(extra_config, "", tasks_text);
+        f.core.attachAlone();
+    }
+
+    /// The folder written and the core opened, nothing attached.
+    fn open(f: *Fix, extra_config: []const u8, briefs_text: []const u8, tasks_text: []const u8) !void {
         try f.e.init();
         const a = f.e.arena.allocator();
         f.home = try std.fs.path.join(a, &.{ f.e.dir, "home" });
@@ -17667,8 +17913,6 @@ const Fix = struct {
         if (try sandbox.unavailable(t.io, a) != null) try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.environments, .data = "[default]\nunattended = host\n" });
         f.rec = .{};
         f.core = try Core.open(t.allocator, t.io, f.home, .{ .omnigate = "og-key-for-tests", .search = "search-key-123" });
-        f.core.attach(f.rec.channel());
-        try f.core.setOwner(42);
         if (builtin.os.tag == .windows) {
             // what a Windows sandbox needs to start cmd
             const sys = try @import("proc.zig").systemDir(a);
@@ -27060,6 +27304,12 @@ const Emergency = struct {
     /// else's is dropped.
     fn press(c: *Core, from: i64, chat: i64, thread: i64, message: i64, data: []const u8) void {
         _ = thread;
+        pressBy(c, from, if (c.owner) |o| o == from else false, chat, message, data);
+    }
+
+    /// `press`, by the owner when `is_owner` (the desk alone has no
+    /// account to compare), else by account `from`.
+    fn pressBy(c: *Core, from: i64, is_owner: bool, chat: i64, message: i64, data: []const u8) void {
         const dash = std.mem.indexOfScalar(u8, data, '-') orelse return dropped(c, from, "not an alert's button");
         const colon = std.mem.lastIndexOfScalar(u8, data, ':') orelse return dropped(c, from, "not an alert's button");
         if (colon < dash) return dropped(c, from, "not an alert's button");
@@ -27069,7 +27319,6 @@ const Emergency = struct {
         const a = arena.allocator();
         const x = c.alerts.get(a, id) orelse return dropped(c, from, "an alert that is gone");
         if (!std.mem.eql(u8, data[dash + 1 .. colon], x.token)) return dropped(c, from, "an alert's button with another token");
-        const is_owner = if (c.owner) |o| o == from else false;
         const by: []const u8 = blk: {
             if (is_owner) {
                 if (x.msg) |m| if (m.chat == chat and message >= m.message and message < m.message + m.count) break :blk "owner";
@@ -37169,4 +37418,251 @@ test "a_provider_copy_outlives_the_settings_it_came_from" {
     try t.expectEqualStrings("sk-tts-123456", own.key);
     try t.expectEqualStrings("X-Org", own.headers[0].name);
     try t.expectEqualStrings("acme", own.headers[0].value);
+}
+
+test "desk_alone_a_reply_reaches_the_desk_with_nobody_paired" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    try t.expect(f.core.owner == null);
+    try f.e.script(1, model.textReply("Three flats match."));
+    try f.core.startWorker();
+    try t.expectEqual(std.http.Status.ok, deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"Find flats\"}").status);
+    const h = try waitDesk(&f, "history", "conv=main", "Three flats match.");
+    try expectHas(h, "\"from\":\"you\",\"text\":\"Find flats\"");
+    // no echo anywhere: there is no Telegram
+    try t.expect(std.mem.indexOf(u8, h, "You, on the desk") == null);
+}
+
+test "desk_alone_a_name_harness_does_not_know_goes_to_main_with_it_in_front" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    try f.core.deliverIn("news", "Second is out.");
+    _ = try waitDesk(&f, "history", "conv=main", "[news] Second is out.");
+}
+
+test "desk_only_refuses_shared_conversations" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    {
+        f.core.convs.mutex.lockUncancelable(t.io);
+        defer f.core.convs.mutex.unlock(t.io);
+        _ = try f.core.convs.add(.{ .name = "family", .chat = -100123, .audience = .shared });
+    }
+    try t.expectError(error.TelegramOff, f.core.deliverIn("family", "Dinner at 7."));
+    try t.expect(std.mem.indexOf(u8, deskCall(&f, .GET, "history", "conv=main", "").body, "Dinner") == null);
+    try expectHas(try logText(&f), "Telegram is off");
+}
+
+test "desk_alone_a_start_warning_reaches_the_desk" {
+    var f: Fix = undefined;
+    try f.open("", "", "");
+    defer f.deinit();
+    f.core.sayAtStart("Warning: the action log changed while harness was not running.");
+    f.core.attachAlone();
+    _ = try waitDesk(&f, "history", "conv=main", "Warning: the action log changed");
+}
+
+test "desk_alone_a_task_result_reaches_the_desk" {
+    var f: Fix = undefined;
+    try f.initAlone("", "[check]\nevery = 5m\ndo = Check the price.\n");
+    defer f.deinit();
+    try f.e.script(1, model.textReply("Price is flat."));
+    try f.core.startWorker();
+    f.core.poller_on = true;
+    f.core.tick();
+    _ = try waitDesk(&f, "history", "conv=main", "[check] Price is flat.");
+}
+
+test "desk_alone_an_approval_is_answered_on_the_desk" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo hi\"}"));
+    try f.e.script(2, model.textReply("Said hi."));
+    try f.core.startWorker();
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"say hi\"}");
+    const st = try waitDesk(&f, "state", "", "{\"key\":\"once\"");
+    const v = jv.parse(a, st).?;
+    const id = jv.int(jv.get(jv.get(v, "items").?.array.items[0], "id")).?;
+    // its message in the chat names the item
+    _ = try waitDesk(&f, "history", "conv=main", try std.fmt.allocPrint(a, "\"item\":{d}", .{id}));
+    try expectHas(deskCall(&f, .POST, "answer", "", try std.fmt.allocPrint(a, "{{\"id\":{d},\"key\":\"once\"}}", .{id})).body, "\"took\":\"taken\"");
+    _ = try waitDesk(&f, "history", "conv=main", "Said hi.");
+}
+
+/// The id of the desk's last message in `conv` with buttons (5 s).
+fn deskButtonsMsg(f: *Fix, conv: []const u8, label: []const u8) !i64 {
+    const a = f.e.arena.allocator();
+    const h = try waitDesk(f, "history", try std.fmt.allocPrint(a, "conv={s}", .{conv}), label);
+    const v = jv.parse(a, h).?;
+    const msgs = jv.get(v, "messages").?.array.items;
+    var i = msgs.len;
+    while (i > 0) {
+        i -= 1;
+        if (jv.get(msgs[i], "buttons") != null) return jv.int(jv.get(msgs[i], "id")).?;
+    }
+    return error.NoButtons;
+}
+
+test "desk_alone_quick_replies_are_pressed_on_the_desk" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"text\":\"Three flats match.\",\"buttons\":[\"Book viewings\",\"Not now\"],\"final\":true}"));
+    try f.e.script(2, model.textReply("Booking them."));
+    try f.core.startWorker();
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"find flats\"}");
+    const id = try deskButtonsMsg(&f, "main", "\"buttons\":[\"Book viewings\",\"Not now\"]");
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "press", "", try std.fmt.allocPrint(a, "{{\"id\":{d},\"n\":0}}", .{id})).body);
+    _ = try waitDesk(&f, "history", "conv=main", "Booking them.");
+    try expectHas(try f.e.request(2), "{\"type\":\"text\",\"text\":\"Book viewings\"");
+    // its buttons are gone, and a second press answers nothing
+    try t.expect(std.mem.indexOf(u8, deskCall(&f, .GET, "history", "conv=main", "").body, "\"buttons\"") == null);
+    try expectHas(deskCall(&f, .POST, "press", "", try std.fmt.allocPrint(a, "{{\"id\":{d},\"n\":1}}", .{id})).body, "That button is out of date.");
+    try t.expectEqual(2, f.e.server.modelRequests());
+    try t.expectEqual(std.http.Status.not_found, deskCall(&f, .POST, "press", "", "{\"id\":999999,\"n\":0}").status);
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "press", "", "{\"id\":-1,\"n\":0}").status);
+}
+
+test "a_desk_press_with_telegram_is_refused" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try f.core.deliver("Hello.");
+    const h = try waitDesk(&f, "history", "conv=main", "Hello.");
+    try t.expect(std.mem.indexOf(u8, h, "\"buttons\"") == null);
+    try t.expectEqual(std.http.Status.conflict, deskCall(&f, .POST, "press", "", "{\"id\":1,\"n\":0}").status);
+}
+
+test "desk_alone_an_urgent_alert_is_taken_on_the_desk" {
+    var f: Fix = undefined;
+    try f.initAlone("[butler]\nescalate = 5m anna\n", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    _ = try leakAlert(&f, "urgent = yes\n");
+    try leakReads(&f, "wet");
+    _ = try waitDesk(&f, "state", "", "\"alerts\":1");
+    const id = try deskButtonsMsg(&f, "main", "\"buttons\":[\"I'm on it\"]");
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "press", "", try std.fmt.allocPrint(a, "{{\"id\":{d},\"n\":0}}", .{id})).body);
+    _ = try waitDesk(&f, "state", "", "\"alerts\":0");
+    _ = try waitDesk(&f, "history", "conv=main", "You're on it");
+}
+
+test "desk_alone_a_posted_file_is_kept" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ f.core.workspace, "flats.csv" }), .data = "street,rooms\n" });
+    try f.e.script(1, model.toolReply("tu_1", "send", "{\"text\":\"Here is the list.\",\"files\":[\"flats.csv\"],\"final\":true}"));
+    try f.core.startWorker();
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"send me the list\"}");
+    _ = try waitDesk(&f, "history", "conv=main", "A file: flats.csv, kept in ");
+    var d = try Io.Dir.cwd().openDir(t.io, try std.fs.path.join(a, &.{ f.core.paths.state, "desk-files" }), .{ .iterate = true });
+    defer d.close(t.io);
+    var it = d.iterate();
+    const e = (try it.next(t.io)).?;
+    try t.expect(std.mem.endsWith(u8, e.name, "-flats.csv"));
+    try t.expectEqualStrings("street,rooms\n", try d.readFileAlloc(t.io, e.name, a, .limited(100)));
+}
+
+test "a_kept_file_name_stays_in_its_folder" {
+    const a = t.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const x = arena.allocator();
+    try t.expectEqualStrings("passwd", try safeFileName(x, "../../etc/passwd"));
+    try t.expectEqualStrings("file", try safeFileName(x, ".."));
+    try t.expectEqualStrings("file", try safeFileName(x, ""));
+    try t.expectEqualStrings("a_b.txt", try safeFileName(x, "a b.txt"));
+}
+
+var test_offset: ?i32 = 60;
+fn testZone(_: Io, _: std.mem.Allocator, _: i64) ?i32 {
+    return test_offset;
+}
+
+test "auto_offset_follows_the_zone_at_each_refresh" {
+    local_reader = testZone;
+    defer local_reader = zones.localNow;
+    test_offset = 60;
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = auto\n", "", "");
+    defer f.deinit();
+    try t.expectEqual(60, f.core.cfg.chat.utc_offset);
+    // the clocks change: within the minute, every use sees it
+    test_offset = 120;
+    const now_s = util.nowSeconds(t.io);
+    f.core.fixed_now = now_s + 61;
+    f.core.tick();
+    try t.expectEqual(120, f.core.cfg.chat.utc_offset);
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"utc_offset\":120");
+    // and after /reload
+    test_offset = 60;
+    try expectHas(try f.core.reload(), "Settings reloaded.");
+    try t.expectEqual(60, f.core.cfg.chat.utc_offset);
+    // +HH:MM is that, whatever the zone
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.fmt.allocPrint(f.e.arena.allocator(), "[model]\nurl = {s}\n[search]\nurl = {s}\n[chat]\nutc_offset = -05:00\n", .{ try f.e.url(), try f.e.url() }) });
+    try expectHas(try f.core.reload(), "Settings reloaded.");
+    test_offset = 120;
+    f.core.fixed_now = now_s + 200;
+    f.core.tick();
+    try t.expectEqual(-300, f.core.cfg.chat.utc_offset);
+}
+
+test "an_unreadable_zone_is_utc_and_said_once_at_start" {
+    local_reader = testZone;
+    defer local_reader = zones.localNow;
+    test_offset = null;
+    defer test_offset = 60;
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = auto\n", "", "");
+    defer f.deinit();
+    try t.expect(f.core.zone_unread);
+    try t.expectEqual(0, f.core.cfg.chat.utc_offset);
+    try f.rec.waitFor(zone_unread_line);
+    _ = try f.core.reload();
+    f.core.fixed_now = util.nowSeconds(t.io) + 61;
+    f.core.tick();
+    try t.expectEqual(1, f.rec.count(zone_unread_line));
+}
+
+test "desk_alone_a_new_conversation_says_why_there_is_none" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    try t.expectEqualStrings("Conversations other than main are Telegram topics, and Telegram is off.", try f.core.command(f.e.arena.allocator(), "/conversation new trips"));
+}
+
+test "desk_alone_a_long_post_reaches_the_desk_whole" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const long = try a.alloc(u8, deskwin.History.max_text * 2 + 10);
+    @memset(long, 'x');
+    long[long.len - 1] = 'Z';
+    try f.core.deliver(long);
+    const h = deskCall(&f, .GET, "history", "conv=main", "").body;
+    try expectHas(h, "xZ\"");
+    try t.expectEqual(3, std.mem.count(u8, h, "\"from\":\"harness\""));
+}
+
+test "a_change_of_offset_tells_the_desk" {
+    local_reader = testZone;
+    defer local_reader = zones.localNow;
+    test_offset = 60;
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = auto\n", "", "");
+    defer f.deinit();
+    const before = f.core.desk_feed.last();
+    test_offset = 120;
+    f.core.fixed_now = util.nowSeconds(t.io) + 61;
+    f.core.tick();
+    try expectHas(deskCall(&f, .GET, "events", try std.fmt.allocPrint(f.e.arena.allocator(), "after={d}&wait=0", .{before}), "").body, "\"type\":\"facts\"");
 }

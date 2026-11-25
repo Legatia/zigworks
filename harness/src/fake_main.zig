@@ -76,6 +76,22 @@ pub fn main(init: std.process.Init) u8 {
         };
         return 0;
     }
+    // the desk entered, then its API one call at a time:
+    // harness-fake --desk-enter HOME; --desk-api HOME COOKIE METHOD PATH [BODY]
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--desk-enter")) {
+        fake.deskEnterCookie(io, init.arena.allocator(), args[2]) catch |e| {
+            std.debug.print("harness-fake: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        return 0;
+    }
+    if ((args.len == 6 or args.len == 7) and std.mem.eql(u8, args[1], "--desk-api")) {
+        const status = fake.deskApiCall(io, init.arena.allocator(), args[2], args[3], args[4], args[5], if (args.len == 7) args[6] else "") catch |e| {
+            std.debug.print("harness-fake: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        return if (status == 200) 0 else 1;
+    }
     // the injection demo's pages and calls, from the catalog
     if (args.len == 5 and std.mem.eql(u8, args[1], "inject")) {
         inject.writeDemo(io, init.arena.allocator(), args[2], args[3], args[4]) catch |e| {

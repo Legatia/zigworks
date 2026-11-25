@@ -329,7 +329,32 @@ function msgEl(m) {
   const open = msgItem(m);
   if (open) li.append(itemBox(open));
   else li.append(el("div", "text cut-s", m.text));
+  // the desk alone: a message's own buttons (quick replies, Undo, Taken)
+  if (!open && m.buttons && m.buttons.length) {
+    const row = el("div", "choices");
+    m.buttons.forEach((label, n) => {
+      const b = el("button", "cut-s" + (n === 0 ? " first" : ""), label);
+      b.type = "button";
+      b.addEventListener("click", () => press(li, m.id, n));
+      row.append(b);
+    });
+    li.append(row);
+  }
   return li;
+}
+
+async function press(box, id, n) {
+  if (fresh()) return;
+  for (const b of box.querySelectorAll("button")) b.disabled = true;
+  try {
+    const d = await post("press", { id, n });
+    if (d.said) box.append(el("p", "said", d.said));
+  } catch (e) {
+    if (!(e instanceof SignedOut)) {
+      box.append(el("p", "said", "The press didn't reach harness."));
+      for (const b of box.querySelectorAll("button")) b.disabled = false;
+    }
+  }
 }
 
 function renderChat() {
@@ -618,6 +643,15 @@ function onEvent(ev) {
         m.conv = ev.conv;
         S.speakQueue.push(m);
         speakNext();
+      }
+      break;
+    }
+    case "edit": {
+      // a message's outcome in place of its buttons
+      const i = ev.conv === S.conv ? S.msgs.findIndex((x) => x.id === ev.msg.id) : -1;
+      if (i >= 0) {
+        S.msgs[i] = ev.msg;
+        renderChat();
       }
       break;
     }

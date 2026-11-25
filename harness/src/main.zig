@@ -29,16 +29,21 @@ const autostart = @import("autostart.zig");
 const mail_mod = @import("mail.zig");
 const sock = @import("sock.zig");
 const avatar = @import("avatar.zig");
+const config_cmd = @import("config_cmd.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
 const usage =
-    \\harness: a personal agent you talk to in Telegram or the terminal.
+    \\harness: a personal agent you talk to on the desk, in Telegram or the terminal.
     \\
     \\Usage: harness [--home DIR] COMMAND
     \\
     \\  init [--butler]            write the data folder with commented defaults; asks
     \\                             (--butler: says yes) whether it is a home butler
+    \\  config set SECTION.KEY VALUE
+    \\                             write one setting in config.ini (comments kept; a
+    \\                             value that doesn't read is refused, the file untouched)
+    \\  config get SECTION.KEY     the value in use; a named section: provider NAME.url
     \\  secret add NAME [--stdin]  store a secret (typed, not shown)
     \\  secret rm NAME             remove a stored secret
     \\  secret list                which of the configured secrets are stored
@@ -48,7 +53,8 @@ const usage =
     \\  login list                 the agent's logins and what is stored for them
     \\  login rm NAME              remove a login, its secrets and its browser profile
     \\  pair                       print a code to send to the bot as /pair CODE
-    \\  run                        run the agent: Telegram and the scheduler
+    \\  run                        run the agent: the desk, the scheduler, and Telegram
+    \\                             when a bot token is stored
     \\  stop                       ask the running harness to stop, and wait for it
     \\  open                       open the desk app (harness-desk), or bring it to the front
     \\  autostart [on|off]         start harness run when you log in, or no longer; alone: which
@@ -131,6 +137,17 @@ const App = struct {
     home: []const u8 = "",
     /// Where this folder's secrets are kept (`prepareStore`).
     store_cache: ?store_mod.Store = null,
+    /// The notes `open` said on stderr (a key missing, mcp.ini's problems):
+    /// the desk alone says them too, where the owner reads.
+    notes: std.ArrayList([]const u8) = .empty,
+
+    /// A note at start: on stderr, and kept for the desk.
+    fn note(app: *App, comptime fmt: []const u8, args: anytype) void {
+        complain(fmt, args);
+        const line = std.fmt.allocPrint(app.arena, fmt, args) catch return;
+        const plain = if (std.mem.startsWith(u8, line, "note: ")) line["note: ".len..] else line;
+        app.notes.append(app.arena, plain) catch {};
+    }
 
     fn defaultHome(app: *App) ![]const u8 {
         if (app.env.get("HARNESS_HOME")) |h| if (h.len > 0) return h;
@@ -301,8 +318,8 @@ const App = struct {
         const sec = app.secrets(cfg);
         // each provider in use without its key or url, said once
         const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), .{ .ctx = @constCast(&sec), .get = startKey });
-        for (try startNotes(app.arena, &set, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model })) |n| complain("{s}", .{n});
-        if (try voiceStartNote(app.arena, &set, cfg.voice.provider)) |n| complain("{s}", .{n});
+        for (try startNotes(app.arena, &set, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model })) |n| app.note("{s}", .{n});
+        if (try voiceStartNote(app.arena, &set, cfg.voice.provider)) |n| app.note("{s}", .{n});
         const c = Core.open(app.gpa, app.io, app.home, sec) catch |e| {
             switch (e) {
                 error.AlreadyRunning => complain("harness is already running on {s}; talk to it there (or stop it first)", .{app.home}),
@@ -327,6 +344,7 @@ const App = struct {
             c.exe_dir = d;
         } else |_| {}
         c.writeStatus() catch {};
+        if (c.zone_unread) complain("note: {s}", .{core_mod.zone_unread_line});
         // Ctrl-C and kill end it the way /stop and close do (from here on,
         // so a slow start of the MCP servers can be ended too)
         catchSignals();
@@ -337,13 +355,13 @@ const App = struct {
         if ((role == .run or role == .chat) and c.cfg.apps.on) {
             if (c.startApps(app.arena)) |url| {
                 complain("Apps: {s}   (new each start)", .{url});
-                if (c.apps_note.len > 0) complain("note: {s}", .{c.apps_note});
-                writeDeskJson(app, c) catch |e| complain("note: state/desk.json was not written: {s}", .{@errorName(e)});
+                if (c.apps_note.len > 0) app.note("note: {s}", .{c.apps_note});
+                writeDeskJson(app, c) catch |e| app.note("note: state/desk.json was not written: {s}", .{@errorName(e)});
             } else |e| complain("note: the app server didn't start: {s}", .{@errorName(e)});
         }
         var warns = std.mem.tokenizeScalar(u8, c.mcp_warn, '\n');
-        while (warns.next()) |w| complain("note: mcp.ini: {s}", .{w});
-        if (c.money_ledger.trouble()) |why| complain("note: {s}; money calls are refused until it is fixed", .{why});
+        while (warns.next()) |w| app.note("note: mcp.ini: {s}", .{w});
+        if (c.money_ledger.trouble()) |why| app.note("note: {s}; money calls are refused until it is fixed", .{why});
         return c;
     }
 };
@@ -428,6 +446,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
         return .ok;
     }
     if (eql(cmd, "init")) return initCmd(app, rest);
+    if (eql(cmd, "config")) return configCmd(app, rest);
     if (eql(cmd, "secret")) return secretCmd(app, rest);
     if (eql(cmd, "login")) return loginCmd(app, rest);
     if (eql(cmd, "pair")) return pairCmd(app);
@@ -496,6 +515,63 @@ fn initCmd(app: *App, args: []const []const u8) !Exit {
     try outAll(app.io, try initText(app.arena, app.home, butler_on, asked));
     // a Hermes setup to bring over: said, never done
     if (hermes_import.noticeFor(app.io, app.arena, app.env)) |line| try outPrint(app.io, "{s}\n", .{line});
+    return .ok;
+}
+
+const config_usage = "usage: harness config set SECTION.KEY VALUE [SECTION.KEY VALUE]... | config get SECTION.KEY (a named section: provider NAME.KEY)";
+
+/// Whether a `harness config` line has what it takes: `set` a key and its
+/// value (more pairs: written together), `get` a key; a key is one
+/// argument, or two for a named section.
+fn configArgs(rest: []const []const u8) ?void {
+    if (rest.len < 2) return null;
+    var buf: [2048]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    if (eql(rest[0], "set")) return if (config_cmd.parsePairs(fba.allocator(), rest[1..]) != null) {} else null;
+    if (eql(rest[0], "get")) return if (config_cmd.parseKey(fba.allocator(), rest[1..]) != null) {} else null;
+    return null;
+}
+
+/// `harness config set SECTION.KEY VALUE | get SECTION.KEY`: one setting of
+/// config.ini (config_cmd.zig). A set that doesn't parse leaves the file
+/// as it was; when harness runs, it says what the change waits for.
+fn configCmd(app: *App, rest: []const []const u8) !Exit {
+    if (configArgs(rest) == null) {
+        complain(config_usage, .{});
+        return .usage;
+    }
+    const set = eql(rest[0], "set");
+    const p = try core_mod.Paths.init(app.arena, app.home);
+    const text = Io.Dir.cwd().readFileAlloc(app.io, p.config, app.arena, .limited(1 << 20)) catch |e| {
+        if (e == error.FileNotFound) complain("no config.ini in {s}; run harness init first", .{app.home}) else complain("can't read {s}: {s}", .{ p.config, @errorName(e) });
+        return .failed;
+    };
+    if (!set) {
+        const got = try config_cmd.getValue(app.arena, text, config_cmd.parseKey(app.arena, rest[1..]).?);
+        if (got.refused) |line| {
+            complain("{s}", .{line});
+            return .failed;
+        }
+        try outPrint(app.io, "{s}\n", .{got.value.?});
+        return .ok;
+    }
+    const pairs = config_cmd.parsePairs(app.arena, rest[1..]).?;
+    const got = try config_cmd.setAll(app.arena, text, pairs);
+    if (got.refused) |line| {
+        complain("{s}", .{line});
+        return .failed;
+    }
+    util.writeReplace(app.io, p.config, got.text.?) catch |e| {
+        complain("config.ini could not be written: {s}; it is as it was", .{@errorName(e)});
+        return .failed;
+    };
+    const restart = for (pairs) |pr| {
+        if (config_cmd.needsRestart(pr.key)) break true;
+    } else false;
+    if (core_mod.lockHeld(app.io, p)) try outAll(app.io, if (restart)
+        "harness is running: restart it to use this (harness stop, then harness run).\n"
+    else
+        "harness is running: send /reload to use it.\n");
     return .ok;
 }
 
@@ -598,10 +674,12 @@ fn initText(a: std.mem.Allocator, home: []const u8, butler_on: bool, asked: bool
         \\  1. The model: set the omnigate url (there is none by default) and route names in config.ini,
         \\     or another provider: [model] provider (README: Models and providers).
         \\  2. harness secret add omnigate     (your omnigate key; another provider's under its name)
-        \\  3. harness secret add telegram     (the bot token from @BotFather)
-        \\  4. harness secret add ha           (a long-lived access token: in Home Assistant, your profile, Security)
-        \\  5. harness run, then harness pair, then send /pair CODE to the bot.
+        \\  3. harness secret add ha           (a long-lived access token: in Home Assistant, your profile, Security)
+        \\  4. harness run                     (keep it running)
+        \\  5. harness open                    (the desk)
         \\  6. In the chat: /setup home, then /setup car if your car is on Smartcar.
+        \\Telegram, for your phone (optional): harness secret add telegram (the bot token from @BotFather),
+        \\  restart harness run, then harness pair and send /pair CODE to the bot.
         \\harness doctor says what is still missing.
         \\
     , .{home});
@@ -611,9 +689,11 @@ fn initText(a: std.mem.Allocator, home: []const u8, butler_on: bool, asked: bool
         \\  1. Set the omnigate url (there is none by default) and route names in config.ini,
         \\     or another provider: [model] provider (README: Models and providers).
         \\  2. harness secret add omnigate     (your omnigate key; another provider's under its name)
-        \\  3. harness secret add telegram     (the bot token from @BotFather)
-        \\  4. harness secret add search       (optional: Brave Search API key)
-        \\  5. harness run, then harness pair, then send /pair CODE to the bot.
+        \\  3. harness run                     (keep it running)
+        \\  4. harness open                    (the desk)
+        \\  5. harness secret add search       (optional: Brave Search API key)
+        \\Telegram, for your phone (optional): harness secret add telegram (the bot token from @BotFather),
+        \\  restart harness run, then harness pair and send /pair CODE to the bot.
         \\harness doctor says what is still missing.{s}
         \\
     , .{ home, if (asked) "" else "\n(A home butler, with Home Assistant? harness init --butler)" });
@@ -1202,14 +1282,8 @@ fn runCmd(app: *App) !Exit {
         c.close();
         if (tc_made) tc.deinit();
     }
-    if (!c.cfg.chat.telegram) {
-        complain("Telegram is off in config.ini; use harness chat", .{});
-        return .failed;
-    }
-    const token = c.secrets.telegram orelse {
-        complain("no bot token stored under \"{s}\"; run: harness secret add {s}", .{ c.cfg.chat.token, c.cfg.chat.token });
-        return .failed;
-    };
+    // no Telegram: the desk is the only way in
+    const token = (if (c.cfg.chat.telegram) c.secrets.telegram else null) orelse return runAlone(app, c);
     tc.init(app.gpa, app.io, c, c.cfg.chat.api, token) catch {
         complain("the Telegram api url in config.ini is not valid", .{});
         return .failed;
@@ -1254,6 +1328,52 @@ fn runCmd(app: *App) !Exit {
         // a /reload among those messages may have changed the api url
         _ = tc.refresh() catch |e| complain("telegram: {s}", .{@errorName(e)});
     }
+}
+
+/// What `harness run` says with no Telegram: why the desk is the only way
+/// in (`start`), or, with no desk server either, the one line it fails
+/// with (`fail`).
+const Alone = struct { start: []const u8, fail: ?[]const u8 = null };
+
+fn deskAlone(a: std.mem.Allocator, telegram_on: bool, token_name: []const u8, apps_on: bool, server_up: bool) !Alone {
+    const start = if (telegram_on)
+        try std.fmt.allocPrint(a, "No bot token is stored under \"{s}\", so Telegram is off. The desk is the only way in.", .{token_name})
+    else
+        "Telegram is off. The desk is the only way in.";
+    if (server_up) return .{ .start = start };
+    const fail = if (!telegram_on)
+        (if (apps_on) "Telegram is off and the desk's server didn't start (see above): fix that, or turn on [chat] telegram, with a bot token" else "Telegram is off and so is the desk's server: turn on [apps] on in config.ini (or [chat] telegram, with a bot token)")
+    else if (apps_on)
+        try std.fmt.allocPrint(a, "no bot token is stored under \"{s}\" and the desk's server didn't start (see above): fix that, or run: harness secret add {s}", .{ token_name, token_name })
+    else
+        try std.fmt.allocPrint(a, "no bot token is stored under \"{s}\" and the desk's server is off: turn on [apps] on in config.ini, or run: harness secret add {s}", .{ token_name, token_name });
+    return .{ .start = start, .fail = fail };
+}
+
+/// `harness run` with the desk as the only way in: the worker, the
+/// scheduler and the desk's server, no Telegram poller; until stopped.
+fn runAlone(app: *App, c: *Core) !Exit {
+    const said = try deskAlone(app.arena, c.cfg.chat.telegram, c.cfg.chat.token, c.cfg.apps.on, c.app_server != null);
+    if (said.fail) |line| {
+        complain("{s}", .{line});
+        return .failed;
+    }
+    complain("{s}", .{said.start});
+    c.attachAlone();
+    // once on the desk too, with what start found (said on stderr, which
+    // nobody reads when the desk app or a login started harness)
+    c.say(said.start);
+    if (app.notes.items.len > 0) c.say(try std.mem.join(app.arena, "\n", app.notes.items));
+    try c.startWorker();
+    c.poller_on = true;
+    const tick_thread = try std.Thread.spawn(.{}, ticker, .{c});
+    defer tick_thread.join();
+    defer c.quitting.store(true, .release);
+    const persona_note = c.personaNote();
+    try errPrint(app.io, "harness {s}: running on {s}{s}{s}\n", .{ build_options.version, app.home, if (persona_note.len > 0) "; " else "", persona_note });
+    // a signal or harness stop ends the process (watchSignals)
+    while (!c.quitting.load(.acquire)) app.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    return .ok;
 }
 
 // ---- terminal ----
@@ -2044,7 +2164,10 @@ fn logCmd(app: *App, args: []const []const u8) !Exit {
         // dates in the owner's time, as config.ini says (UTC without it)
         const offset: i32 = blk: {
             const text = Io.Dir.cwd().readFileAlloc(app.io, p.config, app.arena, .limited(1 << 20)) catch break :blk 0;
-            break :blk (config.parse(app.arena, text) catch break :blk 0).chat.utc_offset;
+            const cfg = config.parse(app.arena, text) catch break :blk 0;
+            // utc_offset = auto: the computer's zone now
+            if (cfg.utc_auto) break :blk core_mod.local_reader(app.io, app.arena, util.nowSeconds(app.io)) orelse 0;
+            break :blk cfg.chat.utc_offset;
         };
         const shown = history_mod.searchText(app.arena, app.io, p.log, args[1..], offset) catch |e| {
             complain("can't read {s}: {s}", .{ p.log, @errorName(e) });
@@ -2593,6 +2716,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
         if (eql(cmd, c)) return if (rest.len == 0) null else "usage: harness " ++ c ++ " (it takes no arguments)";
     }
     if (eql(cmd, "brief")) return if (rest.len <= 1) null else "usage: harness brief [NAME]";
+    if (eql(cmd, "config")) return if (configArgs(rest) != null) null else config_usage;
     if (eql(cmd, "task")) return if (rest.len == 2 and eql(rest[0], "run")) null else "usage: harness task run NAME";
     if (eql(cmd, "memory")) {
         if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "list"))) return null;
@@ -2781,6 +2905,17 @@ test "init_asks_whether_this_is_a_home_butler" {
     try t.expect(std.mem.indexOf(u8, plain, "secret add ha") == null);
     try t.expect(std.mem.indexOf(u8, plain, "harness init --butler") != null);
     try t.expect(std.mem.indexOf(u8, try initText(a, "/data", false, true), "harness init --butler") == null);
+    // the desk first: the provider and its key, harness run, harness open;
+    // Telegram after it, optional, for the phone
+    for ([_][]const u8{ said, plain }) |text| {
+        const key = std.mem.indexOf(u8, text, "harness secret add omnigate").?;
+        const run = std.mem.indexOf(u8, text, ". harness run ").?;
+        const open = std.mem.indexOf(u8, text, ". harness open ").?;
+        const phone = std.mem.indexOf(u8, text, "Telegram, for your phone (optional)").?;
+        try t.expect(key < run and run < open and open < phone);
+        try t.expect(std.mem.indexOf(u8, text[phone..], "harness secret add telegram") != null);
+        try t.expect(std.mem.indexOf(u8, text[0..phone], "telegram") == null);
+    }
     // the butler's manner: persona.md
     try t.expectEqualStrings("---\npreset: butler\n---\n", butler_persona);
     try t.expect(std.mem.indexOf(u8, said, "persona.md: the butler's manner (/persona changes it).") != null);
@@ -3072,6 +3207,7 @@ test "login_add_and_rm_say_exactly_what_they_stored_and_removed" {
 
 test {
     _ = @import("config.zig");
+    _ = @import("config_cmd.zig");
     _ = @import("rules.zig");
     _ = @import("gate.zig");
     _ = @import("util.zig");
@@ -3542,4 +3678,34 @@ test "skill_takes_its_commands" {
     };
     for ([_][]const []const u8{ &.{"skill"}, &.{ "skill", "add" }, &.{ "skill", "remove", "x" }, &.{ "skill", "list", "--yes" } }) |line| try std.testing.expect(badArgs(line) != null);
     for ([_][]const u8{ "skill add SOURCE [--skill NAME] [--yes]", "skill list | show NAME | rm NAME", "skill update [NAME] [--force] [--yes]" }) |l| try std.testing.expect(std.mem.indexOf(u8, usage, l) != null);
+}
+
+test "run_says_why_the_desk_is_the_only_way_in" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqualStrings("Telegram is off. The desk is the only way in.", (try deskAlone(a, false, "telegram", true, true)).start);
+    try t.expectEqualStrings("No bot token is stored under \"bot\", so Telegram is off. The desk is the only way in.", (try deskAlone(a, true, "bot", true, true)).start);
+    // no desk server either: one line, naming what to turn on
+    const off = try deskAlone(a, false, "telegram", false, false);
+    try t.expectEqualStrings("Telegram is off and so is the desk's server: turn on [apps] on in config.ini (or [chat] telegram, with a bot token)", off.fail.?);
+    const none = try deskAlone(a, true, "telegram", false, false);
+    try t.expectEqualStrings("no bot token is stored under \"telegram\" and the desk's server is off: turn on [apps] on in config.ini, or run: harness secret add telegram", none.fail.?);
+    const broke = try deskAlone(a, true, "telegram", true, false);
+    try t.expectEqualStrings("no bot token is stored under \"telegram\" and the desk's server didn't start (see above): fix that, or run: harness secret add telegram", broke.fail.?);
+    try t.expect((try deskAlone(a, true, "telegram", true, true)).fail == null);
+}
+
+test "config_takes_set_and_get_with_their_keys" {
+    try t.expect(configArgs(&.{ "set", "model.url", "https://a.example" }) != null);
+    try t.expect(configArgs(&.{ "set", "provider", "local.url", "https://a.example" }) != null);
+    try t.expect(configArgs(&.{ "set", "provider local.url", "https://a.example", "model.provider", "local" }) != null);
+    try t.expect(configArgs(&.{ "get", "provider", "local.url" }) != null);
+    try t.expect(configArgs(&.{ "get", "model.url" }) != null);
+    try t.expect(configArgs(&.{ "set", "model.url" }) == null);
+    try t.expect(configArgs(&.{ "get", "model.url", "x" }) == null);
+    try t.expect(configArgs(&.{ "show", "model.url" }) == null);
+    try t.expect(configArgs(&.{"set"}) == null);
+    try t.expect(badArgs(&.{ "config", "get" }) != null);
+    try t.expect(badArgs(&.{ "config", "get", "chat.utc_offset" }) == null);
 }

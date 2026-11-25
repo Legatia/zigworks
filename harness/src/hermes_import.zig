@@ -126,7 +126,9 @@ pub fn makePlan(io: Io, a: std.mem.Allocator, s: hermes.Setup, h: Harness, o: Op
     var all: std.ArrayList(scrub.Secret) = .empty;
     try all.appendSlice(a, s.secrets);
     try all.appendSlice(a, h.stored);
-    const cfg = config.parse(a, h.config_text) catch config.Config{};
+    var cfg = config.parse(a, h.config_text) catch config.Config{};
+    // utc_offset = auto: the computer's zone on the day of the import
+    if (cfg.utc_auto) cfg.chat.utc_offset = zones.localNow(io, a, o.now_s) orelse 0;
     var c: Ctx = .{ .io = io, .a = a, .s = s, .h = h, .o = o, .p = &p, .sc = try scrub.Scrubber.init(a, all.items), .cfg = cfg };
     try c.planMemory();
     try c.planSoul();
@@ -360,7 +362,8 @@ const Ctx = struct {
         if (!c.tasks_any) return;
         try c.line(.needs, "Imported tasks run with harness's rules: in a run nobody watches every question is a refusal, so a job that worked in Hermes because a command was always allowed there is refused here until you add a rule.", .{});
         if (c.every_note) try c.line(.needs, "Tasks at every N h: harness's every isn't aligned to the clock hour and varies by up to 10%.", .{});
-        if (c.at_note) try c.line(.needs, "Times: harness's utc_offset ({s}) doesn't follow daylight saving; check the imported times when the clocks change.", .{try fmtOffset(c.a, c.cfg.chat.utc_offset)});
+        // auto follows the clocks: nothing to check
+        if (c.at_note and !c.cfg.utc_auto) try c.line(.needs, "Times: harness's utc_offset ({s}) doesn't follow daylight saving; check the imported times when the clocks change.", .{try fmtOffset(c.a, c.cfg.chat.utc_offset)});
     }
 
     fn planJob(c: *Ctx, j: hermes.Job, taken: *std.ArrayList([]const u8)) !void {

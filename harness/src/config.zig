@@ -37,6 +37,10 @@ pub const Config = struct {
     /// The `[provider NAME]` sections, in the order their names first
     /// appear (not a section of its own: `parse` reads them apart).
     providers: []const model.Section = &.{},
+    /// `[chat] utc_offset = auto`: the computer's zone at each use (the
+    /// core sets `chat.utc_offset` from it: Core.refreshLocalTime). Not a
+    /// section of its own.
+    utc_auto: bool = false,
 
     pub const Model = struct {
         /// The provider of a model value that names none: a preset or a
@@ -338,6 +342,14 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
             try providerLine(arena, &provs, name, l);
             continue;
         }
+        // the computer's own zone: the offset is the core's to fill in
+        if (std.mem.eql(u8, l.section, "chat") and std.mem.eql(u8, l.key, "utc_offset")) {
+            cfg.utc_auto = std.ascii.eqlIgnoreCase(l.value, "auto");
+            if (cfg.utc_auto) {
+                cfg.chat.utc_offset = 0;
+                continue;
+            }
+        }
         // the household's order for urgent alerts: read whole here
         if (std.mem.eql(u8, l.section, "butler") and std.mem.eql(u8, l.key, "escalate")) {
             var why: []const u8 = "";
@@ -349,7 +361,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
         }
         var found = false;
         inline for (@typeInfo(Config).@"struct".field_names) |sname| {
-            if (comptime !std.mem.eql(u8, sname, "providers")) {
+            if (comptime !std.mem.eql(u8, sname, "providers") and !std.mem.eql(u8, sname, "utc_auto")) {
                 if (std.mem.eql(u8, l.section, sname)) {
                     found = true;
                     try setField(&@field(cfg, sname), l);
@@ -852,7 +864,7 @@ pub const defaults_ini =
     \\telegram = on
     \\token = telegram                    ; secret holding the bot token
     \\api = https://api.telegram.org
-    \\utc_offset = +00:00                 ; for brief and task times
+    \\utc_offset = auto                   ; times: this computer's zone, or +HH:MM
     \\
     \\[limits]
     \\steps_per_turn = 20
@@ -1063,9 +1075,30 @@ test "config_defaults_when_empty" {
     try t.expectEqual(20, c.memory.top_size);
     try t.expect(c.memory.auto);
     try t.expectEqual(4096, c.model.max_tokens);
-    // the written defaults read back as the defaults
-    const d = try parse(arena.allocator(), defaults_ini);
+    // the written defaults read back as the defaults, but for the time:
+    // a new folder's follows the computer's zone (a file without the line: UTC)
+    try t.expect(!c.utc_auto);
+    var d = try parse(arena.allocator(), defaults_ini);
+    try t.expect(d.utc_auto);
+    d.utc_auto = false;
     try t.expectEqualDeep(c, d);
+}
+
+test "utc_offset_auto_is_the_computers_zone" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expect((try parse(a, "[chat]\nutc_offset = auto\n")).utc_auto);
+    try t.expect((try parse(a, "[chat]\nutc_offset = Auto\n")).utc_auto);
+    // the last line is the one in use
+    const later = try parse(a, "[chat]\nutc_offset = auto\nutc_offset = +01:00\n");
+    try t.expect(!later.utc_auto);
+    try t.expectEqual(60, later.chat.utc_offset);
+    try t.expect((try parse(a, "[chat]\nutc_offset = +01:00\nutc_offset = auto\n")).utc_auto);
+    // not a section of its own
+    try t.expectError(error.BadConfig, parse(a, "[utc_auto]\nx = 1\n"));
+    try t.expectError(error.BadConfig, parse(a, "[chat]\nutc_auto = on\n"));
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "\nutc_offset = auto ") != null);
 }
 
 test "config_reads_every_section" {
