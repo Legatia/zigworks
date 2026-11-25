@@ -913,9 +913,10 @@ Rulings:
   build.
 - R65. **The stand-in doesn't use `os.kill(pid, 0)` on Windows:** there it
   ends the process. It asks the port.
-- R66. **CI packs without the fit files** (`DESK_ASSETS=none`), since the
-  base head isn't in the repository; the release steps pack strictly and
-  fail without it, as harness's own archive does.
+- R66. **CI packs without the fit files** (`DESK_ASSETS=none`), as the
+  macOS job does; the release steps pack strictly and fail without them,
+  as harness's own archive does. (The base head came into the repository
+  later the same night, ff54518.)
 - R67. **The data folder's parents are made on Windows** (a new computer
   has no `%LOCALAPPDATA%\harness` yet).
 - R68. **The usual models stay as the Mac session named them;** what the
@@ -940,8 +941,10 @@ Verification (2026-11-25):
   computer's zone).
 - The packages: the Windows zip and the Linux archive hold harness; the
   Windows one unpacked and started on a new folder showed "Set up". With
-  `DESK_ASSETS` unset both stop with pack-desk-assets' line about the base
-  head.
+  `DESK_ASSETS` unset the Windows script stopped with pack-desk-assets'
+  line about the base head, which was not in the repository yet; a strict
+  package with the base head there has not been made here (it downloads
+  MediaPipe's files, which I did not do without the owner's word).
 
 Not done or not seen:
 
