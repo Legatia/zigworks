@@ -27,7 +27,8 @@
 //!   whose bytes are the request's text (a 0 added to make it even), or
 //!   `gemini/001.json`, `002.json`, … when there is one:
 //!   `{"status":N}` that error in Google's shape (`"echo_key":true`: its
-//!   message says the key), `{"mime":"audio/wav"}` the same audio as a
+//!   message says the key; `"body":{…}` that body instead),
+//!   `{"mime":"audio/wav"}` the same audio as a
 //!   WAV file, `{"answer":{…}}` that answer as it is. Each request is
 //!   saved as `gemini-requests/001.json`, … with its target, headers and
 //!   body (a string).
@@ -449,6 +450,8 @@ pub const Server = struct {
         try s.writeRecord(a, try s.path(a, &.{ "gemini-requests", name }), saved);
         const v: ?jv.Value = if (s.readScript(a, &.{ "gemini", name })) |x| jv.parse(a, x) else null;
         if (jv.int(jv.get(v, "status"))) |st| {
+            // Google's own error body, as given
+            if (jv.get(v, "body")) |b| return json(req, @fromBackingInt(@as(u10, @intCast(st))), try std.json.Stringify.valueAlloc(a, b, .{}));
             const echo = jv.boolean(jv.get(v, "echo_key")) orelse false;
             const msg = if (echo) try std.fmt.allocPrint(a, "scripted error for key {s}", .{key}) else "scripted error";
             return json(req, @fromBackingInt(@as(u10, @intCast(st))), try std.fmt.allocPrint(a, "{{\"error\":{{\"code\":{d},\"message\":{f},\"status\":\"SCRIPTED\"}}}}", .{ st, std.json.fmt(msg, .{}) }));

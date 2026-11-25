@@ -325,7 +325,9 @@ pub const Speaker = struct {
                 try body.appendSlice(a, "}]}],\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":");
                 try util.jsonString(&body, a, sp.voice);
                 try body.appendSlice(a, "}}}}}");
-                break :blk try std.fmt.allocPrint(a, "/models/{s}:generateContent", .{try pathSegment(a, sp.model)});
+                // Google's model list names them `models/NAME`: either form
+                const name = if (std.mem.startsWith(u8, sp.model, "models/")) sp.model["models/".len..] else sp.model;
+                break :blk try std.fmt.allocPrint(a, "/models/{s}:generateContent", .{try pathSegment(a, name)});
             },
             // config.ini lets no Anthropic-format provider speak
             .anthropic => return error.Rejected,
@@ -360,6 +362,11 @@ pub const Speaker = struct {
 
     /// An error status as every kind says it.
     fn statusError(sp: *Speaker, status: u16, got: []const u8) Error {
+        // Google answers a key it doesn't know with a 400
+        if (status == 400 and badGoogleKey(got)) {
+            sp.note(got);
+            return error.KeyRefused;
+        }
         switch (status) {
             401, 403 => {
                 sp.note(got);
@@ -429,10 +436,23 @@ pub const Speaker = struct {
             error.BudgetSpent => std.fmt.allocPrint(a, "Speech budget used up at {s}.", .{p}),
             error.RateLimited => std.fmt.allocPrint(a, "Speech is rate limited at {s}; try again later.", .{p}),
             error.NoAudio => if (msg.len > 0) std.fmt.allocPrint(a, "Speech failed at {s}: its answer had no audio ({s}).", .{ p, msg }) else std.fmt.allocPrint(a, "Speech failed at {s}: its answer had no audio.", .{p}),
+            error.Rejected => if (msg.len > 0) std.fmt.allocPrint(a, "{s} refused the request: {s}{s}", .{ p, msg, if (std.mem.endsWith(u8, msg, ".")) "" else "." }) else std.fmt.allocPrint(a, "{s} refused the request.", .{p}),
             else => if (msg.len > 0) std.fmt.allocPrint(a, "Speech failed at {s}: {s} {s}", .{ p, @errorName(e), msg }) else std.fmt.allocPrint(a, "Speech failed at {s}: {s}", .{ p, @errorName(e) }),
         } catch "Speech failed.";
     }
 };
+
+/// Whether an error body is Google's for a key it doesn't know (a 400 with
+/// reason API_KEY_INVALID).
+fn badGoogleKey(body: []const u8) bool {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const v = jv.parse(arena.allocator(), body) orelse return false;
+    for (jv.arr(jv.at(v, &.{ "error", "details" })) orelse &.{}) |d| {
+        if (std.mem.eql(u8, jv.str(jv.get(d, "reason")) orelse "", "API_KEY_INVALID")) return true;
+    }
+    return false;
+}
 
 /// Whether `bytes` are a WAV file (its RIFF header says so).
 fn isWav(bytes: []const u8) bool {
@@ -751,7 +771,7 @@ test "gemini_errors_are_said_in_the_providers_words" {
         .{ .script = "{\"status\":403}", .err = error.KeyRefused, .said = "gemini refused the key stored as gemini." },
         .{ .script = "{\"status\":402}", .err = error.BudgetSpent, .said = "Speech budget used up at gemini." },
         .{ .script = "{\"status\":429}", .err = error.RateLimited, .said = "Speech is rate limited at gemini; try again later." },
-        .{ .script = "{\"status\":400}", .err = error.Rejected, .said = "Speech failed at gemini: Rejected scripted error" },
+        .{ .script = "{\"status\":400}", .err = error.Rejected, .said = "gemini refused the request: scripted error." },
         .{ .script = "{\"status\":500}", .err = error.Upstream, .said = "Speech failed at gemini: Upstream scripted error" },
     };
     for (cases, 1..) |cs, n| {
@@ -771,6 +791,34 @@ test "gemini_errors_are_said_in_the_providers_words" {
     try t.expectError(error.NoKey, none.speak(a, "x", null));
     try t.expectEqualStrings("No gemini key is stored (harness secret add gemini).", none.failure(a, error.NoKey));
     try t.expectError(error.FileNotFound, e.tmp.dir.statFile(t.io, "gemini-requests/007.json", .{}));
+}
+
+test "googles_bad_key_is_one_line" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    var sp = try gemSpeaker(&e, .x_goog_api_key, "gm-test-key-1");
+    // Google answers a key it doesn't know with a 400, not a 401
+    try gemScript(&e, 1, "{\"status\":400,\"body\":{\"error\":{\"code\":400,\"message\":\"API key not valid. Please pass a valid API key.\",\"status\":\"INVALID_ARGUMENT\",\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"reason\":\"API_KEY_INVALID\",\"domain\":\"googleapis.com\"}]}}}");
+    try t.expectError(error.KeyRefused, sp.speak(a, "x", null));
+    try t.expectEqualStrings("gemini refused the key stored as gemini.", sp.failure(a, error.KeyRefused));
+    // any other 400: one line in Google's words
+    try gemScript(&e, 2, "{\"status\":400,\"body\":{\"error\":{\"code\":400,\"message\":\"Voice nova is not supported.\",\"status\":\"INVALID_ARGUMENT\"}}}");
+    try t.expectError(error.Rejected, sp.speak(a, "x", null));
+    try t.expectEqualStrings("gemini refused the request: Voice nova is not supported.", sp.failure(a, error.Rejected));
+}
+
+test "a_model_with_models_prefix_is_the_same_model" {
+    var e: model.TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    var sp = try gemSpeaker(&e, .x_goog_api_key, "gm-test-key-1");
+    // as Google's model list names them
+    sp.model = "models/gemini-3.8-flash-lite-tts";
+    _ = try sp.speak(a, "x", null);
+    try t.expectEqualStrings("/v1beta/models/gemini-3.8-flash-lite-tts:generateContent", jv.str(jv.get(try gemRequest(&e, 1), "target")).?);
 }
 
 test "gemini_takes_auth_and_headers_as_its_section_says" {
